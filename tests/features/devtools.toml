@@ -1,0 +1,16 @@
+# Features: developer entry points. See tests/features/README.md for the format.
+
+[[feature]]
+name = "`make run` attaches the serial console (headless mode tested; the window is a manual check)"
+milestone = "M0"
+tests = [
+    "scenario:test_devtools::test_make_run_serial_console",
+    "harness:test_qemu::*",
+]
+
+[[feature]]
+name = "`make debug` boots paused under gdb and stops at kmain"
+milestone = "M0"
+tests = [
+    "scenario:test_devtools::test_make_debug_stops_at_kmain",
+]

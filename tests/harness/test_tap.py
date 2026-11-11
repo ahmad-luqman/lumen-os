@@ -17,11 +17,16 @@ def test_all_passing():
     assert [c.name for c in r.cases] == ["a::one", "a::two"]
 
 
-def test_failure_keeps_diagnostics():
-    r = tap.parse("TAP version 14\n1..2\nok 1 - a\nnot ok 2 - b\n#   assertion failed: x\n")
+def test_failure_keeps_diagnostics_printed_before_the_result():
+    text = (
+        "TAP version 14\n1..2\nok 1 - a\n"
+        "# assertion failed: x\n#    left: 2\nnot ok 2 - b\n# ktest: 1 passed, 1 failed\n"
+    )
+    r = tap.parse(text)
     assert r.complete and not r.all_passed
+    assert r.cases[0].diagnostics == []
     assert r.failed[0].name == "b"
-    assert r.failed[0].diagnostics == ["assertion failed: x"]
+    assert r.failed[0].diagnostics == ["assertion failed: x", "left: 2"]
 
 
 def test_truncated_run_is_not_success():

@@ -50,9 +50,15 @@ class TapReport:
 
 
 def parse(text: str) -> TapReport:
-    """Parse TAP from serial output; non-TAP lines (logs) are ignored."""
+    """Parse TAP from serial output; non-TAP lines (logs) are ignored.
+
+    Lumen's runner prints a test's diagnostics (`# ...`) *before* its result
+    line, because assertions print while the test runs. So `#` lines are held
+    and attached to the next result; any after the last result are dropped.
+    """
     report = TapReport()
     in_tap = False
+    pending: list[str] = []
     for raw in text.splitlines():
         line = raw.rstrip("\r")
         if line.startswith("TAP version"):
@@ -63,7 +69,9 @@ def parse(text: str) -> TapReport:
         if m := _PLAN.match(line):
             report.planned = int(m.group(1))
         elif m := _RESULT.match(line):
-            report.cases.append(TapCase(int(m.group(2)), m.group(3) or "", m.group(1) == "ok"))
-        elif line.startswith("#") and report.cases:
-            report.cases[-1].diagnostics.append(line.lstrip("# ").rstrip())
+            case = TapCase(int(m.group(2)), m.group(3) or "", m.group(1) == "ok", pending)
+            report.cases.append(case)
+            pending = []
+        elif line.startswith("#"):
+            pending.append(line.lstrip("# ").rstrip())
     return report

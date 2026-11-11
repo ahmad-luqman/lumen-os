@@ -397,12 +397,14 @@ kernel. The kernel is the trusted computing base.
 | Screens | QMP `screendump` compared to golden PNG regions | `tests/golden` |
 | Codegen | `make audit`: disassembly and LLVM IR checks | `tools/harness/lumen_harness/audit.py` |
 | Harness itself | self-tests that the TAP parser, audit and image diff catch failures | `tests/harness` |
-| Status | `docs/STATUS.md` generated from all of the above via `tests/features.toml` | `make status` |
+| Feature gate | every feature in `tests/features/*.toml` must pass (CI); `docs/STATUS.md` generated from the same data | `make status-check`, `make status` |
 
 QEMU exit codes: 33 = tests passed, 35 = a test failed, 37 = crash report.
 A triple fault exits with 0 (`-no-reboot`) and therefore fails. Each scenario
 keeps `serial.log`, `qemu.log` (`-d int,cpu_reset,guest_errors`) and
-screenshots when it fails, and CI uploads them.
+screenshots when it fails, and CI uploads them. QEMU records the interrupt
+trace only under TCG, so CI (which runs KVM) re-runs failed scenarios under
+TCG before uploading.
 
 ## 16. Repository layout
 
@@ -417,6 +419,6 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
 crates/            no_std, host-testable libraries (lumen-elf, ...)
 boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, harness/ (Python package)
-tests/             scenarios/, harness/, golden/, features.toml
+tests/             scenarios/, harness/, golden/, features/*.toml
 docs/              ARCHITECTURE.md, ROADMAP.md, STATUS.md (generated)
 ```

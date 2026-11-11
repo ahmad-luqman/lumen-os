@@ -1,0 +1,39 @@
+# Features: crash. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Crash report for CPU exceptions: symbolized rip, registers, backtrace (#PF #UD #DE #GP #DF)"
+milestone = "M0"
+tests = [
+    "scenario:test_crash::test_fault_produces_symbolized_report[*]",
+    "scenario:test_crash::test_page_fault_report_names_address_and_cause",
+    "ktest:lumen_kernel::crash::page_fault_cause_is_decoded",
+]
+
+[[feature]]
+name = "Double fault runs on its own IST stack"
+milestone = "M0"
+tests = [
+    "scenario:test_crash::test_fault_produces_symbolized_report[df]",
+]
+
+[[feature]]
+name = "Crash report for Rust panics"
+milestone = "M0"
+tests = [
+    "scenario:test_crash::test_panic_produces_report",
+]
+
+[[feature]]
+name = "Crash report shown on the framebuffer"
+milestone = "M0"
+tests = [
+    "scenario:test_crash::test_crash_screen_golden",
+]
+
+[[feature]]
+name = "Kernel symbol table from Limine's executable file"
+milestone = "M0"
+tests = [
+    "ktest:lumen_kernel::symbols::symbols_resolve_kernel_functions",
+    "cargo:lumen-elf",
+]

@@ -1,0 +1,32 @@
+# Features: harness. See tests/features/README.md for the format.
+
+[[feature]]
+name = "In-kernel test runner (TAP over serial, isa-debug-exit)"
+milestone = "M0"
+tests = [
+    "scenario:test_ktest::test_in_kernel_tests_pass",
+    "ktest:lumen_kernel::ktest::ktest_registry_is_populated",
+    "harness:test_tap::*",
+]
+
+[[feature]]
+name = "Codegen audit: no SSE/AVX, no red zone, kernel code model, frame pointers"
+milestone = "M0"
+tests = [
+    "audit:flags",
+    "harness:test_audit::*",
+]
+
+[[feature]]
+name = "Golden-image comparison for screendumps"
+milestone = "M0"
+tests = [
+    "harness:test_image::*",
+]
+
+[[feature]]
+name = "STATUS.md generated from test results"
+milestone = "M0"
+tests = [
+    "harness:test_status::*",
+]

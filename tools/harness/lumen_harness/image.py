@@ -70,10 +70,15 @@ def assert_matches_golden(
     size: tuple[int, int],
     artifacts: Path,
     *,
-    tolerance: int = 8,
-    max_fraction: float = 0.001,
+    tolerance: int = 0,
+    max_fraction: float = 0.0,
 ) -> ImageDiff | None:
-    """Compare a region of `screenshot` to `golden_path`, or re-record it."""
+    """Compare a region of `screenshot` to `golden_path`, or re-record it.
+
+    Exact by default: our rendering is deterministic (pinned OVMF, fixed mode,
+    pre-rasterized font), and identical on macOS/TCG and Linux/KVM. Loosen
+    the tolerance only with a reason written next to the call.
+    """
     region = crop(screenshot, origin, size)
     if update_requested():
         golden_path.parent.mkdir(parents=True, exist_ok=True)
@@ -88,7 +93,7 @@ def assert_matches_golden(
         mask.save(artifacts / f"{golden_path.stem}.diff.png")
         raise AssertionError(
             f"{golden_path.name}: {diff.differing} of {diff.width * diff.height} pixels differ "
-            f"(> {max_fraction:.2%}, max channel delta {diff.max_delta}); "
+            f"(allowed {max_fraction:.2%}, max channel delta {diff.max_delta}); "
             f"see {artifacts}/{golden_path.stem}.actual.png and .diff.png"
         )
     return diff
