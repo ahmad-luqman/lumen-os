@@ -35,7 +35,8 @@ jobs:
           rustup toolchain install
           rustc --version
 
-      - uses: astral-sh/setup-uv@v10
+      # setup-uv publishes no floating major tags; pin an exact release.
+      - uses: astral-sh/setup-uv@v10.3.2
 
       - uses: Swatinem/rust-cache@v2
 
