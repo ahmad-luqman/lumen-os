@@ -1,0 +1,8 @@
+# Anchored patterns only (hard rule 8): an unanchored `build/` once hid
+# tools/build/*.mk in v1 and broke fresh clones.
+/target/
+/build/
+/.venv/
+/.pytest_cache/
+**/__pycache__/
+.DS_Store

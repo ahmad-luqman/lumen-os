@@ -1,0 +1,7 @@
+# Pinned toolchain (hard rule 7). Bump deliberately, in its own PR, with CI green.
+# Stable only: no nightly features anywhere in the tree.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy", "llvm-tools"]
+targets = ["x86_64-unknown-none"]

@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["kernel", "crates/*"]
+# `cargo test` / `cargo clippy` with no flags run on the host-testable crates only.
+# The kernel is built for x86_64-unknown-none via `make build`.
+default-members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/ahmad-luqman/lumen-os"
+
+[workspace.dependencies]
+lumen-elf = { path = "crates/lumen-elf" }
+# 0.6.x needs nightly (#![feature(ptr_metadata)]); 0.5.0 is the newest stable-compatible release.
+limine = "=0.5.0"
+log = { version = "0.4", default-features = false }
+rustc-demangle = { version = "=0.1.28", default-features = false }
+noto-sans-mono-bitmap = { version = "=0.4.0", default-features = false, features = ["regular", "bold", "size_16", "size_32", "unicode-basic-latin"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "allow"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.dev]
+panic = "abort"
+
+# The kernel is always built with the release profile: optimized, but with
+# symbols, overflow checks and debug assertions kept (safety over speed).
+[profile.release]
+panic = "abort"
+debug = "line-tables-only"
+strip = false
+overflow-checks = true
+debug-assertions = true

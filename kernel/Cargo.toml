@@ -1,0 +1,27 @@
+[package]
+name = "lumen-kernel"
+description = "The Lumen kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lumen-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+# Build the in-kernel test runner: instead of the kernel monitor, run every
+# `ktest!` and report TAP over serial.
+ktest = []
+
+[dependencies]
+lumen-elf.workspace = true
+limine.workspace = true
+log.workspace = true
+rustc-demangle.workspace = true
+noto-sans-mono-bitmap.workspace = true
+
+[lints]
+workspace = true

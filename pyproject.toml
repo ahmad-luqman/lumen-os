@@ -1,0 +1,24 @@
+[project]
+name = "lumen-harness"
+version = "0.0.1"
+description = "Host-side test harness for the Lumen OS (QEMU scenarios, golden images, flag audit)"
+requires-python = ">=3.12"
+dependencies = [
+    "pillow>=11",
+    "pytest>=8",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.8"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["tools/harness"]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

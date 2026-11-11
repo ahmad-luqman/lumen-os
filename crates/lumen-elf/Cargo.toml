@@ -1,0 +1,9 @@
+[package]
+name = "lumen-elf"
+description = "Minimal no_std ELF64 reader: section headers and symbol lookup (used by the crash reporter)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

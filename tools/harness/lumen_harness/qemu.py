@@ -1,0 +1,253 @@
+"""QEMU configuration and a scriptable, headless machine.
+
+This module is the single source of truth for how Lumen boots under QEMU:
+`make run`, `make debug` and every scenario test build their command line
+with `qemu_args`.
+
+`Machine` boots an ISO headless with serial on a pipe, then lets a test wait
+for output (`expect`, with a timeout, never fixed sleeps), type input
+(`send_line`), take screenshots over QMP (`screendump`), and collect the exit
+status that the kernel sets through `isa-debug-exit`.
+
+Every run writes its artifacts to a directory: `serial.log` (everything the
+guest printed), `qemu.log` (QEMU `-d` trace: interrupts, CPU resets, guest
+errors), `cmdline.txt`, and any screenshots.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Self
+
+from . import BUILD_DIR
+from .qmp import QmpClient
+
+# isa-debug-exit: QEMU exits with (code << 1) | 1. Must match kernel qemu.rs.
+EXIT_SUCCESS = (0x10 << 1) | 1  # 33
+EXIT_FAILURE = (0x11 << 1) | 1  # 35
+EXIT_CRASH = (0x12 << 1) | 1  # 37
+
+
+def ovmf_code() -> Path:
+    """Pinned OVMF firmware from tools/fetch-deps.sh (override: LUMEN_OVMF_CODE)."""
+    return Path(os.environ.get("LUMEN_OVMF_CODE", BUILD_DIR / "deps/ovmf/OVMF_CODE.fd"))
+
+
+def ovmf_vars_template() -> Path:
+    return Path(os.environ.get("LUMEN_OVMF_VARS", BUILD_DIR / "deps/ovmf/OVMF_VARS.fd"))
+
+
+def default_accel() -> str:
+    """KVM when usable (Linux CI), otherwise TCG. Override with LUMEN_ACCEL."""
+    if accel := os.environ.get("LUMEN_ACCEL"):
+        return accel
+    if os.access("/dev/kvm", os.R_OK | os.W_OK):
+        return "kvm"
+    return "tcg"
+
+
+def timeout_scale() -> float:
+    """Multiply every timeout (LUMEN_TIMEOUT_SCALE), e.g. for slow CI runners."""
+    return float(os.environ.get("LUMEN_TIMEOUT_SCALE", "1"))
+
+
+@dataclass
+class QemuOptions:
+    iso: Path
+    vars_file: Path
+    headless: bool = True
+    accel: str = field(default_factory=default_accel)
+    memory: str = "256M"
+    serial: str = "stdio"
+    qmp_socket: Path | None = None
+    log_file: Path | None = None
+    trace: str = "cpu_reset,guest_errors"
+    gdb: bool = False
+    extra: list[str] = field(default_factory=list)
+
+
+def qemu_args(o: QemuOptions) -> list[str]:
+    args = [
+        os.environ.get("LUMEN_QEMU", "qemu-system-x86_64"),
+        "-machine", "q35",
+        "-accel", o.accel,
+        "-m", o.memory,
+        "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf_code()}",
+        "-drive", f"if=pflash,format=raw,file={o.vars_file}",
+        "-cdrom", str(o.iso),
+        "-boot", "d",
+        "-serial", o.serial,
+        "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        # A triple fault must end the run, not silently reboot.
+        "-no-reboot",
+        "-monitor", "none",
+    ]  # fmt: skip
+    if o.headless:
+        args += ["-display", "none"]
+    if o.qmp_socket:
+        args += ["-qmp", f"unix:{o.qmp_socket},server=on,wait=off"]
+    if o.log_file and o.trace:
+        args += ["-d", o.trace, "-D", str(o.log_file)]
+    if o.gdb:
+        args += ["-s", "-S"]
+    return args + o.extra
+
+
+def fresh_vars(dest: Path) -> Path:
+    """OVMF needs a writable variable store; give each run its own copy."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(ovmf_vars_template(), dest)
+    return dest
+
+
+class ExpectTimeout(AssertionError):
+    pass
+
+
+class Machine:
+    """A headless QEMU instance driven over serial and QMP."""
+
+    def __init__(self, iso: Path, artifacts: Path, *, trace_interrupts: bool = False):
+        self.iso = Path(iso)
+        self.artifacts = Path(artifacts)
+        self.trace_interrupts = trace_interrupts
+        self.proc: subprocess.Popen[bytes] | None = None
+        self._buf = bytearray()
+        self._cond = threading.Condition()
+        self._pos = 0  # expect() cursor into the normalized output
+        self._reader: threading.Thread | None = None
+        self._qmp: QmpClient | None = None
+        # macOS limits unix socket paths to ~104 bytes, so keep it short.
+        self._sock_dir = Path(os.environ.get("LUMEN_SOCK_DIR", "/tmp"))
+
+    # -- lifecycle -------------------------------------------------------
+    def start(self) -> Self:
+        self.artifacts.mkdir(parents=True, exist_ok=True)
+        self.qmp_path = self._sock_dir / f"lumen-qmp-{os.getpid()}-{id(self) & 0xFFFFFF:x}.sock"
+        self.qmp_path.unlink(missing_ok=True)
+        trace = "cpu_reset,guest_errors" + (",int" if self.trace_interrupts else "")
+        opts = QemuOptions(
+            iso=self.iso,
+            vars_file=fresh_vars(self.artifacts / "OVMF_VARS.fd"),
+            qmp_socket=self.qmp_path,
+            log_file=self.artifacts / "qemu.log",
+            trace=trace,
+        )
+        args = qemu_args(opts)
+        (self.artifacts / "cmdline.txt").write_text(" ".join(args) + "\n")
+        # Lives as long as the machine; closed in close().
+        self._serial_log = open(self.artifacts / "serial.log", "wb")  # noqa: SIM115
+        self.proc = subprocess.Popen(
+            args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+        return self
+
+    def _read_loop(self) -> None:
+        assert self.proc and self.proc.stdout
+        fd = self.proc.stdout.fileno()
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            self._serial_log.write(chunk)
+            self._serial_log.flush()
+            with self._cond:
+                self._buf += chunk.replace(b"\r", b"")
+                self._cond.notify_all()
+        with self._cond:
+            self._cond.notify_all()
+
+    def close(self) -> None:
+        if self._qmp:
+            self._qmp.close()
+            self._qmp = None
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait(timeout=10)
+        if self._reader:
+            self._reader.join(timeout=5)
+        if hasattr(self, "_serial_log"):
+            self._serial_log.close()
+        if hasattr(self, "qmp_path"):
+            self.qmp_path.unlink(missing_ok=True)
+
+    def __enter__(self) -> Self:
+        return self.start()
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    # -- serial ----------------------------------------------------------
+    @property
+    def output(self) -> str:
+        with self._cond:
+            return self._buf.decode("utf-8", "replace")
+
+    def expect(self, pattern: str | re.Pattern[str], timeout: float = 30) -> re.Match[str]:
+        """Wait until `pattern` (regex) appears after the previous match."""
+        rx = re.compile(pattern) if isinstance(pattern, str) else pattern
+        deadline = time.monotonic() + timeout * timeout_scale()
+        with self._cond:
+            while True:
+                text = self._buf.decode("utf-8", "replace")
+                m = rx.search(text, self._pos)
+                if m:
+                    self._pos = m.end()
+                    return m
+                remaining = deadline - time.monotonic()
+                exited = self.proc is not None and self.proc.poll() is not None
+                if remaining <= 0 or (exited and not self._reader_alive()):
+                    tail = text[-2000:]
+                    why = "QEMU exited" if exited else f"timeout after {timeout}s"
+                    raise ExpectTimeout(
+                        f"{why} waiting for {rx.pattern!r}\n--- last serial output ---\n{tail}"
+                    )
+                self._cond.wait(min(remaining, 0.5))
+
+    def _reader_alive(self) -> bool:
+        return self._reader is not None and self._reader.is_alive()
+
+    def send(self, data: str) -> None:
+        assert self.proc and self.proc.stdin
+        self.proc.stdin.write(data.encode())
+        self.proc.stdin.flush()
+
+    def send_line(self, line: str) -> None:
+        self.send(line + "\r")
+
+    def wait_exit(self, timeout: float = 30) -> int:
+        """Wait for QEMU to exit; returns its status."""
+        assert self.proc
+        try:
+            code = self.proc.wait(timeout=timeout * timeout_scale())
+        except subprocess.TimeoutExpired as e:
+            raise ExpectTimeout(f"QEMU still running after {timeout}s") from e
+        if self._reader:
+            self._reader.join(timeout=5)
+        return code
+
+    # -- QMP -------------------------------------------------------------
+    def qmp(self) -> QmpClient:
+        if self._qmp is None:
+            self._qmp = QmpClient.connect(self.qmp_path, timeout=10)
+        return self._qmp
+
+    def screendump(self, name: str) -> Path:
+        """Save the current screen as PNG in the artifacts directory."""
+        path = (self.artifacts / name).resolve()
+        self.qmp().command("screendump", filename=str(path), format="png")
+        # QEMU writes the file before replying, but be robust to slow disks.
+        for _ in range(50):
+            if path.exists() and path.stat().st_size > 0:
+                return path
+            time.sleep(0.05)
+        raise AssertionError(f"screendump did not produce {path}")

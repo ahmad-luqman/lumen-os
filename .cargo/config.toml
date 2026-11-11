@@ -1,0 +1,14 @@
+# Kernel code-generation flags. They only apply when building for the bare-metal
+# target, so host crates and their tests are unaffected.
+#
+# x86_64-unknown-none already disables SSE/AVX (soft-float), disables the red
+# zone, and uses the kernel code model. We restate the code model explicitly and
+# add the rest. None of this is trusted: `make audit` checks the built ELF
+# (hard rule 3).
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "code-model=kernel",
+    "-C", "relocation-model=static",
+    # Needed by the crash reporter's frame-pointer backtrace.
+    "-C", "force-frame-pointers=yes",
+]

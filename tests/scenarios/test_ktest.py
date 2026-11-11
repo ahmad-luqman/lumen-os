@@ -1,0 +1,24 @@
+"""Run the in-kernel test suite (`--features ktest`) and check its TAP output."""
+
+from lumen_harness import BUILD_DIR, tap
+from lumen_harness.qemu import EXIT_CRASH, EXIT_SUCCESS
+
+TAP_OUT = BUILD_DIR / "test-results" / "ktest.tap"
+
+
+def test_in_kernel_tests_pass(boot):
+    m = boot("ktest")
+    code = m.wait_exit(120)
+    out = m.output
+    report = tap.parse(out)
+    # Saved for `make status` (each ktest is listed individually in STATUS.md).
+    TAP_OUT.parent.mkdir(parents=True, exist_ok=True)
+    TAP_OUT.write_text(out[out.find("TAP version") :] if "TAP version" in out else "")
+    if code == EXIT_CRASH:
+        crash = out[out.find("==== LUMEN CRASH REPORT") :]
+        last = report.cases[-1].name if report.cases else "(before the first test)"
+        raise AssertionError(f"kernel crashed during the test after {last}:\n{crash}")
+    assert report.complete, f"incomplete TAP stream: {report.summary()}\n{out[-2000:]}"
+    assert report.all_passed, report.summary()
+    assert code == EXIT_SUCCESS, f"QEMU exit {code}, expected {EXIT_SUCCESS}"
+    assert len(report.cases) >= 7
