@@ -17,8 +17,10 @@ BOOT_TIMEOUT = 60
 MIB = 1024 * 1024
 HEAP_BASE = 0xFFFF_C000_0000_0000
 # The heap's one-line summary (kmon `heap`, crash reports), written by
-# `mm::heap::write_state`. A crash with the heap's lock held labels it
-# "heap (lock held; may be mid-update)" instead of "heap".
+# `Snapshot::write` in kernel/src/mm/heap.rs. This matches only the plain
+# form with an intact free list: a crash with the heap's lock held labels it
+# "heap (lock held; may be mid-update)", and a failed walk replaces the
+# "in N blocks" part.
 HEAP_LINE = re.compile(
     r"^heap: (?P<mapped>\d+) bytes mapped at (?P<base>0x[0-9a-f]+), (?P<used>\d+) used in "
     r"(?P<live>\d+) allocations, (?P<free>\d+) free in (?P<blocks>\d+) blocks \(largest (?P<largest>\d+)\)"

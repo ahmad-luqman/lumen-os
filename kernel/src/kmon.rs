@@ -247,9 +247,9 @@ fn crash_double_free() {
 }
 
 /// Write into a freed block (a use after free) so its free-list link points
-/// back at itself, then allocate something too big for it: the walk must
-/// panic, not loop forever, and the report must still show the heap (its
-/// lock is held).
+/// back at itself, then allocate something too big for it (a walk without
+/// the link check would follow the self-link forever): the walk must panic,
+/// and the report must still show the heap (its lock is held).
 #[inline(never)]
 fn crash_corrupt_heap() {
     use core::hint::black_box;

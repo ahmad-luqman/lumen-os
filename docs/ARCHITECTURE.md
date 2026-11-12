@@ -230,8 +230,9 @@ our own page tables (#4); #6 replaces them (hard rule 4).
 `kernel/src/mm/heap.rs` is the `#[global_allocator]`; the algorithm is the
 host-tested `crates/lumen-heap`. One contiguous span grows up from the
 heap window's base: when no free block fits, the heap maps fresh frames at
-its end (at least 64 KiB at a time, read-write, no-execute, write-back,
-through `paging::map`) and appends them. Growing is all or nothing: if
+its end (at least 64 KiB at a time, or just the pages a request needs when
+64 KiB isn't available; read-write, no-execute, write-back, through
+`paging::map`) and appends them. Growing is all or nothing: if
 frames or page tables run out part way, every page mapped so far is
 unmapped and its frame freed (the tables created stay; tables are never
 freed). The heap never shrinks and stops 1 GiB below the top of the window.
@@ -245,22 +246,26 @@ the tail stay free. `dealloc` merges with both neighbours, so no two free
 blocks touch, and refuses a block outside the heap, misaligned, or
 overlapping memory that is free right now, without changing anything; the
 kernel then panics. That catches a double free while the block is still
-free and a `Layout` larger than the original, but not a double free after
-the memory was handed out again or a smaller `Layout` (which leaks the
-difference; the heap check reports it once nothing is allocated). Every walk
-checks each free block it reads, so a corrupt list is a panic (and a crash
-report), not a hang. Both operations walk the list (O(free blocks)); size
+free and a `Layout` reaching into free memory or past the heap's end. It
+can't reliably catch a double free after the memory was handed out again, a
+`Layout` reaching into another live block, or a smaller `Layout` (which
+leaks the difference; the heap check reports it once nothing is allocated).
+Every walk checks each free block it reads (inside the heap, linking up to
+a block inside the heap), so a corrupt link is a panic (and a crash report),
+not a hang or an access outside the heap; corruption that keeps blocks in
+place and in order is found only by the heap check's accounting. Both operations walk the list (O(free blocks)); size
 classes for small objects can go in front of it later.
 
-When the heap runs out (no frames, or the window is full) the allocation
-returns null: `try_reserve` callers see an error, and everything else
+When the heap runs out (no frame for the heap or for a page table, or the
+window is full) the allocation returns null: `try_reserve` callers see an error, and everything else
 reaches `alloc`'s default error handler, which panics
-(`#[alloc_error_handler]` is unstable). Any other mapping failure is a
-kernel bug and panics. The serial crash report ends with one line of heap
+(`#[alloc_error_handler]` is unstable). Any other growth failure is a
+kernel bug and panics, as does allocating before `mm::init`. The serial crash report ends with one line of heap
 state, including the last failed growth (size, alignment, reason); kmon's
 `heap` command prints the same line. Lock order: heap, page tables, frame
-allocator; nothing holding the last two may allocate, and the heap logs only
-after releasing its lock. The lock is not IRQ-safe until #7, so interrupt
+allocator; nothing holding the last two may allocate. The allocator never
+logs (a log argument that allocates would re-enter it under the logger's
+lock) and formats its kmon and crash line from a copy taken under the lock. The lock is not IRQ-safe until #7, so interrupt
 handlers must not allocate yet.
 
 ## 6. Interrupts, exceptions and crash reports (built)

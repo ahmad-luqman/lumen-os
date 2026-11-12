@@ -38,7 +38,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Kernel heap with working free (GlobalAlloc): reuse, coalescing, growth in the heap window with rollback; OOM, bad frees and a corrupt free list end in a crash report showing the heap"
+name = "Kernel heap with working free (GlobalAlloc): reuse, coalescing, growth in the heap window with rollback; OOM, a double free and a corrupt free list end in a crash report showing the heap"
 milestone = "M1"
 tests = [
     "cargo:lumen-heap",
@@ -47,6 +47,8 @@ tests = [
     "ktest:lumen_kernel::mm::heap::vec_and_box_work",
     "ktest:lumen_kernel::mm::heap::growth_failure_rolls_back",
     "ktest:lumen_kernel::mm::heap::crash_stats_never_block",
+    "ktest:lumen_kernel::mm::heap::growth_errors_are_classified",
+    "ktest:lumen_kernel::mm::heap::small_growth_when_frames_are_scarce",
     "ktest:lumen_kernel::mm::paging::hhdm_maps_exactly_the_hhdm_types",
     "scenario:test_mm::test_kmon_heap_reports_usage",
     "scenario:test_mm::test_out_of_memory_report_shows_the_heap",

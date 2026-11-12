@@ -236,8 +236,73 @@ fn a_corrupt_list_is_a_panic_not_an_endless_walk() {
     // Link the free block at `a` back to itself (a use-after-free write).
     // SAFETY: the second word of the free block at `a` is its `next`.
     unsafe { a.as_ptr().cast::<usize>().add(1).write(0) };
-    // Too big for the block at `a`, so the walk follows its link.
+    // Too big for the block at `a`: a walk without the link check would
+    // follow the self-link forever.
     heap.alloc(layout(128, 16));
+}
+
+#[test]
+#[should_panic(expected = "heap free list corrupt")]
+fn a_free_block_running_past_the_heap_is_a_panic() {
+    let arena = Arena::new(8192);
+    let mut heap = arena.heap(0, 4096);
+    let l = layout(64, 16);
+    let (_a, b) = (heap.alloc(l).unwrap(), heap.alloc(l).unwrap());
+    let _rest = heap.alloc(layout(4096 - 128, 16)).unwrap();
+    free(&mut heap, b, l);
+    // `b` (offset 64) is now the only free block, linking nowhere. Grow it to
+    // end 16 bytes past the heap: still smaller than the heap and with no
+    // link to contradict it, so only the end-inside check catches it
+    // (unchecked, `alloc` would hand out memory overlapping `_rest` and
+    // running past the end).
+    // SAFETY: the first word of the free block at `b` is its size.
+    unsafe { b.as_ptr().cast::<usize>().write(4096 - 64 + 16) };
+    heap.alloc(layout(128, 16));
+}
+
+#[test]
+fn a_free_below_a_live_tail_does_not_absorb_it_when_extending() {
+    let arena = Arena::new(4096);
+    let mut heap = arena.heap(0, 256);
+    let (a, b, c) = (layout(64, 16), layout(176, 16), layout(16, 16));
+    let (pa, pb, pc) = (heap.alloc(a).unwrap(), heap.alloc(b).unwrap(), heap.alloc(c).unwrap());
+    free(&mut heap, pb, b);
+    // SAFETY: inside the arena.
+    unsafe { heap.extend(256) };
+    // The free block at 64 ends 16 bytes below the end (the live tail):
+    // the new memory is a separate block.
+    assert_eq!(heap.check().unwrap(), FreeList { blocks: 2, bytes: 176 + 256, largest: 256 });
+    free(&mut heap, pa, a);
+    free(&mut heap, pc, c);
+    assert_eq!(heap.check().unwrap(), FreeList { blocks: 1, bytes: 512, largest: 512 });
+}
+
+#[test]
+fn a_free_after_a_smaller_layout_free_is_refused_as_accounting() {
+    let arena = Arena::new(4096);
+    let mut heap = arena.heap(0, 4096);
+    let p = heap.alloc(layout(128, 16)).unwrap();
+    // The first half freed with a too-small layout: accepted (overlaps
+    // nothing free), leaving 64 bytes counted as used with nothing live.
+    free(&mut heap, p, layout(64, 16));
+    let (stats, list) = (heap.stats(), heap.check());
+    // The second half overlaps nothing free either, but nothing is live.
+    // SAFETY: a wrong free, which the heap must refuse without changes.
+    let second = unsafe { p.add(64) };
+    // SAFETY: as above.
+    assert_eq!(unsafe { heap.dealloc(second, layout(64, 16)) }, Err(FreeError::Accounting));
+    assert_eq!((heap.stats(), heap.check()), (stats, list));
+    assert_eq!(list, Err(CheckError::Leaked { used: 64 }));
+}
+
+#[test]
+fn check_reports_more_used_than_the_heap_has() {
+    let arena = Arena::new(4096);
+    let mut heap = arena.heap(0, 4096);
+    heap.used = 8192; // corrupt counters (the tests can reach the fields)
+    assert_eq!(heap.check(), Err(CheckError::UsedExceedsSize { used: 8192, size: 4096 }));
+    assert_eq!(heap.check_bounded(0), Err(CheckError::UsedExceedsSize { used: 8192, size: 4096 }));
+    assert_eq!(heap.stats().free(), 0);
 }
 
 #[test]
@@ -325,6 +390,14 @@ fn check_finds_corruption_without_reading_outside_the_heap() {
     // A loop back to itself is caught as out of order, so walks terminate.
     assert_eq!(corrupt(64, 0), Err(CheckError::Unordered { offset: 0 }));
     assert_eq!(corrupt(64, 128).map(|l| l.blocks), Ok(2));
+    // The tail block at 128 running past the end, by less than the heap's
+    // length (so the bound must be relative to the block's offset).
+    let tail = node.wrapping_add(128 / size_of::<usize>());
+    // SAFETY: the first word of the free tail block (offset 128) is its size.
+    unsafe { tail.write(4096 - 128 + 16) };
+    assert_eq!(heap.check(), Err(CheckError::BadSize { offset: 128, size: 4096 - 128 + 16 }));
+    // SAFETY: as above; restore it.
+    unsafe { tail.write(4096 - 128) };
     assert_eq!(heap.check_bounded(1), Err(CheckError::TooManyBlocks));
 }
 
@@ -400,8 +473,8 @@ fn randomized_stress_with_invariant_checks() {
                 }
                 97..99 if !freed.is_empty() => {
                     // A double free of a block that is still entirely free
-                    // must be refused without changes. (Once reused, even
-                    // partly, it can't be detected without headers.)
+                    // must be refused without changes. (Once fully reused, it
+                    // can't be detected without headers.)
                     let (p, l) = freed[rng.below(freed.len() as u64) as usize];
                     let off = arena.offset(p);
                     let block = block_size(l).unwrap();

@@ -118,10 +118,13 @@ fn emit(body: &dyn Fn(&mut dyn Write), tail: &dyn Fn(&mut dyn Write)) {
     // lost; serial has everything else).
     IN_TAIL.store(true, Ordering::SeqCst);
     tail(&mut s);
-    // Last: it reads heap memory, which nothing validates the way the page
-    // walk validates tables. Doesn't block (says so if the heap's lock is
-    // held); the free-list walk is bounded and stays inside the heap.
-    // SAFETY: we are on the crash path; CRASHING guarantees we run alone.
+    // Last: it trusts the heap's own bounds (base, length); if those are
+    // corrupt the walk can fault, and `IN_TAIL` then closes the report.
+    // Doesn't block (reads the heap anyway if its lock is held); the
+    // free-list walk is bounded and stays inside those bounds.
+    // SAFETY: the crash path: one CPU, interrupts off (until #7), CRASHING
+    // keeps a second report out, and we halt next, so whatever was using the
+    // heap never resumes.
     let _ = unsafe { crate::mm::heap::write_crash_stats(&mut s) };
     IN_TAIL.store(false, Ordering::SeqCst);
     let _ = writeln!(s, "{END_MARKER}");

@@ -20,12 +20,16 @@
 //!   neighbours, so no two free blocks are ever adjacent. It refuses a block
 //!   outside the heap, misaligned, or overlapping memory that is free right
 //!   now, changing nothing. That catches a double free while the block is
-//!   still free and a `Layout` larger than the original; it can't catch a
-//!   double free after the memory was handed out again, or a smaller
-//!   `Layout` (which leaks the difference; [`Heap::check`] reports the leak
-//!   once nothing is allocated).
-//! - Every walk checks each free block it reads (inside the heap, links
-//!   going up), so a corrupt list is a panic, not a hang or a stray access.
+//!   still free and a `Layout` that reaches into free memory or past the
+//!   heap's end. It can't reliably catch a double free after the memory was
+//!   handed out again, a `Layout` that reaches into another live block, or a
+//!   smaller `Layout` (which leaks the difference; [`Heap::check`] reports
+//!   the leak once nothing is allocated).
+//! - Every walk checks each free block it reads (inside the heap, linking
+//!   up to a block inside the heap), so a corrupt link can't make a walk
+//!   loop or read or write outside the heap: it panics instead. Corruption
+//!   that keeps blocks inside the heap and in order isn't caught by the
+//!   walks; [`Heap::check`] finds it through the accounting.
 //!
 //! Both operations walk the free list: O(free blocks). Size classes for small
 //! objects can sit in front of this later, behind the same interface.
@@ -114,11 +118,15 @@ pub struct FreeList {
 pub enum FreeError {
     /// The block is not inside the heap.
     OutsideHeap,
-    /// The pointer is not aligned as its `Layout` requires.
+    /// The pointer is not on a [`GRANULE`] boundary, or not aligned as its
+    /// `Layout` requires.
     Misaligned,
     /// The block overlaps memory that is free (a double free, or a `Layout`
-    /// larger than the original).
+    /// reaching into free memory).
     NotAllocated,
+    /// The block overlaps nothing free, but the counters say less is
+    /// allocated: an earlier free used the wrong (smaller) `Layout`.
+    Accounting,
 }
 
 impl fmt::Display for FreeError {
@@ -127,6 +135,7 @@ impl fmt::Display for FreeError {
             FreeError::OutsideHeap => "block is not entirely inside the heap",
             FreeError::Misaligned => "pointer is not a block start aligned for its layout",
             FreeError::NotAllocated => "block overlaps free memory (double free or wrong layout)",
+            FreeError::Accounting => "frees more than is allocated (an earlier free with a wrong layout?)",
         })
     }
 }
@@ -145,6 +154,8 @@ pub enum CheckError {
     Unordered { offset: usize },
     /// The block touches the previous one (they should have been merged).
     Adjacent { offset: usize },
+    /// More bytes are counted as used than the heap has.
+    UsedExceedsSize { used: usize, size: usize },
     /// The free bytes don't match the heap's size minus the bytes in use.
     Accounting { listed: usize, expected: usize },
     /// Bytes are counted as used but nothing is allocated: a block was freed
@@ -152,6 +163,15 @@ pub enum CheckError {
     Leaked { used: usize },
     /// Not an invariant: [`Heap::check_bounded`] stopped at its block limit.
     TooManyBlocks,
+}
+
+impl CheckError {
+    /// Is this about the counters (used, live) rather than the list itself?
+    /// Mid-update or after a free with the wrong `Layout`, the counters can
+    /// be off while the list is intact.
+    pub fn is_accounting(&self) -> bool {
+        matches!(self, CheckError::UsedExceedsSize { .. } | CheckError::Accounting { .. } | CheckError::Leaked { .. })
+    }
 }
 
 impl fmt::Display for CheckError {
@@ -164,6 +184,7 @@ impl fmt::Display for CheckError {
             CheckError::Accounting { listed, expected } => {
                 write!(f, "free list holds {listed:#x} bytes, expected {expected:#x}")
             }
+            CheckError::UsedExceedsSize { used, size } => write!(f, "{used:#x} bytes used of {size:#x}"),
             CheckError::Leaked { used } => write!(f, "{used:#x} bytes used with nothing allocated"),
             CheckError::TooManyBlocks => f.write_str("walk stopped: too many blocks"),
         }
@@ -251,12 +272,12 @@ impl Heap {
             last = cur;
             cur = self.free_node(cur).next;
         }
-        if last != NIL && last + self.free_node(last).size == end {
-            let n = self.free_node(last);
-            self.set(last, Node { size: n.size + len, ..n });
-        } else {
-            self.set(end, Node { size: len, next: NIL });
-            self.link(last, end);
+        match (last != NIL).then(|| self.free_node(last)) {
+            Some(n) if last + n.size == end => self.set(last, Node { size: n.size + len, ..n }),
+            _ => {
+                self.set(end, Node { size: len, next: NIL });
+                self.link(last, end);
+            }
         }
     }
 
@@ -328,11 +349,12 @@ impl Heap {
     pub unsafe fn dealloc(&mut self, ptr: NonNull<u8>, layout: Layout) -> Result<(), FreeError> {
         let base = self.base.ok_or(FreeError::OutsideHeap)?;
         let size = block_size(layout).ok_or(FreeError::NotAllocated)?;
-        let off = ptr.addr().get().checked_sub(base.addr().get()).ok_or(FreeError::OutsideHeap)?;
+        let addr = ptr.addr().get();
+        let off = addr.checked_sub(base.addr().get()).ok_or(FreeError::OutsideHeap)?;
         if off.checked_add(size).is_none_or(|end| end > self.len) {
             return Err(FreeError::OutsideHeap);
         }
-        if !off.is_multiple_of(GRANULE) || !ptr.addr().get().is_multiple_of(layout.align()) {
+        if !off.is_multiple_of(GRANULE) || !addr.is_multiple_of(layout.align()) {
             return Err(FreeError::Misaligned);
         }
         let (mut prev, mut cur) = (NIL, self.head);
@@ -342,13 +364,15 @@ impl Heap {
         // Overlapping the free block below (it may have absorbed this one
         // when its neighbour was freed) or the one above.
         let before = (prev != NIL).then(|| self.free_node(prev));
-        if before.is_some_and(|p| prev + p.size > off) || (cur != NIL && off + size > cur) {
+        let overlaps_below = before.is_some_and(|p| prev + p.size > off);
+        let overlaps_above = cur != NIL && off + size > cur;
+        if overlaps_below || overlaps_above {
             return Err(FreeError::NotAllocated);
         }
-        // Unreachable while the invariants hold (a block that overlaps no
-        // free memory lies in used bytes); a guard against bad counters.
+        // A block that overlaps nothing free lies in used bytes, so this
+        // fails only after an earlier free with a smaller layout.
         let (Some(used), Some(live)) = (self.used.checked_sub(size), self.live.checked_sub(1)) else {
-            return Err(FreeError::NotAllocated);
+            return Err(FreeError::Accounting);
         };
         let (size_merged, next) = if cur != NIL && off + size == cur {
             let n = self.free_node(cur);
@@ -380,6 +404,10 @@ impl Heap {
     /// [`Heap::check`], giving up after `max_blocks` blocks (for the crash
     /// reporter, which must finish quickly).
     pub fn check_bounded(&self, max_blocks: usize) -> Result<FreeList, CheckError> {
+        // First, so a walk that stops early can't hide it.
+        let Some(expected) = self.len.checked_sub(self.used) else {
+            return Err(CheckError::UsedExceedsSize { used: self.used, size: self.len });
+        };
         let mut list = FreeList::default();
         let mut prev_end = None;
         let mut cur = self.head;
@@ -391,7 +419,7 @@ impl Heap {
                 return Err(CheckError::BadLink { offset: cur });
             }
             let n = self.node(cur);
-            if n.size == 0 || !n.size.is_multiple_of(GRANULE) || n.size > self.len - cur {
+            if !self.fits(cur, n.size) {
                 return Err(CheckError::BadSize { offset: cur, size: n.size });
             }
             match prev_end {
@@ -405,9 +433,8 @@ impl Heap {
             list.largest = list.largest.max(n.size);
             cur = n.next;
         }
-        let expected = self.len.checked_sub(self.used);
-        if expected != Some(list.bytes) {
-            return Err(CheckError::Accounting { listed: list.bytes, expected: expected.unwrap_or(0) });
+        if list.bytes != expected {
+            return Err(CheckError::Accounting { listed: list.bytes, expected });
         }
         if self.live == 0 && self.used != 0 {
             return Err(CheckError::Leaked { used: self.used });
@@ -415,14 +442,21 @@ impl Heap {
         Ok(list)
     }
 
+    /// Does a free block of `size` at `off` (already known to be inside the
+    /// span) hold whole granules, at least one, and end inside the span?
+    fn fits(&self, off: usize, size: usize) -> bool {
+        size != 0 && size.is_multiple_of(GRANULE) && size <= self.len - off
+    }
+
     /// The free block at `off`, checked as the walks need it: inside the
-    /// span, and linking to a block above its end (or nowhere). A corrupt
-    /// list is then a panic, never a stray access or an endless walk.
+    /// span, and linking to a granule above its end and inside the span (or
+    /// nowhere). A corrupt link is then a panic here, naming the block that
+    /// holds it, never a stray access or an endless walk.
     fn free_node(&self, off: usize) -> Node {
         let n = self.node(off);
-        let ends_inside = n.size >= GRANULE && n.size.is_multiple_of(GRANULE) && n.size <= self.len - off;
+        let link_ok = n.next == NIL || (n.next.is_multiple_of(GRANULE) && n.next < self.len);
         assert!(
-            ends_inside && (n.next == NIL || n.next > off + n.size),
+            self.fits(off, n.size) && link_ok && (n.next == NIL || n.next > off + n.size),
             "heap free list corrupt at offset {off:#x} (size {:#x}, next {:#x})",
             n.size,
             n.next
