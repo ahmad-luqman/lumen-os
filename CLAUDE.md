@@ -32,7 +32,8 @@ and keeps the re-run's artifacts apart in `build/test-artifacts-tcg/` via
 `LUMEN_ARTIFACTS_DIR`).
 
 Prerequisites: rustup (the toolchain installs itself from
-`rust-toolchain.toml`), `qemu-system-x86_64`, `xorriso`, `uv`, `make`, `curl`.
+`rust-toolchain.toml`), `qemu-system-x86_64`, `xorriso`, `uv`, `make`, `curl`, and `gdb` for `make debug`
+(its scenario is skipped without it).
 
 ## Hard rules
 
@@ -119,7 +120,10 @@ own PR that updates that doc first.
 
 ## Map
 
-- `kernel/src/main.rs`: boot sequence. `arch/x86_64/`: GDT/TSS, IDT, entry
+- `kernel/src/main.rs`: boot sequence. `boot.rs`: the Limine requests.
+  `cmdline.rs`: kernel command line (flags and `key=value`, e.g.
+  `lumen.log=debug`). `sync.rs`: `SpinLock` (interrupts off while held).
+  `arch/x86_64/`: GDT/TSS, IDT, entry
   stubs and the vector map, `irq.rs` (nested interrupt disable), local and
   I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
   reporter. `ktest.rs`: test runner. `kmon.rs`: serial debug monitor (until
