@@ -34,9 +34,14 @@ dependencies = [
  "limine",
  "log",
  "lumen-elf",
+ "lumen-mm",
  "noto-sans-mono-bitmap",
  "rustc-demangle",
 ]
+
+[[package]]
+name = "lumen-mm"
+version = "0.0.1"
 
 [[package]]
 name = "noto-sans-mono-bitmap"

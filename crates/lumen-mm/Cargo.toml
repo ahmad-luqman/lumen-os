@@ -1,0 +1,9 @@
+[package]
+name = "lumen-mm"
+description = "no_std physical frame allocator logic (bitmap) for the Lumen kernel, host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

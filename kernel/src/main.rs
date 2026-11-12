@@ -19,6 +19,7 @@ mod klog;
 #[cfg_attr(feature = "ktest", allow(dead_code))] // replaced by the test runner
 mod kmon;
 mod ktest;
+mod mm;
 mod symbols;
 mod sync;
 
@@ -76,6 +77,7 @@ extern "C" fn kmain(stack_top: u64) -> ! {
         info!(target: "boot", "hhdm offset {:#x}", hhdm.offset());
     }
     log_memory_map();
+    mm::init();
 
     match boot::FRAMEBUFFER.get_response().and_then(|r| r.framebuffers().next()) {
         Some(fb) => match fb::init(&fb) {
@@ -128,7 +130,7 @@ fn log_memory_map() {
 /// The bytes of a file Limine loaded for us.
 fn file_bytes(file: &limine::file::File) -> &'static [u8] {
     // SAFETY: Limine maps the file in the HHDM for the life of the kernel
-    // (bootloader-reclaimable memory, which we never reclaim in M0).
+    // (bootloader-reclaimable memory, which the frame allocator keeps reserved).
     unsafe { core::slice::from_raw_parts(file.addr(), file.size() as usize) }
 }
 

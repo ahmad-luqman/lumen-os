@@ -78,7 +78,8 @@ tests (for example `lumen-elf`, the symbol-table reader).
    #DF, NMI, #MC), then the IDT with all 256 vectors. **From this point any CPU
    exception produces a crash report.**
 5. Logger (level from `lumen.log=`), Limine responses checked, the symbol table
-   located in our own ELF, a memory-map summary, the framebuffer hello screen,
+   located in our own ELF, a memory-map summary, the frame allocator
+   (`INFO  mem: frames: N usable, M reserved`), the framebuffer hello screen,
    then `boot complete`.
 6. Either the in-kernel test runner (`--features ktest`) or the kernel monitor
    (`kmon`, a serial debug console that the user-mode shell replaces in M2).
@@ -104,16 +105,31 @@ The kernel is linked at -2 GiB because the **kernel code model** requires it
 (all symbols fit in sign-extended 32-bit immediates). `make audit` verifies
 this along with the absence of SSE/AVX and red-zone use (hard rule 3).
 
-### Physical memory (M1)
+### Physical memory (built in M1)
 
-The frame allocator is built only from Limine's memory map. Only `usable`
+The frame allocator (`kernel/src/mm/frame.rs`, logic in the host-tested
+`crates/lumen-mm`) is built only from Limine's memory map. Only `usable`
 regions are handed out. These are **explicitly reserved even if Limine labels
-them usable or reclaimable**: the kernel image, the boot stack, page tables
-in use, the framebuffer, ACPI tables (until parsed), the kernel ELF file
-(the symbol table lives in it), and the frame-allocator bitmap itself. An
-in-kernel test allocates every frame and asserts that none overlaps a reserved
-range (hard rule 2). Bootloader-reclaimable memory is returned only after
-everything in it has been copied or is no longer used.
+them usable or reclaimable**, found by translating live virtual addresses
+through the page tables rather than trusting the map's labels: frame 0, the
+kernel image, the kernel ELF file (the symbol table lives in it), the boot
+stack, the framebuffer, the ACPI RSDP, and the allocator's own bitmaps. Every
+non-usable map entry (including the ACPI tables) and every frame of the active
+page tables is reserved too. The named list is logged at `debug` level.
+
+It is a bitmap allocator with two bits per 4 KiB frame (64 KiB per GiB):
+*owned* (usable and not reserved) and *free*. The owned bit lets `free` reject
+a frame it never handed out (a reserved frame, a non-RAM address, a double
+free) instead of adding it to the pool. Single frames come from a word scan
+starting at a lowest-free hint; contiguous runs from a linear scan. A buddy
+allocator can replace it behind the same interface if contiguous allocation
+becomes hot.
+
+An in-kernel test allocates every frame, checks each against the memory map
+and the reservation list, checks independently (by walking the page tables)
+that nothing behind a live mapping is allocatable, fills every frame, and then
+frees them all (hard rule 2). Bootloader-reclaimable memory is returned only
+after everything in it has been copied or is no longer used.
 
 **Temporary exception (M0):** the boot stack (128 KiB from Limine) and the
 three 16 KiB IST stacks are static and have no guard pages, because there is no

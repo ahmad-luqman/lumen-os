@@ -115,7 +115,10 @@ own PR that updates that doc first.
   stubs, serial, IST stacks. `crash.rs`: crash reporter. `ktest.rs`: test
   runner. `kmon.rs`: serial debug monitor (until the M2 shell). `fb.rs`:
   framebuffer and console. `klog.rs`: logger. `symbols.rs`: symbol lookup.
+  `mm/frame.rs`: physical frame allocator and its reservations.
+  `arch/x86_64/paging.rs`: read-only page-table walks.
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
+- `crates/lumen-mm`: frame-allocator logic (bitmap; host-tested).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
   are built), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`.
 - `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests.

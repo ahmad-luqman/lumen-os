@@ -12,5 +12,5 @@ pub use self::x86_64::{
     cpu::{halt_forever, rdtsc, read_cr0, read_cr2, read_cr3, read_cr4, read_rbp, read_rsp},
     gdt, idt,
     idt::TrapFrame,
-    init_early, qemu, serial, stacks,
+    init_early, paging, qemu, serial, stacks,
 };
