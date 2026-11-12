@@ -6,6 +6,8 @@
 pub mod frame;
 pub mod heap;
 pub mod paging;
+pub mod stack;
+mod window;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -69,10 +71,13 @@ struct LiveRange {
     optional: bool,
     /// The kernel writes it, so it must stay writable.
     written: bool,
+    /// Backed by frames the allocator handed out (an allocated stack), which
+    /// must never be free; otherwise by frames the allocator must never own.
+    allocated: bool,
 }
 
 const fn live(name: &'static str, range: Option<(u64, u64)>, optional: bool, written: bool) -> LiveRange {
-    LiveRange { name, range, optional, written }
+    LiveRange { name, range, optional, written, allocated: false }
 }
 
 /// The virtual ranges the kernel is known to depend on (the memory map's
@@ -94,7 +99,11 @@ fn live_ranges() -> [LiveRange; 8] {
     [
         live(frame::KERNEL_IMAGE, Some(kernel_image()), false, false),
         live(frame::BOOT_STACK, (stack_hi > stack_lo).then_some((stack_lo, stack_hi - stack_lo)), false, true),
-        live("current stack page", Some((arch::read_rsp(), 1)), false, true),
+        LiveRange {
+            // On the boot stack until `kmain` switches to an allocated one.
+            allocated: arch::stacks::REGISTRY.contains(arch::read_rsp(), 1),
+            ..live("current stack page", Some((arch::read_rsp(), 1)), false, true)
+        },
         live(frame::KERNEL_FILE, file, true, false),
         live(frame::FRAMEBUFFER, frame::framebuffer_virt(), true, true),
         live(frame::BITMAP, bitmap, false, true),

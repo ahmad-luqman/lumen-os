@@ -1,40 +1,23 @@
 //! Known kernel stacks.
 //!
-//! Hard rule 4 says every stack comes from the allocator with a guard page
-//! below it. Until #6 (which needs the frame allocator and the page tables
-//! of #4), the boot stack (provided by Limine) and the three IST stacks below
-//! are a **documented temporary exception**: they have no guard pages.
+//! Every stack the kernel runs on after `mm::init` comes from the allocator
+//! with an unmapped guard page below it (hard rule 4; [`crate::mm::stack`])
+//! and is listed in [`REGISTRY`]. The one exception is the stack Limine
+//! booted us on, used until `kmain` switches to an allocated one; it is
+//! recorded here ([`set_boot_stack`]) so a crash before the switch, or a
+//! backtrace reaching back into `kmain`, can still be walked.
 //!
-//! The crash reporter also uses this registry: a frame pointer is only
-//! followed if it points into one of these ranges, so a corrupted `rbp` can't
-//! make the backtrace fault.
+//! The crash reporter uses this module lock-free: a frame pointer is only
+//! followed if it points into a known stack ([`contains`]), so a corrupted
+//! `rbp` can't make the backtrace fault, and a fault in a guard page is
+//! named as a stack overflow ([`guard_hit`]).
 
-use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub const IST_STACK_SIZE: usize = 16 * 1024;
+use lumen_mm::stacks::{Hit, Registered, Registry};
 
-#[repr(C, align(16))]
-pub struct StaticStack(UnsafeCell<[u8; IST_STACK_SIZE]>);
-
-// SAFETY: the memory is only used as a CPU stack, never accessed via `&`.
-unsafe impl Sync for StaticStack {}
-
-impl StaticStack {
-    const fn new() -> Self {
-        Self(UnsafeCell::new([0; IST_STACK_SIZE]))
-    }
-    pub fn bottom(&self) -> u64 {
-        self.0.get() as u64
-    }
-    pub fn top(&self) -> u64 {
-        self.bottom() + IST_STACK_SIZE as u64
-    }
-}
-
-pub static DOUBLE_FAULT: StaticStack = StaticStack::new();
-pub static NMI: StaticStack = StaticStack::new();
-pub static MACHINE_CHECK: StaticStack = StaticStack::new();
+/// The allocated kernel stacks.
+pub static REGISTRY: Registry = Registry::new();
 
 static BOOT_STACK_TOP: AtomicU64 = AtomicU64::new(0);
 static BOOT_STACK_BOTTOM: AtomicU64 = AtomicU64::new(0);
@@ -52,15 +35,31 @@ pub fn boot_stack() -> (u64, u64) {
     (BOOT_STACK_BOTTOM.load(Ordering::Relaxed), BOOT_STACK_TOP.load(Ordering::Relaxed))
 }
 
-/// Is `[addr, addr + len)` entirely inside one known stack?
+/// Is `[addr, addr + len)` entirely inside one known stack (the boot stack
+/// or a registered one)?
 pub fn contains(addr: u64, len: u64) -> bool {
     let Some(end) = addr.checked_add(len) else { return false };
-    let boot = (BOOT_STACK_BOTTOM.load(Ordering::Relaxed), BOOT_STACK_TOP.load(Ordering::Relaxed));
-    let ranges = [
-        boot,
-        (DOUBLE_FAULT.bottom(), DOUBLE_FAULT.top()),
-        (NMI.bottom(), NMI.top()),
-        (MACHINE_CHECK.bottom(), MACHINE_CHECK.top()),
-    ];
-    ranges.iter().any(|&(lo, hi)| lo != 0 && addr >= lo && end <= hi)
+    let (lo, hi) = boot_stack();
+    (lo != 0 && addr >= lo && end <= hi) || REGISTRY.contains(addr, len)
+}
+
+/// The `(bottom, top)` of the known stack (the boot stack or a registered
+/// one) that `addr` is in, if any.
+pub fn bounds_of(addr: u64) -> Option<(u64, u64)> {
+    let (lo, hi) = boot_stack();
+    if lo != 0 && (lo..hi).contains(&addr) {
+        return Some((lo, hi));
+    }
+    match REGISTRY.find(addr) {
+        Some(Hit::Stack(r)) => Some((r.range.bottom, r.range.top)),
+        _ => None,
+    }
+}
+
+/// The registered stack whose guard page `addr` is in, if any.
+pub fn guard_hit(addr: u64) -> Option<Registered> {
+    match REGISTRY.find(addr) {
+        Some(Hit::Guard(r)) => Some(r),
+        _ => None,
+    }
 }

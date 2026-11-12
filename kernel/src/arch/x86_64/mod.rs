@@ -20,3 +20,17 @@ pub fn init_early() {
     gdt::init();
     idt::init();
 }
+
+/// Make the double-fault, NMI and machine-check handlers run on their own
+/// stacks (TSS first, then the IDT, so no gate ever names an empty slot).
+///
+/// # Safety
+/// Each top is the top of a mapped stack that is never freed and nothing
+/// else uses; one CPU, interrupts off.
+pub unsafe fn install_ist_stacks(double_fault: u64, nmi: u64, machine_check: u64) {
+    // SAFETY: upheld by the caller.
+    unsafe {
+        gdt::set_ist_stacks(double_fault, nmi, machine_check);
+        idt::use_ist_stacks();
+    }
+}

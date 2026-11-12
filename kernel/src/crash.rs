@@ -154,6 +154,21 @@ fn write_exception(w: &mut dyn Write, f: &TrapFrame, cr2: u64) {
         let _ = writeln!(w, "  {}", PageFaultCause(f.error_code));
         let _ = writeln!(w, "  faulting address (cr2): {cr2:#018x}");
     }
+    // An overflow faults in the guard page; the #PF can't be delivered on
+    // the full stack, so it usually arrives as a #DF (on its IST stack) with
+    // CR2 still in the guard page.
+    if (f.vector == 14 || f.vector == 8)
+        && let Some(r) = arch::stacks::guard_hit(cr2)
+    {
+        let _ = writeln!(
+            w,
+            "kernel stack overflow (guard page hit): cr2 {cr2:#018x} is in the guard page below the {} stack \
+             [{:#x}, {:#x})",
+            r.kind.name(),
+            r.range.bottom,
+            r.range.top
+        );
+    }
     let _ = writeln!(w, "rip: {:#018x} <{}>", f.rip, Symbolized(f.rip));
     let _ = writeln!(w, "rsp: {:#018x}  rflags: {:#010x}  cs: {:#06x}  ss: {:#06x}", f.rsp, f.rflags, f.cs, f.ss);
     let regs = [
@@ -238,8 +253,12 @@ fn write_backtrace(w: &mut dyn Write, rip: Option<u64>, mut rbp: u64) -> fmt::Re
         // call at the very end of a function still names that function.
         writeln!(w, "  #{n:<2} {ret:#018x} <{}>", Symbolized(ret - 1))?;
         n += 1;
-        if next <= rbp {
-            break; // frames must move toward the stack top
+        // Frames move toward the top of their stack; the one link that may
+        // go elsewhere is into another known stack (the main stack's first
+        // frame links back into `kmain` on the boot stack). MAX_FRAMES
+        // bounds the walk either way.
+        if next <= rbp && arch::stacks::bounds_of(next) == arch::stacks::bounds_of(rbp) {
+            break;
         }
         rbp = next;
     }

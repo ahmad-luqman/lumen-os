@@ -57,3 +57,17 @@ tests = [
     "scenario:test_mm::test_corrupt_free_list_is_a_crash_not_a_hang",
     "scenario:test_crash::test_page_fault_report_names_address_and_cause",
 ]
+
+[[feature]]
+name = "Kernel stacks from the allocator with guard pages (main and IST stacks, no static stacks); an overflow is reported as one"
+milestone = "M1"
+tests = [
+    "cargo:lumen-mm",
+    "ktest:lumen_kernel::mm::stack::guard_page_unmapped",
+    "ktest:lumen_kernel::mm::stack::ist_stacks_are_guarded",
+    "ktest:lumen_kernel::mm::stack::kernel_runs_on_a_guarded_main_stack",
+    "ktest:lumen_kernel::mm::paging::hhdm_maps_exactly_the_hhdm_types",
+    "ktest:lumen_kernel::mm::frame::live_memory_oracle_detects_a_leak",
+    "scenario:test_mm::test_stack_overflow_hits_guard",
+    "scenario:test_crash::test_fault_produces_symbolized_report[*]",
+]

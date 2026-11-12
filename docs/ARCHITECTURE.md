@@ -74,15 +74,19 @@ tests (for example `lumen-elf`, the symbol-table reader).
    answers our requests (`kernel/src/boot.rs`), and jumps to `_start`.
 3. **`_start`** (naked asm): `xor ebp, ebp` ends the backtrace chain, the stack
    top is passed to `kmain`, and the stack is aligned.
-4. **`arch::init_early`**: COM1 serial, then the GDT and TSS (IST stacks for
-   #DF, NMI, #MC), then the IDT with all 256 vectors. **From this point any CPU
-   exception produces a crash report.**
+4. **`arch::init_early`**: COM1 serial, then the GDT and TSS, then the IDT
+   with all 256 vectors. **From this point any CPU exception produces a crash
+   report.** (#DF, NMI and #MC get their IST stacks in step 6.)
 5. Logger (level from `lumen.log=`), Limine responses checked, the symbol table
    located in our own ELF, a memory-map summary, the frame allocator
    (`INFO  mem: frames: N usable, M reserved`), the kernel's own page tables
    (`INFO  mem: paging: kernel page tables active ...`; Limine's are no longer
-   used after this), the framebuffer hello screen, then `boot complete`.
-6. Either the in-kernel test runner (`--features ktest`) or the kernel monitor
+   used after this) and the heap.
+6. Kernel stacks from the allocator, each with a guard page: the three IST
+   stacks are installed, then `kmain` switches from Limine's boot stack to
+   the 128 KiB main stack (`INFO  mem: stacks: ...`) and continues in
+   `kmain_on_kernel_stack`: the framebuffer hello screen, then `boot complete`.
+7. Either the in-kernel test runner (`--features ktest`) or the kernel monitor
    (`kmon`, a serial debug console that the user-mode shell replaces in M2).
 
 Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
@@ -97,7 +101,7 @@ Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 | `0x0000_0000_0000_0000 – 0x0000_7fff_ffff_ffff` | empty in the kernel's tables (null guard); user space, per process, from M2 (except the first 64 KiB) | built (empty) |
 | `0xffff_8000_0000_0000 – +phys size` | higher-half direct map (HHDM) of RAM: usable, bootloader-reclaimable, kernel-and-modules and framebuffer entries; NX, RW- except kernel-and-modules (R--), framebuffer write-combining | built |
 | `0xffff_c000_0000_0000 – 0xffff_c0ff_ffff_ffff` | kernel heap (grows up by mapping frames, to 1 GiB below the top; the top GiB holds a ktest scratch page) | built |
-| `0xffff_d000_0000_0000 – 0xffff_d0ff_ffff_ffff` | kernel stacks: 64 KiB each, **unmapped guard page below every stack** | M1 (#6) |
+| `0xffff_d000_0000_0000 – 0xffff_d0ff_ffff_ffff` | kernel stacks: 64 KiB (the main stack 128 KiB), **unmapped guard page below every stack**; the top GiB holds a ktest page | built |
 | `0xffff_e000_0000_0000 – 0xffff_e0ff_ffff_ffff` | MMIO mappings (uncached, RW-), `map_mmio` | built |
 | `0xffff_ffff_8000_0000 – end of image` | kernel image: `.text` R-X, `.rodata` (and `.got`) R--, `.data/.bss` RW-, page-aligned segments | built |
 
@@ -197,7 +201,7 @@ is what the CPU enforces; `Attrs` can't express a writable and executable
 page. The kernel API:
 
 - `map`/`unmap` (`unsafe`): 4 KiB pages for the owners of the heap and stack
-  windows (the heap; stacks, #6). The caller promises it owns the frame and the page and
+  windows (the heap and the kernel stacks). The caller promises it owns the frame and the page and
   that nothing refers through a page it unmaps; the functions refuse what
   they can check (addresses outside those windows, frames nobody allocated,
   non-write-back or executable rights, since allocator frames are writable
@@ -220,10 +224,36 @@ The kernel's upper-half entries are not yet shared with anything; processes
 (M2) will need the kernel's L4 entries 256-511 copied into every address
 space, so new kernel L3 tables must be allocated up front then.
 
-**Temporary exception (until #6):** the boot stack (128 KiB requested from
-Limine; 64 KiB assumed if it doesn't confirm) and the three 16 KiB IST stacks
-are static and have no guard pages. Guard pages need the frame allocator and
-our own page tables (#4); #6 replaces them (hard rule 4).
+### Kernel stacks (built in M1)
+
+Every stack the kernel runs on after `mm::init` comes from the allocator
+(`kernel/src/mm/stack.rs`; layout and registry in the host-tested
+`lumen_mm::stacks`). `KernelStack::new` takes addresses from the stack
+window, upward, with an unmapped guard page below each stack (so the page
+above a stack is the next one's guard), maps fresh frames there (RW, NX,
+write-back; all or nothing, shared with the heap in `mm/window.rs`) and
+registers the stack. Dropping one retracts it from the registry, then
+unmaps it and frees its frames; addresses are never reused. Stacks the CPU
+points at are leaked so they can't be dropped.
+
+Boot: the IDT starts with every vector on the current stack. Right after
+`mm::init`, `kmain` allocates the 64 KiB #DF, NMI and #MC stacks, puts them in
+the TSS's IST and only then makes those three gates use them, allocates the
+128 KiB main stack and switches to it (`arch::switch_stack`), which plants a
+frame record so backtraces run from the new stack back into `kmain` and
+`_start` on the old one. Limine's boot stack (128 KiB requested, 64 KiB
+assumed if it doesn't confirm) stays reserved and registered for that walk
+but is never run on again. Until the switch it is the one stack without a
+guard page, and a #DF with a broken `rsp` before then is a triple fault
+instead of a report.
+
+The registry (lock-free, 32 slots) is what the crash reporter trusts: a
+frame pointer is followed only into a known stack, frames move toward the top
+of their stack except for one link into another known stack, and a #PF or
+#DF whose CR2 is in a guard page is reported as `kernel stack overflow (guard
+page hit)` with the stack's name and bounds. Every function carries inline
+stack probes (`make audit` checks), so a frame bigger than a page can't jump
+over a guard page.
 
 ### Kernel heap (built in M1)
 
@@ -278,8 +308,10 @@ handlers must not allocate yet.
   calls `lumen_exception_dispatch`.
 - `#BP` is counted and resumes (a ktest proves registers survive the round
   trip). Every other vector is fatal in M0 and goes to `crash::exception`.
-- #DF, NMI and #MC run on IST stacks, so a corrupted kernel stack still yields
-  a report.
+- #DF, NMI and #MC run on their own guarded IST stacks (from step 6 of the
+  boot, before that on the boot stack), so a corrupted or overflowed kernel
+  stack still yields a report; an overflow is named as one (section 5,
+  "Kernel stacks").
 - **Crash report:** exception name and vector, decoded #PF error code and CR2,
   rip with symbol, all registers, CR0/3/4, a frame-pointer backtrace, then on
   serial only the last trace events, for a #PF the page-table walk of CR2,
@@ -580,12 +612,12 @@ TCG before uploading.
 
 ```
 kernel/            the kernel (bin crate, x86_64-unknown-none)
-  src/arch/        HAL; x86_64/ has gdt, idt, serial, stacks, cpu, qemu, paging
+  src/arch/        HAL; x86_64/ has gdt, idt, serial, stacks (registry), cpu, qemu, paging
   src/boot.rs      Limine requests
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
   src/kmon.rs      serial debug monitor (until the M2 shell)
-  src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs)
+  src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs)
   linker.ld        layout at -2 GiB, .ktests section
 crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, ...)
 boot/limine.conf   bootloader config template

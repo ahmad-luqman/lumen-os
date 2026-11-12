@@ -48,7 +48,8 @@ Each rule exists because breaking it caused a real bug in v1.
 3. **Compiler flags are tested, not assumed.** `make audit` checks the built
    ELF and the LLVM IR. Never weaken it to make a build pass.
 4. **No fixed-address stacks.** Every stack comes from the allocator and has a
-   guard page. (Temporary exception: the boot stack and IST stacks, until #6.)
+   guard page (`mm::stack`). The only exception is early boot, which runs on
+   Limine's stack until `kmain` switches right after `mm::init`.
 5. **A real heap with working `free`**, plus in-kernel fragmentation and reuse
    tests.
 6. **Exception handling comes first.** GDT/IDT setup is the first thing
@@ -118,12 +119,15 @@ own PR that updates that doc first.
   framebuffer and console. `klog.rs`: logger. `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator and its reservations.
   `mm/heap.rs`: the `#[global_allocator]`, growing in the heap window.
+  `mm/stack.rs`: kernel stacks with guard pages; `arch/x86_64/stacks.rs`
+  holds their registry (backtraces, overflow reports).
   `mm/paging.rs`: the kernel's page tables (HHDM, W^X image, map/unmap,
   MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
   PAT. `trace.rs`: trace ring, event kinds, `ktrace!`.
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
-- `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, and the
-  page-table format and mapper (host-tested, incl. a model comparison).
+- `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, the
+  page-table format and mapper (host-tested, incl. a model comparison), and
+  the kernel-stack layout and lock-free stack registry.
 - `crates/lumen-heap`: heap allocator logic (address-ordered free list,
   coalescing; host-tested, incl. a randomized stress test against a shadow map).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads).

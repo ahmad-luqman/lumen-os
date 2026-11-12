@@ -117,8 +117,9 @@ def render(evaluated: list[tuple[dict, str]]) -> str:
         "",
         "## Known gaps (temporary exceptions to the hard rules)",
         "",
-        "- Rule 4 (stacks from the allocator with guard pages): the boot stack and",
-        "  the IST stacks are static and unguarded until the M1 allocator exists (#6).",
+        "- Rule 4 (stacks from the allocator with guard pages): early boot runs on",
+        "  Limine's stack, without a guard page, until `kmain` switches to an",
+        "  allocated one right after `mm::init`.",
         "",
     ]
     return "\n".join(lines)

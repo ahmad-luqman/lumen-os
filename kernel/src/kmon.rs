@@ -11,7 +11,7 @@ use core::fmt::Write;
 
 const PROMPT: &str = "kmon> ";
 /// What `crash <kind>` accepts.
-const CRASH_KINDS: &str = "pf ud de gp df wtext nx panic oom dfree heapcorrupt";
+const CRASH_KINDS: &str = "pf ud de gp df wtext nx panic oom dfree heapcorrupt stack";
 const MAX_LINE: usize = 128;
 
 pub fn run() -> ! {
@@ -126,6 +126,10 @@ fn crash(kind: &str) {
         "oom" => crash_out_of_memory(),
         "dfree" => crash_double_free(),
         "heapcorrupt" => crash_corrupt_heap(),
+        "stack" => {
+            let depth = recurse(0);
+            let _ = writeln!(serial::SerialWriter, "crash: recursion returned at depth {depth} (no guard page?)");
+        }
         _ => {
             let _ = writeln!(serial::SerialWriter, "crash: unknown kind '{kind}' ({CRASH_KINDS})");
         }
@@ -272,4 +276,18 @@ fn crash_corrupt_heap() {
         alloc::alloc::dealloc(b, layout);
     }
     let _ = writeln!(serial::SerialWriter, "crash: a corrupt free list went unnoticed");
+}
+
+/// Recurse without end: each call keeps a 256-byte frame live across the
+/// next call (not a tail call; `black_box` stops LLVM folding it into a
+/// loop), so the main stack runs into its guard page and the crash reporter
+/// names the overflow. The `u64::MAX` test never succeeds in practice.
+#[inline(never)]
+#[allow(unconditional_recursion)]
+fn recurse(depth: u64) -> u64 {
+    let frame = core::hint::black_box([depth; 32]);
+    if core::hint::black_box(depth) == u64::MAX {
+        return depth;
+    }
+    recurse(depth + 1) + frame[7]
 }

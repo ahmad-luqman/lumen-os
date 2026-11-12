@@ -147,24 +147,45 @@ struct IdtPointer {
 
 static mut IDT: [IdtEntry; 256] = [IdtEntry::MISSING; 256];
 
-/// Fill and load the IDT. Must run after [`gdt::init`] (the IST stacks).
+/// The vectors that run on their own IST stack, and their slots.
+const IST_VECTORS: [(usize, u8); 3] = [(2, gdt::IST_NMI), (8, gdt::IST_DOUBLE_FAULT), (18, gdt::IST_MACHINE_CHECK)];
+
+/// Fill and load the IDT. Must run after [`gdt::init`]. Every vector runs on
+/// the current stack until [`use_ist_stacks`].
 pub fn init() {
     let stubs = &raw const lumen_isr_stubs as u64;
     let idt = &raw mut IDT;
     // SAFETY: single-threaded early boot; the IDT is static and lives forever.
     unsafe {
         for vector in 0..256u64 {
-            let ist = match vector {
-                2 => gdt::IST_NMI,
-                8 => gdt::IST_DOUBLE_FAULT,
-                18 => gdt::IST_MACHINE_CHECK,
-                _ => 0,
-            };
-            (*idt)[vector as usize] = IdtEntry::interrupt_gate(stubs + vector * STUB_STRIDE, ist);
+            (*idt)[vector as usize] = IdtEntry::interrupt_gate(stubs + vector * STUB_STRIDE, 0);
         }
         let ptr = IdtPointer { limit: (size_of::<[IdtEntry; 256]>() - 1) as u16, base: idt as u64 };
         asm!("lidt [{}]", in(reg) &raw const ptr, options(readonly, nostack, preserves_flags));
     }
+}
+
+/// Make the NMI, double-fault and machine-check gates switch to their IST
+/// stacks.
+///
+/// # Safety
+/// [`gdt::set_ist_stacks`] has filled the slots with valid stacks; nothing
+/// else touches the IDT meanwhile (one CPU, interrupts off).
+pub unsafe fn use_ist_stacks() {
+    let idt = &raw mut IDT;
+    for (vector, slot) in IST_VECTORS {
+        // SAFETY: upheld by the caller; each write is one byte the CPU reads
+        // when it takes that vector, and the slot it names is filled.
+        unsafe { (*idt)[vector].ist = slot };
+    }
+}
+
+/// The IST slot vector `vector` switches to (0: none).
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by ktests
+pub fn ist_index(vector: usize) -> u8 {
+    let idt = &raw const IDT;
+    // SAFETY: a plain read of a static the kernel only writes during boot.
+    unsafe { (*idt)[vector].ist }
 }
 
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by ktests

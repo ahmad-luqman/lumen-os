@@ -156,3 +156,28 @@ def test_corrupt_free_list_is_a_crash_not_a_hang(crash_report):
     locked = r"^heap \(lock held; may be mid-update\): \d+ bytes mapped at 0xffffc00000000000, 64 used in 1 allocations"
     assert re.search(locked, report, re.MULTILINE), report
     assert "(free list broken: block at 0x0 is out of order or overlaps)" in report, report
+
+
+def test_stack_overflow_hits_guard(crash_report):
+    # Unbounded recursion on the main kernel stack runs into its guard page.
+    # The #PF can't be delivered on the full stack, so it arrives as a #DF on
+    # the double-fault IST stack, with cr2 still in the guard page: the report
+    # says so, and QEMU exits with the crash code (no reset, no triple fault).
+    report = crash_report("stack")
+    assert "exception: #DF double fault (vector 8, error code 0x0)" in report, report
+    overflow = re.search(
+        r"^kernel stack overflow \(guard page hit\): cr2 (0x[0-9a-f]{16}) is in the guard page below "
+        r"the kernel main stack \[(0x[0-9a-f]+), (0x[0-9a-f]+)\)$",
+        report,
+        re.MULTILINE,
+    )
+    assert overflow, report
+    cr2, bottom, top = (int(g, 16) for g in overflow.groups())
+    # The page directly below the stack, which is 128 KiB in the stack window.
+    assert bottom - 4096 <= cr2 < bottom and top - bottom == 128 * 1024, report
+    assert bottom >> 40 == 0xFFFFD0, report
+    rip = re.search(r"^rip: 0x[0-9a-f]{16} <(.+)>$", report, re.MULTILINE)
+    assert rip and "kmon::recurse" in rip.group(1), report
+    frames = backtrace(report)
+    assert all("kmon::recurse" in f for f in frames), report
+    assert len(frames) == 32, report  # the walker's frame limit: deep recursion
