@@ -20,8 +20,8 @@
 //! pointers fault.
 //!
 //! After that, [`map`] and [`unmap`] manage 4 KiB pages in the kernel heap
-//! and stack windows (for their owners: [`super::heap`] and the kernel
-//! stacks, #6), and [`map_mmio`] maps
+//! and stack windows (for their owners: [`super::heap`] and
+//! [`super::stack`]), and [`map_mmio`] maps
 //! device registers uncached in the MMIO window (ARCHITECTURE.md section 5).
 //! The format, walks and mapper are host-tested in `lumen_mm::paging`; this
 //! module gives them access to table frames through the HHDM ([`Hhdm`]).
@@ -54,12 +54,16 @@ const KERNEL_BASE: u64 = 0xffff_ffff_8000_0000;
 /// One TiB: the size of the heap, stack and MMIO windows.
 const WINDOW: u64 = 1 << 40;
 /// Base of the kernel heap window ([`super::heap`]). [`map`] and [`unmap`]
-/// work here and in the stacks window ([`STACKS_BASE`], #6).
+/// work here and in the stacks window ([`STACKS_BASE`]).
 pub const HEAP_BASE: u64 = 0xffff_c000_0000_0000;
 /// The heap grows up from [`HEAP_BASE`] and stops below this. The top GiB of
 /// the window is left for the paging ktests' scratch page.
 pub const HEAP_LIMIT: u64 = HEAP_BASE + WINDOW - (1 << 30);
-const STACKS_BASE: u64 = 0xffff_d000_0000_0000;
+/// Base of the kernel stack window ([`super::stack`]).
+pub const STACKS_BASE: u64 = 0xffff_d000_0000_0000;
+/// Kernel stacks are handed out up from [`STACKS_BASE`] and stop below this.
+/// The top GiB of the window is left for the paging ktests' stack page.
+pub const STACKS_LIMIT: u64 = STACKS_BASE + WINDOW - (1 << 30);
 /// Device mappings: [`map_mmio`] hands out addresses from here.
 const MMIO_BASE: u64 = 0xffff_e000_0000_0000;
 const MMIO_END: u64 = MMIO_BASE + WINDOW;
@@ -267,6 +271,18 @@ struct Need {
 
 const SAME_FRAME: Need = Need { write: false, exec: None, cache: None };
 
+/// Whether [`preflight_mismatch`] checks ranges on allocated stacks (the
+/// stack window, which a fresh [`build`] doesn't map). The real switch checks
+/// everything (the kernel is still on the boot stack then); only the ktest
+/// that plants faults in a fresh copy, running on the allocated main stack,
+/// skips them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunningStack {
+    Check,
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by a ktest
+    Skip,
+}
+
 /// Why the new tables don't give the kernel what it needs at `virt`.
 #[derive(Debug)]
 struct Mismatch {
@@ -278,7 +294,7 @@ struct Mismatch {
 
 /// The first place `new` doesn't map something the kernel is using like
 /// `old` does: the same frame, with the rights and memory type it needs.
-fn preflight_mismatch(old: PhysFrame, new: PhysFrame) -> Option<Mismatch> {
+fn preflight_mismatch(old: PhysFrame, new: PhysFrame, running: RunningStack) -> Option<Mismatch> {
     let check = |what: &'static str, virt: u64, need: Need| {
         let v = VirtAddr::new(virt).expect("live addresses are canonical");
         let (before, after) = (pt::walk(&Hhdm, old, v), pt::walk(&Hhdm, new, v));
@@ -293,6 +309,9 @@ fn preflight_mismatch(old: PhysFrame, new: PhysFrame) -> Option<Mismatch> {
         (!ok).then_some(Mismatch { what, virt: v, before: before.end(), after: after.end() })
     };
     for r in super::live_ranges() {
+        if r.allocated && running == RunningStack::Skip {
+            continue;
+        }
         let Some((start, len)) = r.range else {
             assert!(r.optional, "live range '{}' is missing (Limine response absent or empty)", r.name);
             debug!(target: "mem", "paging: no {}; nothing to check", r.name);
@@ -346,7 +365,7 @@ fn preflight_mismatch(old: PhysFrame, new: PhysFrame) -> Option<Mismatch> {
 /// better an assertion with a message than a fault with no stack right after
 /// the CR3 write.
 fn preflight(old: PhysFrame, new: PhysFrame) {
-    if let Some(m) = preflight_mismatch(old, new) {
+    if let Some(m) = preflight_mismatch(old, new, RunningStack::Check) {
         panic!(
             "{}: the kernel's page tables can't replace the boot ones at {} (boot: {:?}; new: {:?})",
             m.what, m.virt, m.before, m.after
@@ -520,6 +539,25 @@ pub fn for_each_active_table(f: impl FnMut(PhysFrame)) -> Result<usize, PhysFram
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: ktests; X-ray (M5)
 pub fn for_each_active_mapping(f: impl FnMut(Mapping)) -> Result<(), PhysFrame> {
     pt::for_each_mapping(&Hhdm, hw::active_root(), f)
+}
+
+/// A 4 KiB kernel page, read-write, no-execute, write-back, backed by an
+/// allocated frame: how the heap and the kernel stacks are mapped (ktests).
+#[cfg(feature = "ktest")]
+pub fn is_private_data_page(m: &Mapping) -> bool {
+    m.size == PageSize::Size4K
+        && m.writable
+        && !m.executable
+        && !m.user
+        && m.cache() == Some(Cache::WriteBack)
+        && frame::is_allocated(m.phys)
+}
+
+/// How many table frames the active hierarchy uses (ktests' frame
+/// accounting: tables are never freed).
+#[cfg(feature = "ktest")]
+pub fn active_table_count() -> Result<usize, &'static str> {
+    for_each_active_table(|_| {}).map_err(|_| "a page table is unreadable")
 }
 
 /// What a leaf allows, for humans: "read-only, executable".
@@ -728,7 +766,7 @@ crate::ktest!(
         kassert_eq!(freed_map, Err(VmError::NotAllocated(freed)));
         // The stack window works like the heap window.
         let stack_frame = frame::alloc().ok_or("out of frames")?;
-        let stack_page = v(STACKS_BASE + WINDOW - 2 * FRAME_SIZE);
+        let stack_page = v(STACKS_LIMIT);
         // SAFETY: the test owns `stack_frame` and this unused stack-window
         // page, and keeps no reference into it.
         let (stack_map, stack_unmap) = unsafe { (map(stack_page, stack_frame, Attrs::DATA), unmap(stack_page)) };
@@ -812,9 +850,10 @@ crate::ktest!(
 crate::ktest!(
     fn hhdm_maps_exactly_the_hhdm_types() {
         // Every mapping is the HHDM (inside an HHDM span, at phys == virt -
-        // hhdm), the kernel image, the MMIO window or the heap's mapped span
-        // (4 KiB pages, read-write, no-execute, write-back, allocated
-        // frames). Each HHDM span is mapped throughout (every 2 MiB step and
+        // hhdm), the kernel image, the MMIO window, the heap's mapped span or
+        // a registered kernel stack (4 KiB pages, read-write, no-execute,
+        // write-back, allocated frames); every stack's guard page is
+        // unmapped. Each HHDM span is mapped throughout (every 2 MiB step and
         // its last page) with its own rights and memory type. ACPI and
         // reserved memory are not mapped (spot check: each entry's first and
         // last whole page).
@@ -835,20 +874,20 @@ crate::ktest!(
             let in_hhdm = lo.checked_sub(hhdm).is_some_and(|p| {
                 p == m.phys.as_u64() && !m.executable && hhdm_spans().any(|(s, e, _)| s <= p && p + size <= e)
             });
-            let in_heap = heap.contains(&lo)
-                && m.size == PageSize::Size4K
-                && m.writable
-                && !m.executable
-                && m.cache() == Some(Cache::WriteBack)
-                && frame::is_allocated(m.phys);
+            let private_page = is_private_data_page(&m);
+            let in_heap = heap.contains(&lo) && private_page;
+            let in_stack = crate::arch::stacks::REGISTRY.contains(lo, size) && private_page;
             big += usize::from(in_hhdm && m.size == PageSize::Size2M);
-            if !in_hhdm && !in_image && !in_mmio && !in_heap {
+            if !in_hhdm && !in_image && !in_mmio && !in_heap && !in_stack {
                 stray.get_or_insert(m);
             }
         });
         drop(keep);
         kassert_eq!(swept, Ok(()));
         kassert_eq!(stray, None);
+        let stacks = || crate::arch::stacks::REGISTRY.iter();
+        kassert!(stacks().count() >= 4); // the main stack and three IST stacks
+        kassert!(stacks().all(|r| walk(v(r.range.guard())).mapping().is_none()));
         kassert!(big > 0); // 2 MiB pages are used where they fit
         let mut wrong = None;
         for (start, end, attrs) in hhdm_spans() {
@@ -1051,7 +1090,11 @@ crate::ktest!(
         use lumen_mm::paging::bits::{NO_EXECUTE, PCD, PWT, WRITABLE};
         let active = hw::active_root();
         let copy = build();
-        let what = |old| preflight_mismatch(old, copy).map(|m| m.what);
+        // This runs on the allocated main stack, which a fresh copy doesn't
+        // map: checked strictly, that is the first thing named; the planted
+        // faults are looked for with it skipped.
+        let strict = preflight_mismatch(active, copy, RunningStack::Check).map(|m| m.what);
+        let what = |old| preflight_mismatch(old, copy, RunningStack::Skip).map(|m| m.what);
         let clean = what(active);
         let [_, _, (_, kdata, _, _)] = kernel_segments();
         let ram = hhdm_spans().find(|&(_, _, a)| a == Attrs::DATA).ok_or("no usable memory")?.0;
@@ -1067,9 +1110,10 @@ crate::ktest!(
         let restored = what(active);
         let freed = free_tables(copy);
         let empty = frame::alloc_zeroed().ok_or("out of frames")?;
-        let nothing = preflight_mismatch(active, empty);
+        let nothing = preflight_mismatch(active, empty, RunningStack::Check);
         kassert_eq!(frame::free(empty), Ok(()));
         kassert_eq!(freed, Ok(()));
+        kassert_eq!(strict, Some("current stack page"));
         kassert_eq!(clean, None);
         kassert_eq!(planted, [Some("kernel data"), Some("kernel image (boot mapping)"), Some("HHDM")]);
         kassert_eq!(restored, None);

@@ -69,6 +69,8 @@ RESULTS := $(BUILD)/test-results
 test-host: ## Host-side unit tests (Rust crates + harness self-tests)
 	@mkdir -p $(RESULTS) && rm -f $(RESULTS)/cargo.json $(RESULTS)/harness.xml
 	cargo test
+	# The stacks tests again, optimized: compiler-reordering mistakes in the seqlock are likelier to surface.
+	cargo test --release -p lumen-mm stacks
 	@printf '{%s}\n' "$$(ls crates | sed 's/.*/"&": true/' | paste -sd, -)" > $(RESULTS)/cargo.json
 	uv run --frozen pytest tests/harness -q --junitxml=$(RESULTS)/harness.xml
 
@@ -76,7 +78,7 @@ test-scenarios: iso ## Boot QEMU headless and run every scenario (incl. in-kerne
 	@mkdir -p $(RESULTS) && rm -f $(RESULTS)/scenarios.xml $(RESULTS)/ktest.tap
 	uv run --frozen pytest tests/scenarios -v --junitxml=$(RESULTS)/scenarios.xml
 
-audit: build ## Prove kernel codegen flags and image layout (no SSE/AVX, no red zone, kernel code model, sections in place)
+audit: build ## Prove kernel codegen flags and image layout (no SSE/AVX, no red zone, stack probes, kernel code model, sections in place)
 	@mkdir -p $(RESULTS) && rm -f $(RESULTS)/audit.json
 	$(HARNESS) audit $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest
 

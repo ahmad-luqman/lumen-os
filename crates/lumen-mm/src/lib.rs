@@ -1,6 +1,7 @@
 //! Memory-management logic for the Lumen kernel: the physical frame
 //! allocator (this module), typed addresses ([`PhysAddr`], [`PhysFrame`],
-//! [`VirtAddr`]) and the page-table format and mapper ([`paging`]).
+//! [`VirtAddr`]), the page-table format and mapper ([`paging`]) and the
+//! kernel-stack layout and registry ([`stacks`]).
 //!
 //! This crate is pure logic: it never touches hardware or dereferences a
 //! physical address, so all of it is tested on the host
@@ -54,6 +55,7 @@
 
 mod addr;
 pub mod paging;
+pub mod stacks;
 
 pub use addr::{PHYS_ADDR_BITS, PhysAddr, PhysFrame, VIRT_ADDR_BITS, VirtAddr};
 

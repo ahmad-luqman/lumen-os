@@ -25,6 +25,9 @@ Compiler checks (LLVM IR of the kernel crate, built separately):
   * Module flag "Code Model" == 2 (kernel).
   * Every function carries `noredzone`, `"frame-pointer"="all"` and target
     features that disable SSE/SSE2.
+  * Every function carries inline stack probes (`"probe-stack"="inline-asm"`):
+    a frame bigger than a page touches each page in turn, so it can't jump
+    over a stack's guard page (hard rule 4).
 """
 
 from __future__ import annotations
@@ -228,6 +231,10 @@ def check_ir(ir: str) -> list[Finding]:
         feat_set = set(feats.group(1).split(",")) if feats else set()
         if not {"-sse", "-sse2"} <= feat_set:
             findings.append(Finding("simd", f"attribute group {group} does not disable SSE/SSE2"))
+        if '"probe-stack"="inline-asm"' not in attrs:
+            findings.append(
+                Finding("stack-probe", f"attribute group {group} lacks inline stack probes")
+            )
     return findings
 
 

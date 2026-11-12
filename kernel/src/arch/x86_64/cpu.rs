@@ -99,3 +99,26 @@ macro_rules! write_cr {
 write_cr!(write_cr0, "cr0");
 write_cr!(write_cr3, "cr3");
 write_cr!(write_cr4, "cr4");
+
+/// Continue on another stack: point `rsp` at `top` and call `entry`, which
+/// never returns. A frame record (the caller's `rbp` and return address) is
+/// planted at the top of the new stack, so the frame-pointer chain runs from
+/// `entry` back into the caller's frames on the old stack and backtraces stay
+/// whole.
+///
+/// # Safety
+/// `top` is the 16-byte-aligned top of a mapped stack that nothing else uses
+/// and that is never freed; the old stack is never reused while that chain
+/// can still be walked.
+#[unsafe(naked)]
+pub unsafe extern "C" fn switch_stack(top: u64, entry: extern "C" fn() -> !) -> ! {
+    core::arch::naked_asm!(
+        "mov rax, [rsp]", // our return address, into the caller
+        "mov rsp, rdi",
+        "push rax", // frame record: return address ...
+        "push rbp", // ... and the caller's frame pointer
+        "mov rbp, rsp",
+        "call rsi", // rsp is 16-byte aligned here, as calls require
+        "ud2",
+    )
+}

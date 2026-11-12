@@ -57,3 +57,27 @@ tests = [
     "scenario:test_mm::test_corrupt_free_list_is_a_crash_not_a_hang",
     "scenario:test_crash::test_page_fault_report_names_address_and_cause",
 ]
+
+[[feature]]
+name = "Kernel stacks from the allocator with guard pages (main and IST stacks, no static stacks); a main-stack overflow is reported as one, a stray guard-page touch as that"
+milestone = "M1"
+tests = [
+    "cargo:lumen-mm",
+    "ktest:lumen_kernel::mm::stack::guard_page_unmapped",
+    "ktest:lumen_kernel::mm::stack::ist_stacks_are_guarded",
+    "ktest:lumen_kernel::mm::stack::kernel_runs_on_a_guarded_main_stack",
+    "ktest:lumen_kernel::mm::paging::hhdm_maps_exactly_the_hhdm_types",
+    "ktest:lumen_kernel::mm::frame::live_memory_oracle_detects_a_leak",
+    "scenario:test_mm::test_stack_overflow_hits_guard",
+    "scenario:test_mm::test_touching_a_guard_page_is_named",
+    "scenario:test_mm::test_big_frames_hit_the_guard_page_too",
+    "ktest:lumen_kernel::mm::stack::out_of_frames_is_an_error_that_leaves_nothing_behind",
+    "ktest:lumen_kernel::mm::window::window_errors_are_classified",
+    "ktest:lumen_kernel::crash::guard_hit_is_classified",
+    "ktest:lumen_kernel::crash::nested_crash_names_a_fresh_guard_hit_only",
+    "ktest:lumen_kernel::crash::backtrace_allows_one_stack_switch",
+    "ktest:lumen_kernel::mm::paging::preflight_detects_each_kind_of_mismatch",
+    "harness:test_audit::test_ir_missing_stack_probes",
+    "ktest:lumen_kernel::mm::stack::a_full_registry_leaves_nothing_behind",
+    "scenario:test_crash::test_fault_produces_symbolized_report[*]",
+]

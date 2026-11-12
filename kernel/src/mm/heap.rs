@@ -37,10 +37,13 @@ use core::ops::Range;
 use core::ptr::{self, NonNull};
 
 use lumen_heap::{CheckError, FreeList, Heap, Stats};
-use lumen_mm::paging::{Attrs, MapError};
-use lumen_mm::{FRAME_SIZE, VirtAddr};
+use lumen_mm::FRAME_SIZE;
+#[cfg(feature = "ktest")]
+use lumen_mm::paging::MapError;
 
-use super::{frame, paging};
+#[cfg(feature = "ktest")]
+use super::frame;
+use super::{paging, window};
 use crate::sync::SpinLock;
 
 /// The heap grows by its current size, at least this much when it can:
@@ -50,6 +53,10 @@ const MIN_GROWTH: u64 = 64 * 1024;
 /// ... and at most this much (unless a request needs more), so a heap that
 /// grew once and went quiet doesn't hold much it never uses.
 const MAX_GROWTH: u64 = 4 * 1024 * 1024;
+
+/// What the heap owns: its window minus the top GiB (the paging ktests'
+/// page).
+const OWNED: Range<u64> = paging::HEAP_BASE..paging::HEAP_LIMIT;
 
 /// How many free blocks the crash report walks before giving up, so it
 /// finishes quickly even with a huge, fragmented free list.
@@ -91,7 +98,7 @@ impl GrowError {
         match self {
             GrowError::WindowFull | GrowError::OutOfFrames => true,
             // A page table that couldn't get a frame is running out too.
-            GrowError::Map(e) => e == paging::VmError::Map(MapError::OutOfMemory),
+            GrowError::Map(e) => window::WindowError::Map(e).is_exhaustion(),
             // Allocating before `mm::init` is a bug.
             GrowError::NotReady => false,
         }
@@ -198,46 +205,22 @@ fn try_grow(heap: &mut Heap, layout: Layout) -> Result<(), GrowError> {
 }
 
 /// Map `bytes` (whole pages) of fresh frames at `end`, the heap's end. All
-/// or nothing: on failure every page mapped so far is unmapped and its frame
-/// freed (page tables created on the way stay; tables are never freed).
+/// or nothing ([`window::map_fresh`]).
 fn map_span(end: u64, bytes: u64) -> Result<(), GrowError> {
     if bytes > paging::HEAP_LIMIT - end {
         return Err(GrowError::WindowFull);
     }
-    for i in 0..bytes / FRAME_SIZE {
-        if let Err(e) = map_one(end + i * FRAME_SIZE) {
-            release(end, i, e);
-            return Err(e);
+    // SAFETY: the heap owns `[HEAP_BASE, HEAP_LIMIT)`, and nothing above its
+    // end is mapped or in use.
+    unsafe { window::map_fresh(&OWNED, end..end + bytes) }.map_err(GrowError::from)
+}
+
+impl From<window::WindowError> for GrowError {
+    fn from(e: window::WindowError) -> GrowError {
+        match e {
+            window::WindowError::OutOfFrames => GrowError::OutOfFrames,
+            window::WindowError::Map(e) => GrowError::Map(e),
         }
-    }
-    Ok(())
-}
-
-/// Map a fresh frame at `virt`, just above the heap's end.
-fn map_one(virt: u64) -> Result<(), GrowError> {
-    assert!((paging::HEAP_BASE..paging::HEAP_LIMIT).contains(&virt), "heap page {virt:#x} outside the heap");
-    let virt = VirtAddr::new(virt).expect("heap addresses are canonical");
-    let frame = frame::alloc().ok_or(GrowError::OutOfFrames)?;
-    // SAFETY: the frame was just allocated for the heap, and pages above the
-    // heap's end (below HEAP_LIMIT) are the heap's and unused.
-    if let Err(e) = unsafe { paging::map(virt, frame, Attrs::DATA) } {
-        frame::free(frame).unwrap_or_else(|fe| panic!("heap: freeing {frame} after `{e}` failed: {fe:?}"));
-        return Err(GrowError::Map(e));
-    }
-    Ok(())
-}
-
-/// Undo the first `pages` pages a [`map_span`] that failed with `cause`
-/// mapped above `end`.
-fn release(end: u64, pages: u64, cause: GrowError) {
-    for i in 0..pages {
-        let virt = VirtAddr::new(end + i * FRAME_SIZE).expect("heap addresses are canonical");
-        // SAFETY: `map_span` mapped this page a moment ago and nothing refers
-        // to it: the heap never got it.
-        let m = unsafe { paging::unmap(virt) }
-            .unwrap_or_else(|e| panic!("heap: rollback after `{cause}` failed to unmap {virt}: {e}"));
-        frame::free(m.phys)
-            .unwrap_or_else(|e| panic!("heap: rollback after `{cause}` failed to free {}: {e:?}", m.phys));
     }
 }
 
@@ -547,7 +530,7 @@ crate::ktest!(
         // below HEAP_LIMIT fails before touching anything.
         use crate::{kassert, kassert_eq};
         use alloc::vec::Vec;
-        let tables = || paging::for_each_active_table(|_| {}).map_err(|_| "unreadable table");
+        let tables = paging::active_table_count;
         let (free0, tables0, size0) = (frame::free_frames(), tables()?, stats().size);
         // `black_box`: LLVM may assume an allocation it can see through
         // succeeds, and skip it.
@@ -565,7 +548,7 @@ crate::ktest!(
         let end = mapped().end;
         let stray = (end..end + (free0 as u64 + 1) * FRAME_SIZE)
             .step_by(FRAME_SIZE as usize)
-            .find(|&page| paging::translate(VirtAddr::new(page).expect("canonical")).is_some());
+            .find(|&page| paging::translate(lumen_mm::VirtAddr::new(page).expect("canonical")).is_some());
         kassert_eq!(stray, None);
         let past_limit = (paging::HEAP_LIMIT - end + FRAME_SIZE) as usize;
         kassert!(v.try_reserve_exact(past_limit).is_err());

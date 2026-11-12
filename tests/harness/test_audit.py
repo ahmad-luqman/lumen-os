@@ -216,7 +216,7 @@ def test_unparseable_readobj_fails():
 IR_OK = """
 define void @f() unnamed_addr #0 {
 }
-attributes #0 = { noredzone nounwind "frame-pointer"="all" "target-features"="-mmx,-sse,-sse2,+soft-float" }
+attributes #0 = { noredzone nounwind "frame-pointer"="all" "probe-stack"="inline-asm" "target-features"="-mmx,-sse,-sse2,+soft-float" }
 !1 = !{i32 1, !"Code Model", i32 2}
 """
 
@@ -228,6 +228,15 @@ def test_ir_ok():
 def test_ir_missing_noredzone_and_sse_disable():
     bad = IR_OK.replace("noredzone ", "").replace("-sse,-sse2,", "")
     assert sorted(f.check for f in check_ir(bad)) == ["red-zone", "simd"]
+
+
+def test_ir_missing_stack_probes():
+    # Without probes a big frame can jump over a stack's guard page.
+    for bad in (
+        IR_OK.replace('"probe-stack"="inline-asm" ', ""),
+        IR_OK.replace("inline-asm", "__rust_probestack"),
+    ):
+        assert [f.check for f in check_ir(bad)] == ["stack-probe"]
 
 
 def test_ir_wrong_code_model():

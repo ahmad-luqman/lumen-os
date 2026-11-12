@@ -5,8 +5,12 @@
 //! expect (M2), and a TSS whose Interrupt Stack Table gives the double-fault,
 //! NMI and machine-check handlers known-good stacks. Without the IST a kernel
 //! stack overflow would triple-fault instead of producing a crash report.
+//!
+//! The IST stacks come from the allocator (`mm::stack`, with guard pages), so
+//! they are installed after `mm::init` ([`set_ist_stacks`], then
+//! `idt::use_ist_stacks`). Until then those three vectors run on the current
+//! (boot) stack.
 
-use super::stacks;
 use core::arch::asm;
 use core::mem::size_of;
 
@@ -63,18 +67,41 @@ static mut GDT: [u64; GDT_ENTRIES] = [
     0,                     // TSS high
 ];
 
+/// Point the TSS's IST slots at the tops of the double-fault, NMI and
+/// machine-check stacks. Only through `install_ist_stacks`, which then makes
+/// the IDT use them.
+///
+/// # Safety
+/// Each top is the top of a mapped stack that is never freed and that
+/// nothing else uses; nothing else touches the TSS meanwhile (one CPU).
+pub(super) unsafe fn set_ist_stacks(double_fault: u64, nmi: u64, machine_check: u64) {
+    let tss = &raw mut TSS_SEGMENT;
+    // SAFETY: upheld by the caller; the CPU reads the TSS only when it takes
+    // an interrupt that uses an IST slot, and the IDT doesn't use them yet.
+    unsafe {
+        (*tss).ist[usize::from(IST_DOUBLE_FAULT - 1)] = double_fault;
+        (*tss).ist[usize::from(IST_NMI - 1)] = nmi;
+        (*tss).ist[usize::from(IST_MACHINE_CHECK - 1)] = machine_check;
+    }
+}
+
+/// The stack top in IST slot `slot` (1-based), 0 if unset.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by ktests
+pub fn ist_top(slot: u8) -> u64 {
+    let tss = &raw const TSS_SEGMENT;
+    // SAFETY: a plain read of a field of a static the kernel only writes
+    // during boot (one CPU, interrupts off).
+    unsafe { (*tss).ist[usize::from(slot - 1)] }
+}
+
 /// Load the GDT and TSS and reload every segment register.
 ///
 /// Called once, very early, on the boot CPU.
 pub fn init() {
     let tss = &raw mut TSS_SEGMENT;
     // SAFETY: single-threaded early boot; nothing else touches the TSS or GDT
-    // yet, and the IST stacks are static and live forever.
+    // yet. The IST slots stay empty until `set_ist_stacks`.
     unsafe {
-        (*tss).ist[usize::from(IST_DOUBLE_FAULT - 1)] = stacks::DOUBLE_FAULT.top();
-        (*tss).ist[usize::from(IST_NMI - 1)] = stacks::NMI.top();
-        (*tss).ist[usize::from(IST_MACHINE_CHECK - 1)] = stacks::MACHINE_CHECK.top();
-
         let base = tss as u64;
         let limit = (size_of::<TaskStateSegment>() - 1) as u64;
         let low = (limit & 0xffff)

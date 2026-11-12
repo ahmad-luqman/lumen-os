@@ -400,15 +400,16 @@ mod checks {
 
     /// The first frame the kernel is using that may be handed out: a frame
     /// behind a live range ([`live_ranges`], found through the page tables,
-    /// not the reservation list) that `is_owned` says the allocator owns, or
-    /// a page-table frame that `is_free` says is free. (The boot tables'
-    /// frames are reserved; the kernel's own tables are allocated, so owned
+    /// not the reservation list) that `is_owned` says the allocator owns (or,
+    /// for an allocated stack, that `is_free` says is free), or a page-table
+    /// frame that `is_free` says is free. (The boot tables' frames are
+    /// reserved; the kernel's own tables and stacks are allocated, so owned
     /// but never free.)
     pub fn first_live_owned(
         is_owned: impl Fn(u64) -> bool,
         is_free: impl Fn(u64) -> bool,
     ) -> Result<Option<(&'static str, u64)>, &'static str> {
-        for super::super::LiveRange { name, range, .. } in super::super::live_ranges() {
+        for super::super::LiveRange { name, range, allocated, .. } in super::super::live_ranges() {
             // Every live range is known in the test configuration (Limine
             // gives every response, and the cmdline is never empty), so no
             // check is silently skipped.
@@ -421,7 +422,10 @@ mod checks {
                     crate::ktest::diag(format_args!("{name}: {page:#x}: {end:?}"));
                     "a live page is not mapped"
                 })?;
-                if is_owned(phys) {
+                // Memory the kernel uses must never be free: reserved memory
+                // is never even owned; an allocated stack is owned, not free.
+                let handed_out = if allocated { is_free(phys) } else { is_owned(phys) };
+                if handed_out {
                     return Ok(Some((name, phys)));
                 }
             }
@@ -633,6 +637,11 @@ crate::ktest!(
         kassert_eq!(first_live_owned(|p| p == stack, never)?, Some((BOOT_STACK, stack)));
         kassert_eq!(first_live_owned(|p| p == bitmap, never)?, Some((BITMAP, bitmap)));
         kassert_eq!(first_live_owned(never, |p| p == table)?, Some(("page table", table)));
+        // The running stack is allocated: owned is fine; free would mean it
+        // could be handed out while in use.
+        let running = translate(align_down(arch::read_rsp(), FRAME_SIZE)).map_err(|_| "stack not mapped")?;
+        kassert_eq!(first_live_owned(|p| p == running, never)?, None);
+        kassert_eq!(first_live_owned(never, |p| p == running)?, Some(("current stack page", running)));
         kassert_eq!(first_live_owned(never, never)?, None);
         Ok(())
     }

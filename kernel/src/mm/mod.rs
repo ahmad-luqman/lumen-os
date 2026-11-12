@@ -6,6 +6,8 @@
 pub mod frame;
 pub mod heap;
 pub mod paging;
+pub mod stack;
+mod window;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -69,10 +71,13 @@ struct LiveRange {
     optional: bool,
     /// The kernel writes it, so it must stay writable.
     written: bool,
+    /// Backed by frames the allocator handed out (an allocated stack), which
+    /// must never be free; otherwise by frames the allocator must never own.
+    allocated: bool,
 }
 
 const fn live(name: &'static str, range: Option<(u64, u64)>, optional: bool, written: bool) -> LiveRange {
-    LiveRange { name, range, optional, written }
+    LiveRange { name, range, optional, written, allocated: false }
 }
 
 /// The virtual ranges the kernel is known to depend on (the memory map's
@@ -83,6 +88,7 @@ const fn live(name: &'static str, range: Option<(u64, u64)>, optional: bool, wri
 /// the frame allocator's tests).
 fn live_ranges() -> [LiveRange; 8] {
     let (stack_lo, stack_hi) = arch::stacks::boot_stack();
+    let rsp = arch::read_rsp();
     let file = boot::EXECUTABLE_FILE.get_response().map(|r| (r.file().addr() as u64, r.file().size()));
     let bitmap = frame::bitmap().map(|b| (phys_to_virt(PhysAddr::new(b.start()).expect("physical")).as_u64(), b.len()));
     let memmap = boot::MEMMAP.get_response().map(|r| {
@@ -94,7 +100,11 @@ fn live_ranges() -> [LiveRange; 8] {
     [
         live(frame::KERNEL_IMAGE, Some(kernel_image()), false, false),
         live(frame::BOOT_STACK, (stack_hi > stack_lo).then_some((stack_lo, stack_hi - stack_lo)), false, true),
-        live("current stack page", Some((arch::read_rsp(), 1)), false, true),
+        LiveRange {
+            // On the boot stack until `kmain` switches to an allocated one.
+            allocated: arch::stacks::REGISTRY.contains(rsp, 1),
+            ..live("current stack page", Some((rsp, 1)), false, true)
+        },
         live(frame::KERNEL_FILE, file, true, false),
         live(frame::FRAMEBUFFER, frame::framebuffer_virt(), true, true),
         live(frame::BITMAP, bitmap, false, true),

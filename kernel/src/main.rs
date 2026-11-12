@@ -2,11 +2,17 @@
 //!
 //! Boot order (see docs/ARCHITECTURE.md, "Boot"):
 //! 1. `_start` (naked): clear rbp so backtraces end here, align the stack.
-//! 2. `arch::init_early`: serial, GDT/TSS (IST stacks), IDT. From here on any
-//!    CPU exception produces a crash report.
-//! 3. Logger, Limine responses, symbol table, memory map, frame allocator and
-//!    the kernel's own page tables and the heap (`mm::init`), framebuffer.
-//! 4. Either the in-kernel tests (`--features ktest`) or the kernel monitor.
+//! 2. `arch::init_early`: serial, GDT/TSS, IDT. From here on a CPU exception
+//!    produces a crash report, except a #DF from a broken stack pointer
+//!    before step 4 (no IST stacks yet), which is a triple fault.
+//! 3. Logger, Limine responses, symbol table, memory map, frame allocator,
+//!    the kernel's own page tables and the heap (`mm::init`).
+//! 4. Allocated kernel stacks with guard pages: the IST stacks (#DF, NMI and
+//!    #MC ran on the boot stack until now) are installed, then `kmain`
+//!    switches from Limine's boot stack to the main kernel stack and
+//!    continues in `kmain_on_kernel_stack`.
+//! 5. Framebuffer, then either the in-kernel tests (`--features ktest`) or
+//!    the kernel monitor.
 
 #![no_std]
 #![no_main]
@@ -28,6 +34,7 @@ mod sync;
 mod trace;
 
 use log::{LevelFilter, info, warn};
+use lumen_mm::stacks::{StackKind, StackRange};
 use trace::{BootPhase, Kind};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -92,7 +99,42 @@ extern "C" fn kmain(stack_top: u64) -> ! {
     log_memory_map();
     mm::init();
     ktrace!(Kind::BootPhase, BootPhase::Memory);
+    let main_stack = install_stacks();
+    // SAFETY: the main stack is leaked (never freed), mapped and used by
+    // nothing else, and its top is page-aligned; the boot stack stays mapped
+    // and reserved and is never reused, so the chain back into `kmain` stays
+    // walkable.
+    unsafe { arch::switch_stack(main_stack.top, kmain_on_kernel_stack) }
+}
 
+/// Allocate the kernel's stacks (each with an unmapped guard page below it):
+/// the IST stacks, installed at once, and the main stack, returned for
+/// `kmain` to switch to. No static stacks remain (hard rule 4).
+fn install_stacks() -> StackRange {
+    use mm::stack::{KernelStack, MAIN_STACK_SIZE, STACK_SIZE};
+    let stack = |size, kind: StackKind| {
+        KernelStack::new(size, kind).unwrap_or_else(|e| panic!("allocating the {} stack: {e}", kind.name())).leak()
+    };
+    let df = stack(STACK_SIZE, StackKind::DoubleFault);
+    let nmi = stack(STACK_SIZE, StackKind::Nmi);
+    let mc = stack(STACK_SIZE, StackKind::MachineCheck);
+    // SAFETY: leaked, mapped stacks nothing else uses; one CPU, interrupts off.
+    unsafe { arch::install_ist_stacks(df.top, nmi.top, mc.top) };
+    let main = stack(MAIN_STACK_SIZE, StackKind::Main);
+    info!(
+        target: "mem",
+        "stacks: main {:#x}..{:#x}, IST {:#x} {:#x} {:#x} (guard page below each)",
+        main.bottom,
+        main.top,
+        df.bottom,
+        nmi.bottom,
+        mc.bottom
+    );
+    main
+}
+
+/// The rest of boot, on the allocated main stack.
+extern "C" fn kmain_on_kernel_stack() -> ! {
     match boot::FRAMEBUFFER.get_response().and_then(|r| r.framebuffers().next()) {
         Some(fb) => match fb::init(&fb) {
             Some((w, h)) => info!(target: "fb", "framebuffer {w}x{h} ready"),

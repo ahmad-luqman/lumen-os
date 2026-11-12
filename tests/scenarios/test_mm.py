@@ -156,3 +156,82 @@ def test_corrupt_free_list_is_a_crash_not_a_hang(crash_report):
     locked = r"^heap \(lock held; may be mid-update\): \d+ bytes mapped at 0xffffc00000000000, 64 used in 1 allocations"
     assert re.search(locked, report, re.MULTILINE), report
     assert "(free list broken: block at 0x0 is out of order or overlaps)" in report, report
+
+
+# The crash reporter's line for an overflow (kernel/src/crash.rs,
+# write_guard_hit): cr2 in the guard page below a stack, with rsp at it.
+OVERFLOW = re.compile(
+    r"^kernel stack overflow \(guard page hit\): cr2 (0x[0-9a-f]{16}) is in the guard page below "
+    r"the kernel main stack \[(0x[0-9a-f]+), (0x[0-9a-f]+)\)$",
+    re.MULTILINE,
+)
+
+
+def assert_main_stack_overflow(report: str, recursing: str) -> None:
+    """A #DF whose overflow line puts cr2 in the page right below the 128 KiB
+    main stack, faulting in `recursing`, and a complete report."""
+    assert "exception: #DF double fault (vector 8, error code 0x0)" in report, report
+    overflow = OVERFLOW.search(report)
+    assert overflow, report
+    cr2, bottom, top = (int(g, 16) for g in overflow.groups())
+    assert bottom - 4096 <= cr2 < bottom and top - bottom == 128 * 1024, report
+    # What makes it an overflow: the interrupted rsp is at the guard page.
+    rsp = re.search(r"^rsp: (0x[0-9a-f]{16})", report, re.MULTILINE)
+    assert rsp and bottom - 4096 <= int(rsp.group(1), 16) < bottom + 4096, report
+    assert bottom >> 40 == 0xFFFFD0, report  # the stack window
+    rip = re.search(r"^rip: 0x[0-9a-f]{16} <(.+)>$", report, re.MULTILINE)
+    assert rip and recursing in rip.group(1), report
+    frames = backtrace(report)
+    assert frames and recursing in frames[0], report
+    # The reporter ran to the end on its 64 KiB IST stack: no nested crash,
+    # and the last section (the heap line) is there.
+    assert "!!!" not in report and heap_line(report), report
+
+
+def test_stack_overflow_hits_guard(crash_report):
+    # Unbounded recursion on the main kernel stack runs into its guard page.
+    # The #PF can't be delivered on the full stack, so it arrives as a #DF on
+    # the double-fault IST stack, with cr2 still in the guard page: the report
+    # says so, and QEMU exits with the crash code (no reset, no triple fault).
+    report = crash_report("stack")
+    assert_main_stack_overflow(report, "kmon::recurse+")
+    frames = backtrace(report)
+    assert len(frames) == 32 and all("kmon::recurse+" in f for f in frames), report
+    assert "(stopped after 32 frames)" in report, report
+
+
+def test_big_frames_hit_the_guard_page_too(crash_report):
+    # Sparse 16 KiB frames (only the lowest word written): stack probes touch
+    # every page in turn, so the overflow still faults in the guard page
+    # instead of jumping over it into the stack mapped below (the #MC IST
+    # stack).
+    report = crash_report("bigframe")
+    assert_main_stack_overflow(report, "kmon::recurse_big")
+    # Only about 8 such frames fit in 128 KiB, so the walk goes past them,
+    # back across the stack switch, to the entry point.
+    frames = backtrace(report)
+    assert any("kmon::crash_big_frame_overflow" in f for f in frames), report
+    assert frames[-1].startswith("_start"), report
+
+
+def test_touching_a_guard_page_is_named(crash_report):
+    # A write into the main stack's guard page from a healthy stack is a
+    # plain #PF (it can be delivered), and the report names the guard page
+    # as a stray access, not an overflow (rsp is nowhere near it).
+    report = crash_report("guard")
+    assert "exception: #PF page fault (vector 14, error code 0x2)" in report, report
+    assert "kernel stack overflow" not in report, report
+    cr2 = re.search(r"faulting address \(cr2\): (0x[0-9a-f]{16})", report)
+    line = re.search(
+        r"^guard page hit: cr2 (?P<cr2>0x[0-9a-f]{16}) is in the guard page below the kernel main stack "
+        r"\[(?P<bottom>0x[0-9a-f]+), (?P<top>0x[0-9a-f]+)\), above the #MC IST stack; "
+        r"rsp (?P<rsp>0x[0-9a-f]{16}) is not near it: a stray access, not an overflow$",
+        report,
+        re.MULTILINE,
+    )
+    assert cr2 and line and line["cr2"] == cr2.group(1), report
+    bottom, top = int(line["bottom"], 16), int(line["top"], 16)
+    assert bottom - 4096 + 8 == int(cr2.group(1), 16), report
+    # kmon runs well inside the main stack, nowhere near its guard page.
+    assert bottom + 4096 <= int(line["rsp"], 16) < top, report
+    assert page_walk(report).end == "not present at L1", report
