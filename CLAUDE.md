@@ -118,7 +118,9 @@ own PR that updates that doc first.
   stubs, serial, IST stacks. `crash.rs`: crash reporter. `ktest.rs`: test
   runner. `kmon.rs`: serial debug monitor (until the M2 shell). `fb.rs`:
   framebuffer and console. `klog.rs`: logger. `symbols.rs`: symbol lookup.
-  `mm/frame.rs`: physical frame allocator and its reservations.
+  `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
+  `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
+  (heap and stacks), through `paging::map` with a `Window` token.
   `mm/heap.rs`: the `#[global_allocator]`, growing in the heap window.
   `mm/stack.rs`: kernel stacks with guard pages; `arch/x86_64/stacks.rs`
   holds their registry (backtraces, overflow reports).

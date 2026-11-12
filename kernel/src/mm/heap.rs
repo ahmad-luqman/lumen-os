@@ -633,17 +633,14 @@ crate::ktest!(
         // 8 frames: half of MIN_GROWTH (the smallest preferred growth), but
         // enough for a page and its tables.
         while frame::free_frames() > 8 {
-            held.push(frame::alloc().ok_or("frames ran out")?);
+            held.push(frame::alloc_owned().ok_or("frames ran out")?);
         }
         let size = stats().size;
         let page = Layout::from_size_align(FRAME_SIZE as usize, 16).map_err(|_| "layout")?;
         // SAFETY: non-zero size.
         let p = core::hint::black_box(unsafe { alloc::alloc::alloc(page) });
         let grown = stats().size - size;
-        for f in held {
-            // SAFETY: held frames this test allocated and never used.
-            unsafe { frame::free(f) }.map_err(|_| "freeing a held frame")?;
-        }
+        drop(held); // frees them
         kassert!(!p.is_null());
         kassert_eq!(grown, FRAME_SIZE as usize);
         // SAFETY: allocated just above with this layout.

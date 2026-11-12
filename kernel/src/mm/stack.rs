@@ -32,9 +32,15 @@ pub const STACK_SIZE: u64 = 64 * 1024;
 /// Limine was asked for, so nothing gets less room than before).
 pub const MAIN_STACK_SIZE: u64 = 128 * 1024;
 
-/// The stack window ([`paging::claim_stack_window`], claimed by the first
-/// stack), which hands each stack its own sub-window.
+/// The stack window ([`paging::claim_stack_window`], claimed by [`init`]),
+/// which hands each stack its own sub-window.
 static WINDOW: SpinLock<Option<StackWindow>> = SpinLock::new(None);
+
+/// Claim the stack window. Called by `mm::init`, after the kernel's page
+/// tables; making a stack before that panics.
+pub fn init() {
+    *WINDOW.lock() = Some(StackWindow::new(paging::claim_stack_window()));
+}
 
 /// Why [`KernelStack::new`] failed (nothing is left mapped or registered).
 /// A mapping failure other than running out is a kernel bug and panics.
@@ -72,7 +78,7 @@ pub struct KernelStack {
 impl KernelStack {
     /// A new stack of `size` bytes (whole pages), registered as `kind`.
     pub fn new(size: u64, kind: StackKind) -> Result<KernelStack, StackError> {
-        let taken = WINDOW.lock().get_or_insert_with(|| StackWindow::new(paging::claim_stack_window())).take(size);
+        let taken = WINDOW.lock().as_mut().expect("mm::init claims the stack window").take(size);
         let (range, mut window) = taken.ok_or(StackError::WindowFull)?;
         match window::map_fresh(&mut window, range.span()) {
             Ok(()) => {}
@@ -266,17 +272,14 @@ crate::ktest!(
         let mut held = Vec::with_capacity(super::frame::free_frames());
         // Two frames: fewer than the four-page stack below needs.
         while super::frame::free_frames() > 2 {
-            held.push(super::frame::alloc().ok_or("frames ran out")?);
+            held.push(super::frame::alloc_owned().ok_or("frames ran out")?);
         }
         let (registered, free, tables) =
             (stacks::REGISTRY.iter().count(), super::frame::free_frames(), active_table_count()?);
         let result = KernelStack::new(4 * lumen_mm::FRAME_SIZE, StackKind::Test).map(|s| s.range());
         let (registered_after, free_after, tables_after) =
             (stacks::REGISTRY.iter().count(), super::frame::free_frames(), active_table_count()?);
-        for f in held {
-            // SAFETY: held frames this test allocated and never used.
-            unsafe { super::frame::free(f) }.map_err(|_| "freeing a held frame")?;
-        }
+        drop(held); // frees them
         kassert_eq!(result, Err(StackError::OutOfMemory));
         kassert_eq!(registered_after, registered);
         kassert_eq!(free_after + (tables_after - tables), free);

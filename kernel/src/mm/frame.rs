@@ -286,7 +286,8 @@ fn frame(addr: u64) -> PhysFrame {
 
 /// Allocate one 4 KiB frame, or `None` when physical memory is exhausted.
 /// Its contents are whatever was there before (see [`alloc_zeroed`]).
-/// Return it with [`free`].
+/// Return it with [`free`] (`unsafe`), or use [`alloc_owned`], which frees
+/// on drop.
 #[must_use = "dropping the frame leaks it"]
 pub fn alloc() -> Option<PhysFrame> {
     with_frames(|f| f.alloc()).map(frame)
@@ -599,7 +600,11 @@ mod checks {
     /// of the frames are then found by sweeping the bitmap for allocated
     /// frames carrying their self-tag, so a failure doesn't leak memory into
     /// later tests. Returns `(frames freed, first problem)`.
-    pub fn free_chain(chain: &Chain) -> (usize, Option<&'static str>) {
+    ///
+    /// # Safety
+    /// `chain` came from [`allocate_all`] and nothing uses its frames any
+    /// more (nor any other allocated frame carrying a chain tag).
+    pub unsafe fn free_chain(chain: &Chain) -> (usize, Option<&'static str>) {
         let (mut head, mut freed, mut problem) = (chain.head, 0, None);
         while head != 0 && problem.is_none() {
             if !ours(head) {
@@ -664,7 +669,8 @@ crate::ktest!(
         let readonly_sum = checksum(kernel_readonly());
         let file_sum = checksum(kernel_file()?);
         let chain = allocate_all(entries, reserved.as_slice());
-        let (freed, problem) = free_chain(&chain);
+        // SAFETY: this test allocated the chain and is done with it.
+        let (freed, problem) = unsafe { free_chain(&chain) };
 
         if let Some(why) = chain.failure.or(problem) {
             return Err(why);

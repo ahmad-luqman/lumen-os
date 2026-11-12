@@ -712,9 +712,13 @@ mod checks {
 
     /// Return every table of a hierarchy (not the active one) to the
     /// allocator.
-    pub fn free_tables(root: PhysFrame) -> Result<(), &'static str> {
+    ///
+    /// # Safety
+    /// The hierarchy is the caller's (built for it, not loaded in CR3) and
+    /// nothing refers to its tables any more.
+    pub unsafe fn free_tables(root: PhysFrame) -> Result<(), &'static str> {
         let mut failed = false;
-        // SAFETY: the copy's tables were allocated by `build` for this test and nothing refers to them any more.
+        // SAFETY: the caller owns every table and nothing uses them.
         pt::for_each_table(&Hhdm, root, |t| failed |= unsafe { frame::free(t) }.is_err())
             .map_err(|_| "unreadable table")?;
         if failed { Err("freeing a table failed") } else { Ok(()) }
@@ -1252,7 +1256,9 @@ crate::ktest!(
             flip_leaf(copy, virt, bits)?;
         }
         let restored = what(active);
-        let freed = free_tables(copy);
+        // SAFETY: `copy` was built for this test, never loaded, and nothing
+        // refers to its tables any more.
+        let freed = unsafe { free_tables(copy) };
         let empty = frame::alloc_zeroed().ok_or("out of frames")?;
         let nothing = preflight_mismatch(active, empty, RunningStack::Check);
         // SAFETY: allocated by this test and not used since.

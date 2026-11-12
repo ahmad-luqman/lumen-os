@@ -26,6 +26,7 @@ pub fn init() {
     frame::init(hhdm);
     paging::init();
     heap::init();
+    stack::init();
 }
 
 /// The HHDM offset, or 0 before [`init`] stores it (its first step).

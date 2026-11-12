@@ -137,7 +137,10 @@ Single frames come from a word scan starting from a hint below which no frame
 is free; contiguous runs from a linear scan. Callers return exactly what they
 allocated (`free` for `alloc`, `free_contiguous` with the same count for
 `alloc_contiguous`), so a buddy allocator can replace it behind the same
-interface if contiguous allocation becomes hot.
+interface if contiguous allocation becomes hot. Both are `unsafe` (the
+caller vouches that it owns the frames and nothing uses them); `alloc_owned`
+gives an `OwnedFrame` instead, which frees itself on drop and is what
+`paging::map` takes.
 
 In-kernel tests check, independently of the reservation list (by walking the
 page tables), that no frame behind a range the kernel is using (kernel image,
