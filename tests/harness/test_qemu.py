@@ -1,11 +1,19 @@
 """QEMU command-line construction, and what each run records about its environment."""
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
 from lumen_harness import qemu
-from lumen_harness.qemu import Machine, QemuOptions, qemu_args, qemu_version
+from lumen_harness.qemu import (
+    Machine,
+    QemuOptions,
+    ovmf_vars_template,
+    ovmf_version,
+    qemu_args,
+    qemu_version,
+)
 
 
 def opts(**kw):
@@ -55,7 +63,7 @@ def fake_qemu(tmp_path: Path, script: str, name: str = "fake-qemu") -> Path:
     return exe
 
 
-def test_qemu_version_is_the_first_line(tmp_path):
+def test_qemu_version_is_the_first_non_blank_line(tmp_path):
     exe = fake_qemu(tmp_path, 'printf "\\nQEMU emulator version 9.2.0\\nCopyright\\n"')
     assert qemu_version(str(exe)) == "QEMU emulator version 9.2.0"
     # Bytes that aren't UTF-8 are replaced, not raised.
@@ -75,13 +83,37 @@ def test_qemu_version_says_why_it_is_unknown(tmp_path):
     assert qemu_version(str(not_executable)).startswith(f"unknown ({not_executable}: ")
 
 
-def test_qemu_version_retries_after_a_failure(tmp_path):
-    # A probe that failed (say, timed out on a busy host) is not remembered.
+def test_qemu_version_retries_after_a_failure(tmp_path, monkeypatch):
+    # A probe that failed is not remembered; one that worked is.
+    monkeypatch.setattr(qemu, "_qemu_versions", {})
     ready = tmp_path / "ready"
     exe = fake_qemu(tmp_path, f'[ -e "{ready}" ] || exit 1; echo "QEMU emulator version 9.2.0"')
     assert qemu_version(str(exe)) == f"unknown ({exe} --version exited 1)"
     ready.touch()
     assert qemu_version(str(exe)) == "QEMU emulator version 9.2.0"
+    ready.unlink()
+    assert qemu_version(str(exe)) == "QEMU emulator version 9.2.0"
+
+
+def test_qemu_version_survives_a_timeout(tmp_path, monkeypatch):
+    # On a busy host `--version` can time out: say so, and try again next time.
+    monkeypatch.setattr(qemu, "_qemu_versions", {})
+    exe = fake_qemu(tmp_path, 'echo "QEMU emulator version 9.2.0"')
+
+    def timeout(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+
+    with monkeypatch.context() as m:
+        m.setattr(qemu.subprocess, "run", timeout)
+        assert qemu_version(str(exe)).startswith(f"unknown ({exe}: Command ")
+    assert qemu_version(str(exe)) == "QEMU emulator version 9.2.0"
+
+
+def test_empty_overrides_mean_unset(monkeypatch):
+    monkeypatch.setenv("LUMEN_QEMU", "")
+    monkeypatch.setenv("LUMEN_OVMF_VARS", "")
+    assert qemu_args(opts())[0] == "qemu-system-x86_64"
+    assert ovmf_vars_template() == qemu.BUILD_DIR / "deps/ovmf/OVMF_VARS.fd"
 
 
 def test_ovmf_version_comes_from_the_fetch_stamp(tmp_path, monkeypatch):
@@ -90,17 +122,19 @@ def test_ovmf_version_comes_from_the_fetch_stamp(tmp_path, monkeypatch):
     monkeypatch.setattr(qemu, "BUILD_DIR", tmp_path)
     code = tmp_path / "deps/ovmf/OVMF_CODE.fd"
     stamp = code.parent / ".version"
-    assert qemu.ovmf_version() == f"unknown, no {stamp} ({code})"
+    assert ovmf_version() == f"unknown, no {stamp} ({code})"
     stamp.parent.mkdir(parents=True)
+    stamp.write_text("\n")  # a truncated stamp is no version either
+    assert ovmf_version() == f"unknown, no {stamp} ({code})"
     stamp.write_text("edk2-stable202605-r1\n")
-    assert qemu.ovmf_version() == f"edk2-stable202605-r1 ({code})"
+    assert ovmf_version() == f"edk2-stable202605-r1 ({code})"
     monkeypatch.setenv("LUMEN_OVMF_VARS", "/elsewhere/VARS.fd")
-    assert qemu.ovmf_version() == (
+    assert ovmf_version() == (
         f"edk2-stable202605-r1 ({code}), custom vars LUMEN_OVMF_VARS=/elsewhere/VARS.fd"
     )
     monkeypatch.delenv("LUMEN_OVMF_VARS")
     monkeypatch.setenv("LUMEN_OVMF_CODE", "/elsewhere/CODE.fd")
-    assert qemu.ovmf_version() == "custom, LUMEN_OVMF_CODE=/elsewhere/CODE.fd"
+    assert ovmf_version() == "custom, LUMEN_OVMF_CODE=/elsewhere/CODE.fd"
 
 
 @pytest.mark.parametrize("accel", ["kvm", "tcg"])

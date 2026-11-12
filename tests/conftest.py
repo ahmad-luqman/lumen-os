@@ -5,8 +5,8 @@
 directory, build/test-artifacts/<module>/<test>/: keyed by module too, so
 same-named tests in two files can run side by side under pytest-xdist.
 Artifacts of passing tests are deleted; failing tests keep serial.log, qemu.log
-(CPU resets, and the `-d int` interrupt trace under TCG), environment.txt and
-any screenshots, and CI uploads them.
+(CPU resets, and the `-d int` interrupt trace under TCG), cmdline.txt,
+environment.txt and any screenshots, and CI uploads them.
 """
 
 from __future__ import annotations

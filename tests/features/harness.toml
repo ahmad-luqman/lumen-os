@@ -43,7 +43,7 @@ tests = [
 ]
 
 [[feature]]
-name = "make test-scenarios runs scenarios in parallel (pytest-xdist); QMP sockets per machine, artifact directories per module and test"
+name = "make test-scenarios passes -n auto to pytest-xdist by default (SCENARIO_JOBS=0: serial); QMP sockets per machine, artifact directories per module and test"
 milestone = "M1"
 tests = [
     "harness:test_ci_config::test_scenarios_run_in_parallel_by_default",
@@ -57,14 +57,16 @@ name = "Each scenario machine records the QEMU version, accelerator and OVMF ver
 milestone = "M1"
 tests = [
     "harness:test_qemu::test_each_run_records_its_environment[*]",
-    "harness:test_qemu::test_qemu_version_is_the_first_line",
+    "harness:test_qemu::test_qemu_version_is_the_first_non_blank_line",
     "harness:test_qemu::test_qemu_version_says_why_it_is_unknown",
     "harness:test_qemu::test_qemu_version_retries_after_a_failure",
+    "harness:test_qemu::test_qemu_version_survives_a_timeout",
+    "harness:test_qemu::test_empty_overrides_mean_unset",
     "harness:test_qemu::test_ovmf_version_comes_from_the_fetch_stamp",
 ]
 
 [[feature]]
-name = "The feature gate writes the feature table, failing rows included, to the CI job summary, also after failed scenarios"
+name = "The feature gate writes the feature table, failing rows included, to the CI job summary; its CI step runs after failed scenarios too"
 milestone = "M1"
 tests = [
     "harness:test_status::test_ci_job_summary_gets_the_table[*]",

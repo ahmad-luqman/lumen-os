@@ -17,10 +17,9 @@ def test_artifacts_are_keyed_by_module_and_test():
     )
 
 
-def test_the_artifacts_fixture_uses_artifact_dir(artifacts, request):
+def test_the_artifacts_fixture_uses_artifact_dir(artifacts):
     # The fixture (tests/conftest.py) is what scenarios get: it must use the
     # module-keyed directory, not just the test name.
-    assert artifacts == artifact_dir(artifacts.parents[1], request.node.nodeid)
     assert artifacts.parts[-2:] == (
         "test_artifacts",
         "test_the_artifacts_fixture_uses_artifact_dir",

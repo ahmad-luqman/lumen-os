@@ -9,10 +9,12 @@ for output (`expect`, with a timeout, never fixed sleeps), type input
 (`send_line`), take screenshots over QMP (`screendump`), and collect the exit
 status that the kernel sets through `isa-debug-exit`.
 
-Every run writes its artifacts to a directory: `serial.log` (everything the
-guest printed), `qemu.log` (QEMU `-d` trace: interrupts, CPU resets, guest
-errors), `cmdline.txt`, `environment.txt` (QEMU version, accelerator, OVMF
-version; `make run`/`make debug` don't write it) and any screenshots.
+Every `Machine` run writes its artifacts to a directory: `serial.log`
+(everything the guest printed), `qemu.log` (QEMU `-d` trace: interrupts, CPU
+resets, guest errors), `cmdline.txt`, `environment.txt` (QEMU version,
+accelerator, OVMF version) and any screenshots. (`make run` and `make debug`
+keep only `qemu.log`, and debug also `serial.log`, in build/run/ and
+build/debug/.)
 """
 
 from __future__ import annotations
@@ -84,9 +86,9 @@ def qemu_version(binary: str) -> str:
         return f"not found ({binary})"
     except (OSError, subprocess.SubprocessError) as e:
         return f"unknown ({binary}: {e})"
-    first = next((line.strip() for line in run.stdout.splitlines() if line.strip()), "")
     if run.returncode != 0:
         return f"unknown ({binary} --version exited {run.returncode})"
+    first = next((line.strip() for line in run.stdout.splitlines() if line.strip()), "")
     if not first:
         return f"unknown ({binary} --version printed nothing)"
     _qemu_versions[binary] = first
@@ -95,25 +97,28 @@ def qemu_version(binary: str) -> str:
 
 def ovmf_version() -> str:
     """The OVMF release from fetch-deps' `.version` stamp, with the firmware's
-    path; `custom` under LUMEN_OVMF_CODE, `unknown` without a stamp. A custom
+    path; `custom` under LUMEN_OVMF_CODE, `unknown` without a (non-empty) stamp. A custom
     variable store (LUMEN_OVMF_VARS) is noted too."""
-    vars_template = os.environ.get("LUMEN_OVMF_VARS")
-    custom_vars = f", custom vars LUMEN_OVMF_VARS={vars_template}" if vars_template else ""
     if custom := os.environ.get("LUMEN_OVMF_CODE"):
-        return f"custom, LUMEN_OVMF_CODE={custom}{custom_vars}"
-    code = ovmf_code()
-    stamp = code.parent / ".version"
-    try:
-        release = stamp.read_text().strip()
-    except OSError:
-        return f"unknown, no {stamp} ({code}){custom_vars}"
-    return f"{release} ({code}){custom_vars}"
+        firmware = f"custom, LUMEN_OVMF_CODE={custom}"
+    else:
+        code = ovmf_code()
+        stamp = code.parent / ".version"
+        try:
+            release = stamp.read_text().strip()
+        except OSError:
+            release = ""
+        firmware = f"{release} ({code})" if release else f"unknown, no {stamp} ({code})"
+    if vars_template := os.environ.get("LUMEN_OVMF_VARS"):
+        firmware += f", custom vars LUMEN_OVMF_VARS={vars_template}"
+    return firmware
 
 
 def environment(accel: str) -> list[str]:
-    """What a run depends on beyond its ISO and command line (cmdline.txt):
-    printed once per test session and saved as environment.txt by every
-    `Machine` run."""
+    """The versions behind a run's command line (cmdline.txt names the QEMU
+    binary and OVMF file, not their versions), plus the accelerator for quick
+    reading. Shown in the pytest header (by the xdist controller; not under -q)
+    and saved as environment.txt by every `Machine` run."""
     return [
         f"qemu: {qemu_version(qemu_binary())}",
         f"accel: {accel}",

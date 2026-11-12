@@ -15,6 +15,7 @@ def artifact_dir(root: Path, nodeid: str) -> Path:
     The module is part of it because tests run side by side (pytest-xdist): two
     same-named tests in different files must not delete each other's files.
     (Only the file's stem is used, so two test files with one name in different
-    directories would still share a directory; all scenarios are in one.)"""
+    directories would still share a directory. Today the fixture's users are
+    tests/scenarios and tests/harness/test_artifacts.py, whose stems differ.)"""
     file, _, test = nodeid.partition("::")
     return root / Path(file).stem / re.sub(r"[^A-Za-z0-9_.-]+", "_", test)

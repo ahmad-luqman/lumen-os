@@ -37,12 +37,11 @@ def results_dir(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("failed", "shown", "rc"),
-    [(False, "passing", 0), (True, "**FAILING**", 1)],
+    ("body", "shown", "rc"),
+    [("", "passing", 0), ("<failure/>", "**FAILING**", 1)],
     ids=["passing", "failing"],
 )
-def test_ci_job_summary_gets_the_table(results_dir, tmp_path, monkeypatch, failed, shown, rc):
-    body = "<failure/>" if failed else ""
+def test_ci_job_summary_gets_the_table(results_dir, tmp_path, monkeypatch, body, shown, rc):
     (results_dir / "harness.xml").write_text(
         f'<testsuite><testcase classname="tests.harness.test_x" name="t">{body}'
         "</testcase></testsuite>"

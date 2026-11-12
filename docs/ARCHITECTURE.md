@@ -775,7 +775,7 @@ kernel. The kernel is the trusted computing base.
 | Whole system | pytest scenarios: boot QEMU headless, `expect` on serial with timeouts, `send_line`, exit codes; run in parallel (pytest-xdist, one worker per CPU) | `tests/scenarios` |
 | Screens | QMP `screendump` compared to golden PNG regions | `tests/golden` |
 | Codegen | `make audit`: disassembly and LLVM IR checks | `tools/harness/lumen_harness/audit.py` |
-| Harness itself | self-tests that the TAP parser, audit and image diff catch failures | `tests/harness` |
+| Harness itself | self-tests that the TAP parser, audit and image diff catch failures, and that the QEMU command line, artifact layout, CI wiring and status generation behave | `tests/harness` |
 | Feature gate | every feature in `tests/features/*.toml` must pass (CI); `docs/STATUS.md` generated from the same data | `make status-check`, `make status` |
 
 QEMU exit codes: 33 = tests passed, 35 = a test failed, 37 = crash report.
