@@ -88,6 +88,13 @@ def test_crash_on_ap_reports_cpu(boot):
     assert "kmon::crash_page_fault" in frames[0] and any("smp::ap_main" in f for f in frames), (
         frames
     )
+    # The trace is CPU 1's own ring: its online log line and the fault, none
+    # of the boot CPU's events.
+    events = re.findall(
+        r"^  #\d+ +tsc=\d+ +(.*)$", report.split("recent trace events")[1], re.MULTILINE
+    )
+    assert events and all(e.startswith("cpu=1 ") for e in events), report
+    assert "exception  vector=14" in events[-1], events
 
 
 def test_double_fault_on_ap_runs_on_its_own_ist_stack(boot):
