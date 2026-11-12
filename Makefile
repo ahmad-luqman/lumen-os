@@ -74,9 +74,15 @@ test-host: ## Host-side unit tests (Rust crates + harness self-tests)
 	@printf '{%s}\n' "$$(ls crates | sed 's/.*/"&": true/' | paste -sd, -)" > $(RESULTS)/cargo.json
 	uv run --frozen pytest tests/harness -q --junitxml=$(RESULTS)/harness.xml
 
-test-scenarios: iso ## Boot QEMU headless and run every scenario (incl. in-kernel tests)
+# Scenarios run in parallel, one QEMU at a time per worker (pytest-xdist):
+# `auto` is one worker per logical CPU; SCENARIO_JOBS=0 runs them one at a time
+# in the main pytest process. Don't run more workers than CPUs: a starved TCG
+# guest loses local APIC timer ticks, and test_time and test_acpi count them.
+SCENARIO_JOBS ?= auto
+
+test-scenarios: iso ## Boot QEMU headless and run every scenario (incl. in-kernel tests; SCENARIO_JOBS=0: serially)
 	@mkdir -p $(RESULTS) && rm -f $(RESULTS)/scenarios.xml $(RESULTS)/ktest.tap
-	uv run --frozen pytest tests/scenarios -v --junitxml=$(RESULTS)/scenarios.xml
+	uv run --frozen pytest tests/scenarios -v -n $(SCENARIO_JOBS) --junitxml=$(RESULTS)/scenarios.xml
 
 audit: build ## Prove kernel codegen flags and image layout (no SSE/AVX, no red zone, stack probes, kernel code model, sections in place)
 	@mkdir -p $(RESULTS) && rm -f $(RESULTS)/audit.json

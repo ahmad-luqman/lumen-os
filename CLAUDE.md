@@ -13,7 +13,7 @@ make run             # QEMU with a window, serial on your terminal (Ctrl-A x qui
 make debug           # QEMU paused + gdb attached, stopped at kmain
 make test            # everything CI runs: host tests, flag audit, QEMU scenarios
 make test-host       # cargo test + harness self-tests (fast, no QEMU)
-make test-scenarios  # headless QEMU scenarios incl. in-kernel ktests (~20 s)
+make test-scenarios  # headless QEMU scenarios incl. in-kernel ktests, in parallel (SCENARIO_JOBS=0: serially)
 make audit           # proves no SSE/AVX, no red zone, stack probes, kernel code model, image layout
 make lint fmt        # clippy -D warnings + ruff; rustfmt + ruff format
 make status-check    # feature gate: every feature in tests/features/ passes (CI runs this)
@@ -22,8 +22,10 @@ make golden          # re-record golden screenshots (look at them before committ
 ```
 
 One scenario: `uv run pytest tests/scenarios/test_crash.py -k pf -v`.
-Failing scenarios keep `build/test-artifacts/<test>/` with `serial.log`,
-`qemu.log` (`-d int,cpu_reset,guest_errors`) and screenshots. The interrupt
+Failing scenarios keep `build/test-artifacts/<module>/<test>/` (e.g.
+`test_crash/test_fault_produces_symbolized_report_pf_/`) with `serial.log`,
+`qemu.log` (`-d int,cpu_reset,guest_errors`), `cmdline.txt`, `environment.txt` (QEMU version,
+accelerator, OVMF version) and screenshots. The interrupt
 trace (`-d int`) is only recorded under TCG: locally on macOS always, and in CI
 by re-running failed scenarios with `LUMEN_ACCEL=tcg` (CI runs KVM first,
 and keeps the re-run's artifacts apart in `build/test-artifacts-tcg/` via

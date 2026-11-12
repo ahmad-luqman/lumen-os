@@ -54,8 +54,12 @@ jobs:
         run: make audit
       - run: make test-host
       - name: QEMU scenarios (boot, crash reports, in-kernel tests, golden images)
+        id: scenarios
         run: make test-scenarios
+      # Also after failed scenarios: the gate writes the feature table to the
+      # job summary, and that is where a failing run is most useful to read.
       - name: Feature gate (every feature in tests/features/ passes)
+        if: ${{ !cancelled() && steps.scenarios.outcome != 'skipped' }}
         run: make status-check
 
       # KVM is fast but QEMU's `-d int` interrupt trace only works under TCG.

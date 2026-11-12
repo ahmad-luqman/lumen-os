@@ -772,16 +772,18 @@ kernel. The kernel is the trusted computing base.
 |---|---|---|
 | Pure logic | `cargo test` on `no_std` crates | `crates/*` |
 | Kernel internals | `ktest!` in-kernel tests → TAP over serial → `isa-debug-exit` | anywhere in `kernel/src` |
-| Whole system | pytest scenarios: boot QEMU headless, `expect` on serial with timeouts, `send_line`, exit codes | `tests/scenarios` |
+| Whole system | pytest scenarios: boot QEMU headless, `expect` on serial with timeouts, `send_line`, exit codes; run in parallel (pytest-xdist, one worker per CPU) | `tests/scenarios` |
 | Screens | QMP `screendump` compared to golden PNG regions | `tests/golden` |
 | Codegen | `make audit`: disassembly and LLVM IR checks | `tools/harness/lumen_harness/audit.py` |
-| Harness itself | self-tests that the TAP parser, audit and image diff catch failures | `tests/harness` |
+| Harness itself | self-tests that the TAP parser, audit and image diff catch failures, and that the QEMU command line, artifact layout, CI wiring and status generation behave | `tests/harness` |
 | Feature gate | every feature in `tests/features/*.toml` must pass (CI); `docs/STATUS.md` generated from the same data | `make status-check`, `make status` |
 
 QEMU exit codes: 33 = tests passed, 35 = a test failed, 37 = crash report.
 A triple fault exits with 0 (`-no-reboot`) and therefore fails. Each scenario
-keeps `serial.log`, `qemu.log` (`-d int,cpu_reset,guest_errors`) and
-screenshots when it fails, and CI uploads them. QEMU records the interrupt
+keeps `serial.log`, `qemu.log` (`-d int,cpu_reset,guest_errors`),
+`cmdline.txt`, `environment.txt` (QEMU version, accelerator, OVMF version) and
+screenshots when it fails, in `build/test-artifacts/<module>/<test>/`, and CI
+uploads them. QEMU records the interrupt
 trace only under TCG, so CI (which runs KVM) re-runs failed scenarios under
 TCG before uploading.
 
