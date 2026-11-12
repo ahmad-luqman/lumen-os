@@ -7,22 +7,28 @@
 //! frames at the heap's end (at least [`MIN_GROWTH`] at a time) and appends
 //! them. The heap never shrinks and stops at [`paging::HEAP_LIMIT`].
 //!
-//! When growing fails the allocation returns null. Callers that can cope use
-//! `try_reserve` and friends; everything else ends in `alloc`'s default
-//! allocation error handler, which panics ("memory allocation of N bytes
-//! failed"). The crash report then shows the heap's state, including why the
-//! last growth failed ([`write_crash_stats`]). A free the heap refuses (a
-//! double free, or a wrong `Layout`) is a panic too.
+//! When the heap runs out (no frames, or the window is full) the allocation
+//! returns null. Callers that can cope use `try_reserve` and friends;
+//! everything else ends in `alloc`'s default allocation error handler, which
+//! panics ("memory allocation of N bytes failed"). Any other growth failure
+//! is a kernel bug and panics. The crash report shows the heap's state,
+//! including the last failed growth ([`write_crash_stats`]). A free the heap
+//! refuses (outside the heap, misaligned, or overlapping free memory: a
+//! double free while the block is still free, or a too-large `Layout`) is a
+//! panic too.
 //!
 //! Lock order: the heap, then the page tables (`paging`), then the frame
-//! allocator. Code holding either of the last two must not allocate.
+//! allocator. Code holding either of the last two must not allocate. The
+//! heap logs only after releasing its lock. Not for interrupt handlers yet:
+//! the lock is not IRQ-safe until #7.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::fmt::{self, Write};
+use core::ops::Range;
 use core::ptr::{self, NonNull};
 
-use lumen_heap::Heap;
-use lumen_mm::paging::Attrs;
+use lumen_heap::{CheckError, Heap};
+use lumen_mm::paging::{Attrs, MapError};
 use lumen_mm::{FRAME_SIZE, VirtAddr};
 
 use super::{frame, paging};
@@ -32,30 +38,38 @@ use crate::sync::SpinLock;
 /// the frame allocator and the page tables.
 const MIN_GROWTH: u64 = 64 * 1024;
 
-/// How many free blocks the crash report walks before giving up (the walk
-/// must finish even if the list is corrupt).
+/// How many free blocks the crash report walks before giving up, so it
+/// finishes quickly even with a huge, fragmented free list.
 const CRASH_WALK_LIMIT: usize = 4096;
 
 struct State {
     heap: Heap,
-    /// Why the most recent growth failed, if it did (cleared by the next
-    /// growth that succeeds).
-    last_error: Option<GrowError>,
+    /// The most recent growth, if it failed: why, and for what request.
+    last_failure: Option<(GrowError, Layout)>,
 }
 
-static STATE: SpinLock<State> = SpinLock::new(State { heap: Heap::empty(), last_error: None });
+static STATE: SpinLock<State> = SpinLock::new(State { heap: Heap::empty(), last_failure: None });
 
 /// Why the heap could not grow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GrowError {
     /// Before [`init`].
     NotReady,
-    /// Growing would pass [`paging::HEAP_LIMIT`].
+    /// The request doesn't fit below [`paging::HEAP_LIMIT`].
     WindowFull,
     /// The frame allocator is empty.
     OutOfFrames,
-    /// The page tables refused the mapping (e.g. no frame for a table).
+    /// The page tables refused the mapping.
     Map(paging::VmError),
+}
+
+impl GrowError {
+    /// Is this the heap running out (the allocation returns null), rather
+    /// than a kernel bug (a panic)? Only a page table that couldn't get a
+    /// frame is an expected mapping failure.
+    fn is_exhaustion(self) -> bool {
+        !matches!(self, GrowError::Map(e) if e != paging::VmError::Map(MapError::OutOfMemory))
+    }
 }
 
 impl fmt::Display for GrowError {
@@ -74,9 +88,9 @@ impl fmt::Display for GrowError {
 /// before that return null.
 pub fn init() {
     let base = NonNull::new(paging::HEAP_BASE as *mut u8).expect("the heap base is not null");
-    // SAFETY: `[HEAP_BASE, HEAP_LIMIT)` belongs to the heap alone: nothing
-    // else maps or uses it (the paging ktests' scratch page is above
-    // HEAP_LIMIT). It starts empty; `grow` maps memory before handing it over.
+    // SAFETY: by convention only the heap maps `[HEAP_BASE, HEAP_LIMIT)`
+    // (the paging ktests' SCRATCH page is at HEAP_LIMIT, just outside). It
+    // starts empty; `grow` maps memory before handing it over.
     unsafe { STATE.lock().heap.init(base, 0) };
 }
 
@@ -86,22 +100,32 @@ static ALLOCATOR: KernelAllocator = KernelAllocator;
 struct KernelAllocator;
 
 // SAFETY: `Heap` hands out disjoint blocks of at least the requested size
-// and alignment, inside memory mapped read-write for the heap alone; the
-// lock serializes every access to it.
+// and alignment, inside memory mapped read-write for the heap alone. The
+// lock serializes every access (interrupts are off until #7 makes
+// `SpinLock` IRQ-safe), and panics abort, so nothing unwinds out of here.
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut state = STATE.lock();
         if let Some(p) = state.heap.alloc(layout) {
             return p.as_ptr();
         }
-        if let Err(e) = grow(&mut state, layout) {
-            state.last_error = Some(e);
-            return ptr::null_mut();
+        let grown = grow(&mut state, layout);
+        let p = if grown.is_ok() { state.heap.alloc(layout) } else { None };
+        drop(state); // log and panic without the lock (the crash report shows the heap)
+        let (size, align) = (layout.size(), layout.align());
+        match grown {
+            // `growth_for` guarantees the fit (host-tested): failing is a bug.
+            Ok(end) => {
+                log::debug!(target: "heap", "grew to {end:#x}");
+                p.unwrap_or_else(|| panic!("heap: grew for {size} bytes (align {align}) but they still don't fit"))
+                    .as_ptr()
+            }
+            Err(e) if e.is_exhaustion() => {
+                log::debug!(target: "heap", "growth for {size} bytes (align {align}) failed: {e}");
+                ptr::null_mut()
+            }
+            Err(e) => panic!("heap: growth for {size} bytes (align {align}) failed: {e}"),
         }
-        let p = state.heap.alloc(layout);
-        drop(state); // so the crash report can show the heap
-        // `growth_for` guarantees the fit (host-tested): failing is a bug.
-        p.unwrap_or_else(|| panic!("heap: grew for {layout:?} but the allocation still failed")).as_ptr()
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -118,53 +142,62 @@ unsafe impl GlobalAlloc for KernelAllocator {
     }
 }
 
-/// Map enough frames at the heap's end for `layout` to fit, and add them to
-/// the heap. All or nothing: on failure every page mapped so far is unmapped
-/// and its frame freed (page tables created on the way stay; tables are
-/// never freed).
-fn grow(state: &mut State, layout: Layout) -> Result<(), GrowError> {
-    let end = state.heap.end().ok_or(GrowError::NotReady)? as u64;
+/// Map enough frames at the heap's end for `layout` to fit and add them to
+/// the heap; returns the new end. Records the outcome in `last_failure`.
+fn grow(state: &mut State, layout: Layout) -> Result<u64, GrowError> {
+    let result = try_grow(&mut state.heap, layout);
+    state.last_failure = result.err().map(|e| (e, layout));
+    result
+}
+
+/// [`grow`] without the bookkeeping. All or nothing: on failure every page
+/// mapped so far is unmapped and its frame freed (page tables created on the
+/// way stay; tables are never freed).
+fn try_grow(heap: &mut Heap, layout: Layout) -> Result<u64, GrowError> {
+    let end = heap.end().ok_or(GrowError::NotReady)? as u64;
+    // `None` only for sizes near `isize::MAX`: far past the window anyway.
     let need = lumen_heap::growth_for(layout).ok_or(GrowError::WindowFull)? as u64;
     let bytes = need.max(MIN_GROWTH).checked_next_multiple_of(FRAME_SIZE).ok_or(GrowError::WindowFull)?;
     if bytes > paging::HEAP_LIMIT - end {
         return Err(GrowError::WindowFull);
     }
-    let pages = bytes / FRAME_SIZE;
-    for i in 0..pages {
+    for i in 0..bytes / FRAME_SIZE {
         if let Err(e) = map_one(end + i * FRAME_SIZE) {
-            release(end, i);
+            release(end, i, e);
             return Err(e);
         }
     }
     // SAFETY: `[end, end + bytes)` is now mapped read-write to frames
     // allocated for the heap, and nothing else uses it.
-    unsafe { state.heap.extend(bytes as usize) };
-    state.last_error = None;
-    log::debug!(target: "heap", "grew by {bytes:#x} to {:#x}", end + bytes);
-    Ok(())
+    unsafe { heap.extend(bytes as usize) };
+    Ok(end + bytes)
 }
 
 /// Map a fresh frame at `virt`, just above the heap's end.
 fn map_one(virt: u64) -> Result<(), GrowError> {
+    assert!((paging::HEAP_BASE..paging::HEAP_LIMIT).contains(&virt), "heap page {virt:#x} outside the heap");
     let virt = VirtAddr::new(virt).expect("heap addresses are canonical");
     let frame = frame::alloc().ok_or(GrowError::OutOfFrames)?;
     // SAFETY: the frame was just allocated for the heap, and pages above the
     // heap's end (below HEAP_LIMIT) are the heap's and unused.
     let mapped = unsafe { paging::map(virt, frame, Attrs::DATA) };
     mapped.map_err(|e| {
-        frame::free(frame).expect("freeing a frame just allocated");
+        frame::free(frame).unwrap_or_else(|fe| panic!("heap: freeing {frame} after `{e}` failed: {fe:?}"));
         GrowError::Map(e)
     })
 }
 
-/// Undo the first `pages` pages a failed [`grow`] mapped above `end`.
-fn release(end: u64, pages: u64) {
+/// Undo the first `pages` pages a [`grow`] that failed with `cause` mapped
+/// above `end`.
+fn release(end: u64, pages: u64, cause: GrowError) {
     for i in 0..pages {
         let virt = VirtAddr::new(end + i * FRAME_SIZE).expect("heap addresses are canonical");
         // SAFETY: `grow` mapped this page a moment ago and nothing refers to
         // it: the heap never got it.
-        let m = unsafe { paging::unmap(virt) }.expect("unmapping a page grow just mapped");
-        frame::free(m.phys).expect("freeing a frame grow just allocated");
+        let m = unsafe { paging::unmap(virt) }
+            .unwrap_or_else(|e| panic!("heap: rollback after `{cause}` failed to unmap {virt}: {e}"));
+        frame::free(m.phys)
+            .unwrap_or_else(|e| panic!("heap: rollback after `{cause}` failed to free {}: {e:?}", m.phys));
     }
 }
 
@@ -176,29 +209,31 @@ pub fn stats() -> lumen_heap::Stats {
 
 /// Walk the free list and check its invariants.
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests
-pub fn check() -> Result<lumen_heap::FreeList, lumen_heap::CheckError> {
+pub fn check() -> Result<lumen_heap::FreeList, CheckError> {
     STATE.lock().heap.check()
 }
 
-/// The heap's mapped span `[HEAP_BASE, end)`.
+/// The heap's mapped span.
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests
-pub fn mapped() -> (u64, u64) {
+pub fn mapped() -> Range<u64> {
     let end = STATE.lock().heap.end().map_or(paging::HEAP_BASE, |e| e as u64);
-    (paging::HEAP_BASE, end)
+    paging::HEAP_BASE..end
 }
 
+/// Why the most recent growth failed, if it did.
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests
 pub fn last_error() -> Option<GrowError> {
-    STATE.lock().last_error
+    STATE.lock().last_failure.map(|(e, _)| e)
 }
 
-/// One line for humans (kmon `heap`, crash reports): sizes, the free list
-/// (walking at most `max_blocks` blocks) and why the last growth failed.
-fn write_state(w: &mut dyn Write, state: &State, max_blocks: usize) -> fmt::Result {
+/// One line for humans (kmon `heap`, crash reports; parsed by `HEAP_LINE`
+/// in tests/scenarios/test_mm.py): sizes, the free list (walking at most
+/// `max_blocks` blocks) and the last failed growth.
+fn write_state(w: &mut dyn Write, label: &str, state: &State, max_blocks: usize) -> fmt::Result {
     let s = state.heap.stats();
     write!(
         w,
-        "heap: {} bytes mapped at {:#x}, {} used in {} allocations, {} free",
+        "{label}: {} bytes mapped at {:#x}, {} used in {} allocations, {} free",
         s.size,
         paging::HEAP_BASE,
         s.used,
@@ -207,26 +242,39 @@ fn write_state(w: &mut dyn Write, state: &State, max_blocks: usize) -> fmt::Resu
     )?;
     match state.heap.check_bounded(max_blocks) {
         Ok(list) => write!(w, " in {} blocks (largest {})", list.blocks, list.largest)?,
+        Err(CheckError::TooManyBlocks) => write!(w, " in more than {max_blocks} blocks (walk stopped)")?,
         Err(e) => write!(w, " (free list broken: {e})")?,
     }
-    if let Some(e) = state.last_error {
-        write!(w, "; last growth failed: {e}")?;
+    if let Some((e, layout)) = state.last_failure {
+        write!(w, "; last growth failed for {} bytes (align {}): {e}", layout.size(), layout.align())?;
     }
     writeln!(w)
 }
 
 /// The heap line for kmon's `heap` command.
-#[cfg_attr(feature = "ktest", allow(dead_code))] // kmon is not built into the test kernel
+#[cfg_attr(feature = "ktest", allow(dead_code))] // kmon, the only caller, never runs in the test kernel
 pub fn write_stats(w: &mut dyn Write) -> fmt::Result {
-    write_state(w, &STATE.lock(), usize::MAX)
+    write_state(w, "heap", &STATE.lock(), usize::MAX)
 }
 
-/// The heap line for a crash report. Never blocks: if the crash happened
-/// inside the heap (its lock held), it says so instead.
-pub fn write_crash_stats(w: &mut dyn Write) -> fmt::Result {
+/// The heap line for a crash report. Never blocks: if the heap's lock is
+/// held (the crash happened while the heap was in use), it reads the state
+/// anyway and says so. Reading is safe even mid-update: the counters are
+/// plain numbers and the bounded walk never reads outside the heap.
+///
+/// # Safety
+/// Nothing else may use the heap while this runs: call it from the crash
+/// reporter (this CPU runs alone and halts next), or while holding the lock
+/// without using it.
+pub unsafe fn write_crash_stats(w: &mut dyn Write) -> fmt::Result {
     match STATE.try_lock() {
-        Some(state) => write_state(w, &state, CRASH_WALK_LIMIT),
-        None => writeln!(w, "heap: locked (the crash happened inside the allocator)"),
+        Some(state) => write_state(w, "heap", &state, CRASH_WALK_LIMIT),
+        None => {
+            // SAFETY: the caller guarantees nothing uses the heap meanwhile;
+            // we only read.
+            let state = unsafe { STATE.force_get() };
+            write_state(w, "heap (lock held; may be mid-update)", state, CRASH_WALK_LIMIT)
+        }
     }
 }
 
@@ -346,17 +394,21 @@ crate::ktest!(
 crate::ktest!(
     fn crash_stats_never_block() {
         // The crash reporter may run while the heap's lock is held (a fault
-        // inside the allocator): its heap line must say so, not deadlock.
-        // (The buffer is on the stack: allocating here would deadlock.)
-        use crate::kassert;
+        // inside the allocator): its heap line must still appear, saying so,
+        // instead of deadlocking. (The buffer is on the stack: allocating
+        // here would deadlock.)
+        use crate::{kassert, kassert_eq};
         let mut buf = crate::ktest::Buf::new();
         let held = STATE.lock();
-        let written = write_crash_stats(&mut buf);
+        // SAFETY: this test holds the lock and doesn't use the heap meanwhile.
+        let written = unsafe { write_crash_stats(&mut buf) };
         drop(held);
-        kassert!(written.is_ok());
-        kassert!(buf.as_str() == "heap: locked (the crash happened inside the allocator)\n");
+        kassert_eq!(written, Ok(()));
+        kassert!(buf.as_str().starts_with("heap (lock held; may be mid-update): "));
+        kassert!(buf.as_str().contains(" bytes mapped at ") && !buf.as_str().contains("broken"));
         let mut buf = crate::ktest::Buf::new();
-        kassert!(write_crash_stats(&mut buf).is_ok());
+        // SAFETY: nothing uses the heap while this runs.
+        kassert_eq!(unsafe { write_crash_stats(&mut buf) }, Ok(()));
         kassert!(buf.as_str().starts_with("heap: ") && buf.as_str().contains(" bytes mapped at "));
         Ok(())
     }
@@ -370,15 +422,14 @@ crate::ktest!(
         use alloc::string::String;
         use alloc::vec::Vec;
         let before = stats();
-        let (start, _) = mapped();
         let boxed = Box::new(0x1234_5678_u64);
         kassert_eq!(*boxed, 0x1234_5678);
-        let at = &raw const *boxed as u64;
-        kassert!(start <= at && at < mapped().1);
+        kassert!(mapped().contains(&(&raw const *boxed as u64)));
         let mut v = Vec::new();
         for i in 0..10_000u64 {
             v.push(i);
         }
+        kassert!(mapped().contains(&(v.as_ptr() as u64)));
         kassert_eq!(v.iter().sum::<u64>(), 10_000 * 9_999 / 2);
         let mut map = BTreeMap::new();
         for i in 0..500u32 {
@@ -389,6 +440,7 @@ crate::ktest!(
         kassert_eq!(map.get(&42).map(String::as_str), Some("value 42"));
         let nested: Vec<Vec<u8>> = (0..64).map(|n| alloc::vec![n as u8; n * 17]).collect();
         kassert!(nested.iter().enumerate().all(|(n, b)| b.len() == n * 17 && b.iter().all(|&x| x == n as u8)));
+        kassert!(stats().live > before.live); // the heap was really used
         drop((boxed, v, map, nested));
         let after = stats();
         kassert_eq!((after.used, after.live), (before.used, before.live));
@@ -400,8 +452,9 @@ crate::ktest!(
     fn growth_failure_rolls_back() {
         // Asking for more than all free RAM maps pages until frames run
         // out, then must undo all of it: no frame leaks (apart from page
-        // tables, which are never freed) and the heap is unchanged. Asking
-        // for more than the window holds fails before touching anything.
+        // tables, which are never freed), nothing stays mapped above the
+        // heap, and the heap is unchanged. Asking for one page more than fits
+        // below HEAP_LIMIT fails before touching anything.
         use crate::{kassert, kassert_eq};
         use alloc::vec::Vec;
         let tables = || paging::for_each_active_table(|_| {}).map_err(|_| "unreadable table");
@@ -411,11 +464,18 @@ crate::ktest!(
         let mut owned = Vec::<u8>::new();
         let v = core::hint::black_box(&mut owned);
         kassert!(v.try_reserve_exact((free0 + 1024) * FRAME_SIZE as usize).is_err());
-        kassert!(matches!(last_error(), Some(GrowError::OutOfFrames | GrowError::Map(_))));
+        let no_table_frame = GrowError::Map(paging::VmError::Map(MapError::OutOfMemory));
+        kassert!(matches!(last_error(), Some(e) if e == GrowError::OutOfFrames || e == no_table_frame));
         let (free1, tables1) = (frame::free_frames(), tables()?);
         kassert_eq!(stats().size, size0);
         kassert_eq!(free1 + (tables1 - tables0), free0);
-        kassert!(v.try_reserve_exact(1 << 41).is_err()); // 2 TiB: more than the window
+        let end = mapped().end;
+        let stray = (end..end + (free0 as u64 + 1) * FRAME_SIZE)
+            .step_by(FRAME_SIZE as usize)
+            .find(|&page| paging::translate(VirtAddr::new(page).expect("canonical")).is_some());
+        kassert_eq!(stray, None);
+        let past_limit = (paging::HEAP_LIMIT - end + FRAME_SIZE) as usize;
+        kassert!(v.try_reserve_exact(past_limit).is_err());
         kassert_eq!(last_error(), Some(GrowError::WindowFull));
         kassert_eq!(frame::free_frames(), free1);
         // The heap still works, and a successful growth (more than is free

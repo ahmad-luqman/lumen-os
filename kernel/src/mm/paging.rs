@@ -53,8 +53,8 @@ pub const HHDM_TYPES: [EntryType; 4] =
 const KERNEL_BASE: u64 = 0xffff_ffff_8000_0000;
 /// One TiB: the size of the heap, stack and MMIO windows.
 const WINDOW: u64 = 1 << 40;
-/// Kernel heap ([`super::heap`]) and kernel stacks (#6): where [`map`] and
-/// [`unmap`] work.
+/// Base of the kernel heap window ([`super::heap`]). [`map`] and [`unmap`]
+/// work here and in the stacks window ([`STACKS_BASE`], #6).
 pub const HEAP_BASE: u64 = 0xffff_c000_0000_0000;
 /// The heap grows up from [`HEAP_BASE`] and stops below this. The top GiB of
 /// the window is left for the paging ktests' scratch page.
@@ -824,9 +824,9 @@ crate::ktest!(
         let (kstart, klen) = crate::mm::kernel_image();
         // Keep a block live so the heap has pages mapped, whichever tests
         // ran before this one.
-        let keep = alloc::vec![0u8; 1];
-        let (heap_start, heap_end) = crate::mm::heap::mapped();
-        kassert!(heap_end > heap_start);
+        let keep = core::hint::black_box(alloc::vec![0u8; 1]);
+        let heap = crate::mm::heap::mapped();
+        kassert!(!heap.is_empty());
         let (mut big, mut stray) = (0usize, None);
         let swept = for_each_active_mapping(|m| {
             let (lo, size) = (m.virt.as_u64(), m.size.bytes());
@@ -835,7 +835,7 @@ crate::ktest!(
             let in_hhdm = lo.checked_sub(hhdm).is_some_and(|p| {
                 p == m.phys.as_u64() && !m.executable && hhdm_spans().any(|(s, e, _)| s <= p && p + size <= e)
             });
-            let in_heap = (heap_start..heap_end).contains(&lo)
+            let in_heap = heap.contains(&lo)
                 && m.size == PageSize::Size4K
                 && m.writable
                 && !m.executable

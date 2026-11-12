@@ -16,11 +16,13 @@ from lumen_harness.crash import backtrace, page_walk
 BOOT_TIMEOUT = 60
 MIB = 1024 * 1024
 HEAP_BASE = 0xFFFF_C000_0000_0000
-# The heap's one-line summary (kmon `heap`, crash reports).
+# The heap's one-line summary (kmon `heap`, crash reports), written by
+# `mm::heap::write_state`. A crash with the heap's lock held labels it
+# "heap (lock held; may be mid-update)" instead of "heap".
 HEAP_LINE = re.compile(
     r"^heap: (?P<mapped>\d+) bytes mapped at (?P<base>0x[0-9a-f]+), (?P<used>\d+) used in "
     r"(?P<live>\d+) allocations, (?P<free>\d+) free in (?P<blocks>\d+) blocks \(largest (?P<largest>\d+)\)"
-    r"(?:; last growth failed: (?P<error>.+))?$",
+    r"(?:; last growth failed for (?P<fail_size>\d+) bytes \(align (?P<fail_align>\d+)\): (?P<error>.+))?$",
     re.MULTILINE,
 )
 
@@ -96,12 +98,14 @@ def test_kmon_heap_reports_usage(boot):
     m = boot("qemutest")
     m.expect(r"kmon> ", BOOT_TIMEOUT)
     m.send_line("heap")
-    line = m.expect(r"heap: .*\n")
-    heap = heap_line(line.group(0).rstrip("\n"))
-    assert int(heap["base"], 16) == HEAP_BASE, heap
-    mapped, used, free = int(heap["mapped"]), int(heap["used"]), int(heap["free"])
-    assert used + free == mapped and mapped % 4096 == 0, heap
-    assert int(heap["largest"]) <= free and heap["error"] is None, heap
+    line = m.expect(r"heap: .*\n").group(0)
+    # Nothing allocates before kmon, so the heap hasn't grown yet. (The first
+    # boot-time allocation changes this line; nonzero values are checked by
+    # the crash scenarios below.)
+    assert (
+        line
+        == f"heap: 0 bytes mapped at {HEAP_BASE:#x}, 0 used in 0 allocations, 0 free in 0 blocks (largest 0)\n"
+    )
 
 
 def test_out_of_memory_report_shows_the_heap(crash_report):
@@ -110,8 +114,12 @@ def test_out_of_memory_report_shows_the_heap(crash_report):
     report = crash_report("oom")
     assert f"panic: memory allocation of {1 << 41} bytes failed" in report, report
     heap = heap_line(report)
-    assert heap["error"] == "heap window full", heap
-    # Serial only, after the trace events.
+    assert (heap["fail_size"], heap["fail_align"], heap["error"]) == (
+        str(1 << 41),
+        "1",
+        "heap window full",
+    ), heap
+    # After the trace events (the serial-only part of the report).
     assert report.index("heap: ") > report.index("recent trace events"), report
 
 
@@ -123,9 +131,26 @@ def test_double_free_is_refused(crash_report):
     )
     assert re.search(bad_free, report, re.MULTILINE), report
     assert any("kmon::crash_double_free" in f for f in backtrace(report)), report
-    # The first free went through and the second changed nothing: only the
-    # 32-byte block kmon keeps is in use, and the free list is intact (one
-    # block: everything above it).
+    # The block was freed after its lower neighbour, so the second free is
+    # caught by its overlap with the merged free block below. It changed
+    # nothing: only the 128-byte block kmon keeps is in use (nothing else
+    # allocates at boot), and the free list is intact (one block: everything
+    # above it).
     heap = heap_line(report)
-    assert (heap["used"], heap["live"], heap["blocks"]) == ("32", "1", "1"), heap
-    assert int(heap["largest"]) == int(heap["free"]) == int(heap["mapped"]) - 32, heap
+    assert (heap["used"], heap["live"], heap["blocks"]) == ("128", "1", "1"), heap
+    assert int(heap["largest"]) == int(heap["free"]) == int(heap["mapped"]) - 128, heap
+
+
+def test_corrupt_free_list_is_a_crash_not_a_hang(crash_report):
+    # kmon links a freed block's free-list node back to itself and then
+    # allocates past it. The walk must panic (with the heap's lock held),
+    # and the report must still show the heap, naming the corruption.
+    report = crash_report("heapcorrupt")
+    assert re.search(
+        r"^panic: heap free list corrupt at offset 0x0 \(size 0x40, next 0x0\)$",
+        report,
+        re.MULTILINE,
+    ), report
+    locked = r"^heap \(lock held; may be mid-update\): \d+ bytes mapped at 0xffffc00000000000, 64 used in 1 allocations"
+    assert re.search(locked, report, re.MULTILINE), report
+    assert "(free list broken: block at 0x0 is out of order or overlaps)" in report, report

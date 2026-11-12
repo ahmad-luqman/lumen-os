@@ -52,7 +52,8 @@ struct Reservation {
     range: PhysRange,
 }
 
-/// A fixed-capacity list (there is no heap yet).
+/// A fixed-capacity list (the frame allocator is built before the heap,
+/// which depends on it).
 #[derive(Clone, Copy)]
 struct Reservations {
     items: [Reservation; MAX_RESERVATIONS],

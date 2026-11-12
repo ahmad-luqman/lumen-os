@@ -13,7 +13,8 @@
 //! crash (it then prints a one-line notice and stops).
 //!
 //! The output format is parsed by `tools/harness/lumen_harness/crash.py`
-//! (markers, backtrace, page walk) and `tests/scenarios/test_crash.py`;
+//! (markers, backtrace, page walk), `tests/scenarios/test_crash.py` and, for
+//! the heap line (`mm::heap::write_state`), `tests/scenarios/test_mm.py`;
 //! change them together.
 
 use crate::arch::{self, TrapFrame, serial::SerialWriter};
@@ -120,7 +121,8 @@ fn emit(body: &dyn Fn(&mut dyn Write), tail: &dyn Fn(&mut dyn Write)) {
     // Last: it reads heap memory, which nothing validates the way the page
     // walk validates tables. Doesn't block (says so if the heap's lock is
     // held); the free-list walk is bounded and stays inside the heap.
-    let _ = crate::mm::heap::write_crash_stats(&mut s);
+    // SAFETY: we are on the crash path; CRASHING guarantees we run alone.
+    let _ = unsafe { crate::mm::heap::write_crash_stats(&mut s) };
     IN_TAIL.store(false, Ordering::SeqCst);
     let _ = writeln!(s, "{END_MARKER}");
     // Serial first: if drawing the screen faults, the serial report survives.

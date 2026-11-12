@@ -243,16 +243,25 @@ Allocated blocks have no header, since `GlobalAlloc::dealloc` gets the same
 16 bytes). Allocation is first fit; padding in front of an aligned block and
 the tail stay free. `dealloc` merges with both neighbours, so no two free
 blocks touch, and refuses a block outside the heap, misaligned, or
-overlapping free memory (a double free or a wrong `Layout`) without changing
-anything; the kernel then panics. Both operations walk the list (O(free
-blocks)); size classes for small objects can go in front of it later.
+overlapping memory that is free right now, without changing anything; the
+kernel then panics. That catches a double free while the block is still
+free and a `Layout` larger than the original, but not a double free after
+the memory was handed out again or a smaller `Layout` (which leaks the
+difference; the heap check reports it once nothing is allocated). Every walk
+checks each free block it reads, so a corrupt list is a panic (and a crash
+report), not a hang. Both operations walk the list (O(free blocks)); size
+classes for small objects can go in front of it later.
 
-When growing fails the allocation returns null: `try_reserve` callers see
-an error, and everything else reaches `alloc`'s default error handler,
-which panics (`#[alloc_error_handler]` is unstable). Every crash report
-shows the heap's state in one line, including why the last growth failed;
-kmon's `heap` command prints the same line. Lock order: heap, page tables, frame
-allocator; nothing holding the last two may allocate.
+When the heap runs out (no frames, or the window is full) the allocation
+returns null: `try_reserve` callers see an error, and everything else
+reaches `alloc`'s default error handler, which panics
+(`#[alloc_error_handler]` is unstable). Any other mapping failure is a
+kernel bug and panics. The serial crash report ends with one line of heap
+state, including the last failed growth (size, alignment, reason); kmon's
+`heap` command prints the same line. Lock order: heap, page tables, frame
+allocator; nothing holding the last two may allocate, and the heap logs only
+after releasing its lock. The lock is not IRQ-safe until #7, so interrupt
+handlers must not allocate yet.
 
 ## 6. Interrupts, exceptions and crash reports (built)
 
@@ -266,9 +275,10 @@ allocator; nothing holding the last two may allocate.
   a report.
 - **Crash report:** exception name and vector, decoded #PF error code and CR2,
   rip with symbol, all registers, CR0/3/4, a frame-pointer backtrace, then on
-  serial only the last trace events, one line of heap state (never blocks: it
-  says so if the heap's lock is held; the free-list walk is bounded) and, for
-  a #PF, the page-table walk of CR2. It is
+  serial only the last trace events, for a #PF the page-table walk of CR2,
+  and last one line of heap state (never blocks: if the heap's lock is held
+  it reads the state anyway and says so; the free-list walk is bounded and
+  stays inside the heap). It is
   written to serial and to the screen. Frame pointers are forced on
   (`-C force-frame-pointers=yes`); the walker follows `rbp` only inside known
   stacks and only to return addresses inside kernel `.text`, so a corrupted
@@ -530,7 +540,7 @@ kernel. The kernel is the trusted computing base.
   under TCG locally; TCG's TSC rate depends on the host, so this is not
   comparable across machines or to cycles). Timestamps are raw TSC ticks until
   #7/#8. `kmon`'s `trace [n]` prints the newest events (a gap line says why
-  an event is missing), and the serial crash report ends with the last 16
+  an event is missing), and the serial crash report includes the last 16
   events (tested for a page fault and a panic).
 - **Boot timeline:** boot phases emit trace events. The fast-boot target is
   under 1 s from bootloader handoff to the shell, measured in the guest from TSC

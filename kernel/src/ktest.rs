@@ -152,6 +152,7 @@ impl Buf {
     }
 
     pub fn as_str(&self) -> &str {
+        // `write_str` appends whole `&str`s or nothing, so this is UTF-8.
         core::str::from_utf8(&self.data[..self.len]).unwrap_or("<invalid utf-8>")
     }
 }

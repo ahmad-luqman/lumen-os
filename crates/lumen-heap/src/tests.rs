@@ -183,10 +183,12 @@ fn refused_frees_change_nothing() {
     // SAFETY: inside the arena.
     let below_base = unsafe { arena.ptr.add(4096) };
     assert_eq!(refused(&mut upper, below_base, l), FreeError::OutsideHeap);
-    // Misaligned: not on a granule, or not at the layout's alignment.
+    // Misaligned: not on a granule (though at the layout's 8-byte
+    // alignment, inside `c`, overlapping nothing free), or not at the
+    // layout's alignment.
     // SAFETY: inside `c`'s block.
     let inside_c = unsafe { c.add(8) };
-    assert_eq!(refused(&mut heap, inside_c, l), FreeError::Misaligned);
+    assert_eq!(refused(&mut heap, inside_c, layout(32, 8)), FreeError::Misaligned);
     assert_eq!(refused(&mut heap, c, layout(64, 4096)), FreeError::Misaligned);
     assert_eq!(heap.stats(), stats);
     assert_eq!(heap.check().unwrap(), list);
@@ -196,15 +198,46 @@ fn refused_frees_change_nothing() {
 }
 
 #[test]
-fn freeing_more_than_is_allocated_is_refused() {
+fn double_free_after_merging_with_the_block_below_is_refused() {
+    // Freeing `b` after `a` merges it into `a`'s free block, so no free
+    // block starts at `b`: only the overlap with the block below catches
+    // the second free.
     let arena = Arena::new(4096);
     let mut heap = arena.heap(0, 4096);
-    let a = heap.alloc(layout(16, 16)).unwrap();
-    // Nothing free overlaps [a, a + 4096) but only 16 bytes are allocated.
-    // SAFETY: the heap must refuse this before touching memory.
-    let r = unsafe { heap.dealloc(a, layout(4096, 16)) };
-    assert_eq!(r, Err(FreeError::NotAllocated));
-    free(&mut heap, a, layout(16, 16));
+    let l = layout(64, 16);
+    let (a, b, _c) = (heap.alloc(l).unwrap(), heap.alloc(l).unwrap(), heap.alloc(l).unwrap());
+    free(&mut heap, a, l);
+    free(&mut heap, b, l);
+    let (stats, list) = (heap.stats(), heap.check().unwrap());
+    // SAFETY: a double free, which the heap must refuse without changes.
+    assert_eq!(unsafe { heap.dealloc(b, l) }, Err(FreeError::NotAllocated));
+    assert_eq!((heap.stats(), heap.check().unwrap()), (stats, list));
+}
+
+#[test]
+fn freeing_with_a_smaller_layout_is_reported_as_a_leak() {
+    let arena = Arena::new(4096);
+    let mut heap = arena.heap(0, 4096);
+    let a = heap.alloc(layout(64, 16)).unwrap();
+    // A smaller layout overlaps nothing free, so it can't be refused; the
+    // 32 bytes it leaves behind show once nothing is allocated.
+    free(&mut heap, a, layout(32, 16));
+    assert_eq!(heap.check(), Err(CheckError::Leaked { used: 32 }));
+}
+
+#[test]
+#[should_panic(expected = "heap free list corrupt")]
+fn a_corrupt_list_is_a_panic_not_an_endless_walk() {
+    let arena = Arena::new(4096);
+    let mut heap = arena.heap(0, 4096);
+    let a = heap.alloc(layout(64, 16)).unwrap();
+    let _b = heap.alloc(layout(64, 16)).unwrap();
+    free(&mut heap, a, layout(64, 16));
+    // Link the free block at `a` back to itself (a use-after-free write).
+    // SAFETY: the second word of the free block at `a` is its `next`.
+    unsafe { a.as_ptr().cast::<usize>().add(1).write(0) };
+    // Too big for the block at `a`, so the walk follows its link.
+    heap.alloc(layout(128, 16));
 }
 
 #[test]
@@ -323,7 +356,8 @@ fn randomized_stress_with_invariant_checks() {
         let mut heap = arena.heap(skew, 256 << 10);
         let mut owner = vec![0u32; ARENA / GRANULE];
         let mut live: Vec<(NonNull<u8>, Layout, u32)> = Vec::new();
-        let (mut next_tag, mut used) = (1u32, 0usize);
+        let mut freed: Vec<(NonNull<u8>, Layout)> = Vec::new();
+        let (mut next_tag, mut used, mut refused) = (1u32, 0usize, 0usize);
         for step in 0..40_000 {
             match rng.below(100) {
                 0..55 => {
@@ -359,8 +393,28 @@ fn randomized_stress_with_invariant_checks() {
                     owner[off / GRANULE..(off + block) / GRANULE].fill(0);
                     free(&mut heap, p, l);
                     used -= block;
+                    freed.push((p, l));
+                    if freed.len() > 64 {
+                        freed.remove(0);
+                    }
                 }
-                97.. => {
+                97..99 if !freed.is_empty() => {
+                    // A double free of a block that is still entirely free
+                    // must be refused without changes. (Once reused, even
+                    // partly, it can't be detected without headers.)
+                    let (p, l) = freed[rng.below(freed.len() as u64) as usize];
+                    let off = arena.offset(p);
+                    let block = block_size(l).unwrap();
+                    if owner[off / GRANULE..(off + block) / GRANULE].iter().all(|&g| g == 0) {
+                        let (stats, list) = (heap.stats(), heap.check().unwrap());
+                        // SAFETY: a double free, which the heap must refuse.
+                        let r = unsafe { heap.dealloc(p, l) };
+                        assert_eq!(r, Err(FreeError::NotAllocated), "step {step}: double free accepted");
+                        assert_eq!((heap.stats(), heap.check().unwrap()), (stats, list), "step {step}");
+                        refused += 1;
+                    }
+                }
+                99.. => {
                     let grow = 16 * (1 + rng.below(1024) as usize);
                     if skew + heap.stats().size + grow <= ARENA {
                         // SAFETY: inside the arena (checked above).
@@ -376,6 +430,7 @@ fn randomized_stress_with_invariant_checks() {
                 assert_eq!(list.bytes, stats.free());
             }
         }
+        assert!(refused > 100, "only {refused} double frees tried");
         for (p, l, _) in live.drain(..) {
             free(&mut heap, p, l);
         }
