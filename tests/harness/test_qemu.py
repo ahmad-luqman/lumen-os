@@ -1,8 +1,11 @@
-"""QEMU command-line construction."""
+"""QEMU command-line construction, and what each run records about its environment."""
 
+import os
 from pathlib import Path
 
-from lumen_harness.qemu import Machine, QemuOptions, qemu_args
+import pytest
+from lumen_harness import qemu
+from lumen_harness.qemu import Machine, QemuOptions, environment, qemu_args, qemu_version
 
 
 def opts(**kw):
@@ -22,6 +25,12 @@ def test_tests_get_debug_exit_and_no_reboot():
     assert args[args.index("-monitor") + 1] == "none"
 
 
+def test_args_include_extra():
+    args = qemu_args(opts(extra=["-smp", "4", "-device", "virtio-rng-pci"]))
+    assert args[-4:] == ["-smp", "4", "-device", "virtio-rng-pci"]
+    assert "-smp" not in qemu_args(opts())
+
+
 def test_machine_appends_extra_args_last(tmp_path):
     m = Machine(Path("x.iso"), tmp_path, extra_args=["-smp", "2,maxcpus=4"])
     args = qemu_args(m.options(Path("v.fd")))
@@ -29,3 +38,64 @@ def test_machine_appends_extra_args_last(tmp_path):
     assert args[args.index("-qmp") + 1] == f"unix:{m.qmp_path},server=on,wait=off"
     plain = qemu_args(Machine(Path("x.iso"), tmp_path).options(Path("v.fd")))
     assert "-smp" not in plain
+
+
+def test_live_machines_never_share_a_qmp_socket(tmp_path):
+    # Parallel workers are kept apart by the pid in the name; machines in one
+    # process (a test that boots twice) by a per-process counter.
+    machines = [Machine(Path("x.iso"), tmp_path / str(i)) for i in range(3)]
+    paths = {m.qmp_path for m in machines}
+    assert len(paths) == 3
+    assert all(f"-{os.getpid()}-" in p.name for p in paths)
+
+
+def fake_qemu(tmp_path: Path, script: str) -> Path:
+    exe = tmp_path / "fake-qemu"
+    exe.write_text("#!/bin/sh\n" + script + "\n")
+    exe.chmod(0o755)
+    return exe
+
+
+def test_qemu_version_is_the_first_line(tmp_path):
+    exe = fake_qemu(tmp_path, 'printf "\\nQEMU emulator version 9.2.0\\nCopyright\\n"')
+    assert qemu_version(str(exe)) == "QEMU emulator version 9.2.0"
+
+
+def test_qemu_version_says_why_it_is_unknown(tmp_path):
+    missing = tmp_path / "no-such-qemu"
+    assert qemu_version(str(missing)) == f"not found ({missing})"
+    failing = fake_qemu(tmp_path, "echo oops; exit 3")
+    assert qemu_version(str(failing)) == f"unknown ({failing} --version exited 3)"
+
+
+def test_ovmf_version_comes_from_the_fetch_stamp(tmp_path, monkeypatch):
+    monkeypatch.delenv("LUMEN_OVMF_CODE", raising=False)
+    monkeypatch.setattr(qemu, "BUILD_DIR", tmp_path)
+    code = tmp_path / "deps/ovmf/OVMF_CODE.fd"
+    assert qemu.ovmf_version() == f"unknown, no {code.parent / '.version'} ({code})"
+    code.parent.mkdir(parents=True)
+    (code.parent / ".version").write_text("edk2-stable202605-r1\n")
+    assert qemu.ovmf_version() == f"edk2-stable202605-r1 ({code})"
+    monkeypatch.setenv("LUMEN_OVMF_CODE", "/elsewhere/CODE.fd")
+    assert qemu.ovmf_version() == "custom, LUMEN_OVMF_CODE=/elsewhere/CODE.fd"
+
+
+@pytest.mark.parametrize("accel", ["kvm", "tcg"])
+def test_each_run_records_its_environment(tmp_path, monkeypatch, accel):
+    exe = fake_qemu(tmp_path, 'echo "QEMU emulator version 0.0 (fake)"')
+    vars_template = tmp_path / "VARS.fd"
+    vars_template.write_bytes(b"vars")
+    monkeypatch.setenv("LUMEN_QEMU", str(exe))
+    monkeypatch.setenv("LUMEN_OVMF_VARS", str(vars_template))
+    monkeypatch.setenv("LUMEN_OVMF_CODE", "/x/CODE.fd")
+    monkeypatch.setenv("LUMEN_ACCEL", accel)
+    with Machine(Path("x.iso"), tmp_path / "run") as m:
+        m.wait_exit(10)
+    recorded = (tmp_path / "run/environment.txt").read_text().splitlines()
+    assert recorded == [
+        "qemu: QEMU emulator version 0.0 (fake)",
+        f"accel: {accel}",
+        "ovmf: custom, LUMEN_OVMF_CODE=/x/CODE.fd",
+    ]
+    assert recorded == environment(accel)
+    assert f"-accel {accel} " in (tmp_path / "run/cmdline.txt").read_text()

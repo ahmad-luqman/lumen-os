@@ -30,3 +30,37 @@ milestone = "M0"
 tests = [
     "harness:test_status::*",
 ]
+
+[[feature]]
+name = "Scenario machines take extra QEMU arguments (-smp, devices, machine options)"
+milestone = "M1"
+tests = [
+    "harness:test_qemu::test_args_include_extra",
+    "harness:test_qemu::test_machine_appends_extra_args_last",
+    "scenario:test_acpi::test_cpu_count_matches_qemu[*]",
+]
+
+[[feature]]
+name = "Scenarios run in parallel (pytest-xdist): QMP sockets and artifact directories never shared"
+milestone = "M1"
+tests = [
+    "harness:test_qemu::test_live_machines_never_share_a_qmp_socket",
+    "harness:test_artifacts::test_artifacts_are_keyed_by_module_and_test",
+]
+
+[[feature]]
+name = "Each QEMU run records the QEMU version, accelerator and OVMF version with its artifacts"
+milestone = "M1"
+tests = [
+    "harness:test_qemu::test_each_run_records_its_environment[*]",
+    "harness:test_qemu::test_qemu_version_is_the_first_line",
+    "harness:test_qemu::test_qemu_version_says_why_it_is_unknown",
+    "harness:test_qemu::test_ovmf_version_comes_from_the_fetch_stamp",
+]
+
+[[feature]]
+name = "CI job summary shows the feature table, failing rows included"
+milestone = "M1"
+tests = [
+    "harness:test_status::test_ci_job_summary_gets_the_table[*]",
+]

@@ -11,11 +11,14 @@ status that the kernel sets through `isa-debug-exit`.
 
 Every run writes its artifacts to a directory: `serial.log` (everything the
 guest printed), `qemu.log` (QEMU `-d` trace: interrupts, CPU resets, guest
-errors), `cmdline.txt`, and any screenshots.
+errors), `cmdline.txt`, `environment.txt` (QEMU version, accelerator, OVMF
+version) and any screenshots.
 """
 
 from __future__ import annotations
 
+import functools
+import itertools
 import os
 import re
 import shutil
@@ -36,6 +39,11 @@ EXIT_FAILURE = (0x11 << 1) | 1  # 35
 EXIT_CRASH = (0x12 << 1) | 1  # 37
 
 
+def qemu_binary() -> str:
+    """The QEMU to run (override: LUMEN_QEMU)."""
+    return os.environ.get("LUMEN_QEMU", "qemu-system-x86_64")
+
+
 def ovmf_code() -> Path:
     """Pinned OVMF firmware from tools/fetch-deps.sh (override: LUMEN_OVMF_CODE)."""
     return Path(os.environ.get("LUMEN_OVMF_CODE", BUILD_DIR / "deps/ovmf/OVMF_CODE.fd"))
@@ -52,6 +60,45 @@ def default_accel() -> str:
     if os.access("/dev/kvm", os.R_OK | os.W_OK):
         return "kvm"
     return "tcg"
+
+
+@functools.cache
+def qemu_version(binary: str) -> str:
+    """First line of `binary --version`, or why it could not be read."""
+    try:
+        run = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=10, check=False
+        )
+    except FileNotFoundError:
+        return f"not found ({binary})"
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"unknown ({binary}: {e})"
+    first = next((line.strip() for line in run.stdout.splitlines() if line.strip()), "")
+    if run.returncode != 0 or not first:
+        return f"unknown ({binary} --version exited {run.returncode})"
+    return first
+
+
+def ovmf_version() -> str:
+    """The pinned OVMF release (from fetch-deps' `.version` stamp) and its path."""
+    code = ovmf_code()
+    if "LUMEN_OVMF_CODE" in os.environ:
+        return f"custom, LUMEN_OVMF_CODE={code}"
+    stamp = code.parent / ".version"
+    try:
+        return f"{stamp.read_text().strip()} ({code})"
+    except OSError:
+        return f"unknown, no {stamp} ({code})"
+
+
+def environment(accel: str) -> list[str]:
+    """What a run depends on besides the ISO: printed once per test session and
+    saved as environment.txt with each run's artifacts."""
+    return [
+        f"qemu: {qemu_version(qemu_binary())}",
+        f"accel: {accel}",
+        f"ovmf: {ovmf_version()}",
+    ]
 
 
 def timeout_scale() -> float:
@@ -78,7 +125,7 @@ class QemuOptions:
 
 def qemu_args(o: QemuOptions) -> list[str]:
     args = [
-        os.environ.get("LUMEN_QEMU", "qemu-system-x86_64"),
+        qemu_binary(),
         "-machine", "q35",
         "-accel", o.accel,
         "-m", o.memory,
@@ -111,6 +158,10 @@ def fresh_vars(dest: Path) -> Path:
     return dest
 
 
+# Numbers this process's machines' QMP sockets: live machines never share one.
+_machine_ids = itertools.count()
+
+
 class ExpectTimeout(AssertionError):
     pass
 
@@ -139,14 +190,17 @@ class Machine:
         self._qmp: QmpClient | None = None
         # macOS limits unix socket paths to ~104 bytes, so keep it short.
         self._sock_dir = Path(os.environ.get("LUMEN_SOCK_DIR", "/tmp"))
-        self.qmp_path = self._sock_dir / f"lumen-qmp-{os.getpid()}-{id(self) & 0xFFFFFF:x}.sock"
+        # The pid keeps parallel test workers (pytest-xdist) apart.
+        self.qmp_path = self._sock_dir / f"lumen-qmp-{os.getpid()}-{next(_machine_ids)}.sock"
 
     # -- lifecycle -------------------------------------------------------
     def start(self) -> Self:
         self.artifacts.mkdir(parents=True, exist_ok=True)
         self.qmp_path.unlink(missing_ok=True)
-        args = qemu_args(self.options(fresh_vars(self.artifacts / "OVMF_VARS.fd")))
+        opts = self.options(fresh_vars(self.artifacts / "OVMF_VARS.fd"))
+        args = qemu_args(opts)
         (self.artifacts / "cmdline.txt").write_text(" ".join(args) + "\n")
+        (self.artifacts / "environment.txt").write_text("\n".join(environment(opts.accel)) + "\n")
         # Lives as long as the machine; closed in close().
         self._serial_log = open(self.artifacts / "serial.log", "wb")  # noqa: SIM115
         self.proc = subprocess.Popen(

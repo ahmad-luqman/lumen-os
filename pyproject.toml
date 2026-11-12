@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "pillow>=11",
     "pytest>=8",
+    "pytest-xdist>=3",
 ]
 
 [dependency-groups]

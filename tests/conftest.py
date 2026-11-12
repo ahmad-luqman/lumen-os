@@ -2,9 +2,10 @@
 
 `boot` starts a headless QEMU machine from one of the ISOs built by
 `make iso` and closes it after the test. Each test gets its own artifacts
-directory under build/test-artifacts/<test name>/. Artifacts of passing tests
-are deleted; failing tests keep serial.log, qemu.log (with the `-d int`
-interrupt trace and CPU resets) and any screenshots, and CI uploads them.
+directory, build/test-artifacts/<module>/<test>/ (unique even when tests run in
+parallel under pytest-xdist). Artifacts of passing tests are deleted; failing
+tests keep serial.log, qemu.log (with the `-d int` interrupt trace and CPU
+resets), environment.txt and any screenshots, and CI uploads them.
 """
 
 from __future__ import annotations
@@ -16,9 +17,9 @@ from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import pytest
-from lumen_harness import BUILD_DIR, REPO_ROOT
+from lumen_harness import BUILD_DIR, REPO_ROOT, artifact_dir
 from lumen_harness.crash import BEGIN, END, PROTECTION_BROKEN
-from lumen_harness.qemu import EXIT_CRASH, Machine
+from lumen_harness.qemu import EXIT_CRASH, Machine, default_accel, environment
 
 ISOS = {
     "interactive": BUILD_DIR / "lumen.iso",
@@ -29,6 +30,11 @@ ISOS = {
 # artifacts apart from the first run's: CI re-runs KVM failures under TCG.
 ARTIFACTS = REPO_ROOT / (os.environ.get("LUMEN_ARTIFACTS_DIR") or BUILD_DIR / "test-artifacts")
 GOLDEN_DIR = Path(__file__).parent / "golden"
+
+
+def pytest_report_header(config: pytest.Config) -> list[str]:
+    # Runs once, in the controlling process even under pytest-xdist.
+    return [f"lumen {line}" for line in environment(default_accel())]
 
 
 @pytest.hookimpl(wrapper=True)
@@ -44,8 +50,7 @@ _FAILED = pytest.StashKey[bool]()
 
 @pytest.fixture
 def artifacts(request: pytest.FixtureRequest) -> Iterator[Path]:
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", request.node.nodeid.split("::", 1)[-1])
-    path = ARTIFACTS / safe
+    path = artifact_dir(ARTIFACTS, request.node.nodeid)
     shutil.rmtree(path, ignore_errors=True)
     path.mkdir(parents=True)
     yield path
