@@ -51,6 +51,8 @@ def test_no_hpet_is_a_warning(boot):
     m.expect(r"INFO  time: tsc .* \(calibrated against pit\)\n", BOOT_TIMEOUT)
     m.expect(r"INFO  boot: boot complete", BOOT_TIMEOUT)
     m.expect(r"kmon> ", BOOT_TIMEOUT)
+    # The boot timeline is still complete (it is logged at warn if not).
+    assert "WARN  boot" not in m.output
     tsc, reference, pit, hpet = clocks(m)
     assert (reference, hpet) == ("pit", None)
     assert pit is not None
@@ -69,6 +71,8 @@ def test_no_madt_boots_without_acpi(boot):
     m.expect(r"INFO  boot: boot complete", BOOT_TIMEOUT)
     # And the local APIC found through IA32_APIC_BASE ticks.
     m.expect(r"kmon> ", BOOT_TIMEOUT)
+    # The boot timeline is still complete (it is logged at warn if not).
+    assert "WARN  boot" not in m.output
     before, *_ = ticks(m)
     m.send_line("sleep 50")
     m.expect(r"kmon> ")
