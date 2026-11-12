@@ -36,6 +36,7 @@ mod klog;
 mod kmon;
 mod ktest;
 mod mm;
+mod smp;
 mod symbols;
 mod sync;
 mod time;
@@ -161,6 +162,8 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
         warn!(target: "irq", "no timer interrupt in 10 ms");
     }
     ktrace!(Kind::BootPhase, BootPhase::Time);
+    smp::init();
+    ktrace!(Kind::BootPhase, BootPhase::Smp);
     match boot::FRAMEBUFFER.get_response().and_then(|r| r.framebuffers().next()) {
         Some(fb) => match fb::init(&fb) {
             Some((w, h)) => info!(target: "fb", "framebuffer {w}x{h} ready"),

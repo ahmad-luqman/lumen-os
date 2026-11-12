@@ -154,8 +154,8 @@ static mut IDT: [IdtEntry; 256] = [IdtEntry::MISSING; 256];
 /// The vectors that run on their own IST stack, and their slots.
 const IST_VECTORS: [(usize, u8); 3] = [(2, gdt::IST_NMI), (8, gdt::IST_DOUBLE_FAULT), (18, gdt::IST_MACHINE_CHECK)];
 
-/// Fill and load the IDT. Must run after [`gdt::init`]. Every vector runs on
-/// the current stack until [`use_ist_stacks`].
+/// Fill the IDT and load it on the boot CPU. Must run after its GDT is
+/// loaded. Every vector runs on the current stack until [`use_ist_stacks`].
 pub fn init() {
     let stubs = &raw const lumen_isr_stubs as u64;
     let idt = &raw mut IDT;
@@ -164,17 +164,24 @@ pub fn init() {
         for vector in 0..256u64 {
             (*idt)[vector as usize] = IdtEntry::interrupt_gate(stubs + vector * STUB_STRIDE, 0);
         }
-        let ptr = IdtPointer { limit: (size_of::<[IdtEntry; 256]>() - 1) as u16, base: idt as u64 };
-        asm!("lidt [{}]", in(reg) &raw const ptr, options(readonly, nostack, preserves_flags));
     }
+    load();
+}
+
+/// Load the (shared, already filled) IDT on this CPU.
+pub fn load() {
+    let ptr = IdtPointer { limit: (size_of::<[IdtEntry; 256]>() - 1) as u16, base: &raw const IDT as u64 };
+    // SAFETY: the IDT is filled (`init` ran on the boot CPU) and static.
+    unsafe { asm!("lidt [{}]", in(reg) &raw const ptr, options(readonly, nostack, preserves_flags)) };
 }
 
 /// Make the NMI, double-fault and machine-check gates switch to their IST
 /// stacks. Only through `install_ist_stacks`, after the slots are filled.
 ///
 /// # Safety
-/// `gdt::set_ist_stacks` has filled the slots with valid stacks; nothing
-/// else touches the IDT meanwhile (one CPU).
+/// `gdt::set_ist_stacks` has filled the boot CPU's slots with valid stacks,
+/// and no other CPU runs yet (each AP fills its own slots before it loads
+/// the IDT, so every CPU taking these vectors has them).
 pub(super) unsafe fn use_ist_stacks() {
     // An empty slot would make the CPU switch to address 0: check them all
     // before switching any gate.

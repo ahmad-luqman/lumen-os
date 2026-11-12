@@ -128,3 +128,40 @@ pub unsafe extern "C" fn switch_stack(top: u64, entry: extern "C" fn() -> !) -> 
         "ud2",
     )
 }
+
+/// Leave the bootloader's address space for good (an application processor):
+/// load the page tables at `root`, flush every TLB entry (also global ones,
+/// which the bootloader's tables may set), point `rsp` at `top` and call
+/// `entry`, which never returns. Nothing touches the old stack after the CR3
+/// load: it may not be mapped in the new tables. The frame chain ends here
+/// (`rbp` = 0), so a backtrace never walks into the bootloader's stack.
+///
+/// # Safety
+/// `root` maps the whole running kernel (code, data, and `top`'s stack) as
+/// the boot CPU uses it, with EFER.NXE on (its entries use NX); `top` is the
+/// 16-byte-aligned top of a mapped stack that nothing else uses and that is
+/// never freed.
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_kernel_space(root: u64, top: u64, entry: extern "C" fn() -> !) -> ! {
+    core::arch::naked_asm!(
+        "mov cr3, rdi",
+        "mov rax, cr4", // toggle CR4.PGE (bit 7): drops global entries too
+        "mov rcx, rax",
+        "btr rcx, 7",
+        "mov cr4, rcx",
+        "mov cr4, rax",
+        "mov rsp, rsi",
+        "xor ebp, ebp",
+        "call rdx", // rsp is 16-byte aligned here, as calls require
+        "ud2",
+    )
+}
+
+/// Turn interrupts on and wait for one (`sti; hlt`: `sti` takes effect after
+/// the next instruction, so an interrupt can't slip in between and leave the
+/// CPU halted with its wakeup already handled). Returns after the handler.
+pub fn wait_for_interrupt() {
+    // SAFETY: the IDT is loaded and every vector has a handler; callers wait
+    // outside every critical section.
+    unsafe { asm!("sti", "hlt", options(nomem, nostack)) }
+}

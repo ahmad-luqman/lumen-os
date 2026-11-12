@@ -79,12 +79,14 @@ pub enum BootPhase {
     Interrupts = 8,
     /// TSC and timer calibration, interrupts on, the 10 ms first-tick check.
     Time = 9,
-    Framebuffer = 10,
-    Complete = 11,
+    /// The other CPUs started (`smp`).
+    Smp = 10,
+    Framebuffer = 11,
+    Complete = 12,
 }
 
 impl BootPhase {
-    pub const ALL: [BootPhase; 11] = [
+    pub const ALL: [BootPhase; 12] = [
         BootPhase::Entry,
         BootPhase::ArchInit,
         BootPhase::Logger,
@@ -94,6 +96,7 @@ impl BootPhase {
         BootPhase::Acpi,
         BootPhase::Interrupts,
         BootPhase::Time,
+        BootPhase::Smp,
         BootPhase::Framebuffer,
         BootPhase::Complete,
     ];
@@ -120,6 +123,7 @@ impl BootPhase {
             BootPhase::Acpi => "acpi",
             BootPhase::Interrupts => "interrupts",
             BootPhase::Time => "time",
+            BootPhase::Smp => "smp",
             BootPhase::Framebuffer => "framebuffer",
             BootPhase::Complete => "complete",
         }
@@ -461,14 +465,14 @@ crate::ktest!(
         // Only boot-phase events count (a log event's args[0] is its level).
         record_at(&ring, 15, Kind::Log, args([BootPhase::Stacks as u64]));
         for (tsc, p) in [(17, BootPhase::Interrupts), (18, BootPhase::Time), (19, BootPhase::Framebuffer)] {
-            phase(tsc, p); // no complete: the total isn't framebuffer's
+            phase(tsc, p); // no smp, no complete: the total isn't framebuffer's
         }
         let t = Timeline::new(&ring, clock);
         kassert_eq!(
             text(&t).as_str(),
             "entry +0.000 ms, arch-init +1.000 ms, logger +2.000 ms, symbols before entry, memory +4.000 ms, \
-             stacks missing, acpi +6.000 ms, interrupts +7.000 ms, time +8.000 ms, framebuffer +9.000 ms, \
-             complete missing (total unknown)"
+             stacks missing, acpi +6.000 ms, interrupts +7.000 ms, time +8.000 ms, smp missing, \
+             framebuffer +9.000 ms, complete missing (total unknown)"
         );
         kassert!(!t.is_complete());
         kassert_eq!(text(&Timeline::new(&ring, None)).as_str(), "unavailable (the TSC isn't calibrated)");
@@ -480,7 +484,7 @@ crate::ktest!(
         }
         let t = Timeline::new(&full, clock);
         kassert!(t.is_complete());
-        kassert!(text(&t).as_str().ends_with("complete +20.000 ms (total 20.000 ms)"));
+        kassert!(text(&t).as_str().ends_with("complete +22.000 ms (total 22.000 ms)"));
         kassert!(!Timeline::new(&full, None).is_complete());
 
         // Every phase after entry, but memory before symbols: it says so.
@@ -503,7 +507,7 @@ crate::ktest!(
         }
         let t = Timeline::new(&unfinished, clock);
         kassert!(!t.is_complete());
-        kassert!(text(&t).as_str().ends_with("framebuffer +18.000 ms, complete missing (total unknown)"));
+        kassert!(text(&t).as_str().ends_with("framebuffer +20.000 ms, complete missing (total unknown)"));
 
         // Every phase but entry.
         let headless = TraceRing::<16>::new();
