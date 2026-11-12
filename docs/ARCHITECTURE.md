@@ -154,10 +154,12 @@ up to `arch::MAX_CPUS` = 8 CPUs in all, without waiting:
   CPU warns how many halted (`2 of 2 CPU(s) past the limit halted`).
 - Why before the calibration: a CPU in Limine's park loop spins on its
   `goto_address`, and under emulation spinning CPUs take host time from
-  every guest's calibration windows (measured: an idle `-smp 10` guest used
-  about 250% host CPU, 100% once the 2 extra CPUs were halted; with the APs
-  started after calibration, 1 of 13 parallel scenario runs failed a 2%
-  calibration check, 0 of 16 once they were started before it).
+  every guest calibrating alongside. Measured under TCG, QEMU's CPU time
+  to the kmon prompt over a 1-CPU boot's: `-smp 4` +0.54 s with the APs
+  started after calibration, +0.34 s before it; `-smp 10` +2.09 s and
+  +1.23 s (the rest is Limine's own boot, when they already spin). An idle
+  `-smp 10` guest used about 250% host CPU while 2 CPUs spun in Limine,
+  100% once they were halted.
 
 **Per-CPU state.** Each CPU's GS base points at its own record
 (`arch::percpu`), so `percpu::index()` (0 is the boot CPU) is one
@@ -175,9 +177,10 @@ check and the halt. kmon's `crash <kind> <cpu>` uses it.
 
 APs handle no device interrupts: every I/O APIC input goes to the boot CPU,
 and an AP's local APIC timer stays masked. Known gap: there is no TLB
-shootdown; `unmap` flushes only the CPU that runs it. Today only the boot
-CPU maps or unmaps, and the APs touch only their own stacks and statics
-(not tested).
+shootdown; `unmap` flushes only the CPU that runs it. Mapping needs none
+(x86 caches no not-present entries, and an AP may grow the heap, e.g.
+`crash oom 1`), and the only pages ever unmapped are dropped kernel stacks
+(test stacks, on the boot CPU), which no other CPU has used (not tested).
 
 ### ACPI (built in M1)
 
