@@ -33,6 +33,11 @@ panic = "abort"
 
 # The kernel is always built with the release profile: optimized, but with
 # symbols, overflow checks and debug assertions kept (safety over speed).
+# The trace ring's concurrency tests only hit their race windows reliably
+# when optimized (measured with mutants in the PR #15 review).
+[profile.dev.package.lumen-trace]
+opt-level = 3
+
 [profile.release]
 panic = "abort"
 debug = "line-tables-only"

@@ -18,38 +18,47 @@ pub const EVENTS: usize = 4096;
 
 static RING: TraceRing<EVENTS> = TraceRing::new();
 
-/// What an event records. Stored as the event's `kind`.
+/// What an event records. Stored as the event's `kind` (0 is never used).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
 pub enum Kind {
     /// `args[0]`: a [`BootPhase`].
     BootPhase = 1,
-    /// `args`: vector, rip, error code.
+    /// `args`: vector, rip, error code (0 if the vector pushes none).
+    /// Recorded for every vector entering the IDT dispatcher, so hardware
+    /// interrupts will show up here once they are enabled (#7) unless they
+    /// get their own kind.
     Exception = 2,
     /// `args[0]`: level (1 = error .. 5 = trace); `args[1]`: the subsystem
-    /// tag's first 8 bytes, little-endian.
+    /// tag's first 8 bytes, little-endian (longer tags are cut). Only lines
+    /// that pass the log-level filter are recorded.
     Log = 3,
     /// Recorded by in-kernel tests.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
     Test = 0xff,
 }
 
-#[cfg_attr(feature = "ktest", allow(dead_code))] // used by kmon's `trace`
+#[cfg_attr(feature = "ktest", allow(dead_code))] // used by kmon's `trace` and crash reports
 impl Kind {
-    fn name(raw: u16) -> &'static str {
-        match raw {
-            1 => "boot-phase",
-            2 => "exception",
-            3 => "log",
-            0xff => "test",
-            _ => "unknown",
+    const ALL: [Kind; 4] = [Kind::BootPhase, Kind::Exception, Kind::Log, Kind::Test];
+
+    fn from_raw(raw: u16) -> Option<Kind> {
+        Self::ALL.into_iter().find(|&k| k as u16 == raw)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Kind::BootPhase => "boot-phase",
+            Kind::Exception => "exception",
+            Kind::Log => "log",
+            Kind::Test => "test",
         }
     }
 }
 
-/// Boot phases, in order. Recorded when the phase is done.
+/// Boot phases, in order. Recorded when the phase ends, whether or not it
+/// succeeded (e.g. `Framebuffer` with no framebuffer).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u64)]
 pub enum BootPhase {
     /// GDT, IDT and serial are up.
     ArchInit = 1,
@@ -60,17 +69,31 @@ pub enum BootPhase {
     Complete = 6,
 }
 
-#[cfg_attr(feature = "ktest", allow(dead_code))] // used by kmon's `trace`
 impl BootPhase {
-    fn name(raw: u64) -> &'static str {
-        match raw {
-            1 => "arch-init",
-            2 => "logger",
-            3 => "symbols",
-            4 => "memory",
-            5 => "framebuffer",
-            6 => "complete",
-            _ => "?",
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // checked by ktests; #8 prints the timeline
+    pub const ALL: [BootPhase; 6] = [
+        BootPhase::ArchInit,
+        BootPhase::Logger,
+        BootPhase::Symbols,
+        BootPhase::Memory,
+        BootPhase::Framebuffer,
+        BootPhase::Complete,
+    ];
+
+    #[cfg_attr(feature = "ktest", allow(dead_code))] // used by kmon's `trace` and crash reports
+    fn from_raw(raw: u64) -> Option<BootPhase> {
+        Self::ALL.into_iter().find(|&p| p as u64 == raw)
+    }
+
+    #[cfg_attr(feature = "ktest", allow(dead_code))] // used by kmon's `trace` and crash reports
+    fn name(self) -> &'static str {
+        match self {
+            BootPhase::ArchInit => "arch-init",
+            BootPhase::Logger => "logger",
+            BootPhase::Symbols => "symbols",
+            BootPhase::Memory => "memory",
+            BootPhase::Framebuffer => "framebuffer",
+            BootPhase::Complete => "complete",
         }
     }
 }
@@ -82,19 +105,16 @@ pub fn ring() -> &'static TraceRing<EVENTS> {
 
 /// Record an event in `ring` now. Use [`ktrace!`](crate::ktrace!) instead.
 pub fn record_in<const N: usize>(ring: &TraceRing<N>, kind: Kind, args: [u64; 4]) {
-    // cpu 0 and pid 0 until SMP (#9) and processes (M2) exist.
-    ring.record(arch::rdtsc(), 0, kind as u16, 0, args);
+    // cpu 0 and pid 0 until SMP (#9) and processes (M2) exist. A dropped
+    // event is counted in the ring's `dropped()`; recording never fails loudly.
+    let _ = ring.record(arch::rdtsc(), 0, kind as u16, 0, args);
 }
 
 /// Pad up to four arguments to the event's four slots (more fail to compile).
 pub const fn args<const M: usize>(given: [u64; M]) -> [u64; 4] {
     const { assert!(M <= 4, "a trace event has at most 4 arguments") };
     let mut out = [0; 4];
-    let mut i = 0;
-    while i < M {
-        out[i] = given[i];
-        i += 1;
-    }
+    out.split_at_mut(M).0.copy_from_slice(&given);
     out
 }
 
@@ -103,7 +123,8 @@ pub const fn args<const M: usize>(given: [u64; M]) -> [u64; 4] {
 ///
 /// Named `ktrace!` rather than `trace!` so it can't be confused with (or
 /// shadow) `log::trace!`. Never blocks and never allocates, so it is safe in
-/// exception handlers.
+/// exception handlers. Arguments are converted with `as u64`: pass unsigned
+/// integers or fieldless enums.
 #[macro_export]
 macro_rules! ktrace {
     ($kind:expr $(, $arg:expr)* $(,)?) => {
@@ -120,33 +141,63 @@ pub fn pack_tag(tag: &str) -> u64 {
     u64::from_le_bytes(b)
 }
 
-#[cfg_attr(feature = "ktest", allow(dead_code))] // used by kmon's `trace`
-fn unpack_tag(v: u64) -> [u8; 8] {
-    v.to_le_bytes()
-}
-
-/// One event as a line of text: `#seq tsc kind details`.
-#[cfg_attr(feature = "ktest", allow(dead_code))] // used by kmon's `trace`
+/// One event as a line of text: `#seq tsc=<ticks> kind details`. Values it
+/// doesn't recognise are printed raw rather than hidden.
+#[cfg_attr(feature = "ktest", allow(dead_code))] // used by kmon's `trace` and crash reports
 pub struct Describe<'a>(pub &'a Event);
 
 impl fmt::Display for Describe<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let e = self.0;
-        write!(f, "#{:<6} tsc={:<14} {:<10}", e.seq, e.tsc, Kind::name(e.kind))?;
-        match e.kind {
-            k if k == Kind::BootPhase as u16 => write!(f, " {}", BootPhase::name(e.args[0])),
-            k if k == Kind::Exception as u16 => {
+        let kind = Kind::from_raw(e.kind);
+        write!(f, "#{:<6} tsc={:<14} ", e.seq, e.tsc)?;
+        match kind {
+            Some(k) => write!(f, "{:<10}", k.name())?,
+            None => write!(f, "kind={:#06x}", e.kind)?,
+        }
+        match kind {
+            Some(Kind::BootPhase) => match BootPhase::from_raw(e.args[0]) {
+                Some(p) => write!(f, " {}", p.name()),
+                None => write!(f, " phase={}", e.args[0]),
+            },
+            Some(Kind::Exception) => {
                 write!(f, " vector={} rip={:#x} error={:#x}", e.args[0], e.args[1], e.args[2])
             }
-            k if k == Kind::Log as u16 => {
-                let tag = unpack_tag(e.args[1]);
-                let tag = core::str::from_utf8(&tag).unwrap_or("?").trim_end_matches('\0');
-                let level = ["?", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"].get(e.args[0] as usize).unwrap_or(&"?");
-                write!(f, " {level} {tag}")
+            Some(Kind::Log) => {
+                match log::Level::iter().find(|&l| l as u64 == e.args[0]) {
+                    Some(level) => write!(f, " {level}")?,
+                    None => write!(f, " level={}", e.args[0])?,
+                }
+                let tag = e.args[1].to_le_bytes();
+                match core::str::from_utf8(&tag) {
+                    Ok(t) => write!(f, " {}", t.trim_end_matches('\0')),
+                    Err(_) => write!(f, " tag={:#x}", e.args[1]),
+                }
             }
-            _ => write!(f, " args={:#x?}", e.args),
+            Some(Kind::Test) | None => write!(f, " args={:#x?}", e.args),
         }
     }
+}
+
+/// Print the newest `n` events of the current CPU's ring, oldest first, one
+/// per line with `indent`; gaps say why an event is missing. Lock-free, so
+/// the crash reporter can use it.
+#[cfg_attr(feature = "ktest", allow(dead_code))] // used by kmon's `trace` and crash reports
+pub fn write_recent(w: &mut dyn fmt::Write, n: u64, indent: &str) -> fmt::Result {
+    let ring = ring();
+    let head = ring.written();
+    let cap = ring.capacity() as u64;
+    let from = head.saturating_sub(n.min(cap));
+    for seq in from..head {
+        match ring.read(seq) {
+            Some(e) => writeln!(w, "{indent}{}", Describe(&e))?,
+            // Older than the ring's capacity: overwritten. Otherwise the
+            // writer dropped it, or is (or was interrupted) mid-write.
+            None if seq + cap < head => writeln!(w, "{indent}#{seq:<6} (overwritten)")?,
+            None => writeln!(w, "{indent}#{seq:<6} (dropped or being written)")?,
+        }
+    }
+    Ok(())
 }
 
 crate::ktest!(
@@ -157,12 +208,11 @@ crate::ktest!(
         for i in 0..3u64 {
             crate::ktrace!(Kind::Test, 0x7e57, i, i * 2);
         }
-        let events = [ring.read(start), ring.read(start + 1), ring.read(start + 2)];
         let mut prev_tsc = 0;
-        for (i, e) in events.iter().enumerate() {
-            let e = e.ok_or("a recorded event is missing")?;
+        for i in 0..3u64 {
+            let e = ring.read(start + i).ok_or("a recorded event is missing")?;
             kassert_eq!(e.kind, Kind::Test as u16);
-            kassert_eq!(e.args, [0x7e57, i as u64, i as u64 * 2, 0]);
+            kassert_eq!(e.args, [0x7e57, i, i * 2, 0]);
             kassert!(e.tsc >= prev_tsc);
             prev_tsc = e.tsc;
         }
@@ -174,24 +224,27 @@ crate::ktest!(
 
 crate::ktest!(
     fn boot_phases_recorded_in_order() {
-        use crate::kassert_eq;
+        // Boot events are the oldest; this relies on the ring not having
+        // wrapped since boot (true while ktests log little).
+        use crate::{kassert, kassert_eq};
         let ring = ring();
-        let mut phases = [0u64; 6];
+        kassert!(ring.written() <= EVENTS as u64);
+        let mut phases = [0u64; BootPhase::ALL.len()];
         let mut found = 0;
         let mut prev_tsc = 0;
-        // Boot events are the oldest; scan from the start of what's held.
-        for seq in ring.written().saturating_sub(EVENTS as u64)..ring.written() {
+        for seq in 0..ring.written() {
             let Some(e) = ring.read(seq) else { continue };
-            if e.kind == Kind::BootPhase as u16 && found < phases.len() {
-                if e.tsc < prev_tsc {
-                    return Err("boot phase timestamps go backwards");
+            if e.kind == Kind::BootPhase as u16 {
+                if found == phases.len() {
+                    return Err("more boot-phase events than phases");
                 }
+                kassert!(e.tsc >= prev_tsc);
                 prev_tsc = e.tsc;
                 phases[found] = e.args[0];
                 found += 1;
             }
         }
-        kassert_eq!(phases, [1, 2, 3, 4, 5, 6]);
+        kassert_eq!(phases, BootPhase::ALL.map(|p| p as u64));
         Ok(())
     }
 );
@@ -203,12 +256,15 @@ crate::ktest!(
         let start = ring.written();
         // SAFETY: #BP is handled and returns (see idt::lumen_exception_dispatch).
         unsafe { core::arch::asm!("int3") };
-        log::info!(target: "tracetest", "a log line for the trace test");
+        log::info!(target: "tracetst", "a log line for the trace test");
         let events: [Option<Event>; 4] = core::array::from_fn(|i| ring.read(start + i as u64));
         let exception =
             events.iter().flatten().find(|e| e.kind == Kind::Exception as u16).ok_or("no exception event")?;
         kassert_eq!(exception.args[0], 3);
-        let log = events.iter().flatten().find(|e| e.kind == Kind::Log as u16 && e.args[1] == pack_tag("tracetest"));
+        let log = events
+            .iter()
+            .flatten()
+            .find(|e| e.kind == Kind::Log as u16 && e.args[1] == u64::from_le_bytes(*b"tracetst"));
         let log = log.ok_or("no log event")?;
         kassert_eq!(log.args[0], log::Level::Info as u64);
         kassert!(log.seq > exception.seq);
@@ -228,9 +284,11 @@ crate::ktest!(
         }
         let per_event = (arch::rdtsc() - t0) / N;
         crate::ktest::diag(format_args!("trace: {per_event} TSC ticks per event ({N} events)"));
-        // Loose bound: catches a lock, a spin or a syscall sneaking in, not
-        // noise (TCG's TSC is emulated).
-        crate::kassert!(per_event < 5_000);
+        // Loose bounds: catches gross regressions such as waiting or doing
+        // I/O (e.g. serial output) per event, and a TSC that doesn't move. An
+        // added uncontended lock would not trip it. Under TCG the TSC follows
+        // a host clock, not guest cycles.
+        crate::kassert!(per_event > 0 && per_event < 5_000);
         crate::kassert_eq!(BENCH.dropped(), 0);
         Ok(())
     }

@@ -35,6 +35,7 @@ impl Log for KernelLogger {
             return;
         }
         let tag = tag_for(record.target());
+        // Trace before taking the line lock: recording never waits.
         crate::ktrace!(crate::trace::Kind::Log, record.level(), crate::trace::pack_tag(tag));
         let _line = LINE_LOCK.lock();
         let mut out = SerialWriter;

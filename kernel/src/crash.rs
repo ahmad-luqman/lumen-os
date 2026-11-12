@@ -25,6 +25,8 @@ pub const END_MARKER: &str = "==== END CRASH REPORT ====";
 pub const SCREEN_MARKER: &str = "(crash report shown on screen)";
 
 const MAX_FRAMES: usize = 32;
+/// How many trace events a crash report shows.
+const RECENT_TRACE_EVENTS: u64 = 16;
 
 static CRASHING: AtomicBool = AtomicBool::new(false);
 
@@ -74,6 +76,10 @@ fn emit(body: &dyn Fn(&mut dyn Write)) {
     let mut s = SerialWriter;
     let _ = writeln!(s, "\n{BEGIN_MARKER}");
     body(&mut s);
+    // What led up to it (serial only: the screen has no room). The ring is
+    // lock-free, so reading it here can't deadlock.
+    let _ = writeln!(s, "recent trace events (oldest first):");
+    let _ = crate::trace::write_recent(&mut s, RECENT_TRACE_EVENTS, "  ");
     let _ = writeln!(s, "{END_MARKER}");
     // Serial first: if drawing the screen faults, the serial report survives.
     // SAFETY: we are on the crash path; CRASHING guarantees we run alone.

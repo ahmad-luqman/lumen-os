@@ -9,6 +9,8 @@ tests = [
     "ktest:lumen_kernel::trace::boot_phases_recorded_in_order",
     "ktest:lumen_kernel::trace::exceptions_and_logs_are_traced",
     "ktest:lumen_kernel::trace::trace_overhead_is_small",
-    "scenario:test_trace::test_trace_command_shows_boot_phases_and_logs",
+    "scenario:test_trace::test_trace_command_shows_every_event_since_boot",
+    "scenario:test_trace::test_trace_defaults_and_usage",
     "scenario:test_trace::test_exception_appears_in_trace",
+    "scenario:test_crash::test_report_shows_the_trace_events_leading_up_to_it",
 ]

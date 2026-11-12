@@ -8,21 +8,42 @@ import re
 
 BOOT_TIMEOUT = 60
 PHASES = ["arch-init", "logger", "symbols", "memory", "framebuffer", "complete"]
+EVENT_LINE = re.compile(r"^#(\d+) +tsc=(\d+) +(\S+)(.*)$", re.MULTILINE)
 
 
-def test_trace_command_shows_boot_phases_and_logs(boot):
+def trace(m, arg: str) -> tuple[list[tuple[str, str, str, str]], int, int]:
+    """Run `trace <arg>`; returns (event lines, claimed, dropped)."""
+    start = len(m.output)
+    m.send_line(f"trace {arg}".strip())
+    summary = m.expect(r"trace: (\d+) events claimed, (\d+) dropped\n", 20)
+    out = m.output[start : summary.start()]
+    return EVENT_LINE.findall(out), int(summary.group(1)), int(summary.group(2))
+
+
+def test_trace_command_shows_every_event_since_boot(boot):
     m = boot("qemutest")
     m.expect(r"kmon> ", BOOT_TIMEOUT)
-    m.send_line("trace 4096")
-    summary = m.expect(r"trace: (\d+) events recorded, (\d+) dropped\n", 20)
-    out = m.output[: summary.start()]
-    phases = re.findall(r"boot-phase +(\S+)", out)
+    events, claimed, dropped = trace(m, "4096")
+    assert dropped == 0
+    # Nothing was overwritten or lost: one line per claimed event, in order.
+    assert [int(seq) for seq, *_ in events] == list(range(claimed)), events
+    assert not any(kind.startswith("(") for *_, kind, _ in events)
+    phases = [rest.strip() for _, _, kind, rest in events if kind == "boot-phase"]
     assert phases == PHASES, phases
-    assert re.search(r"log +INFO boot\n", out), "log lines are traced with level and tag"
-    tsc = [int(t) for t in re.findall(r"tsc=(\d+)", out)]
-    assert tsc == sorted(tsc), "timestamps go backwards"
-    assert int(summary.group(1)) > len(PHASES)
-    assert summary.group(2) == "0"
+    assert any(kind == "log" and rest.strip() == "INFO boot" for _, _, kind, rest in events)
+    # Boot phases come from straight-line code, so their timestamps are in
+    # order (nested interrupts can reorder other events' timestamps).
+    phase_tsc = [int(tsc) for _, tsc, kind, _ in events if kind == "boot-phase"]
+    assert phase_tsc == sorted(phase_tsc)
+
+
+def test_trace_defaults_and_usage(boot):
+    m = boot("qemutest")
+    m.expect(r"kmon> ", BOOT_TIMEOUT)
+    events, claimed, _ = trace(m, "")
+    assert len(events) == min(16, claimed)
+    m.send_line("trace lots")
+    m.expect(r"usage: trace \[n\]\n", 10)
 
 
 def test_exception_appears_in_trace(boot):
@@ -30,5 +51,6 @@ def test_exception_appears_in_trace(boot):
     m.expect(r"kmon> ", BOOT_TIMEOUT)
     m.send_line("int3")
     m.expect(r"breakpoints taken: 1")
-    m.send_line("trace 3")
-    m.expect(r"exception +vector=3 rip=0x[0-9a-f]+ error=0x0\n", 20)
+    events, _, _ = trace(m, "3")
+    exceptions = [rest.strip() for _, _, kind, rest in events if kind == "exception"]
+    assert any(re.fullmatch(r"vector=3 rip=0x[0-9a-f]+ error=0x0", e) for e in exceptions), events

@@ -77,7 +77,7 @@ fn dispatch(line: &str) {
         "crash" => crash(rest.trim()),
         "trace" => match rest.trim() {
             "" => trace(16),
-            n => match n.parse() {
+            arg => match arg.parse() {
                 Ok(n) => trace(n),
                 Err(_) => {
                     let _ = writeln!(out, "usage: trace [n]");
@@ -99,19 +99,12 @@ fn dispatch(line: &str) {
 fn trace(n: u64) {
     let mut out = serial::SerialWriter;
     let ring = crate::trace::ring();
-    let head = ring.written();
-    let from = head.saturating_sub(n.min(ring.capacity() as u64));
-    for seq in from..head {
-        match ring.read(seq) {
-            Some(e) => {
-                let _ = writeln!(out, "{}", crate::trace::Describe(&e));
-            }
-            None => {
-                let _ = writeln!(out, "#{seq:<6} (overwritten or being written)");
-            }
-        }
+    let cap = ring.capacity() as u64;
+    if n > cap {
+        let _ = writeln!(out, "(the ring holds {cap} events; showing those)");
     }
-    let _ = writeln!(out, "trace: {head} events recorded, {} dropped", ring.dropped());
+    let _ = crate::trace::write_recent(&mut out, n, "");
+    let _ = writeln!(out, "trace: {} events claimed, {} dropped", ring.written(), ring.dropped());
 }
 
 fn crash(kind: &str) {
