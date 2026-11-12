@@ -22,6 +22,6 @@ pub fn init() {
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first used by ktests; #4 uses it too
 pub fn phys_to_virt(phys: u64) -> *mut u8 {
     let offset = HHDM_OFFSET.load(Ordering::Relaxed);
-    debug_assert_ne!(offset, 0, "phys_to_virt before mm::init");
+    assert_ne!(offset, 0, "phys_to_virt before mm::init");
     (offset + phys) as *mut u8
 }

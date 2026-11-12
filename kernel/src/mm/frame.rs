@@ -15,9 +15,10 @@
 //!    case entries overlap) and so is every frame of the active page tables.
 //!
 //! The named list is printed at `debug` level (`lumen.log=debug`). The
-//! in-kernel tests check, independently of that list, that nothing behind a
-//! live mapping is allocatable; then allocate every frame and check each one
-//! against the memory map and the list.
+//! in-kernel tests check, independently of that list, that no frame behind
+//! the kernel image, boot stack, kernel file or framebuffer, and no page-table
+//! frame, is allocatable; then allocate every frame and check each one against
+//! the memory map and the list.
 
 use limine::memory_map::{Entry, EntryType};
 use log::{debug, info, warn};
@@ -30,8 +31,15 @@ use crate::sync::SpinLock;
 const MAX_RESERVATIONS: usize = 16;
 /// Size of an ACPI 2.0+ RSDP structure.
 const RSDP_SIZE: u64 = 36;
+// Reservation names (logged, and looked up by the ktests).
 const NULL_FRAME: &str = "null frame";
+const KERNEL_IMAGE: &str = "kernel image";
+const KERNEL_FILE: &str = "kernel file";
+const BOOT_STACK: &str = "boot stack";
+const FRAMEBUFFER: &str = "framebuffer";
+const ACPI_RSDP: &str = "acpi rsdp";
 const BITMAP: &str = "frame bitmap";
+const NOTHING_ALLOCATED: &str = "nothing is allocated during init";
 
 /// A named physical range the allocator must never hand out.
 #[derive(Clone, Copy, Debug)]
@@ -54,12 +62,18 @@ impl Reservations {
 
     fn push(&mut self, name: &'static str, range: PhysRange) {
         assert!(self.len < MAX_RESERVATIONS, "too many named frame reservations");
+        assert!(!range.is_empty(), "reservation '{name}' is empty: it would protect nothing");
         self.items[self.len] = Reservation { name, range };
         self.len += 1;
     }
 
     fn as_slice(&self) -> &[Reservation] {
         &self.items[..self.len]
+    }
+
+    #[cfg(feature = "ktest")]
+    fn get(&self, name: &str) -> Option<PhysRange> {
+        self.as_slice().iter().find(|r| r.name == name).map(|r| r.range)
     }
 }
 
@@ -101,9 +115,11 @@ fn phys_range_of(hhdm: u64, what: &str, virt: u64, len: u64) -> PhysRange {
     let start = translate(virt);
     let (first_page, first_frame) = (align_down(virt, FRAME_SIZE), align_down(start, FRAME_SIZE));
     for page in pages(virt, len) {
-        if translate(page) != first_frame + (page - first_page) {
-            panic!("{what}: not physically contiguous at {page:#x}");
-        }
+        assert_eq!(
+            translate(page),
+            first_frame + (page - first_page),
+            "{what}: not physically contiguous at {page:#x}"
+        );
     }
     PhysRange::from_len(start, len)
 }
@@ -152,28 +168,31 @@ fn named_reservations(hhdm: u64) -> Reservations {
     r.push(NULL_FRAME, PhysRange::new(0, FRAME_SIZE));
 
     let (kstart, klen) = kernel_image_virt();
-    let image = phys_range_of(hhdm, "kernel image", kstart, klen);
-    if let Some(addr) = boot::EXECUTABLE_ADDRESS.get_response() {
+    let image = phys_range_of(hhdm, KERNEL_IMAGE, kstart, klen);
+    match boot::EXECUTABLE_ADDRESS.get_response() {
         // Two sources disagreeing means one of them is wrong about where the
         // kernel lives: don't guess which.
-        assert_eq!(addr.physical_base(), image.start(), "Limine and the page tables disagree on the kernel's address");
+        Some(addr) => {
+            assert_eq!(addr.physical_base(), image.start(), "Limine and the page tables disagree on the kernel")
+        }
+        None => warn!(target: "mem", "no executable address response; kernel location not cross-checked"),
     }
-    r.push("kernel image", image);
+    r.push(KERNEL_IMAGE, image);
 
     match boot::EXECUTABLE_FILE.get_response() {
         Some(resp) => {
             let file = resp.file();
-            r.push("kernel file", phys_range_of(hhdm, "kernel file", file.addr() as u64, file.size()));
+            r.push(KERNEL_FILE, phys_range_of(hhdm, KERNEL_FILE, file.addr() as u64, file.size()));
         }
         // Not used then (symbols aren't loaded); its memory is non-usable.
         None => debug!(target: "mem", "no kernel file response; nothing to reserve"),
     }
 
     let (bottom, top) = arch::stacks::boot_stack();
-    r.push("boot stack", phys_range_of(hhdm, "boot stack", bottom, top - bottom));
+    r.push(BOOT_STACK, phys_range_of(hhdm, BOOT_STACK, bottom, top - bottom));
 
     match framebuffer_virt() {
-        Some((virt, len)) => r.push("framebuffer", phys_range_of(hhdm, "framebuffer", virt, len)),
+        Some((virt, len)) => r.push(FRAMEBUFFER, phys_range_of(hhdm, FRAMEBUFFER, virt, len)),
         None => debug!(target: "mem", "no framebuffer; nothing to reserve"),
     }
 
@@ -182,11 +201,11 @@ fn named_reservations(hhdm: u64) -> Reservations {
     // reserve any table it finds in usable memory.
     match boot::RSDP.get_response() {
         Some(resp) => {
-            // Physical at base revision 3 (what we request); other revisions
-            // give an HHDM pointer. Accept either.
+            // Physical at base revision 3 only (kmain refuses to boot under
+            // any other); other revisions give an HHDM pointer.
             let addr = resp.address() as u64;
-            let phys = if addr >= hhdm { addr - hhdm } else { addr };
-            r.push("acpi rsdp", PhysRange::from_len(phys, RSDP_SIZE));
+            assert!(addr < hhdm, "RSDP address {addr:#x} is not physical; Limine base revision changed?");
+            r.push(ACPI_RSDP, PhysRange::from_len(addr, RSDP_SIZE));
         }
         None => warn!(target: "mem", "no ACPI RSDP from Limine"),
     }
@@ -197,6 +216,7 @@ fn named_reservations(hhdm: u64) -> Reservations {
 /// allocates.
 pub fn init(hhdm: u64) {
     assert!(STATE.lock().is_none(), "frame allocator initialized twice");
+    assert!(paging::four_level(), "5-level paging is on; the page-table walks assume 4 levels");
     let entries = boot::MEMMAP.get_response().expect("Limine gave no memory map").entries();
     let mut reserved = named_reservations(hhdm);
 
@@ -229,7 +249,6 @@ pub fn init(hhdm: u64) {
         FrameAllocator::new(span, storage, usable(entries)).expect("bitmap storage is sized by storage_words");
 
     reserved.push(BITMAP, bitmap);
-    const NOTHING_ALLOCATED: &str = "nothing is allocated during init";
     for r in reserved.as_slice() {
         let taken = frames.reserve(r.range).expect(NOTHING_ALLOCATED);
         // Live memory inside a `usable` entry means the map's labels are
@@ -265,20 +284,25 @@ fn with_frames<R>(f: impl FnOnce(&mut FrameAllocator<'static>) -> R) -> R {
 }
 
 /// Allocate one 4 KiB frame; returns its physical address, or `None` when
-/// physical memory is exhausted. Frames are not zeroed.
+/// physical memory is exhausted. Frames are not zeroed. Return it with [`free`].
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: page tables (#4), heap (#5)
+#[must_use = "dropping the address leaks the frame"]
 pub fn alloc() -> Option<u64> {
     with_frames(|f| f.alloc())
 }
 
 /// Allocate `count` contiguous frames aligned to `align_frames` frames (a
-/// power of two); returns the first physical address.
+/// power of two); returns the first physical address, or `None` if no such
+/// run is free. Panics if `count` is 0 or `align_frames` is not a power of
+/// two (caller bugs). Return the run with [`free_contiguous`] and the same
+/// count.
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: page tables (#4), heap (#5)
+#[must_use = "dropping the address leaks the frames"]
 pub fn alloc_contiguous(count: usize, align_frames: usize) -> Option<u64> {
     with_frames(|f| f.alloc_contiguous(count, align_frames))
 }
 
-/// Return a frame from [`alloc`] or [`alloc_contiguous`].
+/// Return a frame from [`alloc`].
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: page tables (#4), heap (#5)
 pub fn free(addr: u64) -> Result<(), FreeError> {
     with_frames(|f| f.free(addr))
@@ -308,13 +332,24 @@ mod checks {
         with_state(|s| s.frames.free_frames())
     }
 
-    pub fn bitmap() -> Result<PhysRange, &'static str> {
-        let reserved = with_state(|s| s.reserved);
-        reserved.as_slice().iter().find(|r| r.name == BITMAP).map(|r| r.range).ok_or("no bitmap reservation")
+    /// Is any frame free, by scanning the bitmap (not the counters or hint)?
+    pub fn any_free() -> bool {
+        with_state(|s| {
+            let span = s.frames.span();
+            (span.start()..span.end()).step_by(FRAME_SIZE as usize).any(|f| s.frames.is_free(f))
+        })
+    }
+
+    pub fn reservation(name: &str) -> Result<PhysRange, &'static str> {
+        with_state(|s| s.reserved.get(name)).ok_or("named reservation missing")
     }
 
     pub fn hhdm() -> Result<u64, &'static str> {
         Ok(boot::HHDM.get_response().ok_or("no HHDM response")?.offset())
+    }
+
+    pub fn entries() -> Result<&'static [&'static Entry], &'static str> {
+        Ok(boot::MEMMAP.get_response().ok_or("no memory map")?.entries())
     }
 
     /// FNV-1a: detects writes to memory the test must not touch.
@@ -348,17 +383,18 @@ mod checks {
         let file = kernel_file()?;
         let (fb, fb_len) = framebuffer_virt().ok_or("no framebuffer")?;
         Ok([
-            ("kernel image", kstart, klen),
-            ("boot stack", stack_lo, stack_hi - stack_lo),
+            (KERNEL_IMAGE, kstart, klen),
+            (BOOT_STACK, stack_lo, stack_hi - stack_lo),
             ("current stack page", arch::read_rsp(), 1),
-            ("kernel file", file.as_ptr() as u64, file.len() as u64),
-            ("framebuffer", fb, fb_len),
+            (KERNEL_FILE, file.as_ptr() as u64, file.len() as u64),
+            (FRAMEBUFFER, fb, fb_len),
         ])
     }
 
     /// The first frame the kernel is using that `is_owned` says is
-    /// allocatable: behind a live range (found through the page tables, not
-    /// the reservation list) or holding a page table.
+    /// allocatable: behind the kernel image, boot stack, current stack page,
+    /// kernel file or framebuffer (found through the page tables, not the
+    /// reservation list), or holding a page table.
     pub fn first_live_owned(
         hhdm: u64,
         is_owned: impl Fn(u64) -> bool,
@@ -406,16 +442,17 @@ mod checks {
         pub head: u64,
         pub count: usize,
         pub failure: Option<&'static str>,
-        /// `alloc` and `alloc_contiguous` both failed at the end.
-        pub exhausted: bool,
+        /// After the last `alloc`, the bitmap held no free frame.
+        pub none_left: bool,
     }
 
     /// Allocate frames until none is left. Each is checked, then filled with
     /// [`FILL`] except for three words: the previous frame (0 ends the chain:
     /// frame 0 is never handed out), a sequence number and its own address.
-    /// Never returns early: the caller must always free the chain.
+    /// Stops at the first bad frame (after freeing it) with `failure` set.
+    /// Always returns the chain built so far, which the caller must free.
     pub fn allocate_all(entries: &[&Entry], reserved: &[Reservation]) -> Chain {
-        let mut chain = Chain { head: 0, count: 0, failure: None, exhausted: false };
+        let mut chain = Chain { head: 0, count: 0, failure: None, none_left: false };
         while let Some(frame) = alloc() {
             if let Some(why) = bad_frame(frame, entries, reserved) {
                 crate::ktest::diag(format_args!("frame {frame:#x}: {why}"));
@@ -425,52 +462,75 @@ mod checks {
                 }
                 return chain;
             }
-            let p = crate::mm::phys_to_virt(frame).cast::<u64>();
+            let p = crate::mm::phys_to_virt(frame);
+            let w = p.cast::<u64>();
             // SAFETY: the allocator just handed us this frame and it passed
             // the checks above, so nothing else uses it; the HHDM maps it.
             unsafe {
-                core::ptr::write_bytes(p.cast::<u8>(), FILL, FRAME_SIZE as usize);
-                p.write(chain.head);
-                p.add(1).write(chain.count as u64);
-                p.add(2).write(frame);
+                core::ptr::write_bytes(p, FILL, FRAME_SIZE as usize);
+                w.write(chain.head);
+                w.add(1).write(chain.count as u64);
+                w.add(2).write(frame);
             }
             chain.head = frame;
             chain.count += 1;
         }
-        chain.exhausted = match alloc_contiguous(1, 1) {
-            None => true,
-            Some(extra) => {
-                let _ = free(extra); // only to not leak it; the test fails on `exhausted`
-                false
-            }
-        };
+        chain.none_left = !any_free();
         chain
     }
 
-    /// Free every frame of the chain, newest first. Checks each still holds
-    /// what was written: its sequence number counts down from `count - 1`, so
-    /// a frame handed out twice (overwritten by its second allocation) or any
-    /// other writer is caught. Keeps going after a problem so that a failure
-    /// doesn't leak memory into the next test. Returns `(freed, first problem)`.
+    /// Is `frame` an allocated frame that still carries `allocate_all`'s
+    /// self-tag? Only such a frame may be read or freed by the test.
+    fn ours(frame: u64) -> bool {
+        let allocated = with_state(|s| s.frames.is_owned(frame) && !s.frames.is_free(frame));
+        // SAFETY: an allocated frame is either ours (filled by allocate_all)
+        // or leaked by an earlier failed test; either way nothing else uses
+        // it, and the HHDM maps it.
+        allocated && unsafe { crate::mm::phys_to_virt(frame).cast::<u64>().add(2).read() } == frame
+    }
+
+    /// Free every frame of the chain, newest first, checking each one's link,
+    /// sequence number (counting down from `count - 1`), self-tag and last
+    /// byte. A frame handed out twice (its second allocation overwrote the
+    /// first) or a stray write to those words is reported. The walk stops at
+    /// the first problem, since the links can't be trusted after it; the rest
+    /// of the frames are then found by sweeping the bitmap for allocated
+    /// frames carrying their self-tag, so a failure doesn't leak memory into
+    /// later tests. Returns `(frames freed, first problem)`.
     pub fn free_chain(chain: &Chain) -> (usize, Option<&'static str>) {
         let (mut head, mut freed, mut problem) = (chain.head, 0, None);
-        while head != 0 && freed < chain.count {
+        while head != 0 && problem.is_none() {
+            if !ours(head) {
+                crate::ktest::diag(format_args!("chain link {head:#x} is not an allocated, tagged frame"));
+                problem = Some("the chain of allocated frames is broken");
+                break;
+            }
             let p = crate::mm::phys_to_virt(head);
             let w = p.cast::<u64>();
-            // SAFETY: `head` is a frame allocated and filled by allocate_all.
-            let (next, seq, tag, last) =
-                unsafe { (w.read(), w.add(1).read(), w.add(2).read(), p.add(FRAME_SIZE as usize - 1).read()) };
-            let expected_seq = (chain.count - 1 - freed) as u64;
-            if (seq, tag, last) != (expected_seq, head, FILL) && problem.is_none() {
-                crate::ktest::diag(format_args!("frame {head:#x}: seq {seq} (want {expected_seq}), tag {tag:#x}"));
+            // SAFETY: `ours` checked `head` is an allocated frame we tagged.
+            let (next, seq, last) = unsafe { (w.read(), w.add(1).read(), p.add(FRAME_SIZE as usize - 1).read()) };
+            let expected_seq = chain.count.saturating_sub(freed + 1) as u64;
+            if (seq, last) != (expected_seq, FILL) {
+                crate::ktest::diag(format_args!(
+                    "frame {head:#x}: seq {seq} (want {expected_seq}), last byte {last:#x}"
+                ));
                 problem = Some("an allocated frame was overwritten (handed out twice, or another writer)");
             }
-            if let Err(e) = free(head) {
-                crate::ktest::diag(format_args!("free({head:#x}): {e}"));
-                problem = problem.or(Some("freeing an allocated frame failed"));
+            match free(head) {
+                Ok(()) => freed += 1,
+                Err(e) => {
+                    crate::ktest::diag(format_args!("free({head:#x}): {e}"));
+                    problem = problem.or(Some("freeing an allocated frame failed"));
+                }
             }
-            freed += 1;
             head = next;
+        }
+        if problem.is_some() {
+            let span = with_state(|s| s.frames.span());
+            let swept = (span.start()..span.end()).step_by(FRAME_SIZE as usize).filter(|&f| ours(f) && free(f).is_ok());
+            let swept = swept.count();
+            crate::ktest::diag(format_args!("freed {swept} more frames by sweeping the bitmap"));
+            freed += swept;
         }
         (freed, problem)
     }
@@ -481,21 +541,22 @@ crate::ktest!(
         use self::checks::*;
         use crate::{kassert, kassert_eq};
         let hhdm = hhdm()?;
-        let entries = boot::MEMMAP.get_response().ok_or("no memory map")?.entries();
+        let entries = entries()?;
         let reserved = with_state(|s| s.reserved);
 
-        // 1. Independent of the reservation list: nothing the kernel is using
-        //    (found through the page tables) is allocatable. The bitmap check
-        //    needs the list only to know where the bitmap is.
+        // 1. Independent of the reservation list: no frame behind the kernel
+        //    image, boot stack, kernel file or framebuffer (found through the
+        //    page tables), and no page-table frame, is allocatable. The bitmap
+        //    check needs the list only to know where the bitmap is.
         if let Some((name, phys)) = first_live_owned(hhdm, is_owned)? {
             crate::ktest::diag(format_args!("{name}: frame {phys:#x} is allocatable"));
             return Err("a frame the kernel is using is allocatable");
         }
-        let bitmap = bitmap()?;
+        let bitmap = reservation(BITMAP)?;
         kassert!(pages(bitmap.start(), bitmap.len()).all(|p| !is_owned(p)));
 
         // 2. Allocate every frame, checking each against the memory map and
-        //    the named list; 3. free them all, checking contents.
+        //    the named list; 3. free them all, checking their tags.
         let before = free_frames();
         let readonly_sum = checksum(kernel_readonly());
         let file_sum = checksum(kernel_file()?);
@@ -505,7 +566,7 @@ crate::ktest!(
         if let Some(why) = chain.failure.or(problem) {
             return Err(why);
         }
-        kassert!(chain.exhausted);
+        kassert!(chain.none_left);
         kassert_eq!(chain.count, before);
         kassert_eq!(freed, chain.count);
         kassert_eq!(free_frames(), before);
@@ -524,15 +585,39 @@ crate::ktest!(
         use crate::kassert_eq;
         let hhdm = hhdm()?;
         let (kstart, _) = kernel_image_virt();
-        let (stack_lo, _) = arch::stacks::boot_stack();
+        let (_, stack_top) = arch::stacks::boot_stack();
         let image = paging::translate(hhdm, kstart).ok_or("kernel not mapped")?;
-        let stack = paging::translate(hhdm, align_down(stack_lo, FRAME_SIZE)).ok_or("boot stack not mapped")?;
+        let stack = paging::translate(hhdm, align_down(stack_top - 1, FRAME_SIZE)).ok_or("stack not mapped")?;
         let mut table = 0;
         paging::for_each_table_frame(hhdm, |t| table = t);
-        kassert_eq!(first_live_owned(hhdm, |p| p == image)?, Some(("kernel image", image)));
-        kassert_eq!(first_live_owned(hhdm, |p| p == stack)?, Some(("boot stack", stack)));
+        kassert_eq!(first_live_owned(hhdm, |p| p == image)?, Some((KERNEL_IMAGE, image)));
+        kassert_eq!(first_live_owned(hhdm, |p| p == stack)?, Some((BOOT_STACK, stack)));
         kassert_eq!(first_live_owned(hhdm, |p| p == table)?, Some(("page table", table)));
         kassert_eq!(first_live_owned(hhdm, |_| false)?, None);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn bad_frame_detects_reserved_frames() {
+        // The per-frame check in never_returns_reserved must be able to fail.
+        use self::checks::*;
+        use crate::kassert_eq;
+        let entries = entries()?;
+        let reserved = with_state(|s| s.reserved);
+        let reserved = reserved.as_slice();
+        // The bitmap is the named reservation that lies in usable memory.
+        kassert_eq!(
+            bad_frame(reservation(BITMAP)?.start(), entries, reserved),
+            Some("frame overlaps a named reservation")
+        );
+        kassert_eq!(bad_frame(0, entries, reserved).is_some(), true);
+        kassert_eq!(bad_frame(reservation(KERNEL_IMAGE)?.start(), entries, reserved).is_some(), true);
+        let frame = alloc().ok_or("out of frames")?;
+        let (unaligned, good) = (bad_frame(frame + 1, entries, reserved), bad_frame(frame, entries, reserved));
+        kassert_eq!(free(frame), Ok(()));
+        kassert_eq!(unaligned, Some("frame address not aligned"));
+        kassert_eq!(good, None);
         Ok(())
     }
 );
@@ -541,17 +626,14 @@ crate::ktest!(
     fn named_reservations_are_complete() {
         use self::checks::*;
         use crate::kassert_eq;
-        let reserved = with_state(|s| s.reserved);
-        let find = |name| reserved.as_slice().iter().find(|r| r.name == name).filter(|r| !r.range.is_empty());
-        for name in [NULL_FRAME, "kernel image", "kernel file", "boot stack", "framebuffer", "acpi rsdp", BITMAP] {
-            if find(name).is_none() {
-                crate::ktest::diag(format_args!("missing or empty reservation '{name}'"));
+        for name in [NULL_FRAME, KERNEL_IMAGE, KERNEL_FILE, BOOT_STACK, FRAMEBUFFER, ACPI_RSDP, BITMAP] {
+            if reservation(name).is_err() {
+                crate::ktest::diag(format_args!("missing reservation '{name}'"));
                 return Err("a named reservation is missing");
             }
         }
-        let image = find("kernel image").ok_or("no kernel image")?;
         let limine = boot::EXECUTABLE_ADDRESS.get_response().ok_or("no executable address response")?;
-        kassert_eq!(image.range.start(), limine.physical_base());
+        kassert_eq!(reservation(KERNEL_IMAGE)?.start(), limine.physical_base());
         Ok(())
     }
 );
@@ -562,13 +644,15 @@ crate::ktest!(
         // it against an independent answer: the HHDM maps `p` at `hhdm + p`.
         use self::checks::*;
         use crate::{kassert, kassert_eq};
-        kassert!(arch::read_cr4() & (1 << 12) == 0); // no LA57: the walker assumes 4 levels
+        kassert!(paging::four_level());
         let hhdm = hhdm()?;
+        let bitmap = reservation(BITMAP)?.start();
         let frame = alloc().ok_or("out of frames")?;
-        for p in [frame, frame + 0x123, bitmap()?.start(), 0x1000] {
-            kassert_eq!(paging::translate(hhdm, hhdm + p), Some(p));
-        }
+        let got = [frame, frame + 0x123, bitmap, 0x1000].map(|p| (paging::translate(hhdm, hhdm + p), p));
         kassert_eq!(free(frame), Ok(()));
+        for (translated, p) in got {
+            kassert_eq!(translated, Some(p));
+        }
         Ok(())
     }
 );
@@ -580,17 +664,18 @@ crate::ktest!(
         let before = free_frames();
         let a = alloc().ok_or("out of frames")?;
         kassert_eq!(free(a), Ok(()));
-        kassert_eq!(alloc(), Some(a));
-        kassert_eq!(free(a), Ok(()));
+        let b = alloc().ok_or("out of frames")?;
+        kassert_eq!(free(b), Ok(()));
+        kassert_eq!(b, a);
         kassert_eq!(free(a), Err(FreeError::DoubleFree));
 
-        let kernel = paging::translate(hhdm()?, kernel_image_virt().0).ok_or("kernel not mapped")?;
+        let kernel = reservation(KERNEL_IMAGE)?.start();
         kassert!(matches!(free(kernel), Err(FreeError::NotOwned | FreeError::OutOfRange)));
         kassert!(free(0).is_err());
 
         let run = alloc_contiguous(4, 4).ok_or("no 4-frame run")?;
-        kassert!(run.is_multiple_of(4 * FRAME_SIZE));
         kassert_eq!(free_contiguous(run, 4), Ok(()));
+        kassert!(run.is_multiple_of(4 * FRAME_SIZE));
         kassert_eq!(free_frames(), before);
         Ok(())
     }

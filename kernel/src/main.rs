@@ -27,13 +27,14 @@ use log::{LevelFilter, info, warn};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Kernel entry point. Limine jumps here with a 16-byte aligned stack.
+/// Kernel entry point. Limine jumps here with a 16-byte aligned stack top and
+/// a 0 return address pushed on it (Limine protocol, x86-64 entry state).
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
         "xor ebp, ebp",   // end of the frame-pointer chain
-        "mov rdi, rsp",   // stack top, for the stack registry
+        "lea rdi, [rsp + 8]", // stack top (above Limine's 0 return address)
         "and rsp, -16",
         "call {kmain}",
         "ud2",
@@ -63,7 +64,7 @@ extern "C" fn kmain(stack_top: u64) -> ! {
         panic!("Limine does not support base revision 3 (loaded {:?})", boot::BASE_REVISION.loaded_revision());
     }
     if boot::STACK_SIZE.get_response().is_none() {
-        warn!(target: "boot", "boot stack size request ignored; backtraces may stop early");
+        warn!(target: "boot", "boot stack size request ignored; assuming Limine's 64 KiB default");
     }
 
     match boot::EXECUTABLE_FILE.get_response() {

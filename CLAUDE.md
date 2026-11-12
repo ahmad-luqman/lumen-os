@@ -48,7 +48,7 @@ Each rule exists because breaking it caused a real bug in v1.
 3. **Compiler flags are tested, not assumed.** `make audit` checks the built
    ELF and the LLVM IR. Never weaken it to make a build pass.
 4. **No fixed-address stacks.** Every stack comes from the allocator and has a
-   guard page. (Temporary M0 exception: the boot stack and IST stacks, until M1.)
+   guard page. (Temporary exception: the boot stack and IST stacks, until #6.)
 5. **A real heap with working `free`**, plus in-kernel fragmentation and reuse
    tests.
 6. **Exception handling comes first.** GDT/IDT setup is the first thing

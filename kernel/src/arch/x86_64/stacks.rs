@@ -39,8 +39,9 @@ pub static MACHINE_CHECK: StaticStack = StaticStack::new();
 static BOOT_STACK_TOP: AtomicU64 = AtomicU64::new(0);
 static BOOT_STACK_BOTTOM: AtomicU64 = AtomicU64::new(0);
 
-/// Record the boot stack: `top` is the stack pointer at kernel entry and
-/// `size` the size we asked Limine for.
+/// Record the boot stack: `top` is its highest address (the stack pointer at
+/// kernel entry plus Limine's 8-byte return address) and `size` the size
+/// Limine confirmed.
 pub fn set_boot_stack(top: u64, size: u64) {
     BOOT_STACK_TOP.store(top, Ordering::Relaxed);
     BOOT_STACK_BOTTOM.store(top.saturating_sub(size), Ordering::Relaxed);
