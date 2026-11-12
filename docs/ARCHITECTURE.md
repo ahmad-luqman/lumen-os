@@ -95,20 +95,29 @@ tests (for example `lumen-elf`, the symbol-table reader).
 
 `acpi::init` follows the RSDP Limine gives to the XSDT (or the RSDT on ACPI
 1.0 firmware, or when the XSDT address is 0), then reads the MADT and the
-HPET table. The parsing is in the host-tested `lumen-acpi` crate: bounds-checked
-little-endian reads from byte slices (the tables are packed and unaligned),
-with every table's length (capped at 1 MiB) and checksum checked, and each
-MADT entry's length checked against its table and its type, before use. The
-kernel reads tables through one reader: memory outside the HHDM (where
-firmware puts ACPI tables) is mapped uncached with `map_mmio`, and memory
-the HHDM covers is read there, after reserving it if it is usable. The
+HPET table. The parsing is in the host-tested `lumen-acpi` crate:
+bounds-checked little-endian reads from byte slices (the tables are packed
+and unaligned). A table's length (capped at 1 MiB) is checked when its header
+is read, its checksum before any field past the header is used, and each MADT
+entry's length against the table and its type. Looking for a table skips
+null entries and tables whose header can't be read.
+
+The kernel reads tables through one reader, which only reads memory that
+holds firmware data: `acpi-*` and `reserved` entries (outside the HHDM) are
+mapped uncached with `map_mmio`, each page span once; RAM the HHDM covers is
+read through it only if it is usable memory, which is then reserved for ACPI
+tables (`frame::reserve`; see "Physical memory" in section 5). Anything else,
+such as a pointer into the frame bitmap or the framebuffer, is refused. The
 kernel copies what it needs into `acpi::Info` (every MADT CPU with its APIC id
-and enabled flag, the local APIC address with the type 5 override applied,
-the I/O APICs, the interrupt overrides, the 8259 flag and the HPET) and logs
-`INFO  acpi: N CPUs, LAPIC at 0x..., HPET at 0x...` (N counts enabled CPUs;
-`maxcpus` hot-plug slots are listed but disabled). No RSDP or broken tables
-are a warning, not a panic: boot continues without `acpi::info()`. A missing
-or broken HPET alone just leaves `hpet` empty.
+and state, the local APIC address with the type 5 override applied, the I/O
+APICs, the interrupt overrides, the 8259 flag and the HPET) and logs
+`INFO  acpi: N CPU(s), LAPIC at 0x..., HPET at 0x...` (or `..., no HPET`),
+after an `INFO  acpi: I/O APIC ...` line per I/O APIC. N counts enabled
+CPUs; QEMU's `maxcpus` hot-plug slots are listed but disabled. No RSDP, or
+a bad RSDP, root table or MADT, is a warning (`running without ACPI: ...`,
+naming why a read failed), not a panic: boot continues and `acpi::info()` is
+`None` (it panics before `acpi::init`). A missing or broken HPET alone is a
+warning (`no usable HPET: ...`) and leaves `hpet` empty.
 
 Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 `isa-debug-exit`, used by tests) and `lumen.log=<error|warn|info|debug|trace>`.
@@ -141,15 +150,23 @@ Limine labels them usable**: frame 0, the kernel image, the kernel ELF file
 found by translating their live virtual addresses through the page tables
 rather than trusting the map's labels), the ACPI RSDP and the allocator's own
 bitmaps. Every non-usable map entry (including the `acpi-*` entries, where
-firmware normally puts the ACPI tables) and every frame of Limine's page tables (active while
-the allocator is built; the kernel's own tables are then allocated from it)
-is reserved too. The named list is logged at `debug` level. Memory found
-after boot is reserved with `frame::reserve(name, range)`, which joins the
-named list if it takes any frame and refuses (changing nothing) if a frame is
-already allocated: ACPI parsing reserves any table it finds in usable memory
-that way. It runs after the heap and stacks exist, so a table whose frame was
-already handed out is refused and ACPI is skipped with a warning; OVMF never
-puts tables there.
+firmware normally puts the ACPI tables) and every frame of Limine's page
+tables (active while the allocator is built; the kernel's own tables are then
+allocated from it) is reserved too. The named list is logged at `debug`
+level.
+
+Memory found once the allocator is built is reserved with
+`frame::reserve(name, range)`. Every frame must be free (it is taken) or
+already reserved under the same name; an allocated frame, one reserved for
+something else, memory the allocator doesn't manage, or a full named list is
+refused, changing nothing. A range that takes frames joins the named list
+(merged with a same-name range it touches). ACPI parsing reserves each table
+(or header) it reads in usable memory that way. It runs after the kernel's
+page tables, heap and stacks exist (it needs `map_mmio` and the heap), so a
+table whose frame was already handed out is refused: ACPI is skipped with a
+warning, or only the HPET if it was the HPET table. With OVMF on q35 the
+tables are in `acpi-*` entries; only ktest stand-in frames exercise this
+path.
 
 It is a bitmap allocator with two bits per 4 KiB frame (64 KiB per GiB of
 physical span): *owned* (usable and not reserved) and *free*. Reserved and
@@ -195,8 +212,8 @@ frames (zeroed) and switches CR3:
   no writable alias (W^X holds per frame, not just per page); the
   framebuffer is write-combining. 2 MiB pages where a whole one fits, 4 KiB
   elsewhere. ACPI memory is not in the HHDM; ACPI parsing maps the tables
-  it reads uncached with `map_mmio` (see "ACPI" in section 4). Entries that share a page map it
-  once; boot stops if they'd need different rights. A ktest checks every
+  it reads uncached with `map_mmio` (see "ACPI" in section 4). Entries that
+  share a page map it once; boot stops if they'd need different rights. A ktest checks every
   HHDM span is mapped throughout (sampled every 2 MiB) with its own rights
   and memory type, nothing else is mapped outside the image and the MMIO
   window, and ACPI and reserved entries are absent (spot-checked).

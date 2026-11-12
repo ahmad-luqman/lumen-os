@@ -4,10 +4,12 @@
 //!
 //! Firmware tables are packed and unaligned, so everything is parsed from
 //! byte slices with bounds-checked little-endian reads, never pointer casts.
-//! Every structure's length and checksum are checked before any field is
-//! used, and a bad table gives an [`Error`], never a panic. Physical memory
-//! is reached through [`PhysMem`]: the kernel implements it with its page
-//! tables, the tests with a fake memory.
+//! A table's length is range-checked as soon as its header is read, and its
+//! checksum before any field past the header is used (the RSDP's revision
+//! and length come before its checksum: they say how much to sum). A bad
+//! table gives an [`Error`], never a panic. Physical memory is reached
+//! through [`PhysMem`]: the kernel implements it with its page tables, the
+//! tests with a fake memory.
 //!
 //! Nothing here allocates: tables are borrowed (`'a` is how long the memory
 //! behind them stays readable) and MADT entries are decoded on the fly.
@@ -31,8 +33,8 @@ const HPET_LEN: usize = 56;
 
 /// Physical memory as the parser sees it.
 pub trait PhysMem<'a> {
-    /// The `len` bytes at physical address `addr`, or `None` if they can't
-    /// be read.
+    /// Exactly the `len` bytes at physical address `addr`, or `None` if they
+    /// can't be read (a shorter slice counts as unreadable too).
     fn read(&mut self, addr: u64, len: usize) -> Option<&'a [u8]>;
 }
 
@@ -81,20 +83,26 @@ pub enum Error {
     WrongSignature { expected: Signature, found: Signature },
     /// A structure's bytes don't sum to zero.
     BadChecksum(Signature),
-    /// Fewer bytes than the structure's fixed fields or its length field say.
+    /// Fewer bytes than the structure's fixed fields or its length field
+    /// say, or a root table whose body isn't a whole number of entries.
     Truncated(Signature),
     /// A length field below the structure's header or above our cap.
     BadLength { sig: Signature, len: u32 },
     /// The RSDP points at no root table (both addresses are 0).
     NoRootTable,
-    /// The root table lists no table with this signature.
-    NotFound(Signature),
+    /// The root table lists no table with this signature. `skipped` is the
+    /// address of the first listed table whose header couldn't be read, if
+    /// any (it might have been the one).
+    NotFound { sig: Signature, skipped: Option<u64> },
     /// The MADT entry at byte `offset` is shorter than 2 bytes or its type
-    /// needs, or runs past the table's end.
+    /// needs, or runs past the table's end (`len` is 0 if the table ends
+    /// before the entry's length byte).
     BadMadtEntry { offset: usize, kind: u8, len: u8 },
     /// The HPET's registers aren't in memory space (`space` is the generic
     /// address structure's address space id).
     HpetNotInMemory { space: u8 },
+    /// The HPET's register address is 0.
+    HpetAddressZero,
 }
 
 impl fmt::Display for Error {
@@ -107,11 +115,15 @@ impl fmt::Display for Error {
             Error::Truncated(sig) => write!(f, "{sig} is truncated"),
             Error::BadLength { sig, len } => write!(f, "{sig} length {len} is out of range"),
             Error::NoRootTable => f.write_str("RSDP has neither an XSDT nor an RSDT address"),
-            Error::NotFound(sig) => write!(f, "no {sig} table"),
+            Error::NotFound { sig, skipped: None } => write!(f, "no {sig} table"),
+            Error::NotFound { sig, skipped: Some(addr) } => {
+                write!(f, "no {sig} table (skipped an unreadable table at {addr:#x})")
+            }
             Error::BadMadtEntry { offset, kind, len } => {
                 write!(f, "MADT entry at offset {offset} (type {kind}, length {len}) is malformed")
             }
             Error::HpetNotInMemory { space } => write!(f, "HPET registers in address space {space}, not memory"),
+            Error::HpetAddressZero => f.write_str("HPET register address is 0"),
         }
     }
 }
@@ -121,15 +133,15 @@ fn u8_at(b: &[u8], off: usize) -> Option<u8> {
 }
 
 fn u16_at(b: &[u8], off: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(b.get(off..off.checked_add(2)?)?.try_into().ok()?))
+    Some(u16::from_le_bytes(*b.get(off..)?.first_chunk()?))
 }
 
 fn u32_at(b: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(off..off.checked_add(4)?)?.try_into().ok()?))
+    Some(u32::from_le_bytes(*b.get(off..)?.first_chunk()?))
 }
 
 fn u64_at(b: &[u8], off: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(b.get(off..off.checked_add(8)?)?.try_into().ok()?))
+    Some(u64::from_le_bytes(*b.get(off..)?.first_chunk()?))
 }
 
 fn checksum_ok(b: &[u8]) -> bool {
@@ -146,11 +158,13 @@ fn read<'a>(mem: &mut impl PhysMem<'a>, addr: u64, len: usize) -> Result<&'a [u8
 /// The Root System Description Pointer: where the root table is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rsdp {
-    /// 0 for ACPI 1.0, 2 for ACPI 2.0 and later.
+    /// 0 for ACPI 1.0, 2 for ACPI 2.0 and later. (Any value below 2 is
+    /// read as 1.0, any other as 2.0+.)
     pub revision: u8,
-    /// The RSDT's physical address (32-bit pointers), or 0.
-    pub rsdt: u32,
-    /// The XSDT's physical address (64-bit pointers), from revision 2 on.
+    /// The RSDT's physical address (32-bit pointers); `None` if 0.
+    pub rsdt: Option<u32>,
+    /// The XSDT's physical address (64-bit pointers), from revision 2 on;
+    /// `None` before that or if 0.
     pub xsdt: Option<u64>,
 }
 
@@ -167,34 +181,38 @@ impl Rsdp {
         if !checksum_ok(v1) {
             return Err(Error::BadChecksum(Signature::RSDP));
         }
-        let (revision, rsdt) = (v1[15], u32_at(v1, 16).ok_or(Error::Truncated(Signature::RSDP))?);
+        let revision = v1[15];
+        let rsdt = u32_at(v1, 16).filter(|&a| a != 0);
         if revision < 2 {
             return Ok(Rsdp { revision, rsdt, xsdt: None });
         }
-        let len = u32_at(b, 20).ok_or(Error::Truncated(Signature::RSDP))?;
-        if !(RSDP_V2_LEN as u32..=MAX_RSDP_LEN).contains(&len) {
-            return Err(Error::BadLength { sig: Signature::RSDP, len });
-        }
-        let full = b.get(..len as usize).ok_or(Error::Truncated(Signature::RSDP))?;
+        let full = b.get(..rsdp_v2_len(b)? as usize).ok_or(Error::Truncated(Signature::RSDP))?;
         if !checksum_ok(full) {
             return Err(Error::BadChecksum(Signature::RSDP));
         }
-        let xsdt = u64_at(full, 24).ok_or(Error::Truncated(Signature::RSDP))?;
-        Ok(Rsdp { revision, rsdt, xsdt: (xsdt != 0).then_some(xsdt) })
+        let xsdt = u64_at(full, 24).filter(|&a| a != 0);
+        Ok(Rsdp { revision, rsdt, xsdt })
     }
 
-    /// Read and parse the RSDP at physical address `addr`.
+    /// Read and parse the RSDP at physical address `addr`, reading no more
+    /// than its (range-checked) length field says.
     pub fn read<'a>(mem: &mut impl PhysMem<'a>, addr: u64) -> Result<Rsdp, Error> {
         let head = read(mem, addr, RSDP_V1_LEN)?;
         if head[15] < 2 {
             return Rsdp::parse(head);
         }
-        let len = u32_at(read(mem, addr, RSDP_V1_LEN + 4)?, 20).ok_or(Error::Truncated(Signature::RSDP))?;
-        if !(RSDP_V2_LEN as u32..=MAX_RSDP_LEN).contains(&len) {
-            return Err(Error::BadLength { sig: Signature::RSDP, len });
-        }
+        let len = rsdp_v2_len(read(mem, addr, RSDP_V1_LEN + 4)?)?;
         Rsdp::parse(read(mem, addr, len as usize)?)
     }
+}
+
+/// The length field of a revision 2+ RSDP, range-checked.
+fn rsdp_v2_len(b: &[u8]) -> Result<u32, Error> {
+    let len = u32_at(b, 20).ok_or(Error::Truncated(Signature::RSDP))?;
+    if !(RSDP_V2_LEN as u32..=MAX_RSDP_LEN).contains(&len) {
+        return Err(Error::BadLength { sig: Signature::RSDP, len });
+    }
+    Ok(len)
 }
 
 /// A system description table whose length and checksum have been checked.
@@ -223,7 +241,7 @@ impl<'a> Sdt<'a> {
     }
 
     pub fn signature(&self) -> Signature {
-        Signature(self.bytes[..4].try_into().expect("checked by parse: at least a header"))
+        Signature(*self.bytes.first_chunk().expect("checked by parse: at least a header"))
     }
 
     pub fn revision(&self) -> u8 {
@@ -248,11 +266,11 @@ impl<'a> Sdt<'a> {
 
 /// The signature and the (range-checked) length field of a table header.
 fn header(b: &[u8]) -> Result<(Signature, u32), Error> {
-    let sig = Signature(b.get(..4).ok_or(Error::Truncated(Signature(*b"????")))?.try_into().expect("4 bytes"));
-    let len = u32_at(b, 4).ok_or(Error::Truncated(sig))?;
+    let sig = Signature(*b.first_chunk().ok_or(Error::Truncated(Signature(*b"????")))?);
     if b.len() < SDT_HEADER_LEN {
         return Err(Error::Truncated(sig));
     }
+    let len = u32_at(b, 4).expect("within the header");
     if !(SDT_HEADER_LEN as u32..=MAX_TABLE_LEN).contains(&len) {
         return Err(Error::BadLength { sig, len });
     }
@@ -263,26 +281,27 @@ fn header(b: &[u8]) -> Result<(Signature, u32), Error> {
 pub struct Acpi<'a, M> {
     mem: M,
     rsdp: Rsdp,
+    /// The XSDT or the RSDT (which one says how wide its entries are).
     root: Sdt<'a>,
-    /// 8 for the XSDT's 64-bit pointers, 4 for the RSDT's.
-    entry_size: usize,
 }
 
 impl<'a, M: PhysMem<'a>> Acpi<'a, M> {
     /// Read the RSDP at `rsdp_addr` and the root table it points at: the
-    /// XSDT when there is one, else the RSDT.
+    /// XSDT when there is one, else the RSDT. (A broken XSDT is an error
+    /// even if there is an RSDT.)
     pub fn new(mut mem: M, rsdp_addr: u64) -> Result<Self, Error> {
         let rsdp = Rsdp::read(&mut mem, rsdp_addr)?;
-        let (addr, sig, entry_size) = match (rsdp.xsdt, rsdp.rsdt) {
-            (Some(xsdt), _) => (xsdt, Signature::XSDT, 8),
-            (None, 0) => return Err(Error::NoRootTable),
-            (None, rsdt) => (u64::from(rsdt), Signature::RSDT, 4),
+        let (addr, sig) = match (rsdp.xsdt, rsdp.rsdt) {
+            (Some(xsdt), _) => (xsdt, Signature::XSDT),
+            (None, Some(rsdt)) => (u64::from(rsdt), Signature::RSDT),
+            (None, None) => return Err(Error::NoRootTable),
         };
         let root = Sdt::read(&mut mem, addr)?.expect(sig)?;
-        if root.body().len() % entry_size != 0 {
+        let acpi = Acpi { mem, rsdp, root };
+        if root.body().len() % acpi.entry_size() != 0 {
             return Err(Error::Truncated(sig));
         }
-        Ok(Acpi { mem, rsdp, root, entry_size })
+        Ok(acpi)
     }
 
     pub fn rsdp(&self) -> Rsdp {
@@ -294,32 +313,46 @@ impl<'a, M: PhysMem<'a>> Acpi<'a, M> {
         self.root
     }
 
-    /// The physical addresses of the tables the root table lists.
+    /// 8 for the XSDT's 64-bit pointers, 4 for the RSDT's.
+    fn entry_size(&self) -> usize {
+        if self.root.signature() == Signature::XSDT { 8 } else { 4 }
+    }
+
+    /// The physical addresses of the tables the root table lists (including
+    /// any null entries).
     pub fn table_addresses(&self) -> impl Iterator<Item = u64> + use<'a, M> {
-        let size = self.entry_size;
+        let size = self.entry_size();
         self.root.body().chunks_exact(size).map(move |c| match size {
             8 => u64_at(c, 0).expect("8-byte chunk"),
             _ => u64::from(u32_at(c, 0).expect("4-byte chunk")),
         })
     }
 
-    /// The first table with signature `sig`. Reads each listed table's
-    /// header until one matches; an unreadable or malformed header on the
-    /// way is an error (the root table would be corrupt).
+    /// The first listed table with signature `sig`. Reads each listed
+    /// table's header until one matches, skipping null entries and tables
+    /// whose header can't be read (only the table returned has its length
+    /// and checksum checked).
     pub fn find(&mut self, sig: Signature) -> Result<Sdt<'a>, Error> {
-        for addr in self.table_addresses() {
-            let (found, len) = header(read(&mut self.mem, addr, SDT_HEADER_LEN)?)?;
-            if found == sig {
-                return Sdt::parse(read(&mut self.mem, addr, len as usize)?);
+        let mut skipped = None;
+        for addr in self.table_addresses().filter(|&a| a != 0) {
+            match read(&mut self.mem, addr, SDT_HEADER_LEN) {
+                Ok(head) if head.starts_with(&sig.0) => {
+                    let (_, len) = header(head)?;
+                    return Sdt::parse(read(&mut self.mem, addr, len as usize)?);
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    skipped.get_or_insert(addr);
+                }
             }
         }
-        Err(Error::NotFound(sig))
+        Err(Error::NotFound { sig, skipped })
     }
 
-    /// The signatures of the listed tables, in order.
+    /// The signatures of the listed tables, in order (null entries left out).
     pub fn signatures(&mut self) -> impl Iterator<Item = Result<Signature, Error>> + '_ {
-        let addrs = self.table_addresses();
-        addrs.map(|addr| Ok(header(read(&mut self.mem, addr, SDT_HEADER_LEN)?)?.0))
+        let addrs = self.table_addresses().filter(|&a| a != 0);
+        addrs.map(|addr| Ok(Signature(*read(&mut self.mem, addr, SDT_HEADER_LEN)?.first_chunk().expect("36 bytes"))))
     }
 
     /// The memory reader, back.
@@ -338,7 +371,8 @@ pub struct Madt<'a> {
     entries: &'a [u8],
 }
 
-/// One MADT entry.
+/// One MADT entry, as the table has it ([`Madt::cpus`] interprets the CPU
+/// entries' flags).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MadtEntry {
     /// Type 0: a CPU with an 8-bit APIC id.
@@ -352,7 +386,7 @@ pub enum MadtEntry {
     LocalApicAddress(u64),
     /// Type 9: a CPU with a 32-bit x2APIC id.
     LocalX2Apic { apic_id: u32, uid: u32, flags: u32 },
-    /// Any other type (left for later).
+    /// Any other type (not decoded yet).
     Other { kind: u8, len: u8 },
 }
 
@@ -373,34 +407,56 @@ pub struct InterruptOverride {
     pub flags: u16,
 }
 
-/// A CPU listed in the MADT.
+/// Whether a CPU listed in the MADT can be used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuState {
+    /// Ready to use.
+    Enabled,
+    /// Not enabled, but the OS may enable it (hot-plug).
+    OnlineCapable,
+    /// Not usable.
+    Disabled,
+}
+
+impl CpuState {
+    /// From an MADT CPU entry's flags: bit 0 enabled, bit 1 online-capable
+    /// (meaningful only when bit 0 is clear).
+    fn from_flags(flags: u32) -> CpuState {
+        match (flags & 1 != 0, flags & 2 != 0) {
+            (true, _) => CpuState::Enabled,
+            (false, true) => CpuState::OnlineCapable,
+            (false, false) => CpuState::Disabled,
+        }
+    }
+}
+
+impl fmt::Display for CpuState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            CpuState::Enabled => "enabled",
+            CpuState::OnlineCapable => "online-capable",
+            CpuState::Disabled => "disabled",
+        })
+    }
+}
+
+/// A CPU listed in the MADT. (Firmware may list one CPU in both a type 0
+/// and a type 9 entry; the list is as the table has it.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cpu {
     pub apic_id: u32,
     /// The ACPI processor UID.
     pub uid: u32,
-    /// Ready to use.
-    pub enabled: bool,
-    /// Not enabled, but the OS may enable it (hot-plug).
-    pub online_capable: bool,
-}
-
-impl Cpu {
-    fn from_flags(apic_id: u32, uid: u32, flags: u32) -> Cpu {
-        Cpu { apic_id, uid, enabled: flags & 1 != 0, online_capable: flags & 1 == 0 && flags & 2 != 0 }
-    }
+    pub state: CpuState,
 }
 
 impl<'a> Madt<'a> {
     /// Check that `t` is an MADT whose entries all fit, each long enough
     /// for its type.
     pub fn parse(t: Sdt<'a>) -> Result<Madt<'a>, Error> {
-        let t = t.expect(Signature::MADT)?;
-        let b = t.bytes();
-        let (local_apic, flags) = match (u32_at(b, SDT_HEADER_LEN), u32_at(b, SDT_HEADER_LEN + 4)) {
-            (Some(a), Some(f)) => (a, f),
-            _ => return Err(Error::Truncated(Signature::MADT)),
-        };
+        let b = t.expect(Signature::MADT)?.bytes();
+        let (local_apic, flags) =
+            u32_at(b, SDT_HEADER_LEN).zip(u32_at(b, SDT_HEADER_LEN + 4)).ok_or(Error::Truncated(Signature::MADT))?;
         let madt = Madt { local_apic, flags, entries: &b[MADT_FIXED_LEN..] };
         let mut off = 0;
         while off < madt.entries.len() {
@@ -413,10 +469,7 @@ impl<'a> Madt<'a> {
     /// else the header's.
     pub fn local_apic_address(&self) -> u64 {
         self.entries()
-            .find_map(|e| match e {
-                MadtEntry::LocalApicAddress(a) => Some(a),
-                _ => None,
-            })
+            .find_map(|e| if let MadtEntry::LocalApicAddress(a) = e { Some(a) } else { None })
             .unwrap_or(u64::from(self.local_apic))
     }
 
@@ -430,36 +483,34 @@ impl<'a> Madt<'a> {
         let entries = self.entries;
         let mut off = 0;
         core::iter::from_fn(move || {
-            // `parse` checked every entry, so this never fails.
-            let (entry, len) = decode(entries, off).ok()?;
+            if off >= entries.len() {
+                return None;
+            }
+            let (entry, len) = decode(entries, off).expect("Madt::parse checked every entry");
             off += len;
             Some(entry)
         })
     }
 
-    /// Every CPU listed, enabled or not.
+    /// Every CPU listed, whatever its state.
     pub fn cpus(&self) -> impl Iterator<Item = Cpu> + use<'a> {
         self.entries().filter_map(|e| match e {
             MadtEntry::LocalApic { uid, apic_id, flags } => {
-                Some(Cpu::from_flags(u32::from(apic_id), u32::from(uid), flags))
+                Some(Cpu { apic_id: u32::from(apic_id), uid: u32::from(uid), state: CpuState::from_flags(flags) })
             }
-            MadtEntry::LocalX2Apic { apic_id, uid, flags } => Some(Cpu::from_flags(apic_id, uid, flags)),
+            MadtEntry::LocalX2Apic { apic_id, uid, flags } => {
+                Some(Cpu { apic_id, uid, state: CpuState::from_flags(flags) })
+            }
             _ => None,
         })
     }
 
     pub fn io_apics(&self) -> impl Iterator<Item = IoApic> + use<'a> {
-        self.entries().filter_map(|e| match e {
-            MadtEntry::IoApic(io) => Some(io),
-            _ => None,
-        })
+        self.entries().filter_map(|e| if let MadtEntry::IoApic(io) = e { Some(io) } else { None })
     }
 
     pub fn interrupt_overrides(&self) -> impl Iterator<Item = InterruptOverride> + use<'a> {
-        self.entries().filter_map(|e| match e {
-            MadtEntry::InterruptOverride(o) => Some(o),
-            _ => None,
-        })
+        self.entries().filter_map(|e| if let MadtEntry::InterruptOverride(o) = e { Some(o) } else { None })
     }
 }
 
@@ -473,30 +524,31 @@ fn decode(b: &[u8], off: usize) -> Result<(MadtEntry, usize), Error> {
         return Err(bad);
     }
     let e = b.get(off..off + usize::from(len)).ok_or(bad)?;
-    // An entry shorter than its type's fields fails one of these reads.
-    let entry = (|| {
-        Some(match kind {
-            0 => MadtEntry::LocalApic { uid: u8_at(e, 2)?, apic_id: u8_at(e, 3)?, flags: u32_at(e, 4)? },
-            1 => MadtEntry::IoApic(IoApic { id: u8_at(e, 2)?, address: u32_at(e, 4)?, gsi_base: u32_at(e, 8)? }),
-            2 => MadtEntry::InterruptOverride(InterruptOverride {
-                bus: u8_at(e, 2)?,
-                irq: u8_at(e, 3)?,
-                gsi: u32_at(e, 4)?,
-                flags: u16_at(e, 8)?,
-            }),
-            5 => MadtEntry::LocalApicAddress(u64_at(e, 4)?),
-            9 => MadtEntry::LocalX2Apic { apic_id: u32_at(e, 4)?, flags: u32_at(e, 8)?, uid: u32_at(e, 12)? },
-            _ => MadtEntry::Other { kind, len },
-        })
-    })()
-    .ok_or(bad)?;
-    Ok((entry, usize::from(len)))
+    Ok((entry_fields(kind, len, e).ok_or(bad)?, usize::from(len)))
+}
+
+/// Decode entry `e` of type `kind`; `None` if it is shorter than its type's
+/// fields.
+fn entry_fields(kind: u8, len: u8, e: &[u8]) -> Option<MadtEntry> {
+    Some(match kind {
+        0 => MadtEntry::LocalApic { uid: u8_at(e, 2)?, apic_id: u8_at(e, 3)?, flags: u32_at(e, 4)? },
+        1 => MadtEntry::IoApic(IoApic { id: u8_at(e, 2)?, address: u32_at(e, 4)?, gsi_base: u32_at(e, 8)? }),
+        2 => MadtEntry::InterruptOverride(InterruptOverride {
+            bus: u8_at(e, 2)?,
+            irq: u8_at(e, 3)?,
+            gsi: u32_at(e, 4)?,
+            flags: u16_at(e, 8)?,
+        }),
+        5 => MadtEntry::LocalApicAddress(u64_at(e, 4)?),
+        9 => MadtEntry::LocalX2Apic { apic_id: u32_at(e, 4)?, flags: u32_at(e, 8)?, uid: u32_at(e, 12)? },
+        _ => MadtEntry::Other { kind, len },
+    })
 }
 
 /// The High Precision Event Timer description.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hpet {
-    /// Physical address of its registers.
+    /// Physical address of its registers (never 0).
     pub address: u64,
     /// Which HPET this is (0 for the first).
     pub number: u8,
@@ -534,7 +586,11 @@ impl Hpet {
                 pci_vendor: (id >> 16) as u16,
             })
         };
-        parse().ok_or(Error::Truncated(Signature::HPET))
+        let hpet = parse().ok_or(Error::Truncated(Signature::HPET))?;
+        if hpet.address == 0 {
+            return Err(Error::HpetAddressZero);
+        }
+        Ok(hpet)
     }
 }
 

@@ -96,28 +96,34 @@ def test_nx_data_crashes_cleanly(crash_report):
     assert any("kmon::run" in f for f in frames) and frames[-1].startswith("_start"), report
 
 
+HEAP_NUMBERS = ("mapped", "base", "used", "live", "free", "blocks", "largest")
+
+
+def heap_numbers(text: str) -> dict[str, int]:
+    """The heap summary's numbers in `text` (not the optional failure fields).
+    A summary only matches with an intact free list whose bytes add up."""
+    heap = heap_line(text)
+    return {k: int(heap[k], 0) for k in HEAP_NUMBERS}
+
+
 def kmon_heap(m) -> dict[str, int]:
     """Run kmon's `heap` at its prompt; the summary's numbers, back at the prompt."""
     m.send_line("heap")
-    heap = heap_line(m.expect(r"heap: .*\n").group(0))
+    heap = heap_numbers(m.expect(r"heap: .*\n").group(0))
     m.expect(r"kmon> ")
-    return {
-        k: int(v, 0)
-        for k, v in heap.items()
-        if k in ("mapped", "base", "used", "live", "free", "blocks", "largest")
-    }
+    return heap
 
 
 def test_kmon_heap_reports_usage(boot):
     m = boot("qemutest")
     m.expect(r"kmon> ", BOOT_TIMEOUT)
     heap = kmon_heap(m)
-    # What boot keeps (ACPI's tables, for one) is in use; the rest of what
-    # the heap mapped is free, and the numbers add up.
+    # What boot keeps (`acpi::Info`, for one) is in use, a handful of
+    # allocations; the rest of what the heap mapped is free. (In-kernel tests
+    # check that boot code frees what it doesn't keep.)
     assert heap["base"] == HEAP_BASE, heap
-    assert heap["live"] > 0 and heap["used"] > 0, heap
-    assert heap["used"] + heap["free"] == heap["mapped"], heap
-    assert 0 < heap["largest"] <= heap["free"], heap
+    assert 0 < heap["live"] <= 16, f"{heap}: nothing kept at boot (did acpi::init fail?), or a leak"
+    assert 0 < heap["largest"] <= heap["free"] < heap["mapped"], heap
     # Looking doesn't allocate: the summary is the same the second time.
     assert kmon_heap(m) == heap
 
@@ -148,24 +154,13 @@ def test_double_free_is_refused(crash_report):
     assert any("kmon::crash_double_free" in f for f in backtrace(report)), report
     # The block was freed after its lower neighbour, so the second free is
     # caught by its overlap with the merged free block below. It changed
-    # nothing: compared with the prompt, only the 128-byte block kmon keeps
-    # is in use, carved from the top free block, and the free list is intact
-    # (the same blocks).
-    heap = {
-        k: int(v)
-        for k, v in heap_line(report).items()
-        if k in ("mapped", "used", "live", "free", "blocks", "largest")
-    }
-    assert heap["mapped"] == before["mapped"], (before, heap)
-    assert (heap["used"], heap["live"]) == (before["used"] + 128, before["live"] + 1), (
-        before,
-        heap,
-    )
-    assert (heap["free"], heap["largest"]) == (before["free"] - 128, before["largest"] - 128), (
-        before,
-        heap,
-    )
-    assert heap["blocks"] == before["blocks"], (before, heap)
+    # nothing: compared with the prompt, exactly the 128-byte block kmon
+    # keeps is in use, and the free list is intact (the summary only matches
+    # when the walk finds its bytes add up). Where the block landed, and so
+    # the free blocks' count and largest size, depends on boot's layout.
+    heap = heap_numbers(report)
+    change = {k: heap[k] - before[k] for k in ("mapped", "base", "used", "live", "free")}
+    assert change == {"mapped": 0, "base": 0, "used": 128, "live": 1, "free": -128}, (before, heap)
 
 
 def test_corrupt_free_list_is_a_crash_not_a_hang(crash_report):
@@ -180,6 +175,8 @@ def test_corrupt_free_list_is_a_crash_not_a_hang(crash_report):
         re.MULTILINE,
     )
     assert corrupt and corrupt[1] == corrupt[2], report  # the node links to itself
+    offset = int(corrupt[1], 16)
+    assert offset % 16 == 0 and offset < before["mapped"], (before, report)
     # One more 64-byte block in use than at the prompt.
     locked = (
         r"^heap \(lock held; may be mid-update\): \d+ bytes mapped at 0xffffc00000000000, "

@@ -195,20 +195,12 @@ fn first_hhdm_page(first: u64, last: u64) -> Option<u64> {
 /// Does the HHDM map every page of `[phys, phys + len)`? (False for an
 /// empty or overflowing range.)
 pub fn hhdm_covers(phys: PhysAddr, len: u64) -> bool {
-    let Some(end) = phys.as_u64().checked_add(len).filter(|_| len > 0) else {
+    if len == 0 || phys.as_u64().checked_add(len).is_none() {
         return false;
-    };
-    let mut page = align_down(phys.as_u64(), FRAME_SIZE);
-    while page < end {
-        let Some(next) = page.checked_add(FRAME_SIZE) else {
-            return false;
-        };
-        if !hhdm_entries().map(rounded).any(|(start, end)| start <= page && next <= end) {
-            return false;
-        }
-        page = next;
     }
-    true
+    // `rounded` entries start and end on page boundaries, so a page that
+    // starts inside one lies wholly inside it.
+    pages(phys.as_u64(), len).all(|page| hhdm_entries().map(rounded).any(|(start, end)| (start..end).contains(&page)))
 }
 
 /// Page-table frames, read and written through the HHDM. A frame the memory
@@ -595,9 +587,9 @@ impl fmt::Display for MmioError {
     }
 }
 
-/// Map the device registers at `[phys, phys + len)` uncached and read-write
-/// into the MMIO window; returns the virtual address of `phys`. Mappings are
-/// permanent (drivers keep their registers mapped). A failed call maps
+/// Map the device registers (or firmware tables) at `[phys, phys + len)`
+/// uncached and read-write into the MMIO window; returns the virtual address
+/// of `phys`. Mappings are permanent (drivers keep their registers mapped). A failed call maps
 /// nothing (it may use up window addresses, of which there are plenty).
 pub fn map_mmio(phys: PhysAddr, len: u64) -> Result<VirtAddr, MmioError> {
     let end = phys.checked_add(len).filter(|_| len > 0).ok_or(MmioError::BadRange)?;

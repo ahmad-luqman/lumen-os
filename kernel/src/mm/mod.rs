@@ -37,8 +37,8 @@ fn hhdm_offset() -> u64 {
 
 /// The virtual address at which physical address `phys` is mapped. Valid
 /// once [`init`] has stored the HHDM offset (its first step), and only for
-/// memory the HHDM maps ([`paging::HHDM_TYPES`]); ACPI tables and device
-/// memory need [`paging::map_mmio`].
+/// memory the HHDM maps ([`paging::HHDM_TYPES`]); device memory and ACPI
+/// tables outside the HHDM need [`paging::map_mmio`].
 pub fn phys_to_virt(phys: PhysAddr) -> VirtAddr {
     let offset = hhdm_offset();
     assert_ne!(offset, 0, "phys_to_virt before mm::init");
