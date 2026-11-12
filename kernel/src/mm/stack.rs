@@ -5,7 +5,7 @@
 //! ([`paging::STACKS_BASE`] up to [`paging::STACKS_LIMIT`]; the layout is
 //! `lumen_mm::stacks`, host-tested), maps fresh frames there and registers
 //! the stack in [`stacks::REGISTRY`], which the crash reporter reads to walk
-//! backtraces and to name a stack overflow. Dropping a stack retracts it
+//! backtraces and to name guard-page hits (an overflow, or a stray access). Dropping a stack retracts it
 //! from the registry, then unmaps it and frees its frames; stacks the CPU
 //! points at (the TSS's IST entries, the running stack) are [`leak`]ed so
 //! they can't be dropped. Addresses are never reused.
@@ -37,6 +37,12 @@ pub const MAIN_STACK_SIZE: u64 = 128 * 1024;
 const OWNED: Range<u64> = paging::STACKS_BASE..paging::STACKS_LIMIT;
 
 static WINDOW: SpinLock<StackWindow> = SpinLock::new(StackWindow::new(OWNED.start, OWNED.end));
+
+/// A stack's own part of the window (its guard page and its pages): what its
+/// pages must stay inside.
+fn owner(range: StackRange) -> Range<u64> {
+    range.guard()..range.top
+}
 
 /// Why [`KernelStack::new`] failed (nothing is left mapped or registered).
 /// A mapping failure other than running out is a kernel bug and panics.
@@ -72,15 +78,13 @@ impl KernelStack {
     /// A new stack of `size` bytes (whole pages), registered as `kind`.
     pub fn new(size: u64, kind: StackKind) -> Result<KernelStack, StackError> {
         let range = WINDOW.lock().take(size).ok_or(StackError::WindowFull)?;
-        // This stack's own part of the window: what its pages must stay in.
-        let owner = range.guard()..range.top;
+        let owner = owner(range);
         // SAFETY: this module owns `OWNED`, and the window hands out each
         // range once, so nothing in it is mapped or in use.
-        if let Err(e) = unsafe { window::map_fresh(&owner, range.span()) } {
-            if e.is_exhaustion() {
-                return Err(StackError::OutOfMemory);
-            }
-            panic!("mm: mapping a {} stack at {:#x} failed: {e}", kind.name(), range.bottom);
+        match unsafe { window::map_fresh(&owner, range.span()) } {
+            Ok(()) => {}
+            Err(e) if e.is_exhaustion() => return Err(StackError::OutOfMemory),
+            Err(e) => panic!("mm: mapping a {} stack at {:#x} failed: {e}", kind.name(), range.bottom),
         }
         // SAFETY: mapped just above; it stays mapped until `drop` retracts it.
         let Some(handle) = (unsafe { stacks::REGISTRY.register(kind, range) }) else {
@@ -97,8 +101,8 @@ impl KernelStack {
     }
 
     /// Keep the stack mapped and registered forever: for stacks the CPU
-    /// points at (the TSS, `rsp`), which must never be dropped. The returned
-    /// range is the proof that the stack is never freed; only hand its `top`
+    /// points at (the TSS, `rsp`), which must never be dropped. Returns its
+    /// range (the type doesn't record that it is leaked); hand only its `top`
     /// to the CPU.
     pub fn leak(self) -> StackRange {
         let range = self.range;
@@ -118,7 +122,7 @@ impl Drop for KernelStack {
         compiler_fence(Ordering::SeqCst);
         // SAFETY: the stack is ours, and (not leaked) nothing runs on it or
         // points at it.
-        unsafe { window::unmap_and_free(&(self.range.guard()..self.range.top), self.range.span()) };
+        unsafe { window::unmap_and_free(&owner(self.range), self.range.span()) };
     }
 }
 
@@ -274,13 +278,14 @@ crate::ktest!(
         let (registered, free, tables) =
             (stacks::REGISTRY.iter().count(), super::frame::free_frames(), active_table_count()?);
         let result = KernelStack::new(4 * lumen_mm::FRAME_SIZE, StackKind::Test).map(|s| s.range());
-        let after = (stacks::REGISTRY.iter().count(), super::frame::free_frames(), active_table_count()?);
+        let (registered_after, free_after, tables_after) =
+            (stacks::REGISTRY.iter().count(), super::frame::free_frames(), active_table_count()?);
         for f in held {
             super::frame::free(f).map_err(|_| "freeing a held frame")?;
         }
         kassert_eq!(result, Err(StackError::OutOfMemory));
-        kassert_eq!(after.0, registered);
-        kassert_eq!(after.1 + (after.2 - tables), free);
+        kassert_eq!(registered_after, registered);
+        kassert_eq!(free_after + (tables_after - tables), free);
         Ok(())
     }
 );

@@ -11,7 +11,8 @@
 //! The crash reporter uses this module lock-free: a frame pointer is only
 //! followed if it points into a known stack ([`contains`]), so a corrupted
 //! `rbp` can't make the backtrace fault, and a fault in a guard page is
-//! named as a stack overflow ([`guard_hit`]).
+//! named ([`guard_hit`]): as that stack overflowing or as a stray access
+//! (`crash::write_guard_hit`).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

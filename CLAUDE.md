@@ -14,7 +14,7 @@ make debug           # QEMU paused + gdb attached, stopped at kmain
 make test            # everything CI runs: host tests, flag audit, QEMU scenarios
 make test-host       # cargo test + harness self-tests (fast, no QEMU)
 make test-scenarios  # headless QEMU scenarios incl. in-kernel ktests (~20 s)
-make audit           # proves no SSE/AVX, no red zone, kernel code model, image layout
+make audit           # proves no SSE/AVX, no red zone, stack probes, kernel code model, image layout
 make lint fmt        # clippy -D warnings + ruff; rustfmt + ruff format
 make status-check    # feature gate: every feature in tests/features/ passes (CI runs this)
 make status          # regenerate docs/STATUS.md from the last test results (on main)

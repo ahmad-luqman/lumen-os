@@ -108,7 +108,8 @@ Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 
 The kernel is linked at -2 GiB because the **kernel code model** requires it
 (all symbols fit in sign-extended 32-bit immediates). `make audit` verifies
-this along with the absence of SSE/AVX and red-zone use (hard rule 3).
+this along with the absence of SSE/AVX and red-zone use and the presence of
+stack probes (hard rule 3).
 
 ### Physical memory (built in M1)
 
@@ -192,9 +193,10 @@ mapping of the kernel is (the text), and with each HHDM span's memory type.
 A mistake is an assertion naming the range, the address and how each walk
 ended, not a fault with no stack. A ktest builds a copy of the tables,
 plants one fault of each kind (kernel data read-only, text NX, RAM
-uncached, nothing mapped) and checks each is named. (The check skips the
-allocated stacks, which a fresh copy doesn't map; at the real switch the
-kernel still runs on the boot stack, so nothing is skipped then.) EFER.NXE and CR0.WP are set (so
+uncached, nothing mapped) and checks each is named. (It runs on the
+allocated main stack, which a fresh copy doesn't map: it asserts a strict
+check names the current stack page, then looks for the planted faults with
+`RunningStack::Skip`; the real switch passes `RunningStack::Check`.) EFER.NXE and CR0.WP are set (so
 read-only pages bind in ring 0 too) and the PAT layout the mappings rely on
 (slot 0 WB, 3 UC, 5 WC, set up by Limine) is checked rather than rewritten.
 
@@ -257,15 +259,21 @@ instead of a report.
 The registry (lock-free, 32 slots, each a seqlock; registering is `unsafe`
 because readers dereference what it lists) and the boot stack are what the
 crash reporter trusts: a frame pointer is followed only into a known stack,
-and frames move toward the top of their stack, except for one link down into
-another known stack. A #PF or #DF whose CR2 is in a guard page is named: as
-`kernel stack overflow (guard page hit)` with the stack's name and bounds
-when the interrupted `rsp` is in that guard page or the stack's bottom page,
-otherwise as a `guard page hit` from a stray access (naming the stack below
-too, which may have run off its top; on a #DF, CR2 may be stale). Every
-function in the kernel crate carries inline stack probes (`make audit`
-checks its IR; the other crates use the same target setting), so a frame
-bigger than a page can't jump over a guard page (`crash bigframe` shows it).
+and frames move toward the top of their stack; the chain may change stacks
+once (the main stack's first frame links into `kmain` on the boot stack), and
+every early stop says why. A #PF or #DF whose CR2 is in a guard page is
+named. It is `kernel stack overflow (guard page hit)`, with the stack's name
+and bounds, only on a #DF with the interrupted `rsp` in that guard page or
+the stack's bottom page: an overflow's #PF can't be delivered on the full
+stack, so it always arrives as a #DF. Otherwise it is a `guard page hit`: a
+stray access, or the stack below running off its top (named when `rsp` is
+in it); on a #DF the verdict is hedged (nothing sets CR2 on one, and the
+state it saves is not architecturally defined). A nested crash in the
+reporter names a guard page only if CR2 changed since the report began.
+Inline stack probes are the `x86_64-unknown-none` default, so every crate
+gets them; `make audit` checks the kernel crate's IR. A frame bigger than a
+page therefore can't jump over a guard page (`crash bigframe` faults in it
+with a sparse 16 KiB frame).
 
 ### Kernel heap (built in M1)
 

@@ -175,10 +175,13 @@ pub fn init() {
 /// `gdt::set_ist_stacks` has filled the slots with valid stacks; nothing
 /// else touches the IDT meanwhile (one CPU).
 pub(super) unsafe fn use_ist_stacks() {
+    // An empty slot would make the CPU switch to address 0: check them all
+    // before switching any gate.
+    for (_, slot) in IST_VECTORS {
+        assert!(gdt::ist_top(slot) != 0, "IST slot {slot} is empty");
+    }
     let idt = &raw mut IDT;
     for (vector, slot) in IST_VECTORS {
-        // An empty slot would make the CPU switch to address 0.
-        assert!(gdt::ist_top(slot) != 0, "IST slot {slot} is empty");
         // SAFETY: upheld by the caller; each write is one byte the CPU reads
         // when it takes that vector, and the slot it names is filled.
         unsafe { (*idt)[vector].ist = slot };

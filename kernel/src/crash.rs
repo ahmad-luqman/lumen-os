@@ -21,7 +21,9 @@ use crate::arch::{self, TrapFrame, serial::SerialWriter};
 use crate::symbols::Symbolized;
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use lumen_mm::stacks::{Hit, Registered};
 
 pub const BEGIN_MARKER: &str = "==== LUMEN CRASH REPORT ====";
 pub const END_MARKER: &str = "==== END CRASH REPORT ====";
@@ -33,6 +35,9 @@ const MAX_FRAMES: usize = 32;
 const RECENT_TRACE_EVENTS: u64 = 16;
 
 static CRASHING: AtomicBool = AtomicBool::new(false);
+/// CR2 when the first report began: a nested crash only blames a guard page
+/// if CR2 has changed since (only a #PF sets it).
+static FIRST_CR2: AtomicU64 = AtomicU64::new(0);
 /// Set while the serial-only tail (page walk, heap state) is being written: a
 /// fault there still ends the report properly.
 static IN_TAIL: AtomicBool = AtomicBool::new(false);
@@ -52,6 +57,7 @@ fn is_kernel_text(addr: u64) -> bool {
 pub fn exception(frame: &TrapFrame) -> ! {
     enter(frame.vector, frame.rip);
     let cr2 = arch::read_cr2();
+    FIRST_CR2.store(cr2, Ordering::SeqCst);
     let walk = |w: &mut dyn Write| {
         if frame.vector == 14 {
             // Lock-free: the fault may have happened with the page-table
@@ -67,6 +73,7 @@ pub fn exception(frame: &TrapFrame) -> ! {
 /// Report a Rust panic and stop.
 pub fn panic(info: &PanicInfo<'_>) -> ! {
     enter(u64::MAX, 0);
+    FIRST_CR2.store(arch::read_cr2(), Ordering::SeqCst);
     crate::ktrace!(crate::trace::Kind::Panic, info.location().map_or(0, |l| l.line()));
     let rbp = arch::read_rbp();
     emit(
@@ -93,20 +100,28 @@ fn enter(vector: u64, rip: u64) {
                 s,
                 "\n!!! fault while writing the page walk or heap state (vector {vector:#x}, rip {rip:#018x})"
             );
-            write_nested_guard_hit(&mut s);
+            write_nested_guard_hit(&mut s, vector);
             let _ = writeln!(s, "{END_MARKER}");
             finish();
         }
         let _ = writeln!(s, "\n!!! nested crash while reporting (vector {vector:#x}, rip {rip:#018x}); halting");
-        write_nested_guard_hit(&mut s);
+        write_nested_guard_hit(&mut s, vector);
         finish();
     }
 }
 
-/// A crash inside the report that touched a guard page most likely means the
-/// reporter overflowed the stack it runs on: say so (lock-free, bounded).
-fn write_nested_guard_hit(w: &mut dyn Write) {
-    let cr2 = arch::read_cr2();
+/// A nested #PF or #DF whose CR2 changed since the report began and is in a
+/// guard page most likely means the reporter overflowed the stack it runs
+/// on: say so (lock-free, bounded). Other nested crashes don't set CR2.
+fn write_nested_guard_hit(w: &mut dyn Write, vector: u64) {
+    write_nested_note(w, vector, arch::read_cr2(), FIRST_CR2.load(Ordering::SeqCst));
+}
+
+/// [`write_nested_guard_hit`] with the registers passed in (testable).
+fn write_nested_note(w: &mut dyn Write, vector: u64, cr2: u64, first_cr2: u64) {
+    if !matches!(vector, 8 | 14) || cr2 == first_cr2 {
+        return;
+    }
     if let Some(r) = arch::stacks::guard_hit(cr2) {
         let _ = writeln!(
             w,
@@ -210,38 +225,59 @@ fn write_exception(w: &mut dyn Write, f: &TrapFrame, cr2: u64) {
 }
 
 /// A fault whose CR2 is in a stack's guard page. It is that stack
-/// overflowing only if the interrupted `rsp` is in the guard page or the
-/// stack's bottom page (an overflow's #PF can't be delivered on the full
-/// stack, so it usually arrives as a #DF on its IST stack, CR2 still in the
-/// guard page). Anything else touching a guard page is a stray access; it
-/// may also be the stack below running off its top.
-fn write_guard_hit(w: &mut dyn Write, f: &TrapFrame, cr2: u64, r: lumen_mm::stacks::Registered) {
+/// overflowing only on a #DF with the interrupted `rsp` in the guard page or
+/// the stack's bottom page: an overflow's #PF can't be delivered on the full
+/// stack, so it arrives as a #DF on its IST stack, CR2 still in the guard
+/// page. A #PF that was delivered had room on its stack, so it is a stray
+/// access, or the stack below running off its top (`rsp` in or at the top of
+/// that stack). On a #DF the verdict is hedged: nothing sets CR2 on one, and
+/// the state it saves is not architecturally defined.
+fn write_guard_hit(w: &mut dyn Write, f: &TrapFrame, cr2: u64, r: Registered) {
     let (name, bottom, top) = (r.kind.name(), r.range.bottom, r.range.top);
-    let near = (r.range.guard()..bottom + lumen_mm::FRAME_SIZE).contains(&f.rsp);
-    if near {
-        let _ = writeln!(
-            w,
-            "kernel stack overflow (guard page hit): cr2 {cr2:#018x} is in the guard page below the {name} stack \
-             [{bottom:#x}, {top:#x})"
-        );
+    let double_fault = f.vector == 8;
+    let overflow = double_fault && (r.range.guard()..bottom + lumen_mm::FRAME_SIZE).contains(&f.rsp);
+    let headline = if overflow { "kernel stack overflow (guard page hit)" } else { "guard page hit" };
+    let _ =
+        write!(w, "{headline}: cr2 {cr2:#018x} is in the guard page below the {name} stack [{bottom:#x}, {top:#x})");
+    if overflow {
+        let _ = writeln!(w);
         return;
     }
-    let _ = write!(
-        w,
-        "guard page hit: cr2 {cr2:#018x} is in the guard page below the {name} stack [{bottom:#x}, {top:#x})"
-    );
     // The stack whose top is this guard page, if any.
-    if let Some(lumen_mm::stacks::Hit::Stack(b)) = arch::stacks::REGISTRY.find(r.range.guard() - 1)
-        && b.range.top == r.range.guard()
-    {
+    let below = r.range.guard().checked_sub(1).and_then(|a| match arch::stacks::REGISTRY.find(a) {
+        Some(Hit::Stack(b)) if b.range.top == r.range.guard() => Some(b),
+        _ => None,
+    });
+    if let Some(b) = below {
         let _ = write!(w, ", above the {} stack", b.kind.name());
     }
-    let _ = write!(w, "; rsp {:#018x} is not near it: a stray access, not an overflow", f.rsp);
-    if f.vector == 8 {
-        // Nothing sets CR2 on a #DF: it is whatever the last #PF left.
-        let _ = write!(w, " (on a #DF, cr2 may be stale)");
+    let rsp = f.rsp;
+    match below {
+        Some(b) if (b.range.bottom..=b.range.top).contains(&rsp) => {
+            let _ = write!(w, "; rsp {rsp:#018x} is in the {} stack: it may have run off its top", b.kind.name());
+        }
+        _ if double_fault => {
+            let _ = write!(
+                w,
+                "; rsp {rsp:#018x} is not near it: probably a stray access (on a #DF, cr2 may be stale and the \
+                 saved state is not architecturally defined)"
+            );
+        }
+        _ => {
+            let _ = write!(w, "; rsp {rsp:#018x} is not near it: a stray access, not an overflow");
+        }
     }
     let _ = writeln!(w);
+}
+
+/// Why a backtrace stopped before reaching the end of the chain (a null
+/// frame pointer, set by `_start`).
+enum Stop {
+    Limit,
+    UnknownFrame(u64),
+    NotKernelCode(u64),
+    NotUpward(u64),
+    SecondSwitch(u64),
 }
 
 /// Decoded #PF error code.
@@ -280,38 +316,54 @@ fn write_backtrace(w: &mut dyn Write, rip: Option<u64>, mut rbp: u64) -> fmt::Re
         writeln!(w, "  #{n:<2} {rip:#018x} <{}>", Symbolized(rip))?;
         n += 1;
     }
-    // One downward link into another known stack is allowed (see below).
-    let mut crossed = false;
-    while n < MAX_FRAMES {
-        if rbp == 0 || !rbp.is_multiple_of(8) || !arch::stacks::contains(rbp, 16) {
-            break;
+    // Frames move toward the top of their stack. The chain may change stacks
+    // once: the main stack's first frame links back into `kmain` on the boot
+    // stack (`arch::switch_stack`).
+    let mut switched = false;
+    let stop = loop {
+        if rbp == 0 {
+            break None;
+        }
+        if n == MAX_FRAMES {
+            break Some(Stop::Limit);
+        }
+        if !rbp.is_multiple_of(8) || !arch::stacks::contains(rbp, 16) {
+            break Some(Stop::UnknownFrame(rbp));
         }
         // SAFETY: [rbp, rbp+16) lies inside a known, mapped kernel stack
         // (one CPU: a registered stack is mapped until it is retracted, and
         // the boot stack is never unmapped).
         let (next, ret) = unsafe { ((rbp as *const u64).read(), (rbp as *const u64).add(1).read()) };
         if !is_kernel_text(ret) {
-            break;
+            break Some(Stop::NotKernelCode(ret));
         }
         // A return address points just past the call; look up `ret - 1` so a
         // call at the very end of a function still names that function.
         writeln!(w, "  #{n:<2} {ret:#018x} <{}>", Symbolized(ret - 1))?;
         n += 1;
-        // Frames move toward the top of their stack. One link may go down
-        // into a different known stack: the main stack's first frame links
-        // back into `kmain` on the boot stack (`arch::switch_stack`).
-        if next <= rbp {
-            if crossed || arch::stacks::bounds_of(next) == arch::stacks::bounds_of(rbp) {
-                break;
+        let (here, there) = (arch::stacks::bounds_of(rbp), arch::stacks::bounds_of(next));
+        if next != 0 && there.is_some() && there != here {
+            if switched {
+                break Some(Stop::SecondSwitch(next));
             }
-            crossed = true;
+            switched = true;
+        } else if next != 0 && there == here && next <= rbp {
+            break Some(Stop::NotUpward(next));
         }
         rbp = next;
-    }
+    };
     if n == 0 {
         writeln!(w, "  (no frames)")?;
-    } else if n == MAX_FRAMES {
-        writeln!(w, "  (stopped after {MAX_FRAMES} frames)")?;
+    }
+    match stop {
+        None => {}
+        Some(Stop::Limit) => writeln!(w, "  (stopped after {MAX_FRAMES} frames)")?,
+        Some(Stop::UnknownFrame(p)) => writeln!(w, "  (stopped: frame pointer {p:#x} is not in a known stack)")?,
+        Some(Stop::NotKernelCode(r)) => writeln!(w, "  (stopped: return address {r:#x} is not kernel code)")?,
+        Some(Stop::NotUpward(p)) => writeln!(w, "  (stopped: frame pointer {p:#x} does not move up its stack)")?,
+        Some(Stop::SecondSwitch(p)) => {
+            writeln!(w, "  (stopped: frame pointer {p:#x} would switch stacks a second time)")?
+        }
     }
     Ok(())
 }
@@ -322,6 +374,135 @@ crate::ktest!(
         let mut b = crate::ktest::Buf::new();
         let _ = write!(b, "{}", PageFaultCause(0b00010));
         crate::kassert_eq!(b.as_str(), "page fault: write of non-present page (kernel mode)");
+        Ok(())
+    }
+);
+
+/// A trap frame with only `vector` and `rsp` set (for tests of the report).
+#[cfg(feature = "ktest")]
+fn trap_frame(vector: u64, rsp: u64) -> TrapFrame {
+    TrapFrame {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rbp: 0,
+        rdi: 0,
+        rsi: 0,
+        rdx: 0,
+        rcx: 0,
+        rbx: 0,
+        rax: 0,
+        vector,
+        error_code: 0,
+        rip: 0,
+        cs: 0,
+        rflags: 0,
+        rsp,
+        ss: 0,
+    }
+}
+
+crate::ktest!(
+    fn guard_hit_is_classified() {
+        // A hit in the main stack's guard page (the #MC IST stack is right
+        // below it): an overflow only on a #DF with rsp in the guard page or
+        // the bottom page; a #PF never is one.
+        use crate::kassert;
+        use lumen_mm::FRAME_SIZE;
+        use lumen_mm::stacks::StackKind;
+        let find = |kind| arch::stacks::REGISTRY.iter().find(|r| r.kind == kind).ok_or("stack not registered");
+        let (main, lowest) = (find(StackKind::Main)?, find(StackKind::DoubleFault)?);
+        let line = |r: Registered, vector, rsp| {
+            let mut buf = crate::ktest::Buf::new();
+            write_guard_hit(&mut buf, &trap_frame(vector, rsp), r.range.guard() + 8, r);
+            buf
+        };
+        let (guard, bottom) = (main.range.guard(), main.range.bottom);
+        for rsp in [guard, guard + 8, bottom + FRAME_SIZE - 8] {
+            kassert!(line(main, 8, rsp).as_str().starts_with("kernel stack overflow (guard page hit): "));
+        }
+        let far_df = line(main, 8, bottom + FRAME_SIZE);
+        let far_df = far_df.as_str();
+        kassert!(far_df.starts_with("guard page hit: ") && far_df.contains("above the #MC IST stack"));
+        kassert!(far_df.contains("probably a stray access") && far_df.contains("cr2 may be stale"));
+        let pf_at_guard = line(main, 14, guard);
+        kassert!(pf_at_guard.as_str().starts_with("guard page hit: "));
+        kassert!(pf_at_guard.as_str().contains("is in the #MC IST stack: it may have run off its top"));
+        let far_pf = line(main, 14, bottom + 4 * FRAME_SIZE);
+        kassert!(far_pf.as_str().ends_with("a stray access, not an overflow\n"));
+        kassert!(!far_pf.as_str().contains("may be stale"));
+        // The lowest stack in the window has nothing below it.
+        let no_neighbour = line(lowest, 14, bottom);
+        kassert!(no_neighbour.as_str().starts_with("guard page hit: ") && !no_neighbour.as_str().contains("above the"));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn nested_crash_names_a_fresh_guard_hit_only() {
+        // Only a nested #PF or #DF whose CR2 changed since the report began
+        // blames a guard page: other faults (and panics) don't set CR2.
+        use crate::kassert;
+        let main = arch::stacks::REGISTRY
+            .iter()
+            .find(|r| r.kind == lumen_mm::stacks::StackKind::Main)
+            .ok_or("no main stack")?;
+        let cr2 = main.range.guard() + 8;
+        let note = |vector, first| {
+            let mut buf = crate::ktest::Buf::new();
+            write_nested_note(&mut buf, vector, cr2, first);
+            buf
+        };
+        kassert!(note(14, 0).as_str().contains("the crash reporter may have overflowed it"));
+        kassert!(note(8, 0).as_str().contains("below the kernel main stack"));
+        kassert!(note(14, cr2).as_str().is_empty()); // CR2 left over from the first fault
+        kassert!(note(13, 0).as_str().is_empty());
+        kassert!(note(u64::MAX, 0).as_str().is_empty()); // a panic
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn backtrace_allows_one_stack_switch() {
+        // Planted frame records: one switch between known stacks is followed
+        // (as from the main stack into the boot stack), a second is not, and
+        // a link down inside one stack ends the walk; each stop says why.
+        use crate::{kassert, kassert_eq};
+        use lumen_mm::stacks::StackKind;
+        let other = crate::mm::stack::KernelStack::new(4 * lumen_mm::FRAME_SIZE, StackKind::Test)
+            .map_err(|_| "allocating a stack")?;
+        let a = other.range().bottom; // above the main stack (allocated later)
+        let ret = write_backtrace as *const () as u64 + 1; // inside kernel text
+        let mut local = core::hint::black_box([0u64; 2]); // a record on the main stack
+        let on_main = local.as_mut_ptr();
+        let frames = |buf: &crate::ktest::Buf| buf.as_str().lines().filter(|l| l.starts_with("  #")).count();
+        let walk = |records: &[(u64, u64, u64)], start| {
+            for &(at, next, ret) in records {
+                // SAFETY: each record is in the stack this test owns (nothing
+                // runs on it) or in `local`; both stay valid while walked.
+                unsafe {
+                    (at as *mut u64).write_volatile(next);
+                    (at as *mut u64).add(1).write_volatile(ret);
+                }
+            }
+            let mut buf = crate::ktest::Buf::new();
+            let _ = write_backtrace(&mut buf, None, start);
+            buf
+        };
+        let (r1, r2, r3) = (a + 64, on_main as u64, a + 128);
+        let twice = walk(&[(r1, r2, ret), (r2, r3, ret), (r3, 0, ret)], r1);
+        kassert_eq!(frames(&twice), 2);
+        kassert!(twice.as_str().contains("would switch stacks a second time"));
+        let down = walk(&[(a + 128, a + 64, ret)], a + 128);
+        kassert_eq!(frames(&down), 1);
+        kassert!(down.as_str().contains("does not move up its stack"));
+        core::hint::black_box(&mut local);
+        drop(other);
         Ok(())
     }
 );

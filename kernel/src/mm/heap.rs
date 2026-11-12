@@ -38,6 +38,7 @@ use core::ptr::{self, NonNull};
 
 use lumen_heap::{CheckError, FreeList, Heap, Stats};
 use lumen_mm::FRAME_SIZE;
+#[cfg(feature = "ktest")]
 use lumen_mm::paging::MapError;
 
 #[cfg(feature = "ktest")]
@@ -97,7 +98,7 @@ impl GrowError {
         match self {
             GrowError::WindowFull | GrowError::OutOfFrames => true,
             // A page table that couldn't get a frame is running out too.
-            GrowError::Map(e) => e == paging::VmError::Map(MapError::OutOfMemory),
+            GrowError::Map(e) => window::WindowError::Map(e).is_exhaustion(),
             // Allocating before `mm::init` is a bug.
             GrowError::NotReady => false,
         }
@@ -529,7 +530,7 @@ crate::ktest!(
         // below HEAP_LIMIT fails before touching anything.
         use crate::{kassert, kassert_eq};
         use alloc::vec::Vec;
-        let tables = || paging::for_each_active_table(|_| {}).map_err(|_| "unreadable table");
+        let tables = paging::active_table_count;
         let (free0, tables0, size0) = (frame::free_frames(), tables()?, stats().size);
         // `black_box`: LLVM may assume an allocation it can see through
         // succeeds, and skip it.

@@ -115,7 +115,7 @@ def render(evaluated: list[tuple[dict, str]]) -> str:
         "|---|---|---|---|---|",
         *rows,
         "",
-        "## Known gaps (temporary exceptions to the hard rules)",
+        "## Known gaps (exceptions to the hard rules)",
         "",
         "- Rule 4 (stacks from the allocator with guard pages): early boot runs on",
         "  Limine's stack, without a guard page, until `kmain` switches to an",

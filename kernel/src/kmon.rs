@@ -308,14 +308,20 @@ fn crash_big_frame_overflow() {
     let _ = writeln!(serial::SerialWriter, "crash: big-frame recursion returned at depth {depth} (no guard page?)");
 }
 
-/// [`recurse`] with a 6000-byte array per call (more than a page).
+/// [`recurse`] with a 16 KiB frame of which only the lowest word is written:
+/// without stack probes the frame would jump over the guard page and that
+/// write would land in the stack mapped below.
 #[inline(never)]
 fn recurse_big(depth: u64) -> u64 {
-    let frame = core::hint::black_box([depth; 750]);
+    let mut frame = core::mem::MaybeUninit::<[u64; 2048]>::uninit();
+    let lowest = core::hint::black_box(frame.as_mut_ptr().cast::<u64>());
+    // SAFETY: `lowest` is the first word of this frame's own buffer.
+    unsafe { lowest.write_volatile(depth) };
     if core::hint::black_box(depth) == u64::MAX {
         return depth;
     }
-    recurse_big(depth + 1) + frame[749]
+    // SAFETY: written just above; the buffer lives until this returns.
+    recurse_big(depth + 1) + unsafe { lowest.read_volatile() }
 }
 
 /// Recurse without end: each call keeps a 256-byte array live across the

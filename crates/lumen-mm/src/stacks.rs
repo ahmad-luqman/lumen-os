@@ -9,7 +9,7 @@
 //!
 //! The registry is what the backtrace walker trusts ([`Registry::contains`]:
 //! a frame pointer is only followed into a registered stack) and what names
-//! a stack overflow ([`Registry::find`] says an address is in a stack's guard
+//! guard-page hits ([`Registry::find`] says an address is in a stack's guard
 //! page). Each slot is a small seqlock: a writer fills it in only while its
 //! sequence count is odd, so a reader never sees a half-written entry or a
 //! mix of two; an entry is retracted before its memory goes away.
@@ -84,11 +84,12 @@ impl StackRange {
         self.bottom..self.top
     }
 
-    /// Page-aligned, nonempty, with room for a guard page below.
+    /// Page-aligned, nonempty, with a guard page below that isn't the null
+    /// page (readers compute `guard() - 1`).
     fn is_valid(self) -> bool {
         self.bottom.is_multiple_of(FRAME_SIZE)
             && self.top.is_multiple_of(FRAME_SIZE)
-            && GUARD_SIZE <= self.bottom
+            && GUARD_SIZE < self.bottom
             && self.bottom < self.top
     }
 }
@@ -118,7 +119,9 @@ impl StackWindow {
         let bottom = self.next.checked_add(GUARD_SIZE)?;
         let top = bottom.checked_add(size)?;
         // The page above the stack must be free too (the next guard).
-        top.checked_add(GUARD_SIZE).filter(|&end| end <= self.limit)?;
+        if top.checked_add(GUARD_SIZE)? > self.limit {
+            return None;
+        }
         self.next = top;
         Some(StackRange { bottom, top })
     }
@@ -203,11 +206,14 @@ impl Registry {
     /// # Safety
     /// `range` (the stack, not its guard page) is mapped until it is
     /// unregistered: readers such as the crash reporter dereference what the
-    /// registry lists.
+    /// registry lists. (One CPU: readers are exception handlers that run to
+    /// completion. With SMP, unmapping after `unregister` needs a grace
+    /// period, since a reader may still hold the entry.)
     ///
     /// # Panics
-    /// If `range` is not page-aligned, nonempty and above the first page (a
-    /// caller bug; a malformed entry would break every reader).
+    /// If `range` is not page-aligned, nonempty and with its guard page above
+    /// the null page (a caller bug; a malformed entry would break every
+    /// reader).
     pub unsafe fn register(&self, kind: StackKind, range: StackRange) -> Option<Handle> {
         assert!(range.is_valid(), "malformed stack range {range:?}");
         debug_assert_eq!(StackKind::from_raw(kind as u8), Some(kind), "StackKind::ALL is missing {kind:?}");
@@ -328,7 +334,9 @@ mod tests {
     #[test]
     fn malformed_ranges_are_refused() {
         let bad = [
-            StackRange { bottom: 0, top: FRAME_SIZE },               // no room for a guard
+            StackRange { bottom: 0, top: FRAME_SIZE },              // no room for a guard
+            StackRange { bottom: GUARD_SIZE, top: 2 * FRAME_SIZE }, // guard is the null page
+            StackRange { bottom: BASE + FRAME_SIZE, top: BASE + FRAME_SIZE + 8 }, // misaligned top
             StackRange { bottom: BASE + 8, top: BASE + FRAME_SIZE }, // misaligned
             StackRange { bottom: BASE + FRAME_SIZE, top: BASE + FRAME_SIZE }, // empty
             StackRange { bottom: BASE + 2 * FRAME_SIZE, top: BASE + FRAME_SIZE }, // backwards
@@ -398,7 +406,6 @@ mod tests {
             assert!(!k.name().is_empty());
             assert!(k as u8 != EMPTY && k as u8 != FILLING);
         }
-        assert_eq!(StackKind::ALL.len(), 5);
         assert_eq!(StackKind::from_raw(EMPTY), None);
         assert_eq!(StackKind::from_raw(FILLING), None);
     }
@@ -406,7 +413,8 @@ mod tests {
     /// Readers racing a writer that keeps registering and retracting stacks
     /// in one slot only ever see whole entries: bounds that belong together,
     /// with the kind they were registered under. (`make test-host` also runs
-    /// this optimized, where reordering mistakes show up.)
+    /// the stacks tests optimized, where compiler-reordering mistakes in the
+    /// seqlock are likelier to surface.)
     #[test]
     fn readers_never_see_a_torn_entry() {
         let reg = Registry::new();
@@ -416,14 +424,21 @@ mod tests {
         let range =
             |n: u64| StackRange { bottom: BASE + n * 0x10_0000 + GUARD_SIZE, top: BASE + n * 0x10_0000 + 0x8000 };
         let kind = |n: u64| if n % 2 == 0 { StackKind::Main } else { StackKind::Test };
+        // Stops the readers even if the writer panics (else they spin forever).
+        struct StopOnDrop<'a>(&'a AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
         std::thread::scope(|s| {
             s.spawn(|| {
+                let _stop = StopOnDrop(&stop);
                 for n in 0..200_000u64 {
                     let h = register(&reg, kind(n), range(n)).unwrap();
                     assert_eq!(h, Handle(0));
                     reg.unregister(h);
                 }
-                stop.store(true, Ordering::Relaxed);
             });
             let readers: Vec<_> = (0..3)
                 .map(|_| {

@@ -175,6 +175,9 @@ def assert_main_stack_overflow(report: str, recursing: str) -> None:
     assert overflow, report
     cr2, bottom, top = (int(g, 16) for g in overflow.groups())
     assert bottom - 4096 <= cr2 < bottom and top - bottom == 128 * 1024, report
+    # What makes it an overflow: the interrupted rsp is at the guard page.
+    rsp = re.search(r"^rsp: (0x[0-9a-f]{16})", report, re.MULTILINE)
+    assert rsp and bottom - 4096 <= int(rsp.group(1), 16) < bottom + 4096, report
     assert bottom >> 40 == 0xFFFFD0, report  # the stack window
     rip = re.search(r"^rip: 0x[0-9a-f]{16} <(.+)>$", report, re.MULTILINE)
     assert rip and recursing in rip.group(1), report
@@ -191,19 +194,20 @@ def test_stack_overflow_hits_guard(crash_report):
     # the double-fault IST stack, with cr2 still in the guard page: the report
     # says so, and QEMU exits with the crash code (no reset, no triple fault).
     report = crash_report("stack")
-    assert_main_stack_overflow(report, "kmon::recurse")
+    assert_main_stack_overflow(report, "kmon::recurse+")
     frames = backtrace(report)
-    assert len(frames) == 32 and all("kmon::recurse" in f for f in frames), report
+    assert len(frames) == 32 and all("kmon::recurse+" in f for f in frames), report
     assert "(stopped after 32 frames)" in report, report
 
 
 def test_big_frames_hit_the_guard_page_too(crash_report):
-    # Frames bigger than a page: stack probes touch every page in turn, so
-    # the overflow still faults in the guard page instead of jumping over it
-    # into the stack mapped below (the #MC IST stack).
+    # Sparse 16 KiB frames (only the lowest word written): stack probes touch
+    # every page in turn, so the overflow still faults in the guard page
+    # instead of jumping over it into the stack mapped below (the #MC IST
+    # stack).
     report = crash_report("bigframe")
     assert_main_stack_overflow(report, "kmon::recurse_big")
-    # Only about 21 such frames fit in 128 KiB, so the walk goes past them,
+    # Only about 8 such frames fit in 128 KiB, so the walk goes past them,
     # back across the stack switch, to the entry point.
     frames = backtrace(report)
     assert any("kmon::crash_big_frame_overflow" in f for f in frames), report
@@ -219,12 +223,15 @@ def test_touching_a_guard_page_is_named(crash_report):
     assert "kernel stack overflow" not in report, report
     cr2 = re.search(r"faulting address \(cr2\): (0x[0-9a-f]{16})", report)
     line = re.search(
-        r"^guard page hit: cr2 (0x[0-9a-f]{16}) is in the guard page below the kernel main stack "
-        r"\[(0x[0-9a-f]+), 0x[0-9a-f]+\), above the #MC IST stack; rsp (0x[0-9a-f]{16}) is not near it: "
-        r"a stray access, not an overflow$",
+        r"^guard page hit: cr2 (?P<cr2>0x[0-9a-f]{16}) is in the guard page below the kernel main stack "
+        r"\[(?P<bottom>0x[0-9a-f]+), (?P<top>0x[0-9a-f]+)\), above the #MC IST stack; "
+        r"rsp (?P<rsp>0x[0-9a-f]{16}) is not near it: a stray access, not an overflow$",
         report,
         re.MULTILINE,
     )
-    assert cr2 and line and line.group(1) == cr2.group(1), report
-    assert int(line.group(2), 16) - 4096 + 8 == int(cr2.group(1), 16), report
+    assert cr2 and line and line["cr2"] == cr2.group(1), report
+    bottom, top = int(line["bottom"], 16), int(line["top"], 16)
+    assert bottom - 4096 + 8 == int(cr2.group(1), 16), report
+    # kmon runs well inside the main stack, nowhere near its guard page.
+    assert bottom + 4096 <= int(line["rsp"], 16) < top, report
     assert page_walk(report).end == "not present at L1", report
