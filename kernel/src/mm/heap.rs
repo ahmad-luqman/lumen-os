@@ -43,6 +43,8 @@ use lumen_mm::paging::MapError;
 
 #[cfg(feature = "ktest")]
 use super::frame;
+use lumen_mm::window::Window;
+
 use super::{paging, window};
 use crate::sync::SpinLock;
 
@@ -54,21 +56,20 @@ const MIN_GROWTH: u64 = 64 * 1024;
 /// grew once and went quiet doesn't hold much it never uses.
 const MAX_GROWTH: u64 = 4 * 1024 * 1024;
 
-/// What the heap owns: its window minus the top GiB (the paging ktests'
-/// page).
-const OWNED: Range<u64> = paging::HEAP_BASE..paging::HEAP_LIMIT;
-
 /// How many free blocks the crash report walks before giving up, so it
 /// finishes quickly even with a huge, fragmented free list.
 const CRASH_WALK_LIMIT: usize = 4096;
 
 struct State {
     heap: Heap,
+    /// The heap window's token (from [`init`]): what lets the heap map pages
+    /// there.
+    window: Option<Window>,
     /// The most recent growth, if it failed.
     last_failure: Option<GrowFailure>,
 }
 
-static STATE: SpinLock<State> = SpinLock::new(State { heap: Heap::empty(), last_failure: None });
+static STATE: SpinLock<State> = SpinLock::new(State { heap: Heap::empty(), window: None, last_failure: None });
 
 /// A failed growth: why, and for what request.
 #[derive(Clone, Copy, Debug)]
@@ -120,11 +121,13 @@ impl fmt::Display for GrowError {
 /// by `mm::init` once the kernel's page tables are active; allocating
 /// before that panics.
 pub fn init() {
-    let base = NonNull::new(paging::HEAP_BASE as *mut u8).expect("the heap base is not null");
-    // SAFETY: by convention only the heap maps `[HEAP_BASE, HEAP_LIMIT)`
-    // (the paging ktests' SCRATCH page is at HEAP_LIMIT, just outside). It
-    // starts empty; `grow` maps memory before handing it over.
-    unsafe { STATE.lock().heap.init(base, 0) };
+    let window = paging::claim_heap_window();
+    let base = NonNull::new(window.range().start as *mut u8).expect("the heap base is not null");
+    let mut state = STATE.lock();
+    // SAFETY: the heap holds the window's token, so nothing else maps there.
+    // It starts empty; `grow` maps memory before handing it over.
+    unsafe { state.heap.init(base, 0) };
+    state.window = Some(window);
 }
 
 #[global_allocator]
@@ -173,7 +176,10 @@ unsafe impl GlobalAlloc for KernelAllocator {
 /// panic part way doesn't leave an older failure on the crash line).
 fn grow(state: &mut State, layout: Layout) -> Result<(), GrowError> {
     state.last_failure = None;
-    let result = try_grow(&mut state.heap, layout);
+    let result = match state.window.as_mut() {
+        Some(window) => try_grow(&mut state.heap, window, layout),
+        None => Err(GrowError::NotReady),
+    };
     state.last_failure = result.err().map(|error| GrowFailure { error, layout });
     result
 }
@@ -188,14 +194,14 @@ fn preferred_growth(size: u64) -> u64 {
 /// [`grow`] without the bookkeeping: [`preferred_growth`] (or what `layout`
 /// needs, if more), falling back to just what it needs when the heap runs
 /// out on the way.
-fn try_grow(heap: &mut Heap, layout: Layout) -> Result<(), GrowError> {
+fn try_grow(heap: &mut Heap, window: &mut Window, layout: Layout) -> Result<(), GrowError> {
     let end = heap.end().ok_or(GrowError::NotReady)? as u64;
     // `None` only for sizes near `isize::MAX`: far past the window anyway.
     let need = lumen_heap::growth_for(layout).ok_or(GrowError::WindowFull)? as u64;
     let exact = need.checked_next_multiple_of(FRAME_SIZE).ok_or(GrowError::WindowFull)?;
     let preferred = exact.max(preferred_growth(heap.stats().size as u64));
-    let bytes = match map_span(end, preferred) {
-        Err(e) if e.returns_null() && exact < preferred => map_span(end, exact).map(|()| exact)?,
+    let bytes = match map_span(window, end, preferred) {
+        Err(e) if e.returns_null() && exact < preferred => map_span(window, end, exact).map(|()| exact)?,
         result => result.map(|()| preferred)?,
     };
     // SAFETY: `[end, end + bytes)` is now mapped read-write to frames
@@ -204,15 +210,13 @@ fn try_grow(heap: &mut Heap, layout: Layout) -> Result<(), GrowError> {
     Ok(())
 }
 
-/// Map `bytes` (whole pages) of fresh frames at `end`, the heap's end. All
-/// or nothing ([`window::map_fresh`]).
-fn map_span(end: u64, bytes: u64) -> Result<(), GrowError> {
-    if bytes > paging::HEAP_LIMIT - end {
+/// Map `bytes` (whole pages) of fresh frames at `end`, the heap's end, in
+/// the heap's window. All or nothing ([`window::map_fresh`]).
+fn map_span(window: &mut Window, end: u64, bytes: u64) -> Result<(), GrowError> {
+    if bytes > window.range().end - end {
         return Err(GrowError::WindowFull);
     }
-    // SAFETY: the heap owns `[HEAP_BASE, HEAP_LIMIT)`, and nothing above its
-    // end is mapped or in use.
-    unsafe { window::map_fresh(&OWNED, end..end + bytes) }.map_err(GrowError::from)
+    window::map_fresh(window, end..end + bytes).map_err(GrowError::from)
 }
 
 impl From<window::WindowError> for GrowError {
@@ -573,6 +577,11 @@ crate::ktest!(
         kassert!(!GrowError::Map(VmError::Map(MapError::AlreadyMapped)).returns_null());
         kassert!(!GrowError::Map(VmError::NotWriteBack).returns_null());
         kassert!(!GrowError::Map(VmError::Executable).returns_null());
+        let page = lumen_mm::VirtAddr::new(paging::HEAP_BASE).expect("canonical");
+        kassert!(!GrowError::Map(VmError::NotOwner(page)).returns_null());
+        kassert!(!GrowError::Map(VmError::OutsideWindow(page)).returns_null());
+        let f = lumen_mm::PhysFrame::from_u64(0).expect("aligned");
+        kassert!(!GrowError::Map(VmError::NotAllocated(f)).returns_null());
         kassert!(!GrowError::NotReady.returns_null());
         Ok(())
     }
@@ -629,21 +638,42 @@ crate::ktest!(
         // 8 frames: half of MIN_GROWTH (the smallest preferred growth), but
         // enough for a page and its tables.
         while frame::free_frames() > 8 {
-            held.push(frame::alloc().ok_or("frames ran out")?);
+            held.push(frame::alloc_owned().ok_or("frames ran out")?);
         }
         let size = stats().size;
         let page = Layout::from_size_align(FRAME_SIZE as usize, 16).map_err(|_| "layout")?;
         // SAFETY: non-zero size.
         let p = core::hint::black_box(unsafe { alloc::alloc::alloc(page) });
         let grown = stats().size - size;
-        for f in held {
-            frame::free(f).map_err(|_| "freeing a held frame")?;
-        }
+        drop(held); // frees them
         kassert!(!p.is_null());
         kassert_eq!(grown, FRAME_SIZE as usize);
         // SAFETY: allocated just above with this layout.
         unsafe { alloc::alloc::dealloc(p, page) };
         unfill(filler);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn heap_maps_only_in_its_own_window() {
+        // The heap holds the heap window's token, and that token can't map
+        // a page just past the heap (the ktest page) or in the stack window.
+        use crate::kassert_eq;
+        use lumen_mm::VirtAddr;
+        use lumen_mm::paging::Attrs;
+        let v = |a| VirtAddr::new(a).expect("canonical");
+        // (No allocation while STATE is held: it would deadlock. Asserting
+        // only writes to serial.)
+        let mut state = STATE.lock();
+        let window = state.window.as_mut().ok_or("the heap holds no window")?;
+        kassert_eq!(window.range(), paging::HEAP_BASE..paging::HEAP_LIMIT);
+        let mut f = frame::alloc_owned().ok_or("out of frames")?;
+        for page in [paging::HEAP_LIMIT, paging::STACKS_BASE] {
+            let (got, back) = paging::map_refused(window, v(page), f, Attrs::DATA, "outside the heap's window")?;
+            kassert_eq!(got, paging::VmError::NotOwner(v(page)));
+            f = back;
+        }
         Ok(())
     }
 );

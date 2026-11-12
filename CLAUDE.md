@@ -118,7 +118,9 @@ own PR that updates that doc first.
   stubs, serial, IST stacks. `crash.rs`: crash reporter. `ktest.rs`: test
   runner. `kmon.rs`: serial debug monitor (until the M2 shell). `fb.rs`:
   framebuffer and console. `klog.rs`: logger. `symbols.rs`: symbol lookup.
-  `mm/frame.rs`: physical frame allocator and its reservations.
+  `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
+  `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
+  (heap and stacks), through `paging::map` with a `Window` token.
   `mm/heap.rs`: the `#[global_allocator]`, growing in the heap window.
   `mm/stack.rs`: kernel stacks with guard pages; `arch/x86_64/stacks.rs`
   holds their registry (backtraces, overflow reports).
@@ -127,8 +129,9 @@ own PR that updates that doc first.
   PAT. `trace.rs`: trace ring, event kinds, `ktrace!`.
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
 - `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, the
-  page-table format and mapper (host-tested, incl. a model comparison), and
-  the kernel-stack layout and lock-free stack registry.
+  page-table format and mapper (host-tested, incl. a model comparison), the
+  window tokens that confine `paging::map`, and the kernel-stack layout and
+  lock-free stack registry.
 - `crates/lumen-heap`: heap allocator logic (address-ordered free list,
   coalescing; host-tested, incl. a randomized stress test against a shadow map).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads).

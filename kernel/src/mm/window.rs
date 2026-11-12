@@ -1,11 +1,13 @@
-//! Mapping fresh frames into the heap and stack windows, all or nothing:
-//! what the heap ([`super::heap`]) and the kernel stacks ([`super::stack`])
-//! share on top of the `unsafe` [`paging::map`]/[`paging::unmap`].
+//! Mapping fresh frames into a window, all or nothing: what the heap
+//! ([`super::heap`]) and the kernel stacks ([`super::stack`]) share on top of
+//! [`paging::map`]/[`paging::unmap`]. The caller's [`Window`] token is what
+//! says the pages are its own.
 
 use core::fmt;
 use core::ops::Range;
 
 use lumen_mm::paging::Attrs;
+use lumen_mm::window::Window;
 use lumen_mm::{FRAME_SIZE, VirtAddr};
 
 use super::{frame, paging};
@@ -40,85 +42,77 @@ impl fmt::Display for WindowError {
     }
 }
 
-/// Map `pages` (page-aligned, inside `owner`) to fresh frames, read-write
+/// Map `pages` (page-aligned, inside `window`) to fresh frames, read-write
 /// and no-execute. All or nothing: on failure every page mapped so far is
 /// unmapped and its frame freed (page tables created on the way stay; tables
-/// are never freed).
-///
-/// # Safety
-/// The caller owns `owner` (a part of the heap or stack window nothing else
-/// maps) and nothing in `pages` is mapped or in use.
-pub unsafe fn map_fresh(owner: &Range<u64>, pages: Range<u64>) -> Result<(), WindowError> {
-    check_bounds(owner, &pages);
+/// are never freed). A page already mapped is a [`WindowError::Map`].
+/// Panics if `pages` aren't page-aligned inside `window` (a caller bug).
+pub fn map_fresh(window: &mut Window, pages: Range<u64>) -> Result<(), WindowError> {
+    check_bounds(window, &pages);
     for virt in pages.clone().step_by(FRAME_SIZE as usize) {
-        // SAFETY: the caller owns `virt` and nothing uses it.
-        if let Err(e) = unsafe { map_one(virt) } {
+        if let Err(e) = map_one(window, virt) {
             // SAFETY: we mapped these pages just now and handed out nothing
             // in them.
-            unsafe { release(owner, pages.start..virt, Some(e)) };
+            unsafe { release(window, pages.start..virt, Some(e)) };
             return Err(e);
         }
     }
     Ok(())
 }
 
-/// Unmap `pages` (inside `owner`) and free their frames. A failure is a
-/// kernel bug (the pages are the caller's and mapped), so it panics.
+/// Unmap `pages` (inside `window`) and free their frames. A failure is a
+/// kernel bug (the pages are the window's and mapped), so it panics.
 ///
 /// # Safety
-/// The caller owns `pages`, they are mapped, and nothing refers to memory
-/// through them any more.
-pub unsafe fn unmap_and_free(owner: &Range<u64>, pages: Range<u64>) {
+/// `pages` are mapped and nothing refers to memory through them any more.
+pub unsafe fn unmap_and_free(window: &mut Window, pages: Range<u64>) {
     // SAFETY: upheld by the caller.
-    unsafe { release(owner, pages, None) }
+    unsafe { release(window, pages, None) }
 }
 
-/// [`unmap_and_free`], naming `cause` in the panic if this undoes a failed
-/// [`map_fresh`].
+/// [`unmap_and_free`], naming `cause` in the panic (unmapping or freeing
+/// failed) if this undoes a failed [`map_fresh`].
 ///
 /// # Safety
 /// As for [`unmap_and_free`].
-unsafe fn release(owner: &Range<u64>, pages: Range<u64>, cause: Option<WindowError>) {
-    check_bounds(owner, &pages);
+unsafe fn release(window: &mut Window, pages: Range<u64>, cause: Option<WindowError>) {
+    check_bounds(window, &pages);
+    let failed = |what: fmt::Arguments<'_>| -> ! {
+        match cause {
+            Some(c) => panic!("mm: rollback after `{c}` failed: {what}"),
+            None => panic!("mm: releasing owned pages failed: {what}"),
+        }
+    };
     for virt in pages.step_by(FRAME_SIZE as usize) {
         let v = VirtAddr::new(virt).expect("window addresses are canonical");
-        // SAFETY: the caller owns the page and nothing refers to it.
-        let m = unsafe { paging::unmap(v) }.unwrap_or_else(|e| release_failed(cause, format_args!("unmap {v}: {e}")));
-        frame::free(m.phys).unwrap_or_else(|e| release_failed(cause, format_args!("free {}: {e:?}", m.phys)));
+        // SAFETY: the page is the window's and nothing refers to it.
+        match unsafe { paging::unmap(window, v) } {
+            Ok((_, frame)) => {
+                let raw = frame.frame();
+                frame.free().unwrap_or_else(|e| failed(format_args!("free {raw} (mapped at {v}): {e:?}")));
+            }
+            Err(e) => failed(format_args!("unmap {v}: {e}")),
+        }
     }
 }
 
-/// A page the caller owns couldn't be unmapped or freed: a kernel bug.
-fn release_failed(cause: Option<WindowError>, what: fmt::Arguments<'_>) -> ! {
-    match cause {
-        Some(c) => panic!("mm: rollback after `{c}` failed: {what}"),
-        None => panic!("mm: releasing owned pages failed: {what}"),
-    }
-}
-
-/// Map a fresh frame at `virt`.
-///
-/// # Safety
-/// The caller owns the page at `virt` and nothing uses it.
-unsafe fn map_one(virt: u64) -> Result<(), WindowError> {
+/// Map a fresh frame at `virt` (a page of `window`). On failure the frame
+/// comes back and is freed.
+fn map_one(window: &mut Window, virt: u64) -> Result<(), WindowError> {
     let v = VirtAddr::new(virt).expect("window addresses are canonical");
-    let frame = frame::alloc().ok_or(WindowError::OutOfFrames)?;
-    // SAFETY: the frame was just allocated for the caller, who owns the page.
-    if let Err(e) = unsafe { paging::map(v, frame, Attrs::DATA) } {
-        frame::free(frame).unwrap_or_else(|fe| panic!("mm: freeing {frame} after `{e}` failed: {fe:?}"));
-        return Err(WindowError::Map(e));
-    }
-    Ok(())
+    let frame = frame::alloc_owned().ok_or(WindowError::OutOfFrames)?;
+    paging::map(window, v, frame, Attrs::DATA).map_err(|(e, frame)| {
+        let raw = frame.frame();
+        frame.free().unwrap_or_else(|fe| panic!("mm: freeing {raw} after mapping it at {v} failed (`{e}`): {fe:?}"));
+        WindowError::Map(e)
+    })
 }
 
-/// `pages` is page-aligned and inside `owner`: a caller bug otherwise.
-fn check_bounds(owner: &Range<u64>, pages: &Range<u64>) {
+/// `pages` is page-aligned and inside `window`: a caller bug otherwise.
+fn check_bounds(window: &Window, pages: &Range<u64>) {
+    let owner = window.range();
     assert!(
-        pages.start.is_multiple_of(FRAME_SIZE)
-            && pages.end.is_multiple_of(FRAME_SIZE)
-            && owner.start <= pages.start
-            && pages.start <= pages.end
-            && pages.end <= owner.end,
+        pages.start.is_multiple_of(FRAME_SIZE) && pages.end.is_multiple_of(FRAME_SIZE) && window.contains(pages),
         "pages {:#x}..{:#x} not page-aligned inside {:#x}..{:#x}",
         pages.start,
         pages.end,
@@ -139,6 +133,11 @@ crate::ktest!(
         kassert!(!WindowError::Map(VmError::Map(PtError::AlreadyMapped)).is_exhaustion());
         kassert!(!WindowError::Map(VmError::NotWriteBack).is_exhaustion());
         kassert!(!WindowError::Map(VmError::Executable).is_exhaustion());
+        let page = lumen_mm::VirtAddr::new(paging::HEAP_BASE).expect("canonical");
+        kassert!(!WindowError::Map(VmError::NotOwner(page)).is_exhaustion());
+        kassert!(!WindowError::Map(VmError::OutsideWindow(page)).is_exhaustion());
+        let f = lumen_mm::PhysFrame::from_u64(0).expect("aligned");
+        kassert!(!WindowError::Map(VmError::NotAllocated(f)).is_exhaustion());
         Ok(())
     }
 );

@@ -20,8 +20,9 @@
 //! pointers fault.
 //!
 //! After that, [`map`] and [`unmap`] manage 4 KiB pages in the kernel heap
-//! and stack windows (for their owners: [`super::heap`] and
-//! [`super::stack`]), and [`map_mmio`] maps
+//! and stack windows for whoever holds the window's token (handed out once
+//! ever: [`claim_heap_window`] to [`super::heap`], [`claim_stack_window`] to
+//! [`super::stack`]); `map` takes the frame as an owned one. [`map_mmio`] maps
 //! device registers uncached in the MMIO window (ARCHITECTURE.md section 5).
 //! The format, walks and mapper are host-tested in `lumen_mm::paging`; this
 //! module gives them access to table frames through the HHDM ([`Hhdm`]).
@@ -38,6 +39,9 @@ use lumen_mm::paging::{
 };
 use lumen_mm::{FRAME_SIZE, PhysAddr, PhysFrame, VirtAddr, align_down, align_up};
 
+use lumen_mm::window::{Claims, Window};
+
+use super::frame::OwnedFrame;
 use super::{frame, pages};
 use crate::arch::paging as hw;
 use crate::boot;
@@ -64,6 +68,47 @@ pub const STACKS_BASE: u64 = 0xffff_d000_0000_0000;
 /// Kernel stacks are handed out up from [`STACKS_BASE`] and stop below this.
 /// The top GiB of the window is left for the paging ktests' stack page.
 pub const STACKS_LIMIT: u64 = STACKS_BASE + WINDOW - (1 << 30);
+// The indices of the window claims in `CLAIMS`.
+const HEAP_CLAIM: usize = 0;
+#[cfg(feature = "ktest")]
+const HEAP_TEST_CLAIM: usize = 1;
+const STACKS_CLAIM: usize = 2;
+#[cfg(feature = "ktest")]
+const STACKS_TEST_CLAIM: usize = 3;
+// The windows `CLAIMS` covers don't overlap anything else the kernel maps:
+// the heap below the stacks, the stacks below MMIO, MMIO below the image
+// (and `build` checks the HHDM ends below the heap).
+const _: () =
+    assert!(HEAP_BASE + WINDOW <= STACKS_BASE && STACKS_BASE + WINDOW <= MMIO_BASE && MMIO_END <= KERNEL_BASE);
+
+/// Where [`map`] and [`unmap`] work, as window claims: the heap, the top GiB
+/// of the heap window (a ktest page), the stacks, the top GiB of the stack
+/// window (a ktest page).
+// SAFETY: these ranges tile the heap and stack windows, nothing else in the
+// kernel maps there (`map` is the only way in; `build` checks the HHDM ends
+// below them), and this is the only table covering them.
+static CLAIMS: Claims<4> = unsafe {
+    Claims::new([
+        (HEAP_BASE, HEAP_LIMIT),
+        (HEAP_LIMIT, HEAP_BASE + WINDOW),
+        (STACKS_BASE, STACKS_LIMIT),
+        (STACKS_LIMIT, STACKS_BASE + WINDOW),
+    ])
+};
+
+/// The heap's window, `[HEAP_BASE, HEAP_LIMIT)`. Panics if claimed before.
+#[must_use = "dropping the heap window gives it up for good"]
+pub(super) fn claim_heap_window() -> Window {
+    CLAIMS.claim(HEAP_CLAIM).expect("heap window claimed twice (heap::init called again?)")
+}
+
+/// The kernel stacks' window, `[STACKS_BASE, STACKS_LIMIT)`. Panics if
+/// claimed before.
+#[must_use = "dropping the stack window gives it up for good"]
+pub(super) fn claim_stack_window() -> Window {
+    CLAIMS.claim(STACKS_CLAIM).expect("stack window claimed twice (stack::init called again?)")
+}
+
 /// Device mappings: [`map_mmio`] hands out addresses from here.
 const MMIO_BASE: u64 = 0xffff_e000_0000_0000;
 const MMIO_END: u64 = MMIO_BASE + WINDOW;
@@ -220,6 +265,9 @@ fn build() -> PhysFrame {
     let hhdm = super::hhdm_offset();
     let root = frame::alloc_zeroed().expect("no frame for the root page table");
     for (start, end, attrs) in hhdm_spans() {
+        // The heap and stack windows are `map`'s alone (`CLAIMS`, and
+        // `unmap`'s safety rests on it): the HHDM must end below them.
+        assert!(hhdm + end <= HEAP_BASE, "HHDM {start:#x}..{end:#x} reaches the heap window");
         map_range(root, hhdm + start, start, end - start, attrs)
             .unwrap_or_else(|err| panic!("HHDM {start:#x}..{end:#x}: {err}"));
     }
@@ -386,8 +434,11 @@ pub fn kernel_root() -> PhysFrame {
 /// Why [`map`] or [`unmap`] refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmError {
+    /// The page is outside the caller's [`Window`].
+    NotOwner(VirtAddr),
     /// Only the heap and stack windows are managed page by page; everything
-    /// else (the image, the HHDM, MMIO) is fixed.
+    /// else (the image, the HHDM, MMIO) is fixed. (A window outside them
+    /// means its claims table was built wrongly.)
     OutsideWindow(VirtAddr),
     /// The frame isn't one the allocator handed out, so it may be in use.
     NotAllocated(PhysFrame),
@@ -403,6 +454,7 @@ pub enum VmError {
 impl fmt::Display for VmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            VmError::NotOwner(v) => write!(f, "{v} is outside the caller's window"),
             VmError::OutsideWindow(v) => write!(f, "{v} is outside the heap and stack windows"),
             VmError::NotAllocated(p) => write!(f, "frame {p} was not allocated"),
             VmError::NotWriteBack => f.write_str("RAM must be mapped write-back"),
@@ -418,51 +470,85 @@ fn in_window(virt: VirtAddr) -> bool {
     (HEAP_BASE..HEAP_BASE + WINDOW).contains(&v) || (STACKS_BASE..STACKS_BASE + WINDOW).contains(&v)
 }
 
-/// Map the 4 KiB page at `virt` (in the heap or stack window) to `frame`.
-/// Fails, changing nothing, if something is mapped there, or if the request
-/// is outside what the windows are for (see [`VmError`]).
-///
-/// # Safety
-/// The caller owns `frame` (allocated by it, or handed to it) and the page
-/// at `virt`: nothing else may use either while the mapping exists. The
-/// checks catch frames nobody allocated, but not someone else's frame (a
-/// page table, say).
-pub unsafe fn map(virt: VirtAddr, frame: PhysFrame, attrs: Attrs) -> Result<(), VmError> {
-    if !in_window(virt) {
-        return Err(VmError::OutsideWindow(virt));
+/// Map the 4 KiB page at `virt` to `frame`, for the holder of the window
+/// that owns the page. Safe: the window proves the page is the caller's, the
+/// owned frame proves the frame is, and the rights are limited to
+/// write-back, non-executable data. Consumes the frame (held by the mapping
+/// until [`unmap`]); on failure gives it back and maps nothing (page tables
+/// allocated on the way stay). Refuses a page outside `window`
+/// ([`VmError::NotOwner`]) or outside the heap and stack windows, a frame
+/// nobody allocated, executable or non-write-back rights, and a page already
+/// mapped.
+pub fn map(window: &mut Window, virt: VirtAddr, frame: OwnedFrame, attrs: Attrs) -> Result<(), (VmError, OwnedFrame)> {
+    if let Err(e) = check_page(window, virt) {
+        return Err((e, frame));
     }
     if attrs.executable() {
-        return Err(VmError::Executable);
+        return Err((VmError::Executable, frame));
     }
     if attrs.cache() != Cache::WriteBack {
-        return Err(VmError::NotWriteBack);
+        return Err((VmError::NotWriteBack, frame));
     }
-    with_space(|s| {
+    let raw = frame.frame();
+    let mapped = with_space(|s| {
         // Under SPACE (the lock order is SPACE, then the allocator).
-        if !frame::is_allocated(frame) {
-            return Err(VmError::NotAllocated(frame));
+        if !frame::is_allocated(raw) {
+            return Err(VmError::NotAllocated(raw));
         }
-        pt::map(&mut Hhdm, s.root, virt, frame, PageSize::Size4K, attrs).map_err(VmError::Map)
-    })
+        pt::map(&mut Hhdm, s.root, virt, raw, PageSize::Size4K, attrs).map_err(VmError::Map)
+    });
+    // The frame stays out of the closure, so a refusal can give it back.
+    match mapped {
+        Ok(()) => {
+            let _held_by_the_mapping = frame.into_raw();
+            Ok(())
+        }
+        Err(e) => Err((e, frame)),
+    }
 }
 
-/// Unmap the page starting at `virt` (in the heap or stack window), flush
-/// it from the TLB, and return what it mapped. Freeing the frame is the
-/// caller's job.
+/// Unmap the page at `virt` (owned by `window`), flush it from the TLB, and
+/// give back what it mapped and its frame (dropping the frame frees it).
 ///
 /// # Safety
-/// The caller owns the page at `virt` and nothing refers to memory through
-/// it any more (a reference into it would afterwards fault, or, once the
-/// page is mapped again, read someone else's memory).
-pub unsafe fn unmap(virt: VirtAddr) -> Result<Mapping, VmError> {
-    if !in_window(virt) {
-        return Err(VmError::OutsideWindow(virt));
-    }
-    with_space(|s| {
+/// Nothing refers to memory through the page any more (a reference into it
+/// would afterwards fault, or, once the page is mapped again, read someone
+/// else's memory).
+///
+/// # Panics
+/// If the page wasn't mapped by `map` (not a 4 KiB leaf, or its frame isn't
+/// allocated): a broken invariant. The mapping is left in place for the
+/// crash report.
+pub unsafe fn unmap(window: &mut Window, virt: VirtAddr) -> Result<(Mapping, OwnedFrame), VmError> {
+    check_page(window, virt)?;
+    let m = with_space(|s| {
+        // What `map` makes; checked before the entry goes.
+        if let Some(m) = pt::walk(&Hhdm, s.root, virt).mapping() {
+            assert!(
+                m.size == PageSize::Size4K && frame::is_allocated(m.phys),
+                "window page {virt} maps {m:?}, not by `map`"
+            );
+        }
         let m = pt::unmap(&mut Hhdm, s.root, virt).map_err(VmError::Unmap)?;
         hw::invalidate(virt);
         Ok(m)
-    })
+    })?;
+    // SAFETY: window pages are mapped only by `map` (4 KiB leaves), which
+    // took an owned frame for each (vouched for by `alloc_owned` or an
+    // `unsafe` `from_raw`) and left it held by the mapping until now.
+    Ok((m, unsafe { OwnedFrame::from_raw(m.phys) }))
+}
+
+/// Is the page at `virt` the caller's: in `window` and in the heap or stack
+/// windows?
+fn check_page(window: &Window, virt: VirtAddr) -> Result<(), VmError> {
+    if !window.owns_page(virt.as_u64()) {
+        Err(VmError::NotOwner(virt))
+    } else if !in_window(virt) {
+        Err(VmError::OutsideWindow(virt))
+    } else {
+        Ok(())
+    }
 }
 
 /// Why [`map_mmio`] failed.
@@ -605,6 +691,10 @@ fn write_walk_from(w: &mut dyn Write, root: PhysFrame, v: VirtAddr) -> fmt::Resu
     }
 }
 
+/// `map` must refuse (for the heap's and stacks' ktests too).
+#[cfg(feature = "ktest")]
+pub use checks::map_refused;
+
 #[cfg(feature = "ktest")]
 mod checks {
     pub use super::*;
@@ -634,15 +724,22 @@ mod checks {
         PhysAddr::new(addr).ok_or("RSDP is not physical")
     }
 
-    /// Fill a frame (through the HHDM) with `byte`.
-    pub fn fill(frame: PhysFrame, byte: u8) {
-        // SAFETY: the test owns the frame (just allocated); the HHDM maps it.
+    /// Fill a frame through the HHDM.
+    ///
+    /// # Safety
+    /// The caller owns `frame` (it isn't mapped elsewhere or used).
+    pub unsafe fn fill(frame: PhysFrame, byte: u8) {
+        // SAFETY: upheld by the caller; the HHDM maps the frame.
         unsafe { core::ptr::write_bytes(hhdm_virt(frame.as_u64()) as *mut u8, byte, FRAME_SIZE as usize) }
     }
 
-    pub fn read(virt: u64) -> u8 {
-        // SAFETY: `virt` is mapped (by the caller, or the HHDM) to a frame
-        // the test owns.
+    /// Read one byte.
+    ///
+    /// # Safety
+    /// `virt` is mapped (by the caller, or the HHDM) to memory the caller
+    /// may read.
+    pub unsafe fn read(virt: u64) -> u8 {
+        // SAFETY: upheld by the caller.
         unsafe { core::ptr::read_volatile(virt as *const u8) }
     }
 
@@ -657,8 +754,11 @@ mod checks {
         Ok(((start, end), (phys, phys + (end - start))))
     }
 
-    /// Flip `bits` in the leaf that maps `virt` under `root`.
-    pub fn flip_leaf(root: PhysFrame, virt: u64, bits: u64) -> Result<(), &'static str> {
+    /// Flip `bits` in the leaf entry mapping `virt` under `root`.
+    ///
+    /// # Safety
+    /// `root` is a hierarchy the caller owns and that isn't loaded (CR3).
+    pub unsafe fn flip_leaf(root: PhysFrame, virt: u64, bits: u64) -> Result<(), &'static str> {
         let w = pt::walk(&Hhdm, root, v(virt));
         w.mapping().ok_or("not mapped")?;
         let leaf = *w.steps().last().ok_or("no steps")?;
@@ -668,115 +768,318 @@ mod checks {
 
     /// Return every table of a hierarchy (not the active one) to the
     /// allocator.
-    pub fn free_tables(root: PhysFrame) -> Result<(), &'static str> {
+    ///
+    /// # Safety
+    /// The hierarchy is the caller's (built for it, not loaded in CR3) and
+    /// nothing refers to its tables any more.
+    pub unsafe fn free_tables(root: PhysFrame) -> Result<(), &'static str> {
         let mut failed = false;
-        pt::for_each_table(&Hhdm, root, |t| failed |= frame::free(t).is_err()).map_err(|_| "unreadable table")?;
+        // SAFETY: the caller owns every table and nothing uses them.
+        pt::for_each_table(&Hhdm, root, |t| failed |= unsafe { frame::free(t) }.is_err())
+            .map_err(|_| "unreadable table")?;
         if failed { Err("freeing a table failed") } else { Ok(()) }
     }
 
     pub use crate::ktest::Buf;
+
+    /// The two ktest windows (the top GiB of the heap and of the stack
+    /// window), claimed on first use and lent out: claims are once ever.
+    static TEST_WINDOWS: SpinLock<Option<(Window, Window)>> = SpinLock::new(None);
+
+    /// Run `f` with the heap and stack test windows. `f` must not split them
+    /// (that would take SCRATCH away from later tests) or call
+    /// `with_test_windows` again (it would spin forever).
+    pub fn with_test_windows<R>(f: impl FnOnce(&mut Window, &mut Window) -> R) -> R {
+        let mut windows = TEST_WINDOWS.lock();
+        let (heap, stack) = windows.get_or_insert_with(|| {
+            let claim = |i| CLAIMS.claim(i).unwrap_or_else(|| panic!("ktest window {i} claimed twice"));
+            (claim(HEAP_TEST_CLAIM), claim(STACKS_TEST_CLAIM))
+        });
+        f(heap, stack)
+    }
+
+    /// An allocated frame as an owned one (or "out of frames").
+    pub fn owned() -> Result<OwnedFrame, &'static str> {
+        frame::alloc_owned().ok_or("out of frames")
+    }
+
+    /// `map` must refuse: its error and the frame it gives back. If it maps
+    /// instead, the test fails naming `case` (printed first), and the page is
+    /// unmapped again, its frame given up raw so a frame the test doesn't own
+    /// is never freed. (For a frame the allocator doesn't own, `unmap`'s own
+    /// check panics instead, after the case was printed.)
+    pub fn map_refused(
+        window: &mut Window,
+        virt: VirtAddr,
+        frame: OwnedFrame,
+        attrs: Attrs,
+        case: &'static str,
+    ) -> Result<(VmError, OwnedFrame), &'static str> {
+        match map(window, virt, frame, attrs) {
+            Err((e, frame)) => Ok((e, frame)),
+            Ok(()) => {
+                crate::ktest::diag(format_args!("map at {virt} was not refused: {case}"));
+                // SAFETY: the test just mapped this page and holds nothing in it.
+                match unsafe { unmap(window, virt) } {
+                    Ok((_, frame)) => {
+                        let _ = frame.into_raw();
+                    }
+                    Err(e) => crate::ktest::diag(format_args!("and unmapping it again failed: {e}")),
+                }
+                Err("a map that should be refused succeeded")
+            }
+        }
+    }
 }
 
 crate::ktest!(
     fn map_unmap_roundtrip() {
         use self::checks::*;
-        use crate::{kassert, kassert_eq};
-        let (a, b) = (frame::alloc().ok_or("out of frames")?, frame::alloc().ok_or("out of frames")?);
-        fill(a, 0xa1);
-        fill(b, 0xb2);
-        // Collect everything, clean up, then assert: a failure must not
-        // leave SCRATCH mapped for the tests after this one.
-        let before = translate(v(SCRATCH));
-        // SAFETY: the test owns `a`, `b` and the SCRATCH page, and holds no
-        // reference into it across an unmap (same for the calls below).
-        let mapped = unsafe { map(v(SCRATCH), a, Attrs::DATA) };
-        let at = translate(v(SCRATCH + 0x123));
-        let first = read(SCRATCH + 7);
-        // SAFETY: the test owns the frames and the SCRATCH page.
-        let twice = unsafe { map(v(SCRATCH), b, Attrs::DATA) };
-        // SAFETY: SCRATCH maps `a`, which the test owns (or the write faults
-        // and the test fails with a crash report).
-        unsafe { core::ptr::write_volatile((SCRATCH + 8) as *mut u8, 0x77) };
-        let wrote_through = read(hhdm_virt(a.as_u64()) + 8);
-        // SAFETY: the test owns the frames and the SCRATCH page.
-        let unmapped = unsafe { unmap(v(SCRATCH)) };
-        let after = translate(v(SCRATCH));
-        // Remap to `b`: a stale TLB entry (no invlpg on unmap) would still
-        // read `a`.
-        // SAFETY: the test owns the frames and the SCRATCH page.
-        let remapped = unsafe { map(v(SCRATCH), b, Attrs::DATA) };
-        let second = read(SCRATCH + 7);
-        // SAFETY: the test owns the frames and the SCRATCH page.
-        let cleanup = unsafe { unmap(v(SCRATCH)) }.map(|m| m.phys);
-        kassert_eq!(frame::free(a), Ok(()));
-        kassert_eq!(frame::free(b), Ok(()));
-        kassert_eq!(before, None);
-        kassert_eq!(mapped, Ok(()));
-        kassert_eq!(at, a.start().checked_add(0x123));
-        kassert_eq!(first, 0xa1);
-        kassert_eq!(twice, Err(VmError::Map(MapError::AlreadyMapped)));
-        kassert_eq!(wrote_through, 0x77);
-        kassert!(unmapped.is_ok_and(|m| m.phys == a && m.size == PageSize::Size4K && m.writable));
-        kassert_eq!(after, None);
-        kassert_eq!(remapped, Ok(()));
-        kassert_eq!(second, 0xb2);
-        kassert_eq!(cleanup, Ok(b));
-        // SAFETY: the test owns the frames and the SCRATCH page.
-        kassert_eq!(unsafe { unmap(v(SCRATCH)) }, Err(VmError::Unmap(UnmapError::NotMapped)));
-        Ok(())
+        use crate::kassert_eq;
+        with_test_windows(|heap, stack| {
+            let (a, b) = (owned()?, owned()?);
+            let (a_raw, b_raw) = (a.frame(), b.frame());
+            // SAFETY: both frames are this test's and unused.
+            unsafe {
+                fill(a_raw, 0xa1);
+                fill(b_raw, 0xb2);
+            }
+            // Collect everything, clean up, then assert: a failure must not
+            // leave SCRATCH mapped for the tests after this one.
+            let before = translate(v(SCRATCH));
+            let mapped = map(heap, v(SCRATCH), a, Attrs::DATA).map_err(|(e, _)| e);
+            if let Err(e) = mapped {
+                // Reading SCRATCH below would fault and hide the reason.
+                crate::ktest::diag(format_args!("mapping SCRATCH failed: {e}"));
+                return Err("mapping SCRATCH failed");
+            }
+            let at = translate(v(SCRATCH + 0x123));
+            // SAFETY: SCRATCH maps `a` (or the read faults and the test fails
+            // with a crash report); same for the reads below.
+            let first = unsafe { read(SCRATCH + 7) };
+            // A second mapping is refused and gives `b` back; another window
+            // can neither map over the live page nor unmap it.
+            let (twice, b) = map_refused(heap, v(SCRATCH), b, Attrs::DATA, "a second mapping of SCRATCH")?;
+            let (foreign_map, b) = map_refused(stack, v(SCRATCH), b, Attrs::DATA, "SCRATCH from the stack window")?;
+            // SAFETY: refused before touching the mapping (asserted).
+            let foreign_unmap = unsafe { unmap(stack, v(SCRATCH)) }.map(|_| ());
+            let still_a = translate(v(SCRATCH));
+            // SAFETY: SCRATCH maps `a`, which the test owns.
+            unsafe { core::ptr::write_volatile((SCRATCH + 8) as *mut u8, 0x77) };
+            // SAFETY: `a` is the test's; the HHDM maps it.
+            let wrote_through = unsafe { read(hhdm_virt(a_raw.as_u64()) + 8) };
+            // SAFETY: nothing refers into SCRATCH (same for the calls below).
+            let unmapped = unsafe { unmap(heap, v(SCRATCH)) };
+            let after = translate(v(SCRATCH));
+            // Remap to `b`: a stale TLB entry (no invlpg on unmap) would
+            // still read `a`.
+            let remapped = map(heap, v(SCRATCH), b, Attrs::DATA).map_err(|(e, _)| e);
+            // SAFETY: SCRATCH maps `b`.
+            let second = unsafe { read(SCRATCH + 7) };
+            // SAFETY: as above.
+            let cleanup = unsafe { unmap(heap, v(SCRATCH)) };
+            kassert_eq!(before, None);
+            kassert_eq!(mapped, Ok(()));
+            kassert_eq!(at, a_raw.start().checked_add(0x123));
+            kassert_eq!(first, 0xa1);
+            kassert_eq!(twice, VmError::Map(MapError::AlreadyMapped));
+            kassert_eq!(foreign_map, VmError::NotOwner(v(SCRATCH)));
+            kassert_eq!(foreign_unmap, Err(VmError::NotOwner(v(SCRATCH))));
+            kassert_eq!(still_a, Some(a_raw.start()));
+            kassert_eq!(wrote_through, 0x77);
+            // `unmap` gives back the very frame it mapped (dropping it frees it).
+            kassert_eq!(
+                unmapped.map(|(m, f)| (m.phys, f.frame(), m.size, m.writable)),
+                Ok((a_raw, a_raw, PageSize::Size4K, true))
+            );
+            kassert_eq!(after, None);
+            kassert_eq!(remapped, Ok(()));
+            kassert_eq!(second, 0xb2);
+            kassert_eq!(cleanup.map(|(m, f)| (m.phys, f.frame())), Ok((b_raw, b_raw)));
+            // SAFETY: as above.
+            kassert_eq!(unsafe { unmap(heap, v(SCRATCH)) }.map(|_| ()), Err(VmError::Unmap(UnmapError::NotMapped)));
+            Ok(())
+        })
     }
 );
 
 crate::ktest!(
     fn map_and_unmap_refuse_what_they_dont_own() {
-        // The checks map/unmap make before trusting their caller: only the
-        // heap and stack windows, only allocated frames, only write-back,
-        // never executable.
+        // The checks map/unmap make: pages the window owns (NotOwner), in
+        // the heap and stack windows (OutsideWindow), allocated frames,
+        // write-back, never executable. Each refusal gives the frame back.
         use self::checks::*;
-        use crate::{kassert, kassert_eq};
-        let freed = frame::alloc().ok_or("out of frames")?;
-        frame::free(freed).map_err(|_| "free failed")?;
-        let frame = frame::alloc().ok_or("out of frames")?;
+        use crate::kassert_eq;
         let bitmap = frame::bitmap().ok_or("no bitmap")?.start();
-        let past_heap = v(HEAP_BASE + WINDOW);
         let not_ours = PhysFrame::from_u64(bitmap).ok_or("bitmap not aligned")?;
         let text_page = v(code_addr()).align_down(FRAME_SIZE);
-        let (alias, bitmap_alias) = (v(hhdm_virt(frame.as_u64())), v(hhdm_virt(bitmap)));
-        // SAFETY: every call below is refused before touching any mapping
-        // (asserted), so nothing the test doesn't own changes.
-        let checks = unsafe {
-            [
-                (map(text_page, frame, Attrs::DATA), Err(VmError::OutsideWindow(text_page))),
-                (map(alias, frame, Attrs::DATA), Err(VmError::OutsideWindow(alias))),
-                (map(v(SCRATCH), not_ours, Attrs::DATA), Err(VmError::NotAllocated(not_ours))),
-                (map(v(SCRATCH), frame, Attrs::MMIO), Err(VmError::NotWriteBack)),
-                (map(v(SCRATCH), frame, Attrs::CODE), Err(VmError::Executable)),
-                (map(past_heap, frame, Attrs::DATA), Err(VmError::OutsideWindow(past_heap))),
-                (unmap(text_page).map(|_| ()), Err(VmError::OutsideWindow(text_page))),
-                (unmap(bitmap_alias).map(|_| ()), Err(VmError::OutsideWindow(bitmap_alias))),
-            ]
-        };
-        // A frame that was freed (owned by the allocator again, possibly
-        // about to go to someone else) is refused too. (`frame` may be the
-        // same frame, re-allocated: free it first.)
-        let still_mapped = translate(v(SCRATCH));
-        kassert_eq!(frame::free(frame), Ok(()));
+        let (free_before, tables_before) = (frame::free_frames(), active_table_count()?);
+        with_test_windows(|heap, stack| {
+            let alias = v(hhdm_virt(not_ours.as_u64()));
+            let past_heap = v(HEAP_BASE + WINDOW);
+            let heap_last = v(HEAP_LIMIT - FRAME_SIZE);
+            let stacks_last = v(STACKS_LIMIT - FRAME_SIZE);
+            let (scratch, stack_test) = (v(SCRATCH), v(STACKS_LIMIT));
+            // Each refusal gives the frame back for the next one. (No heap
+            // allocation in here: growing the heap would upset the frame
+            // count checked at the end.)
+            let mut f = owned()?;
+            // Through the heap test window: outside both the token and the
+            // windows, then outside only the token.
+            for (virt, case) in [
+                (text_page, "the kernel text"),
+                (alias, "an HHDM alias"),
+                (past_heap, "past the heap window"),
+                (heap_last, "the real heap's last page"),
+                (stack_test, "the stack test window's first page"),
+            ] {
+                let (got, back) = map_refused(heap, virt, f, Attrs::DATA, case)?;
+                kassert_eq!(got, VmError::NotOwner(virt));
+                f = back;
+            }
+            // Through the stack test window: outside only the token.
+            for (virt, case) in [(stacks_last, "the real stacks' last page"), (scratch, "the heap test window")] {
+                let (got, back) = map_refused(stack, virt, f, Attrs::DATA, case)?;
+                kassert_eq!(got, VmError::NotOwner(virt));
+                f = back;
+            }
+            for (attrs, want, case) in [
+                (Attrs::MMIO, VmError::NotWriteBack, "uncached rights"),
+                (Attrs::CODE, VmError::Executable, "executable rights"),
+            ] {
+                let (got, back) = map_refused(heap, scratch, f, attrs, case)?;
+                kassert_eq!(got, want);
+                f = back;
+            }
+            drop(f); // frees it
+            // A frame nobody handed out, and one that was freed: only
+            // `unsafe` code can claim to own them; `map` still refuses. Each
+            // is given back raw before anything is asserted, so an early
+            // return never frees a frame the test doesn't own.
+            // SAFETY: deliberately false ownership, refused before any use
+            // (asserted), and given back raw so nothing frees it.
+            let bogus = unsafe { frame::OwnedFrame::from_raw(not_ours) };
+            let (got, bogus) = map_refused(heap, scratch, bogus, Attrs::DATA, "a frame nobody handed out")?;
+            let _ = bogus.into_raw();
+            kassert_eq!(got, VmError::NotAllocated(not_ours));
+            let freed = owned()?.frame(); // allocated, then freed on drop
+            // SAFETY: as above (`freed` is the allocator's again).
+            let stale = unsafe { frame::OwnedFrame::from_raw(freed) };
+            let (got, stale) = map_refused(heap, scratch, stale, Attrs::DATA, "a freed frame")?;
+            let _ = stale.into_raw();
+            kassert_eq!(got, VmError::NotAllocated(freed));
+            // `unmap` refuses the same way (outside the token).
+            for (on_stack, page) in [(false, text_page), (false, heap_last), (true, scratch)] {
+                let window = if on_stack { &mut *stack } else { &mut *heap };
+                // SAFETY: refused before touching any mapping (asserted).
+                kassert_eq!(unsafe { unmap(window, page) }.map(|_| ()), Err(VmError::NotOwner(page)));
+            }
+            // The stack test window works like the heap one.
+            let stack_page = v(STACKS_LIMIT);
+            let f = owned()?;
+            let raw = f.frame();
+            let stack_map = map(stack, stack_page, f, Attrs::DATA).map_err(|(e, _)| e);
+            // SAFETY: nothing refers into the page.
+            let stack_unmap = unsafe { unmap(stack, stack_page) };
+            kassert_eq!(stack_map, Ok(()));
+            kassert_eq!(stack_unmap.map(|(m, f)| (m.phys, f.frame())), Ok((raw, raw)));
+            kassert_eq!(translate(v(SCRATCH)), None);
+            Ok(())
+        })?;
+        // Every owned frame went back to the allocator (page tables made on
+        // the way stay).
+        kassert_eq!(frame::free_frames() + (active_table_count()? - tables_before), free_before);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_window_outside_the_windows_is_refused_too() {
+        // `map` and `unmap` also check the heap and stack windows themselves,
+        // in case a claims table was built wrongly (only `unsafe` code can).
+        use self::checks::*;
+        use crate::kassert_eq;
+        let text_page = align_down(code_addr(), FRAME_SIZE);
+        let mmio_top = MMIO_END - FRAME_SIZE; // never handed out, unmapped
+        // SAFETY: deliberately wrong (the kernel text, and the MMIO window);
+        // `map` and `unmap` refuse before touching anything (asserted), so
+        // nothing is ever mapped or unmapped there. This table is a second
+        // one only in the test kernel.
+        let wrong = unsafe { Claims::new([(text_page, text_page + FRAME_SIZE), (mmio_top, MMIO_END)]) };
+        let (mut text, mut mmio) = (wrong.claim(0).ok_or("claimed")?, wrong.claim(1).ok_or("claimed")?);
+        let mapped = map(&mut text, v(text_page), owned()?, Attrs::DATA).map_err(|(e, _)| e);
         // SAFETY: refused before touching any mapping (asserted).
-        let freed_map = unsafe { map(v(SCRATCH), freed, Attrs::DATA) };
-        kassert_eq!(freed_map, Err(VmError::NotAllocated(freed)));
-        // The stack window works like the heap window.
-        let stack_frame = frame::alloc().ok_or("out of frames")?;
-        let stack_page = v(STACKS_LIMIT);
-        // SAFETY: the test owns `stack_frame` and this unused stack-window
-        // page, and keeps no reference into it.
-        let (stack_map, stack_unmap) = unsafe { (map(stack_page, stack_frame, Attrs::DATA), unmap(stack_page)) };
-        kassert_eq!(frame::free(stack_frame), Ok(()));
-        kassert_eq!(stack_map, Ok(()));
-        kassert!(stack_unmap.is_ok_and(|m| m.phys == stack_frame));
-        for (got, want) in checks {
-            kassert_eq!(got, want);
-        }
-        kassert_eq!(still_mapped, None);
+        let unmapped = unsafe { unmap(&mut mmio, v(mmio_top)) }.map(|_| ());
+        kassert_eq!(mapped, Err(VmError::OutsideWindow(v(text_page))));
+        kassert_eq!(unmapped, Err(VmError::OutsideWindow(v(mmio_top))));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn windows_are_claimed_once_ever() {
+        // The heap and stack own their windows (claimed in `mm::init`), the
+        // ktests theirs; no one can claim any of them again.
+        use self::checks::*;
+        use crate::kassert;
+        with_test_windows(|_, _| ());
+        kassert!(
+            [HEAP_CLAIM, HEAP_TEST_CLAIM, STACKS_CLAIM, STACKS_TEST_CLAIM]
+                .into_iter()
+                .all(|i| CLAIMS.claim(i).is_none())
+        );
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn map_fresh_rolls_back_at_an_already_mapped_page() {
+        // `map_fresh` (safe) over three pages whose middle one is already
+        // mapped: it fails, unmaps what it mapped, and leaves the page that
+        // was there before alone.
+        use self::checks::*;
+        use crate::kassert_eq;
+        let (free_before, tables_before) = (frame::free_frames(), active_table_count()?);
+        with_test_windows(|heap, _| {
+            let f = owned()?;
+            let raw = f.frame();
+            let middle = v(SCRATCH + FRAME_SIZE);
+            if let Err((e, _)) = map(heap, middle, f, Attrs::DATA) {
+                crate::ktest::diag(format_args!("mapping the middle page failed: {e}"));
+                return Err("mapping the middle page failed");
+            }
+            let result = super::window::map_fresh(heap, SCRATCH..SCRATCH + 3 * FRAME_SIZE);
+            let (first, still) = (translate(v(SCRATCH)), translate(middle));
+            // SAFETY: nothing refers into these pages (a broken rollback may
+            // have left the first one mapped: clean it up for later tests).
+            let cleanup = unsafe { unmap(heap, middle) }.map(|(m, _)| m.phys);
+            if first.is_some() {
+                // SAFETY: as above.
+                let _ = unsafe { unmap(heap, v(SCRATCH)) };
+            }
+            kassert_eq!(result, Err(super::window::WindowError::Map(VmError::Map(MapError::AlreadyMapped))));
+            kassert_eq!(first, None);
+            kassert_eq!(still, Some(raw.start()));
+            kassert_eq!(cleanup, Ok(raw));
+            Ok(())
+        })?;
+        kassert_eq!(frame::free_frames() + (active_table_count()? - tables_before), free_before);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn dropping_an_owned_frame_frees_it() {
+        use self::checks::*;
+        use crate::{kassert, kassert_eq};
+        let before = frame::free_frames();
+        let f = owned()?;
+        let raw = f.frame();
+        kassert_eq!(frame::free_frames(), before - 1);
+        kassert!(frame::is_allocated(raw));
+        drop(f);
+        kassert_eq!(frame::free_frames(), before);
+        kassert!(!frame::is_allocated(raw));
         Ok(())
     }
 );
@@ -1023,7 +1326,8 @@ crate::ktest!(
         // RAM is refused: an uncached alias of write-back memory.
         let frame = frame::alloc().ok_or("out of frames")?;
         let ram = map_mmio(frame.start(), 8);
-        kassert_eq!(frame::free(frame), Ok(()));
+        // SAFETY: allocated by this test and not used since.
+        kassert_eq!(unsafe { frame::free(frame) }, Ok(()));
         kassert_eq!(ram, Err(MmioError::Ram(frame.start())));
         // So is the framebuffer (mapped write-combining by the HHDM).
         let fb = translate(v(frame::framebuffer_virt().ok_or("no framebuffer")?.0)).ok_or("framebuffer unmapped")?;
@@ -1103,15 +1407,20 @@ crate::ktest!(
         for (i, (virt, bits)) in
             [(kdata, WRITABLE), (code_addr(), NO_EXECUTE), (ram, PCD | PWT)].into_iter().enumerate()
         {
-            flip_leaf(copy, virt, bits)?;
+            // SAFETY: `copy` was built for this test and is never loaded.
+            unsafe { flip_leaf(copy, virt, bits)? };
             planted[i] = what(active);
-            flip_leaf(copy, virt, bits)?;
+            // SAFETY: as above.
+            unsafe { flip_leaf(copy, virt, bits)? };
         }
         let restored = what(active);
-        let freed = free_tables(copy);
+        // SAFETY: `copy` was built for this test, never loaded, and nothing
+        // refers to its tables any more.
+        let freed = unsafe { free_tables(copy) };
         let empty = frame::alloc_zeroed().ok_or("out of frames")?;
         let nothing = preflight_mismatch(active, empty, RunningStack::Check);
-        kassert_eq!(frame::free(empty), Ok(()));
+        // SAFETY: allocated by this test and not used since.
+        kassert_eq!(unsafe { frame::free(empty) }, Ok(()));
         kassert_eq!(freed, Ok(()));
         kassert_eq!(strict, Some("current stack page"));
         kassert_eq!(clean, None);

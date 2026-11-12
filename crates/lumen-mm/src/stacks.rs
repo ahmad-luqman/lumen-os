@@ -18,6 +18,7 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering, fence};
 
 use crate::FRAME_SIZE;
+use crate::window::Window;
 
 /// The unmapped page below every stack.
 pub const GUARD_SIZE: u64 = FRAME_SIZE;
@@ -95,35 +96,39 @@ impl StackRange {
 }
 
 /// Hands out stack addresses in the stack window, upward, a guard page below
-/// each and the page above the last one left free. Addresses are never
+/// each and the page above the last one left free. It holds the window's
+/// [`Window`] token and splits off a sub-window for each stack, so each
+/// stack's holder owns its pages. Guard pages get no token: a guard page's
+/// range is split off and dropped when its stack is taken (the page above the
+/// newest stack stays in this window until the next stack takes it as its
+/// guard), so no one can ever map one. Addresses are never
 /// reused; the caller sizes the window so that doesn't run out (the kernel's
 /// is about 1 TiB).
 #[derive(Debug)]
 pub struct StackWindow {
-    next: u64,
-    limit: u64,
+    window: Window,
 }
 
 impl StackWindow {
-    /// A window `[base, limit)`, both page-aligned.
-    pub const fn new(base: u64, limit: u64) -> StackWindow {
-        assert!(base.is_multiple_of(FRAME_SIZE) && limit.is_multiple_of(FRAME_SIZE) && base <= limit);
-        StackWindow { next: base, limit }
+    pub fn new(window: Window) -> StackWindow {
+        StackWindow { window }
     }
 
     /// Addresses for the next stack of `size` bytes (a nonzero multiple of
-    /// the page size), with its guard page below it; `None` once the window
-    /// is full.
-    pub fn take(&mut self, size: u64) -> Option<StackRange> {
+    /// the page size), with its guard page below it, and the sub-window that
+    /// owns the stack (not the guard page); `None` once the window is full.
+    pub fn take(&mut self, size: u64) -> Option<(StackRange, Window)> {
         assert!(size != 0 && size.is_multiple_of(FRAME_SIZE), "stack size {size:#x} is not whole pages");
-        let bottom = self.next.checked_add(GUARD_SIZE)?;
-        let top = bottom.checked_add(size)?;
+        let len = GUARD_SIZE.checked_add(size)?;
         // The page above the stack must be free too (the next guard).
-        if top.checked_add(GUARD_SIZE)? > self.limit {
+        if len.checked_add(GUARD_SIZE)? > self.window.len() {
             return None;
         }
-        self.next = top;
-        Some(StackRange { bottom, top })
+        // The guard page's range is given up for good: no token, no mapping.
+        drop(self.window.split_off(GUARD_SIZE)?);
+        let own = self.window.split_off(size)?;
+        let r = own.range();
+        Some((StackRange { bottom: r.start, top: r.end }, own))
     }
 }
 
@@ -288,11 +293,23 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use crate::window::Claims;
     use std::sync::atomic::AtomicBool;
     use std::vec::Vec;
 
     const BASE: u64 = 0xffff_d000_0000_0000;
     const K: u64 = 1024;
+
+    /// A window over `[start, end)` (host tests: nothing is mapped).
+    fn window(start: u64, end: u64) -> Window {
+        // SAFETY: host tests never map anything.
+        unsafe { Claims::new([(start, end)]) }.claim(0).unwrap()
+    }
+
+    /// The next stack's range from `w`.
+    fn take(w: &mut StackWindow, size: u64) -> Option<StackRange> {
+        w.take(size).map(|(range, _)| range)
+    }
 
     /// Register `range` (host tests: nothing is dereferenced).
     fn register(reg: &Registry, kind: StackKind, range: StackRange) -> Option<Handle> {
@@ -301,10 +318,22 @@ mod tests {
     }
 
     #[test]
+    fn each_stack_gets_its_own_sub_window() {
+        let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));
+        let (a, own_a) = w.take(64 * K).unwrap();
+        let (b, own_b) = w.take(16 * K).unwrap();
+        // Each sub-window is the stack alone: the guard page has no token.
+        assert_eq!(own_a.range(), a.span());
+        assert_eq!(own_b.range(), b.span());
+        assert!(!own_a.owns_page(a.guard()) && !own_b.owns_page(b.guard()));
+        assert!(own_a.range().end <= own_b.range().start);
+    }
+
+    #[test]
     fn window_puts_a_guard_page_below_each_stack() {
-        let mut w = StackWindow::new(BASE, BASE + 1024 * K);
-        let a = w.take(64 * K).unwrap();
-        let b = w.take(16 * K).unwrap();
+        let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));
+        let a = take(&mut w, 64 * K).unwrap();
+        let b = take(&mut w, 16 * K).unwrap();
         assert_eq!(a, StackRange { bottom: BASE + GUARD_SIZE, top: BASE + GUARD_SIZE + 64 * K });
         assert_eq!(a.guard(), BASE);
         assert_eq!(a.span(), a.bottom..a.top);
@@ -315,20 +344,21 @@ mod tests {
 
     #[test]
     fn window_stops_at_its_limit() {
-        let mut w = StackWindow::new(BASE, BASE + 5 * FRAME_SIZE);
-        assert_eq!(w.take(4 * FRAME_SIZE), None, "a guard page below and a free page above need room too");
-        let a = w.take(3 * FRAME_SIZE).unwrap();
+        let mut w = StackWindow::new(window(BASE, BASE + 5 * FRAME_SIZE));
+        assert_eq!(take(&mut w, 4 * FRAME_SIZE), None, "a guard page below and a free page above need room too");
+        let a = take(&mut w, 3 * FRAME_SIZE).unwrap();
         // The last stack still has an unused page above it.
         assert_eq!(a.top + GUARD_SIZE, BASE + 5 * FRAME_SIZE);
-        assert_eq!(w.take(FRAME_SIZE), None);
-        let mut top = StackWindow::new(u64::MAX - FRAME_SIZE + 1, u64::MAX - FRAME_SIZE + 1);
-        assert_eq!(top.take(FRAME_SIZE), None, "no overflow at the top of the address space");
+        assert_eq!(take(&mut w, FRAME_SIZE), None);
+        let top = u64::MAX - FRAME_SIZE + 1;
+        let mut at_top = StackWindow::new(window(top - FRAME_SIZE, top));
+        assert_eq!(take(&mut at_top, FRAME_SIZE), None, "no room for the guard pages");
     }
 
     #[test]
     #[should_panic(expected = "not whole pages")]
     fn window_refuses_partial_pages() {
-        StackWindow::new(BASE, BASE + 1024 * K).take(100);
+        take(&mut StackWindow::new(window(BASE, BASE + 1024 * K)), 100);
     }
 
     #[test]
@@ -350,9 +380,9 @@ mod tests {
     #[test]
     fn find_and_contains_know_stacks_and_guards() {
         let reg = Registry::new();
-        let mut w = StackWindow::new(BASE, BASE + 1024 * K);
-        let main = w.take(64 * K).unwrap();
-        let ist = w.take(16 * K).unwrap();
+        let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));
+        let main = take(&mut w, 64 * K).unwrap();
+        let ist = take(&mut w, 16 * K).unwrap();
         let hm = register(&reg, StackKind::Main, main).unwrap();
         let _hi = register(&reg, StackKind::DoubleFault, ist).unwrap();
         let main_r = Registered { kind: StackKind::Main, range: main };
@@ -379,10 +409,11 @@ mod tests {
     #[test]
     fn a_full_registry_refuses_and_slots_are_reused() {
         let reg = Registry::new();
-        let mut w = StackWindow::new(BASE, BASE + 4096 * K);
-        let mut handles: Vec<_> =
-            (0..MAX_STACKS).map(|_| register(&reg, StackKind::Test, w.take(FRAME_SIZE).unwrap()).unwrap()).collect();
-        let extra = w.take(FRAME_SIZE).unwrap();
+        let mut w = StackWindow::new(window(BASE, BASE + 4096 * K));
+        let mut handles: Vec<_> = (0..MAX_STACKS)
+            .map(|_| register(&reg, StackKind::Test, take(&mut w, FRAME_SIZE).unwrap()).unwrap())
+            .collect();
+        let extra = take(&mut w, FRAME_SIZE).unwrap();
         assert_eq!(register(&reg, StackKind::Test, extra), None);
         reg.unregister(handles.remove(7));
         assert_eq!(register(&reg, StackKind::Main, extra), Some(Handle(7)));
