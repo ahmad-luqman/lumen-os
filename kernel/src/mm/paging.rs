@@ -271,6 +271,18 @@ struct Need {
 
 const SAME_FRAME: Need = Need { write: false, exec: None, cache: None };
 
+/// Whether [`preflight_mismatch`] checks ranges on allocated stacks (the
+/// stack window, which a fresh [`build`] doesn't map). The real switch checks
+/// everything (the kernel is still on the boot stack then); only the ktest
+/// that plants faults in a fresh copy, running on the allocated main stack,
+/// skips them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunningStack {
+    Check,
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by a ktest
+    Skip,
+}
+
 /// Why the new tables don't give the kernel what it needs at `virt`.
 #[derive(Debug)]
 struct Mismatch {
@@ -282,7 +294,7 @@ struct Mismatch {
 
 /// The first place `new` doesn't map something the kernel is using like
 /// `old` does: the same frame, with the rights and memory type it needs.
-fn preflight_mismatch(old: PhysFrame, new: PhysFrame) -> Option<Mismatch> {
+fn preflight_mismatch(old: PhysFrame, new: PhysFrame, running: RunningStack) -> Option<Mismatch> {
     let check = |what: &'static str, virt: u64, need: Need| {
         let v = VirtAddr::new(virt).expect("live addresses are canonical");
         let (before, after) = (pt::walk(&Hhdm, old, v), pt::walk(&Hhdm, new, v));
@@ -297,10 +309,7 @@ fn preflight_mismatch(old: PhysFrame, new: PhysFrame) -> Option<Mismatch> {
         (!ok).then_some(Mismatch { what, virt: v, before: before.end(), after: after.end() })
     };
     for r in super::live_ranges() {
-        // Allocated stacks live in the stack window, which `build` doesn't
-        // map (it is mapped later, through `map`); at the real switch the
-        // kernel is still on the boot stack, so this skips nothing then.
-        if r.allocated {
+        if r.allocated && running == RunningStack::Skip {
             continue;
         }
         let Some((start, len)) = r.range else {
@@ -356,7 +365,7 @@ fn preflight_mismatch(old: PhysFrame, new: PhysFrame) -> Option<Mismatch> {
 /// better an assertion with a message than a fault with no stack right after
 /// the CR3 write.
 fn preflight(old: PhysFrame, new: PhysFrame) {
-    if let Some(m) = preflight_mismatch(old, new) {
+    if let Some(m) = preflight_mismatch(old, new, RunningStack::Check) {
         panic!(
             "{}: the kernel's page tables can't replace the boot ones at {} (boot: {:?}; new: {:?})",
             m.what, m.virt, m.before, m.after
@@ -530,6 +539,25 @@ pub fn for_each_active_table(f: impl FnMut(PhysFrame)) -> Result<usize, PhysFram
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: ktests; X-ray (M5)
 pub fn for_each_active_mapping(f: impl FnMut(Mapping)) -> Result<(), PhysFrame> {
     pt::for_each_mapping(&Hhdm, hw::active_root(), f)
+}
+
+/// A 4 KiB kernel page, read-write, no-execute, write-back, backed by an
+/// allocated frame: how the heap and the kernel stacks are mapped (ktests).
+#[cfg(feature = "ktest")]
+pub fn is_private_data_page(m: &Mapping) -> bool {
+    m.size == PageSize::Size4K
+        && m.writable
+        && !m.executable
+        && !m.user
+        && m.cache() == Some(Cache::WriteBack)
+        && frame::is_allocated(m.phys)
+}
+
+/// How many table frames the active hierarchy uses (ktests' frame
+/// accounting: tables are never freed).
+#[cfg(feature = "ktest")]
+pub fn active_table_count() -> Result<usize, &'static str> {
+    for_each_active_table(|_| {}).map_err(|_| "a page table is unreadable")
 }
 
 /// What a leaf allows, for humans: "read-only, executable".
@@ -846,11 +874,7 @@ crate::ktest!(
             let in_hhdm = lo.checked_sub(hhdm).is_some_and(|p| {
                 p == m.phys.as_u64() && !m.executable && hhdm_spans().any(|(s, e, _)| s <= p && p + size <= e)
             });
-            let private_page = m.size == PageSize::Size4K
-                && m.writable
-                && !m.executable
-                && m.cache() == Some(Cache::WriteBack)
-                && frame::is_allocated(m.phys);
+            let private_page = is_private_data_page(&m);
             let in_heap = heap.contains(&lo) && private_page;
             let in_stack = crate::arch::stacks::REGISTRY.contains(lo, size) && private_page;
             big += usize::from(in_hhdm && m.size == PageSize::Size2M);
@@ -1066,7 +1090,11 @@ crate::ktest!(
         use lumen_mm::paging::bits::{NO_EXECUTE, PCD, PWT, WRITABLE};
         let active = hw::active_root();
         let copy = build();
-        let what = |old| preflight_mismatch(old, copy).map(|m| m.what);
+        // This runs on the allocated main stack, which a fresh copy doesn't
+        // map: checked strictly, that is the first thing named; the planted
+        // faults are looked for with it skipped.
+        let strict = preflight_mismatch(active, copy, RunningStack::Check).map(|m| m.what);
+        let what = |old| preflight_mismatch(old, copy, RunningStack::Skip).map(|m| m.what);
         let clean = what(active);
         let [_, _, (_, kdata, _, _)] = kernel_segments();
         let ram = hhdm_spans().find(|&(_, _, a)| a == Attrs::DATA).ok_or("no usable memory")?.0;
@@ -1082,9 +1110,10 @@ crate::ktest!(
         let restored = what(active);
         let freed = free_tables(copy);
         let empty = frame::alloc_zeroed().ok_or("out of frames")?;
-        let nothing = preflight_mismatch(active, empty);
+        let nothing = preflight_mismatch(active, empty, RunningStack::Check);
         kassert_eq!(frame::free(empty), Ok(()));
         kassert_eq!(freed, Ok(()));
+        kassert_eq!(strict, Some("current stack page"));
         kassert_eq!(clean, None);
         kassert_eq!(planted, [Some("kernel data"), Some("kernel image (boot mapping)"), Some("HHDM")]);
         kassert_eq!(restored, None);

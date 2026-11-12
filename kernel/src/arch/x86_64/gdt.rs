@@ -68,14 +68,13 @@ static mut GDT: [u64; GDT_ENTRIES] = [
 ];
 
 /// Point the TSS's IST slots at the tops of the double-fault, NMI and
-/// machine-check stacks. Call before `idt::use_ist_stacks` makes the IDT use
-/// them.
+/// machine-check stacks. Only through `install_ist_stacks`, which then makes
+/// the IDT use them.
 ///
 /// # Safety
 /// Each top is the top of a mapped stack that is never freed and that
-/// nothing else uses; nothing else touches the TSS meanwhile (one CPU,
-/// interrupts off).
-pub unsafe fn set_ist_stacks(double_fault: u64, nmi: u64, machine_check: u64) {
+/// nothing else uses; nothing else touches the TSS meanwhile (one CPU).
+pub(super) unsafe fn set_ist_stacks(double_fault: u64, nmi: u64, machine_check: u64) {
     let tss = &raw mut TSS_SEGMENT;
     // SAFETY: upheld by the caller; the CPU reads the TSS only when it takes
     // an interrupt that uses an IST slot, and the IDT doesn't use them yet.

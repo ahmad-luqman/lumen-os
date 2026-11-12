@@ -75,8 +75,9 @@ tests (for example `lumen-elf`, the symbol-table reader).
 3. **`_start`** (naked asm): `xor ebp, ebp` ends the backtrace chain, the stack
    top is passed to `kmain`, and the stack is aligned.
 4. **`arch::init_early`**: COM1 serial, then the GDT and TSS, then the IDT
-   with all 256 vectors. **From this point any CPU exception produces a crash
-   report.** (#DF, NMI and #MC get their IST stacks in step 6.)
+   with all 256 vectors. **From this point a CPU exception produces a crash
+   report**, except a #DF caused by a broken stack pointer before step 6
+   (#DF, NMI and #MC get their IST stacks there), which is a triple fault.
 5. Logger (level from `lumen.log=`), Limine responses checked, the symbol table
    located in our own ELF, a memory-map summary, the frame allocator
    (`INFO  mem: frames: N usable, M reserved`), the kernel's own page tables
@@ -230,7 +231,8 @@ space, so new kernel L3 tables must be allocated up front then.
 
 ### Kernel stacks (built in M1)
 
-Every stack the kernel runs on after `mm::init` comes from the allocator
+Every stack the kernel runs on once `kmain` switches stacks (right after
+`mm::init`) comes from the allocator
 (`kernel/src/mm/stack.rs`; layout and registry in the host-tested
 `lumen_mm::stacks`). `KernelStack::new` takes addresses from the stack
 window, upward, with an unmapped guard page below each stack (so the page
@@ -246,18 +248,24 @@ the TSS's IST and only then makes those three gates use them, allocates the
 128 KiB main stack and switches to it (`arch::switch_stack`), which plants a
 frame record so backtraces run from the new stack back into `kmain` and
 `_start` on the old one. Limine's boot stack (128 KiB requested, 64 KiB
-assumed if it doesn't confirm) stays reserved and registered for that walk
-but is never run on again. Until the switch it is the one stack without a
+assumed if it doesn't confirm) stays reserved and is recorded as a known
+stack (`stacks::set_boot_stack`, not in the registry) for that walk, but is
+never run on again. Until the switch it is the one stack without a
 guard page, and a #DF with a broken `rsp` before then is a triple fault
 instead of a report.
 
-The registry (lock-free, 32 slots) is what the crash reporter trusts: a
-frame pointer is followed only into a known stack, frames move toward the top
-of their stack except for one link into another known stack, and a #PF or
-#DF whose CR2 is in a guard page is reported as `kernel stack overflow (guard
-page hit)` with the stack's name and bounds. Every function carries inline
-stack probes (`make audit` checks), so a frame bigger than a page can't jump
-over a guard page.
+The registry (lock-free, 32 slots, each a seqlock; registering is `unsafe`
+because readers dereference what it lists) and the boot stack are what the
+crash reporter trusts: a frame pointer is followed only into a known stack,
+and frames move toward the top of their stack, except for one link down into
+another known stack. A #PF or #DF whose CR2 is in a guard page is named: as
+`kernel stack overflow (guard page hit)` with the stack's name and bounds
+when the interrupted `rsp` is in that guard page or the stack's bottom page,
+otherwise as a `guard page hit` from a stray access (naming the stack below
+too, which may have run off its top; on a #DF, CR2 may be stale). Every
+function in the kernel crate carries inline stack probes (`make audit`
+checks its IR; the other crates use the same target setting), so a frame
+bigger than a page can't jump over a guard page (`crash bigframe` shows it).
 
 ### Kernel heap (built in M1)
 

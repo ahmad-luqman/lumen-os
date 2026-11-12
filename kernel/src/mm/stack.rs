@@ -17,6 +17,7 @@
 
 use core::fmt;
 use core::ops::Range;
+use core::sync::atomic::{Ordering, compiler_fence};
 
 use lumen_mm::stacks::{Handle, StackKind, StackRange, StackWindow};
 
@@ -24,37 +25,38 @@ use super::{paging, window};
 use crate::arch::stacks;
 use crate::sync::SpinLock;
 
-/// The default stack size: the IST stacks (and the documented size in
-/// ARCHITECTURE.md section 5).
+/// Size of each IST stack (#DF, NMI, #MC).
 pub const STACK_SIZE: u64 = 64 * 1024;
 
-/// The boot CPU's kernel stack, `kmain` onward (the size Limine was asked
-/// for, so nothing gets less room than before).
+/// The boot CPU's kernel stack, from `kmain_on_kernel_stack` on (the size
+/// Limine was asked for, so nothing gets less room than before).
 pub const MAIN_STACK_SIZE: u64 = 128 * 1024;
 
-/// What the stack module owns: the stack window minus the ktests' page.
+/// What the stack module owns: the stack window minus its top GiB (the
+/// paging ktests' page).
 const OWNED: Range<u64> = paging::STACKS_BASE..paging::STACKS_LIMIT;
 
 static WINDOW: SpinLock<StackWindow> = SpinLock::new(StackWindow::new(OWNED.start, OWNED.end));
 
 /// Why [`KernelStack::new`] failed (nothing is left mapped or registered).
+/// A mapping failure other than running out is a kernel bug and panics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StackError {
     /// No room left below [`paging::STACKS_LIMIT`].
     WindowFull,
-    /// Mapping the stack failed (no frames, or no frame for a page table).
-    Map(window::MapError),
+    /// No frame for the stack or for a page table.
+    OutOfMemory,
     /// Every registry slot is taken.
     RegistryFull,
 }
 
 impl fmt::Display for StackError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StackError::WindowFull => f.write_str("stack window full"),
-            StackError::Map(e) => write!(f, "{e}"),
-            StackError::RegistryFull => f.write_str("stack registry full"),
-        }
+        f.write_str(match self {
+            StackError::WindowFull => "stack window full",
+            StackError::OutOfMemory => "out of memory",
+            StackError::RegistryFull => "stack registry full",
+        })
     }
 }
 
@@ -70,17 +72,23 @@ impl KernelStack {
     /// A new stack of `size` bytes (whole pages), registered as `kind`.
     pub fn new(size: u64, kind: StackKind) -> Result<KernelStack, StackError> {
         let range = WINDOW.lock().take(size).ok_or(StackError::WindowFull)?;
+        // This stack's own part of the window: what its pages must stay in.
+        let owner = range.guard()..range.top;
         // SAFETY: this module owns `OWNED`, and the window hands out each
         // range once, so nothing in it is mapped or in use.
-        unsafe { window::map_fresh(&OWNED, range.bottom..range.top) }.map_err(StackError::Map)?;
-        match stacks::REGISTRY.register(kind, range) {
-            Some(handle) => Ok(KernelStack { range, handle: Some(handle) }),
-            None => {
-                // SAFETY: mapped just above; nothing has used it.
-                unsafe { window::unmap_and_free(&OWNED, range.bottom..range.top, None) };
-                Err(StackError::RegistryFull)
+        if let Err(e) = unsafe { window::map_fresh(&owner, range.span()) } {
+            if e.is_exhaustion() {
+                return Err(StackError::OutOfMemory);
             }
+            panic!("mm: mapping a {} stack at {:#x} failed: {e}", kind.name(), range.bottom);
         }
+        // SAFETY: mapped just above; it stays mapped until `drop` retracts it.
+        let Some(handle) = (unsafe { stacks::REGISTRY.register(kind, range) }) else {
+            // SAFETY: mapped just above; nothing has used it.
+            unsafe { window::unmap_and_free(&owner, range.span()) };
+            return Err(StackError::RegistryFull);
+        };
+        Ok(KernelStack { range, handle: Some(handle) })
     }
 
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests; threads (M2)
@@ -89,7 +97,9 @@ impl KernelStack {
     }
 
     /// Keep the stack mapped and registered forever: for stacks the CPU
-    /// points at (the TSS, `rsp`), which must never be dropped.
+    /// points at (the TSS, `rsp`), which must never be dropped. The returned
+    /// range is the proof that the stack is never freed; only hand its `top`
+    /// to the CPU.
     pub fn leak(self) -> StackRange {
         let range = self.range;
         core::mem::forget(self);
@@ -101,11 +111,14 @@ impl Drop for KernelStack {
     fn drop(&mut self) {
         let handle = self.handle.take().expect("dropped once");
         // Retract first: the crash reporter must not follow a frame pointer
-        // into memory that is going away.
+        // into memory that is going away (one CPU: a crash during this sees
+        // the stack either registered and mapped, or retracted).
         stacks::REGISTRY.unregister(handle);
+        // Keep the compiler from moving the unmapping above the retraction.
+        compiler_fence(Ordering::SeqCst);
         // SAFETY: the stack is ours, and (not leaked) nothing runs on it or
         // points at it.
-        unsafe { window::unmap_and_free(&OWNED, self.range.bottom..self.range.top, None) };
+        unsafe { window::unmap_and_free(&(self.range.guard()..self.range.top), self.range.span()) };
     }
 }
 
@@ -115,26 +128,17 @@ fn mapping(virt: u64) -> Option<lumen_mm::paging::Mapping> {
     paging::walk(lumen_mm::VirtAddr::new(virt).expect("canonical")).mapping()
 }
 
-/// Is `range` a stack with an unmapped guard page below it, every page
-/// mapped 4 KiB, read-write, no-execute and write-back to an allocated frame,
-/// and registered as `kind`? `Err` says what is wrong.
+/// Is `range` a stack with an unmapped guard page below it, every page a
+/// private data page (`paging::is_private_data_page`), and
+/// registered as `kind`? `Err` says what is wrong.
 #[cfg(feature = "ktest")]
 pub fn check_guarded(range: StackRange, kind: StackKind) -> Result<(), &'static str> {
-    use lumen_mm::paging::{Cache, PageSize};
     use lumen_mm::stacks::{Hit, Registered};
     if mapping(range.guard()).is_some() {
         return Err("guard page mapped");
     }
-    let ok = |page| {
-        mapping(page).is_some_and(|m| {
-            m.size == PageSize::Size4K
-                && m.writable
-                && !m.executable
-                && m.cache() == Some(Cache::WriteBack)
-                && super::frame::is_allocated(m.phys)
-        })
-    };
-    if !(range.bottom..range.top).step_by(lumen_mm::FRAME_SIZE as usize).all(ok) {
+    let private = |page| mapping(page).is_some_and(|m| paging::is_private_data_page(&m));
+    if !range.span().step_by(lumen_mm::FRAME_SIZE as usize).all(private) {
         return Err("a stack page is not mapped as a private RW, NX, WB page");
     }
     let registered = Registered { kind, range };
@@ -153,8 +157,8 @@ crate::ktest!(
         // dropping it retracts it and returns its frames (page tables created
         // on the way stay).
         use crate::{kassert, kassert_eq};
-        let tables = || paging::for_each_active_table(|_| {}).map_err(|_| "unreadable table");
-        let (free0, tables0) = (super::frame::free_frames(), tables()?);
+        use paging::active_table_count;
+        let (free0, tables0) = (super::frame::free_frames(), active_table_count()?);
         let stack = KernelStack::new(4 * lumen_mm::FRAME_SIZE, StackKind::Test).map_err(|_| "allocating a stack")?;
         let range = stack.range();
         kassert_eq!(range.size(), 4 * lumen_mm::FRAME_SIZE);
@@ -173,7 +177,7 @@ crate::ktest!(
         drop(stack);
         kassert!(mapping(range.bottom).is_none() && mapping(range.top - 8).is_none());
         kassert!(stacks::REGISTRY.find(range.bottom).is_none() && stacks::guard_hit(range.guard()).is_none());
-        let (free1, tables1) = (super::frame::free_frames(), tables()?);
+        let (free1, tables1) = (super::frame::free_frames(), active_table_count()?);
         kassert_eq!(free1 + (tables1 - tables0), free0);
         Ok(())
     }
@@ -183,11 +187,11 @@ crate::ktest!(
     fn kernel_runs_on_a_guarded_main_stack() {
         // After boot the kernel runs on the allocated main stack, not the
         // one Limine gave it.
-        use crate::kassert;
+        use crate::{kassert, kassert_eq};
         let rsp = crate::arch::read_rsp();
         let main = stacks::REGISTRY.iter().find(|r| r.kind == StackKind::Main).ok_or("no main stack registered")?;
-        kassert!((main.range.bottom..main.range.top).contains(&rsp));
-        kassert!(main.range.size() == MAIN_STACK_SIZE);
+        kassert!(main.range.span().contains(&rsp));
+        kassert_eq!(main.range.size(), MAIN_STACK_SIZE);
         check_guarded(main.range, StackKind::Main)?;
         let (boot_lo, boot_hi) = stacks::boot_stack();
         kassert!(!(boot_lo..boot_hi).contains(&rsp));
@@ -229,9 +233,9 @@ crate::ktest!(
         // aside), and dropping them all returns every frame.
         use crate::{kassert, kassert_eq};
         use alloc::vec::Vec;
-        let tables = || paging::for_each_active_table(|_| {}).map_err(|_| "unreadable table");
+        use paging::active_table_count;
         let mut held = Vec::with_capacity(lumen_mm::stacks::MAX_STACKS);
-        let (free0, tables0) = (super::frame::free_frames(), tables()?);
+        let (free0, tables0) = (super::frame::free_frames(), active_table_count()?);
         let refused = loop {
             match KernelStack::new(lumen_mm::FRAME_SIZE, StackKind::Test) {
                 Ok(s) => held.push(s),
@@ -246,10 +250,37 @@ crate::ktest!(
         // pages are unmapped again.
         let last = held.last().ok_or("no stack fit")?.range();
         kassert!(mapping(last.top + lumen_mm::FRAME_SIZE).is_none());
-        let (free1, tables1) = (super::frame::free_frames(), tables()?);
+        let (free1, tables1) = (super::frame::free_frames(), active_table_count()?);
         kassert_eq!(free1 + (tables1 - tables0) + held.len(), free0);
         drop(held);
-        kassert_eq!(super::frame::free_frames() + (tables()? - tables0), free0);
+        kassert_eq!(super::frame::free_frames() + (active_table_count()? - tables0), free0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn out_of_frames_is_an_error_that_leaves_nothing_behind() {
+        // With fewer free frames than a stack needs, `new` fails with
+        // OutOfMemory: nothing registered, and every frame it took returned
+        // (page tables it created aside).
+        use crate::kassert_eq;
+        use alloc::vec::Vec;
+        use paging::active_table_count;
+        let mut held = Vec::with_capacity(super::frame::free_frames());
+        // Two frames: fewer than the four-page stack below needs.
+        while super::frame::free_frames() > 2 {
+            held.push(super::frame::alloc().ok_or("frames ran out")?);
+        }
+        let (registered, free, tables) =
+            (stacks::REGISTRY.iter().count(), super::frame::free_frames(), active_table_count()?);
+        let result = KernelStack::new(4 * lumen_mm::FRAME_SIZE, StackKind::Test).map(|s| s.range());
+        let after = (stacks::REGISTRY.iter().count(), super::frame::free_frames(), active_table_count()?);
+        for f in held {
+            super::frame::free(f).map_err(|_| "freeing a held frame")?;
+        }
+        kassert_eq!(result, Err(StackError::OutOfMemory));
+        kassert_eq!(after.0, registered);
+        kassert_eq!(after.1 + (after.2 - tables), free);
         Ok(())
     }
 );

@@ -424,7 +424,8 @@ mod checks {
                 })?;
                 // Memory the kernel uses must never be free: reserved memory
                 // is never even owned; an allocated stack is owned, not free.
-                if if allocated { is_free(phys) } else { is_owned(phys) } {
+                let handed_out = if allocated { is_free(phys) } else { is_owned(phys) };
+                if handed_out {
                     return Ok(Some((name, phys)));
                 }
             }
@@ -636,7 +637,8 @@ crate::ktest!(
         kassert_eq!(first_live_owned(|p| p == stack, never)?, Some((BOOT_STACK, stack)));
         kassert_eq!(first_live_owned(|p| p == bitmap, never)?, Some((BITMAP, bitmap)));
         kassert_eq!(first_live_owned(never, |p| p == table)?, Some(("page table", table)));
-        // The running stack is allocated: owned is fine, free is a leak.
+        // The running stack is allocated: owned is fine; free would mean it
+        // could be handed out while in use.
         let running = translate(align_down(arch::read_rsp(), FRAME_SIZE)).map_err(|_| "stack not mapped")?;
         kassert_eq!(first_live_owned(|p| p == running, never)?, None);
         kassert_eq!(first_live_owned(never, |p| p == running)?, Some(("current stack page", running)));

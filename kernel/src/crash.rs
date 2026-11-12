@@ -93,11 +93,26 @@ fn enter(vector: u64, rip: u64) {
                 s,
                 "\n!!! fault while writing the page walk or heap state (vector {vector:#x}, rip {rip:#018x})"
             );
+            write_nested_guard_hit(&mut s);
             let _ = writeln!(s, "{END_MARKER}");
             finish();
         }
         let _ = writeln!(s, "\n!!! nested crash while reporting (vector {vector:#x}, rip {rip:#018x}); halting");
+        write_nested_guard_hit(&mut s);
         finish();
+    }
+}
+
+/// A crash inside the report that touched a guard page most likely means the
+/// reporter overflowed the stack it runs on: say so (lock-free, bounded).
+fn write_nested_guard_hit(w: &mut dyn Write) {
+    let cr2 = arch::read_cr2();
+    if let Some(r) = arch::stacks::guard_hit(cr2) {
+        let _ = writeln!(
+            w,
+            "!!! cr2 {cr2:#018x} is in the guard page below the {} stack: the crash reporter may have overflowed it",
+            r.kind.name()
+        );
     }
 }
 
@@ -154,20 +169,10 @@ fn write_exception(w: &mut dyn Write, f: &TrapFrame, cr2: u64) {
         let _ = writeln!(w, "  {}", PageFaultCause(f.error_code));
         let _ = writeln!(w, "  faulting address (cr2): {cr2:#018x}");
     }
-    // An overflow faults in the guard page; the #PF can't be delivered on
-    // the full stack, so it usually arrives as a #DF (on its IST stack) with
-    // CR2 still in the guard page.
-    if (f.vector == 14 || f.vector == 8)
+    if matches!(f.vector, 8 | 14)
         && let Some(r) = arch::stacks::guard_hit(cr2)
     {
-        let _ = writeln!(
-            w,
-            "kernel stack overflow (guard page hit): cr2 {cr2:#018x} is in the guard page below the {} stack \
-             [{:#x}, {:#x})",
-            r.kind.name(),
-            r.range.bottom,
-            r.range.top
-        );
+        write_guard_hit(w, f, cr2, r);
     }
     let _ = writeln!(w, "rip: {:#018x} <{}>", f.rip, Symbolized(f.rip));
     let _ = writeln!(w, "rsp: {:#018x}  rflags: {:#010x}  cs: {:#06x}  ss: {:#06x}", f.rsp, f.rflags, f.cs, f.ss);
@@ -202,6 +207,41 @@ fn write_exception(w: &mut dyn Write, f: &TrapFrame, cr2: u64) {
         arch::read_cr4()
     );
     let _ = write_backtrace(w, Some(f.rip), f.rbp);
+}
+
+/// A fault whose CR2 is in a stack's guard page. It is that stack
+/// overflowing only if the interrupted `rsp` is in the guard page or the
+/// stack's bottom page (an overflow's #PF can't be delivered on the full
+/// stack, so it usually arrives as a #DF on its IST stack, CR2 still in the
+/// guard page). Anything else touching a guard page is a stray access; it
+/// may also be the stack below running off its top.
+fn write_guard_hit(w: &mut dyn Write, f: &TrapFrame, cr2: u64, r: lumen_mm::stacks::Registered) {
+    let (name, bottom, top) = (r.kind.name(), r.range.bottom, r.range.top);
+    let near = (r.range.guard()..bottom + lumen_mm::FRAME_SIZE).contains(&f.rsp);
+    if near {
+        let _ = writeln!(
+            w,
+            "kernel stack overflow (guard page hit): cr2 {cr2:#018x} is in the guard page below the {name} stack \
+             [{bottom:#x}, {top:#x})"
+        );
+        return;
+    }
+    let _ = write!(
+        w,
+        "guard page hit: cr2 {cr2:#018x} is in the guard page below the {name} stack [{bottom:#x}, {top:#x})"
+    );
+    // The stack whose top is this guard page, if any.
+    if let Some(lumen_mm::stacks::Hit::Stack(b)) = arch::stacks::REGISTRY.find(r.range.guard() - 1)
+        && b.range.top == r.range.guard()
+    {
+        let _ = write!(w, ", above the {} stack", b.kind.name());
+    }
+    let _ = write!(w, "; rsp {:#018x} is not near it: a stray access, not an overflow", f.rsp);
+    if f.vector == 8 {
+        // Nothing sets CR2 on a #DF: it is whatever the last #PF left.
+        let _ = write!(w, " (on a #DF, cr2 may be stale)");
+    }
+    let _ = writeln!(w);
 }
 
 /// Decoded #PF error code.
@@ -240,11 +280,15 @@ fn write_backtrace(w: &mut dyn Write, rip: Option<u64>, mut rbp: u64) -> fmt::Re
         writeln!(w, "  #{n:<2} {rip:#018x} <{}>", Symbolized(rip))?;
         n += 1;
     }
+    // One downward link into another known stack is allowed (see below).
+    let mut crossed = false;
     while n < MAX_FRAMES {
         if rbp == 0 || !rbp.is_multiple_of(8) || !arch::stacks::contains(rbp, 16) {
             break;
         }
-        // SAFETY: [rbp, rbp+16) lies inside a known, mapped kernel stack.
+        // SAFETY: [rbp, rbp+16) lies inside a known, mapped kernel stack
+        // (one CPU: a registered stack is mapped until it is retracted, and
+        // the boot stack is never unmapped).
         let (next, ret) = unsafe { ((rbp as *const u64).read(), (rbp as *const u64).add(1).read()) };
         if !is_kernel_text(ret) {
             break;
@@ -253,17 +297,21 @@ fn write_backtrace(w: &mut dyn Write, rip: Option<u64>, mut rbp: u64) -> fmt::Re
         // call at the very end of a function still names that function.
         writeln!(w, "  #{n:<2} {ret:#018x} <{}>", Symbolized(ret - 1))?;
         n += 1;
-        // Frames move toward the top of their stack; the one link that may
-        // go elsewhere is into another known stack (the main stack's first
-        // frame links back into `kmain` on the boot stack). MAX_FRAMES
-        // bounds the walk either way.
-        if next <= rbp && arch::stacks::bounds_of(next) == arch::stacks::bounds_of(rbp) {
-            break;
+        // Frames move toward the top of their stack. One link may go down
+        // into a different known stack: the main stack's first frame links
+        // back into `kmain` on the boot stack (`arch::switch_stack`).
+        if next <= rbp {
+            if crossed || arch::stacks::bounds_of(next) == arch::stacks::bounds_of(rbp) {
+                break;
+            }
+            crossed = true;
         }
         rbp = next;
     }
     if n == 0 {
         writeln!(w, "  (no frames)")?;
+    } else if n == MAX_FRAMES {
+        writeln!(w, "  (stopped after {MAX_FRAMES} frames)")?;
     }
     Ok(())
 }

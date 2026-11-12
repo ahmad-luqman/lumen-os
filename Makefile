@@ -69,6 +69,8 @@ RESULTS := $(BUILD)/test-results
 test-host: ## Host-side unit tests (Rust crates + harness self-tests)
 	@mkdir -p $(RESULTS) && rm -f $(RESULTS)/cargo.json $(RESULTS)/harness.xml
 	cargo test
+	# The stack registry's race test also optimized: reordering mistakes show up there.
+	cargo test --release -p lumen-mm stacks
 	@printf '{%s}\n' "$$(ls crates | sed 's/.*/"&": true/' | paste -sd, -)" > $(RESULTS)/cargo.json
 	uv run --frozen pytest tests/harness -q --junitxml=$(RESULTS)/harness.xml
 

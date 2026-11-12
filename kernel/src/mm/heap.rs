@@ -53,6 +53,10 @@ const MIN_GROWTH: u64 = 64 * 1024;
 /// grew once and went quiet doesn't hold much it never uses.
 const MAX_GROWTH: u64 = 4 * 1024 * 1024;
 
+/// What the heap owns: its window minus the top GiB (the paging ktests'
+/// page).
+const OWNED: Range<u64> = paging::HEAP_BASE..paging::HEAP_LIMIT;
+
 /// How many free blocks the crash report walks before giving up, so it
 /// finishes quickly even with a huge, fragmented free list.
 const CRASH_WALK_LIMIT: usize = 4096;
@@ -207,10 +211,16 @@ fn map_span(end: u64, bytes: u64) -> Result<(), GrowError> {
     }
     // SAFETY: the heap owns `[HEAP_BASE, HEAP_LIMIT)`, and nothing above its
     // end is mapped or in use.
-    unsafe { window::map_fresh(&(paging::HEAP_BASE..paging::HEAP_LIMIT), end..end + bytes) }.map_err(|e| match e {
-        window::MapError::OutOfFrames => GrowError::OutOfFrames,
-        window::MapError::Map(e) => GrowError::Map(e),
-    })
+    unsafe { window::map_fresh(&OWNED, end..end + bytes) }.map_err(GrowError::from)
+}
+
+impl From<window::WindowError> for GrowError {
+    fn from(e: window::WindowError) -> GrowError {
+        match e {
+            window::WindowError::OutOfFrames => GrowError::OutOfFrames,
+            window::WindowError::Map(e) => GrowError::Map(e),
+        }
+    }
 }
 
 /// The heap's counters (O(1)).

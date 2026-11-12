@@ -11,7 +11,7 @@ use core::fmt::Write;
 
 const PROMPT: &str = "kmon> ";
 /// What `crash <kind>` accepts.
-const CRASH_KINDS: &str = "pf ud de gp df wtext nx panic oom dfree heapcorrupt stack guard";
+const CRASH_KINDS: &str = "pf ud de gp df wtext nx panic oom dfree heapcorrupt stack bigframe guard";
 const MAX_LINE: usize = 128;
 
 pub fn run() -> ! {
@@ -127,10 +127,8 @@ fn crash(kind: &str) {
         "dfree" => crash_double_free(),
         "heapcorrupt" => crash_corrupt_heap(),
         "guard" => crash_touch_guard(),
-        "stack" => {
-            let depth = recurse(0);
-            let _ = writeln!(serial::SerialWriter, "crash: recursion returned at depth {depth} (no guard page?)");
-        }
+        "stack" => crash_stack_overflow(),
+        "bigframe" => crash_big_frame_overflow(),
         _ => {
             let _ = writeln!(serial::SerialWriter, "crash: unknown kind '{kind}' ({CRASH_KINDS})");
         }
@@ -280,8 +278,8 @@ fn crash_corrupt_heap() {
 }
 
 /// Write into the guard page below the main stack from a healthy stack: a
-/// plain #PF (nothing overflowed), which the report still names as a guard
-/// page hit.
+/// plain #PF (nothing overflowed), which the report names as a stray guard
+/// page hit, not an overflow.
 #[inline(never)]
 fn crash_touch_guard() {
     use lumen_mm::stacks::StackKind;
@@ -294,7 +292,33 @@ fn crash_touch_guard() {
     let _ = writeln!(serial::SerialWriter, "crash: writing to a guard page succeeded (guard page mapped?)");
 }
 
-/// Recurse without end: each call keeps a 256-byte frame live across the
+/// Overflow the main stack with small frames.
+#[inline(never)]
+fn crash_stack_overflow() {
+    let depth = recurse(0);
+    let _ = writeln!(serial::SerialWriter, "crash: recursion returned at depth {depth} (no guard page?)");
+}
+
+/// Overflow the main stack with frames bigger than a page: stack probes must
+/// make it fault in the guard page instead of jumping over it into the
+/// mapped stack below.
+#[inline(never)]
+fn crash_big_frame_overflow() {
+    let depth = recurse_big(0);
+    let _ = writeln!(serial::SerialWriter, "crash: big-frame recursion returned at depth {depth} (no guard page?)");
+}
+
+/// [`recurse`] with a 6000-byte array per call (more than a page).
+#[inline(never)]
+fn recurse_big(depth: u64) -> u64 {
+    let frame = core::hint::black_box([depth; 750]);
+    if core::hint::black_box(depth) == u64::MAX {
+        return depth;
+    }
+    recurse_big(depth + 1) + frame[749]
+}
+
+/// Recurse without end: each call keeps a 256-byte array live across the
 /// next call (not a tail call; `black_box` stops LLVM folding it into a
 /// loop), so the main stack runs into its guard page and the crash reporter
 /// names the overflow. The `u64::MAX` test never succeeds in practice.

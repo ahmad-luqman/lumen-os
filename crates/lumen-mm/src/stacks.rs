@@ -14,6 +14,7 @@
 //! sequence count is odd, so a reader never sees a half-written entry or a
 //! mix of two; an entry is retracted before its memory goes away.
 
+use core::ops::Range;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering, fence};
 
 use crate::FRAME_SIZE;
@@ -29,7 +30,7 @@ pub const MAX_STACKS: usize = 32;
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StackKind {
-    /// The boot CPU's kernel stack (`kmain` onward).
+    /// The boot CPU's kernel stack (`kmain_on_kernel_stack` onward).
     Main = 1,
     /// IST stack for double faults.
     DoubleFault = 2,
@@ -77,11 +78,25 @@ impl StackRange {
     pub fn size(self) -> u64 {
         self.top - self.bottom
     }
+
+    /// The stack's addresses as a range.
+    pub fn span(self) -> Range<u64> {
+        self.bottom..self.top
+    }
+
+    /// Page-aligned, nonempty, with room for a guard page below.
+    fn is_valid(self) -> bool {
+        self.bottom.is_multiple_of(FRAME_SIZE)
+            && self.top.is_multiple_of(FRAME_SIZE)
+            && GUARD_SIZE <= self.bottom
+            && self.bottom < self.top
+    }
 }
 
 /// Hands out stack addresses in the stack window, upward, a guard page below
-/// each. Addresses are never reused: the window is far bigger than the
-/// kernel will ever need (1 TiB for stacks of tens of KiB).
+/// each and the page above the last one left free. Addresses are never
+/// reused; the caller sizes the window so that doesn't run out (the kernel's
+/// is about 1 TiB).
 #[derive(Debug)]
 pub struct StackWindow {
     next: u64,
@@ -101,7 +116,9 @@ impl StackWindow {
     pub fn take(&mut self, size: u64) -> Option<StackRange> {
         assert!(size != 0 && size.is_multiple_of(FRAME_SIZE), "stack size {size:#x} is not whole pages");
         let bottom = self.next.checked_add(GUARD_SIZE)?;
-        let top = bottom.checked_add(size).filter(|&top| top <= self.limit)?;
+        let top = bottom.checked_add(size)?;
+        // The page above the stack must be free too (the next guard).
+        top.checked_add(GUARD_SIZE).filter(|&end| end <= self.limit)?;
         self.next = top;
         Some(StackRange { bottom, top })
     }
@@ -119,12 +136,16 @@ pub struct Registered {
 pub enum Hit {
     /// Inside a registered stack.
     Stack(Registered),
-    /// In the guard page below a registered stack: an overflow.
+    /// In the guard page below a registered stack: usually that stack
+    /// overflowing, but any access here lands in it (a stray pointer, or the
+    /// stack below running off its top).
     Guard(Registered),
 }
 
-/// Proof of a registration, given back to [`Registry::unregister`]. Not
-/// `Clone`: an entry is retracted once.
+/// Proof of a registration, given back to [`Registry::unregister`] of the
+/// same registry. Not `Clone`: an entry is retracted once. Dropping it keeps
+/// the slot taken for good.
+#[must_use = "dropping the handle leaves the stack registered for good"]
 #[derive(Debug, PartialEq, Eq)]
 pub struct Handle(usize);
 
@@ -177,9 +198,19 @@ impl Registry {
         Registry { slots: [const { Slot::new() }; MAX_STACKS] }
     }
 
-    /// Publish a stack (whose memory must already be mapped); `None` if every
-    /// slot is taken.
-    pub fn register(&self, kind: StackKind, range: StackRange) -> Option<Handle> {
+    /// Publish a stack; `None` if every slot is taken.
+    ///
+    /// # Safety
+    /// `range` (the stack, not its guard page) is mapped until it is
+    /// unregistered: readers such as the crash reporter dereference what the
+    /// registry lists.
+    ///
+    /// # Panics
+    /// If `range` is not page-aligned, nonempty and above the first page (a
+    /// caller bug; a malformed entry would break every reader).
+    pub unsafe fn register(&self, kind: StackKind, range: StackRange) -> Option<Handle> {
+        assert!(range.is_valid(), "malformed stack range {range:?}");
+        debug_assert_eq!(StackKind::from_raw(kind as u8), Some(kind), "StackKind::ALL is missing {kind:?}");
         // Claiming (EMPTY -> FILLING) makes this writer the slot's only one.
         let (i, slot) =
             self.slots.iter().enumerate().find(|(_, s)| {
@@ -229,7 +260,7 @@ impl Registry {
     /// Which registered stack, or which stack's guard page, `addr` is in.
     pub fn find(&self, addr: u64) -> Option<Hit> {
         self.iter().find_map(|r| {
-            if (r.range.bottom..r.range.top).contains(&addr) {
+            if r.range.span().contains(&addr) {
                 Some(Hit::Stack(r))
             } else if (r.range.guard()..r.range.bottom).contains(&addr) {
                 Some(Hit::Guard(r))
@@ -257,6 +288,12 @@ mod tests {
     const BASE: u64 = 0xffff_d000_0000_0000;
     const K: u64 = 1024;
 
+    /// Register `range` (host tests: nothing is dereferenced).
+    fn register(reg: &Registry, kind: StackKind, range: StackRange) -> Option<Handle> {
+        // SAFETY: host tests never read through registered ranges.
+        unsafe { reg.register(kind, range) }
+    }
+
     #[test]
     fn window_puts_a_guard_page_below_each_stack() {
         let mut w = StackWindow::new(BASE, BASE + 1024 * K);
@@ -264,6 +301,7 @@ mod tests {
         let b = w.take(16 * K).unwrap();
         assert_eq!(a, StackRange { bottom: BASE + GUARD_SIZE, top: BASE + GUARD_SIZE + 64 * K });
         assert_eq!(a.guard(), BASE);
+        assert_eq!(a.span(), a.bottom..a.top);
         // The page above `a` is `b`'s guard.
         assert_eq!(b.guard(), a.top);
         assert_eq!(b.size(), 16 * K);
@@ -271,10 +309,11 @@ mod tests {
 
     #[test]
     fn window_stops_at_its_limit() {
-        let mut w = StackWindow::new(BASE, BASE + 4 * FRAME_SIZE);
-        assert_eq!(w.take(4 * FRAME_SIZE), None, "the guard page needs room too");
+        let mut w = StackWindow::new(BASE, BASE + 5 * FRAME_SIZE);
+        assert_eq!(w.take(4 * FRAME_SIZE), None, "a guard page below and a free page above need room too");
         let a = w.take(3 * FRAME_SIZE).unwrap();
-        assert_eq!(a.top, BASE + 4 * FRAME_SIZE);
+        // The last stack still has an unused page above it.
+        assert_eq!(a.top + GUARD_SIZE, BASE + 5 * FRAME_SIZE);
         assert_eq!(w.take(FRAME_SIZE), None);
         let mut top = StackWindow::new(u64::MAX - FRAME_SIZE + 1, u64::MAX - FRAME_SIZE + 1);
         assert_eq!(top.take(FRAME_SIZE), None, "no overflow at the top of the address space");
@@ -287,13 +326,27 @@ mod tests {
     }
 
     #[test]
+    fn malformed_ranges_are_refused() {
+        let bad = [
+            StackRange { bottom: 0, top: FRAME_SIZE },               // no room for a guard
+            StackRange { bottom: BASE + 8, top: BASE + FRAME_SIZE }, // misaligned
+            StackRange { bottom: BASE + FRAME_SIZE, top: BASE + FRAME_SIZE }, // empty
+            StackRange { bottom: BASE + 2 * FRAME_SIZE, top: BASE + FRAME_SIZE }, // backwards
+        ];
+        for range in bad {
+            let refused = std::panic::catch_unwind(|| register(&Registry::new(), StackKind::Test, range));
+            assert!(refused.is_err(), "{range:?} was accepted");
+        }
+    }
+
+    #[test]
     fn find_and_contains_know_stacks_and_guards() {
         let reg = Registry::new();
         let mut w = StackWindow::new(BASE, BASE + 1024 * K);
         let main = w.take(64 * K).unwrap();
         let ist = w.take(16 * K).unwrap();
-        let hm = reg.register(StackKind::Main, main).unwrap();
-        let _hi = reg.register(StackKind::DoubleFault, ist).unwrap();
+        let hm = register(&reg, StackKind::Main, main).unwrap();
+        let _hi = register(&reg, StackKind::DoubleFault, ist).unwrap();
         let main_r = Registered { kind: StackKind::Main, range: main };
         let ist_r = Registered { kind: StackKind::DoubleFault, range: ist };
         assert_eq!(reg.find(main.bottom), Some(Hit::Stack(main_r)));
@@ -320,27 +373,40 @@ mod tests {
         let reg = Registry::new();
         let mut w = StackWindow::new(BASE, BASE + 4096 * K);
         let mut handles: Vec<_> =
-            (0..MAX_STACKS).map(|_| reg.register(StackKind::Test, w.take(FRAME_SIZE).unwrap()).unwrap()).collect();
+            (0..MAX_STACKS).map(|_| register(&reg, StackKind::Test, w.take(FRAME_SIZE).unwrap()).unwrap()).collect();
         let extra = w.take(FRAME_SIZE).unwrap();
-        assert_eq!(reg.register(StackKind::Test, extra), None);
+        assert_eq!(register(&reg, StackKind::Test, extra), None);
         reg.unregister(handles.remove(7));
-        assert_eq!(reg.register(StackKind::Main, extra), Some(Handle(7)));
+        assert_eq!(register(&reg, StackKind::Main, extra), Some(Handle(7)));
         assert_eq!(reg.find(extra.bottom), Some(Hit::Stack(Registered { kind: StackKind::Main, range: extra })));
     }
 
     #[test]
     fn every_kind_has_a_name_and_round_trips() {
+        // Adding a variant must not compile until this match (and so, by
+        // the comment, `ALL`) is updated: a kind missing from `ALL` would
+        // register but be invisible to `find`.
         for k in StackKind::ALL {
+            match k {
+                StackKind::Main
+                | StackKind::DoubleFault
+                | StackKind::Nmi
+                | StackKind::MachineCheck
+                | StackKind::Test => {} // keep in step with `StackKind::ALL`
+            }
             assert_eq!(StackKind::from_raw(k as u8), Some(k));
             assert!(!k.name().is_empty());
+            assert!(k as u8 != EMPTY && k as u8 != FILLING);
         }
+        assert_eq!(StackKind::ALL.len(), 5);
         assert_eq!(StackKind::from_raw(EMPTY), None);
         assert_eq!(StackKind::from_raw(FILLING), None);
     }
 
     /// Readers racing a writer that keeps registering and retracting stacks
-    /// only ever see whole entries: bounds that belong together, with the
-    /// kind they were registered under.
+    /// in one slot only ever see whole entries: bounds that belong together,
+    /// with the kind they were registered under. (`make test-host` also runs
+    /// this optimized, where reordering mistakes show up.)
     #[test]
     fn readers_never_see_a_torn_entry() {
         let reg = Registry::new();
@@ -353,7 +419,8 @@ mod tests {
         std::thread::scope(|s| {
             s.spawn(|| {
                 for n in 0..200_000u64 {
-                    let h = reg.register(kind(n), range(n)).unwrap();
+                    let h = register(&reg, kind(n), range(n)).unwrap();
+                    assert_eq!(h, Handle(0));
                     reg.unregister(h);
                 }
                 stop.store(true, Ordering::Relaxed);
@@ -363,7 +430,7 @@ mod tests {
                     s.spawn(|| {
                         let mut seen = 0u64;
                         while !stop.load(Ordering::Relaxed) {
-                            for r in reg.iter() {
+                            if let Some(r) = reg.get(0) {
                                 let n = (r.range.bottom - GUARD_SIZE - BASE) / 0x10_0000;
                                 assert_eq!(r, Registered { kind: kind(n), range: range(n) }, "torn entry");
                                 seen += 1;

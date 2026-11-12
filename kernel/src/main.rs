@@ -2,8 +2,9 @@
 //!
 //! Boot order (see docs/ARCHITECTURE.md, "Boot"):
 //! 1. `_start` (naked): clear rbp so backtraces end here, align the stack.
-//! 2. `arch::init_early`: serial, GDT/TSS, IDT. From here on any CPU
-//!    exception produces a crash report.
+//! 2. `arch::init_early`: serial, GDT/TSS, IDT. From here on a CPU exception
+//!    produces a crash report, except a #DF from a broken stack pointer
+//!    before step 4 (no IST stacks yet), which is a triple fault.
 //! 3. Logger, Limine responses, symbol table, memory map, frame allocator,
 //!    the kernel's own page tables and the heap (`mm::init`).
 //! 4. Allocated kernel stacks with guard pages: the IST stacks (#DF, NMI and

@@ -8,7 +8,10 @@
 //! calls [`lumen_exception_dispatch`].
 //!
 //! No vector ever reaches the CPU without a handler, so even an unexpected
-//! interrupt produces a crash report instead of a triple fault.
+//! interrupt produces a crash report instead of a triple fault. (Until
+//! [`use_ist_stacks`], right after `mm::init`, #DF, NMI and #MC run on the
+//! current stack: a #DF from a broken stack pointer then is still a triple
+//! fault.)
 
 use super::gdt;
 use core::arch::{asm, global_asm};
@@ -166,14 +169,16 @@ pub fn init() {
 }
 
 /// Make the NMI, double-fault and machine-check gates switch to their IST
-/// stacks.
+/// stacks. Only through `install_ist_stacks`, after the slots are filled.
 ///
 /// # Safety
-/// [`gdt::set_ist_stacks`] has filled the slots with valid stacks; nothing
-/// else touches the IDT meanwhile (one CPU, interrupts off).
-pub unsafe fn use_ist_stacks() {
+/// `gdt::set_ist_stacks` has filled the slots with valid stacks; nothing
+/// else touches the IDT meanwhile (one CPU).
+pub(super) unsafe fn use_ist_stacks() {
     let idt = &raw mut IDT;
     for (vector, slot) in IST_VECTORS {
+        // An empty slot would make the CPU switch to address 0.
+        assert!(gdt::ist_top(slot) != 0, "IST slot {slot} is empty");
         // SAFETY: upheld by the caller; each write is one byte the CPU reads
         // when it takes that vector, and the slot it names is filled.
         unsafe { (*idt)[vector].ist = slot };

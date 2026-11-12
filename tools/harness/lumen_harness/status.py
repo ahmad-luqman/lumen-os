@@ -119,7 +119,8 @@ def render(evaluated: list[tuple[dict, str]]) -> str:
         "",
         "- Rule 4 (stacks from the allocator with guard pages): early boot runs on",
         "  Limine's stack, without a guard page, until `kmain` switches to an",
-        "  allocated one right after `mm::init`.",
+        "  allocated one right after `mm::init`; #DF, NMI and #MC run on it too",
+        "  (no IST yet), so a #DF from a broken stack pointer then is a triple fault.",
         "",
     ]
     return "\n".join(lines)

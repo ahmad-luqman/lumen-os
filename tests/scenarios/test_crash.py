@@ -45,7 +45,7 @@ def test_fault_produces_symbolized_report(crash_report, kind):
     assert "<unknown>" not in report, report
     # None of these is a stack overflow (`df` breaks rsp itself, so its #DF
     # runs on the IST stack with cr2 outside every guard page).
-    assert "kernel stack overflow" not in report, report
+    assert "kernel stack overflow" not in report and "guard page hit" not in report, report
 
 
 def test_report_shows_the_trace_events_leading_up_to_it(crash_report):

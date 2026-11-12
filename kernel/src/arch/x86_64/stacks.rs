@@ -1,11 +1,12 @@
 //! Known kernel stacks.
 //!
-//! Every stack the kernel runs on after `mm::init` comes from the allocator
-//! with an unmapped guard page below it (hard rule 4; [`crate::mm::stack`])
-//! and is listed in [`REGISTRY`]. The one exception is the stack Limine
-//! booted us on, used until `kmain` switches to an allocated one; it is
-//! recorded here ([`set_boot_stack`]) so a crash before the switch, or a
-//! backtrace reaching back into `kmain`, can still be walked.
+//! Every stack the kernel runs on once `kmain` switches stacks (right after
+//! `mm::init`) comes from the allocator with an unmapped guard page below it
+//! (hard rule 4; [`crate::mm::stack`]) and is listed in [`REGISTRY`]. The one
+//! exception is the stack Limine booted us on, used until that switch; it is
+//! recorded here ([`set_boot_stack`], not in the registry) so a crash before
+//! the switch, or a backtrace reaching back into `kmain`, can still be
+//! walked.
 //!
 //! The crash reporter uses this module lock-free: a frame pointer is only
 //! followed if it points into a known stack ([`contains`]), so a corrupted
