@@ -77,9 +77,9 @@ def test_page_fault_report_names_address_and_cause(crash_report):
     assert walk.virt == 0xDEADB000, report
     assert walk.steps == [(4, 0, 0)] and walk.end == "not present at L4", report
     assert report.index("page walk of") > report.index("backtrace:"), report
-    # Then, last, the heap's state.
+    # Then the heap's state, and last whether interrupts are (still) off.
     lines = report.splitlines()
-    assert lines[-2].startswith("heap: ") and lines[-1] == END, lines[-3:]
+    assert lines[-3].startswith("heap: ") and lines[-2:] == ["interrupts: off", END], lines[-3:]
     assert report.index("heap: ") > report.index("  -> not present"), report
 
 
@@ -102,3 +102,11 @@ def test_crash_screen_golden(boot, artifacts, golden_dir):
     assert_matches_golden(
         shot, golden_dir / "crash-banner.png", origin=(0, 0), size=(640, 72), artifacts=artifacts
     )
+
+
+@pytest.mark.parametrize("kind", ["panic", "pf"])
+def test_report_is_written_with_interrupts_off(crash_report, kind):
+    # kmon runs with interrupts on; a crash turns them off for good, and no
+    # lock the report takes and releases turns them back on.
+    report = crash_report(kind)
+    assert re.search(r"^interrupts: off$", report, re.MULTILINE), report

@@ -45,6 +45,7 @@ dependencies = [
  "lumen-elf",
  "lumen-heap",
  "lumen-mm",
+ "lumen-time",
  "lumen-trace",
  "noto-sans-mono-bitmap",
  "rustc-demangle",
@@ -52,6 +53,10 @@ dependencies = [
 
 [[package]]
 name = "lumen-mm"
+version = "0.0.1"
+
+[[package]]
+name = "lumen-time"
 version = "0.0.1"
 
 [[package]]

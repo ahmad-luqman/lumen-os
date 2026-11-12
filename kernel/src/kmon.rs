@@ -65,6 +65,10 @@ fn dispatch(line: &str) {
                  crash <kind>      deliberate fault: {CRASH_KINDS}\n  \
                  trace [n]         the last n trace events (default 16)\n  \
                  heap              heap usage and free-list summary\n  \
+                 ticks             timer interrupts taken (and stray ones)\n  \
+                 sleep <ms>        wait that long (guest time)\n  \
+                 uptime            nanoseconds since the TSC started\n  \
+                 clocks            the TSC's frequency, measured again against each clock\n  \
                  exit              end QEMU (only with lumen.qemu_exit)"
             );
         }
@@ -90,6 +94,30 @@ fn dispatch(line: &str) {
         "heap" => {
             let _ = crate::mm::heap::write_stats(&mut out);
         }
+        "ticks" => {
+            let s = arch::idt::strays();
+            let _ = writeln!(
+                out,
+                "ticks: {} (spurious {}, unexpected {}, local APIC errors {})",
+                crate::time::ticks(),
+                s.spurious,
+                s.unexpected,
+                s.lapic_errors
+            );
+        }
+        "sleep" => match rest.trim().parse::<u64>() {
+            Ok(ms) if ms <= 60_000 => {
+                crate::time::sleep(ms * 1_000_000);
+                let _ = writeln!(out, "slept {ms} ms");
+            }
+            _ => {
+                let _ = writeln!(out, "usage: sleep <ms> (up to 60000)");
+            }
+        },
+        "uptime" => {
+            let _ = writeln!(out, "uptime: {} ns", crate::time::now_ns());
+        }
+        "clocks" => clocks(),
         "exit" => {
             if crate::cmdline::qemu_exit_enabled() {
                 arch::qemu::exit(arch::qemu::ExitCode::Success);
@@ -100,6 +128,26 @@ fn dispatch(line: &str) {
             let _ = writeln!(out, "unknown command: {cmd} (try 'help')");
         }
     }
+}
+
+/// The TSC's boot calibration, and its frequency measured again now against
+/// the PIT and the HPET (the tests compare them).
+fn clocks() {
+    use crate::time::{self, Reference};
+    let mut out = serial::SerialWriter;
+    let (Some(tsc), Some(reference)) = (time::tsc(), time::reference()) else {
+        let _ = writeln!(out, "clocks: the TSC isn't calibrated");
+        return;
+    };
+    let _ = write!(out, "clocks: tsc {} Hz (against the {reference} at boot)", tsc.hz());
+    for r in [Reference::Pit, Reference::Hpet] {
+        let _ = match time::measure(r) {
+            Some(Ok(hz)) => write!(out, "; {r} {hz} Hz"),
+            Some(Err(e)) => write!(out, "; {r} failed ({e})"),
+            None => write!(out, "; {r} none"),
+        };
+    }
+    let _ = writeln!(out);
 }
 
 fn trace(n: u64) {

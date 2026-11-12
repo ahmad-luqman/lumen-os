@@ -24,6 +24,9 @@ def test_in_kernel_tests_pass(boot):
     assert report.all_passed, report.summary()
     assert code == EXIT_SUCCESS, f"QEMU exit {code}, expected {EXIT_SUCCESS}"
     assert len(report.cases) >= 7
+    # `device_vectors_are_not_fatal` raises the unused vector twice: one
+    # warning, not one per interrupt.
+    assert out.count("unexpected interrupt on vector 0x30") == 1, "warn-once"
     # Issue #3: the trace cost per event is printed as a TAP diagnostic.
     assert re.search(r"^# trace: \d+ TSC ticks per event", out, re.MULTILINE), (
         "no trace cost diagnostic"

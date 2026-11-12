@@ -11,9 +11,11 @@
 //!    #MC ran on the boot stack until now) are installed, then `kmain`
 //!    switches from Limine's boot stack to the main kernel stack and
 //!    continues in `kmain_on_kernel_stack`.
-//! 5. ACPI tables (CPUs, interrupt controllers, HPET), the framebuffer,
-//!    then either the in-kernel tests (`--features ktest`) or the kernel
-//!    monitor.
+//! 5. ACPI tables (CPUs, interrupt controllers, HPET), the interrupt
+//!    controllers (8259s masked, local APIC on, I/O APIC inputs masked), the
+//!    TSC and local APIC timer calibrated, interrupts on; then the
+//!    framebuffer and either the in-kernel tests (`--features ktest`) or the
+//!    kernel monitor.
 
 #![no_std]
 #![no_main]
@@ -26,6 +28,7 @@ mod boot;
 mod cmdline;
 mod crash;
 mod fb;
+mod interrupts;
 mod klog;
 #[cfg_attr(feature = "ktest", allow(dead_code))] // replaced by the test runner
 mod kmon;
@@ -33,6 +36,7 @@ mod ktest;
 mod mm;
 mod symbols;
 mod sync;
+mod time;
 mod trace;
 
 use log::{LevelFilter, info, warn};
@@ -138,6 +142,14 @@ fn install_stacks() -> StackRange {
 /// The rest of boot, on the allocated main stack.
 extern "C" fn kmain_on_kernel_stack() -> ! {
     acpi::init();
+    interrupts::init();
+    time::init();
+    arch::irq::enable();
+    info!(target: "irq", "interrupts on");
+    time::sleep(10_000_000);
+    if time::ticks() == 0 {
+        warn!(target: "irq", "no timer interrupt in 10 ms");
+    }
     match boot::FRAMEBUFFER.get_response().and_then(|r| r.framebuffers().next()) {
         Some(fb) => match fb::init(&fb) {
             Some((w, h)) => info!(target: "fb", "framebuffer {w}x{h} ready"),

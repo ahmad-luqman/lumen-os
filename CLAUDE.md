@@ -114,9 +114,11 @@ own PR that updates that doc first.
 
 ## Map
 
-- `kernel/src/main.rs`: boot sequence. `arch/x86_64/`: GDT/TSS, IDT and entry
-  stubs, serial, IST stacks. `crash.rs`: crash reporter. `ktest.rs`: test
-  runner. `kmon.rs`: serial debug monitor (until the M2 shell). `fb.rs`:
+- `kernel/src/main.rs`: boot sequence. `arch/x86_64/`: GDT/TSS, IDT, entry
+  stubs and the vector map, `irq.rs` (nested interrupt disable), local and
+  I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
+  reporter. `ktest.rs`: test runner. `kmon.rs`: serial debug monitor (until
+  the M2 shell). `fb.rs`:
   framebuffer and console. `klog.rs`: logger. `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
@@ -128,6 +130,8 @@ own PR that updates that doc first.
   MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
   PAT. `trace.rs`: trace ring, event kinds, `ktrace!`. `acpi.rs`: ACPI
   discovery (CPUs, LAPIC, I/O APICs, HPET) and the firmware-table reader.
+  `interrupts.rs`: 8259s masked, local APIC on, I/O APIC inputs masked.
+  `time.rs`: TSC and LAPIC timer calibration, `now_ns`, `sleep`, `ticks`.
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
 - `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, the
   page-table format and mapper (host-tested, incl. a model comparison), the
@@ -136,6 +140,8 @@ own PR that updates that doc first.
 - `crates/lumen-heap`: heap allocator logic (address-ordered free list,
   coalescing; host-tested, incl. a randomized stress test against a shadow map).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads).
+- `crates/lumen-time`: timekeeping arithmetic: calibration, tick/ns
+  conversion, timer counts (host-tested).
 - `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET
   (host-tested on handcrafted tables).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines

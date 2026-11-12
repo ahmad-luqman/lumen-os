@@ -1,0 +1,44 @@
+# Features: time. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Calibrated TSC (against the HPET, or the PIT without one), now_ns and sleep"
+milestone = "M1"
+tests = [
+    "cargo:lumen-time",
+    "ktest:lumen_kernel::time::tsc_calibrated_within_tolerance",
+    "ktest:lumen_kernel::time::sleep_10ms_elapses",
+    "ktest:lumen_kernel::time::now_ns_follows_the_hpet",
+    "ktest:lumen_kernel::time::a_bad_hpet_address_is_an_error",
+    "scenario:test_time::test_boot_calibrates_the_tsc_against_the_hpet",
+    "scenario:test_time::test_boot_calibration_agrees_with_both_clocks",
+    "scenario:test_acpi::test_no_hpet_is_a_warning",
+    "scenario:test_acpi::test_no_madt_boots_without_acpi",
+]
+
+[[feature]]
+name = "Interrupts on: 8259s masked, local APIC timer at 1 kHz, I/O APIC inputs masked; device interrupts are not fatal"
+milestone = "M1"
+tests = [
+    "ktest:lumen_kernel::time::the_timer_is_programmed_for_1_khz",
+    "ktest:lumen_kernel::time::the_timer_ticks_on_its_vector",
+    "ktest:lumen_kernel::interrupts::controllers_are_masked",
+    "ktest:lumen_kernel::interrupts::ioapic_entries_read_back_as_written",
+    "ktest:lumen_kernel::interrupts::redirection_entries_encode_the_madt_flags",
+    "ktest:lumen_kernel::interrupts::device_vectors_are_not_fatal",
+    "ktest:lumen_kernel::interrupts::mask_all_masks_an_unmasked_input",
+    "ktest:lumen_kernel::time::timer_ticks_are_not_traced",
+    "scenario:test_time::test_timer_interrupts_counted",
+    "scenario:test_acpi::test_no_madt_boots_without_acpi",
+]
+
+[[feature]]
+name = "SpinLock keeps interrupts off while held (nested; the crash path keeps them off for good)"
+milestone = "M1"
+tests = [
+    "ktest:lumen_kernel::sync::a_held_lock_keeps_interrupts_off",
+    "ktest:lumen_kernel::sync::guards_dropped_out_of_order_keep_interrupts_off_until_the_last",
+    "ktest:lumen_kernel::sync::a_failed_try_lock_changes_nothing",
+    "ktest:lumen_kernel::sync::a_lock_taken_with_interrupts_off_leaves_them_off",
+    "ktest:lumen_kernel::time::a_held_lock_holds_off_the_timer",
+    "scenario:test_crash::test_report_is_written_with_interrupts_off[*]",
+]

@@ -43,8 +43,7 @@ pub fn read_rsp() -> u64 {
     v
 }
 
-/// Time-stamp counter. Uncalibrated in M0 (calibration is an M1 timer task).
-#[allow(dead_code)] // HAL surface; boot timeline in M1
+/// The time-stamp counter, in raw ticks (`time` calibrates its frequency).
 pub fn rdtsc() -> u64 {
     let lo: u32;
     let hi: u32;
