@@ -76,7 +76,7 @@ test-scenarios: iso ## Boot QEMU headless and run every scenario (incl. in-kerne
 	@mkdir -p $(RESULTS) && rm -f $(RESULTS)/scenarios.xml $(RESULTS)/ktest.tap
 	uv run --frozen pytest tests/scenarios -v --junitxml=$(RESULTS)/scenarios.xml
 
-audit: build ## Prove kernel codegen flags (no SSE/AVX, no red zone, kernel code model)
+audit: build ## Prove kernel codegen flags and image layout (no SSE/AVX, no red zone, kernel code model, sections in place)
 	@mkdir -p $(RESULTS) && rm -f $(RESULTS)/audit.json
 	$(HARNESS) audit $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest
 

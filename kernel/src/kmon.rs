@@ -60,7 +60,7 @@ fn dispatch(line: &str) {
                 out,
                 "commands:\n  help              this list\n  echo <text>       print text\n  \
                  int3              take a breakpoint and continue\n  \
-                 crash <kind>      deliberate fault: pf ud de gp df panic\n  \
+                 crash <kind>      deliberate fault: pf ud de gp df wtext nx panic\n  \
                  trace [n]         the last n trace events (default 16)\n  \
                  exit              end QEMU (only with lumen.qemu_exit)"
             );
@@ -114,15 +114,17 @@ fn crash(kind: &str) {
         "de" => crash_divide_error(),
         "gp" => crash_general_protection(),
         "df" => crash_double_fault(),
+        "wtext" => crash_write_text(),
+        "nx" => crash_execute_data(),
         "panic" => crash_panic(),
         _ => {
-            let _ = writeln!(serial::SerialWriter, "crash: unknown kind '{kind}' (pf ud de gp df panic)");
+            let _ = writeln!(serial::SerialWriter, "crash: unknown kind '{kind}' (pf ud de gp df wtext nx panic)");
         }
     }
 }
 
-/// Address that is never mapped: Limine base revision >= 3 maps nothing in
-/// the lower half except what we ask for.
+/// Address that is never mapped: the kernel's page tables map nothing in the
+/// lower half.
 pub const UNMAPPED_ADDR: u64 = 0xdead_b000;
 
 #[inline(never)]
@@ -155,6 +157,36 @@ fn crash_general_protection() {
 fn crash_double_fault() {
     // SAFETY: deliberately faulting; never returns.
     unsafe { asm!("mov rsp, {0}", "push rax", "ud2", in(reg) UNMAPPED_ADDR + 0x1000, options(noreturn)) };
+}
+
+/// Write to the kernel's own code: `.text` is mapped read-only and CR0.WP
+/// makes that bind in ring 0, so this must page-fault. If protection is
+/// broken it writes back the byte it read (changing nothing) and says so,
+/// which fails the test cleanly instead of corrupting the kernel.
+#[inline(never)]
+fn crash_write_text() {
+    let target = crash_write_text as *const () as *mut u8;
+    // SAFETY: deliberately faulting; if the write is allowed it stores the
+    // byte that was already there.
+    unsafe { core::ptr::write_volatile(target, core::ptr::read_volatile(target)) };
+    let _ = writeln!(serial::SerialWriter, "crash: write to .text succeeded (W^X broken)");
+}
+
+/// One `ret` instruction in `.data` (writable, so it must not be executable).
+#[unsafe(link_section = ".data.lumen_nx_probe")]
+#[used]
+static RET_IN_DATA: [u8; 1] = [0xc3];
+
+/// Call into `.data`: NX must make the instruction fetch page-fault. If it
+/// doesn't, the `ret` returns and this says so.
+#[inline(never)]
+fn crash_execute_data() {
+    let target = core::ptr::from_ref(&RET_IN_DATA) as u64;
+    // SAFETY: deliberately faulting; if NX is broken the callee is a single
+    // `ret`, which returns here with every register intact except the ones
+    // `clobber_abi` lists.
+    unsafe { asm!("call {0}", in(reg) target, clobber_abi("C")) };
+    let _ = writeln!(serial::SerialWriter, "crash: executing .data succeeded (NX broken)");
 }
 
 #[inline(never)]

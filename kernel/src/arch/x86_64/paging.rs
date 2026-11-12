@@ -1,117 +1,117 @@
-//! Read-only walks of the active 4-level page tables (the ones in CR3).
+//! Paging hardware: CR3, the TLB, NX and write protection, and the PAT.
 //!
-//! M1's frame allocator uses this to find out which physical frames are in
-//! use before it exists: the frames of the page tables themselves, and the
-//! physical frames behind live virtual addresses (kernel image, kernel file,
-//! boot stack, framebuffer). Tables are read through the higher-half direct
-//! map, so the caller passes its offset. Building our own tables is #4.
+//! The page-table format, walks and the mapper are pure logic in
+//! `lumen_mm::paging` (host-tested); `crate::mm::paging` builds the kernel's
+//! tables with it. This module is the part that touches the CPU.
 
-use super::cpu::{read_cr3, read_cr4};
+use core::arch::asm;
 
-const ENTRIES: usize = 512;
-const PRESENT: u64 = 1 << 0;
-/// Page size bit: in an L3 entry maps 1 GiB, in an L2 entry 2 MiB.
-const HUGE: u64 = 1 << 7;
-/// Physical address bits of an entry pointing to a table or 4 KiB page.
-/// Masks off the flags in bits 0-11 and NX/protection keys in bits 52-63.
-const ADDR_4K: u64 = 0x000f_ffff_ffff_f000;
-/// Physical address bits of a 2 MiB / 1 GiB entry (bit 12 there is PAT).
-const ADDR_2M: u64 = 0x000f_ffff_ffe0_0000;
-const ADDR_1G: u64 = 0x000f_ffff_c000_0000;
+use lumen_mm::{PhysFrame, VirtAddr, paging::Cache};
 
+use super::cpu::{cpuid, rdmsr, read_cr0, read_cr3, read_cr4, write_cr0, write_cr3, write_cr4, wrmsr};
+
+/// CR0.WP: supervisor writes honour read-only pages.
+pub const CR0_WP: u64 = 1 << 16;
+/// CR4.PGE: global pages survive CR3 writes.
+const CR4_PGE: u64 = 1 << 7;
 /// CR4.LA57: 5-level paging.
 const CR4_LA57: u64 = 1 << 12;
+const IA32_EFER: u32 = 0xc000_0080;
+/// EFER.NXE: the no-execute bit in page-table entries is honoured.
+pub const EFER_NXE: u64 = 1 << 11;
+const IA32_PAT: u32 = 0x277;
+/// CR3 bits holding the root table's address (no PCIDs in use).
+const CR3_ADDR: u64 = 0x000f_ffff_ffff_f000;
 
-/// Is the CPU using 4-level paging, the only kind these walks understand?
+/// Is the CPU using 4-level paging, the only kind the kernel supports?
 pub fn four_level() -> bool {
     read_cr4() & CR4_LA57 == 0
 }
 
-/// Read one table (512 entries) at physical address `phys`.
+/// Does the CPU support the no-execute bit (CPUID 0x8000_0001, EDX bit 20)?
+fn nx_supported() -> bool {
+    cpuid(0x8000_0000).0 >= 0x8000_0001 && cpuid(0x8000_0001).3 & (1 << 20) != 0
+}
+
+/// The root (L4) table in use.
+pub fn active_root() -> PhysFrame {
+    PhysFrame::from_u64(read_cr3() & CR3_ADDR).expect("CR3's address bits are a frame")
+}
+
+/// Switch to the hierarchy rooted at `root` and flush the whole TLB,
+/// including global entries.
 ///
 /// # Safety
-/// `phys` must be a page-table frame of the active hierarchy and `hhdm` the
-/// direct-map offset under which it is mapped.
-unsafe fn table(hhdm: u64, phys: u64) -> &'static [u64; ENTRIES] {
-    // SAFETY: the caller guarantees the frame is a live, mapped page table.
-    // We only read, and only the present/huge/address bits, which no software
-    // changes (one CPU; nothing writes the tables Limine built until #4). The
-    // CPU may set accessed/dirty bits concurrently; we ignore those bits.
-    // Revisit (volatile reads, no `&'static`) when #4 starts writing tables.
-    unsafe { &*((hhdm + phys) as *const [u64; ENTRIES]) }
-}
-
-fn root() -> u64 {
-    read_cr3() & ADDR_4K
-}
-
-/// The physical address `virt` maps to, if it is mapped.
-pub fn translate(hhdm: u64, virt: u64) -> Option<u64> {
-    let index = |level: u32| ((virt >> (12 + 9 * level)) & 0x1ff) as usize;
-    // SAFETY: each table address comes from CR3 or from a present, non-huge
-    // entry of the previous level, so it is a live page table.
+/// `root` must map everything the kernel uses from here on (code, stack,
+/// data and every pointer it holds) at the same virtual addresses, to the
+/// same physical frames, with rights that allow how the kernel uses them.
+pub unsafe fn load_root(root: PhysFrame) {
+    // SAFETY: the caller guarantees the new hierarchy maps the running
+    // kernel. A CR3 write flushes non-global entries; toggling PGE flushes
+    // the global ones too (Limine may have set G on its mappings).
     unsafe {
-        let l4e = table(hhdm, root())[index(3)];
-        if l4e & PRESENT == 0 {
-            return None;
+        write_cr3(root.as_u64());
+        let cr4 = read_cr4();
+        if cr4 & CR4_PGE != 0 {
+            write_cr4(cr4 & !CR4_PGE);
+            write_cr4(cr4);
         }
-        let l3e = table(hhdm, l4e & ADDR_4K)[index(2)];
-        if l3e & PRESENT == 0 {
-            return None;
-        }
-        if l3e & HUGE != 0 {
-            return Some((l3e & ADDR_1G) + (virt & ((1 << 30) - 1)));
-        }
-        let l2e = table(hhdm, l3e & ADDR_4K)[index(1)];
-        if l2e & PRESENT == 0 {
-            return None;
-        }
-        if l2e & HUGE != 0 {
-            return Some((l2e & ADDR_2M) + (virt & ((1 << 21) - 1)));
-        }
-        let l1e = table(hhdm, l2e & ADDR_4K)[index(0)];
-        if l1e & PRESENT == 0 {
-            return None;
-        }
-        Some((l1e & ADDR_4K) + (virt & 0xfff))
     }
 }
 
-/// Call `f` with the physical address of every page-table frame in the
-/// active hierarchy: the L4 table and every L3, L2 and L1 table it reaches.
-/// Returns how many visits were made (a table referenced twice is visited,
-/// and counted, twice).
-pub fn for_each_table_frame(hhdm: u64, mut f: impl FnMut(u64)) -> usize {
-    let mut visited = 0;
-    let mut visit = |frame: u64| {
-        visited += 1;
-        f(frame);
-    };
-    let l4 = root();
-    visit(l4);
-    // SAFETY: as in `translate`: every table address comes from CR3 or a
-    // present, non-huge entry of the level above.
+/// Drop any TLB entry for the page containing `virt`.
+pub fn invalidate(virt: VirtAddr) {
+    // SAFETY: invlpg only discards a cached translation.
+    unsafe { asm!("invlpg [{}]", in(reg) virt.as_u64(), options(nostack, preserves_flags)) }
+}
+
+/// Make the CPU honour the NX bit and read-only pages in supervisor mode.
+/// Limine turns both on already; the kernel's W^X depends on them, so it
+/// doesn't rely on that.
+pub fn enforce_nx_and_wp() {
+    assert!(nx_supported(), "the CPU has no NX bit; W^X can't be enforced");
+    // SAFETY: EFER exists on every x86-64 CPU and NXE is supported (checked
+    // above). Limine sets both already, so this is normally a no-op; if NXE
+    // were off, no live entry could have bit 63 set (it would be reserved
+    // and fault), so turning it on takes execute rights from no page in use.
+    // WP only makes ring 0 stricter.
     unsafe {
-        for &l4e in table(hhdm, l4) {
-            if l4e & PRESENT == 0 {
-                continue;
-            }
-            let l3 = l4e & ADDR_4K;
-            visit(l3);
-            for &l3e in table(hhdm, l3) {
-                if l3e & PRESENT == 0 || l3e & HUGE != 0 {
-                    continue;
-                }
-                let l2 = l3e & ADDR_4K;
-                visit(l2);
-                for &l2e in table(hhdm, l2) {
-                    if l2e & PRESENT == 0 || l2e & HUGE != 0 {
-                        continue;
-                    }
-                    visit(l2e & ADDR_4K);
-                }
-            }
-        }
+        wrmsr(IA32_EFER, rdmsr(IA32_EFER) | EFER_NXE);
+        write_cr0(read_cr0() | CR0_WP);
     }
-    visited
+}
+
+/// EFER, for the in-kernel tests.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))]
+pub fn efer() -> u64 {
+    // SAFETY: EFER exists on every x86-64 CPU.
+    unsafe { rdmsr(IA32_EFER) }
+}
+
+/// The memory type encoding the PAT uses for `cache` (Intel SDM Vol. 3A,
+/// "Memory Types That Can Be Encoded With PAT").
+const fn memory_type(cache: Cache) -> u64 {
+    match cache {
+        Cache::Uncached => 0,
+        Cache::WriteCombining => 1,
+        Cache::WriteBack => 6,
+    }
+}
+
+/// The PAT MSR: eight memory types, one per byte.
+pub fn pat() -> u64 {
+    // SAFETY: the PAT MSR exists on every x86-64 CPU.
+    unsafe { rdmsr(IA32_PAT) }
+}
+
+/// Check that the PAT slots `lumen_mm::paging::Cache` selects hold the memory
+/// types it names. Limine sets this layout up (slot 0 WB, 3 UC, 5 WC); the
+/// kernel checks rather than rewrites the PAT while its own mappings use it.
+pub fn check_pat() {
+    let pat = pat();
+    for cache in [Cache::WriteBack, Cache::Uncached, Cache::WriteCombining] {
+        let slot = cache.pat_slot();
+        let got = (pat >> (8 * slot)) & 0x7;
+        assert_eq!(got, memory_type(cache), "PAT slot {slot} is not {cache:?} (PAT {pat:#018x})");
+    }
 }

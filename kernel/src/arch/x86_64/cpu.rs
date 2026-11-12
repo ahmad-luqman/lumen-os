@@ -52,3 +52,50 @@ pub fn rdtsc() -> u64 {
     unsafe { asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags)) }
     (u64::from(hi) << 32) | u64::from(lo)
 }
+
+/// Read a model-specific register.
+///
+/// # Safety
+/// `msr` must exist on this CPU (reading an unknown MSR raises #GP).
+pub unsafe fn rdmsr(msr: u32) -> u64 {
+    let (lo, hi): (u32, u32);
+    // SAFETY: the caller guarantees the MSR exists; rdmsr has no other effect.
+    unsafe { asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags)) }
+    (u64::from(hi) << 32) | u64::from(lo)
+}
+
+/// Write a model-specific register.
+///
+/// # Safety
+/// `msr` must exist and `value` must be valid for it; the effect is whatever
+/// that MSR controls.
+pub unsafe fn wrmsr(msr: u32, value: u64) {
+    // SAFETY: delegated to the caller.
+    unsafe {
+        asm!("wrmsr", in("ecx") msr, in("eax") value as u32, in("edx") (value >> 32) as u32, options(nostack, preserves_flags))
+    }
+}
+
+/// `cpuid` leaf `leaf`, subleaf 0, as `(eax, ebx, ecx, edx)`.
+pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
+    let r = core::arch::x86_64::__cpuid_count(leaf, 0);
+    (r.eax, r.ebx, r.ecx, r.edx)
+}
+
+macro_rules! write_cr {
+    ($name:ident, $reg:literal) => {
+        /// Write the control register.
+        ///
+        /// # Safety
+        /// The new value must keep the CPU in a state the kernel can run in
+        /// (paging, protection and caching bits).
+        pub unsafe fn $name(v: u64) {
+            // SAFETY: delegated to the caller. Not `nomem`: changing paging
+            // or protection changes what memory accesses mean.
+            unsafe { asm!(concat!("mov ", $reg, ", {}"), in(reg) v, options(nostack, preserves_flags)) }
+        }
+    };
+}
+write_cr!(write_cr0, "cr0");
+write_cr!(write_cr3, "cr3");
+write_cr!(write_cr4, "cr4");

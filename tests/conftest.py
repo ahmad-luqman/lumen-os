@@ -17,7 +17,8 @@ from pathlib import Path
 
 import pytest
 from lumen_harness import BUILD_DIR, REPO_ROOT
-from lumen_harness.qemu import Machine
+from lumen_harness.crash import BEGIN, END, PROTECTION_BROKEN
+from lumen_harness.qemu import EXIT_CRASH, Machine
 
 ISOS = {
     "interactive": BUILD_DIR / "lumen.iso",
@@ -74,3 +75,22 @@ def boot(artifacts: Path) -> Iterator[Callable[[str], Machine]]:
 @pytest.fixture
 def golden_dir() -> Path:
     return GOLDEN_DIR
+
+
+@pytest.fixture
+def crash_report(boot: Callable[[str], Machine]) -> Callable[[str], str]:
+    """`crash_report("pf")` boots, runs `crash pf` in kmon, checks QEMU exits
+    with the crash code, and returns the report (both markers included)."""
+
+    def _crash(kind: str) -> str:
+        m = boot("qemutest")
+        m.expect(r"kmon> ", 60)
+        m.send_line(f"crash {kind}")
+        # A deliberate protection fault that doesn't fault says so at once.
+        done = m.expect(rf"{re.escape(END)}|{PROTECTION_BROKEN}", 30)
+        assert done.group(0) == END, f"no crash: {done.group(0)}"
+        assert m.wait_exit(10) == EXIT_CRASH
+        out = m.output
+        return out[out.index(BEGIN) : out.index(END) + len(END)]
+
+    return _crash

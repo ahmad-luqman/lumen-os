@@ -36,7 +36,10 @@ def gdb_command(kernel: Path, batch: bool) -> list[str]:
         str(kernel),
         "-ex", "set architecture i386:x86-64",
         "-ex", "target remote :1234",
-        "-ex", "hbreak kmain",
+        # `*kmain`: kmain's first instruction. Plain `kmain` stops after the
+        # prologue, where the next instruction may belong to code inlined
+        # into kmain (e.g. serial setup), and gdb then reports that frame.
+        "-ex", "hbreak *kmain",
         "-ex", "continue",
     ]  # fmt: skip
     if batch:

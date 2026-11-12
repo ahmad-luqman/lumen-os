@@ -14,7 +14,7 @@ make debug           # QEMU paused + gdb attached, stopped at kmain
 make test            # everything CI runs: host tests, flag audit, QEMU scenarios
 make test-host       # cargo test + harness self-tests (fast, no QEMU)
 make test-scenarios  # headless QEMU scenarios incl. in-kernel ktests (~20 s)
-make audit           # proves no SSE/AVX, no red zone, kernel code model
+make audit           # proves no SSE/AVX, no red zone, kernel code model, image layout
 make lint fmt        # clippy -D warnings + ruff; rustfmt + ruff format
 make status-check    # feature gate: every feature in tests/features/ passes (CI runs this)
 make status          # regenerate docs/STATUS.md from the last test results (on main)
@@ -116,12 +116,15 @@ own PR that updates that doc first.
   runner. `kmon.rs`: serial debug monitor (until the M2 shell). `fb.rs`:
   framebuffer and console. `klog.rs`: logger. `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator and its reservations.
-  `arch/x86_64/paging.rs`: read-only page-table walks. `trace.rs`: trace
-  ring, event kinds, `ktrace!`.
+  `mm/paging.rs`: the kernel's page tables (HHDM, W^X image, map/unmap,
+  MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
+  PAT. `trace.rs`: trace ring, event kinds, `ktrace!`.
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
-- `crates/lumen-mm`: frame-allocator logic (bitmap; host-tested).
+- `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, and the
+  page-table format and mapper (host-tested, incl. a model comparison).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
-  are built), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`.
+  are built), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
+  `crash.py` (crash-report parsing).
 - `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests.
   `tests/features/*.toml`: feature → test map (the CI feature gate and STATUS.md).
