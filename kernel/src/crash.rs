@@ -14,7 +14,7 @@
 //!
 //! The output format is parsed by `tools/harness/lumen_harness/crash.py`
 //! (markers, backtrace, page walk), `tests/scenarios/test_crash.py` and, for
-//! the heap line (`mm::heap::write_state`), `tests/scenarios/test_mm.py`;
+//! the heap line (`Snapshot::write` in `mm::heap`), `tests/scenarios/test_mm.py`;
 //! change them together.
 
 use crate::arch::{self, TrapFrame, serial::SerialWriter};
