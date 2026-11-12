@@ -20,15 +20,69 @@ def test_boot_reaches_logger(boot):
     assert "ERROR" not in out, "boot logged an error"
 
 
+# `[seconds.micro] LEVEL tag: message`, or `[    ?.??????]` before the TSC is
+# calibrated (kernel/src/klog.rs, lumen_time::Stamp).
+LOG_LINE = re.compile(
+    r"^\[(?P<stamp> *\d+\.\d{6}|    \?\.\?{6})\] (?P<level>ERROR|WARN |INFO |DEBUG|TRACE) [a-z0-9_:]+: \S"
+)
+TIMELINE = re.compile(r"INFO  boot: timeline: (?P<phases>.*) \(total (?P<total>\d+\.\d{3}) ms\)\n")
+PHASES = [
+    "entry",
+    "arch-init",
+    "logger",
+    "symbols",
+    "memory",
+    "stacks",
+    "acpi",
+    "interrupts",
+    "time",
+    "framebuffer",
+    "complete",
+]
+
+
+def kernel_lines(output: str) -> list[str]:
+    """The kernel's lines, from its first log line to before the prompt.
+    (Limine's console output runs into the first line, so start at its
+    stamp's bracket.)"""
+    start = output.rindex("[", 0, output.index("INFO  boot: Lumen"))
+    return output[start:].splitlines()[:-1]
+
+
 def test_log_lines_are_structured(boot):
-    """Every kernel log line is `LEVEL tag: message` (hard rule 8)."""
+    """Every kernel log line is `[time] LEVEL tag: message` (hard rule 8)."""
     m = boot("qemutest")
     m.expect(r"kmon> ", BOOT_TIMEOUT)
-    start = m.output.index("INFO  boot: Lumen")
-    kernel_lines = m.output[start:].splitlines()[:-1]  # drop the prompt
-    line_rx = re.compile(r"^(ERROR|WARN |INFO |DEBUG|TRACE) [a-z0-9_:]+: \S")
-    bad = [line for line in kernel_lines if not line_rx.match(line)]
+    lines = kernel_lines(m.output)
+    bad = [line for line in lines if not LOG_LINE.match(line)]
     assert not bad, f"unstructured kernel output: {bad}"
+    # The time is unknown until the TSC is calibrated, then real and
+    # non-decreasing.
+    stamps = [LOG_LINE.match(line)["stamp"] for line in lines]
+    calibrated = next(i for i, line in enumerate(lines) if "INFO  time: tsc " in line)
+    assert all("?" in s for s in stamps[:calibrated]), stamps
+    seconds = [float(s) for s in stamps[calibrated:]]
+    assert seconds == sorted(seconds), seconds
+    assert seconds[0] > 0, seconds
+
+
+def test_boot_timeline_printed(boot):
+    """At boot complete, every phase's time since `kmain` began, in order."""
+    m = boot("qemutest")
+    line = m.expect(TIMELINE, BOOT_TIMEOUT)
+    phases = [p.rsplit(" +", 1) for p in line["phases"].split(", ")]
+    assert [name for name, _ in phases] == PHASES, line[0]
+    ms = [float(t.removesuffix(" ms")) for _, t in phases]
+    assert ms[0] == 0 and ms == sorted(ms), line[0]
+    total = float(line["total"])
+    assert total == ms[-1], line[0]
+    # In guest time: calibrating the TSC and the timer alone takes ten 10 ms
+    # windows, so at least 100 ms; generously under 30 s (an emulator runs
+    # slower, never that slow).
+    assert 100 <= total <= 30_000, line[0]
+    # The line's own timestamp, taken just after the last phase, agrees.
+    stamp = m.output[: line.start() + 15].rsplit("[", 1)[1].split("]")[0]
+    assert total <= float(stamp) * 1000 <= total + 50, (stamp, line[0])
 
 
 def test_serial_input_round_trip(boot):

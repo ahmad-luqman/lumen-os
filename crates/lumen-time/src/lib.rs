@@ -137,6 +137,43 @@ impl fmt::Display for Hz {
     }
 }
 
+/// A log line's timestamp: `[    0.012345]`, seconds since boot to the
+/// microsecond, or a placeholder of the same width while the time isn't
+/// known (`None`: before the TSC is calibrated). A zero would read as a
+/// measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp(pub Option<u64>);
+
+impl fmt::Display for Stamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(ns) => write!(f, "[{:>5}.{:06}]", ns / NS_PER_SEC, ns % NS_PER_SEC / 1000),
+            None => f.write_str("[    ?.??????]"),
+        }
+    }
+}
+
+/// A duration in nanoseconds, for humans in milliseconds to the
+/// microsecond: `0.012 ms`, `3400.000 ms`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Millis(pub u64);
+
+impl fmt::Display for Millis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{:03} ms", self.0 / 1_000_000, self.0 % 1_000_000 / 1000)
+    }
+}
+
+/// An offset in nanoseconds, as [`Millis`] with a `+`: `+0.012 ms`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ms(pub u64);
+
+impl fmt::Display for Ms {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "+{}", Millis(self.0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -233,6 +270,25 @@ mod tests {
         assert_eq!(Clock::new(1).unwrap().ns(u64::MAX), u64::MAX, "saturates");
         assert_eq!(Clock::new(u64::MAX).unwrap().ticks(u64::MAX), u64::MAX, "saturates");
         assert_eq!(Clock::new(0), None);
+    }
+
+    #[test]
+    fn stamps_have_one_width() {
+        assert_eq!(Stamp(Some(12_345_678)).to_string(), "[    0.012345]");
+        assert_eq!(Stamp(Some(0)).to_string(), "[    0.000000]");
+        assert_eq!(Stamp(Some(3 * NS_PER_SEC + 999)).to_string(), "[    3.000000]", "rounds down to the µs");
+        assert_eq!(Stamp(None).to_string(), "[    ?.??????]");
+        assert_eq!(Stamp(None).to_string().len(), Stamp(Some(1)).to_string().len());
+        assert_eq!(Stamp(Some(123_456 * NS_PER_SEC)).to_string(), "[123456.000000]", "wider than the field: grows");
+    }
+
+    #[test]
+    fn offsets_read_in_milliseconds() {
+        assert_eq!(Ms(12_000).to_string(), "+0.012 ms");
+        assert_eq!(Ms(3_400_000_000).to_string(), "+3400.000 ms");
+        assert_eq!(Ms(999).to_string(), "+0.000 ms", "rounds down to the µs");
+        assert_eq!(Ms(1_234_567).to_string(), "+1.234 ms");
+        assert_eq!(Millis(3_400_000_000).to_string(), "3400.000 ms");
     }
 
     #[test]

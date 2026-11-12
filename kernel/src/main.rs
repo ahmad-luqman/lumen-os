@@ -63,7 +63,12 @@ extern "C" fn _start() -> ! {
 /// Unmangled so debuggers can `break kmain` without knowing Rust mangling.
 #[unsafe(no_mangle)]
 extern "C" fn kmain(stack_top: u64) -> ! {
+    // The boot timeline's origin: a bare `rdtsc`, which can't fault, so GDT
+    // and IDT setup still come first in effect (hard rule 6).
+    let entry = arch::rdtsc();
     arch::init_early();
+    time::mark_boot(entry);
+    trace::record_at(trace::ring(), entry, Kind::BootPhase, trace::args([BootPhase::Entry as u64]));
     ktrace!(Kind::BootPhase, BootPhase::ArchInit);
     // Only claim the size we asked for if Limine confirms it: the frame
     // allocator reserves this range and the crash reporter walks it.
@@ -106,6 +111,7 @@ extern "C" fn kmain(stack_top: u64) -> ! {
     mm::init();
     ktrace!(Kind::BootPhase, BootPhase::Memory);
     let main_stack = install_stacks();
+    ktrace!(Kind::BootPhase, BootPhase::Stacks);
     // SAFETY: the main stack is leaked (never freed), mapped and used by
     // nothing else, and its top is page-aligned; the boot stack stays mapped
     // and reserved and is never reused, so the chain back into `kmain` stays
@@ -142,7 +148,9 @@ fn install_stacks() -> StackRange {
 /// The rest of boot, on the allocated main stack.
 extern "C" fn kmain_on_kernel_stack() -> ! {
     acpi::init();
+    ktrace!(Kind::BootPhase, BootPhase::Acpi);
     interrupts::init();
+    ktrace!(Kind::BootPhase, BootPhase::Interrupts);
     time::init();
     arch::irq::enable();
     info!(target: "irq", "interrupts on");
@@ -150,6 +158,7 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     if time::ticks() == 0 {
         warn!(target: "irq", "no timer interrupt in 10 ms");
     }
+    ktrace!(Kind::BootPhase, BootPhase::Time);
     match boot::FRAMEBUFFER.get_response().and_then(|r| r.framebuffers().next()) {
         Some(fb) => match fb::init(&fb) {
             Some((w, h)) => info!(target: "fb", "framebuffer {w}x{h} ready"),
@@ -161,6 +170,7 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
 
     info!(target: "boot", "boot complete");
     ktrace!(Kind::BootPhase, BootPhase::Complete);
+    info!(target: "boot", "timeline: {}", trace::Timeline);
     after_boot()
 }
 

@@ -1,12 +1,18 @@
 //! Structured kernel logger (hard rule 8).
 //!
 //! Implements the `log` crate facade, so any crate can log without depending
-//! on the kernel. Every line has a level and a subsystem tag:
+//! on the kernel. Every line has a timestamp (on serial), a level and a
+//! subsystem tag:
 //!
 //! ```text
-//! INFO  boot: Lumen 0.0.1 booting
-//! WARN  mem: 3 regions ignored
+//! [    ?.??????] INFO  boot: Lumen 0.0.1 booting
+//! [    0.412345] WARN  mem: 3 regions ignored
 //! ```
+//!
+//! The timestamp is seconds since `kmain` began, to the microsecond; lines
+//! logged before the TSC is calibrated (most of boot) show `?` instead (the
+//! boot timeline covers those phases afterwards). The screen's console shows
+//! lines without it, so screenshots stay comparable.
 //!
 //! The tag is the `target:` given at the call site, or else the module path
 //! with the `lumen_kernel::` prefix removed. The level threshold comes from
@@ -39,8 +45,10 @@ impl Log for KernelLogger {
         // Trace before taking the line lock: recording never waits.
         crate::ktrace!(crate::trace::Kind::Log, record.level(), crate::trace::pack_tag(tag));
         let _line = LINE_LOCK.lock();
+        // Under the line lock: lines come out in the order of their stamps.
+        let stamp = lumen_time::Stamp(crate::time::since_boot_ns());
         let mut out = SerialWriter;
-        let _ = writeln!(out, "{:<5} {}: {}", record.level(), tag, record.args());
+        let _ = writeln!(out, "{stamp} {:<5} {}: {}", record.level(), tag, record.args());
         if record.level() <= Level::Info {
             crate::fb::console_log(record.level(), tag, record.args());
         }

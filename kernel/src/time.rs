@@ -39,6 +39,9 @@ static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 static LAPIC_TIMER_HZ: AtomicU64 = AtomicU64::new(0);
 /// What the TSC was calibrated against: 0 not yet, else a [`Reference`].
 static REFERENCE: AtomicU8 = AtomicU8::new(0);
+/// The TSC when `kmain` began: the boot timeline's and the log's origin (0
+/// until [`mark_boot`]).
+static BOOT_TSC: AtomicU64 = AtomicU64::new(0);
 /// The HPET, mapped once, if the TSC could be calibrated against it.
 static HPET: SpinLock<Option<HpetCounter>> = SpinLock::new(None);
 
@@ -344,6 +347,22 @@ pub fn tsc() -> Option<Clock> {
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests, SMP (#9)
 pub fn lapic_timer() -> Option<Clock> {
     Clock::new(LAPIC_TIMER_HZ.load(Ordering::Relaxed))
+}
+
+/// Record `tsc`, read as `kmain` began, as the boot's origin. Once, early.
+pub fn mark_boot(tsc: u64) {
+    assert_eq!(BOOT_TSC.swap(tsc, Ordering::Relaxed), 0, "mark_boot called twice");
+}
+
+/// The TSC when `kmain` began (0 before [`mark_boot`]).
+pub fn boot_tsc() -> u64 {
+    BOOT_TSC.load(Ordering::Relaxed)
+}
+
+/// Nanoseconds since `kmain` began, once the TSC is calibrated (`None`
+/// before). Lock-free (the logger stamps lines with it).
+pub fn since_boot_ns() -> Option<u64> {
+    tsc().map(|c| c.ns(arch::rdtsc().saturating_sub(boot_tsc())))
 }
 
 /// Nanoseconds since the TSC was last reset (normally at CPU reset; firmware

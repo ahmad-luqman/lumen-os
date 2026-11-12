@@ -7,7 +7,19 @@ in-kernel (`lumen_kernel::trace::*`); this checks what a person sees.
 import re
 
 BOOT_TIMEOUT = 60
-PHASES = ["arch-init", "logger", "symbols", "memory", "framebuffer", "complete"]
+PHASES = [
+    "entry",
+    "arch-init",
+    "logger",
+    "symbols",
+    "memory",
+    "stacks",
+    "acpi",
+    "interrupts",
+    "time",
+    "framebuffer",
+    "complete",
+]
 EVENT_LINE = re.compile(r"^#(\d+) +tsc=(\d+) +(\S+)(.*)$", re.MULTILINE)
 
 

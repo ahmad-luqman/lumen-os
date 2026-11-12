@@ -93,9 +93,30 @@ tests (for example `lumen-elf`, the symbol-table reader).
    (`INFO  time: tsc 2.9 GHz (calibrated against hpet)`), and the local APIC
    timer against the TSC, started at 1 kHz; interrupts on
    (`INFO  irq: interrupts on`); the framebuffer hello screen, then
-   `boot complete`.
+   `boot complete`, then the boot timeline (below).
 7. Either the in-kernel test runner (`--features ktest`) or the kernel monitor
    (`kmon`, a serial debug console that the user-mode shell replaces in M2).
+
+### Boot timeline and log timestamps (built in M1)
+
+`kmain`'s first statement reads the TSC (a bare `rdtsc`, which can't fault,
+so GDT and IDT setup still come first in effect): the origin of both the
+boot timeline and the log's timestamps. The pinned Limine crate has no
+bootloader-performance request, so the bootloader's own time isn't counted.
+Each phase records a `BootPhase` trace event when it ends: entry, arch-init,
+logger, symbols, memory, stacks, acpi, interrupts, time (calibration,
+interrupts on, the first tick), framebuffer, complete. After `boot complete`
+the kernel prints them from the ring, converted with the calibrated TSC:
+
+```
+[    0.139423] INFO  boot: timeline: entry +0.000 ms, arch-init +0.145 ms, ..., complete +139.382 ms (total 139.382 ms)
+```
+
+(a missing phase is named as missing). Serial log lines start with the
+time since that origin, `[seconds.microseconds]`; lines before the TSC is
+calibrated (most of boot) show `[    ?.??????]`, not a zero that would read
+as a measurement. The screen's console shows lines without timestamps, so
+screenshots stay comparable.
 
 ### ACPI (built in M1)
 
@@ -724,15 +745,19 @@ kernel. The kernel is the trusted computing base.
   `ktest:lumen_kernel::trace::trace_overhead_is_small` (tens of TSC ticks
   under TCG locally; TCG's TSC rate depends on the host, so this is not
   comparable across machines or to cycles). Timestamps are raw TSC ticks
-  until #8 converts them with the TSC frequency `time` calibrates. `kmon`'s
+  (the boot timeline converts its phases; kmon and crash reports show them
+  raw). `kmon`'s
   `trace [n]` prints the newest events (a gap line says why an event is
   missing), and the serial crash report includes the last 16
   events (tested for a page fault and a panic).
-- **Boot timeline:** boot phases emit trace events. The fast-boot target is
-  under 1 s from bootloader handoff to the shell, measured in the guest from TSC
-  timestamps (never by host wall-clock time in tests).
-- **Logger:** `log` facade with level and subsystem tags (built). Every
-  emitted log line also records a `Log` trace event (level, tag).
+- **Boot timeline:** boot phases emit trace events, printed as a timeline at
+  boot complete (section 4). The fast-boot target is under 1 s from kernel
+  entry to the shell, measured in the guest from TSC timestamps (never by
+  host wall-clock time in tests); about 140 ms under TCG today, most of it
+  calibrating the TSC and the timer.
+- **Logger:** `log` facade with level and subsystem tags, and on serial a
+  timestamp since kernel entry (built). Every emitted log line also records
+  a `Log` trace event (level, tag).
 - **Learning:** `explain <subsystem>` and a guided tour link each subsystem to
   its source and docs inside the OS (M5+).
 

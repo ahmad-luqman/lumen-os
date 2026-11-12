@@ -106,7 +106,9 @@ own PR that updates that doc first.
   code, using `kassert!` and `kassert_eq!`. No central list; tests register
   through the `.ktests` linker section.
 - **Logs** that tests match on (e.g. `INFO  boot: boot complete`) are an
-  interface: change the test in the same PR.
+  interface: change the test in the same PR. On serial each line starts
+  with a timestamp (`[    0.139288] `, or `[    ?.??????] ` before the TSC is
+  calibrated): match the rest of the line, not its start.
 - **QEMU exit codes:** 33 pass, 35 test failure, 37 crash report; anything else
   (including 0 from a triple fault with `-no-reboot`) is a failure.
 - **Golden images** live in `tests/golden/`. Re-record with `make golden` only
