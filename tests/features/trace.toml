@@ -1,0 +1,18 @@
+# Features: kernel tracing. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Lock-free trace ring buffer: boot phases, exceptions and log lines recorded"
+milestone = "M1"
+tests = [
+    "cargo:lumen-trace",
+    "ktest:lumen_kernel::trace::events_recorded_in_order",
+    "ktest:lumen_kernel::trace::boot_phases_recorded_in_order",
+    "ktest:lumen_kernel::trace::exceptions_and_logs_are_traced",
+    "ktest:lumen_kernel::trace::trace_overhead_is_small",
+    "scenario:test_trace::test_trace_command_shows_every_event_since_boot",
+    "scenario:test_trace::test_trace_defaults_and_usage",
+    "scenario:test_trace::test_exception_appears_in_trace",
+    "scenario:test_crash::test_report_shows_the_trace_events_leading_up_to_it",
+    "scenario:test_crash::test_panic_report_trace_ends_with_the_panic",
+    "ktest:lumen_kernel::trace::describe_prints_unknown_values_raw",
+]

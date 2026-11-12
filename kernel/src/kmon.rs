@@ -61,6 +61,7 @@ fn dispatch(line: &str) {
                 "commands:\n  help              this list\n  echo <text>       print text\n  \
                  int3              take a breakpoint and continue\n  \
                  crash <kind>      deliberate fault: pf ud de gp df panic\n  \
+                 trace [n]         the last n trace events (default 16)\n  \
                  exit              end QEMU (only with lumen.qemu_exit)"
             );
         }
@@ -74,6 +75,15 @@ fn dispatch(line: &str) {
             let _ = writeln!(out, "breakpoints taken: {n}");
         }
         "crash" => crash(rest.trim()),
+        "trace" => match rest.trim() {
+            "" => trace(16),
+            arg => match arg.parse() {
+                Ok(n) => trace(n),
+                Err(_) => {
+                    let _ = writeln!(out, "usage: trace [n]");
+                }
+            },
+        },
         "exit" => {
             if crate::cmdline::qemu_exit_enabled() {
                 arch::qemu::exit(arch::qemu::ExitCode::Success);
@@ -84,6 +94,17 @@ fn dispatch(line: &str) {
             let _ = writeln!(out, "unknown command: {cmd} (try 'help')");
         }
     }
+}
+
+fn trace(n: u64) {
+    let mut out = serial::SerialWriter;
+    let ring = crate::trace::ring();
+    let cap = ring.capacity() as u64;
+    if n > cap {
+        let _ = writeln!(out, "(the ring holds {cap} events; showing those)");
+    }
+    let _ = crate::trace::write_recent(&mut out, n, "");
+    let _ = writeln!(out, "trace: {} events claimed, {} dropped", ring.written(), ring.dropped());
 }
 
 fn crash(kind: &str) {

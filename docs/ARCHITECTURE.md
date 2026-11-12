@@ -402,17 +402,32 @@ kernel. The kernel is the trusted computing base.
 - **Kill switch:** pause and stop for any lane, effective immediately
   (capabilities revoked, process suspended).
 
-## 14. Observability (planned, M1 and M5)
+## 14. Observability (M1 and M5)
 
-- **Trace ring buffer:** per-CPU, fixed-size binary events (timestamp, CPU,
-  pid, event id, 4 arguments) written lock-free. It is always on and costs a
-  few nanoseconds per event. Events include scheduler switches, syscalls,
-  interrupts, page faults, allocator activity and boot phases.
+- **Trace ring buffer (built):** fixed-size binary events (timestamp, CPU,
+  pid, kind, 4 arguments) in a lock-free ring that overwrites the oldest
+  (`crates/lumen-trace`, host-tested; `kernel/src/trace.rs`, `ktrace!`). Each
+  slot is a small seqlock: writers claim it by compare-and-swap and drop
+  their event (counted) rather than wait if it is busy, so recording never
+  blocks, even from an exception handler that interrupted another record
+  (simulated in host tests; not yet exercised in the kernel); readers skip
+  events that change while they copy them, so they never see a torn event.
+  Events are in `seq` order; timestamps can be out of order across nested
+  writers. One 4096-event ring now (one CPU); one per CPU with SMP (#9).
+  Recorded so far: boot phases, exceptions (every vector entering the IDT
+  dispatcher), log lines. Later: scheduler switches, syscalls, interrupts,
+  page faults, allocator activity. Cost per event is printed by
+  `ktest:lumen_kernel::trace::trace_overhead_is_small` (tens of TSC ticks
+  under TCG locally; TCG's TSC rate depends on the host, so this is not
+  comparable across machines or to cycles). Timestamps are raw TSC ticks until
+  #7/#8. `kmon`'s `trace [n]` prints the newest events (a gap line says why
+  an event is missing), and the serial crash report ends with the last 16
+  events (tested for a page fault and a panic).
 - **Boot timeline:** boot phases emit trace events. The fast-boot target is
   under 1 s from bootloader handoff to the shell, measured in the guest from TSC
   timestamps (never by host wall-clock time in tests).
-- **Logger:** `log` facade with level and subsystem tags (built). It will also
-  feed the ring buffer.
+- **Logger:** `log` facade with level and subsystem tags (built). Every
+  emitted log line also records a `Log` trace event (level, tag).
 - **Learning:** `explain <subsystem>` and a guided tour link each subsystem to
   its source and docs inside the OS (M5+).
 

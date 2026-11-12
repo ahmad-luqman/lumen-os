@@ -35,12 +35,17 @@ dependencies = [
  "log",
  "lumen-elf",
  "lumen-mm",
+ "lumen-trace",
  "noto-sans-mono-bitmap",
  "rustc-demangle",
 ]
 
 [[package]]
 name = "lumen-mm"
+version = "0.0.1"
+
+[[package]]
+name = "lumen-trace"
 version = "0.0.1"
 
 [[package]]

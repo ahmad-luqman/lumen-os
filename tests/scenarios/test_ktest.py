@@ -1,5 +1,7 @@
 """Run the in-kernel test suite (`--features ktest`) and check its TAP output."""
 
+import re
+
 from lumen_harness import BUILD_DIR, tap
 from lumen_harness.qemu import EXIT_CRASH, EXIT_SUCCESS
 
@@ -22,3 +24,7 @@ def test_in_kernel_tests_pass(boot):
     assert report.all_passed, report.summary()
     assert code == EXIT_SUCCESS, f"QEMU exit {code}, expected {EXIT_SUCCESS}"
     assert len(report.cases) >= 7
+    # Issue #3: the trace cost per event is printed as a TAP diagnostic.
+    assert re.search(r"^# trace: \d+ TSC ticks per event", out, re.MULTILINE), (
+        "no trace cost diagnostic"
+    )

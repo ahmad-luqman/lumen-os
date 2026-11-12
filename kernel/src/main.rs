@@ -22,8 +22,10 @@ mod ktest;
 mod mm;
 mod symbols;
 mod sync;
+mod trace;
 
 use log::{LevelFilter, info, warn};
+use trace::{BootPhase, Kind};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -46,6 +48,7 @@ extern "C" fn _start() -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn kmain(stack_top: u64) -> ! {
     arch::init_early();
+    ktrace!(Kind::BootPhase, BootPhase::ArchInit);
     // Only claim the size we asked for if Limine confirms it: the frame
     // allocator reserves this range and the crash reporter walks it.
     let stack_size =
@@ -57,6 +60,7 @@ extern "C" fn kmain(stack_top: u64) -> ! {
     }
     let level = cmdline::value("lumen.log").and_then(klog::parse_level).unwrap_or(LevelFilter::Info);
     klog::init(level);
+    ktrace!(Kind::BootPhase, BootPhase::Logger);
     info!(target: "boot", "Lumen {VERSION} (x86_64) booting");
     info!(target: "boot", "cmdline: '{}'", cmdline::get());
 
@@ -74,6 +78,7 @@ extern "C" fn kmain(stack_top: u64) -> ! {
         },
         None => warn!(target: "boot", "no executable file response; crash reports unsymbolized"),
     }
+    ktrace!(Kind::BootPhase, BootPhase::Symbols);
 
     if let Some(addr) = boot::EXECUTABLE_ADDRESS.get_response() {
         info!(target: "boot", "kernel at phys {:#x} virt {:#x}", addr.physical_base(), addr.virtual_base());
@@ -83,6 +88,7 @@ extern "C" fn kmain(stack_top: u64) -> ! {
     }
     log_memory_map();
     mm::init();
+    ktrace!(Kind::BootPhase, BootPhase::Memory);
 
     match boot::FRAMEBUFFER.get_response().and_then(|r| r.framebuffers().next()) {
         Some(fb) => match fb::init(&fb) {
@@ -91,8 +97,10 @@ extern "C" fn kmain(stack_top: u64) -> ! {
         },
         None => warn!(target: "fb", "no framebuffer"),
     }
+    ktrace!(Kind::BootPhase, BootPhase::Framebuffer);
 
     info!(target: "boot", "boot complete");
+    ktrace!(Kind::BootPhase, BootPhase::Complete);
     after_boot()
 }
 
