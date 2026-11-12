@@ -13,4 +13,6 @@ tests = [
     "scenario:test_trace::test_trace_defaults_and_usage",
     "scenario:test_trace::test_exception_appears_in_trace",
     "scenario:test_crash::test_report_shows_the_trace_events_leading_up_to_it",
+    "scenario:test_crash::test_panic_report_trace_ends_with_the_panic",
+    "ktest:lumen_kernel::trace::describe_prints_unknown_values_raw",
 ]

@@ -9,7 +9,7 @@
 
 use core::fmt;
 
-use lumen_trace::{Event, TraceRing};
+use lumen_trace::{Event, Missing, TraceRing};
 
 use crate::arch;
 
@@ -18,7 +18,7 @@ pub const EVENTS: usize = 4096;
 
 static RING: TraceRing<EVENTS> = TraceRing::new();
 
-/// What an event records. Stored as the event's `kind` (0 is never used).
+/// What an event records. Stored as the event's `kind`. Values start at 1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
 pub enum Kind {
@@ -33,14 +33,15 @@ pub enum Kind {
     /// tag's first 8 bytes, little-endian (longer tags are cut). Only lines
     /// that pass the log-level filter are recorded.
     Log = 3,
+    /// A panic is being reported; `args[0]`: the source line, if known.
+    Panic = 4,
     /// Recorded by in-kernel tests.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
     Test = 0xff,
 }
 
-#[cfg_attr(feature = "ktest", allow(dead_code))] // used by kmon's `trace` and crash reports
 impl Kind {
-    const ALL: [Kind; 4] = [Kind::BootPhase, Kind::Exception, Kind::Log, Kind::Test];
+    // Keep in step with the enum: a kind missing here prints as a raw number.
+    const ALL: [Kind; 5] = [Kind::BootPhase, Kind::Exception, Kind::Log, Kind::Panic, Kind::Test];
 
     fn from_raw(raw: u16) -> Option<Kind> {
         Self::ALL.into_iter().find(|&k| k as u16 == raw)
@@ -51,6 +52,7 @@ impl Kind {
             Kind::BootPhase => "boot-phase",
             Kind::Exception => "exception",
             Kind::Log => "log",
+            Kind::Panic => "panic",
             Kind::Test => "test",
         }
     }
@@ -70,7 +72,6 @@ pub enum BootPhase {
 }
 
 impl BootPhase {
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // checked by ktests; #8 prints the timeline
     pub const ALL: [BootPhase; 6] = [
         BootPhase::ArchInit,
         BootPhase::Logger,
@@ -80,12 +81,10 @@ impl BootPhase {
         BootPhase::Complete,
     ];
 
-    #[cfg_attr(feature = "ktest", allow(dead_code))] // used by kmon's `trace` and crash reports
     fn from_raw(raw: u64) -> Option<BootPhase> {
         Self::ALL.into_iter().find(|&p| p as u64 == raw)
     }
 
-    #[cfg_attr(feature = "ktest", allow(dead_code))] // used by kmon's `trace` and crash reports
     fn name(self) -> &'static str {
         match self {
             BootPhase::ArchInit => "arch-init",
@@ -142,62 +141,96 @@ pub fn pack_tag(tag: &str) -> u64 {
 }
 
 /// One event as a line of text: `#seq tsc=<ticks> kind details`. Values it
-/// doesn't recognise are printed raw rather than hidden.
-#[cfg_attr(feature = "ktest", allow(dead_code))] // used by kmon's `trace` and crash reports
+/// doesn't recognise are printed raw rather than hidden, and a non-zero cpu
+/// or pid is shown.
 pub struct Describe<'a>(pub &'a Event);
 
 impl fmt::Display for Describe<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let e = self.0;
-        let kind = Kind::from_raw(e.kind);
         write!(f, "#{:<6} tsc={:<14} ", e.seq, e.tsc)?;
-        match kind {
-            Some(k) => write!(f, "{:<10}", k.name())?,
-            None => write!(f, "kind={:#06x}", e.kind)?,
+        if e.cpu != 0 || e.pid != 0 {
+            write!(f, "cpu={} pid={} ", e.cpu, e.pid)?;
         }
+        let a = e.args;
+        let Some(kind) = Kind::from_raw(e.kind) else {
+            return write!(f, "kind={:#06x} args=[{:#x}, {:#x}, {:#x}, {:#x}]", e.kind, a[0], a[1], a[2], a[3]);
+        };
+        write!(f, "{:<10}", kind.name())?;
         match kind {
-            Some(Kind::BootPhase) => match BootPhase::from_raw(e.args[0]) {
+            Kind::BootPhase => match BootPhase::from_raw(a[0]) {
                 Some(p) => write!(f, " {}", p.name()),
-                None => write!(f, " phase={}", e.args[0]),
+                None => write!(f, " phase={}", a[0]),
             },
-            Some(Kind::Exception) => {
-                write!(f, " vector={} rip={:#x} error={:#x}", e.args[0], e.args[1], e.args[2])
-            }
-            Some(Kind::Log) => {
-                match log::Level::iter().find(|&l| l as u64 == e.args[0]) {
+            Kind::Exception => write!(f, " vector={} rip={:#x} error={:#x}", a[0], a[1], a[2]),
+            Kind::Log => {
+                match log::Level::iter().find(|&l| l as u64 == a[0]) {
                     Some(level) => write!(f, " {level}")?,
-                    None => write!(f, " level={}", e.args[0])?,
+                    None => write!(f, " level={}", a[0])?,
                 }
-                let tag = e.args[1].to_le_bytes();
+                let tag = a[1].to_le_bytes();
                 match core::str::from_utf8(&tag) {
                     Ok(t) => write!(f, " {}", t.trim_end_matches('\0')),
-                    Err(_) => write!(f, " tag={:#x}", e.args[1]),
+                    Err(_) => write!(f, " tag={:#x}", a[1]),
                 }
             }
-            Some(Kind::Test) | None => write!(f, " args={:#x?}", e.args),
+            Kind::Panic => write!(f, " line={}", a[0]),
+            Kind::Test => write!(f, " args=[{:#x}, {:#x}, {:#x}, {:#x}]", a[0], a[1], a[2], a[3]),
         }
     }
 }
 
 /// Print the newest `n` events of the current CPU's ring, oldest first, one
-/// per line with `indent`; gaps say why an event is missing. Lock-free, so
-/// the crash reporter can use it.
-#[cfg_attr(feature = "ktest", allow(dead_code))] // used by kmon's `trace` and crash reports
+/// per line with `indent`; a gap says why that event is missing. Lock-free,
+/// so the crash reporter can use it.
 pub fn write_recent(w: &mut dyn fmt::Write, n: u64, indent: &str) -> fmt::Result {
     let ring = ring();
     let head = ring.written();
-    let cap = ring.capacity() as u64;
-    let from = head.saturating_sub(n.min(cap));
-    for seq in from..head {
-        match ring.read(seq) {
-            Some(e) => writeln!(w, "{indent}{}", Describe(&e))?,
-            // Older than the ring's capacity: overwritten. Otherwise the
-            // writer dropped it, or is (or was interrupted) mid-write.
-            None if seq + cap < head => writeln!(w, "{indent}#{seq:<6} (overwritten)")?,
-            None => writeln!(w, "{indent}#{seq:<6} (dropped or being written)")?,
-        }
+    for seq in head.saturating_sub(n.min(ring.capacity() as u64))..head {
+        let why = match ring.try_read(seq) {
+            Ok(e) => {
+                writeln!(w, "{indent}{}", Describe(&e))?;
+                continue;
+            }
+            Err(Missing::Overwritten) => "overwritten",
+            Err(Missing::BeingWritten) => "being written",
+            Err(Missing::NotRecorded) => "dropped or not yet written",
+            Err(Missing::NotClaimed) => "not claimed",
+        };
+        writeln!(w, "{indent}#{seq:<6} ({why})")?;
     }
     Ok(())
+}
+
+/// A fixed buffer to format into (no heap); for tests.
+#[cfg(feature = "ktest")]
+struct Line {
+    buf: [u8; 160],
+    len: usize,
+}
+
+#[cfg(feature = "ktest")]
+impl fmt::Write for Line {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len + s.len();
+        self.buf.get_mut(self.len..end).ok_or(fmt::Error)?.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ktest")]
+fn describe(e: &Event) -> Line {
+    let mut line = Line { buf: [0; 160], len: 0 };
+    let _ = fmt::Write::write_fmt(&mut line, format_args!("{}", Describe(e)));
+    line
+}
+
+#[cfg(feature = "ktest")]
+impl Line {
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("<invalid utf-8>")
+    }
 }
 
 crate::ktest!(
@@ -290,6 +323,35 @@ crate::ktest!(
         // a host clock, not guest cycles.
         crate::kassert!(per_event > 0 && per_event < 5_000);
         crate::kassert_eq!(BENCH.dropped(), 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn describe_prints_unknown_values_raw() {
+        use crate::kassert;
+        let base = Event { seq: 7, tsc: 99, ..Event::default() };
+        let cases: [(Event, &str); 6] = [
+            (Event { kind: 0x99, args: [1, 2, 3, 4], ..base }, "kind=0x0099 args=[0x1, 0x2, 0x3, 0x4]"),
+            (Event { kind: Kind::BootPhase as u16, args: [42, 0, 0, 0], ..base }, "boot-phase phase=42"),
+            (Event { kind: Kind::Log as u16, args: [9, pack_tag("mem"), 0, 0], ..base }, "log        level=9 mem"),
+            (Event { kind: Kind::Log as u16, args: [1, 0xff, 0, 0], ..base }, "log        ERROR tag=0xff"),
+            (
+                Event { kind: Kind::Test as u16, args: [0x7e57, 1, 2, 0], ..base },
+                "test       args=[0x7e57, 0x1, 0x2, 0x0]",
+            ),
+            (Event { cpu: 2, pid: 5, kind: Kind::Panic as u16, args: [12, 0, 0, 0], ..base }, "cpu=2 pid=5 panic"),
+        ];
+        for (e, want) in cases {
+            let line = describe(&e);
+            if !line.as_str().contains(want) || line.as_str().contains('\n') {
+                crate::ktest::diag(format_args!("got {:?}, want it to contain {want:?}", line.as_str()));
+                return Err("an event was described wrongly");
+            }
+        }
+        kassert!(
+            describe(&Event { kind: Kind::Panic as u16, args: [12, 0, 0, 0], ..base }).as_str().ends_with("line=12")
+        );
         Ok(())
     }
 );

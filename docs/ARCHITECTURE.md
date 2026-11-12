@@ -418,10 +418,11 @@ kernel. The kernel is the trusted computing base.
   dispatcher), log lines. Later: scheduler switches, syscalls, interrupts,
   page faults, allocator activity. Cost per event is printed by
   `ktest:lumen_kernel::trace::trace_overhead_is_small` (tens of TSC ticks
-  locally; under TCG the TSC follows a host clock, not guest cycles, so it is
-  an order of magnitude). Timestamps are raw TSC ticks until #7/#8. `kmon`'s
-  `trace [n]` prints the newest events, and every crash report ends with the
-  last 16.
+  under TCG locally; TCG's TSC rate depends on the host, so this is not
+  comparable across machines or to cycles). Timestamps are raw TSC ticks until
+  #7/#8. `kmon`'s `trace [n]` prints the newest events (a gap line says why
+  an event is missing), and the serial crash report ends with the last 16
+  events (tested for a page fault and a panic).
 - **Boot timeline:** boot phases emit trace events. The fast-boot target is
   under 1 s from bootloader handoff to the shell, measured in the guest from TSC
   timestamps (never by host wall-clock time in tests).

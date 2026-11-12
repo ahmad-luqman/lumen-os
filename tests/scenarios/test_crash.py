@@ -66,6 +66,14 @@ def test_report_shows_the_trace_events_leading_up_to_it(boot):
     assert len(lines) == 16, trace
     # The last thing recorded before the report is the fault itself.
     assert re.match(r"exception +vector=14 rip=0x[0-9a-f]+ error=0x2$", lines[-1]), trace
+    assert re.search(r"^trace: \d+ events claimed, 0 dropped$", trace, re.MULTILINE), trace
+
+
+def test_panic_report_trace_ends_with_the_panic(boot):
+    report = crash(boot, "panic")
+    trace = report[report.index("recent trace events (oldest first):") :]
+    lines = re.findall(r"^  #\d+ +tsc=\d+ +(\S+.*)$", trace, re.MULTILINE)
+    assert re.match(r"panic +line=\d+$", lines[-1]), trace
 
 
 def test_page_fault_report_names_address_and_cause(boot):

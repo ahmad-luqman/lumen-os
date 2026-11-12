@@ -29,9 +29,9 @@
 //! writer either.
 //!
 //! Events are ordered by `seq`. Their timestamps usually are too, but not
-//! always: if an interrupt records an event between another writer reading
-//! its timestamp and claiming its `seq`, the two come out in opposite
-//! orders. Consumers that need time order sort by `tsc`.
+//! always: if an interrupt (or another CPU's writer) records an event between
+//! another writer reading its timestamp and claiming its `seq`, the two come
+//! out in opposite orders. Consumers that need time order sort by `tsc`.
 //!
 //! The event words are atomics (relaxed loads and stores), which is what
 //! makes the concurrent reads well-defined in Rust's memory model; on x86-64
@@ -43,7 +43,7 @@
 //!
 //! The protocol logic is tested on any host; the memory orderings are only
 //! exercised on weakly ordered hardware (arm64). On x86-64 (TSO) the fences
-//! cost nothing and a missing one would not show up in tests.
+//! cost nothing and a missing one is unlikely to show up in tests.
 //!
 //! This crate is `no_std` and has host-side tests (`cargo test -p lumen-trace`).
 
@@ -61,13 +61,26 @@ pub struct Event {
     pub tsc: u64,
     /// The CPU that recorded it.
     pub cpu: u16,
-    /// What happened; the kernel defines the values (0 is never used, so a
-    /// zeroed `Event` is never mistaken for a real one).
+    /// What happened; the kernel defines the values.
     pub kind: u16,
     /// The process it happened in (0: the kernel).
     pub pid: u32,
     /// Meaning depends on `kind`.
     pub args: [u64; 4],
+}
+
+/// Why an event can't be read ([`TraceRing::try_read`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Missing {
+    /// No event with this sequence number has been claimed yet.
+    NotClaimed,
+    /// Its writer dropped it (the slot was busy), or has claimed the
+    /// sequence number but not yet the slot.
+    NotRecorded,
+    /// Its writer is storing it right now (or was interrupted doing so).
+    BeingWritten,
+    /// A newer event has taken its slot.
+    Overwritten,
 }
 
 const WORDS: usize = 6;
@@ -93,8 +106,9 @@ const fn complete(seq: u64) -> u64 {
 }
 
 /// A ring of `N` event slots. Newer events overwrite the oldest. `N` must be
-/// a power of two: `seq % N` is then a mask, and it divides 2^64, so slots
-/// stay in step even if `seq` ever wrapped.
+/// a power of two (so `seq % N` is a mask) and non-zero. Sequence numbers
+/// are assumed never to reach 2^63 (the stamps are `2 * seq + 2`): centuries
+/// at any realistic event rate.
 pub struct TraceRing<const N: usize> {
     /// Sequence number of the next event (= events ever claimed).
     head: AtomicU64,
@@ -166,13 +180,24 @@ impl<const N: usize> TraceRing<N> {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// Event `seq`, if it is still in the ring and was completely written
-    /// (`None` if it was never written, dropped, overwritten, or is still
-    /// being written).
+    /// Event `seq`, if it is still in the ring and was completely written;
+    /// [`try_read`](Self::try_read) says why not.
     pub fn read(&self, seq: u64) -> Option<Event> {
+        self.try_read(seq).ok()
+    }
+
+    /// Event `seq`, or why it can't be read. The reason comes from the
+    /// slot's stamp, so it reflects the slot at the moment of reading. (A
+    /// writer that dropped its event because the slot already held a newer
+    /// one shows as `Overwritten`.)
+    pub fn try_read(&self, seq: u64) -> Result<Event, Missing> {
+        if seq >= self.written() {
+            return Err(Missing::NotClaimed);
+        }
         let slot = &self.slots[seq as usize % N];
-        if slot.stamp.load(Ordering::Acquire) != complete(seq) {
-            return None;
+        let stamp = slot.stamp.load(Ordering::Acquire);
+        if stamp != complete(seq) {
+            return Err(Self::why_missing(seq, stamp));
         }
         let mut w = [0; WORDS];
         for (dst, src) in w.iter_mut().zip(&slot.words) {
@@ -180,10 +205,11 @@ impl<const N: usize> TraceRing<N> {
         }
         // Keep the word loads before the second stamp read (seqlock reader).
         fence(Ordering::Acquire);
-        if slot.stamp.load(Ordering::Relaxed) != complete(seq) {
-            return None; // overwritten while we copied
+        let again = slot.stamp.load(Ordering::Relaxed);
+        if again != complete(seq) {
+            return Err(Self::why_missing(seq, again)); // overwritten while we copied
         }
-        Some(Event {
+        Ok(Event {
             seq,
             tsc: w[0],
             cpu: w[1] as u16,
@@ -193,11 +219,24 @@ impl<const N: usize> TraceRing<N> {
         })
     }
 
-    /// Copy the newest events, oldest first, into `out` (at most
-    /// `out.len()`, at most `N`); returns how many were copied. Events that
-    /// are overwritten or still being written while it runs are skipped, so
-    /// the result may have gaps in `seq` but is always in order and never
-    /// torn.
+    /// Why claimed event `seq` isn't readable, given its slot's stamp.
+    fn why_missing(seq: u64, stamp: u64) -> Missing {
+        if stamp == writing(seq) {
+            Missing::BeingWritten
+        } else if stamp > complete(seq) {
+            Missing::Overwritten
+        } else {
+            // The slot still holds (or is writing) an older event: this
+            // event's writer dropped it, or hasn't claimed the slot yet.
+            Missing::NotRecorded
+        }
+    }
+
+    /// Copy the newest events, oldest first, into `out`; returns how many
+    /// were copied. Of the newest `min(out.len(), N)` sequence numbers, those
+    /// dropped, overwritten or still being written are skipped (not replaced
+    /// by older events), so the result may have gaps in `seq` but is always
+    /// in order and never torn.
     pub fn snapshot(&self, out: &mut [Event]) -> usize {
         let head = self.written();
         let want = out.len().min(N) as u64;
@@ -225,6 +264,22 @@ mod tests {
         [x, !x, x.wrapping_mul(0x9e37_79b9_7f4a_7c15), x ^ 0xdead_beef]
     }
 
+    /// Sets the flag when dropped, so reader threads stop even if the writer
+    /// panics on a failed assert (otherwise `thread::scope` waits forever
+    /// and the test hangs instead of failing).
+    struct StopOnDrop<'a>(&'a AtomicBool);
+
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// Record an event whose every field derives from `x` (see `consistent`).
+    fn record_derived<const N: usize>(ring: &TraceRing<N>, x: u64, cpu: u16) -> Option<u64> {
+        ring.record(x, cpu, (x >> 32) as u16, x as u32, args_for(x))
+    }
+
     fn consistent(e: &Event) -> bool {
         e.args == args_for(e.tsc) && e.pid == e.tsc as u32 && e.kind == (e.tsc >> 32) as u16
     }
@@ -238,6 +293,26 @@ mod tests {
         let e = ring.read(0).unwrap();
         assert_eq!(e, Event { seq: 0, tsc: 123, cpu: 7, kind: 0xbeef, pid: 0xdead_cafe, args: [1, 2, 3, u64::MAX] });
         assert_eq!((ring.written(), ring.dropped()), (1, 0));
+    }
+
+    #[test]
+    fn try_read_says_why_an_event_is_missing() {
+        let ring = TraceRing::<4>::new();
+        assert_eq!(ring.try_read(0), Err(Missing::NotClaimed));
+        assert_eq!(ring.try_read(u64::MAX), Err(Missing::NotClaimed), "no overflow at the top");
+        for i in 0..6u64 {
+            let _ = ring.record(i, 0, 1, 0, [0; 4]);
+        }
+        assert_eq!(ring.try_read(1), Err(Missing::Overwritten), "event 5 took slot 1");
+        assert_eq!(ring.try_read(5).map(|e| e.tsc), Ok(5));
+        // Event 6 is claimed, but its writer is mid-write.
+        ring.head.store(7, Ordering::Relaxed);
+        ring.slots[2].stamp.store(writing(6), Ordering::Relaxed);
+        assert_eq!(ring.try_read(6), Err(Missing::BeingWritten));
+        // Event 7 was dropped: slot 3 still holds event 3.
+        ring.head.store(8, Ordering::Relaxed);
+        assert_eq!(ring.try_read(7), Err(Missing::NotRecorded));
+        assert_eq!(ring.try_read(3), Ok(ring.read(3).unwrap()));
     }
 
     #[test]
@@ -299,6 +374,7 @@ mod tests {
         assert_eq!(ring.record(55, 0, 0, 0, [5; 4]), Some(5));
         ring.head.store(1, Ordering::Relaxed);
         assert_eq!(ring.record(11, 0, 0, 0, [1; 4]), None);
+        ring.head.store(6, Ordering::Relaxed); // undo the test's rewind
         assert_eq!(ring.read(5).map(|e| e.tsc), Some(55));
     }
 
@@ -337,11 +413,12 @@ mod tests {
                 })
                 .collect();
             start.wait();
+            let stop = StopOnDrop(&done);
             for i in 0..EVENTS {
-                let r = ring.record(i, 1, (i >> 32) as u16, i as u32, args_for(i));
+                let r = record_derived(&ring, i, 1);
                 assert_eq!(r, Some(i), "a single writer never drops");
             }
-            done.store(true, Ordering::Release);
+            drop(stop);
             readers.into_iter().map(|r| r.join().unwrap()).sum::<usize>()
         });
         assert!(seen > 0, "readers saw events");
@@ -350,8 +427,10 @@ mod tests {
 
     /// Several writers at once (as on different CPUs sharing a ring; this
     /// approximates, but does not model, an interrupt nesting inside a
-    /// record) plus a reader: the reader never sees a torn event, and once the
-    /// writers stop the newest events are readable or counted as dropped.
+    /// record) plus a reader: the reader never sees a torn event. Once the
+    /// writers stop, the newest events missing are at most the drop count (a
+    /// coarse check; exact accounting is in
+    /// `contended_slot_stamp_never_goes_backwards`).
     #[test]
     fn concurrent_writers_never_tear_events() {
         const PER_WRITER: u64 = 100_000;
@@ -379,15 +458,16 @@ mod tests {
                         start.wait();
                         for i in 0..PER_WRITER {
                             let x = w << 40 | i;
-                            let _ = ring.record(x, w as u16, (x >> 32) as u16, x as u32, args_for(x));
+                            let _ = record_derived(ring, x, w as u16);
                         }
                     })
                 })
                 .collect();
+            let stop = StopOnDrop(&done);
             for w in writers {
                 w.join().unwrap();
             }
-            done.store(true, Ordering::Release);
+            drop(stop);
             reader.join().unwrap();
         });
         assert_eq!(ring.written(), 4 * PER_WRITER);
@@ -424,15 +504,16 @@ mod tests {
                 });
             }
             start.wait();
+            let _stop = StopOnDrop(&done);
             for i in 0..EVENTS {
-                assert_eq!(ring.record(i, 1, (i >> 32) as u16, i as u32, args_for(i)), Some(i));
+                assert_eq!(record_derived(&ring, i, 1), Some(i));
             }
-            done.store(true, Ordering::Relaxed);
         });
     }
 
     /// Writers fight over a single slot, so compare-and-swap failures (the
-    /// stamp changed between the load and the claim) really happen. The
+    /// stamp changed between the load and the claim) are frequent (the test
+    /// asserts only that writers collided: `dropped() > 0`). The
     /// stamp must never go backwards (a stale writer overwriting a newer
     /// event), and every claimed event is accounted for: recorded or dropped.
     #[test]
@@ -456,18 +537,12 @@ mod tests {
                     let (ring, start) = (&ring, &start);
                     s.spawn(move || {
                         start.wait();
-                        (0..PER_WRITER)
-                            .filter(|i| {
-                                let x = w << 40 | i;
-                                ring.record(x, w as u16, (x >> 32) as u16, x as u32, args_for(x)).is_some()
-                            })
-                            .count() as u64
+                        (0..PER_WRITER).filter(|i| record_derived(ring, w << 40 | i, w as u16).is_some()).count() as u64
                     })
                 })
                 .collect();
-            let n = writers.into_iter().map(|w| w.join().unwrap()).sum::<u64>();
-            done.store(true, Ordering::Relaxed);
-            n
+            let _stop = StopOnDrop(&done);
+            writers.into_iter().map(|w| w.join().unwrap()).sum::<u64>()
         });
         assert_eq!(recorded + ring.dropped(), ring.written(), "every claimed event is recorded or dropped");
         assert!(ring.dropped() > 0, "the writers collided");

@@ -12,7 +12,8 @@
 //! with the `lumen_kernel::` prefix removed. The level threshold comes from
 //! `lumen.log=<level>` on the command line (default `info`).
 //!
-//! M1 adds the trace ring buffer behind this; the format stays the same.
+//! Every emitted line also records a `Log` event in the trace ring
+//! (`crate::trace`); the text format is unchanged.
 
 use crate::arch::serial::SerialWriter;
 use crate::sync::SpinLock;

@@ -3,7 +3,8 @@
 //! Signature feature 5: no silent triple faults. The report goes to serial
 //! (for the test harness and `make run` logs) and to the screen, and contains
 //! the exception, decoded error code, faulting address, registers, and a
-//! symbolized frame-pointer backtrace.
+//! symbolized frame-pointer backtrace; on serial only, it ends with the last
+//! 16 trace events (what led up to it).
 //!
 //! The reporter must not make things worse: it takes no locks it could
 //! deadlock on, follows a frame pointer only if it points into a known stack
@@ -52,6 +53,7 @@ pub fn exception(frame: &TrapFrame) -> ! {
 /// Report a Rust panic and stop.
 pub fn panic(info: &PanicInfo<'_>) -> ! {
     enter(u64::MAX, 0);
+    crate::ktrace!(crate::trace::Kind::Panic, info.location().map_or(0, |l| l.line()));
     let rbp = arch::read_rbp();
     emit(&|w: &mut dyn Write| {
         let _ = writeln!(w, "panic: {}", info.message());
@@ -78,8 +80,11 @@ fn emit(body: &dyn Fn(&mut dyn Write)) {
     body(&mut s);
     // What led up to it (serial only: the screen has no room). The ring is
     // lock-free, so reading it here can't deadlock.
+    // (SerialWriter never fails, so nothing is cut short silently.)
+    let ring = crate::trace::ring();
     let _ = writeln!(s, "recent trace events (oldest first):");
     let _ = crate::trace::write_recent(&mut s, RECENT_TRACE_EVENTS, "  ");
+    let _ = writeln!(s, "trace: {} events claimed, {} dropped", ring.written(), ring.dropped());
     let _ = writeln!(s, "{END_MARKER}");
     // Serial first: if drawing the screen faults, the serial report survives.
     // SAFETY: we are on the crash path; CRASHING guarantees we run alone.
