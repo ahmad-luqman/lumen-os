@@ -18,6 +18,7 @@ ktest = []
 
 [dependencies]
 lumen-elf.workspace = true
+lumen-heap.workspace = true
 lumen-mm.workspace = true
 lumen-trace.workspace = true
 limine.workspace = true

@@ -43,9 +43,11 @@ impl<T> SpinLock<T> {
     /// Access the value even if the lock is held.
     ///
     /// # Safety
-    /// Only for the crash reporter, which must print even when the crash
-    /// happened while the lock was held. The caller guarantees no other code
-    /// runs concurrently (the CPU is about to halt).
+    /// For the crash reporter, which must print even when the crash happened
+    /// while the lock was held, and for tests that hold the lock without
+    /// touching the value. The caller guarantees no other code uses the value
+    /// while the reference lives (on the crash path: one CPU, interrupts off
+    /// until #7, and the interrupted holder never resumes).
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn force_get(&self) -> &mut T {
         // SAFETY: upheld by the caller (see above).

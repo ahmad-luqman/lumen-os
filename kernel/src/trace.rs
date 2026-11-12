@@ -202,35 +202,12 @@ pub fn write_recent(w: &mut dyn fmt::Write, n: u64, indent: &str) -> fmt::Result
     Ok(())
 }
 
-/// A fixed buffer to format into (no heap); for tests.
+/// How an event is printed (for tests).
 #[cfg(feature = "ktest")]
-struct Line {
-    buf: [u8; 160],
-    len: usize,
-}
-
-#[cfg(feature = "ktest")]
-impl fmt::Write for Line {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        let end = self.len + s.len();
-        self.buf.get_mut(self.len..end).ok_or(fmt::Error)?.copy_from_slice(s.as_bytes());
-        self.len = end;
-        Ok(())
-    }
-}
-
-#[cfg(feature = "ktest")]
-fn describe(e: &Event) -> Line {
-    let mut line = Line { buf: [0; 160], len: 0 };
+fn describe(e: &Event) -> crate::ktest::Buf {
+    let mut line = crate::ktest::Buf::new();
     let _ = fmt::Write::write_fmt(&mut line, format_args!("{}", Describe(e)));
     line
-}
-
-#[cfg(feature = "ktest")]
-impl Line {
-    fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("<invalid utf-8>")
-    }
 }
 
 crate::ktest!(

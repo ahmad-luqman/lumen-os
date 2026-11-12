@@ -28,12 +28,17 @@ name = "lumen-elf"
 version = "0.0.1"
 
 [[package]]
+name = "lumen-heap"
+version = "0.0.1"
+
+[[package]]
 name = "lumen-kernel"
 version = "0.0.1"
 dependencies = [
  "limine",
  "log",
  "lumen-elf",
+ "lumen-heap",
  "lumen-mm",
  "lumen-trace",
  "noto-sans-mono-bitmap",

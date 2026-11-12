@@ -52,7 +52,8 @@ struct Reservation {
     range: PhysRange,
 }
 
-/// A fixed-capacity list (there is no heap yet).
+/// A fixed-capacity list (the frame allocator is built before the heap,
+/// which depends on it).
 #[derive(Clone, Copy)]
 struct Reservations {
     items: [Reservation; MAX_RESERVATIONS],
@@ -305,20 +306,19 @@ pub fn alloc_zeroed() -> Option<PhysFrame> {
 /// power of two); returns the first, or `None` if no such run is free.
 /// Panics if `count` is 0 or `align_frames` is not a power of two (caller
 /// bugs). Return the run with [`free_contiguous`] and the same count.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: heap (#5), DMA buffers
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: DMA buffers
 #[must_use = "dropping the frames leaks them"]
 pub fn alloc_contiguous(count: usize, align_frames: usize) -> Option<PhysFrame> {
     with_frames(|f| f.alloc_contiguous(count, align_frames)).map(frame)
 }
 
 /// Return a frame from [`alloc`] or [`alloc_zeroed`].
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: heap (#5), stacks (#6)
 pub fn free(f: PhysFrame) -> Result<(), FreeError> {
     with_frames(|a| a.free(f.as_u64()))
 }
 
 /// Return `count` frames from [`alloc_contiguous`], all or nothing.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: heap (#5), DMA buffers
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: DMA buffers
 pub fn free_contiguous(first: PhysFrame, count: usize) -> Result<(), FreeError> {
     with_frames(|f| f.free_contiguous(first.as_u64(), count))
 }
@@ -332,6 +332,10 @@ pub fn is_allocated(f: PhysFrame) -> bool {
 pub fn bitmap() -> Option<PhysRange> {
     STATE.lock().as_ref().and_then(|s| s.reserved.get(BITMAP))
 }
+
+/// How many frames are free (for the heap's tests).
+#[cfg(feature = "ktest")]
+pub use checks::free_frames;
 
 #[cfg(feature = "ktest")]
 mod checks {

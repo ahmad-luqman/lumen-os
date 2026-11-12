@@ -96,7 +96,7 @@ Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 |---|---|---|
 | `0x0000_0000_0000_0000 – 0x0000_7fff_ffff_ffff` | empty in the kernel's tables (null guard); user space, per process, from M2 (except the first 64 KiB) | built (empty) |
 | `0xffff_8000_0000_0000 – +phys size` | higher-half direct map (HHDM) of RAM: usable, bootloader-reclaimable, kernel-and-modules and framebuffer entries; NX, RW- except kernel-and-modules (R--), framebuffer write-combining | built |
-| `0xffff_c000_0000_0000 – 0xffff_c0ff_ffff_ffff` | kernel heap (grows by mapping frames) | M1 (#5) |
+| `0xffff_c000_0000_0000 – 0xffff_c0ff_ffff_ffff` | kernel heap (grows up by mapping frames, to 1 GiB below the top; the top GiB holds a ktest scratch page) | built |
 | `0xffff_d000_0000_0000 – 0xffff_d0ff_ffff_ffff` | kernel stacks: 64 KiB each, **unmapped guard page below every stack** | M1 (#6) |
 | `0xffff_e000_0000_0000 – 0xffff_e0ff_ffff_ffff` | MMIO mappings (uncached, RW-), `map_mmio` | built |
 | `0xffff_ffff_8000_0000 – end of image` | kernel image: `.text` R-X, `.rodata` (and `.got`) R--, `.data/.bss` RW-, page-aligned segments | built |
@@ -197,7 +197,7 @@ is what the CPU enforces; `Attrs` can't express a writable and executable
 page. The kernel API:
 
 - `map`/`unmap` (`unsafe`): 4 KiB pages for the owners of the heap and stack
-  windows (#5, #6). The caller promises it owns the frame and the page and
+  windows (the heap; stacks, #6). The caller promises it owns the frame and the page and
   that nothing refers through a page it unmaps; the functions refuse what
   they can check (addresses outside those windows, frames nobody allocated,
   non-write-back or executable rights, since allocator frames are writable
@@ -225,6 +225,51 @@ Limine; 64 KiB assumed if it doesn't confirm) and the three 16 KiB IST stacks
 are static and have no guard pages. Guard pages need the frame allocator and
 our own page tables (#4); #6 replaces them (hard rule 4).
 
+### Kernel heap (built in M1)
+
+`kernel/src/mm/heap.rs` is the `#[global_allocator]`; the algorithm is the
+host-tested `crates/lumen-heap`. One contiguous span grows up from the
+heap window's base: when no free block fits, the heap maps fresh frames at
+its end (read-write, no-execute, write-back, through `paging::map`) and
+appends them. It grows by its own size, between 64 KiB and 4 MiB, or by
+what the request needs if that is more (so a heap that reaches N bytes took
+about log2(N) growths); when that much isn't available it grows by just
+the pages the request needs. Growing is all or nothing: if
+frames or page tables run out part way, every page mapped so far is
+unmapped and its frame freed (the tables created stay; tables are never
+freed). The heap never shrinks and stops 1 GiB below the top of the window.
+
+Free memory is a singly linked list of blocks in address order; each free
+block stores its size and the next block's offset in its first 16 bytes.
+Allocated blocks have no header, since `GlobalAlloc::dealloc` gets the same
+`Layout` as `alloc` and both round it to the same block size (a multiple of
+16 bytes). Allocation is first fit; padding in front of an aligned block and
+the tail stay free. `dealloc` merges with both neighbours, so no two free
+blocks touch, and refuses a block outside the heap, misaligned, or
+overlapping memory that is free right now, without changing anything; the
+kernel then panics. That catches a double free while the block is still
+free and a `Layout` reaching into free memory or past the heap's end. It
+can't reliably catch a double free after the memory was handed out again, a
+`Layout` reaching into another live block, or a smaller `Layout` (which
+leaks the difference; the heap check reports it once nothing is allocated).
+Every walk checks each free block it reads (inside the heap, linking up to
+a block inside the heap), so a corrupt link is a panic (and a crash report),
+not a hang or an access outside the heap; corruption that keeps blocks in
+place and in order is found only by the heap check's accounting. Both operations walk the list (O(free blocks)); size
+classes for small objects can go in front of it later.
+
+When the heap runs out (no frame for the heap or for a page table, or the
+window is full) the allocation returns null: `try_reserve` callers see an error, and everything else
+reaches `alloc`'s default error handler, which panics
+(`#[alloc_error_handler]` is unstable). Any other growth failure is a
+kernel bug and panics, as does allocating before `mm::init`. The serial crash report ends with one line of heap
+state, including the last failed growth (size, alignment, reason); kmon's
+`heap` command prints the same line. Lock order: heap, page tables, frame
+allocator; nothing holding the last two may allocate. The allocator never
+logs (a log argument that allocates would re-enter it under the logger's
+lock) and formats its kmon and crash line from a copy taken under the lock. The lock is not IRQ-safe until #7, so interrupt
+handlers must not allocate yet.
+
 ## 6. Interrupts, exceptions and crash reports (built)
 
 - One assembler `.rept` loop generates 256 entry stubs, each 16 bytes apart.
@@ -236,8 +281,11 @@ our own page tables (#4); #6 replaces them (hard rule 4).
 - #DF, NMI and #MC run on IST stacks, so a corrupted kernel stack still yields
   a report.
 - **Crash report:** exception name and vector, decoded #PF error code and CR2,
-  rip with symbol, all registers, CR0/3/4, a frame-pointer backtrace and, for
-  a #PF, the page-table walk of CR2 (serial). It is
+  rip with symbol, all registers, CR0/3/4, a frame-pointer backtrace, then on
+  serial only the last trace events, for a #PF the page-table walk of CR2,
+  and last one line of heap state (never blocks: if the heap's lock is held
+  it reads the state anyway and says so; the free-list walk is bounded and
+  stays inside the heap). It is
   written to serial and to the screen. Frame pointers are forced on
   (`-C force-frame-pointers=yes`); the walker follows `rbp` only inside known
   stacks and only to return addresses inside kernel `.text`, so a corrupted
@@ -499,7 +547,7 @@ kernel. The kernel is the trusted computing base.
   under TCG locally; TCG's TSC rate depends on the host, so this is not
   comparable across machines or to cycles). Timestamps are raw TSC ticks until
   #7/#8. `kmon`'s `trace [n]` prints the newest events (a gap line says why
-  an event is missing), and the serial crash report ends with the last 16
+  an event is missing), and the serial crash report includes the last 16
   events (tested for a page fault and a panic).
 - **Boot timeline:** boot phases emit trace events. The fast-boot target is
   under 1 s from bootloader handoff to the shell, measured in the guest from TSC
@@ -537,9 +585,9 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
   src/kmon.rs      serial debug monitor (until the M2 shell)
-  src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs)
+  src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs)
   linker.ld        layout at -2 GiB, .ktests section
-crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, ...)
+crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, ...)
 boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml

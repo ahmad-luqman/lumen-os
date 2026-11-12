@@ -97,8 +97,9 @@ own PR that updates that doc first.
   `Fixes #n`. **No AI attribution lines** (no `Co-Authored-By` for AI tools, no
   "Generated with" footers) in commits.
 - **Rust:** edition 2024, `unsafe_op_in_unsafe_fn` denied, and every `unsafe`
-  block has a `// SAFETY:` comment. Kernel code is `no_std` with no `alloc`
-  until the M1 heap lands.
+  block has a `// SAFETY:` comment. Kernel code is `no_std`; `alloc` (`Box`,
+  `Vec`) works once `mm::init` has set up the heap. Code holding the
+  page-table or frame-allocator lock must not allocate (the heap takes them).
 - **Kernel tests:** `crate::ktest!(fn name() { ...; Ok(()) });` next to the
   code, using `kassert!` and `kassert_eq!`. No central list; tests register
   through the `.ktests` linker section.
@@ -116,12 +117,15 @@ own PR that updates that doc first.
   runner. `kmon.rs`: serial debug monitor (until the M2 shell). `fb.rs`:
   framebuffer and console. `klog.rs`: logger. `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator and its reservations.
+  `mm/heap.rs`: the `#[global_allocator]`, growing in the heap window.
   `mm/paging.rs`: the kernel's page tables (HHDM, W^X image, map/unmap,
   MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
   PAT. `trace.rs`: trace ring, event kinds, `ktrace!`.
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
 - `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, and the
   page-table format and mapper (host-tested, incl. a model comparison).
+- `crates/lumen-heap`: heap allocator logic (address-ordered free list,
+  coalescing; host-tested, incl. a randomized stress test against a shadow map).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
   are built), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,

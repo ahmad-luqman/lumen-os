@@ -8,7 +8,7 @@ QEMU with status 0 (`-no-reboot`), which fails these tests.
 import re
 
 import pytest
-from lumen_harness.crash import backtrace, page_walk
+from lumen_harness.crash import END, backtrace, page_walk
 from lumen_harness.image import assert_matches_golden
 
 SCREEN_DONE = "(crash report shown on screen)"
@@ -72,6 +72,10 @@ def test_page_fault_report_names_address_and_cause(crash_report):
     assert walk.virt == 0xDEADB000, report
     assert walk.steps == [(4, 0, 0)] and walk.end == "not present at L4", report
     assert report.index("page walk of") > report.index("backtrace:"), report
+    # Then, last, the heap's state.
+    lines = report.splitlines()
+    assert lines[-2].startswith("heap: ") and lines[-1] == END, lines[-3:]
+    assert report.index("heap: ") > report.index("  -> not present"), report
 
 
 def test_panic_produces_report(crash_report):

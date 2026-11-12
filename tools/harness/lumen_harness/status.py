@@ -119,8 +119,6 @@ def render(evaluated: list[tuple[dict, str]]) -> str:
         "",
         "- Rule 4 (stacks from the allocator with guard pages): the boot stack and",
         "  the IST stacks are static and unguarded until the M1 allocator exists (#6).",
-        "- Rules 2 and 5 (reserved-memory assertions, real heap): not implemented",
-        "  yet; they are M1 exit criteria (#1, #5).",
         "",
     ]
     return "\n".join(lines)

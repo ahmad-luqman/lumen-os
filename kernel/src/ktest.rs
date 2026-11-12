@@ -136,3 +136,33 @@ crate::ktest!(
         Ok(())
     }
 );
+
+/// A fixed buffer for checking formatted output in tests without the heap
+/// (some tests hold the heap's lock, or check code that must not allocate).
+#[cfg(feature = "ktest")]
+pub struct Buf {
+    data: [u8; 512],
+    len: usize,
+}
+
+#[cfg(feature = "ktest")]
+impl Buf {
+    pub const fn new() -> Self {
+        Self { data: [0; 512], len: 0 }
+    }
+
+    pub fn as_str(&self) -> &str {
+        // `write_str` appends whole `&str`s or nothing, so this is UTF-8.
+        core::str::from_utf8(&self.data[..self.len]).unwrap_or("<invalid utf-8>")
+    }
+}
+
+#[cfg(feature = "ktest")]
+impl Write for Buf {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len + s.len();
+        self.data.get_mut(self.len..end).ok_or(fmt::Error)?.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
