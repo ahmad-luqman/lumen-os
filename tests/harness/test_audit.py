@@ -1,6 +1,6 @@
 """The flag audit must actually catch the problems it claims to catch."""
 
-from lumen_harness.audit import check_ir, check_sections, scan_disassembly
+from lumen_harness.audit import check_image_bounds, check_ir, check_sections, scan_disassembly
 
 CLEAN = """
 ffffffff80001000 <lumen_kernel::kmain>:
@@ -76,6 +76,76 @@ def test_low_allocated_section_fails():
 def test_pie_is_rejected():
     bad = READOBJ_OK.replace("Type: Executable (0x2)", "Type: SharedObject (0x3)")
     assert [f.check for f in check_sections(bad)] == ["elf"]
+
+
+IMAGE_READOBJ = """
+  Section {
+    Name: .text (1)
+    Flags [ (0x6)
+      SHF_ALLOC (0x2)
+    ]
+    Address: 0xFFFFFFFF80000000
+    Size: 4096
+  }
+  Section {
+    Name: .bss (29)
+    Flags [ (0x3)
+      SHF_ALLOC (0x2)
+      SHF_WRITE (0x1)
+    ]
+    Address: 0xFFFFFFFF80001000
+    Size: 4096
+  }
+  Section {
+    Name: .debug_info (53)
+    Flags [ (0x0)
+    ]
+    Address: 0x0
+    Size: 407006
+  }
+"""
+IMAGE_NM = """\
+ffffffff80000000 T __kernel_start
+ffffffff80002000 B __kernel_end
+ffffffff80000010 t lumen_kernel::kmain
+"""
+
+
+def test_sections_inside_the_image_pass():
+    assert check_image_bounds(IMAGE_READOBJ, IMAGE_NM) == []
+
+
+def test_orphan_section_after_the_image_fails():
+    # The real case: the linker put `.got` after __kernel_end, where the
+    # kernel's page tables don't map it.
+    orphan = (
+        IMAGE_READOBJ
+        + """
+  Section {
+    Name: .got (34)
+    Flags [ (0x3)
+      SHF_ALLOC (0x2)
+    ]
+    Address: 0xFFFFFFFF80002000
+    Size: 232
+  }
+"""
+    )
+    found = check_image_bounds(orphan, IMAGE_NM)
+    assert [f.check for f in found] == ["image"]
+    assert ".got" in found[0].detail
+
+
+def test_section_running_past_the_end_fails():
+    long_bss = IMAGE_READOBJ.replace(
+        "Size: 4096\n  }\n  Section {\n    Name: .debug",
+        "Size: 4097\n  }\n  Section {\n    Name: .debug",
+    )
+    assert [f.check for f in check_image_bounds(long_bss, IMAGE_NM)] == ["image"]
+
+
+def test_missing_image_symbols_fail():
+    assert [f.check for f in check_image_bounds(IMAGE_READOBJ, "")] == ["image"]
 
 
 IR_OK = """

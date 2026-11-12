@@ -10,7 +10,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Codegen audit: no SSE/AVX, no red zone, kernel code model, frame pointers"
+name = "Codegen audit: no SSE/AVX, no red zone, kernel code model, frame pointers, every section inside the kernel image"
 milestone = "M0"
 tests = [
     "audit:flags",

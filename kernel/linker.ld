@@ -2,8 +2,10 @@
  *
  * The kernel is linked at the top 2 GiB of the address space
  * (0xffffffff80000000), which is what the kernel code model requires.
- * Each segment is page-aligned with its own permissions so that Limine maps
- * text R-X, rodata R--, data RW-.
+ * Each segment is page-aligned with its own permissions: Limine maps text
+ * R-X, rodata R--, data RW- from the PHDRs, and the kernel's own page tables
+ * (kernel/src/mm/paging.rs) map [__kernel_start, __rodata_start) R-X,
+ * [__rodata_start, __data_start) R-- and [__data_start, __kernel_end) RW-.
  */
 OUTPUT_FORMAT(elf64-x86-64)
 ENTRY(_start)
@@ -27,6 +29,7 @@ SECTIONS
     } :text
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __rodata_start = .;
 
     .rodata : {
         *(.rodata .rodata.*)
@@ -39,7 +42,18 @@ SECTIONS
         __ktests_end = .;
     } :rodata
 
+    /* Precompiled compiler_builtins calls `memcpy` and friends through the
+     * GOT. With static relocation its entries are link-time constants, so it
+     * is read-only data. Without this rule the linker placed it after
+     * __kernel_end, outside the image the page tables and the frame
+     * allocator's reservation cover (`make audit` checks every allocated
+     * section is inside). */
+    .got : {
+        *(.got .got.*)
+    } :rodata
+
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __data_start = .;
 
     .data : {
         /* Limine scans for requests between these markers. */
