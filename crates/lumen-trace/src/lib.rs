@@ -216,6 +216,7 @@ impl<const N: usize> TraceRing<N> {
 mod tests {
     extern crate std;
     use super::*;
+    use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
     use std::{thread, vec, vec::Vec};
 
@@ -309,13 +310,17 @@ mod tests {
         const EVENTS: u64 = 300_000;
         let ring = TraceRing::<64>::new();
         let done = AtomicBool::new(false);
+        // Everyone starts together, or an optimized writer can finish before
+        // the readers are scheduled (it did on CI) and nothing is tested.
+        let start = Barrier::new(4);
         let seen = thread::scope(|s| {
             let readers: Vec<_> = (0..3)
                 .map(|_| {
                     s.spawn(|| {
                         let mut out = vec![Event::default(); 64];
                         let mut seen = 0usize;
-                        while !done.load(Ordering::Acquire) {
+                        start.wait();
+                        while !done.load(Ordering::Acquire) || seen == 0 {
                             let n = ring.snapshot(&mut out);
                             for pair in out[..n].windows(2) {
                                 assert!(pair[0].seq < pair[1].seq, "out of order: {pair:?}");
@@ -331,6 +336,7 @@ mod tests {
                     })
                 })
                 .collect();
+            start.wait();
             for i in 0..EVENTS {
                 let r = ring.record(i, 1, (i >> 32) as u16, i as u32, args_for(i));
                 assert_eq!(r, Some(i), "a single writer never drops");
@@ -351,10 +357,12 @@ mod tests {
         const PER_WRITER: u64 = 100_000;
         let ring = TraceRing::<32>::new();
         let done = AtomicBool::new(false);
+        let start = Barrier::new(5);
         thread::scope(|s| {
             let reader = s.spawn(|| {
                 let mut out = [Event::default(); 32];
                 let mut seen = 0;
+                start.wait();
                 while !done.load(Ordering::Acquire) || seen == 0 {
                     let n = ring.snapshot(&mut out);
                     for e in &out[..n] {
@@ -366,8 +374,9 @@ mod tests {
             });
             let writers: Vec<_> = (0..4u64)
                 .map(|w| {
-                    let ring = &ring;
+                    let (ring, start) = (&ring, &start);
                     s.spawn(move || {
+                        start.wait();
                         for i in 0..PER_WRITER {
                             let x = w << 40 | i;
                             let _ = ring.record(x, w as u16, (x >> 32) as u16, x as u32, args_for(x));
@@ -398,9 +407,11 @@ mod tests {
         const EVENTS: u64 = 1_000_000;
         let ring = TraceRing::<2>::new();
         let done = AtomicBool::new(false);
+        let start = Barrier::new(4);
         thread::scope(|s| {
             for _ in 0..3 {
                 s.spawn(|| {
+                    start.wait();
                     while !done.load(Ordering::Relaxed) {
                         let head = ring.written();
                         for seq in head.saturating_sub(3)..=head {
@@ -412,6 +423,7 @@ mod tests {
                     }
                 });
             }
+            start.wait();
             for i in 0..EVENTS {
                 assert_eq!(ring.record(i, 1, (i >> 32) as u16, i as u32, args_for(i)), Some(i));
             }
@@ -428,9 +440,11 @@ mod tests {
         const PER_WRITER: u64 = 200_000;
         let ring = TraceRing::<1>::new();
         let done = AtomicBool::new(false);
+        let start = Barrier::new(5);
         let recorded = thread::scope(|s| {
             s.spawn(|| {
                 let mut last = 0;
+                start.wait();
                 while !done.load(Ordering::Relaxed) {
                     let now = ring.slots[0].stamp.load(Ordering::Relaxed);
                     assert!(now >= last, "stamp went backwards: {last} -> {now}");
@@ -439,8 +453,9 @@ mod tests {
             });
             let writers: Vec<_> = (0..4u64)
                 .map(|w| {
-                    let ring = &ring;
+                    let (ring, start) = (&ring, &start);
                     s.spawn(move || {
+                        start.wait();
                         (0..PER_WRITER)
                             .filter(|i| {
                                 let x = w << 40 | i;
