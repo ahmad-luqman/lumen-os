@@ -9,13 +9,14 @@ interrupt trace and CPU resets) and any screenshots, and CI uploads them.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
-from lumen_harness import BUILD_DIR
+from lumen_harness import BUILD_DIR, REPO_ROOT
 from lumen_harness.qemu import Machine
 
 ISOS = {
@@ -23,7 +24,9 @@ ISOS = {
     "qemutest": BUILD_DIR / "lumen-qemutest.iso",
     "ktest": BUILD_DIR / "lumen-ktest.iso",
 }
-ARTIFACTS = BUILD_DIR / "test-artifacts"
+# LUMEN_ARTIFACTS_DIR (relative to the repo root) lets a re-run keep its
+# artifacts apart from the first run's: CI re-runs KVM failures under TCG.
+ARTIFACTS = REPO_ROOT / (os.environ.get("LUMEN_ARTIFACTS_DIR") or BUILD_DIR / "test-artifacts")
 GOLDEN_DIR = Path(__file__).parent / "golden"
 
 

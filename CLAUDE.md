@@ -25,7 +25,9 @@ One scenario: `uv run pytest tests/scenarios/test_crash.py -k pf -v`.
 Failing scenarios keep `build/test-artifacts/<test>/` with `serial.log`,
 `qemu.log` (`-d int,cpu_reset,guest_errors`) and screenshots. The interrupt
 trace (`-d int`) is only recorded under TCG: locally on macOS always, and in CI
-by re-running failed scenarios with `LUMEN_ACCEL=tcg` (CI runs KVM first).
+by re-running failed scenarios with `LUMEN_ACCEL=tcg` (CI runs KVM first,
+and keeps the re-run's artifacts apart in `build/test-artifacts-tcg/` via
+`LUMEN_ARTIFACTS_DIR`).
 
 Prerequisites: rustup (the toolchain installs itself from
 `rust-toolchain.toml`), `qemu-system-x86_64`, `xorriso`, `uv`, `make`, `curl`.

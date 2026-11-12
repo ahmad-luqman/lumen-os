@@ -60,9 +60,12 @@ jobs:
 
       # KVM is fast but QEMU's `-d int` interrupt trace only works under TCG.
       # Re-run whatever failed under TCG so the uploaded artifacts include it.
+      # Separate artifact root: the KVM run's evidence must survive the re-run.
       - name: Re-run failed scenarios under TCG for interrupt traces
         if: failure()
-        run: LUMEN_ACCEL=tcg uv run --frozen pytest tests/scenarios --last-failed -v || true
+        run: >-
+          LUMEN_ACCEL=tcg LUMEN_ARTIFACTS_DIR=build/test-artifacts-tcg
+          uv run --frozen pytest tests/scenarios --last-failed -v || true
 
       - name: Upload test artifacts on failure
         if: failure()
@@ -71,5 +74,6 @@ jobs:
           name: test-artifacts
           path: |
             build/test-artifacts
+            build/test-artifacts-tcg
             build/test-results
           if-no-files-found: ignore

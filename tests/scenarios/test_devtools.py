@@ -4,6 +4,7 @@ Not covered here: the QEMU window that `make run` opens (manual check).
 """
 
 import os
+import select
 import shutil
 import subprocess
 import sys
@@ -27,7 +28,12 @@ def test_make_run_serial_console():
     try:
         deadline = time.monotonic() + 60
         sent = False
-        while time.monotonic() < deadline:
+        while (remaining := deadline - time.monotonic()) > 0:
+            # Wait with a timeout: a bare os.read() would block forever if QEMU
+            # stays alive but goes silent, and the deadline would never fire.
+            ready, _, _ = select.select([proc.stdout], [], [], remaining)
+            if not ready:
+                break
             chunk = os.read(proc.stdout.fileno(), 4096)
             if not chunk:
                 break
