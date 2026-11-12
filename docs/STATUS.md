@@ -16,6 +16,7 @@ this file is refreshed on main with `make test status`.
 | M0 | boot | Framebuffer hello screen (golden image) | passing | `scenario:test_screen::test_boot_hello_golden` |
 | M0 | boot | Serial input from the harness (kernel monitor) | passing | `scenario:test_boot::test_serial_input_round_trip` |
 | M0 | boot | Kernel command line parsing; log level and tags | passing | `ktest:lumen_kernel::cmdline::cmdline_parses_flags_and_values`<br>`ktest:lumen_kernel::klog::log_tags_strip_crate_and_arch_prefixes` |
+| M1 | boot | Boot timeline printed at boot complete (every phase since kernel entry, from the trace ring) and timestamps on serial log lines | passing | `cargo:lumen-time`<br>`ktest:lumen_kernel::trace::boot_phases_recorded_in_order`<br>`ktest:lumen_kernel::trace::the_timeline_says_what_it_lacks`<br>`scenario:test_boot::test_boot_timeline_printed`<br>`scenario:test_boot::test_log_lines_are_structured`<br>`scenario:test_trace::test_trace_command_shows_every_event_since_boot` |
 | M0 | crash | Crash report for CPU exceptions: symbolized rip, registers, backtrace (#PF #UD #DE #GP #DF) | passing | `scenario:test_crash::test_fault_produces_symbolized_report[*]`<br>`scenario:test_crash::test_page_fault_report_names_address_and_cause`<br>`ktest:lumen_kernel::crash::page_fault_cause_is_decoded` |
 | M0 | crash | Double fault runs on its own IST stack | passing | `scenario:test_crash::test_fault_produces_symbolized_report[df]` |
 | M0 | crash | Crash report for Rust panics | passing | `scenario:test_crash::test_panic_produces_report` |
