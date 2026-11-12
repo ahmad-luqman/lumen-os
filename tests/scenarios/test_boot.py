@@ -46,6 +46,7 @@ PHASES = [
     "acpi",
     "interrupts",
     "time",
+    "smp",
     "framebuffer",
     "complete",
 ]

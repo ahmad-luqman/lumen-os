@@ -154,27 +154,38 @@ static mut IDT: [IdtEntry; 256] = [IdtEntry::MISSING; 256];
 /// The vectors that run on their own IST stack, and their slots.
 const IST_VECTORS: [(usize, u8); 3] = [(2, gdt::IST_NMI), (8, gdt::IST_DOUBLE_FAULT), (18, gdt::IST_MACHINE_CHECK)];
 
-/// Fill and load the IDT. Must run after [`gdt::init`]. Every vector runs on
-/// the current stack until [`use_ist_stacks`].
-pub fn init() {
+/// Fill the IDT. Every vector runs on the current stack until
+/// [`use_ist_stacks`].
+///
+/// # Safety
+/// Once, on the boot CPU, before any CPU loads the IDT.
+pub(super) unsafe fn fill() {
     let stubs = &raw const lumen_isr_stubs as u64;
     let idt = &raw mut IDT;
-    // SAFETY: single-threaded early boot; the IDT is static and lives forever.
+    // SAFETY: upheld by the caller (nothing reads the IDT yet); it is static
+    // and lives forever.
     unsafe {
         for vector in 0..256u64 {
             (*idt)[vector as usize] = IdtEntry::interrupt_gate(stubs + vector * STUB_STRIDE, 0);
         }
-        let ptr = IdtPointer { limit: (size_of::<[IdtEntry; 256]>() - 1) as u16, base: idt as u64 };
-        asm!("lidt [{}]", in(reg) &raw const ptr, options(readonly, nostack, preserves_flags));
     }
+}
+
+/// Load the (shared) IDT on this CPU. Only after [`fill`] (`arch::init_cpu`).
+pub(super) fn load() {
+    let ptr = IdtPointer { limit: (size_of::<[IdtEntry; 256]>() - 1) as u16, base: &raw const IDT as u64 };
+    // SAFETY: the IDT is filled (callers run after `fill`) and static.
+    unsafe { asm!("lidt [{}]", in(reg) &raw const ptr, options(readonly, nostack, preserves_flags)) };
 }
 
 /// Make the NMI, double-fault and machine-check gates switch to their IST
 /// stacks. Only through `install_ist_stacks`, after the slots are filled.
 ///
 /// # Safety
-/// `gdt::set_ist_stacks` has filled the slots with valid stacks; nothing
-/// else touches the IDT meanwhile (one CPU).
+/// `gdt::set_ist_stacks` has filled the boot CPU's slots with valid stacks,
+/// and no other CPU runs yet (the boot CPU fills each AP's slots in
+/// `smp::start` before the AP loads this IDT, so every CPU taking these
+/// vectors has them).
 pub(super) unsafe fn use_ist_stacks() {
     // An empty slot would make the CPU switch to address 0: check them all
     // before switching any gate.
@@ -231,9 +242,11 @@ pub const TIMER: u8 = 0x40;
 pub const IOAPIC_BASE: u8 = 0x50;
 /// The last vector for an I/O APIC input.
 const IOAPIC_LAST: u8 = 0xef;
-/// Free: no source uses 0x30-0x3f (a ktest raises 0x30 by `int`).
+/// Free: no source uses 0x30-0x3e (a ktest raises 0x30 by `int`).
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
 pub const UNUSED: u8 = 0x30;
+/// An IPI that only wakes its CPU (`smp::run_on`): handled by an EOI.
+pub const WAKEUP: u8 = 0x3f;
 /// Local APIC errors.
 pub const LAPIC_ERROR: u8 = 0xfe;
 /// The local APIC's spurious vector (needs no EOI).
@@ -243,7 +256,8 @@ pub const SPURIOUS: u8 = 0xff;
 const _: () = assert!(
     32 <= PIC_BASE
         && PIC_BASE + 16 <= UNUSED
-        && UNUSED + 16 <= TIMER
+        && UNUSED < WAKEUP
+        && WAKEUP < TIMER
         && TIMER < IOAPIC_BASE
         && IOAPIC_BASE < IOAPIC_LAST
         && IOAPIC_LAST < LAPIC_ERROR
@@ -354,6 +368,7 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
         SPURIOUS => {
             SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);
         }
+        WAKEUP => super::apic::eoi(),
         v if (PIC_BASE..PIC_BASE + 16).contains(&v) && super::apic::in_service(v) => {
             // Delivered through the local APIC (an MSI or a routed input on
             // the 8259s' vectors), not by the 8259s: its EOI is the APIC's.

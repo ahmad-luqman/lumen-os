@@ -5,8 +5,8 @@
 //!
 //! 1. **Usable memory** is exactly the `usable` entries of Limine's memory map.
 //!    Bootloader-reclaimable memory stays reserved for now (the boot stack,
-//!    Limine's responses and its page tables, unused after the switch to the
-//!    kernel's own, live there).
+//!    Limine's responses, and its page tables and AP stacks live there; the
+//!    APs use those until they switch, and CPUs past the cap for good).
 //! 2. **Reservations** are made explicitly, by name: frame 0, the kernel
 //!    image, the kernel ELF file (the crash reporter's symbols), the boot stack
 //!    and the framebuffer (those four found by translating their live virtual
@@ -683,7 +683,8 @@ mod checks {
         // SAFETY: reading one word of an allocated frame through the HHDM:
         // it is either ours (filled by allocate_all), leaked by an earlier
         // failed test, or in use elsewhere (heap, stacks, page tables), and
-        // nothing writes it meanwhile (one CPU; this test runs alone).
+        // nothing writes it meanwhile (this test runs alone; other CPUs only
+        // idle).
         allocated && unsafe { virt(frame).cast::<u64>().add(2).read() } == frame
     }
 

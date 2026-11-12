@@ -3,7 +3,9 @@
 //! The kernel maps the registers (`map_mmio`, uncached) and hands the
 //! virtual addresses to [`set_lapic`] and [`IoApic::new`]. The local APIC's
 //! address is kept in a static so the interrupt path can send an EOI without
-//! a lock. One CPU for now; every CPU's local APIC sits at the same address.
+//! a lock. Every CPU's local APIC sits at the same address (each CPU reaches
+//! its own there): the boot CPU maps it once ([`set_lapic`]), and each other
+//! CPU then turns its own on ([`enable_local`]).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,6 +24,8 @@ const EOI: usize = 0xb0;
 const ISR: usize = 0x100;
 const SVR: usize = 0xf0;
 const ESR: usize = 0x280;
+const ICR_LOW: usize = 0x300;
+const ICR_HIGH: usize = 0x310;
 const LVT_TIMER: usize = 0x320;
 const LVT_LINT0: usize = 0x350;
 const LVT_LINT1: usize = 0x360;
@@ -35,6 +39,12 @@ const LVT_MASKED: u32 = 1 << 16;
 /// LVT delivery mode NMI (bits 8-10 = 0b100).
 const LVT_NMI: u32 = 0b100 << 8;
 const LVT_PERIODIC: u32 = 1 << 17;
+/// ICR: the IPI is still being sent.
+const ICR_PENDING: u32 = 1 << 12;
+/// ICR: level assert (required for every IPI but INIT de-assert).
+const ICR_ASSERT: u32 = 1 << 14;
+/// How many times [`send`] polls for the IPI to go out before giving up.
+const ICR_SPINS: u32 = 1_000_000;
 /// Divide configuration 0b0011: the timer counts at the bus clock / 16.
 const DIVIDE_BY_16: u32 = 0b0011;
 /// What [`DIVIDE_BY_16`] divides by.
@@ -78,16 +88,22 @@ fn write(offset: usize, value: u32) {
     unsafe { reg(offset).write_volatile(value) }
 }
 
-/// Use the local APIC at `virt` and enable it: spurious interrupts on
-/// [`SPURIOUS`], errors on [`LAPIC_ERROR`], LINT0 (the 8259s' line) and the
-/// timer masked, LINT1 delivering NMIs (the platform's NMI line, as wired on
-/// PCs), every priority accepted.
+/// Use the local APIC registers at `virt` from now on, and enable the boot
+/// CPU's ([`enable_local`]).
 ///
 /// # Safety
-/// `virt` maps this CPU's local APIC registers (4 KiB, uncached) for the
-/// kernel's whole life, and the APIC is in xAPIC mode.
+/// `virt` maps the local APIC registers (4 KiB, uncached) for the kernel's
+/// whole life, and the APIC is in xAPIC mode.
 pub unsafe fn set_lapic(virt: u64) {
     assert!(LAPIC.swap(virt, Ordering::Relaxed) == 0, "set_lapic called twice");
+    enable_local();
+}
+
+/// Enable this CPU's local APIC: spurious interrupts on [`SPURIOUS`], errors
+/// on [`LAPIC_ERROR`], LINT0 (the 8259s' line) and the timer masked, LINT1
+/// delivering NMIs (the platform's NMI line, as wired on PCs), every
+/// priority accepted. Panics before [`set_lapic`].
+pub fn enable_local() {
     // Software-enable first: while the APIC is software-disabled, every LVT
     // entry is forced masked and writes clearing the mask are ignored.
     write(SVR, SVR_ENABLE | u32::from(SPURIOUS));
@@ -124,6 +140,49 @@ pub fn eoi() {
 /// EOI'd)? False before [`set_lapic`].
 pub fn in_service(vector: u8) -> bool {
     lapic_ready() && read(ISR + 0x10 * usize::from(vector / 32)) & (1 << (vector % 32)) != 0
+}
+
+/// Send an interrupt on `vector` to the CPU whose local APIC id is `dest`;
+/// whether it went out.
+#[must_use]
+pub fn send_ipi(dest: u32, vector: u8) -> bool {
+    send(dest, ICR_ASSERT | u32::from(vector))
+}
+
+/// Send an NMI to the CPU whose local APIC id is `dest` (the crash reporter
+/// stops the other CPUs with it); whether it went out. Lock-free.
+#[must_use]
+pub fn send_nmi(dest: u32) -> bool {
+    send(dest, ICR_ASSERT | LVT_NMI)
+}
+
+/// Write the ICR (destination first: writing the low word sends) once the
+/// last IPI has gone, then wait until this one has: false if the ICR stays
+/// busy either time (bounded: the crash path must not hang on a wedged
+/// APIC; it says so). Interrupts are off meanwhile, so a handler on this CPU
+/// can't send one between the writes.
+fn send(dest: u32, low: u32) -> bool {
+    // Online CPUs' ids passed `smp::ap_main`'s check against this 8-bit
+    // register field, so the crash path can't trip this.
+    assert!(dest <= 0xff, "xAPIC destination {dest} doesn't fit in 8 bits");
+    let _irq = super::irq::push_off();
+    if !icr_idle() {
+        return false;
+    }
+    write(ICR_HIGH, dest << 24);
+    write(ICR_LOW, low);
+    icr_idle()
+}
+
+/// Wait, bounded, until no IPI is being sent; whether none is.
+fn icr_idle() -> bool {
+    for _ in 0..ICR_SPINS {
+        if read(ICR_LOW) & ICR_PENDING == 0 {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
 }
 
 /// Latch and read the error status (for the error interrupt).

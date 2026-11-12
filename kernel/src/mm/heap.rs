@@ -31,7 +31,7 @@
 //! crash line then says it read the heap under the lock. Interrupt
 //! handlers are allowed to allocate (none does yet): the lock keeps
 //! interrupts off while held, so a maskable interrupt's handler never spins
-//! on a lock the code it interrupted holds (one CPU).
+//! on a lock the code it interrupted holds (another CPU just waits for it).
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::fmt::{self, Write};
@@ -314,10 +314,11 @@ pub fn write_stats(w: &mut dyn Write) -> fmt::Result {
 /// heap never unmaps what it has.
 ///
 /// # Safety
-/// Nothing may use the heap while this runs: call it from the crash reporter
-/// (one CPU, interrupts off for good, and it halts next, so the interrupted
-/// lock holder never resumes), or from a test that holds the lock and
-/// doesn't use the heap meanwhile.
+/// Nothing on this CPU may use the heap while this runs: call it from the
+/// crash reporter (interrupts off for good, and it halts next, so the
+/// interrupted lock holder never resumes), or from a test that holds the
+/// lock and doesn't use the heap meanwhile. Another CPU the report names as
+/// not stopped could still be using it: the walk is bounded and read-only.
 pub unsafe fn write_crash_stats(w: &mut dyn Write) -> fmt::Result {
     let (snapshot, label) = match STATE.try_lock() {
         Some(state) => (Snapshot::of(&state, CRASH_WALK_LIMIT), "heap"),

@@ -70,8 +70,20 @@ pub fn invalidate(virt: VirtAddr) {
 /// doesn't rely on that.
 pub fn enforce_nx_and_wp() {
     assert!(nx_supported(), "the CPU has no NX bit; W^X can't be enforced");
-    // SAFETY: EFER exists on every x86-64 CPU and NXE is supported (checked
-    // above). Limine sets both already, so this is normally a no-op; if NXE
+    // SAFETY: NXE is supported (checked above).
+    unsafe { turn_on_nx_and_wp() }
+}
+
+/// [`enforce_nx_and_wp`] without the check, for an application processor
+/// before it may fault (`smp::ap_entry`: nothing there can be reported).
+/// It checks again once it can be.
+///
+/// # Safety
+/// This CPU supports NX: the boot CPU checked, and every CPU of the machine
+/// is the same model.
+pub unsafe fn turn_on_nx_and_wp() {
+    // SAFETY: EFER exists on every x86-64 CPU and NXE is supported (the
+    // caller). Limine sets both already, so this is normally a no-op; if NXE
     // were off, no live entry could have bit 63 set (it would be reserved
     // and fault), so turning it on takes execute rights from no page in use.
     // WP only makes ring 0 stricter.

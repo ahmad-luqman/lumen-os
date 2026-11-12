@@ -75,25 +75,29 @@ tests (for example `lumen-elf`, the symbol-table reader).
 3. **`_start`** (naked asm): `xor ebp, ebp` ends the backtrace chain, the stack
    top is passed to `kmain`, and the stack is aligned. `kmain`'s first
    statement reads the TSC, the boot timeline's origin (below).
-4. **`arch::init_early`**: COM1 serial, then the GDT and TSS, then the IDT
+4. **`arch::init_early`**: COM1 serial, then the boot CPU's GDT and TSS, its
+   per-CPU record (the GS base, section "Other CPUs"), then the IDT
    with all 256 vectors. **From this point a CPU exception produces a crash
    report**, except a #DF caused by a broken stack pointer before step 6
    (#DF, NMI and #MC get their IST stacks there), which is a triple fault.
 5. Logger (level from `lumen.log=`), Limine responses checked, the symbol table
    located in our own ELF, a memory-map summary, the frame allocator
    (`INFO  mem: frames: N usable, M reserved`), the kernel's own page tables
-   (`INFO  mem: paging: kernel page tables active ...`; Limine's are no longer
-   used after this) and the heap.
+   (`INFO  mem: paging: kernel page tables active ...`; the boot CPU no longer
+   uses Limine's after this, the APs until they switch, and CPUs past the
+   cap for good) and the heap.
 6. Kernel stacks from the allocator, each with a guard page: the three IST
    stacks are installed, then `kmain` switches from Limine's boot stack to
    the 128 KiB main stack (`INFO  mem: stacks: ...`) and continues in
    `kmain_on_kernel_stack`: ACPI discovery (below); the interrupt
    controllers (the 8259s remapped and masked, the local APIC enabled, every
-   I/O APIC input masked; `INFO  irq: local APIC ...`); the TSC calibrated
+   I/O APIC input masked; `INFO  irq: local APIC ...`); the other CPUs
+   started (below); the TSC calibrated
    against the HPET, or the PIT without one
    (`INFO  time: tsc 2.9 GHz (calibrated against hpet)`), and the local APIC
    timer against the TSC, started at 1 kHz; interrupts on
-   (`INFO  irq: interrupts on`); the framebuffer hello screen, then
+   (`INFO  irq: interrupts on`); a bounded wait until the other CPUs are
+   online (`INFO  smp: 4 CPUs online`); the framebuffer hello screen, then
    `boot complete`, then the boot timeline (below).
 7. Either the in-kernel test runner (`--features ktest`) or the kernel monitor
    (`kmon`, a serial debug console that the user-mode shell replaces in M2).
@@ -106,8 +110,8 @@ boot timeline and the log's timestamps. The pinned Limine crate has no
 bootloader-performance request, so the bootloader's own time isn't counted.
 Entry is recorded with the origin's TSC; every other phase records a
 `BootPhase` trace event when it ends: arch-init, logger, symbols, memory, stacks, acpi, interrupts,
-time (calibration, interrupts on, the 10 ms first-tick check), framebuffer,
-complete. After `boot complete` the kernel prints them from the ring,
+time (calibration, interrupts on, the 10 ms first-tick check), smp (the
+wait until the other CPUs are online), framebuffer, complete. After `boot complete` the kernel prints them from the ring,
 converted with the calibrated TSC:
 
 ```
@@ -123,6 +127,74 @@ before the TSC is calibrated (before `time: tsc ...`) shows `[    ?.??????]`, no
 zero that would read as a measurement. The screen's console shows lines
 without timestamps, so screenshots stay comparable (not tested: the golden
 image covers only the header).
+
+### Other CPUs (SMP, built in M1)
+
+Limine's MP request starts every CPU and parks the application processors
+(APs), each spinning on its `goto_address` with Limine's page tables, GDT
+and a bootloader stack. `smp::start_all` (`kernel/src/smp.rs`), on the
+boot CPU right after the interrupt controllers are set up (inside the
+`interrupts` boot phase), starts them all, up to `arch::MAX_CPUS` = 8 CPUs
+in all, without waiting:
+
+- It allocates the AP's 128 KiB main stack and 64 KiB #DF, NMI and #MC
+  stacks (guard pages, hard rule 4; `INFO  smp: cpu N stacks: ...`), puts the
+  IST ones in the AP's own TSS, and jumps the AP to `ap_entry` with its CPU
+  index.
+- `ap_entry`, still on Limine's tables and stack: the AP's GDT/TSS, its GS
+  base, the shared IDT (hard rule 6), EFER.NXE and CR0.WP; then
+  `arch::enter_kernel_space` loads the kernel's root, flushes the TLB
+  (global entries too) and switches to the allocated stack in one naked
+  step, touching nothing on Limine's stack after the CR3 load. The frame
+  chain starts there (`rbp` = 0). Nothing in this stretch can fault (no
+  check that can fail, only register and memory writes): there an NMI, #DF
+  or #MC would find the AP's IST stacks unmapped (they are in the kernel's
+  tables only), a triple fault, and any other exception would lose its
+  report to a fault on the crash reporter's local APIC write (one `!!!
+  fault while stopping` line).
+- On its own stack the AP enables its local APIC, then checks NX support,
+  the PAT and its APIC id against Limine's (a failure is reported
+  normally), logs `INFO  smp: cpu N online (lapic id X)` and idles in
+  `sti; hlt`. After calibrating the clocks the boot CPU waits, 2 s in all,
+  for every AP (`smp::wait_online`; a CPU that doesn't make it is warned
+  about), then logs `INFO  smp: N CPUs online` (`N of M` at warn if short).
+- CPUs past the cap are sent to a halt loop that counts them on arrival,
+  and the boot CPU warns how many got there (`2 CPU(s) past the limit
+  halted`). They stay on Limine's tables and stack for good.
+- Why before the calibration: a CPU in Limine's park loop spins on its
+  `goto_address`, and under emulation spinning CPUs take host time from
+  every guest calibrating alongside. Measured under TCG, QEMU's CPU time
+  to the kmon prompt over a 1-CPU boot's: `-smp 4` +0.54 s with the APs
+  started after calibration, +0.34 s before it; `-smp 10` +2.09 s and
+  +1.23 s (the rest is Limine's own boot, when they already spin). An idle
+  `-smp 10` guest used about 250% host CPU while 2 CPUs spun in Limine,
+  100% once they were halted.
+
+**Per-CPU state.** Each CPU's GS base points at its own record
+(`arch::percpu`), so `percpu::index()` (0 is the boot CPU) is one
+GS-relative load, usable from interrupt and crash paths. Indexed by it: the
+GDT and TSS (`ltr` marks a TSS busy), interrupt nesting (`arch::irq`), and
+the trace ring. The IDT and the local APIC's mapping are shared (every
+CPU's local APIC answers at the same address). The stack registry holds 48
+stacks: four per CPU, plus room for tests (a build-time assert ties the
+two). Each CPU's `smp` slot is empty, starting or online; only online CPUs
+get IPIs. The in-kernel tests boot with 4 CPUs online.
+
+**Running something on an AP.** `smp::run_on(cpu, job)` puts a `fn()` in the
+AP's mailbox and sends it the `WAKEUP` IPI (vector 0x3f, handled by an
+EOI). The idle loop checks the mailbox with interrupts off and only then
+`sti; hlt` (`arch::irq::wait_unless`), so a wakeup can't land between the
+check and the halt. kmon's `crash <kind> [cpu]` uses it.
+
+APs handle no device interrupts: every I/O APIC input goes to the boot CPU,
+and an AP's local APIC timer stays masked. Known gap: there is no TLB
+shootdown; `unmap` flushes only the CPU that runs it. Mapping needs none
+(x86 caches no not-present entries; an AP may grow the heap, from an
+allocation in a `run_on` job). The only pages unmapped are dropped kernel
+stacks (test stacks, on the boot CPU), the paging ktests' scratch pages
+(boot CPU, other CPUs idle) and the rollback of a failed `map_fresh`, which
+undoes pages its own CPU just mapped. No other CPU has accessed any of
+them; stale entries from speculative fills aren't ruled out (not tested).
 
 ### ACPI (built in M1)
 
@@ -238,7 +310,8 @@ tag it with a sequence number, and free them all, checking each tag (catches
 a frame handed out twice) (hard rule 2). Bootloader-reclaimable
 memory is not returned yet; whoever adds that must first copy or stop using
 everything in it (the boot stack and Limine's responses, including the
-memory map; Limine's page tables are unused after the switch).
+memory map), and Limine's page tables and AP stacks, which the CPUs past
+the cap halt on for good.
 
 ### Page tables (built in M1)
 
@@ -351,17 +424,19 @@ points at are leaked so they can't be dropped.
 
 Boot: the IDT starts with every vector on the current stack. Right after
 `mm::init`, `kmain` allocates the 64 KiB #DF, NMI and #MC stacks, puts them in
-the TSS's IST and only then makes those three gates use them, allocates the
+the boot CPU's TSS's IST and only then makes those three gates use them, allocates the
 128 KiB main stack and switches to it (`arch::switch_stack`), which plants a
 frame record so backtraces run from the new stack back into `kmain` and
 `_start` on the old one. Limine's boot stack (128 KiB requested, 64 KiB
 assumed if it doesn't confirm) stays reserved and is recorded as a known
 stack (`stacks::set_boot_stack`, not in the registry) for that walk, but is
-never run on again. Until the switch it is the one stack without a
-guard page, and a #DF with a broken `rsp` before then is a triple fault
-instead of a report.
+never run on again. Until the switch it is the boot CPU's one stack without
+a guard page, and a #DF with a broken `rsp` before then is a triple fault
+instead of a report. Each AP likewise runs on its own Limine stack from
+`smp::ap_entry` until `enter_kernel_space` (not registered; nothing there
+may fault, see "Other CPUs"), and CPUs past the cap halt on theirs.
 
-The registry (lock-free, 32 slots, each a seqlock; registering is `unsafe`
+The registry (lock-free, 48 slots, each a seqlock; registering is `unsafe`
 because readers dereference what it lists) and the boot stack are what the
 crash reporter trusts: a frame pointer is followed only into a known stack,
 and frames move toward the top of their stack; the chain may change stacks
@@ -434,7 +509,8 @@ interrupt handler is allowed to allocate (none does yet).
   calls `lumen_exception_dispatch`.
 - **Vector map** (`arch/x86_64/idt.rs`): 0-31 CPU exceptions; 0x20-0x2f the
   8259 PICs, remapped there and masked (only a spurious IRQ 7 or 15 should
-  arrive); 0x30-0x3f unused (a ktest raises 0x30); 0x40 the local APIC
+  arrive); 0x30-0x3e unused (a ktest raises 0x30); 0x3f the `WAKEUP` IPI
+  (section 4, "Other CPUs"); 0x40 the local APIC
   timer; 0x50 + n global system interrupt n (up to 0xef), once a driver
   routes it (every I/O APIC input is masked until then); 0xfe local APIC
   errors; 0xff the local APIC's spurious vector; the rest unused.
@@ -454,12 +530,12 @@ interrupt handler is allowed to allocate (none does yet).
 - **Interrupt state:** interrupts are off through boot and turned on once
   the controllers and the timer are set up. Every gate is an interrupt gate
   (handlers run with interrupts off). `SpinLock` keeps them off while held
-  (`arch::irq::push_off`, whose `IrqOff` guard nests by depth, so guards
+  (`arch::irq::push_off`, whose `IrqOff` guard nests by depth per CPU, so guards
   dropped in any order never turn them on early, and can't be sent to
   another thread), so a maskable interrupt's handler never spins on a lock
   the code it interrupted holds: it may log, and is allowed to allocate.
   The crash path turns them off for good before anything else; no guard
-  turns them back on.
+  turns them back on, on any CPU.
 - **Time** (`time.rs`, arithmetic in `crates/lumen-time`): the TSC's
   frequency is the median of five 10 ms windows against the HPET (the PIT's
   channel 2, polled, without one), measured with interrupts off. The local
@@ -478,8 +554,9 @@ interrupt handler is allowed to allocate (none does yet).
   output doesn't go low when programmed, or high again within 2^32 TSC
   ticks (over 4 s at 1 GHz), counts as missing; calibration results outside
   10 MHz to 100 GHz are rejected.
-- #DF, NMI and #MC run on their own guarded IST stacks (from step 6 of the
-  boot, before that on the boot stack), so a corrupted or overflowed kernel
+- #DF, NMI and #MC run on their own guarded IST stacks, each CPU's own (the
+  boot CPU's from step 6 of the boot, before that on the boot stack; an
+  AP's from `enter_kernel_space` on), so a corrupted or overflowed kernel
   stack still yields a report; an overflow is named as one (section 5,
   "Kernel stacks").
 - **Crash report:** exception name and vector, decoded #PF error code and CR2,
@@ -494,6 +571,24 @@ interrupt handler is allowed to allocate (none does yet).
   stacks and only to return addresses inside kernel `.text`, so a corrupted
   chain cannot fault. Symbols come from our own ELF (Limine's executable-file
   response) via `crates/lumen-elf` and are demangled with `rustc-demangle`.
+- **Several CPUs:** the first CPU to crash owns the report (`CRASHING`
+  holds its index plus one). Every CPU records its own crash first thing
+  (vector and rip, or a panic's line). Before writing anything the owner
+  takes one snapshot of the others: online CPUs get an NMI (one still parked
+  in the bootloader has no handler for it), started ones are noted; then it
+  waits, 500 ms in all (a bounded number of rounds before the TSC is
+  calibrated), for each online CPU to halt. Serial starts with
+  `cpu: N (lapic id X)`, `running on: the <kind> stack <bottom>..<top>` (the
+  reporter's own stack, from the registry) and, with other CPUs online,
+  `other cpus stopped: 0 2 3`: those that had halted when the wait ended,
+  without a crash of their own. `!!!` lines name the rest: a CPU that didn't
+  halt in time, one whose NMI couldn't be sent, one that crashed itself
+  (`cpu 2 also crashed: #PF page fault (vector 0xe), rip ...` or `a panic at
+  line N`), and APs started but not yet online (no NMI; one could still log
+  a line into the report; not tested). With every CPU stopped, reports and
+  log lines don't interleave. The screen copy doesn't show these lines. A
+  fault while stopping the others prints one line that keeps the original
+  crash.
 - A fault during the report prints one line and halts, with no recursion. With
   `lumen.qemu_exit` the kernel exits QEMU with status 37; otherwise it halts.
 - Planned: "Explain this crash with Claude" in the GUI, which sends the same
@@ -743,7 +838,8 @@ kernel. The kernel is the trusted computing base.
   readers skip events that change while they copy them, so they never see a
   torn event.
   Events are in `seq` order; timestamps can be out of order across nested
-  writers. One 4096-event ring now (one CPU); one per CPU with SMP (#9).
+  writers. One 4096-event ring per CPU (up to 8); events carry the CPU's
+  index, and the boot timeline reads the boot CPU's ring.
   Recorded so far: boot phases, CPU exceptions and device interrupts nothing
   handles (not the timer, spurious interrupts or local APIC errors), log
   lines. Later: scheduler switches, syscalls, page faults, allocator
@@ -752,9 +848,10 @@ kernel. The kernel is the trusted computing base.
   under TCG locally; TCG's TSC rate depends on the host, so this is not
   comparable across machines or to cycles). Timestamps are raw TSC ticks
   (the boot timeline converts its phases; kmon and crash reports show them
-  raw). `kmon`'s `trace [n]` prints the newest events (a gap line says why
-  an event is missing), and the serial crash report includes the last 16
-  events (tested for a page fault and a panic).
+  raw). `kmon`'s `trace [n]` prints the newest events of the boot CPU's ring
+  (a gap line says why an event is missing), and the serial crash report
+  includes the last 16 of the reporting CPU's (tested for a page fault and a
+  panic, and on an AP).
 - **Boot timeline:** boot phases emit trace events, printed as a timeline at
   boot complete (section 4). The fast-boot target is under 1 s from kernel
   entry to the shell, measured in the guest from TSC timestamps (never by
@@ -791,10 +888,11 @@ TCG before uploading.
 
 ```
 kernel/            the kernel (bin crate, x86_64-unknown-none)
-  src/arch/        HAL; x86_64/ has gdt, idt, irq, apic, pic, pit, serial, stacks (registry), cpu, qemu, paging
+  src/arch/        HAL; x86_64/ has gdt, idt, irq, apic, pic, pit, serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
   src/acpi.rs      ACPI discovery (MADT, HPET) through lumen-acpi
   src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs
   src/time.rs      TSC and local APIC timer calibration, the boot origin, now_ns, sleep, ticks
+  src/smp.rs       starting the other CPUs, run_on
   src/boot.rs      Limine requests
   src/cmdline.rs   kernel command line (flags, key=value)
   src/sync.rs      SpinLock (interrupts off while held)

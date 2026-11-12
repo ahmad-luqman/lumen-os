@@ -6,13 +6,18 @@
 //! NMI and machine-check handlers known-good stacks. Without the IST a kernel
 //! stack overflow would triple-fault instead of producing a crash report.
 //!
-//! The IST stacks come from the allocator (`mm::stack`, with guard pages), so
-//! they are installed after `mm::init` ([`set_ist_stacks`], then
-//! `idt::use_ist_stacks`). Until then those three vectors run on the current
-//! (boot) stack.
+//! Each CPU has its own GDT and TSS (`ltr` marks a TSS descriptor busy, and
+//! each CPU's IST points at its own stacks), indexed by its
+//! [`percpu`](super::percpu) index. The IST stacks come from the allocator
+//! (`mm::stack`, with guard pages), so the boot CPU's are installed after
+//! `mm::init` ([`set_ist_stacks`], then `idt::use_ist_stacks`); until then
+//! those three vectors run on the current (boot) stack. An application
+//! processor's are filled in before it loads its TSS.
 
 use core::arch::asm;
 use core::mem::size_of;
+
+use super::percpu::{self, MAX_CPUS};
 
 pub const KERNEL_CODE: u16 = 0x08;
 pub const KERNEL_DATA: u16 = 0x10;
@@ -47,7 +52,7 @@ struct DescriptorTablePointer {
 
 const GDT_ENTRIES: usize = 7; // null, kcode, kdata, udata, ucode, tss(2)
 
-static mut TSS_SEGMENT: TaskStateSegment = TaskStateSegment {
+const EMPTY_TSS: TaskStateSegment = TaskStateSegment {
     _reserved0: 0,
     rsp: [0; 3],
     _reserved1: 0,
@@ -57,7 +62,15 @@ static mut TSS_SEGMENT: TaskStateSegment = TaskStateSegment {
     iomap_base: size_of::<TaskStateSegment>() as u16, // no I/O bitmap
 };
 
-static mut GDT: [u64; GDT_ENTRIES] = [
+static mut TSS_SEGMENTS: [TaskStateSegment; MAX_CPUS] = [EMPTY_TSS; MAX_CPUS];
+
+/// CPU `cpu`'s TSS (a raw pointer: no reference to the `static mut` is made).
+fn tss(cpu: usize) -> *mut TaskStateSegment {
+    // SAFETY: only takes the (bounds-checked) address; no reference is made.
+    unsafe { &raw mut TSS_SEGMENTS[cpu] }
+}
+
+const GDT_TEMPLATE: [u64; GDT_ENTRIES] = [
     0,
     0x00af_9a00_0000_ffff, // kernel code: present, ring 0, executable, long mode
     0x00cf_9200_0000_ffff, // kernel data: present, ring 0, writable
@@ -67,17 +80,22 @@ static mut GDT: [u64; GDT_ENTRIES] = [
     0,                     // TSS high
 ];
 
-/// Point the TSS's IST slots at the tops of the double-fault, NMI and
-/// machine-check stacks. Only through `install_ist_stacks`, which then makes
-/// the IDT use them.
+static mut GDTS: [[u64; GDT_ENTRIES]; MAX_CPUS] = [GDT_TEMPLATE; MAX_CPUS];
+
+/// Point CPU `cpu`'s IST slots at the tops of its double-fault, NMI and
+/// machine-check stacks. Only through `install_ist_stacks` (boot CPU, which
+/// then makes the IDT use them) or `smp` (an application processor, before
+/// it loads its TSS).
 ///
 /// # Safety
 /// Each top is the top of a mapped stack that is never freed and that
-/// nothing else uses; nothing else touches the TSS meanwhile (one CPU).
-pub(super) unsafe fn set_ist_stacks(double_fault: u64, nmi: u64, machine_check: u64) {
-    let tss = &raw mut TSS_SEGMENT;
-    // SAFETY: upheld by the caller; the CPU reads the TSS only when it takes
-    // an interrupt that uses an IST slot, and the IDT doesn't use them yet.
+/// nothing else uses; CPU `cpu` takes no interrupt that uses an IST slot
+/// meanwhile (the boot CPU: the IDT doesn't use them yet; an AP: it isn't
+/// running kernel code yet), and nothing else writes its TSS.
+pub(super) unsafe fn set_ist_stacks(cpu: usize, double_fault: u64, nmi: u64, machine_check: u64) {
+    let tss = tss(cpu);
+    // SAFETY: upheld by the caller; the CPU reads its TSS only when it takes
+    // an interrupt that uses an IST slot.
     unsafe {
         (*tss).ist[usize::from(IST_DOUBLE_FAULT - 1)] = double_fault;
         (*tss).ist[usize::from(IST_NMI - 1)] = nmi;
@@ -85,22 +103,25 @@ pub(super) unsafe fn set_ist_stacks(double_fault: u64, nmi: u64, machine_check: 
     }
 }
 
-/// The stack top in IST slot `slot` (1-based), 0 if unset.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by ktests
+/// The stack top in this CPU's IST slot `slot` (1-based), 0 if unset.
 pub fn ist_top(slot: u8) -> u64 {
-    let tss = &raw const TSS_SEGMENT;
-    // SAFETY: a plain read of a field of a static the kernel only writes
-    // during boot (one CPU, interrupts off).
+    let tss = tss(percpu::index());
+    // SAFETY: a plain read of a field of this CPU's own TSS, written only by
+    // `set_ist_stacks` (for the boot CPU on itself, with interrupts off; for
+    // an AP before it starts).
     unsafe { (*tss).ist[usize::from(slot - 1)] }
 }
 
-/// Load the GDT and TSS and reload every segment register.
+/// Load CPU `cpu`'s GDT and TSS and reload every segment register (which
+/// may clear the GS base: `percpu::set_current` comes after).
 ///
-/// Called once, very early, on the boot CPU.
-pub fn init() {
-    let tss = &raw mut TSS_SEGMENT;
-    // SAFETY: single-threaded early boot; nothing else touches the TSS or GDT
-    // yet. The IST slots stay empty until `set_ist_stacks`.
+/// # Safety
+/// Once per CPU, on CPU `cpu` itself, with interrupts off: nothing else
+/// touches that CPU's GDT or TSS meanwhile.
+pub(super) unsafe fn load(cpu: usize) {
+    let tss = tss(cpu);
+    // SAFETY: upheld by the caller. The IST slots are empty (boot CPU, until
+    // `set_ist_stacks`) or already filled (an AP).
     unsafe {
         let base = tss as u64;
         let limit = (size_of::<TaskStateSegment>() - 1) as u64;
@@ -110,7 +131,7 @@ pub fn init() {
             | (((limit >> 16) & 0xf) << 48)
             | (((base >> 24) & 0xff) << 56);
         let high = base >> 32;
-        let gdt = &raw mut GDT;
+        let gdt = &raw mut GDTS[cpu];
         (*gdt)[5] = low;
         (*gdt)[6] = high;
 

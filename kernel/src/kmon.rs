@@ -62,8 +62,8 @@ fn dispatch(line: &str) {
                 out,
                 "commands:\n  help              this list\n  echo <text>       print text\n  \
                  int3              take a breakpoint and continue\n  \
-                 crash <kind>      deliberate fault: {CRASH_KINDS}\n  \
-                 trace [n]         the last n trace events (default 16)\n  \
+                 crash <kind> [cpu] deliberate fault (on that CPU): {CRASH_KINDS}\n  \
+                 trace [n]         the boot CPU's last n trace events (default 16)\n  \
                  heap              heap usage and free-list summary\n  \
                  ticks             timer interrupts taken (and stray ones)\n  \
                  sleep <ms>        wait that long (guest time)\n  \
@@ -161,26 +161,52 @@ fn trace(n: u64) {
     let _ = writeln!(out, "trace: {} events claimed, {} dropped", ring.written(), ring.dropped());
 }
 
-fn crash(kind: &str) {
-    match kind {
-        "pf" => crash_page_fault(),
-        "ud" => crash_invalid_opcode(),
-        "de" => crash_divide_error(),
-        "gp" => crash_general_protection(),
-        "df" => crash_double_fault(),
-        "wtext" => crash_write_text(),
-        "nx" => crash_execute_data(),
-        "panic" => crash_panic(),
-        "oom" => crash_out_of_memory(),
-        "dfree" => crash_double_free(),
-        "heapcorrupt" => crash_corrupt_heap(),
-        "guard" => crash_touch_guard(),
-        "stack" => crash_stack_overflow(),
-        "bigframe" => crash_big_frame_overflow(),
-        _ => {
-            let _ = writeln!(serial::SerialWriter, "crash: unknown kind '{kind}' ({CRASH_KINDS})");
+/// `crash <kind> [cpu]`: run the fault here, or on another online CPU (from
+/// its idle loop; its crash report then stops this one).
+fn crash(args: &str) {
+    let mut out = serial::SerialWriter;
+    let mut words = args.split_whitespace();
+    let kind = words.next().unwrap_or("");
+    let Some(fault) = crash_fn(kind) else {
+        let _ = writeln!(out, "crash: unknown kind '{kind}' ({CRASH_KINDS})");
+        return;
+    };
+    let cpu = words.next().map(str::parse::<usize>);
+    if words.next().is_some() {
+        let _ = writeln!(out, "crash: usage: crash <kind> [cpu]");
+        return;
+    }
+    match cpu {
+        None | Some(Ok(0)) => fault(),
+        Some(Ok(cpu)) => {
+            if let Err(e) = crate::smp::run_on(cpu, fault) {
+                let _ = writeln!(out, "crash: cpu {cpu} {e}");
+            }
+        }
+        Some(Err(_)) => {
+            let _ = writeln!(out, "crash: the cpu is a number (0: this one)");
         }
     }
+}
+
+fn crash_fn(kind: &str) -> Option<fn()> {
+    Some(match kind {
+        "pf" => crash_page_fault,
+        "ud" => crash_invalid_opcode,
+        "de" => crash_divide_error,
+        "gp" => crash_general_protection,
+        "df" => crash_double_fault,
+        "wtext" => crash_write_text,
+        "nx" => crash_execute_data,
+        "panic" => crash_panic,
+        "oom" => crash_out_of_memory,
+        "dfree" => crash_double_free,
+        "heapcorrupt" => crash_corrupt_heap,
+        "guard" => crash_touch_guard,
+        "stack" => crash_stack_overflow,
+        "bigframe" => crash_big_frame_overflow,
+        _ => return None,
+    })
 }
 
 /// Address that is never mapped: the kernel's page tables map nothing in the
@@ -326,14 +352,14 @@ fn crash_corrupt_heap() {
     let _ = writeln!(serial::SerialWriter, "crash: a corrupt free list went unnoticed");
 }
 
-/// Write into the guard page below the main stack from a healthy stack: a
+/// Write into the guard page below this CPU's main stack from a healthy stack: a
 /// plain #PF (nothing overflowed), which the report names as a stray guard
 /// page hit, not an overflow.
 #[inline(never)]
 fn crash_touch_guard() {
-    use lumen_mm::stacks::StackKind;
-    let Some(main) = arch::stacks::REGISTRY.iter().find(|r| r.kind == StackKind::Main) else {
-        let _ = writeln!(serial::SerialWriter, "crash: no main stack registered");
+    // This CPU's main stack: the one it runs on.
+    let Some(main) = arch::stacks::stack_of(arch::read_rsp()) else {
+        let _ = writeln!(serial::SerialWriter, "crash: not on a registered stack");
         return;
     };
     // SAFETY: deliberately faulting: the guard page is never mapped.
@@ -341,7 +367,7 @@ fn crash_touch_guard() {
     let _ = writeln!(serial::SerialWriter, "crash: writing to a guard page succeeded (guard page mapped?)");
 }
 
-/// Overflow the main stack with small frames.
+/// Overflow this CPU's main stack with small frames.
 #[inline(never)]
 fn crash_stack_overflow() {
     let depth = recurse(0);

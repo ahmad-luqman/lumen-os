@@ -37,7 +37,8 @@ struct Framebuffer {
 }
 
 // SAFETY: the framebuffer is plain MMIO-like memory owned by the kernel; all
-// access goes through the `CONSOLE` lock (or the crash path, which runs alone).
+// access goes through the `CONSOLE` lock (or the crash path, after it has
+// stopped the other CPUs or named those that didn't stop).
 unsafe impl Send for Framebuffer {}
 
 impl Framebuffer {

@@ -8,7 +8,7 @@ use limine::BaseRevision;
 use limine::memory_map::EntryType;
 use limine::request::{
     ExecutableAddressRequest, ExecutableCmdlineRequest, ExecutableFileRequest, FramebufferRequest, HhdmRequest,
-    MemoryMapRequest, RequestsEndMarker, RequestsStartMarker, RsdpRequest, StackSizeRequest,
+    MemoryMapRequest, MpRequest, RequestsEndMarker, RequestsStartMarker, RsdpRequest, StackSizeRequest,
 };
 
 /// Boot stack size we ask Limine for.
@@ -57,6 +57,12 @@ pub static CMDLINE: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 pub static RSDP: RsdpRequest = RsdpRequest::new();
+
+/// The other CPUs: Limine starts them and parks each until `smp` hands it an
+/// entry point (xAPIC mode: no X2APIC flag).
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static MP: MpRequest = MpRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests_end")]

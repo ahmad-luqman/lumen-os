@@ -36,6 +36,7 @@ mod klog;
 mod kmon;
 mod ktest;
 mod mm;
+mod smp;
 mod symbols;
 mod sync;
 mod time;
@@ -70,7 +71,7 @@ extern "C" fn kmain(stack_top: u64) -> ! {
     let entry = arch::rdtsc();
     arch::init_early();
     time::mark_boot(entry);
-    trace::record_at(trace::ring(), entry, Kind::BootPhase, trace::args([BootPhase::Entry as u64]));
+    trace::record_at(trace::boot_ring(), entry, Kind::BootPhase, trace::args([BootPhase::Entry as u64]));
     ktrace!(Kind::BootPhase, BootPhase::ArchInit);
     // Only claim the size we asked for if Limine confirms it: the frame
     // allocator reserves this range and the crash reporter walks it.
@@ -132,7 +133,8 @@ fn install_stacks() -> StackRange {
     let df = stack(STACK_SIZE, StackKind::DoubleFault);
     let nmi = stack(STACK_SIZE, StackKind::Nmi);
     let mc = stack(STACK_SIZE, StackKind::MachineCheck);
-    // SAFETY: leaked, mapped stacks nothing else uses; one CPU, interrupts off.
+    // SAFETY: leaked, mapped stacks nothing else uses; the boot CPU, before
+    // any other starts, interrupts off.
     unsafe { arch::install_ist_stacks(df.top, nmi.top, mc.top) };
     let main = stack(MAIN_STACK_SIZE, StackKind::Main);
     info!(
@@ -152,6 +154,9 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     acpi::init();
     ktrace!(Kind::BootPhase, BootPhase::Acpi);
     interrupts::init();
+    // The other CPUs halt once started instead of spinning in the bootloader
+    // during the clock calibration below.
+    let started = smp::start_all();
     ktrace!(Kind::BootPhase, BootPhase::Interrupts);
     time::init();
     arch::irq::enable();
@@ -161,6 +166,8 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
         warn!(target: "irq", "no timer interrupt in 10 ms");
     }
     ktrace!(Kind::BootPhase, BootPhase::Time);
+    smp::wait_online(started);
+    ktrace!(Kind::BootPhase, BootPhase::Smp);
     match boot::FRAMEBUFFER.get_response().and_then(|r| r.framebuffers().next()) {
         Some(fb) => match fb::init(&fb) {
             Some((w, h)) => info!(target: "fb", "framebuffer {w}x{h} ready"),

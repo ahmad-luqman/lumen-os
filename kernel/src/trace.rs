@@ -4,9 +4,9 @@
 //! event kinds and [`ktrace!`](crate::ktrace!).
 //!
 //! Timestamps are raw TSC ticks (the boot timeline converts its phases with
-//! the frequency `time` calibrates; kmon's `trace` shows them raw). There is
-//! one ring because there is one CPU; with SMP (#9) each CPU gets its own
-//! and [`ring`] picks the current one.
+//! the frequency `time` calibrates; kmon's `trace` shows them raw). Each CPU
+//! records into its own ring ([`ring`] picks the current one), and each event
+//! carries the CPU's index; the boot timeline reads the boot CPU's.
 
 use core::fmt;
 
@@ -14,10 +14,10 @@ use lumen_trace::{Event, Missing, TraceRing};
 
 use crate::arch;
 
-/// Events the ring holds (a power of two). 4096 × 56 bytes = 224 KiB.
+/// Events a ring holds (a power of two). 4096 × 56 bytes = 224 KiB a CPU.
 pub const EVENTS: usize = 4096;
 
-static RING: TraceRing<EVENTS> = TraceRing::new();
+static RINGS: [TraceRing<EVENTS>; arch::MAX_CPUS] = [const { TraceRing::new() }; arch::MAX_CPUS];
 
 /// What an event records. Stored as the event's `kind`. Values start at 1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,16 +75,18 @@ pub enum BootPhase {
     /// Allocated kernel and IST stacks.
     Stacks = 6,
     Acpi = 7,
-    /// Interrupt controllers.
+    /// Interrupt controllers, then the other CPUs started (`smp::start_all`).
     Interrupts = 8,
     /// TSC and timer calibration, interrupts on, the 10 ms first-tick check.
     Time = 9,
-    Framebuffer = 10,
-    Complete = 11,
+    /// The wait until the other CPUs are online (`smp::wait_online`).
+    Smp = 10,
+    Framebuffer = 11,
+    Complete = 12,
 }
 
 impl BootPhase {
-    pub const ALL: [BootPhase; 11] = [
+    pub const ALL: [BootPhase; 12] = [
         BootPhase::Entry,
         BootPhase::ArchInit,
         BootPhase::Logger,
@@ -94,6 +96,7 @@ impl BootPhase {
         BootPhase::Acpi,
         BootPhase::Interrupts,
         BootPhase::Time,
+        BootPhase::Smp,
         BootPhase::Framebuffer,
         BootPhase::Complete,
     ];
@@ -120,6 +123,7 @@ impl BootPhase {
             BootPhase::Acpi => "acpi",
             BootPhase::Interrupts => "interrupts",
             BootPhase::Time => "time",
+            BootPhase::Smp => "smp",
             BootPhase::Framebuffer => "framebuffer",
             BootPhase::Complete => "complete",
         }
@@ -141,7 +145,12 @@ const _: () = {
 
 /// The current CPU's ring.
 pub fn ring() -> &'static TraceRing<EVENTS> {
-    &RING
+    &RINGS[arch::cpu_index()]
+}
+
+/// The boot CPU's ring (boot phases are recorded there).
+pub fn boot_ring() -> &'static TraceRing<EVENTS> {
+    &RINGS[0]
 }
 
 /// Record an event in `ring` now. Use [`ktrace!`](crate::ktrace!) instead.
@@ -153,11 +162,12 @@ pub fn record_in<const N: usize>(ring: &TraceRing<N>, kind: Kind, args: [u64; 4]
 /// the current TSC; ktests pass chosen stamps). Boot uses it for
 /// `BootPhase::Entry`: its TSC is read before `arch::init_early` (only a bare
 /// `rdtsc` may run before GDT/IDT setup, hard rule 6), and the event is
-/// recorded after.
+/// recorded after (it stamps this CPU's index, read through GS, which
+/// `arch::init_early` sets).
 pub fn record_at<const N: usize>(ring: &TraceRing<N>, tsc: u64, kind: Kind, args: [u64; 4]) {
-    // cpu 0 and pid 0 until SMP (#9) and processes (M2) exist. A dropped
-    // event is counted in the ring's `dropped()`; recording never fails loudly.
-    let _ = ring.record(tsc, 0, kind as u16, 0, args);
+    // pid 0 until processes (M2) exist. A dropped event is counted in the
+    // ring's `dropped()`; recording never fails loudly.
+    let _ = ring.record(tsc, arch::cpu_index() as u16, kind as u16, 0, args);
 }
 
 /// The boot timeline, read once from a ring's boot-phase events, as one line:
@@ -189,9 +199,9 @@ enum Mark {
 }
 
 impl Timeline {
-    /// The boot's timeline: this CPU's ring and the calibrated TSC.
+    /// The boot's timeline: the boot CPU's ring and the calibrated TSC.
     pub fn boot() -> Self {
-        Self::new(ring(), crate::time::tsc())
+        Self::new(boot_ring(), crate::time::tsc())
     }
 
     pub fn new<const N: usize>(ring: &TraceRing<N>, clock: Option<lumen_time::Clock>) -> Self {
@@ -456,14 +466,14 @@ crate::ktest!(
         // Only boot-phase events count (a log event's args[0] is its level).
         record_at(&ring, 15, Kind::Log, args([BootPhase::Stacks as u64]));
         for (tsc, p) in [(17, BootPhase::Interrupts), (18, BootPhase::Time), (19, BootPhase::Framebuffer)] {
-            phase(tsc, p); // no complete: the total isn't framebuffer's
+            phase(tsc, p); // no smp, no complete: the total isn't framebuffer's
         }
         let t = Timeline::new(&ring, clock);
         kassert_eq!(
             text(&t).as_str(),
             "entry +0.000 ms, arch-init +1.000 ms, logger +2.000 ms, symbols before entry, memory +4.000 ms, \
-             stacks missing, acpi +6.000 ms, interrupts +7.000 ms, time +8.000 ms, framebuffer +9.000 ms, \
-             complete missing (total unknown)"
+             stacks missing, acpi +6.000 ms, interrupts +7.000 ms, time +8.000 ms, smp missing, \
+             framebuffer +9.000 ms, complete missing (total unknown)"
         );
         kassert!(!t.is_complete());
         kassert_eq!(text(&Timeline::new(&ring, None)).as_str(), "unavailable (the TSC isn't calibrated)");
@@ -475,7 +485,7 @@ crate::ktest!(
         }
         let t = Timeline::new(&full, clock);
         kassert!(t.is_complete());
-        kassert!(text(&t).as_str().ends_with("complete +20.000 ms (total 20.000 ms)"));
+        kassert!(text(&t).as_str().ends_with("complete +22.000 ms (total 22.000 ms)"));
         kassert!(!Timeline::new(&full, None).is_complete());
 
         // Every phase after entry, but memory before symbols: it says so.
@@ -498,7 +508,7 @@ crate::ktest!(
         }
         let t = Timeline::new(&unfinished, clock);
         kassert!(!t.is_complete());
-        kassert!(text(&t).as_str().ends_with("framebuffer +18.000 ms, complete missing (total unknown)"));
+        kassert!(text(&t).as_str().ends_with("framebuffer +20.000 ms, complete missing (total unknown)"));
 
         // Every phase but entry.
         let headless = TraceRing::<16>::new();
