@@ -589,8 +589,9 @@ impl fmt::Display for MmioError {
 
 /// Map the device registers (or firmware tables) at `[phys, phys + len)`
 /// uncached and read-write into the MMIO window; returns the virtual address
-/// of `phys`. Mappings are permanent (drivers keep their registers mapped). A failed call maps
-/// nothing (it may use up window addresses, of which there are plenty).
+/// of `phys`. Mappings are permanent (drivers keep their registers mapped).
+/// A failed call maps nothing (it may use up window addresses, of which
+/// there are plenty).
 pub fn map_mmio(phys: PhysAddr, len: u64) -> Result<VirtAddr, MmioError> {
     let end = phys.checked_add(len).filter(|_| len > 0).ok_or(MmioError::BadRange)?;
     let (first, last) = (align_down(phys.as_u64(), FRAME_SIZE), align_up(end.as_u64(), FRAME_SIZE));

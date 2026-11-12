@@ -4,9 +4,10 @@
 //!
 //! Firmware tables are packed and unaligned, so everything is parsed from
 //! byte slices with bounds-checked little-endian reads, never pointer casts.
-//! A table's length is range-checked as soon as its header is read, and its
-//! checksum before any field past the header is used (the RSDP's revision
-//! and length come before its checksum: they say how much to sum). A bad
+//! A table that is used has its length range-checked as soon as its header
+//! is read, and its checksum before any field past the header is used (the
+//! RSDP's revision and length come before its checksum: they say how much to
+//! sum). A bad
 //! table gives an [`Error`], never a panic. Physical memory is reached
 //! through [`PhysMem`]: the kernel implements it with its page tables, the
 //! tests with a fake memory.
@@ -169,10 +170,10 @@ pub struct Rsdp {
 }
 
 impl Rsdp {
-    /// Parse an RSDP from `b`, which must hold all of it (20 bytes for
-    /// revision 0, the length field's worth from revision 2 on). Checks the
-    /// signature, the first 20 bytes' checksum and, from revision 2 on, the
-    /// whole structure's.
+    /// Parse an RSDP from `b`, which must hold all of it (20 bytes below
+    /// revision 2, the length field's worth from revision 2 on). Checks the
+    /// signature, the first 20 bytes' checksum and, from revision 2 on, that
+    /// the length field is in range and the whole structure's checksum.
     pub fn parse(b: &[u8]) -> Result<Rsdp, Error> {
         let v1 = b.get(..RSDP_V1_LEN).ok_or(Error::Truncated(Signature::RSDP))?;
         if &v1[..8] != b"RSD PTR " {
@@ -331,7 +332,9 @@ impl<'a, M: PhysMem<'a>> Acpi<'a, M> {
     /// The first listed table with signature `sig`. Reads each listed
     /// table's header until one matches, skipping null entries and tables
     /// whose header can't be read (only the table returned has its length
-    /// and checksum checked).
+    /// and checksum checked). If that table's length or checksum is bad, or
+    /// it can't be read in full, that is the error: later tables with the
+    /// same signature are not tried.
     pub fn find(&mut self, sig: Signature) -> Result<Sdt<'a>, Error> {
         let mut skipped = None;
         for addr in self.table_addresses().filter(|&a| a != 0) {
@@ -351,8 +354,10 @@ impl<'a, M: PhysMem<'a>> Acpi<'a, M> {
 
     /// The signatures of the listed tables, in order (null entries left out).
     pub fn signatures(&mut self) -> impl Iterator<Item = Result<Signature, Error>> + '_ {
-        let addrs = self.table_addresses().filter(|&a| a != 0);
-        addrs.map(|addr| Ok(Signature(*read(&mut self.mem, addr, SDT_HEADER_LEN)?.first_chunk().expect("36 bytes"))))
+        self.table_addresses().filter(|&a| a != 0).map(|addr| {
+            let head = read(&mut self.mem, addr, SDT_HEADER_LEN)?;
+            Ok(Signature(*head.first_chunk().expect("a whole header")))
+        })
     }
 
     /// The memory reader, back.
@@ -518,8 +523,8 @@ impl<'a> Madt<'a> {
 fn decode(b: &[u8], off: usize) -> Result<(MadtEntry, usize), Error> {
     let (kind, len) = (u8_at(b, off).unwrap_or(0), u8_at(b, off + 1).unwrap_or(0));
     let bad = Error::BadMadtEntry { offset: MADT_FIXED_LEN + off, kind, len };
-    // Every entry has its type and length; one shorter than that would
-    // never advance.
+    // Every entry has its type and length bytes: a length of 0 would never
+    // advance, and 1 can't hold the length byte itself.
     if len < 2 {
         return Err(bad);
     }

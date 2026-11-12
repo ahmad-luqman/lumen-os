@@ -44,7 +44,9 @@ pub const KERNEL_IMAGE: &str = "kernel image";
 pub const KERNEL_FILE: &str = "kernel file";
 pub const BOOT_STACK: &str = "boot stack";
 pub const FRAMEBUFFER: &str = "framebuffer";
-const ACPI_RSDP: &str = "acpi rsdp";
+/// ACPI tables (and the RSDP) in usable memory: reserved at boot for the
+/// RSDP, later by `acpi` for each table it reads there.
+pub const ACPI_TABLE: &str = "acpi table";
 pub const BITMAP: &str = "frame bitmap";
 const NOTHING_ALLOCATED: &str = "nothing is allocated during init";
 
@@ -203,7 +205,7 @@ fn named_reservations(hhdm: u64) -> Reservations {
             // any other); other revisions give an HHDM pointer.
             let addr = resp.address() as u64;
             assert!(addr < hhdm, "RSDP address {addr:#x} is not physical; Limine base revision changed?");
-            r.push(ACPI_RSDP, PhysRange::from_len(addr, RSDP_SIZE));
+            r.push(ACPI_TABLE, PhysRange::from_len(addr, RSDP_SIZE));
         }
         None => warn!(target: "mem", "no ACPI RSDP from Limine"),
     }
@@ -408,7 +410,7 @@ pub enum ReserveError {
     ReservedFor { frame: u64, name: &'static str },
     /// This frame isn't usable memory the allocator manages.
     NotUsable(u64),
-    /// The named reservation list is full.
+    /// The range needs a new named reservation and the list is full.
     ListFull,
 }
 
@@ -429,16 +431,17 @@ impl core::fmt::Display for ReserveError {
 /// for `name` (the same table read again). Anything else is refused,
 /// changing nothing: an allocated frame (`InUse`), one reserved for
 /// something else (`ReservedFor`), one the allocator doesn't manage
-/// (`NotUsable`), or a range that would take frames when the named list is
-/// full (`ListFull`). A range that takes frames joins the named
-/// reservations (merged into a `name` reservation it overlaps or touches),
-/// which the in-kernel tests check. Returns how many frames it took.
+/// (`NotUsable`), or a range that takes frames but touches no `name`
+/// reservation when the named list is full (`ListFull`). A range that takes
+/// frames joins the named reservations (merged into a `name` reservation it
+/// overlaps or touches), so the in-kernel test that allocates every frame
+/// checks none of them is handed out. Returns how many frames it took.
 pub fn reserve(name: &'static str, range: PhysRange) -> Result<usize, ReserveError> {
     let mut guard = STATE.lock();
     let s = guard.as_mut().expect("frame allocator used before mm::init");
     let frames = range.grow_to_frames();
     let mut takes_any = false;
-    for f in pages(frames.start(), frames.len()) {
+    for f in (frames.start()..frames.end()).step_by(FRAME_SIZE as usize) {
         if s.frames.is_owned(f) {
             if !s.frames.is_free(f) {
                 return Err(ReserveError::InUse(f));
@@ -470,7 +473,7 @@ pub fn reserve(name: &'static str, range: PhysRange) -> Result<usize, ReserveErr
         }
         None => s.reserved.push(name, frames),
     }
-    debug!(target: "mem", "reservation {frames} {name} ({taken} frames, after boot)");
+    debug!(target: "mem", "reservation {frames} {name} ({taken} frames, found after the allocator was built)");
     Ok(taken)
 }
 
@@ -835,7 +838,7 @@ crate::ktest!(
     fn named_reservations_are_complete() {
         use self::checks::*;
         use crate::kassert_eq;
-        for name in [NULL_FRAME, KERNEL_IMAGE, KERNEL_FILE, BOOT_STACK, FRAMEBUFFER, ACPI_RSDP, BITMAP] {
+        for name in [NULL_FRAME, KERNEL_IMAGE, KERNEL_FILE, BOOT_STACK, FRAMEBUFFER, ACPI_TABLE, BITMAP] {
             if reservation(name).is_err() {
                 crate::ktest::diag(format_args!("missing reservation '{name}'"));
                 return Err("a named reservation is missing");
@@ -853,27 +856,34 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         const NAME: &str = "ktest reservation";
         let named = || with_state(|s| s.reserved.len);
-        // Two neighbouring frames: hold the second, free the first.
-        let a = alloc_contiguous(2, 1).ok_or("out of frames")?.as_u64();
-        let b = a + FRAME_SIZE;
+        // Three neighbouring frames: hold the last, free the others.
+        let first = alloc_contiguous(3, 1).ok_or("out of frames")?;
+        let (a, b, c) = (first.as_u64(), first.as_u64() + FRAME_SIZE, first.as_u64() + 2 * FRAME_SIZE);
+        let held = PhysFrame::from_u64(c).ok_or("frame")?;
         // SAFETY: allocated just above by this test and not used since.
-        kassert_eq!(unsafe { free_raw(a) }, Ok(()));
-        let refused = reserve(NAME, PhysRange::new(a + 8, b + 8));
-        let still = (with_state(|s| s.frames.is_free(a)), is_owned(b) && !with_state(|s| s.frames.is_free(b)));
+        unsafe { kassert!(free_raw(a).is_ok() && free_raw(b).is_ok()) };
+        let refused = reserve(NAME, PhysRange::new(b + 8, c + 8));
+        let still = (with_state(|s| s.frames.is_free(b)), is_allocated(held));
         // SAFETY: allocated above by this test and not used since.
-        kassert_eq!(unsafe { free_raw(b) }, Ok(()));
-        kassert_eq!(refused, Err(ReserveError::InUse(b)));
+        kassert_eq!(unsafe { free_raw(c) }, Ok(()));
+        kassert_eq!(refused, Err(ReserveError::InUse(c)));
         kassert_eq!(still, (true, true)); // refusing changed nothing
-        // Now both are free: `a` is taken first and named...
+        // Now all three are free. `b` is taken and named...
         let (before, names) = (free_frames(), named());
-        kassert_eq!(reserve(NAME, PhysRange::from_len(a + 8, 16)), Ok(1));
+        kassert_eq!(reserve(NAME, PhysRange::from_len(b + 8, 16)), Ok(1));
         kassert_eq!((free_frames(), named()), (before - 1, names + 1));
-        kassert!(!is_owned(a));
-        // ...then `b`, which merges into the same name, and again: nothing.
-        kassert_eq!(reserve(NAME, PhysRange::from_len(b, 1)), Ok(1));
-        kassert_eq!(reserve(NAME, PhysRange::new(a, b + FRAME_SIZE)), Ok(0));
-        kassert_eq!((free_frames(), named()), (before - 2, names + 1));
-        kassert_eq!(reservation(NAME)?, PhysRange::new(a, b + FRAME_SIZE));
+        kassert!(!is_owned(b));
+        // ...then `a` with `b` (merging downwards), then `b` with `c` (a
+        // range part reserved under the name, part free, as when a table's
+        // header and then its whole length are read), then all: nothing.
+        kassert_eq!(reserve(NAME, PhysRange::new(a, b + 8)), Ok(1));
+        kassert_eq!(reserve(NAME, PhysRange::new(b, c + 8)), Ok(1));
+        kassert_eq!(reserve(NAME, PhysRange::new(a, c + FRAME_SIZE)), Ok(0));
+        kassert_eq!((free_frames(), named()), (before - 3, names + 1));
+        kassert_eq!(reservation(NAME)?, PhysRange::new(a, c + FRAME_SIZE));
+        kassert!(!is_owned(a) && !is_owned(c));
+        // An empty range takes nothing, wherever it is.
+        kassert_eq!(reserve(NAME, PhysRange::new(a + 8, a + 8)), Ok(0));
         // Someone else's frames, and memory the allocator never had (the
         // local APIC's registers), are refused.
         let bitmap = reservation(BITMAP)?.start();
@@ -882,7 +892,21 @@ crate::ktest!(
             Err(ReserveError::ReservedFor { frame: bitmap, name: BITMAP })
         );
         kassert_eq!(reserve(NAME, PhysRange::from_len(0xfee0_0000, 4)), Err(ReserveError::NotUsable(0xfee0_0000)));
-        kassert_eq!((free_frames(), named()), (before - 2, names + 1));
+        kassert_eq!((free_frames(), named()), (before - 3, names + 1));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn the_rsdp_is_reserved_as_an_acpi_table() {
+        // `acpi` reads tables in usable memory under the same name, so an
+        // RSDP there (or a table sharing its frame) is not refused.
+        use self::checks::*;
+        use crate::kassert_eq;
+        let rsdp = reservation(ACPI_TABLE)?;
+        let names = with_state(|s| s.reserved.len);
+        kassert_eq!(reserve(ACPI_TABLE, rsdp), Ok(0));
+        kassert_eq!(with_state(|s| s.reserved.len), names);
         Ok(())
     }
 );

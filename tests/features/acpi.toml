@@ -9,6 +9,7 @@ tests = [
     "ktest:lumen_kernel::acpi::info_copies_what_q35_describes",
     "ktest:lumen_kernel::acpi::a_failed_walk_says_why",
     "ktest:lumen_kernel::acpi::discovery_keeps_nothing_it_does_not_return",
+    "ktest:lumen_kernel::acpi::only_enabled_cpus_are_ready",
     "scenario:test_acpi::test_cpu_count_matches_qemu[*]",
     "scenario:test_acpi::test_no_hpet_is_a_warning",
     "scenario:test_acpi::test_no_madt_boots_without_acpi",
@@ -24,4 +25,5 @@ tests = [
     "ktest:lumen_kernel::acpi::memory_that_holds_something_else_is_refused",
     "ktest:lumen_kernel::acpi::hhdm_covers_checks_every_page",
     "ktest:lumen_kernel::mm::frame::reserve_takes_free_frames_and_refuses_the_rest",
+    "ktest:lumen_kernel::mm::frame::the_rsdp_is_reserved_as_an_acpi_table",
 ]

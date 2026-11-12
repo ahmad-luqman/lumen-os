@@ -97,27 +97,33 @@ tests (for example `lumen-elf`, the symbol-table reader).
 1.0 firmware, or when the XSDT address is 0), then reads the MADT and the
 HPET table. The parsing is in the host-tested `lumen-acpi` crate:
 bounds-checked little-endian reads from byte slices (the tables are packed
-and unaligned). A table's length (capped at 1 MiB) is checked when its header
-is read, its checksum before any field past the header is used, and each MADT
-entry's length against the table and its type. Looking for a table skips
-null entries and tables whose header can't be read.
+and unaligned). A table that is used has its length (capped at 1 MiB)
+checked when its header is read, its checksum before any field past the
+header is used, and each MADT entry's length against the table and its type.
+Looking for a table skips null entries and tables whose header can't be
+read; only the table it returns has its length and checksum checked.
 
 The kernel reads tables through one reader, which only reads memory that
 holds firmware data: `acpi-*` and `reserved` entries (outside the HHDM) are
-mapped uncached with `map_mmio`, each page span once; RAM the HHDM covers is
-read through it only if it is usable memory, which is then reserved for ACPI
-tables (`frame::reserve`; see "Physical memory" in section 5). Anything else,
-such as a pointer into the frame bitmap or the framebuffer, is refused. The
-kernel copies what it needs into `acpi::Info` (every MADT CPU with its APIC id
-and state, the local APIC address with the type 5 override applied, the I/O
-APICs, the interrupt overrides, the 8259 flag and the HPET) and logs
-`INFO  acpi: N CPU(s), LAPIC at 0x..., HPET at 0x...` (or `..., no HPET`),
-after an `INFO  acpi: I/O APIC ...` line per I/O APIC. N counts enabled
-CPUs; QEMU's `maxcpus` hot-plug slots are listed but disabled. No RSDP, or
-a bad RSDP, root table or MADT, is a warning (`running without ACPI: ...`,
-naming why a read failed), not a panic: boot continues and `acpi::info()` is
-`None` (it panics before `acpi::init`). A missing or broken HPET alone is a
-warning (`no usable HPET: ...`) and leaves `hpet` empty.
+mapped uncached with `map_mmio` (a read inside a span already mapped reuses
+that mapping); RAM the HHDM covers is read through it only if it is usable
+memory, which is then reserved for ACPI tables under the name the RSDP's boot
+reservation uses (`frame::reserve`; see "Physical memory" in section 5).
+Anything else, such as a pointer into the frame bitmap or the framebuffer,
+is refused. The kernel copies what it needs into `acpi::Info` (every MADT CPU
+entry with its APIC id and state, the local APIC address with the type 5
+override applied, the I/O APICs, the interrupt overrides, the 8259 flag and
+the HPET) and logs `INFO  acpi: N CPU(s), LAPIC at 0x..., HPET at 0x...` (or
+`..., no HPET`), after an `INFO  acpi: I/O APIC ...` line per I/O APIC. N
+counts enabled CPU entries (a CPU listed twice, as type 0 and type 9, is
+warned about); QEMU's `maxcpus` hot-plug slots are listed but not enabled.
+
+No RSDP, or a bad RSDP, root table or MADT, is a warning
+(`running without ACPI: ...`, naming why a read failed), not a panic: boot
+continues and `acpi::info()` is `None` (it panics before `acpi::init`). A
+missing or broken HPET alone is a warning (`no usable HPET: ...`) and leaves
+`hpet` empty. A table skipped while looking for another is warned about too
+(`skipped the table at 0x...: ...`).
 
 Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 `isa-debug-exit`, used by tests) and `lumen.log=<error|warn|info|debug|trace>`.
@@ -158,13 +164,16 @@ level.
 Memory found once the allocator is built is reserved with
 `frame::reserve(name, range)`. Every frame must be free (it is taken) or
 already reserved under the same name; an allocated frame, one reserved for
-something else, memory the allocator doesn't manage, or a full named list is
-refused, changing nothing. A range that takes frames joins the named list
-(merged with a same-name range it touches). ACPI parsing reserves each table
-(or header) it reads in usable memory that way. It runs after the kernel's
-page tables, heap and stacks exist (it needs `map_mmio` and the heap), so a
-table whose frame was already handed out is refused: ACPI is skipped with a
-warning, or only the HPET if it was the HPET table. With OVMF on q35 the
+something else, or memory the allocator doesn't manage is refused, and so is
+a range that needs a new named entry when the list is full, changing
+nothing. A range that takes frames joins the named list (merged with a
+same-name range it touches). ACPI parsing reserves each table (or header) it
+reads in usable memory that way, under the RSDP's reservation name. It runs
+after the kernel's page tables, heap and stacks exist (it needs `map_mmio`
+and the heap), so a table whose frame was already handed out is refused: if
+that is the RSDP, the root table or the MADT, ACPI is skipped with a warning
+naming the frame; if it is the HPET table, only the HPET; another table's
+header is skipped (with a warning) while searching. With OVMF on q35 the
 tables are in `acpi-*` entries; only ktest stand-in frames exercise this
 path.
 
@@ -212,9 +221,10 @@ frames (zeroed) and switches CR3:
   no writable alias (W^X holds per frame, not just per page); the
   framebuffer is write-combining. 2 MiB pages where a whole one fits, 4 KiB
   elsewhere. ACPI memory is not in the HHDM; ACPI parsing maps the tables
-  it reads uncached with `map_mmio` (see "ACPI" in section 4). Entries that
-  share a page map it once; boot stops if they'd need different rights. A ktest checks every
-  HHDM span is mapped throughout (sampled every 2 MiB) with its own rights
+  it reads there uncached with `map_mmio` (see "ACPI" in section 4).
+  Entries that share a page map it once; boot stops if they'd need
+  different rights. A ktest checks every HHDM span is mapped throughout
+  (sampled every 2 MiB) with its own rights
   and memory type, nothing else is mapped outside the image and the MMIO
   window, and ACPI and reserved entries are absent (spot-checked).
 - **Kernel image** per segment from the linker script's page-aligned

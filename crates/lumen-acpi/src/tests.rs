@@ -51,11 +51,11 @@ fn rsdp_v1(rsdt: u32) -> Vec<u8> {
 }
 
 fn rsdp_v2(rsdt: u32, xsdt: u64) -> Vec<u8> {
-    rsdp_v2_len(rsdt, xsdt, 36)
+    rsdp_v2_claiming(rsdt, xsdt, 36)
 }
 
 /// A revision 2 RSDP whose length field says `len` (36 bytes are built).
-fn rsdp_v2_len(rsdt: u32, xsdt: u64, len: u32) -> Vec<u8> {
+fn rsdp_v2_claiming(rsdt: u32, xsdt: u64, len: u32) -> Vec<u8> {
     let mut r = rsdp_v1(rsdt);
     r[15] = 2;
     fix_checksum(&mut r, 8);
@@ -112,7 +112,8 @@ fn madt_flags(flags: u32, entries: &[Vec<u8>]) -> Vec<u8> {
 }
 
 /// Like QEMU q35 with `-smp 2,maxcpus=3`: two enabled CPUs, one hot-pluggable
-/// slot, the I/O APIC, its ISA overrides and a local APIC NMI (type 4).
+/// slot (disabled), the I/O APIC, three of its ISA overrides and a local
+/// APIC NMI (type 4).
 fn qemu_madt() -> Vec<u8> {
     madt_with(&[
         lapic(0, 0, 1),
@@ -212,13 +213,22 @@ fn rsdp_checks_signature_both_checksums_and_length() {
     let mut first = rsdp_v2(1, 2);
     first[16] ^= 1; // covered by both checksums
     assert_eq!(Rsdp::parse(&first), Err(Error::BadChecksum(Signature::RSDP)));
+    // The first 20 bytes' checksum alone: revision 0, and revision 2 with
+    // the extended checksum repaired over the change.
+    let mut v1 = rsdp_v1(1);
+    v1[16] ^= 1;
+    assert_eq!(Rsdp::parse(&v1), Err(Error::BadChecksum(Signature::RSDP)));
+    let mut v2 = rsdp_v2(1, 2);
+    v2[8] ^= 1;
+    fix_checksum(&mut v2, 32);
+    assert_eq!(Rsdp::parse(&v2), Err(Error::BadChecksum(Signature::RSDP)));
     let mut extended = rsdp_v2(1, 2);
     extended[24] ^= 1; // the XSDT address: only the extended checksum covers it
     assert_eq!(Rsdp::parse(&extended), Err(Error::BadChecksum(Signature::RSDP)));
     let mut short = rsdp_v2(1, 2);
     short[20] = 20;
     assert_eq!(Rsdp::parse(&short), Err(Error::BadLength { sig: Signature::RSDP, len: 20 }));
-    let long = rsdp_v2_len(1, 2, MAX_RSDP_LEN + 1);
+    let long = rsdp_v2_claiming(1, 2, MAX_RSDP_LEN + 1);
     assert_eq!(Rsdp::parse(&long), Err(Error::BadLength { sig: Signature::RSDP, len: MAX_RSDP_LEN + 1 }));
     for len in 0..36 {
         assert!(Rsdp::parse(&rsdp_v2(1, 2)[..len]).is_err(), "cut at {len}");
@@ -229,7 +239,7 @@ fn rsdp_checks_signature_both_checksums_and_length() {
 #[test]
 fn a_huge_rsdp_length_is_refused_before_it_is_read() {
     for len in [20, MAX_RSDP_LEN + 1, u32::MAX] {
-        let regions = vec![(0x100, rsdp_v2_len(0, 0x1000, len))];
+        let regions = vec![(0x100, rsdp_v2_claiming(0, 0x1000, len))];
         let mut mem = Mem::new(&regions);
         assert_eq!(Acpi::new(&mut mem, 0x100).err(), Some(Error::BadLength { sig: Signature::RSDP, len }));
         assert_eq!(mem.reads, 2, "only the first 20 and 24 bytes were read (length {len})");
@@ -375,8 +385,9 @@ fn madt_lists_cpus_ioapics_and_overrides() {
 }
 
 #[test]
-fn madt_reads_x2apic_cpus_the_address_override_and_more_ioapics() {
-    // No 8259 PICs, and a second I/O APIC: nothing here is 0 by default.
+fn madt_reads_x2apic_cpus_the_address_override_and_nonzero_fields() {
+    // No 8259 PICs, and an I/O APIC shaped like a machine's second one (id
+    // 2, GSI base 24): nothing here is 0 by default.
     let t = madt_flags(
         0,
         &[
@@ -437,7 +448,7 @@ fn malformed_madt_entries_are_refused() {
 #[test]
 fn a_cut_madt_is_refused_unless_cut_between_entries() {
     let t = qemu_madt();
-    // Entry boundaries in the entry area: 8, 8, 8, 12, 10, 10, 10, 6.
+    // Entry lengths in the entry area: 8, 8, 8, 12, 10, 10, 10, 6.
     let mut boundaries = vec![MADT_FIXED_LEN];
     for len in [8, 8, 8, 12, 10, 10, 10, 6] {
         boundaries.push(boundaries.last().unwrap() + len);
@@ -477,6 +488,13 @@ fn hpet_parses_and_checks_its_address_space() {
     for len in SDT_HEADER_LEN..t.len() {
         assert_eq!(Hpet::parse(Sdt::parse(&cut(&t, len)).unwrap()), Err(Error::Truncated(Signature::HPET)), "{len}");
     }
+    // Each capability bit on its own, and the widest comparator field.
+    let wide = hpet_with(0, 0x3f00 | 1 << 13);
+    let h = Hpet::parse(Sdt::parse(&wide).unwrap()).unwrap();
+    assert_eq!((h.comparators, h.counter_64bit, h.legacy_replacement), (32, true, false));
+    let legacy = hpet_with(0, 1 << 15);
+    let h = Hpet::parse(Sdt::parse(&legacy).unwrap()).unwrap();
+    assert_eq!((h.comparators, h.counter_64bit, h.legacy_replacement), (1, false, true));
     let plain = hpet_at(0, 0x0000_0001, 0x1_2345_6000, 2);
     let h = Hpet::parse(Sdt::parse(&plain).unwrap()).unwrap();
     assert_eq!((h.comparators, h.counter_64bit, h.legacy_replacement, h.pci_vendor), (1, false, false, 0));
@@ -522,4 +540,35 @@ fn a_short_read_is_unreadable() {
     }
     let rsdp = rsdp_v2(0, 0x1000);
     assert_eq!(Acpi::new(Short(&rsdp[..30]), 0x100).err(), Some(Error::Unreadable { addr: 0x100, len: 36 }));
+}
+
+#[test]
+fn a_matching_table_that_cant_be_read_in_full_is_the_error() {
+    // Only the MADT's header is readable: `find` reports that, rather than
+    // looking on and saying there is no MADT.
+    struct HeaderOnly<'a>(Mem<'a>, u64);
+    impl<'a> PhysMem<'a> for HeaderOnly<'a> {
+        fn read(&mut self, addr: u64, len: usize) -> Option<&'a [u8]> {
+            if addr == self.1 && len > SDT_HEADER_LEN { None } else { self.0.read(addr, len) }
+        }
+    }
+    let regions = machine();
+    let mut acpi = Acpi::new(HeaderOnly(Mem::new(&regions), 0x7fbe_2000), RSDP_AT).unwrap();
+    let len = qemu_madt().len();
+    assert_eq!(acpi.find(Signature::MADT), Err(Error::Unreadable { addr: 0x7fbe_2000, len }));
+}
+
+#[test]
+fn unknown_madt_entries_in_the_middle_are_stepped_over() {
+    let t = madt_with(&[
+        lapic(0, 0, 1),
+        vec![4, 6, 0xff, 0, 0, 1],
+        entry(0x7f, &[&[1, 2, 3]]),
+        lapic(1, 1, 1),
+        ioapic(0, 0xfec0_0000, 0),
+    ]);
+    let madt = Madt::parse(Sdt::parse(&t).unwrap()).unwrap();
+    assert_eq!(madt.cpus().map(|c| c.apic_id).collect::<Vec<_>>(), [0, 1]);
+    assert_eq!(madt.io_apics().count(), 1);
+    assert_eq!(madt.entries().nth(2), Some(MadtEntry::Other { kind: 0x7f, len: 5 }));
 }

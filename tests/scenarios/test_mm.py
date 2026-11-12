@@ -114,13 +114,21 @@ def kmon_heap(m) -> dict[str, int]:
     return heap
 
 
+def crash_after_kmon_heap(crash_report, kind: str) -> tuple[dict[str, int], str]:
+    """kmon's heap summary at the prompt, then the report of `crash <kind>`."""
+    before: dict[str, int] = {}
+    report = crash_report(kind, at_prompt=lambda m: before.update(kmon_heap(m)))
+    return before, report
+
+
 def test_kmon_heap_reports_usage(boot):
     m = boot("qemutest")
     m.expect(r"kmon> ", BOOT_TIMEOUT)
     heap = kmon_heap(m)
     # What boot keeps (`acpi::Info`, for one) is in use, a handful of
-    # allocations; the rest of what the heap mapped is free. (In-kernel tests
-    # check that boot code frees what it doesn't keep.)
+    # allocations; the rest of what the heap mapped is free.
+    # (`discovery_keeps_nothing_it_does_not_return` checks that ACPI
+    # discovery frees what it doesn't keep.)
     assert heap["base"] == HEAP_BASE, heap
     assert 0 < heap["live"] <= 16, f"{heap}: nothing kept at boot (did acpi::init fail?), or a leak"
     assert 0 < heap["largest"] <= heap["free"] < heap["mapped"], heap
@@ -144,8 +152,7 @@ def test_out_of_memory_report_shows_the_heap(crash_report):
 
 
 def test_double_free_is_refused(crash_report):
-    before: dict[str, int] = {}
-    report = crash_report("dfree", at_prompt=lambda m: before.update(kmon_heap(m)))
+    before, report = crash_after_kmon_heap(crash_report, "dfree")
     bad_free = (
         r"^panic: heap: bad free of 0xffffc[0-9a-f]{11} \(64 bytes, align 16\): "
         r"block overlaps free memory \(double free or wrong layout\)$"
@@ -167,16 +174,19 @@ def test_corrupt_free_list_is_a_crash_not_a_hang(crash_report):
     # kmon links a freed block's free-list node back to itself and then
     # allocates past it. The walk must panic (with the heap's lock held),
     # and the report must still show the heap, naming the corruption.
-    before: dict[str, int] = {}
-    report = crash_report("heapcorrupt", at_prompt=lambda m: before.update(kmon_heap(m)))
+    before, report = crash_after_kmon_heap(crash_report, "heapcorrupt")
     corrupt = re.search(
-        r"^panic: heap free list corrupt at offset (0x[0-9a-f]+) \(size 0x40, next (0x[0-9a-f]+)\)$",
+        r"^panic: heap free list corrupt at offset (0x[0-9a-f]+) "
+        r"\(size (0x[0-9a-f]+), next (0x[0-9a-f]+)\)$",
         report,
         re.MULTILINE,
     )
-    assert corrupt and corrupt[1] == corrupt[2], report  # the node links to itself
-    offset = int(corrupt[1], 16)
+    assert corrupt and corrupt[1] == corrupt[3], report  # the node links to itself
+    offset, size = int(corrupt[1], 16), int(corrupt[2], 16)
     assert offset % 16 == 0 and offset < before["mapped"], (before, report)
+    # The freed 64-byte block, merged with whatever free space it landed
+    # next to (first fit depends on boot's layout).
+    assert size >= 0x40 and size % 16 == 0, report
     # One more 64-byte block in use than at the prompt.
     locked = (
         r"^heap \(lock held; may be mid-update\): \d+ bytes mapped at 0xffffc00000000000, "
