@@ -6,9 +6,10 @@
 //! from a [`Claims`] table, which hands each of its ranges out once ever
 //! (building a table is `unsafe`: it vouches that nothing else covers those
 //! ranges), and a holder can split off disjoint sub-windows
-//! ([`Window::split_off`]). So two live windows never overlap, and the
-//! kernel's `paging::map` can be safe for whoever holds the window for a
-//! page.
+//! ([`Window::split_off`]). So, given that contract, two live windows never
+//! overlap, and the kernel's `paging::map` can be safe for whoever holds the
+//! window for a page. A window names no address space: the kernel's page
+//! tables check that its pages lie in the heap and stack windows.
 //!
 //! Claims are never released: a dropped window's range is gone for good,
 //! because sub-windows split off it may still be in use.
@@ -19,7 +20,20 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::FRAME_SIZE;
 
 /// A page-aligned virtual range that belongs to its holder alone.
+///
+/// No safe code can make one outside this module, or copy one:
+///
+/// ```compile_fail,E0451
+/// let forged = lumen_mm::window::Window { start: 0, end: 4096 };
+/// ```
+///
+/// ```compile_fail,E0599
+/// fn copy(w: &lumen_mm::window::Window) -> lumen_mm::window::Window {
+///     w.clone()
+/// }
+/// ```
 #[derive(Debug, PartialEq, Eq)]
+#[must_use = "dropping a window gives its range up for good"]
 pub struct Window {
     start: u64,
     end: u64,
@@ -51,6 +65,7 @@ impl Window {
 
     /// Give the lowest `len` bytes (whole pages) away as a window of their
     /// own; this window keeps the rest. `None` if it is smaller than `len`.
+    #[must_use = "dropping the split-off window gives its range up for good"]
     pub fn split_off(&mut self, len: u64) -> Option<Window> {
         assert!(len.is_multiple_of(FRAME_SIZE), "window split {len:#x} is not whole pages");
         if len > self.len() {
@@ -79,7 +94,7 @@ impl<const N: usize> Claims<N> {
     /// window's soundness rests on this.
     ///
     /// # Panics
-    /// If a range is not page-aligned and non-empty, or two overlap.
+    /// If a range is misaligned or empty, or two overlap.
     pub const unsafe fn new(ranges: [(u64, u64); N]) -> Claims<N> {
         let mut i = 0;
         while i < N {
@@ -98,6 +113,10 @@ impl<const N: usize> Claims<N> {
 
     /// Range `i` as a window, the first time it is asked for; `None` ever
     /// after.
+    ///
+    /// # Panics
+    /// If `i >= N`.
+    #[must_use = "dropping a claimed window gives its range up for good"]
     pub fn claim(&self, i: usize) -> Option<Window> {
         let (start, end) = self.ranges[i];
         (!self.taken[i].swap(true, Ordering::AcqRel)).then_some(Window { start, end })
@@ -148,7 +167,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "not whole pages")]
     fn split_off_refuses_partial_pages() {
-        table().claim(0).unwrap().split_off(100);
+        let _ = table().claim(0).unwrap().split_off(100);
     }
 
     #[test]
@@ -157,7 +176,7 @@ mod tests {
         let (lo, hi) = (BASE + 16 * P, BASE + 20 * P);
         assert!(w.owns_page(lo) && w.owns_page(hi - P));
         assert!(!w.owns_page(lo - P) && !w.owns_page(hi));
-        assert!(!w.owns_page(u64::MAX - 8), "no overflow at the top");
+        assert!(!w.owns_page(u64::MAX - 8), "far outside");
         assert!(w.contains(&(lo..hi)) && w.contains(&(lo + 8..lo + 16)));
         assert!(!w.contains(&(lo - 8..lo + 8)) && !w.contains(&(hi - 8..hi + 8)));
         assert!(!w.contains(&(lo + 2 * P..lo + P)), "backwards");
@@ -173,10 +192,14 @@ mod tests {
             // SAFETY: as above.
             unsafe { Claims::new([(BASE + 8, BASE + P)]) }
         });
+        let misaligned_end = std::panic::catch_unwind(|| {
+            // SAFETY: as above.
+            unsafe { Claims::new([(BASE, BASE + P + 8)]) }
+        });
         let empty = std::panic::catch_unwind(|| {
             // SAFETY: as above.
             unsafe { Claims::new([(BASE, BASE)]) }
         });
-        assert!(overlap.is_err() && misaligned.is_err() && empty.is_err());
+        assert!(overlap.is_err() && misaligned.is_err() && misaligned_end.is_err() && empty.is_err());
     }
 }

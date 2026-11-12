@@ -286,3 +286,35 @@ crate::ktest!(
         Ok(())
     }
 );
+
+crate::ktest!(
+    fn a_stack_maps_only_its_own_pages() {
+        // A stack's own window is its pages alone: not its guard page (which
+        // has no token at all) and not the page above it (the next guard).
+        use crate::kassert_eq;
+        use lumen_mm::VirtAddr;
+        use lumen_mm::paging::Attrs;
+        let mut stack =
+            KernelStack::new(2 * lumen_mm::FRAME_SIZE, StackKind::Test).map_err(|_| "allocating a stack")?;
+        let range = stack.range;
+        kassert_eq!(stack.window.range(), range.span());
+        let v = |a| VirtAddr::new(a).expect("canonical");
+        let mut refused = [None, None];
+        for (slot, page) in refused.iter_mut().zip([range.guard(), range.top]) {
+            let f = super::frame::alloc_owned().ok_or("out of frames")?;
+            match paging::map(&mut stack.window, v(page), f, Attrs::DATA) {
+                Err((e, f)) => {
+                    drop(f);
+                    *slot = Some(e);
+                }
+                Ok(()) => return Err("a stack's window mapped a page outside it"),
+            }
+        }
+        drop(stack);
+        kassert_eq!(
+            refused,
+            [Some(paging::VmError::NotOwner(v(range.guard()))), Some(paging::VmError::NotOwner(v(range.top)))]
+        );
+        Ok(())
+    }
+);

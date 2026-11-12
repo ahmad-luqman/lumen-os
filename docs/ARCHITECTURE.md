@@ -137,8 +137,9 @@ Single frames come from a word scan starting from a hint below which no frame
 is free; contiguous runs from a linear scan. Callers return exactly what they
 allocated (`free` for `alloc`, `free_contiguous` with the same count for
 `alloc_contiguous`), so a buddy allocator can replace it behind the same
-interface if contiguous allocation becomes hot. Both are `unsafe` (the
-caller vouches that it owns the frames and nothing uses them); `alloc_owned`
+interface if contiguous allocation becomes hot. `free` and
+`free_contiguous` are `unsafe` (the caller vouches that it owns the frames
+and nothing uses them); `alloc_owned`
 gives an `OwnedFrame` instead, which frees itself on drop and is what
 `paging::map` takes.
 
@@ -215,17 +216,21 @@ page. The kernel API:
   Paging hands each window out once ever (`claim_heap_window`,
   `claim_stack_window`, and two test windows at the top GiB of each for the
   ktests); a holder can split off disjoint sub-windows (each kernel stack
-  gets its own), and nothing else can make one. Frames come as `OwnedFrame`s
+  gets its own; guard pages get none, so they can never be mapped), and no
+  safe code can make one (building a claims table is `unsafe`). Frames come as `OwnedFrame`s
   (move-only, freed on drop; the raw `frame::free` is `unsafe`). With both
   proven, `map(&mut window, virt, frame, attrs)` is safe: it consumes the
   frame (giving it back on failure) and still refuses what it can check
-  (outside the token, outside both windows, a frame nobody allocated,
+  (outside the token, outside the heap and stack windows (the
+  address-space check: a window names no address space; `build` checks the
+  HHDM ends below them), a frame nobody allocated,
   non-write-back or executable rights, since allocator frames are writable
   through the HHDM). `unmap` stays `unsafe`: only the caller knows nothing
   refers through the page any more. It invalidates the TLB entry and gives
   the frame back. What the types don't prove: that nothing uses a page being
   unmapped, and that the frame's HHDM alias goes unused (every allocated
-  frame has one; only `unsafe` code can reach it). Everything else (image,
+  frame has one; only `unsafe` code, including the ktest helpers, can reach
+  it). Everything else (image,
   HHDM, MMIO) is fixed.
 - `map_mmio`: uncached, permanent; refuses memory the HHDM maps (two memory
   types for one frame is undefined); all or nothing (a partial mapping is

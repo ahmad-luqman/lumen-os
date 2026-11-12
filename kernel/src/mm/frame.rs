@@ -317,8 +317,8 @@ pub fn alloc_contiguous(count: usize, align_frames: usize) -> Option<PhysFrame> 
 ///
 /// # Safety
 /// The caller owns `f` (it allocated it, or was handed it) and nothing uses
-/// it any more; in particular no [`OwnedFrame`] holds it (an owned frame is
-/// what lets `paging::map` be safe).
+/// it any more; in particular no other [`OwnedFrame`] holds it, and no
+/// mapping does (an owned frame is what lets `paging::map` be safe).
 pub unsafe fn free(f: PhysFrame) -> Result<(), FreeError> {
     with_frames(|a| a.free(f.as_u64()))
 }
@@ -336,7 +336,7 @@ pub unsafe fn free_contiguous(first: PhysFrame, count: usize) -> Result<(), Free
 /// when dropped. `paging::map` consumes one and `paging::unmap` gives it
 /// back, which is half of what makes `map` safe (the other half is the
 /// window token). Every frame also has an HHDM alias; only `unsafe` code can
-/// reach it.
+/// reach it (including the `unsafe` ktest helpers).
 #[derive(Debug)]
 #[must_use = "dropping an owned frame frees it"]
 pub struct OwnedFrame(PhysFrame);
@@ -358,6 +358,7 @@ impl OwnedFrame {
 
     /// Give up ownership without freeing: the caller now holds `f` raw (for
     /// `paging::map`, whose mapping holds it until `unmap`).
+    #[must_use = "discarding the raw frame leaks it"]
     pub fn into_raw(self) -> PhysFrame {
         let f = self.0;
         core::mem::forget(self);
@@ -365,14 +366,27 @@ impl OwnedFrame {
     }
 }
 
+impl OwnedFrame {
+    /// Free the frame now, reporting a failure (a kernel bug) to the caller,
+    /// which can say what it was doing; dropping panics instead.
+    pub fn free(self) -> Result<(), FreeError> {
+        let f = self.into_raw();
+        // SAFETY: as in `drop`.
+        unsafe { free(f) }
+    }
+}
+
 impl Drop for OwnedFrame {
     fn drop(&mut self) {
-        // SAFETY: we own the frame and are giving it up.
+        // SAFETY: a live `OwnedFrame` is never mapped (`map` turns it raw;
+        // `unmap` hands it back only after removing the mapping and flushing
+        // the TLB) and nothing else holds it, so nothing uses the frame.
         unsafe { free(self.0) }.unwrap_or_else(|e| panic!("mm: freeing owned frame {} failed: {e:?}", self.0));
     }
 }
 
 /// Allocate one 4 KiB frame as an [`OwnedFrame`] (freed when dropped).
+#[must_use = "dropping the frame frees it again"]
 pub fn alloc_owned() -> Option<OwnedFrame> {
     // SAFETY: just allocated, so nothing else owns or uses it.
     alloc().map(|f| unsafe { OwnedFrame::from_raw(f) })
@@ -791,7 +805,8 @@ crate::ktest!(
         // SAFETY: allocated above by this test and not used since.
         kassert_eq!(unsafe { free(b) }, Ok(()));
         kassert_eq!(b, a);
-        // SAFETY: a double free, which the allocator refuses (asserted).
+        // SAFETY: `a` is free again (it is `b`, freed just above, and nothing
+        // allocated since), so `free` only reads the bitmap and refuses.
         kassert_eq!(unsafe { free(a) }, Err(FreeError::DoubleFree));
 
         let kernel = reservation(KERNEL_IMAGE)?.start();

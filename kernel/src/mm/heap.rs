@@ -649,3 +649,38 @@ crate::ktest!(
         Ok(())
     }
 );
+
+crate::ktest!(
+    fn heap_maps_only_in_its_own_window() {
+        // The heap holds the heap window's token, and that token can't map
+        // a page just past the heap (the ktest page) or in the stack window.
+        use crate::kassert_eq;
+        use lumen_mm::VirtAddr;
+        use lumen_mm::paging::Attrs;
+        let v = |a| VirtAddr::new(a).expect("canonical");
+        let mut state = STATE.lock();
+        let window = state.window.as_mut().ok_or("the heap holds no window")?;
+        let range = window.range();
+        let mut refused = [None, None];
+        for (slot, page) in refused.iter_mut().zip([paging::HEAP_LIMIT, paging::STACKS_BASE]) {
+            let f = frame::alloc_owned().ok_or("out of frames")?;
+            match paging::map(window, v(page), f, Attrs::DATA) {
+                Err((e, f)) => {
+                    drop(f);
+                    *slot = Some(e);
+                }
+                Ok(()) => return Err("the heap's window mapped a page outside it"),
+            }
+        }
+        drop(state);
+        kassert_eq!(range, paging::HEAP_BASE..paging::HEAP_LIMIT);
+        kassert_eq!(
+            refused,
+            [
+                Some(paging::VmError::NotOwner(v(paging::HEAP_LIMIT))),
+                Some(paging::VmError::NotOwner(v(paging::STACKS_BASE)))
+            ]
+        );
+        Ok(())
+    }
+);

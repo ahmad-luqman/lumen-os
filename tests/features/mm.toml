@@ -92,6 +92,9 @@ tests = [
     "ktest:lumen_kernel::mm::paging::a_window_outside_the_windows_is_refused_too",
     "ktest:lumen_kernel::mm::paging::windows_are_claimed_once_ever",
     "ktest:lumen_kernel::mm::paging::dropping_an_owned_frame_frees_it",
+    "ktest:lumen_kernel::mm::paging::map_fresh_rolls_back_at_an_already_mapped_page",
+    "ktest:lumen_kernel::mm::heap::heap_maps_only_in_its_own_window",
+    "ktest:lumen_kernel::mm::stack::a_stack_maps_only_its_own_pages",
     "ktest:lumen_kernel::mm::heap::growth_failure_rolls_back",
     "ktest:lumen_kernel::mm::stack::guard_page_unmapped",
 ]

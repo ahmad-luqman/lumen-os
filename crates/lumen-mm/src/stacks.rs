@@ -97,8 +97,9 @@ impl StackRange {
 
 /// Hands out stack addresses in the stack window, upward, a guard page below
 /// each and the page above the last one left free. It holds the window's
-/// [`Window`] token and splits off a sub-window (guard page and stack) for
-/// each stack, so each stack's holder owns its pages. Addresses are never
+/// [`Window`] token and splits off a sub-window for each stack, so each
+/// stack's holder owns its pages. Guard pages get no token at all (their
+/// ranges are split off and dropped), so no one can ever map one. Addresses are never
 /// reused; the caller sizes the window so that doesn't run out (the kernel's
 /// is about 1 TiB).
 #[derive(Debug)]
@@ -112,8 +113,8 @@ impl StackWindow {
     }
 
     /// Addresses for the next stack of `size` bytes (a nonzero multiple of
-    /// the page size), with its guard page below it, and the sub-window
-    /// that owns both; `None` once the window is full.
+    /// the page size), with its guard page below it, and the sub-window that
+    /// owns the stack (not the guard page); `None` once the window is full.
     pub fn take(&mut self, size: u64) -> Option<(StackRange, Window)> {
         assert!(size != 0 && size.is_multiple_of(FRAME_SIZE), "stack size {size:#x} is not whole pages");
         let len = GUARD_SIZE.checked_add(size)?;
@@ -121,9 +122,11 @@ impl StackWindow {
         if len.checked_add(GUARD_SIZE)? > self.window.len() {
             return None;
         }
-        let own = self.window.split_off(len)?;
+        // The guard page's range is given up for good: no token, no mapping.
+        drop(self.window.split_off(GUARD_SIZE)?);
+        let own = self.window.split_off(size)?;
         let r = own.range();
-        Some((StackRange { bottom: r.start + GUARD_SIZE, top: r.end }, own))
+        Some((StackRange { bottom: r.start, top: r.end }, own))
     }
 }
 
@@ -317,8 +320,10 @@ mod tests {
         let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));
         let (a, own_a) = w.take(64 * K).unwrap();
         let (b, own_b) = w.take(16 * K).unwrap();
-        assert_eq!(own_a.range(), a.guard()..a.top);
-        assert_eq!(own_b.range(), b.guard()..b.top);
+        // Each sub-window is the stack alone: the guard page has no token.
+        assert_eq!(own_a.range(), a.span());
+        assert_eq!(own_b.range(), b.span());
+        assert!(!own_a.owns_page(a.guard()) && !own_b.owns_page(b.guard()));
         assert!(own_a.range().end <= own_b.range().start);
     }
 

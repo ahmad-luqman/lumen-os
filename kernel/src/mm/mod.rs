@@ -19,7 +19,8 @@ static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 /// Set up memory management from the bootloader's responses: the frame
 /// allocator (built while Limine's page tables are active), the kernel's
-/// own page tables, then the heap (from here on `alloc` works).
+/// own page tables, then the heap (from here on `alloc` works), then the
+/// stack window (from here on `stack::KernelStack::new` works).
 pub fn init() {
     let hhdm = boot::HHDM.get_response().expect("Limine gave no HHDM response").offset();
     HHDM_OFFSET.store(hhdm, Ordering::Relaxed);

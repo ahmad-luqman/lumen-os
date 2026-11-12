@@ -69,8 +69,8 @@ pub unsafe fn unmap_and_free(window: &mut Window, pages: Range<u64>) {
     unsafe { release(window, pages, None) }
 }
 
-/// [`unmap_and_free`], naming `cause` in the panic if this undoes a failed
-/// [`map_fresh`].
+/// [`unmap_and_free`], naming `cause` in the panic (unmapping or freeing
+/// failed) if this undoes a failed [`map_fresh`].
 ///
 /// # Safety
 /// As for [`unmap_and_free`].
@@ -78,24 +78,30 @@ unsafe fn release(window: &mut Window, pages: Range<u64>, cause: Option<WindowEr
     check_bounds(window, &pages);
     for virt in pages.step_by(FRAME_SIZE as usize) {
         let v = VirtAddr::new(virt).expect("window addresses are canonical");
-        // SAFETY: the page is the window's and nothing refers to it. The
-        // frame comes back owned; dropping it frees it.
-        let freed = unsafe { paging::unmap(window, v) };
-        if let Err(e) = freed {
+        let failed = |what: fmt::Arguments<'_>| -> ! {
             match cause {
-                Some(c) => panic!("mm: rollback after `{c}` failed: unmap {v}: {e}"),
-                None => panic!("mm: releasing owned pages failed: unmap {v}: {e}"),
+                Some(c) => panic!("mm: rollback after `{c}` failed: {what}"),
+                None => panic!("mm: releasing owned pages failed: {what}"),
             }
+        };
+        // SAFETY: the page is the window's and nothing refers to it.
+        match unsafe { paging::unmap(window, v) } {
+            Ok((_, frame)) => frame.free().unwrap_or_else(|e| failed(format_args!("free at {v}: {e:?}"))),
+            Err(e) => failed(format_args!("unmap {v}: {e}")),
         }
     }
 }
 
 /// Map a fresh frame at `virt` (a page of `window`). On failure the frame
-/// comes back and is freed when dropped.
+/// comes back and is freed.
 fn map_one(window: &mut Window, virt: u64) -> Result<(), WindowError> {
     let v = VirtAddr::new(virt).expect("window addresses are canonical");
     let frame = frame::alloc_owned().ok_or(WindowError::OutOfFrames)?;
-    paging::map(window, v, frame, Attrs::DATA).map_err(|(e, _freed_on_drop)| WindowError::Map(e))
+    paging::map(window, v, frame, Attrs::DATA).map_err(|(e, frame)| {
+        let raw = frame.frame();
+        frame.free().unwrap_or_else(|fe| panic!("mm: freeing {raw} after mapping it at {v} failed (`{e}`): {fe:?}"));
+        WindowError::Map(e)
+    })
 }
 
 /// `pages` is page-aligned and inside `window`: a caller bug otherwise.
