@@ -197,7 +197,7 @@ is what the CPU enforces; `Attrs` can't express a writable and executable
 page. The kernel API:
 
 - `map`/`unmap` (`unsafe`): 4 KiB pages for the owners of the heap and stack
-  windows (#5, #6). The caller promises it owns the frame and the page and
+  windows (the heap; stacks, #6). The caller promises it owns the frame and the page and
   that nothing refers through a page it unmaps; the functions refuse what
   they can check (addresses outside those windows, frames nobody allocated,
   non-write-back or executable rights, since allocator frames are writable
@@ -249,9 +249,9 @@ blocks)); size classes for small objects can go in front of it later.
 
 When growing fails the allocation returns null: `try_reserve` callers see
 an error, and everything else reaches `alloc`'s default error handler,
-which panics (`#[alloc_error_handler]` is unstable). Either way the crash
-report shows the heap's state, including why the last growth failed. kmon's
-`heap` command prints the same line. Lock order: heap, page tables, frame
+which panics (`#[alloc_error_handler]` is unstable). Every crash report
+shows the heap's state in one line, including why the last growth failed;
+kmon's `heap` command prints the same line. Lock order: heap, page tables, frame
 allocator; nothing holding the last two may allocate.
 
 ## 6. Interrupts, exceptions and crash reports (built)

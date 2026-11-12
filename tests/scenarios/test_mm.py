@@ -123,8 +123,9 @@ def test_double_free_is_refused(crash_report):
     )
     assert re.search(bad_free, report, re.MULTILINE), report
     assert any("kmon::crash_double_free" in f for f in backtrace(report)), report
-    # The first free went through and the second changed nothing: nothing in
-    # use, and the free list is intact (one block, all of it).
+    # The first free went through and the second changed nothing: only the
+    # 32-byte block kmon keeps is in use, and the free list is intact (one
+    # block: everything above it).
     heap = heap_line(report)
-    assert heap["used"] == heap["live"] == "0" and heap["blocks"] == "1", heap
-    assert heap["largest"] == heap["free"] == heap["mapped"], heap
+    assert (heap["used"], heap["live"], heap["blocks"]) == ("32", "1", "1"), heap
+    assert int(heap["largest"]) == int(heap["free"]) == int(heap["mapped"]) - 32, heap

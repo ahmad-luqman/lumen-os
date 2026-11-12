@@ -46,6 +46,7 @@ tests = [
     "ktest:lumen_kernel::mm::heap::fragmentation_stress",
     "ktest:lumen_kernel::mm::heap::vec_and_box_work",
     "ktest:lumen_kernel::mm::heap::growth_failure_rolls_back",
+    "ktest:lumen_kernel::mm::heap::crash_stats_never_block",
     "ktest:lumen_kernel::mm::paging::hhdm_maps_exactly_the_hhdm_types",
     "scenario:test_mm::test_kmon_heap_reports_usage",
     "scenario:test_mm::test_out_of_memory_report_shows_the_heap",

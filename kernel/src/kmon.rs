@@ -220,11 +220,13 @@ fn crash_out_of_memory() {
 }
 
 /// Free the same block twice: the heap must refuse the second free (a
-/// panic), not corrupt its free list. (`black_box`: see
+/// panic), not corrupt its free list. A 32-byte block stays live, so the
+/// report's heap line has something in use. (`black_box`: see
 /// [`crash_out_of_memory`]; LLVM may delete the whole sequence otherwise.)
 #[inline(never)]
 fn crash_double_free() {
     use core::hint::black_box;
+    let keep = black_box(alloc::boxed::Box::new([0u8; 32]));
     let layout = core::alloc::Layout::from_size_align(64, 16).expect("valid layout");
     // SAFETY: deliberately misusing the allocator: the second `dealloc` is
     // a double free, which the heap detects before touching memory.
@@ -236,5 +238,6 @@ fn crash_double_free() {
         alloc::alloc::dealloc(black_box(p), layout);
         alloc::alloc::dealloc(black_box(p), layout);
     }
+    drop(keep);
     let _ = writeln!(serial::SerialWriter, "crash: a double free went unnoticed");
 }

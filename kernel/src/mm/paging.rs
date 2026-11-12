@@ -20,7 +20,8 @@
 //! pointers fault.
 //!
 //! After that, [`map`] and [`unmap`] manage 4 KiB pages in the kernel heap
-//! and stack windows (for their owners, #5 and #6), and [`map_mmio`] maps
+//! and stack windows (for their owners: [`super::heap`] and the kernel
+//! stacks, #6), and [`map_mmio`] maps
 //! device registers uncached in the MMIO window (ARCHITECTURE.md section 5).
 //! The format, walks and mapper are host-tested in `lumen_mm::paging`; this
 //! module gives them access to table frames through the HHDM ([`Hhdm`]).
@@ -635,29 +636,7 @@ mod checks {
         if failed { Err("freeing a table failed") } else { Ok(()) }
     }
 
-    /// A fixed buffer for checking formatted output without a heap.
-    pub struct Buf {
-        pub data: [u8; 512],
-        pub len: usize,
-    }
-
-    impl Buf {
-        pub const fn new() -> Self {
-            Self { data: [0; 512], len: 0 }
-        }
-        pub fn as_str(&self) -> &str {
-            core::str::from_utf8(&self.data[..self.len]).unwrap_or("<invalid utf-8>")
-        }
-    }
-
-    impl Write for Buf {
-        fn write_str(&mut self, s: &str) -> fmt::Result {
-            let end = self.len + s.len();
-            self.data.get_mut(self.len..end).ok_or(fmt::Error)?.copy_from_slice(s.as_bytes());
-            self.len = end;
-            Ok(())
-        }
-    }
+    pub use crate::ktest::Buf;
 }
 
 crate::ktest!(

@@ -269,16 +269,33 @@ crate::ktest!(
 
 crate::ktest!(
     fn fragmentation_stress() {
-        // Random sizes and alignments, allocated and freed in random order,
-        // each block filled and checked before it is freed. Then everything
-        // is freed: it must coalesce, so an allocation as large as the
-        // stress made the heap grow fits without growing it again.
+        // First every free block is filled, so the stress runs only in
+        // memory it makes the heap grow by, whatever earlier tests left.
+        // Random sizes and alignments are then allocated and freed in random
+        // order, each block filled and checked before it is freed. Freeing
+        // the rest must coalesce everything the stress used back into one
+        // block, so an allocation of all of it fits without growing.
         use crate::{kassert, kassert_eq};
         use alloc::alloc::{alloc, dealloc};
         use alloc::vec::Vec;
-        let (before, list_before) = (stats(), check().map_err(|_| "free list broken before the test")?);
-        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         let mut live: Vec<(*mut u8, Layout, u8)> = Vec::with_capacity(1024);
+        let blocks = check().map_err(|_| "free list broken before the test")?.blocks;
+        let mut filler: Vec<(*mut u8, Layout)> = Vec::with_capacity(2 * blocks + 16);
+        loop {
+            let list = check().map_err(|_| "free list broken while filling")?;
+            if list.largest == 0 {
+                break;
+            }
+            kassert!(filler.len() < filler.capacity());
+            let layout = Layout::from_size_align(list.largest, 16).map_err(|_| "layout")?;
+            // SAFETY: non-zero size.
+            let p = unsafe { alloc(layout) };
+            kassert!(!p.is_null());
+            filler.push((p, layout));
+        }
+        let before = stats();
+        kassert_eq!(before.free(), 0);
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         for step in 0..6000u32 {
             if live.len() < 1000 && (live.is_empty() || rng.below(100) < 55) {
                 let max = if rng.below(10) == 0 { 64 * 1024 } else { 4096 };
@@ -305,14 +322,12 @@ crate::ktest!(
             // SAFETY: allocated above with this layout.
             unsafe { dealloc(p, layout) };
         }
-        drop(live);
         let after = stats();
         kassert_eq!((after.used, after.live), (before.used, before.live));
-        let list = check().map_err(|_| "free list broken after the test")?;
-        // At most one new free block: the growth, merged with any free tail.
-        kassert!(list.blocks <= list_before.blocks + 1);
         let grown = after.size - before.size;
-        kassert!(grown >= 1 << 20); // the stress outgrew the heap it started with
+        kassert!(grown >= 1 << 20);
+        let list = check().map_err(|_| "free list broken after the test")?;
+        kassert_eq!(list, lumen_heap::FreeList { blocks: 1, bytes: grown, largest: grown });
         let big = Layout::from_size_align(grown, 16).map_err(|_| "layout")?;
         // SAFETY: non-zero size.
         let p = unsafe { alloc(big) };
@@ -320,6 +335,29 @@ crate::ktest!(
         kassert_eq!(stats().size, after.size);
         // SAFETY: allocated just above with this layout.
         unsafe { dealloc(p, big) };
+        for (p, layout) in filler {
+            // SAFETY: allocated above with this layout.
+            unsafe { dealloc(p, layout) };
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn crash_stats_never_block() {
+        // The crash reporter may run while the heap's lock is held (a fault
+        // inside the allocator): its heap line must say so, not deadlock.
+        // (The buffer is on the stack: allocating here would deadlock.)
+        use crate::kassert;
+        let mut buf = crate::ktest::Buf::new();
+        let held = STATE.lock();
+        let written = write_crash_stats(&mut buf);
+        drop(held);
+        kassert!(written.is_ok());
+        kassert!(buf.as_str() == "heap: locked (the crash happened inside the allocator)\n");
+        let mut buf = crate::ktest::Buf::new();
+        kassert!(write_crash_stats(&mut buf).is_ok());
+        kassert!(buf.as_str().starts_with("heap: ") && buf.as_str().contains(" bytes mapped at "));
         Ok(())
     }
 );
