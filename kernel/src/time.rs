@@ -1,7 +1,8 @@
 //! Timekeeping: the TSC's frequency, calibrated at boot against the HPET (or
 //! the PIT if there is none, or it doesn't work), [`now_ns`] and [`sleep`]
 //! from it, and the local APIC timer ticking at [`TICK_HZ`], calibrated
-//! against the TSC.
+//! against the TSC. It also holds the boot's origin ([`mark_boot`]), which
+//! the boot timeline and the log's timestamps ([`since_boot_ns`]) count from.
 //!
 //! Calibration polls with interrupts off and takes the median of several
 //! 10 ms windows, so one window stretched by an SMI or a descheduled vCPU

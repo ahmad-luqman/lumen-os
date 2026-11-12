@@ -11,7 +11,7 @@
 //! ```
 //!
 //! The timestamp is seconds since `kmain` began, to the microsecond; every
-//! line before the TSC is calibrated (up to the `time: tsc` line) shows `?`
+//! line before the TSC is calibrated (before the `time: tsc` line) shows `?`
 //! instead (the boot timeline covers those phases afterwards). The screen's
 //! console shows lines without it, so screenshots stay comparable (not
 //! tested: the golden image covers only the header).

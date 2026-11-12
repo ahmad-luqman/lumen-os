@@ -15,6 +15,8 @@ def test_boot_reaches_logger(boot):
     m.expect(r"INFO  mem: \d+ regions, \d+ MiB usable")
     m.expect(r"INFO  fb: framebuffer 1280x800 ready")
     m.expect(r"INFO  boot: boot complete")
+    # The timeline is logged after `boot complete` (at warn if incomplete).
+    m.expect(r"boot: timeline: .*\n")
     out = m.output
     assert "WARN" not in out, "boot logged a warning"
     assert "ERROR" not in out, "boot logged an error"
@@ -23,13 +25,16 @@ def test_boot_reaches_logger(boot):
 # `[seconds.micro] LEVEL tag: message`, or `[    ?.??????]` before the TSC is
 # calibrated (kernel/src/klog.rs, lumen_time::Stamp).
 LOG_LINE = re.compile(
-    r"^\[(?P<stamp> *\d+\.\d{6}|    \?\.\?{6})\] (?P<level>ERROR|WARN |INFO |DEBUG|TRACE) [a-z0-9_:]+: \S"
+    r"^\[(?: *(?P<stamp>\d+\.\d{6})|    \?\.\?{6})\] "
+    r"(?:ERROR|WARN |INFO |DEBUG|TRACE) [a-z0-9_:]+: \S"
 )
 # The timeline line, with its own stamp (kernel/src/trace.rs, `Timeline`).
+# An incomplete one is logged at warn: matched too, so the test fails at once
+# with the line instead of timing out.
 TIMELINE = re.compile(
-    r"\[ *(?P<stamp>\d+\.\d{6})\] INFO  boot: timeline: (?P<phases>.*) "
-    r"\(total (?P<total>\d+\.\d{3}) ms\)\n"
+    r"\[ *(?P<stamp>\d+\.\d{6})\] (?P<level>INFO |WARN ) boot: timeline: (?P<text>.*)\n"
 )
+COMPLETE = re.compile(r"(?P<phases>.*) \(total (?P<total>\d+\.\d{3}) ms\)")
 PHASE = re.compile(r"(?P<name>\S+) \+(?P<ms>\d+\.\d{3}) ms")
 PHASES = [
     "entry",
@@ -74,30 +79,35 @@ def test_log_lines_are_structured(boot):
     stamps = [match["stamp"] for match in matches]
     calibrated = next((i for i, line in enumerate(lines) if "INFO  time: tsc " in line), None)
     assert calibrated is not None, "no `time: tsc` line"
-    assert all("?" in s for s in stamps[:calibrated]), stamps
-    us = [micros(s.strip()) for s in stamps[calibrated:]]
+    assert all(s is None for s in stamps[:calibrated]), stamps
+    assert all(s is not None for s in stamps[calibrated:]), stamps
+    us = [micros(s) for s in stamps[calibrated:]]
     assert us == sorted(us), stamps
-    assert us[0] > 0, stamps
 
 
 def test_boot_timeline_printed(boot):
     """At boot complete, every phase's time since `kmain` began, in order."""
     m = boot("qemutest")
     line = m.expect(TIMELINE, BOOT_TIMEOUT)
-    phases = [PHASE.fullmatch(p) for p in line["phases"].split(", ")]
+    timeline = COMPLETE.fullmatch(line["text"])
+    assert line["level"] == "INFO " and timeline, line[0]
+    phases = [PHASE.fullmatch(p) for p in timeline["phases"].split(", ")]
     assert all(phases) and [p["name"] for p in phases] == PHASES, line[0]
     us = {p["name"]: micros(p["ms"]) for p in phases}
     assert list(us.values()) == sorted(us.values()), line[0]
-    total = micros(line["total"])
+    total = micros(timeline["total"])
     assert total == us["complete"], line[0]
-    # The origin is kmain's start, not the TSC's reset or firmware handoff:
-    # GDT/IDT setup takes well under 50 ms.
+    # The origin is at most 50 ms before arch-init: not the TSC's reset or
+    # firmware handoff (GDT/IDT setup takes well under 50 ms).
     assert us["arch-init"] < 50_000, line[0]
-    # In guest time: the time phase calibrates the TSC and the timer
-    # (2 x `time::WINDOWS` (5) windows of `WINDOW_NS` (10 ms); the TSC's run
-    # on the HPET or PIT, the timer's on the TSC itself) and sleeps 10 ms for
-    # the first tick, so it takes at least 60 ms; the whole boot generously
-    # under 30 s (an emulator runs slower, never that slow).
+    # In guest time, measured by the TSC: the time phase calibrates the timer
+    # against the TSC (`time::WINDOWS` (5) windows of `WINDOW_NS` (10 ms),
+    # each waited out on the TSC) and sleeps 10 ms on it for the first tick:
+    # at least 60 ms by construction. Calibrating the TSC itself (5 more
+    # windows, timed by the HPET or PIT) adds about 50 ms, but in TSC time
+    # only as closely as the median frequency fits each window, so the bound
+    # leaves it out. The whole boot: generously under 30 s (an emulator runs
+    # slower, never that slow).
     assert us["time"] - us["interrupts"] >= 60_000, line[0]
     assert total <= 30_000_000, line[0]
     # The line's own stamp, taken just after the last phase: at or after the

@@ -73,7 +73,8 @@ tests (for example `lumen-elf`, the symbol-table reader).
    `0xffffffff80000000`, and no lower-half identity map at base revision 3),
    answers our requests (`kernel/src/boot.rs`), and jumps to `_start`.
 3. **`_start`** (naked asm): `xor ebp, ebp` ends the backtrace chain, the stack
-   top is passed to `kmain`, and the stack is aligned.
+   top is passed to `kmain`, and the stack is aligned. `kmain`'s first
+   statement reads the TSC, the boot timeline's origin (below).
 4. **`arch::init_early`**: COM1 serial, then the GDT and TSS, then the IDT
    with all 256 vectors. **From this point a CPU exception produces a crash
    report**, except a #DF caused by a broken stack pointer before step 6
@@ -103,8 +104,8 @@ tests (for example `lumen-elf`, the symbol-table reader).
 so GDT and IDT setup still come first in effect): the origin of both the
 boot timeline and the log's timestamps. The pinned Limine crate has no
 bootloader-performance request, so the bootloader's own time isn't counted.
-Entry marks the origin; every other phase records a `BootPhase` trace event
-when it ends: arch-init, logger, symbols, memory, stacks, acpi, interrupts,
+Entry is recorded with the origin's TSC; every other phase records a
+`BootPhase` trace event when it ends: arch-init, logger, symbols, memory, stacks, acpi, interrupts,
 time (calibration, interrupts on, the 10 ms first-tick check), framebuffer,
 complete. After `boot complete` the kernel prints them from the ring,
 converted with the calibrated TSC:
@@ -113,10 +114,12 @@ converted with the calibrated TSC:
 [    0.139423] INFO  boot: timeline: entry +0.000 ms, arch-init +0.145 ms, ..., complete +139.382 ms (total 139.382 ms)
 ```
 
-A phase with no event is named as missing, and the total is `complete`'s;
-an incomplete timeline is logged as a warning. Serial log lines start with
-the time since that origin, `[seconds.microseconds]`; every line before the
-TSC is calibrated (up to `time: tsc ...`) shows `[    ?.??????]`, not a
+A phase with no event is named as missing, one stamped before entry or
+before an earlier phase says so, and the total is `complete`'s; an
+incomplete timeline is logged as a warning (not tested: every boot's
+timeline is complete; the scenario fails on the warning). Serial log lines
+start with the time since that origin, `[seconds.microseconds]`; every line
+before the TSC is calibrated (before `time: tsc ...`) shows `[    ?.??????]`, not a
 zero that would read as a measurement. The screen's console shows lines
 without timestamps, so screenshots stay comparable (not tested: the golden
 image covers only the header).
@@ -755,8 +758,8 @@ kernel. The kernel is the trusted computing base.
 - **Boot timeline:** boot phases emit trace events, printed as a timeline at
   boot complete (section 4). The fast-boot target is under 1 s from kernel
   entry to the shell, measured in the guest from TSC timestamps (never by
-  host wall-clock time in tests). About 140 ms under TCG when this was
-  written, most of it calibrating the TSC and the timer.
+  host wall-clock time in tests). About 140 ms under TCG at M1, most of
+  it calibrating the TSC and the timer.
 - **Logger:** `log` facade with level and subsystem tags, and on serial a
   timestamp since kernel entry (built). Every emitted log line also records
   a `Log` trace event (level, tag).
@@ -789,7 +792,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/arch/        HAL; x86_64/ has gdt, idt, irq, apic, pic, pit, serial, stacks (registry), cpu, qemu, paging
   src/acpi.rs      ACPI discovery (MADT, HPET) through lumen-acpi
   src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs
-  src/time.rs      TSC and local APIC timer calibration, now_ns, sleep, ticks
+  src/time.rs      TSC and local APIC timer calibration, the boot origin, now_ns, sleep, ticks
   src/boot.rs      Limine requests
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner

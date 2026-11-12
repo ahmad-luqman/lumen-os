@@ -131,10 +131,12 @@ own PR that updates that doc first.
   holds their registry (backtraces, overflow reports).
   `mm/paging.rs`: the kernel's page tables (HHDM, W^X image, map/unmap,
   MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
-  PAT. `trace.rs`: trace ring, event kinds, `ktrace!`. `acpi.rs`: ACPI
+  PAT. `trace.rs`: trace ring, event kinds, `ktrace!`, the boot timeline
+  (`Timeline`). `acpi.rs`: ACPI
   discovery (CPUs, LAPIC, I/O APICs, HPET) and the firmware-table reader.
   `interrupts.rs`: 8259s masked, local APIC on, I/O APIC inputs masked.
-  `time.rs`: TSC and LAPIC timer calibration, `now_ns`, `sleep`, `ticks`.
+  `time.rs`: TSC and LAPIC timer calibration, the boot origin
+  (`mark_boot`, `since_boot_ns`), `now_ns`, `sleep`, `ticks`.
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
 - `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, the
   page-table format and mapper (host-tested, incl. a model comparison), the
@@ -144,7 +146,8 @@ own PR that updates that doc first.
   coalescing; host-tested, incl. a randomized stress test against a shadow map).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads).
 - `crates/lumen-time`: timekeeping arithmetic: calibration, tick/ns
-  conversion, timer counts (host-tested).
+  conversion, timer counts, log time formats (`Stamp`, `Millis`)
+  (host-tested).
 - `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET
   (host-tested on handcrafted tables).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines

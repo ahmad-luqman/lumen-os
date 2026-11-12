@@ -1,10 +1,9 @@
 //! Timekeeping arithmetic for the Lumen kernel: working out a counter's
 //! frequency from a reference clock, converting ticks to and from
-//! nanoseconds, and the counts the PIT and the local APIC timer are
-//! programmed with. All of it is integer math (the kernel has no floating
-//! point) in `u128` where products can overflow, so it holds for centuries
-//! of uptime (and then saturates); and how times read in logs (`Stamp`,
-//! `Millis`).
+//! nanoseconds, the counts the PIT and the local APIC timer are programmed
+//! with, and how times read in logs (`Stamp`, `Millis`). All of it is
+//! integer math (the kernel has no floating point) in `u128` where products
+//! can overflow, so it holds for centuries of uptime (and then saturates).
 
 #![no_std]
 
