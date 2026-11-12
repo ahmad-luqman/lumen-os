@@ -56,17 +56,30 @@ fn kernel_image() -> (u64, u64) {
     (start, &raw const __kernel_end as u64 - start)
 }
 
-/// A virtual range the kernel is using: its name, and `(start, length)`, or
-/// `None` where it is unknown or empty (missing Limine response, empty
-/// cmdline, allocator not built yet).
-pub type LiveRange = (&'static str, Option<(u64, u64)>);
+/// A virtual range the kernel is using.
+#[derive(Clone, Copy, Debug)]
+struct LiveRange {
+    name: &'static str,
+    /// `(start, length)`, or `None` where it is unknown or empty (missing
+    /// Limine response, empty cmdline, allocator not built yet).
+    range: Option<(u64, u64)>,
+    /// May legitimately be `None` (the response or value can be absent).
+    optional: bool,
+    /// The kernel writes it, so it must stay writable.
+    written: bool,
+}
 
-/// Every virtual range the running kernel depends on (the memory map's
-/// entries, each its own pointer, are checked separately). The page tables
+const fn live(name: &'static str, range: Option<(u64, u64)>, optional: bool, written: bool) -> LiveRange {
+    LiveRange { name, range, optional, written }
+}
+
+/// The virtual ranges the kernel is known to depend on (the memory map's
+/// entries, each its own pointer, and the rest of Limine's responses are
+/// covered separately by the pre-switch check). The page tables
 /// must map all of them (checked before switching to the kernel's own
 /// tables) and the frames behind them must never be handed out (checked by
 /// the frame allocator's tests).
-pub fn live_ranges() -> [LiveRange; 8] {
+fn live_ranges() -> [LiveRange; 8] {
     let (stack_lo, stack_hi) = arch::stacks::boot_stack();
     let file = boot::EXECUTABLE_FILE.get_response().map(|r| (r.file().addr() as u64, r.file().size()));
     let bitmap = frame::bitmap().map(|b| (phys_to_virt(PhysAddr::new(b.start()).expect("physical")).as_u64(), b.len()));
@@ -77,17 +90,13 @@ pub fn live_ranges() -> [LiveRange; 8] {
     let cmdline = crate::cmdline::get();
     let cmdline = (!cmdline.is_empty()).then_some((cmdline.as_ptr() as u64, cmdline.len() as u64));
     [
-        (frame::KERNEL_IMAGE, Some(kernel_image())),
-        (frame::BOOT_STACK, (stack_hi > stack_lo).then_some((stack_lo, stack_hi - stack_lo))),
-        (CURRENT_STACK, Some((arch::read_rsp(), 1))),
-        (frame::KERNEL_FILE, file),
-        (frame::FRAMEBUFFER, frame::framebuffer_virt()),
-        (frame::BITMAP, bitmap),
-        (MEMORY_MAP, memmap),
-        (CMDLINE, cmdline),
+        live(frame::KERNEL_IMAGE, Some(kernel_image()), false, false),
+        live(frame::BOOT_STACK, (stack_hi > stack_lo).then_some((stack_lo, stack_hi - stack_lo)), false, true),
+        live("current stack page", Some((arch::read_rsp(), 1)), false, true),
+        live(frame::KERNEL_FILE, file, true, false),
+        live(frame::FRAMEBUFFER, frame::framebuffer_virt(), true, true),
+        live(frame::BITMAP, bitmap, false, true),
+        live("memory map (entry pointers)", memmap, false, false),
+        live("cmdline", cmdline, true, false),
     ]
 }
-
-pub const CURRENT_STACK: &str = "current stack page";
-pub const MEMORY_MAP: &str = "memory map (entry pointers)";
-pub const CMDLINE: &str = "cmdline";

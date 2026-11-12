@@ -32,6 +32,9 @@
 //! empty table in place (it is reused by later maps). A 2 MiB or 1 GiB map
 //! where a table already exists fails with [`MapError::AlreadyMapped`] even
 //! if that table is empty.
+//!
+//! Walks don't model reserved bits: a huge bit in an L4 entry (reserved, a
+//! #PF on real hardware) is treated as a table pointer.
 
 use core::fmt;
 
@@ -255,10 +258,6 @@ fn table_entry(table: PhysFrame) -> u64 {
 pub struct Entry(u64);
 
 impl Entry {
-    pub const fn from_raw(raw: u64) -> Self {
-        Self(raw)
-    }
-
     pub const fn raw(self) -> u64 {
         self.0
     }
@@ -331,8 +330,9 @@ pub trait TableMemoryMut: TableMemory {
     fn alloc_table(&mut self) -> Option<PhysFrame>;
 }
 
-/// One entry read on the way down.
+/// One entry read on the way down (built only by [`walk`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Step {
     pub level: Level,
     /// The table the entry was read from.
@@ -341,8 +341,10 @@ pub struct Step {
     pub entry: Entry,
 }
 
-/// A present page, with the rights the CPU enforces for it.
+/// A present page, with the rights the CPU enforces for it (built only by
+/// walks and sweeps).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Mapping {
     /// Start of the virtual page.
     pub virt: VirtAddr,
@@ -365,9 +367,9 @@ impl Mapping {
         Cache::from_pat_slot(self.pat_slot)
     }
 
-    /// Does the physical page contain `frame`?
-    pub const fn contains_frame(&self, frame: PhysFrame) -> bool {
-        self.phys.as_u64() <= frame.as_u64() && frame.as_u64() < self.phys.as_u64() + self.size.bytes()
+    /// The physical address of `virt`, which must be inside this page.
+    pub const fn phys_of(&self, virt: VirtAddr) -> Option<PhysAddr> {
+        self.phys.start().checked_add(virt.as_u64() - self.virt.as_u64())
     }
 }
 
@@ -391,15 +393,16 @@ impl PathRights {
     }
 
     /// The mapping of the page starting at `virt` that leaf `e` (of `size`)
-    /// maps, with these rights (already combined with `e`'s).
-    fn mapping(self, virt: VirtAddr, e: Entry, size: PageSize) -> Mapping {
+    /// maps, with these rights combined with `e`'s.
+    fn leaf(self, virt: VirtAddr, e: Entry, size: PageSize) -> Mapping {
+        let rights = self.and(e);
         Mapping {
             virt,
             phys: e.page(size),
             size,
-            writable: self.writable,
-            executable: self.executable,
-            user: self.user,
+            writable: rights.writable,
+            executable: rights.executable,
+            user: rights.user,
             pat_slot: e.pat_slot(size),
         }
     }
@@ -460,11 +463,11 @@ pub fn walk(mem: &impl TableMemory, root: PhysFrame, virt: VirtAddr) -> Walk {
             w.end = WalkEnd::NotPresent(level);
             return w;
         }
-        rights = rights.and(entry);
         if let Some(size) = entry.page_size(level) {
-            w.end = WalkEnd::Mapped(rights.mapping(virt.align_down(size.bytes()), entry, size));
+            w.end = WalkEnd::Mapped(rights.leaf(virt.align_down(size.bytes()), entry, size));
             return w;
         }
+        rights = rights.and(entry);
         table = entry.table();
         level = level.below().expect("every L1 entry is a page");
     }
@@ -472,8 +475,7 @@ pub fn walk(mem: &impl TableMemory, root: PhysFrame, virt: VirtAddr) -> Walk {
 
 /// The physical address `virt` maps to, if it is mapped.
 pub fn translate(mem: &impl TableMemory, root: PhysFrame, virt: VirtAddr) -> Option<PhysAddr> {
-    let m = walk(mem, root, virt).mapping()?;
-    m.phys.start().checked_add(virt.as_u64() - m.virt.as_u64())
+    walk(mem, root, virt).mapping()?.phys_of(virt)
 }
 
 /// Why [`map`] failed. Nothing is mapped when it fails (though tables it
@@ -538,6 +540,47 @@ pub fn map(
         };
         level = level.below().expect("the leaf level is L1 at the lowest");
     }
+}
+
+/// Map `[virt, virt + len)` to `[phys, phys + len)` (both page aligned)
+/// with 2 MiB pages where a whole one fits (both addresses 2 MiB aligned)
+/// and 4 KiB pages elsewhere. All or nothing: if a page can't be mapped, the
+/// pages already mapped are unmapped again, calling `flushed` with each (the
+/// CPU may have cached them), and the error is returned.
+pub fn map_range(
+    mem: &mut impl TableMemoryMut,
+    root: PhysFrame,
+    virt: VirtAddr,
+    phys: PhysFrame,
+    len: u64,
+    attrs: Attrs,
+    mut flushed: impl FnMut(VirtAddr),
+) -> Result<(), MapError> {
+    let big = PageSize::Size2M.bytes();
+    let mut off = 0;
+    while off < len {
+        let (v, p) = (virt.checked_add(off), phys.start().checked_add(off));
+        let (Some(v), Some(p)) = (v, p) else { return Err(MapError::Misaligned) };
+        let size = if v.is_aligned(big) && p.is_aligned(big) && len - off >= big {
+            PageSize::Size2M
+        } else {
+            PageSize::Size4K
+        };
+        let frame = PhysFrame::from_start(p).ok_or(MapError::Misaligned)?;
+        if let Err(e) = map(mem, root, v, frame, size, attrs) {
+            // Undo by what each unmap removed: a 2 MiB page goes in one step.
+            let mut undo = 0;
+            while undo < off {
+                let at = virt.checked_add(undo).expect("mapped above");
+                let m = unmap(mem, root, at).expect("a page this call just mapped");
+                flushed(at);
+                undo += m.size.bytes();
+            }
+            return Err(e);
+        }
+        off += size.bytes();
+    }
+    Ok(())
 }
 
 /// Why [`unmap`] failed. Nothing changed.
@@ -605,10 +648,9 @@ pub fn for_each_mapping(mem: &impl TableMemory, root: PhysFrame, mut f: impl FnM
                 continue;
             }
             let base = base | (index as u64) << level.shift();
-            let rights = rights.and(entry);
             match (entry.page_size(level), level.below()) {
-                (Some(size), _) => f(rights.mapping(canonical(base), entry, size)),
-                (None, Some(below)) => go(mem, below, entry.table(), base, rights, f, unreadable),
+                (Some(size), _) => f(rights.leaf(canonical(base), entry, size)),
+                (None, Some(below)) => go(mem, below, entry.table(), base, rights.and(entry), f, unreadable),
                 (None, None) => unreachable!("every L1 entry is a page"),
             }
         }
@@ -618,22 +660,22 @@ pub fn for_each_mapping(mem: &impl TableMemory, root: PhysFrame, mut f: impl FnM
     unreadable.map_or(Ok(()), Err)
 }
 
-/// Call `f` with every table frame under `root` (including `root`), with its
-/// level. Returns how many it visited, or the first table that could not be
-/// read (the tables under it are not visited).
+/// Call `f` with every table frame under `root` (including `root`). Returns
+/// how many it visited, or the first table that could not be read (the
+/// tables under it are not visited).
 pub fn for_each_table(
     mem: &impl TableMemory,
     root: PhysFrame,
-    mut f: impl FnMut(Level, PhysFrame),
+    mut f: impl FnMut(PhysFrame),
 ) -> Result<usize, PhysFrame> {
     fn go(
         mem: &impl TableMemory,
         level: Level,
         table: PhysFrame,
-        f: &mut dyn FnMut(Level, PhysFrame),
+        f: &mut dyn FnMut(PhysFrame),
         unreadable: &mut Option<PhysFrame>,
     ) -> usize {
-        f(level, table);
+        f(table);
         let mut n = 1;
         let Some(below) = level.below() else { return n };
         for index in 0..ENTRIES {
@@ -971,7 +1013,7 @@ mod tests {
         // The table sweep visits the unreadable table but says it couldn't
         // look inside, so its children are known to be missing.
         let mut seen = Vec::new();
-        assert_eq!(for_each_table(&m, root, |_, t| seen.push(t)), Err(l2));
+        assert_eq!(for_each_table(&m, root, |t| seen.push(t)), Err(l2));
         assert!(seen.contains(&l2));
         m.unreadable.insert(root.as_u64());
         assert_eq!(walk(&m, root, v(KERNEL)).end(), WalkEnd::Unreadable(Level::L4, root));
@@ -1005,11 +1047,70 @@ mod tests {
             ]
         );
         let mut tables = BTreeSet::new();
-        let n = for_each_table(&m, root, |_, t| {
+        let n = for_each_table(&m, root, |t| {
             tables.insert(t.as_u64());
         });
         assert_eq!(n, Ok(m.tables.len()));
         assert_eq!(tables, m.tables.keys().copied().collect());
+    }
+
+    #[test]
+    fn ranges_use_huge_pages_where_they_fit() {
+        let (mut m, root) = FakeMem::new();
+        // 4 KiB up to the 2 MiB boundary, one 2 MiB page, then a 4 KiB tail.
+        let (virt, phys, len) = (HHDM + M2 - 2 * K, M2 - 2 * K, 2 * K + M2 + K);
+        map_range(&mut m, root, v(virt), f(phys), len, Attrs::DATA, |_| panic!("nothing to undo")).unwrap();
+        let mut seen = Vec::new();
+        for_each_mapping(&m, root, |mp| seen.push((mp.virt.as_u64() - HHDM, mp.size))).unwrap();
+        assert_eq!(
+            seen,
+            [
+                (M2 - 2 * K, PageSize::Size4K),
+                (M2 - K, PageSize::Size4K),
+                (M2, PageSize::Size2M),
+                (2 * M2, PageSize::Size4K),
+            ]
+        );
+        for off in [0, 2 * K, len - 1] {
+            assert_eq!(translate(&m, root, v(virt + off)), Some(p(phys + off)));
+        }
+        assert_eq!(translate(&m, root, v(virt + len)), None, "nothing past the end");
+        // Only 4 KiB pages when the physical side isn't 2 MiB aligned too.
+        let (mut m, root) = FakeMem::new();
+        map_range(&mut m, root, v(HHDM), f(K), M2, Attrs::DATA, |_| {}).unwrap();
+        let mut sizes = BTreeSet::new();
+        for_each_mapping(&m, root, |mp| {
+            sizes.insert(mp.size.bytes());
+        })
+        .unwrap();
+        assert_eq!(sizes, BTreeSet::from([K]));
+    }
+
+    #[test]
+    fn a_failed_range_maps_nothing() {
+        // A 2 MiB page, then a 4 KiB tail whose L1 table can't be allocated:
+        // the rollback must remove the 2 MiB page in one step (stepping by
+        // 4 KiB would find the rest "not mapped").
+        let (mut m, root) = FakeMem::new();
+        let base = HHDM + G1;
+        // L3 + L2 for the 2 MiB page; the tail needs one more (L1).
+        m.allocs_left = 2;
+        let mut flushed = Vec::new();
+        let got = map_range(&mut m, root, v(base), f(G1), M2 + K, Attrs::MMIO, |va| flushed.push(va));
+        assert_eq!(got, Err(MapError::OutOfMemory));
+        assert_eq!(flushed, [v(base)]);
+        assert_eq!(for_each_mapping(&m, root, |mp| panic!("left mapped: {mp:?}")), Ok(()));
+        // The same with several 4 KiB pages before the failure.
+        let (mut m, root) = FakeMem::new();
+        m.allocs_left = 3; // L3, L2, L1 for the first table of small pages
+        let mut flushed = Vec::new();
+        let got = map_range(&mut m, root, v(base + M2 - 2 * K), f(M2 - 2 * K), 3 * K + M2, Attrs::DATA, |va| {
+            flushed.push(va.as_u64() - base)
+        });
+        // The 2 MiB page needs no new table, the tail's L1 table does.
+        assert_eq!(got, Err(MapError::OutOfMemory));
+        assert_eq!(flushed, [M2 - 2 * K, M2 - K, M2]);
+        assert_eq!(for_each_mapping(&m, root, |mp| panic!("left mapped: {mp:?}")), Ok(()));
     }
 
     /// xorshift64: deterministic randomness without a dependency.
@@ -1028,8 +1129,8 @@ mod tests {
 
     #[test]
     fn random_maps_and_unmaps_agree_with_a_model() {
-        // Pages in an 8 MiB window that straddles a 1 GiB boundary in the
-        // upper half, so walks cross L2 and L3 tables.
+        // Pages in a 16 MiB window centred on a 1 GiB boundary in the upper
+        // half, so walks cross L3 entries (two L2 tables) and many L1 tables.
         let base = HHDM + G1 - 4 * M2;
         let sizes = [PageSize::Size4K, PageSize::Size2M];
         // [2M ok, 4K ok, refused over a page, refused by an empty table, unmap ok]

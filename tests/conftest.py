@@ -87,7 +87,7 @@ def crash_report(boot: Callable[[str], Machine]) -> Callable[[str], str]:
         m.expect(r"kmon> ", 60)
         m.send_line(f"crash {kind}")
         # A deliberate protection fault that doesn't fault says so at once.
-        done = m.expect(rf"{re.escape(END)}|{PROTECTION_BROKEN.pattern}", 30)
+        done = m.expect(rf"{re.escape(END)}|{PROTECTION_BROKEN}", 30)
         assert done.group(0) == END, f"no crash: {done.group(0)}"
         assert m.wait_exit(10) == EXIT_CRASH
         out = m.output

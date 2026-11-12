@@ -47,6 +47,8 @@ def test_write_to_text_crashes_cleanly(crash_report):
     rip = r"^rip: 0x[0-9a-f]{16} <lumen_kernel::kmon::crash_write_text"
     assert re.search(rip, report, re.MULTILINE), report
     walk = page_walk(report)
+    cr2 = re.search(r"faulting address \(cr2\): (0x[0-9a-f]{16})", report)
+    assert cr2 and walk.virt == int(cr2.group(1), 16), report
     # The kernel is in the top 2 GiB: L4 entry 511, L3 entry 510; the text is
     # mapped with 4 KiB pages (2 MiB once it is big and aligned enough).
     assert [(lvl, idx) for lvl, idx, _ in walk.steps[:2]] == [(4, 511), (3, 510)], report

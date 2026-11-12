@@ -169,7 +169,10 @@ def check_image_bounds(readobj: str, nm: str) -> list[Finding]:
     if missing:
         return [Finding("image", f"{', '.join(missing)} missing from the symbol table")]
     start, rodata, data, end = (symbols[n] for n in names)
-    sections, findings = alloc_sections(readobj)
+    if not start <= rodata <= data <= end:
+        return [Finding("image", "segment symbols out of order (start <= rodata <= data <= end)")]
+    # Parse problems are reported by check_sections (same input).
+    sections, findings = alloc_sections(readobj)[0], []
     if not sections:
         findings.append(Finding("image", "no allocated sections parsed (readobj format changed?)"))
     for s in sections:
@@ -185,18 +188,20 @@ def check_image_bounds(readobj: str, nm: str) -> list[Finding]:
                     f"[{start:#x}, {end:#x}): place it in linker.ld",
                 )
             )
-        elif "SHF_WRITE" in s.flags and lo < data and s.name not in READ_ONLY_WRITABLE:
+            continue
+        writable = "SHF_WRITE" in s.flags and s.name not in READ_ONLY_WRITABLE
+        if "SHF_EXECINSTR" in s.flags:
+            segment, lo_ok, hi_ok = "text", start, rodata
+        elif writable:
+            segment, lo_ok, hi_ok = "data", data, end
+        else:
+            segment, lo_ok, hi_ok = "rodata", rodata, data
+        if not (lo_ok <= lo and hi <= hi_ok):
             findings.append(
                 Finding(
                     "image",
-                    f"writable section {s.name} at {lo:#x} is below __data_start (mapped read-only)",
-                )
-            )
-        elif "SHF_EXECINSTR" in s.flags and hi > rodata:
-            findings.append(
-                Finding(
-                    "image",
-                    f"executable section {s.name} ends at {hi:#x}, past __rodata_start (mapped NX)",
+                    f"section {s.name} [{lo:#x}, {hi:#x}) belongs in the {segment} segment "
+                    f"[{lo_ok:#x}, {hi_ok:#x}), which gives it the rights it needs",
                 )
             )
     return findings

@@ -30,7 +30,7 @@ tests = [
     "ktest:lumen_kernel::mm::paging::mmio_maps_the_rsdp_uncached",
     "ktest:lumen_kernel::mm::paging::walk_reports_each_level",
     "ktest:lumen_kernel::mm::paging::crash_walk_stops_at_unreadable_tables_without_locks",
-    "ktest:lumen_kernel::mm::paging::preflight_detects_a_missing_mapping",
+    "ktest:lumen_kernel::mm::paging::preflight_detects_each_kind_of_mismatch",
     "scenario:test_mm::test_kernel_page_tables_active",
     "scenario:test_mm::test_write_to_text_crashes_cleanly",
     "scenario:test_mm::test_nx_data_crashes_cleanly",

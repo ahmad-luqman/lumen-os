@@ -93,16 +93,19 @@ pub fn framebuffer_virt() -> Option<(u64, u64)> {
     Some((fb.addr() as u64, fb.pitch() * fb.height()))
 }
 
-/// The physical address `virt` maps to in the active page tables.
-fn translate(virt: u64) -> Option<u64> {
-    VirtAddr::new(virt).and_then(paging::translate).map(|p| p.as_u64())
+/// The physical address `virt` maps to in the active page tables, or how
+/// the walk ended (not present, or a table outside mapped RAM).
+fn translate(virt: u64) -> Result<u64, paging::WalkEnd> {
+    let v = VirtAddr::new(virt).expect("live addresses are canonical");
+    let w = paging::walk(v);
+    w.mapping().and_then(|m| m.phys_of(v)).map(|p| p.as_u64()).ok_or(w.end())
 }
 
 /// The physical range behind `[virt, virt + len)`, which must be mapped and
 /// physically contiguous (true for the HHDM and for the kernel image Limine
 /// loads). Panics otherwise: guessing would risk handing out live memory.
 fn phys_range_of(what: &str, virt: u64, len: u64) -> PhysRange {
-    let translate = |v: u64| translate(v).unwrap_or_else(|| panic!("{what}: virtual address {v:#x} is not mapped"));
+    let translate = |v: u64| translate(v).unwrap_or_else(|end| panic!("{what}: virtual address {v:#x}: {end:?}"));
     let start = translate(virt);
     let (first_page, first_frame) = (align_down(virt, FRAME_SIZE), align_down(start, FRAME_SIZE));
     for page in pages(virt, len) {
@@ -321,7 +324,6 @@ pub fn free_contiguous(first: PhysFrame, count: usize) -> Result<(), FreeError> 
 }
 
 /// Is `f` a frame the allocator has handed out (owned and not free)?
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: ktests; X-ray (M5)
 pub fn is_allocated(f: PhysFrame) -> bool {
     with_frames(|a| a.is_owned(f.as_u64()) && !a.is_free(f.as_u64()))
 }
@@ -402,7 +404,7 @@ mod checks {
         is_owned: impl Fn(u64) -> bool,
         is_free: impl Fn(u64) -> bool,
     ) -> Result<Option<(&'static str, u64)>, &'static str> {
-        for (name, range) in crate::mm::live_ranges() {
+        for super::super::LiveRange { name, range, .. } in super::super::live_ranges() {
             // Every live range is known in the test configuration (Limine
             // gives every response, and the cmdline is never empty), so no
             // check is silently skipped.
@@ -411,7 +413,10 @@ mod checks {
                 return Err("a live range is unknown (missing Limine response?)");
             };
             for page in pages(virt, len) {
-                let phys = translate(page).ok_or("a live page is not mapped")?;
+                let phys = translate(page).map_err(|end| {
+                    crate::ktest::diag(format_args!("{name}: {page:#x}: {end:?}"));
+                    "a live page is not mapped"
+                })?;
                 if is_owned(phys) {
                     return Ok(Some((name, phys)));
                 }
@@ -573,10 +578,10 @@ crate::ktest!(
         let entries = entries()?;
         let reserved = with_state(|s| s.reserved);
 
-        // 1. Independent of the reservation list: no frame behind the kernel
-        //    image, boot stack, kernel file or framebuffer (found through the
-        //    page tables), and no page-table frame, is allocatable. The bitmap
-        //    check needs the list only to know where the bitmap is.
+        // 1. Through the page tables, not the reservation list (except for
+        //    where the bitmap is): no frame behind a live range
+        //    (`mm::live_ranges`) is owned by the allocator, and no page-table
+        //    frame is free.
         if let Some((name, phys)) = first_live_owned(is_owned, is_free)? {
             crate::ktest::diag(format_args!("{name}: frame {phys:#x} is allocatable"));
             return Err("a frame the kernel is using is allocatable");
@@ -614,8 +619,8 @@ crate::ktest!(
         use crate::kassert_eq;
         let (kstart, _) = kernel_image();
         let (_, stack_top) = arch::stacks::boot_stack();
-        let image = translate(kstart).ok_or("kernel not mapped")?;
-        let stack = translate(align_down(stack_top - 1, FRAME_SIZE)).ok_or("stack not mapped")?;
+        let image = translate(kstart).map_err(|_| "kernel not mapped")?;
+        let stack = translate(align_down(stack_top - 1, FRAME_SIZE)).map_err(|_| "stack not mapped")?;
         let bitmap = reservation(BITMAP)?.start();
         let mut table = 0;
         paging::for_each_active_table(|t| table = t.as_u64()).map_err(|_| "a page table is unreadable")?;
@@ -683,7 +688,7 @@ crate::ktest!(
         let hhdm = hhdm()?;
         let bitmap = reservation(BITMAP)?.start();
         let frame = alloc_raw().ok_or("out of frames")?;
-        let got = [frame, frame + 0x123, bitmap, 0x1000].map(|p| (translate(hhdm + p), p));
+        let got = [frame, frame + 0x123, bitmap, 0x1000].map(|p| (translate(hhdm + p).ok(), p));
         kassert_eq!(free_raw(frame), Ok(()));
         for (translated, p) in got {
             kassert_eq!(translated, Some(p));

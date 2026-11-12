@@ -168,14 +168,29 @@ def test_writable_section_outside_the_data_segment_fails():
     found = check_image_bounds(
         IMAGE_READOBJ + section(".wdata", 0xFFFFFFFF80001800, 8, "SHF_WRITE"), IMAGE_NM
     )
-    assert [f.check for f in found] == ["image"] and "writable" in found[0].detail
+    assert [f.check for f in found] == ["image"] and "data segment" in found[0].detail
 
 
 def test_executable_section_outside_the_text_segment_fails():
     found = check_image_bounds(
         IMAGE_READOBJ + section(".xtra", 0xFFFFFFFF80001000, 8, "SHF_EXECINSTR"), IMAGE_NM
     )
-    assert [f.check for f in found] == ["image"] and "executable" in found[0].detail
+    assert [f.check for f in found] == ["image"] and "text segment" in found[0].detail
+
+
+def test_read_only_section_outside_the_rodata_segment_fails():
+    # An orphan read-only section in the data segment would become writable
+    # (in the text segment, executable).
+    for addr in (0xFFFFFFFF80002800, 0xFFFFFFFF80000800):
+        found = check_image_bounds(IMAGE_READOBJ + section(".orphan", addr, 8, ""), IMAGE_NM)
+        assert [f.check for f in found] == ["image"] and "rodata segment" in found[0].detail
+
+
+def test_segment_symbols_out_of_order_fail():
+    swapped = IMAGE_NM.replace(
+        "ffffffff80001000 T __rodata_start", "ffffffff80002800 T __rodata_start"
+    )
+    assert [f.check for f in check_image_bounds(IMAGE_READOBJ, swapped)] == ["image"]
 
 
 def test_read_only_got_is_allowed():
@@ -195,7 +210,7 @@ def test_unparseable_readobj_fails():
         f.check for f in check_sections("Class: 64-bit\nMachine: EM_X86_64\nType: Executable\n")
     ]
     garbled = IMAGE_READOBJ.replace("Address: 0xFFFFFFFF80001000", "Address: ???")
-    assert "elf" in [f.check for f in check_image_bounds(garbled, IMAGE_NM)]
+    assert "elf" in [f.check for f in check_sections(garbled)]
 
 
 IR_OK = """

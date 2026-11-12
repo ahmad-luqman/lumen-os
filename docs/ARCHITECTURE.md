@@ -95,7 +95,7 @@ Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 | Range | Use | Status |
 |---|---|---|
 | `0x0000_0000_0000_0000 – 0x0000_7fff_ffff_ffff` | empty in the kernel's tables (null guard); user space, per process, from M2 (except the first 64 KiB) | built (empty) |
-| `0xffff_8000_0000_0000 – +phys size` | higher-half direct map (HHDM) of RAM: usable, bootloader-reclaimable, kernel and framebuffer entries; RW-, framebuffer write-combining | built |
+| `0xffff_8000_0000_0000 – +phys size` | higher-half direct map (HHDM) of RAM: usable, bootloader-reclaimable, kernel-and-modules and framebuffer entries; NX, RW- except kernel-and-modules (R--), framebuffer write-combining | built |
 | `0xffff_c000_0000_0000 – 0xffff_c0ff_ffff_ffff` | kernel heap (grows by mapping frames) | M1 (#5) |
 | `0xffff_d000_0000_0000 – 0xffff_d0ff_ffff_ffff` | kernel stacks: 64 KiB each, **unmapped guard page below every stack** | M1 (#6) |
 | `0xffff_e000_0000_0000 – 0xffff_e0ff_ffff_ffff` | MMIO mappings (uncached, RW-), `map_mmio` | built |
@@ -159,26 +159,33 @@ frames (zeroed) and switches CR3:
   no writable alias (W^X holds per frame, not just per page); the
   framebuffer is write-combining. 2 MiB pages where a whole one fits, 4 KiB
   elsewhere. ACPI memory is not in the HHDM; ACPI parsing (#2) maps what it
-  needs (`map_mmio` maps the RSDP already). A ktest checks the HHDM covers
-  each such entry completely and nothing else is mapped outside the image
-  and the MMIO window.
+  needs (`map_mmio` maps the RSDP already). Entries that share a page map it
+  once; boot stops if they'd need different rights. A ktest checks every
+  HHDM span is mapped throughout (sampled every 2 MiB) with its own rights
+  and memory type, nothing else is mapped outside the image and the MMIO
+  window, and ACPI and reserved entries are absent (spot-checked).
 - **Kernel image** per segment from the linker script's page-aligned
   boundaries (`__rodata_start`, `__data_start`): text R-X, rodata R--, data
   RW-. `make audit` checks every allocated section of the ELF lies inside
-  `[__kernel_start, __kernel_end)` and writable and executable sections sit
-  in the segment that grants that, so nothing the kernel uses is left
-  unmapped or mapped wrongly (an orphan `.got` once was; it is now placed,
-  read-only, in rodata: its entries are fixed at link time).
+  `[__kernel_start, __kernel_end)` and in the segment whose rights it needs
+  (executable in text, writable in data, the rest in rodata), so no section
+  of the image is left unmapped or mapped with the wrong rights (an orphan
+  `.got` once was; it is now placed, read-only, in rodata: its entries are
+  fixed at link time).
 - **Nothing else.** The lower half is empty, so null and small pointers fault.
 
 Before loading CR3 it checks that every page of every range the kernel is
-using (image, boot stack, current stack page, kernel file, framebuffer,
-frame bitmap, memory map and its entries, cmdline), every page Limine mapped
-in the kernel's 2 GiB, and every 2 MiB step of each HHDM entry translates to
-the same frame under the new tables, writable where the kernel writes (the
-stacks, the bitmap, `.data`/`.bss`): a mistake is an assertion naming the
-range and both walks, not a fault with no stack. A ktest shows the check
-fires on an empty hierarchy. EFER.NXE and CR0.WP are set (so
+known to use (image, boot stack, current stack page, kernel file,
+framebuffer, frame bitmap, memory map and its entries, cmdline), every page
+Limine mapped in the kernel's 2 GiB, and every 2 MiB step of each HHDM span
+(which covers the rest of Limine's responses) translates to the same frame
+under the new tables; writable where the kernel writes (the stacks, the
+framebuffer, the bitmap, `.data`/`.bss`), executable exactly where Limine's
+mapping of the kernel is (the text), and with each HHDM span's memory type.
+A mistake is an assertion naming the range, the address and how each walk
+ended, not a fault with no stack. A ktest builds a copy of the tables,
+plants one fault of each kind (kernel data read-only, text NX, RAM
+uncached, nothing mapped) and checks each is named. EFER.NXE and CR0.WP are set (so
 read-only pages bind in ring 0 too) and the PAT layout the mappings rely on
 (slot 0 WB, 3 UC, 5 WC, set up by Limine) is checked rather than rewritten.
 
@@ -189,19 +196,25 @@ at the leaves, and walks report the rights combined over every level, which
 is what the CPU enforces; `Attrs` can't express a writable and executable
 page. The kernel API:
 
-- `map`/`unmap`: 4 KiB pages in the heap and stack windows only, of frames
-  the allocator handed out, write-back; `unmap` invalidates the TLB entry.
-  Everything else (image, HHDM, MMIO) is fixed, so safe code can't remap
-  memory that live references point into.
+- `map`/`unmap` (`unsafe`): 4 KiB pages for the owners of the heap and stack
+  windows (#5, #6). The caller promises it owns the frame and the page and
+  that nothing refers through a page it unmaps; the functions refuse what
+  they can check (addresses outside those windows, frames nobody allocated,
+  non-write-back or executable rights, since allocator frames are writable
+  through the HHDM). `unmap` invalidates the TLB entry. Everything else
+  (image, HHDM, MMIO) is fixed.
 - `map_mmio`: uncached, permanent; refuses memory the HHDM maps (two memory
-  types for one frame is undefined); a failed call maps nothing.
+  types for one frame is undefined); all or nothing (a partial mapping is
+  rolled back, host-tested).
 - `walk`, `translate`, and sweeps over every table and every mapping (which
-  report a table they couldn't read instead of skipping it).
+  report the first table they couldn't read rather than skipping it
+  silently).
 
-Tables are never freed. A page fault's crash report ends with the walk of
-CR2 (every entry read, then the page and its rights, or the level that is
-not present), taken without locks; a table outside HHDM-mapped RAM ends the
-walk instead of being read.
+Tables are never freed. A page fault's crash report includes, after the
+backtrace and the trace events (serial only), the walk of CR2: every entry
+read, then the page and its rights, or the level that is not present. It
+takes no locks; a table outside HHDM-mapped RAM ends the walk instead of
+being read, and if the walk itself faults the report still ends properly.
 
 The kernel's upper-half entries are not yet shared with anything; processes
 (M2) will need the kernel's L4 entries 256-511 copied into every address
@@ -223,7 +236,8 @@ our own page tables (#4); #6 replaces them (hard rule 4).
 - #DF, NMI and #MC run on IST stacks, so a corrupted kernel stack still yields
   a report.
 - **Crash report:** exception name and vector, decoded #PF error code and CR2,
-  rip with symbol, all registers, CR0/3/4, and a frame-pointer backtrace. It is
+  rip with symbol, all registers, CR0/3/4, a frame-pointer backtrace and, for
+  a #PF, the page-table walk of CR2 (serial). It is
   written to serial and to the screen. Frame pointers are forced on
   (`-C force-frame-pointers=yes`); the walker follows `rbp` only inside known
   stacks and only to return addresses inside kernel `.text`, so a corrupted
