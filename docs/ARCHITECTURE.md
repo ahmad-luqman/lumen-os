@@ -556,8 +556,10 @@ interrupt handler is allowed to allocate (none does yet).
 - **Several CPUs:** the first CPU to crash owns the report (`CRASHING`
   holds its index). Before writing anything it sends every *online* CPU an
   NMI (one still parked in the bootloader has no handler for it) and waits,
-  up to 500 ms, for each to acknowledge and halt, so reports and log lines
-  never interleave. A CPU that crashes while another reports halts quietly.
+  up to 500 ms (a bounded number of rounds before the TSC is calibrated),
+  for each to acknowledge and halt, so reports and log lines never
+  interleave. (An AP started but not yet online gets no NMI and could still
+  log a line into the report: not tested.) A CPU that crashes while another reports halts quietly.
   Serial starts with `cpu: N (lapic id X)`, `running on: the <kind> stack
   <bottom>..<top>` (the reporter's own stack, from the registry) and, with
   other CPUs online, `other cpus stopped: 0 2 3` (and a `!!!` line naming
