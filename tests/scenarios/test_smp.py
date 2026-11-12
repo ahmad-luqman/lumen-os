@@ -12,6 +12,7 @@ import re
 
 from lumen_harness import crash
 from lumen_harness.qemu import EXIT_CRASH
+from test_mm import OVERFLOW, assert_main_stack_overflow
 
 BOOT_TIMEOUT = 60
 ONLINE = re.compile(r"INFO  smp: cpu (\d+) online \(lapic id (\d+)\)\n")
@@ -106,6 +107,18 @@ def test_double_fault_on_ap_runs_on_its_own_ist_stack(boot):
     # each AP has its own TSS.
     kind, bottom, _ = RUNNING_ON.search(report).groups()
     assert (kind, bottom) == ("#DF IST", stacks[2][2]), report
+
+
+def test_stack_overflow_on_ap_hits_its_own_guard(boot):
+    # Unbounded recursion on CPU 1's main stack runs into that stack's guard
+    # page; the #DF runs on CPU 1's own #DF stack and names the overflow.
+    report, stacks = crash_on(boot, "stack 1")
+    assert "\ncpu: 1 (lapic id 1)\n" in report, report
+    assert_main_stack_overflow(report, "kmon::recurse+")
+    _, bottom, top = OVERFLOW.search(report).groups()
+    assert (bottom, top) == (stacks[1][0], stacks[1][1]), report
+    kind, ist_bottom, _ = RUNNING_ON.search(report).groups()
+    assert (kind, ist_bottom) == ("#DF IST", stacks[1][2]), report
 
 
 def test_panic_on_ap_is_reported_by_it(boot):

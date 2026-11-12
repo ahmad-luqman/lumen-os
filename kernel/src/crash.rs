@@ -49,6 +49,9 @@ static STOP_SENT: AtomicU64 = AtomicU64::new(0);
 static STOPPED: AtomicU64 = AtomicU64::new(0);
 /// How long the owner waits for the others to stop.
 const STOP_TIMEOUT_NS: u64 = 500_000_000;
+/// The same bound in spin-loop rounds, for a crash before the TSC is
+/// calibrated (the other CPUs are already online then).
+const STOP_SPINS: u64 = 10_000_000;
 /// CR2 when the first report began: a nested crash only blames a guard page
 /// if CR2 has changed since (only a #PF sets it).
 static FIRST_CR2: AtomicU64 = AtomicU64::new(0);
@@ -147,7 +150,8 @@ fn nested(vector: u64, rip: u64) -> ! {
 
 /// Send every other online CPU a stop NMI and wait (bounded) until each has
 /// stopped. Only online CPUs: one still parked in the bootloader has no
-/// handler for it.
+/// handler for it. (An AP started but not yet online gets none, and could
+/// still log a line into the report.)
 fn stop_others(me: usize) {
     if !arch::apic::lapic_ready() {
         return; // too early for other CPUs to be running
@@ -158,9 +162,20 @@ fn stop_others(me: usize) {
         sent |= 1 << cpu;
     }
     STOP_SENT.store(sent, Ordering::SeqCst);
-    // Other CPUs are only online once time is calibrated.
-    let deadline = crate::time::now_ns() + STOP_TIMEOUT_NS;
-    while STOPPED.load(Ordering::SeqCst) & sent != sent && crate::time::now_ns() < deadline {
+    // The APs come online while the boot CPU calibrates the TSC: before
+    // that (`now_ns` is 0) the wait is bounded by rounds instead.
+    let start = crate::time::now_ns();
+    let mut spins = 0u64;
+    while STOPPED.load(Ordering::SeqCst) & sent != sent {
+        let late = if start == 0 {
+            spins >= STOP_SPINS
+        } else {
+            crate::time::now_ns().saturating_sub(start) >= STOP_TIMEOUT_NS
+        };
+        if late {
+            break;
+        }
+        spins += 1;
         core::hint::spin_loop();
     }
 }

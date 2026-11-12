@@ -8,6 +8,7 @@ tests = [
     "scenario:test_smp::test_one_cpu_boots_alone",
     "scenario:test_smp::test_cpus_past_the_limit_are_halted",
     "scenario:test_smp::test_double_fault_on_ap_runs_on_its_own_ist_stack",
+    "scenario:test_smp::test_stack_overflow_on_ap_hits_its_own_guard",
     "ktest:lumen_kernel::arch::x86_64::percpu::the_boot_cpu_is_cpu_0",
 ]
 
