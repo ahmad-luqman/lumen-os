@@ -39,7 +39,7 @@ static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 static LAPIC_TIMER_HZ: AtomicU64 = AtomicU64::new(0);
 /// What the TSC was calibrated against: 0 not yet, else a [`Reference`].
 static REFERENCE: AtomicU8 = AtomicU8::new(0);
-/// The HPET, mapped once, if it works.
+/// The HPET, mapped once, if the TSC could be calibrated against it.
 static HPET: SpinLock<Option<HpetCounter>> = SpinLock::new(None);
 
 /// What the TSC was calibrated against.
@@ -61,10 +61,30 @@ impl fmt::Display for Reference {
 
 /// What the TSC was calibrated against at boot, once it was.
 pub fn reference() -> Option<Reference> {
+    const HPET: u8 = Reference::Hpet as u8;
+    const PIT: u8 = Reference::Pit as u8;
     match REFERENCE.load(Ordering::Relaxed) {
-        1 => Some(Reference::Hpet),
-        2 => Some(Reference::Pit),
+        HPET => Some(Reference::Hpet),
+        PIT => Some(Reference::Pit),
         _ => None,
+    }
+}
+
+/// Why calibrating against a clock failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CalError {
+    /// It didn't count through a window (or isn't there).
+    NoCount,
+    /// It gave this implausible frequency.
+    Implausible(u64),
+}
+
+impl fmt::Display for CalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CalError::NoCount => f.write_str("it didn't count through a 10 ms window"),
+            CalError::Implausible(hz) => write!(f, "it gave an implausible TSC frequency, {}", Hz(*hz)),
+        }
     }
 }
 
@@ -77,8 +97,8 @@ pub enum HpetError {
     Period(u32),
     /// Its counter didn't move.
     Stalled,
-    /// A calibration window gave no believable TSC frequency.
-    Window,
+    /// Calibrating the TSC against it failed.
+    Window(CalError),
 }
 
 impl fmt::Display for HpetError {
@@ -88,7 +108,7 @@ impl fmt::Display for HpetError {
             HpetError::Map(e) => write!(f, "mapping it: {e}"),
             HpetError::Period(p) => write!(f, "its period {p} fs is out of range"),
             HpetError::Stalled => f.write_str("its counter doesn't count"),
-            HpetError::Window => f.write_str("calibrating against it gave no believable TSC frequency"),
+            HpetError::Window(e) => write!(f, "calibrating against it: {e}"),
         }
     }
 }
@@ -120,13 +140,12 @@ impl HpetCounter {
         let clock = lumen_time::hpet_hz(period).and_then(Clock::new).ok_or(HpetError::Period(period))?;
         let mask = if caps & HPET_COUNT_64 == 0 { 0xffff_ffff } else { u64::MAX };
         let hpet = HpetCounter { regs, clock, mask };
-        // SAFETY: as above; only the general configuration's enable bit is
-        // set.
-        unsafe {
-            let config = read(regs, HPET_CONFIG);
-            if config & HPET_ENABLE == 0 {
-                ((regs as usize + HPET_CONFIG) as *mut u64).write_volatile(config | HPET_ENABLE);
-            }
+        // SAFETY: as above.
+        let config = unsafe { read(regs, HPET_CONFIG) };
+        if config & HPET_ENABLE == 0 {
+            // SAFETY: as above; only the general configuration's enable bit
+            // is set.
+            unsafe { write(regs, HPET_CONFIG, config | HPET_ENABLE) };
         }
         let (start, t0) = (hpet.now(), arch::rdtsc());
         while hpet.now() == start {
@@ -143,7 +162,9 @@ impl HpetCounter {
         unsafe { read(self.regs, HPET_COUNTER) & self.mask }
     }
 
-    /// Ticks from `earlier` to `later` (two [`now`](Self::now) readings).
+    /// Ticks from `earlier` to `later` (two [`now`](Self::now) readings),
+    /// correct across one wrap of a 32-bit counter (about 43 s at 100 MHz):
+    /// not for long-lived timestamps.
     pub fn since(&self, earlier: u64, later: u64) -> u64 {
         lumen_time::counter_delta(earlier, later, self.mask)
     }
@@ -162,30 +183,51 @@ unsafe fn read(regs: u64, offset: usize) -> u64 {
     unsafe { ((regs as usize + offset) as *const u64).read_volatile() }
 }
 
-/// The HPET, if [`init`] found a working one.
+/// Write a 64-bit HPET register.
+///
+/// # Safety
+/// As for [`read`], and the write must leave the HPET in a state the kernel
+/// expects.
+unsafe fn write(regs: u64, offset: usize, value: u64) {
+    // SAFETY: upheld by the caller.
+    unsafe { ((regs as usize + offset) as *mut u64).write_volatile(value) }
+}
+
+/// The HPET, if [`init`] calibrated the TSC against it.
 pub fn hpet() -> Option<HpetCounter> {
     *HPET.lock()
 }
 
-/// The median of [`WINDOWS`] samples taken by `window`; `None` as soon as one
-/// fails or isn't a believable TSC frequency.
-fn median_of_windows(mut window: impl FnMut() -> Option<u64>) -> Option<u64> {
+/// The median of [`WINDOWS`] samples taken by `window`; the first failure
+/// if one fails.
+fn median_of_windows(mut window: impl FnMut() -> Result<u64, CalError>) -> Result<u64, CalError> {
     let mut samples = [0u64; WINDOWS];
     for s in &mut samples {
-        *s = window().filter(|&hz| lumen_time::plausible_tsc_hz(hz))?;
+        *s = window()?;
     }
-    lumen_time::median(&mut samples)
+    Ok(lumen_time::median(&mut samples).expect("WINDOWS samples"))
+}
+
+/// [`median_of_windows`] for TSC frequencies: `window` gives one, or `None`
+/// if its reference didn't count; an implausible one fails.
+fn median_tsc_hz(mut window: impl FnMut() -> Option<u64>) -> Result<u64, CalError> {
+    median_of_windows(|| match window() {
+        Some(hz) if lumen_time::plausible_tsc_hz(hz) => Ok(hz),
+        Some(hz) => Err(CalError::Implausible(hz)),
+        None => Err(CalError::NoCount),
+    })
 }
 
 /// The TSC's frequency against the HPET. Call with interrupts off.
-fn calibrate_with_hpet(hpet: &HpetCounter) -> Option<u64> {
+fn calibrate_with_hpet(hpet: &HpetCounter) -> Result<u64, CalError> {
     let target = hpet.clock().ticks(WINDOW_NS);
-    median_of_windows(|| {
+    median_tsc_hz(|| {
         let (h0, t0) = (hpet.now(), arch::rdtsc());
         loop {
             let (h, t) = (hpet.now(), arch::rdtsc());
-            if hpet.since(h0, h) >= target {
-                break lumen_time::frequency(t - t0, hpet.since(h0, h), hpet.clock().hz());
+            let elapsed = hpet.since(h0, h);
+            if elapsed >= target {
+                break lumen_time::frequency(t - t0, elapsed, hpet.clock().hz());
             }
             if t.wrapping_sub(t0) > WINDOW_BOUND_TSC {
                 break None;
@@ -196,10 +238,10 @@ fn calibrate_with_hpet(hpet: &HpetCounter) -> Option<u64> {
 }
 
 /// The TSC's frequency against the PIT's channel 2. Call with interrupts
-/// off. `None` if there is no working PIT.
-fn calibrate_with_pit() -> Option<u64> {
+/// off.
+fn calibrate_with_pit() -> Result<u64, CalError> {
     let count = lumen_time::pit_count(WINDOW_NS).expect("a 10 ms window fits the PIT");
-    median_of_windows(|| {
+    median_tsc_hz(|| {
         let mut t0 = 0;
         if !pit::wait(count, || t0 = arch::rdtsc()) {
             return None;
@@ -209,67 +251,77 @@ fn calibrate_with_pit() -> Option<u64> {
 }
 
 /// Measure the TSC's frequency again now, against `reference` (with
-/// interrupts off meanwhile: about 50 ms). `None` if that clock is missing
-/// or doesn't count. For cross-checking the boot calibration.
-pub fn measure(reference: Reference) -> Option<u64> {
+/// interrupts off meanwhile: about 50 ms): `None` if there is no such clock
+/// (no HPET the TSC was calibrated against), else what calibrating against
+/// it gave. For cross-checking the boot calibration.
+pub fn measure(reference: Reference) -> Option<Result<u64, CalError>> {
     let _off = arch::irq::push_off();
     match reference {
-        Reference::Hpet => calibrate_with_hpet(&hpet()?),
-        Reference::Pit => calibrate_with_pit(),
+        Reference::Hpet => Some(calibrate_with_hpet(&hpet()?)),
+        Reference::Pit => Some(calibrate_with_pit()),
     }
 }
 
 /// The local APIC timer's input frequency against the (calibrated) TSC.
-fn calibrate_lapic_timer(tsc: Clock) -> Option<u64> {
+fn calibrate_lapic_timer(tsc: Clock) -> Result<u64, CalError> {
     let window = tsc.ticks(WINDOW_NS);
-    let mut samples = [0u64; WINDOWS];
-    for s in &mut samples {
+    median_of_windows(|| {
         apic::timer_one_shot(u32::MAX);
         let t0 = arch::rdtsc();
         while arch::rdtsc() - t0 < window {
             core::hint::spin_loop();
         }
-        let (counted, t1) = (u32::MAX - apic::timer_current(), arch::rdtsc());
-        *s = lumen_time::frequency(u64::from(counted), t1 - t0, tsc.hz())?;
+        let (current, t1) = (apic::timer_current(), arch::rdtsc());
+        // 0: it ran out (or reads as 0), so the count says nothing.
+        let counted = u64::from(u32::MAX - current);
+        lumen_time::frequency(counted, t1 - t0, tsc.hz()).filter(|_| current != 0).ok_or(CalError::NoCount)
+    })
+}
+
+/// The TSC's frequency against the HPET ACPI lists (kept for [`hpet`] if
+/// that works), or against the PIT if there is none or it doesn't work
+/// (warned about). Panics if neither works.
+fn calibrate_tsc() -> (u64, Reference) {
+    let mut hpet_error = None;
+    if let Some(addr) = crate::acpi::info().and_then(|i| i.hpet).map(|h| h.address) {
+        let calibrated = HpetCounter::new(addr)
+            .and_then(|hpet| calibrate_with_hpet(&hpet).map(|hz| (hpet, hz)).map_err(HpetError::Window));
+        match calibrated {
+            Ok((hpet, hz)) => {
+                *HPET.lock() = Some(hpet);
+                return (hz, Reference::Hpet);
+            }
+            Err(e) => {
+                warn!(target: "time", "the HPET at {addr:#x} is unusable ({e}); calibrating against the PIT");
+                hpet_error = Some(e);
+            }
+        }
     }
-    lumen_time::median(&mut samples)
+    match (calibrate_with_pit(), hpet_error) {
+        (Ok(hz), _) => (hz, Reference::Pit),
+        (Err(e), Some(h)) => panic!("can't calibrate the TSC: the HPET is unusable ({h}), and against the PIT {e}"),
+        (Err(e), None) => panic!("can't calibrate the TSC: no HPET, and against the PIT {e}"),
+    }
 }
 
 /// Calibrate the TSC and start the local APIC timer at [`TICK_HZ`] (its
-/// interrupts arrive once interrupts are enabled). Needs `interrupts::init`;
-/// call with interrupts off. An HPET ACPI lists but that doesn't work is
-/// warned about (the PIT is used instead); panics if no clock can calibrate
-/// the TSC.
+/// interrupts arrive once interrupts are enabled). Needs `acpi::init` and
+/// `interrupts::init`; call with interrupts off. An HPET ACPI lists but that
+/// doesn't work is warned about (the PIT is used instead). Panics if no
+/// clock can calibrate the TSC, or the local APIC timer doesn't count or
+/// can't tick at 1 kHz.
 pub fn init() {
     assert!(!arch::irq::enabled(), "time::init with interrupts on");
-    let listed = crate::acpi::info().and_then(|i| i.hpet).map(|h| h.address);
-    let from_hpet = listed.map(|addr| {
-        let hpet = HpetCounter::new(addr)?;
-        *HPET.lock() = Some(hpet);
-        calibrate_with_hpet(&hpet).ok_or(HpetError::Window)
-    });
-    let (hz, reference) = match from_hpet {
-        Some(Ok(hz)) => (hz, Reference::Hpet),
-        failed => {
-            if let (Some(Err(e)), Some(addr)) = (failed, listed) {
-                warn!(target: "time", "the HPET at {addr:#x} is unusable ({e}); calibrating against the PIT");
-            }
-            let hz = calibrate_with_pit().unwrap_or_else(|| match failed {
-                Some(Err(e)) => {
-                    panic!("can't calibrate the TSC: the HPET is unusable ({e}) and there is no working PIT")
-                }
-                _ => panic!("can't calibrate the TSC: no HPET and no working PIT"),
-            });
-            (hz, Reference::Pit)
-        }
-    };
+    let (hz, reference) = calibrate_tsc();
     TSC_HZ.store(hz, Ordering::Relaxed);
     REFERENCE.store(reference as u8, Ordering::Relaxed);
     info!(target: "time", "tsc {} (calibrated against {reference})", Hz(hz));
 
     let tsc = Clock::new(hz).expect("calibrated");
-    let timer_hz = calibrate_lapic_timer(tsc).expect("the local APIC timer doesn't count");
-    let count = lumen_time::periodic_count(timer_hz, TICK_HZ).expect("the local APIC timer is too slow for 1 kHz");
+    let timer_hz = calibrate_lapic_timer(tsc)
+        .unwrap_or_else(|e| panic!("can't calibrate the local APIC timer against the TSC: {e}"));
+    let count = lumen_time::periodic_count(timer_hz, TICK_HZ)
+        .unwrap_or_else(|| panic!("the local APIC timer, at {}, can't tick at {}", Hz(timer_hz), Hz(TICK_HZ)));
     LAPIC_TIMER_HZ.store(timer_hz, Ordering::Relaxed);
     apic::timer_periodic(count);
     info!(
@@ -325,7 +377,7 @@ crate::ktest!(
         if reference() != Some(Reference::Hpet) {
             return Err("the TSC wasn't calibrated against the HPET");
         }
-        let other = measure(Reference::Pit).ok_or("the PIT doesn't count")?;
+        let other = measure(Reference::Pit).ok_or("no PIT")?.map_err(|_| "calibrating against the PIT failed")?;
         crate::ktest::diag(format_args!("tsc {} (boot), {} against the pit", Hz(hz), Hz(other)));
         kassert!(hz.abs_diff(other) * 50 <= hz);
         Ok(())
@@ -334,12 +386,13 @@ crate::ktest!(
 
 crate::ktest!(
     fn now_ns_follows_the_hpet() {
-        // `now_ns` is the TSC converted; across a 10 ms sleep it moves as
-        // far as the HPET says, within 2%.
+        // `now_ns` is the TSC converted; across a 50 ms sleep it moves as
+        // far as the HPET says, within 2% (a 1 ms budget: a host stall on one
+        // reading doesn't fail it).
         use crate::kassert;
         let hpet = hpet().ok_or("no HPET")?;
         let (n0, h0) = (now_ns(), hpet.now());
-        sleep(10_000_000);
+        sleep(50_000_000);
         let (n1, h1) = (now_ns(), hpet.now());
         let by_hpet = hpet.clock().ns(hpet.since(h0, h1));
         crate::ktest::diag(format_args!("now_ns moved {} ns, the HPET {by_hpet} ns", n1 - n0));
@@ -359,8 +412,9 @@ crate::ktest!(
         let (elapsed, ticked) = (hpet.since(h0, hpet.now()), ticks() - t0);
         let ns = hpet.clock().ns(elapsed);
         crate::ktest::diag(format_args!("slept {ns} ns by the HPET, {ticked} ticks"));
-        // At least 10 ms, less 1% for the TSC's calibration error (which the
-        // cross-checks bound at 2%); well under a second. The timer ticked
+        // At least 10 ms, less 1%: the TSC was calibrated against this HPET,
+        // so only window-to-window noise separates them (the 2% cross-checks
+        // are against the PIT). Well under a second. The timer ticked
         // (interrupts are on); its rate is checked elsewhere.
         kassert!((9_900_000..lumen_time::NS_PER_SEC).contains(&ns));
         kassert!(ticked >= 1);
@@ -375,28 +429,51 @@ crate::ktest!(
         // checks the rate without counting interrupts (an emulator delivers
         // them late).
         use crate::{kassert, kassert_eq};
+        kassert_eq!(TICK_HZ, 1000);
         let (lvt, error_lvt, initial) = apic::timer_registers();
         kassert_eq!((lvt & 0xff, lvt & (1 << 16), lvt & (1 << 17)), (u32::from(idt::TIMER), 0, 1 << 17));
         kassert_eq!(error_lvt & 0x1_00ff, u32::from(idt::LAPIC_ERROR)); // unmasked
         let timer = lapic_timer().ok_or("timer not calibrated")?;
-        kassert_eq!(Some(initial), lumen_time::periodic_count(timer.hz(), TICK_HZ));
+        kassert_eq!(Some(initial), lumen_time::periodic_count(timer.hz(), 1000));
         let hpet = hpet().ok_or("no HPET")?;
-        let window = hpet.clock().ticks(200_000); // 200 µs: under one reload
-        let mut samples = [0u64; WINDOWS];
-        for s in &mut samples {
+        // 750 µs windows (most cross a reload, so that path counts), under
+        // the 1 ms period; a window a stall stretched past 950 µs could hide
+        // a whole reload, so it is taken again.
+        let (window, too_long) = (hpet.clock().ticks(750_000), hpet.clock().ticks(950_000));
+        let mut samples = [0u64; 7];
+        let mut taken = 0;
+        for _ in 0..20 {
             let _off = arch::irq::push_off();
             let (h0, c0) = (hpet.now(), apic::timer_current());
             while hpet.since(h0, hpet.now()) < window {
                 core::hint::spin_loop();
             }
             let (h1, c1) = (hpet.now(), apic::timer_current());
-            // Counting down from `initial`, reloading at 0.
-            let counted = if c1 <= c0 { c0 - c1 } else { c0 + initial - c1 };
-            *s = lumen_time::frequency(u64::from(counted), hpet.since(h0, h1), hpet.clock().hz()).unwrap_or(0);
+            let elapsed = hpet.since(h0, h1);
+            if elapsed >= too_long {
+                continue;
+            }
+            let counted = lumen_time::down_counter_delta(c0, c1, initial);
+            samples[taken] = lumen_time::frequency(u64::from(counted), elapsed, hpet.clock().hz()).unwrap_or(0);
+            taken += 1;
+            if taken == samples.len() {
+                break;
+            }
         }
+        kassert_eq!(taken, samples.len());
         let rate = lumen_time::median(&mut samples).ok_or("no samples")?;
         crate::ktest::diag(format_args!("timer counts at {} (calibrated {})", Hz(rate), Hz(timer.hz())));
         kassert!(rate.abs_diff(timer.hz()) * 20 <= timer.hz());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_bad_hpet_address_is_an_error() {
+        // The fallback to the PIT starts from these errors (an HPET that
+        // stalls or calibrates implausibly can't be staged in QEMU).
+        use crate::kassert_eq;
+        kassert_eq!(HpetCounter::new(u64::MAX).err(), Some(HpetError::NotPhysical(u64::MAX)));
         Ok(())
     }
 );

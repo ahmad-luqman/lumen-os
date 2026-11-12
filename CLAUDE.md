@@ -116,8 +116,9 @@ own PR that updates that doc first.
 
 - `kernel/src/main.rs`: boot sequence. `arch/x86_64/`: GDT/TSS, IDT, entry
   stubs and the vector map, `irq.rs` (nested interrupt disable), local and
-  I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash reporter. `ktest.rs`: test
-  runner. `kmon.rs`: serial debug monitor (until the M2 shell). `fb.rs`:
+  I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
+  reporter. `ktest.rs`: test runner. `kmon.rs`: serial debug monitor (until
+  the M2 shell). `fb.rs`:
   framebuffer and console. `klog.rs`: logger. `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window

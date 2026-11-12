@@ -146,6 +146,10 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     time::init();
     arch::irq::enable();
     info!(target: "irq", "interrupts on");
+    time::sleep(10_000_000);
+    if time::ticks() == 0 {
+        warn!(target: "irq", "no timer interrupt in 10 ms");
+    }
     match boot::FRAMEBUFFER.get_response().and_then(|r| r.framebuffers().next()) {
         Some(fb) => match fb::init(&fb) {
             Some((w, h)) => info!(target: "fb", "framebuffer {w}x{h} ready"),

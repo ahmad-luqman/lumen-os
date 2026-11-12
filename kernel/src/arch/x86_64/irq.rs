@@ -44,7 +44,8 @@ fn cli() {
 }
 
 fn sti() {
-    // SAFETY: every caller checks that no critical section is open.
+    // SAFETY: the IDT is loaded and every vector has a handler; callers only
+    // turn interrupts on outside every critical section.
     unsafe { asm!("sti", options(nostack)) };
 }
 

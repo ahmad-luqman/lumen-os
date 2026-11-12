@@ -142,7 +142,8 @@ fn clocks() {
     let _ = write!(out, "clocks: tsc {} Hz (against the {reference} at boot)", tsc.hz());
     for r in [Reference::Pit, Reference::Hpet] {
         let _ = match time::measure(r) {
-            Some(hz) => write!(out, "; {r} {hz} Hz"),
+            Some(Ok(hz)) => write!(out, "; {r} {hz} Hz"),
+            Some(Err(e)) => write!(out, "; {r} failed ({e})"),
             None => write!(out, "; {r} none"),
         };
     }

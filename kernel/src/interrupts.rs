@@ -161,8 +161,8 @@ crate::ktest!(
                 "int {unused}", "int {unused}", "int {spurious}", "int {pic7}", "int {pic15}", "int {error}", "int {pic1}",
                 unused = const idt::UNUSED,
                 spurious = const idt::SPURIOUS,
-                pic7 = const idt::PIC_BASE + 7,
-                pic15 = const idt::PIC_BASE + 15,
+                pic7 = const idt::PIC_SPURIOUS_MASTER,
+                pic15 = const idt::PIC_SPURIOUS_SLAVE,
                 error = const idt::LAPIC_ERROR,
                 pic1 = const idt::PIC_BASE + 1,
             );

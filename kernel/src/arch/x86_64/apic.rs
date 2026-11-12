@@ -19,6 +19,7 @@ const BASE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const ID: usize = 0x20;
 const TPR: usize = 0x80;
 const EOI: usize = 0xb0;
+const ISR: usize = 0x100;
 const SVR: usize = 0xf0;
 const ESR: usize = 0x280;
 const LVT_TIMER: usize = 0x320;
@@ -119,6 +120,12 @@ pub fn eoi() {
     }
 }
 
+/// Is `vector` in service at the local APIC (delivered by it and not yet
+/// EOI'd)? False before [`set_lapic`].
+pub fn in_service(vector: u8) -> bool {
+    lapic_ready() && read(ISR + 0x10 * usize::from(vector / 32)) & (1 << (vector % 32)) != 0
+}
+
 /// Latch and read the error status (for the error interrupt).
 pub fn error_status() -> u32 {
     write(ESR, 0);
@@ -173,7 +180,8 @@ impl IoApic {
     /// for the kernel's whole life, and nothing else drives that I/O APIC.
     pub unsafe fn new(virt: u64) -> IoApic {
         let mut io = IoApic { base: virt, entries: 0 };
-        io.entries = ((io.read(IOAPICVER) >> 16) & 0xff) + 1;
+        // IOREGSEL is 8 bits: entries past 119 can't be addressed.
+        io.entries = (((io.read(IOAPICVER) >> 16) & 0xff) + 1).min(120);
         io
     }
 

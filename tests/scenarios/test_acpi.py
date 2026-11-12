@@ -72,6 +72,8 @@ def test_no_madt_boots_without_acpi(boot):
     before, *_ = ticks(m)
     m.send_line("sleep 50")
     m.expect(r"kmon> ")
-    after, *_ = ticks(m)
-    assert after > before, (before, after)
+    after, *strays = ticks(m)
+    # 50 at 1 kHz (QEMU's TCG delivered about 2/3 when measured).
+    assert after - before >= 20, (before, after)
+    assert strays == [0, 0, 0]
     assert not ACPI_LINE.search(m.output)

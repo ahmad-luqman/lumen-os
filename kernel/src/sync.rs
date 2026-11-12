@@ -41,10 +41,12 @@ impl<T> SpinLock<T> {
 
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
         let irq = arch::irq::push_off();
-        let taken = self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok();
-        // Lazily: a guard built for a failed attempt would unlock the
-        // holder's lock when dropped. (A failed attempt drops `irq`.)
-        taken.then(|| SpinLockGuard { lock: self, _irq: irq })
+        if self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            // No guard: dropping one would unlock the holder's lock (an
+            // eager `then_some` did). Dropping `irq` closes the section.
+            return None;
+        }
+        Some(SpinLockGuard { lock: self, _irq: irq })
     }
 
     /// Access the value even if the lock is held.
@@ -92,19 +94,16 @@ impl<T> Drop for SpinLockGuard<'_, T> {
 
 crate::ktest!(
     fn a_held_lock_keeps_interrupts_off() {
-        use crate::{kassert, kassert_eq};
+        use crate::kassert_eq;
         // Tests run with interrupts on, outside any lock: "restored" means on.
-        kassert!(arch::irq::enabled());
-        kassert_eq!(arch::irq::depth(), 0);
-        let (was, depth) = (arch::irq::enabled(), arch::irq::depth());
+        kassert_eq!((arch::irq::enabled(), arch::irq::depth()), (true, 0));
         let lock = SpinLock::new(0u32);
         {
             let mut g = lock.lock();
             *g += 1;
-            kassert!(!arch::irq::enabled());
-            kassert_eq!(arch::irq::depth(), depth + 1);
+            kassert_eq!((arch::irq::enabled(), arch::irq::depth()), (false, 1));
         }
-        kassert_eq!((arch::irq::enabled(), arch::irq::depth()), (was, depth));
+        kassert_eq!((arch::irq::enabled(), arch::irq::depth()), (true, 0));
         Ok(())
     }
 );
@@ -112,15 +111,14 @@ crate::ktest!(
 crate::ktest!(
     fn guards_dropped_out_of_order_keep_interrupts_off_until_the_last() {
         use crate::{kassert, kassert_eq};
-        kassert!(arch::irq::enabled());
-        let was = arch::irq::enabled();
+        kassert_eq!((arch::irq::enabled(), arch::irq::depth()), (true, 0));
         let (a, b) = (SpinLock::new(()), SpinLock::new(()));
         let ga = a.lock();
         let gb = b.lock();
         drop(ga);
         kassert!(!arch::irq::enabled()); // `b` is still held
         drop(gb);
-        kassert_eq!(arch::irq::enabled(), was);
+        kassert!(arch::irq::enabled());
         Ok(())
     }
 );
@@ -128,21 +126,35 @@ crate::ktest!(
 crate::ktest!(
     fn a_failed_try_lock_changes_nothing() {
         use crate::{kassert, kassert_eq};
+        kassert_eq!((arch::irq::enabled(), arch::irq::depth()), (true, 0));
         let lock = SpinLock::new(());
-        kassert!(arch::irq::enabled());
-        let was = arch::irq::enabled();
         let held = lock.lock();
-        let depth = arch::irq::depth();
         kassert!(lock.try_lock().is_none());
         // Still held: the failed attempt didn't release the holder's lock.
         kassert!(lock.try_lock().is_none());
-        kassert_eq!(arch::irq::depth(), depth);
-        kassert!(!arch::irq::enabled());
+        kassert_eq!((arch::irq::enabled(), arch::irq::depth()), (false, 1));
         drop(held);
         let again = lock.try_lock();
         kassert!(again.is_some() && !arch::irq::enabled());
         drop(again);
-        kassert_eq!(arch::irq::enabled(), was);
+        kassert!(arch::irq::enabled());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_lock_taken_with_interrupts_off_leaves_them_off() {
+        // As in an interrupt handler: interrupts were already off, so
+        // releasing the lock must not turn them on.
+        use crate::{kassert, kassert_eq};
+        kassert_eq!(arch::irq::depth(), 0);
+        // SAFETY: masks interrupts on this CPU; turned back on below.
+        unsafe { core::arch::asm!("cli") };
+        let lock = SpinLock::new(());
+        drop(lock.lock());
+        let stayed_off = !arch::irq::enabled();
+        arch::irq::enable();
+        kassert!(stayed_off);
         Ok(())
     }
 );

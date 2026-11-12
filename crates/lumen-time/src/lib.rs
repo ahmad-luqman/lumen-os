@@ -57,9 +57,16 @@ pub fn counter_delta(earlier: u64, later: u64, mask: u64) -> u64 {
     later.wrapping_sub(earlier) & mask
 }
 
+/// Ticks a down-counter that reloads to `reload` at 0 counted from reading
+/// `earlier` to reading `later`: correct across one reload (two readings
+/// less than a period apart).
+pub fn down_counter_delta(earlier: u32, later: u32, reload: u32) -> u32 {
+    if later <= earlier { earlier - later } else { earlier + (reload - later) }
+}
+
 /// Is `hz` a believable TSC frequency? A miscounted reference gives wild
-/// values (a PIT that isn't there reads as finished at once); real TSCs run
-/// between tens of MHz and a few GHz.
+/// values. Real TSCs run between tens of MHz and a few GHz; the bounds (10 MHz
+/// to 100 GHz) are generous, so only a broken reference fails.
 pub fn plausible_tsc_hz(hz: u64) -> bool {
     (10_000_000..=100_000_000_000).contains(&hz)
 }
@@ -188,9 +195,17 @@ mod tests {
     }
 
     #[test]
+    fn down_counter_deltas_cross_one_reload() {
+        assert_eq!(down_counter_delta(60_000, 50_000, 62_500), 10_000);
+        assert_eq!(down_counter_delta(5_000, 60_000, 62_500), 7_500, "reloaded once");
+        assert_eq!(down_counter_delta(0, 62_500, 62_500), 0, "at 0, then reloaded");
+        assert_eq!(down_counter_delta(7, 7, 62_500), 0);
+    }
+
+    #[test]
     fn tsc_frequencies_must_be_believable() {
         assert!(plausible_tsc_hz(2_900_000_000) && plausible_tsc_hz(10_000_000) && plausible_tsc_hz(100_000_000_000));
-        assert!(!plausible_tsc_hz(9_999_999), "a PIT that finished at once");
+        assert!(!plausible_tsc_hz(9_999_999), "a reference that finished far too soon");
         assert!(!plausible_tsc_hz(100_000_000_001));
     }
 

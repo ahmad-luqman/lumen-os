@@ -17,7 +17,7 @@
 use super::gdt;
 use core::arch::{asm, global_asm};
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Register state saved by the entry stub, lowest address first.
 #[repr(C)]
@@ -216,18 +216,22 @@ pub fn our_base() -> u64 {
 pub static BREAKPOINTS: AtomicU64 = AtomicU64::new(0);
 
 // The vector map. 0-31 are the CPU's exceptions.
-/// `PIC_BASE..PIC_BASE + 16`: the 8259s, remapped and masked; only a spurious
-/// IRQ 7 or 15 can arrive here.
+/// `PIC_BASE..PIC_BASE + 16`: the 8259s, remapped and masked, so only a
+/// spurious IRQ 7 or 15 should arrive (any other line is handled as
+/// unexpected).
 pub const PIC_BASE: u8 = 0x20;
+/// The 8259s' spurious IRQs: 7 (master) and 15 (slave).
+pub const PIC_SPURIOUS_MASTER: u8 = PIC_BASE + 7;
+pub const PIC_SPURIOUS_SLAVE: u8 = PIC_BASE + 15;
 /// The local APIC timer.
 pub const TIMER: u8 = 0x40;
-/// `IOAPIC_BASE + n`: global system interrupt `n` (up to [`IOAPIC_LAST`]),
-/// once a driver routes it (every I/O APIC input is masked until then).
+/// `IOAPIC_BASE + n`: global system interrupt `n` (up to vector 0xef), once
+/// a driver routes it (every I/O APIC input is masked until then).
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: device drivers (M3)
 pub const IOAPIC_BASE: u8 = 0x50;
 /// The last vector for an I/O APIC input.
 const IOAPIC_LAST: u8 = 0xef;
-/// Free: no source uses 0x30-0x3f (the ktests raise these by `int`).
+/// Free: no source uses 0x30-0x3f (a ktest raises 0x30 by `int`).
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
 pub const UNUSED: u8 = 0x30;
 /// Local APIC errors.
@@ -255,6 +259,8 @@ static SPURIOUS_IRQS: AtomicU64 = AtomicU64::new(0);
 static UNEXPECTED_IRQS: AtomicU64 = AtomicU64::new(0);
 /// Local APIC error interrupts taken.
 static LAPIC_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// Every local APIC error status bit seen so far.
+static LAPIC_ERRORS_SEEN: AtomicU32 = AtomicU32::new(0);
 /// Which vectors have been warned about, a bit each.
 static WARNED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
@@ -310,13 +316,6 @@ pub fn exception_name(vector: u64) -> &'static str {
     }
 }
 
-/// Called by `lumen_isr_common` for every vector. CPU exceptions are traced
-/// and fatal (bar #BP). Device interrupts are never fatal: the timer and
-/// spurious interrupts are only counted (at 1 kHz they would flood the trace
-/// ring); a local APIC error is counted and logged with its status (on the
-/// 1st, 2nd, 4th, 8th... one); anything else is traced, counted and warned
-/// about once per vector. Interrupts are off throughout (every gate is an
-/// interrupt gate).
 /// Count, trace and (once per vector) warn about an interrupt nothing handles.
 fn unexpected(frame: &TrapFrame) {
     let v = frame.vector as u8;
@@ -328,6 +327,13 @@ fn unexpected(frame: &TrapFrame) {
     }
 }
 
+/// Called by `lumen_isr_common` for every vector. CPU exceptions are traced
+/// and fatal (bar #BP). Device interrupts are never fatal: the timer and
+/// spurious interrupts are only counted (at 1 kHz they would flood the trace
+/// ring); a local APIC error is counted and logged with its status (on the
+/// 1st, 2nd, 4th, 8th... one, and whenever a new status bit appears);
+/// anything else is traced, counted and warned about once per vector.
+/// Interrupts are off throughout (every gate is an interrupt gate).
 #[unsafe(no_mangle)]
 extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
     let vector = frame.vector;
@@ -348,23 +354,34 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
         SPURIOUS => {
             SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);
         }
-        v if v == PIC_BASE + 7 || v == PIC_BASE + 15 => {
-            // A masked 8259 still raises spurious IRQs 7 and 15; the master
-            // counts a slave's spurious IRQ 15 as real and needs its EOI.
+        v if (PIC_BASE..PIC_BASE + 16).contains(&v) && super::apic::in_service(v) => {
+            // Delivered through the local APIC (an MSI or a routed input on
+            // the 8259s' vectors), not by the 8259s: its EOI is the APIC's.
+            unexpected(frame);
+            super::apic::eoi();
+        }
+        // A masked 8259 still raises spurious IRQs 7 and 15.
+        PIC_SPURIOUS_MASTER => {
             SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);
-            if v == PIC_BASE + 15 {
-                super::pic::eoi_master();
-            }
+        }
+        PIC_SPURIOUS_SLAVE => {
+            // The master counts a slave's spurious IRQ 15 as real: it needs
+            // its EOI.
+            SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);
+            super::pic::eoi_master();
         }
         v if (PIC_BASE..PIC_BASE + 16).contains(&v) => {
-            // Any other 8259 line means it isn't masked after all.
+            // Any other 8259 line means it isn't masked after all: mask
+            // them again.
             unexpected(frame);
             super::pic::eoi(v - PIC_BASE);
+            super::pic::mask_all();
         }
         LAPIC_ERROR => {
             let status = super::apic::error_status();
             let n = LAPIC_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
-            if n.is_power_of_two() {
+            let new_bits = status & !LAPIC_ERRORS_SEEN.fetch_or(status, Ordering::Relaxed);
+            if n.is_power_of_two() || new_bits != 0 {
                 log::warn!(target: "irq", "local APIC error #{n}, status {status:#x}");
             }
             super::apic::eoi();
