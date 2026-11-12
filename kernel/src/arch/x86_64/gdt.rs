@@ -64,6 +64,12 @@ const EMPTY_TSS: TaskStateSegment = TaskStateSegment {
 
 static mut TSS_SEGMENTS: [TaskStateSegment; MAX_CPUS] = [EMPTY_TSS; MAX_CPUS];
 
+/// CPU `cpu`'s TSS (a raw pointer: no reference to the `static mut` is made).
+fn tss(cpu: usize) -> *mut TaskStateSegment {
+    // SAFETY: only takes the (bounds-checked) address; no reference is made.
+    unsafe { &raw mut TSS_SEGMENTS[cpu] }
+}
+
 const GDT_TEMPLATE: [u64; GDT_ENTRIES] = [
     0,
     0x00af_9a00_0000_ffff, // kernel code: present, ring 0, executable, long mode
@@ -87,8 +93,7 @@ static mut GDTS: [[u64; GDT_ENTRIES]; MAX_CPUS] = [GDT_TEMPLATE; MAX_CPUS];
 /// meanwhile (the boot CPU: the IDT doesn't use them yet; an AP: it isn't
 /// running kernel code yet), and nothing else writes its TSS.
 pub(super) unsafe fn set_ist_stacks(cpu: usize, double_fault: u64, nmi: u64, machine_check: u64) {
-    // SAFETY: only takes the (bounds-checked) address; no reference is made.
-    let tss = unsafe { &raw mut TSS_SEGMENTS[cpu] };
+    let tss = tss(cpu);
     // SAFETY: upheld by the caller; the CPU reads its TSS only when it takes
     // an interrupt that uses an IST slot.
     unsafe {
@@ -100,10 +105,10 @@ pub(super) unsafe fn set_ist_stacks(cpu: usize, double_fault: u64, nmi: u64, mac
 
 /// The stack top in this CPU's IST slot `slot` (1-based), 0 if unset.
 pub fn ist_top(slot: u8) -> u64 {
-    // SAFETY: only takes the (bounds-checked) address; no reference is made.
-    let tss = unsafe { &raw const TSS_SEGMENTS[percpu::index()] };
-    // SAFETY: a plain read of a field of this CPU's own TSS, which is written
-    // only before this CPU uses it (`set_ist_stacks`).
+    let tss = tss(percpu::index());
+    // SAFETY: a plain read of a field of this CPU's own TSS, written only by
+    // `set_ist_stacks` (for the boot CPU on itself, with interrupts off; for
+    // an AP before it starts).
     unsafe { (*tss).ist[usize::from(slot - 1)] }
 }
 
@@ -114,8 +119,7 @@ pub fn ist_top(slot: u8) -> u64 {
 /// Once per CPU, on CPU `cpu` itself, with interrupts off: nothing else
 /// touches that CPU's GDT or TSS meanwhile.
 pub(super) unsafe fn load(cpu: usize) {
-    // SAFETY: only takes the (bounds-checked) address; no reference is made.
-    let tss = unsafe { &raw mut TSS_SEGMENTS[cpu] };
+    let tss = tss(cpu);
     // SAFETY: upheld by the caller. The IST slots are empty (boot CPU, until
     // `set_ist_stacks`) or already filled (an AP).
     unsafe {

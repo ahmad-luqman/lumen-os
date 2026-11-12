@@ -63,7 +63,7 @@ fn dispatch(line: &str) {
                 "commands:\n  help              this list\n  echo <text>       print text\n  \
                  int3              take a breakpoint and continue\n  \
                  crash <kind> [cpu] deliberate fault (on that CPU): {CRASH_KINDS}\n  \
-                 trace [n]         the last n trace events (default 16)\n  \
+                 trace [n]         the boot CPU's last n trace events (default 16)\n  \
                  heap              heap usage and free-list summary\n  \
                  ticks             timer interrupts taken (and stray ones)\n  \
                  sleep <ms>        wait that long (guest time)\n  \
@@ -352,14 +352,14 @@ fn crash_corrupt_heap() {
     let _ = writeln!(serial::SerialWriter, "crash: a corrupt free list went unnoticed");
 }
 
-/// Write into the guard page below the main stack from a healthy stack: a
+/// Write into the guard page below this CPU's main stack from a healthy stack: a
 /// plain #PF (nothing overflowed), which the report names as a stray guard
 /// page hit, not an overflow.
 #[inline(never)]
 fn crash_touch_guard() {
-    use lumen_mm::stacks::StackKind;
-    let Some(main) = arch::stacks::REGISTRY.iter().find(|r| r.kind == StackKind::Main) else {
-        let _ = writeln!(serial::SerialWriter, "crash: no main stack registered");
+    // This CPU's main stack: the one it runs on.
+    let Some(main) = arch::stacks::stack_of(arch::read_rsp()) else {
+        let _ = writeln!(serial::SerialWriter, "crash: not on a registered stack");
         return;
     };
     // SAFETY: deliberately faulting: the guard page is never mapped.
@@ -367,7 +367,7 @@ fn crash_touch_guard() {
     let _ = writeln!(serial::SerialWriter, "crash: writing to a guard page succeeded (guard page mapped?)");
 }
 
-/// Overflow the main stack with small frames.
+/// Overflow this CPU's main stack with small frames.
 #[inline(never)]
 fn crash_stack_overflow() {
     let depth = recurse(0);

@@ -26,6 +26,8 @@ def test_in_kernel_tests_pass(boot):
     assert report.complete, f"incomplete TAP stream: {report.summary()}\n{out[-2000:]}"
     assert report.all_passed, report.summary()
     assert code == EXIT_SUCCESS, f"QEMU exit {code}, expected {EXIT_SUCCESS}"
+    # The other CPUs really were online while the tests ran.
+    assert "INFO  smp: 4 CPUs online\n" in out, "the APs didn't come online"
     assert len(report.cases) >= 7
     # `device_vectors_are_not_fatal` raises the unused vector twice: one
     # warning, not one per interrupt.

@@ -23,9 +23,12 @@ pub mod stacks;
 /// crash report.
 pub fn init_early() {
     serial::init();
-    idt::fill();
-    // SAFETY: once, on the boot CPU (index 0), interrupts off.
-    unsafe { init_cpu(0) };
+    // SAFETY: once, on the boot CPU (index 0), interrupts off, before any CPU
+    // loads the IDT.
+    unsafe {
+        idt::fill();
+        init_cpu(0);
+    }
 }
 
 /// A CPU's own setup, the same on every CPU: its GDT/TSS, then its per-CPU

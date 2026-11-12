@@ -104,7 +104,9 @@ def crash_on(boot, args: str, cpus: int = 4):
     m, online = boot_to_prompt(boot, cpus)
     assert online == cpus
     m.send_line(f"crash {args}")
-    m.expect(re.escape(crash.END), 30)
+    # A deliberate protection fault that doesn't fault says so at once.
+    done = m.expect(rf"{re.escape(crash.END)}|{crash.PROTECTION_BROKEN}", 30)
+    assert done.group(0) == crash.END, f"no crash: {done.group(0)}"
     assert m.wait_exit(10) == EXIT_CRASH
     out = m.output
     report = out[out.index(crash.BEGIN) : out.index(crash.END) + len(crash.END)]

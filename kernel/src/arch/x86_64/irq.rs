@@ -122,10 +122,10 @@ pub fn wait_unless(ready: impl FnOnce() -> bool) {
     unsafe { asm!("sti", "hlt", options(nomem, nostack)) };
 }
 
-/// Turn interrupts off on this CPU; from now on no CPU turns them back on
-/// (closing sections, [`enable`] and [`wait_unless`] all refuse). For the
-/// crash path, which never returns to what it interrupted (it stops the
-/// other CPUs itself).
+/// Turn interrupts off on this CPU; from now on no CPU turns them back on:
+/// closing sections don't, [`enable`] refuses and [`wait_unless`] halts the
+/// CPU (one already past that check is stopped by the crash reporter's
+/// NMI). For the crash path, which never returns to what it interrupted.
 pub fn disable_for_good() {
     cli();
     FOR_GOOD.store(true, Ordering::Relaxed);

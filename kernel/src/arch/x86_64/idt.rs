@@ -154,13 +154,16 @@ static mut IDT: [IdtEntry; 256] = [IdtEntry::MISSING; 256];
 /// The vectors that run on their own IST stack, and their slots.
 const IST_VECTORS: [(usize, u8); 3] = [(2, gdt::IST_NMI), (8, gdt::IST_DOUBLE_FAULT), (18, gdt::IST_MACHINE_CHECK)];
 
-/// Fill the IDT (once, on the boot CPU, before any CPU loads it). Every
-/// vector runs on the current stack until [`use_ist_stacks`].
-pub(super) fn fill() {
+/// Fill the IDT. Every vector runs on the current stack until
+/// [`use_ist_stacks`].
+///
+/// # Safety
+/// Once, on the boot CPU, before any CPU loads the IDT.
+pub(super) unsafe fn fill() {
     let stubs = &raw const lumen_isr_stubs as u64;
     let idt = &raw mut IDT;
-    // SAFETY: single-threaded early boot, before any `load`; the IDT is
-    // static and lives forever.
+    // SAFETY: upheld by the caller (nothing reads the IDT yet); it is static
+    // and lives forever.
     unsafe {
         for vector in 0..256u64 {
             (*idt)[vector as usize] = IdtEntry::interrupt_gate(stubs + vector * STUB_STRIDE, 0);

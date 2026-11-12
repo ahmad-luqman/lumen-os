@@ -162,7 +162,8 @@ pub fn record_in<const N: usize>(ring: &TraceRing<N>, kind: Kind, args: [u64; 4]
 /// the current TSC; ktests pass chosen stamps). Boot uses it for
 /// `BootPhase::Entry`: its TSC is read before `arch::init_early` (only a bare
 /// `rdtsc` may run before GDT/IDT setup, hard rule 6), and the event is
-/// recorded after.
+/// recorded after (it stamps this CPU's index, read through GS, which
+/// `arch::init_early` sets).
 pub fn record_at<const N: usize>(ring: &TraceRing<N>, tsc: u64, kind: Kind, args: [u64; 4]) {
     // pid 0 until processes (M2) exist. A dropped event is counted in the
     // ring's `dropped()`; recording never fails loudly.

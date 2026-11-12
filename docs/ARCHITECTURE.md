@@ -147,19 +147,20 @@ in all, without waiting:
   (global entries too) and switches to the allocated stack in one naked
   step, touching nothing on Limine's stack after the CR3 load. The frame
   chain starts there (`rbp` = 0). Nothing in this stretch can fault (no
-  checks, only register and memory writes): an exception there would find
-  the AP's IST stacks unmapped (they are in the kernel's tables only), so an
-  NMI, #DF or #MC would be a triple fault, and the crash reporter's local
-  APIC unmapped too.
+  check that can fail, only register and memory writes): there an NMI, #DF
+  or #MC would find the AP's IST stacks unmapped (they are in the kernel's
+  tables only), a triple fault, and any other exception would lose its
+  report to a fault on the crash reporter's local APIC write (one `!!!
+  fault while stopping` line).
 - On its own stack the AP enables its local APIC, then checks NX support,
   the PAT and its APIC id against Limine's (a failure is reported
   normally), logs `INFO  smp: cpu N online (lapic id X)` and idles in
   `sti; hlt`. After calibrating the clocks the boot CPU waits, 2 s in all,
   for every AP (`smp::wait_online`; a CPU that doesn't make it is warned
   about), then logs `INFO  smp: N CPUs online` (`N of M` at warn if short).
-- CPUs past the cap are sent to a halt loop that counts them, and the boot
-  CPU warns how many halted (`2 CPU(s) past the limit halted`). They stay
-  on Limine's tables and stack for good.
+- CPUs past the cap are sent to a halt loop that counts them on arrival,
+  and the boot CPU warns how many got there (`2 CPU(s) past the limit
+  halted`). They stay on Limine's tables and stack for good.
 - Why before the calibration: a CPU in Limine's park loop spins on its
   `goto_address`, and under emulation spinning CPUs take host time from
   every guest calibrating alongside. Measured under TCG, QEMU's CPU time
@@ -190,9 +191,10 @@ and an AP's local APIC timer stays masked. Known gap: there is no TLB
 shootdown; `unmap` flushes only the CPU that runs it. Mapping needs none
 (x86 caches no not-present entries; an AP may grow the heap, from an
 allocation in a `run_on` job). The only pages unmapped are dropped kernel
-stacks (test stacks, on the boot CPU) and the rollback of a failed
-`map_fresh`, which undoes pages its own CPU just mapped; no other CPU has
-used either (not tested).
+stacks (test stacks, on the boot CPU), the paging ktests' scratch pages
+(boot CPU, other CPUs idle) and the rollback of a failed `map_fresh`, which
+undoes pages its own CPU just mapped. No other CPU has accessed any of
+them; stale entries from speculative fills aren't ruled out (not tested).
 
 ### ACPI (built in M1)
 
@@ -431,9 +433,8 @@ stack (`stacks::set_boot_stack`, not in the registry) for that walk, but is
 never run on again. Until the switch it is the boot CPU's one stack without
 a guard page, and a #DF with a broken `rsp` before then is a triple fault
 instead of a report. Each AP likewise runs on its own Limine stack from
-`smp::ap_entry` until `enter_kernel_space` (not registered: a crash there
-would say `running on: an unknown stack`), and CPUs past the cap halt on
-theirs.
+`smp::ap_entry` until `enter_kernel_space` (not registered; nothing there
+may fault, see "Other CPUs"), and CPUs past the cap halt on theirs.
 
 The registry (lock-free, 48 slots, each a seqlock; registering is `unsafe`
 because readers dereference what it lists) and the boot stack are what the
@@ -571,20 +572,23 @@ interrupt handler is allowed to allocate (none does yet).
   chain cannot fault. Symbols come from our own ELF (Limine's executable-file
   response) via `crates/lumen-elf` and are demangled with `rustc-demangle`.
 - **Several CPUs:** the first CPU to crash owns the report (`CRASHING`
-  holds its index plus one). Before writing anything it sends every
-  *online* CPU an NMI (one still parked in the bootloader has no handler for
-  it) and waits, 500 ms in all (a bounded number of rounds before the TSC is
-  calibrated), for each to stop. Serial starts with `cpu: N (lapic id X)`,
-  `running on: the <kind> stack <bottom>..<top>` (the reporter's own stack,
-  from the registry) and, with other CPUs online, `other cpus stopped: 0 2
-  3`: the CPUs that had stopped through the stop NMI when the wait ended.
-  `!!!` lines name the rest: a CPU that didn't stop in time, one whose NMI
-  couldn't be sent, one that stopped through a crash of its own (with its
-  vector and rip: `cpu 2 also crashed: ...`), and APs started but not yet
-  online (they get no NMI and could still log a line into the report; not
-  tested). With every CPU stopped, reports and log lines don't interleave.
-  The screen copy doesn't show these lines. A fault while stopping the
-  others prints one line that keeps the original crash's vector and rip.
+  holds its index plus one). Every CPU records its own crash first thing
+  (vector and rip, or a panic's line). Before writing anything the owner
+  takes one snapshot of the others: online CPUs get an NMI (one still parked
+  in the bootloader has no handler for it), started ones are noted; then it
+  waits, 500 ms in all (a bounded number of rounds before the TSC is
+  calibrated), for each online CPU to halt. Serial starts with
+  `cpu: N (lapic id X)`, `running on: the <kind> stack <bottom>..<top>` (the
+  reporter's own stack, from the registry) and, with other CPUs online,
+  `other cpus stopped: 0 2 3`: those that had halted when the wait ended,
+  without a crash of their own. `!!!` lines name the rest: a CPU that didn't
+  halt in time, one whose NMI couldn't be sent, one that crashed itself
+  (`cpu 2 also crashed: #PF page fault (vector 0xe), rip ...` or `a panic at
+  line N`), and APs started but not yet online (no NMI; one could still log
+  a line into the report; not tested). With every CPU stopped, reports and
+  log lines don't interleave. The screen copy doesn't show these lines. A
+  fault while stopping the others prints one line that keeps the original
+  crash.
 - A fault during the report prints one line and halts, with no recursion. With
   `lumen.qemu_exit` the kernel exits QEMU with status 37; otherwise it halts.
 - Planned: "Explain this crash with Claude" in the GUI, which sends the same

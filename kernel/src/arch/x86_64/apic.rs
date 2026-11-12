@@ -156,16 +156,26 @@ pub fn send_nmi(dest: u32) -> bool {
     send(dest, ICR_ASSERT | LVT_NMI)
 }
 
-/// Write the ICR (destination first: writing the low word sends) and wait,
-/// bounded, until the local APIC has sent it: false if it hasn't by then
-/// (the crash path must not hang on a wedged APIC; it says so). Interrupts
-/// are off meanwhile, so a handler on this CPU can't send one between the
-/// writes.
+/// Write the ICR (destination first: writing the low word sends) once the
+/// last IPI has gone, then wait until this one has: false if the ICR stays
+/// busy either time (bounded: the crash path must not hang on a wedged
+/// APIC; it says so). Interrupts are off meanwhile, so a handler on this CPU
+/// can't send one between the writes.
 fn send(dest: u32, low: u32) -> bool {
+    // Online CPUs' ids passed `smp::ap_main`'s check against this 8-bit
+    // register field, so the crash path can't trip this.
     assert!(dest <= 0xff, "xAPIC destination {dest} doesn't fit in 8 bits");
     let _irq = super::irq::push_off();
+    if !icr_idle() {
+        return false;
+    }
     write(ICR_HIGH, dest << 24);
     write(ICR_LOW, low);
+    icr_idle()
+}
+
+/// Wait, bounded, until no IPI is being sent; whether none is.
+fn icr_idle() -> bool {
     for _ in 0..ICR_SPINS {
         if read(ICR_LOW) & ICR_PENDING == 0 {
             return true;

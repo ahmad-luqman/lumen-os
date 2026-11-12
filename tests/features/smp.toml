@@ -1,7 +1,7 @@
 # Features: smp. See tests/features/README.md for the format.
 
 [[feature]]
-name = "Every CPU Limine reports comes online (up to 8, the rest halted), each with its own TSS, per-CPU record and allocated, guarded stacks"
+name = "Every CPU Limine reports comes online (up to 8, the rest sent to a halt loop), each with its own TSS, per-CPU record and allocated, guarded stacks"
 milestone = "M1"
 tests = [
     "scenario:test_smp::test_all_cpus_online",

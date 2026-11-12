@@ -6,8 +6,9 @@
 //! exceptions are the stack Limine booted us on, used until that switch,
 //! recorded here ([`set_boot_stack`], not in the registry) so a crash before
 //! the switch, or a backtrace reaching back into `kmain`, can still be
-//! walked; and each AP's Limine stack, which it leaves in `smp::ap_entry`
-//! before anything can fault (CPUs past the cap halt on theirs).
+//! walked; and each AP's Limine stack (not recorded), which it leaves in
+//! `smp::ap_entry` before anything can fault (CPUs past the cap halt on
+//! theirs).
 //!
 //! The crash reporter uses this module lock-free: a frame pointer is only
 //! followed if it points into a known stack ([`contains`]), so a corrupted

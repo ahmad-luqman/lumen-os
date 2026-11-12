@@ -11,11 +11,13 @@
 //! 2. it hands the AP its CPU index and jumps it to [`ap_entry`], which loads
 //!    the AP's own GDT/TSS, per-CPU record and the IDT first (hard rule 6),
 //!    turns on NX and WP, then switches to the kernel's page tables and its
-//!    allocated stack in one step. Nothing in that stretch can fault: an
-//!    exception there would find the AP's IST stacks unmapped (they are in
-//!    the kernel's tables only) and the crash reporter's local APIC too;
+//!    allocated stack in one step. Nothing in that stretch can fault (its
+//!    only checks are bounds checks `start`'s indices always pass): there an
+//!    NMI, #DF or #MC would find the AP's IST stacks unmapped (they are in the
+//!    kernel's tables only), a triple fault, and any other exception would
+//!    lose its report to a fault on the crash reporter's local APIC write;
 //! 3. on its own stack the AP enables its local APIC, checks NX, the PAT and
-//!    its APIC id (a failure is reported normally now), logs
+//!    its APIC id (a failure is reported normally), logs
 //!    `cpu N online (lapic id X)` and idles with interrupts on, running
 //!    whatever [`run_on`] hands it (kmon's `crash <kind> [cpu]`);
 //! 4. after calibrating the clocks, the boot CPU waits (bounded, 2 s in all)
@@ -49,13 +51,15 @@ const START_TIMEOUT_NS: u64 = 2_000_000_000;
 // Four stacks a CPU (main, #DF, NMI, #MC), and room left for others.
 const _: () = assert!(4 * MAX_CPUS < lumen_mm::stacks::MAX_STACKS);
 
-/// Where a CPU's slot is in its life.
+/// Where a CPU's slot is in its life. It only moves forward (Empty,
+/// Starting, Online; the boot CPU straight to Online), which the lock-free
+/// readers rely on: once online, a CPU stays online.
 #[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum State {
     /// No CPU has this index.
     Empty = 0,
-    /// Started (stacks set, jumped to `ap_entry`), not online yet.
+    /// Started (stacks set, about to jump to `ap_entry`), not online yet.
     Starting = 1,
     /// Running the kernel on its own stack with its local APIC enabled
     /// (and, so, its own IDT and TSS: an NMI is safe to send). The boot CPU
@@ -75,6 +79,7 @@ impl Mailbox {
     }
 
     /// Put `job` in, unless one is already waiting.
+    #[must_use]
     fn offer(&self, job: fn()) -> bool {
         self.0.compare_exchange(0, job as usize, Ordering::Release, Ordering::Relaxed).is_ok()
     }
@@ -83,6 +88,7 @@ impl Mailbox {
         self.0.load(Ordering::Relaxed) != 0
     }
 
+    #[must_use]
     fn take(&self) -> Option<fn()> {
         match self.0.swap(0, Ordering::Acquire) {
             0 => None,
@@ -114,7 +120,8 @@ impl Slot {
     }
 
     fn set(&self, state: State) {
-        self.state.store(state as u8, Ordering::Release);
+        let old = self.state.swap(state as u8, Ordering::AcqRel);
+        debug_assert!(old < state as u8, "a CPU's state only moves forward");
     }
 }
 
@@ -133,22 +140,17 @@ static HALTED: AtomicUsize = AtomicUsize::new(0);
 /// [`start_all`] has run.
 static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 
-/// Is CPU `index` online? Lock-free (the crash reporter stops exactly
-/// these CPUs).
-pub fn is_online(index: usize) -> bool {
-    index < MAX_CPUS && SLOTS[index].state() == State::Online
+/// CPU `index`'s local APIC id, if it is online (it can take IPIs).
+/// Lock-free (the crash reporter stops exactly these CPUs).
+pub fn online_lapic_id(index: usize) -> Option<u32> {
+    let slot = SLOTS.get(index)?;
+    (slot.state() == State::Online).then(|| slot.lapic_id.load(Ordering::Relaxed))
 }
 
 /// Has CPU `index` been started but isn't online yet? (The crash reporter
 /// can't stop such a CPU, and says so.)
 pub fn is_starting(index: usize) -> bool {
-    index < MAX_CPUS && SLOTS[index].state() == State::Starting
-}
-
-/// CPU `index`'s local APIC id, if some CPU has that index.
-pub fn lapic_id(index: usize) -> Option<u32> {
-    let slot = SLOTS.get(index)?;
-    (slot.state() != State::Empty).then(|| slot.lapic_id.load(Ordering::Relaxed))
+    SLOTS.get(index).is_some_and(|s| s.state() == State::Starting)
 }
 
 /// How many CPUs are online (the boot CPU included).
@@ -164,11 +166,12 @@ pub enum RunError {
     NotAnOnlineAp,
     /// It hasn't taken the last job yet.
     Busy,
-    /// Its wakeup IPI couldn't be sent (the local APIC stayed busy); the job
-    /// was taken back.
+    /// Its wakeup IPI couldn't be sent (this CPU's local APIC stayed busy);
+    /// the job was taken back.
     IpiNotSent,
 }
 
+/// How kmon finishes `crash: cpu N ...` (a test interface).
 impl core::fmt::Display for RunError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
@@ -183,16 +186,15 @@ impl core::fmt::Display for RunError {
 /// interrupts on), and wake it. Returns once the job is handed over, not
 /// when it has run.
 pub fn run_on(index: usize, job: fn()) -> Result<(), RunError> {
-    if index == 0 || !is_online(index) {
+    let Some(lapic) = online_lapic_id(index).filter(|_| index != 0) else {
         return Err(RunError::NotAnOnlineAp);
-    }
+    };
     let slot = &SLOTS[index];
     if !slot.job.offer(job) {
         return Err(RunError::Busy);
     }
-    let lapic = slot.lapic_id.load(Ordering::Relaxed);
-    if !arch::apic::send_ipi(lapic, arch::idt::WAKEUP) {
-        slot.job.take();
+    // A late IPI may still wake it: if it has taken the job, it runs it.
+    if !arch::apic::send_ipi(lapic, arch::idt::WAKEUP) && slot.job.take().is_some() {
         return Err(RunError::IpiNotSent);
     }
     Ok(())
@@ -216,12 +218,12 @@ pub fn start_all() -> Started {
     let bsp = arch::apic::lapic_id();
     SLOTS[0].lapic_id.store(bsp, Ordering::Relaxed);
     SLOTS[0].set(State::Online);
+    let mut started = Started { aps: 0, parked: 0 };
     let Some(resp) = boot::MP.get_response() else {
         warn!(target: "smp", "no MP response from the bootloader: only the boot CPU runs");
-        return Started { aps: 0, parked: 0 };
+        return started;
     };
     assert_eq!(resp.bsp_lapic_id(), bsp, "Limine and the local APIC disagree on the boot CPU's APIC id");
-    let mut started = Started { aps: 0, parked: 0 };
     for cpu in resp.cpus().iter().filter(|c| c.lapic_id != bsp) {
         if started.aps + 1 == MAX_CPUS {
             cpu.goto_address.write(park);
@@ -318,8 +320,9 @@ unsafe extern "C" fn park(_cpu: &Cpu) -> ! {
 }
 
 /// Where an AP starts: on Limine's page tables and stack, interrupts off.
-/// Nothing here may fault (see the module docs): no checks, only loads,
-/// stores and register writes, then the switch.
+/// Nothing here may fault (see the module docs): no check that can fail
+/// (the index `start` passed is below `MAX_CPUS`), only loads, stores and
+/// register writes, then the switch.
 unsafe extern "C" fn ap_entry(cpu: &Cpu) -> ! {
     let index = cpu.extra.load(Ordering::Relaxed) as usize;
     // SAFETY: `start` gave this CPU its own index and filled its IST slots

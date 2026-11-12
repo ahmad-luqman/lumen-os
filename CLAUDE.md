@@ -54,10 +54,11 @@ Each rule exists because breaking it caused a real bug in v1.
    guard page (`mm::stack`). The only exception is early boot, which runs on
    Limine's stack (and #DF, NMI and #MC with it, no IST yet) until `kmain`
    switches right after `mm::init`, and likewise each other CPU from
-   `smp::ap_entry` until `enter_kernel_space` (its IST stacks are mapped only
-   in the kernel's tables, so nothing in that stretch may fault: an
-   exception there is a triple fault). CPUs past `MAX_CPUS` halt for good on
-   their Limine stack.
+   `smp::ap_entry` until `enter_kernel_space`. Nothing in that stretch may
+   fault: its IST stacks are mapped only in the kernel's tables (an NMI, #DF
+   or #MC there is a triple fault), and any other exception loses its report
+   (one `!!!` line). CPUs past `MAX_CPUS` halt for good on their Limine
+   stack.
 5. **A real heap with working `free`**, plus in-kernel fragmentation and reuse
    tests.
 6. **Exception handling comes first.** GDT/IDT setup is the first thing
