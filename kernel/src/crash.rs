@@ -55,6 +55,8 @@ fn is_kernel_text(addr: u64) -> bool {
 
 /// Report a fatal CPU exception and stop.
 pub fn exception(frame: &TrapFrame) -> ! {
+    // Interrupts are already off (an interrupt gate); keep them off.
+    arch::irq::disable_for_good();
     enter(frame.vector, frame.rip);
     let cr2 = arch::read_cr2();
     FIRST_CR2.store(cr2, Ordering::SeqCst);
@@ -72,6 +74,10 @@ pub fn exception(frame: &TrapFrame) -> ! {
 
 /// Report a Rust panic and stop.
 pub fn panic(info: &PanicInfo<'_>) -> ! {
+    // Before anything else: a panic can come with interrupts on, and a
+    // timer interrupt must not run (or a lock guard turn them back on)
+    // while the report is written.
+    arch::irq::disable_for_good();
     enter(u64::MAX, 0);
     FIRST_CR2.store(arch::read_cr2(), Ordering::SeqCst);
     crate::ktrace!(crate::trace::Kind::Panic, info.location().map_or(0, |l| l.line()));
@@ -152,7 +158,7 @@ fn emit(body: &dyn Fn(&mut dyn Write), tail: &dyn Fn(&mut dyn Write)) {
     // corrupt the walk can fault, and `IN_TAIL` then closes the report.
     // Doesn't block (reads the heap anyway if its lock is held); the
     // free-list walk is bounded and stays inside those bounds.
-    // SAFETY: the crash path: one CPU, interrupts off (until #7), CRASHING
+    // SAFETY: the crash path: one CPU, interrupts off for good, CRASHING
     // keeps a second report out, and we halt next, so whatever was using the
     // heap never resumes.
     let _ = unsafe { crate::mm::heap::write_crash_stats(&mut s) };
