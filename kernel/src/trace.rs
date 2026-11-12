@@ -352,6 +352,9 @@ crate::ktest!(
         kassert!(
             describe(&Event { kind: Kind::Panic as u16, args: [12, 0, 0, 0], ..base }).as_str().ends_with("line=12")
         );
+        // Tags longer than 8 bytes are cut, not mangled.
+        crate::kassert_eq!(pack_tag("framebuffer"), u64::from_le_bytes(*b"framebuf"));
+        crate::kassert_eq!(pack_tag(""), 0);
         Ok(())
     }
 );

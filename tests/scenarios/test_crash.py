@@ -73,7 +73,9 @@ def test_panic_report_trace_ends_with_the_panic(boot):
     report = crash(boot, "panic")
     trace = report[report.index("recent trace events (oldest first):") :]
     lines = re.findall(r"^  #\d+ +tsc=\d+ +(\S+.*)$", trace, re.MULTILINE)
-    assert re.match(r"panic +line=\d+$", lines[-1]), trace
+    at = re.search(r"^  at kernel/src/kmon\.rs:(\d+):\d+$", report, re.MULTILINE)
+    assert at, report
+    assert re.match(rf"panic +line={at.group(1)}$", lines[-1]), trace
 
 
 def test_page_fault_report_names_address_and_cause(boot):

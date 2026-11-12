@@ -313,6 +313,12 @@ mod tests {
         ring.head.store(8, Ordering::Relaxed);
         assert_eq!(ring.try_read(7), Err(Missing::NotRecorded));
         assert_eq!(ring.try_read(3), Ok(ring.read(3).unwrap()));
+        // Another event's writer holds the slot: an older one (event 7 not
+        // recorded yet) or a newer one (event 3 is being overwritten).
+        ring.slots[3].stamp.store(writing(3), Ordering::Relaxed);
+        assert_eq!(ring.try_read(7), Err(Missing::NotRecorded));
+        ring.slots[3].stamp.store(writing(11), Ordering::Relaxed);
+        assert_eq!(ring.try_read(7), Err(Missing::Overwritten));
     }
 
     #[test]
@@ -396,7 +402,10 @@ mod tests {
                         let mut out = vec![Event::default(); 64];
                         let mut seen = 0usize;
                         start.wait();
-                        while !done.load(Ordering::Acquire) || seen == 0 {
+                        // Loop until the writer stops, then once more: the ring
+                        // is quiet by then, so the last pass must see events.
+                        loop {
+                            let finished = done.load(Ordering::Acquire);
                             let n = ring.snapshot(&mut out);
                             for pair in out[..n].windows(2) {
                                 assert!(pair[0].seq < pair[1].seq, "out of order: {pair:?}");
@@ -407,6 +416,9 @@ mod tests {
                                 assert_eq!(e.tsc, e.seq, "event filed under the wrong seq: {e:?}");
                             }
                             seen += n;
+                            if finished {
+                                break;
+                            }
                         }
                         seen
                     })
@@ -442,14 +454,19 @@ mod tests {
                 let mut out = [Event::default(); 32];
                 let mut seen = 0;
                 start.wait();
-                while !done.load(Ordering::Acquire) || seen == 0 {
+                loop {
+                    let finished = done.load(Ordering::Acquire);
                     let n = ring.snapshot(&mut out);
                     for e in &out[..n] {
                         assert!(consistent(e), "torn event: {e:?}");
                     }
                     assert!(out[..n].windows(2).all(|p| p[0].seq < p[1].seq));
                     seen += n;
+                    if finished {
+                        break;
+                    }
                 }
+                seen
             });
             let writers: Vec<_> = (0..4u64)
                 .map(|w| {
@@ -468,7 +485,7 @@ mod tests {
                 w.join().unwrap();
             }
             drop(stop);
-            reader.join().unwrap();
+            assert!(reader.join().unwrap() > 0, "the reader saw events");
         });
         assert_eq!(ring.written(), 4 * PER_WRITER);
         // Once writers stop, each of the newest events is readable and
@@ -488,27 +505,39 @@ mod tests {
         let ring = TraceRing::<2>::new();
         let done = AtomicBool::new(false);
         let start = Barrier::new(4);
-        thread::scope(|s| {
-            for _ in 0..3 {
-                s.spawn(|| {
-                    start.wait();
-                    while !done.load(Ordering::Relaxed) {
-                        let head = ring.written();
-                        for seq in head.saturating_sub(3)..=head {
-                            if let Some(e) = ring.read(seq) {
-                                assert!(consistent(&e), "torn event: {e:?}");
-                                assert_eq!(e.tsc, e.seq, "event filed under the wrong seq: {e:?}");
+        let seen = thread::scope(|s| {
+            let readers: Vec<_> = (0..3)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut seen = 0usize;
+                        start.wait();
+                        loop {
+                            let finished = done.load(Ordering::Relaxed);
+                            let head = ring.written();
+                            for seq in head.saturating_sub(3)..=head {
+                                if let Some(e) = ring.read(seq) {
+                                    assert!(consistent(&e), "torn event: {e:?}");
+                                    assert_eq!(e.tsc, e.seq, "event filed under the wrong seq: {e:?}");
+                                    seen += 1;
+                                }
+                            }
+                            if finished {
+                                break;
                             }
                         }
-                    }
-                });
-            }
+                        seen
+                    })
+                })
+                .collect();
             start.wait();
-            let _stop = StopOnDrop(&done);
+            let stop = StopOnDrop(&done);
             for i in 0..EVENTS {
                 assert_eq!(record_derived(&ring, i, 1), Some(i));
             }
+            drop(stop);
+            readers.into_iter().map(|r| r.join().unwrap()).sum::<usize>()
         });
+        assert!(seen > 0, "readers saw events");
     }
 
     /// Writers fight over a single slot, so compare-and-swap failures (the
@@ -518,9 +547,10 @@ mod tests {
     /// event), and every claimed event is accounted for: recorded or dropped.
     #[test]
     fn contended_slot_stamp_never_goes_backwards() {
-        // Keep writing until the writers have collided enough, whatever the
-        // scheduler does (on a small CI runner an optimized writer can finish
-        // a fixed batch within one time slice and never overlap the others).
+        // Each writer records at least 200,000 events, and keeps going until
+        // the writers have collided enough, whatever the scheduler does (on a
+        // small CI runner an optimized writer can finish a fixed batch within
+        // one time slice and never overlap the others).
         const COLLISIONS: u64 = 100;
         const MAX_PER_WRITER: u64 = 20_000_000;
         let ring = TraceRing::<1>::new();
@@ -543,7 +573,7 @@ mod tests {
                         start.wait();
                         let mut recorded = 0;
                         for i in 0..MAX_PER_WRITER {
-                            if ring.dropped() >= COLLISIONS {
+                            if i >= 200_000 && ring.dropped() >= COLLISIONS {
                                 break;
                             }
                             recorded += record_derived(ring, w << 40 | i, w as u16).is_some() as u64;
