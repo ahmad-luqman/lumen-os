@@ -1,11 +1,14 @@
-//! Physical frame allocator logic for the Lumen kernel.
+//! Memory-management logic for the Lumen kernel: the physical frame
+//! allocator (this module), typed addresses ([`PhysAddr`], [`PhysFrame`],
+//! [`VirtAddr`]) and the page-table format and mapper ([`paging`]).
 //!
 //! This crate is pure logic: it never touches hardware or dereferences a
 //! physical address, so all of it is tested on the host
-//! (`cargo test -p lumen-mm`). The kernel (`kernel/src/mm/frame.rs`) feeds it
-//! the bootloader's memory map and the list of reserved ranges.
+//! (`cargo test -p lumen-mm`). The kernel (`kernel/src/mm/frame.rs`) feeds the
+//! allocator the bootloader's memory map and the list of reserved ranges;
+//! `kernel/src/mm/paging.rs` gives the mapper access to page-table frames.
 //!
-//! # Design: two bitmaps
+//! # Frame allocator design: two bitmaps
 //!
 //! [`FrameAllocator`] keeps one bit per 4 KiB frame in two bitmaps:
 //!
@@ -48,6 +51,11 @@
 //! is what lets a buddy allocator replace it later.
 
 #![no_std]
+
+mod addr;
+pub mod paging;
+
+pub use addr::{PHYS_ADDR_BITS, PhysAddr, PhysFrame, VIRT_ADDR_BITS, VirtAddr};
 
 use core::fmt;
 
