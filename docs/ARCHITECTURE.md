@@ -90,12 +90,13 @@ tests (for example `lumen-elf`, the symbol-table reader).
    the 128 KiB main stack (`INFO  mem: stacks: ...`) and continues in
    `kmain_on_kernel_stack`: ACPI discovery (below); the interrupt
    controllers (the 8259s remapped and masked, the local APIC enabled, every
-   I/O APIC input masked; `INFO  irq: local APIC ...`); the TSC calibrated
+   I/O APIC input masked; `INFO  irq: local APIC ...`); the other CPUs
+   started (below); the TSC calibrated
    against the HPET, or the PIT without one
    (`INFO  time: tsc 2.9 GHz (calibrated against hpet)`), and the local APIC
    timer against the TSC, started at 1 kHz; interrupts on
-   (`INFO  irq: interrupts on`); the other CPUs started (below,
-   `INFO  smp: 4 CPUs online`); the framebuffer hello screen, then
+   (`INFO  irq: interrupts on`); a bounded wait until the other CPUs are
+   online (`INFO  smp: 4 CPUs online`); the framebuffer hello screen, then
    `boot complete`, then the boot timeline (below).
 7. Either the in-kernel test runner (`--features ktest`) or the kernel monitor
    (`kmon`, a serial debug console that the user-mode shell replaces in M2).
@@ -109,7 +110,7 @@ bootloader-performance request, so the bootloader's own time isn't counted.
 Entry is recorded with the origin's TSC; every other phase records a
 `BootPhase` trace event when it ends: arch-init, logger, symbols, memory, stacks, acpi, interrupts,
 time (calibration, interrupts on, the 10 ms first-tick check), smp (the
-other CPUs started), framebuffer, complete. After `boot complete` the kernel prints them from the ring,
+wait until the other CPUs are online), framebuffer, complete. After `boot complete` the kernel prints them from the ring,
 converted with the calibrated TSC:
 
 ```
@@ -130,9 +131,9 @@ image covers only the header).
 
 Limine's MP request starts every CPU and parks the application processors
 (APs), each spinning on its `goto_address` with Limine's page tables, GDT
-and a bootloader stack. `smp::init` (`kernel/src/smp.rs`), on the boot CPU
-after the time phase, starts them one at a time, up to `arch::MAX_CPUS` = 8
-CPUs in all:
+and a bootloader stack. `smp::start_all` (`kernel/src/smp.rs`), on the
+boot CPU right after the interrupt controllers are set up, starts them all,
+up to `arch::MAX_CPUS` = 8 CPUs in all, without waiting:
 
 - It allocates the AP's 128 KiB main stack and 64 KiB #DF, NMI and #MC
   stacks (guard pages, hard rule 4; `INFO  smp: cpu N stacks: ...`), puts the
@@ -146,11 +147,16 @@ CPUs in all:
   chain starts there (`rbp` = 0).
 - On its own stack the AP enables its local APIC, checks the APIC id against
   Limine's, logs `INFO  smp: cpu N online (lapic id X)` and idles in
-  `sti; hlt`. The boot CPU waits up to 2 s for that (a CPU that doesn't make
-  it is warned about), then starts the next; `INFO  smp: N CPUs online`.
-- CPUs past the cap are halted with a warning: left in Limine, each would
-  spin on its `goto_address` for good (measured: an idle `-smp 10` guest
-  used about 250% host CPU, 100% after halting them).
+  `sti; hlt`. After calibrating the clocks the boot CPU waits up to 2 s for
+  every AP (`smp::wait_online`; a CPU that doesn't make it is warned about),
+  then logs `INFO  smp: N CPUs online`.
+- CPUs past the cap are halted with a warning.
+- Why before the calibration: a CPU in Limine's park loop spins on its
+  `goto_address`, and under emulation spinning CPUs take host time from
+  every guest's calibration windows (measured: an idle `-smp 10` guest used
+  about 250% host CPU, 100% once the 2 extra CPUs were halted; with the APs
+  started after calibration, 1 of 13 parallel scenario runs failed a 2%
+  calibration check, 0 of 16 once they were started before it).
 
 **Per-CPU state.** Each CPU's GS base points at its own record
 (`arch::percpu`), so `percpu::index()` (0 is the boot CPU) is one

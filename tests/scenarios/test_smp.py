@@ -35,7 +35,8 @@ def boot_to_prompt(boot, cpus: int):
 def test_all_cpus_online(boot):
     m, online = boot_to_prompt(boot, 4)
     assert online == 4
-    assert [(int(c), int(a)) for c, a in ONLINE.findall(m.output)] == [(1, 1), (2, 2), (3, 3)]
+    # The APs start together, so they may say so in any order.
+    assert sorted((int(c), int(a)) for c, a in ONLINE.findall(m.output)) == [(1, 1), (2, 2), (3, 3)]
     # Every AP has its own main and IST stacks, none shared with another
     # AP or with the boot CPU's (the `mem: stacks:` line).
     stacks = {int(s[0]): s[1:] for s in STACKS.findall(m.output)}
@@ -57,7 +58,7 @@ def test_one_cpu_boots_alone(boot):
 def test_cpus_past_the_limit_are_halted(boot):
     m, online = boot_to_prompt(boot, 10)
     assert online == 8
-    assert [int(c) for c, _ in ONLINE.findall(m.output)] == list(range(1, 8))
+    assert sorted(int(c) for c, _ in ONLINE.findall(m.output)) == list(range(1, 8))
     assert "WARN  smp: 2 CPU(s) halted: the kernel runs on at most 8\n" in m.output
 
 
