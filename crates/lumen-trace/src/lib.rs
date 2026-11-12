@@ -518,7 +518,11 @@ mod tests {
     /// event), and every claimed event is accounted for: recorded or dropped.
     #[test]
     fn contended_slot_stamp_never_goes_backwards() {
-        const PER_WRITER: u64 = 200_000;
+        // Keep writing until the writers have collided enough, whatever the
+        // scheduler does (on a small CI runner an optimized writer can finish
+        // a fixed batch within one time slice and never overlap the others).
+        const COLLISIONS: u64 = 100;
+        const MAX_PER_WRITER: u64 = 20_000_000;
         let ring = TraceRing::<1>::new();
         let done = AtomicBool::new(false);
         let start = Barrier::new(5);
@@ -537,7 +541,14 @@ mod tests {
                     let (ring, start) = (&ring, &start);
                     s.spawn(move || {
                         start.wait();
-                        (0..PER_WRITER).filter(|i| record_derived(ring, w << 40 | i, w as u16).is_some()).count() as u64
+                        let mut recorded = 0;
+                        for i in 0..MAX_PER_WRITER {
+                            if ring.dropped() >= COLLISIONS {
+                                break;
+                            }
+                            recorded += record_derived(ring, w << 40 | i, w as u16).is_some() as u64;
+                        }
+                        recorded
                     })
                 })
                 .collect();
@@ -545,7 +556,7 @@ mod tests {
             writers.into_iter().map(|w| w.join().unwrap()).sum::<u64>()
         });
         assert_eq!(recorded + ring.dropped(), ring.written(), "every claimed event is recorded or dropped");
-        assert!(ring.dropped() > 0, "the writers collided");
+        assert!(ring.dropped() >= COLLISIONS, "the writers collided");
         if let Some(e) = ring.read(ring.written() - 1) {
             assert!(consistent(&e));
         }
