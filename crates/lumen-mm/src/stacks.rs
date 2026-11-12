@@ -446,10 +446,17 @@ mod tests {
     /// with the kind they were registered under. (`make test-host` also runs
     /// the stacks tests optimized, where compiler-reordering mistakes in the
     /// seqlock are likelier to surface.)
+    ///
+    /// A read that overlaps a write reads as empty, so whether the readers see
+    /// an entry at all depends on scheduling: the writer keeps going until one
+    /// has (within a cap, so a reader that can never see one fails, not hangs).
     #[test]
     fn readers_never_see_a_torn_entry() {
+        const ROUNDS: u64 = 200_000;
+        const MAX_ROUNDS: u64 = 100 * ROUNDS;
         let reg = Registry::new();
         let stop = AtomicBool::new(false);
+        let sighted = AtomicBool::new(false);
         // Even-numbered stacks are Main, odd ones Test; bottom and top encode
         // the same index, so a mix of two entries is detectable.
         let range =
@@ -465,10 +472,13 @@ mod tests {
         std::thread::scope(|s| {
             s.spawn(|| {
                 let _stop = StopOnDrop(&stop);
-                for n in 0..200_000u64 {
+                let mut round = 0u64;
+                while round < ROUNDS || (!sighted.load(Ordering::Relaxed) && round < MAX_ROUNDS) {
+                    let n = round % ROUNDS;
                     let h = register(&reg, kind(n), range(n)).unwrap();
                     assert_eq!(h, Handle(0));
                     reg.unregister(h);
+                    round += 1;
                 }
             });
             let readers: Vec<_> = (0..3)
@@ -479,6 +489,7 @@ mod tests {
                             if let Some(r) = reg.get(0) {
                                 let n = (r.range.bottom - GUARD_SIZE - BASE) / 0x10_0000;
                                 assert_eq!(r, Registered { kind: kind(n), range: range(n) }, "torn entry");
+                                sighted.store(true, Ordering::Relaxed);
                                 seen += 1;
                             }
                         }
