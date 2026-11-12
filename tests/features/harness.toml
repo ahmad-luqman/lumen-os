@@ -62,6 +62,9 @@ tests = [
     "harness:test_qemu::test_qemu_version_retries_after_a_failure",
     "harness:test_qemu::test_qemu_version_survives_a_timeout",
     "harness:test_qemu::test_empty_overrides_mean_unset",
+    "harness:test_qemu::test_empty_sock_dir_means_unset",
+    "harness:test_qemu::test_empty_timeout_scale_means_unset",
+    "harness:test_qemu::test_empty_gdb_means_unset",
     "harness:test_qemu::test_ovmf_version_comes_from_the_fetch_stamp",
 ]
 

@@ -29,7 +29,7 @@ def cmd_run(a: argparse.Namespace) -> int:
 
 def gdb_command(kernel: Path, batch: bool) -> list[str]:
     """gdb invocation that attaches to QEMU's stub and stops at kmain."""
-    cmd = [os.environ.get("LUMEN_GDB", "gdb")]
+    cmd = [os.environ.get("LUMEN_GDB") or "gdb"]
     if batch:
         cmd += ["--batch", "-nx"]
     cmd += [

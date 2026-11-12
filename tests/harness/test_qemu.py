@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from lumen_harness import qemu
+from lumen_harness.__main__ import gdb_command
 from lumen_harness.qemu import (
     Machine,
     QemuOptions,
@@ -13,6 +14,7 @@ from lumen_harness.qemu import (
     ovmf_version,
     qemu_args,
     qemu_version,
+    timeout_scale,
 )
 
 
@@ -114,6 +116,21 @@ def test_empty_overrides_mean_unset(monkeypatch):
     monkeypatch.setenv("LUMEN_OVMF_VARS", "")
     assert qemu_args(opts())[0] == "qemu-system-x86_64"
     assert ovmf_vars_template() == qemu.BUILD_DIR / "deps/ovmf/OVMF_VARS.fd"
+
+
+def test_empty_sock_dir_means_unset(tmp_path, monkeypatch):
+    monkeypatch.setenv("LUMEN_SOCK_DIR", "")
+    assert Machine(Path("x.iso"), tmp_path).qmp_path.parent == Path("/tmp")
+
+
+def test_empty_timeout_scale_means_unset(monkeypatch):
+    monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", "")
+    assert timeout_scale() == 1.0
+
+
+def test_empty_gdb_means_unset(monkeypatch):
+    monkeypatch.setenv("LUMEN_GDB", "")
+    assert gdb_command(Path("kernel"), batch=False)[0] == "gdb"
 
 
 def test_ovmf_version_comes_from_the_fetch_stamp(tmp_path, monkeypatch):

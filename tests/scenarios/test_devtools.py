@@ -54,7 +54,7 @@ def test_make_run_serial_console():
 
 
 @pytest.mark.skipif(
-    shutil.which(os.environ.get("LUMEN_GDB", "gdb")) is None, reason="gdb not installed"
+    shutil.which(os.environ.get("LUMEN_GDB") or "gdb") is None, reason="gdb not installed"
 )
 def test_make_debug_stops_at_kmain():
     """`debug` boots paused under gdb, and a hardware breakpoint on kmain is hit."""
