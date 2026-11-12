@@ -40,6 +40,8 @@ extern "C" fn _start() -> ! {
     )
 }
 
+/// Unmangled so debuggers can `break kmain` without knowing Rust mangling.
+#[unsafe(no_mangle)]
 extern "C" fn kmain(stack_top: u64) -> ! {
     arch::init_early();
     arch::stacks::set_boot_stack(stack_top, boot::BOOT_STACK_SIZE);

@@ -119,8 +119,10 @@ pub fn run_all() -> bool {
             }
             Err(reason) => {
                 failed += 1;
+                // Diagnostics always precede their result line (kassert! prints
+                // while the test runs), and the harness parses them that way.
+                let _ = writeln!(out, "# {reason}");
                 let _ = writeln!(out, "not ok {} - {}", i + 1, t.name);
-                let _ = writeln!(out, "#   {reason}");
             }
         }
     }

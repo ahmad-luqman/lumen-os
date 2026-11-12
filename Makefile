@@ -15,6 +15,10 @@ HARNESS     := PYTHONPATH=tools/harness uv run --frozen python -m lumen_harness
 
 KERNEL_SRCS := $(shell find kernel crates -name '*.rs' -o -name '*.toml' -o -name '*.ld') Cargo.toml Cargo.lock .cargo/config.toml rust-toolchain.toml
 
+# Both kernels are built into the same cargo output path and copied out, so
+# their recipes must never run concurrently (`make -j`).
+.NOTPARALLEL:
+
 .PHONY: help deps build iso run debug test test-host test-scenarios audit lint fmt fmt-check status status-check golden clean
 
 help: ## Show this help
@@ -50,10 +54,10 @@ $(BUILD)/lumen-ktest.iso: $(BUILD)/lumen-kernel-ktest $(ISO_DEPS)
 
 iso: $(BUILD)/lumen.iso $(BUILD)/lumen-qemutest.iso $(BUILD)/lumen-ktest.iso ## Build all bootable ISOs
 
-run: $(BUILD)/lumen.iso ## Boot in QEMU with a window; serial on this terminal
-	$(HARNESS) run --iso $<
+run: $(BUILD)/lumen.iso ## Boot in QEMU with a window; serial on this terminal (HEADLESS=1: no window)
+	$(HARNESS) run --iso $< $(if $(HEADLESS),--headless)
 
-debug: $(BUILD)/lumen.iso ## Boot paused with a gdb stub on :1234, then attach gdb
+debug: $(BUILD)/lumen.iso ## Boot paused with a gdb stub on :1234, then attach gdb (stops at kmain)
 	$(HARNESS) debug --iso $< --kernel $(BUILD)/lumen-kernel
 
 test: test-host audit test-scenarios ## Everything CI runs: host tests, flag audit, QEMU scenarios
@@ -93,7 +97,7 @@ fmt-check: ## Check formatting
 status: ## Regenerate docs/STATUS.md from the last test results
 	$(HARNESS) status --write
 
-status-check: ## Fail if docs/STATUS.md disagrees with the last test results
+status-check: ## Feature gate: fail unless every feature in tests/features/ passes
 	$(HARNESS) status --check
 
 golden: iso ## Re-record golden screenshots (review the diff before committing!)

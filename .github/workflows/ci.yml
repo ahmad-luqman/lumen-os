@@ -17,10 +17,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install QEMU and xorriso
+      - name: Install QEMU, xorriso and gdb
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 xorriso
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 xorriso gdb
 
       - name: Enable KVM for the runner user
         run: |
@@ -55,8 +55,17 @@ jobs:
       - run: make test-host
       - name: QEMU scenarios (boot, crash reports, in-kernel tests, golden images)
         run: make test-scenarios
-      - name: docs/STATUS.md matches the test results
+      - name: Feature gate (every feature in tests/features/ passes)
         run: make status-check
+
+      # KVM is fast but QEMU's `-d int` interrupt trace only works under TCG.
+      # Re-run whatever failed under TCG so the uploaded artifacts include it.
+      # Separate artifact root: the KVM run's evidence must survive the re-run.
+      - name: Re-run failed scenarios under TCG for interrupt traces
+        if: failure()
+        run: >-
+          LUMEN_ACCEL=tcg LUMEN_ARTIFACTS_DIR=build/test-artifacts-tcg
+          uv run --frozen pytest tests/scenarios --last-failed -v || true
 
       - name: Upload test artifacts on failure
         if: failure()
@@ -65,5 +74,6 @@ jobs:
           name: test-artifacts
           path: |
             build/test-artifacts
+            build/test-artifacts-tcg
             build/test-results
           if-no-files-found: ignore

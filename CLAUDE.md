@@ -9,20 +9,25 @@ milestones with test-based exit criteria; `docs/STATUS.md` is generated.
 ```bash
 make deps            # pinned Limine + OVMF into build/deps (sha256-checked)
 make build           # both kernels: build/lumen-kernel, build/lumen-kernel-ktest
-make run             # QEMU with a window, serial on your terminal (Ctrl-A x quits)
-make debug           # QEMU paused + gdb attached (hbreak kmain)
+make run             # QEMU with a window, serial on your terminal (Ctrl-A x quits; HEADLESS=1)
+make debug           # QEMU paused + gdb attached, stopped at kmain
 make test            # everything CI runs: host tests, flag audit, QEMU scenarios
 make test-host       # cargo test + harness self-tests (fast, no QEMU)
 make test-scenarios  # headless QEMU scenarios incl. in-kernel ktests (~20 s)
 make audit           # proves no SSE/AVX, no red zone, kernel code model
 make lint fmt        # clippy -D warnings + ruff; rustfmt + ruff format
-make status          # regenerate docs/STATUS.md from the last test results
+make status-check    # feature gate: every feature in tests/features/ passes (CI runs this)
+make status          # regenerate docs/STATUS.md from the last test results (on main)
 make golden          # re-record golden screenshots (look at them before committing!)
 ```
 
 One scenario: `uv run pytest tests/scenarios/test_crash.py -k pf -v`.
 Failing scenarios keep `build/test-artifacts/<test>/` with `serial.log`,
-`qemu.log` (`-d int,cpu_reset,guest_errors`) and screenshots.
+`qemu.log` (`-d int,cpu_reset,guest_errors`) and screenshots. The interrupt
+trace (`-d int`) is only recorded under TCG: locally on macOS always, and in CI
+by re-running failed scenarios with `LUMEN_ACCEL=tcg` (CI runs KVM first,
+and keeps the re-run's artifacts apart in `build/test-artifacts-tcg/` via
+`LUMEN_ARTIFACTS_DIR`).
 
 Prerequisites: rustup (the toolchain installs itself from
 `rust-toolchain.toml`), `qemu-system-x86_64`, `xorriso`, `uv`, `make`, `curl`.
@@ -33,7 +38,7 @@ Each rule exists because breaking it caused a real bug in v1.
 
 1. **"Verified" means an automated test passes in CI.** Never call a feature
    working in docs, a PR or an issue unless a test checks it. Add the test and
-   its `tests/features.toml` entry in the same PR. (v1's docs called pipes and
+   its `tests/features/<area>.toml` entry in the same PR. (v1's docs called pipes and
    cross-directory `mv` "verified" while both were broken.)
 2. **Never hand out memory you don't own.** The frame allocator is built from
    the bootloader map and explicitly reserves the kernel image, boot
@@ -70,12 +75,16 @@ Each rule exists because breaking it caused a real bug in v1.
 3. Implement with tests: an in-kernel `ktest!`, a scenario in `tests/scenarios/`,
    and/or host tests in a `no_std` crate under `crates/`. Prefer putting pure
    logic in a host-testable crate.
-4. Run `make lint test status` locally, then commit `docs/STATUS.md`.
+4. Add your feature to `tests/features/<area>.toml` (one file per area, so
+   parallel PRs don't collide). Run `make lint test status-check` locally.
+   **Don't commit `docs/STATUS.md` in feature PRs**: CI's feature gate
+   (`make status-check`) fails the PR if any listed feature isn't passing, and
+   the committed STATUS.md is refreshed on main (`make test status`) by the
+   lead. Because every merged commit passed the gate, that file can lag behind
+   (missing new rows) but can never claim something broken works.
 5. Open a PR that says `Fixes #<n>`, lists what is tested (by test name), and
    notes anything not yet tested. CI must be green; a reviewer agent or a human
    reviews before merge.
-6. If STATUS.md conflicts after a rebase, re-run `make test status`; never
-   hand-merge it.
 
 Interfaces shared across issues (syscall numbers, `FileSystem`, driver traits,
 the automation tree) are defined in `docs/ARCHITECTURE.md`. Changing one is its
@@ -110,4 +119,4 @@ own PR that updates that doc first.
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
   are built), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`.
 - `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests.
-  `tests/features.toml`: feature → test map for STATUS.md.
+  `tests/features/*.toml`: feature → test map (the CI feature gate and STATUS.md).

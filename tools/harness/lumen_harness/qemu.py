@@ -66,6 +66,8 @@ class QemuOptions:
     accel: str = field(default_factory=default_accel)
     memory: str = "256M"
     serial: str = "stdio"
+    # "none" for tests; None when the serial mux (mon:stdio) provides the monitor.
+    monitor: str | None = "none"
     qmp_socket: Path | None = None
     log_file: Path | None = None
     trace: str = "cpu_reset,guest_errors"
@@ -87,8 +89,9 @@ def qemu_args(o: QemuOptions) -> list[str]:
         "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
         # A triple fault must end the run, not silently reboot.
         "-no-reboot",
-        "-monitor", "none",
     ]  # fmt: skip
+    if o.monitor:
+        args += ["-monitor", o.monitor]
     if o.headless:
         args += ["-display", "none"]
     if o.qmp_socket:

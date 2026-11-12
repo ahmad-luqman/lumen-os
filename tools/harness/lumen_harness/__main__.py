@@ -16,42 +16,52 @@ def cmd_run(a: argparse.Namespace) -> int:
     opts = QemuOptions(
         iso=a.iso,
         vars_file=fresh_vars(BUILD_DIR / "run/OVMF_VARS.fd"),
-        headless=False,
-        serial="mon:stdio",
+        headless=a.headless,
+        serial="mon:stdio",  # Ctrl-A c reaches the QEMU monitor
+        monitor=None,
         log_file=BUILD_DIR / "run/qemu.log",
     )
     args = qemu_args(opts)
-    args = [x for x in args if x not in ("-monitor", "none")]  # keep Ctrl-A c monitor
     print("+", " ".join(args), file=sys.stderr)
     print("(serial is attached here; Ctrl-A x quits QEMU)", file=sys.stderr)
     return subprocess.call(args)
+
+
+def gdb_command(kernel: Path, batch: bool) -> list[str]:
+    """gdb invocation that attaches to QEMU's stub and stops at kmain."""
+    cmd = [os.environ.get("LUMEN_GDB", "gdb")]
+    if batch:
+        cmd += ["--batch", "-nx"]
+    cmd += [
+        str(kernel),
+        "-ex", "set architecture i386:x86-64",
+        "-ex", "target remote :1234",
+        "-ex", "hbreak kmain",
+        "-ex", "continue",
+    ]  # fmt: skip
+    if batch:
+        cmd += ["-ex", "bt", "-ex", "info registers rip", "-ex", "kill"]
+    return cmd
 
 
 def cmd_debug(a: argparse.Namespace) -> int:
     opts = QemuOptions(
         iso=a.iso,
         vars_file=fresh_vars(BUILD_DIR / "debug/OVMF_VARS.fd"),
-        headless=False,
+        headless=a.batch,
         serial=f"file:{BUILD_DIR / 'debug/serial.log'}",
         log_file=BUILD_DIR / "debug/qemu.log",
         gdb=True,
         accel="tcg",  # gdb breakpoints are most reliable under TCG
     )
+    (BUILD_DIR / "debug").mkdir(parents=True, exist_ok=True)
     qemu = subprocess.Popen(qemu_args(opts))
     print(f"QEMU paused, gdb stub on :1234, serial -> {BUILD_DIR / 'debug/serial.log'}")
-    gdb = os.environ.get("LUMEN_GDB", "gdb")
     try:
-        return subprocess.call(
-            [
-                gdb,
-                str(a.kernel),
-                "-ex", "target remote :1234",
-                "-ex", "hbreak kmain",
-                "-ex", "continue",
-            ]
-        )  # fmt: skip
+        return subprocess.call(gdb_command(a.kernel, a.batch), timeout=120 if a.batch else None)
     finally:
         qemu.terminate()
+        qemu.wait(timeout=10)
 
 
 def cmd_audit(a: argparse.Namespace) -> int:
@@ -72,11 +82,13 @@ def main() -> int:
 
     r = sub.add_parser("run", help="boot with a window, serial on this terminal")
     r.add_argument("--iso", type=Path, required=True)
+    r.add_argument("--headless", action="store_true", help="no window (e.g. over SSH)")
     r.set_defaults(func=cmd_run)
 
     d = sub.add_parser("debug", help="boot paused under gdb")
     d.add_argument("--iso", type=Path, required=True)
     d.add_argument("--kernel", type=Path, required=True)
+    d.add_argument("--batch", action="store_true", help="headless: stop at kmain, print bt, quit")
     d.set_defaults(func=cmd_debug)
 
     au = sub.add_parser("audit", help="check kernel code-generation flags")

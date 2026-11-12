@@ -4,7 +4,7 @@ Each milestone ends when its **exit criteria pass in CI**. Every criterion
 names the automated test that proves it: `ktest:` is an in-kernel test,
 `scenario:` a QEMU test in `tests/scenarios/`, and `cargo:` a host unit test.
 Test names below are the intended names; the PR that implements a feature adds
-the test and an entry in `tests/features.toml`. Current state:
+the test and an entry in `tests/features/<area>.toml`. Current state:
 [STATUS.md](STATUS.md).
 
 Work is split into GitHub issues labelled with the milestone (`m1`, `m2`, ...)
@@ -12,7 +12,7 @@ and a component (`area:mm`, `area:arch`, ...). One issue is one branch is one PR
 
 ---
 
-## M0: Decisions, harness, first boot ✅
+## M0: Decisions, harness, first boot
 
 - Boot via Limine to the logger: `scenario:test_boot::test_boot_reaches_logger`
 - Deliberate faults produce symbolized crash reports, not resets:

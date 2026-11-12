@@ -1,0 +1,46 @@
+# Features: boot. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Boots via Limine (UEFI, q35) and reaches the structured logger"
+milestone = "M0"
+tests = [
+    "scenario:test_boot::test_boot_reaches_logger",
+    "scenario:test_boot::test_log_lines_are_structured",
+]
+
+[[feature]]
+name = "GDT/TSS and IDT installed by the kernel"
+milestone = "M0"
+tests = [
+    "ktest:lumen_kernel::gdt_and_idt_are_ours",
+]
+
+[[feature]]
+name = "Exception entry path saves and restores all registers (#BP resumes)"
+milestone = "M0"
+tests = [
+    "ktest:lumen_kernel::breakpoint_exception_returns",
+    "scenario:test_boot::test_breakpoint_is_survivable",
+]
+
+[[feature]]
+name = "Framebuffer hello screen (golden image)"
+milestone = "M0"
+tests = [
+    "scenario:test_screen::test_boot_hello_golden",
+]
+
+[[feature]]
+name = "Serial input from the harness (kernel monitor)"
+milestone = "M0"
+tests = [
+    "scenario:test_boot::test_serial_input_round_trip",
+]
+
+[[feature]]
+name = "Kernel command line parsing; log level and tags"
+milestone = "M0"
+tests = [
+    "ktest:lumen_kernel::cmdline::cmdline_parses_flags_and_values",
+    "ktest:lumen_kernel::klog::log_tags_strip_crate_and_arch_prefixes",
+]
