@@ -150,7 +150,8 @@ up to `arch::MAX_CPUS` = 8 CPUs in all, without waiting:
   `sti; hlt`. After calibrating the clocks the boot CPU waits up to 2 s for
   every AP (`smp::wait_online`; a CPU that doesn't make it is warned about),
   then logs `INFO  smp: N CPUs online`.
-- CPUs past the cap are halted with a warning.
+- CPUs past the cap are sent to a halt loop that counts them, and the boot
+  CPU warns how many halted (`2 of 2 CPU(s) past the limit halted`).
 - Why before the calibration: a CPU in Limine's park loop spins on its
   `goto_address`, and under emulation spinning CPUs take host time from
   every guest's calibration windows (measured: an idle `-smp 10` guest used

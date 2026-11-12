@@ -68,6 +68,9 @@ static ONLINE: AtomicUsize = AtomicUsize::new(1);
 /// CPU indices handed out so far (the boot CPU's included): APs 1.. are
 /// started.
 static STARTED: AtomicUsize = AtomicUsize::new(1);
+/// CPUs past `MAX_CPUS` sent to [`park`], and how many of them got there.
+static TO_HALT: AtomicUsize = AtomicUsize::new(0);
+static HALTED: AtomicUsize = AtomicUsize::new(0);
 /// The kernel's page-table root, for the APs (read lock-free).
 static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -146,13 +149,11 @@ pub fn start_all() {
         next += 1;
     }
     STARTED.store(next, Ordering::Release);
-    if parked > 0 {
-        warn!(target: "smp", "{parked} CPU(s) halted: the kernel runs on at most {MAX_CPUS}");
-    }
+    TO_HALT.store(parked, Ordering::Release);
 }
 
-/// Wait (bounded) until every AP [`start_all`] started is online, and say
-/// how many CPUs are. Runs once, on the boot CPU, after `time::init` (it
+/// Wait (bounded) until every AP [`start_all`] started is online and every
+/// CPU past the cap has halted, and say how many CPUs are online. Runs once, on the boot CPU, after `time::init` (it
 /// times the wait). An AP that doesn't make it is warned about; it keeps its
 /// index and stacks (it may still be on its way).
 pub fn wait_online() {
@@ -165,6 +166,14 @@ pub fn wait_online() {
         if !slot.online.load(Ordering::Acquire) {
             warn!(target: "smp", "cpu {index} (lapic id {}) didn't come online", lapic_id(index));
         }
+    }
+    let to_halt = TO_HALT.load(Ordering::Acquire);
+    if to_halt > 0 {
+        while HALTED.load(Ordering::Acquire) < to_halt && time::now_ns() < deadline {
+            core::hint::spin_loop();
+        }
+        let halted = HALTED.load(Ordering::Acquire);
+        warn!(target: "smp", "{halted} of {to_halt} CPU(s) past the limit halted: the kernel runs on at most {MAX_CPUS}");
     }
     let n = online();
     info!(target: "smp", "{n} CPU{} online", if n == 1 { "" } else { "s" });
@@ -202,10 +211,11 @@ fn start(cpu: &Cpu, index: usize) {
     cpu.goto_address.write(ap_entry);
 }
 
-/// Where a CPU past `MAX_CPUS` goes: halt (interrupts off) on Limine's
-/// tables and stack, touching nothing of the kernel's. Nothing sends it an
-/// IPI (it isn't online).
+/// Where a CPU past `MAX_CPUS` goes: count itself and halt (interrupts off)
+/// on Limine's tables and stack, touching nothing else of the kernel's.
+/// Nothing sends it an IPI (it isn't online).
 unsafe extern "C" fn park(_cpu: &Cpu) -> ! {
+    HALTED.fetch_add(1, Ordering::Release);
     arch::halt_forever()
 }
 

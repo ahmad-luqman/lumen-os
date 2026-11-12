@@ -59,7 +59,9 @@ def test_cpus_past_the_limit_are_halted(boot):
     m, online = boot_to_prompt(boot, 10)
     assert online == 8
     assert sorted(int(c) for c, _ in ONLINE.findall(m.output)) == list(range(1, 8))
-    assert "WARN  smp: 2 CPU(s) halted: the kernel runs on at most 8\n" in m.output
+    assert (
+        "WARN  smp: 2 of 2 CPU(s) past the limit halted: the kernel runs on at most 8\n" in m.output
+    )
 
 
 def crash_on(boot, args: str, cpus: int = 4):
