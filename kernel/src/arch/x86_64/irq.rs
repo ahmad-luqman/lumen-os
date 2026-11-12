@@ -9,17 +9,20 @@
 //! the CPU that opened the section. Once [`disable_for_good`] has run (the
 //! crash path), no section turns them back on.
 //!
-//! One CPU for now: the depth and saved state are global. With SMP (#9) they
-//! become per-CPU.
+//! The depth and saved state are per CPU (indexed by
+//! [`percpu::index`](super::percpu::index)); [`disable_for_good`] holds on
+//! every CPU (a crash stops them all).
 
 use core::arch::asm;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// Open critical sections on this CPU.
-static DEPTH: AtomicUsize = AtomicUsize::new(0);
-/// Whether interrupts were on when the outermost section opened.
-static WERE_ON: AtomicBool = AtomicBool::new(false);
+use super::percpu::{self, MAX_CPUS};
+
+/// Open critical sections, per CPU.
+static DEPTH: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+/// Whether interrupts were on when a CPU's outermost section opened.
+static WERE_ON: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 /// Set by [`disable_for_good`]: interrupts stay off from then on.
 static FOR_GOOD: AtomicBool = AtomicBool::new(false);
 
@@ -61,9 +64,10 @@ pub fn push_off() -> IrqOff {
     let were_on = enabled();
     cli();
     // Interrupts are off: only an NMI or an exception (both fatal) can run
-    // between these.
-    if DEPTH.fetch_add(1, Ordering::Relaxed) == 0 {
-        WERE_ON.store(were_on, Ordering::Relaxed);
+    // between these, and only this CPU touches its own entries.
+    let cpu = percpu::index();
+    if DEPTH[cpu].fetch_add(1, Ordering::Relaxed) == 0 {
+        WERE_ON[cpu].store(were_on, Ordering::Relaxed);
     }
     IrqOff { _cpu: PhantomData }
 }
@@ -73,10 +77,11 @@ impl Drop for IrqOff {
     /// on before the first (and [`disable_for_good`] hasn't run).
     fn drop(&mut self) {
         assert!(!enabled(), "interrupts were turned on inside a critical section");
-        let depth = DEPTH.load(Ordering::Relaxed);
+        let cpu = percpu::index();
+        let depth = DEPTH[cpu].load(Ordering::Relaxed);
         assert!(depth > 0, "closing a critical section that isn't open");
-        DEPTH.store(depth - 1, Ordering::Relaxed);
-        if depth == 1 && WERE_ON.load(Ordering::Relaxed) && !FOR_GOOD.load(Ordering::Relaxed) {
+        DEPTH[cpu].store(depth - 1, Ordering::Relaxed);
+        if depth == 1 && WERE_ON[cpu].load(Ordering::Relaxed) && !FOR_GOOD.load(Ordering::Relaxed) {
             sti();
         }
     }
@@ -84,7 +89,7 @@ impl Drop for IrqOff {
 
 /// How many critical sections are open on this CPU.
 pub fn depth() -> usize {
-    DEPTH.load(Ordering::Relaxed)
+    DEPTH[percpu::index()].load(Ordering::Relaxed)
 }
 
 /// Turn interrupts on, outside any critical section (boot, once everything
@@ -95,9 +100,10 @@ pub fn enable() {
     sti();
 }
 
-/// Turn interrupts off and keep them off: no section closing turns them on
-/// again, and [`enable`] refuses. For the crash path, which must run alone
-/// and never returns to what it interrupted.
+/// Turn interrupts off on this CPU and keep them off on every CPU: no
+/// section closing turns them on again, and [`enable`] refuses. For the
+/// crash path, which must run alone and never returns to what it
+/// interrupted (it stops the other CPUs itself).
 pub fn disable_for_good() {
     cli();
     FOR_GOOD.store(true, Ordering::Relaxed);

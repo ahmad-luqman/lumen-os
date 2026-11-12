@@ -70,7 +70,7 @@ extern "C" fn kmain(stack_top: u64) -> ! {
     let entry = arch::rdtsc();
     arch::init_early();
     time::mark_boot(entry);
-    trace::record_at(trace::ring(), entry, Kind::BootPhase, trace::args([BootPhase::Entry as u64]));
+    trace::record_at(trace::boot_ring(), entry, Kind::BootPhase, trace::args([BootPhase::Entry as u64]));
     ktrace!(Kind::BootPhase, BootPhase::ArchInit);
     // Only claim the size we asked for if Limine confirms it: the frame
     // allocator reserves this range and the crash reporter walks it.

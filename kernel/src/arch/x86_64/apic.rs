@@ -3,7 +3,9 @@
 //! The kernel maps the registers (`map_mmio`, uncached) and hands the
 //! virtual addresses to [`set_lapic`] and [`IoApic::new`]. The local APIC's
 //! address is kept in a static so the interrupt path can send an EOI without
-//! a lock. One CPU for now; every CPU's local APIC sits at the same address.
+//! a lock. Every CPU's local APIC sits at the same address (each CPU reaches
+//! its own there): the boot CPU maps it once ([`set_lapic`]), and each other
+//! CPU then turns its own on ([`enable_local`]).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -78,16 +80,22 @@ fn write(offset: usize, value: u32) {
     unsafe { reg(offset).write_volatile(value) }
 }
 
-/// Use the local APIC at `virt` and enable it: spurious interrupts on
-/// [`SPURIOUS`], errors on [`LAPIC_ERROR`], LINT0 (the 8259s' line) and the
-/// timer masked, LINT1 delivering NMIs (the platform's NMI line, as wired on
-/// PCs), every priority accepted.
+/// Use the local APIC registers at `virt` from now on, and enable the boot
+/// CPU's ([`enable_local`]).
 ///
 /// # Safety
-/// `virt` maps this CPU's local APIC registers (4 KiB, uncached) for the
-/// kernel's whole life, and the APIC is in xAPIC mode.
+/// `virt` maps the local APIC registers (4 KiB, uncached) for the kernel's
+/// whole life, and the APIC is in xAPIC mode.
 pub unsafe fn set_lapic(virt: u64) {
     assert!(LAPIC.swap(virt, Ordering::Relaxed) == 0, "set_lapic called twice");
+    enable_local();
+}
+
+/// Enable this CPU's local APIC: spurious interrupts on [`SPURIOUS`], errors
+/// on [`LAPIC_ERROR`], LINT0 (the 8259s' line) and the timer masked, LINT1
+/// delivering NMIs (the platform's NMI line, as wired on PCs), every
+/// priority accepted. Panics before [`set_lapic`].
+pub fn enable_local() {
     // Software-enable first: while the APIC is software-disabled, every LVT
     // entry is forced masked and writes clearing the mask are ignored.
     write(SVR, SVR_ENABLE | u32::from(SPURIOUS));

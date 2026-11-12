@@ -4,9 +4,9 @@
 //! event kinds and [`ktrace!`](crate::ktrace!).
 //!
 //! Timestamps are raw TSC ticks (the boot timeline converts its phases with
-//! the frequency `time` calibrates; kmon's `trace` shows them raw). There is
-//! one ring because there is one CPU; with SMP (#9) each CPU gets its own
-//! and [`ring`] picks the current one.
+//! the frequency `time` calibrates; kmon's `trace` shows them raw). Each CPU
+//! records into its own ring ([`ring`] picks the current one), and each event
+//! carries the CPU's index; the boot timeline reads the boot CPU's.
 
 use core::fmt;
 
@@ -14,10 +14,10 @@ use lumen_trace::{Event, Missing, TraceRing};
 
 use crate::arch;
 
-/// Events the ring holds (a power of two). 4096 × 56 bytes = 224 KiB.
+/// Events a ring holds (a power of two). 4096 × 56 bytes = 224 KiB a CPU.
 pub const EVENTS: usize = 4096;
 
-static RING: TraceRing<EVENTS> = TraceRing::new();
+static RINGS: [TraceRing<EVENTS>; arch::MAX_CPUS] = [const { TraceRing::new() }; arch::MAX_CPUS];
 
 /// What an event records. Stored as the event's `kind`. Values start at 1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,7 +141,12 @@ const _: () = {
 
 /// The current CPU's ring.
 pub fn ring() -> &'static TraceRing<EVENTS> {
-    &RING
+    &RINGS[arch::cpu_index()]
+}
+
+/// The boot CPU's ring (boot phases are recorded there).
+pub fn boot_ring() -> &'static TraceRing<EVENTS> {
+    &RINGS[0]
 }
 
 /// Record an event in `ring` now. Use [`ktrace!`](crate::ktrace!) instead.
@@ -155,9 +160,9 @@ pub fn record_in<const N: usize>(ring: &TraceRing<N>, kind: Kind, args: [u64; 4]
 /// `rdtsc` may run before GDT/IDT setup, hard rule 6), and the event is
 /// recorded after.
 pub fn record_at<const N: usize>(ring: &TraceRing<N>, tsc: u64, kind: Kind, args: [u64; 4]) {
-    // cpu 0 and pid 0 until SMP (#9) and processes (M2) exist. A dropped
-    // event is counted in the ring's `dropped()`; recording never fails loudly.
-    let _ = ring.record(tsc, 0, kind as u16, 0, args);
+    // pid 0 until processes (M2) exist. A dropped event is counted in the
+    // ring's `dropped()`; recording never fails loudly.
+    let _ = ring.record(tsc, arch::cpu_index() as u16, kind as u16, 0, args);
 }
 
 /// The boot timeline, read once from a ring's boot-phase events, as one line:
@@ -189,9 +194,9 @@ enum Mark {
 }
 
 impl Timeline {
-    /// The boot's timeline: this CPU's ring and the calibrated TSC.
+    /// The boot's timeline: the boot CPU's ring and the calibrated TSC.
     pub fn boot() -> Self {
-        Self::new(ring(), crate::time::tsc())
+        Self::new(boot_ring(), crate::time::tsc())
     }
 
     pub fn new<const N: usize>(ring: &TraceRing<N>, clock: Option<lumen_time::Clock>) -> Self {

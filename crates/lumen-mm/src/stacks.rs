@@ -23,8 +23,9 @@ use crate::window::Window;
 /// The unmapped page below every stack.
 pub const GUARD_SIZE: u64 = FRAME_SIZE;
 
-/// How many stacks can be registered at once.
-pub const MAX_STACKS: usize = 32;
+/// How many stacks can be registered at once: four per CPU (main, #DF, NMI,
+/// #MC) for up to eight CPUs, and room for tests.
+pub const MAX_STACKS: usize = 48;
 
 /// What a stack is for (names it in crash reports). Stored in the registry as
 /// one byte, so a reader gets it in one atomic load.

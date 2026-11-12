@@ -10,6 +10,7 @@ pub mod gdt;
 pub mod idt;
 pub mod irq;
 pub mod paging;
+pub mod percpu;
 pub mod pic;
 pub mod pit;
 pub mod port;
@@ -17,11 +18,16 @@ pub mod qemu;
 pub mod serial;
 pub mod stacks;
 
-/// The earliest setup: serial out, then GDT/TSS and IDT so that any fault from
-/// here on produces a crash report.
+/// The earliest setup on the boot CPU: serial out, then its GDT/TSS, its
+/// per-CPU record (GS) and the IDT, so that any fault from here on produces a
+/// crash report.
 pub fn init_early() {
     serial::init();
-    gdt::init();
+    // SAFETY: once, on the boot CPU (index 0), interrupts off.
+    unsafe {
+        gdt::load(0);
+        percpu::set_current(0);
+    }
     idt::init();
 }
 
@@ -31,10 +37,10 @@ pub fn init_early() {
 ///
 /// # Safety
 /// Each top is the top of a mapped stack that is never freed and nothing
-/// else uses; one CPU.
+/// else uses; called once, on the boot CPU, before any AP starts.
 pub unsafe fn install_ist_stacks(double_fault: u64, nmi: u64, machine_check: u64) {
     // SAFETY: upheld by the caller.
-    unsafe { gdt::set_ist_stacks(double_fault, nmi, machine_check) };
+    unsafe { gdt::set_ist_stacks(percpu::index(), double_fault, nmi, machine_check) };
     // The two are plain stores to different statics: keep the compiler from
     // putting the IDT's before the TSS's.
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
