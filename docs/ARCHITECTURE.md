@@ -794,6 +794,11 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs
   src/time.rs      TSC and local APIC timer calibration, the boot origin, now_ns, sleep, ticks
   src/boot.rs      Limine requests
+  src/cmdline.rs   kernel command line (flags, key=value)
+  src/sync.rs      SpinLock (interrupts off while held)
+  src/klog.rs      logger (levels, subsystem tags, serial timestamps)
+  src/fb.rs        framebuffer: hello screen, text console, crash screen
+  src/symbols.rs   kernel symbol table (symbolized crash reports)
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
   src/kmon.rs      serial debug monitor (until the M2 shell)
