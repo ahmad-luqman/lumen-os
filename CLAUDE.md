@@ -48,7 +48,7 @@ Each rule exists because breaking it caused a real bug in v1.
 3. **Compiler flags are tested, not assumed.** `make audit` checks the built
    ELF and the LLVM IR. Never weaken it to make a build pass.
 4. **No fixed-address stacks.** Every stack comes from the allocator and has a
-   guard page. (Temporary M0 exception: the boot stack and IST stacks, until M1.)
+   guard page. (Temporary exception: the boot stack and IST stacks, until #6.)
 5. **A real heap with working `free`**, plus in-kernel fragmentation and reuse
    tests.
 6. **Exception handling comes first.** GDT/IDT setup is the first thing
@@ -115,7 +115,10 @@ own PR that updates that doc first.
   stubs, serial, IST stacks. `crash.rs`: crash reporter. `ktest.rs`: test
   runner. `kmon.rs`: serial debug monitor (until the M2 shell). `fb.rs`:
   framebuffer and console. `klog.rs`: logger. `symbols.rs`: symbol lookup.
+  `mm/frame.rs`: physical frame allocator and its reservations.
+  `arch/x86_64/paging.rs`: read-only page-table walks.
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
+- `crates/lumen-mm`: frame-allocator logic (bitmap; host-tested).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
   are built), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`.
 - `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests.

@@ -19,6 +19,7 @@ mod klog;
 #[cfg_attr(feature = "ktest", allow(dead_code))] // replaced by the test runner
 mod kmon;
 mod ktest;
+mod mm;
 mod symbols;
 mod sync;
 
@@ -26,13 +27,14 @@ use log::{LevelFilter, info, warn};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Kernel entry point. Limine jumps here with a 16-byte aligned stack.
+/// Kernel entry point. Limine jumps here with a 16-byte aligned stack top and
+/// a 0 return address pushed on it (Limine protocol, x86-64 entry state).
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
         "xor ebp, ebp",   // end of the frame-pointer chain
-        "mov rdi, rsp",   // stack top, for the stack registry
+        "lea rdi, [rsp + 8]", // stack top (above Limine's 0 return address)
         "and rsp, -16",
         "call {kmain}",
         "ud2",
@@ -44,7 +46,11 @@ extern "C" fn _start() -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn kmain(stack_top: u64) -> ! {
     arch::init_early();
-    arch::stacks::set_boot_stack(stack_top, boot::BOOT_STACK_SIZE);
+    // Only claim the size we asked for if Limine confirms it: the frame
+    // allocator reserves this range and the crash reporter walks it.
+    let stack_size =
+        if boot::STACK_SIZE.get_response().is_some() { boot::BOOT_STACK_SIZE } else { boot::LIMINE_DEFAULT_STACK_SIZE };
+    arch::stacks::set_boot_stack(stack_top, stack_size);
 
     if let Some(resp) = boot::CMDLINE.get_response() {
         cmdline::set(resp.cmdline().to_str().unwrap_or(""));
@@ -58,7 +64,7 @@ extern "C" fn kmain(stack_top: u64) -> ! {
         panic!("Limine does not support base revision 3 (loaded {:?})", boot::BASE_REVISION.loaded_revision());
     }
     if boot::STACK_SIZE.get_response().is_none() {
-        warn!(target: "boot", "boot stack size request ignored; backtraces may stop early");
+        warn!(target: "boot", "boot stack size request ignored; assuming Limine's 64 KiB default");
     }
 
     match boot::EXECUTABLE_FILE.get_response() {
@@ -76,6 +82,7 @@ extern "C" fn kmain(stack_top: u64) -> ! {
         info!(target: "boot", "hhdm offset {:#x}", hhdm.offset());
     }
     log_memory_map();
+    mm::init();
 
     match boot::FRAMEBUFFER.get_response().and_then(|r| r.framebuffers().next()) {
         Some(fb) => match fb::init(&fb) {
@@ -128,7 +135,7 @@ fn log_memory_map() {
 /// The bytes of a file Limine loaded for us.
 fn file_bytes(file: &limine::file::File) -> &'static [u8] {
     // SAFETY: Limine maps the file in the HHDM for the life of the kernel
-    // (bootloader-reclaimable memory, which we never reclaim in M0).
+    // (bootloader-reclaimable memory, which the frame allocator keeps reserved).
     unsafe { core::slice::from_raw_parts(file.addr(), file.size() as usize) }
 }
 

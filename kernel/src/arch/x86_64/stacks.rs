@@ -1,9 +1,9 @@
 //! Known kernel stacks.
 //!
 //! Hard rule 4 says every stack comes from the allocator with a guard page
-//! below it. M0 has no allocator yet, so the boot stack (provided by Limine)
-//! and the three IST stacks below are a **documented temporary exception**:
-//! they have no guard pages. Replacing them is tracked by an M1 issue.
+//! below it. Until #6 (which needs the frame allocator and the page tables
+//! of #4), the boot stack (provided by Limine) and the three IST stacks below
+//! are a **documented temporary exception**: they have no guard pages.
 //!
 //! The crash reporter also uses this registry: a frame pointer is only
 //! followed if it points into one of these ranges, so a corrupted `rbp` can't
@@ -39,11 +39,17 @@ pub static MACHINE_CHECK: StaticStack = StaticStack::new();
 static BOOT_STACK_TOP: AtomicU64 = AtomicU64::new(0);
 static BOOT_STACK_BOTTOM: AtomicU64 = AtomicU64::new(0);
 
-/// Record the boot stack: `top` is the stack pointer at kernel entry and
-/// `size` the size we asked Limine for.
+/// Record the boot stack: `top` is its highest address (the stack pointer at
+/// kernel entry plus Limine's 8-byte return address) and `size` the size
+/// Limine confirmed.
 pub fn set_boot_stack(top: u64, size: u64) {
     BOOT_STACK_TOP.store(top, Ordering::Relaxed);
     BOOT_STACK_BOTTOM.store(top.saturating_sub(size), Ordering::Relaxed);
+}
+
+/// The boot stack as `(bottom, top)` virtual addresses.
+pub fn boot_stack() -> (u64, u64) {
+    (BOOT_STACK_BOTTOM.load(Ordering::Relaxed), BOOT_STACK_TOP.load(Ordering::Relaxed))
 }
 
 /// Is `[addr, addr + len)` entirely inside one known stack?

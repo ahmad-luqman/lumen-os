@@ -78,7 +78,8 @@ tests (for example `lumen-elf`, the symbol-table reader).
    #DF, NMI, #MC), then the IDT with all 256 vectors. **From this point any CPU
    exception produces a crash report.**
 5. Logger (level from `lumen.log=`), Limine responses checked, the symbol table
-   located in our own ELF, a memory-map summary, the framebuffer hello screen,
+   located in our own ELF, a memory-map summary, the frame allocator
+   (`INFO  mem: frames: N usable, M reserved`), the framebuffer hello screen,
    then `boot complete`.
 6. Either the in-kernel test runner (`--features ktest`) or the kernel monitor
    (`kmon`, a serial debug console that the user-mode shell replaces in M2).
@@ -104,20 +105,48 @@ The kernel is linked at -2 GiB because the **kernel code model** requires it
 (all symbols fit in sign-extended 32-bit immediates). `make audit` verifies
 this along with the absence of SSE/AVX and red-zone use (hard rule 3).
 
-### Physical memory (M1)
+### Physical memory (built in M1)
 
-The frame allocator is built only from Limine's memory map. Only `usable`
-regions are handed out. These are **explicitly reserved even if Limine labels
-them usable or reclaimable**: the kernel image, the boot stack, page tables
-in use, the framebuffer, ACPI tables (until parsed), the kernel ELF file
-(the symbol table lives in it), and the frame-allocator bitmap itself. An
-in-kernel test allocates every frame and asserts that none overlaps a reserved
-range (hard rule 2). Bootloader-reclaimable memory is returned only after
-everything in it has been copied or is no longer used.
+The frame allocator (`kernel/src/mm/frame.rs`, logic in the host-tested
+`crates/lumen-mm`) is built only from Limine's memory map. Only `usable`
+regions are handed out. These are **explicitly reserved by name, even if
+Limine labels them usable**: frame 0, the kernel image, the kernel ELF file
+(the symbol table lives in it), the boot stack and the framebuffer (those four
+found by translating their live virtual addresses through the page tables
+rather than trusting the map's labels), the ACPI RSDP and the allocator's own
+bitmaps. Every non-usable map entry (including the `acpi-*` entries, where
+firmware normally puts the ACPI tables; #2 must reserve any table it finds in
+usable memory, before anything allocates, since `reserve` refuses frames
+already handed out) and every frame of the active page tables is reserved
+too. The
+named list is logged at `debug` level.
 
-**Temporary exception (M0):** the boot stack (128 KiB from Limine) and the
-three 16 KiB IST stacks are static and have no guard pages, because there is no
-allocator yet. M1 replaces them (hard rule 4).
+It is a bitmap allocator with two bits per 4 KiB frame (64 KiB per GiB of
+physical span): *owned* (usable and not reserved) and *free*. Reserved and
+allocated frames both have a clear free bit; the owned bit tells them apart,
+so `free` rejects a frame that was never the allocator's to give instead of
+adding it to the pool. The usable set is fixed at construction; `reserve` can
+only take frames away, and refuses a range containing an allocated frame.
+Single frames come from a word scan starting from a hint below which no frame
+is free; contiguous runs from a linear scan. Callers return exactly what they
+allocated (`free` for `alloc`, `free_contiguous` with the same count for
+`alloc_contiguous`), so a buddy allocator can replace it behind the same
+interface if contiguous allocation becomes hot.
+
+In-kernel tests check, independently of the reservation list (by walking the
+page tables), that no frame behind the kernel image, boot stack, kernel file
+or framebuffer, and no page-table frame, is allocatable, and that the check
+itself fires when a frame in use is reported free. They then allocate every
+frame, check each against the memory map and the reservation list, fill it,
+tag it with a sequence number, and free them all, checking each tag (catches
+a frame handed out twice) (hard rule 2). Bootloader-reclaimable
+memory is not returned yet; whoever adds that must first copy or stop using
+everything in it (page tables, boot stack, kernel file).
+
+**Temporary exception (until #6):** the boot stack (128 KiB requested from
+Limine; 64 KiB assumed if it doesn't confirm) and the three 16 KiB IST stacks
+are static and have no guard pages. Guard pages need the frame allocator and
+our own page tables (#4); #6 replaces them (hard rule 4).
 
 ## 6. Interrupts, exceptions and crash reports (built)
 
@@ -410,13 +439,14 @@ TCG before uploading.
 
 ```
 kernel/            the kernel (bin crate, x86_64-unknown-none)
-  src/arch/        HAL; x86_64/ has gdt, idt, serial, stacks, cpu, qemu
+  src/arch/        HAL; x86_64/ has gdt, idt, serial, stacks, cpu, qemu, paging
   src/boot.rs      Limine requests
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
   src/kmon.rs      serial debug monitor (until the M2 shell)
+  src/mm/          memory management: frame allocator (frame.rs)
   linker.ld        layout at -2 GiB, .ktests section
-crates/            no_std, host-testable libraries (lumen-elf, ...)
+crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, ...)
 boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml

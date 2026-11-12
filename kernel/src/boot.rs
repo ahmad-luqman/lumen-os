@@ -8,11 +8,13 @@ use limine::BaseRevision;
 use limine::memory_map::EntryType;
 use limine::request::{
     ExecutableAddressRequest, ExecutableCmdlineRequest, ExecutableFileRequest, FramebufferRequest, HhdmRequest,
-    MemoryMapRequest, RequestsEndMarker, RequestsStartMarker, StackSizeRequest,
+    MemoryMapRequest, RequestsEndMarker, RequestsStartMarker, RsdpRequest, StackSizeRequest,
 };
 
 /// Boot stack size we ask Limine for.
 pub const BOOT_STACK_SIZE: u64 = 128 * 1024;
+/// The stack Limine guarantees when it ignores our size request.
+pub const LIMINE_DEFAULT_STACK_SIZE: u64 = 64 * 1024;
 
 #[used]
 #[unsafe(link_section = ".limine_requests_start")]
@@ -50,6 +52,11 @@ pub static EXECUTABLE_ADDRESS: ExecutableAddressRequest = ExecutableAddressReque
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 pub static CMDLINE: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
+
+/// ACPI root pointer (reserved by the frame allocator; parsed in #2).
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static RSDP: RsdpRequest = RsdpRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests_end")]
