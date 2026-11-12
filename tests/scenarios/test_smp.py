@@ -158,6 +158,19 @@ def test_stack_overflow_on_ap_hits_its_own_guard(boot):
     assert (kind, ist_bottom) == ("#DF IST", stacks[1].df), report
 
 
+def test_touching_a_guard_page_on_an_ap_names_its_own_stack(boot):
+    # `crash guard 2` writes into CPU 2's own main-stack guard page: the
+    # stray-access line names CPU 2's stack, not the boot CPU's.
+    report, stacks = crash_on(boot, "guard 2")
+    assert reported_by(report, 2), report
+    hit = re.search(
+        r"^guard page hit: cr2 0x[0-9a-f]{16} is in the guard page below the kernel main stack \[(0x[0-9a-f]+), (0x[0-9a-f]+)\)",
+        report,
+        re.MULTILINE,
+    )
+    assert hit and hit.groups() == (stacks[2].main_bottom, stacks[2].main_top), report
+
+
 @pytest.mark.parametrize(
     ("kind", "error"),
     [
