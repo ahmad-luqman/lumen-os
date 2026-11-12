@@ -2,11 +2,12 @@
 //!
 //! Every stack the kernel runs on once `kmain` switches stacks (right after
 //! `mm::init`) comes from the allocator with an unmapped guard page below it
-//! (hard rule 4; [`crate::mm::stack`]) and is listed in [`REGISTRY`]. The one
-//! exception is the stack Limine booted us on, used until that switch; it is
+//! (hard rule 4; [`crate::mm::stack`]) and is listed in [`REGISTRY`]. The
+//! exceptions are the stack Limine booted us on, used until that switch,
 //! recorded here ([`set_boot_stack`], not in the registry) so a crash before
 //! the switch, or a backtrace reaching back into `kmain`, can still be
-//! walked.
+//! walked; and each AP's Limine stack, which it leaves in `smp::ap_entry`
+//! before anything can fault (CPUs past the cap halt on theirs).
 //!
 //! The crash reporter uses this module lock-free: a frame pointer is only
 //! followed if it points into a known stack ([`contains`]), so a corrupted
@@ -52,10 +53,7 @@ pub fn bounds_of(addr: u64) -> Option<(u64, u64)> {
     if lo != 0 && (lo..hi).contains(&addr) {
         return Some((lo, hi));
     }
-    match REGISTRY.find(addr) {
-        Some(Hit::Stack(r)) => Some((r.range.bottom, r.range.top)),
-        _ => None,
-    }
+    stack_of(addr).map(|r| (r.range.bottom, r.range.top))
 }
 
 /// The registered stack `addr` is in, if any.

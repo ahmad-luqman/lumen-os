@@ -315,9 +315,10 @@ pub fn write_stats(w: &mut dyn Write) -> fmt::Result {
 ///
 /// # Safety
 /// Nothing may use the heap while this runs: call it from the crash reporter
-/// (interrupts off for good, every other CPU stopped, and it halts next, so
-/// the interrupted lock holder never resumes), or from a test that holds the
-/// lock and doesn't use the heap meanwhile.
+/// (interrupts off for good, every other online CPU stopped or named as not
+/// stopped, and it halts next, so the interrupted lock holder never
+/// resumes), or from a test that holds the lock and doesn't use the heap
+/// meanwhile.
 pub unsafe fn write_crash_stats(w: &mut dyn Write) -> fmt::Result {
     let (snapshot, label) = match STATE.try_lock() {
         Some(state) => (Snapshot::of(&state, CRASH_WALK_LIMIT), "heap"),

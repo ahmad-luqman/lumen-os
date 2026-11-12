@@ -4,7 +4,7 @@
 //! (for the test harness and `make run` logs) and to the screen, and contains
 //! the exception, decoded error code, faulting address, registers and a
 //! symbolized frame-pointer backtrace; on serial only, it then gives the last
-//! 16 trace events (what led up to it), for a page fault the page-table walk
+//! 16 trace events of its own CPU (what led up to it), for a page fault the page-table walk
 //! of the faulting address, and the heap's state.
 //!
 //! The reporter must not make things worse: it takes no locks it could
@@ -15,9 +15,12 @@
 //! With several CPUs online, the first CPU to crash owns the report: it
 //! stops every other online CPU with an NMI (each acknowledges and halts) and
 //! waits for them, bounded, before writing anything, so reports and log
-//! lines never interleave. A CPU that crashes while another is reporting
-//! halts quietly. Serial says which CPU crashed (`cpu:`), which stack the
-//! reporter runs on (`running on:`) and which CPUs stopped.
+//! lines don't interleave. A CPU that crashes while another is reporting
+//! halts, and the report names it. Serial says which CPU crashed (`cpu:`),
+//! which stack the reporter runs on (`running on:`) and which CPUs stopped;
+//! `!!!` lines name any CPU that didn't stop through the stop NMI (late, not
+//! sent, crashed itself, or started but not online), which may still touch
+//! the console or the heap: the bounded walks below tolerate that.
 //!
 //! The output format is parsed by `tools/harness/lumen_harness/crash.py`
 //! (markers, backtrace, page walk), `tests/scenarios/test_crash.py` and, for
@@ -43,14 +46,31 @@ const RECENT_TRACE_EVENTS: u64 = 16;
 
 /// Which CPU owns the report: its index plus one, 0 while no CPU is crashing.
 static CRASHING: AtomicUsize = AtomicUsize::new(0);
-/// The other CPUs the owner sent a stop NMI to, a bit each.
+/// Set while the owner stops the other CPUs, before it has printed anything.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+/// The crash being reported: its vector (`u64::MAX`: a panic) and rip, for
+/// a fault while stopping the others, which then is all that gets out.
+static FIRST_VECTOR: AtomicU64 = AtomicU64::new(0);
+static FIRST_RIP: AtomicU64 = AtomicU64::new(0);
+// CPU sets below are u64 masks, a bit each.
+const _: () = assert!(arch::MAX_CPUS <= 64);
+/// The other CPUs the owner sent a stop NMI to.
 static STOP_SENT: AtomicU64 = AtomicU64::new(0);
-/// The CPUs that stopped for it, a bit each.
-static STOPPED: AtomicU64 = AtomicU64::new(0);
-/// How long the owner waits for the others to stop.
+/// Online CPUs whose stop NMI couldn't be sent (their local APIC stayed busy).
+static NOT_SENT: AtomicU64 = AtomicU64::new(0);
+/// The CPUs that stopped through the stop NMI.
+static NMI_STOPPED: AtomicU64 = AtomicU64::new(0);
+/// CPUs that stopped through a crash of their own while another reported,
+/// with that crash's vector and rip.
+static ALSO_CRASHED: AtomicU64 = AtomicU64::new(0);
+static ALSO_VECTOR: [AtomicU64; arch::MAX_CPUS] = [const { AtomicU64::new(0) }; arch::MAX_CPUS];
+static ALSO_RIP: [AtomicU64; arch::MAX_CPUS] = [const { AtomicU64::new(0) }; arch::MAX_CPUS];
+/// The CPUs of `STOP_SENT` that had stopped when the owner's wait ended.
+static STOPPED_IN_TIME: AtomicU64 = AtomicU64::new(0);
+/// How long the owner waits, in all, for the others to stop.
 const STOP_TIMEOUT_NS: u64 = 500_000_000;
-/// The same bound in spin-loop rounds, for a crash before the TSC is
-/// calibrated (the other CPUs are already online then).
+/// A bound in spin-loop rounds instead (not calibrated, roughly comparable),
+/// for a crash before the TSC is calibrated, when APs may already be online.
 const STOP_SPINS: u64 = 10_000_000;
 /// CR2 when the first report began: a nested crash only blames a guard page
 /// if CR2 has changed since (only a #PF sets it).
@@ -122,11 +142,15 @@ fn enter(vector: u64, rip: u64) {
     match CRASHING.compare_exchange(0, me + 1, Ordering::SeqCst, Ordering::SeqCst) {
         Ok(_) => {
             ON_AT_ENTRY.store(arch::irq::enabled(), Ordering::SeqCst);
+            FIRST_VECTOR.store(vector, Ordering::SeqCst);
+            FIRST_RIP.store(rip, Ordering::SeqCst);
+            STOPPING.store(true, Ordering::SeqCst);
             stop_others(me);
+            STOPPING.store(false, Ordering::SeqCst);
         }
         // Another CPU is reporting: this is its stop NMI, or a crash of our
-        // own that its report must not be mixed with.
-        Err(owner) if owner != me + 1 => stop_here(me),
+        // own that its report must not be mixed with (it names it).
+        Err(owner) if owner != me + 1 => stop_here(me, vector, rip),
         Err(_) => nested(vector, rip),
     }
 }
@@ -134,6 +158,18 @@ fn enter(vector: u64, rip: u64) {
 /// A crash while this CPU writes its own report: say so and stop.
 fn nested(vector: u64, rip: u64) -> ! {
     let mut s = SerialWriter;
+    if STOPPING.load(Ordering::SeqCst) {
+        // Nothing is printed yet: keep the crash that was being reported.
+        let (first, first_rip) = (FIRST_VECTOR.load(Ordering::SeqCst), FIRST_RIP.load(Ordering::SeqCst));
+        let what = if first == u64::MAX { "a panic" } else { arch::idt::exception_name(first) };
+        let _ = writeln!(
+            s,
+            "\n!!! fault while stopping the other cpus (vector {vector:#x}, rip {rip:#018x}); the crash being \
+             reported: {what} (vector {first:#x}), rip {first_rip:#018x} <{}>; halting",
+            Symbolized(first_rip)
+        );
+        finish();
+    }
     if IN_TAIL.load(Ordering::SeqCst) {
         // Everything but the tail is out: say what happened and close the
         // report so it still parses.
@@ -149,41 +185,54 @@ fn nested(vector: u64, rip: u64) -> ! {
 }
 
 /// Send every other online CPU a stop NMI and wait (bounded) until each has
-/// stopped. Only online CPUs: one still parked in the bootloader has no
-/// handler for it. (An AP started but not yet online gets none, and could
-/// still log a line into the report.)
+/// stopped; record which had when the wait ended. Only online CPUs: one
+/// still parked in the bootloader has no handler for it, and an AP started
+/// but not yet online gets none either (the report names it).
 fn stop_others(me: usize) {
     if !arch::apic::lapic_ready() {
         return; // too early for other CPUs to be running
     }
-    let mut sent = 0u64;
+    let (mut sent, mut not_sent) = (0u64, 0u64);
     for cpu in (0..arch::MAX_CPUS).filter(|&c| c != me && crate::smp::is_online(c)) {
-        arch::apic::send_nmi(crate::smp::lapic_id(cpu));
-        sent |= 1 << cpu;
+        let Some(lapic) = crate::smp::lapic_id(cpu) else { continue };
+        if arch::apic::send_nmi(lapic) {
+            sent |= 1 << cpu;
+        } else {
+            not_sent |= 1 << cpu;
+        }
     }
     STOP_SENT.store(sent, Ordering::SeqCst);
+    NOT_SENT.store(not_sent, Ordering::SeqCst);
+    let stopped = || (NMI_STOPPED.load(Ordering::SeqCst) | ALSO_CRASHED.load(Ordering::SeqCst)) & sent;
     // The APs come online while the boot CPU calibrates the TSC: before
     // that (`now_ns` is 0) the wait is bounded by rounds instead.
     let start = crate::time::now_ns();
-    let mut spins = 0u64;
-    while STOPPED.load(Ordering::SeqCst) & sent != sent {
+    for spins in 0u64.. {
         let late = if start == 0 {
             spins >= STOP_SPINS
         } else {
             crate::time::now_ns().saturating_sub(start) >= STOP_TIMEOUT_NS
         };
-        if late {
+        if stopped() == sent || late {
             break;
         }
-        spins += 1;
         core::hint::spin_loop();
     }
+    STOPPED_IN_TIME.store(stopped(), Ordering::SeqCst);
 }
 
-/// Stop this CPU for another CPU's report: acknowledge, then halt for good
-/// (interrupts are off; NMIs stay blocked until an `iret` that never comes).
-fn stop_here(me: usize) -> ! {
-    STOPPED.fetch_or(1 << me, Ordering::SeqCst);
+/// Stop this CPU for another CPU's report, then halt for good. Through the
+/// stop NMI (`vector` 2) that is an acknowledgement (further NMIs stay
+/// blocked until an `iret` that never comes); through a crash of its own,
+/// the crash is recorded for the report.
+fn stop_here(me: usize, vector: u64, rip: u64) -> ! {
+    if vector == 2 {
+        NMI_STOPPED.fetch_or(1 << me, Ordering::SeqCst);
+    } else {
+        ALSO_VECTOR[me].store(vector, Ordering::SeqCst);
+        ALSO_RIP[me].store(rip, Ordering::SeqCst);
+        ALSO_CRASHED.fetch_or(1 << me, Ordering::SeqCst);
+    }
     arch::halt_forever()
 }
 
@@ -192,10 +241,11 @@ struct Cpus(u64);
 
 impl fmt::Display for Cpus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut first = true;
-        for cpu in (0..64).filter(|c| self.0 & (1 << c) != 0) {
-            write!(f, "{}{cpu}", if first { "" } else { " " })?;
-            first = false;
+        for (i, cpu) in (0..64).filter(|c| self.0 & (1 << c) != 0).enumerate() {
+            if i > 0 {
+                f.write_str(" ")?;
+            }
+            write!(f, "{cpu}")?;
         }
         Ok(())
     }
@@ -211,13 +261,30 @@ fn write_origin(w: &mut dyn Write, rsp: u64) {
         None if (lo..hi).contains(&rsp) => writeln!(w, "running on: the boot stack {lo:#x}..{hi:#x}"),
         None => writeln!(w, "running on: an unknown stack (rsp {rsp:#018x})"),
     };
-    let sent = STOP_SENT.load(Ordering::SeqCst);
-    if sent != 0 {
-        let stopped = STOPPED.load(Ordering::SeqCst) & sent;
-        let _ = writeln!(w, "other cpus stopped: {}", Cpus(stopped));
-        if stopped != sent {
-            let _ = writeln!(w, "!!! other cpus not stopped: {}", Cpus(sent & !stopped));
+    let (sent, not_sent) = (STOP_SENT.load(Ordering::SeqCst), NOT_SENT.load(Ordering::SeqCst));
+    if sent | not_sent != 0 {
+        let in_time = STOPPED_IN_TIME.load(Ordering::SeqCst);
+        let _ = writeln!(w, "other cpus stopped: {}", Cpus(in_time & NMI_STOPPED.load(Ordering::SeqCst)));
+        if in_time != sent {
+            let _ = writeln!(w, "!!! other cpus not stopped: {}", Cpus(sent & !in_time));
         }
+        if not_sent != 0 {
+            let _ = writeln!(w, "!!! stop NMI not sent (local APIC busy) to cpus: {}", Cpus(not_sent));
+        }
+    }
+    let also = ALSO_CRASHED.load(Ordering::SeqCst);
+    for cpu in (0..arch::MAX_CPUS).filter(|c| also & (1 << c) != 0) {
+        let (vector, rip) = (ALSO_VECTOR[cpu].load(Ordering::SeqCst), ALSO_RIP[cpu].load(Ordering::SeqCst));
+        let what = if vector == u64::MAX { "a panic" } else { arch::idt::exception_name(vector) };
+        let _ = writeln!(
+            w,
+            "!!! cpu {cpu} also crashed: {what} (vector {vector:#x}), rip {rip:#018x} <{}>",
+            Symbolized(rip)
+        );
+    }
+    let starting = (0..arch::MAX_CPUS).filter(|&c| crate::smp::is_starting(c)).fold(0u64, |m, c| m | 1 << c);
+    if starting != 0 {
+        let _ = writeln!(w, "!!! cpus started but not online (not stopped): {}", Cpus(starting));
     }
 }
 
@@ -265,9 +332,10 @@ fn emit(body: &dyn Fn(&mut dyn Write), tail: &dyn Fn(&mut dyn Write)) {
     // Doesn't block (reads the heap anyway if its lock is held); the
     // free-list walk is bounded and stays inside those bounds.
     // SAFETY: the crash path: interrupts off for good, CRASHING keeps a
-    // second report out, every other online CPU has stopped (a CPU that
-    // didn't is named above), and we halt next, so whatever was using the
-    // heap never resumes.
+    // second report out, every other online CPU has stopped or is named
+    // above as not stopped (it could then still use the heap; the walk is
+    // bounded and never writes), and we halt next, so whatever was using
+    // the heap on this CPU never resumes.
     let _ = unsafe { crate::mm::heap::write_crash_stats(&mut s) };
     IN_TAIL.store(false, Ordering::SeqCst);
     // Interrupts must have been off from the start (`disable_for_good`) and
@@ -280,8 +348,9 @@ fn emit(body: &dyn Fn(&mut dyn Write), tail: &dyn Fn(&mut dyn Write)) {
     let _ = writeln!(s, "interrupts: {state}");
     let _ = writeln!(s, "{END_MARKER}");
     // Serial first: if drawing the screen faults, the serial report survives.
-    // SAFETY: we are on the crash path; CRASHING and the stopped CPUs
-    // guarantee we run alone.
+    // SAFETY: we are on the crash path; CRASHING keeps other reports out and
+    // every other online CPU has stopped, or is named above as not stopped
+    // (it could then still draw: a garbled screen, not a broken report).
     if unsafe { crate::fb::with_crash_screen(|w| body(w)) } {
         let _ = writeln!(s, "{SCREEN_MARKER}");
     }

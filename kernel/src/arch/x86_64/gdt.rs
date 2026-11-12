@@ -100,20 +100,15 @@ pub(super) unsafe fn set_ist_stacks(cpu: usize, double_fault: u64, nmi: u64, mac
 
 /// The stack top in this CPU's IST slot `slot` (1-based), 0 if unset.
 pub fn ist_top(slot: u8) -> u64 {
-    ist_top_of(percpu::index(), slot)
-}
-
-/// The stack top in CPU `cpu`'s IST slot `slot` (1-based), 0 if unset.
-pub fn ist_top_of(cpu: usize, slot: u8) -> u64 {
     // SAFETY: only takes the (bounds-checked) address; no reference is made.
-    let tss = unsafe { &raw const TSS_SEGMENTS[cpu] };
-    // SAFETY: a plain read of a field the kernel writes only before that CPU
-    // uses it (`set_ist_stacks`).
+    let tss = unsafe { &raw const TSS_SEGMENTS[percpu::index()] };
+    // SAFETY: a plain read of a field of this CPU's own TSS, which is written
+    // only before this CPU uses it (`set_ist_stacks`).
     unsafe { (*tss).ist[usize::from(slot - 1)] }
 }
 
 /// Load CPU `cpu`'s GDT and TSS and reload every segment register (which
-/// clears the GS base: `percpu::set_current` comes after).
+/// may clear the GS base: `percpu::set_current` comes after).
 ///
 /// # Safety
 /// Once per CPU, on CPU `cpu` itself, with interrupts off: nothing else

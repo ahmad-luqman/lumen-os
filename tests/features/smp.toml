@@ -1,7 +1,7 @@
 # Features: smp. See tests/features/README.md for the format.
 
 [[feature]]
-name = "Every CPU Limine reports comes online (up to 8, the rest halted), each with its own GDT/TSS, per-CPU record and allocated, guarded stacks"
+name = "Every CPU Limine reports comes online (up to 8, the rest halted), each with its own TSS, per-CPU record and allocated, guarded stacks"
 milestone = "M1"
 tests = [
     "scenario:test_smp::test_all_cpus_online",
@@ -22,4 +22,11 @@ tests = [
     "scenario:test_smp::test_crash_on_the_boot_cpu_stops_the_others",
     "scenario:test_smp::test_crash_alone_names_no_other_cpus",
     "scenario:test_smp::test_crash_on_a_cpu_that_isnt_online_is_refused",
+]
+
+[[feature]]
+name = "W^X binds on every CPU (writing kernel text or running data faults on an AP)"
+milestone = "M1"
+tests = [
+    "scenario:test_smp::test_protection_holds_on_aps[*]",
 ]

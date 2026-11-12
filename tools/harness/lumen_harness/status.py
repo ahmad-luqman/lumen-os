@@ -122,7 +122,9 @@ def render(evaluated: list[tuple[dict, str]]) -> str:
         "  allocated one right after `mm::init`; #DF, NMI and #MC run on it too",
         "  (no IST yet), so a #DF from a broken stack pointer then is a triple fault.",
         "  Each other CPU also starts on a Limine stack, until it loads the kernel's",
-        "  page tables (its IST stacks are allocated by then).",
+        "  page tables; its IST stacks are mapped only in those, so nothing in that",
+        "  stretch may fault (an exception there is a triple fault). CPUs past the",
+        "  limit of 8 halt for good on their Limine stacks.",
         "",
     ]
     return "\n".join(lines)

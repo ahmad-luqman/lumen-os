@@ -156,7 +156,7 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     interrupts::init();
     // The other CPUs halt once started instead of spinning in the bootloader
     // during the clock calibration below.
-    smp::start_all();
+    let started = smp::start_all();
     ktrace!(Kind::BootPhase, BootPhase::Interrupts);
     time::init();
     arch::irq::enable();
@@ -166,7 +166,7 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
         warn!(target: "irq", "no timer interrupt in 10 ms");
     }
     ktrace!(Kind::BootPhase, BootPhase::Time);
-    smp::wait_online();
+    smp::wait_online(started);
     ktrace!(Kind::BootPhase, BootPhase::Smp);
     match boot::FRAMEBUFFER.get_response().and_then(|r| r.framebuffers().next()) {
         Some(fb) => match fb::init(&fb) {

@@ -5,8 +5,8 @@
 //!
 //! 1. **Usable memory** is exactly the `usable` entries of Limine's memory map.
 //!    Bootloader-reclaimable memory stays reserved for now (the boot stack,
-//!    Limine's responses and its page tables, unused after the switch to the
-//!    kernel's own, live there).
+//!    Limine's responses, and its page tables and AP stacks live there; the
+//!    APs use those until they switch, and CPUs past the cap for good).
 //! 2. **Reservations** are made explicitly, by name: frame 0, the kernel
 //!    image, the kernel ELF file (the crash reporter's symbols), the boot stack
 //!    and the framebuffer (those four found by translating their live virtual

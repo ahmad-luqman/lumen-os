@@ -43,6 +43,8 @@ const LVT_PERIODIC: u32 = 1 << 17;
 const ICR_PENDING: u32 = 1 << 12;
 /// ICR: level assert (required for every IPI but INIT de-assert).
 const ICR_ASSERT: u32 = 1 << 14;
+/// How many times [`send`] polls for the IPI to go out before giving up.
+const ICR_SPINS: u32 = 1_000_000;
 /// Divide configuration 0b0011: the timer counts at the bus clock / 16.
 const DIVIDE_BY_16: u32 = 0b0011;
 /// What [`DIVIDE_BY_16`] divides by.
@@ -140,33 +142,37 @@ pub fn in_service(vector: u8) -> bool {
     lapic_ready() && read(ISR + 0x10 * usize::from(vector / 32)) & (1 << (vector % 32)) != 0
 }
 
-/// Send an interrupt on `vector` to the CPU whose local APIC id is `dest`.
-pub fn send_ipi(dest: u32, vector: u8) {
-    send(dest, ICR_ASSERT | u32::from(vector));
+/// Send an interrupt on `vector` to the CPU whose local APIC id is `dest`;
+/// whether it went out.
+#[must_use]
+pub fn send_ipi(dest: u32, vector: u8) -> bool {
+    send(dest, ICR_ASSERT | u32::from(vector))
 }
 
 /// Send an NMI to the CPU whose local APIC id is `dest` (the crash reporter
-/// stops the other CPUs with it). Lock-free.
-pub fn send_nmi(dest: u32) {
-    send(dest, ICR_ASSERT | LVT_NMI);
+/// stops the other CPUs with it); whether it went out. Lock-free.
+#[must_use]
+pub fn send_nmi(dest: u32) -> bool {
+    send(dest, ICR_ASSERT | LVT_NMI)
 }
 
 /// Write the ICR (destination first: writing the low word sends) and wait,
-/// bounded, until the local APIC has sent it (the crash path must not hang
-/// on a wedged APIC; it says which CPU didn't stop). Interrupts are off
-/// meanwhile, so a handler on this CPU can't send one between the writes.
-fn send(dest: u32, low: u32) {
+/// bounded, until the local APIC has sent it: false if it hasn't by then
+/// (the crash path must not hang on a wedged APIC; it says so). Interrupts
+/// are off meanwhile, so a handler on this CPU can't send one between the
+/// writes.
+fn send(dest: u32, low: u32) -> bool {
     assert!(dest <= 0xff, "xAPIC destination {dest} doesn't fit in 8 bits");
-    let irq = super::irq::push_off();
+    let _irq = super::irq::push_off();
     write(ICR_HIGH, dest << 24);
     write(ICR_LOW, low);
-    for _ in 0..1_000_000 {
+    for _ in 0..ICR_SPINS {
         if read(ICR_LOW) & ICR_PENDING == 0 {
-            break;
+            return true;
         }
         core::hint::spin_loop();
     }
-    drop(irq);
+    false
 }
 
 /// Latch and read the error status (for the error interrupt).

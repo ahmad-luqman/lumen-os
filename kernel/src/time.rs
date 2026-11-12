@@ -345,7 +345,7 @@ pub fn tsc() -> Option<Clock> {
 
 /// The local APIC timer's input (after its divider) as a [`Clock`], once
 /// calibrated.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests, SMP (#9)
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests
 pub fn lapic_timer() -> Option<Clock> {
     Clock::new(LAPIC_TIMER_HZ.load(Ordering::Relaxed))
 }

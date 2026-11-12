@@ -115,8 +115,9 @@ impl Drop for KernelStack {
         let handle = self.handle.take().expect("dropped once");
         // Retract first: the crash reporter must not follow a frame pointer
         // into memory that is going away. It reads the registry only after
-        // stopping every other CPU, so a crash during this, on any CPU, sees
-        // the stack either registered and mapped, or retracted.
+        // stopping the other CPUs, so a crash during this, on any CPU, sees
+        // the stack either registered and mapped, or retracted (if every CPU
+        // acknowledged the stop; one that didn't is named in the report).
         stacks::REGISTRY.unregister(handle);
         // Keep the compiler from moving the unmapping above the retraction.
         compiler_fence(Ordering::SeqCst);

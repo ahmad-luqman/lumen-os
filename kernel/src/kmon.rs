@@ -171,17 +171,18 @@ fn crash(args: &str) {
         let _ = writeln!(out, "crash: unknown kind '{kind}' ({CRASH_KINDS})");
         return;
     };
-    match words.next().map(str::parse::<usize>) {
+    let cpu = words.next().map(str::parse::<usize>);
+    if words.next().is_some() {
+        let _ = writeln!(out, "crash: usage: crash <kind> [cpu]");
+        return;
+    }
+    match cpu {
         None | Some(Ok(0)) => fault(),
-        Some(Ok(cpu)) => match crate::smp::run_on(cpu, fault) {
-            Ok(()) => {}
-            Err(crate::smp::RunError::NotAnOnlineAp) => {
-                let _ = writeln!(out, "crash: cpu {cpu} isn't online");
+        Some(Ok(cpu)) => {
+            if let Err(e) = crate::smp::run_on(cpu, fault) {
+                let _ = writeln!(out, "crash: cpu {cpu} {e}");
             }
-            Err(crate::smp::RunError::Busy) => {
-                let _ = writeln!(out, "crash: cpu {cpu} hasn't taken its last job yet");
-            }
-        },
+        }
         Some(Err(_)) => {
             let _ = writeln!(out, "crash: the cpu is a number (0: this one)");
         }

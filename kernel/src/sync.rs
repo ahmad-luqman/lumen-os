@@ -56,7 +56,8 @@ impl<T> SpinLock<T> {
     /// while the lock was held, and for tests that hold the lock without
     /// touching the value. The caller guarantees no other code uses the value
     /// while the reference lives (on the crash path: interrupts off for good,
-    /// every other CPU stopped, and the interrupted holder never resumes).
+    /// every other online CPU stopped or named as not stopped, and the
+    /// interrupted holder never resumes).
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn force_get(&self) -> &mut T {
         // SAFETY: upheld by the caller (see above).

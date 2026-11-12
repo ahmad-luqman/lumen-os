@@ -58,9 +58,9 @@ pub fn try_read_byte() -> Option<u8> {
     unsafe { (inb(LINE_STATUS) & LSR_DATA_READY != 0).then(|| inb(DATA)) }
 }
 
-/// A lock-free writer. The UART itself is the only shared state, and
-/// interleaving between CPUs is acceptable for M0 (single CPU). Higher layers
-/// (the logger) serialize whole lines.
+/// A lock-free writer. The UART itself is the only shared state: writes from
+/// different CPUs can interleave byte by byte. The logger serializes whole
+/// lines, and the crash reporter stops the other CPUs first.
 #[derive(Clone, Copy, Default)]
 pub struct SerialWriter;
 

@@ -11,14 +11,18 @@
 //! right after the GDT is loaded (loading a segment selector can reset the
 //! base) and before the IDT: from then on locks, logging and the crash
 //! reporter may run, and all of them ask which CPU they are on.
+//!
+//! This relies on GS holding the kernel's base whenever kernel code runs.
+//! Once there is user mode (M2), every entry from ring 3 must `swapgs`
+//! before anything calls [`index`].
 
 use core::arch::asm;
 use core::mem::offset_of;
 
 use super::cpu::wrmsr;
 
-/// The most CPUs the kernel runs on. More are left parked in the bootloader
-/// (with a warning).
+/// The most CPUs the kernel runs on. More are halted for good in
+/// `smp::park` (with a warning).
 pub const MAX_CPUS: usize = 8;
 
 const IA32_GS_BASE: u32 = 0xc000_0101;
@@ -58,7 +62,8 @@ pub fn index() -> usize {
     let index: u32;
     // SAFETY: GS points at this CPU's `PerCpu` (set in `init_early` or
     // `init_ap` before anything that can call this); the load reads its
-    // `index` field.
+    // `index` field. `readonly`, not `pure`: once threads can move between
+    // CPUs, two calls may differ, so they must not be merged.
     unsafe {
         asm!(
             "mov {:e}, gs:[{off}]",

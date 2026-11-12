@@ -9,7 +9,10 @@ TAP_OUT = BUILD_DIR / "test-results" / "ktest.tap"
 
 
 def test_in_kernel_tests_pass(boot):
-    m = boot("ktest")
+    # With other CPUs online (idle), so the per-CPU state, the heap, the
+    # stack registry and the frame allocator are tested with their stacks and
+    # state in place, as on any multi-CPU machine.
+    m = boot("ktest", extra=["-smp", "4"])
     code = m.wait_exit(120)
     out = m.output
     report = tap.parse(out)

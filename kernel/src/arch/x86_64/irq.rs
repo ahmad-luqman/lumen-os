@@ -101,9 +101,10 @@ pub fn enable() {
 }
 
 /// Unless `ready()`, wait for an interrupt with interrupts on. `ready` runs
-/// with interrupts off, then `sti; hlt` (`sti` takes effect after `hlt`
-/// starts), so an interrupt that makes it true can't slip in between the
-/// check and the halt and leave this CPU asleep. Outside every critical
+/// with interrupts off, then `sti; hlt`: `sti` holds interrupts off until
+/// after the next instruction, so the CPU is already in `hlt` when a pending
+/// one arrives and wakes it; one that makes `ready` true can't slip in
+/// between the check and the halt and leave this CPU asleep. Outside every critical
 /// section; interrupts are on afterwards (and stay off for good, with this
 /// CPU halted, after [`disable_for_good`]).
 pub fn wait_unless(ready: impl FnOnce() -> bool) {
@@ -121,10 +122,10 @@ pub fn wait_unless(ready: impl FnOnce() -> bool) {
     unsafe { asm!("sti", "hlt", options(nomem, nostack)) };
 }
 
-/// Turn interrupts off on this CPU and keep them off on every CPU: no
-/// section closing turns them on again, and [`enable`] refuses. For the
-/// crash path, which must run alone and never returns to what it
-/// interrupted (it stops the other CPUs itself).
+/// Turn interrupts off on this CPU; from now on no CPU turns them back on
+/// (closing sections, [`enable`] and [`wait_unless`] all refuse). For the
+/// crash path, which never returns to what it interrupted (it stops the
+/// other CPUs itself).
 pub fn disable_for_good() {
     cli();
     FOR_GOOD.store(true, Ordering::Relaxed);

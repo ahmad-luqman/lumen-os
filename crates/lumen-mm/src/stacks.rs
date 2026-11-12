@@ -32,7 +32,8 @@ pub const MAX_STACKS: usize = 48;
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StackKind {
-    /// The boot CPU's kernel stack (`kmain_on_kernel_stack` onward).
+    /// A CPU's main kernel stack (the boot CPU's from `kmain_on_kernel_stack`,
+    /// an AP's from `smp::ap_main`).
     Main = 1,
     /// IST stack for double faults.
     DoubleFault = 2,
@@ -213,10 +214,10 @@ impl Registry {
     /// `range` (the stack, not its guard page) is mapped until it is
     /// unregistered: readers such as the crash reporter dereference what the
     /// registry lists. (The kernel's readers are crash reports, which stop
-    /// every other CPU before reading, so a stack retracted and then unmapped
-    /// by a stopped CPU is never half-read. A reader running alongside
-    /// writers would need a grace period after `unregister` before the
-    /// unmapping.)
+    /// the other CPUs before reading, so a stack retracted and then unmapped
+    /// by a stopped CPU is never half-read; and tests and kmon, on the CPU
+    /// that owns the stacks they look at. A reader running alongside writers
+    /// would need a grace period after `unregister` before the unmapping.)
     ///
     /// # Panics
     /// If `range` is not page-aligned, nonempty and with its guard page above

@@ -145,7 +145,7 @@ pub unsafe extern "C" fn switch_stack(top: u64, entry: extern "C" fn() -> !) -> 
 pub unsafe extern "C" fn enter_kernel_space(root: u64, top: u64, entry: extern "C" fn() -> !) -> ! {
     core::arch::naked_asm!(
         "mov cr3, rdi",
-        "mov rax, cr4", // toggle CR4.PGE (bit 7): drops global entries too
+        "mov rax, cr4", // clear, then restore CR4.PGE (bit 7): flushes global entries if set
         "mov rcx, rax",
         "btr rcx, 7",
         "mov cr4, rcx",

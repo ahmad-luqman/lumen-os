@@ -154,24 +154,24 @@ static mut IDT: [IdtEntry; 256] = [IdtEntry::MISSING; 256];
 /// The vectors that run on their own IST stack, and their slots.
 const IST_VECTORS: [(usize, u8); 3] = [(2, gdt::IST_NMI), (8, gdt::IST_DOUBLE_FAULT), (18, gdt::IST_MACHINE_CHECK)];
 
-/// Fill the IDT and load it on the boot CPU. Must run after its GDT is
-/// loaded. Every vector runs on the current stack until [`use_ist_stacks`].
-pub fn init() {
+/// Fill the IDT (once, on the boot CPU, before any CPU loads it). Every
+/// vector runs on the current stack until [`use_ist_stacks`].
+pub(super) fn fill() {
     let stubs = &raw const lumen_isr_stubs as u64;
     let idt = &raw mut IDT;
-    // SAFETY: single-threaded early boot; the IDT is static and lives forever.
+    // SAFETY: single-threaded early boot, before any `load`; the IDT is
+    // static and lives forever.
     unsafe {
         for vector in 0..256u64 {
             (*idt)[vector as usize] = IdtEntry::interrupt_gate(stubs + vector * STUB_STRIDE, 0);
         }
     }
-    load();
 }
 
-/// Load the (shared, already filled) IDT on this CPU.
-pub fn load() {
+/// Load the (shared) IDT on this CPU. Only after [`fill`] (`arch::init_cpu`).
+pub(super) fn load() {
     let ptr = IdtPointer { limit: (size_of::<[IdtEntry; 256]>() - 1) as u16, base: &raw const IDT as u64 };
-    // SAFETY: the IDT is filled (`init` ran on the boot CPU) and static.
+    // SAFETY: the IDT is filled (callers run after `fill`) and static.
     unsafe { asm!("lidt [{}]", in(reg) &raw const ptr, options(readonly, nostack, preserves_flags)) };
 }
 
@@ -180,8 +180,9 @@ pub fn load() {
 ///
 /// # Safety
 /// `gdt::set_ist_stacks` has filled the boot CPU's slots with valid stacks,
-/// and no other CPU runs yet (each AP fills its own slots before it loads
-/// the IDT, so every CPU taking these vectors has them).
+/// and no other CPU runs yet (the boot CPU fills each AP's slots in
+/// `smp::start` before the AP loads this IDT, so every CPU taking these
+/// vectors has them).
 pub(super) unsafe fn use_ist_stacks() {
     // An empty slot would make the CPU switch to address 0: check them all
     // before switching any gate.

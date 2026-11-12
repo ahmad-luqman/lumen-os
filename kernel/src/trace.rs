@@ -75,11 +75,11 @@ pub enum BootPhase {
     /// Allocated kernel and IST stacks.
     Stacks = 6,
     Acpi = 7,
-    /// Interrupt controllers.
+    /// Interrupt controllers, then the other CPUs started (`smp::start_all`).
     Interrupts = 8,
     /// TSC and timer calibration, interrupts on, the 10 ms first-tick check.
     Time = 9,
-    /// The other CPUs started (`smp`).
+    /// The wait until the other CPUs are online (`smp::wait_online`).
     Smp = 10,
     Framebuffer = 11,
     Complete = 12,
