@@ -4,8 +4,8 @@
 //! (for the test harness and `make run` logs) and to the screen, and contains
 //! the exception, decoded error code, faulting address, registers and a
 //! symbolized frame-pointer backtrace; on serial only, it then gives the last
-//! 16 trace events (what led up to it) and, for a page fault, the page-table
-//! walk of the faulting address.
+//! 16 trace events (what led up to it), the heap's state and, for a page
+//! fault, the page-table walk of the faulting address.
 //!
 //! The reporter must not make things worse: it takes no locks it could
 //! deadlock on, follows a frame pointer only if it points into a known stack
@@ -32,8 +32,8 @@ const MAX_FRAMES: usize = 32;
 const RECENT_TRACE_EVENTS: u64 = 16;
 
 static CRASHING: AtomicBool = AtomicBool::new(false);
-/// Set while the serial-only tail (the page walk) is being written: a fault
-/// there still ends the report properly.
+/// Set while the serial-only tail (heap state, page walk) is being written: a
+/// fault there still ends the report properly.
 static IN_TAIL: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" {
@@ -88,7 +88,10 @@ fn enter(vector: u64, rip: u64) {
         if IN_TAIL.load(Ordering::SeqCst) {
             // Everything but the tail is out: say what happened and close the
             // report so it still parses.
-            let _ = writeln!(s, "\n!!! fault while writing the page walk (vector {vector:#x}, rip {rip:#018x})");
+            let _ = writeln!(
+                s,
+                "\n!!! fault while writing the heap state or page walk (vector {vector:#x}, rip {rip:#018x})"
+            );
             let _ = writeln!(s, "{END_MARKER}");
             finish();
         }
@@ -97,8 +100,8 @@ fn enter(vector: u64, rip: u64) {
     }
 }
 
-/// Write the report: `body` to serial and the screen; the trace events and
-/// then `tail` (the riskiest part, last) to serial only.
+/// Write the report: `body` to serial and the screen; the trace events, the
+/// heap's state and then `tail` (the riskiest parts, last) to serial only.
 fn emit(body: &dyn Fn(&mut dyn Write), tail: &dyn Fn(&mut dyn Write)) {
     let mut s = SerialWriter;
     let _ = writeln!(s, "\n{BEGIN_MARKER}");
@@ -113,6 +116,9 @@ fn emit(body: &dyn Fn(&mut dyn Write), tail: &dyn Fn(&mut dyn Write)) {
     // If the tail faults, `enter` closes the report (the screen copy is then
     // lost; serial has everything else).
     IN_TAIL.store(true, Ordering::SeqCst);
+    // Doesn't block: says so if the heap's lock is held. The free-list walk
+    // is bounded and stays inside the heap, even if the list is corrupt.
+    let _ = crate::mm::heap::write_crash_stats(&mut s);
     tail(&mut s);
     IN_TAIL.store(false, Ordering::SeqCst);
     let _ = writeln!(s, "{END_MARKER}");

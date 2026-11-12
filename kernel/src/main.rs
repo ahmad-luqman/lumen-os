@@ -5,11 +5,13 @@
 //! 2. `arch::init_early`: serial, GDT/TSS (IST stacks), IDT. From here on any
 //!    CPU exception produces a crash report.
 //! 3. Logger, Limine responses, symbol table, memory map, frame allocator and
-//!    the kernel's own page tables (`mm::init`), framebuffer.
+//!    the kernel's own page tables and the heap (`mm::init`), framebuffer.
 //! 4. Either the in-kernel tests (`--features ktest`) or the kernel monitor.
 
 #![no_std]
 #![no_main]
+
+extern crate alloc;
 
 mod arch;
 mod boot;

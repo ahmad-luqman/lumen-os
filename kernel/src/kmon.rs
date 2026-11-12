@@ -60,8 +60,9 @@ fn dispatch(line: &str) {
                 out,
                 "commands:\n  help              this list\n  echo <text>       print text\n  \
                  int3              take a breakpoint and continue\n  \
-                 crash <kind>      deliberate fault: pf ud de gp df wtext nx panic\n  \
+                 crash <kind>      deliberate fault: pf ud de gp df wtext nx panic oom dfree\n  \
                  trace [n]         the last n trace events (default 16)\n  \
+                 heap              heap usage and free-list summary\n  \
                  exit              end QEMU (only with lumen.qemu_exit)"
             );
         }
@@ -84,6 +85,9 @@ fn dispatch(line: &str) {
                 }
             },
         },
+        "heap" => {
+            let _ = crate::mm::heap::write_stats(&mut out);
+        }
         "exit" => {
             if crate::cmdline::qemu_exit_enabled() {
                 arch::qemu::exit(arch::qemu::ExitCode::Success);
@@ -117,8 +121,13 @@ fn crash(kind: &str) {
         "wtext" => crash_write_text(),
         "nx" => crash_execute_data(),
         "panic" => crash_panic(),
+        "oom" => crash_out_of_memory(),
+        "dfree" => crash_double_free(),
         _ => {
-            let _ = writeln!(serial::SerialWriter, "crash: unknown kind '{kind}' (pf ud de gp df wtext nx panic)");
+            let _ = writeln!(
+                serial::SerialWriter,
+                "crash: unknown kind '{kind}' (pf ud de gp df wtext nx panic oom dfree)"
+            );
         }
     }
 }
@@ -192,4 +201,40 @@ fn crash_execute_data() {
 #[inline(never)]
 fn crash_panic() {
     panic!("deliberate panic from kmon");
+}
+
+/// Ask the heap for more than its window holds (2 TiB) and treat the null
+/// like any infallible allocation does: `handle_alloc_error` panics.
+/// (`black_box` keeps LLVM from deleting an allocation whose pointer is
+/// unused, and with it the null check: it may assume such allocations
+/// succeed.)
+#[inline(never)]
+fn crash_out_of_memory() {
+    let layout = core::alloc::Layout::from_size_align(1 << 41, 16).expect("valid layout");
+    // SAFETY: the layout has a non-zero size.
+    let p = core::hint::black_box(unsafe { alloc::alloc::alloc(layout) });
+    if p.is_null() {
+        alloc::alloc::handle_alloc_error(layout);
+    }
+    let _ = writeln!(serial::SerialWriter, "crash: a 2 TiB allocation succeeded (heap limit broken)");
+}
+
+/// Free the same block twice: the heap must refuse the second free (a
+/// panic), not corrupt its free list. (`black_box`: see
+/// [`crash_out_of_memory`]; LLVM may delete the whole sequence otherwise.)
+#[inline(never)]
+fn crash_double_free() {
+    use core::hint::black_box;
+    let layout = core::alloc::Layout::from_size_align(64, 16).expect("valid layout");
+    // SAFETY: deliberately misusing the allocator: the second `dealloc` is
+    // a double free, which the heap detects before touching memory.
+    unsafe {
+        let p = black_box(alloc::alloc::alloc(layout));
+        if p.is_null() {
+            alloc::alloc::handle_alloc_error(layout);
+        }
+        alloc::alloc::dealloc(black_box(p), layout);
+        alloc::alloc::dealloc(black_box(p), layout);
+    }
+    let _ = writeln!(serial::SerialWriter, "crash: a double free went unnoticed");
 }

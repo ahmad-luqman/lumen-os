@@ -1,0 +1,9 @@
+[package]
+name = "lumen-heap"
+description = "no_std kernel heap allocator logic (address-ordered free list with coalescing) for the Lumen kernel, host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

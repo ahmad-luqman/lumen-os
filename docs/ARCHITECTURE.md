@@ -96,7 +96,7 @@ Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 |---|---|---|
 | `0x0000_0000_0000_0000 – 0x0000_7fff_ffff_ffff` | empty in the kernel's tables (null guard); user space, per process, from M2 (except the first 64 KiB) | built (empty) |
 | `0xffff_8000_0000_0000 – +phys size` | higher-half direct map (HHDM) of RAM: usable, bootloader-reclaimable, kernel-and-modules and framebuffer entries; NX, RW- except kernel-and-modules (R--), framebuffer write-combining | built |
-| `0xffff_c000_0000_0000 – 0xffff_c0ff_ffff_ffff` | kernel heap (grows by mapping frames) | M1 (#5) |
+| `0xffff_c000_0000_0000 – 0xffff_c0ff_ffff_ffff` | kernel heap (grows up by mapping frames, to 1 GiB below the top; the top GiB holds a ktest scratch page) | built |
 | `0xffff_d000_0000_0000 – 0xffff_d0ff_ffff_ffff` | kernel stacks: 64 KiB each, **unmapped guard page below every stack** | M1 (#6) |
 | `0xffff_e000_0000_0000 – 0xffff_e0ff_ffff_ffff` | MMIO mappings (uncached, RW-), `map_mmio` | built |
 | `0xffff_ffff_8000_0000 – end of image` | kernel image: `.text` R-X, `.rodata` (and `.got`) R--, `.data/.bss` RW-, page-aligned segments | built |
@@ -225,6 +225,35 @@ Limine; 64 KiB assumed if it doesn't confirm) and the three 16 KiB IST stacks
 are static and have no guard pages. Guard pages need the frame allocator and
 our own page tables (#4); #6 replaces them (hard rule 4).
 
+### Kernel heap (built in M1)
+
+`kernel/src/mm/heap.rs` is the `#[global_allocator]`; the algorithm is the
+host-tested `crates/lumen-heap`. One contiguous span grows up from the
+heap window's base: when no free block fits, the heap maps fresh frames at
+its end (at least 64 KiB at a time, read-write, no-execute, write-back,
+through `paging::map`) and appends them. Growing is all or nothing: if
+frames or page tables run out part way, every page mapped so far is
+unmapped and its frame freed (the tables created stay; tables are never
+freed). The heap never shrinks and stops 1 GiB below the top of the window.
+
+Free memory is a singly linked list of blocks in address order; each free
+block stores its size and the next block's offset in its first 16 bytes.
+Allocated blocks have no header, since `GlobalAlloc::dealloc` gets the same
+`Layout` as `alloc` and both round it to the same block size (a multiple of
+16 bytes). Allocation is first fit; padding in front of an aligned block and
+the tail stay free. `dealloc` merges with both neighbours, so no two free
+blocks touch, and refuses a block outside the heap, misaligned, or
+overlapping free memory (a double free or a wrong `Layout`) without changing
+anything; the kernel then panics. Both operations walk the list (O(free
+blocks)); size classes for small objects can go in front of it later.
+
+When growing fails the allocation returns null: `try_reserve` callers see
+an error, and everything else reaches `alloc`'s default error handler,
+which panics (`#[alloc_error_handler]` is unstable). Either way the crash
+report shows the heap's state, including why the last growth failed. kmon's
+`heap` command prints the same line. Lock order: heap, page tables, frame
+allocator; nothing holding the last two may allocate.
+
 ## 6. Interrupts, exceptions and crash reports (built)
 
 - One assembler `.rept` loop generates 256 entry stubs, each 16 bytes apart.
@@ -236,8 +265,10 @@ our own page tables (#4); #6 replaces them (hard rule 4).
 - #DF, NMI and #MC run on IST stacks, so a corrupted kernel stack still yields
   a report.
 - **Crash report:** exception name and vector, decoded #PF error code and CR2,
-  rip with symbol, all registers, CR0/3/4, a frame-pointer backtrace and, for
-  a #PF, the page-table walk of CR2 (serial). It is
+  rip with symbol, all registers, CR0/3/4, a frame-pointer backtrace, then on
+  serial only the last trace events, one line of heap state (never blocks: it
+  says so if the heap's lock is held; the free-list walk is bounded) and, for
+  a #PF, the page-table walk of CR2. It is
   written to serial and to the screen. Frame pointers are forced on
   (`-C force-frame-pointers=yes`); the walker follows `rbp` only inside known
   stacks and only to return addresses inside kernel `.text`, so a corrupted
@@ -537,9 +568,9 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
   src/kmon.rs      serial debug monitor (until the M2 shell)
-  src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs)
+  src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs)
   linker.ld        layout at -2 GiB, .ktests section
-crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, ...)
+crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, ...)
 boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml

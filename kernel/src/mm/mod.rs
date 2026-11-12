@@ -1,9 +1,10 @@
-//! Memory management: the physical frame allocator ([`frame`]) and the
-//! kernel's page tables ([`paging`]); the heap (#5) will join them. Physical
+//! Memory management: the physical frame allocator ([`frame`]), the
+//! kernel's page tables ([`paging`]) and the kernel heap ([`heap`]). Physical
 //! memory is reached through the higher-half direct map (HHDM), which Limine
 //! sets up and [`paging`] rebuilds at the same address.
 
 pub mod frame;
+pub mod heap;
 pub mod paging;
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -15,13 +16,14 @@ use crate::{arch, boot};
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 /// Set up memory management from the bootloader's responses: the frame
-/// allocator (built while Limine's page tables are active), then the
-/// kernel's own page tables.
+/// allocator (built while Limine's page tables are active), the kernel's
+/// own page tables, then the heap (from here on `alloc` works).
 pub fn init() {
     let hhdm = boot::HHDM.get_response().expect("Limine gave no HHDM response").offset();
     HHDM_OFFSET.store(hhdm, Ordering::Relaxed);
     frame::init(hhdm);
     paging::init();
+    heap::init();
 }
 
 /// The HHDM offset, or 0 before [`init`] stores it (its first step).

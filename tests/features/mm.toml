@@ -36,3 +36,18 @@ tests = [
     "scenario:test_mm::test_nx_data_crashes_cleanly",
     "scenario:test_crash::test_page_fault_report_names_address_and_cause",
 ]
+
+[[feature]]
+name = "Kernel heap with working free (GlobalAlloc): reuse, coalescing, growth in the heap window with rollback; OOM and bad frees end in a crash report showing the heap"
+milestone = "M1"
+tests = [
+    "cargo:lumen-heap",
+    "ktest:lumen_kernel::mm::heap::reuse_after_free",
+    "ktest:lumen_kernel::mm::heap::fragmentation_stress",
+    "ktest:lumen_kernel::mm::heap::vec_and_box_work",
+    "ktest:lumen_kernel::mm::heap::growth_failure_rolls_back",
+    "ktest:lumen_kernel::mm::paging::hhdm_maps_exactly_the_hhdm_types",
+    "scenario:test_mm::test_kmon_heap_reports_usage",
+    "scenario:test_mm::test_out_of_memory_report_shows_the_heap",
+    "scenario:test_mm::test_double_free_is_refused",
+]

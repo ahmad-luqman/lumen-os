@@ -52,8 +52,12 @@ pub const HHDM_TYPES: [EntryType; 4] =
 const KERNEL_BASE: u64 = 0xffff_ffff_8000_0000;
 /// One TiB: the size of the heap, stack and MMIO windows.
 const WINDOW: u64 = 1 << 40;
-/// Kernel heap (#5) and kernel stacks (#6): where [`map`] and [`unmap`] work.
-const HEAP_BASE: u64 = 0xffff_c000_0000_0000;
+/// Kernel heap ([`super::heap`]) and kernel stacks (#6): where [`map`] and
+/// [`unmap`] work.
+pub const HEAP_BASE: u64 = 0xffff_c000_0000_0000;
+/// The heap grows up from [`HEAP_BASE`] and stops below this. The top GiB of
+/// the window is left for the paging ktests' scratch page.
+pub const HEAP_LIMIT: u64 = HEAP_BASE + WINDOW - (1 << 30);
 const STACKS_BASE: u64 = 0xffff_d000_0000_0000;
 /// Device mappings: [`map_mmio`] hands out addresses from here.
 const MMIO_BASE: u64 = 0xffff_e000_0000_0000;
@@ -403,7 +407,6 @@ fn in_window(virt: VirtAddr) -> bool {
 /// at `virt`: nothing else may use either while the mapping exists. The
 /// checks catch frames nobody allocated, but not someone else's frame (a
 /// page table, say).
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: heap (#5), stacks (#6)
 pub unsafe fn map(virt: VirtAddr, frame: PhysFrame, attrs: Attrs) -> Result<(), VmError> {
     if !in_window(virt) {
         return Err(VmError::OutsideWindow(virt));
@@ -431,7 +434,6 @@ pub unsafe fn map(virt: VirtAddr, frame: PhysFrame, attrs: Attrs) -> Result<(), 
 /// The caller owns the page at `virt` and nothing refers to memory through
 /// it any more (a reference into it would afterwards fault, or, once the
 /// page is mapped again, read someone else's memory).
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: heap (#5), stacks (#6)
 pub unsafe fn unmap(virt: VirtAddr) -> Result<Mapping, VmError> {
     if !in_window(virt) {
         return Err(VmError::OutsideWindow(virt));
@@ -568,9 +570,9 @@ fn write_walk_from(w: &mut dyn Write, root: PhysFrame, v: VirtAddr) -> fmt::Resu
 mod checks {
     pub use super::*;
 
-    /// A virtual page nothing maps, near the top of the kernel heap window
-    /// (#5 will own the window; the tests unmap what they map).
-    pub const SCRATCH: u64 = HEAP_BASE + WINDOW - 2 * FRAME_SIZE;
+    /// A virtual page nothing maps: in the heap window, but above where the
+    /// heap may grow (the tests unmap what they map).
+    pub const SCRATCH: u64 = HEAP_LIMIT;
 
     pub fn v(a: u64) -> VirtAddr {
         VirtAddr::new(a).expect("canonical")
@@ -831,14 +833,21 @@ crate::ktest!(
 crate::ktest!(
     fn hhdm_maps_exactly_the_hhdm_types() {
         // Every mapping is the HHDM (inside an HHDM span, at phys == virt -
-        // hhdm), the kernel image or the MMIO window. Each span is mapped
-        // throughout (every 2 MiB step and its last page) with its own
-        // rights and memory type. ACPI and reserved memory are not mapped
-        // (spot check: each entry's first and last whole page).
+        // hhdm), the kernel image, the MMIO window or the heap's mapped span
+        // (4 KiB pages, read-write, no-execute, write-back, allocated
+        // frames). Each HHDM span is mapped throughout (every 2 MiB step and
+        // its last page) with its own rights and memory type. ACPI and
+        // reserved memory are not mapped (spot check: each entry's first and
+        // last whole page).
         use self::checks::*;
         use crate::{kassert, kassert_eq};
         let hhdm = crate::mm::hhdm_offset();
         let (kstart, klen) = crate::mm::kernel_image();
+        // Keep a block live so the heap has pages mapped, whichever tests
+        // ran before this one.
+        let keep = alloc::vec![0u8; 1];
+        let (heap_start, heap_end) = crate::mm::heap::mapped();
+        kassert!(heap_end > heap_start);
         let (mut big, mut stray) = (0usize, None);
         let swept = for_each_active_mapping(|m| {
             let (lo, size) = (m.virt.as_u64(), m.size.bytes());
@@ -847,11 +856,18 @@ crate::ktest!(
             let in_hhdm = lo.checked_sub(hhdm).is_some_and(|p| {
                 p == m.phys.as_u64() && !m.executable && hhdm_spans().any(|(s, e, _)| s <= p && p + size <= e)
             });
+            let in_heap = (heap_start..heap_end).contains(&lo)
+                && m.size == PageSize::Size4K
+                && m.writable
+                && !m.executable
+                && m.cache() == Some(Cache::WriteBack)
+                && frame::is_allocated(m.phys);
             big += usize::from(in_hhdm && m.size == PageSize::Size2M);
-            if !in_hhdm && !in_image && !in_mmio {
+            if !in_hhdm && !in_image && !in_mmio && !in_heap {
                 stray.get_or_insert(m);
             }
         });
+        drop(keep);
         kassert_eq!(swept, Ok(()));
         kassert_eq!(stray, None);
         kassert!(big > 0); // 2 MiB pages are used where they fit

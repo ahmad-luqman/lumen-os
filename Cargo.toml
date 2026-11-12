@@ -13,6 +13,7 @@ repository = "https://github.com/ahmad-luqman/lumen-os"
 
 [workspace.dependencies]
 lumen-elf = { path = "crates/lumen-elf" }
+lumen-heap = { path = "crates/lumen-heap" }
 lumen-mm = { path = "crates/lumen-mm" }
 lumen-trace = { path = "crates/lumen-trace" }
 # 0.6.x needs nightly (#![feature(ptr_metadata)]); 0.5.0 is the newest stable-compatible release.

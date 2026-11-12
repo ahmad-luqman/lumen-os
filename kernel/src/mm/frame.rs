@@ -333,6 +333,10 @@ pub fn bitmap() -> Option<PhysRange> {
     STATE.lock().as_ref().and_then(|s| s.reserved.get(BITMAP))
 }
 
+/// How many frames are free (for the heap's tests).
+#[cfg(feature = "ktest")]
+pub use checks::free_frames;
+
 #[cfg(feature = "ktest")]
 mod checks {
     //! Helpers for the in-kernel tests below.
