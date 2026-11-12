@@ -28,8 +28,9 @@
 //! under the logger's lock), and formats nothing while holding its lock.
 //! Panics in the allocator's own paths happen after the lock is released,
 //! except inside the heap itself (a corrupt list, a failed rollback); the
-//! crash line then says it read the heap under the lock. Not for interrupt
-//! handlers yet: the lock is not IRQ-safe until #7.
+//! crash line then says it read the heap under the lock. Interrupt
+//! handlers may allocate: the lock keeps interrupts off while held, so a
+//! handler never spins on a lock the code it interrupted holds (one CPU).
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::fmt::{self, Write};
@@ -137,8 +138,9 @@ struct KernelAllocator;
 
 // SAFETY: `Heap` hands out disjoint blocks of at least the requested size
 // and alignment, inside memory mapped read-write for the heap alone. The
-// lock serializes every access (interrupts are off until #7 makes
-// `SpinLock` IRQ-safe), and panics abort, so nothing unwinds out of here.
+// lock serializes every access (it keeps interrupts off while held, so no
+// handler can re-enter the heap meanwhile), and panics abort, so nothing
+// unwinds out of here.
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut state = STATE.lock();
@@ -312,7 +314,7 @@ pub fn write_stats(w: &mut dyn Write) -> fmt::Result {
 ///
 /// # Safety
 /// Nothing may use the heap while this runs: call it from the crash reporter
-/// (one CPU, interrupts off until #7, and it halts next, so the interrupted
+/// (one CPU, interrupts off for good, and it halts next, so the interrupted
 /// lock holder never resumes), or from a test that holds the lock and
 /// doesn't use the heap meanwhile.
 pub unsafe fn write_crash_stats(w: &mut dyn Write) -> fmt::Result {

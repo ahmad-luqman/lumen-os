@@ -211,8 +211,33 @@ pub fn our_base() -> u64 {
     &raw const IDT as u64
 }
 
-/// Breakpoints (`int3`) taken so far. #BP is the only non-fatal exception in M0.
+/// Breakpoints (`int3`) taken so far. #BP is the only non-fatal exception.
 pub static BREAKPOINTS: AtomicU64 = AtomicU64::new(0);
+
+// The vector map. 0-31 are the CPU's exceptions.
+/// `PIC_BASE..PIC_BASE + 16`: the 8259s, remapped and masked; only a spurious
+/// IRQ 7 or 15 can arrive here.
+pub const PIC_BASE: u8 = 0x20;
+/// The local APIC timer.
+pub const TIMER: u8 = 0x40;
+/// `IOAPIC_BASE + n`: global system interrupt `n`, once a driver routes it
+/// (every I/O APIC input is masked until then).
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: device drivers (M3)
+pub const IOAPIC_BASE: u8 = 0x50;
+/// Local APIC errors.
+pub const LAPIC_ERROR: u8 = 0xfe;
+/// The local APIC's spurious vector (needs no EOI).
+pub const SPURIOUS: u8 = 0xff;
+
+/// Local APIC timer interrupts taken.
+pub static TICKS: AtomicU64 = AtomicU64::new(0);
+/// Spurious interrupts (local APIC or 8259) taken.
+pub static SPURIOUS_IRQS: AtomicU64 = AtomicU64::new(0);
+/// Interrupts on vectors nothing handles, taken (each vector warned about
+/// once).
+pub static UNEXPECTED_IRQS: AtomicU64 = AtomicU64::new(0);
+/// Which vectors have been warned about, a bit each.
+static WARNED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Human-readable names for the architectural exception vectors.
 pub fn exception_name(vector: u64) -> &'static str {
@@ -245,15 +270,52 @@ pub fn exception_name(vector: u64) -> &'static str {
     }
 }
 
-/// Called by `lumen_isr_common` for every vector.
+/// Called by `lumen_isr_common` for every vector. CPU exceptions are fatal
+/// (bar #BP) and traced; device interrupts are not. The timer and spurious
+/// interrupts are only counted (at 1 kHz they would flood the trace ring),
+/// anything else is traced, counted and warned about once per vector.
+/// Interrupts are off throughout (every gate is an interrupt gate).
 #[unsafe(no_mangle)]
 extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
-    crate::ktrace!(crate::trace::Kind::Exception, frame.vector, frame.rip, frame.error_code);
-    match frame.vector {
-        3 => {
+    let vector = frame.vector;
+    if vector < 32 {
+        crate::ktrace!(crate::trace::Kind::Exception, vector, frame.rip, frame.error_code);
+        if vector == 3 {
             BREAKPOINTS.fetch_add(1, Ordering::Relaxed);
             log::debug!(target: "idt", "breakpoint at {:#x}", frame.rip);
+            return;
         }
-        _ => crate::crash::exception(frame),
+        crate::crash::exception(frame);
+    }
+    match vector as u8 {
+        TIMER => {
+            TICKS.fetch_add(1, Ordering::Relaxed);
+            super::apic::eoi();
+        }
+        SPURIOUS => {
+            SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);
+        }
+        v if (PIC_BASE..PIC_BASE + 16).contains(&v) => {
+            // A masked 8259 only raises spurious IRQs 7 and 15; the master
+            // counts a slave's spurious IRQ 15 as real and needs its EOI.
+            SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);
+            if v == PIC_BASE + 15 {
+                super::pic::eoi_master();
+            }
+        }
+        LAPIC_ERROR => {
+            let status = super::apic::error_status();
+            log::warn!(target: "irq", "local APIC error, status {status:#x}");
+            super::apic::eoi();
+        }
+        v => {
+            crate::ktrace!(crate::trace::Kind::Exception, vector, frame.rip, 0);
+            UNEXPECTED_IRQS.fetch_add(1, Ordering::Relaxed);
+            let (word, bit) = (usize::from(v / 64), 1u64 << (v % 64));
+            if WARNED[word].fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                log::warn!(target: "irq", "unexpected interrupt on vector {v:#x} (rip {:#x}); ignored", frame.rip);
+            }
+            super::apic::eoi();
+        }
     }
 }

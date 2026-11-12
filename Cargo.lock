@@ -45,6 +45,7 @@ dependencies = [
  "lumen-elf",
  "lumen-heap",
  "lumen-mm",
+ "lumen-time",
  "lumen-trace",
  "noto-sans-mono-bitmap",
  "rustc-demangle",

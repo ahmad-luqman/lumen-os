@@ -4,11 +4,14 @@
 //! kernel uses only what [`crate::arch`] re-exports, which is the start of the
 //! hardware abstraction layer the ARM64 port (M10) will implement.
 
+pub mod apic;
 pub mod cpu;
 pub mod gdt;
 pub mod idt;
 pub mod irq;
 pub mod paging;
+pub mod pic;
+pub mod pit;
 pub mod port;
 pub mod qemu;
 pub mod serial;

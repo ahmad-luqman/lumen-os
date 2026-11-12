@@ -68,7 +68,6 @@ static DISCOVERY: SpinLock<Discovery> = SpinLock::new(Discovery::NotYet);
 
 /// What ACPI described, or `None` if the firmware gave nothing usable.
 /// Panics before [`init`] (a boot-order bug, not missing ACPI).
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: the APIC timer (#7), SMP (#9)
 pub fn info() -> Option<&'static Info> {
     match *DISCOVERY.lock() {
         Discovery::NotYet => panic!("acpi::info called before acpi::init"),

@@ -163,6 +163,10 @@ fn emit(body: &dyn Fn(&mut dyn Write), tail: &dyn Fn(&mut dyn Write)) {
     // heap never resumes.
     let _ = unsafe { crate::mm::heap::write_crash_stats(&mut s) };
     IN_TAIL.store(false, Ordering::SeqCst);
+    // Every lock taken while reporting has been released by now: interrupts
+    // must still be off (`disable_for_good`).
+    let state = if arch::irq::enabled() { "on (the crash path turned them back on)" } else { "off" };
+    let _ = writeln!(s, "interrupts: {state}");
     let _ = writeln!(s, "{END_MARKER}");
     // Serial first: if drawing the screen faults, the serial report survives.
     // SAFETY: we are on the crash path; CRASHING guarantees we run alone.

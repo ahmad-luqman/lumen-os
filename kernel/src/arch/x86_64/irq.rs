@@ -67,7 +67,6 @@ pub fn depth() -> usize {
 
 /// Turn interrupts on, outside any critical section (boot, once everything
 /// that handles them is set up).
-#[allow(dead_code)] // TEMP: kmain enables interrupts later in this PR
 pub fn enable() {
     assert_eq!(depth(), 0, "enabling interrupts inside a critical section");
     assert!(!FOR_GOOD.load(Ordering::Relaxed), "enabling interrupts after disable_for_good");

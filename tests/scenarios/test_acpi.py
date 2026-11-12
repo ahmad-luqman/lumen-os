@@ -13,6 +13,7 @@ fails if all listed CPUs are counted.
 import re
 
 import pytest
+from test_time import assert_close, clocks
 
 BOOT_TIMEOUT = 60
 ACPI_LINE = re.compile(
@@ -43,12 +44,25 @@ def test_no_hpet_is_a_warning(boot):
     m.expect(r"WARN  acpi: no usable HPET: no HPET table\n", BOOT_TIMEOUT)
     line = m.expect(ACPI_LINE, BOOT_TIMEOUT)
     assert line[0] == f"INFO  acpi: 1 CPU, LAPIC at {LAPIC:#x}, no HPET\n"
+    # Timekeeping falls back to the PIT, and gets the TSC right: measured
+    # again against the PIT, within 2%.
+    m.expect(r"INFO  time: tsc .* \(calibrated against pit\)\n", BOOT_TIMEOUT)
     m.expect(r"INFO  boot: boot complete", BOOT_TIMEOUT)
+    m.expect(r"kmon> ", BOOT_TIMEOUT)
+    tsc, reference, pit, hpet = clocks(m)
+    assert (reference, hpet) == ("pit", None)
+    assert pit is not None
+    assert_close(tsc, pit)
 
 
 def test_no_madt_boots_without_acpi(boot):
     # `acpi=off` leaves OVMF's RSDP and root table but no MADT.
     m = boot("qemutest", extra=["-machine", "q35,acpi=off"])
     m.expect(r"WARN  acpi: running without ACPI: no APIC table\n", BOOT_TIMEOUT)
+    # The local APIC is found without ACPI, and timekeeping falls back to
+    # the PIT (the HPET is only known from ACPI).
+    m.expect(r"WARN  irq: no I/O APIC known: device interrupts can't be routed\n", BOOT_TIMEOUT)
+    m.expect(r"INFO  time: tsc .* \(calibrated against pit\)\n", BOOT_TIMEOUT)
+    m.expect(r"INFO  irq: interrupts on\n", BOOT_TIMEOUT)
     m.expect(r"INFO  boot: boot complete", BOOT_TIMEOUT)
     assert not ACPI_LINE.search(m.output)

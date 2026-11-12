@@ -86,8 +86,13 @@ tests (for example `lumen-elf`, the symbol-table reader).
 6. Kernel stacks from the allocator, each with a guard page: the three IST
    stacks are installed, then `kmain` switches from Limine's boot stack to
    the 128 KiB main stack (`INFO  mem: stacks: ...`) and continues in
-   `kmain_on_kernel_stack`: ACPI discovery (below), the framebuffer hello
-   screen, then `boot complete`.
+   `kmain_on_kernel_stack`: ACPI discovery (below); the interrupt
+   controllers (the 8259s remapped and masked, the local APIC enabled, every
+   I/O APIC input masked; `INFO  irq: local APIC ...`); the TSC calibrated
+   against the HPET, or the PIT without one (`INFO  time: tsc 2.9 GHz
+   (calibrated against hpet)`), and the local APIC timer against the TSC,
+   started at 1 kHz; interrupts on (`INFO  irq: interrupts on`); the
+   framebuffer hello screen, then `boot complete`.
 7. Either the in-kernel test runner (`--features ktest`) or the kernel monitor
    (`kmon`, a serial debug console that the user-mode shell replaces in M2).
 
@@ -389,8 +394,9 @@ state, including the last failed growth (size, alignment, reason); kmon's
 `heap` command prints the same line. Lock order: heap, page tables, frame
 allocator; nothing holding the last two may allocate. The allocator never
 logs (a log argument that allocates would re-enter it under the logger's
-lock) and formats its kmon and crash line from a copy taken under the lock. The lock is not IRQ-safe until #7, so interrupt
-handlers must not allocate yet.
+lock) and formats its kmon and crash line from a copy taken under the
+lock. Like every `SpinLock`, it keeps interrupts off while held, so an
+interrupt handler may allocate.
 
 ## 6. Interrupts, exceptions and crash reports (built)
 
@@ -398,8 +404,38 @@ handlers must not allocate yet.
   Stubs push a dummy error code where the CPU does not, then the vector, then
   jump to `lumen_isr_common`, which saves all 15 GPRs into a `TrapFrame` and
   calls `lumen_exception_dispatch`.
-- `#BP` is counted and resumes (a ktest proves registers survive the round
-  trip). Every other vector is fatal in M0 and goes to `crash::exception`.
+- **Vector map** (`arch/x86_64/idt.rs`): 0-31 CPU exceptions; 0x20-0x2f the
+  8259 PICs, remapped there and masked (only a spurious IRQ 7 or 15
+  arrives); 0x40 the local APIC timer; 0x50 + n global system interrupt n,
+  once a driver routes it (every I/O APIC input is masked until then); 0xfe
+  local APIC errors; 0xff the local APIC's spurious vector.
+- **Dispatch:** `#BP` is counted and resumes (a ktest proves registers
+  survive the round trip); every other exception is fatal and goes to
+  `crash::exception`. Exceptions are traced; device interrupts are not
+  fatal. The timer counts a tick (`time::ticks`) and sends the local APIC an
+  EOI; spurious interrupts are counted and get no EOI (a spurious IRQ 15
+  gets one at the master 8259); an interrupt nothing handles is traced,
+  counted, warned about once per vector, and EOI'd. Timer and spurious
+  interrupts are not traced: at 1 kHz they would flood the ring.
+- **Interrupt state:** interrupts are off through boot and turned on once
+  the controllers and the timer are set up. Every gate is an interrupt gate
+  (handlers run with interrupts off). `SpinLock` keeps them off while held
+  (`arch::irq::push_off`/`pop_off`, nested by depth, so guards dropped in any
+  order never turn them on early), so a handler never spins on a lock the
+  code it interrupted holds, and may log or allocate. The crash path turns
+  them off for good before anything else; no guard turns them back on.
+- **Time** (`time.rs`, arithmetic in `crates/lumen-time`): the TSC's
+  frequency is the median of five 10 ms windows against the HPET (the PIT's
+  channel 2, polled, without one), measured with interrupts off. The local
+  APIC timer (divide by 16) is calibrated against the TSC the same way and
+  set periodic at 1 kHz. `time::now_ns` (TSC-based, lock-free) and
+  `time::sleep` (busy-wait until the scheduler, M2). kmon has `ticks`,
+  `sleep <ms>`, `uptime`, and `clocks` (the TSC measured again against the
+  PIT and the HPET, which the tests compare with the boot calibration: a
+  wrong calibration would cancel out in tick counts, since the timer is
+  calibrated against the TSC). Under QEMU's TCG a busy guest gets about 2/3 of
+  its ticks (late periodic timers skip periods); tests bound tick counts
+  loosely and never assert on host time.
 - #DF, NMI and #MC run on their own guarded IST stacks (from step 6 of the
   boot, before that on the boot stack), so a corrupted or overflowed kernel
   stack still yields a report; an overflow is named as one (section 5,
@@ -407,9 +443,11 @@ handlers must not allocate yet.
 - **Crash report:** exception name and vector, decoded #PF error code and CR2,
   rip with symbol, all registers, CR0/3/4, a frame-pointer backtrace, then on
   serial only the last trace events, for a #PF the page-table walk of CR2,
-  and last one line of heap state (never blocks: if the heap's lock is held
-  it reads the state anyway and says so; the free-list walk is bounded and
-  stays inside the heap). It is
+  one line of heap state (never blocks: if the heap's lock is held it reads
+  the state anyway and says so; the free-list walk is bounded and stays
+  inside the heap), and last `interrupts: off` (the crash path turns them
+  off for good first; the line says so if anything turned them back on). It
+  is
   written to serial and to the screen. Frame pointers are forced on
   (`-C force-frame-pointers=yes`); the walker follows `rbp` only inside known
   stacks and only to return addresses inside kernel `.text`, so a corrupted
@@ -704,15 +742,17 @@ TCG before uploading.
 
 ```
 kernel/            the kernel (bin crate, x86_64-unknown-none)
-  src/arch/        HAL; x86_64/ has gdt, idt, serial, stacks (registry), cpu, qemu, paging
+  src/arch/        HAL; x86_64/ has gdt, idt, irq, apic, pic, pit, serial, stacks (registry), cpu, qemu, paging
   src/acpi.rs      ACPI discovery (MADT, HPET) through lumen-acpi
+  src/interrupts.rs interrupt controllers: 8259s masked, local APIC, I/O APICs
+  src/time.rs      TSC and local APIC timer calibration, now_ns, sleep, ticks
   src/boot.rs      Limine requests
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
   src/kmon.rs      serial debug monitor (until the M2 shell)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
-crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, ...)
+crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-time, ...)
 boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml

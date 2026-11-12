@@ -21,6 +21,7 @@ lumen-acpi.workspace = true
 lumen-elf.workspace = true
 lumen-heap.workspace = true
 lumen-mm.workspace = true
+lumen-time.workspace = true
 lumen-trace.workspace = true
 limine.workspace = true
 log.workspace = true
