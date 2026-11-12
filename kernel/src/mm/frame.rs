@@ -313,14 +313,68 @@ pub fn alloc_contiguous(count: usize, align_frames: usize) -> Option<PhysFrame> 
 }
 
 /// Return a frame from [`alloc`] or [`alloc_zeroed`].
-pub fn free(f: PhysFrame) -> Result<(), FreeError> {
+///
+/// # Safety
+/// The caller owns `f` (it allocated it, or was handed it) and nothing uses
+/// it any more; in particular no [`OwnedFrame`] holds it (an owned frame is
+/// what lets `paging::map` be safe).
+pub unsafe fn free(f: PhysFrame) -> Result<(), FreeError> {
     with_frames(|a| a.free(f.as_u64()))
 }
 
 /// Return `count` frames from [`alloc_contiguous`], all or nothing.
+///
+/// # Safety
+/// As for [`free`], for every frame of the run.
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: DMA buffers
-pub fn free_contiguous(first: PhysFrame, count: usize) -> Result<(), FreeError> {
+pub unsafe fn free_contiguous(first: PhysFrame, count: usize) -> Result<(), FreeError> {
     with_frames(|f| f.free_contiguous(first.as_u64(), count))
+}
+
+/// An allocated frame that only its holder may use: move-only, and freed
+/// when dropped. `paging::map` consumes one and `paging::unmap` gives it
+/// back, which is half of what makes `map` safe (the other half is the
+/// window token). Every frame also has an HHDM alias; only `unsafe` code can
+/// reach it.
+#[derive(Debug)]
+#[must_use = "dropping an owned frame frees it"]
+pub struct OwnedFrame(PhysFrame);
+
+impl OwnedFrame {
+    /// The frame (to look at; holding the number grants nothing).
+    pub fn frame(&self) -> PhysFrame {
+        self.0
+    }
+
+    /// Take ownership of `f`.
+    ///
+    /// # Safety
+    /// `f` is an allocated frame that nothing else owns or uses (no other
+    /// `OwnedFrame`, no raw holder that may free it).
+    pub unsafe fn from_raw(f: PhysFrame) -> OwnedFrame {
+        OwnedFrame(f)
+    }
+
+    /// Give up ownership without freeing: the caller now holds `f` raw (for
+    /// `paging::map`, whose mapping holds it until `unmap`).
+    pub fn into_raw(self) -> PhysFrame {
+        let f = self.0;
+        core::mem::forget(self);
+        f
+    }
+}
+
+impl Drop for OwnedFrame {
+    fn drop(&mut self) {
+        // SAFETY: we own the frame and are giving it up.
+        unsafe { free(self.0) }.unwrap_or_else(|e| panic!("mm: freeing owned frame {} failed: {e:?}", self.0));
+    }
+}
+
+/// Allocate one 4 KiB frame as an [`OwnedFrame`] (freed when dropped).
+pub fn alloc_owned() -> Option<OwnedFrame> {
+    // SAFETY: just allocated, so nothing else owns or uses it.
+    alloc().map(|f| unsafe { OwnedFrame::from_raw(f) })
 }
 
 /// Is `f` a frame the allocator has handed out (owned and not free)?
@@ -451,7 +505,11 @@ mod checks {
 
     /// Free any address, including invalid ones, to test the allocator's
     /// checks.
-    pub fn free_raw(addr: u64) -> Result<(), FreeError> {
+    ///
+    /// # Safety
+    /// As for [`free`](super::free), if `addr` is a frame the allocator
+    /// handed out.
+    pub unsafe fn free_raw(addr: u64) -> Result<(), FreeError> {
         with_frames(|a| a.free(addr))
     }
 
@@ -500,7 +558,8 @@ mod checks {
             if let Some(why) = bad_frame(frame, entries, reserved) {
                 crate::ktest::diag(format_args!("frame {frame:#x}: {why}"));
                 chain.failure = Some(why);
-                if let Err(e) = free_raw(frame) {
+                // SAFETY: a frame this test just allocated and no longer uses.
+                if let Err(e) = unsafe { free_raw(frame) } {
                     crate::ktest::diag(format_args!("free({frame:#x}): {e}"));
                 }
                 return chain;
@@ -559,7 +618,8 @@ mod checks {
                 ));
                 problem = Some("an allocated frame was overwritten (handed out twice, or another writer)");
             }
-            match free_raw(head) {
+            // SAFETY: each chained frame was allocated by this test, which is done with it.
+            match unsafe { free_raw(head) } {
                 Ok(()) => freed += 1,
                 Err(e) => {
                     crate::ktest::diag(format_args!("free({head:#x}): {e}"));
@@ -570,7 +630,8 @@ mod checks {
         }
         if problem.is_some() {
             let span = with_state(|s| s.frames.span());
-            let swept = pages(span.start(), span.len()).filter(|&f| ours(f) && free_raw(f).is_ok());
+            // SAFETY: sweeping frames this test allocated (owned and not free), done with them.
+            let swept = pages(span.start(), span.len()).filter(|&f| ours(f) && unsafe { free_raw(f) }.is_ok());
             let swept = swept.count();
             crate::ktest::diag(format_args!("freed {swept} more frames by sweeping the bitmap"));
             freed += swept;
@@ -664,7 +725,8 @@ crate::ktest!(
         kassert_eq!(bad_frame(reservation(KERNEL_IMAGE)?.start(), entries, reserved).is_some(), true);
         let frame = alloc_raw().ok_or("out of frames")?;
         let (unaligned, good) = (bad_frame(frame + 1, entries, reserved), bad_frame(frame, entries, reserved));
-        kassert_eq!(free_raw(frame), Ok(()));
+        // SAFETY: allocated just above by this test and not used since.
+        kassert_eq!(unsafe { free_raw(frame) }, Ok(()));
         kassert_eq!(unaligned, Some("frame address not aligned"));
         kassert_eq!(good, None);
         Ok(())
@@ -702,7 +764,8 @@ crate::ktest!(
         let bitmap = reservation(BITMAP)?.start();
         let frame = alloc_raw().ok_or("out of frames")?;
         let got = [frame, frame + 0x123, bitmap, 0x1000].map(|p| (translate(hhdm + p).ok(), p));
-        kassert_eq!(free_raw(frame), Ok(()));
+        // SAFETY: allocated just above by this test and not used since.
+        kassert_eq!(unsafe { free_raw(frame) }, Ok(()));
         for (translated, p) in got {
             kassert_eq!(translated, Some(p));
         }
@@ -716,31 +779,40 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         let before = free_frames();
         let a = alloc().ok_or("out of frames")?;
-        kassert_eq!(free(a), Ok(()));
+        // SAFETY: allocated above by this test and not used since.
+        kassert_eq!(unsafe { free(a) }, Ok(()));
         let b = alloc().ok_or("out of frames")?;
-        kassert_eq!(free(b), Ok(()));
+        // SAFETY: allocated above by this test and not used since.
+        kassert_eq!(unsafe { free(b) }, Ok(()));
         kassert_eq!(b, a);
-        kassert_eq!(free(a), Err(FreeError::DoubleFree));
+        // SAFETY: a double free, which the allocator refuses (asserted).
+        kassert_eq!(unsafe { free(a) }, Err(FreeError::DoubleFree));
 
         let kernel = reservation(KERNEL_IMAGE)?.start();
-        kassert!(matches!(free_raw(kernel), Err(FreeError::NotOwned | FreeError::OutOfRange)));
-        kassert!(free_raw(0).is_err());
-        kassert!(free_raw(a.as_u64() + 8).is_err());
+        // SAFETY: refused (asserted): not a frame the allocator handed out.
+        kassert!(matches!(unsafe { free_raw(kernel) }, Err(FreeError::NotOwned | FreeError::OutOfRange)));
+        // SAFETY: refused (asserted): not a frame the allocator handed out.
+        kassert!(unsafe { free_raw(0) }.is_err());
+        // SAFETY: refused (asserted): misaligned.
+        kassert!(unsafe { free_raw(a.as_u64() + 8) }.is_err());
 
         let run = alloc_contiguous(4, 4).ok_or("no 4-frame run")?;
-        kassert_eq!(free_contiguous(run, 4), Ok(()));
+        // SAFETY: the run allocated just above, not used.
+        kassert_eq!(unsafe { free_contiguous(run, 4) }, Ok(()));
         kassert!(run.as_u64().is_multiple_of(4 * FRAME_SIZE));
 
         // alloc_zeroed zeroes a frame that held data.
         let dirty = alloc().ok_or("out of frames")?;
         // SAFETY: the test owns `dirty`; the HHDM maps it.
         unsafe { core::ptr::write_bytes(virt(dirty.as_u64()), 0xee, FRAME_SIZE as usize) };
-        kassert_eq!(free(dirty), Ok(()));
+        // SAFETY: allocated above by this test, which is done with it.
+        kassert_eq!(unsafe { free(dirty) }, Ok(()));
         let zeroed = alloc_zeroed().ok_or("out of frames")?;
         // SAFETY: as above, for `zeroed`.
         let all_zero =
             unsafe { core::slice::from_raw_parts(virt(zeroed.as_u64()), FRAME_SIZE as usize) }.iter().all(|&b| b == 0);
-        kassert_eq!(free(zeroed), Ok(()));
+        // SAFETY: allocated above by this test, which is done with it.
+        kassert_eq!(unsafe { free(zeroed) }, Ok(()));
         kassert_eq!(zeroed, dirty); // the lowest free frame, so the same one
         kassert!(all_zero);
         kassert_eq!(free_frames(), before);

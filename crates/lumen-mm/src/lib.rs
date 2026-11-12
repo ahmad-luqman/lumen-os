@@ -56,6 +56,7 @@
 mod addr;
 pub mod paging;
 pub mod stacks;
+pub mod window;
 
 pub use addr::{PHYS_ADDR_BITS, PhysAddr, PhysFrame, VIRT_ADDR_BITS, VirtAddr};
 

@@ -81,3 +81,17 @@ tests = [
     "ktest:lumen_kernel::mm::stack::a_full_registry_leaves_nothing_behind",
     "scenario:test_crash::test_fault_produces_symbolized_report[*]",
 ]
+
+[[feature]]
+name = "Window owner tokens and owned frames: map is safe for the holder of a page's window, which is handed out once ever; unmap gives the frame back"
+milestone = "M1"
+tests = [
+    "cargo:lumen-mm",
+    "ktest:lumen_kernel::mm::paging::map_unmap_roundtrip",
+    "ktest:lumen_kernel::mm::paging::map_and_unmap_refuse_what_they_dont_own",
+    "ktest:lumen_kernel::mm::paging::a_window_outside_the_windows_is_refused_too",
+    "ktest:lumen_kernel::mm::paging::windows_are_claimed_once_ever",
+    "ktest:lumen_kernel::mm::paging::dropping_an_owned_frame_frees_it",
+    "ktest:lumen_kernel::mm::heap::growth_failure_rolls_back",
+    "ktest:lumen_kernel::mm::stack::guard_page_unmapped",
+]

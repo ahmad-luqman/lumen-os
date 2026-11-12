@@ -16,10 +16,10 @@
 //! [`leak`]: KernelStack::leak
 
 use core::fmt;
-use core::ops::Range;
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use lumen_mm::stacks::{Handle, StackKind, StackRange, StackWindow};
+use lumen_mm::window::Window;
 
 use super::{paging, window};
 use crate::arch::stacks;
@@ -32,23 +32,15 @@ pub const STACK_SIZE: u64 = 64 * 1024;
 /// Limine was asked for, so nothing gets less room than before).
 pub const MAIN_STACK_SIZE: u64 = 128 * 1024;
 
-/// What the stack module owns: the stack window minus its top GiB (the
-/// paging ktests' page).
-const OWNED: Range<u64> = paging::STACKS_BASE..paging::STACKS_LIMIT;
-
-static WINDOW: SpinLock<StackWindow> = SpinLock::new(StackWindow::new(OWNED.start, OWNED.end));
-
-/// A stack's own part of the window (its guard page and its pages): what its
-/// pages must stay inside.
-fn owner(range: StackRange) -> Range<u64> {
-    range.guard()..range.top
-}
+/// The stack window ([`paging::claim_stack_window`], claimed by the first
+/// stack), which hands each stack its own sub-window.
+static WINDOW: SpinLock<Option<StackWindow>> = SpinLock::new(None);
 
 /// Why [`KernelStack::new`] failed (nothing is left mapped or registered).
 /// A mapping failure other than running out is a kernel bug and panics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StackError {
-    /// No room left below [`paging::STACKS_LIMIT`].
+    /// No room left in the stack window.
     WindowFull,
     /// No frame for the stack or for a page table.
     OutOfMemory,
@@ -70,6 +62,9 @@ impl fmt::Display for StackError {
 #[derive(Debug)]
 pub struct KernelStack {
     range: StackRange,
+    /// The stack's own sub-window (guard page and stack): what lets it map
+    /// and unmap its pages.
+    window: Window,
     /// `None` only while dropping.
     handle: Option<Handle>,
 }
@@ -77,11 +72,9 @@ pub struct KernelStack {
 impl KernelStack {
     /// A new stack of `size` bytes (whole pages), registered as `kind`.
     pub fn new(size: u64, kind: StackKind) -> Result<KernelStack, StackError> {
-        let range = WINDOW.lock().take(size).ok_or(StackError::WindowFull)?;
-        let owner = owner(range);
-        // SAFETY: this module owns `OWNED`, and the window hands out each
-        // range once, so nothing in it is mapped or in use.
-        match unsafe { window::map_fresh(&owner, range.span()) } {
+        let taken = WINDOW.lock().get_or_insert_with(|| StackWindow::new(paging::claim_stack_window())).take(size);
+        let (range, mut window) = taken.ok_or(StackError::WindowFull)?;
+        match window::map_fresh(&mut window, range.span()) {
             Ok(()) => {}
             Err(e) if e.is_exhaustion() => return Err(StackError::OutOfMemory),
             Err(e) => panic!("mm: mapping a {} stack at {:#x} failed: {e}", kind.name(), range.bottom),
@@ -89,10 +82,10 @@ impl KernelStack {
         // SAFETY: mapped just above; it stays mapped until `drop` retracts it.
         let Some(handle) = (unsafe { stacks::REGISTRY.register(kind, range) }) else {
             // SAFETY: mapped just above; nothing has used it.
-            unsafe { window::unmap_and_free(&owner, range.span()) };
+            unsafe { window::unmap_and_free(&mut window, range.span()) };
             return Err(StackError::RegistryFull);
         };
-        Ok(KernelStack { range, handle: Some(handle) })
+        Ok(KernelStack { range, window, handle: Some(handle) })
     }
 
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests; threads (M2)
@@ -122,7 +115,7 @@ impl Drop for KernelStack {
         compiler_fence(Ordering::SeqCst);
         // SAFETY: the stack is ours, and (not leaked) nothing runs on it or
         // points at it.
-        unsafe { window::unmap_and_free(&owner(self.range), self.range.span()) };
+        unsafe { window::unmap_and_free(&mut self.window, self.range.span()) };
     }
 }
 
@@ -281,7 +274,8 @@ crate::ktest!(
         let (registered_after, free_after, tables_after) =
             (stacks::REGISTRY.iter().count(), super::frame::free_frames(), active_table_count()?);
         for f in held {
-            super::frame::free(f).map_err(|_| "freeing a held frame")?;
+            // SAFETY: held frames this test allocated and never used.
+            unsafe { super::frame::free(f) }.map_err(|_| "freeing a held frame")?;
         }
         kassert_eq!(result, Err(StackError::OutOfMemory));
         kassert_eq!(registered_after, registered);
