@@ -68,8 +68,8 @@ impl fmt::Display for StackError {
 #[derive(Debug)]
 pub struct KernelStack {
     range: StackRange,
-    /// The stack's own sub-window (guard page and stack): what lets it map
-    /// and unmap its pages.
+    /// The stack's own sub-window (its pages alone, not the guard page):
+    /// what lets it map and unmap them.
     window: Window,
     /// `None` only while dropping.
     handle: Option<Handle>,
@@ -299,22 +299,13 @@ crate::ktest!(
         let range = stack.range;
         kassert_eq!(stack.window.range(), range.span());
         let v = |a| VirtAddr::new(a).expect("canonical");
-        let mut refused = [None, None];
-        for (slot, page) in refused.iter_mut().zip([range.guard(), range.top]) {
-            let f = super::frame::alloc_owned().ok_or("out of frames")?;
-            match paging::map(&mut stack.window, v(page), f, Attrs::DATA) {
-                Err((e, f)) => {
-                    drop(f);
-                    *slot = Some(e);
-                }
-                Ok(()) => return Err("a stack's window mapped a page outside it"),
-            }
+        let mut f = super::frame::alloc_owned().ok_or("out of frames")?;
+        for page in [range.guard(), range.top] {
+            let (got, back) =
+                paging::map_refused(&mut stack.window, v(page), f, Attrs::DATA, "outside the stack's window")?;
+            kassert_eq!(got, paging::VmError::NotOwner(v(page)));
+            f = back;
         }
-        drop(stack);
-        kassert_eq!(
-            refused,
-            [Some(paging::VmError::NotOwner(v(range.guard()))), Some(paging::VmError::NotOwner(v(range.top)))]
-        );
         Ok(())
     }
 );

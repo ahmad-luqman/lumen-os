@@ -577,6 +577,11 @@ crate::ktest!(
         kassert!(!GrowError::Map(VmError::Map(MapError::AlreadyMapped)).returns_null());
         kassert!(!GrowError::Map(VmError::NotWriteBack).returns_null());
         kassert!(!GrowError::Map(VmError::Executable).returns_null());
+        let page = lumen_mm::VirtAddr::new(paging::HEAP_BASE).expect("canonical");
+        kassert!(!GrowError::Map(VmError::NotOwner(page)).returns_null());
+        kassert!(!GrowError::Map(VmError::OutsideWindow(page)).returns_null());
+        let f = lumen_mm::PhysFrame::from_u64(0).expect("aligned");
+        kassert!(!GrowError::Map(VmError::NotAllocated(f)).returns_null());
         kassert!(!GrowError::NotReady.returns_null());
         Ok(())
     }
@@ -658,29 +663,17 @@ crate::ktest!(
         use lumen_mm::VirtAddr;
         use lumen_mm::paging::Attrs;
         let v = |a| VirtAddr::new(a).expect("canonical");
+        // (No allocation while STATE is held: it would deadlock. Asserting
+        // only writes to serial.)
         let mut state = STATE.lock();
         let window = state.window.as_mut().ok_or("the heap holds no window")?;
-        let range = window.range();
-        let mut refused = [None, None];
-        for (slot, page) in refused.iter_mut().zip([paging::HEAP_LIMIT, paging::STACKS_BASE]) {
-            let f = frame::alloc_owned().ok_or("out of frames")?;
-            match paging::map(window, v(page), f, Attrs::DATA) {
-                Err((e, f)) => {
-                    drop(f);
-                    *slot = Some(e);
-                }
-                Ok(()) => return Err("the heap's window mapped a page outside it"),
-            }
+        kassert_eq!(window.range(), paging::HEAP_BASE..paging::HEAP_LIMIT);
+        let mut f = frame::alloc_owned().ok_or("out of frames")?;
+        for page in [paging::HEAP_LIMIT, paging::STACKS_BASE] {
+            let (got, back) = paging::map_refused(window, v(page), f, Attrs::DATA, "outside the heap's window")?;
+            kassert_eq!(got, paging::VmError::NotOwner(v(page)));
+            f = back;
         }
-        drop(state);
-        kassert_eq!(range, paging::HEAP_BASE..paging::HEAP_LIMIT);
-        kassert_eq!(
-            refused,
-            [
-                Some(paging::VmError::NotOwner(v(paging::HEAP_LIMIT))),
-                Some(paging::VmError::NotOwner(v(paging::STACKS_BASE)))
-            ]
-        );
         Ok(())
     }
 );

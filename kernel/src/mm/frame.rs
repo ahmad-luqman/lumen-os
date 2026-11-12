@@ -318,7 +318,7 @@ pub fn alloc_contiguous(count: usize, align_frames: usize) -> Option<PhysFrame> 
 /// # Safety
 /// The caller owns `f` (it allocated it, or was handed it) and nothing uses
 /// it any more; in particular no other [`OwnedFrame`] holds it, and no
-/// mapping does (an owned frame is what lets `paging::map` be safe).
+/// `paging::map` mapping does (an owned frame is what lets `map` be safe).
 pub unsafe fn free(f: PhysFrame) -> Result<(), FreeError> {
     with_frames(|a| a.free(f.as_u64()))
 }
@@ -364,9 +364,7 @@ impl OwnedFrame {
         core::mem::forget(self);
         f
     }
-}
 
-impl OwnedFrame {
     /// Free the frame now, reporting a failure (a kernel bug) to the caller,
     /// which can say what it was doing; dropping panics instead.
     pub fn free(self) -> Result<(), FreeError> {
@@ -378,9 +376,10 @@ impl OwnedFrame {
 
 impl Drop for OwnedFrame {
     fn drop(&mut self) {
-        // SAFETY: a live `OwnedFrame` is never mapped (`map` turns it raw;
-        // `unmap` hands it back only after removing the mapping and flushing
-        // the TLB) and nothing else holds it, so nothing uses the frame.
+        // SAFETY: a live `OwnedFrame` is never mapped by `map` (`map` turns it
+        // raw; `unmap` hands it back only after removing the mapping and
+        // flushing the TLB), its HHDM alias is reached only by `unsafe` code,
+        // and nothing else holds it, so nothing uses the frame.
         unsafe { free(self.0) }.unwrap_or_else(|e| panic!("mm: freeing owned frame {} failed: {e:?}", self.0));
     }
 }
@@ -600,9 +599,10 @@ mod checks {
     /// self-tag? Only such a frame may be read or freed by the test.
     fn ours(frame: u64) -> bool {
         let allocated = with_state(|s| s.frames.is_owned(frame) && !s.frames.is_free(frame));
-        // SAFETY: an allocated frame is either ours (filled by allocate_all)
-        // or leaked by an earlier failed test; either way nothing else uses
-        // it, and the HHDM maps it.
+        // SAFETY: reading one word of an allocated frame through the HHDM:
+        // it is either ours (filled by allocate_all), leaked by an earlier
+        // failed test, or in use elsewhere (heap, stacks, page tables), and
+        // nothing writes it meanwhile (one CPU; this test runs alone).
         allocated && unsafe { virt(frame).cast::<u64>().add(2).read() } == frame
     }
 

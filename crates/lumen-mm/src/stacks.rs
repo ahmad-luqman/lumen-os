@@ -98,8 +98,10 @@ impl StackRange {
 /// Hands out stack addresses in the stack window, upward, a guard page below
 /// each and the page above the last one left free. It holds the window's
 /// [`Window`] token and splits off a sub-window for each stack, so each
-/// stack's holder owns its pages. Guard pages get no token at all (their
-/// ranges are split off and dropped), so no one can ever map one. Addresses are never
+/// stack's holder owns its pages. Guard pages get no token: a guard page's
+/// range is split off and dropped when its stack is taken (the page above the
+/// newest stack stays in this window until the next stack takes it as its
+/// guard), so no one can ever map one. Addresses are never
 /// reused; the caller sizes the window so that doesn't run out (the kernel's
 /// is about 1 TiB).
 #[derive(Debug)]

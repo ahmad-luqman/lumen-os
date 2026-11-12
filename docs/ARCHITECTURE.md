@@ -217,7 +217,7 @@ page. The kernel API:
   `claim_stack_window`, and two test windows at the top GiB of each for the
   ktests); a holder can split off disjoint sub-windows (each kernel stack
   gets its own; guard pages get none, so they can never be mapped), and no
-  safe code can make one (building a claims table is `unsafe`). Frames come as `OwnedFrame`s
+  safe code can forge or copy one (building a claims table is `unsafe`). Frames come as `OwnedFrame`s
   (move-only, freed on drop; the raw `frame::free` is `unsafe`). With both
   proven, `map(&mut window, virt, frame, attrs)` is safe: it consumes the
   frame (giving it back on failure) and still refuses what it can check
@@ -227,7 +227,8 @@ page. The kernel API:
   non-write-back or executable rights, since allocator frames are writable
   through the HHDM). `unmap` stays `unsafe`: only the caller knows nothing
   refers through the page any more. It invalidates the TLB entry and gives
-  the frame back. What the types don't prove: that nothing uses a page being
+  the frame back (it panics, leaving the mapping, if the page isn't a 4 KiB
+  leaf on an allocated frame, which only a broken invariant could cause). What the types don't prove: that nothing uses a page being
   unmapped, and that the frame's HHDM alias goes unused (every allocated
   frame has one; only `unsafe` code, including the ktest helpers, can reach
   it). Everything else (image,
@@ -256,7 +257,8 @@ Every stack the kernel runs on once `kmain` switches stacks (right after
 (`kernel/src/mm/stack.rs`; layout and registry in the host-tested
 `lumen_mm::stacks`). `KernelStack::new` takes addresses from the stack
 window (`StackWindow` holds its token and splits off a sub-window for each
-stack: guard page and stack), upward, with an unmapped guard page below each
+stack, covering the stack alone; the guard page's range is dropped, so it
+has no token), upward, with an unmapped guard page below each
 stack (so the page above a stack is the next one's guard), maps fresh frames
 there through its own sub-window (RW, NX, write-back; all or nothing,
 shared with the heap in `mm/window.rs`) and registers the stack. Dropping one retracts it from the registry, then

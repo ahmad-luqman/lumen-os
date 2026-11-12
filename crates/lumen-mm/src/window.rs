@@ -21,15 +21,19 @@ use crate::FRAME_SIZE;
 
 /// A page-aligned virtual range that belongs to its holder alone.
 ///
-/// No safe code can make one outside this module, or copy one:
+/// Outside this module a window comes only from a [`Claims`] table (building
+/// one is `unsafe`) or from [`Window::split_off`]; no safe code can forge or
+/// copy one. That `Window` isn't `Clone` is checked at compile time below.
+/// Forging fails on the private fields (stable rustdoc doesn't check the
+/// error code, so the passing example next to it keeps the path honest):
 ///
-/// ```compile_fail,E0451
+/// ```compile_fail
 /// let forged = lumen_mm::window::Window { start: 0, end: 4096 };
 /// ```
 ///
-/// ```compile_fail,E0599
-/// fn copy(w: &lumen_mm::window::Window) -> lumen_mm::window::Window {
-///     w.clone()
+/// ```
+/// fn pages(w: &lumen_mm::window::Window) -> u64 {
+///     w.len() / 4096
 /// }
 /// ```
 #[derive(Debug, PartialEq, Eq)]
@@ -65,6 +69,8 @@ impl Window {
 
     /// Give the lowest `len` bytes (whole pages) away as a window of their
     /// own; this window keeps the rest. `None` if it is smaller than `len`.
+    /// Whatever is already mapped in that range goes with it, so split off
+    /// only ranges you haven't handed out.
     #[must_use = "dropping the split-off window gives its range up for good"]
     pub fn split_off(&mut self, len: u64) -> Option<Window> {
         assert!(len.is_multiple_of(FRAME_SIZE), "window split {len:#x} is not whole pages");
@@ -76,6 +82,18 @@ impl Window {
         Some(low)
     }
 }
+
+// `Window` must not be `Clone` (a copy would be a second owner): if it ever
+// is, the call below becomes ambiguous and this fails to compile.
+const _: () = {
+    trait AmbiguousIfClone<A> {
+        fn check() {}
+    }
+    impl<T> AmbiguousIfClone<()> for T {}
+    struct IsClone;
+    impl<T: Clone> AmbiguousIfClone<IsClone> for T {}
+    let _ = <Window as AmbiguousIfClone<_>>::check;
+};
 
 /// A fixed set of ranges, each handed out once ever as a [`Window`].
 #[derive(Debug)]
@@ -200,6 +218,16 @@ mod tests {
             // SAFETY: as above.
             unsafe { Claims::new([(BASE, BASE)]) }
         });
+        // Overlaps that aren't between neighbours in the table.
+        let first_and_last = std::panic::catch_unwind(|| {
+            // SAFETY: as above.
+            unsafe { Claims::new([(BASE, BASE + 2 * P), (BASE + 4 * P, BASE + 5 * P), (BASE + P, BASE + 3 * P)]) }
+        });
+        let nested = std::panic::catch_unwind(|| {
+            // SAFETY: as above.
+            unsafe { Claims::new([(BASE, BASE + 8 * P), (BASE + 9 * P, BASE + 10 * P), (BASE + 2 * P, BASE + 3 * P)]) }
+        });
         assert!(overlap.is_err() && misaligned.is_err() && misaligned_end.is_err() && empty.is_err());
+        assert!(first_and_last.is_err() && nested.is_err());
     }
 }

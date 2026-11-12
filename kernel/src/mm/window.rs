@@ -46,6 +46,7 @@ impl fmt::Display for WindowError {
 /// and no-execute. All or nothing: on failure every page mapped so far is
 /// unmapped and its frame freed (page tables created on the way stay; tables
 /// are never freed). A page already mapped is a [`WindowError::Map`].
+/// Panics if `pages` aren't page-aligned inside `window` (a caller bug).
 pub fn map_fresh(window: &mut Window, pages: Range<u64>) -> Result<(), WindowError> {
     check_bounds(window, &pages);
     for virt in pages.clone().step_by(FRAME_SIZE as usize) {
@@ -76,17 +77,20 @@ pub unsafe fn unmap_and_free(window: &mut Window, pages: Range<u64>) {
 /// As for [`unmap_and_free`].
 unsafe fn release(window: &mut Window, pages: Range<u64>, cause: Option<WindowError>) {
     check_bounds(window, &pages);
+    let failed = |what: fmt::Arguments<'_>| -> ! {
+        match cause {
+            Some(c) => panic!("mm: rollback after `{c}` failed: {what}"),
+            None => panic!("mm: releasing owned pages failed: {what}"),
+        }
+    };
     for virt in pages.step_by(FRAME_SIZE as usize) {
         let v = VirtAddr::new(virt).expect("window addresses are canonical");
-        let failed = |what: fmt::Arguments<'_>| -> ! {
-            match cause {
-                Some(c) => panic!("mm: rollback after `{c}` failed: {what}"),
-                None => panic!("mm: releasing owned pages failed: {what}"),
-            }
-        };
         // SAFETY: the page is the window's and nothing refers to it.
         match unsafe { paging::unmap(window, v) } {
-            Ok((_, frame)) => frame.free().unwrap_or_else(|e| failed(format_args!("free at {v}: {e:?}"))),
+            Ok((_, frame)) => {
+                let raw = frame.frame();
+                frame.free().unwrap_or_else(|e| failed(format_args!("free {raw} (mapped at {v}): {e:?}")));
+            }
             Err(e) => failed(format_args!("unmap {v}: {e}")),
         }
     }
@@ -129,6 +133,11 @@ crate::ktest!(
         kassert!(!WindowError::Map(VmError::Map(PtError::AlreadyMapped)).is_exhaustion());
         kassert!(!WindowError::Map(VmError::NotWriteBack).is_exhaustion());
         kassert!(!WindowError::Map(VmError::Executable).is_exhaustion());
+        let page = lumen_mm::VirtAddr::new(paging::HEAP_BASE).expect("canonical");
+        kassert!(!WindowError::Map(VmError::NotOwner(page)).is_exhaustion());
+        kassert!(!WindowError::Map(VmError::OutsideWindow(page)).is_exhaustion());
+        let f = lumen_mm::PhysFrame::from_u64(0).expect("aligned");
+        kassert!(!WindowError::Map(VmError::NotAllocated(f)).is_exhaustion());
         Ok(())
     }
 );
