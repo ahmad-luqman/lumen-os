@@ -32,8 +32,8 @@ and a component (`area:mm`, `area:arch`, ...). One issue is one branch is one PR
 | Kernel heap with working `free` (`GlobalAlloc`) | `ktest:mm::heap::reuse_after_free`, `ktest:mm::heap::fragmentation_stress` (random alloc/free, then a large allocation succeeds), `cargo:lumen-heap` |
 | Kernel stacks from the allocator with guard pages; replace the static boot and IST stacks | `scenario:test_mm::test_stack_overflow_hits_guard` (recursion produces a crash report naming the guard page, not a silent corruption) |
 | Timer: LAPIC timer calibrated against HPET or the PIT; TSC frequency; interrupts on; IRQ-safe `SpinLock` | `ktest:time::tsc_calibrated_within_tolerance`, `ktest:time::sleep_10ms_elapses`, `scenario:test_time::test_timer_interrupts_counted` |
-| Kernel trace ring buffer (per-CPU, lock-free) plus log timestamps | `cargo:lumen-trace` (ring wraparound, concurrent writers model), `ktest:trace::events_recorded_in_order` |
-| Boot timeline: phases traced and printed | `scenario:test_boot::test_boot_timeline_printed` (every phase present, monotonic timestamps) |
+| Kernel trace ring buffer (per-CPU, lock-free) | `cargo:lumen-trace` (wraparound, ordering, concurrent readers and writers never see torn events), `ktest:lumen_kernel::trace::*` (in order, boot phases, exceptions and logs, overhead), `scenario:test_trace::*` |
+| Boot timeline (phases traced and printed) and log timestamps | `scenario:test_boot::test_boot_timeline_printed` (every phase present, monotonic timestamps) |
 | (Optional) SMP bring-up via Limine MP | `scenario:test_smp::test_all_cpus_online` (with `-smp 4`) |
 
 ## M2: Processes

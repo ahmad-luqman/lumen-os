@@ -34,8 +34,9 @@ impl Log for KernelLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        let _line = LINE_LOCK.lock();
         let tag = tag_for(record.target());
+        crate::ktrace!(crate::trace::Kind::Log, record.level(), crate::trace::pack_tag(tag));
+        let _line = LINE_LOCK.lock();
         let mut out = SerialWriter;
         let _ = writeln!(out, "{:<5} {}: {}", record.level(), tag, record.args());
         if record.level() <= Level::Info {

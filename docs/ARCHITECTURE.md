@@ -402,12 +402,22 @@ kernel. The kernel is the trusted computing base.
 - **Kill switch:** pause and stop for any lane, effective immediately
   (capabilities revoked, process suspended).
 
-## 14. Observability (planned, M1 and M5)
+## 14. Observability (M1 and M5)
 
-- **Trace ring buffer:** per-CPU, fixed-size binary events (timestamp, CPU,
-  pid, event id, 4 arguments) written lock-free. It is always on and costs a
-  few nanoseconds per event. Events include scheduler switches, syscalls,
-  interrupts, page faults, allocator activity and boot phases.
+- **Trace ring buffer (built):** fixed-size binary events (timestamp, CPU,
+  pid, kind, 4 arguments) in a lock-free ring that overwrites the oldest
+  (`crates/lumen-trace`, host-tested; `kernel/src/trace.rs`, `ktrace!`). Each
+  slot is a small seqlock: writers claim it by compare-and-swap and drop
+  their event (counted) rather than wait if it is busy, so recording never
+  blocks, even from an exception handler that interrupted another record;
+  readers skip events that change while they copy them, so they never see a
+  torn event. One 4096-event ring now (one CPU); one per CPU with SMP (#9).
+  Recorded so far: boot phases, exceptions, log lines. Later: scheduler
+  switches, syscalls, interrupts, page faults, allocator activity. Cost per
+  event is printed by `ktest:lumen_kernel::trace::trace_overhead_is_small`
+  (about 60 TSC ticks under TCG; TCG's TSC is emulated, so treat it as an
+  order of magnitude). Timestamps are raw TSC ticks until #7/#8. `kmon`'s
+  `trace [n]` prints the newest events.
 - **Boot timeline:** boot phases emit trace events. The fast-boot target is
   under 1 s from bootloader handoff to the shell, measured in the guest from TSC
   timestamps (never by host wall-clock time in tests).

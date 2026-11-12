@@ -219,6 +219,7 @@ pub fn exception_name(vector: u64) -> &'static str {
 /// Called by `lumen_isr_common` for every vector.
 #[unsafe(no_mangle)]
 extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
+    crate::ktrace!(crate::trace::Kind::Exception, frame.vector, frame.rip, frame.error_code);
     match frame.vector {
         3 => {
             BREAKPOINTS.fetch_add(1, Ordering::Relaxed);

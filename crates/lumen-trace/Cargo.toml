@@ -1,0 +1,9 @@
+[package]
+name = "lumen-trace"
+description = "no_std lock-free trace ring buffer (fixed-size binary events) for the Lumen kernel, host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
