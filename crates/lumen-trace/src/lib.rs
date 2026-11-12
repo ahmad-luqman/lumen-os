@@ -57,8 +57,8 @@ pub struct Event {
     /// 0-based sequence number among all events ever claimed (dropped events
     /// use numbers too, so recorded events can have gaps).
     pub seq: u64,
-    /// Timestamp (raw TSC ticks in the kernel; #8 converts them with the
-    /// frequency `time` calibrates).
+    /// Timestamp (raw TSC ticks in the kernel; only the boot timeline
+    /// converts its phase events, with the frequency `time` calibrates).
     pub tsc: u64,
     /// The CPU that recorded it.
     pub cpu: u16,

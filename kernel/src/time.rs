@@ -1,7 +1,8 @@
 //! Timekeeping: the TSC's frequency, calibrated at boot against the HPET (or
 //! the PIT if there is none, or it doesn't work), [`now_ns`] and [`sleep`]
 //! from it, and the local APIC timer ticking at [`TICK_HZ`], calibrated
-//! against the TSC.
+//! against the TSC. It also holds the boot's origin ([`mark_boot`]), which
+//! the boot timeline and the log's timestamps ([`since_boot_ns`]) count from.
 //!
 //! Calibration polls with interrupts off and takes the median of several
 //! 10 ms windows, so one window stretched by an SMI or a descheduled vCPU
@@ -39,6 +40,9 @@ static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 static LAPIC_TIMER_HZ: AtomicU64 = AtomicU64::new(0);
 /// What the TSC was calibrated against: 0 not yet, else a [`Reference`].
 static REFERENCE: AtomicU8 = AtomicU8::new(0);
+/// The TSC when `kmain` began: the boot timeline's and the log's origin (0
+/// until [`mark_boot`]).
+static BOOT_TSC: AtomicU64 = AtomicU64::new(0);
 /// The HPET, mapped once, if the TSC could be calibrated against it.
 static HPET: SpinLock<Option<HpetCounter>> = SpinLock::new(None);
 
@@ -344,6 +348,28 @@ pub fn tsc() -> Option<Clock> {
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests, SMP (#9)
 pub fn lapic_timer() -> Option<Clock> {
     Clock::new(LAPIC_TIMER_HZ.load(Ordering::Relaxed))
+}
+
+/// Record `tsc`, read as `kmain` began, as the boot's origin. Panics if
+/// called twice (keeping the first origin).
+pub fn mark_boot(tsc: u64) {
+    // 0 means "not marked": a TSC of exactly 0 is stored as 1.
+    let first = BOOT_TSC.compare_exchange(0, tsc.max(1), Ordering::Relaxed, Ordering::Relaxed);
+    assert!(first.is_ok(), "mark_boot called twice");
+}
+
+/// The TSC when `kmain` began, once [`mark_boot`] recorded it.
+pub fn boot_tsc() -> Option<u64> {
+    Some(BOOT_TSC.load(Ordering::Relaxed)).filter(|&t| t != 0)
+}
+
+/// Nanoseconds since `kmain` began, once the TSC is calibrated; `None`
+/// before, or if the TSC reads earlier than the origin (it was reset, or
+/// another CPU's isn't in step): a zero would read as a measurement.
+/// Lock-free (the logger stamps lines with it).
+pub fn since_boot_ns() -> Option<u64> {
+    let ticks = arch::rdtsc().checked_sub(boot_tsc()?)?;
+    Some(tsc()?.ns(ticks))
 }
 
 /// Nanoseconds since the TSC was last reset (normally at CPU reset; firmware

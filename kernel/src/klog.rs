@@ -1,19 +1,27 @@
 //! Structured kernel logger (hard rule 8).
 //!
 //! Implements the `log` crate facade, so any crate can log without depending
-//! on the kernel. Every line has a level and a subsystem tag:
+//! on the kernel. Every line has a timestamp (on serial), a level and a
+//! subsystem tag:
 //!
 //! ```text
-//! INFO  boot: Lumen 0.0.1 booting
-//! WARN  mem: 3 regions ignored
+//! [    ?.??????] INFO  boot: Lumen 0.0.1 (x86_64) booting
+//! [    ?.??????] WARN  mem: no ACPI RSDP from Limine
+//! [    0.072250] INFO  time: tsc 999.8 MHz (calibrated against hpet)
 //! ```
+//!
+//! The timestamp is seconds since `kmain` began, to the microsecond; every
+//! line before the TSC is calibrated (before the `time: tsc` line) shows `?`
+//! instead (the boot timeline covers those phases afterwards). The screen's
+//! console shows lines without it, so screenshots stay comparable (not
+//! tested: the golden image covers only the header).
 //!
 //! The tag is the `target:` given at the call site, or else the module path
 //! with the `lumen_kernel::` prefix removed. The level threshold comes from
 //! `lumen.log=<level>` on the command line (default `info`).
 //!
 //! Every emitted line also records a `Log` event in the trace ring
-//! (`crate::trace`); the text format is unchanged.
+//! (`crate::trace`); recording it doesn't change the printed line.
 
 use crate::arch::serial::SerialWriter;
 use crate::sync::SpinLock;
@@ -39,8 +47,10 @@ impl Log for KernelLogger {
         // Trace before taking the line lock: recording never waits.
         crate::ktrace!(crate::trace::Kind::Log, record.level(), crate::trace::pack_tag(tag));
         let _line = LINE_LOCK.lock();
+        // Under the line lock: lines come out in the order of their stamps.
+        let stamp = lumen_time::Stamp(crate::time::since_boot_ns());
         let mut out = SerialWriter;
-        let _ = writeln!(out, "{:<5} {}: {}", record.level(), tag, record.args());
+        let _ = writeln!(out, "{stamp} {:<5} {}: {}", record.level(), tag, record.args());
         if record.level() <= Level::Info {
             crate::fb::console_log(record.level(), tag, record.args());
         }

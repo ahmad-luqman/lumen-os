@@ -44,3 +44,15 @@ tests = [
     "ktest:lumen_kernel::cmdline::cmdline_parses_flags_and_values",
     "ktest:lumen_kernel::klog::log_tags_strip_crate_and_arch_prefixes",
 ]
+
+[[feature]]
+name = "Boot timeline printed at boot complete (every phase since kernel entry, from the trace ring) and timestamps on serial log lines"
+milestone = "M1"
+tests = [
+    "cargo:lumen-time",
+    "ktest:lumen_kernel::trace::boot_phases_recorded_in_order",
+    "ktest:lumen_kernel::trace::the_timeline_says_what_it_lacks",
+    "scenario:test_boot::test_boot_timeline_printed",
+    "scenario:test_boot::test_log_lines_are_structured",
+    "scenario:test_trace::test_trace_command_shows_every_event_since_boot",
+]

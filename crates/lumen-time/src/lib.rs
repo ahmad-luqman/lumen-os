@@ -1,9 +1,9 @@
 //! Timekeeping arithmetic for the Lumen kernel: working out a counter's
 //! frequency from a reference clock, converting ticks to and from
-//! nanoseconds, and the counts the PIT and the local APIC timer are
-//! programmed with. All of it is integer math (the kernel has no floating
-//! point) in `u128` where products can overflow, so it holds for centuries
-//! of uptime (and then saturates).
+//! nanoseconds, the counts the PIT and the local APIC timer are programmed
+//! with, and how times read in logs (`Stamp`, `Millis`). All of it is
+//! integer math (the kernel has no floating point) in `u128` where products
+//! can overflow, so it holds for centuries of uptime (and then saturates).
 
 #![no_std]
 
@@ -137,6 +137,35 @@ impl fmt::Display for Hz {
     }
 }
 
+/// A log line's timestamp: `[    0.012345]`, nanoseconds since the
+/// caller's origin shown as seconds to the microsecond (100000 s and more
+/// widen the field), or a placeholder of the same width while the time isn't
+/// known (`None`). A zero would read as a measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp(pub Option<u64>);
+
+impl fmt::Display for Stamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(ns) => write!(f, "[{:>5}.{:06}]", ns / NS_PER_SEC, ns % NS_PER_SEC / 1000),
+            None => f.write_str("[    ?.??????]"),
+        }
+    }
+}
+
+/// A duration given in **nanoseconds**, shown in milliseconds to the
+/// microsecond: `0.012 ms`, `3400.000 ms`; with `{:+}`, as an offset:
+/// `+0.012 ms`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Millis(pub u64);
+
+impl fmt::Display for Millis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let sign = if f.sign_plus() { "+" } else { "" };
+        write!(f, "{sign}{}.{:03} ms", self.0 / 1_000_000, self.0 % 1_000_000 / 1000)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -233,6 +262,26 @@ mod tests {
         assert_eq!(Clock::new(1).unwrap().ns(u64::MAX), u64::MAX, "saturates");
         assert_eq!(Clock::new(u64::MAX).unwrap().ticks(u64::MAX), u64::MAX, "saturates");
         assert_eq!(Clock::new(0), None);
+    }
+
+    #[test]
+    fn stamps_have_one_width() {
+        assert_eq!(Stamp(Some(12_345_678)).to_string(), "[    0.012345]");
+        assert_eq!(Stamp(Some(0)).to_string(), "[    0.000000]");
+        assert_eq!(Stamp(Some(3 * NS_PER_SEC + 999)).to_string(), "[    3.000000]", "rounds down to the µs");
+        assert_eq!(Stamp(None).to_string(), "[    ?.??????]");
+        assert_eq!(Stamp(None).to_string().len(), Stamp(Some(1)).to_string().len());
+        assert_eq!(Stamp(Some(123_456 * NS_PER_SEC)).to_string(), "[123456.000000]", "wider than the field: grows");
+    }
+
+    #[test]
+    fn durations_read_in_milliseconds() {
+        use std::format;
+        assert_eq!(format!("{:+}", Millis(12_000)), "+0.012 ms");
+        assert_eq!(format!("{:+}", Millis(3_400_000_000)), "+3400.000 ms");
+        assert_eq!(format!("{:+}", Millis(999)), "+0.000 ms", "rounds down to the µs");
+        assert_eq!(Millis(1_234_567).to_string(), "1.234 ms");
+        assert_eq!(Millis(3_400_000_000).to_string(), "3400.000 ms");
     }
 
     #[test]
