@@ -207,13 +207,23 @@ at the leaves, and walks report the rights combined over every level, which
 is what the CPU enforces; `Attrs` can't express a writable and executable
 page. The kernel API:
 
-- `map`/`unmap` (`unsafe`): 4 KiB pages for the owners of the heap and stack
-  windows (the heap and the kernel stacks). The caller promises it owns the frame and the page and
-  that nothing refers through a page it unmaps; the functions refuse what
-  they can check (addresses outside those windows, frames nobody allocated,
+- `map`/`unmap`: 4 KiB pages in the heap and stack windows, for whoever
+  holds the `Window` token for the page (`lumen_mm::window`, host-tested).
+  Paging hands each window out once ever (`claim_heap_window`,
+  `claim_stack_window`, and two test windows at the top GiB of each for the
+  ktests); a holder can split off disjoint sub-windows (each kernel stack
+  gets its own), and nothing else can make one. Frames come as `OwnedFrame`s
+  (move-only, freed on drop; the raw `frame::free` is `unsafe`). With both
+  proven, `map(&mut window, virt, frame, attrs)` is safe: it consumes the
+  frame (giving it back on failure) and still refuses what it can check
+  (outside the token, outside both windows, a frame nobody allocated,
   non-write-back or executable rights, since allocator frames are writable
-  through the HHDM). `unmap` invalidates the TLB entry. Everything else
-  (image, HHDM, MMIO) is fixed.
+  through the HHDM). `unmap` stays `unsafe`: only the caller knows nothing
+  refers through the page any more. It invalidates the TLB entry and gives
+  the frame back. What the types don't prove: that nothing uses a page being
+  unmapped, and that the frame's HHDM alias goes unused (every allocated
+  frame has one; only `unsafe` code can reach it). Everything else (image,
+  HHDM, MMIO) is fixed.
 - `map_mmio`: uncached, permanent; refuses memory the HHDM maps (two memory
   types for one frame is undefined); all or nothing (a partial mapping is
   rolled back, host-tested).
@@ -237,10 +247,11 @@ Every stack the kernel runs on once `kmain` switches stacks (right after
 `mm::init`) comes from the allocator
 (`kernel/src/mm/stack.rs`; layout and registry in the host-tested
 `lumen_mm::stacks`). `KernelStack::new` takes addresses from the stack
-window, upward, with an unmapped guard page below each stack (so the page
-above a stack is the next one's guard), maps fresh frames there (RW, NX,
-write-back; all or nothing, shared with the heap in `mm/window.rs`) and
-registers the stack. Dropping one retracts it from the registry, then
+window (`StackWindow` holds its token and splits off a sub-window for each
+stack: guard page and stack), upward, with an unmapped guard page below each
+stack (so the page above a stack is the next one's guard), maps fresh frames
+there through its own sub-window (RW, NX, write-back; all or nothing,
+shared with the heap in `mm/window.rs`) and registers the stack. Dropping one retracts it from the registry, then
 unmaps it and frees its frames; addresses are never reused. Stacks the CPU
 points at are leaked so they can't be dropped.
 
@@ -279,9 +290,9 @@ with a sparse 16 KiB frame).
 
 `kernel/src/mm/heap.rs` is the `#[global_allocator]`; the algorithm is the
 host-tested `crates/lumen-heap`. One contiguous span grows up from the
-heap window's base: when no free block fits, the heap maps fresh frames at
-its end (read-write, no-execute, write-back, through `paging::map`) and
-appends them. It grows by its own size, between 64 KiB and 4 MiB, or by
+heap window's base (the heap holds its `Window` token): when no free block
+fits, the heap maps fresh frames at its end (read-write, no-execute,
+write-back, through `paging::map`) and appends them. It grows by its own size, between 64 KiB and 4 MiB, or by
 what the request needs if that is more (so a heap that reaches N bytes took
 about log2(N) growths); when that much isn't available it grows by just
 the pages the request needs. Growing is all or nothing: if
@@ -637,7 +648,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
   src/kmon.rs      serial debug monitor (until the M2 shell)
-  src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs)
+  src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
 crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, ...)
 boot/limine.conf   bootloader config template
