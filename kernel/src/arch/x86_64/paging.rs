@@ -29,7 +29,7 @@ pub fn four_level() -> bool {
 }
 
 /// Does the CPU support the no-execute bit (CPUID 0x8000_0001, EDX bit 20)?
-pub fn nx_supported() -> bool {
+fn nx_supported() -> bool {
     cpuid(0x8000_0000).0 >= 0x8000_0001 && cpuid(0x8000_0001).3 & (1 << 20) != 0
 }
 
@@ -43,7 +43,8 @@ pub fn active_root() -> PhysFrame {
 ///
 /// # Safety
 /// `root` must map everything the kernel uses from here on (code, stack,
-/// data and every pointer it holds) at the same virtual addresses.
+/// data and every pointer it holds) at the same virtual addresses, to the
+/// same physical frames, with rights that allow how the kernel uses them.
 pub unsafe fn load_root(root: PhysFrame) {
     // SAFETY: the caller guarantees the new hierarchy maps the running
     // kernel. A CR3 write flushes non-global entries; toggling PGE flushes
@@ -69,8 +70,11 @@ pub fn invalidate(virt: VirtAddr) {
 /// doesn't rely on that.
 pub fn enforce_nx_and_wp() {
     assert!(nx_supported(), "the CPU has no NX bit; W^X can't be enforced");
-    // SAFETY: EFER exists on every x86-64 CPU; setting NXE (supported, checked
-    // above) and WP only make the CPU stricter.
+    // SAFETY: EFER exists on every x86-64 CPU and NXE is supported (checked
+    // above). Limine sets both already, so this is normally a no-op; if NXE
+    // were off, no live entry could have bit 63 set (it would be reserved
+    // and fault), so turning it on takes execute rights from no page in use.
+    // WP only makes ring 0 stricter.
     unsafe {
         wrmsr(IA32_EFER, rdmsr(IA32_EFER) | EFER_NXE);
         write_cr0(read_cr0() | CR0_WP);
@@ -84,7 +88,8 @@ pub fn efer() -> u64 {
     unsafe { rdmsr(IA32_EFER) }
 }
 
-/// The memory type encoding the PAT uses for `cache` (Intel SDM 13.12.2).
+/// The memory type encoding the PAT uses for `cache` (Intel SDM Vol. 3A,
+/// "Memory Types That Can Be Encoded With PAT").
 const fn memory_type(cache: Cache) -> u64 {
     match cache {
         Cache::Uncached => 0,
@@ -93,12 +98,17 @@ const fn memory_type(cache: Cache) -> u64 {
     }
 }
 
+/// The PAT MSR: eight memory types, one per byte.
+pub fn pat() -> u64 {
+    // SAFETY: the PAT MSR exists on every x86-64 CPU.
+    unsafe { rdmsr(IA32_PAT) }
+}
+
 /// Check that the PAT slots `lumen_mm::paging::Cache` selects hold the memory
 /// types it names. Limine sets this layout up (slot 0 WB, 3 UC, 5 WC); the
 /// kernel checks rather than rewrites the PAT while its own mappings use it.
 pub fn check_pat() {
-    // SAFETY: the PAT MSR exists on every x86-64 CPU.
-    let pat = unsafe { rdmsr(IA32_PAT) };
+    let pat = pat();
     for cache in [Cache::WriteBack, Cache::Uncached, Cache::WriteCombining] {
         let slot = cache.pat_slot();
         let got = (pat >> (8 * slot)) & 0x7;

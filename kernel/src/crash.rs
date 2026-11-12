@@ -2,18 +2,18 @@
 //!
 //! Signature feature 5: no silent triple faults. The report goes to serial
 //! (for the test harness and `make run` logs) and to the screen, and contains
-//! the exception, decoded error code, faulting address (for a page fault,
-//! with the page-table walk of that address), registers, and a symbolized
-//! frame-pointer backtrace; on serial only, it ends with the last 16 trace
-//! events (what led up to it).
+//! the exception, decoded error code, faulting address, registers, a
+//! symbolized frame-pointer backtrace and, for a page fault, the page-table
+//! walk of the faulting address; on serial only, it ends with the last 16
+//! trace events (what led up to it).
 //!
 //! The reporter must not make things worse: it takes no locks it could
 //! deadlock on, follows a frame pointer only if it points into a known stack
 //! ([`crate::arch::stacks::contains`]), and detects a crash while reporting a
 //! crash (it then prints a one-line notice and stops).
 //!
-//! The output format is parsed by `tests/scenarios/test_crash.py`; change
-//! both together.
+//! The output format is parsed by `tests/scenarios/test_crash.py` and
+//! `test_mm.py` (the page walk); change them together.
 
 use crate::arch::{self, TrapFrame, serial::SerialWriter};
 use crate::symbols::Symbolized;
@@ -112,9 +112,6 @@ fn write_exception(w: &mut dyn Write, f: &TrapFrame, cr2: u64) {
     if f.vector == 14 {
         let _ = writeln!(w, "  {}", PageFaultCause(f.error_code));
         let _ = writeln!(w, "  faulting address (cr2): {cr2:#018x}");
-        // Lock-free and reads only mapped RAM (the fault may have happened
-        // with the page-table lock held, or in the tables themselves).
-        let _ = crate::mm::paging::write_walk(w, cr2);
     }
     let _ = writeln!(w, "rip: {:#018x} <{}>", f.rip, Symbolized(f.rip));
     let _ = writeln!(w, "rsp: {:#018x}  rflags: {:#010x}  cs: {:#06x}  ss: {:#06x}", f.rsp, f.rflags, f.cs, f.ss);
@@ -149,6 +146,13 @@ fn write_exception(w: &mut dyn Write, f: &TrapFrame, cr2: u64) {
         arch::read_cr4()
     );
     let _ = write_backtrace(w, Some(f.rip), f.rbp);
+    if f.vector == 14 {
+        // Last, so that if the walk faults (a damaged HHDM) the nested-crash
+        // guard costs only the walk. Lock-free: the fault may have happened
+        // with the page-table lock held. A table entry pointing outside RAM
+        // ends the walk instead of faulting.
+        let _ = crate::mm::paging::write_walk(w, cr2);
+    }
 }
 
 /// Decoded #PF error code.

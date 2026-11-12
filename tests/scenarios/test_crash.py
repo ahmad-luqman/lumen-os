@@ -8,6 +8,7 @@ QEMU with status 0 (`-no-reboot`), which fails these tests.
 import re
 
 import pytest
+from lumen_harness.crash import backtrace, page_walk
 from lumen_harness.image import assert_matches_golden
 
 SCREEN_DONE = "(crash report shown on screen)"
@@ -23,10 +24,6 @@ FAULTS = {
     ),
     "df": (r"exception: #DF double fault \(vector 8,", "kmon::crash_double_fault"),
 }
-
-
-def backtrace(report: str) -> list[str]:
-    return re.findall(r"^  #\d+\s+0x[0-9a-f]{16} <(.+)>$", report, re.MULTILINE)
 
 
 @pytest.mark.parametrize("kind", sorted(FAULTS))
@@ -69,12 +66,12 @@ def test_page_fault_report_names_address_and_cause(crash_report):
     report = crash_report("pf")
     assert "faulting address (cr2): 0x00000000deadb000" in report
     assert "page fault: write of non-present page (kernel mode)" in report
-    # The page-table walk of cr2: the lower half is empty, so it stops at
-    # the first level.
-    walk = report[report.index("  page walk (cr3 ") :]
-    assert re.match(
-        r"  page walk \(cr3 0x[0-9a-f]+\):\n    L4\[000\] 0x0{16}\n    -> not present at L4\n", walk
-    ), walk
+    # The page-table walk of cr2, after the backtrace: the lower half is
+    # empty, so it stops at the first level.
+    walk = page_walk(report)
+    assert walk.virt == 0xDEADB000, report
+    assert walk.steps == [(4, 0, 0)] and walk.end == "not present at L4", report
+    assert report.index("page walk of") > report.index("backtrace:"), report
 
 
 def test_panic_produces_report(crash_report):

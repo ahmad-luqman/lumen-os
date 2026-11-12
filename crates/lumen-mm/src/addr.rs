@@ -43,8 +43,10 @@ impl PhysAddr {
         }
     }
 
-    /// Is the address a multiple of `align` (a power of two)?
+    /// Is the address a multiple of `align`? Panics unless `align` is a
+    /// power of two.
     pub const fn is_aligned(self, align: u64) -> bool {
+        assert!(align.is_power_of_two(), "alignment must be a power of two");
         self.0 & (align - 1) == 0
     }
 }
@@ -81,6 +83,18 @@ impl PhysFrame {
     /// The start address as a raw `u64`.
     pub const fn as_u64(self) -> u64 {
         self.0.0
+    }
+
+    /// The frame `frames` frames after this one, or `None` past the end of
+    /// the physical address space.
+    pub const fn checked_add(self, frames: u64) -> Option<Self> {
+        match frames.checked_mul(FRAME_SIZE) {
+            Some(bytes) => match self.0.checked_add(bytes) {
+                Some(a) => Some(Self(a)),
+                None => None,
+            },
+            None => None,
+        }
     }
 }
 
@@ -122,14 +136,19 @@ impl VirtAddr {
         }
     }
 
-    /// Round down to a multiple of `align` (a power of two, at most 2^47).
-    /// Clearing low bits keeps a canonical address canonical.
+    /// Round down to a multiple of `align`. Panics unless `align` is a power
+    /// of two no larger than 2^47: clearing only bits below 47 keeps a
+    /// canonical address canonical (clearing bit 47 of an upper-half address
+    /// would not).
     pub const fn align_down(self, align: u64) -> Self {
+        assert!(align.is_power_of_two() && align <= 1 << (VIRT_ADDR_BITS - 1), "bad alignment");
         Self(self.0 & !(align - 1))
     }
 
-    /// Is the address a multiple of `align` (a power of two)?
+    /// Is the address a multiple of `align`? Panics unless `align` is a
+    /// power of two.
     pub const fn is_aligned(self, align: u64) -> bool {
+        assert!(align.is_power_of_two(), "alignment must be a power of two");
         self.0 & (align - 1) == 0
     }
 }
@@ -204,6 +223,29 @@ mod tests {
         assert_eq!(v.align_down(1 << 21).as_u64(), 0xffff_8000_0000_0000);
         assert!(v.is_aligned(2) && !v.is_aligned(4));
         assert!(v.align_down(FRAME_SIZE).is_aligned(FRAME_SIZE));
+    }
+
+    #[test]
+    fn frames_step_by_whole_frames() {
+        let f = PhysFrame::from_u64(0x5000).unwrap();
+        assert_eq!(f.checked_add(0), Some(f));
+        assert_eq!(f.checked_add(3).map(PhysFrame::as_u64), Some(0x8000));
+        let last = PhysFrame::from_u64(PHYS_LIMIT - FRAME_SIZE).unwrap();
+        assert_eq!(last.checked_add(1), None);
+        assert_eq!(f.checked_add(u64::MAX), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "bad alignment")]
+    fn align_down_refuses_to_break_canonical_form() {
+        // Clearing bit 47 of an upper-half address would make it non-canonical.
+        let _ = VirtAddr::new(0xffff_8000_0000_0000).unwrap().align_down(1 << 48);
+    }
+
+    #[test]
+    #[should_panic(expected = "power of two")]
+    fn zero_alignment_is_a_bug() {
+        let _ = PhysAddr::new(0).unwrap().is_aligned(0);
     }
 
     #[test]

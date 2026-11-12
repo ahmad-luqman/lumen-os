@@ -10,7 +10,9 @@ Binary checks (the built kernel ELFs):
   * Every allocated section inside [__kernel_start, __kernel_end): the
     kernel's page tables map exactly that range and the frame allocator
     reserves it, so a section the linker script doesn't place (an orphan,
-    like `.got` once was) would be unmapped and unprotected.
+    like `.got` once was) would be unmapped and unprotected. Writable
+    sections must be in the data segment and executable ones in the text
+    segment, which is how the page tables map them.
   * No SSE/AVX/MMX/AVX-512 register or state instruction anywhere in the
     disassembly. The kernel never saves vector state on interrupts, so one
     stray `movaps` would corrupt user state later.
@@ -92,6 +94,38 @@ def scan_disassembly(text: str) -> list[Finding]:
     return findings
 
 
+@dataclass
+class Section:
+    name: str
+    addr: int
+    size: int | None  # None if the readobj output has no Size line
+    flags: set[str]
+
+
+def alloc_sections(readobj: str) -> tuple[list[Section], list[Finding]]:
+    """The SHF_ALLOC sections in `llvm-readobj --sections` output. An
+    allocated section whose name or address can't be parsed is a finding,
+    not skipped: a format change must not make the checks pass vacuously."""
+    sections: list[Section] = []
+    findings: list[Finding] = []
+    for block in readobj.split("Section {")[1:]:
+        flags = set(re.findall(r"^\s*(SHF_\w+) \(", block, re.MULTILINE))
+        if "SHF_ALLOC" not in flags:
+            continue
+        name = re.search(r"^\s*Name: (\S+)", block, re.MULTILINE)
+        addr = re.search(r"^\s*Address: (0x[0-9A-Fa-f]+)$", block, re.MULTILINE)
+        size = re.search(r"^\s*Size: (\d+)$", block, re.MULTILINE)
+        if not (name and addr):
+            findings.append(Finding("elf", f"unparseable allocated section: {block[:80]!r}"))
+            continue
+        sections.append(
+            Section(
+                name.group(1), int(addr.group(1), 16), int(size.group(1)) if size else None, flags
+            )
+        )
+    return sections, findings
+
+
 def check_sections(readobj: str) -> list[Finding]:
     """Check `llvm-readobj --file-headers --sections` output."""
     findings: list[Finding] = []
@@ -101,42 +135,68 @@ def check_sections(readobj: str) -> list[Finding]:
         findings.append(Finding("elf", "not an x86-64 file"))
     if "Type: Executable" not in readobj:
         findings.append(Finding("elf", "not a static executable (ET_EXEC)"))
-    for block in readobj.split("Section {")[1:]:
-        name = re.search(r"Name: (\S+)", block)
-        addr = re.search(r"Address: (0x[0-9A-Fa-f]+)", block)
-        alloc = "SHF_ALLOC" in block
-        if alloc and name and addr and int(addr.group(1), 16) < KERNEL_BASE:
-            findings.append(
-                Finding("code-model", f"section {name.group(1)} at {addr.group(1)} below -2GiB")
-            )
+    sections, problems = alloc_sections(readobj)
+    findings += problems
+    if not any(s.name == ".text" for s in sections):
+        findings.append(
+            Finding("elf", "no allocated .text section found (readobj format changed?)")
+        )
+    for s in sections:
+        if s.addr < KERNEL_BASE:
+            findings.append(Finding("code-model", f"section {s.name} at {s.addr:#x} below -2GiB"))
     return findings
+
+
+# Sections the linker flags writable that the kernel maps read-only on
+# purpose. `.got`: the kernel is statically linked, so its entries are fixed
+# at link time and nothing (no dynamic loader) writes them; read-only keeps
+# those function pointers from being overwritten.
+READ_ONLY_WRITABLE = {".got"}
 
 
 def check_image_bounds(readobj: str, nm: str) -> list[Finding]:
     """Check every allocated section (`llvm-readobj --sections`) lies inside
-    [__kernel_start, __kernel_end) (from `llvm-nm`)."""
+    [__kernel_start, __kernel_end), and in the segment the page tables give
+    the rights it needs: writable sections in [__data_start, __kernel_end),
+    executable ones in [__kernel_start, __rodata_start) (symbols from
+    `llvm-nm`)."""
     symbols = {
         name: int(addr, 16)
         for addr, _, name in re.findall(r"^([0-9a-f]+) (\w) (\S+)$", nm, re.MULTILINE)
     }
-    start, end = symbols.get("__kernel_start"), symbols.get("__kernel_end")
-    if start is None or end is None:
-        return [Finding("image", "__kernel_start or __kernel_end missing from the symbol table")]
-    findings: list[Finding] = []
-    for block in readobj.split("Section {")[1:]:
-        name = re.search(r"Name: (\S+)", block)
-        addr = re.search(r"Address: (0x[0-9A-Fa-f]+)", block)
-        size = re.search(r"Size: (\d+)", block)
-        if "SHF_ALLOC" not in block or not (name and addr and size):
+    names = ("__kernel_start", "__rodata_start", "__data_start", "__kernel_end")
+    missing = [n for n in names if n not in symbols]
+    if missing:
+        return [Finding("image", f"{', '.join(missing)} missing from the symbol table")]
+    start, rodata, data, end = (symbols[n] for n in names)
+    sections, findings = alloc_sections(readobj)
+    if not sections:
+        findings.append(Finding("image", "no allocated sections parsed (readobj format changed?)"))
+    for s in sections:
+        if s.size is None:
+            findings.append(Finding("image", f"section {s.name} has no size"))
             continue
-        lo = int(addr.group(1), 16)
-        hi = lo + int(size.group(1))
+        lo, hi = s.addr, s.addr + s.size
         if lo < start or hi > end:
             findings.append(
                 Finding(
                     "image",
-                    f"section {name.group(1)} [{lo:#x}, {hi:#x}) is outside the kernel image "
+                    f"section {s.name} [{lo:#x}, {hi:#x}) is outside the kernel image "
                     f"[{start:#x}, {end:#x}): place it in linker.ld",
+                )
+            )
+        elif "SHF_WRITE" in s.flags and lo < data and s.name not in READ_ONLY_WRITABLE:
+            findings.append(
+                Finding(
+                    "image",
+                    f"writable section {s.name} at {lo:#x} is below __data_start (mapped read-only)",
+                )
+            )
+        elif "SHF_EXECINSTR" in s.flags and hi > rodata:
+            findings.append(
+                Finding(
+                    "image",
+                    f"executable section {s.name} ends at {hi:#x}, past __rodata_start (mapped NX)",
                 )
             )
     return findings

@@ -4,27 +4,30 @@
 //! The logic is in the host-tested `lumen-mm` crate; this module feeds it:
 //!
 //! 1. **Usable memory** is exactly the `usable` entries of Limine's memory map.
-//!    Bootloader-reclaimable memory stays reserved for now (Limine's page
-//!    tables, the boot stack and the kernel file live there).
+//!    Bootloader-reclaimable memory stays reserved for now (the boot stack,
+//!    Limine's responses and its page tables, unused after the switch to the
+//!    kernel's own, live there).
 //! 2. **Reservations** are made explicitly, by name: frame 0, the kernel
 //!    image, the kernel ELF file (the crash reporter's symbols), the boot stack
 //!    and the framebuffer (those four found by translating their live virtual
 //!    addresses through the page tables rather than trusting the map's
 //!    labels), the ACPI RSDP (Limine's physical address) and the allocator's
 //!    own bitmaps. On top of that every non-usable map entry is reserved (in
-//!    case entries overlap) and so is every frame of the active page tables.
+//!    case entries overlap) and so is every frame of Limine's page tables
+//!    (active while the allocator is built; the kernel's own tables are then
+//!    allocated from it).
 //!
 //! The named list is printed at `debug` level (`lumen.log=debug`). The
 //! in-kernel tests check, independently of that list, that no frame behind
-//! the kernel image, boot stack, kernel file or framebuffer, and no page-table
-//! frame, is allocatable; then allocate every frame and check each one against
-//! the memory map and the list.
+//! a range the kernel is using (`mm::live_ranges`) is allocatable and no
+//! page-table frame is free; then allocate every frame and check each one
+//! against the memory map and the list.
 
 use limine::memory_map::{Entry, EntryType};
 use log::{debug, info, warn};
 use lumen_mm::{FRAME_SIZE, FrameAllocator, FreeError, PhysFrame, PhysRange, VirtAddr, align_down};
 
-use super::paging;
+use super::{kernel_image, pages, paging};
 use crate::arch::{self, paging as hw};
 use crate::boot;
 use crate::sync::SpinLock;
@@ -84,37 +87,22 @@ struct State {
 
 static STATE: SpinLock<Option<State>> = SpinLock::new(None);
 
-unsafe extern "C" {
-    static __kernel_start: u8;
-    static __kernel_end: u8;
-}
-
-fn kernel_image_virt() -> (u64, u64) {
-    let start = &raw const __kernel_start as u64;
-    (start, &raw const __kernel_end as u64 - start)
-}
-
 /// The framebuffer as `(virtual address, length)`, if Limine gave one.
 pub fn framebuffer_virt() -> Option<(u64, u64)> {
     let fb = boot::FRAMEBUFFER.get_response()?.framebuffers().next()?;
     Some((fb.addr() as u64, fb.pitch() * fb.height()))
 }
 
-/// The virtual page addresses touched by `[virt, virt + len)`.
-fn pages(virt: u64, len: u64) -> impl Iterator<Item = u64> {
-    (align_down(virt, FRAME_SIZE)..virt + len).step_by(FRAME_SIZE as usize)
+/// The physical address `virt` maps to in the active page tables.
+fn translate(virt: u64) -> Option<u64> {
+    VirtAddr::new(virt).and_then(paging::translate).map(|p| p.as_u64())
 }
 
 /// The physical range behind `[virt, virt + len)`, which must be mapped and
 /// physically contiguous (true for the HHDM and for the kernel image Limine
 /// loads). Panics otherwise: guessing would risk handing out live memory.
 fn phys_range_of(what: &str, virt: u64, len: u64) -> PhysRange {
-    let translate = |v: u64| {
-        VirtAddr::new(v)
-            .and_then(paging::translate)
-            .unwrap_or_else(|| panic!("{what}: virtual address {v:#x} is not mapped"))
-            .as_u64()
-    };
+    let translate = |v: u64| translate(v).unwrap_or_else(|| panic!("{what}: virtual address {v:#x} is not mapped"));
     let start = translate(virt);
     let (first_page, first_frame) = (align_down(virt, FRAME_SIZE), align_down(start, FRAME_SIZE));
     for page in pages(virt, len) {
@@ -170,7 +158,7 @@ fn named_reservations(hhdm: u64) -> Reservations {
     let mut r = Reservations::new();
     r.push(NULL_FRAME, PhysRange::new(0, FRAME_SIZE));
 
-    let (kstart, klen) = kernel_image_virt();
+    let (kstart, klen) = kernel_image();
     let image = phys_range_of(KERNEL_IMAGE, kstart, klen);
     match boot::EXECUTABLE_ADDRESS.get_response() {
         // Two sources disagreeing means one of them is wrong about where the
@@ -238,7 +226,8 @@ pub fn init(hhdm: u64) {
     // none should be in a usable hole. Check before zeroing the bitmap over one.
     paging::for_each_active_table(|table| {
         assert!(!bitmap.contains(table.as_u64()), "frame bitmap would overwrite page table {table}");
-    });
+    })
+    .unwrap_or_else(|t| panic!("boot page table {t} is outside HHDM-mapped RAM; can't check its subtree"));
 
     // SAFETY: `bitmap` lies in a usable map entry, which the HHDM maps
     // writable, and is frame-aligned (so `u64`-aligned). Limine guarantees
@@ -265,7 +254,8 @@ pub fn init(hhdm: u64) {
     }
     let tables = paging::for_each_active_table(|table| {
         frames.reserve(PhysRange::from_len(table.as_u64(), FRAME_SIZE)).expect(NOTHING_ALLOCATED);
-    });
+    })
+    .unwrap_or_else(|t| panic!("boot page table {t} is outside HHDM-mapped RAM; can't reserve its subtree"));
 
     for r in reserved.as_slice() {
         debug!(target: "mem", "reservation {} {} ({})", r.range, r.name, Size(r.range.len()));
@@ -363,7 +353,7 @@ mod checks {
     pub fn any_free() -> bool {
         with_state(|s| {
             let span = s.frames.span();
-            (span.start()..span.end()).step_by(FRAME_SIZE as usize).any(|f| s.frames.is_free(f))
+            pages(span.start(), span.len()).any(|f| s.frames.is_free(f))
         })
     }
 
@@ -384,12 +374,13 @@ mod checks {
         bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
     }
 
-    /// Kernel `.text` and `.rodata` (which ends with `.ktests`): never written.
+    /// Kernel `.text` and `.rodata` up to the end of `.ktests` (the `.got`
+    /// after it isn't covered): never written.
     pub fn kernel_readonly() -> &'static [u8] {
         unsafe extern "C" {
             static __ktests_end: u8;
         }
-        let (start, _) = kernel_image_virt();
+        let (start, _) = kernel_image();
         let len = &raw const __ktests_end as u64 - start;
         // SAFETY: the kernel's text and rodata segments are mapped and
         // immutable for the life of the kernel.
@@ -399,25 +390,6 @@ mod checks {
     pub fn kernel_file() -> Result<&'static [u8], &'static str> {
         let resp = boot::EXECUTABLE_FILE.get_response().ok_or("no kernel file response")?;
         Ok(crate::file_bytes(resp.file()))
-    }
-
-    /// The virtual ranges the kernel is using right now ([`crate::mm::live_ranges`]),
-    /// as `(name, virtual address, length)`. Every Limine response they
-    /// need must be present, so no check can be silently skipped.
-    pub fn live_ranges() -> Result<[(&'static str, u64, u64); 8], &'static str> {
-        let ranges = crate::mm::live_ranges();
-        if let Some((name, _)) = ranges.iter().find(|(_, r)| r.is_none()) {
-            crate::ktest::diag(format_args!("live range '{name}' unknown"));
-            return Err("a live range is unknown (missing Limine response?)");
-        }
-        Ok(ranges.map(|(name, r)| {
-            let (virt, len) = r.unwrap_or_default();
-            (name, virt, len)
-        }))
-    }
-
-    pub fn translate(virt: u64) -> Option<u64> {
-        VirtAddr::new(virt).and_then(paging::translate).map(|p| p.as_u64())
     }
 
     /// The first frame the kernel is using that may be handed out: a frame
@@ -430,7 +402,14 @@ mod checks {
         is_owned: impl Fn(u64) -> bool,
         is_free: impl Fn(u64) -> bool,
     ) -> Result<Option<(&'static str, u64)>, &'static str> {
-        for (name, virt, len) in live_ranges()? {
+        for (name, range) in crate::mm::live_ranges() {
+            // Every live range is known in the test configuration (Limine
+            // gives every response, and the cmdline is never empty), so no
+            // check is silently skipped.
+            let Some((virt, len)) = range else {
+                crate::ktest::diag(format_args!("live range '{name}' unknown"));
+                return Err("a live range is unknown (missing Limine response?)");
+            };
             for page in pages(virt, len) {
                 let phys = translate(page).ok_or("a live page is not mapped")?;
                 if is_owned(phys) {
@@ -443,7 +422,8 @@ mod checks {
             if table.is_none() && is_free(t.as_u64()) {
                 table = Some(("page table", t.as_u64()));
             }
-        });
+        })
+        .map_err(|_| "a page table is unreadable")?;
         Ok(table)
     }
 
@@ -577,8 +557,7 @@ mod checks {
         }
         if problem.is_some() {
             let span = with_state(|s| s.frames.span());
-            let swept =
-                (span.start()..span.end()).step_by(FRAME_SIZE as usize).filter(|&f| ours(f) && free_raw(f).is_ok());
+            let swept = pages(span.start(), span.len()).filter(|&f| ours(f) && free_raw(f).is_ok());
             let swept = swept.count();
             crate::ktest::diag(format_args!("freed {swept} more frames by sweeping the bitmap"));
             freed += swept;
@@ -633,13 +612,13 @@ crate::ktest!(
         // one frame in use is allocatable, and it must be named.
         use self::checks::*;
         use crate::kassert_eq;
-        let (kstart, _) = kernel_image_virt();
+        let (kstart, _) = kernel_image();
         let (_, stack_top) = arch::stacks::boot_stack();
         let image = translate(kstart).ok_or("kernel not mapped")?;
         let stack = translate(align_down(stack_top - 1, FRAME_SIZE)).ok_or("stack not mapped")?;
         let bitmap = reservation(BITMAP)?.start();
         let mut table = 0;
-        paging::for_each_active_table(|t| table = t.as_u64());
+        paging::for_each_active_table(|t| table = t.as_u64()).map_err(|_| "a page table is unreadable")?;
         let never = |_: u64| false;
         kassert_eq!(first_live_owned(|p| p == image, never)?, Some((KERNEL_IMAGE, image)));
         kassert_eq!(first_live_owned(|p| p == stack, never)?, Some((BOOT_STACK, stack)));
@@ -693,7 +672,11 @@ crate::ktest!(
 crate::ktest!(
     fn translate_agrees_with_the_hhdm() {
         // The reservations and the oracle share the page-table walker; check
-        // it against an independent answer: the HHDM maps `p` at `hhdm + p`.
+        // it against the HHDM's definition: `p` at `hhdm + p`. (The HHDM is
+        // built by the same lumen_mm mapper, so this checks walk against
+        // map's offsets; the CPU's view is checked by never_returns_reserved
+        // writing every frame through the HHDM. 0x1000 is usable low memory
+        // on OVMF.)
         use self::checks::*;
         use crate::{kassert, kassert_eq};
         kassert!(hw::four_level());

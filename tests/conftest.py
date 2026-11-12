@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 from lumen_harness import BUILD_DIR, REPO_ROOT
+from lumen_harness.crash import BEGIN, END, PROTECTION_BROKEN
 from lumen_harness.qemu import EXIT_CRASH, Machine
 
 ISOS = {
@@ -28,8 +29,6 @@ ISOS = {
 # artifacts apart from the first run's: CI re-runs KVM failures under TCG.
 ARTIFACTS = REPO_ROOT / (os.environ.get("LUMEN_ARTIFACTS_DIR") or BUILD_DIR / "test-artifacts")
 GOLDEN_DIR = Path(__file__).parent / "golden"
-CRASH_BEGIN = "==== LUMEN CRASH REPORT ===="
-CRASH_END = "==== END CRASH REPORT ===="
 
 
 @pytest.hookimpl(wrapper=True)
@@ -87,9 +86,11 @@ def crash_report(boot: Callable[[str], Machine]) -> Callable[[str], str]:
         m = boot("qemutest")
         m.expect(r"kmon> ", 60)
         m.send_line(f"crash {kind}")
-        m.expect(re.escape(CRASH_END), 30)
+        # A deliberate protection fault that doesn't fault says so at once.
+        done = m.expect(rf"{re.escape(END)}|{PROTECTION_BROKEN.pattern}", 30)
+        assert done.group(0) == END, f"no crash: {done.group(0)}"
         assert m.wait_exit(10) == EXIT_CRASH
         out = m.output
-        return out[out.index(CRASH_BEGIN) : out.index(CRASH_END) + len(CRASH_END)]
+        return out[out.index(BEGIN) : out.index(END) + len(END)]
 
     return _crash

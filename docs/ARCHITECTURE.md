@@ -117,9 +117,9 @@ rather than trusting the map's labels), the ACPI RSDP and the allocator's own
 bitmaps. Every non-usable map entry (including the `acpi-*` entries, where
 firmware normally puts the ACPI tables; #2 must reserve any table it finds in
 usable memory, before anything allocates, since `reserve` refuses frames
-already handed out) and every frame of the active page tables is reserved
-too. The
-named list is logged at `debug` level.
+already handed out) and every frame of Limine's page tables (active while
+the allocator is built; the kernel's own tables are then allocated from it)
+is reserved too. The named list is logged at `debug` level.
 
 It is a bitmap allocator with two bits per 4 KiB frame (64 KiB per GiB of
 physical span): *owned* (usable and not reserved) and *free*. Reserved and
@@ -134,14 +134,16 @@ allocated (`free` for `alloc`, `free_contiguous` with the same count for
 interface if contiguous allocation becomes hot.
 
 In-kernel tests check, independently of the reservation list (by walking the
-page tables), that no frame behind the kernel image, boot stack, kernel file
-or framebuffer, and no page-table frame, is allocatable, and that the check
-itself fires when a frame in use is reported free. They then allocate every
+page tables), that no frame behind a range the kernel is using (kernel image,
+boot stack, current stack page, kernel file, framebuffer, frame bitmap,
+memory map, cmdline) is allocatable and no page-table frame is free, and
+that the check itself fires when a frame in use is reported free. They then allocate every
 frame, check each against the memory map and the reservation list, fill it,
 tag it with a sequence number, and free them all, checking each tag (catches
 a frame handed out twice) (hard rule 2). Bootloader-reclaimable
 memory is not returned yet; whoever adds that must first copy or stop using
-everything in it (page tables, boot stack, kernel file).
+everything in it (the boot stack and Limine's responses, including the
+memory map; Limine's page tables are unused after the switch).
 
 ### Page tables (built in M1)
 
@@ -149,24 +151,34 @@ At boot the kernel runs on Limine's tables. Right after the frame allocator
 exists, `kernel/src/mm/paging.rs` builds its own hierarchy from allocator
 frames (zeroed) and switches CR3:
 
-- **HHDM** at Limine's offset, covering the memory-map entry types Limine's
-  HHDM covers at base revision 3 (usable, bootloader-reclaimable, kernel and
-  modules, framebuffer), so every HHDM pointer Limine handed out stays valid.
-  2 MiB pages where a whole one fits, 4 KiB at the edges. ACPI memory is not
-  in the HHDM; ACPI parsing (#2) maps what it needs (`map_mmio` maps the RSDP
-  already).
+- **HHDM** at Limine's offset, covering the memory-map entry types the
+  Limine protocol says its HHDM covers at base revision 3 (usable,
+  bootloader-reclaimable, kernel and modules, framebuffer), so every HHDM
+  pointer Limine handed out stays valid. No-execute; read-write except the
+  kernel-and-modules entries, which are read-only so the kernel's code has
+  no writable alias (W^X holds per frame, not just per page); the
+  framebuffer is write-combining. 2 MiB pages where a whole one fits, 4 KiB
+  elsewhere. ACPI memory is not in the HHDM; ACPI parsing (#2) maps what it
+  needs (`map_mmio` maps the RSDP already). A ktest checks the HHDM covers
+  each such entry completely and nothing else is mapped outside the image
+  and the MMIO window.
 - **Kernel image** per segment from the linker script's page-aligned
   boundaries (`__rodata_start`, `__data_start`): text R-X, rodata R--, data
   RW-. `make audit` checks every allocated section of the ELF lies inside
-  `[__kernel_start, __kernel_end)`, so nothing the kernel uses is left
-  unmapped (an orphan `.got` once was; it is now placed in rodata).
+  `[__kernel_start, __kernel_end)` and writable and executable sections sit
+  in the segment that grants that, so nothing the kernel uses is left
+  unmapped or mapped wrongly (an orphan `.got` once was; it is now placed,
+  read-only, in rodata: its entries are fixed at link time).
 - **Nothing else.** The lower half is empty, so null and small pointers fault.
 
-Before loading CR3 it checks that every range the kernel is using (image,
-boot stack, current stack page, kernel file, framebuffer, frame bitmap,
-memory map, cmdline) and every page Limine mapped in the kernel's 2 GiB
-translates to the same frame under the new tables: a mistake is an assertion
-with a message, not a fault with no stack. EFER.NXE and CR0.WP are set (so
+Before loading CR3 it checks that every page of every range the kernel is
+using (image, boot stack, current stack page, kernel file, framebuffer,
+frame bitmap, memory map and its entries, cmdline), every page Limine mapped
+in the kernel's 2 GiB, and every 2 MiB step of each HHDM entry translates to
+the same frame under the new tables, writable where the kernel writes (the
+stacks, the bitmap, `.data`/`.bss`): a mistake is an assertion naming the
+range and both walks, not a fault with no stack. A ktest shows the check
+fires on an empty hierarchy. EFER.NXE and CR0.WP are set (so
 read-only pages bind in ring 0 too) and the PAT layout the mappings rely on
 (slot 0 WB, 3 UC, 5 WC, set up by Limine) is checked rather than rewritten.
 
@@ -174,12 +186,22 @@ The entry format, walks and mapper are pure logic in `lumen_mm::paging`,
 tested on the host against fake table memory (including a randomized
 comparison with a model). Table entries are permissive; rights are enforced
 at the leaves, and walks report the rights combined over every level, which
-is what the CPU enforces. The kernel API: `map`/`unmap` (4 KiB, `unmap`
-invalidates the TLB entry), `map_mmio` (uncached, permanent, refuses RAM the
-HHDM maps, since two memory types for one frame is undefined), `walk` and
-`translate`. Tables are never freed. A page fault's crash report includes the
-walk of CR2 (every entry read, then the page and its rights, or the level
-that is not present), read without locks.
+is what the CPU enforces; `Attrs` can't express a writable and executable
+page. The kernel API:
+
+- `map`/`unmap`: 4 KiB pages in the heap and stack windows only, of frames
+  the allocator handed out, write-back; `unmap` invalidates the TLB entry.
+  Everything else (image, HHDM, MMIO) is fixed, so safe code can't remap
+  memory that live references point into.
+- `map_mmio`: uncached, permanent; refuses memory the HHDM maps (two memory
+  types for one frame is undefined); a failed call maps nothing.
+- `walk`, `translate`, and sweeps over every table and every mapping (which
+  report a table they couldn't read instead of skipping it).
+
+Tables are never freed. A page fault's crash report ends with the walk of
+CR2 (every entry read, then the page and its rights, or the level that is
+not present), taken without locks; a table outside HHDM-mapped RAM ends the
+walk instead of being read.
 
 The kernel's upper-half entries are not yet shared with anything; processes
 (M2) will need the kernel's L4 entries 256-511 copied into every address

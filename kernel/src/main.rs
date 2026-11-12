@@ -4,7 +4,8 @@
 //! 1. `_start` (naked): clear rbp so backtraces end here, align the stack.
 //! 2. `arch::init_early`: serial, GDT/TSS (IST stacks), IDT. From here on any
 //!    CPU exception produces a crash report.
-//! 3. Logger, Limine responses, symbol table, memory map, framebuffer.
+//! 3. Logger, Limine responses, symbol table, memory map, frame allocator and
+//!    the kernel's own page tables (`mm::init`), framebuffer.
 //! 4. Either the in-kernel tests (`--features ktest`) or the kernel monitor.
 
 #![no_std]
@@ -142,8 +143,10 @@ fn log_memory_map() {
 
 /// The bytes of a file Limine loaded for us.
 fn file_bytes(file: &limine::file::File) -> &'static [u8] {
-    // SAFETY: Limine maps the file in the HHDM for the life of the kernel
-    // (bootloader-reclaimable memory, which the frame allocator keeps reserved).
+    // SAFETY: the file is in the HHDM (its memory-map entry type is one of
+    // `mm::paging::HHDM_TYPES`, which Limine's tables and then the kernel's
+    // map for the kernel's whole life), and the frame allocator never hands
+    // it out (non-usable memory, plus the `kernel file` reservation).
     unsafe { core::slice::from_raw_parts(file.addr(), file.size() as usize) }
 }
 
