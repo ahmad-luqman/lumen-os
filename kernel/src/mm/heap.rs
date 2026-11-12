@@ -4,9 +4,12 @@
 //! The algorithm (an address-ordered free list with coalescing) is
 //! [`lumen_heap::Heap`], host-tested. Here it manages the heap window from
 //! [`paging::HEAP_BASE`] up: when no free block fits, [`grow`] maps fresh
-//! frames at the heap's end (at least [`MIN_GROWTH`] at a time, or just what
-//! the request needs when that much isn't available) and appends them. The
-//! heap never shrinks and stops at [`paging::HEAP_LIMIT`].
+//! frames at the heap's end and appends them. It grows by its own size,
+//! between [`MIN_GROWTH`] and [`MAX_GROWTH`] (so a heap that reaches N
+//! bytes took about log2(N) trips to the page tables, not N / 64 KiB), or by
+//! what the request needs if that is more; when that much isn't available it
+//! grows by just what the request needs. The heap never shrinks and stops at
+//! [`paging::HEAP_LIMIT`].
 //!
 //! When the heap runs out (no frame for the heap or for a page table, or the
 //! window is full) the allocation returns null. Callers that can cope use
@@ -40,9 +43,13 @@ use lumen_mm::{FRAME_SIZE, VirtAddr};
 use super::{frame, paging};
 use crate::sync::SpinLock;
 
-/// The heap grows by at least this much at a time when it can: fewer,
-/// larger trips to the frame allocator and the page tables.
+/// The heap grows by its current size, at least this much when it can:
+/// fewer, larger trips to the frame allocator and the page tables.
 const MIN_GROWTH: u64 = 64 * 1024;
+
+/// ... and at most this much (unless a request needs more), so a heap that
+/// grew once and went quiet doesn't hold much it never uses.
+const MAX_GROWTH: u64 = 4 * 1024 * 1024;
 
 /// How many free blocks the crash report walks before giving up, so it
 /// finishes quickly even with a huge, fragmented free list.
@@ -164,7 +171,14 @@ fn grow(state: &mut State, layout: Layout) -> Result<(), GrowError> {
     result
 }
 
-/// [`grow`] without the bookkeeping: [`MIN_GROWTH`] (or what `layout`
+/// How much the heap prefers to grow by when it is `size` bytes: its own
+/// size, between [`MIN_GROWTH`] and [`MAX_GROWTH`] (whole pages, since the
+/// heap's size always is).
+fn preferred_growth(size: u64) -> u64 {
+    size.clamp(MIN_GROWTH, MAX_GROWTH)
+}
+
+/// [`grow`] without the bookkeeping: [`preferred_growth`] (or what `layout`
 /// needs, if more), falling back to just what it needs when the heap runs
 /// out on the way.
 fn try_grow(heap: &mut Heap, layout: Layout) -> Result<(), GrowError> {
@@ -172,9 +186,10 @@ fn try_grow(heap: &mut Heap, layout: Layout) -> Result<(), GrowError> {
     // `None` only for sizes near `isize::MAX`: far past the window anyway.
     let need = lumen_heap::growth_for(layout).ok_or(GrowError::WindowFull)? as u64;
     let exact = need.checked_next_multiple_of(FRAME_SIZE).ok_or(GrowError::WindowFull)?;
-    let bytes = match map_span(end, exact.max(MIN_GROWTH)) {
-        Err(e) if e.returns_null() && exact < MIN_GROWTH => map_span(end, exact).map(|()| exact)?,
-        result => result.map(|()| exact.max(MIN_GROWTH))?,
+    let preferred = exact.max(preferred_growth(heap.stats().size as u64));
+    let bytes = match map_span(end, preferred) {
+        Err(e) if e.returns_null() && exact < preferred => map_span(end, exact).map(|()| exact)?,
+        result => result.map(|()| preferred)?,
     };
     // SAFETY: `[end, end + bytes)` is now mapped read-write to frames
     // allocated for the heap, and nothing else uses it.
@@ -581,14 +596,55 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn growth_is_geometric() {
+        // A small request that has to grow the heap grows it by its own size
+        // (between MIN_GROWTH and MAX_GROWTH); a request bigger than that
+        // grows it by what the request needs. (The growth policy is checked
+        // as a function too: the heap's size when this runs depends on the
+        // tests before it.)
+        use crate::kassert_eq;
+        kassert_eq!(preferred_growth(0), MIN_GROWTH);
+        kassert_eq!(preferred_growth(MIN_GROWTH), MIN_GROWTH);
+        kassert_eq!(preferred_growth(1 << 20), 1 << 20);
+        kassert_eq!(preferred_growth(1 << 30), MAX_GROWTH);
+        let filler = fill()?;
+        let size = stats().size as u64;
+        let small = Layout::from_size_align(64, 16).map_err(|_| "layout")?;
+        // SAFETY: non-zero size.
+        let p = core::hint::black_box(unsafe { alloc::alloc::alloc(small) });
+        let grown_small = stats().size as u64 - size;
+        // The heap is full again apart from the new block's tail; a request
+        // bigger than MAX_GROWTH must grow it by (about) its own size.
+        let filler2 = fill()?;
+        let size2 = stats().size as u64;
+        let big = Layout::from_size_align(MAX_GROWTH as usize + 1, 16).map_err(|_| "layout")?;
+        // SAFETY: non-zero size.
+        let q = core::hint::black_box(unsafe { alloc::alloc::alloc(big) });
+        let grown_big = stats().size as u64 - size2;
+        crate::kassert!(!p.is_null() && !q.is_null());
+        kassert_eq!(grown_small, preferred_growth(size));
+        kassert_eq!(grown_big, (MAX_GROWTH + 1).next_multiple_of(16).next_multiple_of(FRAME_SIZE));
+        // SAFETY: allocated above with these layouts.
+        unsafe {
+            alloc::alloc::dealloc(q, big);
+            alloc::alloc::dealloc(p, small);
+        }
+        unfill(filler2);
+        unfill(filler);
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn small_growth_when_frames_are_scarce() {
-        // With fewer free frames than MIN_GROWTH needs, a one-page request
-        // still succeeds: the heap grows by just that page.
+        // With fewer free frames than the preferred growth needs, a one-page
+        // request still succeeds: the heap grows by just that page.
         use crate::{kassert, kassert_eq};
         use alloc::vec::Vec;
         let mut held = Vec::with_capacity(frame::free_frames());
         let filler = fill()?;
-        // 8 frames: half of MIN_GROWTH, but enough for a page and its tables.
+        // 8 frames: half of MIN_GROWTH (the smallest preferred growth), but
+        // enough for a page and its tables.
         while frame::free_frames() > 8 {
             held.push(frame::alloc().ok_or("frames ran out")?);
         }

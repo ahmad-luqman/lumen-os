@@ -230,9 +230,11 @@ our own page tables (#4); #6 replaces them (hard rule 4).
 `kernel/src/mm/heap.rs` is the `#[global_allocator]`; the algorithm is the
 host-tested `crates/lumen-heap`. One contiguous span grows up from the
 heap window's base: when no free block fits, the heap maps fresh frames at
-its end (at least 64 KiB at a time, or just the pages a request needs when
-64 KiB isn't available; read-write, no-execute, write-back, through
-`paging::map`) and appends them. Growing is all or nothing: if
+its end (read-write, no-execute, write-back, through `paging::map`) and
+appends them. It grows by its own size, between 64 KiB and 4 MiB, or by
+what the request needs if that is more (so a heap that reaches N bytes took
+about log2(N) growths); when that much isn't available it grows by just
+the pages the request needs. Growing is all or nothing: if
 frames or page tables run out part way, every page mapped so far is
 unmapped and its frame freed (the tables created stay; tables are never
 freed). The heap never shrinks and stops 1 GiB below the top of the window.
