@@ -2,7 +2,8 @@
 //! frequency from a reference clock, converting ticks to and from
 //! nanoseconds, and the counts the PIT and the local APIC timer are
 //! programmed with. All of it is integer math (the kernel has no floating
-//! point) in `u128` where products can overflow, so it holds for any uptime.
+//! point) in `u128` where products can overflow, so it holds for centuries
+//! of uptime (and then saturates).
 
 #![no_std]
 
@@ -49,6 +50,20 @@ pub fn periodic_count(timer_hz: u64, rate: u64) -> Option<u32> {
     u32::try_from((timer_hz + rate / 2) / rate).ok().filter(|&c| c > 0)
 }
 
+/// Ticks from `earlier` to `later`, two readings of a counter `mask` wide
+/// (`u64::MAX`, or `0xffff_ffff` for a 32-bit counter): correct across one
+/// wrap.
+pub fn counter_delta(earlier: u64, later: u64, mask: u64) -> u64 {
+    later.wrapping_sub(earlier) & mask
+}
+
+/// Is `hz` a believable TSC frequency? A miscounted reference gives wild
+/// values (a PIT that isn't there reads as finished at once); real TSCs run
+/// between tens of MHz and a few GHz.
+pub fn plausible_tsc_hz(hz: u64) -> bool {
+    (10_000_000..=100_000_000_000).contains(&hz)
+}
+
 /// The median of `samples` (sorted in place). A calibration window can be
 /// stretched by an SMI or, in a VM, by the host descheduling the vCPU; the
 /// median of a few windows ignores such outliers.
@@ -57,7 +72,7 @@ pub fn median(samples: &mut [u64]) -> Option<u64> {
     match samples.len() {
         0 => None,
         n if n % 2 == 1 => Some(samples[n / 2]),
-        n => Some(samples[n / 2 - 1] / 2 + samples[n / 2] / 2 + (samples[n / 2 - 1] % 2 + samples[n / 2] % 2) / 2),
+        n => Some(samples[n / 2 - 1].midpoint(samples[n / 2])),
     }
 }
 
@@ -92,24 +107,24 @@ impl Clock {
     }
 }
 
-/// A frequency for humans, with three significant figures at most:
-/// `2.90 GHz` is shown as "2.9 GHz", `1_193_182` as "1.19 MHz".
+/// A frequency for humans: rounded to hundredths of the largest unit it
+/// reaches, trailing zeros dropped (2_900_000_000 is "2.9 GHz", 1_193_182
+/// "1.19 MHz").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hz(pub u64);
 
 impl fmt::Display for Hz {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        const UNITS: [(u64, &str); 4] = [(1_000_000_000, "GHz"), (1_000_000, "MHz"), (1_000, "kHz"), (1, "Hz")];
-        let (scale, unit) = UNITS.into_iter().find(|&(s, _)| self.0 >= s).unwrap_or((1, "Hz"));
-        if scale == 1 {
+        const UNITS: [(u64, &str); 3] = [(1_000_000_000, "GHz"), (1_000_000, "MHz"), (1_000, "kHz")];
+        let Some((scale, unit)) = UNITS.into_iter().find(|&(s, _)| self.0 >= s) else {
             return write!(f, "{} Hz", self.0);
-        }
+        };
         // Hundredths of the unit, rounded; then drop trailing zeros.
         let hundredths = (u128::from(self.0) * 100 + u128::from(scale / 2)) / u128::from(scale);
         let (whole, frac) = (hundredths / 100, hundredths % 100);
         match frac {
             0 => write!(f, "{whole} {unit}"),
-            f10 if f10 % 10 == 0 => write!(f, "{whole}.{} {unit}", f10 / 10),
+            _ if frac % 10 == 0 => write!(f, "{whole}.{} {unit}", frac / 10),
             _ => write!(f, "{whole}.{frac:02} {unit}"),
         }
     }
@@ -162,6 +177,21 @@ mod tests {
         assert_eq!(periodic_count(499, 1000), None, "rounds to 0");
         assert_eq!(periodic_count(u64::from(u32::MAX) * 1000 + 1000, 1000), None, "over 32 bits");
         assert_eq!(periodic_count(1000, 0), None);
+    }
+
+    #[test]
+    fn counter_deltas_wrap_at_the_counter_width() {
+        assert_eq!(counter_delta(10, 25, u64::MAX), 15);
+        assert_eq!(counter_delta(0xffff_fff0, 0x10, 0xffff_ffff), 0x20, "a 32-bit counter wrapped");
+        assert_eq!(counter_delta(u64::MAX - 1, 3, u64::MAX), 5, "a 64-bit counter wrapped");
+        assert_eq!(counter_delta(5, 5, 0xffff_ffff), 0);
+    }
+
+    #[test]
+    fn tsc_frequencies_must_be_believable() {
+        assert!(plausible_tsc_hz(2_900_000_000) && plausible_tsc_hz(10_000_000) && plausible_tsc_hz(100_000_000_000));
+        assert!(!plausible_tsc_hz(9_999_999), "a PIT that finished at once");
+        assert!(!plausible_tsc_hz(100_000_000_001));
     }
 
     #[test]

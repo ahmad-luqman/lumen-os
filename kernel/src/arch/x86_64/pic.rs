@@ -11,9 +11,10 @@ const SLAVE_CMD: u16 = 0xa0;
 const SLAVE_DATA: u16 = 0xa1;
 const EOI: u8 = 0x20;
 
-/// Remap both PICs to `PIC_BASE..PIC_BASE + 16` and mask every line. Firmware
-/// leaves them at vectors 8-15 (on top of the CPU exceptions), so a spurious
-/// IRQ would otherwise look like a double fault.
+/// Remap both PICs to `PIC_BASE..PIC_BASE + 16` and mask every line. The
+/// BIOS default puts the master on vectors 8-15, over the CPU exceptions
+/// (IRQ 0 would arrive as a #DF), and what UEFI firmware leaves isn't
+/// specified, so remap to a known range before anything can arrive.
 pub fn remap_and_mask() {
     let wait = || {
         // A write to an unused port gives an old PIC time to settle.
@@ -56,4 +57,13 @@ pub fn masks() -> u16 {
 pub fn eoi_master() {
     // SAFETY: a non-specific EOI to the master only ends its current IRQ.
     unsafe { outb(MASTER_CMD, EOI) };
+}
+
+/// End a real (not spurious) IRQ `irq` (0-15) at the PICs that saw it.
+pub fn eoi(irq: u8) {
+    if irq >= 8 {
+        // SAFETY: as for `eoi_master`, at the slave.
+        unsafe { outb(SLAVE_CMD, EOI) };
+    }
+    eoi_master();
 }

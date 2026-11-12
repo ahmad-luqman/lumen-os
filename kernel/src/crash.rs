@@ -41,6 +41,9 @@ static FIRST_CR2: AtomicU64 = AtomicU64::new(0);
 /// Set while the serial-only tail (page walk, heap state) is being written: a
 /// fault there still ends the report properly.
 static IN_TAIL: AtomicBool = AtomicBool::new(false);
+/// Whether interrupts were on when the report began (after
+/// `disable_for_good`: they must not be).
+static ON_AT_ENTRY: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" {
     static __text_start: u8;
@@ -97,6 +100,7 @@ pub fn panic(info: &PanicInfo<'_>) -> ! {
 
 /// Guard against a crash inside the crash reporter.
 fn enter(vector: u64, rip: u64) {
+    ON_AT_ENTRY.store(arch::irq::enabled(), Ordering::SeqCst);
     if CRASHING.swap(true, Ordering::SeqCst) {
         let mut s = SerialWriter;
         if IN_TAIL.load(Ordering::SeqCst) {
@@ -163,9 +167,13 @@ fn emit(body: &dyn Fn(&mut dyn Write), tail: &dyn Fn(&mut dyn Write)) {
     // heap never resumes.
     let _ = unsafe { crate::mm::heap::write_crash_stats(&mut s) };
     IN_TAIL.store(false, Ordering::SeqCst);
-    // Every lock taken while reporting has been released by now: interrupts
-    // must still be off (`disable_for_good`).
-    let state = if arch::irq::enabled() { "on (the crash path turned them back on)" } else { "off" };
+    // Interrupts must have been off from the start (`disable_for_good`) and
+    // still be, now that every lock taken while reporting is released.
+    let state = match (ON_AT_ENTRY.load(Ordering::SeqCst), arch::irq::enabled()) {
+        (false, false) => "off",
+        (true, _) => "on when the report began (the crash path didn't turn them off)",
+        (false, true) => "on (the crash path turned them back on)",
+    };
     let _ = writeln!(s, "interrupts: {state}");
     let _ = writeln!(s, "{END_MARKER}");
     // Serial first: if drawing the screen faults, the serial report survives.

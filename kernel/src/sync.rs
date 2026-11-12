@@ -1,9 +1,10 @@
 //! Minimal synchronization primitives.
 //!
 //! [`SpinLock`] turns this CPU's interrupts off while it is held (nested, see
-//! `arch::irq`), so an interrupt handler that takes a lock can never spin on
-//! one the code it interrupted holds. One CPU for now; SMP (#9) needs no
-//! change here beyond per-CPU interrupt nesting.
+//! `arch::irq`), so a maskable interrupt's handler that takes a lock can
+//! never spin on one the code it interrupted holds. One CPU for now; SMP
+//! (#9) needs no change here beyond per-CPU interrupt nesting. A guard can't
+//! be sent to another thread (it holds this CPU's critical section).
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
@@ -29,24 +30,21 @@ impl<T> SpinLock<T> {
     }
 
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
-        arch::irq::push_off();
+        let irq = arch::irq::push_off();
         while self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             while self.locked.load(Ordering::Relaxed) {
                 core::hint::spin_loop();
             }
         }
-        SpinLockGuard { lock: self }
+        SpinLockGuard { lock: self, _irq: irq }
     }
 
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
-        arch::irq::push_off();
+        let irq = arch::irq::push_off();
         let taken = self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok();
-        if !taken {
-            arch::irq::pop_off();
-        }
         // Lazily: a guard built for a failed attempt would unlock the
-        // holder's lock when dropped.
-        taken.then(|| SpinLockGuard { lock: self })
+        // holder's lock when dropped. (A failed attempt drops `irq`.)
+        taken.then(|| SpinLockGuard { lock: self, _irq: irq })
     }
 
     /// Access the value even if the lock is held.
@@ -66,6 +64,9 @@ impl<T> SpinLock<T> {
 
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
+    /// Dropped after `drop` releases the lock: interrupts come back on (if
+    /// they were on) only once it is free.
+    _irq: arch::irq::IrqOff,
 }
 
 impl<T> Deref for SpinLockGuard<'_, T> {
@@ -86,13 +87,15 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
-        arch::irq::pop_off();
     }
 }
 
 crate::ktest!(
     fn a_held_lock_keeps_interrupts_off() {
         use crate::{kassert, kassert_eq};
+        // Tests run with interrupts on, outside any lock: "restored" means on.
+        kassert!(arch::irq::enabled());
+        kassert_eq!(arch::irq::depth(), 0);
         let (was, depth) = (arch::irq::enabled(), arch::irq::depth());
         let lock = SpinLock::new(0u32);
         {
@@ -109,6 +112,7 @@ crate::ktest!(
 crate::ktest!(
     fn guards_dropped_out_of_order_keep_interrupts_off_until_the_last() {
         use crate::{kassert, kassert_eq};
+        kassert!(arch::irq::enabled());
         let was = arch::irq::enabled();
         let (a, b) = (SpinLock::new(()), SpinLock::new(()));
         let ga = a.lock();
@@ -125,9 +129,12 @@ crate::ktest!(
     fn a_failed_try_lock_changes_nothing() {
         use crate::{kassert, kassert_eq};
         let lock = SpinLock::new(());
+        kassert!(arch::irq::enabled());
         let was = arch::irq::enabled();
         let held = lock.lock();
         let depth = arch::irq::depth();
+        kassert!(lock.try_lock().is_none());
+        // Still held: the failed attempt didn't release the holder's lock.
         kassert!(lock.try_lock().is_none());
         kassert_eq!(arch::irq::depth(), depth);
         kassert!(!arch::irq::enabled());

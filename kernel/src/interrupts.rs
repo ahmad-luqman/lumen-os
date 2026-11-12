@@ -11,12 +11,22 @@ use crate::arch::{apic, pic};
 use crate::mm::paging;
 use crate::sync::SpinLock;
 
-/// The I/O APICs, with the first global system interrupt each handles.
-static IO_APICS: SpinLock<Vec<(apic::IoApic, u32)>> = SpinLock::new(Vec::new());
+/// An I/O APIC and the first global system interrupt it handles.
+struct IoApic {
+    // Read by ktests; routing (device drivers, M3) reads both.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
+    regs: apic::IoApic,
+    #[allow(dead_code)]
+    gsi_base: u32,
+}
+
+static IO_APICS: SpinLock<Vec<IoApic>> = SpinLock::new(Vec::new());
 
 /// Set up the interrupt controllers. Interrupts stay off; needs `map_mmio`
 /// and the heap, and ACPI's description if there is one. Panics if the
-/// local APIC can't be used: the kernel can't keep time without it.
+/// local APIC can't be used (the kernel can't keep time without it), or an
+/// I/O APIC ACPI lists can't be mapped (its address is then wrong, and
+/// leaving its inputs as firmware set them would be worse).
 pub fn init() {
     pic::remap_and_mask();
     let base = apic::apic_base();
@@ -37,10 +47,10 @@ pub fn init() {
         let virt = map(u64::from(io.address), "I/O APIC");
         // SAFETY: `virt` maps this I/O APIC's registers for good, and only
         // this module drives it.
-        let ioapic = unsafe { apic::IoApic::new(virt) };
-        ioapic.mask_all();
-        inputs += ioapic.entries();
-        io_apics.push((ioapic, io.gsi_base));
+        let mut regs = unsafe { apic::IoApic::new(virt) };
+        regs.mask_all();
+        inputs += regs.entries();
+        io_apics.push(IoApic { regs, gsi_base: io.gsi_base });
     }
     if io_apics.is_empty() {
         warn!(target: "irq", "no I/O APIC known: device interrupts can't be routed");
@@ -64,11 +74,11 @@ crate::ktest!(
     fn controllers_are_masked() {
         use crate::{kassert, kassert_eq};
         kassert_eq!(pic::masks(), 0xffff);
-        let io_apics = IO_APICS.lock();
+        let mut io_apics = IO_APICS.lock();
         kassert!(!io_apics.is_empty());
-        for (io, _) in io_apics.iter() {
-            for i in 0..io.entries() {
-                kassert!(io.entry(i) & (1 << 16) != 0);
+        for io in io_apics.iter_mut() {
+            for i in 0..io.regs.entries() {
+                kassert!(io.regs.entry(i) & apic::REDIRECTION_MASKED != 0);
             }
         }
         kassert!(apic::lapic_ready());
@@ -78,38 +88,39 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn ioapic_entries_read_back_as_written() {
-        // Program an input (masked, so nothing fires), read it back, restore.
+    fn redirection_entries_encode_the_madt_flags() {
+        // MADT INTI flags: bits 0-1 polarity (0b11 active low), bits 2-3
+        // trigger (0b11 level); 0b00 and 0b01 are the bus's default and
+        // active high / edge.
         use crate::kassert_eq;
-        let io_apics = IO_APICS.lock();
-        let (io, _) = io_apics.first().ok_or("no I/O APIC")?;
-        let old = io.entry(1);
-        let new = apic::redirection(crate::arch::idt::IOAPIC_BASE + 1, 0, 0b1111, true);
-        io.set_entry(1, new);
-        let read = io.entry(1);
-        io.set_entry(1, old);
-        // Vector, active low (bit 13), level (bit 15), masked (bit 16).
-        kassert_eq!(read & 0x1_a0ff, u64::from(crate::arch::idt::IOAPIC_BASE + 1) | 1 << 13 | 1 << 15 | 1 << 16);
-        kassert_eq!(io.entry(1), old);
+        const LOW: u64 = 1 << 13;
+        const LEVEL: u64 = 1 << 15;
+        let e = |flags| apic::redirection(0x51, 0, flags, false);
+        kassert_eq!(e(0b0000), 0x51);
+        kassert_eq!(e(0b0001), 0x51);
+        kassert_eq!(e(0b0011), 0x51 | LOW);
+        kassert_eq!(e(0b0100), 0x51);
+        kassert_eq!(e(0b1100), 0x51 | LEVEL);
+        kassert_eq!(e(0b1111), 0x51 | LOW | LEVEL);
+        kassert_eq!(e(0b1101), 0x51 | LEVEL);
+        kassert_eq!(apic::redirection(0x60, 3, 0, true), 0x60 | apic::REDIRECTION_MASKED | 3 << 56);
         Ok(())
     }
 );
 
 crate::ktest!(
-    fn device_vectors_are_not_fatal() {
-        // A vector nothing handles is counted (and warned about once), the
-        // spurious vector only counted; both return.
-        use core::sync::atomic::Ordering::Relaxed;
-
-        use crate::arch::idt::{SPURIOUS_IRQS, UNEXPECTED_IRQS};
+    fn ioapic_entries_read_back_as_written() {
+        // Program an input (masked, so nothing fires), read it back, restore.
         use crate::kassert_eq;
-        let (unexpected, spurious) = (UNEXPECTED_IRQS.load(Relaxed), SPURIOUS_IRQS.load(Relaxed));
-        // SAFETY: software interrupts on vectors the dispatcher handles and
-        // returns from; no register is clobbered (the entry stub saves all).
-        unsafe {
-            core::arch::asm!("int 0x60", "int 0x60", "int 0xff");
-        }
-        kassert_eq!((UNEXPECTED_IRQS.load(Relaxed), SPURIOUS_IRQS.load(Relaxed)), (unexpected + 2, spurious + 1));
+        let mut io_apics = IO_APICS.lock();
+        let io = &mut io_apics.first_mut().ok_or("no I/O APIC")?.regs;
+        let old = io.entry(1);
+        let new = apic::redirection(crate::arch::idt::IOAPIC_BASE + 1, 0, 0b1111, true);
+        io.set_entry(1, new);
+        let read = io.entry(1);
+        io.set_entry(1, old);
+        kassert_eq!(read, new);
+        kassert_eq!(io.entry(1), old);
         Ok(())
     }
 );
@@ -117,17 +128,49 @@ crate::ktest!(
 crate::ktest!(
     fn mask_all_masks_an_unmasked_input() {
         // Firmware (and QEMU at reset) leaves inputs masked, so unmask one
-        // first, with interrupts off so nothing it raises is taken.
+        // first. The held lock keeps interrupts off, and the input is masked
+        // again before it drops (an edge raised meanwhile would be latched
+        // and taken afterwards, as an unexpected interrupt).
         use crate::kassert_eq;
-        let io_apics = IO_APICS.lock();
-        let (io, _) = io_apics.first().ok_or("no I/O APIC")?;
+        let mut io_apics = IO_APICS.lock();
+        let io = &mut io_apics.first_mut().ok_or("no I/O APIC")?.regs;
         let old = io.entry(1);
         io.set_entry(1, apic::redirection(crate::arch::idt::IOAPIC_BASE + 1, 0, 0, false));
-        let unmasked = io.entry(1) & (1 << 16);
+        let unmasked = io.entry(1) & apic::REDIRECTION_MASKED;
         io.mask_all();
-        let masked = io.entry(1) & (1 << 16);
+        let masked = io.entry(1) & apic::REDIRECTION_MASKED;
         io.set_entry(1, old);
-        kassert_eq!((unmasked, masked), (0, 1 << 16));
+        kassert_eq!((unmasked, masked), (0, apic::REDIRECTION_MASKED));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn device_vectors_are_not_fatal() {
+        // A vector nothing handles, or an 8259 line other than IRQ 7 and 15,
+        // is counted as unexpected (and warned about once); the spurious
+        // vectors (the local APIC's, the 8259s' IRQ 7 and 15) only counted;
+        // a local APIC error counted and logged. All return.
+        use crate::arch::idt;
+        use crate::kassert_eq;
+        let before = idt::strays();
+        // SAFETY: software interrupts on vectors the dispatcher handles and
+        // returns from; no register is clobbered (the entry stub saves all).
+        unsafe {
+            core::arch::asm!(
+                "int {unused}", "int {unused}", "int {spurious}", "int {pic7}", "int {pic15}", "int {error}", "int {pic1}",
+                unused = const idt::UNUSED,
+                spurious = const idt::SPURIOUS,
+                pic7 = const idt::PIC_BASE + 7,
+                pic15 = const idt::PIC_BASE + 15,
+                error = const idt::LAPIC_ERROR,
+                pic1 = const idt::PIC_BASE + 1,
+            );
+        }
+        let after = idt::strays();
+        kassert_eq!(after.unexpected, before.unexpected + 3);
+        kassert_eq!(after.spurious, before.spurious + 3);
+        kassert_eq!(after.lapic_errors, before.lapic_errors + 1);
         Ok(())
     }
 );

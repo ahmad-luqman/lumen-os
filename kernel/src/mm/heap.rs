@@ -29,8 +29,9 @@
 //! Panics in the allocator's own paths happen after the lock is released,
 //! except inside the heap itself (a corrupt list, a failed rollback); the
 //! crash line then says it read the heap under the lock. Interrupt
-//! handlers may allocate: the lock keeps interrupts off while held, so a
-//! handler never spins on a lock the code it interrupted holds (one CPU).
+//! handlers are allowed to allocate (none does yet): the lock keeps
+//! interrupts off while held, so a maskable interrupt's handler never spins
+//! on a lock the code it interrupted holds (one CPU).
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::fmt::{self, Write};

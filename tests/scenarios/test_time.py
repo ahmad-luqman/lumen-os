@@ -13,9 +13,10 @@ BOOT_TIMEOUT = 60
 TSC_LINE = re.compile(
     r"INFO  time: tsc (\d+(?:\.\d+)?) (GHz|MHz) \(calibrated against (hpet|pit)\)\n"
 )
-TICKS = re.compile(r"ticks: (\d+) \(spurious (\d+), unexpected (\d+)\)\n")
+TICKS = re.compile(r"ticks: (\d+) \(spurious (\d+), unexpected (\d+), local APIC errors (\d+)\)\n")
 CLOCKS = re.compile(
-    r"clocks: tsc (\d+) Hz \(against the (hpet|pit) at boot\); pit (\d+ Hz|none); hpet (\d+ Hz|none)\n"
+    r"clocks: tsc (\d+) Hz \(against the (hpet|pit) at boot\); "
+    r"pit (?:(\d+) Hz|none); hpet (?:(\d+) Hz|none)\n"
 )
 
 
@@ -25,11 +26,8 @@ def clocks(m) -> tuple[int, str, int | None, int | None]:
     m.send_line("clocks")
     c = m.expect(CLOCKS, 30)
     m.expect(r"kmon> ")
-
-    def hz(s: str) -> int | None:
-        return None if s == "none" else int(s.split()[0])
-
-    return int(c[1]), c[2], hz(c[3]), hz(c[4])
+    pit, hpet = (None if g is None else int(g) for g in c.group(3, 4))
+    return int(c[1]), c[2], pit, hpet
 
 
 def assert_close(a: int, b: int) -> None:
@@ -37,11 +35,13 @@ def assert_close(a: int, b: int) -> None:
     assert abs(a - b) * 50 <= a, (a, b)
 
 
-def ticks(m) -> tuple[int, int, int]:
+def ticks(m) -> tuple[int, int, int, int]:
+    """kmon `ticks`: timer interrupts, then spurious and unexpected ones and
+    local APIC errors."""
     m.send_line("ticks")
     t = m.expect(TICKS)
     m.expect(r"kmon> ")
-    return int(t[1]), int(t[2]), int(t[3])
+    return int(t[1]), int(t[2]), int(t[3]), int(t[4])
 
 
 def test_boot_calibrates_the_tsc_against_the_hpet(boot):
@@ -55,15 +55,17 @@ def test_boot_calibrates_the_tsc_against_the_hpet(boot):
 def test_timer_interrupts_counted(boot):
     m = boot("qemutest")
     m.expect(r"kmon> ", BOOT_TIMEOUT)
-    before, _, _ = ticks(m)
+    before, *_ = ticks(m)
     # 100 ms of guest time between the two readings.
     m.send_line("sleep 100")
     m.expect(r"slept 100 ms\n")
     m.expect(r"kmon> ")
-    after, spurious, unexpected = ticks(m)
-    # 100 at 1 kHz; QEMU's TCG delivers about 2/3 of a busy guest's ticks.
+    after, *strays = ticks(m)
+    # 100 at 1 kHz. A smoke test that interrupts arrive (the rate is checked
+    # in-kernel against the HPET): under QEMU's TCG a busy-waiting guest got
+    # about 2/3 of its ticks when measured.
     assert after - before >= 40, (before, after)
-    assert (spurious, unexpected) == (0, 0)
+    assert strays == [0, 0, 0]
     assert "WARN  irq" not in m.output
 
 

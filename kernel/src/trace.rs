@@ -26,8 +26,8 @@ pub enum Kind {
     BootPhase = 1,
     /// `args`: vector, rip, error code (0 if the vector pushes none).
     /// Recorded for every CPU exception and for device interrupts nothing
-    /// handles; not for the timer or spurious interrupts (counted instead:
-    /// at 1 kHz they would flood the ring).
+    /// handles; not for the timer, spurious interrupts or local APIC errors
+    /// (counted instead: at 1 kHz the timer would flood the ring).
     Exception = 2,
     /// `args[0]`: level (1 = error .. 5 = trace); `args[1]`: the subsystem
     /// tag's first 8 bytes, little-endian (longer tags are cut). Only lines

@@ -396,7 +396,7 @@ allocator; nothing holding the last two may allocate. The allocator never
 logs (a log argument that allocates would re-enter it under the logger's
 lock) and formats its kmon and crash line from a copy taken under the
 lock. Like every `SpinLock`, it keeps interrupts off while held, so an
-interrupt handler may allocate.
+interrupt handler is allowed to allocate (none does yet).
 
 ## 6. Interrupts, exceptions and crash reports (built)
 
@@ -406,24 +406,30 @@ interrupt handler may allocate.
   calls `lumen_exception_dispatch`.
 - **Vector map** (`arch/x86_64/idt.rs`): 0-31 CPU exceptions; 0x20-0x2f the
   8259 PICs, remapped there and masked (only a spurious IRQ 7 or 15
-  arrives); 0x40 the local APIC timer; 0x50 + n global system interrupt n,
+  arrives); 0x30-0x3f unused (the ktests raise these); 0x40 the local APIC
+  timer; 0x50 + n global system interrupt n,
   once a driver routes it (every I/O APIC input is masked until then); 0xfe
   local APIC errors; 0xff the local APIC's spurious vector.
 - **Dispatch:** `#BP` is counted and resumes (a ktest proves registers
   survive the round trip); every other exception is fatal and goes to
-  `crash::exception`. Exceptions are traced; device interrupts are not
-  fatal. The timer counts a tick (`time::ticks`) and sends the local APIC an
-  EOI; spurious interrupts are counted and get no EOI (a spurious IRQ 15
-  gets one at the master 8259); an interrupt nothing handles is traced,
-  counted, warned about once per vector, and EOI'd. Timer and spurious
-  interrupts are not traced: at 1 kHz they would flood the ring.
+  `crash::exception`. Exceptions are traced. Device interrupts are never
+  fatal: the timer counts a tick (`time::ticks`) and sends the local APIC an
+  EOI; spurious interrupts (the local APIC's, the 8259s' IRQ 7 and 15) are
+  counted and get no EOI (a spurious IRQ 15 gets one at the master 8259); a
+  local APIC error is counted, logged with its status (the 1st, 2nd, 4th,
+  8th... time) and EOI'd; anything else, including another 8259 line, is
+  traced, counted, warned about once per vector, and EOI'd. Only that last
+  kind is traced: at 1 kHz the timer would flood the ring. kmon `ticks`
+  shows the counts.
 - **Interrupt state:** interrupts are off through boot and turned on once
   the controllers and the timer are set up. Every gate is an interrupt gate
   (handlers run with interrupts off). `SpinLock` keeps them off while held
-  (`arch::irq::push_off`/`pop_off`, nested by depth, so guards dropped in any
-  order never turn them on early), so a handler never spins on a lock the
-  code it interrupted holds, and may log or allocate. The crash path turns
-  them off for good before anything else; no guard turns them back on.
+  (`arch::irq::push_off`, whose `IrqOff` guard nests by depth, so guards
+  dropped in any order never turn them on early, and can't move to another
+  CPU), so a maskable interrupt's handler never spins on a lock the code it
+  interrupted holds: it may log, and is allowed to allocate. The crash path
+  turns them off for good before anything else; no guard turns them back
+  on.
 - **Time** (`time.rs`, arithmetic in `crates/lumen-time`): the TSC's
   frequency is the median of five 10 ms windows against the HPET (the PIT's
   channel 2, polled, without one), measured with interrupts off. The local
@@ -433,9 +439,13 @@ interrupt handler may allocate.
   `sleep <ms>`, `uptime`, and `clocks` (the TSC measured again against the
   PIT and the HPET, which the tests compare with the boot calibration: a
   wrong calibration would cancel out in tick counts, since the timer is
-  calibrated against the TSC). Under QEMU's TCG a busy guest gets about 2/3 of
-  its ticks (late periodic timers skip periods); tests bound tick counts
-  loosely and never assert on host time.
+  calibrated against the TSC). Under QEMU's TCG a busy-waiting guest got
+  about 2/3 of its ticks when measured (late periodic timers skip periods);
+  tests check the timer's rate by its count register against the HPET,
+  bound tick counts loosely, and never assert on host time. Every
+  calibration poll is bounded: an HPET that doesn't count is warned about
+  and the PIT used; a PIT whose output doesn't go low when programmed, or
+  high within about a second, counts as missing.
 - #DF, NMI and #MC run on their own guarded IST stacks (from step 6 of the
   boot, before that on the boot stack), so a corrupted or overflowed kernel
   stack still yields a report; an overflow is named as one (section 5,
@@ -445,9 +455,8 @@ interrupt handler may allocate.
   serial only the last trace events, for a #PF the page-table walk of CR2,
   one line of heap state (never blocks: if the heap's lock is held it reads
   the state anyway and says so; the free-list walk is bounded and stays
-  inside the heap), and last `interrupts: off` (the crash path turns them
-  off for good first; the line says so if anything turned them back on). It
-  is
+  inside the heap), and last `interrupts: off` (sampled when the report
+  begins and at its end; the line says which if they were on). It is
   written to serial and to the screen. Frame pointers are forced on
   (`-C force-frame-pointers=yes`); the walker follows `rbp` only inside known
   stacks and only to return addresses inside kernel `.text`, so a corrupted
@@ -697,18 +706,19 @@ kernel. The kernel is the trusted computing base.
   (`crates/lumen-trace`, host-tested; `kernel/src/trace.rs`, `ktrace!`). Each
   slot is a small seqlock: writers claim it by compare-and-swap and drop
   their event (counted) rather than wait if it is busy, so recording never
-  blocks, even from an exception handler that interrupted another record
-  (simulated in host tests; not yet exercised in the kernel); readers skip
+  blocks, even from an interrupt or exception handler that interrupted
+  another record (simulated in host tests); readers skip
   events that change while they copy them, so they never see a torn event.
   Events are in `seq` order; timestamps can be out of order across nested
   writers. One 4096-event ring now (one CPU); one per CPU with SMP (#9).
-  Recorded so far: boot phases, exceptions (every vector entering the IDT
-  dispatcher), log lines. Later: scheduler switches, syscalls, interrupts,
-  page faults, allocator activity. Cost per event is printed by
+  Recorded so far: boot phases, CPU exceptions and device interrupts nothing
+  handles (not the timer, spurious interrupts or local APIC errors), log
+  lines. Later: scheduler switches, syscalls, page faults, allocator
+  activity. Cost per event is printed by
   `ktest:lumen_kernel::trace::trace_overhead_is_small` (tens of TSC ticks
   under TCG locally; TCG's TSC rate depends on the host, so this is not
-  comparable across machines or to cycles). Timestamps are raw TSC ticks until
-  #7/#8. `kmon`'s `trace [n]` prints the newest events (a gap line says why
+  comparable across machines or to cycles). Timestamps are raw TSC ticks
+  until #8 converts them with the TSC frequency `time` calibrates. `kmon`'s `trace [n]` prints the newest events (a gap line says why
   an event is missing), and the serial crash report includes the last 16
   events (tested for a page fault and a panic).
 - **Boot timeline:** boot phases emit trace events. The fast-boot target is
@@ -744,7 +754,7 @@ TCG before uploading.
 kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/arch/        HAL; x86_64/ has gdt, idt, irq, apic, pic, pit, serial, stacks (registry), cpu, qemu, paging
   src/acpi.rs      ACPI discovery (MADT, HPET) through lumen-acpi
-  src/interrupts.rs interrupt controllers: 8259s masked, local APIC, I/O APICs
+  src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs
   src/time.rs      TSC and local APIC timer calibration, now_ns, sleep, ticks
   src/boot.rs      Limine requests
   src/crash.rs     crash reporter

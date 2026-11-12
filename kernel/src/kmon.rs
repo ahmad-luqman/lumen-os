@@ -65,7 +65,7 @@ fn dispatch(line: &str) {
                  crash <kind>      deliberate fault: {CRASH_KINDS}\n  \
                  trace [n]         the last n trace events (default 16)\n  \
                  heap              heap usage and free-list summary\n  \
-                 ticks             timer interrupts taken (and spurious, unexpected)\n  \
+                 ticks             timer interrupts taken (and stray ones)\n  \
                  sleep <ms>        wait that long (guest time)\n  \
                  uptime            nanoseconds since the TSC started\n  \
                  clocks            the TSC's frequency, measured again against each clock\n  \
@@ -95,9 +95,15 @@ fn dispatch(line: &str) {
             let _ = crate::mm::heap::write_stats(&mut out);
         }
         "ticks" => {
-            let load = |c: &core::sync::atomic::AtomicU64| c.load(core::sync::atomic::Ordering::Relaxed);
-            let (spurious, unexpected) = (load(&arch::idt::SPURIOUS_IRQS), load(&arch::idt::UNEXPECTED_IRQS));
-            let _ = writeln!(out, "ticks: {} (spurious {spurious}, unexpected {unexpected})", crate::time::ticks());
+            let s = arch::idt::strays();
+            let _ = writeln!(
+                out,
+                "ticks: {} (spurious {}, unexpected {}, local APIC errors {})",
+                crate::time::ticks(),
+                s.spurious,
+                s.unexpected,
+                s.lapic_errors
+            );
         }
         "sleep" => match rest.trim().parse::<u64>() {
             Ok(ms) if ms <= 60_000 => {

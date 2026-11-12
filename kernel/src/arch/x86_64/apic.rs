@@ -8,7 +8,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::cpu::rdmsr;
-use super::idt::{LAPIC_ERROR, SPURIOUS};
+use super::idt::{LAPIC_ERROR, SPURIOUS, TIMER};
 
 const IA32_APIC_BASE: u32 = 0x1b;
 const BASE_ENABLE: u64 = 1 << 11;
@@ -31,6 +31,8 @@ const TIMER_DIVIDE: usize = 0x3e0;
 
 const SVR_ENABLE: u32 = 1 << 8;
 const LVT_MASKED: u32 = 1 << 16;
+/// LVT delivery mode NMI (bits 8-10 = 0b100).
+const LVT_NMI: u32 = 0b100 << 8;
 const LVT_PERIODIC: u32 = 1 << 17;
 /// Divide configuration 0b0011: the timer counts at the bus clock / 16.
 const DIVIDE_BY_16: u32 = 0b0011;
@@ -76,23 +78,26 @@ fn write(offset: usize, value: u32) {
 }
 
 /// Use the local APIC at `virt` and enable it: spurious interrupts on
-/// [`SPURIOUS`], errors on [`LAPIC_ERROR`], LINT0/LINT1 and the timer masked,
-/// every priority accepted.
+/// [`SPURIOUS`], errors on [`LAPIC_ERROR`], LINT0 (the 8259s' line) and the
+/// timer masked, LINT1 delivering NMIs (the platform's NMI line, as wired on
+/// PCs), every priority accepted.
 ///
 /// # Safety
 /// `virt` maps this CPU's local APIC registers (4 KiB, uncached) for the
 /// kernel's whole life, and the APIC is in xAPIC mode.
 pub unsafe fn set_lapic(virt: u64) {
-    LAPIC.store(virt, Ordering::Relaxed);
+    assert!(LAPIC.swap(virt, Ordering::Relaxed) == 0, "set_lapic called twice");
+    // Software-enable first: while the APIC is software-disabled, every LVT
+    // entry is forced masked and writes clearing the mask are ignored.
+    write(SVR, SVR_ENABLE | u32::from(SPURIOUS));
     write(LVT_TIMER, LVT_MASKED);
     write(LVT_LINT0, LVT_MASKED);
-    write(LVT_LINT1, LVT_MASKED);
+    write(LVT_LINT1, LVT_NMI);
     write(LVT_ERROR, u32::from(LAPIC_ERROR));
     // The ESR latches errors on a write; clear what firmware left.
     write(ESR, 0);
     write(ESR, 0);
     write(TPR, 0);
-    write(SVR, SVR_ENABLE | u32::from(SPURIOUS));
     write(EOI, 0);
 }
 
@@ -132,24 +137,30 @@ pub fn timer_current() -> u32 {
     read(TIMER_CURRENT)
 }
 
-/// Fire `vector` every `count` timer ticks (the bus clock / [`TIMER_DIVISOR`]).
-pub fn timer_periodic(count: u32, vector: u8) {
+/// Interrupt on [`TIMER`] every `count` timer ticks (the bus clock /
+/// [`TIMER_DIVISOR`]).
+pub fn timer_periodic(count: u32) {
     write(TIMER_DIVIDE, DIVIDE_BY_16);
-    write(LVT_TIMER, LVT_PERIODIC | u32::from(vector));
+    write(LVT_TIMER, LVT_PERIODIC | u32::from(TIMER));
     write(TIMER_INITIAL, count);
 }
 
-/// The timer's LVT entry (for ktests).
+/// The timer's LVT entry, error LVT entry and initial count (for ktests).
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
-pub fn timer_lvt() -> u32 {
-    read(LVT_TIMER)
+pub fn timer_registers() -> (u32, u32, u32) {
+    (read(LVT_TIMER), read(LVT_ERROR), read(TIMER_INITIAL))
 }
 
-/// An I/O APIC's mapped registers (an index/data pair).
+/// An I/O APIC's mapped registers: an index/data pair, so every access
+/// takes `&mut self` (the two steps must not interleave).
 #[derive(Debug)]
 pub struct IoApic {
     base: u64,
+    entries: u32,
 }
+
+/// The mask bit of an I/O APIC redirection entry.
+pub const REDIRECTION_MASKED: u64 = 1 << 16;
 
 const IOREGSEL: usize = 0x00;
 const IOWIN: usize = 0x10;
@@ -161,10 +172,12 @@ impl IoApic {
     /// `virt` maps an I/O APIC's registers (at least 32 bytes, uncached)
     /// for the kernel's whole life, and nothing else drives that I/O APIC.
     pub unsafe fn new(virt: u64) -> IoApic {
-        IoApic { base: virt }
+        let mut io = IoApic { base: virt, entries: 0 };
+        io.entries = ((io.read(IOAPICVER) >> 16) & 0xff) + 1;
+        io
     }
 
-    fn read(&self, index: u32) -> u32 {
+    fn read(&mut self, index: u32) -> u32 {
         // SAFETY: `new`'s contract; select, then read the window (32-bit).
         unsafe {
             ((self.base as usize + IOREGSEL) as *mut u32).write_volatile(index);
@@ -172,7 +185,7 @@ impl IoApic {
         }
     }
 
-    fn write(&self, index: u32, value: u32) {
+    fn write(&mut self, index: u32, value: u32) {
         // SAFETY: as for `read`.
         unsafe {
             ((self.base as usize + IOREGSEL) as *mut u32).write_volatile(index);
@@ -182,25 +195,28 @@ impl IoApic {
 
     /// How many redirection entries (inputs) it has.
     pub fn entries(&self) -> u32 {
-        ((self.read(IOAPICVER) >> 16) & 0xff) + 1
+        self.entries
     }
 
-    /// Redirection entry `i` (64 bits).
-    pub fn entry(&self, i: u32) -> u64 {
+    /// Redirection entry `i` (64 bits). Panics if there is no entry `i`.
+    pub fn entry(&mut self, i: u32) -> u64 {
+        assert!(i < self.entries, "I/O APIC has no input {i}");
         u64::from(self.read(IOREDTBL + 2 * i)) | u64::from(self.read(IOREDTBL + 2 * i + 1)) << 32
     }
 
-    /// Set redirection entry `i`.
-    pub fn set_entry(&self, i: u32, value: u64) {
+    /// Set redirection entry `i`. Panics if there is no entry `i`.
+    pub fn set_entry(&mut self, i: u32, value: u64) {
+        assert!(i < self.entries, "I/O APIC has no input {i}");
         // Low word last: it holds the mask bit.
         self.write(IOREDTBL + 2 * i + 1, (value >> 32) as u32);
         self.write(IOREDTBL + 2 * i, value as u32);
     }
 
     /// Mask every input (entries keep their other fields).
-    pub fn mask_all(&self) {
-        for i in 0..self.entries() {
-            self.set_entry(i, self.entry(i) | u64::from(LVT_MASKED));
+    pub fn mask_all(&mut self) {
+        for i in 0..self.entries {
+            let e = self.entry(i);
+            self.set_entry(i, e | REDIRECTION_MASKED);
         }
     }
 }
@@ -216,6 +232,6 @@ pub fn redirection(vector: u8, dest: u8, flags: u16, masked: bool) -> u64 {
     u64::from(vector)
         | u64::from(active_low) << 13
         | u64::from(level) << 15
-        | u64::from(masked) << 16
+        | if masked { REDIRECTION_MASKED } else { 0 }
         | u64::from(dest) << 56
 }

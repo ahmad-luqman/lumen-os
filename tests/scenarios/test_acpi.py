@@ -13,7 +13,7 @@ fails if all listed CPUs are counted.
 import re
 
 import pytest
-from test_time import assert_close, clocks
+from test_time import assert_close, clocks, ticks
 
 BOOT_TIMEOUT = 60
 ACPI_LINE = re.compile(
@@ -44,8 +44,10 @@ def test_no_hpet_is_a_warning(boot):
     m.expect(r"WARN  acpi: no usable HPET: no HPET table\n", BOOT_TIMEOUT)
     line = m.expect(ACPI_LINE, BOOT_TIMEOUT)
     assert line[0] == f"INFO  acpi: 1 CPU, LAPIC at {LAPIC:#x}, no HPET\n"
-    # Timekeeping falls back to the PIT, and gets the TSC right: measured
-    # again against the PIT, within 2%.
+    # Timekeeping falls back to the PIT, and the PIT calibration repeats:
+    # measured again against the PIT, within 2% (the same clock, so not an
+    # independent check; the default boot cross-checks the PIT against the
+    # HPET).
     m.expect(r"INFO  time: tsc .* \(calibrated against pit\)\n", BOOT_TIMEOUT)
     m.expect(r"INFO  boot: boot complete", BOOT_TIMEOUT)
     m.expect(r"kmon> ", BOOT_TIMEOUT)
@@ -65,4 +67,11 @@ def test_no_madt_boots_without_acpi(boot):
     m.expect(r"INFO  time: tsc .* \(calibrated against pit\)\n", BOOT_TIMEOUT)
     m.expect(r"INFO  irq: interrupts on\n", BOOT_TIMEOUT)
     m.expect(r"INFO  boot: boot complete", BOOT_TIMEOUT)
+    # And the local APIC found through IA32_APIC_BASE ticks.
+    m.expect(r"kmon> ", BOOT_TIMEOUT)
+    before, *_ = ticks(m)
+    m.send_line("sleep 50")
+    m.expect(r"kmon> ")
+    after, *_ = ticks(m)
+    assert after > before, (before, after)
     assert not ACPI_LINE.search(m.output)

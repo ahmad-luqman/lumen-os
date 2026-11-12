@@ -1,16 +1,19 @@
 //! Turning this CPU's interrupts off and back on, nested.
 //!
-//! [`push_off`]/[`pop_off`] (xv6's names) disable interrupts for a critical
-//! section, such as a held `SpinLock`. They nest by depth, not by saved
-//! state: the first `push_off` records whether interrupts were on, and only
-//! the last `pop_off` restores that, so guards dropped in any order never
-//! turn interrupts on while another critical section is still open. Once
-//! [`disable_for_good`] has run (the crash path), nothing turns them back on.
+//! [`push_off`] (xv6's name) disables interrupts for a critical section,
+//! such as a held `SpinLock`, until the [`IrqOff`] it returns is dropped.
+//! Sections nest by depth, not by saved state: the first records whether
+//! interrupts were on, and only the last to close restores that, so guards
+//! dropped in any order never turn interrupts on while another section is
+//! still open. `IrqOff` can't be sent to another thread: the depth belongs to
+//! the CPU that opened the section. Once [`disable_for_good`] has run (the
+//! crash path), no section turns them back on.
 //!
 //! One CPU for now: the depth and saved state are global. With SMP (#9) they
 //! become per-CPU.
 
 use core::arch::asm;
+use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Open critical sections on this CPU.
@@ -31,36 +34,54 @@ pub fn enabled() -> bool {
     rflags & IF != 0
 }
 
+// `cli` and `sti` are not `nomem`: they must also be compiler barriers, so no
+// memory access a critical section protects moves out of it (a lock's
+// acquire before the `cli`, or its release after the `sti`).
+
 fn cli() {
     // SAFETY: masking interrupts on this CPU is always allowed in ring 0.
-    unsafe { asm!("cli", options(nomem, nostack)) };
+    unsafe { asm!("cli", options(nostack)) };
 }
 
-/// Open a critical section: interrupts off until the matching [`pop_off`].
-pub fn push_off() {
+fn sti() {
+    // SAFETY: every caller checks that no critical section is open.
+    unsafe { asm!("sti", options(nostack)) };
+}
+
+/// An open critical section: interrupts are off until it is dropped.
+#[must_use = "interrupts come back on when this is dropped"]
+pub struct IrqOff {
+    /// Not `Send` or `Sync`: the section belongs to this CPU.
+    _cpu: PhantomData<*const ()>,
+}
+
+/// Open a critical section: interrupts off until the returned guard drops.
+pub fn push_off() -> IrqOff {
     let were_on = enabled();
     cli();
-    // Interrupts are off: nothing on this CPU can run between these.
+    // Interrupts are off: only an NMI or an exception (both fatal) can run
+    // between these.
     if DEPTH.fetch_add(1, Ordering::Relaxed) == 0 {
         WERE_ON.store(were_on, Ordering::Relaxed);
     }
+    IrqOff { _cpu: PhantomData }
 }
 
-/// Close a critical section; the last one turns interrupts back on if they
-/// were on before the first (and [`disable_for_good`] hasn't run).
-pub fn pop_off() {
-    assert!(!enabled(), "interrupts were turned on inside a critical section");
-    let depth = DEPTH.fetch_sub(1, Ordering::Relaxed);
-    assert!(depth > 0, "pop_off without push_off");
-    if depth == 1 && WERE_ON.load(Ordering::Relaxed) && !FOR_GOOD.load(Ordering::Relaxed) {
-        // SAFETY: the outermost critical section is closed and interrupts
-        // were on before it opened.
-        unsafe { asm!("sti", options(nomem, nostack)) };
+impl Drop for IrqOff {
+    /// Close the section; the last one turns interrupts back on if they were
+    /// on before the first (and [`disable_for_good`] hasn't run).
+    fn drop(&mut self) {
+        assert!(!enabled(), "interrupts were turned on inside a critical section");
+        let depth = DEPTH.load(Ordering::Relaxed);
+        assert!(depth > 0, "closing a critical section that isn't open");
+        DEPTH.store(depth - 1, Ordering::Relaxed);
+        if depth == 1 && WERE_ON.load(Ordering::Relaxed) && !FOR_GOOD.load(Ordering::Relaxed) {
+            sti();
+        }
     }
 }
 
 /// How many critical sections are open on this CPU.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by ktests
 pub fn depth() -> usize {
     DEPTH.load(Ordering::Relaxed)
 }
@@ -70,14 +91,12 @@ pub fn depth() -> usize {
 pub fn enable() {
     assert_eq!(depth(), 0, "enabling interrupts inside a critical section");
     assert!(!FOR_GOOD.load(Ordering::Relaxed), "enabling interrupts after disable_for_good");
-    // SAFETY: no critical section is open; the caller has installed the
-    // handlers for every source it unmasked.
-    unsafe { asm!("sti", options(nomem, nostack)) };
+    sti();
 }
 
-/// Turn interrupts off and keep them off: no [`pop_off`] or [`enable`] turns
-/// them on again. For the crash path, which must run alone and never return
-/// to what it interrupted.
+/// Turn interrupts off and keep them off: no section closing turns them on
+/// again, and [`enable`] refuses. For the crash path, which must run alone
+/// and never returns to what it interrupted.
 pub fn disable_for_good() {
     cli();
     FOR_GOOD.store(true, Ordering::Relaxed);
