@@ -221,3 +221,35 @@ crate::ktest!(
         Ok(())
     }
 );
+
+crate::ktest!(
+    fn a_full_registry_leaves_nothing_behind() {
+        // Fill the registry with one-page stacks: the next one fails with
+        // RegistryFull and leaves nothing mapped or allocated (page tables
+        // aside), and dropping them all returns every frame.
+        use crate::{kassert, kassert_eq};
+        use alloc::vec::Vec;
+        let tables = || paging::for_each_active_table(|_| {}).map_err(|_| "unreadable table");
+        let mut held = Vec::with_capacity(lumen_mm::stacks::MAX_STACKS);
+        let (free0, tables0) = (super::frame::free_frames(), tables()?);
+        let refused = loop {
+            match KernelStack::new(lumen_mm::FRAME_SIZE, StackKind::Test) {
+                Ok(s) => held.push(s),
+                Err(e) => break e,
+            }
+            if held.len() > lumen_mm::stacks::MAX_STACKS {
+                return Err("more stacks than registry slots");
+            }
+        };
+        kassert_eq!(refused, StackError::RegistryFull);
+        // The refused stack's addresses come right after the last one's: its
+        // pages are unmapped again.
+        let last = held.last().ok_or("no stack fit")?.range();
+        kassert!(mapping(last.top + lumen_mm::FRAME_SIZE).is_none());
+        let (free1, tables1) = (super::frame::free_frames(), tables()?);
+        kassert_eq!(free1 + (tables1 - tables0) + held.len(), free0);
+        drop(held);
+        kassert_eq!(super::frame::free_frames() + (tables()? - tables0), free0);
+        Ok(())
+    }
+);

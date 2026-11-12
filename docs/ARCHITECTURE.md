@@ -141,7 +141,9 @@ In-kernel tests check, independently of the reservation list (by walking the
 page tables), that no frame behind a range the kernel is using (kernel image,
 boot stack, current stack page, kernel file, framebuffer, frame bitmap,
 memory map, cmdline) is allocatable and no page-table frame is free, and
-that the check itself fires when a frame in use is reported free. They then allocate every
+that the check itself fires when a frame in use is reported free. (Since
+the switch to an allocated stack, the current stack page is an allocated
+frame: it must never be free rather than never owned.) They then allocate every
 frame, check each against the memory map and the reservation list, fill it,
 tag it with a sequence number, and free them all, checking each tag (catches
 a frame handed out twice) (hard rule 2). Bootloader-reclaimable
@@ -189,7 +191,9 @@ mapping of the kernel is (the text), and with each HHDM span's memory type.
 A mistake is an assertion naming the range, the address and how each walk
 ended, not a fault with no stack. A ktest builds a copy of the tables,
 plants one fault of each kind (kernel data read-only, text NX, RAM
-uncached, nothing mapped) and checks each is named. EFER.NXE and CR0.WP are set (so
+uncached, nothing mapped) and checks each is named. (The check skips the
+allocated stacks, which a fresh copy doesn't map; at the real switch the
+kernel still runs on the boot stack, so nothing is skipped then.) EFER.NXE and CR0.WP are set (so
 read-only pages bind in ring 0 too) and the PAT layout the mappings rely on
 (slot 0 WB, 3 UC, 5 WC, set up by Limine) is checked rather than rewritten.
 

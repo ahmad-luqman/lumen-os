@@ -10,9 +10,9 @@
 //! The registry is what the backtrace walker trusts ([`Registry::contains`]:
 //! a frame pointer is only followed into a registered stack) and what names
 //! a stack overflow ([`Registry::find`] says an address is in a stack's guard
-//! page). Writers publish an entry's bounds before its kind and retract the
-//! kind before the memory goes away, so a reader never sees a half-written
-//! entry or one whose memory is gone (see [`Registry::get`]).
+//! page). Each slot is a small seqlock: a writer fills it in only while its
+//! sequence count is odd, so a reader never sees a half-written entry or a
+//! mix of two; an entry is retracted before its memory goes away.
 
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering, fence};
 
@@ -134,7 +134,11 @@ const EMPTY: u8 = 0;
 const FILLING: u8 = 0xff;
 
 struct Slot {
-    /// [`EMPTY`], [`FILLING`] or a [`StackKind`].
+    /// Odd while a writer is filling the slot in; bumped twice by every
+    /// register (the only time the bounds change), so a reader can tell the
+    /// slot was refilled under it even if it holds the same kind again.
+    seq: AtomicU64,
+    /// [`EMPTY`], [`FILLING`] (claimed by a writer) or a [`StackKind`].
     state: AtomicU8,
     bottom: AtomicU64,
     top: AtomicU64,
@@ -142,7 +146,18 @@ struct Slot {
 
 impl Slot {
     const fn new() -> Slot {
-        Slot { state: AtomicU8::new(EMPTY), bottom: AtomicU64::new(0), top: AtomicU64::new(0) }
+        Slot { seq: AtomicU64::new(0), state: AtomicU8::new(EMPTY), bottom: AtomicU64::new(0), top: AtomicU64::new(0) }
+    }
+
+    /// Fill in the slot (the caller has claimed it): readers ignore it from
+    /// the first bump until the second.
+    fn write(&self, change: impl FnOnce()) {
+        self.seq.fetch_add(1, Ordering::Relaxed);
+        // The odd count is visible before any change.
+        fence(Ordering::Release);
+        change();
+        // Release: a reader that sees the even count sees the changes.
+        self.seq.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -165,36 +180,45 @@ impl Registry {
     /// Publish a stack (whose memory must already be mapped); `None` if every
     /// slot is taken.
     pub fn register(&self, kind: StackKind, range: StackRange) -> Option<Handle> {
+        // Claiming (EMPTY -> FILLING) makes this writer the slot's only one.
         let (i, slot) =
             self.slots.iter().enumerate().find(|(_, s)| {
                 s.state.compare_exchange(EMPTY, FILLING, Ordering::Acquire, Ordering::Relaxed).is_ok()
             })?;
-        slot.bottom.store(range.bottom, Ordering::Relaxed);
-        slot.top.store(range.top, Ordering::Relaxed);
-        // Release: a reader that sees the kind sees the bounds.
-        slot.state.store(kind as u8, Ordering::Release);
+        slot.write(|| {
+            slot.bottom.store(range.bottom, Ordering::Relaxed);
+            slot.top.store(range.top, Ordering::Relaxed);
+            slot.state.store(kind as u8, Ordering::Relaxed);
+        });
         Some(Handle(i))
     }
 
-    /// Retract a stack before its memory goes away; returns what it was.
+    /// Retract a stack before its memory goes away; returns what it was. A
+    /// reader that loaded the kind before this reads the entry as it was
+    /// (whole: the bounds only change when the slot is refilled).
     pub fn unregister(&self, handle: Handle) -> Registered {
         let r = self.get(handle.0).expect("a handle names a registered stack");
         self.slots[handle.0].state.store(EMPTY, Ordering::Release);
         r
     }
 
-    /// Slot `i`, if it holds a registered stack. The kind is read before and
-    /// after the bounds; if it changed in between (the entry was retracted
-    /// or replaced), the slot reads as empty, so a reader never mixes two
-    /// entries' bounds.
+    /// Slot `i`, if it holds a registered stack: read as a seqlock, so an
+    /// entry that changed while it was read (even back to the same kind)
+    /// reads as empty, never as a mix of two entries.
     fn get(&self, i: usize) -> Option<Registered> {
         let slot = &self.slots[i];
-        let state = slot.state.load(Ordering::Acquire);
-        let kind = StackKind::from_raw(state)?;
+        let seq = slot.seq.load(Ordering::Acquire);
+        if seq % 2 == 1 {
+            return None;
+        }
+        let kind = StackKind::from_raw(slot.state.load(Ordering::Relaxed));
         let range = StackRange { bottom: slot.bottom.load(Ordering::Relaxed), top: slot.top.load(Ordering::Relaxed) };
-        // Keep the bounds loads before the second state load.
+        // Keep those loads before the second count load.
         fence(Ordering::Acquire);
-        (slot.state.load(Ordering::Relaxed) == state).then_some(Registered { kind, range })
+        if slot.seq.load(Ordering::Relaxed) != seq {
+            return None;
+        }
+        kind.map(|kind| Registered { kind, range })
     }
 
     /// Every registered stack.
@@ -334,19 +358,23 @@ mod tests {
                 }
                 stop.store(true, Ordering::Relaxed);
             });
-            for _ in 0..3 {
-                s.spawn(|| {
-                    let mut seen = 0u64;
-                    while !stop.load(Ordering::Relaxed) {
-                        for r in reg.iter() {
-                            let n = (r.range.bottom - GUARD_SIZE - BASE) / 0x10_0000;
-                            assert_eq!(r, Registered { kind: kind(n), range: range(n) }, "torn entry");
-                            seen += 1;
+            let readers: Vec<_> = (0..3)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut seen = 0u64;
+                        while !stop.load(Ordering::Relaxed) {
+                            for r in reg.iter() {
+                                let n = (r.range.bottom - GUARD_SIZE - BASE) / 0x10_0000;
+                                assert_eq!(r, Registered { kind: kind(n), range: range(n) }, "torn entry");
+                                seen += 1;
+                            }
                         }
-                    }
-                    std::println!("reader saw {seen} entries");
-                });
-            }
+                        seen
+                    })
+                })
+                .collect();
+            let seen: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
+            assert!(seen > 0, "the readers never saw an entry");
         });
     }
 }

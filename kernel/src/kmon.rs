@@ -11,7 +11,7 @@ use core::fmt::Write;
 
 const PROMPT: &str = "kmon> ";
 /// What `crash <kind>` accepts.
-const CRASH_KINDS: &str = "pf ud de gp df wtext nx panic oom dfree heapcorrupt stack";
+const CRASH_KINDS: &str = "pf ud de gp df wtext nx panic oom dfree heapcorrupt stack guard";
 const MAX_LINE: usize = 128;
 
 pub fn run() -> ! {
@@ -126,6 +126,7 @@ fn crash(kind: &str) {
         "oom" => crash_out_of_memory(),
         "dfree" => crash_double_free(),
         "heapcorrupt" => crash_corrupt_heap(),
+        "guard" => crash_touch_guard(),
         "stack" => {
             let depth = recurse(0);
             let _ = writeln!(serial::SerialWriter, "crash: recursion returned at depth {depth} (no guard page?)");
@@ -278,12 +279,26 @@ fn crash_corrupt_heap() {
     let _ = writeln!(serial::SerialWriter, "crash: a corrupt free list went unnoticed");
 }
 
+/// Write into the guard page below the main stack from a healthy stack: a
+/// plain #PF (nothing overflowed), which the report still names as a guard
+/// page hit.
+#[inline(never)]
+fn crash_touch_guard() {
+    use lumen_mm::stacks::StackKind;
+    let Some(main) = arch::stacks::REGISTRY.iter().find(|r| r.kind == StackKind::Main) else {
+        let _ = writeln!(serial::SerialWriter, "crash: no main stack registered");
+        return;
+    };
+    // SAFETY: deliberately faulting: the guard page is never mapped.
+    unsafe { core::ptr::write_volatile((main.range.guard() + 8) as *mut u64, 1) };
+    let _ = writeln!(serial::SerialWriter, "crash: writing to a guard page succeeded (guard page mapped?)");
+}
+
 /// Recurse without end: each call keeps a 256-byte frame live across the
 /// next call (not a tail call; `black_box` stops LLVM folding it into a
 /// loop), so the main stack runs into its guard page and the crash reporter
 /// names the overflow. The `u64::MAX` test never succeeds in practice.
 #[inline(never)]
-#[allow(unconditional_recursion)]
 fn recurse(depth: u64) -> u64 {
     let frame = core::hint::black_box([depth; 32]);
     if core::hint::black_box(depth) == u64::MAX {

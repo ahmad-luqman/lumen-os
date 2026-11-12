@@ -69,5 +69,7 @@ tests = [
     "ktest:lumen_kernel::mm::paging::hhdm_maps_exactly_the_hhdm_types",
     "ktest:lumen_kernel::mm::frame::live_memory_oracle_detects_a_leak",
     "scenario:test_mm::test_stack_overflow_hits_guard",
+    "scenario:test_mm::test_touching_a_guard_page_is_named",
+    "ktest:lumen_kernel::mm::stack::a_full_registry_leaves_nothing_behind",
     "scenario:test_crash::test_fault_produces_symbolized_report[*]",
 ]

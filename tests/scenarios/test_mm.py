@@ -181,3 +181,20 @@ def test_stack_overflow_hits_guard(crash_report):
     frames = backtrace(report)
     assert all("kmon::recurse" in f for f in frames), report
     assert len(frames) == 32, report  # the walker's frame limit: deep recursion
+
+
+def test_touching_a_guard_page_is_named(crash_report):
+    # A write into the main stack's guard page from a healthy stack is a
+    # plain #PF (it can be delivered), and the report names the guard page.
+    report = crash_report("guard")
+    assert "exception: #PF page fault (vector 14, error code 0x2)" in report, report
+    cr2 = re.search(r"faulting address \(cr2\): (0x[0-9a-f]{16})", report)
+    line = re.search(
+        r"^kernel stack overflow \(guard page hit\): cr2 (0x[0-9a-f]{16}) is in the guard page below "
+        r"the kernel main stack \[(0x[0-9a-f]+), ",
+        report,
+        re.MULTILINE,
+    )
+    assert cr2 and line and line.group(1) == cr2.group(1), report
+    assert int(line.group(2), 16) - 4096 + 8 == int(cr2.group(1), 16), report
+    assert page_walk(report).end == "not present at L1", report
