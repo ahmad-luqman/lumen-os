@@ -25,6 +25,7 @@ this file is refreshed on main with `make test status`.
 | M0 | harness | Codegen audit: no SSE/AVX, no red zone, kernel code model, frame pointers | passing | `audit:flags`<br>`harness:test_audit::*` |
 | M0 | harness | Golden-image comparison for screendumps | passing | `harness:test_image::*` |
 | M0 | harness | STATUS.md generated from test results | passing | `harness:test_status::*` |
+| M1 | mm | Physical frame allocator from the Limine map, never returns reserved frames | passing | `cargo:lumen-mm`<br>`ktest:lumen_kernel::mm::frame::never_returns_reserved`<br>`ktest:lumen_kernel::mm::frame::live_memory_oracle_detects_a_leak`<br>`ktest:lumen_kernel::mm::frame::bad_frame_detects_reserved_frames`<br>`ktest:lumen_kernel::mm::frame::named_reservations_are_complete`<br>`ktest:lumen_kernel::mm::frame::translate_agrees_with_the_hhdm`<br>`ktest:lumen_kernel::mm::frame::alloc_free_reuse`<br>`scenario:test_mm::test_frame_allocator_summary_logged` |
 
 ## Known gaps (temporary exceptions to the hard rules)
 
