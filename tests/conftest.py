@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 from lumen_harness import BUILD_DIR, REPO_ROOT
-from lumen_harness.qemu import Machine
+from lumen_harness.qemu import EXIT_CRASH, Machine
 
 ISOS = {
     "interactive": BUILD_DIR / "lumen.iso",
@@ -28,6 +28,8 @@ ISOS = {
 # artifacts apart from the first run's: CI re-runs KVM failures under TCG.
 ARTIFACTS = REPO_ROOT / (os.environ.get("LUMEN_ARTIFACTS_DIR") or BUILD_DIR / "test-artifacts")
 GOLDEN_DIR = Path(__file__).parent / "golden"
+CRASH_BEGIN = "==== LUMEN CRASH REPORT ===="
+CRASH_END = "==== END CRASH REPORT ===="
 
 
 @pytest.hookimpl(wrapper=True)
@@ -74,3 +76,20 @@ def boot(artifacts: Path) -> Iterator[Callable[[str], Machine]]:
 @pytest.fixture
 def golden_dir() -> Path:
     return GOLDEN_DIR
+
+
+@pytest.fixture
+def crash_report(boot: Callable[[str], Machine]) -> Callable[[str], str]:
+    """`crash_report("pf")` boots, runs `crash pf` in kmon, checks QEMU exits
+    with the crash code, and returns the report (both markers included)."""
+
+    def _crash(kind: str) -> str:
+        m = boot("qemutest")
+        m.expect(r"kmon> ", 60)
+        m.send_line(f"crash {kind}")
+        m.expect(re.escape(CRASH_END), 30)
+        assert m.wait_exit(10) == EXIT_CRASH
+        out = m.output
+        return out[out.index(CRASH_BEGIN) : out.index(CRASH_END) + len(CRASH_END)]
+
+    return _crash

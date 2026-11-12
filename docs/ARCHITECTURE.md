@@ -79,8 +79,9 @@ tests (for example `lumen-elf`, the symbol-table reader).
    exception produces a crash report.**
 5. Logger (level from `lumen.log=`), Limine responses checked, the symbol table
    located in our own ELF, a memory-map summary, the frame allocator
-   (`INFO  mem: frames: N usable, M reserved`), the framebuffer hello screen,
-   then `boot complete`.
+   (`INFO  mem: frames: N usable, M reserved`), the kernel's own page tables
+   (`INFO  mem: paging: kernel page tables active ...`; Limine's are no longer
+   used after this), the framebuffer hello screen, then `boot complete`.
 6. Either the in-kernel test runner (`--features ktest`) or the kernel monitor
    (`kmon`, a serial debug console that the user-mode shell replaces in M2).
 
@@ -93,13 +94,12 @@ Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 
 | Range | Use | Status |
 |---|---|---|
-| `0x0000_0000_0000_0000 – 0x0000_0000_0000_ffff` | never mapped (null guard) | planned |
-| `0x0000_0000_0001_0000 – 0x0000_7fff_ffff_ffff` | user space, per process | M2 |
-| `0xffff_8000_0000_0000 – +phys size` | higher-half direct map (HHDM) of all physical memory | built (Limine) |
-| `0xffff_c000_0000_0000 – 0xffff_c0ff_ffff_ffff` | kernel heap (grows by mapping frames) | M1 |
-| `0xffff_d000_0000_0000 – 0xffff_d0ff_ffff_ffff` | kernel stacks: 64 KiB each, **unmapped guard page below every stack** | M1 |
-| `0xffff_e000_0000_0000 – 0xffff_e0ff_ffff_ffff` | MMIO mappings (uncached) | M1+ |
-| `0xffff_ffff_8000_0000 – end of image` | kernel image: `.text` R-X, `.rodata` R--, `.data/.bss` RW-, page-aligned segments | built |
+| `0x0000_0000_0000_0000 – 0x0000_7fff_ffff_ffff` | empty in the kernel's tables (null guard); user space, per process, from M2 (except the first 64 KiB) | built (empty) |
+| `0xffff_8000_0000_0000 – +phys size` | higher-half direct map (HHDM) of RAM: usable, bootloader-reclaimable, kernel and framebuffer entries; RW-, framebuffer write-combining | built |
+| `0xffff_c000_0000_0000 – 0xffff_c0ff_ffff_ffff` | kernel heap (grows by mapping frames) | M1 (#5) |
+| `0xffff_d000_0000_0000 – 0xffff_d0ff_ffff_ffff` | kernel stacks: 64 KiB each, **unmapped guard page below every stack** | M1 (#6) |
+| `0xffff_e000_0000_0000 – 0xffff_e0ff_ffff_ffff` | MMIO mappings (uncached, RW-), `map_mmio` | built |
+| `0xffff_ffff_8000_0000 – end of image` | kernel image: `.text` R-X, `.rodata` (and `.got`) R--, `.data/.bss` RW-, page-aligned segments | built |
 
 The kernel is linked at -2 GiB because the **kernel code model** requires it
 (all symbols fit in sign-extended 32-bit immediates). `make audit` verifies
@@ -142,6 +142,48 @@ tag it with a sequence number, and free them all, checking each tag (catches
 a frame handed out twice) (hard rule 2). Bootloader-reclaimable
 memory is not returned yet; whoever adds that must first copy or stop using
 everything in it (page tables, boot stack, kernel file).
+
+### Page tables (built in M1)
+
+At boot the kernel runs on Limine's tables. Right after the frame allocator
+exists, `kernel/src/mm/paging.rs` builds its own hierarchy from allocator
+frames (zeroed) and switches CR3:
+
+- **HHDM** at Limine's offset, covering the memory-map entry types Limine's
+  HHDM covers at base revision 3 (usable, bootloader-reclaimable, kernel and
+  modules, framebuffer), so every HHDM pointer Limine handed out stays valid.
+  2 MiB pages where a whole one fits, 4 KiB at the edges. ACPI memory is not
+  in the HHDM; ACPI parsing (#2) maps what it needs (`map_mmio` maps the RSDP
+  already).
+- **Kernel image** per segment from the linker script's page-aligned
+  boundaries (`__rodata_start`, `__data_start`): text R-X, rodata R--, data
+  RW-. `make audit` checks every allocated section of the ELF lies inside
+  `[__kernel_start, __kernel_end)`, so nothing the kernel uses is left
+  unmapped (an orphan `.got` once was; it is now placed in rodata).
+- **Nothing else.** The lower half is empty, so null and small pointers fault.
+
+Before loading CR3 it checks that every range the kernel is using (image,
+boot stack, current stack page, kernel file, framebuffer, frame bitmap,
+memory map, cmdline) and every page Limine mapped in the kernel's 2 GiB
+translates to the same frame under the new tables: a mistake is an assertion
+with a message, not a fault with no stack. EFER.NXE and CR0.WP are set (so
+read-only pages bind in ring 0 too) and the PAT layout the mappings rely on
+(slot 0 WB, 3 UC, 5 WC, set up by Limine) is checked rather than rewritten.
+
+The entry format, walks and mapper are pure logic in `lumen_mm::paging`,
+tested on the host against fake table memory (including a randomized
+comparison with a model). Table entries are permissive; rights are enforced
+at the leaves, and walks report the rights combined over every level, which
+is what the CPU enforces. The kernel API: `map`/`unmap` (4 KiB, `unmap`
+invalidates the TLB entry), `map_mmio` (uncached, permanent, refuses RAM the
+HHDM maps, since two memory types for one frame is undefined), `walk` and
+`translate`. Tables are never freed. A page fault's crash report includes the
+walk of CR2 (every entry read, then the page and its rights, or the level
+that is not present), read without locks.
+
+The kernel's upper-half entries are not yet shared with anything; processes
+(M2) will need the kernel's L4 entries 256-511 copied into every address
+space, so new kernel L3 tables must be allocated up front then.
 
 **Temporary exception (until #6):** the boot stack (128 KiB requested from
 Limine; 64 KiB assumed if it doesn't confirm) and the three 16 KiB IST stacks
@@ -459,7 +501,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
   src/kmon.rs      serial debug monitor (until the M2 shell)
-  src/mm/          memory management: frame allocator (frame.rs)
+  src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs)
   linker.ld        layout at -2 GiB, .ktests section
 crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, ...)
 boot/limine.conf   bootloader config template

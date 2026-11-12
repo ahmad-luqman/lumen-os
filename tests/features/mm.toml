@@ -13,3 +13,21 @@ tests = [
     "ktest:lumen_kernel::mm::frame::alloc_free_reuse",
     "scenario:test_mm::test_frame_allocator_summary_logged",
 ]
+
+[[feature]]
+name = "Kernel page tables: W^X kernel image, HHDM, map/unmap, uncached MMIO; #PF reports show the page walk"
+milestone = "M1"
+tests = [
+    "cargo:lumen-mm",
+    "ktest:lumen_kernel::mm::paging::map_unmap_roundtrip",
+    "ktest:lumen_kernel::mm::paging::kernel_text_not_writable",
+    "ktest:lumen_kernel::mm::paging::no_page_is_writable_and_executable",
+    "ktest:lumen_kernel::mm::paging::tables_are_ours_and_allocated",
+    "ktest:lumen_kernel::mm::paging::framebuffer_is_write_combining",
+    "ktest:lumen_kernel::mm::paging::mmio_maps_the_rsdp_uncached",
+    "ktest:lumen_kernel::mm::paging::walk_reports_each_level",
+    "scenario:test_mm::test_kernel_page_tables_active",
+    "scenario:test_mm::test_write_to_text_crashes_cleanly",
+    "scenario:test_mm::test_nx_data_crashes_cleanly",
+    "scenario:test_crash::test_page_fault_report_names_address_and_cause",
+]

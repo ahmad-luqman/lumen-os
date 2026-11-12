@@ -116,10 +116,12 @@ own PR that updates that doc first.
   runner. `kmon.rs`: serial debug monitor (until the M2 shell). `fb.rs`:
   framebuffer and console. `klog.rs`: logger. `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator and its reservations.
-  `arch/x86_64/paging.rs`: read-only page-table walks. `trace.rs`: trace
-  ring, event kinds, `ktrace!`.
+  `mm/paging.rs`: the kernel's page tables (HHDM, W^X image, map/unmap,
+  MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
+  PAT. `trace.rs`: trace ring, event kinds, `ktrace!`.
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
-- `crates/lumen-mm`: frame-allocator logic (bitmap; host-tested).
+- `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, and the
+  page-table format and mapper (host-tested, incl. a model comparison).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
   are built), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`.

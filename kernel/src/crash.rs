@@ -2,9 +2,10 @@
 //!
 //! Signature feature 5: no silent triple faults. The report goes to serial
 //! (for the test harness and `make run` logs) and to the screen, and contains
-//! the exception, decoded error code, faulting address, registers, and a
-//! symbolized frame-pointer backtrace; on serial only, it ends with the last
-//! 16 trace events (what led up to it).
+//! the exception, decoded error code, faulting address (for a page fault,
+//! with the page-table walk of that address), registers, and a symbolized
+//! frame-pointer backtrace; on serial only, it ends with the last 16 trace
+//! events (what led up to it).
 //!
 //! The reporter must not make things worse: it takes no locks it could
 //! deadlock on, follows a frame pointer only if it points into a known stack
@@ -111,6 +112,9 @@ fn write_exception(w: &mut dyn Write, f: &TrapFrame, cr2: u64) {
     if f.vector == 14 {
         let _ = writeln!(w, "  {}", PageFaultCause(f.error_code));
         let _ = writeln!(w, "  faulting address (cr2): {cr2:#018x}");
+        // Lock-free and reads only mapped RAM (the fault may have happened
+        // with the page-table lock held, or in the tables themselves).
+        let _ = crate::mm::paging::write_walk(w, cr2);
     }
     let _ = writeln!(w, "rip: {:#018x} <{}>", f.rip, Symbolized(f.rip));
     let _ = writeln!(w, "rsp: {:#018x}  rflags: {:#010x}  cs: {:#06x}  ss: {:#06x}", f.rsp, f.rflags, f.cs, f.ss);

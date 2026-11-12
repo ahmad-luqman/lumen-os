@@ -9,10 +9,7 @@ import re
 
 import pytest
 from lumen_harness.image import assert_matches_golden
-from lumen_harness.qemu import EXIT_CRASH
 
-BEGIN = "==== LUMEN CRASH REPORT ===="
-END = "==== END CRASH REPORT ===="
 SCREEN_DONE = "(crash report shown on screen)"
 
 # kind -> (exception line regex, function the rip must resolve to)
@@ -28,23 +25,13 @@ FAULTS = {
 }
 
 
-def crash(boot, kind: str) -> str:
-    m = boot("qemutest")
-    m.expect(r"kmon> ", 60)
-    m.send_line(f"crash {kind}")
-    m.expect(re.escape(END), 30)
-    assert m.wait_exit(10) == EXIT_CRASH
-    out = m.output
-    return out[out.index(BEGIN) : out.index(END) + len(END)]
-
-
 def backtrace(report: str) -> list[str]:
     return re.findall(r"^  #\d+\s+0x[0-9a-f]{16} <(.+)>$", report, re.MULTILINE)
 
 
 @pytest.mark.parametrize("kind", sorted(FAULTS))
-def test_fault_produces_symbolized_report(boot, kind):
-    report = crash(boot, kind)
+def test_fault_produces_symbolized_report(crash_report, kind):
+    report = crash_report(kind)
     exc_rx, func = FAULTS[kind]
     assert re.search(exc_rx, report), report
     rip = re.search(r"^rip: 0x[0-9a-f]{16} <(.+)>$", report, re.MULTILINE)
@@ -59,8 +46,8 @@ def test_fault_produces_symbolized_report(boot, kind):
     assert "<unknown>" not in report, report
 
 
-def test_report_shows_the_trace_events_leading_up_to_it(boot):
-    report = crash(boot, "pf")
+def test_report_shows_the_trace_events_leading_up_to_it(crash_report):
+    report = crash_report("pf")
     trace = report[report.index("recent trace events (oldest first):") :]
     lines = re.findall(r"^  #\d+ +tsc=\d+ +(\S+.*)$", trace, re.MULTILINE)
     assert len(lines) == 16, trace
@@ -69,8 +56,8 @@ def test_report_shows_the_trace_events_leading_up_to_it(boot):
     assert re.search(r"^trace: \d+ events claimed, 0 dropped$", trace, re.MULTILINE), trace
 
 
-def test_panic_report_trace_ends_with_the_panic(boot):
-    report = crash(boot, "panic")
+def test_panic_report_trace_ends_with_the_panic(crash_report):
+    report = crash_report("panic")
     trace = report[report.index("recent trace events (oldest first):") :]
     lines = re.findall(r"^  #\d+ +tsc=\d+ +(\S+.*)$", trace, re.MULTILINE)
     at = re.search(r"^  at kernel/src/kmon\.rs:(\d+):\d+$", report, re.MULTILINE)
@@ -78,14 +65,20 @@ def test_panic_report_trace_ends_with_the_panic(boot):
     assert re.match(rf"panic +line={at.group(1)}$", lines[-1]), trace
 
 
-def test_page_fault_report_names_address_and_cause(boot):
-    report = crash(boot, "pf")
+def test_page_fault_report_names_address_and_cause(crash_report):
+    report = crash_report("pf")
     assert "faulting address (cr2): 0x00000000deadb000" in report
     assert "page fault: write of non-present page (kernel mode)" in report
+    # The page-table walk of cr2: the lower half is empty, so it stops at
+    # the first level.
+    walk = report[report.index("  page walk (cr3 ") :]
+    assert re.match(
+        r"  page walk \(cr3 0x[0-9a-f]+\):\n    L4\[000\] 0x0{16}\n    -> not present at L4\n", walk
+    ), walk
 
 
-def test_panic_produces_report(boot):
-    report = crash(boot, "panic")
+def test_panic_produces_report(crash_report):
+    report = crash_report("panic")
     assert "panic: deliberate panic from kmon" in report
     assert re.search(r"at kernel/src/kmon\.rs:\d+:\d+", report)
     frames = backtrace(report)
