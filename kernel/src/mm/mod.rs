@@ -1,7 +1,6 @@
-//! Memory management.
-//!
-//! M1 so far: the physical frame allocator ([`frame`]). Physical memory is
-//! reached through Limine's higher-half direct map (HHDM).
+//! Memory management: the physical frame allocator ([`frame`]); paging (#4)
+//! and the heap (#5) will join it. Physical memory is reached through
+//! Limine's higher-half direct map (HHDM).
 
 pub mod frame;
 
@@ -18,8 +17,11 @@ pub fn init() {
     frame::init(hhdm);
 }
 
-/// The virtual address at which physical address `phys` is mapped.
+/// The virtual address at which physical address `phys` is mapped. Only
+/// valid after [`init`].
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first used by ktests; #4 uses it too
 pub fn phys_to_virt(phys: u64) -> *mut u8 {
-    (HHDM_OFFSET.load(Ordering::Relaxed) + phys) as *mut u8
+    let offset = HHDM_OFFSET.load(Ordering::Relaxed);
+    debug_assert_ne!(offset, 0, "phys_to_virt before mm::init");
+    (offset + phys) as *mut u8
 }

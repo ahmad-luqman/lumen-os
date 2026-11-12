@@ -13,29 +13,31 @@
 //!   memory-map entry and outside every reservation).
 //! - **free**: the frame is owned and not currently allocated.
 //!
-//! The owned bitmap is what lets [`FrameAllocator::free`] refuse a frame it
-//! never handed out (a reserved frame such as the kernel image, an address
-//! outside RAM, or a double free) instead of silently adding it to the pool.
-//! That is hard rule 2 ("never hand out memory you don't own") applied to
-//! `free` as well as `alloc`.
+//! A reserved frame and an allocated frame both have a clear free bit; only
+//! the owned bit tells them apart. That is what lets [`FrameAllocator::free`]
+//! refuse a frame that was never the allocator's to give (a reserved frame
+//! such as the kernel image, or a hole inside the span) instead of silently
+//! adding it to the pool: hard rule 2 ("never hand out memory you don't own")
+//! applied to `free` as well as `alloc`. Double frees are caught by the free
+//! bit, addresses outside the span by a range check.
 //!
 //! **Why a bitmap and not a buddy allocator:** at 2 bits per frame the cost is
-//! 64 KiB per GiB of RAM, it is simple enough to check exhaustively, and
+//! 64 KiB per GiB of physical span (lowest to highest usable frame), it is
+//! simple enough that a test can allocate and verify every frame, and
 //! single-frame allocation (what page tables, stacks and the heap need) is a
 //! word scan from a "lowest free frame" hint. Contiguous allocation is a
 //! linear scan, which is fine for the rare large requests (DMA buffers). If
 //! profiling shows contiguous allocation matters, a buddy allocator can
 //! replace this behind the same interface.
 //!
-//! # Order of construction
+//! # Usable memory and reservations
 //!
-//! Build in two phases: [`FrameAllocator::add_usable`] for every usable
-//! region, then [`FrameAllocator::reserve`] for every reserved range. The
-//! first `reserve` seals the usable set: a later `add_usable` fails with
-//! [`InitError::Sealed`], so a reservation can never be undone by accident.
-//! Overlapping or unaligned input is fine: usable ranges are rounded *inward*
-//! to whole frames, reservations *outward*, and a frame that is both usable
-//! and reserved is reserved.
+//! The usable set is fixed when the allocator is built ([`FrameAllocator::new`]);
+//! after that frames can only be taken away, with [`FrameAllocator::reserve`],
+//! never added. Overlapping or unaligned input is fine: usable ranges are
+//! rounded *inward* to whole frames, reservations *outward*, and a frame that
+//! is both usable and reserved is reserved. `reserve` refuses a range that
+//! contains an allocated frame, because someone is already using it.
 
 #![no_std]
 
@@ -60,15 +62,17 @@ pub const fn align_down(x: u64, align: u64) -> u64 {
     x & !(align - 1)
 }
 
-/// A half-open range of physical addresses, `[start, end)`.
+/// A half-open range of physical addresses, `[start, end)`, with
+/// `start <= end` always (the fields are private so it can't be broken).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PhysRange {
-    pub start: u64,
-    pub end: u64,
+    start: u64,
+    end: u64,
 }
 
 impl PhysRange {
-    /// `[start, end)`; an `end` below `start` gives an empty range at `start`.
+    /// `[start, end)`. An `end` below `start` gives an empty range at `start`:
+    /// memory-map input is untrusted, and an inverted entry means "nothing".
     pub const fn new(start: u64, end: u64) -> Self {
         Self { start, end: if end < start { start } else { end } }
     }
@@ -76,6 +80,14 @@ impl PhysRange {
     /// `[start, start + len)`, saturating at the top of the address space.
     pub const fn from_len(start: u64, len: u64) -> Self {
         Self::new(start, start.saturating_add(len))
+    }
+
+    pub const fn start(&self) -> u64 {
+        self.start
+    }
+
+    pub const fn end(&self) -> u64 {
+        self.end
     }
 
     pub const fn len(&self) -> u64 {
@@ -90,9 +102,10 @@ impl PhysRange {
         addr >= self.start && addr < self.end
     }
 
-    /// Do the two ranges share at least one byte?
+    /// Do the two ranges share at least one byte? (An empty range overlaps
+    /// nothing, even when it lies inside the other.)
     pub const fn overlaps(&self, other: &PhysRange) -> bool {
-        self.start < other.end && other.start < self.end
+        !self.is_empty() && !other.is_empty() && self.start < other.end && other.start < self.end
     }
 
     /// The largest frame-aligned range inside `self` (possibly empty).
@@ -103,7 +116,7 @@ impl PhysRange {
     /// The smallest frame-aligned range covering `self`.
     pub const fn grow_to_frames(&self) -> Self {
         if self.is_empty() {
-            return Self::new(self.start, self.start);
+            return *self;
         }
         Self::new(align_down(self.start, FRAME_SIZE), align_up(self.end, FRAME_SIZE))
     }
@@ -120,8 +133,29 @@ impl fmt::Display for PhysRange {
 pub enum InitError {
     /// The storage slice is shorter than [`storage_words`] for the span.
     StorageTooSmall,
-    /// `add_usable` after the first `reserve`.
-    Sealed,
+}
+
+impl fmt::Display for InitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InitError::StorageTooSmall => f.write_str("bitmap storage too small for the span"),
+        }
+    }
+}
+
+/// Why a range could not be reserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReserveError {
+    /// The frame at this address is allocated: someone is using it.
+    InUse(u64),
+}
+
+impl fmt::Display for ReserveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReserveError::InUse(addr) => write!(f, "frame {addr:#x} is already allocated"),
+        }
+    }
 }
 
 /// Why a frame could not be freed. Every variant is a caller bug.
@@ -170,25 +204,21 @@ pub fn find_hole(
     avoid: impl IntoIterator<Item = PhysRange> + Clone,
     size: u64,
 ) -> Option<u64> {
-    let mut best: Option<u64> = None;
-    for region in usable {
-        let region = region.shrink_to_frames();
-        let mut candidate = region.start;
-        while let Some(end) = candidate.checked_add(size) {
-            if end > region.end {
-                break;
-            }
-            let want = PhysRange::new(candidate, end);
-            match avoid.clone().into_iter().filter(|a| a.overlaps(&want)).map(|a| a.end).max() {
-                Some(blocker_end) => candidate = align_up(blocker_end, FRAME_SIZE),
-                None => {
-                    best = Some(best.map_or(candidate, |b| b.min(candidate)));
-                    break;
-                }
-            }
+    usable.into_iter().filter_map(|region| first_fit(region.shrink_to_frames(), avoid.clone(), size)).min()
+}
+
+/// The lowest frame-aligned `a` with `[a, a + size)` inside the aligned
+/// `region` and overlapping none of `avoid`.
+fn first_fit(region: PhysRange, avoid: impl IntoIterator<Item = PhysRange> + Clone, size: u64) -> Option<u64> {
+    let mut candidate = region.start;
+    loop {
+        let end = candidate.checked_add(size).filter(|&end| end <= region.end)?;
+        let want = PhysRange::new(candidate, end);
+        match avoid.clone().into_iter().filter(|a| a.overlaps(&want)).map(|a| a.end).max() {
+            Some(blocker_end) => candidate = align_up(blocker_end, FRAME_SIZE),
+            None => return Some(candidate),
         }
     }
-    best
 }
 
 /// A bitmap frame allocator over one contiguous span of physical memory.
@@ -202,14 +232,18 @@ pub struct FrameAllocator<'a> {
     free_count: usize,
     /// No free frame has an index below this.
     hint: usize,
-    sealed: bool,
 }
 
 impl<'a> FrameAllocator<'a> {
-    /// An allocator for `span` (rounded out to whole frames) with nothing
-    /// usable yet. `storage` holds both bitmaps and must have at least
-    /// [`storage_words`] words; it is zeroed here.
-    pub fn new(span: PhysRange, storage: &'a mut [u64]) -> Result<Self, InitError> {
+    /// An allocator for `span` (rounded out to whole frames) whose free frames
+    /// are the whole frames inside `usable` (clamped to the span). `storage`
+    /// holds both bitmaps and must have at least [`storage_words`] words; it is
+    /// zeroed here, so its previous contents don't matter.
+    pub fn new(
+        span: PhysRange,
+        storage: &'a mut [u64],
+        usable: impl IntoIterator<Item = PhysRange>,
+    ) -> Result<Self, InitError> {
         let span = span.grow_to_frames();
         let frames = frames_in(span);
         let words = frames.div_ceil(BITS);
@@ -220,16 +254,20 @@ impl<'a> FrameAllocator<'a> {
         let free = &mut rest[..words];
         owned.fill(0);
         free.fill(0);
-        Ok(Self {
-            base_frame: span.start / FRAME_SIZE,
-            frames,
-            owned,
-            free,
-            owned_count: 0,
-            free_count: 0,
-            hint: 0,
-            sealed: false,
-        })
+        let mut fa =
+            Self { base_frame: span.start / FRAME_SIZE, frames, owned, free, owned_count: 0, free_count: 0, hint: 0 };
+        for range in usable {
+            let (lo, hi) = fa.indices(range.shrink_to_frames());
+            for i in lo..hi {
+                if !bit(fa.owned, i) {
+                    set(fa.owned, i, true);
+                    set(fa.free, i, true);
+                    fa.owned_count += 1;
+                }
+            }
+        }
+        fa.free_count = fa.owned_count;
+        Ok(fa)
     }
 
     /// The physical span this allocator manages.
@@ -258,45 +296,26 @@ impl<'a> FrameAllocator<'a> {
         self.index_of(addr).is_some_and(|i| bit(self.free, i))
     }
 
-    /// Mark the whole frames inside `range` as usable and free. Returns how
-    /// many frames became usable (frames already usable are not counted).
-    pub fn add_usable(&mut self, range: PhysRange) -> Result<usize, InitError> {
-        if self.sealed {
-            return Err(InitError::Sealed);
-        }
-        let (lo, hi) = self.indices(range.shrink_to_frames());
-        let mut added = 0;
-        for i in lo..hi {
-            if !bit(self.owned, i) {
-                set(self.owned, i, true);
-                set(self.free, i, true);
-                added += 1;
-            }
-        }
-        self.owned_count += added;
-        self.free_count += added;
-        self.hint = self.hint.min(lo);
-        Ok(added)
-    }
-
     /// Take every frame that `range` touches away from the allocator for
-    /// good. Returns how many owned frames that removed. Seals the usable set.
-    pub fn reserve(&mut self, range: PhysRange) -> usize {
-        self.sealed = true;
+    /// good. Returns how many owned frames that removed (frames already
+    /// reserved or outside RAM are not counted). Refuses, changing nothing,
+    /// if any of those frames is allocated.
+    pub fn reserve(&mut self, range: PhysRange) -> Result<usize, ReserveError> {
         let (lo, hi) = self.indices(range.grow_to_frames());
+        if let Some(i) = (lo..hi).find(|&i| bit(self.owned, i) && !bit(self.free, i)) {
+            return Err(ReserveError::InUse(self.addr_of(i)));
+        }
         let mut removed = 0;
         for i in lo..hi {
             if bit(self.owned, i) {
-                if bit(self.free, i) {
-                    self.free_count -= 1;
-                }
                 set(self.owned, i, false);
                 set(self.free, i, false);
                 removed += 1;
             }
         }
         self.owned_count -= removed;
-        removed
+        self.free_count -= removed;
+        Ok(removed)
     }
 
     /// Allocate the lowest free frame; returns its physical address.
@@ -317,16 +336,18 @@ impl<'a> FrameAllocator<'a> {
     }
 
     /// Allocate `count` physically contiguous frames whose first address is
-    /// aligned to `align_frames` frames (a power of two); returns the first
-    /// address. `None` if `count` is 0, `align_frames` is not a power of two,
-    /// or no such run is free.
-    pub fn alloc_contiguous(&mut self, count: usize, align_frames: u64) -> Option<u64> {
-        if count == 0 || !align_frames.is_power_of_two() {
-            return None;
-        }
+    /// aligned to `align_frames` frames; returns the first address, or `None`
+    /// if no such run is free.
+    ///
+    /// # Panics
+    /// If `count` is 0 or `align_frames` is not a power of two (caller bugs,
+    /// kept distinct from running out of memory).
+    pub fn alloc_contiguous(&mut self, count: usize, align_frames: usize) -> Option<u64> {
+        assert!(count > 0, "alloc_contiguous: count must be at least 1");
+        assert!(align_frames.is_power_of_two(), "alloc_contiguous: alignment must be a power of two");
         let mut i = self.hint;
         while i.checked_add(count)? <= self.frames {
-            let aligned = (align_up(self.base_frame + i as u64, align_frames) - self.base_frame) as usize;
+            let aligned = (align_up(self.base_frame + i as u64, align_frames as u64) - self.base_frame) as usize;
             if aligned != i {
                 i = aligned;
                 continue;
@@ -351,6 +372,26 @@ impl<'a> FrameAllocator<'a> {
     /// Return a frame obtained from [`alloc`](Self::alloc) or
     /// [`alloc_contiguous`](Self::alloc_contiguous).
     pub fn free(&mut self, addr: u64) -> Result<(), FreeError> {
+        let i = self.check_allocated(addr)?;
+        self.release(i);
+        Ok(())
+    }
+
+    /// Return `count` contiguous frames starting at `first`, all or nothing:
+    /// if any of them can't be freed, none is.
+    pub fn free_contiguous(&mut self, first: u64, count: usize) -> Result<(), FreeError> {
+        for k in 0..count as u64 {
+            self.check_allocated(first.checked_add(k * FRAME_SIZE).ok_or(FreeError::OutOfRange)?)?;
+        }
+        for k in 0..count as u64 {
+            let i = self.check_allocated(first + k * FRAME_SIZE)?;
+            self.release(i);
+        }
+        Ok(())
+    }
+
+    /// The bitmap index of `addr` if it is an allocated frame.
+    fn check_allocated(&self, addr: u64) -> Result<usize, FreeError> {
         if !addr.is_multiple_of(FRAME_SIZE) {
             return Err(FreeError::NotAligned);
         }
@@ -361,10 +402,13 @@ impl<'a> FrameAllocator<'a> {
         if bit(self.free, i) {
             return Err(FreeError::DoubleFree);
         }
+        Ok(i)
+    }
+
+    fn release(&mut self, i: usize) {
         set(self.free, i, true);
         self.free_count += 1;
         self.hint = self.hint.min(i);
-        Ok(())
     }
 
     fn addr_of(&self, i: usize) -> u64 {
@@ -382,6 +426,19 @@ impl<'a> FrameAllocator<'a> {
         let clamp = |addr: u64| ((addr / FRAME_SIZE).saturating_sub(self.base_frame)).min(self.frames as u64) as usize;
         let (lo, hi) = (clamp(range.start), clamp(range.end));
         (lo, hi.max(lo))
+    }
+
+    /// Assert every internal invariant (host tests only).
+    #[cfg(test)]
+    fn check_invariants(&self) {
+        let popcount = |map: &[u64]| map.iter().map(|w| w.count_ones() as usize).sum::<usize>();
+        assert_eq!(popcount(self.owned), self.owned_count, "owned_count");
+        assert_eq!(popcount(self.free), self.free_count, "free_count");
+        for (o, f) in self.owned.iter().zip(self.free.iter()) {
+            assert_eq!(f & !o, 0, "a free frame is not owned");
+        }
+        assert!((0..self.hint.min(self.frames)).all(|i| !bit(self.free, i)), "free frame below hint");
+        assert!((self.frames..self.owned.len() * BITS).all(|i| !bit(self.owned, i)), "bit set past the span");
     }
 }
 
@@ -410,6 +467,7 @@ mod tests {
         PhysRange::new(start, end)
     }
 
+    /// Storage pre-filled with garbage, to prove `new` zeroes it.
     fn storage(span: PhysRange) -> Vec<u64> {
         vec![0xdead_beef; storage_words(span)]
     }
@@ -428,25 +486,48 @@ mod tests {
         assert_eq!(r(5, 5).grow_to_frames().len(), 0);
         assert_eq!(align_up(u64::MAX - 5, F), !(F - 1));
         assert_eq!(PhysRange::new(10, 2), r(10, 10));
+        assert_eq!(PhysRange::from_len(u64::MAX - 1, 10).end(), u64::MAX);
     }
 
     #[test]
-    fn starts_empty_and_rejects_short_storage() {
+    fn empty_ranges_overlap_nothing() {
+        // Found by random_operations_match_a_model: an empty range inside a
+        // frame used to "overlap" it.
+        let frame = r(F, 2 * F);
+        assert!(!r(F + 5, F + 5).overlaps(&frame));
+        assert!(!frame.overlaps(&r(F + 5, F + 5)));
+        assert!(frame.overlaps(&r(2 * F - 1, 2 * F)));
+        assert!(!frame.overlaps(&r(2 * F, 3 * F)), "half-open: touching is not overlapping");
+    }
+
+    #[test]
+    fn starts_from_usable_and_rejects_short_storage() {
         let span = r(0, 1000 * F);
         let mut short = vec![0; storage_words(span) - 1];
-        assert_eq!(FrameAllocator::new(span, &mut short).err(), Some(InitError::StorageTooSmall));
+        assert_eq!(FrameAllocator::new(span, &mut short, []).err(), Some(InitError::StorageTooSmall));
         let mut s = storage(span);
-        let mut fa = FrameAllocator::new(span, &mut s).unwrap();
+        let mut fa = FrameAllocator::new(span, &mut s, []).unwrap();
         assert_eq!((fa.owned_frames(), fa.free_frames()), (0, 0));
-        assert_eq!(fa.alloc(), None, "nothing is usable until add_usable");
+        assert_eq!(fa.alloc(), None, "nothing usable");
+        fa.check_invariants();
+    }
+
+    #[test]
+    fn oversized_garbage_storage_is_ignored() {
+        let span = r(0, 65 * F);
+        let mut s = vec![u64::MAX; storage_words(span) + 4];
+        let mut fa = FrameAllocator::new(span, &mut s, [span]).unwrap();
+        fa.check_invariants();
+        let got = drain(&mut fa);
+        assert_eq!(got.len(), 65);
+        assert!(got.iter().all(|&a| a < 65 * F));
     }
 
     #[test]
     fn alloc_free_reuse() {
         let span = r(0, 64 * F);
         let mut s = storage(span);
-        let mut fa = FrameAllocator::new(span, &mut s).unwrap();
-        fa.add_usable(r(16 * F, 32 * F)).unwrap();
+        let mut fa = FrameAllocator::new(span, &mut s, [r(16 * F, 32 * F)]).unwrap();
         let a = fa.alloc().unwrap();
         let b = fa.alloc().unwrap();
         assert_eq!((a, b), (16 * F, 17 * F), "lowest frame first");
@@ -456,6 +537,7 @@ mod tests {
         fa.free(b).unwrap();
         fa.free(a).unwrap();
         assert_eq!(fa.free_frames(), 16);
+        fa.check_invariants();
     }
 
     #[test]
@@ -463,10 +545,8 @@ mod tests {
         // Several regions, a span that isn't a multiple of 64 frames.
         let span = r(0, 300 * F);
         let mut s = storage(span);
-        let mut fa = FrameAllocator::new(span, &mut s).unwrap();
-        fa.add_usable(r(F, 70 * F)).unwrap();
-        fa.add_usable(r(100 * F, 101 * F)).unwrap();
-        fa.add_usable(r(200 * F, 300 * F)).unwrap();
+        let usable = [r(F, 70 * F), r(100 * F, 101 * F), r(200 * F, 300 * F)];
+        let mut fa = FrameAllocator::new(span, &mut s, usable).unwrap();
         let total = fa.free_frames();
         let got = drain(&mut fa);
         let unique: BTreeSet<_> = got.iter().copied().collect();
@@ -480,17 +560,16 @@ mod tests {
         }
         assert_eq!(fa.free_frames(), total);
         assert_eq!(drain(&mut fa).len(), total, "everything is reusable after freeing");
+        fa.check_invariants();
     }
 
     #[test]
     fn unaligned_usable_entries_round_inward() {
         let span = r(0, 16 * F);
         let mut s = storage(span);
-        let mut fa = FrameAllocator::new(span, &mut s).unwrap();
-        // Only frames 2..5 are wholly inside.
-        assert_eq!(fa.add_usable(r(F + 7, 5 * F + 100)).unwrap(), 3);
-        // Less than one frame: nothing.
-        assert_eq!(fa.add_usable(r(8 * F + 1, 9 * F + 5)).unwrap(), 0);
+        // Only frames 2..5 are wholly inside the first; the second is less
+        // than one frame.
+        let mut fa = FrameAllocator::new(span, &mut s, [r(F + 7, 5 * F + 100), r(8 * F + 1, 9 * F + 5)]).unwrap();
         assert_eq!(drain(&mut fa), vec![2 * F, 3 * F, 4 * F]);
     }
 
@@ -498,10 +577,9 @@ mod tests {
     fn overlapping_usable_entries_are_counted_once() {
         let span = r(0, 32 * F);
         let mut s = storage(span);
-        let mut fa = FrameAllocator::new(span, &mut s).unwrap();
-        assert_eq!(fa.add_usable(r(0, 10 * F)).unwrap(), 10);
-        assert_eq!(fa.add_usable(r(5 * F, 15 * F)).unwrap(), 5);
+        let mut fa = FrameAllocator::new(span, &mut s, [r(0, 10 * F), r(5 * F, 15 * F)]).unwrap();
         assert_eq!(fa.free_frames(), 15);
+        fa.check_invariants();
         assert_eq!(drain(&mut fa).len(), 15);
     }
 
@@ -509,14 +587,14 @@ mod tests {
     fn reservations_round_outward_and_win_over_usable() {
         let span = r(0, 32 * F);
         let mut s = storage(span);
-        let mut fa = FrameAllocator::new(span, &mut s).unwrap();
-        fa.add_usable(r(0, 32 * F)).unwrap();
+        let mut fa = FrameAllocator::new(span, &mut s, [span]).unwrap();
         // One byte reserves its whole frame; an unaligned range both frames.
-        assert_eq!(fa.reserve(r(0, 1)), 1);
-        assert_eq!(fa.reserve(r(4 * F + 10, 5 * F + 10)), 2);
+        assert_eq!(fa.reserve(r(0, 1)), Ok(1));
+        assert_eq!(fa.reserve(r(4 * F + 10, 5 * F + 10)), Ok(2));
         // Overlapping reservations don't double count.
-        assert_eq!(fa.reserve(r(5 * F, 7 * F)), 1);
-        assert_eq!(fa.free_frames(), 32 - 4);
+        assert_eq!(fa.reserve(r(5 * F, 7 * F)), Ok(1));
+        assert_eq!((fa.owned_frames(), fa.free_frames()), (28, 28));
+        fa.check_invariants();
         let got = drain(&mut fa);
         for reserved in [0, 4 * F, 5 * F, 6 * F] {
             assert!(!got.contains(&reserved), "reserved frame {reserved:#x} handed out");
@@ -525,24 +603,29 @@ mod tests {
     }
 
     #[test]
-    fn add_usable_after_reserve_is_refused() {
-        let span = r(0, 8 * F);
+    fn reserving_an_allocated_frame_is_refused_and_changes_nothing() {
+        let span = r(0, 16 * F);
         let mut s = storage(span);
-        let mut fa = FrameAllocator::new(span, &mut s).unwrap();
-        fa.add_usable(r(0, 8 * F)).unwrap();
-        fa.reserve(r(2 * F, 3 * F));
-        assert_eq!(fa.add_usable(r(0, 8 * F)), Err(InitError::Sealed));
-        assert!(!fa.is_owned(2 * F), "a reservation can't be undone");
+        let mut fa = FrameAllocator::new(span, &mut s, [r(0, 4 * F)]).unwrap();
+        let a = fa.alloc().unwrap();
+        // The range also covers free frames: none of them may be taken either.
+        assert_eq!(fa.reserve(r(0, 4 * F)), Err(ReserveError::InUse(a)));
+        assert_eq!((fa.owned_frames(), fa.free_frames()), (4, 3));
+        assert!(fa.is_owned(F) && fa.is_free(F));
+        fa.free(a).unwrap();
+        assert_eq!(fa.reserve(r(a, a + F)), Ok(1), "once freed it can be reserved");
+        assert_eq!(fa.free(a), Err(FreeError::NotOwned));
+        fa.check_invariants();
     }
 
     #[test]
     fn ranges_outside_the_span_are_clamped() {
         let span = r(16 * F, 32 * F);
         let mut s = storage(span);
-        let mut fa = FrameAllocator::new(span, &mut s).unwrap();
-        assert_eq!(fa.add_usable(r(0, 1 << 40)).unwrap(), 16);
-        assert_eq!(fa.reserve(r(0, 17 * F)), 1);
-        assert_eq!(fa.reserve(r(1 << 40, u64::MAX)), 0);
+        let mut fa = FrameAllocator::new(span, &mut s, [r(0, 1 << 40)]).unwrap();
+        assert_eq!(fa.owned_frames(), 16);
+        assert_eq!(fa.reserve(r(0, 17 * F)), Ok(1));
+        assert_eq!(fa.reserve(r(1 << 40, u64::MAX)), Ok(0));
         assert_eq!(drain(&mut fa).first(), Some(&(17 * F)));
     }
 
@@ -550,9 +633,8 @@ mod tests {
     fn free_rejects_bad_addresses() {
         let span = r(0, 16 * F);
         let mut s = storage(span);
-        let mut fa = FrameAllocator::new(span, &mut s).unwrap();
-        fa.add_usable(r(0, 8 * F)).unwrap();
-        fa.reserve(r(0, F));
+        let mut fa = FrameAllocator::new(span, &mut s, [r(0, 8 * F)]).unwrap();
+        fa.reserve(r(0, F)).unwrap();
         let a = fa.alloc().unwrap();
         assert_eq!(fa.free(a + 1), Err(FreeError::NotAligned));
         assert_eq!(fa.free(0), Err(FreeError::NotOwned), "reserved frame");
@@ -561,15 +643,31 @@ mod tests {
         assert_eq!(fa.free(a), Ok(()));
         assert_eq!(fa.free(a), Err(FreeError::DoubleFree));
         assert_eq!(fa.free_frames(), 7, "failed frees changed nothing");
+        fa.check_invariants();
+    }
+
+    #[test]
+    fn free_contiguous_is_all_or_nothing() {
+        let span = r(0, 16 * F);
+        let mut s = storage(span);
+        let mut fa = FrameAllocator::new(span, &mut s, [r(0, 8 * F)]).unwrap();
+        let run = fa.alloc_contiguous(4, 1).unwrap();
+        // One past the run is free: refused, and the run stays allocated.
+        assert_eq!(fa.free_contiguous(run, 5), Err(FreeError::DoubleFree));
+        assert_eq!(fa.free_frames(), 4);
+        assert_eq!(fa.free_contiguous(!(F - 1), 2), Err(FreeError::OutOfRange));
+        assert_eq!(fa.free_contiguous(run, 4), Ok(()));
+        assert_eq!(fa.free_frames(), 8);
+        assert_eq!(fa.free_contiguous(run, 0), Ok(()));
+        fa.check_invariants();
     }
 
     #[test]
     fn contiguous_allocation_respects_alignment_and_holes() {
         let span = r(0, 128 * F);
         let mut s = storage(span);
-        let mut fa = FrameAllocator::new(span, &mut s).unwrap();
-        fa.add_usable(r(F, 128 * F)).unwrap();
-        fa.reserve(r(10 * F, 11 * F));
+        let mut fa = FrameAllocator::new(span, &mut s, [r(F, 128 * F)]).unwrap();
+        fa.reserve(r(10 * F, 11 * F)).unwrap();
         // 8 frames aligned to 8: frame 0 is not usable and 8..16 contains the
         // reserved frame 10, so the first fit is 16.
         let a = fa.alloc_contiguous(8, 8).unwrap();
@@ -577,26 +675,67 @@ mod tests {
         assert!((16..24).all(|f| !fa.is_free(f * F)));
         // Unaligned single frames still come from the lowest free frame.
         assert_eq!(fa.alloc(), Some(F));
-        assert_eq!(fa.alloc_contiguous(0, 1), None);
-        assert_eq!(fa.alloc_contiguous(1, 3), None, "alignment must be a power of two");
         assert_eq!(fa.alloc_contiguous(1000, 1), None, "larger than memory");
         assert_eq!(fa.alloc_contiguous(usize::MAX, 1), None, "no overflow");
         let before = fa.free_frames();
-        for f in 16..24 {
-            fa.free(f * F).unwrap();
-        }
+        fa.free_contiguous(16 * F, 8).unwrap();
         assert_eq!(fa.free_frames(), before + 8);
         assert_eq!(fa.alloc_contiguous(8, 8), Some(16 * F), "freed run is reusable");
+        fa.check_invariants();
+    }
+
+    #[test]
+    #[should_panic(expected = "count must be at least 1")]
+    fn contiguous_zero_count_is_a_bug() {
+        let span = r(0, 8 * F);
+        let mut s = storage(span);
+        FrameAllocator::new(span, &mut s, [span]).unwrap().alloc_contiguous(0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "power of two")]
+    fn contiguous_bad_alignment_is_a_bug() {
+        let span = r(0, 8 * F);
+        let mut s = storage(span);
+        FrameAllocator::new(span, &mut s, [span]).unwrap().alloc_contiguous(1, 3);
     }
 
     #[test]
     fn contiguous_alignment_is_absolute_not_relative_to_the_span() {
         let span = r(3 * F, 64 * F);
         let mut s = storage(span);
-        let mut fa = FrameAllocator::new(span, &mut s).unwrap();
-        fa.add_usable(span).unwrap();
+        let mut fa = FrameAllocator::new(span, &mut s, [span]).unwrap();
         assert_eq!(fa.alloc_contiguous(4, 4), Some(4 * F));
         assert_eq!(fa.alloc_contiguous(4, 16), Some(16 * F));
+    }
+
+    #[test]
+    fn contiguous_elsewhere_keeps_hint_for_lower_free_frames() {
+        // Frame 1 is the only free frame in bitmap word 0; a run allocated in
+        // word 1 must not move the hint past it.
+        let span = r(0, 256 * F);
+        let mut s = storage(span);
+        let mut fa = FrameAllocator::new(span, &mut s, [r(F, 256 * F)]).unwrap();
+        fa.reserve(r(2 * F, 64 * F)).unwrap();
+        let before = fa.free_frames();
+        assert_eq!(fa.alloc_contiguous(8, 64), Some(64 * F));
+        assert_eq!(fa.free_frames(), before - 8);
+        assert_eq!(fa.alloc(), Some(F), "frame 1 is still the lowest free frame");
+        fa.check_invariants();
+    }
+
+    #[test]
+    fn contiguous_skips_past_a_busy_frame_and_crosses_words() {
+        let span = r(0, 128 * F);
+        let mut s = storage(span);
+        let mut fa = FrameAllocator::new(span, &mut s, [r(F, 128 * F)]).unwrap();
+        fa.reserve(r(3 * F, 4 * F)).unwrap();
+        assert_eq!(fa.alloc_contiguous(4, 1), Some(4 * F));
+        // A run straddling the 64-frame word boundary.
+        let mut s2 = storage(span);
+        let mut fb = FrameAllocator::new(span, &mut s2, [r(60 * F, 68 * F)]).unwrap();
+        assert_eq!(fb.alloc_contiguous(8, 1), Some(60 * F));
+        assert_eq!(fb.alloc(), None);
     }
 
     #[test]
@@ -607,8 +746,80 @@ mod tests {
         // reservation pushes the start to the next frame boundary after it.
         assert_eq!(find_hole(usable, avoid, 4 * F), Some(21 * F));
         assert_eq!(find_hole(usable, avoid, 2 * F), Some(F));
+        assert_eq!(find_hole(usable, avoid, 3 * F), Some(F), "exact fit");
         assert_eq!(find_hole(usable, avoid, 1 << 30), None);
         // Map order doesn't matter: the lowest hole wins.
         assert_eq!(find_hole([usable[1], usable[0]], avoid, 2 * F), Some(F));
+    }
+
+    /// xorshift64: deterministic randomness without a dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Random alloc / alloc_contiguous / free / reserve against a model: no
+    /// frame is ever handed out twice or outside the owned set, and every
+    /// invariant holds after every step.
+    #[test]
+    fn random_operations_match_a_model() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for round in 0..200 {
+            // Span of ~200 frames, not starting at 0 nor a multiple of 64.
+            let base = 3 + rng.below(5);
+            let span = r(base * F, (base + 150 + rng.below(100)) * F);
+            let usable: Vec<_> = (0..4)
+                .map(|_| {
+                    let s = rng.below(span.end() + 4 * F);
+                    PhysRange::from_len(s, rng.below(80 * F))
+                })
+                .collect();
+            let mut s = storage(span);
+            let mut fa = FrameAllocator::new(span, &mut s, usable.iter().copied()).unwrap();
+            let mut outstanding: BTreeSet<u64> = BTreeSet::new();
+            for _ in 0..300 {
+                match rng.below(10) {
+                    0..=3 => {
+                        if let Some(a) = fa.alloc() {
+                            assert!(fa.is_owned(a), "round {round}: handed out an unowned frame");
+                            assert!(outstanding.insert(a), "round {round}: {a:#x} handed out twice");
+                        }
+                    }
+                    4..=5 => {
+                        let count = 1 + rng.below(9) as usize;
+                        let align = 1 << rng.below(4);
+                        if let Some(a) = fa.alloc_contiguous(count, align) {
+                            assert!((a / F).is_multiple_of(align as u64));
+                            for k in 0..count as u64 {
+                                assert!(fa.is_owned(a + k * F));
+                                assert!(outstanding.insert(a + k * F), "round {round}: run overlaps");
+                            }
+                        }
+                    }
+                    6..=8 => {
+                        if let Some(&a) = outstanding.iter().nth(rng.below(outstanding.len() as u64 + 1) as usize) {
+                            assert_eq!(fa.free(a), Ok(()));
+                            outstanding.remove(&a);
+                        }
+                    }
+                    _ => {
+                        let at = rng.below(span.end());
+                        let range = PhysRange::from_len(at, rng.below(4 * F));
+                        let busy = outstanding.iter().any(|&a| range.grow_to_frames().overlaps(&r(a, a + F)));
+                        assert_eq!(fa.reserve(range).is_err(), busy, "round {round}: reserve vs model");
+                    }
+                }
+                fa.check_invariants();
+                assert_eq!(fa.owned_frames() - fa.free_frames(), outstanding.len());
+            }
+        }
     }
 }

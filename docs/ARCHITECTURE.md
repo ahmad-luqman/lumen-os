@@ -109,31 +109,39 @@ this along with the absence of SSE/AVX and red-zone use (hard rule 3).
 
 The frame allocator (`kernel/src/mm/frame.rs`, logic in the host-tested
 `crates/lumen-mm`) is built only from Limine's memory map. Only `usable`
-regions are handed out. These are **explicitly reserved even if Limine labels
-them usable or reclaimable**, found by translating live virtual addresses
-through the page tables rather than trusting the map's labels: frame 0, the
-kernel image, the kernel ELF file (the symbol table lives in it), the boot
-stack, the framebuffer, the ACPI RSDP, and the allocator's own bitmaps. Every
-non-usable map entry (including the ACPI tables) and every frame of the active
-page tables is reserved too. The named list is logged at `debug` level.
+regions are handed out. These are **explicitly reserved by name, even if
+Limine labels them usable**: frame 0, the kernel image, the kernel ELF file
+(the symbol table lives in it), the boot stack and the framebuffer (those four
+found by translating their live virtual addresses through the page tables
+rather than trusting the map's labels), the ACPI RSDP and the allocator's own
+bitmaps. Every non-usable map entry (including the `acpi-*` entries, where
+firmware normally puts the ACPI tables; #2 reserves any table it finds in
+usable memory) and every frame of the active page tables is reserved too. The
+named list is logged at `debug` level.
 
-It is a bitmap allocator with two bits per 4 KiB frame (64 KiB per GiB):
-*owned* (usable and not reserved) and *free*. The owned bit lets `free` reject
-a frame it never handed out (a reserved frame, a non-RAM address, a double
-free) instead of adding it to the pool. Single frames come from a word scan
-starting at a lowest-free hint; contiguous runs from a linear scan. A buddy
-allocator can replace it behind the same interface if contiguous allocation
-becomes hot.
+It is a bitmap allocator with two bits per 4 KiB frame (64 KiB per GiB of
+physical span): *owned* (usable and not reserved) and *free*. Reserved and
+allocated frames both have a clear free bit; the owned bit tells them apart,
+so `free` rejects a frame that was never the allocator's to give instead of
+adding it to the pool. The usable set is fixed at construction; `reserve` can
+only take frames away, and refuses a range containing an allocated frame.
+Single frames come from a word scan starting at a lowest-free hint; contiguous
+runs from a linear scan. A buddy allocator can replace it behind the same
+interface if contiguous allocation becomes hot.
 
-An in-kernel test allocates every frame, checks each against the memory map
-and the reservation list, checks independently (by walking the page tables)
-that nothing behind a live mapping is allocatable, fills every frame, and then
-frees them all (hard rule 2). Bootloader-reclaimable memory is returned only
-after everything in it has been copied or is no longer used.
+In-kernel tests check, independently of the reservation list (by walking the
+page tables), that no frame behind the kernel image, boot stack, kernel file
+or framebuffer, and no page-table frame, is allocatable, and that the check
+itself fires when a frame in use is reported free. They then allocate every
+frame, check each against the memory map and the reservation list, fill it,
+and free them all, checking the contents (hard rule 2). Bootloader-reclaimable
+memory is not returned yet; whoever adds that must first copy or stop using
+everything in it (page tables, boot stack, kernel file).
 
-**Temporary exception (M0):** the boot stack (128 KiB from Limine) and the
-three 16 KiB IST stacks are static and have no guard pages, because there is no
-allocator yet. M1 replaces them (hard rule 4).
+**Temporary exception (until #6):** the boot stack (128 KiB from Limine) and
+the three 16 KiB IST stacks are static and have no guard pages. Guard pages
+need the frame allocator and our own page tables (#4); #6 replaces them (hard
+rule 4).
 
 ## 6. Interrupts, exceptions and crash reports (built)
 

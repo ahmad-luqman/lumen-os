@@ -2,8 +2,8 @@
 //!
 //! M1's frame allocator uses this to find out which physical frames are in
 //! use before it exists: the frames of the page tables themselves, and the
-//! physical frames behind live virtual addresses (kernel image, boot stack,
-//! framebuffer). Tables are read through the higher-half direct map, so the
+//! physical frames behind live virtual addresses (kernel image, kernel file,
+//! boot stack, framebuffer). Tables are read through the higher-half direct map, so the
 //! caller passes its offset. Building our own tables is a separate issue (#4).
 
 use super::cpu::read_cr3;
@@ -25,9 +25,11 @@ const ADDR_1G: u64 = 0x000f_ffff_c000_0000;
 /// `table` must be a page-table frame of the active hierarchy and `hhdm` the
 /// direct-map offset under which it is mapped.
 unsafe fn table(hhdm: u64, table: u64) -> &'static [u64; ENTRIES] {
-    // SAFETY: the caller guarantees the frame is a live, mapped page table;
-    // we only read it, and page tables are not modified concurrently (one CPU,
-    // nothing changes the tables Limine built).
+    // SAFETY: the caller guarantees the frame is a live, mapped page table.
+    // We only read, and only the present/huge/address bits, which no software
+    // changes (one CPU; nothing writes the tables Limine built until #4). The
+    // CPU may set accessed/dirty bits concurrently; we ignore those bits.
+    // Revisit (volatile reads, no `&'static`) when #4 starts writing tables.
     unsafe { &*((hhdm + table) as *const [u64; ENTRIES]) }
 }
 
@@ -69,7 +71,8 @@ pub fn translate(hhdm: u64, virt: u64) -> Option<u64> {
 
 /// Call `f` with the physical address of every page-table frame in the
 /// active hierarchy: the L4 table and every L3, L2 and L1 table it reaches.
-/// Returns how many frames were visited.
+/// Returns how many visits were made (a table referenced twice is visited,
+/// and counted, twice).
 pub fn for_each_table_frame(hhdm: u64, mut f: impl FnMut(u64)) -> usize {
     let mut visited = 0;
     let mut visit = |frame: u64| {

@@ -4,8 +4,9 @@
 //! keep a reference to its `.symtab` and look addresses up with
 //! [`lumen_elf::SymbolTable::lookup`]. Names are demangled on output.
 //!
-//! The file lives in bootloader-reclaimable memory: the M1 physical allocator
-//! must keep it reserved (or copy the symbol table) before reclaiming.
+//! The file lives in bootloader-reclaimable memory; the frame allocator
+//! reserves it by name ("kernel file"). Whoever reclaims that memory must keep
+//! the file or copy the symbol table first.
 
 use core::fmt;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};

@@ -45,7 +45,11 @@ extern "C" fn _start() -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn kmain(stack_top: u64) -> ! {
     arch::init_early();
-    arch::stacks::set_boot_stack(stack_top, boot::BOOT_STACK_SIZE);
+    // Only claim the size we asked for if Limine confirms it: the frame
+    // allocator reserves this range and the crash reporter walks it.
+    let stack_size =
+        if boot::STACK_SIZE.get_response().is_some() { boot::BOOT_STACK_SIZE } else { boot::LIMINE_DEFAULT_STACK_SIZE };
+    arch::stacks::set_boot_stack(stack_top, stack_size);
 
     if let Some(resp) = boot::CMDLINE.get_response() {
         cmdline::set(resp.cmdline().to_str().unwrap_or(""));

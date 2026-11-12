@@ -13,6 +13,8 @@ use limine::request::{
 
 /// Boot stack size we ask Limine for.
 pub const BOOT_STACK_SIZE: u64 = 128 * 1024;
+/// The stack Limine guarantees when it ignores our size request.
+pub const LIMINE_DEFAULT_STACK_SIZE: u64 = 64 * 1024;
 
 #[used]
 #[unsafe(link_section = ".limine_requests_start")]
