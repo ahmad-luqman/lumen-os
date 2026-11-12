@@ -349,20 +349,26 @@ pub fn lapic_timer() -> Option<Clock> {
     Clock::new(LAPIC_TIMER_HZ.load(Ordering::Relaxed))
 }
 
-/// Record `tsc`, read as `kmain` began, as the boot's origin. Once, early.
+/// Record `tsc`, read as `kmain` began, as the boot's origin. Panics if
+/// called twice (keeping the first origin).
 pub fn mark_boot(tsc: u64) {
-    assert_eq!(BOOT_TSC.swap(tsc, Ordering::Relaxed), 0, "mark_boot called twice");
+    // 0 means "not marked": a TSC of exactly 0 is stored as 1.
+    let first = BOOT_TSC.compare_exchange(0, tsc.max(1), Ordering::Relaxed, Ordering::Relaxed);
+    assert!(first.is_ok(), "mark_boot called twice");
 }
 
-/// The TSC when `kmain` began (0 before [`mark_boot`]).
-pub fn boot_tsc() -> u64 {
-    BOOT_TSC.load(Ordering::Relaxed)
+/// The TSC when `kmain` began, once [`mark_boot`] recorded it.
+pub fn boot_tsc() -> Option<u64> {
+    Some(BOOT_TSC.load(Ordering::Relaxed)).filter(|&t| t != 0)
 }
 
-/// Nanoseconds since `kmain` began, once the TSC is calibrated (`None`
-/// before). Lock-free (the logger stamps lines with it).
+/// Nanoseconds since `kmain` began, once the TSC is calibrated; `None`
+/// before, or if the TSC reads earlier than the origin (it was reset, or
+/// another CPU's isn't in step): a zero would read as a measurement.
+/// Lock-free (the logger stamps lines with it).
 pub fn since_boot_ns() -> Option<u64> {
-    tsc().map(|c| c.ns(arch::rdtsc().saturating_sub(boot_tsc())))
+    let ticks = arch::rdtsc().checked_sub(boot_tsc()?)?;
+    Some(tsc()?.ns(ticks))
 }
 
 /// Nanoseconds since the TSC was last reset (normally at CPU reset; firmware

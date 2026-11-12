@@ -200,7 +200,8 @@ pub fn init(fb: &limine::framebuffer::Framebuffer<'_>) -> Option<(usize, usize)>
     Some((w, h))
 }
 
-/// Mirror a log line to the screen (called by the logger).
+/// Mirror a log line to the screen, without the serial timestamp so
+/// screenshots stay comparable (called by the logger).
 pub fn console_log(level: Level, tag: &str, args: &fmt::Arguments<'_>) {
     let Some(mut guard) = CONSOLE.try_lock() else { return };
     let Some(con) = guard.as_mut() else { return };

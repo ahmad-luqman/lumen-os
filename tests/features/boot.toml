@@ -51,6 +51,7 @@ milestone = "M1"
 tests = [
     "cargo:lumen-time",
     "ktest:lumen_kernel::trace::boot_phases_recorded_in_order",
+    "ktest:lumen_kernel::trace::the_timeline_says_what_it_lacks",
     "scenario:test_boot::test_boot_timeline_printed",
     "scenario:test_boot::test_log_lines_are_structured",
     "scenario:test_trace::test_trace_command_shows_every_event_since_boot",

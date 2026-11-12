@@ -54,7 +54,8 @@ Each rule exists because breaking it caused a real bug in v1.
 5. **A real heap with working `free`**, plus in-kernel fragmentation and reuse
    tests.
 6. **Exception handling comes first.** GDT/IDT setup is the first thing
-   `kmain` does; keep it that way.
+   `kmain` does (only a bare `rdtsc`, the boot timeline's origin, comes
+   before it); keep it that way.
 7. **Reproducible toolchain.** Rust is pinned (stable only, no `#![feature]`),
    Limine and OVMF are pinned by sha256, and Python deps by `uv.lock`. Bump
    them deliberately, in their own PR.
@@ -107,7 +108,7 @@ own PR that updates that doc first.
   through the `.ktests` linker section.
 - **Logs** that tests match on (e.g. `INFO  boot: boot complete`) are an
   interface: change the test in the same PR. On serial each line starts
-  with a timestamp (`[    0.139288] `, or `[    ?.??????] ` before the TSC is
+  with a timestamp (`[    0.139288]`, or `[    ?.??????]` before the TSC is
   calibrated): match the rest of the line, not its start.
 - **QEMU exit codes:** 33 pass, 35 test failure, 37 crash report; anything else
   (including 0 from a triple fault with `-no-reboot`) is a failure.

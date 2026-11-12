@@ -25,7 +25,12 @@ def test_boot_reaches_logger(boot):
 LOG_LINE = re.compile(
     r"^\[(?P<stamp> *\d+\.\d{6}|    \?\.\?{6})\] (?P<level>ERROR|WARN |INFO |DEBUG|TRACE) [a-z0-9_:]+: \S"
 )
-TIMELINE = re.compile(r"INFO  boot: timeline: (?P<phases>.*) \(total (?P<total>\d+\.\d{3}) ms\)\n")
+# The timeline line, with its own stamp (kernel/src/trace.rs, `Timeline`).
+TIMELINE = re.compile(
+    r"\[ *(?P<stamp>\d+\.\d{6})\] INFO  boot: timeline: (?P<phases>.*) "
+    r"\(total (?P<total>\d+\.\d{3}) ms\)\n"
+)
+PHASE = re.compile(r"(?P<name>\S+) \+(?P<ms>\d+\.\d{3}) ms")
 PHASES = [
     "entry",
     "arch-init",
@@ -49,40 +54,55 @@ def kernel_lines(output: str) -> list[str]:
     return output[start:].splitlines()[:-1]
 
 
+def micros(decimal: str) -> int:
+    """A decimal number of seconds (6 places) or milliseconds (3 places) as
+    an integer count of microseconds: exact, unlike floats."""
+    whole, frac = decimal.split(".")
+    return int(whole) * 10 ** len(frac) + int(frac)
+
+
 def test_log_lines_are_structured(boot):
     """Every kernel log line is `[time] LEVEL tag: message` (hard rule 8)."""
     m = boot("qemutest")
     m.expect(r"kmon> ", BOOT_TIMEOUT)
     lines = kernel_lines(m.output)
-    bad = [line for line in lines if not LOG_LINE.match(line)]
+    matches = [LOG_LINE.match(line) for line in lines]
+    bad = [line for line, match in zip(lines, matches, strict=True) if not match]
     assert not bad, f"unstructured kernel output: {bad}"
     # The time is unknown until the TSC is calibrated, then real and
     # non-decreasing.
-    stamps = [LOG_LINE.match(line)["stamp"] for line in lines]
-    calibrated = next(i for i, line in enumerate(lines) if "INFO  time: tsc " in line)
+    stamps = [match["stamp"] for match in matches]
+    calibrated = next((i for i, line in enumerate(lines) if "INFO  time: tsc " in line), None)
+    assert calibrated is not None, "no `time: tsc` line"
     assert all("?" in s for s in stamps[:calibrated]), stamps
-    seconds = [float(s) for s in stamps[calibrated:]]
-    assert seconds == sorted(seconds), seconds
-    assert seconds[0] > 0, seconds
+    us = [micros(s.strip()) for s in stamps[calibrated:]]
+    assert us == sorted(us), stamps
+    assert us[0] > 0, stamps
 
 
 def test_boot_timeline_printed(boot):
     """At boot complete, every phase's time since `kmain` began, in order."""
     m = boot("qemutest")
     line = m.expect(TIMELINE, BOOT_TIMEOUT)
-    phases = [p.rsplit(" +", 1) for p in line["phases"].split(", ")]
-    assert [name for name, _ in phases] == PHASES, line[0]
-    ms = [float(t.removesuffix(" ms")) for _, t in phases]
-    assert ms[0] == 0 and ms == sorted(ms), line[0]
-    total = float(line["total"])
-    assert total == ms[-1], line[0]
-    # In guest time: calibrating the TSC and the timer alone takes ten 10 ms
-    # windows, so at least 100 ms; generously under 30 s (an emulator runs
-    # slower, never that slow).
-    assert 100 <= total <= 30_000, line[0]
-    # The line's own timestamp, taken just after the last phase, agrees.
-    stamp = m.output[: line.start() + 15].rsplit("[", 1)[1].split("]")[0]
-    assert total <= float(stamp) * 1000 <= total + 50, (stamp, line[0])
+    phases = [PHASE.fullmatch(p) for p in line["phases"].split(", ")]
+    assert all(phases) and [p["name"] for p in phases] == PHASES, line[0]
+    us = {p["name"]: micros(p["ms"]) for p in phases}
+    assert list(us.values()) == sorted(us.values()), line[0]
+    total = micros(line["total"])
+    assert total == us["complete"], line[0]
+    # The origin is kmain's start, not the TSC's reset or firmware handoff:
+    # GDT/IDT setup takes well under 50 ms.
+    assert us["arch-init"] < 50_000, line[0]
+    # In guest time: the time phase calibrates the TSC and the timer
+    # (2 x `time::WINDOWS` (5) windows of `WINDOW_NS` (10 ms); the TSC's run
+    # on the HPET or PIT, the timer's on the TSC itself) and sleeps 10 ms for
+    # the first tick, so it takes at least 60 ms; the whole boot generously
+    # under 30 s (an emulator runs slower, never that slow).
+    assert us["time"] - us["interrupts"] >= 60_000, line[0]
+    assert total <= 30_000_000, line[0]
+    # The line's own stamp, taken just after the last phase: at or after the
+    # total, by at most 50 ms.
+    assert total <= micros(line["stamp"]) <= total + 50_000, line[0]
 
 
 def test_serial_input_round_trip(boot):

@@ -3,7 +3,8 @@
 //! nanoseconds, and the counts the PIT and the local APIC timer are
 //! programmed with. All of it is integer math (the kernel has no floating
 //! point) in `u128` where products can overflow, so it holds for centuries
-//! of uptime (and then saturates).
+//! of uptime (and then saturates); and how times read in logs (`Stamp`,
+//! `Millis`).
 
 #![no_std]
 
@@ -137,10 +138,10 @@ impl fmt::Display for Hz {
     }
 }
 
-/// A log line's timestamp: `[    0.012345]`, seconds since boot to the
-/// microsecond, or a placeholder of the same width while the time isn't
-/// known (`None`: before the TSC is calibrated). A zero would read as a
-/// measurement.
+/// A log line's timestamp: `[    0.012345]`, nanoseconds since the
+/// caller's origin shown as seconds to the microsecond (100000 s and more
+/// widen the field), or a placeholder of the same width while the time isn't
+/// known (`None`). A zero would read as a measurement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp(pub Option<u64>);
 
@@ -153,24 +154,16 @@ impl fmt::Display for Stamp {
     }
 }
 
-/// A duration in nanoseconds, for humans in milliseconds to the
-/// microsecond: `0.012 ms`, `3400.000 ms`.
+/// A duration given in **nanoseconds**, shown in milliseconds to the
+/// microsecond: `0.012 ms`, `3400.000 ms`; with `{:+}`, as an offset:
+/// `+0.012 ms`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Millis(pub u64);
 
 impl fmt::Display for Millis {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{:03} ms", self.0 / 1_000_000, self.0 % 1_000_000 / 1000)
-    }
-}
-
-/// An offset in nanoseconds, as [`Millis`] with a `+`: `+0.012 ms`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Ms(pub u64);
-
-impl fmt::Display for Ms {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "+{}", Millis(self.0))
+        let sign = if f.sign_plus() { "+" } else { "" };
+        write!(f, "{sign}{}.{:03} ms", self.0 / 1_000_000, self.0 % 1_000_000 / 1000)
     }
 }
 
@@ -283,11 +276,12 @@ mod tests {
     }
 
     #[test]
-    fn offsets_read_in_milliseconds() {
-        assert_eq!(Ms(12_000).to_string(), "+0.012 ms");
-        assert_eq!(Ms(3_400_000_000).to_string(), "+3400.000 ms");
-        assert_eq!(Ms(999).to_string(), "+0.000 ms", "rounds down to the µs");
-        assert_eq!(Ms(1_234_567).to_string(), "+1.234 ms");
+    fn durations_read_in_milliseconds() {
+        use std::format;
+        assert_eq!(format!("{:+}", Millis(12_000)), "+0.012 ms");
+        assert_eq!(format!("{:+}", Millis(3_400_000_000)), "+3400.000 ms");
+        assert_eq!(format!("{:+}", Millis(999)), "+0.000 ms", "rounds down to the µs");
+        assert_eq!(Millis(1_234_567).to_string(), "1.234 ms");
         assert_eq!(Millis(3_400_000_000).to_string(), "3400.000 ms");
     }
 

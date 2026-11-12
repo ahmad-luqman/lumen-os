@@ -2,6 +2,8 @@
 //!
 //! Boot order (see docs/ARCHITECTURE.md, "Boot"):
 //! 1. `_start` (naked): clear rbp so backtraces end here, align the stack.
+//!    `kmain` then reads the TSC (a bare `rdtsc`, which can't fault): the
+//!    boot timeline's and the log's origin.
 //! 2. `arch::init_early`: serial, GDT/TSS, IDT. From here on a CPU exception
 //!    produces a crash report, except a #DF from a broken stack pointer
 //!    before step 4 (no IST stacks yet), which is a triple fault.
@@ -14,8 +16,8 @@
 //! 5. ACPI tables (CPUs, interrupt controllers, HPET), the interrupt
 //!    controllers (8259s masked, local APIC on, I/O APIC inputs masked), the
 //!    TSC and local APIC timer calibrated, interrupts on; then the
-//!    framebuffer and either the in-kernel tests (`--features ktest`) or the
-//!    kernel monitor.
+//!    framebuffer, `boot complete` and the boot timeline, then either the
+//!    in-kernel tests (`--features ktest`) or the kernel monitor.
 
 #![no_std]
 #![no_main]
@@ -170,7 +172,12 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
 
     info!(target: "boot", "boot complete");
     ktrace!(Kind::BootPhase, BootPhase::Complete);
-    info!(target: "boot", "timeline: {}", trace::Timeline);
+    let timeline = trace::Timeline::boot();
+    if timeline.is_complete() {
+        info!(target: "boot", "timeline: {timeline}");
+    } else {
+        warn!(target: "boot", "timeline: {timeline}");
+    }
     after_boot()
 }
 

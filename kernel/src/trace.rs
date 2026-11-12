@@ -4,8 +4,9 @@
 //! event kinds and [`ktrace!`](crate::ktrace!).
 //!
 //! Timestamps are raw TSC ticks (the boot timeline converts its phases with
-//! the frequency `time` calibrates; kmon's `trace` shows them raw). There is one ring because there is one CPU;
-//! with SMP (#9) each CPU gets its own and [`ring`] picks the current one.
+//! the frequency `time` calibrates; kmon's `trace` shows them raw). There is
+//! one ring because there is one CPU; with SMP (#9) each CPU gets its own
+//! and [`ring`] picks the current one.
 
 use core::fmt;
 
@@ -75,7 +76,7 @@ pub enum BootPhase {
     Acpi = 7,
     /// Interrupt controllers.
     Interrupts = 8,
-    /// TSC and timer calibration, interrupts on, the first tick.
+    /// TSC and timer calibration, interrupts on, the 10 ms first-tick check.
     Time = 9,
     Framebuffer = 10,
     Complete = 11,
@@ -97,7 +98,8 @@ impl BootPhase {
     ];
 
     fn from_raw(raw: u64) -> Option<BootPhase> {
-        Self::ALL.into_iter().find(|&p| p as u64 == raw)
+        let i = usize::try_from(raw).ok()?.checked_sub(1)?;
+        Self::ALL.get(i).copied()
     }
 
     fn name(self) -> &'static str {
@@ -117,6 +119,18 @@ impl BootPhase {
     }
 }
 
+// `ALL` lists every phase, numbered 1, 2, ... in boot order, entry first and
+// complete last: `from_raw` and the timeline index it by number.
+const _: () = {
+    let mut i = 0;
+    while i < BootPhase::ALL.len() {
+        assert!(BootPhase::ALL[i] as usize == i + 1);
+        i += 1;
+    }
+    assert!(matches!(BootPhase::ALL[0], BootPhase::Entry));
+    assert!(matches!(BootPhase::ALL[BootPhase::ALL.len() - 1], BootPhase::Complete));
+};
+
 /// The current CPU's ring.
 pub fn ring() -> &'static TraceRing<EVENTS> {
     &RING
@@ -127,51 +141,92 @@ pub fn record_in<const N: usize>(ring: &TraceRing<N>, kind: Kind, args: [u64; 4]
     record_at(ring, arch::rdtsc(), kind, args);
 }
 
-/// Record an event in `ring` stamped `tsc` (taken earlier: the boot's entry
-/// is recorded once the ring can be used).
+/// Record an event in `ring` stamped `tsc`, read earlier. For
+/// `BootPhase::Entry`: its TSC is read before `arch::init_early` (only a bare
+/// `rdtsc` may run before GDT/IDT setup, hard rule 6), and the event is
+/// recorded after.
 pub fn record_at<const N: usize>(ring: &TraceRing<N>, tsc: u64, kind: Kind, args: [u64; 4]) {
     // cpu 0 and pid 0 until SMP (#9) and processes (M2) exist. A dropped
     // event is counted in the ring's `dropped()`; recording never fails loudly.
     let _ = ring.record(tsc, 0, kind as u16, 0, args);
 }
 
-/// The boot timeline from the ring's boot-phase events, as one line:
+/// The boot timeline from a ring's boot-phase events, as one line:
 /// `entry +0.000 ms, arch-init +0.012 ms, ..., complete +340.000 ms (total
-/// 340.000 ms)`, times since `Entry` with the calibrated TSC. A phase with no
-/// event is named as missing; before calibration, says so.
-pub struct Timeline;
+/// 340.000 ms)`, times since `Entry` with `clock`. A phase with no event is
+/// named as missing (with the ring's dropped count, if any), one stamped
+/// before entry says so, and the total is `complete`'s (unknown without it).
+/// Without a clock, an entry event, or once the ring has wrapped past the
+/// boot's events, it says it is unavailable and why.
+pub struct Timeline<'a, const N: usize> {
+    ring: &'a TraceRing<N>,
+    clock: Option<lumen_time::Clock>,
+}
 
-impl fmt::Display for Timeline {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Some(tsc) = crate::time::tsc() else {
-            return f.write_str("unavailable (the TSC isn't calibrated)");
-        };
-        let ring = ring();
+impl Timeline<'static, EVENTS> {
+    /// The boot's timeline: this CPU's ring and the calibrated TSC.
+    pub fn boot() -> Self {
+        Timeline { ring: ring(), clock: crate::time::tsc() }
+    }
+}
+
+impl<'a, const N: usize> Timeline<'a, N> {
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // ktests build timelines of their own rings
+    pub fn new(ring: &'a TraceRing<N>, clock: Option<lumen_time::Clock>) -> Self {
+        Timeline { ring, clock }
+    }
+
+    /// Each phase's TSC (the first event recorded for it), unless the ring
+    /// has wrapped past the boot's events.
+    fn phases(&self) -> Option<[Option<u64>; BootPhase::ALL.len()]> {
+        if self.ring.written() > self.ring.capacity() as u64 {
+            return None;
+        }
         let mut at = [None; BootPhase::ALL.len()];
-        for seq in 0..ring.written().min(EVENTS as u64) {
-            let Some(e) = ring.read(seq) else { continue };
-            if e.kind != Kind::BootPhase as u16 {
-                continue;
-            }
-            if let Some(i) = BootPhase::ALL.iter().position(|&p| p as u64 == e.args[0]) {
-                at[i].get_or_insert(e.tsc);
+        for e in (0..self.ring.written()).filter_map(|seq| self.ring.read(seq)) {
+            if e.kind == Kind::BootPhase as u16
+                && let Some(p) = BootPhase::from_raw(e.args[0])
+            {
+                at[p as usize - 1].get_or_insert(e.tsc);
             }
         }
+        Some(at)
+    }
+
+    /// Every phase is there, in order from entry, and can be converted.
+    pub fn is_complete(&self) -> bool {
+        self.clock.is_some()
+            && self.phases().is_some_and(|at| at.iter().all(Option::is_some) && at.windows(2).all(|w| w[0] <= w[1]))
+    }
+}
+
+impl<const N: usize> fmt::Display for Timeline<'_, N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(clock) = self.clock else {
+            return f.write_str("unavailable (the TSC isn't calibrated)");
+        };
+        let Some(at) = self.phases() else {
+            let (written, holds) = (self.ring.written(), self.ring.capacity());
+            return write!(f, "unavailable ({written} events since boot; the ring holds {holds})");
+        };
         let Some(entry) = at[0] else {
             return f.write_str("unavailable (no entry event)");
         };
-        let mut last = 0;
-        for (i, (phase, tsc_at)) in BootPhase::ALL.iter().zip(at).enumerate() {
+        for (i, (phase, tsc)) in BootPhase::ALL.iter().zip(at).enumerate() {
             let sep = if i == 0 { "" } else { ", " };
-            match tsc_at {
-                Some(t) => {
-                    last = tsc.ns(t.saturating_sub(entry));
-                    write!(f, "{sep}{} {}", phase.name(), lumen_time::Ms(last))?;
+            match tsc.map(|t| t.checked_sub(entry)) {
+                Some(Some(ticks)) => write!(f, "{sep}{} {:+}", phase.name(), lumen_time::Millis(clock.ns(ticks)))?,
+                Some(None) => write!(f, "{sep}{} before entry", phase.name())?,
+                None if self.ring.dropped() > 0 => {
+                    write!(f, "{sep}{} missing ({} events dropped)", phase.name(), self.ring.dropped())?
                 }
                 None => write!(f, "{sep}{} missing", phase.name())?,
             }
         }
-        write!(f, " (total {})", lumen_time::Millis(last))
+        match at[BootPhase::ALL.len() - 1].and_then(|t| t.checked_sub(entry)) {
+            Some(ticks) => write!(f, " (total {})", lumen_time::Millis(clock.ns(ticks))),
+            None => f.write_str(" (total unknown)"),
+        }
     }
 }
 
@@ -318,7 +373,7 @@ crate::ktest!(
                 }
                 kassert!(e.tsc >= prev_tsc);
                 if found == 0 {
-                    kassert_eq!(e.tsc, crate::time::boot_tsc()); // entry is the origin
+                    kassert_eq!(Some(e.tsc), crate::time::boot_tsc()); // entry is the origin
                 }
                 prev_tsc = e.tsc;
                 phases[found] = e.args[0];
@@ -326,6 +381,69 @@ crate::ktest!(
             }
         }
         kassert_eq!(phases, BootPhase::ALL.map(|p| p as u64));
+        // The origin is kmain's start, not the TSC's reset or firmware
+        // handoff: GDT/IDT setup takes well under 50 ms.
+        let clock = crate::time::tsc().ok_or("TSC not calibrated")?;
+        let entry = crate::time::boot_tsc().ok_or("boot not marked")?;
+        let arch_init = (0..ring.written())
+            .filter_map(|seq| ring.read(seq))
+            .find(|e| e.kind == Kind::BootPhase as u16 && e.args[0] == BootPhase::ArchInit as u64)
+            .ok_or("no arch-init event")?;
+        kassert!(clock.ns(arch_init.tsc - entry) < 50_000_000);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn the_timeline_says_what_it_lacks() {
+        // On a ring of our own, with a clock of 1 kHz (a tick is 1 ms).
+        use core::fmt::Write;
+
+        use crate::{kassert, kassert_eq};
+        let clock = lumen_time::Clock::new(1000);
+        let text = |t: &Timeline<'_, 16>| {
+            let mut b = crate::ktest::Buf::new();
+            let _ = write!(b, "{t}");
+            b
+        };
+        let ring = TraceRing::<16>::new();
+        let phase = |tsc, p: BootPhase| record_at(&ring, tsc, Kind::BootPhase, args([p as u64]));
+        kassert_eq!(text(&Timeline::new(&ring, clock)).as_str(), "unavailable (no entry event)");
+        phase(10, BootPhase::Entry);
+        for (tsc, p) in [(11, BootPhase::ArchInit), (12, BootPhase::Logger), (99, BootPhase::Logger)] {
+            phase(tsc, p); // the second logger event is ignored: the first wins
+        }
+        for (tsc, p) in [(5, BootPhase::Symbols), (14, BootPhase::Memory), (16, BootPhase::Acpi)] {
+            phase(tsc, p); // symbols before entry; no stacks
+        }
+        for (tsc, p) in [(17, BootPhase::Interrupts), (18, BootPhase::Time), (19, BootPhase::Framebuffer)] {
+            phase(tsc, p); // no complete: the total isn't framebuffer's
+        }
+        let t = Timeline::new(&ring, clock);
+        kassert_eq!(
+            text(&t).as_str(),
+            "entry +0.000 ms, arch-init +1.000 ms, logger +2.000 ms, symbols before entry, memory +4.000 ms, \
+             stacks missing, acpi +6.000 ms, interrupts +7.000 ms, time +8.000 ms, framebuffer +9.000 ms, \
+             complete missing (total unknown)"
+        );
+        kassert!(!t.is_complete());
+        kassert_eq!(text(&Timeline::new(&ring, None)).as_str(), "unavailable (the TSC isn't calibrated)");
+        // Every phase, in order: complete, with the total.
+        let full = TraceRing::<16>::new();
+        for (i, p) in BootPhase::ALL.into_iter().enumerate() {
+            record_at(&full, 100 + 2 * i as u64, Kind::BootPhase, args([p as u64]));
+        }
+        let t = Timeline::new(&full, clock);
+        kassert!(t.is_complete());
+        kassert!(text(&t).as_str().ends_with("complete +20.000 ms (total 20.000 ms)"));
+        // Once the boot's events are overwritten.
+        let small = TraceRing::<4>::new();
+        for i in 0..5 {
+            record_at(&small, i, Kind::BootPhase, args([BootPhase::Entry as u64]));
+        }
+        let mut b = crate::ktest::Buf::new();
+        let _ = write!(b, "{}", Timeline::new(&small, clock));
+        kassert_eq!(b.as_str(), "unavailable (5 events since boot; the ring holds 4)");
         Ok(())
     }
 );

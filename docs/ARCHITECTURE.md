@@ -103,20 +103,23 @@ tests (for example `lumen-elf`, the symbol-table reader).
 so GDT and IDT setup still come first in effect): the origin of both the
 boot timeline and the log's timestamps. The pinned Limine crate has no
 bootloader-performance request, so the bootloader's own time isn't counted.
-Each phase records a `BootPhase` trace event when it ends: entry, arch-init,
-logger, symbols, memory, stacks, acpi, interrupts, time (calibration,
-interrupts on, the first tick), framebuffer, complete. After `boot complete`
-the kernel prints them from the ring, converted with the calibrated TSC:
+Entry marks the origin; every other phase records a `BootPhase` trace event
+when it ends: arch-init, logger, symbols, memory, stacks, acpi, interrupts,
+time (calibration, interrupts on, the 10 ms first-tick check), framebuffer,
+complete. After `boot complete` the kernel prints them from the ring,
+converted with the calibrated TSC:
 
 ```
 [    0.139423] INFO  boot: timeline: entry +0.000 ms, arch-init +0.145 ms, ..., complete +139.382 ms (total 139.382 ms)
 ```
 
-(a missing phase is named as missing). Serial log lines start with the
-time since that origin, `[seconds.microseconds]`; lines before the TSC is
-calibrated (most of boot) show `[    ?.??????]`, not a zero that would read
-as a measurement. The screen's console shows lines without timestamps, so
-screenshots stay comparable.
+A phase with no event is named as missing, and the total is `complete`'s;
+an incomplete timeline is logged as a warning. Serial log lines start with
+the time since that origin, `[seconds.microseconds]`; every line before the
+TSC is calibrated (up to `time: tsc ...`) shows `[    ?.??????]`, not a
+zero that would read as a measurement. The screen's console shows lines
+without timestamps, so screenshots stay comparable (not tested: the golden
+image covers only the header).
 
 ### ACPI (built in M1)
 
@@ -746,15 +749,14 @@ kernel. The kernel is the trusted computing base.
   under TCG locally; TCG's TSC rate depends on the host, so this is not
   comparable across machines or to cycles). Timestamps are raw TSC ticks
   (the boot timeline converts its phases; kmon and crash reports show them
-  raw). `kmon`'s
-  `trace [n]` prints the newest events (a gap line says why an event is
-  missing), and the serial crash report includes the last 16
+  raw). `kmon`'s `trace [n]` prints the newest events (a gap line says why
+  an event is missing), and the serial crash report includes the last 16
   events (tested for a page fault and a panic).
 - **Boot timeline:** boot phases emit trace events, printed as a timeline at
   boot complete (section 4). The fast-boot target is under 1 s from kernel
   entry to the shell, measured in the guest from TSC timestamps (never by
-  host wall-clock time in tests); about 140 ms under TCG today, most of it
-  calibrating the TSC and the timer.
+  host wall-clock time in tests). About 140 ms under TCG when this was
+  written, most of it calibrating the TSC and the timer.
 - **Logger:** `log` facade with level and subsystem tags, and on serial a
   timestamp since kernel entry (built). Every emitted log line also records
   a `Log` trace event (level, tag).

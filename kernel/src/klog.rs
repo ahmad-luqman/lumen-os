@@ -5,21 +5,23 @@
 //! subsystem tag:
 //!
 //! ```text
-//! [    ?.??????] INFO  boot: Lumen 0.0.1 booting
-//! [    0.412345] WARN  mem: 3 regions ignored
+//! [    ?.??????] INFO  boot: Lumen 0.0.1 (x86_64) booting
+//! [    ?.??????] WARN  mem: no ACPI RSDP from Limine
+//! [    0.072250] INFO  time: tsc 999.8 MHz (calibrated against hpet)
 //! ```
 //!
-//! The timestamp is seconds since `kmain` began, to the microsecond; lines
-//! logged before the TSC is calibrated (most of boot) show `?` instead (the
-//! boot timeline covers those phases afterwards). The screen's console shows
-//! lines without it, so screenshots stay comparable.
+//! The timestamp is seconds since `kmain` began, to the microsecond; every
+//! line before the TSC is calibrated (up to the `time: tsc` line) shows `?`
+//! instead (the boot timeline covers those phases afterwards). The screen's
+//! console shows lines without it, so screenshots stay comparable (not
+//! tested: the golden image covers only the header).
 //!
 //! The tag is the `target:` given at the call site, or else the module path
 //! with the `lumen_kernel::` prefix removed. The level threshold comes from
 //! `lumen.log=<level>` on the command line (default `info`).
 //!
 //! Every emitted line also records a `Log` event in the trace ring
-//! (`crate::trace`); the text format is unchanged.
+//! (`crate::trace`); recording it doesn't change the printed line.
 
 use crate::arch::serial::SerialWriter;
 use crate::sync::SpinLock;
