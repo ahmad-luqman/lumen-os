@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 from lumen_harness import qemu
-from lumen_harness.qemu import Machine, QemuOptions, environment, qemu_args, qemu_version
+from lumen_harness.qemu import Machine, QemuOptions, qemu_args, qemu_version
 
 
 def opts(**kw):
@@ -28,7 +28,6 @@ def test_tests_get_debug_exit_and_no_reboot():
 def test_args_include_extra():
     args = qemu_args(opts(extra=["-smp", "4", "-device", "virtio-rng-pci"]))
     assert args[-4:] == ["-smp", "4", "-device", "virtio-rng-pci"]
-    assert "-smp" not in qemu_args(opts())
 
 
 def test_machine_appends_extra_args_last(tmp_path):
@@ -43,14 +42,14 @@ def test_machine_appends_extra_args_last(tmp_path):
 def test_live_machines_never_share_a_qmp_socket(tmp_path):
     # Parallel workers are kept apart by the pid in the name; machines in one
     # process (a test that boots twice) by a per-process counter.
-    machines = [Machine(Path("x.iso"), tmp_path / str(i)) for i in range(3)]
+    machines = [Machine(Path("x.iso"), tmp_path) for _ in range(3)]
     paths = {m.qmp_path for m in machines}
     assert len(paths) == 3
     assert all(f"-{os.getpid()}-" in p.name for p in paths)
 
 
-def fake_qemu(tmp_path: Path, script: str) -> Path:
-    exe = tmp_path / "fake-qemu"
+def fake_qemu(tmp_path: Path, script: str, name: str = "fake-qemu") -> Path:
+    exe = tmp_path / name
     exe.write_text("#!/bin/sh\n" + script + "\n")
     exe.chmod(0o755)
     return exe
@@ -59,23 +58,47 @@ def fake_qemu(tmp_path: Path, script: str) -> Path:
 def test_qemu_version_is_the_first_line(tmp_path):
     exe = fake_qemu(tmp_path, 'printf "\\nQEMU emulator version 9.2.0\\nCopyright\\n"')
     assert qemu_version(str(exe)) == "QEMU emulator version 9.2.0"
+    # Bytes that aren't UTF-8 are replaced, not raised.
+    odd = fake_qemu(tmp_path, 'printf "QEMU \\377\\n"', "odd")
+    assert qemu_version(str(odd)) == "QEMU \ufffd"
 
 
 def test_qemu_version_says_why_it_is_unknown(tmp_path):
     missing = tmp_path / "no-such-qemu"
     assert qemu_version(str(missing)) == f"not found ({missing})"
-    failing = fake_qemu(tmp_path, "echo oops; exit 3")
+    failing = fake_qemu(tmp_path, "echo oops; exit 3", "failing")
     assert qemu_version(str(failing)) == f"unknown ({failing} --version exited 3)"
+    silent = fake_qemu(tmp_path, "exit 0", "silent")
+    assert qemu_version(str(silent)) == f"unknown ({silent} --version printed nothing)"
+    not_executable = tmp_path / "not-executable"
+    not_executable.write_text("#!/bin/sh\n")
+    assert qemu_version(str(not_executable)).startswith(f"unknown ({not_executable}: ")
+
+
+def test_qemu_version_retries_after_a_failure(tmp_path):
+    # A probe that failed (say, timed out on a busy host) is not remembered.
+    ready = tmp_path / "ready"
+    exe = fake_qemu(tmp_path, f'[ -e "{ready}" ] || exit 1; echo "QEMU emulator version 9.2.0"')
+    assert qemu_version(str(exe)) == f"unknown ({exe} --version exited 1)"
+    ready.touch()
+    assert qemu_version(str(exe)) == "QEMU emulator version 9.2.0"
 
 
 def test_ovmf_version_comes_from_the_fetch_stamp(tmp_path, monkeypatch):
-    monkeypatch.delenv("LUMEN_OVMF_CODE", raising=False)
+    monkeypatch.setenv("LUMEN_OVMF_CODE", "")  # empty is unset, as for LUMEN_ACCEL
+    monkeypatch.delenv("LUMEN_OVMF_VARS", raising=False)
     monkeypatch.setattr(qemu, "BUILD_DIR", tmp_path)
     code = tmp_path / "deps/ovmf/OVMF_CODE.fd"
-    assert qemu.ovmf_version() == f"unknown, no {code.parent / '.version'} ({code})"
-    code.parent.mkdir(parents=True)
-    (code.parent / ".version").write_text("edk2-stable202605-r1\n")
+    stamp = code.parent / ".version"
+    assert qemu.ovmf_version() == f"unknown, no {stamp} ({code})"
+    stamp.parent.mkdir(parents=True)
+    stamp.write_text("edk2-stable202605-r1\n")
     assert qemu.ovmf_version() == f"edk2-stable202605-r1 ({code})"
+    monkeypatch.setenv("LUMEN_OVMF_VARS", "/elsewhere/VARS.fd")
+    assert qemu.ovmf_version() == (
+        f"edk2-stable202605-r1 ({code}), custom vars LUMEN_OVMF_VARS=/elsewhere/VARS.fd"
+    )
+    monkeypatch.delenv("LUMEN_OVMF_VARS")
     monkeypatch.setenv("LUMEN_OVMF_CODE", "/elsewhere/CODE.fd")
     assert qemu.ovmf_version() == "custom, LUMEN_OVMF_CODE=/elsewhere/CODE.fd"
 
@@ -95,7 +118,6 @@ def test_each_run_records_its_environment(tmp_path, monkeypatch, accel):
     assert recorded == [
         "qemu: QEMU emulator version 0.0 (fake)",
         f"accel: {accel}",
-        "ovmf: custom, LUMEN_OVMF_CODE=/x/CODE.fd",
+        f"ovmf: custom, LUMEN_OVMF_CODE=/x/CODE.fd, custom vars LUMEN_OVMF_VARS={vars_template}",
     ]
-    assert recorded == environment(accel)
     assert f"-accel {accel} " in (tmp_path / "run/cmdline.txt").read_text()

@@ -21,8 +21,9 @@ def test_feature_status():
 
 
 @pytest.fixture
-def one_feature(tmp_path, monkeypatch):
-    """A features dir with one feature, and results with just its test."""
+def results_dir(tmp_path, monkeypatch):
+    """One feature (`harness:test_x::t`) and an empty results dir (returned) for
+    the test to fill."""
     features = tmp_path / "features"
     features.mkdir()
     (features / "demo.toml").write_text(
@@ -35,19 +36,17 @@ def one_feature(tmp_path, monkeypatch):
     return results
 
 
-def junit(path, failed: bool):
+@pytest.mark.parametrize(
+    ("failed", "shown", "rc"),
+    [(False, "passing", 0), (True, "**FAILING**", 1)],
+    ids=["passing", "failing"],
+)
+def test_ci_job_summary_gets_the_table(results_dir, tmp_path, monkeypatch, failed, shown, rc):
     body = "<failure/>" if failed else ""
-    path.write_text(
+    (results_dir / "harness.xml").write_text(
         f'<testsuite><testcase classname="tests.harness.test_x" name="t">{body}'
         "</testcase></testsuite>"
     )
-
-
-@pytest.mark.parametrize(
-    ("failed", "shown", "rc"), [(False, "passing", 0), (True, "**FAILING**", 1)]
-)
-def test_ci_job_summary_gets_the_table(one_feature, tmp_path, monkeypatch, failed, shown, rc):
-    junit(one_feature / "harness.xml", failed)
     summary = tmp_path / "summary.md"
     summary.write_text("from an earlier step\n")
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))

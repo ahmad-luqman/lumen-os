@@ -2,10 +2,11 @@
 
 `boot` starts a headless QEMU machine from one of the ISOs built by
 `make iso` and closes it after the test. Each test gets its own artifacts
-directory, build/test-artifacts/<module>/<test>/ (unique even when tests run in
-parallel under pytest-xdist). Artifacts of passing tests are deleted; failing
-tests keep serial.log, qemu.log (with the `-d int` interrupt trace and CPU
-resets), environment.txt and any screenshots, and CI uploads them.
+directory, build/test-artifacts/<module>/<test>/: keyed by module too, so
+same-named tests in two files can run side by side under pytest-xdist.
+Artifacts of passing tests are deleted; failing tests keep serial.log, qemu.log
+(CPU resets, and the `-d int` interrupt trace under TCG), environment.txt and
+any screenshots, and CI uploads them.
 """
 
 from __future__ import annotations
@@ -33,7 +34,10 @@ GOLDEN_DIR = Path(__file__).parent / "golden"
 
 
 def pytest_report_header(config: pytest.Config) -> list[str]:
-    # Runs once, in the controlling process even under pytest-xdist.
+    # Under pytest-xdist only the controller's header is shown; workers would
+    # each probe QEMU for nothing.
+    if hasattr(config, "workerinput"):
+        return []
     return [f"lumen {line}" for line in environment(default_accel())]
 
 

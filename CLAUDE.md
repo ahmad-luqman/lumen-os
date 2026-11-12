@@ -22,7 +22,8 @@ make golden          # re-record golden screenshots (look at them before committ
 ```
 
 One scenario: `uv run pytest tests/scenarios/test_crash.py -k pf -v`.
-Failing scenarios keep `build/test-artifacts/<module>/<test>/` with `serial.log`,
+Failing scenarios keep `build/test-artifacts/<module>/<test>/` (e.g.
+`test_crash/test_fault_produces_symbolized_report_pf_/`) with `serial.log`,
 `qemu.log` (`-d int,cpu_reset,guest_errors`), `environment.txt` (QEMU version,
 accelerator, OVMF version) and screenshots. The interrupt
 trace (`-d int`) is only recorded under TCG: locally on macOS always, and in CI

@@ -12,12 +12,11 @@ status that the kernel sets through `isa-debug-exit`.
 Every run writes its artifacts to a directory: `serial.log` (everything the
 guest printed), `qemu.log` (QEMU `-d` trace: interrupts, CPU resets, guest
 errors), `cmdline.txt`, `environment.txt` (QEMU version, accelerator, OVMF
-version) and any screenshots.
+version; `make run`/`make debug` don't write it) and any screenshots.
 """
 
 from __future__ import annotations
 
-import functools
 import itertools
 import os
 import re
@@ -41,16 +40,16 @@ EXIT_CRASH = (0x12 << 1) | 1  # 37
 
 def qemu_binary() -> str:
     """The QEMU to run (override: LUMEN_QEMU)."""
-    return os.environ.get("LUMEN_QEMU", "qemu-system-x86_64")
+    return os.environ.get("LUMEN_QEMU") or "qemu-system-x86_64"
 
 
 def ovmf_code() -> Path:
     """Pinned OVMF firmware from tools/fetch-deps.sh (override: LUMEN_OVMF_CODE)."""
-    return Path(os.environ.get("LUMEN_OVMF_CODE", BUILD_DIR / "deps/ovmf/OVMF_CODE.fd"))
+    return Path(os.environ.get("LUMEN_OVMF_CODE") or BUILD_DIR / "deps/ovmf/OVMF_CODE.fd")
 
 
 def ovmf_vars_template() -> Path:
-    return Path(os.environ.get("LUMEN_OVMF_VARS", BUILD_DIR / "deps/ovmf/OVMF_VARS.fd"))
+    return Path(os.environ.get("LUMEN_OVMF_VARS") or BUILD_DIR / "deps/ovmf/OVMF_VARS.fd")
 
 
 def default_accel() -> str:
@@ -62,38 +61,59 @@ def default_accel() -> str:
     return "tcg"
 
 
-@functools.cache
+# Successful `--version` probes, per binary (failures are retried: a probe can
+# time out while the host is busy booting many guests).
+_qemu_versions: dict[str, str] = {}
+
+
 def qemu_version(binary: str) -> str:
-    """First line of `binary --version`, or why it could not be read."""
+    """First non-blank line of `binary --version`, or why it could not be read
+    (never raises: this feeds a report header and environment.txt)."""
+    if known := _qemu_versions.get(binary):
+        return known
     try:
         run = subprocess.run(
-            [binary, "--version"], capture_output=True, text=True, timeout=10, check=False
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=10,
+            check=False,
         )
     except FileNotFoundError:
         return f"not found ({binary})"
     except (OSError, subprocess.SubprocessError) as e:
         return f"unknown ({binary}: {e})"
     first = next((line.strip() for line in run.stdout.splitlines() if line.strip()), "")
-    if run.returncode != 0 or not first:
+    if run.returncode != 0:
         return f"unknown ({binary} --version exited {run.returncode})"
+    if not first:
+        return f"unknown ({binary} --version printed nothing)"
+    _qemu_versions[binary] = first
     return first
 
 
 def ovmf_version() -> str:
-    """The pinned OVMF release (from fetch-deps' `.version` stamp) and its path."""
+    """The OVMF release from fetch-deps' `.version` stamp, with the firmware's
+    path; `custom` under LUMEN_OVMF_CODE, `unknown` without a stamp. A custom
+    variable store (LUMEN_OVMF_VARS) is noted too."""
+    vars_template = os.environ.get("LUMEN_OVMF_VARS")
+    custom_vars = f", custom vars LUMEN_OVMF_VARS={vars_template}" if vars_template else ""
+    if custom := os.environ.get("LUMEN_OVMF_CODE"):
+        return f"custom, LUMEN_OVMF_CODE={custom}{custom_vars}"
     code = ovmf_code()
-    if "LUMEN_OVMF_CODE" in os.environ:
-        return f"custom, LUMEN_OVMF_CODE={code}"
     stamp = code.parent / ".version"
     try:
-        return f"{stamp.read_text().strip()} ({code})"
+        release = stamp.read_text().strip()
     except OSError:
-        return f"unknown, no {stamp} ({code})"
+        return f"unknown, no {stamp} ({code}){custom_vars}"
+    return f"{release} ({code}){custom_vars}"
 
 
 def environment(accel: str) -> list[str]:
-    """What a run depends on besides the ISO: printed once per test session and
-    saved as environment.txt with each run's artifacts."""
+    """What a run depends on beyond its ISO and command line (cmdline.txt):
+    printed once per test session and saved as environment.txt by every
+    `Machine` run."""
     return [
         f"qemu: {qemu_version(qemu_binary())}",
         f"accel: {accel}",
@@ -158,12 +178,11 @@ def fresh_vars(dest: Path) -> Path:
     return dest
 
 
-# Numbers this process's machines' QMP sockets: live machines never share one.
-_machine_ids = itertools.count()
-
-
 class ExpectTimeout(AssertionError):
     pass
+
+
+_machine_ids = itertools.count()
 
 
 class Machine:
@@ -190,7 +209,7 @@ class Machine:
         self._qmp: QmpClient | None = None
         # macOS limits unix socket paths to ~104 bytes, so keep it short.
         self._sock_dir = Path(os.environ.get("LUMEN_SOCK_DIR", "/tmp"))
-        # The pid keeps parallel test workers (pytest-xdist) apart.
+        # pid: parallel pytest-xdist workers; counter: machines in one process.
         self.qmp_path = self._sock_dir / f"lumen-qmp-{os.getpid()}-{next(_machine_ids)}.sock"
 
     # -- lifecycle -------------------------------------------------------
