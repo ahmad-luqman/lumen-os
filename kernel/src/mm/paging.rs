@@ -10,7 +10,7 @@
 //!   except the kernel-and-modules entries, which are read-only so the
 //!   kernel's code has no writable alias; the framebuffer is write-combining.
 //!   2 MiB pages where a whole one fits, 4 KiB elsewhere. ACPI memory is not
-//!   mapped ([`map_mmio`] maps what ACPI parsing needs);
+//!   mapped (`acpi` maps the tables it reads with [`map_mmio`]);
 //! - the **kernel image** per segment from `linker.ld`: text R-X, rodata
 //!   (and `.got`) R--, data and bss RW-;
 //!
@@ -190,6 +190,25 @@ fn first_hhdm_page(first: u64, last: u64) -> Option<u64> {
         .filter(|&(start, end)| start < last && first < end)
         .map(|(start, _)| start.max(first))
         .min()
+}
+
+/// Does the HHDM map every page of `[phys, phys + len)`? (False for an
+/// empty or overflowing range.)
+pub fn hhdm_covers(phys: PhysAddr, len: u64) -> bool {
+    let Some(end) = phys.as_u64().checked_add(len).filter(|_| len > 0) else {
+        return false;
+    };
+    let mut page = align_down(phys.as_u64(), FRAME_SIZE);
+    while page < end {
+        let Some(next) = page.checked_add(FRAME_SIZE) else {
+            return false;
+        };
+        if !hhdm_entries().map(rounded).any(|(start, end)| start <= page && next <= end) {
+            return false;
+        }
+        page = next;
+    }
+    true
 }
 
 /// Page-table frames, read and written through the HHDM. A frame the memory
@@ -580,7 +599,6 @@ impl fmt::Display for MmioError {
 /// into the MMIO window; returns the virtual address of `phys`. Mappings are
 /// permanent (drivers keep their registers mapped). A failed call maps
 /// nothing (it may use up window addresses, of which there are plenty).
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ACPI (#2), APIC timer (#7)
 pub fn map_mmio(phys: PhysAddr, len: u64) -> Result<VirtAddr, MmioError> {
     let end = phys.checked_add(len).filter(|_| len > 0).ok_or(MmioError::BadRange)?;
     let (first, last) = (align_down(phys.as_u64(), FRAME_SIZE), align_up(end.as_u64(), FRAME_SIZE));

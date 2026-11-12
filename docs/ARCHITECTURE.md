@@ -86,9 +86,29 @@ tests (for example `lumen-elf`, the symbol-table reader).
 6. Kernel stacks from the allocator, each with a guard page: the three IST
    stacks are installed, then `kmain` switches from Limine's boot stack to
    the 128 KiB main stack (`INFO  mem: stacks: ...`) and continues in
-   `kmain_on_kernel_stack`: the framebuffer hello screen, then `boot complete`.
+   `kmain_on_kernel_stack`: ACPI discovery (below), the framebuffer hello
+   screen, then `boot complete`.
 7. Either the in-kernel test runner (`--features ktest`) or the kernel monitor
    (`kmon`, a serial debug console that the user-mode shell replaces in M2).
+
+### ACPI (built in M1)
+
+`acpi::init` follows the RSDP Limine gives to the XSDT (or the RSDT on ACPI
+1.0 firmware, or when the XSDT address is 0), then reads the MADT and the
+HPET table. The parsing is in the host-tested `lumen-acpi` crate: bounds-checked
+little-endian reads from byte slices (the tables are packed and unaligned),
+with every table's length (capped at 1 MiB) and checksum checked, and each
+MADT entry's length checked against its table and its type, before use. The
+kernel reads tables through one reader: memory outside the HHDM (where
+firmware puts ACPI tables) is mapped uncached with `map_mmio`, and memory
+the HHDM covers is read there, after reserving it if it is usable. The
+kernel copies what it needs into `acpi::Info` (every MADT CPU with its APIC id
+and enabled flag, the local APIC address with the type 5 override applied,
+the I/O APICs, the interrupt overrides, the 8259 flag and the HPET) and logs
+`INFO  acpi: N CPUs, LAPIC at 0x..., HPET at 0x...` (N counts enabled CPUs;
+`maxcpus` hot-plug slots are listed but disabled). No RSDP or broken tables
+are a warning, not a panic: boot continues without `acpi::info()`. A missing
+or broken HPET alone just leaves `hpet` empty.
 
 Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 `isa-debug-exit`, used by tests) and `lumen.log=<error|warn|info|debug|trace>`.
@@ -121,11 +141,15 @@ Limine labels them usable**: frame 0, the kernel image, the kernel ELF file
 found by translating their live virtual addresses through the page tables
 rather than trusting the map's labels), the ACPI RSDP and the allocator's own
 bitmaps. Every non-usable map entry (including the `acpi-*` entries, where
-firmware normally puts the ACPI tables; #2 must reserve any table it finds in
-usable memory, before anything allocates, since `reserve` refuses frames
-already handed out) and every frame of Limine's page tables (active while
+firmware normally puts the ACPI tables) and every frame of Limine's page tables (active while
 the allocator is built; the kernel's own tables are then allocated from it)
-is reserved too. The named list is logged at `debug` level.
+is reserved too. The named list is logged at `debug` level. Memory found
+after boot is reserved with `frame::reserve(name, range)`, which joins the
+named list if it takes any frame and refuses (changing nothing) if a frame is
+already allocated: ACPI parsing reserves any table it finds in usable memory
+that way. It runs after the heap and stacks exist, so a table whose frame was
+already handed out is refused and ACPI is skipped with a warning; OVMF never
+puts tables there.
 
 It is a bitmap allocator with two bits per 4 KiB frame (64 KiB per GiB of
 physical span): *owned* (usable and not reserved) and *free*. Reserved and
@@ -170,8 +194,8 @@ frames (zeroed) and switches CR3:
   kernel-and-modules entries, which are read-only so the kernel's code has
   no writable alias (W^X holds per frame, not just per page); the
   framebuffer is write-combining. 2 MiB pages where a whole one fits, 4 KiB
-  elsewhere. ACPI memory is not in the HHDM; ACPI parsing (#2) maps what it
-  needs (`map_mmio` maps the RSDP already). Entries that share a page map it
+  elsewhere. ACPI memory is not in the HHDM; ACPI parsing maps the tables
+  it reads uncached with `map_mmio` (see "ACPI" in section 4). Entries that share a page map it
   once; boot stops if they'd need different rights. A ktest checks every
   HHDM span is mapped throughout (sampled every 2 MiB) with its own rights
   and memory type, nothing else is mapped outside the image and the MMIO
@@ -654,13 +678,14 @@ TCG before uploading.
 ```
 kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/arch/        HAL; x86_64/ has gdt, idt, serial, stacks (registry), cpu, qemu, paging
+  src/acpi.rs      ACPI discovery (MADT, HPET) through lumen-acpi
   src/boot.rs      Limine requests
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
   src/kmon.rs      serial debug monitor (until the M2 shell)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
-crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, ...)
+crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, ...)
 boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml

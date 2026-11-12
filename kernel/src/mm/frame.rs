@@ -192,8 +192,8 @@ fn named_reservations(hhdm: u64) -> Reservations {
     }
 
     // The ACPI tables are normally in `acpi-*` map entries, which are
-    // reserved with every other non-usable entry. Parsing them (#2) must
-    // reserve any table it finds in usable memory.
+    // reserved with every other non-usable entry. `acpi` reserves any table
+    // it finds in usable memory (with `reserve`, once it can read them).
     match boot::RSDP.get_response() {
         Some(resp) => {
             // Physical at base revision 3 only (kmain refuses to boot under
@@ -394,6 +394,45 @@ pub fn alloc_owned() -> Option<OwnedFrame> {
 /// Is `f` a frame the allocator has handed out (owned and not free)?
 pub fn is_allocated(f: PhysFrame) -> bool {
     with_frames(|a| a.is_owned(f.as_u64()) && !a.is_free(f.as_u64()))
+}
+
+/// Why [`reserve`] refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReserveError {
+    /// This frame of the range is allocated: something may already be
+    /// using it.
+    InUse(u64),
+    /// The named reservation list is full.
+    ListFull,
+}
+
+impl core::fmt::Display for ReserveError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ReserveError::InUse(a) => write!(f, "frame {a:#x} is already allocated"),
+            ReserveError::ListFull => write!(f, "all {MAX_RESERVATIONS} named reservations are used"),
+        }
+    }
+}
+
+/// Take the frames `range` touches away from the allocator for good, after
+/// boot (memory found later, such as an ACPI table in usable memory). If
+/// that takes any frame, `range` joins the named reservations (the
+/// in-kernel tests check every one of them). Returns how many frames it
+/// took: 0 for memory the allocator never had (non-usable or already
+/// reserved). Refuses, changing nothing, if any of the frames is allocated.
+pub fn reserve(name: &'static str, range: PhysRange) -> Result<usize, ReserveError> {
+    let mut guard = STATE.lock();
+    let s = guard.as_mut().expect("frame allocator used before mm::init");
+    let takes_any = pages(range.start(), range.len()).any(|f| s.frames.is_owned(f));
+    if takes_any && s.reserved.len == MAX_RESERVATIONS {
+        return Err(ReserveError::ListFull);
+    }
+    let taken = s.frames.reserve(range).map_err(|lumen_mm::ReserveError::InUse(a)| ReserveError::InUse(a))?;
+    if taken > 0 {
+        s.reserved.push(name, range);
+    }
+    Ok(taken)
 }
 
 /// Where the allocator's own bitmaps are, once it exists.
@@ -765,6 +804,35 @@ crate::ktest!(
         }
         let limine = boot::EXECUTABLE_ADDRESS.get_response().ok_or("no executable address response")?;
         kassert_eq!(reservation(KERNEL_IMAGE)?.start(), limine.physical_base());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn reserve_takes_free_frames_and_refuses_allocated_ones() {
+        use self::checks::*;
+        use crate::{kassert, kassert_eq};
+        const NAME: &str = "ktest reservation";
+        let named = || with_state(|s| s.reserved.len);
+        let held = alloc_raw().ok_or("out of frames")?;
+        let range = PhysRange::from_len(held + 8, 16);
+        let refused = reserve(NAME, range);
+        let still_allocated = !with_state(|s| s.frames.is_free(held)) && is_owned(held);
+        // SAFETY: allocated just above by this test and not used since.
+        kassert_eq!(unsafe { free_raw(held) }, Ok(()));
+        kassert_eq!(refused, Err(ReserveError::InUse(held)));
+        kassert!(still_allocated); // refusing changed nothing
+        // Now free: taken for good, and named.
+        let (before, names) = (free_frames(), named());
+        kassert_eq!(reserve(NAME, range), Ok(1));
+        kassert_eq!((free_frames(), named()), (before - 1, names + 1));
+        kassert!(!is_owned(held));
+        kassert_eq!(reservation(NAME)?.start(), range.start());
+        // Again, or memory the allocator never had (the local APIC's
+        // registers): nothing taken, no new name.
+        kassert_eq!(reserve(NAME, range), Ok(0));
+        kassert_eq!(reserve(NAME, PhysRange::from_len(0xfee0_0000, 4096)), Ok(0));
+        kassert_eq!((free_frames(), named()), (before - 1, names + 1));
         Ok(())
     }
 );

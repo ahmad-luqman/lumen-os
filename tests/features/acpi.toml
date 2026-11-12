@@ -1,0 +1,14 @@
+# Features: acpi. See tests/features/README.md for the format.
+
+[[feature]]
+name = "ACPI tables: RSDP, XSDT/RSDT, MADT (CPUs, LAPIC, I/O APICs, overrides) and HPET parsed and checked; CPU count matches QEMU's -smp"
+milestone = "M1"
+tests = [
+    "cargo:lumen-acpi",
+    "ktest:lumen_kernel::acpi::madt_lists_boot_cpu",
+    "ktest:lumen_kernel::acpi::tables_outside_the_hhdm_are_mapped_uncached",
+    "ktest:lumen_kernel::acpi::tables_in_usable_memory_are_reserved_or_refused",
+    "ktest:lumen_kernel::mm::frame::reserve_takes_free_frames_and_refuses_allocated_ones",
+    "scenario:test_acpi::test_cpu_count_matches_qemu[*]",
+    "harness:test_qemu::test_machine_appends_extra_args_last",
+]

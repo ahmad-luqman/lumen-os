@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Self
@@ -117,10 +118,19 @@ class ExpectTimeout(AssertionError):
 class Machine:
     """A headless QEMU instance driven over serial and QMP."""
 
-    def __init__(self, iso: Path, artifacts: Path, *, trace_interrupts: bool = False):
+    def __init__(
+        self,
+        iso: Path,
+        artifacts: Path,
+        *,
+        trace_interrupts: bool = False,
+        extra_args: Sequence[str] = (),
+    ):
         self.iso = Path(iso)
         self.artifacts = Path(artifacts)
         self.trace_interrupts = trace_interrupts
+        # Appended to the command line, e.g. ["-smp", "2"].
+        self.extra_args = list(extra_args)
         self.proc: subprocess.Popen[bytes] | None = None
         self._buf = bytearray()
         self._cond = threading.Condition()
@@ -129,21 +139,13 @@ class Machine:
         self._qmp: QmpClient | None = None
         # macOS limits unix socket paths to ~104 bytes, so keep it short.
         self._sock_dir = Path(os.environ.get("LUMEN_SOCK_DIR", "/tmp"))
+        self.qmp_path = self._sock_dir / f"lumen-qmp-{os.getpid()}-{id(self) & 0xFFFFFF:x}.sock"
 
     # -- lifecycle -------------------------------------------------------
     def start(self) -> Self:
         self.artifacts.mkdir(parents=True, exist_ok=True)
-        self.qmp_path = self._sock_dir / f"lumen-qmp-{os.getpid()}-{id(self) & 0xFFFFFF:x}.sock"
         self.qmp_path.unlink(missing_ok=True)
-        trace = "cpu_reset,guest_errors" + (",int" if self.trace_interrupts else "")
-        opts = QemuOptions(
-            iso=self.iso,
-            vars_file=fresh_vars(self.artifacts / "OVMF_VARS.fd"),
-            qmp_socket=self.qmp_path,
-            log_file=self.artifacts / "qemu.log",
-            trace=trace,
-        )
-        args = qemu_args(opts)
+        args = qemu_args(self.options(fresh_vars(self.artifacts / "OVMF_VARS.fd")))
         (self.artifacts / "cmdline.txt").write_text(" ".join(args) + "\n")
         # Lives as long as the machine; closed in close().
         self._serial_log = open(self.artifacts / "serial.log", "wb")  # noqa: SIM115
@@ -153,6 +155,18 @@ class Machine:
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
         return self
+
+    def options(self, vars_file: Path) -> QemuOptions:
+        """How start() runs QEMU (separate so the harness tests can check it)."""
+        trace = "cpu_reset,guest_errors" + (",int" if self.trace_interrupts else "")
+        return QemuOptions(
+            iso=self.iso,
+            vars_file=vars_file,
+            qmp_socket=self.qmp_path,
+            log_file=self.artifacts / "qemu.log",
+            trace=trace,
+            extra=self.extra_args,
+        )
 
     def _read_loop(self) -> None:
         assert self.proc and self.proc.stdout

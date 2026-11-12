@@ -11,14 +11,16 @@
 //!    #MC ran on the boot stack until now) are installed, then `kmain`
 //!    switches from Limine's boot stack to the main kernel stack and
 //!    continues in `kmain_on_kernel_stack`.
-//! 5. Framebuffer, then either the in-kernel tests (`--features ktest`) or
-//!    the kernel monitor.
+//! 5. ACPI tables (CPUs, interrupt controllers, HPET), the framebuffer,
+//!    then either the in-kernel tests (`--features ktest`) or the kernel
+//!    monitor.
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+mod acpi;
 mod arch;
 mod boot;
 mod cmdline;
@@ -135,6 +137,7 @@ fn install_stacks() -> StackRange {
 
 /// The rest of boot, on the allocated main stack.
 extern "C" fn kmain_on_kernel_stack() -> ! {
+    acpi::init();
     match boot::FRAMEBUFFER.get_response().and_then(|r| r.framebuffers().next()) {
         Some(fb) => match fb::init(&fb) {
             Some((w, h)) => info!(target: "fb", "framebuffer {w}x{h} ready"),

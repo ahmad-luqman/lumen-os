@@ -17,6 +17,7 @@ bench = false
 ktest = []
 
 [dependencies]
+lumen-acpi.workspace = true
 lumen-elf.workspace = true
 lumen-heap.workspace = true
 lumen-mm.workspace = true

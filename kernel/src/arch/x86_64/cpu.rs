@@ -82,6 +82,13 @@ pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
     (r.eax, r.ebx, r.ecx, r.edx)
 }
 
+/// This CPU's APIC id, as the MADT lists it: the 32-bit x2APIC id (`cpuid`
+/// leaf 0xB) where the CPU reports one, else the 8-bit initial APIC id
+/// (leaf 1).
+pub fn apic_id() -> u32 {
+    if cpuid(0).0 >= 0xb && cpuid(0xb).1 != 0 { cpuid(0xb).3 } else { cpuid(1).1 >> 24 }
+}
+
 macro_rules! write_cr {
     ($name:ident, $reg:literal) => {
         /// Write the control register.

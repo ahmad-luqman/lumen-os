@@ -96,18 +96,30 @@ def test_nx_data_crashes_cleanly(crash_report):
     assert any("kmon::run" in f for f in frames) and frames[-1].startswith("_start"), report
 
 
+def kmon_heap(m) -> dict[str, int]:
+    """Run kmon's `heap` at its prompt; the summary's numbers, back at the prompt."""
+    m.send_line("heap")
+    heap = heap_line(m.expect(r"heap: .*\n").group(0))
+    m.expect(r"kmon> ")
+    return {
+        k: int(v, 0)
+        for k, v in heap.items()
+        if k in ("mapped", "base", "used", "live", "free", "blocks", "largest")
+    }
+
+
 def test_kmon_heap_reports_usage(boot):
     m = boot("qemutest")
     m.expect(r"kmon> ", BOOT_TIMEOUT)
-    m.send_line("heap")
-    line = m.expect(r"heap: .*\n").group(0)
-    # Nothing allocates before kmon, so the heap hasn't grown yet. (The first
-    # boot-time allocation changes this line; nonzero values are checked by
-    # the crash scenarios below.)
-    assert (
-        line
-        == f"heap: 0 bytes mapped at {HEAP_BASE:#x}, 0 used in 0 allocations, 0 free in 0 blocks (largest 0)\n"
-    )
+    heap = kmon_heap(m)
+    # What boot keeps (ACPI's tables, for one) is in use; the rest of what
+    # the heap mapped is free, and the numbers add up.
+    assert heap["base"] == HEAP_BASE, heap
+    assert heap["live"] > 0 and heap["used"] > 0, heap
+    assert heap["used"] + heap["free"] == heap["mapped"], heap
+    assert 0 < heap["largest"] <= heap["free"], heap
+    # Looking doesn't allocate: the summary is the same the second time.
+    assert kmon_heap(m) == heap
 
 
 def test_out_of_memory_report_shows_the_heap(crash_report):
@@ -126,7 +138,8 @@ def test_out_of_memory_report_shows_the_heap(crash_report):
 
 
 def test_double_free_is_refused(crash_report):
-    report = crash_report("dfree")
+    before: dict[str, int] = {}
+    report = crash_report("dfree", at_prompt=lambda m: before.update(kmon_heap(m)))
     bad_free = (
         r"^panic: heap: bad free of 0xffffc[0-9a-f]{11} \(64 bytes, align 16\): "
         r"block overlaps free memory \(double free or wrong layout\)$"
@@ -135,27 +148,47 @@ def test_double_free_is_refused(crash_report):
     assert any("kmon::crash_double_free" in f for f in backtrace(report)), report
     # The block was freed after its lower neighbour, so the second free is
     # caught by its overlap with the merged free block below. It changed
-    # nothing: only the 128-byte block kmon keeps is in use (nothing else
-    # allocates at boot), and the free list is intact (one block: everything
-    # above it).
-    heap = heap_line(report)
-    assert (heap["used"], heap["live"], heap["blocks"]) == ("128", "1", "1"), heap
-    assert int(heap["largest"]) == int(heap["free"]) == int(heap["mapped"]) - 128, heap
+    # nothing: compared with the prompt, only the 128-byte block kmon keeps
+    # is in use, carved from the top free block, and the free list is intact
+    # (the same blocks).
+    heap = {
+        k: int(v)
+        for k, v in heap_line(report).items()
+        if k in ("mapped", "used", "live", "free", "blocks", "largest")
+    }
+    assert heap["mapped"] == before["mapped"], (before, heap)
+    assert (heap["used"], heap["live"]) == (before["used"] + 128, before["live"] + 1), (
+        before,
+        heap,
+    )
+    assert (heap["free"], heap["largest"]) == (before["free"] - 128, before["largest"] - 128), (
+        before,
+        heap,
+    )
+    assert heap["blocks"] == before["blocks"], (before, heap)
 
 
 def test_corrupt_free_list_is_a_crash_not_a_hang(crash_report):
     # kmon links a freed block's free-list node back to itself and then
     # allocates past it. The walk must panic (with the heap's lock held),
     # and the report must still show the heap, naming the corruption.
-    report = crash_report("heapcorrupt")
-    assert re.search(
-        r"^panic: heap free list corrupt at offset 0x0 \(size 0x40, next 0x0\)$",
+    before: dict[str, int] = {}
+    report = crash_report("heapcorrupt", at_prompt=lambda m: before.update(kmon_heap(m)))
+    corrupt = re.search(
+        r"^panic: heap free list corrupt at offset (0x[0-9a-f]+) \(size 0x40, next (0x[0-9a-f]+)\)$",
         report,
         re.MULTILINE,
-    ), report
-    locked = r"^heap \(lock held; may be mid-update\): \d+ bytes mapped at 0xffffc00000000000, 64 used in 1 allocations"
-    assert re.search(locked, report, re.MULTILINE), report
-    assert "(free list broken: block at 0x0 is out of order or overlaps)" in report, report
+    )
+    assert corrupt and corrupt[1] == corrupt[2], report  # the node links to itself
+    # One more 64-byte block in use than at the prompt.
+    locked = (
+        r"^heap \(lock held; may be mid-update\): \d+ bytes mapped at 0xffffc00000000000, "
+        rf"{before['used'] + 64} used in {before['live'] + 1} allocations"
+    )
+    assert re.search(locked, report, re.MULTILINE), (before, report)
+    assert f"(free list broken: block at {corrupt[1]} is out of order or overlaps)" in report, (
+        report
+    )
 
 
 # The crash reporter's line for an overflow (kernel/src/crash.rs,
