@@ -1,0 +1,24 @@
+# Features: smp. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Every CPU Limine reports comes online (up to 8, the rest halted), each with its own GDT/TSS, per-CPU record and allocated, guarded stacks"
+milestone = "M1"
+tests = [
+    "scenario:test_smp::test_all_cpus_online",
+    "scenario:test_smp::test_one_cpu_boots_alone",
+    "scenario:test_smp::test_cpus_past_the_limit_are_halted",
+    "scenario:test_smp::test_double_fault_on_ap_runs_on_its_own_ist_stack",
+    "ktest:lumen_kernel::arch::x86_64::percpu::the_boot_cpu_is_cpu_0",
+]
+
+[[feature]]
+name = "A crash on any CPU is reported by that CPU (cpu, stack it runs on) after it stops the other CPUs with an NMI; kmon runs a fault on a chosen CPU"
+milestone = "M1"
+tests = [
+    "scenario:test_smp::test_crash_on_ap_reports_cpu",
+    "scenario:test_smp::test_double_fault_on_ap_runs_on_its_own_ist_stack",
+    "scenario:test_smp::test_panic_on_ap_is_reported_by_it",
+    "scenario:test_smp::test_crash_on_the_boot_cpu_stops_the_others",
+    "scenario:test_smp::test_crash_alone_names_no_other_cpus",
+    "scenario:test_smp::test_crash_on_a_cpu_that_isnt_online_is_refused",
+]

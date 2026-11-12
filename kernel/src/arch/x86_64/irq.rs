@@ -100,6 +100,27 @@ pub fn enable() {
     sti();
 }
 
+/// Unless `ready()`, wait for an interrupt with interrupts on. `ready` runs
+/// with interrupts off, then `sti; hlt` (`sti` takes effect after `hlt`
+/// starts), so an interrupt that makes it true can't slip in between the
+/// check and the halt and leave this CPU asleep. Outside every critical
+/// section; interrupts are on afterwards (and stay off for good, with this
+/// CPU halted, after [`disable_for_good`]).
+pub fn wait_unless(ready: impl FnOnce() -> bool) {
+    assert_eq!(depth(), 0, "waiting inside a critical section");
+    cli();
+    if FOR_GOOD.load(Ordering::Relaxed) {
+        super::cpu::halt_forever();
+    }
+    if ready() {
+        sti();
+        return;
+    }
+    // SAFETY: the IDT is loaded and every vector has a handler; no
+    // critical section is open (checked above).
+    unsafe { asm!("sti", "hlt", options(nomem, nostack)) };
+}
+
 /// Turn interrupts off on this CPU and keep them off on every CPU: no
 /// section closing turns them on again, and [`enable`] refuses. For the
 /// crash path, which must run alone and never returns to what it

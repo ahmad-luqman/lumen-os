@@ -212,9 +212,11 @@ impl Registry {
     /// # Safety
     /// `range` (the stack, not its guard page) is mapped until it is
     /// unregistered: readers such as the crash reporter dereference what the
-    /// registry lists. (One CPU: readers are exception handlers that run to
-    /// completion. With SMP, unmapping after `unregister` needs a grace
-    /// period, since a reader may still hold the entry.)
+    /// registry lists. (The kernel's readers are crash reports, which stop
+    /// every other CPU before reading, so a stack retracted and then unmapped
+    /// by a stopped CPU is never half-read. A reader running alongside
+    /// writers would need a grace period after `unregister` before the
+    /// unmapping.)
     ///
     /// # Panics
     /// If `range` is not page-aligned, nonempty and with its guard page above

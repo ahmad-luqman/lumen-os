@@ -58,6 +58,14 @@ pub fn bounds_of(addr: u64) -> Option<(u64, u64)> {
     }
 }
 
+/// The registered stack `addr` is in, if any.
+pub fn stack_of(addr: u64) -> Option<Registered> {
+    match REGISTRY.find(addr) {
+        Some(Hit::Stack(r)) => Some(r),
+        _ => None,
+    }
+}
+
 /// The registered stack whose guard page `addr` is in, if any.
 pub fn guard_hit(addr: u64) -> Option<Registered> {
     match REGISTRY.find(addr) {

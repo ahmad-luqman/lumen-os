@@ -133,7 +133,8 @@ fn install_stacks() -> StackRange {
     let df = stack(STACK_SIZE, StackKind::DoubleFault);
     let nmi = stack(STACK_SIZE, StackKind::Nmi);
     let mc = stack(STACK_SIZE, StackKind::MachineCheck);
-    // SAFETY: leaked, mapped stacks nothing else uses; one CPU, interrupts off.
+    // SAFETY: leaked, mapped stacks nothing else uses; the boot CPU, before
+    // any other starts, interrupts off.
     unsafe { arch::install_ist_stacks(df.top, nmi.top, mc.top) };
     let main = stack(MAIN_STACK_SIZE, StackKind::Main);
     info!(

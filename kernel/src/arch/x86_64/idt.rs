@@ -238,9 +238,11 @@ pub const TIMER: u8 = 0x40;
 pub const IOAPIC_BASE: u8 = 0x50;
 /// The last vector for an I/O APIC input.
 const IOAPIC_LAST: u8 = 0xef;
-/// Free: no source uses 0x30-0x3f (a ktest raises 0x30 by `int`).
+/// Free: no source uses 0x30-0x3e (a ktest raises 0x30 by `int`).
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
 pub const UNUSED: u8 = 0x30;
+/// An IPI that only wakes its CPU (`smp::run_on`): handled by an EOI.
+pub const WAKEUP: u8 = 0x3f;
 /// Local APIC errors.
 pub const LAPIC_ERROR: u8 = 0xfe;
 /// The local APIC's spurious vector (needs no EOI).
@@ -250,7 +252,8 @@ pub const SPURIOUS: u8 = 0xff;
 const _: () = assert!(
     32 <= PIC_BASE
         && PIC_BASE + 16 <= UNUSED
-        && UNUSED + 16 <= TIMER
+        && UNUSED < WAKEUP
+        && WAKEUP < TIMER
         && TIMER < IOAPIC_BASE
         && IOAPIC_BASE < IOAPIC_LAST
         && IOAPIC_LAST < LAPIC_ERROR
@@ -361,6 +364,7 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
         SPURIOUS => {
             SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);
         }
+        WAKEUP => super::apic::eoi(),
         v if (PIC_BASE..PIC_BASE + 16).contains(&v) && super::apic::in_service(v) => {
             // Delivered through the local APIC (an MSI or a routed input on
             // the 8259s' vectors), not by the 8259s: its EOI is the APIC's.

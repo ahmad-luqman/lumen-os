@@ -121,6 +121,8 @@ def render(evaluated: list[tuple[dict, str]]) -> str:
         "  Limine's stack, without a guard page, until `kmain` switches to an",
         "  allocated one right after `mm::init`; #DF, NMI and #MC run on it too",
         "  (no IST yet), so a #DF from a broken stack pointer then is a triple fault.",
+        "  Each other CPU also starts on a Limine stack, until it loads the kernel's",
+        "  page tables (its IST stacks are allocated by then).",
         "",
     ]
     return "\n".join(lines)

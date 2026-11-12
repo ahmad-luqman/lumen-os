@@ -683,7 +683,8 @@ mod checks {
         // SAFETY: reading one word of an allocated frame through the HHDM:
         // it is either ours (filled by allocate_all), leaked by an earlier
         // failed test, or in use elsewhere (heap, stacks, page tables), and
-        // nothing writes it meanwhile (one CPU; this test runs alone).
+        // nothing writes it meanwhile (this test runs alone; other CPUs only
+        // idle).
         allocated && unsafe { virt(frame).cast::<u64>().add(2).read() } == frame
     }
 

@@ -2,9 +2,9 @@
 //!
 //! [`SpinLock`] turns this CPU's interrupts off while it is held (nested, see
 //! `arch::irq`), so a maskable interrupt's handler that takes a lock can
-//! never spin on one the code it interrupted holds. One CPU for now; SMP
-//! (#9) needs no change here beyond per-CPU interrupt nesting. A guard can't
-//! be sent to another thread (it holds this CPU's critical section).
+//! never spin on one the code it interrupted holds; other CPUs spin until it
+//! is released (interrupt nesting is per CPU). A guard can't be sent to
+//! another thread (it holds this CPU's critical section).
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
@@ -55,8 +55,8 @@ impl<T> SpinLock<T> {
     /// For the crash reporter, which must print even when the crash happened
     /// while the lock was held, and for tests that hold the lock without
     /// touching the value. The caller guarantees no other code uses the value
-    /// while the reference lives (on the crash path: one CPU, interrupts off
-    /// for good, and the interrupted holder never resumes).
+    /// while the reference lives (on the crash path: interrupts off for good,
+    /// every other CPU stopped, and the interrupted holder never resumes).
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn force_get(&self) -> &mut T {
         // SAFETY: upheld by the caller (see above).

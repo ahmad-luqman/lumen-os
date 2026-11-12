@@ -12,7 +12,8 @@
 //!    makes the CPU honour NX and WP, then switches to the kernel's page
 //!    tables and its allocated stack in one step;
 //! 3. on that stack the AP enables its local APIC, logs
-//!    `cpu N online (lapic id X)` and idles with interrupts on;
+//!    `cpu N online (lapic id X)` and idles with interrupts on, running
+//!    whatever [`run_on`] hands it (kmon's `crash <kind> <cpu>`);
 //! 4. the boot CPU waits (bounded) for that before starting the next.
 //!
 //! CPUs past [`MAX_CPUS`](crate::arch::MAX_CPUS) are halted for good, with a
@@ -39,13 +40,20 @@ struct Slot {
     /// Its local APIC id, from Limine (the MADT's).
     lapic_id: AtomicU32,
     /// Set by the CPU itself once it runs on its own stack with its local
-    /// APIC enabled.
+    /// APIC enabled (and, so, its own IDT and TSS: an NMI is safe to send).
     online: AtomicBool,
+    /// A job for it to run (a `fn()`), 0 if none.
+    job: AtomicUsize,
 }
 
-static SLOTS: [Slot; MAX_CPUS] =
-    [const { Slot { main_top: AtomicU64::new(0), lapic_id: AtomicU32::new(0), online: AtomicBool::new(false) } };
-        MAX_CPUS];
+static SLOTS: [Slot; MAX_CPUS] = [const {
+    Slot {
+        main_top: AtomicU64::new(0),
+        lapic_id: AtomicU32::new(0),
+        online: AtomicBool::new(false),
+        job: AtomicUsize::new(0),
+    }
+}; MAX_CPUS];
 
 /// CPUs online, the boot CPU included.
 static ONLINE: AtomicUsize = AtomicUsize::new(1);
@@ -55,6 +63,46 @@ static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 /// How many CPUs are online (the boot CPU included).
 pub fn online() -> usize {
     ONLINE.load(Ordering::Acquire)
+}
+
+/// Is CPU `index` online? The boot CPU always is. Lock-free (the crash
+/// reporter stops exactly these CPUs).
+pub fn is_online(index: usize) -> bool {
+    index == 0 || (index < MAX_CPUS && SLOTS[index].online.load(Ordering::Acquire))
+}
+
+/// Why [`run_on`] refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunError {
+    /// That CPU isn't an online AP (it doesn't exist, didn't start, or is the
+    /// boot CPU, which runs kmon itself).
+    NotAnOnlineAp,
+    /// It hasn't taken the last job yet.
+    Busy,
+}
+
+/// Have AP `index` run `job` from its idle loop (on its own stack, with
+/// interrupts on), and wake it. Returns once the job is handed over, not
+/// when it has run.
+pub fn run_on(index: usize, job: fn()) -> Result<(), RunError> {
+    if index == 0 || !is_online(index) {
+        return Err(RunError::NotAnOnlineAp);
+    }
+    SLOTS[index]
+        .job
+        .compare_exchange(0, job as usize, Ordering::Release, Ordering::Relaxed)
+        .map_err(|_| RunError::Busy)?;
+    arch::apic::send_ipi(lapic_id(index), arch::idt::WAKEUP);
+    Ok(())
+}
+
+/// Take this AP's job, if it has one.
+fn take_job(index: usize) -> Option<fn()> {
+    match SLOTS[index].job.swap(0, Ordering::Acquire) {
+        0 => None,
+        // SAFETY: `run_on` only ever stores a `fn()`, as a usize.
+        raw => Some(unsafe { core::mem::transmute::<usize, fn()>(raw) }),
+    }
 }
 
 /// CPU `index`'s local APIC id (set for the boot CPU by [`init`], for an AP
@@ -170,7 +218,12 @@ extern "C" fn ap_main() -> ! {
     info!(target: "smp", "cpu {index} online (lapic id {lapic})");
     ONLINE.fetch_add(1, Ordering::AcqRel);
     SLOTS[index].online.store(true, Ordering::Release);
+    let slot = &SLOTS[index];
     loop {
-        arch::wait_for_interrupt();
+        // Checked with interrupts off, so a wakeup can't be lost.
+        arch::irq::wait_unless(|| slot.job.load(Ordering::Relaxed) != 0);
+        if let Some(job) = take_job(index) {
+            job();
+        }
     }
 }

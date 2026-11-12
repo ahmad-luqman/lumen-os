@@ -62,7 +62,7 @@ fn dispatch(line: &str) {
                 out,
                 "commands:\n  help              this list\n  echo <text>       print text\n  \
                  int3              take a breakpoint and continue\n  \
-                 crash <kind>      deliberate fault: {CRASH_KINDS}\n  \
+                 crash <kind> [cpu] deliberate fault (on that CPU): {CRASH_KINDS}\n  \
                  trace [n]         the last n trace events (default 16)\n  \
                  heap              heap usage and free-list summary\n  \
                  ticks             timer interrupts taken (and stray ones)\n  \
@@ -161,26 +161,51 @@ fn trace(n: u64) {
     let _ = writeln!(out, "trace: {} events claimed, {} dropped", ring.written(), ring.dropped());
 }
 
-fn crash(kind: &str) {
-    match kind {
-        "pf" => crash_page_fault(),
-        "ud" => crash_invalid_opcode(),
-        "de" => crash_divide_error(),
-        "gp" => crash_general_protection(),
-        "df" => crash_double_fault(),
-        "wtext" => crash_write_text(),
-        "nx" => crash_execute_data(),
-        "panic" => crash_panic(),
-        "oom" => crash_out_of_memory(),
-        "dfree" => crash_double_free(),
-        "heapcorrupt" => crash_corrupt_heap(),
-        "guard" => crash_touch_guard(),
-        "stack" => crash_stack_overflow(),
-        "bigframe" => crash_big_frame_overflow(),
-        _ => {
-            let _ = writeln!(serial::SerialWriter, "crash: unknown kind '{kind}' ({CRASH_KINDS})");
+/// `crash <kind> [cpu]`: run the fault here, or on another online CPU (from
+/// its idle loop; its crash report then stops this one).
+fn crash(args: &str) {
+    let mut out = serial::SerialWriter;
+    let mut words = args.split_whitespace();
+    let kind = words.next().unwrap_or("");
+    let Some(fault) = crash_fn(kind) else {
+        let _ = writeln!(out, "crash: unknown kind '{kind}' ({CRASH_KINDS})");
+        return;
+    };
+    match words.next().map(str::parse::<usize>) {
+        None | Some(Ok(0)) => fault(),
+        Some(Ok(cpu)) => match crate::smp::run_on(cpu, fault) {
+            Ok(()) => {}
+            Err(crate::smp::RunError::NotAnOnlineAp) => {
+                let _ = writeln!(out, "crash: cpu {cpu} isn't online");
+            }
+            Err(crate::smp::RunError::Busy) => {
+                let _ = writeln!(out, "crash: cpu {cpu} hasn't taken its last job yet");
+            }
+        },
+        Some(Err(_)) => {
+            let _ = writeln!(out, "crash: the cpu is a number (0: this one)");
         }
     }
+}
+
+fn crash_fn(kind: &str) -> Option<fn()> {
+    Some(match kind {
+        "pf" => crash_page_fault,
+        "ud" => crash_invalid_opcode,
+        "de" => crash_divide_error,
+        "gp" => crash_general_protection,
+        "df" => crash_double_fault,
+        "wtext" => crash_write_text,
+        "nx" => crash_execute_data,
+        "panic" => crash_panic,
+        "oom" => crash_out_of_memory,
+        "dfree" => crash_double_free,
+        "heapcorrupt" => crash_corrupt_heap,
+        "guard" => crash_touch_guard,
+        "stack" => crash_stack_overflow,
+        "bigframe" => crash_big_frame_overflow,
+        _ => return None,
+    })
 }
 
 /// Address that is never mapped: the kernel's page tables map nothing in the

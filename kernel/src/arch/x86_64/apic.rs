@@ -24,6 +24,8 @@ const EOI: usize = 0xb0;
 const ISR: usize = 0x100;
 const SVR: usize = 0xf0;
 const ESR: usize = 0x280;
+const ICR_LOW: usize = 0x300;
+const ICR_HIGH: usize = 0x310;
 const LVT_TIMER: usize = 0x320;
 const LVT_LINT0: usize = 0x350;
 const LVT_LINT1: usize = 0x360;
@@ -37,6 +39,10 @@ const LVT_MASKED: u32 = 1 << 16;
 /// LVT delivery mode NMI (bits 8-10 = 0b100).
 const LVT_NMI: u32 = 0b100 << 8;
 const LVT_PERIODIC: u32 = 1 << 17;
+/// ICR: the IPI is still being sent.
+const ICR_PENDING: u32 = 1 << 12;
+/// ICR: level assert (required for every IPI but INIT de-assert).
+const ICR_ASSERT: u32 = 1 << 14;
 /// Divide configuration 0b0011: the timer counts at the bus clock / 16.
 const DIVIDE_BY_16: u32 = 0b0011;
 /// What [`DIVIDE_BY_16`] divides by.
@@ -132,6 +138,35 @@ pub fn eoi() {
 /// EOI'd)? False before [`set_lapic`].
 pub fn in_service(vector: u8) -> bool {
     lapic_ready() && read(ISR + 0x10 * usize::from(vector / 32)) & (1 << (vector % 32)) != 0
+}
+
+/// Send an interrupt on `vector` to the CPU whose local APIC id is `dest`.
+pub fn send_ipi(dest: u32, vector: u8) {
+    send(dest, ICR_ASSERT | u32::from(vector));
+}
+
+/// Send an NMI to the CPU whose local APIC id is `dest` (the crash reporter
+/// stops the other CPUs with it). Lock-free.
+pub fn send_nmi(dest: u32) {
+    send(dest, ICR_ASSERT | LVT_NMI);
+}
+
+/// Write the ICR (destination first: writing the low word sends) and wait,
+/// bounded, until the local APIC has sent it (the crash path must not hang
+/// on a wedged APIC; it says which CPU didn't stop). Interrupts are off
+/// meanwhile, so a handler on this CPU can't send one between the writes.
+fn send(dest: u32, low: u32) {
+    assert!(dest <= 0xff, "xAPIC destination {dest} doesn't fit in 8 bits");
+    let irq = super::irq::push_off();
+    write(ICR_HIGH, dest << 24);
+    write(ICR_LOW, low);
+    for _ in 0..1_000_000 {
+        if read(ICR_LOW) & ICR_PENDING == 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    drop(irq);
 }
 
 /// Latch and read the error status (for the error interrupt).

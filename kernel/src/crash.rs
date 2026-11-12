@@ -12,6 +12,13 @@
 //! ([`crate::arch::stacks::contains`]), and detects a crash while reporting a
 //! crash (it then prints a one-line notice and stops).
 //!
+//! With several CPUs online, the first CPU to crash owns the report: it
+//! stops every other online CPU with an NMI (each acknowledges and halts) and
+//! waits for them, bounded, before writing anything, so reports and log
+//! lines never interleave. A CPU that crashes while another is reporting
+//! halts quietly. Serial says which CPU crashed (`cpu:`), which stack the
+//! reporter runs on (`running on:`) and which CPUs stopped.
+//!
 //! The output format is parsed by `tools/harness/lumen_harness/crash.py`
 //! (markers, backtrace, page walk), `tests/scenarios/test_crash.py` and, for
 //! the heap line (`Snapshot::write` in `mm::heap`), `tests/scenarios/test_mm.py`;
@@ -21,7 +28,7 @@ use crate::arch::{self, TrapFrame, serial::SerialWriter};
 use crate::symbols::Symbolized;
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use lumen_mm::stacks::{Hit, Registered};
 
@@ -34,7 +41,14 @@ const MAX_FRAMES: usize = 32;
 /// How many trace events a crash report shows.
 const RECENT_TRACE_EVENTS: u64 = 16;
 
-static CRASHING: AtomicBool = AtomicBool::new(false);
+/// Which CPU owns the report: its index plus one, 0 while no CPU is crashing.
+static CRASHING: AtomicUsize = AtomicUsize::new(0);
+/// The other CPUs the owner sent a stop NMI to, a bit each.
+static STOP_SENT: AtomicU64 = AtomicU64::new(0);
+/// The CPUs that stopped for it, a bit each.
+static STOPPED: AtomicU64 = AtomicU64::new(0);
+/// How long the owner waits for the others to stop.
+const STOP_TIMEOUT_NS: u64 = 500_000_000;
 /// CR2 when the first report began: a nested crash only blames a guard page
 /// if CR2 has changed since (only a #PF sets it).
 static FIRST_CR2: AtomicU64 = AtomicU64::new(0);
@@ -98,25 +112,97 @@ pub fn panic(info: &PanicInfo<'_>) -> ! {
     finish()
 }
 
-/// Guard against a crash inside the crash reporter.
+/// Claim the report (stopping the other CPUs), or stop: guard against a
+/// crash inside the crash reporter, and against two CPUs reporting at once.
 fn enter(vector: u64, rip: u64) {
-    ON_AT_ENTRY.store(arch::irq::enabled(), Ordering::SeqCst);
-    if CRASHING.swap(true, Ordering::SeqCst) {
-        let mut s = SerialWriter;
-        if IN_TAIL.load(Ordering::SeqCst) {
-            // Everything but the tail is out: say what happened and close the
-            // report so it still parses.
-            let _ = writeln!(
-                s,
-                "\n!!! fault while writing the page walk or heap state (vector {vector:#x}, rip {rip:#018x})"
-            );
-            write_nested_guard_hit(&mut s, vector);
-            let _ = writeln!(s, "{END_MARKER}");
-            finish();
+    let me = arch::cpu_index();
+    match CRASHING.compare_exchange(0, me + 1, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => {
+            ON_AT_ENTRY.store(arch::irq::enabled(), Ordering::SeqCst);
+            stop_others(me);
         }
-        let _ = writeln!(s, "\n!!! nested crash while reporting (vector {vector:#x}, rip {rip:#018x}); halting");
+        // Another CPU is reporting: this is its stop NMI, or a crash of our
+        // own that its report must not be mixed with.
+        Err(owner) if owner != me + 1 => stop_here(me),
+        Err(_) => nested(vector, rip),
+    }
+}
+
+/// A crash while this CPU writes its own report: say so and stop.
+fn nested(vector: u64, rip: u64) -> ! {
+    let mut s = SerialWriter;
+    if IN_TAIL.load(Ordering::SeqCst) {
+        // Everything but the tail is out: say what happened and close the
+        // report so it still parses.
+        let _ =
+            writeln!(s, "\n!!! fault while writing the page walk or heap state (vector {vector:#x}, rip {rip:#018x})");
         write_nested_guard_hit(&mut s, vector);
+        let _ = writeln!(s, "{END_MARKER}");
         finish();
+    }
+    let _ = writeln!(s, "\n!!! nested crash while reporting (vector {vector:#x}, rip {rip:#018x}); halting");
+    write_nested_guard_hit(&mut s, vector);
+    finish();
+}
+
+/// Send every other online CPU a stop NMI and wait (bounded) until each has
+/// stopped. Only online CPUs: one still parked in the bootloader has no
+/// handler for it.
+fn stop_others(me: usize) {
+    if !arch::apic::lapic_ready() {
+        return; // too early for other CPUs to be running
+    }
+    let mut sent = 0u64;
+    for cpu in (0..arch::MAX_CPUS).filter(|&c| c != me && crate::smp::is_online(c)) {
+        arch::apic::send_nmi(crate::smp::lapic_id(cpu));
+        sent |= 1 << cpu;
+    }
+    STOP_SENT.store(sent, Ordering::SeqCst);
+    // Other CPUs are only online once time is calibrated.
+    let deadline = crate::time::now_ns() + STOP_TIMEOUT_NS;
+    while STOPPED.load(Ordering::SeqCst) & sent != sent && crate::time::now_ns() < deadline {
+        core::hint::spin_loop();
+    }
+}
+
+/// Stop this CPU for another CPU's report: acknowledge, then halt for good
+/// (interrupts are off; NMIs stay blocked until an `iret` that never comes).
+fn stop_here(me: usize) -> ! {
+    STOPPED.fetch_or(1 << me, Ordering::SeqCst);
+    arch::halt_forever()
+}
+
+/// The CPUs in `mask`, as `0 2 3`.
+struct Cpus(u64);
+
+impl fmt::Display for Cpus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for cpu in (0..64).filter(|c| self.0 & (1 << c) != 0) {
+            write!(f, "{}{cpu}", if first { "" } else { " " })?;
+            first = false;
+        }
+        Ok(())
+    }
+}
+
+/// The serial-only lines that say where the report comes from: which CPU,
+/// which stack the reporter runs on, and which other CPUs stopped.
+fn write_origin(w: &mut dyn Write, rsp: u64) {
+    let _ = writeln!(w, "cpu: {} (lapic id {})", arch::cpu_index(), arch::apic_id());
+    let (lo, hi) = arch::stacks::boot_stack();
+    let _ = match arch::stacks::stack_of(rsp) {
+        Some(r) => writeln!(w, "running on: the {} stack {:#x}..{:#x}", r.kind.name(), r.range.bottom, r.range.top),
+        None if (lo..hi).contains(&rsp) => writeln!(w, "running on: the boot stack {lo:#x}..{hi:#x}"),
+        None => writeln!(w, "running on: an unknown stack (rsp {rsp:#018x})"),
+    };
+    let sent = STOP_SENT.load(Ordering::SeqCst);
+    if sent != 0 {
+        let stopped = STOPPED.load(Ordering::SeqCst) & sent;
+        let _ = writeln!(w, "other cpus stopped: {}", Cpus(stopped));
+        if stopped != sent {
+            let _ = writeln!(w, "!!! other cpus not stopped: {}", Cpus(sent & !stopped));
+        }
     }
 }
 
@@ -146,6 +232,7 @@ fn write_nested_note(w: &mut dyn Write, vector: u64, cr2: u64, first_cr2: u64) {
 fn emit(body: &dyn Fn(&mut dyn Write), tail: &dyn Fn(&mut dyn Write)) {
     let mut s = SerialWriter;
     let _ = writeln!(s, "\n{BEGIN_MARKER}");
+    write_origin(&mut s, arch::read_rsp());
     body(&mut s);
     // What led up to it (serial only: the screen has no room). The ring is
     // lock-free, so reading it here can't deadlock.
@@ -162,8 +249,9 @@ fn emit(body: &dyn Fn(&mut dyn Write), tail: &dyn Fn(&mut dyn Write)) {
     // corrupt the walk can fault, and `IN_TAIL` then closes the report.
     // Doesn't block (reads the heap anyway if its lock is held); the
     // free-list walk is bounded and stays inside those bounds.
-    // SAFETY: the crash path: one CPU, interrupts off for good, CRASHING
-    // keeps a second report out, and we halt next, so whatever was using the
+    // SAFETY: the crash path: interrupts off for good, CRASHING keeps a
+    // second report out, every other online CPU has stopped (a CPU that
+    // didn't is named above), and we halt next, so whatever was using the
     // heap never resumes.
     let _ = unsafe { crate::mm::heap::write_crash_stats(&mut s) };
     IN_TAIL.store(false, Ordering::SeqCst);
@@ -177,7 +265,8 @@ fn emit(body: &dyn Fn(&mut dyn Write), tail: &dyn Fn(&mut dyn Write)) {
     let _ = writeln!(s, "interrupts: {state}");
     let _ = writeln!(s, "{END_MARKER}");
     // Serial first: if drawing the screen faults, the serial report survives.
-    // SAFETY: we are on the crash path; CRASHING guarantees we run alone.
+    // SAFETY: we are on the crash path; CRASHING and the stopped CPUs
+    // guarantee we run alone.
     if unsafe { crate::fb::with_crash_screen(|w| body(w)) } {
         let _ = writeln!(s, "{SCREEN_MARKER}");
     }
@@ -348,9 +437,9 @@ fn write_backtrace(w: &mut dyn Write, rip: Option<u64>, mut rbp: u64) -> fmt::Re
         if !rbp.is_multiple_of(8) || !arch::stacks::contains(rbp, 16) {
             break Some(Stop::UnknownFrame(rbp));
         }
-        // SAFETY: [rbp, rbp+16) lies inside a known, mapped kernel stack
-        // (one CPU: a registered stack is mapped until it is retracted, and
-        // the boot stack is never unmapped).
+        // SAFETY: [rbp, rbp+16) lies inside a known, mapped kernel stack (a
+        // registered stack is mapped until it is retracted, the other CPUs
+        // are stopped, and the boot stack is never unmapped).
         let (next, ret) = unsafe { ((rbp as *const u64).read(), (rbp as *const u64).add(1).read()) };
         if !is_kernel_text(ret) {
             break Some(Stop::NotKernelCode(ret));

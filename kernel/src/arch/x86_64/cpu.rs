@@ -156,12 +156,3 @@ pub unsafe extern "C" fn enter_kernel_space(root: u64, top: u64, entry: extern "
         "ud2",
     )
 }
-
-/// Turn interrupts on and wait for one (`sti; hlt`: `sti` takes effect after
-/// the next instruction, so an interrupt can't slip in between and leave the
-/// CPU halted with its wakeup already handled). Returns after the handler.
-pub fn wait_for_interrupt() {
-    // SAFETY: the IDT is loaded and every vector has a handler; callers wait
-    // outside every critical section.
-    unsafe { asm!("sti", "hlt", options(nomem, nostack)) }
-}

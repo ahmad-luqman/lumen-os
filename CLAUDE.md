@@ -53,7 +53,9 @@ Each rule exists because breaking it caused a real bug in v1.
 4. **No fixed-address stacks.** Every stack comes from the allocator and has a
    guard page (`mm::stack`). The only exception is early boot, which runs on
    Limine's stack (and #DF, NMI and #MC with it, no IST yet) until `kmain`
-   switches right after `mm::init`.
+   switches right after `mm::init`, and likewise each other CPU from
+   `smp::ap_entry` until `enter_kernel_space` (its IST stacks are already
+   allocated).
 5. **A real heap with working `free`**, plus in-kernel fragmentation and reuse
    tests.
 6. **Exception handling comes first.** GDT/IDT setup is the first thing
@@ -123,8 +125,9 @@ own PR that updates that doc first.
 - `kernel/src/main.rs`: boot sequence. `boot.rs`: the Limine requests.
   `cmdline.rs`: kernel command line (flags and `key=value`, e.g.
   `lumen.log=debug`). `sync.rs`: `SpinLock` (interrupts off while held).
-  `arch/x86_64/`: GDT/TSS, IDT, entry
-  stubs and the vector map, `irq.rs` (nested interrupt disable), local and
+  `smp.rs`: starting the other CPUs, `run_on`.
+  `arch/x86_64/`: GDT/TSS (per CPU), IDT, entry
+  stubs and the vector map, `percpu.rs` (GS base, CPU index), `irq.rs` (nested interrupt disable), local and
   I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
   reporter. `ktest.rs`: test runner. `kmon.rs`: serial debug monitor (until
   the M2 shell). `fb.rs`:
