@@ -126,7 +126,8 @@ own PR that updates that doc first.
   holds their registry (backtraces, overflow reports).
   `mm/paging.rs`: the kernel's page tables (HHDM, W^X image, map/unmap,
   MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
-  PAT. `trace.rs`: trace ring, event kinds, `ktrace!`.
+  PAT. `trace.rs`: trace ring, event kinds, `ktrace!`. `acpi.rs`: ACPI
+  discovery (CPUs, LAPIC, I/O APICs, HPET) and the firmware-table reader.
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
 - `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, the
   page-table format and mapper (host-tested, incl. a model comparison), the
@@ -135,6 +136,8 @@ own PR that updates that doc first.
 - `crates/lumen-heap`: heap allocator logic (address-ordered free list,
   coalescing; host-tested, incl. a randomized stress test against a shadow map).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads).
+- `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET
+  (host-tested on handcrafted tables).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
   are built), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
   `crash.py` (crash-report parsing).

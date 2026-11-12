@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -54,16 +54,17 @@ def artifacts(request: pytest.FixtureRequest) -> Iterator[Path]:
 
 
 @pytest.fixture
-def boot(artifacts: Path) -> Iterator[Callable[[str], Machine]]:
-    """`boot("qemutest")` -> a started Machine (closed automatically)."""
+def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
+    """`boot("qemutest")` -> a started Machine (closed automatically).
+    `extra` is appended to QEMU's command line, e.g. `extra=["-smp", "2"]`."""
     machines: list[Machine] = []
 
-    def _boot(variant: str = "qemutest") -> Machine:
+    def _boot(variant: str = "qemutest", *, extra: Sequence[str] = ()) -> Machine:
         iso = ISOS[variant]
         if not iso.exists():
             pytest.fail(f"{iso} not found; run `make iso` first")
         sub = artifacts if not machines else artifacts / f"run{len(machines)}"
-        m = Machine(iso, sub, trace_interrupts=True).start()
+        m = Machine(iso, sub, trace_interrupts=True, extra_args=extra).start()
         machines.append(m)
         return m
 
@@ -78,13 +79,17 @@ def golden_dir() -> Path:
 
 
 @pytest.fixture
-def crash_report(boot: Callable[[str], Machine]) -> Callable[[str], str]:
+def crash_report(boot: Callable[..., Machine]) -> Callable[..., str]:
     """`crash_report("pf")` boots, runs `crash pf` in kmon, checks QEMU exits
-    with the crash code, and returns the report (both markers included)."""
+    with the crash code, and returns the report (both markers included).
+    `at_prompt(m)`, if given, runs at the kmon prompt first (and must leave
+    kmon at a prompt), e.g. to read the heap before the crash."""
 
-    def _crash(kind: str) -> str:
+    def _crash(kind: str, *, at_prompt: Callable[[Machine], None] | None = None) -> str:
         m = boot("qemutest")
         m.expect(r"kmon> ", 60)
+        if at_prompt:
+            at_prompt(m)
         m.send_line(f"crash {kind}")
         # A deliberate protection fault that doesn't fault says so at once.
         done = m.expect(rf"{re.escape(END)}|{PROTECTION_BROKEN}", 30)

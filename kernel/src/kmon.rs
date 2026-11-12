@@ -230,7 +230,8 @@ fn alloc_or_die(layout: core::alloc::Layout) -> *mut u8 {
 /// Free a block twice after its lower neighbour was freed (so it merged into
 /// the neighbour's free block): the heap must refuse the second free (a
 /// panic), not corrupt its free list. A 128-byte block stays live, so the
-/// report's heap line has something in use.
+/// report shows one more block in use than at the prompt
+/// (`test_double_free_is_refused` checks it).
 #[inline(never)]
 fn crash_double_free() {
     use core::hint::black_box;

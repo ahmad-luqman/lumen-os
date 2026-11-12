@@ -1,0 +1,29 @@
+# Features: acpi. See tests/features/README.md for the format.
+
+[[feature]]
+name = "ACPI tables: RSDP, XSDT/RSDT, MADT (CPUs, LAPIC, I/O APICs, overrides) and HPET parsed and checked; CPU count matches QEMU's -smp; missing tables are warnings"
+milestone = "M1"
+tests = [
+    "cargo:lumen-acpi",
+    "ktest:lumen_kernel::acpi::madt_lists_boot_cpu",
+    "ktest:lumen_kernel::acpi::info_copies_what_q35_describes",
+    "ktest:lumen_kernel::acpi::a_failed_walk_says_why",
+    "ktest:lumen_kernel::acpi::discovery_keeps_nothing_it_does_not_return",
+    "ktest:lumen_kernel::acpi::only_enabled_cpus_are_ready",
+    "scenario:test_acpi::test_cpu_count_matches_qemu[*]",
+    "scenario:test_acpi::test_no_hpet_is_a_warning",
+    "scenario:test_acpi::test_no_madt_boots_without_acpi",
+    "harness:test_qemu::test_machine_appends_extra_args_last",
+]
+
+[[feature]]
+name = "ACPI tables are read only from firmware memory (mapped uncached) or usable memory reserved for them; pointers into memory that holds something else are refused"
+milestone = "M1"
+tests = [
+    "ktest:lumen_kernel::acpi::tables_outside_the_hhdm_are_mapped_uncached_once",
+    "ktest:lumen_kernel::acpi::tables_in_usable_memory_are_reserved_or_refused",
+    "ktest:lumen_kernel::acpi::memory_that_holds_something_else_is_refused",
+    "ktest:lumen_kernel::acpi::hhdm_covers_checks_every_page",
+    "ktest:lumen_kernel::mm::frame::reserve_takes_free_frames_and_refuses_the_rest",
+    "ktest:lumen_kernel::mm::frame::the_rsdp_is_reserved_as_an_acpi_table",
+]

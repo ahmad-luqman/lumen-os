@@ -53,7 +53,7 @@ pub static EXECUTABLE_ADDRESS: ExecutableAddressRequest = ExecutableAddressReque
 #[unsafe(link_section = ".limine_requests")]
 pub static CMDLINE: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
 
-/// ACPI root pointer (reserved by the frame allocator; parsed in #2).
+/// ACPI root pointer (reserved by the frame allocator; parsed by `acpi::init`).
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 pub static RSDP: RsdpRequest = RsdpRequest::new();
