@@ -181,7 +181,10 @@ class FakeQemu:
 
 class FakeClock:
     """Stands in for `time` and the machine's condition variable in expect(): the
-    clock moves only when expect() waits, by exactly as long as it asks."""
+    clock moves only when expect() waits, by exactly as long as it asks. Past an
+    hour it raises, so a wait that never ends fails the test instead of hanging it."""
+
+    LIMIT = 3600.0
 
     def __init__(self):
         self.now = 0.0
@@ -191,6 +194,8 @@ class FakeClock:
 
     def wait(self, timeout: float) -> bool:
         self.now += timeout
+        if self.now > self.LIMIT:
+            raise AssertionError(f"still waiting after {self.LIMIT:g}s (fake time)")
         return False
 
     def __enter__(self) -> Self:
@@ -248,6 +253,9 @@ def test_a_scale_that_overflows_a_wait_is_rejected(tmp_path, monkeypatch, call):
     # Finite, so it passes timeout_scale(), but 30 x 1e307 is inf: that wait would
     # never time out.
     m = hung_machine(tmp_path, monkeypatch, "1e307")
+    clock = FakeClock()
+    monkeypatch.setattr(qemu, "time", clock)
+    m._cond = clock  # type: ignore[assignment]
     wait = (lambda: m.expect("never", 30)) if call == "expect" else (lambda: m.wait_exit(30))
     with pytest.raises(ValueError, match=re.escape("LUMEN_TIMEOUT_SCALE=1e+307 makes a 30s")):
         wait()
