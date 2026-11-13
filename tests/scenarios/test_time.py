@@ -17,7 +17,7 @@ TSC_LINE = re.compile(
 TICKS = re.compile(r"ticks: (\d+) \(spurious (\d+), unexpected (\d+), local APIC errors (\d+)\)\n")
 CLOCKS = re.compile(
     r"clocks: tsc (\d+) Hz \(against the (hpet|pit) at boot\); "
-    r"pit (?:(\d+) Hz|none); hpet (?:(\d+) Hz|none)\n"
+    r"pit (?:(\d+) Hz|none|failed \((.*)\)); hpet (?:(\d+) Hz|none|failed \((.*)\))\n"
 )
 
 
@@ -50,11 +50,19 @@ def clocks_and_windows(m) -> tuple[tuple[int, str, int | None, int | None], dict
     c = m.expect(CLOCKS, 30)
     w = m.expect(r"clocks: windows:(.*)\n", 30)
     m.expect(r"kmon> ")
-    pit, hpet = (None if g is None else int(g) for g in c.group(3, 4))
-    calibrations = {
-        name: Calibration(int(hz), windows, int(retook))
-        for name, hz, windows, retook in WINDOWS_SEGMENT.findall(w[1])
-    }
+    for name, reason in (("pit", c[4]), ("hpet", c[6])):
+        assert reason is None, f"measuring against the {name} failed: {reason}"
+    pit, hpet = (None if g is None else int(g) for g in c.group(3, 5))
+    # Every segment must be a whole calibration; findall alone would skip a
+    # malformed one.
+    segments = [seg.strip() for seg in w[1].split(";")]
+    calibrations = {}
+    for seg in segments:
+        found = WINDOWS_SEGMENT.fullmatch(seg)
+        assert found, f"not a calibration: {seg!r} in {w[0]!r}"
+        name, hz, windows, retook = found.groups()
+        assert name not in calibrations, f"{name} twice in {w[0]!r}"
+        calibrations[name] = Calibration(int(hz), windows, int(retook))
     return (int(c[1]), c[2], pit, hpet), calibrations
 
 
@@ -66,16 +74,29 @@ def assert_close(a: int, b: int) -> None:
 def check_calibration(cal: Calibration, reference_hz: int) -> None:
     """The frequency is exactly what the kernel computes from the windows:
     the median of five, each steady (the gaps at its start and end add up to
-    at most 0.5% of it), with at most MOST_RETAKEN taken again."""
+    at most 0.5% of it) and so within 1% of the median (a steady window is off
+    by at most its gaps), with at most MOST_RETAKEN taken again."""
     hz = []
     for w in cal.windows.split():
-        tsc, ref, polls, start_gap, end_gap = (int(x) for x in w.split("/"))
+        fields = w.split("/")
+        assert len(fields) == 5, f"not tsc/reference/polls/start_gap/end_gap: {w}"
+        tsc, ref, polls, start_gap, end_gap = (int(x) for x in fields)
         assert ref > 0 and polls > 0, w
         assert (start_gap + end_gap) * 200 <= tsc, f"not steady: {w}"
         hz.append(tsc * reference_hz // ref)
     assert len(hz) == 5, cal
     assert sorted(hz)[2] == cal.hz, cal
+    for one in hz:
+        assert abs(one - cal.hz) * 100 <= cal.hz, (
+            f"a window {one} Hz, the median {cal.hz} Hz: {cal}"
+        )
     assert cal.retook <= MOST_RETAKEN, cal
+
+
+def check_retake_line(m, cal: Calibration) -> None:
+    """Boot logs how many windows it took again exactly when it took any."""
+    line = f"INFO  time: tsc calibration took {cal.retook} windows again"
+    assert (line in m.output) == (cal.retook > 0), (cal.retook, line)
 
 
 def ticks(m) -> tuple[int, int, int, int]:
@@ -107,6 +128,7 @@ def test_clocks_shows_the_windows_behind_each_measurement(boot):
     check_calibration(cals["boot"], HPET_HZ)
     check_calibration(cals["pit"], PIT_HZ)
     check_calibration(cals["hpet"], HPET_HZ)
+    check_retake_line(m, cals["boot"])
 
 
 def test_timer_interrupts_counted(boot):
@@ -120,8 +142,8 @@ def test_timer_interrupts_counted(boot):
     after, *strays = ticks(m)
     # Up to 100 at 1 kHz. A smoke test that interrupts arrive (the rate is
     # checked in-kernel against the HPET): QEMU's TCG delivers only some of a
-    # busy-waiting guest's ticks, as few as 28% in test_no_madt's 50 ms under
-    # a loaded host (#45).
+    # busy-waiting guest's ticks, as few as 18% (9 in test_no_madt's 50 ms) in
+    # #45's stress runs.
     assert after - before >= 1, (before, after)
     assert strays == [0, 0, 0]
     assert "WARN  irq" not in m.output

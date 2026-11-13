@@ -8,7 +8,7 @@ tests = [
     "ktest:lumen_kernel::time::tsc_calibrated_within_tolerance",
     "ktest:lumen_kernel::time::a_late_look_at_the_pit_doesnt_stretch_its_window",
     "ktest:lumen_kernel::time::a_late_start_reading_doesnt_shift_a_pit_window",
-    "ktest:lumen_kernel::time::a_paused_pit_start_reading_is_not_steady",
+    "ktest:lumen_kernel::time::a_paused_pit_reading_is_not_steady",
     "ktest:lumen_kernel::time::calibration_gives_up_when_no_window_is_steady",
     "ktest:lumen_kernel::time::a_pit_end_read_after_it_could_wrap_is_not_steady",
     "ktest:lumen_kernel::time::a_paused_pit_reading_is_taken_again",

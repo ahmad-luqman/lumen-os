@@ -13,7 +13,14 @@ fails if all listed CPUs are counted.
 import re
 
 import pytest
-from test_time import PIT_HZ, assert_close, check_calibration, clocks_and_windows, ticks
+from test_time import (
+    PIT_HZ,
+    assert_close,
+    check_calibration,
+    check_retake_line,
+    clocks_and_windows,
+    ticks,
+)
 
 BOOT_TIMEOUT = 60
 ACPI_LINE = re.compile(
@@ -58,11 +65,13 @@ def test_no_hpet_is_a_warning(boot):
     assert pit is not None
     assert_close(tsc, pit)
     # Both calibrations' windows are steady and give exactly what they say
-    # (this is the boot that came out 11.8% high under KVM before #45).
+    # (the configuration whose boot calibration came out 11.8% high under KVM
+    # in CI, #45).
     assert sorted(cals) == ["boot", "pit"]
     assert (cals["boot"].hz, cals["pit"].hz) == (tsc, pit)
     check_calibration(cals["boot"], PIT_HZ)
     check_calibration(cals["pit"], PIT_HZ)
+    check_retake_line(m, cals["boot"])
 
 
 def test_no_madt_boots_without_acpi(boot):
@@ -85,7 +94,7 @@ def test_no_madt_boots_without_acpi(boot):
     after, *strays = ticks(m)
     # Up to 50 at 1 kHz; this checks it ticks at all (the rate is checked
     # in-kernel). QEMU's TCG delivers only some of a busy-waiting guest's
-    # ticks: 14 to 49 here under a loaded host (#45).
+    # ticks: as few as 9 and up to 49 here in #45's stress runs.
     assert after - before >= 1, (before, after)
     assert strays == [0, 0, 0]
     assert not ACPI_LINE.search(m.output)

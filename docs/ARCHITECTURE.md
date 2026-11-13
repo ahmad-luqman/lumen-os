@@ -527,7 +527,7 @@ interrupt handler is allowed to allocate (none does yet).
   in service is EOI'd there). Of device interrupts, only that last kind is
   traced: at 1 kHz the timer would flood the ring. kmon `ticks` shows the
   counts, and boot warns if no tick arrives within 100 ms (it waits 10 ms,
-  then up to 90 ms more while none has come).
+  then up to 90 ms more while none has come, and logs a late one at info).
 - **Interrupt state:** interrupts are off through boot and turned on once
   the controllers and the timer are set up. Every gate is an interrupt gate
   (handlers run with interrupts off). `SpinLock` keeps them off while held
@@ -543,14 +543,17 @@ interrupt handler is allowed to allocate (none does yet).
   starts and ends with a reading of the reference's counter between two TSC
   reads; the PIT's counter runs on past its end, so a vCPU paused while
   waiting for the end doesn't stretch the window (a yes/no "has it run out"
-  did, by up to 12% under KVM, #45). The PIT's start is read too: QEMU's
-  counts from when it is programmed, not from the gate. A window whose start
+  did: one CI boot under KVM calibrated 11.8% high, #45). The PIT's start is read too: QEMU's
+  counts from when it is programmed, not from the gate (measured under TCG). A window whose start
   or end reading was itself paused (the gaps between the TSC reads around
-  them add up to more than 0.5% of the window) is set aside and another
-  taken, up to 20 for five; boot logs how many if any. A PIT read-back that
+  them add up to more than 0.5% of the window), or, for the PIT, whose end
+  was read too late to place, is set aside and another taken, up to 20 for
+  five; boot logs how many if any, and the last. A PIT read-back that
   can't fit how it was programmed is an error. The local APIC timer (divide
   by 16) is calibrated against the TSC as the median of five 10 ms windows
-  too (no retakes: the TSC is read directly), and set periodic at 1 kHz. `time::now_ns` (TSC-based, lock-free) and
+  too (no retakes: each end reads the timer's count next to the TSC, so a
+  late look doesn't stretch it, but a pause between those two reads isn't
+  detected), and set periodic at 1 kHz. `time::now_ns` (TSC-based, lock-free) and
   `time::sleep` (busy-wait until the scheduler, M2). kmon has `ticks`,
   `sleep <ms>`, `uptime`, and `clocks` (the TSC measured again against the
   PIT and the HPET, which the tests compare with the boot calibration: a
@@ -561,11 +564,13 @@ interrupt handler is allowed to allocate (none does yet).
   `tsc/reference/polls/start_gap/end_gap`; a failed or missing measurement
   is left out. Under QEMU's TCG a
   busy-waiting guest gets only some of its ticks (late periodic timers skip
-  periods): about 80% alone, as few as 28% on a loaded host. Tests check the
-  timer's rate by its count register against the HPET, only check that ticks
-  arrive (at least one, none stray), and never assert on host time. Every
-  calibration poll is bounded: an HPET that doesn't count or calibrates
-  implausibly is warned about (with why) and the PIT used; a PIT whose
+  periods): about 80% alone, as few as 18% with many VMs running in parallel.
+  Tests check the timer's rate by its count register against the HPET, check
+  only that ticks arrive (at least one, none stray; the ktest also caps them
+  at 150 per 100 ms), and never assert on host time. Every
+  calibration poll is bounded: an HPET that doesn't count, calibrates
+  implausibly or has no five steady windows in 20 is warned about (with why)
+  and the PIT used; a PIT whose
   output doesn't go low when programmed, or high again within 2^32 TSC
   ticks (over 4 s at 1 GHz), counts as missing; calibration results outside
   10 MHz to 100 GHz are rejected.

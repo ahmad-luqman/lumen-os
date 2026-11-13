@@ -1,5 +1,5 @@
-//! The PIT's channel 2, polled: a known-length delay for calibrating the TSC
-//! when there is no HPET. (Channel 2 drives the PC speaker; its gate and
+//! The PIT's channel 2, polled: a counted window for calibrating the TSC
+//! without an HPET, and for cross-checking it. (Channel 2 drives the PC speaker; its gate and
 //! output are in port 0x61, so it needs no interrupt.)
 
 use super::cpu::rdtsc;
@@ -19,13 +19,14 @@ const OUT: u8 = 1 << 5;
 /// before the PIT counts as missing: the longest count is 55 ms.
 const BOUND_TSC: u64 = 1 << 32;
 
-/// Latch channel 2's counter and read it, between two TSC reads (`latched`
-/// runs in between, just before the second).
+/// Latch channel 2's counter and read it, between two TSC reads; `pause` is
+/// called with `before` after the first and with `after` before the second.
 ///
 /// # Safety
 /// Channel 2 must be programmed for lobyte/hibyte access.
-unsafe fn read(latched: impl FnOnce()) -> PitReading {
+unsafe fn read(pause: &mut impl FnMut(Pause), before: Pause, after: Pause) -> PitReading {
     let tsc_before = rdtsc();
+    pause(before);
     // SAFETY: the latch command and two reads of channel 2's count, as the
     // caller programmed it; nothing else is touched.
     let count = unsafe {
@@ -33,7 +34,7 @@ unsafe fn read(latched: impl FnOnce()) -> PitReading {
         let lo = inb(CHANNEL2);
         u16::from_le_bytes([lo, inb(CHANNEL2)])
     };
-    latched();
+    pause(after);
     PitReading { count, tsc_before, tsc_after: rdtsc() }
 }
 
@@ -46,14 +47,14 @@ unsafe fn read(latched: impl FnOnce()) -> PitReading {
 /// go low when programmed (a missing PIT's ports read all ones), or didn't go
 /// high again within [`BOUND_TSC`] TSC ticks.
 pub fn wait(count: u16, mut pause: impl FnMut(Pause)) -> Option<PitWait> {
-    // SAFETY: programs channel 2 only (mode 0, one-shot, lobyte/hibyte) with
-    // the speaker disconnected, and reads it back (`read` needs that lobyte/
-    // hibyte access); channel 0 and the speaker are left alone.
+    // SAFETY: programs channel 2 only (mode 0, one-shot, lobyte/hibyte) and
+    // reads it back (`read` needs that lobyte/hibyte access); channel 0 is
+    // left alone, and the speaker stays disconnected.
     unsafe {
         let ctl = inb(SPEAKER) & !(GATE | SPEAKER_ON);
         // Gate low. A real 8254 holds the count until the gate goes high;
-        // QEMU's (and KVM's) counts on in mode 0, so the start is read, not
-        // assumed.
+        // QEMU's counts on in mode 0 (measured under TCG, #45; KVM's wasn't
+        // measured), so the start is read, not assumed.
         outb(SPEAKER, ctl);
         outb(COMMAND, 0b1011_0000); // channel 2, lobyte/hibyte, mode 0, binary
         outb(CHANNEL2, count as u8);
@@ -62,14 +63,14 @@ pub fn wait(count: u16, mut pause: impl FnMut(Pause)) -> Option<PitWait> {
         let waited = if inb(SPEAKER) & OUT == 0 {
             outb(SPEAKER, ctl | GATE); // gate high: count down
             pause(Pause::Started);
-            let start = read(|| pause(Pause::StartReading));
+            let start = read(&mut pause, Pause::StartBeforeRead, Pause::StartAfterRead);
             let (mut polls, mut last_running_tsc) = (0, start.tsc_after);
             loop {
                 polls += 1;
                 let t = rdtsc();
                 if inb(SPEAKER) & OUT != 0 {
                     pause(Pause::Ended);
-                    let end = read(|| pause(Pause::EndReading));
+                    let end = read(&mut pause, Pause::EndBeforeRead, Pause::EndAfterRead);
                     break Some(PitWait { start, end, last_running_tsc, polls });
                 }
                 last_running_tsc = t;
