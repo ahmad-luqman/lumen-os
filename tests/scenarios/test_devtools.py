@@ -12,6 +12,7 @@ import time
 
 import pytest
 from lumen_harness import BUILD_DIR, REPO_ROOT
+from lumen_harness.__main__ import gdb_binary
 
 ENV = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "tools/harness"))
 
@@ -53,9 +54,7 @@ def test_make_run_serial_console():
             proc.kill()
 
 
-@pytest.mark.skipif(
-    shutil.which(os.environ.get("LUMEN_GDB", "gdb")) is None, reason="gdb not installed"
-)
+@pytest.mark.skipif(shutil.which(gdb_binary()) is None, reason="gdb not installed")
 def test_make_debug_stops_at_kmain():
     """`debug` boots paused under gdb, and a hardware breakpoint on kmain is hit."""
     # Uses the fixed gdb port 1234: do not run two of these at once.

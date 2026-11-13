@@ -1,4 +1,5 @@
-"""QEMU command-line construction, and what each run records about its environment."""
+"""QEMU and gdb command-line construction, the harness's environment overrides,
+and what each run records about its environment."""
 
 import os
 import subprocess
@@ -6,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from lumen_harness import qemu
+from lumen_harness.__main__ import gdb_binary, gdb_command
 from lumen_harness.qemu import (
     Machine,
     QemuOptions,
@@ -13,6 +15,7 @@ from lumen_harness.qemu import (
     ovmf_version,
     qemu_args,
     qemu_version,
+    timeout_scale,
 )
 
 
@@ -114,6 +117,34 @@ def test_empty_overrides_mean_unset(monkeypatch):
     monkeypatch.setenv("LUMEN_OVMF_VARS", "")
     assert qemu_args(opts())[0] == "qemu-system-x86_64"
     assert ovmf_vars_template() == qemu.BUILD_DIR / "deps/ovmf/OVMF_VARS.fd"
+    # A set value is still used.
+    monkeypatch.setenv("LUMEN_QEMU", "/opt/qemu/bin/qemu-system-x86_64")
+    monkeypatch.setenv("LUMEN_OVMF_VARS", "/elsewhere/VARS.fd")
+    assert qemu_args(opts())[0] == "/opt/qemu/bin/qemu-system-x86_64"
+    assert ovmf_vars_template() == Path("/elsewhere/VARS.fd")
+
+
+def test_empty_sock_dir_means_unset(tmp_path, monkeypatch):
+    monkeypatch.setenv("LUMEN_SOCK_DIR", "")
+    assert Machine(Path("x.iso"), tmp_path).qmp_path.parent == Path("/tmp")
+    monkeypatch.setenv("LUMEN_SOCK_DIR", str(tmp_path))  # a set value is still used
+    assert Machine(Path("x.iso"), tmp_path).qmp_path.parent == tmp_path
+
+
+def test_empty_timeout_scale_means_unset(monkeypatch):
+    monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", "")
+    assert timeout_scale() == 1.0
+    monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", "2.5")  # a set value is still used
+    assert timeout_scale() == 2.5
+
+
+def test_empty_gdb_means_unset(monkeypatch):
+    monkeypatch.setenv("LUMEN_GDB", "")
+    assert gdb_binary() == "gdb"
+    monkeypatch.setenv("LUMEN_GDB", "x86_64-elf-gdb")  # a set value is still used
+    assert gdb_binary() == "x86_64-elf-gdb"
+    # `make debug` goes through it (and test_devtools' skip check calls it).
+    assert gdb_command(Path("kernel"), batch=False)[0] == "x86_64-elf-gdb"
 
 
 def test_ovmf_version_comes_from_the_fetch_stamp(tmp_path, monkeypatch):

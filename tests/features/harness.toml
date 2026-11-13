@@ -61,8 +61,17 @@ tests = [
     "harness:test_qemu::test_qemu_version_says_why_it_is_unknown",
     "harness:test_qemu::test_qemu_version_retries_after_a_failure",
     "harness:test_qemu::test_qemu_version_survives_a_timeout",
-    "harness:test_qemu::test_empty_overrides_mean_unset",
     "harness:test_qemu::test_ovmf_version_comes_from_the_fetch_stamp",
+]
+
+[[feature]]
+name = "Harness overrides (LUMEN_QEMU, LUMEN_OVMF_VARS, LUMEN_SOCK_DIR, LUMEN_TIMEOUT_SCALE, LUMEN_GDB): an empty value means unset, a set one is used"
+milestone = "M1"
+tests = [
+    "harness:test_qemu::test_empty_overrides_mean_unset",
+    "harness:test_qemu::test_empty_sock_dir_means_unset",
+    "harness:test_qemu::test_empty_timeout_scale_means_unset",
+    "harness:test_qemu::test_empty_gdb_means_unset",
 ]
 
 [[feature]]
