@@ -28,7 +28,7 @@ is listed only in [STATUS.md](STATUS.md), which is generated from tests.
 | Decision | Choice | Why | Alternatives considered |
 |---|---|---|---|
 | Language | Rust, **stable only**, pinned in `rust-toolchain.toml` (1.99.1) | Memory safety removes whole bug classes, which matters with many agents writing kernel code in parallel. Stable-only means the build still works next year. | C17 with strict warnings and sanitizers in host tests: simpler interop and faster builds, but it relies on reviewer discipline for memory safety. Nightly Rust: `x86-interrupt` ABI and custom test frameworks, but it breaks over time. |
-| Target | x86-64 UEFI, QEMU `q35` + OVMF, virtio devices first | Closest to a modern laptop; virtio is simple and well documented. | BIOS (legacy), ARM64 first (M10 port instead). |
+| Target | x86-64 UEFI, QEMU `q35` + OVMF, virtio devices first | Closest to a modern laptop; virtio is simple and well documented. | BIOS (legacy), ARM64 first (M13 port instead). |
 | Bootloader | Limine 12.x (pinned binary release + sha256), `limine` crate **0.5.0** | Memory map, framebuffer, higher-half direct map, and our own ELF file for symbolization, with no loader to write. Crate 0.6.x requires nightly (`#![feature(ptr_metadata)]`), so we use 0.5.0 (base revision 3). | Custom UEFI loader (optional learning milestone), GRUB/multiboot2. |
 | Kernel shape | **Modular monolith** with message-shaped internal interfaces; capabilities enforced at the syscall boundary | One address space keeps early milestones fast and debuggable. Agent safety needs capability checks between *processes*, which a monolith enforces just as well. Drivers and services expose request/response interfaces, so any of them can move to user space later. | Microkernel: stronger isolation of drivers, but it puts IPC performance and many extra servers in front of every milestone. |
 | Test harness | Python (`uv`, pytest) on the host; TAP from the kernel | Fast to write scenarios, mature tooling, and QMP/PIL are easy to use. | Rust `xtask`: one language, but slower iteration on test scripts. |
@@ -57,6 +57,11 @@ is listed only in [STATUS.md](STATUS.md), which is generated from tests.
  └──────────────────────────────────────────────────────────────────────┘
    * starts in-kernel; the interface allows moving it out later
 ```
+
+This is the target. To reach a usable system sooner, everything above the
+boundary (the shell, the GUI, WASM apps, the network stack and the Claude
+service) runs in the kernel on kernel threads until M9 adds user mode; see
+[ROADMAP.md](ROADMAP.md#how-this-roadmap-is-ordered).
 
 Module boundaries inside the kernel are enforced by Rust visibility. Code
 outside `arch/` may only use what `arch/mod.rs` re-exports (the HAL surface).
@@ -100,7 +105,8 @@ tests (for example `lumen-elf`, the symbol-table reader).
    online (`INFO  smp: 4 CPUs online`); the framebuffer hello screen, then
    `boot complete`, then the boot timeline (below).
 7. Either the in-kernel test runner (`--features ktest`) or the kernel monitor
-   (`kmon`, a serial debug console that the user-mode shell replaces in M2).
+   (`kmon`, a serial debug console that the shell replaces in M2; the shell
+   runs in the kernel until it moves to user mode in M9).
 
 ### Boot timeline and log timestamps (built in M1)
 
@@ -239,7 +245,7 @@ Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 
 | Range | Use | Status |
 |---|---|---|
-| `0x0000_0000_0000_0000 – 0x0000_7fff_ffff_ffff` | empty in the kernel's tables (null guard); user space, per process, from M2 (except the first 64 KiB) | built (empty) |
+| `0x0000_0000_0000_0000 – 0x0000_7fff_ffff_ffff` | empty in the kernel's tables (null guard); user space, per process, from M9 (except the first 64 KiB) | built (empty) |
 | `0xffff_8000_0000_0000 – +phys size` | higher-half direct map (HHDM) of RAM: usable, bootloader-reclaimable, kernel-and-modules and framebuffer entries; NX, RW- except kernel-and-modules (R--), framebuffer write-combining | built |
 | `0xffff_c000_0000_0000 – 0xffff_c0ff_ffff_ffff` | kernel heap (grows up by mapping frames, to 1 GiB below the top; the top GiB holds a ktest scratch page) | built |
 | `0xffff_d000_0000_0000 – 0xffff_d0ff_ffff_ffff` | kernel stacks: 64 KiB (the main stack 128 KiB), **unmapped guard page below every stack**; the top GiB holds a ktest page | built |
@@ -404,7 +410,7 @@ takes no locks; a table outside HHDM-mapped RAM ends the walk instead of
 being read, and if the walk itself faults the report still ends properly.
 
 The kernel's upper-half entries are not yet shared with anything; processes
-(M2) will need the kernel's L4 entries 256-511 copied into every address
+(M9) will need the kernel's L4 entries 256-511 copied into every address
 space, so new kernel L3 tables must be allocated up front then.
 
 ### Kernel stacks (built in M1)
@@ -612,7 +618,7 @@ interrupt handler is allowed to allocate (none does yet).
 - A fault during the report prints one line and halts, with no recursion. With
   `lumen.qemu_exit` the kernel exits QEMU with status 37; otherwise it halts.
 - Planned: "Explain this crash with Claude" in the GUI, which sends the same
-  report text with the user's consent (M7).
+  report text with the user's consent (M8).
 
 ## 7. Driver interface (planned, M3+)
 
@@ -640,9 +646,14 @@ pub struct BlockRequest { pub op: BlockOp, pub lba: u64, pub buf: DmaBuffer }
 - Device classes: `BlockDevice`, `NetDevice` (send/receive frames), `InputDevice`
   (event stream), `Display` (framebuffer + flush rectangles), `Console`.
 - **virtio first** (blk, net, input, gpu, console) under QEMU; real-hardware
-  drivers (NVMe, AHCI, xHCI HID, a common NIC) in M9 behind the same traits.
+  drivers (NVMe, AHCI, xHCI HID, a common NIC) in M12 behind the same traits.
 
-## 8. Processes, syscalls and capabilities (planned, M2)
+## 8. Processes, syscalls and capabilities (planned, M9)
+
+Until M9, apps are WASM modules running in the kernel (M5), and the
+capabilities below are enforced at the WASM host interface: an app holds
+only the handles the kernel passes it. M9 adds ring 3 and the syscall ABI
+below for native programs.
 
 ### Capabilities
 
@@ -703,7 +714,7 @@ Numbers are reserved in ranges per subsystem so parallel work does not
 collide. A user runtime crate (`lumen-rt`) wraps these. A minimal libc is
 optional and comes later, only if ports need it.
 
-## 9. Storage: VFS, LumenFS and snapshots (planned, M3)
+## 9. Storage: VFS, LumenFS and snapshots (planned: VFS and RAMFS M6, LumenFS M10)
 
 - **VFS:** mount table plus per-process `Dir` capabilities (there is no global
   root namespace in a process; the shell receives a home `Dir`). The trait
@@ -741,9 +752,9 @@ pub trait FileSystem: Send + Sync {
   snapshot for that session's `Dir` subtree. "Undo all" restores the session's
   start. The file manager browses snapshots read-only.
 - **Persistence test:** write, sync, kill QEMU, reboot against the same disk
-  image, and verify (M3 exit criterion).
+  image, and verify (M6 exit criterion with the RAMFS image, M10 with LumenFS).
 
-## 10. IPC (planned, M2)
+## 10. IPC (planned, M9)
 
 - **Channels:** bidirectional message queues created in pairs. A message is up
   to 64 KiB of bytes plus up to 16 handles (moved, not copied).
@@ -757,7 +768,7 @@ pub trait FileSystem: Send + Sync {
 - **Notifications:** a lightweight `event` object (signal and wait) for IRQs
   delivered to user-space drivers and for UI wakeups.
 
-## 11. GUI and the automation API (planned, M5)
+## 11. GUI and the automation API (planned, M4)
 
 - **Compositor service** owns the display (`Display` driver). Clients draw into
   shared-memory surfaces and submit damage rectangles. It handles window
@@ -787,7 +798,7 @@ pub struct AutomationNode {
   screenshots plus tree assertions together make UI tests robust.
 - **X-ray mode** is an app (and an overlay) that reads the `Trace` capability.
 
-## 12. The Claude service (planned, M7)
+## 12. The Claude service (planned, M8)
 
 - **Keychain service:** holds the API key, which is entered at setup and stored
   encrypted on disk. It is never in source, logs, crash reports or agent

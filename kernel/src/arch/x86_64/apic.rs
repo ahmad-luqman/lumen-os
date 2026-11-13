@@ -292,7 +292,7 @@ impl IoApic {
 /// `dest`, fixed delivery, physical destination, with the ISA override's
 /// polarity and trigger `flags` (MADT INTI flags: bits 0-1 polarity, 2-3
 /// trigger; 0 = the bus's default, edge/active-high for ISA), `masked` or not.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: device drivers (M3)
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: the keyboard (M2)
 pub fn redirection(vector: u8, dest: u8, flags: u16, masked: bool) -> u64 {
     let active_low = flags & 0b11 == 0b11;
     let level = (flags >> 2) & 0b11 == 0b11;
