@@ -69,10 +69,13 @@ jobs:
       # tests/scenarios and re-runs every scenario, --lfnf or not. --lfnf=none:
       # if pytest recorded no failure at all (an ISO build error, a killed
       # run), re-run nothing, where the default re-runs everything.
-      # Separate artifact root and junit file: the KVM run's evidence must
-      # survive. Its own timeout: a job timeout would skip the upload below.
-      # A scenario failing again (exit 1) or nothing to re-run (5) is expected;
-      # anything else is a broken re-run, flagged but not fatal.
+      # A separate artifact root, so the KVM run's evidence survives, and its own
+      # junit file, so the upload shows how the re-run went. Its own timeout,
+      # so a long re-run fails this step rather than the job (a job timeout
+      # would skip the upload below). Every outcome is annotated, none fatal:
+      # passed under TCG (0: KVM-only or flaky), failed again (1; flagged if
+      # it was setup errors), nothing recorded to re-run (5), or a broken
+      # re-run (anything else).
       - name: Re-run failed scenarios under TCG for interrupt traces
         if: ${{ failure() && steps.scenarios.outcome == 'failure' }}
         timeout-minutes: 10
@@ -82,8 +85,11 @@ jobs:
             uv run --frozen pytest tests/scenarios --last-failed --lfnf=none -v \
             --junitxml=build/test-artifacts-tcg/scenarios.xml || rc=$?
           case $rc in
-            0|1) ;;
-            5) echo "::notice::pytest recorded no scenario failure: nothing re-run under TCG" ;;
+            0) echo "::notice::the scenarios that failed under KVM passed under TCG (KVM-only or flaky; passing tests keep no artifacts)" ;;
+            1) if grep -q 'errors="[1-9]' build/test-artifacts-tcg/scenarios.xml 2>/dev/null; then
+                 echo "::warning::the TCG re-run had setup errors, not only scenario failures (see its scenarios.xml)"
+               fi ;;
+            5) echo "::notice::pytest recorded no failure at all (the scenarios step failed outside pytest, or was killed): nothing re-run under TCG" ;;
             *) echo "::warning::TCG re-run broke (pytest exit $rc)" ;;
           esac
 
