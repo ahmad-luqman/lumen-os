@@ -133,11 +133,12 @@ fn dispatch(line: &str) {
             let _ = match k.status {
                 Some(Ok(route)) => writeln!(
                     out,
-                    "kbd: layout {}, IRQ {} (vector {:#x}), {} interrupts, {} bytes dropped, {} undecoded, {} line errors",
+                    "kbd: layout {}, IRQ {} (vector {:#x}), {} interrupts, {} bytes, {} dropped, {} undecoded, {} line errors",
                     k.layout,
                     route.irq(),
                     route.vector(),
                     k.irqs,
+                    k.bytes,
                     k.dropped,
                     k.undecoded,
                     k.line_errors

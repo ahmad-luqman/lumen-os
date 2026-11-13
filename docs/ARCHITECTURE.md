@@ -743,7 +743,8 @@ off. A wake from another CPU queues the thread there and sends the
   Redirection entries are a typed `apic::RedirectionEntry` (vector,
   delivery mode, destination mode, polarity, trigger, mask, destination;
   the I/O APIC's read-only remote IRR and delivery status are never
-  written), changed by read-modify-write (`IoApic::update_entry`).
+  written: not tested, QEMU ignores such writes), changed by
+  read-modify-write (`IoApic::update_entry`).
 - **8042 init** (boot CPU, after the framebuffer; IRQ 1 routed first; every
   reply polled with a deadline, 100 ms, 1 s for the keyboard's reset): with
   the controller's IRQs off and port 1's clock off, both ports are
@@ -758,10 +759,11 @@ off. A wake from another CPU queues the thread there and sends the
   boot) is skipped, up to 32 times. Then port 1's clock goes on with its
   IRQ bit, the input is unmasked and the output buffer drained once: a
   byte that was already waiting raised IRQ 1's edge while the input was
-  masked, which the I/O APIC doesn't keep. A missing controller or
-  keyboard is a warning (`no PS/2 keyboard: ...`, naming the command that
-  failed), not a failure (not tested; the no-ACPI boot's routing failure
-  is). The init runs between the framebuffer and `complete` on the boot
+  masked, which the I/O APIC doesn't keep (a ktest has the 8042 put a byte
+  in its buffer while the input is masked, as commands 0xd2 and 0xd3 do
+  for each port). A missing controller (tested with QEMU's `i8042=off`),
+  keyboard (not tested) or I/O APIC (the no-ACPI boot) is a warning (`no
+  PS/2 keyboard: ...`, naming the command that failed), not a failure. The init runs between the framebuffer and `complete` on the boot
   timeline, so its time counts toward `complete` (up to 100 ms with no
   controller, about a second with no keyboard).
 - **Bytes and decoding:** the IRQ handler (boot CPU, interrupts off) moves

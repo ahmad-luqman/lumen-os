@@ -199,15 +199,16 @@ fn scratch_input(io: &IoApic) -> Result<u32, &'static str> {
 
 crate::ktest!(
     fn controllers_are_masked() {
-        // Every I/O APIC input but the routed ones (the keyboard's, and any
-        // a ktest routed).
+        // Every I/O APIC input but the keyboard's (the routing ktests leave
+        // theirs masked).
         use crate::{kassert, kassert_eq};
         kassert_eq!(pic::masks(), 0xffff);
+        let keyboard = crate::keyboard::route().map(Route::gsi);
         let mut io_apics = IO_APICS.lock();
         kassert!(!io_apics.is_empty());
         for io in io_apics.iter_mut() {
             for i in 0..io.regs.entries() {
-                kassert!(io.is_routed(i) || io.regs.entry(i).masked());
+                kassert!(Some(io.gsi_base + i) == keyboard || io.regs.entry(i).masked());
             }
         }
         kassert!(apic::lapic_ready());
@@ -310,7 +311,7 @@ crate::ktest!(
         // ISA IRQ 0 (the PIT) is overridden to GSI 2 on QEMU's q35: routed
         // there, masked, on vector IOAPIC_BASE + 2 to this CPU; routing it
         // again, or the keyboard's IRQ 1, is refused. (It stays routed and
-        // masked: nothing unmasks it.)
+        // masked for the rest of the run: nothing unmasks it.)
         use crate::{kassert, kassert_eq};
         fn nothing() {}
         let route = route_isa_irq(0, nothing).map_err(|e| {
@@ -327,14 +328,26 @@ crate::ktest!(
         kassert_eq!((entry.vector(), u32::from(entry.destination())), (route.vector, apic::lapic_id()));
         kassert_eq!(route_isa_irq(0, nothing), Err(RouteError::Taken(2)));
         kassert_eq!(route_isa_irq(1, nothing), Err(RouteError::Taken(1)));
+        // IRQ 9 (ACPI's SCI) is overridden level triggered, active high
+        // (flags 0b1101): the override's polarity and trigger reach the
+        // entry. (It stays routed and masked too.)
+        use crate::arch::apic::{Polarity, Trigger};
+        let sci = route_isa_irq(9, nothing).map_err(|_| "routing IRQ 9 failed")?;
+        let entry = {
+            let mut io_apics = IO_APICS.lock();
+            let (io, input) = find_input(&mut io_apics, sci.gsi).ok_or("no input for IRQ 9")?;
+            io.regs.entry(input)
+        };
+        kassert_eq!((entry.trigger(), entry.polarity(), entry.masked()), (Trigger::Level, Polarity::ActiveHigh, true));
         Ok(())
     }
 );
 
 crate::ktest!(
     fn device_vectors_are_not_fatal() {
-        // A vector nothing handles, or an 8259 line other than IRQ 7 and 15,
-        // is counted as unexpected (and warned about once); the spurious
+        // A vector nothing handles (an unused one, an I/O APIC vector with
+        // no handler), or an 8259 line other than IRQ 7 and 15, is counted
+        // as unexpected (and warned about once); the spurious
         // vectors (the local APIC's, the 8259s' IRQ 7 and 15) only counted;
         // a local APIC error counted and logged. All return.
         use crate::arch::idt;
@@ -345,7 +358,9 @@ crate::ktest!(
         unsafe {
             core::arch::asm!(
                 "int {unused}", "int {unused}", "int {spurious}", "int {pic7}", "int {pic15}", "int {error}", "int {pic1}",
+                "int {ioapic}",
                 unused = const idt::UNUSED,
+                ioapic = const idt::IOAPIC_LAST,
                 spurious = const idt::SPURIOUS,
                 pic7 = const idt::PIC_SPURIOUS_MASTER,
                 pic15 = const idt::PIC_SPURIOUS_SLAVE,
@@ -354,7 +369,7 @@ crate::ktest!(
             );
         }
         let after = idt::strays();
-        kassert_eq!(after.unexpected, before.unexpected + 3);
+        kassert_eq!(after.unexpected, before.unexpected + 4);
         kassert_eq!(after.spurious, before.spurious + 3);
         kassert_eq!(after.lapic_errors, before.lapic_errors + 1);
         Ok(())

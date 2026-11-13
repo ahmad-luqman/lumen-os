@@ -70,6 +70,8 @@ static DECODER: SpinLock<Option<(Decoder, &'static str)>> = SpinLock::new(None);
 static STATUS: SpinLock<Option<Result<Route, InitError>>> = SpinLock::new(None);
 /// Keyboard interrupts taken.
 static IRQS: AtomicU64 = AtomicU64::new(0);
+/// Bytes put on the queue.
+static BYTES: AtomicU64 = AtomicU64::new(0);
 /// Bytes the controller flagged with a parity or timeout error (discarded).
 static LINE_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Bytes the decoder refused (the keyboard's own overrun code 0xff among
@@ -198,12 +200,23 @@ fn start() -> Result<Route, InitError> {
     let route = interrupts::route_isa_irq(1, on_irq).map_err(InitError::Route)?;
     let config = set_up_controller()?;
     controller_command_with(WRITE_CONFIG, (config & !PORT1_CLOCK_OFF) | PORT1_IRQ)?;
+    enable(route);
+    Ok(route)
+}
+
+/// Unmask IRQ 1's input, then drain the output buffer: a byte that arrived
+/// before the input was unmasked raised IRQ 1's edge while it was masked,
+/// and is still waiting (and holds the line high: no new edge would come).
+fn enable(route: Route) {
     interrupts::set_masked(route, false);
-    // A byte that arrived before the input was unmasked raised IRQ 1's edge
-    // while it was masked, and is still waiting.
     let _off = arch::irq::push_off();
     drain();
-    Ok(route)
+}
+
+/// IRQ 1's route, once [`init`] has set the keyboard up.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests
+pub fn route() -> Option<Route> {
+    STATUS.lock().and_then(Result::ok)
 }
 
 /// Wait until `ready(status)` or `ns` pass; whether it did (looked at once
@@ -367,8 +380,8 @@ fn drain() {
         let byte = i8042::read_data();
         if status & i8042::LINE_ERROR != 0 {
             LINE_ERRORS.fetch_add(1, Ordering::Relaxed);
-        } else if status & i8042::FROM_PORT2 == 0 {
-            let _ = QUEUE.push(byte); // a full queue counts it (`dropped`)
+        } else if status & i8042::FROM_PORT2 == 0 && QUEUE.push(byte) {
+            BYTES.fetch_add(1, Ordering::Relaxed); // (a full queue counts it: `dropped`)
         }
     }
 }
@@ -408,6 +421,8 @@ pub struct Stats {
     /// How [`init`] went (`None` before it).
     pub status: Option<Result<Route, InitError>>,
     pub irqs: u64,
+    /// Bytes put on the queue.
+    pub bytes: u64,
     /// Bytes dropped because the queue was full.
     pub dropped: u64,
     pub undecoded: u64,
@@ -419,6 +434,7 @@ pub fn stats() -> Stats {
         layout: DECODER.lock().as_ref().map_or("none", |d| d.1),
         status: *STATUS.lock(),
         irqs: IRQS.load(Ordering::Relaxed),
+        bytes: BYTES.load(Ordering::Relaxed),
         dropped: QUEUE.dropped(),
         undecoded: UNDECODED.load(Ordering::Relaxed),
         line_errors: LINE_ERRORS.load(Ordering::Relaxed),
@@ -478,6 +494,43 @@ crate::ktest!(
         kassert!(matches!(*STATUS.lock(), Some(Ok(_))));
         kassert!(matches!(interrupts::route_isa_irq(1, on_irq), Err(interrupts::RouteError::Taken(_))));
         kassert!(interrupts::is_unmasked_isa(1));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_byte_waiting_at_unmask_is_drained_and_port2_bytes_dropped() {
+        // The 8042 puts a byte of our choosing in its output buffer, as if
+        // from port 1 (command 0xd2) or port 2 (0xd3). One waiting while
+        // IRQ 1's input is masked raised no edge we kept: `enable` drains
+        // it, after which the next byte raises IRQ 1 (the line went low
+        // again). A byte from port 2 is read and dropped.
+        use crate::{kassert, kassert_eq};
+        let route = route().ok_or("no keyboard")?;
+        while QUEUE.pop().is_some() {} // (nothing else reads it in the ktests)
+        interrupts::set_masked(route, true);
+        controller_command_with(0xd2, 0x1e).map_err(|_| "writing the output buffer")?;
+        kassert!(wait(REPLY_NS, |s| s & i8042::OUTPUT_FULL != 0));
+        kassert_eq!(i8042::status() & i8042::FROM_PORT2, 0);
+        enable(route);
+        kassert_eq!(QUEUE.pop(), Some(0x1e));
+        let before = IRQS.load(Ordering::Relaxed);
+        controller_command_with(0xd2, 0x9e).map_err(|_| "writing the output buffer")?;
+        let deadline = time::now_ns() + REPLY_NS;
+        while IRQS.load(Ordering::Relaxed) == before && time::now_ns() < deadline {
+            core::hint::spin_loop();
+        }
+        kassert!(IRQS.load(Ordering::Relaxed) > before);
+        kassert_eq!(QUEUE.pop(), Some(0x9e));
+        {
+            let _off = arch::irq::push_off();
+            controller_command_with(0xd3, 0x42).map_err(|_| "writing the second port's buffer")?;
+            kassert!(wait(REPLY_NS, |s| s & i8042::OUTPUT_FULL != 0));
+            kassert!(i8042::status() & i8042::FROM_PORT2 != 0);
+            drain();
+            kassert_eq!(i8042::status() & i8042::OUTPUT_FULL, 0);
+        }
+        kassert_eq!(QUEUE.pop(), None);
         Ok(())
     }
 );

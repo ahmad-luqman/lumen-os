@@ -1,12 +1,16 @@
 # Features: input. See tests/features/README.md for the format.
 
 [[feature]]
-name = "PS/2 keyboard through the I/O APIC (IRQ 1): keys sent with QMP reach kmon, also after keys held during boot; without an I/O APIC it is skipped with a warning"
+name = "PS/2 keyboard through the I/O APIC (IRQ 1), pc-keyboard linked (audit passing): keys sent with QMP reach kmon (every printable character, backspace), also after keys held during boot; bytes waiting at unmask drained, port 2 dropped; without an I/O APIC or an 8042 it is skipped with a warning"
 milestone = "M2"
 tests = [
     "scenario:test_input::test_keys_via_qmp_send_key",
     "scenario:test_input::test_keys_held_during_boot_leave_a_working_keyboard",
     "scenario:test_acpi::test_no_madt_boots_without_acpi",
+    "scenario:test_input::test_every_printable_character_and_backspace",
+    "scenario:test_input::test_no_8042_is_a_warning",
+    "ktest:lumen_kernel::keyboard::a_byte_waiting_at_unmask_is_drained_and_port2_bytes_dropped",
+    "audit:flags",
     "ktest:lumen_kernel::keyboard::the_keyboard_is_routed_and_unmasked",
     "cargo:lumen-queue",
 ]
@@ -22,12 +26,13 @@ tests = [
 ]
 
 [[feature]]
-name = "Typed I/O APIC redirection entries (read-modify-write); ISA IRQs routed with the MADT's overrides"
+name = "Typed I/O APIC redirection entries (read-modify-write); ISA IRQs routed with the MADT's overrides (GSI, polarity, trigger); an I/O APIC vector without a handler is unexpected, not fatal"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::interrupts::redirection_entry_roundtrip",
     "ktest:lumen_kernel::interrupts::redirection_entries_encode_the_madt_flags",
     "ktest:lumen_kernel::interrupts::routing_takes_the_madt_override_and_refuses_twice",
+    "ktest:lumen_kernel::interrupts::device_vectors_are_not_fatal",
 ]
 
 [[feature]]
