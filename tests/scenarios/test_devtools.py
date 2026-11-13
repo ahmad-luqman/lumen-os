@@ -4,15 +4,15 @@ Not covered here: the QEMU window that `make run` opens (manual check).
 """
 
 import os
+import re
 import select
-import shutil
 import subprocess
 import sys
 import time
 
 import pytest
 from lumen_harness import BUILD_DIR, REPO_ROOT
-from lumen_harness.__main__ import gdb_binary
+from lumen_harness.__main__ import find_gdb
 
 ENV = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "tools/harness"))
 
@@ -54,14 +54,23 @@ def test_make_run_serial_console():
             proc.kill()
 
 
-@pytest.mark.skipif(shutil.which(gdb_binary()) is None, reason="gdb not installed")
 def test_make_debug_stops_at_kmain():
     """`debug` boots paused under gdb, and a hardware breakpoint on kmain is hit."""
-    # Uses the fixed gdb port 1234: do not run two of these at once.
+    # Checked here, not in a skipif: a LUMEN_GDB that can't be found raises, and
+    # fails this test rather than skipping it. (Raised at collection, it would
+    # error the whole module, and without xdist abort the whole run.) Without the
+    # override, gdb is optional.
+    if find_gdb() is None:
+        pytest.skip("gdb not installed")
+    # Uses the fixed gdb port 1234: do not run two of these at once. It merges
+    # stderr into the output, so a failing run (e.g. gdb timing out) shows why.
     out = subprocess.run(
         [sys.executable, "-m", "lumen_harness", "debug", "--batch",
          "--iso", str(BUILD_DIR / "lumen.iso"), "--kernel", str(BUILD_DIR / "lumen-kernel")],
-        check=False, capture_output=True, text=True, env=ENV, cwd=REPO_ROOT, timeout=180,
+        check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=ENV,
+        cwd=REPO_ROOT, timeout=180,
     ).stdout  # fmt: skip
     assert "#0  kmain () at kernel/src/main.rs" in out, out[-3000:]
-    assert "_start" in out, out[-3000:]
+    assert re.search(r"^#\d+\s.*\b_start\b", out, re.MULTILINE), out[
+        -3000:
+    ]  # a frame, not any text

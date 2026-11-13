@@ -5,13 +5,14 @@ import math
 import os
 import re
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Self
 
 import pytest
-from lumen_harness import qemu
-from lumen_harness.__main__ import gdb_binary, gdb_command
+from lumen_harness import REPO_ROOT, qemu
+from lumen_harness.__main__ import find_gdb, gdb_binary, gdb_command
 from lumen_harness.qemu import (
     ExpectTimeout,
     Machine,
@@ -332,8 +333,127 @@ def test_empty_gdb_means_unset(monkeypatch):
     assert gdb_binary() == "gdb"
     monkeypatch.setenv("LUMEN_GDB", "x86_64-elf-gdb")  # a set value is still used
     assert gdb_binary() == "x86_64-elf-gdb"
-    # `make debug` goes through it (and test_devtools' skip check calls it).
+    # `make debug` goes through it (as does find_gdb, which test_devtools' check uses).
     assert gdb_command(Path("kernel"), batch=False)[0] == "x86_64-elf-gdb"
+
+
+def only_on_path(tmp_path: Path, monkeypatch, *names: str) -> Path:
+    """Sets PATH to a new directory, `tmp_path`/bin, holding executables `names`
+    (and nothing else, so the host's own gdb is out of sight); returns it."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name in names:
+        fake_qemu(bindir, "exit 0", name)
+    monkeypatch.setenv("PATH", str(bindir))
+    return bindir
+
+
+@pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
+def test_find_gdb_without_gdb_or_an_override_is_none(tmp_path, monkeypatch, value):
+    # gdb is optional: make debug's scenario skips as "gdb not installed".
+    if value is None:
+        monkeypatch.delenv("LUMEN_GDB", raising=False)
+    else:
+        monkeypatch.setenv("LUMEN_GDB", value)  # empty is unset
+    bindir = only_on_path(tmp_path, monkeypatch)
+    assert find_gdb() is None
+    fake_qemu(bindir, "exit 0", "gdb")
+    assert find_gdb() == str(bindir / "gdb")  # and with gdb, that one
+
+
+@pytest.mark.parametrize(
+    ("on_path", "value", "found"),
+    [
+        (["gdb", "x86_64-elf-gdb"], "x86_64-elf-gdb", "{tmp}/bin/x86_64-elf-gdb"),
+        (["x86_64-elf-gdb"], "x86_64-elf-gdb", "{tmp}/bin/x86_64-elf-gdb"),
+        ([], "{tmp}/my-gdb", "{tmp}/my-gdb"),
+    ],
+    ids=["name", "name-alone", "path"],
+)
+def test_find_gdb_uses_an_override_that_is_found(tmp_path, monkeypatch, on_path, value, found):
+    # A name wins over a plain `gdb` on PATH and doesn't need one (e.g. a Mac with
+    # only x86_64-elf-gdb). A path off PATH works too, also without a plain `gdb`.
+    only_on_path(tmp_path, monkeypatch, *on_path)
+    fake_qemu(tmp_path, "exit 0", "my-gdb")  # off PATH
+    monkeypatch.setenv("LUMEN_GDB", value.format(tmp=tmp_path))
+    assert find_gdb() == found.format(tmp=tmp_path)
+
+
+def not_found(value: str) -> str:
+    """A regex for exactly find_gdb's message about LUMEN_GDB=`value`, nothing
+    before or after it."""
+    message = f"LUMEN_GDB={value!r} not found or not executable (give a name on PATH or a path)"
+    return f"^{re.escape(message)}$"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("{tmp}/nowhere/gdb", id="missing-path"),
+        pytest.param("x86_64-elf-gdb", id="missing-name"),
+        pytest.param(" ", id="blank"),
+        pytest.param(" gdb ", id="padded"),
+        pytest.param("{tmp}", id="directory"),
+        pytest.param("{tmp}/plain", id="not-executable"),
+    ],
+)
+def test_find_gdb_raises_on_an_override_that_isnt_found(tmp_path, monkeypatch, value):
+    # A plain `gdb` is on PATH: a bad override must not fall back to it silently.
+    only_on_path(tmp_path, monkeypatch, "gdb")
+    (tmp_path / "plain").write_text("")  # a file, but not executable
+    value = value.format(tmp=tmp_path)
+    monkeypatch.setenv("LUMEN_GDB", value)
+    with pytest.raises(ValueError, match=not_found(value)):
+        find_gdb()
+
+
+def test_find_gdb_raises_on_an_explicit_gdb_that_isnt_found(tmp_path, monkeypatch):
+    # LUMEN_GDB=gdb is still set: no gdb at all fails, it doesn't skip.
+    only_on_path(tmp_path, monkeypatch)
+    monkeypatch.setenv("LUMEN_GDB", "gdb")
+    with pytest.raises(ValueError, match=not_found("gdb")):
+        find_gdb()
+
+
+def run_debug_scenario(tmp_path: Path, lumen_gdb: str | None) -> tuple[str, str]:
+    """make debug's scenario in a pytest of its own; returns its whole output and
+    its last line (pytest's summary, e.g. `1 failed in 0.01s`).
+
+    No gdb is on PATH, and "QEMU" exits at once, so nothing boots even if the
+    check is bypassed. No PYTEST_* or LUMEN_* variables are inherited: LUMEN_GDB is
+    `lumen_gdb`, or unset when that is None. No cache, so its deliberate failure
+    never reaches the repo's lastfailed (which CI's --last-failed re-run reads);
+    -rs prints the skip reason whatever pyproject's addopts say; PY_COLORS=0 keeps
+    colour codes out of the summary."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTEST_", "LUMEN_"))}
+    env["PATH"] = str(empty)
+    env["PY_COLORS"] = "0"
+    env["LUMEN_QEMU"] = str(fake_qemu(tmp_path, "exit 0"))
+    if lumen_gdb is not None:
+        env["LUMEN_GDB"] = lumen_gdb
+    node = "tests/scenarios/test_devtools.py::test_make_debug_stops_at_kmain"
+    run = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider", "-p", "no:xdist",
+         node],
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120, check=False,
+    )  # fmt: skip
+    return run.stdout + run.stderr, run.stdout.strip().splitlines()[-1]
+
+
+def test_the_debug_scenario_fails_on_a_lumen_gdb_that_isnt_found(tmp_path):
+    # Failing, not skipping: the override was set on purpose, a skip is easy to
+    # miss locally (pytest still exits 0), and the fix is the variable, not gdb.
+    out, summary = run_debug_scenario(tmp_path, "/nonexistent/gdb")
+    assert re.fullmatch(r"1 failed in [\d.]+s", summary), out  # failed; not skipped, no error
+    assert "ValueError: LUMEN_GDB='/nonexistent/gdb' not found" in out, out
+
+
+def test_the_debug_scenario_skips_without_gdb(tmp_path):
+    out, summary = run_debug_scenario(tmp_path, None)
+    assert re.fullmatch(r"1 skipped in [\d.]+s", summary), out
+    assert "gdb not installed" in out, out
 
 
 def test_ovmf_version_comes_from_the_fetch_stamp(tmp_path, monkeypatch):

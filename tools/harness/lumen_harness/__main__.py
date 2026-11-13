@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +31,24 @@ def cmd_run(a: argparse.Namespace) -> int:
 def gdb_binary() -> str:
     """The gdb to run (override: LUMEN_GDB; unset or empty: `gdb`)."""
     return os.environ.get("LUMEN_GDB") or "gdb"
+
+
+def find_gdb() -> str | None:
+    """The gdb `make debug` would run (make debug's scenario checks with this;
+    cmd_debug itself doesn't), resolved with `shutil.which` as subprocess finds it:
+    a name on PATH, or a path (a relative one from the current directory; `make`
+    runs from the repo root). None when LUMEN_GDB is unset or empty and there is no
+    `gdb`: gdb is optional. A set LUMEN_GDB that can't be found raises ValueError
+    naming it: someone asked for that gdb, so it's a setting to fix, not a missing
+    tool (and not an OSError, which a missing QEMU binary or OVMF variable store
+    raises)."""
+    gdb = gdb_binary()
+    found = shutil.which(gdb)
+    if found is None and os.environ.get("LUMEN_GDB"):
+        raise ValueError(
+            f"LUMEN_GDB={gdb!r} not found or not executable (give a name on PATH or a path)"
+        )
+    return found
 
 
 def gdb_command(kernel: Path, batch: bool) -> list[str]:
