@@ -1,8 +1,10 @@
 //! Timekeeping: the TSC's frequency, calibrated at boot against the HPET (or
-//! the PIT if there is none, or it doesn't work), [`now_ns`] and [`sleep`]
-//! from it, and the local APIC timer ticking at [`TICK_HZ`], calibrated
-//! against the TSC. It also holds the boot's origin ([`mark_boot`]), which
-//! the boot timeline and the log's timestamps ([`since_boot_ns`]) count from.
+//! the PIT if there is none, or it doesn't work), [`now_ns`], [`sleep`] and
+//! [`spin`] from it, and the local APIC timer ticking at [`TICK_HZ`],
+//! calibrated against the TSC (on the boot CPU; each other CPU starts its
+//! own with the same count, [`start_timer_here`]). It also holds the boot's
+//! origin ([`mark_boot`]), which the boot timeline and the log's timestamps
+//! ([`since_boot_ns`]) count from.
 //!
 //! Calibration polls with interrupts off and takes the median of several
 //! 10 ms windows. Each TSC calibration window starts and ends with a reading of
@@ -14,7 +16,7 @@
 //! handlers and the crash path may call them).
 
 use core::fmt;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use log::{info, warn};
 use lumen_mm::PhysAddr;
@@ -43,6 +45,10 @@ static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 /// The local APIC timer's input frequency, after its divider (0 until
 /// [`init`]).
 static LAPIC_TIMER_HZ: AtomicU64 = AtomicU64::new(0);
+/// The local APIC timer's initial count for [`TICK_HZ`], published once the
+/// boot CPU's timer runs (0 before): the other CPUs start theirs with it
+/// (every local APIC counts the same bus clock).
+static TIMER_COUNT: AtomicU32 = AtomicU32::new(0);
 /// What the TSC was calibrated against: 0 not yet, else a [`Reference`].
 static REFERENCE: AtomicU8 = AtomicU8::new(0);
 /// The TSC when `kmain` began: the boot timeline's and the log's origin (0
@@ -421,6 +427,11 @@ pub fn init() {
         .unwrap_or_else(|| panic!("the local APIC timer, at {}, can't tick at {}", Hz(timer_hz), Hz(TICK_HZ)));
     LAPIC_TIMER_HZ.store(timer_hz, Ordering::Relaxed);
     apic::timer_periodic(count);
+    // An AP that misses this checked it before the store, so it was online
+    // already (`smp` marks it with an `xchg`, a full fence on x86, as is this
+    // SeqCst store) when `sched::init` later looks, and is woken to check
+    // again; one that comes online after that look checks after the store.
+    TIMER_COUNT.store(count, Ordering::SeqCst);
     info!(
         target: "time",
         "local APIC timer {} (bus {} / {}), ticking at {}",
@@ -429,6 +440,24 @@ pub fn init() {
         apic::TIMER_DIVISOR,
         Hz(TICK_HZ)
     );
+}
+
+/// Start this CPU's local APIC timer at [`TICK_HZ`] with the boot CPU's
+/// calibrated count, if [`init`] has published it; whether it did. For the
+/// other CPUs (`sched`, from each one's idle loop); interrupts off.
+pub fn start_timer_here() -> bool {
+    match TIMER_COUNT.load(Ordering::SeqCst) {
+        0 => false,
+        count => {
+            apic::timer_periodic(count);
+            true
+        }
+    }
+}
+
+/// Whether [`start_timer_here`] would start the timer.
+pub fn timer_published() -> bool {
+    TIMER_COUNT.load(Ordering::SeqCst) != 0
 }
 
 /// The TSC as a [`Clock`], once calibrated.
@@ -471,10 +500,24 @@ pub fn now_ns() -> u64 {
     tsc().map_or(0, |c| c.ns(arch::rdtsc()))
 }
 
-/// Wait at least `ns` nanoseconds (busy: the scheduler comes in M2).
-/// Panics before [`init`].
+/// Wait at least `ns` nanoseconds. A thread blocks (`sched::sleep`: the CPU
+/// runs other threads or halts meanwhile) where it can; this busy-waits
+/// ([`spin`]) where it can't: before the scheduler runs on this CPU, on its
+/// idle thread, with interrupts off or inside a critical section (a held
+/// lock). Panics before [`init`].
 pub fn sleep(ns: u64) {
-    let tsc = tsc().expect("time::sleep before time::init");
+    if !crate::sched::sleep(ns) {
+        spin(ns);
+    }
+}
+
+/// Busy-wait at least `ns` nanoseconds without yielding or blocking (the
+/// timer still preempts it if another thread is ready on this CPU): for
+/// [`sleep`] where a thread can't block, and for tests that must not switch
+/// threads (the calibration ktests' pauses among them). Panics before
+/// [`init`].
+pub fn spin(ns: u64) {
+    let tsc = tsc().expect("time::spin before time::init");
     let start = arch::rdtsc();
     let ticks = tsc.ticks(ns);
     while arch::rdtsc().wrapping_sub(start) < ticks {
@@ -482,7 +525,7 @@ pub fn sleep(ns: u64) {
     }
 }
 
-/// Local APIC timer interrupts so far. Lock-free.
+/// The boot CPU's local APIC timer interrupts so far. Lock-free.
 pub fn ticks() -> u64 {
     idt::ticks()
 }
@@ -500,13 +543,13 @@ pub fn wait_for_tick(seen: u64, ns: u64) -> bool {
     ticks() != seen
 }
 
-/// A window pause for the ktests: sleeps `ns` at `at`, as a host descheduling
+/// A window pause for the ktests: spins `ns` at `at`, as a host descheduling
 /// the vCPU there would.
 #[cfg(feature = "ktest")]
 fn sleep_at(at: Pause, ns: u64) -> impl FnMut(Pause) {
     move |p| {
         if p == at {
-            sleep(ns)
+            spin(ns)
         }
     }
 }
@@ -747,13 +790,13 @@ crate::ktest!(
 
 crate::ktest!(
     fn now_ns_follows_the_hpet() {
-        // `now_ns` is the TSC converted; across a 50 ms sleep it moves as
+        // `now_ns` is the TSC converted; across a 50 ms spin it moves as
         // far as the HPET says, within 2% (a 1 ms budget: a host stall on one
         // reading doesn't fail it).
         use crate::kassert;
         let hpet = hpet().ok_or("no HPET")?;
         let (n0, h0) = (now_ns(), hpet.now());
-        sleep(50_000_000);
+        spin(50_000_000);
         let (n1, h1) = (now_ns(), hpet.now());
         let by_hpet = hpet.clock().ns(hpet.since(h0, h1));
         crate::ktest::diag(format_args!("now_ns moved {} ns, the HPET {by_hpet} ns", n1 - n0));
@@ -844,9 +887,10 @@ crate::ktest!(
         // Interrupts arrive on the timer's vector, and not much faster than
         // 1 kHz (100 in 100 ms; the bound, 150, leaves room). The rate itself
         // is checked by `the_timer_is_programmed_for_1_khz` (against the
-        // HPET): QEMU's TCG delivers only some of a busy-waiting guest's ticks,
-        // 29 to 81 in #45's stress runs, and a lock held across a period merges
-        // them.
+        // HPET): QEMU's TCG delivers ticks late (late periodic timers skip
+        // periods): 29 to 81 in #45's stress runs (busy-waiting then; the
+        // sleep now halts in the idle thread), and a lock held across a
+        // period merges them.
         use crate::kassert;
         kassert!(arch::irq::enabled());
         let t0 = ticks();
@@ -882,9 +926,11 @@ crate::ktest!(
     fn timer_ticks_are_not_traced() {
         // At 1 kHz they would flood the trace ring.
         use crate::{kassert, kassert_eq};
+        // Spinning, not sleeping: switching to the idle thread and back is
+        // traced.
         let ring = crate::trace::ring();
         let (t0, w0) = (ticks(), ring.written());
-        sleep(20_000_000);
+        spin(20_000_000);
         kassert!(ticks() > t0);
         kassert_eq!(ring.written(), w0);
         Ok(())

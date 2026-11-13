@@ -93,8 +93,8 @@ def test_no_madt_boots_without_acpi(boot):
     m.expect(r"kmon> ")
     after, *strays = ticks(m)
     # Up to 50 at 1 kHz; this checks it ticks at all (the rate is checked
-    # in-kernel). QEMU's TCG delivers only some of a busy-waiting guest's
-    # ticks: as few as 9 and up to 49 here in #45's stress runs.
+    # in-kernel). QEMU's TCG delivers ticks late: as few as 9 and up to 49
+    # here in #45's stress runs (busy-waiting then; the sleep now halts).
     assert after - before >= 1, (before, after)
     assert strays == [0, 0, 0]
     assert not ACPI_LINE.search(m.output)

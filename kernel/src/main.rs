@@ -15,9 +15,10 @@
 //!    continues in `kmain_on_kernel_stack`.
 //! 5. ACPI tables (CPUs, interrupt controllers, HPET), the interrupt
 //!    controllers (8259s masked, local APIC on, I/O APIC inputs masked), the
-//!    TSC and local APIC timer calibrated, interrupts on; then the
-//!    framebuffer, `boot complete` and the boot timeline, then either the
-//!    in-kernel tests (`--features ktest`) or the kernel monitor.
+//!    TSC and local APIC timer calibrated, interrupts on, the scheduler
+//!    started on every CPU (`kmain`'s context becomes the `main` thread);
+//!    then the framebuffer, `boot complete` and the boot timeline, then
+//!    either the in-kernel tests (`--features ktest`) or the kernel monitor.
 
 #![no_std]
 #![no_main]
@@ -36,6 +37,7 @@ mod klog;
 mod kmon;
 mod ktest;
 mod mm;
+mod sched;
 mod smp;
 mod symbols;
 mod sync;
@@ -176,6 +178,7 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     }
     ktrace!(Kind::BootPhase, BootPhase::Time);
     smp::wait_online(started);
+    sched::init();
     ktrace!(Kind::BootPhase, BootPhase::Smp);
     match boot::FRAMEBUFFER.get_response().and_then(|r| r.framebuffers().next()) {
         Some(fb) => match fb::init(&fb) {

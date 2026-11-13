@@ -141,9 +141,9 @@ def test_timer_interrupts_counted(boot):
     m.expect(r"kmon> ")
     after, *strays = ticks(m)
     # Up to 100 at 1 kHz. A smoke test that interrupts arrive (the rate is
-    # checked in-kernel against the HPET): QEMU's TCG delivers only some of a
-    # busy-waiting guest's ticks, as few as 18% (9 in test_no_madt's 50 ms) in
-    # #45's stress runs.
+    # checked in-kernel against the HPET): QEMU's TCG delivers ticks late, as
+    # few as 18% (9 in test_no_madt's 50 ms) in #45's stress runs (kmon's
+    # sleep busy-waited then; it now halts in the idle thread).
     assert after - before >= 1, (before, after)
     assert strays == [0, 0, 0]
     assert "WARN  irq" not in m.output

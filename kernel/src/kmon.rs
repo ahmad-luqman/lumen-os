@@ -30,7 +30,9 @@ fn read_line(buf: &mut [u8]) -> usize {
     let mut len = 0;
     loop {
         let Some(b) = serial::try_read_byte() else {
-            core::hint::spin_loop();
+            // Polled (no serial interrupt yet): let other threads on this
+            // CPU run.
+            crate::sched::yield_now();
             continue;
         };
         match b {
@@ -62,10 +64,10 @@ fn dispatch(line: &str) {
                 out,
                 "commands:\n  help              this list\n  echo <text>       print text\n  \
                  int3              take a breakpoint and continue\n  \
-                 crash <kind> [cpu] deliberate fault (on that CPU): {CRASH_KINDS}\n  \
+                 crash <kind> [cpu|thread]\n                    deliberate fault (on that CPU, or in a new thread): {CRASH_KINDS}\n  \
                  trace [n]         the boot CPU's last n trace events (default 16)\n  \
                  heap              heap usage and free-list summary\n  \
-                 ticks             timer interrupts taken (and stray ones)\n  \
+                 ticks             the boot CPU's timer interrupts (and stray ones)\n  \
                  sleep <ms>        wait that long (guest time)\n  \
                  uptime            nanoseconds since the TSC started\n  \
                  clocks            the TSC's frequency, measured again against each clock\n  \
@@ -175,8 +177,9 @@ fn trace(n: u64) {
     let _ = writeln!(out, "trace: {} events claimed, {} dropped", ring.written(), ring.dropped());
 }
 
-/// `crash <kind> [cpu]`: run the fault here, or on another online CPU (from
-/// its idle loop; its crash report then stops this one).
+/// `crash <kind> [cpu|thread]`: run the fault here, on another online CPU
+/// (from its idle thread; its crash report then stops this one), or in a new
+/// thread on this CPU (named `kmon-crash`), which kmon waits for.
 fn crash(args: &str) {
     let mut out = serial::SerialWriter;
     let mut words = args.split_whitespace();
@@ -185,12 +188,21 @@ fn crash(args: &str) {
         let _ = writeln!(out, "crash: unknown kind '{kind}' ({CRASH_KINDS})");
         return;
     };
-    let cpu = words.next().map(str::parse::<usize>);
+    let target = words.next();
     if words.next().is_some() {
-        let _ = writeln!(out, "crash: usage: crash <kind> [cpu]");
+        let _ = writeln!(out, "crash: usage: crash <kind> [cpu|thread]");
         return;
     }
-    match cpu {
+    if target == Some("thread") {
+        match crate::sched::spawn("kmon-crash", fault) {
+            Ok(handle) => handle.join(),
+            Err(e) => {
+                let _ = writeln!(out, "crash: no thread: {e}");
+            }
+        }
+        return;
+    }
+    match target.map(str::parse::<usize>) {
         None | Some(Ok(0)) => fault(),
         Some(Ok(cpu)) => {
             if let Err(e) = crate::smp::run_on(cpu, fault) {
@@ -198,7 +210,7 @@ fn crash(args: &str) {
             }
         }
         Some(Err(_)) => {
-            let _ = writeln!(out, "crash: the cpu is a number (0: this one)");
+            let _ = writeln!(out, "crash: the cpu is a number (0: this one) or 'thread'");
         }
     }
 }
@@ -366,12 +378,13 @@ fn crash_corrupt_heap() {
     let _ = writeln!(serial::SerialWriter, "crash: a corrupt free list went unnoticed");
 }
 
-/// Write into the guard page below this CPU's main stack from a healthy stack: a
+/// Write into the guard page below the stack this runs on (this CPU's main
+/// stack, or with `crash guard thread` the thread's) from a healthy stack: a
 /// plain #PF (nothing overflowed), which the report names as a stray guard
 /// page hit, not an overflow.
 #[inline(never)]
 fn crash_touch_guard() {
-    // This CPU's main stack: the one it runs on.
+    // The stack it runs on.
     let Some(main) = arch::stacks::stack_of(arch::read_rsp()) else {
         let _ = writeln!(serial::SerialWriter, "crash: not on a registered stack");
         return;

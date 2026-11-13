@@ -100,6 +100,26 @@ pub fn enable() {
     sti();
 }
 
+/// Turn interrupts off outside every critical section, and say whether they
+/// were on (for [`restore`]). For the scheduler, which switches threads only
+/// with interrupts off and no section open: a section's depth belongs to the
+/// CPU, so one held across a switch would be closed by another thread.
+pub fn disable() -> bool {
+    assert_eq!(depth(), 0, "disabling interrupts for a thread switch inside a critical section");
+    let were_on = enabled();
+    cli();
+    were_on
+}
+
+/// Turn interrupts back on if they `were_on` before [`disable`] (and
+/// [`disable_for_good`] hasn't run), outside every critical section.
+pub fn restore(were_on: bool) {
+    assert_eq!(depth(), 0, "restoring interrupts inside a critical section");
+    if were_on && !FOR_GOOD.load(Ordering::Relaxed) {
+        sti();
+    }
+}
+
 /// Unless `ready()`, wait for an interrupt with interrupts on. `ready` runs
 /// with interrupts off, then `sti; hlt`: `sti` holds interrupts off until
 /// after the next instruction, so the CPU is already in `hlt` when a pending
