@@ -28,8 +28,10 @@ Failing scenarios keep `build/test-artifacts/<module>/<test>/` (e.g.
 accelerator, OVMF version) and screenshots. The interrupt
 trace (`-d int`) is only recorded under TCG: locally on macOS always, and in CI
 by re-running failed scenarios with `LUMEN_ACCEL=tcg` (CI runs KVM first,
-and keeps the re-run's artifacts apart in `build/test-artifacts-tcg/` via
-`LUMEN_ARTIFACTS_DIR`).
+and keeps the re-run's artifacts, and its `ktest.tap`, apart in
+`build/test-artifacts-tcg/` via `LUMEN_ARTIFACTS_DIR`; set on a first run, it
+leaves `build/test-results/ktest.tap` unwritten, so `make status` reports the
+ktests as not run).
 
 Prerequisites: rustup (the toolchain installs itself from
 `rust-toolchain.toml`), `qemu-system-x86_64`, `xorriso`, `uv`, `make`, `curl`, and `gdb` for `make debug`
