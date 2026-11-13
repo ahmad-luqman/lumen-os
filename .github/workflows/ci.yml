@@ -62,17 +62,30 @@ jobs:
         if: ${{ !cancelled() && steps.scenarios.outcome != 'skipped' }}
         run: make status-check
 
-      # KVM is fast but QEMU's `-d int` interrupt trace only works under TCG.
-      # Re-run the scenarios that failed under TCG so the uploaded artifacts
-      # include it; only when the scenarios step failed (another step's
-      # failure has no scenario to re-run), and none at all if pytest recorded
-      # no scenario failure (--lfnf=none: the default re-runs everything).
-      # Separate artifact root: the KVM run's evidence must survive the re-run.
+      # KVM is fast but QEMU's `-d int` interrupt trace only works under TCG:
+      # re-run the scenarios that failed under TCG so the uploaded artifacts
+      # include it. Only after a failed scenarios step: after another step's
+      # failure (a harness test, say), --last-failed sees that failure outside
+      # tests/scenarios and re-runs every scenario, --lfnf or not. --lfnf=none:
+      # if pytest recorded no failure at all (an ISO build error, a killed
+      # run), re-run nothing, where the default re-runs everything.
+      # Separate artifact root and junit file: the KVM run's evidence must
+      # survive. Its own timeout: a job timeout would skip the upload below.
+      # A scenario failing again (exit 1) or nothing to re-run (5) is expected;
+      # anything else is a broken re-run, flagged but not fatal.
       - name: Re-run failed scenarios under TCG for interrupt traces
         if: ${{ failure() && steps.scenarios.outcome == 'failure' }}
-        run: >-
-          LUMEN_ACCEL=tcg LUMEN_ARTIFACTS_DIR=build/test-artifacts-tcg
-          uv run --frozen pytest tests/scenarios --last-failed --lfnf=none -v || true
+        timeout-minutes: 10
+        run: |
+          rc=0
+          LUMEN_ACCEL=tcg LUMEN_ARTIFACTS_DIR=build/test-artifacts-tcg \
+            uv run --frozen pytest tests/scenarios --last-failed --lfnf=none -v \
+            --junitxml=build/test-artifacts-tcg/scenarios.xml || rc=$?
+          case $rc in
+            0|1) ;;
+            5) echo "::notice::pytest recorded no scenario failure: nothing re-run under TCG" ;;
+            *) echo "::warning::TCG re-run broke (pytest exit $rc)" ;;
+          esac
 
       - name: Upload test artifacts on failure
         if: failure()

@@ -83,8 +83,9 @@ tests = [
 ]
 
 [[feature]]
-name = "CI's TCG re-run step runs only when the scenarios step failed, and only the scenarios pytest recorded as failed (none if it recorded none)"
+name = "CI's TCG re-run step: only after a failed scenarios step, with --last-failed --lfnf=none (the pinned pytest then re-runs the recorded scenario failures, or nothing), into its own root, flagging a broken re-run"
 milestone = "M1"
 tests = [
     "harness:test_ci_config::test_tcg_rerun_only_reruns_failed_scenarios",
+    "harness:test_ci_config::test_last_failed_behaves_as_the_rerun_step_relies_on",
 ]
