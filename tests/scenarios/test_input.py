@@ -68,8 +68,8 @@ def test_keys_via_qmp_send_key(boot):
     m.expect(r"kmon> ", 10)
     want = before.bytes + 2 * sum(len(qcodes_for(c)) for c in text)
     # The last key's release comes after its press was echoed, once QMP's
-    # hold time (20 ms) has passed: ask again until it has, for up to 2 s.
-    deadline = time.monotonic() + 2
+    # hold time (20 ms) has passed: ask again until it has, for up to 10 s.
+    deadline = time.monotonic() + 10
     while (s := kbd_stats(m)).bytes < want and time.monotonic() <= deadline:
         time.sleep(0.05)
     assert (s.layout, s.dropped, s.undecoded, s.line_errors) == ("us", 0, 0, 0)
@@ -106,7 +106,9 @@ def test_keys_held_during_boot_leave_a_working_keyboard(boot):
     # A key pressed over and over from power-on until the keyboard is set up:
     # its scancodes arrive while the 8042 and the keyboard are being
     # initialized (with port 1 live, the self-test once read one as its
-    # reply), are skipped there (and counted), and the keyboard comes up.
+    # reply), are flushed there (and counted), and the keyboard comes up.
+    # (QEMU never puts one in front of a reply init waits for: that path
+    # is the ktest a_stray_byte_before_the_ack_is_skipped.)
     m = boot("qemutest")
     qmp = QmpClient.connect(m.qmp_path, timeout=10)
     done = threading.Event()

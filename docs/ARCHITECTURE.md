@@ -751,14 +751,17 @@ off. A wake from another CPU queues the thread there and sends the
   rewritten (both IRQs off, translation to scancode set 1 on, both clocks
   still off; the system flag as firmware left it), the self-test run
   (0x55), the configuration written again (some controllers reset it
-  there) and the buffer flushed again, port 1 tested, then enabled (its
-  clock on), scanning disabled, the keyboard reset (an ACK and 0xAA, in
-  either order; not resent), scanning disabled again, set 2 selected and
-  scanning enabled (each of these commands ACKed, resent at most twice on
-  0xFE: not tested, QEMU never asks). The controller's replies come while
-  port 1's clock is off; while waiting for one of the keyboard's, a byte
-  that isn't it (a key pressed during boot) is skipped and counted, up to
-  32 per reply, and so is a byte from port 2; a byte the controller flags
+  there; QEMU's doesn't) and the buffer flushed again, port 1 tested, then
+  enabled (its clock on), scanning disabled, the keyboard reset (an ACK and
+  0xAA, in either order, within 1 s; 0xFC or 0xFD fails it; not resent),
+  scanning disabled again, set 2 selected and scanning enabled (each of
+  these commands ACKed, resent at most twice on 0xFE). QEMU never sends the
+  reset's replies out of order or a failure, asks for a resend, or needs
+  scanning disabled around the reset, so those branches are not tested.
+  The controller's replies come while port 1's clock is off; while waiting
+  for one of the keyboard's, a byte that isn't it (a key pressed during
+  boot) is skipped and counted (a ktest plants one with 0xd2), up to 32 per
+  reply (the bound not tested), and so is a byte from port 2; a byte the controller flags
   with a timeout or parity error ends init (no device answering; not
   tested). Then port 1's IRQ bit is set, the input unmasked and the output
   buffer drained once: a byte that was already waiting raised IRQ 1's edge

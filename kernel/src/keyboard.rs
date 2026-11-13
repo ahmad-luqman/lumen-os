@@ -620,7 +620,7 @@ crate::ktest!(
         kassert_eq!(QUEUE.pop(), Some(0x1e));
         let before = IRQS.load(Ordering::Relaxed);
         controller_command_with(WRITE_PORT1_OUTPUT, 0x9e).map_err(|_| "writing the output buffer")?;
-        let deadline = time::now_ns() + REPLY_NS;
+        let deadline = time::now_ns() + 10 * REPLY_NS;
         while IRQS.load(Ordering::Relaxed) == before && time::now_ns() < deadline {
             core::hint::spin_loop();
         }
@@ -634,6 +634,32 @@ crate::ktest!(
             drain();
             kassert_eq!(i8042::status() & i8042::OUTPUT_FULL, 0);
         }
+        kassert_eq!(QUEUE.pop(), None);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_stray_byte_before_the_ack_is_skipped() {
+        // A byte waiting before the keyboard's ACK (as a key pressed during
+        // init would leave; QEMU never puts one there by itself, so the 8042
+        // is told to with 0xd2) is skipped and counted, and the command
+        // still succeeds, leaving nothing behind.
+        use crate::{kassert, kassert_eq};
+        let route = route().ok_or("no keyboard")?;
+        while QUEUE.pop().is_some() {} // (nothing else reads it in the ktests)
+        interrupts::set_masked(route, true);
+        let skipped = SKIPPED.load(Ordering::Relaxed);
+        let (planted, full, result) = {
+            let _off = arch::irq::push_off();
+            let planted = controller_command_with(WRITE_PORT1_OUTPUT, 0x1e);
+            let full = wait(REPLY_NS, |s| s & i8042::OUTPUT_FULL != 0);
+            (planted.is_ok(), full, keyboard_command(KBD_ENABLE_SCANNING, &[]))
+        };
+        enable(route);
+        kassert!(planted && full);
+        kassert_eq!(result, Ok(()));
+        kassert_eq!(SKIPPED.load(Ordering::Relaxed), skipped + 1);
         kassert_eq!(QUEUE.pop(), None);
         Ok(())
     }

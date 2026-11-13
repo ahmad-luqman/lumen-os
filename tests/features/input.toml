@@ -10,6 +10,7 @@ tests = [
     "scenario:test_input::test_every_printable_character_and_backspace",
     "scenario:test_input::test_no_8042_is_a_warning",
     "ktest:lumen_kernel::keyboard::a_byte_waiting_at_unmask_is_drained_and_port2_bytes_dropped",
+    "ktest:lumen_kernel::keyboard::a_stray_byte_before_the_ack_is_skipped",
     "audit:flags",
     "ktest:lumen_kernel::keyboard::the_keyboard_is_routed_and_unmasked",
     "cargo:lumen-queue",
