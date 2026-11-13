@@ -316,7 +316,8 @@ def test_a_timeout_that_isnt_finite_is_the_callers_fault(tmp_path, monkeypatch, 
 def test_expect_says_when_qemu_exited(tmp_path, monkeypatch, reader, waited):
     # Not a timeout: once QEMU is gone and its output read, expect() stops at once.
     # While the reader is still draining the output, the pattern may yet appear,
-    # so expect() keeps waiting (here to its deadline).
+    # so expect() keeps waiting (here to its deadline, unscaled).
+    monkeypatch.delenv("LUMEN_TIMEOUT_SCALE", raising=False)
     m = Machine(Path("x.iso"), tmp_path)
     clock = fake_time(m, monkeypatch, FakeQemu(code=0))
     monkeypatch.setattr(m, "_reader", reader)
