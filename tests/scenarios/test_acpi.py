@@ -83,9 +83,18 @@ def test_no_madt_boots_without_acpi(boot):
     m.expect(r"WARN  irq: no I/O APIC known: device interrupts can't be routed\n", BOOT_TIMEOUT)
     m.expect(r"INFO  time: tsc .* \(calibrated against pit\)\n", BOOT_TIMEOUT)
     m.expect(r"INFO  irq: interrupts on\n", BOOT_TIMEOUT)
+    # Without an I/O APIC the keyboard's IRQ can't be routed: a warning, and
+    # boot goes on (kmon still reads serial).
+    m.expect(
+        r"WARN  kbd: no PS/2 keyboard: IRQ 1 can't be routed: no I/O APIC input for GSI 1\n",
+        BOOT_TIMEOUT,
+    )
     m.expect(r"INFO  boot: boot complete", BOOT_TIMEOUT)
     # And the local APIC found through IA32_APIC_BASE ticks.
     m.expect(r"kmon> ", BOOT_TIMEOUT)
+    m.send_line("kbd")
+    m.expect(r"kbd: no keyboard \(IRQ 1 can't be routed: no I/O APIC input for GSI 1\)\n", 10)
+    m.expect(r"kmon> ", 10)
     # The boot timeline is still complete (it is logged at warn if not).
     assert "WARN  boot" not in m.output
     before, *_ = ticks(m)

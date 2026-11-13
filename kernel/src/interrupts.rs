@@ -15,18 +15,37 @@ use crate::mm::paging;
 use crate::sync::SpinLock;
 
 /// An I/O APIC, the first global system interrupt it handles, and which of
-/// its inputs are routed (a bit each; an I/O APIC has at most 120).
+/// its inputs are routed (a bit each: `apic::MAX_INPUTS` fit).
 struct IoApic {
     regs: apic::IoApic,
     gsi_base: u32,
     routed: u128,
 }
 
+const _: () = assert!(apic::MAX_INPUTS <= u128::BITS);
+
 impl IoApic {
     /// Its input for global system interrupt `gsi`, if it has one.
     fn input(&self, gsi: u32) -> Option<u32> {
         gsi.checked_sub(self.gsi_base).filter(|&i| i < self.regs.entries())
     }
+
+    fn is_routed(&self, input: u32) -> bool {
+        self.routed & (1 << input) != 0
+    }
+}
+
+/// The I/O APIC with an input for `gsi`, and that input.
+fn find_input(io_apics: &mut [IoApic], gsi: u32) -> Option<(&mut IoApic, u32)> {
+    io_apics.iter_mut().find_map(|io| io.input(gsi).map(|input| (io, input)))
+}
+
+/// ISA interrupt `irq`'s GSI and MADT INTI flags: its interrupt override's,
+/// else `irq` itself and 0 (the bus's default: edge, active high).
+fn isa_gsi(irq: u8) -> (u32, u16) {
+    let info = crate::acpi::info();
+    let ov = info.and_then(|i| i.overrides.iter().find(|o| o.bus == 0 && o.irq == irq));
+    ov.map_or((u32::from(irq), 0), |o| (o.gsi, o.flags))
 }
 
 static IO_APICS: SpinLock<Vec<IoApic>> = SpinLock::new(Vec::new());
@@ -73,13 +92,28 @@ pub fn init() {
     );
 }
 
-/// An ISA interrupt routed to the boot CPU ([`route_isa_irq`]).
+/// An ISA interrupt routed to the boot CPU: only [`route_isa_irq`] makes
+/// one, so [`set_masked`] can only unmask an input with a handler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Route {
-    pub irq: u8,
+    irq: u8,
+    gsi: u32,
+    vector: u8,
+}
+
+impl Route {
+    pub fn irq(self) -> u8 {
+        self.irq
+    }
+
     /// Its global system interrupt (the MADT may override `irq`'s).
-    pub gsi: u32,
-    pub vector: u8,
+    pub fn gsi(self) -> u32 {
+        self.gsi
+    }
+
+    pub fn vector(self) -> u8 {
+        self.vector
+    }
 }
 
 /// Why [`route_isa_irq`] refused.
@@ -108,22 +142,26 @@ impl fmt::Display for RouteError {
 /// unmasks it ([`set_masked`]) once its device is ready. The MADT's
 /// interrupt override for `irq`, if any, gives the GSI, polarity and
 /// trigger; without one the GSI is `irq`, active high and edge triggered
-/// (ISA). On the boot CPU (its APIC id is the destination).
+/// (ISA). Only on the boot CPU (asserted): its APIC id is the destination,
+/// and drivers rely on every I/O APIC interrupt arriving there.
 pub fn route_isa_irq(irq: u8, handler: fn()) -> Result<Route, RouteError> {
-    let ov = crate::acpi::info().and_then(|i| i.overrides.iter().find(|o| o.bus == 0 && o.irq == irq).copied());
-    let (gsi, flags) = ov.map_or((u32::from(irq), 0), |o| (o.gsi, o.flags));
+    assert_eq!(crate::arch::cpu_index(), 0, "I/O APIC interrupts are routed from (and to) the boot CPU");
+    let (gsi, flags) = isa_gsi(irq);
     let vector = u8::try_from(gsi)
         .ok()
         .and_then(|g| idt::IOAPIC_BASE.checked_add(g))
         .filter(|&v| v <= idt::IOAPIC_LAST)
         .ok_or(RouteError::NoVector(gsi))?;
     let mut io_apics = IO_APICS.lock();
-    let io = io_apics.iter_mut().find(|io| io.input(gsi).is_some()).ok_or(RouteError::NoInput(gsi))?;
-    let input = io.input(gsi).ok_or(RouteError::NoInput(gsi))?;
-    if io.routed & (1 << input) != 0 {
+    let (io, input) = find_input(&mut io_apics, gsi).ok_or(RouteError::NoInput(gsi))?;
+    if io.is_routed(input) {
         return Err(RouteError::Taken(gsi));
     }
-    idt::set_irq_handler(vector, handler).map_err(|_| RouteError::Taken(gsi))?;
+    match idt::set_irq_handler(vector, handler) {
+        Ok(()) => {}
+        Err(idt::HandlerError::Taken) => return Err(RouteError::Taken(gsi)),
+        Err(idt::HandlerError::NotAnIoApicVector) => unreachable!("{vector:#x} was checked to be an I/O APIC vector"),
+    }
     let dest = u8::try_from(apic::lapic_id()).expect("the boot CPU's APIC id fits an I/O APIC destination");
     io.regs.set_entry(input, RedirectionEntry::isa(vector, dest, flags, true));
     io.routed |= 1 << input;
@@ -133,8 +171,8 @@ pub fn route_isa_irq(irq: u8, handler: fn()) -> Result<Route, RouteError> {
 /// Mask or unmask a routed input.
 pub fn set_masked(route: Route, masked: bool) {
     let mut io_apics = IO_APICS.lock();
-    let io = io_apics.iter_mut().find(|io| io.input(route.gsi).is_some()).expect("a route has an input");
-    let input = io.input(route.gsi).expect("a route has an input");
+    let (io, input) = find_input(&mut io_apics, route.gsi).expect("a route has an input");
+    assert!(io.is_routed(input), "GSI {} isn't routed", route.gsi);
     io.regs.update_entry(input, |e| e.set_masked(masked));
 }
 
@@ -142,13 +180,9 @@ pub fn set_masked(route: Route, masked: bool) {
 /// routed and unmasked.
 #[cfg(feature = "ktest")]
 pub fn is_unmasked_isa(irq: u8) -> bool {
-    let ov = crate::acpi::info().and_then(|i| i.overrides.iter().find(|o| o.bus == 0 && o.irq == irq).copied());
-    let gsi = ov.map_or(u32::from(irq), |o| o.gsi);
+    let (gsi, _) = isa_gsi(irq);
     let mut io_apics = IO_APICS.lock();
-    io_apics.iter_mut().any(|io| match io.input(gsi) {
-        Some(i) => io.routed & (1 << i) != 0 && !io.regs.entry(i).masked(),
-        None => false,
-    })
+    find_input(&mut io_apics, gsi).is_some_and(|(io, i)| io.is_routed(i) && !io.regs.entry(i).masked())
 }
 
 /// Map a page of controller registers (uncached), or panic naming it.
@@ -157,22 +191,23 @@ fn map(phys: u64, what: &str) -> u64 {
     paging::map_mmio(addr, 4096).unwrap_or_else(|e| panic!("mapping the {what} at {phys:#x}: {e}")).as_u64()
 }
 
-/// An input of `io` that nothing routes, for tests to program (masked).
+/// An input of `io` that nothing routes, for tests to program.
 #[cfg(feature = "ktest")]
 fn scratch_input(io: &IoApic) -> Result<u32, &'static str> {
-    (0..io.regs.entries()).rev().find(|&i| io.routed & (1 << i) == 0).ok_or("no unrouted input")
+    (0..io.regs.entries()).rev().find(|&i| !io.is_routed(i)).ok_or("no unrouted input")
 }
 
 crate::ktest!(
     fn controllers_are_masked() {
-        // Every I/O APIC input but the routed ones (the keyboard's).
+        // Every I/O APIC input but the routed ones (the keyboard's, and any
+        // a ktest routed).
         use crate::{kassert, kassert_eq};
         kassert_eq!(pic::masks(), 0xffff);
         let mut io_apics = IO_APICS.lock();
         kassert!(!io_apics.is_empty());
         for io in io_apics.iter_mut() {
-            for i in (0..io.regs.entries()).filter(|i| io.routed & (1 << i) == 0) {
-                kassert!(io.regs.entry(i).masked());
+            for i in 0..io.regs.entries() {
+                kassert!(io.is_routed(i) || io.regs.entry(i).masked());
             }
         }
         kassert!(apic::lapic_ready());
@@ -206,9 +241,8 @@ crate::ktest!(
     fn redirection_entry_roundtrip() {
         // Every field set to a non-default value encodes where the 82093AA
         // datasheet puts it, survives a write to an unrouted input and a
-        // read back (masked, so nothing fires), and the read-only bits are
-        // neither written nor reported set; `update_entry` changes one field
-        // and keeps the rest.
+        // read back (masked, so nothing fires), and the read-only bits read
+        // back clear; `update_entry` changes one field and keeps the rest.
         use crate::arch::apic::{Delivery, Polarity, Trigger};
         use crate::{kassert, kassert_eq};
         let mut e = RedirectionEntry::MASKED_DEFAULT;
@@ -286,8 +320,7 @@ crate::ktest!(
         kassert_eq!(route, Route { irq: 0, gsi: 2, vector: idt::IOAPIC_BASE + 2 });
         let entry = {
             let mut io_apics = IO_APICS.lock();
-            let io = io_apics.iter_mut().find(|io| io.input(2).is_some()).ok_or("no input for GSI 2")?;
-            let input = io.input(2).ok_or("no input")?;
+            let (io, input) = find_input(&mut io_apics, 2).ok_or("no input for GSI 2")?;
             io.regs.entry(input)
         };
         kassert!(entry.masked());

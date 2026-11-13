@@ -28,12 +28,10 @@ ISOS = {
     "qemutest": BUILD_DIR / "lumen-qemutest.iso",
     "ktest": BUILD_DIR / "lumen-ktest.iso",
 }
-# The kernel and command line behind each ISO, for `boot(..., cmdline=...)`
-# (the Makefile's `iso` targets).
-KERNELS = {
-    "qemutest": (BUILD_DIR / "lumen-kernel", "lumen.qemu_exit"),
-    "ktest": (BUILD_DIR / "lumen-kernel-ktest", "lumen.qemu_exit"),
-}
+# The kernel behind each test ISO, and the command line the Makefile's `iso`
+# targets give it (keep in step), for `boot(..., cmdline=...)`.
+KERNELS = {"qemutest": BUILD_DIR / "lumen-kernel", "ktest": BUILD_DIR / "lumen-kernel-ktest"}
+ISO_CMDLINE = "lumen.qemu_exit"
 GOLDEN_DIR = Path(__file__).parent / "golden"
 
 
@@ -72,7 +70,7 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
     `extra` is appended to QEMU's command line, e.g. `extra=["-smp", "2"]`;
     `cmdline` to the kernel's, e.g. `cmdline="lumen.keymap=de"`, in an ISO
     built for this test in its artifacts directory (so parallel tests don't
-    share one)."""
+    share one; `qemutest` and `ktest` only)."""
     machines: list[Machine] = []
 
     def _boot(
@@ -83,10 +81,11 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
             pytest.fail(f"{iso} not found; run `make iso` first")
         sub = artifacts if not machines else artifacts / f"run{len(machines)}"
         if cmdline is not None:
-            kernel, base = KERNELS[variant]
             iso = sub / "custom.iso"
-            words = f"{base} {cmdline}".split()
-            subprocess.run([REPO_ROOT / "tools" / "mkiso.sh", kernel, iso, *words], check=True)
+            words = [ISO_CMDLINE, *cmdline.split()]
+            subprocess.run(
+                [REPO_ROOT / "tools" / "mkiso.sh", KERNELS[variant], iso, *words], check=True
+            )
         m = Machine(iso, sub, trace_interrupts=True, extra_args=extra).start()
         machines.append(m)
         return m

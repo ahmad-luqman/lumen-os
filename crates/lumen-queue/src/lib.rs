@@ -3,7 +3,8 @@
 //! An interrupt handler pushes bytes (a keyboard's scancodes) and a thread
 //! pops them, without a lock: the handler must never wait for the code it
 //! interrupted. [`ByteQueue`] is a ring of `N` atomic bytes (`N` a power of
-//! two) with two counters that only grow: `tail` (bytes pushed) and `head`
+//! two, so slot `count % N` stays right when a counter wraps) with two
+//! counters that only grow (wrapping): `tail` (bytes pushed) and `head`
 //! (bytes popped), so `tail - head` is how many are waiting.
 //!
 //! - **Push** (the producer): if the ring is full the byte is dropped and
@@ -11,8 +12,9 @@
 //!   stored in its slot, then `tail` is published (Release), so a consumer
 //!   that sees the new `tail` (Acquire) sees the byte.
 //! - **Pop** (the consumer): reads `tail` (Acquire), takes the byte at
-//!   `head`, then publishes `head + 1` (Release), so the producer reuses the
-//!   slot only after the byte was read.
+//!   `head`, then publishes `head + 1` (Release); the producer reads `head`
+//!   (Acquire) before it reuses a slot, so it does so only after the byte
+//!   was read.
 //!
 //! Only one producer and one consumer may run at a time: callers serialize
 //! each side (the kernel's producer is one CPU's interrupt handler, its
@@ -34,11 +36,8 @@ pub struct ByteQueue<const N: usize> {
 }
 
 impl<const N: usize> ByteQueue<N> {
-    const POWER_OF_TWO: () = assert!(N.is_power_of_two(), "a ByteQueue's size is a power of two");
-
     pub const fn new() -> Self {
-        #[allow(clippy::let_unit_value)]
-        let () = Self::POWER_OF_TWO;
+        const { assert!(N.is_power_of_two(), "a ByteQueue's size is a power of two") };
         ByteQueue {
             slots: [const { AtomicU8::new(0) }; N],
             tail: AtomicUsize::new(0),
@@ -71,9 +70,12 @@ impl<const N: usize> ByteQueue<N> {
         Some(byte)
     }
 
-    /// How many bytes are waiting (a snapshot).
+    /// How many bytes are waiting (a snapshot; exact from the producer's or
+    /// the consumer's side, at most `N` from anywhere).
     pub fn len(&self) -> usize {
-        self.tail.load(Ordering::Acquire).wrapping_sub(self.head.load(Ordering::Acquire))
+        // `head` first: `tail` only grows, so it can't be read behind it.
+        let head = self.head.load(Ordering::Acquire);
+        self.tail.load(Ordering::Acquire).wrapping_sub(head).min(N)
     }
 
     pub fn is_empty(&self) -> bool {

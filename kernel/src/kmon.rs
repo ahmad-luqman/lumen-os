@@ -1,4 +1,5 @@
-//! Kernel monitor: a tiny line-based console on serial.
+//! Kernel monitor: a tiny line-based console on serial (typed on serial or
+//! the PS/2 keyboard; output on serial).
 //!
 //! This is a debugging and testing aid, not the shell. It exists so the test
 //! harness can script the kernel over serial (and trigger deliberate faults)
@@ -25,12 +26,12 @@ pub fn run() -> ! {
     }
 }
 
-/// The next byte typed, on serial or the keyboard (an ASCII character;
-/// others are skipped), if any.
+/// The next byte typed, on serial or the keyboard (from the keyboard, an
+/// ASCII character; others, like a `uk` layout's £, are skipped), if any.
 fn try_read_byte() -> Option<u8> {
     serial::try_read_byte().or_else(|| {
         let c = crate::keyboard::read_char()?;
-        u8::try_from(c).ok().filter(u8::is_ascii)
+        c.is_ascii().then_some(c as u8)
     })
 }
 
@@ -40,8 +41,8 @@ fn read_line(buf: &mut [u8]) -> usize {
     let mut len = 0;
     loop {
         let Some(b) = try_read_byte() else {
-            // Polled (no serial interrupt yet): let other threads on this
-            // CPU run.
+            // Polled (no serial interrupt yet, and the keyboard's queue isn't
+            // waited on): let other threads on this CPU run.
             crate::sched::yield_now();
             continue;
         };
@@ -129,7 +130,21 @@ fn dispatch(line: &str) {
         },
         "kbd" => {
             let k = crate::keyboard::stats();
-            let _ = writeln!(out, "kbd: layout {}, {} interrupts, {} bytes dropped", k.layout, k.irqs, k.dropped);
+            let _ = match k.status {
+                Some(Ok(route)) => writeln!(
+                    out,
+                    "kbd: layout {}, IRQ {} (vector {:#x}), {} interrupts, {} bytes dropped, {} undecoded, {} line errors",
+                    k.layout,
+                    route.irq(),
+                    route.vector(),
+                    k.irqs,
+                    k.dropped,
+                    k.undecoded,
+                    k.line_errors
+                ),
+                Some(Err(e)) => writeln!(out, "kbd: no keyboard ({e})"),
+                None => writeln!(out, "kbd: not set up"),
+            };
         }
         "uptime" => {
             let _ = writeln!(out, "uptime: {} ns", crate::time::now_ns());

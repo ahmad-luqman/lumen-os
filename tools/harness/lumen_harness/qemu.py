@@ -382,9 +382,11 @@ class Machine:
 
     def press(self, qcodes: Sequence[str], echo: str, timeout: float = 10) -> None:
         """Press `qcodes` together on the guest's keyboard (QMP `send-key`)
-        and wait until the guest echoes `echo` on serial (kmon echoes what it
-        reads), so keys are paced by the guest, not by sleeps."""
-        self.qmp().send_key(list(qcodes))
+        and wait until the guest echoes `echo` on serial (kmon echoes the
+        printable ASCII, Enter and backspace it reads; a key that makes
+        anything else isn't echoed), so keys are paced by the guest, not by
+        sleeps."""
+        self.qmp().send_key(qcodes)
         self.expect(re.escape(echo), timeout)
 
     def type_text(self, text: str, timeout: float = 10) -> None:

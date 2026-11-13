@@ -26,7 +26,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Interrupts on: 8259s masked, local APIC timer at 1 kHz, I/O APIC inputs masked; device interrupts are not fatal"
+name = "Interrupts on: 8259s masked, local APIC timer at 1 kHz, unrouted I/O APIC inputs masked; device interrupts are not fatal"
 milestone = "M1"
 tests = [
     "ktest:lumen_kernel::time::the_timer_is_programmed_for_1_khz",

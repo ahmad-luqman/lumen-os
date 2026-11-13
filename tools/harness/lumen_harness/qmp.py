@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import socket
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +49,7 @@ def qcodes_for(ch: str) -> list[str]:
     raise ValueError(f"no US key types {ch!r}")
 
 
-def send_key_args(qcodes: list[str], hold_ms: int) -> dict[str, Any]:
+def send_key_args(qcodes: Sequence[str], hold_ms: int) -> dict[str, Any]:
     """The arguments of QMP's `send-key`: press `qcodes` together, hold them
     `hold_ms`, release them."""
     if not qcodes:
@@ -102,7 +103,7 @@ class QmpClient:
                 raise QmpError(f"{name}: {reply['error']}")
             # Asynchronous events ({"event": ...}) are ignored.
 
-    def send_key(self, qcodes: list[str], hold_ms: int = 20) -> None:
+    def send_key(self, qcodes: Sequence[str], hold_ms: int = 20) -> None:
         """Press `qcodes` together on the guest's keyboard, then release."""
         self.command("send-key", **send_key_args(qcodes, hold_ms))
 

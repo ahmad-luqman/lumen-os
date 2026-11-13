@@ -32,7 +32,7 @@ is listed only in [STATUS.md](STATUS.md), which is generated from tests.
 | Bootloader | Limine 12.x (pinned binary release + sha256), `limine` crate **0.5.0** | Memory map, framebuffer, higher-half direct map, and our own ELF file for symbolization, with no loader to write. Crate 0.6.x requires nightly (`#![feature(ptr_metadata)]`), so we use 0.5.0 (base revision 3). | Custom UEFI loader (optional learning milestone), GRUB/multiboot2. |
 | Kernel shape | **Modular monolith** with message-shaped internal interfaces; capabilities enforced at the syscall boundary | One address space keeps early milestones fast and debuggable. Agent safety needs capability checks between *processes*, which a monolith enforces just as well. Drivers and services expose request/response interfaces, so any of them can move to user space later. | Microkernel: stronger isolation of drivers, but it puts IPC performance and many extra servers in front of every milestone. |
 | Test harness | Python (`uv`, pytest) on the host; TAP from the kernel | Fast to write scenarios, mature tooling, and QMP/PIL are easy to use. | Rust `xtask`: one language, but slower iteration on test scripts. |
-| Third-party crates | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), at most one new crate per PR, checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX, no red zone, the kernel code model). Kernel crates so far: `limine`, `log`, `rustc-demangle`, `noto-sans-mono-bitmap` (from M0/M1), `pc-keyboard` (scancode decoding and layouts, #58, the first under this policy). | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
+| Third-party crates | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), at most one new crate per PR, checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX, no red zone, the kernel code model). Kernel crates so far: `limine`, `rustc-demangle`, `noto-sans-mono-bitmap` and `log` (from M0, before this policy; `log` is still `0.4`, to be pinned in a PR of its own), `pc-keyboard` (scancode decoding and layouts, #58, the first under it). | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
 | Firmware for tests | OVMF `edk2-stable202605-r1` from rust-osdev/ovmf-prebuilt, pinned with sha256 | macOS and CI boot byte-identical firmware, so golden screenshots match. | Distro OVMF packages (paths and versions differ per OS). |
 
 ## 3. Layers
@@ -106,10 +106,11 @@ tests (for example `lumen-elf`, the symbol-table reader).
    online (`INFO  smp: 4 CPUs online`); the scheduler started on every CPU
    (`INFO  sched: threads on 4 CPUs, 10 ms slices`; `kmain`'s context
    becomes the `main` thread, section 6, "Kernel threads"); the
-   framebuffer hello screen, then
+   framebuffer hello screen, the PS/2 keyboard (`INFO  kbd: PS/2 keyboard
+   on ISA IRQ 1 ...`, section 6, "Keyboard"), then
    `boot complete`, then the boot timeline (below).
 7. Either the in-kernel test runner (`--features ktest`) or the kernel monitor
-   (`kmon`, a serial debug console that the shell replaces in M2; the shell
+   (`kmon`, a debug console on serial, typed on serial or the keyboard, that the shell replaces in M2; the shell
    runs in the kernel until it moves to user mode in M9).
 
 ### Boot timeline and log timestamps (built in M1)
@@ -121,7 +122,7 @@ bootloader-performance request, so the bootloader's own time isn't counted.
 Entry is recorded with the origin's TSC; every other phase records a
 `BootPhase` trace event when it ends: arch-init, logger, symbols, memory, stacks, acpi, interrupts,
 time (calibration, interrupts on, the first-tick check: 10 ms, up to 100 ms while no tick has come), smp (the
-wait until the other CPUs are online, then the scheduler started on every CPU), framebuffer, complete. After `boot complete` the kernel prints them from the ring,
+wait until the other CPUs are online, then the scheduler started on every CPU), framebuffer, complete (which includes setting up the keyboard). After `boot complete` the kernel prints them from the ring,
 converted with the calibrated TSC:
 
 ```
@@ -730,42 +731,55 @@ off. A wake from another CPU queues the thread there and sends the
 
 `kernel/src/keyboard.rs`, the 8042's ports in `arch/x86_64/i8042.rs`.
 
-- **Routing:** `interrupts::route_isa_irq(irq, handler)` takes the MADT's
-  interrupt override for the ISA IRQ, if any (the GSI, polarity and
-  trigger; ISA's edge, active high without one), finds the I/O APIC with
-  an input for that GSI, registers the handler for vector `0x50 + gsi`
-  (`idt::set_irq_handler`, while the input is still masked) and programs
-  the input masked, for the boot CPU. The driver unmasks it
+- **Routing:** `interrupts::route_isa_irq(irq, handler)` (boot CPU only,
+  asserted) takes the MADT's interrupt override for the ISA IRQ, if any
+  (the GSI, polarity and trigger; ISA's edge, active high without one),
+  finds the I/O APIC with an input for that GSI, registers the handler for
+  vector `0x50 + gsi` (`idt::set_irq_handler`, while the input is still
+  masked) and programs the input masked, for the boot CPU. It returns a
+  `Route`, which only it can make; the driver unmasks the input with it
   (`interrupts::set_masked`) once its device is ready. Without an I/O APIC
-  (no MADT) routing fails and the driver warns. Redirection entries are a
-  typed `apic::RedirectionEntry` (vector, delivery mode, destination mode,
-  polarity, trigger, mask, destination; remote IRR and delivery status are
-  read-only and never written) changed by read-modify-write
-  (`IoApic::update_entry`).
-- **8042 init** (boot CPU, after the framebuffer; every reply polled with a
-  deadline, 100 ms, 1 s for the keyboard's reset): with the controller's
-  IRQs off and IRQ 1's input masked, both ports are disabled, the output
-  buffer flushed, an explicit configuration byte written (both IRQs off,
-  port 1's clock on, translation to scancode set 1 on), the self-test run
-  (0x55), the configuration written again (some controllers reset it
-  there), port 1 tested and enabled, the keyboard reset (an ACK and 0xAA,
-  in either order), set 2 selected and scanning enabled (each command
-  ACKed, resent at most twice on 0xFE). Then IRQ 1 is routed, port 1's IRQ
-  bit set, the input unmasked and the output buffer drained once: IRQ 1 is
-  edge triggered, so a byte that was already waiting would never raise
-  it. A missing controller or keyboard is a warning (`no PS/2 keyboard:
-  ...`, naming the step), not a failure (not tested).
+  (no MADT) routing fails, and the keyboard is skipped with a warning.
+  Redirection entries are a typed `apic::RedirectionEntry` (vector,
+  delivery mode, destination mode, polarity, trigger, mask, destination;
+  the I/O APIC's read-only remote IRR and delivery status are never
+  written), changed by read-modify-write (`IoApic::update_entry`).
+- **8042 init** (boot CPU, after the framebuffer; IRQ 1 routed first; every
+  reply polled with a deadline, 100 ms, 1 s for the keyboard's reset): with
+  the controller's IRQs off and port 1's clock off, both ports are
+  disabled, the output buffer flushed, the configuration byte rewritten
+  (both IRQs off, port 1's clock off, translation to scancode set 1 on;
+  port 2's clock and the system flag as firmware left them), the self-test
+  run (0x55), the configuration written again (some controllers reset it
+  there), port 1 tested and enabled, scanning disabled, the keyboard reset
+  (an ACK and 0xAA, in either order), scanning disabled again, set 2
+  selected and scanning enabled (each command ACKed, resent at most twice
+  on 0xFE). A byte that isn't the awaited reply (a key pressed during
+  boot) is skipped, up to 32 times. Then port 1's clock goes on with its
+  IRQ bit, the input is unmasked and the output buffer drained once: a
+  byte that was already waiting raised IRQ 1's edge while the input was
+  masked, which the I/O APIC doesn't keep. A missing controller or
+  keyboard is a warning (`no PS/2 keyboard: ...`, naming the command that
+  failed), not a failure (not tested; the no-ACPI boot's routing failure
+  is). The init runs between the framebuffer and `complete` on the boot
+  timeline, so its time counts toward `complete` (up to 100 ms with no
+  controller, about a second with no keyboard).
 - **Bytes and decoding:** the IRQ handler (boot CPU, interrupts off) moves
-  up to 16 waiting bytes into a lock-free single-producer queue
-  (`lumen-queue`, 256 bytes, host-tested; a full queue drops and counts),
-  discarding the second port's. `keyboard::read_char` (never blocks)
-  decodes them under a lock with `pc-keyboard` in the layout
-  `lumen.keymap=` names, skipping keys that make no character. kmon reads
-  the keyboard as well as serial (and echoes on serial); `kbd` shows the
-  layout, the interrupts taken and the bytes dropped.
+  up to 16 waiting bytes into a lock-free single-producer, single-consumer
+  queue (`lumen-queue`, 256 bytes, host-tested; a full queue drops and
+  counts), discarding the second port's and counting (and discarding) the
+  ones the controller flags with a parity or timeout error.
+  `keyboard::read_char` (never blocks) decodes them under a lock with
+  `pc-keyboard` in the layout `lumen.keymap=` names, skipping keys that
+  make no character and counting bytes the decoder refuses (the
+  keyboard's overrun code among them). kmon reads the keyboard as well as
+  serial (and echoes on serial); `kbd` shows the layout, the route, the
+  interrupts taken and the bytes dropped, undecoded or flagged, or why
+  there is no keyboard.
 - **Tests:** QMP `send-key` drives the keyboard (`Machine.type_text` and
   `press`, which wait for kmon's echo of each key); a scenario boots with
-  `lumen.keymap=de` in an ISO built for it.
+  `lumen.keymap=de` in an ISO built for it, and one presses a key over and
+  over from power-on until the keyboard is set up.
 - **Not yet:** a blocking read for threads (the shell, #62), key releases
   and modifiers for programs, LEDs, the second port (a mouse), and
   hot-plug.

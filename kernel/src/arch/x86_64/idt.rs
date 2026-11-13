@@ -17,7 +17,7 @@
 use super::gdt;
 use core::arch::{asm, global_asm};
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 /// Register state saved by the entry stub, lowest address first.
 #[repr(C)]
@@ -278,12 +278,13 @@ static UNEXPECTED_IRQS: AtomicU64 = AtomicU64::new(0);
 static LAPIC_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Every local APIC error status bit seen so far.
 static LAPIC_ERRORS_SEEN: AtomicU32 = AtomicU32::new(0);
-/// The handler of each I/O APIC vector (`IOAPIC_BASE..=IOAPIC_LAST`): a
-/// `fn()` kept as a usize, 0 if none (a function pointer is never null).
-static IRQ_HANDLERS: [AtomicUsize; (IOAPIC_LAST - IOAPIC_BASE) as usize + 1] =
-    [const { AtomicUsize::new(0) }; (IOAPIC_LAST - IOAPIC_BASE) as usize + 1];
+/// How many I/O APIC vectors there are.
+const IOAPIC_VECTORS: usize = (IOAPIC_LAST - IOAPIC_BASE) as usize + 1;
 
-const _: () = assert!(size_of::<fn()>() == size_of::<usize>());
+/// The handler of each I/O APIC vector (`IOAPIC_BASE..=IOAPIC_LAST`): a
+/// `fn()` kept as a pointer, null if none (a function pointer never is).
+static IRQ_HANDLERS: [AtomicPtr<()>; IOAPIC_VECTORS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; IOAPIC_VECTORS];
 
 /// Why [`set_irq_handler`] refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,23 +295,28 @@ pub enum HandlerError {
     Taken,
 }
 
+/// `vector`'s slot in [`IRQ_HANDLERS`], if it is an I/O APIC vector.
+fn irq_slot(vector: u8) -> Option<&'static AtomicPtr<()>> {
+    IRQ_HANDLERS.get(usize::from(vector.checked_sub(IOAPIC_BASE)?))
+}
+
 /// Run `handler` (with interrupts off, then the local APIC's EOI) whenever
 /// I/O APIC vector `vector` arrives. Once per vector, before its input is
-/// unmasked; handlers stay for good.
+/// unmasked; handlers stay for good. Only `interrupts::route_isa_irq` calls
+/// it (it keeps the vector and its input in step).
 pub fn set_irq_handler(vector: u8, handler: fn()) -> Result<(), HandlerError> {
-    let slot = vector.checked_sub(IOAPIC_BASE).and_then(|i| IRQ_HANDLERS.get(usize::from(i)));
-    let slot = slot.filter(|_| vector <= IOAPIC_LAST).ok_or(HandlerError::NotAnIoApicVector)?;
-    slot.compare_exchange(0, handler as usize, Ordering::Release, Ordering::Relaxed)
+    let slot = irq_slot(vector).ok_or(HandlerError::NotAnIoApicVector)?;
+    slot.compare_exchange(core::ptr::null_mut(), handler as *mut (), Ordering::Release, Ordering::Relaxed)
         .map(|_| ())
         .map_err(|_| HandlerError::Taken)
 }
 
 /// The handler registered for `vector`, if any.
 fn irq_handler(vector: u8) -> Option<fn()> {
-    let raw = IRQ_HANDLERS.get(usize::from(vector.checked_sub(IOAPIC_BASE)?))?.load(Ordering::Acquire);
-    // SAFETY: `set_irq_handler` is the only store of a non-zero value, and it
-    // stores a `fn()`.
-    (raw != 0).then(|| unsafe { core::mem::transmute::<usize, fn()>(raw) })
+    let raw = irq_slot(vector)?.load(Ordering::Acquire);
+    // SAFETY: `set_irq_handler` is the only store of a non-null pointer, and
+    // it stores a `fn()` cast to a pointer (same size: both are addresses).
+    (!raw.is_null()).then(|| unsafe { core::mem::transmute::<*mut (), fn()>(raw) })
 }
 
 /// Which vectors have been warned about, a bit each.

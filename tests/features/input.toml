@@ -1,10 +1,12 @@
 # Features: input. See tests/features/README.md for the format.
 
 [[feature]]
-name = "PS/2 keyboard through the I/O APIC (IRQ 1, MADT override): keys sent with QMP reach kmon"
+name = "PS/2 keyboard through the I/O APIC (IRQ 1): keys sent with QMP reach kmon, also after keys held during boot; without an I/O APIC it is skipped with a warning"
 milestone = "M2"
 tests = [
     "scenario:test_input::test_keys_via_qmp_send_key",
+    "scenario:test_input::test_keys_held_during_boot_leave_a_working_keyboard",
+    "scenario:test_acpi::test_no_madt_boots_without_acpi",
     "ktest:lumen_kernel::keyboard::the_keyboard_is_routed_and_unmasked",
     "cargo:lumen-queue",
 ]

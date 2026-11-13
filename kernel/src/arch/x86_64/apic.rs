@@ -225,6 +225,11 @@ pub struct IoApic {
     entries: u32,
 }
 
+/// The most inputs an I/O APIC can have that the kernel can address:
+/// IOREGSEL is 8 bits, and input `i`'s entry is registers `0x10 + 2i` and
+/// `0x11 + 2i`.
+pub const MAX_INPUTS: u32 = 120;
+
 const IOREGSEL: usize = 0x00;
 const IOWIN: usize = 0x10;
 const IOAPICVER: u32 = 0x01;
@@ -236,8 +241,7 @@ impl IoApic {
     /// for the kernel's whole life, and nothing else drives that I/O APIC.
     pub unsafe fn new(virt: u64) -> IoApic {
         let mut io = IoApic { base: virt, entries: 0 };
-        // IOREGSEL is 8 bits: entries past 119 can't be addressed.
-        io.entries = (((io.read(IOAPICVER) >> 16) & 0xff) + 1).min(120);
+        io.entries = (((io.read(IOAPICVER) >> 16) & 0xff) + 1).min(MAX_INPUTS);
         io
     }
 
@@ -265,7 +269,9 @@ impl IoApic {
     /// Redirection entry `i`. Panics if there is no entry `i`.
     pub fn entry(&mut self, i: u32) -> RedirectionEntry {
         assert!(i < self.entries, "I/O APIC has no input {i}");
-        RedirectionEntry(u64::from(self.read(IOREDTBL + 2 * i)) | u64::from(self.read(IOREDTBL + 2 * i + 1)) << 32)
+        let low = self.read(IOREDTBL + 2 * i);
+        let high = self.read(IOREDTBL + 2 * i + 1);
+        RedirectionEntry(u64::from(low) | u64::from(high) << 32)
     }
 
     /// Set redirection entry `i` (its read-only bits are ignored). Panics if
@@ -274,19 +280,21 @@ impl IoApic {
         assert!(i < self.entries, "I/O APIC has no input {i}");
         let value = entry.0 & !RedirectionEntry::READ_ONLY;
         // High word first, low word last: the low word holds the mask bit, so
-        // an input is never unmasked with a half-written destination.
+        // a masked input is never unmasked with a half-written destination
+        // (retarget a live input by masking it first).
         self.write(IOREDTBL + 2 * i + 1, (value >> 32) as u32);
         self.write(IOREDTBL + 2 * i, value as u32);
     }
 
     /// Read entry `i`, change it with `f`, write it back (read-modify-write;
     /// the caller holds `&mut self`, so nothing interleaves). Returns what
-    /// was written. Panics if there is no entry `i`.
+    /// was written (the read-only bits clear). Panics if there is no entry
+    /// `i`.
     pub fn update_entry(&mut self, i: u32, f: impl FnOnce(&mut RedirectionEntry)) -> RedirectionEntry {
         let mut e = self.entry(i);
         f(&mut e);
         self.set_entry(i, e);
-        e
+        RedirectionEntry(e.0 & !RedirectionEntry::READ_ONLY)
     }
 
     /// Mask every input (entries keep their other fields).
@@ -323,9 +331,9 @@ pub enum Trigger {
 }
 
 /// An I/O APIC redirection entry (Intel 82093AA datasheet, 3.2.4): what
-/// one input delivers, to whom and how. Built field by field; the CPU sets
-/// the two read-only bits (remote IRR, delivery status), which writes
-/// ignore.
+/// one input delivers, to whom and how. Built field by field; the I/O APIC
+/// itself sets the two read-only bits (remote IRR, delivery status), which
+/// [`IoApic::set_entry`] never writes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct RedirectionEntry(u64);
 
@@ -340,6 +348,7 @@ impl RedirectionEntry {
     const LEVEL: u64 = 1 << 15;
     const MASKED: u64 = 1 << 16;
     const DEST_SHIFT: u32 = 56;
+    const DEST: u64 = 0xff << Self::DEST_SHIFT;
     const READ_ONLY: u64 = Self::DELIVERY_STATUS | Self::REMOTE_IRR;
 
     /// Masked, with every other field 0: vector 0, fixed delivery, physical
@@ -435,7 +444,7 @@ impl RedirectionEntry {
     }
 
     pub fn set_destination(&mut self, dest: u8) {
-        self.0 = (self.0 & !(0xff << Self::DEST_SHIFT)) | u64::from(dest) << Self::DEST_SHIFT;
+        self.0 = (self.0 & !Self::DEST) | u64::from(dest) << Self::DEST_SHIFT;
     }
 
     /// Read-only: a level-triggered interrupt was accepted and awaits its

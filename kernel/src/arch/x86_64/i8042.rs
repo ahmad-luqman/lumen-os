@@ -13,6 +13,8 @@ pub const OUTPUT_FULL: u8 = 1 << 0;
 pub const INPUT_FULL: u8 = 1 << 1;
 /// Status bit 5: the waiting byte came from the second port (a mouse).
 pub const FROM_PORT2: u8 = 1 << 5;
+/// Status bits 6 (timeout) and 7 (parity error): the waiting byte is bad.
+pub const LINE_ERROR: u8 = 1 << 6 | 1 << 7;
 
 pub fn status() -> u8 {
     // SAFETY: reading the 8042's status register has no side effects.
