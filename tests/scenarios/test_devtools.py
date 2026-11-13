@@ -5,14 +5,13 @@ Not covered here: the QEMU window that `make run` opens (manual check).
 
 import os
 import select
-import shutil
 import subprocess
 import sys
 import time
 
 import pytest
 from lumen_harness import BUILD_DIR, REPO_ROOT
-from lumen_harness.__main__ import gdb_binary
+from lumen_harness.__main__ import find_gdb
 
 ENV = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "tools/harness"))
 
@@ -54,9 +53,13 @@ def test_make_run_serial_console():
             proc.kill()
 
 
-@pytest.mark.skipif(shutil.which(gdb_binary()) is None, reason="gdb not installed")
 def test_make_debug_stops_at_kmain():
     """`debug` boots paused under gdb, and a hardware breakpoint on kmain is hit."""
+    # Checked here, not in a skipif: a LUMEN_GDB that can't be found raises, and
+    # fails this test rather than skipping it (or, at collection, breaking the
+    # whole module). Without the override, gdb is optional.
+    if find_gdb() is None:
+        pytest.skip("gdb not installed")
     # Uses the fixed gdb port 1234: do not run two of these at once.
     out = subprocess.run(
         [sys.executable, "-m", "lumen_harness", "debug", "--batch",

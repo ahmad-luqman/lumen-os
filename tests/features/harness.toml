@@ -100,6 +100,17 @@ tests = [
 ]
 
 [[feature]]
+name = "make debug's scenario fails, naming LUMEN_GDB, when that override can't be found, and skips as \"gdb not installed\" only when it is unset and there is no gdb"
+milestone = "M1"
+tests = [
+    "harness:test_qemu::test_find_gdb_without_gdb_or_an_override_is_none[*]",
+    "harness:test_qemu::test_find_gdb_uses_an_override_that_is_found[*]",
+    "harness:test_qemu::test_find_gdb_raises_on_an_override_that_isnt_found[*]",
+    "harness:test_qemu::test_the_debug_scenario_fails_on_a_lumen_gdb_that_isnt_found",
+    "harness:test_qemu::test_the_debug_scenario_skips_without_gdb",
+]
+
+[[feature]]
 name = "The feature gate writes the feature table, failing rows included, to the CI job summary; its CI step runs after failed scenarios too"
 milestone = "M1"
 tests = [

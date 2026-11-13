@@ -36,7 +36,7 @@ says why).
 
 Prerequisites: rustup (the toolchain installs itself from
 `rust-toolchain.toml`), `qemu-system-x86_64`, `xorriso`, `uv`, `make`, `curl`, and `gdb` for `make debug`
-(its scenario is skipped without it).
+(its scenario is skipped without it; a `LUMEN_GDB` that can't be found fails it).
 
 ## Hard rules
 
