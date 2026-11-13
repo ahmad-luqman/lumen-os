@@ -1,7 +1,7 @@
 # Features: time. See tests/features/README.md for the format.
 
 [[feature]]
-name = "Calibrated TSC (against the HPET, or the PIT without one), now_ns and sleep"
+name = "Calibrated TSC (against the HPET, or the PIT without one), each window timestamped at both ends and retaken if a reading was paused; kmon clocks lists the windows; now_ns and sleep"
 milestone = "M1"
 tests = [
     "cargo:lumen-time",
@@ -11,6 +11,7 @@ tests = [
     "ktest:lumen_kernel::time::a_bad_hpet_address_is_an_error",
     "scenario:test_time::test_boot_calibrates_the_tsc_against_the_hpet",
     "scenario:test_time::test_boot_calibration_agrees_with_both_clocks",
+    "scenario:test_time::test_clocks_shows_the_windows_behind_each_measurement",
     "scenario:test_acpi::test_no_hpet_is_a_warning",
     "scenario:test_acpi::test_no_madt_boots_without_acpi",
 ]

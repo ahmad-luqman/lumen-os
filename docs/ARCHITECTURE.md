@@ -538,17 +538,25 @@ interrupt handler is allowed to allocate (none does yet).
   turns them back on, on any CPU.
 - **Time** (`time.rs`, arithmetic in `crates/lumen-time`): the TSC's
   frequency is the median of five 10 ms windows against the HPET (the PIT's
-  channel 2, polled, without one), measured with interrupts off. The local
+  channel 2, polled, without one), measured with interrupts off. Each window
+  starts and ends with a reading of the reference's counter between two TSC
+  reads; the PIT's counter runs on past its end, so a vCPU paused while
+  waiting for the end doesn't stretch the window (a yes/no "has it run out"
+  did, by up to 12% under KVM, #45). A window whose start or end reading was
+  itself paused (its TSC reads more than 0.5% of the window apart) is taken
+  again, up to 20 attempts for five. The local
   APIC timer (divide by 16) is calibrated against the TSC the same way and
   set periodic at 1 kHz. `time::now_ns` (TSC-based, lock-free) and
   `time::sleep` (busy-wait until the scheduler, M2). kmon has `ticks`,
   `sleep <ms>`, `uptime`, and `clocks` (the TSC measured again against the
   PIT and the HPET, which the tests compare with the boot calibration: a
   wrong calibration would cancel out in tick counts, since the timer is
-  calibrated against the TSC). Under QEMU's TCG a busy-waiting guest got
-  about 2/3 of its ticks when measured (late periodic timers skip periods);
-  tests check the timer's rate by its count register against the HPET,
-  bound tick counts loosely, and never assert on host time. Every
+  calibrated against the TSC). `clocks` also lists every window behind each
+  measurement (`tsc/reference/polls/start_gap/end_gap`). Under QEMU's TCG a
+  busy-waiting guest gets only some of its ticks (late periodic timers skip
+  periods): about 80% alone, as few as 28% on a loaded host. Tests check the
+  timer's rate by its count register against the HPET, only check that ticks
+  arrive (at least one, none stray), and never assert on host time. Every
   calibration poll is bounded: an HPET that doesn't count or calibrates
   implausibly is warned about (with why) and the PIT used; a PIT whose
   output doesn't go low when programmed, or high again within 2^32 TSC

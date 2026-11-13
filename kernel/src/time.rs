@@ -584,17 +584,18 @@ crate::ktest!(
 
 crate::ktest!(
     fn the_timer_ticks_on_its_vector() {
-        // Interrupts arrive at roughly 1 kHz: 100 in 100 ms. Loosely
-        // bounded (the rate is checked by `the_timer_is_programmed_for_1_khz`):
-        // under QEMU's TCG a busy-waiting guest got about 2/3 of its ticks
-        // when measured, and a lock held across a period merges ticks.
+        // Interrupts arrive on the timer's vector, and not faster than 1 kHz
+        // allows: 100 in 100 ms, at most. The rate itself is checked by
+        // `the_timer_is_programmed_for_1_khz` (against the HPET): QEMU's TCG
+        // delivers only some of a busy-waiting guest's ticks, 46 to 81 here
+        // under a loaded host (#45), and a lock held across a period merges them.
         use crate::kassert;
         kassert!(arch::irq::enabled());
         let t0 = ticks();
         sleep(100_000_000);
         let ticked = ticks() - t0;
         crate::ktest::diag(format_args!("{ticked} ticks in 100 ms"));
-        kassert!((40..=150).contains(&ticked));
+        kassert!((1..=150).contains(&ticked));
         Ok(())
     }
 );
