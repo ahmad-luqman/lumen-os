@@ -81,7 +81,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Harness overrides (LUMEN_QEMU, LUMEN_OVMF_VARS, LUMEN_SOCK_DIR, LUMEN_TIMEOUT_SCALE, LUMEN_GDB): an empty value means unset, a set one is used; LUMEN_TIMEOUT_SCALE must be a finite number above 0 (else an error names it), is read once per machine, and timeout errors show the scaled wait"
+name = "Harness overrides (LUMEN_QEMU, LUMEN_OVMF_VARS, LUMEN_SOCK_DIR, LUMEN_TIMEOUT_SCALE, LUMEN_GDB): an empty value means unset, a set one is used; LUMEN_TIMEOUT_SCALE must be a finite number above 0 (else an error names it), is read once per machine, and a scale that overflows a wait to inf is rejected; timeout errors show the scaled wait, and expect() says when QEMU exited"
 milestone = "M1"
 tests = [
     "harness:test_qemu::test_empty_overrides_mean_unset",
@@ -93,7 +93,8 @@ tests = [
     "harness:test_qemu::test_expect_timeout_shows_the_scaled_wait[*]",
     "harness:test_qemu::test_wait_exit_timeout_shows_the_scaled_wait[*]",
     "harness:test_qemu::test_a_scale_that_overflows_a_wait_is_rejected[*]",
-    "harness:test_qemu::test_expect_says_when_qemu_exited",
+    "harness:test_qemu::test_a_timeout_that_isnt_finite_is_the_callers_fault[*]",
+    "harness:test_qemu::test_expect_says_when_qemu_exited[*]",
     "harness:test_qemu::test_empty_gdb_means_unset",
 ]
 

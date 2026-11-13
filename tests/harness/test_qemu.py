@@ -1,9 +1,11 @@
 """QEMU and gdb command-line construction, the harness's environment overrides,
 and what each run records about its environment."""
 
+import math
 import os
 import re
 import subprocess
+import threading
 from pathlib import Path
 from typing import Self
 
@@ -180,11 +182,15 @@ class FakeQemu:
 
 
 class FakeClock:
-    """Stands in for `time` and the machine's condition variable in expect(): the
-    clock moves only when expect() waits, by exactly as long as it asks. Past an
-    hour it raises, so a wait that never ends fails the test instead of hanging it."""
+    """Stands in for `time` and the machine's condition variable in expect(). The
+    clock moves only when expect() waits, and each wait wakes after at most 0.1s,
+    as when serial output arrives, so expect() must re-read the clock rather than
+    add up what it asked for. A wait a real Condition would refuse, or one that
+    can't move the clock (0, negative, nan), raises, and so does waiting past an
+    hour: a wait that never ends fails the test instead of hanging it."""
 
     LIMIT = 3600.0
+    STEP = 0.1
 
     def __init__(self):
         self.now = 0.0
@@ -193,10 +199,13 @@ class FakeClock:
         return self.now
 
     def wait(self, timeout: float) -> bool:
-        self.now += timeout
+        if not 0 < timeout <= threading.TIMEOUT_MAX:
+            raise AssertionError(f"wait({timeout!r}) can't move the clock or would overflow")
+        step = min(timeout, self.STEP)
+        self.now += step
         if self.now > self.LIMIT:
             raise AssertionError(f"still waiting after {self.LIMIT:g}s (fake time)")
-        return False
+        return step < timeout  # woken early, as by a notify
 
     def __enter__(self) -> Self:
         return self
@@ -205,46 +214,61 @@ class FakeClock:
         pass
 
 
-def hung_machine(tmp_path: Path, monkeypatch, scale: str) -> Machine:
+class LiveReader:
+    """A serial reader thread still draining QEMU's output."""
+
+    def is_alive(self) -> bool:
+        return True
+
+
+def fake_time(m: Machine, monkeypatch, proc: FakeQemu) -> FakeClock:
+    """Runs `m` on `proc` and a FakeClock. monkeypatch.setattr raises if Machine
+    no longer has these attributes, so a rename fails the test instead of leaving
+    expect() on a real clock or Condition."""
+    clock = FakeClock()
+    monkeypatch.setattr(qemu, "time", clock)
+    monkeypatch.setattr(m, "_cond", clock)
+    monkeypatch.setattr(m, "proc", proc)
+    return clock
+
+
+def hung_machine(tmp_path: Path, monkeypatch, scale: str = "") -> tuple[Machine, FakeClock]:
     """A Machine created under LUMEN_TIMEOUT_SCALE=`scale` whose QEMU prints
-    nothing and never exits. The variable changes afterwards, which the machine
-    must ignore: it reads the scale once."""
+    nothing and never exits, on a FakeClock. The variable changes afterwards,
+    which the machine must ignore: it reads the scale once."""
     monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", scale)
     m = Machine(Path("x.iso"), tmp_path)
     monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", "100")
-    m.proc = FakeQemu()  # type: ignore[assignment]
-    return m
+    return m, fake_time(m, monkeypatch, FakeQemu())
 
 
 scaled_waits = pytest.mark.parametrize(
-    ("scale", "wait", "said"),
+    ("scale", "timeout", "wait", "said"),
     [
-        ("", 0.2, "0.2s"),
-        ("2.5", 0.5, "0.5s (0.2s scaled by LUMEN_TIMEOUT_SCALE=2.5)"),
-        ("0.5", 0.1, "0.1s (0.2s scaled by LUMEN_TIMEOUT_SCALE=0.5)"),
+        ("", 30, 30, "30s"),
+        ("2.5", 30.0, 75, "75s (30s scaled by LUMEN_TIMEOUT_SCALE=2.5)"),
+        ("0.5", 0.2, 0.1, "0.1s (0.2s scaled by LUMEN_TIMEOUT_SCALE=0.5)"),
+        ("1.0000001", 10, 10.000001, "10s (10s scaled by LUMEN_TIMEOUT_SCALE=1.0000001)"),
     ],
-    ids=["unscaled", "scaled-up", "scaled-down"],
+    ids=["unscaled", "scaled-up", "scaled-down", "near-one"],
 )
 
 
 @scaled_waits
-def test_expect_timeout_shows_the_scaled_wait(tmp_path, monkeypatch, scale, wait, said):
-    m = hung_machine(tmp_path, monkeypatch, scale)
-    clock = FakeClock()
-    monkeypatch.setattr(qemu, "time", clock)
-    m._cond = clock  # type: ignore[assignment]
+def test_expect_timeout_shows_the_scaled_wait(tmp_path, monkeypatch, scale, timeout, wait, said):
+    m, clock = hung_machine(tmp_path, monkeypatch, scale)
     with pytest.raises(ExpectTimeout) as e:
-        m.expect("never", 0.2)
+        m.expect("never", timeout)
     assert clock.now == pytest.approx(wait)  # it waited exactly that long
     assert str(e.value).startswith(f"timeout after {said} waiting for 'never'\n")
 
 
 @scaled_waits
-def test_wait_exit_timeout_shows_the_scaled_wait(tmp_path, monkeypatch, scale, wait, said):
-    m = hung_machine(tmp_path, monkeypatch, scale)
+def test_wait_exit_timeout_shows_the_scaled_wait(tmp_path, monkeypatch, scale, timeout, wait, said):
+    m, _ = hung_machine(tmp_path, monkeypatch, scale)
     with pytest.raises(ExpectTimeout) as e:
-        m.wait_exit(0.2)
-    assert m.proc.waits == [pytest.approx(wait)]  # type: ignore[union-attr]
+        m.wait_exit(timeout)
+    assert m.proc.waits == [pytest.approx(wait)]
     assert str(e.value) == f"QEMU still running after {said}"
 
 
@@ -252,22 +276,43 @@ def test_wait_exit_timeout_shows_the_scaled_wait(tmp_path, monkeypatch, scale, w
 def test_a_scale_that_overflows_a_wait_is_rejected(tmp_path, monkeypatch, call):
     # Finite, so it passes timeout_scale(), but 30 x 1e307 is inf: that wait would
     # never time out.
-    m = hung_machine(tmp_path, monkeypatch, "1e307")
-    clock = FakeClock()
-    monkeypatch.setattr(qemu, "time", clock)
-    m._cond = clock  # type: ignore[assignment]
-    wait = (lambda: m.expect("never", 30)) if call == "expect" else (lambda: m.wait_exit(30))
+    m, clock = hung_machine(tmp_path, monkeypatch, "1e307")
     with pytest.raises(ValueError, match=re.escape("LUMEN_TIMEOUT_SCALE=1e+307 makes a 30s")):
-        wait()
-    assert m.proc.waits == []  # type: ignore[union-attr]
+        if call == "expect":
+            m.expect("never", 30)
+        else:
+            m.wait_exit(30)
+    assert clock.now == 0  # rejected before waiting at all
+    assert m.proc.waits == []
 
 
-def test_expect_says_when_qemu_exited(tmp_path):
-    # Not a timeout: QEMU is gone (and its output read), so expect() stops at once.
+@pytest.mark.parametrize("call", ["expect", "wait_exit"])
+@pytest.mark.parametrize("timeout", [math.inf, math.nan], ids=["inf", "nan"])
+def test_a_timeout_that_isnt_finite_is_the_callers_fault(tmp_path, monkeypatch, call, timeout):
+    # Not blamed on LUMEN_TIMEOUT_SCALE, which is unset here.
+    m, clock = hung_machine(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match=re.escape(f"timeout={timeout!r}: expected a finite")):
+        if call == "expect":
+            m.expect("never", timeout)
+        else:
+            m.wait_exit(timeout)
+    assert clock.now == 0
+    assert m.proc.waits == []
+
+
+@pytest.mark.parametrize(
+    ("reader", "waited"), [(None, 0), (LiveReader(), 30)], ids=["read", "reading"]
+)
+def test_expect_says_when_qemu_exited(tmp_path, monkeypatch, reader, waited):
+    # Not a timeout: once QEMU is gone and its output read, expect() stops at once.
+    # While the reader is still draining the output, the pattern may yet appear,
+    # so expect() keeps waiting (here to its deadline).
     m = Machine(Path("x.iso"), tmp_path)
-    m.proc = FakeQemu(code=0)  # type: ignore[assignment]
+    clock = fake_time(m, monkeypatch, FakeQemu(code=0))
+    monkeypatch.setattr(m, "_reader", reader)
     with pytest.raises(ExpectTimeout) as e:
         m.expect("never", 30)
+    assert clock.now == pytest.approx(waited)
     assert str(e.value).startswith("QEMU exited waiting for 'never'\n")
 
 

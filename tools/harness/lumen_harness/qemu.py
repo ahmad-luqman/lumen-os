@@ -218,8 +218,9 @@ class Machine:
         trace_interrupts: bool = False,
         extra_args: Sequence[str] = (),
     ):
-        # Read once, before anything starts: a bad value fails here, not in the
-        # first expect() or wait_exit().
+        # Read once, before anything starts: a value timeout_scale() rejects fails
+        # here, not in the first expect() or wait_exit(). (One so large that it
+        # overflows a particular wait fails in _scaled, when that wait starts.)
         self.timeout_scale = timeout_scale()
         self.iso = Path(iso)
         self.artifacts = Path(artifacts)
@@ -333,8 +334,11 @@ class Machine:
     def _scaled(self, timeout: float) -> tuple[float, str]:
         """The wait for `timeout` under this machine's LUMEN_TIMEOUT_SCALE, and how
         a timeout error says it: when the scale isn't 1, with the unscaled timeout
-        and the scale too. A scale so large that the wait overflows to inf raises
-        ValueError, since that wait would never time out."""
+        and the scale too. A timeout that isn't finite, or a scale so large that
+        the wait overflows to inf, raises ValueError: that wait would never time
+        out."""
+        if not math.isfinite(timeout):
+            raise ValueError(f"timeout={timeout!r}: expected a finite number of seconds")
         wait = timeout * self.timeout_scale
         if not math.isfinite(wait):
             raise ValueError(
