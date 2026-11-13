@@ -568,9 +568,10 @@ fn a_pit_window_paused_at_still_gives_the_tsc(at: Pause) -> Result<(), &'static 
         pit::wait(count, &mut pause).ok_or("no PIT")?
     };
     // About 2386 ticks counted off before the start reading, or past 0 before
-    // the end reading.
+    // the end reading. Counter arithmetic, wrapping: a host stall on top of
+    // the pause can run the count out and on before the start is read.
     let paused = match at {
-        Pause::Started => count - w.start.count,
+        Pause::Started => count.wrapping_sub(w.start.count),
         _ => 0u16.wrapping_sub(w.end.count),
     };
     crate::ktest::diag(format_args!("paused at {at:?}: {paused} ticks; readings {w:?}"));
