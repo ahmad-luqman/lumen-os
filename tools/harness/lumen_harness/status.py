@@ -149,7 +149,10 @@ def missing_tap_hint(bad: list[dict]) -> str | None:
             f"status: no {tap_file}, but there is {rerun / 'ktest.tap'}: LUMEN_ARTIFACTS_DIR "
             "keeps a re-run's ktest results apart (unset it for a first run)"
         )
-    return f"status: no {tap_file}: the ktest scenario did not run"
+    return (
+        f"status: no {tap_file}: the ktest scenario did not run, or ran with "
+        "LUMEN_ARTIFACTS_DIR set (its TAP is then in that directory)"
+    )
 
 
 def run_status(write: bool, check: bool) -> int:

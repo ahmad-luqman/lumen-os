@@ -74,9 +74,11 @@ def status_hint(capsys) -> list[str]:
 
 def test_a_missing_ktest_tap_is_explained(ktest_feature, monkeypatch, capsys):
     monkeypatch.delenv("LUMEN_ARTIFACTS_DIR", raising=False)
-    assert status_hint(capsys) == [
-        f"status: no {ktest_feature / 'ktest.tap'}: the ktest scenario did not run"
-    ]
+    [hint] = status_hint(capsys)
+    assert hint == (
+        f"status: no {ktest_feature / 'ktest.tap'}: the ktest scenario did not run, or ran "
+        "with LUMEN_ARTIFACTS_DIR set (its TAP is then in that directory)"
+    )
 
 
 def test_a_ktest_tap_saved_in_a_rerun_dir_is_named(ktest_feature, tmp_path, monkeypatch, capsys):
@@ -93,7 +95,7 @@ def test_a_ktest_tap_saved_in_a_rerun_dir_is_named(ktest_feature, tmp_path, monk
 def test_the_hint_survives_an_invalid_rerun_dir(ktest_feature, monkeypatch, capsys):
     monkeypatch.setenv("LUMEN_ARTIFACTS_DIR", "build/test-results")
     [hint] = status_hint(capsys)
-    assert hint.endswith(": the ktest scenario did not run"), hint
+    assert ": the ktest scenario did not run, or ran with LUMEN_ARTIFACTS_DIR set" in hint, hint
 
 
 def test_no_hint_with_a_ktest_tap_or_no_failing_ktest_feature(results_dir, monkeypatch, capsys):
