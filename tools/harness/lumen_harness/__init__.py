@@ -9,11 +9,19 @@ BUILD_DIR = REPO_ROOT / "build"
 
 
 def rerun_dir() -> Path | None:
-    """LUMEN_ARTIFACTS_DIR (relative to the repo root), if set: a re-run keeps
-    its artifacts and results there, apart from the first run's (CI re-runs
-    failed scenarios under TCG). Unset or empty: None."""
+    """LUMEN_ARTIFACTS_DIR (relative to the repo root), if set and non-empty:
+    a re-run keeps its artifacts and its ktest.tap there, apart from the first
+    run's (CI re-runs failed scenarios under TCG). Otherwise None. It may not
+    be build/test-results, whose ktest.tap it exists to keep."""
     name = os.environ.get("LUMEN_ARTIFACTS_DIR")
-    return REPO_ROOT / name if name else None
+    if not name:
+        return None
+    path = REPO_ROOT / name
+    if path.resolve() == (BUILD_DIR / "test-results").resolve():
+        raise ValueError(
+            f"LUMEN_ARTIFACTS_DIR={name!r} is build/test-results: a re-run must keep apart from it"
+        )
+    return path
 
 
 def artifacts_root() -> Path:
@@ -23,13 +31,11 @@ def artifacts_root() -> Path:
 
 
 def save_ktest_tap(text: str) -> Path:
-    """Save the in-kernel tests' TAP: build/test-results/ktest.tap, which
-    `make status` reads, or, in a re-run, `ktest.tap` in its own directory,
-    so the first run's file (the one the CI job summary reported) survives.
-    (So with LUMEN_ARTIFACTS_DIR set on a first run, `make status` finds no
-    ktest results and reports the ktests as not run.) Returns the path."""
-    rerun = rerun_dir()
-    path = rerun / "ktest.tap" if rerun else BUILD_DIR / "test-results" / "ktest.tap"
+    """Save the in-kernel tests' TAP where `make status` reads it
+    (build/test-results/ktest.tap), or in a re-run's own directory
+    (`rerun_dir`), so the first run's file (which the feature gate read for
+    the CI job summary) survives. Returns the path."""
+    path = (rerun_dir() or BUILD_DIR / "test-results") / "ktest.tap"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
     return path

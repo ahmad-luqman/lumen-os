@@ -53,3 +53,17 @@ def test_ci_job_summary_gets_the_table(results_dir, tmp_path, monkeypatch, body,
     text = summary.read_text()
     assert text.startswith("from an earlier step\n# Lumen status\n")
     assert f"| M1 | demo | Thing | {shown} | `harness:test_x::t` |" in text
+
+
+def test_a_missing_ktest_tap_under_a_rerun_dir_is_explained(results_dir, monkeypatch, capsys):
+    # LUMEN_ARTIFACTS_DIR set on a first run: the gate fails on the ktests,
+    # and says why rather than only "no test ran with this id".
+    monkeypatch.setenv("LUMEN_ARTIFACTS_DIR", "build/test-artifacts-tcg")
+    assert status.run_status(write=False, check=True) == 1
+    assert (
+        "LUMEN_ARTIFACTS_DIR is set, so the ktest scenario saved its TAP in"
+        in capsys.readouterr().err
+    )
+    monkeypatch.delenv("LUMEN_ARTIFACTS_DIR")
+    assert status.run_status(write=False, check=True) == 1
+    assert "LUMEN_ARTIFACTS_DIR" not in capsys.readouterr().err

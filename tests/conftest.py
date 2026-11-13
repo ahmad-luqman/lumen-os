@@ -26,10 +26,6 @@ ISOS = {
     "qemutest": BUILD_DIR / "lumen-qemutest.iso",
     "ktest": BUILD_DIR / "lumen-ktest.iso",
 }
-# LUMEN_ARTIFACTS_DIR (relative to the repo root) lets a re-run keep its
-# artifacts (and its ktest.tap) apart from the first run's: CI re-runs KVM
-# failures under TCG.
-ARTIFACTS = artifacts_root()
 GOLDEN_DIR = Path(__file__).parent / "golden"
 
 
@@ -54,7 +50,8 @@ _FAILED = pytest.StashKey[bool]()
 
 @pytest.fixture
 def artifacts(request: pytest.FixtureRequest) -> Iterator[Path]:
-    path = artifact_dir(ARTIFACTS, request.node.nodeid)
+    # Under a re-run's own root (LUMEN_ARTIFACTS_DIR): see lumen_harness.rerun_dir.
+    path = artifact_dir(artifacts_root(), request.node.nodeid)
     shutil.rmtree(path, ignore_errors=True)
     path.mkdir(parents=True)
     yield path

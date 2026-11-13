@@ -3,7 +3,9 @@
 Inputs (written by `make test`):
   build/test-results/scenarios.xml   JUnit XML from tests/scenarios
   build/test-results/harness.xml     JUnit XML from tests/harness
-  build/test-results/ktest.tap       TAP from the in-kernel test run
+  build/test-results/ktest.tap       TAP from the in-kernel test run (not
+                                     written with LUMEN_ARTIFACTS_DIR set:
+                                     a re-run's copy, kept apart, isn't read)
   build/test-results/audit.json      result of `make audit`
   build/test-results/cargo.json      result of `cargo test` per crate
 
@@ -28,7 +30,7 @@ import tomllib
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from . import BUILD_DIR, REPO_ROOT, tap
+from . import BUILD_DIR, REPO_ROOT, rerun_dir, tap
 
 RESULTS = BUILD_DIR / "test-results"
 STATUS_MD = REPO_ROOT / "docs" / "STATUS.md"
@@ -151,6 +153,12 @@ def run_status(write: bool, check: bool) -> int:
             for t, ok in matched.items():
                 if not ok:
                     print(f"    {t}: failed", file=sys.stderr)
+    if bad and not (RESULTS / "ktest.tap").exists() and (rerun := rerun_dir()):
+        print(
+            f"status: no {RESULTS / 'ktest.tap'}: LUMEN_ARTIFACTS_DIR is set, so the ktest "
+            f"scenario saved its TAP in {rerun} (unset it for a first run)",
+            file=sys.stderr,
+        )
     if check:
         if bad:
             print(f"status: {len(bad)} feature(s) not passing", file=sys.stderr)
