@@ -626,6 +626,24 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn a_pit_start_read_after_it_ran_out_is_not_steady() {
+        // Paused 15 ms after the count started, before or inside its start
+        // reading: the 10 ms count can have run out (and on, past 0) by the
+        // time it is read, so the window can't be placed and would be taken
+        // again. Not a bad read-back: that would be an error, fatal at a boot
+        // without an HPET.
+        use crate::kassert;
+        let count = lumen_time::pit_count(WINDOW_NS).ok_or("no PIT count")?;
+        for at in [Pause::Started, Pause::StartBeforeRead, Pause::StartAfterRead] {
+            let w = off_or_diag("no PIT window", || pit_window(count, sleep_at(at, 15_000_000)))?;
+            crate::ktest::diag(format_args!("paused at {at:?}: {w}"));
+            kassert!(!w.is_steady());
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn a_pit_end_read_after_it_could_wrap_is_not_steady() {
         // Paused 400 ms after the count ran out: its counter (16 bits, 55 ms
         // around) may have come round past its start value, so the window

@@ -128,8 +128,8 @@ pub enum Pause {
     /// In the start reading, after the TSC read before it, before the
     /// reference is read.
     StartBeforeRead,
-    /// In the start reading, after the reference is read, before the TSC
-    /// read after it.
+    /// In the start reading, after the reference is read (the PIT's latched),
+    /// before the TSC read after it.
     StartAfterRead,
     /// After the PIT ran out, before its end reading. Harmless up to a limit:
     /// the reading says how far past the end it was, while
@@ -138,8 +138,8 @@ pub enum Pause {
     /// In the end reading, after the TSC read before it, before the
     /// reference is read (the HPET reaches this on every poll).
     EndBeforeRead,
-    /// In the end reading, after the reference is read, before the TSC read
-    /// after it.
+    /// In the end reading, after the reference is read (the PIT's latched),
+    /// before the TSC read after it.
     EndAfterRead,
 }
 
@@ -193,20 +193,23 @@ fn pit_elapsed(start: u16, end: u16) -> u64 {
     u64::from(start.wrapping_sub(end))
 }
 
-/// Can a PIT window's end reading be shown to be fewer than 65536 ticks
-/// after its start reading, so [`pit_elapsed`] is right? (False also means
-/// it can't be told.) `running_tsc` is the TSC from
-/// the start reading to just before the last poll that still saw the count
-/// running, so fewer than `start` ticks passed in it; `late_tsc` is from then
-/// to the end reading. If `late_tsc` is at most 4 × `running_tsc`, fewer than
-/// 5 × `start` ticks passed in all, which is under 65536 for a `start` up to
-/// 13107 (10 ms is 11932). No poll that saw it running (`running_tsc` 0)
-/// bounds nothing, so that is rejected too.
-fn pit_end_unambiguous(start: u16, running_tsc: u64, late_tsc: u64) -> bool {
-    running_tsc > 0 && u64::from(start) * 5 <= 65536 && late_tsc <= running_tsc.saturating_mul(4)
+/// Can a PIT window programmed with `programmed` be placed: its start read
+/// while it still counted, and its end shown to be fewer than 65536 ticks
+/// after the start, so [`pit_elapsed`] is right? (False also means it can't
+/// be told.) `running_tsc` is the TSC from the start reading to just before
+/// the last poll that still saw the count running, so the start was read
+/// before it ran out and fewer than its count (at most `programmed`, which
+/// [`pit_window`] then checks) ticks passed in it; `late_tsc` is from then to
+/// the end reading. If `late_tsc` is at most 4 × `running_tsc`, fewer than
+/// 5 × `programmed` ticks passed in all, which is under 65536 for up to 13107
+/// (10 ms is 11932). No poll that saw it running (`running_tsc` 0: the start
+/// may have been read after it ran out) places nothing.
+fn pit_end_unambiguous(programmed: u16, running_tsc: u64, late_tsc: u64) -> bool {
+    running_tsc > 0 && u64::from(programmed) * 5 <= 65536 && late_tsc <= running_tsc.saturating_mul(4)
 }
 
-/// A reading of a PIT channel's counter, latched between two TSC reads.
+/// A reading of a PIT channel's counter, latched between two TSC reads (the
+/// latched count may be read after the second).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PitReading {
     pub count: u16,
@@ -257,26 +260,23 @@ impl fmt::Display for PitBadReadback {
 
 /// The window a PIT channel programmed with `count` gave: from its start
 /// reading to its end reading, so `reference` is the ticks between them (more
-/// than the start reading's count if the end was read late). A start above
-/// `count` is a read-back that can't be right. An end that may have been read
-/// 65536 or more ticks after the start (read more than 4 × as long after the
-/// count was last seen running as it was seen running, or never seen running:
-/// [`pit_end_unambiguous`]) can't be placed: its gap is the whole window, so
-/// it isn't steady. One that can be placed must have run at least the start's
-/// count, or its read-back is wrong too.
+/// than the start reading's count if the end was read late). A window that
+/// can't be placed (never seen running after its start reading, which may
+/// then have come after it ran out, or its end read more than 4 × as long
+/// after it was last seen running as it was seen running:
+/// [`pit_end_unambiguous`]) gets the whole window as its end gap, so it isn't
+/// steady and another is taken. One that can be placed must fit how the
+/// channel was programmed (a start at most `count`, and at least that many
+/// ticks run), or its read-back is wrong.
 pub fn pit_window(count: u16, w: &PitWait) -> Result<Window, PitBadReadback> {
     let (start, end) = (w.start, w.end);
-    let bad = PitBadReadback { programmed: count, start: start.count, end: end.count };
-    if start.count > count {
-        return Err(bad);
-    }
     let tsc = end.tsc_after - start.tsc_after;
     let reference = pit_elapsed(start.count, end.count);
     let running = w.last_running_tsc - start.tsc_after;
     let late = end.tsc_after - w.last_running_tsc;
-    let end_gap = if pit_end_unambiguous(start.count, running, late) {
+    let end_gap = if pit_end_unambiguous(count, running, late) {
         if !pit_counts_make_sense(count, start.count, reference) {
-            return Err(bad);
+            return Err(PitBadReadback { programmed: count, start: start.count, end: end.count });
         }
         end.gap()
     } else {
@@ -524,13 +524,23 @@ mod tests {
     }
 
     #[test]
+    fn a_pit_start_read_after_it_ran_out_is_not_steady_not_an_error() {
+        // Paused 12 ms before the start reading: the counter ran out and on
+        // (about 63150), and no poll saw it running after. Not a bad read-back.
+        let mut w = pit_wait(0, 1000, 60_000);
+        w.start.count = 63_150;
+        let w = pit_window(11_932, &w).unwrap();
+        assert_eq!(w.end_gap, w.tsc);
+        assert!(!w.is_steady());
+    }
+
+    #[test]
     fn a_pit_read_back_that_cant_be_right_is_an_error() {
         // A start above what was programmed.
         let mut w = pit_wait(9_999_000, 1000, 0);
         w.start.count = 11_933;
         assert_eq!(pit_window(11_932, &w), Err(PitBadReadback { programmed: 11_932, start: 11_933, end: 0 }));
-        // All ones (a missing or garbled read): caught though the end then
-        // couldn't be placed.
+        // All ones (a missing or garbled read), though seen running after it.
         w.start.count = 0xffff;
         assert_eq!(pit_window(11_932, &w), Err(PitBadReadback { programmed: 11_932, start: 0xffff, end: 0 }));
         // An end that says it hadn't run out (it had: its output was high).

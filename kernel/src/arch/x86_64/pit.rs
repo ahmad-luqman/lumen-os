@@ -19,23 +19,27 @@ const OUT: u8 = 1 << 5;
 /// before the PIT counts as missing: the longest count is 55 ms.
 const BOUND_TSC: u64 = 1 << 32;
 
-/// Latch channel 2's counter and read it, between two TSC reads; `pause` is
-/// called with `before` after the first and with `after` before the second.
+/// Latch channel 2's counter between two TSC reads, then read the count the
+/// latch froze (however long that takes doesn't matter, so it is outside the
+/// bracket: under KVM each port access is a VM exit). `pause` is called with
+/// `before` after the first TSC read and with `after` after the latch, before
+/// the second.
 ///
 /// # Safety
 /// Channel 2 must be programmed for lobyte/hibyte access.
 unsafe fn read(pause: &mut impl FnMut(Pause), before: Pause, after: Pause) -> PitReading {
     let tsc_before = rdtsc();
     pause(before);
-    // SAFETY: the latch command and two reads of channel 2's count, as the
-    // caller programmed it; nothing else is touched.
+    // SAFETY: the latch command for channel 2; nothing else is touched.
+    unsafe { outb(COMMAND, 0b1000_0000) };
+    pause(after);
+    let tsc_after = rdtsc();
+    // SAFETY: two reads of the latched count, as the caller programmed it.
     let count = unsafe {
-        outb(COMMAND, 0b1000_0000); // latch channel 2
         let lo = inb(CHANNEL2);
         u16::from_le_bytes([lo, inb(CHANNEL2)])
     };
-    pause(after);
-    PitReading { count, tsc_before, tsc_after: rdtsc() }
+    PitReading { count, tsc_before, tsc_after }
 }
 
 /// Run channel 2 for `count` ticks of its 1.193182 MHz clock and return once
