@@ -140,12 +140,26 @@ fn clocks() {
         return;
     };
     let _ = write!(out, "clocks: tsc {} Hz (against the {reference} at boot)", tsc.hz());
-    for r in [Reference::Pit, Reference::Hpet] {
-        let _ = match time::measure(r) {
-            Some(Ok(hz)) => write!(out, "; {r} {hz} Hz"),
+    let measured = [Reference::Pit, Reference::Hpet].map(|r| (r, time::measure(r)));
+    for (r, m) in &measured {
+        let _ = match m {
+            Some(Ok(cal)) => write!(out, "; {r} {} Hz", cal.hz),
             Some(Err(e)) => write!(out, "; {r} failed ({e})"),
             None => write!(out, "; {r} none"),
         };
+    }
+    let _ = writeln!(out);
+    // The windows behind those, for diagnosing: `clocks: windows: boot <cal>;
+    // pit <cal>; hpet <cal>` (a failed or missing one left out), each `<cal>`
+    // a time::Calibration (`<hz> Hz [<w> ...] retook <n>`).
+    let _ = write!(out, "clocks: windows:");
+    if let Some(boot) = time::boot_calibration() {
+        let _ = write!(out, " boot {boot}");
+    }
+    for (r, m) in &measured {
+        if let Some(Ok(cal)) = m {
+            let _ = write!(out, "; {r} {cal}");
+        }
     }
     let _ = writeln!(out);
 }
