@@ -4,6 +4,7 @@ Not covered here: the QEMU window that `make run` opens (manual check).
 """
 
 import os
+import re
 import select
 import subprocess
 import sys
@@ -61,8 +62,8 @@ def test_make_debug_stops_at_kmain():
     # override, gdb is optional.
     if find_gdb() is None:
         pytest.skip("gdb not installed")
-    # Uses the fixed gdb port 1234: do not run two of these at once. stderr too,
-    # so a failing run (e.g. gdb timing out) shows why.
+    # Uses the fixed gdb port 1234: do not run two of these at once. It merges
+    # stderr into the output, so a failing run (e.g. gdb timing out) shows why.
     out = subprocess.run(
         [sys.executable, "-m", "lumen_harness", "debug", "--batch",
          "--iso", str(BUILD_DIR / "lumen.iso"), "--kernel", str(BUILD_DIR / "lumen-kernel")],
@@ -70,4 +71,6 @@ def test_make_debug_stops_at_kmain():
         cwd=REPO_ROOT, timeout=180,
     ).stdout  # fmt: skip
     assert "#0  kmain () at kernel/src/main.rs" in out, out[-3000:]
-    assert "_start" in out, out[-3000:]
+    assert re.search(r"^#\d+\s.*\b_start\b", out, re.MULTILINE), out[
+        -3000:
+    ]  # a frame, not any text

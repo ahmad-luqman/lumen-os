@@ -361,26 +361,29 @@ def test_find_gdb_without_gdb_or_an_override_is_none(tmp_path, monkeypatch, valu
     assert find_gdb() == str(bindir / "gdb")  # and with gdb, that one
 
 
-@pytest.mark.parametrize("how", ["name", "name-alone", "path"])
-def test_find_gdb_uses_an_override_that_is_found(tmp_path, monkeypatch, how):
-    # A name wins over a plain `gdb` on PATH, and needs none (e.g. a Mac with only
-    # x86_64-elf-gdb); so does a path off PATH.
-    if how == "path":
-        only_on_path(tmp_path, monkeypatch)
-        elsewhere = fake_qemu(tmp_path, "exit 0", "my-gdb")
-        monkeypatch.setenv("LUMEN_GDB", str(elsewhere))
-        assert find_gdb() == str(elsewhere)
-    else:
-        names = ["gdb", "x86_64-elf-gdb"] if how == "name" else ["x86_64-elf-gdb"]
-        bindir = only_on_path(tmp_path, monkeypatch, *names)
-        monkeypatch.setenv("LUMEN_GDB", "x86_64-elf-gdb")
-        assert find_gdb() == str(bindir / "x86_64-elf-gdb")
+@pytest.mark.parametrize(
+    ("on_path", "value", "found"),
+    [
+        (["gdb", "x86_64-elf-gdb"], "x86_64-elf-gdb", "{tmp}/bin/x86_64-elf-gdb"),
+        (["x86_64-elf-gdb"], "x86_64-elf-gdb", "{tmp}/bin/x86_64-elf-gdb"),
+        ([], "{tmp}/my-gdb", "{tmp}/my-gdb"),
+    ],
+    ids=["name", "name-alone", "path"],
+)
+def test_find_gdb_uses_an_override_that_is_found(tmp_path, monkeypatch, on_path, value, found):
+    # A name wins over a plain `gdb` on PATH and doesn't need one (e.g. a Mac with
+    # only x86_64-elf-gdb). A path off PATH works too, also without a plain `gdb`.
+    only_on_path(tmp_path, monkeypatch, *on_path)
+    fake_qemu(tmp_path, "exit 0", "my-gdb")  # off PATH
+    monkeypatch.setenv("LUMEN_GDB", value.format(tmp=tmp_path))
+    assert find_gdb() == found.format(tmp=tmp_path)
 
 
 def not_found(value: str) -> str:
-    return re.escape(
-        f"LUMEN_GDB={value!r} not found or not executable (give a name on PATH or a path)"
-    )
+    """A regex for exactly find_gdb's message about LUMEN_GDB=`value`, nothing
+    before or after it."""
+    message = f"LUMEN_GDB={value!r} not found or not executable (give a name on PATH or a path)"
+    return f"^{re.escape(message)}$"
 
 
 @pytest.mark.parametrize(
@@ -412,44 +415,44 @@ def test_find_gdb_raises_on_an_explicit_gdb_that_isnt_found(tmp_path, monkeypatc
         find_gdb()
 
 
-def run_debug_scenario(tmp_path: Path, gdb: str | None) -> subprocess.CompletedProcess[str]:
-    """make debug's scenario in a pytest of its own, with no gdb on PATH and a
-    "QEMU" that exits at once, so nothing boots even if the check is bypassed.
-    No PYTEST_* or LUMEN_* variables are inherited: LUMEN_GDB is `gdb`, or unset
-    when that is None. No cache, so its deliberate failure never reaches the
-    repo's lastfailed (which CI's --last-failed re-run reads); -rs prints the
-    skip reason whatever pyproject's addopts say."""
+def run_debug_scenario(tmp_path: Path, lumen_gdb: str | None) -> tuple[str, str]:
+    """make debug's scenario in a pytest of its own; returns its whole output and
+    its last line (pytest's summary, e.g. `1 failed in 0.01s`).
+
+    No gdb is on PATH, and "QEMU" exits at once, so nothing boots even if the
+    check is bypassed. No PYTEST_* or LUMEN_* variables are inherited: LUMEN_GDB is
+    `lumen_gdb`, or unset when that is None. No cache, so its deliberate failure
+    never reaches the repo's lastfailed (which CI's --last-failed re-run reads);
+    -rs prints the skip reason whatever pyproject's addopts say; PY_COLORS=0 keeps
+    colour codes out of the summary."""
     empty = tmp_path / "empty"
     empty.mkdir()
     env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTEST_", "LUMEN_"))}
     env["PATH"] = str(empty)
+    env["PY_COLORS"] = "0"
     env["LUMEN_QEMU"] = str(fake_qemu(tmp_path, "exit 0"))
-    if gdb is not None:
-        env["LUMEN_GDB"] = gdb
+    if lumen_gdb is not None:
+        env["LUMEN_GDB"] = lumen_gdb
     node = "tests/scenarios/test_devtools.py::test_make_debug_stops_at_kmain"
-    return subprocess.run(
+    run = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider", "-p", "no:xdist",
          node],
         cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120, check=False,
     )  # fmt: skip
+    return run.stdout + run.stderr, run.stdout.strip().splitlines()[-1]
 
 
 def test_the_debug_scenario_fails_on_a_lumen_gdb_that_isnt_found(tmp_path):
     # Failing, not skipping: the override was set on purpose, a skip is easy to
     # miss locally (pytest still exits 0), and the fix is the variable, not gdb.
-    run = run_debug_scenario(tmp_path, "/nonexistent/gdb")
-    out = run.stdout + run.stderr
-    assert run.returncode == 1, out
-    assert "1 failed" in out, out
-    assert "skipped" not in out.lower(), out
-    assert "LUMEN_GDB='/nonexistent/gdb' not found" in out, out
+    out, summary = run_debug_scenario(tmp_path, "/nonexistent/gdb")
+    assert re.fullmatch(r"1 failed in [\d.]+s", summary), out  # failed; not skipped, no error
+    assert "ValueError: LUMEN_GDB='/nonexistent/gdb' not found" in out, out
 
 
 def test_the_debug_scenario_skips_without_gdb(tmp_path):
-    run = run_debug_scenario(tmp_path, None)
-    out = run.stdout + run.stderr
-    assert run.returncode == 0, out
-    assert "1 skipped" in out, out
+    out, summary = run_debug_scenario(tmp_path, None)
+    assert re.fullmatch(r"1 skipped in [\d.]+s", summary), out
     assert "gdb not installed" in out, out
 
 

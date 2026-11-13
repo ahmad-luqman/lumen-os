@@ -100,7 +100,7 @@ tests = [
 ]
 
 [[feature]]
-name = "make debug's scenario fails, naming LUMEN_GDB, when that override can't be found, and skips as \"gdb not installed\" only when it is unset (or empty) and there is no gdb"
+name = "make debug's scenario fails, naming LUMEN_GDB, when that override can't be found, and skips as \"gdb not installed\" when it is unset (or empty) and there is no gdb"
 milestone = "M1"
 tests = [
     "harness:test_qemu::test_find_gdb_without_gdb_or_an_override_is_none[*]",
