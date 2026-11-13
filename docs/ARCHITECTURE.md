@@ -110,7 +110,7 @@ boot timeline and the log's timestamps. The pinned Limine crate has no
 bootloader-performance request, so the bootloader's own time isn't counted.
 Entry is recorded with the origin's TSC; every other phase records a
 `BootPhase` trace event when it ends: arch-init, logger, symbols, memory, stacks, acpi, interrupts,
-time (calibration, interrupts on, the 10 ms first-tick check), smp (the
+time (calibration, interrupts on, the first-tick check: 10 ms, up to 100 ms while no tick has come), smp (the
 wait until the other CPUs are online), framebuffer, complete. After `boot complete` the kernel prints them from the ring,
 converted with the calibrated TSC:
 

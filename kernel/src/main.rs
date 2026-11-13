@@ -162,8 +162,15 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     arch::irq::enable();
     info!(target: "irq", "interrupts on");
     time::sleep(10_000_000);
+    // A working timer's first tick can be late under QEMU's TCG on a loaded
+    // host (none in the first 10 ms, then ticking normally, #45): wait up to
+    // 100 ms in all before warning that it doesn't tick.
+    let deadline = time::now_ns() + 90_000_000;
+    while time::ticks() == 0 && time::now_ns() < deadline {
+        core::hint::spin_loop();
+    }
     if time::ticks() == 0 {
-        warn!(target: "irq", "no timer interrupt in 10 ms");
+        warn!(target: "irq", "no timer interrupt in 100 ms");
     }
     ktrace!(Kind::BootPhase, BootPhase::Time);
     smp::wait_online(started);

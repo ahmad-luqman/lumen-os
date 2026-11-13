@@ -77,7 +77,8 @@ pub enum BootPhase {
     Acpi = 7,
     /// Interrupt controllers, then the other CPUs started (`smp::start_all`).
     Interrupts = 8,
-    /// TSC and timer calibration, interrupts on, the 10 ms first-tick check.
+    /// TSC and timer calibration, interrupts on, the first-tick check (10 ms,
+    /// up to 100 ms while no tick has come).
     Time = 9,
     /// The wait until the other CPUs are online (`smp::wait_online`).
     Smp = 10,
