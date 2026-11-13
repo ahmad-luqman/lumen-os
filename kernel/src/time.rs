@@ -320,30 +320,11 @@ fn calibrate_with_pit() -> Result<Calibration, CalError> {
     median_tsc_hz(PIT_HZ, || pit_window(count, |_| {}))
 }
 
-/// One window of channel 2 started on `count`: from its counter reading just
-/// after it started to the one once it had run out, so `reference` is the
-/// ticks between them (more than `count` if the end was read late). `pause`:
-/// see [`pit::wait`].
+/// One window of channel 2 started on `count` (see [`lumen_time::pit_window`]);
+/// `pause`: see [`pit::wait`].
 fn pit_window(count: u16, pause: impl FnMut(Pause)) -> Result<Window, CalError> {
     let w = pit::wait(count, pause).ok_or(CalError::NoCount)?;
-    let (start, end) = (w.start, w.end);
-    let tsc = end.tsc_after - start.tsc_after;
-    let reference = lumen_time::pit_elapsed(start.count, end.count);
-    // An end read 65536 or more ticks after the start (the counter came round
-    // past the start's value) can't be placed: its gap is the whole window,
-    // so it isn't steady and another is taken. One that can be placed must
-    // fit how the channel was programmed, or its read-back is wrong.
-    let running = w.last_running_tsc - start.tsc_after;
-    let late = end.tsc_after - w.last_running_tsc;
-    let end_gap = if lumen_time::pit_end_unambiguous(start.count, running, late) {
-        if !lumen_time::pit_counts_make_sense(count, start.count, reference) {
-            return Err(CalError::BadReadback { start: start.count, end: end.count });
-        }
-        end.gap()
-    } else {
-        tsc
-    };
-    Ok(Window { tsc, reference, polls: w.polls, start_gap: start.gap(), end_gap })
+    lumen_time::pit_window(count, &w).map_err(|e| CalError::BadReadback { start: e.start, end: e.end })
 }
 
 /// Measure the TSC's frequency again now, against `reference` (with

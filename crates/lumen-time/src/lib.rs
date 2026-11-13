@@ -186,6 +186,65 @@ pub fn pit_end_unambiguous(start: u16, running_tsc: u64, late_tsc: u64) -> bool 
     running_tsc > 0 && u64::from(start) * 5 <= 65536 && late_tsc <= running_tsc.saturating_mul(4)
 }
 
+/// A reading of a PIT channel's counter, latched between two TSC reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PitReading {
+    pub count: u16,
+    pub tsc_before: u64,
+    pub tsc_after: u64,
+}
+
+impl PitReading {
+    /// How far off the reading can be, in TSC ticks.
+    pub fn gap(&self) -> u64 {
+        self.tsc_after - self.tsc_before
+    }
+}
+
+/// How a PIT window went: the channel's counter read just after it started
+/// and again once it had run out (in mode 0 it counts on past 0, so the
+/// second reading says how far past), the TSC just before the last poll that
+/// still saw it running (the start reading's if none did), and how many
+/// times its output was polled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PitWait {
+    pub start: PitReading,
+    pub end: PitReading,
+    pub last_running_tsc: u64,
+    pub polls: u64,
+}
+
+/// A PIT window whose readings can't be right.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PitBadReadback {
+    pub start: u16,
+    pub end: u16,
+}
+
+/// The window a PIT channel programmed with `count` gave: from its start
+/// reading to its end reading, so `reference` is the ticks between them (more
+/// than `count` if the end was read late). An end read 65536 or more ticks
+/// after the start (the counter came round past the start's value) can't be
+/// placed: its gap is the whole window, so it isn't steady
+/// ([`pit_end_unambiguous`]). One that can be placed must fit how the channel
+/// was programmed ([`pit_counts_make_sense`]), or its read-back is wrong.
+pub fn pit_window(count: u16, w: &PitWait) -> Result<Window, PitBadReadback> {
+    let (start, end) = (w.start, w.end);
+    let tsc = end.tsc_after - start.tsc_after;
+    let reference = pit_elapsed(start.count, end.count);
+    let running = w.last_running_tsc - start.tsc_after;
+    let late = end.tsc_after - w.last_running_tsc;
+    let end_gap = if pit_end_unambiguous(start.count, running, late) {
+        if !pit_counts_make_sense(count, start.count, reference) {
+            return Err(PitBadReadback { start: start.count, end: end.count });
+        }
+        end.gap()
+    } else {
+        tsc
+    };
+    Ok(Window { tsc, reference, polls: w.polls, start_gap: start.gap(), end_gap })
+}
+
 /// Do a PIT window's readings fit a channel programmed with `programmed` that
 /// counted `elapsed` ticks from a start reading of `start` until after it ran
 /// out? It counts down from what was programmed (`start` at most that) and
@@ -372,6 +431,58 @@ mod tests {
         assert_eq!(pit_elapsed(11_932, 0xffff), 11_933, "one tick past 0");
         assert_eq!(pit_elapsed(11_932, 0xffff - 999), 12_932, "1000 ticks past 0");
         assert_eq!(pit_elapsed(5, 5), 0);
+    }
+
+    /// A PIT wait on a 1 GHz TSC: started at TSC 1000 (read in 1 µs) on a
+    /// count of 11932 that `lag` ticks had already counted off, running until
+    /// `running_ns`, and the end read `late_ns` after that with the counter
+    /// at `end`.
+    fn pit_wait(lag: u16, running_ns: u64, late_ns: u64, end: u16) -> PitWait {
+        let start = PitReading { count: 11_932 - lag, tsc_before: 0, tsc_after: 1000 };
+        let last = 1000 + running_ns;
+        PitWait {
+            start,
+            end: PitReading { count: end, tsc_before: last + late_ns - 500, tsc_after: last + late_ns },
+            last_running_tsc: last,
+            polls: 42,
+        }
+    }
+
+    #[test]
+    fn a_pit_window_runs_between_its_readings() {
+        // Read right at the end: 11932 ticks, both gaps from the readings.
+        let w = pit_window(11_932, &pit_wait(0, 9_999_000, 1000, 0)).unwrap();
+        assert_eq!(w, Window { tsc: 10_000_000, reference: 11_932, polls: 42, start_gap: 1000, end_gap: 500 });
+        // Read 2 ms late: the counter ran on 2386 ticks past 0, and the TSC
+        // with it, so the frequency is still right.
+        let w = pit_window(11_932, &pit_wait(0, 9_999_000, 2_001_000, 0u16.wrapping_sub(2386))).unwrap();
+        assert_eq!(w.reference, 11_932 + 2386);
+        assert!(w.is_steady());
+        // Started 100 ticks into the count: the window is the 11832 after.
+        let w = pit_window(11_932, &pit_wait(100, 9_915_000, 1000, 0)).unwrap();
+        assert_eq!(w.reference, 11_832);
+    }
+
+    #[test]
+    fn a_pit_end_that_may_have_wrapped_is_not_steady_not_an_error() {
+        // Read 50 ms late after running 10 ms: more than 4 × as late.
+        let w = pit_window(11_932, &pit_wait(0, 10_000_000, 50_000_000, 7)).unwrap();
+        assert_eq!(w.end_gap, w.tsc);
+        assert!(!w.is_steady());
+        // Never seen running (the first poll saw it done): can't be placed.
+        let w = pit_window(11_932, &pit_wait(0, 0, 1000, 0)).unwrap();
+        assert_eq!(w.end_gap, w.tsc);
+    }
+
+    #[test]
+    fn a_pit_read_back_that_cant_be_right_is_an_error() {
+        // A start above what was programmed.
+        let mut w = pit_wait(0, 9_999_000, 1000, 0);
+        w.start.count = 11_933;
+        assert_eq!(pit_window(11_932, &w), Err(PitBadReadback { start: 11_933, end: 0 }));
+        // An end that says it hadn't run out (it had: its output was high).
+        let w = pit_wait(0, 9_999_000, 1000, 5);
+        assert_eq!(pit_window(11_932, &w), Err(PitBadReadback { start: 11_932, end: 5 }));
     }
 
     #[test]

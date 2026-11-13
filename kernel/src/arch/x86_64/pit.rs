@@ -4,7 +4,7 @@
 
 use super::cpu::rdtsc;
 use super::port::{inb, outb};
-use lumen_time::Pause;
+use lumen_time::{Pause, PitReading, PitWait};
 
 const CHANNEL2: u16 = 0x42;
 const COMMAND: u16 = 0x43;
@@ -19,40 +19,12 @@ const OUT: u8 = 1 << 5;
 /// before the PIT counts as missing: the longest count is 55 ms.
 const BOUND_TSC: u64 = 1 << 32;
 
-/// A reading of channel 2's counter, latched between two TSC reads.
-#[derive(Clone, Copy, Debug)]
-pub struct Reading {
-    pub count: u16,
-    pub tsc_before: u64,
-    pub tsc_after: u64,
-}
-
-impl Reading {
-    /// How far off the reading can be, in TSC ticks.
-    pub fn gap(&self) -> u64 {
-        self.tsc_after - self.tsc_before
-    }
-}
-
-/// How a [`wait`] went: the counter read just after it started and again once
-/// it had run out (in mode 0 it counts on past 0, so the second reading says
-/// how far past), the TSC just before the last poll that still saw it
-/// running (the start reading's if none did), and how many times its output
-/// was polled.
-#[derive(Clone, Copy, Debug)]
-pub struct Waited {
-    pub start: Reading,
-    pub end: Reading,
-    pub last_running_tsc: u64,
-    pub polls: u64,
-}
-
 /// Latch channel 2's counter and read it, between two TSC reads (`latched`
 /// runs in between, just before the second).
 ///
 /// # Safety
 /// Channel 2 must be programmed for lobyte/hibyte access.
-unsafe fn read(latched: impl FnOnce()) -> Reading {
+unsafe fn read(latched: impl FnOnce()) -> PitReading {
     let tsc_before = rdtsc();
     // SAFETY: the latch command and two reads of channel 2's count, as the
     // caller programmed it; nothing else is touched.
@@ -62,18 +34,18 @@ unsafe fn read(latched: impl FnOnce()) -> Reading {
         u16::from_le_bytes([lo, inb(CHANNEL2)])
     };
     latched();
-    Reading { count, tsc_before, tsc_after: rdtsc() }
+    PitReading { count, tsc_before, tsc_after: rdtsc() }
 }
 
 /// Run channel 2 for `count` ticks of its 1.193182 MHz clock and return once
-/// it has run out, with its counter read at both ends ([`Waited`]): a late
+/// it has run out, with its counter read at both ends ([`PitWait`]): a late
 /// look at the end doesn't stretch the window, since the counter says how far
 /// past the end it was. `pause` is called at each [`Pause`] point (a no-op
 /// but in tests). Busy-waits (up to about 55 ms with a working PIT); call
 /// with interrupts off. `None` if there is no working PIT: its output didn't
 /// go low when programmed (a missing PIT's ports read all ones), or didn't go
 /// high again within [`BOUND_TSC`] TSC ticks.
-pub fn wait(count: u16, mut pause: impl FnMut(Pause)) -> Option<Waited> {
+pub fn wait(count: u16, mut pause: impl FnMut(Pause)) -> Option<PitWait> {
     // SAFETY: programs channel 2 only (mode 0, one-shot, lobyte/hibyte) with
     // the speaker disconnected, and reads it back (`read` needs that lobyte/
     // hibyte access); channel 0 and the speaker are left alone.
@@ -98,7 +70,7 @@ pub fn wait(count: u16, mut pause: impl FnMut(Pause)) -> Option<Waited> {
                 if inb(SPEAKER) & OUT != 0 {
                     pause(Pause::Ended);
                     let end = read(|| pause(Pause::EndReading));
-                    break Some(Waited { start, end, last_running_tsc, polls });
+                    break Some(PitWait { start, end, last_running_tsc, polls });
                 }
                 last_running_tsc = t;
                 if t.wrapping_sub(start.tsc_after) > BOUND_TSC {
