@@ -426,9 +426,10 @@ pub fn init() {
         .unwrap_or_else(|| panic!("the local APIC timer, at {}, can't tick at {}", Hz(timer_hz), Hz(TICK_HZ)));
     LAPIC_TIMER_HZ.store(timer_hz, Ordering::Relaxed);
     apic::timer_periodic(count);
-    // SeqCst: an AP that checks this after coming online either sees it, or
-    // came online after the boot CPU's look and is woken to check again
-    // (`sched::init`).
+    // An AP that misses this checked it before the store, so it was online
+    // already (`smp` marks it with an `xchg`, a full fence on x86, as is this
+    // SeqCst store) when `sched::init` later looks, and is woken to check
+    // again; one that comes online after that look checks after the store.
     TIMER_COUNT.store(count, Ordering::SeqCst);
     info!(
         target: "time",
@@ -509,8 +510,9 @@ pub fn sleep(ns: u64) {
     }
 }
 
-/// Busy-wait at least `ns` nanoseconds, keeping the CPU (for calibration,
-/// and for tests that must not switch threads). Panics before [`init`].
+/// Busy-wait at least `ns` nanoseconds, keeping the CPU: for [`sleep`]
+/// where a thread can't block, and for tests that must not switch threads
+/// (the calibration ktests' pauses among them). Panics before [`init`].
 pub fn spin(ns: u64) {
     let tsc = tsc().expect("time::spin before time::init");
     let start = arch::rdtsc();
@@ -538,7 +540,7 @@ pub fn wait_for_tick(seen: u64, ns: u64) -> bool {
     ticks() != seen
 }
 
-/// A window pause for the ktests: sleeps `ns` at `at`, as a host descheduling
+/// A window pause for the ktests: spins `ns` at `at`, as a host descheduling
 /// the vCPU there would.
 #[cfg(feature = "ktest")]
 fn sleep_at(at: Pause, ns: u64) -> impl FnMut(Pause) {
@@ -882,9 +884,10 @@ crate::ktest!(
         // Interrupts arrive on the timer's vector, and not much faster than
         // 1 kHz (100 in 100 ms; the bound, 150, leaves room). The rate itself
         // is checked by `the_timer_is_programmed_for_1_khz` (against the
-        // HPET): QEMU's TCG delivers only some of a busy-waiting guest's ticks,
-        // 29 to 81 in #45's stress runs, and a lock held across a period merges
-        // them.
+        // HPET): QEMU's TCG delivers ticks late (late periodic timers skip
+        // periods): 29 to 81 in #45's stress runs (busy-waiting then; the
+        // sleep now halts in the idle thread), and a lock held across a
+        // period merges them.
         use crate::kassert;
         kassert!(arch::irq::enabled());
         let t0 = ticks();

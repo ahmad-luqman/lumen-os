@@ -78,6 +78,9 @@ def test_all_cpus_online(boot):
     bottoms += [b for s in stacks.values() for b in (s.main_bottom, s.df, s.nmi, s.mc)]
     assert len(set(bottoms)) == len(bottoms) == 16
     assert "WARN  smp" not in m.output
+    # Every CPU runs threads (its timer ticks), and none is warned about.
+    assert "INFO  sched: threads on 4 CPUs, 10 ms slices\n" in m.output
+    assert "WARN  sched" not in m.output
     # The boot timeline is still complete (it is logged at warn if not).
     assert "WARN  boot" not in m.output
 

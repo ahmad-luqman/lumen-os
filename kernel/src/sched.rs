@@ -4,10 +4,11 @@
 //! hard rule 4), its saved `rsp` while it isn't running, and a [`State`].
 //! [`spawn`] starts one on this CPU, [`spawn_on`] on another; **a thread
 //! never moves**: it runs only on the CPU it was spawned on (its home), so
-//! only that CPU ever takes threads off its queue, and a thread's saved
-//! registers are touched only by that CPU, with interrupts off. Waking a
-//! thread from another CPU puts it on its home's queue and sends that CPU
-//! the `WAKEUP` IPI (in case it is halted in its idle loop).
+//! only that CPU ever takes threads off its queue, and once the spawner has
+//! laid out its first frame (published by the run queue's lock), a thread's
+//! saved registers are touched only by its home CPU, with interrupts off.
+//! Waking a thread from another CPU puts it on its home's queue and sends
+//! that CPU the `WAKEUP` IPI (in case it is halted in its idle loop).
 //!
 //! **Switching** ([`schedule`]) happens only with interrupts off and no
 //! critical section open (`arch::irq::depth() == 0`, asserted): a held
@@ -17,20 +18,31 @@
 //! interrupts off with `arch::irq::disable` and keeps whether they were on
 //! in a local on its own stack, restoring it when it runs again. The timer
 //! interrupt ([`tick`], 1 kHz on every CPU) preempts: it wakes sleepers
-//! whose deadline has passed and, when the running thread's slice
-//! ([`SLICE_TICKS`]) is used up and another thread is ready, switches; the
-//! preempted thread resumes inside the interrupt handler and `iretq`s back.
+//! whose deadline has passed and switches when another thread is ready and
+//! the running thread's slice ([`SLICE_TICKS`]) is used up, or the idle
+//! thread runs; the preempted thread resumes inside the interrupt handler
+//! and `iretq`s back.
 //!
 //! Every CPU has an idle thread, which runs only when nothing else is ready
 //! and is never queued: on an AP it is the AP's own `smp::ap_main` loop (on
 //! its main stack; `smp::run_on` jobs still run there), on the boot CPU a
 //! thread of its own. `kmain`'s context becomes the boot CPU's `main` thread
-//! (kmon, or the ktests).
+//! (kmon, or the ktests). A CPU's scheduler runs ([`running_on`]) from its
+//! timer's first tick on: until then nothing could wake a sleeper or preempt
+//! there, so threads can't be spawned there and `time::sleep` busy-waits.
 //!
 //! A thread that returns from its entry point (or calls [`exit`]) is dead;
-//! the next thread to run on its CPU frees its stack (the unmap's TLB flush
-//! is local, and that CPU is the one that ran on it), and only then does
-//! [`JoinHandle::join`] return.
+//! the next thread to run on its CPU frees its stack, and only then does
+//! [`JoinHandle::join`] return. The unmap's TLB flush is local: the home CPU
+//! ran on the stack; a spawner on another CPU wrote its first frame and may
+//! keep a stale entry for that page, which nothing uses again (stack
+//! addresses are never reused).
+//!
+//! Lock order: a wait queue's lock, then a CPU's run queue (only
+//! [`WaitQueue::wait_until`] nests them); then the heap, page tables and
+//! frame allocator. Every thread homed on a CPU has room reserved in its
+//! queues ([`Cpu::homed`]), so the timer interrupt never allocates; it does
+//! free (a dead thread's stack and record, in [`finish_switch`]).
 //!
 //! Every switch records a `switch` trace event (previous thread's id, next
 //! thread's id, the previous thread's state), and the crash report names the
@@ -58,14 +70,15 @@ use crate::{smp, time};
 /// CPU gets a turn.
 pub const SLICE_TICKS: u32 = 10;
 
-/// How long [`init`] waits, in all, for every other CPU's scheduler to start.
+/// How long [`init`] waits, in all, for every CPU's scheduler to start.
 const START_TIMEOUT_NS: u64 = 1_000_000_000;
 
 /// Where a thread is in its life.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
-    /// On its CPU's run queue (or about to be put there), waiting for a turn.
+    /// Waiting for a turn: on its CPU's run queue (or about to be put there),
+    /// or an idle thread that isn't running (never queued).
     Ready = 0,
     /// Its CPU's current thread.
     Running = 1,
@@ -78,19 +91,15 @@ pub enum State {
 }
 
 impl State {
-    fn from_raw(raw: u8) -> State {
-        match raw {
-            0 => State::Ready,
-            1 => State::Running,
-            2 => State::Sleeping,
-            3 => State::Blocked,
-            _ => State::Dead,
-        }
+    const ALL: [State; 5] = [State::Ready, State::Running, State::Sleeping, State::Blocked, State::Dead];
+
+    fn from_raw(raw: u8) -> Option<State> {
+        Self::ALL.into_iter().find(|&s| s as u8 == raw)
     }
 
     /// The name of the state whose number is `raw` (a trace event's), if any.
     pub fn name_of(raw: u64) -> Option<&'static str> {
-        u8::try_from(raw).ok().filter(|&r| r <= State::Dead as u8).map(|r| State::from_raw(r).name())
+        u8::try_from(raw).ok().and_then(State::from_raw).map(State::name)
     }
 
     pub fn name(self) -> &'static str {
@@ -107,16 +116,51 @@ impl State {
 /// A thread's entry point.
 type Entry = Box<dyn FnOnce() + Send>;
 
-/// A kernel thread.
+/// The `rsp` [`arch::context::switch`] saved while a thread isn't running
+/// (0 for a thread adopted from running code until it first switches away:
+/// never loaded, `schedule` asserts).
+struct SavedRsp(UnsafeCell<u64>);
+
+// SAFETY: only the thread's home CPU touches the value after the thread is
+// shared, inside `schedule` with interrupts off: it saves into it while
+// switching away from the thread and reads it while switching to it, and a
+// thread is never on two CPUs (it never moves; `schedule` asserts both
+// threads are its CPU's). The value the spawner stores before the thread is
+// shared is published by the run queue's lock.
+unsafe impl Sync for SavedRsp {}
+
+impl SavedRsp {
+    /// Where `switch` saves it.
+    ///
+    /// # Safety
+    /// On the thread's home CPU, with interrupts off.
+    unsafe fn slot(&self) -> *mut u64 {
+        self.0.get()
+    }
+
+    /// What `switch` loads.
+    ///
+    /// # Safety
+    /// On the thread's home CPU, with interrupts off, the thread not running.
+    unsafe fn get(&self) -> u64 {
+        // SAFETY: upheld by the caller: nothing writes it meanwhile.
+        unsafe { *self.0.get() }
+    }
+}
+
+/// A kernel thread. Threads never move between CPUs: if that ever changes,
+/// `SavedRsp`'s `Sync` argument, a woken thread sitting on its queue while
+/// it still runs (see [`WaitQueue::wait_until`]), the callers that keep
+/// `cpu_index()` across a switch, and freeing stacks with a local TLB flush
+/// all have to be revisited.
 pub struct Thread {
     id: u64,
     name: &'static str,
     /// Its home CPU, the only one it runs on.
     cpu: usize,
     state: AtomicU8,
-    /// The `rsp` [`arch::context::switch`] saved while it isn't running.
-    rsp: UnsafeCell<u64>,
-    /// Its stack, `None` for a thread made from code that was already
+    rsp: SavedRsp,
+    /// Its stack: `None` for a thread adopted from code that was already
     /// running on a stack it doesn't own (`main`, an AP's idle thread), and
     /// once freed after the thread died.
     stack: SpinLock<Option<KernelStack>>,
@@ -128,36 +172,22 @@ pub struct Thread {
     exited: WaitQueue,
 }
 
-// SAFETY: `rsp` is the only field without its own synchronization. Only the
-// thread's home CPU touches it, inside `schedule` with interrupts off: it
-// saves into it while switching away from the thread and reads it while
-// switching to it, and a thread is never on two CPUs (it never moves). The
-// value `spawn_on` stores before the thread is shared is published by the
-// run queue's lock.
-unsafe impl Sync for Thread {}
-
 impl Thread {
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests
-    pub fn id(&self) -> u64 {
-        self.id
+    /// A ready thread on CPU `cpu` with a fresh stack, that starts by
+    /// running `entry`.
+    fn spawned(name: &'static str, cpu: usize, entry: Entry) -> Result<Arc<Thread>, SpawnError> {
+        let stack = KernelStack::new(STACK_SIZE, StackKind::Thread).map_err(SpawnError::Stack)?;
+        // SAFETY: a fresh, mapped stack (page-aligned top) nothing runs on;
+        // the thread owns it, and it is freed only after the thread has died
+        // and its CPU has switched away from it.
+        let rsp = unsafe { arch::context::prepare(stack.range().top, thread_entry) };
+        Ok(Arc::new(Thread::new(name, cpu, State::Ready, rsp, Some(stack), Some(entry))))
     }
 
-    pub fn state(&self) -> State {
-        State::from_raw(self.state.load(Ordering::Acquire))
-    }
-
-    /// Its stack, unless it has none (see `stack`).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests
-    pub fn stack(&self) -> Option<StackRange> {
-        self.stack.lock().as_ref().map(KernelStack::range)
-    }
-
-    fn set_state(&self, state: State) {
-        self.state.store(state as u8, Ordering::Release);
-    }
-
-    fn transition(&self, from: State, to: State) -> bool {
-        self.state.compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    /// A thread for the code running now on this CPU, on a stack it doesn't
+    /// own.
+    fn adopted(name: &'static str) -> Arc<Thread> {
+        Arc::new(Thread::new(name, arch::cpu_index(), State::Running, 0, None, None))
     }
 
     fn new(
@@ -173,11 +203,37 @@ impl Thread {
             name,
             cpu,
             state: AtomicU8::new(state as u8),
-            rsp: UnsafeCell::new(rsp),
+            rsp: SavedRsp(UnsafeCell::new(rsp)),
             stack: SpinLock::new(stack),
             entry: SpinLock::new(entry),
             reaped: AtomicBool::new(false),
             exited: WaitQueue::new(),
+        }
+    }
+
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn state(&self) -> State {
+        State::from_raw(self.state.load(Ordering::Acquire)).expect("only a State is stored")
+    }
+
+    /// Its stack, unless it has none (see `stack`).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests
+    pub fn stack(&self) -> Option<StackRange> {
+        self.stack.lock().as_ref().map(KernelStack::range)
+    }
+
+    /// Move it from `from` to `to`, panicking if it wasn't in `from` (a
+    /// broken scheduler invariant: such a thread would be lost, or queued
+    /// twice).
+    fn change(&self, from: State, to: State) {
+        let moved = self.state.compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire);
+        if let Err(was) = moved {
+            let was = State::from_raw(was).map_or("?", State::name);
+            panic!("thread {} (id {}) was {was}, not {}, on its way to {}", self.name, self.id, from.name(), to.name());
         }
     }
 }
@@ -201,6 +257,10 @@ struct Cpu {
     /// The thread it last switched away from, kept alive until the switch
     /// is finished ([`finish_switch`]: a dead one's stack is freed there).
     switched_from: Option<Arc<Thread>>,
+    /// Threads homed here, not yet reaped (the idle thread aside): `ready`
+    /// and `sleepers` always have room for this many, so pushing onto them
+    /// never allocates (the timer interrupt does).
+    homed: usize,
     /// Ticks left in the current thread's slice.
     slice_left: u32,
 }
@@ -213,26 +273,44 @@ impl Cpu {
             ready: VecDeque::new(),
             sleepers: Vec::new(),
             switched_from: None,
+            homed: 0,
             slice_left: SLICE_TICKS,
         }
     }
 
+    /// Count one more thread homed here, and make room for it.
+    fn home(&mut self) {
+        self.homed += 1;
+        let (r, s) = (self.homed.saturating_sub(self.ready.len()), self.homed.saturating_sub(self.sleepers.len()));
+        self.ready.reserve(r);
+        self.sleepers.reserve(s);
+    }
+
+    fn running(&self) -> &Arc<Thread> {
+        self.current.as_ref().expect("a running scheduler has a current thread")
+    }
+
+    fn is_idle_thread(&self, t: &Arc<Thread>) -> bool {
+        self.idle.as_ref().is_some_and(|i| Arc::ptr_eq(i, t))
+    }
+
     fn on_idle(&self) -> bool {
-        match (&self.current, &self.idle) {
-            (Some(c), Some(i)) => Arc::ptr_eq(c, i),
-            _ => false,
-        }
+        self.current.as_ref().is_some_and(|c| self.is_idle_thread(c))
+    }
+
+    fn push_ready(&mut self, cpu: usize, t: Arc<Thread>) {
+        self.ready.push_back(t);
+        READY[cpu].store(self.ready.len(), Ordering::Release);
     }
 
     /// Make every sleeper whose deadline is `now` or earlier ready.
-    fn wake_sleepers(&mut self, now: u64) {
+    fn wake_sleepers(&mut self, cpu: usize, now: u64) {
         let mut i = 0;
         while i < self.sleepers.len() {
             if self.sleepers[i].0 <= now {
                 let (_, t) = self.sleepers.swap_remove(i);
-                if t.transition(State::Sleeping, State::Ready) {
-                    self.ready.push_back(t);
-                }
+                t.change(State::Sleeping, State::Ready);
+                self.push_ready(cpu, t);
             } else {
                 i += 1;
             }
@@ -241,17 +319,21 @@ impl Cpu {
 }
 
 static CPUS: [SpinLock<Cpu>; MAX_CPUS] = [const { SpinLock::new(Cpu::new()) }; MAX_CPUS];
-/// Whether each CPU's scheduler runs: its current and idle threads are set
-/// and its timer ticks. Only moves to true.
+/// Each CPU whose current and idle threads are set and whose timer is
+/// started: its next tick sets `RUNNING`.
+static ARMED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+/// Whether each CPU's scheduler runs: armed, and its timer has ticked. Only
+/// moves to true.
 static RUNNING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
-/// How many threads are on each CPU's run queue, for its idle loop to read
-/// without the lock.
+/// How many threads are on each CPU's run queue, so its idle loop can check
+/// for work without the lock.
 static READY: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
-/// Each CPU's current thread, for the crash reporter (lock-free). Points into
-/// an `Arc` that CPU's `current` (or, mid-switch, `switched_from`) holds.
+/// Each CPU's current thread, for the crash reporter (lock-free); only that
+/// CPU stores it. It points into an `Arc` that CPU's scheduler state holds:
+/// `current`, or, during a switch, `schedule`'s locals and then
+/// `switched_from` until the switch is finished (a crash never unwinds
+/// them). It is set to the next thread just before the switch itself.
 static CURRENT: [AtomicPtr<Thread>; MAX_CPUS] = [const { AtomicPtr::new(ptr::null_mut()) }; MAX_CPUS];
-/// Each CPU's idle thread (null until set), to tell it apart lock-free.
-static IDLE: [AtomicPtr<Thread>; MAX_CPUS] = [const { AtomicPtr::new(ptr::null_mut()) }; MAX_CPUS];
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Whether CPU `cpu`'s scheduler runs (threads can be spawned there).
@@ -259,39 +341,36 @@ pub fn running_on(cpu: usize) -> bool {
     RUNNING.get(cpu).is_some_and(|r| r.load(Ordering::Acquire))
 }
 
-/// The thread running on this CPU, once its scheduler is set up.
+/// The thread running on this CPU, once its threads are set up.
 pub fn current() -> Option<Arc<Thread>> {
     CPUS[arch::cpu_index()].lock().current.clone()
 }
 
 /// The running thread's id and name, for the crash report: lock-free, on
-/// the CPU that crashed (whose current thread can't change any more).
+/// the CPU that crashed (whose current thread can't change any more). Set
+/// from when this CPU's threads are set up (`sched::init` on the boot CPU,
+/// coming online on an AP).
 pub fn running_here() -> Option<(u64, &'static str)> {
     let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
-    // SAFETY: a non-null `CURRENT` points into an `Arc<Thread>` this CPU's
-    // run queue holds (as `current`, or `switched_from` until the switch is
-    // finished) for as long as it is stored here; only this CPU stores it.
+    // SAFETY: a non-null `CURRENT` points into an `Arc<Thread>` that stays
+    // alive while it is stored there (see `CURRENT`).
     (!t.is_null()).then(|| unsafe { ((*t).id, (*t).name) })
 }
 
-fn is_idle(cpu: usize) -> bool {
-    let idle = IDLE[cpu].load(Ordering::Relaxed);
-    !idle.is_null() && CURRENT[cpu].load(Ordering::Relaxed) == idle
-}
-
 /// Can the running thread block here? Only once this CPU's scheduler runs,
-/// not on its idle thread (which must always be ready to run), and with
-/// interrupts on and no critical section open (so not in an interrupt
-/// handler or with a lock held).
+/// with interrupts on and no critical section open (so not in an interrupt
+/// handler or with a lock held), and not on its idle thread (which must
+/// always be ready to run). In that order: the run queue's lock is taken
+/// last, only outside every critical section.
 fn can_block(cpu: usize) -> bool {
-    running_on(cpu) && arch::irq::enabled() && arch::irq::depth() == 0 && !is_idle(cpu)
+    running_on(cpu) && arch::irq::enabled() && arch::irq::depth() == 0 && !CPUS[cpu].lock().on_idle()
 }
 
 /// Why [`spawn_on`] refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpawnError {
-    /// That CPU's scheduler doesn't run (no such CPU, not online, or before
-    /// [`init`]).
+    /// That CPU's scheduler doesn't run (no such CPU, not online, before
+    /// [`init`], or its timer doesn't tick).
     NotRunning,
     /// No stack for it.
     Stack(StackError),
@@ -323,12 +402,12 @@ impl JoinHandle {
     /// calling thread (see [`WaitQueue::wait_until`] for where it can).
     pub fn join(self) {
         let t = &self.thread;
+        assert!(!current().is_some_and(|c| Arc::ptr_eq(&c, t)), "thread {t:?} joining itself");
         t.exited.wait_until(|| t.reaped.load(Ordering::Acquire));
     }
 }
 
 /// Start a thread running `f` on this CPU.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))]
 pub fn spawn(name: &'static str, f: impl FnOnce() + Send + 'static) -> Result<JoinHandle, SpawnError> {
     spawn_on(arch::cpu_index(), name, f)
 }
@@ -339,39 +418,19 @@ pub fn spawn_on(cpu: usize, name: &'static str, f: impl FnOnce() + Send + 'stati
     if !running_on(cpu) {
         return Err(SpawnError::NotRunning);
     }
-    let thread = Arc::new(new_thread(name, cpu, Box::new(f))?);
+    let thread = Thread::spawned(name, cpu, Box::new(f))?;
+    CPUS[cpu].lock().home();
     enqueue(thread.clone());
     Ok(JoinHandle { thread })
 }
 
-/// A ready thread with a fresh stack, that starts by running `entry`.
-fn new_thread(name: &'static str, cpu: usize, entry: Entry) -> Result<Thread, SpawnError> {
-    let stack = KernelStack::new(STACK_SIZE, StackKind::Thread).map_err(SpawnError::Stack)?;
-    // SAFETY: a fresh, mapped stack (page-aligned top) nothing runs on; the
-    // thread owns it, and it is freed only after the thread has died and its
-    // CPU has switched away from it.
-    let rsp = unsafe { arch::context::prepare(stack.range().top, thread_entry) };
-    Ok(Thread::new(name, cpu, State::Ready, rsp, Some(stack), Some(entry)))
-}
-
-/// A thread for the code running now on this CPU, on a stack it doesn't own.
-fn adopt(name: &'static str) -> Arc<Thread> {
-    Arc::new(Thread::new(name, arch::cpu_index(), State::Running, 0, None, None))
-}
-
 /// Put a ready thread on its CPU's queue, and wake that CPU if it isn't this
-/// one (it may be halted in its idle loop; if the IPI can't be sent, its next
-/// tick picks the thread up).
+/// one (it may be halted in its idle loop). If the wakeup IPI can't be sent,
+/// the CPU's next tick finds the thread (its scheduler runs, so it ticks).
 fn enqueue(thread: Arc<Thread>) {
     let cpu = thread.cpu;
-    {
-        let mut q = CPUS[cpu].lock();
-        q.ready.push_back(thread);
-        READY[cpu].store(q.ready.len(), Ordering::Release);
-    }
-    if cpu != arch::cpu_index() {
-        smp::wake(cpu);
-    }
+    CPUS[cpu].lock().push_ready(cpu, thread);
+    let _ = smp::wake(cpu);
 }
 
 /// Where every spawned thread starts (through `arch::context`), on its own
@@ -379,11 +438,13 @@ fn enqueue(thread: Arc<Thread>) {
 /// section open.
 extern "C" fn thread_entry() -> ! {
     finish_switch(arch::cpu_index());
-    arch::irq::enable();
-    let me = current().expect("a thread runs on a CPU with a scheduler");
-    let entry = me.entry.lock().take().expect("a thread starts once");
-    drop(me);
-    entry();
+    // Not `irq::enable`: if another CPU is reporting a crash, interrupts
+    // stay off (and its stop NMI halts this CPU).
+    arch::irq::restore(true);
+    // No reference to itself is kept across the entry (`exit` never
+    // returns, so it would never be dropped).
+    let entry = current().expect("a thread runs on a CPU with a scheduler").entry.lock().take();
+    entry.expect("a thread starts once")();
     exit()
 }
 
@@ -400,10 +461,13 @@ pub fn yield_now() {
     arch::irq::restore(were_on);
 }
 
-/// Block the running thread for at least `ns` nanoseconds (by `now_ns`; the
-/// tick on its CPU wakes it, so up to a tick later, or more where an
-/// emulator delivers ticks late). Returns false, doing nothing, where it
-/// can't block (see [`can_block`]): `time::sleep` busy-waits then.
+/// Block the running thread for at least `ns` nanoseconds (by `now_ns`): the
+/// first tick on its CPU after the deadline makes it ready, and it runs when
+/// its turn comes (at once if the CPU is idle, else after the running
+/// thread's slice and the threads ahead of it; later where an emulator
+/// delivers ticks late). Returns false, doing nothing, where it can't block
+/// (see [`can_block`]): `time::sleep` busy-waits then.
+#[must_use = "false means it didn't sleep"]
 pub fn sleep(ns: u64) -> bool {
     let cpu = arch::cpu_index();
     if !can_block(cpu) {
@@ -413,8 +477,8 @@ pub fn sleep(ns: u64) -> bool {
     let were_on = arch::irq::disable();
     {
         let mut q = CPUS[cpu].lock();
-        let me = q.current.clone().expect("a running scheduler has a current thread");
-        me.set_state(State::Sleeping);
+        let me = q.running().clone();
+        me.change(State::Running, State::Sleeping);
         q.sleepers.push((deadline, me));
     }
     schedule(cpu);
@@ -423,12 +487,18 @@ pub fn sleep(ns: u64) -> bool {
 }
 
 /// End the running thread (a thread's entry returning does this). Its stack
-/// is freed by the next thread on its CPU, and then its joiners wake.
+/// is freed by the next thread on its CPU, and then its joiners wake. Only a
+/// spawned thread can exit (not `main` or an idle thread).
 pub fn exit() -> ! {
     let cpu = arch::cpu_index();
-    assert!(running_on(cpu) && !is_idle(cpu), "only a spawned thread can exit");
+    assert!(running_on(cpu), "exit where no scheduler runs");
     let _ = arch::irq::disable();
-    CPUS[cpu].lock().current.as_ref().expect("a running scheduler has a current thread").set_state(State::Dead);
+    {
+        let q = CPUS[cpu].lock();
+        let me = q.running();
+        assert!(me.stack.lock().is_some(), "only a spawned thread can exit, not {me:?}");
+        me.change(State::Running, State::Dead);
+    }
     schedule(cpu);
     unreachable!("a dead thread was switched back to")
 }
@@ -443,12 +513,15 @@ fn schedule(cpu: usize) {
     assert!(!arch::irq::enabled() && arch::irq::depth() == 0, "switching threads with interrupts on or a lock held");
     let (save, load) = {
         let mut q = CPUS[cpu].lock();
+        assert!(q.switched_from.is_none(), "the last switch on cpu {cpu} wasn't finished");
         let prev = q.current.take().expect("a running scheduler has a current thread");
-        let prev_is_idle = q.idle.as_ref().is_some_and(|i| Arc::ptr_eq(i, &prev));
-        if prev_is_idle {
-            prev.set_state(State::Ready);
-        } else if prev.transition(State::Running, State::Ready) {
-            q.ready.push_back(prev.clone());
+        assert_eq!(prev.cpu, cpu, "thread {prev:?} isn't cpu {cpu}'s");
+        if q.is_idle_thread(&prev) {
+            prev.change(State::Running, State::Ready);
+        } else if prev.state() == State::Running {
+            // Only this CPU moves its running thread out of Running.
+            prev.change(State::Running, State::Ready);
+            q.push_ready(cpu, prev.clone());
         }
         let next = match q.ready.pop_front() {
             Some(t) => t,
@@ -456,23 +529,24 @@ fn schedule(cpu: usize) {
         };
         READY[cpu].store(q.ready.len(), Ordering::Release);
         q.slice_left = SLICE_TICKS;
-        next.set_state(State::Running);
+        assert_eq!(next.cpu, cpu, "thread {next:?} isn't cpu {cpu}'s");
+        next.change(State::Ready, State::Running);
         if Arc::ptr_eq(&next, &prev) {
             q.current = Some(next);
             return;
         }
         crate::ktrace!(Kind::Switch, prev.id, next.id, prev.state());
         CURRENT[cpu].store(Arc::as_ptr(&next).cast_mut(), Ordering::Release);
-        let save = prev.rsp.get();
-        // SAFETY: this CPU is `next`'s home, the only one that touches its
-        // `rsp`, and it isn't running it (see `Thread`'s `Sync`).
-        let load = unsafe { *next.rsp.get() };
+        // SAFETY: this CPU is both threads' home (asserted), interrupts are
+        // off, and `next` isn't running.
+        let (save, load) = unsafe { (prev.rsp.slot(), next.rsp.get()) };
+        assert!(load != 0, "switching to thread {next:?}, which has no saved context");
         q.current = Some(next);
         q.switched_from = Some(prev);
         (save, load)
     };
     // SAFETY: interrupts are off (asserted above); `save` is the running
-    // thread's `rsp` cell, which `switched_from` keeps alive until the next
+    // thread's `rsp` slot, which `switched_from` keeps alive until the next
     // thread has finished the switch; `load` was saved by `switch` (or made
     // by `context::prepare`) on `next`'s stack, which stays mapped until it
     // dies and is switched away from, and which no CPU runs on (`next` is
@@ -483,30 +557,43 @@ fn schedule(cpu: usize) {
 
 /// Finish a switch on CPU `cpu`, on the thread switched to: let go of the
 /// thread switched away from, and if it is dead, free its stack (on its own
-/// CPU, which ran on it, so the unmap's local TLB flush is enough) and wake
-/// its joiners. Interrupts off.
+/// CPU, which ran on it: see the module docs on the TLB) and wake its
+/// joiners. Interrupts off.
 fn finish_switch(cpu: usize) {
-    let Some(prev) = CPUS[cpu].lock().switched_from.take() else { return };
-    if prev.state() == State::Dead {
-        drop(prev.stack.lock().take());
-        prev.reaped.store(true, Ordering::Release);
-        prev.exited.wake_all();
-    }
+    let prev = {
+        let mut q = CPUS[cpu].lock();
+        let prev = q.switched_from.take();
+        if prev.as_ref().is_some_and(|p| p.state() == State::Dead) {
+            q.homed -= 1;
+        }
+        prev
+    };
+    let Some(prev) = prev.filter(|p| p.state() == State::Dead) else { return };
+    let stack = prev.stack.lock().take();
+    drop(stack);
+    prev.reaped.store(true, Ordering::Release);
+    prev.exited.wake_all();
 }
 
-/// The timer interrupt on this CPU (interrupts off, EOI sent): wake the
-/// sleepers whose deadline has passed, and switch threads if the running
-/// one's slice is used up (or the idle thread runs) and another is ready.
+/// The timer interrupt on this CPU (interrupts off, EOI sent): the first
+/// tick of an armed CPU starts its scheduler; after that, wake the sleepers
+/// whose deadline has passed, and switch threads if another is ready and
+/// the running one's slice is used up (or the idle thread runs).
 pub fn tick() {
     let cpu = arch::cpu_index();
-    if !running_on(cpu) || arch::irq::depth() != 0 {
+    if !running_on(cpu) {
+        if ARMED[cpu].load(Ordering::Acquire) {
+            RUNNING[cpu].store(true, Ordering::Release);
+        }
         return;
     }
+    // Interrupts arrive only outside every critical section (they are off
+    // inside).
+    assert_eq!(arch::irq::depth(), 0, "a timer interrupt inside a critical section");
     let now = time::now_ns();
     let switch = {
         let mut q = CPUS[cpu].lock();
-        q.wake_sleepers(now);
-        READY[cpu].store(q.ready.len(), Ordering::Release);
+        q.wake_sleepers(cpu, now);
         q.slice_left = q.slice_left.saturating_sub(1);
         !q.ready.is_empty() && (q.slice_left == 0 || q.on_idle())
     };
@@ -516,6 +603,7 @@ pub fn tick() {
 }
 
 /// Threads waiting for something; whoever makes it happen wakes them.
+/// Dropping one with threads waiting panics (they would never wake).
 pub struct WaitQueue {
     waiters: SpinLock<VecDeque<Arc<Thread>>>,
 }
@@ -528,11 +616,15 @@ impl WaitQueue {
     /// Block the running thread until `ready()`. `ready` is checked with the
     /// queue's lock held, so a waker that makes it true and then calls
     /// [`wake_one`](Self::wake_one) or [`wake_all`](Self::wake_all) can't be
-    /// missed; it must not block or take a lock held around a wake. Panics
+    /// missed; it must not block or take a lock held around a wake. A thread
+    /// woken while `ready()` is still false waits again, at the back. Panics
     /// where the thread can't block (see [`can_block`]).
     pub fn wait_until(&self, mut ready: impl FnMut() -> bool) {
         let cpu = arch::cpu_index();
-        assert!(can_block(cpu), "blocking where a thread can't (no scheduler, the idle thread, or interrupts off)");
+        assert!(
+            can_block(cpu),
+            "blocking where a thread can't (no scheduler, interrupts off, a lock held, or the idle thread)"
+        );
         loop {
             let were_on = arch::irq::disable();
             {
@@ -542,11 +634,11 @@ impl WaitQueue {
                     arch::irq::restore(were_on);
                     return;
                 }
-                let me = CPUS[cpu].lock().current.clone().expect("a running scheduler has a current thread");
+                let me = CPUS[cpu].lock().running().clone();
                 // A waker on another CPU may make it ready (and queue it)
                 // before this CPU switches away: `schedule` then neither
                 // queues it again nor loses it.
-                me.set_state(State::Blocked);
+                me.change(State::Running, State::Blocked);
                 waiters.push_back(me);
             }
             schedule(cpu);
@@ -570,84 +662,96 @@ impl WaitQueue {
     }
 }
 
-fn wake(thread: Arc<Thread>) {
-    if thread.transition(State::Blocked, State::Ready) {
-        enqueue(thread);
+impl Drop for WaitQueue {
+    fn drop(&mut self) {
+        assert!(self.waiters.lock().is_empty(), "a wait queue dropped with threads waiting on it");
     }
 }
 
-/// Run the scheduler on the boot CPU: `kmain`'s context becomes the `main`
-/// thread, the boot CPU gets an idle thread, and the other CPUs are woken
-/// to start their timers and schedulers (each AP's idle loop does that once
-/// the timer count is published); waits for them, bounded. After
-/// `time::init` and `smp::wait_online`, with interrupts on.
+/// Make a thread taken off a wait queue ready (only blocked threads are on
+/// one, and each is taken off before it is woken).
+fn wake(thread: Arc<Thread>) {
+    thread.change(State::Blocked, State::Ready);
+    enqueue(thread);
+}
+
+/// Make `current` CPU `cpu`'s running thread and `idle` its idle thread.
+fn install(cpu: usize, current: Arc<Thread>, idle: Arc<Thread>) {
+    let mut q = CPUS[cpu].lock();
+    CURRENT[cpu].store(Arc::as_ptr(&current).cast_mut(), Ordering::Release);
+    q.current = Some(current);
+    q.idle = Some(idle);
+}
+
+/// Set up the boot CPU's threads: `kmain`'s context becomes the `main`
+/// thread, and the boot CPU gets an idle thread. Then wake the other CPUs
+/// to start their timers (each AP's idle loop does once the timer count is
+/// published) and wait, bounded, until every CPU's scheduler runs (from its
+/// timer's first tick). After `time::init` and `smp::wait_online`, with
+/// interrupts on.
 pub fn init() {
     assert_eq!(arch::cpu_index(), 0, "sched::init is for the boot CPU");
     assert!(time::timer_published(), "sched::init before time::init");
-    let idle = Arc::new(
-        new_thread("idle", 0, Box::new(|| idle_loop(0, || false, || {})))
-            .unwrap_or_else(|e| panic!("the boot CPU's idle thread: {e}")),
-    );
-    let main = adopt("main");
-    {
-        let mut q = CPUS[0].lock();
-        CURRENT[0].store(Arc::as_ptr(&main).cast_mut(), Ordering::Release);
-        IDLE[0].store(Arc::as_ptr(&idle).cast_mut(), Ordering::Release);
-        q.current = Some(main);
-        q.idle = Some(idle);
+    let idle = Thread::spawned("idle", 0, Box::new(|| idle_loop(0, || false, || {})))
+        .unwrap_or_else(|e| panic!("the boot CPU's idle thread: {e}"));
+    install(0, Thread::adopted("main"), idle);
+    CPUS[0].lock().home(); // `main`
+    // The boot CPU's timer already runs (`time::init`).
+    ARMED[0].store(true, Ordering::Release);
+    let aps: Vec<usize> = (1..MAX_CPUS).filter(|&c| smp::online_lapic_id(c).is_some()).collect();
+    for &cpu in &aps {
+        if !smp::wake(cpu) {
+            warn!(target: "sched", "cpu {cpu}: the wakeup IPI wasn't sent; its scheduler starts only once it wakes");
+        }
     }
-    // The boot CPU's timer already ticks (`time::init`).
-    RUNNING[0].store(true, Ordering::Release);
-    let cpus: Vec<usize> = (1..MAX_CPUS).filter(|&c| smp::online_lapic_id(c).is_some()).collect();
-    for &cpu in &cpus {
-        smp::wake(cpu);
-    }
+    let cpus: Vec<usize> = core::iter::once(0).chain(aps).collect();
     let deadline = time::now_ns() + START_TIMEOUT_NS;
     while !cpus.iter().all(|&c| running_on(c)) && time::now_ns() < deadline {
         core::hint::spin_loop();
     }
     for &cpu in cpus.iter().filter(|&&c| !running_on(c)) {
-        warn!(target: "sched", "cpu {cpu}'s scheduler didn't start: its threads can't run");
+        let why =
+            if ARMED[cpu].load(Ordering::Acquire) { "its timer doesn't tick" } else { "it didn't start its timer" };
+        warn!(target: "sched", "cpu {cpu}'s scheduler didn't start in 1 s ({why}): no threads run there");
     }
-    let n = 1 + cpus.iter().filter(|&&c| running_on(c)).count();
+    let n = cpus.iter().filter(|&&c| running_on(c)).count();
     info!(target: "sched", "threads on {n} CPU{}, {SLICE_TICKS} ms slices", if n == 1 { "" } else { "s" });
 }
 
 /// An AP's life from `smp::ap_main` on: its running context becomes its idle
-/// thread, which starts its timer and scheduler once the boot CPU publishes
-/// the timer's count, runs ready threads, and runs the job `run_job` takes
-/// whenever `has_job()` (`smp::run_on`'s mailbox, from these frames, so a
-/// crash in a job backtraces through `ap_main`).
+/// thread, which starts its timer (and with the first tick its scheduler)
+/// once the boot CPU publishes the timer's count, runs ready threads, and
+/// runs the job `run_job` takes whenever `has_job()` (`smp::run_on`'s
+/// mailbox, from these frames, so a crash in a job backtraces through
+/// `ap_main`).
 pub fn run_ap_idle(has_job: impl Fn() -> bool, run_job: impl Fn()) -> ! {
     let cpu = arch::cpu_index();
-    let me = adopt("idle");
-    {
-        let mut q = CPUS[cpu].lock();
-        CURRENT[cpu].store(Arc::as_ptr(&me).cast_mut(), Ordering::Release);
-        IDLE[cpu].store(Arc::as_ptr(&me).cast_mut(), Ordering::Release);
-        q.current = Some(me.clone());
-        q.idle = Some(me);
-    }
+    let me = Thread::adopted("idle");
+    install(cpu, me.clone(), me);
     idle_loop(cpu, has_job, run_job);
     unreachable!("an idle loop returned")
 }
 
 /// A CPU's idle thread: halt until there is work (a ready thread, a job, or
-/// for an AP whose timer isn't running yet, the timer's count), then do it.
+/// for an AP whose timer isn't started yet, the timer's count), then do it.
+/// It never blocks: a job that sleeps busy-waits, and one that waits on a
+/// queue panics.
 fn idle_loop(cpu: usize, has_job: impl Fn() -> bool, run_job: impl Fn()) {
     loop {
-        if !running_on(cpu) {
+        if !ARMED[cpu].load(Ordering::Acquire) {
             let started = {
                 let _off = arch::irq::push_off();
                 time::start_timer_here()
             };
             if started {
-                RUNNING[cpu].store(true, Ordering::Release);
+                ARMED[cpu].store(true, Ordering::Release);
             }
         }
         // Checked with interrupts off: a wakeup can't slip in before the halt.
         arch::irq::wait_unless(|| {
-            READY[cpu].load(Ordering::Acquire) > 0 || has_job() || (!running_on(cpu) && time::timer_published())
+            READY[cpu].load(Ordering::Acquire) > 0
+                || has_job()
+                || (!ARMED[cpu].load(Ordering::Acquire) && time::timer_published())
         });
         run_job();
         yield_now();
@@ -664,62 +768,19 @@ fn running_cpus() -> Vec<usize> {
 }
 
 /// How long a test waits for threads to make progress before failing (no
-/// test waits this long when it passes; bounded so a broken scheduler fails
-/// instead of hanging).
+/// test waits this long when it passes). Waits on the threads' progress are
+/// bounded by it, so a thread that never runs fails the test instead of
+/// hanging it.
 #[cfg(feature = "ktest")]
 const TEST_DEADLINE_NS: u64 = 10_000_000_000;
 
-/// Spawn two threads on `cpu` that never yield, and check that they
-/// interleave: each counts its own loops, and runs until both have seen the
-/// other's count move on three separate occasions (so each was switched
-/// away from and back to at least three times, by preemption alone). Each
-/// also checks it always runs on `cpu`.
+/// `spawn_on` for tests: the error as a diag line and a test failure.
 #[cfg(feature = "ktest")]
-fn interleave_on(cpu: usize) -> crate::ktest::TestResult {
-    use crate::kassert;
-    struct Shared {
-        counts: [AtomicU64; 2],
-        seen: [AtomicU64; 2],
-        wrong_cpu: AtomicBool,
-        deadline: u64,
-    }
-    let shared = Arc::new(Shared {
-        counts: [AtomicU64::new(0), AtomicU64::new(0)],
-        seen: [AtomicU64::new(0), AtomicU64::new(0)],
-        wrong_cpu: AtomicBool::new(false),
-        deadline: time::now_ns() + TEST_DEADLINE_NS,
-    });
-    let spin = |me: usize, s: Arc<Shared>| {
-        move || {
-            let other = 1 - me;
-            let mut last = s.counts[other].load(Ordering::Relaxed);
-            loop {
-                let both = s.seen[0].load(Ordering::Relaxed) >= 3 && s.seen[1].load(Ordering::Relaxed) >= 3;
-                if both || time::now_ns() > s.deadline {
-                    break;
-                }
-                if arch::cpu_index() != cpu {
-                    s.wrong_cpu.store(true, Ordering::Relaxed);
-                }
-                s.counts[me].fetch_add(1, Ordering::Relaxed);
-                let now = s.counts[other].load(Ordering::Relaxed);
-                if now != last {
-                    last = now;
-                    s.seen[me].fetch_add(1, Ordering::Relaxed);
-                }
-                core::hint::spin_loop();
-            }
-        }
-    };
-    let a = spawn_on(cpu, "spin-a", spin(0, shared.clone())).map_err(|_| "spawn failed")?;
-    let b = spawn_on(cpu, "spin-b", spin(1, shared.clone())).map_err(|_| "spawn failed")?;
-    a.join();
-    b.join();
-    let seen = [shared.seen[0].load(Ordering::Relaxed), shared.seen[1].load(Ordering::Relaxed)];
-    crate::ktest::diag(format_args!("cpu {cpu}: each saw the other run {seen:?} times"));
-    kassert!(seen[0] >= 3 && seen[1] >= 3);
-    kassert!(!shared.wrong_cpu.load(Ordering::Relaxed));
-    Ok(())
+fn spawn_test(cpu: usize, name: &'static str, f: impl FnOnce() + Send + 'static) -> Result<JoinHandle, &'static str> {
+    spawn_on(cpu, name, f).map_err(|e| {
+        crate::ktest::diag(format_args!("spawning {name} on cpu {cpu}: {e}"));
+        "spawn failed"
+    })
 }
 
 /// Yield until `done()` or the test deadline; whether `done()`.
@@ -735,23 +796,94 @@ fn yield_until(done: impl Fn() -> bool) -> bool {
     true
 }
 
+/// `join`, failing instead of hanging if the thread isn't reaped by the test
+/// deadline.
+#[cfg(feature = "ktest")]
+fn join_bounded(h: JoinHandle) -> crate::ktest::TestResult {
+    let t = h.thread.clone();
+    if !yield_until(|| t.reaped.load(Ordering::Acquire)) {
+        crate::ktest::diag(format_args!("{t:?} wasn't reaped"));
+        return Err("a thread didn't finish");
+    }
+    h.join();
+    Ok(())
+}
+
+/// Whether the current CPU's ring has, from `start` on, a switch away from
+/// thread `id` in state `state`.
+#[cfg(feature = "ktest")]
+fn switched_away(start: u64, id: u64, state: State) -> bool {
+    let ring = crate::trace::ring();
+    (start..ring.written())
+        .filter_map(|seq| ring.read(seq))
+        .any(|e| e.kind == Kind::Switch as u16 && e.args[0] == id && e.args[2] == state as u64)
+}
+
+/// Spawn two threads on `cpu` that never yield, and check that they
+/// interleave: each counts its own loops, and runs until both have seen the
+/// other's count move on [`ROUNDS`] separate occasions (so each was switched
+/// away from and back to that often, by preemption alone). Each also checks
+/// it always runs on `cpu`.
+#[cfg(feature = "ktest")]
+fn interleave_on(cpu: usize) -> crate::ktest::TestResult {
+    use crate::kassert;
+    const ROUNDS: u64 = 3;
+    #[derive(Default)]
+    struct Shared {
+        counts: [AtomicU64; 2],
+        seen: [AtomicU64; 2],
+        wrong_cpu: AtomicBool,
+    }
+    let shared = Arc::new(Shared::default());
+    let deadline = time::now_ns() + TEST_DEADLINE_NS;
+    let spin = |me: usize, s: Arc<Shared>| {
+        move || {
+            let other = 1 - me;
+            let mut last = s.counts[other].load(Ordering::Relaxed);
+            while s.seen.iter().any(|n| n.load(Ordering::Relaxed) < ROUNDS) && time::now_ns() <= deadline {
+                if arch::cpu_index() != cpu {
+                    s.wrong_cpu.store(true, Ordering::Relaxed);
+                }
+                s.counts[me].fetch_add(1, Ordering::Relaxed);
+                let now = s.counts[other].load(Ordering::Relaxed);
+                if now != last {
+                    last = now;
+                    s.seen[me].fetch_add(1, Ordering::Relaxed);
+                }
+                core::hint::spin_loop();
+            }
+        }
+    };
+    let a = spawn_test(cpu, "spin-a", spin(0, shared.clone()))?;
+    let b = spawn_test(cpu, "spin-b", spin(1, shared.clone()))?;
+    join_bounded(a)?;
+    join_bounded(b)?;
+    let seen = [shared.seen[0].load(Ordering::Relaxed), shared.seen[1].load(Ordering::Relaxed)];
+    crate::ktest::diag(format_args!("cpu {cpu}: each saw the other run {seen:?} times"));
+    kassert!(seen.iter().all(|&n| n >= ROUNDS));
+    kassert!(!shared.wrong_cpu.load(Ordering::Relaxed));
+    Ok(())
+}
+
 crate::ktest!(
     fn two_threads_interleave() {
-        // On this CPU, while `main` waits for them: preemption by the timer
-        // alone switches between two threads that never yield.
+        // On this CPU, alongside `main`: preemption by the timer alone
+        // switches between two threads that never yield.
         interleave_on(arch::cpu_index())
     }
 );
 
 crate::ktest!(
     fn threads_run_on_every_cpu() {
-        // Two non-yielding threads on every CPU interleave there (so every
-        // CPU's timer preempts), and never run anywhere else.
-        use crate::kassert;
+        // Every online CPU runs a scheduler; two non-yielding threads on
+        // each interleave there (so every CPU's timer preempts), and never
+        // run anywhere else.
+        use crate::{kassert, kassert_eq};
         let cpus = running_cpus();
+        let online: Vec<usize> = (0..MAX_CPUS).filter(|&c| smp::online_lapic_id(c).is_some()).collect();
         crate::ktest::diag(format_args!("schedulers on cpus {cpus:?}"));
+        kassert_eq!(cpus, online);
         kassert!(cpus.len() > 1);
-        kassert!(cpus.iter().all(|&c| smp::online_lapic_id(c).is_some()));
         for cpu in cpus {
             interleave_on(cpu)?;
         }
@@ -760,24 +892,129 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn slices_are_10_ticks() {
+        // On an AP (nothing else ready there), two non-yielding threads each
+        // note the CPU's tick count whenever they see the other has run:
+        // from the second turn on, 2 slices (20 ticks) apart. Counted in
+        // ticks, not time, so late emulated ticks don't matter.
+        use crate::{kassert, kassert_eq};
+        const MARKS: usize = 6;
+        #[derive(Default)]
+        struct Shared {
+            counts: [AtomicU64; 2],
+            marks: [[AtomicU64; MARKS]; 2],
+            taken: [AtomicUsize; 2],
+        }
+        kassert_eq!(SLICE_TICKS, 10);
+        let cpu = *running_cpus().last().ok_or("no CPU")?;
+        kassert!(cpu != arch::cpu_index());
+        let s = Arc::new(Shared::default());
+        let deadline = time::now_ns() + TEST_DEADLINE_NS;
+        let mark = |me: usize, s: Arc<Shared>| {
+            move || {
+                let other = 1 - me;
+                let mut last = s.counts[other].load(Ordering::Relaxed);
+                while s.taken.iter().any(|n| n.load(Ordering::Relaxed) < MARKS) && time::now_ns() <= deadline {
+                    s.counts[me].fetch_add(1, Ordering::Relaxed);
+                    let now = s.counts[other].load(Ordering::Relaxed);
+                    if now != last {
+                        last = now;
+                        let i = s.taken[me].load(Ordering::Relaxed);
+                        if i < MARKS {
+                            s.marks[me][i].store(arch::idt::ticks_on(cpu), Ordering::Relaxed);
+                            s.taken[me].store(i + 1, Ordering::Relaxed);
+                        }
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+        };
+        let a = spawn_test(cpu, "slice-a", mark(0, s.clone()))?;
+        let b = spawn_test(cpu, "slice-b", mark(1, s.clone()))?;
+        join_bounded(a)?;
+        join_bounded(b)?;
+        kassert_eq!(s.taken[0].load(Ordering::Relaxed), MARKS);
+        let marks: Vec<u64> = s.marks[0].iter().map(|m| m.load(Ordering::Relaxed)).collect();
+        let gaps: Vec<u64> = marks.windows(2).map(|w| w[1] - w[0]).collect();
+        crate::ktest::diag(format_args!("ticks between spin-a's turns: {gaps:?}"));
+        kassert!(gaps[1..].iter().all(|&g| g == 2 * u64::from(SLICE_TICKS)));
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn sleeping_thread_wakes() {
-        // A thread sleeping 20 ms blocks (it is seen sleeping while `main`
-        // runs on the same CPU) and wakes no earlier than its deadline.
+        // A thread sleeping 20 ms blocks (its CPU switches away from it,
+        // sleeping) and wakes no earlier than its deadline.
         use crate::kassert;
+        let start = crate::trace::ring().written();
         let elapsed = Arc::new(AtomicU64::new(0));
         let out = elapsed.clone();
-        let h = spawn("sleeper", move || {
+        let h = spawn_test(arch::cpu_index(), "sleeper", move || {
             let t0 = time::now_ns();
             time::sleep(20_000_000);
             out.store(time::now_ns() - t0, Ordering::Relaxed);
-        })
-        .map_err(|_| "spawn failed")?;
-        let seen_sleeping = yield_until(|| h.thread().state() == State::Sleeping);
-        h.join();
+        })?;
+        let id = h.thread().id();
+        join_bounded(h)?;
         let ns = elapsed.load(Ordering::Relaxed);
         crate::ktest::diag(format_args!("slept {ns} ns"));
-        kassert!(seen_sleeping);
+        kassert!(switched_away(start, id, State::Sleeping));
         kassert!(ns >= 20_000_000);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn time_sleep_spins_where_a_thread_cannot_block() {
+        // Where a thread can't block, `time::sleep` busy-waits: the whole
+        // time passes and the CPU switches no thread. With a lock held, with
+        // interrupts off, and on an AP's idle thread (a `run_on` job).
+        use crate::kassert;
+        static LOCK: SpinLock<()> = SpinLock::new(());
+        static ELAPSED: AtomicU64 = AtomicU64::new(0);
+        const NS: u64 = 2_000_000;
+        let ring = crate::trace::ring();
+        let switched =
+            |from: u64| (from..ring.written()).filter_map(|s| ring.read(s)).any(|e| e.kind == Kind::Switch as u16);
+        let (w0, t0) = (ring.written(), time::now_ns());
+        {
+            let _held = LOCK.lock();
+            time::sleep(NS);
+        }
+        kassert!(time::now_ns() - t0 >= NS && !switched(w0));
+        let were_on = arch::irq::disable();
+        let (w1, t1) = (ring.written(), time::now_ns());
+        time::sleep(NS);
+        let spun = time::now_ns() - t1 >= NS && !switched(w1);
+        arch::irq::restore(were_on);
+        kassert!(spun);
+        let cpu = *running_cpus().last().ok_or("no CPU")?;
+        ELAPSED.store(0, Ordering::Relaxed);
+        smp::run_on(cpu, || {
+            let t = time::now_ns();
+            time::sleep(NS);
+            ELAPSED.store(time::now_ns() - t + 1, Ordering::Release);
+        })
+        .map_err(|_| "run_on failed")?;
+        kassert!(yield_until(|| ELAPSED.load(Ordering::Acquire) != 0));
+        kassert!(ELAPSED.load(Ordering::Acquire) > NS);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn yielding_with_interrupts_off_keeps_them_off() {
+        // A switch away and back restores this thread's own interrupt state,
+        // not the other thread's.
+        use crate::kassert;
+        let other = spawn_test(arch::cpu_index(), "other", || {})?;
+        let were_on = arch::irq::disable();
+        yield_now();
+        let still_off = !arch::irq::enabled();
+        arch::irq::restore(were_on);
+        join_bounded(other)?;
+        kassert!(were_on && still_off);
         Ok(())
     }
 );
@@ -786,11 +1023,13 @@ crate::ktest!(
     fn wait_queue_wakes_a_blocked_thread() {
         // A thread waiting on a queue blocks until its condition holds and
         // it is woken: on this CPU, and from another (the remote wake path:
-        // its home's queue and a wakeup IPI).
+        // its home's queue and a wakeup IPI). Woken without its condition,
+        // it checks again (counted) and blocks again.
         use crate::{kassert, kassert_eq};
         struct Shared {
             queue: WaitQueue,
             go: AtomicBool,
+            checks: AtomicU64,
             passed: AtomicBool,
         }
         let mut cpus = running_cpus();
@@ -799,23 +1038,26 @@ crate::ktest!(
             let s = Arc::new(Shared {
                 queue: WaitQueue::new(),
                 go: AtomicBool::new(false),
+                checks: AtomicU64::new(0),
                 passed: AtomicBool::new(false),
             });
             let t = s.clone();
-            let h = spawn_on(cpu, "waiter", move || {
-                t.queue.wait_until(|| t.go.load(Ordering::Acquire));
+            let h = spawn_test(cpu, "waiter", move || {
+                t.queue.wait_until(|| {
+                    t.checks.fetch_add(1, Ordering::AcqRel);
+                    t.go.load(Ordering::Acquire)
+                });
                 t.passed.store(true, Ordering::Release);
-            })
-            .map_err(|_| "spawn failed")?;
-            kassert!(yield_until(|| h.thread().state() == State::Blocked));
-            kassert!(!s.passed.load(Ordering::Acquire));
-            // Woken without its condition: it blocks again.
+            })?;
+            let blocked = || h.thread().state() == State::Blocked && !s.queue.waiters.lock().is_empty();
+            kassert!(yield_until(blocked));
+            kassert_eq!(s.checks.load(Ordering::Acquire), 1);
             kassert!(s.queue.wake_one());
-            kassert!(yield_until(|| h.thread().state() == State::Blocked && !s.queue.waiters.lock().is_empty()));
+            kassert!(yield_until(|| blocked() && s.checks.load(Ordering::Acquire) == 2));
             kassert!(!s.passed.load(Ordering::Acquire));
             s.go.store(true, Ordering::Release);
             kassert_eq!(s.queue.wake_all(), 1);
-            h.join();
+            join_bounded(h)?;
             kassert!(s.passed.load(Ordering::Acquire));
             kassert!(!s.queue.wake_one());
         }
@@ -824,22 +1066,61 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn wait_queue_ping_pong_across_cpus_loses_no_wakeup() {
+        // Two threads on two other CPUs hand a turn back and forth through
+        // wait queues, 3000 times each: wakes often land while the woken
+        // thread is still switching out. A lost wakeup stalls them (caught by
+        // the deadline); a thread queued twice trips `schedule`'s checks.
+        use crate::kassert;
+        const ROUNDS: u64 = 3000;
+        struct Shared {
+            queues: [WaitQueue; 2],
+            turn: AtomicU64,
+            rounds: AtomicU64,
+        }
+        let cpus = running_cpus();
+        kassert!(cpus.len() >= 3);
+        let s = Arc::new(Shared {
+            queues: [WaitQueue::new(), WaitQueue::new()],
+            turn: AtomicU64::new(0),
+            rounds: AtomicU64::new(0),
+        });
+        let player = |me: u64, s: Arc<Shared>| {
+            move || {
+                let (mine, theirs) = (me as usize, 1 - me as usize);
+                for _ in 0..ROUNDS {
+                    s.queues[mine].wait_until(|| s.turn.load(Ordering::Acquire) == me);
+                    s.rounds.fetch_add(1, Ordering::Relaxed);
+                    s.turn.store(1 - me, Ordering::Release);
+                    s.queues[theirs].wake_all();
+                }
+            }
+        };
+        let a = spawn_test(cpus[1], "ping", player(0, s.clone()))?;
+        let b = spawn_test(cpus[2], "pong", player(1, s.clone()))?;
+        let (ra, rb) = (join_bounded(a), join_bounded(b));
+        crate::ktest::diag(format_args!("{} of {} rounds", s.rounds.load(Ordering::Relaxed), 2 * ROUNDS));
+        ra?;
+        rb?;
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn switches_are_traced() {
         // Switching to a thread and from it (dead) are both in the ring.
         use crate::kassert;
-        let ring = crate::trace::ring();
-        let start = ring.written();
-        let h = spawn("traced", || {}).map_err(|_| "spawn failed")?;
+        let start = crate::trace::ring().written();
+        let h = spawn_test(arch::cpu_index(), "traced", || {})?;
         let id = h.thread().id();
-        h.join();
+        join_bounded(h)?;
         let me = current().ok_or("no current thread")?.id();
-        let switches: Vec<[u64; 4]> = (start..ring.written())
+        let ring = crate::trace::ring();
+        let to_it = (start..ring.written())
             .filter_map(|seq| ring.read(seq))
-            .filter(|e| e.kind == Kind::Switch as u16)
-            .map(|e| e.args)
-            .collect();
-        kassert!(switches.iter().any(|a| a[0] == me && a[1] == id));
-        kassert!(switches.iter().any(|a| a[0] == id && a[2] == State::Dead as u64));
+            .any(|e| e.kind == Kind::Switch as u16 && e.args[0] == me && e.args[1] == id);
+        kassert!(to_it);
+        kassert!(switched_away(start, id, State::Dead));
         Ok(())
     }
 );
@@ -847,18 +1128,43 @@ crate::ktest!(
 crate::ktest!(
     fn a_dead_threads_stack_is_freed() {
         // Once `join` returns, the thread's stack is unregistered and its
-        // pages unmapped.
+        // pages unmapped: for a thread on this CPU and one on another
+        // (joined from here), 130 times over (more than the registry holds,
+        // so a stack that isn't freed fails the spawns).
         use crate::kassert;
-        let h = spawn("brief", || {}).map_err(|_| "spawn failed")?;
-        let range = h.thread().stack().ok_or("a spawned thread has a stack")?;
-        kassert!(arch::stacks::stack_of(range.bottom).is_some());
-        let thread = h.thread.clone();
-        h.join();
-        kassert!(thread.state() == State::Dead && thread.stack().is_none());
-        kassert!(arch::stacks::stack_of(range.bottom).is_none());
-        let bottom = lumen_mm::VirtAddr::new(range.bottom).ok_or("a stack address is canonical")?;
-        kassert!(crate::mm::paging::translate(bottom).is_none());
+        let cpus = [arch::cpu_index(), *running_cpus().last().ok_or("no CPU")?];
+        for round in 0..130 {
+            let cpu = cpus[round % 2];
+            let go = Arc::new(AtomicBool::new(false));
+            let g = go.clone();
+            // It waits until its stack has been looked at.
+            let h = spawn_test(cpu, "brief", move || {
+                while !g.load(Ordering::Acquire) {
+                    yield_now();
+                }
+            })?;
+            let range = h.thread().stack().ok_or("a spawned thread has a stack")?;
+            kassert!(arch::stacks::stack_of(range.bottom).is_some());
+            let thread = h.thread.clone();
+            go.store(true, Ordering::Release);
+            join_bounded(h)?;
+            kassert!(thread.state() == State::Dead && thread.stack().is_none());
+            kassert!(arch::stacks::stack_of(range.bottom).is_none());
+            let bottom = lumen_mm::VirtAddr::new(range.bottom).ok_or("a stack address is canonical")?;
+            kassert!(crate::mm::paging::translate(bottom).is_none());
+        }
         Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_thread_dying_into_a_fresh_one_is_reaped() {
+        // `a` dies and `b`, never run yet, runs next: `b`'s start finishes
+        // the switch and frees `a`.
+        let a = spawn_test(arch::cpu_index(), "brief-a", || {})?;
+        let b = spawn_test(arch::cpu_index(), "brief-b", || {})?;
+        join_bounded(a)?;
+        join_bounded(b)
     }
 );
 

@@ -22,7 +22,7 @@
 //!    (`sched::run_ap_idle`): with interrupts on, it starts its own timer
 //!    and scheduler once the boot CPU has calibrated the timer, runs the
 //!    threads spawned on it, and whatever [`run_on`] hands it (kmon's
-//!    `crash <kind> [cpu]`);
+//!    `crash <kind> [cpu]`; a job can't block);
 //! 4. after calibrating the clocks, the boot CPU waits (bounded, 2 s in all)
 //!    for every AP to be online ([`wait_online`]).
 //!
@@ -33,8 +33,8 @@
 //!
 //! CPUs past [`MAX_CPUS`](crate::arch::MAX_CPUS) are halted for good, with a
 //! warning (left in Limine, each would spin on its `goto_address` forever).
-//! An AP never handles device interrupts (every I/O APIC input targets the
-//! boot CPU); its local APIC timer drives its scheduler.
+//! An AP never handles I/O APIC interrupts (every input targets the boot
+//! CPU); its local APIC timer drives its scheduler.
 
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -188,7 +188,9 @@ impl core::fmt::Display for RunError {
 /// Have AP `index` run `job` from its idle thread (on its main stack, with
 /// interrupts on; once its scheduler runs, the job waits for the threads
 /// ready there and can be preempted by them), and wake it. Returns once the
-/// job is handed over, not when it has run.
+/// job is handed over, not when it has run. The job can't block: on the
+/// idle thread `time::sleep` busy-waits, and waiting on a queue (or a join)
+/// panics.
 pub fn run_on(index: usize, job: fn()) -> Result<(), RunError> {
     let Some(lapic) = online_lapic_id(index).filter(|_| index != 0) else {
         return Err(RunError::NotAnOnlineAp);
@@ -206,13 +208,13 @@ pub fn run_on(index: usize, job: fn()) -> Result<(), RunError> {
 
 /// Wake CPU `index` if it is online and isn't this one: send it the
 /// `WAKEUP` IPI, which ends its idle loop's halt (the scheduler, after
-/// queueing a thread there). Best effort: if the IPI can't be sent, the
-/// CPU's next timer tick, or its next look at its run queue, finds the work.
-pub fn wake(index: usize) {
-    if index != arch::cpu_index()
-        && let Some(lapic) = online_lapic_id(index)
-    {
-        let _ = arch::apic::send_ipi(lapic, arch::idt::WAKEUP);
+/// queueing a thread there, or to start its timer). False only if the IPI
+/// couldn't be sent (this CPU's local APIC stayed busy).
+#[must_use = "an IPI that wasn't sent woke nothing"]
+pub fn wake(index: usize) -> bool {
+    match online_lapic_id(index) {
+        Some(lapic) if index != arch::cpu_index() => arch::apic::send_ipi(lapic, arch::idt::WAKEUP),
+        _ => true,
     }
 }
 

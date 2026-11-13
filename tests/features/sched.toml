@@ -1,40 +1,53 @@
 # Features: sched. See tests/features/README.md for the format.
 
 [[feature]]
-name = "Kernel threads with their own guarded stacks, preempted round robin (10 ms slices) by the 1 kHz timer"
+name = "Kernel threads preempted round robin by the 1 kHz timer, in 10-tick slices"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::sched::two_threads_interleave",
-    "ktest:lumen_kernel::sched::spawning_where_no_scheduler_runs_is_refused",
+    "ktest:lumen_kernel::sched::slices_are_10_ticks",
+    "ktest:lumen_kernel::sched::yielding_with_interrupts_off_keeps_them_off",
 ]
 
 [[feature]]
-name = "A run queue and a ticking timer on every CPU: threads spawned on a CPU run there, preempted, and only there"
+name = "Each thread has its own stack with a guard page"
+milestone = "M2"
+tests = [
+    "scenario:test_crash::test_thread_stack_overflow_hits_its_guard",
+]
+
+[[feature]]
+name = "A scheduler on every online CPU: threads spawned on a CPU run there, preempted, and only there"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::sched::threads_run_on_every_cpu",
+    "ktest:lumen_kernel::sched::spawning_where_no_scheduler_runs_is_refused",
+    "scenario:test_smp::test_all_cpus_online",
 ]
 
 [[feature]]
-name = "sleep blocks the thread until its deadline (time::sleep once the scheduler runs)"
+name = "sleep blocks the thread until its deadline; where a thread can't block (a lock held, interrupts off, an idle thread) time::sleep busy-waits"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::sched::sleeping_thread_wakes",
+    "ktest:lumen_kernel::sched::time_sleep_spins_where_a_thread_cannot_block",
     "ktest:lumen_kernel::time::sleep_10ms_elapses",
 ]
 
 [[feature]]
-name = "Wait queues: a blocked thread wakes when its condition holds, on its own CPU or from another"
+name = "Wait queues: a blocked thread wakes when its condition holds, on its own CPU or from another, with no lost wakeup"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::sched::wait_queue_wakes_a_blocked_thread",
+    "ktest:lumen_kernel::sched::wait_queue_ping_pong_across_cpus_loses_no_wakeup",
 ]
 
 [[feature]]
-name = "A finished thread's stack is freed before join returns"
+name = "A finished thread's stack is freed (on its own CPU) before join returns"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::sched::a_dead_threads_stack_is_freed",
+    "ktest:lumen_kernel::sched::a_thread_dying_into_a_fresh_one_is_reaped",
 ]
 
 [[feature]]

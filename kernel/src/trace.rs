@@ -38,8 +38,9 @@ pub enum Kind {
     Panic = 4,
     /// The scheduler switched threads on this CPU. `args`: the previous
     /// thread's id, the next thread's id, the previous thread's state
-    /// (`sched::State`: ready when preempted or yielding, or sleeping,
-    /// blocked, dead).
+    /// (`sched::State`: ready when preempted or yielding (also the idle
+    /// thread, and a thread another CPU woke before it switched out), or
+    /// sleeping, blocked, dead).
     Switch = 5,
     /// Recorded by in-kernel tests.
     Test = 0xff,
@@ -86,7 +87,8 @@ pub enum BootPhase {
     /// TSC and timer calibration, interrupts on, the first-tick check (10 ms,
     /// up to 100 ms while no tick has come).
     Time = 9,
-    /// The wait until the other CPUs are online (`smp::wait_online`).
+    /// The wait until the other CPUs are online (`smp::wait_online`), then
+    /// the scheduler started on every CPU (`sched::init`).
     Smp = 10,
     Framebuffer = 11,
     Complete = 12,

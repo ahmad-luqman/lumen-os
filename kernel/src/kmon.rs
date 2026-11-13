@@ -63,10 +63,10 @@ fn dispatch(line: &str) {
                 out,
                 "commands:\n  help              this list\n  echo <text>       print text\n  \
                  int3              take a breakpoint and continue\n  \
-                 crash <kind> [cpu|thread]  deliberate fault (on that CPU, or in a new thread): {CRASH_KINDS}\n  \
+                 crash <kind> [cpu|thread]\n                    deliberate fault (on that CPU, or in a new thread): {CRASH_KINDS}\n  \
                  trace [n]         the boot CPU's last n trace events (default 16)\n  \
                  heap              heap usage and free-list summary\n  \
-                 ticks             timer interrupts taken (and stray ones)\n  \
+                 ticks             the boot CPU's timer interrupts (and stray ones)\n  \
                  sleep <ms>        wait that long (guest time)\n  \
                  uptime            nanoseconds since the TSC started\n  \
                  clocks            the TSC's frequency, measured again against each clock\n  \
@@ -194,7 +194,7 @@ fn crash(args: &str) {
     }
     if target == Some("thread") {
         match crate::sched::spawn("kmon-crash", fault) {
-            Ok(thread) => thread.join(),
+            Ok(handle) => handle.join(),
             Err(e) => {
                 let _ = writeln!(out, "crash: no thread: {e}");
             }

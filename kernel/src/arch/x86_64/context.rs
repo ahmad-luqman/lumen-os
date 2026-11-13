@@ -8,13 +8,13 @@
 //! either: the scheduler switches only with interrupts off, and the
 //! direction flag is clear at every call (ABI).
 //!
-//! A new thread's stack is laid out ([`prepare`]) as if it had called
-//! [`switch`] from [`thread_start`], so the first switch to it "returns"
-//! there, with `rbp` = 0: the frame-pointer chain of everything it runs ends
+//! A new thread's stack is laid out ([`prepare`]) as if [`switch`] had been
+//! called with [`thread_start`] as its return address, so the first switch
+//! to it "returns" there, with `rbp` = 0: the frame-pointer chain of everything it runs ends
 //! at `thread_start`, as a CPU's ends at `_start`.
 
 /// Callee-saved registers [`switch`] pushes (rbp, rbx, r12, r13, r14, r15).
-const SAVED_REGISTERS: u64 = 6;
+const SAVED_REGISTERS: usize = 6;
 
 /// Save this thread's callee-saved registers and `rsp` (into `*save`), then
 /// load another's from `load` (a value an earlier `switch` saved, or one
@@ -72,7 +72,7 @@ pub unsafe fn prepare(top: u64, entry: extern "C" fn() -> !) -> u64 {
     // entry point, for `thread_start`), r13, r14, r15. After the `ret`, rsp
     // is `top`, so `thread_start`'s call leaves the entry with rsp 8 below a
     // 16-byte boundary, as a function expects on entry.
-    let frame: [u64; SAVED_REGISTERS as usize + 1] = [
+    let frame: [u64; SAVED_REGISTERS + 1] = [
         0,                                // r15 (lowest address: the saved rsp)
         0,                                // r14
         0,                                // r13
@@ -81,7 +81,7 @@ pub unsafe fn prepare(top: u64, entry: extern "C" fn() -> !) -> u64 {
         0,                                // rbp
         thread_start as *const () as u64, // return address
     ];
-    let rsp = top - 8 * (SAVED_REGISTERS + 1);
+    let rsp = top - core::mem::size_of_val(&frame) as u64;
     // SAFETY: the caller vouches that the stack is mapped, writable, at least
     // a page (more than these 56 bytes) and unused.
     unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr(), rsp as *mut u64, frame.len()) };

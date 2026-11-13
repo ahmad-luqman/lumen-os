@@ -130,3 +130,16 @@ def test_report_names_the_thread(crash_report):
     assert "context::thread_start" in frames[-1], report
     assert not any("kmain" in f for f in frames), report
     assert "<unknown>" not in report and "(stopped:" not in report, report
+
+
+def test_thread_stack_overflow_hits_its_guard(crash_report):
+    # A thread's stack has its own guard page: unbounded recursion in a
+    # spawned thread is reported as that stack overflowing.
+    report = crash_report("stack thread")
+    assert re.search(
+        r"^kernel stack overflow \(guard page hit\): cr2 0x[0-9a-f]{16} is in the guard page below the "
+        r"thread stack",
+        report,
+        re.MULTILINE,
+    ), report
+    assert re.search(r"^thread: kmon-crash \(id \d+\)$", report, re.MULTILINE), report

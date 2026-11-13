@@ -18,7 +18,7 @@
 //! lines don't interleave. A CPU that crashes while another is reporting
 //! halts, and the report names it. Serial says which CPU crashed (`cpu:`),
 //! which stack the reporter runs on (`running on:`), which thread was
-//! running (`thread:`, once the scheduler runs) and which CPUs stopped;
+//! running (`thread:`, once that CPU's threads are set up) and which CPUs stopped;
 //! `!!!` lines name any CPU that didn't stop through the stop NMI (late, not
 //! sent, crashed itself, or started but not online), which may still touch
 //! the console or the heap: the bounded walks below tolerate that.
@@ -304,7 +304,7 @@ fn write_origin(w: &mut dyn Write, rsp: u64) {
         None if (lo..hi).contains(&rsp) => writeln!(w, "running on: the boot stack {lo:#x}..{hi:#x}"),
         None => writeln!(w, "running on: an unknown stack (rsp {rsp:#018x})"),
     };
-    // Lock-free; none before the scheduler runs on this CPU.
+    // Lock-free; none before this CPU's threads are set up.
     if let Some((id, name)) = crate::sched::running_here() {
         let _ = writeln!(w, "thread: {name} (id {id})");
     }

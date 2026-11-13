@@ -6,9 +6,10 @@
 //! `lumen_mm::stacks`, host-tested), maps fresh frames there and registers
 //! the stack in [`stacks::REGISTRY`], which the crash reporter reads to walk
 //! backtraces and to name guard-page hits (an overflow, or a stray access). Dropping a stack retracts it
-//! from the registry, then unmaps it and frees its frames; stacks the CPU
-//! points at (the TSS's IST entries, the running stack) are [`leak`]ed so
-//! they can't be dropped. Addresses are never reused.
+//! from the registry, then unmaps it and frees its frames; each CPU's main
+//! and IST stacks are [`leak`]ed so they can't be dropped, and a thread's
+//! stack is dropped only once the thread is dead and its CPU has switched
+//! away from it. Addresses are never reused.
 //!
 //! Nothing here uses the heap, so stacks can be set up right after the
 //! kernel's page tables.
@@ -25,7 +26,7 @@ use super::{paging, window};
 use crate::arch::stacks;
 use crate::sync::SpinLock;
 
-/// Size of each IST stack (#DF, NMI, #MC).
+/// Size of each IST stack (#DF, NMI, #MC) and each thread's stack.
 pub const STACK_SIZE: u64 = 64 * 1024;
 
 /// The boot CPU's kernel stack, from `kmain_on_kernel_stack` on (the size
