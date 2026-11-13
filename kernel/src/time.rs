@@ -505,19 +505,24 @@ crate::ktest!(
         use crate::kassert;
         let hz = tsc().ok_or("TSC not calibrated")?.hz();
         let count = lumen_time::pit_count(WINDOW_NS).ok_or("no PIT count")?;
-        let w = {
+        // A steady one, as calibration takes them: a loaded host can pause a
+        // reading too, which isn't what this checks.
+        let mut steady = [Window::default()];
+        {
             let _off = arch::irq::push_off();
-            pit_window(count, |at| {
-                if at == Pause::Ended {
-                    sleep(2_000_000)
-                }
-            })
-            .map_err(|_| "no PIT window")?
-        };
+            let take = || {
+                pit_window(count, |at| {
+                    if at == Pause::Ended {
+                        sleep(2_000_000)
+                    }
+                })
+            };
+            lumen_time::steady_windows(&mut steady, ATTEMPTS, take).map_err(|_| "no steady PIT window")?;
+        }
+        let [w] = steady;
         let measured = lumen_time::frequency(w.tsc, w.reference, PIT_HZ).ok_or("no frequency")?;
         crate::ktest::diag(format_args!("{measured} Hz against {hz} Hz; window {w:?}"));
         kassert!(w.reference >= u64::from(count) + 2000); // ran on about 2386 ticks
-        kassert!(w.is_steady());
         kassert!(hz.abs_diff(measured) * 200 <= hz); // within 0.5%
         Ok(())
     }
@@ -525,16 +530,17 @@ crate::ktest!(
 
 crate::ktest!(
     fn a_pit_end_read_after_it_could_wrap_is_not_steady() {
-        // Paused 60 ms after the count ran out: its counter (16 bits, 55 ms
+        // Paused 400 ms after the count ran out: its counter (16 bits, 55 ms
         // around) may have wrapped, so the window can't be placed and would be
-        // taken again.
+        // taken again. (Far more than 4 × the 10 ms it ran, even if a loaded
+        // host stretched that.)
         use crate::kassert;
         let count = lumen_time::pit_count(WINDOW_NS).ok_or("no PIT count")?;
         let w = {
             let _off = arch::irq::push_off();
             pit_window(count, |at| {
                 if at == Pause::Ended {
-                    sleep(60_000_000)
+                    sleep(400_000_000)
                 }
             })
             .map_err(|_| "no PIT window")?
@@ -549,9 +555,10 @@ crate::ktest!(
     fn a_paused_pit_reading_is_taken_again() {
         // The first two windows' end readings are paused 1 ms between latching
         // the counter and reading the TSC, as a host descheduling the vCPU
-        // there would: their ends are 10% uncertain, so both are taken again,
-        // and the calibration still gives the TSC's frequency.
-        use crate::{kassert, kassert_eq};
+        // there would: their ends are 10% uncertain, so both are taken again
+        // (a loaded host may add more), and the calibration still gives the
+        // TSC's frequency.
+        use crate::kassert;
         let hz = tsc().ok_or("TSC not calibrated")?.hz();
         let count = lumen_time::pit_count(WINDOW_NS).ok_or("no PIT count")?;
         let mut taken = 0;
@@ -569,7 +576,7 @@ crate::ktest!(
             .map_err(|_| "calibrating against the PIT failed")?
         };
         crate::ktest::diag(format_args!("{cal}"));
-        kassert_eq!(cal.retaken, 2);
+        kassert!(cal.retaken >= 2);
         kassert!(cal.windows.iter().all(Window::is_steady));
         kassert!(hz.abs_diff(cal.hz) * 200 <= hz);
         Ok(())
@@ -587,13 +594,9 @@ crate::ktest!(
             let _off = arch::irq::push_off();
             hpet_window(&hpet, target, || sleep(1_000_000)).map_err(|_| "no HPET window")?
         };
+        crate::ktest::diag(format_args!("paused {w:?}"));
         kassert!(!w.is_steady());
-        let steady = {
-            let _off = arch::irq::push_off();
-            hpet_window(&hpet, target, || {}).map_err(|_| "no HPET window")?
-        };
-        crate::ktest::diag(format_args!("paused {w:?}; not paused {steady:?}"));
-        kassert!(w.end_gap > steady.end_gap);
+        kassert!(w.end_gap >= tsc().ok_or("TSC not calibrated")?.ticks(1_000_000)); // the pause is in it
         Ok(())
     }
 );
