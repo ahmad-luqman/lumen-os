@@ -14,8 +14,8 @@ def test_in_kernel_tests_pass(boot):
     code = m.wait_exit(120)
     out = m.output
     report = tap.parse(out)
-    # Saved for `make status` (each ktest is listed individually in STATUS.md),
-    # except in a re-run (LUMEN_ARTIFACTS_DIR): see save_ktest_tap.
+    # Saved for `make status` (each ktest is listed individually in STATUS.md);
+    # a re-run's (LUMEN_ARTIFACTS_DIR) is kept apart: see save_ktest_tap.
     save_ktest_tap(out[out.find("TAP version") :] if "TAP version" in out else "")
     if code == EXIT_CRASH:
         crash = out[out.find("==== LUMEN CRASH REPORT") :]

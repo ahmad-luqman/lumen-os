@@ -133,6 +133,25 @@ def render(evaluated: list[tuple[dict, str]]) -> str:
     return "\n".join(lines)
 
 
+def missing_tap_hint(bad: list[dict]) -> str | None:
+    """Why ktests show as not run, if a failing feature lists one and there is
+    no ktest.tap: the ktest scenario didn't run, or saved its TAP elsewhere
+    because LUMEN_ARTIFACTS_DIR was set (a re-run's copy is never read)."""
+    tap_file = RESULTS / "ktest.tap"
+    if tap_file.exists() or not any(p.startswith("ktest:") for f in bad for p in f["tests"]):
+        return None
+    try:
+        rerun = rerun_dir()
+    except ValueError:
+        rerun = None  # an invalid value is reported where the TAP is saved
+    if rerun and (rerun / "ktest.tap").exists():
+        return (
+            f"status: no {tap_file}, but there is {rerun / 'ktest.tap'}: LUMEN_ARTIFACTS_DIR "
+            "keeps a re-run's ktest results apart (unset it for a first run)"
+        )
+    return f"status: no {tap_file}: the ktest scenario did not run"
+
+
 def run_status(write: bool, check: bool) -> int:
     results = collect_results()
     evaluated = evaluate(results)
@@ -153,12 +172,8 @@ def run_status(write: bool, check: bool) -> int:
             for t, ok in matched.items():
                 if not ok:
                     print(f"    {t}: failed", file=sys.stderr)
-    if bad and not (RESULTS / "ktest.tap").exists() and (rerun := rerun_dir()):
-        print(
-            f"status: no {RESULTS / 'ktest.tap'}: LUMEN_ARTIFACTS_DIR is set, so the ktest "
-            f"scenario saved its TAP in {rerun} (unset it for a first run)",
-            file=sys.stderr,
-        )
+    if hint := missing_tap_hint([f for f, _ in bad]):
+        print(hint, file=sys.stderr)
     if check:
         if bad:
             print(f"status: {len(bad)} feature(s) not passing", file=sys.stderr)

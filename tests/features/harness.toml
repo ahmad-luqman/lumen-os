@@ -10,16 +10,19 @@ tests = [
 ]
 
 [[feature]]
-name = "A re-run with LUMEN_ARTIFACTS_DIR (CI's TCG re-run) keeps its artifacts and ktest.tap apart from the first run's (never in build/test-results; status says why ktest results are missing)"
+name = "A re-run with LUMEN_ARTIFACTS_DIR (CI's TCG re-run) keeps its artifacts and ktest.tap apart from the first run's (never in build/test-results or build/test-artifacts; status says why ktest results are missing)"
 milestone = "M1"
 tests = [
     "harness:test_artifacts::test_a_rerun_keeps_the_first_runs_ktest_tap",
     "harness:test_artifacts::test_a_rerun_on_a_fresh_tree_writes_no_first_run_tap",
-    "harness:test_artifacts::test_a_rerun_dir_may_not_be_the_results_dir",
+    "harness:test_artifacts::test_a_rerun_dir_may_not_be_the_first_runs[*]",
     "harness:test_artifacts::test_artifacts_root_follows_lumen_artifacts_dir",
     "harness:test_artifacts::test_the_artifacts_fixture_follows_a_rerun_dir",
     "harness:test_artifacts::test_the_ktest_scenario_saves_through_save_ktest_tap",
-    "harness:test_status::test_a_missing_ktest_tap_under_a_rerun_dir_is_explained",
+    "harness:test_status::test_a_missing_ktest_tap_is_explained",
+    "harness:test_status::test_a_ktest_tap_saved_in_a_rerun_dir_is_named",
+    "harness:test_status::test_the_hint_survives_an_invalid_rerun_dir",
+    "harness:test_status::test_no_hint_with_a_ktest_tap_or_no_failing_ktest_feature",
 ]
 
 [[feature]]

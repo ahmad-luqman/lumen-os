@@ -9,18 +9,23 @@ BUILD_DIR = REPO_ROOT / "build"
 
 
 def rerun_dir() -> Path | None:
-    """LUMEN_ARTIFACTS_DIR (relative to the repo root), if set and non-empty:
-    a re-run keeps its artifacts and its ktest.tap there, apart from the first
-    run's (CI re-runs failed scenarios under TCG). Otherwise None. It may not
-    be build/test-results, whose ktest.tap it exists to keep."""
+    """LUMEN_ARTIFACTS_DIR (relative to the repo root, or absolute), if set and
+    non-empty: a re-run keeps its artifacts and its ktest.tap there, apart from
+    the first run's (CI re-runs failed scenarios under TCG). Otherwise None.
+
+    Raises ValueError if it names the first run's build/test-results or
+    build/test-artifacts, which it exists to keep (compared ignoring case,
+    as macOS file systems do)."""
     name = os.environ.get("LUMEN_ARTIFACTS_DIR")
     if not name:
         return None
     path = REPO_ROOT / name
-    if path.resolve() == (BUILD_DIR / "test-results").resolve():
-        raise ValueError(
-            f"LUMEN_ARTIFACTS_DIR={name!r} is build/test-results: a re-run must keep apart from it"
-        )
+    for first_run in ("test-results", "test-artifacts"):
+        if str(path.resolve()).casefold() == str((BUILD_DIR / first_run).resolve()).casefold():
+            raise ValueError(
+                f"LUMEN_ARTIFACTS_DIR={name!r} is the first run's build/{first_run}: "
+                "a re-run keeps apart from it (CI uses build/test-artifacts-tcg)"
+            )
     return path
 
 

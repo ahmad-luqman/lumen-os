@@ -2,8 +2,9 @@
 
 `boot` starts a headless QEMU machine from one of the ISOs built by
 `make iso` and closes it after the test. Each test gets its own artifacts
-directory, build/test-artifacts/<module>/<test>/: keyed by module too, so
-same-named tests in two files can run side by side under pytest-xdist.
+directory, build/test-artifacts/<module>/<test>/ (a re-run's, with
+LUMEN_ARTIFACTS_DIR set, goes under that root instead): keyed by module too,
+so same-named tests in two files can run side by side under pytest-xdist.
 Artifacts of passing tests are deleted; failing tests keep serial.log, qemu.log
 (CPU resets, and the `-d int` interrupt trace under TCG), cmdline.txt,
 environment.txt and any screenshots, and CI uploads them.
@@ -50,7 +51,6 @@ _FAILED = pytest.StashKey[bool]()
 
 @pytest.fixture
 def artifacts(request: pytest.FixtureRequest) -> Iterator[Path]:
-    # Under a re-run's own root (LUMEN_ARTIFACTS_DIR): see lumen_harness.rerun_dir.
     path = artifact_dir(artifacts_root(), request.node.nodeid)
     shutil.rmtree(path, ignore_errors=True)
     path.mkdir(parents=True)
