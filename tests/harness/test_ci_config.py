@@ -44,6 +44,16 @@ def test_scenarios_run_in_parallel_by_default(monkeypatch):
     assert re.search(r" -n 0\b", scenario_command("SCENARIO_JOBS=0"))
 
 
+def test_tcg_rerun_only_reruns_failed_scenarios():
+    # Gated on the scenarios step: with `--last-failed`, a failure recorded
+    # elsewhere (a harness test) makes pytest run every selected scenario,
+    # whatever `--lfnf` says (checked by hand with pytest 9.2).
+    [rerun] = [s for s in ci_steps() if "Re-run failed scenarios under TCG" in s]
+    assert "if: ${{ failure() && steps.scenarios.outcome == 'failure' }}" in rerun
+    assert " --last-failed --lfnf=none " in rerun
+    assert "LUMEN_ARTIFACTS_DIR=build/test-artifacts-tcg" in rerun
+
+
 def test_feature_gate_runs_after_failed_scenarios():
     steps = ci_steps()
     [scenarios] = [s for s in steps if "run: make test-scenarios" in s]
