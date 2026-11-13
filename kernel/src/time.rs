@@ -18,10 +18,8 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use log::{info, warn};
 use lumen_mm::PhysAddr;
-use lumen_time::{Clock, Hz, PIT_HZ, SteadyError, Window};
+use lumen_time::{Clock, Hz, PIT_HZ, Pause, SteadyError, Window};
 
-#[cfg(feature = "ktest")]
-use crate::arch::pit::Pause;
 use crate::arch::{self, apic, idt, pit};
 use crate::mm::paging;
 use crate::sync::SpinLock;
@@ -29,10 +27,10 @@ use crate::sync::SpinLock;
 /// The local APIC timer's rate.
 pub const TICK_HZ: u64 = 1000;
 /// Calibration windows, and how long each is.
-pub const WINDOWS: usize = 5;
+const WINDOWS: usize = 5;
+const WINDOW_NS: u64 = 10_000_000;
 /// How many windows a TSC calibration may take to get [`WINDOWS`] steady ones.
 const ATTEMPTS: usize = 4 * WINDOWS;
-const WINDOW_NS: u64 = 10_000_000;
 /// The longest a 10 ms window may take, in TSC ticks (TSC unknown yet: over
 /// 1 s at up to 4 GHz), before its reference counts as stalled.
 const WINDOW_BOUND_TSC: u64 = 1 << 32;
@@ -71,7 +69,7 @@ impl fmt::Display for Calibration {
         write!(f, "{} Hz [", self.hz)?;
         for (i, w) in self.windows.iter().enumerate() {
             let sep = if i == 0 { "" } else { " " };
-            write!(f, "{sep}{}/{}/{}/{}/{}", w.tsc, w.reference, w.polls, w.start_gap, w.end_gap)?;
+            write!(f, "{sep}{w}")?;
         }
         write!(f, "] retook {}", self.retaken)
     }
@@ -112,8 +110,12 @@ pub enum CalError {
     NoCount,
     /// It gave this implausible frequency.
     Implausible(u64),
-    /// Only `steady` of `attempts` windows were read promptly at both ends.
-    Unsteady { steady: usize, attempts: usize },
+    /// Only `steady` of `attempts` windows were read promptly at both ends;
+    /// `last` is the last one that wasn't.
+    Unsteady { steady: usize, attempts: usize, last: Window },
+    /// The PIT's counter read back `start`, then `end` once it had run out,
+    /// which doesn't fit how it was programmed.
+    BadReadback { start: u16, end: u16 },
 }
 
 impl fmt::Display for CalError {
@@ -121,8 +123,13 @@ impl fmt::Display for CalError {
         match self {
             CalError::NoCount => f.write_str("it didn't count through a 10 ms window"),
             CalError::Implausible(hz) => write!(f, "it gave an implausible TSC frequency, {}", Hz(*hz)),
-            CalError::Unsteady { steady, attempts } => {
-                write!(f, "only {steady} of {attempts} windows were read promptly at both ends")
+            CalError::Unsteady { steady, attempts, last } => write!(
+                f,
+                "only {steady} of {attempts} windows were read promptly at both ends (the last that \
+                 wasn't, tsc/reference/polls/start_gap/end_gap: {last})"
+            ),
+            CalError::BadReadback { start, end } => {
+                write!(f, "its counter read back {start}, then {end} once it had run out, which can't be")
             }
         }
     }
@@ -253,18 +260,19 @@ fn median_of_windows(mut window: impl FnMut() -> Result<u64, CalError>) -> Resul
     Ok(lumen_time::median(&mut samples).expect("WINDOWS samples"))
 }
 
-/// The TSC's frequency against a reference counting at `reference_hz`: the
-/// median of [`WINDOWS`] steady windows from `take` (an unsteady one is taken
-/// again, up to [`ATTEMPTS`] in all); an implausible one fails.
+/// A TSC calibration against a reference counting at `reference_hz`: the
+/// median frequency of [`WINDOWS`] steady windows from `take` (an unsteady one
+/// is set aside and another taken, up to [`ATTEMPTS`] in all); an implausible
+/// one fails.
 fn median_tsc_hz(reference_hz: u64, take: impl FnMut() -> Result<Window, CalError>) -> Result<Calibration, CalError> {
     let mut windows = [Window::default(); WINDOWS];
     let retaken = lumen_time::steady_windows(&mut windows, ATTEMPTS, take).map_err(|e| match e {
         SteadyError::Take(e) => e,
-        SteadyError::Unsteady { steady, attempts } => CalError::Unsteady { steady, attempts },
+        SteadyError::Unsteady { steady, attempts, last } => CalError::Unsteady { steady, attempts, last },
     })?;
     let mut hz = [0u64; WINDOWS];
     for (h, w) in hz.iter_mut().zip(&windows) {
-        *h = match lumen_time::frequency(w.tsc, w.reference, reference_hz) {
+        *h = match w.tsc_hz(reference_hz) {
             Some(hz) if lumen_time::plausible_tsc_hz(hz) => hz,
             Some(hz) => return Err(CalError::Implausible(hz)),
             None => return Err(CalError::NoCount),
@@ -276,15 +284,17 @@ fn median_tsc_hz(reference_hz: u64, take: impl FnMut() -> Result<Window, CalErro
 /// The TSC's frequency against the HPET. Call with interrupts off.
 fn calibrate_with_hpet(hpet: &HpetCounter) -> Result<Calibration, CalError> {
     let target = hpet.clock().ticks(WINDOW_NS);
-    median_tsc_hz(hpet.clock().hz(), || hpet_window(hpet, target, || {}))
+    median_tsc_hz(hpet.clock().hz(), || hpet_window(hpet, target, |_| {}))
 }
 
-/// One window of at least `target` HPET ticks. `pause` runs between the final
-/// counter read and the TSC read that closes it (a no-op but in tests; a pause
-/// there widens the end's gap).
-fn hpet_window(hpet: &HpetCounter, target: u64, pause: impl FnOnce()) -> Result<Window, CalError> {
+/// One window of at least `target` HPET ticks, each end a counter read between
+/// two TSC reads. `pause` is called at [`Pause::StartReading`] and
+/// [`Pause::EndReading`] (a no-op but in tests).
+fn hpet_window(hpet: &HpetCounter, target: u64, mut pause: impl FnMut(Pause)) -> Result<Window, CalError> {
     let pre = arch::rdtsc();
-    let (h0, t0) = (hpet.now(), arch::rdtsc());
+    let h0 = hpet.now();
+    pause(Pause::StartReading);
+    let t0 = arch::rdtsc();
     let mut polls = 0;
     loop {
         let before = arch::rdtsc();
@@ -292,7 +302,7 @@ fn hpet_window(hpet: &HpetCounter, target: u64, pause: impl FnOnce()) -> Result<
         polls += 1;
         let elapsed = hpet.since(h0, h);
         if elapsed >= target {
-            pause();
+            pause(Pause::EndReading);
             let t = arch::rdtsc();
             return Ok(Window { tsc: t - t0, reference: elapsed, polls, start_gap: t0 - pre, end_gap: t - before });
         }
@@ -310,28 +320,34 @@ fn calibrate_with_pit() -> Result<Calibration, CalError> {
     median_tsc_hz(PIT_HZ, || pit_window(count, |_| {}))
 }
 
-/// One window of `count` PIT ticks (`pause`: see [`pit::wait`]).
-fn pit_window(count: u16, pause: impl FnMut(pit::Pause)) -> Result<Window, CalError> {
+/// One window of channel 2 started on `count`: from its counter reading just
+/// after it started to the one once it had run out, so `reference` is the
+/// ticks between them (more than `count` if the end was read late). `pause`:
+/// see [`pit::wait`].
+fn pit_window(count: u16, pause: impl FnMut(Pause)) -> Result<Window, CalError> {
     let w = pit::wait(count, pause).ok_or(CalError::NoCount)?;
     let (start, end) = (w.start, w.end);
     let tsc = end.tsc_after - start.tsc_after;
-    // An end reading that may have wrapped past 0 again can't be placed:
-    // as uncertain as the whole window, so it is taken again.
+    let reference = lumen_time::pit_elapsed(start.count, end.count);
+    // An end read 65536 or more ticks after the start (the counter came round
+    // past the start's value) can't be placed: its gap is the whole window,
+    // so it isn't steady and another is taken. One that can be placed must
+    // fit how the channel was programmed, or its read-back is wrong.
     let running = w.last_running_tsc - start.tsc_after;
     let late = end.tsc_after - w.last_running_tsc;
-    let end_gap =
-        if lumen_time::pit_end_unambiguous(start.count, running, late) { end.tsc_after - end.tsc_before } else { tsc };
-    Ok(Window {
-        tsc,
-        reference: lumen_time::pit_elapsed(start.count, end.count),
-        polls: w.polls,
-        start_gap: start.tsc_after - start.tsc_before,
-        end_gap,
-    })
+    let end_gap = if lumen_time::pit_end_unambiguous(start.count, running, late) {
+        if !lumen_time::pit_counts_make_sense(count, start.count, reference) {
+            return Err(CalError::BadReadback { start: start.count, end: end.count });
+        }
+        end.gap()
+    } else {
+        tsc
+    };
+    Ok(Window { tsc, reference, polls: w.polls, start_gap: start.gap(), end_gap })
 }
 
 /// Measure the TSC's frequency again now, against `reference` (with
-/// interrupts off meanwhile: about 50 ms): `None` if there is no such clock
+/// interrupts off meanwhile: at least 50 ms, more if windows are taken again): `None` if there is no such clock
 /// (no HPET the TSC was calibrated against), else what calibrating against
 /// it gave. For cross-checking the boot calibration.
 pub fn measure(reference: Reference) -> Option<Result<Calibration, CalError>> {
@@ -398,6 +414,9 @@ pub fn init() {
     TSC_HZ.store(hz, Ordering::Relaxed);
     REFERENCE.store(reference as u8, Ordering::Relaxed);
     info!(target: "time", "tsc {} (calibrated against {reference})", Hz(hz));
+    if cal.retaken > 0 {
+        info!(target: "time", "tsc calibration took {} windows again (a reading was paused)", cal.retaken);
+    }
 
     let tsc = Clock::new(hz).expect("calibrated");
     let timer_hz = calibrate_lapic_timer(tsc)
@@ -472,6 +491,27 @@ pub fn ticks() -> u64 {
     idt::ticks()
 }
 
+/// Wait up to `ns` nanoseconds for [`ticks`] to move past `seen`; whether it
+/// did.
+pub fn wait_for_tick(seen: u64, ns: u64) -> bool {
+    let deadline = now_ns() + ns;
+    while ticks() == seen && now_ns() < deadline {
+        core::hint::spin_loop();
+    }
+    ticks() != seen
+}
+
+/// A window pause for the ktests: sleeps `ns` at `at`, as a host descheduling
+/// the vCPU there would.
+#[cfg(feature = "ktest")]
+fn sleep_at(at: Pause, ns: u64) -> impl FnMut(Pause) {
+    move |p| {
+        if p == at {
+            sleep(ns)
+        }
+    }
+}
+
 crate::ktest!(
     fn tsc_calibrated_within_tolerance() {
         // Cross-check against the PIT, a different clock from the HPET the
@@ -482,19 +522,43 @@ crate::ktest!(
             return Err("the TSC wasn't calibrated against the HPET");
         }
         let boot = boot_calibration().ok_or("no boot calibration")?;
-        let pit = measure(Reference::Pit).ok_or("no PIT")?.map_err(|_| "calibrating against the PIT failed")?;
+        let pit = measure(Reference::Pit).ok_or("no PIT")?.map_err(|e| {
+            crate::ktest::diag(format_args!("against the pit: {e}"));
+            "calibrating against the PIT failed"
+        })?;
         // Diagnostics only (windows: tsc/reference/polls/start_gap/end_gap): the HPET measured
         // again too, to tell a PIT-only error from a boot calibration that was off.
         crate::ktest::diag(format_args!("tsc boot (hpet) {boot}"));
         crate::ktest::diag(format_args!("tsc now against the pit {pit}"));
         match measure(Reference::Hpet) {
             Some(Ok(hpet)) => crate::ktest::diag(format_args!("tsc now against the hpet {hpet}")),
-            _ => crate::ktest::diag(format_args!("tsc now against the hpet: failed")),
+            Some(Err(e)) => crate::ktest::diag(format_args!("tsc now against the hpet: failed ({e})")),
+            None => crate::ktest::diag(format_args!("tsc now against the hpet: no HPET")),
         }
         kassert!(hz.abs_diff(pit.hz) * 50 <= hz);
         Ok(())
     }
 );
+
+/// One steady 10 ms PIT window taken with `pause`, as calibration takes them
+/// (a loaded host can pause a reading too, which the tests using this aren't
+/// about).
+#[cfg(feature = "ktest")]
+fn steady_pit_window(mut pause: impl FnMut(Pause)) -> Result<Window, &'static str> {
+    let count = lumen_time::pit_count(WINDOW_NS).ok_or("no PIT count")?;
+    let mut steady = [Window::default()];
+    let _off = arch::irq::push_off();
+    lumen_time::steady_windows(&mut steady, ATTEMPTS, || pit_window(count, &mut pause)).map_err(|e| {
+        match e {
+            SteadyError::Take(e) => crate::ktest::diag(format_args!("{e}")),
+            SteadyError::Unsteady { steady, attempts, last } => {
+                crate::ktest::diag(format_args!("{steady} of {attempts} steady; the last that wasn't: {last}"))
+            }
+        }
+        "no steady PIT window"
+    })?;
+    Ok(steady[0])
+}
 
 crate::ktest!(
     fn a_late_look_at_the_pit_doesnt_stretch_its_window() {
@@ -504,26 +568,46 @@ crate::ktest!(
         // read that late made it 20% high).
         use crate::kassert;
         let hz = tsc().ok_or("TSC not calibrated")?.hz();
-        let count = lumen_time::pit_count(WINDOW_NS).ok_or("no PIT count")?;
-        // A steady one, as calibration takes them: a loaded host can pause a
-        // reading too, which isn't what this checks.
-        let mut steady = [Window::default()];
-        {
-            let _off = arch::irq::push_off();
-            let take = || {
-                pit_window(count, |at| {
-                    if at == Pause::Ended {
-                        sleep(2_000_000)
-                    }
-                })
-            };
-            lumen_time::steady_windows(&mut steady, ATTEMPTS, take).map_err(|_| "no steady PIT window")?;
-        }
-        let [w] = steady;
-        let measured = lumen_time::frequency(w.tsc, w.reference, PIT_HZ).ok_or("no frequency")?;
-        crate::ktest::diag(format_args!("{measured} Hz against {hz} Hz; window {w:?}"));
-        kassert!(w.reference >= u64::from(count) + 2000); // ran on about 2386 ticks
+        let w = steady_pit_window(sleep_at(Pause::Ended, 2_000_000))?;
+        let measured = w.tsc_hz(PIT_HZ).ok_or("no frequency")?;
+        crate::ktest::diag(format_args!("{measured} Hz against {hz} Hz; window {w}"));
         kassert!(hz.abs_diff(measured) * 200 <= hz); // within 0.5%
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_late_start_reading_doesnt_shift_a_pit_window() {
+        // Paused 2 ms after the count started, before its start is read: the
+        // window runs from that reading, not from when the count was set, so
+        // it still gives the TSC's frequency (assuming the full count from the
+        // start made it 20% low).
+        use crate::kassert;
+        let hz = tsc().ok_or("TSC not calibrated")?.hz();
+        let w = steady_pit_window(sleep_at(Pause::Started, 2_000_000))?;
+        let measured = w.tsc_hz(PIT_HZ).ok_or("no frequency")?;
+        crate::ktest::diag(format_args!("{measured} Hz against {hz} Hz; window {w}"));
+        kassert!(hz.abs_diff(measured) * 200 <= hz); // within 0.5%
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_paused_pit_start_reading_is_not_steady() {
+        // Paused 1 ms between latching the start count and reading the TSC:
+        // the start is 10% uncertain, so the window would be taken again.
+        use crate::kassert;
+        let w = {
+            let _off = arch::irq::push_off();
+            let count = lumen_time::pit_count(WINDOW_NS).ok_or("no PIT count")?;
+            pit_window(count, sleep_at(Pause::StartReading, 1_000_000)).map_err(|e| {
+                crate::ktest::diag(format_args!("{e}"));
+                "no PIT window"
+            })?
+        };
+        crate::ktest::diag(format_args!("{w}"));
+        kassert!(!w.is_steady());
+        kassert!(w.start_gap >= tsc().ok_or("TSC not calibrated")?.ticks(1_000_000)); // the pause is in it
         Ok(())
     }
 );
@@ -531,19 +615,17 @@ crate::ktest!(
 crate::ktest!(
     fn a_pit_end_read_after_it_could_wrap_is_not_steady() {
         // Paused 400 ms after the count ran out: its counter (16 bits, 55 ms
-        // around) may have wrapped, so the window can't be placed and would be
-        // taken again. (Far more than 4 × the 10 ms it ran, even if a loaded
-        // host stretched that.)
+        // around) may have come round past its start value, so the window
+        // can't be placed and would be taken again. (Far more than 4 × the
+        // 10 ms it ran, even if a loaded host stretched that.)
         use crate::kassert;
         let count = lumen_time::pit_count(WINDOW_NS).ok_or("no PIT count")?;
         let w = {
             let _off = arch::irq::push_off();
-            pit_window(count, |at| {
-                if at == Pause::Ended {
-                    sleep(400_000_000)
-                }
-            })
-            .map_err(|_| "no PIT window")?
+            pit_window(count, sleep_at(Pause::Ended, 400_000_000)).map_err(|e| {
+                crate::ktest::diag(format_args!("{e}"));
+                "no PIT window"
+            })?
         };
         kassert!(!w.is_steady());
         kassert!(w.end_gap == w.tsc);
@@ -566,17 +648,22 @@ crate::ktest!(
             let _off = arch::irq::push_off();
             median_tsc_hz(PIT_HZ, || {
                 taken += 1;
-                let paused = taken <= 2;
+                let pause = if taken <= 2 { 1_000_000 } else { 0 };
                 pit_window(count, |at| {
-                    if paused && at == Pause::EndReading {
-                        sleep(1_000_000);
+                    if pause > 0 && at == Pause::EndReading {
+                        sleep(pause);
                     }
                 })
             })
-            .map_err(|_| "calibrating against the PIT failed")?
+            .map_err(|e| {
+                crate::ktest::diag(format_args!("{e}"));
+                "calibrating against the PIT failed"
+            })?
         };
-        crate::ktest::diag(format_args!("{cal}"));
+        let shown = alloc::format!("{cal}");
+        crate::ktest::diag(format_args!("{shown}"));
         kassert!(cal.retaken >= 2);
+        kassert!(shown.ends_with(&alloc::format!("] retook {}", cal.retaken))); // clocks shows it
         kassert!(cal.windows.iter().all(Window::is_steady));
         kassert!(hz.abs_diff(cal.hz) * 200 <= hz);
         Ok(())
@@ -584,19 +671,43 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn calibration_gives_up_when_no_window_is_steady() {
+        // A reference whose every window has a paused end: after ATTEMPTS
+        // windows, an error that says so and shows the last one.
+        use crate::kassert_eq;
+        let unsteady = Window { tsc: 10_000_000, reference: 11_932, polls: 1, start_gap: 0, end_gap: 1_000_000 };
+        let mut taken = 0;
+        let result = median_tsc_hz(PIT_HZ, || {
+            taken += 1;
+            Ok(unsteady)
+        });
+        kassert_eq!(taken, 20); // ATTEMPTS, as documented
+        kassert_eq!(result, Err(CalError::Unsteady { steady: 0, attempts: ATTEMPTS, last: unsteady }));
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn a_paused_hpet_reading_is_not_steady() {
-        // Paused 1 ms between the last HPET read and the TSC read closing the
-        // window: its end is 10% uncertain, so it would be taken again.
+        // Paused 1 ms between an HPET read and the TSC read beside it, at the
+        // start and then at the end: that end is 10% uncertain, so the window
+        // would be taken again.
         use crate::kassert;
         let hpet = hpet().ok_or("no HPET")?;
         let target = hpet.clock().ticks(WINDOW_NS);
-        let w = {
-            let _off = arch::irq::push_off();
-            hpet_window(&hpet, target, || sleep(1_000_000)).map_err(|_| "no HPET window")?
-        };
-        crate::ktest::diag(format_args!("paused {w:?}"));
-        kassert!(!w.is_steady());
-        kassert!(w.end_gap >= tsc().ok_or("TSC not calibrated")?.ticks(1_000_000)); // the pause is in it
+        let ms = tsc().ok_or("TSC not calibrated")?.ticks(1_000_000);
+        for at in [Pause::StartReading, Pause::EndReading] {
+            let w = {
+                let _off = arch::irq::push_off();
+                hpet_window(&hpet, target, sleep_at(at, 1_000_000)).map_err(|e| {
+                    crate::ktest::diag(format_args!("{e}"));
+                    "no HPET window"
+                })?
+            };
+            crate::ktest::diag(format_args!("paused at {at:?}: {w}"));
+            kassert!(!w.is_steady());
+            kassert!(if at == Pause::StartReading { w.start_gap } else { w.end_gap } >= ms); // the pause is in it
+        }
         Ok(())
     }
 );
@@ -697,11 +808,12 @@ crate::ktest!(
 
 crate::ktest!(
     fn the_timer_ticks_on_its_vector() {
-        // Interrupts arrive on the timer's vector, and not faster than 1 kHz
-        // allows: 100 in 100 ms, at most. The rate itself is checked by
-        // `the_timer_is_programmed_for_1_khz` (against the HPET): QEMU's TCG
-        // delivers only some of a busy-waiting guest's ticks, 46 to 81 here
-        // under a loaded host (#45), and a lock held across a period merges them.
+        // Interrupts arrive on the timer's vector, and not much faster than
+        // 1 kHz (100 in 100 ms; the bound, 150, leaves room). The rate itself
+        // is checked by `the_timer_is_programmed_for_1_khz` (against the
+        // HPET): QEMU's TCG delivers only some of a busy-waiting guest's ticks,
+        // 29 to 81 in #45's stress runs, and a lock held across a period merges
+        // them.
         use crate::kassert;
         kassert!(arch::irq::enabled());
         let t0 = ticks();
@@ -726,10 +838,7 @@ crate::ktest!(
         sleep(5_000_000);
         let during = ticks() - t0;
         drop(guard);
-        let deadline = now_ns() + 100_000_000;
-        while ticks() == t0 && now_ns() < deadline {
-            core::hint::spin_loop();
-        }
+        wait_for_tick(t0, 100_000_000);
         kassert_eq!(during, 0);
         kassert!(ticks() > t0);
         Ok(())

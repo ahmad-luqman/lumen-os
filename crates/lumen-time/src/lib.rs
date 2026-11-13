@@ -1,7 +1,8 @@
 //! Timekeeping arithmetic for the Lumen kernel: working out a counter's
 //! frequency from a reference clock, converting ticks to and from
 //! nanoseconds, the counts the PIT and the local APIC timer are programmed
-//! with, and how times read in logs (`Stamp`, `Millis`). All of it is
+//! with, how times read in logs (`Stamp`, `Millis`), and the rules a
+//! calibration window must meet to be trusted (`Window`, `steady_windows`). All of it is
 //! integer math (the kernel has no floating point) in `u128` where products
 //! can overflow, so it holds for centuries of uptime (and then saturates).
 
@@ -76,6 +77,8 @@ pub fn plausible_tsc_hz(hz: u64) -> bool {
 /// polled, and how uncertain its start and end are, in TSC ticks. Each end is
 /// a reading of the reference taken between two TSC reads; the gap between
 /// them is how far off that end can be (a vCPU paused mid-reading widens it).
+/// An end that can't be placed at all (a PIT counter that may have wrapped)
+/// gets a gap of the whole window, so the window isn't steady.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Window {
     pub tsc: u64,
@@ -85,43 +88,80 @@ pub struct Window {
     pub end_gap: u64,
 }
 
-/// A window is steady if its start and end together are uncertain by at most
+/// A window is steady if the gaps at its start and end add up to at most
 /// 1/`STEADY` of it: 0.5%.
 pub const STEADY: u64 = 200;
 
 impl Window {
     /// Were both its ends read promptly enough to trust it (see [`STEADY`])?
+    /// An empty window isn't.
     pub fn is_steady(&self) -> bool {
-        self.start_gap.saturating_add(self.end_gap).saturating_mul(STEADY) <= self.tsc
+        self.tsc > 0 && self.start_gap.saturating_add(self.end_gap).saturating_mul(STEADY) <= self.tsc
     }
+
+    /// The TSC's frequency it gives against a reference counting at
+    /// `reference_hz` (see [`frequency`]).
+    pub fn tsc_hz(&self, reference_hz: u64) -> Option<u64> {
+        frequency(self.tsc, self.reference, reference_hz)
+    }
+}
+
+impl fmt::Display for Window {
+    /// `tsc/reference/polls/start_gap/end_gap`, in decimal.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}/{}/{}/{}", self.tsc, self.reference, self.polls, self.start_gap, self.end_gap)
+    }
+}
+
+/// Where a window measurement may be paused, for tests: a calibration passes
+/// a no-op, a test pauses there as a host descheduling the vCPU would.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pause {
+    /// After the reference started, before its start reading. Harmless when
+    /// the start is read, not assumed.
+    Started,
+    /// In the start reading, after the reference is read and before the TSC
+    /// is: the start's gap widens by the pause.
+    StartReading,
+    /// After the reference ran out, before its end reading. Harmless when the
+    /// reading says how far past the end it was, up to a limit (for the PIT,
+    /// [`pit_end_unambiguous`]); past that the window can't be placed.
+    Ended,
+    /// In the end reading, after the reference is read and before the TSC
+    /// is: the end's gap widens by the pause.
+    EndReading,
 }
 
 /// Why [`steady_windows`] gave up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SteadyError<E> {
-    /// Taking a window failed.
+    /// Taking a window failed (returned at once, not taken again).
     Take(E),
-    /// Only `steady` of `attempts` windows were steady.
-    Unsteady { steady: usize, attempts: usize },
+    /// Only `steady` of `attempts` windows were steady; `last` is the last
+    /// one that wasn't.
+    Unsteady { steady: usize, attempts: usize, last: Window },
 }
 
-/// Fill `out` with steady windows from `take`, taking an unsteady one again,
-/// at most `attempts` times in all. Returns how many were taken again.
+/// Fill `out` with steady windows from `take`, taking at most `attempts`
+/// windows in all; an unsteady one is set aside and another taken. Returns
+/// how many were set aside.
 pub fn steady_windows<E>(
     out: &mut [Window],
     attempts: usize,
     mut take: impl FnMut() -> Result<Window, E>,
 ) -> Result<usize, SteadyError<E>> {
-    let (mut steady, mut tried) = (0, 0);
+    let (mut steady, mut tried, mut last) = (0, 0, Window::default());
     while steady < out.len() {
         if tried == attempts {
-            return Err(SteadyError::Unsteady { steady, attempts });
+            return Err(SteadyError::Unsteady { steady, attempts, last });
         }
         tried += 1;
         let w = take().map_err(SteadyError::Take)?;
         if w.is_steady() {
             out[steady] = w;
             steady += 1;
+        } else {
+            last = w;
         }
     }
     Ok(tried - out.len())
@@ -134,14 +174,25 @@ pub fn pit_elapsed(start: u16, end: u16) -> u64 {
     u64::from(start.wrapping_sub(end))
 }
 
-/// Can a PIT window's end reading be trusted not to have wrapped past
-/// `start` + 65535 ticks? `running_tsc` is the TSC from the start reading to
-/// just before the last poll that still saw the count running, so fewer than
-/// `start` ticks passed in it; `late_tsc` is from then to the end reading. If
-/// `late_tsc` is at most 4 × `running_tsc`, fewer than 5 × `start` ticks passed
-/// in all, which is under 65536 for a `start` up to 13107 (10 ms is 11932).
+/// Was a PIT window's end reading taken fewer than 65536 ticks after its
+/// start reading, so [`pit_elapsed`] is right? `running_tsc` is the TSC from
+/// the start reading to just before the last poll that still saw the count
+/// running, so fewer than `start` ticks passed in it; `late_tsc` is from then
+/// to the end reading. If `late_tsc` is at most 4 × `running_tsc`, fewer than
+/// 5 × `start` ticks passed in all, which is under 65536 for a `start` up to
+/// 13107 (10 ms is 11932). No poll that saw it running (`running_tsc` 0)
+/// bounds nothing, so that is rejected too.
 pub fn pit_end_unambiguous(start: u16, running_tsc: u64, late_tsc: u64) -> bool {
     running_tsc > 0 && u64::from(start) * 5 <= 65536 && late_tsc <= running_tsc.saturating_mul(4)
+}
+
+/// Do a PIT window's readings fit a channel programmed with `programmed` that
+/// counted `elapsed` ticks from a start reading of `start` until after it ran
+/// out? It counts down from what was programmed (`start` at most that) and
+/// had passed 0 (`elapsed` at least `start`). Only meaningful for an end that
+/// [`pit_end_unambiguous`] places; a garbled read-back fails it.
+pub fn pit_counts_make_sense(programmed: u16, start: u16, elapsed: u64) -> bool {
+    start <= programmed && elapsed >= u64::from(start)
 }
 
 /// The median of `samples` (sorted in place).
@@ -256,6 +307,17 @@ mod tests {
         assert!(!window(10_000_000, 20_000, 30_001).is_steady());
         assert!(!window(10_000_000, 50_001, 0).is_steady(), "a late start counts too");
         assert!(!window(10_000_000, 0, u64::MAX).is_steady(), "saturates, doesn't wrap");
+        // Values where wrapping would give a small product or sum.
+        assert!(!window(10_000_000, 0, u64::MAX / 200 + 1).is_steady(), "the product saturates");
+        assert!(!window(10_000_000, u64::MAX, 1).is_steady(), "the sum saturates");
+        assert!(!window(0, 0, 0).is_steady(), "an empty window isn't steady");
+    }
+
+    #[test]
+    fn a_window_shows_as_its_five_fields_and_gives_its_frequency() {
+        let w = Window { tsc: 29_000_000, reference: 1_000_000, polls: 3, start_gap: 4, end_gap: 5 };
+        assert_eq!(w.to_string(), "29000000/1000000/3/4/5");
+        assert_eq!(w.tsc_hz(100_000_000), Some(2_900_000_000));
     }
 
     #[test]
@@ -268,6 +330,15 @@ mod tests {
         let mut out = [Window::default(); 3];
         assert_eq!(steady_windows::<()>(&mut out, 10, || Ok(taken.next().unwrap())), Ok(2));
         assert_eq!(out.map(|w| w.tsc), [100, 102, 104]);
+        // All steady: none set aside.
+        assert_eq!(steady_windows::<()>(&mut out, 3, || Ok(window(7, 0, 0))), Ok(0));
+        // Done on exactly the last attempt.
+        let mut n = 0;
+        let late = || {
+            n += 1;
+            Ok::<_, ()>(window(100, 0, if n <= 2 { 99 } else { 0 }))
+        };
+        assert_eq!(steady_windows(&mut out, 5, late), Ok(2));
     }
 
     #[test]
@@ -278,8 +349,12 @@ mod tests {
             n += 1;
             Ok::<_, ()>(window(100, 0, if n % 2 == 0 { 0 } else { 99 }))
         };
-        // Every other window is steady: 5 attempts give only 2.
-        assert_eq!(steady_windows(&mut out, 5, flaky), Err(SteadyError::Unsteady { steady: 2, attempts: 5 }));
+        // Every other window is steady: 5 attempts give only 2, and the last
+        // unsteady one (the fifth) is kept as evidence.
+        assert_eq!(
+            steady_windows(&mut out, 5, flaky),
+            Err(SteadyError::Unsteady { steady: 2, attempts: 5, last: window(100, 0, 99) })
+        );
         // A failure to take one is passed on at once.
         let mut calls = 0;
         let failing = || {
@@ -297,6 +372,14 @@ mod tests {
         assert_eq!(pit_elapsed(11_932, 0xffff), 11_933, "one tick past 0");
         assert_eq!(pit_elapsed(11_932, 0xffff - 999), 12_932, "1000 ticks past 0");
         assert_eq!(pit_elapsed(5, 5), 0);
+    }
+
+    #[test]
+    fn pit_counts_must_fit_how_it_was_programmed() {
+        assert!(pit_counts_make_sense(11_932, 11_932, 11_932));
+        assert!(pit_counts_make_sense(11_932, 11_900, 14_000), "started a little early, read late");
+        assert!(!pit_counts_make_sense(11_932, 11_933, 12_000), "more than was programmed");
+        assert!(!pit_counts_make_sense(11_932, 11_900, 11_899), "hadn't reached 0");
     }
 
     #[test]

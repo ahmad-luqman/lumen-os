@@ -8,6 +8,7 @@ asserted on: TCG and KVM run at different speeds.
 """
 
 import re
+from typing import NamedTuple
 
 BOOT_TIMEOUT = 60
 TSC_LINE = re.compile(
@@ -20,14 +21,41 @@ CLOCKS = re.compile(
 )
 
 
+# One measurement on the `clocks: windows:` line:
+# `<name> <hz> Hz [tsc/reference/polls/start_gap/end_gap ...] retook <n>`.
+WINDOWS_SEGMENT = re.compile(r"(boot|pit|hpet) (\d+) Hz \[([^\]]*)\] retook (\d+)")
+PIT_HZ = 1_193_182
+HPET_HZ = 100_000_000  # QEMU's HPET ticks every 10 ns
+# A calibration takes at most 20 windows for 5 steady ones (time::ATTEMPTS).
+MOST_RETAKEN = 15
+
+
+class Calibration(NamedTuple):
+    hz: int
+    windows: str
+    retook: int
+
+
 def clocks(m) -> tuple[int, str, int | None, int | None]:
     """kmon `clocks`: the TSC's boot frequency and reference, and the TSC
     measured again against the PIT and the HPET (None: no such clock)."""
+    return clocks_and_windows(m)[0]
+
+
+def clocks_and_windows(m) -> tuple[tuple[int, str, int | None, int | None], dict[str, Calibration]]:
+    """kmon `clocks`, and the windows line after it: each measurement's
+    calibration by name (`boot`, `pit`, `hpet`; a failed or missing one is
+    left out)."""
     m.send_line("clocks")
     c = m.expect(CLOCKS, 30)
+    w = m.expect(r"clocks: windows:(.*)\n", 30)
     m.expect(r"kmon> ")
     pit, hpet = (None if g is None else int(g) for g in c.group(3, 4))
-    return int(c[1]), c[2], pit, hpet
+    calibrations = {
+        name: Calibration(int(hz), windows, int(retook))
+        for name, hz, windows, retook in WINDOWS_SEGMENT.findall(w[1])
+    }
+    return (int(c[1]), c[2], pit, hpet), calibrations
 
 
 def assert_close(a: int, b: int) -> None:
@@ -35,27 +63,19 @@ def assert_close(a: int, b: int) -> None:
     assert abs(a - b) * 50 <= a, (a, b)
 
 
-WINDOWS_LINE = re.compile(
-    r"clocks: windows: boot (\d+) Hz \[([^\]]*)\] retook (\d+); "
-    r"pit (\d+) Hz \[([^\]]*)\] retook (\d+); hpet (\d+) Hz \[([^\]]*)\] retook (\d+)\n"
-)
-PIT_HZ = 1_193_182
-HPET_HZ = 100_000_000  # QEMU's HPET ticks every 10 ns
-
-
-def median_hz(windows: str, reference_hz: int) -> int:
-    """A calibration's frequency recomputed from its windows (each
-    `tsc/reference/polls/start_gap/end_gap`) as the kernel does: the median of
-    five, after checking each is steady (start and end uncertain by at most
-    0.5% of it in all)."""
+def check_calibration(cal: Calibration, reference_hz: int) -> None:
+    """The frequency is exactly what the kernel computes from the windows:
+    the median of five, each steady (the gaps at its start and end add up to
+    at most 0.5% of it), with at most MOST_RETAKEN taken again."""
     hz = []
-    for w in windows.split():
+    for w in cal.windows.split():
         tsc, ref, polls, start_gap, end_gap = (int(x) for x in w.split("/"))
         assert ref > 0 and polls > 0, w
         assert (start_gap + end_gap) * 200 <= tsc, f"not steady: {w}"
         hz.append(tsc * reference_hz // ref)
-    assert len(hz) == 5, windows
-    return sorted(hz)[2]
+    assert len(hz) == 5, cal
+    assert sorted(hz)[2] == cal.hz, cal
+    assert cal.retook <= MOST_RETAKEN, cal
 
 
 def ticks(m) -> tuple[int, int, int, int]:
@@ -80,16 +100,13 @@ def test_clocks_shows_the_windows_behind_each_measurement(boot):
     # measurements, and each frequency is exactly their median.
     m = boot("qemutest")
     m.expect(r"kmon> ", BOOT_TIMEOUT)
-    m.send_line("clocks")
-    c = m.expect(CLOCKS, 30)
-    w = m.expect(WINDOWS_LINE, 30)
-    m.expect(r"kmon> ")
-    tsc, pit, hpet = int(c[1]), int(c[3]), int(c[4])
-    assert c[2] == "hpet"
-    assert (int(w[1]), int(w[4]), int(w[7])) == (tsc, pit, hpet)
-    assert median_hz(w[2], HPET_HZ) == tsc
-    assert median_hz(w[5], PIT_HZ) == pit
-    assert median_hz(w[8], HPET_HZ) == hpet
+    (tsc, reference, pit, hpet), cals = clocks_and_windows(m)
+    assert reference == "hpet"
+    assert sorted(cals) == ["boot", "hpet", "pit"]
+    assert (cals["boot"].hz, cals["pit"].hz, cals["hpet"].hz) == (tsc, pit, hpet)
+    check_calibration(cals["boot"], HPET_HZ)
+    check_calibration(cals["pit"], PIT_HZ)
+    check_calibration(cals["hpet"], HPET_HZ)
 
 
 def test_timer_interrupts_counted(boot):
@@ -103,7 +120,8 @@ def test_timer_interrupts_counted(boot):
     after, *strays = ticks(m)
     # Up to 100 at 1 kHz. A smoke test that interrupts arrive (the rate is
     # checked in-kernel against the HPET): QEMU's TCG delivers only some of a
-    # busy-waiting guest's ticks, as few as 28% under a loaded host (#45).
+    # busy-waiting guest's ticks, as few as 28% in test_no_madt's 50 ms under
+    # a loaded host (#45).
     assert after - before >= 1, (before, after)
     assert strays == [0, 0, 0]
     assert "WARN  irq" not in m.output

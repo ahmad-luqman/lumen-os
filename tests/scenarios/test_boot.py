@@ -104,8 +104,8 @@ def test_boot_timeline_printed(boot):
     # In guest time, measured by the TSC: the time phase calibrates the timer
     # against the TSC (`time::WINDOWS` (5) windows of `WINDOW_NS` (10 ms),
     # each waited out on the TSC) and sleeps 10 ms on it for the first tick:
-    # at least 60 ms by construction. Calibrating the TSC itself (5 more
-    # windows, timed by the HPET or PIT) adds about 50 ms, but in TSC time
+    # at least 60 ms by construction. Calibrating the TSC itself (5 to 20 more
+    # windows, timed by the HPET or PIT) adds 50 ms or more, but in TSC time
     # only as closely as the median frequency fits each window, so the bound
     # leaves it out. The whole boot: generously under 30 s (an emulator runs
     # slower, never that slow).
