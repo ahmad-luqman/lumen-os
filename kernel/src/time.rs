@@ -299,26 +299,27 @@ fn calibrate_with_hpet(hpet: &HpetCounter) -> Result<Calibration, CalError> {
 /// off.
 fn calibrate_with_pit() -> Result<Calibration, CalError> {
     let count = lumen_time::pit_count(WINDOW_NS).expect("a 10 ms window fits the PIT");
-    median_tsc_hz(PIT_HZ, || {
-        let w = pit::wait(count).ok_or(CalError::NoCount)?;
-        let (start, end) = (w.start, w.end);
-        let tsc = end.tsc_after - start.tsc_after;
-        // An end reading that may have wrapped past 0 again can't be placed:
-        // as uncertain as the whole window, so it is taken again.
-        let running = w.last_running_tsc - start.tsc_after;
-        let late = end.tsc_after - w.last_running_tsc;
-        let end_gap = if lumen_time::pit_end_unambiguous(start.count, running, late) {
-            end.tsc_after - end.tsc_before
-        } else {
-            tsc
-        };
-        Ok(Window {
-            tsc,
-            reference: lumen_time::pit_elapsed(start.count, end.count),
-            polls: w.polls,
-            start_gap: start.tsc_after - start.tsc_before,
-            end_gap,
-        })
+    median_tsc_hz(PIT_HZ, || pit_window(count, || {}))
+}
+
+/// One window of `count` PIT ticks (`pause` runs once it has run out, before
+/// its end is read: see [`pit::wait`]).
+fn pit_window(count: u16, pause: impl FnOnce()) -> Result<Window, CalError> {
+    let w = pit::wait(count, pause).ok_or(CalError::NoCount)?;
+    let (start, end) = (w.start, w.end);
+    let tsc = end.tsc_after - start.tsc_after;
+    // An end reading that may have wrapped past 0 again can't be placed:
+    // as uncertain as the whole window, so it is taken again.
+    let running = w.last_running_tsc - start.tsc_after;
+    let late = end.tsc_after - w.last_running_tsc;
+    let end_gap =
+        if lumen_time::pit_end_unambiguous(start.count, running, late) { end.tsc_after - end.tsc_before } else { tsc };
+    Ok(Window {
+        tsc,
+        reference: lumen_time::pit_elapsed(start.count, end.count),
+        polls: w.polls,
+        start_gap: start.tsc_after - start.tsc_before,
+        end_gap,
     })
 }
 
@@ -484,6 +485,45 @@ crate::ktest!(
             _ => crate::ktest::diag(format_args!("tsc now against the hpet: failed")),
         }
         kassert!(hz.abs_diff(pit.hz) * 50 <= hz);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_late_look_at_the_pit_doesnt_stretch_its_window() {
+        // Paused 2 ms after the count ran out, before its end is read, as a
+        // host descheduling the vCPU would: the counter ran on past 0, so the
+        // window still gives the TSC's frequency (a yes/no "has it run out"
+        // read that late made it 20% high).
+        use crate::kassert;
+        let hz = tsc().ok_or("TSC not calibrated")?.hz();
+        let count = lumen_time::pit_count(WINDOW_NS).ok_or("no PIT count")?;
+        let w = {
+            let _off = arch::irq::push_off();
+            pit_window(count, || sleep(2_000_000)).map_err(|_| "no PIT window")?
+        };
+        let measured = lumen_time::frequency(w.tsc, w.reference, PIT_HZ).ok_or("no frequency")?;
+        crate::ktest::diag(format_args!("{measured} Hz against {hz} Hz; window {w:?}"));
+        kassert!(w.reference >= u64::from(count) + 2000); // ran on about 2386 ticks
+        kassert!(w.is_steady());
+        kassert!(hz.abs_diff(measured) * 200 <= hz); // within 0.5%
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_pit_end_read_after_it_could_wrap_is_not_steady() {
+        // Paused 60 ms after the count ran out: its counter (16 bits, 55 ms
+        // around) may have wrapped, so the window can't be placed and would be
+        // taken again.
+        use crate::kassert;
+        let count = lumen_time::pit_count(WINDOW_NS).ok_or("no PIT count")?;
+        let w = {
+            let _off = arch::irq::push_off();
+            pit_window(count, || sleep(60_000_000)).map_err(|_| "no PIT window")?
+        };
+        kassert!(!w.is_steady());
+        kassert!(w.end_gap == w.tsc);
         Ok(())
     }
 );

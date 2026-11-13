@@ -57,11 +57,13 @@ unsafe fn read() -> Reading {
 /// Run channel 2 for `count` ticks of its 1.193182 MHz clock and return once
 /// it has run out, with its counter read at both ends ([`Waited`]): a late
 /// look at the end doesn't stretch the window, since the counter says how far
-/// past the end it was. Busy-waits (up to about 55 ms with a working PIT);
+/// past the end it was. `pause` runs once it has run out, before the end
+/// reading (calibration passes a no-op; a test pauses there, as a host
+/// descheduling the vCPU would). Busy-waits (up to about 55 ms with a working PIT);
 /// call with interrupts off. `None` if there is no working PIT: its output
 /// didn't go low when programmed (a missing PIT's ports read all ones), or
 /// didn't go high again within [`BOUND_TSC`] TSC ticks.
-pub fn wait(count: u16) -> Option<Waited> {
+pub fn wait(count: u16, pause: impl FnOnce()) -> Option<Waited> {
     // SAFETY: programs channel 2 only (mode 0, one-shot, lobyte/hibyte) with
     // the speaker disconnected; channel 0 and the speaker are left alone.
     unsafe {
@@ -79,6 +81,7 @@ pub fn wait(count: u16) -> Option<Waited> {
                 polls += 1;
                 let t = rdtsc();
                 if inb(SPEAKER) & OUT != 0 {
+                    pause();
                     break Some(Waited { start, end: read(), last_running_tsc, polls });
                 }
                 last_running_tsc = t;
