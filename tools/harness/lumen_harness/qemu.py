@@ -127,7 +127,8 @@ def environment(accel: str) -> list[str]:
 
 
 def timeout_scale() -> float:
-    """Multiply every timeout (LUMEN_TIMEOUT_SCALE), e.g. for slow CI runners."""
+    """The factor for `Machine.expect` and `wait_exit` timeouts (LUMEN_TIMEOUT_SCALE;
+    unset or empty: 1), e.g. for slow CI runners."""
     return float(os.environ.get("LUMEN_TIMEOUT_SCALE") or "1")
 
 
@@ -212,6 +213,7 @@ class Machine:
         self._pos = 0  # expect() cursor into the normalized output
         self._reader: threading.Thread | None = None
         self._qmp: QmpClient | None = None
+        # The QMP socket's directory (LUMEN_SOCK_DIR; unset or empty: /tmp).
         # macOS limits unix socket paths to ~104 bytes, so keep it short.
         self._sock_dir = Path(os.environ.get("LUMEN_SOCK_DIR") or "/tmp")
         # pid: parallel pytest-xdist workers; counter: machines in one process.

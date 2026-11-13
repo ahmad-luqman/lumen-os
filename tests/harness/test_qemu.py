@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from lumen_harness import qemu
-from lumen_harness.__main__ import gdb_command
+from lumen_harness.__main__ import gdb_binary, gdb_command
 from lumen_harness.qemu import (
     Machine,
     QemuOptions,
@@ -121,16 +121,23 @@ def test_empty_overrides_mean_unset(monkeypatch):
 def test_empty_sock_dir_means_unset(tmp_path, monkeypatch):
     monkeypatch.setenv("LUMEN_SOCK_DIR", "")
     assert Machine(Path("x.iso"), tmp_path).qmp_path.parent == Path("/tmp")
+    monkeypatch.setenv("LUMEN_SOCK_DIR", str(tmp_path))  # a set value is still used
+    assert Machine(Path("x.iso"), tmp_path).qmp_path.parent == tmp_path
 
 
 def test_empty_timeout_scale_means_unset(monkeypatch):
     monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", "")
     assert timeout_scale() == 1.0
+    monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", "2.5")  # a set value is still used
+    assert timeout_scale() == 2.5
 
 
 def test_empty_gdb_means_unset(monkeypatch):
+    # `make debug` and its scenario's skip check both go through gdb_binary.
     monkeypatch.setenv("LUMEN_GDB", "")
-    assert gdb_command(Path("kernel"), batch=False)[0] == "gdb"
+    assert gdb_binary() == "gdb" == gdb_command(Path("kernel"), batch=False)[0]
+    monkeypatch.setenv("LUMEN_GDB", "x86_64-elf-gdb")  # a set value is still used
+    assert gdb_command(Path("kernel"), batch=False)[0] == "x86_64-elf-gdb"
 
 
 def test_ovmf_version_comes_from_the_fetch_stamp(tmp_path, monkeypatch):

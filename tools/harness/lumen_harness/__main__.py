@@ -27,9 +27,14 @@ def cmd_run(a: argparse.Namespace) -> int:
     return subprocess.call(args)
 
 
+def gdb_binary() -> str:
+    """The gdb to run (override: LUMEN_GDB; unset or empty: `gdb`)."""
+    return os.environ.get("LUMEN_GDB") or "gdb"
+
+
 def gdb_command(kernel: Path, batch: bool) -> list[str]:
     """gdb invocation that attaches to QEMU's stub and stops at kmain."""
-    cmd = [os.environ.get("LUMEN_GDB") or "gdb"]
+    cmd = [gdb_binary()]
     if batch:
         cmd += ["--batch", "-nx"]
     cmd += [
