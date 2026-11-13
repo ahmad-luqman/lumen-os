@@ -141,6 +141,10 @@ pub enum Pause {
     /// In the end reading, after the reference is read (the PIT's latched),
     /// before the TSC read after it.
     EndAfterRead,
+    /// In either PIT reading, after its second TSC read, while the count the
+    /// latch froze is read. Harmless: outside the bracket, however slow the
+    /// reads are (under KVM each is a VM exit).
+    CountRead,
 }
 
 /// Why [`steady_windows`] gave up.

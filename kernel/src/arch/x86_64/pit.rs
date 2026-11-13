@@ -34,6 +34,7 @@ unsafe fn read(pause: &mut impl FnMut(Pause), before: Pause, after: Pause) -> Pi
     unsafe { outb(COMMAND, 0b1000_0000) };
     pause(after);
     let tsc_after = rdtsc();
+    pause(Pause::CountRead);
     // SAFETY: two reads of the latched count, as the caller programmed it.
     let count = unsafe {
         let lo = inb(CHANNEL2);

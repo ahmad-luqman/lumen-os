@@ -552,9 +552,10 @@ crate::ktest!(
     }
 );
 
-/// A PIT window paused 2 ms at `at` (Started or Ended, which shouldn't
-/// matter): the pause happened (its readings show the 2 ms of ticks), and a
-/// steady window taken as calibration takes them still gives the TSC's
+/// A PIT window paused 2 ms at `at` (Started, Ended or CountRead, which
+/// shouldn't matter): the pause happened (for Started and Ended, the readings
+/// show the 2 ms of ticks; CountRead's is after both), and a steady window
+/// taken as calibration takes them still gives the TSC's
 /// frequency, within 1% (half of that is what a steady window's gaps allow;
 /// a loaded host can pause a reading too, which this isn't about).
 #[cfg(feature = "ktest")]
@@ -568,14 +569,18 @@ fn a_pit_window_paused_at_still_gives_the_tsc(at: Pause) -> Result<(), &'static 
         pit::wait(count, &mut pause).ok_or("no PIT")?
     };
     // About 2386 ticks counted off before the start reading, or past 0 before
-    // the end reading. Counter arithmetic, wrapping: a host stall on top of
-    // the pause can run the count out and on before the start is read.
+    // the end reading (CountRead is after both, so it shows in neither).
+    // Counter arithmetic, wrapping: a host stall on top of the pause can run
+    // the count out and on before the start is read.
     let paused = match at {
-        Pause::Started => count.wrapping_sub(w.start.count),
-        _ => 0u16.wrapping_sub(w.end.count),
+        Pause::Started => Some(count.wrapping_sub(w.start.count)),
+        Pause::Ended => Some(0u16.wrapping_sub(w.end.count)),
+        _ => None,
     };
-    crate::ktest::diag(format_args!("paused at {at:?}: {paused} ticks; readings {w:?}"));
-    kassert!(paused >= 2000);
+    crate::ktest::diag(format_args!("paused at {at:?}: {paused:?} ticks; readings {w:?}"));
+    if let Some(paused) = paused {
+        kassert!(paused >= 2000);
+    }
     let mut window = [Window::default()];
     off_or_diag("no steady PIT window", || {
         lumen_time::steady_windows(&mut window, ATTEMPTS, || pit_window(count, &mut pause)).map_err(CalError::from)
@@ -604,6 +609,16 @@ crate::ktest!(
         // it still gives the TSC's frequency (assuming the full count from the
         // start made it 20% low).
         a_pit_window_paused_at_still_gives_the_tsc(Pause::Started)
+    }
+);
+
+crate::ktest!(
+    fn reading_the_latched_pit_count_is_outside_the_window() {
+        // Paused 1 ms while each reading's latched count is read, after its
+        // bracket closed (as a slow VM exit under KVM would): the windows are
+        // still steady and give the TSC's frequency. With the reads inside the
+        // bracket, every window would be unsteady.
+        a_pit_window_paused_at_still_gives_the_tsc(Pause::CountRead)
     }
 );
 
