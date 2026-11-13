@@ -17,7 +17,7 @@
 //!    controllers (8259s masked, local APIC on, I/O APIC inputs masked), the
 //!    TSC and local APIC timer calibrated, interrupts on, the scheduler
 //!    started on every CPU (`kmain`'s context becomes the `main` thread);
-//!    then the framebuffer, `boot complete` and the boot timeline, then
+//!    then the framebuffer, the PS/2 keyboard, `boot complete` and the boot timeline, then
 //!    either the in-kernel tests (`--features ktest`) or the kernel monitor.
 
 #![no_std]
@@ -32,6 +32,7 @@ mod cmdline;
 mod crash;
 mod fb;
 mod interrupts;
+mod keyboard;
 mod klog;
 #[cfg_attr(feature = "ktest", allow(dead_code))] // replaced by the test runner
 mod kmon;
@@ -188,6 +189,7 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
         None => warn!(target: "fb", "no framebuffer"),
     }
     ktrace!(Kind::BootPhase, BootPhase::Framebuffer);
+    keyboard::init();
 
     info!(target: "boot", "boot complete");
     ktrace!(Kind::BootPhase, BootPhase::Complete);

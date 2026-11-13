@@ -25,11 +25,21 @@ pub fn run() -> ! {
     }
 }
 
-/// Read one line with echo and backspace handling.
+/// The next byte typed, on serial or the keyboard (an ASCII character;
+/// others are skipped), if any.
+fn try_read_byte() -> Option<u8> {
+    serial::try_read_byte().or_else(|| {
+        let c = crate::keyboard::read_char()?;
+        u8::try_from(c).ok().filter(u8::is_ascii)
+    })
+}
+
+/// Read one line, typed on serial or the keyboard, with echo (on serial)
+/// and backspace handling.
 fn read_line(buf: &mut [u8]) -> usize {
     let mut len = 0;
     loop {
-        let Some(b) = serial::try_read_byte() else {
+        let Some(b) = try_read_byte() else {
             // Polled (no serial interrupt yet): let other threads on this
             // CPU run.
             crate::sched::yield_now();
@@ -68,6 +78,7 @@ fn dispatch(line: &str) {
                  trace [n]         the boot CPU's last n trace events (default 16)\n  \
                  heap              heap usage and free-list summary\n  \
                  ticks             the boot CPU's timer interrupts (and stray ones)\n  \
+                 kbd               the keyboard's layout and interrupts\n  \
                  sleep <ms>        wait that long (guest time)\n  \
                  uptime            nanoseconds since the TSC started\n  \
                  clocks            the TSC's frequency, measured again against each clock\n  \
@@ -116,6 +127,10 @@ fn dispatch(line: &str) {
                 let _ = writeln!(out, "usage: sleep <ms> (up to 60000)");
             }
         },
+        "kbd" => {
+            let k = crate::keyboard::stats();
+            let _ = writeln!(out, "kbd: layout {}, {} interrupts, {} bytes dropped", k.layout, k.irqs, k.dropped);
+        }
         "uptime" => {
             let _ = writeln!(out, "uptime: {} ns", crate::time::now_ns());
         }

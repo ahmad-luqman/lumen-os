@@ -6,7 +6,8 @@ with `qemu_args`.
 
 `Machine` boots an ISO headless with serial on a pipe, then lets a test wait
 for output (`expect`, with a timeout, never fixed sleeps), type input
-(`send_line`), take screenshots over QMP (`screendump`), and collect the exit
+(`send_line` on serial, `type_text` and `press` on the keyboard through QMP),
+take screenshots over QMP (`screendump`), and collect the exit
 status that the kernel sets through `isa-debug-exit`.
 
 Every `Machine` run writes its artifacts to a directory: `serial.log`
@@ -33,7 +34,7 @@ from pathlib import Path
 from typing import Self
 
 from . import BUILD_DIR
-from .qmp import QmpClient
+from .qmp import QmpClient, qcodes_for
 
 # isa-debug-exit: QEMU exits with (code << 1) | 1. Must match kernel qemu.rs.
 EXIT_SUCCESS = (0x10 << 1) | 1  # 33
@@ -378,6 +379,19 @@ class Machine:
         if self._qmp is None:
             self._qmp = QmpClient.connect(self.qmp_path, timeout=10)
         return self._qmp
+
+    def press(self, qcodes: Sequence[str], echo: str, timeout: float = 10) -> None:
+        """Press `qcodes` together on the guest's keyboard (QMP `send-key`)
+        and wait until the guest echoes `echo` on serial (kmon echoes what it
+        reads), so keys are paced by the guest, not by sleeps."""
+        self.qmp().send_key(list(qcodes))
+        self.expect(re.escape(echo), timeout)
+
+    def type_text(self, text: str, timeout: float = 10) -> None:
+        """Type `text` on the guest's keyboard as a US layout would, one key
+        at a time, each waiting for the guest's echo (see `press`)."""
+        for ch in text:
+            self.press(qcodes_for(ch), ch, timeout)
 
     def screendump(self, name: str) -> Path:
         """Save the current screen as PNG in the artifacts directory."""

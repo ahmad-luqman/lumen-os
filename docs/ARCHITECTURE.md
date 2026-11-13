@@ -32,6 +32,7 @@ is listed only in [STATUS.md](STATUS.md), which is generated from tests.
 | Bootloader | Limine 12.x (pinned binary release + sha256), `limine` crate **0.5.0** | Memory map, framebuffer, higher-half direct map, and our own ELF file for symbolization, with no loader to write. Crate 0.6.x requires nightly (`#![feature(ptr_metadata)]`), so we use 0.5.0 (base revision 3). | Custom UEFI loader (optional learning milestone), GRUB/multiboot2. |
 | Kernel shape | **Modular monolith** with message-shaped internal interfaces; capabilities enforced at the syscall boundary | One address space keeps early milestones fast and debuggable. Agent safety needs capability checks between *processes*, which a monolith enforces just as well. Drivers and services expose request/response interfaces, so any of them can move to user space later. | Microkernel: stronger isolation of drivers, but it puts IPC performance and many extra servers in front of every milestone. |
 | Test harness | Python (`uv`, pytest) on the host; TAP from the kernel | Fast to write scenarios, mature tooling, and QMP/PIL are easy to use. | Rust `xtask`: one language, but slower iteration on test scripts. |
+| Third-party crates | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), at most one new crate per PR, checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX, no red zone, the kernel code model). Kernel crates so far: `limine`, `log`, `rustc-demangle`, `noto-sans-mono-bitmap` (from M0/M1), `pc-keyboard` (scancode decoding and layouts, #58, the first under this policy). | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
 | Firmware for tests | OVMF `edk2-stable202605-r1` from rust-osdev/ovmf-prebuilt, pinned with sha256 | macOS and CI boot byte-identical firmware, so golden screenshots match. | Distro OVMF packages (paths and versions differ per OS). |
 
 ## 3. Layers
@@ -248,7 +249,10 @@ missing or broken HPET alone is a warning (`no usable HPET: ...`) and leaves
 (`skipped the table at 0x...: ...`).
 
 Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
-`isa-debug-exit`, used by tests) and `lumen.log=<error|warn|info|debug|trace>`.
+`isa-debug-exit`, used by tests), `lumen.log=<error|warn|info|debug|trace>`
+and `lumen.keymap=<us|uk|de|fr|no|se|jp|dvorak|colemak>` (the keyboard's
+layout, section 6; `us` by default and for a name it doesn't know, with a
+warning).
 
 ## 5. Memory layout
 
@@ -535,7 +539,8 @@ allocates.
   arrive); 0x30-0x3e unused (a ktest raises 0x30); 0x3f the `WAKEUP` IPI
   (section 4, "Other CPUs"); 0x40 the local APIC
   timer; 0x50 + n global system interrupt n (up to 0xef), once a driver
-  routes it (every I/O APIC input is masked until then); 0xfe local APIC
+  routes it (`interrupts::route_isa_irq`; every other I/O APIC input stays
+  masked); 0xfe local APIC
   errors; 0xff the local APIC's spurious vector; the rest unused.
 - **Dispatch:** `#BP` is counted and resumes (a ktest proves registers
   survive the round trip); every other exception is fatal and goes to
@@ -545,8 +550,9 @@ allocates.
   may switch threads); spurious interrupts (the local APIC's, the 8259s' IRQ 7 and 15) are
   counted and get no EOI (a spurious IRQ 15 gets one at the master 8259); a
   local APIC error is counted, logged with its status (the 1st, 2nd, 4th,
-  8th... time, and whenever a new status bit appears) and EOI'd; anything
-  else is traced, counted, warned about once per vector, and EOI'd (another
+  8th... time, and whenever a new status bit appears) and EOI'd; a routed
+  I/O APIC vector runs the handler its driver registered and is EOI'd;
+  anything else is traced, counted, warned about once per vector, and EOI'd (another
   8259 line also masks the 8259s again; an 8259 vector the local APIC has
   in service is EOI'd there). Of device interrupts, only that last kind is
   traced: at 1 kHz the timer would flood the ring. kmon `ticks` shows the
@@ -719,6 +725,50 @@ off. A wake from another CPU queues the thread there and sends the
   report names the running thread (`thread: <name> (id N)`).
 - **Not yet:** priorities, migration or load balancing, a per-thread CPU
   time count (`top`, #63), and timeouts on wait queues.
+
+### Keyboard (built in M2)
+
+`kernel/src/keyboard.rs`, the 8042's ports in `arch/x86_64/i8042.rs`.
+
+- **Routing:** `interrupts::route_isa_irq(irq, handler)` takes the MADT's
+  interrupt override for the ISA IRQ, if any (the GSI, polarity and
+  trigger; ISA's edge, active high without one), finds the I/O APIC with
+  an input for that GSI, registers the handler for vector `0x50 + gsi`
+  (`idt::set_irq_handler`, while the input is still masked) and programs
+  the input masked, for the boot CPU. The driver unmasks it
+  (`interrupts::set_masked`) once its device is ready. Without an I/O APIC
+  (no MADT) routing fails and the driver warns. Redirection entries are a
+  typed `apic::RedirectionEntry` (vector, delivery mode, destination mode,
+  polarity, trigger, mask, destination; remote IRR and delivery status are
+  read-only and never written) changed by read-modify-write
+  (`IoApic::update_entry`).
+- **8042 init** (boot CPU, after the framebuffer; every reply polled with a
+  deadline, 100 ms, 1 s for the keyboard's reset): with the controller's
+  IRQs off and IRQ 1's input masked, both ports are disabled, the output
+  buffer flushed, an explicit configuration byte written (both IRQs off,
+  port 1's clock on, translation to scancode set 1 on), the self-test run
+  (0x55), the configuration written again (some controllers reset it
+  there), port 1 tested and enabled, the keyboard reset (an ACK and 0xAA,
+  in either order), set 2 selected and scanning enabled (each command
+  ACKed, resent at most twice on 0xFE). Then IRQ 1 is routed, port 1's IRQ
+  bit set, the input unmasked and the output buffer drained once: IRQ 1 is
+  edge triggered, so a byte that was already waiting would never raise
+  it. A missing controller or keyboard is a warning (`no PS/2 keyboard:
+  ...`, naming the step), not a failure (not tested).
+- **Bytes and decoding:** the IRQ handler (boot CPU, interrupts off) moves
+  up to 16 waiting bytes into a lock-free single-producer queue
+  (`lumen-queue`, 256 bytes, host-tested; a full queue drops and counts),
+  discarding the second port's. `keyboard::read_char` (never blocks)
+  decodes them under a lock with `pc-keyboard` in the layout
+  `lumen.keymap=` names, skipping keys that make no character. kmon reads
+  the keyboard as well as serial (and echoes on serial); `kbd` shows the
+  layout, the interrupts taken and the bytes dropped.
+- **Tests:** QMP `send-key` drives the keyboard (`Machine.type_text` and
+  `press`, which wait for kmon's echo of each key); a scenario boots with
+  `lumen.keymap=de` in an ISO built for it.
+- **Not yet:** a blocking read for threads (the shell, #62), key releases
+  and modifiers for programs, LEDs, the second port (a mouse), and
+  hot-plug.
 
 ## 7. Driver interface (planned, M3+)
 
@@ -1023,9 +1073,10 @@ run's, which the job summary was built from) survives.
 
 ```
 kernel/            the kernel (bin crate, x86_64-unknown-none)
-  src/arch/        HAL; x86_64/ has gdt, idt, irq, context (thread switch), apic, pic, pit, serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
+  src/arch/        HAL; x86_64/ has gdt, idt, irq, context (thread switch), apic, pic, pit, i8042 (ports), serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
   src/acpi.rs      ACPI discovery (MADT, HPET) through lumen-acpi
-  src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs
+  src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs, routing ISA IRQs
+  src/keyboard.rs  the PS/2 keyboard: 8042 init, IRQ 1, decoding (pc-keyboard), lumen.keymap
   src/time.rs      TSC and local APIC timer calibration, the boot origin, now_ns, sleep, ticks
   src/smp.rs       starting the other CPUs, run_on
   src/sched.rs     kernel threads: per-CPU run queues, preemption, sleep, wait queues
@@ -1040,7 +1091,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/kmon.rs      serial debug monitor (until the M2 shell)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
-crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-time, ...)
+crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-time, lumen-queue, ...)
 boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml

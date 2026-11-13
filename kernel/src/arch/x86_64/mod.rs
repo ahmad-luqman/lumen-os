@@ -8,6 +8,7 @@ pub mod apic;
 pub mod context;
 pub mod cpu;
 pub mod gdt;
+pub mod i8042;
 pub mod idt;
 pub mod irq;
 pub mod paging;

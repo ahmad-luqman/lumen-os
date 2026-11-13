@@ -13,6 +13,49 @@ class QmpError(RuntimeError):
     pass
 
 
+# QEMU's key names (QKeyCode, qapi/ui.json) for unshifted characters on a US
+# keyboard; `qcodes_for` adds shift for the rest.
+_UNSHIFTED = {
+    " ": "spc",
+    "\n": "ret",
+    "-": "minus",
+    "=": "equal",
+    "[": "bracket_left",
+    "]": "bracket_right",
+    "\\": "backslash",
+    ";": "semicolon",
+    "'": "apostrophe",
+    "`": "grave_accent",
+    ",": "comma",
+    ".": "dot",
+    "/": "slash",
+}
+_SHIFTED = dict(zip('!@#$%^&*()_+{}|:"~<>?', "1234567890-=[]\\;'`,./", strict=True))
+
+
+def qcodes_for(ch: str) -> list[str]:
+    """The keys (QEMU qcodes, held together) that type `ch` on a US layout."""
+    if len(ch) != 1:
+        raise ValueError(f"one character at a time, not {ch!r}")
+    if "a" <= ch <= "z" or "0" <= ch <= "9":
+        return [ch]
+    if "A" <= ch <= "Z":
+        return ["shift", ch.lower()]
+    if ch in _UNSHIFTED:
+        return [_UNSHIFTED[ch]]
+    if ch in _SHIFTED:
+        return ["shift", *qcodes_for(_SHIFTED[ch])]
+    raise ValueError(f"no US key types {ch!r}")
+
+
+def send_key_args(qcodes: list[str], hold_ms: int) -> dict[str, Any]:
+    """The arguments of QMP's `send-key`: press `qcodes` together, hold them
+    `hold_ms`, release them."""
+    if not qcodes:
+        raise ValueError("send-key needs at least one key")
+    return {"keys": [{"type": "qcode", "data": q} for q in qcodes], "hold-time": hold_ms}
+
+
 class QmpClient:
     def __init__(self, sock: socket.socket):
         self._sock = sock
@@ -58,6 +101,10 @@ class QmpClient:
             if "error" in reply:
                 raise QmpError(f"{name}: {reply['error']}")
             # Asynchronous events ({"event": ...}) are ignored.
+
+    def send_key(self, qcodes: list[str], hold_ms: int = 20) -> None:
+        """Press `qcodes` together on the guest's keyboard, then release."""
+        self.command("send-key", **send_key_args(qcodes, hold_ms))
 
     def close(self) -> None:
         try:
