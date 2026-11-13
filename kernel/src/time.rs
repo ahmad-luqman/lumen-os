@@ -716,7 +716,9 @@ crate::ktest!(
 crate::ktest!(
     fn a_held_lock_holds_off_the_timer() {
         // While a lock is held (interrupts off) no tick arrives; ticks resume
-        // once it is dropped.
+        // once it is dropped. The first can come late under QEMU's TCG on a
+        // loaded host (a fixed 2 ms wait missed it once, #45), so this waits up
+        // to 100 ms for it.
         use crate::{kassert, kassert_eq};
         let lock = crate::sync::SpinLock::new(());
         let guard = lock.lock();
@@ -724,7 +726,10 @@ crate::ktest!(
         sleep(5_000_000);
         let during = ticks() - t0;
         drop(guard);
-        sleep(2_000_000);
+        let deadline = now_ns() + 100_000_000;
+        while ticks() == t0 && now_ns() < deadline {
+            core::hint::spin_loop();
+        }
         kassert_eq!(during, 0);
         kassert!(ticks() > t0);
         Ok(())
