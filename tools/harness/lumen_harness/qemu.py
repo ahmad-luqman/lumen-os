@@ -129,12 +129,13 @@ def environment(accel: str) -> list[str]:
 
 def timeout_scale() -> float:
     """The factor for `Machine.expect` and `wait_exit` timeouts (LUMEN_TIMEOUT_SCALE;
-    unset or empty: 1), e.g. for slow CI runners.
+    unset or empty: 1), e.g. for slow CI runners. Each `Machine` reads it once,
+    when it is created.
 
     It must be a finite number above 0, or this raises ValueError naming the
     variable: 0 or less would time out at once, and nan or inf would never time
-    out, so a hung kernel would hang the run. For a very long wait (e.g. while
-    debugging), set a large finite value."""
+    out, so a hung kernel would hang the run. For a long wait while debugging,
+    set e.g. 100."""
     raw = os.environ.get("LUMEN_TIMEOUT_SCALE")
     if not raw:
         return 1.0
@@ -218,7 +219,7 @@ class Machine:
         extra_args: Sequence[str] = (),
     ):
         # Read once, before anything starts: a bad value fails here, not in the
-        # first expect().
+        # first expect() or wait_exit().
         self.timeout_scale = timeout_scale()
         self.iso = Path(iso)
         self.artifacts = Path(artifacts)
@@ -310,7 +311,7 @@ class Machine:
     def expect(self, pattern: str | re.Pattern[str], timeout: float = 30) -> re.Match[str]:
         """Wait until `pattern` (regex) appears after the previous match."""
         rx = re.compile(pattern) if isinstance(pattern, str) else pattern
-        wait, waited = self._scaled(timeout)
+        wait, said = self._scaled(timeout)
         deadline = time.monotonic() + wait
         with self._cond:
             while True:
@@ -323,22 +324,27 @@ class Machine:
                 exited = self.proc is not None and self.proc.poll() is not None
                 if remaining <= 0 or (exited and not self._reader_alive()):
                     tail = text[-2000:]
-                    why = "QEMU exited" if exited else f"timeout after {waited}"
+                    why = "QEMU exited" if exited else f"timeout after {said}"
                     raise ExpectTimeout(
                         f"{why} waiting for {rx.pattern!r}\n--- last serial output ---\n{tail}"
                     )
                 self._cond.wait(min(remaining, 0.5))
 
     def _scaled(self, timeout: float) -> tuple[float, str]:
-        """The wait for `timeout` under LUMEN_TIMEOUT_SCALE, and how a timeout
-        error describes it (with the unscaled value when they differ)."""
+        """The wait for `timeout` under this machine's LUMEN_TIMEOUT_SCALE, and how
+        a timeout error says it: when the scale isn't 1, with the unscaled timeout
+        and the scale too. A scale so large that the wait overflows to inf raises
+        ValueError, since that wait would never time out."""
         wait = timeout * self.timeout_scale
-        if self.timeout_scale == 1:
-            return wait, f"{wait:g}s"
-        return (
-            wait,
-            f"{wait:g}s ({timeout:g}s scaled by LUMEN_TIMEOUT_SCALE={self.timeout_scale:g})",
-        )
+        if not math.isfinite(wait):
+            raise ValueError(
+                f"LUMEN_TIMEOUT_SCALE={self.timeout_scale!r} makes a {timeout:g}s wait "
+                "overflow to inf"
+            )
+        said = f"{wait:g}s"
+        if self.timeout_scale != 1:
+            said += f" ({timeout:g}s scaled by LUMEN_TIMEOUT_SCALE={self.timeout_scale!r})"
+        return wait, said
 
     def _reader_alive(self) -> bool:
         return self._reader is not None and self._reader.is_alive()
@@ -354,11 +360,11 @@ class Machine:
     def wait_exit(self, timeout: float = 30) -> int:
         """Wait for QEMU to exit; returns its status."""
         assert self.proc
-        wait, waited = self._scaled(timeout)
+        wait, said = self._scaled(timeout)
         try:
             code = self.proc.wait(timeout=wait)
         except subprocess.TimeoutExpired as e:
-            raise ExpectTimeout(f"QEMU still running after {waited}") from e
+            raise ExpectTimeout(f"QEMU still running after {said}") from e
         if self._reader:
             self._reader.join(timeout=5)
         return code
