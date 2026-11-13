@@ -2,8 +2,9 @@
 //! the PIT if there is none, or it doesn't work), [`now_ns`], [`sleep`] and
 //! [`spin`] from it, and the local APIC timer ticking at [`TICK_HZ`],
 //! calibrated against the TSC (on the boot CPU; each other CPU starts its
-//! own with the same count, [`start_timer_here`]). It also holds the boot's origin ([`mark_boot`]), which
-//! the boot timeline and the log's timestamps ([`since_boot_ns`]) count from.
+//! own with the same count, [`start_timer_here`]). It also holds the boot's
+//! origin ([`mark_boot`]), which the boot timeline and the log's timestamps
+//! ([`since_boot_ns`]) count from.
 //!
 //! Calibration polls with interrupts off and takes the median of several
 //! 10 ms windows. Each TSC calibration window starts and ends with a reading of
@@ -510,9 +511,11 @@ pub fn sleep(ns: u64) {
     }
 }
 
-/// Busy-wait at least `ns` nanoseconds, keeping the CPU: for [`sleep`]
-/// where a thread can't block, and for tests that must not switch threads
-/// (the calibration ktests' pauses among them). Panics before [`init`].
+/// Busy-wait at least `ns` nanoseconds without yielding or blocking (the
+/// timer still preempts it if another thread is ready on this CPU): for
+/// [`sleep`] where a thread can't block, and for tests that must not switch
+/// threads (the calibration ktests' pauses among them). Panics before
+/// [`init`].
 pub fn spin(ns: u64) {
     let tsc = tsc().expect("time::spin before time::init");
     let start = arch::rdtsc();
@@ -787,7 +790,7 @@ crate::ktest!(
 
 crate::ktest!(
     fn now_ns_follows_the_hpet() {
-        // `now_ns` is the TSC converted; across a 50 ms sleep it moves as
+        // `now_ns` is the TSC converted; across a 50 ms spin it moves as
         // far as the HPET says, within 2% (a 1 ms budget: a host stall on one
         // reading doesn't fail it).
         use crate::kassert;

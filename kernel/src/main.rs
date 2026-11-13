@@ -17,8 +17,8 @@
 //!    controllers (8259s masked, local APIC on, I/O APIC inputs masked), the
 //!    TSC and local APIC timer calibrated, interrupts on, the scheduler
 //!    started on every CPU (`kmain`'s context becomes the `main` thread);
-//!    then the framebuffer, `boot complete` and the boot timeline, then either the
-//!    in-kernel tests (`--features ktest`) or the kernel monitor.
+//!    then the framebuffer, `boot complete` and the boot timeline, then
+//!    either the in-kernel tests (`--features ktest`) or the kernel monitor.
 
 #![no_std]
 #![no_main]

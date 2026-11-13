@@ -188,7 +188,7 @@ GDT and TSS (`ltr` marks a TSS busy), interrupt nesting (`arch::irq`), and
 the trace ring. The IDT and the local APIC's mapping are shared (every
 CPU's local APIC answers at the same address). The stack registry holds 128
 stacks: four per CPU, and the rest for threads and tests (a build-time
-assert ties the first two). Each CPU's `smp` slot is empty, starting or online; only online CPUs
+assert keeps the four per CPU below it). Each CPU's `smp` slot is empty, starting or online; only online CPUs
 get IPIs. The in-kernel tests boot with 4 CPUs online.
 
 **Running something on an AP.** `smp::run_on(cpu, job)` puts a `fn()` in the
@@ -199,8 +199,9 @@ land between the check and the halt; the job runs on the idle thread, in
 `ap_main`'s frames, and can't block. kmon's `crash <kind> [cpu]` uses it. The scheduler
 sends the same IPI when it queues a thread on another CPU (`smp::wake`).
 
-APs handle no I/O APIC interrupts: every input goes to the boot CPU; an
-AP's local APIC timer ticks once it starts its scheduler. Known gap: there
+APs handle no I/O APIC interrupts: every input goes to the boot CPU. An AP
+starts its local APIC timer once the boot CPU publishes the count, and the
+timer's first tick starts its scheduler. Known gap: there
 is no TLB shootdown; `unmap` flushes only the CPU that runs it. Mapping
 needs none (x86 caches no not-present entries; an AP may grow the heap, or
 map a thread's stack, from a thread or a `run_on` job there). The only
@@ -435,8 +436,10 @@ has no token), upward, with an unmapped guard page below each
 stack (so the page above a stack is the next one's guard), maps fresh frames
 there through its own sub-window (RW, NX, write-back; all or nothing,
 shared with the heap in `mm/window.rs`) and registers the stack. Dropping one retracts it from the registry, then
-unmaps it and frees its frames; addresses are never reused. Stacks the CPU
-points at are leaked so they can't be dropped.
+unmaps it and frees its frames; addresses are never reused. Each CPU's
+main and IST stacks are leaked so they can't be dropped; a thread's stack
+is dropped only once the thread is dead and its CPU has switched away from
+it.
 
 Boot: the IDT starts with every vector on the current stack. Right after
 `mm::init`, `kmain` allocates the 64 KiB #DF, NMI and #MC stacks, puts them in
@@ -515,9 +518,11 @@ allocator; nothing holding the last two may allocate. The allocator never
 logs (a log argument that allocates would re-enter it under the logger's
 lock) and formats its kmon and crash line from a copy taken under the
 lock. Like every `SpinLock`, it keeps interrupts off while held, so an
-interrupt handler is allowed to allocate (the timer's frees a dead
-thread's stack and record; the scheduler reserves room in its queues so
-the timer never allocates).
+interrupt handler is allowed to allocate. The timer interrupt can free
+(in `sched::finish_switch`): a detached dead thread's record and its
+joiners' list (its stack goes back through the page tables and frame
+allocator); the scheduler reserves room in its queues so the timer never
+allocates.
 
 ## 6. Interrupts, exceptions and crash reports (built)
 
@@ -576,8 +581,8 @@ the timer never allocates).
   `time::sleep` (blocks the thread once the scheduler runs on its CPU,
   section "Kernel threads"; busy-waits before that, on an idle thread, with
   interrupts off or a lock held), `time::spin` (always busy). The boot CPU
-  publishes the timer's count; every other CPU starts its own timer with it
-  when its scheduler starts, and ticks are counted per CPU (`time::ticks`
+  publishes the timer's count; every other CPU starts its own timer with
+  it, and the first tick starts that CPU's scheduler, and ticks are counted per CPU (`time::ticks`
   is the boot CPU's). kmon has `ticks`,
   `sleep <ms>`, `uptime`, and `clocks` (the TSC measured again against the
   PIT and the HPET, which the tests compare with the boot calibration: a
@@ -588,7 +593,9 @@ the timer never allocates).
   `tsc/reference/polls/start_gap/end_gap`; a failed or missing measurement
   is left out. Under QEMU's TCG a
   busy-waiting guest gets only some of its ticks (late periodic timers skip
-  periods): about 80% alone, as few as 18% with many VMs running in parallel.
+  periods): about 80% alone, as few as 18% with many VMs running in parallel
+  (measured in M1, when `time::sleep` busy-waited; it now halts in the
+  idle thread).
   Tests check the timer's rate by its count register against the HPET, check
   only that ticks arrive (at least one, none stray; the ktest also caps them
   at 150 per 100 ms), and never assert on host time. Every
@@ -624,7 +631,7 @@ the timer never allocates).
   calibrated), for each online CPU to halt. Serial starts with
   `cpu: N (lapic id X)`, `running on: the <kind> stack <bottom>..<top>` (the
   reporter's own stack, from the registry), `thread: <name> (id N)` (the
-  thread that was running, once the scheduler runs; read lock-free) and, with other CPUs online,
+  thread that was running, once that CPU's threads are set up; read lock-free) and, with other CPUs online,
   `other cpus stopped: 0 2 3`: those that had halted when the wait ended,
   without a crash of their own. `!!!` lines name the rest: a CPU that didn't
   halt in time, one whose NMI couldn't be sent, one that crashed itself
@@ -641,64 +648,72 @@ the timer never allocates).
 
 ### Kernel threads (built in M2)
 
-`kernel/src/sched.rs`. A thread has its own 64 KiB kernel stack from
-`mm::stack` (a guard page below it, hard rule 4; registered as a `thread`
-stack), its saved `rsp`, and a state: ready, running, sleeping, blocked or
-dead. `sched::spawn(name, f)` starts one on this CPU and `spawn_on(cpu, ..)`
-on another; both return a `JoinHandle` (`join` blocks until it has
-finished). A thread **never moves between CPUs**: each CPU has its own run
-queue (a FIFO) and only that CPU takes threads off it, so once its spawner
-has laid out its first frame, a thread's saved registers are touched only
-by its home CPU with interrupts off. A wake from
-another CPU queues the thread there and sends the `WAKEUP` IPI.
+`kernel/src/sched.rs`. A spawned thread has its own 64 KiB kernel stack
+from `mm::stack` (a guard page below it, hard rule 4; registered as a
+`thread` stack), its saved `rsp`, and a state: ready, running, sleeping,
+blocked or dead. (`main` and the APs' idle threads run on stacks they don't
+own.) `sched::spawn(name, f)` starts one on this CPU and `spawn_on(cpu, ..)`
+on another; both return a `JoinHandle`, whose `join` blocks until the
+thread has finished and its stack is freed. A thread **never moves between
+CPUs**: each CPU has its own run queue (a FIFO) and only that CPU takes
+threads off it, so once its spawner has laid out its first frame, a
+thread's saved registers are touched only by its home CPU with interrupts
+off. A wake from another CPU queues the thread there and sends the
+`WAKEUP` IPI, so a halted CPU runs it before its next tick.
 
 - **Switching** (`arch::context::switch`, naked asm): pushes the
   callee-saved registers (rbx, rbp, r12-r15), saves `rsp`, loads the next
-  thread's and pops its registers. There is no SSE or x87 state (the kernel
-  has none, `make audit`). It happens only with interrupts off and no
-  critical section open (asserted): a held `SpinLock`'s section belongs to
-  the CPU, so one held across a switch would be closed by another thread.
-  Whether interrupts were on is a local on the switching thread's stack.
-  State changes are checked (a thread moving from a state it isn't in
-  panics), as is that both threads of a switch are its CPU's. A new
-  thread's stack is laid out as if `switch` had been called with
-  `context::thread_start` as its return address; that which calls `sched::thread_entry` with `rbp` = 0,
-  so its backtraces end there.
+  thread's and pops its registers. There is no SSE/AVX state (`make audit`
+  proves none is used; x87 isn't checked). It happens only with interrupts
+  off and no critical section open (asserted): a held `SpinLock`'s section
+  belongs to the CPU, so one held across a switch would be closed by
+  another thread. Whether interrupts were on is a local on the switching
+  thread's stack. State changes are checked (a thread moving from a state
+  it isn't in panics), as is that both threads of a switch are its CPU's
+  (not tested: correct code never trips them). A new thread's stack is
+  laid out as if `switch` had been called with `context::thread_start` as
+  its return address, which calls `sched::thread_entry` with `rbp` = 0, so
+  its backtraces end there.
 - **Preemption:** round robin on every CPU's 1 kHz local APIC timer: a
   thread runs 10 ticks (`SLICE_TICKS`) before the next ready thread on its
-  CPU gets a turn (the idle thread, at the next tick once one is ready);
-  the timer interrupt (after its EOI) switches, and the preempted thread
-  later returns through the handler's `iretq`. Slices are counted in the
-  CPU's own ticks (a ktest checks 20 ticks between a thread's turns with
-  two threads). Under TCG ticks arrive late, so slices are longer in time;
-  tests bound waits by progress. The timer never allocates: each CPU's
-  queues have room for every thread homed there.
+  CPU gets a turn (the idle thread gives way at once when the wakeup IPI
+  ends its halt, or at the next tick while it runs a `run_on` job); the
+  timer interrupt (after its EOI) switches, and the preempted thread later
+  returns through the handler's `iretq`. Slices are counted in the CPU's
+  own ticks (a ktest checks two threads' turns 20 ticks apart). Under TCG
+  ticks arrive late, so slices are longer in time; tests bound waits by
+  progress. The timer never allocates: each CPU's queues have room for
+  every thread homed there (checked by a ktest, and asserted on every
+  push).
 - **Calls:** `yield_now`; `sleep(ns)` (a deadline from `now_ns`, checked by
   each tick on the thread's CPU, so it never wakes early; it runs once its
-  turn comes after that); `exit` (returning
-  from the entry point does it); `WaitQueue::wait_until(cond)` with
-  `wake_one` and `wake_all` (the condition is checked under the queue's
-  lock, so a waker that sets it and then wakes can't be missed; a thread
-  woken by another CPU before it has switched out is neither lost nor queued
-  twice; a ktest hands a turn between two CPUs 6000 times). Dropping a
-  queue with threads waiting panics, as does a thread joining itself. Blocking panics where a thread can't block (`wait_until`), or
-  falls back to a busy wait (`time::sleep`): before the scheduler runs on
-  the CPU, on an idle thread, with interrupts off or a lock held.
+  turn comes after that); `exit` (returning from the entry point does it);
+  `WaitQueue::wait_until(cond)` with `wake_one` (the longest-waiting thread
+  first) and `wake_all` (the condition is checked under the queue's lock,
+  so a waker that sets it and then wakes can't be missed; a thread woken by
+  another CPU before it has switched out is neither lost nor queued twice;
+  a ktest hands a turn between two CPUs 6000 times). Dropping a queue with
+  threads waiting panics, as does a thread joining itself (not tested).
+  Where a thread can't block, `wait_until` panics (not tested) and
+  `time::sleep` busy-waits (tested with a lock held, interrupts off, and
+  on an idle thread; before the scheduler runs on the CPU, not tested).
 - **Idle and boot:** each CPU's idle thread runs only when nothing is ready
-  and is never queued. An AP's is its `smp::ap_main` loop (on its main
-  stack), which also starts the AP's timer once the boot CPU publishes the
-  calibrated count and runs `run_on` jobs; the boot CPU gets an idle thread
-  with a stack of its own, and `kmain`'s context becomes the `main` thread
-  (kmon or the ktests). A CPU's scheduler runs from its timer's first
-  tick: before that nothing could wake a sleeper there, so `spawn_on`
-  refuses it and `time::sleep` busy-waits. `sched::init` (boot CPU, after
+  and is never queued. An AP's is its `ap_main` context (on its main
+  stack), looping in `sched::idle_loop`, which starts the AP's timer once
+  the boot CPU publishes the calibrated count and runs `run_on` jobs (a job
+  runs only while no thread is ready there); the boot CPU gets an idle
+  thread with a stack of its own, and `kmain`'s context becomes the `main`
+  thread (kmon or the ktests). A CPU's scheduler runs from the first tick
+  after it is armed (its current and idle threads set, its timer started):
+  before that nothing could wake a sleeper there, so `spawn_on` refuses it
+  and `time::sleep` busy-waits. `sched::init` (boot CPU, after
   `smp::wait_online`) wakes the APs and waits for every CPU's scheduler to
   start, 1 s in all; one that doesn't, or an IPI that isn't sent, is
-  warned about (not tested).
-- **Exit:** only a spawned thread can exit (not `main` or an idle thread).
-  Its stack is freed by the next thread to run on its CPU (the unmap's TLB
-  flush is local; see "Other CPUs" on the spawner's entry); only then does
-  `join` return.
+  warned about, and one that starts later says so (not tested).
+- **Exit:** only a spawned thread can exit, not `main` or an idle thread
+  (asserted, not tested). Its stack is freed by the next thread to run on
+  its CPU (the unmap's TLB flush is local; see "Other CPUs" on the
+  spawner's entry); only then does `join` return.
 - **Observability:** every switch records a `switch` trace event (previous
   and next thread's ids, the previous thread's state), and the serial crash
   report names the running thread (`thread: <name> (id N)`).

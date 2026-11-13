@@ -265,7 +265,8 @@ const _: () = assert!(
 );
 
 /// Local APIC timer interrupts taken, per CPU (every CPU's timer ticks once
-/// its scheduler runs).
+/// started: the boot CPU's from `time::init`, each AP's from its idle
+/// thread; its first tick after that starts the CPU's scheduler).
 static TICKS: [AtomicU64; super::percpu::MAX_CPUS] = [const { AtomicU64::new(0) }; super::percpu::MAX_CPUS];
 /// Spurious interrupts (local APIC, or 8259 IRQ 7 or 15) taken.
 static SPURIOUS_IRQS: AtomicU64 = AtomicU64::new(0);
@@ -350,9 +351,10 @@ fn unexpected(frame: &TrapFrame) {
 
 /// Called by `lumen_isr_common` for every vector. CPU exceptions are traced
 /// and fatal (bar #BP). Device interrupts are never fatal: the timer and
-/// spurious interrupts are only counted (at 1 kHz they would flood the trace
-/// ring), and the timer drives the scheduler (`sched::tick`, which may switch
-/// to another thread and return here only when this one runs again); a local APIC error is counted and logged with its status (on the
+/// spurious interrupts are counted, not traced (at 1 kHz they would flood
+/// the trace ring), and the timer drives the scheduler (`sched::tick`, which
+/// may switch to another thread and return here only when this one runs
+/// again); a local APIC error is counted and logged with its status (on the
 /// 1st, 2nd, 4th, 8th... one, and whenever a new status bit appears);
 /// anything else is traced, counted and warned about once per vector.
 /// Interrupts are off throughout (every gate is an interrupt gate).

@@ -30,7 +30,8 @@ fn read_line(buf: &mut [u8]) -> usize {
     let mut len = 0;
     loop {
         let Some(b) = serial::try_read_byte() else {
-            // Polled (no serial interrupt yet): let other threads on this CPU run.
+            // Polled (no serial interrupt yet): let other threads on this
+            // CPU run.
             crate::sched::yield_now();
             continue;
         };
@@ -377,12 +378,13 @@ fn crash_corrupt_heap() {
     let _ = writeln!(serial::SerialWriter, "crash: a corrupt free list went unnoticed");
 }
 
-/// Write into the guard page below this CPU's main stack from a healthy stack: a
+/// Write into the guard page below the stack this runs on (this CPU's main
+/// stack, or with `crash guard thread` the thread's) from a healthy stack: a
 /// plain #PF (nothing overflowed), which the report names as a stray guard
 /// page hit, not an overflow.
 #[inline(never)]
 fn crash_touch_guard() {
-    // This CPU's main stack: the one it runs on.
+    // The stack it runs on.
     let Some(main) = arch::stacks::stack_of(arch::read_rsp()) else {
         let _ = writeln!(serial::SerialWriter, "crash: not on a registered stack");
         return;

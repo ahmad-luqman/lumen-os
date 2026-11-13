@@ -29,8 +29,8 @@
 //! Panics in the allocator's own paths happen after the lock is released,
 //! except inside the heap itself (a corrupt list, a failed rollback); the
 //! crash line then says it read the heap under the lock. Interrupt
-//! handlers are allowed to allocate (the timer's frees: a dead thread's
-//! record, in `sched::finish_switch`): the lock keeps
+//! handlers are allowed to allocate (the timer interrupt can free a dead
+//! thread's record, in `sched::finish_switch`): the lock keeps
 //! interrupts off while held, so a maskable interrupt's handler never spins
 //! on a lock the code it interrupted holds (another CPU just waits for it).
 

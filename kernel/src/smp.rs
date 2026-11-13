@@ -188,9 +188,9 @@ impl core::fmt::Display for RunError {
 /// Have AP `index` run `job` from its idle thread (on its main stack, with
 /// interrupts on; once its scheduler runs, the job waits for the threads
 /// ready there and can be preempted by them), and wake it. Returns once the
-/// job is handed over, not when it has run. The job can't block: on the
-/// idle thread `time::sleep` busy-waits, and waiting on a queue (or a join)
-/// panics.
+/// job is handed over, not when it has run. The job runs only while no
+/// thread is ready there, and can't block: on the idle thread `time::sleep`
+/// busy-waits, and waiting on a queue (or a join) panics.
 pub fn run_on(index: usize, job: fn()) -> Result<(), RunError> {
     let Some(lapic) = online_lapic_id(index).filter(|_| index != 0) else {
         return Err(RunError::NotAnOnlineAp);
@@ -208,8 +208,9 @@ pub fn run_on(index: usize, job: fn()) -> Result<(), RunError> {
 
 /// Wake CPU `index` if it is online and isn't this one: send it the
 /// `WAKEUP` IPI, which ends its idle loop's halt (the scheduler, after
-/// queueing a thread there, or to start its timer). False only if the IPI
-/// couldn't be sent (this CPU's local APIC stayed busy).
+/// queueing a thread there, or to start its timer). False only if an IPI
+/// was due and couldn't be sent (this CPU's local APIC stayed busy); true
+/// if there was nothing to do (this CPU, or one that isn't online).
 #[must_use = "an IPI that wasn't sent woke nothing"]
 pub fn wake(index: usize) -> bool {
     match online_lapic_id(index) {

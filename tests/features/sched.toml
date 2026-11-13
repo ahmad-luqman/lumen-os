@@ -1,11 +1,17 @@
 # Features: sched. See tests/features/README.md for the format.
 
 [[feature]]
-name = "Kernel threads preempted round robin by the 1 kHz timer, in 10-tick slices"
+name = "Kernel threads preempted round robin by the timer, in 10-tick slices"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::sched::two_threads_interleave",
     "ktest:lumen_kernel::sched::slices_are_10_ticks",
+]
+
+[[feature]]
+name = "Each thread keeps its own interrupt state across a switch"
+milestone = "M2"
+tests = [
     "ktest:lumen_kernel::sched::yielding_with_interrupts_off_keeps_them_off",
 ]
 
@@ -17,10 +23,11 @@ tests = [
 ]
 
 [[feature]]
-name = "A scheduler on every online CPU: threads spawned on a CPU run there, preempted, and only there"
+name = "A scheduler on every online CPU, each AP's timer at the boot CPU's 1 kHz count: threads spawned on a CPU run there, preempted, and only there"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::sched::threads_run_on_every_cpu",
+    "ktest:lumen_kernel::sched::ap_timers_are_programmed_for_1_khz",
     "ktest:lumen_kernel::sched::spawning_where_no_scheduler_runs_is_refused",
     "scenario:test_smp::test_all_cpus_online",
 ]
@@ -35,19 +42,29 @@ tests = [
 ]
 
 [[feature]]
-name = "Wait queues: a blocked thread wakes when its condition holds, on its own CPU or from another, with no lost wakeup"
+name = "Wait queues: a blocked thread wakes when its condition holds, on its own CPU or from another (the wakeup IPI), with no lost wakeup; wake_one in FIFO order, wake_all wakes every waiter"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::sched::wait_queue_wakes_a_blocked_thread",
     "ktest:lumen_kernel::sched::wait_queue_ping_pong_across_cpus_loses_no_wakeup",
+    "ktest:lumen_kernel::sched::wake_one_is_fifo_and_wake_all_wakes_every_waiter",
+    "ktest:lumen_kernel::sched::a_remote_wake_does_not_wait_for_a_tick",
 ]
 
 [[feature]]
-name = "A finished thread's stack is freed (on its own CPU) before join returns"
+name = "join blocks until the thread has finished and its stack is freed"
 milestone = "M2"
 tests = [
+    "ktest:lumen_kernel::sched::join_blocks_until_the_thread_is_reaped",
     "ktest:lumen_kernel::sched::a_dead_threads_stack_is_freed",
     "ktest:lumen_kernel::sched::a_thread_dying_into_a_fresh_one_is_reaped",
+]
+
+[[feature]]
+name = "The timer interrupt never allocates: every thread homed on a CPU has room in its queues"
+milestone = "M2"
+tests = [
+    "ktest:lumen_kernel::sched::every_homed_thread_has_room_in_its_queues",
 ]
 
 [[feature]]
@@ -55,6 +72,7 @@ name = "Thread switches are traced"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::sched::switches_are_traced",
+    "ktest:lumen_kernel::sched::every_state_round_trips",
 ]
 
 [[feature]]
