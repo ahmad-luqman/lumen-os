@@ -117,9 +117,8 @@ def test_empty_overrides_mean_unset(monkeypatch):
     monkeypatch.setenv("LUMEN_OVMF_VARS", "")
     assert qemu_args(opts())[0] == "qemu-system-x86_64"
     assert ovmf_vars_template() == qemu.BUILD_DIR / "deps/ovmf/OVMF_VARS.fd"
-    monkeypatch.setenv(
-        "LUMEN_QEMU", "/opt/qemu/bin/qemu-system-x86_64"
-    )  # a set value is still used
+    # A set value is still used.
+    monkeypatch.setenv("LUMEN_QEMU", "/opt/qemu/bin/qemu-system-x86_64")
     monkeypatch.setenv("LUMEN_OVMF_VARS", "/elsewhere/VARS.fd")
     assert qemu_args(opts())[0] == "/opt/qemu/bin/qemu-system-x86_64"
     assert ovmf_vars_template() == Path("/elsewhere/VARS.fd")
