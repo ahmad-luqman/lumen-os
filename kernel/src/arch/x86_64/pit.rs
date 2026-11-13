@@ -18,14 +18,24 @@ const OUT: u8 = 1 << 5;
 /// before the PIT counts as missing: the longest count is 55 ms.
 const BOUND_TSC: u64 = 1 << 32;
 
+/// How a [`wait`] went: how many times the output was polled, the TSC just
+/// before the gate went high (the count starts in between that and
+/// `started`), and the TSC after the last poll that still saw the count
+/// running (it ended in between that and the caller's next TSC read).
+#[derive(Clone, Copy, Debug)]
+pub struct Waited {
+    pub polls: u64,
+    pub gate_tsc: u64,
+    pub last_running_tsc: u64,
+}
+
 /// Run channel 2 for `count` ticks of its 1.193182 MHz clock, calling
-/// `started` just as it starts and returning once it has finished: how many
-/// times its output was polled (the window over that is how late the end can
-/// be seen). Busy-waits (up to about 55 ms with a working PIT); call with
+/// `started` just as it starts and returning once it has finished, with how
+/// it went ([`Waited`]). Busy-waits (up to about 55 ms with a working PIT); call with
 /// interrupts off so the window isn't stretched. `None` if there is no working
 /// PIT: its output didn't go low when programmed (a missing PIT's ports read
 /// all ones), or didn't go high again within [`BOUND_TSC`] TSC ticks.
-pub fn wait(count: u16, started: impl FnOnce()) -> Option<u64> {
+pub fn wait(count: u16, started: impl FnOnce()) -> Option<Waited> {
     // SAFETY: programs channel 2 only (mode 0, one-shot) with the speaker
     // disconnected; channel 0 and the speaker are left alone otherwise.
     unsafe {
@@ -35,17 +45,19 @@ pub fn wait(count: u16, started: impl FnOnce()) -> Option<u64> {
         outb(CHANNEL2, count as u8);
         outb(CHANNEL2, (count >> 8) as u8);
         // Mode 0 drives the output low as soon as it is programmed.
-        let polls = if inb(SPEAKER) & OUT == 0 {
+        let waited = if inb(SPEAKER) & OUT == 0 {
+            let gate_tsc = rdtsc();
             outb(SPEAKER, ctl | GATE); // gate high: count down
             started();
             let t0 = rdtsc();
-            let mut polls = 0;
+            let (mut polls, mut last_running_tsc) = (0, t0);
             loop {
                 polls += 1;
                 if inb(SPEAKER) & OUT != 0 {
-                    break Some(polls);
+                    break Some(Waited { polls, gate_tsc, last_running_tsc });
                 }
-                if rdtsc().wrapping_sub(t0) > BOUND_TSC {
+                last_running_tsc = rdtsc();
+                if last_running_tsc.wrapping_sub(t0) > BOUND_TSC {
                     break None;
                 }
             }
@@ -53,6 +65,6 @@ pub fn wait(count: u16, started: impl FnOnce()) -> Option<u64> {
             None
         };
         outb(SPEAKER, ctl);
-        polls
+        waited
     }
 }

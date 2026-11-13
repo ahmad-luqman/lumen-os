@@ -149,7 +149,7 @@ fn clocks() {
         };
     }
     let _ = writeln!(out);
-    // The windows behind those (tsc/reference/polls each), for diagnosing.
+    // The windows behind those (tsc/reference/polls/start_gap/end_gap each), for diagnosing.
     let _ = write!(out, "clocks: windows:");
     if let Some(boot) = time::boot_calibration() {
         let _ = write!(out, " boot {boot}");

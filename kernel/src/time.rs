@@ -49,13 +49,16 @@ static HPET: SpinLock<Option<HpetCounter>> = SpinLock::new(None);
 static BOOT_CALIBRATION: SpinLock<Option<Calibration>> = SpinLock::new(None);
 
 /// One TSC calibration window as measured: TSC ticks, the reference clock's
-/// ticks over the same stretch, and how often the reference was polled (the
-/// window over that is how late its end could be seen).
+/// ticks over the same stretch, how often the reference was polled, and how
+/// uncertain its start and end were, in TSC ticks (the reference's reading
+/// happened somewhere in that stretch before the TSC was read).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Window {
     pub tsc: u64,
     pub reference: u64,
     pub polls: u64,
+    pub start_gap: u64,
+    pub end_gap: u64,
 }
 
 /// A TSC calibration: the median of its windows' frequencies, and the windows
@@ -67,12 +70,12 @@ pub struct Calibration {
 }
 
 impl fmt::Display for Calibration {
-    /// `<hz> Hz [tsc/reference/polls ...]`.
+    /// `<hz> Hz [tsc/reference/polls/start_gap/end_gap ...]`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} Hz [", self.hz)?;
         for (i, w) in self.windows.iter().enumerate() {
             let sep = if i == 0 { "" } else { " " };
-            write!(f, "{sep}{}/{}/{}", w.tsc, w.reference, w.polls)?;
+            write!(f, "{sep}{}/{}/{}/{}/{}", w.tsc, w.reference, w.polls, w.start_gap, w.end_gap)?;
         }
         f.write_str("]")
     }
@@ -272,15 +275,18 @@ fn median_tsc_hz(reference_hz: u64, mut window: impl FnMut() -> Option<Window>) 
 fn calibrate_with_hpet(hpet: &HpetCounter) -> Result<Calibration, CalError> {
     let target = hpet.clock().ticks(WINDOW_NS);
     median_tsc_hz(hpet.clock().hz(), || {
+        let pre = arch::rdtsc();
         let (h0, t0) = (hpet.now(), arch::rdtsc());
-        let mut polls = 0;
+        let (mut polls, mut prev) = (0, t0);
         loop {
             let (h, t) = (hpet.now(), arch::rdtsc());
             polls += 1;
             let elapsed = hpet.since(h0, h);
             if elapsed >= target {
-                break Some(Window { tsc: t - t0, reference: elapsed, polls });
+                let (start_gap, end_gap) = (t0 - pre, t - prev);
+                break Some(Window { tsc: t - t0, reference: elapsed, polls, start_gap, end_gap });
             }
+            prev = t;
             if t.wrapping_sub(t0) > WINDOW_BOUND_TSC {
                 break None;
             }
@@ -295,8 +301,15 @@ fn calibrate_with_pit() -> Result<Calibration, CalError> {
     let count = lumen_time::pit_count(WINDOW_NS).expect("a 10 ms window fits the PIT");
     median_tsc_hz(PIT_HZ, || {
         let mut t0 = 0;
-        let polls = pit::wait(count, || t0 = arch::rdtsc())?;
-        Some(Window { tsc: arch::rdtsc() - t0, reference: u64::from(count), polls })
+        let w = pit::wait(count, || t0 = arch::rdtsc())?;
+        let t = arch::rdtsc();
+        Some(Window {
+            tsc: t - t0,
+            reference: u64::from(count),
+            polls: w.polls,
+            start_gap: t0 - w.gate_tsc,
+            end_gap: t - w.last_running_tsc,
+        })
     })
 }
 
@@ -453,7 +466,7 @@ crate::ktest!(
         }
         let boot = boot_calibration().ok_or("no boot calibration")?;
         let pit = measure(Reference::Pit).ok_or("no PIT")?.map_err(|_| "calibrating against the PIT failed")?;
-        // Diagnostics only (windows: tsc/reference/polls): the HPET measured
+        // Diagnostics only (windows: tsc/reference/polls/start_gap/end_gap): the HPET measured
         // again too, to tell a PIT-only error from a boot calibration that was off.
         crate::ktest::diag(format_args!("tsc boot (hpet) {boot}"));
         crate::ktest::diag(format_args!("tsc now against the pit {pit}"));
