@@ -2,13 +2,16 @@
 and what each run records about its environment."""
 
 import os
+import re
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 from lumen_harness import qemu
 from lumen_harness.__main__ import gdb_binary, gdb_command
 from lumen_harness.qemu import (
+    ExpectTimeout,
     Machine,
     QemuOptions,
     ovmf_vars_template,
@@ -136,6 +139,69 @@ def test_empty_timeout_scale_means_unset(monkeypatch):
     assert timeout_scale() == 1.0
     monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", "2.5")  # a set value is still used
     assert timeout_scale() == 2.5
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "1e999", "abc", " "])
+def test_timeout_scale_must_be_finite_and_positive(monkeypatch, raw):
+    # 0 or less would time out at once; nan, inf (and 1e999, which parses to
+    # inf) would never time out; a typo would fail deep inside expect().
+    monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", raw)
+    with pytest.raises(ValueError, match=re.escape(f"LUMEN_TIMEOUT_SCALE={raw!r}: expected")):
+        timeout_scale()
+
+
+def test_a_bad_timeout_scale_fails_before_qemu_starts(tmp_path, monkeypatch):
+    monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", "abc")
+    with pytest.raises(ValueError, match="LUMEN_TIMEOUT_SCALE='abc'"):
+        Machine(Path("x.iso"), tmp_path / "run")
+    assert not (tmp_path / "run").exists()
+    monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", "2.5")  # a good one is read once, here
+    m = Machine(Path("x.iso"), tmp_path / "run")
+    monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", "abc")
+    assert m.timeout_scale == 2.5
+
+
+def sleeping_machine(tmp_path: Path, monkeypatch) -> Machine:
+    """A started Machine whose "QEMU" prints nothing and doesn't exit. `exec`, so
+    that close() kills the sleep itself, not just the shell around it."""
+    exe = fake_qemu(
+        tmp_path,
+        'case "$1" in --version) echo "QEMU emulator version 0.0 (fake)" ;; '
+        "*) exec sleep 30 ;; esac",
+    )
+    vars_template = tmp_path / "VARS.fd"
+    vars_template.write_bytes(b"vars")
+    monkeypatch.setenv("LUMEN_QEMU", str(exe))
+    monkeypatch.setenv("LUMEN_OVMF_VARS", str(vars_template))
+    return Machine(Path("x.iso"), tmp_path / "run").start()
+
+
+SCALED_WAITS = [
+    ("", 0.2, "0.2s"),
+    ("2.5", 0.5, "0.5s (0.2s scaled by LUMEN_TIMEOUT_SCALE=2.5)"),
+]
+
+
+@pytest.mark.parametrize(("scale", "wait", "said"), SCALED_WAITS)
+def test_expect_timeout_shows_the_scaled_wait(tmp_path, monkeypatch, scale, wait, said):
+    monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", scale)
+    with sleeping_machine(tmp_path, monkeypatch) as m:
+        start = time.monotonic()
+        with pytest.raises(ExpectTimeout) as e:
+            m.expect("never", 0.2)
+        assert time.monotonic() - start >= wait  # it waited that long, too
+    assert str(e.value).startswith(f"timeout after {said} waiting for 'never'\n")
+
+
+@pytest.mark.parametrize(("scale", "wait", "said"), SCALED_WAITS)
+def test_wait_exit_timeout_shows_the_scaled_wait(tmp_path, monkeypatch, scale, wait, said):
+    monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", scale)
+    with sleeping_machine(tmp_path, monkeypatch) as m:
+        start = time.monotonic()
+        with pytest.raises(ExpectTimeout) as e:
+            m.wait_exit(0.2)
+        assert time.monotonic() - start >= wait
+    assert str(e.value) == f"QEMU still running after {said}"
 
 
 def test_empty_gdb_means_unset(monkeypatch):
