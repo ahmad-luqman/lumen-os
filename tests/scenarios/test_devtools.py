@@ -56,15 +56,18 @@ def test_make_run_serial_console():
 def test_make_debug_stops_at_kmain():
     """`debug` boots paused under gdb, and a hardware breakpoint on kmain is hit."""
     # Checked here, not in a skipif: a LUMEN_GDB that can't be found raises, and
-    # fails this test rather than skipping it (or, at collection, breaking the
-    # whole module). Without the override, gdb is optional.
+    # fails this test rather than skipping it. (Raised at collection, it would
+    # error the whole module, and without xdist abort the whole run.) Without the
+    # override, gdb is optional.
     if find_gdb() is None:
         pytest.skip("gdb not installed")
-    # Uses the fixed gdb port 1234: do not run two of these at once.
+    # Uses the fixed gdb port 1234: do not run two of these at once. stderr too,
+    # so a failing run (e.g. gdb timing out) shows why.
     out = subprocess.run(
         [sys.executable, "-m", "lumen_harness", "debug", "--batch",
          "--iso", str(BUILD_DIR / "lumen.iso"), "--kernel", str(BUILD_DIR / "lumen-kernel")],
-        check=False, capture_output=True, text=True, env=ENV, cwd=REPO_ROOT, timeout=180,
+        check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=ENV,
+        cwd=REPO_ROOT, timeout=180,
     ).stdout  # fmt: skip
     assert "#0  kmain () at kernel/src/main.rs" in out, out[-3000:]
     assert "_start" in out, out[-3000:]

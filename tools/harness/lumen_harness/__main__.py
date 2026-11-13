@@ -34,15 +34,16 @@ def gdb_binary() -> str:
 
 
 def find_gdb() -> str | None:
-    """The gdb `make debug` would run, resolved as the shell would (`shutil.which`:
-    a name on PATH, or a path). None when LUMEN_GDB is unset or empty and there is
-    no `gdb`: gdb is optional. A set LUMEN_GDB that can't be found raises
-    FileNotFoundError naming it: someone asked for that gdb, so it's a mistake to
-    fix, not a missing tool."""
+    """The gdb `make debug` would run, resolved with `shutil.which` as subprocess
+    finds it: a name on PATH, or a path (a relative one from the current directory;
+    `make` runs from the repo root). None when LUMEN_GDB is unset or empty and there
+    is no `gdb`: gdb is optional. A set LUMEN_GDB that can't be found raises
+    ValueError naming it: someone asked for that gdb, so it's a setting to fix, not
+    a missing tool (and not an OSError, which a missing QEMU or OVMF raises)."""
     gdb = gdb_binary()
     found = shutil.which(gdb)
     if found is None and os.environ.get("LUMEN_GDB"):
-        raise FileNotFoundError(
+        raise ValueError(
             f"LUMEN_GDB={gdb!r} not found or not executable (give a name on PATH or a path)"
         )
     return found
