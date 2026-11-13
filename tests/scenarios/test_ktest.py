@@ -2,10 +2,8 @@
 
 import re
 
-from lumen_harness import BUILD_DIR, tap
+from lumen_harness import save_ktest_tap, tap
 from lumen_harness.qemu import EXIT_CRASH, EXIT_SUCCESS
-
-TAP_OUT = BUILD_DIR / "test-results" / "ktest.tap"
 
 
 def test_in_kernel_tests_pass(boot):
@@ -16,9 +14,9 @@ def test_in_kernel_tests_pass(boot):
     code = m.wait_exit(120)
     out = m.output
     report = tap.parse(out)
-    # Saved for `make status` (each ktest is listed individually in STATUS.md).
-    TAP_OUT.parent.mkdir(parents=True, exist_ok=True)
-    TAP_OUT.write_text(out[out.find("TAP version") :] if "TAP version" in out else "")
+    # Saved for `make status` (each ktest is listed individually in STATUS.md);
+    # a re-run's (LUMEN_ARTIFACTS_DIR) is kept apart: see save_ktest_tap.
+    save_ktest_tap(out[out.find("TAP version") :] if "TAP version" in out else "")
     if code == EXIT_CRASH:
         crash = out[out.find("==== LUMEN CRASH REPORT") :]
         last = report.cases[-1].name if report.cases else "(before the first test)"

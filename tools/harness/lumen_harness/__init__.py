@@ -1,10 +1,49 @@
 """Host-side harness for Lumen: boots QEMU, scripts serial, compares screenshots."""
 
+import os
 import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 BUILD_DIR = REPO_ROOT / "build"
+
+
+def rerun_dir() -> Path | None:
+    """LUMEN_ARTIFACTS_DIR (relative to the repo root, or absolute), if set and
+    non-empty: a re-run keeps its artifacts and its ktest.tap there, apart from
+    the first run's (CI re-runs failed scenarios under TCG). Otherwise None.
+
+    Raises ValueError if it names the first run's build/test-results or
+    build/test-artifacts, which it exists to keep (compared ignoring case,
+    as macOS file systems do)."""
+    name = os.environ.get("LUMEN_ARTIFACTS_DIR")
+    if not name:
+        return None
+    path = REPO_ROOT / name
+    for first_run in ("test-results", "test-artifacts"):
+        if str(path.resolve()).casefold() == str((BUILD_DIR / first_run).resolve()).casefold():
+            raise ValueError(
+                f"LUMEN_ARTIFACTS_DIR={name!r} is the first run's build/{first_run}: "
+                "a re-run keeps apart from it (CI uses build/test-artifacts-tcg)"
+            )
+    return path
+
+
+def artifacts_root() -> Path:
+    """Where scenarios keep their artifacts: build/test-artifacts, or a
+    re-run's own directory (`rerun_dir`)."""
+    return rerun_dir() or BUILD_DIR / "test-artifacts"
+
+
+def save_ktest_tap(text: str) -> Path:
+    """Save the in-kernel tests' TAP where `make status` reads it
+    (build/test-results/ktest.tap), or in a re-run's own directory
+    (`rerun_dir`), so the first run's file (which the feature gate read for
+    the CI job summary) survives. Returns the path."""
+    path = (rerun_dir() or BUILD_DIR / "test-results") / "ktest.tap"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
 
 
 def artifact_dir(root: Path, nodeid: str) -> Path:

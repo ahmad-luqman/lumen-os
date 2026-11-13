@@ -882,7 +882,10 @@ keeps `serial.log`, `qemu.log` (`-d int,cpu_reset,guest_errors`),
 screenshots when it fails, in `build/test-artifacts/<module>/<test>/`, and CI
 uploads them. QEMU records the interrupt
 trace only under TCG, so CI (which runs KVM) re-runs failed scenarios under
-TCG before uploading.
+TCG before uploading, into a separate root (`LUMEN_ARTIFACTS_DIR`,
+`build/test-artifacts-tcg` in CI). If the ktest scenario is re-run, its
+`ktest.tap` goes there too, so `build/test-results/ktest.tap` (the first
+run's, which the job summary was built from) survives.
 
 ## 16. Repository layout
 

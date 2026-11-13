@@ -3,7 +3,9 @@
 Inputs (written by `make test`):
   build/test-results/scenarios.xml   JUnit XML from tests/scenarios
   build/test-results/harness.xml     JUnit XML from tests/harness
-  build/test-results/ktest.tap       TAP from the in-kernel test run
+  build/test-results/ktest.tap       TAP from the in-kernel test run (not
+                                     written with LUMEN_ARTIFACTS_DIR set:
+                                     a re-run's copy, kept apart, isn't read)
   build/test-results/audit.json      result of `make audit`
   build/test-results/cargo.json      result of `cargo test` per crate
 
@@ -28,7 +30,7 @@ import tomllib
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from . import BUILD_DIR, REPO_ROOT, tap
+from . import BUILD_DIR, REPO_ROOT, rerun_dir, tap
 
 RESULTS = BUILD_DIR / "test-results"
 STATUS_MD = REPO_ROOT / "docs" / "STATUS.md"
@@ -131,6 +133,28 @@ def render(evaluated: list[tuple[dict, str]]) -> str:
     return "\n".join(lines)
 
 
+def missing_tap_hint(bad: list[dict]) -> str | None:
+    """Why ktests show as not run, if a failing feature lists one and there is
+    no ktest.tap: the ktest scenario didn't run, or saved its TAP elsewhere
+    because LUMEN_ARTIFACTS_DIR was set (a re-run's copy is never read)."""
+    tap_file = RESULTS / "ktest.tap"
+    if tap_file.exists() or not any(p.startswith("ktest:") for f in bad for p in f["tests"]):
+        return None
+    try:
+        rerun = rerun_dir()
+    except ValueError:
+        rerun = None  # an invalid value is reported where the TAP is saved
+    if rerun and (rerun / "ktest.tap").exists():
+        return (
+            f"status: no {tap_file}, but there is {rerun / 'ktest.tap'}: LUMEN_ARTIFACTS_DIR "
+            "keeps a re-run's ktest results apart (unset it for a first run)"
+        )
+    return (
+        f"status: no {tap_file}: the ktest scenario did not run, or ran with "
+        "LUMEN_ARTIFACTS_DIR set (its TAP is then in that directory)"
+    )
+
+
 def run_status(write: bool, check: bool) -> int:
     results = collect_results()
     evaluated = evaluate(results)
@@ -151,6 +175,8 @@ def run_status(write: bool, check: bool) -> int:
             for t, ok in matched.items():
                 if not ok:
                     print(f"    {t}: failed", file=sys.stderr)
+    if hint := missing_tap_hint([f for f, _ in bad]):
+        print(hint, file=sys.stderr)
     if check:
         if bad:
             print(f"status: {len(bad)} feature(s) not passing", file=sys.stderr)

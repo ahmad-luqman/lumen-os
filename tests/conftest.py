@@ -2,8 +2,9 @@
 
 `boot` starts a headless QEMU machine from one of the ISOs built by
 `make iso` and closes it after the test. Each test gets its own artifacts
-directory, build/test-artifacts/<module>/<test>/: keyed by module too, so
-same-named tests in two files can run side by side under pytest-xdist.
+directory, build/test-artifacts/<module>/<test>/ (a re-run's, with
+LUMEN_ARTIFACTS_DIR set, goes under that root instead): keyed by module too,
+so same-named tests in two files can run side by side under pytest-xdist.
 Artifacts of passing tests are deleted; failing tests keep serial.log, qemu.log
 (CPU resets, and the `-d int` interrupt trace under TCG), cmdline.txt,
 environment.txt and any screenshots, and CI uploads them.
@@ -11,14 +12,13 @@ environment.txt and any screenshots, and CI uploads them.
 
 from __future__ import annotations
 
-import os
 import re
 import shutil
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import pytest
-from lumen_harness import BUILD_DIR, REPO_ROOT, artifact_dir
+from lumen_harness import BUILD_DIR, artifact_dir, artifacts_root
 from lumen_harness.crash import BEGIN, END, PROTECTION_BROKEN
 from lumen_harness.qemu import EXIT_CRASH, Machine, default_accel, environment
 
@@ -27,9 +27,6 @@ ISOS = {
     "qemutest": BUILD_DIR / "lumen-qemutest.iso",
     "ktest": BUILD_DIR / "lumen-ktest.iso",
 }
-# LUMEN_ARTIFACTS_DIR (relative to the repo root) lets a re-run keep its
-# artifacts apart from the first run's: CI re-runs KVM failures under TCG.
-ARTIFACTS = REPO_ROOT / (os.environ.get("LUMEN_ARTIFACTS_DIR") or BUILD_DIR / "test-artifacts")
 GOLDEN_DIR = Path(__file__).parent / "golden"
 
 
@@ -54,7 +51,7 @@ _FAILED = pytest.StashKey[bool]()
 
 @pytest.fixture
 def artifacts(request: pytest.FixtureRequest) -> Iterator[Path]:
-    path = artifact_dir(ARTIFACTS, request.node.nodeid)
+    path = artifact_dir(artifacts_root(), request.node.nodeid)
     shutil.rmtree(path, ignore_errors=True)
     path.mkdir(parents=True)
     yield path
