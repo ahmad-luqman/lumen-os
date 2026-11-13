@@ -286,6 +286,16 @@ def test_a_scale_that_overflows_a_wait_is_rejected(tmp_path, monkeypatch, call):
     assert m.proc.waits == []
 
 
+def test_a_huge_finite_scale_keeps_waiting(tmp_path, monkeypatch):
+    # 1e9 is accepted: a 30s wait becomes 3e10s, past what one Condition.wait()
+    # takes (threading.TIMEOUT_MAX, about 9.2e9s, raises OverflowError). expect()
+    # waits in slices, so it just keeps waiting, here until the fake clock's hour.
+    m, clock = hung_machine(tmp_path, monkeypatch, "1e9")
+    with pytest.raises(AssertionError, match="still waiting after 3600s"):
+        m.expect("never", 30)
+    assert clock.now > FakeClock.LIMIT
+
+
 @pytest.mark.parametrize("call", ["expect", "wait_exit"])
 @pytest.mark.parametrize("timeout", [math.inf, math.nan], ids=["inf", "nan"])
 def test_a_timeout_that_isnt_finite_is_the_callers_fault(tmp_path, monkeypatch, call, timeout):

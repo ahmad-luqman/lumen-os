@@ -93,6 +93,7 @@ tests = [
     "harness:test_qemu::test_expect_timeout_shows_the_scaled_wait[*]",
     "harness:test_qemu::test_wait_exit_timeout_shows_the_scaled_wait[*]",
     "harness:test_qemu::test_a_scale_that_overflows_a_wait_is_rejected[*]",
+    "harness:test_qemu::test_a_huge_finite_scale_keeps_waiting",
     "harness:test_qemu::test_a_timeout_that_isnt_finite_is_the_callers_fault[*]",
     "harness:test_qemu::test_expect_says_when_qemu_exited[*]",
     "harness:test_qemu::test_empty_gdb_means_unset",
