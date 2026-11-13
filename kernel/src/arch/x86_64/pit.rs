@@ -18,26 +18,52 @@ const OUT: u8 = 1 << 5;
 /// before the PIT counts as missing: the longest count is 55 ms.
 const BOUND_TSC: u64 = 1 << 32;
 
-/// How a [`wait`] went: how many times the output was polled, the TSC just
-/// before the gate went high (the count starts in between that and
-/// `started`), and the TSC after the last poll that still saw the count
-/// running (it ended in between that and the caller's next TSC read).
+/// A reading of channel 2's counter, latched between two TSC reads.
 #[derive(Clone, Copy, Debug)]
-pub struct Waited {
-    pub polls: u64,
-    pub gate_tsc: u64,
-    pub last_running_tsc: u64,
+pub struct Reading {
+    pub count: u16,
+    pub tsc_before: u64,
+    pub tsc_after: u64,
 }
 
-/// Run channel 2 for `count` ticks of its 1.193182 MHz clock, calling
-/// `started` just as it starts and returning once it has finished, with how
-/// it went ([`Waited`]). Busy-waits (up to about 55 ms with a working PIT); call with
-/// interrupts off so the window isn't stretched. `None` if there is no working
-/// PIT: its output didn't go low when programmed (a missing PIT's ports read
-/// all ones), or didn't go high again within [`BOUND_TSC`] TSC ticks.
-pub fn wait(count: u16, started: impl FnOnce()) -> Option<Waited> {
-    // SAFETY: programs channel 2 only (mode 0, one-shot) with the speaker
-    // disconnected; channel 0 and the speaker are left alone otherwise.
+/// How a [`wait`] went: the counter read just after it started and again once
+/// it had run out (in mode 0 it counts on past 0, so the second reading says
+/// how far past), the TSC just before the last poll that still saw it
+/// running, and how many times its output was polled.
+#[derive(Clone, Copy, Debug)]
+pub struct Waited {
+    pub start: Reading,
+    pub end: Reading,
+    pub last_running_tsc: u64,
+    pub polls: u64,
+}
+
+/// Latch channel 2's counter and read it, between two TSC reads.
+///
+/// # Safety
+/// Channel 2 must be programmed for lobyte/hibyte access.
+unsafe fn read() -> Reading {
+    let tsc_before = rdtsc();
+    // SAFETY: the latch command and two reads of channel 2's count, as the
+    // caller programmed it; nothing else is touched.
+    let count = unsafe {
+        outb(COMMAND, 0b1000_0000); // latch channel 2
+        let lo = inb(CHANNEL2);
+        u16::from_le_bytes([lo, inb(CHANNEL2)])
+    };
+    Reading { count, tsc_before, tsc_after: rdtsc() }
+}
+
+/// Run channel 2 for `count` ticks of its 1.193182 MHz clock and return once
+/// it has run out, with its counter read at both ends ([`Waited`]): a late
+/// look at the end doesn't stretch the window, since the counter says how far
+/// past the end it was. Busy-waits (up to about 55 ms with a working PIT);
+/// call with interrupts off. `None` if there is no working PIT: its output
+/// didn't go low when programmed (a missing PIT's ports read all ones), or
+/// didn't go high again within [`BOUND_TSC`] TSC ticks.
+pub fn wait(count: u16) -> Option<Waited> {
+    // SAFETY: programs channel 2 only (mode 0, one-shot, lobyte/hibyte) with
+    // the speaker disconnected; channel 0 and the speaker are left alone.
     unsafe {
         let ctl = inb(SPEAKER) & !(GATE | SPEAKER_ON);
         outb(SPEAKER, ctl); // gate low: hold the count
@@ -46,18 +72,17 @@ pub fn wait(count: u16, started: impl FnOnce()) -> Option<Waited> {
         outb(CHANNEL2, (count >> 8) as u8);
         // Mode 0 drives the output low as soon as it is programmed.
         let waited = if inb(SPEAKER) & OUT == 0 {
-            let gate_tsc = rdtsc();
             outb(SPEAKER, ctl | GATE); // gate high: count down
-            started();
-            let t0 = rdtsc();
-            let (mut polls, mut last_running_tsc) = (0, t0);
+            let start = read();
+            let (mut polls, mut last_running_tsc) = (0, start.tsc_after);
             loop {
                 polls += 1;
+                let t = rdtsc();
                 if inb(SPEAKER) & OUT != 0 {
-                    break Some(Waited { polls, gate_tsc, last_running_tsc });
+                    break Some(Waited { start, end: read(), last_running_tsc, polls });
                 }
-                last_running_tsc = rdtsc();
-                if last_running_tsc.wrapping_sub(t0) > BOUND_TSC {
+                last_running_tsc = t;
+                if t.wrapping_sub(start.tsc_after) > BOUND_TSC {
                     break None;
                 }
             }

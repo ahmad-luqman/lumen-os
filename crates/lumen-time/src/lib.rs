@@ -71,9 +71,80 @@ pub fn plausible_tsc_hz(hz: u64) -> bool {
     (10_000_000..=100_000_000_000).contains(&hz)
 }
 
-/// The median of `samples` (sorted in place). A calibration window can be
-/// stretched by an SMI or, in a VM, by the host descheduling the vCPU; the
-/// median of a few windows ignores such outliers.
+/// One window of the TSC measured against a reference clock: TSC ticks, the
+/// reference's ticks over the same stretch, how often the reference was
+/// polled, and how uncertain its start and end are, in TSC ticks. Each end is
+/// a reading of the reference taken between two TSC reads; the gap between
+/// them is how far off that end can be (a vCPU paused mid-reading widens it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Window {
+    pub tsc: u64,
+    pub reference: u64,
+    pub polls: u64,
+    pub start_gap: u64,
+    pub end_gap: u64,
+}
+
+/// A window is steady if its start and end together are uncertain by at most
+/// 1/`STEADY` of it: 0.5%.
+pub const STEADY: u64 = 200;
+
+impl Window {
+    /// Were both its ends read promptly enough to trust it (see [`STEADY`])?
+    pub fn is_steady(&self) -> bool {
+        self.start_gap.saturating_add(self.end_gap).saturating_mul(STEADY) <= self.tsc
+    }
+}
+
+/// Why [`steady_windows`] gave up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SteadyError<E> {
+    /// Taking a window failed.
+    Take(E),
+    /// Only `steady` of `attempts` windows were steady.
+    Unsteady { steady: usize, attempts: usize },
+}
+
+/// Fill `out` with steady windows from `take`, taking an unsteady one again,
+/// at most `attempts` times in all. Returns how many were taken again.
+pub fn steady_windows<E>(
+    out: &mut [Window],
+    attempts: usize,
+    mut take: impl FnMut() -> Result<Window, E>,
+) -> Result<usize, SteadyError<E>> {
+    let (mut steady, mut tried) = (0, 0);
+    while steady < out.len() {
+        if tried == attempts {
+            return Err(SteadyError::Unsteady { steady, attempts });
+        }
+        tried += 1;
+        let w = take().map_err(SteadyError::Take)?;
+        if w.is_steady() {
+            out[steady] = w;
+            steady += 1;
+        }
+    }
+    Ok(tried - out.len())
+}
+
+/// PIT ticks between two readings of a channel counting down, `start` then
+/// `end`. In mode 0 it counts on past 0 (wrapping to 0xffff), so this holds
+/// as long as fewer than 65536 ticks passed ([`pit_end_unambiguous`]).
+pub fn pit_elapsed(start: u16, end: u16) -> u64 {
+    u64::from(start.wrapping_sub(end))
+}
+
+/// Can a PIT window's end reading be trusted not to have wrapped past
+/// `start` + 65535 ticks? `running_tsc` is the TSC from the start reading to
+/// just before the last poll that still saw the count running, so fewer than
+/// `start` ticks passed in it; `late_tsc` is from then to the end reading. If
+/// `late_tsc` is at most 4 × `running_tsc`, fewer than 5 × `start` ticks passed
+/// in all, which is under 65536 for a `start` up to 13107 (10 ms is 11932).
+pub fn pit_end_unambiguous(start: u16, running_tsc: u64, late_tsc: u64) -> bool {
+    running_tsc > 0 && u64::from(start) * 5 <= 65536 && late_tsc <= running_tsc.saturating_mul(4)
+}
+
+/// The median of `samples` (sorted in place).
 pub fn median(samples: &mut [u64]) -> Option<u64> {
     samples.sort_unstable();
     match samples.len() {
@@ -173,6 +244,71 @@ mod tests {
     use std::string::ToString;
 
     use super::*;
+
+    fn window(tsc: u64, start_gap: u64, end_gap: u64) -> Window {
+        Window { tsc, reference: 1, polls: 1, start_gap, end_gap }
+    }
+
+    #[test]
+    fn a_window_is_steady_within_half_a_percent() {
+        assert!(window(10_000_000, 0, 0).is_steady());
+        assert!(window(10_000_000, 20_000, 30_000).is_steady()); // exactly 0.5%
+        assert!(!window(10_000_000, 20_000, 30_001).is_steady());
+        assert!(!window(10_000_000, 50_001, 0).is_steady(), "a late start counts too");
+        assert!(!window(10_000_000, 0, u64::MAX).is_steady(), "saturates, doesn't wrap");
+    }
+
+    #[test]
+    fn steady_windows_takes_unsteady_ones_again() {
+        // Two unsteady windows among steady ones: they are taken again, and
+        // only steady ones are kept, in order.
+        let mut taken = [window(100, 0, 0), window(101, 0, 50), window(102, 0, 0), window(103, 9, 0)]
+            .into_iter()
+            .chain((104..).map(|t| window(t, 0, 0)));
+        let mut out = [Window::default(); 3];
+        assert_eq!(steady_windows::<()>(&mut out, 10, || Ok(taken.next().unwrap())), Ok(2));
+        assert_eq!(out.map(|w| w.tsc), [100, 102, 104]);
+    }
+
+    #[test]
+    fn steady_windows_gives_up_after_its_attempts() {
+        let mut out = [Window::default(); 3];
+        let mut n = 0;
+        let flaky = || {
+            n += 1;
+            Ok::<_, ()>(window(100, 0, if n % 2 == 0 { 0 } else { 99 }))
+        };
+        // Every other window is steady: 5 attempts give only 2.
+        assert_eq!(steady_windows(&mut out, 5, flaky), Err(SteadyError::Unsteady { steady: 2, attempts: 5 }));
+        // A failure to take one is passed on at once.
+        let mut calls = 0;
+        let failing = || {
+            calls += 1;
+            Err::<Window, _>("no count")
+        };
+        assert_eq!(steady_windows(&mut out, 5, failing), Err(SteadyError::Take("no count")));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn pit_elapsed_counts_on_past_zero() {
+        assert_eq!(pit_elapsed(11_932, 0), 11_932);
+        assert_eq!(pit_elapsed(11_932, 100), 11_832, "read before it ran out");
+        assert_eq!(pit_elapsed(11_932, 0xffff), 11_933, "one tick past 0");
+        assert_eq!(pit_elapsed(11_932, 0xffff - 999), 12_932, "1000 ticks past 0");
+        assert_eq!(pit_elapsed(5, 5), 0);
+    }
+
+    #[test]
+    fn a_pit_end_read_late_may_have_wrapped() {
+        // Late by up to 4 × the running stretch: fewer than 5 × 11932 ticks.
+        assert!(pit_end_unambiguous(11_932, 1_000_000, 4_000_000));
+        assert!(!pit_end_unambiguous(11_932, 1_000_000, 4_000_001));
+        assert!(!pit_end_unambiguous(11_932, 0, 0), "it never saw the count running");
+        assert!(pit_end_unambiguous(13_107, 1, 4));
+        assert!(!pit_end_unambiguous(13_108, 1, 4), "5 × start could reach 65536");
+        assert!(pit_end_unambiguous(11_932, u64::MAX, u64::MAX), "saturates");
+    }
 
     #[test]
     fn frequency_scales_by_the_reference() {

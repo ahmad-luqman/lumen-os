@@ -5,9 +5,12 @@
 //! the boot timeline and the log's timestamps ([`since_boot_ns`]) count from.
 //!
 //! Calibration polls with interrupts off and takes the median of several
-//! 10 ms windows, so one window stretched by an SMI or a descheduled vCPU
-//! doesn't skew it. Every poll is bounded, so a clock that doesn't count is
-//! an error, not a hang. [`now_ns`] and [`ticks`] are lock-free (interrupt
+//! 10 ms windows. Each window starts and ends with a reading of the reference
+//! clock's counter between two TSC reads (for the PIT too: its counter runs on
+//! past the end), so a vCPU paused while waiting for the end doesn't stretch
+//! it; a window whose start or end reading itself was paused (a wide gap
+//! between its TSC reads) is taken again. Every poll is bounded, so a clock
+//! that doesn't count is an error, not a hang. [`now_ns`] and [`ticks`] are lock-free (interrupt
 //! handlers and the crash path may call them).
 
 use core::fmt;
@@ -15,7 +18,7 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use log::{info, warn};
 use lumen_mm::PhysAddr;
-use lumen_time::{Clock, Hz, PIT_HZ};
+use lumen_time::{Clock, Hz, PIT_HZ, SteadyError, Window};
 
 use crate::arch::{self, apic, idt, pit};
 use crate::mm::paging;
@@ -25,6 +28,8 @@ use crate::sync::SpinLock;
 pub const TICK_HZ: u64 = 1000;
 /// Calibration windows, and how long each is.
 pub const WINDOWS: usize = 5;
+/// How many windows a TSC calibration may take to get [`WINDOWS`] steady ones.
+const ATTEMPTS: usize = 4 * WINDOWS;
 const WINDOW_NS: u64 = 10_000_000;
 /// The longest a 10 ms window may take, in TSC ticks (TSC unknown yet: over
 /// 1 s at up to 4 GHz), before its reference counts as stalled.
@@ -48,36 +53,25 @@ static HPET: SpinLock<Option<HpetCounter>> = SpinLock::new(None);
 /// The boot calibration's windows (None until [`init`]).
 static BOOT_CALIBRATION: SpinLock<Option<Calibration>> = SpinLock::new(None);
 
-/// One TSC calibration window as measured: TSC ticks, the reference clock's
-/// ticks over the same stretch, how often the reference was polled, and how
-/// uncertain its start and end were, in TSC ticks (the reference's reading
-/// happened somewhere in that stretch before the TSC was read).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Window {
-    pub tsc: u64,
-    pub reference: u64,
-    pub polls: u64,
-    pub start_gap: u64,
-    pub end_gap: u64,
-}
-
-/// A TSC calibration: the median of its windows' frequencies, and the windows
-/// in the order they were taken.
+/// A TSC calibration: the median of its windows' frequencies, the (steady)
+/// windows in the order they were taken, and how many unsteady ones were
+/// taken again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Calibration {
     pub hz: u64,
     pub windows: [Window; WINDOWS],
+    pub retaken: usize,
 }
 
 impl fmt::Display for Calibration {
-    /// `<hz> Hz [tsc/reference/polls/start_gap/end_gap ...]`.
+    /// `<hz> Hz [tsc/reference/polls/start_gap/end_gap ...] retook <n>`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} Hz [", self.hz)?;
         for (i, w) in self.windows.iter().enumerate() {
             let sep = if i == 0 { "" } else { " " };
             write!(f, "{sep}{}/{}/{}/{}/{}", w.tsc, w.reference, w.polls, w.start_gap, w.end_gap)?;
         }
-        f.write_str("]")
+        write!(f, "] retook {}", self.retaken)
     }
 }
 
@@ -116,6 +110,8 @@ pub enum CalError {
     NoCount,
     /// It gave this implausible frequency.
     Implausible(u64),
+    /// Only `steady` of `attempts` windows were read promptly at both ends.
+    Unsteady { steady: usize, attempts: usize },
 }
 
 impl fmt::Display for CalError {
@@ -123,6 +119,9 @@ impl fmt::Display for CalError {
         match self {
             CalError::NoCount => f.write_str("it didn't count through a 10 ms window"),
             CalError::Implausible(hz) => write!(f, "it gave an implausible TSC frequency, {}", Hz(*hz)),
+            CalError::Unsteady { steady, attempts } => {
+                write!(f, "only {steady} of {attempts} windows were read promptly at both ends")
+            }
         }
     }
 }
@@ -252,23 +251,24 @@ fn median_of_windows(mut window: impl FnMut() -> Result<u64, CalError>) -> Resul
     Ok(lumen_time::median(&mut samples).expect("WINDOWS samples"))
 }
 
-/// [`median_of_windows`] for TSC frequencies against a reference counting at
-/// `reference_hz`: `window` measures one, or gives `None` if its reference
-/// didn't count; an implausible one fails. Keeps the windows.
-fn median_tsc_hz(reference_hz: u64, mut window: impl FnMut() -> Option<Window>) -> Result<Calibration, CalError> {
+/// The TSC's frequency against a reference counting at `reference_hz`: the
+/// median of [`WINDOWS`] steady windows from `take` (an unsteady one is taken
+/// again, up to [`ATTEMPTS`] in all); an implausible one fails.
+fn median_tsc_hz(reference_hz: u64, take: impl FnMut() -> Result<Window, CalError>) -> Result<Calibration, CalError> {
     let mut windows = [Window::default(); WINDOWS];
-    let mut taken = 0;
-    let hz = median_of_windows(|| {
-        let w = window().ok_or(CalError::NoCount)?;
-        windows[taken] = w;
-        taken += 1;
-        match lumen_time::frequency(w.tsc, w.reference, reference_hz) {
-            Some(hz) if lumen_time::plausible_tsc_hz(hz) => Ok(hz),
-            Some(hz) => Err(CalError::Implausible(hz)),
-            None => Err(CalError::NoCount),
-        }
+    let retaken = lumen_time::steady_windows(&mut windows, ATTEMPTS, take).map_err(|e| match e {
+        SteadyError::Take(e) => e,
+        SteadyError::Unsteady { steady, attempts } => CalError::Unsteady { steady, attempts },
     })?;
-    Ok(Calibration { hz, windows })
+    let mut hz = [0u64; WINDOWS];
+    for (h, w) in hz.iter_mut().zip(&windows) {
+        *h = match lumen_time::frequency(w.tsc, w.reference, reference_hz) {
+            Some(hz) if lumen_time::plausible_tsc_hz(hz) => hz,
+            Some(hz) => return Err(CalError::Implausible(hz)),
+            None => return Err(CalError::NoCount),
+        };
+    }
+    Ok(Calibration { hz: lumen_time::median(&mut hz).expect("WINDOWS samples"), windows, retaken })
 }
 
 /// The TSC's frequency against the HPET. Call with interrupts off.
@@ -277,18 +277,18 @@ fn calibrate_with_hpet(hpet: &HpetCounter) -> Result<Calibration, CalError> {
     median_tsc_hz(hpet.clock().hz(), || {
         let pre = arch::rdtsc();
         let (h0, t0) = (hpet.now(), arch::rdtsc());
-        let (mut polls, mut prev) = (0, t0);
+        let mut polls = 0;
         loop {
+            let before = arch::rdtsc();
             let (h, t) = (hpet.now(), arch::rdtsc());
             polls += 1;
             let elapsed = hpet.since(h0, h);
             if elapsed >= target {
-                let (start_gap, end_gap) = (t0 - pre, t - prev);
-                break Some(Window { tsc: t - t0, reference: elapsed, polls, start_gap, end_gap });
+                let (start_gap, end_gap) = (t0 - pre, t - before);
+                break Ok(Window { tsc: t - t0, reference: elapsed, polls, start_gap, end_gap });
             }
-            prev = t;
             if t.wrapping_sub(t0) > WINDOW_BOUND_TSC {
-                break None;
+                break Err(CalError::NoCount);
             }
             core::hint::spin_loop();
         }
@@ -300,15 +300,24 @@ fn calibrate_with_hpet(hpet: &HpetCounter) -> Result<Calibration, CalError> {
 fn calibrate_with_pit() -> Result<Calibration, CalError> {
     let count = lumen_time::pit_count(WINDOW_NS).expect("a 10 ms window fits the PIT");
     median_tsc_hz(PIT_HZ, || {
-        let mut t0 = 0;
-        let w = pit::wait(count, || t0 = arch::rdtsc())?;
-        let t = arch::rdtsc();
-        Some(Window {
-            tsc: t - t0,
-            reference: u64::from(count),
+        let w = pit::wait(count).ok_or(CalError::NoCount)?;
+        let (start, end) = (w.start, w.end);
+        let tsc = end.tsc_after - start.tsc_after;
+        // An end reading that may have wrapped past 0 again can't be placed:
+        // as uncertain as the whole window, so it is taken again.
+        let running = w.last_running_tsc - start.tsc_after;
+        let late = end.tsc_after - w.last_running_tsc;
+        let end_gap = if lumen_time::pit_end_unambiguous(start.count, running, late) {
+            end.tsc_after - end.tsc_before
+        } else {
+            tsc
+        };
+        Ok(Window {
+            tsc,
+            reference: lumen_time::pit_elapsed(start.count, end.count),
             polls: w.polls,
-            start_gap: t0 - w.gate_tsc,
-            end_gap: t - w.last_running_tsc,
+            start_gap: start.tsc_after - start.tsc_before,
+            end_gap,
         })
     })
 }
