@@ -97,3 +97,12 @@ tests = [
     "harness:test_status::test_ci_job_summary_gets_the_table[*]",
     "harness:test_ci_config::test_feature_gate_runs_after_failed_scenarios",
 ]
+
+[[feature]]
+name = "CI's TCG re-run step: only after a failed scenarios step, with --last-failed --lfnf=none (the pinned pytest then re-runs the recorded scenario failures, or nothing), into its own root, annotating every outcome and never failing itself"
+milestone = "M1"
+tests = [
+    "harness:test_ci_config::test_tcg_rerun_only_reruns_failed_scenarios",
+    "harness:test_ci_config::test_tcg_rerun_step_annotates_every_outcome",
+    "harness:test_ci_config::test_last_failed_behaves_as_the_rerun_step_relies_on",
+]
