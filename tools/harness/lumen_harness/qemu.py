@@ -213,8 +213,8 @@ class Machine:
         self._pos = 0  # expect() cursor into the normalized output
         self._reader: threading.Thread | None = None
         self._qmp: QmpClient | None = None
-        # The QMP socket's directory (LUMEN_SOCK_DIR; unset or empty: /tmp).
-        # macOS limits unix socket paths to ~104 bytes, so keep it short.
+        # The QMP socket's directory (LUMEN_SOCK_DIR; unset or empty: /tmp). A
+        # short one: macOS limits unix socket paths to ~104 bytes.
         self._sock_dir = Path(os.environ.get("LUMEN_SOCK_DIR") or "/tmp")
         # pid: parallel pytest-xdist workers; counter: machines in one process.
         self.qmp_path = self._sock_dir / f"lumen-qmp-{os.getpid()}-{next(_machine_ids)}.sock"

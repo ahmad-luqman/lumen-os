@@ -1,4 +1,5 @@
-"""QEMU command-line construction, and what each run records about its environment."""
+"""QEMU and gdb command-line construction, the harness's environment overrides,
+and what each run records about its environment."""
 
 import os
 import subprocess
@@ -116,6 +117,12 @@ def test_empty_overrides_mean_unset(monkeypatch):
     monkeypatch.setenv("LUMEN_OVMF_VARS", "")
     assert qemu_args(opts())[0] == "qemu-system-x86_64"
     assert ovmf_vars_template() == qemu.BUILD_DIR / "deps/ovmf/OVMF_VARS.fd"
+    monkeypatch.setenv(
+        "LUMEN_QEMU", "/opt/qemu/bin/qemu-system-x86_64"
+    )  # a set value is still used
+    monkeypatch.setenv("LUMEN_OVMF_VARS", "/elsewhere/VARS.fd")
+    assert qemu_args(opts())[0] == "/opt/qemu/bin/qemu-system-x86_64"
+    assert ovmf_vars_template() == Path("/elsewhere/VARS.fd")
 
 
 def test_empty_sock_dir_means_unset(tmp_path, monkeypatch):
@@ -133,10 +140,11 @@ def test_empty_timeout_scale_means_unset(monkeypatch):
 
 
 def test_empty_gdb_means_unset(monkeypatch):
-    # `make debug` and its scenario's skip check both go through gdb_binary.
     monkeypatch.setenv("LUMEN_GDB", "")
-    assert gdb_binary() == "gdb" == gdb_command(Path("kernel"), batch=False)[0]
+    assert gdb_binary() == "gdb"
     monkeypatch.setenv("LUMEN_GDB", "x86_64-elf-gdb")  # a set value is still used
+    assert gdb_binary() == "x86_64-elf-gdb"
+    # `make debug` goes through it (and test_devtools' skip check calls it).
     assert gdb_command(Path("kernel"), batch=False)[0] == "x86_64-elf-gdb"
 
 
