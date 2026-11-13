@@ -20,6 +20,8 @@ use log::{info, warn};
 use lumen_mm::PhysAddr;
 use lumen_time::{Clock, Hz, PIT_HZ, SteadyError, Window};
 
+#[cfg(feature = "ktest")]
+use crate::arch::pit::Pause;
 use crate::arch::{self, apic, idt, pit};
 use crate::mm::paging;
 use crate::sync::SpinLock;
@@ -274,37 +276,42 @@ fn median_tsc_hz(reference_hz: u64, take: impl FnMut() -> Result<Window, CalErro
 /// The TSC's frequency against the HPET. Call with interrupts off.
 fn calibrate_with_hpet(hpet: &HpetCounter) -> Result<Calibration, CalError> {
     let target = hpet.clock().ticks(WINDOW_NS);
-    median_tsc_hz(hpet.clock().hz(), || {
-        let pre = arch::rdtsc();
-        let (h0, t0) = (hpet.now(), arch::rdtsc());
-        let mut polls = 0;
-        loop {
-            let before = arch::rdtsc();
-            let (h, t) = (hpet.now(), arch::rdtsc());
-            polls += 1;
-            let elapsed = hpet.since(h0, h);
-            if elapsed >= target {
-                let (start_gap, end_gap) = (t0 - pre, t - before);
-                break Ok(Window { tsc: t - t0, reference: elapsed, polls, start_gap, end_gap });
-            }
-            if t.wrapping_sub(t0) > WINDOW_BOUND_TSC {
-                break Err(CalError::NoCount);
-            }
-            core::hint::spin_loop();
+    median_tsc_hz(hpet.clock().hz(), || hpet_window(hpet, target, || {}))
+}
+
+/// One window of at least `target` HPET ticks. `pause` runs between the final
+/// counter read and the TSC read that closes it (a no-op but in tests; a pause
+/// there widens the end's gap).
+fn hpet_window(hpet: &HpetCounter, target: u64, pause: impl FnOnce()) -> Result<Window, CalError> {
+    let pre = arch::rdtsc();
+    let (h0, t0) = (hpet.now(), arch::rdtsc());
+    let mut polls = 0;
+    loop {
+        let before = arch::rdtsc();
+        let h = hpet.now();
+        polls += 1;
+        let elapsed = hpet.since(h0, h);
+        if elapsed >= target {
+            pause();
+            let t = arch::rdtsc();
+            return Ok(Window { tsc: t - t0, reference: elapsed, polls, start_gap: t0 - pre, end_gap: t - before });
         }
-    })
+        if arch::rdtsc().wrapping_sub(t0) > WINDOW_BOUND_TSC {
+            return Err(CalError::NoCount);
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// The TSC's frequency against the PIT's channel 2. Call with interrupts
 /// off.
 fn calibrate_with_pit() -> Result<Calibration, CalError> {
     let count = lumen_time::pit_count(WINDOW_NS).expect("a 10 ms window fits the PIT");
-    median_tsc_hz(PIT_HZ, || pit_window(count, || {}))
+    median_tsc_hz(PIT_HZ, || pit_window(count, |_| {}))
 }
 
-/// One window of `count` PIT ticks (`pause` runs once it has run out, before
-/// its end is read: see [`pit::wait`]).
-fn pit_window(count: u16, pause: impl FnOnce()) -> Result<Window, CalError> {
+/// One window of `count` PIT ticks (`pause`: see [`pit::wait`]).
+fn pit_window(count: u16, pause: impl FnMut(pit::Pause)) -> Result<Window, CalError> {
     let w = pit::wait(count, pause).ok_or(CalError::NoCount)?;
     let (start, end) = (w.start, w.end);
     let tsc = end.tsc_after - start.tsc_after;
@@ -500,7 +507,12 @@ crate::ktest!(
         let count = lumen_time::pit_count(WINDOW_NS).ok_or("no PIT count")?;
         let w = {
             let _off = arch::irq::push_off();
-            pit_window(count, || sleep(2_000_000)).map_err(|_| "no PIT window")?
+            pit_window(count, |at| {
+                if at == Pause::Ended {
+                    sleep(2_000_000)
+                }
+            })
+            .map_err(|_| "no PIT window")?
         };
         let measured = lumen_time::frequency(w.tsc, w.reference, PIT_HZ).ok_or("no frequency")?;
         crate::ktest::diag(format_args!("{measured} Hz against {hz} Hz; window {w:?}"));
@@ -520,10 +532,68 @@ crate::ktest!(
         let count = lumen_time::pit_count(WINDOW_NS).ok_or("no PIT count")?;
         let w = {
             let _off = arch::irq::push_off();
-            pit_window(count, || sleep(60_000_000)).map_err(|_| "no PIT window")?
+            pit_window(count, |at| {
+                if at == Pause::Ended {
+                    sleep(60_000_000)
+                }
+            })
+            .map_err(|_| "no PIT window")?
         };
         kassert!(!w.is_steady());
         kassert!(w.end_gap == w.tsc);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_paused_pit_reading_is_taken_again() {
+        // The first two windows' end readings are paused 1 ms between latching
+        // the counter and reading the TSC, as a host descheduling the vCPU
+        // there would: their ends are 10% uncertain, so both are taken again,
+        // and the calibration still gives the TSC's frequency.
+        use crate::{kassert, kassert_eq};
+        let hz = tsc().ok_or("TSC not calibrated")?.hz();
+        let count = lumen_time::pit_count(WINDOW_NS).ok_or("no PIT count")?;
+        let mut taken = 0;
+        let cal = {
+            let _off = arch::irq::push_off();
+            median_tsc_hz(PIT_HZ, || {
+                taken += 1;
+                let paused = taken <= 2;
+                pit_window(count, |at| {
+                    if paused && at == Pause::EndReading {
+                        sleep(1_000_000);
+                    }
+                })
+            })
+            .map_err(|_| "calibrating against the PIT failed")?
+        };
+        crate::ktest::diag(format_args!("{cal}"));
+        kassert_eq!(cal.retaken, 2);
+        kassert!(cal.windows.iter().all(Window::is_steady));
+        kassert!(hz.abs_diff(cal.hz) * 200 <= hz);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_paused_hpet_reading_is_not_steady() {
+        // Paused 1 ms between the last HPET read and the TSC read closing the
+        // window: its end is 10% uncertain, so it would be taken again.
+        use crate::kassert;
+        let hpet = hpet().ok_or("no HPET")?;
+        let target = hpet.clock().ticks(WINDOW_NS);
+        let w = {
+            let _off = arch::irq::push_off();
+            hpet_window(&hpet, target, || sleep(1_000_000)).map_err(|_| "no HPET window")?
+        };
+        kassert!(!w.is_steady());
+        let steady = {
+            let _off = arch::irq::push_off();
+            hpet_window(&hpet, target, || {}).map_err(|_| "no HPET window")?
+        };
+        crate::ktest::diag(format_args!("paused {w:?}; not paused {steady:?}"));
+        kassert!(w.end_gap > steady.end_gap);
         Ok(())
     }
 );
