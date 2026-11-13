@@ -4,15 +4,28 @@
 import re
 import threading
 import time
+from typing import NamedTuple
 
 from lumen_harness.qemu import Machine
-from lumen_harness.qmp import QmpClient
+from lumen_harness.qmp import QmpClient, QmpError, qcodes_for
 
 KBD_LINE = r"INFO  kbd: PS/2 keyboard on ISA IRQ 1 \(GSI 1, vector 0x51\), layout {}\n"
 KBD_STATS = re.compile(
     r"kbd: layout (\S+), IRQ 1 \(vector 0x51\), (\d+) interrupts, (\d+) bytes, (\d+) dropped, "
-    r"(\d+) undecoded, (\d+) line errors\n"
+    r"(\d+) undecoded, (\d+) line errors, (\d+) skipped at setup\n"
 )
+# Without an 8042 its status reads 0xff: never ready for a command.
+NO_8042 = r"no reply in time \(command 0xad: the controller to take it\)"
+
+
+class KbdStats(NamedTuple):
+    layout: str
+    irqs: int
+    bytes: int
+    dropped: int
+    undecoded: int
+    line_errors: int
+    skipped: int
 
 
 def kmon_ready(m: Machine, layout: str) -> None:
@@ -21,14 +34,13 @@ def kmon_ready(m: Machine, layout: str) -> None:
     m.expect(r"kmon> ", 60)
 
 
-def kbd_stats(m: Machine) -> tuple[str, int, int, int, int, int]:
-    """kmon's `kbd`: (layout, interrupts, bytes, dropped, undecoded, line
-    errors)."""
+def kbd_stats(m: Machine) -> KbdStats:
+    """kmon's `kbd`."""
     m.send_line("kbd")
     found = m.expect(KBD_STATS, 10)
     m.expect(r"kmon> ", 10)
     layout, *counts = found.groups()
-    return (layout, *map(int, counts))
+    return KbdStats(layout, *map(int, counts))
 
 
 def echo_physical_yz(m: Machine, typed: str) -> None:
@@ -44,29 +56,25 @@ def echo_physical_yz(m: Machine, typed: str) -> None:
 
 def test_keys_via_qmp_send_key(boot):
     # Typed on the keyboard (shift included), a command runs as if typed on
-    # serial. Every key made two scancodes (press, release; shift two more),
-    # all queued; they raised IRQ 1 (one interrupt can move several, so at
-    # least once a key), and nothing was dropped, undecoded or unexpected.
+    # serial. Every key held made two scancodes (press, release), all
+    # queued; they raised IRQ 1 (one interrupt can move several, so at least
+    # once a character), and nothing was dropped, undecoded or unexpected.
     text = "echo Hello, World!\n"
     m = boot("qemutest")
     kmon_ready(m, "us")
-    _, irqs_before, bytes_before, *_ = kbd_stats(m)
+    before = kbd_stats(m)
     m.type_text(text)
     m.expect(r"Hello, World!\n", 10)
     m.expect(r"kmon> ", 10)
-    shifted = sum(c.isupper() or c == "!" for c in text)
-    want = bytes_before + 2 * len(text) + 2 * shifted
+    want = before.bytes + 2 * sum(len(qcodes_for(c)) for c in text)
     # The last key's release comes after its press was echoed, once QMP's
     # hold time (20 ms) has passed: ask again until it has, for up to 2 s.
     deadline = time.monotonic() + 2
-    while True:
-        layout, irqs, nbytes, dropped, undecoded, line_errors = kbd_stats(m)
-        if nbytes >= want or time.monotonic() > deadline:
-            break
+    while (s := kbd_stats(m)).bytes < want and time.monotonic() <= deadline:
         time.sleep(0.05)
-    assert (layout, dropped, undecoded, line_errors) == ("us", 0, 0, 0)
-    assert nbytes == want, (bytes_before, nbytes, want)
-    assert irqs - irqs_before >= len(text), (irqs_before, irqs)
+    assert (s.layout, s.dropped, s.undecoded, s.line_errors) == ("us", 0, 0, 0)
+    assert s.bytes == want, (before.bytes, s.bytes, want)
+    assert s.irqs - before.irqs >= len(text), (before.irqs, s.irqs)
     m.send_line("ticks")
     strays = m.expect(
         r"ticks: \d+ \(spurious (\d+), unexpected (\d+), local APIC errors (\d+)\)", 10
@@ -83,7 +91,7 @@ def test_second_layout(boot):
     de = boot("qemutest", cmdline="lumen.keymap=de")
     kmon_ready(de, "de")
     echo_physical_yz(de, "zy")
-    assert kbd_stats(de)[0] == "de"
+    assert kbd_stats(de).layout == "de"
     assert "WARN" not in de.output
 
 
@@ -98,30 +106,42 @@ def test_keys_held_during_boot_leave_a_working_keyboard(boot):
     # A key pressed over and over from power-on until the keyboard is set up:
     # its scancodes arrive while the 8042 and the keyboard are being
     # initialized (with port 1 live, the self-test once read one as its
-    # reply), and the keyboard must come up anyway.
+    # reply), are skipped there (and counted), and the keyboard comes up.
     m = boot("qemutest")
     qmp = QmpClient.connect(m.qmp_path, timeout=10)
     done = threading.Event()
+    presses: list[int] = [0]
+    errors: list[Exception] = []
 
     def press_until_set_up() -> None:
-        while not done.is_set() and "kbd: " not in m.output:
-            qmp.send_key(["a"], hold_ms=1)
-            done.wait(0.002)
+        try:
+            while not done.is_set() and "kbd: " not in m.output:
+                qmp.send_key(["a"], hold_ms=1)
+                presses[0] += 1
+                done.wait(0.002)
+        except (QmpError, OSError) as e:  # reported by the test, not lost in the thread
+            errors.append(e)
 
     presser = threading.Thread(target=press_until_set_up, daemon=True)
     presser.start()
     try:
-        m.expect(KBD_LINE.format("us"), 60)
+        first = m.expect(r"(INFO|WARN)  kbd: [^\n]*\n", 60)
     finally:
         done.set()
         presser.join(10)
         qmp.close()
+    assert not presser.is_alive(), "the key presser didn't stop"
+    assert not errors, errors
+    assert presses[0] > 10, presses
+    assert re.fullmatch(KBD_LINE.format("us"), first.group(0)), first.group(0)
+    m.expect(r"INFO  kbd: skipped \d+ stray byte\(s\) while setting the keyboard up\n", 10)
     m.expect(r"kmon> ", 60)
     # Whatever reached kmon before the presses stopped makes one line of
     # a's: end it, then the keyboard types normally.
     m.press(["ret"], "\n")
     m.expect(r"kmon> ", 10)
     echo_physical_yz(m, "yz")
+    assert kbd_stats(m).skipped > 0
     assert "WARN" not in m.output
 
 
@@ -138,16 +158,11 @@ def test_every_printable_character_and_backspace(boot):
 
 
 def test_no_8042_is_a_warning(boot):
-    # Without the controller (its status reads 0xff: never ready for a
-    # command) the keyboard is skipped with a warning naming the command,
-    # and kmon says why there is none.
+    # Without the controller the keyboard is skipped with a warning naming
+    # the command, and kmon says why there is none (IRQ 1 stays routed,
+    # masked).
     m = boot("qemutest", extra=["-machine", "q35,i8042=off"])
-    m.expect(
-        r"WARN  kbd: no PS/2 keyboard: no reply in time \(command 0xad: the controller to take it\)\n",
-        60,
-    )
+    m.expect(rf"WARN  kbd: no PS/2 keyboard: {NO_8042}\n", 60)
     m.expect(r"kmon> ", 60)
     m.send_line("kbd")
-    m.expect(
-        r"kbd: no keyboard \(no reply in time \(command 0xad: the controller to take it\)\)\n", 10
-    )
+    m.expect(rf"kbd: no keyboard \({NO_8042}\); IRQ 1 routed \(vector 0x51\), masked\n", 10)

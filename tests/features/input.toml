@@ -26,7 +26,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Typed I/O APIC redirection entries (read-modify-write); ISA IRQs routed with the MADT's overrides (GSI, polarity, trigger); an I/O APIC vector without a handler is unexpected, not fatal"
+name = "Typed I/O APIC redirection entries (read-modify-write); ISA IRQs routed with the MADT's overrides (GSI, trigger); an I/O APIC vector without a handler is unexpected, not fatal"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::interrupts::redirection_entry_roundtrip",

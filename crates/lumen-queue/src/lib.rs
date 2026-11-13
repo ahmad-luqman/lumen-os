@@ -17,8 +17,9 @@
 //!   was read.
 //!
 //! Only one producer and one consumer may run at a time: callers serialize
-//! each side (the kernel's producer is one CPU's interrupt handler, its
-//! consumers take a lock). The code is safe Rust: misuse (two producers at
+//! each side (the kernel's keyboard producer is the boot CPU with
+//! interrupts off: its interrupt handler, or the driver's drain at unmask;
+//! its consumers take a lock). The code is safe Rust: misuse (two producers at
 //! once) can lose or repeat bytes, but never causes undefined behaviour.
 
 #![cfg_attr(not(test), no_std)]

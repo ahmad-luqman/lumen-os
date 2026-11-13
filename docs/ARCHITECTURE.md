@@ -737,51 +737,60 @@ off. A wake from another CPU queues the thread there and sends the
   finds the I/O APIC with an input for that GSI, registers the handler for
   vector `0x50 + gsi` (`idt::set_irq_handler`, while the input is still
   masked) and programs the input masked, for the boot CPU. It returns a
-  `Route`, which only it can make; the driver unmasks the input with it
-  (`interrupts::set_masked`) once its device is ready. Without an I/O APIC
-  (no MADT) routing fails, and the keyboard is skipped with a warning.
-  Redirection entries are a typed `apic::RedirectionEntry` (vector,
+  `Route`, which only it can make (routes are never undone); the driver
+  unmasks the input with it (`interrupts::set_masked`) once its device is
+  ready. Redirection entries are a typed `apic::RedirectionEntry` (vector,
   delivery mode, destination mode, polarity, trigger, mask, destination;
-  the I/O APIC's read-only remote IRR and delivery status are never
-  written: not tested, QEMU ignores such writes), changed by
+  the I/O APIC's read-only remote IRR and delivery status are never set:
+  written as 0, not tested, QEMU ignores writes to them), changed by
   read-modify-write (`IoApic::update_entry`).
-- **8042 init** (boot CPU, after the framebuffer; IRQ 1 routed first; every
-  reply polled with a deadline, 100 ms, 1 s for the keyboard's reset): with
-  the controller's IRQs off and port 1's clock off, both ports are
-  disabled, the output buffer flushed, the configuration byte rewritten
-  (both IRQs off, port 1's clock off, translation to scancode set 1 on;
-  port 2's clock and the system flag as firmware left them), the self-test
-  run (0x55), the configuration written again (some controllers reset it
-  there), port 1 tested and enabled, scanning disabled, the keyboard reset
-  (an ACK and 0xAA, in either order), scanning disabled again, set 2
-  selected and scanning enabled (each command ACKed, resent at most twice
-  on 0xFE). A byte that isn't the awaited reply (a key pressed during
-  boot) is skipped, up to 32 times. Then port 1's clock goes on with its
-  IRQ bit, the input is unmasked and the output buffer drained once: a
-  byte that was already waiting raised IRQ 1's edge while the input was
-  masked, which the I/O APIC doesn't keep (a ktest has the 8042 put a byte
-  in its buffer while the input is masked, as commands 0xd2 and 0xd3 do
-  for each port). A missing controller (tested with QEMU's `i8042=off`),
-  keyboard (not tested) or I/O APIC (the no-ACPI boot) is a warning (`no
-  PS/2 keyboard: ...`, naming the command that failed), not a failure. The init runs between the framebuffer and `complete` on the boot
-  timeline, so its time counts toward `complete` (up to 100 ms with no
-  controller, about a second with no keyboard).
-- **Bytes and decoding:** the IRQ handler (boot CPU, interrupts off) moves
-  up to 16 waiting bytes into a lock-free single-producer, single-consumer
-  queue (`lumen-queue`, 256 bytes, host-tested; a full queue drops and
-  counts), discarding the second port's and counting (and discarding) the
-  ones the controller flags with a parity or timeout error.
+- **8042 init** (once, boot CPU, after the framebuffer; IRQ 1 routed first;
+  every reply polled with a deadline, 100 ms, 1 s for the keyboard's
+  reset): with the controller's IRQs off, both ports are disabled (their
+  clocks off), the output buffer flushed, the configuration byte
+  rewritten (both IRQs off, translation to scancode set 1 on, both clocks
+  still off; the system flag as firmware left it), the self-test run
+  (0x55), the configuration written again (some controllers reset it
+  there) and the buffer flushed again, port 1 tested, then enabled (its
+  clock on), scanning disabled, the keyboard reset (an ACK and 0xAA, in
+  either order; not resent), scanning disabled again, set 2 selected and
+  scanning enabled (each of these commands ACKed, resent at most twice on
+  0xFE: not tested, QEMU never asks). The controller's replies come while
+  port 1's clock is off; while waiting for one of the keyboard's, a byte
+  that isn't it (a key pressed during boot) is skipped and counted, up to
+  32 per reply, and so is a byte from port 2; a byte the controller flags
+  with a timeout or parity error ends init (no device answering; not
+  tested). Then port 1's IRQ bit is set, the input unmasked and the output
+  buffer drained once: a byte that was already waiting raised IRQ 1's edge
+  while the input was masked, which the I/O APIC doesn't keep (a ktest has
+  the 8042 put a byte in its buffer with command 0xd2 while the input is
+  masked, then a port-2 byte with 0xd3, which is dropped). If init fails
+  after port 1 was enabled, port 1 is disabled again (best effort); IRQ 1
+  stays routed, masked. A missing controller (tested with QEMU's
+  `i8042=off`), keyboard (not tested) or I/O APIC (the no-ACPI boot) is a
+  warning (`no PS/2 keyboard: ...`, saying which step failed), not a
+  failure. The init runs between the framebuffer and `complete` on the
+  boot timeline, so its time counts toward `complete` (up to 100 ms with no
+  controller and up to about 300 ms with no keyboard; not tested).
+- **Bytes and decoding:** the queue's producer is the boot CPU with
+  interrupts off (the IRQ handler, or the drain at unmask): it moves up to
+  16 waiting bytes into a lock-free single-producer, single-consumer queue
+  (`lumen-queue`, 256 bytes, host-tested; a full queue drops and counts),
+  discarding the second port's and counting (and discarding) the ones the
+  controller flags with a parity or timeout error (not tested).
   `keyboard::read_char` (never blocks) decodes them under a lock with
   `pc-keyboard` in the layout `lumen.keymap=` names, skipping keys that
   make no character and counting bytes the decoder refuses (the
   keyboard's overrun code among them). kmon reads the keyboard as well as
   serial (and echoes on serial); `kbd` shows the layout, the route, the
-  interrupts taken and the bytes dropped, undecoded or flagged, or why
-  there is no keyboard.
+  interrupts taken, the bytes queued, dropped, undecoded, flagged, and
+  skipped during setup, or why there is no keyboard (and whether IRQ 1 was
+  routed); a non-zero skip count is also logged after init.
 - **Tests:** QMP `send-key` drives the keyboard (`Machine.type_text` and
   `press`, which wait for kmon's echo of each key); a scenario boots with
   `lumen.keymap=de` in an ISO built for it, and one presses a key over and
-  over from power-on until the keyboard is set up.
+  over from power-on until the keyboard is set up (some of those bytes are
+  skipped during setup).
 - **Not yet:** a blocking read for threads (the shell, #62), key releases
   and modifiers for programs, LEDs, the second port (a mouse), and
   hot-plug.
@@ -1067,7 +1076,7 @@ kernel. The kernel is the trusted computing base.
 |---|---|---|
 | Pure logic | `cargo test` on `no_std` crates | `crates/*` |
 | Kernel internals | `ktest!` in-kernel tests → TAP over serial → `isa-debug-exit` | anywhere in `kernel/src` |
-| Whole system | pytest scenarios: boot QEMU headless, `expect` on serial with timeouts, `send_line`, exit codes; run in parallel (pytest-xdist, one worker per CPU) | `tests/scenarios` |
+| Whole system | pytest scenarios: boot QEMU headless, `expect` on serial with timeouts, `send_line`, keys over QMP (`press`, `type_text`), exit codes; run in parallel (pytest-xdist, one worker per CPU) | `tests/scenarios` |
 | Screens | QMP `screendump` compared to golden PNG regions | `tests/golden` |
 | Codegen | `make audit`: disassembly and LLVM IR checks | `tools/harness/lumen_harness/audit.py` |
 | Harness itself | self-tests that the TAP parser, audit and image diff catch failures, and that the QEMU command line, artifact layout, CI wiring and status generation behave | `tests/harness` |
@@ -1104,7 +1113,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/symbols.rs   kernel symbol table (symbolized crash reports)
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
-  src/kmon.rs      serial debug monitor (until the M2 shell)
+  src/kmon.rs      debug monitor on serial, typed on serial or the keyboard (until the M2 shell)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
 crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-time, lumen-queue, ...)

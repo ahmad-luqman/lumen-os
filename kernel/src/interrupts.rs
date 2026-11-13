@@ -93,7 +93,9 @@ pub fn init() {
 }
 
 /// An ISA interrupt routed to the boot CPU: only [`route_isa_irq`] makes
-/// one, so [`set_masked`] can only unmask an input with a handler.
+/// one, so [`set_masked`] can only unmask an input with a handler. Routes
+/// are never undone, so a copy stays valid (if unrouting is ever added,
+/// `Route` must stop being `Copy`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Route {
     irq: u8,
@@ -180,9 +182,14 @@ pub fn set_masked(route: Route, masked: bool) {
 /// routed and unmasked.
 #[cfg(feature = "ktest")]
 pub fn is_unmasked_isa(irq: u8) -> bool {
-    let (gsi, _) = isa_gsi(irq);
+    routed_entry(isa_gsi(irq).0).is_some_and(|e| !e.masked())
+}
+
+/// The entry of `gsi`'s input, if it is routed.
+#[cfg(feature = "ktest")]
+fn routed_entry(gsi: u32) -> Option<RedirectionEntry> {
     let mut io_apics = IO_APICS.lock();
-    find_input(&mut io_apics, gsi).is_some_and(|(io, i)| io.is_routed(i) && !io.regs.entry(i).masked())
+    find_input(&mut io_apics, gsi).filter(|(io, i)| io.is_routed(*i)).map(|(io, i)| io.regs.entry(i))
 }
 
 /// Map a page of controller registers (uncached), or panic naming it.
@@ -273,8 +280,9 @@ crate::ktest!(
         kassert!(read.masked());
         kassert_eq!(read.destination(), 0x0f);
         kassert!(!read.remote_irr() && !read.delivery_pending());
-        kassert_eq!((updated.vector(), reread.vector()), (0x5a, 0x5a));
-        kassert_eq!(reread.destination(), 0x0f);
+        let mut want = read;
+        want.set_vector(0x5a);
+        kassert_eq!((updated, reread), (want, want));
         kassert_eq!(restored, old);
         Ok(())
     }
@@ -285,8 +293,9 @@ crate::ktest!(
         // Firmware (and QEMU at reset) leaves inputs masked, so unmask an
         // unrouted one first. The held lock keeps interrupts off, and every
         // entry (the routed ones too) is restored before it drops (an edge
-        // raised meanwhile would be latched and taken afterwards, as an
-        // unexpected interrupt).
+        // on the scratch input meanwhile would be latched and taken
+        // afterwards, as an unexpected interrupt; one on the keyboard's,
+        // masked for a moment, would be lost: no keys come in the ktests).
         use crate::kassert_eq;
         let mut io_apics = IO_APICS.lock();
         let io = io_apics.first_mut().ok_or("no I/O APIC")?;
@@ -319,25 +328,17 @@ crate::ktest!(
             "routing IRQ 0 failed"
         })?;
         kassert_eq!(route, Route { irq: 0, gsi: 2, vector: idt::IOAPIC_BASE + 2 });
-        let entry = {
-            let mut io_apics = IO_APICS.lock();
-            let (io, input) = find_input(&mut io_apics, 2).ok_or("no input for GSI 2")?;
-            io.regs.entry(input)
-        };
+        let entry = routed_entry(2).ok_or("no input for GSI 2")?;
         kassert!(entry.masked());
         kassert_eq!((entry.vector(), u32::from(entry.destination())), (route.vector, apic::lapic_id()));
         kassert_eq!(route_isa_irq(0, nothing), Err(RouteError::Taken(2)));
         kassert_eq!(route_isa_irq(1, nothing), Err(RouteError::Taken(1)));
         // IRQ 9 (ACPI's SCI) is overridden level triggered, active high
-        // (flags 0b1101): the override's polarity and trigger reach the
-        // entry. (It stays routed and masked too.)
+        // (flags 0b1101): the override's level trigger reaches the entry
+        // (its polarity is also the default). It stays routed and masked too.
         use crate::arch::apic::{Polarity, Trigger};
         let sci = route_isa_irq(9, nothing).map_err(|_| "routing IRQ 9 failed")?;
-        let entry = {
-            let mut io_apics = IO_APICS.lock();
-            let (io, input) = find_input(&mut io_apics, sci.gsi).ok_or("no input for IRQ 9")?;
-            io.regs.entry(input)
-        };
+        let entry = routed_entry(sci.gsi).ok_or("no input for IRQ 9")?;
         kassert_eq!((entry.trigger(), entry.polarity(), entry.masked()), (Trigger::Level, Polarity::ActiveHigh, true));
         Ok(())
     }

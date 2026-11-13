@@ -3,8 +3,8 @@
 //!
 //! This is a debugging and testing aid, not the shell. It exists so the test
 //! harness can script the kernel over serial (and trigger deliberate faults)
-//! before there are processes. It is removed when the user-mode shell lands
-//! (M2) and the scenario tests move to the shell.
+//! before there is a shell. It is removed when the shell lands (M2; it runs
+//! in the kernel until M9) and the scenario tests move to the shell.
 
 use crate::arch::{self, serial};
 use core::arch::asm;
@@ -130,10 +130,11 @@ fn dispatch(line: &str) {
         },
         "kbd" => {
             let k = crate::keyboard::stats();
-            let _ = match k.status {
-                Some(Ok(route)) => writeln!(
+            let _ = match (k.result, k.route) {
+                (Some(Ok(())), Some(route)) => writeln!(
                     out,
-                    "kbd: layout {}, IRQ {} (vector {:#x}), {} interrupts, {} bytes, {} dropped, {} undecoded, {} line errors",
+                    "kbd: layout {}, IRQ {} (vector {:#x}), {} interrupts, {} bytes, \
+                     {} dropped, {} undecoded, {} line errors, {} skipped at setup",
                     k.layout,
                     route.irq(),
                     route.vector(),
@@ -141,10 +142,17 @@ fn dispatch(line: &str) {
                     k.bytes,
                     k.dropped,
                     k.undecoded,
-                    k.line_errors
+                    k.line_errors,
+                    k.skipped
                 ),
-                Some(Err(e)) => writeln!(out, "kbd: no keyboard ({e})"),
-                None => writeln!(out, "kbd: not set up"),
+                (Some(Err(e)), Some(route)) => writeln!(
+                    out,
+                    "kbd: no keyboard ({e}); IRQ {} routed (vector {:#x}), masked",
+                    route.irq(),
+                    route.vector()
+                ),
+                (Some(Err(e)), None) => writeln!(out, "kbd: no keyboard ({e})"),
+                _ => writeln!(out, "kbd: not set up"),
             };
         }
         "uptime" => {
