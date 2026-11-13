@@ -264,8 +264,9 @@ const _: () = assert!(
         && LAPIC_ERROR < SPURIOUS
 );
 
-/// Local APIC timer interrupts taken.
-static TICKS: AtomicU64 = AtomicU64::new(0);
+/// Local APIC timer interrupts taken, per CPU (every CPU's timer ticks once
+/// its scheduler runs).
+static TICKS: [AtomicU64; super::percpu::MAX_CPUS] = [const { AtomicU64::new(0) }; super::percpu::MAX_CPUS];
 /// Spurious interrupts (local APIC, or 8259 IRQ 7 or 15) taken.
 static SPURIOUS_IRQS: AtomicU64 = AtomicU64::new(0);
 /// Interrupts on vectors nothing handles, taken (each vector warned about
@@ -278,9 +279,15 @@ static LAPIC_ERRORS_SEEN: AtomicU32 = AtomicU32::new(0);
 /// Which vectors have been warned about, a bit each.
 static WARNED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
-/// Local APIC timer interrupts so far.
+/// The boot CPU's local APIC timer interrupts so far.
 pub fn ticks() -> u64 {
-    TICKS.load(Ordering::Relaxed)
+    ticks_on(0)
+}
+
+/// CPU `cpu`'s local APIC timer interrupts so far (0 for a CPU index that
+/// doesn't exist).
+pub fn ticks_on(cpu: usize) -> u64 {
+    TICKS.get(cpu).map_or(0, |t| t.load(Ordering::Relaxed))
 }
 
 /// Interrupts taken that nothing asked for.
@@ -344,7 +351,8 @@ fn unexpected(frame: &TrapFrame) {
 /// Called by `lumen_isr_common` for every vector. CPU exceptions are traced
 /// and fatal (bar #BP). Device interrupts are never fatal: the timer and
 /// spurious interrupts are only counted (at 1 kHz they would flood the trace
-/// ring); a local APIC error is counted and logged with its status (on the
+/// ring), and the timer drives the scheduler (`sched::tick`, which may switch
+/// to another thread and return here only when this one runs again); a local APIC error is counted and logged with its status (on the
 /// 1st, 2nd, 4th, 8th... one, and whenever a new status bit appears);
 /// anything else is traced, counted and warned about once per vector.
 /// Interrupts are off throughout (every gate is an interrupt gate).
@@ -362,8 +370,11 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
     }
     match vector as u8 {
         TIMER => {
-            TICKS.fetch_add(1, Ordering::Relaxed);
+            TICKS[super::percpu::index()].fetch_add(1, Ordering::Relaxed);
+            // Before the scheduler may switch threads: the next tick must be
+            // able to arrive on whatever runs next.
             super::apic::eoi();
+            crate::sched::tick();
         }
         SPURIOUS => {
             SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);

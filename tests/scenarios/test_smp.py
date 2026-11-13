@@ -122,8 +122,9 @@ def test_crash_on_ap_reports_cpu(boot):
     assert reported_by(report, 1), report
     assert "\nother cpus stopped: 0 2 3\n" in report, report
     assert "exception: #PF page fault (vector 14," in report, report
-    # It runs on CPU 1's own main stack, from its idle loop.
+    # It runs on CPU 1's own main stack, from its idle loop (its idle thread).
     assert running_on(report) == ("kernel main", stacks[1].main_bottom, stacks[1].main_top), report
+    assert re.search(r"^thread: idle \(id \d+\)$", report, re.MULTILINE), report
     frames = crash.backtrace(report)
     assert "kmon::crash_page_fault" in frames[0] and any("smp::ap_main" in f for f in frames), (
         frames
@@ -208,8 +209,8 @@ def test_crash_on_a_cpu_that_isnt_online_is_refused(boot):
         m.send_line(f"crash pf {cpu}")
         m.expect(rf"crash: cpu {cpu} isn't online\n", 10)
     m.send_line("crash pf x")
-    m.expect(r"crash: the cpu is a number \(0: this one\)\n", 10)
+    m.expect(r"crash: the cpu is a number \(0: this one\) or 'thread'\n", 10)
     m.send_line("crash pf 1 2")
-    m.expect(r"crash: usage: crash <kind> \[cpu\]\n", 10)
+    m.expect(r"crash: usage: crash <kind> \[cpu\|thread\]\n", 10)
     m.send_line("echo still here")
     m.expect(r"still here\n", 10)

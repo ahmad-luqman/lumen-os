@@ -24,8 +24,9 @@ use crate::window::Window;
 pub const GUARD_SIZE: u64 = FRAME_SIZE;
 
 /// How many stacks can be registered at once: four per CPU (main, #DF, NMI,
-/// #MC) for up to eight CPUs, and room for tests.
-pub const MAX_STACKS: usize = 48;
+/// #MC) for up to eight CPUs, and the rest for kernel threads (one each) and
+/// tests.
+pub const MAX_STACKS: usize = 128;
 
 /// What a stack is for (names it in crash reports). Stored in the registry as
 /// one byte, so a reader gets it in one atomic load.
@@ -43,11 +44,19 @@ pub enum StackKind {
     MachineCheck = 4,
     /// Allocated by a test.
     Test = 5,
+    /// A kernel thread's stack (`sched::spawn`).
+    Thread = 6,
 }
 
 impl StackKind {
-    const ALL: [StackKind; 5] =
-        [StackKind::Main, StackKind::DoubleFault, StackKind::Nmi, StackKind::MachineCheck, StackKind::Test];
+    const ALL: [StackKind; 6] = [
+        StackKind::Main,
+        StackKind::DoubleFault,
+        StackKind::Nmi,
+        StackKind::MachineCheck,
+        StackKind::Test,
+        StackKind::Thread,
+    ];
 
     fn from_raw(raw: u8) -> Option<StackKind> {
         Self::ALL.into_iter().find(|&k| k as u8 == raw)
@@ -60,6 +69,7 @@ impl StackKind {
             StackKind::Nmi => "NMI IST",
             StackKind::MachineCheck => "#MC IST",
             StackKind::Test => "test",
+            StackKind::Thread => "thread",
         }
     }
 }
@@ -435,7 +445,8 @@ mod tests {
                 | StackKind::DoubleFault
                 | StackKind::Nmi
                 | StackKind::MachineCheck
-                | StackKind::Test => {} // keep in step with `StackKind::ALL`
+                | StackKind::Test
+                | StackKind::Thread => {} // keep in step with `StackKind::ALL`
             }
             assert_eq!(StackKind::from_raw(k as u8), Some(k));
             assert!(!k.name().is_empty());

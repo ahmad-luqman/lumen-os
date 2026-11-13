@@ -30,7 +30,8 @@ fn read_line(buf: &mut [u8]) -> usize {
     let mut len = 0;
     loop {
         let Some(b) = serial::try_read_byte() else {
-            core::hint::spin_loop();
+            // Polled (no serial interrupt yet): let other threads on this CPU run.
+            crate::sched::yield_now();
             continue;
         };
         match b {
@@ -62,7 +63,7 @@ fn dispatch(line: &str) {
                 out,
                 "commands:\n  help              this list\n  echo <text>       print text\n  \
                  int3              take a breakpoint and continue\n  \
-                 crash <kind> [cpu] deliberate fault (on that CPU): {CRASH_KINDS}\n  \
+                 crash <kind> [cpu|thread]  deliberate fault (on that CPU, or in a new thread): {CRASH_KINDS}\n  \
                  trace [n]         the boot CPU's last n trace events (default 16)\n  \
                  heap              heap usage and free-list summary\n  \
                  ticks             timer interrupts taken (and stray ones)\n  \
@@ -175,8 +176,9 @@ fn trace(n: u64) {
     let _ = writeln!(out, "trace: {} events claimed, {} dropped", ring.written(), ring.dropped());
 }
 
-/// `crash <kind> [cpu]`: run the fault here, or on another online CPU (from
-/// its idle loop; its crash report then stops this one).
+/// `crash <kind> [cpu|thread]`: run the fault here, on another online CPU
+/// (from its idle thread; its crash report then stops this one), or in a new
+/// thread on this CPU (named `kmon-crash`), which kmon waits for.
 fn crash(args: &str) {
     let mut out = serial::SerialWriter;
     let mut words = args.split_whitespace();
@@ -185,12 +187,21 @@ fn crash(args: &str) {
         let _ = writeln!(out, "crash: unknown kind '{kind}' ({CRASH_KINDS})");
         return;
     };
-    let cpu = words.next().map(str::parse::<usize>);
+    let target = words.next();
     if words.next().is_some() {
-        let _ = writeln!(out, "crash: usage: crash <kind> [cpu]");
+        let _ = writeln!(out, "crash: usage: crash <kind> [cpu|thread]");
         return;
     }
-    match cpu {
+    if target == Some("thread") {
+        match crate::sched::spawn("kmon-crash", fault) {
+            Ok(thread) => thread.join(),
+            Err(e) => {
+                let _ = writeln!(out, "crash: no thread: {e}");
+            }
+        }
+        return;
+    }
+    match target.map(str::parse::<usize>) {
         None | Some(Ok(0)) => fault(),
         Some(Ok(cpu)) => {
             if let Err(e) = crate::smp::run_on(cpu, fault) {
@@ -198,7 +209,7 @@ fn crash(args: &str) {
             }
         }
         Some(Err(_)) => {
-            let _ = writeln!(out, "crash: the cpu is a number (0: this one)");
+            let _ = writeln!(out, "crash: the cpu is a number (0: this one) or 'thread'");
         }
     }
 }

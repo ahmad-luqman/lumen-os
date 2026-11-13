@@ -1,0 +1,54 @@
+# Features: sched. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Kernel threads with their own guarded stacks, preempted round robin (10 ms slices) by the 1 kHz timer"
+milestone = "M2"
+tests = [
+    "ktest:lumen_kernel::sched::two_threads_interleave",
+    "ktest:lumen_kernel::sched::spawning_where_no_scheduler_runs_is_refused",
+]
+
+[[feature]]
+name = "A run queue and a ticking timer on every CPU: threads spawned on a CPU run there, preempted, and only there"
+milestone = "M2"
+tests = [
+    "ktest:lumen_kernel::sched::threads_run_on_every_cpu",
+]
+
+[[feature]]
+name = "sleep blocks the thread until its deadline (time::sleep once the scheduler runs)"
+milestone = "M2"
+tests = [
+    "ktest:lumen_kernel::sched::sleeping_thread_wakes",
+    "ktest:lumen_kernel::time::sleep_10ms_elapses",
+]
+
+[[feature]]
+name = "Wait queues: a blocked thread wakes when its condition holds, on its own CPU or from another"
+milestone = "M2"
+tests = [
+    "ktest:lumen_kernel::sched::wait_queue_wakes_a_blocked_thread",
+]
+
+[[feature]]
+name = "A finished thread's stack is freed before join returns"
+milestone = "M2"
+tests = [
+    "ktest:lumen_kernel::sched::a_dead_threads_stack_is_freed",
+]
+
+[[feature]]
+name = "Thread switches are traced"
+milestone = "M2"
+tests = [
+    "ktest:lumen_kernel::sched::switches_are_traced",
+]
+
+[[feature]]
+name = "The crash report names the running thread, and a thread's backtrace ends at its start"
+milestone = "M2"
+tests = [
+    "scenario:test_crash::test_report_names_the_thread",
+    "scenario:test_crash::test_fault_produces_symbolized_report[*]",
+    "scenario:test_smp::test_crash_on_ap_reports_cpu",
+]

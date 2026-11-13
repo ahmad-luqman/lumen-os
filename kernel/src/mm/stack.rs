@@ -94,7 +94,6 @@ impl KernelStack {
         Ok(KernelStack { range, window, handle: Some(handle) })
     }
 
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests; threads (M2)
     pub fn range(&self) -> StackRange {
         self.range
     }

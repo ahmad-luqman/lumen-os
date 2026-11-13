@@ -18,8 +18,11 @@
 //!    lose its report to a fault on the crash reporter's local APIC write;
 //! 3. on its own stack the AP enables its local APIC, checks NX, the PAT and
 //!    its APIC id (a failure is reported normally), logs
-//!    `cpu N online (lapic id X)` and idles with interrupts on, running
-//!    whatever [`run_on`] hands it (kmon's `crash <kind> [cpu]`);
+//!    `cpu N online (lapic id X)` and becomes its idle thread
+//!    (`sched::run_ap_idle`): with interrupts on, it starts its own timer
+//!    and scheduler once the boot CPU has calibrated the timer, runs the
+//!    threads spawned on it, and whatever [`run_on`] hands it (kmon's
+//!    `crash <kind> [cpu]`);
 //! 4. after calibrating the clocks, the boot CPU waits (bounded, 2 s in all)
 //!    for every AP to be online ([`wait_online`]).
 //!
@@ -31,7 +34,7 @@
 //! CPUs past [`MAX_CPUS`](crate::arch::MAX_CPUS) are halted for good, with a
 //! warning (left in Limine, each would spin on its `goto_address` forever).
 //! An AP never handles device interrupts (every I/O APIC input targets the
-//! boot CPU, and its local APIC timer stays masked).
+//! boot CPU); its local APIC timer drives its scheduler.
 
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -182,9 +185,10 @@ impl core::fmt::Display for RunError {
     }
 }
 
-/// Have AP `index` run `job` from its idle loop (on its own stack, with
-/// interrupts on), and wake it. Returns once the job is handed over, not
-/// when it has run.
+/// Have AP `index` run `job` from its idle thread (on its main stack, with
+/// interrupts on; once its scheduler runs, the job waits for the threads
+/// ready there and can be preempted by them), and wake it. Returns once the
+/// job is handed over, not when it has run.
 pub fn run_on(index: usize, job: fn()) -> Result<(), RunError> {
     let Some(lapic) = online_lapic_id(index).filter(|_| index != 0) else {
         return Err(RunError::NotAnOnlineAp);
@@ -198,6 +202,18 @@ pub fn run_on(index: usize, job: fn()) -> Result<(), RunError> {
         return Err(RunError::IpiNotSent);
     }
     Ok(())
+}
+
+/// Wake CPU `index` if it is online and isn't this one: send it the
+/// `WAKEUP` IPI, which ends its idle loop's halt (the scheduler, after
+/// queueing a thread there). Best effort: if the IPI can't be sent, the
+/// CPU's next timer tick, or its next look at its run queue, finds the work.
+pub fn wake(index: usize) {
+    if index != arch::cpu_index()
+        && let Some(lapic) = online_lapic_id(index)
+    {
+        let _ = arch::apic::send_ipi(lapic, arch::idt::WAKEUP);
+    }
 }
 
 /// What [`start_all`] did, for [`wait_online`].
@@ -356,11 +372,15 @@ extern "C" fn ap_main() -> ! {
     );
     info!(target: "smp", "cpu {index} online (lapic id {lapic})");
     slot.set(State::Online);
-    loop {
-        // Checked with interrupts off, so a wakeup can't be lost.
-        arch::irq::wait_unless(|| slot.job.is_full());
-        if let Some(job) = slot.job.take() {
-            job();
-        }
-    }
+    // From here this context is the CPU's idle thread: it starts the CPU's
+    // timer and scheduler, and runs `run_on`'s jobs (checked with interrupts
+    // off, so a wakeup can't be lost).
+    crate::sched::run_ap_idle(
+        || slot.job.is_full(),
+        || {
+            if let Some(job) = slot.job.take() {
+                job();
+            }
+        },
+    )
 }

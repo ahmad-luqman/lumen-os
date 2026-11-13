@@ -36,13 +36,18 @@ pub enum Kind {
     Log = 3,
     /// A panic is being reported; `args[0]`: the source line, if known.
     Panic = 4,
+    /// The scheduler switched threads on this CPU. `args`: the previous
+    /// thread's id, the next thread's id, the previous thread's state
+    /// (`sched::State`: ready when preempted or yielding, or sleeping,
+    /// blocked, dead).
+    Switch = 5,
     /// Recorded by in-kernel tests.
     Test = 0xff,
 }
 
 impl Kind {
     // Keep in step with the enum: a kind missing here prints as a raw number.
-    const ALL: [Kind; 5] = [Kind::BootPhase, Kind::Exception, Kind::Log, Kind::Panic, Kind::Test];
+    const ALL: [Kind; 6] = [Kind::BootPhase, Kind::Exception, Kind::Log, Kind::Panic, Kind::Switch, Kind::Test];
 
     fn from_raw(raw: u16) -> Option<Kind> {
         Self::ALL.into_iter().find(|&k| k as u16 == raw)
@@ -54,6 +59,7 @@ impl Kind {
             Kind::Exception => "exception",
             Kind::Log => "log",
             Kind::Panic => "panic",
+            Kind::Switch => "switch",
             Kind::Test => "test",
         }
     }
@@ -347,6 +353,13 @@ impl fmt::Display for Describe<'_> {
                 }
             }
             Kind::Panic => write!(f, " line={}", a[0]),
+            Kind::Switch => {
+                write!(f, " from={} to={}", a[0], a[1])?;
+                match crate::sched::State::name_of(a[2]) {
+                    Some(state) => write!(f, " ({state})"),
+                    None => write!(f, " state={}", a[2]),
+                }
+            }
             Kind::Test => write!(f, " args=[{:#x}, {:#x}, {:#x}, {:#x}]", a[0], a[1], a[2], a[3]),
         }
     }

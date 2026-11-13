@@ -43,6 +43,8 @@ def test_fault_produces_symbolized_report(crash_report, kind):
     assert any(f.startswith("kmain+") for f in frames), report
     assert frames[-1].startswith("_start"), report
     assert "<unknown>" not in report, report
+    # kmon runs in the boot CPU's `main` thread (kmain's context).
+    assert re.search(r"^thread: main \(id \d+\)$", report, re.MULTILINE), report
     # None of these is a stack overflow (`df` breaks rsp itself, so its #DF
     # runs on the IST stack with cr2 outside every guard page).
     assert "kernel stack overflow" not in report and "guard page hit" not in report, report
@@ -110,3 +112,21 @@ def test_report_is_written_with_interrupts_off(crash_report, kind):
     # lock the report takes and releases turns them back on.
     report = crash_report(kind)
     assert re.search(r"^interrupts: off$", report, re.MULTILINE), report
+
+
+def test_report_names_the_thread(crash_report):
+    # A fault in a spawned thread: the report names the thread, runs on the
+    # thread's own stack, and the backtrace ends where every thread starts
+    # (`context::thread_start`, rbp = 0), not in kmain.
+    report = crash_report("pf thread")
+    assert re.search(r"^thread: kmon-crash \(id \d+\)$", report, re.MULTILINE), report
+    assert re.search(
+        r"^running on: the thread stack 0x[0-9a-f]+\.\.0x[0-9a-f]+$", report, re.MULTILINE
+    ), report
+    assert re.search(FAULTS["pf"][0], report), report
+    frames = backtrace(report)
+    assert "kmon::crash_page_fault" in frames[0], report
+    assert any("sched::thread_entry" in f for f in frames), report
+    assert "context::thread_start" in frames[-1], report
+    assert not any("kmain" in f for f in frames), report
+    assert "<unknown>" not in report and "(stopped:" not in report, report

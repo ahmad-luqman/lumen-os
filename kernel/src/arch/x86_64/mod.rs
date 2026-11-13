@@ -5,6 +5,7 @@
 //! hardware abstraction layer the ARM64 port (M10) will implement.
 
 pub mod apic;
+pub mod context;
 pub mod cpu;
 pub mod gdt;
 pub mod idt;

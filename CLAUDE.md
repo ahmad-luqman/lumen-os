@@ -132,7 +132,9 @@ own PR that updates that doc first.
 - `kernel/src/main.rs`: boot sequence. `boot.rs`: the Limine requests.
   `cmdline.rs`: kernel command line (flags and `key=value`, e.g.
   `lumen.log=debug`). `sync.rs`: `SpinLock` (interrupts off while held).
-  `smp.rs`: starting the other CPUs, `run_on`.
+  `smp.rs`: starting the other CPUs, `run_on`. `sched.rs`: kernel threads
+  (per-CPU run queues, preemption on the timer, `sleep`, `WaitQueue`,
+  `spawn`/`join`); `arch/x86_64/context.rs` switches threads.
   `arch/x86_64/`: GDT/TSS (per CPU), IDT, entry
   stubs and the vector map, `percpu.rs` (GS base, CPU index), `irq.rs` (nested interrupt disable), local and
   I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
