@@ -27,7 +27,7 @@
 //!
 //! # Scope
 //!
-//! Kernel mappings only: leaves are never user-accessible (M2 adds that).
+//! Kernel mappings only: leaves are never user-accessible (M9 adds that).
 //! Tables are never freed: unmapping the last page under a table leaves the
 //! empty table in place (it is reused by later maps). A 2 MiB or 1 GiB map
 //! where a table already exists fails with [`MapError::AlreadyMapped`] even
