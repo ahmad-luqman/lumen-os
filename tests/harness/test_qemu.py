@@ -182,7 +182,7 @@ SCALED_WAITS = [
 ]
 
 
-@pytest.mark.parametrize(("scale", "wait", "said"), SCALED_WAITS)
+@pytest.mark.parametrize(("scale", "wait", "said"), SCALED_WAITS, ids=["unscaled", "scaled"])
 def test_expect_timeout_shows_the_scaled_wait(tmp_path, monkeypatch, scale, wait, said):
     monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", scale)
     with sleeping_machine(tmp_path, monkeypatch) as m:
@@ -193,7 +193,7 @@ def test_expect_timeout_shows_the_scaled_wait(tmp_path, monkeypatch, scale, wait
     assert str(e.value).startswith(f"timeout after {said} waiting for 'never'\n")
 
 
-@pytest.mark.parametrize(("scale", "wait", "said"), SCALED_WAITS)
+@pytest.mark.parametrize(("scale", "wait", "said"), SCALED_WAITS, ids=["unscaled", "scaled"])
 def test_wait_exit_timeout_shows_the_scaled_wait(tmp_path, monkeypatch, scale, wait, said):
     monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", scale)
     with sleeping_machine(tmp_path, monkeypatch) as m:
