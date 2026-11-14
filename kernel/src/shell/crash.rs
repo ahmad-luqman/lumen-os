@@ -27,6 +27,7 @@ pub const KINDS: &[&str] = &[
     "stack",
     "bigframe",
     "guard",
+    "relock",
 ];
 
 /// Writes to serial and the screen, whichever shell ran the command (a
@@ -150,6 +151,7 @@ fn crash_fn(kind: &str) -> Option<fn()> {
         "guard" => crash_touch_guard,
         "stack" => crash_stack_overflow,
         "bigframe" => crash_big_frame_overflow,
+        "relock" => crash_relock,
         _ => return None,
     })
 }
@@ -368,6 +370,22 @@ fn recurse(depth: u64) -> u64 {
         return depth;
     }
     recurse(depth + 1) + frame[7]
+}
+
+/// The lock `crash relock` takes twice.
+static RELOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+
+/// Take a lock this CPU already holds: `SpinLock::lock` must panic (naming
+/// the lock and this CPU) instead of spinning forever with interrupts off.
+/// Says which lock first, so the test can compare the report with it.
+#[inline(never)]
+fn crash_relock() {
+    let addr = core::ptr::from_ref(&RELOCK).addr();
+    let _ = writeln!(Out, "crash: locking the SpinLock at {addr:#x} twice on cpu {}", arch::cpu_index());
+    let first = RELOCK.lock();
+    let second = RELOCK.lock(); // the re-lock: panics here
+    drop((second, first));
+    let _ = writeln!(Out, "crash: a re-locked SpinLock went unnoticed");
 }
 
 crate::ktest!(

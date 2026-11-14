@@ -8,8 +8,9 @@ QEMU with status 0 (`-no-reboot`), which fails these tests.
 import re
 
 import pytest
-from lumen_harness.crash import END, backtrace, page_walk
+from lumen_harness.crash import BEGIN, END, backtrace, page_walk
 from lumen_harness.image import assert_matches_golden
+from lumen_harness.qemu import EXIT_CRASH
 
 SCREEN_DONE = "(crash report shown on screen)"
 
@@ -146,3 +147,35 @@ def test_thread_stack_overflow_hits_its_guard(crash_report):
         re.MULTILINE,
     ), report
     assert re.search(r"^thread: shell-crash \(id \d+\)$", report, re.MULTILINE), report
+
+
+@pytest.mark.parametrize("cpu", ["0", "1"])
+def test_spinlock_relock_is_reported(boot, cpu):
+    # A CPU taking a lock it already holds panics instead of spinning
+    # forever with interrupts off: the report names the lock (the address
+    # `crash relock` printed first, and its type), the CPU, and the second
+    # `lock()`'s caller (track_caller: the shell, not sync.rs). On CPU 1
+    # too, so the CPU isn't a constant 0.
+    m = boot("qemutest", extra=["-smp", "2"])
+    m.expect(r"lumen> ", 60)
+    m.send_line(f"crash relock {cpu}")
+    said = m.expect(r"crash: locking the SpinLock at (0x[0-9a-f]+) twice on cpu (\d+)\n", 30)
+    assert said.group(2) == cpu, said.group(0)
+    done = m.expect(rf"{re.escape(END)}|crash: a re-locked SpinLock went unnoticed", 30)
+    assert done.group(0) == END, f"no crash: {done.group(0)}"
+    assert m.wait_exit(10) == EXIT_CRASH
+    out = m.output
+    report = out[out.index(BEGIN) : out.index(END) + len(END)]
+    addr = said.group(1)
+    assert (
+        f"\npanic: SpinLock<()> at {addr} re-locked on cpu {cpu}, which already holds it\n"
+        in report
+    ), report
+    assert f"\ncpu: {cpu} (lapic id {cpu})\n" in report, report
+    assert re.search(r"^  at kernel/src/shell/crash\.rs:\d+:\d+$", report, re.MULTILINE), report
+    frames = backtrace(report)
+    assert any("shell::crash::crash_relock" in f for f in frames), report
+    # A complete report: nothing it needs is behind the re-locked lock.
+    assert "!!!" not in report, report
+    lines = report.splitlines()
+    assert lines[-3].startswith("heap: ") and lines[-2:] == ["interrupts: off", END], lines[-3:]
