@@ -45,4 +45,5 @@ tests = [
     "scenario:test_crash::test_spinlock_relock_is_reported[*]",
     "ktest:lumen_kernel::sync::a_lock_records_the_cpu_holding_it",
     "ktest:lumen_kernel::sync::a_lock_held_by_another_cpu_is_waited_for",
+    "ktest:lumen_kernel::sync::a_contended_lock_excludes_and_knows_its_holder",
 ]

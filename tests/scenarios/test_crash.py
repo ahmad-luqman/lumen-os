@@ -8,6 +8,7 @@ QEMU with status 0 (`-no-reboot`), which fails these tests.
 import re
 
 import pytest
+from lumen_harness import REPO_ROOT
 from lumen_harness.crash import BEGIN, END, backtrace, page_walk
 from lumen_harness.image import assert_matches_golden
 from lumen_harness.qemu import EXIT_CRASH
@@ -177,7 +178,13 @@ def test_spinlock_relock_is_reported(boot, cpu):
         in report
     ), report
     assert f"\ncpu: {cpu} (lapic id {cpu})\n" in report, report
-    assert re.search(r"^  at kernel/src/shell/crash\.rs:\d+:\d+$", report, re.MULTILINE), report
+    # The second `lock()`, the one marked in the source.
+    source = (REPO_ROOT / "kernel/src/shell/crash.rs").read_text().splitlines()
+    marked = [n for n, text in enumerate(source, 1) if "// the re-lock: panics here" in text]
+    assert len(marked) == 1, marked
+    assert re.search(rf"^  at kernel/src/shell/crash\.rs:{marked[0]}:\d+$", report, re.MULTILINE), (
+        report
+    )
     frames = backtrace(report)
     assert any("shell::crash::crash_relock" in f for f in frames), report
     # A complete report from inside a held lock (interrupts off): no nested

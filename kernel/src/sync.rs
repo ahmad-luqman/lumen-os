@@ -253,6 +253,49 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn a_contended_lock_excludes_and_knows_its_holder() {
+        // CPUs 0 and 1 hammer one lock with `lock` and `try_lock`: every
+        // critical section sees the lock held by its own CPU, and no
+        // increment is lost (mutual exclusion).
+        use crate::sched::yield_until;
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::{AtomicBool, AtomicU64};
+        const ROUNDS: u64 = 20_000;
+        static HOT: SpinLock<u64> = SpinLock::new(0);
+        static MISSES: AtomicU64 = AtomicU64::new(0);
+        static DONE: AtomicBool = AtomicBool::new(false);
+        fn hammer() -> u64 {
+            let mut entered = 0;
+            for i in 0..ROUNDS {
+                let guard = if i % 2 == 0 { Some(HOT.lock()) } else { HOT.try_lock() };
+                if let Some(mut g) = guard {
+                    if !HOT.held_here() {
+                        MISSES.fetch_add(1, Ordering::Relaxed);
+                    }
+                    *g += 1;
+                    entered += 1;
+                }
+            }
+            entered
+        }
+        static ENTERED_THERE: AtomicU64 = AtomicU64::new(0);
+        crate::smp::run_on(1, || {
+            ENTERED_THERE.store(hammer(), Ordering::Relaxed);
+            DONE.store(true, Ordering::Release);
+        })
+        .map_err(|e| {
+            crate::ktest::diag(format_args!("run_on cpu 1: {e}"));
+            "run_on failed"
+        })?;
+        let entered_here = hammer();
+        kassert!(yield_until(|| DONE.load(Ordering::Acquire)));
+        kassert_eq!(MISSES.load(Ordering::Relaxed), 0);
+        kassert_eq!(*HOT.lock(), entered_here + ENTERED_THERE.load(Ordering::Relaxed));
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn a_failed_try_lock_changes_nothing() {
         use crate::{kassert, kassert_eq};
         kassert_eq!((arch::irq::enabled(), arch::irq::depth()), (true, 0));
