@@ -46,8 +46,8 @@ pub struct Framebuffer {
 
 // SAFETY: the framebuffer is plain MMIO-like memory owned by the kernel.
 // Three kinds of handle draw: the terminal's, under its lock; a
-// `term::Canvas`'s, while the terminal is paused (from any CPU: pixel stores
-// are atomic, see `put`); and the crash screen's (from `FRAMEBUFFER`), after
+// `term::Canvas`'s, while it is live (from any CPU: pixel stores are
+// atomic, see `put` and `term::Canvas`); and the crash screen's (from `FRAMEBUFFER`), after
 // the crash path stopped the terminal (`term::stop`) and the other CPUs, or
 // named those that didn't stop.
 unsafe impl Send for Framebuffer {}
@@ -75,17 +75,26 @@ impl Framebuffer {
     /// CPUs drawing on a `term::Canvas` at once, even the same pixel, don't
     /// race (two writing one pixel leave one of their colours).
     pub fn put(&self, x: usize, y: usize, rgb: u32) {
-        if x < self.width && y < self.height {
-            let px = self.encode(rgb);
-            // SAFETY: (x, y) is inside the framebuffer, whose base is page
-            // aligned and whose rows are a whole number of 32-bit pixels
-            // apart (`init` checks the pitch), so the pointer is valid and
-            // aligned for a u32; every concurrent access to a pixel is a
-            // store through here or a read (`pixel`, `move_rows` with no
-            // other handle drawing).
-            let pixel = unsafe { AtomicU32::from_ptr(self.base.add(y * self.pitch + x * 4).cast::<u32>()) };
-            pixel.store(px, Ordering::Relaxed);
+        if let Some(pixel) = self.pixel_at(x, y) {
+            pixel.store(self.encode(rgb), Ordering::Relaxed);
         }
+    }
+
+    /// The pixel at (`x`, `y`), if it is inside the framebuffer.
+    fn pixel_at(&self, x: usize, y: usize) -> Option<&AtomicU32> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        // SAFETY: (x, y) is inside the framebuffer, whose base is 4-byte
+        // aligned and whose rows are a whole number of 32-bit pixels apart
+        // (`init` checks both), so the pointer is valid and aligned for a
+        // u32 and lives as long as the kernel. Every concurrent access to a
+        // pixel is an atomic store or load through here; `move_rows` (a
+        // plain copy) runs only while no other handle draws, except a row
+        // or glyph a canvas no longer live still draws (see `term::Canvas`'s
+        // `Sync`) and, on the crash path, a CPU that couldn't be stopped
+        // (the report names it): garbled pixels at worst.
+        Some(unsafe { AtomicU32::from_ptr(self.base.add(y * self.pitch + x * 4).cast::<u32>()) })
     }
 
     pub fn fill_rect(&self, x: usize, y: usize, w: usize, h: usize, rgb: u32) {
@@ -116,13 +125,7 @@ impl Framebuffer {
     /// tests).
     #[cfg(feature = "ktest")]
     pub fn pixel(&self, x: usize, y: usize) -> u32 {
-        if x < self.width && y < self.height {
-            // SAFETY: as in `put` (an atomic load, so a canvas drawing
-            // meanwhile doesn't race with it).
-            unsafe { AtomicU32::from_ptr(self.base.add(y * self.pitch + x * 4).cast::<u32>()) }.load(Ordering::Relaxed)
-        } else {
-            0
-        }
+        self.pixel_at(x, y).map_or(0, |pixel| pixel.load(Ordering::Relaxed))
     }
 
     /// Draw one glyph (`?` for one the font lacks), at most `max_w` pixels
@@ -263,6 +266,8 @@ pub enum Unusable {
     /// Rows shorter than 4 bytes a pixel, or not a whole number of pixels
     /// apart.
     Pitch { pitch: u64, width: u64 },
+    /// Pixels not 4-byte aligned (at this address).
+    Misaligned(usize),
 }
 
 impl fmt::Display for Unusable {
@@ -273,6 +278,7 @@ impl fmt::Display for Unusable {
                 write!(f, "colour channels of {red}, {green} and {blue} bits, not 8")
             }
             Unusable::Pitch { pitch, width } => write!(f, "rows of {pitch} bytes for {width} pixels"),
+            Unusable::Misaligned(addr) => write!(f, "pixels at {addr:#x}, not 4-byte aligned"),
         }
     }
 }
@@ -290,6 +296,9 @@ pub fn init(fb: &limine::framebuffer::Framebuffer<'_>) -> Result<(usize, usize),
     }
     if fb.pitch() < fb.width() * 4 || !fb.pitch().is_multiple_of(4) {
         return Err(Unusable::Pitch { pitch: fb.pitch(), width: fb.width() });
+    }
+    if !fb.addr().addr().is_multiple_of(4) {
+        return Err(Unusable::Misaligned(fb.addr().addr()));
     }
     let f = Framebuffer {
         base: fb.addr(),
@@ -326,10 +335,11 @@ pub fn init(fb: &limine::framebuffer::Framebuffer<'_>) -> Result<(usize, usize),
 /// other code may run concurrently.
 pub unsafe fn with_crash_screen(f: impl FnOnce(&mut dyn Write)) -> bool {
     crate::term::stop();
-    // SAFETY: upheld by the caller; the terminal draws no more (stopped
-    // above). A `term::Canvas` held on a CPU the crash path couldn't stop
-    // may still store pixels (atomically, see `put`): the report names that
-    // CPU, the screen may come out garbled, serial has the report.
+    // SAFETY: upheld by the caller; the terminal draws no more and no
+    // canvas is live (stopped above). A canvas row or glyph, or a terminal
+    // render, already under way on a CPU the crash path couldn't stop may
+    // still store pixels: the report names that CPU, the screen may come
+    // out garbled, serial has the report.
     let Some(fb) = (unsafe { FRAMEBUFFER.force_get() }).as_ref().map(|f| unsafe { f.alias() }) else {
         return false;
     };

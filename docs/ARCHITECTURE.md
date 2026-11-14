@@ -924,7 +924,8 @@ off. A wake from another CPU queues the thread there and sends the
 - **Shell commands** (either console, writing to the one that ran them):
   `clear` (the screen and its scrollback, on a console that takes escape
   codes), `colors`, `seq <n>`, `term` (size, cursor, scrollback, the view's offset
-  and top row, cells drawn) and `term text` (the view's rows, and the cursor counted in the view, or
+  and top row, cells drawn, and whether a command has the canvas: that
+  part not tested) and `term text` (the view's rows, and the cursor counted in the view, or
   `cursor below the view` when scrolled back past it; tested); without a
   terminal, `term` says so (not tested). In the screen's shell
   Shift+PageUp/PageDown scroll the view half a screen (logged at debug
@@ -933,21 +934,25 @@ off. A wake from another CPU queues the thread there and sends the
   a scrolled-back view on its lines; the shell takes keys only between
   commands or while a command polls for them, so a scenario can't scroll
   back while a command writes). The view doesn't move while a canvas has
-  the screen.
-- **Canvas:** `term::canvas()` gives one command at a time the pixels
-  below the header (`Canvas`: `put`, `fill_rect`, `clear`, `text`, in its
-  own coordinates, clipped; `Err(CanvasError)` says why there is none: no
-  terminal, a crash report, or another command has it). While it exists
-  the terminal keeps taking output but draws nothing; dropping it clears
-  the canvas and draws every cell again (a ktest checks the pause, the
-  header left alone, the clipping, and the redraw: every cell, text from
-  before and during the pause in ink). Pixel stores are relaxed atomics
-  and `Canvas` is `Sync`, so several CPUs can draw at once (tested by its
-  first multi-CPU user). Each canvas carries an epoch: after a crash report
-  starts, or once the shell takes back a canvas its command left behind
-  (`reclaim_canvas`, after every command, with a warning), it draws
-  nothing and its drop leaves the terminal alone (a ktest checks the
-  taking back; the crash case is not tested).
+  the screen (not tested).
+- **Canvas:** `Ctx::canvas()` (`term::canvas(owner)`) gives one command
+  at a time the pixels below the header (`Canvas`: `put`, `fill_rect`,
+  `clear`, `text`, in its own coordinates, clipped; `Err(CanvasError)`
+  says why there is none: no terminal, a crash report, or another command
+  has it). While it is live the terminal keeps taking output but draws
+  nothing; dropping it clears the canvas and draws every cell again (a
+  ktest checks the pause, the whole header left alone, the clipping, and
+  the redraw: every cell, every visible character in ink). Pixel stores
+  are relaxed atomics and `Canvas` is `Sync`, so several CPUs can draw at
+  once (not tested here: #68's `every_cpu_rendered_rows` is its first
+  multi-CPU user). Each command run gets its own `term::Owner`; when it
+  returns, the shell takes back a canvas that owner left behind, never one
+  a command on the other console holds (`reclaim_canvas`, with a warning;
+  a ktest runs commands that leak a canvas, with and without another
+  owner's held). A canvas taken back, or any after a crash report starts,
+  draws nothing more (`Canvas::is_live`; a draw under way stops at its
+  next row or glyph) and its drop leaves the terminal alone (ktests check
+  the taking back; the crash case is not tested).
 - **Not yet:** virtual terminals (Alt+F1 to F4, ROADMAP M2), a font with
   more than Basic Latin, underline and other SGR attributes, the
   alternate screen, origin mode, left and right margins, and resizing.
@@ -1026,7 +1031,8 @@ off. A wake from another CPU queues the thread there and sends the
   one write, so on the screen a log line can't land in the middle of a
   redraw (not tested on its own). A running command reads keys from its
   console with `Ctx::poll_key` (never blocks) and `Ctx::wait_key`
-  (`Console::try_key`/`read_key`; tested by their first users).
+  (`Console::try_key`/`read_key`; not tested here: #63's `top` is the
+  first user).
 - **Commands:** each `COMMANDS` row carries its usage and a line of help
   (`lumen_shell::Command::usage`/`about`; an `about` ending in `:` is
   followed by its first argument's words), and `help` is generated from

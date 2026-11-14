@@ -27,7 +27,7 @@
 //! evaluation runs ([`State::lend`] empties it before returning).
 
 use crate::shell::{Console, Ctx};
-use crate::term::{self, Canvas};
+use crate::term::{self, Canvas, Owner};
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
@@ -66,8 +66,9 @@ const MAX_SLEEP_MS: i64 = 60_000;
 const HASHING_SEED: [u64; 4] = [0x6c75_6d65_6e00_0001, 2, 3, 4];
 
 /// What the engine's callbacks share with the command running the script.
-#[derive(Default)]
 struct State {
+    /// The command's canvas owner (the shell takes back only its canvas).
+    owner: Owner,
     /// The console, lent for one evaluation (see [`State::lend`]).
     console: Cell<Option<NonNull<dyn Console>>>,
     /// The canvas, once a script drew.
@@ -122,16 +123,20 @@ impl State {
         self.stopped.get()
     }
 
-    /// Run `f` on the canvas, taken on first use.
+    /// Run `f` on the canvas, taken on first use; an error if there is
+    /// none, or it was taken back (a crash report started).
     fn draw(&self, f: impl FnOnce(&Canvas)) -> Result<(), Box<EvalAltResult>> {
         let mut canvas = self.canvas.borrow_mut();
         if canvas.is_none() {
-            *canvas = Some(term::canvas().map_err(|e| e.to_string())?);
+            *canvas = Some(term::canvas(self.owner).map_err(|e| e.to_string())?);
         }
-        if let Some(c) = canvas.as_ref() {
-            f(c);
+        match canvas.as_ref() {
+            Some(c) if c.is_live() => {
+                f(c);
+                Ok(())
+            }
+            _ => Err("the screen was taken back".into()),
         }
-        Ok(())
     }
 }
 
@@ -308,8 +313,9 @@ struct Session {
 }
 
 impl Session {
-    fn new(max_operations: u64) -> Session {
-        let state = Rc::new(State::default());
+    fn new(owner: Owner, max_operations: u64) -> Session {
+        let state =
+            Rc::new(State { owner, console: Cell::new(None), canvas: RefCell::new(None), stopped: Cell::new(false) });
         let engine = engine(&state, max_operations);
         Session { state, engine, scope: Scope::new() }
     }
@@ -357,7 +363,7 @@ enum Job {
 /// Run `job` on `console` in a thread of its own with a [`SCRIPT_STACK`]
 /// stack (rhai recurses deeply: a shell thread's 64 KiB holds only a few
 /// call levels), waiting for it to end.
-fn in_thread(console: &mut dyn Console, job: Job) {
+fn in_thread(console: &mut dyn Console, owner: Owner, job: Job) {
     /// The console, its lifetime erased, sent to the script thread.
     struct Lent(NonNull<dyn Console + 'static>);
     // SAFETY: the console is used by one thread at a time: the script
@@ -380,8 +386,8 @@ fn in_thread(console: &mut dyn Console, job: Job) {
         // SAFETY: the lender waits in `join` until this thread ends.
         let console = unsafe { lent.console() };
         match job {
-            Job::Repl { ansi } => repl(console, ansi),
-            Job::Eval { source, max_operations } => Session::new(max_operations).run(&source, console),
+            Job::Repl { ansi } => repl(console, owner, ansi),
+            Job::Eval { source, max_operations } => Session::new(owner, max_operations).run(&source, console),
         }
     });
     match spawned {
@@ -418,13 +424,14 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
             return;
         }
     };
-    in_thread(ctx.out, job);
+    let owner = ctx.owner();
+    in_thread(ctx.out, owner, job);
 }
 
 /// `rhai` alone: read lines with the shell's line editor and evaluate each,
 /// keeping variables between them, until `exit` (or Ctrl-D on an empty
 /// line).
-fn repl(console: &mut dyn Console, ansi: bool) {
+fn repl(console: &mut dyn Console, owner: Owner, ansi: bool) {
     const PROMPT: &str = "rhai> ";
     let mode = if ansi { Mode::Ansi } else { Mode::Plain };
     // Like the shell's lines: no wider than the console (the screen's, or
@@ -434,7 +441,7 @@ fn repl(console: &mut dyn Console, ansi: bool) {
         Mode::Plain => 160,
     };
     let mut editor = Editor::new(PROMPT, mode, max, 50);
-    let mut session = Session::new(MAX_OPERATIONS);
+    let mut session = Session::new(owner, MAX_OPERATIONS);
     let mut shown = String::new();
     let banner = FUNCTIONS.join(", ");
     let _ = writeln!(console, "rhai: Lumen's functions are {banner}; 'exit' or Ctrl-D leaves");
@@ -477,7 +484,7 @@ fn flush(console: &mut dyn Console, shown: &mut String) {
 fn run_captured(source: &str, max_operations: u64, keys: &[Key]) -> String {
     let mut console = crate::shell::Captured::default();
     console.keys.extend(keys.iter().copied());
-    in_thread(&mut console, Job::Eval { source: source.to_string(), max_operations });
+    in_thread(&mut console, Owner::new(), Job::Eval { source: source.to_string(), max_operations });
     if console.ran_dry {
         console.text.push_str("[ran dry]");
     }
@@ -562,7 +569,7 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         let text = run_captured("draw_rect(0, 0, 10, 10, 0xff0000); screen_width() > 0", 10_000, &[Key::Char(' ')]);
         kassert_eq!(text, "true\nrhai: press a key\n");
-        kassert!(term::canvas().is_ok());
+        kassert!(term::canvas(Owner::new()).is_ok());
         Ok(())
     }
 );

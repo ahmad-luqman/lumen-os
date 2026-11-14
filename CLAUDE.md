@@ -141,10 +141,10 @@ own PR that updates that doc first.
   I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
   reporter. `ktest.rs`: test runner. `script.rs`: rhai scripts (the shell's
   `rhai`; built-in scripts in `script/`). `shell/`: the shells, one on serial
-  (plain text unless `lumen.ansi`) and one on the screen (keyboard), their
-  commands (`commands.rs`: each row carries its help line; commands read
-  keys through `Ctx::poll_key`/`wait_key`) and deliberate faults
-  (`crash.rs`). `fb.rs`:
+  (plain text unless `lumen.ansi`) and one on the screen (keyboard): `mod.rs`
+  the consoles and `Ctx` (keys through `poll_key`/`wait_key`, the screen
+  through `canvas`), their commands (`commands.rs`: each row carries its
+  help line) and deliberate faults (`crash.rs`). `fb.rs`:
   framebuffer pixels, the header and the crash screen. `term.rs`: the
   terminal on the framebuffer (log lines, the screen's shell, scrollback, `view_text`, and
   `Canvas`: the pixels below the header for one command, the terminal paused meanwhile). `klog.rs`: logger. `symbols.rs`: symbol lookup.
