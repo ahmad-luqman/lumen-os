@@ -138,7 +138,7 @@ own PR that updates that doc first.
   `arch/x86_64/`: GDT/TSS (per CPU), IDT, entry
   stubs and the vector map, `percpu.rs` (GS base, CPU index), `irq.rs` (nested interrupt disable), local and
   I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
-  reporter. `ktest.rs`: test runner. `kmon.rs`: serial debug monitor (until
+  reporter. `ktest.rs`: test runner. `kmon.rs`: serial debug monitor, typed on serial or the keyboard (until
   the M2 shell). `fb.rs`:
   framebuffer and console. `klog.rs`: logger. `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
@@ -152,7 +152,10 @@ own PR that updates that doc first.
   PAT. `trace.rs`: trace rings (one per CPU), event kinds, `ktrace!`, the boot timeline
   (`Timeline`). `acpi.rs`: ACPI
   discovery (CPUs, LAPIC, I/O APICs, HPET) and the firmware-table reader.
-  `interrupts.rs`: 8259s masked, local APIC on, I/O APIC inputs masked.
+  `interrupts.rs`: 8259s masked, local APIC on, I/O APIC inputs masked,
+  `route_isa_irq` (MADT overrides, handler registered before unmasking).
+  `keyboard.rs`: the PS/2 keyboard (8042 init, IRQ 1, `pc-keyboard`
+  decoding, `lumen.keymap=`); `arch/x86_64/i8042.rs` its ports.
   `time.rs`: TSC and LAPIC timer calibration, the boot origin
   (`mark_boot`, `since_boot_ns`), `now_ns`, `sleep`, `ticks`.
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
@@ -166,6 +169,8 @@ own PR that updates that doc first.
 - `crates/lumen-time`: timekeeping arithmetic: calibration, tick/ns
   conversion, timer counts, log time formats (`Stamp`, `Millis`)
   (host-tested).
+- `crates/lumen-queue`: lock-free single-producer, single-consumer byte
+  queue (interrupt handler to thread; host-tested, incl. threads).
 - `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET
   (host-tested on handcrafted tables).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines

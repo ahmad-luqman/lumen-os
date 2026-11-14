@@ -21,12 +21,14 @@ lumen-acpi.workspace = true
 lumen-elf.workspace = true
 lumen-heap.workspace = true
 lumen-mm.workspace = true
+lumen-queue.workspace = true
 lumen-time.workspace = true
 lumen-trace.workspace = true
 limine.workspace = true
 log.workspace = true
 rustc-demangle.workspace = true
 noto-sans-mono-bitmap.workspace = true
+pc-keyboard.workspace = true
 
 [lints]
 workspace = true

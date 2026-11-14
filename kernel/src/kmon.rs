@@ -1,9 +1,10 @@
-//! Kernel monitor: a tiny line-based console on serial.
+//! Kernel monitor: a tiny line-based console on serial (typed on serial or
+//! the PS/2 keyboard; output on serial).
 //!
 //! This is a debugging and testing aid, not the shell. It exists so the test
 //! harness can script the kernel over serial (and trigger deliberate faults)
-//! before there are processes. It is removed when the user-mode shell lands
-//! (M2) and the scenario tests move to the shell.
+//! before there is a shell. It is removed when the shell lands (M2; it runs
+//! in the kernel until M9) and the scenario tests move to the shell.
 
 use crate::arch::{self, serial};
 use core::arch::asm;
@@ -25,13 +26,23 @@ pub fn run() -> ! {
     }
 }
 
-/// Read one line with echo and backspace handling.
+/// The next byte typed, on serial or the keyboard (from the keyboard, an
+/// ASCII character; others, like a `uk` layout's £, are skipped), if any.
+fn try_read_byte() -> Option<u8> {
+    serial::try_read_byte().or_else(|| {
+        let c = crate::keyboard::read_char()?;
+        c.is_ascii().then_some(c as u8)
+    })
+}
+
+/// Read one line, typed on serial or the keyboard, with echo (on serial)
+/// and backspace handling.
 fn read_line(buf: &mut [u8]) -> usize {
     let mut len = 0;
     loop {
-        let Some(b) = serial::try_read_byte() else {
-            // Polled (no serial interrupt yet): let other threads on this
-            // CPU run.
+        let Some(b) = try_read_byte() else {
+            // Polled (no serial interrupt yet, and the keyboard's queue isn't
+            // waited on): let other threads on this CPU run.
             crate::sched::yield_now();
             continue;
         };
@@ -68,6 +79,7 @@ fn dispatch(line: &str) {
                  trace [n]         the boot CPU's last n trace events (default 16)\n  \
                  heap              heap usage and free-list summary\n  \
                  ticks             the boot CPU's timer interrupts (and stray ones)\n  \
+                 kbd               the keyboard's layout and interrupts\n  \
                  sleep <ms>        wait that long (guest time)\n  \
                  uptime            nanoseconds since the TSC started\n  \
                  clocks            the TSC's frequency, measured again against each clock\n  \
@@ -116,6 +128,33 @@ fn dispatch(line: &str) {
                 let _ = writeln!(out, "usage: sleep <ms> (up to 60000)");
             }
         },
+        "kbd" => {
+            let k = crate::keyboard::stats();
+            let _ = match (k.result, k.route) {
+                (Some(Ok(())), Some(route)) => writeln!(
+                    out,
+                    "kbd: layout {}, IRQ {} (vector {:#x}), {} interrupts, {} bytes, \
+                     {} dropped, {} undecoded, {} line errors, {} skipped at setup",
+                    k.layout,
+                    route.irq(),
+                    route.vector(),
+                    k.irqs,
+                    k.bytes,
+                    k.dropped,
+                    k.undecoded,
+                    k.line_errors,
+                    k.skipped
+                ),
+                (Some(Err(e)), Some(route)) => writeln!(
+                    out,
+                    "kbd: no keyboard ({e}); IRQ {} routed (vector {:#x}), masked",
+                    route.irq(),
+                    route.vector()
+                ),
+                (Some(Err(e)), None) => writeln!(out, "kbd: no keyboard ({e})"),
+                _ => writeln!(out, "kbd: not set up"),
+            };
+        }
         "uptime" => {
             let _ = writeln!(out, "uptime: {} ns", crate::time::now_ns());
         }

@@ -1,0 +1,44 @@
+# Features: input. See tests/features/README.md for the format.
+
+[[feature]]
+name = "PS/2 keyboard through the I/O APIC (IRQ 1), pc-keyboard linked (audit passing): keys sent with QMP reach kmon (every printable character, backspace), also after keys held during boot; bytes waiting at unmask drained, port 2 dropped; without an I/O APIC or an 8042 it is skipped with a warning"
+milestone = "M2"
+tests = [
+    "scenario:test_input::test_keys_via_qmp_send_key",
+    "scenario:test_input::test_keys_held_during_boot_leave_a_working_keyboard",
+    "scenario:test_acpi::test_no_madt_boots_without_acpi",
+    "scenario:test_input::test_every_printable_character_and_backspace",
+    "scenario:test_input::test_no_8042_is_a_warning",
+    "ktest:lumen_kernel::keyboard::a_byte_waiting_at_unmask_is_drained_and_port2_bytes_dropped",
+    "ktest:lumen_kernel::keyboard::a_stray_byte_before_the_ack_is_skipped",
+    "audit:flags",
+    "ktest:lumen_kernel::keyboard::the_keyboard_is_routed_and_unmasked",
+    "cargo:lumen-queue",
+]
+
+[[feature]]
+name = "Keyboard layouts chosen with lumen.keymap= (us by default and for an unknown name)"
+milestone = "M2"
+tests = [
+    "scenario:test_input::test_second_layout",
+    "scenario:test_input::test_an_unknown_keymap_falls_back_to_us",
+    "ktest:lumen_kernel::keyboard::scancodes_decode_per_layout",
+    "ktest:lumen_kernel::keyboard::keymap_names_choose_a_layout",
+]
+
+[[feature]]
+name = "Typed I/O APIC redirection entries (read-modify-write); ISA IRQs routed with the MADT's overrides (GSI, trigger); an I/O APIC vector without a handler is unexpected, not fatal"
+milestone = "M2"
+tests = [
+    "ktest:lumen_kernel::interrupts::redirection_entry_roundtrip",
+    "ktest:lumen_kernel::interrupts::redirection_entries_encode_the_madt_flags",
+    "ktest:lumen_kernel::interrupts::routing_takes_the_madt_override_and_refuses_twice",
+    "ktest:lumen_kernel::interrupts::device_vectors_are_not_fatal",
+]
+
+[[feature]]
+name = "QMP key helpers in the harness (characters to QEMU key names, send-key)"
+milestone = "M2"
+tests = [
+    "harness:test_qmp::*",
+]

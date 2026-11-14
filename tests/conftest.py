@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import pytest
-from lumen_harness import BUILD_DIR, artifact_dir, artifacts_root
+from lumen_harness import BUILD_DIR, REPO_ROOT, artifact_dir, artifacts_root
 from lumen_harness.crash import BEGIN, END, PROTECTION_BROKEN
 from lumen_harness.qemu import EXIT_CRASH, Machine, default_accel, environment
 
@@ -27,6 +28,10 @@ ISOS = {
     "qemutest": BUILD_DIR / "lumen-qemutest.iso",
     "ktest": BUILD_DIR / "lumen-ktest.iso",
 }
+# The kernel behind each test ISO, and the command line the Makefile's `iso`
+# targets give it (keep in step), for `boot(..., cmdline=...)`.
+KERNELS = {"qemutest": BUILD_DIR / "lumen-kernel", "ktest": BUILD_DIR / "lumen-kernel-ktest"}
+ISO_CMDLINE = "lumen.qemu_exit"
 GOLDEN_DIR = Path(__file__).parent / "golden"
 
 
@@ -62,14 +67,25 @@ def artifacts(request: pytest.FixtureRequest) -> Iterator[Path]:
 @pytest.fixture
 def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
     """`boot("qemutest")` -> a started Machine (closed automatically).
-    `extra` is appended to QEMU's command line, e.g. `extra=["-smp", "2"]`."""
+    `extra` is appended to QEMU's command line, e.g. `extra=["-smp", "2"]`;
+    `cmdline` to the kernel's, e.g. `cmdline="lumen.keymap=de"`, in an ISO
+    built for this test in its artifacts directory (so parallel tests don't
+    share one; `qemutest` and `ktest` only)."""
     machines: list[Machine] = []
 
-    def _boot(variant: str = "qemutest", *, extra: Sequence[str] = ()) -> Machine:
+    def _boot(
+        variant: str = "qemutest", *, extra: Sequence[str] = (), cmdline: str | None = None
+    ) -> Machine:
         iso = ISOS[variant]
         if not iso.exists():
             pytest.fail(f"{iso} not found; run `make iso` first")
         sub = artifacts if not machines else artifacts / f"run{len(machines)}"
+        if cmdline is not None:
+            iso = sub / "custom.iso"
+            words = [ISO_CMDLINE, *cmdline.split()]
+            subprocess.run(
+                [REPO_ROOT / "tools" / "mkiso.sh", KERNELS[variant], iso, *words], check=True
+            )
         m = Machine(iso, sub, trace_interrupts=True, extra_args=extra).start()
         machines.append(m)
         return m

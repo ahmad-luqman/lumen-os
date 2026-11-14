@@ -17,7 +17,7 @@
 use super::gdt;
 use core::arch::{asm, global_asm};
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 /// Register state saved by the entry stub, lowest address first.
 #[repr(C)]
@@ -237,11 +237,12 @@ pub const PIC_SPURIOUS_SLAVE: u8 = PIC_BASE + 15;
 /// The local APIC timer.
 pub const TIMER: u8 = 0x40;
 /// `IOAPIC_BASE + n`: global system interrupt `n` (up to vector 0xef), once
-/// a driver routes it (every I/O APIC input is masked until then).
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: device drivers (M3)
+/// a driver routes it (`interrupts::route_isa_irq`, which registers its
+/// handler first, [`set_irq_handler`]); every other I/O APIC input stays
+/// masked.
 pub const IOAPIC_BASE: u8 = 0x50;
 /// The last vector for an I/O APIC input.
-const IOAPIC_LAST: u8 = 0xef;
+pub const IOAPIC_LAST: u8 = 0xef;
 /// Free: no source uses 0x30-0x3e (a ktest raises 0x30 by `int`).
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
 pub const UNUSED: u8 = 0x30;
@@ -277,6 +278,47 @@ static UNEXPECTED_IRQS: AtomicU64 = AtomicU64::new(0);
 static LAPIC_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Every local APIC error status bit seen so far.
 static LAPIC_ERRORS_SEEN: AtomicU32 = AtomicU32::new(0);
+/// How many I/O APIC vectors there are.
+const IOAPIC_VECTORS: usize = (IOAPIC_LAST - IOAPIC_BASE) as usize + 1;
+
+/// The handler of each I/O APIC vector (`IOAPIC_BASE..=IOAPIC_LAST`): a
+/// `fn()` kept as a pointer, null if none (a function pointer never is).
+static IRQ_HANDLERS: [AtomicPtr<()>; IOAPIC_VECTORS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; IOAPIC_VECTORS];
+
+/// Why [`set_irq_handler`] refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandlerError {
+    /// The vector isn't an I/O APIC vector.
+    NotAnIoApicVector,
+    /// Another handler has it.
+    Taken,
+}
+
+/// `vector`'s slot in [`IRQ_HANDLERS`], if it is an I/O APIC vector.
+fn irq_slot(vector: u8) -> Option<&'static AtomicPtr<()>> {
+    IRQ_HANDLERS.get(usize::from(vector.checked_sub(IOAPIC_BASE)?))
+}
+
+/// Run `handler` (with interrupts off, then the local APIC's EOI) whenever
+/// I/O APIC vector `vector` arrives. Once per vector, before its input is
+/// unmasked; handlers stay for good. Only `interrupts::route_isa_irq` calls
+/// it (it keeps the vector and its input in step).
+pub fn set_irq_handler(vector: u8, handler: fn()) -> Result<(), HandlerError> {
+    let slot = irq_slot(vector).ok_or(HandlerError::NotAnIoApicVector)?;
+    slot.compare_exchange(core::ptr::null_mut(), handler as *mut (), Ordering::Release, Ordering::Relaxed)
+        .map(|_| ())
+        .map_err(|_| HandlerError::Taken)
+}
+
+/// The handler registered for `vector`, if any.
+fn irq_handler(vector: u8) -> Option<fn()> {
+    let raw = irq_slot(vector)?.load(Ordering::Acquire);
+    // SAFETY: `set_irq_handler` is the only store of a non-null pointer, and
+    // it stores a `fn()` cast to a pointer (same size: both are addresses).
+    (!raw.is_null()).then(|| unsafe { core::mem::transmute::<*mut (), fn()>(raw) })
+}
+
 /// Which vectors have been warned about, a bit each.
 static WARNED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
@@ -356,8 +398,10 @@ fn unexpected(frame: &TrapFrame) {
 /// may switch to another thread and return here only when this one runs
 /// again); a local APIC error is counted and logged with its status (on the
 /// 1st, 2nd, 4th, 8th... one, and whenever a new status bit appears);
-/// anything else is traced, counted and warned about once per vector.
-/// Interrupts are off throughout (every gate is an interrupt gate).
+/// an I/O APIC vector runs its handler ([`set_irq_handler`]; one with none
+/// is unexpected); anything else is traced, counted and warned about once
+/// per vector. Interrupts are off throughout (every gate is an interrupt
+/// gate).
 #[unsafe(no_mangle)]
 extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
     let vector = frame.vector;
@@ -404,6 +448,13 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
             unexpected(frame);
             super::pic::eoi(v - PIC_BASE);
             super::pic::mask_all();
+        }
+        v if (IOAPIC_BASE..=IOAPIC_LAST).contains(&v) => {
+            match irq_handler(v) {
+                Some(handler) => handler(),
+                None => unexpected(frame),
+            }
+            super::apic::eoi();
         }
         LAPIC_ERROR => {
             let status = super::apic::error_status();

@@ -32,6 +32,7 @@ is listed only in [STATUS.md](STATUS.md), which is generated from tests.
 | Bootloader | Limine 12.x (pinned binary release + sha256), `limine` crate **0.5.0** | Memory map, framebuffer, higher-half direct map, and our own ELF file for symbolization, with no loader to write. Crate 0.6.x requires nightly (`#![feature(ptr_metadata)]`), so we use 0.5.0 (base revision 3). | Custom UEFI loader (optional learning milestone), GRUB/multiboot2. |
 | Kernel shape | **Modular monolith** with message-shaped internal interfaces; capabilities enforced at the syscall boundary | One address space keeps early milestones fast and debuggable. Agent safety needs capability checks between *processes*, which a monolith enforces just as well. Drivers and services expose request/response interfaces, so any of them can move to user space later. | Microkernel: stronger isolation of drivers, but it puts IPC performance and many extra servers in front of every milestone. |
 | Test harness | Python (`uv`, pytest) on the host; TAP from the kernel | Fast to write scenarios, mature tooling, and QMP/PIL are easy to use. | Rust `xtask`: one language, but slower iteration on test scripts. |
+| Third-party crates | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), at most one new crate per PR, checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX, no red zone, the kernel code model). Kernel crates so far: `limine`, `rustc-demangle`, `noto-sans-mono-bitmap` and `log` (from M0, before this policy; `log` is still `0.4`, to be pinned in a PR of its own), `pc-keyboard` (scancode decoding and layouts, #58, the first under it). | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
 | Firmware for tests | OVMF `edk2-stable202605-r1` from rust-osdev/ovmf-prebuilt, pinned with sha256 | macOS and CI boot byte-identical firmware, so golden screenshots match. | Distro OVMF packages (paths and versions differ per OS). |
 
 ## 3. Layers
@@ -105,10 +106,11 @@ tests (for example `lumen-elf`, the symbol-table reader).
    online (`INFO  smp: 4 CPUs online`); the scheduler started on every CPU
    (`INFO  sched: threads on 4 CPUs, 10 ms slices`; `kmain`'s context
    becomes the `main` thread, section 6, "Kernel threads"); the
-   framebuffer hello screen, then
+   framebuffer hello screen, the PS/2 keyboard (`INFO  kbd: PS/2 keyboard
+   on ISA IRQ 1 ...`, section 6, "Keyboard"), then
    `boot complete`, then the boot timeline (below).
 7. Either the in-kernel test runner (`--features ktest`) or the kernel monitor
-   (`kmon`, a serial debug console that the shell replaces in M2; the shell
+   (`kmon`, a debug console on serial, typed on serial or the keyboard, that the shell replaces in M2; the shell
    runs in the kernel until it moves to user mode in M9).
 
 ### Boot timeline and log timestamps (built in M1)
@@ -120,7 +122,7 @@ bootloader-performance request, so the bootloader's own time isn't counted.
 Entry is recorded with the origin's TSC; every other phase records a
 `BootPhase` trace event when it ends: arch-init, logger, symbols, memory, stacks, acpi, interrupts,
 time (calibration, interrupts on, the first-tick check: 10 ms, up to 100 ms while no tick has come), smp (the
-wait until the other CPUs are online, then the scheduler started on every CPU), framebuffer, complete. After `boot complete` the kernel prints them from the ring,
+wait until the other CPUs are online, then the scheduler started on every CPU), framebuffer, complete (which includes setting up the keyboard). After `boot complete` the kernel prints them from the ring,
 converted with the calibrated TSC:
 
 ```
@@ -248,7 +250,10 @@ missing or broken HPET alone is a warning (`no usable HPET: ...`) and leaves
 (`skipped the table at 0x...: ...`).
 
 Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
-`isa-debug-exit`, used by tests) and `lumen.log=<error|warn|info|debug|trace>`.
+`isa-debug-exit`, used by tests), `lumen.log=<error|warn|info|debug|trace>`
+and `lumen.keymap=<us|uk|de|fr|no|se|jp|dvorak|colemak>` (the keyboard's
+layout, section 6; `us` by default and for a name it doesn't know, with a
+warning).
 
 ## 5. Memory layout
 
@@ -535,7 +540,8 @@ allocates.
   arrive); 0x30-0x3e unused (a ktest raises 0x30); 0x3f the `WAKEUP` IPI
   (section 4, "Other CPUs"); 0x40 the local APIC
   timer; 0x50 + n global system interrupt n (up to 0xef), once a driver
-  routes it (every I/O APIC input is masked until then); 0xfe local APIC
+  routes it (`interrupts::route_isa_irq`; every other I/O APIC input stays
+  masked); 0xfe local APIC
   errors; 0xff the local APIC's spurious vector; the rest unused.
 - **Dispatch:** `#BP` is counted and resumes (a ktest proves registers
   survive the round trip); every other exception is fatal and goes to
@@ -545,8 +551,9 @@ allocates.
   may switch threads); spurious interrupts (the local APIC's, the 8259s' IRQ 7 and 15) are
   counted and get no EOI (a spurious IRQ 15 gets one at the master 8259); a
   local APIC error is counted, logged with its status (the 1st, 2nd, 4th,
-  8th... time, and whenever a new status bit appears) and EOI'd; anything
-  else is traced, counted, warned about once per vector, and EOI'd (another
+  8th... time, and whenever a new status bit appears) and EOI'd; a routed
+  I/O APIC vector runs the handler its driver registered and is EOI'd;
+  anything else is traced, counted, warned about once per vector, and EOI'd (another
   8259 line also masks the 8259s again; an 8259 vector the local APIC has
   in service is EOI'd there). Of device interrupts, only that last kind is
   traced: at 1 kHz the timer would flood the ring. kmon `ticks` shows the
@@ -719,6 +726,77 @@ off. A wake from another CPU queues the thread there and sends the
   report names the running thread (`thread: <name> (id N)`).
 - **Not yet:** priorities, migration or load balancing, a per-thread CPU
   time count (`top`, #63), and timeouts on wait queues.
+
+### Keyboard (built in M2)
+
+`kernel/src/keyboard.rs`, the 8042's ports in `arch/x86_64/i8042.rs`.
+
+- **Routing:** `interrupts::route_isa_irq(irq, handler)` (boot CPU only,
+  asserted) takes the MADT's interrupt override for the ISA IRQ, if any
+  (the GSI, polarity and trigger; ISA's edge, active high without one),
+  finds the I/O APIC with an input for that GSI, registers the handler for
+  vector `0x50 + gsi` (`idt::set_irq_handler`, while the input is still
+  masked) and programs the input masked, for the boot CPU. It returns a
+  `Route`, which only it can make (routes are never undone); the driver
+  unmasks the input with it (`interrupts::set_masked`) once its device is
+  ready. Redirection entries are a typed `apic::RedirectionEntry` (vector,
+  delivery mode, destination mode, polarity, trigger, mask, destination;
+  the I/O APIC's read-only remote IRR and delivery status are never set:
+  written as 0, not tested, QEMU ignores writes to them), changed by
+  read-modify-write (`IoApic::update_entry`).
+- **8042 init** (once, boot CPU, after the framebuffer; IRQ 1 routed first;
+  every reply polled with a deadline, 100 ms, 1 s for the keyboard's
+  reset): with the controller's IRQs off, both ports are disabled (their
+  clocks off), the output buffer flushed, the configuration byte
+  rewritten (both IRQs off, translation to scancode set 1 on, both clocks
+  still off; the system flag as firmware left it), the self-test run
+  (0x55), the configuration written again (some controllers reset it
+  there; QEMU's doesn't) and the buffer flushed again, port 1 tested, then
+  enabled (its clock on), scanning disabled, the keyboard reset (an ACK and
+  0xAA, in either order, within 1 s; 0xFC or 0xFD fails it; not resent),
+  scanning disabled again, set 2 selected and scanning enabled (each of
+  these commands ACKed, resent at most twice on 0xFE). QEMU never sends the
+  reset's replies out of order or a failure, asks for a resend, or needs
+  scanning disabled around the reset, so those branches are not tested.
+  The controller's replies come while port 1's clock is off; while waiting
+  for one of the keyboard's, a byte that isn't it (a key pressed during
+  boot) is skipped and counted (a ktest plants one with 0xd2), up to 32 per
+  reply (the bound not tested), and so is a byte from port 2; a byte the controller flags
+  with a timeout or parity error ends init (no device answering; not
+  tested). Then port 1's IRQ bit is set, the input unmasked and the output
+  buffer drained once: a byte that was already waiting raised IRQ 1's edge
+  while the input was masked, which the I/O APIC doesn't keep (a ktest has
+  the 8042 put a byte in its buffer with command 0xd2 while the input is
+  masked, then a port-2 byte with 0xd3, which is dropped). If init fails
+  after port 1 was enabled, port 1 is disabled again (best effort); IRQ 1
+  stays routed, masked. A missing controller (tested with QEMU's
+  `i8042=off`), keyboard (not tested) or I/O APIC (the no-ACPI boot) is a
+  warning (`no PS/2 keyboard: ...`, saying which step failed), not a
+  failure. The init runs between the framebuffer and `complete` on the
+  boot timeline, so its time counts toward `complete` (up to 100 ms with no
+  controller and up to about 300 ms with no keyboard; not tested).
+- **Bytes and decoding:** the queue's producer is the boot CPU with
+  interrupts off (the IRQ handler, or the drain at unmask): it moves up to
+  16 waiting bytes into a lock-free single-producer, single-consumer queue
+  (`lumen-queue`, 256 bytes, host-tested; a full queue drops and counts),
+  discarding the second port's and counting (and discarding) the ones the
+  controller flags with a parity or timeout error (not tested).
+  `keyboard::read_char` (never blocks) decodes them under a lock with
+  `pc-keyboard` in the layout `lumen.keymap=` names, skipping keys that
+  make no character and counting bytes the decoder refuses (the
+  keyboard's overrun code among them). kmon reads the keyboard as well as
+  serial (and echoes on serial); `kbd` shows the layout, the route, the
+  interrupts taken, the bytes queued, dropped, undecoded, flagged, and
+  skipped during setup, or why there is no keyboard (and whether IRQ 1 was
+  routed); a non-zero skip count is also logged after init.
+- **Tests:** QMP `send-key` drives the keyboard (`Machine.type_text` and
+  `press`, which wait for kmon's echo of each key); a scenario boots with
+  `lumen.keymap=de` in an ISO built for it, and one presses a key over and
+  over from power-on until the keyboard is set up (some of those bytes are
+  skipped during setup).
+- **Not yet:** a blocking read for threads (the shell, #62), key releases
+  and modifiers for programs, LEDs, the second port (a mouse), and
+  hot-plug.
 
 ## 7. Driver interface (planned, M3+)
 
@@ -1001,7 +1079,7 @@ kernel. The kernel is the trusted computing base.
 |---|---|---|
 | Pure logic | `cargo test` on `no_std` crates | `crates/*` |
 | Kernel internals | `ktest!` in-kernel tests → TAP over serial → `isa-debug-exit` | anywhere in `kernel/src` |
-| Whole system | pytest scenarios: boot QEMU headless, `expect` on serial with timeouts, `send_line`, exit codes; run in parallel (pytest-xdist, one worker per CPU) | `tests/scenarios` |
+| Whole system | pytest scenarios: boot QEMU headless, `expect` on serial with timeouts, `send_line`, keys over QMP (`press`, `type_text`), exit codes; run in parallel (pytest-xdist, one worker per CPU) | `tests/scenarios` |
 | Screens | QMP `screendump` compared to golden PNG regions | `tests/golden` |
 | Codegen | `make audit`: disassembly and LLVM IR checks | `tools/harness/lumen_harness/audit.py` |
 | Harness itself | self-tests that the TAP parser, audit and image diff catch failures, and that the QEMU command line, artifact layout, CI wiring and status generation behave | `tests/harness` |
@@ -1023,9 +1101,10 @@ run's, which the job summary was built from) survives.
 
 ```
 kernel/            the kernel (bin crate, x86_64-unknown-none)
-  src/arch/        HAL; x86_64/ has gdt, idt, irq, context (thread switch), apic, pic, pit, serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
+  src/arch/        HAL; x86_64/ has gdt, idt, irq, context (thread switch), apic, pic, pit, i8042 (ports), serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
   src/acpi.rs      ACPI discovery (MADT, HPET) through lumen-acpi
-  src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs
+  src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs, routing ISA IRQs
+  src/keyboard.rs  the PS/2 keyboard: 8042 init, IRQ 1, decoding (pc-keyboard), lumen.keymap
   src/time.rs      TSC and local APIC timer calibration, the boot origin, now_ns, sleep, ticks
   src/smp.rs       starting the other CPUs, run_on
   src/sched.rs     kernel threads: per-CPU run queues, preemption, sleep, wait queues
@@ -1037,10 +1116,10 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/symbols.rs   kernel symbol table (symbolized crash reports)
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
-  src/kmon.rs      serial debug monitor (until the M2 shell)
+  src/kmon.rs      debug monitor on serial, typed on serial or the keyboard (until the M2 shell)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
-crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-time, ...)
+crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-time, lumen-queue, ...)
 boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml

@@ -26,13 +26,13 @@ tests = [
 ]
 
 [[feature]]
-name = "Interrupts on: 8259s masked, local APIC timer at 1 kHz, I/O APIC inputs masked; device interrupts are not fatal"
+name = "Interrupts on: 8259s masked, local APIC timer at 1 kHz, unrouted I/O APIC inputs masked; device interrupts are not fatal"
 milestone = "M1"
 tests = [
     "ktest:lumen_kernel::time::the_timer_is_programmed_for_1_khz",
     "ktest:lumen_kernel::time::the_timer_ticks_on_its_vector",
     "ktest:lumen_kernel::interrupts::controllers_are_masked",
-    "ktest:lumen_kernel::interrupts::ioapic_entries_read_back_as_written",
+    "ktest:lumen_kernel::interrupts::redirection_entry_roundtrip",
     "ktest:lumen_kernel::interrupts::redirection_entries_encode_the_madt_flags",
     "ktest:lumen_kernel::interrupts::device_vectors_are_not_fatal",
     "ktest:lumen_kernel::interrupts::mask_all_masks_an_unmasked_input",

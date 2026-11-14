@@ -225,8 +225,10 @@ pub struct IoApic {
     entries: u32,
 }
 
-/// The mask bit of an I/O APIC redirection entry.
-pub const REDIRECTION_MASKED: u64 = 1 << 16;
+/// The most inputs an I/O APIC can have that the kernel can address:
+/// IOREGSEL is 8 bits, and input `i`'s entry is registers `0x10 + 2i` and
+/// `0x11 + 2i`.
+pub const MAX_INPUTS: u32 = 120;
 
 const IOREGSEL: usize = 0x00;
 const IOWIN: usize = 0x10;
@@ -239,8 +241,7 @@ impl IoApic {
     /// for the kernel's whole life, and nothing else drives that I/O APIC.
     pub unsafe fn new(virt: u64) -> IoApic {
         let mut io = IoApic { base: virt, entries: 0 };
-        // IOREGSEL is 8 bits: entries past 119 can't be addressed.
-        io.entries = (((io.read(IOAPICVER) >> 16) & 0xff) + 1).min(120);
+        io.entries = (((io.read(IOAPICVER) >> 16) & 0xff) + 1).min(MAX_INPUTS);
         io
     }
 
@@ -265,40 +266,211 @@ impl IoApic {
         self.entries
     }
 
-    /// Redirection entry `i` (64 bits). Panics if there is no entry `i`.
-    pub fn entry(&mut self, i: u32) -> u64 {
+    /// Redirection entry `i`. Panics if there is no entry `i`.
+    pub fn entry(&mut self, i: u32) -> RedirectionEntry {
         assert!(i < self.entries, "I/O APIC has no input {i}");
-        u64::from(self.read(IOREDTBL + 2 * i)) | u64::from(self.read(IOREDTBL + 2 * i + 1)) << 32
+        let low = self.read(IOREDTBL + 2 * i);
+        let high = self.read(IOREDTBL + 2 * i + 1);
+        RedirectionEntry(u64::from(low) | u64::from(high) << 32)
     }
 
-    /// Set redirection entry `i`. Panics if there is no entry `i`.
-    pub fn set_entry(&mut self, i: u32, value: u64) {
+    /// Set redirection entry `i` (its read-only bits are ignored). Panics if
+    /// there is no entry `i`.
+    pub fn set_entry(&mut self, i: u32, entry: RedirectionEntry) {
         assert!(i < self.entries, "I/O APIC has no input {i}");
-        // Low word last: it holds the mask bit.
+        let value = entry.0 & !RedirectionEntry::READ_ONLY;
+        // High word first, low word last: the low word holds the mask bit, so
+        // a masked input is never unmasked with a half-written destination
+        // (retarget a live input by masking it first).
         self.write(IOREDTBL + 2 * i + 1, (value >> 32) as u32);
         self.write(IOREDTBL + 2 * i, value as u32);
+    }
+
+    /// Read entry `i`, change it with `f`, write it back (read-modify-write;
+    /// the caller holds `&mut self`, so nothing interleaves). Returns what
+    /// was written (the read-only bits clear). Panics if there is no entry
+    /// `i`.
+    pub fn update_entry(&mut self, i: u32, f: impl FnOnce(&mut RedirectionEntry)) -> RedirectionEntry {
+        let mut e = self.entry(i);
+        f(&mut e);
+        self.set_entry(i, e);
+        RedirectionEntry(e.0 & !RedirectionEntry::READ_ONLY)
     }
 
     /// Mask every input (entries keep their other fields).
     pub fn mask_all(&mut self) {
         for i in 0..self.entries {
-            let e = self.entry(i);
-            self.set_entry(i, e | REDIRECTION_MASKED);
+            self.update_entry(i, |e| e.set_masked(true));
         }
     }
 }
 
-/// An I/O APIC redirection entry: deliver `vector` to the CPU with APIC id
-/// `dest`, fixed delivery, physical destination, with the ISA override's
-/// polarity and trigger `flags` (MADT INTI flags: bits 0-1 polarity, 2-3
-/// trigger; 0 = the bus's default, edge/active-high for ISA), `masked` or not.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: the keyboard (M2)
-pub fn redirection(vector: u8, dest: u8, flags: u16, masked: bool) -> u64 {
-    let active_low = flags & 0b11 == 0b11;
-    let level = (flags >> 2) & 0b11 == 0b11;
-    u64::from(vector)
-        | u64::from(active_low) << 13
-        | u64::from(level) << 15
-        | if masked { REDIRECTION_MASKED } else { 0 }
-        | u64::from(dest) << 56
+/// How an I/O APIC input's interrupt is delivered (bits 8-10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    Fixed = 0b000,
+    LowestPriority = 0b001,
+    Smi = 0b010,
+    Nmi = 0b100,
+    Init = 0b101,
+    ExtInt = 0b111,
+}
+
+/// An input's polarity (bit 13).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Polarity {
+    ActiveHigh,
+    ActiveLow,
+}
+
+/// An input's trigger mode (bit 15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trigger {
+    Edge,
+    Level,
+}
+
+/// An I/O APIC redirection entry (Intel 82093AA datasheet, 3.2.4): what
+/// one input delivers, to whom and how. Built field by field; the I/O APIC
+/// itself sets the two read-only bits (remote IRR, delivery status), which
+/// [`IoApic::set_entry`] never writes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RedirectionEntry(u64);
+
+impl RedirectionEntry {
+    const VECTOR: u64 = 0xff;
+    const DELIVERY_SHIFT: u32 = 8;
+    const DELIVERY: u64 = 0b111 << Self::DELIVERY_SHIFT;
+    const LOGICAL: u64 = 1 << 11;
+    const DELIVERY_STATUS: u64 = 1 << 12;
+    const ACTIVE_LOW: u64 = 1 << 13;
+    const REMOTE_IRR: u64 = 1 << 14;
+    const LEVEL: u64 = 1 << 15;
+    const MASKED: u64 = 1 << 16;
+    const DEST_SHIFT: u32 = 56;
+    const DEST: u64 = 0xff << Self::DEST_SHIFT;
+    const READ_ONLY: u64 = Self::DELIVERY_STATUS | Self::REMOTE_IRR;
+
+    /// Masked, with every other field 0: vector 0, fixed delivery, physical
+    /// destination 0, active high, edge triggered.
+    pub const MASKED_DEFAULT: RedirectionEntry = RedirectionEntry(Self::MASKED);
+
+    /// An ISA interrupt (MADT INTI `flags`: bits 0-1 polarity, 2-3 trigger;
+    /// 0b00 is the bus's default, active high and edge for ISA, 0b11 is
+    /// active low or level) delivered as `vector` to the CPU with APIC id
+    /// `dest`: fixed delivery, physical destination, `masked` or not.
+    pub fn isa(vector: u8, dest: u8, flags: u16, masked: bool) -> RedirectionEntry {
+        let mut e = Self::MASKED_DEFAULT;
+        e.set_vector(vector);
+        e.set_destination(dest);
+        e.set_polarity(if flags & 0b11 == 0b11 { Polarity::ActiveLow } else { Polarity::ActiveHigh });
+        e.set_trigger(if (flags >> 2) & 0b11 == 0b11 { Trigger::Level } else { Trigger::Edge });
+        e.set_masked(masked);
+        e
+    }
+
+    /// The raw 64 bits.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests
+    pub fn bits(self) -> u64 {
+        self.0
+    }
+
+    fn set(&mut self, bit: u64, on: bool) {
+        if on {
+            self.0 |= bit;
+        } else {
+            self.0 &= !bit;
+        }
+    }
+
+    pub fn vector(self) -> u8 {
+        (self.0 & Self::VECTOR) as u8
+    }
+
+    pub fn set_vector(&mut self, vector: u8) {
+        self.0 = (self.0 & !Self::VECTOR) | u64::from(vector);
+    }
+
+    /// The delivery mode, or `None` for a reserved encoding.
+    pub fn delivery(self) -> Option<Delivery> {
+        let raw = (self.0 & Self::DELIVERY) >> Self::DELIVERY_SHIFT;
+        [Delivery::Fixed, Delivery::LowestPriority, Delivery::Smi, Delivery::Nmi, Delivery::Init, Delivery::ExtInt]
+            .into_iter()
+            .find(|&d| d as u64 == raw)
+    }
+
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests
+    pub fn set_delivery(&mut self, d: Delivery) {
+        self.0 = (self.0 & !Self::DELIVERY) | (d as u64) << Self::DELIVERY_SHIFT;
+    }
+
+    /// Whether the destination is a logical one (else a physical APIC id).
+    pub fn logical(self) -> bool {
+        self.0 & Self::LOGICAL != 0
+    }
+
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests
+    pub fn set_logical(&mut self, logical: bool) {
+        self.set(Self::LOGICAL, logical);
+    }
+
+    pub fn polarity(self) -> Polarity {
+        if self.0 & Self::ACTIVE_LOW != 0 { Polarity::ActiveLow } else { Polarity::ActiveHigh }
+    }
+
+    pub fn set_polarity(&mut self, p: Polarity) {
+        self.set(Self::ACTIVE_LOW, p == Polarity::ActiveLow);
+    }
+
+    pub fn trigger(self) -> Trigger {
+        if self.0 & Self::LEVEL != 0 { Trigger::Level } else { Trigger::Edge }
+    }
+
+    pub fn set_trigger(&mut self, t: Trigger) {
+        self.set(Self::LEVEL, t == Trigger::Level);
+    }
+
+    pub fn masked(self) -> bool {
+        self.0 & Self::MASKED != 0
+    }
+
+    pub fn set_masked(&mut self, masked: bool) {
+        self.set(Self::MASKED, masked);
+    }
+
+    /// The destination: a physical APIC id (or a logical set).
+    pub fn destination(self) -> u8 {
+        (self.0 >> Self::DEST_SHIFT) as u8
+    }
+
+    pub fn set_destination(&mut self, dest: u8) {
+        self.0 = (self.0 & !Self::DEST) | u64::from(dest) << Self::DEST_SHIFT;
+    }
+
+    /// Read-only: a level-triggered interrupt was accepted and awaits its
+    /// EOI.
+    pub fn remote_irr(self) -> bool {
+        self.0 & Self::REMOTE_IRR != 0
+    }
+
+    /// Read-only: an interrupt is waiting to be delivered.
+    pub fn delivery_pending(self) -> bool {
+        self.0 & Self::DELIVERY_STATUS != 0
+    }
+}
+
+impl core::fmt::Debug for RedirectionEntry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RedirectionEntry")
+            .field("vector", &self.vector())
+            .field("delivery", &self.delivery())
+            .field("logical", &self.logical())
+            .field("polarity", &self.polarity())
+            .field("trigger", &self.trigger())
+            .field("masked", &self.masked())
+            .field("destination", &self.destination())
+            .field("remote_irr", &self.remote_irr())
+            .field("delivery_pending", &self.delivery_pending())
+            .finish()
+    }
 }
