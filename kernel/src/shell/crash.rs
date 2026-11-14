@@ -27,6 +27,8 @@ pub const KINDS: &[&str] = &[
     "stack",
     "bigframe",
     "guard",
+    "relock",
+    "relocklog",
 ];
 
 /// Writes to serial and the screen, whichever shell ran the command (a
@@ -152,6 +154,8 @@ fn crash_fn(kind: &str) -> Option<fn()> {
         "guard" => crash_touch_guard,
         "stack" => crash_stack_overflow,
         "bigframe" => crash_big_frame_overflow,
+        "relock" => crash_relock,
+        "relocklog" => crash_relock_log,
         _ => return None,
     })
 }
@@ -370,6 +374,31 @@ fn recurse(depth: u64) -> u64 {
         return depth;
     }
     recurse(depth + 1) + frame[7]
+}
+
+/// Take a lock this CPU already holds: `SpinLock::lock` must panic (naming
+/// the lock and this CPU) instead of spinning forever with interrupts off.
+/// Says which lock first, so the test can compare the report with it.
+#[inline(never)]
+fn crash_relock() {
+    static RELOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+    let _ = writeln!(Out, "crash: locking the SpinLock at {:p} twice on cpu {}", &RELOCK, arch::cpu_index());
+    let first = RELOCK.lock();
+    let second = RELOCK.lock(); // the re-lock: panics here
+    // Only if `lock` handed the same lock out twice. A missed re-lock spins
+    // in `lock` instead: on CPU 0 serial goes quiet; from another CPU the
+    // shell says it hasn't finished.
+    drop((second, first));
+    let _ = writeln!(Out, "crash: SpinLock::lock returned while this cpu held it (mutual exclusion broken)");
+}
+
+/// Log while holding the log's line lock (`with_line_lock` forbids it):
+/// the logger's `lock` must report the re-lock, and the report, which never
+/// waits for that lock, must still come out whole.
+#[inline(never)]
+fn crash_relock_log() {
+    crate::klog::with_line_lock(|| log::info!(target: "crash", "logging under the line lock"));
+    let _ = writeln!(Out, "crash: logging under the line lock went unnoticed");
 }
 
 crate::ktest!(

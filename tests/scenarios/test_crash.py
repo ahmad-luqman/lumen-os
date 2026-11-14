@@ -8,8 +8,10 @@ QEMU with status 0 (`-no-reboot`), which fails these tests.
 import re
 
 import pytest
-from lumen_harness.crash import END, backtrace, page_walk
+from lumen_harness import REPO_ROOT
+from lumen_harness.crash import BEGIN, END, backtrace, page_walk
 from lumen_harness.image import assert_matches_golden
+from lumen_harness.qemu import EXIT_CRASH
 
 SCREEN_DONE = "(crash report shown on screen)"
 
@@ -146,3 +148,71 @@ def test_thread_stack_overflow_hits_its_guard(crash_report):
         re.MULTILINE,
     ), report
     assert re.search(r"^thread: shell-crash \(id \d+\)$", report, re.MULTILINE), report
+
+
+@pytest.mark.parametrize("cpu", ["0", "1"])
+def test_spinlock_relock_is_reported(boot, cpu):
+    # A CPU taking a lock it already holds panics instead of spinning
+    # forever with interrupts off: the report names the lock (the address
+    # `crash relock` printed first, and its type), the CPU, and the second
+    # `lock()`'s caller (track_caller: `crash_relock` in shell/crash.rs, not
+    # sync.rs). On CPU 1 too, so the CPU isn't a constant 0.
+    m = boot("qemutest", extra=["-smp", "2"])
+    m.expect(r"lumen> ", 60)
+    m.send_line(f"crash relock {cpu}")
+    said = m.expect(
+        r"crash: locking the SpinLock at (0x[0-9a-f]+) twice on cpu (\d+)\n"
+        rf"|crash: cpu {cpu} .*\n",  # the job never ran there
+        30,
+    )
+    assert said.group(1), said.group(0)
+    addr, said_cpu = said.groups()
+    assert said_cpu == cpu, said.group(0)
+    # A missed re-lock spins with interrupts off: on CPU 1 the shell says so
+    # after 10 s; on CPU 0 serial goes quiet (the expect times out).
+    done = m.expect(
+        rf"{re.escape(END)}|crash: SpinLock::lock returned .*|crash: cpu {cpu} took it but hasn't finished",
+        30,
+    )
+    assert done.group(0) == END, f"no crash: {done.group(0)}"
+    assert m.wait_exit(10) == EXIT_CRASH
+    out = m.output
+    report = out[out.index(BEGIN) : out.index(END) + len(END)]
+    assert (
+        f"\npanic: SpinLock<()> at {addr} re-locked on cpu {cpu}, which already holds it\n"
+        in report
+    ), report
+    assert f"\ncpu: {cpu} (lapic id {cpu})\n" in report, report
+    # The second `lock()`, the one marked in the source.
+    source = (REPO_ROOT / "kernel/src/shell/crash.rs").read_text().splitlines()
+    marked = [n for n, text in enumerate(source, 1) if "// the re-lock: panics here" in text]
+    assert len(marked) == 1, marked
+    assert re.search(rf"^  at kernel/src/shell/crash\.rs:{marked[0]}:\d+$", report, re.MULTILINE), (
+        report
+    )
+    frames = backtrace(report)
+    assert any("shell::crash::crash_relock" in f for f in frames), report
+    # A complete report from inside a held lock (interrupts off): no nested
+    # crash, then the heap line, `interrupts: off`, END.
+    assert "!!!" not in report, report
+    lines = report.splitlines()
+    assert lines[-3].startswith("heap: ") and lines[-2:] == ["interrupts: off", END], lines[-3:]
+
+
+def test_relock_of_the_log_lock_is_reported(crash_report):
+    # A real lock the crash path also writes near: logging inside
+    # `with_line_lock` re-locks the log's line lock. The report names it
+    # (the logger is the second caller) and is complete: the crash path
+    # never waits for that lock.
+    report = crash_report("relocklog")
+    assert re.search(
+        r"^panic: SpinLock<\(\)> at 0x[0-9a-f]+ re-locked on cpu 0, which already holds it$",
+        report,
+        re.MULTILINE,
+    ), report
+    assert re.search(r"^  at kernel/src/klog\.rs:\d+:\d+$", report, re.MULTILINE), report
+    frames = backtrace(report)
+    assert any("shell::crash::crash_relock_log" in f for f in frames), report
+    assert "!!!" not in report, report
+    lines = report.splitlines()
+    assert lines[-3].startswith("heap: ") and lines[-2:] == ["interrupts: off", END], lines[-3:]
