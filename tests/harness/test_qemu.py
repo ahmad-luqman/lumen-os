@@ -42,6 +42,46 @@ def test_tests_get_debug_exit_and_no_reboot():
     assert args[args.index("-monitor") + 1] == "none"
 
 
+def test_reboot_drops_no_reboot(tmp_path):
+    # Only the reboot scenarios let a reset boot the machine again.
+    assert "-no-reboot" not in qemu_args(opts(reboot=True))
+    m = Machine(Path("x.iso"), tmp_path, reboot=True)
+    assert "-no-reboot" not in qemu_args(m.options(Path("v.fd")))
+    assert "-no-reboot" in qemu_args(Machine(Path("x.iso"), tmp_path).options(Path("v.fd")))
+
+
+def test_machine_waits_for_events_with_scaled_timeouts(tmp_path, monkeypatch):
+    monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", "3")
+    m = Machine(Path("x.iso"), tmp_path)
+    waits = []
+
+    class FakeQmp:
+        def wait_event(self, name, timeout):
+            waits.append((name, timeout))
+            return {"event": name}
+
+    m._qmp = FakeQmp()  # type: ignore[assignment]
+    assert m.wait_event("SHUTDOWN", 10) == {"event": "SHUTDOWN"}
+    assert waits == [("SHUTDOWN", 30)]
+
+
+def test_machine_event_failures_show_the_serial_output(tmp_path):
+    from lumen_harness.qmp import QmpError
+
+    m = Machine(Path("x.iso"), tmp_path)
+    m._buf += b"last words from the guest\n"
+
+    class FakeQmp:
+        def wait_event(self, name, timeout):
+            raise QmpError(f"no {name} event")
+
+    m._qmp = FakeQmp()  # type: ignore[assignment]
+    with pytest.raises(
+        QmpError, match="(?s)no SHUTDOWN event.*last serial output.*last words from the guest"
+    ):
+        m.wait_event("SHUTDOWN", 1)
+
+
 def test_args_include_extra():
     args = qemu_args(opts(extra=["-smp", "4", "-device", "virtio-rng-pci"]))
     assert args[-4:] == ["-smp", "4", "-device", "virtio-rng-pci"]

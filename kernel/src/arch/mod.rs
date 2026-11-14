@@ -18,5 +18,5 @@ pub use self::x86_64::{
     idt::TrapFrame,
     init_ap, init_early, install_ist_stacks, irq, paging, percpu,
     percpu::{MAX_CPUS, index as cpu_index},
-    pic, pit, qemu, serial, set_ap_ist_stacks, stacks,
+    pic, pit, qemu, reset, serial, set_ap_ist_stacks, stacks,
 };

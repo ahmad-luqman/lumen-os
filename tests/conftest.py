@@ -71,7 +71,8 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
     `cmdline` to the kernel's, e.g. `cmdline="lumen.keymap=de"`, in an ISO
     built for this test in its artifacts directory (so parallel tests don't
     share one; `qemutest` and `ktest` only). `serial=False` boots without a
-    serial port (keyboard, screendumps and the exit code only)."""
+    serial port (keyboard, screendumps and the exit code only). `reboot=True`
+    lets a reset boot the machine again (no `-no-reboot`)."""
     machines: list[Machine] = []
 
     def _boot(
@@ -80,6 +81,7 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
         extra: Sequence[str] = (),
         cmdline: str | None = None,
         serial: bool = True,
+        reboot: bool = False,
     ) -> Machine:
         iso = ISOS[variant]
         if not iso.exists():
@@ -91,7 +93,9 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
             subprocess.run(
                 [REPO_ROOT / "tools" / "mkiso.sh", KERNELS[variant], iso, *words], check=True
             )
-        m = Machine(iso, sub, trace_interrupts=True, extra_args=extra, serial=serial).start()
+        m = Machine(
+            iso, sub, trace_interrupts=True, extra_args=extra, serial=serial, reboot=reboot
+        ).start()
         machines.append(m)
         return m
 

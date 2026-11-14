@@ -279,11 +279,63 @@ missing or broken HPET alone is a warning (`no usable HPET: ...`) and leaves
 `hpet` empty. A table skipped while looking for another is warned about too
 (`skipped the table at 0x...: ...`).
 
+### Reboot and power-off (built in M2)
+
+`acpi::init` also reads what powering off takes into `acpi::Info::power_off`:
+the FADT's PM1a and PM1b control blocks (each from its 64-bit `X_` field
+when the table has it and its address isn't 0, which must then be in I/O
+space, else from the 32-bit field; a hardware-reduced machine has no PM1
+blocks, only a sleep control register, which isn't supported), the DSDT
+(required), and how to switch to ACPI mode (`AcpiMode`: always, when there
+is no SMI command port; ask, writing `ACPI_ENABLE` to it; or unusable, when
+`ACPI_ENABLE` is 0 or the port doesn't fit 16 bits). The DSDT's `\_S5_`
+package gives the S5 sleep type values: no AML interpreter builds on stable
+Rust, so `SleepType::s5_from_dsdt` searches the DSDT's bytes for `_S5_`
+after a `NameOp` (past one `\` or any number of `^` prefixes) naming a
+`PackageOp` whose length fits the table, and decodes its first two integer
+constants (each at most 7; a single value holds both in its low two bytes,
+with nothing above them); if none decodes, the error counts the
+`Name (_S5_, ...)` found and gives the first one's AML offset and why. The
+ports come out as `Pm1Control` and `AcpiEnable`, which only `Fadt::parse`
+makes, from a checksummed FACP table, and the values as `SlpTyp` (checked to
+fit 3 bits); `arch::reset` writes the ACPI registers only through those, with
+values from `lumen_acpi::pm1_control_value` (host-tested: SLP_TYP replaced,
+SLP_EN only on the second write, other bits kept). A missing or broken FADT,
+DSDT or `_S5_` is a warning at boot (`no ACPI power-off: ...`), as is an
+unusable way to ask for ACPI mode, and the reason is kept for `shutdown`;
+boot goes on. (The parse errors are host-tested; the boot warnings are not
+tested: QEMU's tables are fine.)
+
+The shell's `shutdown` (`power.rs`) says `shutdown: powering off`, logs
+`INFO  power: powering off: ACPI S5, ...`, and with interrupts off asks the
+firmware for ACPI mode if SCI_EN is clear (the SMI command, or a warning
+naming why it can't; not tested: OVMF leaves q35 in ACPI mode), writes
+SLP_TYP into PM1a (and PM1b, not tested: q35 has none), then SLP_EN. Only
+SLP_TYP 0 is exercised in QEMU (q35's `_S5_` is four Zeros). If the machine
+is still on half a second later it warns and says why (`shutdown: can't
+power off: still on after ACPI S5 (...)`; not tested), as it does when ACPI
+gave no way to power off (not tested). `reboot`, interrupts off for good,
+logs `INFO  power: rebooting: reset through port 0xcf9` and writes a full
+reset to the reset control register (0xCF9); half a second later (a warning
+first) it pulses the reset line through the 8042 (command 0xFE, after a
+bounded wait for it to be ready; the warning says if it never was), and half
+a second after that loads an empty IDT and takes `int3` (#GP, #DF, then a
+shutdown: a triple fault, which resets the machine). `lumen.reboot=8042` or
+`lumen.reboot=triple` starts at a later method, which is how the scenarios
+test the fallbacks (q35 always takes 0xCF9's reset); an unknown value starts
+at 0xCF9 with a warning (tested). The reboot scenarios run QEMU without
+`-no-reboot` (the banner appears twice, the log shows which method did it,
+and under TCG `qemu.log` shows a triple fault only for that method); the
+power-off one accepts QEMU's exit status 0 only with a QMP `SHUTDOWN` event
+whose reason is `guest-shutdown` (a triple fault under `-no-reboot` also
+exits with 0, but as `guest-reset`).
+
 Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 `isa-debug-exit`, used by tests), `lumen.log=<error|warn|info|debug|trace>`
 and `lumen.keymap=<us|uk|de|fr|no|se|jp|dvorak|colemak>` (the keyboard's
 layout, section 6; `us` by default and for a name it doesn't know, with a
-warning) and `lumen.ansi` (the serial shell edits with escape codes, its
+warning), `lumen.reboot=<cf9|8042|triple>` (the first way `reboot` tries;
+see "Reboot and power-off") and `lumen.ansi` (the serial shell edits with escape codes, its
 terminal taken to be 80 columns wide; plain text without it, section 6,
 "Shell").
 
@@ -1043,7 +1095,8 @@ the deliberate faults, `crash.rs`).
   `clear`, `colors`, `seq`, `sleep`, `uptime`, `clocks`, `exit` (kmon's;
   besides what this list says, the deliberate panic now says `from the
   shell`, and `crash <kind> <cpu>` reports a fault that returned) and
-  `history` (the console's lines, numbered). Each writes to the console that ran it. On plain serial,
+  `history` (the console's lines, numbered), `reboot` and `shutdown` (see
+  "Reboot and power-off" in section 4). Each writes to the console that ran it. On plain serial,
   `colors` and `clear` say the console is plain (tested), and with
   `lumen.ansi` they work there (tested). A `crash` whose fault doesn't
   happen says so on serial and the screen (the screen not tested). `crash <kind> <cpu>` waits, asleep and allocating nothing,
@@ -1406,7 +1459,9 @@ kernel. The kernel is the trusted computing base.
 | Feature gate | every feature in `tests/features/*.toml` must pass (CI); `docs/STATUS.md` generated from the same data | `make status-check`, `make status` |
 
 QEMU exit codes: 33 = tests passed, 35 = a test failed, 37 = crash report.
-A triple fault exits with 0 (`-no-reboot`) and therefore fails. Each scenario
+A triple fault exits with 0 (`-no-reboot`) and therefore fails; the power-off
+scenario alone accepts 0, with a QMP `SHUTDOWN` event whose reason is
+`guest-shutdown`. Each scenario
 keeps `serial.log`, `qemu.log` (`-d int,cpu_reset,guest_errors`),
 `cmdline.txt`, `environment.txt` (QEMU version, accelerator, OVMF version) and
 screenshots when it fails, in `build/test-artifacts/<module>/<test>/`, and CI
@@ -1421,8 +1476,9 @@ run's, which the job summary was built from) survives.
 
 ```
 kernel/            the kernel (bin crate, x86_64-unknown-none)
-  src/arch/        HAL; x86_64/ has gdt, idt, irq, context (thread switch), apic, pic, pit, i8042 and cmos (ports), serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
-  src/acpi.rs      ACPI discovery (MADT, HPET) through lumen-acpi
+  src/arch/        HAL; x86_64/ has gdt, idt, irq, context (thread switch), apic, pic, pit, i8042 and cmos (ports), reset (reset and PM1 registers), serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
+  src/acpi.rs      ACPI discovery (MADT, HPET, FADT and the DSDT's _S5_) through lumen-acpi
+  src/power.rs     reboot (0xCF9, 8042, triple fault) and ACPI S5 power-off
   src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs, routing ISA IRQs
   src/keyboard.rs  the PS/2 keyboard: 8042 init, IRQ 1, decoding (pc-keyboard), lumen.keymap
   src/time.rs      TSC and local APIC timer calibration, the boot origin, now_ns, sleep, ticks
