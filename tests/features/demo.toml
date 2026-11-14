@@ -1,7 +1,7 @@
 # Features: demo. See tests/features/README.md for the format.
 
 [[feature]]
-name = "Demo logic (lumen-demo, in the kernel with audit passing): the Mandelbrot set in fixed-point integers (agreeing with floating point but for boundary points, never overflowing) and its colours; Conway's Game of Life on a grid with a dead edge (gliders move, oscillators oscillate, the glider gun fires every 30 generations) and its seed patterns"
+name = "Demo logic (lumen-demo, in the kernel with audit passing): the Mandelbrot set in fixed-point integers (agreeing with floating point but for boundary points; no overflow for any point, extreme screens' every pixel and i64's extremes included) and its colours; rows dealt to CPUs in bands, each once; Conway's Game of Life on a grid with a dead edge (the B3/S23 rules for every neighbour count, gliders and spaceships move, the glider gun fires every 30 generations, agreeing with an endless plane away from the edge) and its seed patterns (matching their published RLE, placed where they have room)"
 milestone = "M2"
 tests = [
     "cargo:lumen-demo",
@@ -17,10 +17,11 @@ tests = [
 ]
 
 [[feature]]
-name = "`life [pattern] [n]` runs Conway's Game of Life on the screen (glider, glider gun, lightweight spaceship, R-pentomino, acorn) with a status line: exactly n generations then held until a key, or 20 a second until a key; an unknown pattern lists them"
+name = "`life [pattern] [generations]` runs Conway's Game of Life on the screen (glider, glider gun, lightweight spaceship, R-pentomino, acorn; default gun) with a status line: with a count, that many generations (a key ends it early) then held until a key; without, at most 20 a second until a key; each pattern's population matches an endless plane; a bad argument is named"
 milestone = "M2"
 tests = [
     "scenario:test_demo::test_life_glider_golden",
     "scenario:test_demo::test_life_runs_until_a_key",
-    "scenario:test_demo::test_life_usage_lists_the_patterns",
+    "scenario:test_demo::test_life_usage_names_the_bad_argument",
+    "scenario:test_demo::test_every_pattern_runs_as_on_a_plane",
 ]

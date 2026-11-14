@@ -1,18 +1,46 @@
-//! Conway's Game of Life on a `width` x `height` grid whose outside is dead
-//! (a glider leaving it dies at the edge; nothing wraps around).
+//! Conway's Game of Life on a `width` x `height` grid whose outside counts
+//! as dead: nothing wraps around (a glider reaching the edge ends as a
+//! still block there).
 
 use alloc::vec;
 use alloc::vec::Vec;
 
-/// A seed pattern: its rows, `O` alive and anything else dead.
+/// Where a pattern starts on the grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// [`ORIGIN`] cells in from the top-left corner (heading down-right).
+    TopLeft,
+    /// In the middle (room to grow every way).
+    Centre,
+    /// [`ORIGIN`] cells in from the right edge, halfway down (heading left).
+    Right,
+}
+
+/// How far in from the edges a pattern placed at a side starts, in cells.
+pub const ORIGIN: usize = 4;
+
+/// A seed pattern: its rows, `O` alive and anything else dead, and where it
+/// starts.
 #[derive(Clone, Copy, Debug)]
 pub struct Pattern {
     pub name: &'static str,
     pub about: &'static str,
     pub rows: &'static [&'static str],
+    pub place: Place,
 }
 
 impl Pattern {
+    /// Its top-left cell on a `width` x `height` grid (see [`Place`]).
+    pub fn origin(&self, width: usize, height: usize) -> (usize, usize) {
+        let (w, h) = self.size();
+        let middle = |grid: usize, size: usize| grid.saturating_sub(size) / 2;
+        match self.place {
+            Place::TopLeft => (ORIGIN, ORIGIN),
+            Place::Centre => (middle(width, w), middle(height, h)),
+            Place::Right => (width.saturating_sub(w + ORIGIN), middle(height, h)),
+        }
+    }
+
     /// Its size in cells: (width, height).
     pub fn size(&self) -> (usize, usize) {
         (self.rows.iter().map(|r| r.len()).max().unwrap_or(0), self.rows.len())
@@ -27,9 +55,17 @@ impl Pattern {
     }
 }
 
+/// The patterns' names, as [`PATTERNS`] has them (for completion).
+pub const NAMES: [&str; 5] = ["glider", "gun", "lwss", "rpentomino", "acorn"];
+
 /// The patterns the `life` command knows, by name.
 pub const PATTERNS: &[Pattern] = &[
-    Pattern { name: "glider", about: "the smallest spaceship, moving diagonally", rows: &[".O.", "..O", "OOO"] },
+    Pattern {
+        name: "glider",
+        about: "the smallest spaceship, heading down-right (a block at the edge)",
+        rows: &[".O.", "..O", "OOO"],
+        place: Place::TopLeft,
+    },
     Pattern {
         name: "gun",
         about: "Gosper's glider gun: a new glider every 30 generations",
@@ -44,21 +80,25 @@ pub const PATTERNS: &[Pattern] = &[
             "...........O...O....................",
             "............OO......................",
         ],
+        place: Place::TopLeft,
     },
     Pattern {
         name: "lwss",
-        about: "the lightweight spaceship, moving sideways",
+        about: "the lightweight spaceship, heading left from the right edge",
         rows: &[".O..O", "O....", "O...O", "OOOO."],
+        place: Place::Right,
     },
     Pattern {
         name: "rpentomino",
-        about: "five cells that settle after 1103 generations",
+        about: "five cells that grow chaotically (1103 generations on an endless plane)",
         rows: &[".OO", "OO.", ".O."],
+        place: Place::Centre,
     },
     Pattern {
         name: "acorn",
-        about: "seven cells that grow for 5206 generations",
+        about: "seven cells that grow for 5206 generations on an endless plane",
         rows: &[".O.....", "...O...", "OO..OOO"],
+        place: Place::Centre,
     },
 ];
 
@@ -111,7 +151,7 @@ impl Life {
     /// `y`); cells falling outside the grid are left out.
     pub fn place(&mut self, pattern: &Pattern, x: usize, y: usize) {
         for (dx, dy) in pattern.cells() {
-            self.set(x + dx, y + dy, true);
+            self.set(x.saturating_add(dx), y.saturating_add(dy), true);
         }
     }
 
