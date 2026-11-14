@@ -374,8 +374,10 @@ static CURRENT: [AtomicPtr<Thread>; MAX_CPUS] = [const { AtomicPtr::new(ptr::nul
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// Every thread not yet dropped (weakly: the registry keeps none alive).
 /// Pruned of the dropped ones whenever a thread is created. Nothing else is
-/// locked while it is held but the heap (which it allocates from, so it
-/// must never be taken under the heap's or the page tables' locks).
+/// locked while it is held but the heap (which it allocates from, and which
+/// takes the page tables' and the frame allocator's locks to grow), so it
+/// must never be taken under the heap's, the page tables' or the frame
+/// allocator's locks.
 static THREADS: SpinLock<Vec<Weak<Thread>>> = SpinLock::new(Vec::new());
 /// Ticks each CPU's scheduler has taken (from its start), and how many of
 /// them found the idle thread running. A tick is counted in `TICKED` before
@@ -423,7 +425,7 @@ pub fn threads() -> Vec<ThreadInfo> {
         .collect()
 }
 
-/// CPU `cpu`'s scheduler ticks, and those that found it idle.
+/// A CPU's scheduler ticks, and those that found it idle.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CpuTicks {
     pub ticks: u64,
@@ -431,13 +433,16 @@ pub struct CpuTicks {
 }
 
 impl CpuTicks {
-    /// The ticks taken since `earlier` (a reading of the same CPU).
+    /// The ticks taken since `earlier` (a reading of the same CPU). Each
+    /// reading has idle <= ticks, but two readings' differences need not
+    /// (an earlier reading's ticks may include idle ticks it didn't see):
+    /// the idle ticks are clamped to the ticks.
     pub fn since(self, earlier: CpuTicks) -> CpuTicks {
-        CpuTicks { ticks: self.ticks.saturating_sub(earlier.ticks), idle: self.idle.saturating_sub(earlier.idle) }
+        let ticks = self.ticks.saturating_sub(earlier.ticks);
+        CpuTicks { ticks, idle: self.idle.saturating_sub(earlier.idle).min(ticks) }
     }
 
-    /// How busy the CPU was over these ticks, in whole percent (idle ticks
-    /// past the ticks count as all idle).
+    /// How busy the CPU was over these ticks, in whole percent.
     pub fn busy_percent(self) -> u64 {
         lumen_time::busy_percent(self.ticks, self.idle)
     }
@@ -447,6 +452,8 @@ impl CpuTicks {
 pub fn cpu_ticks(cpu: usize) -> CpuTicks {
     match (TICKED.get(cpu), IDLE_TICKS.get(cpu)) {
         (Some(t), Some(i)) => {
+            // Idle first (acquiring what `tick` released with it), then the
+            // ticks, which are then at least as many as the idle ticks seen.
             let idle = i.load(Ordering::Acquire);
             CpuTicks { ticks: t.load(Ordering::Relaxed), idle }
         }
@@ -697,9 +704,11 @@ fn finish_switch(cpu: usize) {
 }
 
 /// The timer interrupt on this CPU (interrupts off, EOI sent): the first
-/// tick of an armed CPU starts its scheduler; after that, wake the sleepers
-/// whose deadline has passed, and switch threads if another is ready and
-/// the running one's slice is used up (or the idle thread runs).
+/// tick of an armed CPU starts its scheduler; after that, count the tick
+/// (against the running thread, and as idle if that is the idle thread),
+/// wake the sleepers whose deadline has passed, and switch threads if
+/// another is ready and the running one's slice is used up (or the idle
+/// thread runs).
 pub fn tick() {
     let cpu = arch::cpu_index();
     if !running_on(cpu) {
@@ -970,20 +979,25 @@ fn last_cpu() -> Result<usize, &'static str> {
 
 crate::ktest!(
     fn busy_and_idle_ticks_are_counted() {
-        // On the last CPU: a thread spinning there for 100 ms makes that
-        // span read busy, then 100 ms with nothing to run there reads idle.
+        // On the last CPU: a thread spinning there for 100 ms reads that
+        // span busy (it reads the CPU's ticks itself at its start and end,
+        // so the span is only its spinning), then 100 ms with nothing to run
+        // there reads idle.
         use crate::kassert;
         const SPAN_NS: u64 = 100_000_000;
         let cpu = last_cpu()?;
-        let before = cpu_ticks(cpu);
-        let spinner = spawn_test(cpu, "busy-test", || {
+        let span: Arc<SpinLock<Option<CpuTicks>>> = Arc::new(SpinLock::new(None));
+        let result = span.clone();
+        let spinner = spawn_test(cpu, "busy-test", move || {
+            let start = cpu_ticks(cpu);
             let end = time::now_ns() + SPAN_NS;
             while time::now_ns() < end {
                 core::hint::spin_loop();
             }
+            *result.lock() = Some(cpu_ticks(cpu).since(start));
         })?;
         join_bounded(spinner)?;
-        let busy = cpu_ticks(cpu).since(before);
+        let busy = span.lock().ok_or("the spinner didn't report")?;
         let before = cpu_ticks(cpu);
         time::sleep(SPAN_NS);
         let idle = cpu_ticks(cpu).since(before);

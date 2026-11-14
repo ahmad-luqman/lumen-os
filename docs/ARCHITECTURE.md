@@ -1109,7 +1109,8 @@ the deliberate faults, `crash.rs`).
   damage, which the tests compare with the report's.
 - **System commands** (`sysinfo.rs`; each a `<name>: ...` header and,
   but for `date`, rows; output with rows is made into one string first
-  and written in one write, except `dmesg`, which writes 512-byte chunks):
+  and written in one write, except `dmesg`, which writes whole lines in
+  chunks of about 512 bytes):
   - `cpus`: each CPU online, its local APIC id, whether its scheduler
     runs, the ticks it has taken and how busy it has been since it
     started (the share of ticks that didn't find the idle thread running:
@@ -1140,19 +1141,22 @@ the deliberate faults, `crash.rs`).
   - `date`: the CMOS RTC (`rtc.rs`; ports in `arch::cmos`, whose guard
     serializes index/data pairs; reading register C would acknowledge RTC
     interrupts, and every index write leaves NMIs enabled): wait out an
-    update in progress (at most 10 ms per read; 0xff means no clock), read
+    update in progress (at most 10 ms per read; 0xff means no clock, a
+    divider other than the running one a stopped oscillator), read
     until two reads agree (at most 5 reads), refuse a clock that lost
     power (status D) or whose updates are halted (status B's SET), decode
     BCD or binary and 12- or 24-hour hours (all in `lumen_time::rtc`,
     host-tested; a decode failure is logged with the raw registers). The
-    clock's zone is whatever set it: QEMU's `-rtc base=utc` in every test;
-    Lumen never writes the clock. The century is taken as 20xx (the FADT's
+    clock's zone is whatever set it; `date` takes it as UTC (true under
+    QEMU's `-rtc base=utc`, in every test); Lumen never writes the clock. The century is taken as 20xx (the FADT's
     century register isn't read). QEMU's RTC ticks on a phase of its own:
-    measured, it reads 1 to 2 s behind the host's clock, which the test
-    allows.
+    measured, it reads 1 to 2 s behind the host's clock; the test checks
+    it is no later than the host's clock and at most 3 s behind its whole
+    second.
   - `top [frames]`: every second, the CPUs (busy % and ticks per second
     over the last second; `stalled` for one that took no tick, not
-    tested), interrupts per second by vector, the heap and frames, and
+    tested), interrupts per second by vector (from 32 on), the heap and
+    frames, and
     every thread with its share of its CPU's ticks; it polls the console
     for a key (`Ctx::poll_key`) between 20 ms sleeps and stops on `q` or
     Ctrl-C (or after `frames` frames). The scenario checks frames 0.9 to
@@ -1488,7 +1492,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/cmdline.rs   kernel command line (flags, key=value)
   src/sync.rs      SpinLock (interrupts off while held)
   src/klog.rs      logger (levels, subsystem tags, serial timestamps, the ring dmesg reads)
-  src/rtc.rs       the CMOS RTC: date and time (UTC) for `date`
+  src/rtc.rs       the CMOS RTC: date and time (taken as UTC) for `date`
   src/fb.rs        framebuffer: pixels, glyphs, the hello screen, the crash screen
   src/term.rs      the terminal on the framebuffer (lumen-term): drawing changed cells, log lines, the cursor
   src/symbols.rs   kernel symbol table (symbolized crash reports)

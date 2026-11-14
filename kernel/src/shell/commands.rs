@@ -1,7 +1,8 @@
 //! The shell's commands: kmon's, with their names and output (`echo`
 //! joins its words with single spaces; `clear` and `colors` need a console
-//! that takes escape codes), plus `history`, `term text`, `reboot` and
-//! `shutdown`. A table the
+//! that takes escape codes), plus `history`, `term text`, `reboot`,
+//! `shutdown` and the system commands (`cpus`, `mem`, `irqs`, `dmesg`,
+//! `date`, `top`: `sysinfo.rs`). A table the
 //! line editor completes from. Each writes to the console that ran it.
 
 use super::{Ctx, crash, sysinfo};
@@ -87,7 +88,13 @@ pub static COMMANDS: Table<Run> = Table(&[
         about: "the newest log lines, as serial printed them",
         run: sysinfo::dmesg,
     },
-    Command { name: "date", args: &[], usage: "", about: "the date and time from the RTC (UTC)", run: sysinfo::date },
+    Command {
+        name: "date",
+        args: &[],
+        usage: "",
+        about: "the date and time from the RTC (taken as UTC)",
+        run: sysinfo::date,
+    },
     Command {
         name: "top",
         args: &[],

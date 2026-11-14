@@ -78,7 +78,7 @@ tests = [
 ]
 
 [[feature]]
-name = "`date` reads the CMOS RTC (waits out an update, bounded; two agreeing reads; BCD or binary, 12 or 24 hours; a clock that lost power or is halted refused), in UTC under QEMU's `-rtc base=utc`, within 2 s of the host's clock at its one-second resolution"
+name = "`date` reads the CMOS RTC (waits out an update, bounded; two agreeing reads; BCD or binary, 12 or 24 hours; a clock that lost power or is halted refused), taken as UTC (QEMU's `-rtc base=utc`): no later than the host's clock and at most 3 s behind its whole second"
 milestone = "M2"
 tests = [
     "scenario:test_shell::test_date_matches_host",

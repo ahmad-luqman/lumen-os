@@ -148,7 +148,7 @@ own PR that updates that doc first.
   help line; the system ones in `sysinfo.rs`) and deliberate faults (`crash.rs`). `fb.rs`:
   framebuffer pixels, the header and the crash screen. `term.rs`: the
   terminal on the framebuffer (log lines, the screen's shell, scrollback, `view_text`, and
-  `Canvas`: the pixels below the header for one command, the terminal paused meanwhile). `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`). `symbols.rs`: symbol lookup.
+  `Canvas`: the pixels below the header for one command, the terminal paused meanwhile). `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.

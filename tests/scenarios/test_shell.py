@@ -6,6 +6,7 @@ editor, word splitting and completion are tested on the host
 both consoles."""
 
 import re
+from collections.abc import Sequence
 
 import pytest
 from lumen_harness.qemu import Machine, default_accel
@@ -14,8 +15,8 @@ from lumen_harness.screen import PROMPT, expect_screen, read_screen
 SHELLS = r"INFO  shell: shells on serial and the screen; type 'help'\n"
 
 
-def shells(boot, cmdline: str | None = None) -> Machine:
-    m = boot("qemutest", cmdline=cmdline)
+def shells(boot, cmdline: str | None = None, extra: Sequence[str] = ()) -> Machine:
+    m = boot("qemutest", cmdline=cmdline, extra=extra)
     m.expect(SHELLS, 60)
     m.expect(PROMPT, 60)
     return m
@@ -260,9 +261,7 @@ def test_system_commands(boot):
     # Each system command prints its header and at least one row, on serial
     # in plain text; under -smp 2 both CPUs are listed, the keyboard's input
     # (GSI 1) is decoded as routed and unmasked, the timer's vector counts.
-    m = boot("qemutest", extra=["-smp", "2"])
-    m.expect(SHELLS, 60)
-    m.expect(PROMPT, 60)
+    m = shells(boot, extra=["-smp", "2"])
     start = len(m.output)
     out = run(m, "help")
     assert out.startswith("commands:\n")
@@ -297,8 +296,9 @@ def test_system_commands(boot):
 
     out = run(m, "dmesg")
     assert re.match(r"dmesg: the newest \d+ log lines \(all since boot\)\n", out), out
-    # Only whole lines, the first the boot banner.
-    assert out.endswith("\n") and "\n[    ?.??????] INFO  boot: Lumen " in out, out
+    # Only whole lines, the first of them the boot banner.
+    lines = out.splitlines()
+    assert out.endswith("\n") and lines[1].startswith("[    ?.??????] INFO  boot: Lumen "), out
     assert re.search(
         r"^\[\s*\d+\.\d{6}\] INFO  shell: shells on serial and the screen", out, re.MULTILINE
     ), out
@@ -317,11 +317,11 @@ def test_system_commands(boot):
 
 def test_date_matches_host(boot):
     # `date` reads the RTC, which QEMU keeps in UTC (`-rtc base=utc`) from
-    # the host's clock: within 2 s of the host's time while it ran. The RTC
+    # the host's clock: no later than the host's clock when it printed, and
+    # at most 3 s behind the host's whole second when it was sent. The RTC
     # counts whole seconds, and QEMU's ticks on a phase of its own: measured
-    # here it reads 1 to 2 s behind the host, so at most 2 s behind the
-    # host's whole seconds when the command was sent (3 allowed, in case
-    # another QEMU truncates once more).
+    # here it reads 1 to 2 s behind the host (3 allowed, in case another
+    # QEMU truncates once more).
     from datetime import UTC, datetime
 
     m = shells(boot)
@@ -340,23 +340,30 @@ def test_top_refreshes_and_quits(boot):
     # how busy, interrupt rates, the heap, the threads), until `q`. Under
     # -smp 2: frames 0.9 to 1.5 s apart by the kernel's own clock, and each
     # CPU's timer at about 1 kHz.
-    m = boot("qemutest", extra=["-smp", "2"])
-    m.expect(SHELLS, 60)
-    m.expect(PROMPT, 60)
+    m = shells(boot, extra=["-smp", "2"])
     start = len(m.output)
     m.send_line("top")
-    header = r"top: frame {}, up (\d+\.\d) s, 2 CPUs; q quits\n"
+    header = r"top: frame {}, up (\d+)\.(\d) s, 2 CPUs; q quits\n"
     first = m.expect(header.format(1), 15)
     second = m.expect(header.format(2), 15)
     third = m.expect(header.format(3), 15)
-    assert 0.9 <= float(second[1]) - float(first[1]) <= 1.5, (first[1], second[1])
-    assert 0.9 <= float(third[1]) - float(second[1]) <= 1.5, (second[1], third[1])
+
+    def tenths(frame: re.Match[str]) -> int:
+        return int(frame[1]) * 10 + int(frame[2])
+
+    assert 9 <= tenths(second) - tenths(first) <= 15, (first[0], second[0])
+    assert 9 <= tenths(third) - tenths(second) <= 15, (second[0], third[0])
     frame = m.output[second.end() : third.start()]
     assert re.search(r"^\s+0\s+\d+%\s+\d+$", frame, re.MULTILINE), frame
+    # The AP's ticks/s about half the timers' interrupts/s (two CPUs), each
+    # CPU's at most 1.5 kHz and at least 200 Hz (TCG under load ticks at
+    # ~800 Hz).
     ap = re.search(r"^\s+1\s+\d+%\s+(\d+)$", frame, re.MULTILINE)
-    assert ap and 500 <= int(ap[1]) <= 1500, frame
     timer = re.search(r"^  irqs/s: .*local APIC timer (\d+)", frame, re.MULTILINE)
-    assert timer and 500 <= int(timer[1]) / 2 <= 1500, frame
+    assert ap and timer, frame
+    per_cpu = int(timer[1]) / 2
+    assert 200 <= int(ap[1]) <= 1500 and 200 <= per_cpu <= 1500, frame
+    assert abs(int(ap[1]) - per_cpu) <= per_cpu / 2, frame
     assert re.search(r"^  heap .* used of .* in \d+ allocations; frames ", frame, re.MULTILINE), (
         frame
     )

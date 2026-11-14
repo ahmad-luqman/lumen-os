@@ -278,8 +278,9 @@ static UNEXPECTED_IRQS: AtomicU64 = AtomicU64::new(0);
 static LAPIC_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Every local APIC error status bit seen so far.
 static LAPIC_ERRORS_SEEN: AtomicU32 = AtomicU32::new(0);
-/// Interrupts taken on each vector, all CPUs together (the shell's `irqs`
-/// and `top`). Exceptions are counted too (all but #BP are fatal).
+/// Interrupts taken on each vector, all CPUs together. Exceptions are
+/// counted too (all but #BP are fatal); the shell's `irqs` and `top` show
+/// vectors from 32 on.
 static VECTOR_COUNTS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
 /// How many I/O APIC vectors there are.
 const IOAPIC_VECTORS: usize = (IOAPIC_LAST - IOAPIC_BASE) as usize + 1;

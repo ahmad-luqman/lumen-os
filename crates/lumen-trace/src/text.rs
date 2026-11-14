@@ -21,7 +21,7 @@ impl<const N: usize> Default for TextRing<N> {
 
 impl<const N: usize> TextRing<N> {
     pub const fn new() -> Self {
-        assert!(N > 0);
+        const { assert!(N > 0) };
         TextRing { buf: [0; N], written: 0 }
     }
 
@@ -58,9 +58,10 @@ impl<const N: usize> TextRing<N> {
 
     /// Copy the newest whole lines held that fit into `out`, oldest first;
     /// returns how many bytes. A whole line starts where writing started or
-    /// just after a `\n`, and ends with its `\n`: the oldest bytes of a full
-    /// ring (a line whose start was overwritten) and a last line still being
-    /// written (no `\n` yet) are left out.
+    /// just after a `\n` that is still held, and ends with its `\n`: the
+    /// oldest bytes of a full ring (a line whose start was overwritten; also
+    /// when the overwritten byte was a `\n`, which can't be told) and a last
+    /// line still being written (no `\n` yet) are left out.
     pub fn copy_lines(&self, out: &mut [u8]) -> usize {
         let len = self.len();
         let Some(end) = (0..len).rev().find(|&i| self.byte(i) == b'\n').map(|nl| nl + 1) else {
@@ -71,11 +72,9 @@ impl<const N: usize> TextRing<N> {
         // feed at or past `start - 1`.
         let at_beginning = start == 0 && self.written == len as u64;
         if !at_beginning {
+            // (Byte `end - 1` is a line feed, so one is always found.)
             let from = start.saturating_sub(1);
-            match (from..end).find(|&i| self.byte(i) == b'\n') {
-                Some(nl) => start = nl + 1,
-                None => return 0,
-            }
+            start = (from..end).find(|&i| self.byte(i) == b'\n').map_or(end, |nl| nl + 1);
         }
         for (i, slot) in (start..end).zip(out.iter_mut()) {
             *slot = self.byte(i);

@@ -13,6 +13,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
+use lumen_mm::FRAME_SIZE;
 use lumen_shell::Key;
 use lumen_time::{NS_PER_SEC, per_second, percent};
 
@@ -31,9 +32,6 @@ impl fmt::Display for Bytes {
         }
     }
 }
-
-/// A physical frame's size.
-const FRAME_BYTES: u64 = 4096;
 
 /// How busy `cpu` was over `ticks`: `37%`; `-` if its scheduler isn't
 /// running, `stalled` if it runs but took no tick.
@@ -105,10 +103,10 @@ pub fn mem(ctx: &mut Ctx<'_>, _: &[String]) {
     let mut kinds: Vec<(&'static str, usize, u64)> = Vec::new();
     for s in arch::stacks::REGISTRY.iter() {
         let name = s.kind.name();
-        match kinds.iter_mut().find(|k| k.0 == name) {
-            Some(k) => {
-                k.1 += 1;
-                k.2 += s.range.size();
+        match kinds.iter_mut().find(|(n, ..)| *n == name) {
+            Some((_, count, bytes)) => {
+                *count += 1;
+                *bytes += s.range.size();
             }
             None => kinds.push((name, 1, s.range.size())),
         }
@@ -119,8 +117,8 @@ pub fn mem(ctx: &mut Ctx<'_>, _: &[String]) {
     let _ = writeln!(
         t,
         "  frames  {} of {} used ({} frames of {owned} free, 4 KiB each)",
-        Bytes((owned - free) * FRAME_BYTES),
-        Bytes(owned * FRAME_BYTES),
+        Bytes((owned - free) * FRAME_SIZE),
+        Bytes(owned * FRAME_SIZE),
         free
     );
     let _ = writeln!(
@@ -131,8 +129,8 @@ pub fn mem(ctx: &mut Ctx<'_>, _: &[String]) {
         heap.live,
         Bytes(heap.free() as u64)
     );
-    let stacks: u64 = kinds.iter().map(|k| k.2).sum();
-    let count: usize = kinds.iter().map(|k| k.1).sum();
+    let stacks: u64 = kinds.iter().map(|&(_, _, bytes)| bytes).sum();
+    let count: usize = kinds.iter().map(|&(_, count, _)| count).sum();
     let _ = write!(t, "  stacks  {count} ({}, not counting their guard pages):", Bytes(stacks));
     for (name, n, size) in &kinds {
         let _ = write!(t, " {n} {name} ({})", Bytes(*size));
@@ -142,7 +140,7 @@ pub fn mem(ctx: &mut Ctx<'_>, _: &[String]) {
 }
 
 /// `irqs`: every I/O APIC input decoded, then the interrupts taken on each
-/// vector that has taken any or has a routed input.
+/// vector from 32 on that has taken any or has a routed input.
 pub fn irqs(ctx: &mut Ctx<'_>, _: &[String]) {
     use arch::apic::{Polarity, Trigger};
     let inputs = crate::interrupts::inputs();
@@ -196,8 +194,8 @@ const DMESG_CHUNK: usize = 512;
 /// overwritten.
 pub fn dmesg(ctx: &mut Ctx<'_>, _: &[String]) {
     let mut buf = vec![0; crate::klog::RING_BYTES];
-    let n = crate::klog::copy_recent(&mut buf);
-    let lost = crate::klog::written() > crate::klog::RING_BYTES as u64;
+    let (n, written) = crate::klog::copy_recent(&mut buf);
+    let lost = written > crate::klog::RING_BYTES as u64;
     let text = String::from_utf8_lossy(&buf[..n]);
     let lines = text.lines().count();
     let older = if lost { " (older ones overwritten)" } else { " (all since boot)" };
@@ -215,8 +213,9 @@ pub fn dmesg(ctx: &mut Ctx<'_>, _: &[String]) {
     }
 }
 
-/// `date`: the RTC's date and time (UTC with the tests' QEMU), a header
-/// and no rows.
+/// `date`: the RTC's date and time, a header and no rows. The clock is
+/// taken as UTC (true under QEMU's `-rtc base=utc`, the tests' setting;
+/// the RTC itself doesn't say).
 pub fn date(ctx: &mut Ctx<'_>, _: &[String]) {
     let _ = match crate::rtc::now() {
         Ok(now) => writeln!(ctx.out, "date: {now} UTC"),
@@ -246,19 +245,21 @@ impl Sample {
 /// How often `top` checks for a key while it waits.
 const KEY_POLL_NS: u64 = 20_000_000;
 
-/// `top [frames]`: a frame a second (per-CPU busy %, interrupt rates, the
-/// heap, the threads and their share of their CPU), until `q` or Ctrl-C (or
-/// `frames` frames). With escape codes each frame replaces the last; on a
-/// plain console frames follow each other as lines.
+/// `top [frames]`: a frame a second (per-CPU busy %, interrupt rates by
+/// vector from 32 on, the heap, the threads and their share of their CPU),
+/// until `q` or Ctrl-C (or `frames` frames). With escape codes each frame
+/// replaces the last; on a plain console frames follow each other as lines.
 pub fn top(ctx: &mut Ctx<'_>, args: &[String]) {
-    let limit = match args {
-        [] => Some(None),
-        [n] => n.parse::<u64>().ok().filter(|&n| n > 0).map(Some),
-        _ => None,
-    };
-    let Some(limit) = limit else {
+    let usage = |ctx: &mut Ctx<'_>| {
         let _ = writeln!(ctx.out, "usage: top [frames] (q or Ctrl-C quits)");
-        return;
+    };
+    let limit: Option<u64> = match args {
+        [] => None,
+        [n] => match n.parse() {
+            Ok(n) if n > 0 => Some(n),
+            _ => return usage(ctx),
+        },
+        _ => return usage(ctx),
     };
     let mut prev = Sample::take();
     let mut frame = 0;
@@ -327,8 +328,8 @@ fn render(frame: u64, prev: &Sample, now: &Sample, ansi: bool) -> String {
         Bytes(heap.used as u64),
         Bytes(heap.size as u64),
         heap.live,
-        Bytes((frames.owned - frames.free) as u64 * FRAME_BYTES),
-        Bytes(frames.owned as u64 * FRAME_BYTES)
+        Bytes((frames.owned - frames.free) as u64 * FRAME_SIZE),
+        Bytes(frames.owned as u64 * FRAME_SIZE)
     );
     // Threads: each one's share of its CPU's ticks in the span.
     let _ = writeln!(t, "  thread            id  cpu  state     cpu%");
