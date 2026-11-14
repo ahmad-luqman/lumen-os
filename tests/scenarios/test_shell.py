@@ -196,7 +196,9 @@ def test_system_commands(boot):
     out = run(m, "mem")
     assert out.startswith("mem: "), out
     assert re.search(
-        r"^  frames  [\d.]+ [KMG]iB of [\d.]+ [KMG]iB used \(\d+ frames of \d+ free", out, re.M
+        r"^  frames  [\d.]+ [KMG]iB of [\d.]+ [KMG]iB used \(\d+ frames of \d+ free",
+        out,
+        re.MULTILINE,
     ), out
     assert re.search(r"^  heap    .* used in \d+ allocations, .* free$", out, re.MULTILINE), out
     assert re.search(r"^  stacks  \d+ \(.*\): .*\d+ thread", out, re.MULTILINE), out
@@ -212,7 +214,7 @@ def test_system_commands(boot):
     out = run(m, "dmesg")
     assert re.match(r"dmesg: the newest \d+ log lines\n", out), out
     assert re.search(
-        r"^\[\s*\d+\.\d{6}\] INFO  shell: shells on serial and the screen", out, re.M
+        r"^\[\s*\d+\.\d{6}\] INFO  shell: shells on serial and the screen", out, re.MULTILINE
     ), out
 
     out = run(m, "trace 4")
