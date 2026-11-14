@@ -1213,7 +1213,8 @@ crate::ktest!(
             // Whether the row starting with `needle` is on screen with a
             // pixel of its text that isn't background.
             let ink = |needle: &str| {
-                let row = (0..rows).find(|&r| needle.chars().enumerate().all(|(i, ch)| s.terms[s.shown].cell(i, r).ch == ch));
+                let row =
+                    (0..rows).find(|&r| needle.chars().enumerate().all(|(i, ch)| s.terms[s.shown].cell(i, r).ch == ch));
                 row.is_some_and(|r| {
                     let (y, w) = (s.y0 + r * CELL_H, needle.len() * s.cell_w);
                     (y..y + CELL_H).any(|y| (s.x0..s.x0 + w).any(|x| s.fb.pixel(x, y) != bg))
@@ -1351,10 +1352,8 @@ crate::ktest!(
         kassert!(show(2).is_ok());
         kassert_eq!(shown(), 2);
         drop(c);
-        let (paused, cells_match) = with_screen(|s| {
-            (s.canvas.is_some(), s.shadow_matches_grid())
-        })
-        .ok_or("no terminal")?;
+        let (paused, cells_match) =
+            with_screen(|s| (s.canvas.is_some(), s.shadow_matches_grid())).ok_or("no terminal")?;
         kassert!(!paused && cells_match);
         kassert_eq!(shown(), 2);
         show(0).map_err(|_| "no switch back")?;
