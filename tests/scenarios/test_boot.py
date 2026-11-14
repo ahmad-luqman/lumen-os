@@ -1,4 +1,4 @@
-"""First boot: Limine loads the kernel, which reaches the logger and the monitor."""
+"""First boot: Limine loads the kernel, which reaches the logger and the shell."""
 
 import re
 

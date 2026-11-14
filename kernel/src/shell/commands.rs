@@ -50,12 +50,11 @@ pub fn run(line: &str, ctx: &mut Ctx<'_>) {
     }
 }
 
-/// The only argument, if there is at most one (`Err` with more).
-fn one(args: &[String]) -> Result<Option<&str>, ()> {
+/// The only argument as a number, if there is exactly one and it is one.
+fn number<T: core::str::FromStr>(args: &[String]) -> Option<T> {
     match args {
-        [] => Ok(None),
-        [arg] => Ok(Some(arg)),
-        _ => Err(()),
+        [arg] => arg.parse().ok(),
+        _ => None,
     }
 }
 
@@ -78,7 +77,8 @@ fn help(ctx: &mut Ctx<'_>, _: &[String]) {
          clocks            the TSC's frequency, measured again against each clock\n  \
          history           the lines entered on this console\n  \
          exit              end QEMU (only with lumen.qemu_exit)\n\
-         keys: Tab completes; Up/Down history; Ctrl-A/E/K/U/W/C edit (cursor keys and Ctrl-L on the screen, or with lumen.ansi)",
+         keys: Tab completes; Up/Down history; Ctrl-K/U/W edit, Ctrl-C drops the line; \
+         the cursor keys, Home/End, Ctrl-A/E/B/F and Ctrl-L on the screen (or serial with lumen.ansi)",
         crash::KINDS.join(" ")
     );
 }
@@ -95,13 +95,10 @@ fn int3(ctx: &mut Ctx<'_>, _: &[String]) {
 }
 
 fn trace(ctx: &mut Ctx<'_>, args: &[String]) {
-    let n = match one(args).map(|a| a.map(str::parse)) {
-        Ok(None) => 16,
-        Ok(Some(Ok(n))) => n,
-        _ => {
-            let _ = writeln!(ctx.out, "usage: trace [n]");
-            return;
-        }
+    let n = if args.is_empty() { Some(16) } else { number(args) };
+    let Some(n) = n else {
+        let _ = writeln!(ctx.out, "usage: trace [n]");
+        return;
     };
     let out = &mut *ctx.out;
     let ring = crate::trace::ring();
@@ -160,8 +157,8 @@ fn kbd(ctx: &mut Ctx<'_>, _: &[String]) {
 fn term(ctx: &mut Ctx<'_>, args: &[String]) {
     const NONE: &str = "term: no terminal (no usable framebuffer, or one too small)";
     let out = &mut *ctx.out;
-    match one(args) {
-        Ok(None) => {
+    match args {
+        [] => {
             let _ = match crate::term::status() {
                 Some(t) => writeln!(
                     out,
@@ -181,12 +178,15 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
                 None => writeln!(out, "{NONE}"),
             };
         }
-        Ok(Some("text")) => match crate::term::view_text() {
-            Some((rows, cursor)) => {
-                for row in &rows {
+        [arg] if arg == "text" => match crate::term::view_text() {
+            Some(view) => {
+                for row in &view.rows {
                     let _ = writeln!(out, "|{row}");
                 }
-                let _ = writeln!(out, "term text: {} rows, cursor ({}, {})", rows.len(), cursor.col, cursor.row);
+                let _ = match view.cursor {
+                    Some(c) => writeln!(out, "term text: {} rows, cursor ({}, {})", view.rows.len(), c.col, c.row),
+                    None => writeln!(out, "term text: {} rows, scrolled back", view.rows.len()),
+                };
             }
             None => {
                 let _ = writeln!(out, "{NONE}");
@@ -255,8 +255,8 @@ fn colors(ctx: &mut Ctx<'_>, _: &[String]) {
 }
 
 fn seq(ctx: &mut Ctx<'_>, args: &[String]) {
-    match one(args).map(|a| a.map(str::parse::<u32>)) {
-        Ok(Some(Ok(n))) if n <= 10_000 => {
+    match number::<u32>(args) {
+        Some(n) if n <= 10_000 => {
             for i in 1..=n {
                 let _ = writeln!(ctx.out, "{i}");
             }
@@ -268,8 +268,8 @@ fn seq(ctx: &mut Ctx<'_>, args: &[String]) {
 }
 
 fn sleep(ctx: &mut Ctx<'_>, args: &[String]) {
-    match one(args).map(|a| a.map(str::parse::<u64>)) {
-        Ok(Some(Ok(ms))) if ms <= 60_000 => {
+    match number::<u64>(args) {
+        Some(ms) if ms <= 60_000 => {
             crate::time::sleep(ms * 1_000_000);
             let _ = writeln!(ctx.out, "slept {ms} ms");
         }
@@ -329,3 +329,23 @@ fn exit(ctx: &mut Ctx<'_>, _: &[String]) {
     }
     let _ = writeln!(ctx.out, "exit: lumen.qemu_exit not set");
 }
+
+crate::ktest!(
+    fn help_lists_every_command_once() {
+        // Every command in the table has a line in `help`, and no name is
+        // in the table twice (`find` would take the first).
+        use crate::kassert;
+        let mut text = String::new();
+        let history = lumen_shell::History::new(0);
+        help(&mut Ctx { out: &mut text, ansi: false, history: &history }, &[]);
+        for (i, c) in COMMANDS.0.iter().enumerate() {
+            let helped = text.lines().any(|l| l.starts_with(&alloc::format!("  {} ", c.name)));
+            let once = COMMANDS.0[..i].iter().all(|d| d.name != c.name);
+            if !(helped && once) {
+                crate::ktest::diag(format_args!("{}: in help {helped}, once {once}", c.name));
+            }
+            kassert!(helped && once);
+        }
+        Ok(())
+    }
+);

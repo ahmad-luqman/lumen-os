@@ -15,8 +15,12 @@ def test_rows_and_cursor():
     screen = parse(out)
     assert screen.rows == ["lumen> echo hi", "hi", "lumen>", ""]
     assert screen.cursor == (7, 2)
-    assert screen.cursor_row == "lumen>"
     assert screen.text == "lumen> echo hi\nhi\nlumen>\n"
+
+
+def test_no_cursor_while_scrolled_back():
+    screen = parse("|41\n|42\nterm text: 2 rows, scrolled back\n")
+    assert (screen.rows, screen.cursor) == (["41", "42"], None)
 
 
 def test_a_row_that_starts_with_a_bar_keeps_it():

@@ -257,7 +257,9 @@ Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 `isa-debug-exit`, used by tests), `lumen.log=<error|warn|info|debug|trace>`
 and `lumen.keymap=<us|uk|de|fr|no|se|jp|dvorak|colemak>` (the keyboard's
 layout, section 6; `us` by default and for a name it doesn't know, with a
-warning).
+warning) and `lumen.ansi` (the serial shell edits with escape codes, its
+terminal taken to be 80 columns wide; plain text without it, section 6,
+"Shell").
 
 ## 5. Memory layout
 
@@ -864,7 +866,8 @@ off. A wake from another CPU queues the thread there and sends the
   level coloured (ERROR bold red, WARN yellow, INFO green), the tag dimmed,
   errors' and warnings' messages coloured too (a ktest reads the cells).
   The screen's shell writes there (section "Shell"), nothing of it on
-  serial. Each of its `write!`s and each log line is formatted and written under one lock, so
+  serial (except what a `crash` says on both: a fault that didn't happen,
+  the heap's line before a heap crash). Each of its `write!`s and each log line is formatted and written under one lock, so
   another CPU's log line can't split an escape sequence written in one
   `write!` (ktests check the formatting happens under the lock); a log line
   starts from the default colours (a ktest leaves bold, inverse and a
@@ -878,8 +881,9 @@ off. A wake from another CPU queues the thread there and sends the
   pixels, not through the terminal, its lock or the heap (a scenario
   checks its banner after an invalid opcode; drawing it with a corrupt heap
   or the terminal's lock held is not tested).
-- **Shell commands** (either console): `clear` (screen and scrollback),
-  `colors`, `seq <n>`, `term` (size, cursor, scrollback, the view's offset
+- **Shell commands** (either console, writing to the one that ran them):
+  `clear` (the screen and its scrollback, on a console that takes escape
+  codes), `colors`, `seq <n>`, `term` (size, cursor, scrollback, the view's offset
   and top row, cells drawn) and `term text` (the view's rows); without a
   terminal, `term` says so (not tested). In the screen's shell
   Shift+PageUp/PageDown scroll the view half a screen (logged at debug
@@ -916,7 +920,9 @@ off. A wake from another CPU queues the thread there and sends the
   unknown command (`unknown command: x (try 'help')`).
 - **The line editor** (`lumen_shell::Editor`) takes keys and writes what
   the console must show: printable characters inserted at the cursor (up
-  to 160 a line, fewer on a console too narrow; zero-width ones refused),
+  to 160 columns a line, a wide character two, fewer on a console too
+  narrow; zero-width ones refused; a screen too narrow for 16 gets no
+  shell, not tested),
   Left/Right, Home/End and Ctrl-A/E/B/F, Backspace, Delete and Ctrl-D,
   Ctrl-K/U/W, Up/Down and Ctrl-P/N through the history (100 lines; blank
   lines and repeats of the newest not kept; going past the newest brings
@@ -924,18 +930,23 @@ off. A wake from another CPU queues the thread there and sends the
   screen and show the line again), Enter, and Tab, which completes the
   word before the cursor from the command table (command names first,
   then each command's argument words: `crash` its kinds and `thread`,
-  `term` `text`): one that fits is written in full (quoted as the word
-  was, the quote closed) with a space, several up to where they differ,
-  or, if they already differ there, listed on a line of their own. With
+  `term` `text`; options that aren't printable are skipped): one that
+  fits is written in full (quoted as the word was, the quote closed) with
+  a space, several up to where they differ (host-tested only: no two of
+  today's commands or argument words share more than their first
+  letter), or, if they already differ there, listed on a line of their
+  own. With
   ANSI escapes (the screen; serial with `lumen.ansi`) it redraws the line
   (`CR`, the prompt, the line, `ESC [ K`, the cursor moved back) unless
   the change only appends or only moves the cursor. In **plain** mode
   (serial without `lumen.ansi`, so the harness can read it line by line)
   the cursor stays at the end and the console only gets characters to
   append and `BS space BS` to erase: a history line replaces the typed one
-  by erasing and typing; the cursor keys and Ctrl-L do nothing; a listing
-  is a line followed by the prompt and the line again. Neither mode wraps
-  (with `lumen.ansi` a serial terminal is taken to be 80 columns wide). A
+  by erasing and typing; the cursor keys, Home/End, Ctrl-A/E/B/F and
+  Ctrl-L do nothing; a listing is a line followed by the prompt and the
+  line again. Neither mode wraps (with `lumen.ansi` a serial terminal is
+  taken to be 80 columns wide; plain serial doesn't redraw, so its 160
+  columns may wrap on a narrower terminal). A
   randomized host test runs the editor's output, in both modes, through
   `lumen-term` after every key and checks the cursor's row shows the
   prompt and the line, and the cursor sits where the editor says.
@@ -944,17 +955,21 @@ off. A wake from another CPU queues the thread there and sends the
   arrows, Home and End; a ktest maps each); serial's from bytes
   (`lumen_shell::input::Decoder`: CR, LF or CR LF as one Enter, DEL and BS
   as Backspace, other control characters as Ctrl and a letter, `ESC [`
-  and `ESC O` sequences for the arrows, Home, End and Delete, UTF-8; host
-  tested). Each key's output is written to the console in one write, so
-  on the screen a log line can't land in the middle of a redraw.
-- **Commands:** kmon's, in name and output (`help`, `echo` joining its
-  words with single spaces, `int3`, `crash <kind> [cpu|thread]`, `trace
-  [n]`, `heap`, `ticks`, `kbd`, `term`, `clear`, `colors`, `seq`,
-  `sleep`, `uptime`, `clocks`, `exit`), plus `history` (the console's
-  lines, numbered) and `term text`. Each writes to the console that ran
-  it. On plain serial, `colors` and `clear` say the console is plain
-  (tested). A `crash` whose fault doesn't happen says so on serial and
-  the screen. `crash <kind> <cpu>` waits, asleep and allocating nothing,
+  and `ESC O` sequences for the arrows, Home, End and Delete, a control
+  character ending a sequence it interrupts, UTF-8 without overlong
+  forms; host tested). Each key's output is written to the console in
+  one write, so on the screen a log line can't land in the middle of a
+  redraw (not tested on its own).
+- **Commands:** `help` (a ktest checks it has a line for each command
+  in the table, and no name is there twice), `echo` (its words joined by
+  single spaces), `int3`, `crash <kind> [cpu|thread]` (the thread is
+  `shell-crash`), `trace [n]`, `heap`, `ticks`, `kbd`, `term [text]`,
+  `clear`, `colors`, `seq`, `sleep`, `uptime`, `clocks`, `exit` (kmon's,
+  their output unchanged otherwise) and `history` (the console's lines,
+  numbered). Each writes to the console that ran it. On plain serial,
+  `colors` and `clear` say the console is plain (tested), and with
+  `lumen.ansi` they work there (tested). A `crash` whose fault doesn't
+  happen says so on serial and the screen (the screen not tested). `crash <kind> <cpu>` waits, asleep and allocating nothing,
   until that CPU's report stops this one or its fault returns (so the
   report never finds the heap's lock held by the shell freeing its line;
   a CPU that doesn't run it is given up on after 10 s, not tested).

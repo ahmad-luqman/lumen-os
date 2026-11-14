@@ -80,8 +80,12 @@ pub fn partial(line: &str) -> Option<Partial> {
 
 /// `word` written so that it reads back as itself: inside `quote` if one
 /// is open (without the closing quote), else with backslashes before the
-/// characters that need them.
+/// characters that need them (a newline, which a backslash would remove,
+/// in single quotes; an empty word as `''`).
 pub fn quote(word: &str, quote: Option<char>) -> String {
+    if word.is_empty() && quote.is_none() {
+        return String::from("''");
+    }
     let mut out = String::with_capacity(word.len());
     for c in word.chars() {
         match quote {
@@ -92,7 +96,8 @@ pub fn quote(word: &str, quote: Option<char>) -> String {
                 out.push('\\');
                 out.push(c);
             }
-            None if matches!(c, ' ' | '\t' | '\n' | '\'' | '"' | '\\' | '#' | '$' | '`') => {
+            None if c == '\n' => out.push_str("'\n'"),
+            None if matches!(c, ' ' | '\t' | '\'' | '"' | '\\' | '#' | '$' | '`') => {
                 out.push('\\');
                 out.push(c);
             }

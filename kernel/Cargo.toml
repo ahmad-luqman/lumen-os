@@ -12,7 +12,7 @@ test = false
 bench = false
 
 [features]
-# Build the in-kernel test runner: instead of the kernel monitor, run every
+# Build the in-kernel test runner: instead of the shells, run every
 # `ktest!` and report TAP over serial.
 ktest = []
 

@@ -29,7 +29,9 @@ pub const KINDS: &[&str] = &[
     "guard",
 ];
 
-/// Writes to serial and the screen (a fault that didn't happen).
+/// Writes to serial and the screen, whichever shell ran the command (a
+/// fault that didn't happen, the heap's line before a heap crash): the
+/// tests read serial.
 struct Out;
 
 impl Write for Out {
@@ -287,8 +289,8 @@ fn crash_corrupt_heap() {
     let _ = writeln!(Out, "crash: a corrupt free list went unnoticed");
 }
 
-/// Write into the guard page below the stack this runs on (this CPU's main
-/// stack, or with `crash guard thread` the thread's) from a healthy stack: a
+/// Write into the guard page below the stack this runs on (see
+/// [`crash_stack_overflow`]) from a healthy stack: a
 /// plain #PF (nothing overflowed), which the report names as a stray guard
 /// page hit, not an overflow.
 #[inline(never)]
@@ -303,14 +305,17 @@ fn crash_touch_guard() {
     let _ = writeln!(Out, "crash: writing to a guard page succeeded (guard page mapped?)");
 }
 
-/// Overflow this CPU's main stack with small frames.
+/// Overflow the stack this runs on with small frames (the `main` thread's
+/// from the serial shell, the screen shell's thread's from there, a new
+/// thread's with `thread`, the idle thread's on another CPU).
 #[inline(never)]
 fn crash_stack_overflow() {
     let depth = recurse(0);
     let _ = writeln!(Out, "crash: recursion returned at depth {depth} (no guard page?)");
 }
 
-/// Overflow the main stack with frames bigger than a page: stack probes must
+/// Overflow the stack this runs on (see [`crash_stack_overflow`]) with
+/// frames bigger than a page: stack probes must
 /// make it fault in the guard page instead of jumping over it into the
 /// mapped stack below.
 #[inline(never)]
@@ -337,7 +342,7 @@ fn recurse_big(depth: u64) -> u64 {
 
 /// Recurse without end: each call keeps a 256-byte array live across the
 /// next call (not a tail call; `black_box` stops LLVM folding it into a
-/// loop), so the main stack runs into its guard page and the crash reporter
+/// loop), so the stack runs into its guard page and the crash reporter
 /// names the overflow. The `u64::MAX` test never succeeds in practice.
 #[inline(never)]
 fn recurse(depth: u64) -> u64 {

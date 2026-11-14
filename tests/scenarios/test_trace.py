@@ -1,4 +1,4 @@
-"""The kernel trace ring, seen through the the shell's `trace` command.
+"""The kernel trace ring, seen through the shell's `trace` command.
 
 The ring itself is tested on the host (`cargo test -p lumen-trace`) and
 in-kernel (`lumen_kernel::trace::*`); this checks what a person sees.

@@ -3,7 +3,9 @@
 scenarios see what the screen shell, typed on the keyboard, did.
 
 `term text` prints each row of the view after a `|` (trailing blanks
-trimmed), then `term text: <n> rows, cursor (<col>, <row>)`.
+trimmed), then `term text: <n> rows, cursor (<col>, <row>)`, or `term text:
+<n> rows, scrolled back` while the view is scrolled back (the cursor is
+below it).
 """
 
 from __future__ import annotations
@@ -16,32 +18,28 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from lumen_harness.qemu import Machine
 
-SUMMARY = re.compile(r"term text: (\d+) rows, cursor \((\d+), (\d+)\)\n")
+SUMMARY = re.compile(r"term text: (\d+) rows, (?:cursor \((\d+), (\d+)\)|scrolled back)\n")
 PROMPT = r"lumen> "
 
 
 @dataclass
 class Screen:
     rows: list[str]
-    cursor: tuple[int, int]  # (col, row)
+    cursor: tuple[int, int] | None  # (col, row); None while scrolled back
 
     @property
     def text(self) -> str:
         return "\n".join(self.rows)
-
-    @property
-    def cursor_row(self) -> str:
-        return self.rows[self.cursor[1]]
 
 
 def parse_term_text(out: str, summary: re.Match[str]) -> Screen:
     """The screen from `term text`'s output (`out`: what came before its
     summary line, from the command's echo on)."""
     rows = [line[1:] for line in out.split("\n") if line.startswith("|")]
-    n, col, row = map(int, summary.groups())
-    if len(rows) != n:
+    n, col, row = summary.groups()
+    if len(rows) != int(n):
         raise AssertionError(f"term text: {len(rows)} rows read, {n} written:\n{out}")
-    return Screen(rows, (col, row))
+    return Screen(rows, None if col is None else (int(col), int(row)))
 
 
 def read_screen(m: Machine) -> Screen:

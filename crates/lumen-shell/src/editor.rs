@@ -2,8 +2,9 @@
 //! must show.
 //!
 //! Keys (both modes, unless marked ANSI only):
-//! - a printable character: inserted at the cursor (the line holds up to
-//!   its maximum; zero-width characters are refused);
+//! - a printable character: inserted at the cursor (the line takes up to
+//!   its maximum in columns, a wide character two; zero-width characters
+//!   are refused);
 //! - Left/Right, Ctrl-B/Ctrl-F, Home/End, Ctrl-A/Ctrl-E: move the cursor
 //!   (ANSI only);
 //! - Backspace: delete before the cursor; Delete, Ctrl-D: at it;
@@ -22,7 +23,7 @@
 //! the prompt, the line, `ESC [ K`, and the cursor moved back with
 //! `ESC [ n D`) unless the change only appends or only moves the cursor.
 //! Neither mode wraps: the console must be wider than the prompt and the
-//! longest line.
+//! maximum (in columns).
 
 use crate::{History, Key, words};
 use alloc::string::String;
@@ -62,7 +63,7 @@ pub enum Event {
 pub struct Editor {
     prompt: &'static str,
     mode: Mode,
-    /// The longest line, in characters.
+    /// The widest line, in columns.
     max: usize,
     line: Vec<char>,
     /// Where the cursor is in `line` (0 to its length).
@@ -79,7 +80,7 @@ pub struct Editor {
 
 impl Editor {
     /// An editor showing `prompt` (no wider than the console less `max`
-    /// columns), for lines of up to `max` characters, keeping the last
+    /// columns), for lines up to `max` columns wide, keeping the last
     /// `history` lines.
     pub fn new(prompt: &'static str, mode: Mode, max: usize, history: usize) -> Editor {
         Editor {
@@ -202,10 +203,16 @@ impl Editor {
 
     /// Insert `chars` at the cursor, if they are all printable and fit.
     fn insert(&mut self, chars: &[char]) {
-        let fits = self.line.len() + chars.len() <= self.max;
+        self.replace(self.cursor, chars);
+    }
+
+    /// Replace `line[start..cursor]` with `chars` and put the cursor after
+    /// them, if they are all printable and the line still fits.
+    fn replace(&mut self, start: usize, chars: &[char]) {
+        let fits = columns(&self.line) - columns(&self.line[start..self.cursor]) + columns(chars) <= self.max;
         if fits && chars.iter().all(|&c| width(c) > 0) {
-            self.line.splice(self.cursor..self.cursor, chars.iter().copied());
-            self.cursor += chars.len();
+            self.line.splice(start..self.cursor, chars.iter().copied());
+            self.cursor = start + chars.len();
         }
     }
 
@@ -246,49 +253,51 @@ impl Editor {
         };
         let mut options = Vec::new();
         complete.options(&word.words, &mut options);
-        options.retain(|o| o.starts_with(word.text.as_str()));
+        options.retain(|o| o.starts_with(word.text.as_str()) && o.chars().all(|c| width(c) > 0));
         options.sort();
         options.dedup();
-        let (replacement, list) = match options.as_slice() {
+        let replacement = match options.as_slice() {
             [] => return Ok(()),
             [only] => {
                 let mut s = with_quote(only, word.quote);
                 s.extend(word.quote);
                 s.push(' ');
-                (s, false)
+                s
             }
-            [first, rest @ ..] => {
-                let common = rest.iter().fold(first.len(), |n, o| common_len(&first[..n], o));
-                if common > word.text.len() {
-                    (with_quote(&first[..common], word.quote), false)
-                } else {
-                    (String::new(), true)
+            [first, .., last] => {
+                // Sorted: what the first and the last share, they all do.
+                let common = common_len(first, last);
+                if common <= word.text.len() {
+                    return self.list(&options, out);
                 }
+                with_quote(&first[..common], word.quote)
             }
         };
-        if list {
-            self.newline(out)?;
-            for (i, o) in options.iter().enumerate() {
-                if i > 0 {
-                    out.write_str("  ")?;
-                }
-                out.write_str(o)?;
-            }
-            self.newline(out)?;
-            return self.show_prompt_again(out);
-        }
-        // Replace the word as typed with the completed one.
+        // Replace the word as typed with the completed one (an option that
+        // isn't printable, or doesn't fit, changes nothing).
         let start = head[..word.start].chars().count();
         let replacement: Vec<char> = replacement.chars().collect();
-        if self.line.len() - (self.cursor - start) + replacement.len() <= self.max {
-            self.line.splice(start..self.cursor, replacement.iter().copied());
-            self.cursor = start + replacement.len();
-        }
+        self.replace(start, &replacement);
         Ok(())
+    }
+
+    /// List `options` on a line of their own, then show the prompt again.
+    fn list(&mut self, options: &[String], out: &mut dyn Write) -> fmt::Result {
+        self.newline(out)?;
+        for (i, o) in options.iter().enumerate() {
+            if i > 0 {
+                out.write_str("  ")?;
+            }
+            out.write_str(o)?;
+        }
+        self.newline(out)?;
+        self.show_prompt_again(out)
     }
 
     /// Bring the console up to date with the line and the cursor.
     fn render(&mut self, out: &mut dyn Write) -> fmt::Result {
+        debug_assert!(self.cursor <= self.line.len(), "the cursor past the line");
+        debug_assert!(self.mode == Mode::Ansi || self.cursor == self.line.len(), "plain mode's cursor off the end");
         match self.mode {
             Mode::Plain => {
                 // The cursor is always at the end: erase back to where the
@@ -345,7 +354,12 @@ fn with_quote(text: &str, quote: Option<char>) -> String {
 /// How many bytes `a` and `b` share at their start, on a character
 /// boundary.
 fn common_len(a: &str, b: &str) -> usize {
-    a.char_indices().zip(b.chars()).find(|((_, x), y)| x != y).map_or(a.len().min(b.len()), |((i, _), _)| i)
+    for ((i, x), y) in a.char_indices().zip(b.chars()) {
+        if x != y {
+            return i;
+        }
+    }
+    a.len().min(b.len())
 }
 
 /// Where the word before `cursor` starts (skipping blanks before the

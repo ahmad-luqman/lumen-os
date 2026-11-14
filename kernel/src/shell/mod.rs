@@ -31,8 +31,10 @@ use lumen_shell::input::Decoder;
 use lumen_shell::{Editor, Event, History, Key, Mode};
 
 const PROMPT: &str = "lumen> ";
-/// The longest line, in characters (less on a console too narrow for it).
+/// The widest line, in columns (less on a console too narrow for it).
 const MAX_LINE: usize = 160;
+/// The narrowest line a screen shell is started with.
+const MIN_LINE: usize = 16;
 /// Lines each shell keeps in its history.
 const HISTORY: usize = 100;
 /// How wide a serial terminal is taken to be with `lumen.ansi` (lines stay
@@ -41,6 +43,9 @@ const SERIAL_COLUMNS: usize = 80;
 
 /// What a command can use: its console and the shell's history.
 pub struct Ctx<'a> {
+    /// The console. On the screen a `write!` is formatted under the screen's
+    /// lock, so what it formats must not allocate (arguments that allocate,
+    /// like a `join`, are made before the call).
     pub out: &'a mut dyn Write,
     /// Whether the console takes escape codes.
     pub ansi: bool,
@@ -63,13 +68,13 @@ pub fn run() -> ! {
             log::info!(target: "shell", "shells on serial and the screen; type 'help'");
             match crate::sched::spawn("shell-screen", move || run_on(Screen, editor)) {
                 Ok(handle) => drop(handle), // it runs for good
-                Err(e) => log::warn!(target: "shell", "no thread for the screen's shell: {e}"),
+                Err(e) => log::error!(target: "shell", "no shell on the screen after all: no thread for it: {e}"),
             }
         }
         Err(why) => log::info!(target: "shell", "shell on serial (none on the screen: {why}); type 'help'"),
     }
     let mode = if crate::cmdline::has_flag("lumen.ansi") { Mode::Ansi } else { Mode::Plain };
-    let max = if mode == Mode::Ansi { SERIAL_COLUMNS - PROMPT.len() - 1 } else { MAX_LINE };
+    let max = if mode == Mode::Ansi { max_line(SERIAL_COLUMNS) } else { MAX_LINE };
     run_on(Serial { decoder: Decoder::new() }, Editor::new(PROMPT, mode, max, HISTORY))
 }
 
@@ -79,8 +84,17 @@ fn screen_editor() -> Result<Editor, &'static str> {
     if keyboard::stats().result != Some(Ok(())) {
         return Err("no keyboard");
     }
-    let max = MAX_LINE.min(cols.saturating_sub(PROMPT.len() + 1));
+    let max = max_line(cols);
+    if max < MIN_LINE {
+        return Err("terminal too narrow");
+    }
     Ok(Editor::new(PROMPT, Mode::Ansi, max, HISTORY))
+}
+
+/// The widest line on a console `cols` wide: the prompt and the line leave
+/// the last column free (the editor doesn't wrap).
+fn max_line(cols: usize) -> usize {
+    MAX_LINE.min(cols.saturating_sub(PROMPT.len() + 1))
 }
 
 /// A shell's loop: a line, its command, again. What the editor writes for a

@@ -371,8 +371,9 @@ pub fn status() -> Option<Status> {
     })
 }
 
-/// The view's cells, row by row. The vector is allocated before taking the
-/// screen's lock, as everything under it must not allocate.
+/// The view's cells, row by row (for the tests). The vector is allocated
+/// before taking the screen's lock, as everything under it must not allocate.
+#[cfg(feature = "ktest")]
 fn view_cells() -> Option<(usize, Vec<Cell>)> {
     let (cols, rows) = with_screen(|s| (s.term.cols(), s.term.rows()))?;
     let mut cells = Vec::with_capacity(cols * rows);
@@ -384,12 +385,29 @@ fn view_cells() -> Option<(usize, Vec<Cell>)> {
     Some((cols, cells))
 }
 
-/// The view's rows as text (wide characters' spacers skipped, trailing
-/// blanks trimmed) and the cursor: what the shell's `term text` prints, and
-/// how the tests read what the screen shell did.
-pub fn view_text() -> Option<(Vec<String>, Cursor)> {
-    let (cols, cells) = view_cells()?;
-    let cursor = with_screen(|s| s.term.cursor())?;
+/// The view's rows as text, and the cursor if the view shows the screen.
+pub struct ViewText {
+    /// Each row of the view, wide characters' spacers skipped and trailing
+    /// blanks trimmed.
+    pub rows: Vec<String>,
+    /// The cursor, or `None` while the view is scrolled back (the cursor is
+    /// on the screen, below the view).
+    pub cursor: Option<Cursor>,
+}
+
+/// The view as text (what the shell's `term text` prints, and how the tests
+/// read what the screen shell did), read in one go: a log line from another
+/// CPU can't land between the rows and the cursor.
+pub fn view_text() -> Option<ViewText> {
+    let (cols, rows) = with_screen(|s| (s.term.cols(), s.term.rows()))?;
+    // Allocated before taking the lock again, as nothing under it may
+    // allocate; the size never changes, so this fits.
+    let mut cells = Vec::with_capacity(cols * rows);
+    let cursor = with_screen(|s| {
+        let t = &s.term;
+        cells.extend((0..rows).flat_map(|r| (0..cols).map(move |c| t.cell(c, r))));
+        (t.view_offset() == 0).then(|| t.cursor())
+    })?;
     let rows = cells
         .chunks(cols)
         .map(|row| {
@@ -397,7 +415,7 @@ pub fn view_text() -> Option<(Vec<String>, Cursor)> {
             String::from(text.trim_end())
         })
         .collect();
-    Some((rows, cursor))
+    Some(ViewText { rows, cursor })
 }
 
 /// The bottom-most row of the view holding `needle`.

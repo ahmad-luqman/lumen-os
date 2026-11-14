@@ -73,15 +73,24 @@ fn the_word_a_line_ends_in() {
 
 #[test]
 fn quoted_words_read_back_as_themselves() {
-    let tricky = ["plain", "a b", "it's", "say \"hi\"", "back\\slash", "#hash", "$x `y`", "tab\there", ""];
+    let tricky = [
+        "plain",
+        "a b",
+        "it's",
+        "say \"hi\"",
+        "back\\slash",
+        "#hash",
+        "$x `y`",
+        "tab\there",
+        "new\nline",
+        "\\\"$`",
+        "",
+    ];
     for w in tricky {
         for q in [None, Some('\''), Some('"')] {
             let mut line: String = q.into_iter().collect();
             line.push_str(&words::quote(w, q));
             line.extend(q);
-            if w.is_empty() && q.is_none() {
-                continue; // no word at all
-            }
             assert_eq!(split(&line), [w], "{w:?} in {q:?}: {line:?}");
         }
     }
@@ -133,6 +142,17 @@ fn utf8_is_decoded_and_malformed_sequences_dropped() {
     assert_eq!(decode(b"\xc3a\xe2\x82b\x80\xffc"), [Char('a'), Char('b'), Char('c')]);
     // Control characters (U+0080 to U+009F) aren't printable.
     assert_eq!(decode(b"\xc2\x85d"), [Char('d')]);
+    // Overlong forms (A in 3 and 4 bytes), a surrogate, past U+10FFFF.
+    assert_eq!(decode(b"\xe0\x81\x81\xf0\x80\x81\x81\xed\xa0\x80\xf4\x90\x80\x80e"), [Char('e')]);
+}
+
+#[test]
+fn a_control_character_ends_an_escape_sequence() {
+    use Key::*;
+    // Esc then Enter (the CR doesn't vanish into the sequence, and the LF
+    // after it is the same Enter), a sequence cut short by a Ctrl key, an
+    // Esc cut short by another.
+    assert_eq!(decode(b"\x1b\r\n\x1b[1\x15\x1bO\x1b[A\x1bxq"), [Enter, Ctrl('u'), Up, Char('q')]);
 }
 
 static NO_ARGS: &[&[&str]] = &[];
@@ -345,7 +365,7 @@ fn tab_completes_a_unique_match_with_a_space() {
 }
 
 #[test]
-fn tab_extends_to_the_common_start_then_lists() {
+fn tab_lists_options_that_already_differ() {
     use Key::*;
     let mut t = Typist::new(Mode::Plain);
     t.take();
@@ -468,6 +488,74 @@ fn the_terminal_shows_what_the_editor_holds() {
             }
         }
     }
+}
+
+/// Options for every word: completes nothing but these.
+struct Fixed(&'static [&'static str]);
+
+impl Complete for Fixed {
+    fn options(&self, _: &[String], out: &mut Vec<String>) {
+        out.extend(self.0.iter().map(|o| o.to_string()));
+    }
+}
+
+/// Type `text` then Tab in an editor completing from `options`: the line
+/// and the cursor.
+fn tab_after(mode: Mode, options: &'static [&'static str], text: &str) -> (String, usize) {
+    let mut editor = Editor::new("> ", mode, 20, 10);
+    let mut out = String::new();
+    for c in text.chars() {
+        editor.key(Key::Char(c), &Fixed(options), &mut out).unwrap();
+    }
+    editor.key(Key::Tab, &Fixed(options), &mut out).unwrap();
+    (editor.line(), editor.cursor())
+}
+
+#[test]
+fn tab_extends_to_the_start_several_options_share() {
+    for mode in [Mode::Plain, Mode::Ansi] {
+        // No space after it: the word isn't finished.
+        assert_eq!(tab_after(mode, &["stats", "stack", "stop"], "x s"), ("x st".into(), 4));
+        assert_eq!(tab_after(mode, &["stats", "stack"], "x s"), ("x sta".into(), 5));
+        // Quoted as the word was, the quote left open.
+        assert_eq!(tab_after(mode, &["it's one", "it's two"], "x 'i"), ("x 'it'\\''s ".into(), 11));
+        assert_eq!(tab_after(mode, &["a b1", "a b2"], "x a"), ("x a\\ b".into(), 6));
+        assert_eq!(words::split("x 'it'\\''s 'one").unwrap(), ["x", "it's one"]);
+    }
+}
+
+#[test]
+fn tab_completes_after_wider_characters() {
+    // The word starts after multi-byte characters: its start is counted in
+    // characters, not bytes.
+    assert_eq!(tab_after(Mode::Ansi, &["thread"], "éé日 t"), ("éé日 thread ".into(), 11));
+    let mut t = Typist::new(Mode::Ansi);
+    t.text("crash éé t").keys(&[Key::Tab]);
+    assert_eq!(t.state(), ("crash éé thread ".into(), 16));
+}
+
+#[test]
+fn tab_skips_options_that_are_not_printable() {
+    assert_eq!(tab_after(Mode::Plain, &["a\tb", "ab\u{7}"], "x a"), ("x a".into(), 3));
+    assert_eq!(tab_after(Mode::Plain, &["a\tb", "abc"], "x a"), ("x abc ".into(), 6));
+}
+
+#[test]
+fn the_line_is_limited_in_columns() {
+    // 20 columns: a wide character takes two, so ten fill the line, and
+    // the terminal (two for the prompt, one spare) never wraps.
+    let mut term = lumen_term::Terminal::new(23, 4, 0);
+    let mut t = Typist::new(Mode::Ansi);
+    t.text(&"日".repeat(12));
+    assert_eq!(t.state().1, 10);
+    t.keys(&[Key::Backspace]).text("ab").keys(&[Key::Home]).text("x");
+    assert_eq!(t.state(), (alloc::format!("{}ab", "日".repeat(9)), 0));
+    t.keys(&[Key::Backspace, Key::Delete, Key::Char('x')]);
+    term.write(t.take().as_bytes());
+    let row: String = (0..term.cols()).map(|c| term.cell(c, 0).ch).collect();
+    assert_eq!(term.cursor().row, 0);
+    assert!(row.starts_with("> x"), "{row:?}");
+    assert_eq!((term.cell(0, 1).ch, term.cursor().col), (' ', 3));
 }
 
 #[test]

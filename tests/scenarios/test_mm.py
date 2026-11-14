@@ -91,7 +91,7 @@ def test_nx_data_crashes_cleanly(crash_report):
     end = r"(4 KiB|2 MiB) page at phys 0x[0-9a-f]+: writable, no-execute"
     assert re.fullmatch(end, walk.end), report
     # rip is in .data, which has no function symbols; the frame-pointer walk
-    # still reaches the monitor (the faulting `call` set up no frame, so its
+    # still reaches the shell (`shell::run`; the faulting `call` set up no frame, so its
     # caller's caller is the first named frame).
     frames = backtrace(report)
     assert any("shell::run" in f for f in frames) and frames[-1].startswith("_start"), report
@@ -141,7 +141,8 @@ def test_heap_command_reports_usage(boot):
     assert heap["base"] == HEAP_BASE, heap
     assert 0 < heap["live"] <= 40, f"{heap}: nothing kept at boot (did acpi::init fail?), or a leak"
     assert 0 < heap["largest"] <= heap["free"] < heap["mapped"], heap
-    # Looking doesn't allocate: the summary is the same the second time.
+    # Running it again leaves the heap as it was (the line's allocations are
+    # freed; a repeated line isn't kept in the history).
     assert shell_heap(m) == heap
 
 

@@ -166,6 +166,16 @@ def test_every_printable_character_and_backspace(boot):
     expect_screen(m, "^" + re.escape(every) + "$")
 
 
+def test_a_long_line_of_shifted_keys(boot):
+    # 150 shifted keys typed back to back (each takes 12 of the 1024 entries
+    # of QEMU's input queue, which drops the rest unreported): the harness
+    # paces them, and every one arrives.
+    m = boot("qemutest")
+    shells_ready(m, "us")
+    m.type_text("echo " + "A" * 150 + "\n")
+    expect_screen(m, r"^A{150}$", 30)
+
+
 def test_no_8042_is_a_warning(boot):
     # Without the controller the keyboard is skipped with a warning naming
     # the command, the serial shell says why there is none (IRQ 1 stays

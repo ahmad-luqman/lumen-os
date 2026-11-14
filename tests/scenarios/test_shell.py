@@ -8,9 +8,8 @@ both consoles."""
 import re
 
 from lumen_harness.qemu import Machine
-from lumen_harness.screen import expect_screen, read_screen
+from lumen_harness.screen import PROMPT, expect_screen, read_screen
 
-PROMPT = r"lumen> "
 SHELLS = r"INFO  shell: shells on serial and the screen; type 'help'\n"
 
 
@@ -71,8 +70,11 @@ def test_history_and_line_editing(boot):
     keys(m, ["ctrl", "e"], " xyz", ["ctrl", "w"], ["ret"])
     # (The screen's rows come without trailing blanks.)
     expect_screen(m, r"^lumen> echo world\nworld$")
-    keys(m, "junk", ["ctrl", "u"], "echo kept", ["ctrl", "a"], ["ctrl", "k"], "echo cleared\n")
-    expect_screen(m, r"^lumen> echo cleared\ncleared$")
+    # Ctrl-U deletes before the cursor, Ctrl-K after it.
+    keys(m, "junk echo ", *[["left"]] * 5, ["ctrl", "u"], ["end"], "kept\n")
+    expect_screen(m, r"^lumen> echo kept\nkept$")
+    keys(m, "echo cut junk", *[["left"]] * 5, ["ctrl", "k"], ["ctrl", "a"], ["ctrl", "f"], "\n")
+    expect_screen(m, r"^lumen> echo cut\ncut$")
     # Ctrl-C drops the line; nothing runs.
     keys(m, "echo dropped", ["ctrl", "c"], "echo after\n")
     expect_screen(m, r"^lumen> echo dropped\^C\nlumen> echo after\nafter$")
@@ -81,14 +83,15 @@ def test_history_and_line_editing(boot):
     expect_screen(
         m,
         r"^ +1  echo one\n +2  echo two\n +3  echo one\n +4  echo abcd\n +5  echo world\n"
-        r" +6  echo cleared\n +7  echo after\n +8  history$",
+        r" +6  echo kept\n +7  echo cut\n +8  echo after\n +9  history$",
     )
-    # The serial shell has its own history: Up recalls its last line (plain
-    # text: the line erased and typed again, no escape codes).
+    # The serial shell has its own history: Up recalls its last line, in
+    # plain text: what was typed erased, the line typed instead, no escape
+    # codes.
     start = len(m.output)
     assert run(m, "echo serial") == "serial\n"
-    m.send("\x1b[A\r")
-    m.expect(r"serial\n" + PROMPT, 10)
+    m.send("xyz\x1b[A\r")
+    m.expect(r"xyz(\x08 \x08){3}echo serial\nserial\n" + PROMPT, 10)
     assert "\x1b" not in m.output[start:]
     # (The recalled line repeats the last one: kept once. The serial history
     # also has the `term text` lines reading the screen ran.)
@@ -105,7 +108,9 @@ def test_tab_completion(boot):
     expect_screen(m, r"^lumen> echo hi\nhi$")
     keys(m, "crash p", ["tab"])
     expect_screen(m, r"^lumen> crash p\npanic  pf\nlumen> crash p$")
-    keys(m, "a", ["tab"], ["ctrl", "e"], ["ctrl", "u"], "te", ["tab"], ["tab"])
+    keys(m, "a", ["tab"])
+    expect_screen(m, r"^lumen> crash panic$")
+    keys(m, ["ctrl", "u"], "te", ["tab"], ["tab"])
     expect_screen(m, r"^lumen> term text$")
     keys(m, ["ctrl", "u"], "cl", ["tab"])
     expect_screen(m, r"^clear  clocks\nlumen> cl$")
@@ -127,6 +132,8 @@ def test_unknown_command_single_error(boot):
     # error on the console it was typed on, and nothing else.
     m = shells(boot)
     assert run(m, "frobnicate now") == "unknown command: frobnicate (try 'help')\n"
+    # (`help` lists every command: a ktest checks the table against it.)
+    assert run(m, "help").startswith("commands:\n  help ")
     assert run(m, "echo 'open") == "syntax error: unclosed ' quote\n"
     assert run(m, "echo end\\") == "syntax error: a backslash at the end of the line\n"
     start = len(m.output)
@@ -152,3 +159,5 @@ def test_serial_takes_escape_codes_with_lumen_ansi(boot):
     assert "\x1b[K" in m.output[start:]
     m.send_line("colors")
     m.expect(re.compile(r"\x1b\[48;5;16m.*colors: done\n", re.DOTALL), 10)
+    m.send_line("clear")
+    m.expect(r"clear\n\x1b\[H\x1b\[2J\x1b\[3J" + PROMPT, 10)

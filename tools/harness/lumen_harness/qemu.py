@@ -208,6 +208,15 @@ class ExpectTimeout(AssertionError):
 _machine_ids = itertools.count()
 
 
+# How long QEMU holds a key pressed by `Machine.press`, and how long it
+# takes to send one: measured, 30 shifted keys pressed at once reached the
+# guest over 2.4 s (about 4 hold times each), so this allows that.
+KEY_HOLD_MS = 20
+KEY_TIME = 4 * KEY_HOLD_MS / 1000
+# Presses `Machine.press` lets QEMU queue at once (see there).
+KEYS_IN_FLIGHT = 40
+
+
 class Machine:
     """A headless QEMU instance driven over serial and QMP."""
 
@@ -234,6 +243,8 @@ class Machine:
         self._pos = 0  # expect() cursor into the normalized output
         self._reader: threading.Thread | None = None
         self._qmp: QmpClient | None = None
+        # When QEMU will have sent every key pressed so far (see `press`).
+        self._keys_sent_by = 0.0
         # The QMP socket's directory (LUMEN_SOCK_DIR; unset or empty: /tmp). A
         # short one: macOS limits unix socket paths to ~104 bytes.
         self._sock_dir = Path(os.environ.get("LUMEN_SOCK_DIR") or "/tmp")
@@ -382,18 +393,27 @@ class Machine:
 
     def press(self, qcodes: Sequence[str]) -> None:
         """Press `qcodes` together on the guest's keyboard (QMP `send-key`,
-        held 20 ms). QEMU queues each key behind the last one's hold time,
-        so keys pressed back to back arrive in order. The screen shell
-        answers them on the screen, not on serial: wait for what they did
-        with `lumen_harness.screen.expect_screen`."""
-        self.qmp().send_key(qcodes)
+        held 20 ms). QEMU queues each key behind the last one, so keys
+        pressed back to back arrive in order. The screen shell answers them
+        on the screen, not on serial: wait for what they did with
+        `lumen_harness.screen.expect_screen`.
+
+        QEMU's input queue holds 1024 entries and silently drops the rest
+        (`ui/input.c`): a `send-key` of n keys takes about 6n (each key's
+        press and release, a sync after each, and the hold time after
+        each), and QEMU takes about `KEY_TIME` to send one. So this paces
+        itself: it waits whenever more than `KEYS_IN_FLIGHT` presses would
+        be queued (at most 12 entries each with shift, well under the
+        limit). `test_a_long_line_of_shifted_keys` checks 150 arrive."""
+        ahead = self._keys_sent_by - time.monotonic()
+        if ahead > KEYS_IN_FLIGHT * KEY_TIME:
+            time.sleep(ahead - KEYS_IN_FLIGHT * KEY_TIME / 2)
+        self.qmp().send_key(qcodes, hold_ms=KEY_HOLD_MS)
+        self._keys_sent_by = max(self._keys_sent_by, time.monotonic()) + KEY_TIME
 
     def type_text(self, text: str) -> None:
         """Type `text` on the guest's keyboard as a US layout would, a key at
-        a time (see `press`; QEMU's input queue holds some hundreds of keys,
-        so keep it to a line)."""
-        if len(text) > 200:
-            raise ValueError(f"typing {len(text)} keys at once could overflow QEMU's input queue")
+        a time (see `press`)."""
         for ch in text:
             self.press(qcodes_for(ch))
 
