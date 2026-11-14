@@ -47,9 +47,10 @@ const SERIAL_COLUMNS: usize = 80;
 /// [`Ctx::poll_key`]/[`Ctx::wait_key`]), the screen's pixels
 /// ([`Ctx::canvas`]) and the shell's history.
 pub struct Ctx<'a> {
-    /// The console. On the screen a `write!` is formatted under the screen's
-    /// lock, so what it formats must not allocate (arguments that allocate,
-    /// like a `join`, are made before the call). While a command holds the
+    /// The console. A `write!` reaches it whole (on the screen it is
+    /// formatted first, then drawn under one lock; on serial it is
+    /// formatted under the log's line lock, so make text whose formatting
+    /// allocates, like a script's value, before the call). While a command holds the
     /// canvas (`term::status().paused`), screen output reaches the terminal
     /// but isn't drawn.
     pub out: &'a mut dyn Console,
@@ -101,7 +102,7 @@ impl<'a> Ctx<'a> {
 }
 
 /// A console a shell runs on.
-pub trait Console: Write {
+pub trait Console: Write + Send {
     /// Wait for the next key.
     fn read_key(&mut self) -> Key;
     /// The next key, if one is waiting (never blocks).
@@ -173,7 +174,9 @@ fn run_on(mut console: impl Console, mut editor: Editor) -> ! {
     }
 }
 
-fn flush(console: &mut impl Console, shown: &mut String) {
+/// Write what the line editor left in `shown` to `console` (one write), and
+/// empty it.
+pub fn flush(console: &mut (impl Console + ?Sized), shown: &mut String) {
     if !shown.is_empty() {
         let _ = console.write_str(shown);
         shown.clear();
@@ -222,7 +225,9 @@ impl Console for Serial {
 
 /// The keyboard in, the screen's terminal out. Each `write!` reaches the
 /// screen whole (one lock), not in pieces another CPU's log line could land
-/// between.
+/// between. It is formatted before taking the screen's lock: formatting may
+/// allocate (a script value's `Debug` does), which the heap refuses under
+/// that lock.
 struct Screen;
 
 impl Write for Screen {
@@ -232,7 +237,10 @@ impl Write for Screen {
     }
 
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
-        crate::term::write_fmt(args);
+        match args.as_str() {
+            Some(s) => crate::term::write_str(s),
+            None => crate::term::write_str(&alloc::fmt::format(args)),
+        };
         Ok(())
     }
 }
@@ -388,13 +396,25 @@ crate::ktest!(
 
 crate::ktest!(
     fn the_screen_console_writes_each_write_whole() {
-        // A whole `write!` is formatted under the screen's lock.
+        // A whole `write!` is formatted before taking the screen's lock (an
+        // argument that allocates there would be refused by the heap), then
+        // drawn as one piece.
         use crate::kassert;
         use crate::term::LockProbe;
         use core::sync::atomic::{AtomicBool, Ordering};
+        /// Allocates while formatting (as a script value's `Debug` does).
+        struct Allocating;
+        impl fmt::Display for Allocating {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let text = core::hint::black_box(alloc::format!("allocated while formatting {}", 42));
+                f.write_str(&text)
+            }
+        }
         let held = AtomicBool::new(false);
-        let _ = write!(Screen, "{}", LockProbe(&held));
-        kassert!(held.load(Ordering::Relaxed));
+        let _ = writeln!(Screen, "{}{}", LockProbe(&held), Allocating);
+        kassert!(!held.load(Ordering::Relaxed));
+        let view = crate::term::view_text().ok_or("no terminal")?;
+        kassert!(view.rows.iter().any(|r| r.contains("allocated while formatting 42")));
         Ok(())
     }
 );

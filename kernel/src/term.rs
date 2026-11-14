@@ -370,6 +370,12 @@ pub fn canvas(owner: Owner) -> Result<Canvas, CanvasError> {
     }
 }
 
+/// The size in pixels a [`Canvas`] has (or would have), without taking one;
+/// `None` without a terminal (or once a crash report started).
+pub fn canvas_size() -> Option<(usize, usize)> {
+    with_screen(|s| (s.fb.width(), s.fb.height().saturating_sub(fb::CONSOLE_TOP)))
+}
+
 impl Canvas {
     /// Width in pixels.
     pub fn width(&self) -> usize {

@@ -13,7 +13,8 @@ BUILD       := build
 CARGO_KERNEL := cargo build -p lumen-kernel --target $(TARGET) --release
 HARNESS     := PYTHONPATH=tools/harness uv run --frozen python -m lumen_harness
 
-KERNEL_SRCS := $(shell find kernel crates -name '*.rs' -o -name '*.toml' -o -name '*.ld') Cargo.toml Cargo.lock .cargo/config.toml rust-toolchain.toml
+# `.rhai`: the built-in scripts, embedded with `include_str!`.
+KERNEL_SRCS := $(shell find kernel crates -name '*.rs' -o -name '*.toml' -o -name '*.ld' -o -name '*.rhai') Cargo.toml Cargo.lock .cargo/config.toml rust-toolchain.toml
 
 # Both kernels are built into the same cargo output path and copied out, so
 # their recipes must never run concurrently (`make -j`).

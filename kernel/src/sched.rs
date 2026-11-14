@@ -444,15 +444,22 @@ pub fn spawn(name: &'static str, f: impl FnOnce() + Send + 'static) -> Result<Jo
     spawn_on(arch::cpu_index(), name, f)
 }
 
-/// Start a thread running `f` on this CPU with a stack of `stack_size`
-/// bytes (whole pages) instead of [`STACK_SIZE`] (for deeply recursive code:
-/// the script interpreter).
-pub fn spawn_sized(
-    name: &'static str,
-    stack_size: u64,
-    f: impl FnOnce() + Send + 'static,
-) -> Result<JoinHandle, SpawnError> {
-    spawn_with(arch::cpu_index(), name, stack_size, Box::new(f))
+/// Run `f` in a new thread on this CPU with a stack of `stack_size` bytes
+/// (a nonzero multiple of 4 KiB; anything else panics) instead of
+/// [`STACK_SIZE`], and wait for it to finish: for deeply recursive code (the
+/// script interpreter). As it is joined before this returns, `f` may borrow
+/// from the caller. If no thread can be made, `f` is dropped unrun. Blocks
+/// the calling thread (see [`JoinHandle::join`]).
+pub fn run_sized<'a>(name: &'static str, stack_size: u64, f: impl FnOnce() + Send + 'a) -> Result<(), SpawnError> {
+    let f: Box<dyn FnOnce() + Send + 'a> = Box::new(f);
+    // SAFETY: only the closure's lifetime bound changes (same layout). The
+    // thread is joined below before this function returns, so `f` (and
+    // what it borrows) is used only while those borrows are alive; a panic
+    // aborts the kernel, so nothing unwinds past the join. If spawning
+    // fails, `spawn_with` drops `f` before returning.
+    let f: Entry = unsafe { core::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Entry>(f) };
+    spawn_with(arch::cpu_index(), name, stack_size, f)?.join();
+    Ok(())
 }
 
 /// Start a thread running `f` on CPU `cpu`, where it will always run. It is

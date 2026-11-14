@@ -111,3 +111,29 @@ def test_runaway_script_is_stopped(boot):
     expect_screen(m, r"^lumen> rhai -e 'loop \{ sleep\(1000\) \}'$")
     m.press(["ctrl", "c"])
     expect_screen(m, r"^rhai: stopped \(Ctrl-C\)\nlumen>$")
+
+
+def test_screen_shell_scripts(boot, artifacts):
+    # On the screen's shell: a value whose formatting allocates is printed
+    # (the screen console formats before drawing); the screen's size
+    # doesn't take the screen; a script that drew shows "press a key" on a
+    # strip at the bottom of what it drew, and a key brings the terminal
+    # back.
+    m = shells(boot)
+    m.type_text('rhai -e \'[Fn("cpus"), #{f: Fn("x")}]\'\n')
+    expect_screen(m, r'^\[Fn\("cpus"\), #\{"f": Fn\("x"\)\}\]\nlumen>$')
+    m.type_text("rhai -e 'screen_width()'\n")
+    expect_screen(m, r"^1280\nlumen>$")
+    m.type_text("rhai -e 'draw_rect(0, 0, 100, 100, 0x00ff00)'\n")
+    # (The terminal holds the line, drawn once the screen is given back.)
+    expect_screen(m, r"^rhai: press a key$")
+    shot = m.screendump("drawn.png")
+    img = Image.open(shot).convert("RGB")
+    width, height = img.size
+    assert img.getpixel((50, CANVAS_TOP + 50)) == (0, 255, 0)
+    assert img.getpixel((width - 4, height - 4)) == (0x20, 0x20, 0x20)
+    # The strip's text: some pixels lighter than the strip.
+    strip = [img.getpixel((x, y)) for x in range(8, 150) for y in range(height - 20, height - 4)]
+    assert any(p[0] > 0x80 for p in strip)
+    m.type_text(" ")
+    expect_screen(m, r"^rhai: press a key\nlumen>$")
