@@ -18,7 +18,8 @@
 //!   one adds it), CR;
 //! - ESC 7/8 (save/restore the cursor), D (index), E (next line),
 //!   M (reverse index), H (set a tab stop), c (reset: the screen, cursor,
-//!   pen, region, tabs and modes, not the scrollback or the view);
+//!   saved cursor, pen, region, tabs and modes, not the scrollback or the
+//!   view);
 //! - CSI: cursor movement A B C D E F G H f d \`, erase J (0 to 3) K X,
 //!   insert and delete @ P L M, scroll S T, SGR m, scroll region r, save and
 //!   restore s u, tab clear g, DECSET/DECRST `?25` (cursor) and `?7`
@@ -28,14 +29,15 @@
 //!   256 colours (`38;5;n`, `48;5;n`, also with colons), truecolor
 //!   (`38;2;r;g;b`) approximated to the nearest of the 256, defaults 39 49.
 //!
-//! Anything else (OSC, DCS, unknown sequences, malformed ones) is ignored.
+//! Anything else (OSC, DCS, unknown sequences, malformed ones) is ignored;
+//! invalid UTF-8 prints U+FFFD.
 //! Lines go to the scrollback when they leave the top of a scroll region
 //! that is the whole screen (a line feed, or `CSI S`); lines deleted
 //! (`CSI M`) never do.
 //!
 //! The view can be scrolled back into the scrollback ([`Terminal::scroll_view`]);
-//! output doesn't move it: it stays on the lines it shows while new ones
-//! arrive.
+//! output doesn't move it: it stays on the lines it shows while the ring
+//! holds them (`CSI 3 J` empties the ring and shows the screen).
 
 #![no_std]
 
@@ -357,8 +359,9 @@ impl Grid {
         }
     }
 
-    /// Scroll rows `top..bottom` up by `n`; with `keep`, lines leaving the
-    /// top of the whole screen go to the scrollback.
+    /// Scroll rows `top..bottom` up by `n`; with `keep`, and when
+    /// `top..bottom` is the whole screen, the lines leaving the top go to the
+    /// scrollback.
     fn scroll_up(&mut self, top: usize, bottom: usize, n: usize, keep: bool) {
         let n = n.min(bottom - top);
         if n == 0 {
@@ -796,7 +799,7 @@ impl Terminal {
     /// The scroll to draw before the dirty rows, if one is pending (taking
     /// it). Take it, and move what was drawn, before taking any row's mark:
     /// the marks assume the scroll was drawn.
-    #[must_use]
+    #[must_use = "move what was drawn by this scroll before taking any row's mark"]
     pub fn take_scroll(&mut self) -> Option<Scroll> {
         self.grid.scroll.take()
     }
@@ -805,14 +808,15 @@ impl Terminal {
     /// (clearing the mark), after the pending scroll ([`Self::take_scroll`]).
     ///
     /// # Panics
-    /// If `row >= rows()`.
+    /// If `row >= rows()`, or (debug builds) if a scroll is still pending.
     #[must_use]
     pub fn take_dirty(&mut self, row: usize) -> bool {
         debug_assert!(self.grid.scroll.is_none(), "take_scroll (and draw it) before take_dirty");
         core::mem::take(&mut self.grid.dirty[row])
     }
 
-    /// Mark every row of the view to be drawn again.
+    /// Mark every row of the view to be drawn again, dropping any pending
+    /// scroll (draw the cells; don't move pixels).
     pub fn touch_all(&mut self) {
         self.grid.touch_all();
     }

@@ -27,8 +27,9 @@ fn at(t: &Terminal) -> (usize, usize) {
 }
 
 /// The grid's invariants, whatever was written: the cursor and the region
-/// are inside the screen, the view inside the scrollback, and every wide
-/// character has both halves.
+/// are inside the screen, the view inside the scrollback, a pending wrap
+/// only at the last column, every wide character has both halves and no
+/// cell is both, and a pending scroll is within its bounds.
 fn check_invariants(t: &Terminal) {
     let g = &t.grid;
     assert!(g.col < g.cols && g.row < g.rows, "cursor ({}, {})", g.col, g.row);
@@ -501,39 +502,41 @@ impl Shadow {
     }
 }
 
+/// The pending scroll and every row's mark, taken.
+fn take_damage(t: &mut Terminal) -> (Option<Scroll>, Vec<bool>) {
+    (t.take_scroll(), (0..t.rows()).map(|r| t.take_dirty(r)).collect())
+}
+
 #[test]
 fn damage_marks_changed_rows_and_records_scrolls() {
     let mut t = Terminal::new(4, 4, 10);
-    let take = |t: &mut Terminal| -> (Option<Scroll>, Vec<bool>) {
-        (t.take_scroll(), (0..t.rows()).map(|r| t.take_dirty(r)).collect())
-    };
     // A new terminal is all dirty.
-    assert_eq!(take(&mut t), (None, std::vec![true; 4]));
+    assert_eq!(take_damage(&mut t), (None, std::vec![true; 4]));
     t.write(b"\x1b[3;1Hx");
-    assert_eq!(take(&mut t), (None, std::vec![false, false, true, false]));
-    assert_eq!(take(&mut t), (None, std::vec![false; 4]));
+    assert_eq!(take_damage(&mut t), (None, std::vec![false, false, true, false]));
+    assert_eq!(take_damage(&mut t), (None, std::vec![false; 4]));
     // Row 2 changes, then two line feeds at the bottom scroll it to row 0:
     // its mark moves with it, the two new rows are dirty, and the scrolls
     // merge into one.
     t.write(b"y\x1b[4;1H\n\n");
-    assert_eq!(take(&mut t), (Some(Scroll { top: 0, bottom: 4, lines: 2 }), std::vec![true, false, true, true]));
+    assert_eq!(take_damage(&mut t), (Some(Scroll { top: 0, bottom: 4, lines: 2 }), std::vec![true, false, true, true]));
     // A scroll in another region can't merge: both regions are redrawn.
     t.write(b"\n\x1b[2;3r\x1b[3;1H\n");
-    assert_eq!(take(&mut t), (None, std::vec![true; 4]));
+    assert_eq!(take_damage(&mut t), (None, std::vec![true; 4]));
     // Scrolling a whole region's height or more is drawn cell by cell.
     t.write(b"\x1b[r\x1b[4S");
-    assert_eq!(take(&mut t), (None, std::vec![true; 4]));
+    assert_eq!(take_damage(&mut t), (None, std::vec![true; 4]));
     t.write(b"\x1b[2S");
     t.write(b"\x1b[2S");
-    assert_eq!(take(&mut t), (None, std::vec![true; 4]));
+    assert_eq!(take_damage(&mut t), (None, std::vec![true; 4]));
     // Moving the view redraws it.
     t.scroll_view(1);
-    assert_eq!(take(&mut t), (None, std::vec![true; 4]));
+    assert_eq!(take_damage(&mut t), (None, std::vec![true; 4]));
     t.reset_view();
-    assert_eq!(take(&mut t).1, std::vec![true; 4]);
+    assert_eq!(take_damage(&mut t).1, std::vec![true; 4]);
     // The cursor moving changes no cells.
     t.write(b"\x1b[2;2H\x1b[A");
-    assert_eq!(take(&mut t), (None, std::vec![false; 4]));
+    assert_eq!(take_damage(&mut t), (None, std::vec![false; 4]));
 }
 
 #[test]
@@ -654,7 +657,7 @@ fn erasing_scrollback_while_scrolled_back_redraws() {
     let mut t = Terminal::new(4, 2, 10);
     t.write(b"a\r\nb\r\nc\r\nd");
     t.scroll_view(2);
-    let _ = (t.take_scroll(), (0..2).map(|r| t.take_dirty(r)).count());
+    let _ = take_damage(&mut t);
     t.write(b"\x1b[3J");
     assert_eq!(t.view_offset(), 0);
     assert!((0..2).all(|r| t.take_dirty(r)));
@@ -667,4 +670,55 @@ fn save_with_parameters_saves_nothing() {
     assert_eq!(at(&t), (2, 1));
     t.write(b"\x1b[`");
     assert_eq!(at(&t), (0, 1));
+}
+
+#[test]
+fn modes_turn_back_on() {
+    let mut t = term(3, 2, "\x1b[?25l\x1b[?25h");
+    assert!(t.cursor().visible);
+    t.write(b"\x1b[?7l\x1b[?7habcd");
+    assert_eq!(lines(&t), ["abc", "d"]);
+}
+
+#[test]
+fn tabs_from_a_stop_go_to_the_next() {
+    let t = term(20, 1, "\t\tx");
+    assert_eq!(t.cell(16, 0).ch, 'x');
+}
+
+#[test]
+fn reverse_index_cancels_a_pending_wrap() {
+    let t = term(3, 2, "\r\nabc\x1bMd");
+    assert_eq!(lines(&t), ["  d", "abc"]);
+}
+
+#[test]
+fn every_named_colour_and_attribute_bits() {
+    let t = term(20, 1, "\x1b[35ma\x1b[97mb\x1b[45mc\x1b[0;7md\x1b[0me\x1b[1;1mf");
+    assert_eq!(t.cell(0, 0).fg, Color::Indexed(5));
+    assert_eq!(t.cell(1, 0).fg, Color::Indexed(15));
+    assert_eq!(t.cell(2, 0).bg, Color::Indexed(5));
+    assert!(t.cell(3, 0).flags.contains(Flags::INVERSE));
+    assert!(!t.cell(4, 0).flags.contains(Flags::INVERSE));
+    // Setting bold twice keeps it on.
+    assert!(t.cell(5, 0).flags.contains(Flags::BOLD));
+}
+
+#[test]
+fn nearest_chooses_between_the_cube_and_the_greys() {
+    // Off the grid: a near-grey goes to the grey ramp, a colour to the cube.
+    assert_eq!(palette::nearest(100, 100, 110), 242);
+    assert_eq!(palette::nearest(250, 10, 130), 198);
+}
+
+#[test]
+fn only_a_bare_csi_s_or_esc_7_saves() {
+    let mut t = term(10, 3, "\x1b[2;3H\x1b[s\x1b[3;5H\x1b[5s\x1b[H\x1b[u");
+    assert_eq!(at(&t), (2, 1));
+    // ESC with an intermediate (DECALN, ESC # 8) isn't a restore.
+    t.write(b"\x1b[3;3H\x1b#8");
+    assert_eq!(at(&t), (2, 2));
+    // A 1-column terminal prints narrow characters.
+    let t = term(1, 1, "a");
+    assert_eq!(line(&t, 0), "a");
 }

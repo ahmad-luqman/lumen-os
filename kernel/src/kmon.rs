@@ -16,9 +16,9 @@ const PROMPT: &str = "kmon> ";
 const CRASH_KINDS: &str = "pf ud de gp df wtext nx panic oom dfree heapcorrupt stack bigframe guard";
 const MAX_LINE: usize = 128;
 
-/// kmon's output: serial and the screen. Serial gets plain text only (the
-/// harness reads it), so escape sequences go to the screen alone
-/// ([`Screen`]). Each `write!` reaches the screen whole (one lock), not in
+/// kmon's output: serial and the screen. Serial must stay plain text (the
+/// harness reads it): write escape sequences through [`Screen`], never
+/// `Out`. Each `write!` reaches the screen whole (one lock), not in
 /// pieces another CPU's log line could land between.
 struct Out;
 
@@ -253,7 +253,8 @@ fn dispatch(line: &str) {
 }
 
 /// A colour test pattern, on the screen only (escapes stay off serial):
-/// the 16 named colours as backgrounds and as text (SGR 30-37 and 90-97),
+/// the 16 named colours as backgrounds (`48;5;n`) and as text (SGR 30-37
+/// and 90-97),
 /// the 6x6x6 cube and the grey ramp (256-colour SGR), bold, inverse and a
 /// truecolor gradient; then `colors: done` on both.
 fn colors() {
@@ -622,3 +623,18 @@ fn recurse(depth: u64) -> u64 {
     }
     recurse(depth + 1) + frame[7]
 }
+
+crate::ktest!(
+    fn kmon_writes_each_write_whole() {
+        // kmon's writers (serial and screen, screen only) format a whole
+        // `write!` under the screen's lock.
+        use crate::kassert;
+        use crate::term::LockProbe;
+        use core::sync::atomic::{AtomicBool, Ordering};
+        let (out, screen) = (AtomicBool::new(false), AtomicBool::new(false));
+        let _ = write!(Out, "{}", LockProbe(&out));
+        let _ = write!(Screen, "{}", LockProbe(&screen));
+        kassert!(out.load(Ordering::Relaxed) && screen.load(Ordering::Relaxed));
+        Ok(())
+    }
+);

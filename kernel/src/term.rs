@@ -5,8 +5,8 @@
 //! the cells that differ from it, in the rows the terminal marked as changed.
 //! A scroll moves the pixels (`Framebuffer::move_rows`) and the shadow
 //! together, so a line feed at the bottom draws one new line, not the whole
-//! screen. The cursor blinks every 500 ms (the boot CPU's timer interrupt
-//! flips it: no thread, so nothing switches or traces for it) and shows
+//! screen. The cursor flips every 500 ms (the boot CPU's timer interrupt
+//! does it: no thread, so nothing switches or traces for it) and shows
 //! solid while output arrives; it isn't drawn while the view is scrolled
 //! back (Shift+PageUp/PageDown in kmon).
 //!
@@ -51,14 +51,16 @@ struct Screen {
     cursor_drawn: Option<(usize, usize)>,
     /// The blink phase: the cursor is drawn while on.
     blink_on: bool,
-    /// Cells drawn so far (the tests count redraws with it).
+    /// Cells drawn so far (kmon's `term` shows it; the tests count redraws
+    /// with it).
     cells_drawn: u64,
 }
 
 static SCREEN: SpinLock<Option<Screen>> = SpinLock::new(None);
 /// The CPU drawing (holding `SCREEN`) plus one; 0 when none.
 static DRAWING: AtomicUsize = AtomicUsize::new(0);
-/// Set when a crash report starts: nothing is drawn afterwards.
+/// Set when a crash report starts: no drawing starts afterwards (one under
+/// way on another CPU runs until that CPU is stopped).
 static STOPPED: AtomicBool = AtomicBool::new(false);
 /// The boot CPU's tick at which the cursor flips next (output moves it on).
 static NEXT_BLINK: AtomicU64 = AtomicU64::new(0);
@@ -87,6 +89,22 @@ fn drawing_id() -> usize {
     crate::arch::cpu_index() + 1
 }
 
+/// Whether this CPU holds the screen's lock (the heap asserts it doesn't:
+/// allocating under it could deadlock with a CPU logging under the frame
+/// allocator's lock).
+pub fn drawing_here() -> bool {
+    let d = DRAWING.load(Ordering::Relaxed);
+    d != 0 && d == drawing_id()
+}
+
+/// Run `f` on `screen`, marked as this CPU's drawing (the lock is held).
+fn drawing<R>(screen: &mut Screen, f: impl FnOnce(&mut Screen) -> R) -> R {
+    DRAWING.store(drawing_id(), Ordering::Relaxed);
+    let r = f(screen);
+    DRAWING.store(0, Ordering::Relaxed);
+    r
+}
+
 /// Run `f` on the screen, unless there is none, a crash report started, or
 /// this CPU is already drawing (an exception in the middle of it: waiting
 /// would never end; nothing on that path logs to the screen today).
@@ -94,16 +112,11 @@ fn with_screen<R>(f: impl FnOnce(&mut Screen) -> R) -> Option<R> {
     if STOPPED.load(Ordering::Acquire) {
         return None;
     }
-    let me = drawing_id();
-    if DRAWING.load(Ordering::Relaxed) == me {
+    if drawing_here() {
         return None;
     }
     let mut guard = SCREEN.lock();
-    let screen = guard.as_mut()?;
-    DRAWING.store(me, Ordering::Relaxed);
-    let r = f(screen);
-    DRAWING.store(0, Ordering::Relaxed);
-    Some(r)
+    Some(drawing(guard.as_mut()?, f))
 }
 
 /// A crash report started: draw nothing more (the crash screen draws
@@ -124,11 +137,11 @@ pub fn on_tick(tick: u64) {
     // later. (Output moves it on only while holding the lock, like here.)
     NEXT_BLINK.store(tick + BLINK_TICKS, Ordering::Relaxed);
     let Some(s) = guard.as_mut() else { return };
-    // (This CPU can't be drawing: it does so with interrupts off.)
-    DRAWING.store(drawing_id(), Ordering::Relaxed);
-    s.blink_on = !s.blink_on;
-    s.render();
-    DRAWING.store(0, Ordering::Relaxed);
+    // (This CPU can't be drawing already: it does so with interrupts off.)
+    drawing(s, |s| {
+        s.blink_on = !s.blink_on;
+        s.render();
+    });
 }
 
 impl Screen {
@@ -140,6 +153,12 @@ impl Screen {
             }
             self.term.write(line.as_bytes());
         }
+        self.show_cursor();
+    }
+
+    /// Feed `bytes` to the terminal as they are (not drawn yet).
+    fn feed_raw(&mut self, bytes: &[u8]) {
+        self.term.write(bytes);
         self.show_cursor();
     }
 
@@ -238,32 +257,33 @@ struct Raw<'a>(&'a mut Screen);
 
 impl Write for Raw<'_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.0.term.write(s.as_bytes());
-        self.0.show_cursor();
+        self.0.feed_raw(s.as_bytes());
         Ok(())
     }
 }
 
-/// Write `s` to the terminal (`\n` as CR LF) and draw it; false without a
-/// terminal.
+/// Write `s` to the terminal (`\n` as CR LF) and draw it; false if nothing
+/// was drawn (no terminal, a crash report started, or this CPU is already
+/// drawing).
 pub fn write_str(s: &str) -> bool {
     write_fmt(format_args!("{s}"))
 }
 
 /// Write raw bytes to the terminal (no `\n` translation) and draw them;
-/// false without a terminal.
+/// false if nothing was drawn (see [`write_str`]).
 pub fn write_bytes(bytes: &[u8]) -> bool {
     with_screen(|screen| {
-        screen.term.write(bytes);
-        screen.show_cursor();
+        screen.feed_raw(bytes);
         screen.render();
     })
     .is_some()
 }
 
 /// Write formatted text (`\n` as CR LF) and draw it, all under one lock: a
-/// log line from another CPU can't land inside an escape sequence. `args`
-/// must not allocate (see the module comment). False without a terminal.
+/// log line from another CPU can't land inside an escape sequence written
+/// in this one call. `args`
+/// must not allocate (see the module comment). False if nothing was drawn
+/// (see [`write_str`]).
 pub fn write_fmt(args: fmt::Arguments<'_>) -> bool {
     with_screen(|screen| {
         let _ = Feed(screen).write_fmt(args);
@@ -310,7 +330,9 @@ fn move_view(scroll: impl FnOnce(&mut Terminal) -> bool) {
         s.render();
         Some((s.term.view_offset(), top_row(&s.term)))
     });
-    // Logged outside the screen's lock: logging draws.
+    // Logged outside the screen's lock: the logger takes its line lock
+    // before the screen's, so logging under the screen's lock could
+    // deadlock with another CPU's log line.
     if let Some(Some((view, top))) = moved {
         log::debug!(target: "term", "view {view} lines up, top row \"{top}\"");
     }
@@ -366,7 +388,8 @@ pub struct Status {
     pub cells_drawn: u64,
 }
 
-/// The terminal's state, or `None` without one.
+/// The terminal's state, or `None` without one (or once a crash report
+/// started).
 pub fn status() -> Option<Status> {
     with_screen(|s| {
         let t = &s.term;
@@ -494,9 +517,11 @@ crate::ktest!(
     fn scrolled_pixels_match_a_full_redraw() {
         // Scrolls drawn by moving pixels, up and down, whole screen and a
         // region (line feeds at the bottom, a reverse index at the top,
-        // lines inserted, a line feed at a region's bottom), each drawn on
-        // its own: the shadow then matches the terminal, and the screen
-        // matches drawing every cell afresh.
+        // lines inserted and deleted in a region, a line feed at a region's
+        // bottom), each drawn on
+        // its own, on rows that all differ (a moved row lands on a different
+        // one): the shadow then matches the terminal, and the screen matches
+        // drawing every cell afresh (which draws every cell).
         use crate::kassert;
         const STEPS: [&[u8]; 9] = [
             b"\x1b[r\x1b[999;1H\r\nfirst line at the bottom",
@@ -510,13 +535,23 @@ crate::ktest!(
             b"\r\n",
         ];
         reset_view();
-        let (w, h) = with_screen(|s| (s.term.cols() * s.cell_w, s.term.rows() * CELL_H)).ok_or("no terminal")?;
+        let (cols, rows, w, h) = with_screen(|s| {
+            let (cols, rows) = (s.term.cols(), s.term.rows());
+            (cols, rows, cols * s.cell_w, rows * CELL_H)
+        })
+        .ok_or("no terminal")?;
         // Allocated before taking the screen's lock again.
         let (mut drawn, mut fresh) = (Vec::with_capacity(w * h), Vec::with_capacity(w * h));
+        let mut fill = alloc::string::String::new();
+        for r in 1..=rows {
+            let _ = write!(fill, "\x1b[{r};1Hfill row {r} \x1b[4{}m{r}\x1b[0m", r % 8);
+        }
         let snapshot = |s: &Screen, into: &mut Vec<u32>| {
             into.extend((s.y0..s.y0 + h).flat_map(|y| (s.x0..s.x0 + w).map(move |x| s.fb.pixel(x, y))));
         };
-        let shadow_ok = with_screen(|s| {
+        let (shadow_ok, redrawn) = with_screen(|s| {
+            s.term.write(fill.as_bytes());
+            s.render();
             for step in STEPS {
                 s.term.write(step);
                 s.render();
@@ -527,16 +562,89 @@ crate::ktest!(
             // Forget what was drawn (no cell holds U+0001) and draw it all.
             s.shadow.fill(Cell { ch: '\u{1}', ..Cell::BLANK });
             s.term.touch_all();
+            let before = s.cells_drawn;
             s.render();
             snapshot(s, &mut fresh);
-            ok
+            (ok, s.cells_drawn - before)
         })
         .ok_or("no terminal")?;
         kassert!(shadow_ok);
+        kassert!(redrawn >= (cols * rows) as u64);
         if let Some(i) = drawn.iter().zip(&fresh).position(|(a, b)| a != b) {
             crate::ktest::diag(format_args!("first differing pixel: ({}, {}) of the grid", i % w, i / w));
         }
         kassert!(drawn == fresh);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn the_cursor_is_not_drawn_while_scrolled_back() {
+        // With the cursor on the top row, the view scrolled back one line
+        // still holds it (a row down), but it isn't drawn; back at the
+        // bottom it is.
+        use crate::kassert;
+        let (before, moved, hidden, back) = with_screen(|s| {
+            s.term.write(b"\x1b[r\x1b[999;1H\r\nx\x1b[H");
+            s.blink_on = true;
+            s.render();
+            let before = s.cursor_drawn.is_some();
+            let moved = s.term.scroll_view(1);
+            s.blink_on = true;
+            s.render();
+            let hidden = s.cursor_drawn.is_none() && s.term.cursor_in_view().is_some();
+            let _ = s.term.reset_view();
+            s.render();
+            (before, moved, hidden, s.cursor_drawn.is_some())
+        })
+        .ok_or("no terminal")?;
+        kassert!(before && moved && hidden && back);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_log_line_starts_from_the_default_colours() {
+        // Whatever kmon's output left set (bold, inverse, a background), a
+        // log line starts afresh.
+        use crate::kassert;
+        write_raw_fmt(format_args!("\x1b[1;7;44m"));
+        log::info!(target: "termtest", "after a dirty pen");
+        write_raw_fmt(format_args!("\x1b[0m"));
+        let (cols, cells) = view_cells().ok_or("no terminal")?;
+        let row = find_row(cols, &cells, "after a dirty pen").ok_or("the line isn't on screen")?;
+        kassert!(row[0].flags == Flags::NONE);
+        kassert!(row.iter().all(|c| c.bg == Color::Default && !c.flags.contains(Flags::INVERSE)));
+        Ok(())
+    }
+);
+
+/// Formats as nothing, noting whether it was formatted while this CPU held
+/// the screen's lock (for the tests).
+#[cfg(feature = "ktest")]
+pub struct LockProbe<'a>(pub &'a AtomicBool);
+
+#[cfg(feature = "ktest")]
+impl fmt::Display for LockProbe<'_> {
+    fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if drawing_here() {
+            self.0.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+crate::ktest!(
+    fn write_fmt_formats_under_the_lock() {
+        // A whole `write!` (and so a log line) is formatted while holding the
+        // screen's lock: no other CPU's line lands inside it.
+        use crate::kassert;
+        let under = AtomicBool::new(false);
+        kassert!(write_fmt(format_args!("{}", LockProbe(&under))));
+        kassert!(under.load(Ordering::Relaxed));
+        let under_raw = AtomicBool::new(false);
+        kassert!(write_raw_fmt(format_args!("{}", LockProbe(&under_raw))));
+        kassert!(under_raw.load(Ordering::Relaxed));
         Ok(())
     }
 );

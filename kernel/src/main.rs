@@ -185,8 +185,8 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     ktrace!(Kind::BootPhase, BootPhase::Smp);
     match boot::FRAMEBUFFER.get_response().and_then(|r| r.framebuffers().next()) {
         Some(fb) => match fb::init(&fb) {
-            Some((w, h)) => info!(target: "fb", "framebuffer {w}x{h} ready"),
-            None => warn!(target: "fb", "framebuffer format unsupported (bpp {})", fb.bpp()),
+            Ok((w, h)) => info!(target: "fb", "framebuffer {w}x{h} ready"),
+            Err(e) => warn!(target: "fb", "framebuffer {}x{} unusable: {e}", fb.width(), fb.height()),
         },
         None => warn!(target: "fb", "no framebuffer"),
     }

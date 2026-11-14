@@ -790,7 +790,8 @@ off. A wake from another CPU queues the thread there and sends the
   whether shift is held; releases are skipped, and bytes the decoder
   refuses are counted (the keyboard's overrun code among them). kmon
   reads the keyboard as well as serial (echoing on serial and the screen;
-  Shift+PageUp/PageDown scroll the terminal back, section "Terminal");
+  Shift+PageUp/PageDown scroll the terminal's view back and forward,
+  section "Terminal");
   `kbd` shows the layout, the route, the
   interrupts taken, the bytes queued, dropped, undecoded, flagged, and
   skipped during setup, or why there is no keyboard (and whether IRQ 1 was
@@ -813,7 +814,8 @@ off. A wake from another CPU queues the thread there and sends the
   default or one of 256 colours, and flags: bold, inverse, the two halves
   of a wide character). It handles UTF-8, C0 controls (a line feed
   without a carriage return: `term::write_str`, `term::write_fmt` and log
-  lines turn `\n` into CR LF, `term::write_bytes` doesn't), cursor
+  lines turn `\n` into CR LF, `term::write_bytes` and
+  `term::write_raw_fmt` don't), cursor
   movement, save and restore, erasing (in the pen's background), inserting
   and deleting cells and lines, scrolling, scroll regions, tabs, autowrap
   (the cursor waits at the last column), cursor visibility, and SGR for 16
@@ -825,7 +827,8 @@ off. A wake from another CPU queues the thread there and sends the
   region that is the whole screen (a line feed, `CSI S`; never deleted
   lines) go into a scrollback ring (500 lines in the kernel). The view
   scrolls back through it and stays on the lines it shows as new output
-  arrives; `CSI 3 J` clears it. All of it is allocated in `Terminal::new`:
+  arrives, while the ring holds them; `CSI 3 J` clears it and shows the
+  screen. Invalid UTF-8 prints U+FFFD. All of it is allocated in `Terminal::new`:
   writing never allocates (a host test counts allocations), because log
   lines come while the frame allocator's or the page tables' lock is held.
 - **Damage:** the terminal marks the view's rows that changed and keeps a
@@ -848,27 +851,32 @@ off. A wake from another CPU queues the thread there and sends the
   doesn't wait, the flip is retried on the next tick (a ktest sees both
   phases; the pixels not tested). A thread would switch and trace twice a
   blink. Output shows the cursor solid for a whole blink (not tested), and
-  it isn't drawn while the view is scrolled back.
+  it isn't drawn while the view is scrolled back (a ktest scrolls back with
+  the cursor still in the view).
 - **Writers:** log lines up to `info` are shown without the timestamp, the
   level coloured (ERROR bold red, WARN yellow, INFO green), the tag dimmed,
   errors' and warnings' messages coloured too (a ktest reads the cells).
   kmon's output and echo go to serial and the screen; escape sequences go to
   the screen only, so serial stays plain for the harness (`colors` draws a
   test pattern on screen, then prints `colors: done` on both). Each kmon
-  `write!` and each log line reaches the terminal under one lock, so
-  another CPU's log line never lands inside an escape sequence; a log line
-  starts from the default colours. Their arguments are formatted under the
-  lock, so they must not allocate. A CPU that is already drawing (an
+  `write!` and each log line is formatted and written under one lock, so
+  another CPU's log line can't split an escape sequence written in one
+  `write!` (ktests check the formatting happens under the lock); a log line
+  starts from the default colours (a ktest leaves bold, inverse and a
+  background set first). The arguments must not allocate (the heap asserts
+  it isn't called under the screen's lock). A CPU that is already drawing (an
   exception in the middle) doesn't wait for itself: its line is left off
   the screen (nothing on that path logs to the screen today; not tested).
-  Nothing is drawn once a crash report starts (`crash::enter` stops the
-  terminal; not tested), and the crash screen draws straight to the
+  No drawing starts once a crash report starts (`crash::enter` stops the
+  terminal; one under way on another CPU runs until that CPU is stopped;
+  not tested), and the crash screen draws straight to the
   pixels, not through the terminal, its lock or the heap (a scenario
   checks its banner after an invalid opcode; drawing it with a corrupt heap
   or the terminal's lock held is not tested).
 - **kmon:** `clear` (screen and scrollback), `colors`, `seq <n>`, and
   `term` (size, cursor, scrollback, the view's offset and top row, cells
-  drawn); without a terminal they say so. Shift+PageUp/PageDown scroll the
+  drawn); without a terminal, `clear`, `colors` and `term` say so (not
+  tested). Shift+PageUp/PageDown scroll the
   view half a screen (logged at debug level: serial only, the screen shows up to
   `info`); typing on the keyboard returns it to the bottom.
 - **Not yet:** virtual terminals (Alt+F1 to F4, ROADMAP M2), a font with

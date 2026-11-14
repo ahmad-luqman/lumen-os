@@ -29,8 +29,8 @@ const CRASH_TITLE: u32 = 0xff6b6b;
 pub const CONSOLE_TOP: usize = 144;
 pub const MARGIN: usize = 32;
 
-/// The boot framebuffer (32 bits per pixel).
-#[derive(Clone, Copy)]
+/// The boot framebuffer (32 bits per pixel). Not `Copy`: a second handle
+/// (the crash screen's) comes only from [`Framebuffer::alias`].
 pub struct Framebuffer {
     base: *mut u8,
     width: usize,
@@ -42,12 +42,20 @@ pub struct Framebuffer {
 }
 
 // SAFETY: the framebuffer is plain MMIO-like memory owned by the kernel. Two
-// copies draw: the terminal's, under its lock, and the crash screen's (from
+// handles draw: the terminal's, under its lock, and the crash screen's (from
 // `FRAMEBUFFER`), after the crash path stopped the terminal (`term::stop`)
 // and the other CPUs, or named those that didn't stop.
 unsafe impl Send for Framebuffer {}
 
 impl Framebuffer {
+    /// Another handle to the same pixels.
+    ///
+    /// # Safety
+    /// The two handles must never draw at the same time.
+    unsafe fn alias(&self) -> Framebuffer {
+        Framebuffer { ..*self }
+    }
+
     fn encode(&self, rgb: u32) -> u32 {
         let (r, g, b) = ((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
         (r << self.red_shift) | (g << self.green_shift) | (b << self.blue_shift)
@@ -97,8 +105,8 @@ impl Framebuffer {
         }
     }
 
-    /// Draw one glyph, at most `max_w` pixels of it wide; returns its
-    /// advance in pixels, clipped to `max_w`.
+    /// Draw one glyph (`?` for one the font lacks), at most `max_w` pixels
+    /// of it wide; returns its advance in pixels, clipped to `max_w`.
     pub fn glyph_clipped(&mut self, x: usize, y: usize, c: char, st: Style, max_w: usize) -> usize {
         let raster = get_raster(c, st.weight, st.size).or_else(|| get_raster('?', st.weight, st.size));
         let Some(raster) = raster else { return get_raster_width(st.weight, st.size).min(max_w) };
@@ -220,17 +228,41 @@ impl Write for Console {
 /// The framebuffer, once [`init`] found a usable one (for the crash screen).
 static FRAMEBUFFER: SpinLock<Option<Framebuffer>> = SpinLock::new(None);
 
+/// Why a framebuffer can't be used.
+pub enum Unusable {
+    /// Not 32 bits per pixel.
+    Bpp(u16),
+    /// A colour channel isn't 8 bits wide.
+    Masks { red: u8, green: u8, blue: u8 },
+    /// Rows shorter than 4 bytes a pixel.
+    Pitch { pitch: u64, width: u64 },
+}
+
+impl fmt::Display for Unusable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unusable::Bpp(bpp) => write!(f, "{bpp} bits per pixel, not 32"),
+            Unusable::Masks { red, green, blue } => {
+                write!(f, "colour channels of {red}, {green} and {blue} bits, not 8")
+            }
+            Unusable::Pitch { pitch, width } => write!(f, "rows of {pitch} bytes for {width} pixels"),
+        }
+    }
+}
+
 /// Draw the hello screen and start the terminal below it.
 ///
-/// Returns the resolution, or `None` if there is no usable 32-bpp framebuffer.
-pub fn init(fb: &limine::framebuffer::Framebuffer<'_>) -> Option<(usize, usize)> {
-    if fb.bpp() != 32
-        || fb.red_mask_size() != 8
-        || fb.green_mask_size() != 8
-        || fb.blue_mask_size() != 8
-        || fb.pitch() < fb.width() * 4
-    {
-        return None;
+/// Returns the resolution, or why the framebuffer can't be used.
+pub fn init(fb: &limine::framebuffer::Framebuffer<'_>) -> Result<(usize, usize), Unusable> {
+    let (red, green, blue) = (fb.red_mask_size(), fb.green_mask_size(), fb.blue_mask_size());
+    if fb.bpp() != 32 {
+        return Err(Unusable::Bpp(fb.bpp()));
+    }
+    if (red, green, blue) != (8, 8, 8) {
+        return Err(Unusable::Masks { red, green, blue });
+    }
+    if fb.pitch() < fb.width() * 4 {
+        return Err(Unusable::Pitch { pitch: fb.pitch(), width: fb.width() });
     }
     let mut f = Framebuffer {
         base: fb.addr(),
@@ -248,25 +280,31 @@ pub fn init(fb: &limine::framebuffer::Framebuffer<'_>) -> Option<(usize, usize)>
     f.text(MARGIN, 94, "milestone 0 - x86-64 - limine", Style::new(FontWeight::Regular, RasterHeight::Size16, DIM, BG));
     f.fill_rect(MARGIN, 124, 576, 2, ACCENT);
 
-    *FRAMEBUFFER.lock() = Some(f);
+    // SAFETY: the crash screen's handle draws only after the crash path
+    // stopped the terminal (`with_crash_screen`).
+    let crash = unsafe { f.alias() };
+    *FRAMEBUFFER.lock() = Some(crash);
     crate::term::init(f);
-    Some((w, h))
+    Ok((w, h))
 }
 
 /// Switch the screen to the crash screen and run `f` with a writer for it.
 ///
-/// Returns false (and does nothing) if there is no framebuffer. The terminal
-/// draws nothing afterwards.
+/// Returns false if there is no framebuffer. It also stops the terminal (a
+/// backstop: `crash::enter` already did).
 ///
 /// # Safety
 /// Crash path only: takes the framebuffer even if its lock is held, so no
 /// other code may run concurrently.
 pub unsafe fn with_crash_screen(f: impl FnOnce(&mut dyn Write)) -> bool {
     crate::term::stop();
-    // SAFETY: upheld by the caller.
-    let Some(fb) = *(unsafe { FRAMEBUFFER.force_get() }) else { return false };
-    let mut con = Console { fb, top: 80, x: MARGIN, y: 80, fg: TEXT, bg: CRASH_BG };
+    // SAFETY: upheld by the caller; the terminal draws no more (stopped
+    // above), so this is the only handle drawing.
+    let Some(fb) = (unsafe { FRAMEBUFFER.force_get() }).as_ref().map(|f| unsafe { f.alias() }) else {
+        return false;
+    };
     let (w, h) = (fb.width, fb.height);
+    let mut con = Console { fb, top: 80, x: MARGIN, y: 80, fg: TEXT, bg: CRASH_BG };
     con.fb.fill_rect(0, 0, w, h, CRASH_BG);
     let banner = Style::new(FontWeight::Bold, RasterHeight::Size32, CRASH_TITLE, CRASH_BG);
     con.fb.text(MARGIN, 24, "LUMEN CRASH REPORT", banner);

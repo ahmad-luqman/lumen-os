@@ -13,7 +13,7 @@ TERM_STATUS = re.compile(
     r"term: (\d+)x(\d+), cursor \((\d+), (\d+)\)( hidden)?, scrollback (\d+)/500 lines, "
     r'view (\d+) lines up, top row "([^"]*)", (\d+) cells drawn\n'
 )
-# The terminal's top-left pixel and its cells' height.
+# The terminal's top edge (y) and its cells' height.
 TOP, CELL_H = 144, 16
 
 
@@ -111,7 +111,8 @@ def test_scrollback(boot, artifacts, golden_dir):
     assert top == str(scrollback - half), (view, top)
     shot = m.screendump("scrolled.png")
     # The view shows `seq`'s lines from there on; the cursor (on the
-    # screen's last rows) is out of it.
+    # screen's last rows) is out of it anyway (a ktest checks that a
+    # scrolled-back view doesn't draw one it holds).
     assert_matches_golden(
         shot,
         golden_dir / "term-scrollback.png",

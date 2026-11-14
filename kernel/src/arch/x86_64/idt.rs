@@ -397,9 +397,9 @@ fn unexpected(frame: &TrapFrame) {
 /// the trace ring); the timer blinks the terminal's cursor on the boot CPU
 /// (`term::on_tick`, which never waits for a lock), then drives the
 /// scheduler (`sched::tick`, which may switch to another thread and return
-/// here only when this one runs again); a local APIC error is counted and logged with its status (on the 1st, 2nd,
-/// 4th, 8th... one, and whenever a new status bit appears);
-/// an I/O APIC vector runs its handler ([`set_irq_handler`]; one with none
+/// here only when this one runs again); a local APIC error is counted and
+/// logged with its status (on the 1st, 2nd, 4th, 8th... one, and whenever a
+/// new status bit appears); an I/O APIC vector runs its handler ([`set_irq_handler`]; one with none
 /// is unexpected); anything else is traced, counted and warned about once
 /// per vector. Interrupts are off throughout (every gate is an interrupt
 /// gate).
