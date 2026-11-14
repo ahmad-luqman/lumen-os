@@ -7,33 +7,72 @@ use super::{Ctx, crash};
 use crate::arch;
 use alloc::string::String;
 use core::arch::asm;
+use core::fmt::Write;
 use lumen_shell::{Command, Table, words};
 
 type Run = fn(&mut Ctx<'_>, &[String]);
 
 pub static COMMANDS: Table<Run> = Table(&[
-    Command { name: "help", args: &[], run: help },
-    Command { name: "echo", args: &[], run: echo },
-    Command { name: "int3", args: &[], run: int3 },
-    Command { name: "crash", args: &[crash::KINDS, &["thread"]], run: crash::run },
-    Command { name: "trace", args: &[], run: trace },
-    Command { name: "heap", args: &[], run: heap },
-    Command { name: "ticks", args: &[], run: ticks },
-    Command { name: "kbd", args: &[], run: kbd },
-    Command { name: "term", args: &[&["text"]], run: term },
-    Command { name: "clear", args: &[], run: clear },
-    Command { name: "colors", args: &[], run: colors },
-    Command { name: "seq", args: &[], run: seq },
-    Command { name: "sleep", args: &[], run: sleep },
-    Command { name: "uptime", args: &[], run: uptime },
-    Command { name: "clocks", args: &[], run: clocks },
-    Command { name: "history", args: &[], run: history },
-    Command { name: "exit", args: &[], run: exit },
+    Command { name: "help", args: &[], usage: "", about: "this list", run: help },
+    Command { name: "echo", args: &[], usage: "<text>", about: "print text", run: echo },
+    Command { name: "int3", args: &[], usage: "", about: "take a breakpoint and continue", run: int3 },
+    Command {
+        name: "crash",
+        args: &[crash::KINDS, &["thread"]],
+        usage: "<kind> [cpu|thread]",
+        about: "deliberate fault (on that CPU, or in a new thread):",
+        run: crash::run,
+    },
+    Command {
+        name: "trace",
+        args: &[],
+        usage: "[n]",
+        about: "the boot CPU's last n trace events (default 16)",
+        run: trace,
+    },
+    Command { name: "heap", args: &[], usage: "", about: "heap usage and free-list summary", run: heap },
+    Command {
+        name: "ticks",
+        args: &[],
+        usage: "",
+        about: "the boot CPU's timer interrupts (and stray ones)",
+        run: ticks,
+    },
+    Command { name: "kbd", args: &[], usage: "", about: "the keyboard's layout and interrupts", run: kbd },
+    Command {
+        name: "term",
+        args: &[&["text"]],
+        usage: "[text]",
+        about: "the screen's terminal: size, cursor, scrollback (text: its rows)",
+        run: term,
+    },
+    Command { name: "clear", args: &[], usage: "", about: "clear the screen and its scrollback", run: clear },
+    Command { name: "colors", args: &[], usage: "", about: "a colour test pattern", run: colors },
+    Command { name: "seq", args: &[], usage: "<n>", about: "print 1 to n, a line each", run: seq },
+    Command { name: "sleep", args: &[], usage: "<ms>", about: "wait that long (guest time)", run: sleep },
+    Command { name: "uptime", args: &[], usage: "", about: "nanoseconds since the TSC started", run: uptime },
+    Command {
+        name: "clocks",
+        args: &[],
+        usage: "",
+        about: "the TSC's frequency, measured again against each clock",
+        run: clocks,
+    },
+    Command { name: "history", args: &[], usage: "", about: "the lines entered on this console", run: history },
+    Command { name: "exit", args: &[], usage: "", about: "end QEMU (only with lumen.qemu_exit)", run: exit },
 ]);
 
 /// Split `line` into words and run the command the first names (one line
 /// of error if it can't be split or no command has that name).
 pub fn run(line: &str, ctx: &mut Ctx<'_>) {
+    run_in(&COMMANDS, line, ctx);
+}
+
+/// [`run`] with the commands in `table`. The command gets a canvas owner
+/// of its own; when it returns, a canvas it left behind (kept in a static,
+/// leaked) is taken back, so the screen doesn't stay frozen. A canvas held
+/// by a command on the other console isn't this one's, and stays.
+fn run_in(table: &Table<Run>, line: &str, ctx: &mut Ctx<'_>) {
     let words = match words::split(line) {
         Ok(words) => words,
         Err(e) => {
@@ -42,12 +81,18 @@ pub fn run(line: &str, ctx: &mut Ctx<'_>) {
         }
     };
     let Some((name, args)) = words.split_first() else { return };
-    match COMMANDS.find(name) {
-        Some(command) => (command.run)(ctx, args),
-        None => {
-            let _ = writeln!(ctx.out, "unknown command: {name} (try 'help')");
-        }
+    let Some(command) = table.find(name) else {
+        let _ = writeln!(ctx.out, "unknown command: {name} (try 'help')");
+        return;
+    };
+    // (A command run from inside another, e.g. by a script, gets its own
+    // owner too, and the outer one's is back afterwards.)
+    let outer = core::mem::replace(&mut ctx.owner, crate::term::Owner::new());
+    (command.run)(ctx, args);
+    if crate::term::reclaim_canvas(ctx.owner) {
+        log::warn!(target: "shell", "{name} left the screen paused; took it back");
     }
+    ctx.owner = outer;
 }
 
 /// The only argument as a number, if there is exactly one and it is one.
@@ -58,29 +103,38 @@ fn number<T: core::str::FromStr>(args: &[String]) -> Option<T> {
     }
 }
 
+/// Where `help`'s descriptions start.
+const HELP_COLUMN: usize = 20;
+
+/// Every command with its usage and what it does, then the keys. An
+/// `about` ending in `:` is followed by the words its first argument can
+/// be. Built in a `String` first (nothing may allocate while writing to the
+/// screen: see `Ctx::out`), then written in one write, so another CPU's log
+/// line can't land inside it.
 fn help(ctx: &mut Ctx<'_>, _: &[String]) {
-    let _ = writeln!(
-        ctx.out,
-        "commands:\n  help              this list\n  echo <text>       print text\n  \
-         int3              take a breakpoint and continue\n  \
-         crash <kind> [cpu|thread]\n                    deliberate fault (on that CPU, or in a new thread): {}\n  \
-         trace [n]         the boot CPU's last n trace events (default 16)\n  \
-         heap              heap usage and free-list summary\n  \
-         ticks             the boot CPU's timer interrupts (and stray ones)\n  \
-         kbd               the keyboard's layout and interrupts\n  \
-         term [text]       the screen's terminal: size, cursor, scrollback (text: its rows)\n  \
-         clear             clear the screen and its scrollback\n  \
-         colors            a colour test pattern\n  \
-         seq <n>           print 1 to n, a line each\n  \
-         sleep <ms>        wait that long (guest time)\n  \
-         uptime            nanoseconds since the TSC started\n  \
-         clocks            the TSC's frequency, measured again against each clock\n  \
-         history           the lines entered on this console\n  \
-         exit              end QEMU (only with lumen.qemu_exit)\n\
-         keys: Tab completes; Up/Down history; Ctrl-U/W delete, Ctrl-C drops the line; \
-         the cursor keys, Home/End, Delete, Ctrl-A/E/B/F/D/K and Ctrl-L on the screen (or serial with lumen.ansi)",
-        crash::KINDS.join(" ")
+    let mut text = String::from("commands:\n");
+    for c in COMMANDS.0 {
+        let start = text.len();
+        let _ = write!(text, "  {} {}", c.name, c.usage);
+        let mut width = text.len() - start;
+        if width >= HELP_COLUMN {
+            text.push('\n');
+            width = 0;
+        }
+        text.extend(core::iter::repeat_n(' ', HELP_COLUMN - width));
+        text.push_str(c.about);
+        if c.about.ends_with(':') {
+            for word in c.args.first().copied().unwrap_or_default() {
+                let _ = write!(text, " {word}");
+            }
+        }
+        text.push('\n');
+    }
+    text.push_str(
+        "keys: Tab completes; Up/Down history; Ctrl-U/W delete, Ctrl-C drops the line; \
+         the cursor keys, Home/End, Delete, Ctrl-A/E/B/F/D/K and Ctrl-L on the screen (or serial with lumen.ansi)\n",
     );
+    let _ = ctx.out.write_str(&text);
 }
 
 fn echo(ctx: &mut Ctx<'_>, args: &[String]) {
@@ -163,7 +217,7 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
                 Some(t) => writeln!(
                     out,
                     "term: {}x{}, cursor ({}, {}){}, scrollback {}/{} lines, view {} lines up, \
-                     top row \"{}\", {} cells drawn",
+                     top row \"{}\", {} cells drawn{}",
                     t.cols,
                     t.rows,
                     t.cursor.col,
@@ -173,7 +227,8 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
                     t.capacity,
                     t.view,
                     t.top_row,
-                    t.cells_drawn
+                    t.cells_drawn,
+                    if t.paused { ", paused (a command is drawing)" } else { "" }
                 ),
                 None => writeln!(out, "{NONE}"),
             };
@@ -332,20 +387,71 @@ fn exit(ctx: &mut Ctx<'_>, _: &[String]) {
 
 crate::ktest!(
     fn help_lists_every_command_once() {
-        // Every command in the table has a line in `help`, and no name is
-        // in the table twice (`find` would take the first).
-        use crate::kassert;
-        let mut text = String::new();
+        // Every command in the table has a line in `help` and a
+        // description, and no name is in the table twice (`find` would take
+        // the first).
+        use crate::{kassert, kassert_eq};
+        let mut console = super::Captured::default();
         let history = lumen_shell::History::new(0);
-        help(&mut Ctx { out: &mut text, ansi: false, history: &history }, &[]);
+        help(&mut Ctx::new(&mut console, false, &history), &[]);
+        let text = console.text;
         for (i, c) in COMMANDS.0.iter().enumerate() {
             let helped = text.lines().any(|l| l.starts_with(&alloc::format!("  {} ", c.name)));
             let once = COMMANDS.0[..i].iter().all(|d| d.name != c.name);
             if !(helped && once) {
                 crate::ktest::diag(format_args!("{}: in help {helped}, once {once}", c.name));
             }
-            kassert!(helped && once);
+            kassert!(helped && once && !c.about.is_empty());
         }
+        // The layout: descriptions from `HELP_COLUMN` (20), a usage too long
+        // for that wraps to it, and an `about` ending in `:` lists its first
+        // argument's words.
+        let lines: alloc::vec::Vec<&str> = text.lines().collect();
+        kassert!(lines.contains(&"  echo <text>       print text"));
+        let crash = lines.iter().position(|l| *l == "  crash <kind> [cpu|thread]").ok_or("no crash line")?;
+        let kinds = alloc::format!(
+            "{:HELP_COLUMN$}deliberate fault (on that CPU, or in a new thread): {}",
+            "",
+            crash::KINDS.join(" ")
+        );
+        kassert_eq!(lines.get(crash + 1).copied(), Some(kinds.as_str()));
+        for c in COMMANDS.0.iter().filter(|c| c.name.len() + c.usage.len() + 3 < HELP_COLUMN) {
+            let line = alloc::format!("{:HELP_COLUMN$}{}", alloc::format!("  {} {}", c.name, c.usage), c.about);
+            kassert!(lines.iter().any(|l| l.starts_with(line.as_str())));
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_command_s_canvas_is_taken_back_and_no_other() {
+        // A canvas a command leaves behind is taken back when it returns;
+        // one held by a command on the other console (another owner) stays
+        // while commands run and return here.
+        use crate::kassert;
+        use crate::term::{self, Owner};
+        fn leak(ctx: &mut Ctx<'_>, _: &[String]) {
+            if let Ok(canvas) = ctx.canvas() {
+                core::mem::forget(canvas);
+            }
+        }
+        fn nothing(_: &mut Ctx<'_>, _: &[String]) {}
+        static TABLE: Table<Run> = Table(&[
+            Command { name: "leak", args: &[], usage: "", about: "leak a canvas", run: leak },
+            Command { name: "nothing", args: &[], usage: "", about: "do nothing", run: nothing },
+        ]);
+        let paused = || term::status().map(|s| s.paused).ok_or("no terminal");
+        let mut console = super::Captured::default();
+        let history = lumen_shell::History::new(0);
+        let mut ctx = Ctx::new(&mut console, false, &history);
+        run_in(&TABLE, "leak", &mut ctx);
+        kassert!(!paused()?);
+        let other = term::canvas(Owner::new()).map_err(|_| "no canvas")?;
+        run_in(&TABLE, "nothing", &mut ctx);
+        run_in(&TABLE, "leak", &mut ctx);
+        kassert!(paused()? && other.is_live());
+        drop(other);
+        kassert!(!paused()?);
         Ok(())
     }
 );

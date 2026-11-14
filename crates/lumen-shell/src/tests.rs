@@ -161,11 +161,11 @@ fn a_control_character_ends_an_escape_sequence() {
 static NO_ARGS: &[&[&str]] = &[];
 static CRASH_ARGS: &[&[&str]] = &[&["pf", "panic", "ud", "it's"], &["thread"]];
 static TABLE: Table<()> = Table(&[
-    Command { name: "echo", args: NO_ARGS, run: () },
-    Command { name: "exit", args: NO_ARGS, run: () },
-    Command { name: "crash", args: CRASH_ARGS, run: () },
-    Command { name: "clear", args: NO_ARGS, run: () },
-    Command { name: "clocks", args: NO_ARGS, run: () },
+    Command { name: "echo", args: NO_ARGS, usage: "", about: "", run: () },
+    Command { name: "exit", args: NO_ARGS, usage: "", about: "", run: () },
+    Command { name: "crash", args: CRASH_ARGS, usage: "", about: "", run: () },
+    Command { name: "clear", args: NO_ARGS, usage: "", about: "", run: () },
+    Command { name: "clocks", args: NO_ARGS, usage: "", about: "", run: () },
 ]);
 
 #[test]
