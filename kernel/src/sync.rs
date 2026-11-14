@@ -254,11 +254,13 @@ crate::ktest!(
         // CPUs 0 and 1 hammer one lock together with `lock` and `try_lock`:
         // they really contend (some `try_lock` fails), every critical
         // section sees the lock held by its own CPU, and no increment is
-        // lost (mutual exclusion). Each does at least `ROUNDS` rounds, then
-        // goes on until either has seen a `try_lock` fail: under KVM the
-        // host can stop one vCPU for longer than the other's whole run
-        // (#85), so a fixed count needn't overlap. `CONTENTION_NS` bounds
-        // that, well inside the 10 s `DONE` wait below
+        // lost (mutual exclusion). Each counts its `ROUNDS` rounds from when
+        // either first sees a `try_lock` fail, so they're spent together:
+        // under KVM the host can stop one vCPU for longer than the other's
+        // whole run (#85), and counted from the start they needn't overlap
+        // (or overlap in a handful of rounds, leaving the exclusion checks
+        // nothing to catch). Waiting for that first contention is bounded by
+        // `CONTENTION_NS`, well inside the 10 s `DONE` wait below
         // (`sched::TEST_DEADLINE_NS`).
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::{AtomicBool, AtomicU64};
@@ -272,15 +274,22 @@ crate::ktest!(
         static CONTENDED: AtomicBool = AtomicBool::new(false);
         /// CPU 1 is in its job.
         static READY: AtomicBool = AtomicBool::new(false);
-        /// 0 until both start hammering; then the `now_ns` past which,
-        /// with `ROUNDS` done, both stop even without contention.
+        /// 0 until both start hammering; then the `now_ns` past which
+        /// neither waits any longer for contention.
         static GO_UNTIL: AtomicU64 = AtomicU64::new(0);
         static DONE: AtomicBool = AtomicBool::new(false);
         /// The rounds this CPU entered the lock in, and all its rounds.
         fn hammer(until: u64) -> (u64, u64) {
             let mut entered = 0;
             let mut rounds = 0;
-            while rounds < ROUNDS || (!CONTENDED.load(Ordering::Relaxed) && crate::time::now_ns() < until) {
+            // Rounds since contention was first seen.
+            let mut together = 0;
+            while together < ROUNDS {
+                if CONTENDED.load(Ordering::Relaxed) {
+                    together += 1;
+                } else if crate::time::now_ns() >= until {
+                    break;
+                }
                 let guard = if rounds % 2 == 0 { Some(HOT.lock()) } else { HOT.try_lock() };
                 match guard {
                     Some(mut g) => {
@@ -320,8 +329,9 @@ crate::ktest!(
         let (entered_here, rounds_here) = hammer(until);
         let ran_us = (crate::time::now_ns() - start) / 1000;
         let done = crate::smp::job_reached(1, || DONE.load(Ordering::Acquire));
-        // Before any verdict: a CPU with few rounds was stopped meanwhile;
-        // both with many and no contention would be a broken lock.
+        // Before any verdict. Without contention, a CPU with few rounds was
+        // stopped (or came after the deadline); both with millions would
+        // be a broken lock.
         crate::ktest::diag(format_args!(
             "cpu 0: {rounds_here} rounds in {ran_us} us; cpu 1: {}",
             if done { alloc::format!("{} rounds", ROUNDS_THERE.load(Ordering::Relaxed)) } else { "not done".into() }
