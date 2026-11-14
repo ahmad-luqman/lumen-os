@@ -42,11 +42,13 @@ const HISTORY: usize = 100;
 /// shorter than it: the editor doesn't wrap).
 const SERIAL_COLUMNS: usize = 80;
 
-/// What a command can use: its console and the shell's history.
+/// What a command can use: its console (output, and keys through
+/// [`Ctx::poll_key`]/[`Ctx::wait_key`]) and the shell's history.
 pub struct Ctx<'a> {
     /// The console. On the screen a `write!` is formatted under the screen's
     /// lock, so what it formats must not allocate (arguments that allocate,
-    /// like a `join`, are made before the call).
+    /// like a `join`, are made before the call). While a `term::Canvas`
+    /// exists, screen output reaches the terminal but isn't drawn.
     pub out: &'a mut dyn Console,
     /// Whether the console takes escape codes.
     pub ansi: bool,
@@ -57,11 +59,16 @@ pub struct Ctx<'a> {
 impl Ctx<'_> {
     /// The next key typed on this console, if one is waiting (never
     /// blocks): for a command that runs until a key (`q`, Ctrl-C) stops it.
+    /// On the screen, Shift+PageUp/PageDown still scroll the terminal and
+    /// aren't returned, and keys the line editor doesn't take (Esc, F1) are
+    /// dropped. Keys typed ahead for the next line are taken too.
     pub fn poll_key(&mut self) -> Option<Key> {
         self.out.try_key()
     }
 
-    /// Wait for the next key typed on this console.
+    /// Wait for the next key typed on this console (see [`Self::poll_key`]):
+    /// on the screen the thread sleeps until IRQ 1; on serial it polls,
+    /// yielding to the CPU's other threads.
     pub fn wait_key(&mut self) -> Key {
         self.out.read_key()
     }
@@ -205,21 +212,25 @@ impl Write for Screen {
 }
 
 impl Screen {
-    /// The line editor's key for `key`, after Shift+PageUp/PageDown (which
-    /// scroll the screen) and keys it doesn't take; one it takes shows the
-    /// screen again.
+    /// A key from the keyboard: Shift+PageUp/PageDown scroll the screen and
+    /// give `None`, as does a key the line editor doesn't take; any other
+    /// brings the view back to the bottom and is the editor's key.
     fn take(key: keyboard::Key) -> Option<Key> {
         match key {
-            keyboard::Key::Raw { code: KeyCode::PageUp, shift: true } => crate::term::scroll_half_pages(1),
-            keyboard::Key::Raw { code: KeyCode::PageDown, shift: true } => crate::term::scroll_half_pages(-1),
+            keyboard::Key::Raw { code: KeyCode::PageUp, shift: true } => {
+                crate::term::scroll_half_pages(1);
+                None
+            }
+            keyboard::Key::Raw { code: KeyCode::PageDown, shift: true } => {
+                crate::term::scroll_half_pages(-1);
+                None
+            }
             _ => {
-                if let Some(key) = screen_key(key) {
-                    crate::term::reset_view();
-                    return Some(key);
-                }
+                let key = screen_key(key)?;
+                crate::term::reset_view();
+                Some(key)
             }
         }
-        None
     }
 }
 
@@ -243,12 +254,14 @@ impl Console for Screen {
 }
 
 /// A console for the tests: what is written to it, and keys typed on it
-/// (`read_key` with none left is Ctrl-C).
+/// (`read_key` with none left is Ctrl-C, and sets `ran_dry`: a test that
+/// meant its own keys to stop a command checks it stayed false).
 #[cfg(feature = "ktest")]
 #[derive(Default)]
 pub struct Captured {
     pub text: String,
     pub keys: alloc::collections::VecDeque<Key>,
+    pub ran_dry: bool,
 }
 
 #[cfg(feature = "ktest")]
@@ -262,7 +275,10 @@ impl Write for Captured {
 #[cfg(feature = "ktest")]
 impl Console for Captured {
     fn read_key(&mut self) -> Key {
-        self.keys.pop_front().unwrap_or(Key::Ctrl('c'))
+        self.keys.pop_front().unwrap_or_else(|| {
+            self.ran_dry = true;
+            Key::Ctrl('c')
+        })
     }
 
     fn try_key(&mut self) -> Option<Key> {
