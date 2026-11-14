@@ -38,8 +38,8 @@ static LINE_LOCK: SpinLock<()> = SpinLock::new(());
 
 /// Run `f` holding the log's line lock, so no log line (or other serial
 /// write) lands in the middle of what it does. `f` must not re-take it: no
-/// logging, [`LockedSerial`], `kassert!` or `ktest::diag` inside (a hang
-/// today; a crash report once `SpinLock` detects re-locks, #60).
+/// logging, [`LockedSerial`], `kassert!` or `ktest::diag` inside (the
+/// re-lock is a crash report: `crash relocklog`).
 pub fn with_line_lock<R>(f: impl FnOnce() -> R) -> R {
     let _line = LINE_LOCK.lock();
     f()
