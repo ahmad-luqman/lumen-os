@@ -38,6 +38,10 @@ fn check_invariants(t: &Terminal) {
     for r in 0..g.rows {
         for c in 0..g.cols {
             let cell = g.at(c, r);
+            assert!(
+                !(cell.flags.contains(Flags::WIDE) && cell.flags.contains(Flags::SPACER)),
+                "both halves at ({c}, {r})"
+            );
             if cell.flags.contains(Flags::WIDE) {
                 assert!(c + 1 < g.cols && g.at(c + 1, r).flags.contains(Flags::SPACER), "lone wide at ({c}, {r})");
             }
@@ -177,7 +181,10 @@ fn inserting_and_deleting_cells_and_lines() {
     assert_eq!(at(&t), (0, 1));
     t.write(b"\x1b[2M");
     assert_eq!(lines(&t), ["a", "c", "", ""]);
-    // Lines inserted and deleted never go to the scrollback.
+    // Lines inserted and deleted never go to the scrollback, not even
+    // deleted from the top row.
+    t.write(b"\x1b[H\x1b[M");
+    assert_eq!(lines(&t), ["c", "", "", ""]);
     assert_eq!(t.scrollback_len(), 0);
 }
 
@@ -427,6 +434,9 @@ fn random_input_keeps_the_grid_consistent() {
         "\x1bH",
         "\x1b]",
         "\x07",
+        "\x1b[3J",
+        "\x1b[2;3r",
+        "\x1b[r",
     ];
     let mut rng = Rng(0x5eed_1234_abcd_ef01);
     for case in 0..2000 {
@@ -524,4 +534,137 @@ fn damage_marks_changed_rows_and_records_scrolls() {
     // The cursor moving changes no cells.
     t.write(b"\x1b[2;2H\x1b[A");
     assert_eq!(take(&mut t), (None, std::vec![false; 4]));
+}
+
+#[test]
+fn reverse_index_moves_up_away_from_the_top() {
+    let mut t = term(4, 4, "a\r\nb\r\nc");
+    t.write(b"\x1b[3;2H\x1bM");
+    assert_eq!(at(&t), (1, 1));
+    assert_eq!(lines(&t), ["a", "b", "c", ""]);
+}
+
+#[test]
+fn operations_inside_and_outside_a_scroll_region() {
+    let fill = "a\r\nb\r\nc\r\nd\r\ne\r\nf";
+    // SU and SD scroll the region only.
+    let mut t = term(4, 6, fill);
+    t.write(b"\x1b[2;4r\x1b[S");
+    assert_eq!(lines(&t), ["a", "c", "d", "", "e", "f"]);
+    t.write(b"\x1b[2T");
+    assert_eq!(lines(&t), ["a", "", "", "c", "e", "f"]);
+    assert_eq!(t.scrollback_len(), 0);
+    // Cursor down, next line and previous line stop at the region's edges
+    // inside it.
+    t.write(b"\x1b[3;2H\x1b[9B");
+    assert_eq!(at(&t), (1, 3));
+    t.write(b"\x1b[2;1H\x1b[9E");
+    assert_eq!(at(&t), (0, 3));
+    t.write(b"\x1b[9F");
+    assert_eq!(at(&t), (0, 1));
+    // Below the region they use the screen: down moves down, and so does a
+    // line feed above the last row.
+    t.write(b"\x1b[5;1H\x1b[B");
+    assert_eq!(at(&t), (0, 5));
+    t.write(b"\x1b[5;1H\n");
+    assert_eq!(at(&t), (0, 5));
+    assert_eq!(lines(&t), ["a", "", "", "c", "e", "f"]);
+    // Inserting or deleting lines outside the region does nothing.
+    let mut t = term(4, 6, fill);
+    t.write(b"\x1b[3;5r\x1b[1;1H\x1b[L\x1b[6;1H\x1b[M");
+    assert_eq!(lines(&t), ["a", "b", "c", "d", "e", "f"]);
+    // A region from the top row that isn't the whole screen (a status line
+    // below it) keeps no history.
+    let mut t = term(4, 4, "a\r\nb\r\nc\r\nz");
+    t.write(b"\x1b[1;3r\x1b[3;1H\n\n");
+    assert_eq!(lines(&t), ["c", "", "", "z"]);
+    assert_eq!(t.scrollback_len(), 0);
+}
+
+#[test]
+fn erase_to_the_cursor_includes_its_column() {
+    let mut t = term(5, 1, "abcde");
+    t.write(b"\x1b[3G\x1b[1K");
+    assert_eq!(line(&t, 0), "   de");
+}
+
+#[test]
+fn bright_backgrounds_and_attribute_resets() {
+    let t = term(10, 1, "\x1b[100ma\x1b[107mb\x1b[44;49mc\x1b[1;7m\x1b[22md\x1b[1;7m\x1b[27me");
+    assert_eq!(t.cell(0, 0).bg, Color::Indexed(8));
+    assert_eq!(t.cell(1, 0).bg, Color::Indexed(15));
+    assert_eq!(t.cell(2, 0).bg, Color::Default);
+    assert_eq!(t.cell(3, 0).flags, Flags::INVERSE);
+    assert_eq!(t.cell(4, 0).flags, Flags::BOLD);
+    // Truecolor in both forms, each channel on its own (the nearest cube
+    // entry: 255 is level 5, 135 level 2, 0 level 0; 95 level 1, 215 level 4).
+    let t = term(4, 1, "\x1b[38:2::255:135:0ma\x1b[48;2;0;95;215mb");
+    assert_eq!(t.cell(0, 0).fg, Color::Indexed(16 + 36 * 5 + 6 * 2));
+    assert_eq!(t.cell(1, 0).bg, Color::Indexed(16 + 6 + 4));
+}
+
+#[test]
+fn reset_restores_tabs_modes_and_the_saved_cursor() {
+    let mut t = term(20, 3, "\x1b[3;5H\x1b7\x1b[3g\x1b[?7l\x1bc");
+    // Autowrap is back on.
+    t.write(b"\x1b[1;20Hxy");
+    assert_eq!(lines(&t)[..2], ["                   x", "y"]);
+    // Tab stops are back, and nothing is saved (restore goes home).
+    t.write(b"\r\t");
+    assert_eq!(at(&t), (8, 1));
+    t.write(b"\x1b8");
+    assert_eq!(at(&t), (0, 0));
+}
+
+#[test]
+fn pending_wraps_with_autowrap_and_save() {
+    // Turning autowrap off cancels a pending wrap.
+    let mut t = term(3, 2, "abc\x1b[?7lX");
+    assert_eq!(lines(&t), ["abX", ""]);
+    // A saved pending wrap comes back with the cursor.
+    t.write(b"\x1b[?7h\x1bc");
+    t.write(b"abc\x1b7\x1b[2;1H\x1b8d");
+    assert_eq!(lines(&t), ["abc", "d"]);
+    // ... but not once autowrap is off.
+    let t = term(3, 2, "abc\x1b7\x1b[?7l\x1b8d");
+    assert_eq!(lines(&t), ["abd", ""]);
+    // A wide character at the last column without autowrap is dropped.
+    let t = term(3, 1, "\x1b[?7lab\u{4e00}");
+    assert_eq!(line(&t, 0), "ab");
+    // A tab clears a pending wrap.
+    let t = term(10, 2, "0123456789\tx");
+    assert_eq!(lines(&t), ["012345678x", ""]);
+    // A wide character that doesn't fit blanks the last column first.
+    let t = term(4, 2, "abcd\x1b[1;4H\u{4e00}");
+    assert_eq!(lines(&t), ["abc", "\u{4e00}"]);
+}
+
+#[test]
+fn scrolls_and_inserts_bring_in_the_pen_background() {
+    let mut t = term(4, 3, "a\r\nb\r\nc\x1b[44m\n");
+    assert_eq!(t.cell(0, 2).bg, Color::Indexed(4));
+    t.write(b"\x1b[H\x1b[L");
+    assert_eq!(t.cell(3, 0).bg, Color::Indexed(4));
+    t.write(b"\x1b[2;1H\x1b[2@");
+    assert_eq!(t.cell(0, 1).bg, Color::Indexed(4));
+}
+
+#[test]
+fn erasing_scrollback_while_scrolled_back_redraws() {
+    let mut t = Terminal::new(4, 2, 10);
+    t.write(b"a\r\nb\r\nc\r\nd");
+    t.scroll_view(2);
+    let _ = (t.take_scroll(), (0..2).map(|r| t.take_dirty(r)).count());
+    t.write(b"\x1b[3J");
+    assert_eq!(t.view_offset(), 0);
+    assert!((0..2).all(|r| t.take_dirty(r)));
+    assert_eq!(lines(&t), ["c", "d"]);
+}
+
+#[test]
+fn save_with_parameters_saves_nothing() {
+    let mut t = term(10, 3, "\x1b[2;3H\x1b[s\x1b[3;5H\x1b[1;2s\x1b[H\x1b[u");
+    assert_eq!(at(&t), (2, 1));
+    t.write(b"\x1b[`");
+    assert_eq!(at(&t), (0, 1));
 }

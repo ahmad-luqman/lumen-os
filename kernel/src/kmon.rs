@@ -1,6 +1,6 @@
 //! Kernel monitor: a tiny line-based console (typed on serial or the PS/2
 //! keyboard; output on serial and the screen's terminal, where Shift+PageUp
-//! and Shift+PageDown scroll back).
+//! and Shift+PageDown scroll the view back and forward).
 //!
 //! This is a debugging and testing aid, not the shell. It exists so the test
 //! harness can script the kernel over serial (and trigger deliberate faults)
@@ -18,13 +18,20 @@ const MAX_LINE: usize = 128;
 
 /// kmon's output: serial and the screen. Serial gets plain text only (the
 /// harness reads it), so escape sequences go to the screen alone
-/// ([`crate::term::write_bytes`]).
+/// ([`Screen`]). Each `write!` reaches the screen whole (one lock), not in
+/// pieces another CPU's log line could land between.
 struct Out;
 
 impl Write for Out {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         serial::write_bytes(s.as_bytes());
         crate::term::write_str(s);
+        Ok(())
+    }
+
+    fn write_fmt(&mut self, args: core::fmt::Arguments<'_>) -> core::fmt::Result {
+        serial::SerialWriter.write_fmt(args)?;
+        crate::term::write_fmt(args);
         Ok(())
     }
 }
@@ -50,8 +57,7 @@ pub fn run() -> ! {
 /// Typing on the keyboard shows the screen again if it was scrolled back;
 /// Shift+PageUp and Shift+PageDown scroll it by half a screen.
 fn try_read_byte() -> Option<u8> {
-    use crate::keyboard::Key;
-    use pc_keyboard::KeyCode;
+    use crate::keyboard::{Key, KeyCode};
     if let Some(b) = serial::try_read_byte() {
         return Some(b);
     }
@@ -196,7 +202,7 @@ fn dispatch(line: &str) {
                 let _ = writeln!(
                     out,
                     "term: {}x{}, cursor ({}, {}){}, scrollback {}/{} lines, view {} lines up, \
-                     top row \"{}\", {} cells drawn, {} log lines dropped",
+                     top row \"{}\", {} cells drawn",
                     t.cols,
                     t.rows,
                     t.cursor.col,
@@ -206,17 +212,18 @@ fn dispatch(line: &str) {
                     t.capacity,
                     t.view,
                     t.top_row,
-                    t.cells_drawn,
-                    t.dropped
+                    t.cells_drawn
                 );
             }
             None => {
-                let _ = writeln!(out, "term: no terminal (no usable framebuffer)");
+                let _ = writeln!(out, "term: no terminal (no usable framebuffer, or one too small)");
             }
         },
         "clear" => {
             // Home, erase the screen, erase the scrollback.
-            crate::term::write_bytes(b"\x1b[H\x1b[2J\x1b[3J");
+            if !crate::term::write_bytes(b"\x1b[H\x1b[2J\x1b[3J") {
+                let _ = writeln!(out, "clear: no terminal");
+            }
         }
         "colors" => colors(),
         "seq" => match rest.trim().parse::<u32>() {
@@ -250,6 +257,10 @@ fn dispatch(line: &str) {
 /// the 6x6x6 cube and the grey ramp (256-colour SGR), bold, inverse and a
 /// truecolor gradient; then `colors: done` on both.
 fn colors() {
+    if crate::term::status().is_none() {
+        let _ = writeln!(Out, "colors: no terminal");
+        return;
+    }
     let mut s = Screen;
     let _ = write!(s, "16 colours  ");
     for i in 0..16 {
@@ -289,12 +300,18 @@ fn colors() {
     let _ = writeln!(Out, "colors: done");
 }
 
-/// Writes to the screen only (escape sequences, kept off serial).
+/// Writes to the screen only (escape sequences, kept off serial), each
+/// `write!` whole.
 struct Screen;
 
 impl Write for Screen {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         crate::term::write_bytes(s.as_bytes());
+        Ok(())
+    }
+
+    fn write_fmt(&mut self, args: core::fmt::Arguments<'_>) -> core::fmt::Result {
+        crate::term::write_raw_fmt(args);
         Ok(())
     }
 }

@@ -33,17 +33,18 @@ pub const MARGIN: usize = 32;
 #[derive(Clone, Copy)]
 pub struct Framebuffer {
     base: *mut u8,
-    pub width: usize,
-    pub height: usize,
+    width: usize,
+    height: usize,
     pitch: usize,
     red_shift: u8,
     green_shift: u8,
     blue_shift: u8,
 }
 
-// SAFETY: the framebuffer is plain MMIO-like memory owned by the kernel; all
-// access goes through the terminal's lock (or the crash path, after it has
-// stopped the other CPUs or named those that didn't stop).
+// SAFETY: the framebuffer is plain MMIO-like memory owned by the kernel. Two
+// copies draw: the terminal's, under its lock, and the crash screen's (from
+// `FRAMEBUFFER`), after the crash path stopped the terminal (`term::stop`)
+// and the other CPUs, or named those that didn't stop.
 unsafe impl Send for Framebuffer {}
 
 impl Framebuffer {
@@ -52,7 +53,7 @@ impl Framebuffer {
         (r << self.red_shift) | (g << self.green_shift) | (b << self.blue_shift)
     }
 
-    pub fn put(&mut self, x: usize, y: usize, rgb: u32) {
+    fn put(&mut self, x: usize, y: usize, rgb: u32) {
         if x < self.width && y < self.height {
             let px = self.encode(rgb);
             // SAFETY: (x, y) is inside the framebuffer and pixels are 32-bit.
@@ -70,12 +71,34 @@ impl Framebuffer {
 
     /// Draw one glyph (`?` for one the font lacks); returns its advance
     /// width.
-    pub fn glyph(&mut self, x: usize, y: usize, c: char, st: Style) -> usize {
+    fn glyph(&mut self, x: usize, y: usize, c: char, st: Style) -> usize {
         self.glyph_clipped(x, y, c, st, usize::MAX)
     }
 
-    /// Draw one glyph, at most `max_w` pixels of it wide; returns how many
-    /// columns it drew.
+    /// Width in pixels.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Height in pixels.
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// The pixel at (`x`, `y`) as stored (0 outside the framebuffer; for the
+    /// tests).
+    #[cfg(feature = "ktest")]
+    pub fn pixel(&self, x: usize, y: usize) -> u32 {
+        if x < self.width && y < self.height {
+            // SAFETY: (x, y) is inside the framebuffer and pixels are 32-bit.
+            unsafe { (self.base.add(y * self.pitch + x * 4) as *const u32).read_volatile() }
+        } else {
+            0
+        }
+    }
+
+    /// Draw one glyph, at most `max_w` pixels of it wide; returns its
+    /// advance in pixels, clipped to `max_w`.
     pub fn glyph_clipped(&mut self, x: usize, y: usize, c: char, st: Style, max_w: usize) -> usize {
         let raster = get_raster(c, st.weight, st.size).or_else(|| get_raster('?', st.weight, st.size));
         let Some(raster) = raster else { return get_raster_width(st.weight, st.size).min(max_w) };
@@ -122,10 +145,10 @@ impl Framebuffer {
 /// How to draw text: font weight, size and colors.
 #[derive(Clone, Copy)]
 pub struct Style {
-    pub weight: FontWeight,
-    pub size: RasterHeight,
-    pub fg: u32,
-    pub bg: u32,
+    weight: FontWeight,
+    size: RasterHeight,
+    fg: u32,
+    bg: u32,
 }
 
 impl Style {
@@ -201,7 +224,12 @@ static FRAMEBUFFER: SpinLock<Option<Framebuffer>> = SpinLock::new(None);
 ///
 /// Returns the resolution, or `None` if there is no usable 32-bpp framebuffer.
 pub fn init(fb: &limine::framebuffer::Framebuffer<'_>) -> Option<(usize, usize)> {
-    if fb.bpp() != 32 || fb.red_mask_size() != 8 || fb.green_mask_size() != 8 || fb.blue_mask_size() != 8 {
+    if fb.bpp() != 32
+        || fb.red_mask_size() != 8
+        || fb.green_mask_size() != 8
+        || fb.blue_mask_size() != 8
+        || fb.pitch() < fb.width() * 4
+    {
         return None;
     }
     let mut f = Framebuffer {

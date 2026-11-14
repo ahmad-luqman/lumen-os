@@ -42,7 +42,7 @@ use lumen_queue::ByteQueue;
 use pc_keyboard::layouts::{
     AnyLayout, Azerty, Colemak, De105Key, Dvorak104Key, FiSe105Key, Jis109Key, No105Key, Uk105Key, Us104Key,
 };
-use pc_keyboard::{DecodedKey, HandleControl, KeyCode, PS2Keyboard, ScancodeSet1};
+use pc_keyboard::{DecodedKey, HandleControl, PS2Keyboard, ScancodeSet1};
 
 use crate::arch::i8042;
 use crate::interrupts::{self, Route};
@@ -475,7 +475,10 @@ fn drain() {
     }
 }
 
-/// A key read from the keyboard.
+pub use pc_keyboard::KeyCode;
+
+/// A key read from the keyboard. (Only shift is reported; the shell, #62,
+/// will need ctrl and alt.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
     /// A key making a character, in the layout.

@@ -7,26 +7,31 @@
 //! the framebuffer; tests read it back.
 //!
 //! Everything is allocated in [`Terminal::new`]: writing never allocates, so
-//! the kernel can log while it holds the frame allocator's lock (a host test
-//! checks it with a counting allocator).
+//! the kernel can log while it holds the frame allocator's or the page
+//! tables' lock (a host test checks it with a counting allocator).
 //!
 //! Supported:
 //! - printing with autowrap (the cursor waits at the last column until the
 //!   next character), wide characters (two cells; `unicode-width`, ambiguous
 //!   ones narrow), zero-width characters dropped;
-//! - C0: BS, HT, LF/VT/FF (without a carriage return: the writer adds it),
-//!   CR;
+//! - C0: BS, HT, LF/VT/FF (without a carriage return: a writer that wants
+//!   one adds it), CR;
 //! - ESC 7/8 (save/restore the cursor), D (index), E (next line),
-//!   M (reverse index), H (set a tab stop), c (reset);
+//!   M (reverse index), H (set a tab stop), c (reset: the screen, cursor,
+//!   pen, region, tabs and modes, not the scrollback or the view);
 //! - CSI: cursor movement A B C D E F G H f d \`, erase J (0 to 3) K X,
 //!   insert and delete @ P L M, scroll S T, SGR m, scroll region r, save and
 //!   restore s u, tab clear g, DECSET/DECRST `?25` (cursor) and `?7`
 //!   (autowrap);
-//! - SGR: reset, bold, inverse, 16 colours (30-37, 90-97, 40-47, 100-107),
+//! - SGR: reset, bold and inverse (on 1 7, off 22 27), 16 colours (30-37,
+//!   90-97, 40-47, 100-107),
 //!   256 colours (`38;5;n`, `48;5;n`, also with colons), truecolor
 //!   (`38;2;r;g;b`) approximated to the nearest of the 256, defaults 39 49.
 //!
 //! Anything else (OSC, DCS, unknown sequences, malformed ones) is ignored.
+//! Lines go to the scrollback when they leave the top of a scroll region
+//! that is the whole screen (a line feed, or `CSI S`); lines deleted
+//! (`CSI M`) never do.
 //!
 //! The view can be scrolled back into the scrollback ([`Terminal::scroll_view`]);
 //! output doesn't move it: it stays on the lines it shows while new ones
@@ -51,7 +56,8 @@ const TAB_WIDTH: usize = 8;
 
 /// A scroll of the view's rows `top..bottom` by `lines` (positive: up, as a
 /// line feed at the bottom does) that hasn't been drawn yet: the renderer can
-/// move pixels instead of drawing every cell again.
+/// move pixels instead of drawing every cell again. Always
+/// `top < bottom <= rows`, `lines != 0` and `|lines| < bottom - top`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Scroll {
     pub top: usize,
@@ -77,6 +83,11 @@ struct Pen {
 
 impl Pen {
     const DEFAULT: Pen = Pen { fg: Color::Default, bg: Color::Default, flags: Flags::NONE };
+
+    /// A cell showing `ch` in the pen's colours, with its flags plus `extra`.
+    fn cell(self, ch: char, extra: Flags) -> Cell {
+        Cell { ch, fg: self.fg, bg: self.bg, flags: self.flags.union(extra) }
+    }
 }
 
 /// What ESC 7 / CSI s save.
@@ -273,9 +284,7 @@ impl Grid {
             return;
         }
         if self.wrap_pending {
-            self.wrap_pending = false;
-            self.col = 0;
-            self.line_feed();
+            self.next_line();
         }
         if width == 2 && self.col + 1 == self.cols {
             if !self.autowrap {
@@ -284,16 +293,15 @@ impl Grid {
             // No room for both halves: leave the last column blank and wrap.
             let row = self.row;
             self.erase(row, self.col..self.cols);
-            self.col = 0;
-            self.line_feed();
+            self.next_line();
         }
         let (col, row, pen) = (self.col, self.row, self.pen);
         let r = self.row_mut(row);
         if width == 2 {
-            r[col] = Cell { ch, fg: pen.fg, bg: pen.bg, flags: pen.flags.union(Flags::WIDE) };
-            r[col + 1] = Cell { ch: ' ', fg: pen.fg, bg: pen.bg, flags: pen.flags.union(Flags::SPACER) };
+            r[col] = pen.cell(ch, Flags::WIDE);
+            r[col + 1] = pen.cell(' ', Flags::SPACER);
         } else {
-            r[col] = Cell { ch, fg: pen.fg, bg: pen.bg, flags: pen.flags };
+            r[col] = pen.cell(ch, Flags::NONE);
         }
         self.fix_wide(row);
         self.touch(row);
@@ -321,15 +329,27 @@ impl Grid {
         if (self.top..self.bottom).contains(&self.row) { (self.top, self.bottom) } else { (0, self.rows) }
     }
 
+    /// Move down a line, scrolling at the bottom of the region (a pending
+    /// wrap is cancelled).
     fn line_feed(&mut self) {
+        self.wrap_pending = false;
         if self.row + 1 == self.bottom {
-            self.scroll_up(self.top, self.bottom, 1);
+            self.scroll_up(self.top, self.bottom, 1, true);
         } else if self.row + 1 < self.rows {
             self.row += 1;
         }
     }
 
+    /// A line feed, at the start of the line.
+    fn next_line(&mut self) {
+        self.col = 0;
+        self.line_feed();
+    }
+
+    /// Move up a line, scrolling at the top of the region (a pending wrap
+    /// is cancelled).
     fn reverse_index(&mut self) {
+        self.wrap_pending = false;
         if self.row == self.top {
             self.scroll_down(self.top, self.bottom, 1);
         } else if self.row > 0 {
@@ -337,14 +357,14 @@ impl Grid {
         }
     }
 
-    /// Scroll rows `top..bottom` up by `n`; lines leaving the top of the
-    /// whole screen go to the scrollback.
-    fn scroll_up(&mut self, top: usize, bottom: usize, n: usize) {
+    /// Scroll rows `top..bottom` up by `n`; with `keep`, lines leaving the
+    /// top of the whole screen go to the scrollback.
+    fn scroll_up(&mut self, top: usize, bottom: usize, n: usize, keep: bool) {
         let n = n.min(bottom - top);
         if n == 0 {
             return;
         }
-        if top == 0 && bottom == self.rows {
+        if keep && top == 0 && bottom == self.rows {
             for r in 0..n {
                 self.keep(r);
             }
@@ -491,7 +511,7 @@ impl Grid {
         if insert {
             self.scroll_down(self.row, self.bottom, n);
         } else {
-            self.scroll_up(self.row, self.bottom, n);
+            self.scroll_up(self.row, self.bottom, n, false);
         }
         self.col = 0;
         self.wrap_pending = false;
@@ -531,10 +551,8 @@ impl Grid {
                 49 => pen.bg = Color::Default,
                 n @ (38 | 48) => {
                     let color = if p.len() > 1 { extended(&p[1..]) } else { extended_from(&mut it) };
-                    match (color, n) {
-                        (Some(c), 38) => pen.fg = c,
-                        (Some(c), _) => pen.bg = c,
-                        (None, _) => {}
+                    if let Some(c) = color {
+                        if n == 38 { pen.fg = c } else { pen.bg = c }
                     }
                 }
                 _ => {}
@@ -578,9 +596,9 @@ fn truecolor(r: u16, g: u16, b: u16) -> Option<Color> {
 
 /// A sequence's `i`th parameter; `default` when missing or 0.
 fn arg(params: &vte::Params, i: usize, default: u16) -> usize {
-    match params.iter().nth(i).map(|p| p[0]) {
-        None | Some(0) => usize::from(default),
-        Some(n) => usize::from(n),
+    match arg0(params, i) {
+        0 => usize::from(default),
+        n => usize::from(n),
     }
 }
 
@@ -601,10 +619,7 @@ impl vte::Perform for Grid {
                 self.wrap_pending = false;
             }
             0x09 => self.tab(),
-            0x0a..=0x0c => {
-                self.wrap_pending = false;
-                self.line_feed();
-            }
+            0x0a..=0x0c => self.line_feed(),
             0x0d => {
                 self.col = 0;
                 self.wrap_pending = false;
@@ -661,7 +676,7 @@ impl vte::Perform for Grid {
             'P' => self.shift_cells(n, false),
             'L' => self.shift_lines(n, true),
             'M' => self.shift_lines(n, false),
-            'S' => self.scroll_up(self.top, self.bottom, n),
+            'S' => self.scroll_up(self.top, self.bottom, n, true),
             'T' => self.scroll_down(self.top, self.bottom, n),
             'm' => self.sgr(params),
             'r' => self.set_region(usize::from(arg0(params, 0)), usize::from(arg0(params, 1))),
@@ -685,19 +700,9 @@ impl vte::Perform for Grid {
         match byte {
             b'7' => self.save(),
             b'8' => self.restore(),
-            b'D' => {
-                self.wrap_pending = false;
-                self.line_feed();
-            }
-            b'E' => {
-                self.col = 0;
-                self.wrap_pending = false;
-                self.line_feed();
-            }
-            b'M' => {
-                self.wrap_pending = false;
-                self.reverse_index();
-            }
+            b'D' => self.line_feed(),
+            b'E' => self.next_line(),
+            b'M' => self.reverse_index(),
             b'H' => self.tabs[self.col] = true,
             b'c' => self.reset(),
             _ => {}
@@ -789,14 +794,21 @@ impl Terminal {
     }
 
     /// The scroll to draw before the dirty rows, if one is pending (taking
-    /// it).
+    /// it). Take it, and move what was drawn, before taking any row's mark:
+    /// the marks assume the scroll was drawn.
+    #[must_use]
     pub fn take_scroll(&mut self) -> Option<Scroll> {
         self.grid.scroll.take()
     }
 
     /// Whether row `row` of the view changed since it was last taken
-    /// (clearing the mark).
+    /// (clearing the mark), after the pending scroll ([`Self::take_scroll`]).
+    ///
+    /// # Panics
+    /// If `row >= rows()`.
+    #[must_use]
     pub fn take_dirty(&mut self, row: usize) -> bool {
+        debug_assert!(self.grid.scroll.is_none(), "take_scroll (and draw it) before take_dirty");
         core::mem::take(&mut self.grid.dirty[row])
     }
 

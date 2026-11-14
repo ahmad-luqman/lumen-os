@@ -7,10 +7,11 @@ from typing import NamedTuple
 from lumen_harness.image import assert_matches_golden
 from lumen_harness.qemu import Machine
 
-TERM_LINE = r"INFO  term: terminal (\d+)x(\d+), 500 lines of scrollback\n"
+# 1280x800 (limine.conf) less the header and margins, in 7x16 cells.
+TERM_LINE = r"INFO  term: terminal 176x41, 500 lines of scrollback\n"
 TERM_STATUS = re.compile(
     r"term: (\d+)x(\d+), cursor \((\d+), (\d+)\)( hidden)?, scrollback (\d+)/500 lines, "
-    r'view (\d+) lines up, top row "([^"]*)", (\d+) cells drawn, (\d+) log lines dropped\n'
+    r'view (\d+) lines up, top row "([^"]*)", (\d+) cells drawn\n'
 )
 # The terminal's top-left pixel and its cells' height.
 TOP, CELL_H = 144, 16
@@ -22,7 +23,6 @@ class TermStatus(NamedTuple):
     scrollback: int
     view: int
     top_row: str
-    dropped: int
 
 
 def term_status(m: Machine) -> TermStatus:
@@ -30,8 +30,8 @@ def term_status(m: Machine) -> TermStatus:
     m.send_line("term")
     found = m.expect(TERM_STATUS, 10)
     m.expect(r"kmon> ", 10)
-    cols, rows, _, _, _, scrollback, view, top_row, _, dropped = found.groups()
-    return TermStatus(int(cols), int(rows), int(scrollback), int(view), top_row, int(dropped))
+    cols, rows, _, _, _, scrollback, view, top_row, _ = found.groups()
+    return TermStatus(int(cols), int(rows), int(scrollback), int(view), top_row)
 
 
 def kmon(m: Machine, line: str, until: str = "") -> None:
@@ -42,8 +42,8 @@ def kmon(m: Machine, line: str, until: str = "") -> None:
     m.expect(r"kmon> ", 30)
 
 
-def boot_term(boot) -> Machine:
-    m = boot("qemutest")
+def boot_term(boot, cmdline: str | None = None) -> Machine:
+    m = boot("qemutest", cmdline=cmdline)
     m.expect(TERM_LINE, 60)
     m.expect(r"kmon> ", 60)
     return m
@@ -87,9 +87,7 @@ def test_scrollback(boot, artifacts, golden_dir):
     # debug level, which only serial shows); new output doesn't move the
     # view off the lines it shows (it only counts more lines up); a key
     # typed on the keyboard shows the screen again.
-    m = boot("qemutest", cmdline="lumen.log=debug")
-    m.expect(TERM_LINE, 60)
-    m.expect(r"kmon> ", 60)
+    m = boot_term(boot, cmdline="lumen.log=debug")
     kmon(m, "clear")
     kmon(m, "seq 100", r"\n100\n")
     before = term_status(m)
@@ -107,7 +105,7 @@ def test_scrollback(boot, artifacts, golden_dir):
     # Output while scrolled back: the view stays on its lines.
     kmon(m, "echo more")
     still = term_status(m)
-    assert (still.top_row, still.view > 2 * half) == (str(scrollback - 2 * half), True), still
+    assert still.top_row == str(scrollback - 2 * half) and still.view > 2 * half, still
     qmp.send_key(["shift", "pgdn"])
     view, top = view_moved(m)
     assert top == str(scrollback - half), (view, top)
@@ -124,4 +122,4 @@ def test_scrollback(boot, artifacts, golden_dir):
     m.press(["spc"], " ")
     assert view_moved(m)[0] == 0
     back = term_status(m)
-    assert (back.view, back.dropped) == (0, 0), back
+    assert back.view == 0, back

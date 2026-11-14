@@ -138,9 +138,9 @@ incomplete timeline is logged as a warning (not tested: every boot's
 timeline is complete; the scenario fails on the warning). Serial log lines
 start with the time since that origin, `[seconds.microseconds]`; every line
 before the TSC is calibrated (before `time: tsc ...`) shows `[    ?.??????]`, not a
-zero that would read as a measurement. The screen's console shows lines
-without timestamps, so screenshots stay comparable (not tested: the golden
-image covers only the header).
+zero that would read as a measurement. The screen's terminal shows lines
+up to `info` without timestamps, so screenshots stay comparable
+(`term::log_lines_are_coloured_by_level` checks the level starts the line).
 
 ### Other CPUs (SMP, built in M1)
 
@@ -801,7 +801,7 @@ off. A wake from another CPU queues the thread there and sends the
   over from power-on until the keyboard is set up (some of those bytes are
   skipped during setup).
 - **Not yet:** a blocking read for threads (the shell, #62), key releases
-  for programs, LEDs, the second port (a mouse), and hot-plug.
+  and modifiers other than shift for programs, LEDs, the second port (a mouse), and hot-plug.
 
 ### Terminal (built in M2)
 
@@ -812,7 +812,8 @@ off. A wake from another CPU queues the thread there and sends the
   into a grid of cells (a character, foreground and background, each the
   default or one of 256 colours, and flags: bold, inverse, the two halves
   of a wide character). It handles UTF-8, C0 controls (a line feed
-  without a carriage return: the kernel's writers add it), cursor
+  without a carriage return: `term::write_str`, `term::write_fmt` and log
+  lines turn `\n` into CR LF, `term::write_bytes` doesn't), cursor
   movement, save and restore, erasing (in the pen's background), inserting
   and deleting cells and lines, scrolling, scroll regions, tabs, autowrap
   (the cursor waits at the last column), cursor visibility, and SGR for 16
@@ -820,8 +821,9 @@ off. A wake from another CPU queues the thread there and sends the
   first 16 are Lumen's palette, the rest xterm's). Wide characters
   (`unicode-width`, ambiguous ones narrow) take two cells, and breaking
   one in half blanks the other; zero-width ones are dropped; unknown and
-  malformed sequences are ignored. Lines leaving the top of the whole
-  screen go into a scrollback ring (500 lines in the kernel). The view
+  malformed sequences are ignored. Lines leaving the top of a scroll
+  region that is the whole screen (a line feed, `CSI S`; never deleted
+  lines) go into a scrollback ring (500 lines in the kernel). The view
   scrolls back through it and stays on the lines it shows as new output
   arrives; `CSI 3 J` clears it. All of it is allocated in `Terminal::new`:
   writing never allocates (a host test counts allocations), because log
@@ -836,32 +838,38 @@ off. A wake from another CPU queues the thread there and sends the
   scroll moves the pixels (`Framebuffer::move_rows`) and the shadow (a copy
   of every cell drawn) together, and in each marked row only the cells that
   differ from the shadow are drawn (a ktest counts them: a line feed at the
-  bottom draws the new line's cells, not the screen). Bold uses the font's
-  bold weight; characters the font lacks (it has Basic Latin only) are drawn
-  as `?` (not tested on screen). Scrolling down on screen (reverse index,
-  inserted lines) is covered by the host model only. The boot CPU's timer
-  interrupt flips the cursor every 500 ms (skipping a blink rather than
-  waiting if another CPU is drawing; a ktest sees both phases, the pixels
-  not tested); a thread would switch and trace twice a blink. Output shows
-  it solid for a whole blink, and it is hidden while the view is scrolled
-  back.
+  bottom draws fewer cells than one row, not the screen; another draws
+  scrolls up and down, of the screen and of a region, and checks the
+  pixels against drawing every cell afresh). Bold uses the font's bold
+  weight; characters the font lacks (it has Basic Latin only) are drawn as
+  `?` (not tested on screen). On a framebuffer too small for one cell the
+  terminal is skipped with a warning (not tested). The boot CPU's timer
+  interrupt flips the cursor every 500 ms; if another CPU is drawing it
+  doesn't wait, the flip is retried on the next tick (a ktest sees both
+  phases; the pixels not tested). A thread would switch and trace twice a
+  blink. Output shows the cursor solid for a whole blink (not tested), and
+  it isn't drawn while the view is scrolled back.
 - **Writers:** log lines up to `info` are shown without the timestamp, the
   level coloured (ERROR bold red, WARN yellow, INFO green), the tag dimmed,
   errors' and warnings' messages coloured too (a ktest reads the cells).
   kmon's output and echo go to serial and the screen; escape sequences go to
   the screen only, so serial stays plain for the harness (`colors` draws a
-  test pattern on screen, then prints `colors: done` on both). A CPU that
-  is already drawing (an exception in the middle) doesn't wait for itself:
-  its log line is dropped from the screen and counted (`term` shows it; not
-  tested). Nothing is drawn once the crash screen is up (not tested), and
-  the crash screen draws straight to the pixels, not through the terminal,
-  its lock or the heap (a scenario checks its banner after an invalid opcode;
-  drawing it with a corrupt heap or the terminal's lock held is not
-  tested).
+  test pattern on screen, then prints `colors: done` on both). Each kmon
+  `write!` and each log line reaches the terminal under one lock, so
+  another CPU's log line never lands inside an escape sequence; a log line
+  starts from the default colours. Their arguments are formatted under the
+  lock, so they must not allocate. A CPU that is already drawing (an
+  exception in the middle) doesn't wait for itself: its line is left off
+  the screen (nothing on that path logs to the screen today; not tested).
+  Nothing is drawn once a crash report starts (`crash::enter` stops the
+  terminal; not tested), and the crash screen draws straight to the
+  pixels, not through the terminal, its lock or the heap (a scenario
+  checks its banner after an invalid opcode; drawing it with a corrupt heap
+  or the terminal's lock held is not tested).
 - **kmon:** `clear` (screen and scrollback), `colors`, `seq <n>`, and
   `term` (size, cursor, scrollback, the view's offset and top row, cells
-  drawn, log lines dropped). Shift+PageUp/PageDown scroll the view half a
-  screen (logged at debug level: serial only, the screen shows up to
+  drawn); without a terminal they say so. Shift+PageUp/PageDown scroll the
+  view half a screen (logged at debug level: serial only, the screen shows up to
   `info`); typing on the keyboard returns it to the bottom.
 - **Not yet:** virtual terminals (Alt+F1 to F4, ROADMAP M2), a font with
   more than Basic Latin, underline and other SGR attributes, the
