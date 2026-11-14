@@ -1,11 +1,12 @@
 # Features: script. See tests/features/README.md for the format.
 
 [[feature]]
-name = "rhai linked into the kernel with the code-generation audit passing (integers only, no modules, no closures)"
+name = "rhai linked into the kernel with the code-generation audit passing: integers only, no modules, closures that can't capture, curry disabled"
 milestone = "M2"
 tests = [
     "audit:flags",
     "scenario:test_script::test_rhai_eval",
+    "ktest:lumen_kernel::script::errors_are_one_line_and_name_the_limit",
 ]
 
 [[feature]]
@@ -17,7 +18,7 @@ tests = [
     "ktest:lumen_kernel::script::lumen_functions_answer",
     "ktest:lumen_kernel::script::errors_are_one_line_and_name_the_limit",
     "ktest:lumen_kernel::script::the_repl_keeps_going",
-    "ktest:lumen_kernel::shell::the_screen_console_writes_each_write_whole",
+    "ktest:lumen_kernel::shell::the_screen_console_formats_then_draws_each_write_whole",
     "scenario:test_script::test_screen_shell_scripts",
 ]
 
@@ -31,13 +32,15 @@ tests = [
 ]
 
 [[feature]]
-name = "A runaway script is stopped, with an error rather than a crash: Ctrl-C on serial or the keyboard (also in closures, functions, sleep and drawing loops); caps on operations, call depth, expression depth, variables, value sizes (which bound how deeply values nest), and heap growth; recursion and the deepest values fit in half the 1 MiB script stack"
+name = "A runaway script is stopped, with an error rather than a crash: Ctrl-C on serial or the keyboard (also in closures, functions, sleep and drawing loops); caps on operations, call depth, expression depth, variables, value sizes (which bound how deeply values nest), text made from a value, and heap growth over a session (a REPL's too); recursion and the deepest values fit in half the 1 MiB script stack"
 milestone = "M2"
 tests = [
     "scenario:test_script::test_runaway_script_is_stopped",
     "ktest:lumen_kernel::script::ctrl_c_stops_a_script",
     "ktest:lumen_kernel::script::limits_are_set",
     "ktest:lumen_kernel::script::the_heap_budget_stops_a_script",
+    "ktest:lumen_kernel::script::the_repl_heap_budget_lasts_the_session",
+    "ktest:lumen_kernel::script::text_made_from_a_value_is_bounded",
     "ktest:lumen_kernel::script::deep_recursion_is_an_error_not_a_crash",
     "ktest:lumen_kernel::script::nested_values_are_an_error_not_a_crash",
 ]

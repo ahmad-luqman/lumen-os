@@ -49,6 +49,16 @@ def test_rhai_eval(boot):
         == "rhai: Function not found: frobnicate () (line 1, position 1)\n"
     )
     assert run(m, "rhai -x") == "usage: rhai [-e <expr> | demo [name]]\n"
+    # A map holding one 60 KB string 8000 times (added by item assignment,
+    # which rhai counts only as the items) made into text: an error at a
+    # size limit, not 480 MB of text.
+    big = run(
+        m,
+        'rhai -e \'let s = "x"; s.pad(60000, "x"); let m = #{}; '
+        'for i in 0..8000 { m["k" + i] = s; } m.to_string().len()\'',
+        timeout=60,
+    )
+    assert big.startswith("rhai: more than ") and big.count("\n") == 1, big
     # The built-in scripts.
     demos = run(m, "rhai demo")
     assert demos.startswith("demos (rhai demo <name>):\n  rainbow ")
@@ -78,7 +88,7 @@ def test_script_draws_golden(boot, artifacts, golden_dir):
     # terminal is drawn again (its lines from before are back).
     m = shells(boot, ("-smp", "2"))
     m.send_line("rhai demo rainbow")
-    m.expect(r"rhai demo rainbow\nrhai: press a key\n", 30)
+    m.expect(r"rhai demo rainbow\nrhai: press a key on serial\n", 30)
     shot = m.screendump("rainbow.png")
     width, height = Image.open(shot).size
     assert_matches_golden(
@@ -114,8 +124,10 @@ def test_runaway_script_is_stopped(boot):
 
 
 def test_screen_shell_scripts(boot, artifacts):
-    # On the screen's shell: a value whose formatting allocates is printed
-    # (the screen console formats before drawing); the screen's size
+    # On the screen's shell: a value whose formatting allocates (a function
+    # pointer's `Debug`) is printed: the screen console formats each write
+    # before taking the screen's lock, under which the heap would panic;
+    # the screen's size
     # doesn't take the screen; a script that drew shows "press a key" on a
     # strip at the bottom of what it drew, and a key brings the terminal
     # back.
@@ -126,7 +138,7 @@ def test_screen_shell_scripts(boot, artifacts):
     expect_screen(m, r"^1280\nlumen>$")
     m.type_text("rhai -e 'draw_rect(0, 0, 100, 100, 0x00ff00)'\n")
     # (The terminal holds the line, drawn once the screen is given back.)
-    expect_screen(m, r"^rhai: press a key$")
+    expect_screen(m, r"^rhai: press a key on the keyboard$")
     shot = m.screendump("drawn.png")
     img = Image.open(shot).convert("RGB")
     width, height = img.size
@@ -136,4 +148,4 @@ def test_screen_shell_scripts(boot, artifacts):
     strip = [img.getpixel((x, y)) for x in range(8, 150) for y in range(height - 20, height - 4)]
     assert any(p[0] > 0x80 for p in strip)
     m.type_text(" ")
-    expect_screen(m, r"^rhai: press a key\nlumen>$")
+    expect_screen(m, r"^rhai: press a key on the keyboard\nlumen>$")

@@ -50,8 +50,9 @@ const SERIAL_COLUMNS: usize = 80;
 pub struct Ctx<'a> {
     /// The console. A `write!` reaches it whole (on the screen it is
     /// formatted first, then drawn under one lock; on serial it is
-    /// formatted under the log's line lock, so make text whose formatting
-    /// allocates, like a script's value, before the call). While a command holds the
+    /// formatted under the log's line lock, so a `Display` that logs would
+    /// take that lock again, a re-lock crash report: make such text before
+    /// the call). While a command holds the
     /// canvas (`term::status().paused`), screen output reaches the terminal
     /// but isn't drawn.
     pub out: &'a mut dyn Console,
@@ -417,7 +418,7 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn the_screen_console_writes_each_write_whole() {
+    fn the_screen_console_formats_then_draws_each_write_whole() {
         // A whole `write!` is formatted before taking the screen's lock (an
         // argument that allocates there would be refused by the heap), then
         // drawn as one piece.

@@ -360,7 +360,7 @@ pub fn canvas(owner: Owner) -> Result<Canvas, CanvasError> {
         // live (`Screen::canvas`), so the two never draw at the same time
         // (see `Canvas`'s `Sync` for a canvas no longer live).
         let fb = unsafe { s.fb.alias() };
-        let (width, height) = (fb.width(), fb.height().saturating_sub(fb::CONSOLE_TOP));
+        let (width, height) = canvas_dims(&fb);
         Ok(Canvas { fb, width, height, epoch })
     });
     match taken {
@@ -373,7 +373,12 @@ pub fn canvas(owner: Owner) -> Result<Canvas, CanvasError> {
 /// The size in pixels a [`Canvas`] has (or would have), without taking one;
 /// `None` without a terminal (or once a crash report started).
 pub fn canvas_size() -> Option<(usize, usize)> {
-    with_screen(|s| (s.fb.width(), s.fb.height().saturating_sub(fb::CONSOLE_TOP)))
+    with_screen(|s| canvas_dims(&s.fb))
+}
+
+/// The size of a canvas on `fb`: all of it below the header.
+fn canvas_dims(fb: &Framebuffer) -> (usize, usize) {
+    (fb.width(), fb.height().saturating_sub(fb::CONSOLE_TOP))
 }
 
 impl Canvas {

@@ -32,7 +32,7 @@ is listed only in [STATUS.md](STATUS.md), which is generated from tests.
 | Bootloader | Limine 12.x (pinned binary release + sha256), `limine` crate **0.5.0** | Memory map, framebuffer, higher-half direct map, and our own ELF file for symbolization, with no loader to write. Crate 0.6.x requires nightly (`#![feature(ptr_metadata)]`), so we use 0.5.0 (base revision 3). | Custom UEFI loader (optional learning milestone), GRUB/multiboot2. |
 | Kernel shape | **Modular monolith** with message-shaped internal interfaces; capabilities enforced at the syscall boundary | One address space keeps early milestones fast and debuggable. Agent safety needs capability checks between *processes*, which a monolith enforces just as well. Drivers and services expose request/response interfaces, so any of them can move to user space later. | Microkernel: stronger isolation of drivers, but it puts IPC performance and many extra servers in front of every milestone. |
 | Test harness | Python (`uv`, pytest) on the host; TAP from the kernel | Fast to write scenarios, mature tooling, and QMP/PIL are easy to use. | Rust `xtask`: one language, but slower iteration on test scripts. |
-| Third-party crates | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), a PR adding only the crates its issue names (with their own dependencies), each checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX, no red zone, the kernel code model). Kernel crates so far: `limine`, `rustc-demangle`, `noto-sans-mono-bitmap` and `log` (from M0, before this policy; `log` is still `0.4`, to be pinned in a PR of its own), `pc-keyboard` (scancode decoding and layouts, #58, the first under it), `vte` (terminal escape parsing; brings `arrayvec` and `memchr`) and `unicode-width` (character widths), both #59. `rhai` (scripting, #67; integers only, no modules, no time, no closures; brings `ahash`, `hashbrown`, `allocator-api2`, `equivalent`, `foldhash`, `smallvec`, `smartstring`, `thin-vec`, `num-traits`, `libm`, `bitflags`, `once_cell`, `portable-atomic`, `zerocopy`, `static_assertions`, `cfg-if`, `no-std-compat` and `core-error`, plus `const-random`, whose compile-time random seed stays linked but unused (the kernel sets a fixed hashing seed before any script runs), and the proc macros `rhai_codegen` and `const-random-macro`, which run only at build time).  `shlex` (#62) is only a dev-dependency of `lumen-shell`, the word splitter's test oracle; `noline`, which #62 names, isn't used (no completion hook, escape codes always, and it queries the terminal for the cursor on every prompt). | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
+| Third-party crates | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), a PR adding only the crates its issue names (with their own dependencies), each checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX, no red zone, the kernel code model). Kernel crates so far: `limine`, `rustc-demangle`, `noto-sans-mono-bitmap` and `log` (from M0, before this policy; `log` is still `0.4`, to be pinned in a PR of its own), `pc-keyboard` (scancode decoding and layouts, #58, the first under it), `vte` (terminal escape parsing; brings `arrayvec` and `memchr`) and `unicode-width` (character widths), both #59. `rhai` (scripting, #67; integers only, no modules, no time, closures that can't capture (`no_closure`), `curry` disabled; brings `ahash`, `hashbrown`, `allocator-api2`, `equivalent`, `foldhash`, `smallvec`, `smartstring`, `thin-vec`, `num-traits`, `libm`, `bitflags`, `once_cell`, `portable-atomic`, `zerocopy`, `static_assertions`, `cfg-if`, `no-std-compat` and `core-error`, plus `const-random`, whose compile-time random seed stays linked but unused (the kernel sets a fixed hashing seed before any script runs), and the proc macros `rhai_codegen` and `const-random-macro`, which run only at build time).  `shlex` (#62) is only a dev-dependency of `lumen-shell`, the word splitter's test oracle; `noline`, which #62 names, isn't used (no completion hook, escape codes always, and it queries the terminal for the cursor on every prompt). | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
 | Firmware for tests | OVMF `edk2-stable202605-r1` from rust-osdev/ovmf-prebuilt, pinned with sha256 | macOS and CI boot byte-identical firmware, so golden screenshots match. | Distro OVMF packages (paths and versions differ per OS). |
 
 ## 3. Layers
@@ -960,12 +960,14 @@ off. A wake from another CPU queues the thread there and sends the
   errors' and warnings' messages coloured too (a ktest reads the cells).
   The screen's shell writes there (section "Shell"), nothing of it on
   serial (except what a `crash` says on both: a fault that didn't happen,
-  the heap's line before a heap crash; the screen half not tested). Each of its `write!`s and each log line is formatted and written under one lock, so
-  another CPU's log line can't split an escape sequence written in one
-  `write!` (ktests check the formatting happens under the lock); a log line
-  starts from the default colours (a ktest leaves bold, inverse and a
-  background set first). The arguments must not allocate (the heap asserts
-  it isn't called under the screen's lock). A CPU that is already drawing (an
+  the heap's line before a heap crash; the screen half not tested). Each of its `write!`s is
+  formatted first (it may allocate: a script value's `Debug` does) and then
+  drawn under one lock, and each log line is formatted and drawn under one
+  lock, so another CPU's log line can't split an escape sequence written in
+  one `write!` (ktests check where each is formatted); a log line starts
+  from the default colours (a ktest leaves bold, inverse and a background
+  set first). A log line's arguments must not allocate (the heap asserts,
+  a panic, that it isn't called under the screen's lock). A CPU that is already drawing (an
   exception in the middle) doesn't wait for itself: its line is left off
   the screen (nothing on that path logs to the screen today; not tested).
   No drawing starts once a crash report starts (`crash::enter` stops the
@@ -1180,141 +1182,113 @@ the deliberate faults, `crash.rs`).
 ### Scripting (built in M2)
 
 `kernel/src/script.rs`, the shell's `rhai` command, with
-[rhai](https://rhai.rs) 1.27 (integers only, no modules, no time, no
-closures; see the crates row in section 2).
+[rhai](https://rhai.rs) 1.27 (integers only, no modules, no time, closures
+that can't capture (`no_closure`), `curry` disabled; see the crates row in
+section 2).
 
 - **Forms:** `rhai` alone is a REPL (the shell's line editor with its own
   history, prompt `rhai> `, Tab completing Lumen's functions; variables
-  kept from line to line; `exit`, `quit` or Ctrl-D on an empty line
-  leaves); `rhai -e <expr>` evaluates its words joined by spaces; `rhai
-  demo` lists the built-in scripts (`kernel/src/script/*.rhai`: `rainbow`,
-  `fib`, `count`; make rebuilds the kernel when one changes) and `rhai demo
+  kept from line to line, one a name: redefining one doesn't use up the
+  variable limit; `exit`, `quit` or Ctrl-D on an empty line leaves);
+  `rhai -e <expr>` evaluates its words joined by spaces; `rhai demo` lists
+  the built-in scripts (`kernel/src/script/*.rhai`: `rainbow`, `fib`,
+  `count`; make rebuilds the kernel when one changes) and `rhai demo
   <name>` runs one, until M6 brings files. A value other than `()` is
-  printed; an error is one line, `rhai: ...` (the innermost error, a limit
-  in its own words, and `in function 'f'` when it happened in one).
+  printed (at most 64 KiB of text, else an error saying so); an error is
+  one line, `rhai: ...` (the innermost error, a limit in its own words, and
+  `in function 'f'` naming the innermost function it happened in; a thrown
+  value's text cut at 64 KiB).
 - **Lumen's functions:** `cpus()` (each online CPU as `#{index, apic}`),
   `mem()` (`heap_size`, `heap_used`, `heap_free`, `heap_live`),
   `uptime()` (ms since the boot timeline's origin), `trace(n)` (the last n
   events of this CPU's ring, the boot CPU's, where both shells run; gap
   lines included), `sleep(ms)` (clamped to 0 to 60 s), `print` and `debug`
   (to the console), and drawing on the terminal's canvas:
-  `draw_pixel(x, y, rgb)`, `draw_rect(x, y, w, h, rgb)`, `draw_text(x, y,
-  text, rgb[, bg])`, `clear([rgb])` (negative coordinates are clipped; text
-  past the canvas's right edge is cut). `screen_width()` and
+  `draw_pixel(x, y, rgb)` (nothing off the canvas), `draw_rect(x, y, w, h,
+  rgb)` (clipped), `draw_text(x, y, text, rgb[, bg])` (text starting above
+  the canvas is left out, so are characters starting left of it, and text
+  is cut at its right edge), `clear([rgb])`. `screen_width()` and
   `screen_height()` give the canvas's size without taking it. The canvas is
   taken on the first draw (an error naming why if it can't be). A script
-  that drew and succeeded shows `rhai: press a key` on a strip at the
-  canvas's bottom and on its console, and keeps the canvas until a key is
-  pressed on its console; one that failed (Ctrl-C included) gives it back
-  first, so its error shows. Meanwhile, what it prints reaches the
-  screen's terminal but is drawn only when the canvas is given back.
+  that drew and succeeded says `rhai: press a key on <console>` (`serial`,
+  `the keyboard`) on a strip at the canvas's bottom and on its console, and
+  keeps the canvas until a key is pressed there; one that failed (Ctrl-C
+  included) gives it back first, so its error shows. On the screen's
+  shell, what a script prints while it holds the canvas reaches the
+  terminal but is drawn only when the canvas is given back.
 - **Its own thread:** each run (or REPL session) runs in a thread with a
-  1 MiB stack (`sched::run_sized`, which waits for it, so the closure
-  borrows the console; `Console` is `Send`). rhai recurses for calls,
-  nested expressions and every walk over a nested value (clone, drop,
-  print, size checks), so this bounds how deep those go (below) and the
-  stack is twice what the deepest cases need: the ktests
+  1 MiB stack (`sched::run_sized`, which refuses on a thread that can't
+  block and otherwise waits for it, so the closure borrows the console;
+  `Console` is `Send`). rhai recurses for calls, nested expressions and
+  every walk over a nested value (clone, drop, print, size checks); the
+  limits below bound how deep those go, and the stack is at least twice
+  what the deepest cases need: the ktests
   `deep_recursion_is_an_error_not_a_crash` and
   `nested_values_are_an_error_not_a_crash` run them on 512 KiB.
-- **Limits** (`script::LIMITS`), each an error rather than a guard-page
-  crash or an out-of-memory panic: 200 million operations (10 to 30 s at
-  the 7 to 18 million a second measured locally; Ctrl-C is quicker), 16
-  call levels, expression depth 24 (16 in functions), 256 variables in a
-  scope, and per value (counted by rhai over the whole value, nested values
-  included, whenever it checks: building, storing an item, passing,
-  returning) 64 KiB of string bytes, 1024 array items and 256 map items.
-  Each nesting level is an item, so values nest at most 1280 deep. rhai's
-  `==`, `!=`, `to_string`, `to_debug`, `print` and `debug` on arrays and maps
-  call back into the engine for every item (about 1.7 KiB of stack a level);
-  Lumen replaces them with Rust walks (`script::equal`, `format_array`,
-  `format_map`). `curry` is disabled and closures are compiled out: curried
-  arguments nest without being counted. A key added to a map by assigning
-  to it isn't counted until the map is checked again; the heap budget
-  covers that: a run that grows the heap by more than 32 MiB (checked every
-  64 operations, so it can overshoot by what those allocate; other threads'
-  allocations count too) is stopped.
+- **Limits** (`script::LIMITS`, checked at compile time to be nonzero, as
+  rhai takes 0 for unlimited), each an error rather than a guard-page crash
+  or an out-of-memory panic:
+  - 200 million operations (10 to 30 s at the 7 to 18 million a second
+    measured locally; Ctrl-C is quicker), 16 call levels, expression depth
+    24 (16 in functions), 256 variables in a scope;
+  - per value: 64 KiB of string bytes, 1024 array items (BLOB bytes count
+    as items) and 256 map items, counted by rhai over the whole value,
+    nested values included, when it checks one: a literal, an operator
+    assignment, a native function's result and receiver, a property
+    assignment (the map), an item assignment (only the item: a key added
+    that way isn't counted until the map is checked again); not plain `=`
+    or a script function's arguments and result. Each nesting level is an
+    item, so values nest about 1280 deep (an item assignment can add one
+    level unchecked, which `script::equal` caps);
+  - text made from one value: 64 KiB. rhai's `==`, `!=`, `to_string`,
+    `to_debug`, `print` and `debug` on arrays and maps, and `to_json` on
+    maps, call back into the engine for every item (about 1.7 KiB of stack
+    a level) or make the whole text at once; Lumen replaces them with Rust
+    walks (`equal`, `format_array`, `format_map`, `json`) that also stop at
+    64 KiB of text. Past that a `to_string`-like function empties the value
+    and stops the run ("more than 64 KiB of text"): rhai can't be let fail
+    there, as it then checks the value and on that error makes the text
+    itself, whole (a map with thousands of keys added by item assignment,
+    all one 60 KB string, would be hundreds of MB);
+  - heap growth during a session (a run, or a whole REPL): 32 MiB,
+    checked every 64 operations (it can overshoot by what those allocate;
+    other threads' allocations count too). In the REPL a line stopped by
+    it drops every variable ("(variables cleared)"), so the next line runs.
+  `curry` is disabled and closures can't capture: curried arguments nest
+  without being counted.
 - **Ctrl-C** stops a script: the console is asked for a key at most every
   10 ms (the first 10 ms after the start, so keys typed ahead of a short
   script stay), from rhai's progress hook (every 64 operations), from every
-  drawing call, `print` and `debug`, and while `sleep` waits; it is found
-  inside closures and native callbacks too. Asking takes the keys waiting
-  on the console up to a Ctrl-C; the others are dropped.
+  drawing call, after each `print` and `debug` (a stop found in the last
+  statement still stops the run), and while `sleep` waits; it is found
+  inside closures and native callbacks too. Each time, the keys waiting on
+  the console are taken up to a Ctrl-C; the others are dropped.
 - **The console:** rhai's callbacks must be `'static`, so they reach the
-  console through a slot (`ConsoleSlot`) shared with the command, which
-  holds it only while an evaluation runs. Output is formatted before it is
-  written: formatting a value allocates, which the heap refuses under the
-  screen's lock (the screen console now formats every `write!` first).
+  console through a slot (`ConsoleSlot`, neither `Send` nor `Sync`) shared
+  with the command, which holds it only while an evaluation runs. Output
+  is formatted before it is written: formatting a value allocates, which
+  the heap asserts against (a panic) under the screen's lock.
 - **Hashing:** rhai seeds its function hashes from a value `const-random`
   makes when rhai is compiled; the kernel sets a fixed seed before the
   first engine, so runs don't depend on it (the compiled-in value is still
   linked, so images differ by it between builds).
 - **Tests:** `test_script` (`rhai -e` with `-smp 4`, the REPL, the demos,
-  the `rainbow` golden and the terminal back after a key, Ctrl-C on serial
-  and on the keyboard, the screen shell printing values whose formatting
-  allocates, `screen_width()` without taking the screen, the strip and
-  the terminal back); ktests for the functions, one-line errors and the
-  limits' messages, the engine's limits, Ctrl-C (closures, functions,
-  `sleep`, drawing, the `count` demo), the heap budget, recursion and
-  nesting on half the script stack, drawing and waiting for a key, and the
-  REPL going on after Ctrl-C and errors.
-- **Not yet:** scripts from files (M6), floats, closures, scripts in user
-  mode (M9), a script running in the background.
-
-### Demos (built in M2)
-
-- **What:** `mandelbrot` and `life [pattern] [generations]`, shell
-  commands that draw on the terminal's canvas (`Ctx::canvas`: the pixels
-  below the header, the terminal paused) and give it back on a key typed
-  on the console that ran them. The terminal draws nothing meanwhile, so
-  each draws its prompt in a status line at the canvas's bottom ("press a
-  key on serial", or "on the keyboard": `Console::name`) as well as writing
-  it to the console. The arithmetic, the band dealing and the rules
-  are `lumen-demo`'s (host-tested); `kernel/src/demo.rs` draws them.
-- **Mandelbrot:** fixed point (`i64`, 28 fraction bits; the kernel has no
-  SSE), 64 iterations, the whole set fitted to the canvas above the status
-  line. Points with `|re|` or `|im|` above 2 escape after one step and are
-  answered without iterating, so no step can overflow whatever the
-  screen's shape. Drawn twice: by the calling CPU (the boot CPU, where the
-  shells run) alone, then by every CPU whose scheduler runs, and both
-  times printed with the rows each CPU drew. The image is cut into 8-row
-  bands dealt round-robin (band `i` to slot `i % n`). The calling thread
-  draws slot 0; every other such CPU gets a thread pinned to it
-  (`sched::spawn_on`) holding a clone of the `Arc<Canvas>`, and all are
-  joined before the drawing returns, so none draws after the command drops
-  the canvas (whose drop draws the terminal again). A CPU that gets no
-  thread has its slot drawn by the caller, and the command says so, as it
-  does for a CPU online without a scheduler (and the status line counts
-  them). (Threads, not `smp::run_on` jobs: a job is a bare `fn()`, so
-  reaching the canvas from one would take a static raw pointer and
-  `unsafe`.) Times on four vCPUs are in PR #80.
-- **Life:** 8-pixel cells on a grid whose outside counts as dead (nothing
-  wraps), only changed cells drawn, a status line under the grid (pattern,
-  generation, population). Each pattern starts where it has room (glider
-  and gun at the top left, the lightweight spaceship at the right heading
-  left, R-pentomino and acorn in the middle). With a count it steps that
-  many generations as fast as it can (a key ends it early, and it says
-  so) and holds the frame (the golden test); without one it steps at most
-  20 a second until a key. A screen too small for the pattern (or the
-  set) is refused.
-- **Tests:** `cargo:lumen-demo` (fixed point against `f64`, no overflow on
-  any pixel of extreme screens, band dealing, the B3/S23 truth table, the
-  patterns against their published RLE and placed inside small grids,
-  spaceships moving, the gun's first three periods, the glider ending as a
-  block, the grid against an endless-plane reference, R-pentomino's 116
-  cells at generation 1103); `ktest:lumen_kernel::demo::every_cpu_rendered_rows`
-  (every online CPU draws rows, all rows once, the same pixels as one CPU,
-  no thread still holding the canvas, 20 times on an image of a band per
-  CPU so a missing join shows, and a part band); `test_demo` (goldens of
-  the set and of a glider 40 generations on, each pattern's population
-  after 30 generations against a reference, the rate ceiling, a key ending
-  a counted run, the default pattern, the terminal drawn again after the
-  key, usage errors).
-- **Not yet tested:** a CPU that gets no thread or runs no scheduler (both
-  reported on the console), a canvas that can't be had (`Ctx::canvas`
-  failing), and running the demos from the screen's shell (the same key
-  path; the prompt is in the status line the goldens check). A crash
-  report taking the canvas mid-run stops the demo (`is_live`), but the
-  report halts the shell's CPU, so its message isn't expected to show.
+  a map of 8000 references to one 60 KB string made into text, the
+  `rainbow` golden and the terminal back after a key, Ctrl-C on serial and
+  on the keyboard, the screen shell printing values whose formatting
+  allocates, `screen_width()` without taking the screen, the strip and the
+  terminal back); ktests for the functions, one-line errors and the
+  limits' messages (integers only, no modules, curry and capturing refused
+  among them), bounded text, the engine's limits, Ctrl-C (closures,
+  functions, `sleep`, a last `print`, drawing, the `count` demo), the heap
+  budget for a run and across a REPL, recursion and nesting on half the
+  script stack, drawing and waiting for a key, and the REPL going on after
+  Ctrl-C and errors.
+- **Not tested:** the REPL on the screen shell or with `lumen.ansi`, and
+  its Tab completion and history; `sleep`'s 60 s clamp; the heap budget's
+  overshoot; running out of memory or stack window for the script thread.
+- **Not yet:** scripts from files (M6), floats, capturing closures,
+  scripts in user mode (M9), a script running in the background.
 
 ## 7. Driver interface (planned, M3+)
 

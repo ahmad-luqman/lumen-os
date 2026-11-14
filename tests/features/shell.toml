@@ -17,7 +17,7 @@ tests = [
     "scenario:test_shell::test_history_and_line_editing",
     "scenario:test_input::test_keys_via_qmp_send_key",
     "scenario:test_input::test_no_8042_is_a_warning",
-    "ktest:lumen_kernel::shell::the_screen_console_writes_each_write_whole",
+    "ktest:lumen_kernel::shell::the_screen_console_formats_then_draws_each_write_whole",
     "ktest:lumen_kernel::shell::commands::help_lists_every_command_once",
     "ktest:lumen_kernel::shell::crash::every_crash_kind_has_a_fault",
     "scenario:test_boot::test_breakpoint_is_survivable",

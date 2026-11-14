@@ -502,6 +502,9 @@ pub enum SpawnError {
     NotRunning,
     /// No stack for it.
     Stack(StackError),
+    /// [`run_sized`] on a thread that can't wait for another (an interrupt
+    /// handler, a lock held, interrupts off, the idle thread).
+    CantWait,
 }
 
 impl fmt::Display for SpawnError {
@@ -509,6 +512,7 @@ impl fmt::Display for SpawnError {
         match self {
             SpawnError::NotRunning => f.write_str("that CPU runs no scheduler"),
             SpawnError::Stack(e) => write!(f, "no stack: {e}"),
+            SpawnError::CantWait => f.write_str("this thread can't wait for it"),
         }
     }
 }
@@ -544,17 +548,26 @@ pub fn spawn(name: &'static str, f: impl FnOnce() + Send + 'static) -> Result<Jo
 /// (a nonzero multiple of 4 KiB; anything else panics) instead of
 /// [`STACK_SIZE`], and wait for it to finish: for deeply recursive code (the
 /// script interpreter). As it is joined before this returns, `f` may borrow
-/// from the caller. If no thread can be made, `f` is dropped unrun. Blocks
-/// the calling thread (see [`JoinHandle::join`]).
+/// from the caller. If no thread can be made, or the calling thread can't
+/// block (see [`JoinHandle::join`]), `f` is dropped unrun.
 pub fn run_sized<'a>(name: &'static str, stack_size: u64, f: impl FnOnce() + Send + 'a) -> Result<(), SpawnError> {
+    // The SAFETY argument below needs a panic to end the kernel, not unwind
+    // past the join.
+    #[cfg(not(panic = "abort"))]
+    compile_error!("sched::run_sized relies on panic = \"abort\"");
+    let cpu = arch::cpu_index();
+    if !can_block(cpu) {
+        return Err(SpawnError::CantWait);
+    }
     let f: Box<dyn FnOnce() + Send + 'a> = Box::new(f);
     // SAFETY: only the closure's lifetime bound changes (same layout). The
-    // thread is joined below before this function returns, so `f` (and
-    // what it borrows) is used only while those borrows are alive; a panic
-    // aborts the kernel, so nothing unwinds past the join. If spawning
-    // fails, `spawn_with` drops `f` before returning.
+    // thread is joined below before this function returns (a join has no
+    // timeout, and nothing kills a thread), so `f` (and what it borrows) is
+    // used only while those borrows are alive; a panic aborts the kernel,
+    // so nothing unwinds past the join. If spawning fails, `spawn_with`
+    // drops `f` before returning.
     let f: Entry = unsafe { core::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Entry>(f) };
-    spawn_with(arch::cpu_index(), name, stack_size, f)?.join();
+    spawn_with(cpu, name, stack_size, f)?.join();
     Ok(())
 }
 
