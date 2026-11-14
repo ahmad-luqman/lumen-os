@@ -1,17 +1,18 @@
 //! The shell's commands: kmon's, with their names and output (`echo`
 //! joins its words with single spaces; `clear` and `colors` need a console
-//! that takes escape codes), plus `history`, `term text`, `reboot` and
-//! `shutdown`. A table the
+//! that takes escape codes), plus `history`, `term text`, `reboot`,
+//! `shutdown` and the system commands (`cpus`, `mem`, `irqs`, `dmesg`,
+//! `date`, `top`: `sysinfo.rs`). A table the
 //! line editor completes from. Each writes to the console that ran it.
 
-use super::{Ctx, crash};
+use super::{Ctx, crash, sysinfo};
 use crate::arch;
 use alloc::string::String;
 use core::arch::asm;
 use core::fmt::Write;
 use lumen_shell::{Command, Table, words};
 
-type Run = fn(&mut Ctx<'_>, &[String]);
+pub type Run = fn(&mut Ctx<'_>, &[String]);
 
 pub static COMMANDS: Table<Run> = Table(&[
     Command { name: "help", args: &[], usage: "", about: "this list", run: help },
@@ -58,6 +59,48 @@ pub static COMMANDS: Table<Run> = Table(&[
         usage: "",
         about: "the TSC's frequency, measured again against each clock",
         run: clocks,
+    },
+    Command {
+        name: "cpus",
+        args: &[],
+        usage: "",
+        about: "each CPU: its scheduler, ticks, how busy, threads",
+        run: sysinfo::cpus,
+    },
+    Command {
+        name: "mem",
+        args: &[],
+        usage: "",
+        about: "physical frames, the heap and kernel stacks",
+        run: sysinfo::mem,
+    },
+    Command {
+        name: "irqs",
+        args: &[],
+        usage: "",
+        about: "the I/O APIC's inputs decoded, and interrupts per vector",
+        run: sysinfo::irqs,
+    },
+    Command {
+        name: "dmesg",
+        args: &[],
+        usage: "",
+        about: "the newest log lines, as serial printed them",
+        run: sysinfo::dmesg,
+    },
+    Command {
+        name: "date",
+        args: &[],
+        usage: "",
+        about: "the date and time from the RTC (taken as UTC)",
+        run: sysinfo::date,
+    },
+    Command {
+        name: "top",
+        args: &[],
+        usage: "[frames]",
+        about: "CPUs, interrupts, heap and threads each second (q quits)",
+        run: sysinfo::top,
     },
     Command { name: "history", args: &[], usage: "", about: "the lines entered on this console", run: history },
     Command { name: "reboot", args: &[], usage: "", about: "restart the machine", run: reboot },

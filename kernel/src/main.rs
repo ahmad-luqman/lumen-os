@@ -38,6 +38,7 @@ mod klog;
 mod ktest;
 mod mm;
 mod power;
+mod rtc;
 mod sched;
 mod shell;
 mod smp;

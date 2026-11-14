@@ -1,4 +1,5 @@
-//! Lock-free trace ring buffer for the Lumen kernel.
+//! Lock-free trace ring buffer for the Lumen kernel (and, in [`text`], a
+//! plain byte ring for log lines, which isn't lock-free).
 //!
 //! The kernel records fixed-size binary [`Event`]s (timestamp, CPU, kind,
 //! pid, four arguments) into a [`TraceRing`] that always overwrites the
@@ -50,6 +51,9 @@
 #![no_std]
 
 use core::sync::atomic::{AtomicU64, Ordering, fence};
+
+pub mod text;
+pub use text::TextRing;
 
 /// One trace event as recorded.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
