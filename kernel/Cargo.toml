@@ -22,6 +22,7 @@ lumen-elf.workspace = true
 lumen-heap.workspace = true
 lumen-mm.workspace = true
 lumen-queue.workspace = true
+lumen-shell.workspace = true
 lumen-term.workspace = true
 lumen-time.workspace = true
 lumen-trace.workspace = true

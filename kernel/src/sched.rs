@@ -27,7 +27,7 @@
 //! and is never queued: on an AP it is the AP's `ap_main` context (on its
 //! main stack), looping in [`idle_loop`] (`smp::run_on` jobs run there), on the boot CPU a
 //! thread of its own. `kmain`'s context becomes the boot CPU's `main` thread
-//! (kmon, or the ktests). A CPU's scheduler runs ([`running_on`]) from the
+//! (the serial shell, or the ktests). A CPU's scheduler runs ([`running_on`]) from the
 //! first tick after it is armed (its current and idle threads set and its
 //! timer started): until then nothing could wake a sleeper or preempt there,
 //! so threads can't be spawned there and `time::sleep` busy-waits.

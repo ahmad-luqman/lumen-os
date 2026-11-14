@@ -102,16 +102,13 @@ def golden_dir() -> Path:
 
 @pytest.fixture
 def crash_report(boot: Callable[..., Machine]) -> Callable[..., str]:
-    """`crash_report("pf")` boots, runs `crash pf` in kmon, checks QEMU exits
-    with the crash code, and returns the report (both markers included).
-    `at_prompt(m)`, if given, runs at the kmon prompt first (and must leave
-    kmon at a prompt), e.g. to read the heap before the crash."""
+    """`crash_report("pf")` boots, runs `crash pf` in the serial shell, checks
+    QEMU exits with the crash code, and returns the report (both markers
+    included)."""
 
-    def _crash(kind: str, *, at_prompt: Callable[[Machine], None] | None = None) -> str:
+    def _crash(kind: str) -> str:
         m = boot("qemutest")
-        m.expect(r"kmon> ", 60)
-        if at_prompt:
-            at_prompt(m)
+        m.expect(r"lumen> ", 60)
         m.send_line(f"crash {kind}")
         # A deliberate protection fault that doesn't fault says so at once.
         done = m.expect(rf"{re.escape(END)}|{PROTECTION_BROKEN}", 30)

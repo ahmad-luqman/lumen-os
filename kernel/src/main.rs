@@ -36,10 +36,10 @@ mod interrupts;
 mod keyboard;
 mod klog;
 #[cfg_attr(feature = "ktest", allow(dead_code))] // replaced by the test runner
-mod kmon;
 mod ktest;
 mod mm;
 mod sched;
+mod shell;
 mod smp;
 mod symbols;
 mod sync;
@@ -216,7 +216,7 @@ fn after_boot() -> ! {
 
 #[cfg(not(feature = "ktest"))]
 fn after_boot() -> ! {
-    kmon::run()
+    shell::run()
 }
 
 fn log_memory_map() {

@@ -17,6 +17,7 @@ lumen-elf = { path = "crates/lumen-elf" }
 lumen-heap = { path = "crates/lumen-heap" }
 lumen-mm = { path = "crates/lumen-mm" }
 lumen-queue = { path = "crates/lumen-queue" }
+lumen-shell = { path = "crates/lumen-shell" }
 lumen-term = { path = "crates/lumen-term" }
 lumen-time = { path = "crates/lumen-time" }
 lumen-trace = { path = "crates/lumen-trace" }
@@ -29,6 +30,8 @@ pc-keyboard = { version = "=0.9.0", default-features = false }
 # Terminal escape parsing and character widths (#59).
 vte = { version = "=0.15.0", default-features = false }
 unicode-width = { version = "=0.2.3", default-features = false }
+# The shell's word splitter is checked against it (lumen-shell dev-dependency, #62).
+shlex = { version = "=2.0.1", default-features = false }
 noto-sans-mono-bitmap = { version = "=0.4.0", default-features = false, features = ["regular", "bold", "size_16", "size_32", "unicode-basic-latin"] }
 
 [workspace.lints.rust]

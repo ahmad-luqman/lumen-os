@@ -11,7 +11,7 @@ exception into a symbolized crash report. See [docs/STATUS.md](docs/STATUS.md)
 
 ```bash
 make deps    # pinned Limine + OVMF
-make run     # boot in QEMU (type `help` at the kmon> prompt, try `crash pf`)
+make run     # boot in QEMU (type `help` at the lumen> prompt, try `crash pf`)
 make test    # host tests, codegen audit, QEMU scenarios
 ```
 

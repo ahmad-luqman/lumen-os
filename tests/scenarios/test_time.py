@@ -1,5 +1,5 @@
 """Timekeeping: the TSC is calibrated at boot, the local APIC timer
-interrupts arrive, and kmon's `sleep` waits in guest time.
+interrupts arrive, and the shell's `sleep` waits in guest time.
 
 The arithmetic is host-tested (`cargo test -p lumen-time`); calibration
 against a second clock, `time::sleep` and the 1 kHz rate are checked in-kernel
@@ -37,19 +37,19 @@ class Calibration(NamedTuple):
 
 
 def clocks(m) -> tuple[int, str, int | None, int | None]:
-    """kmon `clocks`: the TSC's boot frequency and reference, and the TSC
+    """the shell's `clocks`: the TSC's boot frequency and reference, and the TSC
     measured again against the PIT and the HPET (None: no such clock)."""
     return clocks_and_windows(m)[0]
 
 
 def clocks_and_windows(m) -> tuple[tuple[int, str, int | None, int | None], dict[str, Calibration]]:
-    """kmon `clocks`, and the windows line after it: each measurement's
+    """the shell's `clocks`, and the windows line after it: each measurement's
     calibration by name (`boot`, `pit`, `hpet`; a failed or missing one is
     left out)."""
     m.send_line("clocks")
     c = m.expect(CLOCKS, 30)
     w = m.expect(r"clocks: windows:(.*)\n", 30)
-    m.expect(r"kmon> ")
+    m.expect(r"lumen> ")
     for name, reason in (("pit", c[4]), ("hpet", c[6])):
         assert reason is None, f"measuring against the {name} failed: {reason}"
     pit, hpet = (None if g is None else int(g) for g in c.group(3, 5))
@@ -100,11 +100,11 @@ def check_retake_line(m, cal: Calibration) -> None:
 
 
 def ticks(m) -> tuple[int, int, int, int]:
-    """kmon `ticks`: timer interrupts, then spurious and unexpected ones and
+    """the shell's `ticks`: timer interrupts, then spurious and unexpected ones and
     local APIC errors."""
     m.send_line("ticks")
     t = m.expect(TICKS)
-    m.expect(r"kmon> ")
+    m.expect(r"lumen> ")
     return int(t[1]), int(t[2]), int(t[3]), int(t[4])
 
 
@@ -117,10 +117,10 @@ def test_boot_calibrates_the_tsc_against_the_hpet(boot):
 
 
 def test_clocks_shows_the_windows_behind_each_measurement(boot):
-    # kmon `clocks` lists every window behind the boot calibration and the two
+    # the shell's `clocks` lists every window behind the boot calibration and the two
     # measurements, and each frequency is exactly their median.
     m = boot("qemutest")
-    m.expect(r"kmon> ", BOOT_TIMEOUT)
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
     (tsc, reference, pit, hpet), cals = clocks_and_windows(m)
     assert reference == "hpet"
     assert sorted(cals) == ["boot", "hpet", "pit"]
@@ -133,12 +133,12 @@ def test_clocks_shows_the_windows_behind_each_measurement(boot):
 
 def test_timer_interrupts_counted(boot):
     m = boot("qemutest")
-    m.expect(r"kmon> ", BOOT_TIMEOUT)
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
     before, *_ = ticks(m)
     # 100 ms of guest time between the two readings.
     m.send_line("sleep 100")
     m.expect(r"slept 100 ms\n")
-    m.expect(r"kmon> ")
+    m.expect(r"lumen> ")
     after, *strays = ticks(m)
     # Up to 100 at 1 kHz. A smoke test that interrupts arrive (the rate is
     # checked in-kernel against the HPET): QEMU's TCG delivers ticks late, as
@@ -154,7 +154,7 @@ def test_boot_calibration_agrees_with_both_clocks(boot):
     # the boot calibration (a wrong calibration cancels out in tick counts:
     # the local APIC timer is calibrated against the TSC).
     m = boot("qemutest")
-    m.expect(r"kmon> ", BOOT_TIMEOUT)
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
     tsc, reference, pit, hpet = clocks(m)
     assert reference == "hpet"
     assert pit is not None and hpet is not None

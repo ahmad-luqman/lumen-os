@@ -1,7 +1,7 @@
 # Features: time. See tests/features/README.md for the format.
 
 [[feature]]
-name = "Calibrated TSC (against the HPET, or the PIT without one): each window's ends are reference readings between two TSC reads (the PIT's counter read at both), a window with a paused reading is taken again, and calibration gives up after 20; kmon clocks lists the windows; now_ns and sleep"
+name = "Calibrated TSC (against the HPET, or the PIT without one): each window's ends are reference readings between two TSC reads (the PIT's counter read at both), a window with a paused reading is taken again, and calibration gives up after 20; the shell's clocks lists the windows; now_ns and sleep"
 milestone = "M1"
 tests = [
     "cargo:lumen-time",

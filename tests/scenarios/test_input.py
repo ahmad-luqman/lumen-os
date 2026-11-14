@@ -1,13 +1,16 @@
-"""The PS/2 keyboard: keys sent through QMP reach kmon, decoded in the layout
-`lumen.keymap=` names."""
+"""The PS/2 keyboard: keys sent through QMP reach the screen's shell, decoded
+in the layout `lumen.keymap=` names (read back from the screen with the
+serial shell's `term text`)."""
 
 import re
+import shlex
 import threading
 import time
 from typing import NamedTuple
 
 from lumen_harness.qemu import Machine
 from lumen_harness.qmp import QmpClient, QmpError, qcodes_for
+from lumen_harness.screen import expect_screen
 
 KBD_LINE = r"INFO  kbd: PS/2 keyboard on ISA IRQ 1 \(GSI 1, vector 0x51\), layout {}\n"
 KBD_STATS = re.compile(
@@ -16,6 +19,7 @@ KBD_STATS = re.compile(
 )
 # Without an 8042 its status reads 0xff: never ready for a command.
 NO_8042 = r"no reply in time \(command 0xad: the controller to take it\)"
+SHELLS = r"INFO  shell: shells on serial and the screen; type 'help'\n"
 
 
 class KbdStats(NamedTuple):
@@ -28,46 +32,48 @@ class KbdStats(NamedTuple):
     skipped: int
 
 
-def kmon_ready(m: Machine, layout: str) -> None:
-    """Wait for the keyboard's boot line (in `layout`), then kmon's prompt."""
+def shells_ready(m: Machine, layout: str) -> None:
+    """Wait for the keyboard's boot line (in `layout`), both shells, and the
+    serial shell's prompt."""
     m.expect(KBD_LINE.format(layout), 60)
-    m.expect(r"kmon> ", 60)
+    m.expect(SHELLS, 60)
+    m.expect(r"lumen> ", 60)
 
 
 def kbd_stats(m: Machine) -> KbdStats:
-    """kmon's `kbd`."""
+    """The serial shell's `kbd`."""
     m.send_line("kbd")
     found = m.expect(KBD_STATS, 10)
-    m.expect(r"kmon> ", 10)
+    m.expect(r"lumen> ", 10)
     layout, *counts = found.groups()
     return KbdStats(layout, *map(int, counts))
 
 
 def echo_physical_yz(m: Machine, typed: str) -> None:
     """Press the keys labelled e c h o space Y Z Enter on a US keyboard; the
-    guest reads `typed` for Y Z (one character each), echoes each key, and
-    kmon's echo prints `typed`."""
-    keys = ["e", "c", "h", "o", "spc", "y", "z", "ret"]
-    for key, echo in zip(keys, f"echo {typed}\n", strict=True):
-        m.press([key], echo)
-    # (The echo of the Enter key was the last thing `press` waited for.)
-    m.expect(rf"{typed}\n", 10)
+    guest reads `typed` for Y Z (one character each), and the screen shows
+    the line typed and `echo`'s answer."""
+    for key in ["e", "c", "h", "o", "spc", "y", "z", "ret"]:
+        m.press([key])
+    expect_screen(m, rf"^lumen> echo {typed}\n{typed}$")
 
 
 def test_keys_via_qmp_send_key(boot):
-    # Typed on the keyboard (shift included), a command runs as if typed on
-    # serial. Every key held made two scancodes (press, release), all
+    # Typed on the keyboard (shift included), a command runs in the screen's
+    # shell, which answers on the screen (serial only sees the rows `term
+    # text` prints). Every key held made two scancodes (press, release), all
     # queued; they raised IRQ 1 (one interrupt can move several, so at least
     # once a character), and nothing was dropped, undecoded or unexpected.
     text = "echo Hello, World!\n"
     m = boot("qemutest")
-    kmon_ready(m, "us")
+    shells_ready(m, "us")
     before = kbd_stats(m)
+    start = len(m.output)
     m.type_text(text)
-    m.expect(r"Hello, World!\n", 10)
-    m.expect(r"kmon> ", 10)
+    expect_screen(m, r"^lumen> echo Hello, World!\nHello, World!\nlumen>$")
+    assert not re.search(r"^Hello", m.output[start:], re.MULTILINE)
     want = before.bytes + 2 * sum(len(qcodes_for(c)) for c in text)
-    # The last key's release comes after its press was echoed, once QMP's
+    # The last key's release comes after its press was taken, once QMP's
     # hold time (20 ms) has passed: ask again until it has, for up to 10 s.
     deadline = time.monotonic() + 10
     while (s := kbd_stats(m)).bytes < want and time.monotonic() <= deadline:
@@ -86,10 +92,10 @@ def test_keys_via_qmp_send_key(boot):
 def test_second_layout(boot):
     # The same physical keys: Y and Z trade places on a German keyboard.
     us = boot("qemutest")
-    kmon_ready(us, "us")
+    shells_ready(us, "us")
     echo_physical_yz(us, "yz")
     de = boot("qemutest", cmdline="lumen.keymap=de")
-    kmon_ready(de, "de")
+    shells_ready(de, "de")
     echo_physical_yz(de, "zy")
     assert kbd_stats(de).layout == "de"
     assert "WARN" not in de.output
@@ -98,7 +104,7 @@ def test_second_layout(boot):
 def test_an_unknown_keymap_falls_back_to_us(boot):
     m = boot("qemutest", cmdline="lumen.keymap=klingon")
     m.expect(r"WARN  kbd: unknown keymap 'klingon' \(known: us uk de [a-z ]+\); using us\n", 60)
-    kmon_ready(m, "us")
+    shells_ready(m, "us")
     echo_physical_yz(m, "yz")
 
 
@@ -137,34 +143,36 @@ def test_keys_held_during_boot_leave_a_working_keyboard(boot):
     assert presses[0] > 10, presses
     assert re.fullmatch(KBD_LINE.format("us"), first.group(0)), first.group(0)
     m.expect(r"INFO  kbd: skipped \d+ stray byte\(s\) while setting the keyboard up\n", 10)
-    m.expect(r"kmon> ", 60)
-    # Whatever reached kmon before the presses stopped makes one line of
-    # a's: end it, then the keyboard types normally.
-    m.press(["ret"], "\n")
-    m.expect(r"kmon> ", 10)
+    m.expect(SHELLS, 60)
+    m.expect(r"lumen> ", 60)
+    # Whatever reached the screen's shell before the presses stopped makes
+    # one line of a's: end it, then the keyboard types normally.
+    m.press(["ret"])
     echo_physical_yz(m, "yz")
     assert kbd_stats(m).skipped > 0
     assert "WARN" not in m.output
 
 
 def test_every_printable_character_and_backspace(boot):
-    # Every printable ASCII character typed on a US keyboard reaches kmon as
-    # itself, and backspace erases the last one.
+    # Every printable ASCII character typed on a US keyboard reaches the
+    # screen's shell as itself (quoted, as the shell splits words), and
+    # backspace erases the last one.
     every = "".join(chr(c) for c in range(0x21, 0x7F)) + " end"
     m = boot("qemutest")
-    kmon_ready(m, "us")
-    m.type_text("echo " + every + "X")
-    m.press(["backspace"], "\x08 \x08")
-    m.press(["ret"], "\n")
-    m.expect(re.escape(every) + "\n", 10)
+    shells_ready(m, "us")
+    m.type_text("echo " + shlex.quote(every) + "X")
+    m.press(["backspace"])
+    m.press(["ret"])
+    expect_screen(m, "^" + re.escape(every) + "$")
 
 
 def test_no_8042_is_a_warning(boot):
     # Without the controller the keyboard is skipped with a warning naming
-    # the command, and kmon says why there is none (IRQ 1 stays routed,
-    # masked).
+    # the command, the serial shell says why there is none (IRQ 1 stays
+    # routed, masked), and only the serial shell runs.
     m = boot("qemutest", extra=["-machine", "q35,i8042=off"])
     m.expect(rf"WARN  kbd: no PS/2 keyboard: {NO_8042}\n", 60)
-    m.expect(r"kmon> ", 60)
+    m.expect(r"INFO  shell: shell on serial \(none on the screen: no keyboard\); type 'help'\n", 60)
+    m.expect(r"lumen> ", 60)
     m.send_line("kbd")
     m.expect(rf"kbd: no keyboard \({NO_8042}\); IRQ 1 routed \(vector 0x51\), masked\n", 10)

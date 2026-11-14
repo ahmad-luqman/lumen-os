@@ -57,7 +57,7 @@ def test_no_hpet_is_a_warning(boot):
     # HPET).
     m.expect(r"INFO  time: tsc .* \(calibrated against pit\)\n", BOOT_TIMEOUT)
     m.expect(r"INFO  boot: boot complete", BOOT_TIMEOUT)
-    m.expect(r"kmon> ", BOOT_TIMEOUT)
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
     # The boot timeline is still complete (it is logged at warn if not).
     assert "WARN  boot" not in m.output
     (tsc, reference, pit, hpet), cals = clocks_and_windows(m)
@@ -84,22 +84,22 @@ def test_no_madt_boots_without_acpi(boot):
     m.expect(r"INFO  time: tsc .* \(calibrated against pit\)\n", BOOT_TIMEOUT)
     m.expect(r"INFO  irq: interrupts on\n", BOOT_TIMEOUT)
     # Without an I/O APIC the keyboard's IRQ can't be routed: a warning, and
-    # boot goes on (kmon still reads serial).
+    # boot goes on (the serial shell still reads serial).
     m.expect(
         r"WARN  kbd: no PS/2 keyboard: IRQ 1 can't be routed: no I/O APIC input for GSI 1\n",
         BOOT_TIMEOUT,
     )
     m.expect(r"INFO  boot: boot complete", BOOT_TIMEOUT)
     # And the local APIC found through IA32_APIC_BASE ticks.
-    m.expect(r"kmon> ", BOOT_TIMEOUT)
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
     m.send_line("kbd")
     m.expect(r"kbd: no keyboard \(IRQ 1 can't be routed: no I/O APIC input for GSI 1\)\n", 10)
-    m.expect(r"kmon> ", 10)
+    m.expect(r"lumen> ", 10)
     # The boot timeline is still complete (it is logged at warn if not).
     assert "WARN  boot" not in m.output
     before, *_ = ticks(m)
     m.send_line("sleep 50")
-    m.expect(r"kmon> ")
+    m.expect(r"lumen> ")
     after, *strays = ticks(m)
     # Up to 50 at 1 kHz; this checks it ticks at all (the rate is checked
     # in-kernel). QEMU's TCG delivers ticks late: as few as 9 and up to 49

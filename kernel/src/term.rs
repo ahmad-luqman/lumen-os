@@ -1,5 +1,5 @@
 //! The terminal on the framebuffer: `lumen-term`'s grid drawn below the
-//! header, fed by log lines (coloured by level) and kmon.
+//! header, fed by log lines (coloured by level) and the screen's shell.
 //!
 //! Drawing keeps a copy of every cell it drew (the shadow) and draws only
 //! the cells that differ from it, in the rows the terminal marked as changed.
@@ -8,7 +8,7 @@
 //! screen. The cursor flips every 500 ms (the boot CPU's timer interrupt
 //! does it: no thread, so nothing switches or traces for it) and shows
 //! solid while output arrives; it isn't drawn while the view is scrolled
-//! back (Shift+PageUp/PageDown in kmon).
+//! back (Shift+PageUp/PageDown in the screen's shell).
 //!
 //! Nothing allocates under the screen's lock (the terminal and the shadow
 //! are allocated in [`init`]): log lines come while the frame allocator's or
@@ -17,11 +17,11 @@
 //! [`write_fmt`] must not allocate either.
 //!
 //! The terminal takes `\n` as a line feed only: [`write_str`], [`write_fmt`]
-//! and log lines turn it into CR LF; [`write_bytes`] and [`write_raw_fmt`]
-//! pass bytes as they are.
+//! and log lines turn it into CR LF.
 
 use crate::fb::{self, Framebuffer, Style};
 use crate::sync::SpinLock;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
@@ -51,7 +51,7 @@ struct Screen {
     cursor_drawn: Option<(usize, usize)>,
     /// The blink phase: the cursor is drawn while on.
     blink_on: bool,
-    /// Cells drawn so far (kmon's `term` shows it; the tests count redraws
+    /// Cells drawn so far (the shell's `term` shows it; the tests count redraws
     /// with it).
     cells_drawn: u64,
 }
@@ -156,12 +156,6 @@ impl Screen {
         self.show_cursor();
     }
 
-    /// Feed `bytes` to the terminal as they are (not drawn yet).
-    fn feed_raw(&mut self, bytes: &[u8]) {
-        self.term.write(bytes);
-        self.show_cursor();
-    }
-
     /// Output shows the cursor at once, for a whole blink.
     fn show_cursor(&mut self) {
         self.blink_on = true;
@@ -252,31 +246,11 @@ impl Write for Feed<'_> {
     }
 }
 
-/// Feeds the terminal through `fmt::Write`, bytes as they are.
-struct Raw<'a>(&'a mut Screen);
-
-impl Write for Raw<'_> {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.0.feed_raw(s.as_bytes());
-        Ok(())
-    }
-}
-
 /// Write `s` to the terminal (`\n` as CR LF) and draw it; false if nothing
 /// was drawn (no terminal, a crash report started, or this CPU is already
 /// drawing).
 pub fn write_str(s: &str) -> bool {
     write_fmt(format_args!("{s}"))
-}
-
-/// Write raw bytes to the terminal (no `\n` translation) and draw them;
-/// false if nothing was drawn (see [`write_str`]).
-pub fn write_bytes(bytes: &[u8]) -> bool {
-    with_screen(|screen| {
-        screen.feed_raw(bytes);
-        screen.render();
-    })
-    .is_some()
 }
 
 /// Write formatted text (`\n` as CR LF) and draw it, all under one lock: a
@@ -287,15 +261,6 @@ pub fn write_bytes(bytes: &[u8]) -> bool {
 pub fn write_fmt(args: fmt::Arguments<'_>) -> bool {
     with_screen(|screen| {
         let _ = Feed(screen).write_fmt(args);
-        screen.render();
-    })
-    .is_some()
-}
-
-/// [`write_fmt`] with bytes as they are (no `\n` translation).
-pub fn write_raw_fmt(args: fmt::Arguments<'_>) -> bool {
-    with_screen(|screen| {
-        let _ = Raw(screen).write_fmt(args);
         screen.render();
     })
     .is_some()
@@ -314,7 +279,7 @@ fn level_sgr(level: Level) -> (&'static str, &'static str) {
 
 /// Show a log line, without the serial timestamp (so screenshots stay
 /// comparable): the level coloured, the tag dimmed (called by the logger).
-/// It starts from the default colours, whatever kmon's output left set.
+/// It starts from the default colours, whatever the shell's output left set.
 pub fn console_log(level: Level, tag: &str, args: &fmt::Arguments<'_>) {
     let (lvl, msg) = level_sgr(level);
     write_fmt(format_args!("\x1b[0;{lvl}m{level:<5}\x1b[0m \x1b[90m{tag}:\x1b[0m \x1b[{msg}m{args}\x1b[0m\n"));
@@ -348,7 +313,7 @@ pub fn reset_view() {
     move_view(Terminal::reset_view);
 }
 
-/// The start of a row of the view, as text (for kmon's `term`).
+/// The start of a row of the view, as text (for the shell's `term`).
 #[derive(Clone, Copy)]
 pub struct RowText {
     chars: [char; 32],
@@ -375,7 +340,7 @@ fn top_row(t: &Terminal) -> RowText {
     row
 }
 
-/// What kmon's `term` shows.
+/// What the shell's `term` shows.
 pub struct Status {
     pub cols: usize,
     pub rows: usize,
@@ -406,9 +371,8 @@ pub fn status() -> Option<Status> {
     })
 }
 
-/// The view's cells, row by row (for the tests). The vector is allocated
-/// before taking the screen's lock, as everything under it must not allocate.
-#[cfg(feature = "ktest")]
+/// The view's cells, row by row. The vector is allocated before taking the
+/// screen's lock, as everything under it must not allocate.
 fn view_cells() -> Option<(usize, Vec<Cell>)> {
     let (cols, rows) = with_screen(|s| (s.term.cols(), s.term.rows()))?;
     let mut cells = Vec::with_capacity(cols * rows);
@@ -418,6 +382,22 @@ fn view_cells() -> Option<(usize, Vec<Cell>)> {
         cells.extend((0..rows).flat_map(|r| (0..cols).map(move |c| t.cell(c, r))));
     })?;
     Some((cols, cells))
+}
+
+/// The view's rows as text (wide characters' spacers skipped, trailing
+/// blanks trimmed) and the cursor: what the shell's `term text` prints, and
+/// how the tests read what the screen shell did.
+pub fn view_text() -> Option<(Vec<String>, Cursor)> {
+    let (cols, cells) = view_cells()?;
+    let cursor = with_screen(|s| s.term.cursor())?;
+    let rows = cells
+        .chunks(cols)
+        .map(|row| {
+            let text: String = row.iter().filter(|c| !c.flags.contains(Flags::SPACER)).map(|c| c.ch).collect();
+            String::from(text.trim_end())
+        })
+        .collect();
+    Some((rows, cursor))
 }
 
 /// The bottom-most row of the view holding `needle`.
@@ -604,13 +584,40 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn output_keeps_a_scrolled_back_view() {
+        // Scrolled back, new lines scroll the screen under the view, which
+        // stays on the lines it shows (they are just more lines up); showing
+        // the screen again brings the view back to the bottom.
+        use crate::{kassert, kassert_eq};
+        use alloc::format;
+        for i in 0..60 {
+            write_fmt(format_args!("keep {i}\n"));
+        }
+        let (moved, top, view) = with_screen(|s| {
+            let moved = s.term.scroll_view(5);
+            s.render();
+            (moved, top_row(&s.term), s.term.view_offset())
+        })
+        .ok_or("no terminal")?;
+        kassert!(moved && view == 5);
+        kassert!(write_str("more 1\nmore 2\n"));
+        let after = status().ok_or("no terminal")?;
+        kassert_eq!(format!("{}", after.top_row), format!("{top}"));
+        kassert_eq!(after.view, view + 2);
+        reset_view();
+        kassert_eq!(status().ok_or("no terminal")?.view, 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn a_log_line_starts_from_the_default_colours() {
-        // Whatever kmon's output left set (bold, inverse, a background), a
+        // Whatever the shell's output left set (bold, inverse, a background), a
         // log line starts afresh.
         use crate::kassert;
-        write_raw_fmt(format_args!("\x1b[1;7;44m"));
+        write_str("\x1b[1;7;44m");
         log::info!(target: "termtest", "after a dirty pen");
-        write_raw_fmt(format_args!("\x1b[0m"));
+        write_str("\x1b[0m");
         let (cols, cells) = view_cells().ok_or("no terminal")?;
         let row = find_row(cols, &cells, "after a dirty pen").ok_or("the line isn't on screen")?;
         kassert!(row[0].flags == Flags::NONE);
@@ -642,9 +649,6 @@ crate::ktest!(
         let under = AtomicBool::new(false);
         kassert!(write_fmt(format_args!("{}", LockProbe(&under))));
         kassert!(under.load(Ordering::Relaxed));
-        let under_raw = AtomicBool::new(false);
-        kassert!(write_raw_fmt(format_args!("{}", LockProbe(&under_raw))));
-        kassert!(under_raw.load(Ordering::Relaxed));
         Ok(())
     }
 );

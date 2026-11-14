@@ -1,0 +1,18 @@
+[package]
+name = "lumen-shell"
+description = "no_std shell core for the Lumen kernel: word splitting with quotes, a line editor with history and completion, serial key decoding, host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+unicode-width.workspace = true
+
+[dev-dependencies]
+# The splitter is checked against shlex on random lines (tests/split_oracle.rs).
+shlex = { workspace = true, features = ["std"] }
+# The editor's output is checked on a terminal (src/tests.rs).
+lumen-term.workspace = true
+
+[lints]
+workspace = true

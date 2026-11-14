@@ -1,7 +1,7 @@
 # Features: input. See tests/features/README.md for the format.
 
 [[feature]]
-name = "PS/2 keyboard through the I/O APIC (IRQ 1), pc-keyboard linked (audit passing): keys sent with QMP reach kmon (every printable character, backspace), also after keys held during boot; bytes waiting at unmask drained, port 2 dropped; without an I/O APIC or an 8042 it is skipped with a warning"
+name = "PS/2 keyboard through the I/O APIC (IRQ 1), pc-keyboard linked (audit passing): keys sent with QMP reach the screen's shell (every printable character, backspace; a thread waiting for a key is woken by IRQ 1), also after keys held during boot; bytes waiting at unmask drained, port 2 dropped; without an I/O APIC or an 8042 it is skipped with a warning"
 milestone = "M2"
 tests = [
     "scenario:test_input::test_keys_via_qmp_send_key",

@@ -1,6 +1,6 @@
 //! Boot framebuffer: pixels, glyphs, the "hello" header, and the crash
 //! screen. Below the header, the terminal (`crate::term`) draws log lines and
-//! kmon.
+//! the screen's shell.
 //!
 //! Text uses pre-rasterized Noto Sans Mono glyphs (anti-aliased, so we blend
 //! each pixel between background and foreground). This is deliberately the

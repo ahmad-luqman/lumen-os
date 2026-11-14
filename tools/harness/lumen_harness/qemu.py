@@ -380,20 +380,22 @@ class Machine:
             self._qmp = QmpClient.connect(self.qmp_path, timeout=10)
         return self._qmp
 
-    def press(self, qcodes: Sequence[str], echo: str, timeout: float = 10) -> None:
-        """Press `qcodes` together on the guest's keyboard (QMP `send-key`)
-        and wait until the guest echoes `echo` on serial (kmon echoes the
-        printable ASCII it reads while its line has room, Enter, and
-        backspace on a line that isn't empty; a key that makes anything else
-        isn't echoed), so keys are paced by the guest, not by sleeps."""
+    def press(self, qcodes: Sequence[str]) -> None:
+        """Press `qcodes` together on the guest's keyboard (QMP `send-key`,
+        held 20 ms). QEMU queues each key behind the last one's hold time,
+        so keys pressed back to back arrive in order. The screen shell
+        answers them on the screen, not on serial: wait for what they did
+        with `lumen_harness.screen.expect_screen`."""
         self.qmp().send_key(qcodes)
-        self.expect(re.escape(echo), timeout)
 
-    def type_text(self, text: str, timeout: float = 10) -> None:
-        """Type `text` on the guest's keyboard as a US layout would, one key
-        at a time, each waiting for the guest's echo (see `press`)."""
+    def type_text(self, text: str) -> None:
+        """Type `text` on the guest's keyboard as a US layout would, a key at
+        a time (see `press`; QEMU's input queue holds some hundreds of keys,
+        so keep it to a line)."""
+        if len(text) > 200:
+            raise ValueError(f"typing {len(text)} keys at once could overflow QEMU's input queue")
         for ch in text:
-            self.press(qcodes_for(ch), ch, timeout)
+            self.press(qcodes_for(ch))
 
     def screendump(self, name: str) -> Path:
         """Save the current screen as PNG in the artifacts directory."""

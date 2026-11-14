@@ -28,11 +28,13 @@
 //! moves bytes from the controller into a lock-free single-producer,
 //! single-consumer queue (`lumen_queue::ByteQueue`), discarding bytes from
 //! the second port (a mouse) and counting and discarding those flagged with
-//! a parity or timeout error. Readers ([`read_key`]) decode them with the
+//! a parity or timeout error, then wakes the threads waiting for a key
+//! ([`wait_key`]). Readers ([`read_key`], [`wait_key`]) decode them with the
 //! `pc-keyboard` crate under a lock, in the layout `lumen.keymap=` names
 //! (`us` without one, or for a name it doesn't know, with a warning), into
-//! characters and other keys (with the shift state).
-//! kmon's `kbd` shows how it went ([`stats`]).
+//! characters (Ctrl and a letter making a control character: Ctrl-A is
+//! U+0001) and other keys (with the shift state).
+//! The shell's `kbd` shows how it went ([`stats`]).
 
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -46,6 +48,7 @@ use pc_keyboard::{DecodedKey, HandleControl, PS2Keyboard, ScancodeSet1};
 
 use crate::arch::i8042;
 use crate::interrupts::{self, Route};
+use crate::sched::WaitQueue;
 use crate::sync::SpinLock;
 use crate::{arch, cmdline, time};
 
@@ -84,6 +87,8 @@ struct Status {
 
 /// Bytes from the keyboard, waiting to be decoded.
 static QUEUE: ByteQueue<256> = ByteQueue::new();
+/// Threads waiting for the queue to have bytes ([`wait_key`]).
+static WAITING: WaitQueue = WaitQueue::new();
 /// The decoder: the queue's consumer side is used only under this lock
 /// (outside the ktests). `None` before [`init`].
 static KEYBOARD: SpinLock<Option<Keyboard>> = SpinLock::new(None);
@@ -210,7 +215,7 @@ fn choose_layout(value: Option<&str>) -> (&'static str, AnyLayout, bool) {
 }
 
 fn new_decoder(layout: AnyLayout) -> Decoder {
-    Decoder::new(ScancodeSet1::new(), layout, HandleControl::Ignore)
+    Decoder::new(ScancodeSet1::new(), layout, HandleControl::MapLettersToUnicode)
 }
 
 /// Set up the decoder in the layout `lumen.keymap=` names, then IRQ 1 and
@@ -457,9 +462,11 @@ fn on_irq() {
 }
 
 /// Move up to [`BYTES_PER_IRQ`] waiting bytes from the controller into the
-/// queue, discarding the second port's and those with a line error. With
+/// queue, discarding the second port's and those with a line error, then
+/// wake the threads waiting for a key if any byte was queued. With
 /// interrupts off, on the boot CPU: the queue's only producer.
 fn drain() {
+    let before = BYTES.load(Ordering::Relaxed);
     debug_assert!(!arch::irq::enabled() && arch::cpu_index() == 0, "the keyboard queue's producer is the boot CPU");
     for _ in 0..BYTES_PER_IRQ {
         let status = i8042::status();
@@ -473,12 +480,15 @@ fn drain() {
             BYTES.fetch_add(1, Ordering::Relaxed); // (a full queue counts it: `dropped`)
         }
     }
+    if BYTES.load(Ordering::Relaxed) != before {
+        WAITING.wake_all();
+    }
 }
 
 pub use pc_keyboard::KeyCode;
 
-/// A key read from the keyboard. (Only shift is reported; the shell, #62,
-/// will need ctrl and alt.)
+/// A key read from the keyboard. (Ctrl and a letter make a control
+/// character; Alt isn't reported.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
     /// A key making a character, in the layout.
@@ -495,6 +505,21 @@ pub enum Key {
 pub fn read_key() -> Option<Key> {
     let mut keyboard = KEYBOARD.lock();
     decode(&mut keyboard.as_mut()?.decoder, || QUEUE.pop())
+}
+
+/// The next key pressed, waiting for one (see [`read_key`]): IRQ 1 wakes
+/// the thread when it queues bytes. Blocks the calling thread (only where a
+/// thread can block: see `sched::WaitQueue::wait_until`). Without a keyboard
+/// it never returns.
+pub fn wait_key() -> Key {
+    loop {
+        if let Some(key) = read_key() {
+            return key;
+        }
+        // Checked under the wait queue's lock: bytes queued after `read_key`
+        // emptied the queue either make this true or wake the thread.
+        WAITING.wait_until(|| !QUEUE.is_empty());
+    }
 }
 
 /// Feed `next()`'s bytes to `decoder` until one completes a key press;
@@ -518,7 +543,7 @@ fn decode(decoder: &mut Decoder, mut next: impl FnMut() -> Option<u8>) -> Option
     None
 }
 
-/// What kmon's `kbd` shows.
+/// What the shell's `kbd` shows.
 pub struct Stats {
     /// The layout's name (`none` before [`init`]).
     pub layout: &'static str,
@@ -578,6 +603,11 @@ crate::ktest!(
         kassert_eq!(decode_all("us", &shift_a_3).as_str(), "A#");
         kassert_eq!(decode_all("uk", &shift_a_3).as_str(), "A£");
         kassert_eq!(decode_all("us", &[0x1c, 0x9c, 0x0e, 0x8e]).as_str(), "\n\u{8}");
+        // Left ctrl is 0x1d: with A, then W, Ctrl-A and Ctrl-W (in every
+        // layout: on a German keyboard too, where Y and Z trade places).
+        let ctrl_a_w = [0x1d, 0x1e, 0x9e, 0x11, 0x91, 0x9d, 0x1e, 0x9e];
+        kassert_eq!(decode_all("us", &ctrl_a_w).as_str(), "\u{1}\u{17}a");
+        kassert_eq!(decode_all("de", &[0x1d, 0x15, 0x95, 0x9d]).as_str(), "\u{1a}");
         let before = UNDECODED.load(Ordering::Relaxed);
         kassert_eq!(decode_all("us", &[0xff, 0x15, 0x95]).as_str(), "y");
         kassert_eq!(UNDECODED.load(Ordering::Relaxed), before + 1);

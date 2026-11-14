@@ -619,7 +619,7 @@ pub fn walk(virt: VirtAddr) -> Walk {
 }
 
 /// The physical address `virt` maps to in the active page tables.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: ktests; kmon/X-ray later
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: ktests; the shell/X-ray later
 pub fn translate(virt: VirtAddr) -> Option<PhysAddr> {
     pt::translate(&Hhdm, hw::active_root(), virt)
 }
