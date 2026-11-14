@@ -1,6 +1,13 @@
 //! The terminal on the framebuffer: `lumen-term`'s grid drawn below the
 //! header, fed by log lines (coloured by level) and the screen's shell.
 //!
+//! There are [`VTS`] virtual terminals, each its own grid and scrollback
+//! (allocated in [`init`]), one shown at a time: log lines go to the first,
+//! each screen shell writes to its own ([`write_fmt_to`]), and [`show`]
+//! switches which is drawn (the shells' keys follow it: `crate::vt`). The
+//! header's right end shows which one is shown. Writing to a hidden one
+//! draws nothing; showing it draws all of it.
+//!
 //! Drawing keeps a copy of every cell it drew (the shadow) and draws only
 //! the cells that differ from it, in the rows the terminal marked as changed.
 //! A scroll moves the pixels (`Framebuffer::move_rows`) and the shadow
@@ -19,7 +26,9 @@
 //! A command can take the pixels below the header for itself ([`canvas`]):
 //! the terminal then keeps taking output but draws none of it until the
 //! [`Canvas`] is dropped (or taken back, [`reclaim_canvas`]), which draws
-//! the whole terminal again.
+//! the whole terminal again. A command on a virtual terminal that takes it
+//! brings that terminal to the front first, and while a canvas is held no
+//! other terminal can be shown: the keys stay with the command drawing.
 //!
 //! The terminal takes `\n` as a line feed only: [`write_str`], [`write_fmt`]
 //! and log lines turn it into CR LF.
@@ -36,17 +45,25 @@ use log::Level;
 use lumen_term::{Cell, Color, Cursor, Flags, Terminal, palette};
 use noto_sans_mono_bitmap::{FontWeight, get_raster_width};
 
-/// Lines kept above the screen.
+/// Lines kept above the screen (by each virtual terminal).
 pub const SCROLLBACK: usize = 500;
+/// Virtual terminals (Alt+F1 to Alt+F4).
+pub const VTS: usize = 4;
 /// How long the cursor stays on, then off, in the boot CPU's timer ticks
 /// (1 kHz).
 const BLINK_TICKS: u64 = 500;
 const CELL_H: usize = 16;
 
-/// The terminal and what is drawn of it.
+/// The terminals and what is drawn of the shown one.
 struct Screen {
     fb: Framebuffer,
+    /// The shown virtual terminal's grid.
     term: Terminal,
+    /// Which virtual terminal is shown (0 is the first).
+    shown: usize,
+    /// The hidden ones' grids, by number (`None` at `shown`: its grid is
+    /// `term`). Switching swaps them, so it allocates nothing.
+    parked: Vec<Option<Terminal>>,
     /// What each cell of the view was last drawn as (row by row).
     shadow: Vec<Cell>,
     /// Top-left pixel of the grid.
@@ -90,11 +107,28 @@ pub fn init(fb: Framebuffer) {
     }
     // Allocated here, before taking the lock (see the module comment).
     let term = Terminal::new(cols, rows, SCROLLBACK);
+    let parked = (0..VTS).map(|vt| (vt > 0).then(|| Terminal::new(cols, rows, SCROLLBACK))).collect();
     let shadow = vec![Cell::BLANK; cols * rows];
-    let screen =
-        Screen { fb, term, shadow, x0, y0, cell_w, cursor_drawn: None, blink_on: true, cells_drawn: 0, canvas: None };
+    let mut screen = Screen {
+        fb,
+        term,
+        shown: 0,
+        parked,
+        shadow,
+        x0,
+        y0,
+        cell_w,
+        cursor_drawn: None,
+        blink_on: true,
+        cells_drawn: 0,
+        canvas: None,
+    };
+    screen.draw_tabs();
     *SCREEN.lock() = Some(screen);
-    log::info!(target: "term", "terminal {cols}x{rows}, {SCROLLBACK} lines of scrollback");
+    log::info!(
+        target: "term",
+        "{VTS} terminals {cols}x{rows} (Alt+F1 to F{VTS} switch), {SCROLLBACK} lines of scrollback each"
+    );
 }
 
 /// This CPU's value in [`DRAWING`].
@@ -159,15 +193,61 @@ pub fn on_tick(tick: u64) {
 }
 
 impl Screen {
-    /// Feed `s` to the terminal, `\n` as CR LF (not drawn yet).
-    fn feed(&mut self, s: &str) {
+    /// Virtual terminal `vt`'s grid (shown or not).
+    ///
+    /// # Panics
+    /// If there is no terminal `vt`.
+    fn term_of(&mut self, vt: usize) -> &mut Terminal {
+        if vt == self.shown { &mut self.term } else { self.parked[vt].as_mut().expect("a hidden terminal is parked") }
+    }
+
+    /// Feed `s` to virtual terminal `vt`, `\n` as CR LF (not drawn yet).
+    fn feed(&mut self, vt: usize, s: &str) {
+        let term = self.term_of(vt);
         for (i, line) in s.split('\n').enumerate() {
             if i > 0 {
-                self.term.write(b"\r\n");
+                term.write(b"\r\n");
             }
-            self.term.write(line.as_bytes());
+            term.write(line.as_bytes());
         }
-        self.show_cursor();
+        if vt == self.shown {
+            self.show_cursor();
+        }
+    }
+
+    /// Show virtual terminal `vt` instead (its grid swapped in), drawing
+    /// all of it unless a canvas has the pixels (dropping it will).
+    fn switch(&mut self, vt: usize) {
+        if vt == self.shown {
+            return;
+        }
+        let new = self.parked[vt].take().expect("a hidden terminal is parked");
+        let old = core::mem::replace(&mut self.term, new);
+        self.parked[self.shown] = Some(old);
+        self.shown = vt;
+        self.draw_tabs();
+        if self.canvas.is_none() {
+            self.redraw();
+        }
+    }
+
+    /// The header's right end: a box per virtual terminal, numbered from 1,
+    /// the shown one filled (see [`tab_x`]).
+    fn draw_tabs(&mut self) {
+        for vt in 0..VTS {
+            let Some(x) = tab_x(self.fb.width(), vt) else { return };
+            let (fg, bg) = if vt == self.shown { (fb::BG, fb::TEXT) } else { (fb::TEXT, fb::BG) };
+            self.fb.fill_rect(x, TAB_Y, TAB_W, TAB_H, bg);
+            // Outlined, so a hidden one's box shows too.
+            self.fb.fill_rect(x, TAB_Y, TAB_W, 1, fb::TEXT);
+            self.fb.fill_rect(x, TAB_Y + TAB_H - 1, TAB_W, 1, fb::TEXT);
+            self.fb.fill_rect(x, TAB_Y, 1, TAB_H, fb::TEXT);
+            self.fb.fill_rect(x + TAB_W - 1, TAB_Y, 1, TAB_H, fb::TEXT);
+            let digit = char::from_digit(vt as u32 + 1, 10).unwrap_or('?');
+            let style = Style::new(FontWeight::Bold, fb::CONSOLE_SIZE, fg, bg);
+            let (gx, gy) = (x + (TAB_W - self.cell_w) / 2, TAB_Y + (TAB_H - CELL_H) / 2);
+            self.fb.glyph_clipped(gx, gy, digit, style, self.cell_w);
+        }
     }
 
     /// Output shows the cursor at once, for a whole blink.
@@ -231,6 +311,12 @@ impl Screen {
     /// header) and draw every cell of the terminal again.
     fn resume(&mut self) {
         self.canvas = None;
+        self.redraw();
+    }
+
+    /// Clear everything below the header and draw every cell of the shown
+    /// terminal.
+    fn redraw(&mut self) {
         let (w, h) = (self.fb.width(), self.fb.height());
         self.fb.fill_rect(0, fb::CONSOLE_TOP, w, h.saturating_sub(fb::CONSOLE_TOP), fb::BG);
         // A blank cell draws as the background just filled in.
@@ -261,18 +347,52 @@ impl Screen {
     }
 }
 
+/// The header's virtual-terminal boxes: their size, the gap between them
+/// and their top edge.
+const TAB_W: usize = 28;
+const TAB_H: usize = 24;
+const TAB_GAP: usize = 6;
+const TAB_Y: usize = 36;
+/// The header's text and rule stay in its left 640 pixels (`fb::init`).
+const HEADER_TEXT_W: usize = 640;
+
+/// The left edge of virtual terminal `vt`'s box in the header of a screen
+/// `width` pixels wide: the boxes end a margin from its right edge. `None`
+/// on a screen too narrow to keep them clear of the header's text (no boxes
+/// then).
+fn tab_x(width: usize, vt: usize) -> Option<usize> {
+    let all = VTS * TAB_W + (VTS - 1) * TAB_GAP;
+    let x0 = width.checked_sub(fb::MARGIN + all).filter(|&x| x >= HEADER_TEXT_W)?;
+    Some(x0 + vt * (TAB_W + TAB_GAP))
+}
+
 /// Who holds a [`Canvas`]: the shell makes one for each command it runs
 /// (`Ctx::canvas` takes the canvas for it) and, when the command returns,
 /// takes back a canvas that owner left behind ([`reclaim_canvas`]), but
-/// never another's (the other console's command may be drawing).
+/// never another's (another console's command may be drawing). A command
+/// on a virtual terminal's shell has that terminal, which its canvas
+/// brings to the front.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Owner(NonZeroU64);
+pub struct Owner {
+    id: NonZeroU64,
+    vt: Option<usize>,
+}
 
 impl Owner {
-    /// A new owner, equal to no other.
+    /// A new owner, equal to no other, on no virtual terminal (a command on
+    /// serial).
     pub fn new() -> Owner {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        Owner(NonZeroU64::new(NEXT.fetch_add(1, Ordering::Relaxed)).expect("2^64 owners"))
+        Owner { id: NonZeroU64::new(NEXT.fetch_add(1, Ordering::Relaxed)).expect("2^64 owners"), vt: None }
+    }
+
+    /// A new owner for a command on virtual terminal `vt`.
+    ///
+    /// # Panics
+    /// If `vt >= VTS`.
+    pub fn on_vt(vt: usize) -> Owner {
+        assert!(vt < VTS, "no virtual terminal {vt}");
+        Owner { vt: Some(vt), ..Owner::new() }
     }
 }
 
@@ -338,7 +458,9 @@ impl fmt::Display for CanvasError {
 }
 
 /// Take the pixels below the header for `owner` (see [`Canvas`]; commands
-/// use `Ctx::canvas`).
+/// use `Ctx::canvas`). An owner on a virtual terminal shows it first (its
+/// keys go there: `crate::vt` follows [`shown`]), and while the canvas is
+/// held no other terminal can be shown ([`show`]).
 pub fn canvas(owner: Owner) -> Result<Canvas, CanvasError> {
     // `with_screen` refuses on a CPU already drawing too: never one taking
     // a canvas, as drawing holds the screen's lock with interrupts off
@@ -356,6 +478,10 @@ pub fn canvas(owner: Owner) -> Result<Canvas, CanvasError> {
             return Err(CanvasError::Stopped);
         }
         s.canvas = Some(owner);
+        // Drawn when the canvas goes (`resume`); the header's tabs now.
+        if let Some(vt) = owner.vt {
+            s.switch(vt);
+        }
         // SAFETY: the terminal's handle draws nothing while the canvas is
         // live (`Screen::canvas`), so the two never draw at the same time
         // (see `Canvas`'s `Sync` for a canvas no longer live).
@@ -499,35 +625,100 @@ fn rgb(color: Color, default: u32) -> u32 {
     }
 }
 
-/// Feeds the terminal through `fmt::Write` (`\n` as CR LF), drawing nothing.
-struct Feed<'a>(&'a mut Screen);
+/// Feeds virtual terminal `.1` through `fmt::Write` (`\n` as CR LF; see
+/// [`Screen::feed`]), drawing nothing.
+struct Feed<'a>(&'a mut Screen, usize);
 
 impl Write for Feed<'_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.0.feed(s);
+        self.0.feed(self.1, s);
         Ok(())
     }
 }
 
-/// Write `s` to the terminal (`\n` as CR LF) and draw it; false if the
-/// terminal didn't take it (no terminal, a crash report started, or this
-/// CPU is already drawing). Under a [`Canvas`] it is taken, and drawn when
-/// the canvas is dropped or taken back.
+/// Write `s` to the first virtual terminal (where log lines go; `\n` as CR
+/// LF) and draw it if shown; false if the terminal didn't take it (no
+/// terminal, a crash report started, or this CPU is already drawing).
+/// Under a [`Canvas`] it is taken, and drawn when the canvas is dropped or
+/// taken back.
 pub fn write_str(s: &str) -> bool {
     write_fmt(format_args!("{s}"))
 }
 
-/// Write formatted text (`\n` as CR LF) and draw it, all under one lock: a
-/// log line from another CPU can't land inside an escape sequence written
-/// in this one call. `args`
-/// must not allocate (see the module comment). False if the terminal
-/// didn't take it (see [`write_str`]).
+/// [`write_str`] to virtual terminal `vt` (a screen shell's).
+///
+/// # Panics
+/// If `vt >= VTS`.
+pub fn write_str_to(vt: usize, s: &str) -> bool {
+    write_fmt_to(vt, format_args!("{s}"))
+}
+
+/// Write formatted text to the first virtual terminal (see
+/// [`write_fmt_to`]).
 pub fn write_fmt(args: fmt::Arguments<'_>) -> bool {
+    write_fmt_to(0, args)
+}
+
+/// Write formatted text (`\n` as CR LF) to virtual terminal `vt` and draw
+/// it if that one is shown, all under one lock: a log line from another
+/// CPU can't land inside an escape sequence written in this one call.
+/// `args` must not allocate (see the module comment). False if the
+/// terminal didn't take it (see [`write_str`]).
+///
+/// # Panics
+/// If `vt >= VTS`.
+pub fn write_fmt_to(vt: usize, args: fmt::Arguments<'_>) -> bool {
+    assert!(vt < VTS, "no virtual terminal {vt}");
     with_screen(|screen| {
-        let _ = Feed(screen).write_fmt(args);
-        screen.render();
+        let _ = Feed(screen, vt).write_fmt(args);
+        if vt == screen.shown {
+            screen.render();
+        }
     })
     .is_some()
+}
+
+/// Why [`show`] didn't switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShowError {
+    /// No terminal (or a crash report started).
+    NoTerminal,
+    /// There are only [`VTS`].
+    NoSuchTerminal,
+    /// A command has the screen ([`Canvas`]): its terminal stays in front.
+    InUse,
+}
+
+impl fmt::Display for ShowError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ShowError::NoTerminal => f.write_str("no terminal"),
+            ShowError::NoSuchTerminal => write!(f, "there are terminals 1 to {VTS}"),
+            ShowError::InUse => f.write_str("a command has the screen"),
+        }
+    }
+}
+
+/// Show virtual terminal `vt` (0 is the first) and draw it (nothing to do
+/// if it is shown already). Keys follow it only through `crate::vt::show`,
+/// which calls this.
+pub fn show(vt: usize) -> Result<(), ShowError> {
+    if vt >= VTS {
+        return Err(ShowError::NoSuchTerminal);
+    }
+    with_screen(|s| {
+        if s.canvas.is_some() && vt != s.shown {
+            return Err(ShowError::InUse);
+        }
+        s.switch(vt);
+        Ok(())
+    })
+    .unwrap_or(Err(ShowError::NoTerminal))
+}
+
+/// The virtual terminal shown (0 without a terminal).
+pub fn shown() -> usize {
+    with_screen(|s| s.shown).unwrap_or(0)
 }
 
 /// The SGR colours of a log line's level word (and message, for errors and
@@ -549,17 +740,22 @@ pub fn console_log(level: Level, tag: &str, args: &fmt::Arguments<'_>) {
     write_fmt(format_args!("\x1b[0;{lvl}m{level:<5}\x1b[0m \x1b[90m{tag}:\x1b[0m \x1b[{msg}m{args}\x1b[0m\n"));
 }
 
-/// Move the view with `scroll` (which returns whether it moved) and draw
-/// it; a move is logged (debug: serial only, the screen shows up to `info`).
-fn move_view(scroll: impl FnOnce(&mut Terminal) -> bool) {
+/// Move virtual terminal `vt`'s view with `scroll` (which returns whether
+/// it moved) and draw it if shown; a move is logged (debug: serial only,
+/// the screen shows up to `info`).
+fn move_view(vt: usize, scroll: impl FnOnce(&mut Terminal) -> bool) {
+    assert!(vt < VTS, "no virtual terminal {vt}");
     let moved = with_screen(|s| {
         // The view stays put while a canvas has the screen (nothing would
         // show the move; the terminal comes back as it was left).
-        if s.canvas.is_some() || !scroll(&mut s.term) {
+        if s.canvas.is_some() || !scroll(s.term_of(vt)) {
             return None;
         }
-        s.render();
-        Some((s.term.view_offset(), top_row(&s.term)))
+        if vt == s.shown {
+            s.render();
+        }
+        let t = s.term_of(vt);
+        Some((t.view_offset(), top_row(t)))
     });
     // Logged outside the screen's lock: the logger takes its line lock
     // before the screen's, so logging under the screen's lock could
@@ -569,14 +765,15 @@ fn move_view(scroll: impl FnOnce(&mut Terminal) -> bool) {
     }
 }
 
-/// Scroll the view back (`pages` > 0) or forward by `pages` half screens.
-pub fn scroll_half_pages(pages: isize) {
-    move_view(|t| t.scroll_view(pages * (t.rows() as isize / 2).max(1)));
+/// Scroll virtual terminal `vt`'s view back (`pages` > 0) or forward by
+/// `pages` half screens.
+pub fn scroll_half_pages(vt: usize, pages: isize) {
+    move_view(vt, |t| t.scroll_view(pages * (t.rows() as isize / 2).max(1)));
 }
 
-/// Show the screen again (typing does).
-pub fn reset_view() {
-    move_view(Terminal::reset_view);
+/// Show virtual terminal `vt`'s screen again (typing does).
+pub fn reset_view(vt: usize) {
+    move_view(vt, Terminal::reset_view);
 }
 
 /// The start of a row of the view, as text (for the shell's `term`).
@@ -619,10 +816,12 @@ pub struct Status {
     pub cells_drawn: u64,
     /// A [`Canvas`] has the screen: nothing is drawn.
     pub paused: bool,
+    /// The virtual terminal shown (0 is the first); the rest is its state.
+    pub shown: usize,
 }
 
-/// The terminal's state, or `None` without one (or once a crash report
-/// started).
+/// The shown virtual terminal's state, or `None` without a terminal (or
+/// once a crash report started).
 pub fn status() -> Option<Status> {
     with_screen(|s| {
         let t = &s.term;
@@ -636,13 +835,15 @@ pub fn status() -> Option<Status> {
             top_row: top_row(t),
             cells_drawn: s.cells_drawn,
             paused: s.canvas.is_some(),
+            shown: s.shown,
         }
     })
 }
 
-/// The view's cells, row by row, and the cursor if it is in the view (its
-/// row counted in the view; shown or hidden), read under one lock: a log line from another
-/// CPU can't land between them. The vector is allocated before taking the
+/// The shown virtual terminal's view: its cells, row by row, and the
+/// cursor if it is in the view (its row counted in the view; shown or
+/// hidden), read under one lock: a log line from another CPU can't land
+/// between them. The vector is allocated before taking the
 /// lock again, as nothing under it may allocate.
 fn view_cells() -> Option<(usize, Vec<Cell>, Option<Cursor>)> {
     let (cols, rows) = with_screen(|s| (s.term.cols(), s.term.rows()))?;
@@ -669,8 +870,8 @@ pub struct ViewText {
     pub cursor: Option<Cursor>,
 }
 
-/// The view as text: what the shell's `term text` prints, and how the tests
-/// read what the screen shell did.
+/// The shown virtual terminal's view as text: what the shell's `term text`
+/// prints, and how the tests read what the screen shells did.
 pub fn view_text() -> Option<ViewText> {
     let (cols, cells, cursor) = view_cells()?;
     let rows = cells
@@ -797,7 +998,7 @@ crate::ktest!(
             b"\x1b[r\x1b[999;1H\r\nafter the region",
             b"\r\n",
         ];
-        reset_view();
+        reset_view(0);
         let (cols, rows, w, h) = with_screen(|s| {
             let (cols, rows) = (s.term.cols(), s.term.rows());
             (cols, rows, cols * s.cell_w, rows * CELL_H)
@@ -887,7 +1088,7 @@ crate::ktest!(
         let after = status().ok_or("no terminal")?;
         kassert_eq!(format!("{}", after.top_row), format!("{top}"));
         kassert_eq!(after.view, view + 2);
-        reset_view();
+        reset_view(0);
         kassert_eq!(status().ok_or("no terminal")?.view, 0);
         Ok(())
     }
@@ -947,7 +1148,7 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         const BEFORE: &str = "drawn before the canvas";
         const UNDER: &str = "written under a canvas";
-        reset_view();
+        reset_view(0);
         kassert!(write_str(&alloc::format!("{BEFORE}\n")));
         let drawn = || status().map(|s| s.cells_drawn).ok_or("no terminal");
         // Every pixel of the header, folded into one number (FNV-1a: no
@@ -1053,6 +1254,97 @@ crate::ktest!(
         drop(new);
         kassert!(!paused()?);
         kassert_eq!(corner()?, bg);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn virtual_terminals_keep_their_own_text() {
+        // Text written to a hidden terminal isn't drawn, and log lines go
+        // to the first only; showing another draws all of it (every cell as
+        // its grid holds it), the header's boxes marking it; showing the
+        // first again brings its text back. No terminal past the last.
+        use crate::{kassert, kassert_eq};
+        use alloc::format;
+        const FIRST: &str = "on the first terminal";
+        const SECOND: &str = "on the second terminal";
+        const LOGGED: &str = "logged while the second is shown";
+        kassert_eq!(shown(), 0);
+        reset_view(0);
+        kassert!(write_str(&format!("{FIRST}\n")));
+        let has = |needle: &str| view_text().map(|v| v.rows.iter().any(|r| r.contains(needle))).ok_or("no terminal");
+        let drawn = || status().map(|s| s.cells_drawn).ok_or("no terminal");
+        let before = drawn()?;
+        kassert!(write_str_to(1, &format!("{SECOND}\n")));
+        kassert_eq!(drawn()?, before);
+        kassert!(has(FIRST)? && !has(SECOND)?);
+        show(1).map_err(|_| "no switch")?;
+        kassert_eq!(shown(), 1);
+        kassert!(has(SECOND)? && !has(FIRST)?);
+        log::info!(target: "termtest", "{LOGGED}");
+        kassert!(!has(LOGGED)?);
+        // What is drawn is the second's grid; the box of the shown terminal
+        // is filled (a pixel inside it, clear of its digit and outline).
+        let (cells_match, tabs) = with_screen(|s| {
+            let (cols, rows) = (s.term.cols(), s.term.rows());
+            let cells_match = (0..rows).all(|r| (0..cols).all(|c| s.shadow[r * cols + c] == s.term.cell(c, r)));
+            let text = s.fb.encode(fb::TEXT);
+            let tabs: [Option<bool>; VTS] =
+                core::array::from_fn(|vt| tab_x(s.fb.width(), vt).map(|x| s.fb.pixel(x + 2, TAB_Y + 2) == text));
+            (cells_match, tabs)
+        })
+        .ok_or("no terminal")?;
+        kassert!(cells_match);
+        kassert_eq!(tabs, [Some(false), Some(true), Some(false), Some(false)]);
+        kassert_eq!(show(VTS), Err(ShowError::NoSuchTerminal));
+        kassert_eq!(shown(), 1);
+        show(0).map_err(|_| "no switch back")?;
+        kassert!(has(FIRST)? && has(LOGGED)? && !has(SECOND)?);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn the_header_boxes_keep_clear_of_its_text() {
+        // On a 1280-pixel screen the four boxes end a margin from the right
+        // edge, in order; on one too narrow to keep them right of the
+        // header's text there are none.
+        use crate::kassert_eq;
+        let all = VTS * TAB_W + (VTS - 1) * TAB_GAP;
+        kassert_eq!(tab_x(1280, 0), Some(1280 - fb::MARGIN - all));
+        kassert_eq!(tab_x(1280, VTS - 1).map(|x| x + TAB_W), Some(1280 - fb::MARGIN));
+        kassert_eq!(tab_x(HEADER_TEXT_W + fb::MARGIN + all, 0), Some(HEADER_TEXT_W));
+        kassert_eq!(tab_x(HEADER_TEXT_W + fb::MARGIN + all - 1, 0), None);
+        kassert_eq!(tab_x(0, 0), None);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_canvas_brings_its_terminal_to_the_front_and_keeps_it_there() {
+        // A command on the third terminal taking the canvas shows the third
+        // (its keys go there); no other can be shown while it holds it, and
+        // dropping it draws the third, which stays shown. A canvas for a
+        // command on serial (no terminal) leaves the shown one alone.
+        use crate::{kassert, kassert_eq};
+        kassert_eq!(shown(), 0);
+        let c = canvas(Owner::on_vt(2)).map_err(|_| "no canvas")?;
+        kassert_eq!(shown(), 2);
+        kassert_eq!(show(0), Err(ShowError::InUse));
+        kassert!(show(2).is_ok());
+        kassert_eq!(shown(), 2);
+        drop(c);
+        let (paused, cells_match) = with_screen(|s| {
+            let (cols, rows) = (s.term.cols(), s.term.rows());
+            (s.canvas.is_some(), (0..rows).all(|r| (0..cols).all(|c| s.shadow[r * cols + c] == s.term.cell(c, r))))
+        })
+        .ok_or("no terminal")?;
+        kassert!(!paused && cells_match);
+        kassert_eq!(shown(), 2);
+        show(0).map_err(|_| "no switch back")?;
+        let c = canvas(Owner::new()).map_err(|_| "no canvas")?;
+        kassert_eq!(shown(), 0);
+        drop(c);
         Ok(())
     }
 );

@@ -31,9 +31,9 @@ pub const KINDS: &[&str] = &[
     "relocklog",
 ];
 
-/// Writes to serial and the screen, whichever shell ran the command (a
-/// fault that didn't happen, the heap's line before a heap crash): the
-/// tests read serial.
+/// Writes to serial and the first virtual terminal (with the log lines),
+/// whichever shell ran the command (a fault that didn't happen, the heap's
+/// line before a heap crash): the tests read serial.
 struct Out;
 
 impl Write for Out {

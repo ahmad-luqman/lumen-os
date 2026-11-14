@@ -1,6 +1,6 @@
 //! The shell's commands: kmon's, with their names and output (`echo`
 //! joins its words with single spaces; `clear` and `colors` need a console
-//! that takes escape codes), plus `history`, `term text`, `reboot`,
+//! that takes escape codes), plus `history`, `term text`, `vt`, `reboot`,
 //! `shutdown` and the system commands (`cpus`, `mem`, `irqs`, `dmesg`,
 //! `date`, `top`: `sysinfo.rs`). A table the
 //! line editor completes from. Each writes to the console that ran it.
@@ -52,10 +52,17 @@ pub static COMMANDS: Table<Run> = Table(&[
         name: "term",
         args: &[&["text"]],
         usage: "[text]",
-        about: "the screen's terminal: size, cursor, scrollback (text: its rows)",
+        about: "the shown terminal: size, cursor, scrollback (text: its rows)",
         run: term,
     },
     Command { name: "clear", args: &[], usage: "", about: "clear the screen and its scrollback", run: clear },
+    Command {
+        name: "vt",
+        args: &[&["1", "2", "3", "4"]],
+        usage: "[n]",
+        about: "the virtual terminal shown (n: show that one, as Alt+Fn does)",
+        run: vt,
+    },
     Command { name: "colors", args: &[], usage: "", about: "a colour test pattern", run: colors },
     Command {
         name: "mandelbrot",
@@ -318,6 +325,32 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
             let _ = writeln!(out, "usage: term [text]");
         }
     }
+}
+
+/// `vt`: which virtual terminal is shown; `vt <n>`: show terminal `n` (1
+/// to `term::VTS`), unless a command has the screen.
+fn vt(ctx: &mut Ctx<'_>, args: &[String]) {
+    use crate::term::VTS;
+    let out = &mut *ctx.out;
+    let _ = match args {
+        [] => match crate::term::status() {
+            Some(t) => writeln!(
+                out,
+                "vt: terminal {} of {VTS} shown (Alt+F1 to F{VTS} switch), {} keys dropped",
+                t.shown + 1,
+                crate::vt::dropped()
+            ),
+            None => writeln!(out, "vt: no terminal"),
+        },
+        [n] => match n.parse::<usize>() {
+            Ok(n @ 1..=VTS) => match crate::vt::show(n - 1) {
+                Ok(()) => writeln!(out, "vt: terminal {n} shown"),
+                Err(e) => writeln!(out, "vt: not showing terminal {n}: {e}"),
+            },
+            _ => writeln!(out, "usage: vt [n] (n from 1 to {VTS})"),
+        },
+        _ => writeln!(out, "usage: vt [n] (n from 1 to {VTS})"),
+    };
 }
 
 /// The message for a command that needs escape codes on a plain console.

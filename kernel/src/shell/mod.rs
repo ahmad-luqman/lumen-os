@@ -7,15 +7,17 @@
 //!   boot CPU's `main` thread (kmain's context), polling serial (no serial
 //!   interrupt yet, #61) and yielding to the CPU's other threads between
 //!   polls.
-//! - The screen shell reads the PS/2 keyboard and answers on the screen's
-//!   terminal, with ANSI line editing. It runs in its own thread
-//!   (`shell-screen`, on the boot CPU), blocked until a key arrives; it
-//!   starts only with a keyboard and a terminal wide enough for a 16-column
-//!   line. Shift+PageUp and
-//!   Shift+PageDown scroll the screen back and forward by half a screen;
-//!   any key the line editor takes shows it again.
+//! - The screen shells, one per virtual terminal (`term::VTS`), read the
+//!   PS/2 keyboard while their terminal is shown (Alt+F1 to Alt+F4 switch:
+//!   `crate::vt`) and answer on it, with ANSI line editing. Each runs in its
+//!   own thread (`shell-vt1` to `shell-vt4`, on the boot CPU), blocked until
+//!   a key arrives; they start only with a keyboard and a terminal wide
+//!   enough for a 16-column line. Shift+PageUp and Shift+PageDown scroll
+//!   the shown terminal back and forward by half a screen; any key the line
+//!   editor takes shows its screen again.
 //!
-//! Log lines go to both consoles, between the shells' output. The line
+//! Log lines go to serial and the first virtual terminal, between the
+//! shells' output. The line
 //! editor, the word splitting and completion are `lumen-shell`'s (tested on
 //! the host); the commands are in [`commands`].
 
@@ -68,7 +70,8 @@ impl<'a> Ctx<'a> {
     /// A context for running commands on `out` (each run gets its own
     /// canvas owner).
     pub fn new(out: &'a mut dyn Console, ansi: bool, history: &'a History) -> Ctx<'a> {
-        Ctx { out, ansi, history, owner: term::Owner::new() }
+        let owner = out.vt().map_or_else(term::Owner::new, term::Owner::on_vt);
+        Ctx { out, ansi, history, owner }
     }
 
     /// Take the screen's pixels for this command (see `term::Canvas`; drop
@@ -118,19 +121,34 @@ pub trait Console: Write + Send {
     /// Where its keys are typed, for a prompt shown elsewhere ("press a key
     /// on serial").
     fn name(&self) -> &'static str;
+    /// The virtual terminal it is, if it is one (a canvas its command takes
+    /// brings it to the front).
+    fn vt(&self) -> Option<usize> {
+        None
+    }
 }
 
-/// Start the screen shell (if there is a terminal and a keyboard), then run
-/// the serial shell here.
+/// The screen shells' threads, one per virtual terminal.
+const SCREEN_THREADS: [&str; term::VTS] = ["shell-vt1", "shell-vt2", "shell-vt3", "shell-vt4"];
+
+/// Start the screen shells (if there is a terminal and a keyboard), then
+/// run the serial shell here.
 pub fn run() -> ! {
     match screen_editor() {
-        // Logged before the screen's shell starts, so its prompt comes after
-        // this line on the screen.
-        Ok(editor) => {
+        // Logged before the screen's shells start, so the first's prompt
+        // comes after this line on the screen.
+        Ok(max) => {
             log::info!(target: "shell", "shells on serial and the screen; type 'help'");
-            match crate::sched::spawn("shell-screen", move || run_on(Screen, editor)) {
-                Ok(handle) => drop(handle), // it runs for good
-                Err(e) => log::error!(target: "shell", "no shell on the screen after all: no thread for it: {e}"),
+            for (vt, name) in SCREEN_THREADS.into_iter().enumerate() {
+                let editor = Editor::new(PROMPT, Mode::Ansi, max, HISTORY);
+                match crate::sched::spawn(name, move || run_on(Screen { vt }, editor)) {
+                    Ok(handle) => drop(handle), // it runs for good
+                    Err(e) => log::error!(
+                        target: "shell",
+                        "no shell on terminal {} after all: no thread for it: {e}",
+                        vt + 1
+                    ),
+                }
             }
         }
         Err(why) => log::info!(target: "shell", "shell on serial (none on the screen: {why}); type 'help'"),
@@ -140,8 +158,8 @@ pub fn run() -> ! {
     run_on(Serial { decoder: Decoder::new() }, Editor::new(PROMPT, mode, max, HISTORY))
 }
 
-/// The screen shell's editor, if there is a terminal and a keyboard.
-fn screen_editor() -> Result<Editor, &'static str> {
+/// The screen shells' widest line, if there is a terminal and a keyboard.
+fn screen_editor() -> Result<usize, &'static str> {
     let cols = crate::term::status().ok_or("no terminal")?.cols;
     if keyboard::stats().result != Some(Ok(())) {
         return Err("no keyboard");
@@ -150,7 +168,7 @@ fn screen_editor() -> Result<Editor, &'static str> {
     if max < MIN_LINE {
         return Err("terminal too narrow");
     }
-    Ok(Editor::new(PROMPT, Mode::Ansi, max, HISTORY))
+    Ok(max)
 }
 
 /// The widest line on a console `cols` wide: the prompt, the line and the
@@ -238,45 +256,47 @@ impl Console for Serial {
     }
 }
 
-/// The keyboard in, the screen's terminal out. Each `write!` reaches the
-/// screen whole (one lock), not in pieces another CPU's log line could land
-/// between. It is formatted before taking the screen's lock: formatting may
-/// allocate (a script value's `Debug` does), which the heap refuses under
-/// that lock.
-struct Screen;
+/// A virtual terminal: the keyboard's keys while it is shown in, its
+/// terminal out. Each `write!` reaches the terminal whole (one lock), not
+/// in pieces another CPU's log line could land between. It is formatted
+/// before taking the screen's lock: formatting may allocate (a script
+/// value's `Debug` does), which the heap refuses under that lock.
+struct Screen {
+    vt: usize,
+}
 
 impl Write for Screen {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        crate::term::write_str(s);
+        crate::term::write_str_to(self.vt, s);
         Ok(())
     }
 
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
         match args.as_str() {
-            Some(s) => crate::term::write_str(s),
-            None => crate::term::write_str(&alloc::fmt::format(args)),
+            Some(s) => crate::term::write_str_to(self.vt, s),
+            None => crate::term::write_str_to(self.vt, &alloc::fmt::format(args)),
         };
         Ok(())
     }
 }
 
 impl Screen {
-    /// A key from the keyboard: Shift+PageUp/PageDown scroll the screen and
+    /// A key typed on this terminal: Shift+PageUp/PageDown scroll it and
     /// give `None`, as does a key the line editor doesn't take; any other
-    /// brings the view back to the bottom and is the editor's key.
-    fn take(key: keyboard::Key) -> Option<Key> {
+    /// brings its view back to the bottom and is the editor's key.
+    fn take(&self, key: keyboard::Key) -> Option<Key> {
         match key {
-            keyboard::Key::Raw { code: KeyCode::PageUp, shift: true } => {
-                crate::term::scroll_half_pages(1);
+            keyboard::Key::Raw { code: KeyCode::PageUp, shift: true, .. } => {
+                crate::term::scroll_half_pages(self.vt, 1);
                 None
             }
-            keyboard::Key::Raw { code: KeyCode::PageDown, shift: true } => {
-                crate::term::scroll_half_pages(-1);
+            keyboard::Key::Raw { code: KeyCode::PageDown, shift: true, .. } => {
+                crate::term::scroll_half_pages(self.vt, -1);
                 None
             }
             _ => {
                 let key = screen_key(key)?;
-                crate::term::reset_view();
+                crate::term::reset_view(self.vt);
                 Some(key)
             }
         }
@@ -288,17 +308,21 @@ impl Console for Screen {
         "the keyboard"
     }
 
+    fn vt(&self) -> Option<usize> {
+        Some(self.vt)
+    }
+
     fn read_key(&mut self) -> Key {
         loop {
-            if let Some(key) = Self::take(keyboard::wait_key()) {
+            if let Some(key) = self.take(crate::vt::wait_key(self.vt)) {
                 return key;
             }
         }
     }
 
     fn try_key(&mut self) -> Option<Key> {
-        while let Some(key) = keyboard::read_key() {
-            if let Some(key) = Self::take(key) {
+        while let Some(key) = crate::vt::read_key(self.vt) {
+            if let Some(key) = self.take(key) {
                 return Some(key);
             }
         }
@@ -390,7 +414,7 @@ crate::ktest!(
     fn keyboard_keys_reach_the_line_editor() {
         use crate::kassert_eq;
         use keyboard::Key as K;
-        let raw = |code| K::Raw { code, shift: false };
+        let raw = |code| K::Raw { code, shift: false, alt: false };
         let cases = [
             (K::Char('a'), Some(Key::Char('a'))),
             (K::Char('é'), Some(Key::Char('é'))),
@@ -434,7 +458,7 @@ crate::ktest!(
             }
         }
         let held = AtomicBool::new(false);
-        let _ = writeln!(Screen, "{}{}", LockProbe(&held), Allocating);
+        let _ = writeln!(Screen { vt: 0 }, "{}{}", LockProbe(&held), Allocating);
         kassert!(!held.load(Ordering::Relaxed));
         let view = crate::term::view_text().ok_or("no terminal")?;
         kassert!(view.rows.iter().any(|r| r.contains("allocated while formatting 42")));

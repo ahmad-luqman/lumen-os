@@ -132,8 +132,9 @@ tests (for example `lumen-elf`, the symbol-table reader).
    online (`INFO  smp: 4 CPUs online`); the scheduler started on every CPU
    (`INFO  sched: threads on 4 CPUs, 10 ms slices`; `kmain`'s context
    becomes the `main` thread, section 6, "Kernel threads"); the
-   framebuffer hello screen and the terminal below it (`INFO  term:
-   terminal 176x41, 500 lines of scrollback`, section 6, "Terminal"; log
+   framebuffer hello screen and the terminals below it (`INFO  term:
+   4 terminals 176x41 (Alt+F1 to F4 switch), 500 lines of scrollback
+   each`, section 6, "Terminal"; log
    lines before it are on serial only), the PS/2 keyboard (`INFO  kbd: PS/2 keyboard
    on ISA IRQ 1 ...`, section 6, "Keyboard"), then
    `boot complete`, then the boot timeline (below).
@@ -883,12 +884,15 @@ off. A wake from another CPU queues the thread there and sends the
   a ktest decodes Ctrl-A, Ctrl-W and, on a German keyboard, Ctrl-Z), or
   another key pressed (arrows, PageUp, modifiers) with whether shift is
   held; releases are skipped, and bytes the decoder refuses are counted
-  (the keyboard's overrun code among them). `keyboard::wait_key` blocks
-  the calling thread until a key comes: the producer wakes the keyboard's
-  wait queue whenever it queued a byte, and the waiter checks the queue
-  under the wait queue's lock, so a byte can't slip between its check and
-  its sleep (the screen's shell waits there: every keyboard scenario goes
-  through it). The shell's
+  (the keyboard's overrun code among them); Alt is reported with keys
+  that make no character (a ktest decodes Alt+F2).
+  `keyboard::wait_for_bytes_or(ready)` blocks the calling thread until
+  bytes are queued or `ready()` holds: the producer wakes the keyboard's
+  wait queue whenever it queued a byte, and the waiter checks under the
+  wait queue's lock, so a byte can't slip between its check and its sleep.
+  The screen shells read keys only through the virtual terminals' router
+  (`vt::read_key`/`vt::wait_key`, section "Terminal"): every keyboard
+  scenario goes through it. The shell's
   `kbd` shows the layout, the route, the
   interrupts taken, the bytes queued, dropped, undecoded, flagged, and
   skipped during setup, or why there is no keyboard (and whether IRQ 1 was
@@ -1008,8 +1012,32 @@ off. A wake from another CPU queues the thread there and sends the
   draws nothing more (`Canvas::is_live`; a draw under way stops at its
   next row or glyph) and its drop leaves the terminal alone (ktests check
   the taking back; the crash case is not tested).
-- **Not yet:** virtual terminals (Alt+F1 to F4, ROADMAP M2), a font with
-  more than Basic Latin, underline and other SGR attributes, the
+- **Virtual terminals:** `term::VTS` (4) terminals, each its own grid and
+  scrollback, all allocated at init (a hidden one's grid swaps with the
+  shown one's, so switching allocates nothing); one is drawn. Log lines go
+  to the first; each screen shell writes to its own
+  (`term::write_fmt_to`); writing to a hidden one draws nothing, and
+  showing it (`term::show`) draws all of it (a ktest checks both, and that
+  log lines stay on the first). The header's right end shows a numbered
+  box per terminal, the shown one filled (a golden; left out on a screen
+  too narrow to keep them right of the header's text, a ktest of the
+  geometry). Keys: `kernel/src/vt.rs` decodes the keyboard's bytes under
+  its lock and gives each key to the terminal shown when it was typed
+  (`lumen_term::vt::Router`: a 64-key ring per terminal, a full one drops
+  and counts the newest; host-tested against a model), Alt+F1 to Alt+F4
+  switching (a ktest maps them), so keys typed after a switch go to the
+  new terminal; whichever screen shell runs first after IRQ 1 routes, and
+  wakes the others if a key went elsewhere. The serial shell's `vt [n]`
+  shows which is shown or switches. A command on a terminal that takes the
+  canvas brings that terminal to the front (its `term::Owner` has the
+  terminal), and while any canvas is held no other terminal can be shown:
+  the keys stay with the command drawing (a ktest; a scenario runs `life`
+  in terminal 1 and finds Alt+F2 and `vt 2` refused and the ending key
+  reaching it). `term`, `term text` and Shift+PageUp/PageDown work on the
+  shown terminal (a screen shell's scroll keys on its own). A scenario
+  types in terminal 1, switches to 2 with Alt+F2, types there, switches
+  back and finds 1's text intact (a golden).
+- **Not yet:** a font with more than Basic Latin, underline and other SGR attributes, the
   alternate screen, origin mode, left and right margins, and resizing.
 
 ### Shell (built in M2)
@@ -1018,16 +1046,17 @@ off. A wake from another CPU queues the thread there and sends the
 `mod.rs`; the commands, `commands.rs`; the system commands, `sysinfo.rs`;
 the deliberate faults, `crash.rs`).
 
-- **Two shells, one per console,** each with its own line and history:
+- **Five shells, one per console,** each with its own line and history:
   the serial shell on the boot CPU's `main` thread (where kmon ran), and
-  the screen's in a thread of its own (`shell-screen`, on the boot CPU,
-  started only with a terminal and a keyboard: without a keyboard boot
-  says `shell on serial (none on the screen: no keyboard)`, tested with
-  `i8042=off`; without a terminal, or no thread for it, not tested). The
-  serial shell polls serial (no serial interrupt yet), yielding to
-  the CPU's other threads between polls (sleeping instead would switch
-  to the idle thread and trace twice a millisecond); the screen's blocks
-  in `keyboard::wait_key`. Log lines go to both consoles.
+  one per virtual terminal, each in a thread of its own (`shell-vt1` to
+  `shell-vt4`, on the boot CPU, started only with a terminal and a
+  keyboard: without a keyboard boot says `shell on serial (none on the
+  screen: no keyboard)`, tested with `i8042=off`; without a terminal, or
+  no thread for one, not tested). The serial shell polls serial (no serial
+  interrupt yet), yielding to the CPU's other threads between polls
+  (sleeping instead would switch to the idle thread and trace twice a
+  millisecond); the screen's block in `vt::wait_key`. Log lines go to
+  serial and the first virtual terminal.
 - **Words** (`lumen_shell::words`): blanks separate words; `'...'` keeps
   everything; `"..."` too, except that a backslash escapes `$`, `` ` ``,
   `"`, `\` and a newline; outside quotes a backslash escapes anything;
@@ -1073,7 +1102,7 @@ the deliberate faults, `crash.rs`).
   randomized host test runs the editor's output, in both modes, through
   `lumen-term` after every key and checks the cursor's row shows the
   prompt and the line, and the cursor sits where the editor says.
-- **Keys:** the screen's from `keyboard::wait_key` (Enter `\n`, Backspace
+- **Keys:** the screen's from `vt::wait_key` (Enter `\n`, Backspace
   U+0008, Delete U+007F, Tab, Ctrl with a letter U+0001 to U+001A, the
   arrows, Home and End; a ktest maps each); serial's from bytes
   (`lumen_shell::input::Decoder`: CR, LF or CR LF as one Enter, DEL and BS

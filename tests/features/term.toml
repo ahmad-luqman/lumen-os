@@ -30,7 +30,7 @@ tests = [
     "scenario:test_term::test_scrollback",
     "ktest:lumen_kernel::term::the_cursor_is_not_drawn_while_scrolled_back",
     "ktest:lumen_kernel::term::output_keeps_a_scrolled_back_view",
-    "ktest:lumen_kernel::keyboard::other_keys_come_with_the_shift_state",
+    "ktest:lumen_kernel::keyboard::other_keys_come_with_the_shift_and_alt_state",
 ]
 
 [[feature]]
@@ -40,4 +40,19 @@ tests = [
     "ktest:lumen_kernel::term::a_canvas_pauses_the_terminal_until_dropped",
     "ktest:lumen_kernel::term::a_canvas_is_taken_back_only_from_its_owner",
     "ktest:lumen_kernel::shell::commands::a_command_s_canvas_is_taken_back_and_no_other",
+]
+
+[[feature]]
+name = "Four virtual terminals, each its own grid, scrollback and screen shell (threads shell-vt1 to shell-vt4): Alt+F1 to Alt+F4 (or `vt <n>`) show one and send it the keys typed from then on (each key to the terminal shown when it was typed); text written to a hidden one is kept and drawn when it is shown; log lines go to the first; the header's right end marks the one shown; a command drawing (a canvas) brings its terminal to the front and keeps it there until it is done"
+milestone = "M2"
+tests = [
+    "scenario:test_term::test_virtual_terminals_are_independent",
+    "scenario:test_term::test_a_command_drawing_keeps_its_terminal_shown",
+    "ktest:lumen_kernel::term::virtual_terminals_keep_their_own_text",
+    "ktest:lumen_kernel::term::the_header_boxes_keep_clear_of_its_text",
+    "ktest:lumen_kernel::term::a_canvas_brings_its_terminal_to_the_front_and_keeps_it_there",
+    "ktest:lumen_kernel::vt::alt_f1_to_f4_switch_terminals",
+    "ktest:lumen_kernel::vt::showing_a_terminal_moves_the_keys_and_the_screen",
+    "ktest:lumen_kernel::keyboard::other_keys_come_with_the_shift_and_alt_state",
+    "cargo:lumen-term",
 ]

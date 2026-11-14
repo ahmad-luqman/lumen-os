@@ -98,12 +98,15 @@ def test_nx_data_crashes_cleanly(crash_report):
 
 
 # `shell::run` logs which shells it starts, just before it spawns the
-# screen's on a thread of its own and runs the serial one: "shells on serial
-# and the screen", or "shell on serial (none on the screen: <why>)".
+# screen's (one per virtual terminal, each on a thread of its own) and runs
+# the serial one: "shells on serial and the screen", or "shell on serial
+# (none on the screen: <why>)".
 SHELLS_STARTED = r"INFO  shell: shells? on serial[^\n]*\n"
-# `top`'s row for the screen's shell (`render` in kernel/src/shell/sysinfo.rs:
+# The screen shells' threads (`SCREEN_THREADS` in kernel/src/shell/mod.rs).
+SCREEN_SHELLS = ("shell-vt1", "shell-vt2", "shell-vt3", "shell-vt4")
+# `top`'s row for a screen shell (`render` in kernel/src/shell/sysinfo.rs:
 # name, id, CPU, state).
-SCREEN_SHELL_ROW = re.compile(r"^  shell-screen +\d+ +\d+ +(?P<state>\w+) ", re.MULTILINE)
+SCREEN_SHELL_ROW = re.compile(r"^  (?P<name>shell-vt\d) +\d+ +\d+ +(?P<state>\w+) ", re.MULTILINE)
 
 HEAP_NUMBERS = ("mapped", "base", "used", "live", "free", "blocks", "largest")
 
@@ -124,20 +127,20 @@ def shell_heap(m) -> dict[str, int]:
 
 
 def boot_settled(boot):
-    """Boot qemutest and wait at the serial prompt until the screen's shell
-    is blocked for a key: `top 1` (up to 10 runs) shows it `blocked`.
+    """Boot qemutest and wait at the serial prompt until every screen shell
+    is blocked for a key: `top 1` (up to 10 runs) shows each `blocked`.
 
-    `shell::run` spawns the screen's shell on a thread of its own and then
-    runs the serial shell, so the serial prompt can come first. Until the
-    screen's shell has drawn its first prompt (keeping the buffer `run_on`
-    writes the editor's output into) and blocked in `keyboard::wait_key`
-    (the keyboard's wait queue allocating its buffer, freed again when a key
-    wakes it; none come here), the heap isn't settled and two summaries can
-    differ. `WaitQueue::wait_until` marks it blocked and queues it with
-    interrupts off, and `spawn` put it on the serial shell's CPU (threads
-    stay on theirs), so `top` can't see one without the other. `top` polls
-    serial for its `q`, never the keyboard, so it can't wake the screen's
-    shell."""
+    `shell::run` spawns the screen shells, each on a thread of its own, and
+    then runs the serial shell, so the serial prompt can come first. Until
+    each screen shell has drawn its first prompt (keeping the buffer
+    `run_on` writes the editor's output into) and blocked in
+    `vt::wait_key` (the keyboard's wait queue allocating its buffer the
+    first time, freed again when a key wakes them; none come here), the
+    heap isn't settled and two summaries can differ. `WaitQueue::wait_until`
+    marks a thread blocked and queues it with interrupts off, and `spawn`
+    put them on the serial shell's CPU (threads stay on theirs), so `top`
+    can't see one without the other. `top` polls serial for its `q`, never
+    the keyboard, so it can't wake a screen shell."""
     m = boot("qemutest")
     started = m.expect(SHELLS_STARTED, BOOT_TIMEOUT).group(0)
     assert "shells on serial and the screen" in started, f"no shell on the screen: {started}"
@@ -147,12 +150,15 @@ def boot_settled(boot):
         start = len(m.output)
         m.send_line("top 1")
         done = m.expect(r"top: done after 1 frames\n", 10)
-        row = SCREEN_SHELL_ROW.search(m.output, start, done.start())
+        states = {
+            row["name"]: row["state"]
+            for row in SCREEN_SHELL_ROW.finditer(m.output, start, done.start())
+        }
         m.expect(r"lumen> ")
-        seen.append(row["state"] if row else "no shell-screen row")
-        if row and row["state"] == "blocked":
+        seen.append(states)
+        if all(states.get(name) == "blocked" for name in SCREEN_SHELLS):
             return m
-    raise AssertionError(f"the screen's shell never blocked for a key in 10 `top 1`s: {seen}")
+    raise AssertionError(f"the screen shells weren't all blocked for a key in 10 `top 1`s: {seen}")
 
 
 def crash_after_heap_summary(boot, kind: str) -> tuple[dict[str, int], str]:
@@ -173,14 +179,16 @@ def crash_after_heap_summary(boot, kind: str) -> tuple[dict[str, int], str]:
 def test_heap_command_reports_usage(boot):
     m = boot_settled(boot)
     heap = shell_heap(m)
-    # What boot keeps (`acpi::Info`, for one) and the shells (their editors
-    # and histories, the screen's thread and its slot in the keyboard's wait
-    # queue) is in use, a few dozen allocations; the rest of what the heap
-    # mapped is free.
+    # What boot keeps (`acpi::Info`, for one), the four virtual terminals
+    # (each grid's cells, scrollback, tab stops and dirty marks) and the
+    # shells (their editors and histories, the screen shells' threads and
+    # the keyboard's wait queue they block in) is in use: 54 allocations
+    # with four terminals (29 with one), so a few dozen; the rest of what
+    # the heap mapped is free.
     # (`discovery_keeps_nothing_it_does_not_return` checks that ACPI
     # discovery frees what it doesn't keep.)
     assert heap["base"] == HEAP_BASE, heap
-    assert 0 < heap["live"] <= 40, f"{heap}: nothing kept at boot (did acpi::init fail?), or a leak"
+    assert 0 < heap["live"] <= 70, f"{heap}: nothing kept at boot (did acpi::init fail?), or a leak"
     assert 0 < heap["largest"] <= heap["free"] < heap["mapped"], heap
     # Running it again leaves the heap as it was (the line's allocations are
     # freed; a repeated line isn't kept in the history).

@@ -368,7 +368,8 @@ def test_top_refreshes_and_quits(boot):
         frame
     )
     assert re.search(r"^  main\s+\d+\s+0\s+\w+\s+\d+%$", frame, re.MULTILINE), frame
-    assert re.search(r"^  shell-screen\s+\d+\s+0\s+\w+\s+\d+%$", frame, re.MULTILINE), frame
+    for vt in range(1, 5):
+        assert re.search(rf"^  shell-vt{vt}\s+\d+\s+0\s+\w+\s+\d+%$", frame, re.MULTILINE), frame
     m.send("q")
     m.expect(r"top: quit after \d+ frames\n" + PROMPT, 10)
     # It stopped: no frame after the prompt.
