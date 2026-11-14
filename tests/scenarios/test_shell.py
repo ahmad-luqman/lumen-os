@@ -1,6 +1,7 @@
-"""The shell: one on serial (plain text unless `lumen.ansi`) and one on the
-screen (typed on the keyboard, read back with the serial shell's `term
-text`), each with its own line editing, history and completion. The line
+"""The shell: one on serial (plain text unless `lumen.ansi`) and one on
+each virtual terminal on the screen (typed on the keyboard, read back with
+the serial shell's `term text`), each with its own line editing, history and
+completion. The line
 editor, word splitting and completion are tested on the host
 (`cargo test -p lumen-shell`); this checks them in the kernel, through
 both consoles."""

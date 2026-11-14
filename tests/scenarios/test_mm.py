@@ -165,8 +165,8 @@ def crash_after_heap_summary(boot, kind: str) -> tuple[dict[str, int], str]:
     """`crash <kind>`: the heap summary it prints before doing its damage
     (the shell's own allocations for the command included), and the
     report."""
-    # Once the screen's shell is blocked for a key, it can't allocate between
-    # the summary and the report.
+    # Once every screen shell is blocked for a key, none can allocate
+    # between the summary and the report.
     m = boot_settled(boot)
     m.send_line(f"crash {kind}")
     before = heap_numbers(m.expect(r"heap: .*\n", 30).group(0))
@@ -183,7 +183,7 @@ def test_heap_command_reports_usage(boot):
     # (each grid's cells, scrollback, tab stops and dirty marks) and the
     # shells (their editors and histories, the screen shells' threads and
     # the keyboard's wait queue they block in) is in use: 54 allocations
-    # with four terminals (29 with one), so a few dozen; the rest of what
+    # with four terminals (29 before virtual terminals), so a few dozen; the rest of what
     # the heap mapped is free.
     # (`discovery_keeps_nothing_it_does_not_return` checks that ACPI
     # discovery frees what it doesn't keep.)

@@ -143,9 +143,10 @@ pub fn run(line: &str, ctx: &mut Ctx<'_>) {
 }
 
 /// [`run`] with the commands in `table`. The command gets a canvas owner
-/// of its own; when it returns, a canvas it left behind (kept in a static,
-/// leaked) is taken back, so the screen doesn't stay frozen. A canvas held
-/// by a command on the other console isn't this one's, and stays.
+/// of its own (on the console's virtual terminal, if it is one); when it
+/// returns, a canvas it left behind (kept in a static, leaked) is taken
+/// back, so the screen doesn't stay frozen. A canvas held by a command on
+/// another console isn't this one's, and stays.
 fn run_in(table: &Table<Run>, line: &str, ctx: &mut Ctx<'_>) {
     let words = match words::split(line) {
         Ok(words) => words,
@@ -161,7 +162,8 @@ fn run_in(table: &Table<Run>, line: &str, ctx: &mut Ctx<'_>) {
     };
     // (A command run from inside another, e.g. by a script, gets its own
     // owner too, and the outer one's is back afterwards.)
-    let outer = core::mem::replace(&mut ctx.owner, crate::term::Owner::new());
+    let outer = ctx.owner;
+    ctx.owner = outer.renew();
     (command.run)(ctx, args);
     if crate::term::reclaim_canvas(ctx.owner) {
         log::warn!(target: "shell", "{name} left the screen paused; took it back");
@@ -280,8 +282,8 @@ fn kbd(ctx: &mut Ctx<'_>, _: &[String]) {
     };
 }
 
-/// `term`: the screen's terminal; `term text`: its rows, each after a `|`,
-/// then a summary line.
+/// `term`: the shown virtual terminal; `term text`: its rows, each after a
+/// `|`, then a summary line.
 fn term(ctx: &mut Ctx<'_>, args: &[String]) {
     const NONE: &str = "term: no terminal (no usable framebuffer, or one too small)";
     let out = &mut *ctx.out;
@@ -327,29 +329,40 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
     }
 }
 
-/// `vt`: which virtual terminal is shown; `vt <n>`: show terminal `n` (1
-/// to `term::VTS`), unless a command has the screen.
+/// `vt`: which virtual terminal is shown, keys each dropped and switches
+/// refused; `vt <n>`: show terminal `n` (1 to `term::VTS`), unless a
+/// command has the screen.
 fn vt(ctx: &mut Ctx<'_>, args: &[String]) {
     use crate::term::VTS;
     let out = &mut *ctx.out;
-    let _ = match args {
-        [] => match crate::term::status() {
-            Some(t) => writeln!(
-                out,
-                "vt: terminal {} of {VTS} shown (Alt+F1 to F{VTS} switch), {} keys dropped",
-                t.shown + 1,
-                crate::vt::dropped()
-            ),
-            None => writeln!(out, "vt: no terminal"),
-        },
+    let wanted = match args {
+        [] => None,
         [n] => match n.parse::<usize>() {
-            Ok(n @ 1..=VTS) => match crate::vt::show(n - 1) {
-                Ok(()) => writeln!(out, "vt: terminal {n} shown"),
-                Err(e) => writeln!(out, "vt: not showing terminal {n}: {e}"),
-            },
-            _ => writeln!(out, "usage: vt [n] (n from 1 to {VTS})"),
+            Ok(n @ 1..=VTS) => Some(n),
+            _ => {
+                let _ = writeln!(out, "usage: vt [n] (n from 1 to {VTS})");
+                return;
+            }
         },
-        _ => writeln!(out, "usage: vt [n] (n from 1 to {VTS})"),
+        _ => {
+            let _ = writeln!(out, "usage: vt [n] (n from 1 to {VTS})");
+            return;
+        }
+    };
+    let _ = match (wanted, crate::term::status()) {
+        (_, None) => writeln!(out, "vt: no terminal"),
+        (None, Some(t)) => {
+            let s = crate::vt::stats();
+            let _ = write!(out, "vt: terminal {} of {VTS} shown (Alt+F1 to F{VTS} switch); keys dropped", t.shown + 1);
+            for d in s.dropped {
+                let _ = write!(out, " {d}");
+            }
+            writeln!(out, "; {} switches refused", s.refused)
+        }
+        (Some(n), Some(_)) => match crate::vt::show(n - 1) {
+            Ok(()) => writeln!(out, "vt: terminal {n} shown"),
+            Err(e) => writeln!(out, "vt: not showing terminal {n}: {e}"),
+        },
     };
 }
 
@@ -543,7 +556,7 @@ crate::ktest!(
 crate::ktest!(
     fn a_command_s_canvas_is_taken_back_and_no_other() {
         // A canvas a command leaves behind is taken back when it returns;
-        // one held by a command on the other console (another owner) stays
+        // one held by a command on another console (another owner) stays
         // while commands run and return here.
         use crate::kassert;
         use crate::term::{self, Owner};
@@ -569,6 +582,39 @@ crate::ktest!(
         kassert!(paused()? && other.is_live());
         drop(other);
         kassert!(!paused()?);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_command_s_canvas_brings_its_terminal_to_the_front() {
+        // A command run on the third virtual terminal while the first is
+        // shown: its canvas shows the third, keys routed meanwhile go there
+        // (not to the first), and once it is done the third stays shown.
+        use crate::vt::{self, Routed};
+        use crate::{kassert, kassert_eq, term};
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static SHOWN: AtomicUsize = AtomicUsize::new(usize::MAX);
+        static ROUTED: crate::sync::SpinLock<Option<Routed>> = crate::sync::SpinLock::new(None);
+        fn draw(ctx: &mut Ctx<'_>, _: &[String]) {
+            let Ok(canvas) = ctx.canvas() else { return };
+            SHOWN.store(term::shown(), Ordering::Relaxed);
+            let mut rings = lumen_term::vt::Router::new();
+            let routed = vt::route_key(&mut rings, crate::keyboard::Key::Char('q'), (1 << term::VTS) - 1);
+            *ROUTED.lock() = Some(routed);
+            drop(canvas);
+        }
+        static TABLE: Table<Run> =
+            Table(&[Command { name: "draw", args: &[], usage: "", about: "draw on the screen", run: draw }]);
+        kassert_eq!(term::shown(), 0);
+        let _first = term::ShowFirstAfter;
+        let mut console = super::Captured { vt: Some(2), ..Default::default() };
+        let history = lumen_shell::History::new(0);
+        run_in(&TABLE, "draw", &mut Ctx::new(&mut console, true, &history));
+        kassert_eq!(SHOWN.load(Ordering::Relaxed), 2);
+        kassert_eq!(*ROUTED.lock(), Some(Routed::To(2)));
+        kassert_eq!(term::shown(), 2);
+        kassert!(!term::status().ok_or("no terminal")?.paused);
         Ok(())
     }
 );

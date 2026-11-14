@@ -1,5 +1,6 @@
-"""The terminal on the screen (lumen-term below the header): ANSI colours,
-the screen's shell, scrollback with Shift+PageUp/PageDown."""
+"""The terminals on the screen (lumen-term below the header): ANSI colours,
+the screen shells, scrollback with Shift+PageUp/PageDown, and the virtual
+terminals (Alt+F1 to F4, `vt`)."""
 
 import re
 from typing import NamedTuple
@@ -132,14 +133,26 @@ def test_scrollback(boot, artifacts, golden_dir):
 TABS_ORIGIN, TABS_SIZE = (1112, 32), (144, 32)
 
 
-def vt_shown(m: Machine) -> int:
-    """The serial shell's `vt`: the virtual terminal shown (from 1)."""
+VT_STATUS = re.compile(
+    r"vt: terminal (\d) of 4 shown \(Alt\+F1 to F4 switch\); "
+    r"keys dropped (\d+) (\d+) (\d+) (\d+); (\d+) switches refused\n"
+)
+
+
+class VtStatus(NamedTuple):
+    shown: int
+    dropped: tuple[int, ...]
+    refused: int
+
+
+def vt_status(m: Machine) -> VtStatus:
+    """The serial shell's `vt`: the virtual terminal shown (from 1), the
+    keys each dropped, the switches refused."""
     m.send_line("vt")
-    found = m.expect(
-        r"vt: terminal (\d) of 4 shown \(Alt\+F1 to F4 switch\), \d+ keys dropped\n", 10
-    )
+    found = m.expect(VT_STATUS, 10)
     m.expect(r"lumen> ", 10)
-    return int(found[1])
+    n = [int(g) for g in found.groups()]
+    return VtStatus(n[0], tuple(n[1:5]), n[5])
 
 
 def test_virtual_terminals_are_independent(boot, artifacts, golden_dir):
@@ -154,7 +167,7 @@ def test_virtual_terminals_are_independent(boot, artifacts, golden_dir):
     expect_screen(m, r"\Alumen> echo one\none\nlumen>\s*\Z")
     m.press(["alt", "f2"])
     expect_screen(m, r"\Alumen>\s*\Z")
-    assert vt_shown(m) == 2
+    assert vt_status(m).shown == 2
     m.type_text("echo two\n")
     expect_screen(m, r"\Alumen> echo two\ntwo\nlumen>\s*\Z")
     shot = m.screendump("vt2.png")
@@ -167,7 +180,7 @@ def test_virtual_terminals_are_independent(boot, artifacts, golden_dir):
     )
     m.press(["alt", "f1"])
     expect_screen(m, r"\Alumen> echo one\none\nlumen>\s*\Z")
-    assert vt_shown(m) == 1
+    assert vt_status(m).shown == 1
     shot = m.screendump("vt1.png")
     assert_matches_golden(
         shot,
@@ -176,29 +189,36 @@ def test_virtual_terminals_are_independent(boot, artifacts, golden_dir):
         size=(320, 2 * CELL_H),
         artifacts=artifacts,
     )
-    # From serial too: terminal 3, untouched, then back to 1. There are
-    # four.
+    # From serial too: terminal 3 (untouched until then) takes what is
+    # typed next; back to 1. There are four, numbered from 1.
     m.send_line("vt 3")
     m.expect(r"vt: terminal 3 shown\n", 10)
     expect_screen(m, r"\Alumen>\s*\Z")
+    m.type_text("echo three\n")
+    expect_screen(m, r"\Alumen> echo three\nthree\nlumen>\s*\Z")
     m.send_line("vt 1")
     m.expect(r"vt: terminal 1 shown\n", 10)
-    m.send_line("vt 5")
-    m.expect(r"usage: vt \[n\] \(n from 1 to 4\)\n", 10)
+    for bad in ("5", "0", "x"):
+        m.send_line(f"vt {bad}")
+        m.expect(r"usage: vt \[n\] \(n from 1 to 4\)\n", 10)
     expect_screen(m, r"\Alumen> echo one\none\nlumen>\s*\Z")
+    assert vt_status(m) == VtStatus(1, (0, 0, 0, 0), 0)
 
 
 def test_a_command_drawing_keeps_its_terminal_shown(boot):
     # While `life` (typed in terminal 1) has the screen, Alt+F2 and `vt 2`
-    # don't switch: the key that ends it still reaches it, in terminal 1.
+    # don't switch (each logged and counted): the key that ends it still
+    # reaches it, in terminal 1.
     m = boot_term(boot)
     m.type_text("life\n")
     expect_screen(m, r"^life: gun on 160x80 cells; a key quits$")
     m.press(["alt", "f2"])
+    m.expect(r"INFO  term: not showing terminal 2: a command has the screen\n", 10)
     m.send_line("vt 2")
     m.expect(r"vt: not showing terminal 2: a command has the screen\n", 10)
     m.expect(r"lumen> ", 10)
-    assert vt_shown(m) == 1
+    status = vt_status(m)
+    assert (status.shown, status.refused) == (1, 2), status
     m.press(["x"])
     expect_screen(m, r"^life: generation \d+, \d+ alive\nlumen>$")
-    assert vt_shown(m) == 1
+    assert vt_status(m).shown == 1

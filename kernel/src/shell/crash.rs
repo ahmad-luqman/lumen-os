@@ -31,17 +31,22 @@ pub const KINDS: &[&str] = &[
     "relocklog",
 ];
 
-/// Writes to serial and the first virtual terminal (with the log lines),
-/// whichever shell ran the command (a fault that didn't happen, the heap's
-/// line before a heap crash): the tests read serial.
+/// Writes to serial and to the virtual terminal whose shell ran the
+/// command (the first, with the log lines, for serial's): a fault that
+/// didn't happen, the heap's line before a heap crash. The tests read
+/// serial.
 struct Out;
+
+/// The virtual terminal `crash` was run on ([`run`] sets it before the
+/// fault, which may run in another thread or on another CPU).
+static OUT_VT: AtomicUsize = AtomicUsize::new(0);
 
 impl Write for Out {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         // Under the line lock, like every serial writer but the crash
         // reporter (one lock per piece of a `write!`).
         crate::klog::LockedSerial.write_str(s)?;
-        crate::term::write_str(s);
+        crate::term::write_str_to(OUT_VT.load(Ordering::Relaxed), s);
         Ok(())
     }
 }
@@ -50,6 +55,7 @@ impl Write for Out {
 /// (from its idle thread; its crash report then stops this one), or in a new
 /// thread on this CPU (named `shell-crash`), which the shell waits for.
 pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
+    OUT_VT.store(ctx.out.vt().unwrap_or(0), Ordering::Relaxed);
     let out = &mut *ctx.out;
     let kind = args.first().map_or("", String::as_str);
     let Some(fault) = crash_fn(kind) else {
@@ -116,7 +122,7 @@ fn run_remote() {
 /// returns (it then says why). Asleep, allocating nothing: going on (back
 /// to the prompt, freeing the line's words) could leave the heap's lock
 /// held when the report stops this CPU, and the report would show the heap
-/// as maybe mid-update (the screen's shell could still be allocating if
+/// as maybe mid-update (a screen shell could still be allocating if
 /// someone types there meanwhile; not tested). After 10 s (not tested) the
 /// job is taken back if the CPU hasn't taken it; if it has, it is left to
 /// finish, and another remote crash is refused until it returns.
@@ -329,7 +335,7 @@ fn crash_touch_guard() {
 }
 
 /// Overflow the stack this runs on with small frames (the `main` thread's
-/// from the serial shell, the screen shell's thread's from there, a new
+/// from the serial shell, a screen shell's thread's from there, a new
 /// thread's with `thread`, the idle thread's on another CPU).
 #[inline(never)]
 fn crash_stack_overflow() {

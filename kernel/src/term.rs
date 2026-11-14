@@ -1,12 +1,11 @@
-//! The terminal on the framebuffer: `lumen-term`'s grid drawn below the
-//! header, fed by log lines (coloured by level) and the screen's shell.
-//!
-//! There are [`VTS`] virtual terminals, each its own grid and scrollback
-//! (allocated in [`init`]), one shown at a time: log lines go to the first,
-//! each screen shell writes to its own ([`write_fmt_to`]), and [`show`]
-//! switches which is drawn (the shells' keys follow it: `crate::vt`). The
-//! header's right end shows which one is shown. Writing to a hidden one
-//! draws nothing; showing it draws all of it.
+//! The terminals on the framebuffer: [`VTS`] virtual terminals, each its
+//! own `lumen-term` grid and scrollback (allocated in [`init`]), one drawn
+//! below the header at a time. Log lines (coloured by level) go to the
+//! first, each screen shell writes to its own ([`write_str_to`]), and
+//! [`show`] switches which is drawn (`crate::vt` routes each key to the
+//! terminal [`shown`] when it routes it). The header's right end shows
+//! which one is shown. Writing to a hidden one draws nothing; showing it
+//! draws all of it.
 //!
 //! Drawing keeps a copy of every cell it drew (the shadow) and draws only
 //! the cells that differ from it, in the rows the terminal marked as changed.
@@ -15,23 +14,25 @@
 //! screen. The cursor flips every 500 ms (the boot CPU's timer interrupt
 //! does it: no thread, so nothing switches or traces for it) and shows
 //! solid while output arrives; it isn't drawn while the view is scrolled
-//! back (Shift+PageUp/PageDown in the screen's shell).
+//! back (Shift+PageUp/PageDown in a screen shell).
 //!
-//! Nothing allocates under the screen's lock (the terminal and the shadow
+//! Nothing allocates under the screen's lock (the terminals and the shadow
 //! are allocated in [`init`]): log lines come while the frame allocator's or
 //! the page tables' lock is held, and the heap would take them, so the
 //! arguments of a log line (formatted under the lock) and of
 //! [`write_fmt`] must not allocate either.
 //!
 //! A command can take the pixels below the header for itself ([`canvas`]):
-//! the terminal then keeps taking output but draws none of it until the
+//! the terminals then keep taking output but draw none of it until the
 //! [`Canvas`] is dropped (or taken back, [`reclaim_canvas`]), which draws
-//! the whole terminal again. A command on a virtual terminal that takes it
+//! the shown terminal again. A command on a virtual terminal that takes it
 //! brings that terminal to the front first, and while a canvas is held no
-//! other terminal can be shown: the keys stay with the command drawing.
+//! other terminal can be shown: the keys stay with the command drawing. A
+//! command on serial (on no terminal) leaves the shown one, and its keys,
+//! where they are.
 //!
-//! The terminal takes `\n` as a line feed only: [`write_str`], [`write_fmt`]
-//! and log lines turn it into CR LF.
+//! The terminal takes `\n` as a line feed only: [`write_str_to`],
+//! [`write_fmt`] and log lines turn it into CR LF.
 
 use crate::fb::{self, Framebuffer, Style};
 use crate::sync::SpinLock;
@@ -49,6 +50,9 @@ use noto_sans_mono_bitmap::{FontWeight, get_raster_width};
 pub const SCROLLBACK: usize = 500;
 /// Virtual terminals (Alt+F1 to Alt+F4).
 pub const VTS: usize = 4;
+// Alt+F1 to F4 (`crate::vt`), the `vt` command's words 1 to 4 and the
+// header's one-digit labels are written for at most four.
+const _: () = assert!(VTS >= 1 && VTS <= 4, "between 1 and 4 virtual terminals");
 /// How long the cursor stays on, then off, in the boot CPU's timer ticks
 /// (1 kHz).
 const BLINK_TICKS: u64 = 500;
@@ -57,13 +61,10 @@ const CELL_H: usize = 16;
 /// The terminals and what is drawn of the shown one.
 struct Screen {
     fb: Framebuffer,
-    /// The shown virtual terminal's grid.
-    term: Terminal,
+    /// Each virtual terminal's grid ([`VTS`] of them).
+    terms: Vec<Terminal>,
     /// Which virtual terminal is shown (0 is the first).
     shown: usize,
-    /// The hidden ones' grids, by number (`None` at `shown`: its grid is
-    /// `term`). Switching swaps them, so it allocates nothing.
-    parked: Vec<Option<Terminal>>,
     /// What each cell of the view was last drawn as (row by row).
     shadow: Vec<Cell>,
     /// Top-left pixel of the grid.
@@ -106,14 +107,12 @@ pub fn init(fb: Framebuffer) {
         return;
     }
     // Allocated here, before taking the lock (see the module comment).
-    let term = Terminal::new(cols, rows, SCROLLBACK);
-    let parked = (0..VTS).map(|vt| (vt > 0).then(|| Terminal::new(cols, rows, SCROLLBACK))).collect();
+    let terms = (0..VTS).map(|_| Terminal::new(cols, rows, SCROLLBACK)).collect();
     let shadow = vec![Cell::BLANK; cols * rows];
     let mut screen = Screen {
         fb,
-        term,
+        terms,
         shown: 0,
-        parked,
         shadow,
         x0,
         y0,
@@ -193,17 +192,9 @@ pub fn on_tick(tick: u64) {
 }
 
 impl Screen {
-    /// Virtual terminal `vt`'s grid (shown or not).
-    ///
-    /// # Panics
-    /// If there is no terminal `vt`.
-    fn term_of(&mut self, vt: usize) -> &mut Terminal {
-        if vt == self.shown { &mut self.term } else { self.parked[vt].as_mut().expect("a hidden terminal is parked") }
-    }
-
     /// Feed `s` to virtual terminal `vt`, `\n` as CR LF (not drawn yet).
     fn feed(&mut self, vt: usize, s: &str) {
-        let term = self.term_of(vt);
+        let term = &mut self.terms[vt];
         for (i, line) in s.split('\n').enumerate() {
             if i > 0 {
                 term.write(b"\r\n");
@@ -221,9 +212,6 @@ impl Screen {
         if vt == self.shown {
             return;
         }
-        let new = self.parked[vt].take().expect("a hidden terminal is parked");
-        let old = core::mem::replace(&mut self.term, new);
-        self.parked[self.shown] = Some(old);
         self.shown = vt;
         self.draw_tabs();
         if self.canvas.is_none() {
@@ -262,14 +250,14 @@ impl Screen {
         if self.canvas.is_some() {
             return;
         }
-        let cols = self.term.cols();
+        let cols = self.terms[self.shown].cols();
         // Take the cursor off first, as the shadow has the cell (the
         // terminal may already hold other cells there, before the scroll
         // below moves the pixels).
         if let Some((c, r)) = self.cursor_drawn.take() {
             self.draw(c, r, self.shadow[r * cols + c], false);
         }
-        if let Some(s) = self.term.take_scroll() {
+        if let Some(s) = self.terms[self.shown].take_scroll() {
             let n = s.lines.unsigned_abs();
             let (top, bottom) = (self.y0 + s.top * CELL_H, self.y0 + s.bottom * CELL_H);
             let len = (s.bottom - s.top - n) * CELL_H;
@@ -285,12 +273,12 @@ impl Screen {
             }
             debug_assert!(bottom <= self.fb.height());
         }
-        for r in 0..self.term.rows() {
-            if !self.term.take_dirty(r) {
+        for r in 0..self.terms[self.shown].rows() {
+            if !self.terms[self.shown].take_dirty(r) {
                 continue;
             }
             for c in 0..cols {
-                let cell = self.term.cell(c, r);
+                let cell = self.terms[self.shown].cell(c, r);
                 if self.shadow[r * cols + c] != cell {
                     self.draw(c, r, cell, false);
                     self.shadow[r * cols + c] = cell;
@@ -298,10 +286,10 @@ impl Screen {
             }
         }
         if self.blink_on
-            && self.term.view_offset() == 0
-            && let Some((c, r)) = self.term.cursor_in_view()
+            && self.terms[self.shown].view_offset() == 0
+            && let Some((c, r)) = self.terms[self.shown].cursor_in_view()
         {
-            self.draw(c, r, self.term.cell(c, r), true);
+            self.draw(c, r, self.terms[self.shown].cell(c, r), true);
             self.cursor_drawn = Some((c, r));
         }
     }
@@ -322,8 +310,17 @@ impl Screen {
         // A blank cell draws as the background just filled in.
         self.shadow.fill(Cell::BLANK);
         self.cursor_drawn = None;
-        self.term.touch_all();
+        self.terms[self.shown].touch_all();
         self.render();
+    }
+
+    /// Whether what was drawn (the shadow) is the shown terminal's view, cell
+    /// for cell (for the tests).
+    #[cfg(feature = "ktest")]
+    fn shadow_matches_grid(&self) -> bool {
+        let t = &self.terms[self.shown];
+        let cols = t.cols();
+        (0..t.rows()).all(|r| (0..cols).all(|c| self.shadow[r * cols + c] == t.cell(c, r)))
     }
 
     /// Draw `cell` at (`col`, `row`), colours swapped for inverse or for the
@@ -353,8 +350,6 @@ const TAB_W: usize = 28;
 const TAB_H: usize = 24;
 const TAB_GAP: usize = 6;
 const TAB_Y: usize = 36;
-/// The header's text and rule stay in its left 640 pixels (`fb::init`).
-const HEADER_TEXT_W: usize = 640;
 
 /// The left edge of virtual terminal `vt`'s box in the header of a screen
 /// `width` pixels wide: the boxes end a margin from its right edge. `None`
@@ -362,7 +357,7 @@ const HEADER_TEXT_W: usize = 640;
 /// then).
 fn tab_x(width: usize, vt: usize) -> Option<usize> {
     let all = VTS * TAB_W + (VTS - 1) * TAB_GAP;
-    let x0 = width.checked_sub(fb::MARGIN + all).filter(|&x| x >= HEADER_TEXT_W)?;
+    let x0 = width.checked_sub(fb::MARGIN + all).filter(|&x| x >= fb::HEADER_W)?;
     Some(x0 + vt * (TAB_W + TAB_GAP))
 }
 
@@ -393,6 +388,12 @@ impl Owner {
     pub fn on_vt(vt: usize) -> Owner {
         assert!(vt < VTS, "no virtual terminal {vt}");
         Owner { vt: Some(vt), ..Owner::new() }
+    }
+
+    /// A new owner, equal to no other, on the same virtual terminal as this
+    /// one (or none): for each command a shell runs.
+    pub fn renew(self) -> Owner {
+        Owner { vt: self.vt, ..Owner::new() }
     }
 }
 
@@ -636,16 +637,10 @@ impl Write for Feed<'_> {
     }
 }
 
-/// Write `s` to the first virtual terminal (where log lines go; `\n` as CR
-/// LF) and draw it if shown; false if the terminal didn't take it (no
-/// terminal, a crash report started, or this CPU is already drawing).
-/// Under a [`Canvas`] it is taken, and drawn when the canvas is dropped or
-/// taken back.
-pub fn write_str(s: &str) -> bool {
-    write_fmt(format_args!("{s}"))
-}
-
-/// [`write_str`] to virtual terminal `vt` (a screen shell's).
+/// Write `s` to virtual terminal `vt` (`\n` as CR LF) and draw it if that
+/// one is shown; false if the terminal didn't take it (no terminal, a crash
+/// report started, or this CPU is already drawing). Under a [`Canvas`] it
+/// is taken, and drawn when the canvas is dropped or taken back.
 ///
 /// # Panics
 /// If `vt >= VTS`.
@@ -653,8 +648,11 @@ pub fn write_str_to(vt: usize, s: &str) -> bool {
     write_fmt_to(vt, format_args!("{s}"))
 }
 
-/// Write formatted text to the first virtual terminal (see
-/// [`write_fmt_to`]).
+/// Write formatted text (`\n` as CR LF) to the first virtual terminal,
+/// where log lines go, and draw it if shown, all under one lock: a log line
+/// from another CPU can't land inside an escape sequence written in this
+/// one call. `args` must not allocate (see the module comment). False if
+/// the terminal didn't take it (see [`write_str_to`]).
 pub fn write_fmt(args: fmt::Arguments<'_>) -> bool {
     write_fmt_to(0, args)
 }
@@ -663,11 +661,11 @@ pub fn write_fmt(args: fmt::Arguments<'_>) -> bool {
 /// it if that one is shown, all under one lock: a log line from another
 /// CPU can't land inside an escape sequence written in this one call.
 /// `args` must not allocate (see the module comment). False if the
-/// terminal didn't take it (see [`write_str`]).
+/// terminal didn't take it (see [`write_str_to`]).
 ///
 /// # Panics
 /// If `vt >= VTS`.
-pub fn write_fmt_to(vt: usize, args: fmt::Arguments<'_>) -> bool {
+fn write_fmt_to(vt: usize, args: fmt::Arguments<'_>) -> bool {
     assert!(vt < VTS, "no virtual terminal {vt}");
     with_screen(|screen| {
         let _ = Feed(screen, vt).write_fmt(args);
@@ -681,7 +679,8 @@ pub fn write_fmt_to(vt: usize, args: fmt::Arguments<'_>) -> bool {
 /// Why [`show`] didn't switch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShowError {
-    /// No terminal (or a crash report started).
+    /// No terminal, a crash report started, or this CPU is already drawing
+    /// (see [`write_str_to`]).
     NoTerminal,
     /// There are only [`VTS`].
     NoSuchTerminal,
@@ -700,8 +699,10 @@ impl fmt::Display for ShowError {
 }
 
 /// Show virtual terminal `vt` (0 is the first) and draw it (nothing to do
-/// if it is shown already). Keys follow it only through `crate::vt::show`,
-/// which calls this.
+/// if it is shown already, also while a command has the screen). This is
+/// the screen side only: `crate::vt` routes each key to the terminal
+/// [`shown`] when it routes it, so keys follow; `crate::vt::show` switches
+/// under the router's lock, so a key being routed lands on one side.
 pub fn show(vt: usize) -> Result<(), ShowError> {
     if vt >= VTS {
         return Err(ShowError::NoSuchTerminal);
@@ -716,9 +717,22 @@ pub fn show(vt: usize) -> Result<(), ShowError> {
     .unwrap_or(Err(ShowError::NoTerminal))
 }
 
-/// The virtual terminal shown (0 without a terminal).
+/// The virtual terminal shown (0 without a terminal, once a crash report
+/// started, or on a CPU already drawing).
 pub fn shown() -> usize {
     with_screen(|s| s.shown).unwrap_or(0)
+}
+
+/// Shows the first virtual terminal when dropped: a test that shows another
+/// keeps one, so failing half-way doesn't leave the next tests on it.
+#[cfg(feature = "ktest")]
+pub struct ShowFirstAfter;
+
+#[cfg(feature = "ktest")]
+impl Drop for ShowFirstAfter {
+    fn drop(&mut self) {
+        let _ = show(0);
+    }
 }
 
 /// The SGR colours of a log line's level word (and message, for errors and
@@ -748,13 +762,13 @@ fn move_view(vt: usize, scroll: impl FnOnce(&mut Terminal) -> bool) {
     let moved = with_screen(|s| {
         // The view stays put while a canvas has the screen (nothing would
         // show the move; the terminal comes back as it was left).
-        if s.canvas.is_some() || !scroll(s.term_of(vt)) {
+        if s.canvas.is_some() || !scroll(&mut s.terms[vt]) {
             return None;
         }
         if vt == s.shown {
             s.render();
         }
-        let t = s.term_of(vt);
+        let t = &s.terms[vt];
         Some((t.view_offset(), top_row(t)))
     });
     // Logged outside the screen's lock: the logger takes its line lock
@@ -816,7 +830,8 @@ pub struct Status {
     pub cells_drawn: u64,
     /// A [`Canvas`] has the screen: nothing is drawn.
     pub paused: bool,
-    /// The virtual terminal shown (0 is the first); the rest is its state.
+    /// The virtual terminal shown (0 is the first): the fields above but
+    /// `cells_drawn` and `paused` are its own.
     pub shown: usize,
 }
 
@@ -824,7 +839,7 @@ pub struct Status {
 /// once a crash report started).
 pub fn status() -> Option<Status> {
     with_screen(|s| {
-        let t = &s.term;
+        let t = &s.terms[s.shown];
         Status {
             cols: t.cols(),
             rows: t.rows(),
@@ -842,14 +857,16 @@ pub fn status() -> Option<Status> {
 
 /// The shown virtual terminal's view: its cells, row by row, and the
 /// cursor if it is in the view (its row counted in the view; shown or
-/// hidden), read under one lock: a log line from another CPU can't land
-/// between them. The vector is allocated before taking the
-/// lock again, as nothing under it may allocate.
+/// hidden). The cells and the cursor are read under one lock (a log line
+/// from another CPU can't land between them), after a first look at the
+/// size: the vector is allocated between the two, as nothing may allocate
+/// under the lock. (Every terminal has the same size, which never changes,
+/// so a switch in between doesn't matter.)
 fn view_cells() -> Option<(usize, Vec<Cell>, Option<Cursor>)> {
-    let (cols, rows) = with_screen(|s| (s.term.cols(), s.term.rows()))?;
+    let (cols, rows) = with_screen(|s| (s.terms[s.shown].cols(), s.terms[s.shown].rows()))?;
     let mut cells = Vec::with_capacity(cols * rows);
     let cursor = with_screen(|s| {
-        let t = &s.term;
+        let t = &s.terms[s.shown];
         // The size never changes: this fits the capacity.
         cells.extend((0..rows).flat_map(|r| (0..cols).map(move |c| t.cell(c, r))));
         let c = t.cursor();
@@ -933,12 +950,12 @@ crate::ktest!(
         // differing cells, not the screen; drawing again with nothing new
         // draws only the cursor.
         use crate::kassert;
-        let rows = with_screen(|s| s.term.rows()).ok_or("no terminal")?;
+        let rows = with_screen(|s| s.terms[s.shown].rows()).ok_or("no terminal")?;
         let setup = alloc::format!("\x1b[{rows};1H\x1b[2K");
         let counts = with_screen(|s| {
             let mut count = |bytes: &[u8]| {
                 let before = s.cells_drawn;
-                s.term.write(bytes);
+                s.terms[s.shown].write(bytes);
                 s.render();
                 s.cells_drawn - before
             };
@@ -946,7 +963,7 @@ crate::ktest!(
             let two = count(b"ab");
             let feed = count(b"\r\n");
             let idle = count(b"");
-            (two, feed, idle, s.term.cols())
+            (two, feed, idle, s.terms[s.shown].cols())
         });
         let (two, feed, idle, cols) = counts.ok_or("no terminal")?;
         crate::ktest::diag(format_args!("two characters: {two} cells, a line feed: {feed}, nothing: {idle}"));
@@ -1000,7 +1017,7 @@ crate::ktest!(
         ];
         reset_view(0);
         let (cols, rows, w, h) = with_screen(|s| {
-            let (cols, rows) = (s.term.cols(), s.term.rows());
+            let (cols, rows) = (s.terms[s.shown].cols(), s.terms[s.shown].rows());
             (cols, rows, cols * s.cell_w, rows * CELL_H)
         })
         .ok_or("no terminal")?;
@@ -1014,18 +1031,17 @@ crate::ktest!(
             into.extend((s.y0..s.y0 + h).flat_map(|y| (s.x0..s.x0 + w).map(move |x| s.fb.pixel(x, y))));
         };
         let (shadow_ok, redrawn) = with_screen(|s| {
-            s.term.write(fill.as_bytes());
+            s.terms[s.shown].write(fill.as_bytes());
             s.render();
             for step in STEPS {
-                s.term.write(step);
+                s.terms[s.shown].write(step);
                 s.render();
             }
-            let cols = s.term.cols();
-            let ok = (0..s.term.rows()).all(|r| (0..cols).all(|c| s.shadow[r * cols + c] == s.term.cell(c, r)));
+            let ok = s.shadow_matches_grid();
             snapshot(s, &mut drawn);
             // Forget what was drawn (no cell holds U+0001) and draw it all.
             s.shadow.fill(Cell { ch: '\u{1}', ..Cell::BLANK });
-            s.term.touch_all();
+            s.terms[s.shown].touch_all();
             let before = s.cells_drawn;
             s.render();
             snapshot(s, &mut fresh);
@@ -1049,15 +1065,15 @@ crate::ktest!(
         // bottom it is.
         use crate::kassert;
         let (before, moved, hidden, back) = with_screen(|s| {
-            s.term.write(b"\x1b[r\x1b[999;1H\r\nx\x1b[H");
+            s.terms[s.shown].write(b"\x1b[r\x1b[999;1H\r\nx\x1b[H");
             s.blink_on = true;
             s.render();
             let before = s.cursor_drawn.is_some();
-            let moved = s.term.scroll_view(1);
+            let moved = s.terms[s.shown].scroll_view(1);
             s.blink_on = true;
             s.render();
-            let hidden = s.cursor_drawn.is_none() && s.term.cursor_in_view().is_some();
-            let _ = s.term.reset_view();
+            let hidden = s.cursor_drawn.is_none() && s.terms[s.shown].cursor_in_view().is_some();
+            let _ = s.terms[s.shown].reset_view();
             s.render();
             (before, moved, hidden, s.cursor_drawn.is_some())
         })
@@ -1078,13 +1094,13 @@ crate::ktest!(
             write_fmt(format_args!("keep {i}\n"));
         }
         let (moved, top, view) = with_screen(|s| {
-            let moved = s.term.scroll_view(5);
+            let moved = s.terms[s.shown].scroll_view(5);
             s.render();
-            (moved, top_row(&s.term), s.term.view_offset())
+            (moved, top_row(&s.terms[s.shown]), s.terms[s.shown].view_offset())
         })
         .ok_or("no terminal")?;
         kassert!(moved && view == 5);
-        kassert!(write_str("more 1\nmore 2\n"));
+        kassert!(write_str_to(0, "more 1\nmore 2\n"));
         let after = status().ok_or("no terminal")?;
         kassert_eq!(format!("{}", after.top_row), format!("{top}"));
         kassert_eq!(after.view, view + 2);
@@ -1099,9 +1115,9 @@ crate::ktest!(
         // Whatever the shell's output left set (bold, inverse, a background), a
         // log line starts afresh.
         use crate::kassert;
-        write_str("\x1b[1;7;44m");
+        write_str_to(0, "\x1b[1;7;44m");
         log::info!(target: "termtest", "after a dirty pen");
-        write_str("\x1b[0m");
+        write_str_to(0, "\x1b[0m");
         let (cols, cells, _) = view_cells().ok_or("no terminal")?;
         let row = find_row(cols, &cells, "after a dirty pen").ok_or("the line isn't on screen")?;
         kassert!(row[0].flags == Flags::NONE);
@@ -1149,7 +1165,7 @@ crate::ktest!(
         const BEFORE: &str = "drawn before the canvas";
         const UNDER: &str = "written under a canvas";
         reset_view(0);
-        kassert!(write_str(&alloc::format!("{BEFORE}\n")));
+        kassert!(write_str_to(0, &alloc::format!("{BEFORE}\n")));
         let drawn = || status().map(|s| s.cells_drawn).ok_or("no terminal");
         // Every pixel of the header, folded into one number (FNV-1a: no
         // allocation under the screen's lock).
@@ -1175,7 +1191,7 @@ crate::ktest!(
             kassert_eq!(canvas(Owner::new()).err(), Some(CanvasError::InUse));
             kassert!(status().ok_or("no terminal")?.paused);
             let before = drawn()?;
-            kassert!(write_str(&alloc::format!("{UNDER}\n")));
+            kassert!(write_str_to(0, &alloc::format!("{UNDER}\n")));
             kassert_eq!(drawn()?, before);
             c.clear(0x00ff00);
             kassert_eq!(c.height(), fb_height - fb::CONSOLE_TOP);
@@ -1192,12 +1208,12 @@ crate::ktest!(
             kassert_eq!(header()?, header_before);
         }
         let (paused, cells_match, ink) = with_screen(|s| {
-            let (cols, rows) = (s.term.cols(), s.term.rows());
-            let cells_match = (0..rows).all(|r| (0..cols).all(|c| s.shadow[r * cols + c] == s.term.cell(c, r)));
+            let (cols, rows) = (s.terms[s.shown].cols(), s.terms[s.shown].rows());
+            let cells_match = s.shadow_matches_grid();
             // Whether the row starting with `needle` is on screen with a
             // pixel of its text that isn't background.
             let ink = |needle: &str| {
-                let row = (0..rows).find(|&r| needle.chars().enumerate().all(|(i, ch)| s.term.cell(i, r).ch == ch));
+                let row = (0..rows).find(|&r| needle.chars().enumerate().all(|(i, ch)| s.terms[s.shown].cell(i, r).ch == ch));
                 row.is_some_and(|r| {
                     let (y, w) = (s.y0 + r * CELL_H, needle.len() * s.cell_w);
                     (y..y + CELL_H).any(|y| (s.x0..s.x0 + w).any(|x| s.fb.pixel(x, y) != bg))
@@ -1207,7 +1223,7 @@ crate::ktest!(
             // shadow, which the redraw keeps in step either way).
             let all_inked = (0..rows).all(|r| {
                 (0..cols).all(|c| {
-                    s.term.cell(c, r).ch == ' ' || {
+                    s.terms[s.shown].cell(c, r).ch == ' ' || {
                         let (x, y) = (s.x0 + c * s.cell_w, s.y0 + r * CELL_H);
                         (y..y + CELL_H).any(|y| (x..x + s.cell_w).any(|x| s.fb.pixel(x, y) != bg))
                     }
@@ -1270,8 +1286,9 @@ crate::ktest!(
         const SECOND: &str = "on the second terminal";
         const LOGGED: &str = "logged while the second is shown";
         kassert_eq!(shown(), 0);
+        let _first = ShowFirstAfter;
         reset_view(0);
-        kassert!(write_str(&format!("{FIRST}\n")));
+        kassert!(write_str_to(0, &format!("{FIRST}\n")));
         let has = |needle: &str| view_text().map(|v| v.rows.iter().any(|r| r.contains(needle))).ok_or("no terminal");
         let drawn = || status().map(|s| s.cells_drawn).ok_or("no terminal");
         let before = drawn()?;
@@ -1286,8 +1303,7 @@ crate::ktest!(
         // What is drawn is the second's grid; the box of the shown terminal
         // is filled (a pixel inside it, clear of its digit and outline).
         let (cells_match, tabs) = with_screen(|s| {
-            let (cols, rows) = (s.term.cols(), s.term.rows());
-            let cells_match = (0..rows).all(|r| (0..cols).all(|c| s.shadow[r * cols + c] == s.term.cell(c, r)));
+            let cells_match = s.shadow_matches_grid();
             let text = s.fb.encode(fb::TEXT);
             let tabs: [Option<bool>; VTS] =
                 core::array::from_fn(|vt| tab_x(s.fb.width(), vt).map(|x| s.fb.pixel(x + 2, TAB_Y + 2) == text));
@@ -1313,8 +1329,8 @@ crate::ktest!(
         let all = VTS * TAB_W + (VTS - 1) * TAB_GAP;
         kassert_eq!(tab_x(1280, 0), Some(1280 - fb::MARGIN - all));
         kassert_eq!(tab_x(1280, VTS - 1).map(|x| x + TAB_W), Some(1280 - fb::MARGIN));
-        kassert_eq!(tab_x(HEADER_TEXT_W + fb::MARGIN + all, 0), Some(HEADER_TEXT_W));
-        kassert_eq!(tab_x(HEADER_TEXT_W + fb::MARGIN + all - 1, 0), None);
+        kassert_eq!(tab_x(fb::HEADER_W + fb::MARGIN + all, 0), Some(fb::HEADER_W));
+        kassert_eq!(tab_x(fb::HEADER_W + fb::MARGIN + all - 1, 0), None);
         kassert_eq!(tab_x(0, 0), None);
         Ok(())
     }
@@ -1328,6 +1344,7 @@ crate::ktest!(
         // command on serial (no terminal) leaves the shown one alone.
         use crate::{kassert, kassert_eq};
         kassert_eq!(shown(), 0);
+        let _first = ShowFirstAfter;
         let c = canvas(Owner::on_vt(2)).map_err(|_| "no canvas")?;
         kassert_eq!(shown(), 2);
         kassert_eq!(show(0), Err(ShowError::InUse));
@@ -1335,8 +1352,7 @@ crate::ktest!(
         kassert_eq!(shown(), 2);
         drop(c);
         let (paused, cells_match) = with_screen(|s| {
-            let (cols, rows) = (s.term.cols(), s.term.rows());
-            (s.canvas.is_some(), (0..rows).all(|r| (0..cols).all(|c| s.shadow[r * cols + c] == s.term.cell(c, r))))
+            (s.canvas.is_some(), s.shadow_matches_grid())
         })
         .ok_or("no terminal")?;
         kassert!(!paused && cells_match);
@@ -1345,6 +1361,29 @@ crate::ktest!(
         let c = canvas(Owner::new()).map_err(|_| "no canvas")?;
         kassert_eq!(shown(), 0);
         drop(c);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn scrolling_a_hidden_terminal_leaves_the_shown_one_alone() {
+        // Shift+PageUp from the second terminal's shell (a key routed to it
+        // before a switch) scrolls the second's view, not the first's shown
+        // one, and draws nothing.
+        use crate::{kassert, kassert_eq};
+        kassert_eq!(shown(), 0);
+        reset_view(0);
+        for i in 0..60 {
+            kassert!(write_str_to(1, &alloc::format!("second {i}\n")));
+        }
+        let drawn = || status().map(|s| s.cells_drawn).ok_or("no terminal");
+        let before = drawn()?;
+        scroll_half_pages(1, 1);
+        let views = with_screen(|s| (s.terms[0].view_offset(), s.terms[1].view_offset())).ok_or("no terminal")?;
+        kassert!(views.0 == 0 && views.1 > 0);
+        kassert_eq!(drawn()?, before);
+        reset_view(1);
+        kassert_eq!(with_screen(|s| s.terms[1].view_offset()).ok_or("no terminal")?, 0);
         Ok(())
     }
 );

@@ -1,7 +1,7 @@
 //! Boot framebuffer: pixels, glyphs, the "hello" header, and the crash
-//! screen. Below the header, the terminal (`crate::term`) draws log lines and
-//! the screen's shell, or a command draws on a `term::Canvas` while the
-//! terminal is paused.
+//! screen. Below the header, the shown virtual terminal (`crate::term`)
+//! draws log lines or a screen shell, or a command draws on a
+//! `term::Canvas` while the terminals are paused.
 //!
 //! Text uses pre-rasterized Noto Sans Mono glyphs (anti-aliased, so we blend
 //! each pixel between background and foreground). This is deliberately the
@@ -27,6 +27,10 @@ const ACCENT: u32 = 0x3d7eff;
 const CRASH_BG: u32 = 0x3a0b0b;
 const CRASH_TITLE: u32 = 0xff6b6b;
 
+/// The header's text and rule stay in its left this many pixels (the
+/// screendump test checks them; `term` puts its terminal boxes right of
+/// them).
+pub const HEADER_W: usize = 640;
 /// Top of the terminal, below the fixed header.
 pub const CONSOLE_TOP: usize = 144;
 pub const MARGIN: usize = 32;

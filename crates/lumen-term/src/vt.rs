@@ -1,11 +1,12 @@
 //! Virtual terminals' keys: one keyboard, `N` terminals, each with its own
-//! reader. [`Router`] sends every key typed to the terminal shown when it
-//! was typed, in order, into that terminal's own ring of `CAP` keys, so a
-//! key typed after a switch goes to the terminal switched to, never to the
+//! reader. [`Router`] keeps each terminal's keys in a ring of its own
+//! (`CAP` keys), in the order they were routed: the kernel routes each key
+//! to the terminal shown when it routes it, so keys routed after a switch
+//! go to the terminal switched to, while those routed before stay with the
 //! one left (whose reader may not have run yet).
 //!
 //! Fixed-size, without allocation (`const fn new`): the kernel keeps one in
-//! a static and fills it with interrupts off.
+//! a static, filled under a lock.
 
 /// A ring of up to `CAP` keys.
 struct Ring<K: Copy, const CAP: usize> {
@@ -40,12 +41,11 @@ impl<K: Copy, const CAP: usize> Ring<K, CAP> {
     }
 }
 
-/// Which of `N` terminals is shown, and the keys typed on each waiting for
-/// its reader (`CAP` each at most).
+/// The keys routed to each of `N` terminals, waiting for its reader (`CAP`
+/// each at most), and how many each dropped.
 pub struct Router<K: Copy, const N: usize, const CAP: usize> {
-    shown: usize,
     rings: [Ring<K, CAP>; N],
-    dropped: u64,
+    dropped: [u64; N],
 }
 
 impl<K: Copy, const N: usize, const CAP: usize> Default for Router<K, N, CAP> {
@@ -55,37 +55,25 @@ impl<K: Copy, const N: usize, const CAP: usize> Default for Router<K, N, CAP> {
 }
 
 impl<K: Copy, const N: usize, const CAP: usize> Router<K, N, CAP> {
-    /// Terminal 0 shown, no keys waiting.
+    /// No keys waiting.
     ///
     /// # Panics
-    /// (At compile time when used in a `const`/`static`.) If `N` or `CAP` is 0.
+    /// (At compile time when used in a `const`/`static`.) If `N` or `CAP` is
+    /// 0, or `N` is more than a `usize` has bits (see [`Self::mask`]).
     pub const fn new() -> Self {
         assert!(N > 0 && CAP > 0, "a router needs a terminal and room for a key");
-        Router { shown: 0, rings: [const { Ring::new() }; N], dropped: 0 }
+        assert!(N <= usize::BITS as usize, "a terminal per bit of the mask");
+        Router { rings: [const { Ring::new() }; N], dropped: [0; N] }
     }
 
-    /// The terminal shown (where keys go).
-    pub fn shown(&self) -> usize {
-        self.shown
-    }
-
-    /// Show terminal `vt`: keys typed from now on go to it (those already
-    /// routed stay with their terminal). False, changing nothing, if there
-    /// is no terminal `vt`.
-    pub fn show(&mut self, vt: usize) -> bool {
-        if vt >= N {
-            return false;
-        }
-        self.shown = vt;
-        true
-    }
-
-    /// A key typed: to the shown terminal's ring. False if that ring was
-    /// full (the key is dropped and counted).
-    pub fn route(&mut self, key: K) -> bool {
-        let kept = self.rings[self.shown].push(key);
+    /// Route `key` to terminal `vt`'s ring. False if it didn't fit (the
+    /// ring was full: the key is dropped and counted) or there is no
+    /// terminal `vt` (not counted).
+    pub fn route(&mut self, vt: usize, key: K) -> bool {
+        let Some(ring) = self.rings.get_mut(vt) else { return false };
+        let kept = ring.push(key);
         if !kept {
-            self.dropped += 1;
+            self.dropped[vt] += 1;
         }
         kept
     }
@@ -96,14 +84,20 @@ impl<K: Copy, const N: usize, const CAP: usize> Router<K, N, CAP> {
         self.rings.get_mut(vt)?.pop()
     }
 
-    /// Keys waiting for terminal `vt`'s reader.
-    pub fn waiting(&self, vt: usize) -> usize {
-        self.rings.get(vt).map_or(0, |r| r.len)
+    /// Whether keys wait for terminal `vt`'s reader.
+    pub fn has_keys(&self, vt: usize) -> bool {
+        self.rings.get(vt).is_some_and(|r| r.len > 0)
     }
 
-    /// Keys dropped because their terminal's ring was full.
-    pub fn dropped(&self) -> u64 {
-        self.dropped
+    /// Bit `vt` set for each terminal with keys waiting.
+    pub fn mask(&self) -> usize {
+        (0..N).filter(|&vt| self.has_keys(vt)).fold(0, |m, vt| m | 1 << vt)
+    }
+
+    /// Keys terminal `vt` dropped because its ring was full (0 for one that
+    /// doesn't exist).
+    pub fn dropped(&self, vt: usize) -> u64 {
+        self.dropped.get(vt).copied().unwrap_or(0)
     }
 }
 
@@ -119,66 +113,60 @@ mod tests {
     }
 
     #[test]
-    fn keys_go_to_the_terminal_shown_when_typed() {
+    fn each_terminal_gets_its_own_keys_in_order() {
         let mut r: Router<char, 4, 8> = Router::new();
-        assert_eq!(r.shown(), 0);
+        assert_eq!(r.mask(), 0);
         for c in "ab".chars() {
-            assert!(r.route(c));
+            assert!(r.route(0, c));
         }
-        // Switched before terminal 0's reader ran: its keys stay its own.
-        assert!(r.show(1));
+        // Routed elsewhere before terminal 0's reader ran: its keys stay.
         for c in "xyz".chars() {
-            assert!(r.route(c));
+            assert!(r.route(1, c));
         }
-        assert_eq!((r.waiting(0), r.waiting(1), r.waiting(2)), (2, 3, 0));
+        assert!(r.has_keys(0) && r.has_keys(1) && !r.has_keys(2));
+        assert_eq!(r.mask(), 0b11);
         assert_eq!(drain(&mut r, 1), ['x', 'y', 'z']);
-        assert!(r.show(0));
-        assert!(r.route('c'));
+        assert!(r.route(0, 'c'));
         assert_eq!(drain(&mut r, 0), ['a', 'b', 'c']);
-        assert_eq!(r.take(2), None);
+        assert_eq!((r.take(2), r.mask()), (None, 0));
     }
 
     #[test]
-    fn showing_a_terminal_that_does_not_exist_changes_nothing() {
+    fn a_terminal_that_does_not_exist_takes_nothing() {
         let mut r: Router<char, 4, 8> = Router::new();
-        assert!(r.show(3));
-        assert!(!r.show(4));
-        assert!(!r.show(usize::MAX));
-        assert_eq!(r.shown(), 3);
-        assert_eq!((r.take(4), r.waiting(4)), (None, 0));
+        assert!(!r.route(4, 'a'));
+        assert!(!r.route(usize::MAX, 'a'));
+        assert_eq!((r.take(4), r.has_keys(4), r.dropped(4), r.mask()), (None, false, 0, 0));
     }
 
     #[test]
     fn a_full_ring_drops_and_counts_the_new_key() {
         let mut r: Router<char, 2, 3> = Router::new();
         for c in "abc".chars() {
-            assert!(r.route(c));
+            assert!(r.route(0, c));
         }
-        assert!(!r.route('d'));
-        assert_eq!(r.dropped(), 1);
+        assert!(!r.route(0, 'd'));
+        assert_eq!((r.dropped(0), r.dropped(1)), (1, 0));
         // The other terminal's ring is its own.
-        assert!(r.show(1));
-        assert!(r.route('e'));
+        assert!(r.route(1, 'e'));
         assert_eq!(drain(&mut r, 0), ['a', 'b', 'c']);
         // Room again, and the ring wraps around in order.
-        assert!(r.show(0));
         for c in "fgh".chars() {
-            assert!(r.route(c));
+            assert!(r.route(0, c));
         }
         assert_eq!(r.take(0), Some('f'));
-        assert!(r.route('i'));
+        assert!(r.route(0, 'i'));
         assert_eq!(drain(&mut r, 0), ['g', 'h', 'i']);
         assert_eq!(drain(&mut r, 1), ['e']);
-        assert_eq!(r.dropped(), 1);
+        assert_eq!(r.dropped(0), 1);
     }
 
     #[test]
-    fn interleaved_typing_and_switching_matches_a_model() {
+    fn interleaved_routing_and_taking_matches_a_model() {
         // A model: one queue per terminal, unbounded; the router agrees
         // while no ring overflows (`route` asserts none did with this seed).
         let mut r: Router<u32, 4, 64> = Router::new();
         let mut model: [Vec<u32>; 4] = Default::default();
-        let mut shown = 0;
         let mut seed = 0x2545_f491_u32;
         let mut next = || {
             seed ^= seed << 13;
@@ -186,26 +174,17 @@ mod tests {
             seed ^= seed << 5;
             seed
         };
-        for key in 0..160 {
-            match next() % 5 {
-                0 => {
-                    shown = (next() % 4) as usize;
-                    assert!(r.show(shown));
-                }
-                1 => {
-                    let vt = (next() % 4) as usize;
-                    let got = r.take(vt);
-                    let want = (!model[vt].is_empty()).then(|| model[vt].remove(0));
-                    assert_eq!(got, want);
-                }
-                _ => {
-                    assert!(r.route(key));
-                    model[shown].push(key);
-                }
+        for key in 0..400 {
+            let vt = (next() % 4) as usize;
+            if next() % 3 == 0 {
+                let want = (!model[vt].is_empty()).then(|| model[vt].remove(0));
+                assert_eq!(r.take(vt), want);
+            } else {
+                assert!(r.route(vt, key));
+                model[vt].push(key);
             }
-        }
-        for (vt, keys) in model.iter().enumerate() {
-            assert_eq!(r.waiting(vt), keys.len());
+            let mask = (0..4).filter(|&v| !model[v].is_empty()).fold(0, |m, v| m | 1 << v);
+            assert_eq!(r.mask(), mask);
         }
     }
 }

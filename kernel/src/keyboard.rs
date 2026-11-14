@@ -88,7 +88,8 @@ struct Status {
 
 /// Bytes from the keyboard, waiting to be decoded.
 static QUEUE: ByteQueue<256> = ByteQueue::new();
-/// Threads waiting for the queue to have bytes ([`wait_for_bytes_or`]).
+/// Threads waiting for the queue to have bytes, or for keys routed to
+/// them ([`wait_for_bytes_or`]: the screen shells).
 static WAITING: WaitQueue = WaitQueue::new();
 /// The decoder: the queue's consumer side is used only under this lock
 /// (outside the ktests). `None` before [`init`].
@@ -508,14 +509,24 @@ pub fn read_key() -> Option<Key> {
     decode(&mut keyboard.as_mut()?.decoder, || QUEUE.pop())
 }
 
-/// Block the calling thread until bytes are queued or `ready()` holds
-/// (checked under the wait queue's lock, with interrupts off: it must not
-/// block or allocate); IRQ 1 wakes it when it queues bytes. Only where a
-/// thread can block (see `sched::WaitQueue::wait_until`). For readers that
-/// keep keys of their own (the virtual terminals' router, `crate::vt`,
-/// which decodes with [`read_key`] after each wake-up, checking first:
-/// bytes queued after `read_key` emptied the queue either make this return
-/// at once or wake the thread): whoever makes `ready` true calls
+/// Queue `bytes` as if IRQ 1 had (for the tests: nothing else produces
+/// in the test kernel while it runs, with interrupts off on the boot CPU,
+/// where IRQ 1 goes). False if the queue filled.
+#[cfg(feature = "ktest")]
+pub fn queue_for_test(bytes: &[u8]) -> bool {
+    debug_assert!(arch::cpu_index() == 0, "the keyboard queue's producer is the boot CPU");
+    let _off = arch::irq::push_off();
+    bytes.iter().all(|&b| QUEUE.push(b))
+}
+
+/// Block the calling thread until bytes are queued or `ready()` holds.
+/// Both are checked under the wait queue's lock with interrupts off, so
+/// `ready` must not block or allocate, and a byte queued after the caller
+/// last emptied the queue with [`read_key`] either makes this return at
+/// once or wakes the thread (IRQ 1 wakes it whenever it queues bytes).
+/// Only where a thread can block (see `sched::WaitQueue::wait_until`).
+/// For readers that keep keys of their own (the virtual terminals'
+/// router, `crate::vt`): whoever makes `ready` true calls
 /// [`wake_readers`] afterwards.
 pub fn wait_for_bytes_or(ready: impl Fn() -> bool) {
     WAITING.wait_until(|| !QUEUE.is_empty() || ready());

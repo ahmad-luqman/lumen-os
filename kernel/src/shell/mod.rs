@@ -13,8 +13,8 @@
 //!   own thread (`shell-vt1` to `shell-vt4`, on the boot CPU), blocked until
 //!   a key arrives; they start only with a keyboard and a terminal wide
 //!   enough for a 16-column line. Shift+PageUp and Shift+PageDown scroll
-//!   the shown terminal back and forward by half a screen; any key the line
-//!   editor takes shows its screen again.
+//!   the shell's own terminal back and forward by half a screen; any key
+//!   the line editor takes shows its screen again.
 //!
 //! Log lines go to serial and the first virtual terminal, between the
 //! shells' output. The line
@@ -50,13 +50,13 @@ const SERIAL_COLUMNS: usize = 80;
 /// [`Ctx::poll_key`]/[`Ctx::wait_key`]), the screen's pixels
 /// ([`Ctx::canvas`]) and the shell's history.
 pub struct Ctx<'a> {
-    /// The console. A `write!` reaches it whole (on the screen it is
-    /// formatted first, then drawn under one lock; on serial it is
+    /// The console. A `write!` reaches it whole (on a virtual terminal it
+    /// is formatted first, then drawn under one lock; on serial it is
     /// formatted under the log's line lock, so a `Display` that logs would
     /// take that lock again, a re-lock crash report: make such text before
-    /// the call). While a command holds the
-    /// canvas (`term::status().paused`), screen output reaches the terminal
-    /// but isn't drawn.
+    /// the call). While a command holds the canvas
+    /// (`term::status().paused`), output to the terminals reaches them but
+    /// isn't drawn.
     pub out: &'a mut dyn Console,
     /// Whether the console takes escape codes.
     pub ansi: bool,
@@ -67,8 +67,9 @@ pub struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    /// A context for running commands on `out` (each run gets its own
-    /// canvas owner).
+    /// A context for running commands on `out`: each run gets its own
+    /// canvas owner, on `out`'s virtual terminal if it is one (its canvas
+    /// brings that terminal to the front).
     pub fn new(out: &'a mut dyn Console, ansi: bool, history: &'a History) -> Ctx<'a> {
         let owner = out.vt().map_or_else(term::Owner::new, term::Owner::on_vt);
         Ctx { out, ansi, history, owner }
@@ -89,7 +90,8 @@ impl<'a> Ctx<'a> {
 
     /// The next key typed on this console, if one is waiting (never
     /// blocks): for a command that runs until a key (`q`, Ctrl-C) stops it.
-    /// On the screen, Shift+PageUp/PageDown still scroll the terminal and
+    /// On a virtual terminal, the keyboard's keys routed to it (typed while
+    /// it was shown: `crate::vt`); Shift+PageUp/PageDown still scroll it and
     /// aren't returned, and keys the line editor doesn't take (Esc, F1) are
     /// dropped. Keys typed ahead for the next line are taken too. While a
     /// command holds the canvas, Shift+PageUp/PageDown do nothing (the view
@@ -99,8 +101,9 @@ impl<'a> Ctx<'a> {
     }
 
     /// Wait for the next key typed on this console (see [`Self::poll_key`]):
-    /// on the screen the thread sleeps until IRQ 1; on serial it polls,
-    /// yielding to the CPU's other threads.
+    /// on a virtual terminal the thread sleeps until IRQ 1 (or another
+    /// shell routing it a key); on serial it polls, yielding to the CPU's
+    /// other threads.
     #[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
     pub fn wait_key(&mut self) -> Key {
         self.out.read_key()
@@ -134,20 +137,23 @@ const SCREEN_THREADS: [&str; term::VTS] = ["shell-vt1", "shell-vt2", "shell-vt3"
 /// Start the screen shells (if there is a terminal and a keyboard), then
 /// run the serial shell here.
 pub fn run() -> ! {
-    match screen_editor() {
+    match screen_line_width() {
         // Logged before the screen's shells start, so the first's prompt
         // comes after this line on the screen.
         Ok(max) => {
             log::info!(target: "shell", "shells on serial and the screen; type 'help'");
             for (vt, name) in SCREEN_THREADS.into_iter().enumerate() {
                 let editor = Editor::new(PROMPT, Mode::Ansi, max, HISTORY);
+                // Before it runs: keys typed on it from then on are its own.
+                crate::vt::attach(vt);
                 match crate::sched::spawn(name, move || run_on(Screen { vt }, editor)) {
                     Ok(handle) => drop(handle), // it runs for good
-                    Err(e) => log::error!(
-                        target: "shell",
-                        "no shell on terminal {} after all: no thread for it: {e}",
-                        vt + 1
-                    ),
+                    Err(e) => {
+                        crate::vt::detach(vt);
+                        log::error!(target: "shell", "no shell on terminal {} after all: no thread for it: {e}", vt + 1);
+                        // Not a blank screen: say so where its prompt would be.
+                        let _ = writeln!(Screen { vt }, "no shell on this terminal: no thread for it: {e}");
+                    }
                 }
             }
         }
@@ -159,7 +165,7 @@ pub fn run() -> ! {
 }
 
 /// The screen shells' widest line, if there is a terminal and a keyboard.
-fn screen_editor() -> Result<usize, &'static str> {
+fn screen_line_width() -> Result<usize, &'static str> {
     let cols = crate::term::status().ok_or("no terminal")?.cols;
     if keyboard::stats().result != Some(Ok(())) {
         return Err("no keyboard");
@@ -240,7 +246,7 @@ impl Console for Serial {
             if let Some(key) = self.try_key() {
                 return key;
             }
-            // Let the CPU's other threads run (the screen shell, woken by a
+            // Let the CPU's other threads run (the screen shells, woken by a
             // key, among them).
             crate::sched::yield_now();
         }
@@ -256,9 +262,10 @@ impl Console for Serial {
     }
 }
 
-/// A virtual terminal: the keyboard's keys while it is shown in, its
-/// terminal out. Each `write!` reaches the terminal whole (one lock), not
-/// in pieces another CPU's log line could land between. It is formatted
+/// A virtual terminal as a console: in, the keyboard's keys routed to it
+/// (typed while it is shown); out, its terminal. Each `write!` reaches the
+/// terminal whole (one lock), not in pieces another CPU's log line could
+/// land between. It is formatted
 /// before taking the screen's lock: formatting may allocate (a script
 /// value's `Debug` does), which the heap refuses under that lock.
 struct Screen {
@@ -341,6 +348,8 @@ pub struct Captured {
     pub text: String,
     pub keys: alloc::collections::VecDeque<Key>,
     pub ran_dry: bool,
+    /// The virtual terminal it stands for, if any (see [`Console::vt`]).
+    pub vt: Option<usize>,
     /// Polls in a row that found no key.
     empty_polls: u32,
 }
@@ -368,6 +377,10 @@ impl Write for Captured {
 impl Console for Captured {
     fn name(&self) -> &'static str {
         "the test console"
+    }
+
+    fn vt(&self) -> Option<usize> {
+        self.vt
     }
 
     fn read_key(&mut self) -> Key {

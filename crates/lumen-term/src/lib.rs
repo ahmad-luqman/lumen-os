@@ -39,8 +39,8 @@
 //! output doesn't move it: it stays on the lines it shows while the ring
 //! holds them (`CSI 3 J` empties the ring and shows the screen).
 //!
-//! [`vt::Router`] sends one keyboard's keys to several terminals' readers:
-//! each key to the terminal shown when it was typed.
+//! [`vt::Router`] keeps one keyboard's keys for several terminals'
+//! readers, each terminal's in a ring of its own.
 
 #![no_std]
 
