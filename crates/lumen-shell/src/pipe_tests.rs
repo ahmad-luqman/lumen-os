@@ -133,7 +133,10 @@ fn a_wide_value_widens_its_column_for_every_row() {
     t.push(vec![text("short"), Value::Int(2)]);
     let mut out = String::new();
     t.render(&mut out);
-    assert_eq!(out, "  use                         count\n  a name longer than sixteen  1\n  short                       2\n");
+    assert_eq!(
+        out,
+        "  use                         count\n  a name longer than sixteen  1\n  short                       2\n"
+    );
 }
 
 #[test]
@@ -167,7 +170,10 @@ fn where_compares_numbers_as_numbers_and_text_as_text() {
     let t = table(apply(Data::Table(vectors()), &["where", "use", "<", "k"]));
     assert_eq!(column(&t, 1), vec![text("error")]);
     let t = table(apply(Data::Table(vectors()), &["where", "use", "~", "e"]));
-    assert_eq!(column(&t, 1), vec![text("timer"), text("keyboard"), text("serial"), text("error"), text("remote wake")]);
+    assert_eq!(
+        column(&t, 1),
+        vec![text("timer"), text("keyboard"), text("serial"), text("error"), text("remote wake")]
+    );
     // A percentage may be written with its %; a missing value never matches.
     let t = table(apply(Data::Table(cpus()), &["where", "busy", ">", "50%"]));
     assert_eq!(column(&t, 0), vec![Value::Int(0)]);
@@ -311,10 +317,7 @@ fn text_is_a_table_of_lines_and_comes_back_as_text() {
     assert_eq!(apply(lines.clone(), &["where", "line", "~", "1"]), Ok(Data::Text(strings(&["a 10", "c 1"]))));
     assert_eq!(apply(lines.clone(), &["where", "line", ">=", "b"]), Ok(Data::Text(strings(&["b 2", "c 1"]))));
     assert_eq!(apply(lines.clone(), &["select", "line"]), Ok(lines.clone()));
-    assert_eq!(
-        apply(lines, &["sort", "count"]).unwrap_err().to_string(),
-        "sort: no column 'count' (columns: line)"
-    );
+    assert_eq!(apply(lines, &["sort", "count"]).unwrap_err().to_string(), "sort: no column 'count' (columns: line)");
 }
 
 #[test]

@@ -365,7 +365,9 @@ impl Filter {
                 }
                 Data::Table(mut table) => {
                     let columns = table.columns.clone();
-                    table.rows.retain(|row| row.iter().zip(&columns).any(|(v, c)| v.show(c.kind).contains(text.as_str())));
+                    table
+                        .rows
+                        .retain(|row| row.iter().zip(&columns).any(|(v, c)| v.show(c.kind).contains(text.as_str())));
                     Data::Table(table)
                 }
             }),
@@ -394,10 +396,8 @@ impl Filter {
                     if *op == Op::Contains {
                         return Err(PipeError::ContainsNumbers(column.clone()));
                     }
-                    let n = number(value, kind).ok_or_else(|| PipeError::NotANumber {
-                        column: column.clone(),
-                        value: value.clone(),
-                    })?;
+                    let n = number(value, kind)
+                        .ok_or_else(|| PipeError::NotANumber { column: column.clone(), value: value.clone() })?;
                     Value::Int(n)
                 } else {
                     Value::Text(value.clone())

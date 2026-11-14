@@ -301,10 +301,7 @@ crate::ktest!(
             one("count").as_str(),
             "count: a filter: it takes what a command gives it after a | (cpus | count ...)\n"
         );
-        kassert_eq!(
-            one("cpus | where busy > lots").as_str(),
-            "where: busy holds numbers, and 'lots' isn't one\n"
-        );
+        kassert_eq!(one("cpus | where busy > lots").as_str(), "where: busy holds numbers, and 'lots' isn't one\n");
         kassert_eq!(one("cpus | sort").as_str(), "usage: sort <column> [desc]\n");
         // A wrong filter stops the pipeline before the command runs.
         kassert_eq!(one("echo ran | first x").as_str(), "first: 'x' isn't a number of lines\n");
