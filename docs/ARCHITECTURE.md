@@ -92,20 +92,26 @@ tests (for example `lumen-elf`, the symbol-table reader).
    patterns, or, without one (an 8250), its interrupt enable register does.
    Without a UART, serial writes do nothing, reads find nothing, and boot
    warns on the screen once the framebuffer is up (a golden checks that row
-   with `-serial none`); the screen then shows log lines at info and above,
-   from the framebuffer on. A UART whose transmit FIFO never empties (about
-   a minute of polling) is then treated as absent. Writes come in two
-   kinds. Bursts: with a working FIFO (a 16550A), 16 bytes per wait for an
-   empty transmit FIFO (THRE). They assume nobody else writes meanwhile, so
-   they go only through the log's line lock (`klog::LockedSerial`: the
-   logger, the serial shell, the ktest runner's TAP lines, the `crash`
-   command's messages); two CPUs bursting after the same check would
-   overrun the FIFO (not tested on its own: QEMU never overruns). Byte by
-   byte (`SerialWriter`): one wait per byte, safe without a lock, for the
-   crash reporter, whose stop of the other CPUs is best effort (a CPU it
-   couldn't stop can still write, and lines may interleave, but no bytes are
-   lost to an overrun). The crash reporter first takes the UART out of
-   loopback, in case a CPU was stopped in the loopback ktest.
+   with `-serial none`); only the screen's copy of the log remains then:
+   info and above, from the framebuffer on. Writes come in two kinds.
+   Bursts: with a working FIFO (a 16550A), up to 15 bytes per wait for an
+   empty transmit FIFO (THRE), one slot short of the FIFO. They assume no
+   other burst goes in meanwhile, so only the log writes them, holding its
+   line lock: the logger itself, and `klog::LockedSerial` for the serial
+   shell, the ktest runner's TAP lines and the `crash` command's messages
+   (two CPUs bursting after the same check would overrun the FIFO; not
+   tested on its own: QEMU sends each byte as it is written, so its FIFO
+   never fills). Byte by byte (`SerialWriter`): one wait per byte, without
+   a lock, for the crash reporter, whose stop of the other CPUs is best
+   effort: a CPU it couldn't stop can still log, and lines may interleave,
+   but its burst and the reporter's byte after the same check fit the FIFO
+   (the slot left free; model-checked by `cargo:lumen-uart`, not on
+   hardware). On a UART without a FIFO two byte writers can still collide,
+   as before. The waits are unbounded, as on any polled driver: a UART that
+   never empties hangs its writer (not tested). The crash reporter takes
+   the UART out of loopback before its first line and again once the other
+   CPUs are stopped, in case one was in the loopback ktest (the reset is
+   ktested, not a crash during that ktest).
 5. Logger (level from `lumen.log=`), Limine responses checked, the symbol table
    located in our own ELF, a memory-map summary, the frame allocator
    (`INFO  mem: frames: N usable, M reserved`), the kernel's own page tables
@@ -673,7 +679,8 @@ allocates.
   a line into the report; not tested). With every CPU stopped, reports and
   log lines don't interleave; a CPU that wasn't stopped can still log into
   the report, its line interleaved with the report's (the report writes
-  byte by byte, so nothing is lost to the UART's FIFO). The screen copy doesn't show these lines. A
+  byte by byte and a burst leaves one FIFO slot free, so on a 16550A
+  nothing is lost to the FIFO; see step 4 of the boot sequence). The screen copy doesn't show these lines. A
   fault while stopping the others prints one line that keeps the original
   crash.
 - A fault during the report prints one line and halts, with no recursion. With

@@ -3,14 +3,17 @@
 //! The kernel reaches COM1 through port I/O; the tests (`tests.rs`) a
 //! model 16550. Everything that decides what to write is here: whether a
 //! UART answers ([`probe`]), how to program it and write to it ([`init`],
-//! [`Mode`]), `\n` as `\r\n` in FIFO-sized bursts ([`write_bytes`]), and
-//! reading ([`try_read`]).
+//! [`Mode`]), `\n` as `\r\n` in bursts ([`write_bytes`]), and reading
+//! ([`try_read`]).
 //!
 //! A burst assumes the transmit FIFO is empty once the line status says so
-//! (THRE): two writers bursting after the same check overrun it and lose
-//! bytes. Callers that may write at the same time as another writer use
-//! [`Mode::Bytes`], which waits before every byte; bursts are for callers
-//! that serialize whole writes.
+//! (THRE), and fills all but one of its slots ([`BURST`]). Two writers
+//! bursting after the same check would overrun it and lose bytes, so
+//! bursts are for callers that serialize whole writes with each other. A
+//! writer that can't ([`Mode::Bytes`], one byte per check) still fits in
+//! the slot left over: one burst and one such byte after the same check
+//! lose nothing. Two byte writers on a UART without a FIFO can still
+//! collide in its one-byte holding register (as any polled driver can).
 
 #![no_std]
 
@@ -33,8 +36,8 @@ pub mod reg {
 
 /// Line status: a received byte is waiting.
 pub const LSR_DATA_READY: u8 = 1 << 0;
-/// Line status (THRE): the transmit holding register, with FIFOs on the
-/// whole transmit FIFO, is empty. The shift register may still be sending
+/// Line status (THRE): the transmit holding register (with FIFOs on: the
+/// whole transmit FIFO) is empty. The shift register may still be sending
 /// its last byte.
 pub const LSR_THR_EMPTY: u8 = 1 << 5;
 /// Line status (TEMT): the transmit FIFO and the shift register are both
@@ -54,13 +57,11 @@ pub const MCR_DTR_RTS: u8 = 0x03;
 pub const MCR_LOOPBACK: u8 = 1 << 4;
 /// The 16550A's transmit (and receive) FIFO size.
 pub const FIFO_SIZE: usize = 16;
-/// How many line status reads [`write_bytes`] waits for THRE before it
-/// gives up ([`Stuck`]). Far longer than a working UART ever takes: a byte
-/// takes 87 µs at 115200 baud and a port read about 1 µs on real hardware,
-/// so this is about a minute there; under QEMU it outlasts any stall of the
-/// host side of the pipe. A UART that never empties costs one long pause,
-/// not a hang.
-pub const THR_SPINS: u32 = 50_000_000;
+/// Bytes per wait in [`Mode::Fifo`]: one slot is left for a writer that
+/// doesn't take part in the callers' serialization ([`Mode::Bytes`], the
+/// kernel's crash reporter), so its byte and a burst written after the same
+/// check both fit.
+pub const BURST: usize = FIFO_SIZE - 1;
 
 /// How the UART's registers are reached.
 pub trait Registers {
@@ -74,10 +75,12 @@ pub trait Registers {
 pub enum Mode {
     /// No UART: writes do nothing, reads find nothing.
     Absent = 0,
-    /// One byte per wait for an empty transmit FIFO (no working FIFO, or a
-    /// writer that doesn't serialize with the others).
+    /// One byte per wait for an empty transmit FIFO: no working FIFO, or a
+    /// writer that doesn't serialize with the bursting ones (its byte fits
+    /// in the slot a burst leaves; see the crate doc).
     Bytes = 1,
-    /// Up to [`FIFO_SIZE`] bytes per wait.
+    /// Up to [`BURST`] bytes per wait, for writers that serialize with each
+    /// other.
     Fifo = 2,
 }
 
@@ -98,14 +101,12 @@ impl Mode {
     }
 }
 
-/// [`write_bytes`] gave up: the transmit FIFO never emptied ([`THR_SPINS`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Stuck;
-
 /// Whether a UART answers: its scratch register holds `0x55` and then
 /// `0xaa` (complements, so a bit stuck either way fails one of them), or,
 /// for a UART without one (an 8250), its interrupt enable register holds
-/// `0x0f` and then `0x00`. Every register it writes gets its old value back.
+/// `0x0f` and then `0x00` (briefly enabling the UART's interrupts: the
+/// CPU's are off this early). Every register it writes gets its old value
+/// back.
 /// An absent port reads `0xff` whatever was written (on QEMU and modern
 /// chipsets), so neither holds there.
 pub fn probe(r: &mut impl Registers) -> bool {
@@ -142,7 +143,7 @@ pub fn init(r: &mut impl Registers) -> Mode {
     r.write(reg::INT_ENABLE, 0x00);
     r.write(reg::LINE_CTRL, LCR_DLAB);
     r.write(reg::DATA, 0x01); // divisor 1 = 115200 baud
-    r.write(reg::INT_ENABLE, 0x00);
+    r.write(reg::INT_ENABLE, 0x00); // the divisor's high byte
     r.write(reg::LINE_CTRL, LCR_8N1);
     r.write(reg::FIFO_CTRL, FCR_ENABLE_CLEAR);
     r.write(reg::MODEM_CTRL, MCR_DTR_RTS);
@@ -150,28 +151,23 @@ pub fn init(r: &mut impl Registers) -> Mode {
 }
 
 /// Write `bytes`, each `\n` as `\r\n`: wait until the transmit FIFO is
-/// empty (THRE), then write up to [`FIFO_SIZE`] (expanded) bytes in
+/// empty (THRE), then write up to [`BURST`] (expanded) bytes in
 /// [`Mode::Fifo`], one in [`Mode::Bytes`], and so on; nothing when
-/// [`Mode::Absent`]. Every call waits before its first byte. Returns how
-/// many times it waited, or [`Stuck`] if a wait outlasted [`THR_SPINS`]
-/// (what was left is dropped).
-pub fn write_bytes(r: &mut impl Registers, mode: Mode, bytes: &[u8]) -> Result<usize, Stuck> {
-    write_waiting(r, mode, bytes, THR_SPINS)
-}
-
-/// [`write_bytes`] with each wait bounded by `spins` line status reads.
-fn write_waiting(r: &mut impl Registers, mode: Mode, bytes: &[u8], spins: u32) -> Result<usize, Stuck> {
+/// [`Mode::Absent`]. Every call that writes waits before its first byte.
+/// The waits are unbounded, as polled drivers' are: a UART that never
+/// empties hangs the writer. Returns how many times it waited.
+pub fn write_bytes(r: &mut impl Registers, mode: Mode, bytes: &[u8]) -> usize {
     let burst = match mode {
-        Mode::Absent => return Ok(0),
+        Mode::Absent => return 0,
         Mode::Bytes => 1,
-        Mode::Fifo => FIFO_SIZE,
+        Mode::Fifo => BURST,
     };
     let (mut room, mut waits) = (0, 0);
     for b in bytes {
         let out: &[u8] = if *b == b'\n' { b"\r\n" } else { core::slice::from_ref(b) };
         for &o in out {
             if room == 0 {
-                wait_thr_empty(r, spins)?;
+                wait_thr_empty(r);
                 room = burst;
                 waits += 1;
             }
@@ -179,17 +175,13 @@ fn write_waiting(r: &mut impl Registers, mode: Mode, bytes: &[u8], spins: u32) -
             room -= 1;
         }
     }
-    Ok(waits)
+    waits
 }
 
-fn wait_thr_empty(r: &mut impl Registers, spins: u32) -> Result<(), Stuck> {
-    for _ in 0..spins {
-        if r.read(reg::LINE_STATUS) & LSR_THR_EMPTY != 0 {
-            return Ok(());
-        }
+fn wait_thr_empty(r: &mut impl Registers) {
+    while r.read(reg::LINE_STATUS) & LSR_THR_EMPTY == 0 {
         core::hint::spin_loop();
     }
-    Err(Stuck)
 }
 
 /// One received byte, if one is waiting (never without a UART).

@@ -18,8 +18,6 @@ struct Model {
     no_scratch: bool,
     /// The interrupt enable register doesn't hold what is written either.
     no_ier: bool,
-    /// The transmit FIFO never empties (a wedged UART).
-    stuck: bool,
     /// Bits that read as 0 in the scratch and interrupt enable registers.
     stuck_low: u8,
     /// What reading `INT_ID` returns after the FIFOs were enabled.
@@ -55,7 +53,6 @@ impl Model {
             absent: false,
             no_scratch: false,
             no_ier: false,
-            stuck: false,
             stuck_low: 0,
             iir_fifo_bits: 0xc0,
             fifo_on: false,
@@ -127,12 +124,9 @@ impl Registers for Model {
                 self.status_reads += 1;
                 self.idle_status_reads += 1;
                 assert!(self.idle_status_reads <= MAX_IDLE_STATUS_READS, "polling the line status forever");
-                let empty = self.tx.is_empty() && !self.stuck;
-                let status = (if empty { LSR_THR_EMPTY | LSR_TX_IDLE } else { 0 })
+                let status = (if self.tx.is_empty() { LSR_THR_EMPTY | LSR_TX_IDLE } else { 0 })
                     | (if self.rx.is_empty() { 0 } else { LSR_DATA_READY });
-                if !self.stuck {
-                    self.drain_one();
-                }
+                self.drain_one();
                 status
             }
             reg::INT_ENABLE if self.lcr & LCR_DLAB == 0 => self.ier & !self.stuck_low,
@@ -171,9 +165,14 @@ impl Registers for Model {
 
 /// Write `bytes`, then drain everything; returns (waits, what went out).
 fn send(m: &mut Model, mode: Mode, bytes: &[u8]) -> (usize, Vec<u8>) {
-    let waits = write_bytes(m, mode, bytes).expect("not stuck");
+    let waits = write_bytes(m, mode, bytes);
     m.flush_tx();
     (waits, core::mem::take(&mut m.sent))
+}
+
+/// The values written to register `r`, in order.
+fn writes_to(m: &Model, r: u16) -> Vec<u8> {
+    m.writes.iter().filter(|w| w.0 == r).map(|w| w.1).collect()
 }
 
 fn expanded(bytes: &[u8]) -> Vec<u8> {
@@ -230,7 +229,7 @@ fn an_absent_port_is_not_detected_and_left_alone() {
     // Only the probe's writes (scratch, then interrupt enable): nothing
     // configured.
     assert!(m.writes.iter().all(|&(r, _)| r == reg::SCRATCH || r == reg::INT_ENABLE), "{:?}", m.writes);
-    assert_eq!(write_bytes(&mut m, Mode::Absent, b"hello\n"), Ok(0));
+    assert_eq!(write_bytes(&mut m, Mode::Absent, b"hello\n"), 0);
     assert_eq!(m.writes.iter().filter(|&&(r, _)| r == reg::DATA).count(), 0);
     // Its line status reads 0xff ("data ready"), but nothing is read.
     assert_eq!(try_read(&mut m, Mode::Absent), None);
@@ -262,18 +261,18 @@ fn a_port_holding_neither_register_means_absent() {
 
 #[test]
 fn registers_holding_only_one_pattern_mean_absent_and_are_restored() {
-    // Bits stuck at 0 in both registers the probe tries: 0x55 reads back
-    // wrong and 0xaa right (or the other way round), so either pattern
-    // alone would pass. Absent, and both registers get their old values.
+    // Bits stuck at 0 in both registers the probe tries: one of each
+    // register's patterns reads back wrong, so a probe trying only the
+    // pattern that reads back right would pass. Absent, and both registers
+    // get their old values.
     for stuck in [0x05, 0x0a] {
         let mut m = Model::new();
         m.stuck_low = stuck;
         m.scratch = 0x30;
         m.ier = 0x00;
         assert!(!probe(&mut m), "stuck bits {stuck:#x}");
-        let to = |r| m.writes.iter().filter(|w| w.0 == r).map(|w| w.1).collect::<Vec<u8>>();
-        assert_eq!(to(reg::SCRATCH), [0x55, 0xaa, 0x30]);
-        assert_eq!(to(reg::INT_ENABLE), [0x0f, 0x00, 0x00]);
+        assert_eq!(writes_to(&m, reg::SCRATCH), [0x55, 0xaa, 0x30]);
+        assert_eq!(writes_to(&m, reg::INT_ENABLE), [0x0f, 0x00, 0x00]);
     }
 }
 
@@ -283,19 +282,18 @@ fn probe_restores_the_scratch_register() {
     m.scratch = 0x3c;
     assert!(probe(&mut m));
     assert_eq!(m.scratch, 0x3c);
-    let scratch_writes: Vec<u8> = m.writes.iter().filter(|w| w.0 == reg::SCRATCH).map(|w| w.1).collect();
-    assert_eq!(scratch_writes, [0x55, 0xaa, 0x3c]);
+    assert_eq!(writes_to(&m, reg::SCRATCH), [0x55, 0xaa, 0x3c]);
     // A scratch register that holds: interrupt enable isn't touched.
     assert!(m.writes.iter().all(|w| w.0 == reg::SCRATCH));
 }
 
 #[test]
-fn a_fifo_burst_waits_once_per_sixteen_bytes() {
+fn a_fifo_burst_waits_once_per_fifteen_bytes() {
     let (mut m, mode) = ready(0xc0);
-    for len in [1usize, 15, 16, 17, 31, 32, 33, 100] {
+    for len in [1usize, 14, 15, 16, 29, 30, 31, 100] {
         let bytes: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
         let (waits, out) = send(&mut m, mode, &bytes);
-        assert_eq!(waits, len.div_ceil(FIFO_SIZE), "len {len}");
+        assert_eq!(waits, len.div_ceil(BURST), "len {len}");
         assert_eq!(out, bytes, "len {len}");
     }
     assert_eq!(m.overruns, 0);
@@ -303,17 +301,17 @@ fn a_fifo_burst_waits_once_per_sixteen_bytes() {
 
 #[test]
 fn newlines_count_twice_at_every_burst_boundary() {
-    // A `\n` as the 15th, 16th and 17th input byte: its `\r\n` ends one
-    // burst, straddles two, or starts the next. Never more than 16 bytes
+    // A `\n` as the 14th, 15th and 16th input byte: its `\r\n` ends one
+    // burst, straddles two, or starts the next. Never more than a burst
     // per wait (the model counts overruns).
     let (mut m, mode) = ready(0xc0);
-    for at in 13..19 {
+    for at in 12..18 {
         for len in at + 1..at + 20 {
             let mut bytes: Vec<u8> = (0..len).map(|i| b'0' + (i % 10) as u8).collect();
             bytes[at] = b'\n';
             let (waits, out) = send(&mut m, mode, &bytes);
             assert_eq!(out, expanded(&bytes), "newline at {at}, len {len}");
-            assert_eq!(waits, (len + 1).div_ceil(FIFO_SIZE), "newline at {at}, len {len}");
+            assert_eq!(waits, (len + 1).div_ceil(BURST), "newline at {at}, len {len}");
         }
     }
     let (waits, out) = send(&mut m, mode, b"\n\n\n\n\n\n\n\n\n");
@@ -328,7 +326,7 @@ fn every_call_waits_before_its_first_byte() {
     let (mut m, mode) = ready(0xc0);
     m.tx.extend_from_slice(&[b'x'; FIFO_SIZE]); // someone else's burst, still queued
     m.status_reads = 0;
-    assert_eq!(write_bytes(&mut m, mode, b"ab"), Ok(1));
+    assert_eq!(write_bytes(&mut m, mode, b"ab"), 1);
     assert!(m.status_reads > 1); // it waited for the FIFO to drain
     assert_eq!(m.overruns, 0);
 }
@@ -347,7 +345,7 @@ fn a_burst_in_byte_mode_would_overrun() {
     // The model catches a writer that doesn't wait: what the burst size
     // guards against on a UART without a FIFO.
     let (mut m, _) = ready(0x00);
-    write_bytes(&mut m, Mode::Fifo, b"0123").expect("not stuck");
+    write_bytes(&mut m, Mode::Fifo, b"0123");
     assert!(m.overruns > 0);
 }
 
@@ -355,13 +353,43 @@ fn a_burst_in_byte_mode_would_overrun() {
 fn loopback_returns_a_burst_in_order() {
     let (mut m, mode) = ready(0xc0);
     m.write(reg::MODEM_CTRL, MCR_DTR_RTS | MCR_LOOPBACK);
-    assert_eq!(write_bytes(&mut m, mode, b"0123456\n89abcde"), Ok(1));
+    assert_eq!(write_bytes(&mut m, mode, b"012345\n789abcd"), 1);
     m.flush_tx();
     let mut back = Vec::new();
     while let Some(b) = try_read(&mut m, mode) {
         back.push(b);
     }
-    assert_eq!(back, b"0123456\r\n89abcde");
+    assert_eq!(back, b"012345\r\n789abcd");
+}
+
+#[test]
+fn a_burst_and_a_lock_free_byte_after_the_same_check_fit() {
+    // Two writers see an empty transmit FIFO at once: one bursts, the
+    // other (byte mode, the crash reporter) writes its one byte. With a
+    // burst of `BURST` both fit; a full-FIFO burst would lose a byte.
+    for (burst, lost) in [(BURST, 0), (FIFO_SIZE, 1)] {
+        let (mut m, _) = ready(0xc0);
+        for _ in 0..2 {
+            assert_ne!(m.read(reg::LINE_STATUS) & LSR_THR_EMPTY, 0);
+        }
+        for i in 0..burst {
+            m.write(reg::DATA, b'a' + i as u8);
+        }
+        m.write(reg::DATA, b'!');
+        assert_eq!(m.overruns, lost, "burst {burst}");
+    }
+}
+
+#[test]
+fn a_waiting_receive_byte_doesnt_end_the_wait() {
+    // In loopback the first burst comes back while the second waits: the
+    // wait is for THRE, not for any status bit (a received byte must not
+    // let a burst go into a full FIFO).
+    let (mut m, mode) = ready(0xc0);
+    m.write(reg::MODEM_CTRL, MCR_DTR_RTS | MCR_LOOPBACK);
+    let bytes = [b'x'; 2 * BURST];
+    assert_eq!(write_bytes(&mut m, mode, &bytes), 2);
+    assert_eq!(m.overruns, 0);
 }
 
 #[test]
@@ -370,19 +398,4 @@ fn mode_round_trips_through_u8() {
         assert_eq!(Mode::from_u8(mode.to_u8()), mode);
     }
     assert_eq!(Mode::from_u8(0xff), Mode::Absent);
-}
-
-#[test]
-fn a_transmitter_that_never_empties_is_given_up_on() {
-    // A wedged UART: the bounded wait ends in `Stuck` (after exactly the
-    // allowed reads) instead of spinning forever, having written nothing.
-    let (mut m, mode) = ready(0xc0);
-    m.stuck = true;
-    m.status_reads = 0;
-    assert_eq!(write_waiting(&mut m, mode, b"hello", 100), Err(Stuck));
-    assert_eq!(m.status_reads, 100);
-    assert!(m.tx.is_empty());
-    assert_eq!(write_waiting(&mut m, Mode::Bytes, b"x", 3), Err(Stuck));
-    // Absent never waits.
-    assert_eq!(write_waiting(&mut m, Mode::Absent, b"x", 0), Ok(0));
 }

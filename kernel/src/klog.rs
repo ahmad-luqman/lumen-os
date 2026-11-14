@@ -37,24 +37,24 @@ static LOGGER: KernelLogger = KernelLogger;
 static LINE_LOCK: SpinLock<()> = SpinLock::new(());
 
 /// Run `f` holding the log's line lock, so no log line (or other serial
-/// write) lands in the middle of what it does. `f` must not log, write
-/// through [`LockedSerial`], `kassert!` or `ktest::diag`: they take the same
-/// lock (a CPU re-locking it hangs).
+/// write) lands in the middle of what it does. `f` must not re-take it: no
+/// logging, [`LockedSerial`], `kassert!` or `ktest::diag` inside (a hang
+/// today; a crash report once `SpinLock` detects re-locks, #60).
 pub fn with_line_lock<R>(f: impl FnOnce() -> R) -> R {
     let _line = LINE_LOCK.lock();
     f()
 }
 
-/// Serial output for everything but the logger itself and the crash
-/// reporter: each write (a whole `write!`) is made holding the line lock,
-/// in FIFO bursts.
+/// Serial output for the serial shell, the ktest runner and the `crash`
+/// command (the logger holds the line lock itself; the crash reporter
+/// writes byte by byte without it): each write (a whole `write!`) is made
+/// holding the line lock, in FIFO bursts.
 #[derive(Clone, Copy, Default)]
 pub struct LockedSerial;
 
 impl Write for LockedSerial {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        with_line_lock(|| serial::burst_bytes(s.as_bytes()));
-        Ok(())
+        with_line_lock(|| Burst.write_str(s))
     }
 
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
@@ -67,9 +67,16 @@ struct Burst;
 
 impl Write for Burst {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        serial::burst_bytes(s.as_bytes());
+        burst_held(s.as_bytes());
         Ok(())
     }
+}
+
+/// How the log writes serial, with the line lock held (the caller's job):
+/// in bursts (`serial::burst_bytes`); the waits (for the loopback ktest,
+/// which goes through here to check the logger's own path).
+pub(crate) fn burst_held(bytes: &[u8]) -> usize {
+    serial::burst_bytes(bytes)
 }
 
 impl Log for KernelLogger {

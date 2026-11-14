@@ -106,7 +106,7 @@ history, tab completion, pipes, live system views and a scripting language.
 | Pipes: text (`dmesg \| grep time`) and structured records from system tables (`irqs \| where count > 0 \| sort count \| first 3`) | `cargo:lumen-shell` (pipeline engine), `scenario:test_shell::test_pipe_text`, `scenario:test_shell::test_where_sort_first` |
 | Scripting: a `rhai` REPL and `.rhai` scripts, with OS functions exposed (`cpus()`, `mem()`, `trace()`, `draw_*`) | `scenario:test_script::test_rhai_eval` (`rhai 'cpus().len()'` prints 4 under `-smp 4`), `scenario:test_script::test_script_draws_golden` |
 | Demos: a Mandelbrot set in fixed-point math, rendered by every CPU in parallel; Conway's Game of Life | `scenario:test_demo::test_mandelbrot_golden`, `ktest:lumen_kernel::demo::every_cpu_rendered_rows`, `scenario:test_demo::test_life_glider_golden` |
-| Debug aids: a CPU that re-locks a `SpinLock` it already holds gets a crash report instead of hanging; serial sends 16-byte FIFO bursts and checks that the UART is present | `scenario:test_crash::test_spinlock_relock_is_reported`, `ktest:lumen_kernel::arch::x86_64::serial::fifo_burst_round_trip`, `ktest:lumen_kernel::arch::x86_64::serial::presence_detected` |
+| Debug aids: a CPU that re-locks a `SpinLock` it already holds gets a crash report instead of hanging; serial sends FIFO bursts (15 bytes, one slot short of the FIFO) and checks that the UART is present | `scenario:test_crash::test_spinlock_relock_is_reported`, `ktest:lumen_kernel::arch::x86_64::serial::fifo_burst_round_trip`, `ktest:lumen_kernel::arch::x86_64::serial::presence_detected` |
 
 ## M3: Devices and sound
 

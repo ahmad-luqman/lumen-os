@@ -1,10 +1,11 @@
 # Features: serial. See tests/features/README.md for the format.
 
 [[feature]]
-name = "Serial output in 16-byte FIFO bursts under the log's line lock (one wait for an empty transmit FIFO per burst, newlines as CR LF), byte by byte for the crash reporter; a UART that never empties is dropped"
+name = "Serial output in 15-byte FIFO bursts through the logger's path (one wait for an empty transmit FIFO per burst, newlines as CR LF), byte by byte for the crash reporter's writer; a burst and a lock-free byte after the same check fit the FIFO (model)"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::arch::x86_64::serial::fifo_burst_round_trip",
+    "ktest:lumen_kernel::arch::x86_64::serial::leaving_loopback_restores_the_modem_control",
     "cargo:lumen-uart",
 ]
 

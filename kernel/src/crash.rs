@@ -196,6 +196,9 @@ fn enter(vector: u64, rip: u64) {
             STOPPING.store(true, Ordering::SeqCst);
             stop_others(me);
             STOPPING.store(false, Ordering::SeqCst);
+            // Again: a CPU in the loopback ktest may have entered loopback
+            // after the first call, then been stopped there.
+            arch::serial::leave_loopback();
         }
         // Another CPU is reporting: this is its stop NMI, or a crash of our
         // own that its report must not be mixed with (it names it).
