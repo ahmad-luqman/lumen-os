@@ -95,10 +95,11 @@ pub fn days_in_month(year: u16, month: u8) -> u8 {
 pub fn decode(r: &Registers) -> Result<DateTime, DecodeError> {
     let binary = r.status_b & STATUS_B_BINARY != 0;
     let value = |b: u8| if binary { Ok(b) } else { from_bcd(b) };
-    let pm = r.status_b & STATUS_B_24H == 0 && r.hours & PM != 0;
-    let mut hour = value(if r.status_b & STATUS_B_24H == 0 { r.hours & !PM } else { r.hours })?;
-    if r.status_b & STATUS_B_24H == 0 {
+    let twelve_hour = r.status_b & STATUS_B_24H == 0;
+    let mut hour = value(if twelve_hour { r.hours & !PM } else { r.hours })?;
+    if twelve_hour {
         // 12-hour: 12 AM is midnight, 12 PM noon.
+        let pm = r.hours & PM != 0;
         if !(1..=12).contains(&hour) {
             return Err(DecodeError::OutOfRange);
         }
@@ -113,9 +114,9 @@ pub fn decode(r: &Registers) -> Result<DateTime, DecodeError> {
         Some(c) => value(c)?,
         None => 20,
     };
-    let year = u16::from(century) * 100 + u16::from(value(r.year)?);
+    let year_in_century = value(r.year)?;
     let dt = DateTime {
-        year,
+        year: u16::from(century) * 100 + u16::from(year_in_century),
         month: value(r.month)?,
         day: value(r.day)?,
         hour,
@@ -127,7 +128,7 @@ pub fn decode(r: &Registers) -> Result<DateTime, DecodeError> {
         && dt.hour < 24
         && dt.minute < 60
         && dt.second < 60
-        && value(r.year)? < 100;
+        && year_in_century < 100;
     if valid { Ok(dt) } else { Err(DecodeError::OutOfRange) }
 }
 

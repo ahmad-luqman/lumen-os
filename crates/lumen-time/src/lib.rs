@@ -315,7 +315,7 @@ pub fn median(samples: &mut [u64]) -> Option<u64> {
 /// sampled over a span: `ticks` in all, `idle` of them landing on its idle
 /// thread. 0 for no ticks; idle ticks past `ticks` count as all idle.
 pub fn busy_percent(ticks: u64, idle: u64) -> u64 {
-    percent(ticks - idle.min(ticks), ticks)
+    percent(ticks.saturating_sub(idle), ticks)
 }
 
 /// `part` of `whole` in whole percent, rounded (0 for an empty whole; a

@@ -442,7 +442,7 @@ fn unexpected(frame: &TrapFrame) {
     }
 }
 
-/// Called by `lumen_isr_common` for every vector, which it first counts
+/// Called by `lumen_isr_common` for every vector; counts it first
 /// ([`vector_count`]). CPU exceptions are traced
 /// and fatal (bar #BP). Device interrupts are never fatal: the timer and
 /// spurious interrupts are counted, not traced (at 1 kHz they would flood

@@ -29,6 +29,15 @@ impl fmt::Display for Bytes {
     }
 }
 
+/// A physical frame's size.
+const FRAME_BYTES: u64 = 4096;
+
+/// How busy `cpu` was over `ticks` scheduler ticks, `idle` of them idle:
+/// `37%`, or `-` if its scheduler isn't running.
+fn busy_text(cpu: usize, ticks: u64, idle: u64) -> String {
+    if sched::running_on(cpu) { alloc::format!("{}%", busy_percent(ticks, idle)) } else { String::from("-") }
+}
+
 /// The CPUs online (index, local APIC id).
 fn online() -> impl Iterator<Item = (usize, u32)> {
     (0..MAX_CPUS).filter_map(|c| crate::smp::online_lapic_id(c).map(|id| (c, id)))
@@ -50,11 +59,8 @@ pub fn cpus(ctx: &mut Ctx<'_>, _: &[String]) {
     for (cpu, apic) in online() {
         let homed = threads.iter().filter(|th| th.cpu == cpu).count();
         let c = sched::cpu_ticks(cpu);
-        let (running, busy) = if sched::running_on(cpu) {
-            ("running", alloc::format!("{}%", busy_percent(c.ticks, c.idle)))
-        } else {
-            ("stopped", String::from("-"))
-        };
+        let running = if sched::running_on(cpu) { "running" } else { "stopped" };
+        let busy = busy_text(cpu, c.ticks, c.idle);
         let _ = writeln!(t, "  {cpu:>3}  {apic:>4}  {running:<9}  {:<10}  {busy:>4}  {homed:>7}", c.ticks);
     }
     emit(ctx, &t);
@@ -62,7 +68,6 @@ pub fn cpus(ctx: &mut Ctx<'_>, _: &[String]) {
 
 /// `mem`: physical frames, the heap and kernel stacks.
 pub fn mem(ctx: &mut Ctx<'_>, _: &[String]) {
-    const FRAME: u64 = 4096;
     let frames = crate::mm::frame::counts();
     let heap = crate::mm::heap::stats();
     let mut kinds: Vec<(&'static str, usize, u64)> = Vec::new();
@@ -82,8 +87,8 @@ pub fn mem(ctx: &mut Ctx<'_>, _: &[String]) {
     let _ = writeln!(
         t,
         "  frames  {} of {} used ({} frames of {owned} free, 4 KiB each)",
-        Bytes((owned - free) * FRAME),
-        Bytes(owned * FRAME),
+        Bytes((owned - free) * FRAME_BYTES),
+        Bytes(owned * FRAME_BYTES),
         free
     );
     let _ = writeln!(
@@ -248,7 +253,7 @@ fn render(frame: u64, prev: &Sample, now: &Sample, ansi: bool) -> String {
     for &(cpu, _) in &online {
         let (p, n) = (prev.cpus[cpu], now.cpus[cpu]);
         let (dt, di) = (n.ticks - p.ticks, n.idle - p.idle);
-        let busy = if sched::running_on(cpu) { alloc::format!("{}%", busy_percent(dt, di)) } else { "-".into() };
+        let busy = busy_text(cpu, dt, di);
         let _ = writeln!(t, "  {cpu:>3}  {busy:>4}  {:>7}", per_second(dt, span));
     }
     // Interrupts per second, the vectors that took any.
@@ -257,14 +262,12 @@ fn render(frame: u64, prev: &Sample, now: &Sample, ansi: bool) -> String {
     for v in 32..256 {
         let d = now.vectors[v] - prev.vectors[v];
         if d > 0 {
-            let _ = write!(t, " {} {}", idt::vector_use(v as u8), per_second(d, span));
-            let _ = write!(t, ",");
+            let sep = if any { "," } else { "" };
+            let _ = write!(t, "{sep} {} {}", idt::vector_use(v as u8), per_second(d, span));
             any = true;
         }
     }
-    if any {
-        t.pop();
-    } else {
+    if !any {
         t.push_str(" none");
     }
     t.push('\n');
@@ -276,8 +279,8 @@ fn render(frame: u64, prev: &Sample, now: &Sample, ansi: bool) -> String {
         Bytes(heap.used as u64),
         Bytes(heap.size as u64),
         heap.live,
-        Bytes((frames.owned - frames.free) as u64 * 4096),
-        Bytes(frames.owned as u64 * 4096)
+        Bytes((frames.owned - frames.free) as u64 * FRAME_BYTES),
+        Bytes(frames.owned as u64 * FRAME_BYTES)
     );
     // Threads: each one's share of its CPU's ticks in the span.
     let _ = writeln!(t, "  thread            id  cpu  state     cpu%");
@@ -328,11 +331,13 @@ crate::ktest!(
             let mut lines = console.text.lines();
             let header = lines.next().unwrap_or("");
             let rows = lines.count();
-            if !(header.starts_with(&alloc::format!("{name}: ")) && (rows > 0 || name == "date")) {
+            let has_header = header.starts_with(&alloc::format!("{name}: "));
+            let has_rows = rows > 0 || name == "date";
+            if !(has_header && has_rows) {
                 crate::ktest::diag(format_args!("{name}: header {header:?}, {rows} rows"));
             }
-            kassert!(header.starts_with(&alloc::format!("{name}: ")));
-            kassert!(rows > 0 || name == "date");
+            kassert!(has_header);
+            kassert!(has_rows);
         }
         Ok(())
     }

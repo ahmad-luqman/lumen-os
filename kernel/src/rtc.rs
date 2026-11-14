@@ -52,13 +52,12 @@ impl fmt::Display for RtcError {
 /// read and each set of registers, not across the wait (it turns interrupts
 /// off).
 pub fn now() -> Result<DateTime, RtcError> {
-    let read = |reg| cmos::read(reg);
     let wait_ready = || {
         let deadline = crate::time::now_ns() + UPDATE_WAIT_NS;
         loop {
             let status_a = {
                 let _cmos = CMOS.lock();
-                read(STATUS_A)
+                cmos::read(STATUS_A)
             };
             if status_a & rtc::STATUS_A_UIP == 0 {
                 return true;
@@ -72,14 +71,14 @@ pub fn now() -> Result<DateTime, RtcError> {
     let registers = || {
         let _cmos = CMOS.lock();
         Registers {
-            seconds: read(SECONDS),
-            minutes: read(MINUTES),
-            hours: read(HOURS),
-            day: read(DAY),
-            month: read(MONTH),
-            year: read(YEAR),
+            seconds: cmos::read(SECONDS),
+            minutes: cmos::read(MINUTES),
+            hours: cmos::read(HOURS),
+            day: cmos::read(DAY),
+            month: cmos::read(MONTH),
+            year: cmos::read(YEAR),
             century: None,
-            status_b: read(STATUS_B),
+            status_b: cmos::read(STATUS_B),
         }
     };
     let r = rtc::read_stable(wait_ready, registers, TRIES).ok_or(RtcError::Unsteady)?;
