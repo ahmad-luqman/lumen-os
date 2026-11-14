@@ -254,30 +254,45 @@ crate::ktest!(
         // CPUs 0 and 1 hammer one lock together with `lock` and `try_lock`:
         // they really contend (some `try_lock` fails), every critical
         // section sees the lock held by its own CPU, and no increment is
-        // lost (mutual exclusion).
+        // lost (mutual exclusion). Each does at least `ROUNDS` rounds, then
+        // goes on until either has seen a `try_lock` fail: under KVM the
+        // host can stop one vCPU for longer than the other's whole run
+        // (#85), so a fixed count needn't overlap. `CONTENTION_NS` bounds
+        // that, well inside the test deadline the waits below use.
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::{AtomicBool, AtomicU64};
         const ROUNDS: u64 = 20_000;
+        const CONTENTION_NS: u64 = 2_000_000_000;
         static HOT: SpinLock<u64> = SpinLock::new(0);
         static MISSES: AtomicU64 = AtomicU64::new(0);
         static ENTERED_THERE: AtomicU64 = AtomicU64::new(0);
+        /// Some `try_lock` found the lock held, on either CPU.
+        static CONTENDED: AtomicBool = AtomicBool::new(false);
+        /// When both stop waiting for contention (`now_ns`), set before `GO`.
+        static UNTIL: AtomicU64 = AtomicU64::new(0);
         /// CPU 1 is in its job; both start hammering on `GO`.
         static READY: AtomicBool = AtomicBool::new(false);
         static GO: AtomicBool = AtomicBool::new(false);
         static DONE: AtomicBool = AtomicBool::new(false);
-        fn hammer() -> u64 {
-            let mut entered = 0;
-            for i in 0..ROUNDS {
+        /// The rounds this CPU entered the lock in, and all its rounds.
+        fn hammer() -> (u64, u64) {
+            let until = UNTIL.load(Ordering::Relaxed);
+            let (mut entered, mut i) = (0, 0);
+            while i < ROUNDS || (!CONTENDED.load(Ordering::Relaxed) && crate::time::now_ns() < until) {
                 let guard = if i % 2 == 0 { Some(HOT.lock()) } else { HOT.try_lock() };
-                if let Some(mut g) = guard {
-                    if !HOT.held_here() {
-                        MISSES.fetch_add(1, Ordering::Relaxed);
+                match guard {
+                    Some(mut g) => {
+                        if !HOT.held_here() {
+                            MISSES.fetch_add(1, Ordering::Relaxed);
+                        }
+                        *g += 1;
+                        entered += 1;
                     }
-                    *g += 1;
-                    entered += 1;
+                    None => CONTENDED.store(true, Ordering::Relaxed),
                 }
+                i += 1;
             }
-            entered
+            (entered, i)
         }
         fn on_cpu_1() {
             READY.store(true, Ordering::Release);
@@ -289,16 +304,22 @@ crate::ktest!(
                 }
                 core::hint::spin_loop();
             }
-            ENTERED_THERE.store(hammer(), Ordering::Relaxed);
+            ENTERED_THERE.store(hammer().0, Ordering::Relaxed);
             DONE.store(true, Ordering::Release);
         }
         crate::smp::run_on_test(1, on_cpu_1)?;
         kassert!(crate::smp::job_reached(1, || READY.load(Ordering::Acquire)));
+        let start = crate::time::now_ns();
+        UNTIL.store(start + CONTENTION_NS, Ordering::Relaxed);
         GO.store(true, Ordering::Release);
-        let entered_here = hammer();
+        let (entered_here, rounds_here) = hammer();
         kassert!(crate::smp::job_reached(1, || DONE.load(Ordering::Acquire)));
         let there = ENTERED_THERE.load(Ordering::Relaxed);
-        kassert!(entered_here + there < 2 * ROUNDS); // some `try_lock` found it held
+        crate::ktest::diag(format_args!(
+            "cpu 0: {rounds_here} rounds in {} us",
+            (crate::time::now_ns() - start) / 1000
+        ));
+        kassert!(CONTENDED.load(Ordering::Relaxed)); // some `try_lock` found it held
         kassert_eq!(MISSES.load(Ordering::Relaxed), 0);
         kassert_eq!(*HOT.lock(), entered_here + there);
         Ok(())
