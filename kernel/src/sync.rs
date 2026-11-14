@@ -255,11 +255,13 @@ crate::ktest!(
         // they really contend (some `try_lock` fails), every critical
         // section sees the lock held by its own CPU, and no increment is
         // lost (mutual exclusion). Each counts its `ROUNDS` rounds from when
-        // either first sees a `try_lock` fail, so they're spent together:
-        // under KVM the host can stop one vCPU for longer than the other's
-        // whole run (#85), and counted from the start they needn't overlap
-        // (or overlap in a handful of rounds, leaving the exclusion checks
-        // nothing to catch). Waiting for that first contention is bounded by
+        // either first sees a `try_lock` fail, so both are hammering when
+        // they start: under KVM the host can stop one vCPU for longer than
+        // the other's whole run (#85), and counted from the start they
+        // needn't overlap (or overlap in a handful of rounds, leaving the
+        // exclusion checks little to catch). A vCPU stopped after that
+        // still leaves the other to finish alone: the test then passes on
+        // fewer overlapping rounds rather than failing. Waiting for that first contention is bounded by
         // `CONTENTION_NS`, well inside the 10 s `DONE` wait below
         // (`sched::TEST_DEADLINE_NS`).
         use crate::{kassert, kassert_eq};
@@ -274,8 +276,8 @@ crate::ktest!(
         static CONTENDED: AtomicBool = AtomicBool::new(false);
         /// CPU 1 is in its job.
         static READY: AtomicBool = AtomicBool::new(false);
-        /// 0 until both start hammering; then the `now_ns` past which
-        /// neither waits any longer for contention.
+        /// 0 until CPU 0 gives the start signal, which is the `now_ns`
+        /// past which neither waits any longer for contention.
         static GO_UNTIL: AtomicU64 = AtomicU64::new(0);
         static DONE: AtomicBool = AtomicBool::new(false);
         /// The rounds this CPU entered the lock in, and all its rounds.
@@ -333,8 +335,9 @@ crate::ktest!(
         // stopped (or came after the deadline); both with millions would
         // be a broken lock.
         crate::ktest::diag(format_args!(
-            "cpu 0: {rounds_here} rounds in {ran_us} us; cpu 1: {}",
-            if done { alloc::format!("{} rounds", ROUNDS_THERE.load(Ordering::Relaxed)) } else { "not done".into() }
+            "cpu 0: {rounds_here} rounds in {ran_us} us; cpu 1: {} rounds{}",
+            ROUNDS_THERE.load(Ordering::Relaxed),
+            if done { "" } else { " (not done)" }
         ));
         kassert!(done);
         let there = ENTERED_THERE.load(Ordering::Relaxed);
