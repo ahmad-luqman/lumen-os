@@ -17,6 +17,7 @@ pub mod pic;
 pub mod pit;
 pub mod port;
 pub mod qemu;
+pub mod reset;
 pub mod serial;
 pub mod stacks;
 
