@@ -2,7 +2,8 @@
 //!
 //! QEMU exits with `(code << 1) | 1`, so it can never report 0. The harness
 //! treats exactly `Success` as a pass and everything else (including a clean
-//! QEMU quit or a triple-fault reset) as a failure.
+//! QEMU quit or a triple-fault reset) as a failure, but for the power-off
+//! scenario, which passes on 0 with a `guest-shutdown` QMP event.
 //!
 //! Only used when the kernel command line contains `lumen.qemu_exit`; on real
 //! hardware nothing is written to the port.

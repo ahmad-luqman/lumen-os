@@ -7,6 +7,7 @@ both consoles."""
 
 import re
 
+import pytest
 from lumen_harness.qemu import Machine
 from lumen_harness.screen import PROMPT, expect_screen, read_screen
 
@@ -55,40 +56,67 @@ def test_echo(boot):
 BOOTING = r"INFO  boot: Lumen \d+\.\d+\.\d+ \(x86_64\) booting"
 
 
-def test_reboot_boots_again(boot):
-    # `reboot` resets the machine through port 0xcf9 (no fallback needed:
-    # their warnings would say so) and it boots to the shells again. QEMU
-    # runs without -no-reboot here, so the reset doesn't end it.
-    m = boot("qemutest", reboot=True)
+def reboots(m: Machine, method: str) -> None:
+    """Run `reboot` in the serial shell of `m` (booted with reboot=True) and
+    check it reset by `method` (its log line; no later method's) and booted
+    to the shells again."""
     m.expect(BOOTING, 60)
     shells_ready = m.expect(SHELLS, 60)
     m.expect(PROMPT, 60)
-    qmp = m.qmp()
+    m.qmp()  # connected before the reset, so it gets the RESET event
     m.send_line("reboot")
     m.expect(r"reboot: restarting\n", 10)
-    m.expect(r"INFO  power: rebooting: reset through port 0xcf9\n", 10)
-    assert qmp.wait_event("RESET", 30)["data"]["reason"] == "guest-reset"
+    m.expect(rf"INFO  power: rebooting: {method}\n", 10)
+    assert m.wait_event("RESET", 30)["data"]["reason"] == "guest-reset"
     m.expect(BOOTING, 120)
     m.expect(SHELLS, 60)
     out = m.output
-    assert len(re.findall(BOOTING, out)) == 2
-    assert "didn't reset the machine" not in out[shells_ready.end() :]
+    banners = list(re.finditer(BOOTING, out))
+    assert len(banners) == 2
+    # QEMU reports every guest reset the same way (guest-reset), so the
+    # method that did it is told apart by the log: no later method started.
+    first_boot = out[shells_ready.end() : banners[1].start()]
+    assert "INFO  power: rebooting:" in first_boot
+    assert len(re.findall(r"INFO  power: rebooting: ", first_boot)) == 1, first_boot
+    assert "didn't reset the machine" not in first_boot
     assert m.proc is not None and m.proc.poll() is None, "QEMU ended instead of rebooting"
+
+
+def test_reboot_boots_again(boot):
+    # `reboot` resets the machine through port 0xcf9 and it boots to the
+    # shells again. QEMU runs without -no-reboot here, so the reset doesn't
+    # end it.
+    reboots(boot("qemutest", reboot=True), "reset through port 0xcf9")
+
+
+@pytest.mark.parametrize(
+    ("first", "method"),
+    [("8042", "pulsing the 8042's reset line"), ("triple", "triple fault")],
+    ids=["8042", "triple"],
+)
+def test_reboot_fallbacks_boot_again(boot, first, method):
+    # The fallbacks, started with `lumen.reboot=` (q35 always takes 0xcf9's
+    # reset, so they wouldn't run otherwise).
+    reboots(boot("qemutest", reboot=True, cmdline=f"lumen.reboot={first}"), method)
 
 
 def test_shutdown_powers_off(boot):
     # `shutdown` announces itself, enters ACPI S5 and QEMU exits because the
     # guest powered off: the SHUTDOWN event says `guest-shutdown` (a triple
     # fault under -no-reboot also ends QEMU with status 0, but its reason is
-    # `guest-reset`). Status 0 is a pass only here.
+    # `guest-reset`). Status 0 is a pass only here. OVMF leaves q35 in ACPI
+    # mode, so no switch to it is needed.
     m = shells(boot)
-    qmp = m.qmp()
+    m.qmp()  # connected before the power-off, so it gets the SHUTDOWN event
+    start = len(m.output)
     m.send_line("shutdown")
     m.expect(r"shutdown: powering off\n", 10)
     m.expect(r"INFO  power: powering off: ACPI S5, SLP_TYP 0/0 into PM1a control 0x604\n", 10)
-    assert qmp.wait_event("SHUTDOWN", 30)["data"] == {"guest": True, "reason": "guest-shutdown"}
+    assert m.wait_event("SHUTDOWN", 30)["data"] == {"guest": True, "reason": "guest-shutdown"}
     assert m.wait_exit(30) == 0
-    assert "can't power off" not in m.output
+    after = m.output[start:]
+    assert "can't power off" not in after
+    assert "ACPI mode" not in after
 
 
 def test_history_and_line_editing(boot):

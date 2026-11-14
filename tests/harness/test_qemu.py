@@ -50,6 +50,21 @@ def test_reboot_drops_no_reboot(tmp_path):
     assert "-no-reboot" in qemu_args(Machine(Path("x.iso"), tmp_path).options(Path("v.fd")))
 
 
+def test_machine_waits_for_events_with_scaled_timeouts(tmp_path, monkeypatch):
+    monkeypatch.setenv("LUMEN_TIMEOUT_SCALE", "3")
+    m = Machine(Path("x.iso"), tmp_path)
+    waits = []
+
+    class FakeQmp:
+        def wait_event(self, name, timeout):
+            waits.append((name, timeout))
+            return {"event": name}
+
+    m._qmp = FakeQmp()  # type: ignore[assignment]
+    assert m.wait_event("SHUTDOWN", 10) == {"event": "SHUTDOWN"}
+    assert waits == [("SHUTDOWN", 30)]
+
+
 def test_args_include_extra():
     args = qemu_args(opts(extra=["-smp", "4", "-device", "virtio-rng-pci"]))
     assert args[-4:] == ["-smp", "4", "-device", "virtio-rng-pci"]

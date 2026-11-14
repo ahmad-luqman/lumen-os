@@ -124,7 +124,9 @@ own PR that updates that doc first.
   with a timestamp (`[    0.139288]`, or `[    ?.??????]` before the TSC is
   calibrated): match the rest of the line, not its start.
 - **QEMU exit codes:** 33 pass, 35 test failure, 37 crash report; anything else
-  (including 0 from a triple fault with `-no-reboot`) is a failure.
+  (including 0 from a triple fault with `-no-reboot`) is a failure. The one
+  exception: 0 in the power-off scenario, with a QMP `SHUTDOWN` event whose
+  reason is `guest-shutdown` (a triple fault's is `guest-reset`).
 - **Golden images** live in `tests/golden/`. Re-record with `make golden` only
   when the change to the screen is intended, and open the PNG to check it.
 

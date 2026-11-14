@@ -3,7 +3,8 @@
 //! DSDT's `_S5_` sleep types), read once at boot.
 //!
 //! Limine gives the RSDP's physical address; `lumen_acpi` walks RSDP → XSDT
-//! (or RSDT) → MADT and HPET and checks every table it uses. Tables are
+//! (or RSDT) → MADT, HPET and FADT (and the FADT's DSDT) and checks every
+//! table it uses. Tables are
 //! read through [`Firmware`], which only reads memory that holds firmware
 //! data: memory the memory map gives to firmware (`acpi-*` and `reserved`
 //! entries, outside the HHDM) is mapped uncached with `map_mmio` (a read
@@ -14,13 +15,13 @@
 //! is copied into [`Info`]; nothing keeps pointing into firmware memory.
 //!
 //! No ACPI, or broken tables, is not fatal: boot goes on without the
-//! information, with a warning.
+//! information, with a warning (a broken FADT or DSDT only costs the
+//! power-off, kept with its reason for `shutdown`).
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
 
-use alloc::string::{String, ToString};
 use limine::memory_map::EntryType;
 use log::{debug, info, warn};
 use lumen_acpi::{
@@ -52,7 +53,7 @@ pub struct Info {
     pub has_8259_pics: bool,
     pub hpet: Option<Hpet>,
     /// How to power off (ACPI S5), or why we can't.
-    pub power_off: Result<PowerOff, String>,
+    pub power_off: Result<PowerOff, Failure>,
 }
 
 /// What entering ACPI S5 (soft off) takes.
@@ -208,7 +209,8 @@ fn in_firmware_memory(addr: u64, end: u64) -> bool {
 }
 
 /// An ACPI failure, with the reason the read it names failed, if one did.
-struct Failure {
+#[derive(Clone, Copy, Debug)]
+pub struct Failure {
     error: Error,
     cause: Option<ReadError>,
 }
@@ -235,7 +237,7 @@ impl fmt::Display for Failure {
     }
 }
 
-/// Read the MADT and HPET, log a summary, and keep the result for [`info`].
+/// Read the MADT, HPET, FADT and DSDT, log a summary, and keep the result for [`info`].
 /// Needs the heap and `map_mmio` (after `mm::init`). Panics if called
 /// twice.
 pub fn init() {
@@ -280,18 +282,20 @@ fn discover(fw: &mut Firmware, rsdp: u64) -> Result<Info, Error> {
     let fadt = acpi.find(Signature::FADT).and_then(Fadt::parse);
     let fw = acpi.into_mem();
     let hpet = hpet.inspect_err(|&e| warn!(target: "acpi", "no usable HPET: {}", Failure::new(e, &mut *fw))).ok();
-    let power_off = fadt.and_then(|fadt| power_off(&mut *fw, fadt)).map_err(|e| Failure::new(e, &mut *fw).to_string());
+    let power_off = fadt.and_then(|fadt| power_off(&mut *fw, fadt)).map_err(|e| Failure::new(e, &mut *fw));
     match &power_off {
         Ok(p) => debug!(
             target: "acpi",
             "S5: PM1a control {:#x}, PM1b control {:?}, SLP_TYP {}/{}, DSDT at {:#x}",
-            p.fadt.pm1a_control,
-            p.fadt.pm1b_control,
+            p.fadt.pm1a_control.port(),
+            p.fadt.pm1b_control.map(|c| c.port()),
             p.s5.a,
             p.s5.b,
             p.fadt.dsdt
         ),
-        Err(e) => debug!(target: "acpi", "no ACPI power-off: {e}"),
+        // A warning: `Failure::new` took the reason for a failed read, so
+        // `warn_unreported` won't warn about it again.
+        Err(e) => warn!(target: "acpi", "no ACPI power-off: {e}"),
     }
     let info = Info {
         cpus: madt.cpus().collect(),
@@ -329,12 +333,7 @@ fn discover(fw: &mut Firmware, rsdp: u64) -> Result<Info, Error> {
 
 /// Read the DSDT `fadt` points at and find its `_S5_` sleep types.
 fn power_off(fw: &mut Firmware, fadt: Fadt) -> Result<PowerOff, Error> {
-    let dsdt = Sdt::read(fw, fadt.dsdt)?;
-    let found = dsdt.signature();
-    if found != Signature::DSDT {
-        return Err(Error::WrongSignature { expected: Signature::DSDT, found });
-    }
-    let s5 = lumen_acpi::find_s5(dsdt.body())?;
+    let s5 = SleepType::s5_from_dsdt(Sdt::read(fw, fadt.dsdt)?)?;
     Ok(PowerOff { fadt, s5 })
 }
 
@@ -558,7 +557,7 @@ crate::ktest!(
             overrides: Vec::new(),
             has_8259_pics: false,
             hpet: None,
-            power_off: Err(String::new()),
+            power_off: Err(Failure { error: Error::NoDsdt, cause: None }),
         };
         let ids: Vec<u32> = info.enabled_cpus().map(|c| c.apic_id).collect();
         kassert_eq!(ids.as_slice(), &[0, 3]);
@@ -576,8 +575,8 @@ crate::ktest!(
             crate::ktest::diag(format_args!("{e}"));
             "no ACPI power-off"
         })?;
-        kassert_eq!((p.fadt.pm1a_control, p.fadt.pm1b_control), (0x604, None));
-        kassert_eq!((p.s5.a, p.s5.b), (0, 0));
+        kassert_eq!((p.fadt.pm1a_control.port(), p.fadt.pm1b_control), (0x604, None));
+        kassert_eq!((p.s5.a.get(), p.s5.b.get()), (0, 0));
         Ok(())
     }
 );

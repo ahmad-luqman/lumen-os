@@ -1,17 +1,22 @@
 //! Resetting the machine and powering it off, at the register level. The
-//! order to try them in, and the waits between, are `crate::power`'s.
+//! order to try them in, and the waits between, are `crate::power`'s. The
+//! ACPI registers are written only through the ports a FADT named:
+//! `lumen_acpi`'s [`Pm1Control`] and [`AcpiEnable`] can't be made
+//! otherwise, and [`SlpTyp`] is checked to fit its field.
 
 use super::i8042;
 use super::port::{inb, inw, outb, outw};
 use core::arch::asm;
+use lumen_acpi::{AcpiEnable, Pm1Control, SlpTyp};
 
 /// The reset control register (Intel chipsets, and QEMU's q35 and PIIX).
 const RESET_CONTROL: u16 = 0xcf9;
-/// Its bits: system reset (with `CPU_RESET`, a full platform reset rather
-/// than an INIT), the reset itself (taken on a 0 to 1 change), and a full
-/// reset (power cycled).
+/// Bit 1: a system (platform) reset, not just an INIT of the CPU, when
+/// `CPU_RESET` fires.
 const SYSTEM_RESET: u8 = 1 << 1;
+/// Bit 2: the reset itself, taken when the bit goes from 0 to 1.
 const CPU_RESET: u8 = 1 << 2;
+/// Bit 3: a full reset (power cycled), with `SYSTEM_RESET`.
 const FULL_RESET: u8 = 1 << 3;
 
 /// Reset through port 0xCF9: a full reset. Returns if nothing happened.
@@ -42,9 +47,10 @@ pub fn keyboard_controller() {
     i8042::write_command(PULSE_RESET);
 }
 
-/// Load an empty IDT and take an exception: with no handler for it, nor
-/// for the #DF that follows, the CPU shuts down (a triple fault), which
-/// resets the machine.
+/// Load an empty IDT (limit 0) and take `int3`: delivering vector 3 runs
+/// past the IDT's limit, a #GP; delivering the #GP fails the same way, a
+/// #DF; delivering the #DF fails too, and the CPU shuts down (a triple
+/// fault), which resets the machine.
 pub fn triple_fault() -> ! {
     #[repr(C, packed(2))]
     struct Empty {
@@ -63,34 +69,40 @@ pub fn triple_fault() -> ! {
     }
 }
 
-/// The PM1 control register's fields.
+/// PM1 control bit 0, SCI_EN: the chipset is in ACPI mode.
 const SCI_EN: u16 = 1 << 0;
+/// Where PM1 control's 3-bit SLP_TYP field starts.
 const SLP_TYP_SHIFT: u16 = 10;
+/// PM1 control bits 10-12: the sleep type to enter.
 const SLP_TYP: u16 = 0b111 << SLP_TYP_SHIFT;
+/// PM1 control bit 13, SLP_EN: enter the sleep type in SLP_TYP.
 const SLP_EN: u16 = 1 << 13;
 
-/// Whether the PM1 control register at `port` has SCI_EN set (the
-/// chipset is in ACPI mode).
-pub fn acpi_mode(port: u16) -> bool {
-    // SAFETY: `port` is the PM1a control register the FADT names; reading
-    // it has no side effects.
-    unsafe { inw(port) & SCI_EN != 0 }
+/// Whether the PM1 control register `control` has SCI_EN set (the chipset
+/// is in ACPI mode).
+pub fn acpi_mode(control: Pm1Control) -> bool {
+    // SAFETY: `control` is a PM1 control register a FADT named (only
+    // `Fadt::parse` makes one); reading it has no side effects.
+    unsafe { inw(control.port()) & SCI_EN != 0 }
 }
 
-/// Ask the firmware for ACPI mode: write `value` (the FADT's ACPI_ENABLE)
-/// to its SMI command port.
-pub fn enable_acpi(smi_command: u16, value: u8) {
-    // SAFETY: the port and value are the FADT's, for exactly this.
-    unsafe { outb(smi_command, value) }
+/// Ask the firmware for ACPI mode: write the FADT's ACPI_ENABLE value to
+/// its SMI command port.
+pub fn enable_acpi(enable: AcpiEnable) {
+    // SAFETY: the port and value are a FADT's, for exactly this (only
+    // `Fadt::parse` makes an `AcpiEnable`).
+    unsafe { outb(enable.port(), enable.value()) }
 }
 
-/// Set the sleep type `typ` in the PM1 control register at `port`, then,
+/// Set the sleep type `typ` in the PM1 control register `control`, then,
 /// if `enter`, set SLP_EN (entering that sleep state). Other bits are kept.
-pub fn pm1_sleep(port: u16, typ: u8, enter: bool) {
-    // SAFETY: `port` is a PM1 control register the FADT names; this is how
-    // ACPI enters a sleep state (ACPI 6.5, 7.4.2 and 4.8.3.2.1).
+pub fn pm1_sleep(control: Pm1Control, typ: SlpTyp, enter: bool) {
+    // SAFETY: `control` is a PM1 control register a FADT named (only
+    // `Fadt::parse` makes one) and `typ` fits SLP_TYP; this is how ACPI
+    // enters a sleep state (ACPI 6.5, 4.8.3.2.1 and 7.4.2). Entering one
+    // may power the machine off, which the caller asked for.
     unsafe {
-        let v = (inw(port) & !(SLP_TYP | SLP_EN)) | (u16::from(typ & 7) << SLP_TYP_SHIFT);
-        outw(port, if enter { v | SLP_EN } else { v });
+        let v = (inw(control.port()) & !(SLP_TYP | SLP_EN)) | (u16::from(typ.get()) << SLP_TYP_SHIFT);
+        outw(control.port(), if enter { v | SLP_EN } else { v });
     }
 }

@@ -71,9 +71,14 @@ def test_waiting_for_an_event_ends():
     # QEMU closing the connection, or the time running out, without it.
     client, qemu = _client({"event": "RESET", "data": {}})
     qemu.close()
-    with pytest.raises(QmpError, match="closed"):
+    with pytest.raises(QmpError, match=r"closed while waiting for SHUTDOWN \(got \[.*RESET"):
         client.wait_event("SHUTDOWN", 5)
+    # After a timeout the client refuses to be used (its socket's file is
+    # unusable), rather than misreading what comes next.
     client, qemu = _client()
     with pytest.raises(QmpError, match="no SHUTDOWN event after 0.2s"):
         client.wait_event("SHUTDOWN", 0.2)
+    qemu.sendall(b'{"return": {}}\n')
+    with pytest.raises(QmpError, match="unusable: timed out waiting for SHUTDOWN"):
+        client.command("stop")
     qemu.close()

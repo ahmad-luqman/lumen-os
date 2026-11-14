@@ -31,12 +31,15 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
 from . import BUILD_DIR
 from .qmp import QmpClient, qcodes_for
 
 # isa-debug-exit: QEMU exits with (code << 1) | 1. Must match kernel qemu.rs.
+# Any other status fails a test; the only exception is 0 in the power-off
+# scenario, together with a SHUTDOWN event whose reason is guest-shutdown
+# (`Machine.wait_event`).
 EXIT_SUCCESS = (0x10 << 1) | 1  # 33
 EXIT_FAILURE = (0x11 << 1) | 1  # 35
 EXIT_CRASH = (0x12 << 1) | 1  # 37
@@ -164,8 +167,9 @@ class QemuOptions:
     trace: str = "cpu_reset,guest_errors"
     gdb: bool = False
     # False: `-no-reboot`, so a reset (a triple fault among them) ends QEMU
-    # with status 0, which the tests count as a failure. True: the machine
-    # resets and boots again (the reboot scenario).
+    # with status 0, which the tests count as a failure (but for an ACPI
+    # power-off, see EXIT_SUCCESS). True: the machine resets and boots again
+    # (the reboot scenarios).
     reboot: bool = False
     extra: list[str] = field(default_factory=list)
 
@@ -434,6 +438,13 @@ class Machine:
         a time (see `press`)."""
         for ch in text:
             self.press(qcodes_for(ch))
+
+    def wait_event(self, name: str, timeout: float = 30) -> dict[str, Any]:
+        """Wait for QEMU's QMP event `name` (e.g. `SHUTDOWN`), the timeout
+        scaled like `expect`'s. Connect (`qmp()`) before what makes it
+        happen: QEMU sends events only to clients already connected."""
+        wait, _ = self._scaled(timeout)
+        return self.qmp().wait_event(name, wait)
 
     def screendump(self, name: str) -> Path:
         """Save the current screen as PNG in the artifacts directory."""

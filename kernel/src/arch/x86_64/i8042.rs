@@ -39,6 +39,9 @@ pub fn write_data(byte: u8) {
 /// Write a controller command (call when `INPUT_FULL` is clear).
 pub fn write_command(command: u8) {
     // SAFETY: the keyboard driver is the 8042's only user, but for a
-    // reboot's reset pulse, after which nothing runs.
+    // reboot's reset pulse (`reset::keyboard_controller`), sent with
+    // interrupts off on its CPU; the other CPUs aren't stopped, but a byte
+    // the driver reads or writes meanwhile can only disturb the keyboard,
+    // which a reset is about to take away anyway.
     unsafe { outb(STATUS_COMMAND, command) }
 }

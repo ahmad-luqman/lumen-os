@@ -63,6 +63,9 @@ class QmpClient:
         self._file = sock.makefile("rwb")
         # Asynchronous events received and not yet taken by `wait_event`.
         self.events: list[dict[str, Any]] = []
+        # Why the connection can't be used any more (a read timed out part
+        # way, leaving the socket's file unusable), once it can't.
+        self._broken: str | None = None
 
     @classmethod
     def connect(cls, path: Path, timeout: float = 10) -> QmpClient:
@@ -86,6 +89,8 @@ class QmpClient:
         return client
 
     def _recv(self) -> dict[str, Any]:
+        if self._broken:
+            raise QmpError(f"QMP connection unusable: {self._broken}")
         line = self._file.readline()
         if not line:
             raise QmpError("QMP connection closed")
@@ -110,7 +115,8 @@ class QmpClient:
         """The first event called `name` (QEMU's, e.g. `SHUTDOWN` with its
         `data`), taking it and those before it off `events`; waits up to
         `timeout` seconds for it. Raises QmpError if the connection closes or
-        the time runs out first."""
+        the time runs out first; after a timeout the client is unusable (a
+        read that times out leaves the socket's file unusable)."""
         deadline = time.monotonic() + timeout
         while True:
             for i, event in enumerate(self.events):
@@ -118,14 +124,15 @@ class QmpClient:
                     del self.events[: i + 1]
                     return event
             remaining = deadline - time.monotonic()
-            # (A read that times out leaves the socket's file unusable, so a
-            # timeout ends the wait for good.)
             previous = self._sock.gettimeout()
             self._sock.settimeout(max(remaining, 0.001))
             try:
                 reply = self._recv()
             except TimeoutError:
-                raise QmpError(f"no {name} event after {timeout}s (got {self.events})") from None
+                self._broken = f"timed out waiting for {name}"
+                raise QmpError(f"no {name} event after {timeout:g}s (got {self.events})") from None
+            except QmpError as e:
+                raise QmpError(f"{e} while waiting for {name} (got {self.events})") from None
             finally:
                 self._sock.settimeout(previous)
             if "event" in reply:
