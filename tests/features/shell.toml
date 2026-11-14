@@ -67,17 +67,18 @@ tests = [
 ]
 
 [[feature]]
-name = "System commands, each a header and rows: `cpus` (each CPU online: its scheduler, ticks, how busy, threads), `mem` (frames, heap, kernel stacks), `irqs` (every I/O APIC input decoded, interrupts per vector), `dmesg` (the newest 16 KiB of log lines kept by the logger, as serial printed them); with `help`, `trace`, `uptime`, `clear` and `history`"
+name = "System commands, each a header and rows: `cpus` (each CPU online: its scheduler, ticks, how busy, threads), `mem` (frames, heap, kernel stacks), `irqs` (every I/O APIC input decoded, interrupts per vector), `dmesg` (the newest whole lines of the last 16 KiB of log kept by the logger, as serial printed them); with `help`, `trace`, `uptime`, `clear` and `history`"
 milestone = "M2"
 tests = [
     "scenario:test_shell::test_system_commands",
     "ktest:lumen_kernel::shell::sysinfo::system_commands_print_a_header_and_rows",
+    "ktest:lumen_kernel::sched::busy_and_idle_ticks_are_counted",
     "ktest:lumen_kernel::klog::log_lines_are_kept_for_dmesg",
     "cargo:lumen-trace",
 ]
 
 [[feature]]
-name = "`date` reads the CMOS RTC (waits out an update, two agreeing reads, BCD or binary, 12 or 24 hours) in UTC, within 2 s of the host's clock"
+name = "`date` reads the CMOS RTC (waits out an update, bounded; two agreeing reads; BCD or binary, 12 or 24 hours; a clock that lost power or is halted refused), in UTC under QEMU's `-rtc base=utc`, within 2 s of the host's clock at its one-second resolution"
 milestone = "M2"
 tests = [
     "scenario:test_shell::test_date_matches_host",
@@ -92,4 +93,5 @@ milestone = "M2"
 tests = [
     "scenario:test_shell::test_top_refreshes_and_quits",
     "ktest:lumen_kernel::shell::sysinfo::top_shows_a_frame_and_quits_on_q",
+    "ktest:lumen_kernel::sched::busy_and_idle_ticks_are_counted",
 ]
