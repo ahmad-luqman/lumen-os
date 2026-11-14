@@ -381,8 +381,9 @@ fn crash_relock() {
     let _ = writeln!(Out, "crash: locking the SpinLock at {:p} twice on cpu {}", &RELOCK, arch::cpu_index());
     let first = RELOCK.lock();
     let second = RELOCK.lock(); // the re-lock: panics here
-    // Only if `lock` handed the same lock out twice (a missed re-lock
-    // spins in `lock` instead, and the test times out).
+    // Only if `lock` handed the same lock out twice. A missed re-lock spins
+    // in `lock` instead: on CPU 0 serial goes quiet; from another CPU the
+    // shell says it hasn't finished.
     drop((second, first));
     let _ = writeln!(Out, "crash: SpinLock::lock returned while this cpu held it (mutual exclusion broken)");
 }

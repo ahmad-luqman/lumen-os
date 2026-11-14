@@ -11,7 +11,8 @@
 //! silent hang); [`SpinLock::lock`] panics instead, so the crash report
 //! names the lock, the CPU and the second caller. That is always a
 //! deadlock, never another thread waiting its turn: no thread switches
-//! while a lock is held (`sched::schedule` asserts it), so the holder is
+//! while a lock is held (`sched::schedule` asserts that no `push_off`
+//! section is open, and every guard holds one), so the holder is
 //! this CPU's own code, or the code an exception or NMI interrupted, and
 //! neither runs again until the second `lock` returns.
 
@@ -21,12 +22,13 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch;
 
-/// A test-and-set spinlock protecting a `T`. Interrupts are off while it is
-/// held (and while waiting for it).
+/// A spinlock protecting a `T`, whose word is its owner (a compare-and-swap
+/// takes it). Interrupts are off while it is held (and while waiting for it).
 pub struct SpinLock<T> {
     /// [`FREE`], or the holder's [`owner_id`]. Only the holder stores
-    /// anything but `FREE` here, so a CPU reads its own id exactly while it
-    /// holds the lock.
+    /// anything but `FREE` here, and a CPU never reads a value older than
+    /// its own last store (coherence), so it reads its own id exactly while
+    /// it holds the lock, even with `Relaxed` loads.
     owner: AtomicU32,
     value: UnsafeCell<T>,
 }
@@ -52,16 +54,15 @@ impl<T> SpinLock<T> {
     /// and this CPU, and its location is the caller's (`track_caller`).
     #[track_caller]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
-        // Interrupts off first: no timer switch or maskable handler on this
-        // CPU between reading the owner and taking the lock.
+        // Interrupts off first: the lock is never held with them on (no
+        // handler here can take it from under us), and nothing switches this
+        // thread between `owner_id()` and the compare-and-swap.
         let irq = arch::irq::push_off();
         let me = owner_id();
         loop {
             match self.owner.compare_exchange_weak(FREE, me, Ordering::Acquire, Ordering::Relaxed) {
                 Ok(_) => return SpinLockGuard { lock: self, _irq: irq },
-                Err(owner) if owner == me => {
-                    relocked(core::ptr::from_ref(self).addr(), core::any::type_name::<T>(), me - 1)
-                }
+                Err(owner) if owner == me => relocked(core::ptr::from_ref(self).addr(), core::any::type_name::<T>()),
                 // Held elsewhere (or a spurious failure): wait until it looks free.
                 Err(_) => {
                     while self.owner.load(Ordering::Relaxed) != FREE {
@@ -143,14 +144,16 @@ fn owner_id() -> u32 {
 }
 
 /// The panic of a CPU taking a lock it already holds (out of line: `lock`
-/// stays small). Takes no lock, and neither does the crash reporter (it
-/// reads locked state through `try_lock` and `force_get`), so re-locking
-/// any lock (the heap's, the log's, the page tables') still gets a full
-/// report.
+/// stays small; interrupts are still off, so this is the holding CPU).
+/// Takes no lock, and the crash reporter never waits for one (it reads
+/// locked state through `try_lock`, falling back to `force_get`), so
+/// re-locking any lock (the heap's, the log's, the page tables') still
+/// gets a full report.
 #[cold]
 #[inline(never)]
 #[track_caller]
-fn relocked(addr: usize, ty: &str, cpu: u32) -> ! {
+fn relocked(addr: usize, ty: &str) -> ! {
+    let cpu = arch::cpu_index();
     panic!("SpinLock<{ty}> at {addr:#x} re-locked on cpu {cpu}, which already holds it")
 }
 
@@ -210,14 +213,13 @@ crate::ktest!(
         // CPU 1 takes the lock and holds it for a while: there it is held,
         // here it isn't, and `lock` here waits for CPU 1 to let go instead
         // of reporting a re-lock.
-        use crate::sched::yield_until;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::{AtomicBool, AtomicU8};
         const NOT_TAKEN: u8 = 0;
         const HELD_THERE: u8 = 1; // CPU 1 holds it and saw it held there
         const HELD_UNSEEN: u8 = 2; // CPU 1 holds it but didn't see that
         /// How long CPU 1 holds it: far longer than this CPU takes to see
-        /// that it is held and call `lock`.
+        /// that it is held and call `lock` (measured under TCG: under 0.3 ms).
         const HOLD_NS: u64 = 100_000_000;
         static SHARED: SpinLock<()> = SpinLock::new(());
         static STEP: AtomicU8 = AtomicU8::new(NOT_TAKEN);
@@ -226,25 +228,20 @@ crate::ktest!(
         fn on_cpu_1() {
             let held = SHARED.lock();
             STEP.store(if SHARED.held_here() { HELD_THERE } else { HELD_UNSEEN }, Ordering::Release);
-            let until = crate::time::now_ns() + HOLD_NS;
-            while crate::time::now_ns() < until {
-                core::hint::spin_loop();
-            }
+            crate::time::spin(HOLD_NS);
             RELEASING.store(true, Ordering::Relaxed); // published by the release
             drop(held);
         }
-        crate::smp::run_on(1, on_cpu_1).map_err(|e| {
-            crate::ktest::diag(format_args!("run_on cpu 1: {e}"));
-            "run_on failed"
-        })?;
-        kassert!(yield_until(|| STEP.load(Ordering::Acquire) != NOT_TAKEN));
+        crate::smp::run_on_test(1, on_cpu_1)?;
+        kassert!(crate::smp::job_reached(1, || STEP.load(Ordering::Acquire) != NOT_TAKEN));
         let seen = (STEP.load(Ordering::Acquire), SHARED.held_here(), SHARED.try_lock().is_none());
         let contended = !RELEASING.load(Ordering::Relaxed);
         let here = SHARED.lock();
         let after = (RELEASING.load(Ordering::Relaxed), SHARED.held_here());
         drop(here);
-        // Still held when `lock` was called (so `seen` is from while CPU 1
-        // held it, and `lock` had to wait), and taken only once CPU 1 let go.
+        // Still held just before `lock` was called (so `seen` is from while
+        // CPU 1 held it, and `lock` had to wait), and taken only once CPU 1
+        // let go.
         kassert!(contended);
         kassert_eq!(seen, (HELD_THERE, false, true));
         kassert_eq!(after, (true, true));
@@ -254,15 +251,19 @@ crate::ktest!(
 
 crate::ktest!(
     fn a_contended_lock_excludes_and_knows_its_holder() {
-        // CPUs 0 and 1 hammer one lock with `lock` and `try_lock`: every
-        // critical section sees the lock held by its own CPU, and no
-        // increment is lost (mutual exclusion).
-        use crate::sched::yield_until;
+        // CPUs 0 and 1 hammer one lock together with `lock` and `try_lock`:
+        // they really contend (some `try_lock` fails), every critical
+        // section sees the lock held by its own CPU, and no increment is
+        // lost (mutual exclusion).
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::{AtomicBool, AtomicU64};
         const ROUNDS: u64 = 20_000;
         static HOT: SpinLock<u64> = SpinLock::new(0);
         static MISSES: AtomicU64 = AtomicU64::new(0);
+        static ENTERED_THERE: AtomicU64 = AtomicU64::new(0);
+        /// CPU 1 is in its job; both start hammering on `GO`.
+        static READY: AtomicBool = AtomicBool::new(false);
+        static GO: AtomicBool = AtomicBool::new(false);
         static DONE: AtomicBool = AtomicBool::new(false);
         fn hammer() -> u64 {
             let mut entered = 0;
@@ -278,19 +279,28 @@ crate::ktest!(
             }
             entered
         }
-        static ENTERED_THERE: AtomicU64 = AtomicU64::new(0);
-        crate::smp::run_on(1, || {
+        fn on_cpu_1() {
+            READY.store(true, Ordering::Release);
+            // Bounded: if CPU 0 gave up, don't stay here.
+            let deadline = crate::time::now_ns() + 10_000_000_000;
+            while !GO.load(Ordering::Acquire) {
+                if crate::time::now_ns() > deadline {
+                    return;
+                }
+                core::hint::spin_loop();
+            }
             ENTERED_THERE.store(hammer(), Ordering::Relaxed);
             DONE.store(true, Ordering::Release);
-        })
-        .map_err(|e| {
-            crate::ktest::diag(format_args!("run_on cpu 1: {e}"));
-            "run_on failed"
-        })?;
+        }
+        crate::smp::run_on_test(1, on_cpu_1)?;
+        kassert!(crate::smp::job_reached(1, || READY.load(Ordering::Acquire)));
+        GO.store(true, Ordering::Release);
         let entered_here = hammer();
-        kassert!(yield_until(|| DONE.load(Ordering::Acquire)));
+        kassert!(crate::smp::job_reached(1, || DONE.load(Ordering::Acquire)));
+        let there = ENTERED_THERE.load(Ordering::Relaxed);
+        kassert!(entered_here + there < 2 * ROUNDS); // some `try_lock` found it held
         kassert_eq!(MISSES.load(Ordering::Relaxed), 0);
-        kassert_eq!(*HOT.lock(), entered_here + ENTERED_THERE.load(Ordering::Relaxed));
+        kassert_eq!(*HOT.lock(), entered_here + there);
         Ok(())
     }
 );

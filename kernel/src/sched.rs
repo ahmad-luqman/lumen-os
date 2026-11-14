@@ -1016,15 +1016,11 @@ crate::ktest!(
         kassert!(!aps.is_empty());
         for cpu in aps {
             READ.store(false, Ordering::Release);
-            smp::run_on(cpu, || {
+            smp::run_on_test(cpu, || {
                 let (lvt, _, initial) = arch::apic::timer_registers();
                 LVT.store(u64::from(lvt), Ordering::Relaxed);
                 INITIAL.store(u64::from(initial), Ordering::Relaxed);
                 READ.store(true, Ordering::Release);
-            })
-            .map_err(|e| {
-                crate::ktest::diag(format_args!("run_on cpu {cpu}: {e}"));
-                "run_on failed"
             })?;
             kassert!(yield_until(|| READ.load(Ordering::Acquire)));
             let lvt = LVT.load(Ordering::Relaxed);
@@ -1085,15 +1081,11 @@ crate::ktest!(
         kassert!(spun);
         let cpu = last_cpu()?;
         ELAPSED.store(0, Ordering::Relaxed);
-        smp::run_on(cpu, || {
+        smp::run_on_test(cpu, || {
             let t = time::now_ns();
             time::sleep(NS);
             // + 1: 0 means "not yet", so `> NS` below means it took `>= NS`.
             ELAPSED.store(time::now_ns() - t + 1, Ordering::Release);
-        })
-        .map_err(|e| {
-            crate::ktest::diag(format_args!("run_on cpu {cpu}: {e}"));
-            "run_on failed"
         })?;
         kassert!(yield_until(|| ELAPSED.load(Ordering::Acquire) != 0));
         kassert!(ELAPSED.load(Ordering::Acquire) > NS);

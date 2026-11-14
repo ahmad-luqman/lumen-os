@@ -212,6 +212,32 @@ pub fn withdraw(index: usize) -> bool {
     SLOTS.get(index).is_some_and(|slot| slot.job.take().is_some())
 }
 
+/// [`run_on`] for the ktests: a failure is a diag line and a test failure.
+#[cfg(feature = "ktest")]
+pub(crate) fn run_on_test(index: usize, job: fn()) -> crate::ktest::TestResult {
+    run_on(index, job).map_err(|e| {
+        crate::ktest::diag(format_args!("run_on cpu {index}: {e}"));
+        "run_on failed"
+    })
+}
+
+/// For the ktests: yield until `done()` (the job given to AP `index` got
+/// that far) or the test deadline. On a timeout, take the job back if the
+/// AP hasn't taken it, so it can't run later or block the next `run_on`
+/// there, and say which it was.
+#[cfg(feature = "ktest")]
+pub(crate) fn job_reached(index: usize, done: impl Fn() -> bool) -> bool {
+    if crate::sched::yield_until(done) {
+        return true;
+    }
+    let taken_back = withdraw(index);
+    crate::ktest::diag(format_args!(
+        "cpu {index}: {}",
+        if taken_back { "never took its job (taken back)" } else { "took its job but didn't get far enough" }
+    ));
+    false
+}
+
 /// Wake CPU `index` if it is online and isn't this one: send it the
 /// `WAKEUP` IPI, which ends its idle loop's halt (the scheduler, after
 /// queueing a thread there, or to start its timer). False only if an IPI

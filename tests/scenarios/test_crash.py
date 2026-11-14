@@ -160,13 +160,18 @@ def test_spinlock_relock_is_reported(boot, cpu):
     m = boot("qemutest", extra=["-smp", "2"])
     m.expect(r"lumen> ", 60)
     m.send_line(f"crash relock {cpu}")
-    said = m.expect(r"crash: locking the SpinLock at (0x[0-9a-f]+) twice on cpu (\d+)\n", 30)
+    said = m.expect(
+        r"crash: locking the SpinLock at (0x[0-9a-f]+) twice on cpu (\d+)\n"
+        rf"|crash: cpu {cpu} .*\n",  # the job never ran there
+        30,
+    )
+    assert said.group(1), said.group(0)
     addr, said_cpu = said.groups()
     assert said_cpu == cpu, said.group(0)
     # A missed re-lock spins with interrupts off: on CPU 1 the shell says so
     # after 10 s; on CPU 0 serial goes quiet (the expect times out).
     done = m.expect(
-        rf"{re.escape(END)}|crash: SpinLock::lock returned .*|crash: cpu 1 took it but hasn't finished",
+        rf"{re.escape(END)}|crash: SpinLock::lock returned .*|crash: cpu {cpu} took it but hasn't finished",
         30,
     )
     assert done.group(0) == END, f"no crash: {done.group(0)}"
