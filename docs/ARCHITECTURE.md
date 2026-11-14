@@ -1056,7 +1056,8 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   screen and show the line again), Enter, and Tab, which completes the
   word before the cursor from the command table (command names first,
   then each command's argument words: `crash` its kinds and `thread`,
-  `term` `text`; after a `|`, the command after it; options that aren't
+  `term` `text`; after a `|`, only the filters, then their arguments
+  (`where`'s operators, `sort`'s `desc`); options that aren't
   printable are skipped): one that
   fits is written in full (quoted as the word was, the quote closed) with
   a space (left out if only that doesn't fit), several up to where they
@@ -1105,7 +1106,9 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   besides what this list says, the deliberate panic now says `from the
   shell`, and `crash <kind> <cpu>` reports a fault that returned) and
   `history` (the console's lines, numbered), `reboot` and `shutdown` (see
-  "Reboot and power-off" in section 4). Each writes to the console that ran it. On plain serial,
+  "Reboot and power-off" in section 4). Each writes to the console that ran it (at the start of a pipeline,
+  to the next command; its usage and error lines to the console all the
+  same, `Ctx::fail`). On plain serial,
   `colors` and `clear` say the console is plain (tested), and with
   `lumen.ansi` they work there (tested). A `crash` whose fault doesn't
   happen says so on serial and the screen (the screen not tested). `crash <kind> <cpu>` waits, asleep and allocating nothing,
@@ -1175,34 +1178,49 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   - `threads`: every thread (`sched::threads`), its CPU, state and the
     ticks that found it running.
 - **Pipelines** (`lumen_shell::pipe`, host-tested; `pipe.rs`): `cmd | filter
-  | filter ...`. A command's output is lines of text, or records: a
-  `pipe::Table` of named columns, each holding numbers (printed in
-  decimal, hex or as a percentage) or text, a value possibly absent
-  (printed `-` or `stalled`). In a pipeline `cpus`, `irqs` (its
-  per-vector table only), `mem` (frames, heap and each kind of stack:
-  size, used and count, in bytes) and `threads` give records
-  (`sysinfo::records`); `cpus`, `irqs` and `threads` print the same tables
-  alone (under their header line), so their text is what it was. Any other
-  command runs as alone, writing into a buffer of 64 KiB reserved before it
-  runs (writing never allocates; more stops the pipeline with a line
-  saying so) whose lines go on. Its keys still come from the console and
-  it may draw on the screen; one that would wait on the console unseen
-  refuses with `Ctx::refuse` (on the console, ending the pipeline): the
-  rhai REPL, and `top` without a frame count. Only the first command may
-  be one that isn't a filter. The filters: `grep <text>` (lines, or rows
-  with a value as printed containing it), `where <column> <op> <value>`
-  (`= != < <= > >=`, and `~` contains for text; a number column takes a
-  number, decimal or `0x` hex, a percentage maybe with `%`, else an error;
-  text compares byte by byte; an absent value never matches), `sort
-  <column> [desc]` (stable, absent values last either way), `first <n>`,
-  `count` (one line) and `select <column>...`. Text through `where`,
-  `sort` or `select` is a table with one column, `line`, and comes out as
-  text. A wrong filter (unknown, or the wrong arguments) stops the
-  pipeline before anything runs; one failing on its input (no such
-  column) stops it there; each is one line. The last output is printed in
-  one write: text as lines, a table as its headings and rows (two-space
-  indent, columns two spaces apart and as wide as the widest value, the
-  last unpadded). Alone, a filter says it goes after a `|`.
+  | filter ...`. The first command must not be a filter, and every
+  command after a `|` must be one. A command's output is lines of text,
+  or records: a `pipe::Table` of named columns (names unique), each
+  holding numbers (printed in decimal, hex or as a percentage) or text, a
+  value possibly absent (printed `-` or `stalled`). In a pipeline `cpus`,
+  `irqs` (its per-vector table only), `mem` (frames, the heap and each
+  kind of stack: size and used in bytes, a stack's all used, guard pages
+  not counted; and a count of frames, live allocations or stacks) and
+  `threads` give records (`sysinfo::RECORDS`); `cpus`, `irqs` and the new
+  `threads` print the same tables alone (under their header line), so the
+  text of `cpus` and `irqs` is what it was (tested column by column; one
+  difference: a value wider than its column, `stalled`, now widens it for
+  every row). They take no arguments (`usage: cpus`). Any other command
+  runs as alone on a plain console (no escape codes), writing into a
+  buffer of 64 KiB reserved before it runs (writing never allocates; more
+  stops the pipeline with a line saying so, though the command runs to its
+  end) whose lines go on. Its keys still come from the console. Its usage
+  and error lines go to the console instead (`Ctx::fail`, which every
+  command uses for them) and end the pipeline; so do the refusals of what
+  would wait on the console unseen: the rhai REPL and demos, `top` without
+  a frame count, and whatever draws (`mandelbrot`, `life`, a script's
+  drawing function), which waits for a key after. The filters: `grep
+  <text>` (lines, or rows with a value as printed containing it), `where
+  <column> <op> <value>` (`= != < <= > >=`, and `~` contains for text; a
+  number column takes a number, decimal or `0x` hex (a hex column only
+  hex: `vector = 64` is refused, not read as `0x40`), a percentage maybe
+  with `%`, else an error; text compares byte by byte, unless the value is
+  a decimal number: then lines that are numbers compare as numbers and the
+  others don't match, so `seq 12 | where line > 5` is 6 to 12; an absent
+  value never matches, not even `!=`), `sort <column> [desc]` (stable,
+  absent values last either way), `first <n>`, `count` (one line) and
+  `select <column>...` (each once). Text through `where`, `sort` or
+  `select` is a table with one column, `line`, and comes out as text. A
+  wrong filter (unknown, or the wrong arguments, a column selected twice
+  among them) stops the pipeline before anything runs; one failing on its
+  input (no such column) stops it there; each is one line. The last output
+  is printed in chunks of whole lines of about 512 bytes
+  (`shell::write_in_chunks`, which `dmesg` uses too: a serial write holds
+  the log's line lock with interrupts off): text as lines, a table as its
+  headings and rows (two-space indent, columns two spaces apart and as
+  wide as the widest value, a left-aligned last one unpadded). Alone, a
+  filter says it goes after a `|`. After a `|`, Tab completes only the
+  filters' names.
 - **Tests:** `cargo:lumen-shell`; `test_shell` (echo with quotes on both
   consoles, history and line editing on the screen and history on serial,
   completion on both, one line of error, `lumen.ansi`, the system
@@ -1213,9 +1231,9 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   with `term text`; every serial scenario that drove kmon runs against the
   serial shell with the new prompt.
 - **Not yet:** Ctrl-R search, Alt-B/F word moves, wrapping lines longer
-  than the console, an error stream apart from a command's output (a
-  command's error lines go down a pipeline like the rest), redirection,
-  variables, and a shell in user mode (M9).
+  than the console, a full error stream (only `Ctx::fail`'s lines leave a
+  pipeline for the console, and end it), the I/O APIC's inputs as
+  records, redirection, variables, and a shell in user mode (M9).
   Scripts: see below.
 
 ### Scripting (built in M2)

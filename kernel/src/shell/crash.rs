@@ -50,23 +50,20 @@ impl Write for Out {
 /// (from its idle thread; its crash report then stops this one), or in a new
 /// thread on this CPU (named `shell-crash`), which the shell waits for.
 pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
-    let out = &mut *ctx.out;
     let kind = args.first().map_or("", String::as_str);
     let Some(fault) = crash_fn(kind) else {
-        let _ = writeln!(out, "crash: unknown kind '{kind}' ({})", KINDS.join(" "));
+        ctx.fail(format_args!("crash: unknown kind '{kind}' ({})", KINDS.join(" ")));
         return;
     };
     if args.len() > 2 {
-        let _ = writeln!(out, "crash: usage: crash <kind> [cpu|thread]");
+        ctx.fail("crash: usage: crash <kind> [cpu|thread]");
         return;
     }
     let target = args.get(1).map(String::as_str);
     if target == Some("thread") {
         match crate::sched::spawn("shell-crash", fault) {
             Ok(handle) => handle.join(),
-            Err(e) => {
-                let _ = writeln!(out, "crash: no thread: {e}");
-            }
+            Err(e) => ctx.fail(format_args!("crash: no thread: {e}")),
         }
         return;
     }
@@ -74,21 +71,19 @@ pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
         None | Some(Ok(0)) => fault(),
         Some(Ok(cpu)) => {
             if REMOTE.try_update(Ordering::Acquire, Ordering::Relaxed, |s| (s != HANDED).then_some(HANDED)).is_err() {
-                let _ = writeln!(out, "crash: a crash sent to another CPU hasn't finished yet");
+                ctx.fail("crash: a crash sent to another CPU hasn't finished yet");
                 return;
             }
             REMOTE_KIND.store(KINDS.iter().position(|k| *k == kind).expect("a known kind"), Ordering::Relaxed);
             match crate::smp::run_on(cpu, run_remote) {
-                Ok(()) => wait_remote(out, cpu),
+                Ok(()) => wait_remote(ctx.out, cpu),
                 Err(e) => {
                     REMOTE.store(IDLE, Ordering::Release);
-                    let _ = writeln!(out, "crash: cpu {cpu} {e}");
+                    ctx.fail(format_args!("crash: cpu {cpu} {e}"));
                 }
             }
         }
-        Some(Err(_)) => {
-            let _ = writeln!(out, "crash: the cpu is a number (0: this one) or 'thread'");
-        }
+        Some(Err(_)) => ctx.fail("crash: the cpu is a number (0: this one) or 'thread'"),
     }
 }
 

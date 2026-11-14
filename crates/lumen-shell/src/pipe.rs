@@ -9,14 +9,18 @@
 //!   one of its values, as printed, does).
 //! - `where <column> <op> <value>`: the rows whose `column` compares so
 //!   with `value` (`=`, `!=`, `<`, `<=`, `>`, `>=`; `~` contains, for text).
-//!   A number column takes a number (decimal, or hex with `0x`; a `%` after
-//!   a percentage is allowed); a text column compares text, byte by byte. A
-//!   row without a value there (printed as `-`) never matches.
+//!   A number column takes a number: decimal, or hex after `0x` (which a
+//!   hex column requires: `vector = 20` is refused, not read as `0x14`); a
+//!   `%` after a percentage is allowed. A text column compares text byte by
+//!   byte, unless the value is a decimal number: then rows whose text is
+//!   one compare as numbers and the others don't match (`seq 12 | where
+//!   line > 5`). A row without a value there (printed as `-` or `stalled`)
+//!   never matches, not even `!=`.
 //! - `sort <column> [desc]`: the rows ordered by `column` (numbers as
 //!   numbers), equal ones kept in their order, rows without a value last.
 //! - `first <n>`: the first `n` lines or rows.
 //! - `count`: how many lines or rows, as one line.
-//! - `select <column>...`: those columns, in that order.
+//! - `select <column>...`: those columns, in that order (each once).
 //!
 //! Text going into `where`, `sort` or `select` is a table with one text
 //! column, `line`, and comes out as text again.
@@ -86,7 +90,7 @@ pub enum Value {
 
 impl Value {
     /// The value as printed in a column holding `kind`.
-    fn show(&self, kind: Kind) -> String {
+    pub fn show(&self, kind: Kind) -> String {
         match (self, kind) {
             (Value::Int(n), Kind::Hex) => format!("{n:#04x}"),
             (Value::Int(n), Kind::Percent) => format!("{n}%"),
@@ -105,8 +109,9 @@ impl Value {
     }
 }
 
-/// Records: rows of values under named columns. Every row has a value for
-/// each column, of the kind the column holds (or [`Value::Absent`]).
+/// Records: rows of values under named columns. Column names are unique,
+/// and every row has a value for each column, of the kind the column holds
+/// (or [`Value::Absent`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Table {
     columns: Vec<Column>,
@@ -115,7 +120,14 @@ pub struct Table {
 
 impl Table {
     /// A table with these columns and no rows.
+    ///
+    /// # Panics
+    /// If two columns have the same name (`where` and `select` couldn't
+    /// tell them apart): the code making the table is wrong.
     pub fn new(columns: &[Column]) -> Table {
+        for (i, c) in columns.iter().enumerate() {
+            assert!(columns[..i].iter().all(|d| d.name != c.name), "two columns called {}", c.name);
+        }
         Table { columns: columns.to_vec(), rows: Vec::new() }
     }
 
@@ -143,8 +155,8 @@ impl Table {
 
     /// The headings, then a line per row: each line indented by two spaces,
     /// the columns two spaces apart, each as wide as its widest value (or
-    /// heading, or [`Column::width`]); the last column isn't padded on the
-    /// right.
+    /// heading, or [`Column::width`]); a left-aligned last column isn't
+    /// padded on the right.
     pub fn render(&self, out: &mut String) {
         let cells: Vec<Vec<String>> =
             self.rows.iter().map(|row| row.iter().zip(&self.columns).map(|(v, c)| v.show(c.kind)).collect()).collect();
@@ -245,10 +257,7 @@ impl Data {
             let lines = table
                 .rows
                 .into_iter()
-                .map(|mut row| match row.pop() {
-                    Some(Value::Text(t)) => t,
-                    _ => unreachable!("the line column holds text"),
-                })
+                .map(|mut row| row.pop().map_or_else(String::new, |v| v.show(LINE.kind)))
                 .collect();
             Data::Text(lines)
         } else {
@@ -270,19 +279,14 @@ pub enum Op {
     Contains,
 }
 
+/// `where`'s operators as written, in [`Op::ALL`]'s order.
+pub const OPS: [&str; 7] = ["=", "!=", "<", "<=", ">", ">=", "~"];
+
 impl Op {
-    const WORDS: [(&'static str, Op); 7] = [
-        ("=", Op::Eq),
-        ("!=", Op::Ne),
-        ("<", Op::Lt),
-        ("<=", Op::Le),
-        (">", Op::Gt),
-        (">=", Op::Ge),
-        ("~", Op::Contains),
-    ];
+    const ALL: [Op; 7] = [Op::Eq, Op::Ne, Op::Lt, Op::Le, Op::Gt, Op::Ge, Op::Contains];
 
     fn parse(word: &str) -> Option<Op> {
-        Op::WORDS.iter().find(|(w, _)| *w == word).map(|&(_, op)| op)
+        OPS.iter().position(|w| *w == word).map(|i| Op::ALL[i])
     }
 
     /// Whether `ordering` (a value against the one asked for) passes.
@@ -294,7 +298,7 @@ impl Op {
             Op::Le => ordering.is_le(),
             Op::Gt => ordering.is_gt(),
             Op::Ge => ordering.is_ge(),
-            Op::Contains => unreachable!("~ isn't an ordering"),
+            Op::Contains => false, // not an ordering: `matches` handles it
         }
     }
 }
@@ -303,10 +307,18 @@ impl Op {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Filter {
     Grep(String),
-    Where { column: String, op: Op, value: String },
-    Sort { column: String, desc: bool },
+    Where {
+        column: String,
+        op: Op,
+        value: String,
+    },
+    Sort {
+        column: String,
+        desc: bool,
+    },
     First(usize),
     Count,
+    /// Distinct column names.
     Select(Vec<String>),
 }
 
@@ -320,9 +332,15 @@ pub const FILTERS: [(&str, &str); 6] = [
     ("select", "<column>..."),
 ];
 
+/// Whether `name` is a filter's.
+pub fn is_filter(name: &str) -> bool {
+    FILTERS.iter().any(|(f, _)| *f == name)
+}
+
 impl Filter {
     /// The filter `words` names (its name, then its arguments), or `None`
-    /// if the first word isn't a filter's name.
+    /// if the first word isn't a filter's name. Everything that can be
+    /// checked without the data is checked here.
     pub fn parse(words: &[String]) -> Option<Result<Filter, PipeError>> {
         let (name, args) = words.split_first()?;
         let (name, usage) = *FILTERS.iter().find(|(n, _)| n == name)?;
@@ -338,7 +356,10 @@ impl Filter {
             ("sort", [column, "desc"]) => Ok(Filter::Sort { column: (*column).to_owned(), desc: true }),
             ("first", [n]) => n.parse().map(Filter::First).map_err(|_| PipeError::BadCount((*n).to_owned())),
             ("count", []) => Ok(Filter::Count),
-            ("select", [_, ..]) => Ok(Filter::Select(args.to_vec())),
+            ("select", [_, ..]) => match args.iter().enumerate().find(|(i, a)| args[..*i].contains(a)) {
+                Some((_, twice)) => Err(PipeError::Twice(twice.clone())),
+                None => Ok(Filter::Select(args.to_vec())),
+            },
             _ => Err(usage),
         })
     }
@@ -364,10 +385,10 @@ impl Filter {
                     Data::Text(lines)
                 }
                 Data::Table(mut table) => {
-                    let columns = table.columns.clone();
+                    let columns = &table.columns;
                     table
                         .rows
-                        .retain(|row| row.iter().zip(&columns).any(|(v, c)| v.show(c.kind).contains(text.as_str())));
+                        .retain(|row| row.iter().zip(columns).any(|(v, c)| v.show(c.kind).contains(text.as_str())));
                     Data::Table(table)
                 }
             }),
@@ -390,37 +411,20 @@ impl Filter {
             }
             Filter::Where { column, op, value } => {
                 let (mut table, was_text) = data.into_table();
-                let i = table.column("where", column)?;
-                let kind = table.columns[i].kind;
-                let wanted = if kind.holds_numbers() {
-                    if *op == Op::Contains {
-                        return Err(PipeError::ContainsNumbers(column.clone()));
-                    }
-                    let n = number(value, kind)
-                        .ok_or_else(|| PipeError::NotANumber { column: column.clone(), value: value.clone() })?;
-                    Value::Int(n)
-                } else {
-                    Value::Text(value.clone())
-                };
+                let i = table.column(self.name(), column)?;
+                let wanted = wanted(column, table.columns[i].kind, *op, value)?;
                 table.rows.retain(|row| matches(&row[i], *op, &wanted));
                 Ok(Data::from_table(table, was_text))
             }
             Filter::Sort { column, desc } => {
                 let (mut table, was_text) = data.into_table();
-                let i = table.column("sort", column)?;
+                let i = table.column(self.name(), column)?;
                 table.rows.sort_by(|a, b| order(&a[i], &b[i], *desc));
                 Ok(Data::from_table(table, was_text))
             }
             Filter::Select(names) => {
                 let (table, was_text) = data.into_table();
-                let mut picked: Vec<usize> = Vec::with_capacity(names.len());
-                for name in names {
-                    let i = table.column("select", name)?;
-                    if picked.contains(&i) {
-                        return Err(PipeError::Twice(name.clone()));
-                    }
-                    picked.push(i);
-                }
+                let picked = names.iter().map(|n| table.column(self.name(), n)).collect::<Result<Vec<_>, _>>()?;
                 let columns = picked.iter().map(|&i| table.columns[i]).collect();
                 let rows = table.rows.into_iter().map(|row| picked.iter().map(|&i| row[i].clone()).collect()).collect();
                 Ok(Data::from_table(Table { columns, rows }, was_text))
@@ -429,22 +433,54 @@ impl Filter {
     }
 }
 
-/// `word` as a number for a column holding `kind`: decimal (maybe
-/// negative) or hex after `0x`; a percentage may end in `%`.
-fn number(word: &str, kind: Kind) -> Option<i64> {
-    let word = if kind == Kind::Percent { word.strip_suffix('%').unwrap_or(word) } else { word };
-    match word.strip_prefix("0x") {
-        Some(hex) => i64::from_str_radix(hex, 16).ok(),
-        None => word.parse().ok(),
-    }
+/// What `where` compares a column's values with.
+enum Wanted {
+    /// A number: with a number column's values, or a text column's that
+    /// are decimal numbers.
+    Number(i64),
+    /// Text, byte by byte (or contained, with `~`).
+    Text(String),
 }
 
-/// Whether `value` compares with `wanted` (of its column's kind) by `op`.
-fn matches(value: &Value, op: Op, wanted: &Value) -> bool {
+/// What `where <column> <op> <value>` compares with, for a column holding
+/// `kind`; or why it can't.
+fn wanted(column: &str, kind: Kind, op: Op, value: &str) -> Result<Wanted, PipeError> {
+    if !kind.holds_numbers() {
+        return Ok(match decimal(value) {
+            Some(n) if op != Op::Contains => Wanted::Number(n),
+            _ => Wanted::Text(value.to_owned()),
+        });
+    }
+    if op == Op::Contains {
+        return Err(PipeError::ContainsNumbers(column.to_owned()));
+    }
+    let digits = if kind == Kind::Percent { value.strip_suffix('%').unwrap_or(value) } else { value };
+    let n = match digits.strip_prefix("0x") {
+        Some(hex) if !hex.starts_with(['+', '-']) => i64::from_str_radix(hex, 16).ok(),
+        Some(_) => None,
+        None if kind == Kind::Hex => {
+            return Err(match decimal(digits) {
+                Some(_) => PipeError::HexNeeded { column: column.to_owned(), value: value.to_owned() },
+                None => PipeError::NotANumber { column: column.to_owned(), value: value.to_owned() },
+            });
+        }
+        None => decimal(digits),
+    };
+    n.map(Wanted::Number).ok_or_else(|| PipeError::NotANumber { column: column.to_owned(), value: value.to_owned() })
+}
+
+/// `word` as a decimal number (maybe negative).
+fn decimal(word: &str) -> Option<i64> {
+    word.parse().ok()
+}
+
+/// Whether `value` compares with `wanted` by `op`.
+fn matches(value: &Value, op: Op, wanted: &Wanted) -> bool {
     match (value, wanted) {
-        (Value::Text(t), Value::Text(w)) if op == Op::Contains => t.contains(w.as_str()),
-        (Value::Text(t), Value::Text(w)) => op.passes(t.as_str().cmp(w.as_str())),
-        (Value::Int(n), Value::Int(w)) => op.passes(n.cmp(w)),
+        (Value::Text(t), Wanted::Text(w)) if op == Op::Contains => t.contains(w.as_str()),
+        (Value::Text(t), Wanted::Text(w)) => op.passes(t.as_str().cmp(w.as_str())),
+        (Value::Text(t), Wanted::Number(w)) => decimal(t).is_some_and(|n| op.passes(n.cmp(w))),
+        (Value::Int(n), Wanted::Number(w)) => op.passes(n.cmp(w)),
         _ => false,
     }
 }
@@ -476,6 +512,8 @@ pub enum PipeError {
     NoColumn { filter: &'static str, column: String, columns: Vec<&'static str> },
     /// `where` comparing a number column with something not a number.
     NotANumber { column: String, value: String },
+    /// `where` comparing a hex column with a number not written in hex.
+    HexNeeded { column: String, value: String },
     /// `where` with `~` on a number column.
     ContainsNumbers(String),
     /// `select` naming a column twice.
@@ -486,19 +524,25 @@ impl fmt::Display for PipeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PipeError::Usage { filter, usage } => {
-                write!(f, "usage: {filter} {usage}")?;
+                write!(f, "usage: {filter}")?;
+                if !usage.is_empty() {
+                    write!(f, " {usage}")?;
+                }
                 if *filter == "where" {
-                    f.write_str(" (op: = != < <= > >= ~)")?;
+                    write!(f, " (op: {})", OPS.join(" "))?;
                 }
                 Ok(())
             }
-            PipeError::BadOp(op) => write!(f, "where: no operator '{op}' (one of = != < <= > >= ~)"),
+            PipeError::BadOp(op) => write!(f, "where: no operator '{op}' (one of {})", OPS.join(" ")),
             PipeError::BadCount(n) => write!(f, "first: '{n}' isn't a number of lines"),
             PipeError::NoColumn { filter, column, columns } => {
                 write!(f, "{filter}: no column '{column}' (columns: {})", columns.join(", "))
             }
             PipeError::NotANumber { column, value } => {
                 write!(f, "where: {column} holds numbers, and '{value}' isn't one")
+            }
+            PipeError::HexNeeded { column, value } => {
+                write!(f, "where: {column} is hex: write 0x{value}, not {value}")
             }
             PipeError::ContainsNumbers(column) => write!(f, "where: ~ is for text, and {column} holds numbers"),
             PipeError::Twice(column) => write!(f, "select: {column} named twice"),

@@ -185,20 +185,23 @@ fn report_left_out(ctx: &mut Ctx<'_>, drawn: &Drawn) -> usize {
 /// times; it stays until a key.
 pub fn mandelbrot(ctx: &mut Ctx<'_>, args: &[String]) {
     if let Some(arg) = args.first() {
-        let _ = writeln!(ctx.out, "mandelbrot: takes no arguments (got '{arg}')\nusage: mandelbrot");
+        ctx.fail(format_args!("mandelbrot: takes no arguments (got '{arg}')\nusage: mandelbrot"));
+        return;
+    }
+    if ctx.piped() {
+        ctx.fail(IN_A_PIPELINE.replace('*', "mandelbrot"));
         return;
     }
     let canvas = match ctx.canvas() {
         Ok(canvas) => Arc::new(canvas),
         Err(e) => {
-            let _ = writeln!(ctx.out, "mandelbrot: {e}");
+            ctx.fail(format_args!("mandelbrot: {e}"));
             return;
         }
     };
     let (w, h) = (canvas.width(), canvas.height().saturating_sub(STATUS_H));
     if w == 0 || h == 0 {
-        let _ =
-            writeln!(ctx.out, "mandelbrot: the screen is too small ({}x{} pixels)", canvas.width(), canvas.height());
+        ctx.fail(format_args!("mandelbrot: the screen is too small ({}x{} pixels)", canvas.width(), canvas.height()));
         return;
     }
     let view = View::fit(w, h, MAX_ITER);
@@ -210,7 +213,7 @@ pub fn mandelbrot(ctx: &mut Ctx<'_>, args: &[String]) {
     let all = draw_mandelbrot(&canvas, view, w, h, true);
     if !canvas.is_live() {
         report_left_out(ctx, &all);
-        let _ = writeln!(ctx.out, "mandelbrot: stopped: {}", CanvasError::Stopped);
+        ctx.fail(format_args!("mandelbrot: stopped: {}", CanvasError::Stopped));
         return;
     }
     let ms = |d: &Drawn| d.ns / 1_000_000;
@@ -251,6 +254,9 @@ const LIFE_HZ: u64 = 20;
 /// The pattern `life` runs without one named.
 const DEFAULT_PATTERN: &str = "gun";
 const LIFE_USAGE: &str = "usage: life [pattern] [generations]";
+/// What a demo says in a pipeline (`*`: its name): it would draw and wait
+/// for a key while its output went down the pipeline.
+const IN_A_PIPELINE: &str = "*: draws on the screen and waits for a key: not in a pipeline";
 
 /// `life [pattern] [generations]`: the pattern (default `gun`) where it
 /// starts best ([`life::Place`]); with a count it steps that many
@@ -259,15 +265,16 @@ const LIFE_USAGE: &str = "usage: life [pattern] [generations]";
 /// A status line under the grid shows the generation and the population.
 pub fn life(ctx: &mut Ctx<'_>, args: &[String]) {
     if args.len() > 2 {
-        let _ = writeln!(ctx.out, "life: too many arguments\n{LIFE_USAGE}");
+        ctx.fail(format_args!("life: too many arguments\n{LIFE_USAGE}"));
         return;
     }
     let name = args.first().map_or(DEFAULT_PATTERN, String::as_str);
     let Some(pattern) = life::pattern(name) else {
-        let _ = writeln!(ctx.out, "life: unknown pattern '{name}'\n{LIFE_USAGE}");
+        let mut text = format!("life: unknown pattern '{name}'\n{LIFE_USAGE}");
         for p in PATTERNS {
-            let _ = writeln!(ctx.out, "  {:<12}{}", p.name, p.about);
+            let _ = write!(text, "\n  {:<12}{}", p.name, p.about);
         }
+        ctx.fail(text);
         return;
     };
     let count = match args.get(1) {
@@ -275,26 +282,29 @@ pub fn life(ctx: &mut Ctx<'_>, args: &[String]) {
         Some(arg) => match arg.parse::<u64>() {
             Ok(n) => Some(n),
             Err(_) => {
-                let _ = writeln!(ctx.out, "life: '{arg}' is not a number of generations\n{LIFE_USAGE}");
+                ctx.fail(format_args!("life: '{arg}' is not a number of generations\n{LIFE_USAGE}"));
                 return;
             }
         },
     };
+    if ctx.piped() {
+        ctx.fail(IN_A_PIPELINE.replace('*', "life"));
+        return;
+    }
     let canvas = match ctx.canvas() {
         Ok(canvas) => canvas,
         Err(e) => {
-            let _ = writeln!(ctx.out, "life: {e}");
+            ctx.fail(format_args!("life: {e}"));
             return;
         }
     };
     let (cols, rows) = (canvas.width() / CELL, canvas.height().saturating_sub(STATUS_H) / CELL);
     let (pw, ph) = pattern.size();
     if cols < pw || rows < ph {
-        let _ = writeln!(
-            ctx.out,
+        ctx.fail(format_args!(
             "life: the screen is too small for {} ({cols}x{rows} cells, it needs {pw}x{ph})",
             pattern.name
-        );
+        ));
         return;
     }
     let mut grid = Life::new(cols, rows);
@@ -350,7 +360,7 @@ pub fn life(ctx: &mut Ctx<'_>, args: &[String]) {
             }
         }
         End::Lost => {
-            let _ = writeln!(ctx.out, "life: stopped: {}", CanvasError::Stopped);
+            ctx.fail(format_args!("life: stopped: {}", CanvasError::Stopped));
         }
     }
 }

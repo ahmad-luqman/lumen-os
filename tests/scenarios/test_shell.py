@@ -257,6 +257,28 @@ def test_serial_takes_escape_codes_with_lumen_ansi(boot):
     m.expect(r"clear\n\x1b\[H\x1b\[2J\x1b\[3J" + PROMPT, 10)
 
 
+def assert_laid_out(row: str, layout: Sequence[tuple[int | None, str]]) -> None:
+    """`row` is a table row as the system commands print them: indented two
+    spaces, each column `(width, "<" or ">")` exactly that wide (aligned
+    so), two spaces apart; a last column of width `None` unpadded."""
+    at = 2
+    assert row[:2] == "  ", row
+    for i, (width, align) in enumerate(layout):
+        if i:
+            assert row[at : at + 2] == "  ", (row, i)
+            at += 2
+        field = row[at:] if width is None else row[at : at + width]
+        assert field.strip(), (row, i)
+        if width is None:
+            assert field == field.strip(), (row, i)
+        elif align == "<":
+            assert field == field.rstrip().ljust(width) and not field[0].isspace(), (row, i)
+        else:
+            assert field == field.lstrip().rjust(width) and not field[-1].isspace(), (row, i)
+        at += len(field)
+    assert at == len(row), row
+
+
 def test_system_commands(boot):
     # Each system command prints its header and at least one row, on serial
     # in plain text; under -smp 2 both CPUs are listed, the keyboard's input
@@ -269,7 +291,12 @@ def test_system_commands(boot):
         assert re.search(rf"^  {name} ", out, re.MULTILINE), name
 
     out = run(m, "cpus")
-    assert out.startswith("cpus: 2 online\n  cpu  apic  scheduler"), out
+    assert out.startswith(
+        "cpus: 2 online\n  cpu  apic  scheduler    ticks       busy  threads\n"
+    ), out
+    # Laid out exactly as before the rows became tables.
+    for row in out.splitlines()[2:]:
+        assert_laid_out(row, [(3, ">"), (4, ">"), (11, "<"), (10, "<"), (4, ">"), (7, ">")])
     rows = re.findall(r"^\s+(\d)\s+\d+\s+running\s+(\d+)\s+(\d+)%\s+(\d+)$", out, re.MULTILINE)
     assert [r[0] for r in rows] == ["0", "1"], out
     assert all(
@@ -288,6 +315,33 @@ def test_system_commands(boot):
 
     out = run(m, "irqs")
     assert re.match(r"irqs: \d+ I/O APIC inputs", out), out
+    lines = out.splitlines()
+    assert lines[1] == "  gsi  vector  delivery        trigger  polarity  dest  state     count", (
+        out
+    )
+    vectors = lines.index("  vector  use               count")
+    for row in lines[2:vectors]:
+        if row.endswith("masked    -"):
+            # An input no driver routed: its number and `masked`.
+            assert re.fullmatch(
+                r"  [ \d]{3}  -       -               -        -         -     masked    -", row
+            )
+        else:
+            assert_laid_out(
+                row,
+                [
+                    (3, ">"),
+                    (6, "<"),
+                    (14, "<"),
+                    (7, "<"),
+                    (8, "<"),
+                    (4, "<"),
+                    (8, "<"),
+                    (None, "<"),
+                ],
+            )
+    for row in lines[vectors + 1 :]:
+        assert_laid_out(row, [(6, "<"), (16, "<"), (None, "<")])
     assert re.search(
         r"^\s+1\s+0x51\s+Fixed\s+edge\s+high\s+0\s+unmasked\s+\d+$", out, re.MULTILINE
     ), out
@@ -340,10 +394,17 @@ def test_pipe_text(boot):
         "echo: not a filter (after a | come grep, where, sort, first, count, select)\n"
     )
     assert run(m, "grep x") == (
-        "grep: a filter: it takes what a command gives it after a | (cpus | grep ...)\n"
+        "grep: a filter: it takes what a command gives it after a | (cpus | grep <text>)\n"
     )
-    # A command that would wait unseen says so instead.
+    # A command's usage or error line reaches the console, not the next
+    # command; one that would wait unseen says so instead.
+    assert run(m, "seq x | count") == "usage: seq <n> (up to 10000)\n"
     assert run(m, "top | count") == "top: in a pipeline it needs a number of frames (top 1 | ...)\n"
+    assert run(m, "mandelbrot | count") == (
+        "mandelbrot: draws on the screen and waits for a key: not in a pipeline\n"
+    )
+    # Text that is a number compares as one.
+    assert run(m, "seq 12 | where line > 5 | count") == "7\n"
     # On the screen, typed on the keyboard.
     keys(m, "seq 30 | grep 2 | count\n")
     expect_screen(m, r"^lumen> seq 30 \| grep 2 \| count\n12\nlumen>$")
@@ -354,6 +415,13 @@ def test_where_sort_first(boot):
     # (numbers as numbers), `sort` orders by one, `first` keeps the first
     # rows, `select` some columns; the table is printed at the end.
     m = shells(boot, extra=["-smp", "2"])
+    # The issue's pipeline: the three vectors that took the fewest
+    # interrupts, but some.
+    out = run(m, "irqs | where count > 0 | sort count | first 3")
+    lines = out.splitlines()
+    assert lines[0] == "  vector  use               count", out
+    counts = [int(line.rsplit(maxsplit=1)[1]) for line in lines[1:]]
+    assert 1 <= len(counts) <= 3 and counts == sorted(counts) and counts[0] > 0, out
     out = run(m, "irqs | where count > 0 | sort count desc | first 3")
     lines = out.splitlines()
     assert lines[0] == "  vector  use               count", out
@@ -378,8 +446,12 @@ def test_where_sort_first(boot):
     assert ticks == sorted(ticks, reverse=True), out
     assert run(m, "cpus | where busy > lots") == "where: busy holds numbers, and 'lots' isn't one\n"
     assert run(m, "irqs | sort calls") == "sort: no column 'calls' (columns: vector, use, count)\n"
-    # Tab completes the command after a `|`.
+    assert run(m, "irqs | where vector = 64") == "where: vector is hex: write 0x64, not 64\n"
+    assert run(m, "cpus x | count") == "usage: cpus\n"
+    # Tab completes the command after a `|`: only the filters there.
     m.send("cpus | cou\t\r")
+    m.expect(r"cpus \| count \n2\n" + PROMPT, 10)
+    m.send("cpus | c\t\r")
     m.expect(r"cpus \| count \n2\n" + PROMPT, 10)
 
 

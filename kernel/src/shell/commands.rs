@@ -5,7 +5,8 @@
 //! `dmesg`, `date`, `top`: `sysinfo.rs`) and the filters that come after a
 //! `|` (`grep`, `where`, `sort`, `first`, `count`, `select`: `pipe.rs`). A
 //! table the line editor completes from. Each writes to the console that
-//! ran it (or, at the start of a pipeline, to the next command).
+//! ran it (or, at the start of a pipeline, to the next command; a usage or
+//! error line goes to the console all the same: `Ctx::fail`).
 
 use super::{Ctx, crash, pipe, sysinfo};
 use crate::arch;
@@ -101,7 +102,7 @@ pub static COMMANDS: Table<Run> = Table(&[
         name: "irqs",
         args: &[],
         usage: "",
-        about: "the I/O APIC's inputs decoded, and interrupts per vector (piped: those only)",
+        about: "the I/O APIC's inputs decoded, and interrupts per vector (piped: the per-vector counts only)",
         run: sysinfo::irqs,
     },
     Command {
@@ -142,9 +143,9 @@ pub static COMMANDS: Table<Run> = Table(&[
     },
     Command {
         name: "where",
-        args: &[&[], &["=", "!=", "<", "<=", ">", ">=", "~"]],
+        args: &[&[], &lumen_shell::pipe::OPS],
         usage: "<column> <op> <value>",
-        about: "after a |: the rows whose column compares so (~ contains)",
+        about: "after a |: the rows whose column compares with value by op (~: contains)",
         run: |ctx, _| pipe::needs_input(ctx, "where"),
     },
     Command {
@@ -192,7 +193,7 @@ pub(super) fn run_in(table: &Table<Run>, line: &str, ctx: &mut Ctx<'_>) {
     let stages = match words::split_pipeline(line) {
         Ok(stages) => stages,
         Err(e) => {
-            let _ = writeln!(ctx.out, "syntax error: {e}");
+            ctx.fail(format_args!("syntax error: {e}"));
             return;
         }
     };
@@ -202,13 +203,16 @@ pub(super) fn run_in(table: &Table<Run>, line: &str, ctx: &mut Ctx<'_>) {
             let (name, args) = words.split_first().expect("split_pipeline gives no empty command");
             match table.find(name) {
                 Some(command) => run_command(command, ctx, args),
-                None => {
-                    let _ = writeln!(ctx.out, "unknown command: {name} (try 'help')");
-                }
+                None => unknown(ctx, name),
             }
         }
         _ => pipe::run(table, &stages, ctx),
     }
+}
+
+/// Say no command is called `name`.
+pub(super) fn unknown(ctx: &mut Ctx<'_>, name: &str) {
+    ctx.fail(format_args!("unknown command: {name} (try 'help')"));
 }
 
 /// Run `command` with `args`. It gets a canvas owner of its own; when it
@@ -283,7 +287,7 @@ fn int3(ctx: &mut Ctx<'_>, _: &[String]) {
 fn trace(ctx: &mut Ctx<'_>, args: &[String]) {
     let n = if args.is_empty() { Some(16) } else { number(args) };
     let Some(n) = n else {
-        let _ = writeln!(ctx.out, "usage: trace [n]");
+        ctx.fail("usage: trace [n]");
         return;
     };
     let out = &mut *ctx.out;
@@ -375,13 +379,9 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
                     None => writeln!(out, "term text: {} rows, cursor below the view", view.rows.len()),
                 };
             }
-            None => {
-                let _ = writeln!(out, "{NONE}");
-            }
+            None => ctx.fail(NONE),
         },
-        _ => {
-            let _ = writeln!(out, "usage: term [text]");
-        }
+        _ => ctx.fail("usage: term [text]"),
     }
 }
 
@@ -390,7 +390,11 @@ const PLAIN: &str = "this console is plain text (boot with lumen.ansi for escape
 
 fn clear(ctx: &mut Ctx<'_>, _: &[String]) {
     // Home, erase the screen, erase the scrollback.
-    let _ = if ctx.ansi { ctx.out.write_str("\x1b[H\x1b[2J\x1b[3J") } else { writeln!(ctx.out, "clear: {PLAIN}") };
+    if ctx.ansi {
+        let _ = ctx.out.write_str("\x1b[H\x1b[2J\x1b[3J");
+    } else {
+        ctx.fail(format_args!("clear: {PLAIN}"));
+    }
 }
 
 /// A colour test pattern: the 16 named colours as backgrounds (`48;5;n`)
@@ -398,11 +402,11 @@ fn clear(ctx: &mut Ctx<'_>, _: &[String]) {
 /// (256-colour SGR), bold, inverse and a truecolor gradient; then
 /// `colors: done`.
 fn colors(ctx: &mut Ctx<'_>, _: &[String]) {
-    let s = &mut *ctx.out;
     if !ctx.ansi {
-        let _ = writeln!(s, "colors: {PLAIN}");
+        ctx.fail(format_args!("colors: {PLAIN}"));
         return;
     }
+    let s = &mut *ctx.out;
     let _ = write!(s, "16 colours  ");
     for i in 0..16 {
         let _ = write!(s, "\x1b[48;5;{i}m   ");
@@ -448,9 +452,7 @@ fn seq(ctx: &mut Ctx<'_>, args: &[String]) {
                 let _ = writeln!(ctx.out, "{i}");
             }
         }
-        _ => {
-            let _ = writeln!(ctx.out, "usage: seq <n> (up to 10000)");
-        }
+        _ => ctx.fail("usage: seq <n> (up to 10000)"),
     }
 }
 
@@ -460,9 +462,7 @@ fn sleep(ctx: &mut Ctx<'_>, args: &[String]) {
             crate::time::sleep(ms * 1_000_000);
             let _ = writeln!(ctx.out, "slept {ms} ms");
         }
-        _ => {
-            let _ = writeln!(ctx.out, "usage: sleep <ms> (up to 60000)");
-        }
+        _ => ctx.fail("usage: sleep <ms> (up to 60000)"),
     }
 }
 
@@ -474,11 +474,11 @@ fn uptime(ctx: &mut Ctx<'_>, _: &[String]) {
 /// the PIT and the HPET (the tests compare them).
 fn clocks(ctx: &mut Ctx<'_>, _: &[String]) {
     use crate::time::{self, Reference};
-    let out = &mut *ctx.out;
     let (Some(tsc), Some(reference)) = (time::tsc(), time::reference()) else {
-        let _ = writeln!(out, "clocks: the TSC isn't calibrated");
+        ctx.fail("clocks: the TSC isn't calibrated");
         return;
     };
+    let out = &mut *ctx.out;
     let _ = write!(out, "clocks: tsc {} Hz (against the {reference} at boot)", tsc.hz());
     let measured = [Reference::Pit, Reference::Hpet].map(|r| (r, time::measure(r)));
     for (r, m) in &measured {
@@ -524,14 +524,14 @@ fn shutdown(ctx: &mut Ctx<'_>, _: &[String]) {
         }
         Err(why) => why,
     };
-    let _ = writeln!(ctx.out, "shutdown: can't power off: {why}");
+    ctx.fail(format_args!("shutdown: can't power off: {why}"));
 }
 
 fn exit(ctx: &mut Ctx<'_>, _: &[String]) {
     if crate::cmdline::qemu_exit_enabled() {
         arch::qemu::exit(arch::qemu::ExitCode::Success);
     }
-    let _ = writeln!(ctx.out, "exit: lumen.qemu_exit not set");
+    ctx.fail("exit: lumen.qemu_exit not set");
 }
 
 crate::ktest!(

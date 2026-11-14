@@ -52,7 +52,7 @@ fn partial(line: &str) -> Option<Partial> {
 
 fn word(words: &[&str], start: usize, text: &str, quote: Option<char>) -> Option<Partial> {
     let words = words.iter().map(|w| w.to_string()).collect();
-    Some(Partial { words, start, text: text.to_string(), quote })
+    Some(Partial { words, start, text: text.to_string(), quote, after_pipe: false })
 }
 
 #[test]

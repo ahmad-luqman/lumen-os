@@ -97,7 +97,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Pipes: `|` outside quotes sends a command's output to filters (`grep`, `where <column> <op> <value>`, `sort <column> [desc]` (stable), `first <n>`, `count`, `select <columns>`), on either console; text as lines (`dmesg | grep time`), `cpus`, `irqs`, `mem` and `threads` as records with typed columns (`irqs | where count > 0 | sort count desc | first 3`), numbers compared as numbers; keys still reach the first command, one that would wait unseen refuses, its output is capped at 64 KiB; each mistake is one line"
+name = "Pipes: `|` outside quotes sends a command's output to filters (`grep`, `where <column> <op> <value>`, `sort <column> [desc]` (stable), `first <n>`, `count`, `select <column>...`), on either console; text as lines (`dmesg | grep time`, numbers in text compared as numbers), `cpus`, `irqs`, `mem` and `threads` as records with typed columns (`irqs | where count > 0 | sort count | first 3`); keys still reach the first command, its usage and error lines reach the console and end the pipeline, one that would wait unseen (draws, the REPL, `top` without a count) refuses, a first command writing more than 64 KiB stops the pipeline; after a `|` Tab completes only filters; each mistake is one line"
 milestone = "M2"
 tests = [
     "cargo:lumen-shell",
@@ -105,10 +105,13 @@ tests = [
     "scenario:test_shell::test_where_sort_first",
     "ktest:lumen_kernel::shell::pipe::a_pipeline_filters_what_a_command_writes",
     "ktest:lumen_kernel::shell::pipe::system_commands_hand_on_records",
-    "ktest:lumen_kernel::shell::pipe::every_system_table_fits_its_columns",
+    "ktest:lumen_kernel::shell::sysinfo::every_record_table_fits_its_columns",
+    "ktest:lumen_kernel::shell::sysinfo::mem_records_add_up",
     "ktest:lumen_kernel::shell::pipe::every_filter_is_a_command_with_its_usage",
     "ktest:lumen_kernel::shell::pipe::a_piped_command_takes_keys_from_the_console",
     "ktest:lumen_kernel::shell::pipe::a_command_that_would_wait_unseen_refuses_and_ends_the_pipeline",
+    "ktest:lumen_kernel::shell::pipe::a_command_s_usage_and_errors_reach_the_console_not_the_pipeline",
     "ktest:lumen_kernel::shell::pipe::too_much_output_stops_the_pipeline",
     "ktest:lumen_kernel::shell::pipe::pipeline_mistakes_are_one_line",
+    "ktest:lumen_kernel::shell::pipe::long_output_is_written_in_chunks_of_whole_lines",
 ]

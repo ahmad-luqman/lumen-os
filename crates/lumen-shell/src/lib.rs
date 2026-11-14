@@ -2,8 +2,8 @@
 //! command to run out.
 //!
 //! - [`words`]: splitting a line into words the way a POSIX shell quotes
-//!   them (`'...'`, `"..."`, backslashes, `#` comments), and the word under
-//!   the cursor for completion.
+//!   them (`'...'`, `"..."`, backslashes, `#` comments), and into commands
+//!   at each `|` outside quotes; the word under the cursor for completion.
 //! - [`Editor`]: the line editor. It takes [`Key`]s and writes what the
 //!   console must show, either with ANSI escapes ([`Mode::Ansi`]: the
 //!   screen, or serial with `lumen.ansi`) or as plain text ([`Mode::Plain`]:

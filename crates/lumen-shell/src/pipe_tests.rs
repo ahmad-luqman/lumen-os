@@ -109,8 +109,11 @@ fn column(t: &Table, i: usize) -> Vec<Value> {
 
 #[test]
 fn a_table_prints_as_the_system_commands_lay_out_rows() {
-    // As `cpus` printed them before tables: a right-aligned number, padded
-    // text, the headings laid out like the values, nothing after the last.
+    // Laid out as the system commands' rows were before tables: a
+    // right-aligned number, padded text, the headings laid out like the
+    // values, nothing after a left-aligned last column. (One difference: a
+    // value wider than its column, "stalled" here, widens it for every row,
+    // where a fixed format shifted only its own.)
     let mut out = String::new();
     cpus().render(&mut out);
     assert_eq!(
@@ -161,10 +164,10 @@ fn where_compares_numbers_as_numbers_and_text_as_text() {
     assert_eq!(t.rows().len(), 3);
     let t = table(apply(Data::Table(vectors()), &["where", "count", "<=", "2"]));
     assert_eq!(column(&t, 1), vec![text("keyboard"), text("error")]);
-    // Hex: as printed, or in decimal.
+    // Hex, as printed (`a_hex_column_takes_only_hex`: only so).
     let t = table(apply(Data::Table(vectors()), &["where", "vector", ">=", "0x23"]));
     assert_eq!(t.rows().len(), 3);
-    let t = table(apply(Data::Table(vectors()), &["where", "vector", "=", "254"]));
+    let t = table(apply(Data::Table(vectors()), &["where", "vector", "=", "0xfe"]));
     assert_eq!(column(&t, 1), vec![text("remote wake")]);
     // Text: byte order, and ~ for contains.
     let t = table(apply(Data::Table(vectors()), &["where", "use", "<", "k"]));
@@ -211,7 +214,7 @@ fn sort_keeps_equal_rows_in_order_and_missing_values_last() {
         let t = table(apply(Data::Table(cpus()), desc));
         assert_eq!(column(&t, 0), vec![Value::Int(0), Value::Int(1), Value::Int(2)], "{desc:?}");
     }
-    // Numbers as numbers (1200 before 1234 before... 0 first), text by bytes.
+    // Numbers as numbers (0, then 1200, then 1234), text by bytes.
     let t = table(apply(Data::Table(cpus()), &["sort", "ticks"]));
     assert_eq!(column(&t, 2), vec![Value::Int(0), Value::Int(1200), Value::Int(1234)]);
     let t = table(apply(Data::Table(cpus()), &["sort", "scheduler", "desc"]));
@@ -287,7 +290,7 @@ fn first_count_and_grep_take_text_or_rows() {
     assert_eq!(apply(Data::Table(vectors()), &["count"]), Ok(Data::Text(strings(&["6"]))));
     assert_eq!(table(apply(Data::Table(vectors()), &["first", "1"])).rows().len(), 1);
     assert_eq!(apply(lines.clone(), &["first", "-1"]).unwrap_err().to_string(), "first: '-1' isn't a number of lines");
-    assert_eq!(apply(lines, &["count", "x"]).unwrap_err().to_string(), "usage: count ");
+    assert_eq!(apply(lines, &["count", "x"]).unwrap_err().to_string(), "usage: count");
     // A row matches when a value as printed does: hex, a percentage, a
     // missing value's text; the headings stay.
     let t = table(apply(Data::Table(vectors()), &["grep", "0x2"]));
@@ -305,6 +308,8 @@ fn select_picks_columns_in_the_order_named() {
     assert_eq!(t.columns().iter().map(|c| c.name).collect::<Vec<_>>(), ["count", "use"]);
     assert_eq!(t.rows()[0], vec![Value::Int(5000), text("timer")]);
     let err = |words: &[&str]| apply(Data::Table(vectors()), words).unwrap_err().to_string();
+    // A column named twice is refused before there is any data.
+    assert_eq!(Filter::parse(&strings(&["select", "use", "count", "use"])), Some(Err(PipeError::Twice("use".into()))));
     assert_eq!(err(&["select", "use", "use"]), "select: use named twice");
     assert_eq!(err(&["select", "name"]), "select: no column 'name' (columns: vector, use, count)");
     assert_eq!(err(&["select"]), "usage: select <column>...");
@@ -335,4 +340,106 @@ fn a_pipeline_of_filters() {
     // Not a filter's name: not one.
     assert!(Filter::parse(&strings(&["cpus"])).is_none());
     assert!(Filter::parse(&[]).is_none());
+}
+
+#[test]
+fn where_on_numbers_is_strict_at_the_boundary() {
+    let rows = |words: &[&str]| table(apply(Data::Table(vectors()), words)).rows().len();
+    // Three vectors took exactly 7.
+    assert_eq!(rows(&["where", "count", "<", "7"]), 2);
+    assert_eq!(rows(&["where", "count", "<=", "7"]), 5);
+    assert_eq!(rows(&["where", "count", ">", "7"]), 1);
+    assert_eq!(rows(&["where", "count", ">=", "7"]), 4);
+    assert_eq!(rows(&["where", "vector", "<", "0x22"]), 2);
+    assert_eq!(rows(&["where", "vector", ">", "0x22"]), 3);
+}
+
+#[test]
+fn a_hex_column_takes_only_hex() {
+    let err = |words: &[&str]| apply(Data::Table(vectors()), words).unwrap_err().to_string();
+    assert_eq!(err(&["where", "vector", "=", "32"]), "where: vector is hex: write 0x32, not 32");
+    assert_eq!(err(&["where", "vector", "=", "timer"]), "where: vector holds numbers, and 'timer' isn't one");
+    // No sign after the 0x.
+    assert_eq!(err(&["where", "vector", ">", "0x-5"]), "where: vector holds numbers, and '0x-5' isn't one");
+    assert_eq!(err(&["where", "count", ">", "0x+5"]), "where: count holds numbers, and '0x+5' isn't one");
+    // A decimal column takes hex too: it can't be misread.
+    assert_eq!(table(apply(Data::Table(vectors()), &["where", "count", "=", "0x7"])).rows().len(), 3);
+}
+
+#[test]
+fn text_compares_as_numbers_with_a_number() {
+    // `seq 12 | where line > 5`: 6 to 12, not "6" to "9" by bytes.
+    let lines = Data::Text((1..=12).map(|n| n.to_string()).collect());
+    let got = |words: &[&str]| apply(lines.clone(), words).unwrap();
+    assert_eq!(got(&["where", "line", ">", "5"]), Data::Text(strings(&["6", "7", "8", "9", "10", "11", "12"])));
+    assert_eq!(got(&["where", "line", "=", "10"]), Data::Text(strings(&["10"])));
+    assert_eq!(got(&["where", "line", "<=", "-1"]), Data::Text(Vec::new()));
+    // A line that isn't a number doesn't match a number, not even `!=`.
+    let mixed = Data::from_text("3\nthree\n-4\n");
+    assert_eq!(apply(mixed.clone(), &["where", "line", "!=", "3"]), Ok(Data::Text(strings(&["-4"]))));
+    // Not a number: text, byte by byte; `~` always contains.
+    assert_eq!(apply(mixed.clone(), &["where", "line", ">", "a"]), Ok(Data::Text(strings(&["three"]))));
+    assert_eq!(got(&["where", "line", "~", "1"]), Data::Text(strings(&["1", "10", "11", "12"])));
+}
+
+#[test]
+fn the_issue_s_pipeline_ascending() {
+    // irqs | where count > 0 | sort count | first 3
+    let positive = apply(Data::Table(vectors()), &["where", "count", ">", "0"]).unwrap();
+    assert_eq!(
+        column(&table(Ok(positive.clone())), 1),
+        vec![text("timer"), text("serial"), text("spurious"), text("error"), text("remote wake")]
+    );
+    let sorted = apply(positive, &["sort", "count"]).unwrap();
+    let first = table(apply(sorted, &["first", "3"]));
+    assert_eq!(column(&first, 2), vec![Value::Int(2), Value::Int(7), Value::Int(7)]);
+    assert_eq!(column(&first, 1), vec![text("error"), text("serial"), text("spurious")]);
+}
+
+#[test]
+fn a_heading_wider_than_its_values_sets_the_width() {
+    const ID: Column = Column::new("identifier", Kind::Int, Align::Right, 0);
+    const NAME: Column = Column::new("n", Kind::Text, Align::Left, 0);
+    let mut t = Table::new(&[ID, NAME]);
+    t.push(vec![Value::Int(7), text("seven")]);
+    let mut out = String::new();
+    t.render(&mut out);
+    assert_eq!(out, "  identifier  n\n           7  seven\n");
+}
+
+#[test]
+#[should_panic(expected = "two columns called cpu")]
+fn two_columns_with_one_name_are_a_bug() {
+    Table::new(&[CPU, SCHED, CPU]);
+}
+
+#[test]
+fn after_a_pipe_only_filters_complete() {
+    use crate::{Command, Complete, Table};
+    const fn command(name: &'static str, args: &'static [&'static [&'static str]]) -> Command<()> {
+        Command { name, args, usage: "", about: "", run: () }
+    }
+    static TABLE: Table<()> = Table(&[
+        command("cpus", &[]),
+        command("count", &[]),
+        command("sort", &[&[], &["desc"]]),
+        command("clear", &[]),
+    ]);
+    let options = |after_pipe: bool, words: &[&str]| {
+        let mut out = Vec::new();
+        if after_pipe {
+            TABLE.options_after_pipe(&strings(words), &mut out);
+        } else {
+            TABLE.options(&strings(words), &mut out);
+        }
+        out
+    };
+    assert_eq!(options(false, &[]), ["cpus", "count", "sort", "clear"]);
+    assert_eq!(options(true, &[]), ["count", "sort"]);
+    // A filter's arguments complete as anywhere.
+    assert_eq!(options(true, &["sort", "busy"]), ["desc"]);
+    // The editor knows which place it is in.
+    assert!(words::partial("cpus | c").unwrap().after_pipe);
+    assert!(!words::partial("cpus c").unwrap().after_pipe);
+    assert!(!words::partial("echo '|' c").unwrap().after_pipe);
 }

@@ -94,15 +94,24 @@ pub struct Partial {
     pub text: String,
     /// The quote it is inside, if one is open.
     pub quote: Option<char>,
+    /// Whether its command comes after a `|` (a filter's place).
+    pub after_pipe: bool,
 }
 
 /// The word `line` ends in (see [`Partial`]); `None` inside a comment or
 /// right after a backslash, where nothing is completed.
 pub fn partial(line: &str) -> Option<Partial> {
     let scan = scan(line, true);
+    let after_pipe = !scan.stages.is_empty();
     let quote = match scan.state {
         State::Blank => {
-            return Some(Partial { words: scan.words, start: line.len(), text: String::new(), quote: None });
+            return Some(Partial {
+                words: scan.words,
+                start: line.len(),
+                text: String::new(),
+                quote: None,
+                after_pipe,
+            });
         }
         State::Word => None,
         State::Single => Some('\''),
@@ -110,7 +119,7 @@ pub fn partial(line: &str) -> Option<Partial> {
         State::Comment | State::Escape | State::DoubleEscape => return None,
     };
     let last = scan.last.expect("a line ending inside a word has one");
-    Some(Partial { words: scan.words, start: last.start, text: last.text, quote })
+    Some(Partial { words: scan.words, start: last.start, text: last.text, quote, after_pipe })
 }
 
 /// `word` written so that it reads back as itself: inside `quote` if one
@@ -170,8 +179,7 @@ struct Word {
 struct Scan {
     /// The commands finished by a `|` (with pipes), each its words.
     stages: Vec<Vec<String>>,
-    /// The words of the command being read finished by a blank (or by a
-    /// `|`, until the `|` itself moves them to `stages`).
+    /// The finished words of the command being read (since the last `|`).
     words: Vec<String>,
     /// The word the line ends in, if it ends inside one.
     last: Option<Word>,
