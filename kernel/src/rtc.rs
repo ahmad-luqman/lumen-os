@@ -3,7 +3,8 @@
 //! The registers are read through `arch::cmos`, whose guard serializes
 //! index/data pairs; it is taken for each status read and for each set of
 //! registers, not across the wait (it turns interrupts off). [`now`] waits
-//! for an update in progress to end (at most 10 ms per read), reads until
+//! for an update in progress to end (at most 10 ms per read; refusing a
+//! stopped oscillator, or no clock at all), reads until
 //! two reads agree (at most 5 reads), and decodes BCD or binary, 12 or 24
 //! hours, refusing a clock that lost power or is halted: all of that is
 //! `lumen_time::rtc`'s, host-tested. The century is taken as 20 (the FADT's
@@ -35,7 +36,9 @@ const TRIES: usize = 5;
 pub enum RtcError {
     /// Status A read 0xff: no clock answers.
     Absent,
-    /// An update never ended (10 ms).
+    /// Status A's divider says the oscillator is off.
+    Stopped,
+    /// An update never ended (in [`UPDATE_WAIT_NS`]).
     Busy,
     /// No two reads in a row agreed.
     NeverAgreed,
@@ -48,7 +51,8 @@ impl fmt::Display for RtcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RtcError::Absent => f.write_str("no clock answers at the CMOS ports"),
-            RtcError::Busy => f.write_str("the clock's update didn't end in 10 ms"),
+            RtcError::Stopped => f.write_str("the clock's oscillator is off"),
+            RtcError::Busy => write!(f, "the clock's update didn't end in {} ms", UPDATE_WAIT_NS / 1_000_000),
             RtcError::NeverAgreed => write!(f, "no two of {TRIES} reads of the clock agreed"),
             RtcError::Decode(e) => write!(f, "no date: {e}"),
         }
@@ -75,11 +79,12 @@ pub fn now() -> Result<DateTime, RtcError> {
     };
     let r = rtc::read_stable(wait_ready, registers, TRIES).map_err(|e| match e {
         Unsteady::NotReady(NotReady::Absent) => RtcError::Absent,
+        Unsteady::NotReady(NotReady::Stopped) => RtcError::Stopped,
         Unsteady::NotReady(NotReady::Busy) => RtcError::Busy,
         Unsteady::NeverAgreed => RtcError::NeverAgreed,
     })?;
     rtc::decode(&r).map_err(|e| {
-        log::warn!(target: "rtc", "the clock's registers aren't a date ({e}): {r:x?}");
+        log::warn!(target: "rtc", "the clock gave no date ({e}): {r:x?}");
         RtcError::Decode(e)
     })
 }
@@ -98,7 +103,7 @@ crate::ktest!(
         let first = read()?;
         let second = read()?;
         crate::ktest::diag(format_args!("rtc: {first}"));
-        kassert!(first.year >= 2024 && first.year < 2100);
+        kassert!(first.year() >= 2024 && first.year() < 2100);
         kassert!(second >= first);
         Ok(())
     }

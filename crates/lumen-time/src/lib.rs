@@ -5,8 +5,9 @@
 //! calibration window must meet to be trusted (`Window`, `steady_windows`),
 //! how a PIT channel's two readings become a window (`pit_window`), busy
 //! percentages and rates (`busy_percent`, `percent`, `per_second`), and the
-//! CMOS RTC's registers as a date ([`rtc`]). All of it is integer math (the kernel has no floating point) in `u128` where products
-//! can overflow, so it holds for centuries of uptime (and then saturates).
+//! CMOS RTC's registers as a date ([`rtc`]). All of it is integer math
+//! (the kernel has no floating point) in `u128` where products can
+//! overflow, so it holds for centuries of uptime (and then saturates).
 
 #![no_std]
 

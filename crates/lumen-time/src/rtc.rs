@@ -5,7 +5,8 @@
 //! in BCD or binary and with hours in 12- or 24-hour form, as its status
 //! register B says. While it updates them (once a second) status register
 //! A's update-in-progress bit is set and the registers can read half
-//! updated: [`wait_ready`] waits (bounded) for the bit to clear and
+//! updated: [`wait_ready`] waits (bounded) for the bit to clear, and
+//! refuses a clock whose oscillator is off (or that isn't there), and
 //! [`read_stable`] reads until two reads in a row agree. [`decode`] also
 //! refuses a clock whose battery failed (status D) or whose updates are
 //! halted (status B's SET bit).
@@ -14,6 +15,11 @@ use core::fmt;
 
 /// Status register A: an update is in progress.
 pub const STATUS_A_UIP: u8 = 1 << 7;
+/// Status register A: the divider bits (6-4).
+pub const STATUS_A_DIVIDER: u8 = 0b111 << 4;
+/// The divider for a running 32.768 kHz time base (anything else stops or
+/// resets the clock: 0 among them, as an absent clock reads).
+pub const STATUS_A_DIVIDER_RUNNING: u8 = 0b010 << 4;
 /// Status register B: updates are halted (the clock is being set).
 pub const STATUS_B_SET: u8 = 1 << 7;
 /// Status register B: hours are 24-hour (else 12-hour, bit 7 of the hour
@@ -46,14 +52,15 @@ pub struct Registers {
 /// A date and time, as the RTC keeps it. Which time zone that is, the
 /// clock doesn't say: whoever set it decided (QEMU's `-rtc base=utc`, the
 /// tests' setting, keeps UTC; Lumen never writes the clock).
+/// Only [`DateTime::new`] makes one, so it is always a valid date.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DateTime {
-    pub year: u16,
-    pub month: u8,
-    pub day: u8,
-    pub hour: u8,
-    pub minute: u8,
-    pub second: u8,
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
 }
 
 /// Why registers aren't a date.
@@ -117,21 +124,19 @@ pub fn decode(r: &Registers) -> Result<DateTime, DecodeError> {
     }
     let binary = r.status_b & STATUS_B_BINARY != 0;
     let value = |b: u8| if binary { Ok(b) } else { from_bcd(b) };
-    let twelve_hour = r.status_b & STATUS_B_24H == 0;
-    let mut hour = value(if twelve_hour { r.hours & !PM } else { r.hours })?;
-    if twelve_hour {
+    let hour = if r.status_b & STATUS_B_24H != 0 {
+        value(r.hours)?
+    } else {
         // 12-hour: 12 AM is midnight, 12 PM noon.
         let pm = r.hours & PM != 0;
-        if !(1..=12).contains(&hour) {
-            return Err(DecodeError::OutOfRange);
-        }
-        hour = match (hour, pm) {
+        match (value(r.hours & !PM)?, pm) {
+            (h @ 1..=11, false) => h,
             (12, false) => 0,
+            (h @ 1..=11, true) => h + 12,
             (12, true) => 12,
-            (h, false) => h,
-            (h, true) => h + 12,
-        };
-    }
+            _ => return Err(DecodeError::OutOfRange),
+        }
+    };
     let century = match r.century {
         Some(c) => value(c)?,
         None => 20,
@@ -156,12 +161,15 @@ pub fn decode(r: &Registers) -> Result<DateTime, DecodeError> {
 pub enum NotReady {
     /// Status A read 0xff: nothing answers at the clock's ports.
     Absent,
+    /// Status A's divider isn't the running one: the oscillator is off (or
+    /// held in reset), so the time doesn't advance.
+    Stopped,
     /// The update-in-progress bit didn't clear in time.
     Busy,
 }
 
-/// Wait until status A (read by `status_a`) shows no update in progress,
-/// for at most `timeout_ns` by the clock `now_ns`.
+/// Wait until status A (read by `status_a`) shows a running clock with no
+/// update in progress, for at most `timeout_ns` by the clock `now_ns`.
 pub fn wait_ready(
     mut status_a: impl FnMut() -> u8,
     mut now_ns: impl FnMut() -> u64,
@@ -171,6 +179,7 @@ pub fn wait_ready(
     loop {
         match status_a() {
             0xff => return Err(NotReady::Absent),
+            a if a & STATUS_A_DIVIDER != STATUS_A_DIVIDER_RUNNING => return Err(NotReady::Stopped),
             a if a & STATUS_A_UIP == 0 => return Ok(()),
             _ => {}
         }
@@ -222,10 +231,33 @@ impl DateTime {
         valid.then_some(DateTime { year, month, day, hour, minute, second })
     }
 
-    /// Seconds since 1970-01-01 00:00:00; `None` before 1970 or for a date
-    /// that isn't one.
+    pub fn year(&self) -> u16 {
+        self.year
+    }
+
+    pub fn month(&self) -> u8 {
+        self.month
+    }
+
+    pub fn day(&self) -> u8 {
+        self.day
+    }
+
+    pub fn hour(&self) -> u8 {
+        self.hour
+    }
+
+    pub fn minute(&self) -> u8 {
+        self.minute
+    }
+
+    pub fn second(&self) -> u8 {
+        self.second
+    }
+
+    /// Seconds since 1970-01-01 00:00:00; `None` before 1970.
     pub fn unix_seconds(&self) -> Option<u64> {
-        let d = DateTime::new(self.year, self.month, self.day, self.hour, self.minute, self.second)?;
+        let d = self;
         if d.year < 1970 {
             return None;
         }
@@ -292,10 +324,10 @@ mod tests {
         for (bcd, pm, want) in cases {
             let flag = if pm { 0x80 } else { 0 };
             let r = regs(0, [0, 0, bcd | flag, 1, 1, 0]);
-            assert_eq!(decode(&r).map(|d| d.hour), Ok(want), "bcd {bcd:#x} pm {pm}");
+            assert_eq!(decode(&r).map(|d| d.hour()), Ok(want), "bcd {bcd:#x} pm {pm}");
             let bin = from_bcd(bcd).unwrap();
             let r = regs(STATUS_B_BINARY, [0, 0, bin | flag, 1, 1, 0]);
-            assert_eq!(decode(&r).map(|d| d.hour), Ok(want), "binary {bin} pm {pm}");
+            assert_eq!(decode(&r).map(|d| d.hour()), Ok(want), "binary {bin} pm {pm}");
         }
         // 0 and 13 aren't 12-hour hours.
         assert_eq!(decode(&regs(0, [0, 0, 0x00, 1, 1, 0])), Err(DecodeError::OutOfRange));
@@ -306,13 +338,13 @@ mod tests {
     fn century_register() {
         let mut r = regs(STATUS_B_24H, [0, 0, 0, 1, 1, 0x99]);
         r.century = Some(0x19);
-        assert_eq!(decode(&r).map(|d| d.year), Ok(1999));
+        assert_eq!(decode(&r).map(|d| d.year()), Ok(1999));
         r.century = None;
-        assert_eq!(decode(&r).map(|d| d.year), Ok(2099));
+        assert_eq!(decode(&r).map(|d| d.year()), Ok(2099));
         // Binary: the century is binary too; past 99 isn't a century.
         let mut r = regs(STATUS_B_24H | STATUS_B_BINARY, [0, 0, 0, 1, 1, 5]);
         r.century = Some(21);
-        assert_eq!(decode(&r).map(|d| d.year), Ok(2105));
+        assert_eq!(decode(&r).map(|d| d.year()), Ok(2105));
         r.century = Some(100);
         assert_eq!(decode(&r), Err(DecodeError::OutOfRange));
     }
@@ -328,7 +360,7 @@ mod tests {
         assert_eq!(decode(&regs(h, [0, 0, 0, 0x31, 0x04, 0])), Err(DecodeError::OutOfRange));
         assert_eq!(decode(&regs(h, [0, 0, 0, 0x31, 0x11, 0])), Err(DecodeError::OutOfRange));
         assert_eq!(decode(&regs(h, [0, 0, 0, 0x29, 0x02, 0x25])), Err(DecodeError::OutOfRange));
-        assert_eq!(decode(&regs(h, [0, 0, 0, 0x29, 0x02, 0x24])).map(|d| d.day), Ok(29));
+        assert_eq!(decode(&regs(h, [0, 0, 0, 0x29, 0x02, 0x24])).map(|d| d.day()), Ok(29));
         assert_eq!(decode(&regs(h, [0, 0, 0, 1, 0x13, 0])), Err(DecodeError::OutOfRange));
         assert_eq!(decode(&regs(h, [0, 0, 0, 1, 0x00, 0])), Err(DecodeError::OutOfRange));
         assert_eq!(decode(&regs(h, [0, 0, 0, 0, 1, 0])), Err(DecodeError::OutOfRange));
@@ -357,15 +389,14 @@ mod tests {
         assert_eq!(dt(2000, 3, 1, 0, 0, 0).unix_seconds(), Some(951_868_800));
         assert_eq!(dt(2026, 11, 14, 9, 5, 7).unix_seconds(), Some(1_794_647_107));
         assert_eq!(dt(1969, 12, 31, 23, 59, 59).unix_seconds(), None);
-        let bogus = DateTime { year: 2026, month: 2, day: 30, hour: 0, minute: 0, second: 0 };
-        assert_eq!(bogus.unix_seconds(), None);
         assert_eq!(DateTime::new(2026, 2, 30, 0, 0, 0), None);
         assert_eq!(DateTime::new(2026, 1, 1, 24, 0, 0), None);
     }
 
     #[test]
     fn wait_ready_waits_for_the_update_to_end() {
-        // The clock advances 1 ns per call; UIP clears after 3 reads.
+        // The clock advances 1 ns per call; UIP clears after 3 reads (a
+        // running divider throughout).
         let t = Cell::new(0u64);
         let now = || {
             t.set(t.get() + 1);
@@ -383,7 +414,7 @@ mod tests {
         let reads = Cell::new(0);
         let busy = || {
             reads.set(reads.get() + 1);
-            STATUS_A_UIP
+            0x26 | STATUS_A_UIP
         };
         let now = || {
             t.set(t.get() + 1);
@@ -391,13 +422,24 @@ mod tests {
         };
         assert_eq!(wait_ready(busy, now, 10), Err(NotReady::Busy));
         assert!((5..=12).contains(&reads.get()), "{} reads", reads.get());
-        // No clock at the ports: at once.
-        assert_eq!(wait_ready(|| 0xff, || 0, 10), Err(NotReady::Absent));
+        // No clock at the ports, or a stopped oscillator (an all-zero
+        // status among them): at once, with or without UIP (the clock
+        // advances, so a mutant that waits instead times out, not hangs).
+        let t = Cell::new(0u64);
+        let now = || {
+            t.set(t.get() + 1);
+            t.get()
+        };
+        assert_eq!(wait_ready(|| 0xff, now, 10), Err(NotReady::Absent));
+        for a in [0x00, 0x06, 0x66, 0x76 | STATUS_A_UIP, 0x06 | STATUS_A_UIP] {
+            assert_eq!(wait_ready(|| a, now, 10), Err(NotReady::Stopped), "status A {a:#x}");
+        }
     }
 
     #[test]
     fn read_stable_waits_for_two_agreeing_reads() {
-        // A read torn by an update (the second) is retried.
+        // The first read disagrees with the next (an update came between);
+        // the second and third agree.
         let mut reads = [1, 2, 2].into_iter();
         let mut waits = 0;
         let got = read_stable::<_, ()>(
