@@ -37,6 +37,7 @@ mod keyboard;
 mod klog;
 mod ktest;
 mod mm;
+mod power;
 mod sched;
 mod script;
 mod shell;

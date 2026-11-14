@@ -124,7 +124,9 @@ own PR that updates that doc first.
   with a timestamp (`[    0.139288]`, or `[    ?.??????]` before the TSC is
   calibrated): match the rest of the line, not its start.
 - **QEMU exit codes:** 33 pass, 35 test failure, 37 crash report; anything else
-  (including 0 from a triple fault with `-no-reboot`) is a failure.
+  (including 0 from a triple fault with `-no-reboot`) is a failure. The one
+  exception: 0 in the power-off scenario, with a QMP `SHUTDOWN` event whose
+  reason is `guest-shutdown` (a triple fault's is `guest-reset`).
 - **Golden images** live in `tests/golden/`. Re-record with `make golden` only
   when the change to the screen is intended, and open the PNG to check it.
 
@@ -158,7 +160,9 @@ own PR that updates that doc first.
   MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
   PAT. `trace.rs`: trace rings (one per CPU), event kinds, `ktrace!`, the boot timeline
   (`Timeline`). `acpi.rs`: ACPI
-  discovery (CPUs, LAPIC, I/O APICs, HPET) and the firmware-table reader.
+  discovery (CPUs, LAPIC, I/O APICs, HPET, the S5 power-off registers) and
+  the firmware-table reader. `power.rs`: `reboot` and `shutdown` (ACPI S5);
+  `arch/x86_64/reset.rs` their registers.
   `interrupts.rs`: 8259s masked, local APIC on, I/O APIC inputs masked,
   `route_isa_irq` (MADT overrides, handler registered before unmasking).
   `keyboard.rs`: the PS/2 keyboard (8042 init, IRQ 1, `pc-keyboard`
@@ -185,8 +189,9 @@ own PR that updates that doc first.
   against `shlex`), the line editor (history, completion; ANSI and plain
   output), the command table (names, completion words, usage and help
   lines), serial bytes to keys (host-tested).
-- `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET
-  (host-tested on handcrafted tables).
+- `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET, FADT
+  (PM1 control blocks) and the DSDT's `_S5_` by byte search (host-tested on
+  handcrafted tables).
 - `crates/lumen-uart`: 16550 UART logic: presence probe (scratch or
   interrupt enable register), FIFO detection, `\n` as `\r\n` in 15-byte
   bursts (one FIFO slot left for the crash reporter's byte) (host-tested

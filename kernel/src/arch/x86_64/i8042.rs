@@ -1,6 +1,7 @@
 //! The 8042 PS/2 controller's registers: data at port 0x60, status (read)
 //! and command (write) at 0x64. The protocol (init, the keyboard) is in
-//! `crate::keyboard`; this is only the port access.
+//! `crate::keyboard`; this is only the port access. Its one other user is
+//! `reset::keyboard_controller`, a last resort when rebooting.
 
 use super::port::{inb, outb};
 
@@ -31,12 +32,17 @@ pub fn read_data() -> u8 {
 /// Write `byte` to the data port: a byte for the first port's device, or a
 /// command's argument (call when `INPUT_FULL` is clear).
 pub fn write_data(byte: u8) {
-    // SAFETY: the keyboard driver is the 8042's only user.
+    // SAFETY: only the keyboard driver writes the data port.
     unsafe { outb(DATA, byte) }
 }
 
-/// Write a controller command (call when `INPUT_FULL` is clear).
+/// Write a controller command (call when `INPUT_FULL` is clear; the
+/// reboot's reset pulse sends it after a bounded wait even if not).
 pub fn write_command(command: u8) {
-    // SAFETY: the keyboard driver is the 8042's only user.
+    // SAFETY: the keyboard driver is the 8042's only user, but for a
+    // reboot's reset pulse (`reset::keyboard_controller`), sent with
+    // interrupts off on its CPU; the other CPUs aren't stopped, but a byte
+    // the driver reads or writes meanwhile can only disturb the keyboard,
+    // which a reset is about to take away anyway.
     unsafe { outb(STATUS_COMMAND, command) }
 }
