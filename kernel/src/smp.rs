@@ -206,6 +206,12 @@ pub fn run_on(index: usize, job: fn()) -> Result<(), RunError> {
     Ok(())
 }
 
+/// Take back the job [`run_on`] gave AP `index`, if it hasn't taken it
+/// yet; whether there was one to take back.
+pub fn withdraw(index: usize) -> bool {
+    SLOTS.get(index).is_some_and(|slot| slot.job.take().is_some())
+}
+
 /// Wake CPU `index` if it is online and isn't this one: send it the
 /// `WAKEUP` IPI, which ends its idle loop's halt (the scheduler, after
 /// queueing a thread there, or to start its timer). False only if an IPI

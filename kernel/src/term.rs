@@ -371,43 +371,39 @@ pub fn status() -> Option<Status> {
     })
 }
 
-/// The view's cells, row by row (for the tests). The vector is allocated
-/// before taking the screen's lock, as everything under it must not allocate.
-#[cfg(feature = "ktest")]
-fn view_cells() -> Option<(usize, Vec<Cell>)> {
+/// The view's cells, row by row, and the cursor if it is in the view (its
+/// row counted in the view; shown or hidden), read under one lock: a log line from another
+/// CPU can't land between them. The vector is allocated before taking the
+/// lock again, as nothing under it may allocate.
+fn view_cells() -> Option<(usize, Vec<Cell>, Option<Cursor>)> {
     let (cols, rows) = with_screen(|s| (s.term.cols(), s.term.rows()))?;
     let mut cells = Vec::with_capacity(cols * rows);
-    with_screen(|s| {
+    let cursor = with_screen(|s| {
         let t = &s.term;
         // The size never changes: this fits the capacity.
         cells.extend((0..rows).flat_map(|r| (0..cols).map(move |c| t.cell(c, r))));
+        let c = t.cursor();
+        let row = c.row + t.view_offset();
+        (row < rows).then_some(Cursor { row, ..c })
     })?;
-    Some((cols, cells))
+    Some((cols, cells, cursor))
 }
 
-/// The view's rows as text, and the cursor if the view shows the screen.
+/// The view's rows as text, and the cursor if it is in the view.
 pub struct ViewText {
     /// Each row of the view, wide characters' spacers skipped and trailing
     /// blanks trimmed.
     pub rows: Vec<String>,
-    /// The cursor, or `None` while the view is scrolled back (the cursor is
-    /// on the screen, below the view).
+    /// The cursor, its row counted in the view and its column in cells (a
+    /// wide character before it counts two), or `None` if the view is
+    /// scrolled back past it.
     pub cursor: Option<Cursor>,
 }
 
-/// The view as text (what the shell's `term text` prints, and how the tests
-/// read what the screen shell did), read in one go: a log line from another
-/// CPU can't land between the rows and the cursor.
+/// The view as text: what the shell's `term text` prints, and how the tests
+/// read what the screen shell did.
 pub fn view_text() -> Option<ViewText> {
-    let (cols, rows) = with_screen(|s| (s.term.cols(), s.term.rows()))?;
-    // Allocated before taking the lock again, as nothing under it may
-    // allocate; the size never changes, so this fits.
-    let mut cells = Vec::with_capacity(cols * rows);
-    let cursor = with_screen(|s| {
-        let t = &s.term;
-        cells.extend((0..rows).flat_map(|r| (0..cols).map(move |c| t.cell(c, r))));
-        (t.view_offset() == 0).then(|| t.cursor())
-    })?;
+    let (cols, cells, cursor) = view_cells()?;
     let rows = cells
         .chunks(cols)
         .map(|row| {
@@ -435,7 +431,7 @@ crate::ktest!(
         // (An error straight to the screen: an ERROR line on serial would
         // look like a real one.)
         console_log(Level::Error, "termtest", &format_args!("a red error"));
-        let (cols, cells) = view_cells().ok_or("no terminal")?;
+        let (cols, cells, _) = view_cells().ok_or("no terminal")?;
         let warn = find_row(cols, &cells, "a yellow warning").ok_or("the warning isn't on screen")?;
         let info = find_row(cols, &cells, "plain information").ok_or("the information isn't on screen")?;
         let error = find_row(cols, &cells, "a red error").ok_or("the error isn't on screen")?;
@@ -636,7 +632,7 @@ crate::ktest!(
         write_str("\x1b[1;7;44m");
         log::info!(target: "termtest", "after a dirty pen");
         write_str("\x1b[0m");
-        let (cols, cells) = view_cells().ok_or("no terminal")?;
+        let (cols, cells, _) = view_cells().ok_or("no terminal")?;
         let row = find_row(cols, &cells, "after a dirty pen").ok_or("the line isn't on screen")?;
         kassert!(row[0].flags == Flags::NONE);
         kassert!(row.iter().all(|c| c.bg == Color::Default && !c.flags.contains(Flags::INVERSE)));

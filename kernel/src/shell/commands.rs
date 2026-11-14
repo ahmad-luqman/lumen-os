@@ -77,8 +77,8 @@ fn help(ctx: &mut Ctx<'_>, _: &[String]) {
          clocks            the TSC's frequency, measured again against each clock\n  \
          history           the lines entered on this console\n  \
          exit              end QEMU (only with lumen.qemu_exit)\n\
-         keys: Tab completes; Up/Down history; Ctrl-K/U/W edit, Ctrl-C drops the line; \
-         the cursor keys, Home/End, Ctrl-A/E/B/F and Ctrl-L on the screen (or serial with lumen.ansi)",
+         keys: Tab completes; Up/Down history; Ctrl-U/W delete, Ctrl-C drops the line; \
+         the cursor keys, Home/End, Delete, Ctrl-A/E/B/F/D/K and Ctrl-L on the screen (or serial with lumen.ansi)",
         crash::KINDS.join(" ")
     );
 }
@@ -185,7 +185,7 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
                 }
                 let _ = match view.cursor {
                     Some(c) => writeln!(out, "term text: {} rows, cursor ({}, {})", view.rows.len(), c.col, c.row),
-                    None => writeln!(out, "term text: {} rows, scrolled back", view.rows.len()),
+                    None => writeln!(out, "term text: {} rows, cursor below the view", view.rows.len()),
                 };
             }
             None => {

@@ -9,7 +9,7 @@ use crate::arch::{self, serial};
 use alloc::string::String;
 use core::arch::asm;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 /// What `crash <kind>` accepts.
 pub const KINDS: &[&str] = &[
@@ -69,11 +69,15 @@ pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
     match target.map(str::parse::<usize>) {
         None | Some(Ok(0)) => fault(),
         Some(Ok(cpu)) => {
+            if REMOTE.try_update(Ordering::Acquire, Ordering::Relaxed, |s| (s != HANDED).then_some(HANDED)).is_err() {
+                let _ = writeln!(out, "crash: a crash sent to another CPU hasn't finished yet");
+                return;
+            }
             REMOTE_KIND.store(KINDS.iter().position(|k| *k == kind).expect("a known kind"), Ordering::Relaxed);
-            REMOTE_RETURNED.store(false, Ordering::Relaxed);
             match crate::smp::run_on(cpu, run_remote) {
                 Ok(()) => wait_remote(out, cpu),
                 Err(e) => {
+                    REMOTE.store(IDLE, Ordering::Release);
                     let _ = writeln!(out, "crash: cpu {cpu} {e}");
                 }
             }
@@ -84,36 +88,49 @@ pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
     }
 }
 
-/// The kind (an index into [`KINDS`]) `crash <kind> <cpu>` hands to another
-/// CPU, and whether its fault returned there (protection broken). Shared by
-/// both shells: a crash sent to another CPU from both at once isn't
-/// supported (the first one's report stops everything anyway).
+/// Where `crash <kind> <cpu>` is: nothing sent ([`IDLE`]), a fault sent to
+/// another CPU that hasn't returned ([`HANDED`]: claimed before the kind is
+/// stored, so a second one, from either shell, is refused rather than
+/// changing the kind under the first), or one that returned there
+/// ([`RETURNED`], protection broken).
+static REMOTE: AtomicU8 = AtomicU8::new(IDLE);
+const IDLE: u8 = 0;
+const HANDED: u8 = 1;
+const RETURNED: u8 = 2;
+/// The kind sent (an index into [`KINDS`]).
 static REMOTE_KIND: AtomicUsize = AtomicUsize::new(0);
-static REMOTE_RETURNED: AtomicBool = AtomicBool::new(false);
 
 /// The job `crash <kind> <cpu>` hands to the other CPU (`run_on` takes a
 /// plain `fn()`).
 fn run_remote() {
     let kind = KINDS[REMOTE_KIND.load(Ordering::Relaxed)];
     crash_fn(kind).expect("a known kind")();
-    REMOTE_RETURNED.store(true, Ordering::Release);
+    REMOTE.store(RETURNED, Ordering::Release);
 }
 
 /// Wait until the other CPU's crash report stops this one, or its fault
 /// returns (it then says why). Asleep, allocating nothing: going on (back
 /// to the prompt, freeing the line's words) could leave the heap's lock
 /// held when the report stops this CPU, and the report would show the heap
-/// as maybe mid-update. A CPU that never runs the job (not tested) is
-/// given up on after 10 s.
+/// as maybe mid-update (the screen's shell could still be allocating if
+/// someone types there meanwhile; not tested). After 10 s (not tested) the
+/// job is taken back if the CPU hasn't taken it; if it has, it is left to
+/// finish, and another remote crash is refused until it returns.
 fn wait_remote(out: &mut dyn Write, cpu: usize) {
     let deadline = crate::time::now_ns() + 10_000_000_000;
-    while !REMOTE_RETURNED.load(Ordering::Acquire) {
+    while REMOTE.load(Ordering::Acquire) == HANDED {
         if crate::time::now_ns() > deadline {
-            let _ = writeln!(out, "crash: cpu {cpu} didn't run it in 10 s");
+            if crate::smp::withdraw(cpu) {
+                REMOTE.store(IDLE, Ordering::Release);
+                let _ = writeln!(out, "crash: cpu {cpu} didn't take it in 10 s; taken back");
+            } else {
+                let _ = writeln!(out, "crash: cpu {cpu} took it but hasn't finished in 10 s");
+            }
             return;
         }
         crate::time::sleep(1_000_000);
     }
+    REMOTE.store(IDLE, Ordering::Release);
     let _ = writeln!(out, "crash: cpu {cpu} ran it and went on");
 }
 
@@ -352,3 +369,18 @@ fn recurse(depth: u64) -> u64 {
     }
     recurse(depth + 1) + frame[7]
 }
+
+crate::ktest!(
+    fn every_crash_kind_has_a_fault() {
+        // `KINDS` (help, completion, `crash <kind> <cpu>`) and `crash_fn`
+        // list the same kinds.
+        use crate::kassert;
+        for kind in KINDS {
+            if crash_fn(kind).is_none() {
+                crate::ktest::diag(format_args!("no fault for {kind}"));
+            }
+            kassert!(crash_fn(kind).is_some());
+        }
+        Ok(())
+    }
+);

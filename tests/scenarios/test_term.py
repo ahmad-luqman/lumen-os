@@ -6,7 +6,7 @@ from typing import NamedTuple
 
 from lumen_harness.image import assert_matches_golden
 from lumen_harness.qemu import Machine
-from lumen_harness.screen import expect_screen
+from lumen_harness.screen import expect_screen, read_screen
 
 # 1280x800 (limine.conf) less the header and margins, in 7x16 cells.
 TERM_LINE = r"INFO  term: terminal 176x41, 500 lines of scrollback\n"
@@ -103,6 +103,10 @@ def test_scrollback(boot, artifacts, golden_dir):
     assert view_moved(m) == (half, str(scrollback - half))
     still = term_status(m)
     assert (still.view, still.top_row) == (half, str(scrollback - half)), still
+    # `term text` reads the view, and the cursor (on the screen's last row)
+    # is below it.
+    view = read_screen(m)
+    assert view.rows[0] == str(scrollback - half) and view.cursor is None, view
     shot = m.screendump("scrolled.png")
     # The view shows `seq`'s lines from there on; the cursor (on the
     # screen's last row) is out of it anyway (a ktest checks that a

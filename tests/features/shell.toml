@@ -19,6 +19,7 @@ tests = [
     "scenario:test_input::test_no_8042_is_a_warning",
     "ktest:lumen_kernel::shell::the_screen_console_writes_each_write_whole",
     "ktest:lumen_kernel::shell::commands::help_lists_every_command_once",
+    "ktest:lumen_kernel::shell::crash::every_crash_kind_has_a_fault",
     "scenario:test_boot::test_breakpoint_is_survivable",
     "scenario:test_boot::test_serial_input_round_trip",
     "scenario:test_crash::*",
@@ -32,7 +33,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Line editing and history: on the screen the cursor keys, Home/End, Delete, Ctrl-A/E/F/K/U/W/C and Up/Down; on plain serial history recalled by erasing and retyping; `history` lists a console's lines; lines limited in columns (a wide character takes two)"
+name = "Line editing and history: on the screen the cursor keys, Home/End, Delete, Ctrl-A/E/F/K/U/W/C and Up/Down; on plain serial history recalled by erasing and retyping; `history` lists a console's lines; lines limited in columns (a wide character takes two), and one that didn't fit isn't run"
 milestone = "M2"
 tests = [
     "scenario:test_shell::test_history_and_line_editing",
@@ -42,7 +43,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Tab completion of command names and their arguments (one match in full, the start several share, or a listing), on the screen and on plain serial (the start several share host-tested only: no two of today's words share more than a letter)"
+name = "Tab completion of command names and their arguments (one match in full, the start several share, or a listing), on the screen and on plain serial (the start several share host-tested only: wherever a prefix matches several of today's words, they already differ right after it)"
 milestone = "M2"
 tests = [
     "scenario:test_shell::test_tab_completion",

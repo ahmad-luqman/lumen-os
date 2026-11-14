@@ -7,9 +7,9 @@
 //!   `ESC O H`/`F`, `ESC [ 1 ~`/`7 ~` and `ESC [ 4 ~`/`8 ~`: Home and End;
 //!   `ESC [ 3 ~`: Delete (modifiers, as in `ESC [ 1 ; 5 C`, are ignored);
 //!   other `ESC [` and `ESC O` sequences are dropped whole, and ESC with
-//!   any other byte (Alt and a key) both bytes; a control character in the
-//!   middle of a sequence ends it and counts as itself (ESC then Enter is
-//!   still Enter);
+//!   any other byte (Alt and a key) both bytes; a C0 control (below 0x20)
+//!   in the middle of a sequence ends it and counts as itself (ESC then
+//!   Enter is still Enter);
 //! - UTF-8: [`Key::Char`] (a malformed or overlong sequence, or one for a
 //!   surrogate or past U+10FFFF, is dropped).
 

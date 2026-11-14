@@ -10,7 +10,8 @@
 //! - The screen shell reads the PS/2 keyboard and answers on the screen's
 //!   terminal, with ANSI line editing. It runs in its own thread
 //!   (`shell-screen`, on the boot CPU), blocked until a key arrives; it
-//!   starts only with both a terminal and a keyboard. Shift+PageUp and
+//!   starts only with a keyboard and a terminal wide enough for a 16-column
+//!   line. Shift+PageUp and
 //!   Shift+PageDown scroll the screen back and forward by half a screen;
 //!   any key the line editor takes shows it again.
 //!
@@ -91,10 +92,11 @@ fn screen_editor() -> Result<Editor, &'static str> {
     Ok(Editor::new(PROMPT, Mode::Ansi, max, HISTORY))
 }
 
-/// The widest line on a console `cols` wide: the prompt and the line leave
-/// the last column free (the editor doesn't wrap).
+/// The widest line on a console `cols` wide: the prompt, the line and the
+/// `^C` Ctrl-C writes after it leave the last column free (the editor
+/// doesn't wrap).
 fn max_line(cols: usize) -> usize {
-    MAX_LINE.min(cols.saturating_sub(PROMPT.len() + 1))
+    MAX_LINE.min(cols.saturating_sub(PROMPT.len() + 3))
 }
 
 /// A shell's loop: a line, its command, again. What the editor writes for a
@@ -129,15 +131,21 @@ fn flush(console: &mut impl Console, shown: &mut String) {
     }
 }
 
-/// Serial, in and out.
+/// Serial, in and out. Each write (a whole `write!`) is made holding the
+/// log's line lock, so another CPU's log line can't land in the middle of
+/// it (the harness reads `term text`'s rows whole).
 struct Serial {
     decoder: Decoder,
 }
 
 impl Write for Serial {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        serial::write_bytes(s.as_bytes());
+        crate::klog::with_line_lock(|| serial::write_bytes(s.as_bytes()));
         Ok(())
+    }
+
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
+        crate::klog::with_line_lock(|| serial::SerialWriter.write_fmt(args))
     }
 }
 

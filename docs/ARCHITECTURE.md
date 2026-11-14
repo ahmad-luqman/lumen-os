@@ -804,8 +804,11 @@ off. A wake from another CPU queues the thread there and sends the
   skipped during setup, or why there is no keyboard (and whether IRQ 1 was
   routed); a non-zero skip count is also logged after init.
 - **Tests:** QMP `send-key` drives the keyboard (`Machine.type_text` and
-  `press`; QEMU queues each key behind the last one's hold time, so they
-  arrive in order), and the scenarios read what the screen's shell did
+  `press`; QEMU queues each key behind the last one, so they arrive in
+  order; its input queue holds 1024 entries and drops the rest without a
+  word, so `press` paces itself on the time QEMU takes to send each key,
+  and `test_a_long_line_of_shifted_keys` checks 150 shifted keys arrive),
+  and the scenarios read what the screen's shell did
   back from the screen (`lumen_harness.screen`, through the serial shell's
   `term text`); a scenario boots with
   `lumen.keymap=de` in an ISO built for it, and one presses a key over and
@@ -867,7 +870,7 @@ off. A wake from another CPU queues the thread there and sends the
   errors' and warnings' messages coloured too (a ktest reads the cells).
   The screen's shell writes there (section "Shell"), nothing of it on
   serial (except what a `crash` says on both: a fault that didn't happen,
-  the heap's line before a heap crash). Each of its `write!`s and each log line is formatted and written under one lock, so
+  the heap's line before a heap crash; the screen half not tested). Each of its `write!`s and each log line is formatted and written under one lock, so
   another CPU's log line can't split an escape sequence written in one
   `write!` (ktests check the formatting happens under the lock); a log line
   starts from the default colours (a ktest leaves bold, inverse and a
@@ -884,7 +887,8 @@ off. A wake from another CPU queues the thread there and sends the
 - **Shell commands** (either console, writing to the one that ran them):
   `clear` (the screen and its scrollback, on a console that takes escape
   codes), `colors`, `seq <n>`, `term` (size, cursor, scrollback, the view's offset
-  and top row, cells drawn) and `term text` (the view's rows); without a
+  and top row, cells drawn) and `term text` (the view's rows, and the cursor counted in the view, or
+  `cursor below the view` when scrolled back past it; tested); without a
   terminal, `term` says so (not tested). In the screen's shell
   Shift+PageUp/PageDown scroll the view half a screen (logged at debug
   level: serial only, the screen shows up to `info`); a key the line
@@ -921,8 +925,12 @@ off. A wake from another CPU queues the thread there and sends the
 - **The line editor** (`lumen_shell::Editor`) takes keys and writes what
   the console must show: printable characters inserted at the cursor (up
   to 160 columns a line, a wide character two, fewer on a console too
-  narrow; zero-width ones refused; a screen too narrow for 16 gets no
-  shell, not tested),
+  narrow: the prompt, the line and Ctrl-C's `^C` must fit; zero-width ones
+  refused; a character that doesn't fit makes Enter say `line too long
+  (more than N columns): not run` and drop the line instead of running it
+  cut short, tested on plain serial; the screen's and `lumen.ansi`'s
+  narrower limits not tested on their own; a screen too narrow for 16
+  gets no shell, not tested),
   Left/Right, Home/End and Ctrl-A/E/B/F, Backspace, Delete and Ctrl-D,
   Ctrl-K/U/W, Up/Down and Ctrl-P/N through the history (100 lines; blank
   lines and repeats of the newest not kept; going past the newest brings
@@ -932,21 +940,22 @@ off. A wake from another CPU queues the thread there and sends the
   then each command's argument words: `crash` its kinds and `thread`,
   `term` `text`; options that aren't printable are skipped): one that
   fits is written in full (quoted as the word was, the quote closed) with
-  a space, several up to where they differ (host-tested only: no two of
-  today's commands or argument words share more than their first
-  letter), or, if they already differ there, listed on a line of their
-  own. With
+  a space (left out if only that doesn't fit), several up to where they
+  differ (host-tested only: wherever a prefix matches several of today's
+  words, they already differ right after it), or, if they already differ
+  there or that doesn't fit, listed on a line of their own. With
   ANSI escapes (the screen; serial with `lumen.ansi`) it redraws the line
   (`CR`, the prompt, the line, `ESC [ K`, the cursor moved back) unless
   the change only appends or only moves the cursor. In **plain** mode
   (serial without `lumen.ansi`, so the harness can read it line by line)
   the cursor stays at the end and the console only gets characters to
   append and `BS space BS` to erase: a history line replaces the typed one
-  by erasing and typing; the cursor keys, Home/End, Ctrl-A/E/B/F and
-  Ctrl-L do nothing; a listing is a line followed by the prompt and the
-  line again. Neither mode wraps (with `lumen.ansi` a serial terminal is
-  taken to be 80 columns wide; plain serial doesn't redraw, so its 160
-  columns may wrap on a narrower terminal). A
+  by erasing and typing; the cursor keys, Home/End, Ctrl-A/E/B/F, Delete,
+  Ctrl-D, Ctrl-K and Ctrl-L do nothing (the cursor is always at the end);
+  a listing is a line followed by the prompt and the line again. Neither
+  mode wraps (with `lumen.ansi` a serial terminal is taken to be 80
+  columns wide; plain serial doesn't redraw, so its 160 columns may wrap
+  on a narrower terminal). A
   randomized host test runs the editor's output, in both modes, through
   `lumen-term` after every key and checks the cursor's row shows the
   prompt and the line, and the cursor sits where the editor says.
@@ -955,24 +964,28 @@ off. A wake from another CPU queues the thread there and sends the
   arrows, Home and End; a ktest maps each); serial's from bytes
   (`lumen_shell::input::Decoder`: CR, LF or CR LF as one Enter, DEL and BS
   as Backspace, other control characters as Ctrl and a letter, `ESC [`
-  and `ESC O` sequences for the arrows, Home, End and Delete, a control
-  character ending a sequence it interrupts, UTF-8 without overlong
-  forms; host tested). Each key's output is written to the console in
+  and `ESC O` sequences for the arrows, Home, End and Delete, a C0
+  control (below 0x20) ending a sequence it interrupts, UTF-8 without
+  overlong forms; host tested). Serial writes are made holding the log's
+  line lock, so a log line can't land inside one (not tested on its own). Each key's output is written to the console in
   one write, so on the screen a log line can't land in the middle of a
   redraw (not tested on its own).
 - **Commands:** `help` (a ktest checks it has a line for each command
   in the table, and no name is there twice), `echo` (its words joined by
   single spaces), `int3`, `crash <kind> [cpu|thread]` (the thread is
   `shell-crash`), `trace [n]`, `heap`, `ticks`, `kbd`, `term [text]`,
-  `clear`, `colors`, `seq`, `sleep`, `uptime`, `clocks`, `exit` (kmon's,
-  their output unchanged otherwise) and `history` (the console's lines,
-  numbered). Each writes to the console that ran it. On plain serial,
+  `clear`, `colors`, `seq`, `sleep`, `uptime`, `clocks`, `exit` (kmon's;
+  besides what this list says, the deliberate panic now says `from the
+  shell`, and `crash <kind> <cpu>` reports a fault that returned) and
+  `history` (the console's lines, numbered). Each writes to the console that ran it. On plain serial,
   `colors` and `clear` say the console is plain (tested), and with
   `lumen.ansi` they work there (tested). A `crash` whose fault doesn't
   happen says so on serial and the screen (the screen not tested). `crash <kind> <cpu>` waits, asleep and allocating nothing,
   until that CPU's report stops this one or its fault returns (so the
-  report never finds the heap's lock held by the shell freeing its line;
-  a CPU that doesn't run it is given up on after 10 s, not tested).
+  report doesn't find the heap's lock held by the shell freeing its line;
+  the screen's shell could still allocate if someone types there
+  meanwhile, not tested). After 10 s (not tested) the job is taken back
+  if the CPU hasn't taken it; while one is out, another is refused.
   `crash dfree` and `crash heapcorrupt` print the heap's line before the
   damage, which the tests compare with the report's.
 - **Tests:** `cargo:lumen-shell`; `test_shell` (echo with quotes on both

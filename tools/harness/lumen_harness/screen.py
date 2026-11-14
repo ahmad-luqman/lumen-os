@@ -3,9 +3,9 @@
 scenarios see what the screen shell, typed on the keyboard, did.
 
 `term text` prints each row of the view after a `|` (trailing blanks
-trimmed), then `term text: <n> rows, cursor (<col>, <row>)`, or `term text:
-<n> rows, scrolled back` while the view is scrolled back (the cursor is
-below it).
+trimmed), then `term text: <n> rows, cursor (<col>, <row>)` (the row
+counted in the view, the column in cells), or `term text: <n> rows, cursor
+below the view` when the view is scrolled back past it.
 """
 
 from __future__ import annotations
@@ -18,14 +18,16 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from lumen_harness.qemu import Machine
 
-SUMMARY = re.compile(r"term text: (\d+) rows, (?:cursor \((\d+), (\d+)\)|scrolled back)\n")
+SUMMARY = re.compile(
+    r"^term text: (\d+) rows, cursor (?:\((\d+), (\d+)\)|below the view)\n", re.MULTILINE
+)
 PROMPT = r"lumen> "
 
 
 @dataclass
 class Screen:
     rows: list[str]
-    cursor: tuple[int, int] | None  # (col, row); None while scrolled back
+    cursor: tuple[int, int] | None  # (col, row in the view); None below the view
 
     @property
     def text(self) -> str:

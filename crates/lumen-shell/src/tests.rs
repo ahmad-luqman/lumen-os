@@ -142,6 +142,9 @@ fn utf8_is_decoded_and_malformed_sequences_dropped() {
     assert_eq!(decode(b"\xc3a\xe2\x82b\x80\xffc"), [Char('a'), Char('b'), Char('c')]);
     // Control characters (U+0080 to U+009F) aren't printable.
     assert_eq!(decode(b"\xc2\x85d"), [Char('d')]);
+    // The smallest 3 and 4 byte ones; the largest overlong ones below them.
+    assert_eq!(decode("\u{800}\u{10000}".as_bytes()), [Char('\u{800}'), Char('\u{10000}')]);
+    assert_eq!(decode(b"\xe0\x9f\xbf\xf0\x8f\xbf\xbfz"), [Char('z')]);
     // Overlong forms (A in 3 and 4 bytes), a surrogate, past U+10FFFF.
     assert_eq!(decode(b"\xe0\x81\x81\xf0\x80\x81\x81\xed\xa0\x80\xf4\x90\x80\x80e"), [Char('e')]);
 }
@@ -522,6 +525,50 @@ fn tab_extends_to_the_start_several_options_share() {
         assert_eq!(tab_after(mode, &["a b1", "a b2"], "x a"), ("x a\\ b".into(), 6));
         assert_eq!(words::split("x 'it'\\''s 'one").unwrap(), ["x", "it's one"]);
     }
+}
+
+#[test]
+fn tab_with_one_option_the_start_of_another() {
+    // "df" and "dfree" (crash's kinds): "df" typed is all they share, so
+    // they're listed; "t" for "term" and "terminal" extends to "term".
+    assert_eq!(tab_after(Mode::Plain, &["df", "dfree"], "x df"), ("x df".into(), 4));
+    assert_eq!(tab_after(Mode::Plain, &["term", "terminal"], "x t"), ("x term".into(), 6));
+}
+
+#[test]
+fn tab_near_the_line_limit() {
+    // Just fits, with its space (the word replaced counts as freed).
+    assert_eq!(tab_after(Mode::Ansi, &["crash"], "xxxxxxxxxxxx cra"), ("xxxxxxxxxxxx crash ".into(), 19));
+    assert_eq!(tab_after(Mode::Ansi, &["日日x"], "xxxxxxxxxxxx 日日"), ("xxxxxxxxxxxx 日日x ".into(), 17));
+    // Only the space doesn't fit: completed without it.
+    assert_eq!(tab_after(Mode::Ansi, &["crash"], "xxxxxxxxxxxxxx cra"), ("xxxxxxxxxxxxxx crash".into(), 20));
+    // The start two options share doesn't fit: listed instead.
+    let mut editor = Editor::new("> ", Mode::Plain, 20, 10);
+    let mut out = String::new();
+    for c in "xxxxxxxxxxxxxxxxx s".chars() {
+        editor.key(Key::Char(c), &Fixed(&["stats", "stack"]), &mut out).unwrap();
+    }
+    out.clear();
+    editor.key(Key::Tab, &Fixed(&["stats", "stack"]), &mut out).unwrap();
+    assert_eq!(out, "\nstack  stats\n> xxxxxxxxxxxxxxxxx s");
+}
+
+#[test]
+fn a_line_that_didnt_fit_isnt_run() {
+    use Key::*;
+    // A wide character can't take the last column alone.
+    let mut t = Typist::new(Mode::Plain);
+    t.text(&"x".repeat(19)).text("日");
+    assert_eq!(t.state(), ("x".repeat(19), 19));
+    t.take();
+    // Enter then says so and runs nothing, even after making room.
+    t.keys(&[Backspace, Enter]);
+    assert_eq!(t.take(), "\x08 \x08\nline too long (more than 20 columns): not run\n> ");
+    assert_eq!(t.events, [Event::Cancelled]);
+    assert!(t.editor.history().is_empty());
+    // The next line starts afresh.
+    t.text("ok").keys(&[Enter]);
+    assert_eq!(t.events.last(), Some(&Event::Line("ok".into())));
 }
 
 #[test]

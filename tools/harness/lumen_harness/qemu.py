@@ -208,13 +208,14 @@ class ExpectTimeout(AssertionError):
 _machine_ids = itertools.count()
 
 
-# How long QEMU holds a key pressed by `Machine.press`, and how long it
-# takes to send one: measured, 30 shifted keys pressed at once reached the
-# guest over 2.4 s (about 4 hold times each), so this allows that.
+# How long QEMU holds a key pressed by `Machine.press`. QEMU waits that
+# long after each key's press and after each key's release (`ui/input.c`
+# `qmp_send_key`), so a press of n keys takes 2n hold times to send:
+# measured, 30 shift+a presses reached the guest over 2.4 s.
 KEY_HOLD_MS = 20
-KEY_TIME = 4 * KEY_HOLD_MS / 1000
-# Presses `Machine.press` lets QEMU queue at once (see there).
-KEYS_IN_FLIGHT = 40
+# How far ahead of QEMU `Machine.press` lets the keys queue, in seconds
+# (see there).
+KEYS_AHEAD = 3.2
 
 
 class Machine:
@@ -399,17 +400,19 @@ class Machine:
         `lumen_harness.screen.expect_screen`.
 
         QEMU's input queue holds 1024 entries and silently drops the rest
-        (`ui/input.c`): a `send-key` of n keys takes about 6n (each key's
-        press and release, a sync after each, and the hold time after
-        each), and QEMU takes about `KEY_TIME` to send one. So this paces
-        itself: it waits whenever more than `KEYS_IN_FLIGHT` presses would
-        be queued (at most 12 entries each with shift, well under the
-        limit). `test_a_long_line_of_shifted_keys` checks 150 arrive."""
+        (`ui/input.c`): a `send-key` of n keys takes 6n (each key's press
+        and release, a sync after each, and the hold time after each), and
+        2n hold times to send. So this paces itself: it waits whenever the
+        keys queued would take more than `KEYS_AHEAD` seconds to send, which
+        is at most 150 entries a second ahead whatever n is (about 480, under
+        the limit). `test_a_long_line_of_shifted_keys` checks 150 shifted
+        keys arrive."""
         ahead = self._keys_sent_by - time.monotonic()
-        if ahead > KEYS_IN_FLIGHT * KEY_TIME:
-            time.sleep(ahead - KEYS_IN_FLIGHT * KEY_TIME / 2)
+        if ahead > KEYS_AHEAD:
+            time.sleep(ahead - KEYS_AHEAD / 2)
         self.qmp().send_key(qcodes, hold_ms=KEY_HOLD_MS)
-        self._keys_sent_by = max(self._keys_sent_by, time.monotonic()) + KEY_TIME
+        cost = 2 * len(qcodes) * KEY_HOLD_MS / 1000
+        self._keys_sent_by = max(self._keys_sent_by, time.monotonic()) + cost
 
     def type_text(self, text: str) -> None:
         """Type `text` on the guest's keyboard as a US layout would, a key at

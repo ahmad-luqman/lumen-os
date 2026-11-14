@@ -18,9 +18,17 @@ def test_rows_and_cursor():
     assert screen.text == "lumen> echo hi\nhi\nlumen>\n"
 
 
-def test_no_cursor_while_scrolled_back():
-    screen = parse("|41\n|42\nterm text: 2 rows, scrolled back\n")
+def test_no_cursor_below_the_view():
+    screen = parse("|41\n|42\nterm text: 2 rows, cursor below the view\n")
     assert (screen.rows, screen.cursor) == (["41", "42"], None)
+
+
+def test_the_summary_only_counts_at_the_start_of_a_line():
+    # A screen row showing a `term text` summary is a row, not the end.
+    out = "|term text: 1 rows, cursor (0, 0)\nterm text: 1 rows, cursor (3, 0)\n"
+    summary = SUMMARY.search(out)
+    assert summary and summary.start() > 0
+    assert parse_term_text(out[: summary.start()], summary).cursor == (3, 0)
 
 
 def test_a_row_that_starts_with_a_bar_keeps_it():

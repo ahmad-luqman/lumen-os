@@ -73,7 +73,9 @@ def test_history_and_line_editing(boot):
     # Ctrl-U deletes before the cursor, Ctrl-K after it.
     keys(m, "junk echo ", *[["left"]] * 5, ["ctrl", "u"], ["end"], "kept\n")
     expect_screen(m, r"^lumen> echo kept\nkept$")
-    keys(m, "echo cut junk", *[["left"]] * 5, ["ctrl", "k"], ["ctrl", "a"], ["ctrl", "f"], "\n")
+    # Ctrl-K deletes after the cursor; Ctrl-A goes to the start and Ctrl-F
+    # one on ("eho cut" becomes "echo cut" only if both move).
+    keys(m, "eho cut junk", *[["left"]] * 5, ["ctrl", "k"], ["ctrl", "a"], ["ctrl", "f"], "c\n")
     expect_screen(m, r"^lumen> echo cut\ncut$")
     # Ctrl-C drops the line; nothing runs.
     keys(m, "echo dropped", ["ctrl", "c"], "echo after\n")
@@ -124,6 +126,9 @@ def test_tab_completion(boot):
     m.expect(r"uptime \nuptime: \d+ ns\n" + PROMPT, 10)
     m.send("cr\tp\t\x15\r")
     m.expect(r"crash p\npanic  pf\nlumen> crash p(\x08 \x08){7}\n" + PROMPT, 10)
+    # One option the start of another: "df" is all they share.
+    m.send("crash df\t\x15\r")
+    m.expect(r"crash df\ndf  dfree\nlumen> crash df(\x08 \x08){8}\n" + PROMPT, 10)
     assert "\x1b" not in m.output[start:]
 
 
@@ -132,6 +137,10 @@ def test_unknown_command_single_error(boot):
     # error on the console it was typed on, and nothing else.
     m = shells(boot)
     assert run(m, "frobnicate now") == "unknown command: frobnicate (try 'help')\n"
+    # A line longer than the console takes (160 columns) isn't run cut
+    # short: the shell says so.
+    m.send_line("echo " + "x" * 160)
+    m.expect(r"echo x{155}\nline too long \(more than 160 columns\): not run\n" + PROMPT, 10)
     # (`help` lists every command: a ktest checks the table against it.)
     assert run(m, "help").startswith("commands:\n  help ")
     assert run(m, "echo 'open") == "syntax error: unclosed ' quote\n"
