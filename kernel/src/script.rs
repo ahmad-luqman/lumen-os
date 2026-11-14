@@ -252,6 +252,9 @@ struct State {
     stop: Cell<Option<Stop>>,
     /// When the console may be asked for a key next (`time::now_ns`).
     next_poll: Cell<u64>,
+    /// The run's console is a pipeline's: no drawing (it would wait for a
+    /// key, unseen).
+    piped: Cell<bool>,
     /// The heap's bytes in use when the session started.
     heap_start: usize,
 }
@@ -265,6 +268,7 @@ impl State {
             canvas: RefCell::new(None),
             stop: Cell::new(None),
             next_poll: Cell::new(0),
+            piped: Cell::new(false),
             heap_start: crate::mm::heap::stats().used,
         }
     }
@@ -322,9 +326,13 @@ impl State {
     }
 
     /// Run `f` on the canvas, taken on first use; an error if the run must
-    /// stop, there is no canvas, or it was taken back (a crash report).
+    /// stop, it runs in a pipeline, there is no canvas, or it was taken back
+    /// (a crash report).
     fn draw<R>(&self, f: impl FnOnce(&Canvas) -> R) -> Result<R, Box<EvalAltResult>> {
         self.check()?;
+        if self.piped.get() {
+            return Err("drawing needs the screen, which a command in a pipeline doesn't get".into());
+        }
         let mut canvas = self.canvas.borrow_mut();
         if canvas.is_none() {
             *canvas = Some(term::canvas(self.owner).map_err(|e| e.to_string())?);
@@ -817,6 +825,7 @@ impl Session {
     /// and drops them all after the heap budget stopped a line.
     fn run(&mut self, source: &str, console: &mut dyn Console) {
         self.state.reset();
+        self.state.piped.set(console.piped());
         let result =
             self.state.console.lend(console, || self.engine.eval_with_scope::<Dynamic>(&mut self.scope, source));
         let stop = self.state.stop.get();
@@ -828,13 +837,14 @@ impl Session {
         };
         // Text made before writing it (formatting a value allocates: see
         // `Ctx::out`), at most the text limit.
-        let text = match &result {
-            Ok(v) if v.is_unit() => None,
-            Ok(v) => Some(
-                Bounded::make(limits.string, |w| write!(w, "{v}"))
-                    .unwrap_or_else(|_| format!("rhai: the result is more than {} of text", Bytes(limits.string))),
-            ),
-            Err(e) => Some(format!("rhai: {}", describe(e, stop, &limits))),
+        // (`failed`: an error, or a result too long to show.)
+        let (text, failed) = match &result {
+            Ok(v) if v.is_unit() => (None, false),
+            Ok(v) => match Bounded::make(limits.string, |w| write!(w, "{v}")) {
+                Ok(text) => (Some(text), false),
+                Err(_) => (Some(format!("rhai: the result is more than {} of text", Bytes(limits.string))), true),
+            },
+            Err(e) => (Some(format!("rhai: {}", describe(e, stop, &limits))), true),
         };
         let cleared = self.repl && stop == Some(Stop::Heap) && !self.scope.is_empty();
         if cleared {
@@ -843,8 +853,15 @@ impl Session {
             self.scope = self.scope.clone_visible();
         }
         let canvas = self.state.canvas.take().filter(|c| result.is_ok() && c.is_live());
-        if let Some(text) = text {
-            let _ = writeln!(console, "{text}{}", if cleared { " (variables cleared)" } else { "" });
+        match text {
+            // A failure goes to the console even in a pipeline, and ends it.
+            Some(text) if failed => {
+                console.fail(&format!("{text}{}", if cleared { " (variables cleared)" } else { "" }));
+            }
+            Some(text) => {
+                let _ = writeln!(console, "{text}");
+            }
+            None => {}
         }
         if let Some(c) = canvas {
             press_a_key(&c, console);
@@ -888,13 +905,15 @@ fn in_thread(console: &mut dyn Console, owner: Owner, limits: Limits, job: Job) 
         Job::Eval { source } => Session::new(owner, limits, false).run(&source, console),
     });
     if let Err(e) = ran {
-        let _ = writeln!(console, "rhai: no thread for the script: {e}");
+        console.fail(&format!("rhai: no thread for the script: {e}"));
     }
 }
 
 /// The shell's `rhai` command.
 pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
     let job = match args {
+        // Its prompt and the lines typed would go down the pipeline unseen.
+        [] if ctx.piped() => return ctx.fail("rhai: the REPL doesn't run in a pipeline (rhai -e <expr> does)"),
         [] => Job::Repl { ansi: ctx.ansi },
         [flag, rest @ ..] if flag == "-e" && !rest.is_empty() => Job::Eval { source: rest.join(" ") },
         [demo] if demo == "demo" => {
@@ -906,16 +925,13 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
             return;
         }
         [demo, name] if demo == "demo" => match DEMOS.iter().find(|d| d.name == name.as_str()) {
+            // Refused as a group: `count` runs until Ctrl-C and `rainbow`
+            // draws and waits for a key (`fib` does neither).
+            Some(_) if ctx.piped() => return ctx.fail("rhai: demos don't run in a pipeline (rhai -e <expr> does)"),
             Some(d) => Job::Eval { source: d.source.to_string() },
-            None => {
-                let _ = writeln!(ctx.out, "rhai: no demo called {name} (try 'rhai demo')");
-                return;
-            }
+            None => return ctx.fail(format_args!("rhai: no demo called {name} (try 'rhai demo')")),
         },
-        _ => {
-            let _ = writeln!(ctx.out, "usage: rhai [-e <expr> | demo [name]]");
-            return;
-        }
+        _ => return ctx.fail("usage: rhai [-e <expr> | demo [name]]"),
     };
     let owner = ctx.owner();
     in_thread(ctx.out, owner, LIMITS, job);

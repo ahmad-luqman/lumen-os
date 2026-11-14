@@ -44,10 +44,15 @@ pub enum Mode {
 
 /// What can complete a word.
 pub trait Complete {
-    /// Every word that can follow `words` (the first word of a line when
-    /// `words` is empty). The editor keeps those that start with what was
-    /// typed.
+    /// Every word that can follow `words`, the words of the command being
+    /// typed (since the last `|`; its first word when `words` is empty).
+    /// The editor keeps those that start with what was typed.
     fn options(&self, words: &[String], out: &mut Vec<String>);
+
+    /// [`Self::options`] for a command after a `|`.
+    fn options_after_pipe(&self, words: &[String], out: &mut Vec<String>) {
+        self.options(words, out);
+    }
 }
 
 /// What a key ended.
@@ -274,7 +279,11 @@ impl Editor {
             return Ok(());
         };
         let mut options = Vec::new();
-        complete.options(&word.words, &mut options);
+        if word.after_pipe {
+            complete.options_after_pipe(&word.words, &mut options);
+        } else {
+            complete.options(&word.words, &mut options);
+        }
         options.retain(|o| o.starts_with(word.text.as_str()) && o.chars().all(|c| width(c) > 0));
         options.sort();
         options.dedup();

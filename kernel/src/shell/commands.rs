@@ -1,11 +1,14 @@
 //! The shell's commands: kmon's, with their names and output (`echo`
 //! joins its words with single spaces; `clear` and `colors` need a console
 //! that takes escape codes), plus `history`, `term text`, `reboot`,
-//! `shutdown` and the system commands (`cpus`, `mem`, `irqs`, `dmesg`,
-//! `date`, `top`: `sysinfo.rs`). A table the
-//! line editor completes from. Each writes to the console that ran it.
+//! `shutdown`, the system commands (`cpus`, `mem`, `irqs`, `threads`,
+//! `dmesg`, `date`, `top`: `sysinfo.rs`) and the filters that come after a
+//! `|` (`grep`, `where`, `sort`, `first`, `count`, `select`: `pipe.rs`). A
+//! table the line editor completes from. Each writes to the console that
+//! ran it (or, at the start of a pipeline, to the next command; a usage or
+//! error line goes to the console all the same: `Ctx::fail`).
 
-use super::{Ctx, crash, sysinfo};
+use super::{Ctx, crash, pipe, sysinfo};
 use crate::arch;
 use alloc::string::String;
 use core::arch::asm;
@@ -92,14 +95,14 @@ pub static COMMANDS: Table<Run> = Table(&[
         name: "mem",
         args: &[],
         usage: "",
-        about: "physical frames, the heap and kernel stacks",
+        about: "physical frames, the heap and kernel stacks (piped: in bytes)",
         run: sysinfo::mem,
     },
     Command {
         name: "irqs",
         args: &[],
         usage: "",
-        about: "the I/O APIC's inputs decoded, and interrupts per vector",
+        about: "the I/O APIC's inputs decoded, and interrupts per vector (piped: the per-vector counts only)",
         run: sysinfo::irqs,
     },
     Command {
@@ -124,40 +127,104 @@ pub static COMMANDS: Table<Run> = Table(&[
         run: sysinfo::top,
     },
     Command { name: "history", args: &[], usage: "", about: "the lines entered on this console", run: history },
+    Command {
+        name: "threads",
+        args: &[],
+        usage: "",
+        about: "each thread: its CPU, state and the ticks it ran",
+        run: sysinfo::threads,
+    },
+    Command {
+        name: "grep",
+        args: &[],
+        usage: "<text>",
+        about: "after a |: the lines (or rows) containing text",
+        run: |ctx, _| pipe::needs_input(ctx, "grep"),
+    },
+    Command {
+        name: "where",
+        args: &[&[], &lumen_shell::pipe::OPS],
+        usage: "<column> <op> <value>",
+        about: "after a |: the rows whose column compares with value by op (~: contains)",
+        run: |ctx, _| pipe::needs_input(ctx, "where"),
+    },
+    Command {
+        name: "sort",
+        args: &[&[], &["desc"]],
+        usage: "<column> [desc]",
+        about: "after a |: the rows in that column's order",
+        run: |ctx, _| pipe::needs_input(ctx, "sort"),
+    },
+    Command {
+        name: "first",
+        args: &[],
+        usage: "<n>",
+        about: "after a |: the first n lines (or rows)",
+        run: |ctx, _| pipe::needs_input(ctx, "first"),
+    },
+    Command {
+        name: "count",
+        args: &[],
+        usage: "",
+        about: "after a |: how many lines (or rows)",
+        run: |ctx, _| pipe::needs_input(ctx, "count"),
+    },
+    Command {
+        name: "select",
+        args: &[],
+        usage: "<column>...",
+        about: "after a |: only those columns, in that order",
+        run: |ctx, _| pipe::needs_input(ctx, "select"),
+    },
     Command { name: "reboot", args: &[], usage: "", about: "restart the machine", run: reboot },
     Command { name: "shutdown", args: &[], usage: "", about: "power off (ACPI S5)", run: shutdown },
     Command { name: "exit", args: &[], usage: "", about: "end QEMU (only with lumen.qemu_exit)", run: exit },
 ]);
 
 /// Split `line` into words and run the command the first names (one line
-/// of error if it can't be split or no command has that name).
+/// of error if it can't be split or no command has that name), or the
+/// pipeline it is (`cpus | count`: `pipe.rs`).
 pub fn run(line: &str, ctx: &mut Ctx<'_>) {
     run_in(&COMMANDS, line, ctx);
 }
 
-/// [`run`] with the commands in `table`. The command gets a canvas owner
-/// of its own; when it returns, a canvas it left behind (kept in a static,
-/// leaked) is taken back, so the screen doesn't stay frozen. A canvas held
-/// by a command on the other console isn't this one's, and stays.
-fn run_in(table: &Table<Run>, line: &str, ctx: &mut Ctx<'_>) {
-    let words = match words::split(line) {
-        Ok(words) => words,
+/// [`run`] with the commands in `table`.
+pub(super) fn run_in(table: &Table<Run>, line: &str, ctx: &mut Ctx<'_>) {
+    let stages = match words::split_pipeline(line) {
+        Ok(stages) => stages,
         Err(e) => {
-            let _ = writeln!(ctx.out, "syntax error: {e}");
-            return;
+            return ctx.fail(format_args!("syntax error: {e}"));
         }
     };
-    let Some((name, args)) = words.split_first() else { return };
-    let Some(command) = table.find(name) else {
-        let _ = writeln!(ctx.out, "unknown command: {name} (try 'help')");
-        return;
-    };
+    match stages.as_slice() {
+        [] => {}
+        [words] => {
+            let (name, args) = words.split_first().expect("split_pipeline gives no empty command");
+            match table.find(name) {
+                Some(command) => run_command(command, ctx, args),
+                None => unknown(ctx, name),
+            }
+        }
+        _ => pipe::run(table, &stages, ctx),
+    }
+}
+
+/// Say no command is called `name`.
+pub(super) fn unknown(ctx: &mut Ctx<'_>, name: &str) {
+    ctx.fail(format_args!("unknown command: {name} (try 'help')"));
+}
+
+/// Run `command` with `args`. It gets a canvas owner of its own; when it
+/// returns, a canvas it left behind (kept in a static, leaked) is taken
+/// back, so the screen doesn't stay frozen. A canvas held by a command on
+/// the other console isn't this one's, and stays.
+pub(super) fn run_command(command: &Command<Run>, ctx: &mut Ctx<'_>, args: &[String]) {
     // (A command run from inside another, e.g. by a script, gets its own
     // owner too, and the outer one's is back afterwards.)
     let outer = core::mem::replace(&mut ctx.owner, crate::term::Owner::new());
     (command.run)(ctx, args);
     if crate::term::reclaim_canvas(ctx.owner) {
-        log::warn!(target: "shell", "{name} left the screen paused; took it back");
+        log::warn!(target: "shell", "{} left the screen paused; took it back", command.name);
     }
     ctx.owner = outer;
 }
@@ -197,6 +264,7 @@ fn help(ctx: &mut Ctx<'_>, _: &[String]) {
         }
         text.push('\n');
     }
+    text.push_str("pipes: a command's output through filters, e.g. irqs | where count > 0 | sort count desc\n");
     text.push_str(
         "keys: Tab completes; Up/Down history; Ctrl-U/W delete, Ctrl-C drops the line; \
          the cursor keys, Home/End, Delete, Ctrl-A/E/B/F/D/K and Ctrl-L on the screen (or serial with lumen.ansi)\n",
@@ -218,8 +286,7 @@ fn int3(ctx: &mut Ctx<'_>, _: &[String]) {
 fn trace(ctx: &mut Ctx<'_>, args: &[String]) {
     let n = if args.is_empty() { Some(16) } else { number(args) };
     let Some(n) = n else {
-        let _ = writeln!(ctx.out, "usage: trace [n]");
-        return;
+        return ctx.fail("usage: trace [n]");
     };
     let out = &mut *ctx.out;
     let ring = crate::trace::ring();
@@ -297,7 +364,7 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
                     t.cells_drawn,
                     if t.paused { ", paused (a command is drawing)" } else { "" }
                 ),
-                None => writeln!(out, "{NONE}"),
+                None => return ctx.fail(NONE),
             };
         }
         [arg] if arg == "text" => match crate::term::view_text() {
@@ -310,22 +377,28 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
                     None => writeln!(out, "term text: {} rows, cursor below the view", view.rows.len()),
                 };
             }
-            None => {
-                let _ = writeln!(out, "{NONE}");
-            }
+            None => ctx.fail(NONE),
         },
-        _ => {
-            let _ = writeln!(out, "usage: term [text]");
-        }
+        _ => ctx.fail("usage: term [text]"),
     }
 }
 
-/// The message for a command that needs escape codes on a plain console.
-const PLAIN: &str = "this console is plain text (boot with lumen.ansi for escape codes)";
+/// Whether the console takes escape codes; if not, `name` says why (in a
+/// pipeline, or a plain console) and fails.
+fn takes_escapes(ctx: &mut Ctx<'_>, name: &str) -> bool {
+    if ctx.piped() {
+        ctx.fail(format_args!("{name}: escape codes don't go into a pipeline"));
+    } else if !ctx.ansi {
+        ctx.fail(format_args!("{name}: this console is plain text (boot with lumen.ansi for escape codes)"));
+    }
+    ctx.ansi && !ctx.piped()
+}
 
 fn clear(ctx: &mut Ctx<'_>, _: &[String]) {
     // Home, erase the screen, erase the scrollback.
-    let _ = if ctx.ansi { ctx.out.write_str("\x1b[H\x1b[2J\x1b[3J") } else { writeln!(ctx.out, "clear: {PLAIN}") };
+    if takes_escapes(ctx, "clear") {
+        let _ = ctx.out.write_str("\x1b[H\x1b[2J\x1b[3J");
+    }
 }
 
 /// A colour test pattern: the 16 named colours as backgrounds (`48;5;n`)
@@ -333,11 +406,10 @@ fn clear(ctx: &mut Ctx<'_>, _: &[String]) {
 /// (256-colour SGR), bold, inverse and a truecolor gradient; then
 /// `colors: done`.
 fn colors(ctx: &mut Ctx<'_>, _: &[String]) {
-    let s = &mut *ctx.out;
-    if !ctx.ansi {
-        let _ = writeln!(s, "colors: {PLAIN}");
+    if !takes_escapes(ctx, "colors") {
         return;
     }
+    let s = &mut *ctx.out;
     let _ = write!(s, "16 colours  ");
     for i in 0..16 {
         let _ = write!(s, "\x1b[48;5;{i}m   ");
@@ -383,9 +455,7 @@ fn seq(ctx: &mut Ctx<'_>, args: &[String]) {
                 let _ = writeln!(ctx.out, "{i}");
             }
         }
-        _ => {
-            let _ = writeln!(ctx.out, "usage: seq <n> (up to 10000)");
-        }
+        _ => ctx.fail("usage: seq <n> (up to 10000)"),
     }
 }
 
@@ -395,9 +465,7 @@ fn sleep(ctx: &mut Ctx<'_>, args: &[String]) {
             crate::time::sleep(ms * 1_000_000);
             let _ = writeln!(ctx.out, "slept {ms} ms");
         }
-        _ => {
-            let _ = writeln!(ctx.out, "usage: sleep <ms> (up to 60000)");
-        }
+        _ => ctx.fail("usage: sleep <ms> (up to 60000)"),
     }
 }
 
@@ -409,11 +477,10 @@ fn uptime(ctx: &mut Ctx<'_>, _: &[String]) {
 /// the PIT and the HPET (the tests compare them).
 fn clocks(ctx: &mut Ctx<'_>, _: &[String]) {
     use crate::time::{self, Reference};
-    let out = &mut *ctx.out;
     let (Some(tsc), Some(reference)) = (time::tsc(), time::reference()) else {
-        let _ = writeln!(out, "clocks: the TSC isn't calibrated");
-        return;
+        return ctx.fail("clocks: the TSC isn't calibrated");
     };
+    let out = &mut *ctx.out;
     let _ = write!(out, "clocks: tsc {} Hz (against the {reference} at boot)", tsc.hz());
     let measured = [Reference::Pit, Reference::Hpet].map(|r| (r, time::measure(r)));
     for (r, m) in &measured {
@@ -445,13 +512,28 @@ fn history(ctx: &mut Ctx<'_>, _: &[String]) {
     }
 }
 
+/// Refuse in a pipeline (`name`: the command), where the announcement it
+/// makes before going would be lost; whether it did.
+fn refuse_in_pipeline(ctx: &mut Ctx<'_>, name: &str) -> bool {
+    if ctx.piped() {
+        ctx.fail(format_args!("{name}: not in a pipeline"));
+    }
+    ctx.piped()
+}
+
 fn reboot(ctx: &mut Ctx<'_>, _: &[String]) {
+    if refuse_in_pipeline(ctx, "reboot") {
+        return;
+    }
     let _ = writeln!(ctx.out, "reboot: restarting");
     crate::power::reboot()
 }
 
 /// Power off, or say why it can't be done or didn't happen.
 fn shutdown(ctx: &mut Ctx<'_>, _: &[String]) {
+    if refuse_in_pipeline(ctx, "shutdown") {
+        return;
+    }
     let why = match crate::power::power_off_plan() {
         Ok(plan) => {
             let _ = writeln!(ctx.out, "shutdown: powering off");
@@ -459,14 +541,14 @@ fn shutdown(ctx: &mut Ctx<'_>, _: &[String]) {
         }
         Err(why) => why,
     };
-    let _ = writeln!(ctx.out, "shutdown: can't power off: {why}");
+    ctx.fail(format_args!("shutdown: can't power off: {why}"));
 }
 
 fn exit(ctx: &mut Ctx<'_>, _: &[String]) {
     if crate::cmdline::qemu_exit_enabled() {
         arch::qemu::exit(arch::qemu::ExitCode::Success);
     }
-    let _ = writeln!(ctx.out, "exit: lumen.qemu_exit not set");
+    ctx.fail("exit: lumen.qemu_exit not set");
 }
 
 crate::ktest!(

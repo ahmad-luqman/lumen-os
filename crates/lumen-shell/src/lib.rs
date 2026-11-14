@@ -2,8 +2,8 @@
 //! command to run out.
 //!
 //! - [`words`]: splitting a line into words the way a POSIX shell quotes
-//!   them (`'...'`, `"..."`, backslashes, `#` comments), and the word under
-//!   the cursor for completion.
+//!   them (`'...'`, `"..."`, backslashes, `#` comments), and into commands
+//!   at each `|` outside quotes; the word under the cursor for completion.
 //! - [`Editor`]: the line editor. It takes [`Key`]s and writes what the
 //!   console must show, either with ANSI escapes ([`Mode::Ansi`]: the
 //!   screen, or serial with `lumen.ansi`) or as plain text ([`Mode::Plain`]:
@@ -13,6 +13,8 @@
 //!   arguments.
 //! - [`input::Decoder`]: bytes from a serial terminal (escape sequences for
 //!   the arrows, UTF-8) to [`Key`]s.
+//! - [`pipe`]: pipelines (`cpus | where busy > 50`): text or records
+//!   ([`pipe::Table`]) handed along, and the filters that take them.
 //!
 //! The kernel runs one [`Editor`] per console (`kernel/src/shell/`).
 
@@ -23,6 +25,7 @@ extern crate alloc;
 mod editor;
 mod history;
 pub mod input;
+pub mod pipe;
 mod table;
 pub mod words;
 
@@ -52,3 +55,6 @@ pub enum Key {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod pipe_tests;
