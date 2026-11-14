@@ -1,13 +1,13 @@
 //! Resetting the machine and powering it off, at the register level. The
 //! order to try them in, and the waits between, are `crate::power`'s. The
-//! ACPI registers are written only through the ports a FADT named:
-//! `lumen_acpi`'s [`Pm1Control`] and [`AcpiEnable`] can't be made
-//! otherwise, and [`SlpTyp`] is checked to fit its field.
+//! ACPI registers are reached only through `lumen_acpi`'s [`Pm1Control`]
+//! and [`AcpiEnable`] (only `Fadt::parse` makes them, from a checksummed
+//! FACP table), and [`SlpTyp`] is checked to fit its field.
 
 use super::i8042;
 use super::port::{inb, inw, outb, outw};
 use core::arch::asm;
-use lumen_acpi::{AcpiEnable, Pm1Control, SlpTyp};
+use lumen_acpi::{AcpiEnable, Pm1Control, SCI_EN, SleepStep, SleepType, SlpTyp, pm1_control_value};
 
 /// The reset control register (Intel chipsets, and QEMU's q35 and PIIX).
 const RESET_CONTROL: u16 = 0xcf9;
@@ -35,16 +35,15 @@ pub fn reset_control() {
 const PULSE_RESET: u8 = 0xfe;
 
 /// Pulse the reset line through the 8042 keyboard controller, once it
-/// takes a command (or after a bounded wait for it). Returns if nothing
-/// happened.
-pub fn keyboard_controller() {
-    for _ in 0..100_000 {
-        if i8042::status() & i8042::INPUT_FULL == 0 {
-            break;
-        }
+/// takes a command (or after a bounded wait for it, sending it anyway).
+/// Returns if nothing happened: whether the 8042 was ready for the command.
+pub fn keyboard_controller() -> bool {
+    let ready = (0..100_000).any(|_| {
         core::hint::spin_loop();
-    }
+        i8042::status() & i8042::INPUT_FULL == 0
+    });
     i8042::write_command(PULSE_RESET);
+    ready
 }
 
 /// Load an empty IDT (limit 0) and take `int3`: delivering vector 3 runs
@@ -69,40 +68,44 @@ pub fn triple_fault() -> ! {
     }
 }
 
-/// PM1 control bit 0, SCI_EN: the chipset is in ACPI mode.
-const SCI_EN: u16 = 1 << 0;
-/// Where PM1 control's 3-bit SLP_TYP field starts.
-const SLP_TYP_SHIFT: u16 = 10;
-/// PM1 control bits 10-12: the sleep type to enter.
-const SLP_TYP: u16 = 0b111 << SLP_TYP_SHIFT;
-/// PM1 control bit 13, SLP_EN: enter the sleep type in SLP_TYP.
-const SLP_EN: u16 = 1 << 13;
-
 /// Whether the PM1 control register `control` has SCI_EN set (the chipset
 /// is in ACPI mode).
 pub fn acpi_mode(control: Pm1Control) -> bool {
-    // SAFETY: `control` is a PM1 control register a FADT named (only
-    // `Fadt::parse` makes one); reading it has no side effects.
+    // SAFETY: `control` is a PM1 control register's port: only
+    // `Fadt::parse` makes one, from a checksummed FACP table. Reading it
+    // has no side effects.
     unsafe { inw(control.port()) & SCI_EN != 0 }
 }
 
 /// Ask the firmware for ACPI mode: write the FADT's ACPI_ENABLE value to
 /// its SMI command port.
 pub fn enable_acpi(enable: AcpiEnable) {
-    // SAFETY: the port and value are a FADT's, for exactly this (only
-    // `Fadt::parse` makes an `AcpiEnable`).
+    // SAFETY: the port and value are for exactly this: only `Fadt::parse`
+    // makes an `AcpiEnable`, from a checksummed FACP table.
     unsafe { outb(enable.port(), enable.value()) }
 }
 
-/// Set the sleep type `typ` in the PM1 control register `control`, then,
-/// if `enter`, set SLP_EN (entering that sleep state). Other bits are kept.
-pub fn pm1_sleep(control: Pm1Control, typ: SlpTyp, enter: bool) {
-    // SAFETY: `control` is a PM1 control register a FADT named (only
-    // `Fadt::parse` makes one) and `typ` fits SLP_TYP; this is how ACPI
-    // enters a sleep state (ACPI 6.5, 4.8.3.2.1 and 7.4.2). Entering one
-    // may power the machine off, which the caller asked for.
+/// Enter the sleep state `typ` gives: for each `SleepStep` in order, write
+/// PM1a, then PM1b if there is one (`lumen_acpi::pm1_control_value` makes
+/// each value from the register's current one). Returns if the machine
+/// didn't sleep (or power off).
+pub fn enter_sleep(pm1a: Pm1Control, pm1b: Option<Pm1Control>, typ: SleepType) {
+    for step in SleepStep::ORDER {
+        pm1_write(pm1a, typ.a, step);
+        if let Some(pm1b) = pm1b {
+            pm1_write(pm1b, typ.b, step);
+        }
+    }
+}
+
+fn pm1_write(control: Pm1Control, typ: SlpTyp, step: SleepStep) {
+    // SAFETY: `control` is a PM1 control register's port (only
+    // `Fadt::parse` makes one, from a checksummed FACP table) and the
+    // value only changes SLP_TYP and SLP_EN; this is how ACPI enters a
+    // sleep state. Entering one may power the machine off, which the
+    // caller asked for.
     unsafe {
-        let v = (inw(control.port()) & !(SLP_TYP | SLP_EN)) | (u16::from(typ.get()) << SLP_TYP_SHIFT);
-        outw(control.port(), if enter { v | SLP_EN } else { v });
+        let v = pm1_control_value(inw(control.port()), typ, step);
+        outw(control.port(), v);
     }
 }

@@ -14,6 +14,10 @@ class QmpError(RuntimeError):
     pass
 
 
+class QmpTimeout(QmpError):
+    """A read from QEMU timed out (the client is unusable after it)."""
+
+
 # QEMU's key names (QKeyCode, qapi/ui.json) for unshifted characters on a US
 # keyboard; `qcodes_for` adds shift for the rest.
 _UNSHIFTED = {
@@ -88,35 +92,59 @@ class QmpClient:
         client.command("qmp_capabilities")
         return client
 
-    def _recv(self) -> dict[str, Any]:
+    def _check(self) -> None:
         if self._broken:
             raise QmpError(f"QMP connection unusable: {self._broken}")
-        line = self._file.readline()
+
+    def _recv(self) -> dict[str, Any]:
+        """The next message from QEMU (an event is also kept on `events`).
+        A read that times out or fails leaves the client unusable: a
+        timed-out read leaves the socket's file unusable, and what is read
+        next could be half a message."""
+        self._check()
+        try:
+            line = self._file.readline()
+        except TimeoutError:
+            self._broken = "a read timed out"
+            raise QmpTimeout("QMP read timed out") from None
+        except OSError as e:
+            self._broken = f"a read failed ({e})"
+            raise QmpError(f"QMP read failed: {e}") from e
         if not line:
             raise QmpError("QMP connection closed")
-        return json.loads(line)
+        try:
+            msg = json.loads(line)
+        except ValueError as e:
+            self._broken = f"unreadable reply {line!r}"
+            raise QmpError(f"unreadable QMP reply {line!r}") from e
+        if "event" in msg:
+            self.events.append(msg)
+        return msg
 
     def command(self, name: str, **arguments: Any) -> Any:
+        self._check()
         msg: dict[str, Any] = {"execute": name}
         if arguments:
             msg["arguments"] = arguments
-        self._file.write(json.dumps(msg).encode() + b"\n")
-        self._file.flush()
+        try:
+            self._file.write(json.dumps(msg).encode() + b"\n")
+            self._file.flush()
+        except OSError as e:
+            self._broken = f"a write failed ({e})"
+            raise QmpError(f"{name}: QMP write failed: {e}") from e
         while True:
             reply = self._recv()
             if "return" in reply:
                 return reply["return"]
             if "error" in reply:
                 raise QmpError(f"{name}: {reply['error']}")
-            if "event" in reply:
-                self.events.append(reply)
 
     def wait_event(self, name: str, timeout: float = 30) -> dict[str, Any]:
         """The first event called `name` (QEMU's, e.g. `SHUTDOWN` with its
         `data`), taking it and those before it off `events`; waits up to
-        `timeout` seconds for it. Raises QmpError if the connection closes or
-        the time runs out first; after a timeout the client is unusable (a
-        read that times out leaves the socket's file unusable)."""
+        `timeout` seconds for it. Raises QmpError if the connection closes,
+        a read fails, QEMU sends an error, or the time runs out first; after
+        a timeout or a failed read the client is unusable."""
         deadline = time.monotonic() + timeout
         while True:
             for i, event in enumerate(self.events):
@@ -124,19 +152,19 @@ class QmpClient:
                     del self.events[: i + 1]
                     return event
             remaining = deadline - time.monotonic()
+            self._check()
             previous = self._sock.gettimeout()
             self._sock.settimeout(max(remaining, 0.001))
             try:
                 reply = self._recv()
-            except TimeoutError:
-                self._broken = f"timed out waiting for {name}"
+            except QmpTimeout:
                 raise QmpError(f"no {name} event after {timeout:g}s (got {self.events})") from None
             except QmpError as e:
-                raise QmpError(f"{e} while waiting for {name} (got {self.events})") from None
+                raise QmpError(f"{e} while waiting for {name} (got {self.events})") from e
             finally:
                 self._sock.settimeout(previous)
-            if "event" in reply:
-                self.events.append(reply)
+            if "error" in reply:
+                raise QmpError(f"error reply while waiting for {name}: {reply['error']}")
 
     def send_key(self, qcodes: Sequence[str], hold_ms: int = 20) -> None:
         """Press `qcodes` together on the guest's keyboard, then release."""

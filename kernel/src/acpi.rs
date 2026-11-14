@@ -25,7 +25,8 @@ use core::fmt;
 use limine::memory_map::EntryType;
 use log::{debug, info, warn};
 use lumen_acpi::{
-    Acpi, Cpu, CpuState, Error, Fadt, Hpet, InterruptOverride, IoApic, Madt, PhysMem, Sdt, Signature, SleepType,
+    Acpi, AcpiMode, Cpu, CpuState, Error, Fadt, Hpet, InterruptOverride, IoApic, Madt, PhysMem, Sdt, Signature,
+    SleepType,
 };
 use lumen_mm::{PhysAddr, PhysRange};
 
@@ -56,12 +57,23 @@ pub struct Info {
     pub power_off: Result<PowerOff, Failure>,
 }
 
-/// What entering ACPI S5 (soft off) takes.
+/// What entering ACPI S5 (soft off) takes: made only by
+/// `read_power_off`, from a FADT and its DSDT.
 #[derive(Clone, Copy, Debug)]
 pub struct PowerOff {
-    pub fadt: Fadt,
+    fadt: Fadt,
+    s5: SleepType,
+}
+
+impl PowerOff {
+    pub fn fadt(&self) -> Fadt {
+        self.fadt
+    }
+
     /// The `_S5_` package's values.
-    pub s5: SleepType,
+    pub fn s5(&self) -> SleepType {
+        self.s5
+    }
 }
 
 impl Info {
@@ -161,8 +173,9 @@ impl Firmware {
         // usable frames now reserved for ACPI tables (the allocator never
         // hands them out again). That they are tables and not, say, device
         // registers in a `reserved` entry, we trust the firmware's pointers.
-        // The tables read here (the RSDP, the root table and the tables it
-        // lists) are static; the FACS, which firmware writes, is never read.
+        // The tables read here (the RSDP, the root table, the tables it
+        // lists, and the FADT's DSDT) are static; the FACS, which firmware
+        // writes, is never read.
         Ok(unsafe { core::slice::from_raw_parts(virt as *const u8, len) })
     }
 
@@ -282,20 +295,24 @@ fn discover(fw: &mut Firmware, rsdp: u64) -> Result<Info, Error> {
     let fadt = acpi.find(Signature::FADT).and_then(Fadt::parse);
     let fw = acpi.into_mem();
     let hpet = hpet.inspect_err(|&e| warn!(target: "acpi", "no usable HPET: {}", Failure::new(e, &mut *fw))).ok();
-    let power_off = fadt.and_then(|fadt| power_off(&mut *fw, fadt)).map_err(|e| Failure::new(e, &mut *fw));
+    let power_off = fadt.and_then(|fadt| read_power_off(&mut *fw, fadt)).map_err(|e| Failure::new(e, &mut *fw));
     match &power_off {
         Ok(p) => debug!(
             target: "acpi",
-            "S5: PM1a control {:#x}, PM1b control {:?}, SLP_TYP {}/{}, DSDT at {:#x}",
+            "S5: PM1a control {:#x}, PM1b control {:?}, SLP_TYP {}/{}, DSDT at {:#x}, {}",
             p.fadt.pm1a_control.port(),
             p.fadt.pm1b_control.map(|c| c.port()),
             p.s5.a,
             p.s5.b,
-            p.fadt.dsdt
+            p.fadt.dsdt,
+            p.fadt.acpi_mode
         ),
         // A warning: `Failure::new` took the reason for a failed read, so
         // `warn_unreported` won't warn about it again.
         Err(e) => warn!(target: "acpi", "no ACPI power-off: {e}"),
+    }
+    if let Ok(PowerOff { fadt: Fadt { acpi_mode: mode @ AcpiMode::Unusable { .. }, .. }, .. }) = &power_off {
+        warn!(target: "acpi", "the FADT gives {mode}: power-off works only if the firmware is in ACPI mode");
     }
     let info = Info {
         cpus: madt.cpus().collect(),
@@ -332,7 +349,7 @@ fn discover(fw: &mut Firmware, rsdp: u64) -> Result<Info, Error> {
 }
 
 /// Read the DSDT `fadt` points at and find its `_S5_` sleep types.
-fn power_off(fw: &mut Firmware, fadt: Fadt) -> Result<PowerOff, Error> {
+fn read_power_off(fw: &mut Firmware, fadt: Fadt) -> Result<PowerOff, Error> {
     let s5 = SleepType::s5_from_dsdt(Sdt::read(fw, fadt.dsdt)?)?;
     Ok(PowerOff { fadt, s5 })
 }
@@ -568,15 +585,23 @@ crate::ktest!(
 crate::ktest!(
     fn s5_is_found_at_boot() {
         // QEMU's FADT and DSDT give a way to power off: PM1a control at
-        // port 0x604 (q35's ICH9), `_S5_` as four Zeros.
+        // port 0x604 (q35's ICH9), `_S5_` as four Zeros, and a way to ask
+        // for ACPI mode.
         use crate::kassert_eq;
         let info = info().ok_or("ACPI was not found at boot")?;
-        let p = info.power_off.as_ref().map_err(|e| {
+        let p = info.power_off.as_ref().map(|p| (p.fadt(), p.s5())).map_err(|e| {
             crate::ktest::diag(format_args!("{e}"));
             "no ACPI power-off"
         })?;
-        kassert_eq!((p.fadt.pm1a_control.port(), p.fadt.pm1b_control), (0x604, None));
-        kassert_eq!((p.s5.a.get(), p.s5.b.get()), (0, 0));
+        let (fadt, s5) = p;
+        kassert_eq!((fadt.pm1a_control.port(), fadt.pm1b_control), (0x604, None));
+        kassert_eq!((s5.a.get(), s5.b.get()), (0, 0));
+        // SMI command port 0xb2 takes ICH9's ACPI_ENABLE, 0x02.
+        let ask = match fadt.acpi_mode {
+            AcpiMode::Ask(e) => Some((e.port(), e.value())),
+            _ => None,
+        };
+        kassert_eq!(ask, Some((0xb2, 0x02)));
         Ok(())
     }
 );

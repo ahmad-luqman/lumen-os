@@ -74,11 +74,47 @@ def test_waiting_for_an_event_ends():
     with pytest.raises(QmpError, match=r"closed while waiting for SHUTDOWN \(got \[.*RESET"):
         client.wait_event("SHUTDOWN", 5)
     # After a timeout the client refuses to be used (its socket's file is
-    # unusable), rather than misreading what comes next.
+    # unusable), rather than misreading what comes next, and sends nothing.
     client, qemu = _client()
     with pytest.raises(QmpError, match="no SHUTDOWN event after 0.2s"):
         client.wait_event("SHUTDOWN", 0.2)
     qemu.sendall(b'{"return": {}}\n')
-    with pytest.raises(QmpError, match="unusable: timed out waiting for SHUTDOWN"):
+    with pytest.raises(QmpError, match="unusable: a read timed out"):
         client.command("stop")
-    qemu.close()
+    assert _sent(qemu) == b""
+    # An error reply, and a reply that isn't JSON, end the wait too (the
+    # second leaves the client unusable).
+    client, qemu = _client({"error": {"class": "GenericError", "desc": "no"}})
+    with pytest.raises(QmpError, match="error reply while waiting for SHUTDOWN"):
+        client.wait_event("SHUTDOWN", 5)
+    client, qemu = _client()
+    qemu.sendall(b"not json\n")
+    with pytest.raises(QmpError, match="unreadable QMP reply .* while waiting for SHUTDOWN"):
+        client.wait_event("SHUTDOWN", 5)
+    with pytest.raises(QmpError, match="unusable: unreadable reply"):
+        client.command("stop")
+    assert _sent(qemu) == b""
+
+
+def test_a_command_that_times_out_breaks_the_client():
+    # A command whose reply never comes: the client is unusable afterwards
+    # and sends no second command.
+    client, qemu = _client()
+    client._sock.settimeout(0.2)
+    with pytest.raises(QmpError, match="timed out"):
+        client.command("stop")
+    assert json.loads(_sent(qemu)) == {"execute": "stop"}
+    with pytest.raises(QmpError, match="unusable"):
+        client.command("cont")
+    assert _sent(qemu) == b""
+
+
+def _sent(qemu: socket.socket) -> bytes:
+    """What the client has sent QEMU so far (without waiting)."""
+    qemu.setblocking(False)
+    try:
+        return qemu.recv(4096)
+    except BlockingIOError:
+        return b""
+    finally:
+        qemu.setblocking(True)

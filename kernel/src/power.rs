@@ -19,6 +19,7 @@ use crate::arch::{irq, reset};
 use alloc::format;
 use alloc::string::String;
 use log::{info, warn};
+use lumen_acpi::{AcpiMode, Fadt};
 
 /// How long to wait for a reset method, or S5, to take effect.
 const SETTLE_NS: u64 = 500_000_000;
@@ -61,9 +62,13 @@ pub fn reboot() -> ! {
     }
     if first <= Method::KeyboardController {
         info!(target: "power", "rebooting: pulsing the 8042's reset line");
-        reset::keyboard_controller();
+        let ready = reset::keyboard_controller();
         crate::time::spin(SETTLE_NS);
-        warn!(target: "power", "the 8042 didn't reset the machine");
+        if ready {
+            warn!(target: "power", "the 8042 didn't reset the machine");
+        } else {
+            warn!(target: "power", "the 8042 didn't reset the machine (it never became ready for the command)");
+        }
     }
     info!(target: "power", "rebooting: triple fault");
     reset::triple_fault()
@@ -79,7 +84,7 @@ pub fn power_off_plan() -> Result<&'static PowerOff, String> {
 /// the machine is still on half a second later, with what it tried (also
 /// logged as a warning).
 pub fn power_off(plan: &PowerOff) -> String {
-    let (fadt, s5) = (plan.fadt, plan.s5);
+    let (fadt, s5) = (plan.fadt(), plan.s5());
     info!(
         target: "power",
         "powering off: ACPI S5, SLP_TYP {}/{} into PM1a control {:#x}{}",
@@ -90,29 +95,9 @@ pub fn power_off(plan: &PowerOff) -> String {
     );
     let _off = irq::push_off();
     if !reset::acpi_mode(fadt.pm1a_control) {
-        match fadt.acpi_enable {
-            Some(enable) => {
-                info!(target: "power", "switching to ACPI mode (SMI command {:#x})", enable.port());
-                reset::enable_acpi(enable);
-                let deadline = crate::time::now_ns() + ACPI_MODE_NS;
-                while !reset::acpi_mode(fadt.pm1a_control) && crate::time::now_ns() < deadline {
-                    core::hint::spin_loop();
-                }
-                if !reset::acpi_mode(fadt.pm1a_control) {
-                    warn!(target: "power", "the firmware didn't switch to ACPI mode; trying S5 anyway");
-                }
-            }
-            None => warn!(target: "power", "not in ACPI mode and no way to ask for it; trying S5 anyway"),
-        }
+        switch_to_acpi_mode(fadt);
     }
-    // The sleep type first, then SLP_EN, each into PM1a then PM1b (as
-    // ACPICA does: some chipsets want the type in place before the enable).
-    for enter in [false, true] {
-        reset::pm1_sleep(fadt.pm1a_control, s5.a, enter);
-        if let Some(control) = fadt.pm1b_control {
-            reset::pm1_sleep(control, s5.b, enter);
-        }
-    }
+    reset::enter_sleep(fadt.pm1a_control, fadt.pm1b_control, s5);
     crate::time::spin(SETTLE_NS);
     let why = format!(
         "still on after ACPI S5 (SLP_TYP {}/{} into PM1a control {:#x}, SCI_EN {})",
@@ -123,4 +108,26 @@ pub fn power_off(plan: &PowerOff) -> String {
     );
     warn!(target: "power", "{why}");
     why
+}
+
+/// The chipset isn't in ACPI mode (SCI_EN clear): ask the firmware for it
+/// as the FADT says, waiting up to [`ACPI_MODE_NS`]; warn if that can't be
+/// done or didn't work (S5 is tried anyway).
+fn switch_to_acpi_mode(fadt: Fadt) {
+    let enable = match fadt.acpi_mode {
+        AcpiMode::Ask(enable) => enable,
+        mode => {
+            warn!(target: "power", "not in ACPI mode, and the FADT gives {mode}; trying S5 anyway");
+            return;
+        }
+    };
+    info!(target: "power", "switching to ACPI mode (SMI command {:#x})", enable.port());
+    reset::enable_acpi(enable);
+    let deadline = crate::time::now_ns() + ACPI_MODE_NS;
+    while !reset::acpi_mode(fadt.pm1a_control) && crate::time::now_ns() < deadline {
+        core::hint::spin_loop();
+    }
+    if !reset::acpi_mode(fadt.pm1a_control) {
+        warn!(target: "power", "the firmware didn't switch to ACPI mode; trying S5 anyway");
+    }
 }

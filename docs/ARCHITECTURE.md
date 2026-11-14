@@ -284,36 +284,48 @@ missing or broken HPET alone is a warning (`no usable HPET: ...`) and leaves
 `acpi::init` also reads what powering off takes into `acpi::Info::power_off`:
 the FADT's PM1a and PM1b control blocks (each from its 64-bit `X_` field
 when the table has it and its address isn't 0, which must then be in I/O
-space, else from the 32-bit field; a hardware-reduced machine, whose sleep
-registers are memory-mapped, isn't supported), its SMI command port and
-`ACPI_ENABLE` value (left out when either is 0 or the port doesn't fit 16
-bits), and the DSDT, whose `\_S5_` package gives the S5 sleep type values.
-No AML interpreter builds on stable Rust, so `lumen_acpi::find_s5` searches
-the DSDT's bytes for `_S5_` after a `NameOp` (past a `\` or `^` prefix)
-naming a `PackageOp` whose length fits the table, and decodes its first two
-integer constants (each at most 7; a single value holds both in its low two
-bytes, with nothing above them). The ports come out as `Pm1Control` and
-`AcpiEnable`, which only `Fadt::parse` makes, and the values as `SlpTyp`
-(checked to fit 3 bits): `arch::reset` writes only those. A missing or
-broken FADT, DSDT or `_S5_` is a warning at boot (`no ACPI power-off: ...`)
-and the reason is kept for `shutdown`; boot goes on.
+space, else from the 32-bit field; a hardware-reduced machine has no PM1
+blocks, only a sleep control register, which isn't supported), the DSDT
+(required), and how to switch to ACPI mode (`AcpiMode`: always, when there
+is no SMI command port; ask, writing `ACPI_ENABLE` to it; or unusable, when
+`ACPI_ENABLE` is 0 or the port doesn't fit 16 bits). The DSDT's `\_S5_`
+package gives the S5 sleep type values: no AML interpreter builds on stable
+Rust, so `SleepType::s5_from_dsdt` searches the DSDT's bytes for `_S5_`
+after a `NameOp` (past one `\` or any number of `^` prefixes) naming a
+`PackageOp` whose length fits the table, and decodes its first two integer
+constants (each at most 7; a single value holds both in its low two bytes,
+with nothing above them); if none decodes, the error counts the
+`Name (_S5_, ...)` found and gives the first one's AML offset and why. The
+ports come out as `Pm1Control` and `AcpiEnable`, which only `Fadt::parse`
+makes, from a checksummed FACP table, and the values as `SlpTyp` (checked to
+fit 3 bits); `arch::reset` writes the ACPI registers only through those, with
+values from `lumen_acpi::pm1_control_value` (host-tested: SLP_TYP replaced,
+SLP_EN only on the second write, other bits kept). A missing or broken FADT,
+DSDT or `_S5_` is a warning at boot (`no ACPI power-off: ...`), as is an
+unusable way to ask for ACPI mode, and the reason is kept for `shutdown`;
+boot goes on. (The parse errors are host-tested; the boot warnings are not
+tested: QEMU's tables are fine.)
 
 The shell's `shutdown` (`power.rs`) says `shutdown: powering off`, logs
 `INFO  power: powering off: ACPI S5, ...`, and with interrupts off asks the
-firmware for ACPI mode if SCI_EN is clear (the SMI command; not tested:
-OVMF leaves q35 in ACPI mode), writes SLP_TYP into PM1a (and PM1b, not
-tested: q35 has none), then SLP_EN. If the machine is still on half a second
-later it warns and says why (`shutdown: can't power off: still on after ACPI
-S5 (...)`; not tested), as it does when ACPI gave no way to power off (not
-tested). `reboot`, interrupts off for good, logs `INFO  power: rebooting:
-reset through port 0xcf9` and writes a full reset to the reset control
-register (0xCF9); half a second later (a warning first) it pulses the reset
-line through the 8042 (command 0xFE), and half a second after that loads an
-empty IDT and takes `int3` (#GP, #DF, then a shutdown: a triple fault, which
-resets the CPU). `lumen.reboot=8042` or `lumen.reboot=triple` starts at a
-later method, which is how the scenarios test the fallbacks (q35 always
-takes 0xCF9's reset). The reboot scenarios run QEMU without `-no-reboot`
-(the banner appears twice, and the log shows which method did it); the
+firmware for ACPI mode if SCI_EN is clear (the SMI command, or a warning
+naming why it can't; not tested: OVMF leaves q35 in ACPI mode), writes
+SLP_TYP into PM1a (and PM1b, not tested: q35 has none), then SLP_EN. Only
+SLP_TYP 0 is exercised in QEMU (q35's `_S5_` is four Zeros). If the machine
+is still on half a second later it warns and says why (`shutdown: can't
+power off: still on after ACPI S5 (...)`; not tested), as it does when ACPI
+gave no way to power off (not tested). `reboot`, interrupts off for good,
+logs `INFO  power: rebooting: reset through port 0xcf9` and writes a full
+reset to the reset control register (0xCF9); half a second later (a warning
+first) it pulses the reset line through the 8042 (command 0xFE, after a
+bounded wait for it to be ready; the warning says if it never was), and half
+a second after that loads an empty IDT and takes `int3` (#GP, #DF, then a
+shutdown: a triple fault, which resets the machine). `lumen.reboot=8042` or
+`lumen.reboot=triple` starts at a later method, which is how the scenarios
+test the fallbacks (q35 always takes 0xCF9's reset); an unknown value starts
+at 0xCF9 with a warning (tested). The reboot scenarios run QEMU without
+`-no-reboot` (the banner appears twice, the log shows which method did it,
+and under TCG `qemu.log` shows a triple fault only for that method); the
 power-off one accepts QEMU's exit status 0 only with a QMP `SHUTDOWN` event
 whose reason is `guest-shutdown` (a triple fault under `-no-reboot` also
 exits with 0, but as `guest-reset`).

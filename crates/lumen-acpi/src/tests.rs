@@ -622,7 +622,7 @@ fn the_fadt_gives_the_pm1_control_blocks_and_the_dsdt() {
         dsdt: 0x7fbe_0040,
         pm1a_control: Pm1Control(0x604),
         pm1b_control: None,
-        acpi_enable: Some(AcpiEnable { port: 0xb2, value: 0x02 }),
+        acpi_mode: AcpiMode::Ask(AcpiEnable { port: 0xb2, value: 0x02 }),
     };
     assert_eq!(parse_fadt(&qemu_fadt()), Ok(want));
     // ACPI 1.0: the 32-bit fields only.
@@ -636,15 +636,20 @@ fn the_fadt_gives_the_pm1_control_blocks_and_the_dsdt() {
         seal(&mut t);
         parse_fadt(&t)
     };
-    let no_enable = Fadt { acpi_enable: None, ..want };
     assert_eq!(
         patched(&[(68, &0x608u32.to_le_bytes()), (48, &[0; 4])]),
-        Ok(Fadt { pm1b_control: Some(Pm1Control(0x608)), ..no_enable })
+        Ok(Fadt { pm1b_control: Some(Pm1Control(0x608)), acpi_mode: AcpiMode::Always, ..want })
     );
-    // No ACPI_ENABLE value, or an SMI command port past 16 bits: no way to
-    // ask for ACPI mode, but the FADT is still usable.
-    assert_eq!(patched(&[(52, &[0])]), Ok(no_enable));
-    assert_eq!(patched(&[(48, &0x1_0000u32.to_le_bytes())]), Ok(no_enable));
+    // No SMI command port is "always in ACPI mode" whatever ACPI_ENABLE
+    // says; no ACPI_ENABLE value, or a port past 16 bits, is no usable way
+    // to ask (the raw fields kept), but the FADT is still usable.
+    let mode = |patches: &[(usize, &[u8])]| patched(patches).map(|f| f.acpi_mode);
+    assert_eq!(mode(&[(48, &[0; 4]), (52, &[0])]), Ok(AcpiMode::Always));
+    assert_eq!(mode(&[(52, &[0])]), Ok(AcpiMode::Unusable { smi_command: 0xb2, acpi_enable: 0 }));
+    assert_eq!(
+        mode(&[(48, &0x1_0000u32.to_le_bytes())]),
+        Ok(AcpiMode::Unusable { smi_command: 0x1_0000, acpi_enable: 0x02 })
+    );
 }
 
 #[test]
@@ -680,9 +685,11 @@ fn a_fadt_that_cant_power_off_is_an_error() {
     seal(&mut t);
     assert_eq!(parse_fadt(&t), Err(Error::NoPm1aControl));
     // Memory-mapped PM1 blocks, a port past 16 bits.
-    assert_eq!(patched(172, &gas(0, 0xfed0_0000)), Err(Error::Pm1NotIo { space: 0 }));
-    assert_eq!(patched(184, &gas(0, 0xfed0_0000)), Err(Error::Pm1NotIo { space: 0 }));
-    assert_eq!(patched(172, &gas(1, 0x1_0000)), Err(Error::BadPm1Port(0x1_0000)));
+    let not_io = |block| Err(Error::Pm1NotIo { block, space: 0, address: 0xfed0_0000 });
+    assert_eq!(patched(172, &gas(0, 0xfed0_0000)), not_io(Pm1Block::A));
+    assert_eq!(patched(184, &gas(0, 0xfed0_0000)), not_io(Pm1Block::B));
+    assert_eq!(patched(172, &gas(1, 0x1_0000)), Err(Error::BadPm1Port { block: Pm1Block::A, port: 0x1_0000 }));
+    assert_eq!(patched(68, &0x1_0000u32.to_le_bytes()), Err(Error::BadPm1Port { block: Pm1Block::B, port: 0x1_0000 }));
     assert_eq!(patched(64, &0x1_0000u32.to_le_bytes()), Ok(parse_fadt(&qemu_fadt()).unwrap()), "X_ wins");
     // Hardware-reduced ACPI (FADT flags bit 20).
     assert_eq!(patched(112, &(1u32 << 20).to_le_bytes()), Err(Error::HardwareReduced));
@@ -753,7 +760,27 @@ fn s5_takes_three_and_four_byte_package_lengths() {
         assert_eq!(find_s5(&aml), Ok(SleepType { a: SlpTyp(3), b: SlpTyp(4) }), "{lead:x?}");
         // One byte short of what the length says.
         aml.pop();
-        assert_eq!(find_s5(&aml), Err(Error::NoS5 { bad: 1 }), "{lead:x?}");
+        assert_eq!(rejected(&aml), Some(S5Reject::BadLength), "{lead:x?}");
+    }
+    // Non-zero third and fourth bytes: 0x80 0x00 0x01 is 1 << 12 = 4096
+    // bytes, 0xc0 0x00 0x00 0x01 is 1 << 20.
+    for (lead, len) in [(&[0x80u8, 0x00, 0x01][..], 1 << 12), (&[0xc0, 0x00, 0x00, 0x01], 1 << 20)] {
+        let mut aml = b"\x08_S5_\x12".to_vec();
+        aml.extend_from_slice(lead);
+        aml.extend_from_slice(b"\x02\x0a\x03\x0a\x04");
+        aml.resize(6 + len, 0);
+        assert_eq!(find_s5(&aml), Ok(SleepType { a: SlpTyp(3), b: SlpTyp(4) }), "{lead:x?}");
+        aml.pop();
+        assert_eq!(rejected(&aml), Some(S5Reject::BadLength), "{lead:x?}");
+    }
+}
+
+/// Why the one `Name (_S5_, ...)` in `aml` was refused, if `find_s5` found
+/// exactly one and refused it.
+fn rejected(aml: &[u8]) -> Option<S5Reject> {
+    match find_s5(aml) {
+        Err(Error::NoS5 { found: 1, first: Some((_, why)) }) => Some(why),
+        _ => None,
     }
 }
 
@@ -782,7 +809,7 @@ fn s5_takes_a_two_byte_package_length() {
     assert_eq!(find_s5(&aml), Ok(SleepType { a: SlpTyp(5), b: SlpTyp(6) }));
     // Reserved bits 4-5 set in a multi-byte lead byte.
     aml[6] = 0x71;
-    assert_eq!(find_s5(&aml), Err(Error::NoS5 { bad: 1 }));
+    assert_eq!(rejected(&aml), Some(S5Reject::BadLength));
 }
 
 #[test]
@@ -793,38 +820,48 @@ fn s5_skips_what_isnt_its_package() {
     assert_eq!(find_s5(&aml), Ok(SleepType { a: SlpTyp(5), b: SlpTyp(5) }));
     // A bad package (a value over 7) is counted, and a later good one wins.
     let mut aml = s5(b"", 2, &[0x0a, 8, 0]);
-    assert_eq!(find_s5(&aml), Err(Error::NoS5 { bad: 1 }));
+    assert_eq!(find_s5(&aml), Err(Error::NoS5 { found: 1, first: Some((1, S5Reject::TooLarge)) }));
     aml.extend_from_slice(&s5(b"\\", 2, &[1, 1]));
     assert_eq!(find_s5(&aml), Ok(SleepType { a: SlpTyp(1), b: SlpTyp(1) }));
+    // Two bad ones: the count, and the first one's offset and reason.
+    let mut aml = amid(&s5(b"", 2, &[0x0a, 5]));
+    let at = aml.windows(4).position(|w| w == b"_S5_").unwrap();
+    aml.extend_from_slice(&s5(b"", 2, &[0x0a, 8, 0]));
+    assert_eq!(find_s5(&aml), Err(Error::NoS5 { found: 2, first: Some((at, S5Reject::NotInteger)) }));
     // Nothing at all.
-    assert_eq!(find_s5(&amid(b"")), Err(Error::NoS5 { bad: 0 }));
-    assert_eq!(find_s5(b"_S5_"), Err(Error::NoS5 { bad: 0 }));
+    assert_eq!(find_s5(&amid(b"")), Err(Error::NoS5 { found: 0, first: None }));
+    assert_eq!(find_s5(b"_S5_"), Err(Error::NoS5 { found: 0, first: None }));
 }
 
 #[test]
 fn a_broken_s5_package_is_refused_not_misread() {
-    let bad = |aml: &[u8]| assert_eq!(find_s5(aml), Err(Error::NoS5 { bad: 1 }), "{aml:x?}");
-    // Not a package; no elements; one value only for two; an unknown
-    // element opcode (a name).
-    bad(b"\x08_S5_\x0a\x05");
-    bad(&s5(b"", 0, &[]));
-    bad(&s5(b"", 2, &[0x0a, 5]));
-    bad(&s5(b"", 2, &[b'A', b'B', b'C', b'D']));
+    use S5Reject::*;
+    let bad = |aml: &[u8]| rejected(aml).is_some();
+    let why = |aml: &[u8], want: S5Reject| assert_eq!(rejected(aml), Some(want), "{aml:x?}");
+    // Not a package; no elements (also when values follow); one value only
+    // for two; an unknown element opcode (a name).
+    why(b"\x08_S5_\x0a\x05", NotPackage);
+    why(&s5(b"", 0, &[]), Empty);
+    why(&s5(b"", 0, &[0x0a, 5, 0x0a, 5]), Empty);
+    why(&s5(b"", 2, &[0x0a, 5]), NotInteger);
+    why(&s5(b"", 2, &[b'A', b'B', b'C', b'D']), NotInteger);
     // The package's length runs past the AML, and the AML ends inside it
     // (each cut at every byte).
     let good = s5(b"", 2, &[0x0a, 5, 0x0c, 5, 0, 0, 0]);
     for end in 6..good.len() {
-        bad(&good[..end]);
+        assert!(bad(&good[..end]), "{end}");
     }
     let mut long = good.clone();
     long[6] = 0x3f;
-    bad(&long);
+    why(&long, BadLength);
     // A word value over 255 in a two-value package; SLP_TYPb over 7, as a
-    // byte and as a word; a single value with bits above its two bytes.
-    bad(&s5(b"", 2, &[0x0b, 0, 1, 0]));
-    bad(&s5(b"", 2, &[0x0a, 5, 0x0a, 8]));
-    bad(&s5(b"", 2, &[0x0a, 5, 0x0b, 5, 1]));
-    bad(&s5(b"", 1, &[0x0c, 5, 7, 1, 0]));
+    // byte and as a word; a word SLP_TYPb over 255; a single value with
+    // bits above its two bytes.
+    why(&s5(b"", 2, &[0x0b, 0, 1, 0]), TooLarge);
+    why(&s5(b"", 2, &[0x0a, 5, 0x0a, 8]), TooLarge);
+    why(&s5(b"", 2, &[0x0a, 5, 0x0b, 8, 0]), TooLarge);
+    why(&s5(b"", 2, &[0x0a, 5, 0x0b, 5, 1]), TooLarge);
+    why(&s5(b"", 1, &[0x0c, 5, 7, 1, 0]), TooLarge);
 }
 
 #[test]
@@ -849,10 +886,49 @@ fn s5_is_found_from_the_rsdp() {
 fn power_errors_name_what_went_wrong() {
     use std::string::ToString;
     assert_eq!(Error::NoPm1aControl.to_string(), "the FADT gives no PM1a control block");
-    assert_eq!(Error::Pm1NotIo { space: 0 }.to_string(), "a PM1 control block is in address space 0, not I/O");
-    assert_eq!(Error::BadPm1Port(0x10000).to_string(), "PM1 control block port 0x10000 doesn't fit 16 bits");
+    assert_eq!(
+        Error::Pm1NotIo { block: Pm1Block::B, space: 0, address: 0xfed0_0000 }.to_string(),
+        "the PM1b control block at 0xfed00000 is in address space 0, not I/O"
+    );
+    assert_eq!(
+        Error::BadPm1Port { block: Pm1Block::A, port: 0x10000 }.to_string(),
+        "the PM1a control block's port 0x10000 doesn't fit 16 bits"
+    );
     assert_eq!(Error::NoDsdt.to_string(), "the FADT gives no DSDT address");
-    assert_eq!(Error::HardwareReduced.to_string(), "hardware-reduced ACPI (no PM1 control blocks) isn't supported");
-    assert_eq!(Error::NoS5 { bad: 0 }.to_string(), "the DSDT has no _S5_ object");
-    assert_eq!(Error::NoS5 { bad: 2 }.to_string(), "the DSDT's _S5_ isn't a package of sleep types (2 found)");
+    assert_eq!(
+        Error::HardwareReduced.to_string(),
+        "hardware-reduced ACPI (no PM1 control blocks, a sleep control register) isn't supported"
+    );
+    assert_eq!(Error::NoS5 { found: 0, first: None }.to_string(), "the DSDT has no Name (_S5_, ...)");
+    assert_eq!(
+        Error::NoS5 { found: 2, first: Some((0x1234, S5Reject::TooLarge)) }.to_string(),
+        "the DSDT has 2 Name (_S5_, ...), none decodable; the first, at AML offset 0x1234: a value too large for SLP_TYP"
+    );
+}
+
+#[test]
+fn pm1_control_values_set_the_sleep_type_then_enter() {
+    // SLP_TYP 5 into bits 10-12, SLP_EN (bit 13) only to enter; every
+    // other bit kept, an old SLP_TYP and SLP_EN cleared.
+    let typ = SlpTyp(5);
+    let others = 0b1100_0011_1111_1111u16; // all but bits 10-13
+    assert_eq!(pm1_control_value(others, typ, SleepStep::SetType), others | 0b101 << 10);
+    assert_eq!(pm1_control_value(others, typ, SleepStep::Enter), others | 0b101 << 10 | 1 << 13);
+    assert_eq!(pm1_control_value(0b11 << 12 | SCI_EN, typ, SleepStep::SetType), 0b101 << 10 | SCI_EN);
+    assert_eq!(pm1_control_value(0xffff, SlpTyp(0), SleepStep::SetType), others);
+    assert_eq!(SleepStep::ORDER, [SleepStep::SetType, SleepStep::Enter]);
+}
+
+#[test]
+fn acpi_modes_say_which() {
+    use std::string::ToString;
+    assert_eq!(AcpiMode::Always.to_string(), "always in ACPI mode (no SMI command port)");
+    assert_eq!(
+        AcpiMode::Ask(AcpiEnable { port: 0xb2, value: 2 }).to_string(),
+        "ACPI mode on 0x2 written to SMI command port 0xb2"
+    );
+    assert_eq!(
+        AcpiMode::Unusable { smi_command: 0xb2, acpi_enable: 0 }.to_string(),
+        "no usable way to ask for ACPI mode (SMI command port 0xb2, ACPI_ENABLE 0x0)"
+    );
 }

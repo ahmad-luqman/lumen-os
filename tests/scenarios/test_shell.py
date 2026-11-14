@@ -8,7 +8,7 @@ both consoles."""
 import re
 
 import pytest
-from lumen_harness.qemu import Machine
+from lumen_harness.qemu import Machine, default_accel
 from lumen_harness.screen import PROMPT, expect_screen, read_screen
 
 SHELLS = r"INFO  shell: shells on serial and the screen; type 'help'\n"
@@ -56,16 +56,18 @@ def test_echo(boot):
 BOOTING = r"INFO  boot: Lumen \d+\.\d+\.\d+ \(x86_64\) booting"
 
 
-def reboots(m: Machine, method: str) -> None:
+def reboots(m: Machine, method: str, warning: str | None = None) -> None:
     """Run `reboot` in the serial shell of `m` (booted with reboot=True) and
-    check it reset by `method` (its log line; no later method's) and booted
-    to the shells again."""
+    check it reset by `method` (its log line; no later method's), after
+    `warning` if one is given, and booted to the shells again."""
     m.expect(BOOTING, 60)
     shells_ready = m.expect(SHELLS, 60)
     m.expect(PROMPT, 60)
     m.qmp()  # connected before the reset, so it gets the RESET event
     m.send_line("reboot")
     m.expect(r"reboot: restarting\n", 10)
+    if warning:
+        m.expect(rf"WARN  power: {warning}\n", 10)
     m.expect(rf"INFO  power: rebooting: {method}\n", 10)
     assert m.wait_event("RESET", 30)["data"]["reason"] == "guest-reset"
     m.expect(BOOTING, 120)
@@ -76,10 +78,15 @@ def reboots(m: Machine, method: str) -> None:
     # QEMU reports every guest reset the same way (guest-reset), so the
     # method that did it is told apart by the log: no later method started.
     first_boot = out[shells_ready.end() : banners[1].start()]
-    assert "INFO  power: rebooting:" in first_boot
     assert len(re.findall(r"INFO  power: rebooting: ", first_boot)) == 1, first_boot
     assert "didn't reset the machine" not in first_boot
     assert m.proc is not None and m.proc.poll() is None, "QEMU ended instead of rebooting"
+    # Under TCG QEMU logs a triple fault (`-d cpu_reset`): only the triple
+    # fault method may cause one (so 0xcf9 or the 8042 can't pass by
+    # falling through to it without their warnings).
+    if default_accel() == "tcg":
+        triple = "Triple fault" in (m.artifacts / "qemu.log").read_text(errors="replace")
+        assert triple == (method == "triple fault")
 
 
 def test_reboot_boots_again(boot):
@@ -98,6 +105,16 @@ def test_reboot_fallbacks_boot_again(boot, first, method):
     # The fallbacks, started with `lumen.reboot=` (q35 always takes 0xcf9's
     # reset, so they wouldn't run otherwise).
     reboots(boot("qemutest", reboot=True, cmdline=f"lumen.reboot={first}"), method)
+
+
+def test_reboot_with_an_unknown_first_method_warns(boot):
+    # A `lumen.reboot=` value it doesn't know: a warning, then 0xcf9.
+    m = boot("qemutest", reboot=True, cmdline="lumen.reboot=bogus")
+    reboots(
+        m,
+        "reset through port 0xcf9",
+        "lumen.reboot=bogus: not cf9, 8042 or triple; starting with 0xcf9",
+    )
 
 
 def test_shutdown_powers_off(boot):

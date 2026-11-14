@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, Self
 
 from . import BUILD_DIR
-from .qmp import QmpClient, qcodes_for
+from .qmp import QmpClient, QmpError, qcodes_for
 
 # isa-debug-exit: QEMU exits with (code << 1) | 1. Must match kernel qemu.rs.
 # Any other status fails a test; the only exception is 0 in the power-off
@@ -167,9 +167,9 @@ class QemuOptions:
     trace: str = "cpu_reset,guest_errors"
     gdb: bool = False
     # False: `-no-reboot`, so a reset (a triple fault among them) ends QEMU
-    # with status 0, which the tests count as a failure (but for an ACPI
-    # power-off, see EXIT_SUCCESS). True: the machine resets and boots again
-    # (the reboot scenarios).
+    # with status 0, which fails a test; the power-off scenario passes on a
+    # 0 that comes with a guest-shutdown event (see EXIT_SUCCESS). True: a
+    # reset boots the machine again (the reboot scenarios).
     reboot: bool = False
     extra: list[str] = field(default_factory=list)
 
@@ -186,7 +186,8 @@ def qemu_args(o: QemuOptions) -> list[str]:
         "-boot", "d",
         "-serial", o.serial,
         "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
-        # A triple fault must end the run, not silently reboot.
+        # A triple fault must end the run, not silently reboot (but for the
+        # reboot scenarios, `reboot=True`).
         *([] if o.reboot else ["-no-reboot"]),
     ]  # fmt: skip
     if o.monitor:
@@ -444,7 +445,11 @@ class Machine:
         scaled like `expect`'s. Connect (`qmp()`) before what makes it
         happen: QEMU sends events only to clients already connected."""
         wait, _ = self._scaled(timeout)
-        return self.qmp().wait_event(name, wait)
+        try:
+            return self.qmp().wait_event(name, wait)
+        except QmpError as e:
+            tail = self.output[-2000:]
+            raise QmpError(f"{e}\n--- last serial output ---\n{tail}") from e
 
     def screendump(self, name: str) -> Path:
         """Save the current screen as PNG in the artifacts directory."""

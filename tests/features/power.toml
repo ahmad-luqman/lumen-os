@@ -1,7 +1,7 @@
 # Features: power. See tests/features/README.md for the format.
 
 [[feature]]
-name = "lumen-acpi reads what powering off takes: the FADT's PM1a/PM1b control blocks (a non-zero 64-bit field wins and must be in I/O space; hardware-reduced ACPI refused), DSDT address and SMI command (left out, not an error, when unusable), and the DSDT's `_S5_` sleep types by searching its AML bytes (name prefixes, one- to four-byte package lengths, Zero/One/byte/word/dword/qword values, each at most 7; a broken package refused, not misread); found at boot on QEMU"
+name = "lumen-acpi reads what powering off takes: the FADT's PM1a/PM1b control blocks (a non-zero 64-bit field wins and must be in I/O space; hardware-reduced ACPI refused), the DSDT address (required), the SMI command (which of always in ACPI mode, a way to ask, or unusable), and the DSDT's `_S5_` sleep types by searching its AML bytes (name prefixes, one- to four-byte package lengths, Zero/One/byte/word/dword/qword values, each at most 7; a broken package refused with the first reason and offset, not misread); the PM1 control values (SLP_TYP set, then SLP_EN, other bits kept); found at boot on QEMU"
 milestone = "M2"
 tests = [
     "cargo:lumen-acpi",
@@ -9,15 +9,18 @@ tests = [
 ]
 
 [[feature]]
-name = "`reboot` resets the machine through port 0xCF9 and it boots again; its fallbacks (the 8042's reset pulse, then a triple fault, each started with `lumen.reboot=`) do too; `shutdown` enters ACPI S5 and QEMU exits because the guest powered off (a power-off exit is a pass only for that scenario, with a guest-shutdown SHUTDOWN event)"
+name = "`reboot` resets the machine through port 0xCF9 and it boots again; its fallbacks (the 8042's reset pulse, then a triple fault, each started with `lumen.reboot=`, an unknown value warned about) do too; `shutdown` enters ACPI S5 (SLP_TYP 0 on QEMU) and QEMU exits because the guest powered off (a power-off exit is a pass only for that scenario, with a guest-shutdown SHUTDOWN event)"
 milestone = "M2"
 tests = [
     "scenario:test_shell::test_reboot_boots_again",
     "scenario:test_shell::test_reboot_fallbacks_boot_again[8042]",
     "scenario:test_shell::test_reboot_fallbacks_boot_again[triple]",
+    "scenario:test_shell::test_reboot_with_an_unknown_first_method_warns",
     "scenario:test_shell::test_shutdown_powers_off",
     "harness:test_qemu::test_reboot_drops_no_reboot",
     "harness:test_qmp::test_events_are_kept_and_waited_for",
     "harness:test_qmp::test_waiting_for_an_event_ends",
+    "harness:test_qmp::test_a_command_that_times_out_breaks_the_client",
     "harness:test_qemu::test_machine_waits_for_events_with_scaled_timeouts",
+    "harness:test_qemu::test_machine_event_failures_show_the_serial_output",
 ]
