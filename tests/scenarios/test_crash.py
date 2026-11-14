@@ -197,3 +197,22 @@ def test_spinlock_relock_is_reported(boot, cpu):
     assert "!!!" not in report, report
     lines = report.splitlines()
     assert lines[-3].startswith("heap: ") and lines[-2:] == ["interrupts: off", END], lines[-3:]
+
+
+def test_relock_of_the_log_lock_is_reported(crash_report):
+    # A real lock the crash path also writes near: logging inside
+    # `with_line_lock` re-locks the log's line lock. The report names it
+    # (the logger is the second caller) and is complete: the crash path
+    # never waits for that lock.
+    report = crash_report("relocklog")
+    assert re.search(
+        r"^panic: SpinLock<\(\)> at 0x[0-9a-f]+ re-locked on cpu 0, which already holds it$",
+        report,
+        re.MULTILINE,
+    ), report
+    assert re.search(r"^  at kernel/src/klog\.rs:\d+:\d+$", report, re.MULTILINE), report
+    frames = backtrace(report)
+    assert any("shell::crash::crash_relock_log" in f for f in frames), report
+    assert "!!!" not in report, report
+    lines = report.splitlines()
+    assert lines[-3].startswith("heap: ") and lines[-2:] == ["interrupts: off", END], lines[-3:]

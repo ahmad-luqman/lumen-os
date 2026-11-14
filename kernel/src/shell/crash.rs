@@ -28,6 +28,7 @@ pub const KINDS: &[&str] = &[
     "bigframe",
     "guard",
     "relock",
+    "relocklog",
 ];
 
 /// Writes to serial and the screen, whichever shell ran the command (a
@@ -152,6 +153,7 @@ fn crash_fn(kind: &str) -> Option<fn()> {
         "stack" => crash_stack_overflow,
         "bigframe" => crash_big_frame_overflow,
         "relock" => crash_relock,
+        "relocklog" => crash_relock_log,
         _ => return None,
     })
 }
@@ -386,6 +388,15 @@ fn crash_relock() {
     // shell says it hasn't finished.
     drop((second, first));
     let _ = writeln!(Out, "crash: SpinLock::lock returned while this cpu held it (mutual exclusion broken)");
+}
+
+/// Log while holding the log's line lock (`with_line_lock` forbids it):
+/// the logger's `lock` must report the re-lock, and the report, which never
+/// waits for that lock, must still come out whole.
+#[inline(never)]
+fn crash_relock_log() {
+    crate::klog::with_line_lock(|| log::info!(target: "crash", "logging under the line lock"));
+    let _ = writeln!(Out, "crash: logging under the line lock went unnoticed");
 }
 
 crate::ktest!(
