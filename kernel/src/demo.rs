@@ -18,8 +18,8 @@
 //! no thread draws once the command drops the canvas (whose drop draws the
 //! terminal again), and the last reference is the command's. A CPU that
 //! gets no thread (spawning failed) has its slot drawn by the caller.
-//! (Threads, not `smp::run_on` jobs: a job is a bare `fn()` and couldn't
-//! carry the canvas.)
+//! (Threads, not `smp::run_on` jobs: a job is a bare `fn()`, so reaching
+//! the canvas from one would take a static raw pointer and `unsafe`.)
 
 #![cfg_attr(feature = "ktest", allow(dead_code))] // the test kernel runs no shell
 
@@ -27,6 +27,7 @@ use crate::arch::{self, MAX_CPUS};
 use crate::sched::{self, SpawnError};
 use crate::shell::Ctx;
 use crate::term::{Canvas, CanvasError};
+use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -158,12 +159,33 @@ pub fn draw_mandelbrot(canvas: &Arc<Canvas>, view: View, width: usize, height: u
     Drawn { ns: crate::time::now_ns() - start, rows, caller, no_thread, skipped }
 }
 
+/// Say on the console which CPUs got no thread or were left out of `drawn`
+/// (their rows were drawn by the caller); how many were.
+fn report_left_out(ctx: &mut Ctx<'_>, drawn: &Drawn) -> usize {
+    let mut left_out = 0;
+    for cpu in 0..MAX_CPUS {
+        if let Some(e) = drawn.no_thread[cpu] {
+            let _ = writeln!(
+                ctx.out,
+                "mandelbrot: cpu{cpu} got no thread ({e}); its rows were drawn by cpu{}",
+                drawn.caller
+            );
+            left_out += 1;
+        }
+        if drawn.skipped[cpu] {
+            let _ = writeln!(ctx.out, "mandelbrot: cpu{cpu} is online but runs no scheduler; it drew nothing");
+            left_out += 1;
+        }
+    }
+    left_out
+}
+
 /// `mandelbrot`: the set drawn by the calling CPU (the boot CPU, where the
-/// shells run) alone, then by every CPU, with both times; it stays until a
-/// key.
+/// shells run) alone, then by every CPU whose scheduler runs, with both
+/// times; it stays until a key.
 pub fn mandelbrot(ctx: &mut Ctx<'_>, args: &[String]) {
-    if !args.is_empty() {
-        let _ = writeln!(ctx.out, "usage: mandelbrot");
+    if let Some(arg) = args.first() {
+        let _ = writeln!(ctx.out, "mandelbrot: takes no arguments (got '{arg}')\nusage: mandelbrot");
         return;
     }
     let canvas = match ctx.canvas() {
@@ -174,6 +196,11 @@ pub fn mandelbrot(ctx: &mut Ctx<'_>, args: &[String]) {
         }
     };
     let (w, h) = (canvas.width(), canvas.height().saturating_sub(STATUS_H));
+    if w == 0 || h == 0 {
+        let _ =
+            writeln!(ctx.out, "mandelbrot: the screen is too small ({}x{} pixels)", canvas.width(), canvas.height());
+        return;
+    }
     let view = View::fit(w, h, MAX_ITER);
     canvas.clear(0);
     status_line(&canvas, "Mandelbrot set: drawing on one CPU");
@@ -182,6 +209,7 @@ pub fn mandelbrot(ctx: &mut Ctx<'_>, args: &[String]) {
     canvas.fill_rect(0, 0, w, h, 0);
     let all = draw_mandelbrot(&canvas, view, w, h, true);
     if !canvas.is_live() {
+        report_left_out(ctx, &all);
         let _ = writeln!(ctx.out, "mandelbrot: stopped: {}", CanvasError::Stopped);
         return;
     }
@@ -202,17 +230,12 @@ pub fn mandelbrot(ctx: &mut Ctx<'_>, args: &[String]) {
         let _ = write!(per_cpu, " cpu{cpu}={rows}");
     }
     let _ = writeln!(ctx.out, "mandelbrot: rows drawn by each CPU:{per_cpu}");
-    for cpu in 0..MAX_CPUS {
-        if let Some(e) = all.no_thread[cpu] {
-            let _ =
-                writeln!(ctx.out, "mandelbrot: cpu{cpu} got no thread ({e}); its rows were drawn by cpu{}", all.caller);
-        }
-        if all.skipped[cpu] {
-            let _ = writeln!(ctx.out, "mandelbrot: cpu{cpu} is online but runs no scheduler; it drew nothing");
-        }
-    }
-    let mut line = String::new();
-    let _ = write!(line, "Mandelbrot set, drawn by {}  -  press a key", Cpus(all.cpus()));
+    let left_out = match report_left_out(ctx, &all) {
+        0 => String::new(),
+        n => format!(" ({n} left out: see the console)"),
+    };
+    let line =
+        format!("Mandelbrot set, drawn by {}{left_out}  -  press a key on {}", Cpus(all.cpus()), ctx.console_name());
     status_line(&canvas, &line);
     let _ = writeln!(ctx.out, "mandelbrot: press a key");
     ctx.wait_key();
@@ -231,9 +254,9 @@ const LIFE_USAGE: &str = "usage: life [pattern] [generations]";
 
 /// `life [pattern] [generations]`: the pattern (default `gun`) where it
 /// starts best ([`life::Place`]); with a count it steps that many
-/// generations as fast as it can (a key ends it early) and the frame stays
-/// until a key, else it steps at most 20 a second until a key. A status
-/// line under the grid shows the generation and the population.
+/// generations as fast as it can (a key ends it early, and says so) and the
+/// frame stays until a key, else it steps at most 20 a second until a key.
+/// A status line under the grid shows the generation and the population.
 pub fn life(ctx: &mut Ctx<'_>, args: &[String]) {
     if args.len() > 2 {
         let _ = writeln!(ctx.out, "life: too many arguments\n{LIFE_USAGE}");
@@ -264,7 +287,17 @@ pub fn life(ctx: &mut Ctx<'_>, args: &[String]) {
             return;
         }
     };
-    let mut grid = Life::new(canvas.width() / CELL, canvas.height().saturating_sub(STATUS_H) / CELL);
+    let (cols, rows) = (canvas.width() / CELL, canvas.height().saturating_sub(STATUS_H) / CELL);
+    let (pw, ph) = pattern.size();
+    if cols < pw || rows < ph {
+        let _ = writeln!(
+            ctx.out,
+            "life: the screen is too small for {} ({cols}x{rows} cells, it needs {pw}x{ph})",
+            pattern.name
+        );
+        return;
+    }
+    let mut grid = Life::new(cols, rows);
     let (x0, y0) = pattern.origin(grid.width(), grid.height());
     grid.place(pattern, x0, y0);
     canvas.clear(DEAD);
@@ -275,7 +308,7 @@ pub fn life(ctx: &mut Ctx<'_>, args: &[String]) {
         let (x, y) = (x0.saturating_add(x), y0.saturating_add(y));
         cell(x, y, grid.get(x, y));
     }
-    let _ = writeln!(ctx.out, "life: {} on {}x{} cells; any key quits", pattern.name, grid.width(), grid.height());
+    let _ = writeln!(ctx.out, "life: {} on {}x{} cells; a key quits", pattern.name, grid.width(), grid.height());
     let mut line = String::new();
     let mut show = |grid: &Life, tail: &str| {
         line.clear();
@@ -307,11 +340,15 @@ pub fn life(ctx: &mut Ctx<'_>, args: &[String]) {
     let _ = writeln!(ctx.out, "life: generation {}, {} alive", grid.generation(), grid.population());
     match end {
         End::Count => {
-            show(&grid, "  -  press a key");
+            show(&grid, &format!("  -  press a key on {}", ctx.console_name()));
             let _ = writeln!(ctx.out, "life: press a key");
             ctx.wait_key();
         }
-        End::Key => {}
+        End::Key => {
+            if let Some(n) = count {
+                let _ = writeln!(ctx.out, "life: a key ended it before generation {n}");
+            }
+        }
         End::Lost => {
             let _ = writeln!(ctx.out, "life: stopped: {}", CanvasError::Stopped);
         }
@@ -345,10 +382,14 @@ fn draws_alike(canvas: &Arc<Canvas>, width: usize, height: usize, rounds: usize)
         let held = Arc::strong_count(canvas);
         let same = sums() == alone;
         let rows: Vec<usize> = online.iter().map(|&c| all.rows[c]).collect();
-        if round == 0 || held != 1 || !same {
+        let left_out: Vec<(usize, Option<SpawnError>, bool)> = (0..MAX_CPUS)
+            .filter(|&c| all.no_thread[c].is_some() || all.skipped[c])
+            .map(|c| (c, all.no_thread[c], all.skipped[c]))
+            .collect();
+        if round == 0 || held != 1 || !same || all.cpus() != online.len() {
             crate::ktest::diag(format_args!(
                 "{width}x{height} round {round}: alone {} us, {} {} us, rows per CPU {rows:?}, \
-                 {held} references, same pixels {same}",
+                 {held} references, same pixels {same}, left out (cpu, no thread, no scheduler) {left_out:?}",
                 one.ns / 1000,
                 Cpus(all.cpus()),
                 all.ns / 1000
@@ -368,9 +409,9 @@ crate::ktest!(
         // Drawn by every online CPU, each draws at least one band, all the
         // rows are drawn once, and the pixels match this CPU drawing alone;
         // when it returns no thread holds the canvas any more. A short image
-        // (4 bands: a thread has barely started when the caller is done, so
-        // a missing join shows), 20 times; and a height that ends in a part
-        // band.
+        // (a band per CPU: a thread has barely started when the caller is
+        // done, so a missing join shows), 20 times; and a height that ends
+        // in a part band.
         let canvas = match crate::term::canvas(crate::term::Owner::new()) {
             Ok(canvas) => Arc::new(canvas),
             Err(e) => {
@@ -379,7 +420,9 @@ crate::ktest!(
             }
         };
         let width = canvas.width().min(160);
-        draws_alike(&canvas, width, 4 * BAND.get(), 20)?;
+        // As many bands as CPUs online (whatever -smp says).
+        let cpus = (0..MAX_CPUS).filter(|&c| crate::smp::online_lapic_id(c).is_some()).count();
+        draws_alike(&canvas, width, cpus * BAND.get(), 20)?;
         draws_alike(&canvas, width, 197, 1)
     }
 );

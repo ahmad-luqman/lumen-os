@@ -1,7 +1,7 @@
 extern crate std;
 
 use crate::bands;
-use crate::life::{Life, NAMES, ORIGIN, PATTERNS, Place, pattern};
+use crate::life::{Life, ORIGIN, PATTERNS, Place, pattern};
 use crate::mandel::{ONE, View, color, escape};
 use core::num::NonZeroUsize;
 use std::collections::{HashMap, HashSet};
@@ -95,6 +95,10 @@ fn extreme_points_never_overflow() {
     }
     let _ = View::fit(100, 100, 64).escape_at(usize::MAX, usize::MAX);
     let _ = View::fit(usize::MAX, usize::MAX, 64).escape_at(usize::MAX / 2, 0);
+    let view = View::fit(usize::MAX, 1, 64);
+    for x in [0, 1, usize::MAX / 2, usize::MAX - 1, usize::MAX] {
+        let _ = view.escape_at(x, 0);
+    }
 }
 
 #[test]
@@ -136,15 +140,15 @@ fn bands_deal_every_row_to_exactly_one_slot() {
         for slots in 1..=8 {
             for band in [1, 8, 13] {
                 let mut seen = vec![0u32; height];
-                let mut last_band = vec![None; slots];
                 for slot in 0..slots {
                     let n = NonZeroUsize::new(slots).unwrap();
+                    let mut last = None;
                     for rows in bands::rows(slot, n, height, NonZeroUsize::new(band).unwrap()) {
                         // A slot's band: whole, or the last one cut short.
                         assert!(rows.start % band == 0 && (rows.len() == band || rows.end == height));
                         assert_eq!((rows.start / band) % slots, slot);
-                        assert!(last_band[slot] < Some(rows.start));
-                        last_band[slot] = Some(rows.start);
+                        assert!(last < Some(rows.start));
+                        last = Some(rows.start);
                         rows.for_each(|y| seen[y] += 1);
                     }
                 }
@@ -152,6 +156,17 @@ fn bands_deal_every_row_to_exactly_one_slot() {
             }
         }
     }
+}
+
+#[test]
+fn the_last_band_of_a_huge_image_ends_at_its_height() {
+    // (Its end would overflow without the cut.)
+    // As many slots as bands: the last slot's only band is the last one.
+    let (height, band) = (usize::MAX - 3, NonZeroUsize::new(8).unwrap());
+    let bands_n = height.div_ceil(8);
+    let mut rows = bands::rows(bands_n - 1, NonZeroUsize::new(bands_n).unwrap(), height, band);
+    assert_eq!(rows.next(), Some((bands_n - 1) * 8..height));
+    assert_eq!(rows.next(), None);
 }
 
 #[test]
@@ -220,13 +235,15 @@ fn the_gun_fires_a_glider_every_thirty_generations() {
     let gun = pattern("gun").unwrap();
     life.place(gun, 1, 1);
     assert_eq!(life.population(), 36);
-    for _ in 0..30 {
-        life.step(|_, _, _| {});
-    }
-    // The gun again, plus one glider.
-    assert_eq!(life.population(), 36 + 5);
     let gun_cells: Vec<_> = gun.cells().map(|(x, y)| (x + 1, y + 1)).collect();
-    assert!(gun_cells.iter().all(|&(x, y)| life.get(x, y)));
+    // Three periods: the gun again each time, plus one more glider.
+    for period in 1..=3 {
+        for _ in 0..30 {
+            life.step(|_, _, _| {});
+        }
+        assert_eq!(life.population(), 36 + 5 * period, "period {period}");
+        assert!(gun_cells.iter().all(|&(x, y)| life.get(x, y)));
+    }
 }
 
 #[test]
@@ -286,12 +303,6 @@ fn every_pattern_matches_its_published_rle() {
 }
 
 #[test]
-fn the_names_are_the_patterns() {
-    assert_eq!(NAMES.len(), PATTERNS.len());
-    assert!(NAMES.iter().zip(PATTERNS).all(|(n, p)| *n == p.name));
-}
-
-#[test]
 fn the_rules_are_b3_s23() {
     // A cell with n live neighbours (n = 0..=8), alive or dead: born with
     // exactly 3, survives with 2 or 3, else dead.
@@ -336,8 +347,42 @@ fn patterns_start_where_their_place_says() {
             Place::Right => assert_eq!((x, y), (160 - w - ORIGIN, (80 - h) / 2)),
         }
     }
-    // A grid smaller than the pattern: at the edge, not past it.
-    assert_eq!(pattern("acorn").unwrap().origin(3, 2), (0, 0));
+    // A grid barely larger than each pattern: inside it, whatever its
+    // place; smaller: at the top-left corner, not past it.
+    for p in PATTERNS {
+        let (w, h) = p.size();
+        let (x, y) = p.origin(w + 1, h + 1);
+        assert!(x + w <= w + 1 && y + h <= h + 1, "{}", p.name);
+        assert_eq!(p.origin(w.saturating_sub(1), h.saturating_sub(1)), (0, 0), "{}", p.name);
+    }
+}
+
+#[test]
+fn the_glider_ends_as_a_block_at_the_bottom_edge() {
+    // `life glider`'s grid and start: after 300 generations, a still block
+    // in the bottom rows.
+    let glider = pattern("glider").unwrap();
+    let mut life = Life::new(160, 80);
+    let (x, y) = glider.origin(160, 80);
+    life.place(glider, x, y);
+    for _ in 0..300 {
+        life.step(|_, _, _| {});
+    }
+    let block = alive(&life);
+    assert_eq!(block.len(), 4);
+    let (bx, by) = block[0];
+    assert_eq!(block, [(bx, by), (bx + 1, by), (bx, by + 1), (bx + 1, by + 1)]);
+    assert_eq!(by + 1, 79);
+    let mut changed = false;
+    life.step(|_, _, _| changed = true);
+    assert!(!changed);
+}
+
+#[test]
+fn placing_near_the_end_of_usize_leaves_cells_out() {
+    let mut life = Life::new(4, 4);
+    life.place(pattern("gun").unwrap(), usize::MAX - 2, usize::MAX - 1);
+    assert_eq!(life.population(), 0);
 }
 
 /// Life on an endless plane, the obvious way (a set of live cells): the

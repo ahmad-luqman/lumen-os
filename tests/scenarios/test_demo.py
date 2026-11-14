@@ -6,6 +6,7 @@ that ran it (serial here)."""
 
 import re
 import time
+from collections import Counter
 
 from lumen_harness.image import assert_matches_golden
 from lumen_harness.qemu import Machine
@@ -19,7 +20,7 @@ IMAGE_H = CANVAS[1] - 16
 # The terminal's background (`fb::BG`).
 BG = (0x0F, 0x14, 0x20)
 MANDELBROT = re.compile(
-    rf"mandelbrot: 1280x{IMAGE_H}, 1 CPU (\d+) ms, (\d+) CPUs (\d+) ms \((\d+)\.(\d)x\)\n"
+    rf"mandelbrot: 1280x{IMAGE_H}, 1 CPU (\d+) ms, (\d+) CPUs? (\d+) ms \((\d+)\.(\d)x\)\n"
 )
 ROWS = re.compile(r"mandelbrot: rows drawn by each CPU:((?: cpu\d+=\d+)+)\n")
 
@@ -54,7 +55,7 @@ def test_mandelbrot_golden(boot, artifacts, golden_dir):
     assert sorted(rows) == [0, 1, 2, 3] and sum(rows.values()) == IMAGE_H
     one, cpus, all_ms = int(found[1]), int(found[2]), int(found[3])
     print(f"mandelbrot: 1 CPU {one} ms, {cpus} CPUs {all_ms} ms")
-    assert cpus == 4
+    assert cpus == 4, f"{cpus} CPUs drew"
     # No CPU went without a thread or was left out.
     assert "got no thread" not in m.output and "runs no scheduler" not in m.output
     shot = m.screendump("mandelbrot.png")
@@ -71,7 +72,7 @@ def test_life_glider_golden(boot, artifacts, golden_dir):
     # started, with the status line (and its prompt) under the grid.
     m = boot_shell(boot)
     m.send_line("life glider 40")
-    m.expect(r"life: glider on 160x80 cells; any key quits\n", 10)
+    m.expect(r"life: glider on 160x80 cells; a key quits\n", 10)
     m.expect(r"life: generation 40, 5 alive\n", 120)
     m.expect(r"life: press a key\n", 10)
     shot = m.screendump("life-glider.png")
@@ -85,12 +86,9 @@ def test_life_glider_golden(boot, artifacts, golden_dir):
 
 def step_plane(cells: set[tuple[int, int]]) -> set[tuple[int, int]]:
     """One generation on an endless plane (the reference)."""
-    counts: dict[tuple[int, int], int] = {}
-    for x, y in cells:
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dx or dy:
-                    counts[(x + dx, y + dy)] = counts.get((x + dx, y + dy), 0) + 1
+    counts = Counter(
+        (x + dx, y + dy) for x, y in cells for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dx or dy
+    )
     return {c for c, n in counts.items() if n == 3 or (n == 2 and c in cells)}
 
 
@@ -127,7 +125,7 @@ def test_every_pattern_runs_as_on_a_plane(boot):
         for _ in range(30):
             cells = step_plane(cells)
         m.send_line(f"life {name} 30")
-        m.expect(rf"life: {name} on 160x80 cells; any key quits\n", 10)
+        m.expect(rf"life: {name} on 160x80 cells; a key quits\n", 10)
         m.expect(rf"life: generation 30, {len(cells)} alive\n", 60)
         m.expect(r"life: press a key\n", 10)
         m.send(" ")
@@ -135,11 +133,11 @@ def test_every_pattern_runs_as_on_a_plane(boot):
 
 
 def test_life_runs_until_a_key(boot):
-    # Without a count it runs, at most 20 generations a second, until any
-    # key.
+    # Without a pattern, the gun; without a count it runs, at most 20
+    # generations a second (with a margin for a slow emulator), until a key.
     m = boot_shell(boot)
-    m.send_line("life gun")
-    m.expect(r"life: gun on 160x80 cells; any key quits\n", 10)
+    m.send_line("life")
+    m.expect(r"life: gun on 160x80 cells; a key quits\n", 10)
     start = time.monotonic()
     time.sleep(1)
     m.send(" ")
@@ -147,7 +145,20 @@ def test_life_runs_until_a_key(boot):
     elapsed = time.monotonic() - start
     m.expect(r"lumen> ", 10)
     generations = int(found[1])
-    assert 3 <= generations <= 20 * elapsed + 2, f"{generations} generations in {elapsed:.2f} s"
+    assert 3 <= generations <= 20 * elapsed + 5, f"{generations} generations in {elapsed:.2f} s"
+    assert "life: press a key" not in m.output
+
+
+def test_a_key_ends_a_counted_run_early(boot):
+    m = boot_shell(boot)
+    m.send_line("life acorn 1000000")
+    m.expect(r"life: acorn on 160x80 cells; a key quits\n", 10)
+    time.sleep(1)
+    m.send(" ")
+    found = m.expect(r"life: generation (\d+), (\d+) alive\n", 30)
+    m.expect(r"life: a key ended it before generation 1000000\n", 10)
+    m.expect(r"lumen> ", 10)
+    assert 0 < int(found[1]) < 1_000_000
     assert "life: press a key" not in m.output
 
 
@@ -164,4 +175,7 @@ def test_life_usage_names_the_bad_argument(boot):
     m.expect(r"lumen> ", 10)
     m.send_line("life glider 4 more")
     m.expect(r"life: too many arguments\n" + usage, 10)
+    m.expect(r"lumen> ", 10)
+    m.send_line("mandelbrot now")
+    m.expect(r"mandelbrot: takes no arguments \(got 'now'\)\nusage: mandelbrot\n", 10)
     m.expect(r"lumen> ", 10)

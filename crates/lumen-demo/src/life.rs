@@ -1,6 +1,7 @@
 //! Conway's Game of Life on a `width` x `height` grid whose outside counts
-//! as dead: nothing wraps around (a glider reaching the edge ends as a
-//! still block there).
+//! as dead: nothing wraps around (a glider running into the bottom edge
+//! ends as a still block there; a test checks the one `life glider`
+//! starts).
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -35,7 +36,7 @@ impl Pattern {
         let (w, h) = self.size();
         let middle = |grid: usize, size: usize| grid.saturating_sub(size) / 2;
         match self.place {
-            Place::TopLeft => (ORIGIN, ORIGIN),
+            Place::TopLeft => (ORIGIN.min(width.saturating_sub(w)), ORIGIN.min(height.saturating_sub(h))),
             Place::Centre => (middle(width, w), middle(height, h)),
             Place::Right => (width.saturating_sub(w + ORIGIN), middle(height, h)),
         }
@@ -55,8 +56,16 @@ impl Pattern {
     }
 }
 
-/// The patterns' names, as [`PATTERNS`] has them (for completion).
-pub const NAMES: [&str; 5] = ["glider", "gun", "lwss", "rpentomino", "acorn"];
+/// The patterns' names, in [`PATTERNS`]' order (for completion).
+pub const NAMES: [&str; PATTERNS.len()] = {
+    let mut names = [""; PATTERNS.len()];
+    let mut i = 0;
+    while i < PATTERNS.len() {
+        names[i] = PATTERNS[i].name;
+        i += 1;
+    }
+    names
+};
 
 /// The patterns the `life` command knows, by name.
 pub const PATTERNS: &[Pattern] = &[
@@ -119,8 +128,17 @@ pub struct Life {
 
 impl Life {
     /// An empty `width` x `height` grid at generation 0.
+    ///
+    /// # Panics
+    /// If `width * height` overflows `usize`.
     pub fn new(width: usize, height: usize) -> Life {
-        Life { width, height, cells: vec![false; width * height], next: vec![false; width * height], generation: 0 }
+        let n = width.checked_mul(height).expect("a Life grid's cell count overflows usize");
+        Life { width, height, cells: vec![false; n], next: vec![false; n], generation: 0 }
+    }
+
+    /// Where cell (`x`, `y`) is kept (inside the grid).
+    fn index(&self, x: usize, y: usize) -> usize {
+        y * self.width + x
     }
 
     pub fn width(&self) -> usize {
@@ -137,13 +155,14 @@ impl Life {
 
     /// Whether cell (`x`, `y`) is alive (false outside the grid).
     pub fn get(&self, x: usize, y: usize) -> bool {
-        x < self.width && y < self.height && self.cells[y * self.width + x]
+        x < self.width && y < self.height && self.cells[self.index(x, y)]
     }
 
     /// Make cell (`x`, `y`) alive or dead (nothing outside the grid).
     pub fn set(&mut self, x: usize, y: usize, alive: bool) {
         if x < self.width && y < self.height {
-            self.cells[y * self.width + x] = alive;
+            let i = self.index(x, y);
+            self.cells[i] = alive;
         }
     }
 
@@ -165,7 +184,7 @@ impl Life {
         let mut n = 0;
         for ny in y.saturating_sub(1)..=(y + 1).min(self.height - 1) {
             for nx in x.saturating_sub(1)..=(x + 1).min(self.width - 1) {
-                if (nx, ny) != (x, y) && self.cells[ny * self.width + nx] {
+                if (nx, ny) != (x, y) && self.cells[self.index(nx, ny)] {
                     n += 1;
                 }
             }
@@ -179,7 +198,7 @@ impl Life {
     pub fn step(&mut self, mut changed: impl FnMut(usize, usize, bool)) {
         for y in 0..self.height {
             for x in 0..self.width {
-                let i = y * self.width + x;
+                let i = self.index(x, y);
                 let alive = matches!((self.cells[i], self.neighbours(x, y)), (true, 2 | 3) | (false, 3));
                 self.next[i] = alive;
                 if alive != self.cells[i] {

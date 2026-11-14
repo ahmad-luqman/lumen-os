@@ -5,10 +5,10 @@
 //! No step can overflow. A point with `|re| > 2` or `|im| > 2` has
 //! `|c| > 2`, so it escapes at the first check after one step (`z₁ = c`):
 //! [`escape`] answers that at once, without iterating. Every other point
-//! has `|c| < 2√2`, and is stepped only while `|z|² <= 4`, so going into a
-//! step `|re z|, |im z| <= 2` and coming out they are below `4 + 2√2 < 7`,
-//! that is below 2^31 in units of 2^-28: their squares and product stay
-//! below 2^62.
+//! has `|c| <= 2√2`, and is stepped only while `|z|² <= 4`, so going into
+//! a step `|re z|, |im z| <= 2`, and coming out `|z'| <= |z|² + |c| <=
+//! 4 + 2√2 < 7`: each part is below 2^31 in units of 2^-28, so their
+//! squares and product stay below 2^62.
 
 /// Fraction bits.
 pub const FRAC: u32 = 28;
@@ -57,7 +57,8 @@ impl View {
     }
 }
 
-/// Iterate `z = z² + c` from `z₀ = 0` (`c` = `re` + `im`·i): the index `n`
+/// Iterate `z = z² + c` from `z₀ = 0` (`c` = `re` + `im`·i) in fixed point
+/// (squares and products rounded down to [`FRAC`] bits): the index `n`
 /// of the first `zₙ` with `|zₙ|² > 4`, or `max_iter` if none of `z₀` to
 /// `z₍max_iter-1₎` has (the point counts as inside the set).
 pub fn escape(re: i64, im: i64, max_iter: u32) -> u32 {
