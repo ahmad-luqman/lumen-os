@@ -1,4 +1,4 @@
-use crate::pipe::{Align, Column, Data, Filter, Kind, PipeError, Table, Value};
+use crate::pipe::{self, Align, Column, Data, Filter, Kind, Op, PipeError, Table, Value};
 use crate::words::{self, SplitError};
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -357,7 +357,10 @@ fn where_on_numbers_is_strict_at_the_boundary() {
 #[test]
 fn a_hex_column_takes_only_hex() {
     let err = |words: &[&str]| apply(Data::Table(vectors()), words).unwrap_err().to_string();
-    assert_eq!(err(&["where", "vector", "=", "32"]), "where: vector is hex: write 0x32, not 32");
+    assert_eq!(err(&["where", "vector", "=", "32"]), "where: vector is hex: write it with 0x (e.g. 0x20)");
+    assert_eq!(err(&["where", "vector", "=", "-5"]), "where: vector holds numbers, and '-5' isn't one");
+    // A `%` only after a percentage.
+    assert_eq!(err(&["where", "count", ">", "5%"]), "where: count holds numbers, and '5%' isn't one");
     assert_eq!(err(&["where", "vector", "=", "timer"]), "where: vector holds numbers, and 'timer' isn't one");
     // No sign after the 0x.
     assert_eq!(err(&["where", "vector", ">", "0x-5"]), "where: vector holds numbers, and '0x-5' isn't one");
@@ -442,4 +445,61 @@ fn after_a_pipe_only_filters_complete() {
     assert!(words::partial("cpus | c").unwrap().after_pipe);
     assert!(!words::partial("cpus c").unwrap().after_pipe);
     assert!(!words::partial("echo '|' c").unwrap().after_pipe);
+}
+
+#[test]
+fn sort_orders_numbers_in_text_by_value_as_where_reads_them() {
+    let sorted = |text: &str, words: &[&str]| apply(Data::from_text(text), words).unwrap();
+    let twelve: String = (1..=12).map(|n| alloc::format!("{n}\n")).collect();
+    let want: Vec<String> = (6..=12).rev().map(|n| n.to_string()).collect();
+    // seq 12 | where line > 5 | sort line desc
+    let over_five = apply(Data::from_text(&twelve), &["where", "line", ">", "5"]).unwrap();
+    assert_eq!(apply(over_five, &["sort", "line", "desc"]), Ok(Data::Text(want)));
+    // Numbers first, by value; then text by bytes; `desc` reverses both.
+    assert_eq!(sorted("b\n10\n2\na\n-1\n", &["sort", "line"]), Data::Text(strings(&["-1", "2", "10", "a", "b"])));
+    assert_eq!(
+        sorted("b\n10\n2\na\n-1\n", &["sort", "line", "desc"]),
+        Data::Text(strings(&["b", "a", "10", "2", "-1"]))
+    );
+    // Equal numbers written alike or not keep their order.
+    assert_eq!(sorted("+2\n1\n2\n", &["sort", "line"]), Data::Text(strings(&["1", "+2", "2"])));
+}
+
+#[test]
+fn every_operator_word_parses_to_its_operator() {
+    let ops = [Op::Eq, Op::Ne, Op::Lt, Op::Le, Op::Gt, Op::Ge, Op::Contains];
+    assert_eq!(pipe::OPS.len(), ops.len());
+    for (word, op) in pipe::OPS.iter().zip(ops) {
+        let parsed = Filter::parse(&strings(&["where", "c", word, "1"]));
+        assert_eq!(parsed, Some(Ok(Filter::Where { column: "c".into(), op, value: "1".into() })), "{word}");
+    }
+}
+
+#[test]
+fn chunks_are_whole_lines_of_about_a_size() {
+    let mut text = String::new();
+    for i in 0..400 {
+        text.push_str(&alloc::format!("line {i}\n"));
+    }
+    text.push_str(&"x".repeat(2000));
+    text.push('\n');
+    text.push_str("tail without a newline");
+    for size in [1, 100, 512, 10_000] {
+        let pieces: Vec<&str> = pipe::chunks(&text, size).collect();
+        assert_eq!(pieces.concat(), text, "size {size}");
+        let last = pieces.len() - 1;
+        for (i, piece) in pieces.iter().enumerate() {
+            let last_line = piece.trim_end_matches('\n').rsplit('\n').next().unwrap_or("").len() + 1;
+            if i < last {
+                assert!(piece.ends_with('\n') && piece.len() >= size, "size {size}: {piece:?}");
+                assert!(piece.len() < size + last_line, "size {size}: {} bytes", piece.len());
+            }
+        }
+        assert!(pieces[last].ends_with("newline"), "size {size}");
+    }
+    // Under the size, one piece; nothing, none.
+    assert_eq!(pipe::chunks("a\nb\n", 512).collect::<Vec<_>>(), ["a\nb\n"]);
+    assert_eq!(pipe::chunks("", 512).count(), 0);
+    // A line longer than the size ends the piece it is in.
+    assert_eq!(pipe::chunks("a\nbbbbbb\nc\n", 3).collect::<Vec<_>>(), ["a\nbbbbbb\n", "c\n"]);
 }

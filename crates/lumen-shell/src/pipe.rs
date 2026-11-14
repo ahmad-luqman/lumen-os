@@ -11,13 +11,16 @@
 //!   with `value` (`=`, `!=`, `<`, `<=`, `>`, `>=`; `~` contains, for text).
 //!   A number column takes a number: decimal, or hex after `0x` (which a
 //!   hex column requires: `vector = 20` is refused, not read as `0x14`); a
-//!   `%` after a percentage is allowed. A text column compares text byte by
-//!   byte, unless the value is a decimal number: then rows whose text is
-//!   one compare as numbers and the others don't match (`seq 12 | where
+//!   `%` after a percentage column's is allowed. A text column compares
+//!   text byte by byte, unless the value is a decimal number (and the
+//!   operator isn't `~`, which always looks for text): then rows whose text
+//!   is one compare as numbers and the others don't match (`seq 12 | where
 //!   line > 5`). A row without a value there (printed as `-` or `stalled`)
 //!   never matches, not even `!=`.
-//! - `sort <column> [desc]`: the rows ordered by `column` (numbers as
-//!   numbers), equal ones kept in their order, rows without a value last.
+//! - `sort <column> [desc]`: the rows ordered by `column`, numbers as
+//!   numbers (in a text column, lines that are decimal numbers by value,
+//!   before the rest, as `where` reads them), equal ones kept in their
+//!   order, rows without a value last (`desc` reverses the rest).
 //! - `first <n>`: the first `n` lines or rows.
 //! - `count`: how many lines or rows, as one line.
 //! - `select <column>...`: those columns, in that order (each once).
@@ -239,6 +242,26 @@ impl Data {
         out
     }
 
+    /// How many lines or rows.
+    pub fn len(&self) -> usize {
+        match self {
+            Data::Text(lines) => lines.len(),
+            Data::Table(table) => table.rows.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Keep the first `n` lines or rows.
+    fn truncate(&mut self, n: usize) {
+        match self {
+            Data::Text(lines) => lines.truncate(n),
+            Data::Table(table) => table.rows.truncate(n),
+        }
+    }
+
     /// The data as a table, and whether it was text (a table of one
     /// column, `line`).
     fn into_table(self) -> (Table, bool) {
@@ -298,7 +321,7 @@ impl Op {
             Op::Le => ordering.is_le(),
             Op::Gt => ordering.is_gt(),
             Op::Ge => ordering.is_ge(),
-            Op::Contains => false, // not an ordering: `matches` handles it
+            Op::Contains => false, // not an ordering: `Wanted::Contains`
         }
     }
 }
@@ -392,23 +415,12 @@ impl Filter {
                     Data::Table(table)
                 }
             }),
-            Filter::First(n) => Ok(match data {
-                Data::Text(mut lines) => {
-                    lines.truncate(*n);
-                    Data::Text(lines)
-                }
-                Data::Table(mut table) => {
-                    table.rows.truncate(*n);
-                    Data::Table(table)
-                }
-            }),
-            Filter::Count => {
-                let n = match &data {
-                    Data::Text(lines) => lines.len(),
-                    Data::Table(table) => table.rows.len(),
-                };
-                Ok(Data::Text(alloc::vec![n.to_string()]))
+            Filter::First(n) => {
+                let mut data = data;
+                data.truncate(*n);
+                Ok(data)
             }
+            Filter::Count => Ok(Data::Text(alloc::vec![data.len().to_string()])),
             Filter::Where { column, op, value } => {
                 let (mut table, was_text) = data.into_table();
                 let i = table.column(self.name(), column)?;
@@ -438,38 +450,39 @@ enum Wanted {
     /// A number: with a number column's values, or a text column's that
     /// are decimal numbers.
     Number(i64),
-    /// Text, byte by byte (or contained, with `~`).
+    /// Text, byte by byte.
     Text(String),
+    /// Text to look for (`~`).
+    Contains(String),
 }
 
 /// What `where <column> <op> <value>` compares with, for a column holding
 /// `kind`; or why it can't.
 fn wanted(column: &str, kind: Kind, op: Op, value: &str) -> Result<Wanted, PipeError> {
-    if !kind.holds_numbers() {
-        return Ok(match decimal(value) {
-            Some(n) if op != Op::Contains => Wanted::Number(n),
-            _ => Wanted::Text(value.to_owned()),
-        });
-    }
     if op == Op::Contains {
-        return Err(PipeError::ContainsNumbers(column.to_owned()));
+        return if kind.holds_numbers() {
+            Err(PipeError::ContainsNumbers(column.to_owned()))
+        } else {
+            Ok(Wanted::Contains(value.to_owned()))
+        };
+    }
+    if !kind.holds_numbers() {
+        return Ok(decimal(value).map_or_else(|| Wanted::Text(value.to_owned()), Wanted::Number));
     }
     let digits = if kind == Kind::Percent { value.strip_suffix('%').unwrap_or(value) } else { value };
-    let n = match digits.strip_prefix("0x") {
-        Some(hex) if !hex.starts_with(['+', '-']) => i64::from_str_radix(hex, 16).ok(),
-        Some(_) => None,
-        None if kind == Kind::Hex => {
-            return Err(match decimal(digits) {
-                Some(_) => PipeError::HexNeeded { column: column.to_owned(), value: value.to_owned() },
-                None => PipeError::NotANumber { column: column.to_owned(), value: value.to_owned() },
-            });
+    let n = match (digits.strip_prefix("0x"), kind) {
+        (Some(hex), _) if !hex.starts_with(['+', '-']) => i64::from_str_radix(hex, 16).ok(),
+        (Some(_), _) => None,
+        (None, Kind::Hex) if decimal(digits).is_some_and(|n| n >= 0) => {
+            return Err(PipeError::HexNeeded(column.to_owned()));
         }
-        None => decimal(digits),
+        (None, Kind::Hex) => None,
+        (None, _) => decimal(digits),
     };
     n.map(Wanted::Number).ok_or_else(|| PipeError::NotANumber { column: column.to_owned(), value: value.to_owned() })
 }
 
-/// `word` as a decimal number (maybe negative).
+/// `word` as a decimal number (maybe signed: `-5`, `+5`).
 fn decimal(word: &str) -> Option<i64> {
     word.parse().ok()
 }
@@ -477,7 +490,7 @@ fn decimal(word: &str) -> Option<i64> {
 /// Whether `value` compares with `wanted` by `op`.
 fn matches(value: &Value, op: Op, wanted: &Wanted) -> bool {
     match (value, wanted) {
-        (Value::Text(t), Wanted::Text(w)) if op == Op::Contains => t.contains(w.as_str()),
+        (Value::Text(t), Wanted::Contains(w)) => t.contains(w.as_str()),
         (Value::Text(t), Wanted::Text(w)) => op.passes(t.as_str().cmp(w.as_str())),
         (Value::Text(t), Wanted::Number(w)) => decimal(t).is_some_and(|n| op.passes(n.cmp(w))),
         (Value::Int(n), Wanted::Number(w)) => op.passes(n.cmp(w)),
@@ -485,15 +498,23 @@ fn matches(value: &Value, op: Op, wanted: &Wanted) -> bool {
     }
 }
 
-/// How `sort` orders two values of a column: numbers or text in order
-/// (reversed with `desc`), a missing value after any other.
+/// How `sort` orders two values of a column: numbers, or text (decimal
+/// numbers among it by value, first), in order (reversed with `desc`), a
+/// missing value after any other.
 fn order(a: &Value, b: &Value, desc: bool) -> Ordering {
     let ordering = match (a, b) {
         (Value::Absent(_), Value::Absent(_)) => return Ordering::Equal,
         (Value::Absent(_), _) => return Ordering::Greater,
         (_, Value::Absent(_)) => return Ordering::Less,
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
-        (Value::Text(a), Value::Text(b)) => a.cmp(b),
+        // Decimal numbers by value, before other text (as `where` reads
+        // them).
+        (Value::Text(a), Value::Text(b)) => match (decimal(a), decimal(b)) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => a.cmp(b),
+        },
         _ => Ordering::Equal, // one column holds one kind
     };
     if desc { ordering.reverse() } else { ordering }
@@ -512,8 +533,9 @@ pub enum PipeError {
     NoColumn { filter: &'static str, column: String, columns: Vec<&'static str> },
     /// `where` comparing a number column with something not a number.
     NotANumber { column: String, value: String },
-    /// `where` comparing a hex column with a number not written in hex.
-    HexNeeded { column: String, value: String },
+    /// `where` comparing a hex column (named) with a number not written in
+    /// hex.
+    HexNeeded(String),
     /// `where` with `~` on a number column.
     ContainsNumbers(String),
     /// `select` naming a column twice.
@@ -541,11 +563,45 @@ impl fmt::Display for PipeError {
             PipeError::NotANumber { column, value } => {
                 write!(f, "where: {column} holds numbers, and '{value}' isn't one")
             }
-            PipeError::HexNeeded { column, value } => {
-                write!(f, "where: {column} is hex: write 0x{value}, not {value}")
-            }
+            PipeError::HexNeeded(column) => write!(f, "where: {column} is hex: write it with 0x (e.g. 0x20)"),
             PipeError::ContainsNumbers(column) => write!(f, "where: ~ is for text, and {column} holds numbers"),
             PipeError::Twice(column) => write!(f, "select: {column} named twice"),
         }
+    }
+}
+
+/// `text` in pieces to write a little at a time: each piece is whole lines,
+/// up to and including the first that brings it to `size` bytes or more.
+/// So every piece but the last holds at least `size` bytes, and less than
+/// `size` plus its last line (a line longer than `size` ends the piece it
+/// is in); the last may be shorter, and ends where `text` does.
+pub fn chunks(text: &str, size: usize) -> Chunks<'_> {
+    Chunks { rest: text, size }
+}
+
+/// [`chunks`]' pieces.
+#[derive(Clone, Debug)]
+pub struct Chunks<'a> {
+    rest: &'a str,
+    size: usize,
+}
+
+impl<'a> Iterator for Chunks<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        let mut end = 0;
+        for line in self.rest.split_inclusive('\n') {
+            end += line.len();
+            if end >= self.size {
+                break;
+            }
+        }
+        let (piece, rest) = self.rest.split_at(end);
+        self.rest = rest;
+        Some(piece)
     }
 }

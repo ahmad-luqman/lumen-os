@@ -120,7 +120,8 @@ impl<'a> Ctx<'a> {
     /// Say why the command failed or won't run (`line`: a usage line, an
     /// error; without its newline, though it may hold several lines): on
     /// the console, even in a pipeline, which it then ends. Made into a
-    /// `String` first (see [`Ctx::out`]).
+    /// `String` first (see [`Ctx::out`]), so it allocates: not under a lock
+    /// that forbids the heap.
     pub fn fail(&mut self, line: impl fmt::Display) {
         self.out.fail(&alloc::format!("{line}"));
     }
@@ -136,6 +137,7 @@ pub trait Console: Write + Send {
     /// on serial").
     fn name(&self) -> &'static str;
     /// Whether what is written goes to the next command in a pipeline.
+    /// (A console overrides both this and [`Console::fail`], or neither.)
     fn piped(&self) -> bool {
         false
     }
@@ -155,22 +157,13 @@ pub trait Console: Write + Send {
 /// sends it (512 bytes take 44 ms at 115200 baud).
 const CHUNK: usize = 512;
 
-/// Write `text` to `out` in pieces of about [`CHUNK`] bytes, each ending at
-/// a line's end (a longer line is one piece), so a long output doesn't
-/// hold the log's line lock for long (a log line may land between pieces,
-/// never inside a line).
+/// Write `text` to `out` in pieces of whole lines (`lumen_shell::pipe::
+/// chunks`: each at least [`CHUNK`] bytes but the last, and less than that
+/// plus one line), so a long output doesn't hold the log's line lock for
+/// long (a log line may land between pieces, never inside a line).
 pub fn write_in_chunks(out: &mut dyn Console, text: &str) {
-    let mut start = 0;
-    let mut end = 0;
-    for line in text.split_inclusive('\n') {
-        end += line.len();
-        if end - start >= CHUNK {
-            let _ = out.write_str(&text[start..end]);
-            start = end;
-        }
-    }
-    if start < text.len() {
-        let _ = out.write_str(&text[start..]);
+    for piece in lumen_shell::pipe::chunks(text, CHUNK) {
+        let _ = out.write_str(piece);
     }
 }
 

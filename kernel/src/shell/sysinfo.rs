@@ -49,11 +49,6 @@ fn busy(cpu: usize, ticks: CpuTicks) -> Value {
     }
 }
 
-/// [`busy`] as printed: `37%`, `-` or `stalled`.
-fn busy_text(cpu: usize, ticks: CpuTicks) -> String {
-    busy(cpu, ticks).show(Kind::Percent)
-}
-
 /// `n` as a table's number (absent, `-`, past `i64::MAX`).
 fn int(n: impl TryInto<i64>) -> Value {
     n.try_into().map_or(DASH, Value::Int)
@@ -79,13 +74,13 @@ pub fn records(name: &str) -> Option<MakeTable> {
     RECORDS.iter().find(|(n, _)| *n == name).map(|&(_, table)| table)
 }
 
-/// Whether `args` is empty, as a command taking none (`name`) needs; if
-/// not, its usage line (ending a pipeline).
-fn no_args(ctx: &mut Ctx<'_>, name: &str, args: &[String]) -> bool {
+/// Whether there are `args` for a command taking none (`name`); if so, it
+/// says its usage line (ending a pipeline).
+fn extra_args(ctx: &mut Ctx<'_>, name: &str, args: &[String]) -> bool {
     if !args.is_empty() {
         ctx.fail(format_args!("usage: {name}"));
     }
-    args.is_empty()
+    !args.is_empty()
 }
 
 /// The CPUs online (index, local APIC id).
@@ -123,7 +118,7 @@ fn emit(ctx: &mut Ctx<'_>, text: &str) {
 /// starting. (The boot CPU reads nearly 100% busy even when nothing
 /// happens: the serial shell polls serial, yielding, and never sleeps.)
 pub fn cpus(ctx: &mut Ctx<'_>, args: &[String]) {
-    if !no_args(ctx, "cpus", args) {
+    if extra_args(ctx, "cpus", args) {
         return;
     }
     let mut t = String::new();
@@ -177,7 +172,7 @@ fn stack_kinds() -> Vec<(&'static str, usize, u64)> {
 
 /// `mem`: physical frames, the heap and kernel stacks.
 pub fn mem(ctx: &mut Ctx<'_>, args: &[String]) {
-    if !no_args(ctx, "mem", args) {
+    if extra_args(ctx, "mem", args) {
         return;
     }
     let frames = crate::mm::frame::counts();
@@ -237,7 +232,7 @@ fn mem_table() -> pipe::Table {
 /// `irqs`: every I/O APIC input decoded, then the interrupts taken on each
 /// vector from 32 on that has taken any or has a routed input.
 pub fn irqs(ctx: &mut Ctx<'_>, args: &[String]) {
-    if !no_args(ctx, "irqs", args) {
+    if extra_args(ctx, "irqs", args) {
         return;
     }
     let inputs = crate::interrupts::inputs();
@@ -319,7 +314,7 @@ fn vector_table() -> pipe::Table {
 /// `threads`: every thread, its CPU, state and the timer ticks that found
 /// it running.
 pub fn threads(ctx: &mut Ctx<'_>, args: &[String]) {
-    if !no_args(ctx, "threads", args) {
+    if extra_args(ctx, "threads", args) {
         return;
     }
     let table = thread_table();
@@ -451,7 +446,7 @@ fn render(frame: u64, prev: &Sample, now: &Sample, ansi: bool) -> String {
     let _ = writeln!(t, "  cpu  busy  ticks/s");
     for &(cpu, _) in &online {
         let d = now.cpus[cpu].since(prev.cpus[cpu]);
-        let busy = busy_text(cpu, d);
+        let busy = busy(cpu, d).show(Kind::Percent);
         let _ = writeln!(t, "  {cpu:>3}  {busy:>4}  {:>7}", per_second(d.ticks, span));
     }
     // Interrupts per second, the vectors that took any.

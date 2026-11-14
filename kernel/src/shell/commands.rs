@@ -193,8 +193,7 @@ pub(super) fn run_in(table: &Table<Run>, line: &str, ctx: &mut Ctx<'_>) {
     let stages = match words::split_pipeline(line) {
         Ok(stages) => stages,
         Err(e) => {
-            ctx.fail(format_args!("syntax error: {e}"));
-            return;
+            return ctx.fail(format_args!("syntax error: {e}"));
         }
     };
     match stages.as_slice() {
@@ -287,8 +286,7 @@ fn int3(ctx: &mut Ctx<'_>, _: &[String]) {
 fn trace(ctx: &mut Ctx<'_>, args: &[String]) {
     let n = if args.is_empty() { Some(16) } else { number(args) };
     let Some(n) = n else {
-        ctx.fail("usage: trace [n]");
-        return;
+        return ctx.fail("usage: trace [n]");
     };
     let out = &mut *ctx.out;
     let ring = crate::trace::ring();
@@ -366,7 +364,7 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
                     t.cells_drawn,
                     if t.paused { ", paused (a command is drawing)" } else { "" }
                 ),
-                None => writeln!(out, "{NONE}"),
+                None => return ctx.fail(NONE),
             };
         }
         [arg] if arg == "text" => match crate::term::view_text() {
@@ -385,15 +383,21 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
     }
 }
 
-/// The message for a command that needs escape codes on a plain console.
-const PLAIN: &str = "this console is plain text (boot with lumen.ansi for escape codes)";
+/// Whether the console takes escape codes; if not, `name` says why (in a
+/// pipeline, or a plain console) and fails.
+fn takes_escapes(ctx: &mut Ctx<'_>, name: &str) -> bool {
+    if ctx.piped() {
+        ctx.fail(format_args!("{name}: escape codes don't go into a pipeline"));
+    } else if !ctx.ansi {
+        ctx.fail(format_args!("{name}: this console is plain text (boot with lumen.ansi for escape codes)"));
+    }
+    ctx.ansi && !ctx.piped()
+}
 
 fn clear(ctx: &mut Ctx<'_>, _: &[String]) {
     // Home, erase the screen, erase the scrollback.
-    if ctx.ansi {
+    if takes_escapes(ctx, "clear") {
         let _ = ctx.out.write_str("\x1b[H\x1b[2J\x1b[3J");
-    } else {
-        ctx.fail(format_args!("clear: {PLAIN}"));
     }
 }
 
@@ -402,8 +406,7 @@ fn clear(ctx: &mut Ctx<'_>, _: &[String]) {
 /// (256-colour SGR), bold, inverse and a truecolor gradient; then
 /// `colors: done`.
 fn colors(ctx: &mut Ctx<'_>, _: &[String]) {
-    if !ctx.ansi {
-        ctx.fail(format_args!("colors: {PLAIN}"));
+    if !takes_escapes(ctx, "colors") {
         return;
     }
     let s = &mut *ctx.out;
@@ -475,8 +478,7 @@ fn uptime(ctx: &mut Ctx<'_>, _: &[String]) {
 fn clocks(ctx: &mut Ctx<'_>, _: &[String]) {
     use crate::time::{self, Reference};
     let (Some(tsc), Some(reference)) = (time::tsc(), time::reference()) else {
-        ctx.fail("clocks: the TSC isn't calibrated");
-        return;
+        return ctx.fail("clocks: the TSC isn't calibrated");
     };
     let out = &mut *ctx.out;
     let _ = write!(out, "clocks: tsc {} Hz (against the {reference} at boot)", tsc.hz());
@@ -510,13 +512,28 @@ fn history(ctx: &mut Ctx<'_>, _: &[String]) {
     }
 }
 
+/// Refuse in a pipeline (`name`: the command), where the announcement it
+/// makes before going would be lost; whether it did.
+fn refuse_in_pipeline(ctx: &mut Ctx<'_>, name: &str) -> bool {
+    if ctx.piped() {
+        ctx.fail(format_args!("{name}: not in a pipeline"));
+    }
+    ctx.piped()
+}
+
 fn reboot(ctx: &mut Ctx<'_>, _: &[String]) {
+    if refuse_in_pipeline(ctx, "reboot") {
+        return;
+    }
     let _ = writeln!(ctx.out, "reboot: restarting");
     crate::power::reboot()
 }
 
 /// Power off, or say why it can't be done or didn't happen.
 fn shutdown(ctx: &mut Ctx<'_>, _: &[String]) {
+    if refuse_in_pipeline(ctx, "shutdown") {
+        return;
+    }
     let why = match crate::power::power_off_plan() {
         Ok(plan) => {
             let _ = writeln!(ctx.out, "shutdown: powering off");

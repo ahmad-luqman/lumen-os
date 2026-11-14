@@ -439,14 +439,18 @@ def test_where_sort_first(boot):
     assert out == "  thread\n  shell-screen\n", out
     out = run(m, "mem | where area = heap | select area used")
     assert re.fullmatch(r"  area  +used\n  heap  +\d+\n", out), out
-    # Text sorts as text, numbers as numbers.
-    assert run(m, "seq 10 | sort line | first 3") == "1\n10\n2\n"
+    # Lines that are numbers sort by value (as `where` compares them), the
+    # rest as text after them.
+    assert run(m, "seq 10 | sort line desc | first 3") == "10\n9\n8\n"
+    assert run(m, "echo b | sort line") == "b\n"
     out = run(m, "threads | sort ticks desc | select ticks")
     ticks = [int(t) for t in out.splitlines()[1:]]
     assert ticks == sorted(ticks, reverse=True), out
     assert run(m, "cpus | where busy > lots") == "where: busy holds numbers, and 'lots' isn't one\n"
     assert run(m, "irqs | sort calls") == "sort: no column 'calls' (columns: vector, use, count)\n"
-    assert run(m, "irqs | where vector = 64") == "where: vector is hex: write 0x64, not 64\n"
+    assert (
+        run(m, "irqs | where vector = 64") == "where: vector is hex: write it with 0x (e.g. 0x20)\n"
+    )
     assert run(m, "cpus x | count") == "usage: cpus\n"
     # Tab completes the command after a `|`: only the filters there.
     m.send("cpus | cou\t\r")

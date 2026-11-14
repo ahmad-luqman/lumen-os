@@ -97,7 +97,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Pipes: `|` outside quotes sends a command's output to filters (`grep`, `where <column> <op> <value>`, `sort <column> [desc]` (stable), `first <n>`, `count`, `select <column>...`), on either console; text as lines (`dmesg | grep time`, numbers in text compared as numbers), `cpus`, `irqs`, `mem` and `threads` as records with typed columns (`irqs | where count > 0 | sort count | first 3`); keys still reach the first command, its usage and error lines reach the console and end the pipeline, one that would wait unseen (draws, the REPL, `top` without a count) refuses, a first command writing more than 64 KiB stops the pipeline; after a `|` Tab completes only filters; each mistake is one line"
+name = "Pipes: `|` outside quotes sends a command's output to filters (`grep`, `where <column> <op> <value>`, `sort <column> [desc]` (stable), `first <n>`, `count`, `select <column>...`), on either console; text as lines (`dmesg | grep time`, numbers in text compared and sorted as numbers), `cpus`, `irqs`, `mem` and `threads` as records with typed columns (`irqs | where count > 0 | sort count | first 3`); keys still reach the first command, its usage and error lines reach the console and end the pipeline, one that would wait unseen (draws, the REPL, `top` without a count) or lose its line refuses, a first command writing more than 64 KiB stops the pipeline (and its polling for a key); after a `|` Tab completes only filters; each mistake is one line"
 milestone = "M2"
 tests = [
     "cargo:lumen-shell",
@@ -113,5 +113,7 @@ tests = [
     "ktest:lumen_kernel::shell::pipe::a_command_s_usage_and_errors_reach_the_console_not_the_pipeline",
     "ktest:lumen_kernel::shell::pipe::too_much_output_stops_the_pipeline",
     "ktest:lumen_kernel::shell::pipe::pipeline_mistakes_are_one_line",
-    "ktest:lumen_kernel::shell::pipe::long_output_is_written_in_chunks_of_whole_lines",
+    "ktest:lumen_kernel::shell::pipe::records_come_from_commands_that_take_no_arguments",
+    "ktest:lumen_kernel::shell::pipe::a_wrong_filter_stops_the_pipeline_before_the_command_runs",
+    "ktest:lumen_kernel::shell::pipe::a_full_pipeline_stops_a_command_polling_for_a_key",
 ]

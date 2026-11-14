@@ -1192,31 +1192,40 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   difference: a value wider than its column, `stalled`, now widens it for
   every row). They take no arguments (`usage: cpus`). Any other command
   runs as alone on a plain console (no escape codes), writing into a
-  buffer of 64 KiB reserved before it runs (writing never allocates; more
-  stops the pipeline with a line saying so, though the command runs to its
-  end) whose lines go on. Its keys still come from the console. Its usage
-  and error lines go to the console instead (`Ctx::fail`, which every
-  command uses for them) and end the pipeline; so do the refusals of what
-  would wait on the console unseen: the rhai REPL and demos, `top` without
-  a frame count, and whatever draws (`mandelbrot`, `life`, a script's
-  drawing function), which waits for a key after. The filters: `grep
+  buffer of 64 KiB reserved before it runs (writing never allocates) whose
+  lines go on. Its keys still come from the console, until it writes more
+  than that: then a key it asks for is Ctrl-C (a command polling for one,
+  `top` or a script, stops), its own failure line isn't shown, and the
+  pipeline stops with a line saying it wrote too much. Its usage and error
+  lines go to the console instead (`Ctx::fail`: every command's usage and
+  error lines go through it; status answers such as `kbd`'s `no keyboard`
+  are output) and end the pipeline; so do the refusals of what would wait
+  on the console unseen or lose its line: the rhai REPL and demos, `top`
+  without a frame count, whatever draws (`mandelbrot`, `life`, a script's
+  drawing functions), which waits for a key after, `clear` and `colors`
+  (no escape codes into a pipeline), `reboot` and `shutdown`. The filters: `grep
   <text>` (lines, or rows with a value as printed containing it), `where
   <column> <op> <value>` (`= != < <= > >=`, and `~` contains for text; a
   number column takes a number, decimal or `0x` hex (a hex column only
-  hex: `vector = 64` is refused, not read as `0x40`), a percentage maybe
-  with `%`, else an error; text compares byte by byte, unless the value is
-  a decimal number: then lines that are numbers compare as numbers and the
-  others don't match, so `seq 12 | where line > 5` is 6 to 12; an absent
-  value never matches, not even `!=`), `sort <column> [desc]` (stable,
-  absent values last either way), `first <n>`, `count` (one line) and
+  hex: `vector = 64` is refused, not read as `0x40`), a percentage
+  column's maybe with `%`, else an error; text compares byte by byte,
+  unless the value is a decimal number and the operator isn't `~` (which
+  always looks for text): then lines that are numbers compare as numbers
+  and the others don't match, so `seq 12 | where line > 5` is 6 to 12; an
+  absent value never matches, not even `!=`), `sort <column> [desc]`
+  (stable; in a text column lines that are decimal numbers by value and
+  before the rest, as `where` reads them; absent values last either way),
+  `first <n>`, `count` (one line) and
   `select <column>...` (each once). Text through `where`, `sort` or
   `select` is a table with one column, `line`, and comes out as text. A
   wrong filter (unknown, or the wrong arguments, a column selected twice
   among them) stops the pipeline before anything runs; one failing on its
   input (no such column) stops it there; each is one line. The last output
-  is printed in chunks of whole lines of about 512 bytes
-  (`shell::write_in_chunks`, which `dmesg` uses too: a serial write holds
-  the log's line lock with interrupts off): text as lines, a table as its
+  is printed in pieces of whole lines (`lumen_shell::pipe::chunks`,
+  host-tested: each at least 512 bytes but the last, less than that plus
+  one line; `shell::write_in_chunks`, which `dmesg` uses too: a serial
+  write holds the log's line lock with interrupts off): text as lines, a
+  table as its
   headings and rows (two-space indent, columns two spaces apart and as
   wide as the widest value, a left-aligned last one unpadded). Alone, a
   filter says it goes after a `|`. After a `|`, Tab completes only the
@@ -1231,8 +1240,11 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   with `term text`; every serial scenario that drove kmon runs against the
   serial shell with the new prompt.
 - **Not yet:** Ctrl-R search, Alt-B/F word moves, wrapping lines longer
-  than the console, a full error stream (only `Ctx::fail`'s lines leave a
-  pipeline for the console, and end it), the I/O APIC's inputs as
+  than the console, a full error stream (besides log lines and `crash`'s
+  own reports, only `Ctx::fail`'s lines leave a pipeline for the console,
+  and they end it; headers and notes, such as `dmesg`'s first line and
+  `trace`'s note on the ring's size, are data like the rest), the I/O
+  APIC's inputs as
   records, redirection, variables, and a shell in user mode (M9).
   Scripts: see below.
 

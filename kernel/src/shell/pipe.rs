@@ -6,7 +6,9 @@
 //! plain console (no escape codes), but what it writes goes into a
 //! [`Capture`] (up to [`CAPTURE_LIMIT`] bytes) and becomes lines of text; a
 //! system command with records (`sysinfo::RECORDS`) gives those instead.
-//! Its keys still come from the console (`top 5 | count` stops on `q`).
+//! Its keys still come from the console (`top 5 | count` stops on `q`),
+//! until it has written more than the pipeline takes: then a key it asks
+//! for is Ctrl-C, so a command polling for one stops.
 //! Its usage and error lines go to the console through [`Ctx::fail`] and
 //! end the pipeline; so do the refusals of commands that would wait on the
 //! console unseen: the rhai REPL and demos, `top` without a frame count,
@@ -22,7 +24,7 @@ use super::{Console, Ctx, sysinfo, write_in_chunks};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
-use lumen_shell::pipe::{Data, FILTERS, Filter, is_filter};
+use lumen_shell::pipe::{Data, FILTERS, Filter};
 use lumen_shell::{Key, Table};
 
 /// The most a command may write into a pipeline.
@@ -35,7 +37,9 @@ struct Capture<'a> {
     /// (a command may write while holding a lock under which the heap
     /// can't be used).
     text: String,
-    /// More than [`CAPTURE_LIMIT`] bytes were written (the rest dropped).
+    /// More than [`CAPTURE_LIMIT`] bytes were written (the rest dropped):
+    /// from then on a key asked for is Ctrl-C, and a failure isn't shown
+    /// (the overflow is said instead).
     overflowed: bool,
     /// The command failed or refused to run ([`Console::fail`]).
     failed: bool,
@@ -61,11 +65,11 @@ impl Write for Capture<'_> {
 
 impl Console for Capture<'_> {
     fn read_key(&mut self) -> Key {
-        self.console.read_key()
+        if self.overflowed { Key::Ctrl('c') } else { self.console.read_key() }
     }
 
     fn try_key(&mut self) -> Option<Key> {
-        self.console.try_key()
+        if self.overflowed { Some(Key::Ctrl('c')) } else { self.console.try_key() }
     }
 
     fn name(&self) -> &'static str {
@@ -78,7 +82,9 @@ impl Console for Capture<'_> {
 
     fn fail(&mut self, line: &str) {
         self.failed = true;
-        self.console.fail(line);
+        if !self.overflowed {
+            self.console.fail(line);
+        }
     }
 }
 
@@ -113,10 +119,7 @@ pub fn run(table: &Table<Run>, stages: &[Vec<String>], ctx: &mut Ctx<'_>) {
 /// didn't run, failed or wrote too much (said on the console).
 fn source(table: &Table<Run>, words: &[String], ctx: &mut Ctx<'_>) -> Option<Data> {
     let (name, args) = words.split_first()?;
-    if is_filter(name) {
-        needs_input(ctx, name);
-        return None;
-    }
+    // (A filter here runs as a command: it says it goes after a `|`.)
     let Some(command) = table.find(name) else {
         commands::unknown(ctx, name);
         return None;
@@ -129,25 +132,24 @@ fn source(table: &Table<Run>, words: &[String], ctx: &mut Ctx<'_>) -> Option<Dat
         return Some(Data::Table(records()));
     }
     let mut capture = Capture::new(&mut *ctx.out);
-    // `false`: no escape codes into a pipeline (`colors` and `clear` say
-    // the console is plain, and fail).
+    // `false`: no escape codes into a pipeline (`colors` and `clear`
+    // refuse).
     commands::run_command(command, &mut Ctx::new(&mut capture, false, ctx.history), args);
     let Capture { text, overflowed, failed, .. } = capture;
-    if failed {
-        return None;
-    }
     if overflowed {
         ctx.fail(format_args!("{name}: wrote more than {} KiB, the most a pipeline takes", CAPTURE_LIMIT / 1024));
         return None;
     }
-    Some(Data::from_text(&text))
+    (!failed).then(|| Data::from_text(&text))
 }
 
 /// A filter run without a `|` before it: say where it goes.
 pub fn needs_input(ctx: &mut Ctx<'_>, name: &str) {
     let usage = FILTERS.iter().find(|(f, _)| *f == name).map_or("", |(_, u)| *u);
-    let example = if usage.is_empty() { String::from(name) } else { alloc::format!("{name} {usage}") };
-    ctx.fail(format_args!("{name}: a filter: it takes what a command gives it after a | (cpus | {example})"));
+    let space = if usage.is_empty() { "" } else { " " };
+    ctx.fail(format_args!(
+        "{name}: a filter: it takes what a command gives it after a | (cpus | {name}{space}{usage})"
+    ));
 }
 
 #[cfg(feature = "ktest")]
@@ -166,7 +168,10 @@ crate::ktest!(
         kassert_eq!(run_line("seq 12 | grep 1 | count", &[]).0.as_str(), "4\n");
         // Lines that are numbers compare as numbers with one: 6 to 12.
         kassert_eq!(run_line("seq 12 | where line > 5 | count", &[]).0.as_str(), "7\n");
-        kassert_eq!(run_line("seq 12 | where line > 5 | sort line desc | first 2", &[]).0.as_str(), "9\n8\n");
+        // ... and sort by value, as `where` reads them.
+        kassert_eq!(run_line("seq 12 | where line > 5 | sort line desc | first 2", &[]).0.as_str(), "12\n11\n");
+        // A script's printed lines go on.
+        kassert_eq!(run_line("rhai -e 'print(\"a\"); print(\"b\")' | count", &[]).0.as_str(), "2\n");
         kassert_eq!(run_line("echo 'a | b' | grep '|'", &[]).0.as_str(), "a | b\n");
         Ok(())
     }
@@ -193,6 +198,26 @@ crate::ktest!(
         kassert_eq!(text.as_str(), "  thread            state\n  main              running\n");
         let (text, ..) = run_line("mem | select area | first 2", &[]);
         kassert_eq!(text.as_str(), "  area\n  frames\n  heap\n");
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn records_come_from_commands_that_take_no_arguments() {
+        // Each name in `RECORDS` is a command (a misspelt one would give
+        // text), and given an argument it says its usage, piped or not.
+        use crate::kassert_eq;
+        for (name, _) in sysinfo::RECORDS {
+            kassert_eq!(commands::COMMANDS.find(name).map(|c| c.name), Some(name));
+            let usage = alloc::format!("usage: {name}\n");
+            for line in [alloc::format!("{name} x | count"), alloc::format!("{name} x")] {
+                let (text, ..) = run_line(&line, &[]);
+                if text != usage {
+                    crate::ktest::diag(format_args!("{line}: {text:?}"));
+                }
+                kassert_eq!(text, usage);
+            }
+        }
         Ok(())
     }
 );
@@ -262,7 +287,11 @@ crate::ktest!(
             ("top 0 | count", "usage: top [frames] (q or Ctrl-C quits)\n"),
             ("cpus x | where busy > 5", "usage: cpus\n"),
             ("life a b c | count", "life: too many arguments\nusage: life [pattern] [generations]\n"),
-            ("colors | count", "colors: this console is plain text (boot with lumen.ansi for escape codes)\n"),
+            ("colors | count", "colors: escape codes don't go into a pipeline\n"),
+            ("clear | count", "clear: escape codes don't go into a pipeline\n"),
+            ("reboot | count", "reboot: not in a pipeline\n"),
+            ("shutdown | count", "shutdown: not in a pipeline\n"),
+            ("term nope | count", "usage: term [text]\n"),
         ];
         for (line, want) in cases {
             let (text, ..) = run_line(line, &[]);
@@ -314,6 +343,33 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn a_full_pipeline_stops_a_command_polling_for_a_key() {
+        // Past the limit a key asked for is Ctrl-C (the console's own keys
+        // stay), and the command's failure isn't shown: the overflow is.
+        use crate::{kassert, kassert_eq};
+        use lumen_shell::Command;
+        fn flood(ctx: &mut Ctx<'_>, _: &[String]) {
+            let line = "x".repeat(1023);
+            for _ in 0..=CAPTURE_LIMIT / 1024 {
+                let _ = writeln!(ctx.out, "{line}");
+            }
+            if ctx.poll_key() == Some(Key::Ctrl('c')) && ctx.wait_key() == Key::Ctrl('c') {
+                ctx.fail("flood: stopped (Ctrl-C)");
+            }
+        }
+        static TABLE: Table<Run> =
+            Table(&[Command { name: "flood", args: &[], usage: "", about: "write too much", run: flood }]);
+        let mut console = super::Captured::default();
+        console.keys.push_back(Key::Char('q'));
+        let history = lumen_shell::History::new(0);
+        commands::run_in(&TABLE, "flood | count", &mut Ctx::new(&mut console, false, &history));
+        kassert_eq!(console.text.as_str(), "flood: wrote more than 64 KiB, the most a pipeline takes\n");
+        kassert!(console.keys.len() == 1 && !console.ran_dry);
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn pipeline_mistakes_are_one_line() {
         use crate::kassert_eq;
         let one = |line| run_line(line, &[]).0;
@@ -337,9 +393,8 @@ crate::ktest!(
             "count: a filter: it takes what a command gives it after a | (cpus | count)\n"
         );
         kassert_eq!(one("cpus | where busy > lots").as_str(), "where: busy holds numbers, and 'lots' isn't one\n");
-        kassert_eq!(one("irqs | where vector = 64").as_str(), "where: vector is hex: write 0x64, not 64\n");
+        kassert_eq!(one("irqs | where vector = 64").as_str(), "where: vector is hex: write it with 0x (e.g. 0x20)\n");
         kassert_eq!(one("cpus | sort").as_str(), "usage: sort <column> [desc]\n");
-        // A wrong filter stops the pipeline before the command runs.
         kassert_eq!(one("echo ran | first x").as_str(), "first: 'x' isn't a number of lines\n");
         kassert_eq!(one("echo ran | select a a").as_str(), "select: a named twice\n");
         Ok(())
@@ -347,42 +402,14 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn long_output_is_written_in_chunks_of_whole_lines() {
-        // Each write ends at a line's end and, but for a line longer than a
-        // chunk, holds about 512 bytes.
-        use crate::kassert;
-        struct Writes(Vec<String>);
-        impl Write for Writes {
-            fn write_str(&mut self, s: &str) -> fmt::Result {
-                self.0.push(String::from(s));
-                Ok(())
-            }
-        }
-        impl Console for Writes {
-            fn read_key(&mut self) -> Key {
-                Key::Ctrl('c')
-            }
-            fn try_key(&mut self) -> Option<Key> {
-                None
-            }
-            fn name(&self) -> &'static str {
-                "writes"
-            }
-        }
-        let mut text = String::new();
-        for i in 0..400 {
-            let _ = writeln!(text, "line {i}");
-        }
-        text.push_str(&"x".repeat(2000));
-        text.push('\n');
-        let mut writes = Writes(Vec::new());
-        write_in_chunks(&mut writes, &text);
-        kassert!(writes.0.concat() == text);
-        kassert!(writes.0.len() > 4);
-        let last = writes.0.len() - 1;
-        for (i, w) in writes.0.iter().enumerate() {
-            kassert!(w.ends_with('\n'));
-            kassert!(w.len() < 512 + 16 || (i == last && w.len() > 2000));
+    fn a_wrong_filter_stops_the_pipeline_before_the_command_runs() {
+        // `top` would take the `q` waiting (`a_piped_command_takes_keys_
+        // from_the_console`): it stays, so `top` never ran.
+        use crate::{kassert, kassert_eq};
+        for line in ["top 5 | first x", "top 5 | count | select a a", "top 5 | count | uniq"] {
+            let (text, ran_dry, left) = run_line(line, &[Key::Char('q')]);
+            kassert_eq!(text.lines().count(), 1);
+            kassert!(!text.starts_with("top") && !ran_dry && left == 1);
         }
         Ok(())
     }

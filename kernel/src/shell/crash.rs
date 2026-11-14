@@ -52,12 +52,10 @@ impl Write for Out {
 pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
     let kind = args.first().map_or("", String::as_str);
     let Some(fault) = crash_fn(kind) else {
-        ctx.fail(format_args!("crash: unknown kind '{kind}' ({})", KINDS.join(" ")));
-        return;
+        return ctx.fail(format_args!("crash: unknown kind '{kind}' ({})", KINDS.join(" ")));
     };
     if args.len() > 2 {
-        ctx.fail("crash: usage: crash <kind> [cpu|thread]");
-        return;
+        return ctx.fail("crash: usage: crash <kind> [cpu|thread]");
     }
     let target = args.get(1).map(String::as_str);
     if target == Some("thread") {
@@ -71,12 +69,11 @@ pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
         None | Some(Ok(0)) => fault(),
         Some(Ok(cpu)) => {
             if REMOTE.try_update(Ordering::Acquire, Ordering::Relaxed, |s| (s != HANDED).then_some(HANDED)).is_err() {
-                ctx.fail("crash: a crash sent to another CPU hasn't finished yet");
-                return;
+                return ctx.fail("crash: a crash sent to another CPU hasn't finished yet");
             }
             REMOTE_KIND.store(KINDS.iter().position(|k| *k == kind).expect("a known kind"), Ordering::Relaxed);
             match crate::smp::run_on(cpu, run_remote) {
-                Ok(()) => wait_remote(ctx.out, cpu),
+                Ok(()) => wait_remote(ctx, cpu),
                 Err(e) => {
                     REMOTE.store(IDLE, Ordering::Release);
                     ctx.fail(format_args!("crash: cpu {cpu} {e}"));
@@ -108,29 +105,29 @@ fn run_remote() {
 }
 
 /// Wait until the other CPU's crash report stops this one, or its fault
-/// returns (it then says why). Asleep, allocating nothing: going on (back
+/// returns (it then says why, a failure: `Ctx::fail`). Asleep, allocating nothing: going on (back
 /// to the prompt, freeing the line's words) could leave the heap's lock
 /// held when the report stops this CPU, and the report would show the heap
 /// as maybe mid-update (the screen's shell could still be allocating if
 /// someone types there meanwhile; not tested). After 10 s (not tested) the
 /// job is taken back if the CPU hasn't taken it; if it has, it is left to
 /// finish, and another remote crash is refused until it returns.
-fn wait_remote(out: &mut dyn Write, cpu: usize) {
+fn wait_remote(ctx: &mut Ctx<'_>, cpu: usize) {
     let deadline = crate::time::now_ns() + 10_000_000_000;
     while REMOTE.load(Ordering::Acquire) == HANDED {
         if crate::time::now_ns() > deadline {
             if crate::smp::withdraw(cpu) {
                 REMOTE.store(IDLE, Ordering::Release);
-                let _ = writeln!(out, "crash: cpu {cpu} didn't take it in 10 s; taken back");
+                ctx.fail(format_args!("crash: cpu {cpu} didn't take it in 10 s; taken back"));
             } else {
-                let _ = writeln!(out, "crash: cpu {cpu} took it but hasn't finished in 10 s");
+                ctx.fail(format_args!("crash: cpu {cpu} took it but hasn't finished in 10 s"));
             }
             return;
         }
         crate::time::sleep(1_000_000);
     }
     REMOTE.store(IDLE, Ordering::Release);
-    let _ = writeln!(out, "crash: cpu {cpu} ran it and went on");
+    ctx.fail(format_args!("crash: cpu {cpu} ran it and went on"));
 }
 
 fn crash_fn(kind: &str) -> Option<fn()> {

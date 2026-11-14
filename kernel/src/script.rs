@@ -837,13 +837,14 @@ impl Session {
         };
         // Text made before writing it (formatting a value allocates: see
         // `Ctx::out`), at most the text limit.
-        let text = match &result {
-            Ok(v) if v.is_unit() => None,
-            Ok(v) => Some(
-                Bounded::make(limits.string, |w| write!(w, "{v}"))
-                    .unwrap_or_else(|_| format!("rhai: the result is more than {} of text", Bytes(limits.string))),
-            ),
-            Err(e) => Some(format!("rhai: {}", describe(e, stop, &limits))),
+        // (`failed`: an error, or a result too long to show.)
+        let (text, failed) = match &result {
+            Ok(v) if v.is_unit() => (None, false),
+            Ok(v) => match Bounded::make(limits.string, |w| write!(w, "{v}")) {
+                Ok(text) => (Some(text), false),
+                Err(_) => (Some(format!("rhai: the result is more than {} of text", Bytes(limits.string))), true),
+            },
+            Err(e) => (Some(format!("rhai: {}", describe(e, stop, &limits))), true),
         };
         let cleared = self.repl && stop == Some(Stop::Heap) && !self.scope.is_empty();
         if cleared {
@@ -853,8 +854,8 @@ impl Session {
         }
         let canvas = self.state.canvas.take().filter(|c| result.is_ok() && c.is_live());
         match text {
-            // An error goes to the console even in a pipeline, and ends it.
-            Some(text) if result.is_err() => {
+            // A failure goes to the console even in a pipeline, and ends it.
+            Some(text) if failed => {
                 console.fail(&format!("{text}{}", if cleared { " (variables cleared)" } else { "" }));
             }
             Some(text) => {
@@ -924,7 +925,8 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
             return;
         }
         [demo, name] if demo == "demo" => match DEMOS.iter().find(|d| d.name == name.as_str()) {
-            // One runs until Ctrl-C, another draws and waits for a key.
+            // Refused as a group: `count` runs until Ctrl-C and `rainbow`
+            // draws and waits for a key (`fib` does neither).
             Some(_) if ctx.piped() => return ctx.fail("rhai: demos don't run in a pipeline (rhai -e <expr> does)"),
             Some(d) => Job::Eval { source: d.source.to_string() },
             None => return ctx.fail(format_args!("rhai: no demo called {name} (try 'rhai demo')")),
