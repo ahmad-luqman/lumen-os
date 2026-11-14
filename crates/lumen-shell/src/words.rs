@@ -10,6 +10,10 @@
 //! - quoted and unquoted parts next to each other make one word
 //!   (`a'b c'd` is `ab cd`), and `''` is an empty word;
 //! - `#` at the start of a word starts a comment, up to the end of the line.
+//!
+//! [`split`] takes `|` as any other character (as `shlex` does);
+//! [`split_pipeline`] and [`partial`] take one outside quotes, not escaped,
+//! as the end of a command and the start of the next.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -22,6 +26,11 @@ pub enum SplitError {
     UnclosedQuote(char),
     /// The line ends in a backslash that escapes nothing.
     TrailingBackslash,
+    /// A `|` with no command before it (at the start, or right after
+    /// another `|`).
+    NothingBeforePipe,
+    /// A `|` with no command after it.
+    NothingAfterPipe,
 }
 
 impl fmt::Display for SplitError {
@@ -29,13 +38,38 @@ impl fmt::Display for SplitError {
         match self {
             SplitError::UnclosedQuote(q) => write!(f, "unclosed {q} quote"),
             SplitError::TrailingBackslash => f.write_str("a backslash at the end of the line"),
+            SplitError::NothingBeforePipe => f.write_str("a | with nothing before it"),
+            SplitError::NothingAfterPipe => f.write_str("a | with nothing after it"),
         }
     }
 }
 
-/// The line's words, unquoted.
+/// The line's words, unquoted (a `|` is a character like any other).
 pub fn split(line: &str) -> Result<Vec<String>, SplitError> {
-    let mut scan = scan(line);
+    Ok(finish(scan(line, false))?.words)
+}
+
+/// The line's commands, each as its words, unquoted: split at each `|`
+/// outside quotes and not escaped (`a | b`, or `a|b`). A blank line (or a
+/// comment) has none; a `|` needs a command on each side.
+pub fn split_pipeline(line: &str) -> Result<Vec<Vec<String>>, SplitError> {
+    let mut scan = finish(scan(line, true))?;
+    if scan.stages.is_empty() {
+        return Ok(if scan.words.is_empty() { Vec::new() } else { alloc::vec![scan.words] });
+    }
+    if scan.words.is_empty() {
+        return Err(SplitError::NothingAfterPipe);
+    }
+    if scan.stages.iter().any(Vec::is_empty) {
+        return Err(SplitError::NothingBeforePipe);
+    }
+    scan.stages.push(scan.words);
+    Ok(scan.stages)
+}
+
+/// `scan` at the end of the line: the word it ends in finished, or why the
+/// line can't be split.
+fn finish(mut scan: Scan) -> Result<Scan, SplitError> {
     match scan.state {
         State::Blank | State::Comment => {}
         State::Word => scan.words.extend(scan.last.take().map(|w| w.text)),
@@ -43,14 +77,15 @@ pub fn split(line: &str) -> Result<Vec<String>, SplitError> {
         State::Double | State::DoubleEscape => return Err(SplitError::UnclosedQuote('"')),
         State::Escape => return Err(SplitError::TrailingBackslash),
     }
-    Ok(scan.words)
+    Ok(scan)
 }
 
-/// The word a line ends in, for completing it: the words before it, where
-/// it starts (a byte offset) and what it says so far, unquoted.
+/// The word a line ends in, for completing it: the words before it in its
+/// command (after the last `|`), where it starts (a byte offset) and what it
+/// says so far, unquoted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Partial {
-    /// The words before it.
+    /// The words before it, from the start of its command.
     pub words: Vec<String>,
     /// Where it starts in the line (its length when the line ends in a
     /// blank: a word not started yet).
@@ -64,7 +99,7 @@ pub struct Partial {
 /// The word `line` ends in (see [`Partial`]); `None` inside a comment or
 /// right after a backslash, where nothing is completed.
 pub fn partial(line: &str) -> Option<Partial> {
-    let scan = scan(line);
+    let scan = scan(line, true);
     let quote = match scan.state {
         State::Blank => {
             return Some(Partial { words: scan.words, start: line.len(), text: String::new(), quote: None });
@@ -81,7 +116,8 @@ pub fn partial(line: &str) -> Option<Partial> {
 /// `word` written so that it reads back as itself: inside `quote` if one
 /// is open (without the closing quote), else with backslashes before the
 /// characters that need them (a newline, which a backslash would remove,
-/// in single quotes; an empty word as `''`).
+/// in single quotes; `|`, which would end the command; an empty word as
+/// `''`).
 pub fn quote(word: &str, quote: Option<char>) -> String {
     if word.is_empty() && quote.is_none() {
         return String::from("''");
@@ -97,7 +133,7 @@ pub fn quote(word: &str, quote: Option<char>) -> String {
                 out.push(c);
             }
             None if c == '\n' => out.push_str("'\n'"),
-            None if matches!(c, ' ' | '\t' | '\'' | '"' | '\\' | '#' | '$' | '`') => {
+            None if matches!(c, ' ' | '\t' | '\'' | '"' | '\\' | '#' | '$' | '`' | '|') => {
                 out.push('\\');
                 out.push(c);
             }
@@ -132,7 +168,10 @@ struct Word {
 }
 
 struct Scan {
-    /// The words finished by a blank.
+    /// The commands finished by a `|` (with pipes), each its words.
+    stages: Vec<Vec<String>>,
+    /// The words of the command being read finished by a blank (or by a
+    /// `|`, until the `|` itself moves them to `stages`).
     words: Vec<String>,
     /// The word the line ends in, if it ends inside one.
     last: Option<Word>,
@@ -144,7 +183,10 @@ fn text(word: &mut Option<Word>) -> &mut String {
     &mut word.as_mut().expect("inside a word").text
 }
 
-fn scan(line: &str) -> Scan {
+/// Read `line` up to its end; with `pipes`, a `|` outside quotes (not
+/// escaped) ends the command.
+fn scan(line: &str, pipes: bool) -> Scan {
+    let mut stages = Vec::new();
     let mut words = Vec::new();
     let mut word: Option<Word> = None;
     let mut state = State::Blank;
@@ -152,6 +194,10 @@ fn scan(line: &str) -> Scan {
         state = match state {
             State::Blank => match c {
                 ' ' | '\t' | '\n' => State::Blank,
+                '|' if pipes => {
+                    stages.push(core::mem::take(&mut words));
+                    State::Blank
+                }
                 '#' => State::Comment,
                 _ => {
                     word = Some(Word { start: i, text: String::new() });
@@ -162,6 +208,11 @@ fn scan(line: &str) -> Scan {
             State::Comment => State::Comment,
             State::Word if matches!(c, ' ' | '\t' | '\n') => {
                 words.push(word.take().expect("inside a word").text);
+                State::Blank
+            }
+            State::Word if c == '|' && pipes => {
+                words.push(word.take().expect("inside a word").text);
+                stages.push(core::mem::take(&mut words));
                 State::Blank
             }
             State::Word => in_word(c, text(&mut word)),
@@ -198,7 +249,7 @@ fn scan(line: &str) -> Scan {
             }
         };
     }
-    Scan { words, last: word, state }
+    Scan { stages, words, last: word, state }
 }
 
 /// A character in a word outside quotes (not a blank): the state after it.

@@ -23,6 +23,7 @@
 
 mod commands;
 mod crash;
+mod pipe;
 mod sysinfo;
 
 use crate::arch::serial;
@@ -107,6 +108,19 @@ impl<'a> Ctx<'a> {
     pub fn console_name(&self) -> &'static str {
         self.out.name()
     }
+
+    /// Whether this command's output goes to the next command in a
+    /// pipeline (`cpus | count`) rather than to the console. Its keys still
+    /// come from the console.
+    pub fn piped(&self) -> bool {
+        self.out.piped()
+    }
+
+    /// Say why the command won't run (`line`, without a newline): on the
+    /// console, even in a pipeline, which it then ends.
+    pub fn refuse(&mut self, line: &str) {
+        self.out.refuse(line);
+    }
 }
 
 /// A console a shell runs on.
@@ -118,6 +132,15 @@ pub trait Console: Write + Send {
     /// Where its keys are typed, for a prompt shown elsewhere ("press a key
     /// on serial").
     fn name(&self) -> &'static str;
+    /// Whether what is written goes to the next command in a pipeline.
+    fn piped(&self) -> bool {
+        false
+    }
+    /// Write `line` (and a newline): why a command won't run. In a pipeline
+    /// it goes to the console, and the pipeline stops.
+    fn refuse(&mut self, line: &str) {
+        let _ = writeln!(self, "{line}");
+    }
 }
 
 /// Start the screen shell (if there is a terminal and a keyboard), then run

@@ -1,6 +1,9 @@
-//! The shell's system commands: `cpus`, `mem`, `irqs`, `dmesg`, `date` and
-//! `top`. Each prints a header line (`<name>: ...`), and all but `date`
-//! rows after it. Output with rows is made into a `String` first and
+//! The shell's system commands: `cpus`, `mem`, `irqs`, `threads`, `dmesg`,
+//! `date` and `top`. Each prints a header line (`<name>: ...`), and all but
+//! `date` rows after it. In a pipeline `cpus`, `irqs`, `mem` and `threads`
+//! give records instead ([`records`]): `cpus`, `irqs` and `threads` print
+//! those same tables (under their header), `mem` a table of what it
+//! describes. Output with rows is made into a `String` first and
 //! written in one write (no log line lands inside it, and nothing
 //! allocating is formatted under the screen's lock); `dmesg` writes its
 //! lines in chunks of about [`DMESG_CHUNK`] bytes instead, so a slow UART
@@ -15,6 +18,7 @@ use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use lumen_mm::FRAME_SIZE;
 use lumen_shell::Key;
+use lumen_shell::pipe::{self, Align, Column, Kind, Value};
 use lumen_time::{NS_PER_SEC, per_second, percent};
 
 /// A size in bytes for humans: `512 B`, `12.5 KiB`, `3.0 MiB`, `2.0 GiB`.
@@ -40,6 +44,30 @@ fn busy_text(cpu: usize, ticks: CpuTicks) -> String {
         (false, _) => String::from("-"),
         (true, 0) => String::from("stalled"),
         (true, _) => alloc::format!("{}%", ticks.busy_percent()),
+    }
+}
+
+/// `n` as a table's number.
+fn int(n: impl TryInto<i64>) -> Value {
+    Value::Int(n.try_into().unwrap_or(i64::MAX))
+}
+
+fn text(s: &str) -> Value {
+    Value::Text(String::from(s))
+}
+
+/// No value, printed `-`.
+const NONE: Value = Value::Absent("-");
+
+/// The records a system command gives the next command in a pipeline
+/// (instead of its text), for those that have them.
+pub fn records(name: &str) -> Option<fn() -> pipe::Table> {
+    match name {
+        "cpus" => Some(cpu_table),
+        "irqs" => Some(vector_table),
+        "mem" => Some(mem_table),
+        "threads" => Some(thread_table),
+        _ => None,
     }
 }
 
@@ -78,22 +106,40 @@ fn emit(ctx: &mut Ctx<'_>, text: &str) {
 /// starting. (The boot CPU reads nearly 100% busy even when nothing
 /// happens: the serial shell polls serial, yielding, and never sleeps.)
 pub fn cpus(ctx: &mut Ctx<'_>, _: &[String]) {
-    let threads = sched::threads();
     let mut t = String::new();
     let n = online().count();
     let _ = writeln!(t, "cpus: {n} online{}", not_online());
-    let _ = writeln!(t, "  cpu  apic  scheduler    ticks       busy  threads");
+    cpu_table().render(&mut t);
+    emit(ctx, &t);
+}
+
+/// `cpus`'s rows: busy is a percentage, `-` without a scheduler, `stalled`
+/// if it runs but took no tick.
+fn cpu_table() -> pipe::Table {
+    const COLUMNS: [Column; 6] = [
+        Column::new("cpu", Kind::Int, Align::Right, 3),
+        Column::new("apic", Kind::Int, Align::Right, 4),
+        Column::new("scheduler", Kind::Text, Align::Left, 11),
+        Column::new("ticks", Kind::Int, Align::Left, 10),
+        Column::new("busy", Kind::Percent, Align::Right, 4),
+        Column::new("threads", Kind::Int, Align::Right, 7),
+    ];
+    let threads = sched::threads();
+    let mut t = pipe::Table::new(&COLUMNS);
     for (cpu, apic) in online() {
         let homed = threads.iter().filter(|th| th.cpu == cpu).count();
         let c = sched::cpu_ticks(cpu);
-        let running = if sched::running_on(cpu) { "running" } else { "not started" };
-        let busy = busy_text(cpu, c);
-        let _ = writeln!(t, "  {cpu:>3}  {apic:>4}  {running:<11}  {:<10}  {busy:>4}  {homed:>7}", c.ticks);
+        let (running, busy) = match (sched::running_on(cpu), c.ticks) {
+            (false, _) => ("not started", NONE),
+            (true, 0) => ("running", Value::Absent("stalled")),
+            (true, _) => ("running", int(c.busy_percent())),
+        };
+        t.push(vec![int(cpu), int(apic), text(running), int(c.ticks), busy, int(homed)]);
     }
     for cpu in starting() {
-        let _ = writeln!(t, "  {cpu:>3}     -  starting     -              -        -");
+        t.push(vec![int(cpu), NONE, text("starting"), NONE, NONE, NONE]);
     }
-    emit(ctx, &t);
+    t
 }
 
 /// `mem`: physical frames, the heap and kernel stacks.
@@ -139,22 +185,73 @@ pub fn mem(ctx: &mut Ctx<'_>, _: &[String]) {
     emit(ctx, &t);
 }
 
+/// `mem` in a pipeline: frames, the heap and each kind of kernel stack,
+/// with their sizes and what is used of them in bytes, and how many there
+/// are (frames, allocations, stacks).
+fn mem_table() -> pipe::Table {
+    const COLUMNS: [Column; 4] = [
+        Column::new("area", Kind::Text, Align::Left, 0),
+        Column::new("size", Kind::Int, Align::Right, 0),
+        Column::new("used", Kind::Int, Align::Right, 0),
+        Column::new("count", Kind::Int, Align::Right, 0),
+    ];
+    let frames = crate::mm::frame::counts();
+    let heap = crate::mm::heap::stats();
+    let mut t = pipe::Table::new(&COLUMNS);
+    let (owned, free) = (frames.owned as u64, frames.free as u64);
+    t.push(vec![text("frames"), int(owned * FRAME_SIZE), int((owned - free) * FRAME_SIZE), int(owned)]);
+    t.push(vec![text("heap"), int(heap.size), int(heap.used), int(heap.live)]);
+    let mut kinds: Vec<(&'static str, usize, u64)> = Vec::new();
+    for s in arch::stacks::REGISTRY.iter() {
+        let name = s.kind.name();
+        match kinds.iter_mut().find(|(n, ..)| *n == name) {
+            Some((_, count, bytes)) => {
+                *count += 1;
+                *bytes += s.range.size();
+            }
+            None => kinds.push((name, 1, s.range.size())),
+        }
+    }
+    for (name, count, bytes) in kinds {
+        t.push(vec![Value::Text(alloc::format!("{name} stacks")), int(bytes), int(bytes), int(count)]);
+    }
+    t
+}
+
 /// `irqs`: every I/O APIC input decoded, then the interrupts taken on each
 /// vector from 32 on that has taken any or has a routed input.
 pub fn irqs(ctx: &mut Ctx<'_>, _: &[String]) {
-    use arch::apic::{Polarity, Trigger};
     let inputs = crate::interrupts::inputs();
     let mut t = String::new();
     if inputs.is_empty() {
         let _ = writeln!(t, "irqs: no I/O APIC, interrupts per vector");
     } else {
         let _ = writeln!(t, "irqs: {} I/O APIC inputs, interrupts per vector", inputs.len());
-        let _ = writeln!(t, "  gsi  vector  delivery        trigger  polarity  dest  state     count");
+        input_table(&inputs).render(&mut t);
     }
-    for i in &inputs {
+    vector_table().render(&mut t);
+    emit(ctx, &t);
+}
+
+/// `irqs`' first table: each I/O APIC input decoded (an unrouted, masked
+/// one is only its number and `masked`).
+fn input_table(inputs: &[crate::interrupts::Input]) -> pipe::Table {
+    use arch::apic::{Polarity, Trigger};
+    const COLUMNS: [Column; 8] = [
+        Column::new("gsi", Kind::Int, Align::Right, 3),
+        Column::new("vector", Kind::Hex, Align::Left, 6),
+        Column::new("delivery", Kind::Text, Align::Left, 14),
+        Column::new("trigger", Kind::Text, Align::Left, 7),
+        Column::new("polarity", Kind::Text, Align::Left, 8),
+        Column::new("dest", Kind::Text, Align::Left, 4),
+        Column::new("state", Kind::Text, Align::Left, 8),
+        Column::new("count", Kind::Int, Align::Left, 0),
+    ];
+    let mut t = pipe::Table::new(&COLUMNS);
+    for i in inputs {
         let e = i.entry;
         if !i.routed && e.masked() {
-            let _ = writeln!(t, "  {:>3}  -       -               -        -         -     masked    -", i.gsi);
+            t.push(vec![int(i.gsi), NONE, NONE, NONE, NONE, NONE, text("masked"), NONE]);
             continue;
         }
         let delivery = e.delivery().map_or(String::from("reserved"), |d| alloc::format!("{d:?}"));
@@ -164,24 +261,65 @@ pub fn irqs(ctx: &mut Ctx<'_>, _: &[String]) {
             if e.logical() { alloc::format!("l{}", e.destination()) } else { alloc::format!("{}", e.destination()) };
         let state = if e.masked() { "masked" } else { "unmasked" };
         // A vector under 32 is an exception's: its count isn't this input's.
-        let count =
-            if e.vector() < 32 { String::from("-") } else { alloc::format!("{}", idt::vector_count(e.vector())) };
-        let _ = writeln!(
-            t,
-            "  {:>3}  {:#04x}    {delivery:<14}  {trigger:<7}  {polarity:<8}  {dest:<4}  {state:<8}  {count}",
-            i.gsi,
-            e.vector(),
-        );
+        let count = if e.vector() < 32 { NONE } else { int(idt::vector_count(e.vector())) };
+        t.push(vec![
+            int(i.gsi),
+            int(e.vector()),
+            Value::Text(delivery),
+            text(trigger),
+            text(polarity),
+            Value::Text(dest),
+            text(state),
+            count,
+        ]);
     }
-    let _ = writeln!(t, "  vector  use               count");
+    t
+}
+
+/// `irqs`' second table, and its records in a pipeline: the interrupts
+/// taken on each vector from 32 on that has taken any or has a routed
+/// input.
+fn vector_table() -> pipe::Table {
+    const COLUMNS: [Column; 3] = [
+        Column::new("vector", Kind::Hex, Align::Left, 6),
+        Column::new("use", Kind::Text, Align::Left, 16),
+        Column::new("count", Kind::Int, Align::Left, 0),
+    ];
+    let inputs = crate::interrupts::inputs();
+    let mut t = pipe::Table::new(&COLUMNS);
     for v in 32..=255u8 {
         let count = idt::vector_count(v);
         let routed = inputs.iter().any(|i| i.routed && i.entry.vector() == v);
         if count > 0 || routed {
-            let _ = writeln!(t, "  {v:#04x}    {:<16}  {count}", alloc::format!("{}", idt::vector_use(v)));
+            t.push(vec![int(v), Value::Text(alloc::format!("{}", idt::vector_use(v))), int(count)]);
         }
     }
+    t
+}
+
+/// `threads`: every thread, its CPU, state and the timer ticks that found
+/// it running.
+pub fn threads(ctx: &mut Ctx<'_>, _: &[String]) {
+    let table = thread_table();
+    let mut t = String::new();
+    let _ = writeln!(t, "threads: {}", table.rows().len());
+    table.render(&mut t);
     emit(ctx, &t);
+}
+
+fn thread_table() -> pipe::Table {
+    const COLUMNS: [Column; 5] = [
+        Column::new("thread", Kind::Text, Align::Left, 16),
+        Column::new("id", Kind::Int, Align::Right, 2),
+        Column::new("cpu", Kind::Int, Align::Right, 3),
+        Column::new("state", Kind::Text, Align::Left, 8),
+        Column::new("ticks", Kind::Int, Align::Right, 0),
+    ];
+    let mut t = pipe::Table::new(&COLUMNS);
+    for th in sched::threads() {
+        t.push(vec![text(th.name), int(th.id), int(th.cpu), text(th.state.name()), int(th.ticks)]);
+    }
+    t
 }
 
 /// About how many bytes `dmesg` writes at a time (a write holds the log's
@@ -254,6 +392,10 @@ pub fn top(ctx: &mut Ctx<'_>, args: &[String]) {
         let _ = writeln!(ctx.out, "usage: top [frames] (q or Ctrl-C quits)");
     };
     let limit: Option<u64> = match args {
+        // Its frames would go down the pipeline unseen until a key.
+        [] if ctx.piped() => {
+            return ctx.refuse("top: in a pipeline it needs a number of frames (top 1 | ...)");
+        }
         [] => None,
         [n] => match n.parse() {
             Ok(n) if n > 0 => Some(n),
@@ -376,8 +518,8 @@ crate::ktest!(
         // only its header, a date and time.
         use crate::kassert;
         let history = lumen_shell::History::new(0);
-        let commands: [(&str, super::commands::Run); 5] =
-            [("cpus", cpus), ("mem", mem), ("irqs", irqs), ("dmesg", dmesg), ("date", date)];
+        let commands: [(&str, super::commands::Run); 6] =
+            [("cpus", cpus), ("mem", mem), ("irqs", irqs), ("threads", threads), ("dmesg", dmesg), ("date", date)];
         for (name, run) in commands {
             let mut console = super::Captured::default();
             run(&mut Ctx::new(&mut console, false, &history), &[]);

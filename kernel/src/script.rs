@@ -895,6 +895,8 @@ fn in_thread(console: &mut dyn Console, owner: Owner, limits: Limits, job: Job) 
 /// The shell's `rhai` command.
 pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
     let job = match args {
+        // Its prompt and the lines typed would go down the pipeline unseen.
+        [] if ctx.piped() => return ctx.refuse("rhai: the REPL doesn't run in a pipeline (rhai -e <expr> does)"),
         [] => Job::Repl { ansi: ctx.ansi },
         [flag, rest @ ..] if flag == "-e" && !rest.is_empty() => Job::Eval { source: rest.join(" ") },
         [demo] if demo == "demo" => {

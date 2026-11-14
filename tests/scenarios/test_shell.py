@@ -265,7 +265,7 @@ def test_system_commands(boot):
     start = len(m.output)
     out = run(m, "help")
     assert out.startswith("commands:\n")
-    for name in ("cpus", "mem", "irqs", "dmesg", "date", "top"):
+    for name in ("cpus", "mem", "irqs", "threads", "dmesg", "date", "top"):
         assert re.search(rf"^  {name} ", out, re.MULTILINE), name
 
     out = run(m, "cpus")
@@ -294,6 +294,13 @@ def test_system_commands(boot):
     timer = re.search(r"^\s+0x40\s+local APIC timer\s+(\d+)$", out, re.MULTILINE)
     assert timer and int(timer[1]) > 0, out
 
+    out = run(m, "threads")
+    assert re.match(r"threads: \d+\n  thread            id  cpu  state     ticks\n", out), out
+    assert re.search(r"^  main +\d+ +0 +running +\d+$", out, re.MULTILINE), out
+    assert re.search(
+        r"^  shell-screen +\d+ +0 +(blocked|ready|running) +\d+$", out, re.MULTILINE
+    ), out
+
     out = run(m, "dmesg")
     assert re.match(r"dmesg: the newest \d+ log lines \(all since boot\)\n", out), out
     # Only whole lines, the first of them the boot banner.
@@ -313,6 +320,67 @@ def test_system_commands(boot):
     listed = [line.split(maxsplit=1)[1] for line in run(m, "history").splitlines()]
     assert listed[:3] == ["help", "cpus", "mem"] and listed[-1] == "history", listed
     assert "\x1b" not in m.output[start:]
+
+
+def test_pipe_text(boot):
+    # A command's text through filters, on both consoles: `|` outside quotes
+    # ends a command; a mistake is one line.
+    m = shells(boot)
+    out = run(m, "dmesg | grep time")
+    lines = out.splitlines()
+    assert lines and all("time" in line for line in lines), out
+    assert any("INFO  time: " in line for line in lines), out
+    assert run(m, "seq 20 | grep 1 | count") == "11\n"
+    assert run(m, "seq 20 | grep 1 | first 3") == "1\n10\n11\n"
+    assert run(m, "echo 'a | b' x\\|y | grep '|'") == "a | b x|y\n"
+    assert run(m, "echo 'a | b'") == "a | b\n"
+    assert run(m, "| count") == "syntax error: a | with nothing before it\n"
+    assert run(m, "seq 3 |") == "syntax error: a | with nothing after it\n"
+    assert run(m, "seq 3 | echo") == (
+        "echo: not a filter (after a | come grep, where, sort, first, count, select)\n"
+    )
+    assert run(m, "grep x") == (
+        "grep: a filter: it takes what a command gives it after a | (cpus | grep ...)\n"
+    )
+    # A command that would wait unseen says so instead.
+    assert run(m, "top | count") == "top: in a pipeline it needs a number of frames (top 1 | ...)\n"
+    # On the screen, typed on the keyboard.
+    keys(m, "seq 30 | grep 2 | count\n")
+    expect_screen(m, r"^lumen> seq 30 \| grep 2 \| count\n12\nlumen>$")
+
+
+def test_where_sort_first(boot):
+    # The system commands hand on records: `where` compares a column
+    # (numbers as numbers), `sort` orders by one, `first` keeps the first
+    # rows, `select` some columns; the table is printed at the end.
+    m = shells(boot, extra=["-smp", "2"])
+    out = run(m, "irqs | where count > 0 | sort count desc | first 3")
+    lines = out.splitlines()
+    assert lines[0] == "  vector  use               count", out
+    rows = [re.fullmatch(r"  (0x[0-9a-f]{2})    (.{16})  (\d+)", line) for line in lines[1:]]
+    assert 1 <= len(rows) <= 3 and all(rows), out
+    counts = [int(r[3]) for r in rows]
+    assert counts == sorted(counts, reverse=True) and counts[-1] > 0, out
+    # The timer interrupts most.
+    assert rows[0][2].strip() == "local APIC timer", out
+
+    assert run(m, "cpus | count") == "2\n"
+    out = run(m, "cpus | where cpu >= 1 | select cpu scheduler busy")
+    assert re.fullmatch(r"  cpu  scheduler    busy\n    1  running      +\d+%\n", out), out
+    out = run(m, "threads | where thread ~ shell | sort id | select thread")
+    assert out == "  thread\n  shell-screen\n", out
+    out = run(m, "mem | where area = heap | select area used")
+    assert re.fullmatch(r"  area  +used\n  heap  +\d+\n", out), out
+    # Text sorts as text, numbers as numbers.
+    assert run(m, "seq 10 | sort line | first 3") == "1\n10\n2\n"
+    out = run(m, "threads | sort ticks desc | select ticks")
+    ticks = [int(t) for t in out.splitlines()[1:]]
+    assert ticks == sorted(ticks, reverse=True), out
+    assert run(m, "cpus | where busy > lots") == "where: busy holds numbers, and 'lots' isn't one\n"
+    assert run(m, "irqs | sort calls") == "sort: no column 'calls' (columns: vector, use, count)\n"
+    # Tab completes the command after a `|`.
+    m.send("cpus | cou\t\r")
+    m.expect(r"cpus \| count \n2\n" + PROMPT, 10)
 
 
 def test_date_matches_host(boot):

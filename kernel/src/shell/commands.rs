@@ -1,11 +1,13 @@
 //! The shell's commands: kmon's, with their names and output (`echo`
 //! joins its words with single spaces; `clear` and `colors` need a console
 //! that takes escape codes), plus `history`, `term text`, `reboot`,
-//! `shutdown` and the system commands (`cpus`, `mem`, `irqs`, `dmesg`,
-//! `date`, `top`: `sysinfo.rs`). A table the
-//! line editor completes from. Each writes to the console that ran it.
+//! `shutdown`, the system commands (`cpus`, `mem`, `irqs`, `threads`,
+//! `dmesg`, `date`, `top`: `sysinfo.rs`) and the filters that come after a
+//! `|` (`grep`, `where`, `sort`, `first`, `count`, `select`: `pipe.rs`). A
+//! table the line editor completes from. Each writes to the console that
+//! ran it (or, at the start of a pipeline, to the next command).
 
-use super::{Ctx, crash, sysinfo};
+use super::{Ctx, crash, pipe, sysinfo};
 use crate::arch;
 use alloc::string::String;
 use core::arch::asm;
@@ -92,14 +94,14 @@ pub static COMMANDS: Table<Run> = Table(&[
         name: "mem",
         args: &[],
         usage: "",
-        about: "physical frames, the heap and kernel stacks",
+        about: "physical frames, the heap and kernel stacks (piped: in bytes)",
         run: sysinfo::mem,
     },
     Command {
         name: "irqs",
         args: &[],
         usage: "",
-        about: "the I/O APIC's inputs decoded, and interrupts per vector",
+        about: "the I/O APIC's inputs decoded, and interrupts per vector (piped: those only)",
         run: sysinfo::irqs,
     },
     Command {
@@ -124,40 +126,102 @@ pub static COMMANDS: Table<Run> = Table(&[
         run: sysinfo::top,
     },
     Command { name: "history", args: &[], usage: "", about: "the lines entered on this console", run: history },
+    Command {
+        name: "threads",
+        args: &[],
+        usage: "",
+        about: "each thread: its CPU, state and the ticks it ran",
+        run: sysinfo::threads,
+    },
+    Command {
+        name: "grep",
+        args: &[],
+        usage: "<text>",
+        about: "after a |: the lines (or rows) containing text",
+        run: |ctx, _| pipe::needs_input(ctx, "grep"),
+    },
+    Command {
+        name: "where",
+        args: &[&[], &["=", "!=", "<", "<=", ">", ">=", "~"]],
+        usage: "<column> <op> <value>",
+        about: "after a |: the rows whose column compares so (~ contains)",
+        run: |ctx, _| pipe::needs_input(ctx, "where"),
+    },
+    Command {
+        name: "sort",
+        args: &[&[], &["desc"]],
+        usage: "<column> [desc]",
+        about: "after a |: the rows in that column's order",
+        run: |ctx, _| pipe::needs_input(ctx, "sort"),
+    },
+    Command {
+        name: "first",
+        args: &[],
+        usage: "<n>",
+        about: "after a |: the first n lines (or rows)",
+        run: |ctx, _| pipe::needs_input(ctx, "first"),
+    },
+    Command {
+        name: "count",
+        args: &[],
+        usage: "",
+        about: "after a |: how many lines (or rows)",
+        run: |ctx, _| pipe::needs_input(ctx, "count"),
+    },
+    Command {
+        name: "select",
+        args: &[],
+        usage: "<column>...",
+        about: "after a |: only those columns, in that order",
+        run: |ctx, _| pipe::needs_input(ctx, "select"),
+    },
     Command { name: "reboot", args: &[], usage: "", about: "restart the machine", run: reboot },
     Command { name: "shutdown", args: &[], usage: "", about: "power off (ACPI S5)", run: shutdown },
     Command { name: "exit", args: &[], usage: "", about: "end QEMU (only with lumen.qemu_exit)", run: exit },
 ]);
 
 /// Split `line` into words and run the command the first names (one line
-/// of error if it can't be split or no command has that name).
+/// of error if it can't be split or no command has that name), or the
+/// pipeline it is (`cpus | count`: `pipe.rs`).
 pub fn run(line: &str, ctx: &mut Ctx<'_>) {
     run_in(&COMMANDS, line, ctx);
 }
 
-/// [`run`] with the commands in `table`. The command gets a canvas owner
-/// of its own; when it returns, a canvas it left behind (kept in a static,
-/// leaked) is taken back, so the screen doesn't stay frozen. A canvas held
-/// by a command on the other console isn't this one's, and stays.
-fn run_in(table: &Table<Run>, line: &str, ctx: &mut Ctx<'_>) {
-    let words = match words::split(line) {
-        Ok(words) => words,
+/// [`run`] with the commands in `table`.
+pub(super) fn run_in(table: &Table<Run>, line: &str, ctx: &mut Ctx<'_>) {
+    let stages = match words::split_pipeline(line) {
+        Ok(stages) => stages,
         Err(e) => {
             let _ = writeln!(ctx.out, "syntax error: {e}");
             return;
         }
     };
-    let Some((name, args)) = words.split_first() else { return };
-    let Some(command) = table.find(name) else {
-        let _ = writeln!(ctx.out, "unknown command: {name} (try 'help')");
-        return;
-    };
+    match stages.as_slice() {
+        [] => {}
+        [words] => {
+            let (name, args) = words.split_first().expect("split_pipeline gives no empty command");
+            match table.find(name) {
+                Some(command) => run_command(command, ctx, args),
+                None => {
+                    let _ = writeln!(ctx.out, "unknown command: {name} (try 'help')");
+                }
+            }
+        }
+        _ => pipe::run(table, &stages, ctx),
+    }
+}
+
+/// Run `command` with `args`. It gets a canvas owner of its own; when it
+/// returns, a canvas it left behind (kept in a static, leaked) is taken
+/// back, so the screen doesn't stay frozen. A canvas held by a command on
+/// the other console isn't this one's, and stays.
+pub(super) fn run_command(command: &Command<Run>, ctx: &mut Ctx<'_>, args: &[String]) {
     // (A command run from inside another, e.g. by a script, gets its own
     // owner too, and the outer one's is back afterwards.)
     let outer = core::mem::replace(&mut ctx.owner, crate::term::Owner::new());
     (command.run)(ctx, args);
     if crate::term::reclaim_canvas(ctx.owner) {
-        log::warn!(target: "shell", "{name} left the screen paused; took it back");
+        log::warn!(target: "shell", "{} left the screen paused; took it back", command.name);
     }
     ctx.owner = outer;
 }
@@ -197,6 +261,7 @@ fn help(ctx: &mut Ctx<'_>, _: &[String]) {
         }
         text.push('\n');
     }
+    text.push_str("pipes: a command's output through filters, e.g. irqs | where count > 0 | sort count desc\n");
     text.push_str(
         "keys: Tab completes; Up/Down history; Ctrl-U/W delete, Ctrl-C drops the line; \
          the cursor keys, Home/End, Delete, Ctrl-A/E/B/F/D/K and Ctrl-L on the screen (or serial with lumen.ansi)\n",
