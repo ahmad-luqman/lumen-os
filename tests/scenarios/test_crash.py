@@ -154,19 +154,24 @@ def test_spinlock_relock_is_reported(boot, cpu):
     # A CPU taking a lock it already holds panics instead of spinning
     # forever with interrupts off: the report names the lock (the address
     # `crash relock` printed first, and its type), the CPU, and the second
-    # `lock()`'s caller (track_caller: the shell, not sync.rs). On CPU 1
-    # too, so the CPU isn't a constant 0.
+    # `lock()`'s caller (track_caller: `crash_relock` in shell/crash.rs, not
+    # sync.rs). On CPU 1 too, so the CPU isn't a constant 0.
     m = boot("qemutest", extra=["-smp", "2"])
     m.expect(r"lumen> ", 60)
     m.send_line(f"crash relock {cpu}")
     said = m.expect(r"crash: locking the SpinLock at (0x[0-9a-f]+) twice on cpu (\d+)\n", 30)
-    assert said.group(2) == cpu, said.group(0)
-    done = m.expect(rf"{re.escape(END)}|crash: a re-locked SpinLock went unnoticed", 30)
+    addr, said_cpu = said.groups()
+    assert said_cpu == cpu, said.group(0)
+    # A missed re-lock spins with interrupts off: on CPU 1 the shell says so
+    # after 10 s; on CPU 0 serial goes quiet (the expect times out).
+    done = m.expect(
+        rf"{re.escape(END)}|crash: SpinLock::lock returned .*|crash: cpu 1 took it but hasn't finished",
+        30,
+    )
     assert done.group(0) == END, f"no crash: {done.group(0)}"
     assert m.wait_exit(10) == EXIT_CRASH
     out = m.output
     report = out[out.index(BEGIN) : out.index(END) + len(END)]
-    addr = said.group(1)
     assert (
         f"\npanic: SpinLock<()> at {addr} re-locked on cpu {cpu}, which already holds it\n"
         in report
@@ -175,7 +180,8 @@ def test_spinlock_relock_is_reported(boot, cpu):
     assert re.search(r"^  at kernel/src/shell/crash\.rs:\d+:\d+$", report, re.MULTILINE), report
     frames = backtrace(report)
     assert any("shell::crash::crash_relock" in f for f in frames), report
-    # A complete report: nothing it needs is behind the re-locked lock.
+    # A complete report from inside a held lock (interrupts off): no nested
+    # crash, then the heap line, `interrupts: off`, END.
     assert "!!!" not in report, report
     lines = report.splitlines()
     assert lines[-3].startswith("heap: ") and lines[-2:] == ["interrupts: off", END], lines[-3:]

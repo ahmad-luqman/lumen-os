@@ -372,20 +372,19 @@ fn recurse(depth: u64) -> u64 {
     recurse(depth + 1) + frame[7]
 }
 
-/// The lock `crash relock` takes twice.
-static RELOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
-
 /// Take a lock this CPU already holds: `SpinLock::lock` must panic (naming
 /// the lock and this CPU) instead of spinning forever with interrupts off.
 /// Says which lock first, so the test can compare the report with it.
 #[inline(never)]
 fn crash_relock() {
-    let addr = core::ptr::from_ref(&RELOCK).addr();
-    let _ = writeln!(Out, "crash: locking the SpinLock at {addr:#x} twice on cpu {}", arch::cpu_index());
+    static RELOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+    let _ = writeln!(Out, "crash: locking the SpinLock at {:p} twice on cpu {}", &RELOCK, arch::cpu_index());
     let first = RELOCK.lock();
     let second = RELOCK.lock(); // the re-lock: panics here
+    // Only if `lock` handed the same lock out twice (a missed re-lock
+    // spins in `lock` instead, and the test times out).
     drop((second, first));
-    let _ = writeln!(Out, "crash: a re-locked SpinLock went unnoticed");
+    let _ = writeln!(Out, "crash: SpinLock::lock returned while this cpu held it (mutual exclusion broken)");
 }
 
 crate::ktest!(

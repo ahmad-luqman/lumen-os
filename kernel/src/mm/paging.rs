@@ -1384,7 +1384,7 @@ crate::ktest!(
         kassert!(!frame_in_hhdm(acpi));
         kassert_eq!(pt::walk(&Hhdm, acpi, v(0x1000)).end(), WalkEnd::Unreadable(Level::L4, acpi));
         let mut out = Buf::new();
-        let held = SPACE.lock(); // a deadlock here hangs the test (harness timeout)
+        let held = SPACE.lock(); // a walk taking the lock would panic (a re-lock)
         let wrote = write_walk_from(&mut out, acpi, v(0x1000)).and_then(|()| write_walk(&mut out, 0xdead_b000));
         drop(held);
         kassert_eq!(wrote, Ok(()));

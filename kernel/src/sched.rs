@@ -828,7 +828,7 @@ fn spawn_test(cpu: usize, name: &'static str, f: impl FnOnce() + Send + 'static)
 
 /// Yield until `done()` or the test deadline; whether `done()`.
 #[cfg(feature = "ktest")]
-fn yield_until(done: impl Fn() -> bool) -> bool {
+pub(crate) fn yield_until(done: impl Fn() -> bool) -> bool {
     let deadline = time::now_ns() + TEST_DEADLINE_NS;
     while !done() {
         if time::now_ns() > deadline {
