@@ -573,7 +573,14 @@ allocates.
   another thread), so a maskable interrupt's handler never spins on a lock
   the code it interrupted holds: it may log, and is allowed to allocate.
   The crash path turns them off for good before anything else; no guard
-  turns them back on, on any CPU.
+  turns them back on, on any CPU. The lock word is the holder (free, or
+  the holding CPU's index + 1), so a CPU that takes a lock it already holds
+  (an exception or NMI handler taking one the code it interrupted holds, or
+  plain nesting) panics with the lock's address and type, the CPU, and the
+  caller's location, instead of spinning forever (`crash relock`; only
+  plain nesting is exercised). `try_lock` returns `None` on a lock this
+  CPU holds, as on one another CPU holds. The crash reporter never waits
+  for a lock, so that report is complete.
 - **Time** (`time.rs`, arithmetic in `crates/lumen-time`): the TSC's
   frequency is the median of five 10 ms windows against the HPET (the PIT's
   channel 2, polled, without one), measured with interrupts off. Each window
