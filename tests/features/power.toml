@@ -1,0 +1,20 @@
+# Features: power. See tests/features/README.md for the format.
+
+[[feature]]
+name = "lumen-acpi reads what powering off takes: the FADT's PM1a/PM1b control blocks (its 64-bit fields preferred), DSDT address and SMI command, and the DSDT's `_S5_` sleep types by searching its AML bytes (name prefixes, one- to four-byte package lengths, Zero/One/byte/word/dword/qword values; a broken package refused, not misread); found at boot on QEMU"
+milestone = "M2"
+tests = [
+    "cargo:lumen-acpi",
+    "ktest:lumen_kernel::acpi::s5_is_found_at_boot",
+]
+
+[[feature]]
+name = "`reboot` resets the machine (port 0xCF9 full reset; the 8042 pulse and a triple fault as fallbacks) and it boots again; `shutdown` enters ACPI S5 and QEMU exits because the guest powered off (a power-off exit is a pass only for that scenario)"
+milestone = "M2"
+tests = [
+    "scenario:test_shell::test_reboot_boots_again",
+    "scenario:test_shell::test_shutdown_powers_off",
+    "harness:test_qemu::test_reboot_drops_no_reboot",
+    "harness:test_qmp::test_events_are_kept_and_waited_for",
+    "harness:test_qmp::test_waiting_for_an_event_ends",
+]

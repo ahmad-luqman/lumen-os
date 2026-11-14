@@ -1,6 +1,7 @@
 //! The shell's commands: kmon's, with their names and output (`echo`
 //! joins its words with single spaces; `clear` and `colors` need a console
-//! that takes escape codes), plus `history` and `term text`. A table the
+//! that takes escape codes), plus `history`, `term text`, `reboot` and
+//! `shutdown`. A table the
 //! line editor completes from. Each writes to the console that ran it.
 
 use super::{Ctx, crash};
@@ -59,6 +60,8 @@ pub static COMMANDS: Table<Run> = Table(&[
         run: clocks,
     },
     Command { name: "history", args: &[], usage: "", about: "the lines entered on this console", run: history },
+    Command { name: "reboot", args: &[], usage: "", about: "restart the machine", run: reboot },
+    Command { name: "shutdown", args: &[], usage: "", about: "power off (ACPI S5)", run: shutdown },
     Command { name: "exit", args: &[], usage: "", about: "end QEMU (only with lumen.qemu_exit)", run: exit },
 ]);
 
@@ -358,6 +361,23 @@ fn history(ctx: &mut Ctx<'_>, _: &[String]) {
     for (n, line) in ctx.history.numbered() {
         let _ = writeln!(ctx.out, "{n:5}  {line}");
     }
+}
+
+fn reboot(ctx: &mut Ctx<'_>, _: &[String]) {
+    let _ = writeln!(ctx.out, "reboot: restarting");
+    crate::power::reboot()
+}
+
+/// Power off, or say why it can't be done or didn't happen.
+fn shutdown(ctx: &mut Ctx<'_>, _: &[String]) {
+    let why = match crate::power::power_off_plan() {
+        Ok(plan) => {
+            let _ = writeln!(ctx.out, "shutdown: powering off");
+            crate::power::power_off(plan)
+        }
+        Err(why) => why,
+    };
+    let _ = writeln!(ctx.out, "shutdown: can't power off: {why}");
 }
 
 fn exit(ctx: &mut Ctx<'_>, _: &[String]) {

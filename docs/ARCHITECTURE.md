@@ -279,6 +279,36 @@ missing or broken HPET alone is a warning (`no usable HPET: ...`) and leaves
 `hpet` empty. A table skipped while looking for another is warned about too
 (`skipped the table at 0x...: ...`).
 
+### Reboot and power-off (built in M2)
+
+`acpi::init` also reads what powering off takes into `acpi::Info::power_off`:
+the FADT's PM1a and PM1b control blocks (its 64-bit `X_` fields when they
+are given in I/O space, else the 32-bit ones; memory-mapped blocks, as on
+hardware-reduced ACPI, aren't supported), its SMI command port and
+`ACPI_ENABLE` value, and the DSDT, whose `\_S5_` package gives the S5 sleep
+type values. No AML interpreter builds on stable Rust, so
+`lumen_acpi::find_s5` searches the DSDT's bytes for `_S5_` after a `NameOp`
+(past a `\` or `^` prefix) naming a `PackageOp` whose length fits the
+table, and decodes its first two integer constants (each at most 7; a
+single value holds both, in its low two bytes). A missing or broken FADT,
+DSDT or `_S5_` is only logged (debug) and kept as the reason; boot goes on.
+
+The shell's `shutdown` (`power.rs`) says `shutdown: powering off`, logs
+`INFO  power: powering off: ACPI S5, ...`, and with interrupts off asks the
+firmware for ACPI mode if SCI_EN is clear (the SMI command), writes SLP_TYP
+into PM1a (and PM1b), then SLP_EN. If the machine is still on half a second
+later it says why (`shutdown: can't power off: ...`), as it does when ACPI
+gave no way to power off. `reboot` logs `INFO  power: rebooting: reset
+through port 0xcf9` and, interrupts off for good, writes a full reset to
+the reset control register (0xCF9); half a second later it pulses the
+reset line through the 8042 (command 0xFE), and half a second after that
+loads an empty IDT and takes `int3`: a triple fault, which resets the CPU.
+Each fallback logs a warning first. The scenarios run QEMU without
+`-no-reboot` for the reboot (the banner appears twice), and for the
+power-off accept QEMU's exit status 0 only with a QMP `SHUTDOWN` event whose
+reason is `guest-shutdown` (a triple fault under `-no-reboot` also exits
+with 0, but as `guest-reset`).
+
 Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 `isa-debug-exit`, used by tests), `lumen.log=<error|warn|info|debug|trace>`
 and `lumen.keymap=<us|uk|de|fr|no|se|jp|dvorak|colemak>` (the keyboard's
@@ -1015,7 +1045,8 @@ off. A wake from another CPU queues the thread there and sends the
   `clear`, `colors`, `seq`, `sleep`, `uptime`, `clocks`, `exit` (kmon's;
   besides what this list says, the deliberate panic now says `from the
   shell`, and `crash <kind> <cpu>` reports a fault that returned) and
-  `history` (the console's lines, numbered). Each writes to the console that ran it. On plain serial,
+  `history` (the console's lines, numbered), `reboot` and `shutdown` (see
+  "Reboot and power-off" in section 4). Each writes to the console that ran it. On plain serial,
   `colors` and `clear` say the console is plain (tested), and with
   `lumen.ansi` they work there (tested). A `crash` whose fault doesn't
   happen says so on serial and the screen (the screen not tested). `crash <kind> <cpu>` waits, asleep and allocating nothing,
@@ -1339,8 +1370,9 @@ run's, which the job summary was built from) survives.
 
 ```
 kernel/            the kernel (bin crate, x86_64-unknown-none)
-  src/arch/        HAL; x86_64/ has gdt, idt, irq, context (thread switch), apic, pic, pit, i8042 (ports), serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
-  src/acpi.rs      ACPI discovery (MADT, HPET) through lumen-acpi
+  src/arch/        HAL; x86_64/ has gdt, idt, irq, context (thread switch), apic, pic, pit, i8042 (ports), reset (reset and PM1 registers), serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
+  src/acpi.rs      ACPI discovery (MADT, HPET, FADT and the DSDT's _S5_) through lumen-acpi
+  src/power.rs     reboot (0xCF9, 8042, triple fault) and ACPI S5 power-off
   src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs, routing ISA IRQs
   src/keyboard.rs  the PS/2 keyboard: 8042 init, IRQ 1, decoding (pc-keyboard), lumen.keymap
   src/time.rs      TSC and local APIC timer calibration, the boot origin, now_ns, sleep, ticks

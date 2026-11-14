@@ -61,6 +61,8 @@ class QmpClient:
     def __init__(self, sock: socket.socket):
         self._sock = sock
         self._file = sock.makefile("rwb")
+        # Asynchronous events received and not yet taken by `wait_event`.
+        self.events: list[dict[str, Any]] = []
 
     @classmethod
     def connect(cls, path: Path, timeout: float = 10) -> QmpClient:
@@ -101,7 +103,33 @@ class QmpClient:
                 return reply["return"]
             if "error" in reply:
                 raise QmpError(f"{name}: {reply['error']}")
-            # Asynchronous events ({"event": ...}) are ignored.
+            if "event" in reply:
+                self.events.append(reply)
+
+    def wait_event(self, name: str, timeout: float = 30) -> dict[str, Any]:
+        """The first event called `name` (QEMU's, e.g. `SHUTDOWN` with its
+        `data`), taking it and those before it off `events`; waits up to
+        `timeout` seconds for it. Raises QmpError if the connection closes or
+        the time runs out first."""
+        deadline = time.monotonic() + timeout
+        while True:
+            for i, event in enumerate(self.events):
+                if event["event"] == name:
+                    del self.events[: i + 1]
+                    return event
+            remaining = deadline - time.monotonic()
+            # (A read that times out leaves the socket's file unusable, so a
+            # timeout ends the wait for good.)
+            previous = self._sock.gettimeout()
+            self._sock.settimeout(max(remaining, 0.001))
+            try:
+                reply = self._recv()
+            except TimeoutError:
+                raise QmpError(f"no {name} event after {timeout}s (got {self.events})") from None
+            finally:
+                self._sock.settimeout(previous)
+            if "event" in reply:
+                self.events.append(reply)
 
     def send_key(self, qcodes: Sequence[str], hold_ms: int = 20) -> None:
         """Press `qcodes` together on the guest's keyboard, then release."""

@@ -163,6 +163,10 @@ class QemuOptions:
     log_file: Path | None = None
     trace: str = "cpu_reset,guest_errors"
     gdb: bool = False
+    # False: `-no-reboot`, so a reset (a triple fault among them) ends QEMU
+    # with status 0, which the tests count as a failure. True: the machine
+    # resets and boots again (the reboot scenario).
+    reboot: bool = False
     extra: list[str] = field(default_factory=list)
 
 
@@ -179,7 +183,7 @@ def qemu_args(o: QemuOptions) -> list[str]:
         "-serial", o.serial,
         "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
         # A triple fault must end the run, not silently reboot.
-        "-no-reboot",
+        *([] if o.reboot else ["-no-reboot"]),
     ]  # fmt: skip
     if o.monitor:
         args += ["-monitor", o.monitor]
@@ -229,6 +233,7 @@ class Machine:
         trace_interrupts: bool = False,
         extra_args: Sequence[str] = (),
         serial: bool = True,
+        reboot: bool = False,
     ):
         # Read once, before anything starts: a value timeout_scale() rejects fails
         # here, not in the first expect() or wait_exit(). (One so large that it
@@ -244,6 +249,8 @@ class Machine:
         # still do); drive it with the keyboard and read the screen through
         # screendump().
         self.serial = serial
+        # True: a reset boots the machine again instead of ending QEMU.
+        self.reboot = reboot
         self.proc: subprocess.Popen[bytes] | None = None
         self._buf = bytearray()
         self._cond = threading.Condition()
@@ -285,6 +292,7 @@ class Machine:
             log_file=self.artifacts / "qemu.log",
             trace=trace,
             serial="stdio" if self.serial else "none",
+            reboot=self.reboot,
             extra=self.extra_args,
         )
 

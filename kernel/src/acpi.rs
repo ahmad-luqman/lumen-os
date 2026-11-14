@@ -1,5 +1,6 @@
 //! ACPI discovery: the CPUs, interrupt controllers and HPET the firmware
-//! describes, read once at boot.
+//! describes, and how to power off (the FADT's PM1 control blocks and the
+//! DSDT's `_S5_` sleep types), read once at boot.
 //!
 //! Limine gives the RSDP's physical address; `lumen_acpi` walks RSDP → XSDT
 //! (or RSDT) → MADT and HPET and checks every table it uses. Tables are
@@ -19,9 +20,12 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
 
+use alloc::string::{String, ToString};
 use limine::memory_map::EntryType;
 use log::{debug, info, warn};
-use lumen_acpi::{Acpi, Cpu, CpuState, Error, Hpet, InterruptOverride, IoApic, Madt, PhysMem, Signature};
+use lumen_acpi::{
+    Acpi, Cpu, CpuState, Error, Fadt, Hpet, InterruptOverride, IoApic, Madt, PhysMem, Sdt, Signature, SleepType,
+};
 use lumen_mm::{PhysAddr, PhysRange};
 
 use crate::boot;
@@ -47,6 +51,16 @@ pub struct Info {
     /// The legacy 8259 PICs are present (to be masked).
     pub has_8259_pics: bool,
     pub hpet: Option<Hpet>,
+    /// How to power off (ACPI S5), or why we can't.
+    pub power_off: Result<PowerOff, String>,
+}
+
+/// What entering ACPI S5 (soft off) takes.
+#[derive(Clone, Copy, Debug)]
+pub struct PowerOff {
+    pub fadt: Fadt,
+    /// The `_S5_` package's values.
+    pub s5: SleepType,
 }
 
 impl Info {
@@ -263,8 +277,22 @@ fn discover(fw: &mut Firmware, rsdp: u64) -> Result<Info, Error> {
     }
     let madt = Madt::parse(acpi.find(Signature::MADT)?)?;
     let hpet = acpi.find(Signature::HPET).and_then(Hpet::parse);
+    let fadt = acpi.find(Signature::FADT).and_then(Fadt::parse);
     let fw = acpi.into_mem();
     let hpet = hpet.inspect_err(|&e| warn!(target: "acpi", "no usable HPET: {}", Failure::new(e, &mut *fw))).ok();
+    let power_off = fadt.and_then(|fadt| power_off(&mut *fw, fadt)).map_err(|e| Failure::new(e, &mut *fw).to_string());
+    match &power_off {
+        Ok(p) => debug!(
+            target: "acpi",
+            "S5: PM1a control {:#x}, PM1b control {:?}, SLP_TYP {}/{}, DSDT at {:#x}",
+            p.fadt.pm1a_control,
+            p.fadt.pm1b_control,
+            p.s5.a,
+            p.s5.b,
+            p.fadt.dsdt
+        ),
+        Err(e) => debug!(target: "acpi", "no ACPI power-off: {e}"),
+    }
     let info = Info {
         cpus: madt.cpus().collect(),
         local_apic: madt.local_apic_address(),
@@ -272,6 +300,7 @@ fn discover(fw: &mut Firmware, rsdp: u64) -> Result<Info, Error> {
         overrides: madt.interrupt_overrides().collect(),
         has_8259_pics: madt.has_8259_pics(),
         hpet,
+        power_off,
     };
     for c in &info.cpus {
         debug!(target: "acpi", "CPU uid {} APIC id {} {}", c.uid, c.apic_id, c.state);
@@ -296,6 +325,17 @@ fn discover(fw: &mut Firmware, rsdp: u64) -> Result<Info, Error> {
     }
     debug!(target: "acpi", "{} interrupt overrides, 8259 PICs {}", info.overrides.len(), info.has_8259_pics);
     Ok(info)
+}
+
+/// Read the DSDT `fadt` points at and find its `_S5_` sleep types.
+fn power_off(fw: &mut Firmware, fadt: Fadt) -> Result<PowerOff, Error> {
+    let dsdt = Sdt::read(fw, fadt.dsdt)?;
+    let found = dsdt.signature();
+    if found != Signature::DSDT {
+        return Err(Error::WrongSignature { expected: Signature::DSDT, found });
+    }
+    let s5 = lumen_acpi::find_s5(dsdt.body())?;
+    Ok(PowerOff { fadt, s5 })
 }
 
 /// Log the root table's signature and what it lists (debug level only: it
@@ -518,9 +558,26 @@ crate::ktest!(
             overrides: Vec::new(),
             has_8259_pics: false,
             hpet: None,
+            power_off: Err(String::new()),
         };
         let ids: Vec<u32> = info.enabled_cpus().map(|c| c.apic_id).collect();
         kassert_eq!(ids.as_slice(), &[0, 3]);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn s5_is_found_at_boot() {
+        // QEMU's FADT and DSDT give a way to power off: PM1a control at
+        // port 0x604 (q35's ICH9), `_S5_` as four Zeros.
+        use crate::kassert_eq;
+        let info = info().ok_or("ACPI was not found at boot")?;
+        let p = info.power_off.as_ref().map_err(|e| {
+            crate::ktest::diag(format_args!("{e}"));
+            "no ACPI power-off"
+        })?;
+        kassert_eq!((p.fadt.pm1a_control, p.fadt.pm1b_control), (0x604, None));
+        kassert_eq!((p.s5.a, p.s5.b), (0, 0));
         Ok(())
     }
 );

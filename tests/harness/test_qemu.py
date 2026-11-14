@@ -42,6 +42,14 @@ def test_tests_get_debug_exit_and_no_reboot():
     assert args[args.index("-monitor") + 1] == "none"
 
 
+def test_reboot_drops_no_reboot(tmp_path):
+    # Only the reboot scenario lets a reset boot the machine again.
+    assert "-no-reboot" not in qemu_args(opts(reboot=True))
+    m = Machine(Path("x.iso"), tmp_path, reboot=True)
+    assert "-no-reboot" not in qemu_args(m.options(Path("v.fd")))
+    assert "-no-reboot" in qemu_args(Machine(Path("x.iso"), tmp_path).options(Path("v.fd")))
+
+
 def test_args_include_extra():
     args = qemu_args(opts(extra=["-smp", "4", "-device", "virtio-rng-pci"]))
     assert args[-4:] == ["-smp", "4", "-device", "virtio-rng-pci"]

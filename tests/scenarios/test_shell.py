@@ -52,6 +52,45 @@ def test_echo(boot):
     assert "\x1b" not in m.output[start:]
 
 
+BOOTING = r"INFO  boot: Lumen \d+\.\d+\.\d+ \(x86_64\) booting"
+
+
+def test_reboot_boots_again(boot):
+    # `reboot` resets the machine through port 0xcf9 (no fallback needed:
+    # their warnings would say so) and it boots to the shells again. QEMU
+    # runs without -no-reboot here, so the reset doesn't end it.
+    m = boot("qemutest", reboot=True)
+    m.expect(BOOTING, 60)
+    shells_ready = m.expect(SHELLS, 60)
+    m.expect(PROMPT, 60)
+    qmp = m.qmp()
+    m.send_line("reboot")
+    m.expect(r"reboot: restarting\n", 10)
+    m.expect(r"INFO  power: rebooting: reset through port 0xcf9\n", 10)
+    assert qmp.wait_event("RESET", 30)["data"]["reason"] == "guest-reset"
+    m.expect(BOOTING, 120)
+    m.expect(SHELLS, 60)
+    out = m.output
+    assert len(re.findall(BOOTING, out)) == 2
+    assert "didn't reset the machine" not in out[shells_ready.end() :]
+    assert m.proc is not None and m.proc.poll() is None, "QEMU ended instead of rebooting"
+
+
+def test_shutdown_powers_off(boot):
+    # `shutdown` announces itself, enters ACPI S5 and QEMU exits because the
+    # guest powered off: the SHUTDOWN event says `guest-shutdown` (a triple
+    # fault under -no-reboot also ends QEMU with status 0, but its reason is
+    # `guest-reset`). Status 0 is a pass only here.
+    m = shells(boot)
+    qmp = m.qmp()
+    m.send_line("shutdown")
+    m.expect(r"shutdown: powering off\n", 10)
+    m.expect(r"INFO  power: powering off: ACPI S5, SLP_TYP 0/0 into PM1a control 0x604\n", 10)
+    assert qmp.wait_event("SHUTDOWN", 30)["data"] == {"guest": True, "reason": "guest-shutdown"}
+    assert m.wait_exit(30) == 0
+    assert "can't power off" not in m.output
+
+
 def test_history_and_line_editing(boot):
     # On the screen (QMP keys): history with Up/Down, the cursor keys,
     # Home/End, Ctrl-A/E/K/U/W/C; `history` lists the lines entered there.

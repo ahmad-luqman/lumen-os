@@ -1,6 +1,8 @@
 //! ACPI tables for the Lumen kernel: the RSDP, the root table (the XSDT, or
-//! the RSDT on ACPI 1.0 firmware), the MADT (interrupt controllers and CPUs)
-//! and the HPET.
+//! the RSDT on ACPI 1.0 firmware), the MADT (interrupt controllers and CPUs),
+//! the HPET, and what powering off takes: the FADT's PM1 control registers
+//! and the DSDT's `\_S5_` sleep type values ([`find_s5`] searches the AML
+//! bytes for the package: no AML interpreter builds on stable Rust).
 //!
 //! Firmware tables are packed and unaligned, so everything is parsed from
 //! byte slices with bounds-checked little-endian reads, never pointer casts.
@@ -31,6 +33,8 @@ const RSDP_V1_LEN: usize = 20;
 const RSDP_V2_LEN: usize = 36;
 const MADT_FIXED_LEN: usize = SDT_HEADER_LEN + 8;
 const HPET_LEN: usize = 56;
+/// An ACPI 1.0 FADT, up to and including the fields we read from it.
+const FADT_V1_LEN: usize = 116;
 
 /// Physical memory as the parser sees it.
 pub trait PhysMem<'a> {
@@ -54,6 +58,8 @@ impl Signature {
     pub const RSDT: Signature = Signature(*b"RSDT");
     pub const MADT: Signature = Signature(*b"APIC");
     pub const HPET: Signature = Signature(*b"HPET");
+    pub const FADT: Signature = Signature(*b"FACP");
+    pub const DSDT: Signature = Signature(*b"DSDT");
     /// Not a table signature: names the RSDP in errors.
     pub const RSDP: Signature = Signature(*b"RSDP");
 }
@@ -104,6 +110,19 @@ pub enum Error {
     HpetNotInMemory { space: u8 },
     /// The HPET's register address is 0.
     HpetAddressZero,
+    /// The FADT gives no PM1a control block.
+    NoPm1aControl,
+    /// A PM1 control block is outside I/O space (`space` is the generic
+    /// address structure's address space id; memory-mapped PM1 blocks
+    /// aren't supported).
+    Pm1NotIo { space: u8 },
+    /// A PM1 control block's I/O port doesn't fit 16 bits.
+    BadPm1Port(u64),
+    /// The FADT gives no DSDT address.
+    NoDsdt,
+    /// The AML holds no `_S5_` object we can decode (`bad` counts the
+    /// `_S5_` names found that weren't a package of sleep type values).
+    NoS5 { bad: usize },
 }
 
 impl fmt::Display for Error {
@@ -125,6 +144,12 @@ impl fmt::Display for Error {
             }
             Error::HpetNotInMemory { space } => write!(f, "HPET registers in address space {space}, not memory"),
             Error::HpetAddressZero => f.write_str("HPET register address is 0"),
+            Error::NoPm1aControl => f.write_str("the FADT gives no PM1a control block"),
+            Error::Pm1NotIo { space } => write!(f, "a PM1 control block is in address space {space}, not I/O"),
+            Error::BadPm1Port(port) => write!(f, "PM1 control block port {port:#x} doesn't fit 16 bits"),
+            Error::NoDsdt => f.write_str("the FADT gives no DSDT address"),
+            Error::NoS5 { bad: 0 } => f.write_str("the DSDT has no _S5_ object"),
+            Error::NoS5 { bad } => write!(f, "the DSDT's _S5_ isn't a package of sleep types ({bad} found)"),
         }
     }
 }
@@ -597,6 +622,185 @@ impl Hpet {
         }
         Ok(hpet)
     }
+}
+
+/// What the FADT says about powering off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fadt {
+    /// Physical address of the DSDT (`X_DSDT` when the table has it and it
+    /// isn't 0, else `DSDT`; never 0).
+    pub dsdt: u64,
+    /// The PM1a control register's I/O port (`X_PM1a_CNT_BLK` when it is
+    /// given in I/O space, else `PM1a_CNT_BLK`).
+    pub pm1a_control: u16,
+    /// The PM1b control register's I/O port, if there is one.
+    pub pm1b_control: Option<u16>,
+    /// The port to write [`Self::acpi_enable`] to for ACPI mode (`SMI_CMD`),
+    /// if the firmware has one (no port: it is always in ACPI mode).
+    pub smi_command: Option<u16>,
+    pub acpi_enable: u8,
+}
+
+/// Generic address structure address space ids.
+const SPACE_IO: u8 = 1;
+
+impl Fadt {
+    pub fn parse(t: Sdt<'_>) -> Result<Fadt, Error> {
+        let b = t.expect(Signature::FADT)?.bytes();
+        if b.len() < FADT_V1_LEN {
+            return Err(Error::Truncated(Signature::FADT));
+        }
+        let field = |off| u32_at(b, off).expect("within the ACPI 1.0 FADT");
+        // A 64-bit field (ACPI 2.0+), if the table is long enough for it.
+        let extended = |off| u64_at(b, off).filter(|&a| a != 0);
+        // A PM1 control block: the generic address structure at `gas` if
+        // the table has it and it isn't empty, else the 32-bit port at
+        // `legacy`; `None` if neither gives one.
+        let block = |gas: usize, legacy: usize| -> Result<Option<u16>, Error> {
+            let (space, addr) = match (b.get(gas).copied(), extended(gas + 4)) {
+                (Some(space), Some(addr)) => (space, addr),
+                _ => (SPACE_IO, u64::from(field(legacy))),
+            };
+            if addr == 0 {
+                return Ok(None);
+            }
+            if space != SPACE_IO {
+                return Err(Error::Pm1NotIo { space });
+            }
+            u16::try_from(addr).map(Some).map_err(|_| Error::BadPm1Port(addr))
+        };
+        let pm1a_control = block(172, 64)?.ok_or(Error::NoPm1aControl)?;
+        let pm1b_control = block(184, 68)?;
+        let dsdt = extended(140).unwrap_or(u64::from(field(40)));
+        if dsdt == 0 {
+            return Err(Error::NoDsdt);
+        }
+        let smi = field(48);
+        let smi_command = match smi {
+            0 => None,
+            port => Some(u16::try_from(port).map_err(|_| Error::BadPm1Port(port.into()))?),
+        };
+        Ok(Fadt { dsdt, pm1a_control, pm1b_control, smi_command, acpi_enable: b[52] })
+    }
+}
+
+/// The values to write to the PM1a and PM1b control registers' `SLP_TYP`
+/// field (3 bits each) to enter a sleep state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SleepType {
+    pub a: u8,
+    pub b: u8,
+}
+
+/// AML opcodes and prefixes [`find_s5`] knows.
+mod aml {
+    pub const ZERO: u8 = 0x00;
+    pub const ONE: u8 = 0x01;
+    pub const NAME: u8 = 0x08;
+    pub const BYTE: u8 = 0x0a;
+    pub const WORD: u8 = 0x0b;
+    pub const DWORD: u8 = 0x0c;
+    pub const QWORD: u8 = 0x0e;
+    pub const PACKAGE: u8 = 0x12;
+    pub const ROOT: u8 = b'\\';
+    pub const PARENT: u8 = b'^';
+}
+
+/// Find `Name (_S5_, Package () { SLP_TYPa, SLP_TYPb, ... })` in the AML
+/// `aml` (a DSDT's or SSDT's body) by searching its bytes, and decode the
+/// first two values. A match must be a `NameOp` (with an optional `\` or
+/// `^` prefixes) naming a `PackageOp` whose length fits the AML, holding
+/// integer constants (`Zero`, `One`, or a byte, word, dword or qword
+/// prefix) of at most 7. A package with a single value holds `SLP_TYPa`
+/// in its low byte and `SLP_TYPb` in the next (as some firmware does);
+/// later values are ignored. The first `_S5_` that decodes wins.
+pub fn find_s5(aml: &[u8]) -> Result<SleepType, Error> {
+    let mut bad = 0;
+    for at in aml.windows(4).enumerate().filter(|(_, w)| *w == b"_S5_").map(|(i, _)| i) {
+        if !named(aml, at) {
+            continue;
+        }
+        match s5_package(aml, at + 4) {
+            Some(t) => return Ok(t),
+            None => bad += 1,
+        }
+    }
+    Err(Error::NoS5 { bad })
+}
+
+/// Whether the name at `at` follows a `NameOp`, past one `\` or any `^`
+/// prefixes.
+fn named(aml: &[u8], at: usize) -> bool {
+    let before = &aml[..at];
+    let prefix = match before.last() {
+        Some(&aml::ROOT) => 1,
+        _ => before.iter().rev().take_while(|&&b| b == aml::PARENT).count(),
+    };
+    before.len() > prefix && before[before.len() - 1 - prefix] == aml::NAME
+}
+
+/// The sleep types in the package starting at `at` (its `PackageOp`).
+fn s5_package(aml: &[u8], at: usize) -> Option<SleepType> {
+    if aml.get(at) != Some(&aml::PACKAGE) {
+        return None;
+    }
+    let (len, len_bytes) = pkg_length(aml.get(at + 1..)?)?;
+    // The package's length counts from its PkgLength, through its end.
+    let body = aml.get(at + 1..at + 1 + len)?.get(len_bytes..)?;
+    let (&count, mut rest) = body.split_first()?;
+    let mut value = || {
+        let (v, n) = integer(rest)?;
+        rest = &rest[n..];
+        Some(v)
+    };
+    let t = match count {
+        0 => return None,
+        1 => {
+            let v = value()?;
+            SleepType { a: (v & 0xff) as u8, b: ((v >> 8) & 0xff) as u8 }
+        }
+        _ => {
+            let (a, b) = (value()?, value()?);
+            SleepType { a: u8::try_from(a).ok()?, b: u8::try_from(b).ok()? }
+        }
+    };
+    (t.a <= 7 && t.b <= 7).then_some(t)
+}
+
+/// An AML PkgLength at the start of `b`: the length it encodes and how
+/// many bytes it took (1 to 4).
+fn pkg_length(b: &[u8]) -> Option<(usize, usize)> {
+    let lead = *b.first()?;
+    let follow = usize::from(lead >> 6);
+    if follow == 0 {
+        return Some((usize::from(lead & 0x3f), 1));
+    }
+    // With following bytes, bits 4 and 5 of the lead byte must be 0.
+    if lead & 0x30 != 0 {
+        return None;
+    }
+    let mut len = usize::from(lead & 0x0f);
+    for (i, &byte) in b.get(1..=follow)?.iter().enumerate() {
+        len |= usize::from(byte) << (4 + 8 * i);
+    }
+    Some((len, 1 + follow))
+}
+
+/// An AML integer constant at the start of `b`: its value and its size in
+/// bytes.
+fn integer(b: &[u8]) -> Option<(u64, usize)> {
+    let width = match *b.first()? {
+        aml::ZERO => return Some((0, 1)),
+        aml::ONE => return Some((1, 1)),
+        aml::BYTE => 1,
+        aml::WORD => 2,
+        aml::DWORD => 4,
+        aml::QWORD => 8,
+        _ => return None,
+    };
+    let bytes = b.get(1..1 + width)?;
+    let v = bytes.iter().rev().fold(0u64, |v, &byte| v << 8 | u64::from(byte));
+    Some((v, 1 + width))
 }
 
 #[cfg(test)]
