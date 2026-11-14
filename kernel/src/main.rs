@@ -38,6 +38,7 @@ mod klog;
 mod ktest;
 mod mm;
 mod sched;
+mod script;
 mod shell;
 mod smp;
 mod symbols;

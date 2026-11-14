@@ -15,6 +15,7 @@ type Run = fn(&mut Ctx<'_>, &[String]);
 pub static COMMANDS: Table<Run> = Table(&[
     Command { name: "help", args: &[], usage: "", about: "this list", run: help },
     Command { name: "echo", args: &[], usage: "<text>", about: "print text", run: echo },
+    Command { name: "rhai", args: &[&["-e"]], usage: "-e <expr>", about: "evaluate a rhai expression", run: rhai },
     Command { name: "int3", args: &[], usage: "", about: "take a breakpoint and continue", run: int3 },
     Command {
         name: "crash",
@@ -122,6 +123,16 @@ fn help(ctx: &mut Ctx<'_>, _: &[String]) {
 
 fn echo(ctx: &mut Ctx<'_>, args: &[String]) {
     let _ = writeln!(ctx.out, "{}", args.join(" "));
+}
+
+fn rhai(ctx: &mut Ctx<'_>, args: &[String]) {
+    let _ = match args {
+        [flag, expr] if flag == "-e" => match crate::script::eval(expr) {
+            Ok(v) => writeln!(ctx.out, "{v}"),
+            Err(e) => writeln!(ctx.out, "rhai: {e}"),
+        },
+        _ => writeln!(ctx.out, "usage: rhai -e <expr>"),
+    };
 }
 
 fn int3(ctx: &mut Ctx<'_>, _: &[String]) {

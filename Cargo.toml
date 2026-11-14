@@ -33,6 +33,9 @@ vte = { version = "=0.15.0", default-features = false }
 unicode-width = { version = "=0.2.3", default-features = false }
 # The shell's word splitter is checked against it (lumen-shell dev-dependency, #62).
 shlex = { version = "=2.0.1", default-features = false }
+# Scripting in the shell (#67): integers only (no floats, no SSE to need),
+# no modules (no files until M6).
+rhai = { version = "=1.27.0", default-features = false, features = ["no_std", "no_float", "only_i64", "no_module", "no_time"] }
 noto-sans-mono-bitmap = { version = "=0.4.0", default-features = false, features = ["regular", "bold", "size_16", "size_32", "unicode-basic-latin"] }
 
 [workspace.lints.rust]
