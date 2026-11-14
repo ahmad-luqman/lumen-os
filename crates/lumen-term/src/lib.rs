@@ -38,6 +38,9 @@
 //! The view can be scrolled back into the scrollback ([`Terminal::scroll_view`]);
 //! output doesn't move it: it stays on the lines it shows while the ring
 //! holds them (`CSI 3 J` empties the ring and shows the screen).
+//!
+//! [`vt::Router`] keeps one keyboard's keys for several terminals'
+//! readers, each terminal's in a ring of its own.
 
 #![no_std]
 
@@ -45,6 +48,7 @@ extern crate alloc;
 
 mod cell;
 pub mod palette;
+pub mod vt;
 
 use alloc::vec;
 use alloc::vec::Vec;

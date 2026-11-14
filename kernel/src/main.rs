@@ -49,6 +49,7 @@ mod sync;
 mod term;
 mod time;
 mod trace;
+mod vt;
 
 use log::{LevelFilter, debug, info, warn};
 use lumen_mm::stacks::{StackKind, StackRange};

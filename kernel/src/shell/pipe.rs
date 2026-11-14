@@ -76,6 +76,12 @@ impl Console for Capture<'_> {
         self.console.name()
     }
 
+    /// The console's: a command at the start of a pipeline on a virtual
+    /// terminal that takes the canvas brings that terminal to the front.
+    fn vt(&self) -> Option<usize> {
+        self.console.vt()
+    }
+
     fn piped(&self) -> bool {
         true
     }

@@ -1,6 +1,7 @@
-"""The shell: one on serial (plain text unless `lumen.ansi`) and one on the
-screen (typed on the keyboard, read back with the serial shell's `term
-text`), each with its own line editing, history and completion. The line
+"""The shell: one on serial (plain text unless `lumen.ansi`) and one on
+each virtual terminal on the screen (typed on the keyboard, read back with
+the serial shell's `term text`), each with its own line editing, history and
+completion. The line
 editor, word splitting and completion are tested on the host
 (`cargo test -p lumen-shell`); this checks them in the kernel, through
 both consoles."""
@@ -351,9 +352,10 @@ def test_system_commands(boot):
     out = run(m, "threads")
     assert re.match(r"threads: \d+\n  thread            id  cpu  state     ticks\n", out), out
     assert re.search(r"^  main +\d+ +0 +running +\d+$", out, re.MULTILINE), out
-    assert re.search(
-        r"^  shell-screen +\d+ +0 +(blocked|ready|running) +\d+$", out, re.MULTILINE
-    ), out
+    for vt in range(1, 5):
+        assert re.search(
+            rf"^  shell-vt{vt} +\d+ +0 +(blocked|ready|running) +\d+$", out, re.MULTILINE
+        ), out
 
     out = run(m, "dmesg")
     assert re.match(r"dmesg: the newest \d+ log lines \(all since boot\)\n", out), out
@@ -436,7 +438,7 @@ def test_where_sort_first(boot):
     out = run(m, "cpus | where cpu >= 1 | select cpu scheduler busy")
     assert re.fullmatch(r"  cpu  scheduler    busy\n    1  running      +\d+%\n", out), out
     out = run(m, "threads | where thread ~ shell | sort id | select thread")
-    assert out == "  thread\n  shell-screen\n", out
+    assert out == "  thread\n  shell-vt1\n  shell-vt2\n  shell-vt3\n  shell-vt4\n", out
     out = run(m, "mem | where area = heap | select area used")
     assert re.fullmatch(r"  area  +used\n  heap  +\d+\n", out), out
     # Lines that are numbers sort by value (as `where` compares them), the
@@ -512,7 +514,8 @@ def test_top_refreshes_and_quits(boot):
         frame
     )
     assert re.search(r"^  main\s+\d+\s+0\s+\w+\s+\d+%$", frame, re.MULTILINE), frame
-    assert re.search(r"^  shell-screen\s+\d+\s+0\s+\w+\s+\d+%$", frame, re.MULTILINE), frame
+    for vt in range(1, 5):
+        assert re.search(rf"^  shell-vt{vt}\s+\d+\s+0\s+\w+\s+\d+%$", frame, re.MULTILINE), frame
     m.send("q")
     m.expect(r"top: quit after \d+ frames\n" + PROMPT, 10)
     # It stopped: no frame after the prompt.

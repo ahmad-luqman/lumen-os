@@ -418,8 +418,9 @@ class Machine:
     def press(self, qcodes: Sequence[str]) -> None:
         """Press `qcodes` together on the guest's keyboard (QMP `send-key`,
         held 20 ms). QEMU queues each key behind the last one, so keys
-        pressed back to back arrive in order. The screen shell answers them
-        on the screen, not on serial: wait for what they did with
+        pressed back to back arrive in order. The shown virtual terminal's
+        shell answers them on the screen, not on serial: wait for what they
+        did with
         `lumen_harness.screen.expect_screen`.
 
         QEMU's input queue holds 1024 entries and silently drops the rest

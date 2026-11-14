@@ -1,5 +1,6 @@
-"""The terminal on the screen (lumen-term below the header): ANSI colours,
-the screen's shell, scrollback with Shift+PageUp/PageDown."""
+"""The terminals on the screen (lumen-term below the header): ANSI colours,
+the screen shells, scrollback with Shift+PageUp/PageDown, and the virtual
+terminals (Alt+F1 to F4, `vt`)."""
 
 import re
 from typing import NamedTuple
@@ -9,7 +10,9 @@ from lumen_harness.qemu import Machine
 from lumen_harness.screen import expect_screen, read_screen
 
 # 1280x800 (limine.conf) less the header and margins, in 7x16 cells.
-TERM_LINE = r"INFO  term: terminal 176x41, 500 lines of scrollback\n"
+TERM_LINE = (
+    r"INFO  term: 4 terminals 176x41 \(Alt\+F1 to F4 switch\), 500 lines of scrollback each\n"
+)
 TERM_STATUS = re.compile(
     r"term: (\d+)x(\d+), cursor \((\d+), (\d+)\)( hidden)?, scrollback (\d+)/500 lines, "
     r'view (\d+) lines up, top row "([^"]*)", (\d+) cells drawn\n'
@@ -122,3 +125,119 @@ def test_scrollback(boot, artifacts, golden_dir):
     assert view_moved(m)[0] == 0
     back = term_status(m)
     assert back.view == 0, back
+
+
+# The header's virtual-terminal boxes (`tab_x` in kernel/src/term.rs: four
+# 28x24 boxes 6 apart, ending a margin from the right edge, 36 pixels down),
+# with a few pixels around them.
+TABS_ORIGIN, TABS_SIZE = (1112, 32), (144, 32)
+
+
+VT_STATUS = re.compile(
+    r"vt: terminal (\d) of 4 shown \(Alt\+F1 to F4 switch\); "
+    r"keys dropped (\d+) (\d+) (\d+) (\d+), discarded (\d+) (\d+) (\d+) (\d+); "
+    r"(\d+) switches refused\n"
+)
+
+
+class VtStatus(NamedTuple):
+    shown: int
+    dropped: tuple[int, ...]
+    discarded: tuple[int, ...]
+    refused: int
+
+
+def vt_status(m: Machine) -> VtStatus:
+    """The serial shell's `vt`: the virtual terminal shown (from 1), the
+    keys each dropped and discarded, the switches refused."""
+    m.send_line("vt")
+    found = m.expect(VT_STATUS, 10)
+    m.expect(r"lumen> ", 10)
+    n = [int(g) for g in found.groups()]
+    return VtStatus(n[0], tuple(n[1:5]), tuple(n[5:9]), n[9])
+
+
+def test_virtual_terminals_are_independent(boot, artifacts, golden_dir):
+    # Typed in terminal 1 (on a cleared screen), then Alt+F2 shows terminal
+    # 2, its own shell at its first prompt (nothing of 1's), and what is
+    # typed next goes there; Alt+F1 shows 1 again with its text intact (the
+    # golden: its first two rows, above the blinking cursor's). The header
+    # marks the shown one (a golden of its boxes with 2 shown).
+    m = boot_term(boot)
+    m.type_text("clear\n")
+    m.type_text("echo one\n")
+    expect_screen(m, r"\Alumen> echo one\none\nlumen>\s*\Z")
+    m.press(["alt", "f2"])
+    expect_screen(m, r"\Alumen>\s*\Z")
+    assert vt_status(m).shown == 2
+    m.type_text("echo two\n")
+    expect_screen(m, r"\Alumen> echo two\ntwo\nlumen>\s*\Z")
+    shot = m.screendump("vt2.png")
+    assert_matches_golden(
+        shot,
+        golden_dir / "term-vt-tabs.png",
+        origin=TABS_ORIGIN,
+        size=TABS_SIZE,
+        artifacts=artifacts,
+    )
+    m.press(["alt", "f1"])
+    expect_screen(m, r"\Alumen> echo one\none\nlumen>\s*\Z")
+    assert vt_status(m).shown == 1
+    shot = m.screendump("vt1.png")
+    assert_matches_golden(
+        shot,
+        golden_dir / "term-vt1.png",
+        origin=(0, TOP),
+        size=(320, 2 * CELL_H),
+        artifacts=artifacts,
+    )
+    # From serial too: terminal 3 (untouched until then) takes what is
+    # typed next; back to 1. There are four, numbered from 1.
+    m.send_line("vt 3")
+    m.expect(r"vt: terminal 3 shown\n", 10)
+    expect_screen(m, r"\Alumen>\s*\Z")
+    m.type_text("echo three\n")
+    expect_screen(m, r"\Alumen> echo three\nthree\nlumen>\s*\Z")
+    m.send_line("vt 1")
+    m.expect(r"vt: terminal 1 shown\n", 10)
+    for bad in ("5", "0", "x"):
+        m.send_line(f"vt {bad}")
+        m.expect(r"usage: vt \[n\] \(n from 1 to 4\)\n", 10)
+    expect_screen(m, r"\Alumen> echo one\none\nlumen>\s*\Z")
+    assert vt_status(m) == VtStatus(1, (0, 0, 0, 0), (0, 0, 0, 0), 0)
+
+
+def test_a_command_drawing_keeps_its_terminal_shown(boot):
+    # While `life` (typed in terminal 1) has the screen, Alt+F2 and `vt 2`
+    # don't switch (both counted; Alt+F2's logged, `vt 2`'s answered on its
+    # console): the key that ends it still reaches it, in terminal 1.
+    m = boot_term(boot)
+    m.type_text("life\n")
+    expect_screen(m, r"^life: gun on 160x80 cells; a key quits$")
+    m.press(["alt", "f2"])
+    m.expect(r"INFO  term: not showing terminal 2: a command has the screen\n", 10)
+    m.send_line("vt 2")
+    m.expect(r"vt: not showing terminal 2: a command has the screen\n", 10)
+    m.expect(r"lumen> ", 10)
+    status = vt_status(m)
+    assert (status.shown, status.refused) == (1, 2), status
+    m.press(["x"])
+    expect_screen(m, r"^life: generation \d+, \d+ alive\nlumen>$")
+    assert vt_status(m).shown == 1
+
+
+def test_a_command_drawing_brings_its_terminal_to_the_front(boot):
+    # A script typed in terminal 1 waits, then draws; meanwhile Alt+F2 shows
+    # terminal 2. When it draws, terminal 1 comes back to the front (its
+    # "press a key" line in its grid, which `term text` now reads), and the
+    # key typed then reaches it there.
+    m = boot_term(boot)
+    m.type_text("rhai -e 'sleep(4000); draw_rect(0, 0, 50, 50, 0x00ff00)'\n")
+    m.press(["alt", "f2"])
+    expect_screen(m, r"\Alumen>\s*\Z")
+    assert vt_status(m).shown == 2
+    expect_screen(m, r"^rhai: press a key on the keyboard$", 30)
+    assert vt_status(m).shown == 1
+    m.press(["spc"])
+    expect_screen(m, r"^rhai: press a key on the keyboard\nlumen>$")
+    assert vt_status(m).shown == 1

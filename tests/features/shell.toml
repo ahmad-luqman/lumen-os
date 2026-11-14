@@ -9,7 +9,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Two shells replace kmon, each with its own line and history: on serial (plain text, no escape codes) and on the screen (typed on the keyboard, in its own thread, woken by IRQ 1); kmon's commands kept (help, echo, int3, crash, trace, heap, ticks, kbd, term, clear, colors, seq, sleep, uptime, clocks, exit; help lists every command); one line of error for an unknown command or a line that can't be split; only the serial shell without a keyboard"
+name = "Shells replace kmon, each with its own line and history: on serial (plain text, no escape codes) and on the screen (typed on the keyboard, in its own thread, woken by IRQ 1; one per virtual terminal); kmon's commands kept (help, echo, int3, crash, trace, heap, ticks, kbd, term, clear, colors, seq, sleep, uptime, clocks, exit; help lists every command); one line of error for an unknown command or a line that can't be split; only the serial shell without a keyboard"
 milestone = "M2"
 tests = [
     "scenario:test_shell::test_echo",
@@ -58,7 +58,7 @@ tests = [
 ]
 
 [[feature]]
-name = "`term text` prints the screen's rows; the harness reads them to see what the screen's shell did, and paces keys under QEMU's input queue limit"
+name = "`term text` prints the shown terminal's rows; the harness reads them to see what the screen shells did, and paces keys under QEMU's input queue limit"
 milestone = "M2"
 tests = [
     "harness:test_screen_text::*",

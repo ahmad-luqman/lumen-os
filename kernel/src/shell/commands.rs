@@ -1,6 +1,6 @@
 //! The shell's commands: kmon's, with their names and output (`echo`
 //! joins its words with single spaces; `clear` and `colors` need a console
-//! that takes escape codes), plus `history`, `term text`, `reboot`,
+//! that takes escape codes), plus `history`, `term text`, `vt`, `reboot`,
 //! `shutdown`, the system commands (`cpus`, `mem`, `irqs`, `threads`,
 //! `dmesg`, `date`, `top`: `sysinfo.rs`) and the filters that come after a
 //! `|` (`grep`, `where`, `sort`, `first`, `count`, `select`: `pipe.rs`). A
@@ -55,10 +55,17 @@ pub static COMMANDS: Table<Run> = Table(&[
         name: "term",
         args: &[&["text"]],
         usage: "[text]",
-        about: "the screen's terminal: size, cursor, scrollback (text: its rows)",
+        about: "the shown terminal: size, cursor, scrollback (text: its rows)",
         run: term,
     },
     Command { name: "clear", args: &[], usage: "", about: "clear the screen and its scrollback", run: clear },
+    Command {
+        name: "vt",
+        args: &[&["1", "2", "3", "4"]],
+        usage: "[n]",
+        about: "the virtual terminal shown (n: show that one, as Alt+Fn does)",
+        run: vt,
+    },
     Command { name: "colors", args: &[], usage: "", about: "a colour test pattern", run: colors },
     Command {
         name: "mandelbrot",
@@ -214,14 +221,16 @@ pub(super) fn unknown(ctx: &mut Ctx<'_>, name: &str) {
     ctx.fail(format_args!("unknown command: {name} (try 'help')"));
 }
 
-/// Run `command` with `args`. It gets a canvas owner of its own; when it
-/// returns, a canvas it left behind (kept in a static, leaked) is taken
-/// back, so the screen doesn't stay frozen. A canvas held by a command on
-/// the other console isn't this one's, and stays.
+/// Run `command` with `args`. It gets a canvas owner of its own (on the
+/// console's virtual terminal, if it is one); when it returns, a canvas it
+/// left behind (kept in a static, leaked) is taken back, so the screen
+/// doesn't stay frozen. A canvas held by a command on another console isn't
+/// this one's, and stays.
 pub(super) fn run_command(command: &Command<Run>, ctx: &mut Ctx<'_>, args: &[String]) {
     // (A command run from inside another, e.g. by a script, gets its own
     // owner too, and the outer one's is back afterwards.)
-    let outer = core::mem::replace(&mut ctx.owner, crate::term::Owner::new());
+    let outer = ctx.owner;
+    ctx.owner = outer.renew();
     (command.run)(ctx, args);
     if crate::term::reclaim_canvas(ctx.owner) {
         log::warn!(target: "shell", "{} left the screen paused; took it back", command.name);
@@ -340,8 +349,8 @@ fn kbd(ctx: &mut Ctx<'_>, _: &[String]) {
     };
 }
 
-/// `term`: the screen's terminal; `term text`: its rows, each after a `|`,
-/// then a summary line.
+/// `term`: the shown virtual terminal; `term text`: its rows, each after a
+/// `|`, then a summary line.
 fn term(ctx: &mut Ctx<'_>, args: &[String]) {
     const NONE: &str = "term: no terminal (no usable framebuffer, or one too small)";
     let out = &mut *ctx.out;
@@ -380,6 +389,48 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
             None => ctx.fail(NONE),
         },
         _ => ctx.fail("usage: term [text]"),
+    }
+}
+
+/// `vt`'s usage line.
+const VT_USAGE: &str = "usage: vt [n] (n from 1 to 4)";
+
+/// `vt`: which virtual terminal is shown, keys each dropped (its shell
+/// behind) and discarded (no shell), and switches refused; `vt <n>`: show
+/// terminal `n` (1 to `term::VTS`), unless a command has the screen.
+fn vt(ctx: &mut Ctx<'_>, args: &[String]) {
+    use crate::term::VTS;
+    let wanted = match args {
+        [] => None,
+        [n] => match n.parse::<usize>() {
+            Ok(n @ 1..=VTS) => Some(n),
+            _ => return ctx.fail(VT_USAGE),
+        },
+        _ => return ctx.fail(VT_USAGE),
+    };
+    let Some(t) = crate::term::status() else {
+        return ctx.fail("vt: no terminal");
+    };
+    match wanted {
+        None => {
+            let s = crate::vt::stats();
+            let out = &mut *ctx.out;
+            let _ = write!(out, "vt: terminal {} of {VTS} shown (Alt+F1 to F{VTS} switch); keys dropped", t.shown + 1);
+            for d in s.dropped {
+                let _ = write!(out, " {d}");
+            }
+            let _ = write!(out, ", discarded");
+            for d in s.discarded {
+                let _ = write!(out, " {d}");
+            }
+            let _ = writeln!(out, "; {} switches refused", s.refused);
+        }
+        Some(n) => match crate::vt::show(n - 1) {
+            Ok(()) => {
+                let _ = writeln!(ctx.out, "vt: terminal {n} shown");
+            }
+            Err(e) => ctx.fail(format_args!("vt: not showing terminal {n}: {e}")),
+        },
     }
 }
 
@@ -592,7 +643,7 @@ crate::ktest!(
 crate::ktest!(
     fn a_command_s_canvas_is_taken_back_and_no_other() {
         // A canvas a command leaves behind is taken back when it returns;
-        // one held by a command on the other console (another owner) stays
+        // one held by a command on another console (another owner) stays
         // while commands run and return here.
         use crate::kassert;
         use crate::term::{self, Owner};
@@ -618,6 +669,40 @@ crate::ktest!(
         kassert!(paused()? && other.is_live());
         drop(other);
         kassert!(!paused()?);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_command_s_canvas_brings_its_terminal_to_the_front() {
+        // A command run by the shell on the third virtual terminal's console
+        // while the first is shown: its canvas shows the third, keys routed meanwhile go there
+        // (not to the first), and once it is done the third stays shown.
+        use crate::vt::{self, Routed};
+        use crate::{kassert, kassert_eq, term};
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static SHOWN: AtomicUsize = AtomicUsize::new(usize::MAX);
+        static ROUTED: crate::sync::SpinLock<Option<Routed>> = crate::sync::SpinLock::new(None);
+        fn draw(ctx: &mut Ctx<'_>, _: &[String]) {
+            let Ok(canvas) = ctx.canvas() else { return };
+            SHOWN.store(term::shown(), Ordering::Relaxed);
+            let mut rings = lumen_term::vt::Router::new();
+            let routed = vt::route_key(&mut rings, crate::keyboard::Key::Char('q'), (1 << term::VTS) - 1);
+            *ROUTED.lock() = Some(routed);
+            drop(canvas);
+        }
+        static TABLE: Table<Run> =
+            Table(&[Command { name: "draw", args: &[], usage: "", about: "draw on the screen", run: draw }]);
+        kassert_eq!(term::shown(), 0);
+        let _first = term::ShowFirstAfter;
+        // The shell's own console for the third terminal (writing there).
+        let mut console = super::Screen { vt: 2 };
+        let history = lumen_shell::History::new(0);
+        run_in(&TABLE, "draw", &mut Ctx::new(&mut console, true, &history));
+        kassert_eq!(SHOWN.load(Ordering::Relaxed), 2);
+        kassert_eq!(*ROUTED.lock(), Some(Routed::To(2)));
+        kassert_eq!(term::shown(), 2);
+        kassert!(!term::status().ok_or("no terminal")?.paused);
         Ok(())
     }
 );

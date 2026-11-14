@@ -29,11 +29,12 @@
 //! single-consumer queue (`lumen_queue::ByteQueue`), discarding bytes from
 //! the second port (a mouse) and counting and discarding those flagged with
 //! a parity or timeout error, then wakes the threads waiting for a key
-//! ([`wait_key`]). Readers ([`read_key`], [`wait_key`]) decode them with the
-//! `pc-keyboard` crate under a lock, in the layout `lumen.keymap=` names
-//! (`us` without one, or for a name it doesn't know, with a warning), into
-//! characters (Ctrl and a letter making a control character: Ctrl-A is
-//! U+0001) and other keys (with the shift state).
+//! ([`wait_for_bytes_or`]). Readers ([`read_key`]: the virtual terminals'
+//! router, `crate::vt`) decode them with the `pc-keyboard` crate under a
+//! lock, in the layout `lumen.keymap=` names (`us` without one, or for a
+//! name it doesn't know, with a warning), into characters (Ctrl and a
+//! letter making a control character: Ctrl-A is U+0001) and other keys
+//! (with the shift and Alt state).
 //! The shell's `kbd` shows how it went ([`stats`]).
 
 use core::fmt;
@@ -87,7 +88,8 @@ struct Status {
 
 /// Bytes from the keyboard, waiting to be decoded.
 static QUEUE: ByteQueue<256> = ByteQueue::new();
-/// Threads waiting for the queue to have bytes ([`wait_key`]).
+/// Threads waiting for the queue to have bytes, or for keys routed to
+/// them ([`wait_for_bytes_or`]: the screen shells).
 static WAITING: WaitQueue = WaitQueue::new();
 /// The decoder: the queue's consumer side is used only under this lock
 /// (outside the ktests). `None` before [`init`].
@@ -488,14 +490,14 @@ fn drain() {
 pub use pc_keyboard::KeyCode;
 
 /// A key read from the keyboard. (Ctrl and a letter make a control
-/// character; Alt isn't reported.)
+/// character; Alt is reported only with keys that make none.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
     /// A key making a character, in the layout.
     Char(char),
-    /// Any other key pressed (an arrow, PageUp, a modifier), and whether
-    /// shift was held.
-    Raw { code: KeyCode, shift: bool },
+    /// Any other key pressed (an arrow, PageUp, F1, a modifier), and
+    /// whether shift and Alt were held.
+    Raw { code: KeyCode, shift: bool, alt: bool },
 }
 
 /// The next key pressed, if one is waiting (releases are consumed and
@@ -507,19 +509,32 @@ pub fn read_key() -> Option<Key> {
     decode(&mut keyboard.as_mut()?.decoder, || QUEUE.pop())
 }
 
-/// The next key pressed, waiting for one (see [`read_key`]): IRQ 1 wakes
-/// the thread when it queues bytes. Blocks the calling thread (only where a
-/// thread can block: see `sched::WaitQueue::wait_until`). Without a keyboard
-/// it never returns.
-pub fn wait_key() -> Key {
-    loop {
-        if let Some(key) = read_key() {
-            return key;
-        }
-        // Checked under the wait queue's lock: bytes queued after `read_key`
-        // emptied the queue either make this true or wake the thread.
-        WAITING.wait_until(|| !QUEUE.is_empty());
-    }
+/// Queue `bytes` as if IRQ 1 had (for the tests: nothing else produces
+/// in the test kernel while it runs, with interrupts off on the boot CPU,
+/// where IRQ 1 goes). False if the queue filled.
+#[cfg(feature = "ktest")]
+pub fn queue_for_test(bytes: &[u8]) -> bool {
+    debug_assert!(arch::cpu_index() == 0, "the keyboard queue's producer is the boot CPU");
+    let _off = arch::irq::push_off();
+    bytes.iter().all(|&b| QUEUE.push(b))
+}
+
+/// Block the calling thread until bytes are queued or `ready()` holds.
+/// Both are checked under the wait queue's lock with interrupts off, so
+/// `ready` must not block or allocate, and a byte queued after the caller
+/// last emptied the queue with [`read_key`] either makes this return at
+/// once or wakes the thread (IRQ 1 wakes it whenever it queues bytes).
+/// Only where a thread can block (see `sched::WaitQueue::wait_until`).
+/// For readers that keep keys of their own (the virtual terminals'
+/// router, `crate::vt`): whoever makes `ready` true calls
+/// [`wake_readers`] afterwards.
+pub fn wait_for_bytes_or(ready: impl Fn() -> bool) {
+    WAITING.wait_until(|| !QUEUE.is_empty() || ready());
+}
+
+/// Wake every thread waiting in [`wait_for_bytes_or`].
+pub fn wake_readers() {
+    WAITING.wake_all();
 }
 
 /// Feed `next()`'s bytes to `decoder` until one completes a key press;
@@ -530,7 +545,8 @@ fn decode(decoder: &mut Decoder, mut next: impl FnMut() -> Option<u8>) -> Option
             Ok(Some(event)) => match decoder.process_keyevent(event) {
                 Some(DecodedKey::Unicode(c)) => return Some(Key::Char(c)),
                 Some(DecodedKey::RawKey(code)) => {
-                    return Some(Key::Raw { code, shift: decoder.get_modifiers().is_shifted() });
+                    let m = decoder.get_modifiers();
+                    return Some(Key::Raw { code, shift: m.is_shifted(), alt: m.is_alt() });
                 }
                 None => {}
             },
@@ -616,21 +632,28 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn other_keys_come_with_the_shift_state() {
+    fn other_keys_come_with_the_shift_and_alt_state() {
         // Set 1: PageUp is 0xe0 0x49 (released 0xe0 0xc9), PageDown 0xe0 0x51;
-        // left shift 0x2a (released 0xaa).
+        // left shift 0x2a (released 0xaa), left Alt 0x38 (0xb8), F2 0x3c
+        // (0xbc).
         use crate::kassert_eq;
         let mut decoder = new_decoder(choose_layout(Some("us")).1);
-        let bytes = [0x2a, 0xe0, 0x49, 0xe0, 0xc9, 0xaa, 0xe0, 0x51, 0xe0, 0xd1, 0x1e, 0x9e];
+        let bytes = [
+            0x2a, 0xe0, 0x49, 0xe0, 0xc9, 0xaa, 0xe0, 0x51, 0xe0, 0xd1, 0x1e, 0x9e, 0x38, 0x3c, 0xbc, 0xb8, 0x3c, 0xbc,
+        ];
         let mut it = bytes.iter().copied();
         let keys: alloc::vec::Vec<Key> = core::iter::from_fn(|| decode(&mut decoder, || it.next())).collect();
+        let raw = |code, shift, alt| Key::Raw { code, shift, alt };
         kassert_eq!(
             keys,
             alloc::vec![
-                Key::Raw { code: KeyCode::LShift, shift: true },
-                Key::Raw { code: KeyCode::PageUp, shift: true },
-                Key::Raw { code: KeyCode::PageDown, shift: false },
+                raw(KeyCode::LShift, true, false),
+                raw(KeyCode::PageUp, true, false),
+                raw(KeyCode::PageDown, false, false),
                 Key::Char('a'),
+                raw(KeyCode::LAlt, false, true),
+                raw(KeyCode::F2, false, true),
+                raw(KeyCode::F2, false, false),
             ]
         );
         Ok(())

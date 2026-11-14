@@ -143,14 +143,14 @@ own PR that updates that doc first.
   I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
   reporter. `ktest.rs`: test runner. `script.rs`: rhai scripts (the shell's
   `rhai`; built-in scripts in `script/`). `shell/`: the shells, one on serial
-  (plain text unless `lumen.ansi`) and one on the screen (keyboard): `mod.rs`
+  (plain text unless `lumen.ansi`) and one on each virtual terminal (keyboard): `mod.rs`
   the consoles and `Ctx` (keys through `poll_key`/`wait_key`, the screen
   through `canvas`), their commands (`commands.rs`: each row carries its
   help line; the system ones in `sysinfo.rs`), pipelines (`pipe.rs`: `cpus |
   where busy > 50`) and deliberate faults (`crash.rs`). `fb.rs`:
   framebuffer pixels, the header and the crash screen. `term.rs`: the
-  terminal on the framebuffer (log lines, the screen's shell, scrollback, `view_text`, and
-  `Canvas`: the pixels below the header for one command, the terminal paused meanwhile). `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
+  terminals on the framebuffer (four virtual ones, one shown: log lines on the first, the screen shells, scrollback, `view_text`, and
+  `Canvas`: the pixels below the header for one command, the terminals paused meanwhile). `vt.rs`: the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4 switching. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -190,7 +190,8 @@ own PR that updates that doc first.
   queue (interrupt handler to thread; host-tested, incl. threads).
 - `crates/lumen-term`: terminal emulator core: `vte` escapes into a cell
   grid, scrollback, damage tracking (host-tested, incl. a randomized model
-  renderer).
+  renderer), and `vt::Router`, a key ring per virtual terminal (the
+  kernel fills them with each key routed to the terminal shown then).
 - `crates/lumen-shell`: shell core: word splitting with quotes (checked
   against `shlex`; commands split at `|`), the line editor (history,
   completion; ANSI and plain output), the command table (names, completion

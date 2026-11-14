@@ -132,8 +132,9 @@ tests (for example `lumen-elf`, the symbol-table reader).
    online (`INFO  smp: 4 CPUs online`); the scheduler started on every CPU
    (`INFO  sched: threads on 4 CPUs, 10 ms slices`; `kmain`'s context
    becomes the `main` thread, section 6, "Kernel threads"); the
-   framebuffer hello screen and the terminal below it (`INFO  term:
-   terminal 176x41, 500 lines of scrollback`, section 6, "Terminal"; log
+   framebuffer hello screen and the terminals below it (`INFO  term:
+   4 terminals 176x41 (Alt+F1 to F4 switch), 500 lines of scrollback
+   each`, section 6, "Terminal"; log
    lines before it are on serial only), the PS/2 keyboard (`INFO  kbd: PS/2 keyboard
    on ISA IRQ 1 ...`, section 6, "Keyboard"), then
    `boot complete`, then the boot timeline (below).
@@ -165,8 +166,8 @@ incomplete timeline is logged as a warning (not tested: every boot's
 timeline is complete; the scenario fails on the warning). Serial log lines
 start with the time since that origin, `[seconds.microseconds]`; every line
 before the TSC is calibrated (before `time: tsc ...`) shows `[    ?.??????]`, not a
-zero that would read as a measurement. The screen's terminal shows lines
-up to `info` without timestamps, so screenshots stay comparable
+zero that would read as a measurement. The first virtual terminal shows
+lines up to `info` without timestamps, so screenshots stay comparable
 (`term::log_lines_are_coloured_by_level` checks the level starts the line).
 
 ### Other CPUs (SMP, built in M1)
@@ -883,12 +884,15 @@ off. A wake from another CPU queues the thread there and sends the
   a ktest decodes Ctrl-A, Ctrl-W and, on a German keyboard, Ctrl-Z), or
   another key pressed (arrows, PageUp, modifiers) with whether shift is
   held; releases are skipped, and bytes the decoder refuses are counted
-  (the keyboard's overrun code among them). `keyboard::wait_key` blocks
-  the calling thread until a key comes: the producer wakes the keyboard's
-  wait queue whenever it queued a byte, and the waiter checks the queue
-  under the wait queue's lock, so a byte can't slip between its check and
-  its sleep (the screen's shell waits there: every keyboard scenario goes
-  through it). The shell's
+  (the keyboard's overrun code among them); Alt is reported with keys
+  that make no character (a ktest decodes Alt+F2).
+  `keyboard::wait_for_bytes_or(ready)` blocks the calling thread until
+  bytes are queued or `ready()` holds: the producer wakes the keyboard's
+  wait queue whenever it queued a byte, and the waiter checks under the
+  wait queue's lock, so a byte can't slip between its check and its sleep.
+  The screen shells read keys only through the virtual terminals' router
+  (`vt::read_key`/`vt::wait_key`, section "Terminal"): every keyboard
+  scenario goes through it. The shell's
   `kbd` shows the layout, the route, the
   interrupts taken, the bytes queued, dropped, undecoded, flagged, and
   skipped during setup, or why there is no keyboard (and whether IRQ 1 was
@@ -898,26 +902,29 @@ off. A wake from another CPU queues the thread there and sends the
   order; its input queue holds 1024 entries and drops the rest without a
   word, so `press` paces itself on the time QEMU takes to send each key,
   and `test_a_long_line_of_shifted_keys` checks 150 shifted keys arrive),
-  and the scenarios read what the screen's shell did
+  and the scenarios read what the screen shells did
   back from the screen (`lumen_harness.screen`, through the serial shell's
   `term text`); a scenario boots with
   `lumen.keymap=de` in an ISO built for it, and one presses a key over and
   over from power-on until the keyboard is set up (some of those bytes are
   skipped during setup).
-- **Not yet:** key releases and Alt for programs, LEDs, the second port
-  (a mouse), and hot-plug.
+- **Not yet:** key releases for programs (Alt reaches the virtual
+  terminals' router only, for Alt+F1 to F4), LEDs, the second port (a
+  mouse), and hot-plug.
 
 ### Terminal (built in M2)
 
-`crates/lumen-term` (the emulator, host-tested) and `kernel/src/term.rs`
-(drawing it); `fb.rs` keeps the pixels, the header and the crash screen.
+`crates/lumen-term` (the emulator and the virtual terminals' key rings,
+host-tested), `kernel/src/term.rs` (the virtual terminals' grids and
+drawing the shown one) and `kernel/src/vt.rs` (routing keys to them);
+`fb.rs` keeps the pixels, the header and the crash screen.
 
 - **The emulator:** `Terminal::write` runs bytes through `vte`'s parser
   into a grid of cells (a character, foreground and background, each the
   default or one of 256 colours, and flags: bold, inverse, the two halves
   of a wide character). It handles UTF-8, C0 controls (a line feed
-  without a carriage return: `term::write_str`, `term::write_fmt` and log
-  lines turn `\n` into CR LF), cursor
+  without a carriage return: `term::write_str_to`, `term::write_fmt_to` and
+  log lines turn `\n` into CR LF), cursor
   movement, save and restore, erasing (in the pen's background), inserting
   and deleting cells and lines, scrolling, scroll regions, tabs, autowrap
   (the cursor waits at the last column), cursor visibility, and SGR for 16
@@ -957,10 +964,11 @@ off. A wake from another CPU queues the thread there and sends the
   the cursor still in the view).
 - **Writers:** log lines up to `info` are shown without the timestamp, the
   level coloured (ERROR bold red, WARN yellow, INFO green), the tag dimmed,
-  errors' and warnings' messages coloured too (a ktest reads the cells).
-  The screen's shell writes there (section "Shell"), nothing of it on
-  serial (except what a `crash` says on both: a fault that didn't happen,
-  the heap's line before a heap crash; the screen half not tested). Each of its `write!`s is
+  errors' and warnings' messages coloured too (a ktest reads the cells),
+  on the first virtual terminal. Each screen shell writes to its own
+  (section "Shell"), nothing of it on serial (except what a `crash` says
+  on serial and its terminal: a fault that didn't happen, the heap's line
+  before a heap crash; the terminal half not tested). Each of its `write!`s is
   formatted first (it may allocate: a script value's `Debug` does) and then
   drawn under one lock, and each log line is formatted and drawn under one
   lock, so another CPU's log line can't split an escape sequence written in
@@ -979,11 +987,13 @@ off. A wake from another CPU queues the thread there and sends the
 - **Shell commands** (either console, writing to the one that ran them):
   `clear` (the screen and its scrollback, on a console that takes escape
   codes), `colors`, `seq <n>`, `term` (size, cursor, scrollback, the view's offset
-  and top row, cells drawn, and whether a command has the canvas: that
-  part not tested) and `term text` (the view's rows, and the cursor counted in the view, or
+  and top row, and, for the whole screen, cells drawn and whether a command
+  has the canvas: that part not tested) and `term text` (the view's rows, and the cursor counted in the view, or
   `cursor below the view` when scrolled back past it; tested); without a
-  terminal, `term` says so (not tested). In the screen's shell
-  Shift+PageUp/PageDown scroll the view half a screen (logged at debug
+  terminal, `term` says so (not tested); both read the shown terminal.
+  In a screen shell Shift+PageUp/PageDown scroll its terminal's view half
+  a screen (a ktest gives a hidden terminal's console Shift+PageUp and
+  finds that terminal scrolled, the shown one not) (logged at debug
   level: serial only, the screen shows up to `info`); a key the line
   editor takes returns it to the bottom (a ktest checks that output keeps
   a scrolled-back view on its lines; the shell takes keys only between
@@ -1002,14 +1012,59 @@ off. A wake from another CPU queues the thread there and sends the
   once (not tested here: #68's `every_cpu_rendered_rows` is its first
   multi-CPU user). Each command run gets its own `term::Owner`; when it
   returns, the shell takes back a canvas that owner left behind, never one
-  a command on the other console holds (`reclaim_canvas`, with a warning;
+  a command on another console holds (`reclaim_canvas`, with a warning;
   a ktest runs commands that leak a canvas, with and without another
   owner's held). A canvas taken back, or any after a crash report starts,
   draws nothing more (`Canvas::is_live`; a draw under way stops at its
   next row or glyph) and its drop leaves the terminal alone (ktests check
   the taking back; the crash case is not tested).
-- **Not yet:** virtual terminals (Alt+F1 to F4, ROADMAP M2), a font with
-  more than Basic Latin, underline and other SGR attributes, the
+- **Virtual terminals:** `term::VTS` (4) terminals, each its own grid and
+  scrollback, all allocated at init (indexed by the shown one's number, so
+  switching allocates nothing); one is drawn. Log lines go to the first;
+  each screen shell writes to its own (`term::write_str_to`); writing to a
+  hidden one draws nothing, and showing it (`term::show`) draws all of it
+  (a ktest checks both, and that log lines stay on the first). The
+  header's right end shows a numbered box per terminal, the shown one
+  filled (a golden; left out on a screen too narrow to keep them right of
+  the header's text, `fb::HEADER_W`: a ktest of the geometry).
+- **Keys:** `kernel/src/vt.rs` decodes the keyboard's bytes under its lock
+  and routes each key to the terminal shown when it routes it
+  (`vt::route_key`, reading `term::shown()`), into that terminal's ring
+  (`lumen_term::vt::Router`: 128 keys each, a full one drops and counts
+  the newest, the first drop of each burst logged, a burst ending when the
+  ring empties; host-tested against a model, and a ktest feeds 129 key
+  presses to one terminal and finds one dropped and counted for it alone).
+  Alt+F1 to Alt+F4 switch (a ktest maps them), so keys routed after a switch
+  go to the new terminal (a ktest feeds the scancodes of `a`, Alt+F2 and `b`
+  and finds `a` on the first, `b` on the second). Modifiers on their own
+  take no slot; keys for a terminal whose shell didn't start are discarded
+  and counted (that terminal says so; the counting ktested). Keys are routed as soon as a
+  screen shell runs after IRQ 1 (whichever runs first routes for all, and
+  wakes the others if a key went elsewhere), so a key typed just before a
+  command on another terminal takes the canvas, but not routed yet, goes to
+  that command (not tested). Every shell's `vt [n]` shows which terminal is
+  shown, the keys each dropped and discarded and the switches refused, or
+  switches.
+- **Canvas and terminals:** a command on a terminal that takes the canvas
+  brings that terminal to the front (each command's `term::Owner` carries
+  its console's terminal), so keys routed from then on go to it, and while
+  any canvas is held no other terminal can be shown (Alt+F`n` and `vt n`
+  are refused and counted; Alt+F`n`'s logged, `vt n`'s answered on its
+  console): the keys stay with the command drawing. The canvas switch
+  doesn't take the router's lock, so a key being routed then lands on
+  either side. A ktest runs a command through the shell on a virtual
+  terminal's own console while another is shown and finds its canvas
+  showing that terminal and a key routed meanwhile going there; a scenario
+  types a script in terminal 1 that waits, then draws, switches to terminal
+  2 meanwhile, and finds terminal 1 back in front when it draws and the
+  next key reaching it; another runs `life` in terminal 1 and finds Alt+F2
+  and `vt 2` refused and the ending key reaching it. A pipeline's first
+  command has its console's terminal too. A command
+  on serial leaves the shown terminal where it is. `term`, `term text` and
+  the scroll keys work as above. A scenario types in terminal 1, switches
+  to 2 with Alt+F2, types there, switches back and finds 1's text intact (a
+  golden), and types on terminal 3 after `vt 3`.
+- **Not yet:** a font with more than Basic Latin, underline and other SGR attributes, the
   alternate screen, origin mode, left and right margins, and resizing.
 
 ### Shell (built in M2)
@@ -1018,16 +1073,18 @@ off. A wake from another CPU queues the thread there and sends the
 `mod.rs`; the commands, `commands.rs`; the system commands, `sysinfo.rs`;
 pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
 
-- **Two shells, one per console,** each with its own line and history:
+- **Five shells, one per console,** each with its own line and history:
   the serial shell on the boot CPU's `main` thread (where kmon ran), and
-  the screen's in a thread of its own (`shell-screen`, on the boot CPU,
-  started only with a terminal and a keyboard: without a keyboard boot
-  says `shell on serial (none on the screen: no keyboard)`, tested with
-  `i8042=off`; without a terminal, or no thread for it, not tested). The
-  serial shell polls serial (no serial interrupt yet), yielding to
-  the CPU's other threads between polls (sleeping instead would switch
-  to the idle thread and trace twice a millisecond); the screen's blocks
-  in `keyboard::wait_key`. Log lines go to both consoles.
+  one per virtual terminal, each in a thread of its own (`shell-vt1` to
+  `shell-vt4`, on the boot CPU, started only with a terminal and a
+  keyboard: without a keyboard boot says `shell on serial (none on the
+  screen: no keyboard)`, tested with `i8042=off`; without a terminal, or
+  no thread for one, not tested). The serial shell polls serial (no serial
+  interrupt yet), yielding to the CPU's other threads between polls
+  (sleeping instead would switch to the idle thread and trace twice a
+  millisecond); the virtual terminals' shells block in `vt::wait_key`.
+  Log lines go to serial and the first virtual terminal. A terminal whose
+  shell's thread didn't start says so on it (not tested).
 - **Words** (`lumen_shell::words`): blanks separate words; `'...'` keeps
   everything; `"..."` too, except that a backslash escapes `$`, `` ` ``,
   `"`, `\` and a newline; outside quotes a backslash escapes anything;
@@ -1079,7 +1136,7 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   randomized host test runs the editor's output, in both modes, through
   `lumen-term` after every key and checks the cursor's row shows the
   prompt and the line, and the cursor sits where the editor says.
-- **Keys:** the screen's from `keyboard::wait_key` (Enter `\n`, Backspace
+- **Keys:** the screen's from `vt::wait_key` (Enter `\n`, Backspace
   U+0008, Delete U+007F, Tab, Ctrl with a letter U+0001 to U+001A, the
   arrows, Home and End; a ktest maps each); serial's from bytes
   (`lumen_shell::input::Decoder`: CR, LF or CR LF as one Enter, DEL and BS
@@ -1102,7 +1159,7 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   name is there twice, and the layout), `echo` (its words joined by
   single spaces), `int3`, `crash <kind> [cpu|thread]` (the thread is
   `shell-crash`), `trace [n]`, `heap`, `ticks`, `kbd`, `term [text]`,
-  `clear`, `colors`, `seq`, `sleep`, `uptime`, `clocks`, `exit` (kmon's;
+  `clear`, `vt [n]` (the virtual terminals: above), `colors`, `seq`, `sleep`, `uptime`, `clocks`, `exit` (kmon's;
   besides what this list says, the deliberate panic now says `from the
   shell`, and `crash <kind> <cpu>` reports a fault that returned) and
   `history` (the console's lines, numbered), `reboot` and `shutdown` (see
@@ -1111,10 +1168,11 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   same, `Ctx::fail`). On plain serial,
   `colors` and `clear` say the console is plain (tested), and with
   `lumen.ansi` they work there (tested). A `crash` whose fault doesn't
-  happen says so on serial and the screen (the screen not tested). `crash <kind> <cpu>` waits, asleep and allocating nothing,
+  happen says so on serial and on the virtual terminal that ran it (the
+  first for serial's; the terminal not tested). `crash <kind> <cpu>` waits, asleep and allocating nothing,
   until that CPU's report stops this one or its fault returns (so the
   report doesn't find the heap's lock held by the shell freeing its line;
-  the screen's shell could still allocate if someone types there
+  a screen shell could still allocate if someone types there
   meanwhile, not tested). After 10 s (not tested) the job is taken back
   if the CPU hasn't taken it; while one is out, another is refused.
   `crash dfree` and `crash heapcorrupt` print the heap's line before the
@@ -1678,11 +1736,12 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/klog.rs      logger (levels, subsystem tags, serial timestamps, the ring dmesg reads)
   src/rtc.rs       the CMOS RTC: date and time (taken as UTC) for `date`
   src/fb.rs        framebuffer: pixels, glyphs, the hello screen, the crash screen
-  src/term.rs      the terminal on the framebuffer (lumen-term): drawing changed cells, log lines, the cursor
+  src/term.rs      the virtual terminals on the framebuffer (lumen-term): their grids, drawing the shown one's changed cells, log lines, the cursor, the canvas
+  src/vt.rs        the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4
   src/symbols.rs   kernel symbol table (symbolized crash reports)
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
-  src/shell/       the shells (lumen-shell): serial and the screen's consoles, the commands, system commands (sysinfo.rs), deliberate faults (crash.rs)
+  src/shell/       the shells (lumen-shell): serial and the virtual terminals' consoles, the commands, system commands (sysinfo.rs), deliberate faults (crash.rs)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
 crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, ...)

@@ -9,7 +9,7 @@ tests = [
 ]
 
 [[feature]]
-name = "The terminal on the framebuffer below the unchanged header: the screen shell's output and echo on screen (escapes kept off serial), a colour test pattern, log lines coloured by level and starting from the default colours, each write drawn under one lock (a log line formatted under it, the screen shell's output formatted first), only changed cells drawn, scrolls drawn by moving pixels (matching a full redraw), the cursor's blink phase"
+name = "The terminal on the framebuffer below the header (its text unchanged): the screen shell's output and echo on screen (escapes kept off serial), a colour test pattern, log lines coloured by level and starting from the default colours, each write drawn under one lock (a log line formatted under it, the screen shell's output formatted first), only changed cells drawn, scrolls drawn by moving pixels (matching a full redraw), the cursor's blink phase"
 milestone = "M2"
 tests = [
     "scenario:test_term::test_ansi_colours_golden",
@@ -30,14 +30,34 @@ tests = [
     "scenario:test_term::test_scrollback",
     "ktest:lumen_kernel::term::the_cursor_is_not_drawn_while_scrolled_back",
     "ktest:lumen_kernel::term::output_keeps_a_scrolled_back_view",
-    "ktest:lumen_kernel::keyboard::other_keys_come_with_the_shift_state",
+    "ktest:lumen_kernel::keyboard::other_keys_come_with_the_shift_and_alt_state",
 ]
 
 [[feature]]
-name = "A command can take the pixels below the header (a canvas, one at a time, clipped, the header left alone): the terminal keeps its output undrawn meanwhile, and dropping the canvas clears it and draws the terminal again; the shell takes back a canvas a command left behind when it returns (never one a command on the other console holds), which then draws nothing"
+name = "A command can take the pixels below the header (a canvas, one at a time, clipped, the header left alone): the terminal keeps its output undrawn meanwhile, and dropping the canvas clears it and draws the terminal again; the shell takes back a canvas a command left behind when it returns (never one a command on another console holds), which then draws nothing"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::term::a_canvas_pauses_the_terminal_until_dropped",
     "ktest:lumen_kernel::term::a_canvas_is_taken_back_only_from_its_owner",
     "ktest:lumen_kernel::shell::commands::a_command_s_canvas_is_taken_back_and_no_other",
+]
+
+[[feature]]
+name = "Four virtual terminals, each its own grid, scrollback and screen shell (threads shell-vt1 to shell-vt4): Alt+F1 to Alt+F4 (or `vt <n>` on any shell) show one, and each key goes to the terminal shown when it is routed; text written to a hidden one is kept and drawn when it is shown, and a hidden one scrolls back on its own; log lines go to the first; the header's right end marks the one shown; a command drawing (a canvas) brings its terminal to the front and keeps it there until it is done (switches refused and counted); `vt` shows the keys each terminal dropped"
+milestone = "M2"
+tests = [
+    "scenario:test_term::test_virtual_terminals_are_independent",
+    "scenario:test_term::test_a_command_drawing_keeps_its_terminal_shown",
+    "scenario:test_shell::test_top_refreshes_and_quits",
+    "ktest:lumen_kernel::term::virtual_terminals_keep_their_own_text",
+    "ktest:lumen_kernel::term::the_header_boxes_keep_clear_of_its_text",
+    "ktest:lumen_kernel::term::a_canvas_brings_its_terminal_to_the_front_and_keeps_it_there",
+    "ktest:lumen_kernel::term::scrolling_a_hidden_terminal_leaves_the_shown_one_alone",
+    "ktest:lumen_kernel::vt::alt_f1_to_f4_switch_terminals",
+    "ktest:lumen_kernel::vt::keys_go_to_the_terminal_shown_when_routed",
+    "ktest:lumen_kernel::vt::typed_keys_reach_the_terminal_shown_when_they_are_read",
+    "ktest:lumen_kernel::vt::showing_a_terminal_switches_the_screen_unless_a_command_has_it",
+    "ktest:lumen_kernel::shell::commands::a_command_s_canvas_brings_its_terminal_to_the_front",
+    "ktest:lumen_kernel::keyboard::other_keys_come_with_the_shift_and_alt_state",
+    "cargo:lumen-term",
 ]

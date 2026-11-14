@@ -10,7 +10,7 @@
 //! an error says `rhai: press a key on <console>` on a strip at the canvas's
 //! bottom (and on its console) and keeps the canvas until a key is pressed
 //! there; one that failed gives the canvas back first, so the error shows.
-//! On the screen's shell, what a script prints while it holds the canvas
+//! On a virtual terminal's shell, what a script prints while it holds the canvas
 //! reaches the terminal but is drawn only once the canvas is given back.
 //!
 //! **Its own thread.** Each run (or REPL session) is a thread with a

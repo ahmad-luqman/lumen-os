@@ -31,17 +31,22 @@ pub const KINDS: &[&str] = &[
     "relocklog",
 ];
 
-/// Writes to serial and the screen, whichever shell ran the command (a
-/// fault that didn't happen, the heap's line before a heap crash): the
-/// tests read serial.
+/// Writes to serial and to the virtual terminal whose shell ran the
+/// command (the first, with the log lines, for serial's): a fault that
+/// didn't happen, the heap's line before a heap crash. The tests read
+/// serial.
 struct Out;
+
+/// The virtual terminal `crash` was run on ([`run`] sets it before the
+/// fault, which may run in another thread or on another CPU).
+static OUT_VT: AtomicUsize = AtomicUsize::new(0);
 
 impl Write for Out {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         // Under the line lock, like every serial writer but the crash
         // reporter (one lock per piece of a `write!`).
         crate::klog::LockedSerial.write_str(s)?;
-        crate::term::write_str(s);
+        crate::term::write_str_to(OUT_VT.load(Ordering::Relaxed), s);
         Ok(())
     }
 }
@@ -50,6 +55,9 @@ impl Write for Out {
 /// (from its idle thread; its crash report then stops this one), or in a new
 /// thread on this CPU (named `shell-crash`), which the shell waits for.
 pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
+    // Stored only once the fault will run (a remote one's after its job is
+    // claimed): an earlier refusal leaves a fault under way where it was.
+    let vt = ctx.out.vt().unwrap_or(0);
     let kind = args.first().map_or("", String::as_str);
     let Some(fault) = crash_fn(kind) else {
         return ctx.fail(format_args!("crash: unknown kind '{kind}' ({})", KINDS.join(" ")));
@@ -59,6 +67,7 @@ pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
     }
     let target = args.get(1).map(String::as_str);
     if target == Some("thread") {
+        OUT_VT.store(vt, Ordering::Relaxed);
         match crate::sched::spawn("shell-crash", fault) {
             Ok(handle) => handle.join(),
             Err(e) => ctx.fail(format_args!("crash: no thread: {e}")),
@@ -66,12 +75,16 @@ pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
         return;
     }
     match target.map(str::parse::<usize>) {
-        None | Some(Ok(0)) => fault(),
+        None | Some(Ok(0)) => {
+            OUT_VT.store(vt, Ordering::Relaxed);
+            fault();
+        }
         Some(Ok(cpu)) => {
             if REMOTE.try_update(Ordering::Acquire, Ordering::Relaxed, |s| (s != HANDED).then_some(HANDED)).is_err() {
                 return ctx.fail("crash: a crash sent to another CPU hasn't finished yet");
             }
             REMOTE_KIND.store(KINDS.iter().position(|k| *k == kind).expect("a known kind"), Ordering::Relaxed);
+            OUT_VT.store(vt, Ordering::Relaxed);
             match crate::smp::run_on(cpu, run_remote) {
                 Ok(()) => wait_remote(ctx, cpu),
                 Err(e) => {
@@ -108,7 +121,7 @@ fn run_remote() {
 /// returns (it then says why, a failure: `Ctx::fail`). Asleep, allocating nothing: going on (back
 /// to the prompt, freeing the line's words) could leave the heap's lock
 /// held when the report stops this CPU, and the report would show the heap
-/// as maybe mid-update (the screen's shell could still be allocating if
+/// as maybe mid-update (a screen shell could still be allocating if
 /// someone types there meanwhile; not tested). After 10 s (not tested) the
 /// job is taken back if the CPU hasn't taken it; if it has, it is left to
 /// finish, and another remote crash is refused until it returns.
@@ -321,7 +334,7 @@ fn crash_touch_guard() {
 }
 
 /// Overflow the stack this runs on with small frames (the `main` thread's
-/// from the serial shell, the screen shell's thread's from there, a new
+/// from the serial shell, a screen shell's thread's from there, a new
 /// thread's with `thread`, the idle thread's on another CPU).
 #[inline(never)]
 fn crash_stack_overflow() {

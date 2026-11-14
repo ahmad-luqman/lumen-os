@@ -1,6 +1,7 @@
-"""Reading the screen's terminal through the serial shell's `term text`
-(written by kernel/src/shell/commands.rs `term`; change them together): how
-scenarios see what the screen shell, typed on the keyboard, did.
+"""Reading the shown virtual terminal through the serial shell's `term
+text` (written by kernel/src/shell/commands.rs `term`; change them
+together): how scenarios see what the screen shells, typed on the keyboard,
+did.
 
 `term text` prints each row of the view after a `|` (trailing blanks
 trimmed), then `term text: <n> rows, cursor (<col>, <row>)` (the row
