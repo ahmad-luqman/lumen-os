@@ -13,7 +13,6 @@ import re
 
 from lumen_harness.crash import BEGIN, END, backtrace, page_walk
 from lumen_harness.qemu import EXIT_CRASH
-from lumen_harness.screen import expect_screen
 
 BOOT_TIMEOUT = 60
 MIB = 1024 * 1024
@@ -98,6 +97,12 @@ def test_nx_data_crashes_cleanly(crash_report):
     assert any("shell::run" in f for f in frames) and frames[-1].startswith("_start"), report
 
 
+# Both shells are up (`shell::run`), the screen's on a thread of its own.
+SHELLS = r"INFO  shell: shells on serial and the screen; type 'help'\n"
+# `top`'s row for the screen's shell while it waits for a key (`render` in
+# kernel/src/shell/sysinfo.rs: name, id, CPU, state).
+SCREEN_SHELL_BLOCKED = re.compile(r"^  shell-screen +\d+ +\d+ +blocked ", re.MULTILINE)
+
 HEAP_NUMBERS = ("mapped", "base", "used", "live", "free", "blocks", "largest")
 
 
@@ -130,18 +135,40 @@ def crash_after_heap_summary(boot, kind: str) -> tuple[dict[str, int], str]:
     return before, out[out.index(BEGIN) : out.index(END) + len(END)]
 
 
+def wait_until_screen_shell_waits(m) -> None:
+    """At the serial prompt, run `top 1` until it shows the screen's shell
+    blocked (waiting for a key); back at the prompt.
+
+    `shell::run` spawns the screen's shell on a thread of its own and then
+    runs the serial shell, so the serial prompt can come first. Until the
+    screen's shell has drawn its first prompt (keeping the buffer `run_on`
+    writes the editor's output into) and blocked in `keyboard::wait_key`
+    (taking a slot in the keyboard's wait queue), the heap isn't settled and
+    two `heap`s can differ. `WaitQueue::wait_until` marks it blocked and
+    queues it with interrupts off, and `spawn` put it on this shell's CPU,
+    so `top` can't see one without the other. `top` reads no keys from the
+    screen."""
+    for _ in range(10):
+        start = len(m.output)
+        m.send_line("top 1")
+        m.expect(r"top: done after 1 frames\n", 10)
+        blocked = SCREEN_SHELL_BLOCKED.search(m.output[start:])
+        m.expect(r"lumen> ")
+        if blocked:
+            return
+    raise AssertionError(f"the screen's shell never blocked for a key:\n{m.output[start:]}")
+
+
 def test_heap_command_reports_usage(boot):
     m = boot("qemutest")
+    m.expect(SHELLS, BOOT_TIMEOUT)
     m.expect(r"lumen> ", BOOT_TIMEOUT)
-    # The screen's shell runs on its own thread, started just before the
-    # serial one: until it has shown its first prompt (allocating the
-    # buffers it keeps from then on), the heap isn't settled and two `heap`s
-    # can differ.
-    expect_screen(m, r"^lumen>$")
+    wait_until_screen_shell_waits(m)
     heap = shell_heap(m)
     # What boot keeps (`acpi::Info`, for one) and the shells (their editors
-    # and histories, the screen's thread) is in use, a few dozen
-    # allocations; the rest of what the heap mapped is free.
+    # and histories, the screen's thread and its slot in the keyboard's wait
+    # queue) is in use, a few dozen allocations; the rest of what the heap
+    # mapped is free.
     # (`discovery_keeps_nothing_it_does_not_return` checks that ACPI
     # discovery frees what it doesn't keep.)
     assert heap["base"] == HEAP_BASE, heap
