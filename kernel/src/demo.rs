@@ -25,7 +25,7 @@
 use crate::arch::{self, MAX_CPUS};
 use crate::sched;
 use crate::shell::Ctx;
-use crate::term::{self, Canvas};
+use crate::term::Canvas;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -116,7 +116,7 @@ pub fn mandelbrot(ctx: &mut Ctx<'_>, args: &[String]) {
         let _ = writeln!(ctx.out, "usage: mandelbrot");
         return;
     }
-    let canvas = match term::canvas() {
+    let canvas = match ctx.canvas() {
         Ok(canvas) => Arc::new(canvas),
         Err(e) => {
             let _ = writeln!(ctx.out, "mandelbrot: {e}");
@@ -145,8 +145,12 @@ pub fn mandelbrot(ctx: &mut Ctx<'_>, args: &[String]) {
         let _ = write!(per_cpu, " cpu{cpu}={rows}");
     }
     let _ = writeln!(ctx.out, "mandelbrot: rows drawn by each CPU:{per_cpu}");
-    let _ = writeln!(ctx.out, "mandelbrot: press a key");
-    ctx.wait_key();
+    if canvas.is_live() {
+        let _ = writeln!(ctx.out, "mandelbrot: press a key");
+        ctx.wait_key();
+    } else {
+        let _ = writeln!(ctx.out, "mandelbrot: the screen was taken back");
+    }
 }
 
 /// Pixels per cell side.
@@ -181,7 +185,7 @@ pub fn life(ctx: &mut Ctx<'_>, args: &[String]) {
         }
         return;
     };
-    let canvas = match term::canvas() {
+    let canvas = match ctx.canvas() {
         Ok(canvas) => canvas,
         Err(e) => {
             let _ = writeln!(ctx.out, "life: {e}");
@@ -200,16 +204,25 @@ pub fn life(ctx: &mut Ctx<'_>, args: &[String]) {
     let _ = writeln!(ctx.out, "life: {} on {}x{} cells; any key quits", pattern.name, grid.width(), grid.height());
     let status_y = grid.height() * CELL;
     let mut line = String::new();
-    let quit = loop {
+    /// Why the loop ended.
+    enum End {
+        Count,
+        Key,
+        Lost,
+    }
+    let end = loop {
+        if !canvas.is_live() {
+            break End::Lost;
+        }
         line.clear();
         let _ = write!(line, "{}  generation {}  alive {}", pattern.name, grid.generation(), grid.population());
         canvas.fill_rect(0, status_y, canvas.width(), STATUS_H, DEAD);
         canvas.text(CELL, status_y, &line, STATUS, DEAD);
         if count.is_some_and(|n| grid.generation() >= n) {
-            break false;
+            break End::Count;
         }
         if ctx.poll_key().is_some() {
-            break true;
+            break End::Key;
         }
         grid.step(cell);
         if count.is_none() {
@@ -217,9 +230,15 @@ pub fn life(ctx: &mut Ctx<'_>, args: &[String]) {
         }
     };
     let _ = writeln!(ctx.out, "life: generation {}, {} alive", grid.generation(), grid.population());
-    if !quit {
-        let _ = writeln!(ctx.out, "life: press a key");
-        ctx.wait_key();
+    match end {
+        End::Count => {
+            let _ = writeln!(ctx.out, "life: press a key");
+            ctx.wait_key();
+        }
+        End::Key => {}
+        End::Lost => {
+            let _ = writeln!(ctx.out, "life: stopped: the screen was taken back");
+        }
     }
 }
 
@@ -230,7 +249,7 @@ crate::ktest!(
         // (a small view with few iterations, to keep it quick). When it
         // returns, no CPU's thread holds the canvas any more.
         use crate::{kassert, kassert_eq};
-        let canvas = Arc::new(term::canvas().map_err(|_| "no canvas")?);
+        let canvas = Arc::new(crate::term::canvas(crate::term::Owner::new()).map_err(|_| "no canvas")?);
         let (w, h) = (canvas.width().min(320), canvas.height().min(200));
         let view = View::fit(w, h, 24);
         let sum = || {
