@@ -26,6 +26,7 @@ lumen-shell.workspace = true
 lumen-term.workspace = true
 lumen-time.workspace = true
 lumen-trace.workspace = true
+lumen-uart.workspace = true
 limine.workspace = true
 log.workspace = true
 rustc-demangle.workspace = true

@@ -81,7 +81,11 @@ tests (for example `lumen-elf`, the symbol-table reader).
 3. **`_start`** (naked asm): `xor ebp, ebp` ends the backtrace chain, the stack
    top is passed to `kmain`, and the stack is aligned. `kmain`'s first
    statement reads the TSC, the boot timeline's origin (below).
-4. **`arch::init_early`**: COM1 serial, then the boot CPU's GDT and TSS, its
+4. **`arch::init_early`**: COM1 serial (only if a UART answers its scratch
+   register: without one, serial writes do nothing, reads find nothing, and
+   boot warns on the screen once the framebuffer is up; with a working FIFO,
+   writes go out 16 bytes per wait for an empty transmitter; the logic is
+   the host-tested `lumen-uart` crate), then the boot CPU's GDT and TSS, its
    per-CPU record (the GS base, section "Other CPUs"), then the IDT
    with all 256 vectors. **From this point a CPU exception produces a crash
    report**, except a #DF caused by a broken stack pointer before step 6
@@ -967,7 +971,12 @@ off. A wake from another CPU queues the thread there and sends the
   and `ESC O` sequences for the arrows, Home, End and Delete, a C0
   control (below 0x20) ending a sequence it interrupts, UTF-8 without
   overlong forms; host tested). Serial writes are made holding the log's
-  line lock, so a log line can't land inside one (not tested on its own). Each key's output is written to the console in
+  line lock, so a log line can't land inside one (not tested on its own).
+  Every serial writer holds it (the logger, the shells, the ktest runner's
+  TAP lines, the `crash` command's messages) except the crash reporter,
+  which stops the other CPUs first: a 16-byte burst assumes the transmit
+  FIFO is empty once the line status says so, and two CPUs bursting after
+  the same check would overrun it. Each key's output is written to the console in
   one write, so on the screen a log line can't land in the middle of a
   redraw (not tested on its own).
 - **Commands:** `help` (a ktest checks it has a line for each command
@@ -1320,7 +1329,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/shell/       the shells (lumen-shell): serial and the screen's consoles, the commands, deliberate faults (crash.rs)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
-crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-time, lumen-queue, lumen-term, lumen-shell, ...)
+crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, ...)
 boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml

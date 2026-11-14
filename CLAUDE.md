@@ -181,6 +181,9 @@ own PR that updates that doc first.
   output), the command table, serial bytes to keys (host-tested).
 - `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET
   (host-tested on handcrafted tables).
+- `crates/lumen-uart`: 16550 UART logic: presence probe (scratch
+  register), FIFO detection, `\n` as `\r\n` in 16-byte bursts
+  (host-tested against a model UART).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
   are built), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
   `crash.py` (crash-report parsing), `screen.py` (the screen's rows

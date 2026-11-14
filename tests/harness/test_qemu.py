@@ -56,6 +56,14 @@ def test_machine_appends_extra_args_last(tmp_path):
     assert "-smp" not in plain
 
 
+def test_machine_without_serial_has_no_serial_port(tmp_path):
+    # `-serial none` (not just no output): q35 then creates no COM1 at all.
+    args = qemu_args(Machine(Path("x.iso"), tmp_path, serial=False).options(Path("v.fd")))
+    assert args[args.index("-serial") + 1] == "none" and args.count("-serial") == 1
+    plain = qemu_args(Machine(Path("x.iso"), tmp_path).options(Path("v.fd")))
+    assert plain[plain.index("-serial") + 1] == "stdio"
+
+
 def test_live_machines_never_share_a_qmp_socket(tmp_path):
     # Parallel workers are kept apart by the pid in the name; machines in one
     # process (a test that boots twice) by a per-process counter.

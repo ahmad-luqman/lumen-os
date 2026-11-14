@@ -228,6 +228,7 @@ class Machine:
         *,
         trace_interrupts: bool = False,
         extra_args: Sequence[str] = (),
+        serial: bool = True,
     ):
         # Read once, before anything starts: a value timeout_scale() rejects fails
         # here, not in the first expect() or wait_exit(). (One so large that it
@@ -238,6 +239,9 @@ class Machine:
         self.trace_interrupts = trace_interrupts
         # Appended to the command line, e.g. ["-smp", "2"].
         self.extra_args = list(extra_args)
+        # False: no serial port at all (`-serial none`: q35 then has no COM1),
+        # so nothing arrives for expect(); drive it with the keyboard instead.
+        self.serial = serial
         self.proc: subprocess.Popen[bytes] | None = None
         self._buf = bytearray()
         self._cond = threading.Condition()
@@ -278,6 +282,7 @@ class Machine:
             qmp_socket=self.qmp_path,
             log_file=self.artifacts / "qemu.log",
             trace=trace,
+            serial="stdio" if self.serial else "none",
             extra=self.extra_args,
         )
 

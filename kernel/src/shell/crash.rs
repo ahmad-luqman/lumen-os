@@ -36,7 +36,8 @@ struct Out;
 
 impl Write for Out {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        serial::write_bytes(s.as_bytes());
+        // Under the line lock, as every serial writer (`SerialWriter`).
+        crate::klog::with_line_lock(|| serial::write_bytes(s.as_bytes()));
         crate::term::write_str(s);
         Ok(())
     }

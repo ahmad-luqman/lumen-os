@@ -87,7 +87,16 @@ macro_rules! kassert_eq {
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by ktests
 /// Print a TAP diagnostic line (`# ...`).
 pub fn diag(args: fmt::Arguments<'_>) {
-    let _ = writeln!(SerialWriter, "# {args}");
+    line(format_args!("# {args}"));
+}
+
+/// Write one TAP line to serial under the log's line lock: no log line
+/// lands in the middle of it, and serial writes stay serialized (see
+/// `serial::SerialWriter`).
+fn line(args: fmt::Arguments<'_>) {
+    crate::klog::with_line_lock(|| {
+        let _ = writeln!(SerialWriter, "{args}");
+    });
 }
 
 #[cfg(feature = "ktest")]
@@ -108,25 +117,24 @@ fn registered() -> &'static [KTest] {
 #[cfg(feature = "ktest")]
 pub fn run_all() -> bool {
     let tests = registered();
-    let mut out = SerialWriter;
-    let _ = writeln!(out, "TAP version 14");
-    let _ = writeln!(out, "1..{}", tests.len());
+    line(format_args!("TAP version 14"));
+    line(format_args!("1..{}", tests.len()));
     let mut failed = 0;
     for (i, t) in tests.iter().enumerate() {
         match (t.func)() {
             Ok(()) => {
-                let _ = writeln!(out, "ok {} - {}", i + 1, t.name);
+                line(format_args!("ok {} - {}", i + 1, t.name));
             }
             Err(reason) => {
                 failed += 1;
                 // Diagnostics always precede their result line (kassert! prints
                 // while the test runs), and the harness parses them that way.
-                let _ = writeln!(out, "# {reason}");
-                let _ = writeln!(out, "not ok {} - {}", i + 1, t.name);
+                line(format_args!("# {reason}"));
+                line(format_args!("not ok {} - {}", i + 1, t.name));
             }
         }
     }
-    let _ = writeln!(out, "# ktest: {} passed, {} failed", tests.len() - failed, failed);
+    line(format_args!("# ktest: {} passed, {} failed", tests.len() - failed, failed));
     failed == 0
 }
 

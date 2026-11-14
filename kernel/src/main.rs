@@ -189,6 +189,10 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
         },
         None => warn!(target: "fb", "no framebuffer"),
     }
+    if !arch::serial::present() {
+        // Only the screen shows this (and every other log line).
+        warn!(target: "boot", "no serial port at COM1: logging to the screen only");
+    }
     ktrace!(Kind::BootPhase, BootPhase::Framebuffer);
     keyboard::init();
 

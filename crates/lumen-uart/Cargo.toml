@@ -1,0 +1,9 @@
+[package]
+name = "lumen-uart"
+description = "no_std 16550 UART logic for the Lumen kernel: presence probe, FIFO detection, newlines expanded into FIFO-sized bursts; generic over register access, host-tested against a model UART"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
