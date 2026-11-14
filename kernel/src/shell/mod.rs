@@ -23,6 +23,7 @@
 
 mod commands;
 mod crash;
+mod sysinfo;
 
 use crate::arch::serial;
 use crate::keyboard::{self, KeyCode};
@@ -53,7 +54,6 @@ pub struct Ctx<'a> {
     pub history: &'a History,
 }
 
-#[allow(dead_code, reason = "the first users are `top`, the demos and scripts (#63, #67, #68)")]
 impl Ctx<'_> {
     /// The next key typed on this console, if one is waiting (never
     /// blocks): for a command that runs until a key (`q`, Ctrl-C) stops it.
@@ -62,6 +62,7 @@ impl Ctx<'_> {
     }
 
     /// Wait for the next key typed on this console.
+    #[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
     pub fn wait_key(&mut self) -> Key {
         self.out.read_key()
     }

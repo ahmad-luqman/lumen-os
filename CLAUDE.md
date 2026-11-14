@@ -141,9 +141,9 @@ own PR that updates that doc first.
   I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
   reporter. `ktest.rs`: test runner. `shell/`: the shells, one on serial
   (plain text unless `lumen.ansi`) and one on the screen (keyboard), their
-  commands (`commands.rs`) and deliberate faults (`crash.rs`). `fb.rs`:
+  commands (`commands.rs`, the system ones in `sysinfo.rs`) and deliberate faults (`crash.rs`). `fb.rs`:
   framebuffer pixels, the header and the crash screen. `term.rs`: the
-  terminal on the framebuffer (log lines, the screen's shell, scrollback, `view_text`). `klog.rs`: logger. `symbols.rs`: symbol lookup.
+  terminal on the framebuffer (log lines, the screen's shell, scrollback, `view_text`). `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.

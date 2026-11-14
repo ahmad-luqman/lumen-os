@@ -48,13 +48,18 @@
 //! tables and frame allocator), and on the heap a detached thread's record
 //! and its joiners' list.
 //!
+//! For the shell's `cpus` and `top`, each tick counts against the running
+//! thread and, on the idle thread, as an idle tick of its CPU (sampling at
+//! 1 kHz: [`cpu_ticks`], [`threads`]); every thread is listed in a registry
+//! of weak references, pruned of the dropped ones as threads start.
+//!
 //! Every switch records a `switch` trace event (previous thread's id, next
 //! thread's id, the previous thread's state), and the crash report names the
 //! thread that was running (`thread: <name> (id N)`, read lock-free).
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::fmt;
@@ -174,6 +179,8 @@ pub struct Thread {
     reaped: AtomicBool,
     /// Joiners waiting for `reaped`.
     exited: WaitQueue,
+    /// Timer ticks that found it running.
+    ticks: AtomicU64,
 }
 
 impl Thread {
@@ -185,13 +192,13 @@ impl Thread {
         // the thread owns it, and it is freed only after the thread has died
         // and its CPU has switched away from it.
         let rsp = unsafe { arch::context::prepare(stack.range().top, thread_entry) };
-        Ok(Arc::new(Thread::new(name, cpu, State::Ready, rsp, Some(stack), Some(entry))))
+        Ok(register(Arc::new(Thread::new(name, cpu, State::Ready, rsp, Some(stack), Some(entry)))))
     }
 
     /// A thread for the code running now on this CPU, on a stack it doesn't
     /// own.
     fn adopted(name: &'static str) -> Arc<Thread> {
-        Arc::new(Thread::new(name, arch::cpu_index(), State::Running, 0, None, None))
+        register(Arc::new(Thread::new(name, arch::cpu_index(), State::Running, 0, None, None)))
     }
 
     fn new(
@@ -212,6 +219,7 @@ impl Thread {
             entry: SpinLock::new(entry),
             reaped: AtomicBool::new(false),
             exited: WaitQueue::new(),
+            ticks: AtomicU64::new(0),
         }
     }
 
@@ -364,6 +372,63 @@ static READY: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS
 /// them.
 static CURRENT: [AtomicPtr<Thread>; MAX_CPUS] = [const { AtomicPtr::new(ptr::null_mut()) }; MAX_CPUS];
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// Every thread not yet dropped (weakly: the registry keeps none alive).
+/// A leaf lock: nothing else is taken while it is held but the heap's.
+static THREADS: SpinLock<Vec<Weak<Thread>>> = SpinLock::new(Vec::new());
+/// Ticks each CPU's scheduler has taken (from its start), and how many of
+/// them found the idle thread running.
+static TICKED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static IDLE_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Add `t` to [`THREADS`], dropping the entries of threads gone since.
+/// Not under any other lock (it allocates).
+fn register(t: Arc<Thread>) -> Arc<Thread> {
+    let mut all = THREADS.lock();
+    all.retain(|w| w.strong_count() > 0);
+    all.push(Arc::downgrade(&t));
+    t
+}
+
+/// A thread as [`threads`] saw it.
+#[derive(Clone, Copy, Debug)]
+pub struct ThreadInfo {
+    pub id: u64,
+    pub name: &'static str,
+    pub cpu: usize,
+    pub state: State,
+    /// Timer ticks (1 ms each) that found it running.
+    pub ticks: u64,
+}
+
+/// Every thread still alive (dead ones not yet dropped included), oldest
+/// first.
+pub fn threads() -> Vec<ThreadInfo> {
+    let live: Vec<Arc<Thread>> = THREADS.lock().iter().filter_map(Weak::upgrade).collect();
+    live.iter()
+        .map(|t| ThreadInfo {
+            id: t.id,
+            name: t.name,
+            cpu: t.cpu,
+            state: t.state(),
+            ticks: t.ticks.load(Ordering::Relaxed),
+        })
+        .collect()
+}
+
+/// CPU `cpu`'s scheduler ticks, and those that found it idle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuTicks {
+    pub ticks: u64,
+    pub idle: u64,
+}
+
+/// CPU `cpu`'s [`CpuTicks`] (zeros for a CPU index that doesn't exist).
+pub fn cpu_ticks(cpu: usize) -> CpuTicks {
+    match (TICKED.get(cpu), IDLE_TICKS.get(cpu)) {
+        (Some(t), Some(i)) => CpuTicks { ticks: t.load(Ordering::Relaxed), idle: i.load(Ordering::Relaxed) },
+        _ => CpuTicks::default(),
+    }
+}
 /// Set once [`init`] has stopped waiting for the schedulers to start: one
 /// that starts after that says so.
 static START_WAIT_OVER: AtomicBool = AtomicBool::new(false);
@@ -628,6 +693,12 @@ pub fn tick() {
     let now = time::now_ns();
     let switch = {
         let mut q = CPUS[cpu].lock();
+        // Counted before waking anyone: the thread this tick interrupted.
+        TICKED[cpu].fetch_add(1, Ordering::Relaxed);
+        q.running().ticks.fetch_add(1, Ordering::Relaxed);
+        if q.on_idle() {
+            IDLE_TICKS[cpu].fetch_add(1, Ordering::Relaxed);
+        }
         q.wake_sleepers(cpu, now);
         q.slice_left = q.slice_left.saturating_sub(1);
         !q.ready.is_empty() && (q.slice_left == 0 || q.on_idle())

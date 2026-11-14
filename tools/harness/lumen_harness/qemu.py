@@ -191,6 +191,9 @@ def qemu_args(o: QemuOptions) -> list[str]:
         args += ["-d", o.trace, "-D", str(o.log_file)]
     if o.gdb:
         args += ["-s", "-S"]
+    # The RTC keeps UTC (the shell's `date` says so; the tests compare it
+    # with the host's clock).
+    args += ["-rtc", "base=utc"]
     return args + o.extra
 
 

@@ -278,6 +278,9 @@ static UNEXPECTED_IRQS: AtomicU64 = AtomicU64::new(0);
 static LAPIC_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Every local APIC error status bit seen so far.
 static LAPIC_ERRORS_SEEN: AtomicU32 = AtomicU32::new(0);
+/// Interrupts taken on each vector, all CPUs together (the shell's `irqs`
+/// and `top`). Exceptions are counted too (all but #BP are fatal).
+static VECTOR_COUNTS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
 /// How many I/O APIC vectors there are.
 const IOAPIC_VECTORS: usize = (IOAPIC_LAST - IOAPIC_BASE) as usize + 1;
 
@@ -331,6 +334,54 @@ pub fn ticks() -> u64 {
 /// doesn't exist).
 pub fn ticks_on(cpu: usize) -> u64 {
     TICKS.get(cpu).map_or(0, |t| t.load(Ordering::Relaxed))
+}
+
+/// Interrupts taken on `vector` so far, all CPUs together.
+pub fn vector_count(vector: u8) -> u64 {
+    VECTOR_COUNTS[usize::from(vector)].load(Ordering::Relaxed)
+}
+
+/// What a vector is for, in the vector map (for the shell's `irqs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VectorUse {
+    Exception,
+    /// An 8259 line (`n`), masked: only spurious IRQs 7 and 15 should come.
+    Pic(u8),
+    Timer,
+    Wakeup,
+    /// I/O APIC global system interrupt `n`.
+    Gsi(u8),
+    LapicError,
+    Spurious,
+    Unused,
+}
+
+pub fn vector_use(vector: u8) -> VectorUse {
+    match vector {
+        0..=31 => VectorUse::Exception,
+        v if (PIC_BASE..PIC_BASE + 16).contains(&v) => VectorUse::Pic(v - PIC_BASE),
+        TIMER => VectorUse::Timer,
+        WAKEUP => VectorUse::Wakeup,
+        v if (IOAPIC_BASE..=IOAPIC_LAST).contains(&v) => VectorUse::Gsi(v - IOAPIC_BASE),
+        LAPIC_ERROR => VectorUse::LapicError,
+        SPURIOUS => VectorUse::Spurious,
+        _ => VectorUse::Unused,
+    }
+}
+
+impl core::fmt::Display for VectorUse {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            VectorUse::Exception => f.write_str("exception"),
+            VectorUse::Pic(n) => write!(f, "8259 IRQ {n}"),
+            VectorUse::Timer => f.write_str("local APIC timer"),
+            VectorUse::Wakeup => f.write_str("wakeup IPI"),
+            VectorUse::Gsi(n) => write!(f, "GSI {n}"),
+            VectorUse::LapicError => f.write_str("local APIC error"),
+            VectorUse::Spurious => f.write_str("spurious"),
+            VectorUse::Unused => f.write_str("unused"),
+        }
+    }
 }
 
 /// Interrupts taken that nothing asked for.
@@ -391,7 +442,8 @@ fn unexpected(frame: &TrapFrame) {
     }
 }
 
-/// Called by `lumen_isr_common` for every vector. CPU exceptions are traced
+/// Called by `lumen_isr_common` for every vector, which it first counts
+/// ([`vector_count`]). CPU exceptions are traced
 /// and fatal (bar #BP). Device interrupts are never fatal: the timer and
 /// spurious interrupts are counted, not traced (at 1 kHz they would flood
 /// the trace ring); the timer blinks the terminal's cursor on the boot CPU
@@ -406,6 +458,9 @@ fn unexpected(frame: &TrapFrame) {
 #[unsafe(no_mangle)]
 extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
     let vector = frame.vector;
+    if let Some(count) = VECTOR_COUNTS.get(vector as usize) {
+        count.fetch_add(1, Ordering::Relaxed);
+    }
     if vector < 32 {
         crate::ktrace!(crate::trace::Kind::Exception, vector, frame.rip, frame.error_code);
         if vector == 3 {

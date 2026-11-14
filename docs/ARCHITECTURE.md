@@ -938,7 +938,8 @@ off. A wake from another CPU queues the thread there and sends the
 ### Shell (built in M2)
 
 `crates/lumen-shell` (host-tested) and `kernel/src/shell/` (the consoles,
-`mod.rs`; the commands, `commands.rs`; the deliberate faults, `crash.rs`).
+`mod.rs`; the commands, `commands.rs`; the system commands, `sysinfo.rs`;
+the deliberate faults, `crash.rs`).
 
 - **Two shells, one per console,** each with its own line and history:
   the serial shell on the boot CPU's `main` thread (where kmon ran), and
@@ -1026,9 +1027,45 @@ off. A wake from another CPU queues the thread there and sends the
   if the CPU hasn't taken it; while one is out, another is refused.
   `crash dfree` and `crash heapcorrupt` print the heap's line before the
   damage, which the tests compare with the report's.
+- **System commands** (`sysinfo.rs`; each a `<name>: ...` header and
+  rows, made into one string and written in one write):
+  - `cpus`: each CPU online, its local APIC id, whether its scheduler
+    runs, the ticks it has taken and how busy it has been since it
+    started (the share of ticks that didn't find the idle thread running:
+    the scheduler counts each tick against the running thread and, on the
+    idle thread, as idle; sampling at 1 kHz), and the threads homed there
+    (`sched::threads`, a registry of weak references).
+  - `mem`: frames used of those the allocator owns, the heap's counters,
+    and the kernel stacks registered, by kind.
+  - `irqs`: every I/O APIC input decoded (vector, delivery, trigger,
+    polarity, destination, masked; an input no driver routed is shown only
+    as masked), then the interrupts taken on each vector that took any
+    (`idt::vector_count`: dispatch counts every vector, all CPUs
+    together), with what the vector map uses it for.
+  - `dmesg`: the newest log lines as serial printed them: the logger
+    keeps the last 16 KiB in a `lumen_trace::TextRing` (host-tested
+    against a model), written under the line lock behind a lock of its
+    own, so reading it doesn't take the line lock; only whole lines are
+    shown (a full ring's oldest, cut, line is left out).
+  - `date`: the CMOS RTC (`rtc.rs`, ports in `arch::cmos`): wait out an
+    update in progress (bounded, 10 ms), read until two reads agree,
+    decode BCD or binary and 12- or 24-hour hours (`lumen_time::rtc`,
+    host-tested), in UTC (QEMU's `-rtc base=utc` in every test). The
+    century is taken as 20xx (the FADT's century register isn't read).
+    QEMU's RTC ticks on a phase of its own: measured, it reads 1 to 2 s
+    behind the host's clock, which the test allows.
+  - `top [frames]`: every second, the CPUs (busy % and ticks per second
+    over the last second), interrupts per second by vector, the heap and
+    frames, and every thread with its share of its CPU's ticks; it polls
+    the console for a key (`Ctx::poll_key`) between 20 ms sleeps and stops
+    on `q` or Ctrl-C (or after `frames` frames). With escape codes each
+    frame replaces the last (home, erase; not tested); on plain serial frames follow
+    one another as lines.
 - **Tests:** `cargo:lumen-shell`; `test_shell` (echo with quotes on both
   consoles, history and line editing on the screen and history on serial,
-  completion on both, one line of error, `lumen.ansi`); the keyboard and
+  completion on both, one line of error, `lumen.ansi`, the system
+  commands' headers and rows under `-smp 2`, `date` against the host's
+  clock, `top`'s frames and `q`); the keyboard and
   terminal scenarios type on the screen's shell and read the screen back
   with `term text`; every serial scenario that drove kmon runs against the
   serial shell with the new prompt.
@@ -1339,7 +1376,7 @@ run's, which the job summary was built from) survives.
 
 ```
 kernel/            the kernel (bin crate, x86_64-unknown-none)
-  src/arch/        HAL; x86_64/ has gdt, idt, irq, context (thread switch), apic, pic, pit, i8042 (ports), serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
+  src/arch/        HAL; x86_64/ has gdt, idt, irq, context (thread switch), apic, pic, pit, i8042 and cmos (ports), serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
   src/acpi.rs      ACPI discovery (MADT, HPET) through lumen-acpi
   src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs, routing ISA IRQs
   src/keyboard.rs  the PS/2 keyboard: 8042 init, IRQ 1, decoding (pc-keyboard), lumen.keymap
@@ -1349,13 +1386,14 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/boot.rs      Limine requests
   src/cmdline.rs   kernel command line (flags, key=value)
   src/sync.rs      SpinLock (interrupts off while held)
-  src/klog.rs      logger (levels, subsystem tags, serial timestamps)
+  src/klog.rs      logger (levels, subsystem tags, serial timestamps, the ring dmesg reads)
+  src/rtc.rs       the CMOS RTC: date and time (UTC) for `date`
   src/fb.rs        framebuffer: pixels, glyphs, the hello screen, the crash screen
   src/term.rs      the terminal on the framebuffer (lumen-term): drawing changed cells, log lines, the cursor
   src/symbols.rs   kernel symbol table (symbolized crash reports)
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
-  src/shell/       the shells (lumen-shell): serial and the screen's consoles, the commands, deliberate faults (crash.rs)
+  src/shell/       the shells (lumen-shell): serial and the screen's consoles, the commands, system commands (sysinfo.rs), deliberate faults (crash.rs)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
 crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, ...)

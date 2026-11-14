@@ -503,3 +503,10 @@ def test_each_run_records_its_environment(tmp_path, monkeypatch, accel):
         f"ovmf: custom, LUMEN_OVMF_CODE=/x/CODE.fd, custom vars LUMEN_OVMF_VARS={vars_template}",
     ]
     assert f"-accel {accel} " in (tmp_path / "run/cmdline.txt").read_text()
+
+
+def test_rtc_keeps_utc():
+    # The shell's `date` says UTC; test_date_matches_host compares it with
+    # the host's clock in UTC.
+    args = qemu_args(opts())
+    assert args[args.index("-rtc") + 1] == "base=utc"

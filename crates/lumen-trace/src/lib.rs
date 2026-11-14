@@ -51,6 +51,9 @@
 
 use core::sync::atomic::{AtomicU64, Ordering, fence};
 
+pub mod text;
+pub use text::TextRing;
+
 /// One trace event as recorded.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Event {

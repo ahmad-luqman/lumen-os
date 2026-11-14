@@ -21,12 +21,15 @@
 //! `lumen.log=<level>` on the command line (default `info`).
 //!
 //! Every emitted line also records a `Log` event in the trace ring
-//! (`crate::trace`); recording it doesn't change the printed line.
+//! (`crate::trace`); recording it doesn't change the printed line. The
+//! lines as printed on serial are also kept, the newest [`RING_BYTES`] of
+//! them, for the shell's `dmesg` ([`copy_recent`]).
 
 use crate::arch::serial;
 use crate::sync::SpinLock;
 use core::fmt::{self, Write};
 use log::{Level, LevelFilter, Log, Metadata, Record};
+use lumen_trace::TextRing;
 
 struct KernelLogger;
 
@@ -35,6 +38,20 @@ static LOGGER: KernelLogger = KernelLogger;
 /// never interleave, and two CPUs never burst into the UART's FIFO at once
 /// (`serial::burst_bytes`).
 static LINE_LOCK: SpinLock<()> = SpinLock::new(());
+
+/// How many bytes of log lines [`RING`] keeps.
+pub const RING_BYTES: usize = 16 * 1024;
+/// The newest log lines, as printed on serial. Written only by the logger,
+/// under the line lock; its own lock is a leaf (never held while taking
+/// another), so [`copy_recent`] needn't take the line lock.
+static RING: SpinLock<TextRing<RING_BYTES>> = SpinLock::new(TextRing::new());
+
+/// Copy the newest whole log lines into `out` (as many as fit, oldest
+/// first), as serial printed them; returns the bytes copied. Never
+/// allocates (the caller makes `out`).
+pub fn copy_recent(out: &mut [u8]) -> usize {
+    RING.lock().copy_lines(out)
+}
 
 /// Run `f` holding the log's line lock, so no log line (or other serial
 /// write) lands in the middle of what it does. `f` must not re-take it: no
@@ -65,6 +82,18 @@ impl Write for LockedSerial {
 /// Bursts to serial; only made where the line lock is held.
 struct Burst;
 
+/// Bursts to serial and keeps a copy in [`RING`]; only made where the line
+/// lock is held.
+struct Kept;
+
+impl Write for Kept {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        RING.lock().push(s.as_bytes());
+        burst_held(s.as_bytes());
+        Ok(())
+    }
+}
+
 impl Write for Burst {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         burst_held(s.as_bytes());
@@ -94,7 +123,7 @@ impl Log for KernelLogger {
         let _line = LINE_LOCK.lock();
         // Under the line lock: lines come out in the order of their stamps.
         let stamp = lumen_time::Stamp(crate::time::since_boot_ns());
-        let _ = writeln!(Burst, "{stamp} {:<5} {}: {}", record.level(), tag, record.args());
+        let _ = writeln!(Kept, "{stamp} {:<5} {}: {}", record.level(), tag, record.args());
         if record.level() <= Level::Info {
             crate::term::console_log(record.level(), tag, record.args());
         }
@@ -135,6 +164,27 @@ crate::ktest!(
         crate::kassert_eq!(tag_for("boot"), "boot");
         crate::kassert_eq!(parse_level("debug"), Some(LevelFilter::Debug));
         crate::kassert_eq!(parse_level("loud"), None);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn log_lines_are_kept_for_dmesg() {
+        // A line logged is in the ring as serial printed it (timestamp,
+        // level, tag, message), the newest last; a small buffer gets the
+        // newest whole lines only.
+        use crate::kassert;
+        log::info!(target: "klogtest", "kept for dmesg");
+        let mut out = alloc::vec![0; RING_BYTES];
+        let n = copy_recent(&mut out);
+        let text = core::str::from_utf8(&out[..n]).map_err(|_| "the ring isn't UTF-8")?;
+        let last = text.lines().last().ok_or("the ring is empty")?;
+        kassert!(last.starts_with('[') && last.ends_with("] INFO  klogtest: kept for dmesg"));
+        let mut small = [0u8; 80];
+        let n = copy_recent(&mut small);
+        let tail = core::str::from_utf8(&small[..n]).map_err(|_| "a cut line")?;
+        kassert!(tail.ends_with("klogtest: kept for dmesg\n"));
+        kassert!(n <= small.len());
         Ok(())
     }
 );

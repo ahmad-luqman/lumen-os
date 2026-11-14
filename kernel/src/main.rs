@@ -37,6 +37,7 @@ mod keyboard;
 mod klog;
 mod ktest;
 mod mm;
+mod rtc;
 mod sched;
 mod shell;
 mod smp;

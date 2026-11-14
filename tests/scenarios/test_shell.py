@@ -170,3 +170,103 @@ def test_serial_takes_escape_codes_with_lumen_ansi(boot):
     m.expect(re.compile(r"\x1b\[48;5;16m.*colors: done\n", re.DOTALL), 10)
     m.send_line("clear")
     m.expect(r"clear\n\x1b\[H\x1b\[2J\x1b\[3J" + PROMPT, 10)
+
+
+def test_system_commands(boot):
+    # Each system command prints its header and at least one row, on serial
+    # in plain text; under -smp 2 both CPUs are listed, the keyboard's input
+    # (GSI 1) is decoded as routed and unmasked, the timer's vector counts.
+    m = boot("qemutest", extra=["-smp", "2"])
+    m.expect(SHELLS, 60)
+    m.expect(PROMPT, 60)
+    start = len(m.output)
+    out = run(m, "help")
+    assert out.startswith("commands:\n")
+    for name in ("cpus", "mem", "irqs", "dmesg", "date", "top"):
+        assert re.search(rf"^  {name} ", out, re.MULTILINE), name
+
+    out = run(m, "cpus")
+    assert out.startswith("cpus: 2 online\n  cpu  apic  scheduler"), out
+    rows = re.findall(r"^\s+(\d)\s+\d+\s+running\s+(\d+)\s+(\d+)%\s+(\d+)$", out, re.MULTILINE)
+    assert [r[0] for r in rows] == ["0", "1"], out
+    assert all(
+        int(ticks) > 0 and 0 <= int(busy) <= 100 and int(n) >= 1 for _, ticks, busy, n in rows
+    )
+
+    out = run(m, "mem")
+    assert out.startswith("mem: "), out
+    assert re.search(
+        r"^  frames  [\d.]+ [KMG]iB of [\d.]+ [KMG]iB used \(\d+ frames of \d+ free", out, re.M
+    ), out
+    assert re.search(r"^  heap    .* used in \d+ allocations, .* free$", out, re.MULTILINE), out
+    assert re.search(r"^  stacks  \d+ \(.*\): .*\d+ thread", out, re.MULTILINE), out
+
+    out = run(m, "irqs")
+    assert re.match(r"irqs: \d+ I/O APIC inputs", out), out
+    assert re.search(
+        r"^\s+1\s+0x51\s+Fixed\s+edge\s+high\s+0\s+unmasked\s+\d+$", out, re.MULTILINE
+    ), out
+    timer = re.search(r"^\s+0x40\s+local APIC timer\s+(\d+)$", out, re.MULTILINE)
+    assert timer and int(timer[1]) > 0, out
+
+    out = run(m, "dmesg")
+    assert re.match(r"dmesg: the newest \d+ log lines\n", out), out
+    assert re.search(
+        r"^\[\s*\d+\.\d{6}\] INFO  shell: shells on serial and the screen", out, re.M
+    ), out
+
+    out = run(m, "trace 4")
+    assert re.search(r"^trace: \d+ events claimed, \d+ dropped$", out, re.MULTILINE), out
+    assert len(out.splitlines()) >= 2, out
+
+    assert re.fullmatch(r"uptime: \d+ ns\n", run(m, "uptime"))
+    assert re.fullmatch(r"date: \d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC\n", run(m, "date"))
+    assert run(m, "clear").startswith("clear: this console is plain text")
+    listed = [line.split(maxsplit=1)[1] for line in run(m, "history").splitlines()]
+    assert listed[:3] == ["help", "cpus", "mem"] and listed[-1] == "history", listed
+    assert "\x1b" not in m.output[start:]
+
+
+def test_date_matches_host(boot):
+    # `date` reads the RTC, which QEMU keeps in UTC (`-rtc base=utc`) from
+    # the host's clock: within 2 s of the host's time while it ran. The RTC
+    # counts whole seconds, and QEMU's ticks on a phase of its own: measured
+    # here it reads 1 to 2 s behind the host, so at most 2 s behind the
+    # host's whole seconds when the command was sent.
+    from datetime import UTC, datetime
+
+    m = shells(boot)
+    for _ in range(3):
+        before = datetime.now(UTC).replace(microsecond=0)
+        out = run(m, "date")
+        after = datetime.now(UTC)
+        found = re.fullmatch(r"date: (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) UTC\n", out)
+        assert found, out
+        rtc = datetime.strptime(found[1], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+        assert -2 <= (rtc - before).total_seconds() and rtc <= after, (before, rtc, after)
+
+
+def test_top_refreshes_and_quits(boot):
+    # On plain serial, `top` prints a frame a second as lines (the CPUs and
+    # how busy, interrupt rates, the heap, the threads), until `q`.
+    m = shells(boot)
+    start = len(m.output)
+    m.send_line("top")
+    first = m.expect(r"top: frame 1, up (\d+)\.\d s, \d+ CPUs; q quits\n", 15)
+    second = m.expect(r"top: frame 2, up (\d+)\.\d s, \d+ CPUs; q quits\n", 15)
+    assert int(second[1]) >= int(first[1])
+    frame = m.output[first.end() : second.start()]
+    assert re.search(r"^\s+0\s+\d+%\s+\d+$", frame, re.MULTILINE), frame
+    assert re.search(r"^  irqs/s: .*local APIC timer \d+", frame, re.MULTILINE), frame
+    assert re.search(r"^  heap .* used of .* in \d+ allocations; frames ", frame, re.MULTILINE), (
+        frame
+    )
+    assert re.search(r"^  main\s+\d+\s+0\s+\w+\s+\d+%$", frame, re.MULTILINE), frame
+    assert re.search(r"^  shell-screen\s+\d+\s+0\s+\w+\s+\d+%$", frame, re.MULTILINE), frame
+    m.send("q")
+    m.expect(r"top: quit after \d+ frames\n" + PROMPT, 10)
+    # It stopped: no frame after the prompt.
+    end = len(m.output)
+    assert run(m, "echo still here") == "still here\n"
+    assert "top: frame" not in m.output[end:]
+    assert "\x1b" not in m.output[start:]

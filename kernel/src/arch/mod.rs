@@ -9,7 +9,7 @@ mod x86_64;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)] // the HAL surface is wider than the kernel uses yet
 pub use self::x86_64::{
-    apic, context,
+    apic, cmos, context,
     cpu::{
         apic_id, enter_kernel_space, halt_forever, rdtsc, read_cr0, read_cr2, read_cr3, read_cr4, read_rbp, read_rsp,
         switch_stack,
