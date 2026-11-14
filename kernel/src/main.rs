@@ -43,6 +43,7 @@ mod sched;
 mod smp;
 mod symbols;
 mod sync;
+mod term;
 mod time;
 mod trace;
 

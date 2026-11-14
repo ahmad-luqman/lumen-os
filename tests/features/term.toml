@@ -1,0 +1,28 @@
+# Features: term. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Terminal emulator core (lumen-term, vte and unicode-width linked, audit passing): escape sequences into a cell grid (16, 256 and truecolor SGR, cursor movement and save/restore, erase, insert/delete, scroll regions, tabs, autowrap), wide characters, malformed input ignored, a scrollback ring, damage a renderer can draw from alone; writing never allocates"
+milestone = "M2"
+tests = [
+    "cargo:lumen-term",
+    "audit:flags",
+]
+
+[[feature]]
+name = "The terminal on the framebuffer: kmon's output and echo on screen (escapes kept off serial), a colour test pattern, log lines coloured by level, only changed cells drawn (a scroll moves pixels), a blinking cursor"
+milestone = "M2"
+tests = [
+    "scenario:test_term::test_ansi_colours_golden",
+    "ktest:lumen_kernel::term::log_lines_are_coloured_by_level",
+    "ktest:lumen_kernel::term::only_changed_cells_are_drawn",
+    "ktest:lumen_kernel::term::the_cursor_blinks",
+    "scenario:test_screen::test_boot_hello_golden",
+]
+
+[[feature]]
+name = "Scrollback on screen: Shift+PageUp/PageDown scroll the view half a screen, output keeps it on its lines, typing returns it"
+milestone = "M2"
+tests = [
+    "scenario:test_term::test_scrollback",
+    "ktest:lumen_kernel::keyboard::other_keys_come_with_the_shift_state",
+]

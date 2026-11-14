@@ -396,7 +396,7 @@ fn unexpected(frame: &TrapFrame) {
 /// spurious interrupts are counted, not traced (at 1 kHz they would flood
 /// the trace ring), and the timer drives the scheduler (`sched::tick`, which
 /// may switch to another thread and return here only when this one runs
-/// again); a local APIC error is counted and logged with its status (on the
+/// again) and, on the boot CPU, the terminal's cursor (`term::on_tick`); a local APIC error is counted and logged with its status (on the
 /// 1st, 2nd, 4th, 8th... one, and whenever a new status bit appears);
 /// an I/O APIC vector runs its handler ([`set_irq_handler`]; one with none
 /// is unexpected); anything else is traced, counted and warned about once
@@ -416,10 +416,14 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
     }
     match vector as u8 {
         TIMER => {
-            TICKS[super::percpu::index()].fetch_add(1, Ordering::Relaxed);
+            let cpu = super::percpu::index();
+            let tick = TICKS[cpu].fetch_add(1, Ordering::Relaxed) + 1;
             // Before the scheduler may switch threads: the next tick must be
             // able to arrive on whatever runs next.
             super::apic::eoi();
+            if cpu == 0 {
+                crate::term::on_tick(tick);
+            }
             crate::sched::tick();
         }
         SPURIOUS => {

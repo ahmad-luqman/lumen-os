@@ -138,9 +138,10 @@ own PR that updates that doc first.
   `arch/x86_64/`: GDT/TSS (per CPU), IDT, entry
   stubs and the vector map, `percpu.rs` (GS base, CPU index), `irq.rs` (nested interrupt disable), local and
   I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
-  reporter. `ktest.rs`: test runner. `kmon.rs`: serial debug monitor, typed on serial or the keyboard (until
-  the M2 shell). `fb.rs`:
-  framebuffer and console. `klog.rs`: logger. `symbols.rs`: symbol lookup.
+  reporter. `ktest.rs`: test runner. `kmon.rs`: debug monitor, typed on serial or the keyboard,
+  answering on serial and the screen (until the M2 shell). `fb.rs`:
+  framebuffer pixels, the header and the crash screen. `term.rs`: the
+  terminal on the framebuffer (log lines, kmon, scrollback). `klog.rs`: logger. `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -171,6 +172,9 @@ own PR that updates that doc first.
   (host-tested).
 - `crates/lumen-queue`: lock-free single-producer, single-consumer byte
   queue (interrupt handler to thread; host-tested, incl. threads).
+- `crates/lumen-term`: terminal emulator core: `vte` escapes into a cell
+  grid, scrollback, damage tracking (host-tested, incl. a randomized model
+  renderer).
 - `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET
   (host-tested on handcrafted tables).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
