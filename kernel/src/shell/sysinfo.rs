@@ -297,7 +297,8 @@ crate::ktest!(
         use crate::kassert;
         let history = lumen_shell::History::new(0);
         let mut console = super::Captured::default();
-        top(&mut Ctx { out: &mut console, ansi: false, history: &history }, &[String::from("1")]);
+        top(&mut Ctx::new(&mut console, false, &history), &[String::from("1")]);
+        kassert!(!console.ran_dry);
         let text = console.text;
         crate::ktest::diag(format_args!("{}", text.lines().next().unwrap_or("")));
         kassert!(text.starts_with("top: frame 1, up "));
@@ -307,7 +308,8 @@ crate::ktest!(
         kassert!(!text.contains('\x1b'));
         let mut console = super::Captured::default();
         console.keys.push_back(Key::Char('q'));
-        top(&mut Ctx { out: &mut console, ansi: false, history: &history }, &[]);
+        top(&mut Ctx::new(&mut console, false, &history), &[]);
+        kassert!(!console.ran_dry);
         kassert!(console.text == "top: quit after 0 frames\n");
         Ok(())
     }
@@ -322,7 +324,7 @@ crate::ktest!(
             [("cpus", cpus), ("mem", mem), ("irqs", irqs), ("dmesg", dmesg), ("date", date)];
         for (name, run) in commands {
             let mut console = super::Captured::default();
-            run(&mut Ctx { out: &mut console, ansi: false, history: &history }, &[]);
+            run(&mut Ctx::new(&mut console, false, &history), &[]);
             let mut lines = console.text.lines();
             let header = lines.next().unwrap_or("");
             let rows = lines.count();

@@ -27,6 +27,7 @@ mod sysinfo;
 
 use crate::arch::serial;
 use crate::keyboard::{self, KeyCode};
+use crate::term;
 use alloc::string::String;
 use core::fmt::{self, Write};
 use lumen_shell::input::Decoder;
@@ -43,25 +44,52 @@ const HISTORY: usize = 100;
 /// shorter than it: the editor doesn't wrap).
 const SERIAL_COLUMNS: usize = 80;
 
-/// What a command can use: its console and the shell's history.
+/// What a command can use: its console (output, and keys through
+/// [`Ctx::poll_key`]/[`Ctx::wait_key`]), the screen's pixels
+/// ([`Ctx::canvas`]) and the shell's history.
 pub struct Ctx<'a> {
     /// The console. On the screen a `write!` is formatted under the screen's
     /// lock, so what it formats must not allocate (arguments that allocate,
-    /// like a `join`, are made before the call).
+    /// like a `join`, are made before the call). While a command holds the
+    /// canvas (`term::status().paused`), screen output reaches the terminal
+    /// but isn't drawn.
     pub out: &'a mut dyn Console,
     /// Whether the console takes escape codes.
     pub ansi: bool,
     pub history: &'a History,
+    /// Who holds a canvas this command takes: a new owner for each command
+    /// (`commands::run`), so the shell takes back only its own.
+    owner: term::Owner,
 }
 
-impl Ctx<'_> {
+impl<'a> Ctx<'a> {
+    /// A context for running commands on `out` (each run gets its own
+    /// canvas owner).
+    pub fn new(out: &'a mut dyn Console, ansi: bool, history: &'a History) -> Ctx<'a> {
+        Ctx { out, ansi, history, owner: term::Owner::new() }
+    }
+
+    /// Take the screen's pixels for this command (see `term::Canvas`; drop
+    /// it before returning: the shell takes back one left behind).
+    #[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
+    pub fn canvas(&self) -> Result<term::Canvas, term::CanvasError> {
+        term::canvas(self.owner)
+    }
+
     /// The next key typed on this console, if one is waiting (never
     /// blocks): for a command that runs until a key (`q`, Ctrl-C) stops it.
+    /// On the screen, Shift+PageUp/PageDown still scroll the terminal and
+    /// aren't returned, and keys the line editor doesn't take (Esc, F1) are
+    /// dropped. Keys typed ahead for the next line are taken too. While a
+    /// command holds the canvas, Shift+PageUp/PageDown do nothing (the view
+    /// stays where it was).
     pub fn poll_key(&mut self) -> Option<Key> {
         self.out.try_key()
     }
 
-    /// Wait for the next key typed on this console.
+    /// Wait for the next key typed on this console (see [`Self::poll_key`]):
+    /// on the screen the thread sleeps until IRQ 1; on serial it polls,
+    /// yielding to the CPU's other threads.
     #[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
     pub fn wait_key(&mut self) -> Key {
         self.out.read_key()
@@ -136,7 +164,7 @@ fn run_on(mut console: impl Console, mut editor: Editor) -> ! {
             }
         };
         if let Some(line) = line {
-            commands::run(&line, &mut Ctx { out: &mut console, ansi, history: editor.history() });
+            commands::run(&line, &mut Ctx::new(&mut console, ansi, editor.history()));
         }
     }
 }
@@ -206,21 +234,25 @@ impl Write for Screen {
 }
 
 impl Screen {
-    /// The line editor's key for `key`, after Shift+PageUp/PageDown (which
-    /// scroll the screen) and keys it doesn't take; one it takes shows the
-    /// screen again.
+    /// A key from the keyboard: Shift+PageUp/PageDown scroll the screen and
+    /// give `None`, as does a key the line editor doesn't take; any other
+    /// brings the view back to the bottom and is the editor's key.
     fn take(key: keyboard::Key) -> Option<Key> {
         match key {
-            keyboard::Key::Raw { code: KeyCode::PageUp, shift: true } => crate::term::scroll_half_pages(1),
-            keyboard::Key::Raw { code: KeyCode::PageDown, shift: true } => crate::term::scroll_half_pages(-1),
+            keyboard::Key::Raw { code: KeyCode::PageUp, shift: true } => {
+                crate::term::scroll_half_pages(1);
+                None
+            }
+            keyboard::Key::Raw { code: KeyCode::PageDown, shift: true } => {
+                crate::term::scroll_half_pages(-1);
+                None
+            }
             _ => {
-                if let Some(key) = screen_key(key) {
-                    crate::term::reset_view();
-                    return Some(key);
-                }
+                let key = screen_key(key)?;
+                crate::term::reset_view();
+                Some(key)
             }
         }
-        None
     }
 }
 
@@ -243,13 +275,30 @@ impl Console for Screen {
     }
 }
 
-/// A console for the tests: what is written to it, and keys typed on it
-/// (`read_key` with none left is Ctrl-C).
+/// A console for the tests: what is written to it, and keys typed on it.
+/// With none left, `read_key` is Ctrl-C, and so is `try_key` after
+/// [`Captured::DRY_POLLS`] polls in a row found none (a command polling for
+/// a key ends instead of spinning); both set `ran_dry`, which a test that
+/// meant its own keys to stop a command checks stayed false.
 #[cfg(feature = "ktest")]
 #[derive(Default)]
 pub struct Captured {
     pub text: String,
     pub keys: alloc::collections::VecDeque<Key>,
+    pub ran_dry: bool,
+    /// Polls in a row that found no key.
+    empty_polls: u32,
+}
+
+#[cfg(feature = "ktest")]
+impl Captured {
+    pub const DRY_POLLS: u32 = 100_000;
+
+    /// Ctrl-C, noting the keys ran out.
+    fn dry(&mut self) -> Key {
+        self.ran_dry = true;
+        Key::Ctrl('c')
+    }
 }
 
 #[cfg(feature = "ktest")]
@@ -263,11 +312,17 @@ impl Write for Captured {
 #[cfg(feature = "ktest")]
 impl Console for Captured {
     fn read_key(&mut self) -> Key {
-        self.keys.pop_front().unwrap_or(Key::Ctrl('c'))
+        self.keys.pop_front().unwrap_or_else(|| self.dry())
     }
 
     fn try_key(&mut self) -> Option<Key> {
-        self.keys.pop_front()
+        let key = self.keys.pop_front();
+        self.empty_polls = if key.is_some() { 0 } else { self.empty_polls + 1 };
+        if self.empty_polls >= Self::DRY_POLLS {
+            self.empty_polls = 0;
+            return Some(self.dry());
+        }
+        key
     }
 }
 

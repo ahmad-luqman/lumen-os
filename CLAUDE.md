@@ -140,10 +140,13 @@ own PR that updates that doc first.
   stubs and the vector map, `percpu.rs` (GS base, CPU index), `irq.rs` (nested interrupt disable), local and
   I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
   reporter. `ktest.rs`: test runner. `shell/`: the shells, one on serial
-  (plain text unless `lumen.ansi`) and one on the screen (keyboard), their
-  commands (`commands.rs`, the system ones in `sysinfo.rs`) and deliberate faults (`crash.rs`). `fb.rs`:
+  (plain text unless `lumen.ansi`) and one on the screen (keyboard): `mod.rs`
+  the consoles and `Ctx` (keys through `poll_key`/`wait_key`, the screen
+  through `canvas`), their commands (`commands.rs`: each row carries its
+  help line; the system ones in `sysinfo.rs`) and deliberate faults (`crash.rs`). `fb.rs`:
   framebuffer pixels, the header and the crash screen. `term.rs`: the
-  terminal on the framebuffer (log lines, the screen's shell, scrollback, `view_text`). `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`). `symbols.rs`: symbol lookup.
+  terminal on the framebuffer (log lines, the screen's shell, scrollback, `view_text`, and
+  `Canvas`: the pixels below the header for one command, the terminal paused meanwhile). `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -179,7 +182,8 @@ own PR that updates that doc first.
   renderer).
 - `crates/lumen-shell`: shell core: word splitting with quotes (checked
   against `shlex`), the line editor (history, completion; ANSI and plain
-  output), the command table, serial bytes to keys (host-tested).
+  output), the command table (names, completion words, usage and help
+  lines), serial bytes to keys (host-tested).
 - `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET
   (host-tested on handcrafted tables).
 - `crates/lumen-uart`: 16550 UART logic: presence probe (scratch or
