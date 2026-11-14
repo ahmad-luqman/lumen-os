@@ -2,12 +2,18 @@ use crate::Complete;
 use alloc::string::{String, ToString};
 
 /// A command: its name, the words each of its arguments can be (for
-/// completion; an empty list completes nothing there), and what runs it.
+/// completion; an empty list completes nothing there), its help, and what
+/// runs it.
 #[derive(Debug)]
 pub struct Command<T: 'static> {
     pub name: &'static str,
     /// For each argument in turn, the words it can be.
     pub args: &'static [&'static [&'static str]],
+    /// Its arguments, as help shows them after the name (`<n> [text]`; empty
+    /// for none).
+    pub usage: &'static str,
+    /// What it does, in a line.
+    pub about: &'static str,
     pub run: T,
 }
 

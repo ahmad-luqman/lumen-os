@@ -52,16 +52,20 @@ impl Framebuffer {
     ///
     /// # Safety
     /// The two handles must never draw at the same time.
-    unsafe fn alias(&self) -> Framebuffer {
+    pub(crate) unsafe fn alias(&self) -> Framebuffer {
         Framebuffer { ..*self }
     }
 
-    fn encode(&self, rgb: u32) -> u32 {
+    pub(crate) fn encode(&self, rgb: u32) -> u32 {
         let (r, g, b) = ((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
         (r << self.red_shift) | (g << self.green_shift) | (b << self.blue_shift)
     }
 
-    fn put(&mut self, x: usize, y: usize, rgb: u32) {
+    /// Set one pixel (nothing outside the framebuffer). Takes `&self`:
+    /// the pixels are plain memory written with volatile stores, so
+    /// handles drawing disjoint pixels at once (the terminal's
+    /// `term::Canvas` on several CPUs) can't hurt each other.
+    pub fn put(&self, x: usize, y: usize, rgb: u32) {
         if x < self.width && y < self.height {
             let px = self.encode(rgb);
             // SAFETY: (x, y) is inside the framebuffer and pixels are 32-bit.
@@ -69,7 +73,7 @@ impl Framebuffer {
         }
     }
 
-    pub fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, rgb: u32) {
+    pub fn fill_rect(&self, x: usize, y: usize, w: usize, h: usize, rgb: u32) {
         for yy in y..(y + h).min(self.height) {
             for xx in x..(x + w).min(self.width) {
                 self.put(xx, yy, rgb);
@@ -79,7 +83,7 @@ impl Framebuffer {
 
     /// Draw one glyph (`?` for one the font lacks); returns its advance
     /// width.
-    fn glyph(&mut self, x: usize, y: usize, c: char, st: Style) -> usize {
+    fn glyph(&self, x: usize, y: usize, c: char, st: Style) -> usize {
         self.glyph_clipped(x, y, c, st, usize::MAX)
     }
 
@@ -107,7 +111,7 @@ impl Framebuffer {
 
     /// Draw one glyph (`?` for one the font lacks), at most `max_w` pixels
     /// of it wide; returns its advance in pixels, clipped to `max_w`.
-    pub fn glyph_clipped(&mut self, x: usize, y: usize, c: char, st: Style, max_w: usize) -> usize {
+    pub fn glyph_clipped(&self, x: usize, y: usize, c: char, st: Style, max_w: usize) -> usize {
         let raster = get_raster(c, st.weight, st.size).or_else(|| get_raster('?', st.weight, st.size));
         let Some(raster) = raster else { return get_raster_width(st.weight, st.size).min(max_w) };
         for (dy, row) in raster.rows().enumerate() {
@@ -118,11 +122,13 @@ impl Framebuffer {
         raster.width().min(max_w)
     }
 
-    fn text(&mut self, x: usize, y: usize, s: &str, st: Style) {
+    /// Draw `s` from (`x`, `y`); returns its width in pixels.
+    pub fn text(&self, x: usize, y: usize, s: &str, st: Style) -> usize {
         let mut cx = x;
         for c in s.chars() {
             cx += self.glyph(cx, y, c, st);
         }
+        cx - x
     }
 
     /// Move pixel rows `[from, from+len)` to `[to, to+len)`, up or down (for
@@ -264,7 +270,7 @@ pub fn init(fb: &limine::framebuffer::Framebuffer<'_>) -> Result<(usize, usize),
     if fb.pitch() < fb.width() * 4 {
         return Err(Unusable::Pitch { pitch: fb.pitch(), width: fb.width() });
     }
-    let mut f = Framebuffer {
+    let f = Framebuffer {
         base: fb.addr(),
         width: fb.width() as usize,
         height: fb.height() as usize,

@@ -47,16 +47,32 @@ pub struct Ctx<'a> {
     /// The console. On the screen a `write!` is formatted under the screen's
     /// lock, so what it formats must not allocate (arguments that allocate,
     /// like a `join`, are made before the call).
-    pub out: &'a mut dyn Write,
+    pub out: &'a mut dyn Console,
     /// Whether the console takes escape codes.
     pub ansi: bool,
     pub history: &'a History,
 }
 
+#[allow(dead_code, reason = "the first users are `top`, the demos and scripts (#63, #67, #68)")]
+impl Ctx<'_> {
+    /// The next key typed on this console, if one is waiting (never
+    /// blocks): for a command that runs until a key (`q`, Ctrl-C) stops it.
+    pub fn poll_key(&mut self) -> Option<Key> {
+        self.out.try_key()
+    }
+
+    /// Wait for the next key typed on this console.
+    pub fn wait_key(&mut self) -> Key {
+        self.out.read_key()
+    }
+}
+
 /// A console a shell runs on.
-trait Console: Write {
+pub trait Console: Write {
     /// Wait for the next key.
     fn read_key(&mut self) -> Key;
+    /// The next key, if one is waiting (never blocks).
+    fn try_key(&mut self) -> Option<Key>;
 }
 
 /// Start the screen shell (if there is a terminal and a keyboard), then run
@@ -152,17 +168,22 @@ impl Write for Serial {
 impl Console for Serial {
     fn read_key(&mut self) -> Key {
         loop {
-            match serial::try_read_byte() {
-                Some(byte) => {
-                    if let Some(key) = self.decoder.feed(byte) {
-                        return key;
-                    }
-                }
-                // Let the CPU's other threads run (the screen shell, woken by
-                // a key, among them).
-                None => crate::sched::yield_now(),
+            if let Some(key) = self.try_key() {
+                return key;
+            }
+            // Let the CPU's other threads run (the screen shell, woken by a
+            // key, among them).
+            crate::sched::yield_now();
+        }
+    }
+
+    fn try_key(&mut self) -> Option<Key> {
+        while let Some(byte) = serial::try_read_byte() {
+            if let Some(key) = self.decoder.feed(byte) {
+                return Some(key);
             }
         }
+        None
     }
 }
 
@@ -183,21 +204,69 @@ impl Write for Screen {
     }
 }
 
-impl Console for Screen {
-    fn read_key(&mut self) -> Key {
-        loop {
-            let key = keyboard::wait_key();
-            match key {
-                keyboard::Key::Raw { code: KeyCode::PageUp, shift: true } => crate::term::scroll_half_pages(1),
-                keyboard::Key::Raw { code: KeyCode::PageDown, shift: true } => crate::term::scroll_half_pages(-1),
-                _ => {
-                    if let Some(key) = screen_key(key) {
-                        crate::term::reset_view();
-                        return key;
-                    }
+impl Screen {
+    /// The line editor's key for `key`, after Shift+PageUp/PageDown (which
+    /// scroll the screen) and keys it doesn't take; one it takes shows the
+    /// screen again.
+    fn take(key: keyboard::Key) -> Option<Key> {
+        match key {
+            keyboard::Key::Raw { code: KeyCode::PageUp, shift: true } => crate::term::scroll_half_pages(1),
+            keyboard::Key::Raw { code: KeyCode::PageDown, shift: true } => crate::term::scroll_half_pages(-1),
+            _ => {
+                if let Some(key) = screen_key(key) {
+                    crate::term::reset_view();
+                    return Some(key);
                 }
             }
         }
+        None
+    }
+}
+
+impl Console for Screen {
+    fn read_key(&mut self) -> Key {
+        loop {
+            if let Some(key) = Self::take(keyboard::wait_key()) {
+                return key;
+            }
+        }
+    }
+
+    fn try_key(&mut self) -> Option<Key> {
+        while let Some(key) = keyboard::read_key() {
+            if let Some(key) = Self::take(key) {
+                return Some(key);
+            }
+        }
+        None
+    }
+}
+
+/// A console for the tests: what is written to it, and keys typed on it
+/// (`read_key` with none left is Ctrl-C).
+#[cfg(feature = "ktest")]
+#[derive(Default)]
+pub struct Captured {
+    pub text: String,
+    pub keys: alloc::collections::VecDeque<Key>,
+}
+
+#[cfg(feature = "ktest")]
+impl Write for Captured {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.text.push_str(s);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ktest")]
+impl Console for Captured {
+    fn read_key(&mut self) -> Key {
+        self.keys.pop_front().unwrap_or(Key::Ctrl('c'))
+    }
+
+    fn try_key(&mut self) -> Option<Key> {
+        self.keys.pop_front()
     }
 }
 

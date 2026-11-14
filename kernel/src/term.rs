@@ -16,6 +16,10 @@
 //! arguments of a log line (formatted under the lock) and of
 //! [`write_fmt`] must not allocate either.
 //!
+//! A command can take the pixels below the header for itself ([`canvas`]):
+//! the terminal then keeps taking output but draws none of it until the
+//! [`Canvas`] is dropped, which draws the whole terminal again.
+//!
 //! The terminal takes `\n` as a line feed only: [`write_str`], [`write_fmt`]
 //! and log lines turn it into CR LF.
 
@@ -54,6 +58,8 @@ struct Screen {
     /// Cells drawn so far (the shell's `term` shows it; the tests count redraws
     /// with it).
     cells_drawn: u64,
+    /// A [`Canvas`] has the pixels: draw nothing.
+    paused: bool,
 }
 
 static SCREEN: SpinLock<Option<Screen>> = SpinLock::new(None);
@@ -79,7 +85,8 @@ pub fn init(fb: Framebuffer) {
     // Allocated here, before taking the lock (see the module comment).
     let term = Terminal::new(cols, rows, SCROLLBACK);
     let shadow = vec![Cell::BLANK; cols * rows];
-    let screen = Screen { fb, term, shadow, x0, y0, cell_w, cursor_drawn: None, blink_on: true, cells_drawn: 0 };
+    let screen =
+        Screen { fb, term, shadow, x0, y0, cell_w, cursor_drawn: None, blink_on: true, cells_drawn: 0, paused: false };
     *SCREEN.lock() = Some(screen);
     log::info!(target: "term", "terminal {cols}x{rows}, {SCROLLBACK} lines of scrollback");
 }
@@ -162,8 +169,12 @@ impl Screen {
         NEXT_BLINK.store(crate::time::ticks() + BLINK_TICKS, Ordering::Relaxed);
     }
 
-    /// Draw what changed since the last time.
+    /// Draw what changed since the last time (nothing while a [`Canvas`]
+    /// has the pixels: what changed stays marked for [`Self::resume`]).
     fn render(&mut self) {
+        if self.paused {
+            return;
+        }
         let cols = self.term.cols();
         // Take the cursor off first, as the shadow has the cell (the
         // terminal may already hold other cells there, before the scroll
@@ -226,6 +237,127 @@ impl Screen {
             }
         }
         self.cells_drawn += 1;
+    }
+}
+
+impl Screen {
+    /// A [`Canvas`] gave the pixels back: clear what it drew (everything
+    /// below the header) and draw every cell of the terminal again.
+    #[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
+    fn resume(&mut self) {
+        self.paused = false;
+        let (w, h) = (self.fb.width(), self.fb.height());
+        self.fb.fill_rect(0, fb::CONSOLE_TOP, w, h.saturating_sub(fb::CONSOLE_TOP), fb::BG);
+        // A blank cell draws as the background just filled in.
+        self.shadow.fill(Cell::BLANK);
+        self.cursor_drawn = None;
+        self.term.touch_all();
+        self.render();
+    }
+}
+
+/// The pixels below the header, for a command to draw on (a demo, a
+/// script) while the terminal is paused: output still reaches the terminal
+/// but isn't drawn until the canvas is dropped, which clears what was drawn
+/// and draws the whole terminal again. One at a time.
+///
+/// Coordinates are the canvas's own ((0, 0) is its top-left corner, just
+/// below the header); drawing outside it does nothing. Its methods take
+/// `&self` and it is `Sync`, so several CPUs can draw on it at once (each
+/// its own pixels: two writing one pixel leave one of their colours).
+#[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
+pub struct Canvas {
+    fb: Framebuffer,
+    width: usize,
+    height: usize,
+}
+
+// SAFETY: drawing is volatile 32-bit stores to the framebuffer through
+// `&self` (no state changes); the terminal draws nothing while the canvas
+// exists (`Screen::paused`), so the only other handle drawing at the same
+// time is the crash screen's, after a crash report stopped the terminal.
+unsafe impl Sync for Canvas {}
+
+/// Take the pixels below the header (see [`Canvas`]); `None` without a
+/// terminal, after a crash report started, or while another canvas exists.
+#[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
+pub fn canvas() -> Option<Canvas> {
+    with_screen(|s| {
+        if s.paused {
+            return None;
+        }
+        s.paused = true;
+        // SAFETY: the terminal's handle draws nothing until the canvas is
+        // dropped (`paused`), so the two never draw at the same time.
+        let fb = unsafe { s.fb.alias() };
+        let (width, height) = (fb.width(), fb.height().saturating_sub(fb::CONSOLE_TOP));
+        Some(Canvas { fb, width, height })
+    })
+    .flatten()
+}
+
+#[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
+impl Canvas {
+    /// Width in pixels.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Height in pixels.
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Set the pixel at (`x`, `y`) to `rgb` (`0xRRGGBB`).
+    pub fn put(&self, x: usize, y: usize, rgb: u32) {
+        if x < self.width && y < self.height {
+            self.fb.put(x, y + fb::CONSOLE_TOP, rgb);
+        }
+    }
+
+    /// Fill a rectangle, clipped to the canvas.
+    pub fn fill_rect(&self, x: usize, y: usize, w: usize, h: usize, rgb: u32) {
+        let (w, h) = (w.min(self.width.saturating_sub(x)), h.min(self.height.saturating_sub(y)));
+        self.fb.fill_rect(x, y + fb::CONSOLE_TOP, w, h, rgb);
+    }
+
+    /// Fill the whole canvas.
+    pub fn clear(&self, rgb: u32) {
+        self.fill_rect(0, 0, self.width, self.height, rgb);
+    }
+
+    /// Draw `s` in the terminal's font (16 pixels high) with its top-left
+    /// corner at (`x`, `y`), `fg` on `bg`; returns its width in pixels.
+    /// Glyphs are clipped at the canvas's right edge, not its bottom: keep
+    /// `y` at least 16 pixels above it.
+    pub fn text(&self, x: usize, y: usize, s: &str, fg: u32, bg: u32) -> usize {
+        if y >= self.height {
+            return 0;
+        }
+        let st = Style::new(FontWeight::Regular, fb::CONSOLE_SIZE, fg, bg);
+        let mut cx = x;
+        for c in s.chars() {
+            if cx >= self.width {
+                break;
+            }
+            cx += self.fb.glyph_clipped(cx, y + fb::CONSOLE_TOP, c, st, self.width - cx);
+        }
+        cx - x
+    }
+
+    /// The pixel at (`x`, `y`) as stored (0 outside the canvas; for the
+    /// tests).
+    #[cfg(feature = "ktest")]
+    pub fn pixel(&self, x: usize, y: usize) -> u32 {
+        if x < self.width && y < self.height { self.fb.pixel(x, y + fb::CONSOLE_TOP) } else { 0 }
+    }
+}
+
+impl Drop for Canvas {
+    fn drop(&mut self) {
+        // (Not after a crash report started: the crash screen has the
+        // pixels then.)
+        with_screen(Screen::resume);
     }
 }
 
@@ -663,6 +795,36 @@ crate::ktest!(
         let under = AtomicBool::new(false);
         kassert!(write_fmt(format_args!("{}", LockProbe(&under))));
         kassert!(under.load(Ordering::Relaxed));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_canvas_pauses_the_terminal_until_dropped() {
+        // While a canvas has the pixels there is no second one, and output
+        // reaches the terminal without being drawn; dropping it clears what
+        // it drew and draws the terminal, that output included.
+        use crate::{kassert, kassert_eq};
+        reset_view();
+        let drawn = || status().map(|s| s.cells_drawn).ok_or("no terminal");
+        let corner = || with_screen(|s| s.fb.pixel(0, fb::CONSOLE_TOP)).ok_or("no terminal");
+        let painted = {
+            let c = canvas().ok_or("no terminal")?;
+            kassert!(canvas().is_none());
+            let before = drawn()?;
+            kassert!(write_str("written under a canvas\n"));
+            kassert_eq!(drawn()?, before);
+            c.clear(0x00ff00);
+            corner()?
+        };
+        let (cols, cells, _) = view_cells().ok_or("no terminal")?;
+        kassert!(find_row(cols, &cells, "written under a canvas").is_some());
+        let cleared = corner()?;
+        kassert!(painted != cleared);
+        // The background, as the terminal draws a blank cell.
+        kassert_eq!(cleared, with_screen(|s| s.fb.encode(fb::BG)).ok_or("no terminal")?);
+        // A new canvas can be had again.
+        kassert!(canvas().is_some());
         Ok(())
     }
 );

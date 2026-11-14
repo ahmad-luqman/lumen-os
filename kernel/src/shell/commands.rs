@@ -7,28 +7,59 @@ use super::{Ctx, crash};
 use crate::arch;
 use alloc::string::String;
 use core::arch::asm;
+use core::fmt::Write;
 use lumen_shell::{Command, Table, words};
 
 type Run = fn(&mut Ctx<'_>, &[String]);
 
 pub static COMMANDS: Table<Run> = Table(&[
-    Command { name: "help", args: &[], run: help },
-    Command { name: "echo", args: &[], run: echo },
-    Command { name: "int3", args: &[], run: int3 },
-    Command { name: "crash", args: &[crash::KINDS, &["thread"]], run: crash::run },
-    Command { name: "trace", args: &[], run: trace },
-    Command { name: "heap", args: &[], run: heap },
-    Command { name: "ticks", args: &[], run: ticks },
-    Command { name: "kbd", args: &[], run: kbd },
-    Command { name: "term", args: &[&["text"]], run: term },
-    Command { name: "clear", args: &[], run: clear },
-    Command { name: "colors", args: &[], run: colors },
-    Command { name: "seq", args: &[], run: seq },
-    Command { name: "sleep", args: &[], run: sleep },
-    Command { name: "uptime", args: &[], run: uptime },
-    Command { name: "clocks", args: &[], run: clocks },
-    Command { name: "history", args: &[], run: history },
-    Command { name: "exit", args: &[], run: exit },
+    Command { name: "help", args: &[], usage: "", about: "this list", run: help },
+    Command { name: "echo", args: &[], usage: "<text>", about: "print text", run: echo },
+    Command { name: "int3", args: &[], usage: "", about: "take a breakpoint and continue", run: int3 },
+    Command {
+        name: "crash",
+        args: &[crash::KINDS, &["thread"]],
+        usage: "<kind> [cpu|thread]",
+        about: "deliberate fault (on that CPU, or in a new thread):",
+        run: crash::run,
+    },
+    Command {
+        name: "trace",
+        args: &[],
+        usage: "[n]",
+        about: "the boot CPU's last n trace events (default 16)",
+        run: trace,
+    },
+    Command { name: "heap", args: &[], usage: "", about: "heap usage and free-list summary", run: heap },
+    Command {
+        name: "ticks",
+        args: &[],
+        usage: "",
+        about: "the boot CPU's timer interrupts (and stray ones)",
+        run: ticks,
+    },
+    Command { name: "kbd", args: &[], usage: "", about: "the keyboard's layout and interrupts", run: kbd },
+    Command {
+        name: "term",
+        args: &[&["text"]],
+        usage: "[text]",
+        about: "the screen's terminal: size, cursor, scrollback (text: its rows)",
+        run: term,
+    },
+    Command { name: "clear", args: &[], usage: "", about: "clear the screen and its scrollback", run: clear },
+    Command { name: "colors", args: &[], usage: "", about: "a colour test pattern", run: colors },
+    Command { name: "seq", args: &[], usage: "<n>", about: "print 1 to n, a line each", run: seq },
+    Command { name: "sleep", args: &[], usage: "<ms>", about: "wait that long (guest time)", run: sleep },
+    Command { name: "uptime", args: &[], usage: "", about: "nanoseconds since the TSC started", run: uptime },
+    Command {
+        name: "clocks",
+        args: &[],
+        usage: "",
+        about: "the TSC's frequency, measured again against each clock",
+        run: clocks,
+    },
+    Command { name: "history", args: &[], usage: "", about: "the lines entered on this console", run: history },
+    Command { name: "exit", args: &[], usage: "", about: "end QEMU (only with lumen.qemu_exit)", run: exit },
 ]);
 
 /// Split `line` into words and run the command the first names (one line
@@ -58,29 +89,35 @@ fn number<T: core::str::FromStr>(args: &[String]) -> Option<T> {
     }
 }
 
+/// Every command with its usage and what it does, then the keys. An
+/// `about` ending in `:` is followed by the words its first argument can
+/// be. Written in one write (made before it: see `Ctx::out`).
 fn help(ctx: &mut Ctx<'_>, _: &[String]) {
-    let _ = writeln!(
-        ctx.out,
-        "commands:\n  help              this list\n  echo <text>       print text\n  \
-         int3              take a breakpoint and continue\n  \
-         crash <kind> [cpu|thread]\n                    deliberate fault (on that CPU, or in a new thread): {}\n  \
-         trace [n]         the boot CPU's last n trace events (default 16)\n  \
-         heap              heap usage and free-list summary\n  \
-         ticks             the boot CPU's timer interrupts (and stray ones)\n  \
-         kbd               the keyboard's layout and interrupts\n  \
-         term [text]       the screen's terminal: size, cursor, scrollback (text: its rows)\n  \
-         clear             clear the screen and its scrollback\n  \
-         colors            a colour test pattern\n  \
-         seq <n>           print 1 to n, a line each\n  \
-         sleep <ms>        wait that long (guest time)\n  \
-         uptime            nanoseconds since the TSC started\n  \
-         clocks            the TSC's frequency, measured again against each clock\n  \
-         history           the lines entered on this console\n  \
-         exit              end QEMU (only with lumen.qemu_exit)\n\
-         keys: Tab completes; Up/Down history; Ctrl-U/W delete, Ctrl-C drops the line; \
-         the cursor keys, Home/End, Delete, Ctrl-A/E/B/F/D/K and Ctrl-L on the screen (or serial with lumen.ansi)",
-        crash::KINDS.join(" ")
+    /// Where the descriptions start.
+    const COLUMN: usize = 20;
+    let mut text = String::from("commands:\n");
+    for c in COMMANDS.0 {
+        let start = text.len();
+        let _ = write!(text, "  {} {}", c.name, c.usage);
+        let width = text.len() - start;
+        if width < COLUMN {
+            text.extend(core::iter::repeat_n(' ', COLUMN - width));
+        } else {
+            let _ = write!(text, "\n{:COLUMN$}", "");
+        }
+        text.push_str(c.about);
+        if c.about.ends_with(':') {
+            for word in c.args.first().copied().unwrap_or_default() {
+                let _ = write!(text, " {word}");
+            }
+        }
+        text.push('\n');
+    }
+    text.push_str(
+        "keys: Tab completes; Up/Down history; Ctrl-U/W delete, Ctrl-C drops the line; \
+         the cursor keys, Home/End, Delete, Ctrl-A/E/B/F/D/K and Ctrl-L on the screen (or serial with lumen.ansi)\n",
     );
+    let _ = ctx.out.write_str(&text);
 }
 
 fn echo(ctx: &mut Ctx<'_>, args: &[String]) {
@@ -335,9 +372,10 @@ crate::ktest!(
         // Every command in the table has a line in `help`, and no name is
         // in the table twice (`find` would take the first).
         use crate::kassert;
-        let mut text = String::new();
+        let mut console = super::Captured::default();
         let history = lumen_shell::History::new(0);
-        help(&mut Ctx { out: &mut text, ansi: false, history: &history }, &[]);
+        help(&mut Ctx { out: &mut console, ansi: false, history: &history }, &[]);
+        let text = console.text;
         for (i, c) in COMMANDS.0.iter().enumerate() {
             let helped = text.lines().any(|l| l.starts_with(&alloc::format!("  {} ", c.name)));
             let once = COMMANDS.0[..i].iter().all(|d| d.name != c.name);
