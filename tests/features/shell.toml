@@ -67,7 +67,7 @@ tests = [
 ]
 
 [[feature]]
-name = "System commands, each a header and rows: `cpus` (each CPU online: its scheduler, ticks, how busy, threads), `mem` (frames, heap, kernel stacks), `irqs` (every I/O APIC input decoded, interrupts per vector), `dmesg` (the newest whole lines of the last 16 KiB of log kept by the logger, as serial printed them); with `help`, `trace`, `uptime`, `clear` and `history`"
+name = "System commands, each a header and rows: `cpus` (each CPU online: its scheduler, ticks, how busy, threads), `mem` (frames, heap, kernel stacks), `irqs` (every I/O APIC input decoded, interrupts per vector), `threads` (each thread: its CPU, state and ticks), `dmesg` (the newest whole lines of the last 16 KiB of log kept by the logger, as serial printed them); with `help`, `trace`, `uptime`, `clear` and `history`"
 milestone = "M2"
 tests = [
     "scenario:test_shell::test_system_commands",
@@ -94,4 +94,26 @@ tests = [
     "scenario:test_shell::test_top_refreshes_and_quits",
     "ktest:lumen_kernel::shell::sysinfo::top_shows_a_frame_and_quits_on_q",
     "ktest:lumen_kernel::sched::busy_and_idle_ticks_are_counted",
+]
+
+[[feature]]
+name = "Pipes: `|` outside quotes sends a command's output to filters (`grep`, `where <column> <op> <value>`, `sort <column> [desc]` (stable), `first <n>`, `count`, `select <column>...`), on either console; text as lines (`dmesg | grep time`, numbers in text compared and sorted as numbers), `cpus`, `irqs`, `mem` and `threads` as records with typed columns (`irqs | where count > 0 | sort count | first 3`); keys still reach the first command, its usage and error lines reach the console and end the pipeline, one that would wait unseen (draws, the REPL, `top` without a count) or lose its line refuses, a first command writing more than 64 KiB stops the pipeline (and its polling for a key); after a `|` Tab completes only filters; each mistake is one line"
+milestone = "M2"
+tests = [
+    "cargo:lumen-shell",
+    "scenario:test_shell::test_pipe_text",
+    "scenario:test_shell::test_where_sort_first",
+    "ktest:lumen_kernel::shell::pipe::a_pipeline_filters_what_a_command_writes",
+    "ktest:lumen_kernel::shell::pipe::system_commands_hand_on_records",
+    "ktest:lumen_kernel::shell::sysinfo::every_record_table_fits_its_columns",
+    "ktest:lumen_kernel::shell::sysinfo::mem_records_add_up",
+    "ktest:lumen_kernel::shell::pipe::every_filter_is_a_command_with_its_usage",
+    "ktest:lumen_kernel::shell::pipe::a_piped_command_takes_keys_from_the_console",
+    "ktest:lumen_kernel::shell::pipe::a_command_that_would_wait_unseen_refuses_and_ends_the_pipeline",
+    "ktest:lumen_kernel::shell::pipe::a_command_s_usage_and_errors_reach_the_console_not_the_pipeline",
+    "ktest:lumen_kernel::shell::pipe::too_much_output_stops_the_pipeline",
+    "ktest:lumen_kernel::shell::pipe::pipeline_mistakes_are_one_line",
+    "ktest:lumen_kernel::shell::pipe::records_come_from_commands_that_take_no_arguments",
+    "ktest:lumen_kernel::shell::pipe::a_wrong_filter_stops_the_pipeline_before_the_command_runs",
+    "ktest:lumen_kernel::shell::pipe::a_full_pipeline_stops_a_command_polling_for_a_key",
 ]

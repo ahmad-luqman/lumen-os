@@ -18,8 +18,8 @@ pub struct Command<T: 'static> {
     pub run: T,
 }
 
-/// The commands a shell knows. It completes their names (the first word)
-/// and their arguments' words.
+/// The commands a shell knows. It completes their names (the first word;
+/// after a `|`, only the filters') and their arguments' words.
 #[derive(Debug)]
 pub struct Table<T: 'static>(pub &'static [Command<T>]);
 
@@ -39,6 +39,14 @@ impl<T> Complete for Table<T> {
                     out.extend(choices.iter().map(|w| w.to_string()));
                 }
             }
+        }
+    }
+
+    fn options_after_pipe(&self, words: &[String], out: &mut alloc::vec::Vec<String>) {
+        if words.is_empty() {
+            out.extend(self.0.iter().filter(|c| crate::pipe::is_filter(c.name)).map(|c| c.name.to_string()));
+        } else {
+            self.options(words, out);
         }
     }
 }

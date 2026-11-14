@@ -1,12 +1,16 @@
-//! The shell's system commands: `cpus`, `mem`, `irqs`, `dmesg`, `date` and
-//! `top`. Each prints a header line (`<name>: ...`), and all but `date`
-//! rows after it. Output with rows is made into a `String` first and
-//! written in one write (no log line lands inside it, and nothing
-//! allocating is formatted under the screen's lock); `dmesg` writes its
-//! lines in chunks of about [`DMESG_CHUNK`] bytes instead, so a slow UART
-//! doesn't hold the log's line lock (interrupts off) for long.
+//! The shell's system commands: `cpus`, `mem`, `irqs`, `threads`, `dmesg`,
+//! `date` and `top`. Each prints a header line (`<name>: ...`), and all but
+//! `date` rows after it. In a pipeline `cpus`, `irqs`, `mem` and `threads`
+//! give records instead ([`RECORDS`]): `cpus` and `threads` the table they
+//! print (under their header), `irqs` its per-vector table only (not the
+//! I/O APIC's inputs), `mem` a table of what its prose says (in bytes).
+//! Output with rows is made into a `String` first and written in one write
+//! (no log line lands inside it, and nothing allocating is formatted under
+//! the screen's lock); `dmesg` writes its lines in chunks
+//! (`shell::write_in_chunks`) instead, so a slow UART doesn't hold the
+//! log's line lock (interrupts off) for long.
 
-use super::Ctx;
+use super::{Ctx, write_in_chunks};
 use crate::arch::{self, MAX_CPUS, idt};
 use crate::sched::{self, CpuTicks, ThreadInfo};
 use alloc::string::String;
@@ -15,6 +19,7 @@ use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use lumen_mm::FRAME_SIZE;
 use lumen_shell::Key;
+use lumen_shell::pipe::{self, Align, Column, Kind, Value};
 use lumen_time::{NS_PER_SEC, per_second, percent};
 
 /// A size in bytes for humans: `512 B`, `12.5 KiB`, `3.0 MiB`, `2.0 GiB`.
@@ -33,14 +38,49 @@ impl fmt::Display for Bytes {
     }
 }
 
-/// How busy `cpu` was over `ticks`: `37%`; `-` if its scheduler isn't
-/// running, `stalled` if it runs but took no tick.
-fn busy_text(cpu: usize, ticks: CpuTicks) -> String {
+/// How busy `cpu` was over `ticks`, for a percentage column: absent
+/// (`-`) if its scheduler isn't running, `stalled` if it runs but took no
+/// tick.
+fn busy(cpu: usize, ticks: CpuTicks) -> Value {
     match (sched::running_on(cpu), ticks.ticks) {
-        (false, _) => String::from("-"),
-        (true, 0) => String::from("stalled"),
-        (true, _) => alloc::format!("{}%", ticks.busy_percent()),
+        (false, _) => DASH,
+        (true, 0) => Value::Absent("stalled"),
+        (true, _) => int(ticks.busy_percent()),
     }
+}
+
+/// `n` as a table's number (absent, `-`, past `i64::MAX`).
+fn int(n: impl TryInto<i64>) -> Value {
+    n.try_into().map_or(DASH, Value::Int)
+}
+
+fn text(s: &str) -> Value {
+    Value::Text(String::from(s))
+}
+
+/// No value, printed `-`.
+const DASH: Value = Value::Absent("-");
+
+/// What makes a system command's records.
+pub type MakeTable = fn() -> pipe::Table;
+
+/// The system commands that give records in a pipeline (instead of their
+/// text), and the tables they give.
+pub const RECORDS: [(&str, MakeTable); 4] =
+    [("cpus", cpu_table), ("irqs", vector_table), ("mem", mem_table), ("threads", thread_table)];
+
+/// The records `name` gives in a pipeline, if it is one of [`RECORDS`].
+pub fn records(name: &str) -> Option<MakeTable> {
+    RECORDS.iter().find(|(n, _)| *n == name).map(|&(_, table)| table)
+}
+
+/// Whether there are `args` for a command taking none (`name`); if so, it
+/// says its usage line (ending a pipeline).
+fn extra_args(ctx: &mut Ctx<'_>, name: &str, args: &[String]) -> bool {
+    if !args.is_empty() {
+        ctx.fail(format_args!("usage: {name}"));
+    }
+    !args.is_empty()
 }
 
 /// The CPUs online (index, local APIC id).
@@ -77,29 +117,45 @@ fn emit(ctx: &mut Ctx<'_>, text: &str) {
 /// since it started, and the threads homed there; then any CPU stuck
 /// starting. (The boot CPU reads nearly 100% busy even when nothing
 /// happens: the serial shell polls serial, yielding, and never sleeps.)
-pub fn cpus(ctx: &mut Ctx<'_>, _: &[String]) {
-    let threads = sched::threads();
+pub fn cpus(ctx: &mut Ctx<'_>, args: &[String]) {
+    if extra_args(ctx, "cpus", args) {
+        return;
+    }
     let mut t = String::new();
     let n = online().count();
     let _ = writeln!(t, "cpus: {n} online{}", not_online());
-    let _ = writeln!(t, "  cpu  apic  scheduler    ticks       busy  threads");
+    cpu_table().render(&mut t);
+    emit(ctx, &t);
+}
+
+/// `cpus`'s rows: busy is a percentage, `-` without a scheduler, `stalled`
+/// if it runs but took no tick.
+fn cpu_table() -> pipe::Table {
+    const COLUMNS: [Column; 6] = [
+        Column::new("cpu", Kind::Int, Align::Right, 3),
+        Column::new("apic", Kind::Int, Align::Right, 4),
+        Column::new("scheduler", Kind::Text, Align::Left, 11),
+        Column::new("ticks", Kind::Int, Align::Left, 10),
+        Column::new("busy", Kind::Percent, Align::Right, 4),
+        Column::new("threads", Kind::Int, Align::Right, 7),
+    ];
+    let threads = sched::threads();
+    let mut t = pipe::Table::new(&COLUMNS);
     for (cpu, apic) in online() {
         let homed = threads.iter().filter(|th| th.cpu == cpu).count();
         let c = sched::cpu_ticks(cpu);
         let running = if sched::running_on(cpu) { "running" } else { "not started" };
-        let busy = busy_text(cpu, c);
-        let _ = writeln!(t, "  {cpu:>3}  {apic:>4}  {running:<11}  {:<10}  {busy:>4}  {homed:>7}", c.ticks);
+        t.push(vec![int(cpu), int(apic), text(running), int(c.ticks), busy(cpu, c), int(homed)]);
     }
     for cpu in starting() {
-        let _ = writeln!(t, "  {cpu:>3}     -  starting     -              -        -");
+        t.push(vec![int(cpu), DASH, text("starting"), DASH, DASH, DASH]);
     }
-    emit(ctx, &t);
+    t
 }
 
-/// `mem`: physical frames, the heap and kernel stacks.
-pub fn mem(ctx: &mut Ctx<'_>, _: &[String]) {
-    let frames = crate::mm::frame::counts();
-    let heap = crate::mm::heap::stats();
+/// The kernel stacks registered, by kind: its name, how many, their bytes
+/// (without guard pages).
+fn stack_kinds() -> Vec<(&'static str, usize, u64)> {
     let mut kinds: Vec<(&'static str, usize, u64)> = Vec::new();
     for s in arch::stacks::REGISTRY.iter() {
         let name = s.kind.name();
@@ -111,6 +167,17 @@ pub fn mem(ctx: &mut Ctx<'_>, _: &[String]) {
             None => kinds.push((name, 1, s.range.size())),
         }
     }
+    kinds
+}
+
+/// `mem`: physical frames, the heap and kernel stacks.
+pub fn mem(ctx: &mut Ctx<'_>, args: &[String]) {
+    if extra_args(ctx, "mem", args) {
+        return;
+    }
+    let frames = crate::mm::frame::counts();
+    let heap = crate::mm::heap::stats();
+    let kinds = stack_kinds();
     let (owned, free) = (frames.owned as u64, frames.free as u64);
     let mut t = String::new();
     let _ = writeln!(t, "mem: frames, heap and kernel stacks");
@@ -139,22 +206,66 @@ pub fn mem(ctx: &mut Ctx<'_>, _: &[String]) {
     emit(ctx, &t);
 }
 
+/// `mem` in a pipeline: frames, the heap and each kind of kernel stack
+/// (`<kind> stacks`), with their size and what is used of it in bytes (a
+/// stack's all of it; guard pages not counted), and how many there are
+/// (frames, live allocations, stacks).
+fn mem_table() -> pipe::Table {
+    const COLUMNS: [Column; 4] = [
+        Column::new("area", Kind::Text, Align::Left, 0),
+        Column::new("size", Kind::Int, Align::Right, 0),
+        Column::new("used", Kind::Int, Align::Right, 0),
+        Column::new("count", Kind::Int, Align::Right, 0),
+    ];
+    let frames = crate::mm::frame::counts();
+    let heap = crate::mm::heap::stats();
+    let mut t = pipe::Table::new(&COLUMNS);
+    let (owned, free) = (frames.owned as u64, frames.free as u64);
+    t.push(vec![text("frames"), int(owned * FRAME_SIZE), int((owned - free) * FRAME_SIZE), int(owned)]);
+    t.push(vec![text("heap"), int(heap.size), int(heap.used), int(heap.live)]);
+    for (name, count, bytes) in stack_kinds() {
+        t.push(vec![Value::Text(alloc::format!("{name} stacks")), int(bytes), int(bytes), int(count)]);
+    }
+    t
+}
+
 /// `irqs`: every I/O APIC input decoded, then the interrupts taken on each
 /// vector from 32 on that has taken any or has a routed input.
-pub fn irqs(ctx: &mut Ctx<'_>, _: &[String]) {
-    use arch::apic::{Polarity, Trigger};
+pub fn irqs(ctx: &mut Ctx<'_>, args: &[String]) {
+    if extra_args(ctx, "irqs", args) {
+        return;
+    }
     let inputs = crate::interrupts::inputs();
     let mut t = String::new();
     if inputs.is_empty() {
         let _ = writeln!(t, "irqs: no I/O APIC, interrupts per vector");
     } else {
         let _ = writeln!(t, "irqs: {} I/O APIC inputs, interrupts per vector", inputs.len());
-        let _ = writeln!(t, "  gsi  vector  delivery        trigger  polarity  dest  state     count");
+        input_table(&inputs).render(&mut t);
     }
-    for i in &inputs {
+    vector_table().render(&mut t);
+    emit(ctx, &t);
+}
+
+/// `irqs`' first table: each I/O APIC input decoded (an unrouted, masked
+/// one is only its number and `masked`).
+fn input_table(inputs: &[crate::interrupts::Input]) -> pipe::Table {
+    use arch::apic::{Polarity, Trigger};
+    const COLUMNS: [Column; 8] = [
+        Column::new("gsi", Kind::Int, Align::Right, 3),
+        Column::new("vector", Kind::Hex, Align::Left, 6),
+        Column::new("delivery", Kind::Text, Align::Left, 14),
+        Column::new("trigger", Kind::Text, Align::Left, 7),
+        Column::new("polarity", Kind::Text, Align::Left, 8),
+        Column::new("dest", Kind::Text, Align::Left, 4),
+        Column::new("state", Kind::Text, Align::Left, 8),
+        Column::new("count", Kind::Int, Align::Left, 0),
+    ];
+    let mut t = pipe::Table::new(&COLUMNS);
+    for i in inputs {
         let e = i.entry;
         if !i.routed && e.masked() {
-            let _ = writeln!(t, "  {:>3}  -       -               -        -         -     masked    -", i.gsi);
+            t.push(vec![int(i.gsi), DASH, DASH, DASH, DASH, DASH, text("masked"), DASH]);
             continue;
         }
         let delivery = e.delivery().map_or(String::from("reserved"), |d| alloc::format!("{d:?}"));
@@ -164,30 +275,69 @@ pub fn irqs(ctx: &mut Ctx<'_>, _: &[String]) {
             if e.logical() { alloc::format!("l{}", e.destination()) } else { alloc::format!("{}", e.destination()) };
         let state = if e.masked() { "masked" } else { "unmasked" };
         // A vector under 32 is an exception's: its count isn't this input's.
-        let count =
-            if e.vector() < 32 { String::from("-") } else { alloc::format!("{}", idt::vector_count(e.vector())) };
-        let _ = writeln!(
-            t,
-            "  {:>3}  {:#04x}    {delivery:<14}  {trigger:<7}  {polarity:<8}  {dest:<4}  {state:<8}  {count}",
-            i.gsi,
-            e.vector(),
-        );
+        let count = if e.vector() < 32 { DASH } else { int(idt::vector_count(e.vector())) };
+        t.push(vec![
+            int(i.gsi),
+            int(e.vector()),
+            Value::Text(delivery),
+            text(trigger),
+            text(polarity),
+            Value::Text(dest),
+            text(state),
+            count,
+        ]);
     }
-    let _ = writeln!(t, "  vector  use               count");
+    t
+}
+
+/// `irqs`' second table, and its records in a pipeline: the interrupts
+/// taken on each vector from 32 on that has taken any or has a routed
+/// input.
+fn vector_table() -> pipe::Table {
+    const COLUMNS: [Column; 3] = [
+        Column::new("vector", Kind::Hex, Align::Left, 6),
+        Column::new("use", Kind::Text, Align::Left, 16),
+        Column::new("count", Kind::Int, Align::Left, 0),
+    ];
+    let inputs = crate::interrupts::inputs();
+    let mut t = pipe::Table::new(&COLUMNS);
     for v in 32..=255u8 {
         let count = idt::vector_count(v);
         let routed = inputs.iter().any(|i| i.routed && i.entry.vector() == v);
         if count > 0 || routed {
-            let _ = writeln!(t, "  {v:#04x}    {:<16}  {count}", alloc::format!("{}", idt::vector_use(v)));
+            t.push(vec![int(v), Value::Text(alloc::format!("{}", idt::vector_use(v))), int(count)]);
         }
     }
+    t
+}
+
+/// `threads`: every thread, its CPU, state and the timer ticks that found
+/// it running.
+pub fn threads(ctx: &mut Ctx<'_>, args: &[String]) {
+    if extra_args(ctx, "threads", args) {
+        return;
+    }
+    let table = thread_table();
+    let mut t = String::new();
+    let _ = writeln!(t, "threads: {}", table.rows().len());
+    table.render(&mut t);
     emit(ctx, &t);
 }
 
-/// About how many bytes `dmesg` writes at a time (a write holds the log's
-/// line lock, with interrupts off, while serial sends it: 512 bytes take
-/// 44 ms at 115200 baud).
-const DMESG_CHUNK: usize = 512;
+fn thread_table() -> pipe::Table {
+    const COLUMNS: [Column; 5] = [
+        Column::new("thread", Kind::Text, Align::Left, 16),
+        Column::new("id", Kind::Int, Align::Right, 2),
+        Column::new("cpu", Kind::Int, Align::Right, 3),
+        Column::new("state", Kind::Text, Align::Left, 8),
+        Column::new("ticks", Kind::Int, Align::Right, 0),
+    ];
+    let mut t = pipe::Table::new(&COLUMNS);
+    for th in sched::threads() {
+        t.push(vec![text(th.name), int(th.id), int(th.cpu), text(th.state.name()), int(th.ticks)]);
+    }
+    t
+}
 
 /// `dmesg`: the newest whole log lines kept (the last `klog::RING_BYTES`
 /// bytes), as serial printed them, saying whether older ones were
@@ -200,27 +350,19 @@ pub fn dmesg(ctx: &mut Ctx<'_>, _: &[String]) {
     let lines = text.lines().count();
     let older = if lost { " (older ones overwritten)" } else { " (all since boot)" };
     let _ = writeln!(ctx.out, "dmesg: the newest {lines} log lines{older}");
-    let mut chunk = String::with_capacity(DMESG_CHUNK + 256);
-    for line in text.split_inclusive('\n') {
-        chunk.push_str(line);
-        if chunk.len() >= DMESG_CHUNK {
-            emit(ctx, &chunk);
-            chunk.clear();
-        }
-    }
-    if !chunk.is_empty() {
-        emit(ctx, &chunk);
-    }
+    write_in_chunks(ctx.out, &text);
 }
 
 /// `date`: the RTC's date and time, a header and no rows. The clock is
 /// taken as UTC (true under QEMU's `-rtc base=utc`, the tests' setting;
 /// the RTC itself doesn't say).
 pub fn date(ctx: &mut Ctx<'_>, _: &[String]) {
-    let _ = match crate::rtc::now() {
-        Ok(now) => writeln!(ctx.out, "date: {now} UTC"),
-        Err(e) => writeln!(ctx.out, "date: {e}"),
-    };
+    match crate::rtc::now() {
+        Ok(now) => {
+            let _ = writeln!(ctx.out, "date: {now} UTC");
+        }
+        Err(e) => ctx.fail(format_args!("date: {e}")),
+    }
 }
 
 /// What `top` compares from one frame to the next.
@@ -250,10 +392,12 @@ const KEY_POLL_NS: u64 = 20_000_000;
 /// until `q` or Ctrl-C (or `frames` frames). With escape codes each frame
 /// replaces the last; on a plain console frames follow each other as lines.
 pub fn top(ctx: &mut Ctx<'_>, args: &[String]) {
-    let usage = |ctx: &mut Ctx<'_>| {
-        let _ = writeln!(ctx.out, "usage: top [frames] (q or Ctrl-C quits)");
-    };
+    let usage = |ctx: &mut Ctx<'_>| ctx.fail("usage: top [frames] (q or Ctrl-C quits)");
     let limit: Option<u64> = match args {
+        // Its frames would go down the pipeline unseen until a key.
+        [] if ctx.piped() => {
+            return ctx.fail("top: in a pipeline it needs a number of frames (top 1 | ...)");
+        }
         [] => None,
         [n] => match n.parse() {
             Ok(n) if n > 0 => Some(n),
@@ -302,7 +446,7 @@ fn render(frame: u64, prev: &Sample, now: &Sample, ansi: bool) -> String {
     let _ = writeln!(t, "  cpu  busy  ticks/s");
     for &(cpu, _) in &online {
         let d = now.cpus[cpu].since(prev.cpus[cpu]);
-        let busy = busy_text(cpu, d);
+        let busy = busy(cpu, d).show(Kind::Percent);
         let _ = writeln!(t, "  {cpu:>3}  {busy:>4}  {:>7}", per_second(d.ticks, span));
     }
     // Interrupts per second, the vectors that took any.
@@ -376,8 +520,8 @@ crate::ktest!(
         // only its header, a date and time.
         use crate::kassert;
         let history = lumen_shell::History::new(0);
-        let commands: [(&str, super::commands::Run); 5] =
-            [("cpus", cpus), ("mem", mem), ("irqs", irqs), ("dmesg", dmesg), ("date", date)];
+        let commands: [(&str, super::commands::Run); 6] =
+            [("cpus", cpus), ("mem", mem), ("irqs", irqs), ("threads", threads), ("dmesg", dmesg), ("date", date)];
         for (name, run) in commands {
             let mut console = super::Captured::default();
             run(&mut Ctx::new(&mut console, false, &history), &[]);
@@ -403,3 +547,48 @@ fn is_date_line(line: &str) -> bool {
     line.len() == PATTERN.len()
         && line.bytes().zip(PATTERN).all(|(b, &p)| if p == b'#' { b.is_ascii_digit() } else { b == p })
 }
+
+crate::ktest!(
+    fn every_record_table_fits_its_columns() {
+        // `Table::new` and `Table::push` check each table against its
+        // columns (a mistake is a panic, here rather than at a user's
+        // prompt): the records each system command gives, and `irqs`'
+        // table of inputs.
+        use crate::kassert;
+        for (name, table) in RECORDS {
+            let rows = table().rows().len();
+            crate::ktest::diag(format_args!("{name}: {rows} rows"));
+            kassert!(rows > 0);
+        }
+        kassert!(records("dmesg").is_none());
+        let inputs = crate::interrupts::inputs();
+        kassert!(input_table(&inputs).rows().len() == inputs.len());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn mem_records_add_up() {
+        // Frames: their size is their count's 4 KiB pages, used no more
+        // than that; the heap uses no more than it has; a stack's size is
+        // all used.
+        use crate::kassert;
+        let table = mem_table();
+        let number = |v: &Value| match v {
+            Value::Int(n) => Ok(*n),
+            _ => Err("not a number"),
+        };
+        for row in table.rows() {
+            let Value::Text(area) = &row[0] else { return Err("an area without a name") };
+            let (size, used, count) = (number(&row[1])?, number(&row[2])?, number(&row[3])?);
+            kassert!(0 <= used && used <= size && count > 0);
+            if area == "frames" {
+                kassert!(size == count * FRAME_SIZE as i64);
+            } else if area.ends_with(" stacks") {
+                kassert!(size == used);
+            }
+        }
+        kassert!(table.rows().iter().filter(|r| matches!(&r[0], Value::Text(a) if a.ends_with(" stacks"))).count() > 0);
+        Ok(())
+    }
+);

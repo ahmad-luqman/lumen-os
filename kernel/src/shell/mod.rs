@@ -19,12 +19,14 @@
 //! Log lines go to serial and the first virtual terminal, between the
 //! shells' output. The line
 //! editor, the word splitting and completion are `lumen-shell`'s (tested on
-//! the host); the commands are in [`commands`].
+//! the host); the commands are in [`commands`], and pipelines (`cpus |
+//! count`) in [`pipe`].
 
 #![cfg_attr(feature = "ktest", allow(dead_code))] // the test kernel runs no shell
 
 mod commands;
 mod crash;
+mod pipe;
 mod sysinfo;
 
 use crate::arch::serial;
@@ -62,7 +64,7 @@ pub struct Ctx<'a> {
     pub ansi: bool,
     pub history: &'a History,
     /// Who holds a canvas this command takes: a new owner for each command
-    /// (`commands::run`), so the shell takes back only its own.
+    /// (`commands::run_command`), so the shell takes back only its own.
     owner: term::Owner,
 }
 
@@ -113,6 +115,22 @@ impl<'a> Ctx<'a> {
     pub fn console_name(&self) -> &'static str {
         self.out.name()
     }
+
+    /// Whether this command's output goes to the next command in a
+    /// pipeline (`top 3 | count`) rather than to the console. Its keys
+    /// still come from the console.
+    pub fn piped(&self) -> bool {
+        self.out.piped()
+    }
+
+    /// Say why the command failed or won't run (`line`: a usage line, an
+    /// error; without its newline, though it may hold several lines): on
+    /// the console, even in a pipeline, which it then ends. Made into a
+    /// `String` first (see [`Ctx::out`]), so it allocates: not under a lock
+    /// that forbids the heap.
+    pub fn fail(&mut self, line: impl fmt::Display) {
+        self.out.fail(&alloc::format!("{line}"));
+    }
 }
 
 /// A console a shell runs on.
@@ -128,6 +146,35 @@ pub trait Console: Write + Send {
     /// brings it to the front).
     fn vt(&self) -> Option<usize> {
         None
+    }
+    /// Whether what is written goes to the next command in a pipeline.
+    /// (A console overrides both this and [`Console::fail`], or neither.)
+    fn piped(&self) -> bool {
+        false
+    }
+    /// Write `line` and a newline, in one write: why a command failed or
+    /// won't run. In a pipeline it goes to the console, and the pipeline
+    /// stops.
+    fn fail(&mut self, line: &str) {
+        let mut text = String::with_capacity(line.len() + 1);
+        text.push_str(line);
+        text.push('\n');
+        let _ = self.write_str(&text);
+    }
+}
+
+/// About how many bytes [`write_in_chunks`] writes at a time: a serial
+/// write holds the log's line lock, with interrupts off, while the UART
+/// sends it (512 bytes take 44 ms at 115200 baud).
+const CHUNK: usize = 512;
+
+/// Write `text` to `out` in pieces of whole lines (`lumen_shell::pipe::
+/// chunks`: each at least [`CHUNK`] bytes but the last, and less than that
+/// plus one line), so a long output doesn't hold the log's line lock for
+/// long (a log line may land between pieces, never inside a line).
+pub fn write_in_chunks(out: &mut dyn Console, text: &str) {
+    for piece in lumen_shell::pipe::chunks(text, CHUNK) {
+        let _ = out.write_str(piece);
     }
 }
 

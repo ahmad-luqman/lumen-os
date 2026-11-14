@@ -146,7 +146,8 @@ own PR that updates that doc first.
   (plain text unless `lumen.ansi`) and one on each virtual terminal (keyboard): `mod.rs`
   the consoles and `Ctx` (keys through `poll_key`/`wait_key`, the screen
   through `canvas`), their commands (`commands.rs`: each row carries its
-  help line; the system ones in `sysinfo.rs`) and deliberate faults (`crash.rs`). `fb.rs`:
+  help line; the system ones in `sysinfo.rs`), pipelines (`pipe.rs`: `cpus |
+  where busy > 50`) and deliberate faults (`crash.rs`). `fb.rs`:
   framebuffer pixels, the header and the crash screen. `term.rs`: the
   terminals on the framebuffer (four virtual ones, one shown: log lines on the first, the screen shells, scrollback, `view_text`, and
   `Canvas`: the pixels below the header for one command, the terminal paused meanwhile). `vt.rs`: the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4 switching. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
@@ -192,9 +193,11 @@ own PR that updates that doc first.
   renderer), and `vt::Router`, keys to the virtual terminal shown when
   each was typed.
 - `crates/lumen-shell`: shell core: word splitting with quotes (checked
-  against `shlex`), the line editor (history, completion; ANSI and plain
-  output), the command table (names, completion words, usage and help
-  lines), serial bytes to keys (host-tested).
+  against `shlex`; commands split at `|`), the line editor (history,
+  completion; ANSI and plain output), the command table (names, completion
+  words, usage and help lines), pipelines (text or records in tables, the
+  filters `grep`, `where`, `sort`, `first`, `count`, `select`), serial
+  bytes to keys (host-tested).
 - `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET, FADT
   (PM1 control blocks) and the DSDT's `_S5_` by byte search (host-tested on
   handcrafted tables).
