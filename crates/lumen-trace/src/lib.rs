@@ -1,4 +1,5 @@
-//! Lock-free trace ring buffer for the Lumen kernel.
+//! Lock-free trace ring buffer for the Lumen kernel (and, in [`text`], a
+//! plain byte ring for log lines, which isn't lock-free).
 //!
 //! The kernel records fixed-size binary [`Event`]s (timestamp, CPU, kind,
 //! pid, four arguments) into a [`TraceRing`] that always overwrites the

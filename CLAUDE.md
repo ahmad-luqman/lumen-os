@@ -171,9 +171,11 @@ own PR that updates that doc first.
   lock-free stack registry.
 - `crates/lumen-heap`: heap allocator logic (address-ordered free list,
   coalescing; host-tested, incl. a randomized stress test against a shadow map).
-- `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads).
+- `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads),
+  and `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free).
 - `crates/lumen-time`: timekeeping arithmetic: calibration, tick/ns
-  conversion, timer counts, log time formats (`Stamp`, `Millis`)
+  conversion, timer counts, log time formats (`Stamp`, `Millis`),
+  percentages and rates, and the RTC's registers as a date (`rtc`)
   (host-tested).
 - `crates/lumen-queue`: lock-free single-producer, single-consumer byte
   queue (interrupt handler to thread; host-tested, incl. threads).

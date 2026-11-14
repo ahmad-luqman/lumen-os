@@ -273,7 +273,9 @@ def test_top_refreshes_and_quits(boot):
     assert ap and 500 <= int(ap[1]) <= 1500, frame
     timer = re.search(r"^  irqs/s: .*local APIC timer (\d+)", frame, re.MULTILINE)
     assert timer and 500 <= int(timer[1]) / 2 <= 1500, frame
-    assert re.search(r"^  heap .* used of .* in \d+ allocations; frames ", frame, re.MULTILINE), frame
+    assert re.search(r"^  heap .* used of .* in \d+ allocations; frames ", frame, re.MULTILINE), (
+        frame
+    )
     assert re.search(r"^  main\s+\d+\s+0\s+\w+\s+\d+%$", frame, re.MULTILINE), frame
     assert re.search(r"^  shell-screen\s+\d+\s+0\s+\w+\s+\d+%$", frame, re.MULTILINE), frame
     m.send("q")

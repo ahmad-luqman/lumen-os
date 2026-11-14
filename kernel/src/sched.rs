@@ -51,7 +51,7 @@
 //! For the shell's `cpus` and `top`, each tick counts against the running
 //! thread and, on the idle thread, as an idle tick of its CPU (sampling at
 //! 1 kHz: [`cpu_ticks`], [`threads`]); every thread is listed in a registry
-//! of weak references, pruned of the dropped ones as threads start.
+//! of weak references, pruned of the dropped ones as threads are created.
 //!
 //! Every switch records a `switch` trace event (previous thread's id, next
 //! thread's id, the previous thread's state), and the crash report names the

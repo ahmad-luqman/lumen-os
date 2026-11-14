@@ -1054,45 +1054,63 @@ the deliberate faults, `crash.rs`).
   if the CPU hasn't taken it; while one is out, another is refused.
   `crash dfree` and `crash heapcorrupt` print the heap's line before the
   damage, which the tests compare with the report's.
-- **System commands** (`sysinfo.rs`; each a `<name>: ...` header and
-  rows, made into one string and written in one write):
+- **System commands** (`sysinfo.rs`; each a `<name>: ...` header and,
+  but for `date`, rows; output with rows is made into one string first
+  and written in one write, except `dmesg`, which writes 512-byte chunks):
   - `cpus`: each CPU online, its local APIC id, whether its scheduler
     runs, the ticks it has taken and how busy it has been since it
     started (the share of ticks that didn't find the idle thread running:
     the scheduler counts each tick against the running thread and, on the
-    idle thread, as idle; sampling at 1 kHz), and the threads homed there
-    (`sched::threads`, a registry of weak references).
+    idle thread, as idle; sampling at 1 kHz; a ktest spins on a CPU and
+    leaves it idle and checks both), and the threads homed there
+    (`sched::threads`, a registry of weak references); then CPUs stuck
+    starting, and in the header those halted past `MAX_CPUS` (neither
+    tested). The boot CPU reads nearly 100% busy even when idle: the
+    serial shell polls serial, yielding, and never sleeps.
   - `mem`: frames used of those the allocator owns, the heap's counters,
-    and the kernel stacks registered, by kind.
+    and the kernel stacks registered, by kind (sizes without their guard
+    pages).
   - `irqs`: every I/O APIC input decoded (vector, delivery, trigger,
     polarity, destination, masked; an input no driver routed is shown only
-    as masked), then the interrupts taken on each vector that took any
-    (`idt::vector_count`: dispatch counts every vector, all CPUs
-    together), with what the vector map uses it for.
-  - `dmesg`: the newest log lines as serial printed them: the logger
+    as masked; `no I/O APIC` without any, not tested), then the interrupts
+    taken on each vector that took any or has a routed input
+    (`idt::vector_count`: `lumen_exception_dispatch` counts every vector,
+    all CPUs together), with what the vector map uses it for.
+  - `dmesg`: the newest whole log lines as serial printed them: the logger
     keeps the last 16 KiB in a `lumen_trace::TextRing` (host-tested
-    against a model), written under the line lock behind a lock of its
-    own, so reading it doesn't take the line lock; only whole lines are
-    shown (a full ring's oldest, cut, line is left out).
-  - `date`: the CMOS RTC (`rtc.rs`, ports in `arch::cmos`): wait out an
-    update in progress (bounded, 10 ms), read until two reads agree,
-    decode BCD or binary and 12- or 24-hour hours (`lumen_time::rtc`,
-    host-tested), in UTC (QEMU's `-rtc base=utc` in every test). The
-    century is taken as 20xx (the FADT's century register isn't read).
-    QEMU's RTC ticks on a phase of its own: measured, it reads 1 to 2 s
-    behind the host's clock, which the test allows.
+    against a model; not lock-free: `klog`'s `RING` lock, a leaf, taken
+    under the line lock by the logger and alone by readers). Only whole
+    lines are shown: a full ring's oldest, cut, line and a line another
+    CPU is still writing are left out; the header says whether older lines
+    were overwritten (`klog::written`; the overwritten case not tested in
+    the kernel).
+  - `date`: the CMOS RTC (`rtc.rs`; ports in `arch::cmos`, whose guard
+    serializes index/data pairs; reading register C would acknowledge RTC
+    interrupts, and every index write leaves NMIs enabled): wait out an
+    update in progress (at most 10 ms per read; 0xff means no clock), read
+    until two reads agree (at most 5 reads), refuse a clock that lost
+    power (status D) or whose updates are halted (status B's SET), decode
+    BCD or binary and 12- or 24-hour hours (all in `lumen_time::rtc`,
+    host-tested; a decode failure is logged with the raw registers). The
+    clock's zone is whatever set it: QEMU's `-rtc base=utc` in every test;
+    Lumen never writes the clock. The century is taken as 20xx (the FADT's
+    century register isn't read). QEMU's RTC ticks on a phase of its own:
+    measured, it reads 1 to 2 s behind the host's clock, which the test
+    allows.
   - `top [frames]`: every second, the CPUs (busy % and ticks per second
-    over the last second), interrupts per second by vector, the heap and
-    frames, and every thread with its share of its CPU's ticks; it polls
-    the console for a key (`Ctx::poll_key`) between 20 ms sleeps and stops
-    on `q` or Ctrl-C (or after `frames` frames). With escape codes each
-    frame replaces the last (home, erase; not tested); on plain serial frames follow
-    one another as lines.
+    over the last second; `stalled` for one that took no tick, not
+    tested), interrupts per second by vector, the heap and frames, and
+    every thread with its share of its CPU's ticks; it polls the console
+    for a key (`Ctx::poll_key`) between 20 ms sleeps and stops on `q` or
+    Ctrl-C (or after `frames` frames). The scenario checks frames 0.9 to
+    1.5 s apart and the timers at about 1 kHz. With escape codes each
+    frame replaces the last (home, erase; not tested); on plain serial
+    frames follow one another as lines.
 - **Tests:** `cargo:lumen-shell`; `test_shell` (echo with quotes on both
   consoles, history and line editing on the screen and history on serial,
   completion on both, one line of error, `lumen.ansi`, the system
   commands' headers and rows under `-smp 2`, `date` against the host's
-  clock, `top`'s frames and `q`); the keyboard and
+  clock, `top`'s frames, rates and `q`); the keyboard and
   terminal scenarios type on the screen's shell and read the screen back
   with `term text`; every serial scenario that drove kmon runs against the
   serial shell with the new prompt.
