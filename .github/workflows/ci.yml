@@ -62,12 +62,6 @@ jobs:
         if: ${{ !cancelled() && steps.scenarios.outcome != 'skipped' }}
         run: make status-check
 
-      # TEMPORARY (#61): measure serial before/after under KVM; reverted before merge.
-      - name: Measure serial (boot timeline and bench, main vs branch)
-        if: ${{ !cancelled() }}
-        continue-on-error: true
-        run: tools/measure_serial.sh
-
       # KVM is fast but QEMU's `-d int` interrupt trace only works under TCG:
       # re-run the scenarios that failed under TCG so the uploaded artifacts
       # include it. Only after a failed scenarios step: after another step's
