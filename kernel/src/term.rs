@@ -700,7 +700,8 @@ impl fmt::Display for ShowError {
 /// if it is shown already, also while a command has the screen). This is
 /// the screen side only: `crate::vt` routes each key to the terminal
 /// [`shown`] when it routes it, so keys follow; `crate::vt::show` switches
-/// under the router's lock, so a key being routed lands on one side.
+/// under the router's lock, so a key being routed lands on one side (a
+/// canvas's switch, in [`canvas`], doesn't take it).
 pub fn show(vt: usize) -> Result<(), ShowError> {
     if vt >= VTS {
         return Err(ShowError::NoSuchTerminal);
@@ -1218,8 +1219,7 @@ crate::ktest!(
             // Whether the row starting with `needle` is on screen with a
             // pixel of its text that isn't background.
             let ink = |needle: &str| {
-                let row =
-                    (0..rows).find(|&r| needle.chars().enumerate().all(|(i, ch)| s.term().cell(i, r).ch == ch));
+                let row = (0..rows).find(|&r| needle.chars().enumerate().all(|(i, ch)| s.term().cell(i, r).ch == ch));
                 row.is_some_and(|r| {
                     let (y, w) = (s.y0 + r * CELL_H, needle.len() * s.cell_w);
                     (y..y + CELL_H).any(|y| (s.x0..s.x0 + w).any(|x| s.fb.pixel(x, y) != bg))

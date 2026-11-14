@@ -201,7 +201,10 @@ pub fn run() -> ! {
                         // Not a blank screen: say so where its prompt would be
                         // (formatted under the screen's lock, without
                         // allocating: memory may be what ran out).
-                        crate::term::write_fmt_to(vt, format_args!("no shell on this terminal: no thread for it: {e}\n"));
+                        crate::term::write_fmt_to(
+                            vt,
+                            format_args!("no shell on this terminal: no thread for it: {e}\n"),
+                        );
                     }
                 }
             }

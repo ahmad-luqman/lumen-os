@@ -58,7 +58,7 @@ tests = [
 ]
 
 [[feature]]
-name = "`term text` prints the screen's rows; the harness reads them to see what the screen's shell did, and paces keys under QEMU's input queue limit"
+name = "`term text` prints the shown terminal's rows; the harness reads them to see what the screen shells did, and paces keys under QEMU's input queue limit"
 milestone = "M2"
 tests = [
     "harness:test_screen_text::*",

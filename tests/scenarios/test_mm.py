@@ -134,8 +134,8 @@ def boot_settled(boot):
     then runs the serial shell, so the serial prompt can come first. Until
     each screen shell has drawn its first prompt (keeping the buffer
     `run_on` writes the editor's output into) and blocked in
-    `vt::wait_key` (the keyboard's wait queue allocating its buffer the
-    first time, freed again when a key wakes them; none come here), the
+    `vt::wait_key` (the keyboard's wait queue allocating its buffer when
+    the first of them blocks, freed on every wake-up; none come here), the
     heap isn't settled and two summaries can differ. `WaitQueue::wait_until`
     marks a thread blocked and queues it with interrupts off, and `spawn`
     put them on the serial shell's CPU (threads stay on theirs), so `top`
@@ -182,8 +182,8 @@ def test_heap_command_reports_usage(boot):
     # What boot keeps (`acpi::Info`, for one), the four virtual terminals
     # (each grid's cells, scrollback, tab stops and dirty marks) and the
     # shells (their editors and histories, the screen shells' threads and
-    # the keyboard's wait queue they block in) is in use: 54 allocations
-    # with four terminals (29 before virtual terminals), so a few dozen; the rest of what
+    # the keyboard's wait queue they block in) is in use: a few dozen
+    # allocations (the four terminals add about two dozen); the rest of what
     # the heap mapped is free.
     # (`discovery_keeps_nothing_it_does_not_return` checks that ACPI
     # discovery frees what it doesn't keep.)

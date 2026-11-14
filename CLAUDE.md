@@ -150,7 +150,7 @@ own PR that updates that doc first.
   where busy > 50`) and deliberate faults (`crash.rs`). `fb.rs`:
   framebuffer pixels, the header and the crash screen. `term.rs`: the
   terminals on the framebuffer (four virtual ones, one shown: log lines on the first, the screen shells, scrollback, `view_text`, and
-  `Canvas`: the pixels below the header for one command, the terminal paused meanwhile). `vt.rs`: the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4 switching. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
+  `Canvas`: the pixels below the header for one command, the terminals paused meanwhile). `vt.rs`: the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4 switching. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -190,8 +190,8 @@ own PR that updates that doc first.
   queue (interrupt handler to thread; host-tested, incl. threads).
 - `crates/lumen-term`: terminal emulator core: `vte` escapes into a cell
   grid, scrollback, damage tracking (host-tested, incl. a randomized model
-  renderer), and `vt::Router`, keys to the virtual terminal shown when
-  each was typed.
+  renderer), and `vt::Router`, a key ring per virtual terminal (the
+  kernel fills them with each key routed to the terminal shown then).
 - `crates/lumen-shell`: shell core: word splitting with quotes (checked
   against `shlex`; commands split at `|`), the line editor (history,
   completion; ANSI and plain output), the command table (names, completion

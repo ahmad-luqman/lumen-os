@@ -987,12 +987,13 @@ drawing the shown one) and `kernel/src/vt.rs` (routing keys to them);
 - **Shell commands** (either console, writing to the one that ran them):
   `clear` (the screen and its scrollback, on a console that takes escape
   codes), `colors`, `seq <n>`, `term` (size, cursor, scrollback, the view's offset
-  and top row, cells drawn, and whether a command has the canvas: that
-  part not tested) and `term text` (the view's rows, and the cursor counted in the view, or
+  and top row, and, for the whole screen, cells drawn and whether a command
+  has the canvas: that part not tested) and `term text` (the view's rows, and the cursor counted in the view, or
   `cursor below the view` when scrolled back past it; tested); without a
   terminal, `term` says so (not tested); both read the shown terminal.
   In a screen shell Shift+PageUp/PageDown scroll its terminal's view half
-  a screen (a ktest scrolls a hidden one, leaving the shown one alone) (logged at debug
+  a screen (a ktest gives a hidden terminal's console Shift+PageUp and
+  finds that terminal scrolled, the shown one not) (logged at debug
   level: serial only, the screen shows up to `info`); a key the line
   editor takes returns it to the bottom (a ktest checks that output keeps
   a scrolled-back view on its lines; the shell takes keys only between
@@ -1030,26 +1031,35 @@ drawing the shown one) and `kernel/src/vt.rs` (routing keys to them);
   and routes each key to the terminal shown when it routes it
   (`vt::route_key`, reading `term::shown()`), into that terminal's ring
   (`lumen_term::vt::Router`: 128 keys each, a full one drops and counts
-  the newest, the first drop of a burst logged; host-tested against a
-  model). Alt+F1 to Alt+F4 switch (a ktest maps them), so keys routed after
-  a switch go to the new terminal (a ktest feeds the scancodes of `a`,
-  Alt+F2 and `b` and finds `a` on the first, `b` on the second). Modifiers
-  on their own take no slot; keys for a terminal whose shell didn't start
-  are discarded (that terminal says so). Keys are routed as soon as a
+  the newest, the first drop of each burst logged, a burst ending when the
+  ring empties; host-tested against a model, and a ktest feeds 129 key
+  presses to one terminal and finds one dropped and counted for it alone).
+  Alt+F1 to Alt+F4 switch (a ktest maps them), so keys routed after a switch
+  go to the new terminal (a ktest feeds the scancodes of `a`, Alt+F2 and `b`
+  and finds `a` on the first, `b` on the second). Modifiers on their own
+  take no slot; keys for a terminal whose shell didn't start are discarded
+  and counted (that terminal says so; the counting ktested). Keys are routed as soon as a
   screen shell runs after IRQ 1 (whichever runs first routes for all, and
   wakes the others if a key went elsewhere), so a key typed just before a
   command on another terminal takes the canvas, but not routed yet, goes to
   that command (not tested). Every shell's `vt [n]` shows which terminal is
-  shown, the keys each dropped and the switches refused, or switches.
+  shown, the keys each dropped and discarded and the switches refused, or
+  switches.
 - **Canvas and terminals:** a command on a terminal that takes the canvas
   brings that terminal to the front (each command's `term::Owner` carries
   its console's terminal), so keys routed from then on go to it, and while
   any canvas is held no other terminal can be shown (Alt+F`n` and `vt n`
-  are refused, logged and counted): the keys stay with the command drawing.
-  A ktest runs a command through the shell on a console standing for a
-  hidden terminal and finds its canvas showing that terminal and a key
-  routed meanwhile going there; a scenario runs `life` in terminal 1 and
-  finds Alt+F2 and `vt 2` refused and the ending key reaching it. A command
+  are refused and counted; Alt+F`n`'s logged, `vt n`'s answered on its
+  console): the keys stay with the command drawing. The canvas switch
+  doesn't take the router's lock, so a key being routed then lands on
+  either side. A ktest runs a command through the shell on a virtual
+  terminal's own console while another is shown and finds its canvas
+  showing that terminal and a key routed meanwhile going there; a scenario
+  types a script in terminal 1 that waits, then draws, switches to terminal
+  2 meanwhile, and finds terminal 1 back in front when it draws and the
+  next key reaching it; another runs `life` in terminal 1 and finds Alt+F2
+  and `vt 2` refused and the ending key reaching it. A pipeline's first
+  command has its console's terminal too. A command
   on serial leaves the shown terminal where it is. `term`, `term text` and
   the scroll keys work as above. A scenario types in terminal 1, switches
   to 2 with Alt+F2, types there, switches back and finds 1's text intact (a

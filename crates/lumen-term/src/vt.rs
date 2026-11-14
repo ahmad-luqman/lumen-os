@@ -164,7 +164,8 @@ mod tests {
     #[test]
     fn interleaved_routing_and_taking_matches_a_model() {
         // A model: one queue per terminal, unbounded; the router agrees
-        // while no ring overflows (`route` asserts none did with this seed).
+        // while no ring overflows (the assert! on each route checks none did
+        // with this seed).
         let mut r: Router<u32, 4, 64> = Router::new();
         let mut model: [Vec<u32>; 4] = Default::default();
         let mut seed = 0x2545_f491_u32;

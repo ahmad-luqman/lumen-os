@@ -135,24 +135,26 @@ TABS_ORIGIN, TABS_SIZE = (1112, 32), (144, 32)
 
 VT_STATUS = re.compile(
     r"vt: terminal (\d) of 4 shown \(Alt\+F1 to F4 switch\); "
-    r"keys dropped (\d+) (\d+) (\d+) (\d+); (\d+) switches refused\n"
+    r"keys dropped (\d+) (\d+) (\d+) (\d+), discarded (\d+) (\d+) (\d+) (\d+); "
+    r"(\d+) switches refused\n"
 )
 
 
 class VtStatus(NamedTuple):
     shown: int
     dropped: tuple[int, ...]
+    discarded: tuple[int, ...]
     refused: int
 
 
 def vt_status(m: Machine) -> VtStatus:
     """The serial shell's `vt`: the virtual terminal shown (from 1), the
-    keys each dropped, the switches refused."""
+    keys each dropped and discarded, the switches refused."""
     m.send_line("vt")
     found = m.expect(VT_STATUS, 10)
     m.expect(r"lumen> ", 10)
     n = [int(g) for g in found.groups()]
-    return VtStatus(n[0], tuple(n[1:5]), n[5])
+    return VtStatus(n[0], tuple(n[1:5]), tuple(n[5:9]), n[9])
 
 
 def test_virtual_terminals_are_independent(boot, artifacts, golden_dir):
@@ -202,13 +204,13 @@ def test_virtual_terminals_are_independent(boot, artifacts, golden_dir):
         m.send_line(f"vt {bad}")
         m.expect(r"usage: vt \[n\] \(n from 1 to 4\)\n", 10)
     expect_screen(m, r"\Alumen> echo one\none\nlumen>\s*\Z")
-    assert vt_status(m) == VtStatus(1, (0, 0, 0, 0), 0)
+    assert vt_status(m) == VtStatus(1, (0, 0, 0, 0), (0, 0, 0, 0), 0)
 
 
 def test_a_command_drawing_keeps_its_terminal_shown(boot):
     # While `life` (typed in terminal 1) has the screen, Alt+F2 and `vt 2`
-    # don't switch (each logged and counted): the key that ends it still
-    # reaches it, in terminal 1.
+    # don't switch (both counted; Alt+F2's logged, `vt 2`'s answered on its
+    # console): the key that ends it still reaches it, in terminal 1.
     m = boot_term(boot)
     m.type_text("life\n")
     expect_screen(m, r"^life: gun on 160x80 cells; a key quits$")
@@ -221,4 +223,21 @@ def test_a_command_drawing_keeps_its_terminal_shown(boot):
     assert (status.shown, status.refused) == (1, 2), status
     m.press(["x"])
     expect_screen(m, r"^life: generation \d+, \d+ alive\nlumen>$")
+    assert vt_status(m).shown == 1
+
+
+def test_a_command_drawing_brings_its_terminal_to_the_front(boot):
+    # A script typed in terminal 1 waits, then draws; meanwhile Alt+F2 shows
+    # terminal 2. When it draws, terminal 1 comes back to the front (its
+    # "press a key" line in its grid, which `term text` now reads), and the
+    # key typed then reaches it there.
+    m = boot_term(boot)
+    m.type_text("rhai -e 'sleep(4000); draw_rect(0, 0, 50, 50, 0x00ff00)'\n")
+    m.press(["alt", "f2"])
+    expect_screen(m, r"\Alumen>\s*\Z")
+    assert vt_status(m).shown == 2
+    expect_screen(m, r"^rhai: press a key on the keyboard$", 30)
+    assert vt_status(m).shown == 1
+    m.press(["spc"])
+    expect_screen(m, r"^rhai: press a key on the keyboard\nlumen>$")
     assert vt_status(m).shown == 1
