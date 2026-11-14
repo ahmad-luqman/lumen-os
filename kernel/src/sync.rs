@@ -258,7 +258,8 @@ crate::ktest!(
         // goes on until either has seen a `try_lock` fail: under KVM the
         // host can stop one vCPU for longer than the other's whole run
         // (#85), so a fixed count needn't overlap. `CONTENTION_NS` bounds
-        // that, well inside the test deadline the waits below use.
+        // that, well inside the 10 s `DONE` wait below
+        // (`sched::TEST_DEADLINE_NS`).
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::{AtomicBool, AtomicU64};
         const ROUNDS: u64 = 20_000;
@@ -266,20 +267,21 @@ crate::ktest!(
         static HOT: SpinLock<u64> = SpinLock::new(0);
         static MISSES: AtomicU64 = AtomicU64::new(0);
         static ENTERED_THERE: AtomicU64 = AtomicU64::new(0);
+        static ROUNDS_THERE: AtomicU64 = AtomicU64::new(0);
         /// Some `try_lock` found the lock held, on either CPU.
         static CONTENDED: AtomicBool = AtomicBool::new(false);
-        /// When both stop waiting for contention (`now_ns`), set before `GO`.
-        static UNTIL: AtomicU64 = AtomicU64::new(0);
-        /// CPU 1 is in its job; both start hammering on `GO`.
+        /// CPU 1 is in its job.
         static READY: AtomicBool = AtomicBool::new(false);
-        static GO: AtomicBool = AtomicBool::new(false);
+        /// 0 until both start hammering; then the `now_ns` past which,
+        /// with `ROUNDS` done, both stop even without contention.
+        static GO_UNTIL: AtomicU64 = AtomicU64::new(0);
         static DONE: AtomicBool = AtomicBool::new(false);
         /// The rounds this CPU entered the lock in, and all its rounds.
-        fn hammer() -> (u64, u64) {
-            let until = UNTIL.load(Ordering::Relaxed);
-            let (mut entered, mut i) = (0, 0);
-            while i < ROUNDS || (!CONTENDED.load(Ordering::Relaxed) && crate::time::now_ns() < until) {
-                let guard = if i % 2 == 0 { Some(HOT.lock()) } else { HOT.try_lock() };
+        fn hammer(until: u64) -> (u64, u64) {
+            let mut entered = 0;
+            let mut rounds = 0;
+            while rounds < ROUNDS || (!CONTENDED.load(Ordering::Relaxed) && crate::time::now_ns() < until) {
+                let guard = if rounds % 2 == 0 { Some(HOT.lock()) } else { HOT.try_lock() };
                 match guard {
                     Some(mut g) => {
                         if !HOT.held_here() {
@@ -290,35 +292,42 @@ crate::ktest!(
                     }
                     None => CONTENDED.store(true, Ordering::Relaxed),
                 }
-                i += 1;
+                rounds += 1;
             }
-            (entered, i)
+            (entered, rounds)
         }
         fn on_cpu_1() {
             READY.store(true, Ordering::Release);
             // Bounded: if CPU 0 gave up, don't stay here.
             let deadline = crate::time::now_ns() + 10_000_000_000;
-            while !GO.load(Ordering::Acquire) {
-                if crate::time::now_ns() > deadline {
-                    return;
+            let until = loop {
+                match GO_UNTIL.load(Ordering::Acquire) {
+                    0 if crate::time::now_ns() > deadline => return,
+                    0 => core::hint::spin_loop(),
+                    until => break until,
                 }
-                core::hint::spin_loop();
-            }
-            ENTERED_THERE.store(hammer().0, Ordering::Relaxed);
+            };
+            let (entered, rounds) = hammer(until);
+            ENTERED_THERE.store(entered, Ordering::Relaxed);
+            ROUNDS_THERE.store(rounds, Ordering::Relaxed);
             DONE.store(true, Ordering::Release);
         }
         crate::smp::run_on_test(1, on_cpu_1)?;
         kassert!(crate::smp::job_reached(1, || READY.load(Ordering::Acquire)));
         let start = crate::time::now_ns();
-        UNTIL.store(start + CONTENTION_NS, Ordering::Relaxed);
-        GO.store(true, Ordering::Release);
-        let (entered_here, rounds_here) = hammer();
-        kassert!(crate::smp::job_reached(1, || DONE.load(Ordering::Acquire)));
-        let there = ENTERED_THERE.load(Ordering::Relaxed);
+        let until = start + CONTENTION_NS;
+        GO_UNTIL.store(until, Ordering::Release);
+        let (entered_here, rounds_here) = hammer(until);
+        let ran_us = (crate::time::now_ns() - start) / 1000;
+        let done = crate::smp::job_reached(1, || DONE.load(Ordering::Acquire));
+        // Before any verdict: a CPU with few rounds was stopped meanwhile;
+        // both with many and no contention would be a broken lock.
         crate::ktest::diag(format_args!(
-            "cpu 0: {rounds_here} rounds in {} us",
-            (crate::time::now_ns() - start) / 1000
+            "cpu 0: {rounds_here} rounds in {ran_us} us; cpu 1: {}",
+            if done { alloc::format!("{} rounds", ROUNDS_THERE.load(Ordering::Relaxed)) } else { "not done".into() }
         ));
+        kassert!(done);
+        let there = ENTERED_THERE.load(Ordering::Relaxed);
         kassert!(CONTENDED.load(Ordering::Relaxed)); // some `try_lock` found it held
         kassert_eq!(MISSES.load(Ordering::Relaxed), 0);
         kassert_eq!(*HOT.lock(), entered_here + there);
