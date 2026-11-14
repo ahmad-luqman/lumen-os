@@ -17,9 +17,9 @@
 //!    controllers (8259s masked, local APIC on, I/O APIC inputs masked), the
 //!    TSC and local APIC timer calibrated, interrupts on, the scheduler
 //!    started on every CPU (`kmain`'s context becomes the `main` thread);
-//!    then the framebuffer, the PS/2 keyboard, `boot complete` and the boot
-//!    timeline, then either the in-kernel tests (`--features ktest`) or the
-//!    kernel monitor.
+//!    then the framebuffer and its terminal, the PS/2 keyboard, `boot
+//!    complete` and the boot timeline, then either the in-kernel tests
+//!    (`--features ktest`) or the kernel monitor.
 
 #![no_std]
 #![no_main]
@@ -43,6 +43,7 @@ mod sched;
 mod smp;
 mod symbols;
 mod sync;
+mod term;
 mod time;
 mod trace;
 
@@ -184,8 +185,8 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     ktrace!(Kind::BootPhase, BootPhase::Smp);
     match boot::FRAMEBUFFER.get_response().and_then(|r| r.framebuffers().next()) {
         Some(fb) => match fb::init(&fb) {
-            Some((w, h)) => info!(target: "fb", "framebuffer {w}x{h} ready"),
-            None => warn!(target: "fb", "framebuffer format unsupported (bpp {})", fb.bpp()),
+            Ok((w, h)) => info!(target: "fb", "framebuffer {w}x{h} ready"),
+            Err(e) => warn!(target: "fb", "framebuffer {}x{} unusable: {e}", fb.width(), fb.height()),
         },
         None => warn!(target: "fb", "no framebuffer"),
     }

@@ -1,5 +1,6 @@
-//! Kernel monitor: a tiny line-based console on serial (typed on serial or
-//! the PS/2 keyboard; output on serial).
+//! Kernel monitor: a tiny line-based console (typed on serial or the PS/2
+//! keyboard; output on serial and the screen's terminal, where Shift+PageUp
+//! and Shift+PageDown scroll the view back and forward).
 //!
 //! This is a debugging and testing aid, not the shell. It exists so the test
 //! harness can script the kernel over serial (and trigger deliberate faults)
@@ -15,11 +16,36 @@ const PROMPT: &str = "kmon> ";
 const CRASH_KINDS: &str = "pf ud de gp df wtext nx panic oom dfree heapcorrupt stack bigframe guard";
 const MAX_LINE: usize = 128;
 
+/// kmon's output: serial and the screen. Serial must stay plain text (the
+/// harness reads it): write escape sequences through [`Screen`], never
+/// `Out`. Each `write!` reaches the screen whole (one lock), not in
+/// pieces another CPU's log line could land between.
+struct Out;
+
+impl Write for Out {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        serial::write_bytes(s.as_bytes());
+        crate::term::write_str(s);
+        Ok(())
+    }
+
+    fn write_fmt(&mut self, args: core::fmt::Arguments<'_>) -> core::fmt::Result {
+        serial::SerialWriter.write_fmt(args)?;
+        crate::term::write_fmt(args);
+        Ok(())
+    }
+}
+
+/// Echo what was typed, on serial and the screen.
+fn echo(s: &str) {
+    let _ = Out.write_str(s);
+}
+
 pub fn run() -> ! {
     log::info!(target: "kmon", "kernel monitor ready; type 'help'");
     let mut buf = [0u8; MAX_LINE];
     loop {
-        serial::write_bytes(PROMPT.as_bytes());
+        echo(PROMPT);
         let len = read_line(&mut buf);
         let line = core::str::from_utf8(&buf[..len]).unwrap_or("").trim();
         dispatch(line);
@@ -28,15 +54,27 @@ pub fn run() -> ! {
 
 /// The next byte typed, on serial or the keyboard (from the keyboard, an
 /// ASCII character; others, like a `uk` layout's £, are skipped), if any.
+/// Typing on the keyboard shows the screen again if it was scrolled back;
+/// Shift+PageUp and Shift+PageDown scroll it by half a screen.
 fn try_read_byte() -> Option<u8> {
-    serial::try_read_byte().or_else(|| {
-        let c = crate::keyboard::read_char()?;
-        c.is_ascii().then_some(c as u8)
-    })
+    use crate::keyboard::{Key, KeyCode};
+    if let Some(b) = serial::try_read_byte() {
+        return Some(b);
+    }
+    match crate::keyboard::read_key()? {
+        Key::Raw { code: KeyCode::PageUp, shift: true } => crate::term::scroll_half_pages(1),
+        Key::Raw { code: KeyCode::PageDown, shift: true } => crate::term::scroll_half_pages(-1),
+        Key::Raw { .. } => {}
+        Key::Char(c) => {
+            crate::term::reset_view();
+            return c.is_ascii().then_some(c as u8);
+        }
+    }
+    None
 }
 
-/// Read one line, typed on serial or the keyboard, with echo (on serial)
-/// and backspace handling.
+/// Read one line, typed on serial or the keyboard, with echo (on serial and
+/// the screen) and backspace handling.
 fn read_line(buf: &mut [u8]) -> usize {
     let mut len = 0;
     loop {
@@ -48,17 +86,17 @@ fn read_line(buf: &mut [u8]) -> usize {
         };
         match b {
             b'\r' | b'\n' => {
-                serial::write_bytes(b"\n");
+                echo("\n");
                 return len;
             }
             0x08 | 0x7f if len > 0 => {
                 len -= 1;
-                serial::write_bytes(b"\x08 \x08");
+                echo("\x08 \x08");
             }
             0x20..=0x7e if len < buf.len() => {
                 buf[len] = b;
                 len += 1;
-                serial::write_byte(b);
+                echo(char::from(b).encode_utf8(&mut [0; 4]));
             }
             _ => {}
         }
@@ -66,7 +104,7 @@ fn read_line(buf: &mut [u8]) -> usize {
 }
 
 fn dispatch(line: &str) {
-    let mut out = serial::SerialWriter;
+    let mut out = Out;
     let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
     match cmd {
         "" => {}
@@ -80,6 +118,10 @@ fn dispatch(line: &str) {
                  heap              heap usage and free-list summary\n  \
                  ticks             the boot CPU's timer interrupts (and stray ones)\n  \
                  kbd               the keyboard's layout and interrupts\n  \
+                 term              the screen's terminal: size, cursor, scrollback\n  \
+                 clear             clear the screen and its scrollback\n  \
+                 colors            a colour test pattern (on screen)\n  \
+                 seq <n>           print 1 to n, a line each\n  \
                  sleep <ms>        wait that long (guest time)\n  \
                  uptime            nanoseconds since the TSC started\n  \
                  clocks            the TSC's frequency, measured again against each clock\n  \
@@ -155,6 +197,45 @@ fn dispatch(line: &str) {
                 _ => writeln!(out, "kbd: not set up"),
             };
         }
+        "term" => match crate::term::status() {
+            Some(t) => {
+                let _ = writeln!(
+                    out,
+                    "term: {}x{}, cursor ({}, {}){}, scrollback {}/{} lines, view {} lines up, \
+                     top row \"{}\", {} cells drawn",
+                    t.cols,
+                    t.rows,
+                    t.cursor.col,
+                    t.cursor.row,
+                    if t.cursor.visible { "" } else { " hidden" },
+                    t.scrollback,
+                    t.capacity,
+                    t.view,
+                    t.top_row,
+                    t.cells_drawn
+                );
+            }
+            None => {
+                let _ = writeln!(out, "term: no terminal (no usable framebuffer, or one too small)");
+            }
+        },
+        "clear" => {
+            // Home, erase the screen, erase the scrollback.
+            if !crate::term::write_bytes(b"\x1b[H\x1b[2J\x1b[3J") {
+                let _ = writeln!(out, "clear: no terminal");
+            }
+        }
+        "colors" => colors(),
+        "seq" => match rest.trim().parse::<u32>() {
+            Ok(n) if n <= 10_000 => {
+                for i in 1..=n {
+                    let _ = writeln!(out, "{i}");
+                }
+            }
+            _ => {
+                let _ = writeln!(out, "usage: seq <n> (up to 10000)");
+            }
+        },
         "uptime" => {
             let _ = writeln!(out, "uptime: {} ns", crate::time::now_ns());
         }
@@ -171,11 +252,76 @@ fn dispatch(line: &str) {
     }
 }
 
+/// A colour test pattern, on the screen only (escapes stay off serial):
+/// the 16 named colours as backgrounds (`48;5;n`) and as text (SGR 30-37
+/// and 90-97),
+/// the 6x6x6 cube and the grey ramp (256-colour SGR), bold, inverse and a
+/// truecolor gradient; then `colors: done` on both.
+fn colors() {
+    if crate::term::status().is_none() {
+        let _ = writeln!(Out, "colors: no terminal");
+        return;
+    }
+    let mut s = Screen;
+    let _ = write!(s, "16 colours  ");
+    for i in 0..16 {
+        let _ = write!(s, "\x1b[48;5;{i}m   ");
+        if i == 7 {
+            let _ = write!(s, "\x1b[0m ");
+        }
+    }
+    let _ = write!(s, "\x1b[0m\r\ntext        ");
+    for i in 0..8 {
+        let _ = write!(s, "\x1b[3{i}mAa\x1b[9{i}mAa ");
+    }
+    let _ = write!(s, "\x1b[0m\r\n");
+    for g in 0..6 {
+        let _ = write!(s, "{}", if g == 0 { "256 colours " } else { "            " });
+        for r in 0..6 {
+            for b in 0..6 {
+                let _ = write!(s, "\x1b[48;5;{}m  ", 16 + 36 * r + 6 * g + b);
+            }
+            let _ = write!(s, "\x1b[0m ");
+        }
+        let _ = write!(s, "\r\n");
+    }
+    let _ = write!(s, "grey ramp   ");
+    for i in 232..=255 {
+        let _ = write!(s, "\x1b[48;5;{i}m  ");
+    }
+    let _ = write!(
+        s,
+        "\x1b[0m\r\nattributes  \x1b[1mbold\x1b[0m \x1b[7minverse\x1b[0m \x1b[1;7;94mboth\x1b[0m \x1b[1;91mbright\x1b[0m\r\ntruecolor   "
+    );
+    for i in 0..48 {
+        let v = i * 255 / 47;
+        let _ = write!(s, "\x1b[48;2;{v};{};{}m ", 255 - v, (v / 2) + 64);
+    }
+    let _ = write!(s, "\x1b[0m\r\n");
+    let _ = writeln!(Out, "colors: done");
+}
+
+/// Writes to the screen only (escape sequences, kept off serial), each
+/// `write!` whole.
+struct Screen;
+
+impl Write for Screen {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        crate::term::write_bytes(s.as_bytes());
+        Ok(())
+    }
+
+    fn write_fmt(&mut self, args: core::fmt::Arguments<'_>) -> core::fmt::Result {
+        crate::term::write_raw_fmt(args);
+        Ok(())
+    }
+}
+
 /// The TSC's boot calibration, and its frequency measured again now against
 /// the PIT and the HPET (the tests compare them).
 fn clocks() {
     use crate::time::{self, Reference};
-    let mut out = serial::SerialWriter;
+    let mut out = Out;
     let (Some(tsc), Some(reference)) = (time::tsc(), time::reference()) else {
         let _ = writeln!(out, "clocks: the TSC isn't calibrated");
         return;
@@ -206,7 +352,7 @@ fn clocks() {
 }
 
 fn trace(n: u64) {
-    let mut out = serial::SerialWriter;
+    let mut out = Out;
     let ring = crate::trace::ring();
     let cap = ring.capacity() as u64;
     if n > cap {
@@ -220,7 +366,7 @@ fn trace(n: u64) {
 /// (from its idle thread; its crash report then stops this one), or in a new
 /// thread on this CPU (named `kmon-crash`), which kmon waits for.
 fn crash(args: &str) {
-    let mut out = serial::SerialWriter;
+    let mut out = Out;
     let mut words = args.split_whitespace();
     let kind = words.next().unwrap_or("");
     let Some(fault) = crash_fn(kind) else {
@@ -320,7 +466,7 @@ fn crash_write_text() {
     // SAFETY: deliberately faulting; if the write is allowed it stores the
     // byte that was already there.
     unsafe { core::ptr::write_volatile(target, core::ptr::read_volatile(target)) };
-    let _ = writeln!(serial::SerialWriter, "crash: write to .text succeeded (W^X broken)");
+    let _ = writeln!(Out, "crash: write to .text succeeded (W^X broken)");
 }
 
 /// One `ret` instruction in `.data` (writable, so it must not be executable).
@@ -337,7 +483,7 @@ fn crash_execute_data() {
     // `ret`, which returns here with every register intact except the ones
     // `clobber_abi` lists.
     unsafe { asm!("call {0}", in(reg) target, clobber_abi("C")) };
-    let _ = writeln!(serial::SerialWriter, "crash: executing .data succeeded (NX broken)");
+    let _ = writeln!(Out, "crash: executing .data succeeded (NX broken)");
 }
 
 #[inline(never)]
@@ -352,7 +498,7 @@ fn crash_panic() {
 #[inline(never)]
 fn crash_out_of_memory() {
     drop(core::hint::black_box(alloc::vec::Vec::<u8>::with_capacity(1 << 41)));
-    let _ = writeln!(serial::SerialWriter, "crash: a 2 TiB allocation succeeded (heap limit broken)");
+    let _ = writeln!(Out, "crash: a 2 TiB allocation succeeded (heap limit broken)");
 }
 
 /// Allocate `layout` or end in `handle_alloc_error`, keeping LLVM from
@@ -386,7 +532,7 @@ fn crash_double_free() {
         alloc::alloc::dealloc(black_box(b), layout);
     }
     drop(keep);
-    let _ = writeln!(serial::SerialWriter, "crash: a double free went unnoticed");
+    let _ = writeln!(Out, "crash: a double free went unnoticed");
 }
 
 /// Write into a freed block (a use after free) so its free-list link points
@@ -414,7 +560,7 @@ fn crash_corrupt_heap() {
         alloc::alloc::dealloc(p, big);
         alloc::alloc::dealloc(b, layout);
     }
-    let _ = writeln!(serial::SerialWriter, "crash: a corrupt free list went unnoticed");
+    let _ = writeln!(Out, "crash: a corrupt free list went unnoticed");
 }
 
 /// Write into the guard page below the stack this runs on (this CPU's main
@@ -425,19 +571,19 @@ fn crash_corrupt_heap() {
 fn crash_touch_guard() {
     // The stack it runs on.
     let Some(main) = arch::stacks::stack_of(arch::read_rsp()) else {
-        let _ = writeln!(serial::SerialWriter, "crash: not on a registered stack");
+        let _ = writeln!(Out, "crash: not on a registered stack");
         return;
     };
     // SAFETY: deliberately faulting: the guard page is never mapped.
     unsafe { core::ptr::write_volatile((main.range.guard() + 8) as *mut u64, 1) };
-    let _ = writeln!(serial::SerialWriter, "crash: writing to a guard page succeeded (guard page mapped?)");
+    let _ = writeln!(Out, "crash: writing to a guard page succeeded (guard page mapped?)");
 }
 
 /// Overflow this CPU's main stack with small frames.
 #[inline(never)]
 fn crash_stack_overflow() {
     let depth = recurse(0);
-    let _ = writeln!(serial::SerialWriter, "crash: recursion returned at depth {depth} (no guard page?)");
+    let _ = writeln!(Out, "crash: recursion returned at depth {depth} (no guard page?)");
 }
 
 /// Overflow the main stack with frames bigger than a page: stack probes must
@@ -446,7 +592,7 @@ fn crash_stack_overflow() {
 #[inline(never)]
 fn crash_big_frame_overflow() {
     let depth = recurse_big(0);
-    let _ = writeln!(serial::SerialWriter, "crash: big-frame recursion returned at depth {depth} (no guard page?)");
+    let _ = writeln!(Out, "crash: big-frame recursion returned at depth {depth} (no guard page?)");
 }
 
 /// [`recurse`] with a 16 KiB frame of which only the lowest word is written:
@@ -477,3 +623,18 @@ fn recurse(depth: u64) -> u64 {
     }
     recurse(depth + 1) + frame[7]
 }
+
+crate::ktest!(
+    fn kmon_writes_each_write_whole() {
+        // kmon's writers (serial and screen, screen only) format a whole
+        // `write!` under the screen's lock.
+        use crate::kassert;
+        use crate::term::LockProbe;
+        use core::sync::atomic::{AtomicBool, Ordering};
+        let (out, screen) = (AtomicBool::new(false), AtomicBool::new(false));
+        let _ = write!(Out, "{}", LockProbe(&out));
+        let _ = write!(Screen, "{}", LockProbe(&screen));
+        kassert!(out.load(Ordering::Relaxed) && screen.load(Ordering::Relaxed));
+        Ok(())
+    }
+);

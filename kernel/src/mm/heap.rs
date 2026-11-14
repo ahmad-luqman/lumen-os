@@ -145,6 +145,7 @@ struct KernelAllocator;
 // unwinds out of here.
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        debug_assert!(!crate::term::drawing_here(), "allocation under the screen's lock");
         let mut state = STATE.lock();
         if let Some(p) = state.heap.alloc(layout) {
             return p.as_ptr();

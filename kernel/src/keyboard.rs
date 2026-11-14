@@ -28,9 +28,10 @@
 //! moves bytes from the controller into a lock-free single-producer,
 //! single-consumer queue (`lumen_queue::ByteQueue`), discarding bytes from
 //! the second port (a mouse) and counting and discarding those flagged with
-//! a parity or timeout error. Readers ([`read_char`]) decode them with the
+//! a parity or timeout error. Readers ([`read_key`]) decode them with the
 //! `pc-keyboard` crate under a lock, in the layout `lumen.keymap=` names
-//! (`us` without one, or for a name it doesn't know, with a warning).
+//! (`us` without one, or for a name it doesn't know, with a warning), into
+//! characters and other keys (with the shift state).
 //! kmon's `kbd` shows how it went ([`stats`]).
 
 use core::fmt;
@@ -474,25 +475,40 @@ fn drain() {
     }
 }
 
-/// The next character typed, if one is waiting (keys that make none, such
-/// as shift alone or the arrows, are consumed and skipped). Never blocks.
+pub use pc_keyboard::KeyCode;
+
+/// A key read from the keyboard. (Only shift is reported; the shell, #62,
+/// will need ctrl and alt.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    /// A key making a character, in the layout.
+    Char(char),
+    /// Any other key pressed (an arrow, PageUp, a modifier), and whether
+    /// shift was held.
+    Raw { code: KeyCode, shift: bool },
+}
+
+/// The next key pressed, if one is waiting (releases are consumed and
+/// skipped). Never blocks.
 /// (A byte the queue dropped can leave the decoder out of step, e.g. shift
 /// still held, until the key is pressed again; `kbd` counts drops.)
-pub fn read_char() -> Option<char> {
+pub fn read_key() -> Option<Key> {
     let mut keyboard = KEYBOARD.lock();
     decode(&mut keyboard.as_mut()?.decoder, || QUEUE.pop())
 }
 
-/// Feed `next()`'s bytes to `decoder` until one completes a character;
+/// Feed `next()`'s bytes to `decoder` until one completes a key press;
 /// bytes it refuses are counted.
-fn decode(decoder: &mut Decoder, mut next: impl FnMut() -> Option<u8>) -> Option<char> {
+fn decode(decoder: &mut Decoder, mut next: impl FnMut() -> Option<u8>) -> Option<Key> {
     while let Some(byte) = next() {
         match decoder.add_byte(byte) {
-            Ok(Some(event)) => {
-                if let Some(DecodedKey::Unicode(c)) = decoder.process_keyevent(event) {
-                    return Some(c);
+            Ok(Some(event)) => match decoder.process_keyevent(event) {
+                Some(DecodedKey::Unicode(c)) => return Some(Key::Char(c)),
+                Some(DecodedKey::RawKey(code)) => {
+                    return Some(Key::Raw { code, shift: decoder.get_modifiers().is_shifted() });
                 }
-            }
+                None => {}
+            },
             Ok(None) => {}
             Err(_) => {
                 UNDECODED.fetch_add(1, Ordering::Relaxed);
@@ -541,7 +557,12 @@ pub fn stats() -> Stats {
 fn decode_all(name: &str, bytes: &[u8]) -> alloc::string::String {
     let mut decoder = new_decoder(choose_layout(Some(name)).1);
     let mut it = bytes.iter().copied();
-    core::iter::from_fn(|| decode(&mut decoder, || it.next())).collect()
+    core::iter::from_fn(|| decode(&mut decoder, || it.next()))
+        .filter_map(|k| match k {
+            Key::Char(c) => Some(c),
+            Key::Raw { .. } => None,
+        })
+        .collect()
 }
 
 crate::ktest!(
@@ -560,6 +581,28 @@ crate::ktest!(
         let before = UNDECODED.load(Ordering::Relaxed);
         kassert_eq!(decode_all("us", &[0xff, 0x15, 0x95]).as_str(), "y");
         kassert_eq!(UNDECODED.load(Ordering::Relaxed), before + 1);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn other_keys_come_with_the_shift_state() {
+        // Set 1: PageUp is 0xe0 0x49 (released 0xe0 0xc9), PageDown 0xe0 0x51;
+        // left shift 0x2a (released 0xaa).
+        use crate::kassert_eq;
+        let mut decoder = new_decoder(choose_layout(Some("us")).1);
+        let bytes = [0x2a, 0xe0, 0x49, 0xe0, 0xc9, 0xaa, 0xe0, 0x51, 0xe0, 0xd1, 0x1e, 0x9e];
+        let mut it = bytes.iter().copied();
+        let keys: alloc::vec::Vec<Key> = core::iter::from_fn(|| decode(&mut decoder, || it.next())).collect();
+        kassert_eq!(
+            keys,
+            alloc::vec![
+                Key::Raw { code: KeyCode::LShift, shift: true },
+                Key::Raw { code: KeyCode::PageUp, shift: true },
+                Key::Raw { code: KeyCode::PageDown, shift: false },
+                Key::Char('a'),
+            ]
+        );
         Ok(())
     }
 );

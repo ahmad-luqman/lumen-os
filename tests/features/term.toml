@@ -1,0 +1,33 @@
+# Features: term. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Terminal emulator core (lumen-term, in the kernel with audit passing): escape sequences into a cell grid (16, 256 and truecolor SGR, cursor movement and save/restore, erase, insert/delete, scroll regions, tabs, autowrap), wide characters, malformed input ignored, a scrollback ring, damage a renderer can draw from alone; writing never allocates"
+milestone = "M2"
+tests = [
+    "cargo:lumen-term",
+    "audit:flags",
+]
+
+[[feature]]
+name = "The terminal on the framebuffer below the unchanged header: kmon's output and echo on screen (escapes kept off serial), a colour test pattern, log lines coloured by level and starting from the default colours, each write formatted under one lock, only changed cells drawn, scrolls drawn by moving pixels (matching a full redraw), the cursor's blink phase"
+milestone = "M2"
+tests = [
+    "scenario:test_term::test_ansi_colours_golden",
+    "ktest:lumen_kernel::term::log_lines_are_coloured_by_level",
+    "ktest:lumen_kernel::term::only_changed_cells_are_drawn",
+    "ktest:lumen_kernel::term::the_cursor_blinks",
+    "ktest:lumen_kernel::term::scrolled_pixels_match_a_full_redraw",
+    "ktest:lumen_kernel::term::a_log_line_starts_from_the_default_colours",
+    "ktest:lumen_kernel::term::write_fmt_formats_under_the_lock",
+    "ktest:lumen_kernel::kmon::kmon_writes_each_write_whole",
+    "scenario:test_screen::test_boot_hello_golden",
+]
+
+[[feature]]
+name = "Scrollback on screen: Shift+PageUp/PageDown scroll the view half a screen, output keeps it on its lines, the cursor isn't drawn while scrolled back, typing returns it"
+milestone = "M2"
+tests = [
+    "scenario:test_term::test_scrollback",
+    "ktest:lumen_kernel::term::the_cursor_is_not_drawn_while_scrolled_back",
+    "ktest:lumen_kernel::keyboard::other_keys_come_with_the_shift_state",
+]

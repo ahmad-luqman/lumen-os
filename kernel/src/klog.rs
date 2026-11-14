@@ -13,8 +13,8 @@
 //! The timestamp is seconds since `kmain` began, to the microsecond; every
 //! line before the TSC is calibrated (before the `time: tsc` line) shows `?`
 //! instead (the boot timeline covers those phases afterwards). The screen's
-//! console shows lines without it, so screenshots stay comparable (not
-//! tested: the golden image covers only the header).
+//! terminal shows lines up to `info` without it, so screenshots stay
+//! comparable, with the level coloured (`crate::term`).
 //!
 //! The tag is the `target:` given at the call site, or else the module path
 //! with the `lumen_kernel::` prefix removed. The level threshold comes from
@@ -52,7 +52,7 @@ impl Log for KernelLogger {
         let mut out = SerialWriter;
         let _ = writeln!(out, "{stamp} {:<5} {}: {}", record.level(), tag, record.args());
         if record.level() <= Level::Info {
-            crate::fb::console_log(record.level(), tag, record.args());
+            crate::term::console_log(record.level(), tag, record.args());
         }
     }
 

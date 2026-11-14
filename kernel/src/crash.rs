@@ -182,6 +182,11 @@ fn enter(vector: u64, rip: u64) {
     let me = arch::cpu_index();
     match CRASHING.compare_exchange(0, me + 1, Ordering::SeqCst, Ordering::SeqCst) {
         Ok(_) => {
+            // No drawing starts from here on: a CPU stopped while drawing
+            // holds the screen's lock for good (a log line on the crash path
+            // would wait for it forever), and the crash screen draws
+            // straight to the pixels.
+            crate::term::stop();
             ON_AT_ENTRY.store(arch::irq::enabled(), Ordering::SeqCst);
             FIRST_VECTOR.store(vector, Ordering::SeqCst);
             FIRST_AT.store(rip, Ordering::SeqCst);
