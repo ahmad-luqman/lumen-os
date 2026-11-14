@@ -1175,6 +1175,62 @@ the deliberate faults, `crash.rs`).
   than the console, pipes, variables and scripts, and a shell in user mode
   (M9).
 
+### Demos (built in M2)
+
+- **What:** `mandelbrot` and `life [pattern] [generations]`, shell
+  commands that draw on the terminal's canvas (`Ctx::canvas`: the pixels
+  below the header, the terminal paused) and give it back on a key typed
+  on the console that ran them. The terminal draws nothing meanwhile, so
+  each draws its prompt in a status line at the canvas's bottom ("press a
+  key on serial", or "on the keyboard": `Console::name`) as well as writing
+  it to the console. The arithmetic, the band dealing and the rules
+  are `lumen-demo`'s (host-tested); `kernel/src/demo.rs` draws them.
+- **Mandelbrot:** fixed point (`i64`, 28 fraction bits; the kernel has no
+  SSE), 64 iterations, the whole set fitted to the canvas above the status
+  line. Points with `|re|` or `|im|` above 2 escape after one step and are
+  answered without iterating, so no step can overflow whatever the
+  screen's shape. Drawn twice: by the calling CPU (the boot CPU, where the
+  shells run) alone, then by every CPU whose scheduler runs, and both
+  times printed with the rows each CPU drew. The image is cut into 8-row
+  bands dealt round-robin (band `i` to slot `i % n`). The calling thread
+  draws slot 0; every other such CPU gets a thread pinned to it
+  (`sched::spawn_on`) holding a clone of the `Arc<Canvas>`, and all are
+  joined before the drawing returns, so none draws after the command drops
+  the canvas (whose drop draws the terminal again). A CPU that gets no
+  thread has its slot drawn by the caller, and the command says so, as it
+  does for a CPU online without a scheduler (and the status line counts
+  them). (Threads, not `smp::run_on` jobs: a job is a bare `fn()`, so
+  reaching the canvas from one would take a static raw pointer and
+  `unsafe`.) Times on four vCPUs are in PR #80.
+- **Life:** 8-pixel cells on a grid whose outside counts as dead (nothing
+  wraps), only changed cells drawn, a status line under the grid (pattern,
+  generation, population). Each pattern starts where it has room (glider
+  and gun at the top left, the lightweight spaceship at the right heading
+  left, R-pentomino and acorn in the middle). With a count it steps that
+  many generations as fast as it can (a key ends it early, and it says
+  so) and holds the frame (the golden test); without one it steps at most
+  20 a second until a key. A screen too small for the pattern (or the
+  set) is refused.
+- **Tests:** `cargo:lumen-demo` (fixed point against `f64`, no overflow on
+  any pixel of extreme screens, band dealing, the B3/S23 truth table, the
+  patterns against their published RLE and placed inside small grids,
+  spaceships moving, the gun's first three periods, the glider ending as a
+  block, the grid against an endless-plane reference, R-pentomino's 116
+  cells at generation 1103); `ktest:lumen_kernel::demo::every_cpu_rendered_rows`
+  (every online CPU draws rows, all rows once, the same pixels as one CPU,
+  no thread still holding the canvas, 20 times on an image of a band per
+  CPU so a missing join shows, and a part band); `test_demo` (goldens of
+  the set and of a glider 40 generations on, each pattern's population
+  after 30 generations against a reference, the rate ceiling, a key ending
+  a counted run, the default pattern, the terminal drawn again after the
+  key, usage errors).
+- **Not yet tested:** a CPU that gets no thread or runs no scheduler (both
+  reported on the console), a canvas that can't be had (`Ctx::canvas`
+  failing), and running the demos from the screen's shell (the same key
+  path; the prompt is in the status line the goldens check). A crash
+  report taking the canvas mid-run stops the demo (`is_live`), but the
+  report halts the shell's CPU, so its message isn't expected to show.
+
 ## 7. Driver interface (planned, M3+)
 
 Drivers are kernel modules behind traits whose methods are **messages**: an

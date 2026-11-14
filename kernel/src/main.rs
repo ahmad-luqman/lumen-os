@@ -31,6 +31,7 @@ mod arch;
 mod boot;
 mod cmdline;
 mod crash;
+mod demo;
 mod fb;
 mod interrupts;
 mod keyboard;

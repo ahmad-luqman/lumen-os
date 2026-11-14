@@ -34,6 +34,10 @@ name = "lumen-acpi"
 version = "0.0.1"
 
 [[package]]
+name = "lumen-demo"
+version = "0.0.1"
+
+[[package]]
 name = "lumen-elf"
 version = "0.0.1"
 
@@ -48,6 +52,7 @@ dependencies = [
  "limine",
  "log",
  "lumen-acpi",
+ "lumen-demo",
  "lumen-elf",
  "lumen-heap",
  "lumen-mm",

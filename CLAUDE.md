@@ -168,6 +168,9 @@ own PR that updates that doc first.
   decoding, `lumen.keymap=`); `arch/x86_64/i8042.rs` its ports.
   `time.rs`: TSC and LAPIC timer calibration, the boot origin
   (`mark_boot`, `since_boot_ns`), `now_ns`, `sleep`, `ticks`.
+  `demo.rs`: the `mandelbrot` (bands on every CPU) and `life` commands.
+- `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs
+  in bands, and Game of Life with its patterns (host-tested).
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
 - `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, the
   page-table format and mapper (host-tested, incl. a model comparison), the

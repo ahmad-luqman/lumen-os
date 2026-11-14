@@ -94,6 +94,11 @@ impl<'a> Ctx<'a> {
     pub fn wait_key(&mut self) -> Key {
         self.out.read_key()
     }
+
+    /// Where this console's keys are typed ("serial", "the keyboard").
+    pub fn console_name(&self) -> &'static str {
+        self.out.name()
+    }
 }
 
 /// A console a shell runs on.
@@ -102,6 +107,9 @@ pub trait Console: Write {
     fn read_key(&mut self) -> Key;
     /// The next key, if one is waiting (never blocks).
     fn try_key(&mut self) -> Option<Key>;
+    /// Where its keys are typed, for a prompt shown elsewhere ("press a key
+    /// on serial").
+    fn name(&self) -> &'static str;
 }
 
 /// Start the screen shell (if there is a terminal and a keyboard), then run
@@ -195,6 +203,10 @@ impl Write for Serial {
 }
 
 impl Console for Serial {
+    fn name(&self) -> &'static str {
+        "serial"
+    }
+
     fn read_key(&mut self) -> Key {
         loop {
             if let Some(key) = self.try_key() {
@@ -257,6 +269,10 @@ impl Screen {
 }
 
 impl Console for Screen {
+    fn name(&self) -> &'static str {
+        "the keyboard"
+    }
+
     fn read_key(&mut self) -> Key {
         loop {
             if let Some(key) = Self::take(keyboard::wait_key()) {
@@ -311,6 +327,10 @@ impl Write for Captured {
 
 #[cfg(feature = "ktest")]
 impl Console for Captured {
+    fn name(&self) -> &'static str {
+        "the test console"
+    }
+
     fn read_key(&mut self) -> Key {
         self.keys.pop_front().unwrap_or_else(|| self.dry())
     }

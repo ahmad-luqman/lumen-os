@@ -297,7 +297,6 @@ impl Owner {
 /// through a static that is cleared only after every job has finished
 /// drawing, and drop it after that: a job still drawing would paint over
 /// the terminal the drop drew.
-#[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
 pub struct Canvas {
     fb: Framebuffer,
     width: usize,
@@ -319,7 +318,6 @@ unsafe impl Sync for Canvas {}
 
 /// Why there is no [`Canvas`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
 pub enum CanvasError {
     /// No terminal (no usable framebuffer, or one too small).
     NoTerminal,
@@ -341,7 +339,6 @@ impl fmt::Display for CanvasError {
 
 /// Take the pixels below the header for `owner` (see [`Canvas`]; commands
 /// use `Ctx::canvas`).
-#[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
 pub fn canvas(owner: Owner) -> Result<Canvas, CanvasError> {
     // `with_screen` refuses on a CPU already drawing too: never one taking
     // a canvas, as drawing holds the screen's lock with interrupts off
@@ -373,7 +370,6 @@ pub fn canvas(owner: Owner) -> Result<Canvas, CanvasError> {
     }
 }
 
-#[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
 impl Canvas {
     /// Width in pixels.
     pub fn width(&self) -> usize {
