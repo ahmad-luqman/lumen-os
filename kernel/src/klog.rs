@@ -22,8 +22,8 @@
 //!
 //! Every emitted line also records a `Log` event in the trace ring
 //! (`crate::trace`); recording it doesn't change the printed line. The
-//! lines as printed on serial are also kept, the newest [`RING_BYTES`] of
-//! them, for the shell's `dmesg` ([`copy_recent`]).
+//! lines as printed on serial are also kept, the newest [`RING_BYTES`]
+//! bytes of them, for the shell's `dmesg` ([`copy_recent`]).
 
 use crate::arch::serial;
 use crate::sync::SpinLock;
@@ -47,10 +47,17 @@ pub const RING_BYTES: usize = 16 * 1024;
 static RING: SpinLock<TextRing<RING_BYTES>> = SpinLock::new(TextRing::new());
 
 /// Copy the newest whole log lines into `out` (as many as fit, oldest
-/// first), as serial printed them; returns the bytes copied. Never
-/// allocates (the caller makes `out`).
+/// first), as serial printed them; returns the bytes copied. A line another
+/// CPU is still writing (pushed in pieces) is left out. Never allocates
+/// (the caller makes `out`).
 pub fn copy_recent(out: &mut [u8]) -> usize {
     RING.lock().copy_lines(out)
+}
+
+/// Bytes of log lines written since boot: more than [`RING_BYTES`] means
+/// the oldest have been overwritten.
+pub fn written() -> u64 {
+    RING.lock().written()
 }
 
 /// Run `f` holding the log's line lock, so no log line (or other serial

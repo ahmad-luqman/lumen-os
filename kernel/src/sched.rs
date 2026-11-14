@@ -373,10 +373,15 @@ static READY: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS
 static CURRENT: [AtomicPtr<Thread>; MAX_CPUS] = [const { AtomicPtr::new(ptr::null_mut()) }; MAX_CPUS];
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// Every thread not yet dropped (weakly: the registry keeps none alive).
-/// A leaf lock: nothing else is taken while it is held but the heap's.
+/// Pruned of the dropped ones whenever a thread is created. Nothing else is
+/// locked while it is held but the heap (which it allocates from, so it
+/// must never be taken under the heap's or the page tables' locks).
 static THREADS: SpinLock<Vec<Weak<Thread>>> = SpinLock::new(Vec::new());
 /// Ticks each CPU's scheduler has taken (from its start), and how many of
-/// them found the idle thread running.
+/// them found the idle thread running. A tick is counted in `TICKED` before
+/// `IDLE_TICKS` (whose increment releases it), and [`cpu_ticks`] reads them
+/// the other way round (acquiring), so a reading never has more idle ticks
+/// than ticks.
 static TICKED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static IDLE_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
@@ -400,9 +405,12 @@ pub struct ThreadInfo {
     pub ticks: u64,
 }
 
-/// Every thread still alive (dead ones not yet dropped included), oldest
-/// first.
+/// Every thread whose record is still held somewhere, in the order they
+/// were created; that includes dead threads a join handle or the scheduler
+/// still holds.
 pub fn threads() -> Vec<ThreadInfo> {
+    // Collected first so the `Arc`s drop after `THREADS` is released (the
+    // last one dropped frees a thread's record).
     let live: Vec<Arc<Thread>> = THREADS.lock().iter().filter_map(Weak::upgrade).collect();
     live.iter()
         .map(|t| ThreadInfo {
@@ -422,10 +430,26 @@ pub struct CpuTicks {
     pub idle: u64,
 }
 
+impl CpuTicks {
+    /// The ticks taken since `earlier` (a reading of the same CPU).
+    pub fn since(self, earlier: CpuTicks) -> CpuTicks {
+        CpuTicks { ticks: self.ticks.saturating_sub(earlier.ticks), idle: self.idle.saturating_sub(earlier.idle) }
+    }
+
+    /// How busy the CPU was over these ticks, in whole percent (idle ticks
+    /// past the ticks count as all idle).
+    pub fn busy_percent(self) -> u64 {
+        lumen_time::busy_percent(self.ticks, self.idle)
+    }
+}
+
 /// CPU `cpu`'s [`CpuTicks`] (zeros for a CPU index that doesn't exist).
 pub fn cpu_ticks(cpu: usize) -> CpuTicks {
     match (TICKED.get(cpu), IDLE_TICKS.get(cpu)) {
-        (Some(t), Some(i)) => CpuTicks { ticks: t.load(Ordering::Relaxed), idle: i.load(Ordering::Relaxed) },
+        (Some(t), Some(i)) => {
+            let idle = i.load(Ordering::Acquire);
+            CpuTicks { ticks: t.load(Ordering::Relaxed), idle }
+        }
         _ => CpuTicks::default(),
     }
 }
@@ -697,7 +721,7 @@ pub fn tick() {
         TICKED[cpu].fetch_add(1, Ordering::Relaxed);
         q.running().ticks.fetch_add(1, Ordering::Relaxed);
         if q.on_idle() {
-            IDLE_TICKS[cpu].fetch_add(1, Ordering::Relaxed);
+            IDLE_TICKS[cpu].fetch_add(1, Ordering::Release);
         }
         q.wake_sleepers(cpu, now);
         q.slice_left = q.slice_left.saturating_sub(1);
@@ -943,6 +967,38 @@ fn switched_away(start: u64, id: u64, state: State) -> bool {
 fn last_cpu() -> Result<usize, &'static str> {
     running_cpus().last().copied().ok_or("no CPU runs a scheduler")
 }
+
+crate::ktest!(
+    fn busy_and_idle_ticks_are_counted() {
+        // On the last CPU: a thread spinning there for 100 ms makes that
+        // span read busy, then 100 ms with nothing to run there reads idle.
+        use crate::kassert;
+        const SPAN_NS: u64 = 100_000_000;
+        let cpu = last_cpu()?;
+        let before = cpu_ticks(cpu);
+        let spinner = spawn_test(cpu, "busy-test", || {
+            let end = time::now_ns() + SPAN_NS;
+            while time::now_ns() < end {
+                core::hint::spin_loop();
+            }
+        })?;
+        join_bounded(spinner)?;
+        let busy = cpu_ticks(cpu).since(before);
+        let before = cpu_ticks(cpu);
+        time::sleep(SPAN_NS);
+        let idle = cpu_ticks(cpu).since(before);
+        crate::ktest::diag(format_args!(
+            "cpu {cpu}: spinning {}% of {} ticks, sleeping {}% of {}",
+            busy.busy_percent(),
+            busy.ticks,
+            idle.busy_percent(),
+            idle.ticks
+        ));
+        kassert!(busy.ticks >= 20 && busy.busy_percent() >= 80);
+        kassert!(idle.ticks >= 20 && idle.busy_percent() <= 20);
+        Ok(())
+    }
+);
 
 /// Spawn two threads on `cpu` that never yield, and check that they
 /// interleave: each counts its own loops, and runs until both have seen the

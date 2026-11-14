@@ -212,7 +212,9 @@ def test_system_commands(boot):
     assert timer and int(timer[1]) > 0, out
 
     out = run(m, "dmesg")
-    assert re.match(r"dmesg: the newest \d+ log lines\n", out), out
+    assert re.match(r"dmesg: the newest \d+ log lines \(all since boot\)\n", out), out
+    # Only whole lines, the first the boot banner.
+    assert out.endswith("\n") and "\n[    ?.??????] INFO  boot: Lumen " in out, out
     assert re.search(
         r"^\[\s*\d+\.\d{6}\] INFO  shell: shells on serial and the screen", out, re.MULTILINE
     ), out
@@ -234,7 +236,8 @@ def test_date_matches_host(boot):
     # the host's clock: within 2 s of the host's time while it ran. The RTC
     # counts whole seconds, and QEMU's ticks on a phase of its own: measured
     # here it reads 1 to 2 s behind the host, so at most 2 s behind the
-    # host's whole seconds when the command was sent.
+    # host's whole seconds when the command was sent (3 allowed, in case
+    # another QEMU truncates once more).
     from datetime import UTC, datetime
 
     m = shells(boot)
@@ -245,24 +248,32 @@ def test_date_matches_host(boot):
         found = re.fullmatch(r"date: (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) UTC\n", out)
         assert found, out
         rtc = datetime.strptime(found[1], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-        assert -2 <= (rtc - before).total_seconds() and rtc <= after, (before, rtc, after)
+        assert -3 <= (rtc - before).total_seconds() and rtc <= after, (before, rtc, after)
 
 
 def test_top_refreshes_and_quits(boot):
     # On plain serial, `top` prints a frame a second as lines (the CPUs and
-    # how busy, interrupt rates, the heap, the threads), until `q`.
-    m = shells(boot)
+    # how busy, interrupt rates, the heap, the threads), until `q`. Under
+    # -smp 2: frames 0.9 to 1.5 s apart by the kernel's own clock, and each
+    # CPU's timer at about 1 kHz.
+    m = boot("qemutest", extra=["-smp", "2"])
+    m.expect(SHELLS, 60)
+    m.expect(PROMPT, 60)
     start = len(m.output)
     m.send_line("top")
-    first = m.expect(r"top: frame 1, up (\d+)\.\d s, \d+ CPUs; q quits\n", 15)
-    second = m.expect(r"top: frame 2, up (\d+)\.\d s, \d+ CPUs; q quits\n", 15)
-    assert int(second[1]) >= int(first[1])
-    frame = m.output[first.end() : second.start()]
+    header = r"top: frame {}, up (\d+\.\d) s, 2 CPUs; q quits\n"
+    first = m.expect(header.format(1), 15)
+    second = m.expect(header.format(2), 15)
+    third = m.expect(header.format(3), 15)
+    assert 0.9 <= float(second[1]) - float(first[1]) <= 1.5, (first[1], second[1])
+    assert 0.9 <= float(third[1]) - float(second[1]) <= 1.5, (second[1], third[1])
+    frame = m.output[second.end() : third.start()]
     assert re.search(r"^\s+0\s+\d+%\s+\d+$", frame, re.MULTILINE), frame
-    assert re.search(r"^  irqs/s: .*local APIC timer \d+", frame, re.MULTILINE), frame
-    assert re.search(r"^  heap .* used of .* in \d+ allocations; frames ", frame, re.MULTILINE), (
-        frame
-    )
+    ap = re.search(r"^\s+1\s+\d+%\s+(\d+)$", frame, re.MULTILINE)
+    assert ap and 500 <= int(ap[1]) <= 1500, frame
+    timer = re.search(r"^  irqs/s: .*local APIC timer (\d+)", frame, re.MULTILINE)
+    assert timer and 500 <= int(timer[1]) / 2 <= 1500, frame
+    assert re.search(r"^  heap .* used of .* in \d+ allocations; frames ", frame, re.MULTILINE), frame
     assert re.search(r"^  main\s+\d+\s+0\s+\w+\s+\d+%$", frame, re.MULTILINE), frame
     assert re.search(r"^  shell-screen\s+\d+\s+0\s+\w+\s+\d+%$", frame, re.MULTILINE), frame
     m.send("q")

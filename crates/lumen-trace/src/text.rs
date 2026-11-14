@@ -1,7 +1,8 @@
 //! A ring of text: the newest bytes written, the oldest overwritten. The
 //! kernel's logger keeps its lines in one (`dmesg`). Unlike [`TraceRing`]
-//! it isn't lock-free: the writer and readers hold a lock (the logger's),
-//! and nothing here allocates or blocks.
+//! it isn't lock-free: its user serializes the writer and readers (the
+//! kernel holds a lock around it, `klog`'s `RING`), and nothing here
+//! allocates or blocks.
 //!
 //! [`TraceRing`]: crate::TraceRing
 
@@ -56,27 +57,30 @@ impl<const N: usize> TextRing<N> {
     }
 
     /// Copy the newest whole lines held that fit into `out`, oldest first;
-    /// returns how many bytes. A line is whole if it starts where writing
-    /// started or just after a `\n` (the oldest bytes of a full ring are the
-    /// end of a line whose start was overwritten, and are left out); the
-    /// last line may lack its `\n` (it is still being written).
+    /// returns how many bytes. A whole line starts where writing started or
+    /// just after a `\n`, and ends with its `\n`: the oldest bytes of a full
+    /// ring (a line whose start was overwritten) and a last line still being
+    /// written (no `\n` yet) are left out.
     pub fn copy_lines(&self, out: &mut [u8]) -> usize {
         let len = self.len();
-        let mut start = len.saturating_sub(out.len());
+        let Some(end) = (0..len).rev().find(|&i| self.byte(i) == b'\n').map(|nl| nl + 1) else {
+            return 0;
+        };
+        let mut start = end.saturating_sub(out.len());
         // Unless it starts where writing did, skip to after the first line
         // feed at or past `start - 1`.
         let at_beginning = start == 0 && self.written == len as u64;
         if !at_beginning {
             let from = start.saturating_sub(1);
-            match (from..len).find(|&i| self.byte(i) == b'\n') {
+            match (from..end).find(|&i| self.byte(i) == b'\n') {
                 Some(nl) => start = nl + 1,
                 None => return 0,
             }
         }
-        for (i, slot) in (start..len).zip(out.iter_mut()) {
+        for (i, slot) in (start..end).zip(out.iter_mut()) {
             *slot = self.byte(i);
         }
-        len - start
+        end - start
     }
 }
 
@@ -103,9 +107,12 @@ mod tests {
         r.push(b"one\ntwo\n");
         assert_eq!((r.len(), r.written()), (8, 8));
         assert_eq!(lines(&r, 64), b"one\ntwo\n");
-        // An unfinished last line is shown as far as it goes.
+        // An unfinished last line (another writer's, half written) isn't
+        // shown until its line feed.
         r.push(b"thr");
-        assert_eq!(lines(&r, 64), b"one\ntwo\nthr");
+        assert_eq!(lines(&r, 64), b"one\ntwo\n");
+        r.push(b"\n");
+        assert_eq!(lines(&r, 64), b"one\ntwo\nthr\n");
     }
 
     #[test]
@@ -132,6 +139,17 @@ mod tests {
         assert_eq!(lines(&r, 17), b"alpha\nbeta\ngamma\n");
         // No line fits: nothing.
         assert_eq!(lines(&r, 5), b"");
+    }
+
+    #[test]
+    fn a_long_unfinished_line_gives_nothing() {
+        // A line longer than the ring, without its line feed: no whole line.
+        let mut r = TextRing::<8>::new();
+        r.push(b"a\n0123456789abcdef");
+        assert_eq!(lines(&r, 64), b"");
+        let mut r = TextRing::<64>::new();
+        r.push(b"no line feed yet");
+        assert_eq!(lines(&r, 64), b"");
     }
 
     #[test]
