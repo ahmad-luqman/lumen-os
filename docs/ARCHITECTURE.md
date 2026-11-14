@@ -923,7 +923,7 @@ drawing the shown one) and `kernel/src/vt.rs` (routing keys to them);
   into a grid of cells (a character, foreground and background, each the
   default or one of 256 colours, and flags: bold, inverse, the two halves
   of a wide character). It handles UTF-8, C0 controls (a line feed
-  without a carriage return: `term::write_str_to`, `term::write_fmt` and
+  without a carriage return: `term::write_str_to`, `term::write_fmt_to` and
   log lines turn `\n` into CR LF), cursor
   movement, save and restore, erasing (in the pen's background), inserting
   and deleting cells and lines, scrolling, scroll regions, tabs, autowrap

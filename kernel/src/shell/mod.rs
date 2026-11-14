@@ -90,7 +90,7 @@ impl<'a> Ctx<'a> {
 
     /// The next key typed on this console, if one is waiting (never
     /// blocks): for a command that runs until a key (`q`, Ctrl-C) stops it.
-    /// On a virtual terminal, the keyboard's keys routed to it (typed while
+    /// On a virtual terminal, the keyboard's keys routed to it (routed while
     /// it was shown: `crate::vt`); Shift+PageUp/PageDown still scroll it and
     /// aren't returned, and keys the line editor doesn't take (Esc, F1) are
     /// dropped. Keys typed ahead for the next line are taken too. While a
@@ -151,8 +151,10 @@ pub fn run() -> ! {
                     Err(e) => {
                         crate::vt::detach(vt);
                         log::error!(target: "shell", "no shell on terminal {} after all: no thread for it: {e}", vt + 1);
-                        // Not a blank screen: say so where its prompt would be.
-                        let _ = writeln!(Screen { vt }, "no shell on this terminal: no thread for it: {e}");
+                        // Not a blank screen: say so where its prompt would be
+                        // (formatted under the screen's lock, without
+                        // allocating: memory may be what ran out).
+                        crate::term::write_fmt_to(vt, format_args!("no shell on this terminal: no thread for it: {e}\n"));
                     }
                 }
             }
@@ -263,7 +265,7 @@ impl Console for Serial {
 }
 
 /// A virtual terminal as a console: in, the keyboard's keys routed to it
-/// (typed while it is shown); out, its terminal. Each `write!` reaches the
+/// (routed while it is shown); out, its terminal. Each `write!` reaches the
 /// terminal whole (one lock), not in pieces another CPU's log line could
 /// land between. It is formatted
 /// before taking the screen's lock: formatting may allocate (a script
@@ -348,8 +350,6 @@ pub struct Captured {
     pub text: String,
     pub keys: alloc::collections::VecDeque<Key>,
     pub ran_dry: bool,
-    /// The virtual terminal it stands for, if any (see [`Console::vt`]).
-    pub vt: Option<usize>,
     /// Polls in a row that found no key.
     empty_polls: u32,
 }
@@ -377,10 +377,6 @@ impl Write for Captured {
 impl Console for Captured {
     fn name(&self) -> &'static str {
         "the test console"
-    }
-
-    fn vt(&self) -> Option<usize> {
-        self.vt
     }
 
     fn read_key(&mut self) -> Key {
@@ -475,6 +471,39 @@ crate::ktest!(
         kassert!(!held.load(Ordering::Relaxed));
         let view = crate::term::view_text().ok_or("no terminal")?;
         kassert!(view.rows.iter().any(|r| r.contains("allocated while formatting 42")));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_terminal_s_scroll_keys_scroll_it_even_when_hidden() {
+        // The second terminal's console, given Shift+PageUp while the first
+        // is shown (a key routed to it before a switch), scrolls the second
+        // back and leaves the first alone; a key the editor takes brings the
+        // second back to its screen.
+        use crate::{kassert, kassert_eq, term};
+        kassert_eq!(term::shown(), 0);
+        /// Brings both views back when dropped.
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                term::reset_view(0);
+                term::reset_view(1);
+            }
+        }
+        let _reset = Reset;
+        for i in 0..60 {
+            kassert!(term::write_str_to(1, &alloc::format!("second {i}\n")));
+        }
+        let second = Screen { vt: 1 };
+        kassert_eq!(second.vt(), Some(1));
+        let page_up = keyboard::Key::Raw { code: KeyCode::PageUp, shift: true, alt: false };
+        kassert_eq!(second.take(page_up), None);
+        let views = || term::view_offset(0).zip(term::view_offset(1)).ok_or("no terminal");
+        let (first, scrolled) = views()?;
+        kassert!(first == 0 && scrolled > 0);
+        kassert_eq!(second.take(keyboard::Key::Char('x')), Some(Key::Char('x')));
+        kassert_eq!(views()?, (0, 0));
         Ok(())
     }
 );

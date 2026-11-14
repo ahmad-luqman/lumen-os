@@ -55,7 +55,9 @@ impl Write for Out {
 /// (from its idle thread; its crash report then stops this one), or in a new
 /// thread on this CPU (named `shell-crash`), which the shell waits for.
 pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
-    OUT_VT.store(ctx.out.vt().unwrap_or(0), Ordering::Relaxed);
+    // Stored only once the fault will run (a remote one's after its job is
+    // claimed): an earlier refusal leaves a fault under way where it was.
+    let vt = ctx.out.vt().unwrap_or(0);
     let out = &mut *ctx.out;
     let kind = args.first().map_or("", String::as_str);
     let Some(fault) = crash_fn(kind) else {
@@ -68,6 +70,7 @@ pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
     }
     let target = args.get(1).map(String::as_str);
     if target == Some("thread") {
+        OUT_VT.store(vt, Ordering::Relaxed);
         match crate::sched::spawn("shell-crash", fault) {
             Ok(handle) => handle.join(),
             Err(e) => {
@@ -77,13 +80,17 @@ pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
         return;
     }
     match target.map(str::parse::<usize>) {
-        None | Some(Ok(0)) => fault(),
+        None | Some(Ok(0)) => {
+            OUT_VT.store(vt, Ordering::Relaxed);
+            fault();
+        }
         Some(Ok(cpu)) => {
             if REMOTE.try_update(Ordering::Acquire, Ordering::Relaxed, |s| (s != HANDED).then_some(HANDED)).is_err() {
                 let _ = writeln!(out, "crash: a crash sent to another CPU hasn't finished yet");
                 return;
             }
             REMOTE_KIND.store(KINDS.iter().position(|k| *k == kind).expect("a known kind"), Ordering::Relaxed);
+            OUT_VT.store(vt, Ordering::Relaxed);
             match crate::smp::run_on(cpu, run_remote) {
                 Ok(()) => wait_remote(out, cpu),
                 Err(e) => {

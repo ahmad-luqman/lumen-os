@@ -12,12 +12,16 @@
 //! [`keyboard::wait_for_bytes_or`]). So a key typed just before a command on
 //! another terminal takes the canvas, but not routed yet, goes to that
 //! command (not tested: the window is the time between IRQ 1 and the first
-//! shell running).
+//! shell running). A canvas brings its terminal to the front without taking
+//! [`ROUTER`]'s lock (`term::canvas`): a key being routed then lands on
+//! either side.
 //!
-//! Lock order: [`ROUTER`], then the keyboard's decoder, then the screen's
-//! lock (taken for each key, to read which terminal is shown, and for a
-//! switch); nothing takes [`ROUTER`] while holding either. [`HAS_KEYS`]
-//! mirrors which rings hold keys, so a reader's wake-up check takes no lock.
+//! Lock order: [`ROUTER`], then the keyboard's decoder (released before
+//! the key is routed), then the screen's lock (taken for each key, to read
+//! which terminal is shown, and for a switch); nothing takes [`ROUTER`]
+//! while holding either. [`HAS_KEYS`] mirrors which rings hold keys, so a
+//! reader's wake-up check takes no lock of its own (it runs under the wait
+//! queue's lock, so not [`ROUTER`]'s).
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -27,43 +31,36 @@ use crate::term::{self, ShowError, VTS};
 use lumen_term::vt::Router;
 
 /// Keys each terminal's ring holds at most (a shell that falls this far
-/// behind loses the newest, counted: [`stats`]). As many keys as the
-/// keyboard's queue holds bytes, though a key takes two bytes or more
-/// (press and release).
+/// behind loses the newest, counted: [`stats`]): half the keyboard's
+/// 256-byte queue, though a key takes two bytes or more (press and
+/// release).
 const RING: usize = 128;
 
 type Rings = Router<Key, VTS, RING>;
 
 static ROUTER: SpinLock<Rings> = SpinLock::new(Router::new());
-/// Bit `vt` set while terminal `vt`'s ring holds keys (changed under
-/// [`ROUTER`]'s lock).
+/// Bit `vt` set while terminal `vt`'s ring holds keys: [`publish`]ed under
+/// [`ROUTER`]'s lock after every change.
 static HAS_KEYS: AtomicUsize = AtomicUsize::new(0);
 /// Bit `vt` set once terminal `vt` has a shell reading it ([`attach`]):
-/// keys typed on one without are discarded, not routed to a ring nothing
-/// reads.
+/// keys typed on one without are discarded (counted), not routed to a ring
+/// nothing reads.
 static READERS: AtomicUsize = AtomicUsize::new(0);
-/// Bit `vt` set while terminal `vt` is dropping keys (its ring full): the
-/// first drop of a burst is logged (changed under [`ROUTER`]'s lock).
+/// Bit `vt` set from terminal `vt`'s first dropped key until its ring
+/// empties again: one warning per burst (changed under [`ROUTER`]'s lock).
 static DROPPING: AtomicUsize = AtomicUsize::new(0);
-/// Switches refused because a command had the screen.
+/// Keys each terminal discarded because no shell reads it.
+static DISCARDED: [AtomicU64; VTS] = [const { AtomicU64::new(0) }; VTS];
+/// Switches refused because a command had the screen ([`show_counted`]).
 static REFUSED: AtomicU64 = AtomicU64::new(0);
 
-/// Alt+F`n` shows terminal `n` (from 1).
-const SWITCH_KEYS: [KeyCode; VTS] = {
-    const ALL: [KeyCode; 4] = [KeyCode::F1, KeyCode::F2, KeyCode::F3, KeyCode::F4];
-    let mut keys = [KeyCode::F1; VTS];
-    let mut vt = 0;
-    while vt < VTS {
-        keys[vt] = ALL[vt];
-        vt += 1;
-    }
-    keys
-};
+/// Alt+F`n` shows terminal `n` (from 1; the first [`VTS`] of them).
+const SWITCH_KEYS: [KeyCode; 4] = [KeyCode::F1, KeyCode::F2, KeyCode::F3, KeyCode::F4];
 
 /// The terminal Alt+F`n` shows (`n` 1 to [`VTS`]), if `key` is one.
 fn switch_key(key: Key) -> Option<usize> {
     let Key::Raw { code, alt: true, .. } = key else { return None };
-    SWITCH_KEYS.iter().position(|&f| f == code)
+    SWITCH_KEYS[..VTS].iter().position(|&f| f == code)
 }
 
 /// A modifier or lock key on its own: the decoder tracks it, no shell needs
@@ -98,7 +95,7 @@ pub enum Routed {
     To(usize),
     /// Terminal `.0`'s ring was full: dropped (counted).
     Dropped(usize),
-    /// Terminal `.0`, shown, has no shell: discarded.
+    /// Terminal `.0`, shown, has no shell: discarded (counted).
     NoShell(usize),
     /// Alt+F`n`: terminal `.0` is shown now.
     Switched(usize),
@@ -109,12 +106,22 @@ pub enum Routed {
     Modifier,
 }
 
+/// Show terminal `vt` (`term::show`), counting a refusal because a command
+/// has the screen. Called under [`ROUTER`]'s lock, but by the ktests.
+fn show_counted(vt: usize) -> Result<(), ShowError> {
+    let shown = term::show(vt);
+    if shown == Err(ShowError::InUse) {
+        REFUSED.fetch_add(1, Ordering::Relaxed);
+    }
+    shown
+}
+
 /// Route one decoded key: Alt+F`n` switches, a bare modifier is skipped,
 /// any other goes to the terminal shown now, if a shell reads it (bit `vt`
 /// of `readers`).
 pub fn route_key(router: &mut Rings, key: Key, readers: usize) -> Routed {
     if let Some(to) = switch_key(key) {
-        return match term::show(to) {
+        return match show_counted(to) {
             Ok(()) => Routed::Switched(to),
             Err(e) => Routed::Refused(to, e),
         };
@@ -124,12 +131,22 @@ pub fn route_key(router: &mut Rings, key: Key, readers: usize) -> Routed {
     }
     let vt = term::shown();
     if readers & 1 << vt == 0 {
+        DISCARDED[vt].fetch_add(1, Ordering::Relaxed);
         Routed::NoShell(vt)
     } else if router.route(vt, key) {
         Routed::To(vt)
     } else {
         Routed::Dropped(vt)
     }
+}
+
+/// After a change to `router` (under [`ROUTER`]'s lock): which rings hold
+/// keys, for the readers' wake-up check; a ring that emptied ends its burst
+/// of drops.
+fn publish(router: &Rings) {
+    let mask = router.mask();
+    HAS_KEYS.store(mask, Ordering::Release);
+    DROPPING.fetch_and(mask, Ordering::Relaxed);
 }
 
 /// Terminal `vt` has a shell reading it from now on.
@@ -139,22 +156,26 @@ pub fn attach(vt: usize) {
 }
 
 /// Terminal `vt` has no shell after all (its thread didn't start): keys
-/// typed on it are discarded, and those already routed to it too.
+/// typed on it are discarded, and those already routed to it too (counted).
 pub fn detach(vt: usize) {
     assert!(vt < VTS, "no virtual terminal {vt}");
     let mut router = ROUTER.lock();
     READERS.fetch_and(!(1 << vt), Ordering::AcqRel);
-    while router.take(vt).is_some() {}
-    HAS_KEYS.store(router.mask(), Ordering::Release);
+    while router.take(vt).is_some() {
+        DISCARDED[vt].fetch_add(1, Ordering::Relaxed);
+    }
+    publish(&router);
 }
 
 /// The next key typed on virtual terminal `vt`, if one is waiting (never
 /// blocks): first the keyboard's waiting bytes are decoded and each key
 /// routed ([`route_key`]). Wakes the other terminals' shells if a key went
-/// to theirs.
+/// to theirs. Of the refusals and new bursts of drops in one pass, each is
+/// counted and the last of each logged.
 pub fn read_key(vt: usize) -> Option<Key> {
-    // Refusals and the first drop of a burst, logged after the locks (the
-    // logger draws on the screen at `info` and up).
+    assert!(vt < VTS, "no virtual terminal {vt}");
+    // Logged after the locks (the logger draws on the screen at `info` and
+    // up).
     let (mut refused, mut dropping) = (None, None);
     let (key, elsewhere) = {
         let mut router = ROUTER.lock();
@@ -162,24 +183,18 @@ pub fn read_key(vt: usize) -> Option<Key> {
         let mut elsewhere = false;
         while let Some(key) = keyboard::read_key() {
             match route_key(&mut router, key, readers) {
-                Routed::To(to) => {
-                    DROPPING.fetch_and(!(1 << to), Ordering::Relaxed);
-                    elsewhere |= to != vt;
-                }
+                Routed::To(to) => elsewhere |= to != vt,
                 Routed::Dropped(to) => {
                     if DROPPING.fetch_or(1 << to, Ordering::Relaxed) & 1 << to == 0 {
                         dropping = Some(to);
                     }
                 }
-                Routed::Refused(to, e) => {
-                    REFUSED.fetch_add(1, Ordering::Relaxed);
-                    refused = Some((to, e));
-                }
+                Routed::Refused(to, e) => refused = Some((to, e)),
                 Routed::Switched(_) | Routed::NoShell(_) | Routed::Modifier => {}
             }
         }
         let key = router.take(vt);
-        HAS_KEYS.store(router.mask(), Ordering::Release);
+        publish(&router);
         (key, elsewhere)
     };
     if elsewhere {
@@ -197,6 +212,7 @@ pub fn read_key(vt: usize) -> Option<Key> {
 /// The next key typed on virtual terminal `vt`, waiting for one (blocks the
 /// calling thread; without a keyboard it never returns).
 pub fn wait_key(vt: usize) -> Key {
+    assert!(vt < VTS, "no virtual terminal {vt}");
     loop {
         if let Some(key) = read_key(vt) {
             return key;
@@ -206,30 +222,33 @@ pub fn wait_key(vt: usize) -> Key {
 }
 
 /// Show virtual terminal `vt` (0 is the first): keys routed from now on go
-/// to it. Refused while a command has the screen (`term::Canvas`), unless
-/// `vt` is shown already.
+/// to it. Refused (and counted) while a command has the screen
+/// (`term::Canvas`), unless `vt` is shown already.
 pub fn show(vt: usize) -> Result<(), ShowError> {
     // Under the router's lock: a key being routed lands on one side of the
     // switch.
     let _router = ROUTER.lock();
-    let shown = term::show(vt);
-    if matches!(shown, Err(ShowError::InUse)) {
-        REFUSED.fetch_add(1, Ordering::Relaxed);
-    }
-    shown
+    show_counted(vt)
 }
 
 /// What the shell's `vt` shows.
 pub struct Stats {
-    /// Keys each terminal dropped (its shell fell behind).
+    /// Keys each terminal dropped because its ring was full (its shell fell
+    /// behind).
     pub dropped: [u64; VTS],
+    /// Keys each terminal discarded because no shell reads it.
+    pub discarded: [u64; VTS],
     /// Switches refused because a command had the screen.
     pub refused: u64,
 }
 
 pub fn stats() -> Stats {
     let router = ROUTER.lock();
-    Stats { dropped: core::array::from_fn(|vt| router.dropped(vt)), refused: REFUSED.load(Ordering::Relaxed) }
+    Stats {
+        dropped: core::array::from_fn(|vt| router.dropped(vt)),
+        discarded: core::array::from_fn(|vt| DISCARDED[vt].load(Ordering::Relaxed)),
+        refused: REFUSED.load(Ordering::Relaxed),
+    }
 }
 
 crate::ktest!(
@@ -257,8 +276,8 @@ crate::ktest!(
         // the third holds the canvas is refused and the next key still goes
         // to the third; a canvas a command on the third takes while the
         // first is shown brings the third to the front, and keys follow it.
-        // A shown terminal without a shell gets nothing; bare modifiers take
-        // no slot.
+        // A shown terminal without a shell gets nothing (counted); bare
+        // modifiers take no slot.
         use crate::kassert_eq;
         use term::Owner;
         const ALL: usize = (1 << VTS) - 1;
@@ -279,7 +298,9 @@ crate::ktest!(
         kassert_eq!(route_key(&mut r, Key::Char('d'), ALL), Routed::To(2));
         drop(canvas);
         kassert_eq!(term::show(0), Ok(()));
+        let discarded = stats().discarded;
         kassert_eq!(route_key(&mut r, Key::Char('e'), ALL & !1), Routed::NoShell(0));
+        kassert_eq!(stats().discarded[0], discarded[0] + 1);
         let ring = |r: &mut Rings, vt| core::iter::from_fn(|| r.take(vt)).collect::<alloc::vec::Vec<_>>();
         kassert_eq!(ring(&mut r, 0), alloc::vec![Key::Char('a')]);
         kassert_eq!(ring(&mut r, 2), alloc::vec![Key::Char('b'), Key::Char('c'), Key::Char('d')]);
@@ -292,16 +313,17 @@ crate::ktest!(
     fn showing_a_terminal_switches_the_screen_unless_a_command_has_it() {
         // `show` switches the screen (where keys are routed from then on);
         // a terminal that doesn't exist, or another terminal while a command
-        // has the screen, changes nothing, and that refusal is counted;
-        // showing the one shown succeeds.
+        // has the screen, changes nothing (only the second refusal is
+        // counted); showing the one shown succeeds.
         use crate::{kassert, kassert_eq};
         kassert_eq!(term::shown(), 0);
         let _first = term::ShowFirstAfter;
         show(2).map_err(|_| "no switch")?;
         kassert_eq!(term::shown(), 2);
-        kassert_eq!(show(VTS), Err(ShowError::NoSuchTerminal));
-        let canvas = term::canvas(term::Owner::new()).map_err(|_| "no canvas")?;
         let refused = stats().refused;
+        kassert_eq!(show(VTS), Err(ShowError::NoSuchTerminal));
+        kassert_eq!(stats().refused, refused);
+        let canvas = term::canvas(term::Owner::new()).map_err(|_| "no canvas")?;
         kassert_eq!(show(0), Err(ShowError::InUse));
         kassert_eq!(stats().refused, refused + 1);
         kassert!(show(2).is_ok());
@@ -313,6 +335,28 @@ crate::ktest!(
     }
 );
 
+/// Shells attached to every terminal until dropped (the test kernel runs
+/// none), which drains the keyboard's queue and detaches them, discarding
+/// their keys.
+#[cfg(feature = "ktest")]
+struct Attached;
+
+#[cfg(feature = "ktest")]
+impl Attached {
+    fn all() -> Attached {
+        (0..VTS).for_each(attach);
+        Attached
+    }
+}
+
+#[cfg(feature = "ktest")]
+impl Drop for Attached {
+    fn drop(&mut self) {
+        while keyboard::read_key().is_some() {}
+        (0..VTS).for_each(detach);
+    }
+}
+
 crate::ktest!(
     fn typed_keys_reach_the_terminal_shown_when_they_are_read() {
         // Scancodes for `a`, Alt+F2 and `b`, decoded in one pass: `a` is the
@@ -323,18 +367,7 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         kassert_eq!(term::shown(), 0);
         let _first = term::ShowFirstAfter;
-        for vt in 0..VTS {
-            attach(vt);
-        }
-        /// Takes the shells back off the terminals (and the keys they hold)
-        /// when dropped: the test kernel runs none.
-        struct Detach;
-        impl Drop for Detach {
-            fn drop(&mut self) {
-                (0..VTS).for_each(detach);
-            }
-        }
-        let _detach = Detach;
+        let _attached = Attached::all();
         kassert!(keyboard::queue_for_test(&[0x1e, 0x9e, 0x38, 0x3c, 0xbc, 0xb8, 0x30, 0xb0]));
         kassert_eq!(read_key(0), Some(Key::Char('a')));
         kassert_eq!(term::shown(), 1);
@@ -344,6 +377,33 @@ crate::ktest!(
         kassert_eq!(read_key(1), None);
         kassert_eq!(read_key(2), Some(Key::Char('c')));
         drop(canvas);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_full_ring_drops_and_counts_and_a_detached_one_discards() {
+        // 129 presses of `a` typed on the first terminal while its shell
+        // reads nothing: its ring keeps 128 and drops one, counted for it
+        // alone (and its burst marked). Taking its shell off discards the
+        // 128 kept, counted, and ends the burst. (Set 1: `a` 0x1e, released
+        // 0x9e; queued in batches the keyboard's byte queue holds.)
+        use crate::{kassert, kassert_eq};
+        kassert_eq!(term::shown(), 0);
+        let attached = Attached::all();
+        let before = stats();
+        kassert!(keyboard::queue_for_test(&[0x1e; RING]));
+        kassert_eq!(read_key(1), None);
+        kassert!(keyboard::queue_for_test(&[0x1e, 0x9e]));
+        kassert_eq!(read_key(1), None);
+        let after = stats();
+        let dropped: [u64; VTS] = core::array::from_fn(|vt| after.dropped[vt] - before.dropped[vt]);
+        kassert_eq!(dropped, [1, 0, 0, 0]);
+        kassert!(DROPPING.load(Ordering::Relaxed) & 1 != 0);
+        kassert!(HAS_KEYS.load(Ordering::Acquire) & 1 != 0);
+        drop(attached);
+        kassert_eq!(stats().discarded[0], after.discarded[0] + RING as u64);
+        kassert_eq!((HAS_KEYS.load(Ordering::Acquire), DROPPING.load(Ordering::Relaxed) & 1), (0, 0));
         Ok(())
     }
 );

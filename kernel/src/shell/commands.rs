@@ -329,9 +329,12 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
     }
 }
 
-/// `vt`: which virtual terminal is shown, keys each dropped and switches
-/// refused; `vt <n>`: show terminal `n` (1 to `term::VTS`), unless a
-/// command has the screen.
+/// `vt`'s usage line.
+const VT_USAGE: &str = "usage: vt [n] (n from 1 to 4)";
+
+/// `vt`: which virtual terminal is shown, keys each dropped (its shell
+/// behind) and discarded (no shell), and switches refused; `vt <n>`: show
+/// terminal `n` (1 to `term::VTS`), unless a command has the screen.
 fn vt(ctx: &mut Ctx<'_>, args: &[String]) {
     use crate::term::VTS;
     let out = &mut *ctx.out;
@@ -340,26 +343,33 @@ fn vt(ctx: &mut Ctx<'_>, args: &[String]) {
         [n] => match n.parse::<usize>() {
             Ok(n @ 1..=VTS) => Some(n),
             _ => {
-                let _ = writeln!(out, "usage: vt [n] (n from 1 to {VTS})");
+                let _ = writeln!(out, "{VT_USAGE}");
                 return;
             }
         },
         _ => {
-            let _ = writeln!(out, "usage: vt [n] (n from 1 to {VTS})");
+            let _ = writeln!(out, "{VT_USAGE}");
             return;
         }
     };
-    let _ = match (wanted, crate::term::status()) {
-        (_, None) => writeln!(out, "vt: no terminal"),
-        (None, Some(t)) => {
+    let Some(t) = crate::term::status() else {
+        let _ = writeln!(out, "vt: no terminal");
+        return;
+    };
+    let _ = match wanted {
+        None => {
             let s = crate::vt::stats();
             let _ = write!(out, "vt: terminal {} of {VTS} shown (Alt+F1 to F{VTS} switch); keys dropped", t.shown + 1);
             for d in s.dropped {
                 let _ = write!(out, " {d}");
             }
+            let _ = write!(out, ", discarded");
+            for d in s.discarded {
+                let _ = write!(out, " {d}");
+            }
             writeln!(out, "; {} switches refused", s.refused)
         }
-        (Some(n), Some(_)) => match crate::vt::show(n - 1) {
+        Some(n) => match crate::vt::show(n - 1) {
             Ok(()) => writeln!(out, "vt: terminal {n} shown"),
             Err(e) => writeln!(out, "vt: not showing terminal {n}: {e}"),
         },
@@ -588,8 +598,8 @@ crate::ktest!(
 
 crate::ktest!(
     fn a_command_s_canvas_brings_its_terminal_to_the_front() {
-        // A command run on the third virtual terminal while the first is
-        // shown: its canvas shows the third, keys routed meanwhile go there
+        // A command run by the shell on the third virtual terminal's console
+        // while the first is shown: its canvas shows the third, keys routed meanwhile go there
         // (not to the first), and once it is done the third stays shown.
         use crate::vt::{self, Routed};
         use crate::{kassert, kassert_eq, term};
@@ -608,7 +618,8 @@ crate::ktest!(
             Table(&[Command { name: "draw", args: &[], usage: "", about: "draw on the screen", run: draw }]);
         kassert_eq!(term::shown(), 0);
         let _first = term::ShowFirstAfter;
-        let mut console = super::Captured { vt: Some(2), ..Default::default() };
+        // The shell's own console for the third terminal (writing there).
+        let mut console = super::Screen { vt: 2 };
         let history = lumen_shell::History::new(0);
         run_in(&TABLE, "draw", &mut Ctx::new(&mut console, true, &history));
         kassert_eq!(SHOWN.load(Ordering::Relaxed), 2);
