@@ -1,16 +1,18 @@
 //! The shell's commands: kmon's, with their names and output (`echo`
 //! joins its words with single spaces; `clear` and `colors` need a console
-//! that takes escape codes), plus `history` and `term text`. A table the
+//! that takes escape codes), plus `history`, `term text`, `reboot`,
+//! `shutdown` and the system commands (`cpus`, `mem`, `irqs`, `dmesg`,
+//! `date`, `top`: `sysinfo.rs`). A table the
 //! line editor completes from. Each writes to the console that ran it.
 
-use super::{Ctx, crash};
+use super::{Ctx, crash, sysinfo};
 use crate::arch;
 use alloc::string::String;
 use core::arch::asm;
 use core::fmt::Write;
 use lumen_shell::{Command, Table, words};
 
-type Run = fn(&mut Ctx<'_>, &[String]);
+pub type Run = fn(&mut Ctx<'_>, &[String]);
 
 pub static COMMANDS: Table<Run> = Table(&[
     Command { name: "help", args: &[], usage: "", about: "this list", run: help },
@@ -72,7 +74,51 @@ pub static COMMANDS: Table<Run> = Table(&[
         about: "the TSC's frequency, measured again against each clock",
         run: clocks,
     },
+    Command {
+        name: "cpus",
+        args: &[],
+        usage: "",
+        about: "each CPU: its scheduler, ticks, how busy, threads",
+        run: sysinfo::cpus,
+    },
+    Command {
+        name: "mem",
+        args: &[],
+        usage: "",
+        about: "physical frames, the heap and kernel stacks",
+        run: sysinfo::mem,
+    },
+    Command {
+        name: "irqs",
+        args: &[],
+        usage: "",
+        about: "the I/O APIC's inputs decoded, and interrupts per vector",
+        run: sysinfo::irqs,
+    },
+    Command {
+        name: "dmesg",
+        args: &[],
+        usage: "",
+        about: "the newest log lines, as serial printed them",
+        run: sysinfo::dmesg,
+    },
+    Command {
+        name: "date",
+        args: &[],
+        usage: "",
+        about: "the date and time from the RTC (taken as UTC)",
+        run: sysinfo::date,
+    },
+    Command {
+        name: "top",
+        args: &[],
+        usage: "[frames]",
+        about: "CPUs, interrupts, heap and threads each second (q quits)",
+        run: sysinfo::top,
+    },
     Command { name: "history", args: &[], usage: "", about: "the lines entered on this console", run: history },
+    Command { name: "reboot", args: &[], usage: "", about: "restart the machine", run: reboot },
+    Command { name: "shutdown", args: &[], usage: "", about: "power off (ACPI S5)", run: shutdown },
     Command { name: "exit", args: &[], usage: "", about: "end QEMU (only with lumen.qemu_exit)", run: exit },
 ]);
 
@@ -390,6 +436,23 @@ fn history(ctx: &mut Ctx<'_>, _: &[String]) {
     for (n, line) in ctx.history.numbered() {
         let _ = writeln!(ctx.out, "{n:5}  {line}");
     }
+}
+
+fn reboot(ctx: &mut Ctx<'_>, _: &[String]) {
+    let _ = writeln!(ctx.out, "reboot: restarting");
+    crate::power::reboot()
+}
+
+/// Power off, or say why it can't be done or didn't happen.
+fn shutdown(ctx: &mut Ctx<'_>, _: &[String]) {
+    let why = match crate::power::power_off_plan() {
+        Ok(plan) => {
+            let _ = writeln!(ctx.out, "shutdown: powering off");
+            crate::power::power_off(plan)
+        }
+        Err(why) => why,
+    };
+    let _ = writeln!(ctx.out, "shutdown: can't power off: {why}");
 }
 
 fn exit(ctx: &mut Ctx<'_>, _: &[String]) {

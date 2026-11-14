@@ -124,7 +124,9 @@ own PR that updates that doc first.
   with a timestamp (`[    0.139288]`, or `[    ?.??????]` before the TSC is
   calibrated): match the rest of the line, not its start.
 - **QEMU exit codes:** 33 pass, 35 test failure, 37 crash report; anything else
-  (including 0 from a triple fault with `-no-reboot`) is a failure.
+  (including 0 from a triple fault with `-no-reboot`) is a failure. The one
+  exception: 0 in the power-off scenario, with a QMP `SHUTDOWN` event whose
+  reason is `guest-shutdown` (a triple fault's is `guest-reset`).
 - **Golden images** live in `tests/golden/`. Re-record with `make golden` only
   when the change to the screen is intended, and open the PNG to check it.
 
@@ -143,10 +145,10 @@ own PR that updates that doc first.
   (plain text unless `lumen.ansi`) and one on the screen (keyboard): `mod.rs`
   the consoles and `Ctx` (keys through `poll_key`/`wait_key`, the screen
   through `canvas`), their commands (`commands.rs`: each row carries its
-  help line) and deliberate faults (`crash.rs`). `fb.rs`:
+  help line; the system ones in `sysinfo.rs`) and deliberate faults (`crash.rs`). `fb.rs`:
   framebuffer pixels, the header and the crash screen. `term.rs`: the
   terminal on the framebuffer (log lines, the screen's shell, scrollback, `view_text`, and
-  `Canvas`: the pixels below the header for one command, the terminal paused meanwhile). `klog.rs`: logger. `symbols.rs`: symbol lookup.
+  `Canvas`: the pixels below the header for one command, the terminal paused meanwhile). `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -157,7 +159,9 @@ own PR that updates that doc first.
   MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
   PAT. `trace.rs`: trace rings (one per CPU), event kinds, `ktrace!`, the boot timeline
   (`Timeline`). `acpi.rs`: ACPI
-  discovery (CPUs, LAPIC, I/O APICs, HPET) and the firmware-table reader.
+  discovery (CPUs, LAPIC, I/O APICs, HPET, the S5 power-off registers) and
+  the firmware-table reader. `power.rs`: `reboot` and `shutdown` (ACPI S5);
+  `arch/x86_64/reset.rs` their registers.
   `interrupts.rs`: 8259s masked, local APIC on, I/O APIC inputs masked,
   `route_isa_irq` (MADT overrides, handler registered before unmasking).
   `keyboard.rs`: the PS/2 keyboard (8042 init, IRQ 1, `pc-keyboard`
@@ -174,9 +178,11 @@ own PR that updates that doc first.
   lock-free stack registry.
 - `crates/lumen-heap`: heap allocator logic (address-ordered free list,
   coalescing; host-tested, incl. a randomized stress test against a shadow map).
-- `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads).
+- `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads),
+  and `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free).
 - `crates/lumen-time`: timekeeping arithmetic: calibration, tick/ns
-  conversion, timer counts, log time formats (`Stamp`, `Millis`)
+  conversion, timer counts, log time formats (`Stamp`, `Millis`),
+  percentages and rates, and the RTC's registers as a date (`rtc`)
   (host-tested).
 - `crates/lumen-queue`: lock-free single-producer, single-consumer byte
   queue (interrupt handler to thread; host-tested, incl. threads).
@@ -187,8 +193,9 @@ own PR that updates that doc first.
   against `shlex`), the line editor (history, completion; ANSI and plain
   output), the command table (names, completion words, usage and help
   lines), serial bytes to keys (host-tested).
-- `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET
-  (host-tested on handcrafted tables).
+- `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET, FADT
+  (PM1 control blocks) and the DSDT's `_S5_` by byte search (host-tested on
+  handcrafted tables).
 - `crates/lumen-uart`: 16550 UART logic: presence probe (scratch or
   interrupt enable register), FIFO detection, `\n` as `\r\n` in 15-byte
   bursts (one FIFO slot left for the crash reporter's byte) (host-tested

@@ -48,13 +48,18 @@
 //! tables and frame allocator), and on the heap a detached thread's record
 //! and its joiners' list.
 //!
+//! For the shell's `cpus` and `top`, each tick counts against the running
+//! thread and, on the idle thread, as an idle tick of its CPU (sampling at
+//! 1 kHz: [`cpu_ticks`], [`threads`]); every thread is listed in a registry
+//! of weak references, pruned of the dropped ones as threads are created.
+//!
 //! Every switch records a `switch` trace event (previous thread's id, next
 //! thread's id, the previous thread's state), and the crash report names the
 //! thread that was running (`thread: <name> (id N)`, read lock-free).
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::fmt;
@@ -174,6 +179,8 @@ pub struct Thread {
     reaped: AtomicBool,
     /// Joiners waiting for `reaped`.
     exited: WaitQueue,
+    /// Timer ticks that found it running.
+    ticks: AtomicU64,
 }
 
 impl Thread {
@@ -185,13 +192,13 @@ impl Thread {
         // the thread owns it, and it is freed only after the thread has died
         // and its CPU has switched away from it.
         let rsp = unsafe { arch::context::prepare(stack.range().top, thread_entry) };
-        Ok(Arc::new(Thread::new(name, cpu, State::Ready, rsp, Some(stack), Some(entry))))
+        Ok(register(Arc::new(Thread::new(name, cpu, State::Ready, rsp, Some(stack), Some(entry)))))
     }
 
     /// A thread for the code running now on this CPU, on a stack it doesn't
     /// own.
     fn adopted(name: &'static str) -> Arc<Thread> {
-        Arc::new(Thread::new(name, arch::cpu_index(), State::Running, 0, None, None))
+        register(Arc::new(Thread::new(name, arch::cpu_index(), State::Running, 0, None, None)))
     }
 
     fn new(
@@ -212,6 +219,7 @@ impl Thread {
             entry: SpinLock::new(entry),
             reaped: AtomicBool::new(false),
             exited: WaitQueue::new(),
+            ticks: AtomicU64::new(0),
         }
     }
 
@@ -364,6 +372,94 @@ static READY: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS
 /// them.
 static CURRENT: [AtomicPtr<Thread>; MAX_CPUS] = [const { AtomicPtr::new(ptr::null_mut()) }; MAX_CPUS];
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// Every thread not yet dropped (weakly: the registry keeps none alive).
+/// Pruned of the dropped ones whenever a thread is created. Nothing else is
+/// locked while it is held but the heap (which it allocates from, and which
+/// takes the page tables' and the frame allocator's locks to grow), so it
+/// must never be taken under the heap's, the page tables' or the frame
+/// allocator's locks.
+static THREADS: SpinLock<Vec<Weak<Thread>>> = SpinLock::new(Vec::new());
+/// Ticks each CPU's scheduler has taken (from its start), and how many of
+/// them found the idle thread running. A tick is counted in `TICKED` before
+/// `IDLE_TICKS` (whose increment releases it), and [`cpu_ticks`] reads them
+/// the other way round (acquiring), so a reading never has more idle ticks
+/// than ticks.
+static TICKED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static IDLE_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Add `t` to [`THREADS`], dropping the entries of threads gone since.
+/// Not under any other lock (it allocates).
+fn register(t: Arc<Thread>) -> Arc<Thread> {
+    let mut all = THREADS.lock();
+    all.retain(|w| w.strong_count() > 0);
+    all.push(Arc::downgrade(&t));
+    t
+}
+
+/// A thread as [`threads`] saw it.
+#[derive(Clone, Copy, Debug)]
+pub struct ThreadInfo {
+    pub id: u64,
+    pub name: &'static str,
+    pub cpu: usize,
+    pub state: State,
+    /// Timer ticks (1 ms each) that found it running.
+    pub ticks: u64,
+}
+
+/// Every thread whose record is still held somewhere, in the order they
+/// were created; that includes dead threads a join handle or the scheduler
+/// still holds.
+pub fn threads() -> Vec<ThreadInfo> {
+    // Collected first so the `Arc`s drop after `THREADS` is released (the
+    // last one dropped frees a thread's record).
+    let live: Vec<Arc<Thread>> = THREADS.lock().iter().filter_map(Weak::upgrade).collect();
+    live.iter()
+        .map(|t| ThreadInfo {
+            id: t.id,
+            name: t.name,
+            cpu: t.cpu,
+            state: t.state(),
+            ticks: t.ticks.load(Ordering::Relaxed),
+        })
+        .collect()
+}
+
+/// A CPU's scheduler ticks, and those that found it idle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuTicks {
+    pub ticks: u64,
+    pub idle: u64,
+}
+
+impl CpuTicks {
+    /// The ticks taken since `earlier` (a reading of the same CPU). Each
+    /// reading has idle <= ticks, but two readings' differences need not
+    /// (an earlier reading's ticks may include idle ticks it didn't see):
+    /// the idle ticks are clamped to the ticks.
+    pub fn since(self, earlier: CpuTicks) -> CpuTicks {
+        let ticks = self.ticks.saturating_sub(earlier.ticks);
+        CpuTicks { ticks, idle: self.idle.saturating_sub(earlier.idle).min(ticks) }
+    }
+
+    /// How busy the CPU was over these ticks, in whole percent.
+    pub fn busy_percent(self) -> u64 {
+        lumen_time::busy_percent(self.ticks, self.idle)
+    }
+}
+
+/// CPU `cpu`'s [`CpuTicks`] (zeros for a CPU index that doesn't exist).
+pub fn cpu_ticks(cpu: usize) -> CpuTicks {
+    match (TICKED.get(cpu), IDLE_TICKS.get(cpu)) {
+        (Some(t), Some(i)) => {
+            // Idle first (acquiring what `tick` released with it), then the
+            // ticks, which are then at least as many as the idle ticks seen.
+            let idle = i.load(Ordering::Acquire);
+            CpuTicks { ticks: t.load(Ordering::Relaxed), idle }
+        }
+        _ => CpuTicks::default(),
+    }
+}
 /// Set once [`init`] has stopped waiting for the schedulers to start: one
 /// that starts after that says so.
 static START_WAIT_OVER: AtomicBool = AtomicBool::new(false);
@@ -608,9 +704,11 @@ fn finish_switch(cpu: usize) {
 }
 
 /// The timer interrupt on this CPU (interrupts off, EOI sent): the first
-/// tick of an armed CPU starts its scheduler; after that, wake the sleepers
-/// whose deadline has passed, and switch threads if another is ready and
-/// the running one's slice is used up (or the idle thread runs).
+/// tick of an armed CPU starts its scheduler; after that, count the tick
+/// (against the running thread, and as idle if that is the idle thread),
+/// wake the sleepers whose deadline has passed, and switch threads if
+/// another is ready and the running one's slice is used up (or the idle
+/// thread runs).
 pub fn tick() {
     let cpu = arch::cpu_index();
     if !running_on(cpu) {
@@ -628,6 +726,12 @@ pub fn tick() {
     let now = time::now_ns();
     let switch = {
         let mut q = CPUS[cpu].lock();
+        // Counted before waking anyone: the thread this tick interrupted.
+        TICKED[cpu].fetch_add(1, Ordering::Relaxed);
+        q.running().ticks.fetch_add(1, Ordering::Relaxed);
+        if q.on_idle() {
+            IDLE_TICKS[cpu].fetch_add(1, Ordering::Release);
+        }
         q.wake_sleepers(cpu, now);
         q.slice_left = q.slice_left.saturating_sub(1);
         !q.ready.is_empty() && (q.slice_left == 0 || q.on_idle())
@@ -872,6 +976,43 @@ fn switched_away(start: u64, id: u64, state: State) -> bool {
 fn last_cpu() -> Result<usize, &'static str> {
     running_cpus().last().copied().ok_or("no CPU runs a scheduler")
 }
+
+crate::ktest!(
+    fn busy_and_idle_ticks_are_counted() {
+        // On the last CPU: a thread spinning there for 100 ms reads that
+        // span busy (it reads the CPU's ticks itself at its start and end,
+        // so the span is only its spinning), then 100 ms with nothing to run
+        // there reads idle.
+        use crate::kassert;
+        const SPAN_NS: u64 = 100_000_000;
+        let cpu = last_cpu()?;
+        let span: Arc<SpinLock<Option<CpuTicks>>> = Arc::new(SpinLock::new(None));
+        let result = span.clone();
+        let spinner = spawn_test(cpu, "busy-test", move || {
+            let start = cpu_ticks(cpu);
+            let end = time::now_ns() + SPAN_NS;
+            while time::now_ns() < end {
+                core::hint::spin_loop();
+            }
+            *result.lock() = Some(cpu_ticks(cpu).since(start));
+        })?;
+        join_bounded(spinner)?;
+        let busy = span.lock().ok_or("the spinner didn't report")?;
+        let before = cpu_ticks(cpu);
+        time::sleep(SPAN_NS);
+        let idle = cpu_ticks(cpu).since(before);
+        crate::ktest::diag(format_args!(
+            "cpu {cpu}: spinning {}% of {} ticks, sleeping {}% of {}",
+            busy.busy_percent(),
+            busy.ticks,
+            idle.busy_percent(),
+            idle.ticks
+        ));
+        kassert!(busy.ticks >= 20 && busy.busy_percent() >= 80);
+        kassert!(idle.ticks >= 20 && idle.busy_percent() <= 20);
+        Ok(())
+    }
+);
 
 /// Spawn two threads on `cpu` that never yield, and check that they
 /// interleave: each counts its own loops, and runs until both have seen the

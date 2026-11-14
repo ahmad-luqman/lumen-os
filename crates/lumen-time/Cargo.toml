@@ -1,6 +1,6 @@
 [package]
 name = "lumen-time"
-description = "no_std timekeeping arithmetic (calibration, tick/ns conversion, timer counts) for the Lumen kernel, host-tested"
+description = "no_std timekeeping arithmetic (calibration, tick/ns conversion, timer counts, RTC decoding) for the Lumen kernel, host-tested"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

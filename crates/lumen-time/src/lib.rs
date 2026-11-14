@@ -3,13 +3,17 @@
 //! nanoseconds, the counts the PIT and the local APIC timer are programmed
 //! with, how times read in logs (`Stamp`, `Millis`), the rules a
 //! calibration window must meet to be trusted (`Window`, `steady_windows`),
-//! and how a PIT channel's two readings become a window (`pit_window`). All of it is
-//! integer math (the kernel has no floating point) in `u128` where products
-//! can overflow, so it holds for centuries of uptime (and then saturates).
+//! how a PIT channel's two readings become a window (`pit_window`), busy
+//! percentages and rates (`busy_percent`, `percent`, `per_second`), and the
+//! CMOS RTC's registers as a date ([`rtc`]). All of it is integer math
+//! (the kernel has no floating point) in `u128` where products can
+//! overflow, so it holds for centuries of uptime (and then saturates).
 
 #![no_std]
 
 use core::fmt;
+
+pub mod rtc;
 
 pub const NS_PER_SEC: u64 = 1_000_000_000;
 /// The PIT's input clock.
@@ -307,6 +311,32 @@ pub fn median(samples: &mut [u64]) -> Option<u64> {
         n if n % 2 == 1 => Some(samples[n / 2]),
         n => Some(samples[n / 2 - 1].midpoint(samples[n / 2])),
     }
+}
+
+/// How busy a CPU was, in whole percent (rounded), from timer ticks
+/// sampled over a span: `ticks` in all, `idle` of them landing on its idle
+/// thread. 0 for no ticks; idle ticks past `ticks` count as all idle.
+pub fn busy_percent(ticks: u64, idle: u64) -> u64 {
+    percent(ticks.saturating_sub(idle), ticks)
+}
+
+/// `part` of `whole` in whole percent, rounded (0 for an empty whole; a
+/// part past the whole counts as all of it).
+pub fn percent(part: u64, whole: u64) -> u64 {
+    if whole == 0 {
+        return 0;
+    }
+    let part = u128::from(part.min(whole));
+    ((part * 100 + u128::from(whole) / 2) / u128::from(whole)) as u64
+}
+
+/// `count` events in `ns` nanoseconds as a rate per second (rounded down;
+/// 0 for an empty span, saturating).
+pub fn per_second(count: u64, ns: u64) -> u64 {
+    if ns == 0 {
+        return 0;
+    }
+    u64::try_from(u128::from(count) * u128::from(NS_PER_SEC) / u128::from(ns)).unwrap_or(u64::MAX)
 }
 
 /// A counter of fixed, known frequency.
@@ -633,6 +663,35 @@ mod tests {
         assert!(plausible_tsc_hz(2_900_000_000) && plausible_tsc_hz(10_000_000) && plausible_tsc_hz(100_000_000_000));
         assert!(!plausible_tsc_hz(9_999_999), "a reference that finished far too soon");
         assert!(!plausible_tsc_hz(100_000_000_001));
+    }
+
+    #[test]
+    fn busy_percent_rounds_and_clamps() {
+        assert_eq!(busy_percent(0, 0), 0);
+        assert_eq!(busy_percent(1000, 1000), 0);
+        assert_eq!(busy_percent(1000, 0), 100);
+        assert_eq!(busy_percent(1000, 875), 13); // 12.5 rounds up
+        assert_eq!(busy_percent(1000, 876), 12);
+        assert_eq!(busy_percent(3, 1), 67);
+        assert_eq!(busy_percent(10, 11), 0);
+        assert_eq!(busy_percent(u64::MAX, 0), 100);
+    }
+
+    #[test]
+    fn percent_rounds_and_clamps() {
+        assert_eq!(percent(1, 3), 33);
+        assert_eq!(percent(2, 3), 67);
+        assert_eq!(percent(5, 0), 0);
+        assert_eq!(percent(7, 5), 100);
+    }
+
+    #[test]
+    fn per_second_scales_by_the_span() {
+        assert_eq!(per_second(1000, NS_PER_SEC), 1000);
+        assert_eq!(per_second(1500, 1_500_000_000), 1000);
+        assert_eq!(per_second(999, 2 * NS_PER_SEC), 499);
+        assert_eq!(per_second(5, 0), 0);
+        assert_eq!(per_second(u64::MAX, 1), u64::MAX);
     }
 
     #[test]

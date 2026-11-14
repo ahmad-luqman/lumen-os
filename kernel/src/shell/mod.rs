@@ -23,6 +23,7 @@
 
 mod commands;
 mod crash;
+mod sysinfo;
 
 use crate::arch::serial;
 use crate::keyboard::{self, KeyCode};
@@ -70,6 +71,7 @@ impl<'a> Ctx<'a> {
 
     /// Take the screen's pixels for this command (see `term::Canvas`; drop
     /// it before returning: the shell takes back one left behind).
+    #[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
     pub fn canvas(&self) -> Result<term::Canvas, term::CanvasError> {
         term::canvas(self.owner)
     }
@@ -88,6 +90,7 @@ impl<'a> Ctx<'a> {
     /// Wait for the next key typed on this console (see [`Self::poll_key`]):
     /// on the screen the thread sleeps until IRQ 1; on serial it polls,
     /// yielding to the CPU's other threads.
+    #[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
     pub fn wait_key(&mut self) -> Key {
         self.out.read_key()
     }
