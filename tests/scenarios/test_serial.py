@@ -29,4 +29,6 @@ def test_boots_without_a_uart(boot):
     else:
         raise AssertionError(f"no crash after typing `crash panic` {ATTEMPTS} times")
     assert code == EXIT_CRASH
-    assert m.output == "", m.output  # nothing came out of a port that isn't there
+    # Nothing from the kernel came out of a port that isn't there (QEMU's
+    # own warnings, such as KVM's about CPUID features, share the stream).
+    assert "boot:" not in m.output and "lumen>" not in m.output, m.output
