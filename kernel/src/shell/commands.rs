@@ -17,6 +17,13 @@ pub type Run = fn(&mut Ctx<'_>, &[String]);
 pub static COMMANDS: Table<Run> = Table(&[
     Command { name: "help", args: &[], usage: "", about: "this list", run: help },
     Command { name: "echo", args: &[], usage: "<text>", about: "print text", run: echo },
+    Command {
+        name: "rhai",
+        args: &[&["-e", "demo"], crate::script::DEMO_NAMES],
+        usage: "[-e <expr> | demo [name]]",
+        about: "rhai scripts: a REPL, an expression, or a built-in demo (Ctrl-C stops one)",
+        run: crate::script::command,
+    },
     Command { name: "int3", args: &[], usage: "", about: "take a breakpoint and continue", run: int3 },
     Command {
         name: "crash",

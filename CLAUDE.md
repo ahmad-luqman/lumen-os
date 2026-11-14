@@ -141,7 +141,8 @@ own PR that updates that doc first.
   `arch/x86_64/`: GDT/TSS (per CPU), IDT, entry
   stubs and the vector map, `percpu.rs` (GS base, CPU index), `irq.rs` (nested interrupt disable), local and
   I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
-  reporter. `ktest.rs`: test runner. `shell/`: the shells, one on serial
+  reporter. `ktest.rs`: test runner. `script.rs`: rhai scripts (the shell's
+  `rhai`; built-in scripts in `script/`). `shell/`: the shells, one on serial
   (plain text unless `lumen.ansi`) and one on the screen (keyboard): `mod.rs`
   the consoles and `Ctx` (keys through `poll_key`/`wait_key`, the screen
   through `canvas`), their commands (`commands.rs`: each row carries its

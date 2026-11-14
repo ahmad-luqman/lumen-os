@@ -184,10 +184,10 @@ pub struct Thread {
 }
 
 impl Thread {
-    /// A ready thread on CPU `cpu` with a fresh stack, that starts by
-    /// running `entry`.
-    fn spawned(name: &'static str, cpu: usize, entry: Entry) -> Result<Arc<Thread>, SpawnError> {
-        let stack = KernelStack::new(STACK_SIZE, StackKind::Thread).map_err(SpawnError::Stack)?;
+    /// A ready thread on CPU `cpu` with a fresh stack of `stack_size` bytes,
+    /// that starts by running `entry`.
+    fn spawned(name: &'static str, cpu: usize, stack_size: u64, entry: Entry) -> Result<Arc<Thread>, SpawnError> {
+        let stack = KernelStack::new(stack_size, StackKind::Thread).map_err(SpawnError::Stack)?;
         // SAFETY: a fresh, mapped stack (page-aligned top) nothing runs on;
         // the thread owns it, and it is freed only after the thread has died
         // and its CPU has switched away from it.
@@ -502,6 +502,9 @@ pub enum SpawnError {
     NotRunning,
     /// No stack for it.
     Stack(StackError),
+    /// [`run_sized`] on a thread that can't wait for another (an interrupt
+    /// handler, a lock held, interrupts off, the idle thread).
+    CantWait,
 }
 
 impl fmt::Display for SpawnError {
@@ -509,6 +512,7 @@ impl fmt::Display for SpawnError {
         match self {
             SpawnError::NotRunning => f.write_str("that CPU runs no scheduler"),
             SpawnError::Stack(e) => write!(f, "no stack: {e}"),
+            SpawnError::CantWait => f.write_str("this thread can't wait for it"),
         }
     }
 }
@@ -540,13 +544,44 @@ pub fn spawn(name: &'static str, f: impl FnOnce() + Send + 'static) -> Result<Jo
     spawn_on(arch::cpu_index(), name, f)
 }
 
+/// Run `f` in a new thread on this CPU with a stack of `stack_size` bytes
+/// (a nonzero multiple of 4 KiB; anything else panics) instead of
+/// [`STACK_SIZE`], and wait for it to finish: for deeply recursive code (the
+/// script interpreter). As it is joined before this returns, `f` may borrow
+/// from the caller. If no thread can be made, or the calling thread can't
+/// block (see [`JoinHandle::join`]), `f` is dropped unrun.
+pub fn run_sized<'a>(name: &'static str, stack_size: u64, f: impl FnOnce() + Send + 'a) -> Result<(), SpawnError> {
+    // The SAFETY argument below needs a panic to end the kernel, not unwind
+    // past the join.
+    #[cfg(not(panic = "abort"))]
+    compile_error!("sched::run_sized relies on panic = \"abort\"");
+    let cpu = arch::cpu_index();
+    if !can_block(cpu) {
+        return Err(SpawnError::CantWait);
+    }
+    let f: Box<dyn FnOnce() + Send + 'a> = Box::new(f);
+    // SAFETY: only the closure's lifetime bound changes (same layout). The
+    // thread is joined below before this function returns (a join has no
+    // timeout, and nothing kills a thread), so `f` (and what it borrows) is
+    // used only while those borrows are alive; a panic aborts the kernel,
+    // so nothing unwinds past the join. If spawning fails, `spawn_with`
+    // drops `f` before returning.
+    let f: Entry = unsafe { core::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Entry>(f) };
+    spawn_with(cpu, name, stack_size, f)?.join();
+    Ok(())
+}
+
 /// Start a thread running `f` on CPU `cpu`, where it will always run. It is
 /// queued behind the threads already ready there.
 pub fn spawn_on(cpu: usize, name: &'static str, f: impl FnOnce() + Send + 'static) -> Result<JoinHandle, SpawnError> {
+    spawn_with(cpu, name, STACK_SIZE, Box::new(f))
+}
+
+fn spawn_with(cpu: usize, name: &'static str, stack_size: u64, f: Entry) -> Result<JoinHandle, SpawnError> {
     if !running_on(cpu) {
         return Err(SpawnError::NotRunning);
     }
-    let thread = Thread::spawned(name, cpu, Box::new(f))?;
+    let thread = Thread::spawned(name, cpu, stack_size, f)?;
     {
         let mut q = CPUS[cpu].lock();
         q.home();
@@ -838,7 +873,7 @@ pub fn init() {
     assert_eq!(arch::cpu_index(), 0, "sched::init is for the boot CPU");
     assert!(time::timer_published(), "sched::init before time::init");
     assert!(arch::irq::enabled(), "sched::init with interrupts off: no tick could start a scheduler");
-    let idle = Thread::spawned("idle", 0, Box::new(|| idle_loop(0, || false, || {})))
+    let idle = Thread::spawned("idle", 0, STACK_SIZE, Box::new(|| idle_loop(0, || false, || {})))
         .unwrap_or_else(|e| panic!("the boot CPU's idle thread: {e}"));
     install(0, Thread::adopted("main"), idle);
     CPUS[0].lock().home(); // `main`: it can sleep and block too

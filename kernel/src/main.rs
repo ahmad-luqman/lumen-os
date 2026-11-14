@@ -41,6 +41,7 @@ mod mm;
 mod power;
 mod rtc;
 mod sched;
+mod script;
 mod shell;
 mod smp;
 mod symbols;
