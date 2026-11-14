@@ -1,0 +1,29 @@
+# Features: demo. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Demo logic (lumen-demo, in the kernel with audit passing): the Mandelbrot set in fixed-point integers (agreeing with floating point on all but <0.1% of points; no overflow for any point, extreme screens' every pixel and i64's extremes included), black inside the set and coloured outside; rows dealt to CPUs in bands, each once; Conway's Game of Life on a grid with a dead edge (the B3/S23 rules for every neighbour count, gliders and spaceships move, the glider gun adds a glider in each of its first three 30-generation periods, `life glider`'s glider ends as a still block at the bottom edge, agreeing with an endless plane away from the edge) and its seed patterns (matching their published RLE, placed where they have room, inside a grid barely larger than them)"
+milestone = "M2"
+tests = [
+    "cargo:lumen-demo",
+    "audit:flags",
+]
+
+[[feature]]
+name = "`mandelbrot` draws the set on the screen with the boot CPU alone, then with every CPU whose scheduler runs (row bands dealt round-robin to threads pinned to each CPU, each CPU drawing some, the same pixels, every thread joined before the screen is given back), prints both times and each CPU's rows, shows its prompt on the screen too, and gives the screen back on a key; an argument is refused by name"
+milestone = "M2"
+tests = [
+    "scenario:test_demo::test_mandelbrot_golden",
+    "ktest:lumen_kernel::demo::every_cpu_rendered_rows",
+    "scenario:test_demo::test_life_usage_names_the_bad_argument",
+]
+
+[[feature]]
+name = "`life [pattern] [generations]` runs Conway's Game of Life on the screen (glider, glider gun, lightweight spaceship, R-pentomino, acorn; the gun without a pattern) with a status line: with a count, that many generations then held until a key (a key ends it early, and it says so); without, at most 20 a second until a key; after 30 generations each pattern's population matches an endless plane's; a bad argument is named"
+milestone = "M2"
+tests = [
+    "scenario:test_demo::test_life_glider_golden",
+    "scenario:test_demo::test_life_runs_until_a_key",
+    "scenario:test_demo::test_a_key_ends_a_counted_run_early",
+    "scenario:test_demo::test_life_usage_names_the_bad_argument",
+    "scenario:test_demo::test_every_pattern_runs_as_on_a_plane",
+]

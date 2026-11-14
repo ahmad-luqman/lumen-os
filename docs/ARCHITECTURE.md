@@ -1013,7 +1013,8 @@ off. A wake from another CPU queues the thread there and sends the
 ### Shell (built in M2)
 
 `crates/lumen-shell` (host-tested) and `kernel/src/shell/` (the consoles,
-`mod.rs`; the commands, `commands.rs`; the deliberate faults, `crash.rs`).
+`mod.rs`; the commands, `commands.rs`; the system commands, `sysinfo.rs`;
+the deliberate faults, `crash.rs`).
 
 - **Two shells, one per console,** each with its own line and history:
   the serial shell on the boot CPU's `main` thread (where kmon ran), and
@@ -1108,9 +1109,67 @@ off. A wake from another CPU queues the thread there and sends the
   if the CPU hasn't taken it; while one is out, another is refused.
   `crash dfree` and `crash heapcorrupt` print the heap's line before the
   damage, which the tests compare with the report's.
+- **System commands** (`sysinfo.rs`; each a `<name>: ...` header and,
+  but for `date`, rows; output with rows is made into one string first
+  and written in one write, except `dmesg`, which writes whole lines in
+  chunks of about 512 bytes):
+  - `cpus`: each CPU online, its local APIC id, whether its scheduler
+    runs, the ticks it has taken and how busy it has been since it
+    started (the share of ticks that didn't find the idle thread running:
+    the scheduler counts each tick against the running thread and, on the
+    idle thread, as idle; sampling at 1 kHz; a ktest spins on a CPU and
+    leaves it idle and checks both), and the threads homed there
+    (`sched::threads`, a registry of weak references); then CPUs stuck
+    starting, and in the header those halted past `MAX_CPUS` (neither
+    tested). The boot CPU reads nearly 100% busy even when idle: the
+    serial shell polls serial, yielding, and never sleeps.
+  - `mem`: frames used of those the allocator owns, the heap's counters,
+    and the kernel stacks registered, by kind (sizes without their guard
+    pages).
+  - `irqs`: every I/O APIC input decoded (vector, delivery, trigger,
+    polarity, destination, masked; an input no driver routed is shown only
+    as masked; `no I/O APIC` without any, not tested), then the interrupts
+    taken on each vector that took any or has a routed input
+    (`idt::vector_count`: `lumen_exception_dispatch` counts every vector,
+    all CPUs together), with what the vector map uses it for.
+  - `dmesg`: the newest whole log lines as serial printed them: the logger
+    keeps the last 16 KiB in a `lumen_trace::TextRing` (host-tested
+    against a model; not lock-free: `klog`'s `RING` lock, a leaf, taken
+    under the line lock by the logger and alone by readers). Only whole
+    lines are shown: a full ring's oldest, cut, line and a line another
+    CPU is still writing are left out; the header says whether older lines
+    were overwritten (`klog::written`; the overwritten case not tested in
+    the kernel).
+  - `date`: the CMOS RTC (`rtc.rs`; ports in `arch::cmos`, whose guard
+    serializes index/data pairs; reading register C would acknowledge RTC
+    interrupts, and every index write leaves NMIs enabled): wait out an
+    update in progress (at most 10 ms per read; 0xff means no clock, a
+    divider other than the running one a stopped oscillator), read
+    until two reads agree (at most 5 reads), refuse a clock that lost
+    power (status D) or whose updates are halted (status B's SET), decode
+    BCD or binary and 12- or 24-hour hours (all in `lumen_time::rtc`,
+    host-tested; a decode failure is logged with the raw registers). The
+    clock's zone is whatever set it; `date` takes it as UTC (true under
+    QEMU's `-rtc base=utc`, in every test); Lumen never writes the clock. The century is taken as 20xx (the FADT's
+    century register isn't read). QEMU's RTC ticks on a phase of its own:
+    measured, it reads 1 to 2 s behind the host's clock; the test checks
+    it is no later than the host's clock and at most 3 s behind its whole
+    second.
+  - `top [frames]`: every second, the CPUs (busy % and ticks per second
+    over the last second; `stalled` for one that took no tick, not
+    tested), interrupts per second by vector (from 32 on), the heap and
+    frames, and
+    every thread with its share of its CPU's ticks; it polls the console
+    for a key (`Ctx::poll_key`) between 20 ms sleeps and stops on `q` or
+    Ctrl-C (or after `frames` frames). The scenario checks frames 0.9 to
+    1.5 s apart and the timers at about 1 kHz. With escape codes each
+    frame replaces the last (home, erase; not tested); on plain serial
+    frames follow one another as lines.
 - **Tests:** `cargo:lumen-shell`; `test_shell` (echo with quotes on both
   consoles, history and line editing on the screen and history on serial,
-  completion on both, one line of error, `lumen.ansi`); the keyboard and
+  completion on both, one line of error, `lumen.ansi`, the system
+  commands' headers and rows under `-smp 2`, `date` against the host's
+  clock, `top`'s frames, rates and `q`); the keyboard and
   terminal scenarios type on the screen's shell and read the screen back
   with `term text`; every serial scenario that drove kmon runs against the
   serial shell with the new prompt.
@@ -1200,6 +1259,62 @@ closures; see the crates row in section 2).
   REPL going on after Ctrl-C and errors.
 - **Not yet:** scripts from files (M6), floats, closures, scripts in user
   mode (M9), a script running in the background.
+
+### Demos (built in M2)
+
+- **What:** `mandelbrot` and `life [pattern] [generations]`, shell
+  commands that draw on the terminal's canvas (`Ctx::canvas`: the pixels
+  below the header, the terminal paused) and give it back on a key typed
+  on the console that ran them. The terminal draws nothing meanwhile, so
+  each draws its prompt in a status line at the canvas's bottom ("press a
+  key on serial", or "on the keyboard": `Console::name`) as well as writing
+  it to the console. The arithmetic, the band dealing and the rules
+  are `lumen-demo`'s (host-tested); `kernel/src/demo.rs` draws them.
+- **Mandelbrot:** fixed point (`i64`, 28 fraction bits; the kernel has no
+  SSE), 64 iterations, the whole set fitted to the canvas above the status
+  line. Points with `|re|` or `|im|` above 2 escape after one step and are
+  answered without iterating, so no step can overflow whatever the
+  screen's shape. Drawn twice: by the calling CPU (the boot CPU, where the
+  shells run) alone, then by every CPU whose scheduler runs, and both
+  times printed with the rows each CPU drew. The image is cut into 8-row
+  bands dealt round-robin (band `i` to slot `i % n`). The calling thread
+  draws slot 0; every other such CPU gets a thread pinned to it
+  (`sched::spawn_on`) holding a clone of the `Arc<Canvas>`, and all are
+  joined before the drawing returns, so none draws after the command drops
+  the canvas (whose drop draws the terminal again). A CPU that gets no
+  thread has its slot drawn by the caller, and the command says so, as it
+  does for a CPU online without a scheduler (and the status line counts
+  them). (Threads, not `smp::run_on` jobs: a job is a bare `fn()`, so
+  reaching the canvas from one would take a static raw pointer and
+  `unsafe`.) Times on four vCPUs are in PR #80.
+- **Life:** 8-pixel cells on a grid whose outside counts as dead (nothing
+  wraps), only changed cells drawn, a status line under the grid (pattern,
+  generation, population). Each pattern starts where it has room (glider
+  and gun at the top left, the lightweight spaceship at the right heading
+  left, R-pentomino and acorn in the middle). With a count it steps that
+  many generations as fast as it can (a key ends it early, and it says
+  so) and holds the frame (the golden test); without one it steps at most
+  20 a second until a key. A screen too small for the pattern (or the
+  set) is refused.
+- **Tests:** `cargo:lumen-demo` (fixed point against `f64`, no overflow on
+  any pixel of extreme screens, band dealing, the B3/S23 truth table, the
+  patterns against their published RLE and placed inside small grids,
+  spaceships moving, the gun's first three periods, the glider ending as a
+  block, the grid against an endless-plane reference, R-pentomino's 116
+  cells at generation 1103); `ktest:lumen_kernel::demo::every_cpu_rendered_rows`
+  (every online CPU draws rows, all rows once, the same pixels as one CPU,
+  no thread still holding the canvas, 20 times on an image of a band per
+  CPU so a missing join shows, and a part band); `test_demo` (goldens of
+  the set and of a glider 40 generations on, each pattern's population
+  after 30 generations against a reference, the rate ceiling, a key ending
+  a counted run, the default pattern, the terminal drawn again after the
+  key, usage errors).
+- **Not yet tested:** a CPU that gets no thread or runs no scheduler (both
+  reported on the console), a canvas that can't be had (`Ctx::canvas`
+  failing), and running the demos from the screen's shell (the same key
+  path; the prompt is in the status line the goldens check). A crash
+  report taking the canvas mid-run stops the demo (`is_live`), but the
+  report halts the shell's CPU, so its message isn't expected to show.
 
 ## 7. Driver interface (planned, M3+)
 
@@ -1506,7 +1621,7 @@ run's, which the job summary was built from) survives.
 
 ```
 kernel/            the kernel (bin crate, x86_64-unknown-none)
-  src/arch/        HAL; x86_64/ has gdt, idt, irq, context (thread switch), apic, pic, pit, i8042 (ports), reset (reset and PM1 registers), serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
+  src/arch/        HAL; x86_64/ has gdt, idt, irq, context (thread switch), apic, pic, pit, i8042 and cmos (ports), reset (reset and PM1 registers), serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
   src/acpi.rs      ACPI discovery (MADT, HPET, FADT and the DSDT's _S5_) through lumen-acpi
   src/power.rs     reboot (0xCF9, 8042, triple fault) and ACPI S5 power-off
   src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs, routing ISA IRQs
@@ -1517,13 +1632,14 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/boot.rs      Limine requests
   src/cmdline.rs   kernel command line (flags, key=value)
   src/sync.rs      SpinLock (interrupts off while held)
-  src/klog.rs      logger (levels, subsystem tags, serial timestamps)
+  src/klog.rs      logger (levels, subsystem tags, serial timestamps, the ring dmesg reads)
+  src/rtc.rs       the CMOS RTC: date and time (taken as UTC) for `date`
   src/fb.rs        framebuffer: pixels, glyphs, the hello screen, the crash screen
   src/term.rs      the terminal on the framebuffer (lumen-term): drawing changed cells, log lines, the cursor
   src/symbols.rs   kernel symbol table (symbolized crash reports)
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
-  src/shell/       the shells (lumen-shell): serial and the screen's consoles, the commands, deliberate faults (crash.rs)
+  src/shell/       the shells (lumen-shell): serial and the screen's consoles, the commands, system commands (sysinfo.rs), deliberate faults (crash.rs)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
 crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, ...)

@@ -234,7 +234,6 @@ impl From<window::WindowError> for GrowError {
 }
 
 /// The heap's counters (O(1)).
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests; X-ray (M5)
 pub fn stats() -> Stats {
     STATE.lock().heap.stats()
 }

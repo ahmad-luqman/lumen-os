@@ -178,6 +178,30 @@ pub fn set_masked(route: Route, masked: bool) {
     io.regs.update_entry(input, |e| e.set_masked(masked));
 }
 
+/// An I/O APIC input as it is programmed now (for the shell's `irqs`).
+#[derive(Clone, Copy, Debug)]
+pub struct Input {
+    /// Its global system interrupt.
+    pub gsi: u32,
+    pub entry: RedirectionEntry,
+    /// Whether a driver routed it ([`route_isa_irq`]); the others stay
+    /// masked.
+    pub routed: bool,
+}
+
+/// Every I/O APIC input, in GSI order per I/O APIC, read from the I/O
+/// APICs.
+pub fn inputs() -> Vec<Input> {
+    let mut io_apics = IO_APICS.lock();
+    let mut all = Vec::new();
+    for io in io_apics.iter_mut() {
+        for i in 0..io.regs.entries() {
+            all.push(Input { gsi: io.gsi_base + i, entry: io.regs.entry(i), routed: io.is_routed(i) });
+        }
+    }
+    all
+}
+
 /// Whether ISA interrupt `irq`'s input (after the MADT's override) is
 /// routed and unmasked.
 #[cfg(feature = "ktest")]

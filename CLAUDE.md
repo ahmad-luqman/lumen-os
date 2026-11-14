@@ -146,10 +146,10 @@ own PR that updates that doc first.
   (plain text unless `lumen.ansi`) and one on the screen (keyboard): `mod.rs`
   the consoles and `Ctx` (keys through `poll_key`/`wait_key`, the screen
   through `canvas`), their commands (`commands.rs`: each row carries its
-  help line) and deliberate faults (`crash.rs`). `fb.rs`:
+  help line; the system ones in `sysinfo.rs`) and deliberate faults (`crash.rs`). `fb.rs`:
   framebuffer pixels, the header and the crash screen. `term.rs`: the
   terminal on the framebuffer (log lines, the screen's shell, scrollback, `view_text`, and
-  `Canvas`: the pixels below the header for one command, the terminal paused meanwhile). `klog.rs`: logger. `symbols.rs`: symbol lookup.
+  `Canvas`: the pixels below the header for one command, the terminal paused meanwhile). `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -169,6 +169,9 @@ own PR that updates that doc first.
   decoding, `lumen.keymap=`); `arch/x86_64/i8042.rs` its ports.
   `time.rs`: TSC and LAPIC timer calibration, the boot origin
   (`mark_boot`, `since_boot_ns`), `now_ns`, `sleep`, `ticks`.
+  `demo.rs`: the `mandelbrot` (bands on every CPU) and `life` commands.
+- `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs
+  in bands, and Game of Life with its patterns (host-tested).
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
 - `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, the
   page-table format and mapper (host-tested, incl. a model comparison), the
@@ -176,9 +179,11 @@ own PR that updates that doc first.
   lock-free stack registry.
 - `crates/lumen-heap`: heap allocator logic (address-ordered free list,
   coalescing; host-tested, incl. a randomized stress test against a shadow map).
-- `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads).
+- `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads),
+  and `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free).
 - `crates/lumen-time`: timekeeping arithmetic: calibration, tick/ns
-  conversion, timer counts, log time formats (`Stamp`, `Millis`)
+  conversion, timer counts, log time formats (`Stamp`, `Millis`),
+  percentages and rates, and the RTC's registers as a date (`rtc`)
   (host-tested).
 - `crates/lumen-queue`: lock-free single-producer, single-consumer byte
   queue (interrupt handler to thread; host-tested, incl. threads).

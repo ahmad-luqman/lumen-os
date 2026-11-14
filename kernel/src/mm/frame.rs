@@ -289,6 +289,20 @@ fn frame(addr: u64) -> PhysFrame {
     PhysFrame::from_u64(addr).expect("the allocator hands out aligned physical frames")
 }
 
+/// The allocator's frame counts (for the shell's `mem` and `top`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Counts {
+    /// Frames it manages (usable RAM, less what it reserved at boot).
+    pub owned: usize,
+    /// Of those, free now.
+    pub free: usize,
+}
+
+/// The allocator's [`Counts`] (O(1)).
+pub fn counts() -> Counts {
+    with_frames(|f| Counts { owned: f.owned_frames(), free: f.free_frames() })
+}
+
 /// Allocate one 4 KiB frame, or `None` when physical memory is exhausted.
 /// Its contents are whatever was there before (see [`alloc_zeroed`]).
 /// Return it with [`free`] (`unsafe`), or use [`alloc_owned`], which frees

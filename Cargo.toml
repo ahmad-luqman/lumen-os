@@ -13,6 +13,7 @@ repository = "https://github.com/ahmad-luqman/lumen-os"
 
 [workspace.dependencies]
 lumen-acpi = { path = "crates/lumen-acpi" }
+lumen-demo = { path = "crates/lumen-demo" }
 lumen-elf = { path = "crates/lumen-elf" }
 lumen-heap = { path = "crates/lumen-heap" }
 lumen-mm = { path = "crates/lumen-mm" }

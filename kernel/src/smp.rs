@@ -150,6 +150,12 @@ pub fn online_lapic_id(index: usize) -> Option<u32> {
     (slot.state() == State::Online).then(|| slot.lapic_id.load(Ordering::Relaxed))
 }
 
+/// How many CPUs past `MAX_CPUS` have halted for good (on their Limine
+/// stack); the shell's `cpus` and `top` say so.
+pub fn halted_past_max() -> usize {
+    HALTED.load(Ordering::Acquire)
+}
+
 /// Has CPU `index` been started but isn't online yet? (The crash reporter
 /// can't stop such a CPU, and says so.)
 pub fn is_starting(index: usize) -> bool {
