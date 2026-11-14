@@ -121,20 +121,6 @@ def shell_heap(m) -> dict[str, int]:
     return heap
 
 
-def crash_after_heap_summary(boot, kind: str) -> tuple[dict[str, int], str]:
-    """`crash <kind>`: the heap summary it prints before doing its damage
-    (the shell's own allocations for the command included), and the
-    report."""
-    m = boot("qemutest")
-    m.expect(r"lumen> ", BOOT_TIMEOUT)
-    m.send_line(f"crash {kind}")
-    before = heap_numbers(m.expect(r"heap: .*\n", 30).group(0))
-    m.expect(re.escape(END), 30)
-    assert m.wait_exit(10) == EXIT_CRASH
-    out = m.output
-    return before, out[out.index(BEGIN) : out.index(END) + len(END)]
-
-
 def wait_until_screen_shell_waits(m) -> None:
     """At the serial prompt, run `top 1` until it shows the screen's shell
     blocked (waiting for a key); back at the prompt.
@@ -157,6 +143,23 @@ def wait_until_screen_shell_waits(m) -> None:
         if blocked:
             return
     raise AssertionError(f"the screen's shell never blocked for a key:\n{m.output[start:]}")
+
+
+def crash_after_heap_summary(boot, kind: str) -> tuple[dict[str, int], str]:
+    """`crash <kind>`: the heap summary it prints before doing its damage
+    (the shell's own allocations for the command included), and the
+    report."""
+    m = boot("qemutest")
+    m.expect(SHELLS, BOOT_TIMEOUT)
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
+    # The screen's shell can't allocate between the summary and the report.
+    wait_until_screen_shell_waits(m)
+    m.send_line(f"crash {kind}")
+    before = heap_numbers(m.expect(r"heap: .*\n", 30).group(0))
+    m.expect(re.escape(END), 30)
+    assert m.wait_exit(10) == EXIT_CRASH
+    out = m.output
+    return before, out[out.index(BEGIN) : out.index(END) + len(END)]
 
 
 def test_heap_command_reports_usage(boot):
