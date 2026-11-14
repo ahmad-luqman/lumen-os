@@ -182,6 +182,9 @@ fn enter(vector: u64, rip: u64) {
     let me = arch::cpu_index();
     match CRASHING.compare_exchange(0, me + 1, Ordering::SeqCst, Ordering::SeqCst) {
         Ok(_) => {
+            // Before anything is written: a CPU stopped in the loopback
+            // ktest would leave serial looping back to itself.
+            arch::serial::leave_loopback();
             // No drawing starts from here on: a CPU stopped while drawing
             // holds the screen's lock for good (a log line on the crash path
             // would wait for it forever), and the crash screen draws

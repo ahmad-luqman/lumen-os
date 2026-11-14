@@ -1,7 +1,7 @@
 # Features: serial. See tests/features/README.md for the format.
 
 [[feature]]
-name = "Serial output in 16-byte FIFO bursts (one wait for an empty transmitter per burst, newlines as CR LF)"
+name = "Serial output in 16-byte FIFO bursts under the log's line lock (one wait for an empty transmit FIFO per burst, newlines as CR LF), byte by byte for the crash reporter; a UART that never empties is dropped"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::arch::x86_64::serial::fifo_burst_round_trip",
@@ -9,12 +9,13 @@ tests = [
 ]
 
 [[feature]]
-name = "Serial port presence probe (scratch register): no UART means no serial writes or reads, and boot goes on"
+name = "Serial port presence probe (scratch or interrupt enable register): no UART means no serial writes or reads, boot goes on and warns on the screen"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::arch::x86_64::serial::presence_detected",
     "ktest:lumen_kernel::arch::x86_64::serial::absent_uart_is_not_detected",
+    "ktest:lumen_kernel::arch::x86_64::serial::an_absent_uart_is_neither_written_nor_read",
     "cargo:lumen-uart",
-    "scenario:test_serial::test_boots_without_a_uart",
+    "scenario:test_serial::test_boots_without_a_uart_and_warns_on_screen_golden",
     "harness:test_qemu::test_machine_without_serial_has_no_serial_port",
 ]

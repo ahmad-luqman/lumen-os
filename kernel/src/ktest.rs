@@ -11,7 +11,7 @@
 //! test is caught by the crash reporter, which exits with `Crash`; the harness
 //! reports that test as failed and shows the crash report.
 
-use crate::arch::serial::SerialWriter;
+use crate::klog::LockedSerial;
 use core::fmt::{self, Write};
 
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by ktests
@@ -85,18 +85,11 @@ macro_rules! kassert_eq {
 }
 
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by ktests
-/// Print a TAP diagnostic line (`# ...`).
+/// Print a TAP diagnostic line (`# ...`), whole (under the log's line lock).
+/// So neither this nor `kassert!` may run inside `klog::with_line_lock`:
+/// the CPU would re-lock the line lock.
 pub fn diag(args: fmt::Arguments<'_>) {
-    line(format_args!("# {args}"));
-}
-
-/// Write one TAP line to serial under the log's line lock: no log line
-/// lands in the middle of it, and serial writes stay serialized (see
-/// `serial::SerialWriter`).
-fn line(args: fmt::Arguments<'_>) {
-    crate::klog::with_line_lock(|| {
-        let _ = writeln!(SerialWriter, "{args}");
-    });
+    let _ = writeln!(LockedSerial, "# {args}");
 }
 
 #[cfg(feature = "ktest")]
@@ -117,24 +110,26 @@ fn registered() -> &'static [KTest] {
 #[cfg(feature = "ktest")]
 pub fn run_all() -> bool {
     let tests = registered();
-    line(format_args!("TAP version 14"));
-    line(format_args!("1..{}", tests.len()));
+    // Each line whole, under the log's line lock.
+    let mut out = LockedSerial;
+    let _ = writeln!(out, "TAP version 14");
+    let _ = writeln!(out, "1..{}", tests.len());
     let mut failed = 0;
     for (i, t) in tests.iter().enumerate() {
         match (t.func)() {
             Ok(()) => {
-                line(format_args!("ok {} - {}", i + 1, t.name));
+                let _ = writeln!(out, "ok {} - {}", i + 1, t.name);
             }
             Err(reason) => {
                 failed += 1;
                 // Diagnostics always precede their result line (kassert! prints
                 // while the test runs), and the harness parses them that way.
-                line(format_args!("# {reason}"));
-                line(format_args!("not ok {} - {}", i + 1, t.name));
+                let _ = writeln!(out, "# {reason}");
+                let _ = writeln!(out, "not ok {} - {}", i + 1, t.name);
             }
         }
     }
-    line(format_args!("# ktest: {} passed, {} failed", tests.len() - failed, failed));
+    let _ = writeln!(out, "# ktest: {} passed, {} failed", tests.len() - failed, failed);
     failed == 0
 }
 

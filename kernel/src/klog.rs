@@ -23,23 +23,53 @@
 //! Every emitted line also records a `Log` event in the trace ring
 //! (`crate::trace`); recording it doesn't change the printed line.
 
-use crate::arch::serial::SerialWriter;
+use crate::arch::serial;
 use crate::sync::SpinLock;
-use core::fmt::Write;
+use core::fmt::{self, Write};
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
 struct KernelLogger;
 
 static LOGGER: KernelLogger = KernelLogger;
-/// Serializes whole log lines so they never interleave.
+/// Serializes every serial write but the crash reporter's: whole log lines
+/// never interleave, and two CPUs never burst into the UART's FIFO at once
+/// (`serial::burst_bytes`).
 static LINE_LOCK: SpinLock<()> = SpinLock::new(());
 
-/// Run `f` holding the log's line lock, so no log line lands in the middle
-/// of what it writes to serial (the serial shell's writes). `f` must not
-/// log.
+/// Run `f` holding the log's line lock, so no log line (or other serial
+/// write) lands in the middle of what it does. `f` must not log, write
+/// through [`LockedSerial`], `kassert!` or `ktest::diag`: they take the same
+/// lock (a CPU re-locking it hangs).
 pub fn with_line_lock<R>(f: impl FnOnce() -> R) -> R {
     let _line = LINE_LOCK.lock();
     f()
+}
+
+/// Serial output for everything but the logger itself and the crash
+/// reporter: each write (a whole `write!`) is made holding the line lock,
+/// in FIFO bursts.
+#[derive(Clone, Copy, Default)]
+pub struct LockedSerial;
+
+impl Write for LockedSerial {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        with_line_lock(|| serial::burst_bytes(s.as_bytes()));
+        Ok(())
+    }
+
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
+        with_line_lock(|| Burst.write_fmt(args))
+    }
+}
+
+/// Bursts to serial; only made where the line lock is held.
+struct Burst;
+
+impl Write for Burst {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        serial::burst_bytes(s.as_bytes());
+        Ok(())
+    }
 }
 
 impl Log for KernelLogger {
@@ -57,8 +87,7 @@ impl Log for KernelLogger {
         let _line = LINE_LOCK.lock();
         // Under the line lock: lines come out in the order of their stamps.
         let stamp = lumen_time::Stamp(crate::time::since_boot_ns());
-        let mut out = SerialWriter;
-        let _ = writeln!(out, "{stamp} {:<5} {}: {}", record.level(), tag, record.args());
+        let _ = writeln!(Burst, "{stamp} {:<5} {}: {}", record.level(), tag, record.args());
         if record.level() <= Level::Info {
             crate::term::console_log(record.level(), tag, record.args());
         }

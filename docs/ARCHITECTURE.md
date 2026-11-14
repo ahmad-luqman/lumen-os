@@ -81,15 +81,31 @@ tests (for example `lumen-elf`, the symbol-table reader).
 3. **`_start`** (naked asm): `xor ebp, ebp` ends the backtrace chain, the stack
    top is passed to `kmain`, and the stack is aligned. `kmain`'s first
    statement reads the TSC, the boot timeline's origin (below).
-4. **`arch::init_early`**: COM1 serial (only if a UART answers its scratch
-   register: without one, serial writes do nothing, reads find nothing, and
-   boot warns on the screen once the framebuffer is up; with a working FIFO,
-   writes go out 16 bytes per wait for an empty transmitter; the logic is
-   the host-tested `lumen-uart` crate), then the boot CPU's GDT and TSS, its
+4. **`arch::init_early`**: COM1 serial, then the boot CPU's GDT and TSS, its
    per-CPU record (the GS base, section "Other CPUs"), then the IDT
    with all 256 vectors. **From this point a CPU exception produces a crash
    report**, except a #DF caused by a broken stack pointer before step 6
    (#DF, NMI and #MC get their IST stacks there), which is a triple fault.
+
+   Serial (`arch::serial`, the logic in the host-tested `lumen-uart`
+   crate) is set up only if a UART answers: its scratch register holds two
+   patterns, or, without one (an 8250), its interrupt enable register does.
+   Without a UART, serial writes do nothing, reads find nothing, and boot
+   warns on the screen once the framebuffer is up (a golden checks that row
+   with `-serial none`); the screen then shows log lines at info and above,
+   from the framebuffer on. A UART whose transmit FIFO never empties (about
+   a minute of polling) is then treated as absent. Writes come in two
+   kinds. Bursts: with a working FIFO (a 16550A), 16 bytes per wait for an
+   empty transmit FIFO (THRE). They assume nobody else writes meanwhile, so
+   they go only through the log's line lock (`klog::LockedSerial`: the
+   logger, the serial shell, the ktest runner's TAP lines, the `crash`
+   command's messages); two CPUs bursting after the same check would
+   overrun the FIFO (not tested on its own: QEMU never overruns). Byte by
+   byte (`SerialWriter`): one wait per byte, safe without a lock, for the
+   crash reporter, whose stop of the other CPUs is best effort (a CPU it
+   couldn't stop can still write, and lines may interleave, but no bytes are
+   lost to an overrun). The crash reporter first takes the UART out of
+   loopback, in case a CPU was stopped in the loopback ktest.
 5. Logger (level from `lumen.log=`), Limine responses checked, the symbol table
    located in our own ELF, a memory-map summary, the frame allocator
    (`INFO  mem: frames: N usable, M reserved`), the kernel's own page tables
@@ -655,7 +671,9 @@ allocates.
   (`cpu 2 also crashed: #PF page fault (vector 0xe), rip ...` or `a panic at
   line N`), and APs started but not yet online (no NMI; one could still log
   a line into the report; not tested). With every CPU stopped, reports and
-  log lines don't interleave. The screen copy doesn't show these lines. A
+  log lines don't interleave; a CPU that wasn't stopped can still log into
+  the report, its line interleaved with the report's (the report writes
+  byte by byte, so nothing is lost to the UART's FIFO). The screen copy doesn't show these lines. A
   fault while stopping the others prints one line that keeps the original
   crash.
 - A fault during the report prints one line and halts, with no recursion. With
@@ -914,7 +932,7 @@ off. A wake from another CPU queues the thread there and sends the
   started only with a terminal and a keyboard: without a keyboard boot
   says `shell on serial (none on the screen: no keyboard)`, tested with
   `i8042=off`; without a terminal, or no thread for it, not tested). The
-  serial shell polls serial (no serial interrupt yet, #61), yielding to
+  serial shell polls serial (no serial interrupt yet), yielding to
   the CPU's other threads between polls (sleeping instead would switch
   to the idle thread and trace twice a millisecond); the screen's blocks
   in `keyboard::wait_key`. Log lines go to both consoles.
@@ -970,13 +988,10 @@ off. A wake from another CPU queues the thread there and sends the
   as Backspace, other control characters as Ctrl and a letter, `ESC [`
   and `ESC O` sequences for the arrows, Home, End and Delete, a C0
   control (below 0x20) ending a sequence it interrupts, UTF-8 without
-  overlong forms; host tested). Serial writes are made holding the log's
-  line lock, so a log line can't land inside one (not tested on its own).
-  Every serial writer holds it (the logger, the shells, the ktest runner's
-  TAP lines, the `crash` command's messages) except the crash reporter,
-  which stops the other CPUs first: a 16-byte burst assumes the transmit
-  FIFO is empty once the line status says so, and two CPUs bursting after
-  the same check would overrun it. Each key's output is written to the console in
+  overlong forms; host tested). The serial shell's writes are made holding
+  the log's line lock (`klog::LockedSerial`, see step 4 of the boot
+  sequence), so a log line can't land inside one (not tested on its own).
+  Each key's output is written to the console in
   one write, so on the screen a log line can't land in the middle of a
   redraw (not tested on its own).
 - **Commands:** `help` (a ktest checks it has a line for each command

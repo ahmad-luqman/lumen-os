@@ -68,7 +68,8 @@ def artifacts(request: pytest.FixtureRequest) -> Iterator[Path]:
 def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
     """`boot("qemutest")` -> a started Machine (closed automatically).
     `extra` is appended to QEMU's command line, e.g. `extra=["-smp", "2"]`;
-    `serial=False` boots without a serial port (keyboard and exit code only);
+    `serial=False` boots without a serial port (keyboard, screendumps and the
+    exit code only);
     `cmdline` to the kernel's, e.g. `cmdline="lumen.keymap=de"`, in an ISO
     built for this test in its artifacts directory (so parallel tests don't
     share one; `qemutest` and `ktest` only)."""

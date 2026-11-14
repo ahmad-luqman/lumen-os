@@ -65,8 +65,9 @@ Each rule exists because breaking it caused a real bug in v1.
 5. **A real heap with working `free`**, plus in-kernel fragmentation and reuse
    tests.
 6. **Exception handling comes first.** GDT/IDT setup is the first thing
-   `kmain` does (only a bare `rdtsc`, the boot timeline's origin, comes
-   before it), and the first thing `smp::ap_entry` does on each other CPU;
+   `kmain` does (only a bare `rdtsc`, the boot timeline's origin, and
+   COM1's setup in `arch::init_early`, which takes no lock and can't fault,
+   come before it), and the first thing `smp::ap_entry` does on each other CPU;
    keep it that way.
 7. **Reproducible toolchain.** Rust is pinned (stable only, no `#![feature]`),
    Limine and OVMF are pinned by sha256, and Python deps by `uv.lock`. Bump
@@ -181,9 +182,10 @@ own PR that updates that doc first.
   output), the command table, serial bytes to keys (host-tested).
 - `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET
   (host-tested on handcrafted tables).
-- `crates/lumen-uart`: 16550 UART logic: presence probe (scratch
-  register), FIFO detection, `\n` as `\r\n` in 16-byte bursts
-  (host-tested against a model UART).
+- `crates/lumen-uart`: 16550 UART logic: presence probe (scratch or
+  interrupt enable register), FIFO detection, `\n` as `\r\n` in 16-byte
+  bursts, a bounded wait for an empty transmit FIFO (host-tested against a
+  model UART).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
   are built), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
   `crash.py` (crash-report parsing), `screen.py` (the screen's rows

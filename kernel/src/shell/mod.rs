@@ -131,21 +131,21 @@ fn flush(console: &mut impl Console, shown: &mut String) {
     }
 }
 
-/// Serial, in and out. Each write (a whole `write!`) is made holding the
-/// log's line lock, so another CPU's log line can't land in the middle of
-/// it (the harness reads `term text`'s rows whole).
+/// Serial, in and out. Each write (a whole `write!`) goes through
+/// `klog::LockedSerial`, holding the log's line lock, so another CPU's log
+/// line can't land in the middle of it (the harness reads `term text`'s
+/// rows whole).
 struct Serial {
     decoder: Decoder,
 }
 
 impl Write for Serial {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        crate::klog::with_line_lock(|| serial::write_bytes(s.as_bytes()));
-        Ok(())
+        crate::klog::LockedSerial.write_str(s)
     }
 
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
-        crate::klog::with_line_lock(|| serial::SerialWriter.write_fmt(args))
+        crate::klog::LockedSerial.write_fmt(args)
     }
 }
 
