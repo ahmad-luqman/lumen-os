@@ -29,7 +29,7 @@ deps: $(BUILD)/deps/limine/.version ## Download pinned Limine + OVMF (checksumme
 $(BUILD)/deps/limine/.version $(BUILD)/deps/ovmf/.version: tools/fetch-deps.sh
 	tools/fetch-deps.sh
 
-# Two kernels: the normal one (kernel monitor) and the in-kernel test build.
+# Two kernels: the normal one (the shells) and the in-kernel test build.
 $(BUILD)/lumen-kernel: $(KERNEL_SRCS)
 	$(CARGO_KERNEL)
 	@mkdir -p $(BUILD) && cp $(KERNEL_OUT) $@

@@ -31,7 +31,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Serial input from the harness (kernel monitor)"
+name = "Serial input from the harness (the serial shell)"
 milestone = "M0"
 tests = [
     "scenario:test_boot::test_serial_input_round_trip",

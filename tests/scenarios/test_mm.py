@@ -4,19 +4,20 @@ heap.
 The allocators' and the mapper's correctness are checked in-kernel
 (`lumen_kernel::mm::{frame,paging,heap}::*`, run by test_ktest) and on the
 host (`cargo test -p lumen-mm -p lumen-heap`); this checks what boot and
-kmon report, that W^X is enforced (writing to the kernel's code and
+the shell reports, that W^X is enforced (writing to the kernel's code and
 executing its data both fault with a page-table walk in the crash report),
 and that heap failures end in a crash report showing the heap.
 """
 
 import re
 
-from lumen_harness.crash import backtrace, page_walk
+from lumen_harness.crash import BEGIN, END, backtrace, page_walk
+from lumen_harness.qemu import EXIT_CRASH
 
 BOOT_TIMEOUT = 60
 MIB = 1024 * 1024
 HEAP_BASE = 0xFFFF_C000_0000_0000
-# The heap's one-line summary (kmon `heap`, crash reports), written by
+# The heap's one-line summary (the shell's `heap`, crash reports), written by
 # `Snapshot::write` in kernel/src/mm/heap.rs. This matches only the plain
 # form with an intact free list: a crash with the heap's lock held labels it
 # "heap (lock held; may be mid-update)", and a failed walk replaces the
@@ -64,7 +65,7 @@ def test_write_to_text_crashes_cleanly(crash_report):
     # Error code 0x3: present page, write access.
     assert "exception: #PF page fault (vector 14, error code 0x3)" in report, report
     assert "page fault: write of protection violation (kernel mode)" in report, report
-    rip = r"^rip: 0x[0-9a-f]{16} <lumen_kernel::kmon::crash_write_text"
+    rip = r"^rip: 0x[0-9a-f]{16} <lumen_kernel::shell::crash::crash_write_text"
     assert re.search(rip, report, re.MULTILINE), report
     walk = page_walk(report)
     cr2 = re.search(r"faulting address \(cr2\): (0x[0-9a-f]{16})", report)
@@ -90,10 +91,10 @@ def test_nx_data_crashes_cleanly(crash_report):
     end = r"(4 KiB|2 MiB) page at phys 0x[0-9a-f]+: writable, no-execute"
     assert re.fullmatch(end, walk.end), report
     # rip is in .data, which has no function symbols; the frame-pointer walk
-    # still reaches the monitor (the faulting `call` set up no frame, so its
+    # still reaches the shell (`shell::run`; the faulting `call` set up no frame, so its
     # caller's caller is the first named frame).
     frames = backtrace(report)
-    assert any("kmon::run" in f for f in frames) and frames[-1].startswith("_start"), report
+    assert any("shell::run" in f for f in frames) and frames[-1].startswith("_start"), report
 
 
 HEAP_NUMBERS = ("mapped", "base", "used", "live", "free", "blocks", "largest")
@@ -106,38 +107,47 @@ def heap_numbers(text: str) -> dict[str, int]:
     return {k: int(heap[k], 0) for k in HEAP_NUMBERS}
 
 
-def kmon_heap(m) -> dict[str, int]:
-    """Run kmon's `heap` at its prompt; the summary's numbers, back at the prompt."""
+def shell_heap(m) -> dict[str, int]:
+    """Run the shell's `heap` at its prompt; the summary's numbers, back at the prompt."""
     m.send_line("heap")
     heap = heap_numbers(m.expect(r"heap: .*\n").group(0))
-    m.expect(r"kmon> ")
+    m.expect(r"lumen> ")
     return heap
 
 
-def crash_after_kmon_heap(crash_report, kind: str) -> tuple[dict[str, int], str]:
-    """kmon's heap summary at the prompt, then the report of `crash <kind>`."""
-    before: dict[str, int] = {}
-    report = crash_report(kind, at_prompt=lambda m: before.update(kmon_heap(m)))
-    return before, report
-
-
-def test_kmon_heap_reports_usage(boot):
+def crash_after_heap_summary(boot, kind: str) -> tuple[dict[str, int], str]:
+    """`crash <kind>`: the heap summary it prints before doing its damage
+    (the shell's own allocations for the command included), and the
+    report."""
     m = boot("qemutest")
-    m.expect(r"kmon> ", BOOT_TIMEOUT)
-    heap = kmon_heap(m)
-    # What boot keeps (`acpi::Info`, for one) is in use, a handful of
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
+    m.send_line(f"crash {kind}")
+    before = heap_numbers(m.expect(r"heap: .*\n", 30).group(0))
+    m.expect(re.escape(END), 30)
+    assert m.wait_exit(10) == EXIT_CRASH
+    out = m.output
+    return before, out[out.index(BEGIN) : out.index(END) + len(END)]
+
+
+def test_heap_command_reports_usage(boot):
+    m = boot("qemutest")
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
+    heap = shell_heap(m)
+    # What boot keeps (`acpi::Info`, for one) and the shells (their editors
+    # and histories, the screen's thread) is in use, a few dozen
     # allocations; the rest of what the heap mapped is free.
     # (`discovery_keeps_nothing_it_does_not_return` checks that ACPI
     # discovery frees what it doesn't keep.)
     assert heap["base"] == HEAP_BASE, heap
-    assert 0 < heap["live"] <= 16, f"{heap}: nothing kept at boot (did acpi::init fail?), or a leak"
+    assert 0 < heap["live"] <= 40, f"{heap}: nothing kept at boot (did acpi::init fail?), or a leak"
     assert 0 < heap["largest"] <= heap["free"] < heap["mapped"], heap
-    # Looking doesn't allocate: the summary is the same the second time.
-    assert kmon_heap(m) == heap
+    # Running it again leaves the heap as it was (the line's allocations are
+    # freed; a repeated line isn't kept in the history).
+    assert shell_heap(m) == heap
 
 
 def test_out_of_memory_report_shows_the_heap(crash_report):
-    # kmon asks for 2 TiB (more than the heap window) and treats the null as
+    # the shell asks for 2 TiB (more than the heap window) and treats the null as
     # an infallible allocation would: alloc's error handler panics.
     report = crash_report("oom")
     assert f"panic: memory allocation of {1 << 41} bytes failed" in report, report
@@ -151,18 +161,18 @@ def test_out_of_memory_report_shows_the_heap(crash_report):
     assert report.index("heap: ") > report.index("recent trace events"), report
 
 
-def test_double_free_is_refused(crash_report):
-    before, report = crash_after_kmon_heap(crash_report, "dfree")
+def test_double_free_is_refused(boot):
+    before, report = crash_after_heap_summary(boot, "dfree")
     bad_free = (
         r"^panic: heap: bad free of 0xffffc[0-9a-f]{11} \(64 bytes, align 16\): "
         r"block overlaps free memory \(double free or wrong layout\)$"
     )
     assert re.search(bad_free, report, re.MULTILINE), report
-    assert any("kmon::crash_double_free" in f for f in backtrace(report)), report
+    assert any("shell::crash::crash_double_free" in f for f in backtrace(report)), report
     # The block was freed after its lower neighbour, so the second free is
     # caught by its overlap with the merged free block below. It changed
-    # nothing: compared with the prompt, exactly the 128-byte block kmon
-    # keeps is in use, and the free list is intact (the summary only matches
+    # nothing: compared with the summary printed first, exactly the 128-byte
+    # block it keeps is in use, and the free list is intact (the summary only matches
     # when the walk finds its bytes add up). Where the block landed, and so
     # the free blocks' count and largest size, depends on boot's layout.
     heap = heap_numbers(report)
@@ -170,11 +180,11 @@ def test_double_free_is_refused(crash_report):
     assert change == {"mapped": 0, "base": 0, "used": 128, "live": 1, "free": -128}, (before, heap)
 
 
-def test_corrupt_free_list_is_a_crash_not_a_hang(crash_report):
-    # kmon links a freed block's free-list node back to itself and then
+def test_corrupt_free_list_is_a_crash_not_a_hang(boot):
+    # the shell links a freed block's free-list node back to itself and then
     # allocates past it. The walk must panic (with the heap's lock held),
     # and the report must still show the heap, naming the corruption.
-    before, report = crash_after_kmon_heap(crash_report, "heapcorrupt")
+    before, report = crash_after_heap_summary(boot, "heapcorrupt")
     corrupt = re.search(
         r"^panic: heap free list corrupt at offset (0x[0-9a-f]+) "
         r"\(size (0x[0-9a-f]+), next (0x[0-9a-f]+)\)$",
@@ -187,7 +197,7 @@ def test_corrupt_free_list_is_a_crash_not_a_hang(crash_report):
     # The freed 64-byte block, merged with whatever free space it landed
     # next to (first fit depends on boot's layout).
     assert size >= 0x40 and size % 16 == 0, report
-    # One more 64-byte block in use than at the prompt.
+    # One more 64-byte block in use than the summary printed first.
     locked = (
         r"^heap \(lock held; may be mid-update\): \d+ bytes mapped at 0xffffc00000000000, "
         rf"{before['used'] + 64} used in {before['live'] + 1} allocations"
@@ -234,9 +244,9 @@ def test_stack_overflow_hits_guard(crash_report):
     # the double-fault IST stack, with cr2 still in the guard page: the report
     # says so, and QEMU exits with the crash code (no reset, no triple fault).
     report = crash_report("stack")
-    assert_main_stack_overflow(report, "kmon::recurse+")
+    assert_main_stack_overflow(report, "shell::crash::recurse+")
     frames = backtrace(report)
-    assert len(frames) == 32 and all("kmon::recurse+" in f for f in frames), report
+    assert len(frames) == 32 and all("shell::crash::recurse+" in f for f in frames), report
     assert "(stopped after 32 frames)" in report, report
 
 
@@ -246,11 +256,11 @@ def test_big_frames_hit_the_guard_page_too(crash_report):
     # instead of jumping over it into the stack mapped below (the #MC IST
     # stack).
     report = crash_report("bigframe")
-    assert_main_stack_overflow(report, "kmon::recurse_big")
+    assert_main_stack_overflow(report, "shell::crash::recurse_big")
     # Only about 8 such frames fit in 128 KiB, so the walk goes past them,
     # back across the stack switch, to the entry point.
     frames = backtrace(report)
-    assert any("kmon::crash_big_frame_overflow" in f for f in frames), report
+    assert any("shell::crash::crash_big_frame_overflow" in f for f in frames), report
     assert frames[-1].startswith("_start"), report
 
 
@@ -272,6 +282,6 @@ def test_touching_a_guard_page_is_named(crash_report):
     assert cr2 and line and line["cr2"] == cr2.group(1), report
     bottom, top = int(line["bottom"], 16), int(line["top"], 16)
     assert bottom - 4096 + 8 == int(cr2.group(1), 16), report
-    # kmon runs well inside the main stack, nowhere near its guard page.
+    # the shell runs well inside the main stack, nowhere near its guard page.
     assert bottom + 4096 <= int(line["rsp"], 16) < top, report
     assert page_walk(report).end == "not present at L1", report

@@ -19,7 +19,7 @@
 //!    started on every CPU (`kmain`'s context becomes the `main` thread);
 //!    then the framebuffer and its terminal, the PS/2 keyboard, `boot
 //!    complete` and the boot timeline, then either the in-kernel tests
-//!    (`--features ktest`) or the kernel monitor.
+//!    (`--features ktest`) or the shells (`shell::run`).
 
 #![no_std]
 #![no_main]
@@ -35,11 +35,10 @@ mod fb;
 mod interrupts;
 mod keyboard;
 mod klog;
-#[cfg_attr(feature = "ktest", allow(dead_code))] // replaced by the test runner
-mod kmon;
 mod ktest;
 mod mm;
 mod sched;
+mod shell;
 mod smp;
 mod symbols;
 mod sync;
@@ -216,7 +215,7 @@ fn after_boot() -> ! {
 
 #[cfg(not(feature = "ktest"))]
 fn after_boot() -> ! {
-    kmon::run()
+    shell::run()
 }
 
 fn log_memory_map() {

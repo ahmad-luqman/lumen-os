@@ -39,7 +39,7 @@ def test_make_run_serial_console():
             if not chunk:
                 break
             out += chunk
-            if not sent and b"kmon> " in out:
+            if not sent and b"lumen> " in out:
                 proc.stdin.write(b"help\r")
                 proc.stdin.flush()
                 sent = True

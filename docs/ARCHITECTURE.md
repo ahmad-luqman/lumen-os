@@ -32,7 +32,7 @@ is listed only in [STATUS.md](STATUS.md), which is generated from tests.
 | Bootloader | Limine 12.x (pinned binary release + sha256), `limine` crate **0.5.0** | Memory map, framebuffer, higher-half direct map, and our own ELF file for symbolization, with no loader to write. Crate 0.6.x requires nightly (`#![feature(ptr_metadata)]`), so we use 0.5.0 (base revision 3). | Custom UEFI loader (optional learning milestone), GRUB/multiboot2. |
 | Kernel shape | **Modular monolith** with message-shaped internal interfaces; capabilities enforced at the syscall boundary | One address space keeps early milestones fast and debuggable. Agent safety needs capability checks between *processes*, which a monolith enforces just as well. Drivers and services expose request/response interfaces, so any of them can move to user space later. | Microkernel: stronger isolation of drivers, but it puts IPC performance and many extra servers in front of every milestone. |
 | Test harness | Python (`uv`, pytest) on the host; TAP from the kernel | Fast to write scenarios, mature tooling, and QMP/PIL are easy to use. | Rust `xtask`: one language, but slower iteration on test scripts. |
-| Third-party crates | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), a PR adding only the crates its issue names (with their own dependencies), each checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX, no red zone, the kernel code model). Kernel crates so far: `limine`, `rustc-demangle`, `noto-sans-mono-bitmap` and `log` (from M0, before this policy; `log` is still `0.4`, to be pinned in a PR of its own), `pc-keyboard` (scancode decoding and layouts, #58, the first under it), `vte` (terminal escape parsing; brings `arrayvec` and `memchr`) and `unicode-width` (character widths), both #59. | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
+| Third-party crates | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), a PR adding only the crates its issue names (with their own dependencies), each checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX, no red zone, the kernel code model). Kernel crates so far: `limine`, `rustc-demangle`, `noto-sans-mono-bitmap` and `log` (from M0, before this policy; `log` is still `0.4`, to be pinned in a PR of its own), `pc-keyboard` (scancode decoding and layouts, #58, the first under it), `vte` (terminal escape parsing; brings `arrayvec` and `memchr`) and `unicode-width` (character widths), both #59. `shlex` (#62) is only a dev-dependency of `lumen-shell`, the word splitter's test oracle; `noline`, which #62 names, isn't used (no completion hook, escape codes always, and it queries the terminal for the cursor on every prompt). | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
 | Firmware for tests | OVMF `edk2-stable202605-r1` from rust-osdev/ovmf-prebuilt, pinned with sha256 | macOS and CI boot byte-identical firmware, so golden screenshots match. | Distro OVMF packages (paths and versions differ per OS). |
 
 ## 3. Layers
@@ -111,10 +111,11 @@ tests (for example `lumen-elf`, the symbol-table reader).
    lines before it are on serial only), the PS/2 keyboard (`INFO  kbd: PS/2 keyboard
    on ISA IRQ 1 ...`, section 6, "Keyboard"), then
    `boot complete`, then the boot timeline (below).
-7. Either the in-kernel test runner (`--features ktest`) or the kernel monitor
-   (`kmon`, a debug console typed on serial or the keyboard, answering on
-   serial and the screen's terminal, that the shell replaces in M2; the shell
-   runs in the kernel until it moves to user mode in M9).
+7. Either the in-kernel test runner (`--features ktest`) or the shells
+   (`shell::run`, section 6, "Shell"): the screen's in a thread of its own,
+   then the serial one on the `main` thread (`INFO  shell: shells on serial
+   and the screen; type 'help'`). They run in the kernel until the shell
+   moves to user mode in M9.
 
 ### Boot timeline and log timestamps (built in M1)
 
@@ -201,7 +202,7 @@ AP's mailbox and sends it the `WAKEUP` IPI (vector 0x3f, handled by an
 EOI). The idle loop checks the mailbox (and its run queue) with interrupts
 off and only then `sti; hlt` (`arch::irq::wait_unless`), so a wakeup can't
 land between the check and the halt; the job runs on the idle thread, in
-`ap_main`'s frames, and can't block. kmon's `crash <kind> [cpu]` uses it. The scheduler
+`ap_main`'s frames, and can't block. The shell's `crash <kind> [cpu]` uses it. The scheduler
 sends the same IPI when it queues a thread on another CPU (`smp::wake`).
 
 APs handle no I/O APIC interrupts: every input goes to the boot CPU. An AP
@@ -256,7 +257,9 @@ Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 `isa-debug-exit`, used by tests), `lumen.log=<error|warn|info|debug|trace>`
 and `lumen.keymap=<us|uk|de|fr|no|se|jp|dvorak|colemak>` (the keyboard's
 layout, section 6; `us` by default and for a name it doesn't know, with a
-warning).
+warning) and `lumen.ansi` (the serial shell edits with escape codes, its
+terminal taken to be 80 columns wide; plain text without it, section 6,
+"Shell").
 
 ## 5. Memory layout
 
@@ -520,11 +523,11 @@ window is full) the allocation returns null: `try_reserve` callers see an error,
 reaches `alloc`'s default error handler, which panics
 (`#[alloc_error_handler]` is unstable). Any other growth failure is a
 kernel bug and panics, as does allocating before `mm::init`. The serial crash report ends with one line of heap
-state, including the last failed growth (size, alignment, reason); kmon's
-`heap` command prints the same line. Lock order: heap, page tables, frame
+state, including the last failed growth (size, alignment, reason); the
+shell's `heap` command prints the same line. Lock order: heap, page tables, frame
 allocator; nothing holding the last two may allocate. The allocator never
 logs (a log argument that allocates would re-enter it under the logger's
-lock) and formats its kmon and crash line from a copy taken under the
+lock) and formats its shell and crash line from a copy taken under the
 lock. Like every `SpinLock`, it keeps interrupts off while held, so an
 interrupt handler is allowed to allocate. The timer interrupt can free
 (in `sched::finish_switch`): a detached dead thread's record and its
@@ -559,7 +562,7 @@ allocates.
   anything else is traced, counted, warned about once per vector, and EOI'd (another
   8259 line also masks the 8259s again; an 8259 vector the local APIC has
   in service is EOI'd there). Of device interrupts, only that last kind is
-  traced: at 1 kHz the timer would flood the ring. kmon `ticks` shows the
+  traced: at 1 kHz the timer would flood the ring. The shell's `ticks` shows the
   counts (the boot CPU's timer), and boot warns if no tick arrives within 100 ms (it waits 10 ms,
   then up to 90 ms more while none has come, and logs a late one at info).
 - **Interrupt state:** interrupts are off through boot and turned on once
@@ -593,7 +596,7 @@ allocates.
   interrupts off or a lock held), `time::spin` (always busy). The boot CPU
   publishes the timer's count; every other CPU starts its own timer with
   it, and the first tick starts that CPU's scheduler, and ticks are counted per CPU (`time::ticks`
-  is the boot CPU's). kmon has `ticks`,
+  is the boot CPU's). The shell has `ticks`,
   `sleep <ms>`, `uptime`, and `clocks` (the TSC measured again against the
   PIT and the HPET, which the tests compare with the boot calibration: a
   wrong calibration would cancel out in tick counts, since the timer is
@@ -713,7 +716,7 @@ off. A wake from another CPU queues the thread there and sends the
   the boot CPU publishes the calibrated count and runs `run_on` jobs (a job
   runs only while no thread is ready there); the boot CPU gets an idle
   thread with a stack of its own, and `kmain`'s context becomes the `main`
-  thread (kmon or the ktests). A CPU's scheduler runs from the first tick
+  thread (the serial shell or the ktests). A CPU's scheduler runs from the first tick
   after it is armed (its current and idle threads set, its timer started):
   before that nothing could wake a sleeper there, so `spawn_on` refuses it
   and `time::sleep` busy-waits. `sched::init` (boot CPU, after
@@ -786,23 +789,33 @@ off. A wake from another CPU queues the thread there and sends the
   controller flags with a parity or timeout error (not tested).
   `keyboard::read_key` (never blocks) decodes them under a lock with
   `pc-keyboard` in the layout `lumen.keymap=` names into a `Key`: a
-  character, or another key pressed (arrows, PageUp, modifiers) with
-  whether shift is held; releases are skipped, and bytes the decoder
-  refuses are counted (the keyboard's overrun code among them). kmon
-  reads the keyboard as well as serial (echoing on serial and the screen;
-  Shift+PageUp/PageDown scroll the terminal's view back and forward,
-  section "Terminal");
+  character (Ctrl and a letter make a control character, Ctrl-A U+0001;
+  a ktest decodes Ctrl-A, Ctrl-W and, on a German keyboard, Ctrl-Z), or
+  another key pressed (arrows, PageUp, modifiers) with whether shift is
+  held; releases are skipped, and bytes the decoder refuses are counted
+  (the keyboard's overrun code among them). `keyboard::wait_key` blocks
+  the calling thread until a key comes: the producer wakes the keyboard's
+  wait queue whenever it queued a byte, and the waiter checks the queue
+  under the wait queue's lock, so a byte can't slip between its check and
+  its sleep (the screen's shell waits there: every keyboard scenario goes
+  through it). The shell's
   `kbd` shows the layout, the route, the
   interrupts taken, the bytes queued, dropped, undecoded, flagged, and
   skipped during setup, or why there is no keyboard (and whether IRQ 1 was
   routed); a non-zero skip count is also logged after init.
 - **Tests:** QMP `send-key` drives the keyboard (`Machine.type_text` and
-  `press`, which wait for kmon's echo of each key); a scenario boots with
+  `press`; QEMU queues each key behind the last one, so they arrive in
+  order; its input queue holds 1024 entries and drops the rest without a
+  word, so `press` paces itself on the time QEMU takes to send each key,
+  and `test_a_long_line_of_shifted_keys` checks 150 shifted keys arrive),
+  and the scenarios read what the screen's shell did
+  back from the screen (`lumen_harness.screen`, through the serial shell's
+  `term text`); a scenario boots with
   `lumen.keymap=de` in an ISO built for it, and one presses a key over and
   over from power-on until the keyboard is set up (some of those bytes are
   skipped during setup).
-- **Not yet:** a blocking read for threads (the shell, #62), key releases
-  and modifiers other than shift for programs, LEDs, the second port (a mouse), and hot-plug.
+- **Not yet:** key releases and Alt for programs, LEDs, the second port
+  (a mouse), and hot-plug.
 
 ### Terminal (built in M2)
 
@@ -814,8 +827,7 @@ off. A wake from another CPU queues the thread there and sends the
   default or one of 256 colours, and flags: bold, inverse, the two halves
   of a wide character). It handles UTF-8, C0 controls (a line feed
   without a carriage return: `term::write_str`, `term::write_fmt` and log
-  lines turn `\n` into CR LF, `term::write_bytes` and
-  `term::write_raw_fmt` don't), cursor
+  lines turn `\n` into CR LF), cursor
   movement, save and restore, erasing (in the pen's background), inserting
   and deleting cells and lines, scrolling, scroll regions, tabs, autowrap
   (the cursor waits at the last column), cursor visibility, and SGR for 16
@@ -856,10 +868,9 @@ off. A wake from another CPU queues the thread there and sends the
 - **Writers:** log lines up to `info` are shown without the timestamp, the
   level coloured (ERROR bold red, WARN yellow, INFO green), the tag dimmed,
   errors' and warnings' messages coloured too (a ktest reads the cells).
-  kmon's output and echo go to serial and the screen; escape sequences go to
-  the screen only, so serial stays plain for the harness (`colors` draws a
-  test pattern on screen, then prints `colors: done` on both). Each kmon
-  `write!` and each log line is formatted and written under one lock, so
+  The screen's shell writes there (section "Shell"), nothing of it on
+  serial (except what a `crash` says on both: a fault that didn't happen,
+  the heap's line before a heap crash; the screen half not tested). Each of its `write!`s and each log line is formatted and written under one lock, so
   another CPU's log line can't split an escape sequence written in one
   `write!` (ktests check the formatting happens under the lock); a log line
   starts from the default colours (a ktest leaves bold, inverse and a
@@ -873,15 +884,119 @@ off. A wake from another CPU queues the thread there and sends the
   pixels, not through the terminal, its lock or the heap (a scenario
   checks its banner after an invalid opcode; drawing it with a corrupt heap
   or the terminal's lock held is not tested).
-- **kmon:** `clear` (screen and scrollback), `colors`, `seq <n>`, and
-  `term` (size, cursor, scrollback, the view's offset and top row, cells
-  drawn); without a terminal, `clear`, `colors` and `term` say so (not
-  tested). Shift+PageUp/PageDown scroll the
-  view half a screen (logged at debug level: serial only, the screen shows up to
-  `info`); typing on the keyboard returns it to the bottom.
+- **Shell commands** (either console, writing to the one that ran them):
+  `clear` (the screen and its scrollback, on a console that takes escape
+  codes), `colors`, `seq <n>`, `term` (size, cursor, scrollback, the view's offset
+  and top row, cells drawn) and `term text` (the view's rows, and the cursor counted in the view, or
+  `cursor below the view` when scrolled back past it; tested); without a
+  terminal, `term` says so (not tested). In the screen's shell
+  Shift+PageUp/PageDown scroll the view half a screen (logged at debug
+  level: serial only, the screen shows up to `info`); a key the line
+  editor takes returns it to the bottom (a ktest checks that output keeps
+  a scrolled-back view on its lines; the shell takes keys only between
+  commands, so a scenario can't scroll back while a command writes).
 - **Not yet:** virtual terminals (Alt+F1 to F4, ROADMAP M2), a font with
   more than Basic Latin, underline and other SGR attributes, the
   alternate screen, origin mode, left and right margins, and resizing.
+
+### Shell (built in M2)
+
+`crates/lumen-shell` (host-tested) and `kernel/src/shell/` (the consoles,
+`mod.rs`; the commands, `commands.rs`; the deliberate faults, `crash.rs`).
+
+- **Two shells, one per console,** each with its own line and history:
+  the serial shell on the boot CPU's `main` thread (where kmon ran), and
+  the screen's in a thread of its own (`shell-screen`, on the boot CPU,
+  started only with a terminal and a keyboard: without a keyboard boot
+  says `shell on serial (none on the screen: no keyboard)`, tested with
+  `i8042=off`; without a terminal, or no thread for it, not tested). The
+  serial shell polls serial (no serial interrupt yet, #61), yielding to
+  the CPU's other threads between polls (sleeping instead would switch
+  to the idle thread and trace twice a millisecond); the screen's blocks
+  in `keyboard::wait_key`. Log lines go to both consoles.
+- **Words** (`lumen_shell::words`): blanks separate words; `'...'` keeps
+  everything; `"..."` too, except that a backslash escapes `$`, `` ` ``,
+  `"`, `\` and a newline; outside quotes a backslash escapes anything;
+  parts next to each other make one word, `''` an empty one; `#` at the
+  start of a word starts a comment. A randomized host test checks it
+  against `shlex` on 200,000 lines. An unclosed quote or a trailing
+  backslash is one line of error (`syntax error: ...`), and so is an
+  unknown command (`unknown command: x (try 'help')`).
+- **The line editor** (`lumen_shell::Editor`) takes keys and writes what
+  the console must show: printable characters inserted at the cursor (up
+  to 160 columns a line, a wide character two, fewer on a console too
+  narrow: the prompt, the line and Ctrl-C's `^C` must fit; zero-width ones
+  refused; a character that doesn't fit makes Enter say `line too long
+  (more than N columns): not run` and drop the line instead of running it
+  cut short, tested on plain serial; the screen's and `lumen.ansi`'s
+  narrower limits not tested on their own; a screen too narrow for 16
+  gets no shell, not tested),
+  Left/Right, Home/End and Ctrl-A/E/B/F, Backspace, Delete and Ctrl-D,
+  Ctrl-K/U/W, Up/Down and Ctrl-P/N through the history (100 lines; blank
+  lines and repeats of the newest not kept; going past the newest brings
+  back the line being typed), Ctrl-C (drop the line), Ctrl-L (clear the
+  screen and show the line again), Enter, and Tab, which completes the
+  word before the cursor from the command table (command names first,
+  then each command's argument words: `crash` its kinds and `thread`,
+  `term` `text`; options that aren't printable are skipped): one that
+  fits is written in full (quoted as the word was, the quote closed) with
+  a space (left out if only that doesn't fit), several up to where they
+  differ (host-tested only: wherever a prefix matches several of today's
+  words, they already differ right after it), or, if they already differ
+  there or that doesn't fit, listed on a line of their own. With
+  ANSI escapes (the screen; serial with `lumen.ansi`) it redraws the line
+  (`CR`, the prompt, the line, `ESC [ K`, the cursor moved back) unless
+  the change only appends or only moves the cursor. In **plain** mode
+  (serial without `lumen.ansi`, so the harness can read it line by line)
+  the cursor stays at the end and the console only gets characters to
+  append and `BS space BS` to erase: a history line replaces the typed one
+  by erasing and typing; the cursor keys, Home/End, Ctrl-A/E/B/F, Delete,
+  Ctrl-D, Ctrl-K and Ctrl-L do nothing (the cursor is always at the end);
+  a listing is a line followed by the prompt and the line again. Neither
+  mode wraps (with `lumen.ansi` a serial terminal is taken to be 80
+  columns wide; plain serial doesn't redraw, so its 160 columns may wrap
+  on a narrower terminal). A
+  randomized host test runs the editor's output, in both modes, through
+  `lumen-term` after every key and checks the cursor's row shows the
+  prompt and the line, and the cursor sits where the editor says.
+- **Keys:** the screen's from `keyboard::wait_key` (Enter `\n`, Backspace
+  U+0008, Delete U+007F, Tab, Ctrl with a letter U+0001 to U+001A, the
+  arrows, Home and End; a ktest maps each); serial's from bytes
+  (`lumen_shell::input::Decoder`: CR, LF or CR LF as one Enter, DEL and BS
+  as Backspace, other control characters as Ctrl and a letter, `ESC [`
+  and `ESC O` sequences for the arrows, Home, End and Delete, a C0
+  control (below 0x20) ending a sequence it interrupts, UTF-8 without
+  overlong forms; host tested). Serial writes are made holding the log's
+  line lock, so a log line can't land inside one (not tested on its own). Each key's output is written to the console in
+  one write, so on the screen a log line can't land in the middle of a
+  redraw (not tested on its own).
+- **Commands:** `help` (a ktest checks it has a line for each command
+  in the table, and no name is there twice), `echo` (its words joined by
+  single spaces), `int3`, `crash <kind> [cpu|thread]` (the thread is
+  `shell-crash`), `trace [n]`, `heap`, `ticks`, `kbd`, `term [text]`,
+  `clear`, `colors`, `seq`, `sleep`, `uptime`, `clocks`, `exit` (kmon's;
+  besides what this list says, the deliberate panic now says `from the
+  shell`, and `crash <kind> <cpu>` reports a fault that returned) and
+  `history` (the console's lines, numbered). Each writes to the console that ran it. On plain serial,
+  `colors` and `clear` say the console is plain (tested), and with
+  `lumen.ansi` they work there (tested). A `crash` whose fault doesn't
+  happen says so on serial and the screen (the screen not tested). `crash <kind> <cpu>` waits, asleep and allocating nothing,
+  until that CPU's report stops this one or its fault returns (so the
+  report doesn't find the heap's lock held by the shell freeing its line;
+  the screen's shell could still allocate if someone types there
+  meanwhile, not tested). After 10 s (not tested) the job is taken back
+  if the CPU hasn't taken it; while one is out, another is refused.
+  `crash dfree` and `crash heapcorrupt` print the heap's line before the
+  damage, which the tests compare with the report's.
+- **Tests:** `cargo:lumen-shell`; `test_shell` (echo with quotes on both
+  consoles, history and line editing on the screen and history on serial,
+  completion on both, one line of error, `lumen.ansi`); the keyboard and
+  terminal scenarios type on the screen's shell and read the screen back
+  with `term text`; every serial scenario that drove kmon runs against the
+  serial shell with the new prompt.
+- **Not yet:** Ctrl-R search, Alt-B/F word moves, wrapping lines longer
+  than the console, pipes, variables and scripts, and a shell in user mode
+  (M9).
 
 ## 7. Driver interface (planned, M3+)
 
@@ -1142,8 +1257,8 @@ kernel. The kernel is the trusted computing base.
   `ktest:lumen_kernel::trace::trace_overhead_is_small` (tens of TSC ticks
   under TCG locally; TCG's TSC rate depends on the host, so this is not
   comparable across machines or to cycles). Timestamps are raw TSC ticks
-  (the boot timeline converts its phases; kmon and crash reports show them
-  raw). `kmon`'s `trace [n]` prints the newest events of the boot CPU's ring
+  (the boot timeline converts its phases; the shell and crash reports show them
+  raw). The shell's `trace [n]` prints the newest events of the boot CPU's ring
   (a gap line says why an event is missing), and the serial crash report
   includes the last 16 of the reporting CPU's (tested for a page fault and a
   panic, and on an AP).
@@ -1202,10 +1317,10 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/symbols.rs   kernel symbol table (symbolized crash reports)
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
-  src/kmon.rs      debug monitor, typed on serial or the keyboard, answering on serial and the screen (until the M2 shell)
+  src/shell/       the shells (lumen-shell): serial and the screen's consoles, the commands, deliberate faults (crash.rs)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
-crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-time, lumen-queue, lumen-term, ...)
+crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-time, lumen-queue, lumen-term, lumen-shell, ...)
 boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml

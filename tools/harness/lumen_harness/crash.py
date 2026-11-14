@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 BEGIN = "==== LUMEN CRASH REPORT ===="
 END = "==== END CRASH REPORT ===="
-# Printed by kmon's `crash wtext` / `crash nx` when the fault didn't happen.
+# Printed by the shell's `crash wtext` / `crash nx` when the fault didn't happen.
 PROTECTION_BROKEN = r"crash: .* succeeded \((?:W\^X|NX) broken\)"
 
 _FRAME = re.compile(r"^  #\d+\s+0x[0-9a-f]{16} <(.+)>$", re.MULTILINE)

@@ -14,7 +14,7 @@ const LINE_CTRL: u16 = COM1 + 3;
 const MODEM_CTRL: u16 = COM1 + 4;
 const LINE_STATUS: u16 = COM1 + 5;
 
-#[cfg_attr(feature = "ktest", allow(dead_code))] // kmon input
+#[cfg_attr(feature = "ktest", allow(dead_code))] // the serial shell's input
 const LSR_DATA_READY: u8 = 1 << 0;
 const LSR_TX_EMPTY: u8 = 1 << 5;
 
@@ -51,7 +51,7 @@ pub fn write_bytes(bytes: &[u8]) {
     }
 }
 
-#[cfg_attr(feature = "ktest", allow(dead_code))] // kmon input
+#[cfg_attr(feature = "ktest", allow(dead_code))] // the serial shell's input
 /// Non-blocking read of one received byte.
 pub fn try_read_byte() -> Option<u8> {
     // SAFETY: reading COM1 status/data registers.

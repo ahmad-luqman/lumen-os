@@ -12,7 +12,7 @@ test = false
 bench = false
 
 [features]
-# Build the in-kernel test runner: instead of the kernel monitor, run every
+# Build the in-kernel test runner: instead of the shells, run every
 # `ktest!` and report TAP over serial.
 ktest = []
 
@@ -22,6 +22,7 @@ lumen-elf.workspace = true
 lumen-heap.workspace = true
 lumen-mm.workspace = true
 lumen-queue.workspace = true
+lumen-shell.workspace = true
 lumen-term.workspace = true
 lumen-time.workspace = true
 lumen-trace.workspace = true

@@ -52,6 +52,7 @@ dependencies = [
  "lumen-heap",
  "lumen-mm",
  "lumen-queue",
+ "lumen-shell",
  "lumen-term",
  "lumen-time",
  "lumen-trace",
@@ -67,6 +68,15 @@ version = "0.0.1"
 [[package]]
 name = "lumen-queue"
 version = "0.0.1"
+
+[[package]]
+name = "lumen-shell"
+version = "0.0.1"
+dependencies = [
+ "lumen-term",
+ "shlex",
+ "unicode-width",
+]
 
 [[package]]
 name = "lumen-term"
@@ -107,6 +117,12 @@ name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
+
+[[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "unicode-width"

@@ -208,6 +208,16 @@ class ExpectTimeout(AssertionError):
 _machine_ids = itertools.count()
 
 
+# How long QEMU holds a key pressed by `Machine.press`. QEMU waits that
+# long after each key's press and after each key's release (`ui/input.c`
+# `qmp_send_key`), so a press of n keys takes 2n hold times to send:
+# measured, 30 shift+a presses reached the guest over 2.4 s.
+KEY_HOLD_MS = 20
+# How far ahead of QEMU `Machine.press` lets the keys queue, in seconds
+# (see there).
+KEYS_AHEAD = 3.2
+
+
 class Machine:
     """A headless QEMU instance driven over serial and QMP."""
 
@@ -234,6 +244,8 @@ class Machine:
         self._pos = 0  # expect() cursor into the normalized output
         self._reader: threading.Thread | None = None
         self._qmp: QmpClient | None = None
+        # When QEMU will have sent every key pressed so far (see `press`).
+        self._keys_sent_by = 0.0
         # The QMP socket's directory (LUMEN_SOCK_DIR; unset or empty: /tmp). A
         # short one: macOS limits unix socket paths to ~104 bytes.
         self._sock_dir = Path(os.environ.get("LUMEN_SOCK_DIR") or "/tmp")
@@ -380,20 +392,33 @@ class Machine:
             self._qmp = QmpClient.connect(self.qmp_path, timeout=10)
         return self._qmp
 
-    def press(self, qcodes: Sequence[str], echo: str, timeout: float = 10) -> None:
-        """Press `qcodes` together on the guest's keyboard (QMP `send-key`)
-        and wait until the guest echoes `echo` on serial (kmon echoes the
-        printable ASCII it reads while its line has room, Enter, and
-        backspace on a line that isn't empty; a key that makes anything else
-        isn't echoed), so keys are paced by the guest, not by sleeps."""
-        self.qmp().send_key(qcodes)
-        self.expect(re.escape(echo), timeout)
+    def press(self, qcodes: Sequence[str]) -> None:
+        """Press `qcodes` together on the guest's keyboard (QMP `send-key`,
+        held 20 ms). QEMU queues each key behind the last one, so keys
+        pressed back to back arrive in order. The screen shell answers them
+        on the screen, not on serial: wait for what they did with
+        `lumen_harness.screen.expect_screen`.
 
-    def type_text(self, text: str, timeout: float = 10) -> None:
-        """Type `text` on the guest's keyboard as a US layout would, one key
-        at a time, each waiting for the guest's echo (see `press`)."""
+        QEMU's input queue holds 1024 entries and silently drops the rest
+        (`ui/input.c`): a `send-key` of n keys takes 6n (each key's press
+        and release, a sync after each, and the hold time after each), and
+        2n hold times to send. So this paces itself: it waits whenever the
+        keys queued would take more than `KEYS_AHEAD` seconds to send, which
+        is at most 150 entries a second ahead whatever n is (about 480, under
+        the limit). `test_a_long_line_of_shifted_keys` checks 150 shifted
+        keys arrive."""
+        ahead = self._keys_sent_by - time.monotonic()
+        if ahead > KEYS_AHEAD:
+            time.sleep(ahead - KEYS_AHEAD / 2)
+        self.qmp().send_key(qcodes, hold_ms=KEY_HOLD_MS)
+        cost = 2 * len(qcodes) * KEY_HOLD_MS / 1000
+        self._keys_sent_by = max(self._keys_sent_by, time.monotonic()) + cost
+
+    def type_text(self, text: str) -> None:
+        """Type `text` on the guest's keyboard as a US layout would, a key at
+        a time (see `press`)."""
         for ch in text:
-            self.press(qcodes_for(ch), ch, timeout)
+            self.press(qcodes_for(ch))
 
     def screendump(self, name: str) -> Path:
         """Save the current screen as PNG in the artifacts directory."""

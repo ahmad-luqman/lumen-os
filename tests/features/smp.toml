@@ -14,7 +14,7 @@ tests = [
 ]
 
 [[feature]]
-name = "A crash on any CPU is reported by that CPU (cpu, stack it runs on) after it stops the other CPUs with an NMI; kmon runs a fault on a chosen CPU"
+name = "A crash on any CPU is reported by that CPU (cpu, stack it runs on) after it stops the other CPUs with an NMI; the shell runs a fault on a chosen CPU"
 milestone = "M1"
 tests = [
     "scenario:test_smp::test_crash_on_ap_reports_cpu",

@@ -225,7 +225,7 @@ impl Registry {
     /// unregistered: readers such as the crash reporter dereference what the
     /// registry lists. (The kernel's readers are crash reports, which stop
     /// the other CPUs before reading, so a stack retracted and then unmapped
-    /// by a stopped CPU is never half-read; and tests and kmon, on the CPU
+    /// by a stopped CPU is never half-read; and tests and the shell, on the CPU
     /// that owns the stacks they look at. A reader running alongside writers
     /// would need a grace period after `unregister` before the unmapping.)
     ///

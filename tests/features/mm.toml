@@ -51,7 +51,7 @@ tests = [
     "ktest:lumen_kernel::mm::heap::growth_is_geometric",
     "ktest:lumen_kernel::mm::heap::small_growth_when_frames_are_scarce",
     "ktest:lumen_kernel::mm::paging::hhdm_maps_exactly_the_hhdm_types",
-    "scenario:test_mm::test_kmon_heap_reports_usage",
+    "scenario:test_mm::test_heap_command_reports_usage",
     "scenario:test_mm::test_out_of_memory_report_shows_the_heap",
     "scenario:test_mm::test_double_free_is_refused",
     "scenario:test_mm::test_corrupt_free_list_is_a_crash_not_a_hang",

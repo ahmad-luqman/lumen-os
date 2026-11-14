@@ -9,7 +9,7 @@ tests = [
 ]
 
 [[feature]]
-name = "The terminal on the framebuffer below the unchanged header: kmon's output and echo on screen (escapes kept off serial), a colour test pattern, log lines coloured by level and starting from the default colours, each write formatted under one lock, only changed cells drawn, scrolls drawn by moving pixels (matching a full redraw), the cursor's blink phase"
+name = "The terminal on the framebuffer below the unchanged header: the screen shell's output and echo on screen (escapes kept off serial), a colour test pattern, log lines coloured by level and starting from the default colours, each write formatted under one lock, only changed cells drawn, scrolls drawn by moving pixels (matching a full redraw), the cursor's blink phase"
 milestone = "M2"
 tests = [
     "scenario:test_term::test_ansi_colours_golden",
@@ -19,7 +19,7 @@ tests = [
     "ktest:lumen_kernel::term::scrolled_pixels_match_a_full_redraw",
     "ktest:lumen_kernel::term::a_log_line_starts_from_the_default_colours",
     "ktest:lumen_kernel::term::write_fmt_formats_under_the_lock",
-    "ktest:lumen_kernel::kmon::kmon_writes_each_write_whole",
+    "ktest:lumen_kernel::shell::the_screen_console_writes_each_write_whole",
     "scenario:test_screen::test_boot_hello_golden",
 ]
 
@@ -29,5 +29,6 @@ milestone = "M2"
 tests = [
     "scenario:test_term::test_scrollback",
     "ktest:lumen_kernel::term::the_cursor_is_not_drawn_while_scrolled_back",
+    "ktest:lumen_kernel::term::output_keeps_a_scrolled_back_view",
     "ktest:lumen_kernel::keyboard::other_keys_come_with_the_shift_state",
 ]

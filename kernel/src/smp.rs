@@ -21,7 +21,7 @@
 //!    `cpu N online (lapic id X)` and becomes its idle thread
 //!    (`sched::run_ap_idle`): with interrupts on, it starts its own timer
 //!    and scheduler once the boot CPU has calibrated the timer, runs the
-//!    threads spawned on it, and whatever [`run_on`] hands it (kmon's
+//!    threads spawned on it, and whatever [`run_on`] hands it (the shell's
 //!    `crash <kind> [cpu]`; a job can't block);
 //! 4. after calibrating the clocks, the boot CPU waits (bounded, 2 s in all)
 //!    for every AP to be online ([`wait_online`]).
@@ -165,7 +165,7 @@ fn online() -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunError {
     /// That CPU isn't an online AP (it doesn't exist, didn't start, or is the
-    /// boot CPU, which runs kmon itself).
+    /// boot CPU, which runs the serial shell itself).
     NotAnOnlineAp,
     /// It hasn't taken the last job yet.
     Busy,
@@ -174,7 +174,7 @@ pub enum RunError {
     IpiNotSent,
 }
 
-/// How kmon finishes `crash: cpu N ...` (a test interface).
+/// How the shell finishes `crash: cpu N ...` (a test interface).
 impl core::fmt::Display for RunError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
@@ -204,6 +204,12 @@ pub fn run_on(index: usize, job: fn()) -> Result<(), RunError> {
         return Err(RunError::IpiNotSent);
     }
     Ok(())
+}
+
+/// Take back the job [`run_on`] gave AP `index`, if it hasn't taken it
+/// yet; whether there was one to take back.
+pub fn withdraw(index: usize) -> bool {
+    SLOTS.get(index).is_some_and(|slot| slot.job.take().is_some())
 }
 
 /// Wake CPU `index` if it is online and isn't this one: send it the

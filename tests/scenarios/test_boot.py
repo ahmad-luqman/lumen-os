@@ -1,4 +1,4 @@
-"""First boot: Limine loads the kernel, which reaches the logger and the monitor."""
+"""First boot: Limine loads the kernel, which reaches the logger and the shell."""
 
 import re
 
@@ -70,7 +70,7 @@ def micros(decimal: str) -> int:
 def test_log_lines_are_structured(boot):
     """Every kernel log line is `[time] LEVEL tag: message` (hard rule 8)."""
     m = boot("qemutest")
-    m.expect(r"kmon> ", BOOT_TIMEOUT)
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
     lines = kernel_lines(m.output)
     matches = [LOG_LINE.match(line) for line in lines]
     bad = [line for line, match in zip(lines, matches, strict=True) if not match]
@@ -119,10 +119,10 @@ def test_boot_timeline_printed(boot):
 def test_serial_input_round_trip(boot):
     """The harness can type into the kernel and read the reply."""
     m = boot("qemutest")
-    m.expect(r"kmon> ", BOOT_TIMEOUT)
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
     m.send_line("echo hello-from-the-harness")
     m.expect(r"\nhello-from-the-harness\n", 10)
-    m.expect(r"kmon> ", 10)
+    m.expect(r"lumen> ", 10)
     m.send_line("frobnicate")
     m.expect(r"unknown command: frobnicate", 10)
     m.send_line("exit")
@@ -132,7 +132,7 @@ def test_serial_input_round_trip(boot):
 def test_breakpoint_is_survivable(boot):
     """#BP returns to the interrupted code; the stub restores all registers."""
     m = boot("qemutest")
-    m.expect(r"kmon> ", BOOT_TIMEOUT)
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
     m.send_line("int3")
     m.expect(r"breakpoints taken: 1\n", 10)
     m.send_line("int3")

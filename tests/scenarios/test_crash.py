@@ -15,14 +15,17 @@ SCREEN_DONE = "(crash report shown on screen)"
 
 # kind -> (exception line regex, function the rip must resolve to)
 FAULTS = {
-    "pf": (r"exception: #PF page fault \(vector 14, error code 0x2\)", "kmon::crash_page_fault"),
-    "ud": (r"exception: #UD invalid opcode \(vector 6,", "kmon::crash_invalid_opcode"),
-    "de": (r"exception: #DE divide error \(vector 0,", "kmon::crash_divide_error"),
+    "pf": (
+        r"exception: #PF page fault \(vector 14, error code 0x2\)",
+        "shell::crash::crash_page_fault",
+    ),
+    "ud": (r"exception: #UD invalid opcode \(vector 6,", "shell::crash::crash_invalid_opcode"),
+    "de": (r"exception: #DE divide error \(vector 0,", "shell::crash::crash_divide_error"),
     "gp": (
         r"exception: #GP general protection fault \(vector 13,",
-        "kmon::crash_general_protection",
+        "shell::crash::crash_general_protection",
     ),
-    "df": (r"exception: #DF double fault \(vector 8,", "kmon::crash_double_fault"),
+    "df": (r"exception: #DF double fault \(vector 8,", "shell::crash::crash_double_fault"),
 }
 
 
@@ -43,7 +46,7 @@ def test_fault_produces_symbolized_report(crash_report, kind):
     assert any(f.startswith("kmain+") for f in frames), report
     assert frames[-1].startswith("_start"), report
     assert "<unknown>" not in report, report
-    # kmon runs in the boot CPU's `main` thread (kmain's context).
+    # The serial shell runs in the boot CPU's `main` thread (kmain's context).
     assert re.search(r"^thread: main \(id \d+\)$", report, re.MULTILINE), report
     # None of these is a stack overflow (`df` breaks rsp itself, so its #DF
     # runs on the IST stack with cr2 outside every guard page).
@@ -64,7 +67,7 @@ def test_panic_report_trace_ends_with_the_panic(crash_report):
     report = crash_report("panic")
     trace = report[report.index("recent trace events (oldest first):") :]
     lines = re.findall(r"^  #\d+ +tsc=\d+ +(\S+.*)$", trace, re.MULTILINE)
-    at = re.search(r"^  at kernel/src/kmon\.rs:(\d+):\d+$", report, re.MULTILINE)
+    at = re.search(r"^  at kernel/src/shell/crash\.rs:(\d+):\d+$", report, re.MULTILINE)
     assert at, report
     assert re.match(rf"panic +line={at.group(1)}$", lines[-1]), trace
 
@@ -87,17 +90,17 @@ def test_page_fault_report_names_address_and_cause(crash_report):
 
 def test_panic_produces_report(crash_report):
     report = crash_report("panic")
-    assert "panic: deliberate panic from kmon" in report
-    assert re.search(r"at kernel/src/kmon\.rs:\d+:\d+", report)
+    assert "panic: deliberate panic from the shell" in report
+    assert re.search(r"at kernel/src/shell/crash\.rs:\d+:\d+", report)
     frames = backtrace(report)
-    assert any("kmon::crash_panic" in f for f in frames), report
+    assert any("shell::crash::crash_panic" in f for f in frames), report
     assert frames[-1].startswith("_start"), report
 
 
 def test_crash_screen_golden(boot, artifacts, golden_dir):
     """The crash report is also shown on screen (banner checked against a golden)."""
     m = boot("interactive")  # no qemu_exit: the crash screen stays up
-    m.expect(r"kmon> ", 60)
+    m.expect(r"lumen> ", 60)
     m.send_line("crash ud")
     m.expect(re.escape(SCREEN_DONE), 30)  # drawing finished, not just serial
     shot = m.screendump("crash.png")
@@ -108,7 +111,7 @@ def test_crash_screen_golden(boot, artifacts, golden_dir):
 
 @pytest.mark.parametrize("kind", ["panic", "pf"])
 def test_report_is_written_with_interrupts_off(crash_report, kind):
-    # kmon runs with interrupts on; a crash turns them off for good, and no
+    # The serial shell runs with interrupts on; a crash turns them off for good, and no
     # lock the report takes and releases turns them back on.
     report = crash_report(kind)
     assert re.search(r"^interrupts: off$", report, re.MULTILINE), report
@@ -119,13 +122,13 @@ def test_report_names_the_thread(crash_report):
     # thread's own stack, and the backtrace ends where every thread starts
     # (`context::thread_start`, rbp = 0), not in kmain.
     report = crash_report("pf thread")
-    assert re.search(r"^thread: kmon-crash \(id \d+\)$", report, re.MULTILINE), report
+    assert re.search(r"^thread: shell-crash \(id \d+\)$", report, re.MULTILINE), report
     assert re.search(
         r"^running on: the thread stack 0x[0-9a-f]+\.\.0x[0-9a-f]+$", report, re.MULTILINE
     ), report
     assert re.search(FAULTS["pf"][0], report), report
     frames = backtrace(report)
-    assert "kmon::crash_page_fault" in frames[0], report
+    assert "shell::crash::crash_page_fault" in frames[0], report
     assert any("sched::thread_entry" in f for f in frames), report
     assert "context::thread_start" in frames[-1], report
     assert not any("kmain" in f for f in frames), report
@@ -142,4 +145,4 @@ def test_thread_stack_overflow_hits_its_guard(crash_report):
         report,
         re.MULTILINE,
     ), report
-    assert re.search(r"^thread: kmon-crash \(id \d+\)$", report, re.MULTILINE), report
+    assert re.search(r"^thread: shell-crash \(id \d+\)$", report, re.MULTILINE), report

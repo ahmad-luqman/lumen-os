@@ -4,7 +4,7 @@
 //! event kinds and [`ktrace!`](crate::ktrace!).
 //!
 //! Timestamps are raw TSC ticks (the boot timeline converts its phases with
-//! the frequency `time` calibrates; kmon's `trace` shows them raw). Each CPU
+//! the frequency `time` calibrates; the shell's `trace` shows them raw). Each CPU
 //! records into its own ring ([`ring`] picks the current one), and each event
 //! carries the CPU's index; the boot timeline reads the boot CPU's.
 

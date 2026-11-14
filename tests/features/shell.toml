@@ -1,0 +1,67 @@
+# Features: shell. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Shell core (lumen-shell, in the kernel with audit passing): POSIX-style word splitting (quotes, backslashes, comments; agreeing with shlex on random lines), a line editor with history and completion whose ANSI and plain output a terminal shows as the line it holds after random edits, serial bytes to keys"
+milestone = "M2"
+tests = [
+    "cargo:lumen-shell",
+    "audit:flags",
+]
+
+[[feature]]
+name = "Two shells replace kmon, each with its own line and history: on serial (plain text, no escape codes) and on the screen (typed on the keyboard, in its own thread, woken by IRQ 1); kmon's commands kept (help, echo, int3, crash, trace, heap, ticks, kbd, term, clear, colors, seq, sleep, uptime, clocks, exit; help lists every command); one line of error for an unknown command or a line that can't be split; only the serial shell without a keyboard"
+milestone = "M2"
+tests = [
+    "scenario:test_shell::test_echo",
+    "scenario:test_shell::test_unknown_command_single_error",
+    "scenario:test_shell::test_history_and_line_editing",
+    "scenario:test_input::test_keys_via_qmp_send_key",
+    "scenario:test_input::test_no_8042_is_a_warning",
+    "ktest:lumen_kernel::shell::the_screen_console_writes_each_write_whole",
+    "ktest:lumen_kernel::shell::commands::help_lists_every_command_once",
+    "ktest:lumen_kernel::shell::crash::every_crash_kind_has_a_fault",
+    "scenario:test_boot::test_breakpoint_is_survivable",
+    "scenario:test_boot::test_serial_input_round_trip",
+    "scenario:test_crash::*",
+    "scenario:test_trace::test_trace_defaults_and_usage",
+    "scenario:test_mm::test_heap_command_reports_usage",
+    "scenario:test_time::test_timer_interrupts_counted",
+    "scenario:test_time::test_clocks_shows_the_windows_behind_each_measurement",
+    "scenario:test_input::test_second_layout",
+    "scenario:test_term::*",
+    "scenario:test_shell::test_tab_completion",
+]
+
+[[feature]]
+name = "Line editing and history: on the screen the cursor keys, Home/End, Delete, Ctrl-A/E/F/K/U/W/C and Up/Down; on plain serial history recalled by erasing and retyping; `history` lists a console's lines; lines limited in columns (a wide character takes two), and one that didn't fit isn't run"
+milestone = "M2"
+tests = [
+    "scenario:test_shell::test_history_and_line_editing",
+    "cargo:lumen-shell",
+    "ktest:lumen_kernel::shell::keyboard_keys_reach_the_line_editor",
+    "ktest:lumen_kernel::keyboard::scancodes_decode_per_layout",
+]
+
+[[feature]]
+name = "Tab completion of command names and their arguments (one match in full, the start several share, or a listing), on the screen and on plain serial (the start several share host-tested only: wherever a prefix matches several of today's words, they already differ right after it)"
+milestone = "M2"
+tests = [
+    "scenario:test_shell::test_tab_completion",
+    "cargo:lumen-shell",
+]
+
+[[feature]]
+name = "Serial with lumen.ansi edits like the screen (escape codes) and takes the colour pattern and clear; without it they say the console is plain"
+milestone = "M2"
+tests = [
+    "scenario:test_shell::test_serial_takes_escape_codes_with_lumen_ansi",
+]
+
+[[feature]]
+name = "`term text` prints the screen's rows; the harness reads them to see what the screen's shell did, and paces keys under QEMU's input queue limit"
+milestone = "M2"
+tests = [
+    "harness:test_screen_text::*",
+    "scenario:test_input::test_every_printable_character_and_backspace",
+    "scenario:test_input::test_a_long_line_of_shifted_keys",
+]

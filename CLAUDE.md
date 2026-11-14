@@ -138,10 +138,11 @@ own PR that updates that doc first.
   `arch/x86_64/`: GDT/TSS (per CPU), IDT, entry
   stubs and the vector map, `percpu.rs` (GS base, CPU index), `irq.rs` (nested interrupt disable), local and
   I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
-  reporter. `ktest.rs`: test runner. `kmon.rs`: debug monitor, typed on serial or the keyboard,
-  answering on serial and the screen (until the M2 shell). `fb.rs`:
+  reporter. `ktest.rs`: test runner. `shell/`: the shells, one on serial
+  (plain text unless `lumen.ansi`) and one on the screen (keyboard), their
+  commands (`commands.rs`) and deliberate faults (`crash.rs`). `fb.rs`:
   framebuffer pixels, the header and the crash screen. `term.rs`: the
-  terminal on the framebuffer (log lines, kmon, scrollback). `klog.rs`: logger. `symbols.rs`: symbol lookup.
+  terminal on the framebuffer (log lines, the screen's shell, scrollback, `view_text`). `klog.rs`: logger. `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -175,10 +176,14 @@ own PR that updates that doc first.
 - `crates/lumen-term`: terminal emulator core: `vte` escapes into a cell
   grid, scrollback, damage tracking (host-tested, incl. a randomized model
   renderer).
+- `crates/lumen-shell`: shell core: word splitting with quotes (checked
+  against `shlex`), the line editor (history, completion; ANSI and plain
+  output), the command table, serial bytes to keys (host-tested).
 - `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET
   (host-tested on handcrafted tables).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
   are built), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
-  `crash.py` (crash-report parsing).
+  `crash.py` (crash-report parsing), `screen.py` (the screen's rows
+  through the serial shell's `term text`).
 - `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests.
   `tests/features/*.toml`: feature → test map (the CI feature gate and STATUS.md).

@@ -34,6 +34,14 @@ static LOGGER: KernelLogger = KernelLogger;
 /// Serializes whole log lines so they never interleave.
 static LINE_LOCK: SpinLock<()> = SpinLock::new(());
 
+/// Run `f` holding the log's line lock, so no log line lands in the middle
+/// of what it writes to serial (the serial shell's writes). `f` must not
+/// log.
+pub fn with_line_lock<R>(f: impl FnOnce() -> R) -> R {
+    let _line = LINE_LOCK.lock();
+    f()
+}
+
 impl Log for KernelLogger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         metadata.level() <= log::max_level()

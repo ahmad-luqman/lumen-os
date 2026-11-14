@@ -1,4 +1,4 @@
-"""The kernel trace ring, seen through the kmon `trace` command.
+"""The kernel trace ring, seen through the shell's `trace` command.
 
 The ring itself is tested on the host (`cargo test -p lumen-trace`) and
 in-kernel (`lumen_kernel::trace::*`); this checks what a person sees.
@@ -21,13 +21,13 @@ def trace(m, arg: str) -> tuple[list[tuple[str, str, str, str]], int, int]:
     m.send_line(f"trace {arg}".strip())
     summary = m.expect(r"trace: (\d+) events claimed, (\d+) dropped\n", 20)
     out = m.output[start : summary.start()]
-    assert not GAP_LINE.findall(out), out  # nothing records while kmon prints
+    assert not GAP_LINE.findall(out), out  # nothing records while the shell prints
     return EVENT_LINE.findall(out), int(summary.group(1)), int(summary.group(2))
 
 
 def test_trace_command_shows_every_event_since_boot(boot):
     m = boot("qemutest")
-    m.expect(r"kmon> ", BOOT_TIMEOUT)
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
     events, claimed, dropped = trace(m, "4096")
     assert dropped == 0
     # Nothing was overwritten or lost: one line per claimed event, in order.
@@ -43,7 +43,7 @@ def test_trace_command_shows_every_event_since_boot(boot):
 
 def test_trace_defaults_and_usage(boot):
     m = boot("qemutest")
-    m.expect(r"kmon> ", BOOT_TIMEOUT)
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
     events, claimed, _ = trace(m, "")
     assert len(events) == min(16, claimed)
     m.send_line("trace lots")
@@ -52,7 +52,7 @@ def test_trace_defaults_and_usage(boot):
 
 def test_exception_appears_in_trace(boot):
     m = boot("qemutest")
-    m.expect(r"kmon> ", BOOT_TIMEOUT)
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
     m.send_line("int3")
     m.expect(r"breakpoints taken: 1")
     events, _, _ = trace(m, "3")

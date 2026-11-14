@@ -50,7 +50,7 @@ def ap_stacks(output: str) -> dict[int, ApStacks]:
 def boot_to_prompt(boot, cpus: int):
     m = boot("qemutest", extra=["-smp", str(cpus)])
     summary = m.expect(SUMMARY, BOOT_TIMEOUT)
-    m.expect(r"kmon> ", BOOT_TIMEOUT)
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
     return m, int(summary.group(1))
 
 
@@ -100,7 +100,7 @@ def test_cpus_past_the_limit_are_halted(boot):
 
 
 def crash_on(boot, args: str, cpus: int = 4):
-    """Boot `cpus` CPUs, run `crash <args>` in kmon, check QEMU exits with the
+    """Boot `cpus` CPUs, run `crash <args>` in the shell, check QEMU exits with the
     crash code after a complete report (no `!!!` line: every other CPU
     stopped through its stop NMI; the heap line and `interrupts: off` at
     the end; drawn on screen too). Returns (report, the APs' logged stacks)."""
@@ -129,9 +129,9 @@ def test_crash_on_ap_reports_cpu(boot):
     assert running_on(report) == ("kernel main", stacks[1].main_bottom, stacks[1].main_top), report
     assert re.search(r"^thread: idle \(id \d+\)$", report, re.MULTILINE), report
     frames = crash.backtrace(report)
-    assert "kmon::crash_page_fault" in frames[0] and any("smp::ap_main" in f for f in frames), (
-        frames
-    )
+    assert "shell::crash::crash_page_fault" in frames[0] and any(
+        "smp::ap_main" in f for f in frames
+    ), frames
     # The trace is CPU 1's own ring: its online log line and the fault, none
     # of the boot CPU's events.
     events = re.findall(
@@ -155,7 +155,7 @@ def test_stack_overflow_on_ap_hits_its_own_guard(boot):
     # page; the #DF runs on CPU 1's own #DF stack and names the overflow.
     report, stacks = crash_on(boot, "stack 1")
     assert reported_by(report, 1), report
-    assert_main_stack_overflow(report, "kmon::recurse+")
+    assert_main_stack_overflow(report, "shell::crash::recurse+")
     _, bottom, top = OVERFLOW.search(report).groups()
     assert (bottom, top) == (stacks[1].main_bottom, stacks[1].main_top), report
     kind, ist_bottom, _ = running_on(report)
@@ -201,7 +201,7 @@ def test_crash_on_the_boot_cpu_stops_the_others(boot):
 
 
 def test_crash_alone_names_no_other_cpus(boot):
-    # `0` is the boot CPU, which runs kmon: the fault runs right there.
+    # `0` is the boot CPU, which runs the serial shell: the fault runs right there.
     report, _ = crash_on(boot, "pf 0", cpus=1)
     assert reported_by(report, 0) and "other cpus" not in report, report
 

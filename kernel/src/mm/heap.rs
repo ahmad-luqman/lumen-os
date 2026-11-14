@@ -275,7 +275,7 @@ impl Snapshot {
         Snapshot { stats: state.heap.stats(), list, max_blocks, last_failure: state.last_failure }
     }
 
-    /// One line for humans (kmon `heap`, crash reports; parsed by
+    /// One line for humans (the shell's `heap`, crash reports; parsed by
     /// `HEAP_LINE` in tests/scenarios/test_mm.py): sizes, the free list and
     /// the last failed growth.
     fn write(&self, w: &mut dyn Write, label: &str) -> fmt::Result {
@@ -302,8 +302,9 @@ impl Snapshot {
     }
 }
 
-/// The heap line for kmon's `heap` command.
-#[cfg_attr(feature = "ktest", allow(dead_code))] // kmon, the only caller, never runs in the test kernel
+/// The heap line for the shell's `heap` command (and `crash dfree` and
+/// `crash heapcorrupt`, before they do their damage).
+#[cfg_attr(feature = "ktest", allow(dead_code))] // the shell, the only caller, never runs in the test kernel
 pub fn write_stats(w: &mut dyn Write) -> fmt::Result {
     let snapshot = Snapshot::of(&STATE.lock(), usize::MAX);
     snapshot.write(w, "heap")
