@@ -13,6 +13,7 @@ import re
 
 from lumen_harness.crash import BEGIN, END, backtrace, page_walk
 from lumen_harness.qemu import EXIT_CRASH
+from lumen_harness.screen import expect_screen
 
 BOOT_TIMEOUT = 60
 MIB = 1024 * 1024
@@ -132,6 +133,11 @@ def crash_after_heap_summary(boot, kind: str) -> tuple[dict[str, int], str]:
 def test_heap_command_reports_usage(boot):
     m = boot("qemutest")
     m.expect(r"lumen> ", BOOT_TIMEOUT)
+    # The screen's shell runs on its own thread, started just before the
+    # serial one: until it has shown its first prompt (allocating the
+    # buffers it keeps from then on), the heap isn't settled and two `heap`s
+    # can differ.
+    expect_screen(m, r"^lumen>$")
     heap = shell_heap(m)
     # What boot keeps (`acpi::Info`, for one) and the shells (their editors
     # and histories, the screen's thread) is in use, a few dozen
