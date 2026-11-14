@@ -1,6 +1,7 @@
 //! Boot framebuffer: pixels, glyphs, the "hello" header, and the crash
 //! screen. Below the header, the terminal (`crate::term`) draws log lines and
-//! the screen's shell.
+//! the screen's shell, or a command draws on a `term::Canvas` while the
+//! terminal is paused.
 //!
 //! Text uses pre-rasterized Noto Sans Mono glyphs (anti-aliased, so we blend
 //! each pixel between background and foreground). This is deliberately the
@@ -15,6 +16,7 @@
 
 use crate::sync::SpinLock;
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicU32, Ordering};
 use noto_sans_mono_bitmap::{FontWeight, RasterHeight, get_raster, get_raster_width};
 
 pub const BG: u32 = 0x0f1420;
@@ -29,8 +31,9 @@ const CRASH_TITLE: u32 = 0xff6b6b;
 pub const CONSOLE_TOP: usize = 144;
 pub const MARGIN: usize = 32;
 
-/// The boot framebuffer (32 bits per pixel). Not `Copy`: a second handle
-/// (the crash screen's) comes only from [`Framebuffer::alias`].
+/// The boot framebuffer (32 bits per pixel, rows a whole number of pixels
+/// apart). Not `Copy`: other handles (the crash screen's, a
+/// `term::Canvas`'s) come only from [`Framebuffer::alias`].
 pub struct Framebuffer {
     base: *mut u8,
     width: usize,
@@ -41,17 +44,23 @@ pub struct Framebuffer {
     blue_shift: u8,
 }
 
-// SAFETY: the framebuffer is plain MMIO-like memory owned by the kernel. Two
-// handles draw: the terminal's, under its lock, and the crash screen's (from
-// `FRAMEBUFFER`), after the crash path stopped the terminal (`term::stop`)
-// and the other CPUs, or named those that didn't stop.
+// SAFETY: the framebuffer is plain MMIO-like memory owned by the kernel.
+// Three kinds of handle draw: the terminal's, under its lock; a
+// `term::Canvas`'s, while the terminal is paused (from any CPU: pixel stores
+// are atomic, see `put`); and the crash screen's (from `FRAMEBUFFER`), after
+// the crash path stopped the terminal (`term::stop`) and the other CPUs, or
+// named those that didn't stop.
 unsafe impl Send for Framebuffer {}
 
 impl Framebuffer {
     /// Another handle to the same pixels.
     ///
     /// # Safety
-    /// The two handles must never draw at the same time.
+    /// Handles must keep out of each other's way: one never draws while
+    /// another does, except that several CPUs may draw on a `term::Canvas`
+    /// at once (`put`'s stores are atomic), and the crash screen takes the
+    /// pixels whatever a CPU the crash path couldn't stop still draws
+    /// (`with_crash_screen`).
     pub(crate) unsafe fn alias(&self) -> Framebuffer {
         Framebuffer { ..*self }
     }
@@ -61,15 +70,21 @@ impl Framebuffer {
         (r << self.red_shift) | (g << self.green_shift) | (b << self.blue_shift)
     }
 
-    /// Set one pixel (nothing outside the framebuffer). Takes `&self`:
-    /// the pixels are plain memory written with volatile stores, so
-    /// handles drawing disjoint pixels at once (the terminal's
-    /// `term::Canvas` on several CPUs) can't hurt each other.
+    /// Set one pixel (nothing outside the framebuffer). Takes `&self`: the
+    /// store is a relaxed atomic one (a plain `mov` on x86), so several
+    /// CPUs drawing on a `term::Canvas` at once, even the same pixel, don't
+    /// race (two writing one pixel leave one of their colours).
     pub fn put(&self, x: usize, y: usize, rgb: u32) {
         if x < self.width && y < self.height {
             let px = self.encode(rgb);
-            // SAFETY: (x, y) is inside the framebuffer and pixels are 32-bit.
-            unsafe { (self.base.add(y * self.pitch + x * 4) as *mut u32).write_volatile(px) }
+            // SAFETY: (x, y) is inside the framebuffer, whose base is page
+            // aligned and whose rows are a whole number of 32-bit pixels
+            // apart (`init` checks the pitch), so the pointer is valid and
+            // aligned for a u32; every concurrent access to a pixel is a
+            // store through here or a read (`pixel`, `move_rows` with no
+            // other handle drawing).
+            let pixel = unsafe { AtomicU32::from_ptr(self.base.add(y * self.pitch + x * 4).cast::<u32>()) };
+            pixel.store(px, Ordering::Relaxed);
         }
     }
 
@@ -102,8 +117,9 @@ impl Framebuffer {
     #[cfg(feature = "ktest")]
     pub fn pixel(&self, x: usize, y: usize) -> u32 {
         if x < self.width && y < self.height {
-            // SAFETY: (x, y) is inside the framebuffer and pixels are 32-bit.
-            unsafe { (self.base.add(y * self.pitch + x * 4) as *const u32).read_volatile() }
+            // SAFETY: as in `put` (an atomic load, so a canvas drawing
+            // meanwhile doesn't race with it).
+            unsafe { AtomicU32::from_ptr(self.base.add(y * self.pitch + x * 4).cast::<u32>()) }.load(Ordering::Relaxed)
         } else {
             0
         }
@@ -122,11 +138,15 @@ impl Framebuffer {
         raster.width().min(max_w)
     }
 
-    /// Draw `s` from (`x`, `y`); returns its width in pixels.
+    /// Draw `s` from (`x`, `y`), clipped at the right edge; returns the
+    /// width drawn in pixels (0 if it starts past the edge).
     pub fn text(&self, x: usize, y: usize, s: &str, st: Style) -> usize {
         let mut cx = x;
         for c in s.chars() {
-            cx += self.glyph(cx, y, c, st);
+            if cx >= self.width {
+                break;
+            }
+            cx += self.glyph_clipped(cx, y, c, st, self.width - cx);
         }
         cx - x
     }
@@ -240,7 +260,8 @@ pub enum Unusable {
     Bpp(u16),
     /// A colour channel isn't 8 bits wide.
     Masks { red: u8, green: u8, blue: u8 },
-    /// Rows shorter than 4 bytes a pixel.
+    /// Rows shorter than 4 bytes a pixel, or not a whole number of pixels
+    /// apart.
     Pitch { pitch: u64, width: u64 },
 }
 
@@ -267,7 +288,7 @@ pub fn init(fb: &limine::framebuffer::Framebuffer<'_>) -> Result<(usize, usize),
     if (red, green, blue) != (8, 8, 8) {
         return Err(Unusable::Masks { red, green, blue });
     }
-    if fb.pitch() < fb.width() * 4 {
+    if fb.pitch() < fb.width() * 4 || !fb.pitch().is_multiple_of(4) {
         return Err(Unusable::Pitch { pitch: fb.pitch(), width: fb.width() });
     }
     let f = Framebuffer {
@@ -287,7 +308,8 @@ pub fn init(fb: &limine::framebuffer::Framebuffer<'_>) -> Result<(usize, usize),
     f.fill_rect(MARGIN, 124, 576, 2, ACCENT);
 
     // SAFETY: the crash screen's handle draws only after the crash path
-    // stopped the terminal (`with_crash_screen`).
+    // stopped the terminal (`with_crash_screen`; a `term::Canvas` on a CPU
+    // that didn't stop may still draw then, see there).
     let crash = unsafe { f.alias() };
     *FRAMEBUFFER.lock() = Some(crash);
     crate::term::init(f);
@@ -305,7 +327,9 @@ pub fn init(fb: &limine::framebuffer::Framebuffer<'_>) -> Result<(usize, usize),
 pub unsafe fn with_crash_screen(f: impl FnOnce(&mut dyn Write)) -> bool {
     crate::term::stop();
     // SAFETY: upheld by the caller; the terminal draws no more (stopped
-    // above), so this is the only handle drawing.
+    // above). A `term::Canvas` held on a CPU the crash path couldn't stop
+    // may still store pixels (atomically, see `put`): the report names that
+    // CPU, the screen may come out garbled, serial has the report.
     let Some(fb) = (unsafe { FRAMEBUFFER.force_get() }).as_ref().map(|f| unsafe { f.alias() }) else {
         return false;
     };

@@ -9,7 +9,7 @@ tests = [
 ]
 
 [[feature]]
-name = "`mandelbrot` draws the set on the screen with the boot CPU alone, then with every CPU at once (row bands dealt round-robin, each CPU drawing some, the same pixels), prints both times, and gives the screen back on a key"
+name = "`mandelbrot` draws the set on the screen with the boot CPU alone, then with every CPU at once (row bands dealt round-robin to threads pinned to each CPU, each CPU drawing some, the same pixels, every thread joined before the screen is given back), prints both times and each CPU's rows, and gives the screen back on a key"
 milestone = "M2"
 tests = [
     "scenario:test_demo::test_mandelbrot_golden",

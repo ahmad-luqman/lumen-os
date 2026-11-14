@@ -42,7 +42,11 @@ def test_mandelbrot_golden(boot, artifacts, golden_dir):
     m = boot_shell(boot, cpus=4)
     m.send_line("mandelbrot")
     found = m.expect(MANDELBROT, 300)
+    per_cpu = m.expect(r"mandelbrot: rows drawn by each CPU:((?: cpu\d+=\d+)+)\n", 10)
     m.expect(r"mandelbrot: press a key\n", 10)
+    rows = dict(map(int, r.removeprefix("cpu").split("=")) for r in per_cpu[1].split())
+    # Each of the four CPUs drew bands, every row once.
+    assert sorted(rows) == [0, 1, 2, 3] and sum(rows.values()) == CANVAS[1]
     one, cpus, all_ms = int(found[1]), int(found[2]), int(found[3])
     print(f"mandelbrot: 1 CPU {one} ms, {cpus} CPUs {all_ms} ms")
     assert cpus == 4
