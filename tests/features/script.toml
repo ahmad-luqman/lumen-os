@@ -1,0 +1,35 @@
+# Features: script. See tests/features/README.md for the format.
+
+[[feature]]
+name = "rhai linked into the kernel with the code-generation audit passing (integers only, no modules)"
+milestone = "M2"
+tests = [
+    "audit:flags",
+    "scenario:test_script::test_rhai_eval",
+]
+
+[[feature]]
+name = "Scripts in the shell: `rhai -e <expr>` (cpus(), mem(), uptime(), trace(n), sleep(ms), print), a REPL keeping variables, built-in demos; a value printed, an error in one line"
+milestone = "M2"
+tests = [
+    "scenario:test_script::test_rhai_eval",
+    "scenario:test_script::test_rhai_repl",
+    "ktest:lumen_kernel::script::lumen_functions_answer",
+]
+
+[[feature]]
+name = "Scripts draw on the screen (draw_pixel, draw_rect, draw_text, clear) and keep it until a key, then the terminal is back"
+milestone = "M2"
+tests = [
+    "scenario:test_script::test_script_draws_golden",
+    "ktest:lumen_kernel::script::a_script_that_drew_waits_for_a_key",
+]
+
+[[feature]]
+name = "A runaway script is stopped: Ctrl-C on serial or the keyboard (also during sleep), an operation cap, call-depth and expression-depth caps on a 256 KiB script thread (an error, not a crash)"
+milestone = "M2"
+tests = [
+    "scenario:test_script::test_runaway_script_is_stopped",
+    "ktest:lumen_kernel::script::operations_are_capped_and_ctrl_c_stops",
+    "ktest:lumen_kernel::script::deep_recursion_is_an_error_not_a_crash",
+]

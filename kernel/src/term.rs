@@ -277,7 +277,6 @@ impl Screen {
 /// which take a plain `fn()`) reach it through a static that is cleared
 /// only after every job has finished drawing, and drop it after that: a
 /// job still drawing would paint over the terminal the drop drew.
-#[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
 pub struct Canvas {
     fb: Framebuffer,
     width: usize,
@@ -295,7 +294,6 @@ unsafe impl Sync for Canvas {}
 
 /// Why there is no [`Canvas`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
 pub enum CanvasError {
     /// No terminal (no usable framebuffer, or one too small).
     NoTerminal,
@@ -316,7 +314,6 @@ impl fmt::Display for CanvasError {
 }
 
 /// Take the pixels below the header (see [`Canvas`]).
-#[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
 pub fn canvas() -> Result<Canvas, CanvasError> {
     let taken = with_screen(|s| {
         if s.paused {
@@ -337,7 +334,6 @@ pub fn canvas() -> Result<Canvas, CanvasError> {
     taken.unwrap_or(Err(if STOPPED.load(Ordering::Acquire) { CanvasError::Stopped } else { CanvasError::NoTerminal }))
 }
 
-#[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
 impl Canvas {
     /// Width in pixels.
     pub fn width(&self) -> usize {

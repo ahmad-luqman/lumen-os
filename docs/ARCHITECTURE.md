@@ -296,7 +296,7 @@ terminal taken to be 80 columns wide; plain text without it, section 6,
 | `0x0000_0000_0000_0000 – 0x0000_7fff_ffff_ffff` | empty in the kernel's tables (null guard); user space, per process, from M9 (except the first 64 KiB) | built (empty) |
 | `0xffff_8000_0000_0000 – +phys size` | higher-half direct map (HHDM) of RAM: usable, bootloader-reclaimable, kernel-and-modules and framebuffer entries; NX, RW- except kernel-and-modules (R--), framebuffer write-combining | built |
 | `0xffff_c000_0000_0000 – 0xffff_c0ff_ffff_ffff` | kernel heap (grows up by mapping frames, to 1 GiB below the top; the top GiB holds a ktest scratch page) | built |
-| `0xffff_d000_0000_0000 – 0xffff_d0ff_ffff_ffff` | kernel stacks: 64 KiB (the main stack 128 KiB), **unmapped guard page below every stack**; the top GiB holds a ktest page | built |
+| `0xffff_d000_0000_0000 – 0xffff_d0ff_ffff_ffff` | kernel stacks: 64 KiB (the main stack 128 KiB, script threads 256 KiB), **unmapped guard page below every stack**; the top GiB holds a ktest page | built |
 | `0xffff_e000_0000_0000 – 0xffff_e0ff_ffff_ffff` | MMIO mappings (uncached, RW-), `map_mmio` | built |
 | `0xffff_ffff_8000_0000 – end of image` | kernel image: `.text` R-X, `.rodata` (and `.got`) R--, `.data/.bss` RW-, page-aligned segments | built |
 
@@ -698,6 +698,7 @@ allocates.
 ### Kernel threads (built in M2)
 
 `kernel/src/sched.rs`. A spawned thread has its own 64 KiB kernel stack
+(`spawn_sized` asks for another size: the script threads' 256 KiB)
 from `mm::stack` (a guard page below it, hard rule 4; registered as a
 `thread` stack), its saved `rsp`, and a state: ready, running, sleeping,
 blocked or dead. (`main` and the APs' idle threads run on stacks they don't
@@ -1054,8 +1055,56 @@ off. A wake from another CPU queues the thread there and sends the
   with `term text`; every serial scenario that drove kmon runs against the
   serial shell with the new prompt.
 - **Not yet:** Ctrl-R search, Alt-B/F word moves, wrapping lines longer
-  than the console, pipes, variables and scripts, and a shell in user mode
-  (M9).
+  than the console, pipes, variables, and a shell in user mode (M9).
+  Scripts: see below.
+
+### Scripting (built in M2)
+
+`kernel/src/script.rs`, the shell's `rhai` command, with
+[rhai](https://rhai.rs) 1.27 (integers only, no modules, no time; see the
+crates row in section 2).
+
+- **Forms:** `rhai` alone is a REPL (the shell's line editor with its own
+  history, prompt `rhai> `, Tab completing Lumen's functions; variables
+  kept from line to line; `exit`, `quit` or Ctrl-D on an empty line
+  leaves); `rhai -e <expr>` evaluates its words joined by spaces; `rhai
+  demo` lists the built-in scripts (`kernel/src/script/*.rhai`: `rainbow`,
+  `fib`, `count`) and `rhai demo <name>` runs one, until M6 brings files.
+  A value other than `()` is printed; an error is one line, `rhai: ...`.
+- **Lumen's functions:** `cpus()` (each online CPU as `#{index, apic}`),
+  `mem()` (`heap_size`, `heap_used`, `heap_free`, `heap_live`),
+  `uptime()` (ms), `trace(n)` (the boot CPU's last n events, a string
+  each), `sleep(ms)` (at most 60 s), `print` and `debug` (to the console),
+  and drawing on the terminal's canvas: `draw_pixel(x, y, rgb)`,
+  `draw_rect(x, y, w, h, rgb)`, `draw_text(x, y, text, rgb[, bg])`,
+  `clear([rgb])`, `screen_width()`, `screen_height()`. The canvas is taken
+  on the first draw (an error naming why if it can't be); a script that
+  drew prints `rhai: press a key` and keeps it until one is pressed on its
+  console, then gives it back (the terminal is drawn again).
+- **Its own thread:** each run (or REPL session) is a thread with a
+  256 KiB stack (`sched::spawn_sized`), the shell waiting in `join`: a
+  rhai call level can take several KiB of stack, and 12 levels with
+  nested expressions overflowed a shell thread's 64 KiB. The console is
+  lent to that thread (its lifetime erased) while the shell waits.
+- **Limits:** 200 million operations, 16 call levels, expression depth 24
+  (16 in functions), strings and arrays of 64 Ki items, maps of 4096:
+  each an error, not a guard-page crash or an out-of-memory panic.
+  **Ctrl-C** stops a script: rhai's progress hook asks the console for a
+  key every 4096 operations, and `sleep` every 10 ms; other keys typed
+  meanwhile are dropped. rhai's callbacks must be `'static`, so they reach
+  the console through a slot shared with the command (`Rc`) that holds it
+  only during an evaluation.
+- **Hashing:** rhai seeds its function hashes from a value `const-random`
+  makes when it is compiled; the kernel sets a fixed seed before the first
+  engine, so runs don't depend on it (the image still differs by that
+  constant between builds).
+- **Tests:** `test_script` (`rhai -e` with `-smp 4`, the REPL, the
+  demos, the `rainbow` golden and the terminal back after a key, Ctrl-C
+  on serial and on the keyboard, also during `sleep`); ktests for the
+  functions, the operation cap, Ctrl-C, recursion and nesting on the
+  script stack, and a drawing script waiting for a key.
+- **Not yet:** scripts from files (M6), floats, scripts in user mode (M9),
+  a script running in the background.
 
 ## 7. Driver interface (planned, M3+)
 
