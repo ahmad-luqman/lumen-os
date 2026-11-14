@@ -1036,6 +1036,35 @@ off. A wake from another CPU queues the thread there and sends the
   than the console, pipes, variables and scripts, and a shell in user mode
   (M9).
 
+### Demos (built in M2)
+
+- **What:** `mandelbrot` and `life`, shell commands that draw on the
+  terminal's canvas (`term::canvas`: the pixels below the header, the
+  terminal paused) and give it back on a key typed on the console that ran
+  them. The arithmetic and the rules are `lumen-demo`'s (host-tested);
+  `kernel/src/demo.rs` draws them.
+- **Mandelbrot:** fixed point (`i64`, 28 fraction bits; the kernel has no
+  SSE), 64 iterations, the whole set fitted to the canvas. Drawn twice:
+  by the boot CPU alone, then by every online CPU, and both times printed.
+  The canvas is cut into 8-row bands dealt round-robin to the CPUs (band
+  `i` to slot `i % n`). Each other CPU gets a job through `smp::run_on`; a
+  job is a plain `fn()`, so the canvas, the view and the slots reach it
+  through statics, written before a `SEALED` flag the jobs spin on. The
+  boot CPU draws its own bands, waits for every job to finish (a CPU that
+  hasn't taken its job after 10 s has it taken back and its bands drawn
+  by the boot CPU), and clears the statics before the canvas can be
+  dropped. 1280x656 under TCG on four vCPUs: see the PR for times.
+- **Life:** 8-pixel cells on a grid whose outside is dead (nothing wraps),
+  only changed cells drawn, a status line under the grid (pattern,
+  generation, population). `life <pattern> <n>` steps exactly `n`
+  generations as fast as it can and holds the frame (the golden test);
+  without a count it runs at 20 generations a second until a key.
+- **Tests:** `cargo:lumen-demo`; `ktest:lumen_kernel::demo::every_cpu_rendered_rows`
+  (every online CPU draws rows, all rows once, the same pixels as one CPU,
+  no job left running); `test_demo` (goldens of the set and of a glider 40
+  generations on, the terminal drawn again after the key, `life` until a
+  key, its usage).
+
 ## 7. Driver interface (planned, M3+)
 
 Drivers are kernel modules behind traits whose methods are **messages**: an

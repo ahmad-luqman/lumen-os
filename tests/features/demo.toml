@@ -1,0 +1,26 @@
+# Features: demo. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Demo logic (lumen-demo, in the kernel with audit passing): the Mandelbrot set in fixed-point integers (agreeing with floating point but for boundary points, never overflowing) and its colours; Conway's Game of Life on a grid with a dead edge (gliders move, oscillators oscillate, the glider gun fires every 30 generations) and its seed patterns"
+milestone = "M2"
+tests = [
+    "cargo:lumen-demo",
+    "audit:flags",
+]
+
+[[feature]]
+name = "`mandelbrot` draws the set on the screen with the boot CPU alone, then with every CPU at once (row bands dealt round-robin, each CPU drawing some, the same pixels), prints both times, and gives the screen back on a key"
+milestone = "M2"
+tests = [
+    "scenario:test_demo::test_mandelbrot_golden",
+    "ktest:lumen_kernel::demo::every_cpu_rendered_rows",
+]
+
+[[feature]]
+name = "`life [pattern] [n]` runs Conway's Game of Life on the screen (glider, glider gun, lightweight spaceship, R-pentomino, acorn) with a status line: exactly n generations then held until a key, or 20 a second until a key; an unknown pattern lists them"
+milestone = "M2"
+tests = [
+    "scenario:test_demo::test_life_glider_golden",
+    "scenario:test_demo::test_life_runs_until_a_key",
+    "scenario:test_demo::test_life_usage_lists_the_patterns",
+]

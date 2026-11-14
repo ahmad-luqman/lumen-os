@@ -1,0 +1,9 @@
+[package]
+name = "lumen-demo"
+description = "no_std demo logic for the Lumen kernel: fixed-point Mandelbrot and Conway's Game of Life, host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

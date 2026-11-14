@@ -243,7 +243,6 @@ impl Screen {
 impl Screen {
     /// A [`Canvas`] gave the pixels back: clear what it drew (everything
     /// below the header) and draw every cell of the terminal again.
-    #[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
     fn resume(&mut self) {
         self.paused = false;
         let (w, h) = (self.fb.width(), self.fb.height());
@@ -265,7 +264,6 @@ impl Screen {
 /// below the header); drawing outside it does nothing. Its methods take
 /// `&self` and it is `Sync`, so several CPUs can draw on it at once (each
 /// its own pixels: two writing one pixel leave one of their colours).
-#[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
 pub struct Canvas {
     fb: Framebuffer,
     width: usize,
@@ -280,7 +278,6 @@ unsafe impl Sync for Canvas {}
 
 /// Take the pixels below the header (see [`Canvas`]); `None` without a
 /// terminal, after a crash report started, or while another canvas exists.
-#[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
 pub fn canvas() -> Option<Canvas> {
     with_screen(|s| {
         if s.paused {
@@ -296,7 +293,6 @@ pub fn canvas() -> Option<Canvas> {
     .flatten()
 }
 
-#[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
 impl Canvas {
     /// Width in pixels.
     pub fn width(&self) -> usize {
