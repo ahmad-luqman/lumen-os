@@ -97,11 +97,13 @@ def test_nx_data_crashes_cleanly(crash_report):
     assert any("shell::run" in f for f in frames) and frames[-1].startswith("_start"), report
 
 
-# Both shells are up (`shell::run`), the screen's on a thread of its own.
-SHELLS = r"INFO  shell: shells on serial and the screen; type 'help'\n"
-# `top`'s row for the screen's shell while it waits for a key (`render` in
-# kernel/src/shell/sysinfo.rs: name, id, CPU, state).
-SCREEN_SHELL_BLOCKED = re.compile(r"^  shell-screen +\d+ +\d+ +blocked ", re.MULTILINE)
+# `shell::run` logs which shells it starts, just before it spawns the
+# screen's on a thread of its own and runs the serial one: "shells on serial
+# and the screen", or "shell on serial (none on the screen: <why>)".
+SHELLS_STARTED = r"INFO  shell: shells? on serial[^\n]*\n"
+# `top`'s row for the screen's shell (`render` in kernel/src/shell/sysinfo.rs:
+# name, id, CPU, state).
+SCREEN_SHELL_ROW = re.compile(r"^  shell-screen +\d+ +\d+ +(?P<state>\w+) ", re.MULTILINE)
 
 HEAP_NUMBERS = ("mapped", "base", "used", "live", "free", "blocks", "largest")
 
@@ -121,39 +123,45 @@ def shell_heap(m) -> dict[str, int]:
     return heap
 
 
-def wait_until_screen_shell_waits(m) -> None:
-    """At the serial prompt, run `top 1` until it shows the screen's shell
-    blocked (waiting for a key); back at the prompt.
+def boot_settled(boot):
+    """Boot qemutest and wait at the serial prompt until the screen's shell
+    is blocked for a key: `top 1` (up to 10 runs) shows it `blocked`.
 
     `shell::run` spawns the screen's shell on a thread of its own and then
     runs the serial shell, so the serial prompt can come first. Until the
     screen's shell has drawn its first prompt (keeping the buffer `run_on`
     writes the editor's output into) and blocked in `keyboard::wait_key`
-    (taking a slot in the keyboard's wait queue), the heap isn't settled and
-    two `heap`s can differ. `WaitQueue::wait_until` marks it blocked and
-    queues it with interrupts off, and `spawn` put it on this shell's CPU,
-    so `top` can't see one without the other. `top` reads no keys from the
-    screen."""
+    (the keyboard's wait queue allocating its buffer, freed again when a key
+    wakes it; none come here), the heap isn't settled and two summaries can
+    differ. `WaitQueue::wait_until` marks it blocked and queues it with
+    interrupts off, and `spawn` put it on the serial shell's CPU (threads
+    stay on theirs), so `top` can't see one without the other. `top` polls
+    serial for its `q`, never the keyboard, so it can't wake the screen's
+    shell."""
+    m = boot("qemutest")
+    started = m.expect(SHELLS_STARTED, BOOT_TIMEOUT).group(0)
+    assert "shells on serial and the screen" in started, f"no shell on the screen: {started}"
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
+    seen = []
     for _ in range(10):
         start = len(m.output)
         m.send_line("top 1")
-        m.expect(r"top: done after 1 frames\n", 10)
-        blocked = SCREEN_SHELL_BLOCKED.search(m.output[start:])
+        done = m.expect(r"top: done after 1 frames\n", 10)
+        row = SCREEN_SHELL_ROW.search(m.output, start, done.start())
         m.expect(r"lumen> ")
-        if blocked:
-            return
-    raise AssertionError(f"the screen's shell never blocked for a key:\n{m.output[start:]}")
+        seen.append(row["state"] if row else "no shell-screen row")
+        if row and row["state"] == "blocked":
+            return m
+    raise AssertionError(f"the screen's shell never blocked for a key in 10 `top 1`s: {seen}")
 
 
 def crash_after_heap_summary(boot, kind: str) -> tuple[dict[str, int], str]:
     """`crash <kind>`: the heap summary it prints before doing its damage
     (the shell's own allocations for the command included), and the
     report."""
-    m = boot("qemutest")
-    m.expect(SHELLS, BOOT_TIMEOUT)
-    m.expect(r"lumen> ", BOOT_TIMEOUT)
-    # The screen's shell can't allocate between the summary and the report.
-    wait_until_screen_shell_waits(m)
+    # Once the screen's shell is blocked for a key, it can't allocate between
+    # the summary and the report.
+    m = boot_settled(boot)
     m.send_line(f"crash {kind}")
     before = heap_numbers(m.expect(r"heap: .*\n", 30).group(0))
     m.expect(re.escape(END), 30)
@@ -163,10 +171,7 @@ def crash_after_heap_summary(boot, kind: str) -> tuple[dict[str, int], str]:
 
 
 def test_heap_command_reports_usage(boot):
-    m = boot("qemutest")
-    m.expect(SHELLS, BOOT_TIMEOUT)
-    m.expect(r"lumen> ", BOOT_TIMEOUT)
-    wait_until_screen_shell_waits(m)
+    m = boot_settled(boot)
     heap = shell_heap(m)
     # What boot keeps (`acpi::Info`, for one) and the shells (their editors
     # and histories, the screen's thread and its slot in the keyboard's wait
