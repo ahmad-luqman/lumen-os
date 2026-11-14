@@ -4,7 +4,7 @@ This module is the single source of truth for how Lumen boots under QEMU:
 `make run`, `make debug` and every scenario test build their command line
 with `qemu_args`.
 
-`Machine` boots an ISO headless with serial on a pipe, then lets a test wait
+`Machine` boots an ISO headless with serial on a pipe (or none at all), then lets a test wait
 for output (`expect`, with a timeout, never fixed sleeps), type input
 (`send_line` on serial, `type_text` and `press` on the keyboard through QMP),
 take screenshots over QMP (`screendump`), and collect the exit
@@ -228,6 +228,7 @@ class Machine:
         *,
         trace_interrupts: bool = False,
         extra_args: Sequence[str] = (),
+        serial: bool = True,
     ):
         # Read once, before anything starts: a value timeout_scale() rejects fails
         # here, not in the first expect() or wait_exit(). (One so large that it
@@ -238,6 +239,11 @@ class Machine:
         self.trace_interrupts = trace_interrupts
         # Appended to the command line, e.g. ["-smp", "2"].
         self.extra_args = list(extra_args)
+        # False: no serial port at all (`-serial none`: q35 then has no COM1),
+        # so nothing from the guest arrives for expect() (QEMU's own messages
+        # still do); drive it with the keyboard and read the screen through
+        # screendump().
+        self.serial = serial
         self.proc: subprocess.Popen[bytes] | None = None
         self._buf = bytearray()
         self._cond = threading.Condition()
@@ -278,6 +284,7 @@ class Machine:
             qmp_socket=self.qmp_path,
             log_file=self.artifacts / "qemu.log",
             trace=trace,
+            serial="stdio" if self.serial else "none",
             extra=self.extra_args,
         )
 

@@ -70,11 +70,16 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
     `extra` is appended to QEMU's command line, e.g. `extra=["-smp", "2"]`;
     `cmdline` to the kernel's, e.g. `cmdline="lumen.keymap=de"`, in an ISO
     built for this test in its artifacts directory (so parallel tests don't
-    share one; `qemutest` and `ktest` only)."""
+    share one; `qemutest` and `ktest` only). `serial=False` boots without a
+    serial port (keyboard, screendumps and the exit code only)."""
     machines: list[Machine] = []
 
     def _boot(
-        variant: str = "qemutest", *, extra: Sequence[str] = (), cmdline: str | None = None
+        variant: str = "qemutest",
+        *,
+        extra: Sequence[str] = (),
+        cmdline: str | None = None,
+        serial: bool = True,
     ) -> Machine:
         iso = ISOS[variant]
         if not iso.exists():
@@ -86,7 +91,7 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
             subprocess.run(
                 [REPO_ROOT / "tools" / "mkiso.sh", KERNELS[variant], iso, *words], check=True
             )
-        m = Machine(iso, sub, trace_interrupts=True, extra_args=extra).start()
+        m = Machine(iso, sub, trace_interrupts=True, extra_args=extra, serial=serial).start()
         machines.append(m)
         return m
 

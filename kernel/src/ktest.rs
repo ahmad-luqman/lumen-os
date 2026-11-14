@@ -11,7 +11,7 @@
 //! test is caught by the crash reporter, which exits with `Crash`; the harness
 //! reports that test as failed and shows the crash report.
 
-use crate::arch::serial::SerialWriter;
+use crate::klog::LockedSerial;
 use core::fmt::{self, Write};
 
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by ktests
@@ -85,9 +85,11 @@ macro_rules! kassert_eq {
 }
 
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by ktests
-/// Print a TAP diagnostic line (`# ...`).
+/// Print a TAP diagnostic line (`# ...`), whole (under the log's line lock).
+/// So neither this nor `kassert!` may run inside `klog::with_line_lock`:
+/// the CPU would re-lock the line lock.
 pub fn diag(args: fmt::Arguments<'_>) {
-    let _ = writeln!(SerialWriter, "# {args}");
+    let _ = writeln!(LockedSerial, "# {args}");
 }
 
 #[cfg(feature = "ktest")]
@@ -108,7 +110,8 @@ fn registered() -> &'static [KTest] {
 #[cfg(feature = "ktest")]
 pub fn run_all() -> bool {
     let tests = registered();
-    let mut out = SerialWriter;
+    // Each line whole, under the log's line lock.
+    let mut out = LockedSerial;
     let _ = writeln!(out, "TAP version 14");
     let _ = writeln!(out, "1..{}", tests.len());
     let mut failed = 0;

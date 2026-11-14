@@ -46,7 +46,7 @@ mod term;
 mod time;
 mod trace;
 
-use log::{LevelFilter, info, warn};
+use log::{LevelFilter, debug, info, warn};
 use lumen_mm::stacks::{StackKind, StackRange};
 use trace::{BootPhase, Kind};
 
@@ -189,6 +189,13 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
         },
         None => warn!(target: "fb", "no framebuffer"),
     }
+    if !arch::serial::present() {
+        // Without serial only the screen's copy of the log remains: info and
+        // above, from the framebuffer on (debug, trace and earlier lines are
+        // lost).
+        warn!(target: "boot", "no serial port at COM1: logging to the screen only");
+    }
+    debug!(target: "serial", "COM1: {:?}", arch::serial::mode());
     ktrace!(Kind::BootPhase, BootPhase::Framebuffer);
     keyboard::init();
 

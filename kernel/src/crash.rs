@@ -182,6 +182,9 @@ fn enter(vector: u64, rip: u64) {
     let me = arch::cpu_index();
     match CRASHING.compare_exchange(0, me + 1, Ordering::SeqCst, Ordering::SeqCst) {
         Ok(_) => {
+            // Before anything is written: a CPU stopped in the loopback
+            // ktest would leave serial looping back to itself.
+            arch::serial::leave_loopback();
             // No drawing starts from here on: a CPU stopped while drawing
             // holds the screen's lock for good (a log line on the crash path
             // would wait for it forever), and the crash screen draws
@@ -193,6 +196,9 @@ fn enter(vector: u64, rip: u64) {
             STOPPING.store(true, Ordering::SeqCst);
             stop_others(me);
             STOPPING.store(false, Ordering::SeqCst);
+            // Again: a CPU in the loopback ktest may have entered loopback
+            // after the first call, then been stopped there.
+            arch::serial::leave_loopback();
         }
         // Another CPU is reporting: this is its stop NMI, or a crash of our
         // own that its report must not be mixed with (it names it).

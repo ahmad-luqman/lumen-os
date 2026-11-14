@@ -21,6 +21,7 @@ lumen-shell = { path = "crates/lumen-shell" }
 lumen-term = { path = "crates/lumen-term" }
 lumen-time = { path = "crates/lumen-time" }
 lumen-trace = { path = "crates/lumen-trace" }
+lumen-uart = { path = "crates/lumen-uart" }
 # 0.6.x needs nightly (#![feature(ptr_metadata)]); 0.5.0 is the newest stable-compatible release.
 limine = "=0.5.0"
 log = { version = "0.4", default-features = false }

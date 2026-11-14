@@ -5,7 +5,7 @@
 //! the screen, whichever console asked for it: the tests read serial.
 
 use super::Ctx;
-use crate::arch::{self, serial};
+use crate::arch;
 use alloc::string::String;
 use core::arch::asm;
 use core::fmt::Write;
@@ -38,7 +38,9 @@ struct Out;
 
 impl Write for Out {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        serial::write_bytes(s.as_bytes());
+        // Under the line lock, like every serial writer but the crash
+        // reporter (one lock per piece of a `write!`).
+        crate::klog::LockedSerial.write_str(s)?;
         crate::term::write_str(s);
         Ok(())
     }

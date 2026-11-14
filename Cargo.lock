@@ -56,6 +56,7 @@ dependencies = [
  "lumen-term",
  "lumen-time",
  "lumen-trace",
+ "lumen-uart",
  "noto-sans-mono-bitmap",
  "pc-keyboard",
  "rustc-demangle",
@@ -92,6 +93,10 @@ version = "0.0.1"
 
 [[package]]
 name = "lumen-trace"
+version = "0.0.1"
+
+[[package]]
+name = "lumen-uart"
 version = "0.0.1"
 
 [[package]]
