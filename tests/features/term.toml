@@ -34,9 +34,10 @@ tests = [
 ]
 
 [[feature]]
-name = "A command can take the pixels below the header (a canvas, one at a time, clipped, the header left alone): the terminal keeps its output undrawn meanwhile, and dropping the canvas clears it and draws the terminal again; the shell takes back a canvas a command left behind, which then draws nothing"
+name = "A command can take the pixels below the header (a canvas, one at a time, clipped, the header left alone): the terminal keeps its output undrawn meanwhile, and dropping the canvas clears it and draws the terminal again; the shell takes back a canvas a command left behind when it returns (never one a command on the other console holds), which then draws nothing"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::term::a_canvas_pauses_the_terminal_until_dropped",
-    "ktest:lumen_kernel::term::the_shell_takes_back_a_canvas_left_behind",
+    "ktest:lumen_kernel::term::a_canvas_is_taken_back_only_from_its_owner",
+    "ktest:lumen_kernel::shell::commands::a_command_s_canvas_is_taken_back_and_no_other",
 ]
