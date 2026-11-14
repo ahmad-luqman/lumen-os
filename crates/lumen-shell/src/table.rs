@@ -12,7 +12,8 @@ pub struct Command<T: 'static> {
     /// Its arguments, as help shows them after the name (`<n> [text]`; empty
     /// for none).
     pub usage: &'static str,
-    /// What it does, in a line.
+    /// What it does, in a line. Ending in `:`, the kernel's `help` lists
+    /// the words of its first argument after it.
     pub about: &'static str,
     pub run: T,
 }

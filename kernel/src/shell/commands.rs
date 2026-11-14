@@ -79,6 +79,11 @@ pub fn run(line: &str, ctx: &mut Ctx<'_>) {
             let _ = writeln!(ctx.out, "unknown command: {name} (try 'help')");
         }
     }
+    // A command that drew gives the screen back by dropping its canvas; one
+    // it left behind (kept in a static, leaked) would freeze the screen.
+    if crate::term::reclaim_canvas() {
+        log::warn!(target: "shell", "{name} left the screen paused; took it back");
+    }
 }
 
 /// The only argument as a number, if there is exactly one and it is one.
@@ -91,7 +96,9 @@ fn number<T: core::str::FromStr>(args: &[String]) -> Option<T> {
 
 /// Every command with its usage and what it does, then the keys. An
 /// `about` ending in `:` is followed by the words its first argument can
-/// be. Written in one write (made before it: see `Ctx::out`).
+/// be. Built in a `String` first (nothing may allocate while writing to the
+/// screen: see `Ctx::out`), then written in one write, so another CPU's log
+/// line can't land inside it.
 fn help(ctx: &mut Ctx<'_>, _: &[String]) {
     /// Where the descriptions start.
     const COLUMN: usize = 20;
@@ -99,12 +106,12 @@ fn help(ctx: &mut Ctx<'_>, _: &[String]) {
     for c in COMMANDS.0 {
         let start = text.len();
         let _ = write!(text, "  {} {}", c.name, c.usage);
-        let width = text.len() - start;
-        if width < COLUMN {
-            text.extend(core::iter::repeat_n(' ', COLUMN - width));
-        } else {
-            let _ = write!(text, "\n{:COLUMN$}", "");
+        let mut width = text.len() - start;
+        if width >= COLUMN {
+            text.push('\n');
+            width = 0;
         }
+        text.extend(core::iter::repeat_n(' ', COLUMN - width));
         text.push_str(c.about);
         if c.about.ends_with(':') {
             for word in c.args.first().copied().unwrap_or_default() {
@@ -200,7 +207,7 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
                 Some(t) => writeln!(
                     out,
                     "term: {}x{}, cursor ({}, {}){}, scrollback {}/{} lines, view {} lines up, \
-                     top row \"{}\", {} cells drawn",
+                     top row \"{}\", {} cells drawn{}",
                     t.cols,
                     t.rows,
                     t.cursor.col,
@@ -210,7 +217,8 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
                     t.capacity,
                     t.view,
                     t.top_row,
-                    t.cells_drawn
+                    t.cells_drawn,
+                    if t.paused { ", paused (a command is drawing)" } else { "" }
                 ),
                 None => writeln!(out, "{NONE}"),
             };
@@ -371,7 +379,7 @@ crate::ktest!(
     fn help_lists_every_command_once() {
         // Every command in the table has a line in `help`, and no name is
         // in the table twice (`find` would take the first).
-        use crate::kassert;
+        use crate::{kassert, kassert_eq};
         let mut console = super::Captured::default();
         let history = lumen_shell::History::new(0);
         help(&mut Ctx { out: &mut console, ansi: false, history: &history }, &[]);
@@ -382,7 +390,20 @@ crate::ktest!(
             if !(helped && once) {
                 crate::ktest::diag(format_args!("{}: in help {helped}, once {once}", c.name));
             }
-            kassert!(helped && once);
+            kassert!(helped && once && !c.about.is_empty());
+        }
+        // The layout: descriptions from column 20, a usage too long for that
+        // wraps to it, and an `about` ending in `:` lists its first
+        // argument's words.
+        let lines: alloc::vec::Vec<&str> = text.lines().collect();
+        kassert!(lines.contains(&"  echo <text>       print text"));
+        let crash = lines.iter().position(|l| *l == "  crash <kind> [cpu|thread]").ok_or("no crash line")?;
+        let kinds =
+            alloc::format!("{:20}deliberate fault (on that CPU, or in a new thread): {}", "", crash::KINDS.join(" "));
+        kassert_eq!(lines.get(crash + 1).copied(), Some(kinds.as_str()));
+        for c in COMMANDS.0.iter().filter(|c| c.name.len() + c.usage.len() + 3 < 20) {
+            let line = alloc::format!("{:20}{}", alloc::format!("  {} {}", c.name, c.usage), c.about);
+            kassert!(text.starts_with(&line) || text.contains(&alloc::format!("\n{line}")));
         }
         Ok(())
     }

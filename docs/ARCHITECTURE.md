@@ -915,8 +915,8 @@ off. A wake from another CPU queues the thread there and sends the
   exception in the middle) doesn't wait for itself: its line is left off
   the screen (nothing on that path logs to the screen today; not tested).
   No drawing starts once a crash report starts (`crash::enter` stops the
-  terminal; one under way on another CPU runs until that CPU is stopped;
-  not tested), and the crash screen draws straight to the
+  terminal and makes any canvas inert; one under way on another CPU runs
+  until that CPU is stopped; not tested), and the crash screen draws straight to the
   pixels, not through the terminal, its lock or the heap (a scenario
   checks its banner after an invalid opcode; drawing it with a corrupt heap
   or the terminal's lock held is not tested).
@@ -930,7 +930,23 @@ off. A wake from another CPU queues the thread there and sends the
   level: serial only, the screen shows up to `info`); a key the line
   editor takes returns it to the bottom (a ktest checks that output keeps
   a scrolled-back view on its lines; the shell takes keys only between
-  commands, so a scenario can't scroll back while a command writes).
+  commands or while a command polls for them, so a scenario can't scroll
+  back while a command writes). The view doesn't move while a canvas has
+  the screen.
+- **Canvas:** `term::canvas()` gives one command at a time the pixels
+  below the header (`Canvas`: `put`, `fill_rect`, `clear`, `text`, in its
+  own coordinates, clipped; `Err(CanvasError)` says why there is none: no
+  terminal, a crash report, or another command has it). While it exists
+  the terminal keeps taking output but draws nothing; dropping it clears
+  the canvas and draws every cell again (a ktest checks the pause, the
+  header left alone, the clipping, and the redraw: every cell, text from
+  before and during the pause in ink). Pixel stores are relaxed atomics
+  and `Canvas` is `Sync`, so several CPUs can draw at once (tested by its
+  first multi-CPU user). Each canvas carries an epoch: after a crash report
+  starts, or once the shell takes back a canvas its command left behind
+  (`reclaim_canvas`, after every command, with a warning), it draws
+  nothing and its drop leaves the terminal alone (a ktest checks the
+  taking back; the crash case is not tested).
 - **Not yet:** virtual terminals (Alt+F1 to F4, ROADMAP M2), a font with
   more than Basic Latin, underline and other SGR attributes, the
   alternate screen, origin mode, left and right margins, and resizing.
@@ -1007,9 +1023,14 @@ off. A wake from another CPU queues the thread there and sends the
   sequence), so a log line can't land inside one (not tested on its own).
   Each key's output is written to the console in
   one write, so on the screen a log line can't land in the middle of a
-  redraw (not tested on its own).
-- **Commands:** `help` (a ktest checks it has a line for each command
-  in the table, and no name is there twice), `echo` (its words joined by
+  redraw (not tested on its own). A running command reads keys from its
+  console with `Ctx::poll_key` (never blocks) and `Ctx::wait_key`
+  (`Console::try_key`/`read_key`; tested by their first users).
+- **Commands:** each `COMMANDS` row carries its usage and a line of help
+  (`lumen_shell::Command::usage`/`about`; an `about` ending in `:` is
+  followed by its first argument's words), and `help` is generated from
+  them (a ktest checks it has a line for each command in the table, no
+  name is there twice, and the layout), `echo` (its words joined by
   single spaces), `int3`, `crash <kind> [cpu|thread]` (the thread is
   `shell-crash`), `trace [n]`, `heap`, `ticks`, `kbd`, `term [text]`,
   `clear`, `colors`, `seq`, `sleep`, `uptime`, `clocks`, `exit` (kmon's;
