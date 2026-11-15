@@ -5,9 +5,9 @@ This module is the single source of truth for how Lumen boots under QEMU:
 with `qemu_args`.
 
 `Devices` picks the virtio devices a `Machine` attaches (none by default):
-tablet, keyboard, rng, sound (into a wav file), blk (a scratch disk), net
-(user networking with TCP ports forwarded from the host) and 9p (a shared
-host folder). `Machine(cpu=...)` sets the CPU model (`max` for RDRAND).
+tablet, keyboard, rng, sound (into a wav file), blk (a scratch disk or a
+kept image), net (user networking with TCP ports forwarded from the host)
+and 9p (a shared host folder). `Machine(cpu=...)` sets the CPU model.
 
 `Machine` boots an ISO headless with serial on a pipe (or none at all), then lets a test wait
 for output (`expect`, with a timeout, never fixed sleeps), type input
@@ -177,8 +177,10 @@ class QemuOptions:
     # 0 that comes with a guest-shutdown event (see EXIT_SUCCESS). True: a
     # reset boots the machine again (the reboot scenarios).
     reboot: bool = False
-    # `-cpu` (None: QEMU's default model, qemu64, which has no RDRAND; `max`
-    # has every feature the accelerator can give, under TCG and KVM alike).
+    # `-cpu` (None: QEMU's default model, qemu64, which has no RDRAND). Use
+    # `max`, not `host`: `host` is fatal under TCG, and CI re-runs failed
+    # scenarios under TCG. Under KVM `max` is the host CPU's features, so
+    # RDRAND only if the host has it.
     cpu: str | None = None
     # Virtio devices, all PCI (see `Devices`; `Machine` fills these in).
     virtio_tablet: bool = False
@@ -188,16 +190,26 @@ class QemuOptions:
     sound_wav: Path | None = None
     # virtio-blk backed by this raw image (read-write).
     blk_image: Path | None = None
-    # virtio-net on user networking, each (host port, guest port) a TCP
-    # forward from the host's 127.0.0.1. None: no virtio-net; (): no forwards.
-    net_forwards: tuple[tuple[int, int], ...] | None = None
+    # virtio-net on user networking: guest TCP port -> host port forwarded
+    # from the host's 127.0.0.1. None: no virtio-net; {}: no forwards.
+    net_forwards: dict[int, int] | None = None
     # virtio-9p sharing this host folder, mount tag `SHARE_TAG`.
     share_dir: Path | None = None
     extra: list[str] = field(default_factory=list)
 
 
-# The 9p mount tag the guest looks for (`QemuOptions.share_dir`).
+# The 9p mount tag the device advertises (a guest driver mounts by it).
 SHARE_TAG = "lumen-share"
+# Each device's qdev id, so QMP's `query-pci` (`qdev_id`) names it.
+DEVICE_IDS = {
+    "tablet": "lumen-tablet",
+    "keyboard": "lumen-keyboard",
+    "rng": "lumen-rng",
+    "sound": "lumen-sound",
+    "blk": "lumen-blk",
+    "net": "lumen-nic",
+    "share": "lumen-9p",
+}
 
 
 def _opt(value: object) -> str:
@@ -207,69 +219,125 @@ def _opt(value: object) -> str:
 
 
 def device_args(o: QemuOptions) -> list[str]:
-    """The virtio devices' part of the command line. Each device has a
-    `lumen-*` id, so QMP's `query-pci` names it (`qdev_id`)."""
+    """The virtio devices' part of the command line (ids from `DEVICE_IDS`)."""
+    ids = DEVICE_IDS
     args: list[str] = []
     if o.virtio_tablet:
-        args += ["-device", "virtio-tablet-pci,id=lumen-tablet"]
+        args += ["-device", f"virtio-tablet-pci,id={ids['tablet']}"]
     if o.virtio_keyboard:
-        args += ["-device", "virtio-keyboard-pci,id=lumen-keyboard"]
+        args += ["-device", f"virtio-keyboard-pci,id={ids['keyboard']}"]
     if o.virtio_rng:
-        args += ["-device", "virtio-rng-pci,id=lumen-rng"]
+        args += ["-device", f"virtio-rng-pci,id={ids['rng']}"]
     if o.sound_wav:
+        # QEMU creates the wav file when the device is realized and leaves
+        # the header's lengths at 0 (seen with 11.1 after debug-exit, QMP
+        # `quit` and SIGTERM): readers take the length from the file size.
+        # `streams=1`: the output stream only. The wav backend has no capture
+        # side (QEMU warns about the input stream otherwise), and playback is
+        # all we need.
         args += [
             "-audiodev", f"wav,id=lumen-audio,path={_opt(o.sound_wav)}",
-            "-device", "virtio-sound-pci,id=lumen-sound,audiodev=lumen-audio",
+            "-device", f"virtio-sound-pci,id={ids['sound']},audiodev=lumen-audio,streams=1",
         ]  # fmt: skip
     if o.blk_image:
         args += [
             "-drive", f"if=none,id=lumen-disk,format=raw,file={_opt(o.blk_image)}",
-            "-device", "virtio-blk-pci,id=lumen-blk,drive=lumen-disk",
+            "-device", f"virtio-blk-pci,id={ids['blk']},drive=lumen-disk",
         ]  # fmt: skip
     if o.net_forwards is not None:
-        forwards = "".join(f",hostfwd=tcp:127.0.0.1:{h}-:{g}" for h, g in o.net_forwards)
-        # `romfile=` (empty): no iPXE option ROM, so the firmware doesn't
-        # spend boot time on network boot.
+        # The empty guest address is slirp's default, 10.0.2.15: the first
+        # DHCP lease, which the guest must take for the forwards to reach it.
+        forwards = "".join(
+            f",hostfwd=tcp:127.0.0.1:{host}-:{guest}" for guest, host in o.net_forwards.items()
+        )
+        # `romfile=` (empty): no iPXE option ROM is loaded; nothing here boots
+        # from the network.
         args += [
             "-netdev", f"user,id=lumen-net{forwards}",
-            "-device", "virtio-net-pci,id=lumen-nic,netdev=lumen-net,romfile=",
+            "-device", f"virtio-net-pci,id={ids['net']},netdev=lumen-net,romfile=",
         ]  # fmt: skip
     if o.share_dir:
-        # security_model=none: files are the QEMU user's, and the guest's
-        # chown/chmod failures are ignored (no root needed on the host).
+        # security_model=none: no root needed on the host. Files are the QEMU
+        # user's; only ownership failures when the guest creates a file are
+        # ignored (an explicit chown from the guest still fails), and a chmod
+        # applies to the host's file.
         args += [
             "-fsdev", f"local,id=lumen-fs,path={_opt(o.share_dir)},security_model=none",
-            "-device", f"virtio-9p-pci,id=lumen-9p,fsdev=lumen-fs,mount_tag={SHARE_TAG}",
+            "-device",
+            f"virtio-9p-pci,id={ids['share']},fsdev=lumen-fs,mount_tag={SHARE_TAG}",
         ]  # fmt: skip
     return args
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 @dataclass(frozen=True)
 class Devices:
     """The virtio devices a `Machine` attaches (none by default). Their
-    files live in the machine's artifacts directory: `Machine.wav_path`,
-    `Machine.blk_image`, `Machine.share_dir`; forwarded ports are in
-    `Machine.forwards` (guest port -> host port)."""
+    files are `Machine.wav_path`, `Machine.blk_image` and `Machine.share_dir`
+    (in the machine's artifacts directory, except an image given as
+    `blk_image`); forwarded ports are `Machine.forwards` (guest port -> host
+    port). `test_pci::test_boots_with_every_virtio_device` boots `every()`."""
 
     tablet: bool = False
     keyboard: bool = False
     rng: bool = False
     # virtio-sound, recorded to `Machine.wav_path`.
     sound: bool = False
-    # virtio-blk on a zero-filled (sparse) scratch image of this many MiB.
+    # virtio-blk on a scratch image of this many MiB, zero-filled again on
+    # every start().
     blk_mib: int | None = None
+    # virtio-blk on this existing raw image, used as it is (never zeroed), so
+    # a second boot sees what the first wrote. Not with `blk_mib`.
+    blk_image: Path | None = None
     # virtio-net on user networking (implied by `forward`).
     net: bool = False
     # Guest TCP ports reachable from the host, each on a free host port.
     forward: tuple[int, ...] = ()
-    # virtio-9p sharing a fresh, empty folder, `Machine.share_dir`.
+    # virtio-9p sharing a folder, `Machine.share_dir` (empty when the
+    # artifacts directory is fresh, as scenarios' are).
     share: bool = False
+
+    def __post_init__(self) -> None:
+        if self.blk_mib is not None and not (_is_int(self.blk_mib) and self.blk_mib > 0):
+            raise ValueError(f"blk_mib={self.blk_mib!r}: expected a whole number of MiB above 0")
+        if self.blk_image is not None:
+            if self.blk_mib is not None:
+                raise ValueError(
+                    "blk_mib and blk_image: give one (a fresh image or an existing one)"
+                )
+            object.__setattr__(self, "blk_image", Path(self.blk_image))
+        forward = tuple(self.forward)
+        for port in forward:
+            if not (_is_int(port) and 1 <= port <= 65535):
+                raise ValueError(f"forward={forward!r}: {port!r} is not a TCP port (1 to 65535)")
+        if len(set(forward)) != len(forward):
+            raise ValueError(f"forward={forward!r}: a port is forwarded twice")
+        object.__setattr__(self, "forward", forward)
+
+    @property
+    def wants_blk(self) -> bool:
+        return self.blk_mib is not None or self.blk_image is not None
+
+    @property
+    def wants_net(self) -> bool:
+        return self.net or bool(self.forward)
 
     @classmethod
     def every(cls) -> Devices:
-        """Every device the harness knows (the smoke scenario boots them all)."""
+        """Every device the harness knows (`blk_image` is the alternative to
+        `blk_mib`, so it stays off)."""
         return cls(
-            tablet=True, keyboard=True, rng=True, sound=True, blk_mib=16, forward=(80,), share=True
+            tablet=True,
+            keyboard=True,
+            rng=True,
+            sound=True,
+            blk_mib=16,
+            net=True,
+            forward=(80,),
+            share=True,
         )
 
 
@@ -277,12 +345,25 @@ class Devices:
 NO_DEVICES = Devices()
 
 
-def free_port() -> int:
-    """A TCP port on 127.0.0.1 that nothing listens on right now (the OS
-    picks it; QEMU binds it moments later)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def free_ports(count: int) -> list[int]:
+    """`count` distinct TCP ports on 127.0.0.1 that nothing listens on right
+    now (the OS picks them; every socket stays open until all are picked, so
+    no two are the same). Another process may still take one before QEMU
+    binds it: `Machine.start` retries once if QEMU says so."""
+    sockets = []
+    try:
+        for _ in range(count):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sockets.append(s)
+            s.bind(("127.0.0.1", 0))
+        return [s.getsockname()[1] for s in sockets]
+    finally:
+        for s in sockets:
+            s.close()
+
+
+# What QEMU prints when it can't bind a forwarded host port.
+HOSTFWD_FAILED = "Could not set up host forwarding rule"
 
 
 def qemu_args(o: QemuOptions) -> list[str]:
@@ -374,15 +455,11 @@ class Machine:
         self.serial = serial
         # True: a reset boots the machine again instead of ending QEMU.
         self.reboot = reboot
-        self.devices = devices
+        self._devices = devices
         self.cpu = cpu
-        # Where the devices' files go (created by start()). The wav file is
-        # QEMU's to write: its header gets the final sizes when QEMU exits.
-        self.wav_path = self.artifacts / "audio.wav"
-        self.blk_image = self.artifacts / "disk.img"
-        self.share_dir = self.artifacts / "share"
-        # Guest TCP port -> the host port forwarded to it (on 127.0.0.1).
-        self.forwards = {guest: free_port() for guest in devices.forward}
+        # Guest TCP port -> the host port forwarded to it (on 127.0.0.1),
+        # picked by start() just before QEMU starts (see `_pick_forwards`).
+        self.forwards: dict[int, int] = {}
         self.proc: subprocess.Popen[bytes] | None = None
         self._buf = bytearray()
         self._cond = threading.Condition()
@@ -397,15 +474,64 @@ class Machine:
         # pid: parallel pytest-xdist workers; counter: machines in one process.
         self.qmp_path = self._sock_dir / f"lumen-qmp-{os.getpid()}-{next(_machine_ids)}.sock"
 
+    # -- devices ---------------------------------------------------------
+    @property
+    def devices(self) -> Devices:
+        """The devices this machine attaches (fixed when it is created)."""
+        return self._devices
+
+    @property
+    def wav_path(self) -> Path:
+        """Where virtio-sound's output goes (QEMU writes it; see `device_args`)."""
+        if not self._devices.sound:
+            raise AttributeError("no virtio-sound: boot with Devices(sound=True)")
+        return self.artifacts / "audio.wav"
+
+    @property
+    def blk_image(self) -> Path:
+        """virtio-blk's raw image: the one given as `Devices.blk_image`, or the
+        scratch image start() makes for `Devices.blk_mib`."""
+        if self._devices.blk_image is not None:
+            return self._devices.blk_image
+        if self._devices.blk_mib is None:
+            raise AttributeError(
+                "no virtio-blk: boot with Devices(blk_mib=...) or Devices(blk_image=...)"
+            )
+        return self.artifacts / "disk.img"
+
+    @property
+    def share_dir(self) -> Path:
+        """The host folder virtio-9p shares."""
+        if not self._devices.share:
+            raise AttributeError("no virtio-9p: boot with Devices(share=True)")
+        return self.artifacts / "share"
+
+    def _pick_forwards(self) -> None:
+        """Pick a free host port for each forwarded guest port, all distinct."""
+        guests = self._devices.forward
+        self.forwards = dict(zip(guests, free_ports(len(guests)), strict=True))
+
     # -- lifecycle -------------------------------------------------------
     def start(self) -> Self:
         self.artifacts.mkdir(parents=True, exist_ok=True)
-        self.qmp_path.unlink(missing_ok=True)
-        if self.devices.blk_mib is not None:
+        if self._devices.blk_mib is not None:
             with open(self.blk_image, "wb") as disk:
-                disk.truncate(self.devices.blk_mib << 20)
-        if self.devices.share:
+                disk.truncate(self._devices.blk_mib << 20)
+        if self._devices.share:
             self.share_dir.mkdir(exist_ok=True)
+        self._launch()
+        # Another process can take a forwarded host port between picking it
+        # and QEMU binding it; QEMU then exits at once. Pick again, once.
+        if self.forwards and self._forwarding_failed():
+            self.close()
+            self._buf = bytearray()
+            self._pos = 0
+            self._launch()
+        return self
+
+    def _launch(self) -> None:
+        self.qmp_path.unlink(missing_ok=True)
+        self._pick_forwards()
         opts = self.options(fresh_vars(self.artifacts / "OVMF_VARS.fd"))
         args = qemu_args(opts)
         (self.artifacts / "cmdline.txt").write_text(" ".join(args) + "\n")
@@ -417,7 +543,27 @@ class Machine:
         )
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
-        return self
+
+    def _forwarding_failed(self, timeout: float = 30) -> bool:
+        """Whether QEMU exited because it couldn't bind a forwarded port.
+        QEMU answers QMP only once every backend is set up (the forwards
+        among them), so a QMP connection means they're bound. A failed QEMU
+        exits within milliseconds but may leave its socket file behind, so
+        this watches the process too, not only the socket."""
+        assert self.proc
+        wait, _ = self._scaled(timeout)
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline and self.proc.poll() is None:
+            try:
+                self._qmp = QmpClient.connect(self.qmp_path, timeout=2)
+                return False
+            except (QmpError, OSError):
+                continue
+        if self.proc.poll() is None:
+            return False  # still starting: let the test's own waits report it
+        if self._reader:
+            self._reader.join(timeout=5)
+        return HOSTFWD_FAILED in self.output
 
     def options(self, vars_file: Path) -> QemuOptions:
         """How start() runs QEMU (separate so the harness tests can check it)."""
@@ -436,12 +582,8 @@ class Machine:
             virtio_keyboard=d.keyboard,
             virtio_rng=d.rng,
             sound_wav=self.wav_path if d.sound else None,
-            blk_image=self.blk_image if d.blk_mib is not None else None,
-            net_forwards=(
-                tuple((host, guest) for guest, host in self.forwards.items())
-                if d.net or d.forward
-                else None
-            ),
+            blk_image=self.blk_image if d.wants_blk else None,
+            net_forwards=dict(self.forwards) if d.wants_net else None,
             share_dir=self.share_dir if d.share else None,
             extra=self.extra_args,
         )
@@ -462,6 +604,8 @@ class Machine:
             self._cond.notify_all()
 
     def close(self) -> None:
+        if self._devices.sound and self.proc and self.proc.poll() is None:
+            self._quit()
         if self._qmp:
             self._qmp.close()
             self._qmp = None
@@ -474,6 +618,17 @@ class Machine:
             self._serial_log.close()
         if hasattr(self, "qmp_path"):
             self.qmp_path.unlink(missing_ok=True)
+
+    def _quit(self, timeout: float = 5) -> None:
+        """Ask QEMU to quit (QMP `quit`) and wait for it: unlike a kill, that
+        lets the wav audiodev write out the samples it buffered (a kill
+        leaves audio.wav empty). close() kills QEMU if this doesn't end it."""
+        assert self.proc
+        try:
+            self.qmp().command("quit")
+            self.proc.wait(timeout=timeout)
+        except (QmpError, OSError, subprocess.TimeoutExpired):
+            pass
 
     def __enter__(self) -> Self:
         return self.start()

@@ -129,7 +129,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Virtio device options (tablet, keyboard, rng, sound into a wav file, blk on a scratch image, user net with forwarded host ports, 9p host folder) and the CPU model, all off by default; QEMU boots the kernel with every one attached"
+name = "Virtio device options (tablet, keyboard, rng, sound on QEMU's wav audiodev, blk on a scratch or kept image, user net with forwarded host ports, a 9p host folder option) and the CPU model, all off by default; QEMU starts with every one attached and lists them, and the kernel boots"
 milestone = "M3"
 tests = [
     "harness:test_devices::*",

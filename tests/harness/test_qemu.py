@@ -16,17 +16,13 @@ from lumen_harness.__main__ import find_gdb, gdb_binary, gdb_command
 from lumen_harness.qemu import (
     ExpectTimeout,
     Machine,
-    QemuOptions,
     ovmf_vars_template,
     ovmf_version,
     qemu_args,
     qemu_version,
     timeout_scale,
 )
-
-
-def opts(**kw):
-    return QemuOptions(iso=Path("x.iso"), vars_file=Path("v.fd"), accel="tcg", **kw)
+from qemu_fakes import fake_qemu, opts
 
 
 def test_headless_run_keeps_display_none_without_monitor():
@@ -111,13 +107,6 @@ def test_live_machines_never_share_a_qmp_socket(tmp_path):
     paths = {m.qmp_path for m in machines}
     assert len(paths) == 3
     assert all(f"-{os.getpid()}-" in p.name for p in paths)
-
-
-def fake_qemu(tmp_path: Path, script: str, name: str = "fake-qemu") -> Path:
-    exe = tmp_path / name
-    exe.write_text("#!/bin/sh\n" + script + "\n")
-    exe.chmod(0o755)
-    return exe
 
 
 def test_qemu_version_is_the_first_non_blank_line(tmp_path):
