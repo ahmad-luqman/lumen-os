@@ -253,7 +253,7 @@ pub const IOAPIC_LAST: u8 = 0x8f;
 pub const MSI_BASE: u8 = 0x90;
 /// The last MSI vector.
 pub const MSI_LAST: u8 = 0xef;
-/// Free: no source uses 0x30-0x3e (a ktest raises 0x30 by `int`).
+/// Free: no source uses 0x30-0x3e (ktests raise 0x30 and 0x31 by `int`).
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
 pub const UNUSED: u8 = 0x30;
 /// An IPI that only wakes its CPU (`smp::run_on`): handled by an EOI.
@@ -275,6 +275,8 @@ const _: () = assert!(
         && MSI_BASE < MSI_LAST
         && MSI_LAST < LAPIC_ERROR
         && LAPIC_ERROR < SPURIOUS
+        && PIC_LAST - PIC_BASE == 15
+        && PIC_LAST < UNUSED
 );
 // Room for every input of q35's I/O APIC (24), and 96 MSI vectors (section 7
 // of ARCHITECTURE.md).
@@ -286,8 +288,7 @@ const _: () = assert!(IOAPIC_LAST - IOAPIC_BASE + 1 >= 24 && MSI_LAST - MSI_BASE
 static TICKS: [AtomicU64; super::percpu::MAX_CPUS] = [const { AtomicU64::new(0) }; super::percpu::MAX_CPUS];
 /// Spurious interrupts (local APIC, or 8259 IRQ 7 or 15) taken.
 static SPURIOUS_IRQS: AtomicU64 = AtomicU64::new(0);
-/// Interrupts on vectors nothing handles, taken (each vector reported the
-/// first time, then at its 1024th, 2048th, 4096th...: [`unexpected`]).
+/// Interrupts on vectors nothing handles, taken ([`unexpected`]).
 static UNEXPECTED_IRQS: AtomicU64 = AtomicU64::new(0);
 /// Local APIC error interrupts taken.
 static LAPIC_ERRORS: AtomicU64 = AtomicU64::new(0);
@@ -462,24 +463,13 @@ fn unexpected(frame: &TrapFrame) {
     crate::ktrace!(crate::trace::Kind::Exception, frame.vector, frame.rip, 0);
     UNEXPECTED_IRQS.fetch_add(1, Ordering::Relaxed);
     let n = UNEXPECTED_ON[usize::from(v)].fetch_add(1, Ordering::Relaxed) + 1;
-    if n != 1 && !(n >= 1024 && n.is_power_of_two()) {
-        return;
-    }
-    let rip = frame.rip;
-    let so_far = Repeats(n);
-    if (MSI_BASE..=MSI_LAST).contains(&v) {
-        log::error!(target: "irq", "interrupt on MSI vector {v:#x}, which no device has claimed (rip {rip:#x}){so_far}; ignored");
-    } else {
-        log::warn!(target: "irq", "unexpected interrupt on vector {v:#x} (rip {rip:#x}){so_far}; ignored");
-    }
-}
-
-/// How many times a vector has come, for a report after its first.
-struct Repeats(u64);
-
-impl core::fmt::Display for Repeats {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        if self.0 > 1 { write!(f, ", {} so far", self.0) } else { Ok(()) }
+    if n == 1 || (n >= 1024 && n.is_power_of_two()) {
+        let rip = frame.rip;
+        if (MSI_BASE..=MSI_LAST).contains(&v) {
+            log::error!(target: "irq", "interrupt on MSI vector {v:#x}, which no device has claimed (rip {rip:#x}, #{n}); ignored");
+        } else {
+            log::warn!(target: "irq", "unexpected interrupt on vector {v:#x} (rip {rip:#x}, #{n}); ignored");
+        }
     }
 }
 
@@ -493,9 +483,7 @@ impl core::fmt::Display for Repeats {
 /// here only when this one runs again); a local APIC error is counted and
 /// logged with its status (on the 1st, 2nd, 4th, 8th... one, and whenever a
 /// new status bit appears); an I/O APIC vector runs its handler ([`set_irq_handler`]; one with none
-/// is unexpected); an MSI vector is unexpected (reported as an error: no
-/// device may send one yet; it keeps its own arm for #96's handlers);
-/// anything else is unexpected: traced, counted and reported
+/// is unexpected); an MSI vector, and anything else, is unexpected
 /// ([`unexpected`]). Interrupts are off throughout (every gate is an interrupt
 /// gate).
 #[unsafe(no_mangle)]

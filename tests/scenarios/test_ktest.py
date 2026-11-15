@@ -39,6 +39,10 @@ def test_in_kernel_tests_pass(boot):
         assert out.count(line) == 1, f"MSI vector {vector} not reported exactly once as an error"
     # The last I/O APIC vector (no handler) is still a plain warning.
     assert out.count("WARN  irq: unexpected interrupt on vector 0x8f") == 1, "0x8f not a warning"
+    # `an_unexpected_storm_is_reported_sparsely` raises 0x31 2048 times:
+    # reported at the 1st, 1024th and 2048th only.
+    storm = re.findall(r"unexpected interrupt on vector 0x31 \(rip 0x[0-9a-f]+, #(\d+)\)", out)
+    assert storm == ["1", "1024", "2048"], f"0x31 storm reports: {storm}"
     # Issue #3: the trace cost per event is printed as a TAP diagnostic.
     assert re.search(r"^# trace: \d+ TSC ticks per event", out, re.MULTILINE), (
         "no trace cost diagnostic"

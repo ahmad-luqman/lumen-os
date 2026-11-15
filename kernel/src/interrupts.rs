@@ -406,12 +406,30 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn an_unexpected_storm_is_reported_sparsely() {
+        // 2048 interrupts on a free vector: reported at the 1st, 1024th and
+        // 2048th only (test_ktest counts the lines), each counted.
+        use crate::arch::idt;
+        use crate::kassert_eq;
+        const V: u8 = idt::UNUSED + 1;
+        let before = idt::strays().unexpected;
+        for _ in 0..2048 {
+            // SAFETY: a software interrupt on a vector the dispatcher
+            // handles and returns from; the entry stub saves every register.
+            unsafe { core::arch::asm!("int {v}", v = const V) };
+        }
+        kassert_eq!(idt::strays().unexpected, before + 2048);
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn msi_vector_delivered_by_the_apic_is_eoid() {
         // A fixed self-IPI on an MSI vector arrives like a device's message
         // would: through the local APIC, so the dispatcher must EOI it (with
-        // the EOI missing it stays in service and blocks the timer and every
-        // lower vector). Nothing claims MSI vectors yet, so it is reported
-        // as an error once.
+        // the EOI missing it stays in service and blocks every vector up to
+        // 0x9f, its priority class and below, the timer included). Nothing
+        // claims MSI vectors yet, so it is reported as an error.
         use crate::arch::{apic, idt};
         use crate::{kassert, kassert_eq};
         const V: u8 = idt::MSI_BASE + 1;

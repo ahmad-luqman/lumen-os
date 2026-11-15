@@ -37,11 +37,12 @@ tests = [
 ]
 
 [[feature]]
-name = "Vector map with an MSI range (0x90-0xef, the I/O APIC keeping 0x50-0x8f): an MSI vector nothing claims is reported as an error, EOI'd, not fatal"
+name = "Vector map with an MSI range (0x90-0xef, the I/O APIC keeping 0x50-0x8f): an MSI vector nothing claims is reported as an error, EOI'd, not fatal; an unexpected vector is reported at its 1st, 1024th, 2048th... interrupt"
 milestone = "M3"
 tests = [
     "ktest:lumen_kernel::interrupts::device_vectors_are_not_fatal",
     "ktest:lumen_kernel::interrupts::msi_vector_delivered_by_the_apic_is_eoid",
+    "ktest:lumen_kernel::interrupts::an_unexpected_storm_is_reported_sparsely",
     "ktest:lumen_kernel::arch::x86_64::idt::vector_map_boundaries",
     "scenario:test_ktest::test_in_kernel_tests_pass",
 ]
