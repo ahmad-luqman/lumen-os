@@ -116,7 +116,7 @@ pub static COMMANDS: Table<Run> = Table(&[
         name: "lspci",
         args: &[],
         usage: "",
-        about: "the PCI functions found at boot: address, vendor and device ids, class, name",
+        about: "the PCI functions found at boot: address, vendor and device ids, class, name, driver",
         run: sysinfo::lspci,
     },
     Command {

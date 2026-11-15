@@ -18,9 +18,10 @@
 //!    controllers (8259s masked, local APIC on, I/O APIC inputs masked), the
 //!    TSC and local APIC timer calibrated, interrupts on, the scheduler
 //!    started on every CPU (`kmain`'s context becomes the `main` thread);
-//!    then the framebuffer and its terminal, the PS/2 keyboard, `boot
-//!    complete` and the boot timeline, then either the in-kernel tests
-//!    (`--features ktest`) or the shells (`shell::run`).
+//!    then the framebuffer and its terminal, the PS/2 keyboard, the drivers
+//!    (`drivers::probe_all`: each PCI function offered to the driver
+//!    table), `boot complete` and the boot timeline, then either the
+//!    in-kernel tests (`--features ktest`) or the shells (`shell::run`).
 
 #![no_std]
 #![no_main]
@@ -33,6 +34,7 @@ mod boot;
 mod cmdline;
 mod crash;
 mod demo;
+mod drivers;
 mod fb;
 mod interrupts;
 mod keyboard;
@@ -51,6 +53,7 @@ mod sync;
 mod term;
 mod time;
 mod trace;
+mod virtio;
 mod vt;
 
 use log::{LevelFilter, debug, info, warn};
@@ -211,6 +214,9 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     debug!(target: "serial", "COM1: {:?}", arch::serial::mode());
     ktrace!(Kind::BootPhase, BootPhase::Framebuffer);
     keyboard::init();
+    // Drivers may wait (bounded) and start threads, so after the
+    // scheduler and the clocks; before the shells.
+    drivers::probe_all();
 
     info!(target: "boot", "boot complete");
     ktrace!(Kind::BootPhase, BootPhase::Complete);

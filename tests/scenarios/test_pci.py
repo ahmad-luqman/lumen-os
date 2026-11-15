@@ -118,23 +118,29 @@ def run(m: Machine, line: str) -> str:
     return m.output[echo.end() : end.start()]
 
 
-def lspci(m: Machine) -> dict[str, tuple[int, int, str, str]]:
-    """`lspci`'s rows by address: vendor, device, class and name. Checks the
-    header says nothing is missing, and the ids' four hex digits."""
+def lspci_rows(m: Machine) -> dict[str, tuple[int, int, str, str, str]]:
+    """`lspci`'s rows by address: vendor, device, class, name and driver.
+    Checks the header says nothing is missing, and the ids' four hex
+    digits."""
     out = run(m, "lspci")
     lines = out.splitlines()
     header = re.fullmatch(r"lspci: (\d+) functions?", lines[0])
     assert header, out
-    assert re.fullmatch(r"  addr\s+vendor\s+device\s+class\s+name", lines[1]), out
+    assert re.fullmatch(r"  addr\s+vendor\s+device\s+class\s+name\s+driver", lines[1]), out
     rows = {}
     for line in lines[2:]:
-        addr, vendor, device, cls, name = re.split(r"\s{2,}", line.strip())
+        addr, vendor, device, cls, name, driver = re.split(r"\s{2,}", line.strip())
         assert re.fullmatch(r"0x[0-9a-f]{4}", vendor) and re.fullmatch(r"0x[0-9a-f]{4}", device), (
             line
         )
-        rows[addr] = (int(vendor, 16), int(device, 16), cls, name)
+        rows[addr] = (int(vendor, 16), int(device, 16), cls, name, driver)
     assert len(rows) == int(header[1]), out
     return rows
+
+
+def lspci(m: Machine) -> dict[str, tuple[int, int, str, str]]:
+    """`lspci`'s rows by address, as [`lspci_rows`] without the driver."""
+    return {addr: row[:4] for addr, row in lspci_rows(m).items()}
 
 
 def pci_address(d: dict) -> str:
@@ -175,6 +181,22 @@ def test_lspci_lists_virtio_devices(boot):
     )
     assert (int(line[1]), int(line[2])) == (len(rows), memory_bars)
     assert "WARN  pci" not in m.output
+
+
+def test_lspci_shows_no_driver(boot):
+    # No driver rows yet (each driver's issue adds one and tests its own
+    # probe outcome; when rng lands (#97), its row shows `rng: bound` here
+    # and the summary line changes): every function, the virtio ones
+    # included, shows "no driver", and boot offered them to nobody.
+    m = shell(boot, devices=Devices.every())
+    rows = lspci_rows(m)
+    assert rows and {row[4] for row in rows.values()} == {"no driver"}, rows
+    assert (
+        "INFO  drivers: 0 bound, 0 failed, 0 declined, 0 not probed (0 driver rows)\n" in m.output
+    )
+    assert "WARN  drivers" not in m.output
+    # The column filters like the others.
+    assert run(m, "lspci | where driver = 'no driver' | count") == f"{len(rows)}\n"
 
 
 def test_lspci_records_filter(boot):
@@ -250,4 +272,5 @@ def test_no_acpi_means_no_pci_devices(boot):
         "device",
         "class",
         "name",
+        "driver",
     ], out

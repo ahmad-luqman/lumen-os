@@ -44,6 +44,14 @@ shlex = { version = "=2.0.1", default-features = false }
 # the engine).
 rhai = { version = "=1.27.0", default-features = false, features = ["no_std", "no_float", "only_i64", "no_module", "no_time", "no_closure"] }
 noto-sans-mono-bitmap = { version = "=0.4.0", default-features = false, features = ["regular", "bold", "size_16", "size_32", "unicode-basic-latin"] }
+# virtio devices over PCI (#95): virtqueues and device protocols; Lumen
+# supplies the transport and the `Hal` (kernel/src/virtio.rs). `alloc`
+# because input and sound use `Box`/`Vec`; no `embedded-io`.
+virtio-drivers = { version = "=0.13.0", default-features = false, features = ["alloc"] }
+# `Transport::read_config_space`/`write_config_space` name its traits and
+# virtio-drivers doesn't re-export them: pinned to the version Cargo.lock
+# already resolves for virtio-drivers (and rhai).
+zerocopy = { version = "=0.8.63", default-features = false }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

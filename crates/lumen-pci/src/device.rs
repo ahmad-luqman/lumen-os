@@ -176,13 +176,19 @@ impl DeviceInfo {
         names::device(self.vendor, self.device, self.subsystem.1)
     }
 
+    /// Its virtio device type, if it is a virtio device
+    /// ([`names::virtio_type`]).
+    pub fn virtio_type(&self) -> Option<u16> {
+        names::virtio_type(self.vendor, self.device, self.subsystem.1)
+    }
+
     /// The class code's name ([`names::class`]).
     pub fn class_name(&self) -> &'static str {
         names::class(self.class, self.subclass)
     }
 
     /// Whether a driver may be given this device: its capability list was
-    /// read in full (#95's `probe_all` skips it otherwise).
+    /// read in full (`pci::claim` refuses it otherwise).
     pub fn probeable(&self) -> bool {
         self.caps.is_complete()
     }
