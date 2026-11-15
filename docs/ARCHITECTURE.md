@@ -171,8 +171,11 @@ converted with the calibrated TSC:
 
 ```
 [    0.139423] INFO  boot: timeline: entry +0.000 ms, arch-init +0.145 ms, ..., complete +139.382 ms (total 139.382 ms)
-[    0.139501] INFO  boot: before kmain: limine started at 3274.784 ms and handed off at 3917.361 ms (TSC time), kmain began +0.012 ms after the handoff
+[    0.139501] INFO  boot: before kmain: limine started at 1932.697 ms and handed off at 2514.149 ms (TSC time), kmain began +10.379 ms after the handoff
 ```
+
+(The values in that line are from a TCG boot. The 10 ms after the handoff is Limine's own:
+it waits 10 ms for pending interrupts, `flush_irqs`, after its last TSC reading.)
 
 A phase with no event is named as missing, one stamped before entry or
 before an earlier phase says so, and the total is `complete`'s; an
