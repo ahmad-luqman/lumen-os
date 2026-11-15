@@ -161,8 +161,10 @@ own PR that updates that doc first.
   MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
   PAT. `trace.rs`: trace rings (one per CPU), event kinds, `ktrace!`, the boot timeline
   (`Timeline`). `acpi.rs`: ACPI
-  discovery (CPUs, LAPIC, I/O APICs, HPET, the S5 power-off registers) and
-  the firmware-table reader. `power.rs`: `reboot` and `shutdown` (ACPI S5);
+  discovery (CPUs, LAPIC, I/O APICs, HPET, the MCFG's ECAM regions, the S5
+  power-off registers) and the firmware-table reader. `pci.rs`: PCI
+  functions found over ECAM at boot (`pci::devices`, which `lspci` lists,
+  and `pci::status`), the BAR registry. `power.rs`: `reboot` and `shutdown` (ACPI S5);
   `arch/x86_64/reset.rs` their registers.
   `interrupts.rs`: 8259s masked, local APIC on, I/O APIC inputs masked,
   `route_isa_irq` (MADT overrides, handler registered before unmasking).
@@ -198,9 +200,14 @@ own PR that updates that doc first.
   words, usage and help lines), pipelines (text or records in tables, the
   filters `grep`, `where`, `sort`, `first`, `count`, `select`), serial
   bytes to keys (host-tested).
-- `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET, FADT
-  (PM1 control blocks) and the DSDT's `_S5_` by byte search (host-tested on
-  handcrafted tables).
+- `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET, MCFG,
+  FADT (PM1 control blocks) and the DSDT's `_S5_` by byte search
+  (host-tested on handcrafted tables).
+- `crates/lumen-pci`: PCI configuration space behind a `ConfigSpace` trait:
+  headers, BAR sizing, the capability list walked with a loop guard, a
+  brute-force multi-function scan into `DeviceInfo`, ECAM offsets, the
+  warnings' text (`Problem`), and names for q35's and the virtio devices
+  (host-tested against a fake configuration space).
 - `crates/lumen-uart`: 16550 UART logic: presence probe (scratch or
   interrupt enable register), FIFO detection, `\n` as `\r\n` in 15-byte
   bursts (one FIFO slot left for the crash reporter's byte) (host-tested

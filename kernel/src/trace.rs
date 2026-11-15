@@ -82,20 +82,22 @@ pub enum BootPhase {
     /// Allocated kernel and IST stacks.
     Stacks = 6,
     Acpi = 7,
+    /// PCI enumeration over ECAM (`pci::init`).
+    Pci = 8,
     /// Interrupt controllers, then the other CPUs started (`smp::start_all`).
-    Interrupts = 8,
+    Interrupts = 9,
     /// TSC and timer calibration, interrupts on, the first-tick check (10 ms,
     /// up to 100 ms while no tick has come).
-    Time = 9,
+    Time = 10,
     /// The wait until the other CPUs are online (`smp::wait_online`), then
     /// the scheduler started on every CPU (`sched::init`).
-    Smp = 10,
-    Framebuffer = 11,
-    Complete = 12,
+    Smp = 11,
+    Framebuffer = 12,
+    Complete = 13,
 }
 
 impl BootPhase {
-    pub const ALL: [BootPhase; 12] = [
+    pub const ALL: [BootPhase; 13] = [
         BootPhase::Entry,
         BootPhase::ArchInit,
         BootPhase::Logger,
@@ -103,6 +105,7 @@ impl BootPhase {
         BootPhase::Memory,
         BootPhase::Stacks,
         BootPhase::Acpi,
+        BootPhase::Pci,
         BootPhase::Interrupts,
         BootPhase::Time,
         BootPhase::Smp,
@@ -130,6 +133,7 @@ impl BootPhase {
             BootPhase::Memory => "memory",
             BootPhase::Stacks => "stacks",
             BootPhase::Acpi => "acpi",
+            BootPhase::Pci => "pci",
             BootPhase::Interrupts => "interrupts",
             BootPhase::Time => "time",
             BootPhase::Smp => "smp",
@@ -488,7 +492,7 @@ crate::ktest!(
         kassert_eq!(
             text(&t).as_str(),
             "entry +0.000 ms, arch-init +1.000 ms, logger +2.000 ms, symbols before entry, memory +4.000 ms, \
-             stacks missing, acpi +6.000 ms, interrupts +7.000 ms, time +8.000 ms, smp missing, \
+             stacks missing, acpi +6.000 ms, pci missing, interrupts +7.000 ms, time +8.000 ms, smp missing, \
              framebuffer +9.000 ms, complete missing (total unknown)"
         );
         kassert!(!t.is_complete());
@@ -501,7 +505,7 @@ crate::ktest!(
         }
         let t = Timeline::new(&full, clock);
         kassert!(t.is_complete());
-        kassert!(text(&t).as_str().ends_with("complete +22.000 ms (total 22.000 ms)"));
+        kassert!(text(&t).as_str().ends_with("complete +24.000 ms (total 24.000 ms)"));
         kassert!(!Timeline::new(&full, None).is_complete());
 
         // Every phase after entry, but memory before symbols: it says so.
@@ -524,7 +528,7 @@ crate::ktest!(
         }
         let t = Timeline::new(&unfinished, clock);
         kassert!(!t.is_complete());
-        kassert!(text(&t).as_str().ends_with("framebuffer +20.000 ms, complete missing (total unknown)"));
+        kassert!(text(&t).as_str().ends_with("framebuffer +22.000 ms, complete missing (total unknown)"));
 
         // Every phase but entry.
         let headless = TraceRing::<16>::new();

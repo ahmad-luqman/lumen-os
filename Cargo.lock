@@ -209,6 +209,7 @@ dependencies = [
  "lumen-elf",
  "lumen-heap",
  "lumen-mm",
+ "lumen-pci",
  "lumen-queue",
  "lumen-shell",
  "lumen-term",
@@ -223,6 +224,10 @@ dependencies = [
 
 [[package]]
 name = "lumen-mm"
+version = "0.0.1"
+
+[[package]]
+name = "lumen-pci"
 version = "0.0.1"
 
 [[package]]

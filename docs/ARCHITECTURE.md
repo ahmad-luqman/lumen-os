@@ -122,7 +122,8 @@ tests (for example `lumen-elf`, the symbol-table reader).
 6. Kernel stacks from the allocator, each with a guard page: the three IST
    stacks are installed, then `kmain` switches from Limine's boot stack to
    the 128 KiB main stack (`INFO  mem: stacks: ...`) and continues in
-   `kmain_on_kernel_stack`: ACPI discovery (below); the interrupt
+   `kmain_on_kernel_stack`: ACPI discovery (below); PCI enumeration over
+   ECAM (`INFO  pci: 12 functions, ...`, section 7); the interrupt
    controllers (the 8259s remapped and masked, the local APIC enabled, every
    I/O APIC input masked; `INFO  irq: local APIC ...`); the other CPUs
    started (below); the TSC calibrated
@@ -152,7 +153,7 @@ so GDT and IDT setup still come first in effect): the origin of both the
 boot timeline and the log's timestamps. The pinned Limine crate has no
 bootloader-performance request, so the bootloader's own time isn't counted.
 Entry is recorded with the origin's TSC; every other phase records a
-`BootPhase` trace event when it ends: arch-init, logger, symbols, memory, stacks, acpi, interrupts,
+`BootPhase` trace event when it ends: arch-init, logger, symbols, memory, stacks, acpi, pci, interrupts,
 time (calibration, interrupts on, the first-tick check: 10 ms, up to 100 ms while no tick has come), smp (the
 wait until the other CPUs are online, then the scheduler started on every CPU), framebuffer, complete (which includes setting up the keyboard). After `boot complete` the kernel prints them from the ring,
 converted with the calibrated TSC:
@@ -250,8 +251,8 @@ them; stale entries from speculative fills aren't ruled out (not tested).
 ### ACPI (built in M1)
 
 `acpi::init` follows the RSDP Limine gives to the XSDT (or the RSDT on ACPI
-1.0 firmware, or when the XSDT address is 0), then reads the MADT and the
-HPET table. The parsing is in the host-tested `lumen-acpi` crate:
+1.0 firmware, or when the XSDT address is 0), then reads the MADT, the
+HPET table and the MCFG (PCI's ECAM regions, section 7). The parsing is in the host-tested `lumen-acpi` crate:
 bounds-checked little-endian reads from byte slices (the tables are packed
 and unaligned). A table that is used has its length (capped at 1 MiB)
 checked when its header is read, its checksum before any field past the
@@ -1209,6 +1210,9 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
     taken on each vector that took any or has a routed input
     (`idt::vector_count`: `lumen_exception_dispatch` counts every vector,
     all CPUs together), with what the vector map uses it for.
+  - `lspci`: the PCI functions found at boot (`pci::devices`: address,
+    vendor and device ids, class and device names; section 7), the header
+    saying why any are missing (`pci::status`).
   - `dmesg`: the newest whole log lines as serial printed them: the logger
     keeps the last 16 KiB in a `lumen_trace::TextRing` (host-tested
     against a model; not lock-free: `klog`'s `RING` lock, a leaf, taken
@@ -1248,13 +1252,15 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   | filter ...`. The first command must not be a filter, and every
   command after a `|` must be one. A command's output is lines of text,
   or records: a `pipe::Table` of named columns (names unique), each
-  holding numbers (printed in decimal, hex or as a percentage) or text, a
-  value possibly absent (printed `-` or `stalled`). In a pipeline `cpus`,
-  `irqs` (its per-vector table only), `mem` (frames, the heap and each
-  kind of stack: size and used in bytes, a stack's all used, guard pages
-  not counted; and a count of frames, live allocations or stacks) and
-  `threads` give records (`sysinfo::RECORDS`); `cpus`, `irqs` and the new
-  `threads` print the same tables alone (under their header line), so the
+  holding numbers (printed in decimal, hex, four-digit hex for 16-bit ids,
+  or as a percentage) or text, a value possibly absent (printed `-` or
+  `stalled`). In a pipeline `cpus`, `irqs` (its per-vector table only),
+  `mem` (frames, the heap and each kind of stack: size and used in bytes, a
+  stack's all used, guard pages not counted; and a count of frames, live
+  allocations or stacks), `threads` and `lspci` give records
+  (`sysinfo::RECORDS`; `lspci` first writes a note line to the console
+  when PCI devices are missing, which its table can't carry); `cpus`,
+  `irqs`, `threads` and `lspci` print the same tables alone (under their header line), so the
   text of `cpus` and `irqs` is what it was (tested column by column; one
   difference: a value wider than its column, `stalled`, now widens it for
   every row). They take no arguments (`usage: cpus`). Any other command
@@ -1426,9 +1432,10 @@ section 2).
 - **Not yet:** scripts from files (M6), floats, capturing closures,
   scripts in user mode (M9), a script running in the background.
 
-## 7. Driver interface (planned for M3: PCI and virtio; device classes later)
+## 7. Driver interface (M3: PCI discovery built; virtio and MSI-X planned; device classes later)
 
-Nothing here is built yet; #94–#96 build it with the tests they list.
+PCI discovery is built (#94); claiming, virtio and MSI-X are planned
+(#95, #96), with the tests they list.
 
 M3 lays the layer drivers stand on: finding PCI devices (#94), handing a
 driver exactly its device's resources and running `virtio-drivers` on top
@@ -1439,34 +1446,71 @@ completion out, no shared mutable state across the boundary, so a driver
 can move to a user-space server by serializing the same messages) comes
 with the device-class traits at the end of this section.
 
-### Discovery: PCI (#94)
+### Discovery: PCI (built, #94)
 
-- **Configuration space through ECAM.** The MCFG table is to be parsed in
-  `lumen-acpi` (host-tested, #94): each segment's ECAM base and bus range.
-  The kernel will map the range once, uncached (1 MiB per bus: 256 MiB for
-  q35's 256 buses, out of the 1 TiB MMIO window), behind an accessor
-  private to the `pci` module. No MCFG means no PCI devices, logged, not a
-  crash. The legacy `0xcf8` ports aren't used.
-- **Decoding in a host-tested crate.** A `lumen-pci` crate (to be added by
-  #94) will hold the header, BAR and capability decoding behind a small
-  config-space trait (32-bit reads and writes at a function and offset),
-  tested against a fake config space. It is ours rather than
-  `virtio-drivers`' `PciRoot` because it lands before #95 links that crate,
-  and that crate's `enumerate_bus` ignores the multi-function bit, knows no
-  segment, and its capability walk has no loop guard; ours is host-tested.
-- **Enumeration** will be a brute-force scan: every bus in the MCFG range,
-  devices 0-31, functions 1-7 only for multi-function devices. Bridges'
-  secondary buses fall inside the scanned range, so no recursion. BARs are
-  sized with I/O and memory decoding turned off in the command register
-  while all-ones is written (and restored after); `virtio-drivers` sizes
-  the BARs it uses again while probing (below). The firmware's BAR
-  addresses are kept: OVMF assigns them and Lumen never reassigns in M3; a
-  memory BAR at 0 counts as unassigned. The capability walk is guarded
-  (offsets dword-aligned and at least 0x40, at most 48 entries); a device
-  whose list doesn't end cleanly is listed but never probed.
+- **Configuration space through ECAM.** `lumen-acpi` parses the MCFG
+  (host-tested) and judges each entry on its own: a base that is 0 or not
+  1 MiB aligned, buses numbered backwards, a range not ending below 2^64,
+  buses overlapping an entry accepted before it, or a place past the
+  first 256 entries get that entry refused with its reason (a warning
+  each), and the others are still used (a partial entry at the table's
+  end refuses the whole table). The
+  kernel maps each accepted region once, uncached (1 MiB per bus: 256 MiB
+  for q35's 256 buses, out of the 1 TiB MMIO window; the pinned OVMF moves
+  q35's from QEMU's 0xb0000000 to 0xe0000000), behind an accessor private
+  to the `pci` module (the address arithmetic, `lumen_pci::ecam_offset`,
+  is host-tested). No ACPI, no MCFG, no usable entry or no region mapped
+  means no PCI devices: a warning, and the reason in `pci::status()`,
+  which `lspci`'s header shows (`lspci: 0 functions (no PCI: running
+  without ACPI, so no MCFG)`; in a pipeline, a note line on the console),
+  not a crash; refused entries and unmapped regions are counted there too,
+  with a pointer to the boot log. Only the no-ACPI case runs in QEMU; an
+  MCFG that is missing, empty or wholly refused, and a region that can't
+  be mapped, are not tested booted. The legacy `0xcf8` ports aren't
+  used.
+- **Decoding in a host-tested crate.** The `lumen-pci` crate holds the
+  header, BAR and capability decoding behind a small config-space trait
+  (32-bit reads and writes at a function and offset), tested against a
+  fake config space. It is ours rather than `virtio-drivers`' `PciRoot`
+  because it lands before #95 links that crate, and that crate's
+  `enumerate_bus` ignores the multi-function bit, knows no segment, and
+  its capability walk has no loop guard (as of virtio-drivers 0.13); ours
+  is host-tested.
+- **Enumeration** is a brute-force scan: every bus in each region, devices
+  0-31, functions 1-7 only for multi-function devices. Bridges' secondary
+  buses normally fall inside the scanned range, so no recursion; a bridge
+  with no secondary bus, bus numbers that don't fit the bus it is on or
+  run backwards, or buses not all in a mapped region is a warning (the
+  devices behind it aren't listed; host-tested, not booted). BARs are sized with I/O and memory decoding turned off
+  in the command register while all-ones is written (and restored after),
+  except on a host bridge, sized with decoding on as Linux does
+  (`mmio_always_on`: turning a host bridge's decoding off can cut the CPU
+  off from memory on real hardware). That must happen while nothing can
+  touch a device: `pci::init` runs right after ACPI on the boot CPU alone,
+  with interrupts off, before the framebuffer's terminal draws (the screen
+  is inside the VGA BAR), and nothing logs while a device's decoding is
+  off. A panic then reports on serial only (there is no crash screen
+  before `fb::init`). `virtio-drivers` sizes the BARs it uses again while probing
+  (below). The firmware's BAR addresses are kept: OVMF assigns them and
+  Lumen never reassigns in M3. A BAR left at address 0 is
+  `Bar::Unassigned` (its size kept), and a reserved memory type, a 64-bit
+  BAR in the last slot, an I/O range past port 0xffff or a 64-bit range
+  ending at 2^64 is `Bar::Malformed`: each is a warning naming the
+  function and the BAR (host-tested; q35's BARs have none).
+  `DeviceInfo::bar_slot` says why a slot holds no BAR (out of range, not
+  implemented, or the upper half of a 64-bit BAR, by `Bar::slots`). The capability walk is guarded (pointers have
+  their two reserved low bits masked, as the PCI specification says, so
+  offsets are dword-aligned; below 0x40, or a 49th entry, cuts the list
+  off); an unknown header type's (3-127) BARs and capabilities aren't
+  read (its header is), and a CardBus bridge's BARs and capability list
+  (its pointer, at 0x14) aren't decoded. A device whose list was cut off
+  or not read is listed, warned about, and #95's `probe_all` skips it
+  (host-tested, not booted). Each function is logged at debug level
+  (`DEBUG pci: 0000:00:00.0 8086:29c0 host bridge (class 060000) Q35 host
+  bridge`); the warnings' text is `lumen_pci::Problem`'s, host-tested.
 - **`DeviceInfo`**, one per function, built once at boot (after `mm::init`
-  and ACPI, before any driver) into `pci::devices()`, which never changes
-  afterwards:
+  and ACPI, before any driver) into `pci::devices()`, in address order,
+  which never changes afterwards:
 
 ```rust
 pub struct DeviceInfo {
@@ -1475,17 +1519,30 @@ pub struct DeviceInfo {
     pub class: u8, pub subclass: u8, pub prog_if: u8, pub revision: u8,
     pub subsystem: (u16, u16),          // vendor, id
     pub bars: [Option<Bar>; 6],         // Memory { phys, size, prefetchable, is_64 } | Io { port, size }
-    pub caps: CapList,                  // (id, offset): MSI, MSI-X, vendor-specific (virtio's); complete or cut off
-    pub irq_pin: u8,                    // INTx pin, shown only: INTx is never routed (no `_PRT`)
+                                        //   | Unassigned { io, size, is_64 } | Malformed(BarProblem)
+    pub caps: CapList,                  // (id, offset): MSI, MSI-X, vendor-specific (virtio's); complete, cut off, or not read
+    pub irq_pin: u8,                    // INTx pin, recorded only: INTx is never routed (no `_PRT`)
+    pub buses: Option<BusNumbers>,      // a PCI-to-PCI bridge's primary, secondary, subordinate buses
 }
 ```
 
 - **The BAR registry.** Enumeration records every memory BAR. BARs are
-  mapped only by the registry, through a path private to `pci`, once per
+  mapped only by the registry, through a path private to `pci`
+  (`map_bar`, returning a `BarMapping { phys, virt, size }`), once per
   BAR, when its device is claimed (#95), and never unmapped (`map_mmio`'s
-  window only grows). The registry is the one record of BAR mappings;
-  everything else looks them up there. `lspci` lists `pci::devices()`;
-  #95 adds its driver column.
+  window only grows); `mapped_bar` looks a mapping up without mapping
+  (for #95's pre-probe check and `mmio_phys_to_virt`, and #96's MSI-X
+  table). The registry is the one record of BAR mappings; everything else
+  looks them up there. Nothing else maps BARs, except that the
+  framebuffer Limine set up inside the VGA BAR is in the HHDM, so
+  `map_mmio` refuses that BAR. A refusal says which function and BAR, and
+  why (`BarError`: no such function, out of range, not implemented, the
+  upper half of a 64-bit BAR, an I/O BAR, unassigned, malformed, not
+  mapped yet (the lookup), or the mapping's error with the physical
+  range). `lspci` lists `pci::devices()` as records: `addr`,
+  `vendor` and `device` (four hex digits: `lspci | where vendor =
+  0x1af4`), `class` and `name`; #95 adds its driver column. Which device
+  is claimed (one claim per address) is #95's `pci::claim`'s to track.
 
 ### Claiming and probing (#95)
 
@@ -1505,9 +1562,12 @@ pub struct Driver {
   registry and sets **memory space and bus master** in the command
   register, with I/O space off: `virtio-drivers` never sets bus master, and
   the firmware's state isn't trusted.
-- A device isn't probed when a BAR mapping fails (`MmioError`) or its
-  capability list was cut off: a warning with the address and the reason
-  (for a BAR: its index, physical range and the error), and `lspci` shows
+- A device isn't probed when one of its memory BARs can't be mapped
+  (`BarError`: the mapping failed, or the BAR is unassigned or malformed;
+  an I/O BAR or an unimplemented slot isn't mapped and doesn't stop it) or
+  its capability list was cut off or not read: a warning with the address
+  and the reason (for a BAR: `BarError`'s text, with its index and, for a
+  failed mapping, its physical range and the error), and `lspci` shows
   `not probed: <reason>`. Before each probe, `probe_all` logs `probing
   <driver> on <addr>` (info), so a hang points at a device. The outcome is
   recorded: `lspci`'s driver column shows `<driver>: bound` or `<driver>:
@@ -2004,7 +2064,8 @@ run's, which the job summary was built from) survives.
 ```
 kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/arch/        HAL; x86_64/ has gdt, idt, irq, context (thread switch), apic, pic, pit, i8042 and cmos (ports), reset (reset and PM1 registers), serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
-  src/acpi.rs      ACPI discovery (MADT, HPET, FADT and the DSDT's _S5_) through lumen-acpi
+  src/acpi.rs      ACPI discovery (MADT, HPET, MCFG, FADT and the DSDT's _S5_) through lumen-acpi
+  src/pci.rs       PCI discovery over ECAM (lumen-pci): pci::devices, the BAR registry
   src/power.rs     reboot (0xCF9, 8042, triple fault) and ACPI S5 power-off
   src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs, routing ISA IRQs
   src/keyboard.rs  the PS/2 keyboard: 8042 init, IRQ 1, decoding (pc-keyboard), lumen.keymap
@@ -2025,7 +2086,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/shell/       the shells (lumen-shell): serial and the virtual terminals' consoles, the commands, system commands (sysinfo.rs), deliberate faults (crash.rs)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
-crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, ...)
+crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-pci, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, ...)
 boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml

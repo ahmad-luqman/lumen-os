@@ -288,7 +288,7 @@ def test_system_commands(boot):
     start = len(m.output)
     out = run(m, "help")
     assert out.startswith("commands:\n")
-    for name in ("cpus", "mem", "irqs", "threads", "dmesg", "date", "top"):
+    for name in ("cpus", "mem", "irqs", "threads", "lspci", "dmesg", "date", "top"):
         assert re.search(rf"^  {name} ", out, re.MULTILINE), name
 
     out = run(m, "cpus")

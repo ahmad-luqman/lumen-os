@@ -13,7 +13,8 @@
 //!    #MC ran on the boot stack until now) are installed, then `kmain`
 //!    switches from Limine's boot stack to the main kernel stack and
 //!    continues in `kmain_on_kernel_stack`.
-//! 5. ACPI tables (CPUs, interrupt controllers, HPET), the interrupt
+//! 5. ACPI tables (CPUs, interrupt controllers, HPET, the MCFG), the PCI
+//!    functions in ECAM configuration space (`pci::devices`), the interrupt
 //!    controllers (8259s masked, local APIC on, I/O APIC inputs masked), the
 //!    TSC and local APIC timer calibrated, interrupts on, the scheduler
 //!    started on every CPU (`kmain`'s context becomes the `main` thread);
@@ -38,6 +39,7 @@ mod keyboard;
 mod klog;
 mod ktest;
 mod mm;
+mod pci;
 mod power;
 mod rtc;
 mod sched;
@@ -162,6 +164,12 @@ fn install_stacks() -> StackRange {
 extern "C" fn kmain_on_kernel_stack() -> ! {
     acpi::init();
     ktrace!(Kind::BootPhase, BootPhase::Acpi);
+    // Sizing a BAR turns its device's decoding off for a moment: this runs
+    // on this CPU alone (the others start below), with interrupts off,
+    // before the framebuffer's terminal draws (the screen is in the VGA
+    // BAR).
+    pci::init();
+    ktrace!(Kind::BootPhase, BootPhase::Pci);
     interrupts::init();
     // The other CPUs halt once started instead of spinning in the bootloader
     // during the clock calibration below.

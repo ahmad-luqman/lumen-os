@@ -43,6 +43,8 @@ pub enum Kind {
     Int,
     /// A number, in hex with at least two digits (`0x21`).
     Hex,
+    /// A 16-bit id, in hex with at least four digits (`0x1af4`, `0x000c`).
+    Hex16,
     /// A percentage (`37%`).
     Percent,
     /// Text.
@@ -96,6 +98,7 @@ impl Value {
     pub fn show(&self, kind: Kind) -> String {
         match (self, kind) {
             (Value::Int(n), Kind::Hex) => format!("{n:#04x}"),
+            (Value::Int(n), Kind::Hex16) => format!("{n:#06x}"),
             (Value::Int(n), Kind::Percent) => format!("{n}%"),
             (Value::Int(n), _) => n.to_string(),
             (Value::Text(t), _) => t.clone(),
@@ -473,10 +476,10 @@ fn wanted(column: &str, kind: Kind, op: Op, value: &str) -> Result<Wanted, PipeE
     let n = match (digits.strip_prefix("0x"), kind) {
         (Some(hex), _) if !hex.starts_with(['+', '-']) => i64::from_str_radix(hex, 16).ok(),
         (Some(_), _) => None,
-        (None, Kind::Hex) if decimal(digits).is_some_and(|n| n >= 0) => {
+        (None, Kind::Hex | Kind::Hex16) if decimal(digits).is_some_and(|n| n >= 0) => {
             return Err(PipeError::HexNeeded(column.to_owned()));
         }
-        (None, Kind::Hex) => None,
+        (None, Kind::Hex | Kind::Hex16) => None,
         (None, _) => decimal(digits),
     };
     n.map(Wanted::Number).ok_or_else(|| PipeError::NotANumber { column: column.to_owned(), value: value.to_owned() })

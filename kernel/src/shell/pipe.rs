@@ -135,6 +135,11 @@ fn source(table: &Table<Run>, words: &[String], ctx: &mut Ctx<'_>) -> Option<Dat
     if args.is_empty()
         && let Some(records) = sysinfo::records(name)
     {
+        // A caveat the records can't carry goes to the console first
+        // (`lspci`: why devices are missing).
+        if let Some(note) = sysinfo::records_note(name) {
+            let _ = writeln!(ctx.out, "{note}");
+        }
         return Some(Data::Table(records()));
     }
     let mut capture = Capture::new(&mut *ctx.out);

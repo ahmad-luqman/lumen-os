@@ -2,7 +2,7 @@
 //! joins its words with single spaces; `clear` and `colors` need a console
 //! that takes escape codes), plus `history`, `term text`, `vt`, `reboot`,
 //! `shutdown`, the system commands (`cpus`, `mem`, `irqs`, `threads`,
-//! `dmesg`, `date`, `top`: `sysinfo.rs`) and the filters that come after a
+//! `lspci`, `dmesg`, `date`, `top`: `sysinfo.rs`) and the filters that come after a
 //! `|` (`grep`, `where`, `sort`, `first`, `count`, `select`: `pipe.rs`). A
 //! table the line editor completes from. Each writes to the console that
 //! ran it (or, at the start of a pipeline, to the next command; a usage or
@@ -111,6 +111,13 @@ pub static COMMANDS: Table<Run> = Table(&[
         usage: "",
         about: "the I/O APIC's inputs decoded, and interrupts per vector (piped: the per-vector counts only)",
         run: sysinfo::irqs,
+    },
+    Command {
+        name: "lspci",
+        args: &[],
+        usage: "",
+        about: "the PCI functions found at boot: address, vendor and device ids, class, name",
+        run: sysinfo::lspci,
     },
     Command {
         name: "dmesg",

@@ -370,6 +370,25 @@ fn a_hex_column_takes_only_hex() {
 }
 
 #[test]
+fn a_16_bit_hex_column_prints_four_digits_and_takes_only_hex() {
+    // `lspci`'s ids: 0x000c, not 0x0c (the vector column keeps two digits).
+    const VENDOR: Column = Column::new("vendor", Kind::Hex16, Align::Left, 6);
+    let mut t = Table::new(&[VENDOR, VECTOR]);
+    t.push(vec![Value::Int(0x1b36), Value::Int(0x0c)]);
+    t.push(vec![Value::Int(0x000c), Value::Int(0x20)]);
+    let mut out = String::new();
+    t.render(&mut out);
+    assert_eq!(out, "  vendor  vector\n  0x1b36  0x0c\n  0x000c  0x20\n");
+    assert_eq!(Value::Int(0x1af4).show(Kind::Hex16), "0x1af4");
+    assert_eq!(Value::Int(0x12345).show(Kind::Hex16), "0x12345");
+    let got = apply(Data::Table(t.clone()), &["where", "vendor", "=", "0xc"]);
+    assert_eq!(table(got).rows().len(), 1);
+    let err = |value: &str| apply(Data::Table(t.clone()), &["where", "vendor", "=", value]).unwrap_err().to_string();
+    assert_eq!(err("12"), "where: vendor is hex: write it with 0x (e.g. 0x20)");
+    assert_eq!(err("-5"), "where: vendor holds numbers, and '-5' isn't one");
+}
+
+#[test]
 fn text_compares_as_numbers_with_a_number() {
     // `seq 12 | where line > 5`: 6 to 12, not "6" to "9" by bytes.
     let lines = Data::Text((1..=12).map(|n| n.to_string()).collect());

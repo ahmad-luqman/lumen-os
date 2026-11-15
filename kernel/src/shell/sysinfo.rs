@@ -1,8 +1,8 @@
-//! The shell's system commands: `cpus`, `mem`, `irqs`, `threads`, `dmesg`,
-//! `date` and `top`. Each prints a header line (`<name>: ...`), and all but
-//! `date` rows after it. In a pipeline `cpus`, `irqs`, `mem` and `threads`
-//! give records instead ([`RECORDS`]): `cpus` and `threads` the table they
-//! print (under their header), `irqs` its per-vector table only (not the
+//! The shell's system commands: `cpus`, `mem`, `irqs`, `threads`, `lspci`,
+//! `dmesg`, `date` and `top`. Each prints a header line (`<name>: ...`), and
+//! all but `date` rows after it. In a pipeline `cpus`, `irqs`, `mem`,
+//! `threads` and `lspci` give records instead ([`RECORDS`]): `cpus`,
+//! `threads` and `lspci` the table they print (under their header), `irqs` its per-vector table only (not the
 //! I/O APIC's inputs), `mem` a table of what its prose says (in bytes).
 //! Output with rows is made into a `String` first and written in one write
 //! (no log line lands inside it, and nothing allocating is formatted under
@@ -66,8 +66,15 @@ pub type MakeTable = fn() -> pipe::Table;
 
 /// The system commands that give records in a pipeline (instead of their
 /// text), and the tables they give.
-pub const RECORDS: [(&str, MakeTable); 4] =
-    [("cpus", cpu_table), ("irqs", vector_table), ("mem", mem_table), ("threads", thread_table)];
+pub const RECORDS: [(&str, MakeTable); 5] =
+    [("cpus", cpu_table), ("irqs", vector_table), ("lspci", pci_table), ("mem", mem_table), ("threads", thread_table)];
+
+/// A line for the console when `name`'s records come with a caveat the
+/// table can't carry: `lspci`'s, when PCI devices are missing.
+pub fn records_note(name: &str) -> Option<String> {
+    let status = crate::pci::status();
+    (name == "lspci" && !status.is_clean()).then(|| alloc::format!("lspci: {}", status.note()))
+}
 
 /// The records `name` gives in a pipeline, if it is one of [`RECORDS`].
 pub fn records(name: &str) -> Option<MakeTable> {
@@ -311,6 +318,39 @@ fn vector_table() -> pipe::Table {
     t
 }
 
+/// `lspci`: every PCI function found at boot, and why there are none (or
+/// some may be missing).
+pub fn lspci(ctx: &mut Ctx<'_>, args: &[String]) {
+    if extra_args(ctx, "lspci", args) {
+        return;
+    }
+    let table = pci_table();
+    let mut t = String::new();
+    let n = table.rows().len();
+    let _ = writeln!(t, "lspci: {n} function{}{}", if n == 1 { "" } else { "s" }, crate::pci::status());
+    table.render(&mut t);
+    emit(ctx, &t);
+}
+
+/// `lspci`'s rows: the address, vendor and device ids (four hex digits,
+/// so `where vendor = 0x1af4` works), the class's name and the device's
+/// (`-` if Lumen doesn't know it).
+fn pci_table() -> pipe::Table {
+    const COLUMNS: [Column; 5] = [
+        Column::new("addr", Kind::Text, Align::Left, 12),
+        Column::new("vendor", Kind::Hex16, Align::Left, 6),
+        Column::new("device", Kind::Hex16, Align::Left, 6),
+        Column::new("class", Kind::Text, Align::Left, 0),
+        Column::new("name", Kind::Text, Align::Left, 0),
+    ];
+    let mut t = pipe::Table::new(&COLUMNS);
+    for d in crate::pci::devices() {
+        let addr = Value::Text(alloc::format!("{}", d.addr));
+        t.push(vec![addr, int(d.vendor), int(d.device), text(d.class_name()), d.name().map_or(DASH, text)]);
+    }
+    t
+}
+
 /// `threads`: every thread, its CPU, state and the timer ticks that found
 /// it running.
 pub fn threads(ctx: &mut Ctx<'_>, args: &[String]) {
@@ -520,8 +560,15 @@ crate::ktest!(
         // only its header, a date and time.
         use crate::kassert;
         let history = lumen_shell::History::new(0);
-        let commands: [(&str, super::commands::Run); 6] =
-            [("cpus", cpus), ("mem", mem), ("irqs", irqs), ("threads", threads), ("dmesg", dmesg), ("date", date)];
+        let commands: [(&str, super::commands::Run); 7] = [
+            ("cpus", cpus),
+            ("mem", mem),
+            ("irqs", irqs),
+            ("threads", threads),
+            ("lspci", lspci),
+            ("dmesg", dmesg),
+            ("date", date),
+        ];
         for (name, run) in commands {
             let mut console = super::Captured::default();
             run(&mut Ctx::new(&mut console, false, &history), &[]);

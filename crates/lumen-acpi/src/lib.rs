@@ -1,6 +1,7 @@
 //! ACPI tables for the Lumen kernel: the RSDP, the root table (the XSDT, or
 //! the RSDT on ACPI 1.0 firmware), the MADT (interrupt controllers and CPUs),
-//! the HPET, and what powering off takes: the FADT's PM1 control registers
+//! the HPET, the MCFG (where PCI configuration space is memory-mapped), and
+//! what powering off takes: the FADT's PM1 control registers
 //! and the DSDT's `\_S5_` sleep type values ([`SleepType::s5_from_dsdt`]
 //! searches the AML bytes for the package: no AML interpreter builds on
 //! stable Rust).
@@ -21,6 +22,7 @@
 #![no_std]
 
 use core::fmt;
+use core::ops::RangeInclusive;
 
 /// Size of the header every system description table starts with.
 pub const SDT_HEADER_LEN: usize = 36;
@@ -34,6 +36,9 @@ const RSDP_V1_LEN: usize = 20;
 const RSDP_V2_LEN: usize = 36;
 const MADT_FIXED_LEN: usize = SDT_HEADER_LEN + 8;
 const HPET_LEN: usize = 56;
+/// The MCFG's header and its 8 reserved bytes, before the first entry.
+const MCFG_FIXED_LEN: usize = SDT_HEADER_LEN + 8;
+const MCFG_ENTRY_LEN: usize = 16;
 /// An ACPI 1.0 FADT, up to and including the fields we read from it.
 const FADT_V1_LEN: usize = 116;
 
@@ -59,6 +64,7 @@ impl Signature {
     pub const RSDT: Signature = Signature(*b"RSDT");
     pub const MADT: Signature = Signature(*b"APIC");
     pub const HPET: Signature = Signature(*b"HPET");
+    pub const MCFG: Signature = Signature(*b"MCFG");
     pub const FADT: Signature = Signature(*b"FACP");
     pub const DSDT: Signature = Signature(*b"DSDT");
     /// Not a table signature: names the RSDP in errors.
@@ -639,6 +645,209 @@ impl Hpet {
         }
         Ok(hpet)
     }
+}
+
+/// One accepted MCFG entry: the memory-mapped (ECAM) configuration space
+/// of a PCI segment's buses `bus_start..=bus_end`. Bus `b`'s space is the
+/// 1 MiB at `base + (b << 20)` (`base` is bus 0's address, even when
+/// `bus_start` is higher), 4 KiB per function. Made only by
+/// [`EcamRegion::new`], which checks that `base` isn't 0 and is 1 MiB
+/// aligned, that `bus_start <= bus_end`, and that the range ends below
+/// 2^64.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EcamRegion {
+    base: u64,
+    segment: u16,
+    bus_start: u8,
+    bus_end: u8,
+}
+
+/// Why an MCFG entry was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EcamReject {
+    NoBase,
+    /// The base isn't 1 MiB aligned.
+    Misaligned,
+    /// The first bus is above the last.
+    BusesBackwards,
+    /// The range doesn't end below 2^64.
+    PastAddressSpace,
+    /// It covers a bus of entry `earlier` (from 0), accepted before it.
+    Overlaps {
+        earlier: usize,
+    },
+    /// It comes after the first [`MAX_ECAM_REGIONS`] entries.
+    TooMany,
+}
+
+impl fmt::Display for EcamReject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EcamReject::NoBase => f.write_str("its base address is 0"),
+            EcamReject::Misaligned => f.write_str("its base isn't 1 MiB aligned"),
+            EcamReject::BusesBackwards => f.write_str("its first bus is above its last"),
+            EcamReject::PastAddressSpace => f.write_str("its range doesn't end below 2^64"),
+            EcamReject::Overlaps { earlier } => write!(f, "it overlaps entry {earlier}'s buses"),
+            EcamReject::TooMany => write!(f, "only the first {MAX_ECAM_REGIONS} entries are read"),
+        }
+    }
+}
+
+impl EcamRegion {
+    /// The region, if it can be configuration space (see the type's doc).
+    pub fn new(base: u64, segment: u16, bus_start: u8, bus_end: u8) -> Result<EcamRegion, EcamReject> {
+        if base == 0 {
+            return Err(EcamReject::NoBase);
+        }
+        if !base.is_multiple_of(1 << 20) {
+            return Err(EcamReject::Misaligned);
+        }
+        if bus_start > bus_end {
+            return Err(EcamReject::BusesBackwards);
+        }
+        // The end must be a representable address: below 2^64.
+        if base.checked_add((u64::from(bus_end) + 1) << 20).is_none() {
+            return Err(EcamReject::PastAddressSpace);
+        }
+        Ok(EcamRegion { base, segment, bus_start, bus_end })
+    }
+
+    /// Bus 0's address (whether or not the region starts there).
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    pub fn segment(&self) -> u16 {
+        self.segment
+    }
+
+    pub fn bus_start(&self) -> u8 {
+        self.bus_start
+    }
+
+    pub fn bus_end(&self) -> u8 {
+        self.bus_end
+    }
+
+    /// The physical address of `bus_start`'s configuration space: where a
+    /// mapping of this region starts.
+    pub fn start(&self) -> u64 {
+        self.base + (u64::from(self.bus_start) << 20)
+    }
+
+    /// `bus_start..=bus_end`.
+    pub fn buses(&self) -> RangeInclusive<u8> {
+        self.bus_start..=self.bus_end
+    }
+
+    /// The bytes from [`start`](Self::start) to the end of `bus_end`'s
+    /// configuration space (1 MiB per bus).
+    pub fn size(&self) -> u64 {
+        (u64::from(self.bus_end) - u64::from(self.bus_start) + 1) << 20
+    }
+
+    /// Whether `bus` of `segment` is in this region.
+    pub fn covers(&self, segment: u16, bus: u8) -> bool {
+        segment == self.segment && self.buses().contains(&bus)
+    }
+
+    /// Whether the two regions share a bus of the same segment.
+    pub fn overlaps(&self, other: &EcamRegion) -> bool {
+        self.segment == other.segment && self.bus_start <= other.bus_end && other.bus_start <= self.bus_end
+    }
+}
+
+/// `segment 0 buses 0-255 at 0xe0000000` (the address is
+/// [`start`](EcamRegion::start)'s).
+impl fmt::Display for EcamRegion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "segment {} buses {}-{} at {:#x}", self.segment, self.bus_start, self.bus_end, self.start())
+    }
+}
+
+/// An MCFG entry that was refused, as the table has it, and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BadEcamRegion {
+    /// Its position in the table, from 0.
+    pub index: usize,
+    pub base: u64,
+    pub segment: u16,
+    pub bus_start: u8,
+    pub bus_end: u8,
+    pub why: EcamReject,
+}
+
+impl fmt::Display for BadEcamRegion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let BadEcamRegion { index, base, segment, bus_start, bus_end, why } = *self;
+        write!(f, "MCFG entry {index} (base {base:#x}, segment {segment}, buses {bus_start}-{bus_end}) refused: {why}")
+    }
+}
+
+/// The most MCFG entries read (real tables have a handful): the walk
+/// remembers which entries it accepted in a fixed bitmap. Each entry past
+/// them is refused ([`EcamReject::TooMany`]).
+pub const MAX_ECAM_REGIONS: usize = 256;
+
+/// The PCI Express memory-mapped configuration table: its entries, each
+/// judged on its own by [`Mcfg::regions`].
+#[derive(Clone, Copy, Debug)]
+pub struct Mcfg<'a> {
+    entries: &'a [[u8; MCFG_ENTRY_LEN]],
+}
+
+impl<'a> Mcfg<'a> {
+    /// Check that `t` is an MCFG whose body after its reserved bytes is a
+    /// whole number of 16-byte entries (a partial entry at the end refuses
+    /// the whole table: the table is cut short). An MCFG listing none
+    /// parses (and gives none). The entries themselves are judged by
+    /// [`regions`](Self::regions), one by one.
+    pub fn parse(t: Sdt<'a>) -> Result<Mcfg<'a>, Error> {
+        let b = t.expect(Signature::MCFG)?.bytes();
+        let body = b.get(MCFG_FIXED_LEN..).ok_or(Error::Truncated(Signature::MCFG))?;
+        let (entries, rest) = body.as_chunks::<MCFG_ENTRY_LEN>();
+        if !rest.is_empty() {
+            return Err(Error::Truncated(Signature::MCFG));
+        }
+        Ok(Mcfg { entries })
+    }
+
+    /// Each entry in table order: the region, or why it was refused (see
+    /// [`EcamRegion::new`]; an entry covering a bus of an entry accepted
+    /// before it, or past the first [`MAX_ECAM_REGIONS`], is refused too).
+    /// One bad entry doesn't cost the others.
+    pub fn regions(&self) -> impl Iterator<Item = Result<EcamRegion, BadEcamRegion>> + use<'a> {
+        let entries = self.entries;
+        let mut accepted = [0u64; MAX_ECAM_REGIONS / 64];
+        entries.iter().enumerate().map(move |(index, e)| {
+            let (base, segment, bus_start, bus_end) = mcfg_entry_fields(e);
+            let bad = |why| BadEcamRegion { index, base, segment, bus_start, bus_end, why };
+            if index >= MAX_ECAM_REGIONS {
+                return Err(bad(EcamReject::TooMany));
+            }
+            let region = EcamRegion::new(base, segment, bus_start, bus_end).map_err(bad)?;
+            let earlier = (0..index).find(|&j| {
+                accepted[j / 64] & 1 << (j % 64) != 0 && entry_region(&entries[j]).is_some_and(|r| r.overlaps(&region))
+            });
+            if let Some(earlier) = earlier {
+                return Err(bad(EcamReject::Overlaps { earlier }));
+            }
+            accepted[index / 64] |= 1 << (index % 64);
+            Ok(region)
+        })
+    }
+}
+
+/// A 16-byte MCFG entry's base (8 bytes), segment (2), first and last bus
+/// (1 each); 4 reserved bytes follow.
+fn mcfg_entry_fields(e: &[u8; MCFG_ENTRY_LEN]) -> (u64, u16, u8, u8) {
+    (u64_at(e, 0).expect("within 16 bytes"), u16_at(e, 8).expect("within 16 bytes"), e[10], e[11])
+}
+
+/// The region an MCFG entry describes, if it is a valid one.
+fn entry_region(e: &[u8; MCFG_ENTRY_LEN]) -> Option<EcamRegion> {
+    let (base, segment, bus_start, bus_end) = mcfg_entry_fields(e);
+    EcamRegion::new(base, segment, bus_start, bus_end).ok()
 }
 
 /// What the FADT says about powering off.
