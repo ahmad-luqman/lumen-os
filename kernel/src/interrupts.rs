@@ -123,7 +123,8 @@ impl Route {
 pub enum RouteError {
     /// No I/O APIC has an input for the GSI (none at all without ACPI).
     NoInput(u32),
-    /// The GSI is past the I/O APIC vectors (`IOAPIC_BASE + gsi` > 0xef).
+    /// The GSI is past the I/O APIC vectors (`IOAPIC_BASE + gsi` >
+    /// `IOAPIC_LAST`).
     NoVector(u32),
     /// The input (or its vector) is routed already.
     Taken(u32),
@@ -371,8 +372,9 @@ crate::ktest!(
 crate::ktest!(
     fn device_vectors_are_not_fatal() {
         // A vector nothing handles (an unused one, an I/O APIC vector with
-        // no handler), or an 8259 line other than IRQ 7 and 15, is counted
-        // as unexpected (and warned about once); the spurious
+        // no handler, an MSI vector), or an 8259 line other than IRQ 7 and
+        // 15, is counted as unexpected (and reported the first time: an MSI
+        // vector as an error, nothing may send one yet); the spurious
         // vectors (the local APIC's, the 8259s' IRQ 7 and 15) only counted;
         // a local APIC error counted and logged. All return.
         use crate::arch::idt;
@@ -383,9 +385,11 @@ crate::ktest!(
         unsafe {
             core::arch::asm!(
                 "int {unused}", "int {unused}", "int {spurious}", "int {pic7}", "int {pic15}", "int {error}", "int {pic1}",
-                "int {ioapic}",
+                "int {ioapic}", "int {msi}", "int {msi}", "int {msi_last}",
                 unused = const idt::UNUSED,
                 ioapic = const idt::IOAPIC_LAST,
+                msi = const idt::MSI_BASE,
+                msi_last = const idt::MSI_LAST,
                 spurious = const idt::SPURIOUS,
                 pic7 = const idt::PIC_SPURIOUS_MASTER,
                 pic15 = const idt::PIC_SPURIOUS_SLAVE,
@@ -394,9 +398,55 @@ crate::ktest!(
             );
         }
         let after = idt::strays();
-        kassert_eq!(after.unexpected, before.unexpected + 4);
+        kassert_eq!(after.unexpected, before.unexpected + 7);
         kassert_eq!(after.spurious, before.spurious + 3);
         kassert_eq!(after.lapic_errors, before.lapic_errors + 1);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn an_unexpected_storm_is_reported_sparsely() {
+        // 2048 interrupts on a free vector: reported at the 1st, 1024th and
+        // 2048th only (test_ktest counts the lines), each counted.
+        use crate::arch::idt;
+        use crate::kassert_eq;
+        const V: u8 = idt::UNUSED + 1;
+        let before = idt::strays().unexpected;
+        for _ in 0..2048 {
+            // SAFETY: a software interrupt on a vector the dispatcher
+            // handles and returns from; the entry stub saves every register.
+            unsafe { core::arch::asm!("int {v}", v = const V) };
+        }
+        kassert_eq!(idt::strays().unexpected, before + 2048);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn msi_vector_delivered_by_the_apic_is_eoid() {
+        // A fixed self-IPI on an MSI vector arrives like a device's message
+        // would: through the local APIC, so the dispatcher must EOI it (with
+        // the EOI missing it stays in service and blocks every vector up to
+        // 0x9f, its priority class and below, the timer included). Nothing
+        // claims MSI vectors yet, so it is reported as an error.
+        use crate::arch::{apic, idt};
+        use crate::{kassert, kassert_eq};
+        const V: u8 = idt::MSI_BASE + 1;
+        kassert!(crate::arch::irq::enabled());
+        let before = idt::vector_count(V);
+        kassert!(apic::send_ipi(apic::lapic_id(), V));
+        let deadline = crate::time::now_ns() + 1_000_000_000;
+        while idt::vector_count(V) == before && crate::time::now_ns() < deadline {
+            core::hint::spin_loop();
+        }
+        let in_service = apic::in_service(V);
+        if in_service {
+            // Unblock the CPU so the failure is reported, not a timeout.
+            apic::eoi();
+        }
+        kassert_eq!(idt::vector_count(V), before + 1);
+        kassert!(!in_service);
         Ok(())
     }
 );
