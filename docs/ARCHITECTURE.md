@@ -1841,7 +1841,10 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
 
 ### Sound: virtio-sound (built, #99)
 
-- **Probe.** The `sound` row takes virtio device type 25. After the
+- **Probe.** The `sound` row takes virtio device type 25, one device:
+  the player is one (one slot, one thread, one format), so a second sound
+  function is declined (`ProbeError::NotMine`) before its transport is
+  touched, unless the first one's probe failed. After the
   crate's `VirtIOSound::new` it checks the device is ready, then (control
   requests: the known unbounded spins, once here) picks the first output
   stream and a format: signed 16-bit samples (what `lumen-synth` makes),

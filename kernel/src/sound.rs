@@ -33,7 +33,7 @@ use alloc::vec;
 use core::fmt::{self, Write};
 use core::num::NonZeroU8;
 use core::ops::RangeInclusive;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::time::Duration;
 
 use log::{info, warn};
@@ -297,7 +297,26 @@ pub fn beep(hz: u32, ms: u32) -> Result<u64, SoundError> {
     play(Box::new(tone))
 }
 
+/// Whether a sound device is bound, or being probed: the player is one
+/// (one slot, one thread, one format), so a second device is declined
+/// before its transport is touched.
+static TAKEN: AtomicBool = AtomicBool::new(false);
+
 fn probe(res: DeviceResources) -> Result<(), ProbeError> {
+    if TAKEN.swap(true, Ordering::AcqRel) {
+        info!(target: "sound", "{}: another sound device is bound; Lumen plays on one", res.info().addr);
+        return Err(ProbeError::NotMine);
+    }
+    let bound = bind(res);
+    if bound.is_err() {
+        // The next sound device may do better.
+        TAKEN.store(false, Ordering::Release);
+    }
+    bound
+}
+
+/// Bring the device up and start its thread (see [`probe`]).
+fn bind(res: DeviceResources) -> Result<(), ProbeError> {
     let transport = virtio::transport(res)?;
     let status = transport.status();
     let addr = transport.info().addr;

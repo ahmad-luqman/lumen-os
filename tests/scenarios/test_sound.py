@@ -164,6 +164,34 @@ def test_lspci_shows_sound_bound(boot):
     assert "WARN  sound" not in m.output and "WARN  drivers" not in m.output
 
 
+def test_a_second_sound_device_is_declined(boot, tmp_path):
+    # The player is one: the first sound function (in address order) is
+    # bound, the second declined before its transport is touched, and a
+    # beep plays on the first (recorded in `wav_path`).
+    second = tmp_path / "second.wav"
+    m = boot(
+        "qemutest",
+        devices=SOUND,
+        extra=[
+            "-audiodev", f"wav,id=lumen-audio2,path={second}",
+            "-device", "virtio-sound-pci,id=lumen-sound2,audiodev=lumen-audio2,streams=1",
+        ],
+    )  # fmt: skip
+    m.expect(SHELLS, 60)
+    m.expect(PROMPT, 60)
+    out = run(m, "lspci | where name = 'virtio sound' | select driver")
+    assert out == "  driver\n  sound: bound\n  no driver (sound declined it)\n", out
+    assert re.search(
+        r"INFO  sound: \S+: another sound device is bound; Lumen plays on one\n", m.output
+    )
+    assert len(re.findall(READY, m.output)) == 1
+    assert run(m, "beep 440 300") == ""
+    wait_played(m, 1)
+    wav = recording(m)
+    freq = audio.dominant_frequency(wav.first_channel, wav.rate)
+    assert freq is not None and abs(freq - 440) <= 4.4, freq
+
+
 def test_no_sound_device_message(boot):
     m = shell(boot, devices=Devices())
     assert run(m, "beep 440 500") == "beep: no sound device\n"
