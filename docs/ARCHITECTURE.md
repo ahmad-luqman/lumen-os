@@ -1030,6 +1030,22 @@ drawing the shown one) and `kernel/src/vt.rs` (routing keys to them);
   draws nothing more (`Canvas::is_live`; a draw under way stops at its
   next row or glyph) and its drop leaves the terminal alone (ktests check
   the taking back; the crash case is not tested).
+- **Mouse pointer** (#98): drawn by `term.rs` over everything (header
+  included) once the tablet reports a position (`term::move_pointer`, from
+  the tablet's thread; never before, so a boot without one draws what it
+  always did). A save-under arrow (`lumen_input::Cursor`, host-tested
+  against a model screen with random drawing around it): each drawing
+  step under the screen's lock that would touch the arrow's box (a cell, a
+  scroll's rows, a full redraw, a header box) takes it off first, putting
+  back what it covered, and the end of every step under the lock draws it
+  again at its newest position. So the terminal's redraws never erase it
+  and moving it leaves no trail (a ktest moves it over text, scrolls,
+  clears and header boxes and compares the pixels with drawing everything
+  afresh; a scenario does the same through QMP and screendumps). While a
+  canvas is live the arrow is off (a canvas draws without the lock, from
+  any CPU, so it can't be kept out of the arrow's box); dropping the
+  canvas draws it again (ktest and scenario). M4's compositor replaces
+  this with a cursor plane.
 - **Virtual terminals:** `term::VTS` (4) terminals, each its own grid and
   scrollback, all allocated at init (indexed by the shown one's number, so
   switching allocates nothing); one is drawn. Log lines go to the first;
@@ -1437,9 +1453,9 @@ section 2).
 
 ## 7. Driver interface (M3: PCI discovery, claiming and the virtio adapter built; MSI-X planned; device classes later)
 
-PCI discovery (#94), claiming and the virtio adapter (#95) are built; MSI-X
-is planned (#96), with the tests it lists. The first drivers (#97-#99) add
-their rows to the driver table.
+PCI discovery (#94), claiming and the virtio adapter (#95) are built, and
+the tablet's driver row (#98); MSI-X is planned (#96), with the tests it
+lists. rng (#97) and sound (#99) add their rows to the driver table.
 
 M3 lays the layer drivers stand on: finding PCI devices (#94), handing a
 driver exactly its device's resources and running `virtio-drivers` on top
@@ -1602,9 +1618,9 @@ pub struct Driver {
     earlier themselves.
   - `<driver>: failed: <reason>`, a warning, with bus mastering turned off
     so the device can't reach memory its driver dropped.
-  - Declined (`ProbeError::NotMine`: virtio's keyboard and tablet share an
-    id and are told apart only by their configuration): the function is
-    freed, its command register restored, and the next matching row is
+  - Declined (`ProbeError::NotMine`: a device the row's `matches` can't
+    rule out, e.g. another virtio input device with the tablet's class):
+    the function is freed, its command register restored, and the next matching row is
     offered it; `lspci` shows `no driver (<driver> declined it)` if no row
     takes it. A driver may decline only between `virtio::transport` and
     the crate's device constructor, reading the configuration through
@@ -1825,8 +1841,23 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
     probe attempt left outstanding.
 - **Polling until MSI-X.** Until #96, drivers poll (bounded where the crate
   allows, as above); event devices (the tablet) are polled from their
-  thread. Their API doesn't change when interrupts arrive: the handler
-  wakes the driver's `WaitQueue` instead.
+  thread, which sleeps between looks (`sched::sleep`, 5 ms for the
+  tablet), so polling costs no CPU while nothing happens. Their API
+  doesn't change when interrupts arrive: the handler wakes the driver's
+  `WaitQueue` instead. No lock is held across such a wait (`SpinLock`
+  keeps interrupts off, and a thread can't sleep under it): a device
+  that is waited on has one owner thread, the only code touching it
+  (the tablet's `mouse` thread), and the rest of the kernel reads what
+  that thread publishes.
+- **The tablet (#98).** virtio's keyboard and tablet share their PCI id
+  (1af4:1052, virtio input); QEMU gives them different class codes
+  (keyboard 09/00, tablet 09/80, a relative mouse 09/02), so the tablet's
+  row `matches` class 09/80 only and the keyboard is never offered to it.
+  Other 09/80 devices (multitouch, a passed-through host device) are
+  declined before the crate's constructor: the probe reads `EV_BITS` for
+  `EV_ABS` through the raw transport and needs `ABS_X` and `ABS_Y`, then
+  reads both axes' `ABS_INFO` ranges (and `ID_NAME`, for the log) before
+  `VirtIOInput::new` posts its 32 event buffers.
 
 ### Interrupts for devices: MSI-X (#96)
 
@@ -1893,6 +1924,26 @@ pub trait BlockDevice: Send + Sync {
 }
 pub struct BlockRequest { pub op: BlockOp, pub lba: u64, pub buf: DmaBuffer }
 ```
+
+**`InputDevice`** (defined with #98, the tablet; the PS/2 keyboard is the
+first implementation). An input device is a stream of messages, each one
+whole: nothing half applied is ever seen.
+
+- **Pointer:** `lumen_input::PointerState { x, y, buttons, wheel, hwheel }`,
+  one per device frame (evdev's events up to `SYN_REPORT`, applied
+  together by `lumen_input::Tablet`; a `SYN_DROPPED` discards the rest of
+  its frame). Positions are screen pixels, already scaled from the
+  device's axes (`AbsAxis::scale`, rounded, so a pixel a host aimed at
+  arrives exactly); wheels count clicks so far.
+- **Keys:** the keyboard's decoded keys (`lumen_shell::Key`, through
+  `crate::vt`'s per-terminal rings today).
+- **Delivery:** the device's owner thread publishes each message; a
+  consumer reads the newest state (`mouse::status`) or, for keys, takes
+  them in order. In M3 each device has one consumer (the cursor, the
+  shown terminal's shell), so the trait itself (`fn next(&self, after:
+  Seq) -> Option<(Seq, InputEvent)>` over a ring per device, with
+  `InputEvent::{Key, Pointer}`) lands with M4's desktop, the first
+  consumer of both.
 
 **virtio first** (rng, input, sound in M3; blk, 9p in M6; net in M7) under
 QEMU; real-hardware drivers (NVMe, AHCI, xHCI HID, a common NIC) in M12
