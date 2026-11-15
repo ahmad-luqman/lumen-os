@@ -200,6 +200,26 @@ def test_a_thread_first_run_once_a_crash_began_halts_for_its_report(boot):
     assert "exception: #PF page fault (vector 14," in report, report
 
 
+def test_a_thread_holding_a_lock_once_a_crash_began_still_panics(boot):
+    # As in the bystander test, but the thread on CPU 3 waits with its
+    # critical section still open: a bug whatever else is going on, so it
+    # panics instead of halting CPU 3, and its report (first to claim it)
+    # stops CPU 2, which was waiting for CPU 3 to halt.
+    report, _ = crash_on(boot, "heldelsewhere 2")
+    assert reported_by(report, 3) and "\nother cpus stopped: 0 1 2\n" in report, report
+    assert "\npanic: blocking where a thread can't (" in report, report
+
+
+def test_a_cpu_that_turned_interrupts_off_itself_still_panics_when_it_blocks(boot):
+    # CPU 0 turns interrupts off for good, then CPU 3 does too (and spins),
+    # as a report's stopped CPUs do after its owner; then CPU 0 blocks. CPU
+    # 0 started this itself, so its wait panics and it reports, rather than
+    # halting quietly as if for CPU 3.
+    report, _ = crash_on(boot, "selfblock")
+    assert reported_by(report, 0) and "\nother cpus stopped: 1 2 3\n" in report, report
+    assert "\npanic: blocking where a thread can't (" in report, report
+
+
 @pytest.mark.parametrize(
     ("kind", "error"),
     [

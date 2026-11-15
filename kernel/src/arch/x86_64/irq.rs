@@ -153,19 +153,31 @@ pub fn wait_unless(ready: impl FnOnce() -> bool) {
 /// they interrupted.
 pub fn disable_for_good() {
     cli();
-    FOR_GOOD.fetch_or(1 << percpu::index(), Ordering::Relaxed);
+    // `fetch_or`, not `store`: the bits accumulate, so a CPU that ran this
+    // stays told apart from one that didn't, whoever ran it later (every
+    // CPU a crash report stops runs it too, from the stop NMI).
+    FOR_GOOD.fetch_or(this_cpu_bit(), Ordering::Relaxed);
+}
+
+/// This CPU's bit in [`FOR_GOOD`].
+fn this_cpu_bit() -> u64 {
+    1 << percpu::index()
 }
 
 /// Whether [`disable_for_good`] has run, on any CPU (a crash report or a
 /// reboot has begun). On a CPU that didn't run it, interrupts then stay off
-/// once a critical section closes or a thread switches itself out and back
-/// in, until the crash report's stop NMI halts it (or the reset comes).
+/// once a critical section closes, a thread switches itself out and back
+/// in, or a new thread first runs, until the crash report's stop NMI halts
+/// it (or, for a reboot, the reset comes).
 pub fn disabled_for_good() -> bool {
     FOR_GOOD.load(Ordering::Relaxed) != 0
 }
 
-/// Whether another CPU than this one ran [`disable_for_good`]: whatever
-/// this CPU does next, it didn't start that crash report or reboot.
-pub fn disabled_for_good_elsewhere() -> bool {
-    FOR_GOOD.load(Ordering::Relaxed) & !(1 << percpu::index()) != 0
+/// Whether [`disable_for_good`] has run on some CPU but not on this one:
+/// this CPU didn't start that crash report or reboot, and hasn't been
+/// stopped for it yet (the stop NMI runs it too). False on the report's
+/// owner, the rebooting CPU and every CPU already stopped.
+pub fn disabled_for_good_but_not_here() -> bool {
+    let mask = FOR_GOOD.load(Ordering::Relaxed);
+    mask != 0 && mask & this_cpu_bit() == 0
 }

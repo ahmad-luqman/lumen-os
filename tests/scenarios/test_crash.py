@@ -107,7 +107,9 @@ def test_panic_produces_report(crash_report):
         # Interrupts off, no lock held (in a wait with a deadline).
         ("blockirqoff", "crash_block_with_interrupts_off"),
         # Interrupts off for good by this CPU itself, as by its own crash
-        # path or a reboot: not another CPU's report to halt for.
+        # path or a reboot: not another CPU's report to halt for (with
+        # another CPU's bit set too: test_smp's
+        # test_a_cpu_that_turned_interrupts_off_itself_still_panics_when_it_blocks).
         ("selfblock", "crash_block_after_disabling_for_good"),
     ],
 )
