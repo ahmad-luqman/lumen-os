@@ -9,7 +9,9 @@
 //!   device passed through) share 09/80: [`probe`] reads the device's
 //!   `EV_BITS` for `EV_ABS` through the raw transport, before the crate's
 //!   `VirtIOInput::new` posts its 32 event buffers, and declines one that
-//!   lacks `ABS_X` and `ABS_Y`.
+//!   lacks `ABS_X` and `ABS_Y`. Only the first tablet is used: another is
+//!   declined before its transport is set up (the state and the pointer
+//!   are single).
 //! - **One owner.** The probe hands the `VirtIOInput` to the `mouse`
 //!   thread, the only code that touches the device afterwards: no lock is
 //!   held across a wait. It polls the event queue every [`POLL_NS`]
@@ -150,8 +152,15 @@ fn axis(t: &mut VirtioTransport, axis: u16) -> Result<AbsAxis, ProbeError> {
 /// the crate posts any buffer), read the axes' ranges, start the crate's
 /// driver, and hand it to the `mouse` thread.
 fn probe(res: DeviceResources) -> Result<(), ProbeError> {
+    let addr = res.info().addr;
+    // One tablet: its state and the pointer are single. A second is
+    // declined before anything is set up (`probe_all` probes one function
+    // at a time, so nothing binds one meanwhile).
+    if let Some(first) = SHARED.lock().device.as_ref().map(|d| d.addr) {
+        info!(target: "mouse", "{addr}: a tablet is bound already (on {first}): only one is used");
+        return Err(ProbeError::NotMine);
+    }
     let mut t = virtio::transport(res)?;
-    let addr = t.info().addr;
     let mut abs = [0u8; 1];
     let size = query(&mut t, cfg::EV_BITS, evdev::EV_ABS as u8, &mut abs)?;
     let xy = (1 << evdev::ABS_X) | (1 << evdev::ABS_Y);

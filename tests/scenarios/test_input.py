@@ -372,16 +372,28 @@ def test_tablet_is_bound_and_the_keyboard_is_not(boot):
     # virtio's keyboard and tablet share a PCI id; the tablet driver takes
     # only the tablet (by its class), so the keyboard is never offered to
     # it: `lspci` shows the tablet bound and the keyboard without a driver.
-    m = boot("qemutest", devices=Devices(tablet=True, keyboard=True))
+    # Only one tablet is used: a second one is declined (before its
+    # transport is set up), and `mouse` names the first.
+    m = boot(
+        "qemutest",
+        devices=Devices(tablet=True, keyboard=True),
+        extra=["-device", "virtio-tablet-pci,id=lumen-tablet2"],
+    )
     addr = tablet_ready(m)
     rows = lspci_rows(m)
     qdev = {d["qdev_id"]: pci_address(d) for d in pci_devices(m)}
-    assert qdev["lumen-tablet"] == addr
-    assert rows[qdev["lumen-tablet"]][4] == "virtio-tablet: bound"
+    first, second = sorted([qdev["lumen-tablet"], qdev["lumen-tablet2"]])
+    assert addr == first
+    assert rows[first][4] == "virtio-tablet: bound"
+    assert rows[second][4] == "no driver (virtio-tablet declined it)"
     assert rows[qdev["lumen-keyboard"]][4] == "no driver"
-    assert "INFO  drivers: 1 bound, 0 failed, 0 declined, 0 not probed (1 driver row)\n" in m.output
-    assert "probing virtio-tablet on " + addr in m.output
-    assert m.output.count("probing virtio-tablet") == 1
+    assert "INFO  drivers: 1 bound, 0 failed, 1 declined, 0 not probed (1 driver row)\n" in m.output
+    assert (
+        f"INFO  mouse: {second}: a tablet is bound already (on {first}): only one is used\n"
+        in m.output
+    )
+    assert re.findall(r"probing virtio-tablet on (\S+)\n", m.output) == [first, second]
+    assert MOUSE_HEADER.fullmatch(mouse(m)[0])[1] == first
     assert "WARN" not in m.output
 
 
