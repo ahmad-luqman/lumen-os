@@ -123,6 +123,21 @@ def test_net_forwards_host_ports_on_loopback():
     ]  # fmt: skip
 
 
+def test_host_audio_plays_through_the_host():
+    # `make run SOUND=1`: the same device, on a host audio driver instead of
+    # the wav file; not both.
+    assert device_args(opts(host_audio="coreaudio")) == [
+        "-audiodev", "coreaudio,id=lumen-audio",
+        "-device", "virtio-sound-pci,id=lumen-sound,audiodev=lumen-audio,streams=1",
+    ]  # fmt: skip
+    with pytest.raises(ValueError, match="one virtio-sound device"):
+        device_args(opts(host_audio="pa", sound_wav=Path("w.wav")))
+    assert qemu.host_audio_driver("darwin", {}) == "coreaudio"
+    assert qemu.host_audio_driver("linux", {}) == "pa"
+    assert qemu.host_audio_driver("linux", {"LUMEN_AUDIO": "alsa"}) == "alsa"
+    assert qemu.host_audio_driver("darwin", {"LUMEN_AUDIO": ""}) == "coreaudio"
+
+
 def test_commas_in_paths_are_escaped():
     # QEMU would read what follows a lone comma as more options.
     args = device_args(

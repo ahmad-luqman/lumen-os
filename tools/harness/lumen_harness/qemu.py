@@ -36,7 +36,7 @@ import subprocess
 import threading
 import time
 import warnings
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, Self
@@ -190,6 +190,10 @@ class QemuOptions:
     virtio_rng: bool = False
     # virtio-sound, played into this wav file through QEMU's wav audiodev.
     sound_wav: Path | None = None
+    # virtio-sound, played through the host's speakers by this QEMU audio
+    # driver (`make run SOUND=1`: `host_audio_driver()`). Not with
+    # `sound_wav`.
+    host_audio: str | None = None
     # virtio-blk backed by this raw image (read-write).
     blk_image: Path | None = None
     # virtio-net on user networking: guest TCP port -> host port forwarded
@@ -214,6 +218,13 @@ DEVICE_IDS = {
 }
 
 
+def host_audio_driver(platform: str, env: Mapping[str, str]) -> str:
+    """The QEMU audio driver `make run SOUND=1` plays through: `LUMEN_AUDIO`
+    if set (e.g. `alsa`, `pipewire`, `sdl`), else Core Audio on macOS and
+    PulseAudio elsewhere (PipeWire serves it too)."""
+    return env.get("LUMEN_AUDIO") or ("coreaudio" if platform == "darwin" else "pa")
+
+
 def _opt(value: object) -> str:
     """A value inside a QEMU `key=value,...` option: commas doubled, or QEMU
     would read the rest of a path with one as more options."""
@@ -230,6 +241,13 @@ def device_args(o: QemuOptions) -> list[str]:
         args += ["-device", f"virtio-keyboard-pci,id={ids['keyboard']}"]
     if o.virtio_rng:
         args += ["-device", f"virtio-rng-pci,id={ids['rng']}"]
+    if o.sound_wav and o.host_audio:
+        raise ValueError("sound_wav and host_audio: one virtio-sound device, recorded or heard")
+    if o.host_audio:
+        args += [
+            "-audiodev", f"{_opt(o.host_audio)},id=lumen-audio",
+            "-device", f"virtio-sound-pci,id={ids['sound']},audiodev=lumen-audio,streams=1",
+        ]  # fmt: skip
     if o.sound_wav:
         # QEMU creates the wav file when it realizes the device. The header's
         # lengths depend on the version: 8.2 (CI) fills them in at exit (an

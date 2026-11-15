@@ -136,3 +136,10 @@ tests = [
     "scenario:test_pci::test_boots_with_every_virtio_device",
     "scenario:test_pci::test_a_taken_host_port_is_picked_again",
 ]
+
+[[feature]]
+name = "`make run SOUND=1`: virtio-sound on a host audio driver (Core Audio on macOS, PulseAudio elsewhere, `LUMEN_AUDIO` choosing another), never together with the wav recording (the command line is checked; CI doesn't boot it, having no speakers)"
+milestone = "M3"
+tests = [
+    "harness:test_devices::test_host_audio_plays_through_the_host",
+]

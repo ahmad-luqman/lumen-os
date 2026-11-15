@@ -9,7 +9,7 @@ milestones with test-based exit criteria; `docs/STATUS.md` is generated.
 ```bash
 make deps            # pinned Limine + OVMF into build/deps (sha256-checked)
 make build           # both kernels: build/lumen-kernel, build/lumen-kernel-ktest
-make run             # QEMU with a window, serial on your terminal (Ctrl-A x quits; HEADLESS=1)
+make run             # QEMU with a window, serial on your terminal (Ctrl-A x quits; HEADLESS=1; SOUND=1 for beep/play)
 make debug           # QEMU paused + gdb attached, stopped at kmain
 make test            # everything CI runs: host tests, flag audit, QEMU scenarios
 make test-host       # cargo test + harness self-tests (fast, no QEMU)
