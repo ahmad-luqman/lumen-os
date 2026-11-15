@@ -844,7 +844,7 @@ fn a_broken_s5_package_is_refused_not_misread() {
     why(&s5(b"", 0, &[]), Empty);
     why(&s5(b"", 0, &[0x0a, 5, 0x0a, 5]), Empty);
     why(&s5(b"", 2, &[0x0a, 5]), NotInteger);
-    why(&s5(b"", 2, &[b'A', b'B', b'C', b'D']), NotInteger);
+    why(&s5(b"", 2, b"ABCD"), NotInteger);
     // The package's length runs past the AML, and the AML ends inside it
     // (each cut at every byte).
     let good = s5(b"", 2, &[0x0a, 5, 0x0c, 5, 0, 0, 0]);
