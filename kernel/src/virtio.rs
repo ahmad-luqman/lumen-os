@@ -425,9 +425,8 @@ pub enum ProbeError {
     /// class without its axes): `probe_all` frees the function and offers
     /// it to the next driver row.
     NotMine,
-    /// The device is one the driver can't use (a tablet's axis range, no
-    /// stream or format sound can play, ...): why. Shared by the drivers
-    /// (#97-#99).
+    /// The device can't be used by this driver: its configuration or
+    /// behaviour.
     Unusable(String),
     /// The driver's thread couldn't be started. Shared by the drivers.
     Thread(crate::sched::SpawnError),
@@ -444,7 +443,7 @@ impl fmt::Display for ProbeError {
             }
             ProbeError::Wait(e) => write!(f, "{e}"),
             ProbeError::NotMine => f.write_str("not this driver's device"),
-            ProbeError::Unusable(why) => write!(f, "unusable: {why}"),
+            ProbeError::Unusable(why) => write!(f, "unusable device: {why}"),
             ProbeError::Thread(e) => write!(f, "no thread for the driver: {e}"),
         }
     }
