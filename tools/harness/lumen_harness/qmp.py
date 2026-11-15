@@ -64,14 +64,16 @@ def send_key_args(qcodes: Sequence[str], hold_ms: int) -> dict[str, Any]:
 # QEMU's absolute axes run from 0 to this (`INPUT_EVENT_ABS_MAX`), on QMP's
 # `input-send-event` and on virtio's tablet alike.
 ABS_MAX = 0x7FFF
-# QMP's pointer buttons (`InputButton`, qapi/ui.json) the harness presses.
-BUTTONS = ("left", "middle", "right", "side", "extra")
+# QMP's pointer buttons (`InputButton`, qapi/ui.json) the harness presses;
+# QEMU's tablet turns the wheel ones into `REL_WHEEL` clicks.
+BUTTONS = ("left", "middle", "right", "side", "extra", "wheel-up", "wheel-down")
 
 
 def abs_of(px: int, pixels: int) -> int:
     """Pixel `px` of a screen `pixels` wide as an absolute axis value
     (0-`ABS_MAX`), rounded to the nearest: the kernel scales it back to the
-    same pixel (`lumen_input::AbsAxis::scale`)."""
+    same pixel (`lumen_input::AbsAxis::scale`, which `tests/harness/
+    test_qmp.py`'s `kernel_scale` mirrors: change them together)."""
     if not (isinstance(pixels, int) and pixels >= 2):
         raise ValueError(f"a screen {pixels!r} pixels wide: expected 2 or more")
     if not (isinstance(px, int) and 0 <= px < pixels):

@@ -5,8 +5,14 @@
 //! events, ended by `EV_SYN`/`SYN_REPORT`. A [`Tablet`] applies them to a
 //! pending state and publishes it at the report, so a move to (x, y) is
 //! never seen half done (x moved, y not yet). `SYN_DROPPED` (the device's
-//! buffer overflowed) discards the events up to the next report, as evdev
-//! says to: the state stays what the last whole frame made it.
+//! buffer overflowed) discards its whole frame, up to the next
+//! `SYN_REPORT`, as evdev says to: the state stays what the last whole
+//! frame made it.
+//!
+//! A consumer that looks now and then (the kernel's tablet thread, every
+//! few milliseconds) sees only the newest state, so a state also carries
+//! what happened in between: each button's presses so far, the wheels'
+//! clicks so far, and the frame's sequence number.
 
 use core::fmt;
 
@@ -42,13 +48,12 @@ use evdev::*;
 pub struct Event {
     pub kind: u16,
     pub code: u16,
-    /// Signed for relative axes (a wheel's -1), stored as the device sends
-    /// it.
-    pub value: u32,
+    /// Signed, as evdev's `value` is (a wheel's -1).
+    pub value: i32,
 }
 
 impl Event {
-    pub const fn new(kind: u16, code: u16, value: u32) -> Event {
+    pub const fn new(kind: u16, code: u16, value: i32) -> Event {
         Event { kind, code, value }
     }
 }
@@ -126,24 +131,18 @@ impl Buttons {
         (Buttons::EXTRA, "extra"),
     ];
 
-    /// The button an `EV_KEY` code names, if it is a pointer's.
-    pub fn from_code(code: u16) -> Option<Buttons> {
-        Some(match code {
-            BTN_LEFT => Buttons::LEFT,
-            BTN_RIGHT => Buttons::RIGHT,
-            BTN_MIDDLE => Buttons::MIDDLE,
-            BTN_SIDE => Buttons::SIDE,
-            BTN_EXTRA => Buttons::EXTRA,
+    /// The button an `EV_KEY` code names, if it is a pointer's: its index
+    /// in [`PointerState::presses`] and its bit.
+    fn from_code(code: u16) -> Option<(usize, Buttons)> {
+        let i = match code {
+            BTN_LEFT => 0,
+            BTN_RIGHT => 1,
+            BTN_MIDDLE => 2,
+            BTN_SIDE => 3,
+            BTN_EXTRA => 4,
             _ => return None,
-        })
-    }
-
-    pub const fn bits(self) -> u8 {
-        self.0
-    }
-
-    pub const fn from_bits(bits: u8) -> Buttons {
-        Buttons(bits & 0x1f)
+        };
+        Some((i, Buttons::NAMES[i].0))
     }
 
     pub const fn contains(self, other: Buttons) -> bool {
@@ -196,6 +195,19 @@ pub struct PointerState {
     /// horizontal wheel's (right positive).
     pub wheel: i64,
     pub hwheel: i64,
+    /// Each button's presses so far (left, right, middle, side, extra): a
+    /// press and release between two looks shows here although
+    /// [`PointerState::buttons`] has it up again.
+    pub presses: [u64; 5],
+    /// Whole frames so far, this one included (1 for the first).
+    pub seq: u64,
+}
+
+impl PointerState {
+    /// Every button's presses so far.
+    pub fn clicks(&self) -> u64 {
+        self.presses.iter().sum()
+    }
 }
 
 /// An absolute pointer (virtio's tablet): its axes and the screen it
@@ -231,7 +243,8 @@ impl Tablet {
     }
 
     /// Apply one event; at a `SYN_REPORT`, the state the frame made (also
-    /// when it changed nothing). Events a tablet doesn't use are counted
+    /// when it changed nothing), except the report ending a frame a
+    /// `SYN_DROPPED` discarded. Events a tablet doesn't use are counted
     /// ([`Tablet::ignored`]).
     pub fn feed(&mut self, e: Event) -> Option<PointerState> {
         if self.dropping {
@@ -243,6 +256,7 @@ impl Tablet {
         }
         match (e.kind, e.code) {
             (EV_SYN, SYN_REPORT) => {
+                self.pending.seq += 1;
                 self.current = Some(self.pending);
                 return self.current;
             }
@@ -250,23 +264,24 @@ impl Tablet {
                 self.dropping = true;
                 self.dropped += 1;
             }
-            (EV_ABS, ABS_X) => self.pending.x = self.x.scale(e.value as i32, self.width),
-            (EV_ABS, ABS_Y) => self.pending.y = self.y.scale(e.value as i32, self.height),
-            (EV_REL, REL_WHEEL) => self.pending.wheel += i64::from(e.value as i32),
-            (EV_REL, REL_HWHEEL) => self.pending.hwheel += i64::from(e.value as i32),
-            (EV_KEY, code) if Buttons::from_code(code).is_some() => {
-                let b = Buttons::from_code(code).unwrap_or(Buttons::NONE);
-                // 0 released, 1 pressed, 2 held (autorepeat).
-                self.pending.buttons.set(b, e.value != 0);
-            }
+            (EV_ABS, ABS_X) => self.pending.x = self.x.scale(e.value, self.width),
+            (EV_ABS, ABS_Y) => self.pending.y = self.y.scale(e.value, self.height),
+            (EV_REL, REL_WHEEL) => self.pending.wheel += i64::from(e.value),
+            (EV_REL, REL_HWHEEL) => self.pending.hwheel += i64::from(e.value),
+            (EV_KEY, code) => match Buttons::from_code(code) {
+                Some((i, b)) => {
+                    // 0 released, 1 pressed, 2 held (autorepeat).
+                    let down = e.value != 0;
+                    if down && !self.pending.buttons.contains(b) {
+                        self.pending.presses[i] += 1;
+                    }
+                    self.pending.buttons.set(b, down);
+                }
+                None => self.ignored += 1,
+            },
             _ => self.ignored += 1,
         }
         None
-    }
-
-    /// The state the last whole frame made, if there was one.
-    pub fn state(&self) -> Option<PointerState> {
-        self.current
     }
 
     /// Events it had no use for.
@@ -274,7 +289,7 @@ impl Tablet {
         self.ignored
     }
 
-    /// `SYN_DROPPED`s seen (each discarded the rest of its frame).
+    /// `SYN_DROPPED`s seen (each discarded its whole frame).
     pub fn dropped(&self) -> u64 {
         self.dropped
     }
@@ -286,14 +301,14 @@ mod tests {
 
     const QEMU: AbsAxis = AbsAxis { min: 0, max: 32767 };
 
-    fn abs(code: u16, v: u32) -> Event {
+    fn abs(code: u16, v: i32) -> Event {
         Event::new(EV_ABS, code, v)
     }
     fn key(code: u16, down: bool) -> Event {
-        Event::new(EV_KEY, code, u32::from(down))
+        Event::new(EV_KEY, code, i32::from(down))
     }
     fn rel(code: u16, v: i32) -> Event {
-        Event::new(EV_REL, code, v as u32)
+        Event::new(EV_REL, code, v)
     }
     const SYN: Event = Event::new(EV_SYN, SYN_REPORT, 0);
     const DROPPED: Event = Event::new(EV_SYN, SYN_DROPPED, 0);
@@ -338,8 +353,9 @@ mod tests {
     #[test]
     fn every_pixel_the_harness_aims_at_comes_back() {
         // The harness turns a pixel into QEMU's 0-32767 by rounding
-        // (`lumen_harness.qemu.abs_of`); the kernel must land on the same
-        // pixel, on every screen size the tests may use.
+        // (`lumen_harness.qmp.abs_of`, which this mirrors: change them
+        // together); the kernel must land on the same pixel, on every
+        // screen up to 32768 pixels (where the axis has a step per pixel).
         for pixels in [2usize, 3, 640, 800, 1024, 1280, 1920, 2560, 4096, 32768] {
             let last = pixels as u64 - 1;
             for x in 0..pixels as u64 {
@@ -352,16 +368,14 @@ mod tests {
     #[test]
     fn a_frame_is_published_at_its_report_only() {
         let mut t = Tablet::new(QEMU, QEMU, 1280, 800);
-        assert_eq!(t.state(), None);
         assert_eq!(t.feed(abs(ABS_X, 32767)), None);
-        assert_eq!(t.feed(abs(ABS_Y, 32767)), None);
-        assert_eq!(t.state(), None, "not before the report");
+        assert_eq!(t.feed(abs(ABS_Y, 32767)), None, "not before the report");
         let s = t.feed(SYN).unwrap();
-        assert_eq!((s.x, s.y), (1279, 799));
-        assert_eq!(t.state(), Some(s));
-        // A frame moving x only keeps y; an empty frame reports the same.
-        assert_eq!(feed_all(&mut t, &[abs(ABS_X, 0), SYN]), [PointerState { x: 0, y: 799, ..s }]);
-        assert_eq!(feed_all(&mut t, &[SYN]), [PointerState { x: 0, y: 799, ..s }]);
+        assert_eq!((s.x, s.y, s.seq), (1279, 799, 1));
+        // A frame moving x only keeps y; an empty frame reports the same
+        // (each its own sequence number).
+        assert_eq!(feed_all(&mut t, &[abs(ABS_X, 0), SYN]), [PointerState { x: 0, seq: 2, ..s }]);
+        assert_eq!(feed_all(&mut t, &[SYN]), [PointerState { x: 0, seq: 3, ..s }]);
     }
 
     #[test]
@@ -388,8 +402,28 @@ mod tests {
         assert_eq!(b, ["left", "left right middle", "right middle", "side extra"]);
         assert_eq!(Buttons::NONE.to_string(), "none");
         assert_eq!(format!("{:?}", Buttons::LEFT), "Buttons(left)");
-        assert_eq!(Buttons::from_bits(0xff).bits(), 0x1f);
+        // Presses count once each (an autorepeat 2 after a press isn't
+        // another).
+        assert_eq!(states[3].presses, [1, 1, 1, 1, 1]);
+        assert_eq!(states[3].clicks(), 5);
         assert_eq!(t.ignored(), 0);
+    }
+
+    #[test]
+    fn a_click_between_two_looks_still_shows() {
+        // Pressed and released in frames read in one batch: the newest
+        // state has the button up, but its presses went up by one.
+        let mut t = Tablet::new(QEMU, QEMU, 100, 100);
+        let batch = feed_all(&mut t, &[key(BTN_LEFT, true), SYN, key(BTN_LEFT, false), SYN]);
+        let newest = batch.last().copied().unwrap();
+        assert_eq!(newest.buttons, Buttons::NONE);
+        assert_eq!((newest.presses[0], newest.seq), (1, 2));
+        // Even pressed and released inside one frame.
+        let s = feed_all(&mut t, &[key(BTN_RIGHT, true), key(BTN_RIGHT, false), SYN])[0];
+        assert_eq!((s.buttons, s.presses[1], s.clicks()), (Buttons::NONE, 1, 2));
+        // Held with autorepeat, released: one press.
+        let held = [key(BTN_LEFT, true), SYN, Event::new(EV_KEY, BTN_LEFT, 2), SYN, key(BTN_LEFT, false), SYN];
+        assert_eq!(feed_all(&mut t, &held).last().unwrap().presses[0], 2);
     }
 
     #[test]
@@ -414,11 +448,14 @@ mod tests {
             &mut t,
             &[abs(ABS_X, 0), DROPPED, abs(ABS_Y, 32767), key(BTN_LEFT, false), SYN, abs(ABS_Y, 16384), SYN],
         );
-        assert_eq!(after, [PointerState { y: 400, ..first }]);
+        assert_eq!(after, [PointerState { y: 400, seq: 2, ..first }]);
         assert_eq!(t.dropped(), 1);
         // Before any whole frame: back to the start.
         let mut t = Tablet::new(QEMU, QEMU, 1280, 800);
-        assert_eq!(feed_all(&mut t, &[abs(ABS_X, 32767), DROPPED, SYN, SYN]), [PointerState::default()]);
+        assert_eq!(
+            feed_all(&mut t, &[abs(ABS_X, 32767), DROPPED, SYN, SYN]),
+            [PointerState { seq: 1, ..PointerState::default() }]
+        );
     }
 
     #[test]
@@ -435,7 +472,7 @@ mod tests {
                 SYN,
             ],
         );
-        assert_eq!(s, [PointerState::default()]);
+        assert_eq!(s, [PointerState { seq: 1, ..PointerState::default() }]);
         assert_eq!(t.ignored(), 5);
     }
 }

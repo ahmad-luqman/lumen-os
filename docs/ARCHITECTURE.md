@@ -1040,8 +1040,10 @@ drawing the shown one) and `kernel/src/vt.rs` (routing keys to them);
   back what it covered, and the end of every step under the lock draws it
   again at its newest position. So the terminal's redraws never erase it
   and moving it leaves no trail (a ktest moves it over text, scrolls,
-  clears and header boxes and compares the pixels with drawing everything
-  afresh; a scenario does the same through QMP and screendumps). While a
+  clears, full redraws, the header's boxes and the screen's bottom corner
+  and compares the pixels with drawing everything afresh; a scenario moves
+  it across text, the header and its boxes, types below it and compares
+  screendumps with a fresh redraw). While a
   canvas is live the arrow is off (a canvas draws without the lock, from
   any CPU, so it can't be kept out of the arrow's box); dropping the
   canvas draws it again (ktest and scenario). M4's compositor replaces
@@ -1619,13 +1621,15 @@ pub struct Driver {
   - `<driver>: failed: <reason>`, a warning, with bus mastering turned off
     so the device can't reach memory its driver dropped.
   - Declined (`ProbeError::NotMine`: a device the row's `matches` can't
-    rule out, e.g. another virtio input device with the tablet's class):
-    the function is freed, its command register restored, and the next matching row is
-    offered it; `lspci` shows `no driver (<driver> declined it)` if no row
-    takes it. A driver may decline only between `virtio::transport` and
-    the crate's device constructor, reading the configuration through
-    `VirtioTransport::read_config_space` (virtio-input's ID_NAME and
-    EV_BITS selections don't depend on the features): after the
+    rule out, e.g. a second tablet, or another virtio input device with
+    the tablet's class): the function is freed, its command register
+    restored, and the next matching row is offered it; `lspci` shows `no
+    driver (<driver> declined it)` if no row takes it. A driver may
+    decline only before the crate's device constructor: before
+    `virtio::transport` (the tablet's one-tablet rule), or after it,
+    reading the configuration through `VirtioTransport::read_config_space`
+    (virtio-input's ID_NAME, EV_BITS and ABS_INFO selections don't depend
+    on the features): after the
     constructor the crate has posted buffers it never takes back
     (`VirtIOInput`: 32 bounce runs), and under #96 MSI-X would be enabled,
     so #96 allocates the vector lazily, at the first `queue_set`, and a
@@ -1635,17 +1639,34 @@ pub struct Driver {
   `no driver` is shown for a function no driver took. DMA runs handed out
   during a probe attempt are recorded as that attempt's, so a failed or
   declined probe warns with the runs it left outstanding (buffers still
-  posted when its queues were dropped), not counting a previous row's;
-  runs another thread hands out meanwhile count too (no driver thread runs
-  at boot). A summary line counts the bound, failed, declined and refused.
+  posted when its queues were dropped), not counting a previous row's.
+  Only the probing thread's runs are charged to the attempt (the attempt
+  records its thread): a bound driver's thread handing out runs meanwhile
+  (the tablet's re-posting its event buffers while later functions are
+  probed) isn't blamed on the probe (a ktest). A summary line counts the
+  bound, failed, declined and refused.
+- **A probe's side effects come last.** A thread started or state
+  published for the rest of the kernel comes after the probe's last
+  fallible check, `StatusHandle::check_ready` included (the tablet checks
+  it itself before publishing and spawning; a spawn that fails undoes the
+  publishing), so a failed probe leaves no live thread or "healthy"
+  status behind. A device that fails after binding (its thread sees
+  `FAILED` or `DEVICE_NEEDS_RESET`) is marked with
+  `pci::failed_after_bind`: `lspci` shows `<driver>: failed: <why>` and
+  bus mastering goes off.
+- **Shared errors.** `ProbeError::Unusable(String)` (a device the driver
+  can't use: a tablet's axis range, no stream or format sound can play)
+  and `ProbeError::Thread(SpawnError)` (no thread for the driver) are
+  shared by the M3 drivers (#97-#99).
 - **A virtio driver's probe** calls `virtio::transport(res)` from the probe
   itself (runs and the status handle are charged to the running probe
   attempt), may decline the device (above), then calls the crate's device
   constructor and keeps the device.
-- **Blocking and locks.** A driver keeps its device in its own state (a
-  `SpinLock` static), holds the lock (interrupts off) only for one
-  operation, and waits outside it, with a bound, where the crate allows
-  it. Only `VirtIOInput::pop_pending_event` and sound's
+- **Blocking and locks.** A driver whose callers come from anywhere (rng)
+  keeps its device in its own state (a `SpinLock` static), holds the lock
+  (interrupts off) only for one operation, and waits outside it, with a
+  bound, where the crate allows it; an event device (the tablet) has one
+  owner thread instead (below), and no lock around the device at all. Only `VirtIOInput::pop_pending_event` and sound's
   `pcm_xfer_nb`/`pcm_xfer_ok` are non-blocking. `VirtIORng::request_entropy`
   and every sound control request (`pcm_set_params`, `pcm_prepare`,
   `pcm_start`, `pcm_stop`, `pcm_release`, and `set_up`'s info queries,
@@ -1836,9 +1857,11 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
     posted 8-byte input event holds a 4 KiB bounce frame. Buffers still
     posted when their queue is dropped are never unshared (`VirtQueue` and
     `OwningQueue` have no `Drop` that does): their frames and table entries
-    leak. Drivers are never dropped in M3, but a probe that fails (or
-    declines) partway leaks this way; `probe_all` reports the runs that
-    probe attempt left outstanding.
+    leak. A probe that fails (or declines) partway leaks this way, and
+    `probe_all` reports the runs that probe attempt left outstanding; so
+    does a driver dropped later: the tablet's, when its device fails (or
+    its thread can't be spawned), leaks its up to 32 posted event buffers
+    (its error line says how many runs are outstanding then).
 - **Polling until MSI-X.** Until #96, drivers poll (bounded where the crate
   allows, as above); event devices (the tablet) are polled from their
   thread, which sleeps between looks (`sched::sleep`, 5 ms for the
@@ -1857,7 +1880,10 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
   declined before the crate's constructor: the probe reads `EV_BITS` for
   `EV_ABS` through the raw transport and needs `ABS_X` and `ABS_Y`, then
   reads both axes' `ABS_INFO` ranges (and `ID_NAME`, for the log) before
-  `VirtIOInput::new` posts its 32 event buffers.
+  `VirtIOInput::new` posts its 32 event buffers (a scenario attaches
+  QEMU's multitouch panel, 09/80 without `ABS_X`/`ABS_Y`, and finds it
+  declined). Only one tablet is used: a second is declined before its
+  transport is set up.
 
 ### Interrupts for devices: MSI-X (#96)
 
@@ -1913,8 +1939,9 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
 `BlockDevice` (M6), `NetDevice` (send/receive frames, M7), `InputDevice`
 (event stream: the keyboard and the tablet), `Display` (framebuffer +
 flush rectangles), `Console`: traits whose methods are the messages above,
-added when a class has a second implementation. The shape, for the block
-device:
+added when a class has a second implementation and a consumer that needs
+the common interface (`InputDevice`: M4's desktop, below). The shape, for
+the block device:
 
 ```rust
 pub trait BlockDevice: Send + Sync {
@@ -1929,21 +1956,29 @@ pub struct BlockRequest { pub op: BlockOp, pub lba: u64, pub buf: DmaBuffer }
 first implementation). An input device is a stream of messages, each one
 whole: nothing half applied is ever seen.
 
-- **Pointer:** `lumen_input::PointerState { x, y, buttons, wheel, hwheel }`,
-  one per device frame (evdev's events up to `SYN_REPORT`, applied
-  together by `lumen_input::Tablet`; a `SYN_DROPPED` discards the rest of
-  its frame). Positions are screen pixels, already scaled from the
-  device's axes (`AbsAxis::scale`, rounded, so a pixel a host aimed at
-  arrives exactly); wheels count clicks so far.
+- **Pointer:** `lumen_input::PointerState { x, y, buttons, wheel, hwheel,
+  presses, seq }`, one per device frame (evdev's events up to
+  `SYN_REPORT`, applied together by `lumen_input::Tablet`; a
+  `SYN_DROPPED` discards its whole frame, up to the next `SYN_REPORT`).
+  Positions are screen pixels, already scaled from the device's axes
+  (`AbsAxis::scale`, rounded, so a pixel a host aimed at arrives exactly,
+  on screens up to 32768 pixels); wheels count clicks so far, each
+  button its presses so far, and `seq` the frames so far, so a consumer
+  that only sees the newest state still sees a click (or a wheel turn)
+  that came and went between two looks.
 - **Keys:** the keyboard's decoded keys (`lumen_shell::Key`, through
-  `crate::vt`'s per-terminal rings today).
-- **Delivery:** the device's owner thread publishes each message; a
-  consumer reads the newest state (`mouse::status`) or, for keys, takes
-  them in order. In M3 each device has one consumer (the cursor, the
-  shown terminal's shell), so the trait itself (`fn next(&self, after:
-  Seq) -> Option<(Seq, InputEvent)>` over a ring per device, with
-  `InputEvent::{Key, Pointer}`) lands with M4's desktop, the first
-  consumer of both.
+  `crate::vt`'s per-terminal rings today). That is a line editor's key
+  (characters and editing keys, no key-up, no modifiers on their own),
+  not a desktop's key event: M4 adds one (key code, press/release,
+  modifiers) for the desktop.
+- **Delivery:** the device's owner thread reads a batch of events per
+  poll and publishes the newest state with the batch's counts (`mouse::
+  status`: one snapshot under one lock), overwriting the last; keys are
+  taken in order from their ring. In M3 each device has one consumer
+  (the cursor, the shown terminal's shell), so the trait itself (`fn
+  next(&self, after: Seq) -> Option<(Seq, InputEvent)>` over a ring per
+  device, with `InputEvent::{Key, Pointer}`) lands with M4's desktop, the
+  first consumer of both.
 
 **virtio first** (rng, input, sound in M3; blk, 9p in M6; net in M7) under
 QEMU; real-hardware drivers (NVMe, AHCI, xHCI HID, a common NIC) in M12

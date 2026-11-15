@@ -56,7 +56,9 @@ def test_send_key_presses_together_and_holds():
 
 
 def kernel_scale(value: int, pixels: int) -> int:
-    """`lumen_input::AbsAxis::scale` on QEMU's 0-32767 axis."""
+    """`lumen_input::AbsAxis::scale` on QEMU's 0-32767 axis: mirrors it (and
+    its test `every_pixel_the_harness_aims_at_comes_back` mirrors `abs_of`),
+    so change them together."""
     return (value * (pixels - 1) + ABS_MAX // 2) // ABS_MAX
 
 
@@ -85,8 +87,9 @@ def test_a_move_sends_both_axes_and_a_button_its_state():
     assert button_args("right", True) == {
         "events": [{"type": "btn", "data": {"down": True, "button": "right"}}]
     }
-    with pytest.raises(ValueError, match="no pointer button 'wheel-up'"):
-        button_args("wheel-up", True)
+    assert button_args("wheel-down", True)["events"][0]["data"]["button"] == "wheel-down"
+    with pytest.raises(ValueError, match="no pointer button 'wheel'"):
+        button_args("wheel", True)
 
 
 def _client(*lines: dict) -> tuple[QmpClient, socket.socket]:

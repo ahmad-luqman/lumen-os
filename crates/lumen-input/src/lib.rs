@@ -17,5 +17,5 @@
 pub mod cursor;
 pub mod tablet;
 
-pub use cursor::{Cursor, SPRITE_H, SPRITE_W, Surface};
+pub use cursor::{Cursor, Surface};
 pub use tablet::{AbsAxis, AxisError, Buttons, Event, PointerState, Tablet, evdev};

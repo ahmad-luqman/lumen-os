@@ -13,15 +13,23 @@ from . import BUILD_DIR
 from .qemu import QemuOptions, fresh_vars, qemu_args
 
 
-def cmd_run(a: argparse.Namespace) -> int:
-    opts = QemuOptions(
-        iso=a.iso,
-        vars_file=fresh_vars(BUILD_DIR / "run/OVMF_VARS.fd"),
-        headless=a.headless,
+def run_options(iso: Path, vars_file: Path, headless: bool) -> QemuOptions:
+    """`make run`'s machine: serial on the terminal, and a virtio tablet so
+    the mouse moves the pointer in the window (drawn only once the tablet
+    reports, so nothing changes until the mouse moves there)."""
+    return QemuOptions(
+        iso=iso,
+        vars_file=vars_file,
+        headless=headless,
         serial="mon:stdio",  # Ctrl-A c reaches the QEMU monitor
         monitor=None,
         log_file=BUILD_DIR / "run/qemu.log",
+        virtio_tablet=True,
     )
+
+
+def cmd_run(a: argparse.Namespace) -> int:
+    opts = run_options(a.iso, fresh_vars(BUILD_DIR / "run/OVMF_VARS.fd"), a.headless)
     args = qemu_args(opts)
     print("+", " ".join(args), file=sys.stderr)
     print("(serial is attached here; Ctrl-A x quits QEMU)", file=sys.stderr)

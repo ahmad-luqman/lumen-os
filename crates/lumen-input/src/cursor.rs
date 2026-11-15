@@ -36,14 +36,14 @@ const SPRITE: [&[u8; SPRITE_W]; SPRITE_H] = [
 
 /// What the arrow paints at (`dx`, `dy`) from its tip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Paint {
+enum Paint {
     Clear,
     Outline,
     Fill,
 }
 
 /// The arrow's pixel at (`dx`, `dy`) (clear outside its box).
-pub fn paint(dx: usize, dy: usize) -> Paint {
+fn paint(dx: usize, dy: usize) -> Paint {
     match SPRITE.get(dy).and_then(|row| row.get(dx)) {
         Some(b'X') => Paint::Outline,
         Some(b'o') => Paint::Fill,
@@ -78,19 +78,17 @@ pub struct Cursor {
     saved: [u32; SPRITE_W * SPRITE_H],
 }
 
+/// Not drawn anywhere.
 impl Default for Cursor {
-    fn default() -> Self {
-        Cursor::new()
+    fn default() -> Cursor {
+        Cursor { drawn: None, saved: [0; SPRITE_W * SPRITE_H] }
     }
 }
 
 impl Cursor {
-    /// Not drawn anywhere.
-    pub const fn new() -> Cursor {
-        Cursor { drawn: None, saved: [0; SPRITE_W * SPRITE_H] }
-    }
 
-    /// Where its tip is drawn, if it is.
+    /// Where its tip is drawn, if any of it is (a tip off the surface
+    /// draws nothing, so it isn't drawn).
     pub fn drawn_at(&self) -> Option<(usize, usize)> {
         self.drawn.map(|(x, y, _, _)| (x, y))
     }
@@ -99,14 +97,7 @@ impl Cursor {
     /// rectangle at (`x`, `y`).
     pub fn overlaps(&self, x: usize, y: usize, w: usize, h: usize) -> bool {
         let Some((cx, cy, cw, ch)) = self.drawn else { return false };
-        cw > 0
-            && ch > 0
-            && w > 0
-            && h > 0
-            && x < cx + cw
-            && cx < x.saturating_add(w)
-            && y < cy + ch
-            && cy < y.saturating_add(h)
+        w > 0 && h > 0 && x < cx + cw && cx < x.saturating_add(w) && y < cy + ch && cy < y.saturating_add(h)
     }
 
     /// Draw the arrow with its tip at (`x`, `y`) in `outline` and `fill`,
@@ -130,7 +121,7 @@ impl Cursor {
                 }
             }
         }
-        self.drawn = Some((x, y, w, h));
+        self.drawn = (w > 0 && h > 0).then_some((x, y, w, h));
     }
 
     /// Put back what the arrow covered, if it is drawn (only the pixels it
@@ -144,12 +135,6 @@ impl Cursor {
                 }
             }
         }
-    }
-
-    /// Forget the arrow without touching the pixels: whatever was drawn
-    /// over all of it (a full redraw, a crash screen) replaced it.
-    pub fn forget(&mut self) {
-        self.drawn = None;
     }
 }
 
@@ -231,7 +216,7 @@ mod tests {
     fn hiding_puts_back_what_was_there() {
         let model = Grid::new(40, 30, 7);
         let mut screen = model.clone();
-        let mut c = Cursor::new();
+        let mut c = Cursor::default();
         assert_eq!(c.drawn_at(), None);
         c.hide(&mut screen);
         assert_eq!(screen, model, "hiding an undrawn arrow changes nothing");
@@ -254,7 +239,7 @@ mod tests {
         let model = Grid::new(20, 20, 3);
         for (x, y) in [(19, 19), (15, 0), (0, 10), (10, 19), (20, 5), (5, 20), (100, 100)] {
             let mut screen = model.clone();
-            let mut c = Cursor::new();
+            let mut c = Cursor::default();
             c.show(&mut screen, x, y, OUT, FILL);
             assert_eq!(screen, expected(&model, Some((x, y))), "at ({x}, {y})");
             c.hide(&mut screen);
@@ -265,7 +250,7 @@ mod tests {
     #[test]
     fn overlap_is_the_clipped_box() {
         let mut screen = Grid::new(30, 30, 1);
-        let mut c = Cursor::new();
+        let mut c = Cursor::default();
         assert!(!c.overlaps(0, 0, 30, 30), "not drawn");
         c.show(&mut screen, 10, 10, OUT, FILL);
         assert!(c.overlaps(10, 10, 1, 1));
@@ -281,11 +266,13 @@ mod tests {
         c.show(&mut screen, 25, 25, OUT, FILL);
         assert!(c.overlaps(29, 29, 1, 1));
         assert!(!c.overlaps(30, 25, 10, 10));
-        // Off the surface: drawn nowhere, overlapping nothing.
+        // Off the surface: drawn nowhere, overlapping nothing (the old
+        // place restored).
+        let shown = screen.clone();
         c.show(&mut screen, 30, 30, OUT, FILL);
-        assert!(!c.overlaps(0, 0, usize::MAX, usize::MAX));
-        c.forget();
         assert_eq!(c.drawn_at(), None);
+        assert!(!c.overlaps(0, 0, usize::MAX, usize::MAX));
+        assert_ne!(screen, shown, "the arrow at (25, 25) was taken off");
     }
 
     #[test]
@@ -302,7 +289,7 @@ mod tests {
         let (w, h) = (48, 40);
         let mut model = Grid::new(w, h, 99);
         let mut screen = model.clone();
-        let mut c = Cursor::new();
+        let mut c = Cursor::default();
         let mut at = None;
         for step in 0..20_000 {
             match next(4) {

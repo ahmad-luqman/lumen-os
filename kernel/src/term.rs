@@ -94,8 +94,9 @@ struct Screen {
     /// Whose [`Canvas`] has the pixels, if one has: draw nothing then.
     canvas: Option<Owner>,
     /// Where the mouse pointer's tip should be (framebuffer pixels), if the
-    /// tablet reported one, and the arrow as drawn.
+    /// tablet reported a position (and the pointer wasn't hidden since).
     pointer_at: Option<(usize, usize)>,
+    /// The arrow as drawn, and the pixels it covers.
     pointer: lumen_input::Cursor,
 }
 
@@ -139,7 +140,7 @@ pub fn init(fb: Framebuffer) {
         cells_drawn: 0,
         canvas: None,
         pointer_at: None,
-        pointer: lumen_input::Cursor::new(),
+        pointer: lumen_input::Cursor::default(),
     };
     screen.draw_tabs();
     *SCREEN.lock() = Some(screen);
@@ -385,15 +386,13 @@ impl Screen {
         }
     }
 
-    /// Draw the mouse pointer at [`Self::pointer_at`] (moving it there, or
-    /// taking it off if there is none), unless a canvas has the pixels (it
-    /// was taken off then).
+    /// Draw the mouse pointer at [`Self::pointer_at`] (moving it there), or
+    /// take it off if there is none or a canvas has the pixels (a canvas
+    /// draws without the lock, so the arrow can't be kept out of its way).
+    /// The one place that decides whether the pointer shows.
     fn place_pointer(&mut self) {
-        if self.canvas.is_some() {
-            return;
-        }
         let px = &mut Pixels(&self.fb);
-        match self.pointer_at {
+        match self.pointer_at.filter(|_| self.canvas.is_none()) {
             Some((x, y)) => {
                 let (outline, fill) = (self.fb.encode(POINTER_OUTLINE), self.fb.encode(POINTER_FILL));
                 self.pointer.show(px, x, y, outline, fill);
@@ -563,8 +562,7 @@ pub fn canvas(owner: Owner) -> Result<Canvas, CanvasError> {
         if let Some(vt) = owner.vt {
             s.switch(vt);
         }
-        // Off until the canvas goes: the canvas draws without the lock.
-        s.pointer.hide(&mut Pixels(&s.fb));
+        // (`drawing` takes the pointer off now: `place_pointer`.)
         // SAFETY: the terminal's handle draws nothing while the canvas is
         // live (`Screen::canvas`), so the two never draw at the same time
         // (see `Canvas`'s `Sync` for a canvas no longer live).
@@ -800,7 +798,7 @@ pub fn shown() -> usize {
 /// Point the mouse pointer's tip at framebuffer pixel (`x`, `y`) and draw
 /// it there (taken off its old place), or, while a [`Canvas`] has the
 /// pixels, when the canvas goes. False if there is no terminal to draw it
-/// with (or a crash report started).
+/// with, a crash report started, or this CPU is already drawing.
 pub fn move_pointer(x: usize, y: usize) -> bool {
     with_screen(|s| s.pointer_at = Some((x, y))).is_some()
 }
@@ -1169,31 +1167,33 @@ crate::ktest!(
 crate::ktest!(
     fn the_pointer_survives_redraws_and_leaves_no_trail() {
         // The mouse pointer over the terminal while it draws, scrolls (whole
-        // screen and a region), clears, and redraws the header's boxes
-        // below it, moved across all of it: after each step its
-        // tip is drawn where it was put, and once it is taken off, the
-        // pixels (the grid and the header's boxes) are exactly what drawing
-        // everything afresh gives. Then a canvas takes it off until dropped.
-        // (The ktests boot with no tablet: nothing else moves it.)
+        // screen and a region), clears, redraws everything and redraws the
+        // header's boxes below it, moved across all of it: after each step
+        // its tip is drawn where it was put, and once it is taken off, the
+        // pixels (everything below the header, its margins included, and
+        // the header's boxes) are exactly what drawing everything afresh
+        // gives. Then a canvas takes it off until dropped. (The ktests boot
+        // with no tablet: nothing else moves it.)
         use crate::{kassert, kassert_eq};
-        const STEPS: [&[u8]; 6] = [
+        const STEPS: [&[u8]; 7] = [
             b"\x1b[r\x1b[999;1H\r\nunder the pointer",
             b"\r\nscrolled below the pointer",
             b"\x1b[3;12r\x1b[12;1H\nregion scrolled",
             b"\x1b[r\x1b[H\x1b[2Jcleared",
             b"\x1b[1;1H\x1b[44m          \x1b[0m",
             b"\x1b[999;1H\r\n",
+            // A step that also redraws everything (below).
+            b"",
         ];
         reset_view(0);
         kassert_eq!(pointer_drawn(), None);
-        let (rows, w, h, x0, y0, cell_w, fb_w) = with_screen(|s| {
-            let rows = s.term().rows();
-            (rows, s.term().cols() * s.cell_w, rows * CELL_H, s.x0, s.y0, s.cell_w, s.fb.width())
-        })
-        .ok_or("no terminal")?;
+        let (rows, x0, y0, cell_w, fb_w, fb_h) =
+            with_screen(|s| (s.term().rows(), s.x0, s.y0, s.cell_w, s.fb.width(), s.fb.height()))
+                .ok_or("no terminal")?;
         let tabs = tab_x(fb_w, 0).ok_or("no header boxes on this screen")?;
-        // Tips: inside the grid on cell edges, on the top row, straddling
-        // the header and the grid, on the header's boxes, at the edges.
+        // Tips: inside the grid on cell edges, on the bottom row's first
+        // cell, straddling the header and the grid, on the header's boxes,
+        // at the right edge, and in the bottom margin's corner (clipped).
         let tips = [
             (x0 + 3 * cell_w, y0 + 2 * CELL_H),
             (x0 + 3 * cell_w + 5, y0 + 2 * CELL_H + 9),
@@ -1202,17 +1202,18 @@ crate::ktest!(
             (tabs + 3, TAB_Y + 2),
             (tabs + TAB_W + 1, TAB_Y + TAB_H - 4),
             (fb_w - 1, y0 + 5 * CELL_H),
+            (x0 + 2, fb_h - 3),
         ];
         let mut fill = alloc::string::String::new();
         for r in 1..=rows {
             let _ = write!(fill, "\x1b[{r};1Hrow {r} \x1b[4{}m{r}{r}{r}\x1b[0m", r % 8);
         }
-        let (mut drawn, mut fresh) = (Vec::with_capacity(w * h), Vec::with_capacity(w * h));
-        let (mut tabs_drawn, mut tabs_fresh) = (Vec::new(), Vec::new());
-        tabs_drawn.reserve(fb_w * TAB_H);
-        tabs_fresh.reserve(fb_w * TAB_H);
+        // Allocated before taking the screen's lock again.
+        let below = fb_w * (fb_h - fb::CONSOLE_TOP);
+        let (mut drawn, mut fresh) = (Vec::with_capacity(below), Vec::with_capacity(below));
+        let (mut tabs_drawn, mut tabs_fresh) = (Vec::with_capacity(fb_w * TAB_H), Vec::with_capacity(fb_w * TAB_H));
         let snapshot = |s: &Screen, grid: &mut Vec<u32>, header: &mut Vec<u32>| {
-            grid.extend((s.y0..s.y0 + h).flat_map(|y| (s.x0..s.x0 + w).map(move |x| s.fb.pixel(x, y))));
+            grid.extend((fb::CONSOLE_TOP..fb_h).flat_map(|y| (0..fb_w).map(move |x| s.fb.pixel(x, y))));
             header.extend((TAB_Y..TAB_Y + TAB_H).flat_map(|y| (0..fb_w).map(move |x| s.fb.pixel(x, y))));
         };
         let result = with_screen(|s| {
@@ -1227,7 +1228,11 @@ crate::ktest!(
                 s.place_pointer();
                 for (j, step) in STEPS.iter().enumerate() {
                     s.term_mut().write(step);
-                    s.render();
+                    if step.is_empty() {
+                        s.redraw();
+                    } else {
+                        s.render();
+                    }
                     // The header's boxes redrawn below it.
                     s.draw_tabs();
                     s.place_pointer();
@@ -1240,9 +1245,9 @@ crate::ktest!(
             s.place_pointer();
             let off = s.pointer.drawn_at().is_none();
             snapshot(s, &mut drawn, &mut tabs_drawn);
-            s.shadow.fill(Cell { ch: '\u{1}', ..Cell::BLANK });
-            s.term_mut().touch_all();
-            s.render();
+            // Everything afresh: below the header cleared and every cell
+            // drawn, and the header's boxes.
+            s.redraw();
             s.draw_tabs();
             snapshot(s, &mut fresh, &mut tabs_fresh);
             (bad, off)
@@ -1254,7 +1259,7 @@ crate::ktest!(
         kassert!(bad.is_none());
         kassert!(off);
         if let Some(i) = drawn.iter().zip(&fresh).position(|(a, b)| a != b) {
-            crate::ktest::diag(format_args!("first differing pixel: ({}, {}) of the grid", i % w, i / w));
+            crate::ktest::diag(format_args!("first differing pixel: ({}, {})", i % fb_w, fb::CONSOLE_TOP + i / fb_w));
         }
         kassert!(drawn == fresh);
         kassert!(tabs_drawn == tabs_fresh);

@@ -844,6 +844,10 @@ class Machine:
         return self._screen_size
 
     def _pointer(self, args: dict[str, Any]) -> None:
+        if not self.devices.tablet:
+            # QEMU would hand the events to the PS/2 mouse, and nothing
+            # would say so.
+            raise ValueError("no tablet to point with: boot with Devices(tablet=True)")
         wait = self._pointer_sent_at + POINTER_GAP - time.monotonic()
         if wait > 0:
             time.sleep(wait)
@@ -859,10 +863,11 @@ class Machine:
 
     def click(self, button: str = "left", release: bool = True) -> None:
         """Press `button` on the guest's pointer, and release it again
-        unless `release` is false (each paced like `move_pointer`)."""
+        unless `release` is false (each paced like `move_pointer`). Wait
+        for the guest's answer (`mouse`) before relying on it."""
         self._pointer(button_args(button, True))
         if release:
-            self._pointer(button_args(button, False))
+            self.release(button)
 
     def release(self, button: str = "left") -> None:
         """Release `button` (pressed with `click(release=False)`)."""

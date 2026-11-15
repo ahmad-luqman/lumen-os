@@ -654,11 +654,29 @@ pub enum Probed {
     /// It failed: why. Bus mastering is turned off, so the device can't
     /// reach memory its driver dropped.
     Failed(String),
-    /// Not this driver's device after all (a keyboard and a tablet share
-    /// virtio's input id): the function is free again, its command
+    /// Not this driver's device after all (one its `matches` couldn't rule
+    /// out, e.g. a second tablet, or a virtio input device of the tablet's
+    /// class without its axes): the function is free again, its command
     /// register as before the claim, for the next driver row. Refused (a
     /// failure) if the driver kept its `DeviceResources`.
     Declined,
+}
+
+/// A bound function's driver gave up on it later (its thread saw the
+/// device fail): `lspci` shows `<driver>: failed: <why>` from now on, and
+/// bus mastering is turned off. False, changing nothing, unless a driver
+/// has `addr` bound.
+pub fn failed_after_bind(addr: PciAddr, why: String) -> bool {
+    let driver = with_slot(addr, |slot| match slot.state {
+        SlotState::Bound(driver) => Some(driver),
+        _ => None,
+    })
+    .flatten();
+    let Some(driver) = driver else { return false };
+    let now = with_ecam(|ecam| ecam.read16(addr, lumen_pci::reg::COMMAND));
+    set_command(addr, now & !command::BUS_MASTER, "bus mastering off after its device failed");
+    with_slot(addr, |slot| slot.state = SlotState::Failed(driver, why));
+    true
 }
 
 /// Record how `driver`'s probe of the function it claimed went (see

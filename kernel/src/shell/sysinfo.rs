@@ -388,54 +388,64 @@ pub fn mouse(ctx: &mut Ctx<'_>, args: &[String]) {
     if extra_args(ctx, "mouse", args) {
         return;
     }
-    let mut t = String::new();
-    match crate::mouse::status() {
-        Some(st) => {
-            let d = &st.device;
-            let failed = st.failed.map_or(String::new(), |why| alloc::format!(", failed: {why}"));
-            let _ = writeln!(
-                t,
-                "mouse: \"{}\" on {}, screen {}x{}, {} events in {} frames ({} ignored){failed}",
-                d.name, d.addr, d.screen.0, d.screen.1, st.events, st.frames, st.ignored
-            );
-        }
-        None => t.push_str("mouse: no tablet (QEMU: -device virtio-tablet-pci)\n"),
-    }
-    mouse_table().render(&mut t);
+    // One snapshot for the header and the row.
+    let bound = crate::mouse::status();
+    let mut t = crate::mouse::header(bound.as_ref());
+    t.push('\n');
+    mouse_table_of(bound.as_ref()).render(&mut t);
     emit(ctx, &t);
+}
+
+fn mouse_table() -> pipe::Table {
+    mouse_table_of(crate::mouse::status().as_ref())
 }
 
 /// `mouse`'s row: always one (`none` for its device without a tablet;
 /// `-` before the first report): the pointer's position, the buttons held
-/// (`left right`, or `none`), the wheels' clicks so far, and whether the
-/// pointer is drawn (`hidden` while a command draws on the screen).
-fn mouse_table() -> pipe::Table {
-    const COLUMNS: [Column; 7] = [
+/// (`left right`, or `none`), every button's presses so far (a click
+/// between two looks shows here), the wheels' clicks so far, the pointer
+/// (`drawn`, `hidden` while a command draws on the screen, `none` without
+/// a terminal, `-` once the tablet failed) and why the tablet failed (`-`
+/// while it works).
+fn mouse_table_of(bound: Option<&crate::mouse::Bound>) -> pipe::Table {
+    const COLUMNS: [Column; 9] = [
         Column::new("device", Kind::Text, Align::Left, 12),
         Column::new("x", Kind::Int, Align::Right, 4),
         Column::new("y", Kind::Int, Align::Right, 4),
         Column::new("buttons", Kind::Text, Align::Left, 7),
+        Column::new("presses", Kind::Int, Align::Right, 7),
         Column::new("wheel", Kind::Int, Align::Right, 5),
         Column::new("hwheel", Kind::Int, Align::Right, 6),
-        Column::new("pointer", Kind::Text, Align::Left, 0),
+        Column::new("pointer", Kind::Text, Align::Left, 7),
+        Column::new("failed", Kind::Text, Align::Left, 0),
     ];
     let mut t = pipe::Table::new(&COLUMNS);
-    let status = crate::mouse::status();
-    let device = status.as_ref().map_or(text("none"), |st| Value::Text(alloc::format!("{}", st.device.addr)));
-    let row = match status.and_then(|st| st.state) {
+    let device = bound.map_or(text("none"), |b| Value::Text(b.device.addr.to_string()));
+    let failed = bound.and_then(|b| b.failed).map_or(DASH, |why| Value::Text(why.to_string()));
+    let row = match bound.and_then(|b| b.state) {
         Some(s) => {
-            let drawn = crate::term::pointer_drawn().is_some();
+            let pointer = if failed != DASH {
+                "-"
+            } else if crate::term::screen_size().is_none() {
+                "none"
+            } else if crate::term::pointer_drawn().is_some() {
+                "drawn"
+            } else {
+                "hidden"
+            };
             vec![
                 device,
                 int(s.x),
                 int(s.y),
                 Value::Text(s.buttons.to_string()),
+                int(s.clicks()),
                 int(s.wheel),
                 int(s.hwheel),
-                text(if drawn { "drawn" } else { "hidden" }),
+                text(pointer),
+                failed,
             ]
         }
-        None => vec![device, DASH, DASH, DASH, DASH, DASH, DASH],
+        None => vec![device, DASH, DASH, DASH, DASH, DASH, DASH, DASH, failed],
     };
     t.push(row);
     t

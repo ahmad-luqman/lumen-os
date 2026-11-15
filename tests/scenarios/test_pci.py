@@ -147,6 +147,11 @@ def pci_address(d: dict) -> str:
     return f"0000:{d['bus']:02x}:{d['slot']:02x}.{d['function']:x}"
 
 
+def qdev_addresses(m: Machine) -> dict[str, str]:
+    """The PCI address of each device QEMU names by qdev id."""
+    return {d["qdev_id"]: pci_address(d) for d in pci_devices(m) if d.get("qdev_id")}
+
+
 def assert_lists_what_qemu_has(m: Machine, rows: dict) -> list[dict]:
     """`lspci`'s rows are exactly the functions QEMU has, with their ids;
     returns QEMU's."""
@@ -190,7 +195,7 @@ def test_lspci_shows_no_driver(boot):
     # other virtio ones included, shows "no driver".
     m = shell(boot, devices=Devices.every())
     rows = lspci_rows(m)
-    tablet = next(pci_address(d) for d in pci_devices(m) if d["qdev_id"] == DEVICE_IDS["tablet"])
+    tablet = qdev_addresses(m)[DEVICE_IDS["tablet"]]
     assert rows[tablet][4] == "virtio-tablet: bound", rows
     others = {row[4] for addr, row in rows.items() if addr != tablet}
     assert others == {"no driver"}, rows

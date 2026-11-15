@@ -12,8 +12,9 @@ from typing import Self
 
 import pytest
 from lumen_harness import REPO_ROOT, qemu
-from lumen_harness.__main__ import find_gdb, gdb_binary, gdb_command
+from lumen_harness.__main__ import find_gdb, gdb_binary, gdb_command, run_options
 from lumen_harness.qemu import (
+    Devices,
     ExpectTimeout,
     Machine,
     ovmf_vars_template,
@@ -64,7 +65,7 @@ def test_machine_waits_for_events_with_scaled_timeouts(tmp_path, monkeypatch):
 def test_pointer_events_are_paced_and_scaled_to_the_screen(tmp_path, monkeypatch):
     # Pixels become QEMU's axis values for the screen's size (taken once),
     # and no two pointer events go closer together than POINTER_GAP.
-    m = Machine(Path("x.iso"), tmp_path)
+    m = Machine(Path("x.iso"), tmp_path, devices=Devices(tablet=True))
     m._screen_size = (1280, 800)
     clock = [100.0]
     sent = []
@@ -91,6 +92,21 @@ def test_pointer_events_are_paced_and_scaled_to_the_screen(tmp_path, monkeypatch
         {"down": True, "button": "right"},
         {"down": False, "button": "right"},
     ]
+
+
+def test_pointer_events_need_a_tablet(tmp_path):
+    # Without one QEMU would give them to the PS/2 mouse, silently.
+    m = Machine(Path("x.iso"), tmp_path)
+    m._screen_size = (1280, 800)
+    for send in (lambda: m.move_pointer(1, 1), m.click, m.release):
+        with pytest.raises(ValueError, match="no tablet to point with"):
+            send()
+
+
+def test_make_run_attaches_a_tablet():
+    # So the mouse moves the pointer in `make run`'s window.
+    args = qemu_args(run_options(Path("x.iso"), Path("v.fd"), headless=True))
+    assert "virtio-tablet-pci,id=lumen-tablet" in args
 
 
 def test_machine_event_failures_show_the_serial_output(tmp_path):

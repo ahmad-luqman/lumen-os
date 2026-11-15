@@ -151,7 +151,7 @@ own PR that updates that doc first.
   framebuffer pixels, the header and the crash screen. `term.rs`: the
   terminals on the framebuffer (four virtual ones, one shown: log lines on the first, the screen shells, scrollback, `view_text`, and
   `Canvas`: the pixels below the header for one command, the terminals paused meanwhile;
-  and the mouse pointer, a save-under arrow every drawing step takes off and puts back). `vt.rs`: the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4 switching. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
+  and the mouse pointer, a save-under arrow that drawing over it takes off and puts back). `vt.rs`: the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4 switching. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -177,6 +177,7 @@ own PR that updates that doc first.
   `route_isa_irq` (MADT overrides, handler registered before unmasking).
   `mouse.rs`: the virtio tablet (#98; bound by class, read by its own
   `mouse` thread, which moves the pointer; `mouse::status` for `mouse`).
+  `make run` attaches a tablet.
   `keyboard.rs`: the PS/2 keyboard (8042 init, IRQ 1, `pc-keyboard`
   decoding, `lumen.keymap=`); `arch/x86_64/i8042.rs` its ports.
   `time.rs`: TSC and LAPIC timer calibration, the boot origin

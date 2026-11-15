@@ -22,7 +22,10 @@ pub use crate::virtio::ProbeError;
 /// [`ProbeError::NotMine`] for a device that turns out not to be its own,
 /// but only before the crate's `new()` (reading the device configuration
 /// through the transport): after it, the crate has posted buffers it never
-/// takes back.
+/// takes back. A probe's side effects (a thread started, state published
+/// for the rest of the kernel) come after its last fallible check
+/// (`StatusHandle::check_ready` included), so a failed probe leaves none
+/// behind.
 pub struct Driver {
     pub name: &'static str,
     pub matches: fn(&DeviceInfo) -> bool,
