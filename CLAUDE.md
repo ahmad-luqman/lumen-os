@@ -198,6 +198,10 @@ own PR that updates that doc first.
   words, usage and help lines), pipelines (text or records in tables, the
   filters `grep`, `where`, `sort`, `first`, `count`, `select`), serial
   bytes to keys (host-tested).
+- `crates/lumen-synth`: sound synthesis for `beep` and `play`: fixed-point
+  oscillators (square, triangle, sine table, noise), ADSR envelopes,
+  saturating mixing, the melody notation (`t=140 w=sine C4/8 r/8`), and
+  `Source`s that fill interleaved 16-bit PCM buffers (host-tested).
 - `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET, FADT
   (PM1 control blocks) and the DSDT's `_S5_` by byte search (host-tested on
   handcrafted tables).
@@ -207,7 +211,8 @@ own PR that updates that doc first.
   against a model UART).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
   are built), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
-  `crash.py` (crash-report parsing), `screen.py` (the screen's rows
+  `crash.py` (crash-report parsing), `audio.py` (wav captures:
+  pitch by zero crossings, Goertzel amplitude), `screen.py` (the screen's rows
   through the serial shell's `term text`).
 - `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests.
   `tests/features/*.toml`: feature → test map (the CI feature gate and STATUS.md).

@@ -1,0 +1,22 @@
+# Features: sound. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Sound synthesis (lumen-synth, integer-only): square, triangle, sine (a fixed-point quarter-wave table within 2 LSB of floating point) and noise oscillators at their frequency within 1% (zero crossings), clamped below half the sample rate; ADSR envelopes (linear attack to full in its time, decay to sustain, release from the current level, retriggering without a jump); mixing saturates instead of wrapping; `beep` lasts exactly its length with click-free edges; a melody plays its notes in order for exactly its duration, repeated notes separated by their release; volume scales the output; PCM fills interleaved buffers in periods, padding with silence after the end"
+milestone = "M3"
+tests = [
+    "cargo:lumen-synth",
+]
+
+[[feature]]
+name = "Melody notation for `play`: notes A-G in either case with `#`/`b`, octaves 0-8 (default 4), lengths /1 to /32 and dotted, rests, `t=` tempo (20-999) and `w=` waveform; equal-tempered frequencies (A4 = 440 Hz, accidentals crossing octaves); canonical text round trips; every bad word is refused with its kind and byte position before anything plays"
+milestone = "M3"
+tests = [
+    "cargo:lumen-synth",
+]
+
+[[feature]]
+name = "Harness: wav captures from QEMU's wav audiodev are read even with the header's sizes left 0 (to the end of the file, partial frames dropped, first channel of stereo), and their pitch is measured within 1% (zero crossings with hysteresis, through DC offset and noise; per-window for melodies; silence has none), with a Goertzel amplitude at a given frequency"
+milestone = "M3"
+tests = [
+    "harness:test_audio::*",
+]
