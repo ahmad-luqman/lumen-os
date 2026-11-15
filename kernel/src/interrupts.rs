@@ -123,7 +123,8 @@ impl Route {
 pub enum RouteError {
     /// No I/O APIC has an input for the GSI (none at all without ACPI).
     NoInput(u32),
-    /// The GSI is past the I/O APIC vectors (`IOAPIC_BASE + gsi` > 0xef).
+    /// The GSI is past the I/O APIC vectors (`IOAPIC_BASE + gsi` >
+    /// `IOAPIC_LAST`, 0x8f: GSIs 0-63 have one).
     NoVector(u32),
     /// The input (or its vector) is routed already.
     Taken(u32),
@@ -371,8 +372,9 @@ crate::ktest!(
 crate::ktest!(
     fn device_vectors_are_not_fatal() {
         // A vector nothing handles (an unused one, an I/O APIC vector with
-        // no handler), or an 8259 line other than IRQ 7 and 15, is counted
-        // as unexpected (and warned about once); the spurious
+        // no handler, an MSI vector), or an 8259 line other than IRQ 7 and
+        // 15, is counted as unexpected (and reported once: an MSI vector
+        // as an error, nothing may send one yet); the spurious
         // vectors (the local APIC's, the 8259s' IRQ 7 and 15) only counted;
         // a local APIC error counted and logged. All return.
         use crate::arch::idt;
@@ -383,9 +385,11 @@ crate::ktest!(
         unsafe {
             core::arch::asm!(
                 "int {unused}", "int {unused}", "int {spurious}", "int {pic7}", "int {pic15}", "int {error}", "int {pic1}",
-                "int {ioapic}",
+                "int {ioapic}", "int {msi}", "int {msi}", "int {msi_last}",
                 unused = const idt::UNUSED,
                 ioapic = const idt::IOAPIC_LAST,
+                msi = const idt::MSI_BASE,
+                msi_last = const idt::MSI_LAST,
                 spurious = const idt::SPURIOUS,
                 pic7 = const idt::PIC_SPURIOUS_MASTER,
                 pic15 = const idt::PIC_SPURIOUS_SLAVE,
@@ -394,7 +398,7 @@ crate::ktest!(
             );
         }
         let after = idt::strays();
-        kassert_eq!(after.unexpected, before.unexpected + 4);
+        kassert_eq!(after.unexpected, before.unexpected + 7);
         kassert_eq!(after.spurious, before.spurious + 3);
         kassert_eq!(after.lapic_errors, before.lapic_errors + 1);
         Ok(())

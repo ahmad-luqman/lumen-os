@@ -32,7 +32,7 @@ is listed only in [STATUS.md](STATUS.md), which is generated from tests.
 | Bootloader | Limine 12.x (pinned binary release + sha256), `limine` crate **0.5.0** | Memory map, framebuffer, higher-half direct map, and our own ELF file for symbolization, with no loader to write. Crate 0.6.x requires nightly (`#![feature(ptr_metadata)]`), so we use 0.5.0 (base revision 3). | Custom UEFI loader (optional learning milestone), GRUB/multiboot2. |
 | Kernel shape | **Modular monolith** with message-shaped internal interfaces; capabilities enforced at the syscall boundary | One address space keeps early milestones fast and debuggable. Agent safety needs capability checks between *processes*, which a monolith enforces just as well. Drivers and services expose request/response interfaces, so any of them can move to user space later. | Microkernel: stronger isolation of drivers, but it puts IPC performance and many extra servers in front of every milestone. |
 | Test harness | Python (`uv`, pytest) on the host; TAP from the kernel | Fast to write scenarios, mature tooling, and QMP/PIL are easy to use. | Rust `xtask`: one language, but slower iteration on test scripts. |
-| Third-party crates | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), a PR adding only the crates its issue names (with their own dependencies), each checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX, no red zone, the kernel code model). Kernel crates so far: `limine`, `rustc-demangle`, `noto-sans-mono-bitmap` and `log` (from M0, before this policy; `log` is still `0.4`, to be pinned in a PR of its own), `pc-keyboard` (scancode decoding and layouts, #58, the first under it), `vte` (terminal escape parsing; brings `arrayvec` and `memchr`) and `unicode-width` (character widths), both #59. `rhai` (scripting, #67; integers only, no modules, no time, closures that can't capture (`no_closure`), `curry` disabled; brings `ahash`, `hashbrown`, `allocator-api2`, `equivalent`, `foldhash`, `smallvec`, `smartstring`, `thin-vec`, `num-traits`, `libm`, `bitflags`, `once_cell`, `portable-atomic`, `zerocopy`, `static_assertions`, `cfg-if`, `no-std-compat` and `core-error`, plus `const-random`, whose compile-time random seed stays linked but unused (the kernel sets a fixed hashing seed before any script runs), and the proc macros `rhai_codegen` and `const-random-macro`, which run only at build time).  `shlex` (#62) is only a dev-dependency of `lumen-shell`, the word splitter's test oracle; `noline`, which #62 names, isn't used (no completion hook, escape codes always, and it queries the terminal for the cursor on every prompt). | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
+| Third-party crates | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), a PR adding only the crates its issue names (with their own dependencies), each checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX, no red zone, the kernel code model). Kernel crates so far: `limine`, `rustc-demangle`, `noto-sans-mono-bitmap` and `log` (from M0, before this policy; `log` is still `0.4`, to be pinned in a PR of its own), `pc-keyboard` (scancode decoding and layouts, #58, the first under it), `vte` (terminal escape parsing; brings `arrayvec` and `memchr`) and `unicode-width` (character widths), both #59. `rhai` (scripting, #67; integers only, no modules, no time, closures that can't capture (`no_closure`), `curry` disabled; brings `ahash`, `hashbrown`, `allocator-api2`, `equivalent`, `foldhash`, `smallvec`, `smartstring`, `thin-vec`, `num-traits`, `libm`, `bitflags`, `once_cell`, `portable-atomic`, `zerocopy`, `static_assertions`, `cfg-if`, `no-std-compat` and `core-error`, plus `const-random`, whose compile-time random seed stays linked but unused (the kernel sets a fixed hashing seed before any script runs), and the proc macros `rhai_codegen` and `const-random-macro`, which run only at build time).  `shlex` (#62) is only a dev-dependency of `lumen-shell`, the word splitter's test oracle; `noline`, which #62 names, isn't used (no completion hook, escape codes always, and it queries the terminal for the cursor on every prompt). Next: `virtio-drivers` `=0.13.0` (virtqueues and the virtio device protocols; `default-features = false` with `alloc`; brings `safe-mmio`, `thiserror`, `enumn`, `bitflags` and `zerocopy`), adopted by #95 under the adapter rules in section 7. | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
 | Firmware for tests | OVMF `edk2-stable202605-r1` from rust-osdev/ovmf-prebuilt, pinned with sha256 | macOS and CI boot byte-identical firmware, so golden screenshots match. | Distro OVMF packages (paths and versions differ per OS). |
 
 ## 3. Layers
@@ -624,10 +624,12 @@ allocates.
   8259 PICs, remapped there and masked (only a spurious IRQ 7 or 15 should
   arrive); 0x30-0x3e unused (a ktest raises 0x30); 0x3f the `WAKEUP` IPI
   (section 4, "Other CPUs"); 0x40 the local APIC
-  timer; 0x50 + n global system interrupt n (up to 0xef), once a driver
-  routes it (`interrupts::route_isa_irq`; every other I/O APIC input stays
-  masked); 0xfe local APIC
-  errors; 0xff the local APIC's spurious vector; the rest unused.
+  timer; 0x50 + n global system interrupt n (GSIs 0-63, up to 0x8f),
+  once a driver routes it (`interrupts::route_isa_irq`; every other I/O
+  APIC input stays masked); 0x90-0xef message-signalled interrupts (MSI and
+  MSI-X, `idt::MSI_BASE..=MSI_LAST`), for PCI devices (section 7; none is
+  handed out until #96); 0xfe local APIC errors; 0xff the local APIC's
+  spurious vector; the rest unused.
 - **Dispatch:** `#BP` is counted and resumes (a ktest proves registers
   survive the round trip); every other exception is fatal and goes to
   `crash::exception`. Exceptions are traced. Device interrupts are never
@@ -638,7 +640,8 @@ allocates.
   local APIC error is counted, logged with its status (the 1st, 2nd, 4th,
   8th... time, and whenever a new status bit appears) and EOI'd; a routed
   I/O APIC vector runs the handler its driver registered and is EOI'd;
-  anything else is traced, counted, warned about once per vector, and EOI'd (another
+  an MSI vector is counted as unexpected, logged as an error once per
+  vector (no device may send one yet) and EOI'd; anything else is traced, counted, warned about once per vector, and EOI'd (another
   8259 line also masks the 8259s again; an 8259 vector the local APIC has
   in service is EOI'd there). Of device interrupts, only that last kind is
   traced: at 1 kHz the timer would flood the ring. The shell's `ticks` shows the
@@ -1417,13 +1420,189 @@ section 2).
 - **Not yet:** scripts from files (M6), floats, capturing closures,
   scripts in user mode (M9), a script running in the background.
 
-## 7. Driver interface (planned, M3+)
+## 7. Driver interface (M3: PCI and virtio; device classes planned)
 
-Drivers are kernel modules behind traits whose methods are **messages**: an
-owned request goes in and a completion comes back, with no shared mutable
-state across the boundary. That keeps drivers testable with fakes and lets a
-driver move to a user-space server later by serializing the same messages over
-a channel.
+Drivers are kernel modules whose interfaces are **messages**: an owned
+request goes in and a completion comes back, with no shared mutable state
+across the boundary. That keeps drivers testable with fakes and lets a
+driver move to a user-space server later by serializing the same messages
+over a channel. M3 builds the layer under that: finding PCI devices, handing
+each driver exactly its device's resources, and running `virtio-drivers`
+on top. Issues: PCI #94, virtio adapter #95, MSI-X #96; the first drivers
+are rng #97, tablet #98 and sound #99.
+
+### Discovery: PCI (#94)
+
+- **Configuration space through ECAM.** The MCFG table (parsed in
+  `lumen-acpi`, host-tested) gives each segment's ECAM base and bus range.
+  The kernel maps the range once, uncached, with `map_mmio` (1 MiB per bus:
+  256 MiB for q35's 256 buses, out of the 1 TiB MMIO window). No MCFG means
+  no PCI devices, logged, not a crash. The legacy `0xcf8` ports aren't used.
+- **Decoding is host-tested.** A `lumen-pci` crate holds the header, BAR and
+  capability decoding behind a small config-space trait (32-bit reads and
+  writes at a function and offset), tested against a fake config space; the
+  kernel only supplies the ECAM accessor.
+- **Enumeration** is a brute-force scan: every bus in the MCFG range, devices
+  0-31, functions 1-7 only for multi-function devices. Bridges' secondary
+  buses fall inside the scanned range, so no recursion. Each **BAR is sized
+  once**, with I/O and memory decoding turned off in the command register
+  while all-ones is written (and restored after). The firmware's BAR
+  addresses are kept: OVMF assigns them and Lumen never reassigns in M3; a
+  memory BAR at 0 counts as unassigned. The capability list is walked with a
+  guard (offsets dword-aligned and at least 0x40, at most 48 entries), so a
+  looping list ends.
+- **`DeviceInfo`**, one per function, built once at boot (after `mm::init`
+  and ACPI, before any driver) into `pci::devices()`, which never changes
+  afterwards; `lspci` reads it:
+
+```rust
+pub struct DeviceInfo {
+    pub addr: PciAddr,                  // segment, bus, device, function
+    pub vendor: u16, pub device: u16,
+    pub class: u8, pub subclass: u8, pub prog_if: u8, pub revision: u8,
+    pub subsystem: (u16, u16),          // vendor, id
+    pub bars: [Option<Bar>; 6],         // Memory { phys, size, prefetchable, is_64 } | Io { port, size }
+    pub caps: CapList,                  // (id, offset): MSI, MSI-X, vendor-specific (virtio's)
+    pub irq_pin: u8,                    // INTx pin, shown only: INTx is never routed (no `_PRT`)
+}
+```
+
+### Drivers and probing
+
+```rust
+pub struct Driver {
+    pub name: &'static str,                       // `lspci`'s driver column
+    pub matches: fn(&DeviceInfo) -> bool,
+    pub probe: fn(DeviceResources) -> Result<(), ProbeError>,
+}
+```
+
+- One static table, `drivers::DRIVERS`, one row per driver (each issue adds
+  its row). After enumeration, `drivers::probe_all` gives each device to the
+  first driver whose `matches` accepts it; the device is then **claimed**
+  (recorded for `lspci`) whether or not `probe` succeeds. A failed probe is a
+  warning (`target: "pci"`) and boot goes on.
+- The driver keeps its device in its own state (e.g. a `SpinLock` static)
+  and exposes it through its module (`rng::fill`, `sound::play`). Device
+  class traits (below) come when a class has a second implementation.
+
+### Resources: `DeviceResources`
+
+A driver gets exactly its device's resources, and nothing else, even in the
+kernel:
+
+```rust
+pub struct DeviceResources {
+    pub info: &'static DeviceInfo,
+    bars: [Option<BarMapping>; 6],      // its memory BARs, mapped on claim
+}
+pub struct BarMapping { pub phys: PhysAddr, pub virt: VirtAddr, pub size: u64 }
+
+impl DeviceResources {
+    pub fn bar(&self, i: usize) -> Option<&BarMapping>;
+    pub fn config(&self) -> FunctionConfig;   // config space of this function only
+    pub fn msix(&self, handler: fn()) -> Result<MsiVector, MsiError>; // from #96
+}
+```
+
+- **BAR mappings are permanent.** `map_mmio` never unmaps and its window only
+  grows, so each memory BAR of a claimed device is mapped once, whole, when
+  the device is claimed, and recorded in a registry of BAR mappings. Nothing
+  maps a BAR again: a later lookup reuses the recorded mapping. Unclaimed
+  devices' BARs are never mapped. I/O BARs are recorded, not mapped (modern
+  virtio uses none).
+- **`FunctionConfig`** reads and writes the claimed function's config space
+  and refuses any other function.
+- These map one-to-one onto capabilities if a driver moves out of the kernel
+  (`Device` in section 8).
+
+### virtio: the adapter for `virtio-drivers` (#95)
+
+`virtio-drivers` `=0.13.0` (`default-features = false`, `features =
+["alloc"]`: input and sound use `Box` and `Vec`; `embedded-io` isn't
+needed) does the virtqueues and the device protocols. Lumen supplies the
+transport and its `Hal`.
+
+- **Transport.** `virtio-drivers`' `PciTransport::new` takes its own
+  `PciRoot<C: ConfigurationAccess>` and reads the virtio capabilities and
+  BARs itself (its `bar_info` sizes BARs with decoding off, like ours; it is
+  called during probe, before the device runs). Lumen implements
+  `ConfigurationAccess` over the device's `FunctionConfig` (it accesses the
+  first 256 bytes, enough for virtio's capabilities) and builds a `PciRoot`
+  only to construct the transport. It never enumerates with it: discovery is
+  #94's. The transport is wrapped in Lumen's `VirtioTransport`, which
+  implements the crate's (public, unsealed) `Transport` trait by delegating,
+  so it can add what the crate leaves out (MSI-X vectors, below).
+- **`Hal`.** Its methods are associated functions with **no `self` and no
+  device argument** (`virtio-drivers` `src/hal.rs`: `dma_alloc(pages,
+  direction)`, `dma_dealloc(paddr, vaddr, pages)`,
+  `mmio_phys_to_virt(paddr, size)`, `share(buffer, direction)`,
+  `unshare(paddr, buffer, direction)`), so `VirtioHal` reaches the frame
+  allocator, the HHDM and the BAR registry through statics:
+  - `dma_alloc`: `frame::alloc_contiguous(pages, 1)`, zeroed through the
+    HHDM, returned as (physical, HHDM address). Out of frames returns
+    physical 0, which the crate turns into `Error::DmaError` (frame 0 is
+    reserved and never handed out, so 0 is unambiguous). Every DMA frame
+    belongs to the frame allocator (hard rule 2) and goes back through
+    `dma_dealloc` (`frame::free_contiguous`), which returns non-zero for a
+    run that wasn't allocated (the crate asserts 0: a double free panics).
+  - `mmio_phys_to_virt`: looks the range up in the BAR registry and panics
+    if it isn't inside a claimed device's BAR. It never calls `map_mmio`
+    (the transport asks for each virtio structure separately: four calls
+    per device).
+  - `share` / `unshare`: **bounce buffers, not address translation.** The
+    crate passes `share` whatever buffer a request uses: the caller's slice
+    (`VirtIORng::request_entropy(dst)`), a driver's `Box` (`VirtIOInput`'s
+    events), stack locals (`VirtIOSound`'s control requests and replies), a
+    `Vec` (`pcm_xfer_nb`). `share` returns one physical address for the
+    whole buffer, so the device needs it physically contiguous, but the heap
+    and the stacks are windows mapped on fresh frames one page at a time:
+    a buffer that crosses a page there is in general not contiguous, and the
+    HHDM is the only contiguous view of RAM. So `share` allocates
+    `ceil(len / 4096)` contiguous frames, copies the buffer in
+    (`DriverToDevice`) or zeroes them (`DeviceToDriver`, so stale memory
+    never reaches the caller), and returns their address; `unshare` copies
+    `DeviceToDriver` data back and frees the frames (found from the address
+    and the buffer's length: no table). Out of frames in `share` panics with
+    the size (it can't return an error). The cost, an allocation and a copy
+    per buffer, is fine for rng, input and sound; a fast path (no bounce for
+    a buffer within one page or in the HHDM, found by a page-table walk) can
+    come with networking (M7) if profiling asks for it. `share` takes the
+    frame allocator's lock and doesn't allocate from the heap.
+- **Polling until MSI-X.** `virtio-drivers`' blocking calls spin on the used
+  ring; event devices (the tablet) are polled from their thread. Drivers
+  keep the same API when interrupts arrive (#96): the interrupt handler
+  wakes the driver's `WaitQueue` instead.
+
+### Interrupts for devices: MSI-X (#96)
+
+- **Vectors** `idt::MSI_BASE..=MSI_LAST` (0x90-0xef, 96 vectors; section 6)
+  are handed out by a vector allocator: `DeviceResources::msix(handler)`
+  registers the handler **before** the MSI-X table entry is unmasked (the
+  rule `route_isa_irq` follows), and vectors are never freed in M3 (like
+  routes). One vector per device (its configuration changes and all its
+  queues), delivered to the boot CPU (fixed delivery, physical destination),
+  edge-triggered, EOI'd at the local APIC. Until the allocator exists, an
+  interrupt on an MSI vector is logged as an error (nothing may send one).
+- **The MSI-X table** lives in one of the device's BARs, so it is reached
+  through that BAR's mapping: no extra `map_mmio`.
+- **virtio's vectors.** `virtio-drivers` 0.13 never writes `msix_config` or
+  `queue_msix_vector`: its `CommonCfg` declares them (`src/transport/pci.rs`
+  lines 394 and 400) but `queue_set` (lines 275-289) writes only the queue's
+  size, addresses and enable, and the struct is crate-private. With MSI-X
+  enabled, a queue whose vector is `NO_VECTOR` (0xffff, the reset value)
+  raises no interrupt at all, and INTx is off. So `VirtioTransport` writes
+  `msix_config` once and, in `queue_set`, selects the queue and writes its
+  `queue_msix_vector` before delegating (the virtio spec's order: the vector
+  before `queue_enable`), through the common configuration's place in the
+  BAR mapping (read from the device's virtio capability). It reads each back:
+  `NO_VECTOR` means the device refused, and the driver falls back to polling.
+
+### Device classes (planned)
+
+`BlockDevice` (M6), `NetDevice` (send/receive frames, M7), `InputDevice`
+(event stream: the keyboard and the tablet, #98), `Display` (framebuffer +
+flush rectangles), `Console`. The shape, for the block device:
 
 ```rust
 pub trait BlockDevice: Send + Sync {
@@ -1434,16 +1613,9 @@ pub trait BlockDevice: Send + Sync {
 pub struct BlockRequest { pub op: BlockOp, pub lba: u64, pub buf: DmaBuffer }
 ```
 
-- **Discovery:** PCI enumeration (and later ACPI) produces `DeviceInfo`; drivers
-  register `probe(&DeviceInfo) -> Option<Box<dyn Driver>>`.
-- **Resources as capabilities:** a driver receives a `DeviceResources` value
-  holding exactly its BARs (MMIO), its IRQ line or MSI vectors, and a DMA
-  allocator. It cannot touch other devices, even in the kernel. These map
-  one-to-one onto capabilities if the driver moves out.
-- Device classes: `BlockDevice`, `NetDevice` (send/receive frames), `InputDevice`
-  (event stream), `Display` (framebuffer + flush rectangles), `Console`.
-- **virtio first** (blk, net, input, gpu, console) under QEMU; real-hardware
-  drivers (NVMe, AHCI, xHCI HID, a common NIC) in M12 behind the same traits.
+**virtio first** (rng, input, sound in M3; blk, 9p in M6; net in M7) under
+QEMU; real-hardware drivers (NVMe, AHCI, xHCI HID, a common NIC) in M12
+behind the same traits.
 
 ## 8. Processes, syscalls and capabilities (planned, M9)
 

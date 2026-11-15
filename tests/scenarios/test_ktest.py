@@ -30,6 +30,10 @@ def test_in_kernel_tests_pass(boot):
     # `device_vectors_are_not_fatal` raises the unused vector twice: one
     # warning, not one per interrupt.
     assert out.count("unexpected interrupt on vector 0x30") == 1, "warn-once"
+    # ... and the first MSI vector twice: one error (#91: no device may
+    # send an MSI until the vector allocator exists).
+    assert out.count("ERROR irq: interrupt on MSI vector 0x90, which no device has claimed") == 1
+    assert out.count("interrupt on MSI vector 0xef") == 1
     # Issue #3: the trace cost per event is printed as a TAP diagnostic.
     assert re.search(r"^# trace: \d+ TSC ticks per event", out, re.MULTILINE), (
         "no trace cost diagnostic"
