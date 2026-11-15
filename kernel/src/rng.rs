@@ -43,11 +43,17 @@
 //! **Concurrent callers.** The pool sits behind a `SpinLock` held only to
 //! mix and split (no waiting); the virtio device sits in an `Option`
 //! behind another, taken out for a request (made with no lock held: the
-//! wait busy-waits, and a `SpinLock` keeps interrupts off) and put back
+//! wait blocks, and a `SpinLock` keeps interrupts off) and put back
 //! after. A caller that finds the device taken by another skips it for
 //! that call (counted in [`Stats::busy`]): the pool was seeded by the probe,
 //! so its output is still unpredictable, and RDRAND still adds fresh input
-//! when in use. Polling until MSI-X (#96).
+//! when in use.
+//!
+//! **The device's interrupt** (MSI-X, through `virtio::transport`) rings
+//! [`BELL`]; a request waits for it (`StatusHandle::wait_for`), blocking
+//! between looks at the queue, and spins instead only where its caller
+//! can't block (a lock held, interrupts off). A device that can't take its
+//! vector fails the probe.
 //!
 //! Locks: `DEVICE`, `POOL` and `TOKEN` are never held together, and none
 //! across a device wait.
@@ -68,7 +74,7 @@ use virtio_drivers::transport::Transport;
 use crate::arch::Rdrand;
 use crate::pci::{DeviceInfo, DeviceResources};
 use crate::sync::SpinLock;
-use crate::virtio::{self, ProbeError, StatusHandle, VirtioHal, VirtioTransport, WaitError};
+use crate::virtio::{self, Doorbell, ProbeError, StatusHandle, VirtioHal, VirtioTransport, WaitError};
 
 /// The driver table's name for the virtio-rng row.
 pub const DRIVER: &str = "virtio-rng";
@@ -463,8 +469,16 @@ pub fn probe(res: DeviceResources) -> Result<(), ProbeError> {
     probed
 }
 
+/// Rung by the device's MSI-X interrupt: a request's buffer came back (or
+/// its configuration changed).
+static BELL: Doorbell = Doorbell::new();
+
+fn on_interrupt() {
+    BELL.ring();
+}
+
 fn bring_up(res: DeviceResources) -> Result<(), ProbeError> {
-    let mut transport = virtio::transport(res)?;
+    let mut transport = virtio::transport(res, Some(on_interrupt))?;
     let status = transport.status();
     let addr = transport.info().addr;
     transport.begin_init(Feature::VERSION_1);
@@ -473,6 +487,7 @@ fn bring_up(res: DeviceResources) -> Result<(), ProbeError> {
     let queue = VirtQueue::new(&mut transport, QUEUE, false, false).map_err(ProbeError::Device)?;
     transport.finish_init();
     let dev = Device { transport, queue, status, addr, in_flight: 0 };
+    virtio::check_vectors()?;
     status.check_ready()?;
     let mut seed = [0u8; DRAW];
     let dev = dev.request(&mut seed).map_err(|lost| {
@@ -620,12 +635,24 @@ impl Device {
         }
         let queue = &self.queue;
         let left = deadline.saturating_sub(crate::time::now_ns());
-        self.status.wait_until(left, || queue.can_pop()).map_err(RequestError::Wait)?;
+        self.status.wait_for(&BELL, left, || queue.can_pop()).map_err(RequestError::Wait)?;
         // SAFETY: the buffers passed to `add` with this token, still alive.
         let n = unsafe { self.queue.pop_used(token, &[], &mut outputs) }.map_err(RequestError::Queue)?;
         self.in_flight -= 1;
         Ok(n)
     }
+}
+
+/// Ktests: the bound virtio-rng device's address, if one is bound.
+#[cfg(feature = "ktest")]
+pub fn ktest_device() -> Option<PciAddr> {
+    DEVICE.lock().as_ref().map(|d| d.addr)
+}
+
+/// Ktests: how many times the device's interrupt has rung its doorbell.
+#[cfg(feature = "ktest")]
+pub fn ktest_rings() -> u64 {
+    BELL.rings()
 }
 
 crate::ktest!(

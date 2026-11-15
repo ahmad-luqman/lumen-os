@@ -136,8 +136,8 @@ own PR that updates that doc first.
   `cmdline.rs`: kernel command line (flags and `key=value`, e.g.
   `lumen.log=debug`). `sync.rs`: `SpinLock` (interrupts off while held).
   `smp.rs`: starting the other CPUs, `run_on`. `sched.rs`: kernel threads
-  (per-CPU run queues, preemption on the timer, `sleep`, `WaitQueue`,
-  `spawn`/`join`); `arch/x86_64/context.rs` switches threads.
+  (per-CPU run queues, preemption on the timer, `sleep`, `WaitQueue`
+  with or without a deadline, `spawn`/`join`); `arch/x86_64/context.rs` switches threads.
   `arch/x86_64/`: GDT/TSS (per CPU), IDT, entry
   stubs and the vector map, `percpu.rs` (GS base, CPU index), `irq.rs` (nested interrupt disable), local and
   I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
@@ -163,16 +163,18 @@ own PR that updates that doc first.
   PAT. `trace.rs`: trace rings (one per CPU), event kinds, `ktrace!`, the boot timeline
   (`Timeline`). `acpi.rs`: ACPI
   discovery (CPUs, LAPIC, I/O APICs, HPET, the MCFG's ECAM regions, the S5
-  power-off registers) and the firmware-table reader. `pci.rs`: PCI
+  power-off registers) and the firmware-table reader. `pci/mod.rs`: PCI
   functions found over ECAM at boot (`pci::devices`, which `lspci` lists,
   and `pci::status`), the registry (one slot per function: its BARs'
   mappings and who claimed it), `pci::claim`, `DeviceResources`,
   `FunctionConfig`, and `pci::failed_after_bind` (a driver giving its
-  device up after binding). `drivers.rs`: the driver table (`DRIVERS`) and
+  device up after binding); `pci/msix.rs`: a claimed function's MSI-X
+  vector (`DeviceResources::msix`, `MsiVector`). `drivers.rs`: the driver table (`DRIVERS`) and
   `probe_all` (declines, the readiness check). `virtio.rs`: the adapter for
   `virtio-drivers` (the `Hal`: DMA runs from the frame allocator, bounce
-  buffers, probe attempts; `transport`, `VirtioTransport`, the device
-  status handle). `rng.rs`: randomness: `rng::fill`, `u64`, `below`,
+  buffers, probe attempts; `transport`, `VirtioTransport` and its MSI-X
+  vectors, the device status handle, the `Doorbell` a driver's interrupt
+  rings). `rng.rs`: randomness: `rng::fill`, `u64`, `below`,
   `sources`, `stats` (the shell's `random`, rhai's `random()`), RDRAND and
   the virtio-rng driver (its own queue, one deadline per request, dropped
   on a failed request) feeding a ChaCha20 pool. `power.rs`: `reboot` and `shutdown` (ACPI S5);
@@ -233,7 +235,8 @@ own PR that updates that doc first.
   brute-force multi-function scan into `DeviceInfo`, ECAM offsets, the
   warnings' text (`Problem`), names for q35's and the virtio devices,
   finding the MSI/MSI-X capability a write would land in
-  (`CapList::interrupt_cap_at`, `msi_len`), and virtio's capabilities with
+  (`CapList::interrupt_cap_at`, `msi_len`), MSI-X's table location and
+  entry encoding (`msix`), and virtio's capabilities with
   the checks around `PciTransport::new` (`virtio`) (host-tested against a
   fake configuration space).
 - `crates/lumen-uart`: 16550 UART logic: presence probe (scratch or

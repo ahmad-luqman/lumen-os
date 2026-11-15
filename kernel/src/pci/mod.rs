@@ -45,6 +45,12 @@ pub use lumen_pci::{Bar, BarProblem, DeviceInfo, NoBar, PciAddr};
 use lumen_pci::{ConfigSpace, command, ecam_offset, enumerate};
 use virtio_drivers::transport::pci::bus::{ConfigurationAccess, DeviceFunction};
 
+mod msix;
+
+#[cfg(feature = "ktest")]
+pub use msix::ktest_control;
+pub use msix::{MsiError, MsiVector, msix_vectors};
+
 use crate::acpi::{self, Failure};
 use crate::mm::paging::{self, MmioError};
 use crate::sync::SpinLock;
@@ -263,7 +269,13 @@ fn discover() -> (Vec<DeviceInfo>, Status) {
             Some(Bar::Memory { phys, size, .. }) => Some(BarEntry { phys, size, mapped: None }),
             _ => None,
         });
-        slots.push(Slot { addr: d.addr, bars, state: SlotState::Free { declined_by: None }, resources_live: false });
+        slots.push(Slot {
+            addr: d.addr,
+            bars,
+            state: SlotState::Free { declined_by: None },
+            resources_live: false,
+            msix: None,
+        });
     }
     let memory_bars = slots.iter().map(|s| s.bars.iter().flatten().count()).sum::<usize>();
     let plural = if found.len() == 1 { "" } else { "s" };
@@ -321,14 +333,17 @@ struct BarEntry {
 }
 
 /// One function's entry in the registry: its memory BARs (by index), who
-/// has it, and whether the [`DeviceResources`] a claim handed out are still
-/// alive.
+/// has it, whether the [`DeviceResources`] a claim handed out are still
+/// alive, and its MSI-X vector once it has one (once per function, kept
+/// here rather than in the resources, so a function declined and claimed
+/// again can't get a second).
 #[derive(Clone, Debug)]
 struct Slot {
     addr: PciAddr,
     bars: [Option<BarEntry>; 6],
     state: SlotState,
     resources_live: bool,
+    msix: Option<msix::Programmed>,
 }
 
 /// Who has a function, with what only the registry needs (the command
@@ -425,7 +440,7 @@ impl BarMapping {
         self.phys
     }
 
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: #96's MSI-X table
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests
     pub fn virt(&self) -> VirtAddr {
         self.virt
     }
@@ -531,7 +546,7 @@ fn map_bar(addr: PciAddr, index: usize) -> Result<BarMapping, BarError> {
 
 /// Memory BAR `index` of `addr`'s mapping, if [`map_bar`] made one; maps
 /// nothing (for the virtio adapter's pre-probe check and
-/// `mmio_phys_to_virt`, and #96's MSI-X table).
+/// `mmio_phys_to_virt`, and the MSI-X table).
 fn mapped_bar(addr: PciAddr, index: usize) -> Result<BarMapping, BarError> {
     check_bar(addr, index)?;
     let mapped = with_slot(addr, |slot| slot.bars[index].expect("every memory BAR is registered").mapped);
@@ -764,10 +779,10 @@ impl DeviceResources {
 /// One claimed function's configuration space, tied to its
 /// [`DeviceResources`]: reads and writes go through ECAM (its lock taken
 /// for each), and another function's address is a bug that panics, as is
-/// a write into its MSI or MSI-X capability (#96 programs those through a
-/// path private to `pci`; `virtio-drivers` 0.13 writes only the command
-/// register and the BARs, sizing them while probing, before the device
-/// runs: no BAR emulation in M3).
+/// a write into its MSI or MSI-X capability (`DeviceResources::msix`
+/// programs MSI-X through a path private to `pci`; `virtio-drivers` 0.13
+/// writes only the command register and the BARs, sizing them while
+/// probing, before the device runs: no BAR emulation in M3).
 #[derive(Debug)]
 pub struct FunctionConfig<'a> {
     info: &'static DeviceInfo,

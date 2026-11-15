@@ -86,11 +86,11 @@ fn probe_with(drivers: &[Driver]) {
             info!(target: "drivers", "probing {} on {}", driver.name, d.addr);
             let attempt = crate::virtio::begin_probe(d.addr);
             let mut outcome = (driver.probe)(res);
-            let status = crate::virtio::end_probe();
+            let brought_up = crate::virtio::end_probe();
             if outcome.is_ok()
-                && let Some(status) = status
+                && let Some(b) = brought_up
             {
-                outcome = status.check_ready();
+                outcome = b.check();
             }
             let leaked = crate::virtio::outstanding_runs_of(attempt);
             let left =
@@ -197,7 +197,7 @@ crate::ktest!(
                 name: "ktest-unready",
                 matches: is_balloon,
                 probe: |res| {
-                    virtio::transport(res)?;
+                    virtio::transport(res, None)?;
                     Ok(())
                 },
             },
@@ -206,7 +206,7 @@ crate::ktest!(
                 name: "ktest-console",
                 matches: is_console,
                 probe: |res| {
-                    let mut t = virtio::transport(res)?;
+                    let mut t = virtio::transport(res, None)?;
                     t.set_status(
                         DeviceStatus::ACKNOWLEDGE
                             | DeviceStatus::DRIVER

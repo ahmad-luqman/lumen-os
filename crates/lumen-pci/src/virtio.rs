@@ -54,7 +54,7 @@ pub const NOTIFY_MULTIPLIER_AT: u8 = 16;
 
 /// Offsets in the common configuration structure, `virtio_pci_common_cfg`
 /// (virtio 1.2 §4.1.4.3): what the kernel reads or writes beside the crate
-/// (the device status handle; #96's MSI-X vectors).
+/// (the device status handle; the MSI-X vectors).
 pub mod common {
     /// `msix_config` (1.2's `config_msix_vector`), 16 bits.
     pub const MSIX_CONFIG: u64 = 16;

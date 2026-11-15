@@ -166,6 +166,10 @@ def test_devices_come_before_extra_args():
             ["-device", "virtio-rng-pci,id=lumen-rng,max-bytes=64,period=20000"],
         ),
         (
+            Devices(rng_no_msix=True),
+            ["-device", "virtio-rng-pci,id=lumen-rng,vectors=0"],
+        ),
+        (
             Devices(sound=True),
             [
                 "-audiodev", "wav,id=lumen-audio,path={art}/audio.wav",
@@ -201,7 +205,10 @@ def test_devices_come_before_extra_args():
             ],
         ),
     ],
-    ids=["tablet", "keyboard", "rng", "rng_rate", "sound", "blk_mib", "blk_image", "net", "share"],
+    ids=[
+        "tablet", "keyboard", "rng", "rng_rate", "rng_no_msix", "sound", "blk_mib", "blk_image",
+        "net", "share",
+    ],
 )  # fmt: skip
 def test_one_device_attaches_exactly_its_own(tmp_path, devices, expected):
     m = Machine(Path("x.iso"), tmp_path, devices=devices)
@@ -212,9 +219,9 @@ def test_one_device_attaches_exactly_its_own(tmp_path, devices, expected):
 def test_every_turns_every_device_on():
     every = Devices.every()
     for f in dataclasses.fields(Devices):
-        # blk_image: the alternative to blk_mib, which is on; rng_rate: a
-        # limit on rng, which is on unlimited.
-        if f.name in ("blk_image", "rng_rate"):
+        # blk_image: the alternative to blk_mib, which is on; rng_rate and
+        # rng_no_msix: changes to rng, which is on unlimited, with MSI-X.
+        if f.name in ("blk_image", "rng_rate", "rng_no_msix"):
             continue
         assert getattr(every, f.name) != f.default, f.name
 

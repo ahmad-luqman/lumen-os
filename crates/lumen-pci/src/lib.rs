@@ -18,6 +18,7 @@
 mod bar;
 pub mod cap;
 mod device;
+pub mod msix;
 pub mod names;
 mod problem;
 pub mod virtio;
@@ -120,7 +121,7 @@ pub trait ConfigSpace {
     fn write(&mut self, addr: PciAddr, offset: u16, value: u32);
 
     /// The 16 bits at `offset` (2-byte aligned, below 4096), from the
-    /// dword holding them. (MSI-X's message control, #96.)
+    /// dword holding them. (MSI-X's message control.)
     fn read16(&mut self, addr: PciAddr, offset: u16) -> u16 {
         debug_assert!(offset.is_multiple_of(2) && offset < 4096, "read16 at {offset:#x}");
         (self.read(addr, offset & !3) >> ((offset & 2) * 8)) as u16

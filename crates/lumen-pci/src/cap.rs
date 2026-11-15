@@ -144,7 +144,7 @@ impl CapList {
     /// The MSI or MSI-X capability whose bytes hold the dword at `offset`
     /// of `addr`, if one does (an MSI capability's length read from its
     /// message control). The kernel refuses a driver's write there: those
-    /// are programmed through a path private to `pci` (#96).
+    /// are programmed through a path private to `pci` (`pci::msix`).
     pub fn interrupt_cap_at(&self, cs: &mut impl ConfigSpace, addr: PciAddr, offset: u16) -> Option<Cap> {
         self.iter().find(|c| {
             let len = match c.id {

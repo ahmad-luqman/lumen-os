@@ -14,20 +14,22 @@
 //!   are single).
 //! - **One owner.** The probe hands the `VirtIOInput` to the `mouse`
 //!   thread, the only code that touches the device afterwards: no lock is
-//!   held across a wait. It polls the event queue every [`POLL_NS`]
-//!   (sleeping in between, so it costs no CPU; MSI-X, #96, will replace the
-//!   sleep with a wait its interrupt ends), feeds the events to a
-//!   `lumen_input::Tablet`, and after a batch publishes the newest state
+//!   held across a wait. It sleeps until the device's MSI-X interrupt
+//!   (through `virtio::transport`) rings [`BELL`] (or [`IDLE_CHECK_NS`]
+//!   passes, to look at the device's status), so it costs no CPU while
+//!   nothing happens; then it drains the event queue, feeds the events to
+//!   a `lumen_input::Tablet`, and after a batch publishes the newest state
 //!   and the batch's counts under one lock ([`status`]) and moves the
-//!   pointer (`term::move_pointer`). A press and release inside one poll
+//!   pointer (`term::move_pointer`). A press and release inside one batch
 //!   still shows, while no frame was dropped at the device: a state counts
-//!   each button's presses so far (that a click happened, not where).
+//!   each button's presses so far (that a click happened, not where). A
+//!   device that can't take its vector fails the probe.
 //! - **Overruns.** The ring holds 32 event buffers and QEMU drops a whole
 //!   frame (a move is 3 events) that doesn't fit, without a `SYN_DROPPED`.
-//!   A poll that read 30 events or more may have missed frames: it counts
-//!   as an overrun (warned about once), the state is marked stale until a
-//!   clean poll brings a frame, and the thread looks again at once instead
-//!   of sleeping. The count is a lower bound: frames the device dropped
+//!   A batch of 30 events or more may have missed frames: it counts as an
+//!   overrun (warned about once), the state is marked stale until a clean
+//!   batch brings a frame, and the thread looks again at once instead of
+//!   waiting. The count is a lower bound: frames the device dropped
 //!   can't be counted exactly.
 //! - **Failure.** A device that stops being ready (`FAILED`, which for the
 //!   tablet means the status reads all ones or something else gave up on
@@ -64,14 +66,23 @@ use virtio_drivers::transport::{DeviceStatus, Transport};
 use crate::drivers::Driver;
 use crate::pci::{DeviceInfo, DeviceResources};
 use crate::sync::SpinLock;
-use crate::virtio::{self, ProbeError, StatusHandle, VirtioHal, VirtioTransport};
+use crate::virtio::{self, Doorbell, ProbeError, StatusHandle, VirtioHal, VirtioTransport};
 
 /// The driver table's row.
 pub const DRIVER: Driver = Driver { name: "virtio-tablet", matches, probe };
 
-/// How often the `mouse` thread looks for events: 200 times a second, so a
-/// move shows within a frame or so of a 60 Hz screen.
-pub const POLL_NS: u64 = 5_000_000;
+/// How long the `mouse` thread waits for an interrupt before it looks at
+/// the device's status anyway (a device that stops without saying so, its
+/// status reading all ones, sends none).
+pub const IDLE_CHECK_NS: u64 = 1_000_000_000;
+
+/// Rung by the tablet's MSI-X interrupt: events came in (or its
+/// configuration changed).
+static BELL: Doorbell = Doorbell::new();
+
+fn on_interrupt() {
+    BELL.ring();
+}
 
 /// The event buffers the crate keeps posted (`VirtIOInput`'s queue size).
 const RING: u64 = 32;
@@ -118,7 +129,7 @@ pub struct Counts {
     pub ignored: u64,
     /// `SYN_DROPPED`s (the device said it lost a frame).
     pub dropped: u64,
-    /// Polls that read so many events that a frame may not have fit in
+    /// Batches that read so many events that a frame may not have fit in
     /// the ring (`lumen_input::may_have_lost_frames`): a lower bound on
     /// trouble, since QEMU drops such frames without saying so and they
     /// can't be counted exactly.
@@ -157,7 +168,7 @@ pub struct Bound {
     /// once the tablet failed: nothing is held any more).
     pub state: Option<PointerState>,
     pub counts: Counts,
-    /// The newest poll that brought frames may have missed some (an
+    /// The newest batch that brought frames may have missed some (an
     /// overrun): the state may be older than the device's.
     pub stale: bool,
     /// Set when the device failed (its thread ended).
@@ -219,7 +230,7 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
         info!(target: "mouse", "{addr}: a tablet is bound already (on {first}): only one is used");
         return Err(ProbeError::NotMine);
     }
-    let mut t = virtio::transport(res)?;
+    let mut t = virtio::transport(res, Some(on_interrupt))?;
     let mut abs = [0u8; 1];
     let n = query(&mut t, cfg::EV_BITS, evdev::EV_ABS as u8, &mut abs)?;
     if !has_abs_xy(&abs[..n]) {
@@ -241,6 +252,7 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
     let screen = crate::term::screen_size().unwrap_or((units(x), units(y)));
     let status = t.status();
     let input = Input::new(t).map_err(ProbeError::Device)?;
+    virtio::check_vectors()?;
     status.check_ready()?;
     let tablet = Tablet::new(x, y, screen.0, screen.1);
     info!(
@@ -263,6 +275,9 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
 fn run(mut input: Input, mut tablet: Tablet, status: StatusHandle, addr: PciAddr) {
     let (mut warned_overrun, mut logged_ignored) = (false, false);
     loop {
+        // Read before draining, so an interrupt after the drain ends the
+        // wait below.
+        let seen = BELL.rings();
         let (mut events, mut newest) = (0u64, None);
         while let Some(e) = input.pop_pending_event() {
             events += 1;
@@ -277,8 +292,8 @@ fn run(mut input: Input, mut tablet: Tablet, status: StatusHandle, addr: PciAddr
         let overrun = may_have_lost_frames(events, RING);
         if overrun && !warned_overrun {
             warned_overrun = true;
-            warn!(target: "mouse", "{addr}: {events} events in one poll: the event ring was nearly full, so frames \
-                may have been lost (said once; `mouse` counts such polls)");
+            warn!(target: "mouse", "{addr}: {events} events in one batch: the event ring was nearly full, so frames \
+                may have been lost (said once; `mouse` counts such batches)");
         }
         if events > 0
             && let Some(b) = BOUND.lock().as_mut()
@@ -303,9 +318,9 @@ fn run(mut input: Input, mut tablet: Tablet, status: StatusHandle, addr: PciAddr
         if status.check_ready().is_err() {
             return fail(input, status, addr);
         }
-        // A busy poll looks again at once: the ring may be filling.
+        // A busy batch looks again at once: the ring may be filling.
         if events < RING / 2 {
-            crate::time::sleep(POLL_NS);
+            let _ = BELL.wait_after(seen, crate::time::now_ns().saturating_add(IDLE_CHECK_NS));
         }
     }
 }

@@ -10,7 +10,7 @@ import re
 from collections.abc import Sequence
 
 import pytest
-from lumen_harness.qemu import Machine, default_accel
+from lumen_harness.qemu import Devices, Machine, default_accel
 from lumen_harness.screen import PROMPT, expect_screen, read_screen
 
 SHELLS = r"INFO  shell: shells on serial and the screen; type 'help'\n"
@@ -30,6 +30,34 @@ def run(m: Machine, line: str) -> str:
     echo = m.expect(re.escape(line) + r"\n", 10)
     end = m.expect(PROMPT, 10)
     return m.output[echo.end() : end.start()]
+
+
+def test_irqs_lists_msix(boot):
+    # virtio-rng's MSI-X vector (#96): `irqs` names it by its function and
+    # table entry (`msix <pci address> #0`), with a non-zero count (the
+    # probe's request already came back through it), and a request
+    # (`random`) makes it fire again. No MSI vector is listed as plain
+    # `MSI n` (nothing raised one no device claimed).
+    m = boot("qemutest", devices=Devices(rng=True))
+    m.expect(SHELLS, 60)
+    m.expect(PROMPT, 60)
+    row = re.compile(r"^  (0x[0-9a-f]{2})\s+msix (\S+) #0\s+(\d+)$", re.MULTILINE)
+
+    def msix_rows() -> list[tuple[str, str, int]]:
+        out = run(m, "irqs | where use ~ msix")
+        return [(v, addr, int(n)) for v, addr, n in row.findall(out)]
+
+    rows = msix_rows()
+    assert len(rows) == 1, rows
+    vector, addr, before = rows[0]
+    assert 0x90 <= int(vector, 16) <= 0xEF, vector
+    assert before > 0
+    lspci = run(m, "lspci | where name = 'virtio rng' | select addr")
+    assert addr in lspci, lspci
+    assert re.fullmatch(r"[0-9a-f]{64}\n", run(m, "random 32"))
+    [(v, a, after)] = msix_rows()
+    assert (v, a) == (vector, addr) and after > before, (v, a, after, before)
+    assert run(m, "irqs | where use ~ 'MSI ' | count") == "0\n"
 
 
 def keys(m: Machine, *presses: str | list[str]) -> None:

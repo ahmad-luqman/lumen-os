@@ -238,6 +238,13 @@ impl Thread {
         self.stack.lock().as_ref().map(KernelStack::range)
     }
 
+    /// Move it from `from` to `to` if it is in `from`; whether it was. For a
+    /// thread two wakers race for (a queue's waker and its deadline): only
+    /// the one that moves it queues it.
+    fn try_change(&self, from: State, to: State) -> bool {
+        self.state.compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
     /// Move it from `from` to `to`, panicking if it wasn't in `from` (a
     /// broken scheduler invariant: such a thread would be lost, or queued
     /// twice).
@@ -271,8 +278,10 @@ struct Cpu {
     idle: Option<Arc<Thread>>,
     /// Threads waiting for a turn, in order.
     ready: VecDeque<Arc<Thread>>,
-    /// Sleeping threads and the `now_ns` each wakes at.
-    sleepers: Vec<(u64, Arc<Thread>)>,
+    /// Sleeping threads, and threads waiting on a queue with a deadline
+    /// ([`WaitQueue::wait_until_or_deadline`]), with the `now_ns` each
+    /// wakes at.
+    sleepers: Vec<Sleeper>,
     /// The thread it last switched away from, kept alive until the switch
     /// is finished ([`finish_switch`]: a dead one's stack is freed there).
     switched_from: Option<Arc<Thread>>,
@@ -339,19 +348,40 @@ impl Cpu {
         t
     }
 
-    /// Make every sleeper whose deadline is `now` or earlier ready.
+    /// Make every sleeper whose deadline is `now` or earlier ready. A
+    /// thread waiting on a queue with that deadline is made ready only if
+    /// it is still blocked (its queue's waker may have woken it first: then
+    /// the entry is just dropped).
     fn wake_sleepers(&mut self, cpu: usize, now: u64) {
         let mut i = 0;
         while i < self.sleepers.len() {
-            if self.sleepers[i].0 <= now {
-                let (_, t) = self.sleepers.swap_remove(i);
-                t.change(State::Sleeping, State::Ready);
-                self.push_ready(cpu, t);
+            if self.sleepers[i].at <= now {
+                let Sleeper { thread, on_queue, .. } = self.sleepers.swap_remove(i);
+                if !on_queue {
+                    thread.change(State::Sleeping, State::Ready);
+                    self.push_ready(cpu, thread);
+                } else if thread.try_change(State::Blocked, State::Ready) {
+                    self.push_ready(cpu, thread);
+                }
             } else {
                 i += 1;
             }
         }
     }
+
+    /// Drop `me`'s deadline entry, if it is still there (it woke some other
+    /// way).
+    fn forget_deadline(&mut self, me: &Arc<Thread>) {
+        self.sleepers.retain(|s| !(s.on_queue && Arc::ptr_eq(&s.thread, me)));
+    }
+}
+
+/// A thread waiting for a deadline: asleep ([`sleep`]), or blocked on a
+/// [`WaitQueue`] until the deadline at the latest (`on_queue`).
+struct Sleeper {
+    at: u64,
+    thread: Arc<Thread>,
+    on_queue: bool,
 }
 
 static CPUS: [SpinLock<Cpu>; MAX_CPUS] = [const { SpinLock::new(Cpu::new()) }; MAX_CPUS];
@@ -498,6 +528,11 @@ pub fn running_here() -> Option<(u64, &'static str)> {
 /// last, only outside every critical section.
 fn can_block(cpu: usize) -> bool {
     running_on(cpu) && arch::irq::enabled() && arch::irq::depth() == 0 && !CPUS[cpu].lock().on_idle()
+}
+
+/// Whether the running thread can block here (see [`can_block`]).
+pub fn can_block_now() -> bool {
+    can_block(arch::cpu_index())
 }
 
 /// Why [`spawn_on`] refused.
@@ -653,7 +688,7 @@ pub fn sleep(ns: u64) -> bool {
         let me = q.running().clone();
         me.change(State::Running, State::Sleeping);
         assert!(q.sleepers.len() < q.sleepers.capacity(), "thread {me:?} sleeping without room reserved");
-        q.sleepers.push((deadline, me));
+        q.sleepers.push(Sleeper { at: deadline, thread: me, on_queue: false });
     }
     schedule(cpu);
     arch::irq::restore(were_on);
@@ -807,7 +842,7 @@ impl WaitQueue {
         );
         loop {
             let were_on = arch::irq::disable();
-            {
+            let me = {
                 let mut waiters = self.waiters.lock();
                 if ready() {
                     drop(waiters);
@@ -819,25 +854,94 @@ impl WaitQueue {
                 // before this CPU switches away: `schedule` then neither
                 // queues it again nor loses it.
                 me.change(State::Running, State::Blocked);
-                waiters.push_back(me);
-            }
+                waiters.push_back(me.clone());
+                me
+            };
             schedule(cpu);
+            // Normally its waker took it off; but a waker that took it off
+            // an earlier wait (with a deadline, which woke it first) may have
+            // woken it instead: then it is still on, and must come off, so
+            // no waker finds it later, blocked on something else.
+            self.forget(&me);
             arch::irq::restore(were_on);
         }
     }
 
-    /// Wake the longest-waiting thread; whether there was one.
-    pub fn wake_one(&self) -> bool {
-        let first = self.waiters.lock().pop_front();
-        first.map(wake).is_some()
+    /// Take `me` off the queue, if it is still on.
+    fn forget(&self, me: &Arc<Thread>) {
+        self.waiters.lock().retain(|w| !Arc::ptr_eq(w, me));
     }
 
-    /// Wake every waiting thread; how many there were.
+    /// [`wait_until`](Self::wait_until), but at most until `deadline`
+    /// (`time::now_ns`): whether `ready()` held. A waker and the deadline
+    /// may race to wake the thread: whichever moves it out of `Blocked`
+    /// first queues it, and the other's entry is dropped (by that waker, by
+    /// the timer, or by the thread itself once it runs). `ready()` is
+    /// checked once more at the deadline. Like a sleep, the deadline is
+    /// noticed at the first tick after it. Panics where the thread can't
+    /// block.
+    pub fn wait_until_or_deadline(&self, deadline: u64, mut ready: impl FnMut() -> bool) -> bool {
+        let cpu = arch::cpu_index();
+        assert!(
+            can_block(cpu),
+            "blocking where a thread can't (no scheduler, interrupts off, a lock held, or the idle thread)"
+        );
+        loop {
+            let were_on = arch::irq::disable();
+            let me = {
+                let mut waiters = self.waiters.lock();
+                if ready() {
+                    drop(waiters);
+                    arch::irq::restore(were_on);
+                    return true;
+                }
+                if time::now_ns() >= deadline {
+                    drop(waiters);
+                    arch::irq::restore(were_on);
+                    return false;
+                }
+                let mut q = CPUS[cpu].lock();
+                let me = q.running().clone();
+                // As in `wait_until`: a waker on another CPU may queue it
+                // before this CPU switches away. The timer can't (interrupts
+                // are off here until the switch).
+                me.change(State::Running, State::Blocked);
+                assert!(q.sleepers.len() < q.sleepers.capacity(), "thread {me:?} waiting without room reserved");
+                q.sleepers.push(Sleeper { at: deadline, thread: me.clone(), on_queue: true });
+                waiters.push_back(me.clone());
+                me
+            };
+            schedule(cpu);
+            // Woken by one of the two: drop the other's entry, so neither
+            // can find this thread later, blocked on something else. (The
+            // timer can't run here, on this CPU, before the deadline entry
+            // is gone: interrupts are still off.)
+            self.forget(&me);
+            CPUS[cpu].lock().forget_deadline(&me);
+            arch::irq::restore(were_on);
+        }
+    }
+
+    /// Wake the longest-waiting thread; whether there was one (a thread
+    /// already woken some other way, e.g. by its deadline, doesn't count).
+    pub fn wake_one(&self) -> bool {
+        loop {
+            let first = self.waiters.lock().pop_front();
+            match first {
+                None => return false,
+                Some(t) => {
+                    if wake(t) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wake every waiting thread; how many it woke.
     pub fn wake_all(&self) -> usize {
         let all = core::mem::take(&mut *self.waiters.lock());
-        let n = all.len();
-        all.into_iter().for_each(wake);
-        n
+        all.into_iter().filter(|t| wake(t.clone())).count()
     }
 }
 
@@ -853,11 +957,16 @@ impl Drop for WaitQueue {
     }
 }
 
-/// Make a thread taken off a wait queue ready (only blocked threads are on
-/// one, and each is taken off before it is woken).
-fn wake(thread: Arc<Thread>) {
-    thread.change(State::Blocked, State::Ready);
+/// Make a thread taken off a wait queue ready: whether it did. It is
+/// blocked unless something else woke it first (its deadline, or a waker
+/// holding an entry from an earlier wait); then it isn't queued again, and
+/// it takes its own entries off once it runs.
+fn wake(thread: Arc<Thread>) -> bool {
+    if !thread.try_change(State::Blocked, State::Ready) {
+        return false;
+    }
     enqueue(thread);
+    true
 }
 
 /// Make `current` CPU `cpu`'s running thread and `idle` its idle thread.
@@ -1644,6 +1753,130 @@ crate::ktest!(
         for cpu in (0..MAX_CPUS).filter(|&c| smp::online_lapic_id(c).is_none()) {
             kassert!(matches!(spawn_on(cpu, "offline", || {}), Err(SpawnError::NotRunning)));
         }
+        Ok(())
+    }
+);
+
+/// Ktests: whether `t` has a deadline entry on its CPU, or is on `queue`.
+#[cfg(feature = "ktest")]
+fn entries_of(t: &Arc<Thread>, queue: &WaitQueue) -> (bool, bool) {
+    let deadline = CPUS[t.cpu].lock().sleepers.iter().any(|s| s.on_queue && Arc::ptr_eq(&s.thread, t));
+    let queued = queue.waiters.lock().iter().any(|w| Arc::ptr_eq(w, t));
+    (deadline, queued)
+}
+
+crate::ktest!(
+    fn a_wait_with_a_deadline_ends_at_it_or_when_woken() {
+        // Nobody wakes it: false, no earlier than the deadline, and neither
+        // entry is left behind. A waker on another CPU wakes it long before
+        // its deadline: true. Then 200 waits a waker races with the
+        // deadline (a wake about when it passes): never a panic, a lost
+        // thread or an entry left behind, each side winning sometimes.
+        use crate::{kassert, kassert_eq};
+        let me = current().ok_or("the ktests run on a thread")?;
+        let q = WaitQueue::new();
+        let start = time::now_ns();
+        kassert!(!q.wait_until_or_deadline(start + 5_000_000, || false));
+        kassert!(time::now_ns() >= start + 5_000_000);
+        kassert_eq!(entries_of(&me, &q), (false, false));
+        // Already ready, or the deadline already passed: no wait.
+        kassert!(q.wait_until_or_deadline(0, || true));
+        kassert!(!q.wait_until_or_deadline(0, || false));
+
+        let s = Arc::new((WaitQueue::new(), AtomicBool::new(false)));
+        let w = s.clone();
+        let waker = spawn_test(last_cpu()?, "waker", move || {
+            let _ = sleep(2_000_000);
+            w.1.store(true, Ordering::Release);
+            w.0.wake_all();
+        })?;
+        let start = time::now_ns();
+        kassert!(s.0.wait_until_or_deadline(start + 10_000_000_000, || s.1.load(Ordering::Acquire)));
+        kassert!(time::now_ns() - start < 5_000_000_000);
+        join_bounded(waker)?;
+        kassert_eq!(entries_of(&me, &s.0), (false, false));
+
+        // The race, on two other CPUs (so the switches don't fill this
+        // CPU's trace ring, which holds the boot's events): each round the
+        // racer marks the round and wakes the queue 0, 0.4, 0.8, 1.2 or 1.6
+        // ms after it starts, around the waiter's 1 ms deadline, so each
+        // side wins sometimes (the wait returns true if the racer's mark
+        // came first). Then the waiter blocks again at once on another
+        // queue: a stale wake (the racer may still hold an entry from the
+        // wait before) may wake it, but it waits on until its deadline.
+        let cpus = running_cpus();
+        let (waiter_cpu, racer_cpu) = match cpus.as_slice() {
+            [.., a, b] => (*b, *a),
+            _ => return Err("the race needs two CPUs"),
+        };
+        struct Race {
+            queue: WaitQueue,
+            other: WaitQueue,
+            round: core::sync::atomic::AtomicU64,
+            marked: core::sync::atomic::AtomicU64,
+            done: AtomicBool,
+            woke: core::sync::atomic::AtomicU64,
+            timed_out: core::sync::atomic::AtomicU64,
+            broken: AtomicBool,
+        }
+        use core::sync::atomic::AtomicU64;
+        let race = Arc::new(Race {
+            queue: WaitQueue::new(),
+            other: WaitQueue::new(),
+            round: AtomicU64::new(0),
+            marked: AtomicU64::new(0),
+            done: AtomicBool::new(false),
+            woke: AtomicU64::new(0),
+            timed_out: AtomicU64::new(0),
+            broken: AtomicBool::new(false),
+        });
+        let r = race.clone();
+        let racer = spawn_test(racer_cpu, "racer", move || {
+            let mut seen = 0;
+            while !r.done.load(Ordering::Acquire) {
+                let n = r.round.load(Ordering::Acquire);
+                if n == seen {
+                    core::hint::spin_loop();
+                    continue;
+                }
+                seen = n;
+                let until = time::now_ns() + n % 5 * 400_000;
+                while time::now_ns() < until {
+                    core::hint::spin_loop();
+                }
+                r.marked.store(n, Ordering::Release);
+                r.queue.wake_all();
+            }
+        })?;
+        let r = race.clone();
+        let waiter = spawn_test(waiter_cpu, "waiter", move || {
+            let Some(me) = current() else {
+                r.broken.store(true, Ordering::Release);
+                return;
+            };
+            for n in 1..=200u64 {
+                r.round.store(n, Ordering::Release);
+                let deadline = time::now_ns() + 1_000_000;
+                if r.queue.wait_until_or_deadline(deadline, || r.marked.load(Ordering::Acquire) == n) {
+                    r.woke.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    r.timed_out.fetch_add(1, Ordering::Relaxed);
+                }
+                let d2 = time::now_ns() + 100_000;
+                let early = r.other.wait_until_or_deadline(d2, || false) || time::now_ns() < d2;
+                let left = entries_of(&me, &r.queue) != (false, false) || entries_of(&me, &r.other) != (false, false);
+                if early || left {
+                    r.broken.store(true, Ordering::Release);
+                }
+            }
+        })?;
+        join_bounded(waiter)?;
+        race.done.store(true, Ordering::Release);
+        join_bounded(racer)?;
+        let (woke, timed_out) = (race.woke.load(Ordering::Relaxed), race.timed_out.load(Ordering::Relaxed));
+        crate::ktest::diag(format_args!("of 200 racing waits, {woke} were woken first, {timed_out} timed out"));
+        kassert!(!race.broken.load(Ordering::Acquire));
+        kassert!(woke > 0 && timed_out > 0);
         Ok(())
     }
 );
