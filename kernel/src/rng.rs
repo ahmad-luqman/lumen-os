@@ -481,7 +481,6 @@ fn bring_up(res: DeviceResources) -> Result<(), ProbeError> {
     let mut transport = virtio::transport(res, on_interrupt)?;
     let status = transport.status();
     let addr = transport.info().addr;
-    BELL.attach(addr);
     transport.begin_init(Feature::VERSION_1);
     // On an error the transport drops first (resetting the device), and
     // `VirtQueue::new` frees what it made.

@@ -184,6 +184,9 @@ pub enum CapProblem {
     /// Queue `queue`'s notify register (`queue_notify_off` times the
     /// multiplier) isn't inside the notify structure.
     NotifyPastEnd { cap: VirtioCap, queue: u16, notify_off: u16, multiplier: u32 },
+    /// A kept structure overlaps the function's MSI-X table or pending bit
+    /// array (`table`: which), which the kernel programs itself.
+    OverlapsMsix { cap: VirtioCap, table: bool },
 }
 
 impl fmt::Display for CapProblem {
@@ -226,6 +229,15 @@ impl fmt::Display for CapProblem {
                 }
                 Ok(())
             }
+            CapProblem::OverlapsMsix { cap, table } => write!(
+                f,
+                "the {} structure ({:#x} bytes at {:#x} in BAR {}) overlaps the MSI-X {}",
+                name(cap),
+                cap.length,
+                cap.offset,
+                cap.bar,
+                if *table { "table" } else { "pending bit array" }
+            ),
         }
     }
 }
@@ -233,8 +245,14 @@ impl fmt::Display for CapProblem {
 /// Whether `PciTransport::new` can be given this device: every capability
 /// in `caps` it reads (length field at least 16) has its fields inside the
 /// header, and every structure [`used`] keeps lies inside a mapped memory
-/// BAR (`bar_size(i)`: BAR `i`'s size if the kernel mapped it).
-pub fn check(caps: &[VirtioCap], bar_size: impl Fn(u8) -> Option<u64>) -> Result<Used, CapProblem> {
+/// BAR (`bar_size(i)`: BAR `i`'s size if the kernel mapped it) and clear of
+/// the MSI-X table and pending bit array (`msix`: their (BAR, offset,
+/// length), `msix::Capability::regions`; the kernel programs those itself).
+pub fn check(
+    caps: &[VirtioCap],
+    bar_size: impl Fn(u8) -> Option<u64>,
+    msix: &[(u8, u64, u64)],
+) -> Result<Used, CapProblem> {
     for &cap in caps.iter().filter(|c| c.cap_len >= MIN_CAP_LEN) {
         // The crate reads the dwords at +4, +8 and +12 of every one it
         // looks at, and at +16 of the notify one it keeps, adding in a u8.
@@ -258,6 +276,12 @@ pub fn check(caps: &[VirtioCap], bar_size: impl Fn(u8) -> Option<u64>) -> Result
         let need = min_length(cap.cfg_type);
         if cap.length < need {
             return Err(CapProblem::TooShort { cap, need });
+        }
+        let (start, end) = (u64::from(cap.offset), u64::from(cap.offset) + u64::from(cap.length));
+        for (i, &(bar, offset, len)) in msix.iter().enumerate() {
+            if bar == cap.bar && start < offset + len && offset < end {
+                return Err(CapProblem::OverlapsMsix { cap, table: i == 0 });
+            }
         }
     }
     Ok(u)

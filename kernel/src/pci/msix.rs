@@ -35,17 +35,14 @@ use super::{DeviceResources, set_command, with_ecam, with_slot};
 const ENTRY: u16 = 0;
 
 /// A function's MSI-X state in its registry slot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MsixState {
     /// `msix` hasn't been called (or refused before claiming a vector).
-    #[default]
     None,
     /// An IDT vector is claimed for it, but programming the device didn't
-    /// finish (MSI-X Enable didn't stick): never again.
-    Claimed {
-        #[allow(dead_code)] // for a crash report or a debugger: which vector it holds
-        vector: u8,
-    },
+    /// finish (MSI-X Enable didn't stick; the error names the vector):
+    /// never again.
+    Claimed,
     /// Its entry is programmed and MSI-X enabled.
     Programmed(MsixRecord),
 }
@@ -62,7 +59,8 @@ pub struct MsixRecord {
 
 /// A device's MSI-X vector: its table entry (and where it is mapped) and
 /// the IDT vector the entry sends. Private fields; not `Copy` or `Clone`:
-/// one owner (the transport) unmasks it.
+/// its owner (the transport) unmasks and masks the entry, and listings get
+/// a read-only [`MsixRecord`].
 #[derive(Debug, PartialEq, Eq)]
 pub struct MsiVector {
     pci: PciAddr,
@@ -92,8 +90,11 @@ pub enum MsiError {
     /// The boot CPU's local APIC id, which a message address can't hold
     /// (above 255: x2APIC).
     ApicIdTooLarge(u32),
-    /// MSI-X Enable didn't stick: what Message Control reads after `wrote`.
-    NotEnabled { wrote: u16, read: u16 },
+    /// MSI-X Enable didn't stick: what Message Control reads after `wrote`
+    /// (`vector` stays claimed: vectors are never freed).
+    NotEnabled { vector: u8, wrote: u16, read: u16 },
+    /// The entry still reads masked after it was unmasked.
+    StillMasked { vector: u8 },
 }
 
 impl fmt::Display for MsiError {
@@ -108,8 +109,13 @@ impl fmt::Display for MsiError {
             MsiError::NoVector => f.write_str("every MSI vector is taken"),
             MsiError::BootCpuOffline => f.write_str("the boot CPU isn't online"),
             MsiError::ApicIdTooLarge(id) => write!(f, "the boot CPU's local APIC id {id} doesn't fit a message"),
-            MsiError::NotEnabled { wrote, read } => {
-                write!(f, "MSI-X Enable didn't stick: Message Control reads {read:#06x} after {wrote:#06x}")
+            MsiError::NotEnabled { vector, wrote, read } => write!(
+                f,
+                "MSI-X Enable didn't stick: Message Control reads {read:#06x} after {wrote:#06x} (vector {vector:#x} \
+                 stays claimed)"
+            ),
+            MsiError::StillMasked { vector } => {
+                write!(f, "its MSI-X entry (vector {vector:#x}) still reads masked after it was unmasked")
             }
         }
     }
@@ -139,7 +145,7 @@ impl DeviceResources {
         let vector = crate::arch::idt::claim_msi_vector(handler).map_err(|_| MsiError::NoVector)?;
         // Recorded before the device is touched: whatever happens next, the
         // function has had its one try.
-        with_slot(addr, |s| s.msix = MsixState::Claimed { vector });
+        with_slot(addr, |s| s.msix = MsixState::Claimed);
         for (offset, value) in Message::fixed(apic_id, vector).masked_writes() {
             write_entry(at, offset, value);
         }
@@ -148,7 +154,7 @@ impl DeviceResources {
         if !m::delivers(read) {
             // The vector stays claimed (vectors are never freed); its entry
             // stays masked.
-            return Err(MsiError::NotEnabled { wrote, read });
+            return Err(MsiError::NotEnabled { vector, wrote, read });
         }
         let now = with_ecam(|e| e.read16(addr, lumen_pci::reg::COMMAND));
         set_command(addr, now | command::INTX_DISABLE, "INTx off once MSI-X is on");
@@ -180,7 +186,6 @@ fn write_entry(entry: VirtAddr, offset: u64, value: u32) {
     unsafe { (entry.as_u64() as *mut u32).byte_add(offset as usize).write_volatile(value) }
 }
 
-#[cfg(feature = "ktest")]
 fn read_entry(entry: VirtAddr, offset: u64) -> u32 {
     // SAFETY: as in `write_entry`.
     unsafe { (entry.as_u64() as *const u32).byte_add(offset as usize).read_volatile() }
@@ -205,10 +210,15 @@ impl MsiVector {
     }
 
     /// Unmask its entry: the device may send it from now on (a message it
-    /// held pending while masked is sent at once). No lock: the entry's
-    /// mapping is the vector's own.
-    pub fn unmask(&self) {
+    /// held pending while masked is sent at once). Read back: an entry that
+    /// still reads masked would never deliver. No lock: the entry's mapping
+    /// is the vector's own.
+    pub fn unmask(&self) -> Result<(), MsiError> {
         write_entry(self.at, m::ENTRY_VECTOR_CONTROL, 0);
+        if read_entry(self.at, m::ENTRY_VECTOR_CONTROL) & m::VECTOR_MASKED != 0 {
+            return Err(MsiError::StillMasked { vector: self.vector });
+        }
+        Ok(())
     }
 
     /// Mask its entry again (nothing does in M3 but the ktests).
@@ -261,8 +271,8 @@ crate::ktest!(
         // masked with a message to the boot CPU's local APIC, sets MSI-X
         // Enable (Function Mask clear) and INTx-disable; a second call is
         // refused. Declined after that, the function is recorded as failed
-        // (MSI-X stays on). Only the `MsiVector` unmasks (and masks) the
-        // entry; `msix_vectors` lists it.
+        // (MSI-X stays on). Its `MsiVector` unmasks (read back) and masks the
+        // entry; `msix_vectors` lists it as a read-only record.
         use lumen_pci::msix::{CONTROL_ENABLE, CONTROL_FUNCTION_MASK};
 
         use super::{Binding, Probed, claim, probed};
@@ -290,17 +300,21 @@ crate::ktest!(
         kassert_eq!(res.msix(nothing), Err(MsiError::AlreadyAllocated));
         let record = MsixRecord { pci: addr, table_entry: 0, idt_vector: v.idt_vector() };
         kassert!(msix_vectors().contains(&record));
-        v.unmask();
+        kassert_eq!(v.unmask(), Ok(()));
         kassert!(!v.is_masked());
         v.mask();
         kassert!(v.is_masked());
         drop(res);
         let binding = probed(addr, "ktest-msix", Probed::Declined);
-        let why = alloc::string::String::from("declined it after setting up its MSI-X vector");
+        let why = alloc::string::String::from("declined it after its MSI-X vector was set up (it has had its one)");
         kassert_eq!(binding, Binding::Failed("ktest-msix", why));
         kassert_eq!(alloc::format!("{}", MsiError::AlreadyAllocated), "its MSI-X vector is allocated already");
         kassert_eq!(alloc::format!("{}", MsiError::NoCapability), "no MSI-X capability");
         kassert_eq!(alloc::format!("{}", MsiError::BootCpuOffline), "the boot CPU isn't online");
+        kassert_eq!(
+            alloc::format!("{}", MsiError::NotEnabled { vector: 0x92, wrote: 0x8001, read: 0x0001 }),
+            "MSI-X Enable didn't stick: Message Control reads 0x0001 after 0x8001 (vector 0x92 stays claimed)"
+        );
         kassert_eq!(
             alloc::format!("{}", MsiError::ApicIdTooLarge(300)),
             "the boot CPU's local APIC id 300 doesn't fit a message"

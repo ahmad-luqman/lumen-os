@@ -38,25 +38,24 @@ def test_irqs_lists_msix(boot):
     # probe's request already came back through it), and a request
     # (`random`) makes it fire again. No MSI vector is listed as plain
     # `MSI n` (nothing raised one no device claimed).
+    from test_pci import msix_rows
+
     m = boot("qemutest", devices=Devices(rng=True))
     m.expect(SHELLS, 60)
     m.expect(PROMPT, 60)
-    row = re.compile(r"^  (0x[0-9a-f]{2})\s+msix (\S+) #0\s+(\d+)$", re.MULTILINE)
-
-    def msix_rows() -> list[tuple[str, str, int]]:
-        out = run(m, "irqs | where use ~ msix")
-        return [(v, addr, int(n)) for v, addr, n in row.findall(out)]
-
-    rows = msix_rows()
+    rows = msix_rows(m)
     assert len(rows) == 1, rows
-    vector, addr, before = rows[0]
-    assert 0x90 <= int(vector, 16) <= 0xEF, vector
+    [(addr, (vector, entry, before))] = rows.items()
+    assert 0x90 <= vector <= 0xEF and entry == 0, rows
     assert before > 0
     lspci = run(m, "lspci | where name = 'virtio rng' | select addr")
     assert addr in lspci, lspci
     assert re.fullmatch(r"[0-9a-f]{64}\n", run(m, "random 32"))
-    [(v, a, after)] = msix_rows()
-    assert (v, a) == (vector, addr) and after > before, (v, a, after, before)
+    after = msix_rows(m)
+    assert after.keys() == {addr} and after[addr][:2] == (vector, 0) and after[addr][2] > before, (
+        after
+    )
+    assert "interrupt never came" not in m.output
     assert run(m, "irqs | where use ~ 'MSI ' | count") == "0\n"
 
 

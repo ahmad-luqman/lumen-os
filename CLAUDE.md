@@ -170,7 +170,7 @@ own PR that updates that doc first.
   `FunctionConfig`, and `pci::failed_after_bind` (a driver giving its
   device up after binding); `pci/msix.rs`: a claimed function's MSI-X
   vector (`DeviceResources::msix`, `MsiVector`). `drivers.rs`: the driver table (`DRIVERS`) and
-  `probe_all` (declines, the readiness check). `virtio.rs`: the adapter for
+  `probe_all` (declines, the MSI-X vector and readiness checks). `virtio.rs`: the adapter for
   `virtio-drivers` (the `Hal`: DMA runs from the frame allocator, bounce
   buffers, probe attempts; `transport`, `VirtioTransport` and its MSI-X
   vectors, the device status handle, the `Doorbell` a driver's interrupt

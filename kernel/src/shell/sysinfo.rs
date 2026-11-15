@@ -323,7 +323,7 @@ fn vector_table() -> pipe::Table {
         Column::new("count", Kind::Int, Align::Left, 0),
     ];
     let inputs = crate::interrupts::inputs();
-    let msix = crate::pci::msix_vectors();
+    let msix: Vec<crate::pci::MsixRecord> = crate::pci::msix_vectors();
     let mut t = pipe::Table::new(&COLUMNS);
     for v in 32..=255u8 {
         let count = idt::vector_count(v);

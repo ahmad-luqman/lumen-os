@@ -1693,9 +1693,10 @@ pub struct Driver {
   bound, failed, declined and refused.
 - **A probe's side effects come last.** A thread started or state
   published for the rest of the kernel comes after the probe's last
-  fallible check, `StatusHandle::check_ready` included (the tablet and
-  sound check it themselves before publishing and spawning; a spawn that
-  fails undoes the tablet's publishing), so a probe that fails its own
+  fallible check, `virtio::check_device` included (no MSI-X vector
+  problem latched, and `StatusHandle::check_ready`; every driver calls it
+  before publishing and spawning; a spawn that fails undoes the tablet's
+  publishing), so a probe that fails its own
   checks leaves no live thread or "healthy" status behind; a driver must
   not depend on its device staying bound until `probe_all` has recorded
   the outcome (its check after the probe can still fail it). A device
@@ -1704,19 +1705,20 @@ pub struct Driver {
   `pci::failed_after_bind`: `lspci` shows `<driver>: failed: its status
   showed <why> after binding` and bus mastering goes off (not tested for
   the tablet: QEMU can't make the device fail; `mouse`'s text for a failed
-  tablet is ktested). The tablet's own `check_ready` before publishing
-  and the undoing of a failed spawn are reached only by fault injection
-  (not tested).
+  tablet is ktested). `check_device` failing before a driver publishes
+  is tested through its vector check (`vectors=0`, and the refused-vector
+  ktests' probes); its readiness check failing there, and the undoing of
+  a failed spawn, are reached only by fault injection (not tested).
 - **Shared errors.** `ProbeError::Unusable(String)` (a device the driver
   can't use: `<driver>: failed: unusable device: <why>`, e.g. a tablet's
   axis range, no stream or format sound can play, a virtio-rng answering
   one repeated byte) and `ProbeError::Thread(SpawnError)` (no thread for
   the driver) are shared by the M3 drivers (#97-#99).
-- **A virtio driver's probe** calls `virtio::transport(res)` from the probe
-  itself (runs and the status handle are charged to the running probe
-  attempt), may decline the device (above), then calls the crate's device
-  constructor, or sets up its own queues, as rng does, and keeps the
-  device.
+- **A virtio driver's probe** calls `virtio::transport(res, handler)` from
+  the probe itself (runs and the status handle are charged to the running
+  probe attempt), may decline the device (above), then calls the crate's
+  device constructor, or sets up its own queues, as rng does, calls
+  `virtio::check_device` and keeps the device.
 - **Blocking and locks.** A driver whose callers come from anywhere (rng)
   keeps its device in its own state (a `SpinLock` static), holds the lock
   (interrupts off) only for one operation, and waits outside it, with a
@@ -1747,7 +1749,8 @@ pub struct Driver {
   spinning, only for the ktests' made-up device) checks `ready` once more at
   the deadline, gives up when the status shows `DEVICE_NEEDS_RESET` (set
   by the device) or `FAILED` (set by a driver; all ones, a device gone or
-  not decoding, shows as `FAILED` at once), and otherwise returns a
+  not decoding, shows as `FAILED`), seen at the next wake or the
+  deadline, and otherwise returns a
   timeout carrying the time waited and the status byte rather than
   hanging.
 - **Drop order.** DMA memory must not be freed under a live device: reset
@@ -1818,10 +1821,12 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
   device and unmap its configuration vector). It hides `RING_EVENT_IDX`
   (bit 29) from `read_device_features`, so no driver negotiates it: with
   it, `virtio-drivers` stores `used_event` and then loads `used.idx` with
-  no full fence between them, and on x86 a store may pass a later load,
-  so the device could read the old `used_event` and skip the interrupt
-  while the driver, having seen no new buffer, goes to sleep. Without it
-  the device interrupts for every used buffer.
+  no full fence between them, and x86 may perform that load before the
+  store is visible, so the device could read the old `used_event` and
+  skip the interrupt while the driver, having seen no new buffer, goes to
+  sleep. Without it the device interrupts for every used buffer (nothing
+  calls the crate's `set_dev_notify(false)`, so `NO_INTERRUPT` stays
+  clear). A ktest checks QEMU offers the bit and the transport hides it.
   - It first checks what `PciTransport::new` will look up
     (`lumen_pci::virtio`, host-tested): the first virtio capability of each
     type 1-4 (common, notify, ISR, device configuration; length field at
@@ -2196,10 +2201,15 @@ is tested by taking the device).
   the device's interrupt"); `irqs` lists each device's vector as `msix
   <pci address> #<entry>` with its count. A wait that blocked to its
   deadline with no ring, after which the device turned out to have
-  answered (the tablet: events found after a wait that ended at its 1 s
-  look), counts a missed interrupt, warned about once per device
-  (`<addr>: MSI-X vector 0x..: the device answered but its interrupt never
-  came`), so a dead interrupt path doesn't hide as slow polling.
+  answered with the ring count still unchanged (`virtio::MissedRule`, one
+  rule for `wait_for` and the tablet's loop: a ring in between is an
+  interrupt that came late, not a miss), counts a missed interrupt,
+  warned about once per device (`<addr>: the device answered but its
+  MSI-X interrupt never came (said once)`, ktested), so a dead interrupt
+  path doesn't hide as slow polling. A vector the device accepts must
+  also read back as written, and its entry must read unmasked after the
+  unmask: otherwise the probe fails too (not tested: QEMU echoes the
+  entry or `NO_VECTOR`, and honours the mask).
 
 ### Device classes (later)
 

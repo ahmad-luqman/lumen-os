@@ -866,22 +866,17 @@ impl WaitQueue {
             let were_on = arch::irq::disable();
             {
                 let mut waiters = self.waiters.lock();
-                let outcome = if ready() {
-                    Some(true)
-                } else if deadline.is_some_and(|d| time::now_ns() >= d) {
-                    Some(false)
-                } else {
-                    None
-                };
-                if let Some(outcome) = outcome {
+                let is_ready = ready();
+                if is_ready || deadline.is_some_and(|d| time::now_ns() >= d) {
                     drop(waiters);
                     arch::irq::restore(were_on);
-                    return outcome;
+                    return is_ready;
                 }
-                // On the queue first: pushing may allocate, which mustn't
-                // happen under the run queue's lock (the timer takes it).
-                // No waker can take the entry before the thread is blocked:
-                // the queue's lock is held until then.
+                // On the queue first, before the run queue's lock: pushing
+                // may allocate, and that lock is kept short (the timer
+                // takes it on every tick). No waker can take the entry
+                // before the thread is blocked: the queue's lock is held
+                // until then.
                 waiters.push_back(me.clone());
                 // A waker on another CPU may make it ready (and queue it)
                 // before this CPU switches away: `schedule` then neither
@@ -915,7 +910,11 @@ impl WaitQueue {
     }
 
     /// Wake the longest-waiting thread; whether there was one (a thread
-    /// already woken some other way, e.g. by its deadline, doesn't count).
+    /// already woken some other way, e.g. by its deadline, doesn't count,
+    /// and the next is tried). A thread whose deadline won the race may
+    /// still be on the queue, blocked again on the same queue by then: the
+    /// wake then goes to it, ahead of threads that queued after it, which
+    /// is a wake like any other (it rechecks its condition).
     pub fn wake_one(&self) -> bool {
         loop {
             let first = self.waiters.lock().pop_front();

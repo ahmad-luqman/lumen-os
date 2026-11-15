@@ -96,11 +96,6 @@ fn probe_with(drivers: &[Driver]) {
             {
                 outcome = b.check();
             }
-            // A vector problem behind another failure: kept in the reason.
-            let vector = brought_up
-                .and_then(|b| b.vector_error())
-                .filter(|_| !matches!(outcome, Ok(()) | Err(ProbeError::NotMine | ProbeError::Vector(_))))
-                .map_or(String::new(), |e| alloc::format!(" (after {e})"));
             let leaked = crate::virtio::outstanding_runs_of(attempt);
             let left =
                 if leaked == 0 { String::new() } else { alloc::format!(" ({leaked} DMA runs left outstanding)") };
@@ -115,6 +110,12 @@ fn probe_with(drivers: &[Driver]) {
                     pci::probed(d.addr, driver.name, Probed::Declined)
                 }
                 Err(e) => {
+                    // A vector problem behind another failure: kept in the
+                    // reason.
+                    let vector = match (&e, brought_up.and_then(|b| b.vector_error())) {
+                        (ProbeError::Vector(_), _) | (_, None) => String::new(),
+                        (_, Some(v)) => alloc::format!(" (after {v})"),
+                    };
                     warn!(target: "drivers", "{}: {} probe failed: {e}{vector}{left}", d.addr, driver.name);
                     pci::probed(d.addr, driver.name, Probed::Failed(alloc::format!("{e}{vector}{left}")))
                 }
@@ -187,7 +188,7 @@ crate::ktest!(
                 name: "ktest-decline",
                 matches: is_9p,
                 probe: |res| {
-                    drop(virtio::transport(res, virtio::ktest_no_handler)?);
+                    drop(virtio::transport(res, || {})?);
                     leave_a_run();
                     Err(ProbeError::NotMine)
                 },
@@ -209,7 +210,7 @@ crate::ktest!(
                 name: "ktest-unready",
                 matches: is_balloon,
                 probe: |res| {
-                    virtio::transport(res, virtio::ktest_no_handler)?;
+                    virtio::transport(res, || {})?;
                     Ok(())
                 },
             },
@@ -218,7 +219,7 @@ crate::ktest!(
                 name: "ktest-console",
                 matches: is_console,
                 probe: |res| {
-                    let mut t = virtio::transport(res, virtio::ktest_no_handler)?;
+                    let mut t = virtio::transport(res, || {})?;
                     t.set_status(
                         DeviceStatus::ACKNOWLEDGE
                             | DeviceStatus::DRIVER
@@ -302,66 +303,142 @@ crate::ktest!(
     }
 );
 
+/// Ktests: the spare virtio input devices (no driver takes a keyboard or a
+/// mouse in M3), in address order, after the first (`pci::msix`'s ktest
+/// takes that one).
+#[cfg(feature = "ktest")]
+fn spare_input(i: usize) -> Result<&'static DeviceInfo, &'static str> {
+    crate::virtio::ktest_devices(18)
+        .get(1 + i)
+        .copied()
+        .ok_or("the ktest machine lacks a spare virtio input device (tests/scenarios/test_ktest.py attaches them)")
+}
+
+/// Ktests: the table entry the next [`spare_probe`] offers its device to.
+#[cfg(feature = "ktest")]
+static SPARE: crate::sync::SpinLock<Option<lumen_pci::PciAddr>> = crate::sync::SpinLock::new(None);
+
+#[cfg(feature = "ktest")]
+fn spare_matches(d: &DeviceInfo) -> bool {
+    *SPARE.lock() == Some(d.addr)
+}
+
+/// Ktests: probe `d` with `probe` alone (a row named `driver`), returning
+/// its binding.
+#[cfg(feature = "ktest")]
+fn probe_spare(
+    d: &'static DeviceInfo,
+    driver: &'static str,
+    probe: fn(DeviceResources) -> Result<(), ProbeError>,
+) -> Option<Binding> {
+    *SPARE.lock() = Some(d.addr);
+    probe_with(&[Driver { name: driver, matches: spare_matches, probe }]);
+    *SPARE.lock() = None;
+    pci::binding(d.addr)
+}
+
+/// Ktests: bring up `res`'s transport and its queue 0 (4 entries), as a
+/// driver's own queue setup does; the transport first, then the queue.
+#[cfg(feature = "ktest")]
+fn with_queue0<R>(res: DeviceResources, then: impl FnOnce(&crate::virtio::StatusHandle) -> R) -> Result<R, ProbeError> {
+    use virtio_drivers::device::common::Feature;
+    use virtio_drivers::queue::VirtQueue;
+    use virtio_drivers::transport::Transport;
+    let mut t = crate::virtio::transport(res, || {})?;
+    let status = t.status();
+    t.begin_init(Feature::VERSION_1);
+    let queue = VirtQueue::<crate::virtio::VirtioHal, 4>::new(&mut t, 0, false, false).map_err(ProbeError::Device)?;
+    let r = then(&status);
+    // The transport first (resetting the device), then the queue.
+    drop(t);
+    drop(queue);
+    Ok(r)
+}
+
 crate::ktest!(
     fn a_refused_vector_fails_the_probe() {
-        // Two spare virtio input devices (a mouse and a second keyboard; no
-        // driver takes either): the transport maps an entry past the MSI-X
-        // table (`virtio::KTEST_REFUSE`), which QEMU refuses, reading back
-        // NO_VECTOR: once for configuration changes, once for the first
-        // queue. Each probe fails with the vector error (what
-        // `check_device` returns, and `lspci`'s reason), nothing leaked.
-        use virtio_drivers::device::common::Feature;
-        use virtio_drivers::queue::VirtQueue;
-        use virtio_drivers::transport::Transport;
-
+        // Two spare virtio input devices: the transport maps an entry past
+        // the MSI-X table (`virtio::KTEST_REFUSE`, scoped to the device),
+        // which QEMU refuses, reading back NO_VECTOR: once for configuration
+        // changes, once for queue 0. Each probe fails with the vector error
+        // (what `check_device` returns, and `lspci`'s reason), no DMA runs
+        // left; the vector stays programmed (it was allocated).
         use crate::sync::SpinLock;
-        use crate::virtio::{
-            self, KTEST_REFUSE, KTEST_REFUSE_CONFIG, KTEST_REFUSE_QUEUE, VectorError, VectorFor, VirtioHal,
-        };
+        use crate::virtio::{self, KTEST_REFUSE, VectorError, VectorFor};
         use crate::{kassert, kassert_eq};
-        static TARGET: SpinLock<Option<lumen_pci::PciAddr>> = SpinLock::new(None);
         static GOT: SpinLock<Option<VectorError>> = SpinLock::new(None);
-        fn target(d: &DeviceInfo) -> bool {
-            *TARGET.lock() == Some(d.addr)
-        }
         fn probe(res: DeviceResources) -> Result<(), ProbeError> {
-            let mut t = virtio::transport(res, virtio::ktest_no_handler)?;
-            let status = t.status();
-            t.begin_init(Feature::VERSION_1);
-            let queue = VirtQueue::<VirtioHal, 4>::new(&mut t, 0, false, false).map_err(ProbeError::Device)?;
-            let checked = virtio::check_device(&status);
-            // The transport first (resetting the device), then the queue.
-            drop(t);
-            drop(queue);
+            let checked = with_queue0(res, virtio::check_device)?;
             if let Err(ProbeError::Vector(v)) = &checked {
                 *GOT.lock() = Some(*v);
             }
             checked
         }
-        let spares = virtio::ktest_devices(18);
-        let [_, mouse, keyboard] = spares.as_slice() else {
-            return Err("the ktest machine needs three virtio input devices");
-        };
-        let table = [Driver { name: "ktest-refuse", matches: target, probe }];
-        for (d, refuse, what, text) in [
-            (mouse, KTEST_REFUSE_CONFIG, VectorFor::Config, "for configuration changes"),
-            (keyboard, KTEST_REFUSE_QUEUE, VectorFor::Queue(0), "for queue 0"),
-        ] {
-            *TARGET.lock() = Some(d.addr);
+        for (i, what, text) in
+            [(0, VectorFor::Config, "for configuration changes"), (1, VectorFor::Queue(0), "for queue 0")]
+        {
+            let d = spare_input(i)?;
             *GOT.lock() = None;
-            KTEST_REFUSE.store(refuse, Ordering::Relaxed);
-            probe_with(&table);
-            KTEST_REFUSE.store(0, Ordering::Relaxed);
+            *KTEST_REFUSE.lock() = Some((d.addr, what));
+            let binding = probe_spare(d, "ktest-refuse", probe);
+            *KTEST_REFUSE.lock() = None;
             let got = GOT.lock().take();
             kassert_eq!(got, Some(VectorError::Refused(what)));
             let why = alloc::format!("MSI-X: the device refused its vector {text} (NO_VECTOR read back)");
             kassert_eq!(alloc::format!("{}", ProbeError::Vector(got.ok_or("no error")?)), why);
-            kassert_eq!(pci::binding(d.addr), Some(Binding::Failed("ktest-refuse", why.clone())));
+            kassert_eq!(binding, Some(Binding::Failed("ktest-refuse", why.clone())));
             kassert_eq!(crate::shell::sysinfo::driver_text(d.addr), alloc::format!("ktest-refuse: failed: {why}"));
             kassert_eq!(virtio::outstanding_runs_of_function(d.addr), 0);
             kassert!(crate::pci::msix_vectors().iter().any(|r| r.pci == d.addr));
         }
-        *TARGET.lock() = None;
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_probe_failing_otherwise_keeps_the_vector_problem_in_its_reason() {
+        // A spare device whose queue 0 is refused its vector, and a probe
+        // that then fails for another reason without checking the vector:
+        // `lspci`'s reason is that reason, with the latched vector problem
+        // after it.
+        use crate::kassert_eq;
+        use crate::virtio::{KTEST_REFUSE, VectorFor};
+        fn probe(res: DeviceResources) -> Result<(), ProbeError> {
+            with_queue0(res, |_| ())?;
+            Err(ProbeError::Unusable(String::from("x")))
+        }
+        let d = spare_input(2)?;
+        *KTEST_REFUSE.lock() = Some((d.addr, VectorFor::Queue(0)));
+        let binding = probe_spare(d, "ktest-unusable", probe);
+        *KTEST_REFUSE.lock() = None;
+        let why = "unusable device: x (after MSI-X: the device refused its vector for queue 0 (NO_VECTOR read back))";
+        kassert_eq!(binding, Some(Binding::Failed("ktest-unusable", why.into())));
+        kassert_eq!(crate::shell::sysinfo::driver_text(d.addr), alloc::format!("ktest-unusable: failed: {why}"));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ring_event_idx_is_hidden_from_the_crate() {
+        // A spare virtio input device: QEMU offers RING_EVENT_IDX (bit 29),
+        // the transport's `read_device_features` doesn't, so `begin_init`
+        // never negotiates it even when the driver asks for it.
+        use virtio_drivers::device::common::Feature;
+        use virtio_drivers::transport::Transport;
+
+        use crate::{kassert, kassert_eq};
+        let d = spare_input(3)?;
+        let res = pci::claim(d.addr, "ktest-event-idx").map_err(|_| "claim refused")?;
+        let mut t = crate::virtio::transport(res, || {}).map_err(|_| "no transport")?;
+        let event_idx = Feature::RING_EVENT_IDX.bits();
+        kassert_eq!(event_idx, 1 << 29);
+        kassert!(t.ktest_inner_features() & event_idx != 0); // QEMU offers it
+        kassert!(t.read_device_features() & event_idx == 0);
+        let negotiated = t.begin_init(Feature::VERSION_1 | Feature::RING_EVENT_IDX);
+        kassert!(negotiated.contains(Feature::VERSION_1));
+        kassert!(!negotiated.contains(Feature::RING_EVENT_IDX));
+        drop(t);
+        pci::probed(d.addr, "ktest-event-idx", Probed::Failed(String::from("ktest: done")));
         Ok(())
     }
 );

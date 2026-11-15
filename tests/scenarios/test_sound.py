@@ -105,6 +105,8 @@ def test_tone_is_captured(boot):
     # padding), with no underrun.
     assert int(row["frames"]) == rate // 2, row
     assert row["underruns"] == "0", row
+    # Each period came back by its interrupt (#96).
+    assert "interrupt never came" not in m.output
     wav = recording(m)
     samples = wav.first_channel
     assert_pitch(audio.dominant_frequency(samples, wav.rate), 440)
@@ -135,6 +137,7 @@ def test_a_long_tone_plays_without_underrun(boot):
     assert run(m, "beep 440 10000") == ""
     row = wait_played(m, 1, timeout=60)
     assert (row["frames"], row["underruns"]) == (str(rate * 10), "0"), row
+    assert "interrupt never came" not in m.output
 
 
 def test_melody_notes_in_order(boot):

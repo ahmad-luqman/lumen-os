@@ -53,13 +53,15 @@
 //!   reading it back (virtio 1.2 §3.1.1 step 6), so a device refusing the
 //!   features would otherwise end up "bound": [`transport`] records the
 //!   probing attempt's status handle, and `drivers::probe_all` runs
-//!   [`StatusHandle::check_ready`] on it when the probe returns `Ok`,
-//!   turning a device that isn't ready into a failed probe (drivers may
-//!   also call it earlier). A driver's bounded wait
-//!   ([`StatusHandle::wait_for`], or `wait_until` for a device without an
-//!   interrupt) gives up on time, or when the device
-//!   sets `DEVICE_NEEDS_RESET` (or a driver set `FAILED`; all ones, a
-//!   device gone, shows as `FAILED`). Known limits:
+//!   [`BroughtUp::check`] when the probe returns `Ok` (no MSI-X vector
+//!   problem was latched, and [`StatusHandle::check_ready`]), turning a
+//!   device that isn't ready into a failed probe (drivers call
+//!   [`check_device`], the same checks, earlier). A driver's bounded wait
+//!   ([`StatusHandle::wait_for`]; `wait_until`, spinning, only for the
+//!   ktests' made-up device) gives up on time, or when the device sets
+//!   `DEVICE_NEEDS_RESET` (or a driver set `FAILED`; all ones, a device
+//!   gone, shows as `FAILED`; either is seen at the next wake or the
+//!   deadline). Known limits:
 //!   `VirtIORng::request_entropy` and sound's control requests spin
 //!   unbounded in the crate (#97 drives its own queue; #99's control
 //!   requests run in its probe and on its own thread around each sound,
@@ -212,7 +214,7 @@ pub struct BroughtUp {
 }
 
 impl BroughtUp {
-    /// The device must have taken its MSI-X vector and be ready
+    /// No MSI-X vector problem was latched, and the device is ready
     /// ([`check_device`]'s checks).
     pub fn check(&self) -> Result<(), ProbeError> {
         both_checks(self.vectors, &self.status)
@@ -242,13 +244,16 @@ pub fn end_probe() -> Option<BroughtUp> {
 }
 
 /// From a probe, after the crate's device constructor (or the driver's own
-/// queue setup): the device took its MSI-X vector, for every queue set up
-/// so far and for configuration changes (else the problem the transport
-/// latched), and it is ready ([`StatusHandle::check_ready`]). A driver
-/// checks this before it waits for an interrupt, publishes the device or
-/// starts a thread; `probe_all` checks it again when the probe returns.
+/// queue setup): no MSI-X vector problem was latched (for configuration
+/// changes or any queue set up so far: else that problem), and the device
+/// is ready ([`StatusHandle::check_ready`]). A driver checks this before it
+/// waits for an interrupt, publishes the device or starts a thread;
+/// `probe_all` checks it again when the probe returns.
 pub fn check_device(status: &StatusHandle) -> Result<(), ProbeError> {
-    let vectors = OWNER.lock().vectors;
+    let p = OWNER.lock();
+    debug_assert!(p.attempt.is_some(), "check_device outside a probe: no vector problem could be latched");
+    let vectors = p.vectors;
+    drop(p);
     both_checks(vectors, status)
 }
 
@@ -259,6 +264,8 @@ pub enum VectorError {
     Msi(MsiError),
     /// The device read back `NO_VECTOR` (virtio 1.2 §4.1.5.1.2.1).
     Refused(VectorFor),
+    /// The device read back neither the entry written nor `NO_VECTOR`.
+    Mismatch { what: VectorFor, wrote: u16, read: u16 },
 }
 
 /// What a vector was being mapped for.
@@ -280,6 +287,14 @@ impl fmt::Display for VectorError {
             VectorError::Refused(VectorFor::Config) => {
                 f.write_str("MSI-X: the device refused its vector for configuration changes (NO_VECTOR read back)")
             }
+            VectorError::Mismatch { what, wrote, read } => {
+                write!(f, "MSI-X: the device read back entry {read:#06x} for ")?;
+                match what {
+                    VectorFor::Config => f.write_str("configuration changes")?,
+                    VectorFor::Queue(q) => write!(f, "queue {q}")?,
+                }
+                write!(f, " after entry {wrote} was written")
+            }
         }
     }
 }
@@ -287,10 +302,17 @@ impl fmt::Display for VectorError {
 /// Record the transport's vector problem for the probe attempt of `addr`
 /// that is running, if one is (the first problem wins), with a warning.
 fn latch(addr: PciAddr, e: VectorError) {
-    warn!(target: "virtio", "{addr}: {e}");
     let mut p = OWNER.lock();
-    if p.attempt.is_some_and(|a| a.addr == addr) && p.vectors.is_none() {
-        p.vectors = Some(e);
+    if p.attempt.is_some_and(|a| a.addr == addr) {
+        if p.vectors.is_none() {
+            p.vectors = Some(e);
+        }
+        drop(p);
+        warn!(target: "virtio", "{addr}: {e}");
+    } else {
+        drop(p);
+        // Only a probe sets queues up in M3: nothing will check this one.
+        error!(target: "virtio", "{addr}: {e} (outside its probe: the device runs without its interrupt)");
     }
 }
 
@@ -618,7 +640,16 @@ pub fn transport(res: DeviceResources, handler: fn()) -> Result<VirtioTransport,
         info.caps.iter().filter(|c| c.id == cap::id::VENDOR).map(|c| VirtioCap::read(&mut config, addr, c)).collect()
     };
     let bars: [Option<BarMapping>; 6] = core::array::from_fn(|i| res.bar(i));
-    let used = caps::check(&found, |i| bars[usize::from(i)].map(|m| m.size())).map_err(ProbeError::Capability)?;
+    // The MSI-X table and pending bit array, which no virtio structure may
+    // overlap (the kernel programs them itself). A capability that can't
+    // be read is `msix`'s to report.
+    let msix = info
+        .caps
+        .find(cap::id::MSIX)
+        .and_then(|c| lumen_pci::msix::Capability::read(&mut res.config(), addr, c).ok())
+        .map(|m| m.regions());
+    let used = caps::check(&found, |i| bars[usize::from(i)].map(|m| m.size()), msix.as_ref().map_or(&[], |r| &r[..]))
+        .map_err(ProbeError::Capability)?;
     let made = {
         let _one_at_a_time = PROBE.lock();
         *PROBING.lock() = Some((addr, bars));
@@ -686,39 +717,29 @@ enum Vectors {
     /// set up from now on is given it.
     Mapped(MsiVector),
     /// It couldn't be had, or the device refused it (latched for the
-    /// probe): no more tries.
-    Failed,
+    /// probe, and kept here, in the transport's `Debug`, for when no probe
+    /// was running): no more tries.
+    Failed(#[allow(dead_code)] VectorError),
 }
 
-/// Ktests: map entries this far past the vector's own, so the device
-/// refuses them (QEMU reads back `NO_VECTOR` for an entry past its table),
-/// for configuration changes ([`KTEST_REFUSE_CONFIG`]) or queues
-/// ([`KTEST_REFUSE_QUEUE`]); 0: map the vector's own.
+/// Ktests: make this function's transport map an entry 8 past its own for
+/// this (configuration changes, or that queue), so the device refuses it:
+/// QEMU reads back `NO_VECTOR` for an entry past its table. `None`: every
+/// transport maps its own entry.
 #[cfg(feature = "ktest")]
-pub static KTEST_REFUSE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-#[cfg(feature = "ktest")]
-pub const KTEST_REFUSE_CONFIG: u8 = 1;
-#[cfg(feature = "ktest")]
-pub const KTEST_REFUSE_QUEUE: u8 = 2;
+pub static KTEST_REFUSE: SpinLock<Option<(PciAddr, VectorFor)>> = SpinLock::new(None);
 
 /// virtio's `VIRTIO_F_EVENT_IDX` (1.2 §6), the crate's `RING_EVENT_IDX`.
 const RING_EVENT_IDX: u64 = 1 << 29;
 
-/// The entry to write for `what`: the vector's own (ktests may push it past
-/// the table).
-fn entry_for(v: &MsiVector, what: VectorFor) -> u16 {
+/// The entry to write for `what` on `addr`'s device: the vector's own
+/// (ktests may push it past the table, [`KTEST_REFUSE`]).
+fn entry_for(addr: PciAddr, v: &MsiVector, what: VectorFor) -> u16 {
     #[cfg(feature = "ktest")]
-    {
-        let refuse = KTEST_REFUSE.load(Ordering::Relaxed);
-        let applies = match what {
-            VectorFor::Config => refuse == KTEST_REFUSE_CONFIG,
-            VectorFor::Queue(_) => refuse == KTEST_REFUSE_QUEUE,
-        };
-        if applies {
-            return v.table_entry() + 8;
-        }
+    if *KTEST_REFUSE.lock() == Some((addr, what)) {
+        return v.table_entry() + 8;
     }
-    let _ = what;
+    let _ = (addr, what);
     v.table_entry()
 }
 
@@ -736,7 +757,7 @@ impl VirtioTransport {
         // SAFETY: `common` is the checked base of the 56-byte common
         // configuration, so +20 is inside it.
         let reg = unsafe { self.common.add(common::DEVICE_STATUS as usize) };
-        StatusHandle { reg }
+        StatusHandle { reg, addr: Some(self.res.info().addr) }
     }
 
     pub fn info(&self) -> &'static DeviceInfo {
@@ -759,10 +780,16 @@ impl VirtioTransport {
     }
 
     /// Write `entry` to the 16-bit vector field at `offset` and read it
-    /// back (virtio 1.2 §4.1.5.1.2.2): whether the device took it.
-    fn map_vector(&mut self, offset: u64, entry: u16) -> bool {
+    /// back (virtio 1.2 §4.1.5.1.2.2): the device must read back exactly
+    /// the entry written (`NO_VECTOR`: refused; anything else: a device
+    /// that won't deliver what was asked).
+    fn map_vector(&mut self, offset: u64, entry: u16, what: VectorFor) -> Result<(), VectorError> {
         self.common_write16(offset, entry);
-        self.common_read16(offset) != common::NO_VECTOR
+        match self.common_read16(offset) {
+            read if read == entry => Ok(()),
+            common::NO_VECTOR => Err(VectorError::Refused(what)),
+            read => Err(VectorError::Mismatch { what, wrote: entry, read }),
+        }
     }
 
     /// Before the crate sets queue `queue` up (so before its
@@ -779,19 +806,30 @@ impl VirtioTransport {
                 Ok(v) => v,
                 Err(e) => return self.fail_vector(addr, VectorError::Msi(e)),
             };
-            if !self.map_vector(common::MSIX_CONFIG, entry_for(&v, VectorFor::Config)) {
-                return self.fail_vector(addr, VectorError::Refused(VectorFor::Config));
+            let entry = entry_for(addr, &v, VectorFor::Config);
+            if let Err(e) = self.map_vector(common::MSIX_CONFIG, entry, VectorFor::Config) {
+                return self.fail_vector(addr, e);
             }
-            v.unmask();
+            if let Err(e) = v.unmask() {
+                return self.fail_vector(addr, VectorError::Msi(e));
+            }
             debug!(target: "virtio", "{addr}: MSI-X vector {:#x} (entry {})", v.idt_vector(), v.table_entry());
             self.vectors = Vectors::Mapped(v);
         }
         let Vectors::Mapped(v) = &self.vectors else { return };
-        let entry = entry_for(v, VectorFor::Queue(queue));
+        let what = VectorFor::Queue(queue);
+        let entry = entry_for(addr, v, what);
         self.common_write16(common::QUEUE_SELECT, queue);
-        if !self.map_vector(common::QUEUE_MSIX_VECTOR, entry) {
-            self.fail_vector(addr, VectorError::Refused(VectorFor::Queue(queue)));
+        if let Err(e) = self.map_vector(common::QUEUE_MSIX_VECTOR, entry, what) {
+            self.fail_vector(addr, e);
         }
+    }
+
+    /// Ktests: the device's features as the crate's transport reads them
+    /// (before [`Transport::read_device_features`] hides any).
+    #[cfg(feature = "ktest")]
+    pub fn ktest_inner_features(&mut self) -> u64 {
+        self.inner.read_device_features()
     }
 
     /// Ktests: what `msix_config` and queue 0's `queue_msix_vector` read
@@ -803,7 +841,7 @@ impl VirtioTransport {
     }
 
     fn fail_vector(&mut self, addr: PciAddr, e: VectorError) {
-        self.vectors = Vectors::Failed;
+        self.vectors = Vectors::Failed(e);
         latch(addr, e);
     }
 }
@@ -852,11 +890,12 @@ impl Transport for VirtioTransport {
 
     /// The device's features without `RING_EVENT_IDX` (bit 29), so no
     /// driver negotiates it: with it, the crate stores `used_event` and then
-    /// loads `used.idx` with no full fence between them, and on x86 a store
-    /// can pass a later load: the device may read the old `used_event`,
-    /// skip the interrupt, while the driver read no new buffer and sleeps.
-    /// Without it the device interrupts for every used buffer (the queues'
-    /// `NO_INTERRUPT` flag is never set).
+    /// loads `used.idx` with no full fence between them, and x86 may perform
+    /// that load before the store is visible: the device may read the old
+    /// `used_event` and skip the interrupt, while the driver, having read no
+    /// new buffer, sleeps. Without it the device interrupts for every used
+    /// buffer (nothing calls the crate's `set_dev_notify(false)`, so the
+    /// queues' `NO_INTERRUPT` flag stays clear).
     fn read_device_features(&mut self) -> u64 {
         self.inner.read_device_features() & !RING_EVENT_IDX
     }
@@ -878,6 +917,12 @@ impl Transport for VirtioTransport {
     }
 
     fn set_status(&mut self, status: DeviceStatus) {
+        // One initialization per transport: a reset after the vector was
+        // mapped would unmap it (see the type's doc).
+        debug_assert!(
+            !(status.is_empty() && matches!(self.vectors, Vectors::Mapped(_))),
+            "a second initialization of a virtio transport: its MSI-X vector would be unmapped"
+        );
         self.inner.set_status(status)
     }
 
@@ -934,6 +979,8 @@ impl Transport for VirtioTransport {
 #[derive(Clone, Copy, Debug)]
 pub struct StatusHandle {
     reg: NonNull<u8>,
+    /// The device's function, for warnings (`None`: a ktest's made-up one).
+    addr: Option<PciAddr>,
 }
 
 // SAFETY: it only reads a device register through a mapping that lasts the
@@ -973,8 +1020,8 @@ impl StatusHandle {
     /// Ktests: a handle reading `byte` instead of a device's register (a
     /// made-up device whose status the test sets).
     #[cfg(feature = "ktest")]
-    pub fn ktest_reading(byte: &'static core::sync::atomic::AtomicU8) -> StatusHandle {
-        StatusHandle { reg: NonNull::from(byte).cast() }
+    pub fn ktest_reading(byte: &'static core::sync::atomic::AtomicU8, addr: Option<PciAddr>) -> StatusHandle {
+        StatusHandle { reg: NonNull::from(byte).cast(), addr }
     }
 
     /// The raw status byte.
@@ -1023,9 +1070,10 @@ impl StatusHandle {
     /// and comes with none, so it is seen at the next wake or the
     /// deadline). Where the thread can't block (a lock held, interrupts
     /// off, before the scheduler) it spins instead. A wait that blocked to
-    /// its deadline without a ring, after which `ready()` held, means the
-    /// device answered without its interrupt: counted, and warned about
-    /// once ([`Doorbell::note_missed`]).
+    /// its deadline without a ring, after which `ready()` held with the
+    /// ring count still unchanged, means the device answered without its
+    /// interrupt ([`MissedRule`]): counted, and warned about once
+    /// ([`Doorbell::note_missed`]).
     pub fn wait_for(&self, bell: &Doorbell, timeout_ns: u64, ready: impl FnMut() -> bool) -> Result<(), WaitError> {
         self.wait(timeout_ns, Some(bell), ready)
     }
@@ -1033,11 +1081,12 @@ impl StatusHandle {
     fn wait(&self, timeout_ns: u64, bell: Option<&Doorbell>, mut ready: impl FnMut() -> bool) -> Result<(), WaitError> {
         let start = crate::time::now_ns();
         let deadline = start.saturating_add(timeout_ns);
-        // The last block ended at the deadline with no ring.
-        let mut silent = false;
-        let answered = |silent: bool| {
-            if silent && let Some(bell) = bell {
-                bell.note_missed();
+        let mut rule = MissedRule::default();
+        let answered = |rule: &mut MissedRule, seen: Option<u64>| {
+            if let (Some(bell), Some(seen)) = (bell, seen)
+                && rule.answered(seen)
+            {
+                bell.note_missed(self.addr);
             }
             Ok(())
         };
@@ -1045,7 +1094,7 @@ impl StatusHandle {
             // Read before looking, so a ring after the look ends the wait.
             let seen = bell.map(Doorbell::rings);
             if ready() {
-                return answered(silent);
+                return answered(&mut rule, seen);
             }
             let status = self.raw();
             let s = bits(status);
@@ -1057,17 +1106,17 @@ impl StatusHandle {
             }
             let now = crate::time::now_ns();
             if now >= deadline {
+                let seen = bell.map(Doorbell::rings);
                 return if ready() {
-                    answered(silent)
+                    answered(&mut rule, seen)
                 } else {
                     Err(WaitError::Timeout { waited_ns: now - start, status })
                 };
             }
             match (bell, seen) {
                 (Some(bell), Some(seen)) => match bell.wait_after(seen, deadline) {
-                    Wake::Rang => silent = false,
-                    Wake::Deadline => silent = true,
                     Wake::CannotBlock => core::hint::spin_loop(),
+                    wake => rule.blocked(seen, wake),
                 },
                 _ => core::hint::spin_loop(),
             }
@@ -1084,11 +1133,36 @@ impl StatusHandle {
 pub struct Doorbell {
     rings: AtomicU64,
     queue: WaitQueue,
-    /// The device it belongs to ([`attach`](Self::attach)), for warnings.
-    device: SpinLock<Option<PciAddr>>,
     /// Waits that ran to their deadline with no ring though the device had
     /// answered ([`note_missed`](Self::note_missed)).
     missed: AtomicU64,
+}
+
+/// The missed-interrupt rule every wait for a [`Doorbell`] uses: the
+/// device answered (a buffer came back) without its interrupt if the last
+/// block ended at its deadline with no ring, and the ring count, read just
+/// before the look that found the answer, is still the one that block
+/// waited after. A ring in between (an MSI taken just after the block's
+/// last check, or just past the deadline) is an interrupt that came.
+#[derive(Debug, Default)]
+pub struct MissedRule {
+    /// The ring count the last block waited after, if it ended at its
+    /// deadline with no ring.
+    silent: Option<u64>,
+}
+
+impl MissedRule {
+    /// A block that waited after ring count `seen` ended with `wake`.
+    pub fn blocked(&mut self, seen: u64, wake: Wake) {
+        self.silent = (wake == Wake::Deadline).then_some(seen);
+    }
+
+    /// The device turned out to have answered, at a look made after
+    /// reading ring count `seen`: whether the answer came without its
+    /// interrupt. Starts over (one answer counts once).
+    pub fn answered(&mut self, seen: u64) -> bool {
+        self.silent.take() == Some(seen)
+    }
 }
 
 /// How [`Doorbell::wait_after`] ended.
@@ -1104,17 +1178,7 @@ pub enum Wake {
 
 impl Doorbell {
     pub const fn new() -> Doorbell {
-        Doorbell {
-            rings: AtomicU64::new(0),
-            queue: WaitQueue::new(),
-            device: SpinLock::new(None),
-            missed: AtomicU64::new(0),
-        }
-    }
-
-    /// Name the device whose interrupt rings it (the driver's probe).
-    pub fn attach(&self, addr: PciAddr) {
-        *self.device.lock() = Some(addr);
+        Doorbell { rings: AtomicU64::new(0), queue: WaitQueue::new(), missed: AtomicU64::new(0) }
     }
 
     /// From the interrupt handler: count the ring and wake every waiter.
@@ -1139,30 +1203,24 @@ impl Doorbell {
         if self.queue.wait_until_or_deadline(deadline, || self.rings() != seen) { Wake::Rang } else { Wake::Deadline }
     }
 
-    /// The device answered (a buffer came back) though a wait for it ran to
-    /// its deadline with no ring: its interrupt never came. Counted; the
-    /// first time, a warning naming the device and its vector.
-    pub fn note_missed(&self) {
+    /// The device at `addr` answered though a wait for it ran to its
+    /// deadline with no ring ([`MissedRule`]): its interrupt never came.
+    /// Counted; the first time, a warning naming the device.
+    pub fn note_missed(&self, addr: Option<PciAddr>) {
         if self.missed.fetch_add(1, Ordering::Relaxed) != 0 {
             return;
         }
-        let device = *self.device.lock();
-        let Some(addr) = device else {
-            warn!(target: "virtio", "a device answered but its interrupt never came (said once)");
-            return;
-        };
-        match crate::pci::msix_vectors().into_iter().find(|r| r.pci == addr) {
-            Some(r) => warn!(
+        match addr {
+            Some(addr) => warn!(
                 target: "virtio",
-                "{addr}: MSI-X vector {:#x}: the device answered but its interrupt never came (said once)",
-                r.idt_vector
+                "{addr}: the device answered but its MSI-X interrupt never came (said once)"
             ),
-            None => warn!(target: "virtio", "{addr}: the device answered but it has no MSI-X vector (said once)"),
+            None => warn!(target: "virtio", "a device answered but its MSI-X interrupt never came (said once)"),
         }
     }
 
     /// How many waits ran to their deadline though the device had answered.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests
+    #[cfg(feature = "ktest")]
     pub fn missed(&self) -> u64 {
         self.missed.load(Ordering::Relaxed)
     }
@@ -1179,11 +1237,6 @@ fn bits(status: u8) -> DeviceStatus {
     DeviceStatus::from_bits_truncate(u32::from(status))
 }
 
-/// Ktests: an interrupt handler that does nothing, for a device a ktest
-/// brings up but never waits on.
-#[cfg(feature = "ktest")]
-pub fn ktest_no_handler() {}
-
 /// The ktest machine's virtio devices of `kind`, in address order.
 #[cfg(feature = "ktest")]
 pub fn ktest_devices(kind: u16) -> Vec<&'static DeviceInfo> {
@@ -1199,7 +1252,7 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         static BYTE: AtomicU8 = AtomicU8::new(0x01);
         static BELL: Doorbell = Doorbell::new();
-        let status = StatusHandle::ktest_reading(&BYTE);
+        let status = StatusHandle::ktest_reading(&BYTE, None);
         let lock = SpinLock::new(());
         let (wake, waited) = {
             let _held = lock.lock();
@@ -1217,8 +1270,9 @@ crate::ktest!(
     }
 );
 
-/// The ktest machine's virtio device of `kind` (virtio 1.2 §5 device type:
-/// 1 network, 2 block, 5 balloon, 9 9p; no driver takes those in M3).
+/// The ktest machine's first virtio device of `kind` (virtio 1.2 §5 device
+/// type: 1 network, 2 block, 3 console, 5 balloon, 8 SCSI, 9 9p, 18 input:
+/// keyboards and a mouse; no driver takes those in M3).
 #[cfg(feature = "ktest")]
 pub fn ktest_device(kind: u16) -> Result<&'static DeviceInfo, &'static str> {
     crate::pci::devices()
@@ -1533,7 +1587,7 @@ crate::ktest!(
         let d = ktest_device(2)?;
         let res = pci::claim(d.addr, "ktest").map_err(|_| "the claim failed")?;
         let runs = outstanding_runs();
-        let mut t = transport(res, ktest_no_handler).map_err(|e| {
+        let mut t = transport(res, || {}).map_err(|e| {
             crate::ktest::diag(format_args!("{e}"));
             "transport failed"
         })?;
@@ -1629,6 +1683,21 @@ crate::ktest!(
         let t1 = crate::time::now_ns();
         kassert_eq!(status.wait_for(&BELL, 5_000_000, || crate::time::now_ns() >= t1 + 5_000_000), Ok(()));
         kassert_eq!(BELL.missed(), 1);
+        // A ring during the first look (rung by `ready` itself): the wait
+        // read the ring count before looking, so it doesn't block, and
+        // returns well before its deadline, with no miss.
+        static EARLY: Doorbell = Doorbell::new();
+        let (t2, mut calls) = (crate::time::now_ns(), 0);
+        let early = status.wait_for(&EARLY, 5_000_000_000, || {
+            calls += 1;
+            if calls == 1 {
+                EARLY.ring();
+            }
+            calls > 1
+        });
+        kassert_eq!(early, Ok(()));
+        kassert!(crate::time::now_ns() - t2 < 1_000_000_000);
+        kassert_eq!((calls, EARLY.missed()), (2, 0));
         kassert_eq!(status.wait_until(1_000_000, || true), Ok(()));
         // `ready` is asked once more at the deadline.
         let t1 = crate::time::now_ns();
@@ -1648,6 +1717,40 @@ crate::ktest!(
         t.set_status(DeviceStatus::ACKNOWLEDGE);
         drop(t);
         kassert_eq!(status.raw(), 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_missed_interrupt_is_an_answer_after_a_silent_deadline_with_no_ring() {
+        // The rule (`MissedRule`): a block that ended at its deadline with no
+        // ring, then an answer with the ring count unchanged, is a miss; a
+        // ring in between, or a block a ring ended, isn't; an answer counts
+        // once. A miss warns once, naming the device (read back from the
+        // log), and counts every time.
+        use crate::{kassert, kassert_eq};
+        let mut rule = MissedRule::default();
+        rule.blocked(5, Wake::Deadline);
+        kassert!(!rule.answered(6)); // a ring after the silent deadline
+        rule.blocked(5, Wake::Deadline);
+        kassert!(rule.answered(5)); // an answer after a silent deadline, no ring
+        kassert!(!rule.answered(5)); // counted once
+        rule.blocked(5, Wake::Rang);
+        kassert!(!rule.answered(5)); // the block was rung
+        kassert!(!MissedRule::default().answered(0)); // never blocked
+
+        static BELL: Doorbell = Doorbell::new();
+        let addr = PciAddr::new(0, 0x80, 31, 6).ok_or("addr")?;
+        BELL.note_missed(Some(addr));
+        BELL.note_missed(Some(addr));
+        kassert_eq!(BELL.missed(), 2);
+        let mut log = alloc::vec![0u8; crate::klog::RING_BYTES];
+        let (n, _) = crate::klog::copy_recent(&mut log);
+        let log = core::str::from_utf8(&log[..n]).map_err(|_| "the log isn't UTF-8")?;
+        let line = alloc::format!(
+            "WARN  virtio: {addr}: the device answered but its MSI-X interrupt never came (said once)\n"
+        );
+        kassert_eq!(log.matches(line.as_str()).count(), 1);
         Ok(())
     }
 );

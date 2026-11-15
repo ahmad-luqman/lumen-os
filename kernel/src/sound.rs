@@ -563,7 +563,6 @@ fn bind(res: DeviceResources) -> Result<(), ProbeError> {
     let transport = virtio::transport(res, on_interrupt)?;
     let status = transport.status();
     let addr = transport.info().addr;
-    BELL.attach(addr);
     let mut dev = VirtIOSound::<VirtioHal, VirtioTransport>::new(transport).map_err(ProbeError::Device)?;
     virtio::check_device(&status)?;
     let format = set_up(&mut dev)?;
@@ -1087,7 +1086,7 @@ crate::ktest!(
         let addr = PciAddr::new(0, 0xff, 0x1f, 7).ok_or("addr")?;
         let bound = |activity| Bound {
             device: Device { addr, format: device_format },
-            status: StatusHandle::ktest_reading(&STATUS),
+            status: StatusHandle::ktest_reading(&STATUS, None),
             activity,
             next: None,
             counts: Counts::default(),

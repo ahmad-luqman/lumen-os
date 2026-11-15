@@ -17,7 +17,7 @@ from lumen_harness.qemu import Devices, Machine
 from lumen_harness.qmp import QmpClient, QmpError, pointer_move_args, qcodes_for
 from lumen_harness.screen import expect_screen, read_screen
 from PIL import Image
-from test_pci import lspci_rows, qdev_addresses, run
+from test_pci import lspci_rows, msix_rows, qdev_addresses, run
 
 KBD_LINE = r"INFO  kbd: PS/2 keyboard on ISA IRQ 1 \(GSI 1, vector 0x51\), layout {}\n"
 KBD_STATS = re.compile(
@@ -452,18 +452,11 @@ def test_a_pointer_move_raises_the_tablets_interrupt(boot):
     # raises no interrupt), and no interrupt is reported missing.
     m = boot("qemutest", devices=Devices(tablet=True))
     addr = tablet_ready(m)
-    row = re.compile(rf"^  0x[0-9a-f]{{2}}\s+msix {re.escape(addr)} #0\s+(\d+)$", re.MULTILINE)
-
-    def interrupts() -> int:
-        out = run(m, "irqs | where use ~ msix")
-        found = row.search(out)
-        assert found, out
-        return int(found[1])
-
-    before = interrupts()
+    _, entry, before = msix_rows(m)[addr]
+    assert entry == 0
     m.move_pointer(320, 200)
     wait_mouse(m, x="320", y="200")
-    assert interrupts() > before
+    assert msix_rows(m)[addr][2] > before
     assert "interrupt never came" not in m.output
 
 

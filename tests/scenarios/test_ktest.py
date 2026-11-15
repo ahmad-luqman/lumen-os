@@ -11,8 +11,8 @@ def test_in_kernel_tests_pass(boot):
     # stack registry and the frame allocator are tested with their stacks and
     # state in place, as on any multi-CPU machine. With virtio devices no
     # driver takes in M3 (network, block, 9p, a memory balloon, a console,
-    # SCSI, two keyboards and a mouse), for the virtio adapter's and MSI-X's
-    # ktests to claim and probe, and virtio-rng, bound at boot, for the rng ktests (on the
+    # SCSI, four keyboards and a mouse), for the virtio adapter's and
+    # MSI-X's ktests to claim and probe, and virtio-rng, bound at boot, for the rng ktests (on the
     # default CPU: no RDRAND, so they use virtio-rng) and its MSI-X vector.
     extra = ["-smp", "4"]
     for device in (
@@ -20,6 +20,8 @@ def test_in_kernel_tests_pass(boot):
         "virtio-serial-pci",
         "virtio-scsi-pci",
         "virtio-mouse-pci",
+        "virtio-keyboard-pci",
+        "virtio-keyboard-pci",
         "virtio-keyboard-pci",
     ):
         extra += ["-device", device]

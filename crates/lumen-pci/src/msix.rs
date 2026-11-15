@@ -85,14 +85,17 @@ impl fmt::Display for MsixProblem {
 }
 
 impl Capability {
-    /// Read the MSI-X capability `cap` (one `CapList::find(id::MSIX)` gave)
-    /// of `addr`.
+    /// Read the MSI-X capability at `cap`'s offset (one
+    /// `CapList::find(id::MSIX)` gave) of `addr`; the id is checked in
+    /// configuration space, not taken from `cap`.
     pub fn read(cs: &mut impl ConfigSpace, addr: PciAddr, cap: Cap) -> Result<Capability, MsixProblem> {
-        if cap.id != crate::cap::id::MSIX {
-            return Err(MsixProblem::NotMsix(cap.id));
-        }
         let at = u16::from(cap.offset);
-        let control = (cs.read(addr, at) >> 16) as u16;
+        let header = cs.read(addr, at);
+        let id = header as u8;
+        if id != crate::cap::id::MSIX {
+            return Err(MsixProblem::NotMsix(id));
+        }
+        let control = (header >> 16) as u16;
         let table = Location::from_dword(cs.read(addr, at + 4));
         let pba = Location::from_dword(cs.read(addr, at + 8));
         if table.bir > 5 {
@@ -112,6 +115,21 @@ impl Capability {
     /// The table's length in bytes.
     pub fn table_len(&self) -> u64 {
         u64::from(self.table_size()) * ENTRY_LEN
+    }
+
+    /// The pending bit array's length in bytes: a bit per entry, in
+    /// 64-bit words.
+    pub fn pba_len(&self) -> u64 {
+        u64::from(self.table_size()).div_ceil(64) * 8
+    }
+
+    /// The table's and the pending bit array's places: (BAR, offset,
+    /// length) each.
+    pub fn regions(&self) -> [(u8, u64, u64); 2] {
+        [
+            (self.table.bir, u64::from(self.table.offset), self.table_len()),
+            (self.pba.bir, u64::from(self.pba.offset), self.pba_len()),
+        ]
     }
 
     /// Entry `entry`'s offset from the table's start, if the table has it.

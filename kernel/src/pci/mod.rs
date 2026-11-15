@@ -49,7 +49,7 @@ mod msix;
 
 #[cfg(feature = "ktest")]
 pub use msix::ktest_control;
-pub use msix::{MsiError, MsiVector, msix_vectors};
+pub use msix::{MsiError, MsiVector, MsixRecord, msix_vectors};
 
 use crate::acpi::{self, Failure};
 use crate::mm::paging::{self, MmioError};
@@ -334,9 +334,9 @@ struct BarEntry {
 
 /// One function's entry in the registry: its memory BARs (by index), who
 /// has it, whether the [`DeviceResources`] a claim handed out are still
-/// alive, and its MSI-X vector once it has one (once per function, kept
-/// here rather than in the resources, so a function declined and claimed
-/// again can't get a second).
+/// alive, and its MSI-X state (a vector is claimed once per function, kept
+/// here rather than in the resources; a driver declining the function
+/// after that is recorded as failed, so it is never claimed again).
 #[derive(Clone, Debug)]
 struct Slot {
     addr: PciAddr,
@@ -440,7 +440,7 @@ impl BarMapping {
         self.phys
     }
 
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests
+    #[cfg(feature = "ktest")]
     pub fn virt(&self) -> VirtAddr {
         self.virt
     }
@@ -705,11 +705,15 @@ pub fn probed(addr: PciAddr, driver: &'static str, outcome: Probed) -> Binding {
             SlotState::Failed(driver, String::from("declined the device but kept its resources"))
         }
         Probed::Declined if msix => {
-            // MSI-X stays enabled (and the vector claimed): the next driver
-            // couldn't get one, nor use INTx.
-            warn!(target: "pci", "{addr}: {driver} declined it after setting up its MSI-X vector: recorded as failed");
+            // MSI-X stays enabled (and the vector claimed): the function has
+            // had its one vector, so the next driver couldn't get one, nor
+            // use INTx.
+            warn!(target: "pci", "{addr}: {driver} declined it after its MSI-X vector was set up: recorded as failed");
             bus_master_off(addr, "bus mastering off after a failed probe");
-            SlotState::Failed(driver, String::from("declined it after setting up its MSI-X vector"))
+            SlotState::Failed(
+                driver,
+                String::from("declined it after its MSI-X vector was set up (it has had its one)"),
+            )
         }
         Probed::Declined => {
             set_command(addr, restore, "restoring it after a decline");
