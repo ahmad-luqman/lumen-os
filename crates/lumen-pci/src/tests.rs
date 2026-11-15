@@ -740,29 +740,29 @@ fn check_wants_each_kept_structure_inside_a_mapped_bar() {
     let caps = RNG_CAPS;
     let bar4 = |size| move |bar| (bar == 4).then_some(size);
     // QEMU's layout in its 16 KiB BAR 4 passes.
-    assert_eq!(virtio::check(&caps, bar4(0x4000)), Ok(virtio::used(caps.iter().copied())));
+    assert_eq!(virtio::check(&caps, bar4(0x4000), &[]), Ok(virtio::used(caps.iter().copied())));
     let common = caps[4];
     // BAR 4 not mapped (or missing): the first kept structure, common,
     // is refused.
-    assert_eq!(virtio::check(&caps, |_| None), Err(CapProblem::BarNotMapped { cap: common }));
+    assert_eq!(virtio::check(&caps, |_| None, &[]), Err(CapProblem::BarNotMapped { cap: common }));
     // A BAR too small for the notify structure at 0x3000.
-    assert_eq!(virtio::check(&caps, bar4(0x3fff)), Err(CapProblem::PastBar { cap: caps[1], bar_size: 0x3fff }));
+    assert_eq!(virtio::check(&caps, bar4(0x3fff), &[]), Err(CapProblem::PastBar { cap: caps[1], bar_size: 0x3fff }));
     // A BAR index above 5 is refused even if the lookup answered.
     let bad = [vcap(0x40, 16, virtio::COMMON_CFG, 6, 0, 0x10)];
-    assert_eq!(virtio::check(&bad, |_| Some(0x4000)), Err(CapProblem::BarNotMapped { cap: bad[0] }));
+    assert_eq!(virtio::check(&bad, |_| Some(0x4000), &[]), Err(CapProblem::BarNotMapped { cap: bad[0] }));
     // Offset plus length past 4 GiB (the crate adds them in a u32).
     let wraps = [vcap(0x40, 16, virtio::COMMON_CFG, 4, 0xffff_f000, 0x2000)];
     assert_eq!(
-        virtio::check(&wraps, |_| Some(u64::MAX)),
+        virtio::check(&wraps, |_| Some(u64::MAX), &[]),
         Err(CapProblem::PastBar { cap: wraps[0], bar_size: u64::MAX })
     );
     // A structure ending exactly at the BAR's end fits.
     let exact = [vcap(0x40, 16, virtio::COMMON_CFG, 4, 0x3000, 0x1000)];
-    assert!(virtio::check(&exact, bar4(0x4000)).is_ok());
+    assert!(virtio::check(&exact, bar4(0x4000), &[]).is_ok());
     // What the crate won't keep isn't checked: a second common capability
     // in an unmapped BAR, the configuration-access one (type 5, BAR 0).
     let second = [vcap(0x40, 16, virtio::COMMON_CFG, 4, 0, 0x38), vcap(0x50, 16, virtio::COMMON_CFG, 2, 0, 0x10)];
-    assert!(virtio::check(&second, bar4(0x4000)).is_ok());
+    assert!(virtio::check(&second, bar4(0x4000), &[]).is_ok());
 }
 
 #[test]
@@ -779,15 +779,19 @@ fn check_wants_each_kept_structure_as_long_as_what_the_crate_maps() {
         [(virtio::COMMON_CFG, 56), (virtio::NOTIFY_CFG, 2), (virtio::ISR_CFG, 1), (virtio::DEVICE_CFG, 4)]
     {
         assert_eq!(virtio::min_length(cfg_type), need);
-        assert!(virtio::check(&one(cfg_type, need), bar).is_ok(), "type {cfg_type}");
+        assert!(virtio::check(&one(cfg_type, need), bar, &[]).is_ok(), "type {cfg_type}");
         let short = one(cfg_type, need - 1);
-        assert_eq!(virtio::check(&short, bar), Err(CapProblem::TooShort { cap: short[0], need }), "type {cfg_type}");
+        assert_eq!(
+            virtio::check(&short, bar, &[]),
+            Err(CapProblem::TooShort { cap: short[0], need }),
+            "type {cfg_type}"
+        );
     }
     // A notify capability with a length field of 19 is skipped (no
     // multiplier), so a short notify structure behind it isn't checked.
     let skipped = [vcap(0x40, 19, virtio::NOTIFY_CFG, 4, 0, 0)];
     assert_eq!(virtio::used(skipped).notify, None);
-    assert!(virtio::check(&skipped, bar).is_ok());
+    assert!(virtio::check(&skipped, bar, &[]).is_ok());
 }
 
 #[test]
@@ -846,17 +850,17 @@ fn check_refuses_capabilities_the_crate_cant_read_inside_the_header() {
     // The crate reads the dwords at +4, +8 and +12 of every capability
     // with a length field of 16 or more, adding the offsets in a u8.
     let at_f0 = [vcap(0xf0, 16, virtio::COMMON_CFG, 4, 0, 0x38)];
-    assert!(virtio::check(&at_f0, |_| Some(0x1000)).is_ok());
+    assert!(virtio::check(&at_f0, |_| Some(0x1000), &[]).is_ok());
     let at_f4 = [vcap(0xf4, 16, 9, 0, 0, 0)];
-    assert_eq!(virtio::check(&at_f4, |_| Some(0x1000)), Err(CapProblem::PastHeader { cap: at_f4[0] }));
+    assert_eq!(virtio::check(&at_f4, |_| Some(0x1000), &[]), Err(CapProblem::PastHeader { cap: at_f4[0] }));
     // ... and +16 of the notify one it keeps.
     let notify_ec = [vcap(0xec, 20, virtio::NOTIFY_CFG, 4, 0, 0x10)];
-    assert!(virtio::check(&notify_ec, |_| Some(0x1000)).is_ok());
+    assert!(virtio::check(&notify_ec, |_| Some(0x1000), &[]).is_ok());
     let notify_f0 = [vcap(0xf0, 20, virtio::NOTIFY_CFG, 4, 0, 0x10)];
-    assert_eq!(virtio::check(&notify_f0, |_| Some(0x1000)), Err(CapProblem::PastHeader { cap: notify_f0[0] }));
+    assert_eq!(virtio::check(&notify_f0, |_| Some(0x1000), &[]), Err(CapProblem::PastHeader { cap: notify_f0[0] }));
     // A capability it skips (length field below 16) may sit anywhere.
     let short = [vcap(0xfc, 4, 9, 0, 0, 0)];
-    assert!(virtio::check(&short, |_| None).is_ok());
+    assert!(virtio::check(&short, |_| None, &[]).is_ok());
 }
 
 #[test]
@@ -907,4 +911,159 @@ fn virtio_cap_problems_say_which_structure_and_why() {
     for (problem, want) in cases {
         assert_eq!(std::format!("{problem}"), want);
     }
+}
+
+/// `virtio_rng()` with its MSI-X capability's registers as QEMU sets them:
+/// 2 entries (table size field 1), the table at BAR 1 offset 0, the PBA at
+/// BAR 1 offset 0x800, Message Control otherwise clear.
+fn virtio_rng_with_msix(control: u16, table: u32, pba: u32) -> Function {
+    let mut f = virtio_rng();
+    // The header (id 0x11, next 0x84) stays as `caps` laid it out.
+    f.regs[0x98 / 4] = f.regs[0x98 / 4] & 0xffff | u32::from(control) << 16;
+    f.regs[0x9c / 4] = table;
+    f.regs[0xa0 / 4] = pba;
+    f
+}
+
+#[test]
+fn the_msix_capability_says_where_its_table_is_and_how_big() {
+    use crate::msix::{Capability, Location};
+    let a = at(0, 0, 3, 0);
+    let mut cs = Fake::default().with(a, virtio_rng_with_msix(1, 1, 0x801));
+    let caps = DeviceInfo::read(&mut cs, a).expect("present").caps;
+    let cap = caps.find(cap::id::MSIX).expect("an MSI-X capability");
+    let m = Capability::read(&mut cs, a, cap).expect("usable");
+    assert_eq!(m.offset, 0x98);
+    assert_eq!(m.table, Location { bir: 1, offset: 0 });
+    assert_eq!(m.pba, Location { bir: 1, offset: 0x800 });
+    assert_eq!((m.table_size(), m.table_len()), (2, 32));
+    assert_eq!([m.entry_offset(0), m.entry_offset(1), m.entry_offset(2)], [Some(0), Some(16), None]);
+    // The offset's low 3 bits are the BIR, not part of it; the table size
+    // field's top (2047) means 2048 entries; the control bits above it
+    // don't count.
+    let mut cs = Fake::default().with(a, virtio_rng_with_msix(0xc7ff, 0x2004, 5));
+    let m = Capability::read(&mut cs, a, cap).expect("usable");
+    assert_eq!(m.table, Location { bir: 4, offset: 0x2000 });
+    assert_eq!((m.table_size(), m.table_len()), (2048, 2048 * 16));
+    assert_eq!(m.control, 0xc7ff);
+}
+
+#[test]
+fn a_reserved_msix_bar_indicator_is_refused() {
+    use crate::msix::{Capability, MsixProblem};
+    let a = at(0, 0, 3, 0);
+    let cap = Cap { id: cap::id::MSIX, offset: 0x98 };
+    for (table, pba, want) in
+        [(6, 1, MsixProblem::TableBir(6)), (0x1007, 1, MsixProblem::TableBir(7)), (1, 6, MsixProblem::PbaBir(6))]
+    {
+        let mut cs = Fake::default().with(a, virtio_rng_with_msix(0, table, pba));
+        assert_eq!(Capability::read(&mut cs, a, cap), Err(want));
+    }
+    assert_eq!(std::format!("{}", MsixProblem::TableBir(6)), "the MSI-X table's BAR indicator is 6 (reserved)");
+    assert_eq!(
+        std::format!("{}", MsixProblem::PbaBir(7)),
+        "the MSI-X pending bit array's BAR indicator is 7 (reserved)"
+    );
+}
+
+#[test]
+fn msix_enable_clears_the_function_mask_and_keeps_the_rest() {
+    use crate::msix::{CONTROL_ENABLE, CONTROL_FUNCTION_MASK, enabled, with_control};
+    assert_eq!((CONTROL_ENABLE, CONTROL_FUNCTION_MASK), (0x8000, 0x4000));
+    assert_eq!(enabled(0x0001), 0x8001);
+    assert_eq!(enabled(0x4001), 0x8001);
+    assert_eq!(enabled(0xc7ff), 0x87ff);
+    // The header's id and next pointer stay as read.
+    assert_eq!(with_control(0x4001_8411, 0x8001), 0x8001_8411);
+    assert_eq!(with_control(0xffff_0011, 0), 0x0000_0011);
+}
+
+#[test]
+fn an_msix_entry_encodes_fixed_delivery_to_one_local_apic() {
+    use crate::msix::{
+        ENTRY_ADDR_HI, ENTRY_ADDR_LO, ENTRY_DATA, ENTRY_LEN, ENTRY_VECTOR_CONTROL, Message, VECTOR_MASKED,
+    };
+    // The layout (PCI 3.0 §6.8.2.6-9) and the mask bit.
+    assert_eq!((ENTRY_ADDR_LO, ENTRY_ADDR_HI, ENTRY_DATA, ENTRY_VECTOR_CONTROL, ENTRY_LEN), (0, 4, 8, 12, 16));
+    assert_eq!(VECTOR_MASKED, 1);
+    // To APIC 0, vector 0x90: 0xfee00000, physical mode, no redirection
+    // hint; data = the vector, fixed delivery, edge triggered.
+    let m = Message::fixed(0, 0x90);
+    assert_eq!(m, Message { address: 0xfee0_0000, data: 0x90 });
+    assert_eq!(m.entry(true), [0xfee0_0000, 0, 0x90, 1]);
+    assert_eq!(m.entry(false), [0xfee0_0000, 0, 0x90, 0]);
+    // The destination id goes in address bits 12-19.
+    let m = Message::fixed(0xab, 0xef);
+    assert_eq!(m.address, 0xfeea_b000);
+    assert_eq!(m.entry(false), [0xfeea_b000, 0, 0xef, 0]);
+    assert_eq!(Message::fixed(0xff, 0x91).address >> 12 & 0xff, 0xff);
+}
+
+#[test]
+fn an_msix_entry_is_masked_before_its_message_is_written() {
+    use crate::msix::{ENTRY_ADDR_HI, ENTRY_ADDR_LO, ENTRY_DATA, ENTRY_VECTOR_CONTROL, Message, VECTOR_MASKED};
+    let w = Message::fixed(3, 0x91).masked_writes();
+    assert_eq!(w[0], (ENTRY_VECTOR_CONTROL, VECTOR_MASKED), "masked first");
+    assert_eq!(&w[1..], &[(ENTRY_ADDR_LO, 0xfee0_3000), (ENTRY_ADDR_HI, 0), (ENTRY_DATA, 0x91)]);
+}
+
+#[test]
+fn entries_deliver_only_with_msix_enabled_and_the_function_unmasked() {
+    use crate::msix::delivers;
+    assert!(delivers(0x8001));
+    assert!(delivers(0x87ff));
+    assert!(!delivers(0x0001), "not enabled");
+    assert!(!delivers(0xc001), "function masked");
+    assert!(!delivers(0x4000));
+}
+
+#[test]
+fn only_an_msix_capability_is_read_as_one() {
+    use crate::msix::{Capability, MsixProblem};
+    let a = at(0, 0, 3, 0);
+    let mut cs = Fake::default().with(a, virtio_rng_with_msix(1, 1, 0x801));
+    let vendor = Cap { id: cap::id::VENDOR, offset: 0x84 };
+    assert_eq!(Capability::read(&mut cs, a, vendor), Err(MsixProblem::NotMsix(9)));
+    assert_eq!(std::format!("{}", MsixProblem::NotMsix(9)), "capability 0x09 isn't MSI-X");
+}
+
+#[test]
+fn no_vector_is_all_ones() {
+    assert_eq!(virtio::common::NO_VECTOR, 0xffff);
+}
+
+#[test]
+fn a_virtio_structure_overlapping_the_msix_table_or_pba_is_refused() {
+    use crate::msix::Capability;
+    use crate::virtio::{CapProblem, check, used};
+    // QEMU's layout: the virtio structures in BAR 4, the MSI-X table and PBA
+    // in BAR 1: clear of each other.
+    let a = at(0, 0, 3, 0);
+    let mut cs = Fake::default().with(a, virtio_rng_with_msix(1, 1, 0x801));
+    let m = Capability::read(&mut cs, a, Cap { id: cap::id::MSIX, offset: 0x98 }).expect("usable");
+    assert_eq!(m.pba_len(), 8);
+    assert_eq!(m.regions(), [(1, 0, 32), (1, 0x800, 8)]);
+    let caps = RNG_CAPS;
+    assert_eq!(check(&caps, |_| Some(0x4000), &m.regions()), Ok(used(caps.iter().copied())));
+    // The table (or the PBA) in BAR 4, where the common configuration is.
+    let common = caps.iter().find(|c| c.cfg_type == virtio::COMMON_CFG).copied().expect("common");
+    let table = [(common.bar, u64::from(common.offset) + 8, 16), (1, 0x800, 8)];
+    assert_eq!(check(&caps, |_| Some(0x4000), &table), Err(CapProblem::OverlapsMsix { cap: common, table: true }));
+    let pba = [(1, 0, 32), (common.bar, u64::from(common.offset), 8)];
+    assert_eq!(check(&caps, |_| Some(0x4000), &pba), Err(CapProblem::OverlapsMsix { cap: common, table: false }));
+    // The same offsets in another BAR: fine.
+    let elsewhere = [(1, u64::from(common.offset), 16)];
+    assert!(check(&caps, |_| Some(0x4000), &elsewhere).is_ok());
+    assert_eq!(
+        std::format!("{}", CapProblem::OverlapsMsix { cap: common, table: true }),
+        std::format!(
+            "the common configuration structure ({:#x} bytes at {:#x} in BAR {}) overlaps the MSI-X table",
+            common.length,
+            common.offset,
+            common.bar
+        )
+    );
+    // 65 entries take two 64-bit words of pending bits.
+    let mut cs = Fake::default().with(a, virtio_rng_with_msix(64, 1, 0x801));
+    assert_eq!(Capability::read(&mut cs, a, Cap { id: cap::id::MSIX, offset: 0x98 }).map(|m| m.pba_len()), Ok(16));
 }

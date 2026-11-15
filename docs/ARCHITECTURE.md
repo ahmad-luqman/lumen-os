@@ -633,8 +633,8 @@ allocates.
   timer; 0x50 + n global system interrupt n (GSIs 0-63, up to 0x8f),
   once a driver routes it (`interrupts::route_isa_irq`; every other I/O
   APIC input stays masked); 0x90-0xef message-signalled interrupts (MSI and
-  MSI-X, `idt::MSI_BASE..=MSI_LAST`), for PCI devices (section 7; none is
-  handed out until #96); 0xfe local APIC errors; 0xff the local APIC's
+  MSI-X, `idt::MSI_BASE..=MSI_LAST`), for PCI devices (section 7: handed
+  out lowest first by `idt::claim_msi_vector`, each with its handler); 0xfe local APIC errors; 0xff the local APIC's
   spurious vector; the rest unused.
 - **Dispatch:** `#BP` is counted and resumes (a ktest proves registers
   survive the round trip); every other exception is fatal and goes to
@@ -645,10 +645,11 @@ allocates.
   counted and get no EOI (a spurious IRQ 15 gets one at the master 8259); a
   local APIC error is counted, logged with its status (the 1st, 2nd, 4th,
   8th... time, and whenever a new status bit appears) and EOI'd; a routed
-  I/O APIC vector runs the handler its driver registered and is EOI'd;
-  every interrupt nothing handles (an unused vector, an I/O APIC vector
-  without a handler, an MSI vector: none is claimed until #96, another
-  8259 line) is unexpected: traced, counted, reported the first time on its
+  I/O APIC vector runs the handler its driver registered and is EOI'd, and
+  so does a claimed MSI vector (its own handler table, beside the I/O APIC
+  one: `set_irq_handler` stays I/O APIC only); every interrupt nothing
+  handles (an unused vector, an I/O APIC vector without a handler, an MSI
+  vector nothing claimed, another 8259 line) is unexpected: traced, counted, reported the first time on its
   vector and again at its 1024th, 2048th, 4096th... (each report with the
   count, so a storm stays visible), and EOI'd. The report is a warning, or an error on
   an MSI vector (only a device programmed to send one can). Another 8259
@@ -810,9 +811,16 @@ off. A wake from another CPU queues the thread there and sends the
   first) and `wake_all` (the condition is checked under the queue's lock,
   so a waker that sets it and then wakes can't be missed; a thread woken by
   another CPU before it has switched out is neither lost nor queued twice;
-  a ktest hands a turn between two CPUs 6000 times). Dropping a queue with
-  threads waiting panics, as does a thread joining itself (not tested).
-  Where a thread can't block, `wait_until` panics (not tested) and
+  a ktest hands a turn between two CPUs 6000 times).
+  `WaitQueue::wait_until_or_deadline(deadline, cond)` waits at most until
+  `deadline` (whether `cond` held): the thread is on the queue and on its
+  CPU's sleepers at once, and whichever of a waker and the tick that
+  passes the deadline moves it out of `Blocked` first queues it; every
+  wake only moves a thread that is still blocked, and a woken thread takes
+  its own leftover entries off (a ktest races the two 200 times). Dropping
+  a queue with threads waiting panics, as does a thread joining itself
+  (not tested).
+  Where a thread can't block, both waits panic (not tested) and
   `time::sleep` busy-waits (tested with a lock held, interrupts off, and
   on an idle thread; before the scheduler runs on the CPU, not tested).
 - **Idle and boot:** each CPU's idle thread runs only when nothing is ready
@@ -835,8 +843,8 @@ off. A wake from another CPU queues the thread there and sends the
 - **Observability:** every switch records a `switch` trace event (previous
   and next thread's ids, the previous thread's state), and the serial crash
   report names the running thread (`thread: <name> (id N)`).
-- **Not yet:** priorities, migration or load balancing, a per-thread CPU
-  time count (`top`, #63), and timeouts on wait queues.
+- **Not yet:** priorities, migration or load balancing, and a per-thread
+  CPU time count (`top`, #63).
 
 ### Keyboard (built in M2)
 
@@ -1230,9 +1238,12 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   - `irqs`: every I/O APIC input decoded (vector, delivery, trigger,
     polarity, destination, masked; an input no driver routed is shown only
     as masked; `no I/O APIC` without any, not tested), then the interrupts
-    taken on each vector that took any or has a routed input
-    (`idt::vector_count`: `lumen_exception_dispatch` counts every vector,
-    all CPUs together), with what the vector map uses it for.
+    taken on each vector that took any, has a routed input or is a
+    device's MSI-X vector (`idt::vector_count`: `lumen_exception_dispatch`
+    counts every vector, all CPUs together), with what the vector map uses
+    it for, or for a device's MSI-X vector `msix <pci address> #<table
+    entry>` (`pci::msix_vectors`), listed with a count of 0 before it
+    fires.
   - `lspci`: the PCI functions found at boot (`pci::devices`: address,
     vendor and device ids, class and device names, and the driver that
     has each (section 7)), the header
@@ -1469,13 +1480,13 @@ section 2).
 - **Not yet:** scripts from files (M6), floats, capturing closures,
   scripts in user mode (M9), a script running in the background.
 
-## 7. Driver interface (M3: PCI discovery, claiming, the virtio adapter, virtio-rng, the tablet and sound built; MSI-X planned; device classes later)
+## 7. Driver interface (M3: PCI discovery, claiming, the virtio adapter, MSI-X, virtio-rng, the tablet and sound built; device classes later)
 
-PCI discovery (#94), claiming and the virtio adapter (#95) are built; MSI-X
-is planned (#96), with the tests it lists. The first drivers (#97-#99) add
-their rows to the driver table: virtio-rng (#97, "Randomness", below), the
-tablet (#98, "The tablet", below) and sound (#99, "Sound", below) are
-built.
+PCI discovery (#94), claiming, the virtio adapter (#95) and MSI-X (#96,
+"Interrupts for devices: MSI-X", below) are built. The first drivers
+(#97-#99) add their rows to the driver table: virtio-rng (#97,
+"Randomness", below), the tablet (#98, "The tablet", below) and sound
+(#99, "Sound", below) are built, and interrupt through MSI-X.
 
 M3 lays the layer drivers stand on: finding PCI devices (#94), handing a
 driver exactly its device's resources and running `virtio-drivers` on top
@@ -1575,7 +1586,7 @@ pub struct DeviceInfo {
   BAR, when its device is claimed, and never unmapped (`map_mmio`'s
   window only grows); `mapped_bar` looks a mapping up without mapping
   (for the virtio adapter's pre-probe check and `mmio_phys_to_virt`, and
-  #96's MSI-X table). The registry is the one record of BAR mappings; everything else
+  the MSI-X table). The registry is the one record of BAR mappings; everything else
   looks them up there. Nothing else maps BARs, except that the
   framebuffer Limine set up inside the VGA BAR is in the HHDM, so
   `map_mmio` refuses that BAR. A refusal says which function and BAR, and
@@ -1634,8 +1645,14 @@ pub struct Driver {
     The crate's `begin_init` writes `FEATURES_OK` without reading it back
     (virtio 1.2 §3.1.1 step 6) and `finish_init` checks nothing, so a
     device refusing the features would otherwise end up bound; a device
-    that isn't ready makes the probe fail. Drivers may call `check_ready`
-    earlier themselves.
+    that isn't ready makes the probe fail. Before that it checks the
+    device took its MSI-X vector (`virtio::BroughtUp::check`: a problem
+    the transport latched fails the probe, "Interrupts for devices:
+    MSI-X", below), and a probe that failed some other way keeps that
+    problem in its reason (`... (after MSI-X: ...)`). Drivers call
+    `virtio::check_device` (both checks) earlier themselves, before
+    waiting for an interrupt, publishing the device or starting a
+    thread.
   - `<driver>: failed: <reason>`, a warning, with bus mastering turned off
     so the device can't reach memory its driver dropped. The same binding
     records a driver giving its device up after binding it:
@@ -1658,9 +1675,9 @@ pub struct Driver {
     `VirtioTransport::read_config_space` (virtio-input's ID_NAME, EV_BITS
     and ABS_INFO selections don't depend on the features): after the
     constructor the crate has posted buffers it never takes back
-    (`VirtIOInput`: 32 bounce runs), and under #96 MSI-X would be enabled,
-    so #96 allocates the vector lazily, at the first `queue_set`, and a
-    decline leaves nothing behind. A probe that declines but keeps its
+    (`VirtIOInput`: 32 bounce runs) and MSI-X is enabled (the transport
+    allocates the vector lazily, at the first `queue_set`, inside the
+    constructor), so a decline before it leaves nothing behind. A probe that declines but keeps its
     `DeviceResources` (the registry knows while they live) is recorded as
     failed instead, so the next row can't get a second set.
   `no driver` is shown for a function no driver took. DMA runs handed out
@@ -1676,9 +1693,10 @@ pub struct Driver {
   bound, failed, declined and refused.
 - **A probe's side effects come last.** A thread started or state
   published for the rest of the kernel comes after the probe's last
-  fallible check, `StatusHandle::check_ready` included (the tablet and
-  sound check it themselves before publishing and spawning; a spawn that
-  fails undoes the tablet's publishing), so a probe that fails its own
+  fallible check, `virtio::check_device` included (no MSI-X vector
+  problem latched, and `StatusHandle::check_ready`; every driver calls it
+  before publishing and spawning; a spawn that fails undoes the tablet's
+  publishing), so a probe that fails its own
   checks leaves no live thread or "healthy" status behind; a driver must
   not depend on its device staying bound until `probe_all` has recorded
   the outcome (its check after the probe can still fail it). A device
@@ -1687,19 +1705,20 @@ pub struct Driver {
   `pci::failed_after_bind`: `lspci` shows `<driver>: failed: its status
   showed <why> after binding` and bus mastering goes off (not tested for
   the tablet: QEMU can't make the device fail; `mouse`'s text for a failed
-  tablet is ktested). The tablet's own `check_ready` before publishing
-  and the undoing of a failed spawn are reached only by fault injection
-  (not tested).
+  tablet is ktested). `check_device` failing before a driver publishes
+  is tested through its vector check (`vectors=0`, and the refused-vector
+  ktests' probes); its readiness check failing there, and the undoing of
+  a failed spawn, are reached only by fault injection (not tested).
 - **Shared errors.** `ProbeError::Unusable(String)` (a device the driver
   can't use: `<driver>: failed: unusable device: <why>`, e.g. a tablet's
   axis range, no stream or format sound can play, a virtio-rng answering
   one repeated byte) and `ProbeError::Thread(SpawnError)` (no thread for
   the driver) are shared by the M3 drivers (#97-#99).
-- **A virtio driver's probe** calls `virtio::transport(res)` from the probe
-  itself (runs and the status handle are charged to the running probe
-  attempt), may decline the device (above), then calls the crate's device
-  constructor, or sets up its own queues, as rng does, and keeps the
-  device.
+- **A virtio driver's probe** calls `virtio::transport(res, handler)` from
+  the probe itself (runs and the status handle are charged to the running
+  probe attempt), may decline the device (above), then calls the crate's
+  device constructor, or sets up its own queues, as rng does, calls
+  `virtio::check_device` and keeps the device.
 - **Blocking and locks.** A driver whose callers come from anywhere (rng)
   keeps its device in its own state (a `SpinLock` static), holds the lock
   (interrupts off) only for one operation, and waits outside it, with a
@@ -1726,10 +1745,12 @@ pub struct Driver {
   an error (naming it, the time and its status), its bus mastering turned
   off, and its `PciTransport` leaked instead of dropped, so boot doesn't
   hang in that spin (not tested: QEMU's devices reset). A bounded wait
-  (`StatusHandle::wait_until(timeout, ready)`) checks `ready` once more at
+  (`StatusHandle::wait_for(bell, timeout, ready)`, below; `wait_until`,
+  spinning, only for the ktests' made-up device) checks `ready` once more at
   the deadline, gives up when the status shows `DEVICE_NEEDS_RESET` (set
   by the device) or `FAILED` (set by a driver; all ones, a device gone or
-  not decoding, shows as `FAILED` at once), and otherwise returns a
+  not decoding, shows as `FAILED`), seen at the next wake or the
+  deadline, and otherwise returns a
   timeout carrying the time waited and the status byte rather than
   hanging.
 - **Drop order.** DMA memory must not be freed under a live device: reset
@@ -1767,8 +1788,8 @@ impl DeviceResources {
   bus/device/function has no segment: the function's own is used), and
   borrows the `DeviceResources`, so it can't outlive the claim. Another
   function is a bug, and it panics; so is a write inside the function's MSI
-  or MSI-X capability (`CapList::interrupt_cap_at`, host-tested; #96
-  programs those through a path private to `pci`). Both panics are not
+  or MSI-X capability (`CapList::interrupt_cap_at`, host-tested;
+  `DeviceResources::msix` programs MSI-X through a path private to `pci`). Both panics are not
   tested booted. `virtio-drivers` 0.13 writes only the command register and
   the BARs, sizing them in `bar_info` during probe, before the device runs;
   full BAR emulation is out of scope for M3. Known limit: a driver could
@@ -1788,14 +1809,24 @@ needed) does the virtqueues and the device protocols. #95 also adds
 crate's `read_config_space`/`write_config_space` name its traits, and it
 doesn't re-export them. Lumen supplies the transport and the `Hal`.
 
-- **One entry point.** `virtio::transport(res: DeviceResources) ->
-  Result<VirtioTransport, ProbeError>` takes the resources by value, so it
-  runs once per claim (a function is claimed again only after its driver
-  declines it), and `VirtioTransport` owns them.
-  It is called from the probe itself, and runs under a probe lock, one
-  device at a time. #96 adds the interrupt part (a handler argument, with
-  `transport` calling `res.msix` itself, so a vector can't belong to
-  another device).
+- **One entry point.** `virtio::transport(res: DeviceResources, handler:
+  fn()) -> Result<VirtioTransport, ProbeError>` takes the resources by
+  value, so it runs once per claim (a function is claimed again only
+  after its driver declines it), and `VirtioTransport` owns them. It is
+  called from the probe itself, and runs under a probe lock, one device at
+  a time. The transport calls `res.msix(handler)` itself (so a vector
+  can't belong to another device), lazily ("Interrupts for devices:
+  MSI-X", below); the ktests pass a handler that does nothing. One
+  initialization per transport (a second `begin_init` would reset the
+  device and unmap its configuration vector). It hides `RING_EVENT_IDX`
+  (bit 29) from `read_device_features`, so no driver negotiates it: with
+  it, `virtio-drivers` stores `used_event` and then loads `used.idx` with
+  no full fence between them, and x86 may perform that load before the
+  store is visible, so the device could read the old `used_event` and
+  skip the interrupt while the driver, having seen no new buffer, goes to
+  sleep. Without it the device interrupts for every used buffer (nothing
+  calls the crate's `set_dev_notify(false)`, so `NO_INTERRUPT` stays
+  clear). A ktest checks QEMU offers the bit and the transport hides it.
   - It first checks what `PciTransport::new` will look up
     (`lumen_pci::virtio`, host-tested): the first virtio capability of each
     type 1-4 (common, notify, ISR, device configuration; length field at
@@ -1827,9 +1858,8 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
   - The result is wrapped in `VirtioTransport`, which implements the
     crate's public, unsealed `Transport` trait by delegating, so it can add
     what the crate leaves out: the checked common configuration's base
-    (#96 writes its MSI-X vectors there; the per-transport error slot for a
-    refused vector is #96's) and the device status handle derived from it
-    (`StatusHandle`: `check_ready`, `wait_until`). The common configuration
+    (the MSI-X vectors are written there) and the device status handle
+    derived from it (`StatusHandle`: `check_ready`, `wait_for`). The common configuration
     offsets it uses are `lumen_pci::virtio::common`.
   - **One aliasing exception.** The crate holds the common configuration
     as a `UniqueMmioPointer` (safe-mmio: nothing else may access it), and
@@ -1912,16 +1942,19 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
     to 32 posted event buffers, its error line giving the DMA runs
     outstanding in all; not tested), and rng reports the runs it leaked in
     its warning and in `lspci`'s reason.
-- **Polling until MSI-X.** Until #96, drivers poll (bounded where the crate
-  allows, as above); event devices (the tablet) are polled from their
-  thread, which sleeps between looks (`sched::sleep`, 5 ms for the
-  tablet; none after a poll that read half the ring or more), so polling
-  costs no CPU while nothing happens, and a wait as long as the device
-  takes to play something sleeps between looks too
-  (`StatusHandle::sleep_until(timeout, pause, ready)`, otherwise
-  `wait_until`'s checks). Their API
-  doesn't change when interrupts arrive: the handler wakes the driver's
-  `WaitQueue` instead. No lock is held across such a wait (`SpinLock`
+- **Waiting for the device's interrupt.** Each driver's MSI-X handler
+  rings its `virtio::Doorbell` (a count of rings and a `WaitQueue`); its
+  waits read the count, look at the device, and block until the count
+  moves or a deadline passes (`StatusHandle::wait_for(bell, timeout,
+  ready)`: the status checks on each wake, `DEVICE_NEEDS_RESET`, which a
+  device announces with a configuration-change interrupt on the same
+  vector, and `FAILED`, a driver's or all ones, which comes with none and
+  is seen at the next wake or the deadline;
+  `WaitQueue::wait_until_or_deadline` underneath), so a wait costs no CPU.
+  Where the caller can't block (a lock held, interrupts off) it spins. The
+  tablet's thread waits up to 1 s at a time, then looks at the status
+  anyway (a device gone, reading all ones, sends nothing), and looks again
+  at once after a batch of half the ring or more. No lock is held across such a wait (`SpinLock`
   keeps interrupts off, and a thread can't sleep under it): a device that
   is waited on this long has one owner thread, the only code touching it
   (the tablet's `mouse` thread, the `sound` thread), and the rest of the
@@ -1982,8 +2015,8 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
   (`pcm_xfer_ok` takes it back; QEMU returns a period once its audio
   backend has consumed it), so the sound plays without gaps as long as
   the thread is back within 160 ms. Between looks at the oldest period it
-  sleeps 1 ms (`sleep_until`, at most 2 s a period, ending on
-  `DEVICE_NEEDS_RESET` or `FAILED`). When the source has ended (its last
+  blocks until the device's interrupt (`wait_for`, at most 2 s a period,
+  ending on `DEVICE_NEEDS_RESET` or `FAILED`). When the source has ended (its last
   period padded with silence) and the queue has drained, it stops and
   releases the stream. A queue found empty before the end counts as an
   underrun (a warning per sound; `sound` counts them).
@@ -2010,8 +2043,6 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
   event queue aren't read. The crate itself warns, on every boot with a
   sound device, that it got no jack and no channel map infos (QEMU's
   device has none); left as it is.
-- **#96** replaces the 1 ms sleeps with a wait woken by the device's MSI-X
-  interrupt.
 
 ### Randomness (#97)
 
@@ -2036,7 +2067,7 @@ known answer of its own) fed by two sources:
   device: a second is declined, `ProbeError::NotMine`, before its
   transport is touched): negotiates only `VERSION_1` (no indirect
   descriptors, no event index), one 8-entry queue, and drives it itself:
-  `add`, notify, a bounded wait (`StatusHandle::wait_until`, ended early by
+  `add`, notify, a bounded wait for its interrupt (`StatusHandle::wait_for`, ended early by
   `DEVICE_NEEDS_RESET`/`FAILED`), `pop_used`. A request has 1 s in all,
   however many buffers it takes (none is posted after it): at most a page
   per buffer, a short answer asked again for the rest; 8 empty answers in a
@@ -2070,7 +2101,8 @@ says so as info, not a warning, because QEMU's default machine has
 neither. **Concurrent callers:** the pool's `SpinLock` is held only to mix
 and split; the virtio device sits in an `Option` behind its own
 `SpinLock`, taken out for a request made with no lock held (the wait
-busy-waits; a `SpinLock` keeps interrupts off) and put back after. A caller
+blocks until the device's interrupt, or spins where the caller can't
+block; a `SpinLock` keeps interrupts off) and put back after. A caller
 finding it taken skips it for that call (counted): the pool was seeded at
 probe, so its output stays unpredictable, and RDRAND still adds fresh input
 when in use. The shell's `random [bytes]` prints hex, `random --stats` the
@@ -2088,24 +2120,46 @@ cutting a wait short (a ktest checks only that nothing is posted once it
 has passed), and two callers really racing for the device (the busy path
 is tested by taking the device).
 
-### Interrupts for devices: MSI-X (#96)
+### Interrupts for devices: MSI-X (built, #96)
 
 - **Vectors** `idt::MSI_BASE..=MSI_LAST` (0x90-0xef, 96; section 6) come
-  from a vector allocator with its own handler table (`set_irq_handler`
-  stays I/O APIC only). `DeviceResources::msix(&mut self, handler: fn()) ->
-  Result<MsiVector, MsiError>` follows `Route`'s pattern: once per device
-  (a second call is `MsiError::AlreadyAllocated`); on success the handler
-  is registered, the MSI-X table entry is programmed **masked**, MSI-X
-  Enable is set (through a config accessor private to `pci`) and so is
-  INTx-disable; only a function taking the `MsiVector` unmasks the entry.
-  `MsiVector` has private fields `{ pci, entry, vector }` with
-  `table_entry()` and `idt_vector()` accessors, and is `Copy` because
-  vectors are never freed in M3 (it must stop being `Copy` if freeing is
-  added). One vector per device (its configuration changes and all its
-  queues), delivered to the boot CPU (fixed delivery, physical
-  destination), edge-triggered, EOI'd at the local APIC.
-- **The MSI-X table** lives in one of the device's BARs, so #96 reaches it
-  through that BAR's mapping in the registry: no new `map_mmio`.
+  from `idt::claim_msi_vector(handler)`, lowest free first, lock-free (one
+  compare-and-swap per slot), with its own handler table
+  (`set_irq_handler` stays I/O APIC only); never freed in M3. The MSI arm
+  of `lumen_exception_dispatch` runs the vector's handler, then EOIs at the
+  local APIC; one nothing claimed is unexpected (an error).
+- **`DeviceResources::msix(&mut self, handler: fn()) -> Result<MsiVector,
+  MsiError>`** (`pci/msix.rs`, inside `pci` for its private accessors)
+  follows `Route`'s pattern: once per function (a second call is
+  `MsiError::AlreadyAllocated`: the registry slot records the claim as
+  soon as an IDT vector is claimed, before any write to the device, so a
+  failed try counts too; a driver that declines the function after
+  `msix` is recorded as failed, since MSI-X stays enabled on it). It takes the MSI-X capability enumeration found
+  (`caps.find(id::MSIX)`, never an offset a caller gives), reads where the
+  table is (`lumen_pci::msix`, host-tested: BAR indicator, offset, size,
+  the entry and Message Control encodings) and reaches it through the
+  claimed BAR's mapping in the registry (no new `map_mmio`; a table outside
+  a mapped memory BAR is `MsiError::Table`). It claims an IDT vector with
+  the handler, programs table entry 0 **masked** (Vector Control first,
+  then the message: fixed delivery, physical destination, the boot CPU's
+  local APIC id in the address, edge triggered, the vector in the data),
+  sets MSI-X Enable with Function Mask clear in Message Control (read,
+  modify and write of the capability's first dword, through a helper
+  private to `pci`: its id and next-pointer bytes are read-only, unlike
+  the status register beside the command register), reading it back
+  (`MsiError::NotEnabled`), and sets INTx-disable in the command register.
+  Other errors: no capability (or not MSI-X), a reserved BAR indicator,
+  every vector taken, the boot CPU offline or its APIC id too large for a
+  message (x2APIC ids past 255). Only `MsiVector::unmask` unmasks the
+  entry. `MsiVector` has private fields `{ pci, entry, vector, at }` (`at`:
+  where the entry is mapped, so unmasking takes no lock) with
+  `table_entry()` and `idt_vector()`, and is neither `Copy` nor `Clone`:
+  one owner, the transport. Listings (`irqs`) get a read-only
+  `MsixRecord { pci, table_entry, idt_vector }` from
+  `pci::msix_vectors()`. One vector per device (its configuration changes and all its
+  queues), to the boot CPU. A probe that fails after `msix` keeps its
+  vector and handler; its bus mastering is off, so it can't send the
+  message (a memory write).
 - **virtio's vectors.** `virtio-drivers` 0.13 never writes the common
   configuration's `msix_config` (the spec's `config_msix_vector`) or
   `queue_msix_vector`: its `CommonCfg` declares them, but
@@ -2117,25 +2171,45 @@ is tested by taking the device).
   (§4.1.5.1.2.2); with `NO_VECTOR` no interrupt is sent for the queue or
   for configuration changes (§4.1.5.3.1, §4.1.5.4.1); a queue's vector is
   set before `queue_enable` (§4.1.4.3.2). With MSI-X enabled, INTx is
-  disabled (PCI specification). So the value written is the table entry
-  index (0: one entry per device), and the IDT vector goes in that entry's
-  message data. `VirtioTransport` writes `msix_config` on the first
-  `queue_set` (after `begin_init`'s reset, by which time `msix` has
-  enabled MSI-X) and reads it back; in `queue_set` it selects the queue and
-  writes `queue_msix_vector` before delegating, so before `queue_enable`,
-  and reads it back. A refusal (`NO_VECTOR` read back) or an `MsiError`
-  makes the **probe fail** (a warning naming the device, the queue and the
-  reason; `lspci` shows `failed: <reason>`): no polling fallback once #96
-  has landed.
+  disabled (PCI specification). So `VirtioTransport::queue_set`, before
+  delegating: the first time, calls `res.msix(handler)` (after
+  `begin_init`'s reset), writes the table entry index (0) to `msix_config`
+  and reads it back, and unmasks the entry; each time, selects the queue
+  and writes the entry to `queue_msix_vector`, reading it back, before the
+  crate's `queue_enable`. A refusal (`NO_VECTOR` read back) or an
+  `MsiError` is latched (a warning naming the device, and the queue or
+  configuration changes): `queue_set` returns `()`, so the error goes to
+  the running probe attempt (`virtio::check_device`, which each driver
+  calls after the crate's constructor, before it waits for an interrupt,
+  publishes the device or starts a thread; `probe_all` checks it again),
+  and the **probe fails** (`ProbeError::Vector(VectorError)`: `Msi(MsiError)`
+  or `Refused(VectorFor::{Config, Queue(n)})`; `lspci` shows `failed:
+  <reason>`): no polling fallback. A virtio-rng without an MSI-X
+  capability (QEMU's `vectors=0`) fails this way, and so does a device
+  that reads back `NO_VECTOR`, for configuration changes or a queue (a
+  ktest maps an entry past the table, which QEMU refuses).
 - **Aliasing.** The wrapper's writes go through its second pointer to the
   common configuration: the adapter's aliasing exception (above), whose
   argument covers `msix_config` and `queue_msix_vector` too (written
   through `&mut self`, `queue_select` rewritten by the inner transport
   before each queue access of its own).
 - **Vector lifetime.** The vector is allocated lazily, at the first
-  `queue_set` (inside the crate's device constructor), so a driver that
-  declines a device before the constructor (above) leaves no vector
-  behind.
+  `queue_set` (inside the crate's device constructor, or rng's own queue
+  setup), so a driver that declines a device before the constructor
+  (above) leaves no vector behind.
+- **Drivers wait for it** through their `Doorbell` (above, "Waiting for
+  the device's interrupt"); `irqs` lists each device's vector as `msix
+  <pci address> #<entry>` with its count. A wait that blocked to its
+  deadline with no ring, after which the device turned out to have
+  answered with the ring count still unchanged (`virtio::MissedRule`, one
+  rule for `wait_for` and the tablet's loop: a ring in between is an
+  interrupt that came late, not a miss), counts a missed interrupt,
+  warned about once per device (`<addr>: the device answered but its
+  MSI-X interrupt never came (said once)`, ktested), so a dead interrupt
+  path doesn't hide as slow polling. A vector the device accepts must
+  also read back as written, and its entry must read unmasked after the
+  unmask: otherwise the probe fails too (not tested: QEMU echoes the
+  entry or `NO_VECTOR`, and honours the mask).
 
 ### Device classes (later)
 
@@ -2172,10 +2246,10 @@ ever seen.
   (or a wheel turn) that came and went between two looks, while no frame
   was dropped at the device: it sees that a click happened, not where.
 - **Overruns:** the tablet's ring holds 32 event buffers, and QEMU drops a
-  whole frame that doesn't fit, with no `SYN_DROPPED`. A poll that read
+  whole frame that doesn't fit, with no `SYN_DROPPED`. A batch that read
   enough events that a frame may not have fit (30 of 32: a move is 3)
-  counts as an overrun, marks the state stale until a clean poll brings a
-  frame, and polls again at once. The count is a lower bound: frames
+  counts as an overrun, marks the state stale until a clean batch brings a
+  frame, and the thread looks again at once instead of waiting. The count is a lower bound: frames
   dropped at the device can't be counted exactly (a scenario sends 300
   moves unpaced and checks that lost frames come with an overrun).
 - **Keys:** the keyboard's decoded keys (`lumen_shell::Key`, through
@@ -2183,8 +2257,8 @@ ever seen.
   (characters and editing keys, no key-up, no modifiers on their own),
   not a desktop's key event: M4 adds one (key code, press/release,
   modifiers) for the desktop.
-- **Delivery:** the device's owner thread reads a batch of events per
-  poll and publishes the newest state with the batch's counts (`mouse::
+- **Delivery:** the device's owner thread reads a batch of events each
+  time its interrupt wakes it (or its 1 s status look) and publishes the newest state with the batch's counts (`mouse::
   status`: one snapshot under one lock), overwriting the last; keys are
   taken in order from their ring. In M3 the tablet's state has two
   readers (the cursor and `mouse`) and the keys one consumer (the shown
@@ -2476,7 +2550,7 @@ run's, which the job summary was built from) survives.
 kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/arch/        HAL; x86_64/ has gdt, idt, irq, context (thread switch), apic, pic, pit, i8042 and cmos (ports), reset (reset and PM1 registers), serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
   src/acpi.rs      ACPI discovery (MADT, HPET, MCFG, FADT and the DSDT's _S5_) through lumen-acpi
-  src/pci.rs       PCI discovery over ECAM (lumen-pci): pci::devices, the registry (BARs, claims), pci::claim, DeviceResources
+  src/pci/         PCI discovery over ECAM (lumen-pci): pci::devices, the registry (BARs, claims), pci::claim, DeviceResources (mod.rs); MSI-X, DeviceResources::msix (msix.rs)
   src/drivers.rs   the driver table and probe_all
   src/sound.rs     the virtio-sound driver (its thread owns the device), beep, play, volume, sound
   src/virtio.rs    the adapter for virtio-drivers: the Hal (DMA runs, bounce buffers), transport, VirtioTransport

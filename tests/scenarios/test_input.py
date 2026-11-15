@@ -17,7 +17,7 @@ from lumen_harness.qemu import Devices, Machine
 from lumen_harness.qmp import QmpClient, QmpError, pointer_move_args, qcodes_for
 from lumen_harness.screen import expect_screen, read_screen
 from PIL import Image
-from test_pci import lspci_rows, qdev_addresses, run
+from test_pci import lspci_rows, msix_rows, qdev_addresses, run
 
 KBD_LINE = r"INFO  kbd: PS/2 keyboard on ISA IRQ 1 \(GSI 1, vector 0x51\), layout {}\n"
 KBD_STATS = re.compile(
@@ -443,6 +443,21 @@ def test_a_burst_of_moves_counts_overruns(boot):
         assert overruns >= 1, (frames, overruns)
     m.move_pointer(640, 400)
     assert wait_mouse(m, x="640", y="400").stale == "no"
+
+
+def test_a_pointer_move_raises_the_tablets_interrupt(boot):
+    # The tablet interrupts through MSI-X (#96): its vector, `msix <addr>
+    # #0` in `irqs`, counts up when a QMP move makes the device return an
+    # event buffer (the 1 s status look would drain the ring too, but
+    # raises no interrupt), and no interrupt is reported missing.
+    m = boot("qemutest", devices=Devices(tablet=True))
+    addr = tablet_ready(m)
+    _, entry, before = msix_rows(m)[addr]
+    assert entry == 0
+    m.move_pointer(320, 200)
+    wait_mouse(m, x="320", y="200")
+    assert msix_rows(m)[addr][2] > before
+    assert "interrupt never came" not in m.output
 
 
 def test_tablet_is_bound_and_the_keyboard_is_not(boot):

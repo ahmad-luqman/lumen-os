@@ -227,7 +227,7 @@ pub fn has_abs_xy(bits: &[u8]) -> bool {
 /// sync of a move).
 pub const MAX_FRAME: u64 = 3;
 
-/// Whether a poll that read `events` events from a ring of `ring` event
+/// Whether a batch that read `events` events from a ring of `ring` event
 /// buffers may have missed frames: once fewer than [`MAX_FRAME`] buffers
 /// were free, a whole frame may not have fit, and QEMU drops such a frame
 /// without a `SYN_DROPPED`. A lower bound on trouble, not a count: frames

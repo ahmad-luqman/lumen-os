@@ -11,13 +11,25 @@ def test_in_kernel_tests_pass(boot):
     # stack registry and the frame allocator are tested with their stacks and
     # state in place, as on any multi-CPU machine. With virtio devices no
     # driver takes in M3 (network, block, 9p, a memory balloon, a console,
-    # SCSI), for the virtio adapter's ktests to claim and probe, and
-    # virtio-rng, bound at boot, for the rng ktests (on the default CPU: no
-    # RDRAND, so they use virtio-rng).
+    # SCSI, four keyboards and a mouse), for the virtio adapter's and
+    # MSI-X's ktests to claim and probe, and virtio-rng, bound at boot, for the rng ktests (on the
+    # default CPU: no RDRAND, so they use virtio-rng) and its MSI-X vector.
     extra = ["-smp", "4"]
-    for device in ("virtio-balloon-pci", "virtio-serial-pci", "virtio-scsi-pci"):
+    for device in (
+        "virtio-balloon-pci",
+        "virtio-serial-pci",
+        "virtio-scsi-pci",
+        "virtio-mouse-pci",
+        "virtio-keyboard-pci",
+        "virtio-keyboard-pci",
+        "virtio-keyboard-pci",
+    ):
         extra += ["-device", device]
-    m = boot("ktest", extra=extra, devices=Devices(blk_mib=1, net=True, share=True, rng=True))
+    m = boot(
+        "ktest",
+        extra=extra,
+        devices=Devices(blk_mib=1, net=True, share=True, rng=True, keyboard=True),
+    )
     code = m.wait_exit(120)
     out = m.output
     report = tap.parse(out)
@@ -37,11 +49,11 @@ def test_in_kernel_tests_pass(boot):
     # `device_vectors_are_not_fatal` raises the unused vector twice: one
     # warning, not one per interrupt.
     assert out.count("unexpected interrupt on vector 0x30") == 1, "warn-once"
-    # It raises the first MSI vector twice and the last once, and
-    # `msi_vector_delivered_by_the_apic_is_eoid` sends 0x91 as a self-IPI:
-    # each is reported once, as an error (#91: no device may send an MSI
-    # until the vector allocator exists, #96).
-    for vector in ("0x90", "0xef", "0x91"):
+    # It raises the last MSI vector twice and the one below once, and
+    # `msi_vector_delivered_by_the_apic_is_eoid` sends the third from the
+    # top as a self-IPI: vectors the allocator (lowest first) hasn't handed
+    # out, so each is reported once, as an error.
+    for vector in ("0xef", "0xee", "0xed"):
         line = f"ERROR irq: interrupt on MSI vector {vector}, which no device has claimed"
         assert out.count(line) == 1, f"MSI vector {vector} not reported exactly once as an error"
     # The last I/O APIC vector (no handler) is still a plain warning.

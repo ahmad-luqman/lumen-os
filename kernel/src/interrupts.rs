@@ -372,24 +372,27 @@ crate::ktest!(
 crate::ktest!(
     fn device_vectors_are_not_fatal() {
         // A vector nothing handles (an unused one, an I/O APIC vector with
-        // no handler, an MSI vector), or an 8259 line other than IRQ 7 and
-        // 15, is counted as unexpected (and reported the first time: an MSI
-        // vector as an error, nothing may send one yet); the spurious
-        // vectors (the local APIC's, the 8259s' IRQ 7 and 15) only counted;
-        // a local APIC error counted and logged. All return.
+        // no handler, an MSI vector nothing claimed), or an 8259 line other
+        // than IRQ 7 and 15, is counted as unexpected (and reported the
+        // first time: an MSI vector as an error, a device only sends one it
+        // was given); the spurious vectors (the local APIC's, the 8259s' IRQ
+        // 7 and 15) only counted; a local APIC error counted and logged. All
+        // return. The MSI vectors raised are the last two, which the
+        // allocator (lowest first) hasn't handed out on the ktest machine.
         use crate::arch::idt;
-        use crate::kassert_eq;
+        use crate::{kassert, kassert_eq};
+        kassert!(!idt::msi_claimed(idt::MSI_LAST) && !idt::msi_claimed(idt::MSI_LAST - 1));
         let before = idt::strays();
         // SAFETY: software interrupts on vectors the dispatcher handles and
         // returns from; no register is clobbered (the entry stub saves all).
         unsafe {
             core::arch::asm!(
                 "int {unused}", "int {unused}", "int {spurious}", "int {pic7}", "int {pic15}", "int {error}", "int {pic1}",
-                "int {ioapic}", "int {msi}", "int {msi}", "int {msi_last}",
+                "int {ioapic}", "int {msi_top}", "int {msi_top}", "int {msi_below}",
                 unused = const idt::UNUSED,
                 ioapic = const idt::IOAPIC_LAST,
-                msi = const idt::MSI_BASE,
-                msi_last = const idt::MSI_LAST,
+                msi_top = const idt::MSI_LAST,
+                msi_below = const idt::MSI_LAST - 1,
                 spurious = const idt::SPURIOUS,
                 pic7 = const idt::PIC_SPURIOUS_MASTER,
                 pic15 = const idt::PIC_SPURIOUS_SLAVE,
@@ -428,11 +431,13 @@ crate::ktest!(
         // A fixed self-IPI on an MSI vector arrives like a device's message
         // would: through the local APIC, so the dispatcher must EOI it (with
         // the EOI missing it stays in service and blocks every vector up to
-        // 0x9f, its priority class and below, the timer included). Nothing
-        // claims MSI vectors yet, so it is reported as an error.
+        // 0xef, its priority class and below, the timer included). Nothing
+        // claimed this one (the third from the top), so it is reported as an
+        // error.
         use crate::arch::{apic, idt};
         use crate::{kassert, kassert_eq};
-        const V: u8 = idt::MSI_BASE + 1;
+        const V: u8 = idt::MSI_LAST - 2;
+        kassert!(!idt::msi_claimed(V));
         kassert!(crate::arch::irq::enabled());
         let before = idt::vector_count(V);
         kassert!(apic::send_ipi(apic::lapic_id(), V));
@@ -447,6 +452,74 @@ crate::ktest!(
         }
         kassert_eq!(idt::vector_count(V), before + 1);
         kassert!(!in_service);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_claimed_msi_vector_runs_its_handler() {
+        // A vector the allocator hands out (the lowest free: every one
+        // below it is claimed) runs its handler when it arrives through the
+        // local APIC, which is EOI'd, not counted unexpected; the next claim
+        // gets the next vector up.
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        use crate::arch::{apic, idt};
+        use crate::{kassert, kassert_eq};
+        static RAN: AtomicU64 = AtomicU64::new(0);
+        let v = idt::claim_msi_vector(|| {
+            RAN.fetch_add(1, Ordering::Relaxed);
+        })
+        .map_err(|_| "no MSI vector left")?;
+        kassert!((idt::MSI_BASE..=idt::MSI_LAST).contains(&v) && idt::msi_claimed(v));
+        kassert!((idt::MSI_BASE..v).all(idt::msi_claimed));
+        let before = (RAN.load(Ordering::Relaxed), idt::vector_count(v), idt::strays().unexpected);
+        kassert!(apic::send_ipi(apic::lapic_id(), v));
+        let deadline = crate::time::now_ns() + 1_000_000_000;
+        while RAN.load(Ordering::Relaxed) == before.0 && crate::time::now_ns() < deadline {
+            core::hint::spin_loop();
+        }
+        let in_service = apic::in_service(v);
+        if in_service {
+            apic::eoi();
+        }
+        kassert_eq!(
+            (RAN.load(Ordering::Relaxed), idt::vector_count(v), idt::strays().unexpected),
+            (before.0 + 1, before.1 + 1, before.2)
+        );
+        kassert!(!in_service);
+        let next = idt::claim_msi_vector(|| {}).map_err(|_| "no MSI vector left")?;
+        kassert_eq!(next, v + 1);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn msix_vector_delivered() {
+        // virtio-rng's MSI-X vector (bound at boot on the ktest machine):
+        // its device has table entry 0 for configuration changes and its
+        // queue (`msix_config` and `queue_msix_vector` read back 0, not
+        // NO_VECTOR: mapped after `begin_init`'s reset, which unmaps them);
+        // MSI-X is on, INTx off. A request makes the device return a
+        // buffer: its message arrives on the vector (so the entry is
+        // unmasked) and its handler runs (rng's doorbell rings).
+        use crate::{kassert, kassert_eq};
+        let addr = crate::rng::ktest_device().ok_or("no virtio-rng bound")?;
+        let v =
+            crate::pci::msix_vectors().into_iter().find(|r| r.pci == addr).ok_or("virtio-rng has no MSI-X vector")?;
+        kassert_eq!(v.table_entry, 0);
+        kassert_eq!(crate::rng::ktest_vectors(), Some((0, 0)));
+        let (control, command) = crate::pci::ktest_control(addr).ok_or("no MSI-X capability")?;
+        kassert_eq!(
+            control & (lumen_pci::msix::CONTROL_ENABLE | lumen_pci::msix::CONTROL_FUNCTION_MASK),
+            lumen_pci::msix::CONTROL_ENABLE
+        );
+        kassert!(command & lumen_pci::command::INTX_DISABLE != 0);
+        let (count, rings) = (crate::arch::idt::vector_count(v.idt_vector), crate::rng::ktest_rings());
+        let mut buf = [0u8; 64];
+        crate::rng::fill(&mut buf).map_err(|_| "fill refused")?;
+        kassert!(crate::arch::idt::vector_count(v.idt_vector) > count);
+        kassert!(crate::rng::ktest_rings() > rings);
         Ok(())
     }
 );

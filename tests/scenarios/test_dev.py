@@ -221,6 +221,25 @@ def test_a_virtio_rng_answering_zeros_fails_its_probe(boot):
     assert run(m, "random") == f"random: {refused}\n"
 
 
+def test_a_virtio_rng_without_msix_fails_its_probe(boot):
+    # QEMU's `vectors=0`: no MSI-X capability (the device still has INTx,
+    # which Lumen doesn't route: no `_PRT`), so it has no interrupt Lumen
+    # uses, and there is no polling fallback (#96): the probe fails saying
+    # why, before any request.
+    m = shell(boot, devices=Devices(rng_no_msix=True))
+    why = "MSI-X: no MSI-X capability"
+    assert lspci_driver(m, "virtio rng") == [f"virtio-rng: failed: {why}"]
+    assert re.search(r"WARN  virtio: \S+: " + re.escape(why) + "\n", m.output)
+    assert re.search(
+        r"WARN  drivers: \S+: virtio-rng probe failed: " + re.escape(why) + "\n", m.output
+    )
+    assert re.search(
+        r"INFO  drivers: 0 bound, 1 failed, 0 declined, 0 not probed \(\d+ driver rows?\)\n",
+        m.output,
+    )
+    assert "random: no randomness source has answered" in run(m, "random")
+
+
 def test_a_virtio_rng_that_turns_to_zeros_is_dropped(boot, tmp_path):
     # 512 random bytes, then zeros: the firmware reads about 160 bytes at
     # boot and the probe 32, so a few `random`s get good answers, then each

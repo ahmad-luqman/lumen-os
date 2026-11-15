@@ -54,7 +54,7 @@ pub const NOTIFY_MULTIPLIER_AT: u8 = 16;
 
 /// Offsets in the common configuration structure, `virtio_pci_common_cfg`
 /// (virtio 1.2 §4.1.4.3): what the kernel reads or writes beside the crate
-/// (the device status handle; #96's MSI-X vectors).
+/// (the device status handle; the MSI-X vectors).
 pub mod common {
     /// `msix_config` (1.2's `config_msix_vector`), 16 bits.
     pub const MSIX_CONFIG: u64 = 16;
@@ -68,6 +68,10 @@ pub mod common {
     pub const QUEUE_MSIX_VECTOR: u64 = 26;
     /// `queue_notify_off`, 16 bits.
     pub const QUEUE_NOTIFY_OFF: u64 = 30;
+    /// What `msix_config` and `queue_msix_vector` hold for no vector, and
+    /// read back when the device can't map the one written (virtio 1.2
+    /// §4.1.5.1.2).
+    pub const NO_VECTOR: u16 = 0xffff;
     /// What `virtio-drivers`' `CommonCfg` maps: through `queue_device`'s 8
     /// bytes at 48 (virtio 1.2's full structure is 60 bytes, with
     /// `queue_notify_data` and `queue_reset`, which the crate doesn't use).
@@ -180,6 +184,9 @@ pub enum CapProblem {
     /// Queue `queue`'s notify register (`queue_notify_off` times the
     /// multiplier) isn't inside the notify structure.
     NotifyPastEnd { cap: VirtioCap, queue: u16, notify_off: u16, multiplier: u32 },
+    /// A kept structure overlaps the function's MSI-X table or pending bit
+    /// array (`table`: which), which the kernel programs itself.
+    OverlapsMsix { cap: VirtioCap, table: bool },
 }
 
 impl fmt::Display for CapProblem {
@@ -222,6 +229,15 @@ impl fmt::Display for CapProblem {
                 }
                 Ok(())
             }
+            CapProblem::OverlapsMsix { cap, table } => write!(
+                f,
+                "the {} structure ({:#x} bytes at {:#x} in BAR {}) overlaps the MSI-X {}",
+                name(cap),
+                cap.length,
+                cap.offset,
+                cap.bar,
+                if *table { "table" } else { "pending bit array" }
+            ),
         }
     }
 }
@@ -229,8 +245,14 @@ impl fmt::Display for CapProblem {
 /// Whether `PciTransport::new` can be given this device: every capability
 /// in `caps` it reads (length field at least 16) has its fields inside the
 /// header, and every structure [`used`] keeps lies inside a mapped memory
-/// BAR (`bar_size(i)`: BAR `i`'s size if the kernel mapped it).
-pub fn check(caps: &[VirtioCap], bar_size: impl Fn(u8) -> Option<u64>) -> Result<Used, CapProblem> {
+/// BAR (`bar_size(i)`: BAR `i`'s size if the kernel mapped it) and clear of
+/// the MSI-X table and pending bit array (`msix`: their (BAR, offset,
+/// length), `msix::Capability::regions`; the kernel programs those itself).
+pub fn check(
+    caps: &[VirtioCap],
+    bar_size: impl Fn(u8) -> Option<u64>,
+    msix: &[(u8, u64, u64)],
+) -> Result<Used, CapProblem> {
     for &cap in caps.iter().filter(|c| c.cap_len >= MIN_CAP_LEN) {
         // The crate reads the dwords at +4, +8 and +12 of every one it
         // looks at, and at +16 of the notify one it keeps, adding in a u8.
@@ -254,6 +276,12 @@ pub fn check(caps: &[VirtioCap], bar_size: impl Fn(u8) -> Option<u64>) -> Result
         let need = min_length(cap.cfg_type);
         if cap.length < need {
             return Err(CapProblem::TooShort { cap, need });
+        }
+        let (start, end) = (u64::from(cap.offset), u64::from(cap.offset) + u64::from(cap.length));
+        for (i, &(bar, offset, len)) in msix.iter().enumerate() {
+            if bar == cap.bar && start < offset + len && offset < end {
+                return Err(CapProblem::OverlapsMsix { cap, table: i == 0 });
+            }
         }
     }
     Ok(u)

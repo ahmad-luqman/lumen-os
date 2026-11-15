@@ -169,3 +169,11 @@ milestone = "M3"
 tests = [
     "harness:test_devices::test_host_audio_plays_through_the_host",
 ]
+
+[[feature]]
+name = "Harness: virtio-rng without an MSI-X capability as a device option (`Devices(rng_no_msix=True)`: QEMU's `vectors=0`, implying virtio-rng)"
+milestone = "M3"
+tests = [
+    "harness:test_devices::test_one_device_attaches_exactly_its_own[rng_no_msix]",
+    "scenario:test_dev::test_a_virtio_rng_without_msix_fails_its_probe",
+]

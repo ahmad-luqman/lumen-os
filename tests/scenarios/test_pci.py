@@ -147,6 +147,16 @@ def pci_address(d: dict) -> str:
     return f"0000:{d['bus']:02x}:{d['slot']:02x}.{d['function']:x}"
 
 
+MSIX_ROW = re.compile(r"^  (0x[0-9a-f]{2})\s+msix (\S+) #(\d+)\s+(\d+)$", re.MULTILINE)
+
+
+def msix_rows(m: Machine) -> dict[str, tuple[int, int, int]]:
+    """`irqs`' MSI-X rows (#96): PCI address -> (IDT vector, table entry,
+    interrupts taken)."""
+    out = run(m, "irqs | where use ~ msix")
+    return {addr: (int(v, 16), int(entry), int(n)) for v, addr, entry, n in MSIX_ROW.findall(out)}
+
+
 def qdev_addresses(m: Machine) -> dict[str, str]:
     """The PCI address of each device QEMU names by qdev id."""
     return {d["qdev_id"]: pci_address(d) for d in pci_devices(m) if d.get("qdev_id")}

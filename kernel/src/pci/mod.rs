@@ -45,6 +45,12 @@ pub use lumen_pci::{Bar, BarProblem, DeviceInfo, NoBar, PciAddr};
 use lumen_pci::{ConfigSpace, command, ecam_offset, enumerate};
 use virtio_drivers::transport::pci::bus::{ConfigurationAccess, DeviceFunction};
 
+mod msix;
+
+#[cfg(feature = "ktest")]
+pub use msix::ktest_control;
+pub use msix::{MsiError, MsiVector, MsixRecord, msix_vectors};
+
 use crate::acpi::{self, Failure};
 use crate::mm::paging::{self, MmioError};
 use crate::sync::SpinLock;
@@ -263,7 +269,13 @@ fn discover() -> (Vec<DeviceInfo>, Status) {
             Some(Bar::Memory { phys, size, .. }) => Some(BarEntry { phys, size, mapped: None }),
             _ => None,
         });
-        slots.push(Slot { addr: d.addr, bars, state: SlotState::Free { declined_by: None }, resources_live: false });
+        slots.push(Slot {
+            addr: d.addr,
+            bars,
+            state: SlotState::Free { declined_by: None },
+            resources_live: false,
+            msix: msix::MsixState::None,
+        });
     }
     let memory_bars = slots.iter().map(|s| s.bars.iter().flatten().count()).sum::<usize>();
     let plural = if found.len() == 1 { "" } else { "s" };
@@ -321,14 +333,17 @@ struct BarEntry {
 }
 
 /// One function's entry in the registry: its memory BARs (by index), who
-/// has it, and whether the [`DeviceResources`] a claim handed out are still
-/// alive.
+/// has it, whether the [`DeviceResources`] a claim handed out are still
+/// alive, and its MSI-X state (a vector is claimed once per function, kept
+/// here rather than in the resources; a driver declining the function
+/// after that is recorded as failed, so it is never claimed again).
 #[derive(Clone, Debug)]
 struct Slot {
     addr: PciAddr,
     bars: [Option<BarEntry>; 6],
     state: SlotState,
     resources_live: bool,
+    msix: msix::MsixState,
 }
 
 /// Who has a function, with what only the registry needs (the command
@@ -425,7 +440,7 @@ impl BarMapping {
         self.phys
     }
 
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: #96's MSI-X table
+    #[cfg(feature = "ktest")]
     pub fn virt(&self) -> VirtAddr {
         self.virt
     }
@@ -531,7 +546,7 @@ fn map_bar(addr: PciAddr, index: usize) -> Result<BarMapping, BarError> {
 
 /// Memory BAR `index` of `addr`'s mapping, if [`map_bar`] made one; maps
 /// nothing (for the virtio adapter's pre-probe check and
-/// `mmio_phys_to_virt`, and #96's MSI-X table).
+/// `mmio_phys_to_virt`, and the MSI-X table).
 fn mapped_bar(addr: PciAddr, index: usize) -> Result<BarMapping, BarError> {
     check_bar(addr, index)?;
     let mapped = with_slot(addr, |slot| slot.bars[index].expect("every memory BAR is registered").mapped);
@@ -659,7 +674,8 @@ pub enum Probed {
     /// out, e.g. a second tablet, or a virtio input device of the tablet's
     /// class without its axes): the function is free again, its command
     /// register as before the claim, for the next driver row. Refused (a
-    /// failure) if the driver kept its `DeviceResources`.
+    /// failure) if the driver kept its `DeviceResources`, or set up its
+    /// MSI-X vector (`DeviceResources::msix`: once per function).
     Declined,
 }
 
@@ -670,8 +686,10 @@ pub enum Probed {
 /// being probed by `driver` (a bug in `probe_all`). Returns the binding
 /// recorded.
 pub fn probed(addr: PciAddr, driver: &'static str, outcome: Probed) -> Binding {
-    let (restore, live) = with_slot(addr, |slot| match slot.state {
-        SlotState::Probing { driver: d, restore } if d == driver => (restore, slot.resources_live),
+    let (restore, live, msix) = with_slot(addr, |slot| match slot.state {
+        SlotState::Probing { driver: d, restore } if d == driver => {
+            (restore, slot.resources_live, slot.msix != msix::MsixState::None)
+        }
         ref other => panic!("pci::probed: {addr} isn't being probed by {driver} ({})", other.binding()),
     })
     .unwrap_or_else(|| panic!("pci::probed: no function {addr}"));
@@ -685,6 +703,17 @@ pub fn probed(addr: PciAddr, driver: &'static str, outcome: Probed) -> Binding {
             warn!(target: "pci", "{addr}: {driver} declined it but kept its resources: recorded as failed");
             bus_master_off(addr, "bus mastering off after a failed probe");
             SlotState::Failed(driver, String::from("declined the device but kept its resources"))
+        }
+        Probed::Declined if msix => {
+            // MSI-X stays enabled (and the vector claimed): the function has
+            // had its one vector, so the next driver couldn't get one, nor
+            // use INTx.
+            warn!(target: "pci", "{addr}: {driver} declined it after its MSI-X vector was set up: recorded as failed");
+            bus_master_off(addr, "bus mastering off after a failed probe");
+            SlotState::Failed(
+                driver,
+                String::from("declined it after its MSI-X vector was set up (it has had its one)"),
+            )
         }
         Probed::Declined => {
             set_command(addr, restore, "restoring it after a decline");
@@ -764,10 +793,10 @@ impl DeviceResources {
 /// One claimed function's configuration space, tied to its
 /// [`DeviceResources`]: reads and writes go through ECAM (its lock taken
 /// for each), and another function's address is a bug that panics, as is
-/// a write into its MSI or MSI-X capability (#96 programs those through a
-/// path private to `pci`; `virtio-drivers` 0.13 writes only the command
-/// register and the BARs, sizing them while probing, before the device
-/// runs: no BAR emulation in M3).
+/// a write into its MSI or MSI-X capability (`DeviceResources::msix`
+/// programs MSI-X through a path private to `pci`; `virtio-drivers` 0.13
+/// writes only the command register and the BARs, sizing them while
+/// probing, before the device runs: no BAR emulation in M3).
 #[derive(Debug)]
 pub struct FunctionConfig<'a> {
     info: &'static DeviceInfo,

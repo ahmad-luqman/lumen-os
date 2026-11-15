@@ -83,3 +83,13 @@ tests = [
     "scenario:test_crash::test_fault_produces_symbolized_report[*]",
     "scenario:test_smp::test_crash_on_ap_reports_cpu",
 ]
+
+[[feature]]
+name = "A wait on a queue with a deadline (`WaitQueue::wait_until_or_deadline`): false at the deadline when nothing makes it ready (not before it), true when a waker on another CPU wakes it first; a waker and the deadline racing (200 rounds, each winning sometimes) never panic, lose the thread or leave an entry on the queue or the CPU's sleepers, and the thread blocks again at once on another queue until its own deadline; a plain wait woken by a stale wake blocks again on its queue once, not twice; `wake_one` passes over a thread that isn't blocked and wakes the one behind it"
+milestone = "M3"
+tests = [
+    "ktest:lumen_kernel::sched::a_wait_with_a_deadline_ends_at_it_or_when_woken",
+    "ktest:lumen_kernel::sched::a_stale_wake_leaves_a_plain_wait_on_its_queue_once",
+    "ktest:lumen_kernel::sched::wake_one_skips_a_thread_that_isnt_blocked",
+    "scenario:test_ktest::test_in_kernel_tests_pass",
+]

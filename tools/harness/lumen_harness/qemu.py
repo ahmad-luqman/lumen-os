@@ -194,6 +194,9 @@ class QemuOptions:
     # virtio-rng's rate limit, QEMU's `max-bytes` per `period` ms (implies
     # virtio-rng). None: unlimited.
     virtio_rng_rate: tuple[int, int] | None = None
+    # virtio-rng without an MSI-X capability (QEMU's `vectors=0`; implies
+    # virtio-rng).
+    virtio_rng_no_msix: bool = False
     # virtio-sound, played into this wav file through QEMU's wav audiodev.
     sound_wav: Path | None = None
     # virtio-sound, played through the host's speakers by this QEMU audio
@@ -249,10 +252,11 @@ def device_args(o: QemuOptions) -> list[str]:
         args += ["-device", f"virtio-tablet-pci,id={ids['tablet']}"]
     if o.virtio_keyboard:
         args += ["-device", f"virtio-keyboard-pci,id={ids['keyboard']}"]
-    if o.virtio_rng or o.virtio_rng_rate:
+    if o.virtio_rng or o.virtio_rng_rate or o.virtio_rng_no_msix:
         rate = o.virtio_rng_rate
         limit = f",max-bytes={rate[0]},period={rate[1]}" if rate else ""
-        args += ["-device", f"virtio-rng-pci,id={ids['rng']}{limit}"]
+        vectors = ",vectors=0" if o.virtio_rng_no_msix else ""
+        args += ["-device", f"virtio-rng-pci,id={ids['rng']}{limit}{vectors}"]
     # The sound device's audiodev (its driver and options): the host's
     # speakers (`make run SOUND=1`), or a wav file.
     audiodev = None
@@ -325,6 +329,10 @@ class Devices:
     # attaches virtio-rng (whatever `rng` says), a device that stops
     # answering in time.
     rng_rate: tuple[int, int] | None = None
+    # virtio-rng without an MSI-X capability (QEMU's `vectors=0`): attaches
+    # virtio-rng (whatever `rng` says), a device left with INTx only, which
+    # Lumen doesn't route.
+    rng_no_msix: bool = False
     # virtio-sound, recorded to `Machine.wav_path`.
     sound: bool = False
     # virtio-blk on a scratch image of this many MiB, zero-filled again on
@@ -376,8 +384,8 @@ class Devices:
     @classmethod
     def every(cls) -> Devices:
         """Every device the harness knows (`blk_image` is the alternative to
-        `blk_mib`, so it stays off; `rng_rate` only limits virtio-rng, which
-        is on, unlimited)."""
+        `blk_mib`, so it stays off; `rng_rate` and `rng_no_msix` only change
+        virtio-rng, which is on, unlimited, with MSI-X)."""
         return cls(
             tablet=True,
             keyboard=True,
@@ -698,6 +706,7 @@ class Machine:
             virtio_keyboard=d.keyboard,
             virtio_rng=d.rng,
             virtio_rng_rate=d.rng_rate,
+            virtio_rng_no_msix=d.rng_no_msix,
             sound_wav=self.wav_path if d.sound else None,
             blk_image=self.blk_image if d.wants_blk else None,
             net_forwards=dict(self.forwards) if d.wants_net else None,

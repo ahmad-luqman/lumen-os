@@ -313,8 +313,9 @@ fn input_table(inputs: &[crate::interrupts::Input]) -> pipe::Table {
 }
 
 /// `irqs`' second table, and its records in a pipeline: the interrupts
-/// taken on each vector from 32 on that has taken any or has a routed
-/// input.
+/// taken on each vector from 32 on that has taken any, has a routed input
+/// or is a device's MSI-X vector (its use `msix <pci address> #<table
+/// entry>`).
 fn vector_table() -> pipe::Table {
     const COLUMNS: [Column; 3] = [
         Column::new("vector", Kind::Hex, Align::Left, 6),
@@ -322,12 +323,18 @@ fn vector_table() -> pipe::Table {
         Column::new("count", Kind::Int, Align::Left, 0),
     ];
     let inputs = crate::interrupts::inputs();
+    let msix: Vec<crate::pci::MsixRecord> = crate::pci::msix_vectors();
     let mut t = pipe::Table::new(&COLUMNS);
     for v in 32..=255u8 {
         let count = idt::vector_count(v);
         let routed = inputs.iter().any(|i| i.routed && i.entry.vector() == v);
-        if count > 0 || routed {
-            t.push(vec![int(v), Value::Text(alloc::format!("{}", idt::vector_use(v))), int(count)]);
+        let device = msix.iter().find(|m| m.idt_vector == v);
+        if count > 0 || routed || device.is_some() {
+            let what = match device {
+                Some(m) => alloc::format!("msix {} #{}", m.pci, m.table_entry),
+                None => alloc::format!("{}", idt::vector_use(v)),
+            };
+            t.push(vec![int(v), Value::Text(what), int(count)]);
         }
     }
     t

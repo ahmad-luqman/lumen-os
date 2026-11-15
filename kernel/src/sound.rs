@@ -17,12 +17,13 @@
 //!   the stream, keeps up to [`DEPTH`] periods queued (`pcm_xfer_nb`), and
 //!   queues another each time the device returns one (`pcm_xfer_ok` takes
 //!   it back; QEMU returns a period once its audio backend has consumed
-//!   it). Between looks it sleeps ([`POLL_NS`], `StatusHandle::sleep_until`),
+//!   it). Between looks it blocks until the device's MSI-X interrupt
+//!   (through `virtio::transport`) rings [`BELL`] (`StatusHandle::wait_for`),
 //!   bounded per period and ending on `DEVICE_NEEDS_RESET`/`FAILED`, so a
 //!   melody doesn't keep a CPU busy. Once the source has ended (its last
 //!   period padded with silence) and the queue has drained, it stops and
-//!   releases the stream. #96 replaces the sleeps with the device's
-//!   interrupt.
+//!   releases the stream. A device that can't take its vector fails the
+//!   probe.
 //! - **Control requests spin unbounded** in the crate (a known limit): the
 //!   info queries and `pcm_set_params` in the probe, and prepare, start,
 //!   stop and release around every sound, on the thread. One that never
@@ -67,7 +68,7 @@ use crate::pci::{DeviceInfo, DeviceResources};
 use crate::sched::WaitQueue;
 use crate::shell::Ctx;
 use crate::sync::SpinLock;
-use crate::virtio::{self, ProbeError, StatusHandle, VirtioHal, VirtioTransport, WaitError};
+use crate::virtio::{self, Doorbell, ProbeError, StatusHandle, VirtioHal, VirtioTransport, WaitError};
 
 /// The driver's row in `drivers::DRIVERS`.
 pub const DRIVER: Driver = Driver { name: "sound", matches: is_sound, probe };
@@ -81,8 +82,6 @@ const PERIOD_MS: u32 = 20;
 /// be late). Each holds 3 DMA runs (the samples behind the stream id, the
 /// status reply, the indirect descriptor list).
 const DEPTH: usize = 8;
-/// How long the thread sleeps between looks at the oldest period.
-const POLL_NS: u64 = 1_000_000;
 /// How long a period may take to come back before the device counts as
 /// stuck: far more than the 160 ms of [`DEPTH`] periods queued ahead of it.
 const PERIOD_WAIT_NS: u64 = 2_000_000_000;
@@ -530,6 +529,15 @@ fn played_too_fast(frames: u64, rate: Rate, ms: u64) -> bool {
     length_ms >= PACE_CHECK_MS && ms < length_ms / 2
 }
 
+/// Rung by the device's MSI-X interrupt: whatever it signals (a buffer
+/// back on any of its queues, a period among them, or a configuration
+/// change).
+static BELL: Doorbell = Doorbell::new();
+
+fn on_interrupt() {
+    BELL.ring();
+}
+
 /// Whether a sound device is bound, or being probed: the player is one
 /// (one slot, one thread, one format), so a second device is declined
 /// before its transport is touched.
@@ -552,11 +560,11 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
 /// that can fail comes before the thread starts and the device is
 /// published.
 fn bind(res: DeviceResources) -> Result<(), ProbeError> {
-    let transport = virtio::transport(res)?;
+    let transport = virtio::transport(res, on_interrupt)?;
     let status = transport.status();
     let addr = transport.info().addr;
     let mut dev = VirtIOSound::<VirtioHal, VirtioTransport>::new(transport).map_err(ProbeError::Device)?;
-    status.check_ready()?;
+    virtio::check_device(&status)?;
     let format = set_up(&mut dev)?;
     status.check_ready()?;
     let device = Device { addr, format };
@@ -785,12 +793,13 @@ impl Stream {
         }
     }
 
-    /// Wait (bounded, sleeping) until the device returns period `token`.
+    /// Wait (bounded, blocking until the device's interrupt) until the
+    /// device returns period `token`.
     fn wait_taken_back(&mut self, token: u16) -> Result<(), PlayError> {
         let status = self.status;
         let mut answer = Ok(false);
         status
-            .sleep_until(PERIOD_WAIT_NS, POLL_NS, || {
+            .wait_for(&BELL, PERIOD_WAIT_NS, || {
                 answer = self.taken_back(token);
                 !matches!(answer, Ok(false))
             })
@@ -1077,7 +1086,7 @@ crate::ktest!(
         let addr = PciAddr::new(0, 0xff, 0x1f, 7).ok_or("addr")?;
         let bound = |activity| Bound {
             device: Device { addr, format: device_format },
-            status: StatusHandle::ktest_reading(&STATUS),
+            status: StatusHandle::ktest_reading(&STATUS, None),
             activity,
             next: None,
             counts: Counts::default(),
