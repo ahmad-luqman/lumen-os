@@ -147,3 +147,10 @@ tests = [
     "harness:test_devices::test_devices_reject_bad_values*",
     "scenario:test_dev::test_a_virtio_rng_that_stops_answering_is_dropped[alone]",
 ]
+
+[[feature]]
+name = "qemu.py's host-audio option (intended for `make run SOUND=1`): virtio-sound on a host audio driver (Core Audio on macOS, PulseAudio elsewhere, `LUMEN_AUDIO` choosing another), never together with the wav recording (the command line is checked; CI doesn't boot it, having no speakers)"
+milestone = "M3"
+tests = [
+    "harness:test_devices::test_host_audio_plays_through_the_host",
+]

@@ -9,7 +9,7 @@ milestones with test-based exit criteria; `docs/STATUS.md` is generated.
 ```bash
 make deps            # pinned Limine + OVMF into build/deps (sha256-checked)
 make build           # both kernels: build/lumen-kernel, build/lumen-kernel-ktest
-make run             # QEMU with a window, serial on your terminal (Ctrl-A x quits; HEADLESS=1)
+make run             # QEMU with a window, serial on your terminal (Ctrl-A x quits; HEADLESS=1; SOUND=1 for beep/play)
 make debug           # QEMU paused + gdb attached, stopped at kmain
 make test            # everything CI runs: host tests, flag audit, QEMU scenarios
 make test-host       # cargo test + harness self-tests (fast, no QEMU)
@@ -183,6 +183,9 @@ own PR that updates that doc first.
   `time.rs`: TSC and LAPIC timer calibration, the boot origin
   (`mark_boot`, `since_boot_ns`), `now_ns`, `sleep`, `ticks`.
   `demo.rs`: the `mandelbrot` (bands on every CPU) and `life` commands.
+  `sound.rs`: the virtio-sound driver (its `sound` thread owns the device,
+  playing `lumen-synth` sources paced by the device), `beep`, `play`,
+  `volume` and `sound`.
 - `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs
   in bands, and Game of Life with its patterns (host-tested).
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
@@ -229,8 +232,8 @@ own PR that updates that doc first.
   interrupt enable register), FIFO detection, `\n` as `\r\n` in 15-byte
   bursts (one FIFO slot left for the crash reporter's byte) (host-tested
   against a model UART).
-- `crates/lumen-synth`: sound synthesis for the shell's coming `beep` and
-  `play` (#99): fixed-point oscillators (square, triangle, sine table,
+- `crates/lumen-synth`: sound synthesis for the shell's `beep` and
+  `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
   (`t=140 w=sine C4/8 r/8`), and `Source`s that fill interleaved 16-bit
   PCM buffers (host-tested).

@@ -224,6 +224,7 @@ dependencies = [
  "lumen-queue",
  "lumen-rand",
  "lumen-shell",
+ "lumen-synth",
  "lumen-term",
  "lumen-time",
  "lumen-trace",

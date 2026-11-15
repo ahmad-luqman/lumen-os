@@ -1,4 +1,4 @@
-//! Sound synthesis for the shell's coming `beep` and `play` (#99), kept
+//! Sound synthesis for the shell's `beep` and `play` (`kernel/src/sound.rs`), kept
 //! free of kernel dependencies so it can be tested on the host. Everything
 //! is integer arithmetic: the kernel is built without SSE, so floating
 //! point would be slow soft-float calls.

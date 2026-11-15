@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from . import BUILD_DIR
-from .qemu import QemuOptions, fresh_vars, qemu_args
+from .qemu import QemuOptions, fresh_vars, host_audio_driver, qemu_args
 
 
 def cmd_run(a: argparse.Namespace) -> int:
@@ -21,13 +21,23 @@ def cmd_run(a: argparse.Namespace) -> int:
         serial="mon:stdio",  # Ctrl-A c reaches the QEMU monitor
         monitor=None,
         log_file=BUILD_DIR / "run/qemu.log",
+        host_audio=host_audio_driver(sys.platform, os.environ) if a.sound else None,
         # So `random` works (QEMU's default CPU has no RDRAND).
         virtio_rng=True,
     )
     args = qemu_args(opts)
     print("+", " ".join(args), file=sys.stderr)
     print("(serial is attached here; Ctrl-A x quits QEMU)", file=sys.stderr)
-    return subprocess.call(args)
+    rc = subprocess.call(args)
+    if rc == 1 and a.sound:
+        # (QEMU exits with 1 when it refuses its command line.)
+        print(
+            "(QEMU exited with 1; with SOUND=1, its audio driver may be missing (LUMEN_AUDIO=<driver> "
+            "picks another; `qemu-system-x86_64 -audiodev help` lists them), or this QEMU has no "
+            "virtio-sound-pci (8.2 or later))",
+            file=sys.stderr,
+        )
+    return rc
 
 
 def gdb_binary() -> str:
@@ -112,6 +122,11 @@ def main() -> int:
     r = sub.add_parser("run", help="boot with a window, serial on this terminal")
     r.add_argument("--iso", type=Path, required=True)
     r.add_argument("--headless", action="store_true", help="no window (e.g. over SSH)")
+    r.add_argument(
+        "--sound",
+        action="store_true",
+        help="virtio-sound through the host's audio (LUMEN_AUDIO: the QEMU audio driver)",
+    )
     r.set_defaults(func=cmd_run)
 
     d = sub.add_parser("debug", help="boot paused under gdb")

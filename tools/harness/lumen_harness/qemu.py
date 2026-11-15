@@ -36,7 +36,7 @@ import subprocess
 import threading
 import time
 import warnings
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, Self
@@ -193,6 +193,10 @@ class QemuOptions:
     virtio_rng_rate: tuple[int, int] | None = None
     # virtio-sound, played into this wav file through QEMU's wav audiodev.
     sound_wav: Path | None = None
+    # virtio-sound, played through the host's speakers by this QEMU audio
+    # driver (`make run SOUND=1`: `host_audio_driver()`). Not with
+    # `sound_wav`.
+    host_audio: str | None = None
     # virtio-blk backed by this raw image (read-write).
     blk_image: Path | None = None
     # virtio-net on user networking: guest TCP port -> host port forwarded
@@ -201,6 +205,10 @@ class QemuOptions:
     # virtio-9p sharing this host folder, mount tag `SHARE_TAG`.
     share_dir: Path | None = None
     extra: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.sound_wav and self.host_audio:
+            raise ValueError("sound_wav and host_audio: one virtio-sound device, recorded or heard")
 
 
 # The 9p mount tag the device advertises (a guest driver mounts by it).
@@ -215,6 +223,13 @@ DEVICE_IDS = {
     "net": "lumen-nic",
     "share": "lumen-9p",
 }
+
+
+def host_audio_driver(platform: str, env: Mapping[str, str]) -> str:
+    """The QEMU audio driver `make run SOUND=1` plays through: `LUMEN_AUDIO`
+    if set and non-empty (e.g. `alsa`, `pipewire`, `sdl`), else Core Audio on macOS and
+    PulseAudio elsewhere (PipeWire serves it too)."""
+    return env.get("LUMEN_AUDIO") or ("coreaudio" if platform == "darwin" else "pa")
 
 
 def _opt(value: object) -> str:
@@ -235,18 +250,26 @@ def device_args(o: QemuOptions) -> list[str]:
         rate = o.virtio_rng_rate
         limit = f",max-bytes={rate[0]},period={rate[1]}" if rate else ""
         args += ["-device", f"virtio-rng-pci,id={ids['rng']}{limit}"]
-    if o.sound_wav:
+    # The sound device's audiodev (its driver and options): the host's
+    # speakers (`make run SOUND=1`), or a wav file.
+    audiodev = None
+    if o.host_audio:
+        audiodev = (_opt(o.host_audio), "")
+    elif o.sound_wav:
         # QEMU creates the wav file when it realizes the device. The header's
         # lengths depend on the version: 8.2 (CI) fills them in at exit (an
         # atexit audio_cleanup), 11.1 leaves them at 0 (seen after
         # debug-exit, QMP `quit` and SIGTERM). While QEMU runs the file can
         # be 0 bytes (the header still in stdio's buffer). Readers take the
         # length from the file size, once QEMU has exited.
-        # `streams=1`: the output stream only. The wav backend has no capture
-        # side (QEMU warns about the input stream otherwise), and playback is
-        # all we need.
+        audiodev = ("wav", f",path={_opt(o.sound_wav)}")
+    if audiodev:
+        # `streams=1`: the output stream only, on either audiodev. The wav
+        # backend has no capture side (QEMU warns about the input stream
+        # otherwise), and playback is all Lumen does.
+        driver, options = audiodev
         args += [
-            "-audiodev", f"wav,id=lumen-audio,path={_opt(o.sound_wav)}",
+            "-audiodev", f"{driver},id=lumen-audio{options}",
             "-device", f"virtio-sound-pci,id={ids['sound']},audiodev=lumen-audio,streams=1",
         ]  # fmt: skip
     if o.blk_image:

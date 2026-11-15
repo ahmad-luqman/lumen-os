@@ -51,7 +51,8 @@ def test_in_kernel_tests_pass(boot):
     storm = re.findall(r"unexpected interrupt on vector 0x31 \(rip 0x[0-9a-f]+, #(\d+)\)", out)
     assert storm == ["1", "1024", "2048"], f"0x31 storm reports: {storm}"
     # `probing_records_each_outcome` (#95): boot's own pass binds only
-    # virtio-rng (#97); the ktest's table declines the 9p device once alone, then
+    # virtio-rng (#97; sound's row, #99, finds no sound device on the ktest
+    # machine); the ktest's table declines the 9p device once alone, then
     # declines it (leaving a run) and fails it (leaving one of its own),
     # finds the balloon not ready, binds the console, and refuses the SCSI
     # device's decline (its probe kept the resources); offered again, the

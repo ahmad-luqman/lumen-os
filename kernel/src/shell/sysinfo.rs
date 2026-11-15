@@ -66,14 +66,27 @@ pub type MakeTable = fn() -> pipe::Table;
 
 /// The system commands that give records in a pipeline (instead of their
 /// text), and the tables they give.
-pub const RECORDS: [(&str, MakeTable); 5] =
-    [("cpus", cpu_table), ("irqs", vector_table), ("lspci", pci_table), ("mem", mem_table), ("threads", thread_table)];
+pub const RECORDS: [(&str, MakeTable); 6] = [
+    ("cpus", cpu_table),
+    ("irqs", vector_table),
+    ("lspci", pci_table),
+    ("mem", mem_table),
+    ("sound", crate::sound::table),
+    ("threads", thread_table),
+];
 
 /// A line for the console when `name`'s records come with a caveat the
-/// table can't carry: `lspci`'s, when PCI devices are missing.
+/// table can't carry: `lspci`'s when PCI devices are missing, `sound`'s
+/// when there is no sound device.
 pub fn records_note(name: &str) -> Option<String> {
-    let status = crate::pci::status();
-    (name == "lspci" && !status.is_clean()).then(|| alloc::format!("lspci: {}", status.note()))
+    match name {
+        "lspci" => {
+            let status = crate::pci::status();
+            (!status.is_clean()).then(|| alloc::format!("lspci: {}", status.note()))
+        }
+        "sound" => crate::sound::records_note(),
+        _ => None,
+    }
 }
 
 /// The records `name` gives in a pipeline, if it is one of [`RECORDS`].
@@ -630,7 +643,9 @@ crate::ktest!(
         for (name, table) in RECORDS {
             let rows = table().rows().len();
             crate::ktest::diag(format_args!("{name}: {rows} rows"));
-            kassert!(rows > 0);
+            // (`sound` has a row only with a device, and the ktest machine
+            // has none: `sound::the_record_fits_its_columns` checks one.)
+            kassert!(rows > 0 || name == "sound");
         }
         kassert!(records("dmesg").is_none());
         let inputs = crate::interrupts::inputs();

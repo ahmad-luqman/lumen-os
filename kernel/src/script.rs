@@ -3,8 +3,9 @@
 //! M6 brings files).
 //!
 //! Scripts see the machine through a few functions ([`FUNCTIONS`]): `cpus()`,
-//! `mem()`, `uptime()`, `trace(n)`, `sleep(ms)`, `random([n])`, `print`,
-//! `debug`, and
+//! `mem()`, `uptime()`, `trace(n)`, `sleep(ms)`, `random([n])`, `beep()` /
+//! `beep(hz, ms)` (returns while it plays; it cuts off one still playing at
+//! its next period, and drops one still waiting), `print`, `debug`, and
 //! drawing (`draw_pixel`, `draw_rect`, `draw_text`, `clear`) on the
 //! terminal's [`Canvas`], taken on the first draw (`screen_width()` and
 //! `screen_height()` don't take it). A script that drew and ended without
@@ -354,6 +355,8 @@ pub const FUNCTIONS: &[&str] = &[
     "trace(n)",
     "sleep(ms)",
     "random([n])",
+    "beep()",
+    "beep(hz, ms)",
     "print(x)",
     "debug(x)",
     "draw_pixel(x, y, rgb)",
@@ -674,6 +677,8 @@ fn engine(state: &Rc<State>) -> Engine {
     e.register_fn("random", random_below);
     let s = state.clone();
     e.register_fn("sleep", move |ms: i64| sleep(&s, ms));
+    e.register_fn("beep", || beep(i64::from(crate::sound::DEFAULT_BEEP_HZ), i64::from(crate::sound::DEFAULT_BEEP_MS)));
+    e.register_fn("beep", beep);
 
     let s = state.clone();
     e.register_fn("draw_pixel", move |x: i64, y: i64, c: i64| {
@@ -754,6 +759,21 @@ fn sleep(state: &State, ms: i64) -> Result<(), Box<EvalAltResult>> {
         }
         crate::time::sleep((end - now).min(state.limits.poll_ns.max(1_000_000)));
     }
+}
+
+/// `beep(hz, ms)` (or `beep()`: 440 Hz for 200 ms): starts the beep and
+/// returns while it plays (cutting off one still playing at its next
+/// period); an error without a sound device.
+fn beep(hz: i64, ms: i64) -> Result<(), Box<EvalAltResult>> {
+    let max = crate::sound::MAX_BEEP_MS;
+    let Ok(hz) = u32::try_from(hz) else {
+        return Err(format!("beep: {hz} Hz is out of range (0 to {})", u32::MAX).into());
+    };
+    let ms = match u32::try_from(ms) {
+        Ok(ms) if ms <= max => ms,
+        _ => return Err(format!("beep: {ms} ms is out of range (0 to {max})").into()),
+    };
+    crate::sound::beep(hz, ms).map(drop).map_err(|e| format!("beep: {e}").into())
 }
 
 /// A size in bytes, as MiB or KiB when it is a whole number of them.
@@ -907,6 +927,8 @@ struct Functions;
 impl Complete for Functions {
     fn options(&self, _: &[String], out: &mut Vec<String>) {
         out.extend(FUNCTIONS.iter().map(|f| f.split('(').next().unwrap_or(f).to_string()));
+        // (`beep()` and `beep(hz, ms)` are one name.)
+        out.dedup();
     }
 }
 

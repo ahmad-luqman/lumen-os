@@ -34,8 +34,10 @@ pub struct Driver {
 }
 
 /// Every driver, in the order they are offered a function.
-pub static DRIVERS: &[Driver] =
-    &[Driver { name: crate::rng::DRIVER, matches: crate::rng::matches, probe: crate::rng::probe }];
+pub static DRIVERS: &[Driver] = &[
+    Driver { name: crate::rng::DRIVER, matches: crate::rng::matches, probe: crate::rng::probe },
+    crate::sound::DRIVER,
+];
 
 static PROBED: AtomicBool = AtomicBool::new(false);
 
