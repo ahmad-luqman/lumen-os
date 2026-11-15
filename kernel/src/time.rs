@@ -955,18 +955,20 @@ crate::ktest!(
 
 crate::ktest!(
     fn an_hpet_reading_is_placed_at_its_brackets_midpoint() {
-        // A reading paused 2 ms before and 2 ms after its HPET read (a 4 ms
-        // bracket) is placed at its midpoint, where the HPET was read: by
-        // the HPET and by the placed `now_ns` it is as far from a narrow
-        // reference reading, to well under 1 ms (half the pause). Reading
-        // the HPET outside the bracket, or placing the reading at either end
-        // of it, puts it 2 ms off. A paused reading wider than 4 ms plus
-        // HPET_BRACKET_NS had a natural stall in a pause too (which could
-        // move the read off the midpoint by up to half that) and is taken
-        // again.
+        // A reading paused 5 ms before and 5 ms after its HPET read (a 10 ms
+        // bracket) is placed at its midpoint, where the HPET was read: from
+        // a narrow reference reading, the placed `now_ns` and the HPET agree
+        // to under 2.5 ms (half the pause). Reading the HPET outside the
+        // bracket, or placing the reading at either end of it, puts it 5 ms
+        // off. A try is judged only if its own uncertainty is at most a
+        // quarter of the pause: half the reference's width, plus half of
+        // what a natural stall added to the paused bracket (over 10 ms),
+        // which can move the read off its midpoint by that much. So a right
+        // placement is at most 1.25 ms off and a wrong one at least 3.75 ms;
+        // a try over that is taken again (a loaded host stalls a 5 ms spin).
         use crate::kassert;
-        const PAUSE_NS: u64 = 2_000_000;
-        const TRIES: usize = 5;
+        const PAUSE_NS: u64 = 5_000_000;
+        const TRIES: usize = 8;
         let hpet = hpet().ok_or("no HPET")?;
         let reference = narrow_hpet_reading(&hpet, START_READING, |_| {});
         let reference = reference.reading.ok_or("no narrow reference reading")?;
@@ -974,7 +976,8 @@ crate::ktest!(
         for tried in 0..TRIES {
             let paused = hpet_between_now_ns(&hpet, END_READING, |_| spin(PAUSE_NS));
             widths_ns[tried] = paused.width;
-            if paused.width > 2 * PAUSE_NS + HPET_BRACKET_NS {
+            let stalled_ns = paused.width.saturating_sub(2 * PAUSE_NS);
+            if (reference.width + stalled_ns) * 2 > PAUSE_NS {
                 continue;
             }
             let by_now_ns = paused.at - reference.at;
@@ -991,7 +994,9 @@ crate::ktest!(
             return Ok(());
         }
         crate::ktest::diag(format_args!(
-            "injected pause: every paused reading had a natural stall too: brackets {widths_ns:?} ns"
+            "injected pause: every paused reading had a natural stall too: brackets {widths_ns:?} ns, the \
+             reference's {} ns",
+            reference.width
         ));
         Err("every paused HPET reading was stalled as well")
     }
@@ -1187,18 +1192,22 @@ crate::ktest!(
 
 crate::ktest!(
     fn a_timer_reading_is_placed_at_its_brackets_midpoint() {
-        // A timer reading paused 300 µs before and 300 µs after its count is
-        // read (a 600 µs bracket) is placed at its midpoint, where the timer
-        // was read: from a narrow reference reading, the HPET midpoints and
-        // the timer's count (at its calibrated rate) agree to well under
-        // 150 µs (half the pause). Reading the timer outside its bracket
-        // puts it 300 µs off. A reference over HPET_BRACKET_NS wide, a paused
-        // reading over 600 µs plus that (a natural stall in a pause too), or
-        // the two more than 950 µs apart (the timer may have reloaded twice)
-        // are taken again.
+        // A timer reading paused 400 µs before and 400 µs after its count is
+        // read (an 800 µs bracket) is placed at its midpoint, where the timer
+        // was read: from a reference reading, the HPET midpoints and the
+        // timer's count (at its calibrated rate) agree to under 200 µs (half
+        // the pause). Reading the timer outside its bracket, or placing it at
+        // either end, puts it 400 µs off. As for the HPET's placement test, a
+        // try is judged only if its uncertainty (half the reference's width,
+        // plus half of what a natural stall added to the paused bracket) is
+        // at most a quarter of the pause, so a right placement is at most
+        // 100 µs off and a wrong one at least 300 µs. The two readings must
+        // also be under 950 µs apart: the timer reloads every 1 ms, and its
+        // count says nothing about how many reloads passed. Other tries are
+        // taken again.
         use crate::kassert;
-        const PAUSE_NS: u64 = 300_000;
-        const TRIES: usize = 5;
+        const PAUSE_NS: u64 = 400_000;
+        const TRIES: usize = 8;
         let (_, _, initial) = apic::timer_registers();
         let timer = lapic_timer().ok_or("timer not calibrated")?;
         let hpet = hpet().ok_or("no HPET")?;
@@ -1209,11 +1218,10 @@ crate::ktest!(
             let reference = timer_between_hpet(&hpet, || {});
             let paused = timer_between_hpet(&hpet, || spin(PAUSE_NS));
             let by_hpet_ns = clock.ns(hpet.since(reference.at, paused.at));
-            tried_ns[tried] = (clock.ns(reference.width), clock.ns(paused.width));
-            if tried_ns[tried].0 > HPET_BRACKET_NS
-                || tried_ns[tried].1 > 2 * PAUSE_NS + HPET_BRACKET_NS
-                || by_hpet_ns >= 950_000
-            {
+            let (reference_ns, paused_ns) = (clock.ns(reference.width), clock.ns(paused.width));
+            tried_ns[tried] = (reference_ns, paused_ns);
+            let stalled_ns = paused_ns.saturating_sub(2 * PAUSE_NS);
+            if (reference_ns + stalled_ns) * 2 > PAUSE_NS || by_hpet_ns >= 950_000 {
                 continue;
             }
             let counted = lumen_time::down_counter_delta(reference.value, paused.value, initial);
