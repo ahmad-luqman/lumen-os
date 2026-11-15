@@ -1,6 +1,6 @@
 """Sound: virtio-sound, `beep`, `play`, `volume` and `sound` (#99).
 
-Each test boots with virtio-sound recorded through QEMU's wav audiodev
+Most tests boot with virtio-sound recorded through QEMU's wav audiodev
 (`Devices(sound=True)`) unless it is about having none, plays something
 from the serial shell, waits until `sound`'s record says it has been played,
 then quits QEMU (so the wav is complete) and measures what came out with
@@ -76,6 +76,19 @@ def recording(m: Machine) -> audio.Wav:
     return audio.read_wav(m.wav_path)
 
 
+def assert_pitch(freq: float | None, want: float) -> None:
+    """`freq` is `want` within 1%."""
+    assert freq is not None and abs(freq - want) <= want * 0.01, (freq, want)
+
+
+def loudness_ratio(wav: audio.Wav, loud_hz: float, quiet_hz: float) -> float:
+    """How much louder the recording is at `loud_hz` than at `quiet_hz`."""
+    samples = wav.first_channel
+    return audio.tone_amplitude(samples, wav.rate, loud_hz) / audio.tone_amplitude(
+        samples, wav.rate, quiet_hz
+    )
+
+
 def sounding(samples: list[int] | tuple[int, ...], level: int = 200) -> tuple[int, int]:
     """The first and last sample louder than `level`."""
     loud = [i for i, s in enumerate(samples) if abs(s) > level]
@@ -88,14 +101,13 @@ def test_tone_is_captured(boot):
     rate = rate_of(m)
     assert run(m, "beep 440 500") == ""
     row = wait_played(m, 1)
-    # Exactly 500 ms of frames went to the device (the last period's
-    # padding isn't counted), with no underrun.
+    # Exactly 500 ms of frames went to the device (25 whole periods, no
+    # padding), with no underrun.
     assert int(row["frames"]) == rate // 2, row
     assert row["underruns"] == "0", row
     wav = recording(m)
     samples = wav.first_channel
-    freq = audio.dominant_frequency(samples, wav.rate)
-    assert freq is not None and abs(freq - 440) <= 4.4, freq
+    assert_pitch(audio.dominant_frequency(samples, wav.rate), 440)
     first, last = sounding(samples)
     assert 0.45 <= (last - first) / wav.rate <= 0.55, (first, last, wav.rate)
 
@@ -142,7 +154,7 @@ def test_melody_notes_in_order(boot):
     expected = [523.25, 659.26, 783.99, 1046.50]
     assert len(notes) == len(expected), notes
     for got, want in zip(notes, expected, strict=True):
-        assert abs(got - want) <= want * 0.01, (notes, expected)
+        assert_pitch(got, want)
     # Each quarter note at tempo 120 lasts 500 ms.
     assert 1.9 <= (last - first) / wav.rate <= 2.1, (first, last)
 
@@ -176,7 +188,17 @@ def test_a_newer_sound_replaces_the_one_playing(boot):
     windows = audio.window_frequencies(wav.first_channel, wav.rate, 0.1)
     pitches = [f for f in windows if f is not None]
     assert pitches, windows
-    assert abs(pitches[0] - 440) <= 4.4 and abs(pitches[-1] - 660) <= 6.6, pitches
+    assert_pitch(pitches[0], 440)
+    assert_pitch(pitches[-1], 660)
+
+
+def test_a_sound_that_has_made_its_samples_plays_out(boot):
+    # The first beep (150 ms, under the 160 ms queued) has made all its
+    # samples when the second arrives 30 ms later: both play in full.
+    m = shell(boot)
+    assert run(m, 'rhai -e "beep(440, 150); sleep(30); beep(660, 150)"') == ""
+    row = wait_played(m, 2)
+    assert (row["played"], row["replaced"]) == ("2", "0"), row
 
 
 def test_play_says_when_a_newer_sound_cut_it_off(boot):
@@ -205,11 +227,7 @@ def test_volume_and_beep_from_rhai(boot):
     row = wait_played(m, 2)
     assert row["volume"] == "25%", row
     assert run(m, "volume 101").startswith("usage: volume [percent]")
-    wav = recording(m)
-    samples = wav.first_channel
-    loud = audio.tone_amplitude(samples, wav.rate, 440)
-    quiet = audio.tone_amplitude(samples, wav.rate, 660)
-    assert 3.0 <= loud / quiet <= 5.0, (loud, quiet)
+    assert 3.0 <= loudness_ratio(recording(m), 440, 660) <= 5.0
 
 
 def test_play_honours_the_volume(boot):
@@ -219,11 +237,7 @@ def test_play_honours_the_volume(boot):
     run(m, "volume 25")
     assert run(m, "play w=square E5/4", timeout=30) == ""
     wait_played(m, 2)
-    wav = recording(m)
-    samples = wav.first_channel
-    loud = audio.tone_amplitude(samples, wav.rate, 440)
-    quiet = audio.tone_amplitude(samples, wav.rate, 659.26)
-    assert 3.0 <= loud / quiet <= 5.0, (loud, quiet)
+    assert 3.0 <= loudness_ratio(recording(m), 440, 659.26) <= 5.0
 
 
 def test_lspci_shows_sound_bound(boot):
@@ -264,8 +278,7 @@ def test_a_second_sound_device_is_declined(boot, tmp_path):
     assert run(m, "beep 440 300") == ""
     wait_played(m, 1)
     wav = recording(m)
-    freq = audio.dominant_frequency(wav.first_channel, wav.rate)
-    assert freq is not None and abs(freq - 440) <= 4.4, freq
+    assert_pitch(audio.dominant_frequency(wav.first_channel, wav.rate), 440)
 
 
 def test_no_sound_device_message(boot):
@@ -282,6 +295,24 @@ def test_no_sound_device_message(boot):
     assert run(m, "play").startswith("usage: play")
 
 
+def test_rhai_beep_defaults_and_ranges(boot):
+    # `beep()` is 440 Hz for 200 ms; out-of-range arguments are refused.
+    m = shell(boot)
+    rate = rate_of(m)
+    assert run(m, 'rhai -e "beep()"') == ""
+    row = wait_played(m, 1)
+    assert int(row["frames"]) == rate // 5, row
+    assert run(m, 'rhai -e "beep(-1, 10)"') == (
+        "rhai: Runtime error: beep: -1 Hz is out of range (0 to 4294967295) (line 1, position 1)\n"
+    )
+    assert run(m, 'rhai -e "beep(440, 60001)"') == (
+        "rhai: Runtime error: beep: 60001 ms is out of range (0 to 60000) (line 1, position 1)\n"
+    )
+    assert run(m, "beep a b c").startswith("usage: beep")
+    assert run(m, "beep 440 100 3").startswith("usage: beep")
+    assert sound_row(m)["played"] == "1"
+
+
 @pytest.mark.parametrize(
     ("line", "said"),
     [
@@ -289,11 +320,14 @@ def test_no_sound_device_message(boot):
         ("play C9/4", "play: octave at 1 is out of range (0-8, C0 lowest)\n"),
         (
             "beep 30000 100",
-            "beep: 30000.000 Hz is too high for a 44100 Hz sample rate (it must be below half)\n",
+            "beep: 30000.000 Hz is too high for a {rate} Hz sample rate (it must be below half)\n",
         ),
     ],
 )
 def test_bad_sounds_are_refused(boot, line, said):
     m = shell(boot)
-    assert run(m, line) == said
-    assert sound_row(m)["played"] == "0"
+    assert run(m, line) == said.format(rate=rate_of(m))
+    # Nothing plays, even a moment later.
+    time.sleep(1)
+    row = sound_row(m)
+    assert (row["state"], row["played"], row["frames"]) == ("idle", "0", "0"), row

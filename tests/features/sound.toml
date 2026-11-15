@@ -29,7 +29,7 @@ tests = [
 ]
 
 [[feature]]
-name = "virtio-sound driver: binds QEMU's sound device (`lspci` shows `sound: bound`) and picks its first output stream's format (signed 16-bit, stereo else mono, 44.1 kHz else 48 kHz else a lower then a higher rate), refusing a stream without 16-bit samples, without 1 or 2 channels or without a rate it plays, saying which (`unusable device: its first output stream lacks ...`); `sound` shows the device, its format and its record (state, sounds played and replaced, frames, underruns, volume), which `where` filters in a pipeline; a second sound device is declined (`no driver (sound declined it)`: the player is one), and a beep still plays on the first; a failed device (and one stuck in a control request) refuses sounds with the reason, in `sound`'s state too, and a source made at another rate is refused"
+name = "virtio-sound driver: binds QEMU's sound device (`lspci` shows `sound: bound`) and picks its first output stream's format (signed 16-bit, stereo else mono, 44.1 kHz else 48 kHz else a lower then a higher rate), refusing a stream without 16-bit samples, without 1 or 2 channels or without a rate it plays, saying which (`unusable device: its first output stream lacks ...`); `sound` shows the device, its format and its record (state, sounds played and replaced, frames, underruns, volume), which `where` filters in a pipeline; a second sound device is declined (`no driver (sound declined it)`: the player is one), and a beep still plays on the first. With a made-up device (ktest): a failed device refuses sounds with its reason (also in `sound`'s state); a thread playing with no answer for 5 s is given up for good (`stuck in a control request`, or the status when it shows DEVICE_NEEDS_RESET); a device whose status shows it broken while idle refuses the next sound at once; a failure counts what the sound played and fails the sound waiting; a sound waiting is dropped by a newer one (counted as replaced) or kept from starting by `stop`; a source at another rate is refused; periods returned in under half a sound's length (1 s or more) are caught"
 milestone = "M3"
 tests = [
     "scenario:test_sound::test_lspci_shows_sound_bound",
@@ -37,10 +37,11 @@ tests = [
     "ktest:lumen_kernel::sound::formats_are_chosen_from_what_the_stream_supports",
     "ktest:lumen_kernel::sound::the_record_fits_its_columns",
     "ktest:lumen_kernel::sound::a_failed_or_stuck_device_refuses_sounds",
+    "ktest:lumen_kernel::sound::the_pace_check_catches_periods_returned_unplayed",
 ]
 
 [[feature]]
-name = "`beep 440 500` plays a 440 Hz tone (within 1%) lasting 500 ms (within 10%) into QEMU's wav audiodev, and returns while it plays (`sound` says `playing` right after); exactly the tone's frames are handed to the device, also when its last period is padded with silence (510 ms), with no underrun reported, also over a 10 s tone (500 periods)"
+name = "`beep 440 500` plays a 440 Hz tone (within 1%) lasting 500 ms (within 10%) into QEMU's wav audiodev, and returns while it plays (`sound` says `playing` right after); the frames handed to the device are exactly the tone's (a last period's padding not counted: 510 ms), with no underrun reported, also over a 10 s tone (500 periods)"
 milestone = "M3"
 tests = [
     "scenario:test_sound::test_tone_is_captured",
@@ -50,22 +51,24 @@ tests = [
 ]
 
 [[feature]]
-name = "`play` plays a melody's notes in order at their pitch (within 1%) and tempo (four quarter notes at 120 in 2 s, within 5%), returning once it has played (`sound` idle with it counted); `q` or Ctrl-C stops it within about a second plus the queued periods (`play: stopped`); a newer sound replaces the one playing (440 Hz then 660 Hz in the recording; counted as replaced) and a `play` cut off says `play: interrupted by a newer sound`; a melody that doesn't parse, or a `beep` the sample rate can't carry, is refused with the reason and nothing plays"
+name = "`play` plays a melody's notes in order at their pitch (within 1%) and tempo (four quarter notes at 120 in 2 s, within 5%), returning once it has played (`sound` idle with it counted); `q` or Ctrl-C after 1 s stops a 16 s melody with under 3 s of it played (`play: stopped`); a newer sound cuts the playing one off (440 Hz then 660 Hz in the recording; counted as replaced) and a `play` cut off says `play: interrupted by a newer sound`, while a sound that has made all its samples plays out (two short rhai beeps 30 ms apart both play); a melody that doesn't parse, or a `beep` the sample rate can't carry, is refused with the reason and nothing plays"
 milestone = "M3"
 tests = [
     "scenario:test_sound::test_melody_notes_in_order",
     "scenario:test_sound::test_play_stops_on_a_key[*]",
     "scenario:test_sound::test_a_newer_sound_replaces_the_one_playing",
     "scenario:test_sound::test_play_says_when_a_newer_sound_cut_it_off",
+    "scenario:test_sound::test_a_sound_that_has_made_its_samples_plays_out",
     "scenario:test_sound::test_bad_sounds_are_refused[*]",
 ]
 
 [[feature]]
-name = "`volume` shows and sets the volume new sounds get (0-100, with or without `%`; more refused): a beep, or a melody's note, at 25% is about a quarter as loud as at 100%; `beep(hz, ms)` plays from a rhai script"
+name = "`volume` shows and sets the volume new sounds get (0-100, with or without `%`; more refused): a beep, or a melody's note, at 25% is about a quarter as loud as at 100%; rhai's `beep(hz, ms)` plays, `beep()` is 440 Hz for 200 ms, and out-of-range arguments are refused; `beep` with more than two arguments or a non-number is a usage error"
 milestone = "M3"
 tests = [
     "scenario:test_sound::test_volume_and_beep_from_rhai",
     "scenario:test_sound::test_play_honours_the_volume",
+    "scenario:test_sound::test_rhai_beep_defaults_and_ranges",
 ]
 
 [[feature]]

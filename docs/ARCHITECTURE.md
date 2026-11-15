@@ -1350,9 +1350,10 @@ section 2).
   `mem()` (`heap_size`, `heap_used`, `heap_free`, `heap_live`),
   `uptime()` (ms since the boot timeline's origin), `trace(n)` (the last n
   events of this CPU's ring, the boot CPU's, where both shells run; gap
-  lines included), `sleep(ms)` (clamped to 0 to 60 s), `beep([hz, ms])`
-  (440 Hz for 200 ms by default; returns while it plays, so beeps without a
-  pause between them replace each other; an error without a sound device),
+  lines included), `sleep(ms)` (clamped to 0 to 60 s), `beep()` /
+  `beep(hz, ms)` (440 Hz for 200 ms by default; returns while it plays,
+  cutting off one still playing at its next period and dropping one still
+  waiting; an error without a sound device or out of range),
   `print` and `debug` (to the console), and drawing on the terminal's canvas:
   `draw_pixel(x, y, rgb)` (nothing off the canvas), `draw_rect(x, y, w, h,
   rgb)` (clipped), `draw_text(x, y, text, rgb[, bg])` (text starting above
@@ -1440,11 +1441,11 @@ section 2).
 - **Not yet:** scripts from files (M6), floats, capturing closures,
   scripts in user mode (M9), a script running in the background.
 
-## 7. Driver interface (M3: PCI discovery, claiming and the virtio adapter built; MSI-X planned; device classes later)
+## 7. Driver interface (M3: PCI discovery, claiming, the virtio adapter and sound built; MSI-X planned; device classes later)
 
-PCI discovery (#94), claiming and the virtio adapter (#95) are built; MSI-X
-is planned (#96), with the tests it lists. The first drivers (#97-#99) add
-their rows to the driver table.
+PCI discovery (#94), claiming and the virtio adapter (#95) are built, and so
+is the sound driver (#99); MSI-X is planned (#96), with the tests it lists.
+The other first drivers (#97, #98) add their rows to the driver table.
 
 M3 lays the layer drivers stand on: finding PCI devices (#94), handing a
 driver exactly its device's resources and running `virtio-drivers` on top
@@ -1607,6 +1608,13 @@ pub struct Driver {
     earlier themselves.
   - `<driver>: failed: <reason>`, a warning, with bus mastering turned off
     so the device can't reach memory its driver dropped.
+  - A driver that gives its device up after binding (it already dropped or
+    reset it) calls `pci::failed_after_bind(addr, driver, why) -> bool`:
+    the binding becomes `<driver>: failed: <why>` and bus mastering is
+    turned off (a warning if its `DeviceResources` are still live). It
+    changes nothing and returns false unless the function is bound to that
+    driver (already failed, still probing, or someone else's). Sound does
+    so when its device fails while playing, or is given up.
   - Declined (`ProbeError::NotMine`: virtio's keyboard and tablet share an
     id and are told apart only by their configuration): the function is
     freed, its command register restored, and the next matching row is
@@ -1632,10 +1640,11 @@ pub struct Driver {
 - **A virtio driver's probe** calls `virtio::transport(res)` from the probe
   itself (runs and the status handle are charged to the running probe
   attempt), may decline the device (above), then calls the crate's device
-  constructor and keeps the device. Its side effects (a thread started,
-  state published for commands) come after its last check that can fail,
-  so `probe_all`'s readiness check after an `Ok` can't fail with a thread
-  already running.
+  constructor and keeps the device. A probe's side effects (threads,
+  published state) come after its last fallible check, and a driver must
+  not depend on its device staying bound until `probe_all` has recorded
+  the outcome (its readiness check after an `Ok` shouldn't fail with a
+  thread already running).
 - **Blocking and locks.** A driver keeps its device in its own state (a
   `SpinLock` static), holds the lock (interrupts off) only for one
   operation, and waits outside it, with a bound, where the crate allows
@@ -1646,9 +1655,8 @@ pub struct Driver {
   and every sound control request (`pcm_set_params`, `pcm_prepare`,
   `pcm_start`, `pcm_stop`, `pcm_release`, and `set_up`'s info queries,
   which the first `pcm_xfer_nb` also reaches) use the crate's
-  `add_notify_wait_pop`, an unbounded spin. So (planned with those
-  drivers):
-  - rng (#97) drives its own `virtio_drivers::queue::VirtQueue` (public:
+  `add_notify_wait_pop`, an unbounded spin. So:
+  - rng (#97, planned) drives its own `virtio_drivers::queue::VirtQueue` (public:
     `add`, `pop_used`) over `VirtioTransport`, with a bounded wait;
   - sound's (#99) control requests are a known unbounded wait: the stream
     is set up once in the probe, and each sound's prepare, start, stop and
@@ -1796,10 +1804,9 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
     not outstanding (not a stale free after the frames were handed out
     again at the same address). 256 comes from the counts: input 36 (32
     posted events and its rings) plus sound 40 idle (rings and its event
-    queue) plus rng about 3 is about 79 at boot; with sound's 96
-    runs in flight (its whole tx queue, 3 runs a period) and 3 for a control
-    request, about 178 while it streams. The sound driver keeps 8 periods
-    in flight: 24 runs.
+    queue) plus rng about 3 is about 79 at boot; up to about 178 with
+    sound's whole tx queue in flight (96 runs, 3 a period) and 3 for a
+    control request; Lumen keeps 8 periods (24 runs): about 106.
   - `dma_alloc`: an `OwnedRun`, zeroed through the HHDM, returned as
     (physical, HHDM address); 0 pages, a full table (checked before
     allocating) or no contiguous run free returns `(0,
@@ -1874,48 +1881,56 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
   it, so no lock is held across a device wait. Only the first output
   stream is considered.
 - **Requests.** `sound::play(Box<dyn Source + Send>) -> Result<Sound,
-  SoundError>` checks the device and the source's rate (it must be the
-  device's: `SoundError::WrongRate`) and puts the sound in a `SpinLock`ed
-  slot in one critical section, wakes the thread (a `WaitQueue`) and
-  returns a `Sound` (its `SoundId`, a `NonZeroU64` only the player makes,
-  and a cell its `Outcome` lands in: `Played`, `Stopped`, `Replaced` or
-  `Failed(why)`, so the outcome is never lost to later sounds). A newer
-  sound replaces the one playing (faded out by `Source::stop`) and one
-  still waiting to start: consecutive `beep`s without a pause replace
-  each other. `sound::stop(&sound)` fades a sound out (the periods already
-  queued still play) or keeps it from starting. `beep` returns at once;
-  `play` checks its sound's outcome and the keys every 20 ms (`q` or
-  Ctrl-C stops it) and says `play: stopped`, `play: interrupted by a newer
-  sound` or why the device failed. Sounds are made at the device's rate
-  (`sound::format()`) and take the volume when they are made.
+  SoundError>` checks the device (its state, and while idle its status
+  register) and the source's rate (it must be the device's:
+  `SoundError::WrongRate`) and puts the sound in the player's `next` in
+  one critical section, wakes the thread (a `WaitQueue`) and returns a
+  `Sound` (a private id and a cell its `Outcome` lands in: `Played`,
+  `Stopped`, `Replaced` or `Failed(why)`, so the outcome is never lost to
+  later sounds). A newer sound cuts the playing one off at its next
+  period (up to 160 ms already queued still plays; a sound that has made
+  all its samples plays out); a sound still waiting is dropped.
+  `sound::stop(&sound)` fades a sound out (the periods already queued
+  still play) or keeps it from starting. `beep` returns at once; `play`
+  checks its sound's outcome and the keys every 20 ms (`q` or Ctrl-C
+  stops it; other keys are discarded) and says `play: stopped`, `play:
+  interrupted by a newer sound` or why the device failed. Sounds are made
+  at the device's rate (`sound::format()`) and take the volume when they
+  are made.
 - **Paced by the device.** For each sound the thread checks the device is
   ready, prepares and starts the stream, keeps up to 8 periods queued
-  (`pcm_xfer_nb`) and queues another each time `pcm_xfer_ok` takes one
-  back (QEMU returns a period once its audio backend has consumed it), so
-  the sound plays without gaps as long as the thread is back within
-  160 ms. Between looks at the oldest period it sleeps 1 ms
-  (`sleep_until`, at most 2 s a period, ending on `DEVICE_NEEDS_RESET` or
-  `FAILED`). When the source has ended (its last period padded with
-  silence) and the queue has drained, it stops and releases the stream. A
-  queue found empty before the end counts as an underrun (a warning per
-  sound; `sound` counts them).
-- **Failure.** A wait that gives up, a request the device refuses (named
-  in the reason), or a sound of 1 s or more whose periods all came back in
-  less than half its length (the crate's `pcm_xfer_ok` doesn't read a
-  period's status reply, so a refused period counts as played: this
-  catches a device refusing them all) ends the thread and drops the
-  device (resetting it; runs still posted leak): `sound` shows `failed:
-  <reason>`, and `beep` and `play` say the device failed. A control
-  request around a sound (prepare, start, stop, release) that never
-  completes spins forever (the crate's limit) and wedges the thread:
-  after 5 s playing without an answer from the device the player reads as
-  failed (`stuck in a control request; reboot to retry`), `play` gives up
-  waiting, and a stopped `play` gives up after the release, the queued
-  periods and one period's wait (`play: the sound device isn't
-  responding`). Nothing re-initialises the device. Without a sound device
-  they say `no sound device` (with the function's binding if one was
-  found but not bound). Underrun and overrun events on the device's event
-  queue aren't read.
+  (`pcm_xfer_nb`) and queues another each time the device returns one
+  (`pcm_xfer_ok` takes it back; QEMU returns a period once its audio
+  backend has consumed it), so the sound plays without gaps as long as
+  the thread is back within 160 ms. Between looks at the oldest period it
+  sleeps 1 ms (`sleep_until`, at most 2 s a period, ending on
+  `DEVICE_NEEDS_RESET` or `FAILED`). When the source has ended (its last
+  period padded with silence) and the queue has drained, it stops and
+  releases the stream. A queue found empty before the end counts as an
+  underrun (a warning per sound; `sound` counts them).
+- **Failure.** The thread gives the device up (drops it, resetting it;
+  runs still posted leak; then `pci::failed_after_bind`, so `lspci` shows
+  `sound: failed: <why>`) when the device isn't ready before a sound
+  (`checking the device before a sound: status ...`), a wait gives up, a
+  request the device refuses (named in the reason), or a sound of 1 s or
+  more whose periods all came back in under half its length (the crate's
+  `pcm_xfer_ok` doesn't read a period's status reply, so a refused period
+  counts as played: this catches a device refusing them all). `sound`
+  then shows `failed: <reason>`, and `beep` and `play` say the device
+  failed. A control request around a sound (prepare, start, stop,
+  release) that never completes spins forever (the crate's limit) and
+  wedges the thread: after 5 s playing without an answer from the device
+  the player is given up for good (a warning; the reason gives the
+  device's status if it shows `DEVICE_NEEDS_RESET` or `FAILED`, else `no
+  answer from the device for N s`; `lspci` shows it failed), `play` stops
+  its sound and returns, and a thread that comes back drops the device. A
+  device whose status shows it broken while idle is given up by the next
+  sound or `sound`. Nothing re-initialises the device. Without a sound
+  device they say `no sound device` (with the function's binding if one
+  was found but not bound). Underrun and overrun events on the device's
+  event queue aren't read. The crate itself warns, on every boot with a
+  sound device, that it got no jack and no channel map infos (QEMU's
+  device has none); left as it is.
 - **#96** replaces the 1 ms sleeps with a wait woken by the device's MSI-X
   interrupt.
 
@@ -2270,6 +2285,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/acpi.rs      ACPI discovery (MADT, HPET, MCFG, FADT and the DSDT's _S5_) through lumen-acpi
   src/pci.rs       PCI discovery over ECAM (lumen-pci): pci::devices, the registry (BARs, claims), pci::claim, DeviceResources
   src/drivers.rs   the driver table and probe_all
+  src/sound.rs     the virtio-sound driver (its thread owns the device), beep, play, volume, sound
   src/virtio.rs    the adapter for virtio-drivers: the Hal (DMA runs, bounce buffers), transport, VirtioTransport
   src/power.rs     reboot (0xCF9, 8042, triple fault) and ACPI S5 power-off
   src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs, routing ISA IRQs

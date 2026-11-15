@@ -224,7 +224,7 @@ DEVICE_IDS = {
 
 def host_audio_driver(platform: str, env: Mapping[str, str]) -> str:
     """The QEMU audio driver `make run SOUND=1` plays through: `LUMEN_AUDIO`
-    if set (e.g. `alsa`, `pipewire`, `sdl`), else Core Audio on macOS and
+    if set and non-empty (e.g. `alsa`, `pipewire`, `sdl`), else Core Audio on macOS and
     PulseAudio elsewhere (PipeWire serves it too)."""
     return env.get("LUMEN_AUDIO") or ("coreaudio" if platform == "darwin" else "pa")
 
@@ -259,9 +259,9 @@ def device_args(o: QemuOptions) -> list[str]:
         # length from the file size, once QEMU has exited.
         audiodev = ("wav", f",path={_opt(o.sound_wav)}")
     if audiodev:
-        # `streams=1`: the output stream only. The wav backend has no capture
-        # side (QEMU warns about the input stream otherwise), and playback is
-        # all we need.
+        # `streams=1`: the output stream only, on either audiodev. The wav
+        # backend has no capture side (QEMU warns about the input stream
+        # otherwise), and playback is all Lumen does.
         driver, options = audiodev
         args += [
             "-audiodev", f"{driver},id=lumen-audio{options}",

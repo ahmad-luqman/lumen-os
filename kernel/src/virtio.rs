@@ -441,7 +441,7 @@ impl fmt::Display for ProbeError {
 }
 
 /// Why a status byte after setup isn't ready, for messages.
-fn not_ready_why(status: u8) -> &'static str {
+pub fn not_ready_why(status: u8) -> &'static str {
     let s = bits(status);
     if status == 0xff {
         "all ones, the device is gone or not decoding"
@@ -726,6 +726,13 @@ impl fmt::Display for WaitError {
 }
 
 impl StatusHandle {
+    /// Ktests: a handle reading `byte` instead of a device's register (a
+    /// made-up device whose status the test sets).
+    #[cfg(feature = "ktest")]
+    pub fn ktest_reading(byte: &'static core::sync::atomic::AtomicU8) -> StatusHandle {
+        StatusHandle { reg: NonNull::from(byte).cast() }
+    }
+
     /// The raw status byte.
     pub fn raw(&self) -> u8 {
         // SAFETY: the register is in a BAR mapped uncached for the kernel's

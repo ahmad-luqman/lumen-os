@@ -27,10 +27,12 @@ def cmd_run(a: argparse.Namespace) -> int:
     print("+", " ".join(args), file=sys.stderr)
     print("(serial is attached here; Ctrl-A x quits QEMU)", file=sys.stderr)
     rc = subprocess.call(args)
-    if rc != 0 and a.sound:
+    if rc == 1 and a.sound:
+        # (QEMU exits with 1 when it refuses its command line.)
         print(
-            f"(QEMU exited with {rc}; with SOUND=1 its audio driver may be missing: "
-            "LUMEN_AUDIO=<driver> picks another, `qemu-system-x86_64 -audiodev help` lists them)",
+            "(QEMU exited with 1; with SOUND=1, its audio driver may be missing (LUMEN_AUDIO=<driver> "
+            "picks another; `qemu-system-x86_64 -audiodev help` lists them), or this QEMU has no "
+            "virtio-sound-pci (8.2 or later))",
             file=sys.stderr,
         )
     return rc

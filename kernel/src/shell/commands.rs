@@ -92,7 +92,7 @@ pub static COMMANDS: Table<Run> = Table(&[
         name: "play",
         args: &[],
         usage: "<melody>",
-        about: "play notes, e.g. t=140 C4/8 E4/8 G4/4 r/8 (w=sine changes the waveform; q stops it)",
+        about: "play notes, e.g. t=140 C4/8 E4/8 G4/4 r/8 (w=sine changes the waveform; q or Ctrl-C stops it)",
         run: crate::sound::play_command,
     },
     Command {

@@ -3,8 +3,9 @@
 //! M6 brings files).
 //!
 //! Scripts see the machine through a few functions ([`FUNCTIONS`]): `cpus()`,
-//! `mem()`, `uptime()`, `trace(n)`, `sleep(ms)`, `beep([hz, ms])` (returns
-//! while it plays; a beep replaces the one before), `print`, `debug`, and
+//! `mem()`, `uptime()`, `trace(n)`, `sleep(ms)`, `beep()` / `beep(hz, ms)`
+//! (returns while it plays; it cuts off one still playing at its next
+//! period, and drops one still waiting), `print`, `debug`, and
 //! drawing (`draw_pixel`, `draw_rect`, `draw_text`, `clear`) on the
 //! terminal's [`Canvas`], taken on the first draw (`screen_width()` and
 //! `screen_height()` don't take it). A script that drew and ended without
@@ -353,7 +354,8 @@ pub const FUNCTIONS: &[&str] = &[
     "uptime()",
     "trace(n)",
     "sleep(ms)",
-    "beep([hz, ms])",
+    "beep()",
+    "beep(hz, ms)",
     "print(x)",
     "debug(x)",
     "draw_pixel(x, y, rgb)",
@@ -740,8 +742,8 @@ fn sleep(state: &State, ms: i64) -> Result<(), Box<EvalAltResult>> {
 }
 
 /// `beep(hz, ms)` (or `beep()`: 440 Hz for 200 ms): starts the beep and
-/// returns while it plays (a beep replaces the one playing); an error
-/// without a sound device.
+/// returns while it plays (cutting off one still playing at its next
+/// period); an error without a sound device.
 fn beep(hz: i64, ms: i64) -> Result<(), Box<EvalAltResult>> {
     let max = crate::sound::MAX_BEEP_MS;
     let Ok(hz) = u32::try_from(hz) else {
@@ -905,6 +907,8 @@ struct Functions;
 impl Complete for Functions {
     fn options(&self, _: &[String], out: &mut Vec<String>) {
         out.extend(FUNCTIONS.iter().map(|f| f.split('(').next().unwrap_or(f).to_string()));
+        // (`beep()` and `beep(hz, ms)` are one name.)
+        out.dedup();
     }
 }
 

@@ -6,30 +6,36 @@
 //!   is declined), sets its stream up and hands the `VirtIOSound` to the
 //!   `sound` thread, the only code that touches it from then on, so no lock
 //!   is ever held across a device wait.
-//! - **Requests.** [`play`] puts a boxed [`Source`] in [`PLAYER`]'s slot and
-//!   wakes the thread; it returns a [`Sound`] at once, whose
-//!   [`outcome`](Sound::outcome) says how it ended. A newer sound replaces
-//!   the one playing (faded out by [`Source::stop`]) and one still waiting
-//!   to start: consecutive `beep`s without a pause replace each other.
-//!   [`stop`] fades a sound out, or keeps it from starting.
+//! - **Requests.** [`play`] puts a boxed [`Source`] in [`PLAYER`]'s `next`
+//!   and wakes the thread; it returns a [`Sound`] at once, whose
+//!   [`outcome`](Sound::outcome) says how it ended. A newer sound cuts the
+//!   playing one off at its next period (up to 160 ms already queued still
+//!   plays; one that has made all its samples plays out); a sound still
+//!   waiting is dropped. [`stop`] fades a sound out, or keeps it from
+//!   starting.
 //! - **Paced by the device.** For each sound the thread prepares and starts
 //!   the stream, keeps up to [`DEPTH`] periods queued (`pcm_xfer_nb`), and
-//!   queues another each time the device takes one back (`pcm_xfer_ok`; QEMU
-//!   returns a period once its audio backend has consumed it). Between
-//!   looks it sleeps ([`POLL_NS`], `StatusHandle::sleep_until`), bounded per
-//!   period and ending on `DEVICE_NEEDS_RESET`/`FAILED`, so a melody
-//!   doesn't keep a CPU busy. Once the source has ended (its last period
-//!   padded with silence) and the queue has drained, it stops and releases
-//!   the stream. #96 replaces the sleeps with the device's interrupt.
+//!   queues another each time the device returns one (`pcm_xfer_ok` takes
+//!   it back; QEMU returns a period once its audio backend has consumed
+//!   it). Between looks it sleeps ([`POLL_NS`], `StatusHandle::sleep_until`),
+//!   bounded per period and ending on `DEVICE_NEEDS_RESET`/`FAILED`, so a
+//!   melody doesn't keep a CPU busy. Once the source has ended (its last
+//!   period padded with silence) and the queue has drained, it stops and
+//!   releases the stream. #96 replaces the sleeps with the device's
+//!   interrupt.
 //! - **Control requests spin unbounded** in the crate (a known limit): the
 //!   info queries and `pcm_set_params` in the probe, and prepare, start,
 //!   stop and release around every sound, on the thread. One that never
 //!   completes wedges the thread: after [`STUCK_NS`] without progress the
-//!   player reads as failed, and `play` gives up waiting.
-//! - **Failure.** A wait that gives up, a request the device refuses, or
-//!   periods coming back faster than they can have played end the thread
-//!   and drop the device (resetting it; the runs still posted leak):
-//!   `sound` shows `failed: <reason>`, and `beep` and `play` say so. The
+//!   player is given up for good (a warning; `lspci` shows it failed), and
+//!   a thread that comes back afterwards drops the device.
+//! - **Failure.** A device that isn't ready before a sound, a wait that
+//!   gives up, a request the device refuses, or a sound of 1 s or more whose
+//!   periods came back in under half its length ends the thread: it drops
+//!   the device (resetting it; the runs still posted leak) and records it
+//!   failed (`pci::failed_after_bind`). `sound` shows `failed: <reason>`,
+//!   and `beep` and `play` say so. A device that reports itself broken
+//!   while idle (its status) is given up by the next sound or `sound`. The
 //!   crate doesn't read a period's status reply, so a period the device
 //!   refused counts as played (the pace check catches a device refusing
 //!   them all).
@@ -51,8 +57,9 @@ use log::{info, warn};
 use lumen_pci::PciAddr;
 use lumen_shell::Key;
 use lumen_shell::pipe::{self, Align, Column, Kind, Value};
-use lumen_synth::{DEFAULT_VOLUME, Freq, Melody, Rate, Sequencer, Source, TooHigh};
+use lumen_synth::{DEFAULT_VOLUME, Freq, Melody, ParseError, Rate, Sequencer, Source, TooHigh};
 use virtio_drivers::device::sound::{PcmFeatures, PcmFormat, PcmFormats, PcmRate, PcmRates, VirtIOSound};
+use virtio_drivers::transport::DeviceStatus;
 use zerocopy::IntoBytes;
 
 use crate::drivers::Driver;
@@ -79,19 +86,19 @@ const POLL_NS: u64 = 1_000_000;
 /// How long a period may take to come back before the device counts as
 /// stuck: far more than the 160 ms of [`DEPTH`] periods queued ahead of it.
 const PERIOD_WAIT_NS: u64 = 2_000_000_000;
-/// While playing, this long without progress (a control request done, a
-/// period taken back) means the thread is stuck in a control request: the
-/// player reads as failed.
+/// While playing, this long without progress (the sound starting, a
+/// control request done, a period taken back; a stopped sound's fade-out
+/// and its stop and release requests included) means the thread is stuck
+/// in a control request: the player is given up.
 const STUCK_NS: u64 = 5_000_000_000;
-/// After `play` stops its sound, how long it waits for the sound to end: a
-/// release, the periods already queued, and one period's wait.
-const STOP_WAIT_NS: u64 = 500_000_000 + DEPTH as u64 * PERIOD_MS as u64 * 1_000_000 + PERIOD_WAIT_NS;
 /// Sounds at least this long are checked for having taken at least half
 /// their length to play (a device returning periods unplayed).
 const PACE_CHECK_MS: u64 = 1000;
-/// `beep`'s defaults (also rhai's `beep()`), and the longest beep.
+/// `beep`'s default frequency (also rhai's `beep()`).
 pub const DEFAULT_BEEP_HZ: u32 = 440;
+/// `beep`'s default length.
 pub const DEFAULT_BEEP_MS: u32 = 200;
+/// The longest `beep`.
 pub const MAX_BEEP_MS: u32 = 60_000;
 /// How often `play` checks for a key (and whether its sound is over).
 const KEY_POLL_NS: u64 = 20_000_000;
@@ -189,7 +196,7 @@ struct Device {
 
 /// A sound handed to the player (ids count from 1, never reused).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SoundId(NonZeroU64);
+struct SoundId(NonZeroU64);
 
 /// How a sound ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,18 +205,35 @@ pub enum Outcome {
     Played,
     /// [`stop`]ped (faded out, or never started).
     Stopped,
-    /// A newer sound took its place (faded out, or never started).
+    /// A newer sound took its place (cut off, or never started).
     Replaced,
-    /// The device failed: why.
+    /// The device failed or was given up: why.
     Failed(String),
+}
+
+/// How the thread ended a sound it played (failing is an `Err`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ended {
+    Played,
+    Stopped,
+    Replaced,
+}
+
+impl From<Ended> for Outcome {
+    fn from(e: Ended) -> Outcome {
+        match e {
+            Ended::Played => Outcome::Played,
+            Ended::Stopped => Outcome::Stopped,
+            Ended::Replaced => Outcome::Replaced,
+        }
+    }
 }
 
 /// Where a sound's [`Outcome`] lands once it is over (its lock is a leaf).
 type OutcomeCell = Arc<SpinLock<Option<Outcome>>>;
 
-/// A sound handed to [`play`]: its id, and how it ended once it has. The
-/// outcome lives here, not in the player, so it is never lost to later
-/// sounds.
+/// A sound handed to [`play`], and how it ended once it has. The outcome
+/// lives here, not in the player, so it is never lost to later sounds.
 pub struct Sound {
     id: SoundId,
     outcome: OutcomeCell,
@@ -222,15 +246,20 @@ impl Sound {
     }
 }
 
-fn settle(cell: &OutcomeCell, outcome: Outcome) {
-    cell.lock().get_or_insert(outcome);
+/// The player's side of a sound's outcome: settled once, consuming it.
+struct Settle(OutcomeCell);
+
+impl Settle {
+    fn settle(self, outcome: Outcome) {
+        *self.0.lock() = Some(outcome);
+    }
 }
 
 /// A sound waiting for the thread.
 struct Pending {
     id: SoundId,
     source: Box<dyn Source + Send>,
-    outcome: OutcomeCell,
+    settle: Settle,
 }
 
 /// What the bound device is doing.
@@ -238,62 +267,107 @@ struct Pending {
 enum Activity {
     Idle,
     /// Playing `id`; `stop` once [`stop`] asked; `progress_ns` when the
-    /// thread last got an answer from the device.
+    /// sound started or the thread last got an answer from the device.
     Playing {
         id: SoundId,
         stop: bool,
         progress_ns: u64,
     },
-    /// The device failed: why (the thread has ended).
+    /// Given up: why (the thread has ended, or ends when it next gets an
+    /// answer from the device).
     Failed(String),
+}
+
+/// What the player has played.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Counts {
+    /// Sounds that played to their end or until stopped.
+    played: u64,
+    /// Sounds a newer one cut off or kept from starting.
+    replaced: u64,
+    /// Frames handed to the device (a last period's padding not counted).
+    frames: u64,
+    /// How often the queue ran dry before a sound's end.
+    underruns: u64,
 }
 
 /// The bound device, what it does and what it played.
 struct Bound {
     device: Device,
+    /// The device's status register (read by [`Bound::check`]).
+    status: StatusHandle,
     activity: Activity,
-    /// Sounds that played to their end or until stopped; sounds a newer one
-    /// cut off or kept from starting; frames handed to the device; how often
-    /// the queue ran dry before a sound's end.
-    played: u64,
-    replaced: u64,
-    frames: u64,
-    underruns: u64,
+    /// The sound waiting to start.
+    next: Option<Pending>,
+    counts: Counts,
+}
+
+/// Why sounds can't play, as found under [`PLAYER`]'s lock; [`refusal`]
+/// makes it a [`SoundError`] once the lock is dropped.
+enum Refusal {
+    NoDevice,
+    Failed(String),
+    /// Just given up: why, and whether the thread is stuck (else idle, to
+    /// be woken to drop the device).
+    GivenUp {
+        addr: PciAddr,
+        why: String,
+        stuck: bool,
+    },
 }
 
 impl Bound {
-    /// `Err(why)` if the device failed, or is stuck: playing with no answer
-    /// for [`STUCK_NS`] (a control request that never completes).
-    fn health(&self, now: u64) -> Result<(), String> {
-        match &self.activity {
-            Activity::Failed(why) => Err(why.clone()),
-            Activity::Playing { progress_ns, .. } if now.saturating_sub(*progress_ns) > STUCK_NS => Err(format!(
-                "no answer from the device for {} s (stuck in a control request; reboot to retry)",
-                now.saturating_sub(*progress_ns) / 1_000_000_000
-            )),
-            _ => Ok(()),
-        }
+    /// Whether sounds can play: not if the device failed. A thread stuck
+    /// (playing with no answer for [`STUCK_NS`]) or an idle device whose
+    /// status says it is broken is given up here, for good.
+    fn check(&mut self, now: u64) -> Result<Format, Refusal> {
+        let raw = self.status.raw();
+        let reports = || format!("the device reports status {raw:#04x}: {}", virtio::not_ready_why(raw));
+        let (why, stuck) = match &self.activity {
+            Activity::Failed(why) => return Err(Refusal::Failed(why.clone())),
+            Activity::Playing { progress_ns, .. } => match now.saturating_sub(*progress_ns) {
+                quiet if quiet <= STUCK_NS => return Ok(self.device.format),
+                _ if broken(raw) => (reports(), true),
+                quiet => (
+                    format!(
+                        "no answer from the device for {} s (stuck in a control request; reboot to retry)",
+                        quiet / 1_000_000_000
+                    ),
+                    true,
+                ),
+            },
+            Activity::Idle if self.status.check_ready().is_ok() => return Ok(self.device.format),
+            Activity::Idle => (reports(), false),
+        };
+        self.activity = Activity::Failed(why.clone());
+        Err(Refusal::GivenUp { addr: self.device.addr, why, stuck })
     }
 }
 
-/// Whether a device is bound (set once, by the probe).
-enum Slot {
-    Absent,
-    Bound(Bound),
+/// Whether a status byte says the device is broken (`DEVICE_NEEDS_RESET`
+/// or `FAILED`; all ones reads as `FAILED`).
+fn broken(raw: u8) -> bool {
+    DeviceStatus::from_bits_truncate(u32::from(raw)).intersects(DeviceStatus::DEVICE_NEEDS_RESET | DeviceStatus::FAILED)
 }
 
 /// The state shared between [`play`]'s callers and the `sound` thread.
 struct Player {
-    slot: Slot,
-    /// The sound waiting to start.
-    next: Option<Pending>,
+    /// The bound device (set once, by the probe).
+    bound: Option<Bound>,
     /// The last id handed out.
     last_id: u64,
 }
 
-static PLAYER: SpinLock<Player> = SpinLock::new(Player { slot: Slot::Absent, next: None, last_id: 0 });
+impl Player {
+    /// [`Bound::check`] on the bound device.
+    fn check(&mut self, now: u64) -> Result<Format, Refusal> {
+        self.bound.as_mut().ok_or(Refusal::NoDevice)?.check(now)
+    }
+}
 
-/// The `sound` thread waits here for [`Player::next`].
+static PLAYER: SpinLock<Player> = SpinLock::new(Player { bound: None, last_id: 0 });
+
+/// The `sound` thread waits here for a sound, or to give its device up.
 static WAKE: WaitQueue = WaitQueue::new();
 
 /// The volume new sounds get, in percent.
@@ -304,10 +378,12 @@ static VOLUME: AtomicU8 = AtomicU8::new(DEFAULT_VOLUME);
 pub enum SoundError {
     /// No sound device is bound: the hint says what was found instead.
     NoDevice(String),
-    /// The device failed or is stuck: why.
+    /// The device failed or was given up: why.
     Failed(String),
     /// A frequency the device's sample rate can't carry.
     TooHigh(TooHigh),
+    /// A melody that doesn't parse, or has a note the rate can't carry.
+    Melody(ParseError),
     /// A source made at another rate than the device's.
     WrongRate { source: Rate, device: Rate },
 }
@@ -318,6 +394,7 @@ impl fmt::Display for SoundError {
             SoundError::NoDevice(hint) => write!(f, "no sound device{hint}"),
             SoundError::Failed(why) => write!(f, "the sound device failed: {why}"),
             SoundError::TooHigh(e) => write!(f, "{e}"),
+            SoundError::Melody(e) => write!(f, "{e}"),
             SoundError::WrongRate { source, device } => {
                 write!(f, "a sound made at {source} can't play on a {device} device")
             }
@@ -336,37 +413,49 @@ fn no_device_hint() -> String {
         .unwrap_or_default()
 }
 
-/// The bound device's format, or why sounds can't play (from `slot`, read
-/// under [`PLAYER`]'s lock: the hint is made after it is dropped).
-fn usable(slot: &Slot, now: u64) -> Result<Format, Option<String>> {
-    match slot {
-        Slot::Absent => Err(None),
-        Slot::Bound(b) => b.health(now).map(|()| b.device.format).map_err(Some),
-    }
+/// `sound`'s line without a device.
+fn no_device_line() -> String {
+    format!("sound: no sound device{}", no_device_hint())
 }
 
-fn unusable(why: Option<String>) -> SoundError {
-    why.map_or_else(|| SoundError::NoDevice(no_device_hint()), SoundError::Failed)
+/// `r` as the error callers see, once [`PLAYER`]'s lock is dropped: the
+/// no-device hint added, and a device just given up reported (a warning;
+/// a stuck thread can't drop the device, so it is recorded failed here; an
+/// idle one is woken to drop it and record it).
+fn refusal(r: Refusal) -> SoundError {
+    match r {
+        Refusal::NoDevice => SoundError::NoDevice(no_device_hint()),
+        Refusal::Failed(why) => SoundError::Failed(why),
+        Refusal::GivenUp { addr, why, stuck } => {
+            warn!(target: "sound", "{addr}: the device is given up: {why}");
+            if stuck {
+                crate::pci::failed_after_bind(addr, DRIVER.name, why.clone());
+            } else {
+                WAKE.wake_one();
+            }
+            SoundError::Failed(why)
+        }
+    }
 }
 
 /// The format sounds must be made in (their rate), or why none can play.
 pub fn format() -> Result<Format, SoundError> {
     let now = crate::time::now_ns();
-    let checked = usable(&PLAYER.lock().slot, now);
-    checked.map_err(unusable)
+    let checked = PLAYER.lock().check(now);
+    checked.map_err(refusal)
 }
 
-/// Play `source` (made at [`format`]'s rate): it replaces whatever plays or
-/// waits to. Returns at once.
+/// Play `source` (made at [`format`]'s rate): it cuts off whatever plays at
+/// its next period and drops one waiting. Returns at once.
 pub fn play(source: Box<dyn Source + Send>) -> Result<Sound, SoundError> {
     let outcome: OutcomeCell = Arc::new(SpinLock::new(None));
     let now = crate::time::now_ns();
     let mut p = PLAYER.lock();
-    let format = match usable(&p.slot, now) {
+    let format = match p.check(now) {
         Ok(f) => f,
-        Err(why) => {
+        Err(r) => {
             drop(p);
-            return Err(unusable(why));
+            return Err(refusal(r));
         }
     };
     if source.rate() != format.rate {
@@ -375,15 +464,14 @@ pub fn play(source: Box<dyn Source + Send>) -> Result<Sound, SoundError> {
     }
     p.last_id += 1;
     let id = SoundId(NonZeroU64::new(p.last_id).expect("ids count from 1"));
-    let replaced = p.next.replace(Pending { id, source, outcome: outcome.clone() });
-    if replaced.is_some()
-        && let Slot::Bound(b) = &mut p.slot
-    {
-        b.replaced += 1;
+    let b = p.bound.as_mut().expect("checked: bound");
+    let dropped = b.next.replace(Pending { id, source, settle: Settle(outcome.clone()) });
+    if dropped.is_some() {
+        b.counts.replaced += 1;
     }
     drop(p);
-    if let Some(r) = replaced {
-        settle(&r.outcome, Outcome::Replaced);
+    if let Some(d) = dropped {
+        d.settle.settle(Outcome::Replaced);
     }
     WAKE.wake_one();
     Ok(Sound { id, outcome })
@@ -393,16 +481,16 @@ pub fn play(source: Box<dyn Source + Send>) -> Result<Sound, SoundError> {
 /// still play), or keep it from starting. Nothing if it is over.
 pub fn stop(sound: &Sound) {
     let mut p = PLAYER.lock();
-    let unstarted = if p.next.as_ref().is_some_and(|n| n.id == sound.id) { p.next.take() } else { None };
-    if let Slot::Bound(b) = &mut p.slot
-        && let Activity::Playing { id, stop, .. } = &mut b.activity
+    let Some(b) = p.bound.as_mut() else { return };
+    let unstarted = b.next.take_if(|n| n.id == sound.id);
+    if let Activity::Playing { id, stop, .. } = &mut b.activity
         && *id == sound.id
     {
         *stop = true;
     }
     drop(p);
     if let Some(n) = unstarted {
-        settle(&n.outcome, Outcome::Stopped);
+        n.settle.settle(Outcome::Stopped);
     }
 }
 
@@ -425,6 +513,21 @@ pub fn beep(hz: u32, ms: u32) -> Result<Sound, SoundError> {
         .map_err(SoundError::TooHigh)?;
     tone.set_volume(volume());
     play(Box::new(tone))
+}
+
+/// `text` as a melody at `rate`, at the current volume.
+fn melody(text: String, rate: Rate) -> Result<Sequencer<String>, SoundError> {
+    let mut seq = Melody::parse(text).and_then(|m| Sequencer::new(m, rate)).map_err(SoundError::Melody)?;
+    seq.set_volume(volume());
+    Ok(seq)
+}
+
+/// Whether a sound of 1 s or more ([`PACE_CHECK_MS`]) of `frames` at
+/// `rate` came back in `ms`, under half its length: periods returned
+/// without being played.
+fn played_too_fast(frames: u64, rate: Rate, ms: u64) -> bool {
+    let length_ms = frames * 1000 / u64::from(rate.hz());
+    length_ms >= PACE_CHECK_MS && ms < length_ms / 2
 }
 
 /// Whether a sound device is bound, or being probed: the player is one
@@ -456,17 +559,12 @@ fn bind(res: DeviceResources) -> Result<(), ProbeError> {
     status.check_ready()?;
     let format = set_up(&mut dev)?;
     status.check_ready()?;
-    let stream = Stream { dev, status, format, samples: vec![0; format.period_samples()] };
+    let device = Device { addr, format };
+    let stream = Stream { dev, status, device, samples: vec![0; format.period_samples()] };
     // Detached: it runs for the kernel's life (or until the device fails).
     let _thread = crate::sched::spawn("sound", move || run(stream)).map_err(ProbeError::Thread)?;
-    PLAYER.lock().slot = Slot::Bound(Bound {
-        device: Device { addr, format },
-        activity: Activity::Idle,
-        played: 0,
-        replaced: 0,
-        frames: 0,
-        underruns: 0,
-    });
+    PLAYER.lock().bound =
+        Some(Bound { device, status, activity: Activity::Idle, next: None, counts: Counts::default() });
     info!(target: "sound", "{addr}: {format}");
     Ok(())
 }
@@ -502,10 +600,12 @@ enum PlayError {
     Device { op: &'static str, e: virtio_drivers::Error },
     /// A period didn't come back.
     Wait(WaitError),
-    /// The device isn't ready (checked before each sound).
-    NotReady(ProbeError),
+    /// The device wasn't ready before a sound: its status.
+    NotReady { status: u8 },
     /// Periods came back faster than they can have played.
     Unplayed { frames: u64, ms: u64 },
+    /// The player was given up while the thread was stuck: why.
+    GivenUp(String),
 }
 
 impl fmt::Display for PlayError {
@@ -513,16 +613,20 @@ impl fmt::Display for PlayError {
         match self {
             PlayError::Device { op, e } => write!(f, "{op}: virtio: {e}"),
             PlayError::Wait(e) => write!(f, "waiting for a period: {e}"),
-            PlayError::NotReady(e) => write!(f, "{e}"),
+            PlayError::NotReady { status } => {
+                let why = virtio::not_ready_why(*status);
+                write!(f, "checking the device before a sound: status {status:#04x}: {why}")
+            }
             PlayError::Unplayed { frames, ms } => {
                 write!(f, "the device returned periods without playing them ({frames} frames in {ms} ms)")
             }
+            PlayError::GivenUp(why) => f.write_str(why),
         }
     }
 }
 
-/// `Err` naming `op` for a request the device refused.
-fn op<T>(op: &'static str, r: virtio_drivers::Result<T>) -> Result<T, PlayError> {
+/// `r`, or an `Err` naming the request `op` the device refused.
+fn requested<T>(op: &'static str, r: virtio_drivers::Result<T>) -> Result<T, PlayError> {
     r.map_err(|e| PlayError::Device { op, e })
 }
 
@@ -530,100 +634,149 @@ fn op<T>(op: &'static str, r: virtio_drivers::Result<T>) -> Result<T, PlayError>
 struct Stream {
     dev: VirtIOSound<VirtioHal, VirtioTransport>,
     status: StatusHandle,
-    format: Format,
+    device: Device,
     /// One period's samples (always [`Format::period_samples`] long).
     samples: Vec<i16>,
 }
 
-/// What one sound played.
+/// What one sound played (also when it failed).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Played {
-    how: Outcome,
     frames: u64,
     underruns: u64,
 }
 
-/// The `sound` thread: play each sound handed over, until the device fails.
+/// What the thread is to do next.
+enum Next {
+    Play(Pending),
+    /// The player was given up (while idle): drop the device.
+    GiveUp(String),
+}
+
+/// The `sound` thread: play each sound handed over, until the device fails
+/// or is given up.
 fn run(mut stream: Stream) {
+    let addr = stream.device.addr;
     loop {
-        WAKE.wait_until(|| PLAYER.lock().next.is_some());
-        let Some(Pending { id, source, outcome }) = take_next() else { continue };
-        match stream.play(id, source) {
-            Ok(played) => {
-                let mut p = PLAYER.lock();
-                if let Slot::Bound(b) = &mut p.slot {
-                    b.activity = Activity::Idle;
-                    b.frames += played.frames;
-                    b.underruns += played.underruns;
-                    match played.how {
-                        Outcome::Replaced => b.replaced += 1,
-                        _ => b.played += 1,
+        WAKE.wait_until(|| {
+            PLAYER.lock().bound.as_ref().is_some_and(|b| b.next.is_some() || matches!(b.activity, Activity::Failed(_)))
+        });
+        let failed = match take_next() {
+            None => continue,
+            Some(Next::GiveUp(why)) => why,
+            Some(Next::Play(Pending { id, source, settle })) => {
+                let mut played = Played::default();
+                match stream.play(id, source, &mut played) {
+                    Ok(ended) => {
+                        record(played, ended, settle);
+                        continue;
                     }
+                    Err(e) => fail(&e.to_string(), played, settle),
                 }
-                drop(p);
-                if played.underruns > 0 {
-                    warn!(target: "sound", "sound {}: {} underruns", id.0, played.underruns);
-                }
-                settle(&outcome, played.how);
             }
-            Err(e) => {
-                let why = e.to_string();
-                let mut p = PLAYER.lock();
-                if let Slot::Bound(b) = &mut p.slot {
-                    b.activity = Activity::Failed(why.clone());
-                }
-                let next = p.next.take();
-                drop(p);
-                warn!(target: "sound", "playing failed: {why}; the device is given up");
-                settle(&outcome, Outcome::Failed(why.clone()));
-                if let Some(n) = next {
-                    settle(&n.outcome, Outcome::Failed(why));
-                }
-                // Dropping it resets the device (`VirtioTransport`'s `Drop`).
-                return;
-            }
+        };
+        // Dropping it resets the device (`VirtioTransport`'s `Drop`); then
+        // `lspci` says why.
+        drop(stream);
+        if crate::pci::failed_after_bind(addr, DRIVER.name, failed.clone()) {
+            warn!(target: "sound", "{addr}: playing failed: {failed}; the device is given up");
+        } else {
+            warn!(target: "sound", "{addr}: the device answered again after it was given up; dropped it");
         }
+        return;
     }
 }
 
 /// Take the sound waiting to start, marking it playing (one critical
-/// section, so [`stop`] finds it in one place or the other).
-fn take_next() -> Option<Pending> {
+/// section, so [`stop`] finds it in one place or the other), or learn the
+/// player was given up.
+fn take_next() -> Option<Next> {
     let now = crate::time::now_ns();
     let mut p = PLAYER.lock();
-    let next = p.next.take()?;
-    if let Slot::Bound(b) = &mut p.slot {
-        b.activity = Activity::Playing { id: next.id, stop: false, progress_ns: now };
+    let b = p.bound.as_mut()?;
+    if let Activity::Failed(why) = &b.activity {
+        return Some(Next::GiveUp(why.clone()));
     }
-    Some(next)
+    let next = b.next.take()?;
+    b.activity = Activity::Playing { id: next.id, stop: false, progress_ns: now };
+    Some(Next::Play(next))
 }
 
-/// The device answered: the thread isn't stuck.
-fn progress() {
+/// A sound ended: count it and settle its outcome.
+fn record(played: Played, ended: Ended, settle: Settle) {
+    let mut p = PLAYER.lock();
+    if let Some(b) = p.bound.as_mut() {
+        if let Activity::Playing { .. } = b.activity {
+            b.activity = Activity::Idle;
+        }
+        b.counts.frames += played.frames;
+        b.counts.underruns += played.underruns;
+        match ended {
+            Ended::Played | Ended::Stopped => b.counts.played += 1,
+            Ended::Replaced => b.counts.replaced += 1,
+        }
+    }
+    drop(p);
+    if played.underruns > 0 {
+        warn!(target: "sound", "a sound found the queue empty {} times (underruns)", played.underruns);
+    }
+    settle.settle(ended.into());
+}
+
+/// A sound failed with `why`: count what it played, mark the player failed
+/// (keeping the reason it was given up with, if it was), and settle the
+/// sound and the one waiting as failed. Returns the reason recorded.
+fn fail(why: &str, played: Played, settle: Settle) -> String {
+    let mut p = PLAYER.lock();
+    let mut waiting = None;
+    let mut reason = String::from(why);
+    if let Some(b) = p.bound.as_mut() {
+        b.counts.frames += played.frames;
+        b.counts.underruns += played.underruns;
+        match &b.activity {
+            Activity::Failed(given) => reason = given.clone(),
+            _ => b.activity = Activity::Failed(reason.clone()),
+        }
+        waiting = b.next.take();
+    }
+    drop(p);
+    settle.settle(Outcome::Failed(reason.clone()));
+    if let Some(w) = waiting {
+        w.settle.settle(Outcome::Failed(reason.clone()));
+    }
+    reason
+}
+
+/// The device answered: the thread isn't stuck; `Err` if the player was
+/// given up meanwhile.
+fn progress() -> Result<(), PlayError> {
     let now = crate::time::now_ns();
-    if let Slot::Bound(b) = &mut PLAYER.lock().slot
-        && let Activity::Playing { progress_ns, .. } = &mut b.activity
-    {
-        *progress_ns = now;
+    let mut p = PLAYER.lock();
+    match p.bound.as_mut().map(|b| &mut b.activity) {
+        Some(Activity::Playing { progress_ns, .. }) => {
+            *progress_ns = now;
+            Ok(())
+        }
+        Some(Activity::Failed(why)) => Err(PlayError::GivenUp(why.clone())),
+        _ => Ok(()),
     }
 }
 
-/// Whether sound `id` is to end early, and as what: stopped, or replaced
-/// by a newer sound.
-fn cut_short(id: SoundId) -> Option<Outcome> {
+/// Whether sound `id` is to end early, and as what: stopped, or cut off by
+/// a newer sound.
+fn cut_short(id: SoundId) -> Option<Ended> {
     let p = PLAYER.lock();
-    let stopped =
-        matches!(&p.slot, Slot::Bound(Bound { activity: Activity::Playing { id: i, stop: true, .. }, .. }) if *i == id);
-    if stopped {
-        Some(Outcome::Stopped)
-    } else if p.next.is_some() {
-        Some(Outcome::Replaced)
-    } else {
-        None
+    let b = p.bound.as_ref()?;
+    match b.activity {
+        Activity::Playing { id: i, stop: true, .. } if i == id => Some(Ended::Stopped),
+        _ if b.next.is_some() => Some(Ended::Replaced),
+        _ => None,
     }
 }
 
 impl Stream {
-    /// Whether the device has taken back period `token`.
+    /// Whether the device has returned period `token` (`pcm_xfer_ok` takes
+    /// it back).
     fn taken_back(&mut self, token: u16) -> Result<bool, PlayError> {
         match self.dev.pcm_xfer_ok(token) {
             Ok(()) => Ok(true),
@@ -632,66 +785,82 @@ impl Stream {
         }
     }
 
-    /// Play `source`, paced by the device (the module doc).
-    fn play(&mut self, id: SoundId, mut source: Box<dyn Source + Send>) -> Result<Played, PlayError> {
-        let stream = self.format.stream;
-        let mut played = Played { how: Outcome::Played, frames: 0, underruns: 0 };
+    /// Wait (bounded, sleeping) until the device returns period `token`.
+    fn wait_taken_back(&mut self, token: u16) -> Result<(), PlayError> {
+        let status = self.status;
+        let mut answer = Ok(false);
+        status
+            .sleep_until(PERIOD_WAIT_NS, POLL_NS, || {
+                answer = self.taken_back(token);
+                !matches!(answer, Ok(false))
+            })
+            .map_err(PlayError::Wait)?;
+        answer.map(drop)
+    }
+
+    /// Play `source`, paced by the device (the module doc), counting into
+    /// `played`.
+    fn play(
+        &mut self,
+        id: SoundId,
+        mut source: Box<dyn Source + Send>,
+        played: &mut Played,
+    ) -> Result<Ended, PlayError> {
+        let format = self.device.format;
+        let stream = format.stream;
+        let mut how = Ended::Played;
         let mut queued: VecDeque<u16> = VecDeque::with_capacity(DEPTH);
         let mut ended = false;
         // A device broken while idle fails here, not in a control request.
-        self.status.check_ready().map_err(PlayError::NotReady)?;
-        op("preparing the stream", self.dev.pcm_prepare(stream))?;
-        progress();
-        op("starting the stream", self.dev.pcm_start(stream))?;
-        progress();
+        if self.status.check_ready().is_err() {
+            return Err(PlayError::NotReady { status: self.status.raw() });
+        }
+        requested("preparing the stream", self.dev.pcm_prepare(stream))?;
+        progress()?;
+        requested("starting the stream", self.dev.pcm_start(stream))?;
+        progress()?;
         let start = crate::time::now_ns();
         loop {
-            if played.how == Outcome::Played
-                && let Some(how) = cut_short(id)
+            // (A sound that has made all its samples plays out.)
+            if !ended
+                && how == Ended::Played
+                && let Some(cut) = cut_short(id)
             {
                 source.stop();
-                played.how = how;
+                how = cut;
             }
             while !ended && queued.len() < DEPTH {
-                let filled = source.fill(&mut self.samples, self.format.channels);
+                let filled = source.fill(&mut self.samples, format.channels);
                 ended = filled.ended;
                 if filled.frames == 0 {
                     break;
                 }
                 played.frames += filled.frames as u64;
-                queued.push_back(op("queueing a period", self.dev.pcm_xfer_nb(stream, self.samples.as_bytes()))?);
+                queued
+                    .push_back(requested("queueing a period", self.dev.pcm_xfer_nb(stream, self.samples.as_bytes()))?);
             }
             let Some(&oldest) = queued.front() else { break };
             // Wait for the oldest period, then take back any others done.
-            let status = self.status;
-            let mut answer = Ok(false);
-            status
-                .sleep_until(PERIOD_WAIT_NS, POLL_NS, || {
-                    answer = self.taken_back(oldest);
-                    !matches!(answer, Ok(false))
-                })
-                .map_err(PlayError::Wait)?;
-            answer?;
+            self.wait_taken_back(oldest)?;
             queued.pop_front();
             while let Some(&token) = queued.front()
                 && self.taken_back(token)?
             {
                 queued.pop_front();
             }
-            progress();
+            progress()?;
             if queued.is_empty() && !ended {
                 played.underruns += 1;
             }
         }
         let ms = crate::time::now_ns().saturating_sub(start) / 1_000_000;
-        let length_ms = played.frames * 1000 / u64::from(self.format.rate.hz());
-        if length_ms >= PACE_CHECK_MS && ms < length_ms / 2 {
+        if played_too_fast(played.frames, format.rate, ms) {
             return Err(PlayError::Unplayed { frames: played.frames, ms });
         }
-        op("stopping the stream", self.dev.pcm_stop(stream))?;
-        progress();
-        op("releasing the stream", self.dev.pcm_release(stream))?;
-        Ok(played)
+        requested("stopping the stream", self.dev.pcm_stop(stream))?;
+        progress()?;
+        requested("releasing the stream", self.dev.pcm_release(stream))?;
+        Ok(how)
     }
 }
 
@@ -715,45 +884,37 @@ pub fn beep_command(ctx: &mut Ctx<'_>, args: &[String]) {
 }
 
 /// `play <melody>`: play a melody (its words joined with spaces), until it
-/// ends, `q`/Ctrl-C stops it, a newer sound replaces it, or the device
-/// stops answering.
+/// ends, `q`/Ctrl-C stops it (other keys typed meanwhile are discarded), a
+/// newer sound cuts it off, or the device fails or is given up (then it
+/// stops its sound, so nothing plays on unseen).
 pub fn play_command(ctx: &mut Ctx<'_>, args: &[String]) {
     if args.is_empty() {
         return ctx.fail("usage: play <melody> (e.g. play t=140 C4/8 E4/8 G4/4 r/8 C5/2)");
     }
-    let f = match format() {
-        Ok(f) => f,
-        Err(e) => return ctx.fail(format_args!("play: {e}")),
-    };
-    let mut seq = match Melody::parse(args.join(" ")).and_then(|m| Sequencer::new(m, f.rate)) {
-        Ok(seq) => seq,
-        Err(e) => return ctx.fail(format_args!("play: {e}")),
-    };
-    seq.set_volume(volume());
-    let sound = match play(Box::new(seq)) {
+    let started = format().and_then(|f| melody(args.join(" "), f.rate)).and_then(|seq| play(Box::new(seq)));
+    let sound = match started {
         Ok(sound) => sound,
         Err(e) => return ctx.fail(format_args!("play: {e}")),
     };
-    let mut stopped_at = None;
+    let mut stopped = false;
     let outcome = loop {
         if let Some(outcome) = sound.outcome() {
             break outcome;
         }
-        let now = crate::time::now_ns();
-        if stopped_at.is_none()
-            && let Some(Key::Char('q') | Key::Ctrl('c')) = ctx.poll_key()
-        {
+        if !stopped && let Some(Key::Char('q') | Key::Ctrl('c')) = ctx.poll_key() {
             stop(&sound);
-            stopped_at = Some(now);
+            stopped = true;
         }
-        // (A failed device settles the outcome too; a stuck one never does.)
+        // (A failed device settles the outcome too; a stuck one is given
+        // up after `STUCK_NS` without an answer.)
         if let Err(SoundError::Failed(why)) = format()
             && sound.outcome().is_none()
         {
-            return ctx.fail(format_args!("play: the sound device failed: {why}"));
-        }
-        if stopped_at.is_some_and(|t| now.saturating_sub(t) > STOP_WAIT_NS) {
-            return ctx.fail("play: the sound device isn't responding (reboot to retry)");
+            stop(&sound);
+            if stopped {
+                warn!(target: "sound", "play gave up waiting for its stopped sound: {why}");
+            }
+            break Outcome::Failed(why);
         }
         crate::time::sleep(KEY_POLL_NS);
     };
@@ -763,7 +924,7 @@ pub fn play_command(ctx: &mut Ctx<'_>, args: &[String]) {
             let _ = writeln!(ctx.out, "play: stopped");
         }
         Outcome::Replaced => ctx.fail("play: interrupted by a newer sound"),
-        Outcome::Failed(why) => ctx.fail(format_args!("play: the sound device failed: {why}")),
+        Outcome::Failed(why) => ctx.fail(format_args!("play: {}", SoundError::Failed(why))),
     }
 }
 
@@ -787,10 +948,7 @@ pub fn sound_command(ctx: &mut Ctx<'_>, args: &[String]) {
     if !args.is_empty() {
         return ctx.fail("usage: sound");
     }
-    let device = match &PLAYER.lock().slot {
-        Slot::Absent => None,
-        Slot::Bound(b) => Some(b.device),
-    };
+    let device = PLAYER.lock().bound.as_ref().map(|b| b.device);
     let mut t = String::new();
     match device {
         Some(d) => {
@@ -798,7 +956,8 @@ pub fn sound_command(ctx: &mut Ctx<'_>, args: &[String]) {
             table().render(&mut t);
         }
         None => {
-            let _ = writeln!(t, "sound: no sound device{}", no_device_hint());
+            t = no_device_line();
+            t.push('\n');
         }
     }
     let _ = ctx.out.write_str(&t);
@@ -807,29 +966,25 @@ pub fn sound_command(ctx: &mut Ctx<'_>, args: &[String]) {
 /// What `sound`'s one record says.
 struct Row {
     state: String,
-    played: u64,
-    replaced: u64,
-    frames: u64,
-    underruns: u64,
+    counts: Counts,
 }
 
 /// `sound`'s records: one row, none without a device.
 pub fn table() -> pipe::Table {
     let now = crate::time::now_ns();
-    let row = match &PLAYER.lock().slot {
-        Slot::Absent => None,
-        Slot::Bound(b) => Some(Row {
-            state: match (b.health(now), &b.activity) {
-                (Err(why), _) => format!("failed: {why}"),
-                (Ok(()), Activity::Playing { .. }) => String::from("playing"),
-                (Ok(()), _) => String::from("idle"),
-            },
-            played: b.played,
-            replaced: b.replaced,
-            frames: b.frames,
-            underruns: b.underruns,
-        }),
-    };
+    let mut p = PLAYER.lock();
+    let checked = p.check(now);
+    let seen = p.bound.as_ref().map(|b| (b.counts, matches!(b.activity, Activity::Playing { .. })));
+    drop(p);
+    let row = seen.map(|(counts, playing)| Row {
+        state: match checked.map_err(refusal) {
+            Err(SoundError::Failed(why)) => format!("failed: {why}"),
+            Err(other) => other.to_string(),
+            Ok(_) if playing => String::from("playing"),
+            Ok(_) => String::from("idle"),
+        },
+        counts,
+    });
     table_of(row)
 }
 
@@ -844,13 +999,13 @@ fn table_of(row: Option<Row>) -> pipe::Table {
         Column::new("volume", Kind::Percent, Align::Right, 6),
     ];
     let mut t = pipe::Table::new(&COLUMNS);
-    if let Some(r) = row {
+    if let Some(Row { state, counts: c }) = row {
         t.push(vec![
-            Value::Text(r.state),
-            int(r.played),
-            int(r.replaced),
-            int(r.frames),
-            int(r.underruns),
+            Value::Text(state),
+            int(c.played),
+            int(c.replaced),
+            int(c.frames),
+            int(c.underruns),
             Value::Int(i64::from(volume())),
         ]);
     }
@@ -859,20 +1014,33 @@ fn table_of(row: Option<Row>) -> pipe::Table {
 
 /// A note for `sound`'s records when there are none.
 pub fn records_note() -> Option<String> {
-    let absent = matches!(PLAYER.lock().slot, Slot::Absent);
-    absent.then(|| format!("sound: no sound device{}", no_device_hint()))
+    let absent = PLAYER.lock().bound.is_none();
+    absent.then(no_device_line)
 }
 
 fn int(n: u64) -> Value {
     i64::try_from(n).map_or(Value::Absent("-"), Value::Int)
 }
 
+/// Ktests: put the player back as the ktest machine has it (no device),
+/// however the test ends.
+#[cfg(feature = "ktest")]
+struct Unbind;
+
+#[cfg(feature = "ktest")]
+impl Drop for Unbind {
+    fn drop(&mut self) {
+        let old = PLAYER.lock().bound.take();
+        drop(old);
+    }
+}
+
 crate::ktest!(
     fn the_record_fits_its_columns() {
         // (The ktest machine has no sound device: `table()` has no row.)
         use crate::kassert_eq;
-        let row = Row { state: "failed: x".into(), played: 1, replaced: 2, frames: u64::MAX, underruns: 0 };
-        let t = table_of(Some(row));
+        let counts = Counts { played: 1, replaced: 2, frames: u64::MAX, underruns: 0 };
+        let t = table_of(Some(Row { state: "failed: x".into(), counts }));
         kassert_eq!(t.rows().len(), 1);
         kassert_eq!(t.rows()[0][3], Value::Absent("-"));
         kassert_eq!(table_of(None).rows().len(), 0);
@@ -881,44 +1049,102 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn the_pace_check_catches_periods_returned_unplayed() {
+        use crate::kassert;
+        let rate = Rate::new(44_100).ok_or("rate")?;
+        // A 2 s sound: in 999 ms too fast, in 1000 ms fine.
+        kassert!(played_too_fast(88_200, rate, 999));
+        kassert!(!played_too_fast(88_200, rate, 1000));
+        // Under 1 s, never judged; 1 s in no time is.
+        kassert!(!played_too_fast(44_099, rate, 0));
+        kassert!(played_too_fast(44_100, rate, 0));
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn a_failed_or_stuck_device_refuses_sounds() {
-        // With a made-up bound device (the ktest machine has none): failed,
-        // stuck in a control request, and a source at another rate. The
-        // player is put back as it was (absent) afterwards.
-        use crate::kassert_eq;
+        // With a made-up bound device (the ktest machine has none, so
+        // nothing plays) whose status byte the test sets: replacing and
+        // stopping waiting sounds, a failure settling the waiting sound, a
+        // failed device, a stuck thread, a device reporting itself broken
+        // while idle, and a source at another rate. `Unbind` puts the
+        // player back.
+        use crate::{kassert, kassert_eq};
+        static STATUS: AtomicU8 = AtomicU8::new(0x0f);
+        let _unbind = Unbind;
         let device_format = choose(0, PcmRates::all(), PcmFormats::S16, 1..=2)?;
         let addr = PciAddr::new(0, 0xff, 0x1f, 7).ok_or("addr")?;
         let bound = |activity| Bound {
             device: Device { addr, format: device_format },
+            status: StatusHandle::ktest_reading(&STATUS),
             activity,
-            played: 0,
-            replaced: 0,
-            frames: 0,
-            underruns: 0,
+            next: None,
+            counts: Counts::default(),
         };
-        let set = |slot| core::mem::replace(&mut PLAYER.lock().slot, slot);
-        kassert_eq!(matches!(set(Slot::Bound(bound(Activity::Failed("x".into())))), Slot::Absent), true);
+        let set = |b| core::mem::replace(&mut PLAYER.lock().bound, b);
+        let rate = device_format.rate;
+        let tone = || -> Result<Box<dyn Source + Send>, &'static str> {
+            Ok(Box::new(lumen_synth::beep(Freq::from_hz(440), Duration::from_millis(10), rate).map_err(|_| "tone")?))
+        };
+        kassert!(set(Some(bound(Activity::Idle))).is_none());
+
+        // Two sounds waiting: the first is dropped, counted as replaced;
+        // the second, stopped, never starts.
+        let first = play(tone()?).map_err(|_| "play 1")?;
+        let second = play(tone()?).map_err(|_| "play 2")?;
+        kassert_eq!(first.outcome(), Some(Outcome::Replaced));
+        kassert_eq!(table().rows()[0][2], Value::Int(1));
+        stop(&second);
+        kassert_eq!(second.outcome(), Some(Outcome::Stopped));
+        kassert!(PLAYER.lock().bound.as_ref().is_some_and(|b| b.next.is_none()));
+
+        // A failure counts what the sound played and settles it and the
+        // one waiting.
+        let waiting = play(tone()?).map_err(|_| "play 3")?;
+        let cell: OutcomeCell = Arc::new(SpinLock::new(None));
+        let why = fail("x", Played { frames: 5, underruns: 1 }, Settle(cell.clone()));
+        kassert_eq!(why.as_str(), "x");
+        kassert_eq!(cell.lock().clone(), Some(Outcome::Failed("x".into())));
+        kassert_eq!(waiting.outcome(), Some(Outcome::Failed("x".into())));
+        let counts = PLAYER.lock().bound.as_ref().map(|b| b.counts);
+        kassert_eq!(counts.map(|c| (c.frames, c.underruns)), Some((5, 1)));
+
+        // Failed: refused with the reason, everywhere.
         let failed = SoundError::Failed("x".into());
         kassert_eq!(format(), Err(failed.clone()));
         kassert_eq!(beep(440, 10).map(drop), Err(failed.clone()));
+        kassert_eq!(play(tone()?).map(drop), Err(failed.clone()));
         kassert_eq!(failed.to_string().as_str(), "the sound device failed: x");
         kassert_eq!(table().rows()[0][0], Value::Text("failed: x".into()));
 
+        // Stuck: given up for good, `sound` saying so; with a broken
+        // status, the status says why.
         let long_ago = crate::time::now_ns().saturating_sub(STUCK_NS + 1_000_000_000);
         let id = SoundId(NonZeroU64::MIN);
-        set(Slot::Bound(bound(Activity::Playing { id, stop: false, progress_ns: long_ago })));
-        let stuck = matches!(format(), Err(SoundError::Failed(why)) if why.contains("stuck in a control request"));
-        kassert_eq!(stuck, true);
+        set(Some(bound(Activity::Playing { id, stop: false, progress_ns: long_ago })));
+        let shown = matches!(&table().rows()[0][0], Value::Text(s) if s.contains("stuck in a control request"));
+        kassert!(shown);
+        let latched = matches!(format(), Err(SoundError::Failed(why)) if why.contains("stuck in a control request"));
+        kassert!(latched);
+        STATUS.store(0x4f, Ordering::Relaxed);
+        set(Some(bound(Activity::Playing { id, stop: false, progress_ns: long_ago })));
+        let reports =
+            matches!(format(), Err(SoundError::Failed(why)) if why.contains("status 0x4f: DEVICE_NEEDS_RESET"));
+        kassert!(reports);
 
-        set(Slot::Bound(bound(Activity::Idle)));
+        // Broken while idle: the next sound fails at once.
+        set(Some(bound(Activity::Idle)));
+        let refused = matches!(play(tone()?).map(drop), Err(SoundError::Failed(why)) if why.contains("status 0x4f"));
+        kassert!(refused);
+        STATUS.store(0x0f, Ordering::Relaxed);
+
+        // A source at another rate.
+        set(Some(bound(Activity::Idle)));
         let other = Rate::new(8000).ok_or("rate")?;
-        let tone = lumen_synth::beep(Freq::from_hz(440), Duration::from_millis(10), other).map_err(|_| "tone")?;
-        kassert_eq!(
-            play(Box::new(tone)).map(drop),
-            Err(SoundError::WrongRate { source: other, device: device_format.rate })
-        );
-        kassert_eq!(PLAYER.lock().next.is_none(), true);
-        set(Slot::Absent);
+        let slow = lumen_synth::beep(Freq::from_hz(440), Duration::from_millis(10), other).map_err(|_| "tone")?;
+        kassert_eq!(play(Box::new(slow)).map(drop), Err(SoundError::WrongRate { source: other, device: rate }));
+        kassert!(PLAYER.lock().bound.as_ref().is_some_and(|b| b.next.is_none()));
         Ok(())
     }
 );

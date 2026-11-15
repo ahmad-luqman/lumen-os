@@ -389,7 +389,7 @@ pub enum Binding {
     /// Claimed by this driver, which is probing it.
     Probing(&'static str),
     Bound(&'static str),
-    /// The driver's probe failed: why.
+    /// The probe failed, or the driver gave the device up later: why.
     Failed(&'static str, String),
 }
 
@@ -673,19 +673,15 @@ pub fn probed(addr: PciAddr, driver: &'static str, outcome: Probed) -> Binding {
         ref other => panic!("pci::probed: {addr} isn't being probed by {driver} ({})", other.binding()),
     })
     .unwrap_or_else(|| panic!("pci::probed: no function {addr}"));
-    let bus_master_off = || {
-        let now = with_ecam(|ecam| ecam.read16(addr, lumen_pci::reg::COMMAND));
-        set_command(addr, now & !command::BUS_MASTER, "bus mastering off after a failed probe");
-    };
     let state = match outcome {
         Probed::Bound => SlotState::Bound(driver),
         Probed::Failed(why) => {
-            bus_master_off();
+            bus_master_off(addr, "bus mastering off after a failed probe");
             SlotState::Failed(driver, why)
         }
         Probed::Declined if live => {
             warn!(target: "pci", "{addr}: {driver} declined it but kept its resources: recorded as failed");
-            bus_master_off();
+            bus_master_off(addr, "bus mastering off after a failed probe");
             SlotState::Failed(driver, String::from("declined the device but kept its resources"))
         }
         Probed::Declined => {
@@ -696,6 +692,28 @@ pub fn probed(addr: PciAddr, driver: &'static str, outcome: Probed) -> Binding {
     let binding = state.binding();
     with_slot(addr, |slot| slot.state = state);
     binding
+}
+
+/// Turn `addr`'s bus mastering off (`what`: why, for a mismatch warning).
+fn bus_master_off(addr: PciAddr, what: &str) {
+    let now = with_ecam(|ecam| ecam.read16(addr, lumen_pci::reg::COMMAND));
+    set_command(addr, now & !command::BUS_MASTER, what);
+}
+
+/// A bound driver gave its device up after binding (it already dropped or reset it): record `<driver>: failed: <why>` and turn bus mastering off. Changes nothing and returns false unless the function is bound to `driver` (e.g. already failed, still probing, or someone else's).
+pub fn failed_after_bind(addr: PciAddr, driver: &'static str, why: String) -> bool {
+    let live = with_slot(addr, |slot| match slot.state {
+        SlotState::Bound(d) if d == driver => Some(slot.resources_live),
+        _ => None,
+    })
+    .flatten();
+    let Some(live) = live else { return false };
+    if live {
+        warn!(target: "pci", "{addr}: {driver} gave the device up but its resources are still live");
+    }
+    bus_master_off(addr, "bus mastering off after its driver gave the device up");
+    with_slot(addr, |slot| slot.state = SlotState::Failed(driver, why));
+    true
 }
 
 /// A claimed function's resources, and nothing else: its `DeviceInfo`, its
