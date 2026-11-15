@@ -399,18 +399,21 @@ fn px(v: i64) -> usize {
     usize::try_from(v).unwrap_or(0)
 }
 
-/// `random()`: any integer; `random(n)`: 0 to n - 1 (n above 0).
-fn random(below: Option<i64>) -> Result<i64, Box<EvalAltResult>> {
-    let refused = |e: crate::rng::NoSource| -> Box<EvalAltResult> { alloc::format!("random: {e}").into() };
-    match below {
-        None => {
-            let mut b = [0u8; 8];
-            crate::rng::fill(&mut b).map_err(refused)?;
-            Ok(i64::from_le_bytes(b))
-        }
-        Some(n) if n > 0 => Ok(crate::rng::below(n as u64).map_err(refused)? as i64),
-        Some(n) => Err(alloc::format!("random({n}): expected a bound above 0").into()),
+fn random_refused(e: crate::rng::NoSource) -> Box<EvalAltResult> {
+    alloc::format!("random: {e}").into()
+}
+
+/// `random()`: any integer.
+fn random_any() -> Result<i64, Box<EvalAltResult>> {
+    Ok(crate::rng::u64().map_err(random_refused)? as i64)
+}
+
+/// `random(n)`: 0 to n - 1 (n above 0).
+fn random_below(n: i64) -> Result<i64, Box<EvalAltResult>> {
+    if n <= 0 {
+        return Err(alloc::format!("random({n}): expected a bound above 0").into());
     }
+    Ok(crate::rng::below(n as u64).map_err(random_refused)? as i64)
 }
 
 /// A colour from a script (`0xRRGGBB`; higher bits ignored).
@@ -667,8 +670,8 @@ fn engine(state: &Rc<State>) -> Engine {
     e.register_fn("mem", mem);
     e.register_fn("uptime", || crate::time::since_boot_ns().map_or(0, |ns| (ns / 1_000_000) as i64));
     e.register_fn("trace", trace);
-    e.register_fn("random", || random(None));
-    e.register_fn("random", |n: i64| random(Some(n)));
+    e.register_fn("random", random_any);
+    e.register_fn("random", random_below);
     let s = state.clone();
     e.register_fn("sleep", move |ms: i64| sleep(&s, ms));
 

@@ -183,7 +183,7 @@ def test_lspci_lists_virtio_devices(boot):
     assert "WARN  pci" not in m.output
 
 
-def test_lspci_shows_no_driver(boot):
+def test_lspci_driver_column(boot):
     # Only virtio-rng has a driver row so far (each driver's issue adds one
     # and tests its own probe outcome: rng in test_dev): every other
     # function, the other virtio ones included, shows "no driver".

@@ -11,23 +11,32 @@
 //!   second half) and the pool's next key (its first half), so neither
 //!   reveals the other, and a pool key read later can't recover streams
 //!   handed out before.
-//! - Each use of the block function gets its own nonce (a domain word, then
-//!   a 64-bit counter), so absorbing, splitting and streaming never share a
-//!   keystream.
+//! - Each use of the block function gets a nonce of its own: absorbing and
+//!   splitting use their domain word and their own 64-bit count, a stream
+//!   uses the stream domain and the high half of its 64-bit block number
+//!   (the low half is the block counter), so absorbing, splitting and
+//!   streaming never share a keystream.
 //! - The pool counts the bytes it was given (each is credited as one byte of
 //!   entropy: the kernel only mixes in its sources' output) and refuses to
-//!   hand out a stream until it has [`SEED_BYTES`].
+//!   hand out a stream until it has [`SEED_BYTES`]. Streams come only from
+//!   a seeded pool (`Stream`'s constructor is private).
+//! - Pure helpers for the kernel's sources, host-tested with fakes:
+//!   [`retry`] (a hardware draw tried up to [`RETRIES`] times),
+//!   [`fill_words`], [`all_same`] (a stuck source, or a device answering one
+//!   repeated byte) and [`below`] (a number below a bound, without modulo
+//!   bias).
 //!
 //! Not audited, not constant-time-reviewed: a hobby OS's randomness. The
-//! code is safe Rust; keys are cleared on drop on a best-effort basis
-//! (nothing stops an earlier copy surviving on a stack).
+//! code is safe Rust. Keys and buffers are cleared ([`clear`]) when dropped
+//! or used up, but the compiler may still keep copies elsewhere (registers,
+//! moved-from stack slots): clearing is not a guarantee.
 
 #![cfg_attr(not(test), no_std)]
 
 /// The key length (bytes).
-pub const KEY_LEN: usize = 32;
+const KEY_LEN: usize = 32;
 /// The block length (bytes).
-pub const BLOCK_LEN: usize = 64;
+const BLOCK_LEN: usize = 64;
 /// How many bytes of entropy the pool needs before it hands out a stream.
 pub const SEED_BYTES: usize = 32;
 
@@ -51,22 +60,18 @@ fn quarter_round(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
     s[b] = (s[b] ^ s[c]).rotate_left(7);
 }
 
-fn word(bytes: &[u8], i: usize) -> u32 {
-    u32::from_le_bytes([bytes[4 * i], bytes[4 * i + 1], bytes[4 * i + 2], bytes[4 * i + 3]])
-}
-
 /// ChaCha20's block function (RFC 8439 section 2.3): 20 rounds over the
 /// constants, `key`, `counter` and `nonce`, plus the input, serialized
 /// little-endian.
-pub fn block(key: &[u8; KEY_LEN], counter: u32, nonce: &[u8; 12]) -> [u8; BLOCK_LEN] {
+pub(crate) fn block(key: &[u8; KEY_LEN], counter: u32, nonce: &[u8; 12]) -> [u8; BLOCK_LEN] {
     let mut input = [0u32; 16];
     input[..4].copy_from_slice(&SIGMA);
-    for i in 0..8 {
-        input[4 + i] = word(key, i);
+    for (w, b) in input[4..12].iter_mut().zip(key.as_chunks::<4>().0) {
+        *w = u32::from_le_bytes(*b);
     }
     input[12] = counter;
-    for i in 0..3 {
-        input[13 + i] = word(nonce, i);
+    for (w, b) in input[13..].iter_mut().zip(nonce.as_chunks::<4>().0) {
+        *w = u32::from_le_bytes(*b);
     }
     let mut s = input;
     for _ in 0..10 {
@@ -97,16 +102,16 @@ fn nonce(domain: u32, n: u64) -> [u8; 12] {
     out
 }
 
-/// The first or second half of a block, as a key.
-fn half(b: &[u8; BLOCK_LEN], second: bool) -> [u8; KEY_LEN] {
-    let mut key = [0u8; KEY_LEN];
-    let at = if second { KEY_LEN } else { 0 };
-    key.copy_from_slice(&b[at..at + KEY_LEN]);
-    key
+/// A block's two halves, as keys.
+fn halves(b: &[u8; BLOCK_LEN]) -> (&[u8; KEY_LEN], &[u8; KEY_LEN]) {
+    let ([first, second], _) = b.as_chunks::<KEY_LEN>() else { unreachable!("a block is two keys long") };
+    (first, second)
 }
 
-/// Clear a buffer, best effort (the compiler may not drop the stores).
-fn clear(bytes: &mut [u8]) {
+/// Overwrite a secret buffer with zeros, through `black_box` so the stores
+/// aren't optimized away as dead. Copies made earlier (registers, other
+/// stack slots) aren't reached.
+pub fn clear(bytes: &mut [u8]) {
     bytes.fill(0);
     core::hint::black_box(bytes);
 }
@@ -146,7 +151,7 @@ impl Pool {
                 *k ^= b;
             }
             let mut b = block(&self.key, chunk.len() as u32, &nonce(MIX, self.mixes));
-            self.key = half(&b, false);
+            self.key = *halves(&b).0;
             clear(&mut b);
             self.mixes = self.mixes.wrapping_add(1);
         }
@@ -171,8 +176,9 @@ impl Pool {
         }
         let mut b = block(&self.key, 0, &nonce(SPLIT, self.splits));
         self.splits = self.splits.wrapping_add(1);
-        self.key = half(&b, false);
-        let stream = Stream::new(half(&b, true));
+        let (next, stream_key) = halves(&b);
+        self.key = *next;
+        let stream = Stream::new(*stream_key);
         clear(&mut b);
         Some(stream)
     }
@@ -197,8 +203,9 @@ pub struct Stream {
 }
 
 impl Stream {
-    /// The keystream under `key`.
-    pub fn new(key: [u8; KEY_LEN]) -> Stream {
+    /// The keystream under `key` (only [`Pool::stream`] makes one, from a
+    /// seeded pool).
+    pub(crate) fn new(key: [u8; KEY_LEN]) -> Stream {
         Stream { key, next: 0, buf: [0; BLOCK_LEN], used: BLOCK_LEN }
     }
 
@@ -220,19 +227,69 @@ impl Stream {
             at += take;
         }
     }
-
-    /// The next 8 bytes of the keystream as a number (little-endian).
-    pub fn next_u64(&mut self) -> u64 {
-        let mut b = [0u8; 8];
-        self.fill(&mut b);
-        u64::from_le_bytes(b)
-    }
 }
 
 impl Drop for Stream {
     fn drop(&mut self) {
         clear(&mut self.key);
         clear(&mut self.buf);
+    }
+}
+
+/// How many times [`retry`] tries a draw (Intel's guidance for RDRAND: a
+/// failure means the generator is momentarily drained; 10 failures in a row
+/// mean something is wrong).
+pub const RETRIES: u32 = 10;
+
+/// One draw from a hardware source, tried up to [`RETRIES`] times: the first
+/// value `try_once` gives, or `None` if every try failed.
+pub fn retry(mut try_once: impl FnMut() -> Option<u64>) -> Option<u64> {
+    (0..RETRIES).find_map(|_| try_once())
+}
+
+/// A draw that failed every one of its [`RETRIES`] tries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrawFailed;
+
+/// Fill `out` with one [`retry`]ed draw per word (little-endian). If a draw
+/// fails, `out` is cleared and the error returned (no partial output).
+pub fn fill_words(out: &mut [[u8; 8]], mut try_once: impl FnMut() -> Option<u64>) -> Result<(), DrawFailed> {
+    for word in out.iter_mut() {
+        match retry(&mut try_once) {
+            Some(v) => *word = v.to_le_bytes(),
+            None => {
+                clear(out.as_flattened_mut());
+                return Err(DrawFailed);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// More than one item, all equal: a stuck source (RDRAND returning one
+/// value, a device answering one repeated byte or all zeros).
+pub fn all_same<T: PartialEq>(items: &[T]) -> bool {
+    items.len() > 1 && items.iter().all(|x| *x == items[0])
+}
+
+/// The smallest value [`below`] accepts for `bound`: `2^64 mod bound`, so
+/// the accepted values `zone_start(bound)..=u64::MAX` are a whole number
+/// of runs of `bound` values each, and `v % bound` is uniform over them.
+fn zone_start(bound: u64) -> u64 {
+    bound.wrapping_neg() % bound
+}
+
+/// A number below `bound` (above 0) from `next`'s uniform 64-bit values,
+/// without modulo bias: values below [`zone_start`] are drawn again.
+/// Panics if `bound` is 0.
+pub fn below<E>(bound: u64, mut next: impl FnMut() -> Result<u64, E>) -> Result<u64, E> {
+    assert!(bound > 0, "below(0)");
+    let min = zone_start(bound);
+    loop {
+        let v = next()?;
+        if v >= min {
+            return Ok(v % bound);
+        }
     }
 }
 
@@ -300,9 +357,6 @@ mod tests {
             pieces.extend(b);
         }
         assert_eq!(pieces, whole);
-        let mut s = Stream::new(k);
-        let a = s.next_u64();
-        assert_eq!(a.to_le_bytes(), whole[..8]);
     }
 
     #[test]
@@ -394,6 +448,143 @@ mod tests {
         s.fill(&mut b);
         assert!(s.buf[..10].iter().all(|&x| x == 0));
         assert!(s.buf[10..].iter().any(|&x| x != 0));
+    }
+
+    const KAT_FIRST: &str = "2b38654b3a9db6c10067023d1b012e8c416fdaaf0940cca8bf450835359ec32d\
+                             680214b50d251cc2aa1ccf67562050220ba4666ccfdd9e2a6daec09d851cc295\
+                             8758629251f1746ee20929890ab33440";
+    const KAT_SECOND: &str = "76c3b043d985e8ce763c303f6e3a74ac";
+
+    #[test]
+    fn a_pool_gives_known_bytes_for_known_input() {
+        // Pins the construction (the domains, the mix and split counters,
+        // the chunk length as the counter): computed once by this code.
+        let mut p = pool_of(&[&(0..40).collect::<Vec<u8>>(), b"lumen"]);
+        let mut first = [0u8; 80];
+        p.stream().unwrap().fill(&mut first);
+        let mut second = [0u8; 16];
+        p.stream().unwrap().fill(&mut second);
+        assert_eq!(first.to_vec(), hex(KAT_FIRST), "first stream");
+        assert_eq!(second.to_vec(), hex(KAT_SECOND), "second stream");
+    }
+
+    #[test]
+    fn retry_tries_ten_times_then_gives_up() {
+        let mut calls = 0;
+        assert_eq!(
+            retry(|| {
+                calls += 1;
+                None
+            }),
+            None
+        );
+        assert_eq!(calls, RETRIES);
+        // Fails 9 times, then answers: the answer.
+        let mut calls = 0;
+        assert_eq!(
+            retry(|| {
+                calls += 1;
+                (calls == RETRIES).then_some(7)
+            }),
+            Some(7)
+        );
+        // Answers at once: tried once.
+        let mut calls = 0;
+        assert_eq!(
+            retry(|| {
+                calls += 1;
+                Some(1)
+            }),
+            Some(1)
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn fill_words_fills_each_word_or_nothing() {
+        let mut out = [[0xffu8; 8]; 3];
+        let mut n = 0u64;
+        assert_eq!(
+            fill_words(&mut out, || {
+                n += 1;
+                Some(n)
+            }),
+            Ok(())
+        );
+        assert_eq!(out, [1u64.to_le_bytes(), 2u64.to_le_bytes(), 3u64.to_le_bytes()]);
+        // The second draw fails every try: nothing left behind.
+        let mut calls = 0;
+        let mut out = [[0xffu8; 8]; 3];
+        let got = fill_words(&mut out, || {
+            calls += 1;
+            (calls == 1 || calls > 1 + RETRIES as usize).then_some(5)
+        });
+        assert_eq!(got, Err(DrawFailed));
+        assert_eq!(out, [[0u8; 8]; 3]);
+        // A failure retried within its 10 tries isn't one.
+        let mut calls = 0;
+        let mut out = [[0u8; 8]; 2];
+        assert_eq!(
+            fill_words(&mut out, || {
+                calls += 1;
+                (calls % 3 == 0).then_some(9)
+            }),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn all_same_finds_a_stuck_source() {
+        assert!(all_same(&[5u64; 8]));
+        assert!(all_same(&[0u8; 32]) && all_same(&[0xabu8; 32]));
+        assert!(!all_same(&[1u64, 1, 1, 2]) && !all_same(&[2u8, 1, 1, 1]));
+        // One item (or none) proves nothing.
+        assert!(!all_same(&[0u8]) && !all_same::<u8>(&[]));
+    }
+
+    #[test]
+    fn the_zone_is_two_to_the_64_mod_the_bound() {
+        assert_eq!(zone_start(1), 0);
+        assert_eq!(zone_start(2), 0);
+        assert_eq!(zone_start(3), 1);
+        assert_eq!(zone_start(6), 4);
+        assert_eq!(zone_start(1 << 63), 0);
+        assert_eq!(zone_start((1 << 63) + 1), (1 << 63) - 1);
+        assert_eq!(zone_start(u64::MAX), 1);
+    }
+
+    fn below_from(bound: u64, values: &[u64]) -> (u64, usize) {
+        let mut it = values.iter();
+        let mut used = 0;
+        let v = below::<()>(bound, || {
+            used += 1;
+            Ok(*it.next().expect("ran out of values"))
+        })
+        .unwrap();
+        (v, used)
+    }
+
+    #[test]
+    fn below_redraws_values_before_the_zone() {
+        // 0 is before bound 3's zone (it would make 0 likelier): drawn again.
+        assert_eq!(below_from(3, &[0, 5]), (2, 2));
+        assert_eq!(below_from(3, &[1]), (1, 1));
+        assert_eq!(below_from(3, &[u64::MAX]), (0, 1));
+        let b = (1 << 63) + 1;
+        assert_eq!(below_from(b, &[0, (1 << 63) - 2, (1 << 63) - 1]), ((1 << 63) - 1, 3));
+        assert_eq!(below_from(b, &[u64::MAX]), ((1 << 63) - 2, 1));
+        // Bounds dividing 2^64 take every value.
+        assert_eq!(below_from(1, &[0]), (0, 1));
+        assert_eq!(below_from(1 << 63, &[0]), (0, 1));
+        assert_eq!(below_from(2, &[u64::MAX]), (1, 1));
+        // An error from the source is passed on.
+        assert_eq!(below(3, || Err::<u64, _>("dry")), Err("dry"));
+    }
+
+    #[test]
+    #[should_panic(expected = "below(0)")]
+    fn below_zero_panics() {
+        let _ = below::<()>(0, || Ok(1));
     }
 
     #[test]

@@ -170,9 +170,10 @@ own PR that updates that doc first.
   `probe_all` (declines, the readiness check). `virtio.rs`: the adapter for
   `virtio-drivers` (the `Hal`: DMA runs from the frame allocator, bounce
   buffers, probe attempts; `transport`, `VirtioTransport`, the device
-  status handle). `rng.rs`: randomness (`rng::fill`, `random`): RDRAND
-  and the virtio-rng driver (its own queue, bounded waits) into a ChaCha20
-  pool. `power.rs`: `reboot` and `shutdown` (ACPI S5);
+  status handle). `rng.rs`: randomness: `rng::fill`, `u64`, `below`,
+  `sources`, `stats` (the shell's `random`, rhai's `random()`), RDRAND and
+  the virtio-rng driver (its own queue, one deadline per request, dropped
+  on a failed request) feeding a ChaCha20 pool. `power.rs`: `reboot` and `shutdown` (ACPI S5);
   `arch/x86_64/reset.rs` their registers.
   `interrupts.rs`: 8259s masked, local APIC on, I/O APIC inputs masked,
   `route_isa_irq` (MADT overrides, handler registered before unmasking).
@@ -196,8 +197,10 @@ own PR that updates that doc first.
   conversion, timer counts, log time formats (`Stamp`, `Millis`),
   percentages and rates, and the RTC's registers as a date (`rtc`)
   (host-tested).
-- `crates/lumen-rand`: ChaCha20's block function (RFC 8439 vectors) and
-  the entropy pool: mixing, fast-key-erasure streams (host-tested).
+- `crates/lumen-rand`: ChaCha20's block function (RFC 8439 vectors), the
+  entropy pool (mixing, fast-key-erasure streams), and pure helpers for
+  the sources: `retry`, `fill_words`, `all_same`, `below` (host-tested
+  with fakes).
 - `crates/lumen-queue`: lock-free single-producer, single-consumer byte
   queue (interrupt handler to thread; host-tested, incl. threads).
 - `crates/lumen-term`: terminal emulator core: `vte` escapes into a cell

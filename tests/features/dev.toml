@@ -73,20 +73,32 @@ tests = [
 name = "`lspci`'s driver column: with every virtio device attached, only virtio-rng shows a driver (`virtio-rng: bound`), every other function `no driver`, and boot reports one device bound and none failed, declined or refused; the column filters like the others"
 milestone = "M3"
 tests = [
-    "scenario:test_pci::test_lspci_shows_no_driver",
+    "scenario:test_pci::test_lspci_driver_column",
 ]
 
 [[feature]]
-name = "Randomness pool (lumen-rand): ChaCha20's block function matches RFC 8439 (section 2.3.2 and appendix A.1), its keystream comes out in block order whatever the pieces it is read in (the block number carrying into the nonce past 2^32), handed-out bytes aren't kept; the pool hands out nothing until 32 bytes are mixed in, every input byte, its order and a short last chunk change the output, the same input gives the same output, each stream differs from the next and from the pool's key (fast key erasure), mixing after a stream changes the next one, and 1 MiB of output is balanced (byte chi-square, bit count)"
+name = "Randomness pool (lumen-rand): ChaCha20's block function matches RFC 8439 (section 2.3.2 and appendix A.1), its keystream comes out in block order whatever the pieces it is read in (the block number carrying into the nonce past 2^32), handed-out bytes aren't kept; the pool hands out nothing until 32 bytes are mixed in, flipped bytes at either end and at chunk edges, the input's order and a short last chunk change the output, the same input gives the same output (and a pinned known answer for two streams), each stream differs from the next and from the pool's key (fast key erasure), mixing after a stream changes the next one, and 1 MiB of output is balanced (byte chi-square, bit count); a hardware draw is tried 10 times then given up, words are filled all or nothing, a stuck source (one value, one repeated byte) is recognised but one item proves nothing; numbers below a bound redraw values before 2^64 mod bound (bounds 1, 2, 3, 6, 2^63, 2^63 + 1, 2^64 - 1), pass a source's error on, and refuse bound 0"
 milestone = "M3"
 tests = [
     "cargo:lumen-rand",
 ]
 
 [[feature]]
-name = "Randomness from RDRAND and virtio-rng: each source alone (the default CPU with virtio-rng, `cpu=max` without it) and both give `random` output that differs call to call, boot to boot, and across a 4096-byte run; boot logs the sources; with neither, boot says so (info, not a warning) and `random` (and rhai's `random()`) refuse saying why; `random`'s usage (1 to 4096 bytes); the virtio-rng device shows `virtio-rng: bound` in `lspci` and boot reports it bound; in-kernel: a request over a page (two chunks, both written) leaves the DMA run table as it was, each `fill` asks virtio-rng unless another caller has it (then skipped and counted, the probe-seeded pool still answering), `rng::below` stays below its bound and reaches every value"
+name = "Randomness from RDRAND and virtio-rng: each source alone (the default CPU with virtio-rng, `cpu=max` without it) and both give `random` output that differs call to call and across a 4096-byte run, boot logs the sources and `random --stats` shows them, with no rng warning; two boots differ with each source alone; with neither, boot says so (info, not a warning, naming QEMU's options) and `random` (and rhai's `random()`) refuse saying why; `random`'s usage (1 to 4096 bytes, `--stats`); the virtio-rng device shows `virtio-rng: bound` in `lspci` and boot reports it bound; a second virtio-rng device is declined (one bound, `lspci` shows the other declined); a rate-limited device that misses a request's second is dropped with a warning saying no source is left, `lspci` shows `virtio-rng: failed: <why>`, and `random` goes on answering from the pool; in-kernel: a request over a page posts two buffers and leaves the DMA run table as it was, each `fill` asks virtio-rng and mixes in its 32 bytes unless another caller has the device (then skipped and counted, nothing mixed in, the probe-seeded pool still answering), `rng::below` stays below its bound and reaches every value"
 milestone = "M3"
 tests = [
-    "scenario:test_dev::*",
-    "ktest:lumen_kernel::rng::*",
+    "scenario:test_dev::test_random_with_only_virtio_rng",
+    "scenario:test_dev::test_random_with_only_rdrand",
+    "scenario:test_dev::test_random_with_both_sources",
+    "scenario:test_dev::test_random_refuses_without_a_source",
+    "scenario:test_dev::test_random_usage",
+    "scenario:test_dev::test_random_differs_between_boots[rdrand]",
+    "scenario:test_dev::test_random_differs_between_boots[virtio-rng]",
+    "scenario:test_dev::test_lspci_shows_rng_bound",
+    "scenario:test_dev::test_a_second_virtio_rng_is_declined",
+    "scenario:test_dev::test_a_virtio_rng_that_stops_answering_is_dropped",
+    "ktest:lumen_kernel::rng::rdrand_or_virtio_available",
+    "ktest:lumen_kernel::rng::no_bounce_outstanding_after_a_request",
+    "ktest:lumen_kernel::rng::a_fill_uses_virtio_rng_unless_another_caller_has_it",
+    "ktest:lumen_kernel::rng::below_stays_below_its_bound",
 ]

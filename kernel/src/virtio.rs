@@ -82,6 +82,7 @@
 // only by the ktests until more drivers than rng (#97) use them.
 #![cfg_attr(not(feature = "ktest"), allow(dead_code))]
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 use core::mem::ManuallyDrop;
@@ -412,6 +413,8 @@ pub enum ProbeError {
     /// share an id, told apart only by their configuration): `probe_all`
     /// frees the function and offers it to the next driver row.
     NotMine,
+    /// The device can't be used by this driver: its configuration or behaviour.
+    Unusable(String),
 }
 
 impl fmt::Display for ProbeError {
@@ -425,6 +428,7 @@ impl fmt::Display for ProbeError {
             }
             ProbeError::Wait(e) => write!(f, "{e}"),
             ProbeError::NotMine => f.write_str("not this driver's device"),
+            ProbeError::Unusable(why) => write!(f, "unusable device: {why}"),
         }
     }
 }

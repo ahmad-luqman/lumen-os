@@ -424,7 +424,7 @@ impl BarMapping {
         self.phys
     }
 
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: rng (#97) or #96's MSI-X table
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: #96's MSI-X table
     pub fn virt(&self) -> VirtAddr {
         self.virt
     }
@@ -693,6 +693,25 @@ pub fn probed(addr: PciAddr, driver: &'static str, outcome: Probed) -> Binding {
             SlotState::Free { declined_by: Some(driver) }
         }
     };
+    let binding = state.binding();
+    with_slot(addr, |slot| slot.state = state);
+    binding
+}
+
+/// Record that `driver`'s bound device stopped working and the driver
+/// dropped it (no reaping or re-init: rng #97 drops a virtio-rng device
+/// whose request failed): `lspci` shows `<driver>: failed: <why>`, and bus
+/// mastering is turned off (the driver already reset it). Panics unless
+/// `driver` has `addr` bound (a driver bug). Returns the binding recorded.
+pub fn failed_after_bind(addr: PciAddr, driver: &'static str, why: String) -> Binding {
+    with_slot(addr, |slot| match slot.state {
+        SlotState::Bound(d) if d == driver => {}
+        ref other => panic!("pci::failed_after_bind: {addr} isn't bound to {driver} ({})", other.binding()),
+    })
+    .unwrap_or_else(|| panic!("pci::failed_after_bind: no function {addr}"));
+    let now = with_ecam(|ecam| ecam.read16(addr, lumen_pci::reg::COMMAND));
+    set_command(addr, now & !command::BUS_MASTER, "bus mastering off after its driver dropped it");
+    let state = SlotState::Failed(driver, why);
     let binding = state.binding();
     with_slot(addr, |slot| slot.state = state);
     binding

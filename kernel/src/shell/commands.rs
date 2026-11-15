@@ -86,8 +86,9 @@ pub static COMMANDS: Table<Run> = Table(&[
     Command {
         name: "random",
         args: &[],
-        usage: "[bytes]",
-        about: "random bytes in hex (default 16, up to 4096), from RDRAND and virtio-rng",
+        usage: "[bytes | --stats]",
+        about: "random bytes in hex (default 16, up to 4096) from the pool RDRAND and/or virtio-rng feed; \
+                --stats: its sources and counters",
         run: random,
     },
     Command { name: "uptime", args: &[], usage: "", about: "nanoseconds since the TSC started", run: uptime },
@@ -524,17 +525,36 @@ fn seq(ctx: &mut Ctx<'_>, args: &[String]) {
     }
 }
 
+/// `random`'s default and largest byte counts.
+const RANDOM_BYTES: usize = 16;
+const RANDOM_MAX: usize = 4096;
+
 fn random(ctx: &mut Ctx<'_>, args: &[String]) {
-    let n = if args.is_empty() { Some(16) } else { number::<usize>(args) };
-    let Some(n) = n.filter(|n| (1..=4096).contains(n)) else {
-        return ctx.fail("usage: random [bytes] (1 to 4096)");
+    if matches!(args, [a] if a == "--stats") {
+        let _ = writeln!(ctx.out, "rng: sources: {}; {}", crate::rng::sources(), crate::rng::stats());
+        return;
+    }
+    let n = if args.is_empty() { Some(RANDOM_BYTES) } else { number::<usize>(args) };
+    let Some(n) = n.filter(|n| (1..=RANDOM_MAX).contains(n)) else {
+        return ctx.fail(format_args!("usage: random [bytes | --stats] (bytes: 1 to {RANDOM_MAX})"));
     };
-    match crate::rng::hex(n) {
+    match random_hex(n) {
         Ok(hex) => {
             let _ = writeln!(ctx.out, "{hex}");
         }
         Err(e) => ctx.fail(format_args!("random: {e}")),
     }
+}
+
+/// `n` random bytes as lowercase hex.
+fn random_hex(n: usize) -> Result<String, crate::rng::NoSource> {
+    let mut bytes = alloc::vec![0u8; n];
+    crate::rng::fill(&mut bytes)?;
+    let mut s = String::with_capacity(2 * n);
+    for b in &bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    Ok(s)
 }
 
 fn sleep(ctx: &mut Ctx<'_>, args: &[String]) {

@@ -1173,7 +1173,8 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   name is there twice, and the layout), `echo` (its words joined by
   single spaces), `int3`, `crash <kind> [cpu|thread]` (the thread is
   `shell-crash`), `trace [n]`, `heap`, `ticks`, `kbd`, `term [text]`,
-  `clear`, `vt [n]` (the virtual terminals: above), `colors`, `seq`, `sleep`, `uptime`, `clocks`, `exit` (kmon's;
+  `clear`, `vt [n]` (the virtual terminals: above), `colors`, `seq`, `sleep`, `random [bytes | --stats]`
+  (section 7, "Randomness"), `uptime`, `clocks`, `exit` (kmon's;
   besides what this list says, the deliberate panic now says `from the
   shell`, and `crash <kind> <cpu>` reports a fault that returned) and
   `history` (the console's lines, numbered), `reboot` and `shutdown` (see
@@ -1349,7 +1350,9 @@ section 2).
   `mem()` (`heap_size`, `heap_used`, `heap_free`, `heap_live`),
   `uptime()` (ms since the boot timeline's origin), `trace(n)` (the last n
   events of this CPU's ring, the boot CPU's, where both shells run; gap
-  lines included), `sleep(ms)` (clamped to 0 to 60 s), `print` and `debug`
+  lines included), `sleep(ms)` (clamped to 0 to 60 s), `random()` (any
+  integer) and `random(n)` (0 to n - 1, n above 0; both refuse while no
+  randomness source has ever answered: section 7), `print` and `debug`
   (to the console), and drawing on the terminal's canvas:
   `draw_pixel(x, y, rgb)` (nothing off the canvas), `draw_rect(x, y, w, h,
   rgb)` (clipped), `draw_text(x, y, text, rgb[, bg])` (text starting above
@@ -1437,7 +1440,7 @@ section 2).
 - **Not yet:** scripts from files (M6), floats, capturing closures,
   scripts in user mode (M9), a script running in the background.
 
-## 7. Driver interface (M3: PCI discovery, claiming and the virtio adapter built; MSI-X planned; device classes later)
+## 7. Driver interface (M3: PCI discovery, claiming, the virtio adapter and virtio-rng built; MSI-X planned; device classes later)
 
 PCI discovery (#94), claiming and the virtio adapter (#95) are built; MSI-X
 is planned (#96), with the tests it lists. The first drivers (#97-#99) add
@@ -1637,13 +1640,12 @@ pub struct Driver {
   and every sound control request (`pcm_set_params`, `pcm_prepare`,
   `pcm_start`, `pcm_stop`, `pcm_release`, and `set_up`'s info queries,
   which the first `pcm_xfer_nb` also reaches) use the crate's
-  `add_notify_wait_pop`, an unbounded spin. So (planned with those
-  drivers):
+  `add_notify_wait_pop`, an unbounded spin. So:
   - rng (#97) drives its own `virtio_drivers::queue::VirtQueue` (public:
     `add`, `pop_used`) over `VirtioTransport`, with a bounded wait
     ("Randomness", below);
-  - sound's (#99) control path is a known unbounded wait, done once at
-    setup, outside the playback path.
+  - sound's (#99, planned) control path is a known unbounded wait, done
+    once at setup, outside the playback path.
   `PciTransport`'s `Drop` spins until the device status reads 0, so
   `VirtioTransport`'s own `Drop` writes 0 and waits up to 100 ms for the
   status to read 0 (no early exit on the status from before the reset),
@@ -1834,41 +1836,67 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
 
 ### Randomness (#97)
 
-`rng::fill(&mut [u8]) -> Result<(), NoSource>` (and `rng::below(n)`,
-unbiased) hands out bytes from a ChaCha20 pool (`lumen-rand`, host-tested
-against RFC 8439's vectors) fed by two sources:
+`rng::fill(&mut [u8]) -> Result<(), NoSource>`, `rng::u64()` and
+`rng::below(n)` (unbiased: `lumen_rand::below`) hand out bytes from a
+ChaCha20 pool (`lumen-rand`, host-tested against RFC 8439's vectors and a
+known answer of its own) fed by two sources:
 
 - **RDRAND**, when CPUID leaf 1 says so (QEMU's default `qemu64` has none;
-  `-cpu max` has it). Each 64-bit draw is retried up to 10 times (a failure
-  means "drained for now", never "gone"); a draw that still fails leaves
-  RDRAND out of that call only. At boot a CPU whose RDRAND returns one value
-  8 times running isn't used. The instruction itself is in
-  `arch::x86_64::cpu` (`has_rdrand`, `rdrand`), behind the HAL boundary.
-- **virtio-rng** (`DRIVERS` row `virtio-rng`, virtio device type 4):
-  negotiates only `VERSION_1` (no indirect descriptors, no event index),
-  one 8-entry queue, and drives it itself: `add`, notify, a bounded wait
-  (`StatusHandle::wait_until`, 1 s per chunk, ended early by
-  `DEVICE_NEEDS_RESET`/`FAILED`), `pop_used`; a request goes in chunks of
-  at most a page, a short answer is asked again for the rest, and 8 empty
-  answers in a row or a length past the buffer is an error. The probe makes
-  one request, the pool's first seed: a device that doesn't answer fails the
-  probe (`lspci`: `virtio-rng: failed: ...`). A device that fails a later
-  request is dropped (its transport resets it; the unanswered request's
-  bounce frame stays outstanding, leaked) and the pool goes on with RDRAND,
-  if any.
+  `-cpu max` has it). The instruction is in `arch::x86_64::cpu` behind the
+  HAL boundary: `Rdrand::detect()` gives a token, and only the token runs it
+  (`try_once`). Each 64-bit draw is tried up to 10 times
+  (`lumen_rand::retry`); a draw that still fails leaves RDRAND out of that
+  request only (counted, warned about at the 1st, 1024th, 2048th...). At
+  boot it draws a 64-byte seed: if the boot CPU's RDRAND gave one value for
+  all 8 words it is never used (not checked per CPU); if a draw failed the
+  seed is tried again on the next request; otherwise the seed is mixed in
+  and RDRAND is in use from then on, never before it seeded the pool.
+- **virtio-rng** (`DRIVERS` row `virtio-rng`, virtio device type 4; one
+  device: a second is declined, `ProbeError::NotMine`, before its
+  transport is touched): negotiates only `VERSION_1` (no indirect
+  descriptors, no event index), one 8-entry queue, and drives it itself:
+  `add`, notify, a bounded wait (`StatusHandle::wait_until`, ended early by
+  `DEVICE_NEEDS_RESET`/`FAILED`), `pop_used`. A request has 1 s in all,
+  however many buffers it takes: at most a page per buffer, a short answer
+  asked again for the rest; 8 empty answers in a row or a length past the
+  buffer is an error. The probe makes one request, the pool's first seed: a
+  device that doesn't answer fails the probe (`lspci`: `virtio-rng: failed:
+  ...`), and so does one answering 32 bytes of one value
+  (`ProbeError::Unusable`, the variant #98 and #99 share for a device a
+  driver can't use, with the reason; so are the empty and too-long
+  answers). Later, an answer of one repeated byte isn't mixed in (warned,
+  counted).
+- **A failed request consumes the device** (`Device::request` takes it by
+  value and gives it back only on success). It is dropped: its transport
+  resets it, and the bounce frame of the buffer it never answered, after a
+  wait that gave up, stays outstanding, leaked. `pci::failed_after_bind`
+  records it, so `lspci` shows `virtio-rng: failed: <reason>` and bus
+  mastering is off. It is never reaped or re-initialized; the pool goes on
+  with RDRAND, if any.
 
-Each `fill` draws 32 bytes from every source it can use, mixes them in,
-and hands out a stream keyed from the pool by fast key erasure (one block
-gives the stream's key and the pool's next key). With neither source the
-pool is never seeded and `fill` refuses; boot says so (info, not a
-warning: QEMU's default machine has neither). **Concurrent
+Each `fill` draws 32 bytes from every source in use, mixes them in, and
+hands out a stream keyed from the pool by fast key erasure (one block gives
+the stream's key and the pool's next key). **Once seeded, the pool always
+answers**, even after every source is lost (a cryptographic generator:
+unpredictable without its key; the warning that drops the last source says
+so). Only a pool never seeded refuses (`NoSource`: "no randomness source has
+answered", naming the QEMU options that add one); boot says so as info, not
+a warning, because QEMU's default machine has neither. **Concurrent
 callers:** the pool's `SpinLock` is held only to mix and split; the
-virtio device sits in an `Option` behind its own `SpinLock`, taken out for a
-request made with no lock held (the wait busy-waits; a `SpinLock` keeps
+virtio device sits in an `Option` behind its own `SpinLock`, taken out for
+a request made with no lock held (the wait busy-waits; a `SpinLock` keeps
 interrupts off) and put back after. A caller finding it taken skips it for
 that call (counted): the pool was seeded at probe, so its output stays
-unpredictable, and RDRAND still adds fresh input when present. The shell's
-`random [bytes]` prints hex; rhai has `random()` and `random(n)`.
+unpredictable, and RDRAND still adds fresh input when in use. The shell's
+`random [bytes]` prints hex, `random --stats` the sources and counters;
+rhai has `random()` and `random(n)`. `make run` attaches virtio-rng.
+
+Not tested on their own: RDRAND failing (the retry limit and the
+stuck-value check run only against fakes, on the host), a device that
+needs a reset or answers empty, too long or one repeated byte (QEMU's
+always answers well; only a device too slow to answer is tested, with
+QEMU's rate limit), and two callers really racing for the device (the
+busy path is tested by taking the device).
 
 ### Interrupts for devices: MSI-X (#96)
 
