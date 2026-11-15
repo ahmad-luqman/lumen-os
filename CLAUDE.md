@@ -167,9 +167,10 @@ own PR that updates that doc first.
   and `pci::status`), the registry (one slot per function: its BARs'
   mappings and who claimed it), `pci::claim`, `DeviceResources` and
   `FunctionConfig`. `drivers.rs`: the driver table (`DRIVERS`) and
-  `probe_all`. `virtio.rs`: the adapter for `virtio-drivers` (the `Hal`:
-  DMA runs from the frame allocator, bounce buffers; `transport`,
-  `VirtioTransport`, the device status handle). `power.rs`: `reboot` and `shutdown` (ACPI S5);
+  `probe_all` (declines, the readiness check). `virtio.rs`: the adapter for
+  `virtio-drivers` (the `Hal`: DMA runs from the frame allocator, bounce
+  buffers, probe attempts; `transport`, `VirtioTransport`, the device
+  status handle). `power.rs`: `reboot` and `shutdown` (ACPI S5);
   `arch/x86_64/reset.rs` their registers.
   `interrupts.rs`: 8259s masked, local APIC on, I/O APIC inputs masked,
   `route_isa_irq` (MADT overrides, handler registered before unmasking).
@@ -211,9 +212,11 @@ own PR that updates that doc first.
 - `crates/lumen-pci`: PCI configuration space behind a `ConfigSpace` trait:
   headers, BAR sizing, the capability list walked with a loop guard, a
   brute-force multi-function scan into `DeviceInfo`, ECAM offsets, the
-  warnings' text (`Problem`), names for q35's and the virtio devices, and
-  virtio's capabilities with the check before `PciTransport::new`
-  (`virtio`) (host-tested against a fake configuration space).
+  warnings' text (`Problem`), names for q35's and the virtio devices,
+  finding the MSI/MSI-X capability a write would land in
+  (`CapList::interrupt_cap_at`, `msi_len`), and virtio's capabilities with
+  the checks around `PciTransport::new` (`virtio`) (host-tested against a
+  fake configuration space).
 - `crates/lumen-uart`: 16550 UART logic: presence probe (scratch or
   interrupt enable register), FIFO detection, `\n` as `\r\n` in 15-byte
   bursts (one FIFO slot left for the crash reporter's byte) (host-tested

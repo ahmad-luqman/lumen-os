@@ -68,7 +68,9 @@ pub mod common {
     pub const QUEUE_MSIX_VECTOR: u64 = 26;
     /// `queue_notify_off`, 16 bits.
     pub const QUEUE_NOTIFY_OFF: u64 = 30;
-    /// The structure's length: up to `queue_device`'s 8 bytes at 48.
+    /// What `virtio-drivers`' `CommonCfg` maps: through `queue_device`'s 8
+    /// bytes at 48 (virtio 1.2's full structure is 60 bytes, with
+    /// `queue_notify_data` and `queue_reset`, which the crate doesn't use).
     pub const LEN: u32 = 56;
 }
 
@@ -177,7 +179,7 @@ pub enum CapProblem {
     TooShort { cap: VirtioCap, need: u32 },
     /// Queue `queue`'s notify register (`queue_notify_off` times the
     /// multiplier) isn't inside the notify structure.
-    NotifyPastEnd { cap: VirtioCap, queue: u16, offset: u64 },
+    NotifyPastEnd { cap: VirtioCap, queue: u16, notify_off: u16, multiplier: u32 },
 }
 
 impl fmt::Display for CapProblem {
@@ -207,11 +209,19 @@ impl fmt::Display for CapProblem {
             CapProblem::TooShort { cap, need } => {
                 write!(f, "the {} structure is {:#x} bytes, shorter than {need:#x}", name(cap), cap.length)
             }
-            CapProblem::NotifyPastEnd { cap, queue, offset } => write!(
-                f,
-                "queue {queue}'s notify register at {offset:#x} is outside the notification structure ({:#x} bytes)",
-                cap.length
-            ),
+            CapProblem::NotifyPastEnd { cap, queue, notify_off, multiplier } => {
+                let offset = u64::from(*notify_off) * u64::from(*multiplier);
+                write!(
+                    f,
+                    "queue {queue}'s notify register at {offset:#x} (queue_notify_off {notify_off} times {multiplier}) \
+                     is outside the notification structure ({:#x} bytes)",
+                    cap.length
+                )?;
+                if *notify_off == u16::MAX && *multiplier == u32::MAX {
+                    f.write_str(": both read all ones, the device isn't responding")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -259,6 +269,6 @@ pub fn notify_fits(notify: VirtioCap, multiplier: u32, queue: u16, queue_notify_
     if offset / 2 < u64::from(notify.length) / 2 {
         Ok(())
     } else {
-        Err(CapProblem::NotifyPastEnd { cap: notify, queue, offset })
+        Err(CapProblem::NotifyPastEnd { cap: notify, queue, notify_off: queue_notify_off, multiplier })
     }
 }

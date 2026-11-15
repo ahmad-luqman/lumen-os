@@ -18,9 +18,10 @@
 //!    controllers (8259s masked, local APIC on, I/O APIC inputs masked), the
 //!    TSC and local APIC timer calibrated, interrupts on, the scheduler
 //!    started on every CPU (`kmain`'s context becomes the `main` thread);
-//!    then the framebuffer and its terminal, the PS/2 keyboard, `boot
-//!    complete` and the boot timeline, then either the in-kernel tests
-//!    (`--features ktest`) or the shells (`shell::run`).
+//!    then the framebuffer and its terminal, the PS/2 keyboard, the drivers
+//!    (`drivers::probe_all`: each PCI function offered to the driver
+//!    table), `boot complete` and the boot timeline, then either the
+//!    in-kernel tests (`--features ktest`) or the shells (`shell::run`).
 
 #![no_std]
 #![no_main]

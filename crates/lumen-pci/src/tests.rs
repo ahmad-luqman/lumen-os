@@ -675,17 +675,21 @@ fn the_boot_log_line_names_the_function() {
     assert_eq!(DeviceInfo::read(&mut cs, a).unwrap().virtio_type(), Some(4));
 }
 
-/// [`virtio_rng`] with its virtio capabilities filled in as QEMU does: the
-/// PCI-configuration-access one (type 5, BAR 0, length 0) at 0x84, notify at
-/// 0x70 (length field 20, its multiplier after), device at 0x60, ISR at 0x50
-/// and common at 0x40, each 4 KiB of BAR 4.
+/// [`virtio_rng`]'s virtio capabilities as QEMU lays them out, in list
+/// order: the PCI-configuration-access one (type 5, BAR 0, length 0) at
+/// 0x84, notify at 0x70 (length field 20, its multiplier after), device at
+/// 0x60, ISR at 0x50 and common at 0x40, each 4 KiB of BAR 4.
+const RNG_CAPS: [virtio::VirtioCap; 5] = [
+    vcap(0x84, 20, 5, 0, 0, 0),
+    vcap(0x70, 20, virtio::NOTIFY_CFG, 4, 0x3000, 0x1000),
+    vcap(0x60, 16, virtio::DEVICE_CFG, 4, 0x2000, 0x1000),
+    vcap(0x50, 16, virtio::ISR_CFG, 4, 0x1000, 0x1000),
+    vcap(0x40, 16, virtio::COMMON_CFG, 4, 0, 0x1000),
+];
+
+/// [`virtio_rng`] with [`RNG_CAPS`] filled in.
 fn virtio_rng_caps() -> Function {
-    virtio_rng()
-        .virtio_cap(0x84, 20, 5, 0, 0, 0)
-        .virtio_cap(0x70, 20, virtio::NOTIFY_CFG, 4, 0x3000, 0x1000)
-        .virtio_cap(0x60, 16, virtio::DEVICE_CFG, 4, 0x2000, 0x1000)
-        .virtio_cap(0x50, 16, virtio::ISR_CFG, 4, 0x1000, 0x1000)
-        .virtio_cap(0x40, 16, virtio::COMMON_CFG, 4, 0, 0x1000)
+    RNG_CAPS.iter().fold(virtio_rng(), |f, c| f.virtio_cap(c.at, c.cap_len, c.cfg_type, c.bar, c.offset, c.length))
 }
 
 fn virtio_caps(f: Function) -> Vec<virtio::VirtioCap> {
@@ -695,23 +699,13 @@ fn virtio_caps(f: Function) -> Vec<virtio::VirtioCap> {
     d.caps.iter().filter(|c| c.id == cap::id::VENDOR).map(|c| virtio::VirtioCap::read(&mut cs, a, c)).collect()
 }
 
-fn vcap(at: u8, cap_len: u8, cfg_type: u8, bar: u8, offset: u32, length: u32) -> virtio::VirtioCap {
+const fn vcap(at: u8, cap_len: u8, cfg_type: u8, bar: u8, offset: u32, length: u32) -> virtio::VirtioCap {
     virtio::VirtioCap { at, cap_len, cfg_type, bar, offset, length }
 }
 
 #[test]
 fn virtio_capabilities_are_read_in_list_order() {
-    let caps = virtio_caps(virtio_rng_caps());
-    assert_eq!(
-        caps,
-        [
-            vcap(0x84, 20, 5, 0, 0, 0),
-            vcap(0x70, 20, virtio::NOTIFY_CFG, 4, 0x3000, 0x1000),
-            vcap(0x60, 16, virtio::DEVICE_CFG, 4, 0x2000, 0x1000),
-            vcap(0x50, 16, virtio::ISR_CFG, 4, 0x1000, 0x1000),
-            vcap(0x40, 16, virtio::COMMON_CFG, 4, 0, 0x1000),
-        ]
-    );
+    assert_eq!(virtio_caps(virtio_rng_caps()), RNG_CAPS);
     // Fields past the 256-byte header aren't read: a capability at 0xfc
     // has only its header dword.
     let near_end = virtio_caps(virtio_rng().caps(0xfc, &[(0xfc, 9, 0)]).virtio_cap(0xfc, 16, 1, 4, 0, 0));
@@ -720,11 +714,9 @@ fn virtio_capabilities_are_read_in_list_order() {
 
 #[test]
 fn used_keeps_what_pci_transport_new_keeps() {
-    let u = virtio::used(virtio_caps(virtio_rng_caps()));
-    assert_eq!(u.common, Some(vcap(0x40, 16, virtio::COMMON_CFG, 4, 0, 0x1000)));
-    assert_eq!(u.notify, Some(vcap(0x70, 20, virtio::NOTIFY_CFG, 4, 0x3000, 0x1000)));
-    assert_eq!(u.isr, Some(vcap(0x50, 16, virtio::ISR_CFG, 4, 0x1000, 0x1000)));
-    assert_eq!(u.device, Some(vcap(0x60, 16, virtio::DEVICE_CFG, 4, 0x2000, 0x1000)));
+    let u = virtio::used(RNG_CAPS);
+    assert_eq!((u.common, u.notify), (Some(RNG_CAPS[4]), Some(RNG_CAPS[1])));
+    assert_eq!((u.isr, u.device), (Some(RNG_CAPS[3]), Some(RNG_CAPS[2])));
     assert_eq!(u.iter().map(|c| c.cfg_type).collect::<Vec<_>>(), [1, 2, 3, 4]);
     // The first of each type counts; a length field below 16 is skipped,
     // and a notify capability needs 20 (its multiplier follows).
@@ -745,7 +737,7 @@ fn used_keeps_what_pci_transport_new_keeps() {
 #[test]
 fn check_wants_each_kept_structure_inside_a_mapped_bar() {
     use virtio::CapProblem;
-    let caps = virtio_caps(virtio_rng_caps());
+    let caps = RNG_CAPS;
     let bar4 = |size| move |bar| (bar == 4).then_some(size);
     // QEMU's layout in its 16 KiB BAR 4 passes.
     assert_eq!(virtio::check(&caps, bar4(0x4000)), Ok(virtio::used(caps.iter().copied())));
@@ -807,12 +799,17 @@ fn a_queues_notify_register_must_be_inside_the_notify_structure() {
     assert_eq!(virtio::notify_fits(notify, 4, 3, 1023), Ok(()));
     assert_eq!(
         virtio::notify_fits(notify, 4, 3, 1024),
-        Err(CapProblem::NotifyPastEnd { cap: notify, queue: 3, offset: 0x1000 })
+        Err(CapProblem::NotifyPastEnd { cap: notify, queue: 3, notify_off: 1024, multiplier: 4 })
     );
     // A 2-byte structure holds exactly one register, at 0.
     let tiny = vcap(0x70, 20, virtio::NOTIFY_CFG, 4, 0, 2);
     assert_eq!(virtio::notify_fits(tiny, 0, 5, 77), Ok(()));
+    assert_eq!(virtio::notify_fits(tiny, 0, 0, 1), Ok(()));
     assert!(virtio::notify_fits(tiny, 2, 0, 1).is_err());
+    // An odd length: the crate sees length / 2 registers (one here).
+    let odd = vcap(0x70, 20, virtio::NOTIFY_CFG, 4, 0, 3);
+    assert_eq!(virtio::notify_fits(odd, 1, 0, 1), Ok(()));
+    assert!(virtio::notify_fits(odd, 2, 0, 1).is_err());
     // No overflow at the extremes.
     assert!(virtio::notify_fits(notify, u32::MAX, 0, u16::MAX).is_err());
 }
@@ -890,9 +887,21 @@ fn virtio_cap_problems_say_which_structure_and_why() {
             CapProblem::NotifyPastEnd {
                 cap: vcap(0x70, 20, virtio::NOTIFY_CFG, 4, 0, 0x1000),
                 queue: 2,
-                offset: 0x1000,
+                notify_off: 0x400,
+                multiplier: 4,
             },
-            "queue 2's notify register at 0x1000 is outside the notification structure (0x1000 bytes)",
+            "queue 2's notify register at 0x1000 (queue_notify_off 1024 times 4) is outside the notification \
+             structure (0x1000 bytes)",
+        ),
+        (
+            CapProblem::NotifyPastEnd {
+                cap: vcap(0x70, 20, virtio::NOTIFY_CFG, 4, 0, 0x1000),
+                queue: 0,
+                notify_off: u16::MAX,
+                multiplier: u32::MAX,
+            },
+            "queue 0's notify register at 0xfffeffff0001 (queue_notify_off 65535 times 4294967295) is outside the \
+             notification structure (0x1000 bytes): both read all ones, the device isn't responding",
         ),
     ];
     for (problem, want) in cases {

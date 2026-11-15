@@ -1445,7 +1445,7 @@ M3 lays the layer drivers stand on: finding PCI devices (#94), handing a
 driver exactly its device's resources and running `virtio-drivers` on top
 (#95), and message-signalled interrupts (#96). The first drivers are rng
 (#97), the tablet (#98) and sound (#99). They expose plain module functions
-(`rng::fill`, `sound::play`). The message shape (an owned request in, a
+(`rng::fill`, `sound::play`, with those issues). The message shape (an owned request in, a
 completion out, no shared mutable state across the boundary, so a driver
 can move to a user-space server by serializing the same messages) comes
 with the device-class traits at the end of this section.
@@ -1509,8 +1509,8 @@ with the device-class traits at the end of this section.
   read (its header is), and a CardBus bridge's BARs and capability list
   (its pointer, at 0x14) aren't decoded. A device whose list was cut off
   or not read is listed, warned about, and `pci::claim` refuses it
-  (recorded as `<driver>: not probed: capability list ...`; host-tested,
-  not booted). Each function is logged at debug level
+  (recorded as `<driver>: not probed: capability list ...`; the cut-off
+  detection is host-tested, the claim's refusal isn't tested). Each function is logged at debug level
   (`DEBUG pci: 0000:00:00.0 8086:29c0 host bridge (class 060000) Q35 host
   bridge`); the warnings' text is `lumen_pci::Problem`'s, host-tested.
 - **`DeviceInfo`**, one per function, built once at boot (after `mm::init`
@@ -1566,43 +1566,66 @@ pub struct Driver {
   driver may wait or start a thread) and before the shells, and is the
   only caller of `pci::claim(addr, driver) -> Result<DeviceResources,
   ClaimError>` at boot (ktests claim devices no driver takes). It offers
-  each device to the matching rows in order. The claim is **once per
-  function**, whoever asks: the function's slot in the registry goes from
-  `Free` to `Probing(driver)` under the registry's lock, and a second claim
-  is `ClaimError::Taken` with the binding, which it leaves as it was. The
-  claim maps the device's memory BARs through the registry and sets
-  **memory space and bus master** in the command register, with I/O space
-  off (`virtio-drivers` never sets bus master, and the firmware's state
-  isn't trusted), reading the register back: bits that don't stick refuse
-  the claim (`ClaimError::Command`).
+  each device to the matching rows in order, until one doesn't decline it.
+  The claim is **once per claim**, whoever asks: the function's slot in
+  the registry goes from free to probing under the registry's lock (with
+  the command register to restore), and a second claim is
+  `ClaimError::Taken` with the binding, which it leaves as it was; a
+  function is claimed again only after its driver declined it. The claim
+  maps the device's memory BARs through the registry and sets **memory
+  space and bus master** in the command register, with I/O space off
+  (`virtio-drivers` never sets bus master, and the firmware's state isn't
+  trusted), reading the register back: bits that don't stick refuse the
+  claim (`ClaimError::Command`), with the register restored first (read
+  back too; not tested: QEMU keeps the bits).
 - A device isn't probed when one of its memory BARs can't be mapped
   (`BarError`: the mapping failed, or the memory BAR is unassigned or
-  malformed; an I/O BAR, assigned or not, or an unimplemented slot isn't
-  mapped and doesn't stop it), its capability list was cut off or not
-  read, or its command register refuses: a warning with the address and
-  the reason (for a BAR: `BarError`'s text, with its index and, for a
-  failed mapping, its physical range and the error), and `lspci` shows
-  `<driver>: not probed: <reason>`. Before each probe, `probe_all` logs
-  `probing <driver> on <addr>` (info), so a hang points at a device. The
-  outcome is recorded (`pci::probed`, only from `Probing` by the same
-  driver): `<driver>: bound`; `<driver>: failed: <reason>`, a warning, with
-  bus mastering turned off so the device can't reach memory its driver
-  dropped; or declined (`ProbeError::NotMine`: virtio's keyboard and tablet
-  share an id and are told apart only by their configuration, read after
-  the transport is up), which frees the function, restores its command
-  register and offers it to the next matching row. `no driver` is shown
-  for a function no driver took. DMA runs handed out during a probe are
-  recorded as that function's, so a failed or declined probe reports the
-  runs it left outstanding (buffers still posted when its queues were
-  dropped). A summary line counts the bound, failed and refused.
-- **A virtio driver's probe** calls `virtio::transport(res)`, then the
-  crate's device constructor, then `StatusHandle::check_ready` on the
-  transport's status handle (before handing the transport over, keep
-  `transport.status()`): the crate's `begin_init` writes `FEATURES_OK`
-  without reading it back (virtio 1.2 §3.1.1 step 6) and `finish_init`
-  checks nothing, so a device refusing the features would otherwise end up
-  bound. `check_ready` wants `FEATURES_OK` and `DRIVER_OK` and neither
-  `DEVICE_NEEDS_RESET` nor `FAILED` (#97-#99 must call it).
+  malformed; an I/O BAR, assigned or not, unless malformed, or an
+  unimplemented slot isn't mapped and doesn't stop it), its capability
+  list was cut off or not read, or its command register refuses: a
+  warning with the address and the reason (for a BAR: `BarError`'s text,
+  with its index and, for a failed mapping, its physical range and the
+  error), and `lspci` shows `<driver>: not probed: <reason>`. Before each
+  probe, `probe_all` logs `probing <driver> on <addr>` (info), so a hang
+  points at a device. The outcome is recorded (`pci::probed`, only from
+  probing by the same driver; it writes the command register first, read
+  back and warned about on a mismatch, then the binding, so no other claim
+  sees the function free before its register is restored):
+  - `<driver>: bound`. If the probe brought up a virtio transport,
+    `probe_all` first checks that device is ready
+    (`StatusHandle::check_ready`: `FEATURES_OK` and `DRIVER_OK`, neither
+    `DEVICE_NEEDS_RESET` nor `FAILED`; its message names what is missing).
+    The crate's `begin_init` writes `FEATURES_OK` without reading it back
+    (virtio 1.2 §3.1.1 step 6) and `finish_init` checks nothing, so a
+    device refusing the features would otherwise end up bound; a device
+    that isn't ready makes the probe fail. Drivers may call `check_ready`
+    earlier themselves.
+  - `<driver>: failed: <reason>`, a warning, with bus mastering turned off
+    so the device can't reach memory its driver dropped.
+  - Declined (`ProbeError::NotMine`: virtio's keyboard and tablet share an
+    id and are told apart only by their configuration): the function is
+    freed, its command register restored, and the next matching row is
+    offered it; `lspci` shows `no driver (<driver> declined it)` if no row
+    takes it. A driver may decline only between `virtio::transport` and
+    the crate's device constructor, reading the configuration through
+    `VirtioTransport::read_config_space` (virtio-input's ID_NAME and
+    EV_BITS selections don't depend on the features): after the
+    constructor the crate has posted buffers it never takes back
+    (`VirtIOInput`: 32 bounce runs), and under #96 MSI-X would be enabled,
+    so #96 allocates the vector lazily, at the first `queue_set`, and a
+    decline leaves nothing behind. A probe that declines but keeps its
+    `DeviceResources` (the registry knows while they live) is recorded as
+    failed instead, so the next row can't get a second set.
+  `no driver` is shown for a function no driver took. DMA runs handed out
+  during a probe attempt are recorded as that attempt's, so a failed or
+  declined probe warns with the runs it left outstanding (buffers still
+  posted when its queues were dropped), not counting a previous row's;
+  runs another thread hands out meanwhile count too (no driver thread runs
+  at boot). A summary line counts the bound, failed, declined and refused.
+- **A virtio driver's probe** calls `virtio::transport(res)` from the probe
+  itself (runs and the status handle are charged to the running probe
+  attempt), may decline the device (above), then calls the crate's device
+  constructor and keeps the device.
 - **Blocking and locks.** A driver keeps its device in its own state (a
   `SpinLock` static), holds the lock (interrupts off) only for one
   operation, and waits outside it, with a bound, where the crate allows
@@ -1617,20 +1640,28 @@ pub struct Driver {
     `add`, `pop_used`) over `VirtioTransport`, with a bounded wait;
   - sound's (#99) control path is a known unbounded wait, done once at
     setup, outside the playback path.
-  `PciTransport`'s `Drop` spins until the device status reads 0 (after a
-  failed probe): `VirtioTransport`'s own `Drop` resets first and waits at
-  most 100 ms, logging a device that doesn't reset (`waiting forever in
-  PciTransport::drop`, naming it and its status) before that spin, a known
-  limit. A bounded wait (`StatusHandle::wait_until(timeout, ready)`)
-  checks `ready` once more at the deadline, gives up when the status shows
-  `DEVICE_NEEDS_RESET` (set by the device) or `FAILED` (set by a driver),
-  and returns a timeout carrying the time waited and the status byte
-  (all ones: the device is gone or not decoding) rather than hanging.
+  `PciTransport`'s `Drop` spins until the device status reads 0, so
+  `VirtioTransport`'s own `Drop` writes 0 and waits up to 100 ms for the
+  status to read 0 (no early exit on the status from before the reset),
+  then drops the `PciTransport`. A device that doesn't reset is logged as
+  an error (naming it, the time and its status), its bus mastering turned
+  off, and its `PciTransport` leaked instead of dropped, so boot doesn't
+  hang in that spin (not tested: QEMU's devices reset). A bounded wait
+  (`StatusHandle::wait_until(timeout, ready)`) checks `ready` once more at
+  the deadline, gives up when the status shows `DEVICE_NEEDS_RESET` (set
+  by the device) or `FAILED` (set by a driver; all ones, a device gone or
+  not decoding, shows as `FAILED` at once), and otherwise returns a
+  timeout carrying the time waited and the status byte rather than
+  hanging.
 - **Drop order.** DMA memory must not be freed under a live device: reset
   the transport before any queue is dropped. A driver keeps its queues in
   a struct field declared after the transport (fields drop in order) or
-  drops the transport first; the crate's device structs own both and reset
-  in their `Drop`.
+  drops the transport first. The crate's device structs get this from
+  their field order: `transport` is their first field (their own `Drop`s
+  only call `queue_unset`, a no-op on PCI; `VirtIOSound` has none). A
+  crate constructor that fails partway (`?`) drops the queues it made
+  before the transport resets the device: allowed, because the device was
+  never set `DRIVER_OK`.
 
 ### Resources: `DeviceResources` (built, #95)
 
@@ -1680,7 +1711,8 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
 
 - **One entry point.** `virtio::transport(res: DeviceResources) ->
   Result<VirtioTransport, ProbeError>` takes the resources by value, so it
-  runs once per device by construction, and `VirtioTransport` owns them.
+  runs once per claim (a function is claimed again only after its driver
+  declines it), and `VirtioTransport` owns them.
   It is called from the probe itself, and runs under a probe lock, one
   device at a time. #96 adds the interrupt part (a handler argument, with
   `transport` calling `res.msix` itself, so a vector can't belong to
@@ -1741,7 +1773,8 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
     `frame::alloc_contiguous`; `Drop` frees them). Every run handed out
     stays owned by a fixed table of outstanding runs until it comes back:
     no heap, `RUNS = 256` entries, with its own lock, taken before the
-    frame allocator's (a run is freed with the table's lock held). Each
+    probe owner's and the frame allocator's (a run is freed with the
+    table's lock held). Each
     entry records its kind (a DMA buffer, or a bounce buffer of a given
     length) and the function whose probe handed it out. A run comes back
     only at its address with its kind and length, so the table catches a
@@ -1779,7 +1812,7 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
     find or free panics with the address, length and what is recorded.
     `share` has no error path: out of frames or table entries it panics,
     with the size and the runs outstanding. Caller-sized buffers
-    (`rng::fill`) go to the device in chunks of at most a page, so each
+    (`rng::fill`, #97) go to the device in chunks of at most a page, so each
     bounce is one frame.
   - The cost: an allocation and a copy per buffer, fine for rng, input and
     sound; a fast path (no bounce for a buffer within one page or in the
@@ -1787,9 +1820,9 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
     posted 8-byte input event holds a 4 KiB bounce frame. Buffers still
     posted when their queue is dropped are never unshared (`VirtQueue` and
     `OwningQueue` have no `Drop` that does): their frames and table entries
-    leak. Drivers are never dropped in M3, but a probe that fails partway
-    leaks this way; `probe_all` reports the runs the probe left
-    outstanding.
+    leak. Drivers are never dropped in M3, but a probe that fails (or
+    declines) partway leaks this way; `probe_all` reports the runs that
+    probe attempt left outstanding.
 - **Polling until MSI-X.** Until #96, drivers poll (bounded where the crate
   allows, as above); event devices (the tablet) are polled from their
   thread. Their API doesn't change when interrupts arrive: the handler
@@ -1834,16 +1867,15 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
   makes the **probe fail** (a warning naming the device, the queue and the
   reason; `lspci` shows `failed: <reason>`): no polling fallback once #96
   has landed.
-- **Aliasing.** The wrapper's writes go through a second pointer to the
-  common configuration (found from the common-configuration capability
-  and the BAR's mapping in the registry). That departs from the letter of
-  `safe-mmio`'s `UniqueMmioPointer::new` contract and of the `Hal`'s
-  promise that `mmio_phys_to_virt` returns memory nothing else aliases. It
-  is benign: both sides make only volatile accesses through raw pointers,
-  the wrapper owns the inner transport and touches the registers only
-  through `&mut self` (so the inner transport isn't in the middle of an
-  access), and the inner transport rewrites `queue_select` before each
-  queue access of its own.
+- **Aliasing.** The wrapper's writes go through its second pointer to the
+  common configuration: the adapter's aliasing exception (above), whose
+  argument covers `msix_config` and `queue_msix_vector` too (written
+  through `&mut self`, `queue_select` rewritten by the inner transport
+  before each queue access of its own).
+- **Vector lifetime.** The vector is allocated lazily, at the first
+  `queue_set` (inside the crate's device constructor), so a driver that
+  declines a device before the constructor (above) leaves no vector
+  behind.
 
 ### Device classes (later)
 

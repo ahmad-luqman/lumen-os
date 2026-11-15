@@ -191,7 +191,9 @@ def test_lspci_shows_no_driver(boot):
     m = shell(boot, devices=Devices.every())
     rows = lspci_rows(m)
     assert rows and {row[4] for row in rows.values()} == {"no driver"}, rows
-    assert "INFO  drivers: 0 bound, 0 failed, 0 not probed (0 driver rows)\n" in m.output
+    assert (
+        "INFO  drivers: 0 bound, 0 failed, 0 declined, 0 not probed (0 driver rows)\n" in m.output
+    )
     assert "WARN  drivers" not in m.output
     # The column filters like the others.
     assert run(m, "lspci | where driver = 'no driver' | count") == f"{len(rows)}\n"

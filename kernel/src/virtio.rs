@@ -8,12 +8,14 @@
 //!   outstanding runs owns until it comes back ([`RUNS`] entries, no heap,
 //!   its own lock, taken before the frame allocator's: a run is freed with
 //!   the table's lock held). Each entry records its kind (a DMA buffer, or a
-//!   bounce buffer of a given length) and the device whose probe made it.
+//!   bounce buffer of a given length) and the probe attempt that made it.
 //!   `dma_dealloc` and `unshare` free only a run recorded at that address
 //!   with that kind and length, so the table catches a wrong length or
 //!   kind, an address never handed out, and a free of a run not
 //!   outstanding (not a stale free after the frames were handed out again
-//!   at the same address). A refusal is logged with what was recorded.
+//!   at the same address). `dma_dealloc` logs a refusal with what was
+//!   recorded and returns non-zero (the crate's `Dma::drop` then panics);
+//!   `unshare` panics with it.
 //! - **Bounce buffers, not address translation.** The crate shares
 //!   whatever buffer a request uses (a caller's slice, a driver's `Box`, a
 //!   stack local), and the device needs one physical address for it, but
@@ -26,32 +28,42 @@
 //!   many runs are outstanding); buffers still posted when their queue is
 //!   dropped are never unshared (`VirtQueue` has no `Drop` that does), so a
 //!   probe failing partway leaks frames and table entries
-//!   (`drivers::probe_all` reports the runs its probe left).
+//!   (`drivers::probe_all` reports the runs that probe attempt left, which
+//!   includes any another thread handed out meanwhile: none at boot).
 //! - **Drop order.** DMA memory must not be freed under a live device:
 //!   reset the transport before any queue is dropped. A driver keeps its
 //!   queues in a struct field declared after the transport (fields drop in
-//!   order), or drops the transport first; the crate's device structs own
-//!   both and reset in their `Drop`. (#97 drives its own `VirtQueue`.)
+//!   order), or drops the transport first. The crate's device structs get
+//!   this from their field order: `transport` is their first field (their
+//!   own `Drop`s only call `queue_unset`, a no-op on PCI; `VirtIOSound` has
+//!   none). A crate constructor that fails partway (`?`) drops queues it
+//!   made before the transport resets the device: allowed, because the
+//!   device was never set `DRIVER_OK`. (#97 drives its own `VirtQueue`.)
 //! - **MMIO.** `mmio_phys_to_virt` only looks up the BAR mappings of the
 //!   device [`transport`] is probing (the claim mapped them); it never maps,
 //!   and panics outside a probe or outside that device's BARs, naming it
 //!   (the check before the probe makes that unreachable).
 //! - **Setup and waiting.** The crate's device structs don't expose their
 //!   transport, so [`VirtioTransport::status`] hands out a [`StatusHandle`]
-//!   on the device status register. Every driver calls
-//!   [`StatusHandle::check_ready`] right after the crate's `new()`: the
-//!   crate writes `FEATURES_OK` without reading it back (virtio 1.2 §3.1.1
-//!   step 6), so a device refusing the features would otherwise end up
-//!   "bound". A driver's bounded wait ([`StatusHandle::wait_until`]) gives
-//!   up on time, or when the device sets `DEVICE_NEEDS_RESET` (or a driver
-//!   set `FAILED`). Known limits: `VirtIORng::request_entropy` and sound's
-//!   control requests spin unbounded in the crate (#97 drives its own
-//!   queue; #99's control path is done once at setup); `PciTransport`'s
-//!   `Drop` spins until the status reads 0 (the [`VirtioTransport`]'s
-//!   `Drop` waits a bounded time first and logs a device that doesn't
-//!   reset); [`transport`] must be called from the probe itself (it runs
-//!   under the probe lock, one device at a time). Drivers poll until MSI-X
-//!   (#96).
+//!   on the device status register. The crate writes `FEATURES_OK` without
+//!   reading it back (virtio 1.2 §3.1.1 step 6), so a device refusing the
+//!   features would otherwise end up "bound": [`transport`] records the
+//!   probing attempt's status handle, and `drivers::probe_all` runs
+//!   [`StatusHandle::check_ready`] on it when the probe returns `Ok`,
+//!   turning a device that isn't ready into a failed probe (drivers may
+//!   also call it earlier). A driver's bounded wait
+//!   ([`StatusHandle::wait_until`]) gives up on time, or when the device
+//!   sets `DEVICE_NEEDS_RESET` (or a driver set `FAILED`; all ones, a
+//!   device gone, shows as `FAILED`). Known limits:
+//!   `VirtIORng::request_entropy` and sound's control requests spin
+//!   unbounded in the crate (#97 drives its own queue; #99's control path
+//!   is done once at setup); `PciTransport`'s `Drop` spins until the status
+//!   reads 0, so the [`VirtioTransport`]'s `Drop` waits a bounded time
+//!   first and, for a device that doesn't reset, logs it, turns its bus
+//!   mastering off and leaks the `PciTransport` instead. [`transport`] must
+//!   be called from the probe itself: runs and the status handle are
+//!   charged to the running probe attempt, and it runs under the probe lock,
+//!   one device at a time. Drivers poll until MSI-X (#96).
 //! - **One aliasing exception.** The crate holds the common configuration
 //!   as a `UniqueMmioPointer` (safe-mmio: nothing else may access it), and
 //!   the `Hal` promises `mmio_phys_to_virt`'s memory isn't aliased. The
@@ -63,8 +75,8 @@
 //!   `&mut self`, when the crate isn't in the middle of an access (it
 //!   rewrites `queue_select` before each queue access of its own).
 //!
-//! Locks: the probe lock, then the probe scope or ECAM; the run table
-//! before the frame allocator.
+//! Locks: the probe lock, then the probe scope or ECAM (each taken last);
+//! the run table before the probe owner and the frame allocator.
 
 // The first driver on this adapter is rng (#97): until then only the ktests
 // and `probe_all`'s bookkeeping use it.
@@ -72,10 +84,10 @@
 
 use alloc::vec::Vec;
 use core::fmt;
+use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
 
-use log::{error, warn};
+use log::{debug, error, warn};
 use lumen_mm::{FRAME_SIZE, FreeError, PhysAddr, PhysFrame};
 use lumen_pci::virtio::{self as caps, CapProblem, VirtioCap, common};
 use lumen_pci::{ConfigSpace, PciAddr, cap};
@@ -95,11 +107,11 @@ use crate::sync::SpinLock;
 const RUNS: usize = 256;
 
 /// What a run in the table was handed out as: `dma_dealloc` frees only a
-/// `Dma` run of that many frames, `unshare` only a `Bounce` run of that
-/// buffer length.
+/// `Dma` run of that many pages, `unshare` only a `Bounce` run of that
+/// buffer length (its frames follow from the length).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
-    Dma,
+    Dma { pages: usize },
     Bounce { len: usize },
 }
 
@@ -108,40 +120,70 @@ enum Kind {
 struct Entry {
     run: OwnedRun,
     kind: Kind,
-    /// Whose probe was running when it was handed out.
-    owner: Option<PciAddr>,
+    /// The probe attempt that was running when it was handed out.
+    owner: Option<Attempt>,
 }
 
 type Runs = [Option<Entry>; RUNS];
 
 static TABLE: SpinLock<Runs> = SpinLock::new([const { None }; RUNS]);
 
-/// The function whose probe is running (`drivers::probe_all`): runs handed
-/// out meanwhile are recorded as its. `NO_OWNER` when none.
-static OWNER: AtomicU64 = AtomicU64::new(NO_OWNER);
-const NO_OWNER: u64 = u64::MAX;
-
-fn pack(a: PciAddr) -> u64 {
-    u64::from(a.segment()) << 16 | u64::from(a.bus()) << 8 | u64::from(a.device()) << 3 | u64::from(a.function())
+/// One probe of one function by one driver row (`drivers::probe_all`):
+/// runs handed out meanwhile are its, so a declined row's leftovers aren't
+/// charged to the next row. (Runs another thread hands out during the
+/// probe are charged to it too: at boot no driver's thread runs yet.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attempt {
+    pub addr: PciAddr,
+    id: u64,
 }
 
-fn unpack(v: u64) -> Option<PciAddr> {
-    (v != NO_OWNER).then(|| PciAddr::new((v >> 16) as u16, (v >> 8) as u8, (v >> 3) as u8 & 31, v as u8 & 7)).flatten()
+/// The probe attempt running now, the last attempt's id, and the status
+/// handle of the transport the running attempt brought up.
+struct Probe {
+    attempt: Option<Attempt>,
+    last_id: u64,
+    status: Option<StatusHandle>,
 }
 
-/// Record runs handed out from now on as `addr`'s (or nobody's).
-pub fn set_probe_owner(addr: Option<PciAddr>) {
-    OWNER.store(addr.map_or(NO_OWNER, pack), Ordering::Relaxed);
+static OWNER: SpinLock<Probe> = SpinLock::new(Probe { attempt: None, last_id: 0, status: None });
+
+/// Start a probe attempt of `addr`: runs handed out until [`end_probe`]
+/// are recorded as its.
+pub fn begin_probe(addr: PciAddr) -> Attempt {
+    let mut p = OWNER.lock();
+    p.last_id += 1;
+    let attempt = Attempt { addr, id: p.last_id };
+    p.attempt = Some(attempt);
+    p.status = None;
+    attempt
+}
+
+/// End the running probe attempt: the status handle of the transport it
+/// brought up, if it brought one up (`probe_all` checks it is ready).
+pub fn end_probe() -> Option<StatusHandle> {
+    let mut p = OWNER.lock();
+    p.attempt = None;
+    p.status.take()
+}
+
+/// How many runs `attempt` left outstanding.
+pub fn outstanding_runs_of(attempt: Attempt) -> usize {
+    TABLE.lock().iter().flatten().filter(|e| e.owner == Some(attempt)).count()
+}
+
+/// How many runs any probe of `addr` left outstanding.
+pub fn outstanding_runs_of_function(addr: PciAddr) -> usize {
+    TABLE.lock().iter().flatten().filter(|e| e.owner.is_some_and(|a| a.addr == addr)).count()
 }
 
 /// How many DMA runs are outstanding (handed to the crate, not yet freed).
 pub fn outstanding_runs() -> usize {
-    TABLE.lock().iter().flatten().count()
+    count(&TABLE.lock())
 }
 
-/// How many of them were handed out while `addr`'s probe ran.
-pub fn outstanding_runs_of(addr: PciAddr) -> usize {
-    TABLE.lock().iter().flatten().filter(|e| e.owner == Some(addr)).count()
+fn count(table: &Runs) -> usize {
+    table.iter().flatten().count()
 }
 
 /// Contiguous frames from the frame allocator, freed when dropped.
@@ -185,24 +227,22 @@ impl OwnedRun {
 
 impl Drop for OwnedRun {
     fn drop(&mut self) {
-        // SAFETY: a live `OwnedRun` owns its frames (from `alloc`); a device
-        // it was shared with has finished with it, because only
-        // `dma_dealloc` and `unshare` take a recorded run out of the table.
+        // SAFETY: a live `OwnedRun` owns its frames (from `alloc`). A device
+        // it was shared with has finished with it: only `dma_dealloc` and
+        // `unshare` take a recorded run out of the table, and the crate
+        // calls them once the device is done with the buffer or reset (the
+        // drop-order rule in the module doc).
         unsafe { frame::free_contiguous(self.first, self.count) }.unwrap_or_else(|e| {
             panic!("virtio: freeing the DMA run at {:#x} ({} frames): {e:?}", self.phys(), self.count)
         });
     }
 }
 
-/// Whether the table has room for one more run.
-fn has_room(table: &Runs) -> bool {
-    table.iter().any(|e| e.is_none())
-}
-
-/// Record `run` (the caller checked [`has_room`]): its physical address.
+/// Record `run` (the caller checked the table isn't full): its physical
+/// address.
 fn record(table: &mut Runs, run: OwnedRun, kind: Kind) -> u64 {
-    let entry = table.iter_mut().find(|e| e.is_none()).expect("has_room was checked");
-    let owner = unpack(OWNER.load(Ordering::Relaxed));
+    let entry = table.iter_mut().find(|e| e.is_none()).expect("the table isn't full");
+    let owner = OWNER.lock().attempt;
     entry.insert(Entry { run, kind, owner }).run.phys()
 }
 
@@ -212,16 +252,16 @@ enum Miss {
     /// Nothing outstanding starts at that address.
     NotOutstanding,
     /// A run starts there, but of another kind or length.
-    Differs { kind: Kind, frames: usize },
+    Differs(Kind),
 }
 
-/// Take out the run at `paddr` of `kind` and `frames` frames.
-fn take(table: &mut Runs, paddr: u64, kind: Kind, frames: usize) -> Result<OwnedRun, Miss> {
+/// Take out the run at `paddr` handed out as `kind`.
+fn take(table: &mut Runs, paddr: u64, kind: Kind) -> Result<OwnedRun, Miss> {
     let entry =
         table.iter_mut().find(|e| e.as_ref().is_some_and(|e| e.run.phys() == paddr)).ok_or(Miss::NotOutstanding)?;
-    let e = entry.as_ref().expect("found");
-    if (e.kind, e.run.count) != (kind, frames) {
-        return Err(Miss::Differs { kind: e.kind, frames: e.run.count });
+    let recorded = entry.as_ref().expect("found").kind;
+    if recorded != kind {
+        return Err(Miss::Differs(recorded));
     }
     Ok(entry.take().expect("found").run)
 }
@@ -255,8 +295,9 @@ pub struct VirtioHal;
 unsafe impl Hal for VirtioHal {
     fn dma_alloc(pages: usize, _direction: BufferDirection) -> (u64, NonNull<u8>) {
         let mut table = TABLE.lock();
-        let outstanding = table.iter().flatten().count();
-        let run = if pages == 0 || !has_room(&table) { None } else { OwnedRun::alloc(pages) };
+        let outstanding = count(&table);
+        // (`OwnedRun::alloc` refuses 0 pages.)
+        let run = if outstanding < RUNS { OwnedRun::alloc(pages) } else { None };
         let Some(run) = run else {
             drop(table);
             if pages == 0 {
@@ -271,7 +312,7 @@ unsafe impl Hal for VirtioHal {
         // SAFETY: a fresh run nothing else uses, in the HHDM.
         unsafe { core::ptr::write_bytes(run.ptr(), 0, run.len()) };
         let ptr = NonNull::new(run.ptr()).expect("HHDM addresses aren't null");
-        (record(&mut table, run, Kind::Dma), ptr)
+        (record(&mut table, run, Kind::Dma { pages }), ptr)
     }
 
     unsafe fn dma_dealloc(paddr: u64, vaddr: NonNull<u8>, pages: usize) -> i32 {
@@ -285,7 +326,7 @@ unsafe impl Hal for VirtioHal {
             return refused(format_args!("dma_alloc returned {hhdm:p} for it"));
         }
         let mut table = TABLE.lock();
-        let taken = take(&mut table, paddr, Kind::Dma, pages);
+        let taken = take(&mut table, paddr, Kind::Dma { pages });
         let freed = taken.map(|run| run.free());
         drop(table);
         match freed {
@@ -295,9 +336,7 @@ unsafe impl Hal for VirtioHal {
                 -2
             }
             Err(Miss::NotOutstanding) => refused(format_args!("no run is outstanding there")),
-            Err(Miss::Differs { kind, frames }) => {
-                refused(format_args!("the run there is {kind:?} of {frames} frames"))
-            }
+            Err(Miss::Differs(kind)) => refused(format_args!("the run there is {kind:?}")),
         }
     }
 
@@ -313,8 +352,8 @@ unsafe impl Hal for VirtioHal {
     unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> u64 {
         let len = buffer.len();
         let mut table = TABLE.lock();
-        let outstanding = table.iter().flatten().count();
-        if !has_room(&table) {
+        let outstanding = count(&table);
+        if outstanding == RUNS {
             panic!("virtio: sharing a {len}-byte buffer: the run table is full ({RUNS} outstanding)");
         }
         let run = OwnedRun::alloc(frames_for(len)).unwrap_or_else(|| {
@@ -337,10 +376,10 @@ unsafe impl Hal for VirtioHal {
     }
 
     unsafe fn unshare(paddr: u64, buffer: NonNull<[u8]>, direction: BufferDirection) {
-        let (len, frames) = (buffer.len(), frames_for(buffer.len()));
+        let len = buffer.len();
         let mut table = TABLE.lock();
-        let run = take(&mut table, paddr, Kind::Bounce { len }, frames).unwrap_or_else(|miss| {
-            let outstanding = table.iter().flatten().count();
+        let run = take(&mut table, paddr, Kind::Bounce { len }).unwrap_or_else(|miss| {
+            let outstanding = count(&table);
             panic!("virtio: unshare of {paddr:#x} ({len} bytes): {miss:?} ({outstanding} runs outstanding)")
         });
         if direction == BufferDirection::DeviceToDriver {
@@ -348,6 +387,7 @@ unsafe impl Hal for VirtioHal {
             // of `len` bytes; the device has finished with the run.
             unsafe { core::ptr::copy_nonoverlapping(run.ptr(), buffer.as_ptr().cast::<u8>(), len) };
         }
+        let frames = run.count;
         run.free().unwrap_or_else(|e| panic!("virtio: freeing the bounce run at {paddr:#x} ({frames} frames): {e:?}"));
     }
 }
@@ -381,14 +421,30 @@ impl fmt::Display for ProbeError {
             ProbeError::Capability(p) => write!(f, "{p}"),
             ProbeError::Transport(e) => write!(f, "virtio transport: {e}"),
             ProbeError::Device(e) => write!(f, "virtio: {e}"),
-            ProbeError::NotReady { status } => write!(
-                f,
-                "the device status reads {status:#04x} after setup (FEATURES_OK and DRIVER_OK wanted){}",
-                gone(*status)
-            ),
+            ProbeError::NotReady { status } => {
+                write!(f, "the device status reads {status:#04x} after setup: {}", not_ready_why(*status))
+            }
             ProbeError::Wait(e) => write!(f, "{e}"),
             ProbeError::NotMine => f.write_str("not this driver's device"),
         }
+    }
+}
+
+/// Why a status byte after setup isn't ready, for messages.
+fn not_ready_why(status: u8) -> &'static str {
+    let s = bits(status);
+    if status == 0xff {
+        "all ones, the device is gone or not decoding"
+    } else if s.contains(DeviceStatus::FAILED) {
+        "FAILED set"
+    } else if s.contains(DeviceStatus::DEVICE_NEEDS_RESET) {
+        "DEVICE_NEEDS_RESET set: the device needs a reset"
+    } else if !s.contains(DeviceStatus::FEATURES_OK) {
+        "FEATURES_OK clear: the device refused the negotiated features"
+    } else if !s.contains(DeviceStatus::DRIVER_OK) {
+        "DRIVER_OK clear"
+    } else {
+        "ready"
     }
 }
 
@@ -398,8 +454,11 @@ fn gone(status: u8) -> &'static str {
 }
 
 /// Bring up the virtio transport of a claimed function: the one entry
-/// point, called from the driver's probe. It takes the resources by value,
-/// so it runs once per device, and the transport owns them. First it checks
+/// point, called from the driver's probe (the running probe attempt is
+/// charged its runs, and given its status handle for `probe_all`'s
+/// readiness check). It takes the resources by value, so it runs once per
+/// claim (a function is claimed again only after its driver declines it),
+/// and the transport owns them. First it checks
 /// what `PciTransport::new` will look up (`lumen_pci::virtio::check`: the
 /// structures `used` keeps inside mapped memory BARs and long enough, every
 /// capability the crate reads inside the header); then it runs it, under
@@ -430,7 +489,7 @@ pub fn transport(res: DeviceResources) -> Result<VirtioTransport, ProbeError> {
         .virt_of(bar.phys().as_u64() + u64::from(cfg.offset), u64::from(common::LEN))
         .expect("checked: the common configuration is inside its BAR");
     let common = NonNull::new(base.as_mut_ptr::<u8>()).expect("mapped addresses aren't null");
-    let mut t = VirtioTransport { inner, common, res };
+    let mut t = VirtioTransport { inner: ManuallyDrop::new(inner), common, res };
     let notify = used.notify.expect("PciTransport::new found the notify structure");
     let multiplier = t.res.config().read(addr, u16::from(notify.at + caps::NOTIFY_MULTIPLIER_AT));
     for queue in 0..t.common_read16(common::NUM_QUEUES) {
@@ -439,6 +498,13 @@ pub fn transport(res: DeviceResources) -> Result<VirtioTransport, ProbeError> {
         // On failure the transport drops here, resetting the device.
         caps::notify_fits(notify, multiplier, queue, off).map_err(ProbeError::Capability)?;
     }
+    // For `probe_all`, which checks the device is ready once the probe
+    // returns (a probe brings up at most one transport).
+    let mut p = OWNER.lock();
+    if p.attempt.is_some_and(|a| a.addr == addr) {
+        p.status = Some(t.status());
+    }
+    drop(p);
     Ok(t)
 }
 
@@ -446,12 +512,15 @@ pub fn transport(res: DeviceResources) -> Result<VirtioTransport, ProbeError> {
 /// it delegates to, plus what the crate leaves out: a [`StatusHandle`], and
 /// the checked common configuration's base (#96 writes its MSI-X vectors
 /// there; the per-transport error slot for a refused vector is #96's).
-/// Owns the device's resources. Dropping it resets the device, waiting a
-/// bounded time and logging a device that doesn't reset before
-/// `PciTransport`'s own `Drop` spins on it.
+/// Owns the device's resources. Dropping it resets the device: it writes 0
+/// and waits up to [`RESET_WAIT_NS`] for the status to read 0, then drops
+/// the `PciTransport` (whose own `Drop` writes 0 and spins until it reads
+/// 0, now at once). A device that doesn't reset is logged as an error, its
+/// bus mastering turned off, and its `PciTransport` leaked rather than
+/// dropped, so boot doesn't hang in that spin.
 #[derive(Debug)]
 pub struct VirtioTransport {
-    inner: PciTransport,
+    inner: ManuallyDrop<PciTransport>,
     common: NonNull<u8>,
     res: DeviceResources,
 }
@@ -478,10 +547,11 @@ impl VirtioTransport {
     }
 
     fn common_read16(&self, offset: u64) -> u16 {
-        // SAFETY: a 16-bit field of the checked common configuration
-        // (2-byte aligned: the structure is in a BAR at a 4-byte aligned
-        // offset), mapped uncached; a volatile read (the aliasing exception
-        // in the module doc).
+        // SAFETY: a 16-bit field of the checked common configuration, mapped
+        // uncached; aligned, because `PciTransport::new` refused a common
+        // configuration not 8-byte aligned (its `Misaligned` check) and the
+        // offset is even. A volatile read (the aliasing exception in the
+        // module doc).
         unsafe { self.common.add(offset as usize).cast::<u16>().read_volatile() }
     }
 
@@ -497,19 +567,35 @@ const RESET_WAIT_NS: u64 = 100_000_000;
 
 impl Drop for VirtioTransport {
     fn drop(&mut self) {
+        let addr = self.res.info().addr;
         self.inner.set_status(DeviceStatus::empty());
+        // Not `wait_until`: the status before the reset (FAILED, say) must
+        // not end the wait.
         let status = self.status();
-        let reset = status.wait_until(RESET_WAIT_NS, || status.raw() == 0);
-        if reset.is_err() {
-            error!(
-                target: "virtio",
-                "{}: the device status still reads {:#04x} {} ms after a reset{}: waiting forever in PciTransport::drop",
-                self.res.info().addr,
-                status.raw(),
-                RESET_WAIT_NS / 1_000_000,
-                gone(status.raw())
-            );
+        let start = crate::time::now_ns();
+        let deadline = start.saturating_add(RESET_WAIT_NS);
+        let mut last = status.raw();
+        while last != 0 && crate::time::now_ns() < deadline {
+            core::hint::spin_loop();
+            last = status.raw();
         }
+        let took = crate::time::now_ns().saturating_sub(start);
+        if last == 0 {
+            debug!(target: "virtio", "{addr}: reset in {} us", took / 1000);
+            // SAFETY: dropped once, here; the field isn't used afterwards.
+            unsafe { ManuallyDrop::drop(&mut self.inner) };
+            return;
+        }
+        let mut config = self.res.config();
+        let command = config.read16(addr, lumen_pci::reg::COMMAND);
+        config.write_command(addr, command & !lumen_pci::command::BUS_MASTER);
+        error!(
+            target: "virtio",
+            "{addr}: the device status still reads {last:#04x} {} ms after a reset{}: bus mastering turned off, \
+             its transport leaked (PciTransport::drop would wait forever)",
+            took / 1_000_000,
+            gone(last)
+        );
     }
 }
 
@@ -617,12 +703,10 @@ pub enum WaitError {
 impl fmt::Display for WaitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            WaitError::Timeout { waited_ns, status } => write!(
-                f,
-                "the device didn't answer in {} ms (status {status:#04x}{})",
-                waited_ns / 1_000_000,
-                gone(status)
-            ),
+            // (All ones never times out: it shows FAILED.)
+            WaitError::Timeout { waited_ns, status } => {
+                write!(f, "the device didn't answer in {} ms (status {status:#04x})", waited_ns / 1_000_000)
+            }
             WaitError::NeedsReset { status } => write!(f, "the device needs a reset (status {status:#04x})"),
             WaitError::Failed { status } => {
                 write!(f, "the device status reads FAILED ({status:#04x}{})", gone(status))
@@ -641,7 +725,7 @@ impl StatusHandle {
     }
 
     pub fn get(&self) -> DeviceStatus {
-        DeviceStatus::from_bits_truncate(u32::from(self.raw()))
+        bits(self.raw())
     }
 
     /// After the crate's `new()`: the device accepted the features and is
@@ -650,7 +734,7 @@ impl StatusHandle {
     /// back, so every driver calls this before it reports the device bound.
     pub fn check_ready(&self) -> Result<(), ProbeError> {
         let status = self.raw();
-        let s = DeviceStatus::from_bits_truncate(u32::from(status));
+        let s = bits(status);
         let ready = s.contains(DeviceStatus::FEATURES_OK | DeviceStatus::DRIVER_OK)
             && !s.intersects(DeviceStatus::DEVICE_NEEDS_RESET | DeviceStatus::FAILED);
         if ready { Ok(()) } else { Err(ProbeError::NotReady { status }) }
@@ -669,7 +753,7 @@ impl StatusHandle {
                 return Ok(());
             }
             let status = self.raw();
-            let s = DeviceStatus::from_bits_truncate(u32::from(status));
+            let s = bits(status);
             if s.contains(DeviceStatus::FAILED) {
                 return Err(WaitError::Failed { status });
             }
@@ -685,10 +769,15 @@ impl StatusHandle {
     }
 }
 
+/// A status byte as flags (bits `DeviceStatus` doesn't name dropped).
+fn bits(status: u8) -> DeviceStatus {
+    DeviceStatus::from_bits_truncate(u32::from(status))
+}
+
 /// The ktest machine's virtio device of `kind` (virtio 1.2 §5 device type:
 /// 1 network, 2 block, 5 balloon, 9 9p; no driver takes those in M3).
 #[cfg(feature = "ktest")]
-fn ktest_device(kind: u16) -> Result<&'static DeviceInfo, &'static str> {
+pub fn ktest_device(kind: u16) -> Result<&'static DeviceInfo, &'static str> {
     crate::pci::devices()
         .iter()
         .find(|d| d.virtio_type() == Some(kind))
@@ -698,6 +787,14 @@ fn ktest_device(kind: u16) -> Result<&'static DeviceInfo, &'static str> {
 #[cfg(feature = "ktest")]
 fn hhdm(paddr: u64) -> *mut u8 {
     crate::mm::phys_to_virt(PhysAddr::new(paddr).expect("physical")).as_mut_ptr::<u8>()
+}
+
+/// Whether the `frames` frames from `paddr` are all allocated (`true`) or
+/// all free (`false`).
+#[cfg(feature = "ktest")]
+fn all_allocated(paddr: u64, frames: u64, allocated: bool) -> bool {
+    (0..frames)
+        .all(|i| PhysFrame::from_u64(paddr + i * FRAME_SIZE).is_some_and(|f| frame::is_allocated(f) == allocated))
 }
 
 crate::ktest!(
@@ -715,8 +812,7 @@ crate::ktest!(
         kassert_eq!(paddr, dirty_phys);
         // Allocated from the allocator (owned by it, so not reserved: hard
         // rule 2), recorded, zeroed and reached through the HHDM.
-        let frames = || (0..3).map(|i| PhysFrame::from_u64(paddr + i * FRAME_SIZE).expect("aligned"));
-        kassert!(frames().all(frame::is_allocated));
+        kassert!(all_allocated(paddr, 3, true));
         kassert_eq!(outstanding_runs(), before + 1);
         kassert_eq!(vaddr.as_ptr(), hhdm(paddr));
         // SAFETY: the run is ours until `dma_dealloc`, 3 frames long.
@@ -733,10 +829,10 @@ crate::ktest!(
             kassert_eq!(VirtioHal::dma_dealloc(paddr, NonNull::dangling(), 3), -1);
         }
         kassert_eq!(outstanding_runs(), before + 1);
-        kassert!(frames().all(frame::is_allocated));
+        kassert!(all_allocated(paddr, 3, true));
         // SAFETY: the run this test allocated, no longer used.
         kassert_eq!(unsafe { VirtioHal::dma_dealloc(paddr, vaddr, 3) }, 0);
-        kassert!(frames().all(|f| !frame::is_allocated(f)));
+        kassert!(all_allocated(paddr, 3, false));
         kassert_eq!(outstanding_runs(), before);
         // Freed once: a second free is refused, not a double free.
         // SAFETY: refused.
@@ -769,14 +865,14 @@ crate::ktest!(
         {
             let mut table = TABLE.lock();
             kassert!(matches!(
-                take(&mut table, dma, Kind::Bounce { len: 100 }, 1),
-                Err(Miss::Differs { kind: Kind::Dma, frames: 1 })
+                take(&mut table, dma, Kind::Bounce { len: 100 }),
+                Err(Miss::Differs(Kind::Dma { pages: 1 }))
             ));
             kassert!(matches!(
-                take(&mut table, bounce, Kind::Bounce { len: 99 }, 1),
-                Err(Miss::Differs { kind: Kind::Bounce { len: 100 }, frames: 1 })
+                take(&mut table, bounce, Kind::Bounce { len: 99 }),
+                Err(Miss::Differs(Kind::Bounce { len: 100 }))
             ));
-            kassert!(matches!(take(&mut table, 0x1000, Kind::Dma, 1), Err(Miss::NotOutstanding)));
+            kassert!(matches!(take(&mut table, 0x1000, Kind::Dma { pages: 1 }), Err(Miss::NotOutstanding)));
         }
         // SAFETY: the buffer and address `share` returned.
         unsafe { VirtioHal::unshare(bounce, shared, BufferDirection::DriverToDevice) };
@@ -784,16 +880,19 @@ crate::ktest!(
         kassert_eq!(unsafe { VirtioHal::dma_dealloc(dma, dma_v, 1) }, 0);
         kassert_eq!(outstanding_runs(), before);
         // A run handed out during a probe is that device's.
+        // A run handed out during a probe attempt is that attempt's (and its
+        // function's), not the next attempt's.
         let owner = lumen_pci::PciAddr::new(0, 0, 3, 0).ok_or("addr")?;
-        set_probe_owner(Some(owner));
+        let first = begin_probe(owner);
         let (p, v) = VirtioHal::dma_alloc(1, BufferDirection::DriverToDevice);
-        set_probe_owner(None);
-        kassert_eq!(outstanding_runs_of(owner), 1);
+        kassert!(end_probe().is_none());
+        let second = begin_probe(owner);
+        end_probe();
+        kassert_eq!((outstanding_runs_of(first), outstanding_runs_of(second)), (1, 0));
+        kassert_eq!(outstanding_runs_of_function(owner), 1);
         // SAFETY: the run this test allocated.
         kassert_eq!(unsafe { VirtioHal::dma_dealloc(p, v, 1) }, 0);
-        kassert_eq!(outstanding_runs_of(owner), 0);
-        kassert_eq!(unpack(pack(owner)), Some(owner));
-        kassert_eq!(unpack(NO_OWNER), None);
+        kassert_eq!(outstanding_runs_of(first), 0);
         Ok(())
     }
 );
@@ -819,7 +918,7 @@ crate::ktest!(
         // whatever the device does to it isn't copied back.
         // SAFETY: `buf` stays alive and untouched until `unshare`.
         let paddr = unsafe { VirtioHal::share(shared, BufferDirection::DriverToDevice) };
-        kassert!(frame::is_allocated(PhysFrame::from_u64(paddr).ok_or("not a frame")?));
+        kassert!(all_allocated(paddr, 1, true));
         kassert_eq!(outstanding_runs(), before + 1);
         // SAFETY: the bounce run, 1 frame, ours until `unshare`.
         let copy = unsafe { core::slice::from_raw_parts_mut(hhdm(paddr), 600) };
@@ -828,7 +927,7 @@ crate::ktest!(
         // SAFETY: the buffer and address `share` returned.
         unsafe { VirtioHal::unshare(paddr, shared, BufferDirection::DriverToDevice) };
         kassert!(buf.iter().enumerate().all(|(i, &b)| b == i as u8 ^ 0x5a));
-        kassert!(!frame::is_allocated(PhysFrame::from_u64(paddr).ok_or("not a frame")?));
+        kassert!(all_allocated(paddr, 1, false));
         kassert_eq!(outstanding_runs(), before);
 
         // From the device: zeroed (no stale bytes), what the device wrote
@@ -844,7 +943,7 @@ crate::ktest!(
         // SAFETY: as above.
         unsafe { VirtioHal::unshare(paddr, shared, BufferDirection::DeviceToDriver) };
         kassert!(buf.iter().enumerate().all(|(i, &b)| b == (i * 7) as u8));
-        kassert!(!frame::is_allocated(PhysFrame::from_u64(paddr).ok_or("not a frame")?));
+        kassert!(all_allocated(paddr, 1, false));
         kassert_eq!(outstanding_runs(), before);
 
         // Exactly a page takes one frame, a page and a byte two, two pages
@@ -854,14 +953,15 @@ crate::ktest!(
         let shared = NonNull::from(&big[..]);
         // SAFETY: `big` outlives the share and isn't written meanwhile.
         let paddr = unsafe { VirtioHal::share(shared, BufferDirection::DriverToDevice) };
-        kassert!((0..3).all(|i| frame::is_allocated(PhysFrame::from_u64(paddr + i * FRAME_SIZE).expect("aligned"))));
+        kassert!(all_allocated(paddr, 3, true));
         // SAFETY: as above.
         unsafe { VirtioHal::unshare(paddr, shared, BufferDirection::DriverToDevice) };
         let empty: &[u8] = &[];
         let shared = NonNull::from(empty);
-        // SAFETY: an empty buffer: nothing read or written.
+        // SAFETY: an empty buffer (a dangling but aligned, non-null pointer
+        // of length 0): nothing is read or written through it.
         let paddr = unsafe { VirtioHal::share(shared, BufferDirection::DeviceToDriver) };
-        kassert!(frame::is_allocated(PhysFrame::from_u64(paddr).ok_or("not a frame")?));
+        kassert!(all_allocated(paddr, 1, true));
         // SAFETY: as above.
         unsafe { VirtioHal::unshare(paddr, shared, BufferDirection::DeviceToDriver) };
         kassert_eq!(outstanding_runs(), before);
@@ -877,6 +977,8 @@ crate::ktest!(
         use crate::pci::{self, Binding, ClaimError, Probed, ktest_command};
         use crate::{kassert, kassert_eq};
         let d = ktest_device(1)?;
+        let nowhere = lumen_pci::PciAddr::new(0, 0x80, 31, 7).ok_or("addr")?;
+        kassert_eq!(pci::claim(nowhere, "ktest").map(|_| ()), Err(ClaimError::NoSuchFunction));
         let bits = MEMORY_SPACE | BUS_MASTER | IO_SPACE;
         // Firmware left it decoding I/O only, mastering nothing.
         kassert_eq!(ktest_command(d.addr, Some(IO_SPACE)) & bits, IO_SPACE);
@@ -895,7 +997,8 @@ crate::ktest!(
         kassert!(matches!(pci::claim(d.addr, "ktest"), Err(ClaimError::Taken(Binding::Bound("ktest")))));
         // How `lspci` shows each binding.
         let shown = [
-            (Binding::Free, "no driver"),
+            (Binding::Free { declined_by: None }, "no driver"),
+            (Binding::Free { declined_by: Some("kbd") }, "no driver (kbd declined it)"),
             (Binding::NotProbed("rng", "why".into()), "rng: not probed: why"),
             (Binding::Probing("rng"), "rng: probing"),
             (Binding::Bound("rng"), "rng: bound"),
@@ -924,8 +1027,7 @@ crate::ktest!(
         kassert_eq!((driver, why.clone()), ("ktest", alloc::format!("{e}")));
         kassert!(why.starts_with("0000:00:01.0 BAR 0: mapping 0x"));
         // `lspci`'s driver column.
-        let row = crate::shell::sysinfo::pci_rows().into_iter().find(|(a, _)| *a == vga.addr).ok_or("no row")?;
-        kassert_eq!(row.1, alloc::format!("ktest: not probed: {why}"));
+        kassert_eq!(crate::shell::sysinfo::driver_text(vga.addr), alloc::format!("ktest: not probed: {why}"));
         Ok(())
     }
 );
@@ -959,11 +1061,26 @@ crate::ktest!(
         kassert!(matches!(status.check_ready(), Err(ProbeError::NotReady { status: 0x07 })));
         t.set_status(ok | DeviceStatus::DEVICE_NEEDS_RESET);
         kassert!(status.check_ready().is_err());
+        t.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER | DeviceStatus::FEATURES_OK);
+        kassert!(matches!(status.check_ready(), Err(ProbeError::NotReady { status: 0x0b })));
+        t.set_status(ok | DeviceStatus::FAILED);
+        kassert!(matches!(status.check_ready(), Err(ProbeError::NotReady { status: 0x8f })));
+        // The message names what is missing.
+        let why = |status| alloc::format!("{}", ProbeError::NotReady { status });
         kassert_eq!(
-            alloc::format!("{}", ProbeError::NotReady { status: 0xff }),
-            "the device status reads 0xff after setup (FEATURES_OK and DRIVER_OK wanted): all ones, the device is \
-             gone or not decoding"
+            why(0xff),
+            "the device status reads 0xff after setup: all ones, the device is gone or not decoding"
         );
+        kassert_eq!(why(0x8f), "the device status reads 0x8f after setup: FAILED set");
+        kassert_eq!(
+            why(0x4f),
+            "the device status reads 0x4f after setup: DEVICE_NEEDS_RESET set: the device needs a reset"
+        );
+        kassert_eq!(
+            why(0x07),
+            "the device status reads 0x07 after setup: FEATURES_OK clear: the device refused the negotiated features"
+        );
+        kassert_eq!(why(0x0b), "the device status reads 0x0b after setup: DRIVER_OK clear");
         // A bounded wait gives up on time (at least the timeout, well under
         // a second), re-polling `ready`; or when the status shows
         // DEVICE_NEEDS_RESET (which the device sets) or FAILED (a driver).
@@ -984,6 +1101,9 @@ crate::ktest!(
         );
         kassert_eq!(polls, 3);
         kassert_eq!(status.wait_until(1_000_000, || true), Ok(()));
+        // `ready` is asked once more at the deadline.
+        let t1 = crate::time::now_ns();
+        kassert_eq!(status.wait_until(2_000_000, || crate::time::now_ns() >= t1 + 2_000_000), Ok(()));
         t.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DEVICE_NEEDS_RESET);
         kassert_eq!(status.wait_until(10_000_000_000, || false), Err(WaitError::NeedsReset { status: 0x41 }));
         t.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::FAILED);
@@ -993,9 +1113,12 @@ crate::ktest!(
         kassert_eq!(t.get_status(), DeviceStatus::empty());
         kassert_eq!(outstanding_runs(), runs);
         pci::probed(d.addr, "ktest", Probed::Bound);
-        // Dropping it resets the device: a bounded wait, then `PciTransport`'s
-        // `Drop` (writes 0, spins until the status reads 0).
+        // Dropping it resets a running device: writes 0, waits for the status
+        // to read 0, then `PciTransport`'s `Drop` (test_ktest.py checks no
+        // reset failure is logged).
+        t.set_status(DeviceStatus::ACKNOWLEDGE);
         drop(t);
+        kassert_eq!(status.raw(), 0);
         Ok(())
     }
 );

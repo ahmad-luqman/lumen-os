@@ -339,21 +339,13 @@ fn driver_cell(addr: crate::pci::PciAddr) -> Value {
     crate::pci::binding(addr).map_or(DASH, |b| Value::Text(b.to_string()))
 }
 
-/// Ktests: each function's driver column, as `lspci` shows it.
+/// Ktests: `addr`'s driver column, as `lspci` shows it.
 #[cfg(feature = "ktest")]
-pub fn pci_rows() -> Vec<(crate::pci::PciAddr, String)> {
-    crate::pci::devices()
-        .iter()
-        .map(|d| {
-            (
-                d.addr,
-                match driver_cell(d.addr) {
-                    Value::Text(t) => t,
-                    _ => String::from("-"),
-                },
-            )
-        })
-        .collect()
+pub fn driver_text(addr: crate::pci::PciAddr) -> String {
+    match driver_cell(addr) {
+        Value::Text(t) => t,
+        _ => String::from("-"),
+    }
 }
 
 /// `lspci`'s rows: the address, vendor and device ids (four hex digits,
