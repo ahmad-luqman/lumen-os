@@ -22,6 +22,8 @@ def cmd_run(a: argparse.Namespace) -> int:
         monitor=None,
         log_file=BUILD_DIR / "run/qemu.log",
         host_audio=host_audio_driver(sys.platform, os.environ) if a.sound else None,
+        # So `random` works (QEMU's default CPU has no RDRAND).
+        virtio_rng=True,
     )
     args = qemu_args(opts)
     print("+", " ".join(args), file=sys.stderr)

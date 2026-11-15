@@ -389,7 +389,8 @@ pub enum Binding {
     /// Claimed by this driver, which is probing it.
     Probing(&'static str),
     Bound(&'static str),
-    /// The probe failed, or the driver gave the device up later: why.
+    /// The driver's probe failed, or the driver gave the device up after
+    /// binding it (`failed_after_bind`): why.
     Failed(&'static str, String),
 }
 
@@ -694,13 +695,10 @@ pub fn probed(addr: PciAddr, driver: &'static str, outcome: Probed) -> Binding {
     binding
 }
 
-/// Turn `addr`'s bus mastering off (`what`: why, for a mismatch warning).
-fn bus_master_off(addr: PciAddr, what: &str) {
-    let now = with_ecam(|ecam| ecam.read16(addr, lumen_pci::reg::COMMAND));
-    set_command(addr, now & !command::BUS_MASTER, what);
-}
-
-/// A bound driver gave its device up after binding (it already dropped or reset it): record `<driver>: failed: <why>` and turn bus mastering off. Changes nothing and returns false unless the function is bound to `driver` (e.g. already failed, still probing, or someone else's).
+/// A bound driver gave its device up after binding (it already dropped or
+/// reset it): record `<driver>: failed: <why>` and turn bus mastering off.
+/// Changes nothing and returns false unless the function is bound to
+/// `driver` (e.g. already failed, still probing, or someone else's).
 pub fn failed_after_bind(addr: PciAddr, driver: &'static str, why: String) -> bool {
     let live = with_slot(addr, |slot| match slot.state {
         SlotState::Bound(d) if d == driver => Some(slot.resources_live),
@@ -709,11 +707,19 @@ pub fn failed_after_bind(addr: PciAddr, driver: &'static str, why: String) -> bo
     .flatten();
     let Some(live) = live else { return false };
     if live {
-        warn!(target: "pci", "{addr}: {driver} gave the device up but its resources are still live");
+        warn!(target: "pci", "{addr}: {driver} gave it up after binding but its resources are still live");
     }
-    bus_master_off(addr, "bus mastering off after its driver gave the device up");
+    bus_master_off(addr, "bus mastering off after its driver gave it up");
     with_slot(addr, |slot| slot.state = SlotState::Failed(driver, why));
     true
+}
+
+/// Turn `addr`'s bus mastering off (read back; `what` names why, for a
+/// mismatch's warning), so the device can't reach memory its driver
+/// dropped.
+fn bus_master_off(addr: PciAddr, what: &str) {
+    let now = with_ecam(|ecam| ecam.read16(addr, lumen_pci::reg::COMMAND));
+    set_command(addr, now & !command::BUS_MASTER, what);
 }
 
 /// A claimed function's resources, and nothing else: its `DeviceInfo`, its

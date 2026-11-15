@@ -188,6 +188,9 @@ class QemuOptions:
     virtio_tablet: bool = False
     virtio_keyboard: bool = False
     virtio_rng: bool = False
+    # virtio-rng's rate limit, QEMU's `max-bytes` per `period` ms (implies
+    # virtio-rng). None: unlimited.
+    virtio_rng_rate: tuple[int, int] | None = None
     # virtio-sound, played into this wav file through QEMU's wav audiodev.
     sound_wav: Path | None = None
     # virtio-sound, played through the host's speakers by this QEMU audio
@@ -243,8 +246,10 @@ def device_args(o: QemuOptions) -> list[str]:
         args += ["-device", f"virtio-tablet-pci,id={ids['tablet']}"]
     if o.virtio_keyboard:
         args += ["-device", f"virtio-keyboard-pci,id={ids['keyboard']}"]
-    if o.virtio_rng:
-        args += ["-device", f"virtio-rng-pci,id={ids['rng']}"]
+    if o.virtio_rng or o.virtio_rng_rate:
+        rate = o.virtio_rng_rate
+        limit = f",max-bytes={rate[0]},period={rate[1]}" if rate else ""
+        args += ["-device", f"virtio-rng-pci,id={ids['rng']}{limit}"]
     # The sound device's audiodev (its driver and options): the host's
     # speakers (`make run SOUND=1`), or a wav file.
     audiodev = None
@@ -313,6 +318,10 @@ class Devices:
     tablet: bool = False
     keyboard: bool = False
     rng: bool = False
+    # virtio-rng limited to `max-bytes` per `period` ms (QEMU's properties):
+    # attaches virtio-rng (whatever `rng` says), a device that stops
+    # answering in time.
+    rng_rate: tuple[int, int] | None = None
     # virtio-sound, recorded to `Machine.wav_path`.
     sound: bool = False
     # virtio-blk on a scratch image of this many MiB, zero-filled again on
@@ -338,6 +347,13 @@ class Devices:
             raise ValueError(f"blk_mib={self.blk_mib!r}: expected a whole number of MiB above 0")
         if self.blk_image is not None:
             object.__setattr__(self, "blk_image", Path(self.blk_image).absolute())
+        if self.rng_rate is not None:
+            rate = tuple(self.rng_rate)
+            if len(rate) != 2 or not all(_is_int(v) and v > 0 for v in rate):
+                raise ValueError(
+                    f"rng_rate={self.rng_rate!r}: expected (max-bytes, period ms), both above 0"
+                )
+            object.__setattr__(self, "rng_rate", rate)
         forward = tuple(self.forward)
         for port in forward:
             if not (_is_int(port) and 1 <= port <= 65535):
@@ -357,7 +373,8 @@ class Devices:
     @classmethod
     def every(cls) -> Devices:
         """Every device the harness knows (`blk_image` is the alternative to
-        `blk_mib`, so it stays off)."""
+        `blk_mib`, so it stays off; `rng_rate` only limits virtio-rng, which
+        is on, unlimited)."""
         return cls(
             tablet=True,
             keyboard=True,
@@ -670,6 +687,7 @@ class Machine:
             virtio_tablet=d.tablet,
             virtio_keyboard=d.keyboard,
             virtio_rng=d.rng,
+            virtio_rng_rate=d.rng_rate,
             sound_wav=self.wav_path if d.sound else None,
             blk_image=self.blk_image if d.wants_blk else None,
             net_forwards=dict(self.forwards) if d.wants_net else None,

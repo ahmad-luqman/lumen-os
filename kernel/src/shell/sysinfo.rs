@@ -347,7 +347,8 @@ pub fn lspci(ctx: &mut Ctx<'_>, args: &[String]) {
 
 /// `lspci`'s driver column for `addr`: its binding (`no driver`,
 /// `<driver>: not probed: <reason>`, `<driver>: probing` while its probe
-/// runs, `<driver>: bound` or `<driver>: failed: <reason>`).
+/// runs, `<driver>: bound` or `<driver>: failed: <reason>`, the probe having
+/// failed or the driver having given the device up after binding it).
 fn driver_cell(addr: crate::pci::PciAddr) -> Value {
     crate::pci::binding(addr).map_or(DASH, |b| Value::Text(b.to_string()))
 }

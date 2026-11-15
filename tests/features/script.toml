@@ -44,3 +44,10 @@ tests = [
     "ktest:lumen_kernel::script::deep_recursion_is_an_error_not_a_crash",
     "ktest:lumen_kernel::script::nested_values_are_an_error_not_a_crash",
 ]
+
+[[feature]]
+name = "rhai's `random()` (any integer, differing call to call) and `random(n)` (0 to n - 1; `random(1)` is 0, `random(0)` an error naming the bound)"
+milestone = "M3"
+tests = [
+    "ktest:lumen_kernel::script::lumen_functions_answer",
+]

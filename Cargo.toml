@@ -19,6 +19,7 @@ lumen-heap = { path = "crates/lumen-heap" }
 lumen-mm = { path = "crates/lumen-mm" }
 lumen-pci = { path = "crates/lumen-pci" }
 lumen-queue = { path = "crates/lumen-queue" }
+lumen-rand = { path = "crates/lumen-rand" }
 lumen-shell = { path = "crates/lumen-shell" }
 lumen-synth = { path = "crates/lumen-synth" }
 lumen-term = { path = "crates/lumen-term" }

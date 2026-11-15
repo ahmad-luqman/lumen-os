@@ -222,6 +222,7 @@ dependencies = [
  "lumen-mm",
  "lumen-pci",
  "lumen-queue",
+ "lumen-rand",
  "lumen-shell",
  "lumen-synth",
  "lumen-term",
@@ -246,6 +247,10 @@ version = "0.0.1"
 
 [[package]]
 name = "lumen-queue"
+version = "0.0.1"
+
+[[package]]
+name = "lumen-rand"
 version = "0.0.1"
 
 [[package]]
