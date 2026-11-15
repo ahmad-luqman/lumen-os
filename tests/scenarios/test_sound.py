@@ -82,9 +82,11 @@ def test_tone_is_captured(boot):
     assert ready, "no sound line"
     assert run(m, "beep 440 500") == ""
     row = wait_played(m, 1)
-    # 500 ms of samples, rounded up to whole 20 ms periods.
+    # Exactly 500 ms of frames went to the device (the last period's
+    # padding isn't counted).
     rate = int(ready[2])
-    assert 0 < int(row["frames"]) <= rate // 2 + rate // 50, row
+    assert int(row["frames"]) == rate // 2, row
+    assert row["underruns"] == "0", row
     wav = recording(m)
     samples = wav.first_channel
     freq = audio.dominant_frequency(samples, wav.rate)
