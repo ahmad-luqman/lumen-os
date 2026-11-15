@@ -12,8 +12,9 @@ from typing import Self
 
 import pytest
 from lumen_harness import REPO_ROOT, qemu
-from lumen_harness.__main__ import find_gdb, gdb_binary, gdb_command
+from lumen_harness.__main__ import debug_options, find_gdb, gdb_binary, gdb_command, run_options
 from lumen_harness.qemu import (
+    Devices,
     ExpectTimeout,
     Machine,
     ovmf_vars_template,
@@ -22,6 +23,7 @@ from lumen_harness.qemu import (
     qemu_version,
     timeout_scale,
 )
+from PIL import Image
 from qemu_fakes import fake_qemu, opts
 
 
@@ -59,6 +61,74 @@ def test_machine_waits_for_events_with_scaled_timeouts(tmp_path, monkeypatch):
     m._qmp = FakeQmp()  # type: ignore[assignment]
     assert m.wait_event("SHUTDOWN", 10) == {"event": "SHUTDOWN"}
     assert waits == [("SHUTDOWN", 30)]
+
+
+def test_pointer_events_are_paced_and_scaled_to_the_screen(tmp_path, monkeypatch):
+    # Pixels become QEMU's axis values for the screen's size (taken once),
+    # and no two pointer events go closer together than POINTER_GAP.
+    m = Machine(Path("x.iso"), tmp_path, devices=Devices(tablet=True))
+    m._screen_size = (1280, 800)
+    clock = [100.0]
+    sent = []
+    monkeypatch.setattr(qemu.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(qemu.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+
+    class FakeQmp:
+        def send_input(self, args):
+            sent.append((clock[0], args["events"]))
+
+    m._qmp = FakeQmp()  # type: ignore[assignment]
+    m.move_pointer(1279, 799)
+    m.click("left")
+    clock[0] += 1
+    m.click("right", release=False)
+    m.release("right")
+    times = [t for t, _ in sent]
+    assert times == pytest.approx([100.0, 100.03, 100.06, 101.06, 101.09])
+    assert sent[0][1][0]["data"] == {"axis": "x", "value": 0x7FFF}
+    assert sent[0][1][1]["data"] == {"axis": "y", "value": 0x7FFF}
+    assert [e[0]["data"] for _, e in sent[1:]] == [
+        {"down": True, "button": "left"},
+        {"down": False, "button": "left"},
+        {"down": True, "button": "right"},
+        {"down": False, "button": "right"},
+    ]
+
+
+def test_pointer_events_need_a_tablet(tmp_path):
+    # Without one QEMU would give them to the PS/2 mouse, silently.
+    m = Machine(Path("x.iso"), tmp_path)
+    m._screen_size = (1280, 800)
+    for send in (lambda: m.move_pointer(1, 1), m.click, m.release):
+        with pytest.raises(ValueError, match="no tablet to point with"):
+            send()
+
+
+def test_make_run_and_debug_attach_a_tablet():
+    # So the mouse moves the pointer in their windows.
+    for machine in (
+        run_options(Path("x.iso"), Path("v.fd"), headless=True),
+        debug_options(Path("x.iso"), Path("v.fd"), batch=True),
+    ):
+        assert "virtio-tablet-pci,id=lumen-tablet" in qemu_args(machine)
+    assert "-S" in qemu_args(debug_options(Path("x.iso"), Path("v.fd"), batch=True))
+
+
+def test_the_screen_size_is_taken_once(tmp_path, monkeypatch):
+    # From one screendump, kept for every later pointer event.
+    m = Machine(Path("x.iso"), tmp_path, devices=Devices(tablet=True))
+    shots = []
+
+    def screendump(name):
+        shots.append(name)
+        path = tmp_path / name
+        Image.new("RGB", (640, 480)).save(path)
+        return path
+
+    monkeypatch.setattr(m, "screendump", screendump)
+    assert m.screen_size() == (640, 480)
+    assert m.screen_size() == (640, 480)
+    assert shots == ["screen-size.png"]
 
 
 def test_machine_event_failures_show_the_serial_output(tmp_path):

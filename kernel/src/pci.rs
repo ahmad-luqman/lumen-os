@@ -655,8 +655,9 @@ pub enum Probed {
     /// It failed: why. Bus mastering is turned off, so the device can't
     /// reach memory its driver dropped.
     Failed(String),
-    /// Not this driver's device after all (a keyboard and a tablet share
-    /// virtio's input id): the function is free again, its command
+    /// Not this driver's device after all (one its `matches` couldn't rule
+    /// out, e.g. a second tablet, or a virtio input device of the tablet's
+    /// class without its axes): the function is free again, its command
     /// register as before the claim, for the next driver row. Refused (a
     /// failure) if the driver kept its `DeviceResources`.
     Declined,

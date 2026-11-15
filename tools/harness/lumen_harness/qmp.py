@@ -61,6 +61,47 @@ def send_key_args(qcodes: Sequence[str], hold_ms: int) -> dict[str, Any]:
     return {"keys": [{"type": "qcode", "data": q} for q in qcodes], "hold-time": hold_ms}
 
 
+# QEMU's absolute axes run from 0 to this (`INPUT_EVENT_ABS_MAX`), on QMP's
+# `input-send-event` and on virtio's tablet alike.
+ABS_MAX = 0x7FFF
+# QMP's pointer buttons (`InputButton`, qapi/ui.json) the harness presses;
+# QEMU's tablet turns the wheel ones into `REL_WHEEL` clicks.
+BUTTONS = ("left", "middle", "right", "side", "extra", "wheel-up", "wheel-down")
+
+
+def abs_of(px: int, pixels: int) -> int:
+    """Pixel `px` of a screen `pixels` wide as an absolute axis value
+    (0-`ABS_MAX`), rounded to the nearest: the kernel scales it back to the
+    same pixel (`lumen_input::AbsAxis::scale`, which `tests/harness/
+    test_qmp.py`'s `kernel_scale` mirrors: change them together)."""
+    if not (isinstance(pixels, int) and pixels >= 2):
+        raise ValueError(f"a screen {pixels!r} pixels wide: expected 2 or more")
+    if not (isinstance(px, int) and 0 <= px < pixels):
+        raise ValueError(f"pixel {px!r} is off a screen {pixels} pixels wide")
+    last = pixels - 1
+    return (px * ABS_MAX + last // 2) // last
+
+
+def pointer_move_args(x: int, y: int, size: tuple[int, int]) -> dict[str, Any]:
+    """The arguments of QMP's `input-send-event` moving an absolute pointer
+    to pixel (`x`, `y`) of a screen `size` (width, height) pixels big."""
+    width, height = size
+    return {
+        "events": [
+            {"type": "abs", "data": {"axis": "x", "value": abs_of(x, width)}},
+            {"type": "abs", "data": {"axis": "y", "value": abs_of(y, height)}},
+        ]
+    }
+
+
+def button_args(button: str, down: bool) -> dict[str, Any]:
+    """The arguments of QMP's `input-send-event` pressing or releasing a
+    pointer button."""
+    if button not in BUTTONS:
+        raise ValueError(f"no pointer button {button!r} (one of {', '.join(BUTTONS)})")
+    return {"events": [{"type": "btn", "data": {"down": down, "button": button}}]}
+
+
 class QmpClient:
     def __init__(self, sock: socket.socket):
         self._sock = sock
@@ -169,6 +210,11 @@ class QmpClient:
     def send_key(self, qcodes: Sequence[str], hold_ms: int = 20) -> None:
         """Press `qcodes` together on the guest's keyboard, then release."""
         self.command("send-key", **send_key_args(qcodes, hold_ms))
+
+    def send_input(self, args: dict[str, Any]) -> None:
+        """Send input events (`pointer_move_args`, `button_args`); QEMU ends
+        them with a sync, so the guest sees them as one frame."""
+        self.command("input-send-event", **args)
 
     def close(self) -> None:
         try:

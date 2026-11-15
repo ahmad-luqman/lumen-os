@@ -33,6 +33,18 @@
 //!
 //! The terminal takes `\n` as a line feed only: [`write_str_to`],
 //! [`write_fmt_to`] and log lines turn it into CR LF.
+//!
+//! The mouse pointer (#98) is drawn here too, over everything, header
+//! included, once the tablet has reported a position ([`move_pointer`];
+//! never before, so a boot without a tablet draws exactly what it did).
+//! It is a save-under arrow (`lumen_input::Cursor`): every drawing step
+//! that would touch its box takes it off first (putting back the pixels it
+//! covered), and the end of every step under the screen's lock puts it
+//! back, at its newest position. So redrawing the terminal never erases
+//! it and moving it never leaves a trail. While a [`Canvas`] has the
+//! pixels it is taken off and stays off (a canvas draws without the lock,
+//! so it can't be kept out of the arrow's box); dropping the canvas draws
+//! it again.
 
 use crate::fb::{self, Framebuffer, Style};
 use crate::sync::SpinLock;
@@ -81,6 +93,11 @@ struct Screen {
     cells_drawn: u64,
     /// Whose [`Canvas`] has the pixels, if one has: draw nothing then.
     canvas: Option<Owner>,
+    /// Where the mouse pointer's tip should be (framebuffer pixels), if the
+    /// tablet reported a position (and the pointer wasn't hidden since).
+    pointer_at: Option<(usize, usize)>,
+    /// The arrow as drawn, and the pixels it covers.
+    pointer: lumen_input::Cursor,
 }
 
 static SCREEN: SpinLock<Option<Screen>> = SpinLock::new(None);
@@ -122,6 +139,8 @@ pub fn init(fb: Framebuffer) {
         blink_on: true,
         cells_drawn: 0,
         canvas: None,
+        pointer_at: None,
+        pointer: lumen_input::Cursor::default(),
     };
     screen.draw_tabs();
     *SCREEN.lock() = Some(screen);
@@ -144,10 +163,13 @@ pub fn drawing_here() -> bool {
     d != 0 && d == drawing_id()
 }
 
-/// Run `f` on `screen`, marked as this CPU's drawing (the lock is held).
+/// Run `f` on `screen`, marked as this CPU's drawing (the lock is held),
+/// then put the mouse pointer where it belongs (`f` may have taken it off,
+/// or moved it).
 fn drawing<R>(screen: &mut Screen, f: impl FnOnce(&mut Screen) -> R) -> R {
     DRAWING.store(drawing_id(), Ordering::Relaxed);
     let r = f(screen);
+    screen.place_pointer();
     DRAWING.store(0, Ordering::Relaxed);
     r
 }
@@ -235,6 +257,7 @@ impl Screen {
         for vt in 0..VTS {
             let Some(x) = tab_x(self.fb.width(), vt) else { return };
             let (fg, bg) = if vt == self.shown { (fb::BG, fb::TEXT) } else { (fb::TEXT, fb::BG) };
+            self.uncover(x, TAB_Y, TAB_W, TAB_H);
             // Outlined, so a hidden one's box shows too.
             self.fb.fill_rect(x, TAB_Y, TAB_W, TAB_H, fb::TEXT);
             self.fb.fill_rect(x + 1, TAB_Y + 1, TAB_W - 2, TAB_H - 2, bg);
@@ -270,6 +293,8 @@ impl Screen {
             let len = (s.bottom - s.top - n) * CELL_H;
             let shift = n * CELL_H;
             let rows = s.top * cols..s.bottom * cols;
+            // The pixels move: the pointer mustn't move with them.
+            self.uncover(0, top, self.fb.width(), bottom - top);
             if s.lines > 0 {
                 self.fb.move_rows(top + shift, top, len);
                 self.shadow[rows].copy_within(n * cols.., 0);
@@ -313,6 +338,7 @@ impl Screen {
     /// terminal.
     fn redraw(&mut self) {
         let (w, h) = (self.fb.width(), self.fb.height());
+        self.uncover(0, fb::CONSOLE_TOP, w, h.saturating_sub(fb::CONSOLE_TOP));
         self.fb.fill_rect(0, fb::CONSOLE_TOP, w, h.saturating_sub(fb::CONSOLE_TOP), fb::BG);
         // A blank cell draws as the background just filled in.
         self.shadow.fill(Cell::BLANK);
@@ -338,6 +364,7 @@ impl Screen {
             core::mem::swap(&mut fg, &mut bg);
         }
         let (x, y, w) = (self.x0 + col * self.cell_w, self.y0 + row * CELL_H, self.cell_w);
+        self.uncover(x, y, w, CELL_H);
         if cell.ch == ' ' || cell.flags.contains(Flags::SPACER) {
             self.fb.fill_rect(x, y, w, CELL_H, bg);
         } else {
@@ -348,6 +375,51 @@ impl Screen {
             }
         }
         self.cells_drawn += 1;
+    }
+
+    /// About to draw the `w` x `h` pixels at (`x`, `y`): take the mouse
+    /// pointer off if it is drawn there (putting back what it covered;
+    /// [`drawing`] draws it again afterwards).
+    fn uncover(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        if self.pointer.overlaps(x, y, w, h) {
+            self.pointer.hide(&mut Pixels(&self.fb));
+        }
+    }
+
+    /// Draw the mouse pointer at [`Self::pointer_at`] (moving it there), or
+    /// take it off if there is none or a canvas has the pixels (a canvas
+    /// draws without the lock, so the arrow can't be kept out of its way).
+    /// The one place that decides whether the pointer shows.
+    fn place_pointer(&mut self) {
+        let px = &mut Pixels(&self.fb);
+        match self.pointer_at.filter(|_| self.canvas.is_none()) {
+            Some((x, y)) => {
+                let (outline, fill) = (self.fb.encode(POINTER_OUTLINE), self.fb.encode(POINTER_FILL));
+                self.pointer.show(px, x, y, outline, fill);
+            }
+            None => self.pointer.hide(px),
+        }
+    }
+}
+
+/// The mouse pointer's colours.
+const POINTER_OUTLINE: u32 = 0x000000;
+const POINTER_FILL: u32 = 0xffffff;
+
+/// The framebuffer as the pointer's save-under sees it: encoded pixels.
+struct Pixels<'a>(&'a Framebuffer);
+
+impl lumen_input::Surface for Pixels<'_> {
+    fn size(&self) -> (usize, usize) {
+        (self.0.width(), self.0.height())
+    }
+
+    fn get(&self, x: usize, y: usize) -> u32 {
+        self.0.pixel(x, y)
+    }
+
+    fn set(&mut self, x: usize, y: usize, value: u32) {
+        self.0.put_encoded(x, y, value);
     }
 }
 
@@ -490,6 +562,7 @@ pub fn canvas(owner: Owner) -> Result<Canvas, CanvasError> {
         if let Some(vt) = owner.vt {
             s.switch(vt);
         }
+        // (`drawing` takes the pointer off now: `place_pointer`.)
         // SAFETY: the terminal's handle draws nothing while the canvas is
         // live (`Screen::canvas`), so the two never draw at the same time
         // (see `Canvas`'s `Sync` for a canvas no longer live).
@@ -720,6 +793,34 @@ pub fn show(vt: usize) -> Result<(), ShowError> {
 /// started, or on a CPU already drawing).
 pub fn shown() -> usize {
     with_screen(|s| s.shown).unwrap_or(0)
+}
+
+/// Point the mouse pointer's tip at framebuffer pixel (`x`, `y`) and draw
+/// it there (taken off its old place), or, while a [`Canvas`] has the
+/// pixels, when the canvas goes. False if there is no terminal to draw it
+/// with, a crash report started, or this CPU is already drawing.
+pub fn move_pointer(x: usize, y: usize) -> bool {
+    with_screen(|s| s.pointer_at = Some((x, y))).is_some()
+}
+
+/// Take the mouse pointer off the screen (what it covered comes back)
+/// until [`move_pointer`] again.
+pub fn hide_pointer() {
+    with_screen(|s| s.pointer_at = None);
+}
+
+/// Where the mouse pointer's tip is drawn, if it is (not before the first
+/// [`move_pointer`], after [`hide_pointer`], while a [`Canvas`] has the
+/// pixels, with the tip off the screen, or without a terminal).
+pub fn pointer_drawn() -> Option<(usize, usize)> {
+    with_screen(|s| s.pointer.drawn_at()).flatten()
+}
+
+/// The framebuffer's width and height in pixels (`None` without a
+/// terminal, or once a crash report started): what the tablet's positions
+/// are scaled to.
+pub fn screen_size() -> Option<(usize, usize)> {
+    with_screen(|s| (s.fb.width(), s.fb.height()))
 }
 
 /// How many lines virtual terminal `vt`'s view is scrolled back (for the
@@ -1060,6 +1161,124 @@ crate::ktest!(
             crate::ktest::diag(format_args!("first differing pixel: ({}, {}) of the grid", i % w, i / w));
         }
         kassert!(drawn == fresh);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn the_pointer_survives_redraws_and_leaves_no_trail() {
+        // The mouse pointer over the terminal while it draws, scrolls (whole
+        // screen and a region), clears, redraws everything and redraws the
+        // header's boxes below it, moved across all of it: after each step
+        // its tip is drawn where it was put, and once it is taken off, the
+        // pixels (everything below the header, its margins included, and
+        // the header's boxes) are exactly what drawing everything afresh
+        // gives. Then a canvas takes it off until dropped. (The ktests boot
+        // with no tablet: nothing else moves it.)
+        use crate::{kassert, kassert_eq};
+        const STEPS: [&[u8]; 7] = [
+            b"\x1b[r\x1b[999;1H\r\nunder the pointer",
+            b"\r\nscrolled below the pointer",
+            b"\x1b[3;12r\x1b[12;1H\nregion scrolled",
+            b"\x1b[r\x1b[H\x1b[2Jcleared",
+            b"\x1b[1;1H\x1b[44m          \x1b[0m",
+            b"\x1b[999;1H\r\n",
+            // A step that also redraws everything (below).
+            b"",
+        ];
+        reset_view(0);
+        kassert_eq!(pointer_drawn(), None);
+        let (rows, x0, y0, cell_w, fb_w, fb_h) =
+            with_screen(|s| (s.term().rows(), s.x0, s.y0, s.cell_w, s.fb.width(), s.fb.height()))
+                .ok_or("no terminal")?;
+        let tabs = tab_x(fb_w, 0).ok_or("no header boxes on this screen")?;
+        // Tips: inside the grid on a cell corner and between cell edges, on
+        // the bottom row's first cell, straddling the header and the grid, on the header's boxes,
+        // at the right edge, and in the bottom margin's corner (clipped).
+        let tips = [
+            (x0 + 3 * cell_w, y0 + 2 * CELL_H),
+            (x0 + 3 * cell_w + 5, y0 + 2 * CELL_H + 9),
+            (x0, y0 + (rows - 1) * CELL_H),
+            (x0 + 40, y0 - 8),
+            (tabs + 3, TAB_Y + 2),
+            (tabs + TAB_W + 1, TAB_Y + TAB_H - 4),
+            (fb_w - 1, y0 + 5 * CELL_H),
+            (x0 + 2, fb_h - 3),
+        ];
+        let mut fill = alloc::string::String::new();
+        for r in 1..=rows {
+            let _ = write!(fill, "\x1b[{r};1Hrow {r} \x1b[4{}m{r}{r}{r}\x1b[0m", r % 8);
+        }
+        // Allocated before taking the screen's lock again.
+        let below = fb_w * (fb_h - fb::CONSOLE_TOP);
+        let (mut drawn, mut fresh) = (Vec::with_capacity(below), Vec::with_capacity(below));
+        let (mut tabs_drawn, mut tabs_fresh) = (Vec::with_capacity(fb_w * TAB_H), Vec::with_capacity(fb_w * TAB_H));
+        let snapshot = |s: &Screen, grid: &mut Vec<u32>, header: &mut Vec<u32>| {
+            grid.extend((fb::CONSOLE_TOP..fb_h).flat_map(|y| (0..fb_w).map(move |x| s.fb.pixel(x, y))));
+            header.extend((TAB_Y..TAB_Y + TAB_H).flat_map(|y| (0..fb_w).map(move |x| s.fb.pixel(x, y))));
+        };
+        let result = with_screen(|s| {
+            let tip_ok = |s: &Screen, (x, y): (usize, usize)| {
+                s.pointer.drawn_at() == Some((x, y)) && s.fb.pixel(x, y) == s.fb.encode(POINTER_OUTLINE)
+            };
+            let mut bad = None;
+            s.term_mut().write(fill.as_bytes());
+            s.render();
+            for (i, &tip) in tips.iter().enumerate() {
+                s.pointer_at = Some(tip);
+                s.place_pointer();
+                for (j, step) in STEPS.iter().enumerate() {
+                    s.term_mut().write(step);
+                    if step.is_empty() {
+                        s.redraw();
+                    } else {
+                        s.render();
+                    }
+                    // The header's boxes redrawn below it.
+                    s.draw_tabs();
+                    s.place_pointer();
+                    if bad.is_none() && !tip_ok(s, tip) {
+                        bad = Some((i, j));
+                    }
+                }
+            }
+            s.pointer_at = None;
+            s.place_pointer();
+            let off = s.pointer.drawn_at().is_none();
+            snapshot(s, &mut drawn, &mut tabs_drawn);
+            // Everything afresh: below the header cleared and every cell
+            // drawn, and the header's boxes.
+            s.redraw();
+            s.draw_tabs();
+            snapshot(s, &mut fresh, &mut tabs_fresh);
+            (bad, off)
+        });
+        let (bad, off) = result.ok_or("no terminal")?;
+        if let Some((tip, step)) = bad {
+            crate::ktest::diag(format_args!("the pointer's tip {tip} isn't drawn after step {step}"));
+        }
+        kassert!(bad.is_none());
+        kassert!(off);
+        if let Some(i) = drawn.iter().zip(&fresh).position(|(a, b)| a != b) {
+            crate::ktest::diag(format_args!("first differing pixel: ({}, {})", i % fb_w, fb::CONSOLE_TOP + i / fb_w));
+        }
+        kassert!(drawn == fresh);
+        kassert!(tabs_drawn == tabs_fresh);
+        // A canvas takes it off (the pixels below come back) until dropped;
+        // moved meanwhile, it comes back at its new place.
+        let (a, b) = (tips[0], tips[1]);
+        kassert!(move_pointer(a.0, a.1));
+        kassert_eq!(pointer_drawn(), Some(a));
+        let canvas = canvas(Owner::new()).map_err(|_| "no canvas")?;
+        kassert_eq!(pointer_drawn(), None);
+        kassert!(move_pointer(b.0, b.1));
+        kassert_eq!(pointer_drawn(), None);
+        let restored = with_screen(|s| s.fb.pixel(a.0, a.1) != s.fb.encode(POINTER_OUTLINE)).ok_or("no terminal")?;
+        kassert!(restored);
+        drop(canvas);
+        kassert_eq!(pointer_drawn(), Some(b));
+        hide_pointer();
+        kassert_eq!(pointer_drawn(), None);
         Ok(())
     }
 );

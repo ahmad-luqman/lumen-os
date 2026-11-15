@@ -125,11 +125,18 @@ impl Framebuffer {
         self.height
     }
 
-    /// The pixel at (`x`, `y`) as stored (0 outside the framebuffer; for the
-    /// tests).
-    #[cfg(feature = "ktest")]
+    /// The pixel at (`x`, `y`) as stored, encoded (0 outside the
+    /// framebuffer): the mouse pointer's save-under reads what it covers.
     pub fn pixel(&self, x: usize, y: usize) -> u32 {
         self.pixel_at(x, y).map_or(0, |pixel| pixel.load(Ordering::Relaxed))
+    }
+
+    /// Store an already encoded pixel value (one [`Framebuffer::pixel`]
+    /// read) at (`x`, `y`) (nothing outside the framebuffer).
+    pub fn put_encoded(&self, x: usize, y: usize, value: u32) {
+        if let Some(pixel) = self.pixel_at(x, y) {
+            pixel.store(value, Ordering::Relaxed);
+        }
     }
 
     /// Draw one glyph (`?` for one the font lacks), at most `max_w` pixels

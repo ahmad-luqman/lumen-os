@@ -147,6 +147,11 @@ def pci_address(d: dict) -> str:
     return f"0000:{d['bus']:02x}:{d['slot']:02x}.{d['function']:x}"
 
 
+def qdev_addresses(m: Machine) -> dict[str, str]:
+    """The PCI address of each device QEMU names by qdev id."""
+    return {d["qdev_id"]: pci_address(d) for d in pci_devices(m) if d.get("qdev_id")}
+
+
 def assert_lists_what_qemu_has(m: Machine, rows: dict) -> list[dict]:
     """`lspci`'s rows are exactly the functions QEMU has, with their ids;
     returns QEMU's."""
@@ -185,20 +190,24 @@ def test_lspci_lists_virtio_devices(boot):
 
 def test_lspci_driver_column(boot):
     # Each driver's issue adds its row and tests its own probe outcome (rng
-    # in test_dev, sound in test_sound): only virtio-rng and sound bind;
-    # every other function, the other virtio ones included, shows "no
-    # driver".
+    # in test_dev, the tablet in test_input, sound in test_sound): only
+    # virtio-rng, the tablet and sound bind; every other function, the
+    # other virtio ones included, shows "no driver".
     m = shell(boot, devices=Devices.every())
     rows = lspci_rows(m)
-    drivers = {row[3]: row[4] for row in rows.values() if row[4] != "no driver"}
+    tablet = qdev_addresses(m)[DEVICE_IDS["tablet"]]
+    assert rows[tablet][4] == "virtio-tablet: bound", rows
+    drivers = {
+        row[3]: row[4] for addr, row in rows.items() if row[4] != "no driver" and addr != tablet
+    }
     assert drivers == {"virtio rng": "virtio-rng: bound", "virtio sound": "sound: bound"}, rows
     assert re.search(
-        r"INFO  drivers: 2 bound, 0 failed, 0 declined, 0 not probed \(\d+ driver rows?\)\n",
+        r"INFO  drivers: 3 bound, 0 failed, 0 declined, 0 not probed \(\d+ driver rows?\)\n",
         m.output,
     )
     assert "WARN  drivers" not in m.output
     # The column filters like the others.
-    assert run(m, "lspci | where driver = 'no driver' | count") == f"{len(rows) - 2}\n"
+    assert run(m, "lspci | where driver = 'no driver' | count") == f"{len(rows) - 3}\n"
 
 
 def test_lspci_records_filter(boot):

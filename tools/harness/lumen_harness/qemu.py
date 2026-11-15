@@ -11,7 +11,8 @@ and 9p (a shared host folder). `Machine(cpu=...)` sets the CPU model.
 
 `Machine` boots an ISO headless with serial on a pipe (or none at all), then lets a test wait
 for output (`expect`, with a timeout, never fixed sleeps), type input
-(`send_line` on serial, `type_text` and `press` on the keyboard through QMP),
+(`send_line` on serial, `type_text` and `press` on the keyboard through QMP,
+`move_pointer`, `click` and `release` on a tablet through QMP),
 take screenshots over QMP (`screendump`), and collect the exit
 status that the kernel sets through `isa-debug-exit`.
 
@@ -41,8 +42,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, Self
 
+from PIL import Image
+
 from . import BUILD_DIR
-from .qmp import QmpClient, QmpError, qcodes_for
+from .qmp import QmpClient, QmpError, button_args, pointer_move_args, qcodes_for
 
 # isa-debug-exit: QEMU exits with (code << 1) | 1. Must match kernel qemu.rs.
 # Any other status fails a test; the only exception is 0 in the power-off
@@ -483,6 +486,11 @@ KEY_HOLD_MS = 20
 # How far ahead of QEMU `Machine.press` lets the keys queue, in seconds
 # (see there).
 KEYS_AHEAD = 3.2
+# The least time between two pointer events (`move_pointer`, `click`): the
+# kernel's tablet thread looks for events every 5 ms and has 32 event
+# buffers (a move takes three: x, y and the sync), so this keeps QEMU from
+# finding none free, even with the guest slowed down several times.
+POINTER_GAP = 0.03
 
 
 class Machine:
@@ -533,6 +541,8 @@ class Machine:
         self._qmp: QmpClient | None = None
         # When QEMU will have sent every key pressed so far (see `press`).
         self._keys_sent_by = 0.0
+        self._pointer_sent_at = 0.0
+        self._screen_size: tuple[int, int] | None = None
         # The QMP socket's directory (LUMEN_SOCK_DIR; unset or empty: /tmp). A
         # short one: macOS limits unix socket paths to ~104 bytes.
         self._sock_dir = Path(os.environ.get("LUMEN_SOCK_DIR") or "/tmp")
@@ -866,6 +876,44 @@ class Machine:
         a time (see `press`)."""
         for ch in text:
             self.press(qcodes_for(ch))
+
+    def screen_size(self) -> tuple[int, int]:
+        """The guest's screen (width, height) in pixels, from a screendump
+        (taken once)."""
+        if self._screen_size is None:
+            with Image.open(self.screendump("screen-size.png")) as shot:
+                self._screen_size = shot.size
+        return self._screen_size
+
+    def _pointer(self, args: dict[str, Any]) -> None:
+        if not self.devices.tablet:
+            # QEMU would hand the events to the PS/2 mouse, and nothing
+            # would say so.
+            raise ValueError("no tablet to point with: boot with Devices(tablet=True)")
+        wait = self._pointer_sent_at + POINTER_GAP - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        self.qmp().send_input(args)
+        self._pointer_sent_at = time.monotonic()
+
+    def move_pointer(self, x: int, y: int) -> None:
+        """Move the guest's absolute pointer (a virtio tablet,
+        `Devices(tablet=True)`) to pixel (`x`, `y`) of its screen (QMP
+        `input-send-event`), at least `POINTER_GAP` after the last pointer
+        event. Wait for the guest's answer (`mouse`) before relying on it."""
+        self._pointer(pointer_move_args(x, y, self.screen_size()))
+
+    def click(self, button: str = "left", release: bool = True) -> None:
+        """Press `button` on the guest's pointer, and release it again
+        unless `release` is false (each paced like `move_pointer`). Wait
+        for the guest's answer (`mouse`) before relying on it."""
+        self._pointer(button_args(button, True))
+        if release:
+            self.release(button)
+
+    def release(self, button: str = "left") -> None:
+        """Release `button` (pressed with `click(release=False)`)."""
+        self._pointer(button_args(button, False))
 
     def wait_event(self, name: str, timeout: float = 30) -> dict[str, Any]:
         """Wait for QEMU's QMP event `name` (e.g. `SHUTDOWN`), the timeout

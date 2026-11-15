@@ -1,16 +1,23 @@
 """The PS/2 keyboard: keys sent through QMP reach the screen's shell, decoded
 in the layout `lumen.keymap=` names (read back from the screen with the
-serial shell's `term text`)."""
+serial shell's `term text`). The mouse: virtio's tablet, moved and clicked
+through QMP's `input-send-event`, reported by `mouse` and drawn as an
+arrow that leaves no trail; the virtio keyboard (same PCI id) isn't taken
+for a tablet."""
 
 import re
 import shlex
 import threading
 import time
+from collections.abc import Callable
 from typing import NamedTuple
 
-from lumen_harness.qemu import Machine
-from lumen_harness.qmp import QmpClient, QmpError, qcodes_for
-from lumen_harness.screen import expect_screen
+from lumen_harness.image import assert_matches_golden, compare
+from lumen_harness.qemu import Devices, Machine
+from lumen_harness.qmp import QmpClient, QmpError, pointer_move_args, qcodes_for
+from lumen_harness.screen import expect_screen, read_screen
+from PIL import Image
+from test_pci import lspci_rows, qdev_addresses, run
 
 KBD_LINE = r"INFO  kbd: PS/2 keyboard on ISA IRQ 1 \(GSI 1, vector 0x51\), layout {}\n"
 KBD_STATS = re.compile(
@@ -186,3 +193,312 @@ def test_no_8042_is_a_warning(boot):
     m.expect(r"lumen> ", 60)
     m.send_line("kbd")
     m.expect(rf"kbd: no keyboard \({NO_8042}\); IRQ 1 routed \(vector 0x51\), masked\n", 10)
+
+
+TABLET_LINE = re.compile(
+    r'INFO  mouse: (\S+): "QEMU Virtio Tablet", axes 0 to 32767 by 0 to 32767, '
+    r"scaled to 1280x800\n"
+)
+MOUSE_HEADER = re.compile(
+    r'mouse: "QEMU Virtio Tablet" on (\S+), screen 1280x800, (\d+) events in (\d+) frames '
+    r"\((\d+) ignored, (\d+) dropped, at least (\d+) overruns\)"
+)
+# The terminal's top-left pixel and its cells' size (1280x800, limine.conf).
+GRID_X, GRID_Y, CELL_W, CELL_H = 32, 144, 7, 16
+
+
+class Mouse(NamedTuple):
+    device: str
+    x: str
+    y: str
+    buttons: str
+    presses: str
+    wheel: str
+    hwheel: str
+    pointer: str
+    stale: str
+    failed: str
+
+
+NOTHING_YET = ("-",) * 9
+
+
+def mouse(m: Machine) -> tuple[str, Mouse]:
+    """The serial shell's `mouse`: its header line and its row."""
+    lines = run(m, "mouse").splitlines()
+    assert len(lines) == 3, lines
+    assert re.fullmatch(
+        r"  device\s+x\s+y\s+buttons\s+presses\s+wheel\s+hwheel\s+pointer\s+stale\s+failed",
+        lines[1],
+    ), lines
+    return lines[0], Mouse(*re.split(r"\s{2,}", lines[2].strip()))
+
+
+def mouse_counts(m: Machine) -> tuple[int, ...]:
+    """`mouse`'s header counts: events, frames, ignored, dropped, overruns."""
+    header = mouse(m)[0]
+    found = MOUSE_HEADER.fullmatch(header)
+    assert found, header
+    return tuple(map(int, found.groups()[1:]))
+
+
+def poll[T](what: Callable[[], T], done: Callable[[T], bool], m: Machine, timeout: float = 10) -> T:
+    """Call `what()` until `done(result)` (up to `timeout` seconds, scaled);
+    the last result."""
+    deadline = time.monotonic() + timeout * m.timeout_scale
+    while True:
+        got = what()
+        if done(got) or time.monotonic() > deadline:
+            return got
+        time.sleep(0.05)
+
+
+def wait_mouse(m: Machine, **want: str) -> Mouse:
+    """Ask `mouse` until its row has the values `want` (up to 10 s)."""
+
+    def shows(row: Mouse) -> bool:
+        return all(getattr(row, k) == v for k, v in want.items())
+
+    row = poll(lambda: mouse(m)[1], shows, m)
+    assert shows(row), f"mouse never showed {want}: {row}"
+    return row
+
+
+def tablet_ready(m: Machine) -> str:
+    """Wait for the keyboard's line, the shells and the serial prompt, and
+    find the tablet's boot line; the tablet's PCI address."""
+    shells_ready(m, "us")
+    found = TABLET_LINE.search(m.output)
+    assert found, "no tablet line at boot"
+    return found[1]
+
+
+def test_mouse_moves_pointer(boot, artifacts, golden_dir):
+    # Before the tablet reports anything `mouse` shows its device and
+    # dashes (nothing reported yet; the header comparison in
+    # test_cursor_leaves_no_trail checks nothing is drawn); moved through
+    # QMP, it reports
+    # the pixel aimed at (the screen's corners included), as records too,
+    # and the arrow's tip is drawn there (a golden of it on the empty
+    # terminal); buttons are held and released, presses counted; the wheel
+    # turns both ways.
+    m = boot("qemutest", devices=Devices(tablet=True))
+    addr = tablet_ready(m)
+    assert mouse(m)[1] == Mouse(addr, *NOTHING_YET)
+    assert mouse_counts(m) == (0, 0, 0, 0, 0)
+    target = (900, 500)
+    m.move_pointer(*target)
+    row = wait_mouse(m, x="900", y="500")
+    assert row == Mouse(addr, "900", "500", "none", "0", "0", "0", "drawn", "no", "-")
+    shot = m.screendump("pointer.png")
+    assert_matches_golden(
+        shot,
+        golden_dir / "mouse-pointer.png",
+        origin=(target[0] - 4, target[1] - 4),
+        size=(20, 26),
+        artifacts=artifacts,
+    )
+    # Its records filter on numbers.
+    assert run(m, "mouse | where x > 899 | count") == "1\n"
+    assert run(m, "mouse | where x > 900 | count") == "0\n"
+    for corner in [(0, 0), (1279, 799), (1279, 0), (0, 799)]:
+        m.move_pointer(*corner)
+        wait_mouse(m, x=str(corner[0]), y=str(corner[1]), pointer="drawn")
+    m.click("left", release=False)
+    wait_mouse(m, buttons="left")
+    m.click("right", release=False)
+    wait_mouse(m, buttons="left right")
+    assert run(m, "mouse | where buttons = 'left right' | select x y").split() == [
+        "x", "y", "0", "799",
+    ]  # fmt: skip
+    m.release("left")
+    m.release("right")
+    wait_mouse(m, buttons="none")
+    m.click("middle")
+    # Each move is x, y and a sync; each button change a key and a sync:
+    # all of them read, none ignored, dropped or overrun.
+    want = (5 * 3 + 6 * 2, 5 + 6, 0, 0, 0)
+    assert poll(lambda: mouse_counts(m), lambda c: c == want, m) == want
+    assert wait_mouse(m, presses="3").buttons == "none"
+    # The wheel: a click away from the user, then one back.
+    m.click("wheel-up")
+    wait_mouse(m, wheel="1")
+    m.click("wheel-down")
+    wait_mouse(m, wheel="0", hwheel="0")
+    assert "WARN" not in m.output
+
+
+def pixels(shot: Image.Image, box: tuple[int, int, int, int]) -> list:
+    return list(shot.crop(box).convert("RGB").getdata())
+
+
+def test_cursor_leaves_no_trail(boot, artifacts):
+    # The arrow crosses text, the header and its boxes; text is typed and
+    # drawn below it; a command takes the screen (the arrow is hidden while
+    # it draws) and gives it back. Then, with the arrow parked on an empty
+    # spot, the screen must be exactly what drawing the terminal afresh
+    # gives (`vt 2`, `vt 1`), the blinking text cursor's cell aside, and
+    # the header exactly what it was before the arrow ever showed.
+    m = boot("qemutest", devices=Devices(tablet=True))
+    tablet_ready(m)
+    m.type_text("clear\n")
+    m.type_text("seq 20\n")
+    expect_screen(m, r"^20\nlumen>$")
+    # Row 0 the command, rows 1-20 its output, row 21 the prompt.
+    prompt_row = 21
+    assert read_screen(m).rows[prompt_row].startswith("lumen>")
+    before = Image.open(m.screendump("before.png")).convert("RGB")
+    path = [
+        (GRID_X, GRID_Y),
+        (GRID_X + 3, GRID_Y + 5 * CELL_H + 7),
+        (GRID_X + 9 * CELL_W + 2, GRID_Y + 12 * CELL_H),
+        (300, 100),
+        (600, 130),
+        (1150, 40),
+        (1210, 50),
+        (GRID_X + 4, GRID_Y - 6),
+        (GRID_X + 5 * CELL_W, GRID_Y + prompt_row * CELL_H + 3),
+    ]
+    for x, y in path:
+        m.move_pointer(x, y)
+        wait_mouse(m, x=str(x), y=str(y), pointer="drawn")
+    # Typed below the arrow (its tip on the prompt row): the line, then
+    # its output and a new prompt are drawn under and around it.
+    m.type_text("echo under the pointer\n")
+    expect_screen(m, r"^lumen> echo under the pointer\nunder the pointer\nlumen>$")
+    assert read_screen(m).rows[prompt_row] == "lumen> echo under the pointer"
+    wait_mouse(m, pointer="drawn")
+    # A command drawing on the screen: hidden meanwhile, back after.
+    m.type_text("life glider 40\n")
+    expect_screen(m, r"^life: press a key$", 120)
+    wait_mouse(m, pointer="hidden")
+    m.press(["x"])
+    expect_screen(m, r"^life: press a key\nlumen>$")
+    wait_mouse(m, pointer="drawn")
+    park = (1200, 720)
+    m.move_pointer(*park)
+    wait_mouse(m, x=str(park[0]), y=str(park[1]), pointer="drawn")
+    after = Image.open(m.screendump("after.png")).convert("RGB")
+    screen = read_screen(m)
+    m.send_line("vt 2")
+    m.expect(r"vt: terminal 2 shown\n", 10)
+    m.send_line("vt 1")
+    m.expect(r"vt: terminal 1 shown\n", 10)
+    fresh = Image.open(m.screendump("fresh.png")).convert("RGB")
+    # The arrow is drawn at the parked spot in both (its tip is outline).
+    assert after.getpixel(park) == (0, 0, 0)
+    assert fresh.getpixel(park) == (0, 0, 0)
+    # The text cursor blinks: its cell may differ.
+    assert screen.cursor, screen
+    col, row = screen.cursor
+    cx, cy = GRID_X + col * CELL_W, GRID_Y + row * CELL_H
+    for img in (after, fresh):
+        img.paste((0, 0, 0), (cx, cy, cx + CELL_W, cy + CELL_H))
+    diff, mask = compare(after, fresh, tolerance=0)
+    if diff.differing:
+        mask.save(artifacts / "trail.diff.png")
+    assert diff.differing == 0, (
+        f"{diff.differing} pixels differ from a fresh redraw (trail.diff.png)"
+    )
+    # `vt` redraws below the header and its boxes only, so a trail across
+    # the rest of the header would survive it: the header must be as it
+    # was before the arrow ever showed.
+    header = (0, 0, 1280, GRID_Y)
+    assert pixels(after, header) == pixels(before, header)
+
+
+def test_a_burst_of_moves_counts_overruns(boot):
+    # 300 moves sent as fast as QMP takes them (no pacing): QEMU drops a
+    # whole frame that doesn't fit in the 32-buffer ring (traced as
+    # virtio_input_queue_full) without telling the guest. If any frame was
+    # lost, `mouse` counts at least one overrun (a lower bound); none is
+    # ignored or SYN_DROPPED. A paced move afterwards is a clean frame: the
+    # state isn't stale.
+    m = boot("qemutest", devices=Devices(tablet=True), extra=["-trace", "virtio_input_queue_full"])
+    tablet_ready(m)
+    size = m.screen_size()
+    qmp = m.qmp()
+    sent = 300
+    for i in range(sent):
+        qmp.send_input(pointer_move_args(100 + i % 2, 100 + i, size))
+    # Settled: the same counts twice, a little apart.
+    last: list[tuple[int, ...]] = [()]
+
+    def settled(counts: tuple[int, ...]) -> bool:
+        same, last[0] = counts == last[0], counts
+        return same
+
+    events, frames, ignored, dropped, overruns = poll(lambda: mouse_counts(m), settled, m, 30)
+    # The trace goes to `-D`'s qemu.log where the harness sets one (TCG),
+    # else to stderr.
+    log = m.artifacts / "qemu.log"
+    traced = m.qemu_stderr() + (log.read_text(errors="replace") if log.exists() else "")
+    full = traced.count("virtio_input_queue_full")
+    print(f"sent {sent}, read {frames} frames, {overruns} overruns, queue full {full} times")
+    assert (ignored, dropped) == (0, 0)
+    assert frames <= sent and events == 3 * frames
+    if full:
+        assert frames < sent
+    if frames < sent:
+        assert overruns >= 1, (frames, overruns)
+    m.move_pointer(640, 400)
+    assert wait_mouse(m, x="640", y="400").stale == "no"
+
+
+def test_tablet_is_bound_and_the_keyboard_is_not(boot):
+    # virtio's keyboard and tablet share a PCI id; the tablet driver takes
+    # only the tablet (by its class), so the keyboard is never offered to
+    # it: `lspci` shows the tablet bound and the keyboard without a driver.
+    # Only one tablet is used: a second one is declined (before its
+    # transport is set up), and `mouse` names the first.
+    m = boot(
+        "qemutest",
+        devices=Devices(tablet=True, keyboard=True),
+        extra=["-device", "virtio-tablet-pci,id=lumen-tablet2"],
+    )
+    addr = tablet_ready(m)
+    rows = lspci_rows(m)
+    qdev = qdev_addresses(m)
+    first, second = sorted([qdev["lumen-tablet"], qdev["lumen-tablet2"]])
+    assert addr == first
+    assert rows[first][4] == "virtio-tablet: bound"
+    assert rows[second][4] == "no driver (virtio-tablet declined it)"
+    assert rows[qdev["lumen-keyboard"]][4] == "no driver"
+    assert re.search(
+        r"INFO  drivers: 1 bound, 0 failed, 1 declined, 0 not probed \(\d+ driver rows?\)\n",
+        m.output,
+    )
+    assert (
+        f"INFO  mouse: {second}: a tablet is bound already (on {first}): only one is used\n"
+        in m.output
+    )
+    assert re.findall(r"probing virtio-tablet on (\S+)\n", m.output) == [first, second]
+    assert MOUSE_HEADER.fullmatch(mouse(m)[0])[1] == first
+    assert "WARN" not in m.output
+
+
+def test_an_input_device_without_absolute_axes_is_declined(boot):
+    # QEMU's multitouch panel has the tablet's class (input, other) but
+    # only multitouch axes: read from its configuration before the crate
+    # posts any buffer, it is declined, and nothing is bound or leaked.
+    m = boot("qemutest", extra=["-device", "virtio-multitouch-pci,id=lumen-mt"])
+    shells_ready(m, "us")
+    addr = qdev_addresses(m)["lumen-mt"]
+    assert lspci_rows(m)[addr][4] == "no driver (virtio-tablet declined it)"
+    assert f"INFO  mouse: {addr}: no absolute X and Y axes, so not a tablet\n" in m.output
+    assert re.search(
+        r"INFO  drivers: 0 bound, 0 failed, 1 declined, 0 not probed \(\d+ driver rows?\)\n",
+        m.output,
+    )
+    assert mouse(m)[0] == "mouse: no tablet (QEMU: -device virtio-tablet-pci)"
+    assert "WARN" not in m.output
+
+
+def test_mouse_without_a_tablet(boot):
+    m = boot("qemutest")
+    shells_ready(m, "us")
+    header, row = mouse(m)
+    assert header == "mouse: no tablet (QEMU: -device virtio-tablet-pci)"
+    assert row == Mouse("none", *NOTHING_YET)
+    assert run(m, "mouse | select device pointer").split() == ["device", "pointer", "none", "-"]
+    assert "INFO  mouse" not in m.output

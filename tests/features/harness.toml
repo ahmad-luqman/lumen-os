@@ -138,6 +138,21 @@ tests = [
 ]
 
 [[feature]]
+name = "Harness: the guest's absolute pointer moved to a pixel (rounded to QEMU's 0-32767 axes so the kernel's scaling lands on it, on any screen up to 32768 pixels; off-screen pixels refused) and its buttons (the wheel's too) pressed and released through QMP's `input-send-event`, unknown buttons refused, every pointer event at least 30 ms after the last, refused without a tablet attached; the screen's size taken once; `make run` and `make debug` attach a tablet"
+milestone = "M3"
+tests = [
+    "harness:test_qmp::test_pixels_become_axis_values_the_kernel_scales_back",
+    "harness:test_qmp::test_a_pixel_off_the_screen_is_refused",
+    "harness:test_qmp::test_a_move_sends_both_axes_and_a_button_its_state",
+    "harness:test_qemu::test_pointer_events_are_paced_and_scaled_to_the_screen",
+    "harness:test_qemu::test_pointer_events_need_a_tablet",
+    "harness:test_qemu::test_make_run_and_debug_attach_a_tablet",
+    "harness:test_qemu::test_the_screen_size_is_taken_once",
+    "cargo:lumen-input",
+    "scenario:test_input::test_mouse_moves_pointer",
+]
+
+[[feature]]
 name = "virtio-rng's rate limit as a device option (`Devices(rng_rate=(max_bytes, period_ms))`: QEMU's `max-bytes` and `period`, implying virtio-rng, both above 0, refused otherwise), passed from `Machine` to QEMU; `make run` attaches virtio-rng"
 milestone = "M3"
 tests = [

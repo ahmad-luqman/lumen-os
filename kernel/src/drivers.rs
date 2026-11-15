@@ -27,6 +27,9 @@ pub use crate::virtio::ProbeError;
 /// buffers it never takes back. A probe's side effects (threads, published
 /// state) come after its last fallible check, and a driver must not depend
 /// on its device staying bound until `probe_all` has recorded the outcome.
+/// A probe hands out DMA runs from its own thread or threads it spawns
+/// (those are charged to the attempt; a bound driver's older threads'
+/// aren't).
 pub struct Driver {
     pub name: &'static str,
     pub matches: fn(&DeviceInfo) -> bool,
@@ -36,6 +39,7 @@ pub struct Driver {
 /// Every driver, in the order they are offered a function.
 pub static DRIVERS: &[Driver] = &[
     Driver { name: crate::rng::DRIVER, matches: crate::rng::matches, probe: crate::rng::probe },
+    crate::mouse::DRIVER,
     crate::sound::DRIVER,
 ];
 

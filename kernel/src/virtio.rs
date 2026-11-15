@@ -27,11 +27,13 @@
 //!   error path, so out of frames or table entries it panics (saying how
 //!   many runs are outstanding); buffers still posted when their queue is
 //!   dropped are never unshared (`VirtQueue` has no `Drop` that does), so a
-//!   probe failing partway leaks frames and table entries
-//!   (`drivers::probe_all` reports the runs that probe attempt left, which
-//!   includes any another thread handed out meanwhile: none at boot), and
-//!   so does a driver dropping a device with a buffer still posted (rng
-//!   after a request that gave up: it reports the runs it leaked).
+//!   probe failing partway leaks frames and table entries, and so does a
+//!   driver dropping a device with a buffer still posted (rng after a
+//!   request that gave up: it reports the runs it leaked; the tablet's,
+//!   when its device fails) (`drivers::probe_all` reports the runs that
+//!   probe attempt left: only those of the probing thread and threads made
+//!   during the attempt are charged to it, not those an older driver's
+//!   thread hands out meanwhile).
 //! - **Drop order.** DMA memory must not be freed under a live device:
 //!   reset the transport before any queue is dropped. A driver keeps its
 //!   queues in a struct field declared after the transport (fields drop in
@@ -135,13 +137,33 @@ type Runs = [Option<Entry>; RUNS];
 static TABLE: SpinLock<Runs> = SpinLock::new([const { None }; RUNS]);
 
 /// One probe of one function by one driver row (`drivers::probe_all`):
-/// runs handed out meanwhile are its, so a declined row's leftovers aren't
-/// charged to the next row. (Runs another thread hands out during the
-/// probe are charged to it too: at boot no driver's thread runs yet.)
+/// runs the probing thread, or a thread made during the attempt (one the
+/// probe spawned), hands out meanwhile are its, so a declined row's
+/// leftovers aren't charged to the next row. Runs older threads hand out
+/// meanwhile (a bound driver's thread re-posting its buffers, like the
+/// tablet's) aren't charged to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Attempt {
     pub addr: PciAddr,
     id: u64,
+    /// The probing thread's id (`None` before this CPU's threads run).
+    thread: Option<u64>,
+    /// Threads with at least this id were made during the attempt.
+    watermark: u64,
+}
+
+impl Attempt {
+    /// Whether a run handed out now by this thread is the attempt's.
+    fn charges_this_thread(&self) -> bool {
+        let me = this_thread();
+        me == self.thread || me.is_some_and(|id| id >= self.watermark)
+    }
+}
+
+/// The running thread's id, lock-free (`None` before this CPU's threads
+/// are set up).
+fn this_thread() -> Option<u64> {
+    crate::sched::running_here().map(|(id, _)| id)
 }
 
 /// The probe attempt running now, the last attempt's id, and the status
@@ -159,7 +181,7 @@ static OWNER: SpinLock<Probe> = SpinLock::new(Probe { attempt: None, last_id: 0,
 pub fn begin_probe(addr: PciAddr) -> Attempt {
     let mut p = OWNER.lock();
     p.last_id += 1;
-    let attempt = Attempt { addr, id: p.last_id };
+    let attempt = Attempt { addr, id: p.last_id, thread: this_thread(), watermark: crate::sched::next_thread_id() };
     p.attempt = Some(attempt);
     p.status = None;
     attempt
@@ -248,7 +270,7 @@ impl Drop for OwnedRun {
 /// address.
 fn record(table: &mut Runs, run: OwnedRun, kind: Kind) -> u64 {
     let entry = table.iter_mut().find(|e| e.is_none()).expect("the table isn't full");
-    let owner = OWNER.lock().attempt;
+    let owner = OWNER.lock().attempt.filter(Attempt::charges_this_thread);
     entry.insert(Entry { run, kind, owner }).run.phys()
 }
 
@@ -414,10 +436,11 @@ pub enum ProbeError {
     NotReady { status: u8 },
     /// A bounded wait gave up.
     Wait(WaitError),
-    /// Not this driver's device after all (virtio's keyboard and tablet
-    /// share an id, told apart only by their configuration), or one the
-    /// driver doesn't take (rng: a second device): `probe_all` frees the
-    /// function and offers it to the next driver row.
+    /// Not this driver's device after all (one its row's `matches` can't
+    /// rule out: a second tablet, a virtio input device of the tablet's
+    /// class without its axes), or one the driver doesn't take (rng and
+    /// sound: a second device): `probe_all` frees the function and offers
+    /// it to the next driver row.
     NotMine,
     /// The device can't be used by this driver: its configuration or
     /// behaviour.
@@ -930,6 +953,57 @@ crate::ktest!(
         // SAFETY: the run this test allocated.
         kassert_eq!(unsafe { VirtioHal::dma_dealloc(p, v, 1) }, 0);
         kassert_eq!(outstanding_runs_of(first), 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn runs_are_charged_to_a_probe_only_from_its_own_threads() {
+        // While a function is probed: a run from the probing thread, or from
+        // a thread made during the attempt (one a probe spawns), is the
+        // attempt's; a run from a thread made before it (a bound driver's,
+        // like the tablet's re-posting an event buffer) isn't, so the probe
+        // running meanwhile isn't blamed for it.
+        use crate::kassert_eq;
+        use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        static GO: AtomicBool = AtomicBool::new(false);
+        static OLD_RUN: AtomicU64 = AtomicU64::new(0);
+        static NEW_RUN: AtomicU64 = AtomicU64::new(0);
+        let alloc_into = |slot: &'static AtomicU64| {
+            let (p, _) = VirtioHal::dma_alloc(1, BufferDirection::DriverToDevice);
+            slot.store(p, Ordering::Relaxed);
+        };
+        GO.store(false, Ordering::Relaxed);
+        // Made before the attempt; hands out its run during it.
+        let old = crate::sched::spawn("ktest-old", move || {
+            while !GO.load(Ordering::Acquire) {
+                crate::sched::yield_now();
+            }
+            alloc_into(&OLD_RUN);
+        })
+        .map_err(|_| "no thread")?;
+        let owner = lumen_pci::PciAddr::new(0, 0, 3, 0).ok_or("addr")?;
+        let attempt = begin_probe(owner);
+        // Everything that can fail runs before `end_probe`, which runs on
+        // every path.
+        let during = (|| {
+            let new = crate::sched::spawn("ktest-new", move || alloc_into(&NEW_RUN)).map_err(|_| "no thread")?;
+            new.join();
+            GO.store(true, Ordering::Release);
+            old.join();
+            Ok::<_, &'static str>(VirtioHal::dma_alloc(1, BufferDirection::DriverToDevice))
+        })();
+        end_probe();
+        let (mine, mine_v) = during?;
+        kassert_eq!(outstanding_runs_of(attempt), 2);
+        for p in [OLD_RUN.load(Ordering::Relaxed), NEW_RUN.load(Ordering::Relaxed)] {
+            let v = NonNull::new(hhdm(p)).ok_or("null")?;
+            // SAFETY: the runs this test's threads allocated, each freed once.
+            kassert_eq!(unsafe { VirtioHal::dma_dealloc(p, v, 1) }, 0);
+        }
+        // SAFETY: as above.
+        kassert_eq!(unsafe { VirtioHal::dma_dealloc(mine, mine_v, 1) }, 0);
+        kassert_eq!(outstanding_runs_of(attempt), 0);
         Ok(())
     }
 );

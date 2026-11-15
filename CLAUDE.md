@@ -150,7 +150,8 @@ own PR that updates that doc first.
   where busy > 50`) and deliberate faults (`crash.rs`). `fb.rs`:
   framebuffer pixels, the header and the crash screen. `term.rs`: the
   terminals on the framebuffer (four virtual ones, one shown: log lines on the first, the screen shells, scrollback, `view_text`, and
-  `Canvas`: the pixels below the header for one command, the terminals paused meanwhile). `vt.rs`: the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4 switching. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
+  `Canvas`: the pixels below the header for one command, the terminals paused meanwhile;
+  and the mouse pointer, a save-under arrow that drawing over it takes off and puts back). `vt.rs`: the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4 switching. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -178,6 +179,9 @@ own PR that updates that doc first.
   `arch/x86_64/reset.rs` their registers.
   `interrupts.rs`: 8259s masked, local APIC on, I/O APIC inputs masked,
   `route_isa_irq` (MADT overrides, handler registered before unmasking).
+  `mouse.rs`: the virtio tablet (#98; bound by class, read by its own
+  `mouse` thread, which moves the pointer; `mouse::status` for `mouse`).
+  `make run` attaches a tablet.
   `keyboard.rs`: the PS/2 keyboard (8042 init, IRQ 1, `pc-keyboard`
   decoding, `lumen.keymap=`); `arch/x86_64/i8042.rs` its ports.
   `time.rs`: TSC and LAPIC timer calibration, the boot origin
@@ -189,6 +193,10 @@ own PR that updates that doc first.
 - `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs
   in bands, and Game of Life with its patterns (host-tested).
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
+- `crates/lumen-input`: pointer input: evdev events into whole-frame
+  pointer states, axes scaled to the screen (`Tablet`, `AbsAxis`), and the
+  arrow sprite with its save-under (`Cursor`, over a `Surface`)
+  (host-tested, incl. a randomized model of drawing around it).
 - `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, the
   page-table format and mapper (host-tested, incl. a model comparison), the
   window tokens that confine `paging::map`, and the kernel-stack layout and
@@ -238,7 +246,8 @@ own PR that updates that doc first.
   (`t=140 w=sine C4/8 r/8`), and `Source`s that fill interleaved 16-bit
   PCM buffers (host-tested).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
-  are built; virtio devices through `Devices`), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
+  are built; virtio devices through `Devices`; `press`/`type_text` for keys,
+  `move_pointer`/`click` for the tablet), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
   `crash.py` (crash-report parsing), `audio.py` (wav files as QEMU's
   wav audiodev writes them: pitch by zero crossings, Goertzel amplitude),
   `screen.py` (the screen's rows through the serial shell's `term text`).

@@ -53,3 +53,34 @@ milestone = "M2"
 tests = [
     "harness:test_qmp::*",
 ]
+
+[[feature]]
+name = "Mouse: QEMU's virtio tablet bound by class (input/other, so the virtio keyboard sharing its PCI id is never offered to it; another device of that class without absolute X and Y, QEMU's multitouch panel, is declined before the crate posts buffers), only the first tablet used (a second declined); its name and axis ranges read from its configuration and logged; moved and clicked through QMP, `mouse` reports the pixel aimed at (also the screen's corners), the buttons held and released, and the events and frames read (none ignored), as records too; before the first report it shows dashes; without a tablet it says so; evdev frames published whole at SYN_REPORT (each with its sequence number), SYN_DROPPED discarding its whole frame up to the next SYN_REPORT, wheels counting clicks both ways (also through QEMU), each button's presses counted so a click between two looks still shows, other events counted and ignored, axes scaled with rounding so every pixel the harness aims at comes back on any screen up to 32768 pixels (host-tested)"
+milestone = "M3"
+tests = [
+    "cargo:lumen-input",
+    "scenario:test_input::test_mouse_moves_pointer",
+    "scenario:test_input::test_tablet_is_bound_and_the_keyboard_is_not",
+    "scenario:test_input::test_mouse_without_a_tablet",
+    "scenario:test_input::test_an_input_device_without_absolute_axes_is_declined",
+]
+
+[[feature]]
+name = "The mouse pointer: an outlined arrow drawn with a save-under (golden), not drawn until the tablet reports, clipped at the screen's edges; the terminal's drawing (cells, scrolls of the screen and of a region, clears, full redraws, the header's boxes, the screen's bottom corner) takes it off where it would overlap and puts it back, so it survives redraws and leaves no trail (host-tested against a model screen with random drawing; a ktest compares the pixels with drawing everything afresh; a scenario moves it across text, the header and its boxes, types below it and compares screendumps with a fresh redraw); hidden while a command draws on the screen, back when it ends"
+milestone = "M3"
+tests = [
+    "cargo:lumen-input",
+    "ktest:lumen_kernel::term::the_pointer_survives_redraws_and_leaves_no_trail",
+    "scenario:test_input::test_mouse_moves_pointer",
+    "scenario:test_input::test_cursor_leaves_no_trail",
+]
+
+[[feature]]
+name = "Mouse overruns and failure: 300 moves sent unpaced lose frames QEMU drops when the 32-buffer ring is full (no SYN_DROPPED), and `mouse` then counts at least one overrun (a lower bound: a poll that read 30 events or more), none ignored or dropped; a later clean frame isn't stale; a poll near a full ring may have lost frames from 30 of 32 events (host-tested); a failed tablet's `mouse` header gives every count and why, its row the last position with no pointer, stale and the reason (ktest on a built state: QEMU can't make the device fail)"
+milestone = "M3"
+tests = [
+    "cargo:lumen-input",
+    "scenario:test_input::test_a_burst_of_moves_counts_overruns",
+    "ktest:lumen_kernel::shell::sysinfo::mouse_shows_a_failed_tablet_and_its_counts",
+    "scenario:test_ktest::test_in_kernel_tests_pass",
+]
