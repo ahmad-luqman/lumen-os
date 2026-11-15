@@ -69,6 +69,13 @@ pub type MakeTable = fn() -> pipe::Table;
 pub const RECORDS: [(&str, MakeTable); 5] =
     [("cpus", cpu_table), ("irqs", vector_table), ("lspci", pci_table), ("mem", mem_table), ("threads", thread_table)];
 
+/// A line for the console when `name`'s records come with a caveat the
+/// table can't carry: `lspci`'s, when PCI devices are missing.
+pub fn records_note(name: &str) -> Option<String> {
+    let status = crate::pci::status();
+    (name == "lspci" && !status.is_clean()).then(|| alloc::format!("lspci: {}", status.note()))
+}
+
 /// The records `name` gives in a pipeline, if it is one of [`RECORDS`].
 pub fn records(name: &str) -> Option<MakeTable> {
     RECORDS.iter().find(|(n, _)| *n == name).map(|&(_, table)| table)

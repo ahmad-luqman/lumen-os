@@ -41,7 +41,7 @@ fn pci_addresses_check_their_ranges_and_print_like_lspci() {
     assert_eq!((a.segment(), a.bus(), a.device(), a.function()), (1, 0xab, 31, 7));
     assert_eq!(std::format!("{a}"), "0001:ab:1f.7");
     assert_eq!(std::format!("{}", at(0, 0, 2, 0)), "0000:00:02.0");
-    assert_eq!(a.ecam_offset(), 31 << 15 | 7 << 12);
+    assert_eq!(a.function_offset(), 31 << 15 | 7 << 12);
     assert!(at(0, 1, 0, 0) > at(0, 0, 31, 7), "ordered by bus, then device, then function");
 }
 
@@ -187,7 +187,7 @@ fn a_64_bit_bar_at_0_is_unassigned_and_keeps_its_upper_slot() {
     let mut cs = Fake::default().with(a, Function::endpoint(VIRTIO, 0x1044, 0, 0xff).mem64(4, 0, 0x4000, true));
     let bars = DeviceInfo::read(&mut cs, a).unwrap().bars;
     assert_eq!(bars[4..], [Some(Bar::Unassigned { io: false, size: 0x4000, is_64: true }), None]);
-    assert!(bars[4].unwrap().is_64() && !bars[4].unwrap().is_memory());
+    assert!(bars[4].unwrap().slots() == 2 && !bars[4].unwrap().is_memory());
 }
 
 #[test]
@@ -512,29 +512,107 @@ fn problems_name_each_thing_wrong() {
     );
 }
 
+/// A bridge at `addr` with these bus numbers, read.
+fn bridge_at(addr: PciAddr, primary: u8, secondary: u8, subordinate: u8) -> DeviceInfo {
+    let f = Function::endpoint(0x1b36, 0x000c, 6, 4).header_type(1).bridge_buses(primary, secondary, subordinate);
+    let mut cs = Fake::default().with(addr, f);
+    DeviceInfo::read(&mut cs, addr).unwrap()
+}
+
 #[test]
-fn a_bridge_to_buses_outside_ecam_is_a_problem() {
-    let bridge = |secondary, subordinate| {
-        let a = at(0, 0, 0x1c, 0);
-        let f = Function::endpoint(0x1b36, 0x000c, 6, 4).header_type(1).bridge_buses(0, secondary, subordinate);
-        let mut cs = Fake::default().with(a, f);
-        DeviceInfo::read(&mut cs, a).unwrap()
-    };
+fn a_bridges_bus_numbers_are_checked() {
+    let on_bus_0 = |secondary, subordinate| bridge_at(at(0, 0, 0x1c, 0), 0, secondary, subordinate);
     // ECAM covers segment 0's buses 0-15.
     let covered = |segment: u16, bus: u8| segment == 0 && bus < 16;
-    assert_eq!(bridge(1, 15).problems(covered).count(), 0);
-    assert_eq!(bridge(0, 0).problems(covered).count(), 0, "not configured");
-    for (secondary, subordinate) in [(1, 16), (16, 16), (5, 4)] {
+    let problems = |d: DeviceInfo| d.problems(covered).collect::<Vec<_>>();
+    assert_eq!(problems(on_bus_0(1, 15)), []);
+    assert_eq!(problems(on_bus_0(0, 0)), [Problem::BridgeUnconfigured]);
+    assert_eq!(problems(on_bus_0(0, 5)), [Problem::BridgeUnconfigured]);
+    for (secondary, subordinate) in [(1, 16), (16, 16)] {
         assert_eq!(
-            bridge(secondary, subordinate).problems(covered).collect::<Vec<_>>(),
+            problems(on_bus_0(secondary, subordinate)),
             [Problem::BusesOutsideEcam { secondary, subordinate }],
             "{secondary}-{subordinate}"
         );
     }
+    assert_eq!(problems(on_bus_0(5, 4)), [Problem::BridgeBusesBackwards { secondary: 5, subordinate: 4 }]);
+    // On bus 2: its primary bus must be 2, its secondary above 2.
+    let on_bus_2 = |primary, secondary| bridge_at(at(0, 2, 0, 0), primary, secondary, 9);
+    assert_eq!(problems(on_bus_2(2, 3)), []);
+    assert_eq!(problems(on_bus_2(0, 3)), [Problem::BridgeMisnumbered { primary: 0, secondary: 3, subordinate: 9 }]);
+    assert_eq!(problems(on_bus_2(2, 2)), [Problem::BridgeMisnumbered { primary: 2, secondary: 2, subordinate: 9 }]);
+    // `covered` is asked about the bridge's own segment.
+    let in_segment_1 = bridge_at(at(1, 0, 0x1c, 0), 0, 1, 15);
+    assert_eq!(in_segment_1.problems(|segment, bus| segment == 1 && bus < 16).count(), 0);
+    assert_eq!(
+        in_segment_1.problems(covered).collect::<Vec<_>>(),
+        [Problem::BusesOutsideEcam { secondary: 1, subordinate: 15 }]
+    );
     assert_eq!(
         std::format!("{}", Problem::BusesOutsideEcam { secondary: 1, subordinate: 16 }),
         "the buses behind this bridge (1-16) aren't all in mapped configuration space: devices there aren't listed"
     );
+}
+
+#[test]
+fn bar_slots_say_why_they_hold_no_bar() {
+    let a = at(0, 0, 3, 0);
+    let read = |f: Function| {
+        let mut cs = Fake::default().with(a, f);
+        DeviceInfo::read(&mut cs, a).unwrap()
+    };
+    let rng = read(virtio_rng());
+    assert_eq!(
+        rng.bar_slot(4),
+        Ok(Bar::Memory { phys: 0x80_0000_4000, size: 0x4000, prefetchable: true, is_64: true })
+    );
+    assert_eq!(rng.bar_slot(5), Err(NoBar::UpperHalf));
+    assert_eq!(rng.bar_slot(0), Err(NoBar::NotImplemented));
+    assert_eq!(rng.bar_slot(6), Err(NoBar::OutOfRange));
+    let unassigned = read(virtio_rng().mem64(4, 0, 0x4000, true));
+    assert_eq!(unassigned.bar_slot(4), Ok(Bar::Unassigned { io: false, size: 0x4000, is_64: true }));
+    assert_eq!(unassigned.bar_slot(5), Err(NoBar::UpperHalf));
+    // A 64-bit range ending at 2^64 still takes both slots.
+    let top =
+        read(Function::endpoint(1, 2, 3, 4).raw_bar(0, 0xffff_f004, 0xffff_f000).raw_bar(1, 0xffff_ffff, 0xffff_ffff));
+    let past = BarProblem::PastAddressSpace { phys: 0xffff_ffff_ffff_f000, size: 0x1000 };
+    assert_eq!((top.bar_slot(0), top.bar_slot(1)), (Ok(Bar::Malformed(past)), Err(NoBar::UpperHalf)));
+    // A 64-bit BAR in the last slot takes only it.
+    let last = read(Function::endpoint(1, 2, 3, 4).raw_bar(5, 0xfd00_0004, 0xffff_f000));
+    assert_eq!(last.bar_slot(5), Ok(Bar::Malformed(BarProblem::NoUpperHalf)));
+    assert_eq!(Bar::Malformed(BarProblem::NoUpperHalf).slots(), 1);
+    // A bridge's slots past its 2 BARs.
+    let bridge = bridge_at(at(0, 0, 0x1c, 0), 0, 1, 1);
+    assert_eq!(bridge.bar_slot(2), Err(NoBar::NotImplemented));
+}
+
+#[test]
+fn a_below_1_mib_memory_bar_is_decoded_as_32_bit() {
+    // Type 0b01, a PCI 2.x leftover.
+    let a = at(0, 0, 3, 0);
+    let mut cs = Fake::default().with(a, Function::endpoint(1, 2, 3, 4).raw_bar(0, 0x000d_0002, 0xffff_0000));
+    let bars = DeviceInfo::read(&mut cs, a).unwrap().bars;
+    assert_eq!(bars[0], Some(Bar::Memory { phys: 0x000d_0000, size: 0x1_0000, prefetchable: false, is_64: false }));
+}
+
+#[test]
+fn io_bars_without_writable_bits_or_with_the_reserved_bit_set() {
+    let a = at(0, 0, 3, 0);
+    // An I/O BAR none of whose address bits stick: not implemented.
+    // Bit 1 of an I/O BAR is reserved: it isn't part of the port.
+    let f = Function::endpoint(1, 2, 3, 4).raw_bar(0, 0x1, 0).raw_bar(1, 0xc043, 0xffff_ffe0);
+    let mut cs = Fake::default().with(a, f);
+    let bars = DeviceInfo::read(&mut cs, a).unwrap().bars;
+    assert_eq!(bars[..2], [None, Some(Bar::Io { port: 0xc040, size: 0x20 })]);
+}
+
+#[test]
+fn virtio_ids_are_transitional_up_to_0x103f_and_modern_to_0x107f() {
+    assert_eq!(names::virtio_type(VIRTIO, 0x103f, 4), Some(4));
+    assert_eq!(names::virtio_type(VIRTIO, 0x1040, 4), Some(0));
+    assert_eq!(names::virtio_type(VIRTIO, 0x107f, 4), Some(0x3f));
+    assert_eq!(names::virtio_type(VIRTIO, 0x1080, 4), None);
+    assert_eq!(names::virtio_type(VIRTIO, 0x0fff, 4), None);
 }
 
 #[test]
@@ -562,6 +640,19 @@ fn every_problem_and_cap_end_reads_as_a_sentence() {
         (
             std::format!("{}", Problem::UnassignedBar { index: 2, io: true, size: 0x20 }),
             "BAR 2 (I/O, 0x20 bytes) has no address: the firmware didn't assign it",
+        ),
+        (
+            std::format!("{}", Problem::BridgeUnconfigured),
+            "this bridge has no secondary bus (not configured): devices behind it aren't listed",
+        ),
+        (
+            std::format!("{}", Problem::BridgeMisnumbered { primary: 0, secondary: 2, subordinate: 9 }),
+            "this bridge's bus numbers (primary 0, secondary 2, subordinate 9) don't fit the bus it is on: \
+             devices behind it may not be listed",
+        ),
+        (
+            std::format!("{}", Problem::BridgeBusesBackwards { secondary: 5, subordinate: 4 }),
+            "this bridge's secondary bus 5 is above its subordinate bus 4: devices behind it may not be listed",
         ),
     ];
     for (got, want) in cases {

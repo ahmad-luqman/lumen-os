@@ -383,8 +383,9 @@ fn a_16_bit_hex_column_prints_four_digits_and_takes_only_hex() {
     assert_eq!(Value::Int(0x12345).show(Kind::Hex16), "0x12345");
     let got = apply(Data::Table(t.clone()), &["where", "vendor", "=", "0xc"]);
     assert_eq!(table(got).rows().len(), 1);
-    let err = apply(Data::Table(t), &["where", "vendor", "=", "12"]).unwrap_err().to_string();
-    assert_eq!(err, "where: vendor is hex: write it with 0x (e.g. 0x20)");
+    let err = |value: &str| apply(Data::Table(t.clone()), &["where", "vendor", "=", value]).unwrap_err().to_string();
+    assert_eq!(err("12"), "where: vendor is hex: write it with 0x (e.g. 0x20)");
+    assert_eq!(err("-5"), "where: vendor holds numbers, and '-5' isn't one");
 }
 
 #[test]

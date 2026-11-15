@@ -11,7 +11,7 @@ use crate::{ConfigSpace, PciAddr, command, reg};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bar {
     /// Memory space. A 64-bit BAR also takes the next BAR's slot (which
-    /// is then `None`).
+    /// is then `None`): see [`Bar::slots`].
     Memory { phys: u64, size: u64, prefetchable: bool, is_64: bool },
     /// I/O space, within the 16-bit port space.
     Io { port: u32, size: u32 },
@@ -31,7 +31,7 @@ pub enum BarProblem {
     NoUpperHalf,
     /// An I/O range that doesn't end within the 16-bit port space.
     IoPastPortSpace { port: u32, size: u32 },
-    /// A 64-bit range that doesn't end below 2^64.
+    /// A 64-bit range that doesn't end below 2^64 (it still takes 2 slots).
     PastAddressSpace { phys: u64, size: u64 },
 }
 
@@ -56,10 +56,17 @@ impl Bar {
         matches!(self, Bar::Memory { .. })
     }
 
-    /// Whether it also takes the next slot: a 64-bit memory BAR, assigned
-    /// or not.
-    pub fn is_64(&self) -> bool {
-        matches!(self, Bar::Memory { is_64: true, .. } | Bar::Unassigned { is_64: true, .. })
+    /// How many BAR slots it takes: 2 for a 64-bit memory BAR (assigned,
+    /// unassigned, or with a range ending at 2^64), whose upper half is the
+    /// next slot; 1 for the others (a 64-bit BAR in the last slot has no
+    /// upper half).
+    pub fn slots(&self) -> usize {
+        match self {
+            Bar::Memory { is_64: true, .. }
+            | Bar::Unassigned { is_64: true, .. }
+            | Bar::Malformed(BarProblem::PastAddressSpace { .. }) => 2,
+            _ => 1,
+        }
     }
 }
 
@@ -116,8 +123,9 @@ fn lowest_bit(mask: u64) -> u64 {
     mask.isolate_lowest_one()
 }
 
-/// Size BAR `i` of `count`; returns it and the slots it takes (2 for any
-/// 64-bit memory BAR, even one that turns out unusable).
+/// Size BAR `i` of `count`; returns it and the slots it takes:
+/// [`Bar::slots`], or for a BAR that isn't implemented, 2 if its type
+/// says 64-bit (its upper half isn't sized as a BAR of its own).
 fn size_one(cs: &mut impl ConfigSpace, addr: PciAddr, i: usize, count: usize) -> (Option<Bar>, usize) {
     let offset = reg::BAR0 + 4 * i as u16;
     let (value, readback) = probe(cs, addr, offset);
@@ -157,5 +165,5 @@ fn size_one(cs: &mut impl ConfigSpace, addr: PciAddr, i: usize, count: usize) ->
         _ if phys.checked_add(size).is_none() => Some(Bar::Malformed(BarProblem::PastAddressSpace { phys, size })),
         _ => Some(Bar::Memory { phys, size, prefetchable, is_64 }),
     };
-    (bar, if is_64 { 2 } else { 1 })
+    (bar, bar.map_or(if is_64 { 2 } else { 1 }, |b| b.slots()))
 }

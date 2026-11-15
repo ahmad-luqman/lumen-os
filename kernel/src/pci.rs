@@ -8,12 +8,13 @@
 //! behind an accessor private to this module. `lumen_pci` decodes headers,
 //! sizes BARs and walks capability lists; the scan is brute force (every
 //! bus in the range, devices 0-31, functions 1-7 only for multi-function
-//! devices), so bridges need no recursion. No ACPI, no MCFG or an MCFG
-//! without a usable region means no PCI devices, with a warning and the
-//! reason in [`status`] (which `lspci` prints), not a crash. Each refused
-//! MCFG entry, unmapped region, and each function's problems
-//! (`DeviceInfo::problems`: a capability list cut off, a BAR unassigned or
-//! malformed, a bridge to buses outside the mapped regions) is a warning.
+//! devices), so bridges need no recursion. No ACPI, no MCFG, an MCFG
+//! without a usable region, or no region mapped means no PCI devices, with
+//! a warning and the reason in [`status`] (which `lspci` prints), not a
+//! crash. Each refused MCFG entry, unmapped region, and each function's
+//! problems (`DeviceInfo::problems`: a capability list cut off or not
+//! read, a BAR unassigned or malformed, a bridge whose bus numbers are
+//! wrong or reach outside the mapped regions) is a warning.
 //!
 //! Enumeration also records every memory BAR in the BAR registry. The
 //! registry maps a BAR (`map_bar`) only when asked, once, when a driver
@@ -22,8 +23,9 @@
 //! up inside the VGA BAR is in the HHDM (so `map_mmio` refuses that BAR).
 //!
 //! Locks: `REGISTRY` is taken before the page tables and the frame
-//! allocator (`map_mmio`); `ECAM` before `DISCOVERY` (the ECAM ktest);
-//! `DISCOVERY` is held only to copy it out.
+//! allocator (`map_mmio`), and before the heap (the ktest clones it);
+//! `ECAM` before `DISCOVERY` (the ECAM ktest); `DISCOVERY` is held only to
+//! copy it out.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -32,7 +34,7 @@ use core::fmt;
 use log::{debug, info, warn};
 use lumen_acpi::EcamRegion;
 use lumen_mm::{PhysAddr, VirtAddr};
-pub use lumen_pci::{Bar, BarProblem, DeviceInfo, PciAddr};
+pub use lumen_pci::{Bar, BarProblem, DeviceInfo, NoBar, PciAddr};
 use lumen_pci::{ConfigSpace, ecam_offset, enumerate};
 
 use crate::acpi::{self, Failure};
@@ -54,13 +56,19 @@ struct Ecam {
 }
 
 impl Ecam {
-    /// The dword at `offset` in `addr`'s configuration space.
+    /// The dword at `offset` in `addr`'s configuration space. Panics for
+    /// an offset that isn't a dword below 4096, or a function outside
+    /// every region (both bugs).
     fn dword(&self, addr: PciAddr, offset: u16) -> *mut u32 {
-        let at = self.regions.iter().find_map(|r| {
-            let m = r.mcfg;
-            ecam_offset(m.segment(), m.bus_start()..=m.bus_end(), addr, offset).map(|o| r.virt.as_u64() + o)
-        });
-        at.unwrap_or_else(|| panic!("PCI config {addr} offset {offset:#x} is outside every ECAM region")) as *mut u32
+        assert!(
+            offset.is_multiple_of(4) && offset < 4096,
+            "PCI config offset {offset:#x} for {addr} isn't a dword below 4096"
+        );
+        let at = self
+            .regions
+            .iter()
+            .find_map(|r| ecam_offset(r.mcfg.segment(), r.mcfg.buses(), addr, offset).map(|o| r.virt.as_u64() + o));
+        at.unwrap_or_else(|| panic!("PCI config of {addr} is outside every ECAM region")) as *mut u32
     }
 
     /// Whether `bus` of `segment` is in a mapped region.
@@ -88,6 +96,8 @@ impl ConfigSpace for Ecam {
 /// Why there are no PCI devices.
 #[derive(Clone, Copy, Debug)]
 pub enum NoPci {
+    /// `acpi::init` found nothing usable (no RSDP, a broken root table, no
+    /// MADT, ...): there is no MCFG to read.
     NoAcpi,
     NoMcfg(Failure),
     /// The MCFG lists no entry, or refused all of them.
@@ -99,7 +109,7 @@ pub enum NoPci {
 impl fmt::Display for NoPci {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            NoPci::NoAcpi => f.write_str("no ACPI tables, so no MCFG"),
+            NoPci::NoAcpi => f.write_str("running without ACPI, so no MCFG"),
             NoPci::NoMcfg(e) => write!(f, "{e}"),
             NoPci::NoRegions => f.write_str("the MCFG lists no usable ECAM region"),
             NoPci::NoneMapped => f.write_str("no ECAM region could be mapped"),
@@ -117,16 +127,34 @@ pub struct Status {
     pub skipped: usize,
 }
 
-/// ` (no PCI: <reason>)` or ` (2 ECAM regions skipped: see the boot
-/// log)`, or nothing: what `lspci`'s header adds.
+impl Status {
+    /// Nothing missing, nothing skipped.
+    pub fn is_clean(&self) -> bool {
+        self.missing.is_none() && self.skipped == 0
+    }
+
+    /// What is missing, for a note: `no PCI: <reason>`, `2 ECAM regions
+    /// skipped (refused or not mapped): see the boot log`, or both,
+    /// separated by `; `. Empty when [`is_clean`](Self::is_clean).
+    pub fn note(&self) -> impl fmt::Display + use<> {
+        let Status { missing, skipped } = *self;
+        fmt::from_fn(move |f| {
+            if let Some(why) = missing {
+                write!(f, "no PCI: {why}")?;
+            }
+            if skipped > 0 {
+                let (sep, s) = (if missing.is_some() { "; " } else { "" }, if skipped == 1 { "" } else { "s" });
+                write!(f, "{sep}{skipped} ECAM region{s} skipped (refused or not mapped): see the boot log")?;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// ` (<note>)`, or nothing when clean: what `lspci`'s header adds.
 impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (self.missing, self.skipped) {
-            (Some(why), _) => write!(f, " (no PCI: {why})"),
-            (None, 0) => Ok(()),
-            (None, 1) => f.write_str(" (1 ECAM region skipped: see the boot log)"),
-            (None, n) => write!(f, " ({n} ECAM regions skipped: see the boot log)"),
-        }
+        if self.is_clean() { Ok(()) } else { write!(f, " ({})", self.note()) }
     }
 }
 
@@ -170,8 +198,8 @@ pub fn status() -> Status {
 /// run while nothing can touch a device: on the boot CPU alone, with
 /// interrupts off, before the framebuffer's terminal draws (the screen is
 /// inside the VGA BAR). Nothing logs while a device's decoding is off
-/// (`size_bars` doesn't). A panic in that window would lose the crash
-/// screen (serial still works). Panics if called twice.
+/// (`size_bars` doesn't). A panic now reports on serial only (there is no
+/// crash screen before `fb::init`). Panics if called twice.
 pub fn init() {
     assert!(matches!(*DISCOVERY.lock(), Discovery::NotYet), "pci::init called twice");
     let (devices, status) = discover();
@@ -204,7 +232,7 @@ fn discover() -> (Vec<DeviceInfo>, Status) {
     let mut found = Vec::new();
     for i in 0..ecam.regions.len() {
         let m = ecam.regions[i].mcfg;
-        enumerate(&mut ecam, m.segment(), m.bus_start()..=m.bus_end(), |d| found.push(d));
+        enumerate(&mut ecam, m.segment(), m.buses(), |d| found.push(d));
     }
     found.sort_unstable_by_key(|d| d.addr);
     let mut bars = Vec::new();
@@ -234,7 +262,7 @@ fn discover() -> (Vec<DeviceInfo>, Status) {
 
 /// Map `r`'s buses, or warn and skip it.
 fn map_region(r: &EcamRegion) -> Option<Region> {
-    let mapped = PhysAddr::new(r.start()).ok_or(MmioError::BadRange).and_then(|p| paging::map_mmio(p, r.len()));
+    let mapped = PhysAddr::new(r.start()).ok_or(MmioError::BadRange).and_then(|p| paging::map_mmio(p, r.size()));
     match mapped {
         Ok(virt) => Some(Region { mcfg: *r, virt }),
         Err(e) => {
@@ -256,9 +284,9 @@ struct Regions<'a>(&'a Ecam);
 
 impl fmt::Display for Regions<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, Region { mcfg: r, .. }) in self.0.regions.iter().enumerate() {
+        for (i, r) in self.0.regions.iter().enumerate() {
             let sep = if i == 0 { "" } else { ", " };
-            write!(f, "{sep}segment {} buses {}-{} at {:#x}", r.segment(), r.bus_start(), r.bus_end(), r.start())?;
+            write!(f, "{sep}{}", r.mcfg)?;
         }
         Ok(())
     }
@@ -273,7 +301,7 @@ struct BarEntry {
     index: usize,
     phys: u64,
     size: u64,
-    mapped: Option<VirtAddr>,
+    mapped: Option<BarMapping>,
 }
 
 /// The BAR registry: every memory BAR, in address order. The one record
@@ -331,7 +359,12 @@ pub enum BarWhy {
     Malformed(BarProblem),
     /// Not mapped yet (the lookup that doesn't map).
     NotMapped,
-    Mmio(MmioError),
+    /// Mapping `[phys, phys + size)` failed.
+    Mmio {
+        phys: u64,
+        size: u64,
+        error: MmioError,
+    },
 }
 
 impl fmt::Display for BarError {
@@ -346,7 +379,7 @@ impl fmt::Display for BarError {
             BarWhy::Unassigned => f.write_str("the firmware assigned it no address"),
             BarWhy::Malformed(why) => write!(f, "unusable: {why}"),
             BarWhy::NotMapped => f.write_str("not mapped yet"),
-            BarWhy::Mmio(e) => write!(f, "mapping it: {e}"),
+            BarWhy::Mmio { phys, size, error } => write!(f, "mapping {phys:#x} (+{size:#x}): {error}"),
         }
     }
 }
@@ -356,14 +389,14 @@ impl fmt::Display for BarError {
 fn check_bar(addr: PciAddr, index: usize) -> Result<(), BarError> {
     let fail = |why| Err(BarError { addr, index, why });
     let Some(d) = devices().iter().find(|d| d.addr == addr) else { return fail(BarWhy::NoSuchFunction) };
-    match d.bars.get(index) {
-        None => fail(BarWhy::OutOfRange),
-        Some(Some(Bar::Memory { .. })) => Ok(()),
-        Some(Some(Bar::Io { .. })) => fail(BarWhy::Io),
-        Some(Some(Bar::Unassigned { .. })) => fail(BarWhy::Unassigned),
-        Some(Some(Bar::Malformed(why))) => fail(BarWhy::Malformed(*why)),
-        Some(None) if index > 0 && d.bars[index - 1].is_some_and(|b| b.is_64()) => fail(BarWhy::UpperHalf),
-        Some(None) => fail(BarWhy::NotImplemented),
+    match d.bar_slot(index) {
+        Ok(Bar::Memory { .. }) => Ok(()),
+        Ok(Bar::Io { .. }) => fail(BarWhy::Io),
+        Ok(Bar::Unassigned { .. }) => fail(BarWhy::Unassigned),
+        Ok(Bar::Malformed(why)) => fail(BarWhy::Malformed(why)),
+        Err(NoBar::OutOfRange) => fail(BarWhy::OutOfRange),
+        Err(NoBar::UpperHalf) => fail(BarWhy::UpperHalf),
+        Err(NoBar::NotImplemented) => fail(BarWhy::NotImplemented),
     }
 }
 
@@ -375,13 +408,14 @@ fn map_bar(addr: PciAddr, index: usize) -> Result<BarMapping, BarError> {
     check_bar(addr, index)?;
     let mut registry = REGISTRY.lock();
     let e = registry.iter_mut().find(|e| e.addr == addr && e.index == index).expect("every memory BAR is registered");
-    let fail = |why| BarError { addr, index, why };
-    let phys = PhysAddr::new(e.phys).ok_or(fail(BarWhy::Mmio(MmioError::BadRange)))?;
-    let virt = match e.mapped {
-        Some(virt) => virt,
-        None => *e.mapped.insert(paging::map_mmio(phys, e.size).map_err(|m| fail(BarWhy::Mmio(m)))?),
-    };
-    Ok(BarMapping { phys, virt, size: e.size })
+    if let Some(m) = e.mapped {
+        return Ok(m);
+    }
+    let (raw, size) = (e.phys, e.size);
+    let fail = |error| BarError { addr, index, why: BarWhy::Mmio { phys: raw, size, error } };
+    let phys = PhysAddr::new(raw).ok_or(fail(MmioError::BadRange))?;
+    let virt = paging::map_mmio(phys, size).map_err(fail)?;
+    Ok(*e.mapped.insert(BarMapping { phys, virt, size }))
 }
 
 /// Memory BAR `index` of `addr`'s mapping, if [`map_bar`] made one; maps
@@ -392,9 +426,7 @@ fn mapped_bar(addr: PciAddr, index: usize) -> Result<BarMapping, BarError> {
     check_bar(addr, index)?;
     let registry = REGISTRY.lock();
     let e = registry.iter().find(|e| e.addr == addr && e.index == index).expect("every memory BAR is registered");
-    let virt = e.mapped.ok_or(BarError { addr, index, why: BarWhy::NotMapped })?;
-    let phys = PhysAddr::new(e.phys).expect("mapped, so physical");
-    Ok(BarMapping { phys, virt, size: e.size })
+    e.mapped.ok_or(BarError { addr, index, why: BarWhy::NotMapped })
 }
 
 crate::ktest!(
@@ -412,7 +444,9 @@ crate::ktest!(
         kassert!(has(0x1f, 2, 0x8086, 0x2922));
         kassert!(has(0x1f, 3, 0x8086, 0x2930));
         kassert!(devices().windows(2).all(|w| w[0].addr < w[1].addr));
-        kassert!(devices().iter().all(|d| d.probeable() && d.problems(|_, _| true).count() == 0));
+        let guard = ECAM.lock();
+        let ecam = guard.as_ref().ok_or("no ECAM")?;
+        kassert!(devices().iter().all(|d| d.probeable() && d.problems(|s, b| ecam.covers(s, b)).count() == 0));
         let status = status();
         kassert!(status.missing.is_none() && status.skipped == 0);
         Ok(())
@@ -473,7 +507,7 @@ crate::ktest!(
         let walk = paging::walk(m.virt()).mapping().ok_or("not mapped")?;
         kassert_eq!(walk.phys_of(m.virt()), Some(m.phys()));
         kassert_eq!(walk.cache(), Some(Cache::Uncached));
-        // What isn't a mapped memory BAR is refused, saying why.
+        // What isn't a memory BAR is refused, saying why.
         let fail = |addr, index, why| Err(BarError { addr, index, why });
         kassert_eq!(map_bar(e.addr, 6), fail(e.addr, 6, BarWhy::OutOfRange));
         let nowhere = PciAddr::new(0, 0x80, 31, 7).expect("valid");
@@ -493,14 +527,28 @@ crate::ktest!(
 
 crate::ktest!(
     fn the_status_says_why_there_are_no_devices() {
-        use crate::kassert_eq;
+        use crate::{kassert, kassert_eq};
         let show = |missing, skipped| alloc::format!("{}", Status { missing, skipped });
         kassert_eq!(show(None, 0), "");
-        kassert_eq!(show(None, 1), " (1 ECAM region skipped: see the boot log)");
-        kassert_eq!(show(None, 3), " (3 ECAM regions skipped: see the boot log)");
-        kassert_eq!(show(Some(NoPci::NoAcpi), 0), " (no PCI: no ACPI tables, so no MCFG)");
-        kassert_eq!(show(Some(NoPci::NoRegions), 2), " (no PCI: the MCFG lists no usable ECAM region)");
-        kassert_eq!(show(Some(NoPci::NoneMapped), 1), " (no PCI: no ECAM region could be mapped)");
+        kassert_eq!(show(None, 1), " (1 ECAM region skipped (refused or not mapped): see the boot log)");
+        kassert_eq!(show(None, 3), " (3 ECAM regions skipped (refused or not mapped): see the boot log)");
+        kassert_eq!(show(Some(NoPci::NoAcpi), 0), " (no PCI: running without ACPI, so no MCFG)");
+        kassert_eq!(
+            show(Some(NoPci::NoRegions), 2),
+            " (no PCI: the MCFG lists no usable ECAM region; 2 ECAM regions skipped (refused or not mapped): see the \
+             boot log)"
+        );
+        kassert_eq!(
+            show(Some(NoPci::NoneMapped), 1),
+            " (no PCI: no ECAM region could be mapped; 1 ECAM region skipped (refused or not mapped): see the boot log)"
+        );
+        let no_mcfg = NoPci::NoMcfg(acpi::Failure::without_cause(lumen_acpi::Error::NotFound {
+            sig: lumen_acpi::Signature::MCFG,
+            skipped: None,
+        }));
+        kassert_eq!(show(Some(no_mcfg), 0), " (no PCI: no MCFG table)");
+        kassert!(Status { missing: None, skipped: 0 }.is_clean());
+        kassert!(!Status { missing: None, skipped: 1 }.is_clean());
         Ok(())
     }
 );

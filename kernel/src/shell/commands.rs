@@ -2,7 +2,7 @@
 //! joins its words with single spaces; `clear` and `colors` need a console
 //! that takes escape codes), plus `history`, `term text`, `vt`, `reboot`,
 //! `shutdown`, the system commands (`cpus`, `mem`, `irqs`, `threads`,
-//! `dmesg`, `date`, `top`: `sysinfo.rs`) and the filters that come after a
+//! `lspci`, `dmesg`, `date`, `top`: `sysinfo.rs`) and the filters that come after a
 //! `|` (`grep`, `where`, `sort`, `first`, `count`, `select`: `pipe.rs`). A
 //! table the line editor completes from. Each writes to the console that
 //! ran it (or, at the start of a pipeline, to the next command; a usage or

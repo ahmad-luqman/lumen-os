@@ -1210,6 +1210,9 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
     taken on each vector that took any or has a routed input
     (`idt::vector_count`: `lumen_exception_dispatch` counts every vector,
     all CPUs together), with what the vector map uses it for.
+  - `lspci`: the PCI functions found at boot (`pci::devices`: address,
+    vendor and device ids, class and device names; section 7), the header
+    saying why any are missing (`pci::status`).
   - `dmesg`: the newest whole log lines as serial printed them: the logger
     keeps the last 16 KiB in a `lumen_trace::TextRing` (host-tested
     against a model; not lock-free: `klog`'s `RING` lock, a leaf, taken
@@ -1249,13 +1252,15 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   | filter ...`. The first command must not be a filter, and every
   command after a `|` must be one. A command's output is lines of text,
   or records: a `pipe::Table` of named columns (names unique), each
-  holding numbers (printed in decimal, hex or as a percentage) or text, a
-  value possibly absent (printed `-` or `stalled`). In a pipeline `cpus`,
-  `irqs` (its per-vector table only), `mem` (frames, the heap and each
-  kind of stack: size and used in bytes, a stack's all used, guard pages
-  not counted; and a count of frames, live allocations or stacks) and
-  `threads` give records (`sysinfo::RECORDS`); `cpus`, `irqs` and the new
-  `threads` print the same tables alone (under their header line), so the
+  holding numbers (printed in decimal, hex, four-digit hex for 16-bit ids,
+  or as a percentage) or text, a value possibly absent (printed `-` or
+  `stalled`). In a pipeline `cpus`, `irqs` (its per-vector table only),
+  `mem` (frames, the heap and each kind of stack: size and used in bytes, a
+  stack's all used, guard pages not counted; and a count of frames, live
+  allocations or stacks), `threads` and `lspci` give records
+  (`sysinfo::RECORDS`; `lspci` first writes a note line to the console
+  when PCI devices are missing, which its table can't carry); `cpus`,
+  `irqs`, `threads` and `lspci` print the same tables alone (under their header line), so the
   text of `cpus` and `irqs` is what it was (tested column by column; one
   difference: a value wider than its column, `stalled`, now widens it for
   every row). They take no arguments (`usage: cpus`). Any other command
@@ -1446,17 +1451,23 @@ with the device-class traits at the end of this section.
 - **Configuration space through ECAM.** `lumen-acpi` parses the MCFG
   (host-tested) and judges each entry on its own: a base that is 0 or not
   1 MiB aligned, buses numbered backwards, a range not ending below 2^64,
-  or buses overlapping an entry accepted before it get that entry refused
-  with its reason (a warning each), and the others are still used. The
+  buses overlapping an entry accepted before it, or a place past the
+  first 256 entries get that entry refused with its reason (a warning
+  each), and the others are still used (a partial entry at the table's
+  end refuses the whole table). The
   kernel maps each accepted region once, uncached (1 MiB per bus: 256 MiB
   for q35's 256 buses, out of the 1 TiB MMIO window; the pinned OVMF moves
   q35's from QEMU's 0xb0000000 to 0xe0000000), behind an accessor private
   to the `pci` module (the address arithmetic, `lumen_pci::ecam_offset`,
   is host-tested). No ACPI, no MCFG, no usable entry or no region mapped
   means no PCI devices: a warning, and the reason in `pci::status()`,
-  which `lspci`'s header shows (`lspci: 0 functions (no PCI: no ACPI
-  tables, so no MCFG)`), not a crash; skipped regions are counted there
-  too. The legacy `0xcf8` ports aren't used.
+  which `lspci`'s header shows (`lspci: 0 functions (no PCI: running
+  without ACPI, so no MCFG)`; in a pipeline, a note line on the console),
+  not a crash; refused entries and unmapped regions are counted there too,
+  with a pointer to the boot log. Only the no-ACPI case runs in QEMU; an
+  MCFG that is missing, empty or wholly refused, and a region that can't
+  be mapped, are not tested booted. The legacy `0xcf8` ports aren't
+  used.
 - **Decoding in a host-tested crate.** The `lumen-pci` crate holds the
   header, BAR and capability decoding behind a small config-space trait
   (32-bit reads and writes at a function and offset), tested against a
@@ -1467,9 +1478,10 @@ with the device-class traits at the end of this section.
   is host-tested.
 - **Enumeration** is a brute-force scan: every bus in each region, devices
   0-31, functions 1-7 only for multi-function devices. Bridges' secondary
-  buses fall inside the scanned range, so no recursion; a bridge whose
-  buses aren't all in a mapped region is a warning (the devices behind it
-  aren't listed). BARs are sized with I/O and memory decoding turned off
+  buses normally fall inside the scanned range, so no recursion; a bridge
+  with no secondary bus, bus numbers that don't fit the bus it is on or
+  run backwards, or buses not all in a mapped region is a warning (the
+  devices behind it aren't listed; host-tested, not booted). BARs are sized with I/O and memory decoding turned off
   in the command register while all-ones is written (and restored after),
   except on a host bridge, sized with decoding on as Linux does
   (`mmio_always_on`: turning a host bridge's decoding off can cut the CPU
@@ -1477,20 +1489,23 @@ with the device-class traits at the end of this section.
   touch a device: `pci::init` runs right after ACPI on the boot CPU alone,
   with interrupts off, before the framebuffer's terminal draws (the screen
   is inside the VGA BAR), and nothing logs while a device's decoding is
-  off. A panic in that window would lose the crash screen (serial still
-  works). `virtio-drivers` sizes the BARs it uses again while probing
+  off. A panic then reports on serial only (there is no crash screen
+  before `fb::init`). `virtio-drivers` sizes the BARs it uses again while probing
   (below). The firmware's BAR addresses are kept: OVMF assigns them and
   Lumen never reassigns in M3. A BAR left at address 0 is
   `Bar::Unassigned` (its size kept), and a reserved memory type, a 64-bit
   BAR in the last slot, an I/O range past port 0xffff or a 64-bit range
   ending at 2^64 is `Bar::Malformed`: each is a warning naming the
-  function and the BAR. The capability walk is guarded (pointers have
+  function and the BAR (host-tested; q35's BARs have none).
+  `DeviceInfo::bar_slot` says why a slot holds no BAR (out of range, not
+  implemented, or the upper half of a 64-bit BAR, by `Bar::slots`). The capability walk is guarded (pointers have
   their two reserved low bits masked, as the PCI specification says, so
   offsets are dword-aligned; below 0x40, or a 49th entry, cuts the list
-  off); an unknown header type (3-127) isn't read at all, and a CardBus
-  bridge's list (its pointer is at 0x14) isn't decoded. A device whose
-  list was cut off or not read is listed, warned about, and #95's
-  `probe_all` skips it. Each function is logged at debug level
+  off); an unknown header type's (3-127) BARs and capabilities aren't
+  read (its header is), and a CardBus bridge's BARs and capability list
+  (its pointer, at 0x14) aren't decoded. A device whose list was cut off
+  or not read is listed, warned about, and #95's `probe_all` skips it
+  (host-tested, not booted). Each function is logged at debug level
   (`DEBUG pci: 0000:00:00.0 8086:29c0 host bridge (class 060000) Q35 host
   bridge`); the warnings' text is `lumen_pci::Problem`'s, host-tested.
 - **`DeviceInfo`**, one per function, built once at boot (after `mm::init`
@@ -1505,7 +1520,7 @@ pub struct DeviceInfo {
     pub subsystem: (u16, u16),          // vendor, id
     pub bars: [Option<Bar>; 6],         // Memory { phys, size, prefetchable, is_64 } | Io { port, size }
                                         //   | Unassigned { io, size, is_64 } | Malformed(BarProblem)
-    pub caps: CapList,                  // (id, offset): MSI, MSI-X, vendor-specific (virtio's); complete or cut off
+    pub caps: CapList,                  // (id, offset): MSI, MSI-X, vendor-specific (virtio's); complete, cut off, or not read
     pub irq_pin: u8,                    // INTx pin, recorded only: INTx is never routed (no `_PRT`)
     pub buses: Option<BusNumbers>,      // a PCI-to-PCI bridge's primary, secondary, subordinate buses
 }
@@ -1522,8 +1537,9 @@ pub struct DeviceInfo {
   framebuffer Limine set up inside the VGA BAR is in the HHDM, so
   `map_mmio` refuses that BAR. A refusal says which function and BAR, and
   why (`BarError`: no such function, out of range, not implemented, the
-  upper half of a 64-bit BAR, an I/O BAR, unassigned, malformed, or the
-  mapping's error). `lspci` lists `pci::devices()` as records: `addr`,
+  upper half of a 64-bit BAR, an I/O BAR, unassigned, malformed, not
+  mapped yet (the lookup), or the mapping's error with the physical
+  range). `lspci` lists `pci::devices()` as records: `addr`,
   `vendor` and `device` (four hex digits: `lspci | where vendor =
   0x1af4`), `class` and `name`; #95 adds its driver column. Which device
   is claimed (one claim per address) is #95's `pci::claim`'s to track.
@@ -1546,9 +1562,12 @@ pub struct Driver {
   registry and sets **memory space and bus master** in the command
   register, with I/O space off: `virtio-drivers` never sets bus master, and
   the firmware's state isn't trusted.
-- A device isn't probed when a BAR mapping fails (`MmioError`) or its
-  capability list was cut off: a warning with the address and the reason
-  (for a BAR: its index, physical range and the error), and `lspci` shows
+- A device isn't probed when one of its memory BARs can't be mapped
+  (`BarError`: the mapping failed, or the BAR is unassigned or malformed;
+  an I/O BAR or an unimplemented slot isn't mapped and doesn't stop it) or
+  its capability list was cut off or not read: a warning with the address
+  and the reason (for a BAR: `BarError`'s text, with its index and, for a
+  failed mapping, its physical range and the error), and `lspci` shows
   `not probed: <reason>`. Before each probe, `probe_all` logs `probing
   <driver> on <addr>` (info), so a hang points at a device. The outcome is
   recorded: `lspci`'s driver column shows `<driver>: bound` or `<driver>:

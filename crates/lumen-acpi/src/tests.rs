@@ -969,7 +969,7 @@ fn mcfg_gives_q35s_ecam_region() {
     assert_eq!(judged(&mcfg(&[Q35_ECAM])), [Ok(r)]);
     assert_eq!((r.base(), r.segment(), r.bus_start(), r.bus_end()), Q35_ECAM);
     // 256 buses of 1 MiB, from bus 0.
-    assert_eq!((r.start(), r.len(), r.is_empty()), (0xb000_0000, 256 << 20, false));
+    assert_eq!((r.start(), r.size()), (0xb000_0000, 256 << 20));
     assert!(r.covers(0, 0) && r.covers(0, 255) && !r.covers(1, 0));
 }
 
@@ -980,16 +980,18 @@ fn mcfg_regions_come_in_table_order_and_start_at_their_first_bus() {
     assert_eq!(regions, [Ok(region(a)), Ok(region(b))]);
     // The base is bus 0's: bus 0x10's space starts 16 MiB in.
     let first = region(a);
-    assert_eq!((first.start(), first.len()), (0xe100_0000, 16 << 20));
+    assert_eq!((first.start(), first.size()), (0xe100_0000, 16 << 20));
     assert!(first.covers(0, 0x10) && first.covers(0, 0x1f) && !first.covers(0, 0x0f) && !first.covers(0, 0x20));
-    assert_eq!((region(b).start(), region(b).len()), (0x40_0000_0000, 1 << 20));
+    assert_eq!((region(b).start(), region(b).size()), (0x40_0000_0000, 1 << 20));
+    assert_eq!(first.buses(), 0x10..=0x1f);
+    assert_eq!(std::format!("{first}"), "segment 0 buses 16-31 at 0xe1000000");
 }
 
 #[test]
 fn an_mcfg_without_regions_parses_empty() {
     let t = mcfg(&[]);
     let m = Mcfg::parse(Sdt::parse(&t).unwrap()).unwrap();
-    assert_eq!((m.len(), m.is_empty(), m.regions().count()), (0, true, 0));
+    assert_eq!(m.regions().count(), 0);
 }
 
 #[test]
@@ -1011,17 +1013,39 @@ fn mcfg_refuses_a_partial_entry_or_a_missing_reserved_field() {
 }
 
 #[test]
-fn mcfg_takes_up_to_256_entries() {
+fn mcfg_reads_256_entries_and_refuses_each_one_past_them() {
     let at = |i: usize| (0x10_0000_0000 + ((i as u64) << 28), i as u16, 0, 255);
-    let most: Vec<_> = (0..MAX_ECAM_REGIONS).map(at).collect();
-    let t = mcfg(&most);
-    assert!(judged(&t).iter().all(Result::is_ok));
-    let too_many: Vec<_> = (0..=MAX_ECAM_REGIONS).map(at).collect();
-    let t = mcfg(&too_many);
+    let entries: Vec<_> = (0..MAX_ECAM_REGIONS + 2).map(at).collect();
+    let got = judged(&mcfg(&entries));
+    assert!(got[..MAX_ECAM_REGIONS].iter().all(Result::is_ok));
     assert_eq!(
-        Mcfg::parse(Sdt::parse(&t).unwrap()).map(|_| ()),
-        Err(Error::BadLength { sig: Signature::MCFG, len: t.len() as u32 })
+        got[MAX_ECAM_REGIONS..],
+        [
+            Err(refused(MAX_ECAM_REGIONS, at(MAX_ECAM_REGIONS), EcamReject::TooMany)),
+            Err(refused(MAX_ECAM_REGIONS + 1, at(MAX_ECAM_REGIONS + 1), EcamReject::TooMany)),
+        ]
     );
+}
+
+#[test]
+fn overlaps_are_found_past_the_bitmaps_first_word() {
+    // 70 entries, each its own segment except: entry 1 shares entry 0's
+    // segment (refused), entry 69 shares entry 65's (refused: past the
+    // bitmap's first 64 bits), and entry 68 shares entry 1's, which was
+    // refused, so 68 is accepted.
+    let mut entries: Vec<(u64, u16, u8, u8)> =
+        (0..70).map(|i: usize| (0x10_0000_0000 + ((i as u64) << 28), i as u16, 0, 255)).collect();
+    entries[68].1 = 1;
+    entries[1].1 = 0;
+    entries[69].1 = 65;
+    let got = judged(&mcfg(&entries));
+    assert_eq!(got[1], Err(refused(1, entries[1], EcamReject::Overlaps { earlier: 0 })));
+    assert_eq!(got[69], Err(refused(69, entries[69], EcamReject::Overlaps { earlier: 65 })));
+    assert_eq!(got[68], Ok(region(entries[68])));
+    assert_eq!(got.iter().filter(|r| r.is_err()).count(), 2);
+    // An overlap with an entry other than the first.
+    let (a, b, c) = ((0xb000_0000, 0, 0, 9), (0xc000_0000, 0, 10, 19), (0xd000_0000, 0, 15, 15));
+    assert_eq!(judged(&mcfg(&[a, b, c]))[2], Err(refused(2, c, EcamReject::Overlaps { earlier: 1 })));
 }
 
 #[test]
@@ -1041,6 +1065,10 @@ fn mcfg_refuses_each_bad_entry_with_its_reason_and_keeps_the_others() {
     }
     // A region must end below 2^64: one bus based 2 MiB below it fits.
     assert!(EcamRegion::new(0xffff_ffff_ffe0_0000, 3, 0, 0).is_ok());
+    // The end counts from bus 0, not the first bus: buses 8-15 of a base
+    // 16 MiB below 2^64 end exactly there; 32 MiB below, they fit.
+    assert_eq!(EcamRegion::new(0xffff_ffff_ff00_0000, 0, 8, 15), Err(EcamReject::PastAddressSpace));
+    assert!(EcamRegion::new(0xffff_ffff_fe00_0000, 0, 8, 15).is_ok());
 }
 
 #[test]
@@ -1082,6 +1110,7 @@ fn refusals_say_why() {
         (EcamReject::BusesBackwards, "its first bus is above its last"),
         (EcamReject::PastAddressSpace, "its range doesn't end below 2^64"),
         (EcamReject::Overlaps { earlier: 0 }, "it overlaps entry 0's buses"),
+        (EcamReject::TooMany, "only the first 256 entries are read"),
     ];
     for (why, text) in all {
         assert_eq!(std::format!("{why}"), text);

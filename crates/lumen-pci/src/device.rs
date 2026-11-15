@@ -75,6 +75,17 @@ pub(crate) fn read_header(cs: &mut impl ConfigSpace, addr: PciAddr) -> Option<He
     })
 }
 
+/// Why a BAR slot holds no [`Bar`] ([`DeviceInfo::bar_slot`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoBar {
+    /// There are only slots 0-5.
+    OutOfRange,
+    /// Not implemented, or past the header type's BARs.
+    NotImplemented,
+    /// The upper half of the 64-bit BAR in the slot before.
+    UpperHalf,
+}
+
 /// A PCI-to-PCI bridge's bus numbers: the bus it is on, the bus behind it,
 /// and the highest bus below it. Buses `secondary..=subordinate` are
 /// reached through it (a secondary bus of 0: not configured).
@@ -99,11 +110,13 @@ pub struct DeviceInfo {
     /// Subsystem vendor and id (an endpoint's; `(0, 0)` for other header
     /// types). virtio's transitional devices give their device type here.
     pub subsystem: (u16, u16),
-    /// The implemented BARs, sized; `None` for one that isn't implemented
-    /// or is the upper half of a 64-bit BAR.
+    /// The implemented BARs, sized; `None` for one that isn't implemented,
+    /// is the upper half of a 64-bit BAR, or is past the header's BARs (an
+    /// endpoint has 6, a bridge 2, others none): [`DeviceInfo::bar_slot`]
+    /// says which.
     pub bars: [Option<Bar>; 6],
-    /// MSI, MSI-X, vendor-specific (virtio's) and the others, complete or
-    /// cut off (or not read: an unknown header type).
+    /// MSI, MSI-X, vendor-specific (virtio's) and the others: complete,
+    /// cut off, or not read (an unknown header type).
     pub caps: CapList,
     /// The INTx pin (1-4 for INTA-INTD, 0 for none): recorded only, INTx
     /// is never routed (no `_PRT`).
@@ -148,6 +161,16 @@ impl DeviceInfo {
         }
     }
 
+    /// BAR slot `index`: its [`Bar`], or why it has none.
+    pub fn bar_slot(&self, index: usize) -> Result<Bar, NoBar> {
+        let bar = *self.bars.get(index).ok_or(NoBar::OutOfRange)?;
+        match bar {
+            Some(bar) => Ok(bar),
+            None if index > 0 && self.bars[index - 1].is_some_and(|b| b.slots() == 2) => Err(NoBar::UpperHalf),
+            None => Err(NoBar::NotImplemented),
+        }
+    }
+
     /// The device's name, if Lumen knows it ([`names::device`]).
     pub fn name(&self) -> Option<&'static str> {
         names::device(self.vendor, self.device, self.subsystem.1)
@@ -165,10 +188,11 @@ impl DeviceInfo {
     }
 
     /// What is wrong with this function, for warnings: a capability list
-    /// cut off or not read, each unassigned or malformed BAR, and a
-    /// bridge's buses that `covered(segment, bus)` says aren't all in the
-    /// configuration space being scanned (the devices behind it would be
-    /// invisible).
+    /// cut off or not read, each unassigned or malformed BAR, and a bridge
+    /// with no secondary bus, bus numbers that can't be right, or buses
+    /// that `covered(segment, bus)` (asked about the bridge's own segment)
+    /// says aren't all in the configuration space being scanned (the
+    /// devices behind it would be invisible).
     pub fn problems(&self, covered: impl Fn(u16, u8) -> bool) -> impl Iterator<Item = Problem> {
         let caps = (!self.caps.is_complete()).then_some(Problem::Caps(self.caps.end()));
         let bars = self.bars.into_iter().enumerate().filter_map(|(index, bar)| match bar? {
@@ -176,11 +200,20 @@ impl DeviceInfo {
             Bar::Malformed(why) => Some(Problem::MalformedBar { index, why }),
             _ => None,
         });
-        let segment = self.addr.segment();
+        let (segment, own) = (self.addr.segment(), self.addr.bus());
         let bridge = self.buses.and_then(|b| {
-            let invisible = b.secondary != 0
-                && (b.secondary > b.subordinate || !(b.secondary..=b.subordinate).all(|bus| covered(segment, bus)));
-            invisible.then_some(Problem::BusesOutsideEcam { secondary: b.secondary, subordinate: b.subordinate })
+            let BusNumbers { primary, secondary, subordinate } = b;
+            Some(if secondary == 0 {
+                Problem::BridgeUnconfigured
+            } else if primary != own || secondary <= own {
+                Problem::BridgeMisnumbered { primary, secondary, subordinate }
+            } else if secondary > subordinate {
+                Problem::BridgeBusesBackwards { secondary, subordinate }
+            } else if !(secondary..=subordinate).all(|bus| covered(segment, bus)) {
+                Problem::BusesOutsideEcam { secondary, subordinate }
+            } else {
+                return None;
+            })
         });
         caps.into_iter().chain(bars).chain(bridge)
     }
@@ -210,8 +243,9 @@ impl fmt::Display for DeviceInfo {
 
 /// Scan `buses` of `segment` by brute force: devices 0-31 on each bus,
 /// functions 1-7 only where function 0 exists and says it is
-/// multi-function. Bridges' secondary buses lie inside the range ECAM
-/// covers, so they are reached without following bridges. Calls `found`
+/// multi-function. Bridges' secondary buses normally lie inside the range
+/// ECAM covers, so they are reached without following bridges (one that
+/// doesn't is [`Problem::BusesOutsideEcam`]). Calls `found`
 /// for each function, in address order.
 pub fn enumerate(
     cs: &mut impl ConfigSpace,

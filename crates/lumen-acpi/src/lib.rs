@@ -22,6 +22,7 @@
 #![no_std]
 
 use core::fmt;
+use core::ops::RangeInclusive;
 
 /// Size of the header every system description table starts with.
 pub const SDT_HEADER_LEN: usize = 36;
@@ -675,6 +676,8 @@ pub enum EcamReject {
     Overlaps {
         earlier: usize,
     },
+    /// It comes after the first [`MAX_ECAM_REGIONS`] entries.
+    TooMany,
 }
 
 impl fmt::Display for EcamReject {
@@ -685,6 +688,7 @@ impl fmt::Display for EcamReject {
             EcamReject::BusesBackwards => f.write_str("its first bus is above its last"),
             EcamReject::PastAddressSpace => f.write_str("its range doesn't end below 2^64"),
             EcamReject::Overlaps { earlier } => write!(f, "it overlaps entry {earlier}'s buses"),
+            EcamReject::TooMany => write!(f, "only the first {MAX_ECAM_REGIONS} entries are read"),
         }
     }
 }
@@ -731,25 +735,33 @@ impl EcamRegion {
         self.base + (u64::from(self.bus_start) << 20)
     }
 
-    /// The bytes from [`start`](Self::start) to the end of `bus_end`'s
-    /// configuration space (1 MiB per bus).
-    pub fn len(&self) -> u64 {
-        (u64::from(self.bus_end) - u64::from(self.bus_start) + 1) << 20
+    /// `bus_start..=bus_end`.
+    pub fn buses(&self) -> RangeInclusive<u8> {
+        self.bus_start..=self.bus_end
     }
 
-    /// Never: a region holds at least one bus. (For clippy's `len` rule.)
-    pub fn is_empty(&self) -> bool {
-        false
+    /// The bytes from [`start`](Self::start) to the end of `bus_end`'s
+    /// configuration space (1 MiB per bus).
+    pub fn size(&self) -> u64 {
+        (u64::from(self.bus_end) - u64::from(self.bus_start) + 1) << 20
     }
 
     /// Whether `bus` of `segment` is in this region.
     pub fn covers(&self, segment: u16, bus: u8) -> bool {
-        segment == self.segment && (self.bus_start..=self.bus_end).contains(&bus)
+        segment == self.segment && self.buses().contains(&bus)
     }
 
     /// Whether the two regions share a bus of the same segment.
     pub fn overlaps(&self, other: &EcamRegion) -> bool {
         self.segment == other.segment && self.bus_start <= other.bus_end && other.bus_start <= self.bus_end
+    }
+}
+
+/// `segment 0 buses 0-255 at 0xe0000000` (the address is
+/// [`start`](EcamRegion::start)'s).
+impl fmt::Display for EcamRegion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "segment {} buses {}-{} at {:#x}", self.segment, self.bus_start, self.bus_end, self.start())
     }
 }
 
@@ -772,8 +784,9 @@ impl fmt::Display for BadEcamRegion {
     }
 }
 
-/// The most MCFG entries accepted (real tables have a handful): the walk
-/// remembers which entries it accepted in a fixed bitmap.
+/// The most MCFG entries read (real tables have a handful): the walk
+/// remembers which entries it accepted in a fixed bitmap. Each entry past
+/// them is refused ([`EcamReject::TooMany`]).
 pub const MAX_ECAM_REGIONS: usize = 256;
 
 /// The PCI Express memory-mapped configuration table: its entries, each
@@ -785,9 +798,10 @@ pub struct Mcfg<'a> {
 
 impl<'a> Mcfg<'a> {
     /// Check that `t` is an MCFG whose body after its reserved bytes is a
-    /// whole number of 16-byte entries, at most [`MAX_ECAM_REGIONS`]. An
-    /// MCFG listing none parses (and gives none). The entries themselves
-    /// are judged by [`regions`](Self::regions), one by one.
+    /// whole number of 16-byte entries (a partial entry at the end refuses
+    /// the whole table: the table is cut short). An MCFG listing none
+    /// parses (and gives none). The entries themselves are judged by
+    /// [`regions`](Self::regions), one by one.
     pub fn parse(t: Sdt<'a>) -> Result<Mcfg<'a>, Error> {
         let b = t.expect(Signature::MCFG)?.bytes();
         let body = b.get(MCFG_FIXED_LEN..).ok_or(Error::Truncated(Signature::MCFG))?;
@@ -795,30 +809,22 @@ impl<'a> Mcfg<'a> {
         if !rest.is_empty() {
             return Err(Error::Truncated(Signature::MCFG));
         }
-        if entries.len() > MAX_ECAM_REGIONS {
-            return Err(Error::BadLength { sig: Signature::MCFG, len: b.len() as u32 });
-        }
         Ok(Mcfg { entries })
-    }
-
-    /// How many entries the table has.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 
     /// Each entry in table order: the region, or why it was refused (see
     /// [`EcamRegion::new`]; an entry covering a bus of an entry accepted
-    /// before it is refused too). One bad entry doesn't cost the others.
+    /// before it, or past the first [`MAX_ECAM_REGIONS`], is refused too).
+    /// One bad entry doesn't cost the others.
     pub fn regions(&self) -> impl Iterator<Item = Result<EcamRegion, BadEcamRegion>> + use<'a> {
         let entries = self.entries;
         let mut accepted = [0u64; MAX_ECAM_REGIONS / 64];
         entries.iter().enumerate().map(move |(index, e)| {
             let (base, segment, bus_start, bus_end) = mcfg_entry_fields(e);
             let bad = |why| BadEcamRegion { index, base, segment, bus_start, bus_end, why };
+            if index >= MAX_ECAM_REGIONS {
+                return Err(bad(EcamReject::TooMany));
+            }
             let region = EcamRegion::new(base, segment, bus_start, bus_end).map_err(bad)?;
             let earlier = (0..index).find(|&j| {
                 accepted[j / 64] & 1 << (j % 64) != 0 && entry_region(&entries[j]).is_some_and(|r| r.overlaps(&region))

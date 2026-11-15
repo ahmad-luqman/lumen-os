@@ -26,6 +26,7 @@ use core::ops::RangeInclusive;
 
 pub use bar::{Bar, BarProblem};
 pub use cap::{Cap, CapEnd, CapList, MAX_CAPS};
+pub use device::NoBar;
 pub use device::{BusNumbers, DeviceInfo, enumerate};
 pub use problem::Problem;
 
@@ -96,7 +97,7 @@ impl PciAddr {
 
     /// The offset of this function's 4 KiB in its bus's ECAM megabyte:
     /// `device << 15 | function << 12`.
-    pub const fn ecam_offset(&self) -> u32 {
+    pub const fn function_offset(&self) -> u32 {
         (self.device as u32) << 15 | (self.function as u32) << 12
     }
 }
@@ -147,7 +148,7 @@ pub fn ecam_offset(segment: u16, buses: RangeInclusive<u8>, addr: PciAddr, offse
         return None;
     }
     let bus = u64::from(addr.bus() - buses.start());
-    Some(bus << 20 | u64::from(addr.ecam_offset()) | u64::from(offset))
+    Some(bus << 20 | u64::from(addr.function_offset()) | u64::from(offset))
 }
 
 #[cfg(test)]

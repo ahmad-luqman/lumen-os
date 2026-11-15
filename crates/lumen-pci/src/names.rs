@@ -1,6 +1,7 @@
-//! Readable names for the vendors, devices and classes Lumen meets: QEMU
-//! q35's chipset, its display and NICs, and the virtio devices. Anything
-//! else has no device name, and a class name from the class code alone.
+//! Readable names for the devices and classes Lumen meets: QEMU q35's
+//! chipset, its display and NICs, its bridges, and the virtio devices.
+//! Anything else has no device name, and a class name from the class code
+//! alone.
 
 /// Red Hat's vendor id, which every virtio PCI device uses.
 pub const VIRTIO_VENDOR: u16 = 0x1af4;

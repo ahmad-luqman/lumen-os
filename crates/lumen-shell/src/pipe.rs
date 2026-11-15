@@ -55,10 +55,6 @@ impl Kind {
     fn holds_numbers(self) -> bool {
         self != Kind::Text
     }
-
-    fn is_hex(self) -> bool {
-        matches!(self, Kind::Hex | Kind::Hex16)
-    }
 }
 
 /// Which side of its column a value is printed against.
@@ -480,10 +476,10 @@ fn wanted(column: &str, kind: Kind, op: Op, value: &str) -> Result<Wanted, PipeE
     let n = match (digits.strip_prefix("0x"), kind) {
         (Some(hex), _) if !hex.starts_with(['+', '-']) => i64::from_str_radix(hex, 16).ok(),
         (Some(_), _) => None,
-        (None, k) if k.is_hex() && decimal(digits).is_some_and(|n| n >= 0) => {
+        (None, Kind::Hex | Kind::Hex16) if decimal(digits).is_some_and(|n| n >= 0) => {
             return Err(PipeError::HexNeeded(column.to_owned()));
         }
-        (None, k) if k.is_hex() => None,
+        (None, Kind::Hex | Kind::Hex16) => None,
         (None, _) => decimal(digits),
     };
     n.map(Wanted::Number).ok_or_else(|| PipeError::NotANumber { column: column.to_owned(), value: value.to_owned() })

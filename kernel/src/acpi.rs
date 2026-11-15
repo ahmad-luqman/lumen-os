@@ -268,6 +268,14 @@ impl Failure {
     }
 }
 
+impl Failure {
+    /// `error` with no failed read behind it (for tests of what prints it).
+    #[cfg(feature = "ktest")]
+    pub fn without_cause(error: Error) -> Failure {
+        Failure { error, cause: None }
+    }
+}
+
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.error)?;
@@ -420,8 +428,8 @@ crate::ktest!(
         // QEMU q35's MADT and HPET (hw/i386/acpi-common.c): one I/O APIC at
         // 0xfec00000 handling GSIs from 0, ISA IRQ 0 (the PIT) wired to GSI 2,
         // the 8259 PICs present, the HPET at 0xfed00000; and its MCFG: segment
-        // 0's 256 buses, where the pinned OVMF moves them from QEMU's
-        // 0xb0000000 (include/hw/pci-host/q35.h): 0xe0000000.
+        // 0's 256 buses at 0xe0000000, where the pinned OVMF moves them
+        // (QEMU's default is 0xb0000000, include/hw/pci-host/q35.h).
         use crate::{kassert, kassert_eq};
         let info = info().ok_or("ACPI was not found at boot")?;
         kassert_eq!(info.local_apic, 0xfee0_0000);

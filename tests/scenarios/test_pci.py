@@ -9,7 +9,8 @@ real QEMU fails the way the harness expects and the retry recovers.
 
 The kernel's side: `lspci` lists exactly the functions `query-pci` reports
 (address, vendor and device ids), names the virtio ones, and the boot log
-counts the memory BARs QEMU has; also behind a PCIe root port (bus 1);
+counts the memory BARs QEMU has; also behind a PCIe root port (on a
+secondary bus);
 each function is logged at debug level; its records filter (`where vendor =
 0x1af4`); and without ACPI there is no MCFG, so no PCI devices, with a
 warning and the reason in `lspci`'s header. The decoding itself is host-tested (`cargo test -p lumen-pci`,
@@ -202,8 +203,8 @@ def test_lspci_records_filter(boot):
 
 
 def test_lspci_sees_devices_behind_a_bridge(boot):
-    # A PCIe root port with a virtio rng behind it, on bus 1: the scan
-    # finds it without following the bridge (every bus is scanned).
+    # A PCIe root port with a virtio rng behind it, on a secondary bus: the
+    # scan finds it without following the bridge (every bus is scanned).
     m = shell(
         boot,
         extra=[
@@ -235,6 +236,18 @@ def test_each_function_is_logged_at_debug_level(boot):
 def test_no_acpi_means_no_pci_devices(boot):
     # `acpi=off` leaves no MADT, so ACPI is absent and with it the MCFG.
     m = shell(boot, extra=["-machine", "q35,acpi=off"])
-    assert "WARN  pci: no PCI devices: no ACPI tables, so no MCFG\n" in m.output
-    assert run(m, "lspci").startswith("lspci: 0 functions (no PCI: no ACPI tables, so no MCFG)\n")
-    assert run(m, "lspci | count") == "0\n"
+    assert "WARN  pci: no PCI devices: running without ACPI, so no MCFG\n" in m.output
+    assert run(m, "lspci").startswith(
+        "lspci: 0 functions (no PCI: running without ACPI, so no MCFG)\n"
+    )
+    # In a pipeline the reason goes to the console before the result.
+    note = "lspci: no PCI: running without ACPI, so no MCFG\n"
+    assert run(m, "lspci | count") == note + "0\n"
+    out = run(m, "lspci | where vendor = 0x1af4")
+    assert out.startswith(note) and out[len(note) :].split() == [
+        "addr",
+        "vendor",
+        "device",
+        "class",
+        "name",
+    ], out
