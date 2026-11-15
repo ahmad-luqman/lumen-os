@@ -95,8 +95,8 @@ tests = [
 ]
 
 [[feature]]
-name = "A wait where the thread can't block (here a lock held) panics with a crash report, when no crash report is under way"
+name = "A wait where the thread can't block (a lock held; interrupts off, also in a wait with a deadline; interrupts off for good by its own CPU) panics with a crash report"
 milestone = "M3"
 tests = [
-    "scenario:test_crash::test_blocking_with_a_lock_held_panics",
+    "scenario:test_crash::test_blocking_where_a_thread_cant_panics[*]",
 ]

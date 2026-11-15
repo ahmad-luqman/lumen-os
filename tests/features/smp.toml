@@ -33,8 +33,9 @@ tests = [
 ]
 
 [[feature]]
-name = "A CPU whose thread blocks after another CPU's crash began (interrupts off for good) but before that report's stop NMI arrived halts for the report, counted as stopped, instead of crashing on the can't-block check (#106)"
+name = "A CPU whose thread blocks after another CPU's crash began (interrupts off for good) but before that report's stop NMI arrived halts for the report, counted as stopped, instead of crashing on the can't-block check (#106): a thread leaving a critical section, and a thread's first run"
 milestone = "M3"
 tests = [
     "scenario:test_smp::test_a_cpu_blocking_once_a_crash_began_halts_for_its_report",
+    "scenario:test_smp::test_a_thread_first_run_once_a_crash_began_halts_for_its_report",
 ]

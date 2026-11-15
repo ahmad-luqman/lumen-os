@@ -13,17 +13,25 @@
 //! crash (it then prints a one-line notice and stops).
 //!
 //! With several CPUs online, the first CPU to crash owns the report: it
-//! stops every other online CPU with an NMI (each acknowledges and halts) and
-//! waits for them, bounded, before writing anything, so reports and log
+//! stops every other online CPU with an NMI (each acknowledges and halts)
+//! and waits for them, bounded, before writing anything, so reports and log
 //! lines don't interleave. A CPU that crashes while another is reporting
-//! halts, and the report names it; one whose thread would block once a
-//! report has begun (interrupts off for good) halts before its stop NMI
-//! comes, and counts as stopped ([`halt_for_report`]). Serial says which CPU crashed (`cpu:`),
-//! which stack the reporter runs on (`running on:`), which thread was
-//! running (`thread:`, once that CPU's threads are set up) and which CPUs stopped;
-//! `!!!` lines name any CPU that didn't stop through the stop NMI (late, not
-//! sent, crashed itself, or started but not online), which may still touch
-//! the console or the heap: the bounded walks below tolerate that.
+//! halts, and the report names it.
+//!
+//! The order on the crashing CPU: it records its own crash, turns
+//! interrupts off for good (`irq::disable_for_good`, on every CPU from then
+//! on), claims the report (`CRASHING`), and only then sends the stop NMIs.
+//! Until its NMI arrives, every other CPU runs on with interrupts staying
+//! off whenever a critical section closes or a thread switches itself out
+//! and back in; a thread there that would block then halts its CPU instead
+//! ([`halt_if_stopping_elsewhere`]), counted as stopped.
+//!
+//! Serial says which CPU crashed (`cpu:`), which stack the reporter runs on
+//! (`running on:`), which thread was running (`thread:`, once that CPU's
+//! threads are set up) and which CPUs stopped; `!!!` lines name any CPU
+//! that didn't stop for the report (late, not sent, crashed itself, or
+//! started but not online), which may still touch the console or the heap:
+//! the bounded walks below tolerate that.
 //!
 //! The output format is parsed by `tools/harness/lumen_harness/crash.py`
 //! (markers, backtrace, page walk), `tests/scenarios/test_crash.py` and, for
@@ -66,8 +74,7 @@ const _: () = assert!(arch::MAX_CPUS <= 64);
 static CRASHED: AtomicU64 = AtomicU64::new(0);
 static CRASH_VECTOR: [AtomicU64; arch::MAX_CPUS] = [const { AtomicU64::new(0) }; arch::MAX_CPUS];
 static CRASH_AT: [AtomicU64; arch::MAX_CPUS] = [const { AtomicU64::new(0) }; arch::MAX_CPUS];
-/// The CPUs that halted for another CPU's report (through the stop NMI, a
-/// crash of their own, or [`halt_for_report`]).
+/// The CPUs that halted for another CPU's report (see [`stop_here`]).
 static HALTED: AtomicU64 = AtomicU64::new(0);
 // The owner's snapshot, taken once when it stops the others: every other
 // CPU that has an index is in exactly one of these three, or is empty.
@@ -277,26 +284,44 @@ fn stop_others(me: usize) {
     STOPPED_IN_TIME.store(halted(), Ordering::SeqCst);
 }
 
-/// Halt this CPU for good for another CPU's report, saying so. Reached
-/// through the stop NMI (further NMIs stay blocked until an `iret` that
-/// never comes) or through a crash of its own, recorded already.
+/// Halt this CPU for good for another CPU's report, saying so (in
+/// [`HALTED`]). Reached three ways: through the stop NMI (further NMIs stay
+/// blocked until an `iret` that never comes), through a crash of its own,
+/// recorded already, or through [`halt_if_stopping_elsewhere`] before the
+/// NMI came (the NMI, when it comes, wakes this CPU from its halt and halts
+/// it again here).
 fn stop_here(me: usize) -> ! {
     HALTED.fetch_or(1 << me, Ordering::SeqCst);
     arch::halt_forever()
 }
 
-/// Halt this CPU for good for another CPU's report, which has begun
-/// (interrupts are off for good) but whose stop NMI hasn't arrived: for a
-/// thread that finds it can't go on (it can't block: interrupts stayed off
-/// when it left a critical section or was switched back to) and would
-/// otherwise crash too, a second crash the report would only name (#106).
-/// The report counts it as stopped, as the NMI would have; that NMI, when
-/// it comes, finds it halted.
-pub fn halt_for_report() -> ! {
-    stop_here(arch::cpu_index())
+/// Halt this CPU for another CPU's crash report (or reboot), if that is the
+/// only reason the running thread can't block: interrupts are off, another
+/// CPU turned them off for good (so they stayed off when this thread last
+/// closed a critical section, or switched itself out and back in, or first
+/// ran), and otherwise it could (its CPU's scheduler runs, no critical
+/// section is open, it isn't the idle thread). Otherwise it returns, and
+/// the caller goes on to its can't-block panic: a real bug, or this CPU's
+/// own report or reboot, whose CPU can't halt quietly without cutting it
+/// short. For `WaitQueue`'s wait, right before that panic (#106: a screen
+/// shell's first wait on the boot CPU while an AP's report was starting
+/// would otherwise crash too, a second crash the report only names).
+///
+/// If it halts before the report's owner stops waiting for the others, the
+/// report counts this CPU as stopped, as the NMI would have; after that, it
+/// names it as not stopped in time.
+pub fn halt_if_stopping_elsewhere() {
+    let me = arch::cpu_index();
+    if arch::irq::disabled_for_good_elsewhere()
+        && !arch::irq::enabled()
+        && crate::sched::can_block_with_interrupts_on(me)
+    {
+        stop_here(me);
+    }
 }
 
-/// Whether CPU `cpu` has halted for a crash report (see [`HALTED`]).
+/// Whether CPU `cpu` has halted for a crash report (see [`HALTED`]): for
+/// `crash bystander`, which faults only once the other CPU it set up has.
 pub fn halted(cpu: usize) -> bool {
     cpu < arch::MAX_CPUS && HALTED.load(Ordering::SeqCst) & (1 << cpu) != 0
 }
