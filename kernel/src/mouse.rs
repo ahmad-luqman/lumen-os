@@ -74,10 +74,10 @@ pub const DRIVER: Driver = Driver { name: "virtio-tablet", matches, probe };
 /// How long the `mouse` thread waits for an interrupt before it looks at
 /// the device's status anyway (a device that stops without saying so, its
 /// status reading all ones, sends none).
-pub const IDLE_CHECK_NS: u64 = 1_000_000_000;
+const IDLE_CHECK_NS: u64 = 1_000_000_000;
 
-/// Rung by the tablet's MSI-X interrupt: events came in (or its
-/// configuration changed).
+/// Rung by the tablet's MSI-X interrupt: whatever it signals (a buffer back
+/// on either queue, events among them, or a configuration change).
 static BELL: Doorbell = Doorbell::new();
 
 fn on_interrupt() {
@@ -230,7 +230,8 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
         info!(target: "mouse", "{addr}: a tablet is bound already (on {first}): only one is used");
         return Err(ProbeError::NotMine);
     }
-    let mut t = virtio::transport(res, Some(on_interrupt))?;
+    let mut t = virtio::transport(res, on_interrupt)?;
+    BELL.attach(addr);
     let mut abs = [0u8; 1];
     let n = query(&mut t, cfg::EV_BITS, evdev::EV_ABS as u8, &mut abs)?;
     if !has_abs_xy(&abs[..n]) {
@@ -252,8 +253,7 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
     let screen = crate::term::screen_size().unwrap_or((units(x), units(y)));
     let status = t.status();
     let input = Input::new(t).map_err(ProbeError::Device)?;
-    virtio::check_vectors()?;
-    status.check_ready()?;
+    virtio::check_device(&status)?;
     let tablet = Tablet::new(x, y, screen.0, screen.1);
     info!(
         target: "mouse",
@@ -274,6 +274,8 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
 /// The `mouse` thread: the device's only user from here on.
 fn run(mut input: Input, mut tablet: Tablet, status: StatusHandle, addr: PciAddr) {
     let (mut warned_overrun, mut logged_ignored) = (false, false);
+    // The ring count when the last wait ran to its deadline with no ring.
+    let mut silent: Option<u64> = None;
     loop {
         // Read before draining, so an interrupt after the drain ends the
         // wait below.
@@ -285,6 +287,12 @@ fn run(mut input: Input, mut tablet: Tablet, status: StatusHandle, addr: PciAddr
                 newest = Some(s);
             }
         }
+        // Events after a wait that ended at its deadline, with still no
+        // ring: they came without their interrupt.
+        if events > 0 && silent == Some(seen) {
+            BELL.note_missed();
+        }
+        silent = None;
         if !logged_ignored && let Some((kind, code)) = tablet.first_ignored() {
             logged_ignored = true;
             debug!(target: "mouse", "{addr}: ignoring events a tablet has no use for, first type {kind:#x} code {code:#x}");
@@ -319,8 +327,10 @@ fn run(mut input: Input, mut tablet: Tablet, status: StatusHandle, addr: PciAddr
             return fail(input, status, addr);
         }
         // A busy batch looks again at once: the ring may be filling.
-        if events < RING / 2 {
-            let _ = BELL.wait_after(seen, crate::time::now_ns().saturating_add(IDLE_CHECK_NS));
+        if events < RING / 2
+            && BELL.wait_after(seen, crate::time::now_ns().saturating_add(IDLE_CHECK_NS)) == virtio::Wake::Deadline
+        {
+            silent = Some(seen);
         }
     }
 }

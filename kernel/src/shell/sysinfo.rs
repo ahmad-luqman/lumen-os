@@ -328,10 +328,10 @@ fn vector_table() -> pipe::Table {
     for v in 32..=255u8 {
         let count = idt::vector_count(v);
         let routed = inputs.iter().any(|i| i.routed && i.entry.vector() == v);
-        let device = msix.iter().find(|m| m.idt_vector() == v);
+        let device = msix.iter().find(|m| m.idt_vector == v);
         if count > 0 || routed || device.is_some() {
             let what = match device {
-                Some(m) => alloc::format!("msix {} #{}", m.pci(), m.table_entry()),
+                Some(m) => alloc::format!("msix {} #{}", m.pci, m.table_entry),
                 None => alloc::format!("{}", idt::vector_use(v)),
             };
             t.push(vec![int(v), Value::Text(what), int(count)]);

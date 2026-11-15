@@ -68,6 +68,10 @@ pub mod common {
     pub const QUEUE_MSIX_VECTOR: u64 = 26;
     /// `queue_notify_off`, 16 bits.
     pub const QUEUE_NOTIFY_OFF: u64 = 30;
+    /// What `msix_config` and `queue_msix_vector` hold for no vector, and
+    /// read back when the device can't map the one written (virtio 1.2
+    /// §4.1.5.1.2).
+    pub const NO_VECTOR: u16 = 0xffff;
     /// What `virtio-drivers`' `CommonCfg` maps: through `queue_device`'s 8
     /// bytes at 48 (virtio 1.2's full structure is 60 bytes, with
     /// `queue_notify_data` and `queue_reset`, which the crate doesn't use).

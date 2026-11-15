@@ -330,7 +330,8 @@ class Devices:
     # answering in time.
     rng_rate: tuple[int, int] | None = None
     # virtio-rng without an MSI-X capability (QEMU's `vectors=0`): attaches
-    # virtio-rng (whatever `rng` says), a device that can't interrupt.
+    # virtio-rng (whatever `rng` says), a device left with INTx only, which
+    # Lumen doesn't route.
     rng_no_msix: bool = False
     # virtio-sound, recorded to `Machine.wav_path`.
     sound: bool = False

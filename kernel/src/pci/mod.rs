@@ -274,7 +274,7 @@ fn discover() -> (Vec<DeviceInfo>, Status) {
             bars,
             state: SlotState::Free { declined_by: None },
             resources_live: false,
-            msix: None,
+            msix: msix::MsixState::None,
         });
     }
     let memory_bars = slots.iter().map(|s| s.bars.iter().flatten().count()).sum::<usize>();
@@ -343,7 +343,7 @@ struct Slot {
     bars: [Option<BarEntry>; 6],
     state: SlotState,
     resources_live: bool,
-    msix: Option<msix::Programmed>,
+    msix: msix::MsixState,
 }
 
 /// Who has a function, with what only the registry needs (the command
@@ -674,7 +674,8 @@ pub enum Probed {
     /// out, e.g. a second tablet, or a virtio input device of the tablet's
     /// class without its axes): the function is free again, its command
     /// register as before the claim, for the next driver row. Refused (a
-    /// failure) if the driver kept its `DeviceResources`.
+    /// failure) if the driver kept its `DeviceResources`, or set up its
+    /// MSI-X vector (`DeviceResources::msix`: once per function).
     Declined,
 }
 
@@ -685,8 +686,10 @@ pub enum Probed {
 /// being probed by `driver` (a bug in `probe_all`). Returns the binding
 /// recorded.
 pub fn probed(addr: PciAddr, driver: &'static str, outcome: Probed) -> Binding {
-    let (restore, live) = with_slot(addr, |slot| match slot.state {
-        SlotState::Probing { driver: d, restore } if d == driver => (restore, slot.resources_live),
+    let (restore, live, msix) = with_slot(addr, |slot| match slot.state {
+        SlotState::Probing { driver: d, restore } if d == driver => {
+            (restore, slot.resources_live, slot.msix != msix::MsixState::None)
+        }
         ref other => panic!("pci::probed: {addr} isn't being probed by {driver} ({})", other.binding()),
     })
     .unwrap_or_else(|| panic!("pci::probed: no function {addr}"));
@@ -700,6 +703,13 @@ pub fn probed(addr: PciAddr, driver: &'static str, outcome: Probed) -> Binding {
             warn!(target: "pci", "{addr}: {driver} declined it but kept its resources: recorded as failed");
             bus_master_off(addr, "bus mastering off after a failed probe");
             SlotState::Failed(driver, String::from("declined the device but kept its resources"))
+        }
+        Probed::Declined if msix => {
+            // MSI-X stays enabled (and the vector claimed): the next driver
+            // couldn't get one, nor use INTx.
+            warn!(target: "pci", "{addr}: {driver} declined it after setting up its MSI-X vector: recorded as failed");
+            bus_master_off(addr, "bus mastering off after a failed probe");
+            SlotState::Failed(driver, String::from("declined it after setting up its MSI-X vector"))
         }
         Probed::Declined => {
             set_command(addr, restore, "restoring it after a decline");

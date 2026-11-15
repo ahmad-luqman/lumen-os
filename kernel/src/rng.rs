@@ -469,8 +469,8 @@ pub fn probe(res: DeviceResources) -> Result<(), ProbeError> {
     probed
 }
 
-/// Rung by the device's MSI-X interrupt: a request's buffer came back (or
-/// its configuration changed).
+/// Rung by the device's MSI-X interrupt: whatever it signals (its one
+/// queue's buffer came back, or its configuration changed).
 static BELL: Doorbell = Doorbell::new();
 
 fn on_interrupt() {
@@ -478,17 +478,17 @@ fn on_interrupt() {
 }
 
 fn bring_up(res: DeviceResources) -> Result<(), ProbeError> {
-    let mut transport = virtio::transport(res, Some(on_interrupt))?;
+    let mut transport = virtio::transport(res, on_interrupt)?;
     let status = transport.status();
     let addr = transport.info().addr;
+    BELL.attach(addr);
     transport.begin_init(Feature::VERSION_1);
     // On an error the transport drops first (resetting the device), and
     // `VirtQueue::new` frees what it made.
     let queue = VirtQueue::new(&mut transport, QUEUE, false, false).map_err(ProbeError::Device)?;
     transport.finish_init();
     let dev = Device { transport, queue, status, addr, in_flight: 0 };
-    virtio::check_vectors()?;
-    status.check_ready()?;
+    virtio::check_device(&status)?;
     let mut seed = [0u8; DRAW];
     let dev = dev.request(&mut seed).map_err(|lost| {
         warn!(target: "rng", "virtio-rng on {addr}: its first request: {}", lost.why);
@@ -653,6 +653,13 @@ pub fn ktest_device() -> Option<PciAddr> {
 #[cfg(feature = "ktest")]
 pub fn ktest_rings() -> u64 {
     BELL.rings()
+}
+
+/// Ktests: the bound device's `msix_config` and queue 0's
+/// `queue_msix_vector`, as read now.
+#[cfg(feature = "ktest")]
+pub fn ktest_vectors() -> Option<(u16, u16)> {
+    DEVICE.lock().as_mut().map(|d| d.transport.ktest_vectors())
 }
 
 crate::ktest!(

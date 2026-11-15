@@ -222,9 +222,10 @@ def test_a_virtio_rng_answering_zeros_fails_its_probe(boot):
 
 
 def test_a_virtio_rng_without_msix_fails_its_probe(boot):
-    # QEMU's `vectors=0`: no MSI-X capability, so the device can't
-    # interrupt, and there is no polling fallback (#96): the probe fails
-    # saying why, before any request.
+    # QEMU's `vectors=0`: no MSI-X capability (the device still has INTx,
+    # which Lumen doesn't route: no `_PRT`), so it has no interrupt Lumen
+    # uses, and there is no polling fallback (#96): the probe fails saying
+    # why, before any request.
     m = shell(boot, devices=Devices(rng_no_msix=True))
     why = "MSI-X: no MSI-X capability"
     assert lspci_driver(m, "virtio rng") == [f"virtio-rng: failed: {why}"]

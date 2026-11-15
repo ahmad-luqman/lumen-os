@@ -17,8 +17,9 @@ pub use crate::virtio::ProbeError;
 /// gets the function's resources (and nothing else); an error is a
 /// warning, recorded for `lspci`, and boot goes on. A virtio driver calls
 /// `virtio::transport` from the probe itself (runs are charged to the
-/// probe attempt, and `probe_all` checks that transport's device is ready
-/// when the probe returns `Ok`), then the crate's `new()`. It may return
+/// probe attempt, and `probe_all` checks that transport's device took its
+/// MSI-X vector and is ready when the probe returns `Ok`), then the
+/// crate's `new()`. It may return
 /// [`ProbeError::NotMine`] for a device that turns out not to be its own,
 /// or one the driver doesn't take (rng: a second device), but only before
 /// the crate's `new()` (or before setting up its own queues, as rng does;
@@ -61,13 +62,16 @@ pub fn probe_all() {
 /// `probing <driver> on <addr>`, so a hang points at a device; runs handed
 /// out during the probe are recorded as that attempt's
 /// (`virtio::begin_probe`). The outcome is recorded:
-/// - `Ok`: if the probe brought up a virtio transport, its device must be
-///   ready (`StatusHandle::check_ready`: the crate never reads
-///   `FEATURES_OK` back), else the probe failed; `<driver>: bound`.
+/// - `Ok`: if the probe brought up a virtio transport, its device must have
+///   taken its MSI-X vector and be ready (`virtio::BroughtUp::check`: the
+///   crate never reads `FEATURES_OK` back), else the probe failed;
+///   `<driver>: bound`.
 /// - [`ProbeError::NotMine`]: declined; the function is freed, its command
 ///   register restored, and the next matching row is offered it (refused,
 ///   recorded as failed, if the probe kept its `DeviceResources`).
-/// - any other error: `<driver>: failed: <reason>`, a warning.
+/// - any other error: `<driver>: failed: <reason>`, a warning (with the
+///   MSI-X vector problem the transport latched, if any and not the reason
+///   already).
 ///
 /// A failed or declined probe that left DMA runs outstanding (buffers still
 /// posted when its queues were dropped) says how many, in a warning.
@@ -92,6 +96,11 @@ fn probe_with(drivers: &[Driver]) {
             {
                 outcome = b.check();
             }
+            // A vector problem behind another failure: kept in the reason.
+            let vector = brought_up
+                .and_then(|b| b.vector_error())
+                .filter(|_| !matches!(outcome, Ok(()) | Err(ProbeError::NotMine | ProbeError::Vector(_))))
+                .map_or(String::new(), |e| alloc::format!(" (after {e})"));
             let leaked = crate::virtio::outstanding_runs_of(attempt);
             let left =
                 if leaked == 0 { String::new() } else { alloc::format!(" ({leaked} DMA runs left outstanding)") };
@@ -106,8 +115,8 @@ fn probe_with(drivers: &[Driver]) {
                     pci::probed(d.addr, driver.name, Probed::Declined)
                 }
                 Err(e) => {
-                    warn!(target: "drivers", "{}: {} probe failed: {e}{left}", d.addr, driver.name);
-                    pci::probed(d.addr, driver.name, Probed::Failed(alloc::format!("{e}{left}")))
+                    warn!(target: "drivers", "{}: {} probe failed: {e}{vector}{left}", d.addr, driver.name);
+                    pci::probed(d.addr, driver.name, Probed::Failed(alloc::format!("{e}{vector}{left}")))
                 }
             };
             match probed {
@@ -171,11 +180,14 @@ crate::ktest!(
         // A run outside any probe isn't charged to one.
         let (unowned, unowned_v) = VirtioHal::dma_alloc(1, BufferDirection::DriverToDevice);
         let table = [
-            // Declines 9p, leaving a run (not charged to the next row)...
+            // Declines 9p after bringing up its transport (which allocates
+            // no vector before a queue is set up), leaving a run (not
+            // charged to the next row)...
             Driver {
                 name: "ktest-decline",
                 matches: is_9p,
-                probe: |_| {
+                probe: |res| {
+                    drop(virtio::transport(res, virtio::ktest_no_handler)?);
                     leave_a_run();
                     Err(ProbeError::NotMine)
                 },
@@ -197,7 +209,7 @@ crate::ktest!(
                 name: "ktest-unready",
                 matches: is_balloon,
                 probe: |res| {
-                    virtio::transport(res, None)?;
+                    virtio::transport(res, virtio::ktest_no_handler)?;
                     Ok(())
                 },
             },
@@ -206,7 +218,7 @@ crate::ktest!(
                 name: "ktest-console",
                 matches: is_console,
                 probe: |res| {
-                    let mut t = virtio::transport(res, None)?;
+                    let mut t = virtio::transport(res, virtio::ktest_no_handler)?;
                     t.set_status(
                         DeviceStatus::ACKNOWLEDGE
                             | DeviceStatus::DRIVER
@@ -229,6 +241,9 @@ crate::ktest!(
             Driver { name: "never", matches: is_scsi, probe: |_| panic!("offered a device a row before it took") },
         ];
         probe_with(&table);
+        // The decline after a transport left no MSI-X vector behind (it is
+        // allocated at the first queue set up).
+        kassert!(crate::pci::msix_vectors().iter().all(|r| r.pci != p9));
         let why = "the device didn't answer in 0 ms (status 0x00) (1 DMA runs left outstanding)";
         kassert_eq!(pci::binding(p9), Some(Binding::Failed("ktest-9p", why.into())));
         kassert_eq!(alloc::format!("{}", pci::binding(p9).ok_or("gone")?), alloc::format!("ktest-9p: failed: {why}"));
@@ -283,6 +298,70 @@ crate::ktest!(
         // The bound transport and kept resources stay (their devices are
         // the ktests').
         kassert!(KEPT.lock().is_some() && KEPT_RES.lock().is_some());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_refused_vector_fails_the_probe() {
+        // Two spare virtio input devices (a mouse and a second keyboard; no
+        // driver takes either): the transport maps an entry past the MSI-X
+        // table (`virtio::KTEST_REFUSE`), which QEMU refuses, reading back
+        // NO_VECTOR: once for configuration changes, once for the first
+        // queue. Each probe fails with the vector error (what
+        // `check_device` returns, and `lspci`'s reason), nothing leaked.
+        use virtio_drivers::device::common::Feature;
+        use virtio_drivers::queue::VirtQueue;
+        use virtio_drivers::transport::Transport;
+
+        use crate::sync::SpinLock;
+        use crate::virtio::{
+            self, KTEST_REFUSE, KTEST_REFUSE_CONFIG, KTEST_REFUSE_QUEUE, VectorError, VectorFor, VirtioHal,
+        };
+        use crate::{kassert, kassert_eq};
+        static TARGET: SpinLock<Option<lumen_pci::PciAddr>> = SpinLock::new(None);
+        static GOT: SpinLock<Option<VectorError>> = SpinLock::new(None);
+        fn target(d: &DeviceInfo) -> bool {
+            *TARGET.lock() == Some(d.addr)
+        }
+        fn probe(res: DeviceResources) -> Result<(), ProbeError> {
+            let mut t = virtio::transport(res, virtio::ktest_no_handler)?;
+            let status = t.status();
+            t.begin_init(Feature::VERSION_1);
+            let queue = VirtQueue::<VirtioHal, 4>::new(&mut t, 0, false, false).map_err(ProbeError::Device)?;
+            let checked = virtio::check_device(&status);
+            // The transport first (resetting the device), then the queue.
+            drop(t);
+            drop(queue);
+            if let Err(ProbeError::Vector(v)) = &checked {
+                *GOT.lock() = Some(*v);
+            }
+            checked
+        }
+        let spares = virtio::ktest_devices(18);
+        let [_, mouse, keyboard] = spares.as_slice() else {
+            return Err("the ktest machine needs three virtio input devices");
+        };
+        let table = [Driver { name: "ktest-refuse", matches: target, probe }];
+        for (d, refuse, what, text) in [
+            (mouse, KTEST_REFUSE_CONFIG, VectorFor::Config, "for configuration changes"),
+            (keyboard, KTEST_REFUSE_QUEUE, VectorFor::Queue(0), "for queue 0"),
+        ] {
+            *TARGET.lock() = Some(d.addr);
+            *GOT.lock() = None;
+            KTEST_REFUSE.store(refuse, Ordering::Relaxed);
+            probe_with(&table);
+            KTEST_REFUSE.store(0, Ordering::Relaxed);
+            let got = GOT.lock().take();
+            kassert_eq!(got, Some(VectorError::Refused(what)));
+            let why = alloc::format!("MSI-X: the device refused its vector {text} (NO_VECTOR read back)");
+            kassert_eq!(alloc::format!("{}", ProbeError::Vector(got.ok_or("no error")?)), why);
+            kassert_eq!(pci::binding(d.addr), Some(Binding::Failed("ktest-refuse", why.clone())));
+            kassert_eq!(crate::shell::sysinfo::driver_text(d.addr), alloc::format!("ktest-refuse: failed: {why}"));
+            kassert_eq!(virtio::outstanding_runs_of_function(d.addr), 0);
+            kassert!(crate::pci::msix_vectors().iter().any(|r| r.pci == d.addr));
+        }
+        *TARGET.lock() = None;
         Ok(())
     }
 );

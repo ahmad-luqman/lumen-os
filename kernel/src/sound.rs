@@ -529,8 +529,9 @@ fn played_too_fast(frames: u64, rate: Rate, ms: u64) -> bool {
     length_ms >= PACE_CHECK_MS && ms < length_ms / 2
 }
 
-/// Rung by the device's MSI-X interrupt: a period came back (or its
-/// configuration changed).
+/// Rung by the device's MSI-X interrupt: whatever it signals (a buffer
+/// back on any of its queues, a period among them, or a configuration
+/// change).
 static BELL: Doorbell = Doorbell::new();
 
 fn on_interrupt() {
@@ -559,12 +560,12 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
 /// that can fail comes before the thread starts and the device is
 /// published.
 fn bind(res: DeviceResources) -> Result<(), ProbeError> {
-    let transport = virtio::transport(res, Some(on_interrupt))?;
+    let transport = virtio::transport(res, on_interrupt)?;
     let status = transport.status();
     let addr = transport.info().addr;
+    BELL.attach(addr);
     let mut dev = VirtIOSound::<VirtioHal, VirtioTransport>::new(transport).map_err(ProbeError::Device)?;
-    virtio::check_vectors()?;
-    status.check_ready()?;
+    virtio::check_device(&status)?;
     let format = set_up(&mut dev)?;
     status.check_ready()?;
     let device = Device { addr, format };

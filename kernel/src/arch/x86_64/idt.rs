@@ -327,16 +327,26 @@ fn irq_slot(vector: u8) -> Option<&'static AtomicPtr<()>> {
 /// it (it keeps the vector and its input in step).
 pub fn set_irq_handler(vector: u8, handler: fn()) -> Result<(), HandlerError> {
     let slot = irq_slot(vector).ok_or(HandlerError::NotAnIoApicVector)?;
-    slot.compare_exchange(core::ptr::null_mut(), handler as *mut (), Ordering::Release, Ordering::Relaxed)
-        .map(|_| ())
-        .map_err(|_| HandlerError::Taken)
+    if take_slot(slot, handler) { Ok(()) } else { Err(HandlerError::Taken) }
 }
 
 /// The handler registered for `vector`, if any.
 fn irq_handler(vector: u8) -> Option<fn()> {
-    let raw = irq_slot(vector)?.load(Ordering::Acquire);
-    // SAFETY: `set_irq_handler` is the only store of a non-null pointer, and
-    // it stores a `fn()` cast to a pointer (same size: both are addresses).
+    slot_handler(irq_slot(vector)?)
+}
+
+/// Store `handler` in an empty handler slot (of [`IRQ_HANDLERS`] or
+/// [`MSI_HANDLERS`]): whether it was empty. Slots are never cleared.
+fn take_slot(slot: &AtomicPtr<()>, handler: fn()) -> bool {
+    slot.compare_exchange(core::ptr::null_mut(), handler as *mut (), Ordering::AcqRel, Ordering::Relaxed).is_ok()
+}
+
+/// The handler in a handler slot, if any.
+fn slot_handler(slot: &AtomicPtr<()>) -> Option<fn()> {
+    let raw = slot.load(Ordering::Acquire);
+    // SAFETY: `take_slot` is the only store of a non-null pointer into a
+    // handler slot, and it stores a `fn()` cast to a pointer (same size:
+    // both are addresses).
     (!raw.is_null()).then(|| unsafe { core::mem::transmute::<*mut (), fn()>(raw) })
 }
 
@@ -356,22 +366,17 @@ pub struct NoMsiVector;
 /// are never freed (M3). Lock-free: each slot is taken by one
 /// compare-and-swap.
 pub fn claim_msi_vector(handler: fn()) -> Result<u8, NoMsiVector> {
-    let free = MSI_HANDLERS.iter().position(|slot| {
-        slot.compare_exchange(core::ptr::null_mut(), handler as *mut (), Ordering::AcqRel, Ordering::Relaxed).is_ok()
-    });
+    let free = MSI_HANDLERS.iter().position(|slot| take_slot(slot, handler));
     free.map(|i| MSI_BASE + i as u8).ok_or(NoMsiVector)
 }
 
 /// The handler claimed for MSI vector `vector`, if any.
 fn msi_handler(vector: u8) -> Option<fn()> {
-    let raw = MSI_HANDLERS.get(usize::from(vector.checked_sub(MSI_BASE)?))?.load(Ordering::Acquire);
-    // SAFETY: `claim_msi_vector` is the only store of a non-null pointer, and
-    // it stores a `fn()` cast to a pointer (same size: both are addresses).
-    (!raw.is_null()).then(|| unsafe { core::mem::transmute::<*mut (), fn()>(raw) })
+    slot_handler(MSI_HANDLERS.get(usize::from(vector.checked_sub(MSI_BASE)?))?)
 }
 
 /// Whether MSI vector `vector` has been claimed (false outside the range).
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests' check
+#[cfg(feature = "ktest")]
 pub fn msi_claimed(vector: u8) -> bool {
     msi_handler(vector).is_some()
 }

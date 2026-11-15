@@ -994,3 +994,36 @@ fn an_msix_entry_encodes_fixed_delivery_to_one_local_apic() {
     assert_eq!(m.entry(false), [0xfeea_b000, 0, 0xef, 0]);
     assert_eq!(Message::fixed(0xff, 0x91).address >> 12 & 0xff, 0xff);
 }
+
+#[test]
+fn an_msix_entry_is_masked_before_its_message_is_written() {
+    use crate::msix::{ENTRY_ADDR_HI, ENTRY_ADDR_LO, ENTRY_DATA, ENTRY_VECTOR_CONTROL, Message, VECTOR_MASKED};
+    let w = Message::fixed(3, 0x91).masked_writes();
+    assert_eq!(w[0], (ENTRY_VECTOR_CONTROL, VECTOR_MASKED), "masked first");
+    assert_eq!(&w[1..], &[(ENTRY_ADDR_LO, 0xfee0_3000), (ENTRY_ADDR_HI, 0), (ENTRY_DATA, 0x91)]);
+}
+
+#[test]
+fn entries_deliver_only_with_msix_enabled_and_the_function_unmasked() {
+    use crate::msix::delivers;
+    assert!(delivers(0x8001));
+    assert!(delivers(0x87ff));
+    assert!(!delivers(0x0001), "not enabled");
+    assert!(!delivers(0xc001), "function masked");
+    assert!(!delivers(0x4000));
+}
+
+#[test]
+fn only_an_msix_capability_is_read_as_one() {
+    use crate::msix::{Capability, MsixProblem};
+    let a = at(0, 0, 3, 0);
+    let mut cs = Fake::default().with(a, virtio_rng_with_msix(1, 1, 0x801));
+    let vendor = Cap { id: cap::id::VENDOR, offset: 0x84 };
+    assert_eq!(Capability::read(&mut cs, a, vendor), Err(MsixProblem::NotMsix(9)));
+    assert_eq!(std::format!("{}", MsixProblem::NotMsix(9)), "capability 0x09 isn't MSI-X");
+}
+
+#[test]
+fn no_vector_is_all_ones() {
+    assert_eq!(virtio::common::NO_VECTOR, 0xffff);
+}

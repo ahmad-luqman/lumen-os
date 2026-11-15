@@ -76,7 +76,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Mouse overruns and failure: 300 moves sent unpaced lose frames QEMU drops when the 32-buffer ring is full (no SYN_DROPPED), and `mouse` then counts at least one overrun (a lower bound: a batch of 30 events or more read after an interrupt), none ignored or dropped; a later clean frame isn't stale; a batch near a full ring may have lost frames from 30 of 32 events (host-tested); a failed tablet's `mouse` header gives every count and why, its row the last position with no pointer, stale and the reason (ktest on a built state: QEMU can't make the device fail)"
+name = "Mouse overruns and failure: 300 moves sent unpaced lose frames QEMU drops when the 32-buffer ring is full (no SYN_DROPPED), and `mouse` then counts at least one overrun (a lower bound: a batch of 30 events or more), none ignored or dropped; a later clean frame isn't stale; a batch near a full ring may have lost frames from 30 of 32 events (host-tested); a failed tablet's `mouse` header gives every count and why, its row the last position with no pointer, stale and the reason (ktest on a built state: QEMU can't make the device fail)"
 milestone = "M3"
 tests = [
     "cargo:lumen-input",
@@ -86,7 +86,7 @@ tests = [
 ]
 
 [[feature]]
-name = "MSI vectors handed out by an allocator (lowest free first, each with its handler, in a table of its own beside the I/O APIC's): a claimed vector arriving through the local APIC runs its handler and is EOI'd, not counted as unexpected"
+name = "MSI vectors handed out by an allocator (lowest free first, each with its handler, in a table of its own beside the I/O APIC's): a claimed vector arriving through the local APIC runs its handler and is EOI'd, not counted as unexpected; the next claim gets the next vector"
 milestone = "M3"
 tests = [
     "ktest:lumen_kernel::interrupts::a_claimed_msi_vector_runs_its_handler",
@@ -94,14 +94,14 @@ tests = [
 ]
 
 [[feature]]
-name = "MSI-X for PCI devices (lumen-pci): the capability's table and pending-bit-array locations (BAR indicator in the low 3 bits, the rest the offset), table size (1 to 2048 entries) and entry offsets; a reserved BAR indicator (6, 7) refused; Message Control enabled with Function Mask cleared, the rest kept, written into the capability's first dword with its id and next pointer as read; an entry's message for fixed delivery of a vector to one local APIC (0xfee00000 with the APIC id in bits 12-19, the vector as data, edge triggered) and its mask bit"
+name = "MSI-X for PCI devices (lumen-pci): the capability's table and pending-bit-array locations (BAR indicator in the low 3 bits, the rest the offset), table size (1 to 2048 entries) and entry offsets; a reserved BAR indicator (6, 7) refused; Message Control enabled with Function Mask cleared, the rest kept, written into the capability's first dword with its id and next pointer as read; an entry's message for fixed delivery of a vector to one local APIC (0xfee00000 with the APIC id in bits 12-19, the vector as data, edge triggered), its mask bit, and its writes in order (masked first, then the message); entries deliver only with Enable set and Function Mask clear; only an MSI-X capability is read as one; NO_VECTOR is 0xffff"
 milestone = "M3"
 tests = [
     "cargo:lumen-pci",
 ]
 
 [[feature]]
-name = "MSI-X for a claimed function (`DeviceResources::msix`): an IDT vector claimed with the handler, table entry 0 programmed masked with a message to the boot CPU's local APIC, MSI-X Enable set with Function Mask clear, INTx-disable set; once per function (a second call, and one after the function was declined and claimed again, is AlreadyAllocated); only its `MsiVector` unmasks (and masks) the entry"
+name = "MSI-X for a claimed function (`DeviceResources::msix`): an IDT vector claimed with the handler, table entry 0 programmed masked with a message to the boot CPU's local APIC, MSI-X Enable set with Function Mask clear, INTx-disable set; once per function (a second call is AlreadyAllocated, and a decline after it is recorded as failed); only its `MsiVector` unmasks (and masks) the entry"
 milestone = "M3"
 tests = [
     "ktest:lumen_kernel::pci::msix::msix_is_programmed_masked_once_per_function",
@@ -109,13 +109,17 @@ tests = [
 ]
 
 [[feature]]
-name = "Interrupts for virtio devices through MSI-X: the transport gets the function's vector at the first queue set up, maps configuration changes and each queue to its table entry (read back) and unmasks it; virtio-rng's vector fires and its handler runs when a request comes back (entry unmasked, MSI-X on, INTx off); rng, the tablet and sound wait for their interrupt instead of polling (their scenarios pass); a device without an MSI-X capability fails its probe (`virtio-rng: failed: MSI-X: no MSI-X capability`, a warning naming the device), no polling fallback; `irqs` lists the vector as `msix <pci address> #0` with a count that goes up with each request, and no MSI vector shows unclaimed"
+name = "Interrupts for virtio devices through MSI-X: the transport gets the function's vector at the first queue set up (a device declined after its transport but before any queue has none), maps configuration changes and each queue to its table entry (`msix_config` and `queue_msix_vector` read back 0) and unmasks it; virtio-rng's vector fires and its handler runs when a request comes back (MSI-X on, INTx off), the tablet's when a QMP move comes in, and sound's periods come back by it with no underrun; a device without an MSI-X capability fails its probe (`virtio-rng: failed: MSI-X: no MSI-X capability`, a warning naming the device), and one that refuses its entry (NO_VECTOR read back, for configuration changes or a queue) fails it saying which (`lspci`), no polling fallback; `irqs` lists each vector as `msix <pci address> #0` with a count that goes up with each request, and no MSI vector shows unclaimed"
 milestone = "M3"
 tests = [
     "ktest:lumen_kernel::interrupts::msix_vector_delivered",
+    "ktest:lumen_kernel::drivers::a_refused_vector_fails_the_probe",
+    "ktest:lumen_kernel::drivers::probing_records_each_outcome",
     "scenario:test_ktest::test_in_kernel_tests_pass",
     "scenario:test_dev::test_a_virtio_rng_without_msix_fails_its_probe",
     "scenario:test_shell::test_irqs_lists_msix",
+    "scenario:test_input::test_a_pointer_move_raises_the_tablets_interrupt",
+    "scenario:test_sound::test_tone_is_captured",
+    "scenario:test_sound::test_a_long_tone_plays_without_underrun",
     "scenario:test_dev::test_random_with_only_virtio_rng",
-    "scenario:test_input::test_mouse_moves_pointer",
 ]

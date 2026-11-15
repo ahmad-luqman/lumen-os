@@ -445,6 +445,28 @@ def test_a_burst_of_moves_counts_overruns(boot):
     assert wait_mouse(m, x="640", y="400").stale == "no"
 
 
+def test_a_pointer_move_raises_the_tablets_interrupt(boot):
+    # The tablet interrupts through MSI-X (#96): its vector, `msix <addr>
+    # #0` in `irqs`, counts up when a QMP move makes the device return an
+    # event buffer (the 1 s status look would drain the ring too, but
+    # raises no interrupt), and no interrupt is reported missing.
+    m = boot("qemutest", devices=Devices(tablet=True))
+    addr = tablet_ready(m)
+    row = re.compile(rf"^  0x[0-9a-f]{{2}}\s+msix {re.escape(addr)} #0\s+(\d+)$", re.MULTILINE)
+
+    def interrupts() -> int:
+        out = run(m, "irqs | where use ~ msix")
+        found = row.search(out)
+        assert found, out
+        return int(found[1])
+
+    before = interrupts()
+    m.move_pointer(320, 200)
+    wait_mouse(m, x="320", y="200")
+    assert interrupts() > before
+    assert "interrupt never came" not in m.output
+
+
 def test_tablet_is_bound_and_the_keyboard_is_not(boot):
     # virtio's keyboard and tablet share a PCI id; the tablet driver takes
     # only the tablet (by its class), so the keyboard is never offered to

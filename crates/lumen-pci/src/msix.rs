@@ -66,6 +66,8 @@ pub struct Capability {
 /// Why an MSI-X capability can't be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MsixProblem {
+    /// The capability given isn't MSI-X: its id.
+    NotMsix(u8),
     /// The table's BAR indicator isn't 0-5 (6 and 7 are reserved).
     TableBir(u8),
     /// The pending bit array's BAR indicator isn't 0-5.
@@ -75,6 +77,7 @@ pub enum MsixProblem {
 impl fmt::Display for MsixProblem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
+            MsixProblem::NotMsix(id) => write!(f, "capability {id:#04x} isn't MSI-X"),
             MsixProblem::TableBir(b) => write!(f, "the MSI-X table's BAR indicator is {b} (reserved)"),
             MsixProblem::PbaBir(b) => write!(f, "the MSI-X pending bit array's BAR indicator is {b} (reserved)"),
         }
@@ -85,6 +88,9 @@ impl Capability {
     /// Read the MSI-X capability `cap` (one `CapList::find(id::MSIX)` gave)
     /// of `addr`.
     pub fn read(cs: &mut impl ConfigSpace, addr: PciAddr, cap: Cap) -> Result<Capability, MsixProblem> {
+        if cap.id != crate::cap::id::MSIX {
+            return Err(MsixProblem::NotMsix(cap.id));
+        }
         let at = u16::from(cap.offset);
         let control = (cs.read(addr, at) >> 16) as u16;
         let table = Location::from_dword(cs.read(addr, at + 4));
@@ -120,6 +126,12 @@ pub const fn enabled(control: u16) -> u16 {
     (control | CONTROL_ENABLE) & !CONTROL_FUNCTION_MASK
 }
 
+/// Whether Message Control as read lets entries deliver: MSI-X Enable set
+/// and Function Mask clear.
+pub const fn delivers(control: u16) -> bool {
+    control & (CONTROL_ENABLE | CONTROL_FUNCTION_MASK) == CONTROL_ENABLE
+}
+
 /// The capability's first dword with Message Control replaced by `control`
 /// (the header's id and next pointer, read-only, as read).
 pub const fn with_control(dword: u32, control: u16) -> u32 {
@@ -146,5 +158,14 @@ impl Message {
     /// masked or not.
     pub const fn entry(&self, masked: bool) -> [u32; 4] {
         [self.address as u32, (self.address >> 32) as u32, self.data, if masked { VECTOR_MASKED } else { 0 }]
+    }
+
+    /// The writes that program an entry with this message, left masked, in
+    /// order (offset in the entry, value): Vector Control masked first, so
+    /// the entry is never live with half a message, then the address and
+    /// the data.
+    pub const fn masked_writes(&self) -> [(u64, u32); 4] {
+        let [lo, hi, data, _] = self.entry(true);
+        [(ENTRY_VECTOR_CONTROL, VECTOR_MASKED), (ENTRY_ADDR_LO, lo), (ENTRY_ADDR_HI, hi), (ENTRY_DATA, data)]
     }
 }
