@@ -565,7 +565,7 @@ fn off_or_diag<T>(what: &'static str, take: impl FnOnce() -> Result<T, CalError>
     })
 }
 
-/// The spin [`now_ns_follows_the_hpet`] checks `now_ns` across, and its 2%
+/// The spin `now_ns_follows_the_hpet` checks `now_ns` across, and its 2%
 /// budget: 1 ms.
 #[cfg(feature = "ktest")]
 const NOW_NS_SPIN_NS: u64 = 50_000_000;
@@ -704,12 +704,15 @@ fn now_ns_against_the_hpet(
 }
 
 /// The local APIC timer's current count read between two HPET reads, placed
-/// at their midpoint (`at` and `width` in HPET ticks). Call with interrupts
-/// off.
+/// at their midpoint (`at` and `width` in HPET ticks). `pause` runs just
+/// before the timer is read and just after (a no-op but in tests). Call with
+/// interrupts off.
 #[cfg(feature = "ktest")]
-fn timer_between_hpet(hpet: &HpetCounter) -> lumen_time::Bracketed<u32> {
+fn timer_between_hpet(hpet: &HpetCounter, mut pause: impl FnMut()) -> lumen_time::Bracketed<u32> {
     let before_ticks = hpet.now();
+    pause();
     let value = apic::timer_current();
+    pause();
     let after_ticks = hpet.now();
     lumen_time::Bracketed::between(before_ticks, value, after_ticks, hpet.mask)
 }
@@ -1132,11 +1135,11 @@ crate::ktest!(
         let mut bracketed = 0;
         for _ in 0..WINDOWS {
             let _off = arch::irq::push_off();
-            let start = timer_between_hpet(&hpet);
+            let start = timer_between_hpet(&hpet, || {});
             while hpet.since(start.at, hpet.now()) < window_ticks {
                 core::hint::spin_loop();
             }
-            let end = timer_between_hpet(&hpet);
+            let end = timer_between_hpet(&hpet, || {});
             widths_ticks[bracketed] = start.width;
             widths_ticks[bracketed + 1] = end.width;
             bracketed += 2;
@@ -1179,6 +1182,57 @@ crate::ktest!(
         crate::ktest::diag(format_args!("timer counts at {} (calibrated {})", Hz(rate), Hz(timer.hz())));
         kassert!(rate.abs_diff(timer.hz()) * 20 <= timer.hz());
         Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_timer_reading_is_placed_at_its_brackets_midpoint() {
+        // A timer reading paused 300 µs before and 300 µs after its count is
+        // read (a 600 µs bracket) is placed at its midpoint, where the timer
+        // was read: from a narrow reference reading, the HPET midpoints and
+        // the timer's count (at its calibrated rate) agree to well under
+        // 150 µs (half the pause). Reading the timer outside its bracket
+        // puts it 300 µs off. A reference over HPET_BRACKET_NS wide, a paused
+        // reading over 600 µs plus that (a natural stall in a pause too), or
+        // the two more than 950 µs apart (the timer may have reloaded twice)
+        // are taken again.
+        use crate::kassert;
+        const PAUSE_NS: u64 = 300_000;
+        const TRIES: usize = 5;
+        let (_, _, initial) = apic::timer_registers();
+        let timer = lapic_timer().ok_or("timer not calibrated")?;
+        let hpet = hpet().ok_or("no HPET")?;
+        let clock = hpet.clock();
+        let mut tried_ns = [(0u64, 0u64); TRIES];
+        for tried in 0..TRIES {
+            let _off = arch::irq::push_off();
+            let reference = timer_between_hpet(&hpet, || {});
+            let paused = timer_between_hpet(&hpet, || spin(PAUSE_NS));
+            let by_hpet_ns = clock.ns(hpet.since(reference.at, paused.at));
+            tried_ns[tried] = (clock.ns(reference.width), clock.ns(paused.width));
+            if tried_ns[tried].0 > HPET_BRACKET_NS
+                || tried_ns[tried].1 > 2 * PAUSE_NS + HPET_BRACKET_NS
+                || by_hpet_ns >= 950_000
+            {
+                continue;
+            }
+            let counted = lumen_time::down_counter_delta(reference.value, paused.value, initial);
+            let by_timer_ns = timer.ns(u64::from(counted));
+            let off_ns = by_hpet_ns.abs_diff(by_timer_ns);
+            crate::ktest::diag(format_args!(
+                "injected pause: {PAUSE_NS} ns either side of the timer read: brackets (reference, paused) {:?} \
+                 ns; {by_hpet_ns} ns by the HPET, {by_timer_ns} ns by the timer: placed {off_ns} ns off, at most \
+                 {} ns allowed",
+                &tried_ns[..=tried],
+                PAUSE_NS / 2,
+            ));
+            kassert!(off_ns * 2 <= PAUSE_NS);
+            return Ok(());
+        }
+        crate::ktest::diag(format_args!(
+            "injected pause: every try had a stalled bracket: (reference, paused) {tried_ns:?} ns"
+        ));
+        Err("every try at a timer placement had a stalled bracket")
     }
 );
 
