@@ -424,7 +424,7 @@ impl BarMapping {
         self.phys
     }
 
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: rng (#97) or #96's MSI-X table
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: #96's MSI-X table
     pub fn virt(&self) -> VirtAddr {
         self.virt
     }

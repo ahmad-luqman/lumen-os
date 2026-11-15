@@ -3,7 +3,8 @@
 //! M6 brings files).
 //!
 //! Scripts see the machine through a few functions ([`FUNCTIONS`]): `cpus()`,
-//! `mem()`, `uptime()`, `trace(n)`, `sleep(ms)`, `print`, `debug`, and
+//! `mem()`, `uptime()`, `trace(n)`, `sleep(ms)`, `beep([hz, ms])` (returns
+//! while it plays; a beep replaces the one before), `print`, `debug`, and
 //! drawing (`draw_pixel`, `draw_rect`, `draw_text`, `clear`) on the
 //! terminal's [`Canvas`], taken on the first draw (`screen_width()` and
 //! `screen_height()` don't take it). A script that drew and ended without
@@ -352,6 +353,7 @@ pub const FUNCTIONS: &[&str] = &[
     "uptime()",
     "trace(n)",
     "sleep(ms)",
+    "beep([hz, ms])",
     "print(x)",
     "debug(x)",
     "draw_pixel(x, y, rgb)",
@@ -653,7 +655,7 @@ fn engine(state: &Rc<State>) -> Engine {
     e.register_fn("trace", trace);
     let s = state.clone();
     e.register_fn("sleep", move |ms: i64| sleep(&s, ms));
-    e.register_fn("beep", || beep(440, 200));
+    e.register_fn("beep", || beep(i64::from(crate::sound::DEFAULT_BEEP_HZ), i64::from(crate::sound::DEFAULT_BEEP_MS)));
     e.register_fn("beep", beep);
 
     let s = state.clone();
@@ -738,15 +740,18 @@ fn sleep(state: &State, ms: i64) -> Result<(), Box<EvalAltResult>> {
 }
 
 /// `beep(hz, ms)` (or `beep()`: 440 Hz for 200 ms): starts the beep and
-/// returns while it plays; an error without a sound device.
+/// returns while it plays (a beep replaces the one playing); an error
+/// without a sound device.
 fn beep(hz: i64, ms: i64) -> Result<(), Box<EvalAltResult>> {
-    let (Ok(hz), Ok(ms)) = (u32::try_from(hz), u32::try_from(ms)) else {
-        return Err(alloc::format!("beep({hz}, {ms}): hz and ms must be 0 or more").into());
+    let max = crate::sound::MAX_BEEP_MS;
+    let Ok(hz) = u32::try_from(hz) else {
+        return Err(format!("beep: {hz} Hz is out of range (0 to {})", u32::MAX).into());
     };
-    if ms > crate::sound::MAX_BEEP_MS {
-        return Err(alloc::format!("beep: {ms} ms is longer than {} ms", crate::sound::MAX_BEEP_MS).into());
-    }
-    crate::sound::beep(hz, ms).map(drop).map_err(|e| alloc::format!("beep: {e}").into())
+    let ms = match u32::try_from(ms) {
+        Ok(ms) if ms <= max => ms,
+        _ => return Err(format!("beep: {ms} ms is out of range (0 to {max})").into()),
+    };
+    crate::sound::beep(hz, ms).map(drop).map_err(|e| format!("beep: {e}").into())
 }
 
 /// A size in bytes, as MiB or KiB when it is a whole number of them.

@@ -203,6 +203,10 @@ class QemuOptions:
     share_dir: Path | None = None
     extra: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        if self.sound_wav and self.host_audio:
+            raise ValueError("sound_wav and host_audio: one virtio-sound device, recorded or heard")
+
 
 # The 9p mount tag the device advertises (a guest driver mounts by it).
 SHARE_TAG = "lumen-share"
@@ -241,25 +245,26 @@ def device_args(o: QemuOptions) -> list[str]:
         args += ["-device", f"virtio-keyboard-pci,id={ids['keyboard']}"]
     if o.virtio_rng:
         args += ["-device", f"virtio-rng-pci,id={ids['rng']}"]
-    if o.sound_wav and o.host_audio:
-        raise ValueError("sound_wav and host_audio: one virtio-sound device, recorded or heard")
+    # The sound device's audiodev (its driver and options): the host's
+    # speakers (`make run SOUND=1`), or a wav file.
+    audiodev = None
     if o.host_audio:
-        args += [
-            "-audiodev", f"{_opt(o.host_audio)},id=lumen-audio",
-            "-device", f"virtio-sound-pci,id={ids['sound']},audiodev=lumen-audio,streams=1",
-        ]  # fmt: skip
-    if o.sound_wav:
+        audiodev = (_opt(o.host_audio), "")
+    elif o.sound_wav:
         # QEMU creates the wav file when it realizes the device. The header's
         # lengths depend on the version: 8.2 (CI) fills them in at exit (an
         # atexit audio_cleanup), 11.1 leaves them at 0 (seen after
         # debug-exit, QMP `quit` and SIGTERM). While QEMU runs the file can
         # be 0 bytes (the header still in stdio's buffer). Readers take the
         # length from the file size, once QEMU has exited.
+        audiodev = ("wav", f",path={_opt(o.sound_wav)}")
+    if audiodev:
         # `streams=1`: the output stream only. The wav backend has no capture
         # side (QEMU warns about the input stream otherwise), and playback is
         # all we need.
+        driver, options = audiodev
         args += [
-            "-audiodev", f"wav,id=lumen-audio,path={_opt(o.sound_wav)}",
+            "-audiodev", f"{driver},id=lumen-audio{options}",
             "-device", f"virtio-sound-pci,id={ids['sound']},audiodev=lumen-audio,streams=1",
         ]  # fmt: skip
     if o.blk_image:

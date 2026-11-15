@@ -1,12 +1,13 @@
 """Sound: virtio-sound, `beep`, `play`, `volume` and `sound` (#99).
 
 Each test boots with virtio-sound recorded through QEMU's wav audiodev
-(`Devices(sound=True)`), plays something from the serial shell, waits until
-`sound`'s records say it has been played, quits QEMU (so the wav is
-complete) and measures what came out with the harness's audio helpers
-(`lumen_harness.audio`, self-tested in `tests/harness/test_audio.py`). The
-synthesis is host-tested (`cargo test -p lumen-synth`); choosing the stream's
-format is a ktest (`lumen_kernel::sound::formats_are_chosen_from_what_the_stream_supports`).
+(`Devices(sound=True)`) unless it is about having none, plays something
+from the serial shell, waits until `sound`'s record says it has been played,
+then quits QEMU (so the wav is complete) and measures what came out with
+the harness's audio helpers (`lumen_harness.audio`, self-tested in
+`tests/harness/test_audio.py`). The synthesis is host-tested (`cargo test
+-p lumen-synth`); the stream's format choice and a failed or stuck device
+are ktests (`lumen_kernel::sound::*`).
 """
 
 import re
@@ -23,13 +24,21 @@ SOUND = Devices(sound=True)
 READY = (
     r"INFO  sound: [0-9a-f:.]+: stream 0: signed 16-bit, (\d) channels?, (\d+) Hz, 20 ms periods\n"
 )
+COLUMNS = ["state", "played", "replaced", "frames", "underruns", "volume"]
 
 
-def shell(boot, devices: Devices = SOUND) -> Machine:
-    m = boot("qemutest", devices=devices)
+def shell(boot, devices: Devices = SOUND, **kwargs) -> Machine:
+    m = boot("qemutest", devices=devices, **kwargs)
     m.expect(SHELLS, 60)
     m.expect(PROMPT, 60)
     return m
+
+
+def rate_of(m: Machine) -> int:
+    """The device's sample rate, from the driver's boot line."""
+    ready = re.search(READY, m.output)
+    assert ready, "no sound line"
+    return int(ready[2])
 
 
 def run(m: Machine, line: str, timeout: float = 10) -> str:
@@ -43,17 +52,15 @@ def run(m: Machine, line: str, timeout: float = 10) -> str:
 
 def sound_row(m: Machine) -> dict[str, str]:
     """`sound`'s one record, by column."""
-    out = run(m, "sound | select state played frames underruns volume")
+    out = run(m, "sound | select " + " ".join(COLUMNS))
     header, row = out.splitlines()
-    names = header.split()
-    assert names == ["state", "played", "frames", "underruns", "volume"], out
-    values = re.split(r"\s{2,}", row.strip())
-    return dict(zip(names, values, strict=True))
+    assert header.split() == COLUMNS, out
+    return dict(zip(COLUMNS, re.split(r"\s{2,}", row.strip()), strict=True))
 
 
 def wait_played(m: Machine, n: int, timeout: float = 30) -> dict[str, str]:
     """Wait until `sound` says `n` sounds have been played and it is idle."""
-    deadline = time.monotonic() + m._scaled(timeout)[0]
+    deadline = time.monotonic() + timeout * m.timeout_scale
     while True:
         row = sound_row(m)
         if int(row["played"]) >= n and row["state"] == "idle":
@@ -78,13 +85,11 @@ def sounding(samples: list[int] | tuple[int, ...], level: int = 200) -> tuple[in
 
 def test_tone_is_captured(boot):
     m = shell(boot)
-    ready = re.search(READY, m.output)
-    assert ready, "no sound line"
+    rate = rate_of(m)
     assert run(m, "beep 440 500") == ""
     row = wait_played(m, 1)
     # Exactly 500 ms of frames went to the device (the last period's
-    # padding isn't counted).
-    rate = int(ready[2])
+    # padding isn't counted), with no underrun.
     assert int(row["frames"]) == rate // 2, row
     assert row["underruns"] == "0", row
     wav = recording(m)
@@ -95,11 +100,38 @@ def test_tone_is_captured(boot):
     assert 0.45 <= (last - first) / wav.rate <= 0.55, (first, last, wav.rate)
 
 
+def test_beep_returns_while_it_plays(boot):
+    m = shell(boot)
+    assert run(m, "beep 440 3000") == ""
+    assert sound_row(m)["state"] == "playing"
+
+
+def test_a_padded_last_period_counts_only_the_sound(boot):
+    # 510 ms is 25.5 periods: the last one is half silence.
+    m = shell(boot)
+    rate = rate_of(m)
+    assert run(m, "beep 440 510") == ""
+    row = wait_played(m, 1)
+    assert int(row["frames"]) == rate * 510 // 1000, row
+
+
+def test_a_long_tone_plays_without_underrun(boot):
+    # 500 periods: none found the queue empty, and all were taken back (a
+    # run leaking per period would exhaust the run table long before).
+    m = shell(boot)
+    rate = rate_of(m)
+    assert run(m, "beep 440 10000") == ""
+    row = wait_played(m, 1, timeout=60)
+    assert (row["frames"], row["underruns"]) == (str(rate * 10), "0"), row
+
+
 def test_melody_notes_in_order(boot):
     m = shell(boot)
-    # Blocks until the melody has played: the prompt comes back after it.
+    # Blocks until the melody has played: once the prompt is back, `sound`
+    # says so without waiting.
     assert run(m, "play t=120 w=sine C5/4 E5/4 G5/4 C6/4", timeout=30) == ""
-    wait_played(m, 1)
+    row = sound_row(m)
+    assert (row["state"], row["played"]) == ("idle", "1"), row
     wav = recording(m)
     samples = wav.first_channel
     first, last = sounding(samples)
@@ -115,16 +147,48 @@ def test_melody_notes_in_order(boot):
     assert 1.9 <= (last - first) / wav.rate <= 2.1, (first, last)
 
 
-def test_play_stops_on_q(boot):
+@pytest.mark.parametrize("key", ["q", "\x03"], ids=["q", "ctrl-c"])
+def test_play_stops_on_a_key(boot, key):
     m = shell(boot)
+    rate = rate_of(m)
     m.send_line("play t=60 C4/1 C4/1 C4/1 C4/1")
     m.expect(r"play t=60 C4/1 C4/1 C4/1 C4/1\n", 10)
     time.sleep(1)
-    m.send("q")
+    m.send(key)
     m.expect(r"play: stopped\n" + PROMPT, 10)
     row = wait_played(m, 1)
-    # Far less than the melody's 16 s.
-    assert int(row["frames"]) < 8 * 48_000, row
+    # Far less than the melody's 16 s: about a second, plus the fade and the
+    # periods already queued.
+    assert int(row["frames"]) < 3 * rate, row
+
+
+def test_a_newer_sound_replaces_the_one_playing(boot):
+    m = shell(boot)
+    rate = rate_of(m)
+    assert run(m, "beep 440 5000") == ""
+    time.sleep(0.5)
+    assert run(m, "beep 660 300") == ""
+    row = wait_played(m, 1)
+    assert (row["played"], row["replaced"]) == ("1", "1"), row
+    assert int(row["frames"]) < 2 * rate, row
+    # The 440 Hz tone, then the 660 Hz one.
+    wav = recording(m)
+    windows = audio.window_frequencies(wav.first_channel, wav.rate, 0.1)
+    pitches = [f for f in windows if f is not None]
+    assert pitches, windows
+    assert abs(pitches[0] - 440) <= 4.4 and abs(pitches[-1] - 660) <= 6.6, pitches
+
+
+def test_play_says_when_a_newer_sound_cut_it_off(boot):
+    # The serial shell plays a melody; the screen's shell beeps meanwhile.
+    m = shell(boot)
+    m.send_line("play t=60 C4/1 C4/1")
+    m.expect(r"play t=60 C4/1 C4/1\n", 10)
+    time.sleep(1)
+    m.type_text("beep 880 100\n")
+    m.expect(r"play: interrupted by a newer sound\n" + PROMPT, 10)
+    row = wait_played(m, 1)
+    assert (row["played"], row["replaced"]) == ("1", "1"), row
 
 
 def test_volume_and_beep_from_rhai(boot):
@@ -136,15 +200,29 @@ def test_volume_and_beep_from_rhai(boot):
     assert run(m, "volume 100") == "volume: 100%\n"
     assert run(m, "beep 440 300") == ""
     wait_played(m, 1)
-    assert run(m, "volume 25") == "volume: 25%\n"
+    assert run(m, "volume 25%") == "volume: 25%\n"
     assert run(m, 'rhai -e "beep(660, 300)"') == ""
     row = wait_played(m, 2)
     assert row["volume"] == "25%", row
-    assert run(m, "volume 101") == "usage: volume [0-100]\n"
+    assert run(m, "volume 101").startswith("usage: volume [percent]")
     wav = recording(m)
     samples = wav.first_channel
     loud = audio.tone_amplitude(samples, wav.rate, 440)
     quiet = audio.tone_amplitude(samples, wav.rate, 660)
+    assert 3.0 <= loud / quiet <= 5.0, (loud, quiet)
+
+
+def test_play_honours_the_volume(boot):
+    m = shell(boot)
+    run(m, "volume 100")
+    assert run(m, "play w=square A4/4", timeout=30) == ""
+    run(m, "volume 25")
+    assert run(m, "play w=square E5/4", timeout=30) == ""
+    wait_played(m, 2)
+    wav = recording(m)
+    samples = wav.first_channel
+    loud = audio.tone_amplitude(samples, wav.rate, 440)
+    quiet = audio.tone_amplitude(samples, wav.rate, 659.26)
     assert 3.0 <= loud / quiet <= 5.0, (loud, quiet)
 
 
@@ -155,10 +233,12 @@ def test_lspci_shows_sound_bound(boot):
     out = run(m, "sound")
     assert re.fullmatch(
         r"sound: virtio sound at \S+, stream 0: signed 16-bit, \d channels?, \d+ Hz, 20 ms periods\n"
-        r"  state\s+played\s+frames\s+underruns\s+volume\n"
-        r"  idle\s+0\s+0\s+0\s+50%\n",
+        r"  state\s+played\s+replaced\s+frames\s+underruns\s+volume\n"
+        r"  idle\s+0\s+0\s+0\s+0\s+50%\n",
         out,
     ), out
+    # Its record filters like the others.
+    assert run(m, "sound | where state = idle | count") == "1\n"
     # (The crate itself warns that it got no jack or channel map infos:
     # QEMU's device has none.)
     assert "WARN  sound" not in m.output and "WARN  drivers" not in m.output
@@ -169,21 +249,17 @@ def test_a_second_sound_device_is_declined(boot, tmp_path):
     # bound, the second declined before its transport is touched, and a
     # beep plays on the first (recorded in `wav_path`).
     second = tmp_path / "second.wav"
-    m = boot(
-        "qemutest",
-        devices=SOUND,
+    m = shell(
+        boot,
         extra=[
             "-audiodev", f"wav,id=lumen-audio2,path={second}",
             "-device", "virtio-sound-pci,id=lumen-sound2,audiodev=lumen-audio2,streams=1",
         ],
     )  # fmt: skip
-    m.expect(SHELLS, 60)
-    m.expect(PROMPT, 60)
     out = run(m, "lspci | where name = 'virtio sound' | select driver")
     assert out == "  driver\n  sound: bound\n  no driver (sound declined it)\n", out
-    assert re.search(
-        r"INFO  sound: \S+: another sound device is bound; Lumen plays on one\n", m.output
-    )
+    declined = r"INFO  sound: \S+: another sound device is bound; Lumen plays on one\n"
+    assert re.search(declined, m.output)
     assert len(re.findall(READY, m.output)) == 1
     assert run(m, "beep 440 300") == ""
     wait_played(m, 1)
@@ -201,7 +277,7 @@ def test_no_sound_device_message(boot):
     assert run(m, 'rhai -e "beep(440, 100)"') == (
         "rhai: Runtime error: beep: no sound device (line 1, position 1)\n"
     )
-    # Bad arguments are refused before the device is looked for.
+    # Usage errors are refused first.
     assert run(m, "beep 440 60001").startswith("usage: beep")
     assert run(m, "play").startswith("usage: play")
 
@@ -220,3 +296,4 @@ def test_no_sound_device_message(boot):
 def test_bad_sounds_are_refused(boot, line, said):
     m = shell(boot)
     assert run(m, line) == said
+    assert sound_row(m)["played"] == "0"

@@ -131,7 +131,7 @@ def test_host_audio_plays_through_the_host():
         "-device", "virtio-sound-pci,id=lumen-sound,audiodev=lumen-audio,streams=1",
     ]  # fmt: skip
     with pytest.raises(ValueError, match="one virtio-sound device"):
-        device_args(opts(host_audio="pa", sound_wav=Path("w.wav")))
+        opts(host_audio="pa", sound_wav=Path("w.wav"))
     assert qemu.host_audio_driver("darwin", {}) == "coreaudio"
     assert qemu.host_audio_driver("linux", {}) == "pa"
     assert qemu.host_audio_driver("linux", {"LUMEN_AUDIO": "alsa"}) == "alsa"

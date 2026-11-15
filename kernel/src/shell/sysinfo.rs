@@ -76,13 +76,17 @@ pub const RECORDS: [(&str, MakeTable); 6] = [
 ];
 
 /// A line for the console when `name`'s records come with a caveat the
-/// table can't carry: `lspci`'s, when PCI devices are missing.
+/// table can't carry: `lspci`'s when PCI devices are missing, `sound`'s
+/// when there is no sound device.
 pub fn records_note(name: &str) -> Option<String> {
-    if name == "sound" {
-        return crate::sound::records_note();
+    match name {
+        "lspci" => {
+            let status = crate::pci::status();
+            (!status.is_clean()).then(|| alloc::format!("lspci: {}", status.note()))
+        }
+        "sound" => crate::sound::records_note(),
+        _ => None,
     }
-    let status = crate::pci::status();
-    (name == "lspci" && !status.is_clean()).then(|| alloc::format!("lspci: {}", status.note()))
 }
 
 /// The records `name` gives in a pipeline, if it is one of [`RECORDS`].

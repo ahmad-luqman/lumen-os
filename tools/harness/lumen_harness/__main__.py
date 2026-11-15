@@ -26,7 +26,14 @@ def cmd_run(a: argparse.Namespace) -> int:
     args = qemu_args(opts)
     print("+", " ".join(args), file=sys.stderr)
     print("(serial is attached here; Ctrl-A x quits QEMU)", file=sys.stderr)
-    return subprocess.call(args)
+    rc = subprocess.call(args)
+    if rc != 0 and a.sound:
+        print(
+            f"(QEMU exited with {rc}; with SOUND=1 its audio driver may be missing: "
+            "LUMEN_AUDIO=<driver> picks another, `qemu-system-x86_64 -audiodev help` lists them)",
+            file=sys.stderr,
+        )
+    return rc
 
 
 def gdb_binary() -> str:

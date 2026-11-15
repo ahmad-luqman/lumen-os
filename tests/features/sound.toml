@@ -29,40 +29,47 @@ tests = [
 ]
 
 [[feature]]
-name = "virtio-sound driver: binds QEMU's sound device (`lspci` shows `sound: bound`) and picks its first output stream's format (signed 16-bit, stereo else mono, 44.1 kHz else 48 kHz else a lower then a higher rate), refusing a stream without 16-bit samples, without 1 or 2 channels or without a rate it plays, saying which; `sound` shows the device, its format and its record (state, sounds played, frames, underruns, volume), which also filters in a pipeline; a second sound device is declined (`no driver (sound declined it)`: the player is one) while the first plays"
+name = "virtio-sound driver: binds QEMU's sound device (`lspci` shows `sound: bound`) and picks its first output stream's format (signed 16-bit, stereo else mono, 44.1 kHz else 48 kHz else a lower then a higher rate), refusing a stream without 16-bit samples, without 1 or 2 channels or without a rate it plays, saying which (`unusable device: its first output stream lacks ...`); `sound` shows the device, its format and its record (state, sounds played and replaced, frames, underruns, volume), which `where` filters in a pipeline; a second sound device is declined (`no driver (sound declined it)`: the player is one), and a beep still plays on the first; a failed device (and one stuck in a control request) refuses sounds with the reason, in `sound`'s state too, and a source made at another rate is refused"
 milestone = "M3"
 tests = [
     "scenario:test_sound::test_lspci_shows_sound_bound",
     "scenario:test_sound::test_a_second_sound_device_is_declined",
     "ktest:lumen_kernel::sound::formats_are_chosen_from_what_the_stream_supports",
     "ktest:lumen_kernel::sound::the_record_fits_its_columns",
+    "ktest:lumen_kernel::sound::a_failed_or_stuck_device_refuses_sounds",
 ]
 
 [[feature]]
-name = "`beep 440 500` plays a 440 Hz tone (within 1%) lasting 500 ms (within 10%) into QEMU's wav audiodev, and returns while it plays; exactly the tone's frames are handed to the device (its last period padded with silence), with no underrun"
+name = "`beep 440 500` plays a 440 Hz tone (within 1%) lasting 500 ms (within 10%) into QEMU's wav audiodev, and returns while it plays (`sound` says `playing` right after); exactly the tone's frames are handed to the device, also when its last period is padded with silence (510 ms), with no underrun reported, also over a 10 s tone (500 periods)"
 milestone = "M3"
 tests = [
     "scenario:test_sound::test_tone_is_captured",
+    "scenario:test_sound::test_beep_returns_while_it_plays",
+    "scenario:test_sound::test_a_padded_last_period_counts_only_the_sound",
+    "scenario:test_sound::test_a_long_tone_plays_without_underrun",
 ]
 
 [[feature]]
-name = "`play` plays a melody's notes in order at their pitch (within 1%) and tempo (four quarter notes at 120 in 2 s, within 5%), returning when it has played; `q` stops it early (`play: stopped`); a melody that doesn't parse or a frequency the sample rate can't carry is refused with the reason before anything plays"
+name = "`play` plays a melody's notes in order at their pitch (within 1%) and tempo (four quarter notes at 120 in 2 s, within 5%), returning once it has played (`sound` idle with it counted); `q` or Ctrl-C stops it within about a second plus the queued periods (`play: stopped`); a newer sound replaces the one playing (440 Hz then 660 Hz in the recording; counted as replaced) and a `play` cut off says `play: interrupted by a newer sound`; a melody that doesn't parse, or a `beep` the sample rate can't carry, is refused with the reason and nothing plays"
 milestone = "M3"
 tests = [
     "scenario:test_sound::test_melody_notes_in_order",
-    "scenario:test_sound::test_play_stops_on_q",
+    "scenario:test_sound::test_play_stops_on_a_key[*]",
+    "scenario:test_sound::test_a_newer_sound_replaces_the_one_playing",
+    "scenario:test_sound::test_play_says_when_a_newer_sound_cut_it_off",
     "scenario:test_sound::test_bad_sounds_are_refused[*]",
 ]
 
 [[feature]]
-name = "`volume` shows and sets the volume new sounds get (0-100%, more refused): a beep at 25% is about a quarter as loud as one at 100%; `beep(hz, ms)` plays from a rhai script"
+name = "`volume` shows and sets the volume new sounds get (0-100, with or without `%`; more refused): a beep, or a melody's note, at 25% is about a quarter as loud as at 100%; `beep(hz, ms)` plays from a rhai script"
 milestone = "M3"
 tests = [
     "scenario:test_sound::test_volume_and_beep_from_rhai",
+    "scenario:test_sound::test_play_honours_the_volume",
 ]
 
 [[feature]]
-name = "Without a sound device, `beep`, `play`, `sound` (also as records: none, with a note) and rhai's `beep` say `no sound device`; bad arguments are refused first"
+name = "Without a sound device, `beep`, `play`, `sound` (also as records: none, with a note) and rhai's `beep` say `no sound device`; usage errors are refused first"
 milestone = "M3"
 tests = [
     "scenario:test_sound::test_no_sound_device_message",

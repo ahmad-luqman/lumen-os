@@ -58,7 +58,9 @@
 //!   `VirtIORng::request_entropy` and sound's control requests spin
 //!   unbounded in the crate (#97 drives its own queue; #99's control
 //!   requests run in its probe and on its own thread around each sound,
-//!   outside the bounded waits for periods); `PciTransport`'s `Drop` spins until the status
+//!   outside the bounded waits for periods; the crate's `pcm_xfer_ok`
+//!   doesn't read a period's status reply, so a period the device refused
+//!   counts as played); `PciTransport`'s `Drop` spins until the status
 //!   reads 0, so the [`VirtioTransport`]'s `Drop` waits a bounded time
 //!   first and, for a device that doesn't reset, logs it, turns its bus
 //!   mastering off and leaks the `PciTransport` instead. [`transport`] must
@@ -79,8 +81,8 @@
 //! Locks: the probe lock, then the probe scope or ECAM (each taken last);
 //! the run table before the probe owner and the frame allocator.
 
-// The first driver on this adapter is rng (#97): until then only the ktests
-// and `probe_all`'s bookkeeping use it.
+// Parts only the ktests use so far (the first driver, sound (#99), uses the
+// rest).
 #![cfg_attr(not(feature = "ktest"), allow(dead_code))]
 
 use alloc::string::String;
@@ -404,7 +406,6 @@ pub enum ProbeError {
     /// `PciTransport::new` refused the device.
     Transport(virtio_drivers::transport::pci::VirtioPciError),
     /// The device driver's setup failed.
-    #[cfg_attr(feature = "ktest", allow(dead_code))] // first user: rng (#97)
     Device(virtio_drivers::Error),
     /// The device status after setup isn't `FEATURES_OK` and `DRIVER_OK`
     /// (or shows `DEVICE_NEEDS_RESET` or `FAILED`): the raw byte.
@@ -415,9 +416,11 @@ pub enum ProbeError {
     /// share an id, told apart only by their configuration): `probe_all`
     /// frees the function and offers it to the next driver row.
     NotMine,
-    /// The device offers nothing this driver can use (sound: no output
-    /// stream, or none taking 16-bit samples): why.
-    Unsupported(String),
+    /// The device can't be used by this driver: its configuration or
+    /// behaviour.
+    Unusable(String),
+    /// The driver's owner thread couldn't be started.
+    Thread(crate::sched::SpawnError),
 }
 
 impl fmt::Display for ProbeError {
@@ -431,7 +434,8 @@ impl fmt::Display for ProbeError {
             }
             ProbeError::Wait(e) => write!(f, "{e}"),
             ProbeError::NotMine => f.write_str("not this driver's device"),
-            ProbeError::Unsupported(why) => write!(f, "unsupported device: {why}"),
+            ProbeError::Unusable(why) => write!(f, "unusable device: {why}"),
+            ProbeError::Thread(e) => write!(f, "no thread for the driver: {e}"),
         }
     }
 }
@@ -1123,6 +1127,19 @@ crate::ktest!(
             Ok(())
         );
         kassert_eq!(polls, 3);
+        // `sleep_until` gives up the same way, sleeping between looks: a
+        // 20 ms wait with 5 ms pauses looks a handful of times, not
+        // thousands.
+        let (t0, mut looks) = (crate::time::now_ns(), 0);
+        let Err(WaitError::Timeout { waited_ns, status: 0x01 }) = status.sleep_until(20_000_000, 5_000_000, || {
+            looks += 1;
+            false
+        }) else {
+            return Err("no timeout sleeping");
+        };
+        let took = crate::time::now_ns() - t0;
+        kassert!(waited_ns >= 20_000_000 && (20_000_000..1_000_000_000).contains(&took));
+        kassert!((2..=10).contains(&looks));
         kassert_eq!(status.wait_until(1_000_000, || true), Ok(()));
         // `ready` is asked once more at the deadline.
         let t1 = crate::time::now_ns();

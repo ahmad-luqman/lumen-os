@@ -190,8 +190,8 @@ def test_lspci_shows_no_driver(boot):
     # the other virtio ones included, shows "no driver".
     m = shell(boot, devices=Devices.every())
     rows = lspci_rows(m)
-    drivers = {row[3]: row[4] for row in rows.values() if row[3] == "virtio sound"}
-    assert drivers == {"virtio sound": "sound: bound"}, rows
+    drivers = [row[4] for row in rows.values() if row[3] == "virtio sound"]
+    assert drivers == ["sound: bound"], rows
     others = {row[4] for row in rows.values() if row[3] != "virtio sound"}
     assert others == {"no driver"}, rows
     assert "INFO  drivers: 1 bound, 0 failed, 0 declined, 0 not probed (1 driver row)\n" in m.output
