@@ -81,6 +81,32 @@ pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
     (r.eax, r.ebx, r.ecx, r.edx)
 }
 
+/// Proof that the CPU [`Rdrand::detect`] ran on has RDRAND (`cpuid` leaf 1,
+/// ECX bit 30): only `detect` makes one, so [`Rdrand::try_once`] never runs
+/// the instruction on a machine without it (that would be #UD, a crash
+/// report). Not tied to one CPU: Lumen takes every CPU of a machine to have
+/// the same features (QEMU's do), so a token is used on any of them.
+#[derive(Clone, Copy, Debug)]
+pub struct Rdrand(());
+
+impl Rdrand {
+    /// `Some` if the CPU this runs on has RDRAND.
+    pub fn detect() -> Option<Rdrand> {
+        (cpuid(1).2 & (1 << 30) != 0).then_some(Rdrand(()))
+    }
+
+    /// One RDRAND attempt: `None` when the CPU had no random number ready
+    /// (the caller retries: `lumen_rand::retry`).
+    pub fn try_once(self) -> Option<u64> {
+        let v: u64;
+        let ok: u8;
+        // SAFETY: RDRAND only writes a register and the flags (clobbered:
+        // no `preserves_flags`); the token proves the CPU has it.
+        unsafe { asm!("rdrand {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nomem, nostack)) };
+        (ok != 0).then_some(v)
+    }
+}
+
 /// This CPU's APIC id, as the MADT lists it: the 32-bit x2APIC id (`cpuid`
 /// leaf 0xB) where the CPU reports one, else the 8-bit initial APIC id
 /// (leaf 1).

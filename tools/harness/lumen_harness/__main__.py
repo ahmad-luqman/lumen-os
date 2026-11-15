@@ -21,6 +21,8 @@ def cmd_run(a: argparse.Namespace) -> int:
         serial="mon:stdio",  # Ctrl-A c reaches the QEMU monitor
         monitor=None,
         log_file=BUILD_DIR / "run/qemu.log",
+        # So `random` works (QEMU's default CPU has no RDRAND).
+        virtio_rng=True,
     )
     args = qemu_args(opts)
     print("+", " ".join(args), file=sys.stderr)

@@ -3,6 +3,7 @@ fragment, what a `Machine` sets up for them (files, forwarded ports, the
 retry when a port is taken, a graceful quit with sound), the checks on
 `Devices`, and a default command line that doesn't change at all."""
 
+import argparse
 import dataclasses
 import socket
 import subprocess
@@ -11,6 +12,7 @@ import time
 from pathlib import Path
 
 import pytest
+from lumen_harness import __main__ as cli
 from lumen_harness import qemu
 from lumen_harness.qemu import (
     HOSTFWD_FAILED,
@@ -145,6 +147,10 @@ def test_devices_come_before_extra_args():
         (Devices(keyboard=True), ["-device", "virtio-keyboard-pci,id=lumen-keyboard"]),
         (Devices(rng=True), ["-device", "virtio-rng-pci,id=lumen-rng"]),
         (
+            Devices(rng_rate=(64, 20000)),
+            ["-device", "virtio-rng-pci,id=lumen-rng,max-bytes=64,period=20000"],
+        ),
+        (
             Devices(sound=True),
             [
                 "-audiodev", "wav,id=lumen-audio,path={art}/audio.wav",
@@ -180,7 +186,7 @@ def test_devices_come_before_extra_args():
             ],
         ),
     ],
-    ids=["tablet", "keyboard", "rng", "sound", "blk_mib", "blk_image", "net", "share"],
+    ids=["tablet", "keyboard", "rng", "rng_rate", "sound", "blk_mib", "blk_image", "net", "share"],
 )  # fmt: skip
 def test_one_device_attaches_exactly_its_own(tmp_path, devices, expected):
     m = Machine(Path("x.iso"), tmp_path, devices=devices)
@@ -191,7 +197,9 @@ def test_one_device_attaches_exactly_its_own(tmp_path, devices, expected):
 def test_every_turns_every_device_on():
     every = Devices.every()
     for f in dataclasses.fields(Devices):
-        if f.name == "blk_image":  # the alternative to blk_mib, which is on
+        # blk_image: the alternative to blk_mib, which is on; rng_rate: a
+        # limit on rng, which is on unlimited.
+        if f.name in ("blk_image", "rng_rate"):
             continue
         assert getattr(every, f.name) != f.default, f.name
 
@@ -209,6 +217,10 @@ def test_every_turns_every_device_on():
         {"forward": (65536,)},
         {"forward": ("80",)},
         {"forward": (True,)},
+        {"rng_rate": (0, 1000)},
+        {"rng_rate": (64,)},
+        {"rng_rate": (64, -1)},
+        {"rng_rate": (64, 1.5)},
     ],
     ids=repr,
 )
@@ -518,3 +530,20 @@ def test_close_kills_without_sound(tmp_path):
     m.proc, m._qmp = proc, qmp  # type: ignore[assignment]
     m.close()
     assert qmp.sent == [] and proc.returncode == -9
+
+
+def test_machine_passes_the_rng_rate_on(tmp_path):
+    o = Machine(Path("x.iso"), tmp_path, devices=Devices(rng_rate=[64, 20000])).options(
+        Path("v.fd")
+    )  # type: ignore[arg-type]
+    assert o.virtio_rng_rate == (64, 20000) and not o.virtio_rng
+
+
+def test_make_run_attaches_virtio_rng(tmp_path, monkeypatch):
+    # So `random` works in `make run` (the default CPU has no RDRAND).
+    ran: list[list[str]] = []
+    monkeypatch.setattr(cli, "BUILD_DIR", tmp_path)
+    monkeypatch.setattr(cli, "fresh_vars", lambda dest: tmp_path / "vars.fd")
+    monkeypatch.setattr(cli.subprocess, "call", lambda args: ran.append(args) or 0)
+    assert cli.cmd_run(argparse.Namespace(iso=tmp_path / "x.iso", headless=True)) == 0
+    assert "virtio-rng-pci,id=lumen-rng" in ran[0]

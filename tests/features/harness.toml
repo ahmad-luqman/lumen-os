@@ -136,3 +136,14 @@ tests = [
     "scenario:test_pci::test_boots_with_every_virtio_device",
     "scenario:test_pci::test_a_taken_host_port_is_picked_again",
 ]
+
+[[feature]]
+name = "virtio-rng's rate limit as a device option (`Devices(rng_rate=(max_bytes, period_ms))`: QEMU's `max-bytes` and `period`, implying virtio-rng, both above 0, refused otherwise), passed from `Machine` to QEMU; `make run` attaches virtio-rng"
+milestone = "M3"
+tests = [
+    "harness:test_devices::test_one_device_attaches_exactly_its_own[rng_rate]",
+    "harness:test_devices::test_machine_passes_the_rng_rate_on",
+    "harness:test_devices::test_make_run_attaches_virtio_rng",
+    "harness:test_devices::test_devices_reject_bad_values*",
+    "scenario:test_dev::test_a_virtio_rng_that_stops_answering_is_dropped[alone]",
+]

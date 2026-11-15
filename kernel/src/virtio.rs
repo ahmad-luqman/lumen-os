@@ -29,7 +29,9 @@
 //!   dropped are never unshared (`VirtQueue` has no `Drop` that does), so a
 //!   probe failing partway leaks frames and table entries
 //!   (`drivers::probe_all` reports the runs that probe attempt left, which
-//!   includes any another thread handed out meanwhile: none at boot).
+//!   includes any another thread handed out meanwhile: none at boot), and
+//!   so does a driver dropping a device with a buffer still posted (rng
+//!   after a request that gave up: it reports the runs it leaked).
 //! - **Drop order.** DMA memory must not be freed under a live device:
 //!   reset the transport before any queue is dropped. A driver keeps its
 //!   queues in a struct field declared after the transport (fields drop in
@@ -78,10 +80,11 @@
 //! Locks: the probe lock, then the probe scope or ECAM (each taken last);
 //! the run table before the probe owner and the frame allocator.
 
-// The first driver on this adapter is rng (#97): until then only the ktests
-// and `probe_all`'s bookkeeping use it.
+// Parts of the adapter (run counts, the status bits) are used only by the
+// ktests until more drivers than rng (#97) use them.
 #![cfg_attr(not(feature = "ktest"), allow(dead_code))]
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 use core::mem::ManuallyDrop;
@@ -402,7 +405,6 @@ pub enum ProbeError {
     /// `PciTransport::new` refused the device.
     Transport(virtio_drivers::transport::pci::VirtioPciError),
     /// The device driver's setup failed.
-    #[cfg_attr(feature = "ktest", allow(dead_code))] // first user: rng (#97)
     Device(virtio_drivers::Error),
     /// The device status after setup isn't `FEATURES_OK` and `DRIVER_OK`
     /// (or shows `DEVICE_NEEDS_RESET` or `FAILED`): the raw byte.
@@ -410,9 +412,12 @@ pub enum ProbeError {
     /// A bounded wait gave up.
     Wait(WaitError),
     /// Not this driver's device after all (virtio's keyboard and tablet
-    /// share an id, told apart only by their configuration): `probe_all`
-    /// frees the function and offers it to the next driver row.
+    /// share an id, told apart only by their configuration), or one the
+    /// driver doesn't take (rng: a second device): `probe_all` frees the
+    /// function and offers it to the next driver row.
     NotMine,
+    /// The device can't be used by this driver: its configuration or behaviour.
+    Unusable(String),
 }
 
 impl fmt::Display for ProbeError {
@@ -426,6 +431,7 @@ impl fmt::Display for ProbeError {
             }
             ProbeError::Wait(e) => write!(f, "{e}"),
             ProbeError::NotMine => f.write_str("not this driver's device"),
+            ProbeError::Unusable(why) => write!(f, "unusable device: {why}"),
         }
     }
 }
