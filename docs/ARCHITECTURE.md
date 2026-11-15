@@ -139,9 +139,11 @@ tests (for example `lumen-elf`, the symbol-table reader).
    each`, section 6, "Terminal"; log
    lines before it are on serial only), the PS/2 keyboard (`INFO  kbd: PS/2 keyboard
    on ISA IRQ 1 ...`, section 6, "Keyboard"), the drivers (`drivers::probe_all`:
-   each PCI function offered to the driver table, `INFO  drivers: 0 bound, 0
-   failed, 0 not probed (0 driver rows)` until #97, section 7), then
-   `boot complete`, then the boot timeline (below).
+   each PCI function offered to the driver table, `INFO  drivers: <n>
+   bound, ... (<rows> driver rows)`, section 7), the randomness sources
+   (`INFO  rng: sources: RDRAND, virtio-rng`, or `INFO  rng: no
+   randomness source ...`: section 7, "Randomness"), then `boot complete`, then the boot timeline
+   (below).
 7. Either the in-kernel test runner (`--features ktest`) or the shells
    (`shell::run`, section 6, "Shell"): the screen's in a thread of its own,
    then the serial one on the `main` thread (`INFO  shell: shells on serial
@@ -1439,7 +1441,8 @@ section 2).
 
 PCI discovery (#94), claiming and the virtio adapter (#95) are built; MSI-X
 is planned (#96), with the tests it lists. The first drivers (#97-#99) add
-their rows to the driver table.
+their rows to the driver table: virtio-rng (#97) is built ("Randomness",
+below).
 
 M3 lays the layer drivers stand on: finding PCI devices (#94), handing a
 driver exactly its device's resources and running `virtio-drivers` on top
@@ -1561,7 +1564,7 @@ pub struct Driver {
 ```
 
 - One static table, `drivers::DRIVERS`, one row per driver (each driver's
-  issue adds its row; empty until #97). `drivers::probe_all` runs once
+  issue adds its row: virtio-rng first, #97). `drivers::probe_all` runs once
   (guarded) at the end of boot, after the scheduler and the clocks (a
   driver may wait or start a thread) and before the shells, and is the
   only caller of `pci::claim(addr, driver) -> Result<DeviceResources,
@@ -1637,7 +1640,8 @@ pub struct Driver {
   `add_notify_wait_pop`, an unbounded spin. So (planned with those
   drivers):
   - rng (#97) drives its own `virtio_drivers::queue::VirtQueue` (public:
-    `add`, `pop_used`) over `VirtioTransport`, with a bounded wait;
+    `add`, `pop_used`) over `VirtioTransport`, with a bounded wait
+    ("Randomness", below);
   - sound's (#99) control path is a known unbounded wait, done once at
     setup, outside the playback path.
   `PciTransport`'s `Drop` spins until the device status reads 0, so
@@ -1811,9 +1815,9 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
     run, copies `DeviceToDriver` data back and frees it; a run it can't
     find or free panics with the address, length and what is recorded.
     `share` has no error path: out of frames or table entries it panics,
-    with the size and the runs outstanding. Caller-sized buffers
-    (`rng::fill`, #97) go to the device in chunks of at most a page, so each
-    bounce is one frame.
+    with the size and the runs outstanding. Caller-sized buffers (a
+    virtio-rng request, #97) go to the device in chunks of at most a page,
+    so each bounce is one frame.
   - The cost: an allocation and a copy per buffer, fine for rng, input and
     sound; a fast path (no bounce for a buffer within one page or in the
     HHDM) can come with networking (M7) if profiling asks for it. Each
@@ -1827,6 +1831,44 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
   allows, as above); event devices (the tablet) are polled from their
   thread. Their API doesn't change when interrupts arrive: the handler
   wakes the driver's `WaitQueue` instead.
+
+### Randomness (#97)
+
+`rng::fill(&mut [u8]) -> Result<(), NoSource>` (and `rng::below(n)`,
+unbiased) hands out bytes from a ChaCha20 pool (`lumen-rand`, host-tested
+against RFC 8439's vectors) fed by two sources:
+
+- **RDRAND**, when CPUID leaf 1 says so (QEMU's default `qemu64` has none;
+  `-cpu max` has it). Each 64-bit draw is retried up to 10 times (a failure
+  means "drained for now", never "gone"); a draw that still fails leaves
+  RDRAND out of that call only. At boot a CPU whose RDRAND returns one value
+  8 times running isn't used. The instruction itself is in
+  `arch::x86_64::cpu` (`has_rdrand`, `rdrand`), behind the HAL boundary.
+- **virtio-rng** (`DRIVERS` row `virtio-rng`, virtio device type 4):
+  negotiates only `VERSION_1` (no indirect descriptors, no event index),
+  one 8-entry queue, and drives it itself: `add`, notify, a bounded wait
+  (`StatusHandle::wait_until`, 1 s per chunk, ended early by
+  `DEVICE_NEEDS_RESET`/`FAILED`), `pop_used`; a request goes in chunks of
+  at most a page, a short answer is asked again for the rest, and 8 empty
+  answers in a row or a length past the buffer is an error. The probe makes
+  one request, the pool's first seed: a device that doesn't answer fails the
+  probe (`lspci`: `virtio-rng: failed: ...`). A device that fails a later
+  request is dropped (its transport resets it; the unanswered request's
+  bounce frame stays outstanding, leaked) and the pool goes on with RDRAND,
+  if any.
+
+Each `fill` draws 32 bytes from every source it can use, mixes them in,
+and hands out a stream keyed from the pool by fast key erasure (one block
+gives the stream's key and the pool's next key). With neither source the
+pool is never seeded and `fill` refuses; boot says so (info, not a
+warning: QEMU's default machine has neither). **Concurrent
+callers:** the pool's `SpinLock` is held only to mix and split; the
+virtio device sits in an `Option` behind its own `SpinLock`, taken out for a
+request made with no lock held (the wait busy-waits; a `SpinLock` keeps
+interrupts off) and put back after. A caller finding it taken skips it for
+that call (counted): the pool was seeded at probe, so its output stays
+unpredictable, and RDRAND still adds fresh input when present. The shell's
+`random [bytes]` prints hex; rhai has `random()` and `random(n)`.
 
 ### Interrupts for devices: MSI-X (#96)
 

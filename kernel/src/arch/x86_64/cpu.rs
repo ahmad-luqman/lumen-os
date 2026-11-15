@@ -81,6 +81,22 @@ pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
     (r.eax, r.ebx, r.ecx, r.edx)
 }
 
+/// The CPU has RDRAND (`cpuid` leaf 1, ECX bit 30).
+pub fn has_rdrand() -> bool {
+    cpuid(1).2 & (1 << 30) != 0
+}
+
+/// One RDRAND attempt: `None` when the CPU had no random number ready (the
+/// caller retries). Only call it where [`has_rdrand`] is true (else #UD).
+pub fn rdrand() -> Option<u64> {
+    let v: u64;
+    let ok: u8;
+    // SAFETY: RDRAND writes a register and the carry flag (flags clobbered:
+    // no `preserves_flags`); the caller checked the CPU has it.
+    unsafe { asm!("rdrand {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nomem, nostack)) };
+    (ok != 0).then_some(v)
+}
+
 /// This CPU's APIC id, as the MADT lists it: the 32-bit x2APIC id (`cpuid`
 /// leaf 0xB) where the CPU reports one, else the 8-bit initial APIC id
 /// (leaf 1).

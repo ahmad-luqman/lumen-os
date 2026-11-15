@@ -78,8 +78,8 @@
 //! Locks: the probe lock, then the probe scope or ECAM (each taken last);
 //! the run table before the probe owner and the frame allocator.
 
-// The first driver on this adapter is rng (#97): until then only the ktests
-// and `probe_all`'s bookkeeping use it.
+// Parts of the adapter (declining, run counts, the status bits) are used
+// only by the ktests until more drivers than rng (#97) use them.
 #![cfg_attr(not(feature = "ktest"), allow(dead_code))]
 
 use alloc::vec::Vec;
@@ -402,7 +402,6 @@ pub enum ProbeError {
     /// `PciTransport::new` refused the device.
     Transport(virtio_drivers::transport::pci::VirtioPciError),
     /// The device driver's setup failed.
-    #[cfg_attr(feature = "ktest", allow(dead_code))] // first user: rng (#97)
     Device(virtio_drivers::Error),
     /// The device status after setup isn't `FEATURES_OK` and `DRIVER_OK`
     /// (or shows `DEVICE_NEEDS_RESET` or `FAILED`): the raw byte.

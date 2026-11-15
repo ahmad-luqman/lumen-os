@@ -3,7 +3,8 @@
 //! M6 brings files).
 //!
 //! Scripts see the machine through a few functions ([`FUNCTIONS`]): `cpus()`,
-//! `mem()`, `uptime()`, `trace(n)`, `sleep(ms)`, `print`, `debug`, and
+//! `mem()`, `uptime()`, `trace(n)`, `sleep(ms)`, `random([n])`, `print`,
+//! `debug`, and
 //! drawing (`draw_pixel`, `draw_rect`, `draw_text`, `clear`) on the
 //! terminal's [`Canvas`], taken on the first draw (`screen_width()` and
 //! `screen_height()` don't take it). A script that drew and ended without
@@ -352,6 +353,7 @@ pub const FUNCTIONS: &[&str] = &[
     "uptime()",
     "trace(n)",
     "sleep(ms)",
+    "random([n])",
     "print(x)",
     "debug(x)",
     "draw_pixel(x, y, rgb)",
@@ -395,6 +397,20 @@ pub const DEMO_NAMES: &[&str] = &{
 /// rest).
 fn px(v: i64) -> usize {
     usize::try_from(v).unwrap_or(0)
+}
+
+/// `random()`: any integer; `random(n)`: 0 to n - 1 (n above 0).
+fn random(below: Option<i64>) -> Result<i64, Box<EvalAltResult>> {
+    let refused = |e: crate::rng::NoSource| -> Box<EvalAltResult> { alloc::format!("random: {e}").into() };
+    match below {
+        None => {
+            let mut b = [0u8; 8];
+            crate::rng::fill(&mut b).map_err(refused)?;
+            Ok(i64::from_le_bytes(b))
+        }
+        Some(n) if n > 0 => Ok(crate::rng::below(n as u64).map_err(refused)? as i64),
+        Some(n) => Err(alloc::format!("random({n}): expected a bound above 0").into()),
+    }
 }
 
 /// A colour from a script (`0xRRGGBB`; higher bits ignored).
@@ -651,6 +667,8 @@ fn engine(state: &Rc<State>) -> Engine {
     e.register_fn("mem", mem);
     e.register_fn("uptime", || crate::time::since_boot_ns().map_or(0, |ns| (ns / 1_000_000) as i64));
     e.register_fn("trace", trace);
+    e.register_fn("random", || random(None));
+    e.register_fn("random", |n: i64| random(Some(n)));
     let s = state.clone();
     e.register_fn("sleep", move |ms: i64| sleep(&s, ms));
 
@@ -1035,6 +1053,13 @@ crate::ktest!(
         kassert!(run("frobnicate()").starts_with("rhai: Function not found: frobnicate"));
         // The size of the screen, without taking it.
         kassert_eq!(run("screen_width() > 0 && screen_height() > 0"), "true\n");
+        // Random numbers (the ktest machine has virtio-rng).
+        kassert_eq!(
+            run("let ok = random() != random(); for i in 0..50 { let v = random(3); ok = ok && v >= 0 && v < 3 } ok"),
+            "true\n"
+        );
+        kassert_eq!(run("random(1)"), "0\n");
+        kassert!(run("random(0)").contains("random(0): expected a bound above 0"));
         kassert!(term::canvas(Owner::new()).is_ok());
         // Equality on arrays and maps (Lumen's), and through `contains`.
         kassert_eq!(run("[1, [2, \"a\"], #{k: [3]}] == [1, [2, \"a\"], #{k: [3]}]"), "true\n");

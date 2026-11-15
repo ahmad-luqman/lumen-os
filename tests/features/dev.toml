@@ -70,8 +70,23 @@ tests = [
 ]
 
 [[feature]]
-name = "`lspci`'s driver column: with no driver rows yet, every function (the virtio ones included) shows `no driver` and boot reports no device bound, failed, declined or refused; the column filters like the others"
+name = "`lspci`'s driver column: with every virtio device attached, only virtio-rng shows a driver (`virtio-rng: bound`), every other function `no driver`, and boot reports one device bound and none failed, declined or refused; the column filters like the others"
 milestone = "M3"
 tests = [
     "scenario:test_pci::test_lspci_shows_no_driver",
+]
+
+[[feature]]
+name = "Randomness pool (lumen-rand): ChaCha20's block function matches RFC 8439 (section 2.3.2 and appendix A.1), its keystream comes out in block order whatever the pieces it is read in (the block number carrying into the nonce past 2^32), handed-out bytes aren't kept; the pool hands out nothing until 32 bytes are mixed in, every input byte, its order and a short last chunk change the output, the same input gives the same output, each stream differs from the next and from the pool's key (fast key erasure), mixing after a stream changes the next one, and 1 MiB of output is balanced (byte chi-square, bit count)"
+milestone = "M3"
+tests = [
+    "cargo:lumen-rand",
+]
+
+[[feature]]
+name = "Randomness from RDRAND and virtio-rng: each source alone (the default CPU with virtio-rng, `cpu=max` without it) and both give `random` output that differs call to call, boot to boot, and across a 4096-byte run; boot logs the sources; with neither, boot says so (info, not a warning) and `random` (and rhai's `random()`) refuse saying why; `random`'s usage (1 to 4096 bytes); the virtio-rng device shows `virtio-rng: bound` in `lspci` and boot reports it bound; in-kernel: a request over a page (two chunks, both written) leaves the DMA run table as it was, each `fill` asks virtio-rng unless another caller has it (then skipped and counted, the probe-seeded pool still answering), `rng::below` stays below its bound and reaches every value"
+milestone = "M3"
+tests = [
+    "scenario:test_dev::*",
+    "ktest:lumen_kernel::rng::*",
 ]

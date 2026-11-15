@@ -11,11 +11,13 @@ def test_in_kernel_tests_pass(boot):
     # stack registry and the frame allocator are tested with their stacks and
     # state in place, as on any multi-CPU machine. With virtio devices no
     # driver takes in M3 (network, block, 9p, a memory balloon, a console,
-    # SCSI), for the virtio adapter's ktests to claim and probe.
+    # SCSI), for the virtio adapter's ktests to claim and probe, and
+    # virtio-rng, bound at boot, for the rng ktests (on the default CPU: no
+    # RDRAND, so they use virtio-rng).
     extra = ["-smp", "4"]
     for device in ("virtio-balloon-pci", "virtio-serial-pci", "virtio-scsi-pci"):
         extra += ["-device", device]
-    m = boot("ktest", extra=extra, devices=Devices(blk_mib=1, net=True, share=True))
+    m = boot("ktest", extra=extra, devices=Devices(blk_mib=1, net=True, share=True, rng=True))
     code = m.wait_exit(120)
     out = m.output
     report = tap.parse(out)
@@ -48,13 +50,16 @@ def test_in_kernel_tests_pass(boot):
     # reported at the 1st, 1024th and 2048th only.
     storm = re.findall(r"unexpected interrupt on vector 0x31 \(rip 0x[0-9a-f]+, #(\d+)\)", out)
     assert storm == ["1", "1024", "2048"], f"0x31 storm reports: {storm}"
-    # `probing_records_each_outcome` (#95): boot's own pass finds no driver
-    # rows; the ktest's table declines the 9p device once alone, then
+    # `probing_records_each_outcome` (#95): boot's own pass binds only
+    # virtio-rng (#97); the ktest's table declines the 9p device once alone, then
     # declines it (leaving a run) and fails it (leaving one of its own),
     # finds the balloon not ready, binds the console, and refuses the SCSI
     # device's decline (its probe kept the resources); offered again, the
     # 9p device isn't probed.
-    assert "INFO  drivers: 0 bound, 0 failed, 0 declined, 0 not probed (0 driver rows)\n" in out
+    assert re.search(
+        r"INFO  drivers: 1 bound, 0 failed, 0 declined, 0 not probed \(\d+ driver rows?\)\n", out
+    )
+    assert "INFO  rng: sources: virtio-rng\n" in out
     p9 = re.search(r"INFO  drivers: probing ktest-9p on (\S+)\n", out)
     assert p9, "no ktest-9p probe logged"
     addr = re.escape(p9[1])
