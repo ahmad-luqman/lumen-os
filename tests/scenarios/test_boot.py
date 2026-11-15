@@ -17,6 +17,8 @@ def test_boot_reaches_logger(boot):
     m.expect(r"INFO  boot: boot complete")
     # The timeline is logged after `boot complete` (at warn if incomplete).
     m.expect(r"boot: timeline: .*\n")
+    # Then Limine's times (at warn if unknown or out of order).
+    m.expect(r"boot: before kmain: .*\n")
     out = m.output
     assert "WARN" not in out, "boot logged a warning"
     assert "ERROR" not in out, "boot logged an error"
@@ -51,11 +53,13 @@ PHASES = [
     "framebuffer",
     "complete",
 ]
-# Logged just after the timeline (kernel/src/boot.rs, `BeforeKmain`): Limine's
-# own times for the boot (microseconds of the TSC by its calibration), and
-# how long after its handoff `kmain` read the timeline's origin, from ticks
-# (signed: an origin before the handoff reads `-`). At warn if Limine gave
-# no times or they are out of order: matched too, to fail at once.
+# Logged just after the timeline (kernel/src/main.rs, `log_before_kmain`;
+# the text is lumen_time::handoff's `BeforeKmain`, pinned in its host tests):
+# Limine's own times for the boot (microseconds of the TSC by its
+# calibration), and how long after its handoff `kmain` read the timeline's
+# origin, from ticks (signed: an origin before the handoff reads `-`). At
+# warn, and matched too to fail at once, if anything is unknown
+# (`unknown (...)`) or out of order (`...; out of order: <reason>`).
 BEFORE_KMAIN = re.compile(
     r"(?P<level>INFO |WARN ) boot: before kmain: (?P<text>limine started at (?P<started>\d+\.\d{3}) ms "
     r"and handed off at (?P<handoff>\d+\.\d{3}) ms \(TSC time\), "
@@ -109,13 +113,16 @@ def test_boot_timeline_printed(boot):
     assert list(us.values()) == sorted(us.values()), line[0]
     total = micros(timeline["total"])
     assert total == us["complete"], line[0]
-    # The origin is `kmain`'s first instruction: at or before arch-init
-    # (above), and at or after Limine's handoff, so not the TSC's reset or
-    # the firmware's handoff to Limine (both before Limine started). The
-    # kernel compares in ticks, so this holds however slowly the emulator
-    # ran; a time bound on arch-init didn't (#55).
+    # The origin is at or before arch-init (above), and at least Limine's
+    # 10 ms post-handoff wait after its handoff, which the kernel checks in
+    # ticks (INFO means in order): so between Limine's handoff and
+    # arch-init, not the TSC's reset or the firmware's handoff to Limine
+    # (both before Limine started). That holds however slowly the emulator
+    # ran; a time bound on arch-init didn't (#55). An origin read later,
+    # before arch-init, isn't caught.
     before = m.expect(BEFORE_KMAIN, 10)
     what = f"arch-init +{us['arch-init'] / 1000:.3f} ms; {before['text']}"
+    assert not before["text"].startswith("unknown ("), what
     assert before["level"] == "INFO " and before["gap"], what
     assert 0 < micros(before["started"]) < micros(before["handoff"]), what
     assert not before["gap"].startswith("-"), what

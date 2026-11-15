@@ -46,7 +46,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Boot timeline printed at boot complete (every phase since kernel entry, from the trace ring) and timestamps on serial log lines"
+name = "Boot timeline printed at boot complete (every phase since kernel entry, from the trace ring), its origin checked against Limine's handoff in ticks, and timestamps on serial log lines"
 milestone = "M1"
 tests = [
     "cargo:lumen-time",

@@ -5,7 +5,8 @@
 //! calibration window must meet to be trusted (`Window`, `steady_windows`),
 //! how a PIT channel's two readings become a window (`pit_window`), busy
 //! percentages and rates (`busy_percent`, `percent`, `per_second`), a
-//! bootloader's microseconds back as ticks (`ticks_at_usec`), and the
+//! bootloader's microseconds back as ticks (`ticks_at_usec`), Limine's boot
+//! times against the timeline's origin ([`handoff`]), and the
 //! CMOS RTC's registers as a date ([`rtc`]). All of it is integer math
 //! (the kernel has no floating point) in `u128` where products can
 //! overflow, so it holds for centuries of uptime (and then saturates).
@@ -14,6 +15,7 @@
 
 use core::fmt;
 
+pub mod handoff;
 pub mod rtc;
 
 pub const NS_PER_SEC: u64 = 1_000_000_000;
@@ -374,8 +376,9 @@ impl Clock {
 /// A counter reading a bootloader gave in whole microseconds (Limine's
 /// `rdtsc_usec`: the reading times 10^6 / `hz`, rounded down) back in
 /// ticks, rounded down: at or before the reading it was taken from, never
-/// after (and by less than one microsecond's ticks, plus one). `None` for
-/// 0 Hz or a result past `u64`.
+/// after, and by fewer than `hz / 10^6 + 1` ticks. (Rounding up would also
+/// stay at or before it, the reading being a whole tick; down is pinned.)
+/// `None` for 0 Hz or a result past `u64`.
 pub fn ticks_at_usec(usec: u64, hz: u64) -> Option<u64> {
     if hz == 0 {
         return None;
@@ -764,6 +767,26 @@ mod tests {
                 assert!(back <= t, "after the reading: {back} > {t} at {hz} Hz");
                 assert!(t - back <= per_us, "a microsecond early: {back} for {t} at {hz} Hz");
             }
+        }
+    }
+
+    #[test]
+    fn a_bootloaders_microseconds_come_back_right_over_a_small_range() {
+        // Every reading below 20000 at every frequency up to 3000 Hz (a tick
+        // spans many microseconds), and every reading below 200000 at
+        // frequencies around 1 MHz (where a tick is about a microsecond).
+        let check = |hz: u64, t: u64| {
+            let back = ticks_at_usec(limine_usec(t, hz), hz).unwrap();
+            assert!(
+                back <= t && u128::from(t - back) * 1_000_000 < u128::from(hz) + 1_000_000,
+                "{t} at {hz} Hz: {back}"
+            );
+        };
+        for hz in 1..=3_000 {
+            (0..20_000).for_each(|t| check(hz, t));
+        }
+        for hz in [999_999, 1_000_000, 1_000_001, 1_193_182, 2_000_003] {
+            (0..200_000).for_each(|t| check(hz, t));
         }
     }
 

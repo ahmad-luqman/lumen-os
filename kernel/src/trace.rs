@@ -451,23 +451,33 @@ crate::ktest!(
         }
         kassert_eq!(phases, BootPhase::ALL.map(|p| p as u64));
         // So `tscs` is in `ALL`'s order. Entry is the origin, at or before
-        // arch-init (above) and at or after Limine's handoff: so `kmain`'s
-        // first instruction, not the TSC's reset or the firmware's handoff
-        // to Limine (both before Limine started). Compared in ticks, Limine's
-        // microseconds turned back with its own frequency: exact however
-        // long the boot took (a starved emulator stretches the gaps, never
-        // reorders them; #55).
+        // arch-init (above), and at least Limine's post-handoff wait after
+        // its handoff tick (`lumen_time::handoff::BeforeKmain::check`, which
+        // also checks the tick's units and Limine's frequency against ours).
+        // Compared in ticks, so exact however long the boot took (#55).
+        // That bounds the origin between Limine's handoff and arch-init; an
+        // origin read later than `kmain`'s first instruction, before
+        // arch-init, isn't caught.
         let (entry, arch_init) = (tscs[BootPhase::Entry.index()], tscs[BootPhase::ArchInit.index()]);
         kassert_eq!(Some(entry), crate::time::boot_tsc());
-        let clock = crate::time::tsc().ok_or("TSC not calibrated")?;
-        let limine = crate::boot::LimineTimes::get()?;
-        let before = crate::boot::BeforeKmain { limine, entry, clock };
-        let arch_ms = lumen_time::Millis(clock.ns(arch_init - entry));
-        crate::ktest::diag(format_args!("arch-init {arch_ms} after entry; {before}"));
-        let handoff = limine.handoff_tsc().ok_or("Limine's handoff time doesn't fit in 64 bits")?;
-        kassert!(0 < limine.started_us && limine.started_us < limine.handed_off_us);
-        kassert!(handoff <= entry);
-        kassert!(before.in_order());
+        let before = match crate::boot::before_kmain() {
+            Ok(before) => before,
+            Err(why) => {
+                crate::ktest::diag(format_args!("before kmain: unknown ({why})"));
+                return Err("Limine's times or the origin are unknown");
+            }
+        };
+        kassert_eq!(before.entry(), entry);
+        let (clock, limine_hz) = (before.clock(), before.limine().hz());
+        crate::ktest::diag(format_args!(
+            "arch-init {} after entry; {before}; Limine's TSC {limine_hz} Hz, ours {} Hz",
+            lumen_time::Millis(clock.ns(arch_init - entry)),
+            clock.hz()
+        ));
+        if let Err(disorder) = before.check() {
+            crate::ktest::diag(format_args!("out of order: {disorder}"));
+            return Err("the origin is out of order with Limine's handoff");
+        }
         Ok(())
     }
 );

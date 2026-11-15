@@ -132,7 +132,7 @@ own PR that updates that doc first.
 
 ## Map
 
-- `kernel/src/main.rs`: boot sequence. `boot.rs`: the Limine requests.
+- `kernel/src/main.rs`: boot sequence. `boot.rs`: the Limine requests (and, by hand, the TSC-frequency and bootloader-performance ones, `before_kmain`).
   `cmdline.rs`: kernel command line (flags and `key=value`, e.g.
   `lumen.log=debug`). `sync.rs`: `SpinLock` (interrupts off while held).
   `smp.rs`: starting the other CPUs, `run_on`. `sched.rs`: kernel threads
@@ -209,8 +209,9 @@ own PR that updates that doc first.
   and `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free).
 - `crates/lumen-time`: timekeeping arithmetic: calibration, tick/ns
   conversion, timer counts, log time formats (`Stamp`, `Millis`),
-  percentages and rates, and the RTC's registers as a date (`rtc`)
-  (host-tested).
+  percentages and rates, the RTC's registers as a date (`rtc`), and
+  Limine's boot times against the timeline's origin (`handoff`: the
+  `before kmain` line and its check, all in ticks) (host-tested).
 - `crates/lumen-rand`: ChaCha20's block function (RFC 8439 vectors), the
   entropy pool (mixing, fast-key-erasure streams), and pure helpers for
   the sources: `retry`, `fill_words`, `all_same`, `below` (host-tested

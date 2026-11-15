@@ -5,7 +5,6 @@
 //! Everything the kernel knows about the machine at boot comes from here.
 
 use core::cell::UnsafeCell;
-use core::fmt;
 
 use limine::BaseRevision;
 use limine::memory_map::EntryType;
@@ -13,6 +12,7 @@ use limine::request::{
     ExecutableAddressRequest, ExecutableCmdlineRequest, ExecutableFileRequest, FramebufferRequest, HhdmRequest,
     MemoryMapRequest, MpRequest, RequestsEndMarker, RequestsStartMarker, RsdpRequest, StackSizeRequest,
 };
+use lumen_time::handoff::{BeforeKmain, LimineTimes, Unknown};
 
 /// Boot stack size we ask Limine for.
 pub const BOOT_STACK_SIZE: u64 = 128 * 1024;
@@ -71,12 +71,13 @@ pub static MP: MpRequest = MpRequest::new();
 /// are in.
 #[used]
 #[unsafe(link_section = ".limine_requests")]
-static TSC_FREQUENCY: RawRequest<TscFrequencyResponse> = RawRequest::new([0x10f2ee1d87d195e4, 0xf747a2b78f6ddb31]);
+static TSC_FREQUENCY: RawRequest<TscFrequencyResponse> = RawRequest::new();
 
-/// When Limine started and when it handed off to the kernel.
+/// When Limine started and when it handed off to the kernel (the last TSC
+/// reading it records before the jump).
 #[used]
 #[unsafe(link_section = ".limine_requests")]
-static PERFORMANCE: RawRequest<PerformanceResponse> = RawRequest::new([0x6b50ad9bf36d13ad, 0xdc4c7e88fc759e17]);
+static PERFORMANCE: RawRequest<PerformanceResponse> = RawRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests_end")]
@@ -97,38 +98,53 @@ pub fn memmap_type_name(kind: EntryType) -> &'static str {
     }
 }
 
-/// A request the pinned `limine` crate (0.5) has no type for, in the
-/// protocol's common layout (`limine.h`): Limine's common magic and the
-/// request's two IDs, the revision we ask for (0), and the response pointer
-/// Limine fills in. `R` is the response's layout.
+/// A Limine response the pinned `limine` crate (0.5) has no type for, tied
+/// to its request's two IDs (after Limine's common magic).
+///
+/// These types (`RawRequest` and both responses) exist only because of that
+/// pin: on a bump to `limine` 0.6 or later, delete them for its
+/// `TscFrequencyRequest` and `BootloaderPerformanceRequest`.
+///
+/// # Safety
+///
+/// The implementing type must be laid out as `limine.h`'s response for the
+/// request with `ID` (checked below for the two there are).
+unsafe trait Response: Sync + 'static {
+    const ID: [u64; 2];
+}
+
+/// A request in the protocol's common layout (`limine.h`): Limine's common
+/// magic and `R`'s two IDs, the revision we ask for (0), and the response
+/// pointer Limine fills in.
 #[repr(C)]
-struct RawRequest<R> {
+struct RawRequest<R: Response> {
     id: [u64; 4],
     revision: u64,
     response: UnsafeCell<*const R>,
 }
 
 // SAFETY: Limine writes `response` before the kernel starts; the kernel
-// only reads it.
-unsafe impl<R> Sync for RawRequest<R> {}
+// only reads it, and the response it points to is `Sync` (`Response`).
+unsafe impl<R: Response + Sync> Sync for RawRequest<R> {}
 
-impl<R> RawRequest<R> {
-    const fn new(id: [u64; 2]) -> Self {
+impl<R: Response> RawRequest<R> {
+    const fn new() -> Self {
         Self {
-            id: [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, id[0], id[1]],
+            id: [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b, R::ID[0], R::ID[1]],
             revision: 0,
             response: UnsafeCell::new(core::ptr::null()),
         }
     }
 
-    fn response(&self) -> Option<&'static R> {
+    fn get_response(&self) -> Option<&'static R> {
         // SAFETY: a volatile read, as Limine wrote the pointer behind the
         // compiler's back (the `limine` crate reads its own the same way).
         let ptr = unsafe { core::ptr::read_volatile(self.response.get()) };
         // SAFETY: a non-null pointer is Limine's response: an `R` (its
-        // layout, from `limine.h`), aligned, in bootloader-reclaimable memory
-        // that the frame allocator keeps reserved and the HHDM keeps mapped,
-        // never written after the handoff.
+        // layout, from `limine.h`, per `Response`'s contract), aligned, in
+        // bootloader-reclaimable memory that the frame allocator keeps
+        // reserved and the HHDM keeps mapped, never written after the
+        // handoff.
         unsafe { ptr.as_ref() }
     }
 }
@@ -138,6 +154,11 @@ impl<R> RawRequest<R> {
 struct TscFrequencyResponse {
     _revision: u64,
     frequency: u64,
+}
+
+// SAFETY: laid out as `limine.h`'s response for this ID (asserted below).
+unsafe impl Response for TscFrequencyResponse {
+    const ID: [u64; 2] = [0x10f2ee1d87d195e4, 0xf747a2b78f6ddb31];
 }
 
 /// `struct limine_bootloader_performance_response` (the system reset's
@@ -150,73 +171,32 @@ struct PerformanceResponse {
     exec_usec: u64,
 }
 
-/// Limine's own times for the boot, in microseconds of the TSC (since its
-/// reset) as Limine calibrated it (`hz`): when it started (just after the
-/// firmware handed it control) and when it handed off to the kernel (its
-/// last TSC reading before jumping to `_start`).
-#[derive(Clone, Copy, Debug)]
-pub struct LimineTimes {
-    pub hz: u64,
-    pub started_us: u64,
-    pub handed_off_us: u64,
+// SAFETY: laid out as `limine.h`'s response for this ID (asserted below).
+unsafe impl Response for PerformanceResponse {
+    const ID: [u64; 2] = [0x6b50ad9bf36d13ad, 0xdc4c7e88fc759e17];
 }
 
-impl LimineTimes {
-    /// Both responses, or why not: Limine gives neither without a TSC
-    /// frequency.
-    pub fn get() -> Result<LimineTimes, &'static str> {
-        let tsc = TSC_FREQUENCY.response().ok_or("no TSC frequency from Limine")?;
-        let perf = PERFORMANCE.response().ok_or("no bootloader performance times from Limine")?;
-        Ok(LimineTimes { hz: tsc.frequency, started_us: perf.init_usec, handed_off_us: perf.exec_usec })
-    }
+// The layouts `limine.h` gives (protocol 3a0526b, as Limine v12.9.4 pins).
+const _: () = {
+    use core::mem::{offset_of, size_of};
+    assert!(size_of::<RawRequest<TscFrequencyResponse>>() == 48);
+    assert!(offset_of!(RawRequest<TscFrequencyResponse>, revision) == 32);
+    assert!(offset_of!(RawRequest<TscFrequencyResponse>, response) == 40);
+    assert!(size_of::<RawRequest<PerformanceResponse>>() == 48);
+    assert!(size_of::<TscFrequencyResponse>() == 16);
+    assert!(offset_of!(TscFrequencyResponse, frequency) == 8);
+    assert!(size_of::<PerformanceResponse>() == 32);
+    assert!(offset_of!(PerformanceResponse, init_usec) == 16);
+    assert!(offset_of!(PerformanceResponse, exec_usec) == 24);
+};
 
-    /// The TSC at the handoff, at or before Limine's own reading: the
-    /// earliest the kernel's first instruction can have run. Exact in ticks
-    /// (Limine's microseconds turned back with its own frequency), so
-    /// independent of how fast the boot went.
-    pub fn handoff_tsc(&self) -> Option<u64> {
-        lumen_time::ticks_at_usec(self.handed_off_us, self.hz)
-    }
-}
-
-/// How the boot timeline's origin (`kmain`'s first TSC reading, `entry`)
-/// relates to Limine's times: `limine started at 1834.112 ms and handed off
-/// at 2210.405 ms (TSC time), kmain began +0.031 ms after the handoff`. The
-/// gap is measured in ticks, so its sign is exact; a negative one (an origin
-/// before the handoff: the TSC's reset or the firmware's handoff to Limine)
-/// reads `-...`.
-pub struct BeforeKmain {
-    pub limine: LimineTimes,
-    pub entry: u64,
-    pub clock: lumen_time::Clock,
-}
-
-impl BeforeKmain {
-    /// Limine started after the TSC's reset and before its handoff, and the
-    /// origin is at or after the handoff.
-    pub fn in_order(&self) -> bool {
-        let l = &self.limine;
-        0 < l.started_us && l.started_us < l.handed_off_us && l.handoff_tsc().is_some_and(|h| h <= self.entry)
-    }
-}
-
-impl fmt::Display for BeforeKmain {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use lumen_time::Millis;
-        let l = &self.limine;
-        let ms = |us: u64| Millis(us.saturating_mul(1000));
-        write!(
-            f,
-            "limine started at {} and handed off at {} (TSC time), kmain began ",
-            ms(l.started_us),
-            ms(l.handed_off_us)
-        )?;
-        let Some(handoff) = l.handoff_tsc() else {
-            return f.write_str("at an unknown time after the handoff (it doesn't fit in 64 bits)");
-        };
-        match self.entry.checked_sub(handoff) {
-            Some(after) => write!(f, "{:+} after the handoff", Millis(self.clock.ns(after))),
-            None => write!(f, "-{} after the handoff", Millis(self.clock.ns(handoff - self.entry))),
-        }
-    }
+/// Limine's times (its two responses, or which is missing), the kernel's
+/// TSC calibration and the timeline's origin, for the `boot: before kmain:`
+/// line and its check (`lumen_time::handoff`).
+pub fn before_kmain() -> Result<BeforeKmain, Unknown> {
+    let limine = LimineTimes::from_responses(
+        TSC_FREQUENCY.get_response().map(|r| r.frequency),
+        PERFORMANCE.get_response().map(|r| (r.init_usec, r.exec_usec)),
+    );
+    BeforeKmain::new(crate::time::tsc(), limine, crate::time::boot_tsc())
 }
