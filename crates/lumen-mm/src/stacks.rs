@@ -476,7 +476,7 @@ mod tests {
         // the same index, so a mix of two entries is detectable.
         let range =
             |n: u64| StackRange { bottom: BASE + n * 0x10_0000 + GUARD_SIZE, top: BASE + n * 0x10_0000 + 0x8000 };
-        let kind = |n: u64| if n % 2 == 0 { StackKind::Main } else { StackKind::Test };
+        let kind = |n: u64| if n.is_multiple_of(2) { StackKind::Main } else { StackKind::Test };
         // Stops the readers even if the writer panics (else they spin forever).
         struct StopOnDrop<'a>(&'a AtomicBool);
         impl Drop for StopOnDrop<'_> {

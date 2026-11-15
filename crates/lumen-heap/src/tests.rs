@@ -350,7 +350,7 @@ fn growth_for_is_always_enough() {
         let arena = Arena::new(1 << 20);
         let mut heap = arena.heap(16 * rng.below(8) as usize, 4096);
         // Fill the heap with a random mix, so the tail is allocated or free.
-        while let Some(_) = heap.alloc(layout(16 + rng.below(512) as usize, 16)) {}
+        while heap.alloc(layout(16 + rng.below(512) as usize, 16)).is_some() {}
         let l = layout(1 + rng.below(8192) as usize, 1 << rng.below(15));
         let grow = growth_for(l).unwrap();
         if arena.offset(heap.base().unwrap()) + heap.stats().size + grow > 1 << 20 {
