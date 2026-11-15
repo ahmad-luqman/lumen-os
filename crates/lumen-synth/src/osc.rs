@@ -1,7 +1,7 @@
 //! Oscillators: a 32-bit phase accumulator advanced by a fixed step each
 //! sample (one full cycle is 2^32), shaped into a waveform. Every waveform
 //! is at full scale (±[`FULL_SCALE`]); volume and envelopes come later
-//! ([`crate::play::Voice`]).
+//! (the voice inside a [`crate::Tone`]).
 //!
 //! The square and noise are naive (not band-limited): at high pitches
 //! their harmonics above half the rate fold back as audible aliases.
@@ -56,9 +56,11 @@ impl core::fmt::Display for Waveform {
 
 /// The phase step for `freq` at `rate`: the fraction of a cycle per sample,
 /// scaled to 2^32 and rounded down. Frequencies at or above half the rate
-/// are clamped just below it; [`Rate::check`] refuses them before they get
-/// here (at the clamp a sine or triangle samples near its zeros: silence).
-pub fn phase_step(freq: Freq, rate: Rate) -> u32 {
+/// are clamped just below it, silently (at the clamp a sine or triangle
+/// samples near its zeros: silence); the crate's public entry points
+/// ([`crate::Tone::new`], [`crate::Sequencer::new`]) refuse them first with
+/// [`Rate::check`].
+pub(crate) fn phase_step(freq: Freq, rate: Rate) -> u32 {
     // (2^32 - 1) << 32 still fits in a u64, so this can't overflow.
     let step = (u64::from(freq.millihz()) << 32) / (u64::from(rate.hz()) * 1000);
     step.min((1 << 31) - 1) as u32
@@ -67,9 +69,10 @@ pub fn phase_step(freq: Freq, rate: Rate) -> u32 {
 /// The noise LFSR's taps (16, 14, 13, 11): a maximal-length sequence.
 const LFSR_TAPS: u16 = 0xB400;
 
-/// One oscillator.
+/// One oscillator. Its frequency is clamped below half the rate
+/// ([`phase_step`]).
 #[derive(Clone, Debug)]
-pub struct Oscillator {
+pub(crate) struct Oscillator {
     wave: Waveform,
     rate: Rate,
     phase: u32,

@@ -2,11 +2,6 @@
 
 use std::vec::Vec;
 
-/// The number of times `samples` goes from negative to zero or above.
-pub fn rising_zero_crossings(samples: &[i16]) -> usize {
-    samples.windows(2).filter(|w| w[0] < 0 && w[1] >= 0).count()
-}
-
 /// The frequency of a single periodic signal, from the times of its rising
 /// zero crossings interpolated between samples: (crossings - 1) periods
 /// between the first and last. Exact to a fraction of a sample at each end,

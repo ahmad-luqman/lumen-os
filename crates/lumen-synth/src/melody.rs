@@ -8,8 +8,9 @@
 //! | `w=sine` | the waveform from here on: `square` (default), `triangle`, `sine`, `noise` |
 //!
 //! Settings and waveform names are lowercase, and numbers are plain digits
-//! without a sign or leading zeros, so each word has one spelling (the
-//! canonical text [`Token`]'s `Display` prints parses back unchanged).
+//! without a sign or leading zeros: each number has one spelling, and the
+//! canonical text [`Token`]'s `Display` prints parses back to the same
+//! tokens.
 //! [`Melody::parse`] checks the whole text first, so playing it never meets
 //! a bad word halfway. Octave 4 starts at middle C, A4 is 440 Hz, and
 //! accidentals may cross octaves (`Cb4` is B3, `B#3` is C4).
@@ -233,7 +234,8 @@ pub enum ParseErrorKind {
     /// A word without `=` that starts with something other than a note
     /// letter or `r`.
     UnknownNote(char),
-    /// An octave above 8, or a note below C0 (`Cb0`).
+    /// An octave that isn't a single digit 0-8 (`C9`, `C04`, `C#10`), or
+    /// a note below C0 (`Cb0`).
     BadOctave,
     /// A length other than 1, 2, 4, 8, 16 or 32 after `/`.
     BadLength,
@@ -245,8 +247,9 @@ pub enum ParseErrorKind {
     UnknownSetting,
     /// A character left over after a complete word (`C4x`).
     Unexpected(char),
-    /// A note at or above half the sample rate ([`Melody::check`]).
-    TooHigh,
+    /// A note at or above half the sample rate ([`Melody::check`]), with
+    /// its frequency and the rate.
+    TooHigh(crate::TooHigh),
 }
 
 /// A melody error and where it is.
@@ -272,7 +275,7 @@ impl fmt::Display for ParseError {
             ParseErrorKind::BadWave => write!(f, "waveform at {pos} must be square, triangle, sine or noise"),
             ParseErrorKind::UnknownSetting => write!(f, "setting at {pos} is not t= (tempo) or w= (waveform)"),
             ParseErrorKind::Unexpected(c) => write!(f, "unexpected {c:?} at {pos}"),
-            ParseErrorKind::TooHigh => write!(f, "note at {pos} is too high for the sample rate"),
+            ParseErrorKind::TooHigh(e) => write!(f, "note at {pos}: {e}"),
         }
     }
 }
@@ -281,6 +284,9 @@ impl core::error::Error for ParseError {}
 
 /// A checked melody, holding its text as any `S: AsRef<str>`: a `&str`
 /// to play it in place, or an owned string to send it to another thread.
+/// `S::as_ref` must return the same text every time (as `String`, `&str`,
+/// `Box<str>` and `Arc<str>` do): a text that changes after parsing ends
+/// the melody at the first word that no longer parses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Melody<S> {
     text: S,
@@ -317,10 +323,8 @@ impl<S: AsRef<str>> Melody<S> {
     pub fn check(&self, rate: Rate) -> Result<(), ParseError> {
         let mut pos = 0;
         while let Some((start, token)) = next_word(self.text(), &mut pos) {
-            if let Ok(Token::Note(pitch, _)) = token
-                && !rate.carries(pitch.freq())
-            {
-                return Err(ParseError { pos: start, kind: ParseErrorKind::TooHigh });
+            if let Ok(Token::Note(pitch, _)) = token {
+                rate.check(pitch.freq()).map_err(|e| ParseError { pos: start, kind: ParseErrorKind::TooHigh(e) })?;
             }
         }
         Ok(())
@@ -329,26 +333,17 @@ impl<S: AsRef<str>> Melody<S> {
     /// How many samples the melody lasts at `rate` (each length rounded
     /// down to whole samples, as [`crate::Sequencer`] plays it).
     pub fn duration_samples(&self, rate: Rate) -> u32 {
-        duration_samples(self.text(), rate)
-    }
-
-    pub(crate) fn into_text(self) -> S {
-        self.text
-    }
-}
-
-/// How many samples a checked melody's `text` lasts at `rate`.
-pub(crate) fn duration_samples(text: &str, rate: Rate) -> u32 {
-    let mut tempo = DEFAULT_TEMPO;
-    let mut total = 0u32;
-    for token in (Tokens { text, pos: 0 }) {
-        match token {
-            Token::Note(_, len) | Token::Rest(len) => total = total.saturating_add(len.samples(tempo, rate)),
-            Token::Tempo(t) => tempo = t,
-            Token::Wave(_) => {}
+        let mut tempo = DEFAULT_TEMPO;
+        let mut total = 0u32;
+        for token in self.tokens() {
+            match token {
+                Token::Note(_, len) | Token::Rest(len) => total = total.saturating_add(len.samples(tempo, rate)),
+                Token::Tempo(t) => tempo = t,
+                Token::Wave(_) => {}
+            }
         }
+        total
     }
-    total
 }
 
 /// A checked melody's words ([`Melody::tokens`]).
@@ -367,9 +362,16 @@ impl Iterator for Tokens<'_> {
 }
 
 /// The checked word at byte `*pos` of `text` (a melody's), advancing `*pos`
-/// past it.
+/// past it. A word that doesn't parse (only if `S::as_ref` returned a
+/// different text, see [`Melody`]) ends the melody.
 pub(crate) fn next_token(text: &str, pos: &mut usize) -> Option<Token> {
-    next_word(text, pos).map(|(_, r)| r.expect("checked by Melody::parse"))
+    match next_word(text, pos)? {
+        (_, Ok(token)) => Some(token),
+        (_, Err(_)) => {
+            *pos = text.len();
+            None
+        }
+    }
 }
 
 /// The word at or after byte `*pos` of `text` and where it starts,
@@ -379,7 +381,8 @@ fn next_word(text: &str, pos: &mut usize) -> Option<(usize, Result<Token, ParseE
     while bytes.get(*pos).is_some_and(u8::is_ascii_whitespace) {
         *pos += 1;
     }
-    if *pos >= bytes.len() {
+    // (`*pos` off a char boundary only if the text changed under us.)
+    if *pos >= bytes.len() || !text.is_char_boundary(*pos) {
         return None;
     }
     let start = *pos;
@@ -582,9 +585,15 @@ mod tests {
         let m = Melody::parse("w=sine C4 B#8 C8").unwrap();
         assert_eq!(m.check(RATE), Ok(()));
         let low = Rate::new(16_000).unwrap(); // carries up to 8 kHz; B#8 is 8372 Hz
-        assert_eq!(m.check(low), Err(ParseError { pos: 10, kind: ParseErrorKind::TooHigh }));
+        let b_sharp_8 = Freq::from_millihz(8_372_032);
+        let too_high = |rate| ParseErrorKind::TooHigh(crate::TooHigh { freq: b_sharp_8, rate });
+        assert_eq!(m.check(low), Err(ParseError { pos: 10, kind: too_high(low) }));
         let lower = Rate::new(8000).unwrap();
-        assert_eq!(m.check(lower), Err(ParseError { pos: 10, kind: ParseErrorKind::TooHigh }));
+        assert_eq!(m.check(lower), Err(ParseError { pos: 10, kind: too_high(lower) }));
+        assert_eq!(
+            m.check(lower).unwrap_err().to_string(),
+            "note at 10: 8372.032 Hz is too high for a 8000 Hz sample rate (it must be below half)"
+        );
         assert_eq!(Melody::parse("C8").unwrap().check(lower).unwrap_err().pos, 0);
     }
 

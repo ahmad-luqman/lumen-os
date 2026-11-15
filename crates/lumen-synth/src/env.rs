@@ -21,8 +21,9 @@ pub struct Adsr {
     /// The level held while the note sounds, in percent of full (0..=100;
     /// more counts as 100).
     pub sustain: u8,
-    /// Time from full level to silence after the note is released, in
-    /// milliseconds (from a lower level it is proportionally shorter).
+    /// Time from full level to silence after [`Envelope::note_off`], in
+    /// milliseconds (from a lower level it is proportionally shorter; 0
+    /// takes one sample). [`Envelope::release_over`] ignores it.
     pub release_ms: u32,
 }
 
@@ -60,8 +61,8 @@ pub struct Envelope {
     sustain_level: u32,
     /// The release step from [`Adsr::release_ms`].
     release_step: u32,
-    /// The step of the release under way ([`Envelope::release_over`] can
-    /// make it steeper).
+    /// The step of the release under way: `release_step` after
+    /// [`Envelope::note_off`], or whatever [`Envelope::release_over`] chose.
     releasing_step: u32,
     release_samples: u32,
 }
@@ -105,8 +106,9 @@ impl Envelope {
     }
 
     /// Release the note so it is silent after at most `samples` more
-    /// [`gain`](Self::gain)s, whatever its level (immediately for 0): for
-    /// a note that must end before its release time is up.
+    /// [`gain`](Self::gain)s, whatever its level (0 counts as 1: silent
+    /// after the next gain), using all of them: for a note that must end
+    /// before its release time is up.
     pub fn release_over(&mut self, samples: u32) {
         self.release_with(step(self.level, samples));
     }
@@ -242,6 +244,16 @@ mod tests {
         env.gain();
         env.note_off();
         assert_eq!(run(&mut env, 10).iter().position(|&g| g == 0), Some(9));
+    }
+
+    #[test]
+    fn release_over_from_a_partial_level_uses_all_its_samples() {
+        let mut env = Envelope::new(Adsr { attack_ms: 0, decay_ms: 0, sustain: 50, release_ms: 1000 }, RATE);
+        env.note_on();
+        run(&mut env, 3);
+        env.release_over(10);
+        let g = run(&mut env, 10);
+        assert!(g[8] > 0 && g[9] == 0, "{g:?}");
     }
 
     #[test]

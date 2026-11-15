@@ -13,11 +13,16 @@ RATE = 48_000
 
 
 def tone(
-    freq: float, seconds: float, amp: int = 12_000, wave: str = "sine", phase: float = 0.0
+    freq: float,
+    seconds: float,
+    amp: int = 12_000,
+    wave: str = "sine",
+    phase: float = 0.0,
+    rate: int = RATE,
 ) -> list[int]:
     out = []
-    for i in range(round(seconds * RATE)):
-        p = (freq * i / RATE + phase) % 1.0
+    for i in range(round(seconds * rate)):
+        p = (freq * i / rate + phase) % 1.0
         s = math.sin(2 * math.pi * p) if wave == "sine" else (1 if p < 0.5 else -1)
         out.append(round(amp * s))
     return out
@@ -203,3 +208,97 @@ def test_rejects_what_it_cannot_read(data, message):
 def test_wav_checks_its_fields(rate, channels, message):
     with pytest.raises(ValueError, match=message):
         audio.Wav(rate=rate, channels=channels)
+
+
+@pytest.mark.parametrize("freq", [2200, 2500, 3500, 4186, 7000])
+@pytest.mark.parametrize("rate", [44_100, 48_000])
+def test_high_square_waves_within_one_percent(freq, rate):
+    # Interpolated crossings of a square land on half samples, so a short
+    # period's intervals alternate between neighbours: still one pitch.
+    samples = tone(freq, 0.5, wave="square", rate=rate)
+    assert within(audio.dominant_frequency(samples, rate), freq)
+
+
+@pytest.mark.parametrize("second", [466.16, 493.88, 554.37, 659.26])
+@pytest.mark.parametrize("split", [0.3, 0.5, 0.7])
+def test_close_notes_in_one_window_have_no_single_pitch(second, split):
+    samples = tone(440, 0.25 * split) + tone(second, 0.25 * (1 - split))
+    assert audio.dominant_frequency(samples, RATE) is None
+
+
+def test_two_periods_are_too_few():
+    assert audio.dominant_frequency(tone(440, 2.5 / 440), RATE) is None
+
+
+def test_low_noise_in_short_windows_has_no_pitch():
+    # An A3-rate LFSR noise holds ~11 bits in 50 ms: never 8 even crossings.
+    assert all(f is None for f in audio.window_frequencies(lfsr_noise(RATE, 220), RATE, 0.05))
+
+
+def test_partial_last_window_counts_from_half_a_window():
+    assert len(audio.window_frequencies(tone(440, 0.4), RATE, 0.25)) == 2
+    assert len(audio.window_frequencies(tone(440, 0.35), RATE, 0.25)) == 1
+
+
+def test_input_shorter_than_a_window_is_refused():
+    with pytest.raises(ValueError, match="less than one"):
+        audio.window_frequencies(tone(440, 0.2), RATE, 0.25)
+
+
+def test_silence_is_checked_from_zero():
+    assert audio.is_silent([0] * 100)
+    assert audio.is_silent([3, -3, 0], max_abs=3)
+    assert not audio.is_silent([0] * 99 + [1])
+    assert not audio.is_silent([20_000] * 100), "DC is not silence"
+    assert not audio.is_silent(lfsr_noise(4800, 1000, amp=32_767)), "noise is not silence"
+    assert audio.peak([5, -7, 3]) == 7
+    assert audio.peak([]) == 0
+    with pytest.raises(ValueError, match="no samples"):
+        audio.is_silent([])
+
+
+def test_rates_must_be_positive():
+    for call in (
+        lambda: audio.dominant_frequency([1, 2], 0),
+        lambda: audio.window_frequencies([1, 2], -1, 0.1),
+        lambda: audio.tone_amplitude([1, 2], 0, 440),
+    ):
+        with pytest.raises(ValueError, match="positive"):
+            call()
+
+
+def test_a_header_without_samples_is_refused():
+    with pytest.raises(ValueError, match="no samples"):
+        audio.parse_wav(wav_bytes([[]], sizes=False))
+
+
+def test_stereo_stray_sample_after_the_last_frame_is_dropped():
+    data = wav_bytes([[1, 2, 3], [-1, -2, -3]], sizes=False) + struct.pack("<h", 7)
+    assert audio.parse_wav(data).channels == ((1, 2, 3), (-1, -2, -3))
+
+
+def test_an_odd_sized_chunk_before_the_data_is_skipped_with_its_pad_byte():
+    odd = chunk(b"junk", b"abc")
+    data = (
+        b"RIFF"
+        + bytes(4)
+        + b"WAVE"
+        + chunk(b"fmt ", fmt_body())
+        + odd
+        + chunk(b"data", struct.pack("<2h", 5, 6))
+    )
+    assert audio.parse_wav(data).first_channel == (5, 6)
+
+
+@pytest.mark.parametrize("size", [0xFFFFFFFF, 1000])
+def test_data_sizes_beyond_the_file_read_to_its_end(size):
+    data = (
+        b"RIFF"
+        + bytes(4)
+        + b"WAVE"
+        + chunk(b"fmt ", fmt_body())
+        + b"data"
+        + struct.pack("<I", size)
+        + struct.pack("<3h", 1, 2, 3)
+    )
+    assert audio.parse_wav(data).first_channel == (1, 2, 3)

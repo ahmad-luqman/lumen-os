@@ -30,13 +30,13 @@ pub mod play;
 mod test_util;
 
 use core::fmt;
-use core::num::{NonZeroU8, NonZeroU32};
+use core::num::NonZeroU32;
 use core::time::Duration;
 
 pub use env::{Adsr, Envelope};
 pub use melody::{Length, Melody, ParseError, ParseErrorKind, Pitch, Token};
-pub use osc::{Oscillator, Waveform};
-pub use play::{Filled, Sequencer, Source, Tone, Voice, beep, mix};
+pub use osc::Waveform;
+pub use play::{DEFAULT_VOLUME, Filled, Sequencer, Source, Tone, beep, mix};
 
 /// A frequency, in millihertz (notes aren't whole hertz: C4 is 261.626 Hz).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -133,21 +133,6 @@ impl fmt::Display for TooHigh {
 
 impl core::error::Error for TooHigh {}
 
-/// A PCM stream's shape: the rate and how many channels each frame has.
-/// Sources are mono; [`Source::fill`] copies each sample to every channel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Format {
-    pub rate: Rate,
-    pub channels: NonZeroU8,
-}
-
-impl Format {
-    /// The number of `i16` samples in one frame.
-    pub fn frame_len(self) -> usize {
-        usize::from(self.channels.get())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +146,7 @@ mod tests {
         assert_eq!(r.samples_in_ms(u32::MAX), u32::MAX);
         assert_eq!(r.samples_in(Duration::from_micros(1500)), 72);
         assert_eq!(r.samples_in(Duration::from_secs(2)), 96_000);
+        assert_eq!(r.samples_in(Duration::from_secs(100_000)), u32::MAX);
         assert_eq!(r.samples_in(Duration::MAX), u32::MAX);
     }
 
@@ -178,11 +164,5 @@ mod tests {
         assert_eq!(Freq::from_hz(u32::MAX).millihz(), u32::MAX);
         assert_eq!(Freq::from_hz(4_294_967).millihz(), 4_294_967_000);
         assert_eq!(std::format!("{}", Freq::from_millihz(261_626)), "261.626 Hz");
-    }
-
-    #[test]
-    fn formats_count_samples_per_frame() {
-        let f = Format { rate: Rate::DEFAULT, channels: NonZeroU8::new(2).unwrap() };
-        assert_eq!(f.frame_len(), 2);
     }
 }
