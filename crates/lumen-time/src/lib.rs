@@ -3,7 +3,9 @@
 //! nanoseconds, the counts the PIT and the local APIC timer are programmed
 //! with, how times read in logs (`Stamp`, `Millis`), the rules a
 //! calibration window must meet to be trusted (`Window`, `steady_windows`),
-//! how a PIT channel's two readings become a window (`pit_window`), busy
+//! how a PIT channel's two readings become a window (`pit_window`), one
+//! clock's reading placed between two reads of another and retaken while too
+//! wide (`Bracketed`, `first_narrow`: the ktests' clock cross-checks), busy
 //! percentages and rates (`busy_percent`, `percent`, `per_second`), and the
 //! CMOS RTC's registers as a date ([`rtc`]). All of it is integer math
 //! (the kernel has no floating point) in `u128` where products can
@@ -70,17 +72,30 @@ pub fn counter_midpoint(earlier: u64, later: u64, mask: u64) -> u64 {
     earlier.wrapping_add(counter_delta(earlier, later, mask) / 2) & mask
 }
 
-/// A reading of one clock (`value`) taken between two reads of another,
-/// with `at` their midpoint and `width` the time between them, both in the
-/// other clock's units. Placed at `at`, the reading is off by at most half
-/// of `width`. Anything between the two reads widens it: a host stalling
-/// the vCPU, or a slow emulated read (under KVM each HPET read exits to
-/// QEMU), so a wide one is evidence of a stall, not a reading to trust.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// A reading of one clock (`value`) taken between two reads of another (the
+/// bracket), placed at their midpoint: `at` and `width` are in the bracketing
+/// clock's units (its counter value, and the time between its two reads).
+/// Placed at `at`, the reading is off by at most half of `width`, rounded up.
+/// Anything between the two reads widens it: a host stalling the vCPU, a slow
+/// emulated read (under KVM each HPET read exits to QEMU), or the bracketing
+/// clock itself jumping, so a wide one is evidence of something wrong, not a
+/// reading to trust. (A [`Window`]'s `start_gap` and `end_gap` are the same
+/// widths, for a calibration's two ends.) Built by [`Bracketed::between`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bracketed<T> {
     pub value: T,
     pub at: u64,
     pub width: u64,
+}
+
+impl<T> Bracketed<T> {
+    /// `value`, read between `before` and `after`, two reads of a counter
+    /// `mask` wide (`u64::MAX` for one that doesn't wrap, such as `now_ns`;
+    /// `after` before `before` then gives a huge width, so the reading is
+    /// never trusted).
+    pub fn between(before: u64, value: T, after: u64, mask: u64) -> Self {
+        Bracketed { value, at: counter_midpoint(before, after, mask), width: counter_delta(before, after, mask) }
+    }
 }
 
 /// How [`first_narrow`] went: the first reading at most its limit wide
@@ -101,13 +116,15 @@ impl<T, const N: usize> NarrowReading<T, N> {
     }
 
     /// How many readings were taken again because the one before was too
-    /// wide.
+    /// wide: at most `N - 1`.
     pub fn retries(&self) -> usize {
         self.taken.saturating_sub(1)
     }
 }
 
-/// Up to `N` readings from `take`, until one is at most `limit` wide.
+/// Up to `N` readings from `take`, until one is at most `limit` wide (in the
+/// bracketing clock's units).
+#[must_use]
 pub fn first_narrow<T, const N: usize>(limit: u64, mut take: impl FnMut() -> Bracketed<T>) -> NarrowReading<T, N> {
     let mut out = NarrowReading { reading: None, widths: [0; N], taken: 0 };
     while out.taken < N {
@@ -116,7 +133,7 @@ pub fn first_narrow<T, const N: usize>(limit: u64, mut take: impl FnMut() -> Bra
         out.taken += 1;
         if r.width <= limit {
             out.reading = Some(r);
-            break;
+            return out;
         }
     }
     out
@@ -182,7 +199,9 @@ impl fmt::Display for Window {
 /// end is a reading of the reference between two TSC reads, paused before or
 /// after the reference is read (either widens that end's gap); `Started` and
 /// `Ended` are only the PIT's (the HPET's first and last readings are its
-/// start and end).
+/// start and end). The kernel's `now_ns`-against-HPET ktests pause at the
+/// same four reading points, in [`Bracketed`] readings of the HPET between
+/// two `now_ns` reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pause {
     /// After the PIT started counting, before its start reading. Harmless:
@@ -717,6 +736,29 @@ mod tests {
         assert_eq!(counter_midpoint(0xffff_fff0, 0x10, 0xffff_ffff), 0, "a 32-bit counter wrapped");
         assert_eq!(counter_midpoint(0xffff_fff0, 0x8, 0xffff_ffff), 0xffff_fffc, "wrapped, midpoint before it");
         assert_eq!(counter_midpoint(u64::MAX - 1, 4, u64::MAX), 1, "a 64-bit counter wrapped");
+    }
+
+    #[test]
+    fn a_bracketed_reading_is_placed_within_half_its_width_of_both_ends() {
+        let cases = [
+            (10, 30, u64::MAX),
+            (10, 31, u64::MAX),
+            (7, 7, u64::MAX),
+            (0xffff_fff0, 0x10, 0xffff_ffff), // a 32-bit counter wrapped
+            (0xffff_fff0, 0x9, 0xffff_ffff),
+            (u64::MAX - 2, 4, u64::MAX), // a 64-bit one wrapped
+        ];
+        for (before, after, mask) in cases {
+            let b = Bracketed::between(before, 'v', after, mask);
+            assert_eq!((b.value, b.width), ('v', counter_delta(before, after, mask)), "{before} {after}");
+            let half_up = b.width.div_ceil(2);
+            assert!(counter_delta(before, b.at, mask) <= half_up, "{before} {after}: {b:?}");
+            assert!(counter_delta(b.at, after, mask) <= half_up, "{before} {after}: {b:?}");
+            assert_eq!(counter_delta(before, b.at, mask) + counter_delta(b.at, after, mask), b.width);
+        }
+        // A clock read going backwards (`now_ns` jumping back) is a huge
+        // width, never a narrow reading.
+        assert_eq!(Bracketed::between(1_000, (), 999, u64::MAX).width, u64::MAX);
     }
 
     fn bracketed(width: u64) -> Bracketed<u64> {

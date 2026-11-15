@@ -26,14 +26,17 @@ tests = [
 ]
 
 [[feature]]
-name = "The ktests' clock cross-checks read one clock between two reads of the other and place it at their midpoint, reporting the widths: now_ns around each HPET reading (a bracket over 100 µs, a stall, is read again, and if every reading at one end is wide the check fails, listing the widths) and the HPET around each local APIC timer reading"
+name = "now_ns checked against the HPET with each HPET reading between two now_ns reads, placed at their midpoint: a reading over 100 µs wide is read again, one stalled reading at each end still passes, and every reading at one end wide fails; the brackets and retries (bounded) are reported on every run, and the timer check's HPET brackets have widths"
 milestone = "M3"
 tests = [
     "cargo:lumen-time",
     "ktest:lumen_kernel::time::now_ns_follows_the_hpet",
+    "ktest:lumen_kernel::time::an_hpet_reading_is_placed_at_its_brackets_midpoint",
     "ktest:lumen_kernel::time::a_stalled_hpet_bracket_is_read_again",
     "ktest:lumen_kernel::time::every_stalled_hpet_bracket_is_a_failure",
+    "ktest:lumen_kernel::time::one_stalled_reading_at_each_end_still_passes",
     "ktest:lumen_kernel::time::the_timer_is_programmed_for_1_khz",
+    "scenario:test_ktest::test_in_kernel_tests_pass",
 ]
 
 [[feature]]
