@@ -30,7 +30,7 @@ pub struct Driver {
 }
 
 /// Every driver, in the order they are offered a function.
-pub static DRIVERS: &[Driver] = &[];
+pub static DRIVERS: &[Driver] = &[crate::sound::DRIVER];
 
 static PROBED: AtomicBool = AtomicBool::new(false);
 

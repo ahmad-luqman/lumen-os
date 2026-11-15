@@ -653,6 +653,8 @@ fn engine(state: &Rc<State>) -> Engine {
     e.register_fn("trace", trace);
     let s = state.clone();
     e.register_fn("sleep", move |ms: i64| sleep(&s, ms));
+    e.register_fn("beep", || beep(440, 200));
+    e.register_fn("beep", beep);
 
     let s = state.clone();
     e.register_fn("draw_pixel", move |x: i64, y: i64, c: i64| {
@@ -733,6 +735,18 @@ fn sleep(state: &State, ms: i64) -> Result<(), Box<EvalAltResult>> {
         }
         crate::time::sleep((end - now).min(state.limits.poll_ns.max(1_000_000)));
     }
+}
+
+/// `beep(hz, ms)` (or `beep()`: 440 Hz for 200 ms): starts the beep and
+/// returns while it plays; an error without a sound device.
+fn beep(hz: i64, ms: i64) -> Result<(), Box<EvalAltResult>> {
+    let (Ok(hz), Ok(ms)) = (u32::try_from(hz), u32::try_from(ms)) else {
+        return Err(alloc::format!("beep({hz}, {ms}): hz and ms must be 0 or more").into());
+    };
+    if ms > crate::sound::MAX_BEEP_MS {
+        return Err(alloc::format!("beep: {ms} ms is longer than {} ms", crate::sound::MAX_BEEP_MS).into());
+    }
+    crate::sound::beep(hz, ms).map(drop).map_err(|e| alloc::format!("beep: {e}").into())
 }
 
 /// A size in bytes, as MiB or KiB when it is a whole number of them.

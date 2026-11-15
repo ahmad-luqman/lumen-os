@@ -27,3 +27,42 @@ milestone = "M3"
 tests = [
     "harness:test_audio::*",
 ]
+
+[[feature]]
+name = "virtio-sound driver: binds QEMU's sound device (`lspci` shows `sound: bound`) and picks its first output stream's format (signed 16-bit, stereo else mono, 44.1 kHz else 48 kHz else a lower then a higher rate), refusing a stream without 16-bit samples, without 1 or 2 channels or without a rate it plays, saying which; `sound` shows the device, its format and its record (state, sounds played, frames, underruns, volume), which also filters in a pipeline"
+milestone = "M3"
+tests = [
+    "scenario:test_sound::test_lspci_shows_sound_bound",
+    "ktest:lumen_kernel::sound::formats_are_chosen_from_what_the_stream_supports",
+    "ktest:lumen_kernel::sound::the_record_fits_its_columns",
+]
+
+[[feature]]
+name = "`beep 440 500` plays a 440 Hz tone (within 1%) lasting 500 ms (within 10%) into QEMU's wav audiodev, and returns while it plays; the samples handed to the device are the tone's, rounded up to whole 20 ms periods"
+milestone = "M3"
+tests = [
+    "scenario:test_sound::test_tone_is_captured",
+]
+
+[[feature]]
+name = "`play` plays a melody's notes in order at their pitch (within 1%) and tempo (four quarter notes at 120 in 2 s, within 5%), returning when it has played; `q` stops it early (`play: stopped`); a melody that doesn't parse or a frequency the sample rate can't carry is refused with the reason before anything plays"
+milestone = "M3"
+tests = [
+    "scenario:test_sound::test_melody_notes_in_order",
+    "scenario:test_sound::test_play_stops_on_q",
+    "scenario:test_sound::test_bad_sounds_are_refused[*]",
+]
+
+[[feature]]
+name = "`volume` shows and sets the volume new sounds get (0-100%, more refused): a beep at 25% is about a quarter as loud as one at 100%; `beep(hz, ms)` plays from a rhai script"
+milestone = "M3"
+tests = [
+    "scenario:test_sound::test_volume_and_beep_from_rhai",
+]
+
+[[feature]]
+name = "Without a sound device, `beep`, `play`, `sound` (also as records: none, with a note) and rhai's `beep` say `no sound device`; bad arguments are refused first"
+milestone = "M3"
+tests = [
+    "scenario:test_sound::test_no_sound_device_message",
+]

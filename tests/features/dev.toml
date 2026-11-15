@@ -70,7 +70,7 @@ tests = [
 ]
 
 [[feature]]
-name = "`lspci`'s driver column: with no driver rows yet, every function (the virtio ones included) shows `no driver` and boot reports no device bound, failed, declined or refused; the column filters like the others"
+name = "`lspci`'s driver column: the sound device shows `sound: bound`, every function without a driver row (the other virtio ones included) shows `no driver`, and boot reports one device bound and none failed, declined or refused; the column filters like the others"
 milestone = "M3"
 tests = [
     "scenario:test_pci::test_lspci_shows_no_driver",

@@ -223,6 +223,7 @@ dependencies = [
  "lumen-pci",
  "lumen-queue",
  "lumen-shell",
+ "lumen-synth",
  "lumen-term",
  "lumen-time",
  "lumen-trace",

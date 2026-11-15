@@ -56,8 +56,9 @@
 //!   sets `DEVICE_NEEDS_RESET` (or a driver set `FAILED`; all ones, a
 //!   device gone, shows as `FAILED`). Known limits:
 //!   `VirtIORng::request_entropy` and sound's control requests spin
-//!   unbounded in the crate (#97 drives its own queue; #99's control path
-//!   is done once at setup); `PciTransport`'s `Drop` spins until the status
+//!   unbounded in the crate (#97 drives its own queue; #99's control
+//!   requests run in its probe and on its own thread around each sound,
+//!   outside the bounded waits for periods); `PciTransport`'s `Drop` spins until the status
 //!   reads 0, so the [`VirtioTransport`]'s `Drop` waits a bounded time
 //!   first and, for a device that doesn't reset, logs it, turns its bus
 //!   mastering off and leaks the `PciTransport` instead. [`transport`] must
@@ -82,6 +83,7 @@
 // and `probe_all`'s bookkeeping use it.
 #![cfg_attr(not(feature = "ktest"), allow(dead_code))]
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 use core::mem::ManuallyDrop;
@@ -413,6 +415,9 @@ pub enum ProbeError {
     /// share an id, told apart only by their configuration): `probe_all`
     /// frees the function and offers it to the next driver row.
     NotMine,
+    /// The device offers nothing this driver can use (sound: no output
+    /// stream, or none taking 16-bit samples): why.
+    Unsupported(String),
 }
 
 impl fmt::Display for ProbeError {
@@ -426,6 +431,7 @@ impl fmt::Display for ProbeError {
             }
             ProbeError::Wait(e) => write!(f, "{e}"),
             ProbeError::NotMine => f.write_str("not this driver's device"),
+            ProbeError::Unsupported(why) => write!(f, "unsupported device: {why}"),
         }
     }
 }
@@ -745,7 +751,21 @@ impl StatusHandle {
     /// thread may have been preempted past the deadline). Gives up early if
     /// the status shows `DEVICE_NEEDS_RESET` or `FAILED`. Busy-waits: call it
     /// without a lock held (after `time::init`).
-    pub fn wait_until(&self, timeout_ns: u64, mut ready: impl FnMut() -> bool) -> Result<(), WaitError> {
+    pub fn wait_until(&self, timeout_ns: u64, ready: impl FnMut() -> bool) -> Result<(), WaitError> {
+        self.wait(timeout_ns, None, ready)
+    }
+
+    /// [`wait_until`](Self::wait_until), sleeping `pause_ns` between looks
+    /// instead of spinning: for a wait as long as the device takes to play
+    /// something (sound's periods, #99), which would otherwise keep a CPU
+    /// busy throughout. From a thread that can block (elsewhere
+    /// `time::sleep` spins), without a lock held. Until MSI-X (#96) wakes
+    /// the driver instead.
+    pub fn sleep_until(&self, timeout_ns: u64, pause_ns: u64, ready: impl FnMut() -> bool) -> Result<(), WaitError> {
+        self.wait(timeout_ns, Some(pause_ns), ready)
+    }
+
+    fn wait(&self, timeout_ns: u64, pause_ns: Option<u64>, mut ready: impl FnMut() -> bool) -> Result<(), WaitError> {
         let start = crate::time::now_ns();
         let deadline = start.saturating_add(timeout_ns);
         loop {
@@ -764,7 +784,10 @@ impl StatusHandle {
             if now >= deadline {
                 return if ready() { Ok(()) } else { Err(WaitError::Timeout { waited_ns: now - start, status }) };
             }
-            core::hint::spin_loop();
+            match pause_ns {
+                Some(ns) => crate::time::sleep(ns.min(deadline - now)),
+                None => core::hint::spin_loop(),
+            }
         }
     }
 }

@@ -25,6 +25,7 @@ lumen-mm.workspace = true
 lumen-pci.workspace = true
 lumen-queue.workspace = true
 lumen-shell.workspace = true
+lumen-synth.workspace = true
 lumen-term.workspace = true
 lumen-time.workspace = true
 lumen-trace.workspace = true

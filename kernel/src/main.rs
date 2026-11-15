@@ -48,6 +48,7 @@ mod sched;
 mod script;
 mod shell;
 mod smp;
+mod sound;
 mod symbols;
 mod sync;
 mod term;
