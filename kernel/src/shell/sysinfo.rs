@@ -13,7 +13,7 @@
 use super::{Ctx, write_in_chunks};
 use crate::arch::{self, MAX_CPUS, idt};
 use crate::sched::{self, CpuTicks, ThreadInfo};
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
@@ -334,19 +334,22 @@ pub fn lspci(ctx: &mut Ctx<'_>, args: &[String]) {
 
 /// `lspci`'s rows: the address, vendor and device ids (four hex digits,
 /// so `where vendor = 0x1af4` works), the class's name and the device's
-/// (`-` if Lumen doesn't know it).
+/// (`-` if Lumen doesn't know it), and its driver (`no driver`, `not
+/// probed: <reason>`, `<driver>: bound` or `<driver>: failed: <reason>`).
 fn pci_table() -> pipe::Table {
-    const COLUMNS: [Column; 5] = [
+    const COLUMNS: [Column; 6] = [
         Column::new("addr", Kind::Text, Align::Left, 12),
         Column::new("vendor", Kind::Hex16, Align::Left, 6),
         Column::new("device", Kind::Hex16, Align::Left, 6),
         Column::new("class", Kind::Text, Align::Left, 0),
         Column::new("name", Kind::Text, Align::Left, 0),
+        Column::new("driver", Kind::Text, Align::Left, 0),
     ];
     let mut t = pipe::Table::new(&COLUMNS);
     for d in crate::pci::devices() {
         let addr = Value::Text(alloc::format!("{}", d.addr));
-        t.push(vec![addr, int(d.vendor), int(d.device), text(d.class_name()), d.name().map_or(DASH, text)]);
+        let driver = crate::pci::binding(d.addr).map_or(DASH, |b| Value::Text(b.to_string()));
+        t.push(vec![addr, int(d.vendor), int(d.device), text(d.class_name()), d.name().map_or(DASH, text), driver]);
     }
     t
 }

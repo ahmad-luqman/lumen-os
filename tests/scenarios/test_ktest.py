@@ -3,14 +3,16 @@
 import re
 
 from lumen_harness import save_ktest_tap, tap
-from lumen_harness.qemu import EXIT_CRASH, EXIT_SUCCESS
+from lumen_harness.qemu import EXIT_CRASH, EXIT_SUCCESS, Devices
 
 
 def test_in_kernel_tests_pass(boot):
     # With other CPUs online (idle), so the per-CPU state, the heap, the
     # stack registry and the frame allocator are tested with their stacks and
-    # state in place, as on any multi-CPU machine.
-    m = boot("ktest", extra=["-smp", "4"])
+    # state in place, as on any multi-CPU machine. With virtio devices no
+    # driver takes in M3 (network, block, 9p), for the virtio adapter's
+    # ktests to claim and probe.
+    m = boot("ktest", extra=["-smp", "4"], devices=Devices(blk_mib=1, net=True, share=True))
     code = m.wait_exit(120)
     out = m.output
     report = tap.parse(out)

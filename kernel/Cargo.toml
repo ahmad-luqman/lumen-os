@@ -35,6 +35,8 @@ rustc-demangle.workspace = true
 noto-sans-mono-bitmap.workspace = true
 pc-keyboard.workspace = true
 rhai.workspace = true
+virtio-drivers.workspace = true
+zerocopy.workspace = true
 
 [lints]
 workspace = true

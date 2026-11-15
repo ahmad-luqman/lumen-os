@@ -33,6 +33,7 @@ mod boot;
 mod cmdline;
 mod crash;
 mod demo;
+mod drivers;
 mod fb;
 mod interrupts;
 mod keyboard;
@@ -51,6 +52,7 @@ mod sync;
 mod term;
 mod time;
 mod trace;
+mod virtio;
 mod vt;
 
 use log::{LevelFilter, debug, info, warn};
@@ -211,6 +213,9 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     debug!(target: "serial", "COM1: {:?}", arch::serial::mode());
     ktrace!(Kind::BootPhase, BootPhase::Framebuffer);
     keyboard::init();
+    // Drivers may wait (bounded) and start threads, so after the
+    // scheduler and the clocks; before the shells.
+    drivers::probe_all();
 
     info!(target: "boot", "boot complete");
     ktrace!(Kind::BootPhase, BootPhase::Complete);

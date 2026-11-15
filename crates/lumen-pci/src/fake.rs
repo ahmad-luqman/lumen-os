@@ -124,6 +124,22 @@ impl Function {
         self
     }
 
+    /// The body of a vendor-specific capability `caps` laid out at `at`, as
+    /// virtio's `virtio_pci_cap` (virtio 1.2 §4.1.4): its length field,
+    /// `cfg_type`, BAR, offset and length (each dword only if it fits in
+    /// the 256 bytes the fake has).
+    pub fn virtio_cap(mut self, at: u8, cap_len: u8, cfg_type: u8, bar: u8, offset: u32, length: u32) -> Function {
+        let at = usize::from(at);
+        self.set_byte(at + 2, cap_len);
+        self.set_byte(at + 3, cfg_type);
+        for (n, value) in [(1, u32::from(bar)), (2, offset), (3, length)] {
+            if let Some(r) = self.regs.get_mut(at / 4 + n) {
+                *r = value;
+            }
+        }
+        self
+    }
+
     pub fn command(&self) -> u16 {
         self.regs[1] as u16
     }

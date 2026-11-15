@@ -19,7 +19,7 @@ tests = [
 ]
 
 [[feature]]
-name = "The BAR registry records every memory BAR found at boot, all unmapped, and maps one only when asked: once (the same mapping again, one entry mapped), uncached, to its physical address, looked up without mapping before and after; a BAR that can't be mapped is refused naming the function, the BAR and why (out of range, no such function, I/O, not implemented)"
+name = "The BAR registry records every memory BAR found at boot (one slot per function, in address order), nothing mapped for a function nobody claimed, and maps one only when asked: once (the same mapping again, one entry mapped), uncached, to its physical address, looked up without mapping before and after; a BAR that can't be mapped is refused naming the function, the BAR and why (out of range, no such function, I/O, not implemented)"
 milestone = "M3"
 tests = [
     "ktest:lumen_kernel::pci::the_registry_records_every_memory_bar_and_maps_each_once",
@@ -38,4 +38,36 @@ tests = [
     "ktest:lumen_kernel::shell::sysinfo::every_record_table_fits_its_columns",
     "ktest:lumen_kernel::shell::sysinfo::system_commands_print_a_header_and_rows",
     "cargo:lumen-shell",
+]
+
+[[feature]]
+name = "Claiming a PCI function for a driver: once per function (a second claim is refused, saying who has it), every memory BAR mapped, then memory space and bus master on and I/O space off in the command register; a function whose BAR can't be mapped (QEMU's VGA, whose framebuffer the HHDM maps) is refused naming the BAR, the range and the error, and recorded as not probed; `probe_all`'s loop offers each function to the first matching driver row only, logs `probing <driver> on <addr>`, records a failed probe (`<driver>: failed: <reason>`, a warning with the DMA runs outstanding before and after) or a bound one, and doesn't offer a claimed function again"
+milestone = "M3"
+tests = [
+    "ktest:lumen_kernel::virtio::a_claimed_device_has_memory_space_and_bus_master_on_and_io_off",
+    "ktest:lumen_kernel::virtio::a_claim_that_cant_map_a_bar_is_refused_and_recorded",
+    "ktest:lumen_kernel::drivers::probing_records_each_outcome",
+]
+
+[[feature]]
+name = "virtio DMA owned by the frame allocator (virtio-drivers' Hal): `dma_alloc` gives zeroed, contiguous frames the allocator handed out (not reserved), recorded in the table of outstanding runs, and `dma_dealloc` frees exactly that run (a wrong length, another address or a second free refused, freeing nothing); shared buffers are bounced through fresh runs: a heap buffer straddling a page boundary reaches the device as one contiguous copy, a buffer from the device starts zeroed and is copied back, a two-page-and-a-byte buffer takes three frames, and every bounce run is freed"
+milestone = "M3"
+tests = [
+    "ktest:lumen_kernel::virtio::dma_frames_are_owned_and_freed",
+    "ktest:lumen_kernel::virtio::share_bounces_a_buffer_across_pages",
+]
+
+[[feature]]
+name = "The virtio adapter: a claimed virtio PCI device (QEMU's virtio-blk) is brought up through `PciTransport` on the function's own configuration space and the Hal's BAR lookups, after checking that the first virtio capability of each type 1-4 (common, notify, ISR, device; length field 16, notify 20) lies inside a mapped memory BAR and that the capabilities the crate reads fit the 256-byte header (host-tested: QEMU's layout accepted; an unmapped or out-of-range BAR, a structure past its BAR's end or 4 GiB, a capability near the header's end refused; skipped and duplicate capabilities ignored as the crate does); its device status handle reads what the transport does, and a bounded wait returns on time or when the device reports FAILED"
+milestone = "M3"
+tests = [
+    "cargo:lumen-pci",
+    "ktest:lumen_kernel::virtio::transport_brings_up_a_virtio_device_through_the_hal",
+]
+
+[[feature]]
+name = "`lspci`'s driver column: with no driver rows yet, every function (the virtio ones included) shows `no driver` and boot reports no device bound, failed or refused; the column filters like the others"
+milestone = "M3"
+tests = [
+    "scenario:test_pci::test_lspci_shows_no_driver",
 ]

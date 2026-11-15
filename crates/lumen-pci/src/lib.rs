@@ -20,6 +20,7 @@ pub mod cap;
 mod device;
 pub mod names;
 mod problem;
+pub mod virtio;
 
 use core::fmt;
 use core::ops::RangeInclusive;

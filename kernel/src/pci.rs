@@ -28,6 +28,7 @@
 //! copy it out.
 
 use alloc::boxed::Box;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -35,7 +36,7 @@ use log::{debug, info, warn};
 use lumen_acpi::EcamRegion;
 use lumen_mm::{PhysAddr, VirtAddr};
 pub use lumen_pci::{Bar, BarProblem, DeviceInfo, NoBar, PciAddr};
-use lumen_pci::{ConfigSpace, ecam_offset, enumerate};
+use lumen_pci::{ConfigSpace, command, ecam_offset, enumerate};
 
 use crate::acpi::{self, Failure};
 use crate::mm::paging::{self, MmioError};
@@ -88,7 +89,10 @@ impl ConfigSpace for Ecam {
 
     fn write(&mut self, addr: PciAddr, offset: u16, value: u32) {
         // SAFETY: as in `read`. Only this module writes configuration
-        // space (BAR sizing and command registers at enumeration).
+        // space: BAR sizing and command registers at enumeration, the
+        // claim's command register, and a claimed function's own space
+        // through its `FunctionConfig` (`virtio-drivers` sizing its BARs
+        // while probing).
         unsafe { self.dword(addr, offset).write_volatile(value) }
     }
 }
@@ -167,9 +171,8 @@ enum Discovery {
 
 static DISCOVERY: SpinLock<Discovery> = SpinLock::new(Discovery::NotYet);
 
-/// The mapped configuration space, for #95's claim and its function
-/// config (nothing outside this module reaches it).
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // read by ktests until #95
+/// The mapped configuration space, for the claim and each claimed
+/// function's [`FunctionConfig`] (nothing outside this module reaches it).
 static ECAM: SpinLock<Option<Ecam>> = SpinLock::new(None);
 
 fn discovery() -> (&'static [DeviceInfo], Status) {
@@ -235,27 +238,29 @@ fn discover() -> (Vec<DeviceInfo>, Status) {
         enumerate(&mut ecam, m.segment(), m.buses(), |d| found.push(d));
     }
     found.sort_unstable_by_key(|d| d.addr);
-    let mut bars = Vec::new();
+    let mut slots = Vec::with_capacity(found.len());
     for d in &found {
         debug!(target: "pci", "{d}");
         for problem in d.problems(|segment, bus| ecam.covers(segment, bus)) {
             warn!(target: "pci", "{}: {problem}", d.addr);
         }
-        for (index, bar) in d.bars.iter().enumerate() {
-            if let Some(Bar::Memory { phys, size, .. }) = *bar {
-                bars.push(BarEntry { addr: d.addr, index, phys, size, mapped: None });
+        let mut bars = [None; 6];
+        for (entry, bar) in bars.iter_mut().zip(d.bars) {
+            if let Some(Bar::Memory { phys, size, .. }) = bar {
+                *entry = Some(BarEntry { phys, size, mapped: None });
             }
         }
+        slots.push(Slot { addr: d.addr, bars, binding: Binding::Free });
     }
+    let memory_bars = slots.iter().map(|s| s.bars.iter().flatten().count()).sum::<usize>();
     let plural = if found.len() == 1 { "" } else { "s" };
     info!(
         target: "pci",
-        "{} function{plural}, {} memory BARs, through ECAM: {}",
+        "{} function{plural}, {memory_bars} memory BARs, through ECAM: {}",
         found.len(),
-        bars.len(),
         Regions(&ecam)
     );
-    *REGISTRY.lock() = bars;
+    *REGISTRY.lock() = slots;
     *ECAM.lock() = Some(ecam);
     (found, Status { missing: None, skipped })
 }
@@ -297,32 +302,79 @@ impl fmt::Display for Regions<'_> {
 /// address space, which mapping it then refuses.)
 #[derive(Clone, Copy, Debug)]
 struct BarEntry {
-    addr: PciAddr,
-    index: usize,
     phys: u64,
     size: u64,
     mapped: Option<BarMapping>,
 }
 
-/// The BAR registry: every memory BAR, in address order. The one record
-/// of BAR mappings.
-static REGISTRY: SpinLock<Vec<BarEntry>> = SpinLock::new(Vec::new());
+/// One function's entry in the registry: its memory BARs (by index) and
+/// who has it.
+#[derive(Clone, Debug)]
+struct Slot {
+    addr: PciAddr,
+    bars: [Option<BarEntry>; 6],
+    binding: Binding,
+}
+
+/// The registry: one slot per function, in [`devices`]' order. The one
+/// record of BAR mappings and of claims.
+static REGISTRY: SpinLock<Vec<Slot>> = SpinLock::new(Vec::new());
+
+/// `f` on `addr`'s slot, under the registry's lock; `None` if enumeration
+/// found no such function.
+fn with_slot<R>(addr: PciAddr, f: impl FnOnce(&mut Slot) -> R) -> Option<R> {
+    let i = devices().binary_search_by_key(&addr, |d| d.addr).ok()?;
+    let mut registry = REGISTRY.lock();
+    let slot = registry.get_mut(i)?;
+    debug_assert_eq!(slot.addr, addr, "the registry is in devices() order");
+    Some(f(slot))
+}
+
+/// Who has a function: what `lspci`'s driver column shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Binding {
+    /// No driver claimed it (none matches it, or none was offered it).
+    Free,
+    /// A driver matched it but the claim refused: why.
+    NotProbed(String),
+    /// Claimed by this driver, which is probing it.
+    Probing(&'static str),
+    Bound(&'static str),
+    /// The driver's probe failed: why.
+    Failed(&'static str, String),
+}
+
+impl fmt::Display for Binding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Binding::Free => f.write_str("no driver"),
+            Binding::NotProbed(why) => write!(f, "not probed: {why}"),
+            Binding::Probing(driver) => write!(f, "{driver}: probing"),
+            Binding::Bound(driver) => write!(f, "{driver}: bound"),
+            Binding::Failed(driver, why) => write!(f, "{driver}: failed: {why}"),
+        }
+    }
+}
+
+/// Who has `addr` (for `lspci`); `None` if there is no such function.
+pub fn binding(addr: PciAddr) -> Option<Binding> {
+    with_slot(addr, |s| s.binding.clone())
+}
 
 /// A memory BAR's mapping: uncached, for the kernel's life.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: #95's claim
 pub struct BarMapping {
     phys: PhysAddr,
     virt: VirtAddr,
     size: u64,
 }
 
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: #95's claim
 impl BarMapping {
     pub fn phys(&self) -> PhysAddr {
         self.phys
     }
 
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: rng (#97) or #96's MSI-X table
     pub fn virt(&self) -> VirtAddr {
         self.virt
     }
@@ -330,11 +382,16 @@ impl BarMapping {
     pub fn size(&self) -> u64 {
         self.size
     }
+
+    /// Where `[phys, phys + len)` is mapped, if it lies inside this BAR.
+    pub fn virt_of(&self, phys: u64, len: u64) -> Option<VirtAddr> {
+        let offset = phys.checked_sub(self.phys.as_u64())?;
+        (offset.checked_add(len)? <= self.size).then(|| VirtAddr::new(self.virt.as_u64() + offset)).flatten()
+    }
 }
 
 /// Why BAR `index` of `addr` has no mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: #95's claim
 pub struct BarError {
     pub addr: PciAddr,
     pub index: usize,
@@ -342,7 +399,6 @@ pub struct BarError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: #95's claim
 pub enum BarWhy {
     /// Enumeration found no such function.
     NoSuchFunction,
@@ -403,30 +459,204 @@ fn check_bar(addr: PciAddr, index: usize) -> Result<(), BarError> {
 /// Memory BAR `index` of `addr`, mapped (uncached) the first time it is
 /// asked for; later calls return the same mapping. The registry's lock is
 /// held across `map_mmio`, so two callers can't map one BAR twice.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first caller: #95's claim
 fn map_bar(addr: PciAddr, index: usize) -> Result<BarMapping, BarError> {
     check_bar(addr, index)?;
-    let mut registry = REGISTRY.lock();
-    let e = registry.iter_mut().find(|e| e.addr == addr && e.index == index).expect("every memory BAR is registered");
-    if let Some(m) = e.mapped {
-        return Ok(m);
-    }
-    let (raw, size) = (e.phys, e.size);
-    let fail = |error| BarError { addr, index, why: BarWhy::Mmio { phys: raw, size, error } };
-    let phys = PhysAddr::new(raw).ok_or(fail(MmioError::BadRange))?;
-    let virt = paging::map_mmio(phys, size).map_err(fail)?;
-    Ok(*e.mapped.insert(BarMapping { phys, virt, size }))
+    let mapped = with_slot(addr, |slot| {
+        let e = slot.bars[index].as_mut().expect("every memory BAR is registered");
+        if let Some(m) = e.mapped {
+            return Ok(m);
+        }
+        let (raw, size) = (e.phys, e.size);
+        let fail = |error| BarError { addr, index, why: BarWhy::Mmio { phys: raw, size, error } };
+        let phys = PhysAddr::new(raw).ok_or(fail(MmioError::BadRange))?;
+        let virt = paging::map_mmio(phys, size).map_err(fail)?;
+        Ok(*e.mapped.insert(BarMapping { phys, virt, size }))
+    });
+    mapped.expect("check_bar found the function")
 }
 
 /// Memory BAR `index` of `addr`'s mapping, if [`map_bar`] made one; maps
-/// nothing (for #95's pre-probe check and `mmio_phys_to_virt`, and #96's
-/// MSI-X table).
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first caller: #95's probe
+/// nothing (for the virtio adapter's pre-probe check and
+/// `mmio_phys_to_virt`, and #96's MSI-X table).
 fn mapped_bar(addr: PciAddr, index: usize) -> Result<BarMapping, BarError> {
     check_bar(addr, index)?;
-    let registry = REGISTRY.lock();
-    let e = registry.iter().find(|e| e.addr == addr && e.index == index).expect("every memory BAR is registered");
-    e.mapped.ok_or(BarError { addr, index, why: BarWhy::NotMapped })
+    let mapped = with_slot(addr, |slot| slot.bars[index].expect("every memory BAR is registered").mapped);
+    mapped.expect("check_bar found the function").ok_or(BarError { addr, index, why: BarWhy::NotMapped })
+}
+
+/// Why [`claim`] refused a function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaimError {
+    /// Enumeration found no such function.
+    NoSuchFunction,
+    /// It was claimed before (by `probe_all` or a test): who has it.
+    Taken(Binding),
+    /// Its capability list was cut off or not read.
+    Caps(lumen_pci::CapEnd),
+    /// A memory BAR couldn't be mapped (or is unassigned or malformed).
+    Bar(BarError),
+}
+
+impl fmt::Display for ClaimError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ClaimError::NoSuchFunction => f.write_str("no such function"),
+            ClaimError::Taken(b) => write!(f, "already claimed ({b})"),
+            ClaimError::Caps(end) => write!(f, "capability list {end}"),
+            ClaimError::Bar(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Give `addr` to `driver`: once per function (a second claim is
+/// [`ClaimError::Taken`], whoever asks), recorded in the registry as
+/// [`Binding::Probing`]. Maps every memory BAR (an I/O BAR or an
+/// unimplemented slot is skipped; an unassigned or malformed one refuses),
+/// then turns memory space and bus master on and I/O space off in the
+/// command register (`virtio-drivers` never sets bus master, and the
+/// firmware's state isn't trusted). A function whose capability list was
+/// cut off or not read, or whose BAR can't be mapped, is refused and
+/// recorded as [`Binding::NotProbed`] with the reason.
+///
+/// Only `drivers::probe_all` calls this at boot (and ktests, on devices no
+/// driver takes).
+pub fn claim(addr: PciAddr, driver: &'static str) -> Result<DeviceResources, ClaimError> {
+    let Some(info) = devices().iter().find(|d| d.addr == addr) else { return Err(ClaimError::NoSuchFunction) };
+    let taken = with_slot(addr, |slot| match slot.binding {
+        Binding::Free => {
+            slot.binding = Binding::Probing(driver);
+            None
+        }
+        ref other => Some(other.clone()),
+    });
+    if let Some(b) = taken.expect("found in devices()") {
+        return Err(ClaimError::Taken(b));
+    }
+    let refuse = |e: ClaimError| {
+        with_slot(addr, |slot| slot.binding = Binding::NotProbed(e.to_string()));
+        Err(e)
+    };
+    if !info.caps.is_complete() {
+        return refuse(ClaimError::Caps(info.caps.end()));
+    }
+    for (index, bar) in info.bars.iter().enumerate() {
+        match bar {
+            None | Some(Bar::Io { .. } | Bar::Unassigned { io: true, .. }) => {}
+            Some(_) => {
+                if let Err(e) = map_bar(addr, index) {
+                    return refuse(ClaimError::Bar(e));
+                }
+            }
+        }
+    }
+    let mut guard = ECAM.lock();
+    let ecam = guard.as_mut().expect("a function was found, so ECAM is mapped");
+    let before = ecam.read16(addr, lumen_pci::reg::COMMAND);
+    ecam.write_command(addr, (before | command::MEMORY_SPACE | command::BUS_MASTER) & !command::IO_SPACE);
+    Ok(DeviceResources { info })
+}
+
+/// Record how `driver`'s probe of the function it claimed went:
+/// [`Binding::Bound`], or [`Binding::Failed`] with the reason. Panics
+/// unless `addr` is being probed by `driver` (a bug in `probe_all`).
+pub fn probed(addr: PciAddr, driver: &'static str, outcome: Result<(), String>) {
+    with_slot(addr, |slot| {
+        assert_eq!(slot.binding, Binding::Probing(driver), "pci::probed: {addr} isn't being probed by {driver}");
+        slot.binding = match outcome {
+            Ok(()) => Binding::Bound(driver),
+            Err(why) => Binding::Failed(driver, why),
+        };
+    })
+    .unwrap_or_else(|| panic!("pci::probed: no function {addr}"));
+}
+
+/// A claimed function's resources, and nothing else: its `DeviceInfo`, its
+/// memory BARs' mappings and its own configuration space. Only [`claim`]
+/// makes one (private fields, not `Clone`), once per function.
+#[derive(Debug)]
+pub struct DeviceResources {
+    info: &'static DeviceInfo,
+}
+
+impl DeviceResources {
+    pub fn info(&self) -> &'static DeviceInfo {
+        self.info
+    }
+
+    /// Memory BAR `i`'s mapping (the claim mapped every memory BAR); `None`
+    /// for an I/O BAR, an unimplemented slot or `i` above 5.
+    pub fn bar(&self, i: usize) -> Option<BarMapping> {
+        mapped_bar(self.info.addr, i).ok()
+    }
+
+    /// This function's configuration space, and only its.
+    pub fn config(&self) -> FunctionConfig {
+        FunctionConfig { addr: self.info.addr }
+    }
+}
+
+/// One claimed function's configuration space: reads and writes go through
+/// ECAM (its lock taken for each), and another function's address is a bug
+/// that panics. BAR writes happen only in `virtio-drivers`' BAR sizing while
+/// probing, before the device runs (no BAR emulation in M3). Known limit: a
+/// driver could write its own MSI/MSI-X capability through it; #96
+/// programs those through a path private to `pci`.
+#[derive(Debug)]
+pub struct FunctionConfig {
+    addr: PciAddr,
+}
+
+impl FunctionConfig {
+    fn check(&self, addr: PciAddr) {
+        assert_eq!(addr, self.addr, "{}'s config access used for {addr}", self.addr);
+    }
+}
+
+impl ConfigSpace for FunctionConfig {
+    fn read(&mut self, addr: PciAddr, offset: u16) -> u32 {
+        self.check(addr);
+        ECAM.lock().as_mut().expect("claimed, so ECAM is mapped").read(addr, offset)
+    }
+
+    fn write(&mut self, addr: PciAddr, offset: u16, value: u32) {
+        self.check(addr);
+        ECAM.lock().as_mut().expect("claimed, so ECAM is mapped").write(addr, offset, value)
+    }
+}
+
+/// `virtio-drivers`' view: a bus/device/function without a segment, so the
+/// segment is this function's, and anything but this function panics.
+impl virtio_drivers::transport::pci::bus::ConfigurationAccess for FunctionConfig {
+    fn read_word(&self, df: virtio_drivers::transport::pci::bus::DeviceFunction, register_offset: u8) -> u32 {
+        let addr = self.same(df);
+        ECAM.lock().as_mut().expect("claimed, so ECAM is mapped").read(addr, u16::from(register_offset))
+    }
+
+    fn write_word(&mut self, df: virtio_drivers::transport::pci::bus::DeviceFunction, register_offset: u8, data: u32) {
+        let addr = self.same(df);
+        ECAM.lock().as_mut().expect("claimed, so ECAM is mapped").write(addr, u16::from(register_offset), data)
+    }
+
+    // SAFETY (of the contract): every access takes ECAM's lock, so a clone
+    // can't race the original on a register.
+    unsafe fn unsafe_clone(&self) -> Self {
+        FunctionConfig { addr: self.addr }
+    }
+}
+
+impl FunctionConfig {
+    /// `df` as this function's address; panics if it is another function.
+    fn same(&self, df: virtio_drivers::transport::pci::bus::DeviceFunction) -> PciAddr {
+        let a = self.addr;
+        assert!(
+            (df.bus, df.device, df.function) == (a.bus(), a.device(), a.function()),
+            "{a}'s config access used for {:02x}:{:02x}.{:x}",
+            df.bus,
+            df.device,
+            df.function
+        );
+        a
+    }
 }
 
 crate::ktest!(
@@ -481,35 +711,53 @@ crate::ktest!(
 
         use crate::{kassert, kassert_eq};
         let memory_bars = devices().iter().flat_map(|d| d.bars.iter()).flatten().filter(|b| b.is_memory()).count();
-        let entries: Vec<BarEntry> = REGISTRY.lock().clone();
-        kassert_eq!(entries.len(), memory_bars);
+        let slots: Vec<Slot> = REGISTRY.lock().clone();
+        kassert_eq!(slots.len(), devices().len());
+        kassert!(slots.iter().zip(devices()).all(|(s, d)| s.addr == d.addr));
+        let entries: Vec<(PciAddr, usize, BarEntry)> = slots
+            .iter()
+            .filter(|s| s.binding == Binding::Free)
+            .flat_map(|s| s.bars.iter().enumerate().filter_map(move |(i, e)| Some((s.addr, i, (*e)?))))
+            .collect();
+        kassert_eq!(slots.iter().map(|s| s.bars.iter().flatten().count()).sum::<usize>(), memory_bars);
         kassert!(memory_bars > 0);
-        kassert!(entries.iter().all(|e| e.mapped.is_none()));
+        // A function nobody claimed has nothing mapped (the virtio ktests
+        // claim theirs, and other ktests may run first).
+        kassert!(entries.iter().all(|(_, _, e)| e.mapped.is_none()));
         // A BAR with no page in the HHDM (the VGA BAR holding the
-        // framebuffer has some: `map_mmio` refuses it): mapped once,
-        // uncached, to its physical address.
+        // framebuffer has some: `map_mmio` refuses it), of a function no
+        // ktest claims: mapped once, uncached, to its physical address.
         let outside_hhdm = |e: &BarEntry| {
             (e.phys..e.phys + e.size)
                 .step_by(lumen_mm::FRAME_SIZE as usize)
                 .all(|p| PhysAddr::new(p).is_some_and(|p| !paging::hhdm_covers(p, 1)))
         };
-        let e = entries.iter().find(|e| outside_hhdm(e)).copied().ok_or("no memory BAR outside the HHDM")?;
-        let err = |why| Err(BarError { addr: e.addr, index: e.index, why });
-        kassert_eq!(mapped_bar(e.addr, e.index), err(BarWhy::NotMapped));
-        let m = map_bar(e.addr, e.index).map_err(|err| {
+        let not_virtio =
+            |a: &PciAddr| devices().iter().any(|d| d.addr == *a && d.vendor != lumen_pci::names::VIRTIO_VENDOR);
+        let (addr, index, e) = entries
+            .iter()
+            .find(|(a, _, e)| not_virtio(a) && outside_hhdm(e))
+            .copied()
+            .ok_or("no memory BAR outside the HHDM")?;
+        let mapped_now =
+            || REGISTRY.lock().iter().flat_map(|s| s.bars.iter().flatten()).filter(|e| e.mapped.is_some()).count();
+        let before = mapped_now();
+        let err = |why| Err(BarError { addr, index, why });
+        kassert_eq!(mapped_bar(addr, index), err(BarWhy::NotMapped));
+        let m = map_bar(addr, index).map_err(|err| {
             crate::ktest::diag(format_args!("{err}"));
             "mapping failed"
         })?;
         kassert_eq!((m.phys().as_u64(), m.size()), (e.phys, e.size));
-        kassert_eq!(map_bar(e.addr, e.index), Ok(m));
-        kassert_eq!(mapped_bar(e.addr, e.index), Ok(m));
-        kassert_eq!(REGISTRY.lock().iter().filter(|e| e.mapped.is_some()).count(), 1);
+        kassert_eq!(map_bar(addr, index), Ok(m));
+        kassert_eq!(mapped_bar(addr, index), Ok(m));
+        kassert_eq!(mapped_now(), before + 1);
         let walk = paging::walk(m.virt()).mapping().ok_or("not mapped")?;
         kassert_eq!(walk.phys_of(m.virt()), Some(m.phys()));
         kassert_eq!(walk.cache(), Some(Cache::Uncached));
         // What isn't a memory BAR is refused, saying why.
         let fail = |addr, index, why| Err(BarError { addr, index, why });
-        kassert_eq!(map_bar(e.addr, 6), fail(e.addr, 6, BarWhy::OutOfRange));
+        kassert_eq!(map_bar(addr, 6), fail(addr, 6, BarWhy::OutOfRange));
         let nowhere = PciAddr::new(0, 0x80, 31, 7).expect("valid");
         kassert_eq!(map_bar(nowhere, 0), fail(nowhere, 0, BarWhy::NoSuchFunction));
         // q35's ICH9 SATA controller: BAR 4 is I/O, BAR 0 isn't implemented
