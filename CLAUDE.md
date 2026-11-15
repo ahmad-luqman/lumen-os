@@ -206,7 +206,7 @@ own PR that updates that doc first.
   bursts (one FIFO slot left for the crash reporter's byte) (host-tested
   against a model UART).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
-  are built), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
+  are built; virtio devices through `Devices`), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
   `crash.py` (crash-report parsing), `screen.py` (the screen's rows
   through the serial shell's `term text`).
 - `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests.

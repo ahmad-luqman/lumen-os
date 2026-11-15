@@ -127,3 +127,11 @@ tests = [
     "harness:test_ci_config::test_tcg_rerun_step_annotates_every_outcome",
     "harness:test_ci_config::test_last_failed_behaves_as_the_rerun_step_relies_on",
 ]
+
+[[feature]]
+name = "Virtio device options (tablet, keyboard, rng, sound into a wav file, blk on a scratch image, user net with forwarded host ports, 9p host folder) and the CPU model, all off by default; QEMU boots the kernel with every one attached"
+milestone = "M3"
+tests = [
+    "harness:test_devices::*",
+    "scenario:test_pci::test_boots_with_every_virtio_device",
+]

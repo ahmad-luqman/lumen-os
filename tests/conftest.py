@@ -21,7 +21,14 @@ from pathlib import Path
 import pytest
 from lumen_harness import BUILD_DIR, REPO_ROOT, artifact_dir, artifacts_root
 from lumen_harness.crash import BEGIN, END, PROTECTION_BROKEN
-from lumen_harness.qemu import EXIT_CRASH, Machine, default_accel, environment
+from lumen_harness.qemu import (
+    EXIT_CRASH,
+    NO_DEVICES,
+    Devices,
+    Machine,
+    default_accel,
+    environment,
+)
 
 ISOS = {
     "interactive": BUILD_DIR / "lumen.iso",
@@ -72,7 +79,9 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
     built for this test in its artifacts directory (so parallel tests don't
     share one; `qemutest` and `ktest` only). `serial=False` boots without a
     serial port (keyboard, screendumps and the exit code only). `reboot=True`
-    lets a reset boot the machine again (no `-no-reboot`)."""
+    lets a reset boot the machine again (no `-no-reboot`). `devices` attaches
+    virtio devices (`Devices(rng=True)`, `Devices.every()`), `cpu` sets the
+    CPU model (`cpu="max"`)."""
     machines: list[Machine] = []
 
     def _boot(
@@ -82,6 +91,8 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
         cmdline: str | None = None,
         serial: bool = True,
         reboot: bool = False,
+        devices: Devices = NO_DEVICES,
+        cpu: str | None = None,
     ) -> Machine:
         iso = ISOS[variant]
         if not iso.exists():
@@ -94,7 +105,14 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
                 [REPO_ROOT / "tools" / "mkiso.sh", KERNELS[variant], iso, *words], check=True
             )
         m = Machine(
-            iso, sub, trace_interrupts=True, extra_args=extra, serial=serial, reboot=reboot
+            iso,
+            sub,
+            trace_interrupts=True,
+            extra_args=extra,
+            serial=serial,
+            reboot=reboot,
+            devices=devices,
+            cpu=cpu,
         ).start()
         machines.append(m)
         return m
