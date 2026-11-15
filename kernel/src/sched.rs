@@ -827,7 +827,6 @@ impl WaitQueue {
     }
 
     /// Wake the longest-waiting thread; whether there was one.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests; the shell's blocking read (#62)
     pub fn wake_one(&self) -> bool {
         let first = self.waiters.lock().pop_front();
         first.map(wake).is_some()

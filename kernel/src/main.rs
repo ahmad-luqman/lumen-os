@@ -44,11 +44,13 @@ mod mm;
 mod mouse;
 mod pci;
 mod power;
+mod rng;
 mod rtc;
 mod sched;
 mod script;
 mod shell;
 mod smp;
+mod sound;
 mod symbols;
 mod sync;
 mod term;
@@ -218,6 +220,8 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     // Drivers may wait (bounded) and start threads, so after the
     // scheduler and the clocks; before the shells.
     drivers::probe_all();
+    // Randomness: RDRAND, and the virtio-rng the probe brought up.
+    rng::init();
 
     info!(target: "boot", "boot complete");
     ktrace!(Kind::BootPhase, BootPhase::Complete);

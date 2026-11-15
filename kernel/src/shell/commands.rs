@@ -1,7 +1,7 @@
 //! The shell's commands: kmon's, with their names and output (`echo`
 //! joins its words with single spaces; `clear` and `colors` need a console
 //! that takes escape codes), plus `history`, `term text`, `vt`, `reboot`,
-//! `shutdown`, the system commands (`cpus`, `mem`, `irqs`, `threads`,
+//! `shutdown`, `random`, the system commands (`cpus`, `mem`, `irqs`, `threads`,
 //! `lspci`, `mouse`, `dmesg`, `date`, `top`: `sysinfo.rs`) and the filters that come after a
 //! `|` (`grep`, `where`, `sort`, `first`, `count`, `select`: `pipe.rs`). A
 //! table the line editor completes from. Each writes to the console that
@@ -81,8 +81,44 @@ pub static COMMANDS: Table<Run> = Table(&[
         about: "Conway's Game of Life (default gun; generations: stop after that many, a key ends it early):",
         run: crate::demo::life,
     },
+    Command {
+        name: "beep",
+        args: &[],
+        usage: "[hz] [ms]",
+        about: "a square-wave beep (default 440 Hz for 200 ms), played while the shell goes on",
+        run: crate::sound::beep_command,
+    },
+    Command {
+        name: "play",
+        args: &[],
+        usage: "<melody>",
+        about: "play notes, e.g. t=140 C4/8 E4/8 G4/4 r/8 (w=sine changes the waveform; q or Ctrl-C stops it)",
+        run: crate::sound::play_command,
+    },
+    Command {
+        name: "volume",
+        args: &[],
+        usage: "[percent]",
+        about: "the volume of new sounds",
+        run: crate::sound::volume_command,
+    },
+    Command {
+        name: "sound",
+        args: &[],
+        usage: "",
+        about: "the sound device, its format and what it played",
+        run: crate::sound::sound_command,
+    },
     Command { name: "seq", args: &[], usage: "<n>", about: "print 1 to n, a line each", run: seq },
     Command { name: "sleep", args: &[], usage: "<ms>", about: "wait that long (guest time)", run: sleep },
+    Command {
+        name: "random",
+        args: &[],
+        usage: "[bytes | --stats]",
+        about: "random bytes in hex (default 16, up to 4096) from the pool RDRAND and/or virtio-rng feed; \
+                --stats: its sources and counters",
+        run: random,
+    },
     Command { name: "uptime", args: &[], usage: "", about: "nanoseconds since the TSC started", run: uptime },
     Command {
         name: "clocks",
@@ -522,6 +558,38 @@ fn seq(ctx: &mut Ctx<'_>, args: &[String]) {
         }
         _ => ctx.fail("usage: seq <n> (up to 10000)"),
     }
+}
+
+/// `random`'s default and largest byte counts.
+const RANDOM_BYTES: usize = 16;
+const RANDOM_MAX: usize = 4096;
+
+fn random(ctx: &mut Ctx<'_>, args: &[String]) {
+    if matches!(args, [a] if a == "--stats") {
+        let _ = writeln!(ctx.out, "rng: sources: {}; {}", crate::rng::sources(), crate::rng::stats());
+        return;
+    }
+    let n = if args.is_empty() { Some(RANDOM_BYTES) } else { number::<usize>(args) };
+    let Some(n) = n.filter(|n| (1..=RANDOM_MAX).contains(n)) else {
+        return ctx.fail(format_args!("usage: random [bytes | --stats] (bytes: 1 to {RANDOM_MAX})"));
+    };
+    match random_hex(n) {
+        Ok(hex) => {
+            let _ = writeln!(ctx.out, "{hex}");
+        }
+        Err(e) => ctx.fail(format_args!("random: {e}")),
+    }
+}
+
+/// `n` random bytes as lowercase hex.
+fn random_hex(n: usize) -> Result<String, crate::rng::NoSource> {
+    let mut bytes = alloc::vec![0u8; n];
+    crate::rng::fill(&mut bytes)?;
+    let mut s = String::with_capacity(2 * n);
+    for b in &bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    Ok(s)
 }
 
 fn sleep(ctx: &mut Ctx<'_>, args: &[String]) {

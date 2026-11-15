@@ -28,11 +28,12 @@
 //!   many runs are outstanding); buffers still posted when their queue is
 //!   dropped are never unshared (`VirtQueue` has no `Drop` that does), so a
 //!   probe failing partway leaks frames and table entries, and so does a
-//!   driver dropped later: the tablet's, when its device fails
-//!   (`drivers::probe_all` reports the runs that probe attempt left: only
-//!   those of the probing thread and threads made during the attempt are
-//!   charged to it, not those an older driver's thread hands out
-//!   meanwhile).
+//!   driver dropping a device with a buffer still posted (rng after a
+//!   request that gave up: it reports the runs it leaked; the tablet's,
+//!   when its device fails) (`drivers::probe_all` reports the runs that
+//!   probe attempt left: only those of the probing thread and threads made
+//!   during the attempt are charged to it, not those an older driver's
+//!   thread hands out meanwhile).
 //! - **Drop order.** DMA memory must not be freed under a live device:
 //!   reset the transport before any queue is dropped. A driver keeps its
 //!   queues in a struct field declared after the transport (fields drop in
@@ -59,8 +60,11 @@
 //!   sets `DEVICE_NEEDS_RESET` (or a driver set `FAILED`; all ones, a
 //!   device gone, shows as `FAILED`). Known limits:
 //!   `VirtIORng::request_entropy` and sound's control requests spin
-//!   unbounded in the crate (#97 drives its own queue; #99's control path
-//!   is done once at setup); `PciTransport`'s `Drop` spins until the status
+//!   unbounded in the crate (#97 drives its own queue; #99's control
+//!   requests run in its probe and on its own thread around each sound,
+//!   outside the bounded waits for periods; the crate's `pcm_xfer_ok`
+//!   doesn't read a period's status reply, so a period the device refused
+//!   counts as played); `PciTransport`'s `Drop` spins until the status
 //!   reads 0, so the [`VirtioTransport`]'s `Drop` waits a bounded time
 //!   first and, for a device that doesn't reset, logs it, turns its bus
 //!   mastering off and leaks the `PciTransport` instead. [`transport`] must
@@ -81,9 +85,8 @@
 //! Locks: the probe lock, then the probe scope or ECAM (each taken last);
 //! the run table before the probe owner and the frame allocator.
 
-// Still used only by the ktests until rng (#97) and sound (#99) land:
-// `StatusHandle::wait_until` and `WaitError` (bounded waits), and
-// `outstanding_runs_of_function`.
+// Parts of the adapter (run counts, the status bits) are used only by the
+// ktests until more drivers use them.
 #![cfg_attr(not(feature = "ktest"), allow(dead_code))]
 
 use alloc::string::String;
@@ -435,13 +438,14 @@ pub enum ProbeError {
     Wait(WaitError),
     /// Not this driver's device after all (one its row's `matches` can't
     /// rule out: a second tablet, a virtio input device of the tablet's
-    /// class without its axes): `probe_all` frees the function and offers
+    /// class without its axes), or one the driver doesn't take (rng and
+    /// sound: a second device): `probe_all` frees the function and offers
     /// it to the next driver row.
     NotMine,
     /// The device can't be used by this driver: its configuration or
     /// behaviour.
     Unusable(String),
-    /// The driver's thread couldn't be started. Shared by the drivers.
+    /// The driver's owner thread couldn't be started.
     Thread(crate::sched::SpawnError),
 }
 
@@ -463,7 +467,7 @@ impl fmt::Display for ProbeError {
 }
 
 /// Why a status byte after setup isn't ready, for messages.
-fn not_ready_why(status: u8) -> &'static str {
+pub fn not_ready_why(status: u8) -> &'static str {
     let s = bits(status);
     if status == 0xff {
         "all ones, the device is gone or not decoding"
@@ -748,6 +752,13 @@ impl fmt::Display for WaitError {
 }
 
 impl StatusHandle {
+    /// Ktests: a handle reading `byte` instead of a device's register (a
+    /// made-up device whose status the test sets).
+    #[cfg(feature = "ktest")]
+    pub fn ktest_reading(byte: &'static core::sync::atomic::AtomicU8) -> StatusHandle {
+        StatusHandle { reg: NonNull::from(byte).cast() }
+    }
+
     /// The raw status byte.
     pub fn raw(&self) -> u8 {
         // SAFETY: the register is in a BAR mapped uncached for the kernel's
@@ -777,7 +788,21 @@ impl StatusHandle {
     /// thread may have been preempted past the deadline). Gives up early if
     /// the status shows `DEVICE_NEEDS_RESET` or `FAILED`. Busy-waits: call it
     /// without a lock held (after `time::init`).
-    pub fn wait_until(&self, timeout_ns: u64, mut ready: impl FnMut() -> bool) -> Result<(), WaitError> {
+    pub fn wait_until(&self, timeout_ns: u64, ready: impl FnMut() -> bool) -> Result<(), WaitError> {
+        self.wait(timeout_ns, None, ready)
+    }
+
+    /// [`wait_until`](Self::wait_until), sleeping `pause_ns` between looks
+    /// instead of spinning: for a wait as long as the device takes to play
+    /// something (sound's periods, #99), which would otherwise keep a CPU
+    /// busy throughout. From a thread that can block (elsewhere
+    /// `time::sleep` spins), without a lock held. Until MSI-X (#96) wakes
+    /// the driver instead.
+    pub fn sleep_until(&self, timeout_ns: u64, pause_ns: u64, ready: impl FnMut() -> bool) -> Result<(), WaitError> {
+        self.wait(timeout_ns, Some(pause_ns), ready)
+    }
+
+    fn wait(&self, timeout_ns: u64, pause_ns: Option<u64>, mut ready: impl FnMut() -> bool) -> Result<(), WaitError> {
         let start = crate::time::now_ns();
         let deadline = start.saturating_add(timeout_ns);
         loop {
@@ -796,7 +821,10 @@ impl StatusHandle {
             if now >= deadline {
                 return if ready() { Ok(()) } else { Err(WaitError::Timeout { waited_ns: now - start, status }) };
             }
-            core::hint::spin_loop();
+            match pause_ns {
+                Some(ns) => crate::time::sleep(ns.min(deadline - now)),
+                None => core::hint::spin_loop(),
+            }
         }
     }
 }
@@ -1183,6 +1211,19 @@ crate::ktest!(
             Ok(())
         );
         kassert_eq!(polls, 3);
+        // `sleep_until` gives up the same way, sleeping between looks: a
+        // 20 ms wait with 5 ms pauses looks a handful of times, not
+        // thousands.
+        let (t0, mut looks) = (crate::time::now_ns(), 0);
+        let Err(WaitError::Timeout { waited_ns, status: 0x01 }) = status.sleep_until(20_000_000, 5_000_000, || {
+            looks += 1;
+            false
+        }) else {
+            return Err("no timeout sleeping");
+        };
+        let took = crate::time::now_ns() - t0;
+        kassert!(waited_ns >= 20_000_000 && (20_000_000..1_000_000_000).contains(&took));
+        kassert!((2..=10).contains(&looks));
         kassert_eq!(status.wait_until(1_000_000, || true), Ok(()));
         // `ready` is asked once more at the deadline.
         let t1 = crate::time::now_ns();

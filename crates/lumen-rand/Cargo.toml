@@ -1,0 +1,9 @@
+[package]
+name = "lumen-rand"
+description = "no_std ChaCha20 and the entropy pool behind the Lumen kernel's rng (fast key erasure), host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

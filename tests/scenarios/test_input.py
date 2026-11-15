@@ -464,7 +464,10 @@ def test_tablet_is_bound_and_the_keyboard_is_not(boot):
     assert rows[first][4] == "virtio-tablet: bound"
     assert rows[second][4] == "no driver (virtio-tablet declined it)"
     assert rows[qdev["lumen-keyboard"]][4] == "no driver"
-    assert "INFO  drivers: 1 bound, 0 failed, 1 declined, 0 not probed (1 driver row)\n" in m.output
+    assert re.search(
+        r"INFO  drivers: 1 bound, 0 failed, 1 declined, 0 not probed \(\d+ driver rows?\)\n",
+        m.output,
+    )
     assert (
         f"INFO  mouse: {second}: a tablet is bound already (on {first}): only one is used\n"
         in m.output
@@ -483,7 +486,10 @@ def test_an_input_device_without_absolute_axes_is_declined(boot):
     addr = qdev_addresses(m)["lumen-mt"]
     assert lspci_rows(m)[addr][4] == "no driver (virtio-tablet declined it)"
     assert f"INFO  mouse: {addr}: no absolute X and Y axes, so not a tablet\n" in m.output
-    assert "INFO  drivers: 0 bound, 0 failed, 1 declined, 0 not probed (1 driver row)\n" in m.output
+    assert re.search(
+        r"INFO  drivers: 0 bound, 0 failed, 1 declined, 0 not probed \(\d+ driver rows?\)\n",
+        m.output,
+    )
     assert mouse(m)[0] == "mouse: no tablet (QEMU: -device virtio-tablet-pci)"
     assert "WARN" not in m.output
 

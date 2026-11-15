@@ -188,21 +188,26 @@ def test_lspci_lists_virtio_devices(boot):
     assert "WARN  pci" not in m.output
 
 
-def test_lspci_shows_no_driver(boot):
-    # Each driver's issue adds its row and tests its own probe outcome
-    # (when rng lands, #97, its row shows `rng: bound` here and the summary
-    # line changes): the tablet is bound (#98), every other function, the
+def test_lspci_driver_column(boot):
+    # Each driver's issue adds its row and tests its own probe outcome (rng
+    # in test_dev, the tablet in test_input, sound in test_sound): only
+    # virtio-rng, the tablet and sound bind; every other function, the
     # other virtio ones included, shows "no driver".
     m = shell(boot, devices=Devices.every())
     rows = lspci_rows(m)
     tablet = qdev_addresses(m)[DEVICE_IDS["tablet"]]
     assert rows[tablet][4] == "virtio-tablet: bound", rows
-    others = {row[4] for addr, row in rows.items() if addr != tablet}
-    assert others == {"no driver"}, rows
-    assert "INFO  drivers: 1 bound, 0 failed, 0 declined, 0 not probed (1 driver row)\n" in m.output
+    drivers = {
+        row[3]: row[4] for addr, row in rows.items() if row[4] != "no driver" and addr != tablet
+    }
+    assert drivers == {"virtio rng": "virtio-rng: bound", "virtio sound": "sound: bound"}, rows
+    assert re.search(
+        r"INFO  drivers: 3 bound, 0 failed, 0 declined, 0 not probed \(\d+ driver rows?\)\n",
+        m.output,
+    )
     assert "WARN  drivers" not in m.output
     # The column filters like the others.
-    assert run(m, "lspci | where driver = 'no driver' | count") == f"{len(rows) - 1}\n"
+    assert run(m, "lspci | where driver = 'no driver' | count") == f"{len(rows) - 3}\n"
 
 
 def test_lspci_records_filter(boot):

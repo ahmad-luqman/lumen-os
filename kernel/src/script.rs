@@ -3,7 +3,9 @@
 //! M6 brings files).
 //!
 //! Scripts see the machine through a few functions ([`FUNCTIONS`]): `cpus()`,
-//! `mem()`, `uptime()`, `trace(n)`, `sleep(ms)`, `print`, `debug`, and
+//! `mem()`, `uptime()`, `trace(n)`, `sleep(ms)`, `random([n])`, `beep()` /
+//! `beep(hz, ms)` (returns while it plays; it cuts off one still playing at
+//! its next period, and drops one still waiting), `print`, `debug`, and
 //! drawing (`draw_pixel`, `draw_rect`, `draw_text`, `clear`) on the
 //! terminal's [`Canvas`], taken on the first draw (`screen_width()` and
 //! `screen_height()` don't take it). A script that drew and ended without
@@ -352,6 +354,9 @@ pub const FUNCTIONS: &[&str] = &[
     "uptime()",
     "trace(n)",
     "sleep(ms)",
+    "random([n])",
+    "beep()",
+    "beep(hz, ms)",
     "print(x)",
     "debug(x)",
     "draw_pixel(x, y, rgb)",
@@ -395,6 +400,23 @@ pub const DEMO_NAMES: &[&str] = &{
 /// rest).
 fn px(v: i64) -> usize {
     usize::try_from(v).unwrap_or(0)
+}
+
+fn random_refused(e: crate::rng::NoSource) -> Box<EvalAltResult> {
+    alloc::format!("random: {e}").into()
+}
+
+/// `random()`: any integer.
+fn random_any() -> Result<i64, Box<EvalAltResult>> {
+    Ok(crate::rng::u64().map_err(random_refused)? as i64)
+}
+
+/// `random(n)`: 0 to n - 1 (n above 0).
+fn random_below(n: i64) -> Result<i64, Box<EvalAltResult>> {
+    if n <= 0 {
+        return Err(alloc::format!("random({n}): expected a bound above 0").into());
+    }
+    Ok(crate::rng::below(n as u64).map_err(random_refused)? as i64)
 }
 
 /// A colour from a script (`0xRRGGBB`; higher bits ignored).
@@ -651,8 +673,12 @@ fn engine(state: &Rc<State>) -> Engine {
     e.register_fn("mem", mem);
     e.register_fn("uptime", || crate::time::since_boot_ns().map_or(0, |ns| (ns / 1_000_000) as i64));
     e.register_fn("trace", trace);
+    e.register_fn("random", random_any);
+    e.register_fn("random", random_below);
     let s = state.clone();
     e.register_fn("sleep", move |ms: i64| sleep(&s, ms));
+    e.register_fn("beep", || beep(i64::from(crate::sound::DEFAULT_BEEP_HZ), i64::from(crate::sound::DEFAULT_BEEP_MS)));
+    e.register_fn("beep", beep);
 
     let s = state.clone();
     e.register_fn("draw_pixel", move |x: i64, y: i64, c: i64| {
@@ -733,6 +759,21 @@ fn sleep(state: &State, ms: i64) -> Result<(), Box<EvalAltResult>> {
         }
         crate::time::sleep((end - now).min(state.limits.poll_ns.max(1_000_000)));
     }
+}
+
+/// `beep(hz, ms)` (or `beep()`: 440 Hz for 200 ms): starts the beep and
+/// returns while it plays (cutting off one still playing at its next
+/// period); an error without a sound device.
+fn beep(hz: i64, ms: i64) -> Result<(), Box<EvalAltResult>> {
+    let max = crate::sound::MAX_BEEP_MS;
+    let Ok(hz) = u32::try_from(hz) else {
+        return Err(format!("beep: {hz} Hz is out of range (0 to {})", u32::MAX).into());
+    };
+    let ms = match u32::try_from(ms) {
+        Ok(ms) if ms <= max => ms,
+        _ => return Err(format!("beep: {ms} ms is out of range (0 to {max})").into()),
+    };
+    crate::sound::beep(hz, ms).map(drop).map_err(|e| format!("beep: {e}").into())
 }
 
 /// A size in bytes, as MiB or KiB when it is a whole number of them.
@@ -886,6 +927,8 @@ struct Functions;
 impl Complete for Functions {
     fn options(&self, _: &[String], out: &mut Vec<String>) {
         out.extend(FUNCTIONS.iter().map(|f| f.split('(').next().unwrap_or(f).to_string()));
+        // (`beep()` and `beep(hz, ms)` are one name.)
+        out.dedup();
     }
 }
 
@@ -1035,6 +1078,13 @@ crate::ktest!(
         kassert!(run("frobnicate()").starts_with("rhai: Function not found: frobnicate"));
         // The size of the screen, without taking it.
         kassert_eq!(run("screen_width() > 0 && screen_height() > 0"), "true\n");
+        // Random numbers (the ktest machine has virtio-rng).
+        kassert_eq!(
+            run("let ok = random() != random(); for i in 0..50 { let v = random(3); ok = ok && v >= 0 && v < 3 } ok"),
+            "true\n"
+        );
+        kassert_eq!(run("random(1)"), "0\n");
+        kassert!(run("random(0)").contains("random(0): expected a bound above 0"));
         kassert!(term::canvas(Owner::new()).is_ok());
         // Equality on arrays and maps (Lumen's), and through `contains`.
         kassert_eq!(run("[1, [2, \"a\"], #{k: [3]}] == [1, [2, \"a\"], #{k: [3]}]"), "true\n");

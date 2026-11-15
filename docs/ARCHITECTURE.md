@@ -139,9 +139,11 @@ tests (for example `lumen-elf`, the symbol-table reader).
    each`, section 6, "Terminal"; log
    lines before it are on serial only), the PS/2 keyboard (`INFO  kbd: PS/2 keyboard
    on ISA IRQ 1 ...`, section 6, "Keyboard"), the drivers (`drivers::probe_all`:
-   each PCI function offered to the driver table, `INFO  drivers: 0 bound, 0
-   failed, 0 not probed (0 driver rows)` until #97, section 7), then
-   `boot complete`, then the boot timeline (below).
+   each PCI function offered to the driver table, `INFO  drivers: <n>
+   bound, ... (<rows> driver rows)`, section 7), the randomness sources
+   (`INFO  rng: sources: RDRAND, virtio-rng`, or `INFO  rng: no
+   randomness source ...`: section 7, "Randomness"), then `boot complete`, then the boot timeline
+   (below).
 7. Either the in-kernel test runner (`--features ktest`) or the shells
    (`shell::run`, section 6, "Shell"): the screen's in a thread of its own,
    then the serial one on the `main` thread (`INFO  shell: shells on serial
@@ -1189,7 +1191,8 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   name is there twice, and the layout), `echo` (its words joined by
   single spaces), `int3`, `crash <kind> [cpu|thread]` (the thread is
   `shell-crash`), `trace [n]`, `heap`, `ticks`, `kbd`, `term [text]`,
-  `clear`, `vt [n]` (the virtual terminals: above), `colors`, `seq`, `sleep`, `uptime`, `clocks`, `exit` (kmon's;
+  `clear`, `vt [n]` (the virtual terminals: above), `colors`, `seq`, `sleep`, `random [bytes | --stats]`
+  (section 7, "Randomness"), `uptime`, `clocks`, `exit` (kmon's;
   besides what this list says, the deliberate panic now says `from the
   shell`, and `crash <kind> <cpu>` reports a fault that returned) and
   `history` (the console's lines, numbered), `reboot` and `shutdown` (see
@@ -1284,9 +1287,11 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   `stalled`). In a pipeline `cpus`, `irqs` (its per-vector table only),
   `mem` (frames, the heap and each kind of stack: size and used in bytes, a
   stack's all used, guard pages not counted; and a count of frames, live
-  allocations or stacks), `threads`, `lspci` and `mouse` give records
+  allocations or stacks), `threads`, `lspci`, `mouse` and `sound` (one
+  row: its state and counts; none without a device) give records
   (`sysinfo::RECORDS`; `lspci` first writes a note line to the console
-  when PCI devices are missing, which its table can't carry); `cpus`,
+  when PCI devices are missing, which its table can't carry, and `sound`
+  when there is no sound device); `cpus`,
   `irqs`, `threads`, `lspci` and `mouse` print the same tables alone (under their header line), so the
   text of `cpus` and `irqs` is what it was (tested column by column; one
   difference: a value wider than its column, `stalled`, now widens it for
@@ -1371,8 +1376,13 @@ section 2).
   `mem()` (`heap_size`, `heap_used`, `heap_free`, `heap_live`),
   `uptime()` (ms since the boot timeline's origin), `trace(n)` (the last n
   events of this CPU's ring, the boot CPU's, where both shells run; gap
-  lines included), `sleep(ms)` (clamped to 0 to 60 s), `print` and `debug`
-  (to the console), and drawing on the terminal's canvas:
+  lines included), `sleep(ms)` (clamped to 0 to 60 s), `random()` (any
+  integer) and `random(n)` (0 to n - 1, n above 0; both refuse while no
+  randomness source has ever answered: section 7), `beep()` /
+  `beep(hz, ms)` (440 Hz for 200 ms by default; returns while it plays,
+  cutting off one still playing at its next period and dropping one still
+  waiting; an error without a sound device or out of range),
+  `print` and `debug` (to the console), and drawing on the terminal's canvas:
   `draw_pixel(x, y, rgb)` (nothing off the canvas), `draw_rect(x, y, w, h,
   rgb)` (clipped), `draw_text(x, y, text, rgb[, bg])` (text starting above
   the canvas is left out, so are characters starting left of it, and text
@@ -1459,11 +1469,13 @@ section 2).
 - **Not yet:** scripts from files (M6), floats, capturing closures,
   scripts in user mode (M9), a script running in the background.
 
-## 7. Driver interface (M3: PCI discovery, claiming, the virtio adapter and the tablet built; MSI-X planned; device classes later)
+## 7. Driver interface (M3: PCI discovery, claiming, the virtio adapter, virtio-rng, the tablet and sound built; MSI-X planned; device classes later)
 
-PCI discovery (#94), claiming and the virtio adapter (#95) are built, and
-the tablet's driver row (#98); MSI-X is planned (#96), with the tests it
-lists. rng (#97) and sound (#99) add their rows to the driver table.
+PCI discovery (#94), claiming and the virtio adapter (#95) are built; MSI-X
+is planned (#96), with the tests it lists. The first drivers (#97-#99) add
+their rows to the driver table: virtio-rng (#97, "Randomness", below), the
+tablet (#98, "The tablet", below) and sound (#99, "Sound", below) are
+built.
 
 M3 lays the layer drivers stand on: finding PCI devices (#94), handing a
 driver exactly its device's resources and running `virtio-drivers` on top
@@ -1585,7 +1597,7 @@ pub struct Driver {
 ```
 
 - One static table, `drivers::DRIVERS`, one row per driver (each driver's
-  issue adds its row; empty until #97). `drivers::probe_all` runs once
+  issue adds its row: virtio-rng first, #97, then sound, #99). `drivers::probe_all` runs once
   (guarded) at the end of boot, after the scheduler and the clocks (a
   driver may wait or start a thread) and before the shells, and is the
   only caller of `pci::claim(addr, driver) -> Result<DeviceResources,
@@ -1631,17 +1643,20 @@ pub struct Driver {
     dropped or reset it; bus mastering off, a warning if the device's
     resources are still live; false, changing nothing, unless the function
     is bound to that driver: already failed, still probing, someone
-    else's). rng (#97) uses it for a device whose request failed.
+    else's). rng (#97) uses it for a device whose request failed, the
+    tablet (#98) when its device stops being ready, sound (#99) when its
+    device fails while playing, or is given up.
   - Declined (`ProbeError::NotMine`: a device the row's `matches` can't
-    rule out, e.g. a second tablet, or another virtio input device with
-    the tablet's class): the function is freed, its command register
-    restored, and the next matching row is offered it; `lspci` shows `no
-    driver (<driver> declined it)` if no row takes it. A driver may
-    decline only before the crate's device constructor: before
-    `virtio::transport` (the tablet's one-tablet rule), or after it,
-    reading the configuration through `VirtioTransport::read_config_space`
-    (virtio-input's ID_NAME, EV_BITS and ABS_INFO selections don't depend
-    on the features): after the
+    rule out, e.g. a second tablet, rng or sound device, or another virtio
+    input device with the tablet's class): the function is freed, its
+    command register restored, and the next matching row is offered it;
+    `lspci` shows `no driver (<driver> declined it)` if no row takes it. A
+    driver may decline only before the crate's device constructor (or
+    before setting up its own queues, as rng does): before
+    `virtio::transport` (one tablet, one rng and one sound device), or
+    after it, reading the configuration through
+    `VirtioTransport::read_config_space` (virtio-input's ID_NAME, EV_BITS
+    and ABS_INFO selections don't depend on the features): after the
     constructor the crate has posted buffers it never takes back
     (`VirtIOInput`: 32 bounce runs), and under #96 MSI-X would be enabled,
     so #96 allocates the vector lazily, at the first `queue_set`, and a
@@ -1661,14 +1676,14 @@ pub struct Driver {
   bound, failed, declined and refused.
 - **A probe's side effects come last.** A thread started or state
   published for the rest of the kernel comes after the probe's last
-  fallible check, `StatusHandle::check_ready` included (the tablet checks
-  it itself before publishing and spawning; a spawn that fails undoes the
-  publishing), so a probe that fails its own checks leaves no live
-  thread or "healthy" status behind; a driver must not depend on its
-  device staying bound until `probe_all` has recorded the outcome (its
-  check after the probe can still fail it). A device that fails after
-  binding (the tablet's thread sees it stop being ready: `FAILED`,
-  `DEVICE_NEEDS_RESET` or `DRIVER_OK` gone) is marked with
+  fallible check, `StatusHandle::check_ready` included (the tablet and
+  sound check it themselves before publishing and spawning; a spawn that
+  fails undoes the tablet's publishing), so a probe that fails its own
+  checks leaves no live thread or "healthy" status behind; a driver must
+  not depend on its device staying bound until `probe_all` has recorded
+  the outcome (its check after the probe can still fail it). A device
+  that fails after binding (the tablet's thread sees it stop being ready:
+  `FAILED`, `DEVICE_NEEDS_RESET` or `DRIVER_OK` gone) is marked with
   `pci::failed_after_bind`: `lspci` shows `<driver>: failed: its status
   showed <why> after binding` and bus mastering goes off (not tested for
   the tablet: QEMU can't make the device fail; `mouse`'s text for a failed
@@ -1676,28 +1691,34 @@ pub struct Driver {
   and the undoing of a failed spawn are reached only by fault injection
   (not tested).
 - **Shared errors.** `ProbeError::Unusable(String)` (a device the driver
-  can't use: a tablet's axis range, no stream or format sound can play)
-  and `ProbeError::Thread(SpawnError)` (no thread for the driver) are
-  shared by the M3 drivers (#97-#99).
+  can't use: `<driver>: failed: unusable device: <why>`, e.g. a tablet's
+  axis range, no stream or format sound can play, a virtio-rng answering
+  one repeated byte) and `ProbeError::Thread(SpawnError)` (no thread for
+  the driver) are shared by the M3 drivers (#97-#99).
 - **A virtio driver's probe** calls `virtio::transport(res)` from the probe
   itself (runs and the status handle are charged to the running probe
   attempt), may decline the device (above), then calls the crate's device
-  constructor and keeps the device.
+  constructor, or sets up its own queues, as rng does, and keeps the
+  device.
 - **Blocking and locks.** A driver whose callers come from anywhere (rng)
   keeps its device in its own state (a `SpinLock` static), holds the lock
   (interrupts off) only for one operation, and waits outside it, with a
-  bound, where the crate allows it; an event device (the tablet) has one
-  owner thread instead (below), and no lock around the device at all. Only `VirtIOInput::pop_pending_event` and sound's
+  bound, where the crate allows it; the tablet and sound give their
+  device to one owner thread instead (below), which touches it with no
+  lock at all (sound's commands reach its thread through a `SpinLock`ed
+  request slot). Only `VirtIOInput::pop_pending_event` and sound's
   `pcm_xfer_nb`/`pcm_xfer_ok` are non-blocking. `VirtIORng::request_entropy`
   and every sound control request (`pcm_set_params`, `pcm_prepare`,
   `pcm_start`, `pcm_stop`, `pcm_release`, and `set_up`'s info queries,
   which the first `pcm_xfer_nb` also reaches) use the crate's
-  `add_notify_wait_pop`, an unbounded spin. So (planned with those
-  drivers):
+  `add_notify_wait_pop`, an unbounded spin. So:
   - rng (#97) drives its own `virtio_drivers::queue::VirtQueue` (public:
-    `add`, `pop_used`) over `VirtioTransport`, with a bounded wait;
-  - sound's (#99) control path is a known unbounded wait, done once at
-    setup, outside the playback path.
+    `add`, `pop_used`) over `VirtioTransport`, with a bounded wait
+    ("Randomness", below);
+  - sound's (#99) control requests are a known unbounded wait: the stream
+    is set up once in the probe, and each sound's prepare, start, stop and
+    release run on the `sound` thread, outside the waits for periods
+    (below, "Sound").
   `PciTransport`'s `Drop` spins until the device status reads 0, so
   `VirtioTransport`'s own `Drop` writes 0 and waits up to 100 ms for the
   status to read 0 (no early exit on the status from before the reset),
@@ -1840,8 +1861,9 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
     not outstanding (not a stale free after the frames were handed out
     again at the same address). 256 comes from the counts: input 36 (32
     posted events and its rings) plus sound 40 idle (rings and its event
-    queue) plus rng about 3 is about 79 at boot; with sound's 96 buffers in
-    flight and 3 for a control request, about 178 while it streams.
+    queue) plus rng about 3 is about 79 at boot; up to about 178 with
+    sound's whole tx queue in flight (96 runs, 3 a period) and 3 for a
+    control request; Lumen keeps 8 periods (24 runs): about 106.
   - `dma_alloc`: an `OwnedRun`, zeroed through the HHDM, returned as
     (physical, HHDM address); 0 pages, a full table (checked before
     allocating) or no contiguous run free returns `(0,
@@ -1853,7 +1875,7 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
     on it). Every DMA frame belongs to the frame allocator (hard rule 2).
   - `share` / `unshare`: **bounce buffers, not address translation.** The
     crate passes `share` whatever buffer a request uses: rng's own request
-    (a caller's slice), a driver's `Box` (`VirtIOInput`'s events,
+    (a stack array: 32 bytes per `fill`), a driver's `Box` (`VirtIOInput`'s events,
     `VirtIOSound`'s `queue_buf_recv` for control replies), stack locals
     (`pcm_xfer`'s stream id and statuses), a `Vec` (`pcm_xfer_nb`), and
     heap `Box`es for indirect descriptor lists. `share` returns one
@@ -1869,32 +1891,41 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
     run, copies `DeviceToDriver` data back and frees it; a run it can't
     find or free panics with the address, length and what is recorded.
     `share` has no error path: out of frames or table entries it panics,
-    with the size and the runs outstanding. Caller-sized buffers
-    (`rng::fill`, #97) go to the device in chunks of at most a page, so each
-    bounce is one frame.
+    with the size and the runs outstanding. A virtio-rng request of any
+    size (#97; `fill` asks for 32 bytes, a ktest for more than a page) goes
+    to the device in buffers of at most a page, so each bounce is one
+    frame.
   - The cost: an allocation and a copy per buffer, fine for rng, input and
     sound; a fast path (no bounce for a buffer within one page or in the
-    HHDM) can come with networking (M7) if profiling asks for it. Each
+    HHDM) can come with networking (M7) if profiling asks for it; rng's
+    early return after a wait that gave up relies on the bounce (the
+    device never has the caller's buffer), so such a fast path must reset
+    the device first. Each
     posted 8-byte input event holds a 4 KiB bounce frame. Buffers still
     posted when their queue is dropped are never unshared (`VirtQueue` and
     `OwningQueue` have no `Drop` that does): their frames and table entries
     leak. A probe that fails (or declines) partway leaks this way, and
     `probe_all` reports the runs that probe attempt left outstanding; so
-    does a driver dropped later: the tablet's, when its device fails (or
-    its thread can't be spawned), leaks its up to 32 posted event buffers
-    (its error line gives the DMA runs outstanding in all, the tablet's up
-    to 32 posted buffers among them; not tested).
+    does a driver dropping its device with a buffer still posted (rng after
+    a request that gave up, sound when its device fails while playing, the
+    tablet's when its device fails or its thread can't be spawned: its up
+    to 32 posted event buffers, its error line giving the DMA runs
+    outstanding in all; not tested), and rng reports the runs it leaked in
+    its warning and in `lspci`'s reason.
 - **Polling until MSI-X.** Until #96, drivers poll (bounded where the crate
   allows, as above); event devices (the tablet) are polled from their
   thread, which sleeps between looks (`sched::sleep`, 5 ms for the
   tablet; none after a poll that read half the ring or more), so polling
-  costs no CPU while nothing happens. Their API
+  costs no CPU while nothing happens, and a wait as long as the device
+  takes to play something sleeps between looks too
+  (`StatusHandle::sleep_until(timeout, pause, ready)`, otherwise
+  `wait_until`'s checks). Their API
   doesn't change when interrupts arrive: the handler wakes the driver's
   `WaitQueue` instead. No lock is held across such a wait (`SpinLock`
-  keeps interrupts off, and a thread can't sleep under it): an event
-  device that is waited on has one owner thread, the only code touching it
-  (the tablet's `mouse` thread), and the rest of the kernel reads what
-  that thread publishes.
+  keeps interrupts off, and a thread can't sleep under it): a device that
+  is waited on this long has one owner thread, the only code touching it
+  (the tablet's `mouse` thread, the `sound` thread), and the rest of the
+  kernel reads what that thread publishes.
 - **The tablet (#98).** virtio's keyboard and tablet share their PCI id
   (1af4:1052, virtio input); QEMU gives them different class codes
   (keyboard 09/00, tablet 09/80, a relative mouse 09/02), so the tablet's
@@ -1907,6 +1938,155 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
   QEMU's multitouch panel, 09/80 without `ABS_X`/`ABS_Y`, and finds it
   declined). Only one tablet is used: a second is declined before its
   transport is set up.
+
+### Sound: virtio-sound (built, #99)
+
+- **Probe.** The `sound` row takes virtio device type 25, one device:
+  the player is one (one slot, one thread, one format), so a second sound
+  function is declined (`ProbeError::NotMine`) before its transport is
+  touched, unless the first one's probe failed. After the crate's
+  `VirtIOSound::new` it checks the device is ready, then (control
+  requests: the known unbounded spins) picks the first output stream and
+  a format: signed 16-bit samples (what `lumen-synth` makes), stereo if
+  the stream takes 2 channels, else mono, and 44.1 kHz (the default rate
+  of QEMU's audiodevs: no resampling there), else 48 kHz, else a lower
+  rate, else a higher one. A stream without one of those fails the probe
+  (`ProbeError::Unusable`: `unusable device: its first output stream
+  lacks ...`), as does a request the device refuses (naming it). It sets
+  the stream's parameters (20 ms periods, a buffer of 8), checks the
+  device is still ready, and only then starts the `sound` thread (a
+  failure there is `ProbeError::Thread`) and publishes the device: the
+  thread owns the `VirtIOSound` from then on, and no other code touches
+  it, so no lock is held across a device wait. Only the first output
+  stream is considered.
+- **Requests.** `sound::play(Box<dyn Source + Send>) -> Result<Sound,
+  SoundError>` checks the device (its state, and while idle its status
+  register) and the source's rate (it must be the device's:
+  `SoundError::WrongRate`) and puts the sound in the player's `next` in
+  one critical section, wakes the thread (a `WaitQueue`) and returns a
+  `Sound` (a private id and a cell its `Outcome` lands in: `Played`,
+  `Stopped`, `Replaced` or `Failed(why)`, so the outcome is never lost to
+  later sounds). A newer sound cuts the playing one off at its next
+  period (up to 160 ms already queued still plays; a sound that has made
+  all its samples plays out); a sound still waiting is dropped.
+  `sound::stop(&sound)` fades a sound out (the periods already queued
+  still play) or keeps it from starting. `beep` returns at once; `play`
+  checks its sound's outcome and the keys every 20 ms (`q` or Ctrl-C
+  stops it; other keys are discarded) and says `play: stopped`, `play:
+  interrupted by a newer sound` or why the device failed. Sounds are made
+  at the device's rate (`sound::format()`) and take the volume when they
+  are made.
+- **Paced by the device.** For each sound the thread checks the device is
+  ready, prepares and starts the stream, keeps up to 8 periods queued
+  (`pcm_xfer_nb`) and queues another each time the device returns one
+  (`pcm_xfer_ok` takes it back; QEMU returns a period once its audio
+  backend has consumed it), so the sound plays without gaps as long as
+  the thread is back within 160 ms. Between looks at the oldest period it
+  sleeps 1 ms (`sleep_until`, at most 2 s a period, ending on
+  `DEVICE_NEEDS_RESET` or `FAILED`). When the source has ended (its last
+  period padded with silence) and the queue has drained, it stops and
+  releases the stream. A queue found empty before the end counts as an
+  underrun (a warning per sound; `sound` counts them).
+- **Failure.** The thread gives the device up (drops it, resetting it;
+  runs still posted leak; then `pci::failed_after_bind`, so `lspci` shows
+  `sound: failed: <why>`) when the device isn't ready before a sound
+  (`checking the device before a sound: status ...`), a wait gives up, a
+  request the device refuses (named in the reason), or a sound of 1 s or
+  more whose periods all came back in under half its length (the crate's
+  `pcm_xfer_ok` doesn't read a period's status reply, so a refused period
+  counts as played: this catches a device refusing them all). `sound`
+  then shows `failed: <reason>`, and `beep` and `play` say the device
+  failed. A control request around a sound (prepare, start, stop,
+  release) that never completes spins forever (the crate's limit) and
+  wedges the thread: after 5 s playing without an answer from the device
+  the player is given up for good (a warning; the reason gives the
+  device's status if it shows `DEVICE_NEEDS_RESET` or `FAILED`, else `no
+  answer from the device for N s`; `lspci` shows it failed), `play` stops
+  its sound and returns, and a thread that comes back drops the device. A
+  device whose status shows it broken while idle is given up by the next
+  sound or `sound`. Nothing re-initialises the device. Without a sound
+  device they say `no sound device` (with the function's binding if one
+  was found but not bound). Underrun and overrun events on the device's
+  event queue aren't read. The crate itself warns, on every boot with a
+  sound device, that it got no jack and no channel map infos (QEMU's
+  device has none); left as it is.
+- **#96** replaces the 1 ms sleeps with a wait woken by the device's MSI-X
+  interrupt.
+
+### Randomness (#97)
+
+`rng::fill(&mut [u8]) -> Result<(), NoSource>`, `rng::u64()` and
+`rng::below(n)` (unbiased: `lumen_rand::below`) hand out bytes from a
+ChaCha20 pool (`lumen-rand`, host-tested against RFC 8439's vectors and a
+known answer of its own) fed by two sources:
+
+- **RDRAND**, when CPUID leaf 1 says so (QEMU's default `qemu64` has none;
+  `-cpu max` has it). The instruction is in `arch::x86_64::cpu` behind the
+  HAL boundary: `Rdrand::detect()` gives a token (found once, at `init`),
+  and only the token runs it (`try_once`). Each 64-bit draw is tried up to
+  10 times (`lumen_rand::retry`); a draw that still fails leaves RDRAND out
+  of that request only (counted, warned about at the 1st, 1024th, 2048th...:
+  `lumen_rand::should_warn`). At boot it draws a 64-byte seed: if this
+  CPU's RDRAND gave one value for all 8 words it is never used (not checked
+  per CPU); if a draw failed the seed is tried again on the next request
+  (`RDRAND seeded on retry` when it works); otherwise the seed is mixed in
+  and RDRAND is in use from then on, never before it seeded the pool. A
+  later draw of one value for all 4 words marks it stuck too.
+- **virtio-rng** (`DRIVERS` row `virtio-rng`, virtio device type 4; one
+  device: a second is declined, `ProbeError::NotMine`, before its
+  transport is touched): negotiates only `VERSION_1` (no indirect
+  descriptors, no event index), one 8-entry queue, and drives it itself:
+  `add`, notify, a bounded wait (`StatusHandle::wait_until`, ended early by
+  `DEVICE_NEEDS_RESET`/`FAILED`), `pop_used`. A request has 1 s in all,
+  however many buffers it takes (none is posted after it): at most a page
+  per buffer, a short answer asked again for the rest; 8 empty answers in a
+  row or a length past the buffer is an error. The probe makes one request,
+  the pool's first seed, and publishes the device only after it: a request
+  that fails fails the probe (`lspci`: `virtio-rng: failed: ...`), and so
+  does an answer of 32 bytes of one value (`ProbeError::Unusable`, the
+  variant #98 and #99 share for a device a driver can't use, with the
+  reason; so are the empty and too-long answers). Later, an answer of one
+  repeated byte isn't mixed in (counted, warned about rate-limited), and 8
+  in a row give the device up.
+- **A failed request consumes the device** (`Device::request` takes it by
+  value and gives it back only on success), and so do 8 repeated-byte
+  answers in a row. It is dropped: its transport resets it, and the bounce
+  frame of a buffer it never answered, after a wait that gave up, stays
+  outstanding, leaked (counted: the warning and `lspci`'s reason say how
+  many). `pci::failed_after_bind` records it, so `lspci` shows
+  `virtio-rng: failed: <reason>` and bus mastering is off. It is never
+  reaped or re-initialized; the pool goes on with RDRAND, if any (the
+  warning says which source carries on, or that none does).
+
+Each `fill` draws 32 bytes from every source in use, mixes them in, and
+hands out a stream keyed from the pool by fast key erasure (one block gives
+the stream's key and the pool's next key). **Once seeded, the pool always
+answers**, even after every source is lost (a cryptographic generator:
+unpredictable without its key; the warning that drops the last source says
+so). Only a pool never seeded refuses (`NoSource`: "no randomness source has
+answered", saying RDRAND's state and whether a virtio-rng device failed, and
+naming the QEMU options that add a source only when there is neither); boot
+says so as info, not a warning, because QEMU's default machine has
+neither. **Concurrent callers:** the pool's `SpinLock` is held only to mix
+and split; the virtio device sits in an `Option` behind its own
+`SpinLock`, taken out for a request made with no lock held (the wait
+busy-waits; a `SpinLock` keeps interrupts off) and put back after. A caller
+finding it taken skips it for that call (counted): the pool was seeded at
+probe, so its output stays unpredictable, and RDRAND still adds fresh input
+when in use. The shell's `random [bytes]` prints hex, `random --stats` the
+sources, RDRAND's state (absent, pending, in use, stuck) and the counters;
+rhai has `random()` and `random(n)`. `make run` attaches virtio-rng.
+
+Not tested on their own: RDRAND failing or stuck in the kernel (the retry
+limit, the seed tried again on the next request, the stuck checks at boot
+and per request; `retry`, `fill_words` and `all_same` run only against
+fakes, on the host), a device that needs a reset, answers empty or too
+long, or doesn't answer the probe's request (QEMU's devices answer; tested:
+a device too slow to answer later, with QEMU's rate limit, and one
+answering zeros at the probe and later, backed by a file), the deadline
+cutting a wait short (a ktest checks only that nothing is posted once it
+has passed), and two callers really racing for the device (the busy path
+is tested by taking the device).
 
 ### Interrupts for devices: MSI-X (#96)
 
@@ -2298,6 +2478,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/acpi.rs      ACPI discovery (MADT, HPET, MCFG, FADT and the DSDT's _S5_) through lumen-acpi
   src/pci.rs       PCI discovery over ECAM (lumen-pci): pci::devices, the registry (BARs, claims), pci::claim, DeviceResources
   src/drivers.rs   the driver table and probe_all
+  src/sound.rs     the virtio-sound driver (its thread owns the device), beep, play, volume, sound
   src/virtio.rs    the adapter for virtio-drivers: the Hal (DMA runs, bounce buffers), transport, VirtioTransport
   src/power.rs     reboot (0xCF9, 8042, triple fault) and ACPI S5 power-off
   src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs, routing ISA IRQs

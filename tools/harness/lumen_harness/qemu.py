@@ -37,7 +37,7 @@ import subprocess
 import threading
 import time
 import warnings
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, Self
@@ -191,8 +191,15 @@ class QemuOptions:
     virtio_tablet: bool = False
     virtio_keyboard: bool = False
     virtio_rng: bool = False
+    # virtio-rng's rate limit, QEMU's `max-bytes` per `period` ms (implies
+    # virtio-rng). None: unlimited.
+    virtio_rng_rate: tuple[int, int] | None = None
     # virtio-sound, played into this wav file through QEMU's wav audiodev.
     sound_wav: Path | None = None
+    # virtio-sound, played through the host's speakers by this QEMU audio
+    # driver (`make run SOUND=1`: `host_audio_driver()`). Not with
+    # `sound_wav`.
+    host_audio: str | None = None
     # virtio-blk backed by this raw image (read-write).
     blk_image: Path | None = None
     # virtio-net on user networking: guest TCP port -> host port forwarded
@@ -201,6 +208,10 @@ class QemuOptions:
     # virtio-9p sharing this host folder, mount tag `SHARE_TAG`.
     share_dir: Path | None = None
     extra: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.sound_wav and self.host_audio:
+            raise ValueError("sound_wav and host_audio: one virtio-sound device, recorded or heard")
 
 
 # The 9p mount tag the device advertises (a guest driver mounts by it).
@@ -217,6 +228,13 @@ DEVICE_IDS = {
 }
 
 
+def host_audio_driver(platform: str, env: Mapping[str, str]) -> str:
+    """The QEMU audio driver `make run SOUND=1` plays through: `LUMEN_AUDIO`
+    if set and non-empty (e.g. `alsa`, `pipewire`, `sdl`), else Core Audio on macOS and
+    PulseAudio elsewhere (PipeWire serves it too)."""
+    return env.get("LUMEN_AUDIO") or ("coreaudio" if platform == "darwin" else "pa")
+
+
 def _opt(value: object) -> str:
     """A value inside a QEMU `key=value,...` option: commas doubled, or QEMU
     would read the rest of a path with one as more options."""
@@ -231,20 +249,30 @@ def device_args(o: QemuOptions) -> list[str]:
         args += ["-device", f"virtio-tablet-pci,id={ids['tablet']}"]
     if o.virtio_keyboard:
         args += ["-device", f"virtio-keyboard-pci,id={ids['keyboard']}"]
-    if o.virtio_rng:
-        args += ["-device", f"virtio-rng-pci,id={ids['rng']}"]
-    if o.sound_wav:
+    if o.virtio_rng or o.virtio_rng_rate:
+        rate = o.virtio_rng_rate
+        limit = f",max-bytes={rate[0]},period={rate[1]}" if rate else ""
+        args += ["-device", f"virtio-rng-pci,id={ids['rng']}{limit}"]
+    # The sound device's audiodev (its driver and options): the host's
+    # speakers (`make run SOUND=1`), or a wav file.
+    audiodev = None
+    if o.host_audio:
+        audiodev = (_opt(o.host_audio), "")
+    elif o.sound_wav:
         # QEMU creates the wav file when it realizes the device. The header's
         # lengths depend on the version: 8.2 (CI) fills them in at exit (an
         # atexit audio_cleanup), 11.1 leaves them at 0 (seen after
         # debug-exit, QMP `quit` and SIGTERM). While QEMU runs the file can
         # be 0 bytes (the header still in stdio's buffer). Readers take the
         # length from the file size, once QEMU has exited.
-        # `streams=1`: the output stream only. The wav backend has no capture
-        # side (QEMU warns about the input stream otherwise), and playback is
-        # all we need.
+        audiodev = ("wav", f",path={_opt(o.sound_wav)}")
+    if audiodev:
+        # `streams=1`: the output stream only, on either audiodev. The wav
+        # backend has no capture side (QEMU warns about the input stream
+        # otherwise), and playback is all Lumen does.
+        driver, options = audiodev
         args += [
-            "-audiodev", f"wav,id=lumen-audio,path={_opt(o.sound_wav)}",
+            "-audiodev", f"{driver},id=lumen-audio{options}",
             "-device", f"virtio-sound-pci,id={ids['sound']},audiodev=lumen-audio,streams=1",
         ]  # fmt: skip
     if o.blk_image:
@@ -293,6 +321,10 @@ class Devices:
     tablet: bool = False
     keyboard: bool = False
     rng: bool = False
+    # virtio-rng limited to `max-bytes` per `period` ms (QEMU's properties):
+    # attaches virtio-rng (whatever `rng` says), a device that stops
+    # answering in time.
+    rng_rate: tuple[int, int] | None = None
     # virtio-sound, recorded to `Machine.wav_path`.
     sound: bool = False
     # virtio-blk on a scratch image of this many MiB, zero-filled again on
@@ -318,6 +350,13 @@ class Devices:
             raise ValueError(f"blk_mib={self.blk_mib!r}: expected a whole number of MiB above 0")
         if self.blk_image is not None:
             object.__setattr__(self, "blk_image", Path(self.blk_image).absolute())
+        if self.rng_rate is not None:
+            rate = tuple(self.rng_rate)
+            if len(rate) != 2 or not all(_is_int(v) and v > 0 for v in rate):
+                raise ValueError(
+                    f"rng_rate={self.rng_rate!r}: expected (max-bytes, period ms), both above 0"
+                )
+            object.__setattr__(self, "rng_rate", rate)
         forward = tuple(self.forward)
         for port in forward:
             if not (_is_int(port) and 1 <= port <= 65535):
@@ -337,7 +376,8 @@ class Devices:
     @classmethod
     def every(cls) -> Devices:
         """Every device the harness knows (`blk_image` is the alternative to
-        `blk_mib`, so it stays off)."""
+        `blk_mib`, so it stays off; `rng_rate` only limits virtio-rng, which
+        is on, unlimited)."""
         return cls(
             tablet=True,
             keyboard=True,
@@ -657,6 +697,7 @@ class Machine:
             virtio_tablet=d.tablet,
             virtio_keyboard=d.keyboard,
             virtio_rng=d.rng,
+            virtio_rng_rate=d.rng_rate,
             sound_wav=self.wav_path if d.sound else None,
             blk_image=self.blk_image if d.wants_blk else None,
             net_forwards=dict(self.forwards) if d.wants_net else None,

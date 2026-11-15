@@ -55,8 +55,8 @@ $(BUILD)/lumen-ktest.iso: $(BUILD)/lumen-kernel-ktest $(ISO_DEPS)
 
 iso: $(BUILD)/lumen.iso $(BUILD)/lumen-qemutest.iso $(BUILD)/lumen-ktest.iso ## Build all bootable ISOs
 
-run: $(BUILD)/lumen.iso ## Boot in QEMU with a window; serial on this terminal (HEADLESS=1: no window)
-	$(HARNESS) run --iso $< $(if $(HEADLESS),--headless)
+run: $(BUILD)/lumen.iso ## Boot in QEMU with a window; serial on this terminal (HEADLESS=1: no window; SOUND=1: virtio-sound on the host's audio; any value counts, 0 too)
+	$(HARNESS) run --iso $< $(if $(HEADLESS),--headless) $(if $(SOUND),--sound)
 
 debug: $(BUILD)/lumen.iso ## Boot paused with a gdb stub on :1234, then attach gdb (stops at kmain)
 	$(HARNESS) debug --iso $< --kernel $(BUILD)/lumen-kernel

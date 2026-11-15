@@ -151,3 +151,21 @@ tests = [
     "cargo:lumen-input",
     "scenario:test_input::test_mouse_moves_pointer",
 ]
+
+[[feature]]
+name = "virtio-rng's rate limit as a device option (`Devices(rng_rate=(max_bytes, period_ms))`: QEMU's `max-bytes` and `period`, implying virtio-rng, both above 0, refused otherwise), passed from `Machine` to QEMU; `make run` attaches virtio-rng"
+milestone = "M3"
+tests = [
+    "harness:test_devices::test_one_device_attaches_exactly_its_own[rng_rate]",
+    "harness:test_devices::test_machine_passes_the_rng_rate_on",
+    "harness:test_devices::test_make_run_attaches_virtio_rng",
+    "harness:test_devices::test_devices_reject_bad_values*",
+    "scenario:test_dev::test_a_virtio_rng_that_stops_answering_is_dropped[alone]",
+]
+
+[[feature]]
+name = "qemu.py's host-audio option (intended for `make run SOUND=1`): virtio-sound on a host audio driver (Core Audio on macOS, PulseAudio elsewhere, `LUMEN_AUDIO` choosing another), never together with the wav recording (the command line is checked; CI doesn't boot it, having no speakers)"
+milestone = "M3"
+tests = [
+    "harness:test_devices::test_host_audio_plays_through_the_host",
+]
