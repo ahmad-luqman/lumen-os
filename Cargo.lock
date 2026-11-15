@@ -239,6 +239,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-synth"
+version = "0.0.1"
+
+[[package]]
 name = "lumen-term"
 version = "0.0.1"
 dependencies = [

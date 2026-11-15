@@ -205,9 +205,15 @@ own PR that updates that doc first.
   interrupt enable register), FIFO detection, `\n` as `\r\n` in 15-byte
   bursts (one FIFO slot left for the crash reporter's byte) (host-tested
   against a model UART).
+- `crates/lumen-synth`: sound synthesis for the shell's coming `beep` and
+  `play` (#99): fixed-point oscillators (square, triangle, sine table,
+  LFSR noise), ADSR envelopes, saturating mixing, the melody notation
+  (`t=140 w=sine C4/8 r/8`), and `Source`s that fill interleaved 16-bit
+  PCM buffers (host-tested).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
   are built; virtio devices through `Devices`), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
-  `crash.py` (crash-report parsing), `screen.py` (the screen's rows
-  through the serial shell's `term text`).
+  `crash.py` (crash-report parsing), `audio.py` (wav files as QEMU's
+  wav audiodev writes them: pitch by zero crossings, Goertzel amplitude),
+  `screen.py` (the screen's rows through the serial shell's `term text`).
 - `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests.
   `tests/features/*.toml`: feature → test map (the CI feature gate and STATUS.md).
