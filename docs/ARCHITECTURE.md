@@ -820,7 +820,12 @@ off. A wake from another CPU queues the thread there and sends the
   its own leftover entries off (a ktest races the two 200 times). Dropping
   a queue with threads waiting panics, as does a thread joining itself
   (not tested).
-  Where a thread can't block, both waits panic (not tested) and
+  Where a thread can't block, both waits panic (`crash blockheld`, a
+  lock held), except once a crash report has begun on another CPU
+  (interrupts off for good, so a thread leaving a critical section or
+  switched back to there finds them off before the stop NMI arrives):
+  then they halt that CPU for the report, counted as stopped (`crash
+  bystander`, #106); and
   `time::sleep` busy-waits (tested with a lock held, interrupts off, and
   on an idle thread; before the scheduler runs on the CPU, not tested).
 - **Idle and boot:** each CPU's idle thread runs only when nothing is ready

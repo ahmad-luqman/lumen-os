@@ -835,7 +835,8 @@ impl WaitQueue {
     /// [`wake_one`](Self::wake_one) or [`wake_all`](Self::wake_all) can't be
     /// missed; it must not block or take a lock held around a wake. A thread
     /// woken while `ready()` is still false waits again, at the back. Panics
-    /// where the thread can't block (see [`can_block`]).
+    /// where the thread can't block (see [`can_block`]), except once a crash
+    /// report has begun on another CPU: then it halts this CPU for it.
     pub fn wait_until(&self, ready: impl FnMut() -> bool) {
         let woke = self.block(None, ready);
         debug_assert!(woke, "a wait without a deadline returned unready");
@@ -857,10 +858,17 @@ impl WaitQueue {
     /// (false).
     fn block(&self, deadline: Option<u64>, mut ready: impl FnMut() -> bool) -> bool {
         let cpu = arch::cpu_index();
-        assert!(
-            can_block(cpu),
-            "blocking where a thread can't (no scheduler, interrupts off, a lock held, or the idle thread)"
-        );
+        if !can_block(cpu) {
+            // If a crash report has begun on another CPU, interrupts are off
+            // for good: they stayed off when this thread last left a
+            // critical section or was switched back to, and the report's
+            // stop NMI hasn't got here yet. Halt for that report as the NMI
+            // would, rather than crash too (#106).
+            if arch::irq::disabled_for_good() {
+                crate::crash::halt_for_report();
+            }
+            panic!("blocking where a thread can't (no scheduler, interrupts off, a lock held, or the idle thread)");
+        }
         let me = CPUS[cpu].lock().running().clone();
         loop {
             let were_on = arch::irq::disable();

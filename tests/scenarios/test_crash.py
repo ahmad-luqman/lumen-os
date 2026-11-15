@@ -99,6 +99,18 @@ def test_panic_produces_report(crash_report):
     assert frames[-1].startswith("_start"), report
 
 
+def test_blocking_with_a_lock_held_panics(crash_report):
+    # With no crash report under way, a thread that can't block (here a
+    # lock is held) and tries is a bug: the wait panics, it doesn't halt the
+    # CPU quietly as it does for another CPU's report (test_smp's
+    # test_a_cpu_blocking_once_a_crash_began_halts_for_its_report).
+    report = crash_report("blockheld")
+    assert "\npanic: blocking where a thread can't (" in report, report
+    frames = backtrace(report)
+    assert any("shell::crash::crash_block_with_lock_held" in f for f in frames), report
+    assert "!!!" not in report, report
+
+
 def test_crash_screen_golden(boot, artifacts, golden_dir):
     """The crash report is also shown on screen (banner checked against a golden)."""
     m = boot("interactive")  # no qemu_exit: the crash screen stays up

@@ -175,6 +175,19 @@ def test_touching_a_guard_page_on_an_ap_names_its_own_stack(boot):
     assert hit and hit.groups() == (stacks[2].main_bottom, stacks[2].main_top), report
 
 
+def test_a_cpu_blocking_once_a_crash_began_halts_for_its_report(boot):
+    # #106: CPU 2's crash has begun (interrupts off for good) when a thread
+    # on CPU 3 leaves a critical section, so interrupts stay off there, and
+    # blocks before the stop NMI has reached CPU 3. CPU 3 halts for CPU 2's
+    # report instead of panicking on the can't-block assert, which made it a
+    # second crash (`!!! cpu 3 also crashed`), or the report's owner had it
+    # got there first. `crash bystander` makes that order certain: CPU 2
+    # faults only once CPU 3 has halted.
+    report, _ = crash_on(boot, "bystander 2")
+    assert reported_by(report, 2) and "\nother cpus stopped: 0 1 3\n" in report, report
+    assert "exception: #PF page fault (vector 14," in report, report
+
+
 @pytest.mark.parametrize(
     ("kind", "error"),
     [

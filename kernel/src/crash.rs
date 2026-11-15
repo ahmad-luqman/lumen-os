@@ -16,7 +16,9 @@
 //! stops every other online CPU with an NMI (each acknowledges and halts) and
 //! waits for them, bounded, before writing anything, so reports and log
 //! lines don't interleave. A CPU that crashes while another is reporting
-//! halts, and the report names it. Serial says which CPU crashed (`cpu:`),
+//! halts, and the report names it; one whose thread would block once a
+//! report has begun (interrupts off for good) halts before its stop NMI
+//! comes, and counts as stopped ([`halt_for_report`]). Serial says which CPU crashed (`cpu:`),
 //! which stack the reporter runs on (`running on:`), which thread was
 //! running (`thread:`, once that CPU's threads are set up) and which CPUs stopped;
 //! `!!!` lines name any CPU that didn't stop through the stop NMI (late, not
@@ -64,8 +66,8 @@ const _: () = assert!(arch::MAX_CPUS <= 64);
 static CRASHED: AtomicU64 = AtomicU64::new(0);
 static CRASH_VECTOR: [AtomicU64; arch::MAX_CPUS] = [const { AtomicU64::new(0) }; arch::MAX_CPUS];
 static CRASH_AT: [AtomicU64; arch::MAX_CPUS] = [const { AtomicU64::new(0) }; arch::MAX_CPUS];
-/// The CPUs that halted for another CPU's report (through the stop NMI or
-/// a crash of their own).
+/// The CPUs that halted for another CPU's report (through the stop NMI, a
+/// crash of their own, or [`halt_for_report`]).
 static HALTED: AtomicU64 = AtomicU64::new(0);
 // The owner's snapshot, taken once when it stops the others: every other
 // CPU that has an index is in exactly one of these three, or is empty.
@@ -281,6 +283,22 @@ fn stop_others(me: usize) {
 fn stop_here(me: usize) -> ! {
     HALTED.fetch_or(1 << me, Ordering::SeqCst);
     arch::halt_forever()
+}
+
+/// Halt this CPU for good for another CPU's report, which has begun
+/// (interrupts are off for good) but whose stop NMI hasn't arrived: for a
+/// thread that finds it can't go on (it can't block: interrupts stayed off
+/// when it left a critical section or was switched back to) and would
+/// otherwise crash too, a second crash the report would only name (#106).
+/// The report counts it as stopped, as the NMI would have; that NMI, when
+/// it comes, finds it halted.
+pub fn halt_for_report() -> ! {
+    stop_here(arch::cpu_index())
+}
+
+/// Whether CPU `cpu` has halted for a crash report (see [`HALTED`]).
+pub fn halted(cpu: usize) -> bool {
+    cpu < arch::MAX_CPUS && HALTED.load(Ordering::SeqCst) & (1 << cpu) != 0
 }
 
 /// The CPUs in `mask`, as `0 2 3`.

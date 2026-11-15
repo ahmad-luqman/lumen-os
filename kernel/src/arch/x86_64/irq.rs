@@ -150,3 +150,11 @@ pub fn disable_for_good() {
     cli();
     FOR_GOOD.store(true, Ordering::Relaxed);
 }
+
+/// Whether [`disable_for_good`] has run, on any CPU: a crash report has
+/// begun. On another CPU interrupts then stay off once a critical section
+/// closes or a thread is switched back to, until the report's stop NMI
+/// halts it.
+pub fn disabled_for_good() -> bool {
+    FOR_GOOD.load(Ordering::Relaxed)
+}
