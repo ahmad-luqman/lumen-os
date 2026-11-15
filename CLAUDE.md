@@ -24,7 +24,7 @@ make golden          # re-record golden screenshots (look at them before committ
 One scenario: `uv run pytest tests/scenarios/test_crash.py -k pf -v`.
 Failing scenarios keep `build/test-artifacts/<module>/<test>/` (e.g.
 `test_crash/test_fault_produces_symbolized_report_pf_/`) with `serial.log`,
-`qemu.log` (`-d int,cpu_reset,guest_errors`), `cmdline.txt`, `environment.txt` (QEMU version,
+`qemu-stderr.log` (QEMU's own warnings), `qemu.log` (`-d int,cpu_reset,guest_errors`), `cmdline.txt`, `environment.txt` (QEMU version,
 accelerator, OVMF version) and screenshots. The interrupt
 trace (`-d int`) is only recorded under TCG: locally on macOS always, and in CI
 by re-running failed scenarios with `LUMEN_ACCEL=tcg` (CI runs KVM first,
@@ -211,7 +211,7 @@ own PR that updates that doc first.
   (`t=140 w=sine C4/8 r/8`), and `Source`s that fill interleaved 16-bit
   PCM buffers (host-tested).
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
-  are built), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
+  are built; virtio devices through `Devices`), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
   `crash.py` (crash-report parsing), `audio.py` (wav files as QEMU's
   wav audiodev writes them: pitch by zero crossings, Goertzel amplitude),
   `screen.py` (the screen's rows through the serial shell's `term text`).
