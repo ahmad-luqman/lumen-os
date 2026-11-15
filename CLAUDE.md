@@ -165,8 +165,9 @@ own PR that updates that doc first.
   power-off registers) and the firmware-table reader. `pci.rs`: PCI
   functions found over ECAM at boot (`pci::devices`, which `lspci` lists,
   and `pci::status`), the registry (one slot per function: its BARs'
-  mappings and who claimed it), `pci::claim`, `DeviceResources` and
-  `FunctionConfig`. `drivers.rs`: the driver table (`DRIVERS`) and
+  mappings and who claimed it), `pci::claim`, `DeviceResources`,
+  `FunctionConfig`, and `pci::failed_after_bind` (a driver giving its
+  device up after binding). `drivers.rs`: the driver table (`DRIVERS`) and
   `probe_all` (declines, the readiness check). `virtio.rs`: the adapter for
   `virtio-drivers` (the `Hal`: DMA runs from the frame allocator, bounce
   buffers, probe attempts; `transport`, `VirtioTransport`, the device

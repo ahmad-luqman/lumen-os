@@ -20,9 +20,13 @@ pub use crate::virtio::ProbeError;
 /// probe attempt, and `probe_all` checks that transport's device is ready
 /// when the probe returns `Ok`), then the crate's `new()`. It may return
 /// [`ProbeError::NotMine`] for a device that turns out not to be its own,
-/// but only before the crate's `new()` (reading the device configuration
-/// through the transport): after it, the crate has posted buffers it never
-/// takes back.
+/// or one the driver doesn't take (rng: a second device), but only before
+/// the crate's `new()` (or before setting up its own queues, as rng does;
+/// reading the device configuration through the transport, or before
+/// calling `virtio::transport` at all): after it, the crate has posted
+/// buffers it never takes back. A probe's side effects (threads, published
+/// state) come after its last fallible check, and a driver must not depend
+/// on its device staying bound until `probe_all` has recorded the outcome.
 pub struct Driver {
     pub name: &'static str,
     pub matches: fn(&DeviceInfo) -> bool,
@@ -236,6 +240,15 @@ crate::ktest!(
         );
         kassert_eq!(pci::binding(console), Some(Binding::Bound("ktest-console")));
         kassert_eq!(ktest_command(console, None) & (MEMORY_SPACE | BUS_MASTER), MEMORY_SPACE | BUS_MASTER);
+        // Given up after binding (`pci::failed_after_bind`; the ktest keeps
+        // the transport, so its resources are still live: warned about):
+        // failed, bus mastering off; not again, and not for another driver.
+        kassert!(pci::failed_after_bind(console, "ktest-console", "gave up".into()));
+        kassert_eq!(pci::binding(console), Some(Binding::Failed("ktest-console", "gave up".into())));
+        kassert_eq!(ktest_command(console, None) & (MEMORY_SPACE | BUS_MASTER), MEMORY_SPACE);
+        kassert!(!pci::failed_after_bind(console, "ktest-console", "again".into()));
+        kassert_eq!(pci::binding(console), Some(Binding::Failed("ktest-console", "gave up".into())));
+        kassert!(!pci::failed_after_bind(balloon, "ktest-console", "not mine".into()));
         kassert_eq!(
             pci::binding(scsi),
             Some(Binding::Failed("ktest-keeper", "declined the device but kept its resources".into()))

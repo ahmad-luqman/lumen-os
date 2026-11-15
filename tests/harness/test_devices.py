@@ -3,6 +3,7 @@ fragment, what a `Machine` sets up for them (files, forwarded ports, the
 retry when a port is taken, a graceful quit with sound), the checks on
 `Devices`, and a default command line that doesn't change at all."""
 
+import argparse
 import dataclasses
 import socket
 import subprocess
@@ -11,6 +12,7 @@ import time
 from pathlib import Path
 
 import pytest
+from lumen_harness import __main__ as cli
 from lumen_harness import qemu
 from lumen_harness.qemu import (
     HOSTFWD_FAILED,
@@ -539,10 +541,6 @@ def test_machine_passes_the_rng_rate_on(tmp_path):
 
 def test_make_run_attaches_virtio_rng(tmp_path, monkeypatch):
     # So `random` works in `make run` (the default CPU has no RDRAND).
-    import argparse
-
-    from lumen_harness import __main__ as cli
-
     ran: list[list[str]] = []
     monkeypatch.setattr(cli, "BUILD_DIR", tmp_path)
     monkeypatch.setattr(cli, "fresh_vars", lambda dest: tmp_path / "vars.fd")

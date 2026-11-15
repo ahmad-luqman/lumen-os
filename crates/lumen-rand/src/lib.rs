@@ -19,12 +19,12 @@
 //! - The pool counts the bytes it was given (each is credited as one byte of
 //!   entropy: the kernel only mixes in its sources' output) and refuses to
 //!   hand out a stream until it has [`SEED_BYTES`]. Streams come only from
-//!   a seeded pool (`Stream`'s constructor is private).
+//!   a seeded pool (`Stream`'s constructor is crate-private).
 //! - Pure helpers for the kernel's sources, host-tested with fakes:
 //!   [`retry`] (a hardware draw tried up to [`RETRIES`] times),
-//!   [`fill_words`], [`all_same`] (a stuck source, or a device answering one
-//!   repeated byte) and [`below`] (a number below a bound, without modulo
-//!   bias).
+//!   [`fill_words`], [`should_warn`] (rate-limited warnings), [`all_same`]
+//!   (a stuck source, or a device answering one repeated byte) and
+//!   [`below`] (a number below a bound, without modulo bias).
 //!
 //! Not audited, not constant-time-reviewed: a hobby OS's randomness. The
 //! code is safe Rust. Keys and buffers are cleared ([`clear`]) when dropped
@@ -122,9 +122,9 @@ pub struct Pool {
     key: [u8; KEY_LEN],
     /// Bytes mixed in so far (saturating).
     credited: usize,
-    /// Chunks absorbed and streams split off so far: each block the pool
-    /// computes has a nonce of its own.
+    /// Chunks absorbed so far: each absorbing block's nonce number.
     mixes: u64,
+    /// Streams split off so far: each splitting block's nonce number.
     splits: u64,
 }
 
@@ -264,6 +264,12 @@ pub fn fill_words(out: &mut [[u8; 8]], mut try_once: impl FnMut() -> Option<u64>
         }
     }
     Ok(())
+}
+
+/// Whether the `n`th occurrence (from 1) of something worth a warning gets
+/// one: the 1st, then every 1024th (1024, 2048, ...); never the 0th.
+pub fn should_warn(n: u64) -> bool {
+    n != 0 && (n == 1 || n.is_multiple_of(1024))
 }
 
 /// More than one item, all equal: a stuck source (RDRAND returning one
@@ -466,6 +472,18 @@ mod tests {
         p.stream().unwrap().fill(&mut second);
         assert_eq!(first.to_vec(), hex(KAT_FIRST), "first stream");
         assert_eq!(second.to_vec(), hex(KAT_SECOND), "second stream");
+    }
+
+    #[test]
+    fn the_constants_are_what_the_docs_say() {
+        assert_eq!(RETRIES, 10);
+        assert_eq!(SEED_BYTES, 32);
+    }
+
+    #[test]
+    fn should_warn_at_the_first_and_every_1024th() {
+        let warned: Vec<u64> = (0..=5000).filter(|&n| should_warn(n)).collect();
+        assert_eq!(warned, [1, 1024, 2048, 3072, 4096]);
     }
 
     #[test]

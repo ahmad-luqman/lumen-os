@@ -145,5 +145,5 @@ tests = [
     "harness:test_devices::test_machine_passes_the_rng_rate_on",
     "harness:test_devices::test_make_run_attaches_virtio_rng",
     "harness:test_devices::test_devices_reject_bad_values*",
-    "scenario:test_dev::test_a_virtio_rng_that_stops_answering_is_dropped",
+    "scenario:test_dev::test_a_virtio_rng_that_stops_answering_is_dropped[alone]",
 ]

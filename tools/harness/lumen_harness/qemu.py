@@ -295,8 +295,9 @@ class Devices:
     tablet: bool = False
     keyboard: bool = False
     rng: bool = False
-    # virtio-rng limited to `max-bytes` per `period` ms (QEMU's properties;
-    # implies `rng`): a device that stops answering in time.
+    # virtio-rng limited to `max-bytes` per `period` ms (QEMU's properties):
+    # attaches virtio-rng (whatever `rng` says), a device that stops
+    # answering in time.
     rng_rate: tuple[int, int] | None = None
     # virtio-sound, recorded to `Machine.wav_path`.
     sound: bool = False
@@ -349,7 +350,8 @@ class Devices:
     @classmethod
     def every(cls) -> Devices:
         """Every device the harness knows (`blk_image` is the alternative to
-        `blk_mib`, so it stays off)."""
+        `blk_mib`, so it stays off; `rng_rate` only limits virtio-rng, which
+        is on, unlimited)."""
         return cls(
             tablet=True,
             keyboard=True,

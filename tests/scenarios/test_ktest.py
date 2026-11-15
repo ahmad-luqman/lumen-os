@@ -81,6 +81,12 @@ def test_in_kernel_tests_pass(boot):
     ), "a probe whose device isn't ready isn't failed"
     assert re.search(r"INFO  drivers: probing ktest-console on \S+\n", out)
     assert re.search(r"WARN  pci: \S+: ktest-keeper declined it but kept its resources", out)
+    # ... and `pci::failed_after_bind` on the bound console, whose transport
+    # the ktest keeps: warned about.
+    assert re.search(
+        r"WARN  pci: \S+: ktest-console gave it up after binding but its resources are still live\n",
+        out,
+    )
     for summary in (
         "0 bound, 0 failed, 1 declined, 0 not probed (1 driver row)",
         "1 bound, 3 failed, 1 declined, 0 not probed (7 driver rows)",

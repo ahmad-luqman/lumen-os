@@ -81,14 +81,16 @@ pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
     (r.eax, r.ebx, r.ecx, r.edx)
 }
 
-/// Proof that this CPU has RDRAND (`cpuid` leaf 1, ECX bit 30): only
-/// [`Rdrand::detect`] makes one, so [`Rdrand::try_once`] never runs the
-/// instruction on a CPU without it (that would be #UD, a crash report).
+/// Proof that the CPU [`Rdrand::detect`] ran on has RDRAND (`cpuid` leaf 1,
+/// ECX bit 30): only `detect` makes one, so [`Rdrand::try_once`] never runs
+/// the instruction on a machine without it (that would be #UD, a crash
+/// report). Not tied to one CPU: Lumen takes every CPU of a machine to have
+/// the same features (QEMU's do), so a token is used on any of them.
 #[derive(Clone, Copy, Debug)]
 pub struct Rdrand(());
 
 impl Rdrand {
-    /// `Some` if this CPU has RDRAND.
+    /// `Some` if the CPU this runs on has RDRAND.
     pub fn detect() -> Option<Rdrand> {
         (cpuid(1).2 & (1 << 30) != 0).then_some(Rdrand(()))
     }
