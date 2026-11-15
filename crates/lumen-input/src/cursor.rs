@@ -86,7 +86,6 @@ impl Default for Cursor {
 }
 
 impl Cursor {
-
     /// Where its tip is drawn, if any of it is (a tip off the surface
     /// draws nothing, so it isn't drawn).
     pub fn drawn_at(&self) -> Option<(usize, usize)> {
