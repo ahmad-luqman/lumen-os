@@ -124,7 +124,7 @@ pub enum RouteError {
     /// No I/O APIC has an input for the GSI (none at all without ACPI).
     NoInput(u32),
     /// The GSI is past the I/O APIC vectors (`IOAPIC_BASE + gsi` >
-    /// `IOAPIC_LAST`, 0x8f: GSIs 0-63 have one).
+    /// `IOAPIC_LAST`).
     NoVector(u32),
     /// The input (or its vector) is routed already.
     Taken(u32),
@@ -373,8 +373,8 @@ crate::ktest!(
     fn device_vectors_are_not_fatal() {
         // A vector nothing handles (an unused one, an I/O APIC vector with
         // no handler, an MSI vector), or an 8259 line other than IRQ 7 and
-        // 15, is counted as unexpected (and reported once: an MSI vector
-        // as an error, nothing may send one yet); the spurious
+        // 15, is counted as unexpected (and reported the first time: an MSI
+        // vector as an error, nothing may send one yet); the spurious
         // vectors (the local APIC's, the 8259s' IRQ 7 and 15) only counted;
         // a local APIC error counted and logged. All return.
         use crate::arch::idt;
@@ -401,6 +401,34 @@ crate::ktest!(
         kassert_eq!(after.unexpected, before.unexpected + 7);
         kassert_eq!(after.spurious, before.spurious + 3);
         kassert_eq!(after.lapic_errors, before.lapic_errors + 1);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn msi_vector_delivered_by_the_apic_is_eoid() {
+        // A fixed self-IPI on an MSI vector arrives like a device's message
+        // would: through the local APIC, so the dispatcher must EOI it (with
+        // the EOI missing it stays in service and blocks the timer and every
+        // lower vector). Nothing claims MSI vectors yet, so it is reported
+        // as an error once.
+        use crate::arch::{apic, idt};
+        use crate::{kassert, kassert_eq};
+        const V: u8 = idt::MSI_BASE + 1;
+        kassert!(crate::arch::irq::enabled());
+        let before = idt::vector_count(V);
+        kassert!(apic::send_ipi(apic::lapic_id(), V));
+        let deadline = crate::time::now_ns() + 1_000_000_000;
+        while idt::vector_count(V) == before && crate::time::now_ns() < deadline {
+            core::hint::spin_loop();
+        }
+        let in_service = apic::in_service(V);
+        if in_service {
+            // Unblock the CPU so the failure is reported, not a timeout.
+            apic::eoi();
+        }
+        kassert_eq!(idt::vector_count(V), before + 1);
+        kassert!(!in_service);
         Ok(())
     }
 );

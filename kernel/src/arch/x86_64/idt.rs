@@ -234,14 +234,17 @@ pub const PIC_BASE: u8 = 0x20;
 /// The 8259s' spurious IRQs: 7 (master) and 15 (slave).
 pub const PIC_SPURIOUS_MASTER: u8 = PIC_BASE + 7;
 pub const PIC_SPURIOUS_SLAVE: u8 = PIC_BASE + 15;
+/// The last 8259 vector.
+const PIC_LAST: u8 = PIC_BASE + 15;
 /// The local APIC timer.
 pub const TIMER: u8 = 0x40;
-/// `IOAPIC_BASE + n`: global system interrupt `n` (GSIs 0-63, up to vector
-/// 0x8f), once a driver routes it (`interrupts::route_isa_irq`, which
-/// registers its handler first, [`set_irq_handler`]); every other I/O APIC
-/// input stays masked.
+/// `IOAPIC_BASE + n`: global system interrupt `n` (up to [`IOAPIC_LAST`]),
+/// once a driver routes it (`interrupts::route_isa_irq`, which registers its
+/// handler first, [`set_irq_handler`]); every other I/O APIC input stays
+/// masked.
 pub const IOAPIC_BASE: u8 = 0x50;
-/// The last vector for an I/O APIC input (q35's one I/O APIC has 24).
+/// The last vector for an I/O APIC input: GSIs 0-63 have one; q35 has one
+/// I/O APIC with 24 inputs.
 pub const IOAPIC_LAST: u8 = 0x8f;
 /// `MSI_BASE..=MSI_LAST`: message-signalled interrupts (MSI and MSI-X),
 /// which PCI devices send straight to a local APIC, no I/O APIC input
@@ -273,6 +276,9 @@ const _: () = assert!(
         && MSI_LAST < LAPIC_ERROR
         && LAPIC_ERROR < SPURIOUS
 );
+// Room for every input of q35's I/O APIC (24), and 96 MSI vectors (section 7
+// of ARCHITECTURE.md).
+const _: () = assert!(IOAPIC_LAST - IOAPIC_BASE + 1 >= 24 && MSI_LAST - MSI_BASE + 1 == 96);
 
 /// Local APIC timer interrupts taken, per CPU (every CPU's timer ticks once
 /// started: the boot CPU's from `time::init`, each AP's from its idle
@@ -280,8 +286,8 @@ const _: () = assert!(
 static TICKS: [AtomicU64; super::percpu::MAX_CPUS] = [const { AtomicU64::new(0) }; super::percpu::MAX_CPUS];
 /// Spurious interrupts (local APIC, or 8259 IRQ 7 or 15) taken.
 static SPURIOUS_IRQS: AtomicU64 = AtomicU64::new(0);
-/// Interrupts on vectors nothing handles, taken (each vector warned about
-/// once).
+/// Interrupts on vectors nothing handles, taken (each vector reported the
+/// first time, then at its 1024th, 2048th, 4096th...: [`unexpected`]).
 static UNEXPECTED_IRQS: AtomicU64 = AtomicU64::new(0);
 /// Local APIC error interrupts taken.
 static LAPIC_ERRORS: AtomicU64 = AtomicU64::new(0);
@@ -332,8 +338,8 @@ fn irq_handler(vector: u8) -> Option<fn()> {
     (!raw.is_null()).then(|| unsafe { core::mem::transmute::<*mut (), fn()>(raw) })
 }
 
-/// Which vectors have been warned about, a bit each.
-static WARNED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Interrupts nothing handled, per vector (for when [`unexpected`] reports).
+static UNEXPECTED_ON: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
 
 /// The boot CPU's local APIC timer interrupts so far.
 pub fn ticks() -> u64 {
@@ -361,8 +367,9 @@ pub enum VectorUse {
     Wakeup,
     /// I/O APIC global system interrupt `n`.
     Gsi(u8),
-    /// A message-signalled interrupt (MSI or MSI-X).
-    Msi,
+    /// Message-signalled interrupt vector `n` (MSI or MSI-X), counted from
+    /// [`MSI_BASE`].
+    Msi(u8),
     LapicError,
     Spurious,
     Unused,
@@ -371,11 +378,11 @@ pub enum VectorUse {
 pub fn vector_use(vector: u8) -> VectorUse {
     match vector {
         0..=31 => VectorUse::Exception,
-        v if (PIC_BASE..PIC_BASE + 16).contains(&v) => VectorUse::Pic(v - PIC_BASE),
+        v @ PIC_BASE..=PIC_LAST => VectorUse::Pic(v - PIC_BASE),
         TIMER => VectorUse::Timer,
         WAKEUP => VectorUse::Wakeup,
-        v if (IOAPIC_BASE..=IOAPIC_LAST).contains(&v) => VectorUse::Gsi(v - IOAPIC_BASE),
-        v if (MSI_BASE..=MSI_LAST).contains(&v) => VectorUse::Msi,
+        v @ IOAPIC_BASE..=IOAPIC_LAST => VectorUse::Gsi(v - IOAPIC_BASE),
+        v @ MSI_BASE..=MSI_LAST => VectorUse::Msi(v - MSI_BASE),
         LAPIC_ERROR => VectorUse::LapicError,
         SPURIOUS => VectorUse::Spurious,
         _ => VectorUse::Unused,
@@ -390,7 +397,7 @@ impl core::fmt::Display for VectorUse {
             VectorUse::Timer => f.write_str("local APIC timer"),
             VectorUse::Wakeup => f.write_str("wakeup IPI"),
             VectorUse::Gsi(n) => write!(f, "GSI {n}"),
-            VectorUse::Msi => f.write_str("MSI"),
+            VectorUse::Msi(n) => write!(f, "MSI {n}"),
             VectorUse::LapicError => f.write_str("local APIC error"),
             VectorUse::Spurious => f.write_str("spurious"),
             VectorUse::Unused => f.write_str("unused"),
@@ -445,33 +452,34 @@ pub fn exception_name(vector: u64) -> &'static str {
     }
 }
 
-/// Count and trace an interrupt nothing handles; true the first time its
-/// vector comes (so it is reported once per vector).
-fn stray(frame: &TrapFrame) -> bool {
+/// Count, trace and report an interrupt nothing handles. Each vector is
+/// reported the first time, then again at its 1024th, 2048th, 4096th...
+/// (with the count), so a storm stays visible without flooding the log. A
+/// warning, or an error on an MSI vector: one only fires if something
+/// programmed a device to send it, and nothing may yet (#96).
+fn unexpected(frame: &TrapFrame) {
     let v = frame.vector as u8;
     crate::ktrace!(crate::trace::Kind::Exception, frame.vector, frame.rip, 0);
     UNEXPECTED_IRQS.fetch_add(1, Ordering::Relaxed);
-    let (word, bit) = (usize::from(v / 64), 1u64 << (v % 64));
-    WARNED[word].fetch_or(bit, Ordering::Relaxed) & bit == 0
-}
-
-/// Count, trace and (once per vector) warn about an interrupt nothing handles.
-fn unexpected(frame: &TrapFrame) {
-    if stray(frame) {
-        log::warn!(target: "irq", "unexpected interrupt on vector {:#x} (rip {:#x}); ignored", frame.vector, frame.rip);
+    let n = UNEXPECTED_ON[usize::from(v)].fetch_add(1, Ordering::Relaxed) + 1;
+    if n != 1 && !(n >= 1024 && n.is_power_of_two()) {
+        return;
+    }
+    let rip = frame.rip;
+    let so_far = Repeats(n);
+    if (MSI_BASE..=MSI_LAST).contains(&v) {
+        log::error!(target: "irq", "interrupt on MSI vector {v:#x}, which no device has claimed (rip {rip:#x}){so_far}; ignored");
+    } else {
+        log::warn!(target: "irq", "unexpected interrupt on vector {v:#x} (rip {rip:#x}){so_far}; ignored");
     }
 }
 
-/// Like [`unexpected`], but an error: an MSI vector only fires if something
-/// programmed a device to send it, and nothing may yet (#96).
-fn unclaimed_msi(frame: &TrapFrame) {
-    if stray(frame) {
-        log::error!(
-            target: "irq",
-            "interrupt on MSI vector {:#x}, which no device has claimed (rip {:#x}); ignored",
-            frame.vector,
-            frame.rip
-        );
+/// How many times a vector has come, for a report after its first.
+struct Repeats(u64);
+
+impl core::fmt::Display for Repeats {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 > 1 { write!(f, ", {} so far", self.0) } else { Ok(()) }
     }
 }
 
@@ -485,9 +493,10 @@ fn unclaimed_msi(frame: &TrapFrame) {
 /// here only when this one runs again); a local APIC error is counted and
 /// logged with its status (on the 1st, 2nd, 4th, 8th... one, and whenever a
 /// new status bit appears); an I/O APIC vector runs its handler ([`set_irq_handler`]; one with none
-/// is unexpected); an MSI vector is unexpected and logged as an error (no
-/// device may send one yet); anything else is traced, counted and warned about once
-/// per vector. Interrupts are off throughout (every gate is an interrupt
+/// is unexpected); an MSI vector is unexpected (reported as an error: no
+/// device may send one yet; it keeps its own arm for #96's handlers);
+/// anything else is unexpected: traced, counted and reported
+/// ([`unexpected`]). Interrupts are off throughout (every gate is an interrupt
 /// gate).
 #[unsafe(no_mangle)]
 extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
@@ -520,7 +529,7 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
             SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);
         }
         WAKEUP => super::apic::eoi(),
-        v if (PIC_BASE..PIC_BASE + 16).contains(&v) && super::apic::in_service(v) => {
+        v @ PIC_BASE..=PIC_LAST if super::apic::in_service(v) => {
             // Delivered through the local APIC (an MSI or a routed input on
             // the 8259s' vectors), not by the 8259s: its EOI is the APIC's.
             unexpected(frame);
@@ -536,22 +545,23 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
             SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);
             super::pic::eoi_master();
         }
-        v if (PIC_BASE..PIC_BASE + 16).contains(&v) => {
+        v @ PIC_BASE..=PIC_LAST => {
             // Any other 8259 line means it isn't masked after all: mask
             // them again.
             unexpected(frame);
             super::pic::eoi(v - PIC_BASE);
             super::pic::mask_all();
         }
-        v if (IOAPIC_BASE..=IOAPIC_LAST).contains(&v) => {
+        v @ IOAPIC_BASE..=IOAPIC_LAST => {
             match irq_handler(v) {
                 Some(handler) => handler(),
                 None => unexpected(frame),
             }
             super::apic::eoi();
         }
-        v if (MSI_BASE..=MSI_LAST).contains(&v) => {
-            unclaimed_msi(frame);
+        MSI_BASE..=MSI_LAST => {
+            // No device may send one yet: #96 looks its handler up here.
+            unexpected(frame);
             super::apic::eoi();
         }
         LAPIC_ERROR => {
@@ -569,3 +579,20 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
         }
     }
 }
+
+crate::ktest!(
+    fn vector_map_boundaries() {
+        // The ends of the I/O APIC and MSI ranges, as `irqs` names them.
+        use crate::kassert_eq;
+        use alloc::format;
+        kassert_eq!(vector_use(IOAPIC_LAST), VectorUse::Gsi(63));
+        kassert_eq!(vector_use(MSI_BASE), VectorUse::Msi(0));
+        kassert_eq!(vector_use(MSI_LAST), VectorUse::Msi(95));
+        kassert_eq!(vector_use(0xf0), VectorUse::Unused);
+        kassert_eq!(format!("{}", vector_use(0x8f)), "GSI 63");
+        kassert_eq!(format!("{}", vector_use(0x90)), "MSI 0");
+        kassert_eq!(format!("{}", vector_use(0xef)), "MSI 95");
+        kassert_eq!(format!("{}", vector_use(0xf0)), "unused");
+        Ok(())
+    }
+);
