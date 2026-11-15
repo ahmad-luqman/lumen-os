@@ -41,6 +41,7 @@ mod keyboard;
 mod klog;
 mod ktest;
 mod mm;
+mod mouse;
 mod pci;
 mod power;
 mod rtc;

@@ -61,6 +61,38 @@ def test_machine_waits_for_events_with_scaled_timeouts(tmp_path, monkeypatch):
     assert waits == [("SHUTDOWN", 30)]
 
 
+def test_pointer_events_are_paced_and_scaled_to_the_screen(tmp_path, monkeypatch):
+    # Pixels become QEMU's axis values for the screen's size (taken once),
+    # and no two pointer events go closer together than POINTER_GAP.
+    m = Machine(Path("x.iso"), tmp_path)
+    m._screen_size = (1280, 800)
+    clock = [100.0]
+    sent = []
+    monkeypatch.setattr(qemu.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(qemu.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+
+    class FakeQmp:
+        def send_input(self, args):
+            sent.append((clock[0], args["events"]))
+
+    m._qmp = FakeQmp()  # type: ignore[assignment]
+    m.move_pointer(1279, 799)
+    m.click("left")
+    clock[0] += 1
+    m.click("right", release=False)
+    m.release("right")
+    times = [t for t, _ in sent]
+    assert times == pytest.approx([100.0, 100.03, 100.06, 101.06, 101.09])
+    assert sent[0][1][0]["data"] == {"axis": "x", "value": 0x7FFF}
+    assert sent[0][1][1]["data"] == {"axis": "y", "value": 0x7FFF}
+    assert [e[0]["data"] for _, e in sent[1:]] == [
+        {"down": True, "button": "left"},
+        {"down": False, "button": "left"},
+        {"down": True, "button": "right"},
+        {"down": False, "button": "right"},
+    ]
+
+
 def test_machine_event_failures_show_the_serial_output(tmp_path):
     from lumen_harness.qmp import QmpError
 

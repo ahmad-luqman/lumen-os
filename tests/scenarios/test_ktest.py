@@ -48,13 +48,13 @@ def test_in_kernel_tests_pass(boot):
     # reported at the 1st, 1024th and 2048th only.
     storm = re.findall(r"unexpected interrupt on vector 0x31 \(rip 0x[0-9a-f]+, #(\d+)\)", out)
     assert storm == ["1", "1024", "2048"], f"0x31 storm reports: {storm}"
-    # `probing_records_each_outcome` (#95): boot's own pass finds no driver
-    # rows; the ktest's table declines the 9p device once alone, then
+    # `probing_records_each_outcome` (#95): boot's own pass offers its
+    # driver rows nothing (no tablet attached); the ktest's table declines the 9p device once alone, then
     # declines it (leaving a run) and fails it (leaving one of its own),
     # finds the balloon not ready, binds the console, and refuses the SCSI
     # device's decline (its probe kept the resources); offered again, the
     # 9p device isn't probed.
-    assert "INFO  drivers: 0 bound, 0 failed, 0 declined, 0 not probed (0 driver rows)\n" in out
+    assert "INFO  drivers: 0 bound, 0 failed, 0 declined, 0 not probed (1 driver row)\n" in out
     p9 = re.search(r"INFO  drivers: probing ktest-9p on (\S+)\n", out)
     assert p9, "no ktest-9p probe logged"
     addr = re.escape(p9[1])

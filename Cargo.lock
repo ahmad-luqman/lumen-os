@@ -210,6 +210,10 @@ name = "lumen-heap"
 version = "0.0.1"
 
 [[package]]
+name = "lumen-input"
+version = "0.0.1"
+
+[[package]]
 name = "lumen-kernel"
 version = "0.0.1"
 dependencies = [
@@ -219,6 +223,7 @@ dependencies = [
  "lumen-demo",
  "lumen-elf",
  "lumen-heap",
+ "lumen-input",
  "lumen-mm",
  "lumen-pci",
  "lumen-queue",

@@ -136,3 +136,14 @@ tests = [
     "scenario:test_pci::test_boots_with_every_virtio_device",
     "scenario:test_pci::test_a_taken_host_port_is_picked_again",
 ]
+
+[[feature]]
+name = "Harness: the guest's absolute pointer moved to a pixel (rounded to QEMU's 0-32767 axes so the kernel's scaling lands on it, any screen size; off-screen pixels refused) and its buttons pressed and released through QMP's `input-send-event`, unknown buttons refused, every pointer event at least 30 ms after the last"
+milestone = "M3"
+tests = [
+    "harness:test_qmp::test_pixels_become_axis_values_the_kernel_scales_back",
+    "harness:test_qmp::test_a_pixel_off_the_screen_is_refused",
+    "harness:test_qmp::test_a_move_sends_both_axes_and_a_button_its_state",
+    "harness:test_qemu::test_pointer_events_are_paced_and_scaled_to_the_screen",
+    "scenario:test_input::test_mouse_moves_pointer",
+]

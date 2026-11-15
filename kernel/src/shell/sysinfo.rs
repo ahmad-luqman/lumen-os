@@ -1,8 +1,9 @@
 //! The shell's system commands: `cpus`, `mem`, `irqs`, `threads`, `lspci`,
-//! `dmesg`, `date` and `top`. Each prints a header line (`<name>: ...`), and
-//! all but `date` rows after it. In a pipeline `cpus`, `irqs`, `mem`,
-//! `threads` and `lspci` give records instead ([`RECORDS`]): `cpus`,
-//! `threads` and `lspci` the table they print (under their header), `irqs` its per-vector table only (not the
+//! `mouse`, `dmesg`, `date` and `top`. Each prints a header line (`<name>:
+//! ...`), and all but `date` rows after it. In a pipeline `cpus`, `irqs`,
+//! `mem`, `threads`, `lspci` and `mouse` give records instead
+//! ([`RECORDS`]): `cpus`, `threads`, `lspci` and `mouse` the table they
+//! print (under their header), `irqs` its per-vector table only (not the
 //! I/O APIC's inputs), `mem` a table of what its prose says (in bytes).
 //! Output with rows is made into a `String` first and written in one write
 //! (no log line lands inside it, and nothing allocating is formatted under
@@ -66,8 +67,14 @@ pub type MakeTable = fn() -> pipe::Table;
 
 /// The system commands that give records in a pipeline (instead of their
 /// text), and the tables they give.
-pub const RECORDS: [(&str, MakeTable); 5] =
-    [("cpus", cpu_table), ("irqs", vector_table), ("lspci", pci_table), ("mem", mem_table), ("threads", thread_table)];
+pub const RECORDS: [(&str, MakeTable); 6] = [
+    ("cpus", cpu_table),
+    ("irqs", vector_table),
+    ("lspci", pci_table),
+    ("mem", mem_table),
+    ("mouse", mouse_table),
+    ("threads", thread_table),
+];
 
 /// A line for the console when `name`'s records come with a caveat the
 /// table can't carry: `lspci`'s, when PCI devices are missing.
@@ -372,6 +379,65 @@ fn pci_table() -> pipe::Table {
             driver_cell(d.addr),
         ]);
     }
+    t
+}
+
+/// `mouse`: the tablet (#98), where it points and what is held: a header
+/// naming the device (or saying there is none) and its row.
+pub fn mouse(ctx: &mut Ctx<'_>, args: &[String]) {
+    if extra_args(ctx, "mouse", args) {
+        return;
+    }
+    let mut t = String::new();
+    match crate::mouse::status() {
+        Some(st) => {
+            let d = &st.device;
+            let failed = st.failed.map_or(String::new(), |why| alloc::format!(", failed: {why}"));
+            let _ = writeln!(
+                t,
+                "mouse: \"{}\" on {}, screen {}x{}, {} events in {} frames ({} ignored){failed}",
+                d.name, d.addr, d.screen.0, d.screen.1, st.events, st.frames, st.ignored
+            );
+        }
+        None => t.push_str("mouse: no tablet (QEMU: -device virtio-tablet-pci)\n"),
+    }
+    mouse_table().render(&mut t);
+    emit(ctx, &t);
+}
+
+/// `mouse`'s row: always one (`none` for its device without a tablet;
+/// `-` before the first report): the pointer's position, the buttons held
+/// (`left right`, or `none`), the wheels' clicks so far, and whether the
+/// pointer is drawn (`hidden` while a command draws on the screen).
+fn mouse_table() -> pipe::Table {
+    const COLUMNS: [Column; 7] = [
+        Column::new("device", Kind::Text, Align::Left, 12),
+        Column::new("x", Kind::Int, Align::Right, 4),
+        Column::new("y", Kind::Int, Align::Right, 4),
+        Column::new("buttons", Kind::Text, Align::Left, 7),
+        Column::new("wheel", Kind::Int, Align::Right, 5),
+        Column::new("hwheel", Kind::Int, Align::Right, 6),
+        Column::new("pointer", Kind::Text, Align::Left, 0),
+    ];
+    let mut t = pipe::Table::new(&COLUMNS);
+    let status = crate::mouse::status();
+    let device = status.as_ref().map_or(text("none"), |st| Value::Text(alloc::format!("{}", st.device.addr)));
+    let row = match status.and_then(|st| st.state) {
+        Some(s) => {
+            let drawn = crate::term::pointer_drawn().is_some();
+            vec![
+                device,
+                int(s.x),
+                int(s.y),
+                Value::Text(s.buttons.to_string()),
+                int(s.wheel),
+                int(s.hwheel),
+                text(if drawn { "drawn" } else { "hidden" }),
+            ]
+        }
+        None => vec![device, DASH, DASH, DASH, DASH, DASH, DASH],
+    };
+    t.push(row);
     t
 }
 

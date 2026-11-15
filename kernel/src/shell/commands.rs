@@ -120,6 +120,13 @@ pub static COMMANDS: Table<Run> = Table(&[
         run: sysinfo::lspci,
     },
     Command {
+        name: "mouse",
+        args: &[],
+        usage: "",
+        about: "the tablet: where the pointer is, the buttons held, the wheels",
+        run: sysinfo::mouse,
+    },
+    Command {
         name: "dmesg",
         args: &[],
         usage: "",

@@ -1,11 +1,21 @@
-"""The QMP client and key helpers: events kept and waited for, characters to
-QEMU key names, and `send-key`'s arguments."""
+"""The QMP client and input helpers: events kept and waited for, characters to
+QEMU key names, `send-key`'s arguments, and `input-send-event`'s for an
+absolute pointer (pixels to QEMU's 0-32767 axes) and its buttons."""
 
 import json
 import socket
 
 import pytest
-from lumen_harness.qmp import QmpClient, QmpError, qcodes_for, send_key_args
+from lumen_harness.qmp import (
+    ABS_MAX,
+    QmpClient,
+    QmpError,
+    abs_of,
+    button_args,
+    pointer_move_args,
+    qcodes_for,
+    send_key_args,
+)
 
 
 def test_letters_digits_and_space():
@@ -43,6 +53,40 @@ def test_send_key_presses_together_and_holds():
     }
     with pytest.raises(ValueError):
         send_key_args([], 20)
+
+
+def kernel_scale(value: int, pixels: int) -> int:
+    """`lumen_input::AbsAxis::scale` on QEMU's 0-32767 axis."""
+    return (value * (pixels - 1) + ABS_MAX // 2) // ABS_MAX
+
+
+def test_pixels_become_axis_values_the_kernel_scales_back():
+    assert abs_of(0, 1280) == 0
+    assert abs_of(1279, 1280) == ABS_MAX
+    assert abs_of(400, 801) == 16384
+    for pixels in (2, 3, 640, 800, 1280, 1920, 4096):
+        for px in range(pixels):
+            assert kernel_scale(abs_of(px, pixels), pixels) == px, (px, pixels)
+
+
+def test_a_pixel_off_the_screen_is_refused():
+    for px, pixels in [(-1, 800), (800, 800), (5, 1), (0, 0), (1.5, 800)]:
+        with pytest.raises(ValueError):
+            abs_of(px, pixels)
+
+
+def test_a_move_sends_both_axes_and_a_button_its_state():
+    assert pointer_move_args(1279, 0, (1280, 800)) == {
+        "events": [
+            {"type": "abs", "data": {"axis": "x", "value": ABS_MAX}},
+            {"type": "abs", "data": {"axis": "y", "value": 0}},
+        ]
+    }
+    assert button_args("right", True) == {
+        "events": [{"type": "btn", "data": {"down": True, "button": "right"}}]
+    }
+    with pytest.raises(ValueError, match="no pointer button 'wheel-up'"):
+        button_args("wheel-up", True)
 
 
 def _client(*lines: dict) -> tuple[QmpClient, socket.socket]:

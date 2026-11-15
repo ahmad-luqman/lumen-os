@@ -78,10 +78,12 @@
 //! Locks: the probe lock, then the probe scope or ECAM (each taken last);
 //! the run table before the probe owner and the frame allocator.
 
-// The first driver on this adapter is rng (#97): until then only the ktests
-// and `probe_all`'s bookkeeping use it.
+// The tablet (#98) uses only part of it: the bounded waits and the run
+// counts wait for rng (#97) and sound (#99); until then only the ktests
+// and `probe_all`'s bookkeeping use them.
 #![cfg_attr(not(feature = "ktest"), allow(dead_code))]
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 use core::mem::ManuallyDrop;
@@ -413,6 +415,11 @@ pub enum ProbeError {
     /// share an id, told apart only by their configuration): `probe_all`
     /// frees the function and offers it to the next driver row.
     NotMine,
+    /// The device's configuration is one the driver can't use (a tablet's
+    /// axis range): why.
+    Unusable(String),
+    /// The driver's thread couldn't be started.
+    Thread(crate::sched::SpawnError),
 }
 
 impl fmt::Display for ProbeError {
@@ -426,6 +433,8 @@ impl fmt::Display for ProbeError {
             }
             ProbeError::Wait(e) => write!(f, "{e}"),
             ProbeError::NotMine => f.write_str("not this driver's device"),
+            ProbeError::Unusable(why) => write!(f, "unusable: {why}"),
+            ProbeError::Thread(e) => write!(f, "no thread for the driver: {e}"),
         }
     }
 }
