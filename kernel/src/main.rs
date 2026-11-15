@@ -231,7 +231,27 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     } else {
         warn!(target: "boot", "timeline: {timeline}");
     }
+    log_before_kmain();
     after_boot()
+}
+
+/// Limine's times for the boot, and where the timeline's origin falls after
+/// its handoff; a warning if Limine gave none or the origin is before it.
+fn log_before_kmain() {
+    let Some(clock) = time::tsc() else {
+        return warn!(target: "boot", "before kmain: unknown (the TSC isn't calibrated)");
+    };
+    let limine = match boot::LimineTimes::get() {
+        Ok(limine) => limine,
+        Err(e) => return warn!(target: "boot", "before kmain: unknown ({e})"),
+    };
+    let entry = time::boot_tsc().unwrap_or(0);
+    let before = boot::BeforeKmain { limine, entry, clock };
+    if before.in_order() {
+        info!(target: "boot", "before kmain: {before}");
+    } else {
+        warn!(target: "boot", "before kmain: {before}");
+    }
 }
 
 #[cfg(feature = "ktest")]

@@ -51,6 +51,16 @@ PHASES = [
     "framebuffer",
     "complete",
 ]
+# Logged just after the timeline (kernel/src/boot.rs, `BeforeKmain`): Limine's
+# own times for the boot (microseconds of the TSC by its calibration), and
+# how long after its handoff `kmain` read the timeline's origin, from ticks
+# (signed: an origin before the handoff reads `-`). At warn if Limine gave
+# no times or they are out of order: matched too, to fail at once.
+BEFORE_KMAIN = re.compile(
+    r"(?P<level>INFO |WARN ) boot: before kmain: (?P<text>limine started at (?P<started>\d+\.\d{3}) ms "
+    r"and handed off at (?P<handoff>\d+\.\d{3}) ms \(TSC time\), "
+    r"kmain began (?P<gap>[+-]\d+\.\d{3}) ms after the handoff|.*)\n"
+)
 
 
 def kernel_lines(output: str) -> list[str]:
@@ -99,9 +109,16 @@ def test_boot_timeline_printed(boot):
     assert list(us.values()) == sorted(us.values()), line[0]
     total = micros(timeline["total"])
     assert total == us["complete"], line[0]
-    # The origin is at most 50 ms before arch-init: not the TSC's reset or
-    # firmware handoff (GDT/IDT setup takes well under 50 ms).
-    assert us["arch-init"] < 50_000, line[0]
+    # The origin is `kmain`'s first instruction: at or before arch-init
+    # (above), and at or after Limine's handoff, so not the TSC's reset or
+    # the firmware's handoff to Limine (both before Limine started). The
+    # kernel compares in ticks, so this holds however slowly the emulator
+    # ran; a time bound on arch-init didn't (#55).
+    before = m.expect(BEFORE_KMAIN, 10)
+    what = f"arch-init +{us['arch-init'] / 1000:.3f} ms; {before['text']}"
+    assert before["level"] == "INFO " and before["gap"], what
+    assert 0 < micros(before["started"]) < micros(before["handoff"]), what
+    assert not before["gap"].startswith("-"), what
     # In guest time, measured by the TSC: the time phase calibrates the timer
     # against the TSC (`time::WINDOWS` (5) windows of `WINDOW_NS` (10 ms),
     # each waited out on the TSC) and sleeps 10 ms on it for the first tick:

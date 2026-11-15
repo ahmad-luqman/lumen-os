@@ -450,13 +450,24 @@ crate::ktest!(
             }
         }
         kassert_eq!(phases, BootPhase::ALL.map(|p| p as u64));
-        // So `tscs` is in `ALL`'s order. Entry is the origin, and at most
-        // 50 ms before arch-init: not the TSC's reset or firmware handoff
-        // (GDT/IDT setup takes well under 50 ms).
+        // So `tscs` is in `ALL`'s order. Entry is the origin, at or before
+        // arch-init (above) and at or after Limine's handoff: so `kmain`'s
+        // first instruction, not the TSC's reset or the firmware's handoff
+        // to Limine (both before Limine started). Compared in ticks, Limine's
+        // microseconds turned back with its own frequency: exact however
+        // long the boot took (a starved emulator stretches the gaps, never
+        // reorders them; #55).
         let (entry, arch_init) = (tscs[BootPhase::Entry.index()], tscs[BootPhase::ArchInit.index()]);
         kassert_eq!(Some(entry), crate::time::boot_tsc());
         let clock = crate::time::tsc().ok_or("TSC not calibrated")?;
-        kassert!(clock.ns(arch_init - entry) < 50_000_000);
+        let limine = crate::boot::LimineTimes::get()?;
+        let before = crate::boot::BeforeKmain { limine, entry, clock };
+        let arch_ms = lumen_time::Millis(clock.ns(arch_init - entry));
+        crate::ktest::diag(format_args!("arch-init {arch_ms} after entry; {before}"));
+        let handoff = limine.handoff_tsc().ok_or("Limine's handoff time doesn't fit in 64 bits")?;
+        kassert!(0 < limine.started_us && limine.started_us < limine.handed_off_us);
+        kassert!(handoff <= entry);
+        kassert!(before.in_order());
         Ok(())
     }
 );

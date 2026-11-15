@@ -154,8 +154,15 @@ tests (for example `lumen-elf`, the symbol-table reader).
 
 `kmain`'s first statement reads the TSC (a bare `rdtsc`, which can't fault,
 so GDT and IDT setup still come first in effect): the origin of both the
-boot timeline and the log's timestamps. The pinned Limine crate has no
-bootloader-performance request, so the bootloader's own time isn't counted.
+boot timeline and the log's timestamps. The bootloader's own time isn't
+counted in the timeline, but it is logged just after it: `boot.rs` asks
+Limine for its bootloader-performance and TSC-frequency responses (by hand:
+the pinned `limine` crate has no types for them), which give when Limine
+started and when it handed off, in microseconds of the TSC by Limine's
+calibration. Turned back into ticks with Limine's frequency (rounded down,
+so at or before its reading), the handoff must come at or before the
+origin: that, not a time bound, is what shows the origin is `kmain`'s first
+instruction rather than the TSC's reset or the firmware's handoff (#55).
 Entry is recorded with the origin's TSC; every other phase records a
 `BootPhase` trace event when it ends: arch-init, logger, symbols, memory, stacks, acpi, pci, interrupts,
 time (calibration, interrupts on, the first-tick check: 10 ms, up to 100 ms while no tick has come), smp (the
@@ -164,6 +171,7 @@ converted with the calibrated TSC:
 
 ```
 [    0.139423] INFO  boot: timeline: entry +0.000 ms, arch-init +0.145 ms, ..., complete +139.382 ms (total 139.382 ms)
+[    0.139501] INFO  boot: before kmain: limine started at 3274.784 ms and handed off at 3917.361 ms (TSC time), kmain began +0.012 ms after the handoff
 ```
 
 A phase with no event is named as missing, one stamped before entry or

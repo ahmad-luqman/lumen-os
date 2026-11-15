@@ -4,7 +4,8 @@
 //! with, how times read in logs (`Stamp`, `Millis`), the rules a
 //! calibration window must meet to be trusted (`Window`, `steady_windows`),
 //! how a PIT channel's two readings become a window (`pit_window`), busy
-//! percentages and rates (`busy_percent`, `percent`, `per_second`), and the
+//! percentages and rates (`busy_percent`, `percent`, `per_second`), a
+//! bootloader's microseconds back as ticks (`ticks_at_usec`), and the
 //! CMOS RTC's registers as a date ([`rtc`]). All of it is integer math
 //! (the kernel has no floating point) in `u128` where products can
 //! overflow, so it holds for centuries of uptime (and then saturates).
@@ -370,6 +371,18 @@ impl Clock {
     }
 }
 
+/// A counter reading a bootloader gave in whole microseconds (Limine's
+/// `rdtsc_usec`: the reading times 10^6 / `hz`, rounded down) back in
+/// ticks, rounded down: at or before the reading it was taken from, never
+/// after (and by less than one microsecond's ticks, plus one). `None` for
+/// 0 Hz or a result past `u64`.
+pub fn ticks_at_usec(usec: u64, hz: u64) -> Option<u64> {
+    if hz == 0 {
+        return None;
+    }
+    u64::try_from(u128::from(usec) * u128::from(hz) / 1_000_000).ok()
+}
+
 /// A frequency for humans: rounded to hundredths of the largest unit it
 /// reaches, trailing zeros dropped (2_900_000_000 is "2.9 GHz", 1_193_182
 /// "1.19 MHz").
@@ -718,6 +731,40 @@ mod tests {
         assert_eq!(Clock::new(1).unwrap().ns(u64::MAX), u64::MAX, "saturates");
         assert_eq!(Clock::new(u64::MAX).unwrap().ticks(u64::MAX), u64::MAX, "saturates");
         assert_eq!(Clock::new(0), None);
+    }
+
+    /// Limine's `rdtsc_usec` (common/sys/cpu.h, v12.9.4), on a given reading.
+    fn limine_usec(ticks: u64, hz: u64) -> u64 {
+        ticks / hz * 1_000_000 + ticks % hz * 1_000_000 / hz
+    }
+
+    #[test]
+    fn a_bootloaders_microseconds_come_back_at_or_before_the_reading() {
+        assert_eq!(ticks_at_usec(1_000_000, 2_900_000_000), Some(2_900_000_000));
+        assert_eq!(ticks_at_usec(1, 2_900_000_001), Some(2_900), "rounds down");
+        assert_eq!(ticks_at_usec(5, 0), None);
+        assert_eq!(ticks_at_usec(u64::MAX, 2_000_000), None, "past u64");
+        assert_eq!(ticks_at_usec(u64::MAX, 1_000_000), Some(u64::MAX), "just fits");
+        // Readings near a microsecond's edges, at frequencies a TSC has (and
+        // odd ones a calibration gives), and pseudo-random ones up to
+        // centuries: never after the reading, never a microsecond before.
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for hz in [1_000_000u64, 1_193_182, 999_999_937, 2_899_956_252, 3_000_000_000, 5_123_456_789] {
+            let per_us = hz.div_ceil(1_000_000);
+            let mut readings = std::vec![0, 1, hz - 1, hz, hz + 1, per_us - 1, per_us, per_us + 1];
+            readings.extend((0..2000).map(|_| next() % (hz * 3_600 * 24 * 365 * 100)));
+            for t in readings {
+                let back = ticks_at_usec(limine_usec(t, hz), hz).unwrap();
+                assert!(back <= t, "after the reading: {back} > {t} at {hz} Hz");
+                assert!(t - back <= per_us, "a microsecond early: {back} for {t} at {hz} Hz");
+            }
+        }
     }
 
     #[test]
