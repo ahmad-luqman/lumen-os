@@ -8,23 +8,42 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from . import BUILD_DIR
 from .qemu import QemuOptions, fresh_vars, qemu_args
 
 
+def interactive(**options: Any) -> QemuOptions:
+    """A machine someone uses (`make run`, `make debug`): with a virtio
+    tablet, so the mouse moves the pointer in the window (drawn only once
+    the tablet reports, so nothing changes until the mouse moves there)."""
+    return QemuOptions(virtio_tablet=True, **options)
+
+
 def run_options(iso: Path, vars_file: Path, headless: bool) -> QemuOptions:
-    """`make run`'s machine: serial on the terminal, and a virtio tablet so
-    the mouse moves the pointer in the window (drawn only once the tablet
-    reports, so nothing changes until the mouse moves there)."""
-    return QemuOptions(
+    """`make run`'s machine: serial on the terminal (`interactive`)."""
+    return interactive(
         iso=iso,
         vars_file=vars_file,
         headless=headless,
         serial="mon:stdio",  # Ctrl-A c reaches the QEMU monitor
         monitor=None,
         log_file=BUILD_DIR / "run/qemu.log",
-        virtio_tablet=True,
+    )
+
+
+def debug_options(iso: Path, vars_file: Path, batch: bool) -> QemuOptions:
+    """`make debug`'s machine: paused for gdb, serial to a file
+    (`interactive`)."""
+    return interactive(
+        iso=iso,
+        vars_file=vars_file,
+        headless=batch,
+        serial=f"file:{BUILD_DIR / 'debug/serial.log'}",
+        log_file=BUILD_DIR / "debug/qemu.log",
+        gdb=True,
+        accel="tcg",  # gdb breakpoints are most reliable under TCG
     )
 
 
@@ -80,15 +99,7 @@ def gdb_command(kernel: Path, batch: bool) -> list[str]:
 
 
 def cmd_debug(a: argparse.Namespace) -> int:
-    opts = QemuOptions(
-        iso=a.iso,
-        vars_file=fresh_vars(BUILD_DIR / "debug/OVMF_VARS.fd"),
-        headless=a.batch,
-        serial=f"file:{BUILD_DIR / 'debug/serial.log'}",
-        log_file=BUILD_DIR / "debug/qemu.log",
-        gdb=True,
-        accel="tcg",  # gdb breakpoints are most reliable under TCG
-    )
+    opts = debug_options(a.iso, fresh_vars(BUILD_DIR / "debug/OVMF_VARS.fd"), a.batch)
     (BUILD_DIR / "debug").mkdir(parents=True, exist_ok=True)
     qemu = subprocess.Popen(qemu_args(opts))
     print(f"QEMU paused, gdb stub on :1234, serial -> {BUILD_DIR / 'debug/serial.log'}")

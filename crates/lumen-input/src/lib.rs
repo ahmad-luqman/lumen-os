@@ -18,4 +18,6 @@ pub mod cursor;
 pub mod tablet;
 
 pub use cursor::{Cursor, Surface};
-pub use tablet::{AbsAxis, AxisError, Buttons, Event, PointerState, Tablet, evdev};
+pub use tablet::{
+    AbsAxis, AxisError, Buttons, Event, MAX_FRAME, PointerState, Tablet, evdev, has_abs_xy, may_have_lost_frames,
+};

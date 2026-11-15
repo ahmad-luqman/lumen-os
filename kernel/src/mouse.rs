@@ -20,12 +20,23 @@
 //!   `lumen_input::Tablet`, and after a batch publishes the newest state
 //!   and the batch's counts under one lock ([`status`]) and moves the
 //!   pointer (`term::move_pointer`). A press and release inside one poll
-//!   still shows: a state counts each button's presses so far. A batch of
-//!   32 events or more (the event ring holds 32) counts as an overrun:
-//!   events may have been lost (warned about once).
-//! - **Failure.** A device that sets `DEVICE_NEEDS_RESET` or `FAILED` ends
-//!   the thread: an error naming the DMA runs left outstanding, `mouse`
-//!   and `lspci` show it failed, and the pointer leaves the screen.
+//!   still shows, while no frame was dropped at the device: a state counts
+//!   each button's presses so far (that a click happened, not where).
+//! - **Overruns.** The ring holds 32 event buffers and QEMU drops a whole
+//!   frame (a move is 3 events) that doesn't fit, without a `SYN_DROPPED`.
+//!   A poll that read 30 events or more may have missed frames: it counts
+//!   as an overrun (warned about once), the state is marked stale until a
+//!   clean poll brings a frame, and the thread looks again at once instead
+//!   of sleeping. The count is a lower bound: frames the device dropped
+//!   can't be counted exactly.
+//! - **Failure.** A device that stops being ready (`FAILED`, which for the
+//!   tablet means the status reads all ones or something else gave up on
+//!   it, `DEVICE_NEEDS_RESET`, or `DRIVER_OK` gone after a reset) ends the
+//!   thread: `mouse` shows it failed (nothing held), the pointer leaves the
+//!   screen, an error gives the DMA runs outstanding in all (the tablet's
+//!   up to 32 posted buffers among them), and `lspci` shows it failed
+//!   (`pci::failed_after_bind`). Not tested: QEMU can't make the device
+//!   fail.
 //!   Dropping the driver: the crate's `Drop` unsets the queues (nothing,
 //!   on PCI), then the transport resets the device (one that doesn't reset
 //!   loses its bus mastering first), then the queues free their rings; the
@@ -40,11 +51,11 @@
 //!   tablet's messages are `lumen_input::PointerState`s; M4's desktop
 //!   consumes them.
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use core::fmt;
 
 use log::{debug, error, info, warn};
-use lumen_input::{AbsAxis, Event, PointerState, Tablet, evdev};
+use lumen_input::{AbsAxis, Event, PointerState, Tablet, evdev, has_abs_xy, may_have_lost_frames};
 use lumen_pci::PciAddr;
 use lumen_pci::names::virtio_type;
 use virtio_drivers::device::input::VirtIOInput;
@@ -62,9 +73,8 @@ pub const DRIVER: Driver = Driver { name: "virtio-tablet", matches, probe };
 /// move shows within a frame or so of a 60 Hz screen.
 pub const POLL_NS: u64 = 5_000_000;
 
-/// The event buffers the crate keeps posted (`VirtIOInput`'s queue size):
-/// a poll that reads this many may have found the ring full.
-const RING: usize = 32;
+/// The event buffers the crate keeps posted (`VirtIOInput`'s queue size).
+const RING: u64 = 32;
 
 /// virtio input's device type (virtio 1.2 §5.8).
 const VIRTIO_INPUT: u16 = 18;
@@ -99,17 +109,19 @@ pub struct Device {
     pub screen: (usize, usize),
 }
 
-/// What the `mouse` thread has read.
+/// What the `mouse` thread has read (whole frames: the state's `seq`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
-    /// Events read, and whole frames among them.
+    /// Events read.
     pub events: u64,
-    pub frames: u64,
     /// Events a tablet has no use for.
     pub ignored: u64,
-    /// `SYN_DROPPED`s (the device's own buffer overflowed: a frame lost).
+    /// `SYN_DROPPED`s (the device said it lost a frame).
     pub dropped: u64,
-    /// Polls that read a whole ring's worth (events may have been lost).
+    /// Polls that read so many events that a frame may not have fit in
+    /// the ring (`lumen_input::may_have_lost_frames`): a lower bound on
+    /// trouble, since QEMU drops such frames without saying so and they
+    /// can't be counted exactly.
     pub overruns: u64,
 }
 
@@ -118,8 +130,13 @@ pub struct Counts {
 pub enum Failure {
     /// The device set `DEVICE_NEEDS_RESET`.
     NeedsReset,
-    /// The device set `FAILED` (or reads all ones: gone).
+    /// The status shows `FAILED`. A driver sets that bit, so for the
+    /// tablet it means the status reads all ones (the device is gone) or
+    /// something else gave up on the device.
     Failed,
+    /// `DRIVER_OK` went clear (the status reads 0 after a reset): the
+    /// device stopped running.
+    Stopped,
 }
 
 impl fmt::Display for Failure {
@@ -127,6 +144,7 @@ impl fmt::Display for Failure {
         f.write_str(match self {
             Failure::NeedsReset => "DEVICE_NEEDS_RESET",
             Failure::Failed => "FAILED",
+            Failure::Stopped => "DRIVER_OK clear",
         })
     }
 }
@@ -135,9 +153,13 @@ impl fmt::Display for Failure {
 #[derive(Clone, Debug)]
 pub struct Bound {
     pub device: Device,
-    /// The newest whole frame's state, if one came.
+    /// The newest whole frame's state, if one came (its buttons cleared
+    /// once the tablet failed: nothing is held any more).
     pub state: Option<PointerState>,
     pub counts: Counts,
+    /// The newest poll that brought frames may have missed some (an
+    /// overrun): the state may be older than the device's.
+    pub stale: bool,
     /// Set when the device failed (its thread ended).
     pub failed: Option<Failure>,
 }
@@ -183,9 +205,10 @@ fn axis(t: &mut VirtioTransport, axis: u16) -> Result<AbsAxis, ProbeError> {
 
 /// Bring up a tablet: decline a second one, or a device without both
 /// absolute axes (before the crate posts any buffer), read the axes'
-/// ranges, start the crate's driver and check it is ready, then publish it
-/// and hand it to the `mouse` thread (the side effects after the last
-/// fallible check, except the spawn itself, undone if it fails).
+/// ranges, start the crate's driver and check it is ready; then publish it
+/// and hand it to the `mouse` thread. Those side effects come after the
+/// last fallible check; the spawn, which can fail too, comes last, and a
+/// failed one takes the publishing back.
 fn probe(res: DeviceResources) -> Result<(), ProbeError> {
     let addr = res.info().addr;
     // One tablet: its state and the pointer are single. A second is
@@ -199,15 +222,15 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
     let mut t = virtio::transport(res)?;
     let mut abs = [0u8; 1];
     let n = query(&mut t, cfg::EV_BITS, evdev::EV_ABS as u8, &mut abs)?;
-    let xy = (1 << evdev::ABS_X) | (1 << evdev::ABS_Y);
-    if n == 0 || abs[0] & xy != xy {
+    if !has_abs_xy(&abs[..n]) {
         info!(target: "mouse", "{addr}: no absolute X and Y axes, so not a tablet");
         return Err(ProbeError::NotMine);
     }
     let (x, y) = (axis(&mut t, evdev::ABS_X)?, axis(&mut t, evdev::ABS_Y)?);
     let mut name = [0u8; cfg::DATA_LEN];
     let len = query(&mut t, cfg::ID_NAME, 0, &mut name)?;
-    // QEMU counts a terminating NUL; anything else unprintable shows as `?`.
+    // A terminating NUL, if counted, is dropped; anything else unprintable
+    // shows as `?`.
     let name: String = String::from_utf8_lossy(&name[..len])
         .trim_end_matches('\0')
         .chars()
@@ -226,7 +249,7 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
         x.min(), x.max(), y.min(), y.max(), screen.0, screen.1
     );
     let device = Device { addr, name, screen };
-    *BOUND.lock() = Some(Bound { device, state: None, counts: Counts::default(), failed: None });
+    *BOUND.lock() = Some(Bound { device, state: None, counts: Counts::default(), stale: false, failed: None });
     match crate::sched::spawn("mouse", move || run(input, tablet, status, addr)) {
         Ok(_) => Ok(()),
         Err(e) => {
@@ -240,36 +263,36 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
 fn run(mut input: Input, mut tablet: Tablet, status: StatusHandle, addr: PciAddr) {
     let (mut warned_overrun, mut logged_ignored) = (false, false);
     loop {
-        let (mut events, mut frames, mut newest) = (0u64, 0u64, None);
+        let (mut events, mut newest) = (0u64, None);
         while let Some(e) = input.pop_pending_event() {
             events += 1;
-            let ignored = tablet.ignored();
-            let event = Event::new(e.event_type, e.code, e.value as i32);
-            if let Some(s) = tablet.feed(event) {
-                frames += 1;
+            if let Some(s) = tablet.feed(Event::new(e.event_type, e.code, e.value as i32)) {
                 newest = Some(s);
             }
-            if !logged_ignored && tablet.ignored() > ignored {
-                logged_ignored = true;
-                debug!(target: "mouse", "{addr}: ignoring events a tablet has no use for, first type {:#x} code {:#x}",
-                    event.kind, event.code);
-            }
         }
-        let overrun = events >= RING as u64;
+        if !logged_ignored && let Some((kind, code)) = tablet.first_ignored() {
+            logged_ignored = true;
+            debug!(target: "mouse", "{addr}: ignoring events a tablet has no use for, first type {kind:#x} code {code:#x}");
+        }
+        let overrun = may_have_lost_frames(events, RING);
         if overrun && !warned_overrun {
             warned_overrun = true;
-            warn!(target: "mouse", "{addr}: {events} events in one poll: the event ring was full, some may be lost \
-                (said once; `mouse` counts them)");
+            warn!(target: "mouse", "{addr}: {events} events in one poll: the event ring was nearly full, so frames \
+                may have been lost (said once; `mouse` counts such polls)");
         }
         if events > 0
             && let Some(b) = BOUND.lock().as_mut()
         {
             let c = &mut b.counts;
             c.events += events;
-            c.frames += frames;
             c.ignored = tablet.ignored();
             c.dropped = tablet.dropped();
             c.overruns += u64::from(overrun);
+            if overrun {
+                b.stale = true;
+            } else if newest.is_some() {
+                b.stale = false;
+            }
             if newest.is_some() {
                 b.state = newest;
             }
@@ -277,45 +300,44 @@ fn run(mut input: Input, mut tablet: Tablet, status: StatusHandle, addr: PciAddr
         if let Some(s) = newest {
             crate::term::move_pointer(s.x, s.y);
         }
-        let st = status.get();
-        if st.intersects(DeviceStatus::DEVICE_NEEDS_RESET | DeviceStatus::FAILED) {
-            let why = if st.contains(DeviceStatus::FAILED) { Failure::Failed } else { Failure::NeedsReset };
-            let raw = status.raw();
-            // (See the module doc for what dropping it does and leaks.)
-            drop(input);
-            let left = virtio::outstanding_runs();
-            error!(
-                target: "mouse",
-                "{addr}: the tablet's status reads {raw:#04x} ({why}): the mouse stops; {left} DMA runs \
-                 outstanding now (its posted event buffers, up to {RING}, never come back)"
-            );
-            if let Some(b) = BOUND.lock().as_mut() {
-                b.failed = Some(why);
-            }
-            crate::pci::failed_after_bind(addr, alloc::format!("the device set {why} after binding"));
-            crate::term::hide_pointer();
-            return;
+        if status.check_ready().is_err() {
+            return fail(input, status, addr);
         }
-        crate::time::sleep(POLL_NS);
+        // A busy poll looks again at once: the ring may be filling.
+        if events < RING / 2 {
+            crate::time::sleep(POLL_NS);
+        }
     }
 }
 
-/// `mouse`'s text: its header line (the device and the counts, or that
-/// there is no tablet), for `bound` (one snapshot, as its row uses).
-pub fn header(bound: Option<&Bound>) -> String {
-    let Some(b) = bound else { return "mouse: no tablet (QEMU: -device virtio-tablet-pci)".to_string() };
-    let (d, c) = (&b.device, &b.counts);
-    let failed = b.failed.map_or(String::new(), |why| alloc::format!(", failed: {why}"));
-    alloc::format!(
-        "mouse: \"{}\" on {}, screen {}x{}, {} events in {} frames ({} ignored, {} dropped, {} overruns){failed}",
-        d.name,
-        d.addr,
-        d.screen.0,
-        d.screen.1,
-        c.events,
-        c.frames,
-        c.ignored,
-        c.dropped,
-        c.overruns
-    )
+/// The device stopped being ready (`FAILED`, `DEVICE_NEEDS_RESET`, or
+/// `DRIVER_OK` gone): publish it (nothing held any more), drop the driver,
+/// say so, and mark the function failed.
+fn fail(input: Input, status: StatusHandle, addr: PciAddr) {
+    let (raw, st) = (status.raw(), status.get());
+    let why = if st.contains(DeviceStatus::FAILED) {
+        Failure::Failed
+    } else if st.contains(DeviceStatus::DEVICE_NEEDS_RESET) {
+        Failure::NeedsReset
+    } else {
+        Failure::Stopped
+    };
+    if let Some(b) = BOUND.lock().as_mut() {
+        b.failed = Some(why);
+        if let Some(s) = b.state.as_mut() {
+            s.buttons = lumen_input::Buttons::NONE;
+        }
+    }
+    crate::term::hide_pointer();
+    // (See the module doc for what dropping it does and leaks.)
+    drop(input);
+    let left = virtio::outstanding_runs();
+    error!(
+        target: "mouse",
+        "{addr}: the tablet's status reads {raw:#04x} ({why}): the mouse stops; {left} DMA runs outstanding in \
+         all (the tablet's up to {RING} posted buffers among them)"
+    );
+    if !crate::pci::failed_after_bind(addr, DRIVER.name, alloc::format!("its status showed {why} after binding")) {
+        warn!(target: "mouse", "{addr}: couldn't record the tablet as failed: the function isn't bound to it");
+    }
 }

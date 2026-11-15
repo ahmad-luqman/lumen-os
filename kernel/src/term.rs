@@ -810,7 +810,8 @@ pub fn hide_pointer() {
 }
 
 /// Where the mouse pointer's tip is drawn, if it is (not before the first
-/// [`move_pointer`], nor while a [`Canvas`] has the pixels).
+/// [`move_pointer`], after [`hide_pointer`], while a [`Canvas`] has the
+/// pixels, with the tip off the screen, or without a terminal).
 pub fn pointer_drawn() -> Option<(usize, usize)> {
     with_screen(|s| s.pointer.drawn_at()).flatten()
 }
@@ -1191,8 +1192,8 @@ crate::ktest!(
             with_screen(|s| (s.term().rows(), s.x0, s.y0, s.cell_w, s.fb.width(), s.fb.height()))
                 .ok_or("no terminal")?;
         let tabs = tab_x(fb_w, 0).ok_or("no header boxes on this screen")?;
-        // Tips: inside the grid on cell edges, on the bottom row's first
-        // cell, straddling the header and the grid, on the header's boxes,
+        // Tips: inside the grid on a cell corner and between cell edges, on
+        // the bottom row's first cell, straddling the header and the grid, on the header's boxes,
         // at the right edge, and in the bottom margin's corner (clipped).
         let tips = [
             (x0 + 3 * cell_w, y0 + 2 * CELL_H),

@@ -66,7 +66,7 @@ def test_pixels_become_axis_values_the_kernel_scales_back():
     assert abs_of(0, 1280) == 0
     assert abs_of(1279, 1280) == ABS_MAX
     assert abs_of(400, 801) == 16384
-    for pixels in (2, 3, 640, 800, 1280, 1920, 4096):
+    for pixels in (2, 3, 640, 800, 1280, 1920, 4096, 32768):
         for px in range(pixels):
             assert kernel_scale(abs_of(px, pixels), pixels) == px, (px, pixels)
 

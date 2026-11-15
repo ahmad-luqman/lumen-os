@@ -372,6 +372,12 @@ static READY: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS
 /// them.
 static CURRENT: [AtomicPtr<Thread>; MAX_CPUS] = [const { AtomicPtr::new(ptr::null_mut()) }; MAX_CPUS];
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The id the next thread made will get: every thread made from now on has
+/// at least this id (ids only grow).
+pub fn next_thread_id() -> u64 {
+    NEXT_ID.load(Ordering::Relaxed)
+}
 /// Every thread not yet dropped (weakly: the registry keeps none alive).
 /// Pruned of the dropped ones whenever a thread is created. Nothing else is
 /// locked while it is held but the heap (which it allocates from, and which

@@ -205,9 +205,35 @@ pub struct PointerState {
 
 impl PointerState {
     /// Every button's presses so far.
-    pub fn clicks(&self) -> u64 {
+    pub fn total_presses(&self) -> u64 {
         self.presses.iter().sum()
     }
+
+    /// Button `b`'s presses so far (all of `b`'s, if it names several).
+    pub fn presses_of(&self, b: Buttons) -> u64 {
+        Buttons::NAMES.iter().zip(self.presses).filter(|((n, _), _)| b.contains(*n)).map(|(_, p)| p).sum()
+    }
+}
+
+/// Whether an `EV_ABS` bitmap (virtio-input's `EV_BITS` for `EV_ABS`, bit
+/// n for axis n) has both `ABS_X` and `ABS_Y`: what makes a tablet (an
+/// empty one: the device has no absolute axes).
+pub fn has_abs_xy(bits: &[u8]) -> bool {
+    let xy = (1 << ABS_X) | (1 << ABS_Y);
+    bits.first().is_some_and(|b| b & xy == xy)
+}
+
+/// The most events one pointer frame takes on QEMU's tablet (x, y and the
+/// sync of a move).
+pub const MAX_FRAME: u64 = 3;
+
+/// Whether a poll that read `events` events from a ring of `ring` event
+/// buffers may have missed frames: once fewer than [`MAX_FRAME`] buffers
+/// were free, a whole frame may not have fit, and QEMU drops such a frame
+/// without a `SYN_DROPPED`. A lower bound on trouble, not a count: frames
+/// lost that way can't be counted exactly.
+pub fn may_have_lost_frames(events: u64, ring: u64) -> bool {
+    events + MAX_FRAME > ring
 }
 
 /// An absolute pointer (virtio's tablet): its axes and the screen it
@@ -222,6 +248,7 @@ pub struct Tablet {
     current: Option<PointerState>,
     dropping: bool,
     ignored: u64,
+    first_ignored: Option<(u16, u16)>,
     dropped: u64,
 }
 
@@ -238,6 +265,7 @@ impl Tablet {
             current: None,
             dropping: false,
             ignored: 0,
+            first_ignored: None,
             dropped: 0,
         }
     }
@@ -270,18 +298,30 @@ impl Tablet {
             (EV_REL, REL_HWHEEL) => self.pending.hwheel += i64::from(e.value),
             (EV_KEY, code) => match Buttons::from_code(code) {
                 Some((i, b)) => {
-                    // 0 released, 1 pressed, 2 held (autorepeat).
+                    // 0 released, 1 pressed, 2 held (autorepeat). A press
+                    // counts even if the button seems held (its release was
+                    // in a dropped frame); an autorepeat only if it doesn't.
                     let down = e.value != 0;
-                    if down && !self.pending.buttons.contains(b) {
+                    if e.value == 1 || (down && !self.pending.buttons.contains(b)) {
                         self.pending.presses[i] += 1;
                     }
                     self.pending.buttons.set(b, down);
                 }
-                None => self.ignored += 1,
+                None => self.ignore(e),
             },
-            _ => self.ignored += 1,
+            _ => self.ignore(e),
         }
         None
+    }
+
+    fn ignore(&mut self, e: Event) {
+        self.ignored += 1;
+        self.first_ignored.get_or_insert((e.kind, e.code));
+    }
+
+    /// The first event it had no use for: its type and code.
+    pub fn first_ignored(&self) -> Option<(u16, u16)> {
+        self.first_ignored
     }
 
     /// Events it had no use for.
@@ -405,7 +445,9 @@ mod tests {
         // Presses count once each (an autorepeat 2 after a press isn't
         // another).
         assert_eq!(states[3].presses, [1, 1, 1, 1, 1]);
-        assert_eq!(states[3].clicks(), 5);
+        assert_eq!(states[3].total_presses(), 5);
+        assert_eq!(states[3].presses_of(Buttons::RIGHT), 1);
+        assert_eq!(states[3].presses_of(Buttons::NONE), 0);
         assert_eq!(t.ignored(), 0);
     }
 
@@ -420,7 +462,7 @@ mod tests {
         assert_eq!((newest.presses[0], newest.seq), (1, 2));
         // Even pressed and released inside one frame.
         let s = feed_all(&mut t, &[key(BTN_RIGHT, true), key(BTN_RIGHT, false), SYN])[0];
-        assert_eq!((s.buttons, s.presses[1], s.clicks()), (Buttons::NONE, 1, 2));
+        assert_eq!((s.buttons, s.presses_of(Buttons::RIGHT), s.total_presses()), (Buttons::NONE, 1, 2));
         // Held with autorepeat, released: one press.
         let held = [key(BTN_LEFT, true), SYN, Event::new(EV_KEY, BTN_LEFT, 2), SYN, key(BTN_LEFT, false), SYN];
         assert_eq!(feed_all(&mut t, &held).last().unwrap().presses[0], 2);
@@ -431,9 +473,17 @@ mod tests {
         let mut t = Tablet::new(QEMU, QEMU, 100, 100);
         let s = feed_all(
             &mut t,
-            &[rel(REL_WHEEL, 1), rel(REL_WHEEL, 1), SYN, rel(REL_WHEEL, -3), rel(REL_HWHEEL, -1), SYN],
+            &[
+                rel(REL_WHEEL, 1),
+                rel(REL_WHEEL, 1),
+                rel(REL_HWHEEL, 2),
+                SYN,
+                rel(REL_WHEEL, -3),
+                rel(REL_HWHEEL, -3),
+                SYN,
+            ],
         );
-        assert_eq!((s[0].wheel, s[0].hwheel), (2, 0));
+        assert_eq!((s[0].wheel, s[0].hwheel), (2, 2));
         assert_eq!((s[1].wheel, s[1].hwheel), (-1, -1));
     }
 
@@ -474,5 +524,48 @@ mod tests {
         );
         assert_eq!(s, [PointerState { seq: 1, ..PointerState::default() }]);
         assert_eq!(t.ignored(), 5);
+        assert_eq!(t.first_ignored(), Some((EV_ABS, 0x02)));
+        assert_eq!(Tablet::new(QEMU, QEMU, 1, 1).first_ignored(), None);
+    }
+
+    #[test]
+    fn a_press_after_a_lost_release_is_counted() {
+        // The release was in a dropped frame, so the button still seems
+        // held when it is pressed again: that press counts all the same.
+        let mut t = Tablet::new(QEMU, QEMU, 100, 100);
+        let events = [
+            key(BTN_LEFT, true),
+            SYN,
+            DROPPED,
+            key(BTN_LEFT, false),
+            SYN,
+            key(BTN_LEFT, true),
+            SYN,
+            key(BTN_LEFT, false),
+            SYN,
+        ];
+        let last = *feed_all(&mut t, &events).last().unwrap();
+        assert_eq!((last.presses_of(Buttons::LEFT), last.buttons), (2, Buttons::NONE));
+    }
+
+    #[test]
+    fn a_tablet_has_absolute_x_and_y() {
+        assert!(has_abs_xy(&[0b11]));
+        assert!(has_abs_xy(&[0xff, 0xff]));
+        assert!(!has_abs_xy(&[0b01]), "X only");
+        assert!(!has_abs_xy(&[0b10]), "Y only");
+        assert!(!has_abs_xy(&[0b1100]), "other axes only");
+        assert!(!has_abs_xy(&[]), "no absolute axes");
+    }
+
+    #[test]
+    fn a_poll_near_a_full_ring_may_have_lost_frames() {
+        // 32 buffers: with 29 read, 3 were free at worst (a whole move
+        // fits); with 30, only 2 (a move may have been dropped).
+        assert!(!may_have_lost_frames(0, 32));
+        assert!(!may_have_lost_frames(29, 32));
+        assert!(may_have_lost_frames(30, 32));
+        assert!(may_have_lost_frames(32, 32));
+        assert!(may_have_lost_frames(100, 32));
     }
 }

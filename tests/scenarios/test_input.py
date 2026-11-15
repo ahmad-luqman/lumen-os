@@ -9,11 +9,12 @@ import re
 import shlex
 import threading
 import time
+from collections.abc import Callable
 from typing import NamedTuple
 
 from lumen_harness.image import assert_matches_golden, compare
 from lumen_harness.qemu import Devices, Machine
-from lumen_harness.qmp import QmpClient, QmpError, qcodes_for
+from lumen_harness.qmp import QmpClient, QmpError, pointer_move_args, qcodes_for
 from lumen_harness.screen import expect_screen, read_screen
 from PIL import Image
 from test_pci import lspci_rows, qdev_addresses, run
@@ -200,7 +201,7 @@ TABLET_LINE = re.compile(
 )
 MOUSE_HEADER = re.compile(
     r'mouse: "QEMU Virtio Tablet" on (\S+), screen 1280x800, (\d+) events in (\d+) frames '
-    r"\((\d+) ignored, (\d+) dropped, (\d+) overruns\)"
+    r"\((\d+) ignored, (\d+) dropped, at least (\d+) overruns\)"
 )
 # The terminal's top-left pixel and its cells' size (1280x800, limine.conf).
 GRID_X, GRID_Y, CELL_W, CELL_H = 32, 144, 7, 16
@@ -215,10 +216,11 @@ class Mouse(NamedTuple):
     wheel: str
     hwheel: str
     pointer: str
+    stale: str
     failed: str
 
 
-NOTHING_YET = ("-",) * 8
+NOTHING_YET = ("-",) * 9
 
 
 def mouse(m: Machine) -> tuple[str, Mouse]:
@@ -226,7 +228,8 @@ def mouse(m: Machine) -> tuple[str, Mouse]:
     lines = run(m, "mouse").splitlines()
     assert len(lines) == 3, lines
     assert re.fullmatch(
-        r"  device\s+x\s+y\s+buttons\s+presses\s+wheel\s+hwheel\s+pointer\s+failed", lines[1]
+        r"  device\s+x\s+y\s+buttons\s+presses\s+wheel\s+hwheel\s+pointer\s+stale\s+failed",
+        lines[1],
     ), lines
     return lines[0], Mouse(*re.split(r"\s{2,}", lines[2].strip()))
 
@@ -239,7 +242,7 @@ def mouse_counts(m: Machine) -> tuple[int, ...]:
     return tuple(map(int, found.groups()[1:]))
 
 
-def poll(what, done, m: Machine, timeout: float = 10):
+def poll[T](what: Callable[[], T], done: Callable[[T], bool], m: Machine, timeout: float = 10) -> T:
     """Call `what()` until `done(result)` (up to `timeout` seconds, scaled);
     the last result."""
     deadline = time.monotonic() + timeout * m.timeout_scale
@@ -252,8 +255,12 @@ def poll(what, done, m: Machine, timeout: float = 10):
 
 def wait_mouse(m: Machine, **want: str) -> Mouse:
     """Ask `mouse` until its row has the values `want` (up to 10 s)."""
-    row = poll(lambda: mouse(m)[1], lambda r: all(getattr(r, k) == v for k, v in want.items()), m)
-    assert all(getattr(row, k) == v for k, v in want.items()), f"mouse never showed {want}: {row}"
+
+    def shows(row: Mouse) -> bool:
+        return all(getattr(row, k) == v for k, v in want.items())
+
+    row = poll(lambda: mouse(m)[1], shows, m)
+    assert shows(row), f"mouse never showed {want}: {row}"
     return row
 
 
@@ -268,7 +275,9 @@ def tablet_ready(m: Machine) -> str:
 
 def test_mouse_moves_pointer(boot, artifacts, golden_dir):
     # Before the tablet reports anything `mouse` shows its device and
-    # dashes (the pointer `-`: not drawn); moved through QMP, it reports
+    # dashes (nothing reported yet; the header comparison in
+    # test_cursor_leaves_no_trail checks nothing is drawn); moved through
+    # QMP, it reports
     # the pixel aimed at (the screen's corners included), as records too,
     # and the arrow's tip is drawn there (a golden of it on the empty
     # terminal); buttons are held and released, presses counted; the wheel
@@ -280,7 +289,7 @@ def test_mouse_moves_pointer(boot, artifacts, golden_dir):
     target = (900, 500)
     m.move_pointer(*target)
     row = wait_mouse(m, x="900", y="500")
-    assert row == Mouse(addr, "900", "500", "none", "0", "0", "0", "drawn", "-")
+    assert row == Mouse(addr, "900", "500", "none", "0", "0", "0", "drawn", "no", "-")
     shot = m.screendump("pointer.png")
     assert_matches_golden(
         shot,
@@ -396,6 +405,44 @@ def test_cursor_leaves_no_trail(boot, artifacts):
     # was before the arrow ever showed.
     header = (0, 0, 1280, GRID_Y)
     assert pixels(after, header) == pixels(before, header)
+
+
+def test_a_burst_of_moves_counts_overruns(boot):
+    # 300 moves sent as fast as QMP takes them (no pacing): QEMU drops a
+    # whole frame that doesn't fit in the 32-buffer ring (traced as
+    # virtio_input_queue_full) without telling the guest. If any frame was
+    # lost, `mouse` counts at least one overrun (a lower bound); none is
+    # ignored or SYN_DROPPED. A paced move afterwards is a clean frame: the
+    # state isn't stale.
+    m = boot("qemutest", devices=Devices(tablet=True), extra=["-trace", "virtio_input_queue_full"])
+    tablet_ready(m)
+    size = m.screen_size()
+    qmp = m.qmp()
+    sent = 300
+    for i in range(sent):
+        qmp.send_input(pointer_move_args(100 + i % 2, 100 + i, size))
+    # Settled: the same counts twice, a little apart.
+    last: list[tuple[int, ...]] = [()]
+
+    def settled(counts: tuple[int, ...]) -> bool:
+        same, last[0] = counts == last[0], counts
+        return same
+
+    events, frames, ignored, dropped, overruns = poll(lambda: mouse_counts(m), settled, m, 30)
+    # The trace goes to `-D`'s qemu.log where the harness sets one (TCG),
+    # else to stderr.
+    log = m.artifacts / "qemu.log"
+    traced = m.qemu_stderr() + (log.read_text(errors="replace") if log.exists() else "")
+    full = traced.count("virtio_input_queue_full")
+    print(f"sent {sent}, read {frames} frames, {overruns} overruns, queue full {full} times")
+    assert (ignored, dropped) == (0, 0)
+    assert frames <= sent and events == 3 * frames
+    if full:
+        assert frames < sent
+    if frames < sent:
+        assert overruns >= 1, (frames, overruns)
+    m.move_pointer(640, 400)
+    assert wait_mouse(m, x="640", y="400").stale == "no"
 
 
 def test_tablet_is_bound_and_the_keyboard_is_not(boot):

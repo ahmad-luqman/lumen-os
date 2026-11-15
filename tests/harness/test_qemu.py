@@ -12,7 +12,7 @@ from typing import Self
 
 import pytest
 from lumen_harness import REPO_ROOT, qemu
-from lumen_harness.__main__ import find_gdb, gdb_binary, gdb_command, run_options
+from lumen_harness.__main__ import debug_options, find_gdb, gdb_binary, gdb_command, run_options
 from lumen_harness.qemu import (
     Devices,
     ExpectTimeout,
@@ -23,6 +23,7 @@ from lumen_harness.qemu import (
     qemu_version,
     timeout_scale,
 )
+from PIL import Image
 from qemu_fakes import fake_qemu, opts
 
 
@@ -103,10 +104,31 @@ def test_pointer_events_need_a_tablet(tmp_path):
             send()
 
 
-def test_make_run_attaches_a_tablet():
-    # So the mouse moves the pointer in `make run`'s window.
-    args = qemu_args(run_options(Path("x.iso"), Path("v.fd"), headless=True))
-    assert "virtio-tablet-pci,id=lumen-tablet" in args
+def test_make_run_and_debug_attach_a_tablet():
+    # So the mouse moves the pointer in their windows.
+    for machine in (
+        run_options(Path("x.iso"), Path("v.fd"), headless=True),
+        debug_options(Path("x.iso"), Path("v.fd"), batch=True),
+    ):
+        assert "virtio-tablet-pci,id=lumen-tablet" in qemu_args(machine)
+    assert "-S" in qemu_args(debug_options(Path("x.iso"), Path("v.fd"), batch=True))
+
+
+def test_the_screen_size_is_taken_once(tmp_path, monkeypatch):
+    # From one screendump, kept for every later pointer event.
+    m = Machine(Path("x.iso"), tmp_path, devices=Devices(tablet=True))
+    shots = []
+
+    def screendump(name):
+        shots.append(name)
+        path = tmp_path / name
+        Image.new("RGB", (640, 480)).save(path)
+        return path
+
+    monkeypatch.setattr(m, "screendump", screendump)
+    assert m.screen_size() == (640, 480)
+    assert m.screen_size() == (640, 480)
+    assert shots == ["screen-size.png"]
 
 
 def test_machine_event_failures_show_the_serial_output(tmp_path):

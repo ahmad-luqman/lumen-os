@@ -390,10 +390,32 @@ pub fn mouse(ctx: &mut Ctx<'_>, args: &[String]) {
     }
     // One snapshot for the header and the row.
     let bound = crate::mouse::status();
-    let mut t = crate::mouse::header(bound.as_ref());
+    let mut t = mouse_header(bound.as_ref());
     t.push('\n');
     mouse_table_of(bound.as_ref()).render(&mut t);
     emit(ctx, &t);
+}
+
+/// `mouse`'s header line: the device, the screen and the counts (whole
+/// frames are the state's `seq`; overruns a lower bound), and why it
+/// failed; or that there is no tablet.
+fn mouse_header(bound: Option<&crate::mouse::Bound>) -> String {
+    let Some(b) = bound else { return String::from("mouse: no tablet (QEMU: -device virtio-tablet-pci)") };
+    let (d, c) = (&b.device, &b.counts);
+    let frames = b.state.map_or(0, |s| s.seq);
+    let failed = b.failed.map_or(String::new(), |why| alloc::format!(", failed: {why}"));
+    alloc::format!(
+        "mouse: \"{}\" on {}, screen {}x{}, {} events in {frames} frames ({} ignored, {} dropped, at least {} \
+         overruns){failed}",
+        d.name,
+        d.addr,
+        d.screen.0,
+        d.screen.1,
+        c.events,
+        c.ignored,
+        c.dropped,
+        c.overruns
+    )
 }
 
 fn mouse_table() -> pipe::Table {
@@ -402,13 +424,14 @@ fn mouse_table() -> pipe::Table {
 
 /// `mouse`'s row: always one (`none` for its device without a tablet;
 /// `-` before the first report): the pointer's position, the buttons held
-/// (`left right`, or `none`), every button's presses so far (a click
-/// between two looks shows here), the wheels' clicks so far, the pointer
-/// (`drawn`, `hidden` while a command draws on the screen, `none` without
-/// a terminal, `-` once the tablet failed) and why the tablet failed (`-`
-/// while it works).
+/// (`left right`, or `none`), every button's presses so far, summed (a
+/// click between two looks shows here), the wheels' clicks so far, the
+/// pointer (`drawn`, `hidden` while a command draws on the screen, `none`
+/// without a terminal, `-` once the tablet failed), whether frames may
+/// have been missed since the newest one (`stale`: `yes` after an overrun)
+/// and why the tablet failed (`-` while it works).
 fn mouse_table_of(bound: Option<&crate::mouse::Bound>) -> pipe::Table {
-    const COLUMNS: [Column; 9] = [
+    const COLUMNS: [Column; 10] = [
         Column::new("device", Kind::Text, Align::Left, 12),
         Column::new("x", Kind::Int, Align::Right, 4),
         Column::new("y", Kind::Int, Align::Right, 4),
@@ -417,14 +440,16 @@ fn mouse_table_of(bound: Option<&crate::mouse::Bound>) -> pipe::Table {
         Column::new("wheel", Kind::Int, Align::Right, 5),
         Column::new("hwheel", Kind::Int, Align::Right, 6),
         Column::new("pointer", Kind::Text, Align::Left, 7),
+        Column::new("stale", Kind::Text, Align::Left, 5),
         Column::new("failed", Kind::Text, Align::Left, 0),
     ];
     let mut t = pipe::Table::new(&COLUMNS);
     let device = bound.map_or(text("none"), |b| Value::Text(b.device.addr.to_string()));
-    let failed = bound.and_then(|b| b.failed).map_or(DASH, |why| Value::Text(why.to_string()));
-    let row = match bound.and_then(|b| b.state) {
-        Some(s) => {
-            let pointer = if failed != DASH {
+    let failed = bound.and_then(|b| b.failed);
+    let failed_cell = failed.map_or(DASH, |why| Value::Text(why.to_string()));
+    let row = match bound.and_then(|b| b.state.map(|s| (s, b.stale))) {
+        Some((s, stale)) => {
+            let pointer = if failed.is_some() {
                 "-"
             } else if crate::term::screen_size().is_none() {
                 "none"
@@ -438,14 +463,15 @@ fn mouse_table_of(bound: Option<&crate::mouse::Bound>) -> pipe::Table {
                 int(s.x),
                 int(s.y),
                 Value::Text(s.buttons.to_string()),
-                int(s.clicks()),
+                int(s.total_presses()),
                 int(s.wheel),
                 int(s.hwheel),
                 text(pointer),
-                failed,
+                text(if stale { "yes" } else { "no" }),
+                failed_cell,
             ]
         }
-        None => vec![device, DASH, DASH, DASH, DASH, DASH, DASH, DASH, failed],
+        None => vec![device, DASH, DASH, DASH, DASH, DASH, DASH, DASH, DASH, failed_cell],
     };
     t.push(row);
     t
@@ -710,6 +736,43 @@ crate::ktest!(
         kassert!(records("dmesg").is_none());
         let inputs = crate::interrupts::inputs();
         kassert!(input_table(&inputs).rows().len() == inputs.len());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn mouse_shows_a_failed_tablet_and_its_counts() {
+        // A tablet that failed after reporting (built here: QEMU can't make
+        // one fail): the header gives every count and why it failed; the
+        // row keeps the last position, no pointer (`-`), stale, and why.
+        use crate::kassert_eq;
+        use crate::mouse::{Bound, Counts, Device, Failure};
+        use lumen_input::{Buttons, PointerState};
+        let addr = lumen_pci::PciAddr::new(0, 0, 3, 0).ok_or("addr")?;
+        let state =
+            PointerState { x: 5, y: 6, buttons: Buttons::NONE, presses: [2, 1, 0, 0, 0], seq: 7, ..Default::default() };
+        let bound = Bound {
+            device: Device { addr, name: String::from("ktest tablet"), screen: (1280, 800) },
+            state: Some(state),
+            counts: Counts { events: 9, ignored: 1, dropped: 2, overruns: 3 },
+            stale: true,
+            failed: Some(Failure::Failed),
+        };
+        kassert_eq!(
+            mouse_header(Some(&bound)),
+            "mouse: \"ktest tablet\" on 0000:00:03.0, screen 1280x800, 9 events in 7 frames (1 ignored, 2 dropped, \
+             at least 3 overruns), failed: FAILED"
+        );
+        let table = mouse_table_of(Some(&bound));
+        let row = &table.rows()[0];
+        kassert_eq!(row[0], Value::Text(String::from("0000:00:03.0")));
+        kassert_eq!((row[1].clone(), row[2].clone(), row[4].clone()), (Value::Int(5), Value::Int(6), Value::Int(3)));
+        kassert_eq!(row[7], text("-"));
+        kassert_eq!(row[8], text("yes"));
+        kassert_eq!(row[9], text("FAILED"));
+        // Without a tablet: one row of dashes.
+        kassert_eq!(mouse_header(None), "mouse: no tablet (QEMU: -device virtio-tablet-pci)");
+        kassert_eq!(mouse_table_of(None).rows()[0][9], DASH);
         Ok(())
     }
 );

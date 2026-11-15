@@ -11,7 +11,8 @@ and 9p (a shared host folder). `Machine(cpu=...)` sets the CPU model.
 
 `Machine` boots an ISO headless with serial on a pipe (or none at all), then lets a test wait
 for output (`expect`, with a timeout, never fixed sleeps), type input
-(`send_line` on serial, `type_text` and `press` on the keyboard through QMP),
+(`send_line` on serial, `type_text` and `press` on the keyboard through QMP,
+`move_pointer`, `click` and `release` on a tablet through QMP),
 take screenshots over QMP (`screendump`), and collect the exit
 status that the kernel sets through `isa-debug-exit`.
 
