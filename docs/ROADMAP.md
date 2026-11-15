@@ -112,7 +112,7 @@ history, tab completion, pipes, live system views and a scripting language.
 
 | Feature | Exit criteria (tests) |
 |---|---|
-| PCI enumeration, the virtio adapter for `virtio-drivers` (DMA frames from the frame allocator, HHDM translation), `lspci` | `scenario:test_pci::test_lspci_lists_virtio_devices`, `ktest:lumen_kernel::virtio::dma_frames_are_owned_and_freed` |
+| PCI enumeration, the virtio adapter for `virtio-drivers` (DMA frames from the frame allocator, bounce buffers for shared buffers), `lspci` | `scenario:test_pci::test_lspci_lists_virtio_devices`, `ktest:lumen_kernel::virtio::dma_frames_are_owned_and_freed`, `ktest:lumen_kernel::virtio::share_bounces_a_buffer_across_pages` |
 | Harness: `qemu.py` options for virtio tablet, keyboard, rng, sound (wav capture), blk, net (user net with port forwarding) and 9p (host folder) | `tests/harness` (each option's command line), `scenario:test_pci::test_lspci_lists_virtio_devices` with all of them attached |
 | Randomness: RDRAND plus virtio-rng; `random` | `scenario:test_dev::test_random_differs_between_boots`, `ktest:lumen_kernel::rng::rdrand_or_virtio_available` |
 | Mouse: virtio-tablet (absolute pointer), drawn cursor | `scenario:test_input::test_mouse_moves_pointer` (QMP `input-send-event`, golden) |
