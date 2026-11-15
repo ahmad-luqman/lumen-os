@@ -1,8 +1,9 @@
 //! ADSR envelopes: how a note's loudness rises when it starts (attack),
 //! falls to a holding level (decay, sustain) and dies away when it is
-//! released (release). Levels are linear, in Q24 inside and Q16 out.
+//! released (release). Levels are linear: Q24 inside, for fine steps, and
+//! Q16 out ([`Envelope::gain`] drops the low 8 bits).
 
-use crate::samples_in_ms;
+use crate::Rate;
 
 /// Full level inside the envelope (Q24).
 const UNITY: u32 = 1 << 24;
@@ -57,32 +58,37 @@ pub struct Envelope {
     attack_step: u32,
     decay_step: u32,
     sustain_level: u32,
+    /// The release step from [`Adsr::release_ms`].
     release_step: u32,
+    /// The step of the release under way ([`Envelope::release_over`] can
+    /// make it steeper).
+    releasing_step: u32,
     release_samples: u32,
 }
 
-/// The per-sample step that covers `span` in `ms` milliseconds (rounded up,
-/// so the span is covered in exactly that many samples); all of it at once
-/// when that is less than one sample.
-fn step(span: u32, ms: u32, rate: u32) -> u32 {
-    match samples_in_ms(ms, rate) {
-        0 => span.max(1),
-        n => span.div_ceil(n).max(1),
-    }
+/// The per-sample step that covers `span` in `samples` samples, rounded up
+/// so it takes at most that many (exactly that many unless the rounding
+/// adds up to a whole step, which needs more than about √span samples);
+/// all of it at once for 0 samples.
+fn step(span: u32, samples: u32) -> u32 {
+    span.div_ceil(samples.max(1)).max(1)
 }
 
 impl Envelope {
-    /// An idle (silent) envelope of shape `adsr` at `rate` samples a second.
-    pub fn new(adsr: Adsr, rate: u32) -> Envelope {
+    /// An idle (silent) envelope of shape `adsr` at `rate`.
+    pub fn new(adsr: Adsr, rate: Rate) -> Envelope {
         let sustain_level = (u64::from(UNITY) * u64::from(adsr.sustain.min(100)) / 100) as u32;
+        let release_samples = rate.samples_in_ms(adsr.release_ms);
+        let release_step = step(UNITY, release_samples);
         Envelope {
             stage: Stage::Idle,
             level: 0,
-            attack_step: step(UNITY, adsr.attack_ms, rate),
-            decay_step: step(UNITY - sustain_level, adsr.decay_ms, rate),
+            attack_step: step(UNITY, rate.samples_in_ms(adsr.attack_ms)),
+            decay_step: step(UNITY - sustain_level, rate.samples_in_ms(adsr.decay_ms)),
             sustain_level,
-            release_step: step(UNITY, adsr.release_ms, rate),
-            release_samples: samples_in_ms(adsr.release_ms, rate),
+            release_step,
+            releasing_step: release_step,
+            release_samples,
         }
     }
 
@@ -92,10 +98,23 @@ impl Envelope {
         self.stage = Stage::Attack;
     }
 
-    /// Release the note: the level falls from where it is to silence.
+    /// Release the note at the shape's release rate: the level falls from
+    /// where it is to silence.
     pub fn note_off(&mut self) {
+        self.release_with(self.release_step);
+    }
+
+    /// Release the note so it is silent after at most `samples` more
+    /// [`gain`](Self::gain)s, whatever its level (immediately for 0): for
+    /// a note that must end before its release time is up.
+    pub fn release_over(&mut self, samples: u32) {
+        self.release_with(step(self.level, samples));
+    }
+
+    fn release_with(&mut self, step: u32) {
         if self.stage != Stage::Idle {
             self.stage = Stage::Release;
+            self.releasing_step = step;
         }
     }
 
@@ -105,7 +124,8 @@ impl Envelope {
         self.stage == Stage::Idle
     }
 
-    /// The number of samples a release from full level takes.
+    /// At most how many samples a release from full level takes
+    /// ([`Adsr::release_ms`] at the rate).
     pub fn release_samples(&self) -> u32 {
         self.release_samples
     }
@@ -128,7 +148,7 @@ impl Envelope {
                 }
             }
             Stage::Release => {
-                self.level = self.level.saturating_sub(self.release_step);
+                self.level = self.level.saturating_sub(self.releasing_step);
                 if self.level == 0 {
                     self.stage = Stage::Idle;
                 }
@@ -144,7 +164,7 @@ mod tests {
     use std::vec::Vec;
 
     // 1000 samples a second: one sample per millisecond.
-    const RATE: u32 = 1000;
+    const RATE: Rate = Rate::new(1000).unwrap();
 
     fn run(env: &mut Envelope, n: usize) -> Vec<u32> {
         (0..n).map(|_| env.gain()).collect()
@@ -203,6 +223,28 @@ mod tests {
     }
 
     #[test]
+    fn release_over_ends_in_the_samples_given() {
+        for samples in [0, 1, 3, 7, 100] {
+            let mut env = Envelope::new(Adsr { attack_ms: 0, decay_ms: 0, sustain: 100, release_ms: 1000 }, RATE);
+            env.note_on();
+            env.gain();
+            env.release_over(samples);
+            let g = run(&mut env, samples.max(1) as usize);
+            assert_eq!(*g.last().unwrap(), 0, "{samples}: {g:?}");
+            assert!(env.is_idle());
+        }
+        // The next note's release is the shape's again.
+        let mut env = Envelope::new(Adsr { attack_ms: 0, decay_ms: 0, sustain: 100, release_ms: 10 }, RATE);
+        env.note_on();
+        env.release_over(2);
+        run(&mut env, 2);
+        env.note_on();
+        env.gain();
+        env.note_off();
+        assert_eq!(run(&mut env, 10).iter().position(|&g| g == 0), Some(9));
+    }
+
+    #[test]
     fn retriggering_rises_from_the_current_level() {
         let mut env = Envelope::new(Adsr { attack_ms: 10, decay_ms: 0, sustain: 100, release_ms: 100 }, RATE);
         env.note_on();
@@ -215,9 +257,10 @@ mod tests {
     }
 
     #[test]
-    fn note_off_while_idle_stays_idle() {
+    fn releasing_while_idle_stays_idle() {
         let mut env = Envelope::new(Adsr::PLUCK, RATE);
         env.note_off();
+        env.release_over(3);
         assert!(env.is_idle());
         assert_eq!(env.gain(), 0);
     }

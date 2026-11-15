@@ -1,21 +1,23 @@
-//! The melody notation `play` takes: words separated by spaces.
+//! The melody notation `play` takes: words separated by ASCII whitespace.
 //!
 //! | Word | Meaning |
 //! |---|---|
-//! | `C4/8` | a note: letter `A`–`G` (either case), then `#` (sharp) or `b` (flat), then the octave `0`–`8` (default 4), then `/` and the length as a fraction of a whole note: 1, 2, 4, 8, 16 or 32 (default 4, a quarter), then `.` for a dotted note (half as long again) |
-//! | `r/4` | a rest (`r` or `R`), with a length like a note's |
+//! | `C#4/8.` | a note: a letter `A`–`G` (either case), then optionally `#` (sharp) or `b` (flat, lowercase only), the octave `0`–`8` (default 4), `/` and the length as a fraction of a whole note: 1, 2, 4, 8, 16 or 32 (default 4, a quarter), and `.` for a dotted note (half as long again) |
+//! | `r/4` | a rest (`r` or `R`), optionally with a length and dot like a note's |
 //! | `t=140` | the tempo from here on, in quarter notes a minute (20–999; default 120) |
 //! | `w=sine` | the waveform from here on: `square` (default), `triangle`, `sine`, `noise` |
 //!
+//! Settings and waveform names are lowercase, and numbers are plain digits
+//! without a sign or leading zeros, so each word has one spelling (the
+//! canonical text [`Token`]'s `Display` prints parses back unchanged).
 //! [`Melody::parse`] checks the whole text first, so playing it never meets
-//! an error halfway; errors carry the byte offset of the offending
-//! character. Octave 4 starts at middle C, A4 is 440 Hz, and accidentals
-//! may cross octaves (`Cb4` is B3, `B#3` is C4).
+//! a bad word halfway. Octave 4 starts at middle C, A4 is 440 Hz, and
+//! accidentals may cross octaves (`Cb4` is B3, `B#3` is C4).
 
 use core::fmt;
 
-use crate::Freq;
 use crate::osc::Waveform;
+use crate::{Freq, Rate};
 
 /// The tempo before any `t=`, in quarter notes a minute.
 pub const DEFAULT_TEMPO: u16 = 120;
@@ -83,35 +85,59 @@ pub enum Accidental {
     Sharp,
 }
 
-/// A pitch: letter, accidental and octave.
+/// A pitch: letter, accidental and octave, from C0 (`Cb0` is refused) to
+/// B#8 (C9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Pitch {
-    pub letter: Letter,
-    pub accidental: Accidental,
-    /// 0..=8 as written (the accidental may move the sounding note an
-    /// octave).
-    pub octave: u8,
+    letter: Letter,
+    accidental: Accidental,
+    octave: u8,
 }
+
+/// The highest octave a pitch is written in.
+pub const MAX_OCTAVE: u8 = 8;
 
 /// Octave 4's notes from C, in millihertz (equal temperament, A4 = 440 Hz).
 const OCTAVE_4: [u32; 12] =
     [261_626, 277_183, 293_665, 311_127, 329_628, 349_228, 369_994, 391_995, 415_305, 440_000, 466_164, 493_883];
 
 impl Pitch {
-    /// Semitones above C0, or `None` below it (`Cb0`).
-    fn semitones(self) -> Option<u32> {
+    /// The pitch, or `None` for an octave above [`MAX_OCTAVE`] or a note
+    /// below C0.
+    pub fn new(letter: Letter, accidental: Accidental, octave: u8) -> Option<Pitch> {
+        let pitch = Pitch { letter, accidental, octave };
+        (octave <= MAX_OCTAVE && pitch.semitones() >= 0).then_some(pitch)
+    }
+
+    pub fn letter(self) -> Letter {
+        self.letter
+    }
+
+    pub fn accidental(self) -> Accidental {
+        self.accidental
+    }
+
+    /// The octave as written (the accidental may move the sounding note an
+    /// octave).
+    pub fn octave(self) -> u8 {
+        self.octave
+    }
+
+    /// Semitones above C0 (0..=108 for any pitch [`Pitch::new`] accepts).
+    fn semitones(self) -> i32 {
         let accidental = match self.accidental {
             Accidental::Flat => -1,
             Accidental::Natural => 0,
             Accidental::Sharp => 1,
         };
-        u32::try_from(i32::from(self.octave) * 12 + self.letter.semitone() + accidental).ok()
+        i32::from(self.octave) * 12 + self.letter.semitone() + accidental
     }
 
-    /// The pitch's frequency.
+    /// The pitch's frequency (C0 is 16.352 Hz, C9 8372.032 Hz).
     pub fn freq(self) -> Freq {
-        // Pitches come from the parser, which refuses the one below C0.
-        let n = self.semitones().unwrap_or(0);
+        // 0..=108 by construction, so the octave is 0..=9 and the shift
+        // can't overflow.
+        let n = self.semitones().clamp(0, 108) as u32;
         let (octave, step) = (n / 12, (n % 12) as usize);
         let base = OCTAVE_4[step];
         Freq::from_millihz(if octave >= 4 {
@@ -137,28 +163,35 @@ impl fmt::Display for Pitch {
 /// A note or rest's length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Length {
-    /// The fraction of a whole note: 1, 2, 4, 8, 16 or 32.
-    pub denominator: u8,
-    /// Half as long again.
-    pub dotted: bool,
+    denominator: u8,
+    dotted: bool,
 }
 
 impl Length {
     /// A quarter note, the default.
     pub const QUARTER: Length = Length { denominator: 4, dotted: false };
 
-    /// How many samples the length lasts at `tempo` quarter notes a minute
-    /// and `rate` samples a second (rounded down).
-    pub fn samples(self, tempo: u16, rate: u32) -> u32 {
-        // A whole note is 4 beats = 240 / tempo seconds.
-        let (num, den) = if self.dotted { (3, 2) } else { (1, 1) };
-        let n = u64::from(rate) * 240 * num / (u64::from(tempo.max(1)) * u64::from(self.denominator.max(1)) * den);
-        u32::try_from(n).unwrap_or(u32::MAX)
+    /// `1/denominator` of a whole note (half as long again if `dotted`), or
+    /// `None` unless the denominator is 1, 2, 4, 8, 16 or 32.
+    pub fn new(denominator: u8, dotted: bool) -> Option<Length> {
+        matches!(denominator, 1 | 2 | 4 | 8 | 16 | 32).then_some(Length { denominator, dotted })
     }
 
-    /// How many milliseconds the length lasts at `tempo` (rounded down).
-    pub fn ms(self, tempo: u16) -> u32 {
-        self.samples(tempo, 1000)
+    pub fn denominator(self) -> u8 {
+        self.denominator
+    }
+
+    pub fn dotted(self) -> bool {
+        self.dotted
+    }
+
+    /// How many samples the length lasts at `tempo` quarter notes a minute
+    /// (0 counts as 1) and `rate` (rounded down).
+    pub fn samples(self, tempo: u16, rate: Rate) -> u32 {
+        // A whole note is 4 beats = 240 / tempo seconds.
+        let (num, den) = if self.dotted { (3, 2) } else { (1, 1) };
+        let n = u64::from(rate.hz()) * 240 * num / (u64::from(tempo.max(1)) * u64::from(self.denominator) * den);
+        u32::try_from(n).unwrap_or(u32::MAX)
     }
 }
 
@@ -197,14 +230,14 @@ impl fmt::Display for Token {
 pub enum ParseErrorKind {
     /// No notes or rests at all.
     Empty,
-    /// A word that starts with something other than a note letter, `r` or a
-    /// known `x=` setting.
+    /// A word without `=` that starts with something other than a note
+    /// letter or `r`.
     UnknownNote(char),
     /// An octave above 8, or a note below C0 (`Cb0`).
     BadOctave,
     /// A length other than 1, 2, 4, 8, 16 or 32 after `/`.
     BadLength,
-    /// A tempo outside 20..=999 or not a number.
+    /// A tempo outside 20..=999 or not plain digits.
     BadTempo,
     /// A waveform name that doesn't exist.
     BadWave,
@@ -212,12 +245,17 @@ pub enum ParseErrorKind {
     UnknownSetting,
     /// A character left over after a complete word (`C4x`).
     Unexpected(char),
+    /// A note at or above half the sample rate ([`Melody::check`]).
+    TooHigh,
 }
 
 /// A melody error and where it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ParseError {
-    /// The byte offset in the melody's text of the character at fault.
+    /// The byte offset in the melody's text of the character at fault
+    /// (a char boundary), or where it should be when it is missing: the
+    /// text's length for no notes at all ([`ParseErrorKind::Empty`]), just
+    /// past `t=`, `w=` or `/` when nothing follows.
     pub pos: usize,
     pub kind: ParseErrorKind,
 }
@@ -234,124 +272,157 @@ impl fmt::Display for ParseError {
             ParseErrorKind::BadWave => write!(f, "waveform at {pos} must be square, triangle, sine or noise"),
             ParseErrorKind::UnknownSetting => write!(f, "setting at {pos} is not t= (tempo) or w= (waveform)"),
             ParseErrorKind::Unexpected(c) => write!(f, "unexpected {c:?} at {pos}"),
+            ParseErrorKind::TooHigh => write!(f, "note at {pos} is too high for the sample rate"),
         }
     }
 }
 
 impl core::error::Error for ParseError {}
 
-/// A checked melody.
+/// A checked melody, holding its text as any `S: AsRef<str>`: a `&str`
+/// to play it in place, or an owned string to send it to another thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Melody<'a> {
-    text: &'a str,
+pub struct Melody<S> {
+    text: S,
 }
 
-impl<'a> Melody<'a> {
+impl<S: AsRef<str>> Melody<S> {
     /// Check `text`: every word must parse and there must be at least one
     /// note or rest.
-    pub fn parse(text: &'a str) -> Result<Melody<'a>, ParseError> {
-        let mut words = Words { text, pos: 0 };
+    pub fn parse(text: S) -> Result<Melody<S>, ParseError> {
+        let s = text.as_ref();
+        let mut pos = 0;
         let mut sounds = false;
-        while let Some(token) = words.next_word() {
+        while let Some((_, token)) = next_word(s, &mut pos) {
             sounds |= matches!(token?, Token::Note(..) | Token::Rest(_));
         }
         if !sounds {
-            return Err(ParseError { pos: text.len(), kind: ParseErrorKind::Empty });
+            return Err(ParseError { pos: s.len(), kind: ParseErrorKind::Empty });
         }
         Ok(Melody { text })
     }
 
+    /// The melody's text.
+    pub fn text(&self) -> &str {
+        self.text.as_ref()
+    }
+
     /// The melody's words, in order.
-    pub fn tokens(&self) -> Tokens<'a> {
-        Tokens(Words { text: self.text, pos: 0 })
+    pub fn tokens(&self) -> Tokens<'_> {
+        Tokens { text: self.text(), pos: 0 }
     }
 
-    /// How long the melody plays, in milliseconds (each length rounded down
-    /// to whole samples at `rate`, as [`crate::Sequencer`] plays it).
-    pub fn duration_ms(&self, rate: u32) -> u64 {
-        u64::from(self.duration_samples(rate)) * 1000 / u64::from(rate.max(1))
-    }
-
-    /// How many samples the melody lasts at `rate`.
-    pub fn duration_samples(&self, rate: u32) -> u32 {
-        let mut tempo = DEFAULT_TEMPO;
-        let mut total = 0u32;
-        for token in self.tokens() {
-            match token {
-                Token::Note(_, len) | Token::Rest(len) => total = total.saturating_add(len.samples(tempo, rate)),
-                Token::Tempo(t) => tempo = t,
-                Token::Wave(_) => {}
+    /// `Ok` if `rate` carries every note ([`Rate::carries`]); otherwise the
+    /// first note that is too high.
+    pub fn check(&self, rate: Rate) -> Result<(), ParseError> {
+        let mut pos = 0;
+        while let Some((start, token)) = next_word(self.text(), &mut pos) {
+            if let Ok(Token::Note(pitch, _)) = token
+                && !rate.carries(pitch.freq())
+            {
+                return Err(ParseError { pos: start, kind: ParseErrorKind::TooHigh });
             }
         }
-        total
+        Ok(())
     }
+
+    /// How many samples the melody lasts at `rate` (each length rounded
+    /// down to whole samples, as [`crate::Sequencer`] plays it).
+    pub fn duration_samples(&self, rate: Rate) -> u32 {
+        duration_samples(self.text(), rate)
+    }
+
+    pub(crate) fn into_text(self) -> S {
+        self.text
+    }
+}
+
+/// How many samples a checked melody's `text` lasts at `rate`.
+pub(crate) fn duration_samples(text: &str, rate: Rate) -> u32 {
+    let mut tempo = DEFAULT_TEMPO;
+    let mut total = 0u32;
+    for token in (Tokens { text, pos: 0 }) {
+        match token {
+            Token::Note(_, len) | Token::Rest(len) => total = total.saturating_add(len.samples(tempo, rate)),
+            Token::Tempo(t) => tempo = t,
+            Token::Wave(_) => {}
+        }
+    }
+    total
 }
 
 /// A checked melody's words ([`Melody::tokens`]).
 #[derive(Clone, Debug)]
-pub struct Tokens<'a>(Words<'a>);
+pub struct Tokens<'a> {
+    text: &'a str,
+    pos: usize,
+}
 
 impl Iterator for Tokens<'_> {
     type Item = Token;
 
     fn next(&mut self) -> Option<Token> {
-        // The melody was checked when it was parsed, so no word fails.
-        self.0.next_word().and_then(Result::ok)
+        next_token(self.text, &mut self.pos)
     }
 }
 
-/// The word parser.
-#[derive(Clone, Debug)]
-struct Words<'a> {
-    text: &'a str,
-    pos: usize,
+/// The checked word at byte `*pos` of `text` (a melody's), advancing `*pos`
+/// past it.
+pub(crate) fn next_token(text: &str, pos: &mut usize) -> Option<Token> {
+    next_word(text, pos).map(|(_, r)| r.expect("checked by Melody::parse"))
 }
 
-impl Words<'_> {
-    fn next_word(&mut self) -> Option<Result<Token, ParseError>> {
-        let bytes = self.text.as_bytes();
-        while bytes.get(self.pos).is_some_and(u8::is_ascii_whitespace) {
-            self.pos += 1;
-        }
-        if self.pos >= bytes.len() {
-            return None;
-        }
-        let start = self.pos;
-        let end = bytes[start..].iter().position(u8::is_ascii_whitespace).map_or(bytes.len(), |n| start + n);
-        self.pos = end;
-        Some(parse_word(self.text, start, end))
+/// The word at or after byte `*pos` of `text` and where it starts,
+/// advancing `*pos` past it.
+fn next_word(text: &str, pos: &mut usize) -> Option<(usize, Result<Token, ParseError>)> {
+    let bytes = text.as_bytes();
+    while bytes.get(*pos).is_some_and(u8::is_ascii_whitespace) {
+        *pos += 1;
     }
+    if *pos >= bytes.len() {
+        return None;
+    }
+    let start = *pos;
+    let end = bytes[start..].iter().position(u8::is_ascii_whitespace).map_or(bytes.len(), |n| start + n);
+    *pos = end;
+    let result = parse_word(&text[start..end]).map_err(|(at, kind)| ParseError { pos: start + at, kind });
+    Some((start, result))
 }
 
-fn error(pos: usize, kind: ParseErrorKind) -> ParseError {
-    ParseError { pos, kind }
+/// Plain decimal digits without a sign or leading zero (and short enough
+/// for a u32).
+fn decimal(s: &str) -> Option<u32> {
+    let plain = !s.is_empty() && s.len() <= 9 && s.bytes().all(|b| b.is_ascii_digit());
+    if !plain || (s.len() > 1 && s.starts_with('0')) {
+        return None;
+    }
+    s.parse().ok()
 }
 
-/// The character at byte `pos` of `text` (a char boundary).
-fn char_at(text: &str, pos: usize) -> char {
-    text[pos..].chars().next().unwrap_or(' ')
+/// The character at byte `at` of `word` (a char boundary).
+fn char_at(word: &str, at: usize) -> char {
+    word[at..].chars().next().unwrap_or(' ')
 }
 
-fn parse_word(text: &str, start: usize, end: usize) -> Result<Token, ParseError> {
-    let word = &text[start..end];
+/// One word (non-empty, no whitespace); errors carry the offset in it.
+fn parse_word(word: &str) -> Result<Token, (usize, ParseErrorKind)> {
+    use ParseErrorKind::*;
     let bytes = word.as_bytes();
     if let Some(eq) = word.find('=') {
-        let (key, value) = (&word[..eq], &word[eq + 1..]);
-        let at = start + eq + 1;
+        let (key, value, at) = (&word[..eq], &word[eq + 1..], eq + 1);
         return match key {
-            "t" => value
-                .parse::<u16>()
-                .ok()
+            "t" => decimal(value)
+                .and_then(|t| u16::try_from(t).ok())
                 .filter(|t| TEMPO_RANGE.contains(t))
                 .map(Token::Tempo)
-                .ok_or(error(at, ParseErrorKind::BadTempo)),
-            "w" => Waveform::from_name(value).map(Token::Wave).ok_or(error(at, ParseErrorKind::BadWave)),
-            _ => Err(error(start, ParseErrorKind::UnknownSetting)),
+                .ok_or((at, BadTempo)),
+            "w" => Waveform::from_name(value).map(Token::Wave).ok_or((at, BadWave)),
+            _ => Err((0, UnknownSetting)),
         };
     }
     let mut i = 1;
     let token = if bytes[0].eq_ignore_ascii_case(&b'r') {
-        Token::Rest(parse_length(text, start, bytes, &mut i)?)
+        Token::Rest(parse_length(word, &mut i)?)
     } else if let Some(letter) = Letter::from_byte(bytes[0]) {
         let accidental = match bytes.get(i) {
             Some(b'#') => Accidental::Sharp,
@@ -361,50 +432,42 @@ fn parse_word(text: &str, start: usize, end: usize) -> Result<Token, ParseError>
         if accidental != Accidental::Natural {
             i += 1;
         }
-        let octave = match bytes.get(i) {
-            Some(d @ b'0'..=b'8') => {
-                i += 1;
-                d - b'0'
-            }
-            Some(b'9') => return Err(error(start + i, ParseErrorKind::BadOctave)),
-            _ => 4,
+        let digits = bytes[i..].iter().take_while(|b| b.is_ascii_digit()).count();
+        let octave = match &bytes[i..i + digits] {
+            [] => 4,
+            [d @ b'0'..=b'8'] => d - b'0',
+            _ => return Err((i, BadOctave)),
         };
-        if bytes.get(i).is_some_and(u8::is_ascii_digit) {
-            // A two-digit octave.
-            return Err(error(start + i - 1, ParseErrorKind::BadOctave));
-        }
-        let pitch = Pitch { letter, accidental, octave };
-        if pitch.semitones().is_none() {
-            return Err(error(start, ParseErrorKind::BadOctave));
-        }
-        Token::Note(pitch, parse_length(text, start, bytes, &mut i)?)
+        i += digits;
+        let pitch = Pitch::new(letter, accidental, octave).ok_or((0, BadOctave))?;
+        Token::Note(pitch, parse_length(word, &mut i)?)
     } else {
-        return Err(error(start, ParseErrorKind::UnknownNote(char_at(text, start))));
+        return Err((0, UnknownNote(char_at(word, 0))));
     };
     match bytes.get(i) {
         None => Ok(token),
-        Some(_) => Err(error(start + i, ParseErrorKind::Unexpected(char_at(text, start + i)))),
+        Some(_) => Err((i, Unexpected(char_at(word, i)))),
     }
 }
 
-/// An optional `/n` and `.` at `bytes[*i..]` (the word starts at `start`
-/// in `text`); advances `*i` past them.
-fn parse_length(text: &str, start: usize, bytes: &[u8], i: &mut usize) -> Result<Length, ParseError> {
-    let mut len = Length::QUARTER;
+/// An optional `/n` and `.` at `word[*i..]`; advances `*i` past them.
+fn parse_length(word: &str, i: &mut usize) -> Result<Length, (usize, ParseErrorKind)> {
+    let bytes = word.as_bytes();
+    let mut denominator = 4;
     if bytes.get(*i) == Some(&b'/') {
-        let digits = bytes[*i + 1..].iter().take_while(|b| b.is_ascii_digit()).count();
-        let number = &text[start + *i + 1..start + *i + 1 + digits];
-        len.denominator = match number.parse::<u8>() {
-            Ok(n @ (1 | 2 | 4 | 8 | 16 | 32)) => n,
-            _ => return Err(error(start + *i + 1, ParseErrorKind::BadLength)),
-        };
-        *i += 1 + digits;
+        let at = *i + 1;
+        let digits = bytes[at..].iter().take_while(|b| b.is_ascii_digit()).count();
+        denominator = decimal(&word[at..at + digits])
+            .and_then(|n| u8::try_from(n).ok())
+            .filter(|&n| Length::new(n, false).is_some())
+            .ok_or((at, ParseErrorKind::BadLength))?;
+        *i = at + digits;
     }
-    if bytes.get(*i) == Some(&b'.') {
-        len.dotted = true;
+    let dotted = bytes.get(*i) == Some(&b'.');
+    if dotted {
         *i += 1;
     }
-    Ok(len)
+    Ok(Length { denominator, dotted })
 }
 
 #[cfg(test)]
@@ -412,6 +475,8 @@ mod tests {
     use super::*;
     use std::string::{String, ToString};
     use std::vec::Vec;
+
+    const RATE: Rate = Rate::DEFAULT;
 
     fn tokens(text: &str) -> Vec<Token> {
         Melody::parse(text).unwrap().tokens().collect()
@@ -424,43 +489,37 @@ mod tests {
         }
     }
 
-    fn err(text: &str) -> ParseError {
-        Melody::parse(text).unwrap_err()
+    fn pitch(letter: Letter, accidental: Accidental, octave: u8) -> Pitch {
+        Pitch::new(letter, accidental, octave).unwrap()
+    }
+
+    fn canonical(tokens: &[Token]) -> String {
+        tokens.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ")
     }
 
     #[test]
     fn parses_notes_rests_and_settings() {
         let t = tokens("t=140 w=sine C4/8 Eb5/16. r/2 g#");
-        assert_eq!(t.len(), 6);
-        assert_eq!(t[0], Token::Tempo(140));
-        assert_eq!(t[1], Token::Wave(Waveform::Sine));
         assert_eq!(
-            t[2],
-            Token::Note(
-                Pitch { letter: Letter::C, accidental: Accidental::Natural, octave: 4 },
-                Length { denominator: 8, dotted: false }
-            )
+            t,
+            [
+                Token::Tempo(140),
+                Token::Wave(Waveform::Sine),
+                Token::Note(pitch(Letter::C, Accidental::Natural, 4), Length::new(8, false).unwrap()),
+                Token::Note(pitch(Letter::E, Accidental::Flat, 5), Length::new(16, true).unwrap()),
+                Token::Rest(Length::new(2, false).unwrap()),
+                Token::Note(pitch(Letter::G, Accidental::Sharp, 4), Length::QUARTER),
+            ]
         );
-        assert_eq!(
-            t[3],
-            Token::Note(
-                Pitch { letter: Letter::E, accidental: Accidental::Flat, octave: 5 },
-                Length { denominator: 16, dotted: true }
-            )
-        );
-        assert_eq!(t[4], Token::Rest(Length { denominator: 2, dotted: false }));
-        assert_eq!(
-            t[5],
-            Token::Note(Pitch { letter: Letter::G, accidental: Accidental::Sharp, octave: 4 }, Length::QUARTER)
-        );
+        assert_eq!(tokens("r/4"), [Token::Rest(Length::QUARTER)], "a rest alone is a melody");
     }
 
     #[test]
     fn letters_and_rests_ignore_case_and_extra_spaces() {
         assert_eq!(tokens("  a4\tR  bb3\n"), tokens("A4 r Bb3"));
         // A lowercase `b` is the note B; after a letter it is a flat.
-        assert_eq!(note("b").0.letter, Letter::B);
-        assert_eq!(note("bb").0, Pitch { letter: Letter::B, accidental: Accidental::Flat, octave: 4 });
+        assert_eq!(note("b").0.letter(), Letter::B);
+        assert_eq!(note("bb").0, pitch(Letter::B, Accidental::Flat, 4));
     }
 
     #[test]
@@ -487,57 +546,148 @@ mod tests {
     }
 
     #[test]
+    fn pitches_and_lengths_are_only_built_in_range() {
+        assert!(Pitch::new(Letter::C, Accidental::Natural, 9).is_none());
+        assert!(Pitch::new(Letter::C, Accidental::Flat, 0).is_none());
+        assert!(Pitch::new(Letter::B, Accidental::Sharp, 8).is_some());
+        // Every constructible pitch has a frequency, without overflow.
+        for octave in 0..=255u8 {
+            for letter in [Letter::C, Letter::D, Letter::E, Letter::F, Letter::G, Letter::A, Letter::B] {
+                for acc in [Accidental::Flat, Accidental::Natural, Accidental::Sharp] {
+                    if let Some(p) = Pitch::new(letter, acc, octave) {
+                        assert!((16_000..8_400_000).contains(&p.freq().millihz()), "{p}");
+                    }
+                }
+            }
+        }
+        for d in 0..=255u8 {
+            assert_eq!(Length::new(d, false).is_some(), [1, 2, 4, 8, 16, 32].contains(&d), "{d}");
+        }
+    }
+
+    #[test]
     fn lengths_follow_the_tempo() {
-        let quarter = Length::QUARTER;
-        assert_eq!(quarter.ms(120), 500);
-        assert_eq!(quarter.ms(60), 1000);
-        assert_eq!(Length { denominator: 1, dotted: false }.ms(120), 2000);
-        assert_eq!(Length { denominator: 8, dotted: true }.ms(120), 375);
-        assert_eq!(Length { denominator: 32, dotted: false }.samples(999, 48_000), 360);
+        let ms = |len: Length, tempo| len.samples(tempo, Rate::new(1000).unwrap());
+        assert_eq!(ms(Length::QUARTER, 120), 500);
+        assert_eq!(ms(Length::QUARTER, 60), 1000);
+        assert_eq!(ms(Length::new(1, false).unwrap(), 120), 2000);
+        assert_eq!(ms(Length::new(8, true).unwrap(), 120), 375);
+        assert_eq!(Length::new(32, false).unwrap().samples(999, RATE), 360);
         let m = Melody::parse("C4 t=60 C4/2. r/8").unwrap();
-        assert_eq!(m.duration_ms(48_000), 500 + 3000 + 500);
-        assert_eq!(m.duration_samples(48_000), 4 * 48_000);
+        assert_eq!(m.duration_samples(RATE), 4 * 48_000);
+    }
+
+    #[test]
+    fn check_names_the_first_note_too_high_for_the_rate() {
+        let m = Melody::parse("w=sine C4 B#8 C8").unwrap();
+        assert_eq!(m.check(RATE), Ok(()));
+        let low = Rate::new(16_000).unwrap(); // carries up to 8 kHz; B#8 is 8372 Hz
+        assert_eq!(m.check(low), Err(ParseError { pos: 10, kind: ParseErrorKind::TooHigh }));
+        let lower = Rate::new(8000).unwrap();
+        assert_eq!(m.check(lower), Err(ParseError { pos: 10, kind: ParseErrorKind::TooHigh }));
+        assert_eq!(Melody::parse("C8").unwrap().check(lower).unwrap_err().pos, 0);
     }
 
     #[test]
     fn canonical_text_round_trips() {
         let text = "t=90 w=triangle c d#5/8 Gb3/16. r R/32. w=noise A/1 B#8/2 t=999 cb1";
         let first = tokens(text);
-        let canonical: String = first.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ");
-        assert_eq!(canonical, "t=90 w=triangle C4/4 D#5/8 Gb3/16. r/4 r/32. w=noise A4/1 B#8/2 t=999 Cb1/4");
-        assert_eq!(tokens(&canonical), first);
+        let canon = canonical(&first);
+        assert_eq!(canon, "t=90 w=triangle C4/4 D#5/8 Gb3/16. r/4 r/32. w=noise A4/1 B#8/2 t=999 Cb1/4");
+        assert_eq!(tokens(&canon), first);
     }
 
     #[test]
     fn rejects_bad_words_with_their_position() {
         use ParseErrorKind::*;
-        assert_eq!(err(""), ParseError { pos: 0, kind: Empty });
-        assert_eq!(err("   "), ParseError { pos: 3, kind: Empty });
-        assert_eq!(err("t=100 w=sine"), ParseError { pos: 12, kind: Empty });
-        assert_eq!(err("C4 H4"), ParseError { pos: 3, kind: UnknownNote('H') });
-        assert_eq!(err("C4 é4"), ParseError { pos: 3, kind: UnknownNote('é') });
-        assert_eq!(err("C9"), ParseError { pos: 1, kind: BadOctave });
-        assert_eq!(err("C#10"), ParseError { pos: 2, kind: BadOctave });
-        assert_eq!(err("A Cb0"), ParseError { pos: 2, kind: BadOctave });
-        assert_eq!(err("C4/3"), ParseError { pos: 3, kind: BadLength });
-        assert_eq!(err("C4/"), ParseError { pos: 3, kind: BadLength });
-        assert_eq!(err("r/64"), ParseError { pos: 2, kind: BadLength });
-        assert_eq!(err("C4/300"), ParseError { pos: 3, kind: BadLength });
-        assert_eq!(err("t=0 C"), ParseError { pos: 2, kind: BadTempo });
-        assert_eq!(err("t=1000 C"), ParseError { pos: 2, kind: BadTempo });
-        assert_eq!(err("C t=fast"), ParseError { pos: 4, kind: BadTempo });
-        assert_eq!(err("w=saw C"), ParseError { pos: 2, kind: BadWave });
-        assert_eq!(err("C x=1"), ParseError { pos: 2, kind: UnknownSetting });
-        assert_eq!(err("C4x"), ParseError { pos: 2, kind: Unexpected('x') });
-        assert_eq!(err("C4/8.."), ParseError { pos: 5, kind: Unexpected('.') });
-        assert_eq!(err("C##4"), ParseError { pos: 2, kind: Unexpected('#') });
-        assert_eq!(err("r4"), ParseError { pos: 1, kind: Unexpected('4') });
+        let cases: &[(&str, usize, ParseErrorKind)] = &[
+            ("", 0, Empty),
+            ("   ", 3, Empty),
+            ("t=100 w=sine", 12, Empty),
+            ("C4 H4", 3, UnknownNote('H')),
+            ("C4 é4", 3, UnknownNote('é')),
+            ("C9", 1, BadOctave),
+            ("C#10", 2, BadOctave),
+            ("C04", 1, BadOctave),
+            ("A Cb0", 2, BadOctave),
+            ("C4/3", 3, BadLength),
+            ("C4/", 3, BadLength),
+            ("r/64", 2, BadLength),
+            ("C4/300", 3, BadLength),
+            ("C/08", 2, BadLength),
+            ("C/+8", 2, BadLength),
+            ("t=0 C", 2, BadTempo),
+            ("t=19 C", 2, BadTempo),
+            ("t=1000 C", 2, BadTempo),
+            ("C t=fast", 4, BadTempo),
+            ("t=+140 C", 2, BadTempo),
+            ("t=0140 C", 2, BadTempo),
+            ("t= C", 2, BadTempo),
+            ("w=saw C", 2, BadWave),
+            ("w=Sine C", 2, BadWave),
+            ("C x=1", 2, UnknownSetting),
+            ("C T=100", 2, UnknownSetting),
+            ("C4x", 2, Unexpected('x')),
+            ("C4/8..", 5, Unexpected('.')),
+            ("C##4", 2, Unexpected('#')),
+            ("CB4", 1, Unexpected('B')),
+            ("r4", 1, Unexpected('4')),
+            ("C4é", 2, Unexpected('é')),
+        ];
+        for &(text, pos, kind) in cases {
+            assert_eq!(Melody::parse(text), Err(ParseError { pos, kind }), "{text:?}");
+        }
+        assert!(Melody::parse("t=20 C t=999 C").is_ok(), "the tempo range's edges");
     }
 
     #[test]
     fn errors_print_their_position() {
-        let e = err("C4 H4");
+        let e = Melody::parse("C4 H4").unwrap_err();
         assert_eq!(e.to_string(), "'H' at 3 is not a note (A-G), rest (r), t= or w=");
-        assert!(err("C4/3").to_string().contains("1, 2, 4, 8, 16 or 32"));
+        assert!(Melody::parse("C4/3").unwrap_err().to_string().contains("1, 2, 4, 8, 16 or 32"));
+    }
+
+    #[test]
+    fn owned_text_parses_like_borrowed() {
+        let owned = Melody::parse(String::from("A4 r/8")).unwrap();
+        assert_eq!(owned.tokens().collect::<Vec<_>>(), tokens("A4 r/8"));
+        assert_eq!(owned.text(), "A4 r/8");
+    }
+
+    /// Random words from the notation's alphabet: parsing never panics,
+    /// accepted text round-trips through its canonical form, and every
+    /// error points at a char boundary.
+    #[test]
+    fn fuzzed_words_never_panic_and_round_trip() {
+        const ALPHABET: [&str; 32] = [
+            "A", "C", "G", "b", "e", "r", "R", "H", "#", "b", ".", "/", "=", "t", "w", "0", "1", "2", "4", "8", "9",
+            "3", "6", "é", " ", "\t", "+", "sine", "noise", "x", "t=", "w=",
+        ];
+        let mut state = 0xACE1u32;
+        let mut next = || {
+            // xorshift32
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let mut accepted = 0;
+        for _ in 0..100_000 {
+            let len = 1 + next() % 8;
+            let text: String = (0..len).map(|_| ALPHABET[(next() % 32) as usize]).collect();
+            match Melody::parse(text.as_str()) {
+                Ok(m) => {
+                    accepted += 1;
+                    let first: Vec<Token> = m.tokens().collect();
+                    let canon = canonical(&first);
+                    let again: Vec<Token> = Melody::parse(canon.as_str()).unwrap().tokens().collect();
+                    assert_eq!(again, first, "{text:?} -> {canon:?}");
+                }
+                Err(e) => {
+                    assert!(e.pos <= text.len() && text.is_char_boundary(e.pos), "{text:?}: {e:?}");
+                }
+            }
+        }
+        assert!(accepted > 1000, "the generator should hit valid melodies too: {accepted}");
     }
 }
