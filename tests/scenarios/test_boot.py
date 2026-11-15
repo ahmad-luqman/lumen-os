@@ -44,6 +44,7 @@ PHASES = [
     "memory",
     "stacks",
     "acpi",
+    "pci",
     "interrupts",
     "time",
     "smp",

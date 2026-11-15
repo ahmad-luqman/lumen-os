@@ -1,25 +1,28 @@
 //! A function's header, the [`DeviceInfo`] the kernel keeps for it, and
 //! the brute-force scan that finds them.
 
+use core::fmt;
 use core::ops::RangeInclusive;
 
-use crate::{Bar, CapList, ConfigSpace, PciAddr, reg, size_bars};
+use crate::bar::size_bars;
+use crate::{Bar, CapList, ConfigSpace, PciAddr, Problem, names, reg};
 
 /// The header's layout (the header type field's low 7 bits).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeaderType {
+pub(crate) enum HeaderType {
     /// Type 0: a device (6 BARs).
     Endpoint,
     /// Type 1: a PCI-to-PCI bridge (2 BARs).
     PciBridge,
     /// Type 2: a CardBus bridge (no BARs or capabilities decoded).
     CardBus,
-    Other(u8),
+    /// 3-127, which PCI doesn't define.
+    Unknown(u8),
 }
 
 /// The fields every header type shares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Header {
+pub(crate) struct Header {
     pub vendor: u16,
     pub device: u16,
     pub command: u16,
@@ -41,10 +44,10 @@ impl Header {
     }
 }
 
-/// The header of the function at `addr`, or `None` if there is none: the
-/// id dword reads as all ones (nothing answered) or a vendor of 0 or
-/// 0xffff.
-pub fn read_header(cs: &mut impl ConfigSpace, addr: PciAddr) -> Option<Header> {
+/// The header of the function at `addr`, or `None` if nothing answers
+/// there: the vendor id reads as 0xffff (as an absent function's all-ones
+/// dword does) or 0.
+pub(crate) fn read_header(cs: &mut impl ConfigSpace, addr: PciAddr) -> Option<Header> {
     let id = cs.read(addr, reg::ID);
     let (vendor, device) = (id as u16, (id >> 16) as u16);
     if vendor == 0xffff || vendor == 0 {
@@ -66,10 +69,20 @@ pub fn read_header(cs: &mut impl ConfigSpace, addr: PciAddr) -> Option<Header> {
             0 => HeaderType::Endpoint,
             1 => HeaderType::PciBridge,
             2 => HeaderType::CardBus,
-            other => HeaderType::Other(other),
+            other => HeaderType::Unknown(other),
         },
         multi_function: kind & 0x80 != 0,
     })
+}
+
+/// A PCI-to-PCI bridge's bus numbers: the bus it is on, the bus behind it,
+/// and the highest bus below it. Buses `secondary..=subordinate` are
+/// reached through it (a secondary bus of 0: not configured).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BusNumbers {
+    pub primary: u8,
+    pub secondary: u8,
+    pub subordinate: u8,
 }
 
 /// What the kernel knows about one function, read once at boot
@@ -86,31 +99,39 @@ pub struct DeviceInfo {
     /// Subsystem vendor and id (an endpoint's; `(0, 0)` for other header
     /// types). virtio's transitional devices give their device type here.
     pub subsystem: (u16, u16),
-    /// The BARs the firmware assigned, sized ([`size_bars`]).
+    /// The implemented BARs, sized; `None` for one that isn't implemented
+    /// or is the upper half of a 64-bit BAR.
     pub bars: [Option<Bar>; 6],
     /// MSI, MSI-X, vendor-specific (virtio's) and the others, complete or
-    /// cut off.
+    /// cut off (or not read: an unknown header type).
     pub caps: CapList,
-    /// The INTx pin (1-4 for INTA-INTD, 0 for none): shown only, INTx is
-    /// never routed (no `_PRT`).
+    /// The INTx pin (1-4 for INTA-INTD, 0 for none): recorded only, INTx
+    /// is never routed (no `_PRT`).
     pub irq_pin: u8,
+    /// A PCI-to-PCI bridge's bus numbers.
+    pub buses: Option<BusNumbers>,
 }
 
 impl DeviceInfo {
     /// Read the function at `addr`, sizing its BARs (which briefly turns
     /// its decoding off: see [`size_bars`]); `None` if there is none.
-    pub fn read(cs: &mut impl ConfigSpace, addr: PciAddr) -> Option<DeviceInfo> {
+    pub(crate) fn read(cs: &mut impl ConfigSpace, addr: PciAddr) -> Option<DeviceInfo> {
         read_header(cs, addr).map(|h| DeviceInfo::from_header(cs, addr, &h))
     }
 
     fn from_header(cs: &mut impl ConfigSpace, addr: PciAddr, h: &Header) -> DeviceInfo {
-        let subsystem = match h.header_type {
+        let (mut subsystem, mut buses) = ((0, 0), None);
+        match h.header_type {
             HeaderType::Endpoint => {
                 let s = cs.read(addr, reg::SUBSYSTEM);
-                (s as u16, (s >> 16) as u16)
+                subsystem = (s as u16, (s >> 16) as u16);
             }
-            _ => (0, 0),
-        };
+            HeaderType::PciBridge => {
+                let b = cs.read(addr, reg::BRIDGE_BUSES);
+                buses = Some(BusNumbers { primary: b as u8, secondary: (b >> 8) as u8, subordinate: (b >> 16) as u8 });
+            }
+            _ => {}
+        }
         DeviceInfo {
             addr,
             vendor: h.vendor,
@@ -123,6 +144,66 @@ impl DeviceInfo {
             bars: size_bars(cs, addr, h),
             caps: CapList::read(cs, addr, h.status, h.header_type),
             irq_pin: cs.read8(addr, reg::INTERRUPT + 1),
+            buses,
+        }
+    }
+
+    /// The device's name, if Lumen knows it ([`names::device`]).
+    pub fn name(&self) -> Option<&'static str> {
+        names::device(self.vendor, self.device, self.subsystem.1)
+    }
+
+    /// The class code's name ([`names::class`]).
+    pub fn class_name(&self) -> &'static str {
+        names::class(self.class, self.subclass)
+    }
+
+    /// Whether a driver may be given this device: its capability list was
+    /// read in full (#95's `probe_all` skips it otherwise).
+    pub fn probeable(&self) -> bool {
+        self.caps.is_complete()
+    }
+
+    /// What is wrong with this function, for warnings: a capability list
+    /// cut off or not read, each unassigned or malformed BAR, and a
+    /// bridge's buses that `covered(segment, bus)` says aren't all in the
+    /// configuration space being scanned (the devices behind it would be
+    /// invisible).
+    pub fn problems(&self, covered: impl Fn(u16, u8) -> bool) -> impl Iterator<Item = Problem> {
+        let caps = (!self.caps.is_complete()).then_some(Problem::Caps(self.caps.end()));
+        let bars = self.bars.into_iter().enumerate().filter_map(|(index, bar)| match bar? {
+            Bar::Unassigned { io, size, .. } => Some(Problem::UnassignedBar { index, io, size }),
+            Bar::Malformed(why) => Some(Problem::MalformedBar { index, why }),
+            _ => None,
+        });
+        let segment = self.addr.segment();
+        let bridge = self.buses.and_then(|b| {
+            let invisible = b.secondary != 0
+                && (b.secondary > b.subordinate || !(b.secondary..=b.subordinate).all(|bus| covered(segment, bus)));
+            invisible.then_some(Problem::BusesOutsideEcam { secondary: b.secondary, subordinate: b.subordinate })
+        });
+        caps.into_iter().chain(bars).chain(bridge)
+    }
+}
+
+/// The boot log's line for a function: `0000:00:00.0 8086:29c0 host
+/// bridge (class 060000) Q35 host bridge`.
+impl fmt::Display for DeviceInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} {:04x}:{:04x} {} (class {:02x}{:02x}{:02x})",
+            self.addr,
+            self.vendor,
+            self.device,
+            self.class_name(),
+            self.class,
+            self.subclass,
+            self.prog_if
+        )?;
+        match self.name() {
+            Some(name) => write!(f, " {name}"),
+            None => Ok(()),
         }
     }
 }

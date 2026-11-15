@@ -1,16 +1,17 @@
 # Features: devices (PCI, drivers). See tests/features/README.md for the format.
 
 [[feature]]
-name = "PCI configuration space through ECAM: the MCFG's regions parsed and checked (base present and 1 MiB aligned, buses in order, the range within 64 bits; entries in table order, a partial entry refused), q35's one region for segment 0's 256 buses found at boot, mapped once uncached, reading back what enumeration found, an absent function reading as all ones"
+name = "PCI configuration space through ECAM: each MCFG entry judged on its own (a base that is 0 or not 1 MiB aligned, buses backwards, a range not ending below 2^64, or buses overlapping an accepted entry: refused with its reason, the others kept; up to 256 entries; a partial entry refused), q35's one region for segment 0's 256 buses found at boot where the pinned OVMF puts it (0xe0000000), mapped once uncached, reading back what enumeration found, an absent function reading as all ones; ECAM offsets counted from a region's first bus"
 milestone = "M3"
 tests = [
     "cargo:lumen-acpi",
+    "cargo:lumen-pci",
     "ktest:lumen_kernel::acpi::info_copies_what_q35_describes",
     "ktest:lumen_kernel::pci::ecam_is_mapped_uncached_and_reads_what_enumeration_found",
 ]
 
 [[feature]]
-name = "PCI decoding and enumeration (lumen-pci): header fields, BARs sized with I/O and memory decoding off and the command register and every BAR restored (a host bridge's decoding left on), 32- and 64-bit memory BARs (also 8 GiB above 4 GiB), 16- and 32-bit I/O BARs, unimplemented, unassigned (at 0), reserved-type and last-slot 64-bit BARs left out, a bridge's 2 BARs and a CardBus bridge's none; the capability list in order (reserved pointer bits masked), a looping chain or a pointer into the header cut off and marked, the longest clean list complete; a brute-force scan of every bus in the range, functions 1-7 only behind a multi-function function 0; q35's chipset found at boot in address order"
+name = "PCI decoding and enumeration (lumen-pci): header fields, BARs sized with I/O and memory decoding off and the command register, the status register and every BAR restored (a host bridge's decoding left on; ISA and PCI-to-PCI bridges' turned off), 32- and 64-bit memory BARs (also 8 GiB above 4 GiB), 16- and 32-bit I/O BARs; unimplemented BARs left out, unassigned ones (at 0, 32- or 64-bit) kept with their size, malformed ones (reserved type, 64-bit in the last slot, I/O past port 0xffff, ending at 2^64) marked; a bridge's 2 BARs, its bus numbers and no subsystem; a CardBus bridge's BARs and capability pointer not decoded; an unknown header type's capabilities not read and not probeable; the capability list in order (reserved pointer bits masked), a looping chain or a pointer into the header cut off and marked, the longest clean list complete; a brute-force scan of every bus in the range, functions 1-7 only behind a multi-function function 0 (decoded like a single-function one); each problem (incomplete capability list, unassigned or malformed BAR, bridge to buses outside ECAM) named in a host-tested warning; q35's chipset found at boot in address order with no problems"
 milestone = "M3"
 tests = [
     "cargo:lumen-pci",
@@ -18,19 +19,23 @@ tests = [
 ]
 
 [[feature]]
-name = "The BAR registry records every memory BAR found at boot and maps one only when asked, once (the same address again), uncached, to its physical address; an unknown BAR is refused"
+name = "The BAR registry records every memory BAR found at boot, all unmapped, and maps one only when asked: once (the same mapping again, one entry mapped), uncached, to its physical address, looked up without mapping before and after; a BAR that can't be mapped is refused naming the function, the BAR and why (out of range, no such function, I/O, not implemented)"
 milestone = "M3"
 tests = [
     "ktest:lumen_kernel::pci::the_registry_records_every_memory_bar_and_maps_each_once",
 ]
 
 [[feature]]
-name = "`lspci` lists exactly the PCI functions QEMU reports (address, vendor and device ids) with class and device names, every virtio device the harness attaches by name (modern and transitional ids), the boot log counting them and QEMU's memory BARs; its records filter and select (`lspci | where vendor = 0x1af4 | count`, hex values only); without ACPI there is no MCFG, so no PCI devices, with a warning"
+name = "`lspci` lists exactly the PCI functions QEMU reports (address, vendor and device ids in four hex digits) with class and device names, every virtio device the harness attaches by name (modern and transitional ids), devices behind a PCIe root port too, the boot log counting them and QEMU's memory BARs and logging each at debug level; its records filter and select (`lspci | where vendor = 0x1af4 | count`, hex values only); without ACPI there is no MCFG, so no PCI devices, with a warning and the reason in `lspci`'s header"
 milestone = "M3"
 tests = [
     "scenario:test_pci::test_lspci_lists_virtio_devices",
     "scenario:test_pci::test_lspci_records_filter",
+    "scenario:test_pci::test_lspci_sees_devices_behind_a_bridge",
+    "scenario:test_pci::test_each_function_is_logged_at_debug_level",
     "scenario:test_pci::test_no_acpi_means_no_pci_devices",
+    "ktest:lumen_kernel::pci::the_status_says_why_there_are_no_devices",
     "ktest:lumen_kernel::shell::sysinfo::every_record_table_fits_its_columns",
     "ktest:lumen_kernel::shell::sysinfo::system_commands_print_a_header_and_rows",
+    "cargo:lumen-shell",
 ]

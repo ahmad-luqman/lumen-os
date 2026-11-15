@@ -5,17 +5,6 @@
 /// Red Hat's vendor id, which every virtio PCI device uses.
 pub const VIRTIO_VENDOR: u16 = 0x1af4;
 
-/// The vendor's name, if it is one Lumen knows.
-pub fn vendor(vendor: u16) -> Option<&'static str> {
-    Some(match vendor {
-        0x8086 => "Intel",
-        VIRTIO_VENDOR => "Red Hat (virtio)",
-        0x1b36 => "Red Hat (QEMU)",
-        0x1234 => "QEMU",
-        _ => return None,
-    })
-}
-
 /// The virtio device type of a virtio PCI device: modern ones encode it in
 /// the device id (`0x1040 + type`), transitional ones (`0x1000-0x103f`) in
 /// the subsystem id. `None` for other vendors and ids.

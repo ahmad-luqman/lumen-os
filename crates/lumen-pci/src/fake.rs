@@ -60,6 +60,18 @@ impl Function {
         self
     }
 
+    /// Set status register bits (besides the capabilities bit).
+    pub fn status(mut self, bits: u16) -> Function {
+        self.regs[1] |= u32::from(bits) << 16;
+        self
+    }
+
+    /// A bridge's primary, secondary and subordinate bus numbers.
+    pub fn bridge_buses(mut self, primary: u8, secondary: u8, subordinate: u8) -> Function {
+        self.regs[6] = u32::from(subordinate) << 16 | u32::from(secondary) << 8 | u32::from(primary);
+        self
+    }
+
     pub fn irq_pin(mut self, pin: u8) -> Function {
         self.set_byte(0x3d, pin);
         self
@@ -116,6 +128,10 @@ impl Function {
         self.regs[1] as u16
     }
 
+    pub fn status_bits(&self) -> u16 {
+        (self.regs[1] >> 16) as u16
+    }
+
     pub fn bar(&self, i: usize) -> u32 {
         self.regs[4 + i]
     }
@@ -160,8 +176,10 @@ impl ConfigSpace for Fake {
         match offset {
             reg::ID | reg::CLASS => {}
             reg::COMMAND => {
-                // Status bits are write-one-to-clear: writing 0 keeps them.
-                f.regs[1] = f.regs[1] & 0xffff_0000 | value & 0xffff;
+                // Status bits are write-one-to-clear: a 1 written clears
+                // that bit, a 0 keeps it.
+                let status = f.regs[1] & 0xffff_0000 & !(value & 0xffff_0000);
+                f.regs[1] = status | value & 0xffff;
                 f.commands.push(value as u16);
             }
             0x10..=0x27 => {

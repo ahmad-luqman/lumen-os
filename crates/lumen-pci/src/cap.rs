@@ -1,6 +1,8 @@
 //! The capability list, walked with a guard: a list that loops or points
-//! into the header is cut off, and the device is marked so the kernel never
-//! probes it.
+//! into the header is cut off and marked incomplete (#95's `probe_all`
+//! skips such a device).
+
+use core::fmt;
 
 use crate::device::HeaderType;
 use crate::{ConfigSpace, PciAddr, STATUS_CAP_LIST, reg};
@@ -11,11 +13,9 @@ pub const MAX_CAPS: usize = 48;
 
 /// Capability ids.
 pub mod id {
-    pub const POWER_MANAGEMENT: u8 = 0x01;
     pub const MSI: u8 = 0x05;
     /// Vendor-specific: virtio's structures are described by these.
     pub const VENDOR: u8 = 0x09;
-    pub const PCI_EXPRESS: u8 = 0x10;
     pub const MSIX: u8 = 0x11;
 }
 
@@ -37,6 +37,25 @@ pub enum CapEnd {
     IntoHeader { from: u8, to: u8 },
     /// Cut off after [`MAX_CAPS`] entries: the list loops.
     TooLong,
+    /// Not read: the header type (3-127) is one PCI doesn't define, so
+    /// where its capabilities pointer is isn't known.
+    UnknownHeader(u8),
+}
+
+impl fmt::Display for CapEnd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            CapEnd::Complete => f.write_str("complete"),
+            CapEnd::IntoHeader { from: 0, to } => {
+                write!(f, "the capabilities pointer points into the header ({to:#x})")
+            }
+            CapEnd::IntoHeader { from, to } => {
+                write!(f, "the capability at {from:#x} points into the header ({to:#x})")
+            }
+            CapEnd::TooLong => write!(f, "more than {MAX_CAPS} capabilities (the list loops)"),
+            CapEnd::UnknownHeader(kind) => write!(f, "header type {kind} is unknown"),
+        }
+    }
 }
 
 /// A function's capabilities, in list order, and how the list ended.
@@ -53,14 +72,24 @@ impl CapList {
 
     /// Walk the capability list of the function at `addr` (status register
     /// `status`, header type `header_type`). A function without the
-    /// status register's capabilities bit, or a CardBus bridge, has none.
-    /// Pointers have their low two bits masked off (reserved, as the PCI
-    /// specification tells software to do), so every offset is
-    /// dword-aligned; one below 0x40, or a 49th entry, cuts the list off.
-    pub fn read(cs: &mut impl ConfigSpace, addr: PciAddr, status: u16, header_type: HeaderType) -> CapList {
+    /// status register's capabilities bit has none, and so, as far as
+    /// Lumen knows, does a CardBus bridge (its pointer, at 0x14, isn't
+    /// decoded); an unknown header type's list isn't read and ends
+    /// [`CapEnd::UnknownHeader`]. Pointers have their low two bits masked
+    /// off (reserved, as the PCI specification tells software to do), so
+    /// every offset is dword-aligned; one below 0x40, or a 49th entry,
+    /// cuts the list off.
+    pub(crate) fn read(cs: &mut impl ConfigSpace, addr: PciAddr, status: u16, header_type: HeaderType) -> CapList {
         let mut list = CapList::EMPTY;
-        let has_list = matches!(header_type, HeaderType::Endpoint | HeaderType::PciBridge);
-        if status & STATUS_CAP_LIST == 0 || !has_list {
+        match header_type {
+            HeaderType::Endpoint | HeaderType::PciBridge => {}
+            HeaderType::CardBus => return list,
+            HeaderType::Unknown(kind) => {
+                list.end = CapEnd::UnknownHeader(kind);
+                return list;
+            }
+        }
+        if status & STATUS_CAP_LIST == 0 {
             return list;
         }
         let (mut from, mut next) = (0, cs.read8(addr, reg::CAP_PTR) & !3);
@@ -81,7 +110,9 @@ impl CapList {
         list
     }
 
-    /// The capabilities found (before any cut-off), in list order.
+    /// The capabilities found (before any cut-off), in list order. A
+    /// driver must check [`is_complete`](Self::is_complete) first: a
+    /// cut-off list may be missing the one it looks for.
     pub fn iter(&self) -> impl Iterator<Item = Cap> + '_ {
         self.caps[..usize::from(self.len)].iter().copied()
     }
@@ -99,12 +130,13 @@ impl CapList {
     }
 
     /// Whether the list ended cleanly. A device whose list didn't is
-    /// listed but never probed.
+    /// listed, and #95's `probe_all` skips it.
     pub fn is_complete(&self) -> bool {
         self.end == CapEnd::Complete
     }
 
-    /// The first capability with id `id`.
+    /// The first capability with id `id` (check
+    /// [`is_complete`](Self::is_complete) first, as for [`iter`](Self::iter)).
     pub fn find(&self, id: u8) -> Option<Cap> {
         self.iter().find(|c| c.id == id)
     }

@@ -163,10 +163,13 @@ fn install_stacks() -> StackRange {
 /// The rest of boot, on the allocated main stack.
 extern "C" fn kmain_on_kernel_stack() -> ! {
     acpi::init();
-    // Before anything uses a device or draws on the framebuffer: sizing a
-    // BAR turns its device's decoding off for a moment.
-    pci::init();
     ktrace!(Kind::BootPhase, BootPhase::Acpi);
+    // Sizing a BAR turns its device's decoding off for a moment: this runs
+    // on this CPU alone (the others start below), with interrupts off,
+    // before the framebuffer's terminal draws (the screen is in the VGA
+    // BAR).
+    pci::init();
+    ktrace!(Kind::BootPhase, BootPhase::Pci);
     interrupts::init();
     // The other CPUs halt once started instead of spinning in the bootloader
     // during the clock calibration below.

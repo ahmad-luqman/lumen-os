@@ -311,7 +311,8 @@ fn vector_table() -> pipe::Table {
     t
 }
 
-/// `lspci`: every PCI function found at boot.
+/// `lspci`: every PCI function found at boot, and why there are none (or
+/// some may be missing).
 pub fn lspci(ctx: &mut Ctx<'_>, args: &[String]) {
     if extra_args(ctx, "lspci", args) {
         return;
@@ -319,28 +320,26 @@ pub fn lspci(ctx: &mut Ctx<'_>, args: &[String]) {
     let table = pci_table();
     let mut t = String::new();
     let n = table.rows().len();
-    let _ = writeln!(t, "lspci: {n} function{}", if n == 1 { "" } else { "s" });
+    let _ = writeln!(t, "lspci: {n} function{}{}", if n == 1 { "" } else { "s" }, crate::pci::status());
     table.render(&mut t);
     emit(ctx, &t);
 }
 
-/// `lspci`'s rows: the address, vendor and device ids (hex, so `where
-/// vendor = 0x1af4` works), the class's name and the device's (`-` if
-/// Lumen doesn't know it).
+/// `lspci`'s rows: the address, vendor and device ids (four hex digits,
+/// so `where vendor = 0x1af4` works), the class's name and the device's
+/// (`-` if Lumen doesn't know it).
 fn pci_table() -> pipe::Table {
-    use crate::pci::{self, names};
     const COLUMNS: [Column; 5] = [
         Column::new("addr", Kind::Text, Align::Left, 12),
-        Column::new("vendor", Kind::Hex, Align::Left, 6),
-        Column::new("device", Kind::Hex, Align::Left, 6),
+        Column::new("vendor", Kind::Hex16, Align::Left, 6),
+        Column::new("device", Kind::Hex16, Align::Left, 6),
         Column::new("class", Kind::Text, Align::Left, 0),
         Column::new("name", Kind::Text, Align::Left, 0),
     ];
     let mut t = pipe::Table::new(&COLUMNS);
-    for d in pci::devices() {
-        let name = names::device(d.vendor, d.device, d.subsystem.1).map_or(DASH, text);
+    for d in crate::pci::devices() {
         let addr = Value::Text(alloc::format!("{}", d.addr));
-        t.push(vec![addr, int(d.vendor), int(d.device), text(names::class(d.class, d.subclass)), name]);
+        t.push(vec![addr, int(d.vendor), int(d.device), text(d.class_name()), d.name().map_or(DASH, text)]);
     }
     t
 }

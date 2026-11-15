@@ -19,12 +19,15 @@ mod bar;
 pub mod cap;
 mod device;
 pub mod names;
+mod problem;
 
 use core::fmt;
+use core::ops::RangeInclusive;
 
-pub use bar::{Bar, size_bars};
+pub use bar::{Bar, BarProblem};
 pub use cap::{Cap, CapEnd, CapList, MAX_CAPS};
-pub use device::{DeviceInfo, Header, HeaderType, enumerate, read_header};
+pub use device::{BusNumbers, DeviceInfo, enumerate};
+pub use problem::Problem;
 
 /// Offsets in a function's configuration space header.
 pub mod reg {
@@ -38,6 +41,9 @@ pub mod reg {
     pub const HEADER_TYPE: u16 = 0x0c;
     /// The first BAR; each is 4 bytes.
     pub const BAR0: u16 = 0x10;
+    /// A PCI-to-PCI bridge's primary (bits 0-7), secondary (8-15) and
+    /// subordinate (16-23) bus numbers.
+    pub const BRIDGE_BUSES: u16 = 0x18;
     /// Subsystem vendor (bits 0-15) and id (16-31), header type 0 only.
     pub const SUBSYSTEM: u16 = 0x2c;
     /// The first capability's offset (bits 0-7), header types 0 and 1.
@@ -111,13 +117,16 @@ pub trait ConfigSpace {
     fn read(&mut self, addr: PciAddr, offset: u16) -> u32;
     fn write(&mut self, addr: PciAddr, offset: u16, value: u32);
 
-    /// The 16 bits at `offset` (2-byte aligned), from the dword holding them.
+    /// The 16 bits at `offset` (2-byte aligned, below 4096), from the
+    /// dword holding them. (MSI-X's message control, #96.)
     fn read16(&mut self, addr: PciAddr, offset: u16) -> u16 {
+        debug_assert!(offset.is_multiple_of(2) && offset < 4096, "read16 at {offset:#x}");
         (self.read(addr, offset & !3) >> ((offset & 2) * 8)) as u16
     }
 
-    /// The byte at `offset`, from the dword holding it.
+    /// The byte at `offset` (below 4096), from the dword holding it.
     fn read8(&mut self, addr: PciAddr, offset: u16) -> u8 {
+        debug_assert!(offset < 4096, "read8 at {offset:#x}");
         (self.read(addr, offset & !3) >> ((offset & 3) * 8)) as u8
     }
 
@@ -129,14 +138,16 @@ pub trait ConfigSpace {
     }
 }
 
-impl<C: ConfigSpace + ?Sized> ConfigSpace for &mut C {
-    fn read(&mut self, addr: PciAddr, offset: u16) -> u32 {
-        (**self).read(addr, offset)
+/// Where `offset` of `addr`'s configuration space lies in an ECAM mapping
+/// of `segment`'s buses `buses` (bus `buses.start()` at the mapping's
+/// start, 1 MiB per bus, 4 KiB per function): `None` if `addr` is outside
+/// those buses or that segment, or `offset` isn't dword-aligned below 4096.
+pub fn ecam_offset(segment: u16, buses: RangeInclusive<u8>, addr: PciAddr, offset: u16) -> Option<u64> {
+    if addr.segment() != segment || !buses.contains(&addr.bus()) || !offset.is_multiple_of(4) || offset >= 4096 {
+        return None;
     }
-
-    fn write(&mut self, addr: PciAddr, offset: u16, value: u32) {
-        (**self).write(addr, offset, value)
-    }
+    let bus = u64::from(addr.bus() - buses.start());
+    Some(bus << 20 | u64::from(addr.ecam_offset()) | u64::from(offset))
 }
 
 #[cfg(test)]

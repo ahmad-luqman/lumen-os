@@ -26,8 +26,8 @@ use core::fmt;
 use limine::memory_map::EntryType;
 use log::{debug, info, warn};
 use lumen_acpi::{
-    Acpi, AcpiMode, Cpu, CpuState, EcamRegion, Error, Fadt, Hpet, InterruptOverride, IoApic, Madt, Mcfg, PhysMem, Sdt,
-    Signature, SleepType,
+    Acpi, AcpiMode, BadEcamRegion, Cpu, CpuState, EcamRegion, Error, Fadt, Hpet, InterruptOverride, IoApic, Madt, Mcfg,
+    PhysMem, Sdt, Signature, SleepType,
 };
 use lumen_mm::{PhysAddr, PhysRange};
 
@@ -54,12 +54,35 @@ pub struct Info {
     /// The legacy 8259 PICs are present (to be masked).
     pub has_8259_pics: bool,
     pub hpet: Option<Hpet>,
-    /// Where PCI configuration space is memory-mapped (the MCFG's regions,
-    /// in table order), or why there is no MCFG to say: `pci::init` logs
-    /// that, and finds no devices.
-    pub ecam: Result<Vec<EcamRegion>, Failure>,
+    /// Where PCI configuration space is memory-mapped: the MCFG's entries,
+    /// accepted or refused, or why there is no usable MCFG. `pci::init`
+    /// warns about each refused entry and scans the accepted ones (none
+    /// without an MCFG).
+    pub ecam: Result<EcamTable, Failure>,
     /// How to power off (ACPI S5), or why we can't.
     pub power_off: Result<PowerOff, Failure>,
+}
+
+/// The MCFG's entries, judged one by one (`lumen_acpi::Mcfg::regions`).
+#[derive(Debug, Default)]
+pub struct EcamTable {
+    /// The accepted regions, in table order (no two share a bus).
+    pub regions: Vec<EcamRegion>,
+    /// The refused entries, each with its reason.
+    pub refused: Vec<BadEcamRegion>,
+}
+
+impl EcamTable {
+    fn from_mcfg(mcfg: Mcfg<'_>) -> EcamTable {
+        let mut table = EcamTable::default();
+        for entry in mcfg.regions() {
+            match entry {
+                Ok(r) => table.regions.push(r),
+                Err(bad) => table.refused.push(bad),
+            }
+        }
+        table
+    }
 }
 
 /// What entering ACPI S5 (soft off) takes: made only by
@@ -298,7 +321,7 @@ fn discover(fw: &mut Firmware, rsdp: u64) -> Result<Info, Error> {
     let madt = Madt::parse(acpi.find(Signature::MADT)?)?;
     let hpet = acpi.find(Signature::HPET).and_then(Hpet::parse);
     let fadt = acpi.find(Signature::FADT).and_then(Fadt::parse);
-    let ecam = acpi.find(Signature::MCFG).and_then(Mcfg::parse).map(|m| m.regions().collect::<Vec<_>>());
+    let ecam = acpi.find(Signature::MCFG).and_then(Mcfg::parse).map(EcamTable::from_mcfg);
     let fw = acpi.into_mem();
     let ecam = ecam.map_err(|e| Failure::new(e, &mut *fw));
     let hpet = hpet.inspect_err(|&e| warn!(target: "acpi", "no usable HPET: {}", Failure::new(e, &mut *fw))).ok();
@@ -397,8 +420,8 @@ crate::ktest!(
         // QEMU q35's MADT and HPET (hw/i386/acpi-common.c): one I/O APIC at
         // 0xfec00000 handling GSIs from 0, ISA IRQ 0 (the PIT) wired to GSI 2,
         // the 8259 PICs present, the HPET at 0xfed00000; and its MCFG: segment
-        // 0's 256 buses, at QEMU's default 0xb0000000 (hw/pci-host/q35.c) or
-        // where OVMF moved them (its PcdPciExpressBaseAddress, 0xe0000000).
+        // 0's 256 buses, where the pinned OVMF moves them from QEMU's
+        // 0xb0000000 (include/hw/pci-host/q35.h): 0xe0000000.
         use crate::{kassert, kassert_eq};
         let info = info().ok_or("ACPI was not found at boot")?;
         kassert_eq!(info.local_apic, 0xfee0_0000);
@@ -407,11 +430,12 @@ crate::ktest!(
         kassert!(info.has_8259_pics);
         kassert_eq!(info.hpet.map(|h| h.address), Some(0xfed0_0000));
         let ecam = info.ecam.as_ref().map_err(|_| "no MCFG")?;
-        let [EcamRegion { base, segment: 0, bus_start: 0, bus_end: 255 }] = ecam.as_slice() else {
+        kassert!(ecam.refused.is_empty());
+        let [r] = ecam.regions.as_slice() else {
             crate::ktest::diag(format_args!("MCFG: {ecam:x?}"));
-            return Err("not one region for segment 0's 256 buses");
+            return Err("not one ECAM region");
         };
-        kassert!([0xb000_0000, 0xe000_0000].contains(base));
+        kassert_eq!((r.base(), r.segment(), r.bus_start(), r.bus_end()), (0xe000_0000, 0, 0, 255));
         Ok(())
     }
 );
@@ -590,7 +614,7 @@ crate::ktest!(
             overrides: Vec::new(),
             has_8259_pics: false,
             hpet: None,
-            ecam: Ok(Vec::new()),
+            ecam: Ok(EcamTable::default()),
             power_off: Err(Failure { error: Error::NoDsdt, cause: None }),
         };
         let ids: Vec<u32> = info.enabled_cpus().map(|c| c.apic_id).collect();

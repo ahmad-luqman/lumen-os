@@ -945,41 +945,51 @@ fn mcfg(regions: &[(u64, u16, u8, u8)]) -> Vec<u8> {
     table(b"MCFG", &body)
 }
 
-/// QEMU q35's MCFG (hw/pci-host/q35.c, `MCH_HOST_BRIDGE_PCIEXBAR_DEFAULT`):
-/// segment 0, buses 0-255, at 0xb000_0000.
+/// QEMU q35's MCFG: segment 0, buses 0-255, at QEMU's default
+/// `MCH_HOST_BRIDGE_PCIEXBAR_DEFAULT` (include/hw/pci-host/q35.h); the
+/// pinned OVMF moves it to 0xe000_0000.
 const Q35_ECAM: (u64, u16, u8, u8) = (0xb000_0000, 0, 0, 255);
+
+/// What `Mcfg::regions` gives for table `t`.
+fn judged(t: &[u8]) -> Vec<Result<EcamRegion, BadEcamRegion>> {
+    Mcfg::parse(Sdt::parse(t).unwrap()).unwrap().regions().collect()
+}
+
+fn region((base, segment, start, end): (u64, u16, u8, u8)) -> EcamRegion {
+    EcamRegion::new(base, segment, start, end).unwrap()
+}
+
+fn refused(index: usize, (base, segment, bus_start, bus_end): (u64, u16, u8, u8), why: EcamReject) -> BadEcamRegion {
+    BadEcamRegion { index, base, segment, bus_start, bus_end, why }
+}
 
 #[test]
 fn mcfg_gives_q35s_ecam_region() {
-    let t = mcfg(&[Q35_ECAM]);
-    let m = Mcfg::parse(Sdt::parse(&t).unwrap()).unwrap();
-    let regions: Vec<EcamRegion> = m.regions().collect();
-    let r = EcamRegion { base: 0xb000_0000, segment: 0, bus_start: 0, bus_end: 255 };
-    assert_eq!(regions, [r]);
+    let r = region(Q35_ECAM);
+    assert_eq!(judged(&mcfg(&[Q35_ECAM])), [Ok(r)]);
+    assert_eq!((r.base(), r.segment(), r.bus_start(), r.bus_end()), Q35_ECAM);
     // 256 buses of 1 MiB, from bus 0.
     assert_eq!((r.start(), r.len(), r.is_empty()), (0xb000_0000, 256 << 20, false));
+    assert!(r.covers(0, 0) && r.covers(0, 255) && !r.covers(1, 0));
 }
 
 #[test]
 fn mcfg_regions_come_in_table_order_and_start_at_their_first_bus() {
-    let t = mcfg(&[(0xe000_0000, 0, 0x10, 0x1f), (0x40_0000_0000, 1, 0, 0)]);
-    let regions: Vec<EcamRegion> = Mcfg::parse(Sdt::parse(&t).unwrap()).unwrap().regions().collect();
-    assert_eq!(
-        regions,
-        [
-            EcamRegion { base: 0xe000_0000, segment: 0, bus_start: 0x10, bus_end: 0x1f },
-            EcamRegion { base: 0x40_0000_0000, segment: 1, bus_start: 0, bus_end: 0 },
-        ]
-    );
+    let (a, b) = ((0xe000_0000, 0, 0x10, 0x1f), (0x40_0000_0000, 1, 0, 0));
+    let regions = judged(&mcfg(&[a, b]));
+    assert_eq!(regions, [Ok(region(a)), Ok(region(b))]);
     // The base is bus 0's: bus 0x10's space starts 16 MiB in.
-    assert_eq!((regions[0].start(), regions[0].len()), (0xe100_0000, 16 << 20));
-    assert_eq!((regions[1].start(), regions[1].len()), (0x40_0000_0000, 1 << 20));
+    let first = region(a);
+    assert_eq!((first.start(), first.len()), (0xe100_0000, 16 << 20));
+    assert!(first.covers(0, 0x10) && first.covers(0, 0x1f) && !first.covers(0, 0x0f) && !first.covers(0, 0x20));
+    assert_eq!((region(b).start(), region(b).len()), (0x40_0000_0000, 1 << 20));
 }
 
 #[test]
 fn an_mcfg_without_regions_parses_empty() {
     let t = mcfg(&[]);
-    assert_eq!(Mcfg::parse(Sdt::parse(&t).unwrap()).unwrap().regions().count(), 0);
+    let m = Mcfg::parse(Sdt::parse(&t).unwrap()).unwrap();
+    assert_eq!((m.len(), m.is_empty(), m.regions().count()), (0, true, 0));
 }
 
 #[test]
@@ -1001,26 +1011,81 @@ fn mcfg_refuses_a_partial_entry_or_a_missing_reserved_field() {
 }
 
 #[test]
-fn mcfg_refuses_regions_that_cant_be_configuration_space() {
-    let bad =
-        |index, (base, segment, bus_start, bus_end)| Error::BadEcamRegion { index, base, segment, bus_start, bus_end };
-    for region in [
-        (0, 0, 0, 255),                   // no address
-        (0xb000_1000, 0, 0, 255),         // not 1 MiB aligned
-        (0xb000_0000, 0, 9, 8),           // buses backwards
-        (u64::MAX << 20, 0, 0, 1),        // past the end of the address space
-        (0xffff_ffff_fff0_0000, 0, 0, 0), // ends exactly at 2^64
+fn mcfg_takes_up_to_256_entries() {
+    let at = |i: usize| (0x10_0000_0000 + ((i as u64) << 28), i as u16, 0, 255);
+    let most: Vec<_> = (0..MAX_ECAM_REGIONS).map(at).collect();
+    let t = mcfg(&most);
+    assert!(judged(&t).iter().all(Result::is_ok));
+    let too_many: Vec<_> = (0..=MAX_ECAM_REGIONS).map(at).collect();
+    let t = mcfg(&too_many);
+    assert_eq!(
+        Mcfg::parse(Sdt::parse(&t).unwrap()).map(|_| ()),
+        Err(Error::BadLength { sig: Signature::MCFG, len: t.len() as u32 })
+    );
+}
+
+#[test]
+fn mcfg_refuses_each_bad_entry_with_its_reason_and_keeps_the_others() {
+    for (bad, why) in [
+        ((0, 0, 0, 255), EcamReject::NoBase),
+        ((0xb000_1000, 0, 0, 255), EcamReject::Misaligned),
+        ((0xb000_0000, 0, 9, 8), EcamReject::BusesBackwards),
+        ((u64::MAX << 20, 0, 0, 1), EcamReject::PastAddressSpace),
+        // Ends exactly at 2^64.
+        ((0xffff_ffff_fff0_0000, 0, 0, 0), EcamReject::PastAddressSpace),
+        ((0xffff_ffff_f000_0000, 0, 0, 255), EcamReject::PastAddressSpace),
     ] {
-        let t = mcfg(&[Q35_ECAM, region]);
-        assert_eq!(Mcfg::parse(Sdt::parse(&t).unwrap()).map(|_| ()), Err(bad(1, region)), "{region:x?}");
+        let good = (0x40_0000_0000, 1, 0, 255);
+        assert_eq!(judged(&mcfg(&[bad, good])), [Err(refused(0, bad, why)), Ok(region(good))], "{bad:x?}");
+        assert_eq!(EcamRegion::new(bad.0, bad.1, bad.2, bad.3), Err(why));
     }
     // A region must end below 2^64: one bus based 2 MiB below it fits.
-    let top = (0xffff_ffff_ffe0_0000, 3, 0, 0);
-    assert!(Mcfg::parse(Sdt::parse(&mcfg(&[top])).unwrap()).is_ok());
+    assert!(EcamRegion::new(0xffff_ffff_ffe0_0000, 3, 0, 0).is_ok());
+}
+
+#[test]
+fn an_entry_overlapping_an_accepted_one_is_refused() {
+    let q35 = Q35_ECAM;
+    let same_buses_elsewhere = (0xe000_0000, 0, 0x80, 0x80);
+    let other_segment = (0xe000_0000, 1, 0, 255);
     assert_eq!(
-        std::format!("{}", bad(1, (0xb000_1000, 2, 0, 255))),
-        "MCFG entry 1 (base 0xb0001000, segment 2, buses 0-255) is malformed"
+        judged(&mcfg(&[q35, same_buses_elsewhere, other_segment])),
+        [
+            Ok(region(q35)),
+            Err(refused(1, same_buses_elsewhere, EcamReject::Overlaps { earlier: 0 })),
+            Ok(region(other_segment)),
+        ]
     );
+    // Only accepted entries count: one overlapping a refused entry (here
+    // refused for overlapping the first) is fine if it overlaps nothing
+    // accepted.
+    let (a, b, c) = ((0xb000_0000, 0, 0, 10), (0xc000_0000, 0, 5, 15), (0xd000_0000, 0, 11, 20));
+    assert_eq!(
+        judged(&mcfg(&[a, b, c])),
+        [Ok(region(a)), Err(refused(1, b, EcamReject::Overlaps { earlier: 0 })), Ok(region(c))]
+    );
+    // Touching ranges don't overlap; sharing one bus does.
+    assert!(!region((0xb000_0000, 0, 0, 9)).overlaps(&region((0xc000_0000, 0, 10, 20))));
+    assert!(region((0xb000_0000, 0, 0, 10)).overlaps(&region((0xc000_0000, 0, 10, 20))));
+    assert!(region((0xc000_0000, 0, 10, 20)).overlaps(&region((0xb000_0000, 0, 0, 10))));
+}
+
+#[test]
+fn refusals_say_why() {
+    let r = refused(1, (0xb000_1000, 2, 0, 255), EcamReject::Misaligned);
+    assert_eq!(
+        std::format!("{r}"),
+        "MCFG entry 1 (base 0xb0001000, segment 2, buses 0-255) refused: its base isn't 1 MiB aligned"
+    );
+    let all = [
+        (EcamReject::NoBase, "its base address is 0"),
+        (EcamReject::BusesBackwards, "its first bus is above its last"),
+        (EcamReject::PastAddressSpace, "its range doesn't end below 2^64"),
+        (EcamReject::Overlaps { earlier: 0 }, "it overlaps entry 0's buses"),
+    ];
+    for (why, text) in all {
+        assert_eq!(std::format!("{why}"), text);
+    }
 }
 
 #[test]
@@ -1030,5 +1095,5 @@ fn acpi_finds_the_mcfg() {
     regions.push((0x7fbe_4000, mcfg(&[Q35_ECAM])));
     let mut acpi = Acpi::new(Mem::new(&regions), RSDP_AT).unwrap();
     let m = Mcfg::parse(acpi.find(Signature::MCFG).unwrap()).unwrap();
-    assert_eq!(m.regions().map(|r| r.base).collect::<Vec<_>>(), [0xb000_0000]);
+    assert_eq!(m.regions().collect::<Vec<_>>(), [Ok(region(Q35_ECAM))]);
 }
