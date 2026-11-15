@@ -1638,8 +1638,10 @@ pub struct Driver {
   drivers):
   - rng (#97) drives its own `virtio_drivers::queue::VirtQueue` (public:
     `add`, `pop_used`) over `VirtioTransport`, with a bounded wait;
-  - sound's (#99) control path is a known unbounded wait, done once at
-    setup, outside the playback path.
+  - sound's (#99) control requests are a known unbounded wait: the stream
+    is set up once in the probe, and each sound's prepare, start, stop and
+    release run on the `sound` thread, outside the waits for periods
+    (below, "Sound").
   `PciTransport`'s `Drop` spins until the device status reads 0, so
   `VirtioTransport`'s own `Drop` writes 0 and waits up to 100 ms for the
   status to read 0 (no early exit on the status from before the reset),
@@ -1783,7 +1785,9 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
     again at the same address). 256 comes from the counts: input 36 (32
     posted events and its rings) plus sound 40 idle (rings and its event
     queue) plus rng about 3 is about 79 at boot; with sound's 96 buffers in
-    flight and 3 for a control request, about 178 while it streams.
+    flight (its whole tx queue, 3 runs a period) and 3 for a control request,
+    about 178 while it streams. The sound driver keeps 8 periods in flight:
+    24 runs.
   - `dma_alloc`: an `OwnedRun`, zeroed through the HHDM, returned as
     (physical, HHDM address); 0 pages, a full table (checked before
     allocating) or no contiguous run free returns `(0,
@@ -1826,7 +1830,53 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
 - **Polling until MSI-X.** Until #96, drivers poll (bounded where the crate
   allows, as above); event devices (the tablet) are polled from their
   thread. Their API doesn't change when interrupts arrive: the handler
-  wakes the driver's `WaitQueue` instead.
+  wakes the driver's `WaitQueue` instead. A wait as long as the device
+  takes to play something sleeps between looks instead of spinning
+  (`StatusHandle::sleep_until(timeout, pause, ready)`, otherwise
+  `wait_until`'s checks), so it doesn't keep a CPU busy.
+- **A device with nothing to use** fails its probe with
+  `ProbeError::Unsupported(why)` (`<driver>: failed: unsupported device:
+  <why>`), e.g. a sound device without an output stream taking 16-bit
+  samples.
+
+### Sound: virtio-sound (built, #99)
+
+- **Probe.** The `sound` row takes virtio device type 25. After the
+  crate's `VirtIOSound::new` it checks the device is ready, then (control
+  requests: the known unbounded spins, once here) picks the first output
+  stream and a format: signed 16-bit samples (what `lumen-synth` makes),
+  stereo if the stream takes 2 channels, else mono, and 44.1 kHz (the
+  rate of QEMU's wav audiodev and of most hosts: no resampling), else
+  48 kHz, else a lower rate, else a higher one. A stream without one of
+  those fails the probe (`ProbeError::Unsupported`, saying which). It sets
+  the stream's parameters (20 ms periods, a buffer of 8) and starts the
+  `sound` thread, which owns the `VirtIOSound` from then on: no other code
+  touches the device, so no lock is held across a device wait.
+- **Requests.** `sound::play(Box<dyn Source + Send>)` puts the sound in a
+  `SpinLock`ed slot, wakes the thread (a `WaitQueue`) and returns its id;
+  a newer sound replaces the one playing (faded out by `Source::stop`) and
+  one still waiting to start. `sound::stop(id)` fades a sound out (the
+  periods already queued still play), `sound::finished(id)` says whether it
+  is over. `beep` returns at once; `play` checks `finished` and the keys
+  every 20 ms (`q` or Ctrl-C stops it). Sounds are made at the device's
+  rate (`sound::format()`) and the volume when they start.
+- **Paced by the device.** For each sound the thread prepares and starts
+  the stream, keeps up to 8 periods queued (`pcm_xfer_nb`) and queues
+  another each time `pcm_xfer_ok` takes one back (QEMU returns a period
+  once its audio backend has consumed it), so the sound plays without gaps
+  as long as the thread is back within 160 ms. Between looks at the oldest
+  period it sleeps 1 ms (`sleep_until`, at most 2 s a period, ending on
+  `DEVICE_NEEDS_RESET` or `FAILED`). When the source has ended (its last
+  period padded with silence) and the queue has drained, it stops and
+  releases the stream. A queue found empty before the end counts as an
+  underrun (`sound` shows them).
+- **Failure.** A wait that gives up, or a request the device refuses,
+  ends the thread and drops the device (resetting it; runs still posted
+  leak): `sound` shows `failed: <reason>`, and `beep` and `play` say the
+  device failed. Without a sound device they say `no sound device` (with
+  the function's binding if one was found but not bound).
+- **#96** replaces the 1 ms sleeps with a wait woken by the device's MSI-X
+  interrupt.
 
 ### Interrupts for devices: MSI-X (#96)
 
