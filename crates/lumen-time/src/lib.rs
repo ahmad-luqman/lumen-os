@@ -63,6 +63,65 @@ pub fn counter_delta(earlier: u64, later: u64, mask: u64) -> u64 {
     later.wrapping_sub(earlier) & mask
 }
 
+/// The midpoint of two readings of a counter `mask` wide, `earlier` then
+/// `later` (less than one wrap apart; rounded down): where a reading of
+/// another clock taken between them is placed.
+pub fn counter_midpoint(earlier: u64, later: u64, mask: u64) -> u64 {
+    earlier.wrapping_add(counter_delta(earlier, later, mask) / 2) & mask
+}
+
+/// A reading of one clock (`value`) taken between two reads of another,
+/// with `at` their midpoint and `width` the time between them, both in the
+/// other clock's units. Placed at `at`, the reading is off by at most half
+/// of `width`. Anything between the two reads widens it: a host stalling
+/// the vCPU, or a slow emulated read (under KVM each HPET read exits to
+/// QEMU), so a wide one is evidence of a stall, not a reading to trust.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bracketed<T> {
+    pub value: T,
+    pub at: u64,
+    pub width: u64,
+}
+
+/// How [`first_narrow`] went: the first reading at most its limit wide
+/// (`None` if every one of the `N` taken was wider), and the widths of all
+/// the readings it took, in order (the wide ones too, so a stall stays
+/// visible).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NarrowReading<T, const N: usize> {
+    pub reading: Option<Bracketed<T>>,
+    widths: [u64; N],
+    taken: usize,
+}
+
+impl<T, const N: usize> NarrowReading<T, N> {
+    /// The widths of the readings taken, in order.
+    pub fn widths(&self) -> &[u64] {
+        &self.widths[..self.taken]
+    }
+
+    /// How many readings were taken again because the one before was too
+    /// wide.
+    pub fn retries(&self) -> usize {
+        self.taken.saturating_sub(1)
+    }
+}
+
+/// Up to `N` readings from `take`, until one is at most `limit` wide.
+pub fn first_narrow<T, const N: usize>(limit: u64, mut take: impl FnMut() -> Bracketed<T>) -> NarrowReading<T, N> {
+    let mut out = NarrowReading { reading: None, widths: [0; N], taken: 0 };
+    while out.taken < N {
+        let r = take();
+        out.widths[out.taken] = r.width;
+        out.taken += 1;
+        if r.width <= limit {
+            out.reading = Some(r);
+            break;
+        }
+    }
+    out
+}
+
 /// Ticks a down-counter that reloads to `reload` at 0 counted from reading
 /// `earlier` to reading `later`: correct across one reload (two readings
 /// less than a period apart).
@@ -648,6 +707,52 @@ mod tests {
         assert_eq!(counter_delta(0xffff_fff0, 0x10, 0xffff_ffff), 0x20, "a 32-bit counter wrapped");
         assert_eq!(counter_delta(u64::MAX - 1, 3, u64::MAX), 5, "a 64-bit counter wrapped");
         assert_eq!(counter_delta(5, 5, 0xffff_ffff), 0);
+    }
+
+    #[test]
+    fn counter_midpoints_wrap_at_the_counter_width() {
+        assert_eq!(counter_midpoint(10, 30, u64::MAX), 20);
+        assert_eq!(counter_midpoint(10, 31, u64::MAX), 20, "rounds down");
+        assert_eq!(counter_midpoint(7, 7, 0xffff_ffff), 7);
+        assert_eq!(counter_midpoint(0xffff_fff0, 0x10, 0xffff_ffff), 0, "a 32-bit counter wrapped");
+        assert_eq!(counter_midpoint(0xffff_fff0, 0x8, 0xffff_ffff), 0xffff_fffc, "wrapped, midpoint before it");
+        assert_eq!(counter_midpoint(u64::MAX - 1, 4, u64::MAX), 1, "a 64-bit counter wrapped");
+    }
+
+    fn bracketed(width: u64) -> Bracketed<u64> {
+        Bracketed { value: width * 10, at: width * 100, width }
+    }
+
+    #[test]
+    fn the_first_narrow_reading_is_kept() {
+        let mut widths = [5, 100, 7].into_iter();
+        let r = first_narrow::<_, 5>(100, || bracketed(widths.next().unwrap()));
+        assert_eq!(r.reading, Some(bracketed(5)));
+        assert_eq!((r.widths(), r.retries()), (&[5][..], 0));
+        assert_eq!(widths.next(), Some(100), "no more readings taken");
+    }
+
+    #[test]
+    fn a_wide_reading_is_taken_again_and_its_width_kept() {
+        let mut widths = [101, 5_000, 100, 7].into_iter();
+        let r = first_narrow::<_, 5>(100, || bracketed(widths.next().unwrap()));
+        assert_eq!(r.reading, Some(bracketed(100)), "the limit is inclusive");
+        assert_eq!((r.widths(), r.retries()), (&[101, 5_000, 100][..], 2));
+        assert_eq!(widths.next(), Some(7));
+    }
+
+    #[test]
+    fn no_reading_when_every_one_is_wide() {
+        let mut taken = 0u64;
+        let r = first_narrow::<_, 3>(100, || {
+            taken += 1;
+            bracketed(1_000 + taken)
+        });
+        assert_eq!(r.reading, None);
+        assert_eq!((r.widths(), r.retries()), (&[1_001, 1_002, 1_003][..], 2));
+        assert_eq!(taken, 3, "stops after N");
+        let none = first_narrow::<u64, 0>(100, || unreachable!());
+        assert_eq!((none.reading, none.widths(), none.retries()), (None, &[][..], 0));
     }
 
     #[test]
