@@ -89,9 +89,9 @@ audit: build ## Prove kernel codegen flags and image layout (no SSE/AVX, no red 
 	@mkdir -p $(RESULTS) && rm -f $(RESULTS)/audit.json
 	$(HARNESS) audit $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest
 
-lint: ## clippy on host crates and the kernel; ruff on the harness
+lint: ## clippy on host crates (incl. their tests) and the kernel; ruff on the harness
 	uv run --frozen ruff check tools tests
-	cargo clippy -- -D warnings
+	cargo clippy --all-targets -- -D warnings
 	cargo clippy -p lumen-kernel --target $(TARGET) --release -- -D warnings
 	cargo clippy -p lumen-kernel --target $(TARGET) --release --features ktest -- -D warnings
 
