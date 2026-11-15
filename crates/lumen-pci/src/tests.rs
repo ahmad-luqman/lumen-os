@@ -670,6 +670,9 @@ fn the_boot_log_line_names_the_function() {
     let d = DeviceInfo::read(&mut cs, a).unwrap();
     assert_eq!(std::format!("{d}"), "0000:00:00.0 dead:000c unknown class (class 400102)");
     assert_eq!((d.name(), d.class_name()), (None, "unknown class"));
+    assert_eq!(d.virtio_type(), None);
+    let mut cs = Fake::default().with(a, virtio_rng());
+    assert_eq!(DeviceInfo::read(&mut cs, a).unwrap().virtio_type(), Some(4));
 }
 
 /// [`virtio_rng`] with its virtio capabilities filled in as QEMU does: the
@@ -744,10 +747,11 @@ fn check_wants_each_kept_structure_inside_a_mapped_bar() {
     use virtio::CapProblem;
     let caps = virtio_caps(virtio_rng_caps());
     let bar4 = |size| move |bar| (bar == 4).then_some(size);
+    // QEMU's layout in its 16 KiB BAR 4 passes.
     assert_eq!(virtio::check(&caps, bar4(0x4000)), Ok(virtio::used(caps.iter().copied())));
+    let common = caps[4];
     // BAR 4 not mapped (or missing): the first kept structure, common,
     // is refused.
-    let common = caps[4];
     assert_eq!(virtio::check(&caps, |_| None), Err(CapProblem::BarNotMapped { cap: common }));
     // A BAR too small for the notify structure at 0x3000.
     assert_eq!(virtio::check(&caps, bar4(0x3fff)), Err(CapProblem::PastBar { cap: caps[1], bar_size: 0x3fff }));
@@ -765,8 +769,78 @@ fn check_wants_each_kept_structure_inside_a_mapped_bar() {
     assert!(virtio::check(&exact, bar4(0x4000)).is_ok());
     // What the crate won't keep isn't checked: a second common capability
     // in an unmapped BAR, the configuration-access one (type 5, BAR 0).
-    let second = [vcap(0x40, 16, virtio::COMMON_CFG, 4, 0, 0x10), vcap(0x50, 16, virtio::COMMON_CFG, 2, 0, 0x10)];
+    let second = [vcap(0x40, 16, virtio::COMMON_CFG, 4, 0, 0x38), vcap(0x50, 16, virtio::COMMON_CFG, 2, 0, 0x10)];
     assert!(virtio::check(&second, bar4(0x4000)).is_ok());
+}
+
+#[test]
+fn check_wants_each_kept_structure_as_long_as_what_the_crate_maps() {
+    use virtio::CapProblem;
+    // The common configuration is 56 bytes (up to queue_device at 48).
+    assert_eq!(virtio::common::LEN, 56);
+    assert_eq!(virtio::common::DEVICE_STATUS, 20);
+    assert_eq!((virtio::common::MSIX_CONFIG, virtio::common::QUEUE_SELECT), (16, 22));
+    assert_eq!((virtio::common::QUEUE_MSIX_VECTOR, virtio::common::QUEUE_NOTIFY_OFF), (26, 30));
+    let one = |cfg_type, length| [vcap(0x40, 20, cfg_type, 4, 0, length)];
+    let bar = |_| Some(0x1000);
+    for (cfg_type, need) in
+        [(virtio::COMMON_CFG, 56), (virtio::NOTIFY_CFG, 2), (virtio::ISR_CFG, 1), (virtio::DEVICE_CFG, 4)]
+    {
+        assert_eq!(virtio::min_length(cfg_type), need);
+        assert!(virtio::check(&one(cfg_type, need), bar).is_ok(), "type {cfg_type}");
+        let short = one(cfg_type, need - 1);
+        assert_eq!(virtio::check(&short, bar), Err(CapProblem::TooShort { cap: short[0], need }), "type {cfg_type}");
+    }
+    // A notify capability with a length field of 19 is skipped (no
+    // multiplier), so a short notify structure behind it isn't checked.
+    let skipped = [vcap(0x40, 19, virtio::NOTIFY_CFG, 4, 0, 0)];
+    assert_eq!(virtio::used(skipped).notify, None);
+    assert!(virtio::check(&skipped, bar).is_ok());
+}
+
+#[test]
+fn a_queues_notify_register_must_be_inside_the_notify_structure() {
+    use virtio::CapProblem;
+    // QEMU's: 4 KiB, multiplier 4.
+    let notify = vcap(0x70, 20, virtio::NOTIFY_CFG, 4, 0x3000, 0x1000);
+    assert_eq!(virtio::notify_fits(notify, 4, 0, 0), Ok(()));
+    assert_eq!(virtio::notify_fits(notify, 4, 3, 1023), Ok(()));
+    assert_eq!(
+        virtio::notify_fits(notify, 4, 3, 1024),
+        Err(CapProblem::NotifyPastEnd { cap: notify, queue: 3, offset: 0x1000 })
+    );
+    // A 2-byte structure holds exactly one register, at 0.
+    let tiny = vcap(0x70, 20, virtio::NOTIFY_CFG, 4, 0, 2);
+    assert_eq!(virtio::notify_fits(tiny, 0, 5, 77), Ok(()));
+    assert!(virtio::notify_fits(tiny, 2, 0, 1).is_err());
+    // No overflow at the extremes.
+    assert!(virtio::notify_fits(notify, u32::MAX, 0, u16::MAX).is_err());
+}
+
+#[test]
+fn writes_to_the_msi_and_msix_capabilities_are_found() {
+    use crate::cap::{MSIX_LEN, msi_len};
+    assert_eq!(MSIX_LEN, 12);
+    assert_eq!([msi_len(0), msi_len(1 << 7), msi_len(1 << 8), msi_len(1 << 7 | 1 << 8)], [12, 16, 20, 24]);
+    // virtio_rng: MSI-X at 0x98 (12 bytes); a 64-bit MSI with masking at
+    // 0xa8 (24 bytes) added after it.
+    let a = at(0, 0, 3, 0);
+    let mut f = virtio_rng_caps().caps(0x98, &[(0x98, cap::id::MSIX, 0xa8), (0xa8, cap::id::MSI, 0x84)]);
+    f.regs[0xa8 / 4] |= (1 << 7 | 1 << 8) << 16;
+    let mut cs = Fake::default().with(a, f);
+    let d = DeviceInfo::read(&mut cs, a).unwrap();
+    assert!(d.caps.is_complete());
+    let hit = |cs: &mut Fake, off| d.caps.interrupt_cap_at(cs, a, off).map(|c| c.id);
+    assert_eq!(hit(&mut cs, 0x94), None);
+    assert_eq!(hit(&mut cs, 0x98), Some(cap::id::MSIX));
+    assert_eq!(hit(&mut cs, 0xa0), Some(cap::id::MSIX));
+    assert_eq!(hit(&mut cs, 0xa4), None);
+    assert_eq!(hit(&mut cs, 0xa8), Some(cap::id::MSI));
+    assert_eq!(hit(&mut cs, 0xbc), Some(cap::id::MSI));
+    assert_eq!(hit(&mut cs, 0xc0), None);
+    // The virtio capabilities and the header aren't.
+    assert_eq!(hit(&mut cs, 0x40), None);
+    assert_eq!(hit(&mut cs, 0x04), None);
 }
 
 #[test]
@@ -774,7 +848,7 @@ fn check_refuses_capabilities_the_crate_cant_read_inside_the_header() {
     use virtio::CapProblem;
     // The crate reads the dwords at +4, +8 and +12 of every capability
     // with a length field of 16 or more, adding the offsets in a u8.
-    let at_f0 = [vcap(0xf0, 16, virtio::COMMON_CFG, 4, 0, 0x10)];
+    let at_f0 = [vcap(0xf0, 16, virtio::COMMON_CFG, 4, 0, 0x38)];
     assert!(virtio::check(&at_f0, |_| Some(0x1000)).is_ok());
     let at_f4 = [vcap(0xf4, 16, 9, 0, 0, 0)];
     assert_eq!(virtio::check(&at_f4, |_| Some(0x1000)), Err(CapProblem::PastHeader { cap: at_f4[0] }));
@@ -807,6 +881,18 @@ fn virtio_cap_problems_say_which_structure_and_why() {
         (
             CapProblem::BarNotMapped { cap: vcap(0x60, 16, virtio::DEVICE_CFG, 7, 0, 0) },
             "the device configuration structure is in BAR 7, which isn't a mapped memory BAR",
+        ),
+        (
+            CapProblem::TooShort { cap: vcap(0x40, 16, virtio::COMMON_CFG, 4, 0, 0x30), need: 0x38 },
+            "the common configuration structure is 0x30 bytes, shorter than 0x38",
+        ),
+        (
+            CapProblem::NotifyPastEnd {
+                cap: vcap(0x70, 20, virtio::NOTIFY_CFG, 4, 0, 0x1000),
+                queue: 2,
+                offset: 0x1000,
+            },
+            "queue 2's notify register at 0x1000 is outside the notification structure (0x1000 bytes)",
         ),
     ];
     for (problem, want) in cases {

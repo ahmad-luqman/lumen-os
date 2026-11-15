@@ -8,8 +8,8 @@ use crate::{BarProblem, CapEnd};
 /// One thing wrong with a function ([`DeviceInfo::problems`](crate::DeviceInfo::problems)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Problem {
-    /// The capability list was cut off, or not read: #95's `probe_all`
-    /// skips the device.
+    /// The capability list was cut off, or not read: `pci::claim` refuses
+    /// the device (recorded as not probed).
     Caps(CapEnd),
     /// BAR `index` is implemented but the firmware assigned it no address.
     UnassignedBar { index: usize, io: bool, size: u64 },

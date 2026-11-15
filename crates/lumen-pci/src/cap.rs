@@ -1,6 +1,6 @@
 //! The capability list, walked with a guard: a list that loops or points
-//! into the header is cut off and marked incomplete (#95's `probe_all`
-//! skips such a device).
+//! into the header is cut off and marked incomplete (`pci::claim` refuses
+//! such a device, recorded as not probed).
 
 use core::fmt;
 
@@ -130,7 +130,7 @@ impl CapList {
     }
 
     /// Whether the list ended cleanly. A device whose list didn't is
-    /// listed, and #95's `probe_all` skips it.
+    /// listed, and `pci::claim` refuses it.
     pub fn is_complete(&self) -> bool {
         self.end == CapEnd::Complete
     }
@@ -140,4 +140,32 @@ impl CapList {
     pub fn find(&self, id: u8) -> Option<Cap> {
         self.iter().find(|c| c.id == id)
     }
+
+    /// The MSI or MSI-X capability whose bytes hold the dword at `offset`
+    /// of `addr`, if one does (an MSI capability's length read from its
+    /// message control). The kernel refuses a driver's write there: those
+    /// are programmed through a path private to `pci` (#96).
+    pub fn interrupt_cap_at(&self, cs: &mut impl ConfigSpace, addr: PciAddr, offset: u16) -> Option<Cap> {
+        self.iter().find(|c| {
+            let len = match c.id {
+                id::MSIX => MSIX_LEN,
+                id::MSI => msi_len((cs.read(addr, u16::from(c.offset)) >> 16) as u16),
+                _ => return false,
+            };
+            let start = u16::from(c.offset);
+            (start..start + u16::from(len)).contains(&offset)
+        })
+    }
+}
+
+/// An MSI-X capability's bytes (PCI 3.0 §6.8.2): header and message
+/// control, table offset, PBA offset.
+pub const MSIX_LEN: u8 = 12;
+
+/// An MSI capability's bytes for its message control (PCI 3.0 §6.8.1): 12
+/// with a 32-bit address, 16 with a 64-bit one (bit 7), 8 more with
+/// per-vector masking (bit 8: mask and pending bits).
+pub const fn msi_len(control: u16) -> u8 {
+    let address = if control & (1 << 7) != 0 { 16 } else { 12 };
+    address + if control & (1 << 8) != 0 { 8 } else { 0 }
 }

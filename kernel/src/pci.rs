@@ -16,27 +16,34 @@
 //! read, a BAR unassigned or malformed, a bridge whose bus numbers are
 //! wrong or reach outside the mapped regions) is a warning.
 //!
-//! Enumeration also records every memory BAR in the BAR registry. The
-//! registry maps a BAR (`map_bar`) only when asked, once, when a driver
-//! claims the device (#95), and never unmaps it (`map_mmio`'s window only
-//! grows). Nothing else maps BARs, except that the framebuffer Limine set
-//! up inside the VGA BAR is in the HHDM (so `map_mmio` refuses that BAR).
+//! Enumeration also fills the registry: one slot per function, its memory
+//! BARs and who has it (`Binding`, which `lspci`'s driver column shows).
+//! The registry maps a BAR (`map_bar`) only when asked, once, when a driver
+//! claims the device ([`claim`]), and never unmaps it (`map_mmio`'s window
+//! only grows). Nothing else maps BARs, except that the framebuffer Limine
+//! set up inside the VGA BAR is in the HHDM (so `map_mmio` refuses that
+//! BAR). A claim hands out [`DeviceResources`]: the function's BAR mappings
+//! and its own configuration space ([`FunctionConfig`]), nothing else.
 //!
-//! Locks: `REGISTRY` is taken before the page tables and the frame
-//! allocator (`map_mmio`), and before the heap (the ktest clones it);
-//! `ECAM` before `DISCOVERY` (the ECAM ktest); `DISCOVERY` is held only to
-//! copy it out.
+//! Locks: `DISCOVERY` is held only to copy it out, and released before any
+//! other is taken. `REGISTRY` is taken before the page tables and the
+//! frame allocator (`map_bar` holds it across `map_mmio`) and before the
+//! heap (a refusal's reason and the binding's text are `String`s, cloned
+//! under it); `ECAM` is taken alone, except in the ECAM ktests (before
+//! `DISCOVERY`).
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
+use core::marker::PhantomData;
 
 use log::{debug, info, warn};
 use lumen_acpi::EcamRegion;
 use lumen_mm::{PhysAddr, VirtAddr};
 pub use lumen_pci::{Bar, BarProblem, DeviceInfo, NoBar, PciAddr};
 use lumen_pci::{ConfigSpace, command, ecam_offset, enumerate};
+use virtio_drivers::transport::pci::bus::{ConfigurationAccess, DeviceFunction};
 
 use crate::acpi::{self, Failure};
 use crate::mm::paging::{self, MmioError};
@@ -188,6 +195,12 @@ pub fn devices() -> &'static [DeviceInfo] {
     discovery().0
 }
 
+/// `addr`'s entry in [`devices`], if enumeration found it.
+fn device(addr: PciAddr) -> Option<&'static DeviceInfo> {
+    let devices = devices();
+    devices.binary_search_by_key(&addr, |d| d.addr).ok().map(|i| &devices[i])
+}
+
 /// Why [`devices`] is empty, or what it may be missing. Panics before
 /// [`init`].
 pub fn status() -> Status {
@@ -244,13 +257,11 @@ fn discover() -> (Vec<DeviceInfo>, Status) {
         for problem in d.problems(|segment, bus| ecam.covers(segment, bus)) {
             warn!(target: "pci", "{}: {problem}", d.addr);
         }
-        let mut bars = [None; 6];
-        for (entry, bar) in bars.iter_mut().zip(d.bars) {
-            if let Some(Bar::Memory { phys, size, .. }) = bar {
-                *entry = Some(BarEntry { phys, size, mapped: None });
-            }
-        }
-        slots.push(Slot { addr: d.addr, bars, binding: Binding::Free });
+        let bars = d.bars.map(|bar| match bar {
+            Some(Bar::Memory { phys, size, .. }) => Some(BarEntry { phys, size, mapped: None }),
+            _ => None,
+        });
+        slots.push(Slot { addr: d.addr, bars, binding: Binding::Free, command_before_claim: None });
     }
     let memory_bars = slots.iter().map(|s| s.bars.iter().flatten().count()).sum::<usize>();
     let plural = if found.len() == 1 { "" } else { "s" };
@@ -307,13 +318,15 @@ struct BarEntry {
     mapped: Option<BarMapping>,
 }
 
-/// One function's entry in the registry: its memory BARs (by index) and
-/// who has it.
+/// One function's entry in the registry: its memory BARs (by index), who
+/// has it, and its command register before the claim (restored when the
+/// driver declines it).
 #[derive(Clone, Debug)]
 struct Slot {
     addr: PciAddr,
     bars: [Option<BarEntry>; 6],
     binding: Binding,
+    command_before_claim: Option<u16>,
 }
 
 /// The registry: one slot per function, in [`devices`]' order. The one
@@ -325,6 +338,7 @@ static REGISTRY: SpinLock<Vec<Slot>> = SpinLock::new(Vec::new());
 fn with_slot<R>(addr: PciAddr, f: impl FnOnce(&mut Slot) -> R) -> Option<R> {
     let i = devices().binary_search_by_key(&addr, |d| d.addr).ok()?;
     let mut registry = REGISTRY.lock();
+    // (The registry's lock is taken after `DISCOVERY`'s is released.)
     let slot = registry.get_mut(i)?;
     debug_assert_eq!(slot.addr, addr, "the registry is in devices() order");
     Some(f(slot))
@@ -335,8 +349,8 @@ fn with_slot<R>(addr: PciAddr, f: impl FnOnce(&mut Slot) -> R) -> Option<R> {
 pub enum Binding {
     /// No driver claimed it (none matches it, or none was offered it).
     Free,
-    /// A driver matched it but the claim refused: why.
-    NotProbed(String),
+    /// This driver matched it but the claim refused: why.
+    NotProbed(&'static str, String),
     /// Claimed by this driver, which is probing it.
     Probing(&'static str),
     Bound(&'static str),
@@ -348,7 +362,7 @@ impl fmt::Display for Binding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Binding::Free => f.write_str("no driver"),
-            Binding::NotProbed(why) => write!(f, "not probed: {why}"),
+            Binding::NotProbed(driver, why) => write!(f, "{driver}: not probed: {why}"),
             Binding::Probing(driver) => write!(f, "{driver}: probing"),
             Binding::Bound(driver) => write!(f, "{driver}: bound"),
             Binding::Failed(driver, why) => write!(f, "{driver}: failed: {why}"),
@@ -386,7 +400,10 @@ impl BarMapping {
     /// Where `[phys, phys + len)` is mapped, if it lies inside this BAR.
     pub fn virt_of(&self, phys: u64, len: u64) -> Option<VirtAddr> {
         let offset = phys.checked_sub(self.phys.as_u64())?;
-        (offset.checked_add(len)? <= self.size).then(|| VirtAddr::new(self.virt.as_u64() + offset)).flatten()
+        if offset.checked_add(len)? > self.size {
+            return None;
+        }
+        VirtAddr::new(self.virt.as_u64() + offset)
     }
 }
 
@@ -444,7 +461,7 @@ impl fmt::Display for BarError {
 /// not, why. Takes no lock but `DISCOVERY`'s, briefly.
 fn check_bar(addr: PciAddr, index: usize) -> Result<(), BarError> {
     let fail = |why| Err(BarError { addr, index, why });
-    let Some(d) = devices().iter().find(|d| d.addr == addr) else { return fail(BarWhy::NoSuchFunction) };
+    let Some(d) = device(addr) else { return fail(BarWhy::NoSuchFunction) };
     match d.bar_slot(index) {
         Ok(Bar::Memory { .. }) => Ok(()),
         Ok(Bar::Io { .. }) => fail(BarWhy::Io),
@@ -489,12 +506,17 @@ fn mapped_bar(addr: PciAddr, index: usize) -> Result<BarMapping, BarError> {
 pub enum ClaimError {
     /// Enumeration found no such function.
     NoSuchFunction,
-    /// It was claimed before (by `probe_all` or a test): who has it.
+    /// It is claimed already, or a claim of it was refused before (by
+    /// `probe_all` or a ktest): its binding, which this claim leaves as it
+    /// was.
     Taken(Binding),
     /// Its capability list was cut off or not read.
     Caps(lumen_pci::CapEnd),
     /// A memory BAR couldn't be mapped (or is unassigned or malformed).
     Bar(BarError),
+    /// The command register didn't keep what the claim wrote (memory space
+    /// and bus master on, I/O space off): what it reads instead.
+    Command { wrote: u16, read: u16 },
 }
 
 impl fmt::Display for ClaimError {
@@ -504,39 +526,46 @@ impl fmt::Display for ClaimError {
             ClaimError::Taken(b) => write!(f, "already claimed ({b})"),
             ClaimError::Caps(end) => write!(f, "capability list {end}"),
             ClaimError::Bar(e) => write!(f, "{e}"),
+            ClaimError::Command { wrote, read } => {
+                write!(f, "the command register reads {read:#06x} after {wrote:#06x} was written")
+            }
         }
     }
 }
 
+/// The command bits a claim sets (memory space, bus master) and clears
+/// (I/O space).
+const CLAIM_ON: u16 = command::MEMORY_SPACE | command::BUS_MASTER;
+const CLAIM_OFF: u16 = command::IO_SPACE;
+
 /// Give `addr` to `driver`: once per function (a second claim is
 /// [`ClaimError::Taken`], whoever asks), recorded in the registry as
-/// [`Binding::Probing`]. Maps every memory BAR (an I/O BAR or an
-/// unimplemented slot is skipped; an unassigned or malformed one refuses),
-/// then turns memory space and bus master on and I/O space off in the
-/// command register (`virtio-drivers` never sets bus master, and the
-/// firmware's state isn't trusted). A function whose capability list was
-/// cut off or not read, or whose BAR can't be mapped, is refused and
-/// recorded as [`Binding::NotProbed`] with the reason.
+/// [`Binding::Probing`]. Maps every memory BAR (an I/O BAR, unassigned or
+/// not, and an unimplemented slot are skipped; an unassigned or malformed
+/// memory BAR refuses), then turns memory space and bus master on and I/O
+/// space off in the command register (`virtio-drivers` never sets bus
+/// master, and the firmware's state isn't trusted), reading it back. A
+/// function whose capability list was cut off or not read, whose BAR can't
+/// be mapped, or whose command register doesn't keep those bits is refused
+/// and recorded as [`Binding::NotProbed`] by `driver`, with the reason.
 ///
 /// Only `drivers::probe_all` calls this at boot (and ktests, on devices no
 /// driver takes).
 pub fn claim(addr: PciAddr, driver: &'static str) -> Result<DeviceResources, ClaimError> {
-    let Some(info) = devices().iter().find(|d| d.addr == addr) else { return Err(ClaimError::NoSuchFunction) };
-    let taken = with_slot(addr, |slot| match slot.binding {
+    let Some(info) = device(addr) else { return Err(ClaimError::NoSuchFunction) };
+    with_slot(addr, |slot| match slot.binding {
         Binding::Free => {
             slot.binding = Binding::Probing(driver);
-            None
+            Ok(())
         }
-        ref other => Some(other.clone()),
-    });
-    if let Some(b) = taken.expect("found in devices()") {
-        return Err(ClaimError::Taken(b));
-    }
+        ref other => Err(ClaimError::Taken(other.clone())),
+    })
+    .expect("found in devices()")?;
     let refuse = |e: ClaimError| {
-        with_slot(addr, |slot| slot.binding = Binding::NotProbed(e.to_string()));
+        with_slot(addr, |slot| slot.binding = Binding::NotProbed(driver, e.to_string()));
         Err(e)
     };
-    if !info.caps.is_complete() {
+    if !info.probeable() {
         return refuse(ClaimError::Caps(info.caps.end()));
     }
     for (index, bar) in info.bars.iter().enumerate() {
@@ -549,25 +578,58 @@ pub fn claim(addr: PciAddr, driver: &'static str) -> Result<DeviceResources, Cla
             }
         }
     }
-    let mut guard = ECAM.lock();
-    let ecam = guard.as_mut().expect("a function was found, so ECAM is mapped");
-    let before = ecam.read16(addr, lumen_pci::reg::COMMAND);
-    ecam.write_command(addr, (before | command::MEMORY_SPACE | command::BUS_MASTER) & !command::IO_SPACE);
+    let (before, wrote, read) = with_ecam(|ecam| {
+        let before = ecam.read16(addr, lumen_pci::reg::COMMAND);
+        let wrote = (before | CLAIM_ON) & !CLAIM_OFF;
+        ecam.write_command(addr, wrote);
+        (before, wrote, ecam.read16(addr, lumen_pci::reg::COMMAND))
+    });
+    debug!(target: "pci", "{addr}: claimed by {driver}, command {before:#06x} -> {read:#06x}");
+    with_slot(addr, |slot| slot.command_before_claim = Some(before));
+    if read & (CLAIM_ON | CLAIM_OFF) != CLAIM_ON {
+        return refuse(ClaimError::Command { wrote, read });
+    }
     Ok(DeviceResources { info })
 }
 
-/// Record how `driver`'s probe of the function it claimed went:
-/// [`Binding::Bound`], or [`Binding::Failed`] with the reason. Panics
-/// unless `addr` is being probed by `driver` (a bug in `probe_all`).
-pub fn probed(addr: PciAddr, driver: &'static str, outcome: Result<(), String>) {
-    with_slot(addr, |slot| {
+/// How a driver's probe of the function it claimed went.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Probed {
+    Bound,
+    /// It failed: why. Bus mastering is turned off, so the device can't
+    /// reach memory its driver dropped.
+    Failed(String),
+    /// Not this driver's device after all (a keyboard and a tablet share
+    /// virtio's input id): the function is free again, its command
+    /// register as before the claim, for the next driver row.
+    Declined,
+}
+
+/// Record how `driver`'s probe of the function it claimed went (see
+/// [`Probed`]). Panics unless `addr` is being probed by `driver` (a bug in
+/// `probe_all`).
+pub fn probed(addr: PciAddr, driver: &'static str, outcome: Probed) {
+    let restore = with_slot(addr, |slot| {
         assert_eq!(slot.binding, Binding::Probing(driver), "pci::probed: {addr} isn't being probed by {driver}");
-        slot.binding = match outcome {
-            Ok(()) => Binding::Bound(driver),
-            Err(why) => Binding::Failed(driver, why),
+        let before = slot.command_before_claim.take();
+        let (binding, command) = match outcome {
+            Probed::Bound => (Binding::Bound(driver), None),
+            Probed::Failed(why) => (Binding::Failed(driver, why), Some(None)),
+            Probed::Declined => (Binding::Free, Some(before)),
         };
+        slot.binding = binding;
+        command
     })
     .unwrap_or_else(|| panic!("pci::probed: no function {addr}"));
+    match restore {
+        None => {}
+        // Failed: bus master off, the rest as the claim left it.
+        Some(None) => with_ecam(|ecam| {
+            let now = ecam.read16(addr, lumen_pci::reg::COMMAND);
+            ecam.write_command(addr, now & !command::BUS_MASTER);
+        }),
+        Some(Some(before)) => with_ecam(|ecam| ecam.write_command(addr, before)),
+    }
 }
 
 /// A claimed function's resources, and nothing else: its `DeviceInfo`, its
@@ -584,70 +646,44 @@ impl DeviceResources {
     }
 
     /// Memory BAR `i`'s mapping (the claim mapped every memory BAR); `None`
-    /// for an I/O BAR, an unimplemented slot or `i` above 5.
+    /// for an I/O BAR, an unimplemented slot, the upper half of a 64-bit
+    /// BAR or `i` above 5.
     pub fn bar(&self, i: usize) -> Option<BarMapping> {
-        mapped_bar(self.info.addr, i).ok()
+        match mapped_bar(self.info.addr, i) {
+            Ok(m) => Some(m),
+            Err(BarError { why: BarWhy::NotMapped, .. }) => panic!("{}: claimed, so BAR {i} is mapped", self.info.addr),
+            Err(_) => None,
+        }
     }
 
-    /// This function's configuration space, and only its.
-    pub fn config(&self) -> FunctionConfig {
-        FunctionConfig { addr: self.info.addr }
+    /// This function's configuration space, and only its, for as long as
+    /// these resources live.
+    pub fn config(&self) -> FunctionConfig<'_> {
+        FunctionConfig { info: self.info, claim: PhantomData }
     }
 }
 
-/// One claimed function's configuration space: reads and writes go through
-/// ECAM (its lock taken for each), and another function's address is a bug
-/// that panics. BAR writes happen only in `virtio-drivers`' BAR sizing while
-/// probing, before the device runs (no BAR emulation in M3). Known limit: a
-/// driver could write its own MSI/MSI-X capability through it; #96
-/// programs those through a path private to `pci`.
+/// One claimed function's configuration space, tied to its
+/// [`DeviceResources`]: reads and writes go through ECAM (its lock taken
+/// for each), and another function's address is a bug that panics, as is
+/// a write into its MSI or MSI-X capability (#96 programs those through a
+/// path private to `pci`; `virtio-drivers` 0.13 writes only the command
+/// register and the BARs, sizing them while probing, before the device
+/// runs: no BAR emulation in M3).
 #[derive(Debug)]
-pub struct FunctionConfig {
-    addr: PciAddr,
+pub struct FunctionConfig<'a> {
+    info: &'static DeviceInfo,
+    claim: PhantomData<&'a DeviceResources>,
 }
 
-impl FunctionConfig {
+impl FunctionConfig<'_> {
     fn check(&self, addr: PciAddr) {
-        assert_eq!(addr, self.addr, "{}'s config access used for {addr}", self.addr);
-    }
-}
-
-impl ConfigSpace for FunctionConfig {
-    fn read(&mut self, addr: PciAddr, offset: u16) -> u32 {
-        self.check(addr);
-        ECAM.lock().as_mut().expect("claimed, so ECAM is mapped").read(addr, offset)
+        assert_eq!(addr, self.info.addr, "{}'s config access used for {addr}", self.info.addr);
     }
 
-    fn write(&mut self, addr: PciAddr, offset: u16, value: u32) {
-        self.check(addr);
-        ECAM.lock().as_mut().expect("claimed, so ECAM is mapped").write(addr, offset, value)
-    }
-}
-
-/// `virtio-drivers`' view: a bus/device/function without a segment, so the
-/// segment is this function's, and anything but this function panics.
-impl virtio_drivers::transport::pci::bus::ConfigurationAccess for FunctionConfig {
-    fn read_word(&self, df: virtio_drivers::transport::pci::bus::DeviceFunction, register_offset: u8) -> u32 {
-        let addr = self.same(df);
-        ECAM.lock().as_mut().expect("claimed, so ECAM is mapped").read(addr, u16::from(register_offset))
-    }
-
-    fn write_word(&mut self, df: virtio_drivers::transport::pci::bus::DeviceFunction, register_offset: u8, data: u32) {
-        let addr = self.same(df);
-        ECAM.lock().as_mut().expect("claimed, so ECAM is mapped").write(addr, u16::from(register_offset), data)
-    }
-
-    // SAFETY (of the contract): every access takes ECAM's lock, so a clone
-    // can't race the original on a register.
-    unsafe fn unsafe_clone(&self) -> Self {
-        FunctionConfig { addr: self.addr }
-    }
-}
-
-impl FunctionConfig {
     /// `df` as this function's address; panics if it is another function.
-    fn same(&self, df: virtio_drivers::transport::pci::bus::DeviceFunction) -> PciAddr {
-        let a = self.addr;
+    fn same(&self, df: DeviceFunction) -> PciAddr {
+        let a = self.info.addr;
         assert!(
             (df.bus, df.device, df.function) == (a.bus(), a.device(), a.function()),
             "{a}'s config access used for {:02x}:{:02x}.{:x}",
@@ -657,6 +693,71 @@ impl FunctionConfig {
         );
         a
     }
+
+    /// Write `value` at `offset` unless that is inside an MSI or MSI-X
+    /// capability (panics: a driver bug).
+    fn guarded_write(&self, addr: PciAddr, offset: u16, value: u32) {
+        with_ecam(|e| {
+            if let Some(cap) = self.info.caps.interrupt_cap_at(e, addr, offset) {
+                panic!(
+                    "{addr}: a driver wrote {value:#x} at {offset:#x}, inside the capability {:#04x} at {:#x}",
+                    cap.id, cap.offset
+                );
+            }
+            e.write(addr, offset, value)
+        })
+    }
+}
+
+/// `f` on ECAM, under its lock, for a claimed function's access.
+fn with_ecam<R>(f: impl FnOnce(&mut Ecam) -> R) -> R {
+    f(ECAM.lock().as_mut().expect("claimed, so ECAM is mapped"))
+}
+
+impl ConfigSpace for FunctionConfig<'_> {
+    fn read(&mut self, addr: PciAddr, offset: u16) -> u32 {
+        self.check(addr);
+        with_ecam(|e| e.read(addr, offset))
+    }
+
+    fn write(&mut self, addr: PciAddr, offset: u16, value: u32) {
+        self.check(addr);
+        self.guarded_write(addr, offset, value)
+    }
+}
+
+/// `virtio-drivers`' view: a bus/device/function without a segment, so the
+/// segment is this function's, and anything but this function panics.
+impl ConfigurationAccess for FunctionConfig<'_> {
+    fn read_word(&self, df: DeviceFunction, register_offset: u8) -> u32 {
+        let addr = self.same(df);
+        with_ecam(|e| e.read(addr, u16::from(register_offset)))
+    }
+
+    fn write_word(&mut self, df: DeviceFunction, register_offset: u8, data: u32) {
+        let addr = self.same(df);
+        self.guarded_write(addr, u16::from(register_offset), data)
+    }
+
+    // The contract: a clone may only read read-only fields. Only the
+    // crate's `enumerate_bus` calls this, which the kernel never uses;
+    // every access takes ECAM's lock anyway, and the clone keeps the same
+    // lifetime, so it can't outlive the claim.
+    unsafe fn unsafe_clone(&self) -> Self {
+        FunctionConfig { info: self.info, claim: PhantomData }
+    }
+}
+
+/// Ktests: set `addr`'s command register directly (an adverse state before
+/// a claim) and read it.
+#[cfg(feature = "ktest")]
+pub fn ktest_command(addr: PciAddr, set: Option<u16>) -> u16 {
+    with_ecam(|e| {
+        if let Some(value) = set {
+            e.write_command(addr, value);
+        }
+        e.read16(addr, lumen_pci::reg::COMMAND)
+    })
 }
 
 crate::ktest!(

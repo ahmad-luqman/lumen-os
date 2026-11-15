@@ -27,7 +27,7 @@
 mod commands;
 mod crash;
 mod pipe;
-mod sysinfo;
+pub(crate) mod sysinfo;
 
 use crate::arch::serial;
 use crate::keyboard::{self, KeyCode};

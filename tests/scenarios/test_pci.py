@@ -185,8 +185,9 @@ def test_lspci_lists_virtio_devices(boot):
 
 def test_lspci_shows_no_driver(boot):
     # No driver rows yet (each driver's issue adds one and tests its own
-    # probe outcome): every function, the virtio ones included, shows "no
-    # driver", and boot offered them to nobody.
+    # probe outcome; when rng lands (#97), its row shows `rng: bound` here
+    # and the summary line changes): every function, the virtio ones
+    # included, shows "no driver", and boot offered them to nobody.
     m = shell(boot, devices=Devices.every())
     rows = lspci_rows(m)
     assert rows and {row[4] for row in rows.values()} == {"no driver"}, rows

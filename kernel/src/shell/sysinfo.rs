@@ -332,10 +332,33 @@ pub fn lspci(ctx: &mut Ctx<'_>, args: &[String]) {
     emit(ctx, &t);
 }
 
+/// `lspci`'s driver column for `addr`: its binding (`no driver`,
+/// `<driver>: not probed: <reason>`, `<driver>: probing` while its probe
+/// runs, `<driver>: bound` or `<driver>: failed: <reason>`).
+fn driver_cell(addr: crate::pci::PciAddr) -> Value {
+    crate::pci::binding(addr).map_or(DASH, |b| Value::Text(b.to_string()))
+}
+
+/// Ktests: each function's driver column, as `lspci` shows it.
+#[cfg(feature = "ktest")]
+pub fn pci_rows() -> Vec<(crate::pci::PciAddr, String)> {
+    crate::pci::devices()
+        .iter()
+        .map(|d| {
+            (
+                d.addr,
+                match driver_cell(d.addr) {
+                    Value::Text(t) => t,
+                    _ => String::from("-"),
+                },
+            )
+        })
+        .collect()
+}
+
 /// `lspci`'s rows: the address, vendor and device ids (four hex digits,
 /// so `where vendor = 0x1af4` works), the class's name and the device's
-/// (`-` if Lumen doesn't know it), and its driver (`no driver`, `not
-/// probed: <reason>`, `<driver>: bound` or `<driver>: failed: <reason>`).
+/// (`-` if Lumen doesn't know it), and its driver ([`driver_cell`]).
 fn pci_table() -> pipe::Table {
     const COLUMNS: [Column; 6] = [
         Column::new("addr", Kind::Text, Align::Left, 12),
@@ -348,8 +371,14 @@ fn pci_table() -> pipe::Table {
     let mut t = pipe::Table::new(&COLUMNS);
     for d in crate::pci::devices() {
         let addr = Value::Text(alloc::format!("{}", d.addr));
-        let driver = crate::pci::binding(d.addr).map_or(DASH, |b| Value::Text(b.to_string()));
-        t.push(vec![addr, int(d.vendor), int(d.device), text(d.class_name()), d.name().map_or(DASH, text), driver]);
+        t.push(vec![
+            addr,
+            int(d.vendor),
+            int(d.device),
+            text(d.class_name()),
+            d.name().map_or(DASH, text),
+            driver_cell(d.addr),
+        ]);
     }
     t
 }

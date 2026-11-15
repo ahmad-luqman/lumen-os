@@ -49,7 +49,8 @@ noto-sans-mono-bitmap = { version = "=0.4.0", default-features = false, features
 # because input and sound use `Box`/`Vec`; no `embedded-io`.
 virtio-drivers = { version = "=0.13.0", default-features = false, features = ["alloc"] }
 # `Transport::read_config_space`/`write_config_space` name its traits and
-# virtio-drivers doesn't re-export them: pinned to the version it locks.
+# virtio-drivers doesn't re-export them: pinned to the version Cargo.lock
+# already resolves for virtio-drivers (and rhai).
 zerocopy = { version = "=0.8.63", default-features = false }
 
 [workspace.lints.rust]
