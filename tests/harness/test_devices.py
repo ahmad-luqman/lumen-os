@@ -424,6 +424,18 @@ def test_qemu_stderr_is_kept_apart(tmp_path, fake_env):
     assert (run / "serial.log").read_text() == "from the guest\n"
 
 
+def test_complaints_leave_out_known_noise(tmp_path, fake_env):
+    svm = (
+        "qemu-system-x86_64: warning: host doesn't support requested feature: "
+        "CPUID.80000001H:ECX.svm [bit 2]"
+    )
+    fake_env(f"echo \"{svm}\" >&2; echo 'audio: Can not open x' >&2; exit 0")
+    with Machine(Path("x.iso"), tmp_path / "run") as m:
+        m.wait_exit(10)
+        assert svm in m.qemu_stderr()
+        assert m.qemu_complaints() == ["audio: Can not open x"]
+
+
 class RecordingQmp:
     """Records QMP commands; `on_command` runs for each."""
 

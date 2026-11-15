@@ -373,6 +373,15 @@ def free_ports(count: int) -> list[int]:
 HOSTFWD_FAILED = "Could not set up host forwarding rule"
 
 
+# Lines QEMU prints on stderr that say nothing about the devices or the
+# guest (`Machine.qemu_complaints` leaves them out), each with its reason:
+QEMU_NOISE = [
+    # QEMU's default CPU model, qemu64, asks for SVM; under KVM on a host
+    # without it (CI's runners), QEMU warns and leaves the bit out.
+    re.compile(r"warning: host doesn't support requested feature: CPUID\.80000001H:ECX\.svm "),
+]
+
+
 def _ports(forwards: dict[int, int]) -> str:
     """`forwards` (guest -> host) for a message: `host 5555 for guest 80`."""
     return ", ".join(f"host {host} for guest {guest}" for guest, host in forwards.items())
@@ -608,10 +617,19 @@ class Machine:
 
     def qemu_stderr(self) -> str:
         """What QEMU itself printed so far (warnings and errors, on its
-        stderr; also in `qemu-stderr.log`). A device scenario asserts it is
-        empty: QEMU complains there about devices and backends it dislikes."""
+        stderr; also in `qemu-stderr.log`)."""
         with self._cond:
             return self._stderr.decode("utf-8", "replace")
+
+    def qemu_complaints(self) -> list[str]:
+        """The lines of `qemu_stderr()` but the known noise (`QEMU_NOISE`).
+        A device scenario asserts there are none: QEMU complains there
+        about devices and backends it dislikes."""
+        return [
+            line
+            for line in self.qemu_stderr().splitlines()
+            if not any(noise.search(line) for noise in QEMU_NOISE)
+        ]
 
     def options(self, vars_file: Path) -> QemuOptions:
         """How start() runs QEMU (separate so the harness tests can check it)."""

@@ -38,7 +38,7 @@ def test_boots_with_every_virtio_device(boot):
     m.expect(r"INFO  boot: boot complete", 60)
     virtio = {d["qdev_id"] for d in pci_devices(m) if d["id"]["vendor"] == VIRTIO_VENDOR}
     assert virtio == EVERY_DEVICE
-    assert m.qemu_stderr() == ""
+    assert m.qemu_complaints() == []
     # QEMU creates the wav file when it realizes the device.
     assert m.wav_path.exists()
     disks = {b["device"]: b for b in m.qmp().command("query-block")}
@@ -67,6 +67,6 @@ def test_a_taken_host_port_is_picked_again(boot, monkeypatch):
         m.expect(r"INFO  boot: boot complete", 60)
         assert m.forwards[80] != port
         assert HOSTFWD_FAILED in (m.artifacts / "qemu-stderr-attempt1.log").read_text()
-        assert m.qemu_stderr() == ""
+        assert m.qemu_complaints() == []
         with socket.create_connection(("127.0.0.1", m.forwards[80]), timeout=5):
             pass
