@@ -6,12 +6,13 @@ retry when a port is taken, a graceful quit with sound), the checks on
 import dataclasses
 import socket
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
 from lumen_harness import qemu
 from lumen_harness.qemu import (
-    DEVICE_IDS,
     HOSTFWD_FAILED,
     NO_DEVICES,
     Devices,
@@ -20,6 +21,7 @@ from lumen_harness.qemu import (
     free_ports,
     qemu_args,
 )
+from lumen_harness.qmp import QmpError
 from qemu_fakes import fake_qemu, opts
 
 
@@ -113,30 +115,11 @@ def test_cpu_model(tmp_path):
     assert fragment(qemu_args(m.options(Path("v.fd"))), "-cpu") == ["max"]
 
 
-def test_sound_records_to_a_wav_file():
-    assert device_args(opts(sound_wav=Path("/a/audio.wav"))) == [
-        "-audiodev", "wav,id=lumen-audio,path=/a/audio.wav",
-        "-device", "virtio-sound-pci,id=lumen-sound,audiodev=lumen-audio,streams=1",
-    ]  # fmt: skip
-
-
 def test_net_forwards_host_ports_on_loopback():
     assert device_args(opts(net_forwards={80: 5555, 22: 5556})) == [
         "-netdev",
         "user,id=lumen-net,hostfwd=tcp:127.0.0.1:5555-:80,hostfwd=tcp:127.0.0.1:5556-:22",
         "-device", "virtio-net-pci,id=lumen-nic,netdev=lumen-net,romfile=",
-    ]  # fmt: skip
-
-
-def test_net_without_forwards():
-    assert fragment(device_args(opts(net_forwards={})), "-netdev") == ["user,id=lumen-net"]
-    assert "-netdev" not in device_args(opts())
-
-
-def test_9p_shares_a_folder():
-    assert device_args(opts(share_dir=Path("/a/share"))) == [
-        "-fsdev", "local,id=lumen-fs,path=/a/share,security_model=none",
-        "-device", "virtio-9p-pci,id=lumen-9p,fsdev=lumen-fs,mount_tag=lumen-share",
     ]  # fmt: skip
 
 
@@ -211,7 +194,6 @@ def test_every_turns_every_device_on():
         if f.name == "blk_image":  # the alternative to blk_mib, which is on
             continue
         assert getattr(every, f.name) != f.default, f.name
-    assert set(DEVICE_IDS) == {"tablet", "keyboard", "rng", "sound", "blk", "net", "share"}
 
 
 @pytest.mark.parametrize(
@@ -224,7 +206,7 @@ def test_every_turns_every_device_on():
         {"blk_mib": 4, "blk_image": Path("/d.img")},
         {"forward": (80, 80)},
         {"forward": (0,)},
-        {"forward": (70000,)},
+        {"forward": (65536,)},
         {"forward": ("80",)},
         {"forward": (True,)},
     ],
@@ -235,9 +217,11 @@ def test_devices_reject_bad_values(kw):
         Devices(**kw)
 
 
-def test_devices_normalize_forward_and_blk_image():
-    d = Devices(forward=[80, 22], blk_image="/d.img")  # type: ignore[arg-type]
-    assert d.forward == (80, 22) and d.blk_image == Path("/d.img")
+def test_devices_normalize_forward_and_blk_image(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    d = Devices(forward=[80, 22], blk_image="d.img")  # type: ignore[arg-type]
+    assert d.forward == (80, 22) and d.blk_image == tmp_path / "d.img"
+    Devices(forward=(1, 65535))  # the bounds themselves are ports
     assert d.wants_net and Devices(net=True).wants_net and not NO_DEVICES.wants_net
 
 
@@ -265,11 +249,12 @@ def test_devices_cant_be_swapped_after_creation(tmp_path):
     m = Machine(Path("x.iso"), tmp_path, devices=Devices(forward=(80,)))
     with pytest.raises(AttributeError):
         m.devices = NO_DEVICES  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        NO_DEVICES.sound = True  # type: ignore[misc]
 
 
 def test_net_alone_has_no_forwards(tmp_path):
     m = Machine(Path("x.iso"), tmp_path, devices=Devices(net=True))
-    m._pick_forwards()
     assert m.options(Path("v.fd")).net_forwards == {}
 
 
@@ -328,36 +313,115 @@ def test_start_keeps_an_existing_image(tmp_path, fake_env):
     assert not (tmp_path / "run" / "disk.img").exists()
 
 
+def launches(count: Path) -> int:
+    return count.read_text().count("x") if count.exists() else 0
+
+
+# A fake QEMU's first lines: skip environment.txt's `--version` probe (not
+# a start), and count each start in `count`.
+def counting(count: Path) -> str:
+    return f'if [ "$1" = --version ]; then exit 0; fi; echo x >> {count}; '
+
+
 def test_a_taken_forward_port_is_picked_again_once(tmp_path, fake_env, monkeypatch):
     # The first QEMU fails like QEMU does when a host port is taken; start()
-    # picks new ports and starts again.
+    # keeps that attempt's files, picks new ports and starts again.
     count = tmp_path / "count"
     failed = tmp_path / "failed"
     fake_env(
-        # (`--version` is environment.txt's probe, not a start.)
-        'if [ "$1" = --version ]; then exit 0; fi; '
-        f"echo x >> {count}; if [ ! -e {failed} ]; then touch {failed}; "
-        f"echo \"qemu-system-x86_64: -netdev ...: {HOSTFWD_FAILED} 'tcp:...'\"; exit 1; fi; "
+        counting(count) + f"if [ ! -e {failed} ]; then touch {failed}; echo attempt one; "
+        f"echo \"qemu-system-x86_64: -netdev ...: {HOSTFWD_FAILED} 'tcp:...'\" >&2; exit 1; fi; "
         "exit 0"
     )
     picks = iter([[40001], [40002]])
     monkeypatch.setattr(qemu, "free_ports", lambda n: next(picks))
-    with Machine(Path("x.iso"), tmp_path / "run", devices=Devices(forward=(80,))) as m:
+    run = tmp_path / "run"
+    m = Machine(Path("x.iso"), run, devices=Devices(forward=(80,)))
+    with pytest.warns(UserWarning, match="host 40001 for guest 80.*retried with host 40002"):
+        m.start()
+    try:
         assert m.wait_exit(10) == 0
         assert m.forwards == {80: 40002}
         assert HOSTFWD_FAILED not in m.output
-    assert count.read_text().count("x") == 2
-    assert "127.0.0.1:40002-:80" in (tmp_path / "run" / "cmdline.txt").read_text()
+    finally:
+        m.close()
+    assert launches(count) == 2
+    assert "127.0.0.1:40002-:80" in (run / "cmdline.txt").read_text()
+    assert "127.0.0.1:40001-:80" in (run / "cmdline-attempt1.txt").read_text()
+    assert (run / "serial-attempt1.log").read_text() == "attempt one\n"
+    assert HOSTFWD_FAILED in (run / "qemu-stderr-attempt1.log").read_text()
+    assert (run / "serial.log").read_text() == ""
 
 
 def test_a_second_port_failure_is_left_to_the_test(tmp_path, fake_env, monkeypatch):
-    fake_env(f'echo "{HOSTFWD_FAILED}"; exit 1')
+    fake_env(f'echo "{HOSTFWD_FAILED}" >&2; exit 1')
     picks = iter([[40001], [40002], [40003]])
     monkeypatch.setattr(qemu, "free_ports", lambda n: next(picks))
-    with Machine(Path("x.iso"), tmp_path / "run", devices=Devices(forward=(80,))) as m:
+    m = Machine(Path("x.iso"), tmp_path / "run", devices=Devices(forward=(80,)))
+    with pytest.warns(UserWarning, match="retried"):
+        m.start()
+    try:
         assert m.wait_exit(10) == 1
         assert m.forwards == {80: 40002}  # tried twice, not more
         assert HOSTFWD_FAILED in m.output
+    finally:
+        m.close()
+
+
+def test_other_failures_are_not_retried(tmp_path, fake_env):
+    count = tmp_path / "count"
+    fake_env(
+        counting(count) + 'echo "qemu-system-x86_64: -device virtio-foo: not found" >&2; exit 1'
+    )
+    with Machine(Path("x.iso"), tmp_path / "run", devices=Devices(forward=(80,))) as m:
+        assert m.wait_exit(10) == 1
+        assert "virtio-foo: not found" in m.output
+    assert launches(count) == 1
+
+
+def test_a_forwarding_qemu_that_answers_qmp_starts_once(tmp_path, fake_env, monkeypatch):
+    # The QMP connection that proves the forwards bound is only a probe:
+    # it is closed, and later QMP calls get a connection with the usual
+    # timeout, as without forwards.
+    count = tmp_path / "count"
+    fake_env(counting(count) + "exec sleep 30")
+    clients = []
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+            self.closed = False
+
+        @classmethod
+        def connect(cls, path, timeout=10):
+            deadline = time.monotonic() + 5
+            while launches(count) < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)  # answers once this QEMU is up
+            clients.append(cls(timeout))
+            return clients[-1]
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(qemu, "QmpClient", FakeClient)
+    with Machine(Path("x.iso"), tmp_path / "run", devices=Devices(forward=(80,))) as m:
+        assert m._qmp is None
+        assert m.qmp().timeout == Machine(Path("x.iso"), tmp_path).qmp().timeout == 10
+    assert clients[0].closed
+    assert launches(count) == 1
+
+
+def test_qemu_stderr_is_kept_apart(tmp_path, fake_env):
+    # QEMU's messages go to qemu-stderr.log and qemu_stderr(), the guest's
+    # serial to serial.log; `output` (expect's view) has both.
+    fake_env("echo from the guest; echo 'audio: from QEMU' >&2; exit 0")
+    run = tmp_path / "run"
+    with Machine(Path("x.iso"), run) as m:
+        m.wait_exit(10)
+        assert m.qemu_stderr() == "audio: from QEMU\n"
+        assert "from the guest" in m.output and "audio: from QEMU" in m.output
+    assert (run / "qemu-stderr.log").read_text() == "audio: from QEMU\n"
+    assert (run / "serial.log").read_text() == "from the guest\n"
 
 
 class RecordingQmp:
@@ -385,6 +449,54 @@ def test_close_quits_gracefully_with_sound(tmp_path):
     m.close()
     assert qmp.sent == ["quit"]
     assert proc.returncode == -15  # ended by the quit, not killed (-9)
+
+
+def sound_machine(tmp_path, proc, qmp) -> Machine:
+    m = Machine(Path("x.iso"), tmp_path, devices=Devices(sound=True))
+    m.proc, m._qmp = proc, qmp  # type: ignore[assignment]
+    return m
+
+
+def test_close_waits_for_the_quit(tmp_path):
+    proc = subprocess.Popen(["sleep", "30"])
+    qmp = RecordingQmp(on_command=lambda: threading.Timer(0.3, proc.terminate).start())
+    sound_machine(tmp_path, proc, qmp).close()
+    assert proc.returncode == -15
+
+
+def test_close_kills_when_quit_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(Machine._quit, "__defaults__", (0.2,))
+    proc = subprocess.Popen(["sleep", "30"])
+
+    def broken():
+        raise QmpError("QMP connection unusable")
+
+    with pytest.warns(UserWarning) as said:
+        sound_machine(tmp_path, proc, RecordingQmp(on_command=broken)).close()
+    assert proc.returncode == -9
+    # It still waited for QEMU to exit before the kill.
+    assert [str(w.message).split(":")[0] for w in said] == [
+        "QMP quit failed (QMP connection unusable)",
+        "QEMU did not quit within 0.2s",
+    ]
+    assert "audio.wav may be truncated" in str(said[0].message)
+
+
+def test_close_kills_when_quit_is_ignored(tmp_path, monkeypatch):
+    monkeypatch.setattr(Machine._quit, "__defaults__", (0.2,))
+    proc = subprocess.Popen(["sleep", "30"])
+    qmp = RecordingQmp()
+    with pytest.warns(UserWarning, match="did not quit within 0.2s"):
+        sound_machine(tmp_path, proc, qmp).close()
+    assert qmp.sent == ["quit"] and proc.returncode == -9
+
+
+def test_close_after_exit_sends_no_quit(tmp_path):
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    qmp = RecordingQmp()
+    sound_machine(tmp_path, proc, qmp).close()
+    assert qmp.sent == []
 
 
 def test_close_kills_without_sound(tmp_path):

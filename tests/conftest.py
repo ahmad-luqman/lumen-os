@@ -5,7 +5,7 @@
 directory, build/test-artifacts/<module>/<test>/ (a re-run's, with
 LUMEN_ARTIFACTS_DIR set, goes under that root instead): keyed by module too,
 so same-named tests in two files can run side by side under pytest-xdist.
-Artifacts of passing tests are deleted; failing tests keep serial.log, qemu.log
+Artifacts of passing tests are deleted; failing tests keep serial.log, qemu-stderr.log, qemu.log
 (CPU resets, and the `-d int` interrupt trace under TCG), cmdline.txt,
 environment.txt and any screenshots, and CI uploads them.
 """

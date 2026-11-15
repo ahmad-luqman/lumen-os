@@ -129,9 +129,10 @@ tests = [
 ]
 
 [[feature]]
-name = "Virtio device options (tablet, keyboard, rng, sound on QEMU's wav audiodev, blk on a scratch or kept image, user net with forwarded host ports, a 9p host folder option) and the CPU model, all off by default; QEMU starts with every one attached and lists them, and the kernel boots"
+name = "Virtio device options (tablet, keyboard, rng, sound on QEMU's wav audiodev, blk on a scratch or kept image, user net with forwarded host ports picked again once if one is taken, a 9p host folder option) and the CPU model, all off by default; QEMU starts with every one attached, lists them and prints nothing on stderr (kept apart in qemu-stderr.log), and the kernel boots"
 milestone = "M3"
 tests = [
     "harness:test_devices::*",
     "scenario:test_pci::test_boots_with_every_virtio_device",
+    "scenario:test_pci::test_a_taken_host_port_is_picked_again",
 ]

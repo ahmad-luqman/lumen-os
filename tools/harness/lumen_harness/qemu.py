@@ -16,7 +16,8 @@ take screenshots over QMP (`screendump`), and collect the exit
 status that the kernel sets through `isa-debug-exit`.
 
 Every `Machine` run writes its artifacts to a directory: `serial.log`
-(everything the guest printed), `qemu.log` (QEMU `-d` trace: interrupts, CPU
+(everything the guest printed), `qemu-stderr.log` (QEMU's own warnings and
+errors), `qemu.log` (QEMU `-d` trace: interrupts, CPU
 resets, guest errors), `cmdline.txt`, `environment.txt` (QEMU version,
 accelerator, OVMF version) and any screenshots. (`make run` and `make debug`
 keep only `qemu.log`, and debug also `serial.log`, in build/run/ and
@@ -34,10 +35,11 @@ import socket
 import subprocess
 import threading
 import time
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Self
+from typing import IO, Any, Self
 
 from . import BUILD_DIR
 from .qmp import QmpClient, QmpError, qcodes_for
@@ -229,9 +231,12 @@ def device_args(o: QemuOptions) -> list[str]:
     if o.virtio_rng:
         args += ["-device", f"virtio-rng-pci,id={ids['rng']}"]
     if o.sound_wav:
-        # QEMU creates the wav file when the device is realized and leaves
-        # the header's lengths at 0 (seen with 11.1 after debug-exit, QMP
-        # `quit` and SIGTERM): readers take the length from the file size.
+        # QEMU creates the wav file when it realizes the device. The header's
+        # lengths depend on the version: 8.2 (CI) fills them in at exit (an
+        # atexit audio_cleanup), 11.1 leaves them at 0 (seen after
+        # debug-exit, QMP `quit` and SIGTERM). While QEMU runs the file can
+        # be 0 bytes (the header still in stdio's buffer). Readers take the
+        # length from the file size, once QEMU has exited.
         # `streams=1`: the output stream only. The wav backend has no capture
         # side (QEMU warns about the input stream otherwise), and playback is
         # all we need.
@@ -246,7 +251,8 @@ def device_args(o: QemuOptions) -> list[str]:
         ]  # fmt: skip
     if o.net_forwards is not None:
         # The empty guest address is slirp's default, 10.0.2.15: the first
-        # DHCP lease, which the guest must take for the forwards to reach it.
+        # DHCP lease, which the guest must use (by DHCP or set statically)
+        # for the forwards to reach it.
         forwards = "".join(
             f",hostfwd=tcp:127.0.0.1:{host}-:{guest}" for guest, host in o.net_forwards.items()
         )
@@ -290,7 +296,9 @@ class Devices:
     # every start().
     blk_mib: int | None = None
     # virtio-blk on this existing raw image, used as it is (never zeroed), so
-    # a second boot sees what the first wrote. Not with `blk_mib`.
+    # a second boot sees what the first wrote, once the first QEMU has exited
+    # (QEMU takes a write lock on the image). Kept as an absolute path. Not
+    # with `blk_mib`.
     blk_image: Path | None = None
     # virtio-net on user networking (implied by `forward`).
     net: bool = False
@@ -301,14 +309,12 @@ class Devices:
     share: bool = False
 
     def __post_init__(self) -> None:
+        if self.blk_mib is not None and self.blk_image is not None:
+            raise ValueError("blk_mib and blk_image: give one (a fresh image or an existing one)")
         if self.blk_mib is not None and not (_is_int(self.blk_mib) and self.blk_mib > 0):
             raise ValueError(f"blk_mib={self.blk_mib!r}: expected a whole number of MiB above 0")
         if self.blk_image is not None:
-            if self.blk_mib is not None:
-                raise ValueError(
-                    "blk_mib and blk_image: give one (a fresh image or an existing one)"
-                )
-            object.__setattr__(self, "blk_image", Path(self.blk_image))
+            object.__setattr__(self, "blk_image", Path(self.blk_image).absolute())
         forward = tuple(self.forward)
         for port in forward:
             if not (_is_int(port) and 1 <= port <= 65535):
@@ -362,8 +368,14 @@ def free_ports(count: int) -> list[int]:
             s.close()
 
 
-# What QEMU prints when it can't bind a forwarded host port.
+# What QEMU prints when it can't bind a forwarded host port
+# (test_pci::test_a_taken_host_port_is_picked_again checks it).
 HOSTFWD_FAILED = "Could not set up host forwarding rule"
+
+
+def _ports(forwards: dict[int, int]) -> str:
+    """`forwards` (guest -> host) for a message: `host 5555 for guest 80`."""
+    return ", ".join(f"host {host} for guest {guest}" for guest, host in forwards.items())
 
 
 def qemu_args(o: QemuOptions) -> list[str]:
@@ -465,6 +477,10 @@ class Machine:
         self._cond = threading.Condition()
         self._pos = 0  # expect() cursor into the normalized output
         self._reader: threading.Thread | None = None
+        # QEMU's own messages (its stderr), kept apart from the guest's serial
+        # output (and also added to `output`, so expect()'s errors show them).
+        self._stderr = bytearray()
+        self._err_reader: threading.Thread | None = None
         self._qmp: QmpClient | None = None
         # When QEMU will have sent every key pressed so far (see `press`).
         self._keys_sent_by = 0.0
@@ -482,7 +498,8 @@ class Machine:
 
     @property
     def wav_path(self) -> Path:
-        """Where virtio-sound's output goes (QEMU writes it; see `device_args`)."""
+        """Where virtio-sound's output goes. QEMU writes it, and it is complete
+        only after QEMU has exited (see `device_args` and `close`)."""
         if not self._devices.sound:
             raise AttributeError("no virtio-sound: boot with Devices(sound=True)")
         return self.artifacts / "audio.wav"
@@ -521,54 +538,85 @@ class Machine:
             self.share_dir.mkdir(exist_ok=True)
         self._launch()
         # Another process can take a forwarded host port between picking it
-        # and QEMU binding it; QEMU then exits at once. Pick again, once.
+        # and QEMU binding it; QEMU then exits at once. Pick again, once,
+        # keeping the first attempt's files as *-attempt1.*.
         if self.forwards and self._forwarding_failed():
+            taken = self.forwards
             self.close()
-            self._buf = bytearray()
-            self._pos = 0
+            for name in ("serial.log", "cmdline.txt", "qemu-stderr.log"):
+                f = self.artifacts / name
+                if f.exists():
+                    f.rename(f.with_name(f"{f.stem}-attempt1{f.suffix}"))
             self._launch()
+            warnings.warn(
+                f"forwarded host port taken ({_ports(taken)}): retried with {_ports(self.forwards)}",
+                stacklevel=2,
+            )
         return self
 
     def _launch(self) -> None:
         self.qmp_path.unlink(missing_ok=True)
+        with self._cond:
+            self._buf = bytearray()
+            self._stderr = bytearray()
+            self._pos = 0
         self._pick_forwards()
         opts = self.options(fresh_vars(self.artifacts / "OVMF_VARS.fd"))
         args = qemu_args(opts)
         (self.artifacts / "cmdline.txt").write_text(" ".join(args) + "\n")
         (self.artifacts / "environment.txt").write_text("\n".join(environment(opts.accel)) + "\n")
-        # Lives as long as the machine; closed in close().
+        # Live as long as the machine; closed in close().
         self._serial_log = open(self.artifacts / "serial.log", "wb")  # noqa: SIM115
+        self._stderr_log = open(self.artifacts / "qemu-stderr.log", "wb")  # noqa: SIM115
         self.proc = subprocess.Popen(
-            args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        assert self.proc.stdout and self.proc.stderr
+        self._reader = threading.Thread(
+            target=self._read_loop, args=(self.proc.stdout, self._serial_log, None), daemon=True
+        )
+        self._err_reader = threading.Thread(
+            target=self._read_loop,
+            args=(self.proc.stderr, self._stderr_log, self._stderr),
+            daemon=True,
+        )
         self._reader.start()
+        self._err_reader.start()
 
     def _forwarding_failed(self, timeout: float = 30) -> bool:
         """Whether QEMU exited because it couldn't bind a forwarded port.
-        QEMU answers QMP only once every backend is set up (the forwards
-        among them), so a QMP connection means they're bound. A failed QEMU
-        exits within milliseconds but may leave its socket file behind, so
-        this watches the process too, not only the socket."""
+        QEMU's QMP socket listens early, but the monitor's greeting (which a
+        connect waits for) comes only after the netdevs are set up, so a
+        completed connect means the forwards are bound. The probe connection
+        is closed again: `qmp()` makes its own, with its usual timeouts. A
+        failed QEMU exits within milliseconds but may leave its socket file
+        behind, so this watches the process too, not only the socket."""
         assert self.proc
         wait, _ = self._scaled(timeout)
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline and self.proc.poll() is None:
             try:
-                self._qmp = QmpClient.connect(self.qmp_path, timeout=2)
-                return False
+                probe = QmpClient.connect(self.qmp_path, timeout=2)
             except (QmpError, OSError):
                 continue
+            probe.close()
+            return False
         if self.proc.poll() is None:
             return False  # still starting: let the test's own waits report it
-        if self._reader:
-            self._reader.join(timeout=5)
+        self._join_readers()
         return HOSTFWD_FAILED in self.output
+
+    def qemu_stderr(self) -> str:
+        """What QEMU itself printed so far (warnings and errors, on its
+        stderr; also in `qemu-stderr.log`). A device scenario asserts it is
+        empty: QEMU complains there about devices and backends it dislikes."""
+        with self._cond:
+            return self._stderr.decode("utf-8", "replace")
 
     def options(self, vars_file: Path) -> QemuOptions:
         """How start() runs QEMU (separate so the harness tests can check it)."""
         trace = "cpu_reset,guest_errors" + (",int" if self.trace_interrupts else "")
-        d = self.devices
+        d = self._devices
         return QemuOptions(
             iso=self.iso,
             vars_file=vars_file,
@@ -588,20 +636,28 @@ class Machine:
             extra=self.extra_args,
         )
 
-    def _read_loop(self) -> None:
-        assert self.proc and self.proc.stdout
-        fd = self.proc.stdout.fileno()
+    def _read_loop(self, stream: IO[bytes], log: IO[bytes], keep: bytearray | None) -> None:
+        """Copy one of QEMU's output streams to its log and to `output` (and,
+        for stderr, to `keep`) until QEMU closes it."""
+        fd = stream.fileno()
         while True:
             chunk = os.read(fd, 4096)
             if not chunk:
                 break
-            self._serial_log.write(chunk)
-            self._serial_log.flush()
+            log.write(chunk)
+            log.flush()
             with self._cond:
                 self._buf += chunk.replace(b"\r", b"")
+                if keep is not None:
+                    keep += chunk
                 self._cond.notify_all()
         with self._cond:
             self._cond.notify_all()
+
+    def _join_readers(self) -> None:
+        for reader in (self._reader, self._err_reader):
+            if reader:
+                reader.join(timeout=5)
 
     def close(self) -> None:
         if self._devices.sound and self.proc and self.proc.poll() is None:
@@ -612,23 +668,35 @@ class Machine:
         if self.proc and self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait(timeout=10)
-        if self._reader:
-            self._reader.join(timeout=5)
-        if hasattr(self, "_serial_log"):
-            self._serial_log.close()
+        self._join_readers()
+        for log in ("_serial_log", "_stderr_log"):
+            if hasattr(self, log):
+                getattr(self, log).close()
         if hasattr(self, "qmp_path"):
             self.qmp_path.unlink(missing_ok=True)
 
     def _quit(self, timeout: float = 5) -> None:
-        """Ask QEMU to quit (QMP `quit`) and wait for it: unlike a kill, that
-        lets the wav audiodev write out the samples it buffered (a kill
-        leaves audio.wav empty). close() kills QEMU if this doesn't end it."""
+        """Ask QEMU to quit (QMP `quit`) and wait for it (`timeout`, scaled
+        like expect's): unlike a kill, that lets the wav audiodev write out
+        what it still buffers (a kill drops it: the tail, or everything when
+        little was played). close() kills QEMU if it is still running after
+        this; a failure here only warns."""
         assert self.proc
         try:
             self.qmp().command("quit")
-            self.proc.wait(timeout=timeout)
-        except (QmpError, OSError, subprocess.TimeoutExpired):
-            pass
+        except (QmpError, OSError) as e:
+            warnings.warn(
+                f"QMP quit failed ({e}): QEMU will be killed, so {self.wav_path} may be truncated",
+                stacklevel=3,
+            )
+        wait, said = self._scaled(timeout)
+        try:
+            self.proc.wait(timeout=wait)
+        except subprocess.TimeoutExpired:
+            warnings.warn(
+                f"QEMU did not quit within {said}: killing it, so {self.wav_path} may be truncated",
+                stacklevel=3,
+            )
 
     def __enter__(self) -> Self:
         return self.start()
@@ -684,7 +752,7 @@ class Machine:
         return wait, said
 
     def _reader_alive(self) -> bool:
-        return self._reader is not None and self._reader.is_alive()
+        return any(r is not None and r.is_alive() for r in (self._reader, self._err_reader))
 
     def send(self, data: str) -> None:
         assert self.proc and self.proc.stdin
@@ -702,8 +770,7 @@ class Machine:
             code = self.proc.wait(timeout=wait)
         except subprocess.TimeoutExpired as e:
             raise ExpectTimeout(f"QEMU still running after {said}") from e
-        if self._reader:
-            self._reader.join(timeout=5)
+        self._join_readers()
         return code
 
     # -- QMP -------------------------------------------------------------
