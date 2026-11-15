@@ -1,4 +1,4 @@
-"""PCI devices: the virtio devices the harness attaches.
+"""PCI devices: the virtio devices the harness attaches, and `lspci`.
 
 Boots with every device `Devices.every()` names and checks QEMU's own view
 of them: it starts without complaint (CI's QEMU accepts each one, sound and
@@ -6,13 +6,23 @@ its wav audiodev among them), `query-pci` lists each, the disk is the image
 the harness made, the CPU model is `max`, the forwarded host port is open,
 and the kernel still boots. And when a forwarded host port is taken,
 real QEMU fails the way the harness expects and the retry recovers.
+
+The kernel's side: `lspci` lists exactly the functions `query-pci` reports
+(address, vendor and device ids), names the virtio ones, and the boot log
+counts the memory BARs QEMU has; its records filter (`where vendor =
+0x1af4`); and without ACPI there is no MCFG, so no PCI devices, with a
+warning. The decoding itself is host-tested (`cargo test -p lumen-pci`,
+`-p lumen-acpi` for the MCFG) and checked in-kernel
+(`lumen_kernel::pci::*`).
 """
 
+import re
 import socket
 
 import pytest
 from lumen_harness import qemu
 from lumen_harness.qemu import DEVICE_IDS, HOSTFWD_FAILED, Devices, Machine
+from lumen_harness.screen import PROMPT
 
 EVERY_DEVICE = set(DEVICE_IDS.values())
 # The PCI vendor id of every virtio device (Red Hat's).
@@ -70,3 +80,108 @@ def test_a_taken_host_port_is_picked_again(boot, monkeypatch):
         assert m.qemu_complaints() == []
         with socket.create_connection(("127.0.0.1", m.forwards[80]), timeout=5):
             pass
+
+
+# (Without ACPI there is no keyboard, so no shell on the screen.)
+SHELLS = r"INFO  shell: shells? on serial.*; type 'help'\n"
+PCI_LINE = re.compile(
+    r"INFO  pci: (\d+) functions?, (\d+) memory BARs, through ECAM: "
+    r"segment 0 buses 0-255 at 0x[0-9a-f]+0000000\n"
+)
+# What `lspci` calls each device the harness attaches.
+VIRTIO_NAMES = {
+    "tablet": "virtio input",
+    "keyboard": "virtio input",
+    "rng": "virtio rng",
+    "sound": "virtio sound",
+    "blk": "virtio block",
+    "net": "virtio network",
+    "share": "virtio 9p",
+}
+
+
+def shell(boot, **kwargs) -> Machine:
+    m = boot("qemutest", **kwargs)
+    m.expect(SHELLS, 60)
+    m.expect(PROMPT, 60)
+    return m
+
+
+def run(m: Machine, line: str) -> str:
+    """Run `line` in the serial shell: what it printed between its echo and
+    the next prompt."""
+    m.send_line(line)
+    echo = m.expect(re.escape(line) + r"\n", 10)
+    end = m.expect(PROMPT, 10)
+    return m.output[echo.end() : end.start()]
+
+
+def lspci(m: Machine) -> dict[str, tuple[int, int, str, str]]:
+    """`lspci`'s rows by address: vendor, device, class and name."""
+    out = run(m, "lspci")
+    lines = out.splitlines()
+    header = re.fullmatch(r"lspci: (\d+) functions?", lines[0])
+    assert header, out
+    assert re.fullmatch(r"  addr\s+vendor\s+device\s+class\s+name", lines[1]), out
+    rows = {}
+    for line in lines[2:]:
+        addr, vendor, device, cls, name = re.split(r"\s{2,}", line.strip())
+        rows[addr] = (int(vendor, 16), int(device, 16), cls, name)
+    assert len(rows) == int(header[1]), out
+    return rows
+
+
+def pci_address(d: dict) -> str:
+    return f"0000:{d['bus']:02x}:{d['slot']:02x}.{d['function']:x}"
+
+
+def test_lspci_lists_virtio_devices(boot):
+    m = shell(boot, devices=Devices.every())
+    rows = lspci(m)
+    qemu_devices = pci_devices(m)
+    # Exactly the functions QEMU has, with their ids.
+    assert {a: r[:2] for a, r in rows.items()} == {
+        pci_address(d): (d["id"]["vendor"], d["id"]["device"]) for d in qemu_devices
+    }
+    # Each device the harness attached is there under its name.
+    ids = {qdev: key for key, qdev in DEVICE_IDS.items()}
+    names = {
+        ids[d["qdev_id"]]: rows[pci_address(d)][3] for d in qemu_devices if d["qdev_id"] in ids
+    }
+    assert names == VIRTIO_NAMES
+    assert rows["0000:00:00.0"][2:] == ("host bridge", "Q35 host bridge")
+    # The boot log counts them, and the memory BARs QEMU has (BARs 0-5:
+    # QEMU lists the ROM as region 6).
+    line = PCI_LINE.search(m.output)
+    assert line, "no pci summary line"
+    memory_bars = sum(
+        1 for d in qemu_devices for r in d["regions"] if r["type"] == "memory" and r["bar"] < 6
+    )
+    assert (int(line[1]), int(line[2])) == (len(rows), memory_bars)
+    assert "WARN  pci" not in m.output
+
+
+def test_lspci_records_filter(boot):
+    m = shell(boot, devices=Devices(rng=True, tablet=True, keyboard=True))
+    assert run(m, "lspci | where vendor = 0x1af4 | count") == "3\n"
+    out = run(m, "lspci | where vendor = 0x1af4 | select name addr")
+    assert sorted(re.findall(r"^  (virtio \w+)  ", out, re.MULTILINE)) == [
+        "virtio input",
+        "virtio input",
+        "virtio rng",
+    ], out
+    # A hex column takes hex only.
+    assert run(m, "lspci | where vendor = 6900 | count") == (
+        "where: vendor is hex: write it with 0x (e.g. 0x20)\n"
+    )
+    out = run(m, "lspci | select addr class name")
+    assert out.splitlines()[0].split() == ["addr", "class", "name"], out
+    assert run(m, "lspci | where class ~ bridge | count") != "0\n"
+
+
+def test_no_acpi_means_no_pci_devices(boot):
+    # `acpi=off` leaves no MADT, so ACPI is absent and with it the MCFG.
+    m = shell(boot, extra=["-machine", "q35,acpi=off"])
+    assert "WARN  pci: no PCI devices: no ACPI tables, so no MCFG\n" in m.output
+    assert run(m, "lspci").startswith("lspci: 0 functions\n")
+    assert run(m, "lspci | count") == "0\n"

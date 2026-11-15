@@ -1,6 +1,7 @@
 //! ACPI tables for the Lumen kernel: the RSDP, the root table (the XSDT, or
 //! the RSDT on ACPI 1.0 firmware), the MADT (interrupt controllers and CPUs),
-//! the HPET, and what powering off takes: the FADT's PM1 control registers
+//! the HPET, the MCFG (where PCI configuration space is memory-mapped), and
+//! what powering off takes: the FADT's PM1 control registers
 //! and the DSDT's `\_S5_` sleep type values ([`SleepType::s5_from_dsdt`]
 //! searches the AML bytes for the package: no AML interpreter builds on
 //! stable Rust).
@@ -34,6 +35,9 @@ const RSDP_V1_LEN: usize = 20;
 const RSDP_V2_LEN: usize = 36;
 const MADT_FIXED_LEN: usize = SDT_HEADER_LEN + 8;
 const HPET_LEN: usize = 56;
+/// The MCFG's header and its 8 reserved bytes, before the first entry.
+const MCFG_FIXED_LEN: usize = SDT_HEADER_LEN + 8;
+const MCFG_ENTRY_LEN: usize = 16;
 /// An ACPI 1.0 FADT, up to and including the fields we read from it.
 const FADT_V1_LEN: usize = 116;
 
@@ -59,6 +63,7 @@ impl Signature {
     pub const RSDT: Signature = Signature(*b"RSDT");
     pub const MADT: Signature = Signature(*b"APIC");
     pub const HPET: Signature = Signature(*b"HPET");
+    pub const MCFG: Signature = Signature(*b"MCFG");
     pub const FADT: Signature = Signature(*b"FACP");
     pub const DSDT: Signature = Signature(*b"DSDT");
     /// Not a table signature: names the RSDP in errors.
@@ -111,6 +116,9 @@ pub enum Error {
     HpetNotInMemory { space: u8 },
     /// The HPET's register address is 0.
     HpetAddressZero,
+    /// MCFG entry `index` (from 0) can't describe configuration space: see
+    /// [`EcamRegion`] for what is checked.
+    BadEcamRegion { index: usize, base: u64, segment: u16, bus_start: u8, bus_end: u8 },
     /// The FADT gives no PM1a control block.
     NoPm1aControl,
     /// A PM1 control block's 64-bit field is outside I/O space (`space` is
@@ -151,6 +159,10 @@ impl fmt::Display for Error {
             }
             Error::HpetNotInMemory { space } => write!(f, "HPET registers in address space {space}, not memory"),
             Error::HpetAddressZero => f.write_str("HPET register address is 0"),
+            Error::BadEcamRegion { index, base, segment, bus_start, bus_end } => write!(
+                f,
+                "MCFG entry {index} (base {base:#x}, segment {segment}, buses {bus_start}-{bus_end}) is malformed"
+            ),
             Error::NoPm1aControl => f.write_str("the FADT gives no PM1a control block"),
             Error::Pm1NotIo { block, space, address } => {
                 write!(f, "the {block} control block at {address:#x} is in address space {space}, not I/O")
@@ -638,6 +650,86 @@ impl Hpet {
             return Err(Error::HpetAddressZero);
         }
         Ok(hpet)
+    }
+}
+
+/// One MCFG entry: the memory-mapped (ECAM) configuration space of a PCI
+/// segment's buses. Bus `b`'s space is the 1 MiB at `base + (b << 20)`
+/// (`base` is bus 0's address, even when `bus_start` is higher), 4 KiB per
+/// function. [`Mcfg::parse`] checks that `base` isn't 0 and is 1 MiB
+/// aligned, that `bus_start <= bus_end`, and that the range's end fits 64
+/// bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EcamRegion {
+    pub base: u64,
+    pub segment: u16,
+    pub bus_start: u8,
+    pub bus_end: u8,
+}
+
+impl EcamRegion {
+    /// The physical address of `bus_start`'s configuration space: where a
+    /// mapping of this region starts.
+    pub fn start(&self) -> u64 {
+        self.base + (u64::from(self.bus_start) << 20)
+    }
+
+    /// The bytes from [`start`](Self::start) to the end of `bus_end`'s
+    /// configuration space (1 MiB per bus).
+    pub fn len(&self) -> u64 {
+        (u64::from(self.bus_end) - u64::from(self.bus_start) + 1) << 20
+    }
+
+    /// Never: a region holds at least one bus. (For clippy's `len` rule.)
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+/// The PCI Express memory-mapped configuration table: one [`EcamRegion`]
+/// per segment group (or bus range of one), each checked by
+/// [`Mcfg::parse`].
+#[derive(Clone, Copy, Debug)]
+pub struct Mcfg<'a> {
+    entries: &'a [u8],
+}
+
+impl<'a> Mcfg<'a> {
+    /// Check that `t` is an MCFG whose body after its reserved bytes is a
+    /// whole number of 16-byte entries, each a valid [`EcamRegion`]. An
+    /// MCFG listing no region parses (and gives none).
+    pub fn parse(t: Sdt<'a>) -> Result<Mcfg<'a>, Error> {
+        let b = t.expect(Signature::MCFG)?.bytes();
+        let entries = b.get(MCFG_FIXED_LEN..).ok_or(Error::Truncated(Signature::MCFG))?;
+        let (whole, rest) = entries.as_chunks::<MCFG_ENTRY_LEN>();
+        if !rest.is_empty() {
+            return Err(Error::Truncated(Signature::MCFG));
+        }
+        for (index, e) in whole.iter().enumerate() {
+            let r = ecam_region(e);
+            let end = r.base.checked_add((u64::from(r.bus_end) + 1) << 20);
+            if r.base == 0 || !r.base.is_multiple_of(1 << 20) || r.bus_start > r.bus_end || end.is_none() {
+                let EcamRegion { base, segment, bus_start, bus_end } = r;
+                return Err(Error::BadEcamRegion { index, base, segment, bus_start, bus_end });
+            }
+        }
+        Ok(Mcfg { entries })
+    }
+
+    /// The regions, in table order.
+    pub fn regions(&self) -> impl Iterator<Item = EcamRegion> + use<'a> {
+        self.entries.as_chunks::<MCFG_ENTRY_LEN>().0.iter().map(ecam_region)
+    }
+}
+
+/// Decode a 16-byte MCFG entry: base (8 bytes), segment (2), start and end
+/// bus (1 each), 4 reserved.
+fn ecam_region(e: &[u8; MCFG_ENTRY_LEN]) -> EcamRegion {
+    EcamRegion {
+        base: u64_at(e, 0).expect("within 16 bytes"),
+        segment: u16_at(e, 8).expect("within 16 bytes"),
+        bus_start: e[10],
+        bus_end: e[11],
     }
 }
 

@@ -113,6 +113,13 @@ pub static COMMANDS: Table<Run> = Table(&[
         run: sysinfo::irqs,
     },
     Command {
+        name: "lspci",
+        args: &[],
+        usage: "",
+        about: "the PCI functions found at boot: address, vendor and device ids, class, name",
+        run: sysinfo::lspci,
+    },
+    Command {
         name: "dmesg",
         args: &[],
         usage: "",

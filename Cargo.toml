@@ -17,6 +17,7 @@ lumen-demo = { path = "crates/lumen-demo" }
 lumen-elf = { path = "crates/lumen-elf" }
 lumen-heap = { path = "crates/lumen-heap" }
 lumen-mm = { path = "crates/lumen-mm" }
+lumen-pci = { path = "crates/lumen-pci" }
 lumen-queue = { path = "crates/lumen-queue" }
 lumen-shell = { path = "crates/lumen-shell" }
 lumen-synth = { path = "crates/lumen-synth" }

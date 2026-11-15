@@ -22,6 +22,7 @@ lumen-demo.workspace = true
 lumen-elf.workspace = true
 lumen-heap.workspace = true
 lumen-mm.workspace = true
+lumen-pci.workspace = true
 lumen-queue.workspace = true
 lumen-shell.workspace = true
 lumen-term.workspace = true

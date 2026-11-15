@@ -932,3 +932,103 @@ fn acpi_modes_say_which() {
         "no usable way to ask for ACPI mode (SMI command port 0xb2, ACPI_ENABLE 0x0)"
     );
 }
+
+/// An MCFG body: 8 reserved bytes, then one 16-byte entry per region
+/// `(base, segment, first bus, last bus)`.
+fn mcfg(regions: &[(u64, u16, u8, u8)]) -> Vec<u8> {
+    let mut body = vec![0u8; 8];
+    for &(base, segment, start, end) in regions {
+        body.extend_from_slice(&base.to_le_bytes());
+        body.extend_from_slice(&segment.to_le_bytes());
+        body.extend_from_slice(&[start, end, 0, 0, 0, 0]);
+    }
+    table(b"MCFG", &body)
+}
+
+/// QEMU q35's MCFG (hw/pci-host/q35.c, `MCH_HOST_BRIDGE_PCIEXBAR_DEFAULT`):
+/// segment 0, buses 0-255, at 0xb000_0000.
+const Q35_ECAM: (u64, u16, u8, u8) = (0xb000_0000, 0, 0, 255);
+
+#[test]
+fn mcfg_gives_q35s_ecam_region() {
+    let t = mcfg(&[Q35_ECAM]);
+    let m = Mcfg::parse(Sdt::parse(&t).unwrap()).unwrap();
+    let regions: Vec<EcamRegion> = m.regions().collect();
+    let r = EcamRegion { base: 0xb000_0000, segment: 0, bus_start: 0, bus_end: 255 };
+    assert_eq!(regions, [r]);
+    // 256 buses of 1 MiB, from bus 0.
+    assert_eq!((r.start(), r.len(), r.is_empty()), (0xb000_0000, 256 << 20, false));
+}
+
+#[test]
+fn mcfg_regions_come_in_table_order_and_start_at_their_first_bus() {
+    let t = mcfg(&[(0xe000_0000, 0, 0x10, 0x1f), (0x40_0000_0000, 1, 0, 0)]);
+    let regions: Vec<EcamRegion> = Mcfg::parse(Sdt::parse(&t).unwrap()).unwrap().regions().collect();
+    assert_eq!(
+        regions,
+        [
+            EcamRegion { base: 0xe000_0000, segment: 0, bus_start: 0x10, bus_end: 0x1f },
+            EcamRegion { base: 0x40_0000_0000, segment: 1, bus_start: 0, bus_end: 0 },
+        ]
+    );
+    // The base is bus 0's: bus 0x10's space starts 16 MiB in.
+    assert_eq!((regions[0].start(), regions[0].len()), (0xe100_0000, 16 << 20));
+    assert_eq!((regions[1].start(), regions[1].len()), (0x40_0000_0000, 1 << 20));
+}
+
+#[test]
+fn an_mcfg_without_regions_parses_empty() {
+    let t = mcfg(&[]);
+    assert_eq!(Mcfg::parse(Sdt::parse(&t).unwrap()).unwrap().regions().count(), 0);
+}
+
+#[test]
+fn mcfg_refuses_a_partial_entry_or_a_missing_reserved_field() {
+    let t = mcfg(&[Q35_ECAM]);
+    for len in SDT_HEADER_LEN..t.len() {
+        assert_eq!(
+            Mcfg::parse(Sdt::parse(&cut(&t, len)).unwrap()).map(|m| m.regions().count()),
+            // The reserved bytes alone are a table without regions.
+            if len == SDT_HEADER_LEN + 8 { Ok(0) } else { Err(Error::Truncated(Signature::MCFG)) },
+            "{len}"
+        );
+    }
+    let hpet = hpet_with(0, QEMU_HPET_ID);
+    assert_eq!(
+        Mcfg::parse(Sdt::parse(&hpet).unwrap()).map(|_| ()),
+        Err(Error::WrongSignature { expected: Signature::MCFG, found: Signature::HPET })
+    );
+}
+
+#[test]
+fn mcfg_refuses_regions_that_cant_be_configuration_space() {
+    let bad =
+        |index, (base, segment, bus_start, bus_end)| Error::BadEcamRegion { index, base, segment, bus_start, bus_end };
+    for region in [
+        (0, 0, 0, 255),                   // no address
+        (0xb000_1000, 0, 0, 255),         // not 1 MiB aligned
+        (0xb000_0000, 0, 9, 8),           // buses backwards
+        (u64::MAX << 20, 0, 0, 1),        // past the end of the address space
+        (0xffff_ffff_fff0_0000, 0, 0, 0), // ends exactly at 2^64
+    ] {
+        let t = mcfg(&[Q35_ECAM, region]);
+        assert_eq!(Mcfg::parse(Sdt::parse(&t).unwrap()).map(|_| ()), Err(bad(1, region)), "{region:x?}");
+    }
+    // A region must end below 2^64: one bus based 2 MiB below it fits.
+    let top = (0xffff_ffff_ffe0_0000, 3, 0, 0);
+    assert!(Mcfg::parse(Sdt::parse(&mcfg(&[top])).unwrap()).is_ok());
+    assert_eq!(
+        std::format!("{}", bad(1, (0xb000_1000, 2, 0, 255))),
+        "MCFG entry 1 (base 0xb0001000, segment 2, buses 0-255) is malformed"
+    );
+}
+
+#[test]
+fn acpi_finds_the_mcfg() {
+    let mut regions = machine();
+    regions[2] = (0x7fbe_0001, xsdt(&[0x7fbe_1000, 0x7fbe_2000, 0x7fbe_3000, 0x7fbe_4000]));
+    regions.push((0x7fbe_4000, mcfg(&[Q35_ECAM])));
+    let mut acpi = Acpi::new(Mem::new(&regions), RSDP_AT).unwrap();
+    let m = Mcfg::parse(acpi.find(Signature::MCFG).unwrap()).unwrap();
+    assert_eq!(m.regions().map(|r| r.base).collect::<Vec<_>>(), [0xb000_0000]);
+}
