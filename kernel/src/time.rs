@@ -11,7 +11,10 @@
 //! the reference clock's counter between two TSC reads (for the PIT too: its counter runs on
 //! past the end), so a vCPU paused while waiting for the end doesn't stretch
 //! it; a window whose start or end reading itself was paused (a wide gap
-//! between its TSC reads) is taken again. Every poll is bounded, so a clock
+//! between its TSC reads) is taken again. The local APIC timer's windows have
+//! the same shape against the TSC: the timer started, and its count read, each
+//! between two TSC reads, and a paused one taken again, spaced out (#129); it
+//! warns rather than panics when too few are steady. Every poll is bounded, so a clock
 //! that doesn't count is an error, not a hang. [`now_ns`] and [`ticks`] are lock-free (interrupt
 //! handlers and the crash path may call them).
 
@@ -20,7 +23,7 @@ use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use log::{info, warn};
 use lumen_mm::PhysAddr;
-use lumen_time::{Clock, Hz, PIT_HZ, Pause, PitBadReadback, SteadyError, Window};
+use lumen_time::{Clock, Hz, PIT_HZ, Pause, PitBadReadback, SetAside, SteadyError, Window};
 
 use crate::arch::{self, apic, idt, pit};
 use crate::mm::paging;
@@ -31,7 +34,8 @@ pub const TICK_HZ: u64 = 1000;
 /// Calibration windows, and how long each is.
 const WINDOWS: usize = 5;
 const WINDOW_NS: u64 = 10_000_000;
-/// How many windows a TSC calibration may take to get [`WINDOWS`] steady ones.
+/// How many windows a calibration (the TSC's, or the local APIC timer's) may
+/// take to get [`WINDOWS`] steady ones.
 const ATTEMPTS: usize = 4 * WINDOWS;
 /// The longest a 10 ms window may take, in TSC ticks (TSC unknown yet: over
 /// 1 s at up to 4 GHz), before its reference counts as stalled.
@@ -58,16 +62,40 @@ static BOOT_TSC: AtomicU64 = AtomicU64::new(0);
 static HPET: SpinLock<Option<HpetCounter>> = SpinLock::new(None);
 /// The boot calibration (None until [`init`]).
 static BOOT_CALIBRATION: SpinLock<Option<Calibration>> = SpinLock::new(None);
+/// The local APIC timer's boot calibration (None until [`init`]).
+static BOOT_TIMER_CALIBRATION: SpinLock<Option<Calibration>> = SpinLock::new(None);
 
-/// A TSC calibration: the median of its windows' frequencies, the (steady)
-/// windows in the order they were taken, and how many unsteady ones were set
-/// aside for others (and the last of those).
+/// A calibration: the median of its windows' frequencies (the TSC's against a
+/// reference, or the local APIC timer's against the TSC), the windows (the
+/// steady ones first, in the order they were taken: all of them for the TSC;
+/// for the timer, if attempts ran out, the least unsteady fill the rest), and
+/// how many unsteady windows were taken (each followed by another, unless
+/// attempts ran out; filling in, some are kept) and the last of those.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Calibration {
     pub hz: u64,
     pub windows: [Window; WINDOWS],
     pub retaken: usize,
     pub last_retaken: Option<Window>,
+}
+
+impl Calibration {
+    /// How many of its windows are steady (the first ones).
+    pub fn steady(&self) -> usize {
+        self.windows.iter().filter(|w| w.is_steady()).count()
+    }
+
+    /// Whether most of its windows are steady, so its median is as good as
+    /// theirs ([`lumen_time::median_is_steady`]).
+    pub fn median_is_steady(&self) -> bool {
+        lumen_time::median_is_steady(self.steady(), WINDOWS)
+    }
+
+    /// The most its median can be off, in parts per million
+    /// ([`lumen_time::median_bound_ppm`]).
+    pub fn median_bound_ppm(&self) -> u64 {
+        lumen_time::median_bound_ppm(&self.windows)
+    }
 }
 
 impl fmt::Display for Calibration {
@@ -259,19 +287,16 @@ pub fn boot_calibration() -> Option<Calibration> {
     *BOOT_CALIBRATION.lock()
 }
 
+/// The local APIC timer's boot calibration, with its windows (None before
+/// [`init`]).
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: a ktest
+pub fn boot_timer_calibration() -> Option<Calibration> {
+    *BOOT_TIMER_CALIBRATION.lock()
+}
+
 /// The HPET, if [`init`] calibrated the TSC against it.
 pub fn hpet() -> Option<HpetCounter> {
     *HPET.lock()
-}
-
-/// The median of [`WINDOWS`] samples taken by `window`; the first failure
-/// if one fails.
-fn median_of_windows(mut window: impl FnMut() -> Result<u64, CalError>) -> Result<u64, CalError> {
-    let mut samples = [0u64; WINDOWS];
-    for s in &mut samples {
-        *s = window()?;
-    }
-    Ok(lumen_time::median(&mut samples).expect("WINDOWS samples"))
 }
 
 /// A TSC calibration against a reference counting at `reference_hz`: the
@@ -281,13 +306,24 @@ fn median_of_windows(mut window: impl FnMut() -> Result<u64, CalError>) -> Resul
 fn median_tsc_hz(reference_hz: u64, take: impl FnMut() -> Result<Window, CalError>) -> Result<Calibration, CalError> {
     let mut windows = [Window::default(); WINDOWS];
     let aside = lumen_time::steady_windows(&mut windows, ATTEMPTS, take)?;
+    median_calibration(windows, aside, |w| match w.tsc_hz(reference_hz) {
+        Some(hz) if lumen_time::plausible_tsc_hz(hz) => Ok(hz),
+        Some(hz) => Err(CalError::Implausible(hz)),
+        None => Err(CalError::NoCount),
+    })
+}
+
+/// A calibration from `windows` (the steady ones first) and the unsteady ones
+/// taken: the median of the frequencies `rate` gives them, or the first error
+/// it gives.
+fn median_calibration(
+    windows: [Window; WINDOWS],
+    aside: SetAside,
+    rate: impl Fn(&Window) -> Result<u64, CalError>,
+) -> Result<Calibration, CalError> {
     let mut hz = [0u64; WINDOWS];
     for (h, w) in hz.iter_mut().zip(&windows) {
-        *h = match w.tsc_hz(reference_hz) {
-            Some(hz) if lumen_time::plausible_tsc_hz(hz) => hz,
-            Some(hz) => return Err(CalError::Implausible(hz)),
-            None => return Err(CalError::NoCount),
-        };
+        *h = rate(w)?;
     }
     let hz = lumen_time::median(&mut hz).expect("WINDOWS samples");
     Ok(Calibration { hz, windows, retaken: aside.count, last_retaken: aside.last })
@@ -355,19 +391,158 @@ pub fn measure(reference: Reference) -> Option<Result<Calibration, CalError>> {
     }
 }
 
-/// The local APIC timer's input frequency against the (calibrated) TSC.
-fn calibrate_lapic_timer(tsc: Clock) -> Result<u64, CalError> {
+/// How long the local APIC timer's calibration waits before taking a window
+/// again after an unsteady one: 20 ms. On a loaded KVM runner the vCPU
+/// stalled next to the timer's register accesses in bursts lasting hundreds
+/// of ms (#129: in one boot 17 of 20 windows taken back to back were
+/// unsteady); spaced, 20 attempts span about 600 ms.
+const TIMER_RETRY_SPACING_NS: u64 = 20_000_000;
+
+/// The local APIC timer's input frequency against the (calibrated) TSC: the
+/// median of [`WINDOWS`] windows from [`timer_window`]. A window with a
+/// paused end is taken again, after [`timer_retake_pause`], up to
+/// [`ATTEMPTS`] in all; if attempts run out first, the least unsteady
+/// windows make up the rest ([`lumen_time::steadiest_windows`]), rather than
+/// panicking the boot: with most steady the median lies between theirs, and
+/// otherwise [`init`] warns how far off it can be, or panics if that is
+/// 100% or more ([`timer_report`]). Call with interrupts off.
+fn calibrate_lapic_timer(tsc: Clock) -> Result<Calibration, CalError> {
     let window = tsc.ticks(WINDOW_NS);
-    median_of_windows(|| {
-        apic::timer_one_shot(u32::MAX);
-        let t0 = arch::rdtsc();
-        while arch::rdtsc() - t0 < window {
-            core::hint::spin_loop();
+    calibrate_timer_with(tsc, || timer_window(window, |_| {}))
+}
+
+/// [`calibrate_lapic_timer`] with its windows from `take` (ktests make them
+/// up), against `tsc`.
+fn calibrate_timer_with(tsc: Clock, take: impl FnMut() -> Result<Window, CalError>) -> Result<Calibration, CalError> {
+    let got = lumen_time::steadiest_windows::<CalError, WINDOWS>(ATTEMPTS, take, || timer_retake_pause(tsc))?;
+    median_calibration(*got.windows(), got.aside(), |w| w.reference_hz(tsc.hz()).ok_or(CalError::NoCount))
+}
+
+/// The wait before a timer calibration window taken again:
+/// [`TIMER_RETRY_SPACING_NS`] by `tsc`, the clock being calibrated against,
+/// busy (interrupts are off at boot).
+fn timer_retake_pause(tsc: Clock) {
+    let (start, ticks) = (arch::rdtsc(), tsc.ticks(TIMER_RETRY_SPACING_NS));
+    while arch::rdtsc().wrapping_sub(start) < ticks {
+        core::hint::spin_loop();
+    }
+}
+
+/// What [`init`] says about the local APIC timer's calibration
+/// ([`timer_report`]), and at what level.
+enum TimerReport {
+    /// Every window steady at the first try: nothing to say.
+    Clean,
+    /// Some windows taken again, most kept steady (INFO): the median lies
+    /// between steady windows'.
+    Retook(Calibration),
+    /// Fewer than most steady (WARN): the median may be off by up to the
+    /// bound, in ppm ([`Calibration::median_bound_ppm`]). A warning, not a
+    /// panic: the timer paces preemption, when deadlines are noticed (each
+    /// tick checks them), the cursor's blink and the `ticks` counts, while
+    /// sleeps and deadlines themselves are `now_ns`, the TSC.
+    Imprecise(Calibration, u64),
+    /// The bound is 100% or more (the middle windows' gaps are as long as
+    /// themselves): the rate says nothing, and a tick from it could come
+    /// arbitrarily fast or slow. `init` panics, as it does when the TSC
+    /// can't be calibrated.
+    Unusable(Calibration),
+}
+
+/// How `init` reports `cal`: see [`TimerReport`].
+fn timer_report(cal: &Calibration) -> TimerReport {
+    match (cal.median_is_steady(), cal.median_bound_ppm()) {
+        (true, _) if cal.retaken == 0 => TimerReport::Clean,
+        (true, _) => TimerReport::Retook(*cal),
+        (false, ppm) if ppm >= 1_000_000 => TimerReport::Unusable(*cal),
+        (false, ppm) => TimerReport::Imprecise(*cal, ppm),
+    }
+}
+
+impl TimerReport {
+    /// The level `init` logs it at: none for [`Clean`](Self::Clean) (nothing
+    /// to say) or [`Unusable`](Self::Unusable) (a panic instead).
+    fn level(&self) -> Option<log::Level> {
+        match self {
+            TimerReport::Clean | TimerReport::Unusable(_) => None,
+            TimerReport::Retook(_) => Some(log::Level::Info),
+            TimerReport::Imprecise(..) => Some(log::Level::Warn),
         }
-        let (current, t1) = (apic::timer_current(), arch::rdtsc());
-        // 0: it ran out (or reads as 0), so the count says nothing.
-        let counted = u64::from(u32::MAX - current);
-        lumen_time::frequency(counted, t1 - t0, tsc.hz()).filter(|_| current != 0).ok_or(CalError::NoCount)
+    }
+}
+
+impl fmt::Display for TimerReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TimerReport::Clean => f.write_str("local APIC timer calibration: every window steady"),
+            TimerReport::Retook(cal) => write!(
+                f,
+                "local APIC timer calibration took {} windows again, {} of {WINDOWS} kept steady (read too late to \
+                 trust; the last, tsc/timer/polls/start_gap/end_gap: {})",
+                cal.retaken,
+                cal.steady(),
+                cal.last_retaken.unwrap_or_default()
+            ),
+            TimerReport::Imprecise(cal, ppm) => {
+                // Rounded up to a tenth of a percent.
+                let tenths = ppm.div_ceil(1_000);
+                write!(
+                    f,
+                    "local APIC timer calibration: only {} of {ATTEMPTS} windows read promptly ({WINDOWS} wanted; a \
+                     stall next to the timer's register accesses), so its rate may be off by up to {}.{}% \
+                     (tsc/timer/polls/start_gap/end_gap: {cal})",
+                    cal.steady(),
+                    tenths / 10,
+                    tenths % 10
+                )
+            }
+            TimerReport::Unusable(cal) => write!(
+                f,
+                "can't calibrate the local APIC timer against the TSC: only {} of {ATTEMPTS} windows read promptly \
+                 ({WINDOWS} wanted), and the middle ones' stalls were as long as themselves, so the rate says nothing \
+                 (tsc/timer/polls/start_gap/end_gap: {cal})",
+                cal.steady()
+            ),
+        }
+    }
+}
+
+/// One window of the local APIC timer against the TSC, at least `window` TSC
+/// ticks long: the timer started (one-shot, masked, from `u32::MAX`) between
+/// two TSC reads, and its count read between two more, as [`hpet_window`]
+/// reads the HPET. So `reference` is the timer's ticks, and `start_gap` and
+/// `end_gap` are how far off each end can be (a vCPU paused between the
+/// timer's register access and the TSC read next to it widens them). `pause`
+/// is called at the [`Pause`] points (a no-op but in tests). Call with
+/// interrupts off. A count of 0 (it ran out, or reads as 0) is
+/// [`CalError::NoCount`].
+fn timer_window(window: u64, mut pause: impl FnMut(Pause)) -> Result<Window, CalError> {
+    apic::timer_prepare_one_shot();
+    let pre = arch::rdtsc();
+    pause(Pause::StartBeforeRead);
+    apic::timer_start(u32::MAX);
+    pause(Pause::StartAfterRead);
+    let t0 = arch::rdtsc();
+    let before = loop {
+        let now = arch::rdtsc();
+        if now.wrapping_sub(t0) >= window {
+            break now;
+        }
+        core::hint::spin_loop();
+    };
+    pause(Pause::EndBeforeRead);
+    let current = apic::timer_current();
+    pause(Pause::EndAfterRead);
+    let t = arch::rdtsc();
+    if current == 0 {
+        return Err(CalError::NoCount);
+    }
+    Ok(Window {
+        tsc: t - t0,
+        reference: u64::from(u32::MAX - current),
+        polls: 1,
+        start_gap: t0 - pre,
+        end_gap: t - before,
     })
 }
 
@@ -402,7 +577,8 @@ fn calibrate_tsc() -> (Calibration, Reference) {
 /// `interrupts::init`; call with interrupts off. An HPET ACPI lists but that
 /// doesn't work is warned about (the PIT is used instead). Panics if no
 /// clock can calibrate the TSC, or the local APIC timer doesn't count or
-/// can't tick at 1 kHz.
+/// can't tick at 1 kHz (too few steady windows for it is warned about, not a
+/// panic).
 pub fn init() {
     assert!(!arch::irq::enabled(), "time::init with interrupts on");
     let (cal, reference) = calibrate_tsc();
@@ -421,8 +597,16 @@ pub fn init() {
     }
 
     let tsc = Clock::new(hz).expect("calibrated");
-    let timer_hz = calibrate_lapic_timer(tsc)
+    let timer_cal = calibrate_lapic_timer(tsc)
         .unwrap_or_else(|e| panic!("can't calibrate the local APIC timer against the TSC: {e}"));
+    *BOOT_TIMER_CALIBRATION.lock() = Some(timer_cal);
+    let timer_hz = timer_cal.hz;
+    let report = timer_report(&timer_cal);
+    match report.level() {
+        Some(level) => log::log!(target: "time", level, "{report}"),
+        None if matches!(report, TimerReport::Unusable(_)) => panic!("{report}"),
+        None => {}
+    }
     let count = lumen_time::periodic_count(timer_hz, TICK_HZ)
         .unwrap_or_else(|| panic!("the local APIC timer, at {}, can't tick at {}", Hz(timer_hz), Hz(TICK_HZ)));
     LAPIC_TIMER_HZ.store(timer_hz, Ordering::Relaxed);
@@ -514,8 +698,9 @@ pub fn sleep(ns: u64) {
 /// Busy-wait at least `ns` nanoseconds without yielding or blocking (the
 /// timer still preempts it if another thread is ready on this CPU): for
 /// [`sleep`] where a thread can't block, and for tests that must not switch
-/// threads (the calibration ktests' pauses among them). Panics before
-/// [`init`].
+/// threads (the calibration ktests' injected pauses among them; the boot's
+/// timer calibration waits with [`timer_retake_pause`] instead, on the clock
+/// it was given). Panics before [`init`].
 pub fn spin(ns: u64) {
     let tsc = tsc().expect("time::spin before time::init");
     let start = arch::rdtsc();
@@ -1035,6 +1220,223 @@ crate::ktest!(
     }
 );
 
+/// Runs `f` with interrupts off and this CPU's local APIC timer free for a
+/// ktest to run once, masked (which stops its 1 kHz tick: [`timer_window`],
+/// or the 1 kHz check's one-shot windows), then restarts the tick before
+/// interrupts come back, and checks the timer's registers (LVT, error LVT,
+/// initial count, divider) read as they did before: `f`'s result if they do.
+/// Interrupts stay off throughout, so the thread neither waits for a tick
+/// that is stopped nor moves to another CPU and restarts that one's.
+#[cfg(feature = "ktest")]
+fn with_tick_stopped<T>(f: impl FnOnce() -> T) -> Result<T, &'static str> {
+    use crate::kassert_eq;
+    /// Restarts the tick when dropped.
+    struct TickStopped;
+    impl Drop for TickStopped {
+        fn drop(&mut self) {
+            apic::timer_periodic(TIMER_COUNT.load(Ordering::SeqCst));
+        }
+    }
+    let registers = || (apic::timer_registers(), apic::timer_divide_config());
+    let (before, out, after) = {
+        let _off = arch::irq::push_off();
+        let before = registers();
+        let out = {
+            let _tick = TickStopped;
+            f()
+        };
+        (before, out, registers())
+    };
+    kassert_eq!(after, before); // the tick restarted as it was
+    Ok(out)
+}
+
+crate::ktest!(
+    fn a_paused_timer_reading_is_not_steady() {
+        // Paused 1 ms inside a local APIC timer window's start (before or
+        // after the timer is started) or end (before or after its count is
+        // read): that end is 10% uncertain, so the window would be taken
+        // again. And the pause lands where the register access says. A
+        // window's rate is off by at most its start gap high and its end gap
+        // low. Paused while the timer counts (after the start, or before the
+        // read), the pause can't take the rate low: after the start the timer
+        // counts it but the TSC window doesn't (about 10% high); before the
+        // read both have it. Paused while it doesn't (before the start, or
+        // after the read, #129's stall: about 9% low), it can't take the rate
+        // high. Each check allows the other gap (a loaded host may stall
+        // there too) and 1% for the calibration. All four windows are taken
+        // with the tick stopped (`with_tick_stopped`).
+        use crate::kassert;
+        let tsc = tsc().ok_or("TSC not calibrated")?;
+        let timer_hz = lapic_timer().ok_or("timer not calibrated")?.hz();
+        let (window, ms) = (tsc.ticks(WINDOW_NS), tsc.ticks(1_000_000));
+        const AT: [Pause; 4] =
+            [Pause::StartBeforeRead, Pause::StartAfterRead, Pause::EndBeforeRead, Pause::EndAfterRead];
+        let windows = with_tick_stopped(|| AT.map(|at| timer_window(window, sleep_at(at, 1_000_000))))?;
+        // Parts per million of `w`'s TSC span.
+        let ppm = |ticks: u64, w: &Window| (u128::from(ticks) * 1_000_000 / u128::from(w.tsc.max(1))) as i64;
+        for (at, w) in AT.into_iter().zip(windows) {
+            let w = w.map_err(|e| {
+                crate::ktest::diag(format_args!("{e}"));
+                "no timer window"
+            })?;
+            let rate = w.reference_hz(tsc.hz()).unwrap_or(0);
+            let off_ppm = (rate as i64 - timer_hz as i64) * 1_000_000 / timer_hz as i64;
+            crate::ktest::diag(format_args!("paused at {at:?}: {w}, rate {rate} Hz ({off_ppm} ppm off)"));
+            kassert!(!w.is_steady());
+            let start = matches!(at, Pause::StartBeforeRead | Pause::StartAfterRead);
+            kassert!(if start { w.start_gap } else { w.end_gap } >= ms); // the pause is in it
+            let (high, low, paused) = (ppm(w.start_gap, &w) + 10_000, ppm(w.end_gap, &w) + 10_000, ppm(ms, &w));
+            if matches!(at, Pause::StartAfterRead | Pause::EndBeforeRead) {
+                kassert!(off_ppm >= paused - low && off_ppm <= high); // the timer counted the pause
+            } else {
+                kassert!(off_ppm >= -low && off_ppm <= high - paused); // it didn't
+            }
+        }
+        Ok(())
+    }
+);
+
+// Pinned: a_timer_calibration_waits_between_retakes measures the waits
+// against this, and loaded KVM's bursts of stalls are what it was chosen for.
+const _: () = assert!(TIMER_RETRY_SPACING_NS == 20_000_000);
+
+/// Made-up timer windows in `tsc`'s ticks, 10 ms each, at `hz`, with
+/// `end_gap_ns` of end gap (50 µs or less is steady).
+#[cfg(feature = "ktest")]
+fn made_up_timer_window(tsc: Clock, hz: u64, end_gap_ns: u64) -> Window {
+    Window { tsc: tsc.ticks(WINDOW_NS), reference: hz / 100, polls: 1, start_gap: 0, end_gap: tsc.ticks(end_gap_ns) }
+}
+
+crate::ktest!(
+    fn a_timer_calibration_waits_between_retakes() {
+        // Made-up windows in this TSC's ticks: the first three 10% low with
+        // a 1 ms end gap (unsteady; three can move a median of five), then
+        // steady ones. All three are taken again, each after a wait of
+        // 20 ms by the TSC (60 ms in all; a no-op wait would take
+        // microseconds), and the rate is the steady windows'.
+        use crate::{kassert, kassert_eq};
+        let tsc = tsc().ok_or("TSC not calibrated")?;
+        let steady = made_up_timer_window(tsc, 62_500_000, 10_000);
+        let stalled = made_up_timer_window(tsc, 56_250_000, 1_000_000);
+        let mut taken = 0;
+        let start = arch::rdtsc();
+        let cal = calibrate_timer_with(tsc, || {
+            taken += 1;
+            Ok(if taken <= 3 { stalled } else { steady })
+        })
+        .map_err(|_| "calibrating failed")?;
+        let waited = arch::rdtsc().wrapping_sub(start);
+        crate::ktest::diag(format_args!("{cal}; {} ns in all", tsc.ns(waited)));
+        kassert_eq!((cal.steady(), cal.retaken, taken), (WINDOWS, 3, 8));
+        kassert_eq!(Some(cal.hz), steady.reference_hz(tsc.hz()));
+        kassert!(waited >= tsc.ticks(60_000_000));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_timer_calibration_short_of_steady_windows_fills_in() {
+        // Made-up windows in this TSC's ticks, only windows 4, 11 and 17 of
+        // ATTEMPTS steady; the others 2% low with a 200 µs end gap (two of
+        // them) or 20% low with over 2 ms: no error (a timer is still
+        // started), the three steady ones first and the two 2% ones after,
+        // the rate a steady one's, and an INFO report (most are steady).
+        // 16 waits of 20 ms, about 320 ms.
+        use crate::{kassert, kassert_eq};
+        let tsc = tsc().ok_or("TSC not calibrated")?;
+        let steady = made_up_timer_window(tsc, 62_500_000, 10_000);
+        let near = made_up_timer_window(tsc, 61_250_000, 200_000);
+        let far = made_up_timer_window(tsc, 50_000_000, 2_100_000);
+        let mut taken = 0usize;
+        let cal = calibrate_timer_with(tsc, || {
+            taken += 1;
+            Ok(match taken {
+                4 | 11 | 17 => steady,
+                7 | 9 => near,
+                _ => far,
+            })
+        })
+        .map_err(|_| "calibrating failed")?;
+        crate::ktest::diag(format_args!("{cal}"));
+        kassert_eq!((taken, cal.steady(), cal.retaken), (ATTEMPTS, 3, ATTEMPTS - 3));
+        kassert_eq!(cal.windows, [steady, steady, steady, near, near]);
+        kassert_eq!(Some(cal.hz), steady.reference_hz(tsc.hz()));
+        kassert!(matches!(timer_report(&cal), TimerReport::Retook(_)));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn the_timer_calibration_report_fits_each_outcome() {
+        // What init logs, and at what level, for each outcome (made-up
+        // windows of 10,000,000 ticks; 50,000 ticks of gaps or less is
+        // steady): every window steady at once, nothing; some retaken but 3
+        // of 5 steady, INFO; 2 steady, WARN with the bound, the third
+        // smallest gap share (20,001 ppm, so "2.1%" shows it rounded up);
+        // the middle windows' gaps as long as themselves, a panic (no
+        // level), saying so.
+        use crate::{kassert, kassert_eq};
+        let w = |end_gap: u64| Window { tsc: 10_000_000, reference: 625_000, polls: 1, start_gap: 0, end_gap };
+        let cal = |gaps: [u64; WINDOWS], retaken| Calibration {
+            hz: 62_500_000,
+            windows: gaps.map(w),
+            retaken,
+            last_retaken: Some(w(60_000)),
+        };
+        let level = |c: &Calibration| timer_report(c).level();
+        let text = |c: &Calibration| alloc::format!("{}", timer_report(c));
+        let clean = cal([1_000, 2_000, 3_000, 4_000, 5_000], 0);
+        kassert!(matches!(timer_report(&clean), TimerReport::Clean));
+        kassert_eq!(level(&clean), None);
+        let retook = cal([1_000, 2_000, 3_000, 200_000, 300_000], 17);
+        kassert_eq!((retook.steady(), level(&retook)), (3, Some(log::Level::Info)));
+        kassert!(text(&retook).starts_with("local APIC timer calibration took 17 windows again, 3 of 5 kept steady"));
+        let imprecise = cal([1_000, 2_000, 200_010, 300_000, 2_000_000], 18);
+        kassert_eq!((imprecise.steady(), imprecise.median_bound_ppm()), (2, 20_001));
+        kassert!(matches!(timer_report(&imprecise), TimerReport::Imprecise(_, 20_001)));
+        kassert_eq!(level(&imprecise), Some(log::Level::Warn));
+        let warning = text(&imprecise);
+        crate::ktest::diag(format_args!("{warning}"));
+        kassert!(warning.starts_with(
+            "local APIC timer calibration: only 2 of 20 windows read promptly (5 wanted; a stall next to the timer's \
+             register accesses), so its rate may be off by up to 2.1% ("
+        ));
+        let unusable = cal([1_000, 2_000, 10_000_000, 10_000_000, 20_000_000], 18);
+        kassert!(matches!(timer_report(&unusable), TimerReport::Unusable(_)));
+        kassert_eq!(level(&unusable), None);
+        kassert!(text(&unusable).starts_with("can't calibrate the local APIC timer against the TSC: only 2 of 20"));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn the_boot_timer_calibration_is_the_median_of_mostly_steady_windows() {
+        // Expected, not guaranteed: most of the boot's windows were read
+        // promptly at both ends, so the median lies between theirs (#129's
+        // 8.5% off one must have had at least 3 of 5 stalled), and the timer
+        // runs at it. A boot that had to fill in with unsteady windows (and
+        // warned) fails this on purpose: its rate may be off.
+        use crate::{kassert, kassert_eq};
+        let cal = boot_timer_calibration().ok_or("no timer calibration")?;
+        let tsc_hz = tsc().ok_or("TSC not calibrated")?.hz();
+        // Its windows (tsc/timer/polls/start_gap/end_gap) and each one's
+        // rate, so a calibration that was off shows which windows moved it.
+        let mut rates = cal.windows.map(|w| w.reference_hz(tsc_hz).unwrap_or(0));
+        crate::ktest::diag(format_args!(
+            "timer boot calibration {cal}, {} steady, median within {} ppm; window rates {rates:?} Hz",
+            cal.steady(),
+            cal.median_bound_ppm()
+        ));
+        // The steady ones first.
+        kassert_eq!(cal.windows.iter().take_while(|w| w.is_steady()).count(), cal.steady());
+        kassert!(cal.median_is_steady());
+        kassert_eq!(lumen_time::median(&mut rates), Some(cal.hz));
+        kassert_eq!(lapic_timer().map(|c| c.hz()), Some(cal.hz));
+        Ok(())
+    }
+);
+
 crate::ktest!(
     fn now_ns_follows_the_hpet() {
         // `now_ns` is the TSC converted; across a 50 ms spin it moves as
@@ -1054,11 +1456,16 @@ crate::ktest!(
 /// disagree.
 #[cfg(feature = "ktest")]
 const PAUSE_SLACK_NS: u64 = 10_000;
-/// The longest stretch the timer ktests trust the local APIC timer's count
-/// over: under its 1 ms reload period, with room, since the count can't
-/// tell how many reloads passed.
+/// The longest stretch `a_timer_reading_is_placed_at_its_brackets_midpoint`
+/// trusts the periodic local APIC timer's count over: under its 1 ms reload
+/// period, with room, since the count can't tell how many reloads passed.
+/// (`the_timer_is_programmed_for_1_khz` measures one-shot, without reloads.)
 #[cfg(feature = "ktest")]
 const TIMER_WINDOW_MAX_NS: u64 = 950_000;
+/// How long each of `the_timer_is_programmed_for_1_khz`'s one-shot windows
+/// is, by the HPET.
+#[cfg(feature = "ktest")]
+const TIMER_ONE_SHOT_WINDOW_NS: u64 = 20_000_000;
 
 crate::ktest!(
     fn an_hpet_reading_is_placed_at_its_brackets_midpoint() {
@@ -1261,9 +1668,9 @@ crate::ktest!(
 crate::ktest!(
     fn the_timer_is_programmed_for_1_khz() {
         // Periodic and unmasked on the timer vector, reloading every 1 ms of
-        // its calibrated input; and counting at that rate by the HPET. This
-        // checks the rate without counting interrupts (an emulator delivers
-        // them late).
+        // its calibrated input; and its input counting at that rate by the
+        // HPET. This checks the rate without counting interrupts (an
+        // emulator delivers them late).
         use crate::{kassert, kassert_eq};
         kassert_eq!(TICK_HZ, 1000);
         let (lvt, error_lvt, initial) = apic::timer_registers();
@@ -1271,79 +1678,96 @@ crate::ktest!(
         kassert_eq!(error_lvt & 0x1_00ff, u32::from(idt::LAPIC_ERROR)); // unmasked
         let timer = lapic_timer().ok_or("timer not calibrated")?;
         kassert_eq!(Some(initial), lumen_time::periodic_count(timer.hz(), 1000));
+        // Divided by 16, as calibrated: the rate measured below is the
+        // timer's input after the divider the periodic setup left.
+        kassert_eq!(apic::timer_divide_config(), apic::DIVIDE_BY_16);
         let hpet = hpet().ok_or("no HPET")?;
-        // 750 µs windows (most cross a reload, so that path counts), under
-        // the 1 ms period. A window over TIMER_WINDOW_MAX_NS, midpoint to
-        // midpoint, could hide a whole reload, so it is taken again; one a
-        // stall inside a bracket stretched past that by less than half the
-        // bracket is kept, and could still hide a reload: the median of 7 is
-        // left to absorb it. Each end is a timer reading between two HPET
-        // reads, placed at their midpoint (#117), and the brackets' widths
-        // are reported, so a stall between the two clocks' reads shows.
-        // Placed at midpoints, a window is off by at most half its two
-        // brackets' widths added up. They aren't a reason to take a window
-        // again: a bracket holds one HPET read, about 13 to 18 µs under KVM
-        // (19 to 35 µs on a loaded host, PR #121), so two can come to over
-        // the 37.5 µs (5% of 750 µs) the rate is allowed, though only half of
-        // that counts; the median absorbs a stalled window. How many kept
-        // windows' brackets added up to more than 5% of them is reported. A
-        // window over which the timer didn't count fails the test: it isn't
-        // counting (or isn't periodic).
-        const WINDOWS: usize = 20;
-        let (window_ticks, too_long_ticks) = (hpet.clock().ticks(750_000), hpet.clock().ticks(TIMER_WINDOW_MAX_NS));
-        let mut samples_hz = [0u64; 7];
-        let (mut taken, mut long, mut wide) = (0, 0, 0);
-        // Every bracket's width, in HPET ticks (two per window).
-        let mut widths_ticks = [0u64; 2 * WINDOWS];
-        let mut bracketed = 0;
-        for _ in 0..WINDOWS {
-            let _off = arch::irq::push_off();
-            let start = timer_between_hpet(&hpet, || {});
-            while hpet.since(start.at, hpet.now()) < window_ticks {
-                core::hint::spin_loop();
+        let tsc = tsc().ok_or("TSC not calibrated")?;
+        // The rate, by the HPET, measured in one-shot mode (#129): the timer
+        // masked and started from u32::MAX, which at 62.5 MHz runs 68 s before
+        // it would reach 0, so a count over any window is exact. Periodic, it
+        // reloads every 1 ms and a count says nothing about how many reloads
+        // passed; the old 750 µs windows each had to stay under the period,
+        // and a loaded KVM runner's HPET reads (0.5 ms and more in bursts)
+        // stretched most past it, or ate the 5% budget (37.5 µs) with two
+        // brackets. Overcommitted KVM pauses the vCPU for longer than a
+        // period often enough that no polling can count across reloads
+        // either. Switching to one-shot writes only the LVT, so this is the
+        // input the periodic count divides: the divider is read again at
+        // the end of the measurement, before the tick is restarted (which
+        // writes it). 7 windows of 20 ms by the HPET, each end a timer
+        // reading between two HPET reads, placed at their midpoint (#117):
+        // two 35 µs brackets put a window off by at most 35 µs (half of
+        // each), 0.175% of it, and one a burst of wide brackets throws off is
+        // a sample the median absorbs. How many windows' brackets added up
+        // to over 5% of them is reported, with the widths and every sample.
+        // It runs with the tick stopped (`with_tick_stopped`, which checks
+        // the timer's registers read as before afterwards). A window over
+        // which the timer counted nothing (or up), or over which the HPET
+        // didn't reach 20 ms within 1 s by the TSC, fails the test there.
+        const ONE_SHOT_WINDOWS: usize = 7;
+        let window_ticks = hpet.clock().ticks(TIMER_ONE_SHOT_WINDOW_NS);
+        let hpet_bound = tsc.ticks(lumen_time::NS_PER_SEC);
+        let mut samples_hz = [0u64; ONE_SHOT_WINDOWS];
+        let mut widths_ticks = [0u64; 2 * ONE_SHOT_WINDOWS];
+        let mut wide = 0;
+        let during = with_tick_stopped(|| {
+            apic::timer_mask_one_shot();
+            apic::timer_start(u32::MAX);
+            for i in 0..ONE_SHOT_WINDOWS {
+                let start = timer_between_hpet(&hpet, || {});
+                let waiting = arch::rdtsc();
+                while hpet.since(start.at, hpet.now()) < window_ticks {
+                    if arch::rdtsc().wrapping_sub(waiting) > hpet_bound {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                let end = timer_between_hpet(&hpet, || {});
+                (widths_ticks[2 * i], widths_ticks[2 * i + 1]) = (start.width, end.width);
+                let elapsed_ticks = hpet.since(start.at, end.at);
+                let so_far = |what: fmt::Arguments<'_>| {
+                    crate::ktest::diag(format_args!(
+                        "window {i}: {what}; bracket widths so far {:?} HPET ticks, samples so far {:?} Hz",
+                        &widths_ticks[..2 * i + 2],
+                        &samples_hz[..i]
+                    ))
+                };
+                if elapsed_ticks < window_ticks {
+                    so_far(format_args!(
+                        "the HPET counted {elapsed_ticks} of {window_ticks} ticks within 1 s by the TSC"
+                    ));
+                    return Err("the HPET stalled in a one-shot window");
+                }
+                if start.width.saturating_add(end.width).saturating_mul(20) > elapsed_ticks {
+                    wide += 1;
+                }
+                let counted = start.value.saturating_sub(end.value);
+                if counted == 0 {
+                    so_far(format_args!(
+                        "the timer counted nothing over {elapsed_ticks} HPET ticks (it read {}, then {})",
+                        start.value, end.value
+                    ));
+                    return Err("the timer didn't count over a window");
+                }
+                samples_hz[i] =
+                    lumen_time::frequency(u64::from(counted), elapsed_ticks, hpet.clock().hz()).unwrap_or(0);
             }
-            let end = timer_between_hpet(&hpet, || {});
-            widths_ticks[bracketed] = start.width;
-            widths_ticks[bracketed + 1] = end.width;
-            bracketed += 2;
-            let elapsed_ticks = hpet.since(start.at, end.at);
-            if elapsed_ticks >= too_long_ticks {
-                long += 1;
-                continue;
-            }
-            if start.width.saturating_add(end.width).saturating_mul(20) > elapsed_ticks {
-                wide += 1;
-            }
-            let counted = lumen_time::down_counter_delta(start.value, end.value, initial);
-            if counted == 0 {
-                crate::ktest::diag(format_args!(
-                    "the timer counted nothing over {elapsed_ticks} HPET ticks (it read {} at both ends); bracket \
-                     widths so far {:?} HPET ticks, samples so far {:?} Hz",
-                    start.value,
-                    &widths_ticks[..bracketed],
-                    &samples_hz[..taken],
-                ));
-                return Err("the timer didn't count over a window");
-            }
-            samples_hz[taken] =
-                lumen_time::frequency(u64::from(counted), elapsed_ticks, hpet.clock().hz()).unwrap_or(0);
-            taken += 1;
-            if taken == samples_hz.len() {
-                break;
-            }
-        }
-        let widths_ticks = &mut widths_ticks[..bracketed];
-        let median_ticks = lumen_time::median(widths_ticks).unwrap_or(0); // sorts them
+            Ok(apic::timer_divide_config())
+        })??;
+        // The divider as the measurement left it: not rewritten.
+        kassert_eq!(during, apic::DIVIDE_BY_16);
+        let median_ticks = lumen_time::median(&mut widths_ticks).unwrap_or(0); // sorts them
         let ns = |ticks: u64| hpet.clock().ns(ticks);
         crate::ktest::diag(format_args!(
-            "bracket widths min/median/max {}/{}/{} ns over {bracketed} brackets; windows taken again: {long} \
-             too long; {wide} kept with brackets over 5% of them",
-            ns(widths_ticks.first().copied().unwrap_or(0)),
+            "bracket widths min/median/max {}/{}/{} ns over {} brackets; {wide} of {ONE_SHOT_WINDOWS} one-shot windows \
+             with brackets over 5% of them",
+            ns(widths_ticks[0]),
             ns(median_ticks),
-            ns(widths_ticks.last().copied().unwrap_or(0)),
+            ns(widths_ticks[2 * ONE_SHOT_WINDOWS - 1]),
+            2 * ONE_SHOT_WINDOWS,
         ));
-        crate::ktest::diag(format_args!("samples {:?} Hz", &samples_hz[..taken]));
-        kassert_eq!(taken, samples_hz.len());
+        crate::ktest::diag(format_args!("samples {samples_hz:?} Hz"));
         let rate = lumen_time::median(&mut samples_hz).ok_or("no samples")?;
         crate::ktest::diag(format_args!("timer counts at {} (calibrated {})", Hz(rate), Hz(timer.hz())));
         kassert!(rate.abs_diff(timer.hz()) * 20 <= timer.hz());
@@ -1432,8 +1856,8 @@ crate::ktest!(
 crate::ktest!(
     fn the_timer_ticks_on_its_vector() {
         // Interrupts arrive on the timer's vector, and not much faster than
-        // 1 kHz (100 in 100 ms; the bound, 150, leaves room). The rate itself
-        // is checked by `the_timer_is_programmed_for_1_khz` (against the
+        // 1 kHz (100 in 100 ms; the bound, 150, leaves room). The timer's
+        // input rate is checked by `the_timer_is_programmed_for_1_khz` (against the
         // HPET): QEMU's TCG delivers ticks late (late periodic timers skip
         // periods): 29 to 81 in #45's stress runs (busy-waiting then; the
         // sleep now halts in the idle thread), and a lock held across a

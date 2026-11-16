@@ -796,9 +796,16 @@ allocates.
   five; boot logs how many if any, and the last. A PIT read-back that
   can't fit how it was programmed is an error. The local APIC timer (divide
   by 16) is calibrated against the TSC as the median of five 10 ms windows
-  too (no retakes: each end reads the timer's count next to the TSC, so a
-  late look doesn't stretch it, but a pause between those two reads isn't
-  detected), and set periodic at 1 kHz. `time::now_ns` (TSC-based, lock-free) and
+  too, each end a register access between two TSC reads (the timer started
+  by one write, its count read), so a window whose ends were paused (gaps
+  over 0.5% of it) is taken again, 20 ms later (stalls come in bursts), up
+  to 20 windows in all (#129). If those run out, the least unsteady fill in
+  rather than panicking the boot: with three or more of the five steady the
+  median lies between theirs (logged at INFO); otherwise boot warns how far
+  off it may be (the third smallest gap share), and panics only if that is
+  100% or more (the rate says nothing). The timer paces preemption, when
+  deadlines are noticed, the cursor's blink and the `ticks` counts; sleeps
+  and deadlines themselves are TSC times. It is then set periodic at 1 kHz. `time::now_ns` (TSC-based, lock-free) and
   `time::sleep` (blocks the thread once the scheduler runs on its CPU,
   section "Kernel threads"; busy-waits before that, on an idle thread, with
   interrupts off or a lock held), `time::spin` (always busy). The boot CPU
@@ -1441,7 +1448,15 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
     row: position,
     buttons held, presses so far (summed), wheels, the pointer (`drawn`,
     `hidden` under a canvas, `none` without a terminal), `stale`, and why
-    it failed; `no tablet` and a row of dashes without one.
+    it failed; `no tablet` and a row of dashes without one. `mouse hold`
+    stops the `mouse` thread reading the tablet until `mouse release`: it
+    returns once the thread has parked (the header ends `, held`, or
+    `, holding` until then), and fails with no tablet, a failed one (also
+    one failing while it waits), the request taken back first (a release,
+    or another console's hold timing out), or no park within
+    `HOLD_WAIT_NS` (1 s, a bug, logged). Events wait in the device's ring and frames that don't
+    fit are dropped, an overrun made on purpose (#142). The hold is every
+    console's (`mouse hold | ...` holds too), and both are logged at INFO.
   - `dmesg`: the newest whole log lines as serial printed them: the logger
     keeps the last 16 KiB in a `lumen_trace::TextRing` (host-tested
     against a model; not lock-free: `klog`'s `RING` lock, a leaf, taken
@@ -1494,7 +1509,8 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   `irqs`, `threads`, `lspci` and `mouse` print the same tables alone (under their header line), so the
   text of `cpus` and `irqs` is what it was (tested column by column; one
   difference: a value wider than its column, `stalled`, now widens it for
-  every row). They take no arguments (`usage: cpus`). Any other command
+  every row). Given arguments they run as commands: `usage: cpus`, or
+  what the arguments ask for (`mouse hold`, `mouse release`). Any other command
   runs as alone on a plain console (no escape codes), writing into a
   buffer of 64 KiB reserved before it runs (writing never allocates) whose
   lines go on. Its keys still come from the console, until it writes more
@@ -2142,7 +2158,8 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
   Where the caller can't block (a lock held, interrupts off) it spins. The
   tablet's thread waits up to 1 s at a time, then looks at the status
   anyway (a device gone, reading all ones, sends nothing), and looks again
-  at once after a batch of half the ring or more. No lock is held across such a wait (`SpinLock`
+  at once after a batch of half the ring or more (held by `mouse hold`,
+  it waits only for `mouse release`, and looks at nothing). No lock is held across such a wait (`SpinLock`
   keeps interrupts off, and a thread can't sleep under it): a device that
   is waited on this long has one owner thread, the only code touching it
   (the tablet's `mouse` thread, the `sound` thread), and the rest of the
@@ -2454,18 +2471,26 @@ ever seen.
   marks the state stale until a clean batch brings a frame. What that
   count guarantees, and its preconditions, are stated once, in
   `lumen_input::may_have_lost_frames`'s doc, and a host model checks them
-  (#124). Scenarios send 300 moves, and 7-event frames until QEMU traces
-  the first drop (at most 300), unpaced while the guest's CPU is busy, and
-  check that frames were lost (as many as QEMU traced), that an overrun
-  was counted, and the overrun warning; the 7-event frames tell the
-  device's bound from moves' 3.
+  (#124). A scenario per frame size (moves, and 7-event frames) holds
+  the `mouse` thread (`mouse hold`), sends frames until 5 past the ring's
+  room, and releases it: QEMU dropped each frame past the room (traced at
+  its send), the thread read exactly the frames that fit in one batch,
+  one overrun was counted, and the warning names that batch and the hold;
+  a second held overflow is counted but not warned about. The warning is
+  said once per boot, so a held overflow uses it up (a later real overrun
+  is only counted). The 7-event frames tell the device's bound from
+  moves' 3. (Before #142 the scenario waited for a busy guest to fall
+  behind: the `mouse` thread got the CPU back once per 10 ms slice, and on
+  KVM runners QMP's roughly 0.7 to 3 ms per frame sometimes didn't
+  outpace it, so the ring never filled.)
 - **Keys:** the keyboard's decoded keys (`lumen_shell::Key`, through
   `crate::vt`'s per-terminal rings today). That is a line editor's key
   (characters and editing keys, no key-up, no modifiers on their own),
   not a desktop's key event: M4 adds one (key code, press/release,
   modifiers) for the desktop.
 - **Delivery:** the device's owner thread reads a batch of events each
-  time its interrupt wakes it (or its 1 s status look) and publishes the newest state with the batch's counts (`mouse::
+  time its interrupt wakes it (or its 1 s status look; not while held)
+  and publishes the newest state with the batch's counts (`mouse::
   status`: one snapshot under one lock), overwriting the last; keys are
   taken in order from their ring. In M3 the tablet's state has two
   readers (the cursor and `mouse`) and the keys one consumer (the shown

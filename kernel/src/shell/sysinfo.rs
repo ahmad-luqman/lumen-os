@@ -398,15 +398,29 @@ fn pci_table() -> pipe::Table {
     t
 }
 
-/// `mouse`: the tablet (#98), where it points and what is held: a header
-/// naming the device (or saying there is none) and its row.
+/// `mouse`: the tablet (#98), where it points and the buttons pressed: a header
+/// naming the device (or saying there is none) and its row. `mouse hold`
+/// stops its thread reading it until `mouse release` (`mouse::hold`: the
+/// hold is every console's; releasing a tablet that isn't held just says
+/// `released`).
 pub fn mouse(ctx: &mut Ctx<'_>, args: &[String]) {
-    if extra_args(ctx, "mouse", args) {
-        return;
+    match args {
+        [] => {}
+        [a] if a == "hold" => {
+            return match crate::mouse::hold() {
+                Ok(()) => emit(ctx, "mouse: held: reading nothing until `mouse release`\n"),
+                Err(e) => ctx.fail(format_args!("mouse: can't hold: {e}")),
+            };
+        }
+        [a] if a == "release" => {
+            crate::mouse::release();
+            return emit(ctx, "mouse: released\n");
+        }
+        _ => return ctx.fail("usage: mouse [hold|release]"),
     }
     // One snapshot for the header and the row.
     let bound = crate::mouse::status();
-    let mut t = mouse_header(bound.as_ref());
+    let mut t = mouse_header(bound.as_ref(), crate::mouse::reads());
     t.push('\n');
     mouse_table_of(bound.as_ref()).render(&mut t);
     emit(ctx, &t);
@@ -414,15 +428,22 @@ pub fn mouse(ctx: &mut Ctx<'_>, args: &[String]) {
 
 /// `mouse`'s header line: the device, the screen and the counts (whole
 /// frames are the state's `seq`; overruns the batches that may have lost
-/// frames), and why it failed; or that there is no tablet.
-fn mouse_header(bound: Option<&crate::mouse::Bound>) -> String {
+/// frames), whether its reads are held (`mouse hold`: `, held`, or
+/// `, holding` until the thread parks) and why it failed; or
+/// that there is no tablet.
+fn mouse_header(bound: Option<&crate::mouse::Bound>, reads: crate::mouse::Reads) -> String {
     let Some(b) = bound else { return String::from("mouse: no tablet (QEMU: -device virtio-tablet-pci)") };
     let (d, c) = (&b.device, &b.counts);
     let frames = b.state.map_or(0, |s| s.seq);
+    let held = match reads {
+        crate::mouse::Reads::Running => "",
+        crate::mouse::Reads::HoldAsked => ", holding",
+        crate::mouse::Reads::Held => ", held",
+    };
     let failed = b.failed.map_or(String::new(), |why| alloc::format!(", failed: {why}"));
     alloc::format!(
         "mouse: \"{}\" on {}, screen {}x{}, {} events in {frames} frames ({} ignored, {} dropped, {} \
-         overruns){failed}",
+         overruns){held}{failed}",
         d.name,
         d.addr,
         d.screen.0,
@@ -777,7 +798,7 @@ crate::ktest!(
             failed: Some(Failure::Failed),
         };
         kassert_eq!(
-            mouse_header(Some(&bound)),
+            mouse_header(Some(&bound), crate::mouse::Reads::Running),
             "mouse: \"ktest tablet\" on 0000:00:03.0, screen 1280x800, 9 events in 7 frames (1 ignored, 2 dropped, \
              3 overruns), failed: FAILED"
         );
@@ -789,7 +810,20 @@ crate::ktest!(
         kassert_eq!(row[8], text("yes"));
         kassert_eq!(row[9], text("FAILED"));
         // Without a tablet: one row of dashes.
-        kassert_eq!(mouse_header(None), "mouse: no tablet (QEMU: -device virtio-tablet-pci)");
+        // The hold shows at the end, before why it failed: held, or holding
+        // until the thread parks; nothing while it reads.
+        use crate::mouse::Reads;
+        let counts = "9 events in 7 frames (1 ignored, 2 dropped, 3 overruns)";
+        for (reads, suffix) in [(Reads::Running, ""), (Reads::HoldAsked, ", holding"), (Reads::Held, ", held")] {
+            let header = mouse_header(Some(&bound), reads);
+            kassert_eq!(
+                header,
+                alloc::format!(
+                    "mouse: \"ktest tablet\" on 0000:00:03.0, screen 1280x800, {counts}{suffix}, failed: FAILED"
+                )
+            );
+        }
+        kassert_eq!(mouse_header(None, Reads::Held), "mouse: no tablet (QEMU: -device virtio-tablet-pci)");
         kassert_eq!(mouse_table_of(None).rows()[0][9], DASH);
         Ok(())
     }
