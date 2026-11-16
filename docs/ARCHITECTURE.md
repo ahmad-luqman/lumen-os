@@ -137,7 +137,10 @@ tests (for example `lumen-elf`, the symbol-table reader).
    only while neither holds a byte (`lumen_uart::read_next` and
    `available`, host-tested against a model of that worst case). The
    block has a 100 ms deadline as a safety net: input whose interrupt
-   never wakes the shell is still read, every 100 ms, and three waits in a
+   never wakes the shell is still read, within 200 ms (input found at the
+   deadline in the UART only, nothing queued, gets one more period for a
+   late interrupt to queue it: under load QEMU's character timeout was
+   measured arriving 1.6 ms after such a deadline), and three waits in a
    row that find input at their deadline (no interrupt bringing input
    between) warn once to check IRQ 4's routing. `serial` counts how the
    waits ended (woken by the interrupt, or input found at the deadline);

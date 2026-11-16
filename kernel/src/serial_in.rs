@@ -27,11 +27,14 @@
 //!   case).
 //! - **Safety net:** the wait has a deadline ([`WAIT_NS`]), so input whose
 //!   interrupt doesn't wake the shell (the UART's interrupt not reaching
-//!   IRQ 4, or a handler that doesn't wake it) is still read, every 100 ms.
-//!   Each wait's end is counted (`serial` shows them): woken by the
-//!   handler, or input found at the deadline. Three of the latter in a row,
-//!   with no interrupt bringing input between, warn once
-//!   (`lumen_uart::MissedInterrupts`).
+//!   IRQ 4, or a handler that doesn't wake it) is still read, within 200
+//!   ms: input found at the deadline in the UART only, nothing queued, gets
+//!   one more period for a late interrupt to queue it (a race measured
+//!   under load: QEMU's character timeout 1.6 ms after the deadline). Each
+//!   wait's end is counted (`serial` shows them): woken by the handler, or
+//!   input found at the deadline (and, if only in the UART, still there a
+//!   period later). Three of the latter in a row, with no interrupt
+//!   bringing input between, warn once (`lumen_uart::MissedInterrupts`).
 //! - **How it waits** (`lumen_uart::wait_mode`): with the interrupt, block
 //!   with the deadline; without a UART, block for good; either only where
 //!   the thread can block (not before the boot CPU's scheduler runs);
@@ -190,14 +193,23 @@ fn wait_with_deadline() {
     let woken = READER_WOKEN.load(Ordering::Relaxed);
     let deadline = crate::time::now_ns() + WAIT_NS;
     let found = WAITING.wait_until_or_deadline(deadline, available);
+    if found && READER_WOKEN.load(Ordering::Relaxed) == woken && QUEUE.is_empty() {
+        // Input in the UART only, at the deadline, and its interrupt not
+        // taken: it may be on its way (on a loaded TCG host QEMU's
+        // character timeout was measured arriving 1.6 ms after such a
+        // deadline). One more period for the handler to queue it; if it
+        // doesn't, the input waited a whole period without its interrupt.
+        let grace = crate::time::now_ns() + WAIT_NS;
+        let _ = WAITING.wait_until_or_deadline(grace, || !QUEUE.is_empty());
+    }
     let end = if READER_WOKEN.load(Ordering::Relaxed) != woken {
         // The handler's wake readied this thread (even if it ran only after
         // the deadline).
         WOKEN.fetch_add(1, Ordering::Relaxed);
         WaitEnd::Interrupt
     } else if found && crate::time::now_ns() >= deadline {
-        // The deadline readied it, and input was waiting: no interrupt
-        // woke it for that input (none came, or one came and didn't wake).
+        // A deadline readied it, and input was waiting: no interrupt woke
+        // it for that input (none came, or one came and didn't wake).
         AT_DEADLINE.fetch_add(1, Ordering::Relaxed);
         WaitEnd::InputAtDeadline
     } else {
@@ -209,7 +221,7 @@ fn wait_with_deadline() {
     if MISSED.lock().note(end) {
         warn!(
             target: "serial",
-            "COM1 input found without its interrupt {} times in a row; check IRQ {COM1_IRQ}'s routing (GSI {}, vector {:#04x}): input is read every 100 ms instead",
+            "COM1 input found without its interrupt {} times in a row; check IRQ {COM1_IRQ}'s routing (GSI {}, vector {:#04x}): input is read late (within 200 ms) instead",
             MissedInterrupts::THRESHOLD,
             GSI.load(Ordering::Relaxed),
             VECTOR.load(Ordering::Relaxed)
