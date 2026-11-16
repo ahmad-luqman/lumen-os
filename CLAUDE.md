@@ -211,7 +211,9 @@ own PR that updates that doc first.
   and `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free).
 - `crates/lumen-time`: timekeeping arithmetic: calibration, tick/ns
   conversion, timer counts, log time formats (`Stamp`, `Millis`),
-  percentages and rates, the RTC's registers as a date (`rtc`), and
+  percentages and rates, one clock's reading placed between two reads of
+  another and retaken while too wide (`Bracketed`, `first_narrow`: the
+  ktests' clock cross-checks), the RTC's registers as a date (`rtc`), and
   Limine's boot times against the timeline's origin (`handoff`: the
   `before kmain` line and its check, none a time bound) (host-tested).
 - `crates/lumen-rand`: ChaCha20's block function (RFC 8439 vectors), the

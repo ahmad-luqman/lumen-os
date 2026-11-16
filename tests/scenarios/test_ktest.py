@@ -3,6 +3,7 @@
 import re
 
 from lumen_harness import save_ktest_tap, tap
+from lumen_harness.clock_diags import check_clock_diags
 from lumen_harness.qemu import EXIT_CRASH, EXIT_SUCCESS, Devices
 
 
@@ -130,3 +131,6 @@ def test_in_kernel_tests_pass(boot):
     assert re.search(r"^# trace: \d+ TSC ticks per event", out, re.MULTILINE), (
         "no trace cost diagnostic"
     )
+    # #117: the clock cross-checks report their brackets, retries and
+    # placement tries on passing runs too, where nobody reads the TAP.
+    check_clock_diags(report, out)
