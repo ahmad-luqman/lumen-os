@@ -29,7 +29,7 @@ tests = [
 ]
 
 [[feature]]
-name = "virtio-sound driver: binds QEMU's sound device (`lspci` shows `sound: bound`) and picks its first output stream's format (signed 16-bit, stereo else mono, 44.1 kHz else 48 kHz else a lower then a higher rate), refusing a stream without 16-bit samples, without 1 or 2 channels or without a rate it plays, saying which (`unusable device: its first output stream lacks ...`); `sound` shows the device, its format and its record (state, sounds played and replaced, frames, underruns, volume), which `where` filters in a pipeline; a second sound device is declined (`no driver (sound declined it)`: the player is one), and a beep still plays on the first. With a made-up device (ktest): a failed device refuses sounds with its reason (also in `sound`'s state); a thread playing with no answer for 5 s is given up for good (`stuck in a control request`, or the status when it shows DEVICE_NEEDS_RESET); a device whose status shows it broken while idle refuses the next sound at once; a failure counts what the sound played and fails the sound waiting; a sound waiting is dropped by a newer one (counted as replaced) or kept from starting by `stop`; a source at another rate is refused; periods returned in under half a sound's length (1 s or more) are caught"
+name = "virtio-sound driver: binds QEMU's sound device (`lspci` shows `sound: bound`) and picks its first output stream's format (signed 16-bit, stereo else mono, 44.1 kHz else 48 kHz else a lower then a higher rate), refusing a stream without 16-bit samples, without 1 or 2 channels or without a rate it plays, saying which (`unusable device: its first output stream lacks ...`); `sound` shows the device, its format and its record (state, sounds played and replaced, frames, underruns, volume), which `where` filters in a pipeline; a second sound device is declined (`no driver (sound declined it)`: the player is one), and a beep still plays on the first. With a made-up device (ktest): a failed device refuses sounds with its reason (also in `sound`'s state); a thread playing with no answer for over 5 s is given up for good by the next look (`stuck in a control request`, or the status when it shows DEVICE_NEEDS_RESET); a device whose status shows it broken while idle refuses the next sound at once; a failure counts what the sound played and fails the sound waiting; a sound waiting when the device is given up fails with the reason, whether the idle device shows itself broken (given up by `play`, `sound` or `format`) or the thread is stuck, and afterwards `play` is refused without leaving a sound waiting; a look at exactly 5 s isn't stuck yet; the stuck reason stays when the thread later fails with another, which is warned about (and not when it fails with the same); the thread settles a sound found waiting on a given-up player (a hand-built state no give-up leaves), logging an error only then; a `Settle` dropped unsettled (also under the player's lock, or with a refusal dropped there) settles its sound lost (not failed), logging an error naming it, without overwriting a settled outcome; a sound waiting is dropped by a newer one (counted as replaced) or kept from starting by `stop`; a source at another rate is refused; periods returned in under half a sound's length (1 s or more) are caught"
 milestone = "M3"
 tests = [
     "scenario:test_sound::test_lspci_shows_sound_bound",
@@ -37,6 +37,11 @@ tests = [
     "ktest:lumen_kernel::sound::formats_are_chosen_from_what_the_stream_supports",
     "ktest:lumen_kernel::sound::the_record_fits_its_columns",
     "ktest:lumen_kernel::sound::a_failed_or_stuck_device_refuses_sounds",
+    "ktest:lumen_kernel::sound::an_idle_device_given_up_settles_the_sound_waiting",
+    "ktest:lumen_kernel::sound::a_stuck_thread_given_up_settles_the_sound_waiting_behind_it",
+    "ktest:lumen_kernel::sound::the_thread_settles_a_sound_left_waiting_on_a_given_up_player",
+    "ktest:lumen_kernel::sound::a_settle_dropped_unsettled_loses_its_sound",
+    "ktest:lumen_kernel::sound::a_waiting_sound_dropped_under_the_players_lock_is_lost",
     "ktest:lumen_kernel::sound::the_pace_check_catches_periods_returned_unplayed",
 ]
 
