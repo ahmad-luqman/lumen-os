@@ -16,7 +16,7 @@ TIMER = (
     "# timer counts at 62.5 MHz (calibrated 62.5 MHz)\n"
 )
 HPET_PLACEMENT = (
-    "# injected pause: HPET placement 5000 ns off (at most 2500000 ns allowed) on try {tries} "
+    "# injected pause: HPET placement {off} ns off (at most 2500000 ns allowed) on try {tries} "
     "of 8; paused brackets [10048000] ns, the reference's 30000 ns\n"
 )
 TIMER_PLACEMENT = (
@@ -35,13 +35,14 @@ def run(
     timer_max=39000,
     placement_tries=1,
     injected_retries=2,
+    hpet_off=5000,
 ):
     now_ns = NOW_NS.format(start=start, end=end, retries=retries, limit=limit)
     cases = [
         (now_ns_case, now_ns + (now_ns if extra_line else "")),
         (
             "an_hpet_reading_is_placed_at_its_brackets_midpoint",
-            HPET_PLACEMENT.format(tries=placement_tries),
+            HPET_PLACEMENT.format(tries=placement_tries, off=hpet_off),
         ),
         (
             "a_stalled_hpet_bracket_is_read_again",
@@ -117,7 +118,7 @@ def test_timer_brackets_without_width_fail():
         check_clock_diags(*run(timer_max=0))
 
 
-def test_too_many_placement_tries_fail():
-    check_clock_diags(*run(placement_tries=4))
-    with pytest.raises(AssertionError, match="over 4 tries"):
-        check_clock_diags(*run(placement_tries=5))
+def test_a_placement_too_far_off_fails():
+    check_clock_diags(*run(placement_tries=8))
+    with pytest.raises(AssertionError, match="placed too far off"):
+        check_clock_diags(*run(hpet_off=2500001))
