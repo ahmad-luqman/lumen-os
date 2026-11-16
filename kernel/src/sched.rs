@@ -432,7 +432,8 @@ static IDLE_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPU
 /// `LAST_TICK_NS` is 0 until the first tick that finds it running, and
 /// `PREV_TICK_NS` until the one after. Each is written only by its own
 /// CPU's tick and read on that CPU: `LAST_TICK_NS` by threads pinned there
-/// (the deadline race's waiter), `PREV_TICK_NS` by that CPU's tick (in
+/// (the deadline race's waiter) and by the tick itself (to shift it into
+/// `PREV_TICK_NS`), `PREV_TICK_NS` by that CPU's tick (in
 /// [`count_queue_deadline`]) and by the race's waiter, so `Relaxed` is
 /// enough.
 #[cfg(feature = "ktest")]
@@ -1957,10 +1958,13 @@ crate::ktest!(
             /// scheduler never ticked, so every phase would be 0).
             first_tick_ns: AtomicU64,
             /// The waiter CPU's queue deadlines fired, late and early during
-            /// the race ([`queue_deadlines`]), and its tick before last and
-            /// last as the waiter ended, all as the waiter read them there.
+            /// the race ([`queue_deadlines`]), its tick before last and last
+            /// as the waiter ended, and whether one tick later the tick
+            /// before last was the last one read before it, all as the
+            /// waiter read them there.
             deadlines: SpinLock<[u64; 3]>,
             ticks_at_end: SpinLock<(u64, u64)>,
+            prev_follows_last: AtomicBool,
             /// For the diags: what the racer did each round (index = round;
             /// 0 unused), and each round as the waiter saw it, recorded as
             /// it ends (in room reserved up front: no allocation mid-race).
@@ -2011,6 +2015,7 @@ crate::ktest!(
             first_tick_ns: AtomicU64::new(0),
             deadlines: SpinLock::new([0; 3]),
             ticks_at_end: SpinLock::new((0, 0)),
+            prev_follows_last: AtomicBool::new(false),
             marks: (0..=ROUNDS).map(|_| Mark::default()).collect(),
             rounds: SpinLock::new(Vec::with_capacity(ROUNDS as usize)),
         });
@@ -2114,6 +2119,20 @@ crate::ktest!(
                     break ends;
                 }
             };
+            // And not stale: across exactly one tick, `PREV_TICK_NS` takes
+            // the `LAST_TICK_NS` read before it (taken again if the spin
+            // sees two ticks, or one more comes before the reads end).
+            let follows = loop {
+                let (t, last) = (ticks(), last_tick());
+                while ticks() == t {
+                    core::hint::spin_loop();
+                }
+                let prev = PREV_TICK_NS[waiter_cpu].load(Ordering::Relaxed);
+                if ticks() == t + 1 && last != 0 {
+                    break prev == last;
+                }
+            };
+            r.prev_follows_last.store(follows, Ordering::Relaxed);
             stage(4);
         });
         let waiter = match spawned {
@@ -2155,6 +2174,7 @@ crate::ktest!(
         let first_tick_ns = race.first_tick_ns.load(Ordering::Relaxed);
         let [fired, late_deadlines, early_deadlines] = *race.deadlines.lock();
         let (prev_tick_ns, last_tick_ns) = *race.ticks_at_end.lock();
+        let prev_follows_last = race.prev_follows_last.load(Ordering::Relaxed);
         let mark = |x: &Round| race.marks.get(x.n as usize).and_then(Mark::read);
         let woke = rounds.iter().filter(|x| x.woke).count();
         let timed_out = rounds.len() - woke;
@@ -2227,7 +2247,8 @@ crate::ktest!(
         crate::ktest::diag(format_args!(
             "queue deadlines on the waiter's cpu {waiter_cpu} during the race: {fired} fired, {late_deadlines} a \
              tick late, {early_deadlines} early; its ticks before last and last at {prev_tick_ns} and \
-             {last_tick_ns} ns as the waiter ended; its last tick as the waiter began at {first_tick_ns} ns"
+             {last_tick_ns} ns as the waiter ended (a tick later, the tick before last was that last one: \
+             {prev_follows_last}); its last tick as the waiter began at {first_tick_ns} ns"
         ));
         let checks = || -> crate::ktest::TestResult {
             if let Some((n, how)) = broken {
@@ -2238,15 +2259,19 @@ crate::ktest!(
             // The sweep ran: the waiter's CPU had ticked, so the phases
             // were real.
             kassert!(first_tick_ns != 0);
+            // The exact checks first, so a deterministic failure names
+            // itself. Every queue deadline on the waiter's CPU fired at the
+            // first tick after it. `fired > 0` checks the counting is wired
+            // up: the waits on the other queue alone fire up to 200.
+            kassert!(fired > 0 && late_deadlines == 0 && early_deadlines == 0);
+            // The ticks the detector compares were being recorded, and
+            // `PREV_TICK_NS` was the tick before the last, not stale.
+            kassert!(0 < prev_tick_ns && prev_tick_ns < last_tick_ns);
+            kassert!(prev_follows_last);
+            // Then the ones that depend on timing, with margins.
             kassert!(woke > 0 && timed_out > 0);
             // Some rounds were won by the racer's mark before the deadline.
             kassert!(ready_early > 0);
-            // Every queue deadline on the waiter's CPU fired at the first
-            // tick after it. `fired > 0` checks the counting is wired up:
-            // the waits on the other queue alone fire 200.
-            kassert!(fired > 0 && late_deadlines == 0 && early_deadlines == 0);
-            // The ticks the detector compares were being recorded.
-            kassert!(0 < prev_tick_ns && prev_tick_ns < last_tick_ns);
             Ok(())
         };
         let result = checks();
@@ -2288,7 +2313,7 @@ crate::ktest!(
         // entries, none a tick late and none early, and each wait returns
         // false no earlier than it. (A `wake_sleepers` that stepped past the
         // entry swapped into a fired one's place would fire it a tick late.)
-        use crate::kassert;
+        use crate::{kassert, kassert_eq};
         const WAITERS: usize = 3;
         let cpu = last_cpu()?;
         // CPU `cpu`'s queue deadline counts, read there.
@@ -2315,15 +2340,23 @@ crate::ktest!(
             let q = CPUS[cpu].lock();
             threads.iter().filter(|t| q.sleepers.iter().any(|s| s.on_queue && Arc::ptr_eq(&s.thread, t))).count()
         };
-        // All three blocked before the deadline, so one tick passes it for all.
-        kassert!(yield_until(|| deadline_entries() == WAITERS || time::now_ns() >= deadline));
-        kassert!(time::now_ns() < deadline);
+        // All three blocked before the deadline, so one tick passes it for
+        // all: their entries were counted, then the time read was before it.
+        let in_time = core::cell::Cell::new(false);
+        kassert!(yield_until(|| {
+            let all = deadline_entries() == WAITERS;
+            let before = time::now_ns() < deadline;
+            in_time.set(all && before);
+            all || !before
+        }));
+        kassert!(in_time.get());
         for h in handles {
             join_bounded(h)?;
         }
         let after = counts()?;
         let [fired, late, early]: [u64; 3] = core::array::from_fn(|i| after[i] - before[i]);
         crate::ktest::diag(format_args!("cpu {cpu}: {fired} queue deadlines fired, {late} a tick late, {early} early"));
+        kassert_eq!(results.lock().len(), WAITERS);
         kassert!(results.lock().iter().all(|&r| r == (false, true)));
         kassert!(fired >= WAITERS as u64 && late == 0 && early == 0);
         Ok(())
