@@ -6,8 +6,9 @@
 //! [`Mode`]), `\n` as `\r\n` in bursts ([`write_bytes`]), and reading
 //! ([`data_ready`], [`try_read`]; by interrupt: [`enable_rx_interrupt`],
 //! the handler's [`drain`], the reader's policy, [`read_next`] and
-//! [`available`], how it waits, [`wait_mode`], and when a missing
-//! interrupt is worth a warning, [`MissedInterrupts`]).
+//! [`available`], how it waits, [`wait_mode`], how a wait ended,
+//! [`another_period`] and [`classify`], and when a missing interrupt is
+//! worth a warning, [`MissedInterrupts`]).
 //!
 //! **Reading by interrupt.** The received-data interrupt reaches the CPU
 //! as an edge (ISA IRQ 4 through an I/O APIC). The worst case the design
@@ -285,17 +286,50 @@ pub fn wait_mode(present: bool, by_interrupt: bool, can_block: bool) -> WaitMode
     }
 }
 
-/// How a [`WaitMode::Deadline`] wait ended, as far as the warning rule
-/// cares.
+/// How a [`WaitMode::Deadline`] wait ended ([`classify`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitEnd {
-    /// An interrupt brought input during the wait.
-    Interrupt,
-    /// The deadline passed and input was waiting, though no interrupt
-    /// brought any: the interrupt may not be reaching the CPU.
+    /// The interrupt handler's wake readied the reader: an interrupt
+    /// brought input.
+    Woken,
+    /// The deadline readied the reader first, and an interrupt brought the
+    /// input at or after the deadline, before the reader ran (another
+    /// thread, or the vCPU, ran meanwhile): the interrupt came, late.
+    Late,
+    /// The deadline passed and input was waiting with no interrupt having
+    /// brought it, or with one before the deadline that didn't wake the
+    /// reader: the interrupt may not be reaching the CPU, or not waking it.
     InputAtDeadline,
-    /// Neither: the deadline passed with nothing to read.
+    /// Nothing came; or a byte was already waiting at the first look,
+    /// before any deadline (its interrupt still pending): neither says
+    /// anything about the interrupt.
     Idle,
+}
+
+/// Whether a wait that found input should wait one more period for a late
+/// interrupt: input `found` at the deadline (`past_deadline`), not woken
+/// by the handler (`woken`), with nothing `queued` (so it is in the UART
+/// alone, its interrupt not taken yet; it may be on its way).
+pub fn another_period(found: bool, woken: bool, queued: bool, past_deadline: bool) -> bool {
+    found && past_deadline && !woken && !queued
+}
+
+/// How a deadline wait ended: `woken` by the handler; else the first
+/// interrupt that brought input since the reader blocked
+/// (`first_input_irq_ns`) at or after the `deadline_ns` ([`WaitEnd::Late`]);
+/// else input `found` once `now_ns` is past the deadline
+/// ([`WaitEnd::InputAtDeadline`]: no interrupt, or one before the deadline
+/// that didn't wake the reader); else [`WaitEnd::Idle`].
+pub fn classify(woken: bool, first_input_irq_ns: Option<u64>, deadline_ns: u64, found: bool, now_ns: u64) -> WaitEnd {
+    if woken {
+        WaitEnd::Woken
+    } else if first_input_irq_ns.is_some_and(|t| t >= deadline_ns) {
+        WaitEnd::Late
+    } else if found && now_ns >= deadline_ns {
+        WaitEnd::InputAtDeadline
+    } else {
+        WaitEnd::Idle
+    }
 }
 
 /// When input found at the deadline is worth a warning: after
@@ -320,7 +354,7 @@ impl MissedInterrupts {
     /// Note how a wait ended; whether to warn now (true once at most).
     pub fn note(&mut self, end: WaitEnd) -> bool {
         match end {
-            WaitEnd::Interrupt => self.in_a_row = 0,
+            WaitEnd::Woken | WaitEnd::Late => self.in_a_row = 0,
             WaitEnd::Idle => {}
             WaitEnd::InputAtDeadline => self.in_a_row = self.in_a_row.saturating_add(1),
         }

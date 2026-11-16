@@ -564,16 +564,19 @@ fn missed_interrupts_warn_once_after_three_in_a_row() {
     assert_eq!(run(&[InputAtDeadline; 7]), [false, false, true, false, false, false, false]);
     // An interrupt that brought input starts the count again.
     assert_eq!(
-        run(&[InputAtDeadline, InputAtDeadline, Interrupt, InputAtDeadline, InputAtDeadline, InputAtDeadline]),
+        run(&[InputAtDeadline, InputAtDeadline, Woken, InputAtDeadline, InputAtDeadline, InputAtDeadline]),
         [false, false, false, false, false, true]
     );
     // Interrupts working: never.
-    assert_eq!(run(&[Interrupt, Idle, InputAtDeadline, Interrupt, InputAtDeadline, Idle, Interrupt]), [false; 7]);
+    assert_eq!(run(&[Woken, Idle, InputAtDeadline, Woken, InputAtDeadline, Idle, Woken]), [false; 7]);
     // Interrupts that worked earlier, then stopped: it still warns.
     assert_eq!(
-        run(&[Interrupt, Interrupt, InputAtDeadline, InputAtDeadline, InputAtDeadline]),
+        run(&[Woken, Late, InputAtDeadline, InputAtDeadline, InputAtDeadline]),
         [false, false, false, false, true]
     );
+    // An interrupt that came late (the deadline readied the reader first)
+    // also starts the count again.
+    assert_eq!(run(&[InputAtDeadline, InputAtDeadline, Late, InputAtDeadline, InputAtDeadline]), [false; 5]);
     assert_eq!(MissedInterrupts::THRESHOLD, 3);
 }
 
@@ -592,4 +595,56 @@ fn drain_stops_at_room_and_leaves_the_rest_in_the_uart() {
     assert_eq!(got, b"hello");
     assert_eq!(drain(&mut m, mode, 16, |b| got.push(b)), 0);
     assert_eq!(drain(&mut m, Mode::Absent, 16, |b| got.push(b)), 0);
+}
+
+#[test]
+fn a_wait_is_classified_by_the_table() {
+    // (woken by the handler, first input interrupt, found, now) with the
+    // deadline at 100 -> how the wait ended.
+    use WaitEnd::*;
+    const D: u64 = 100;
+    let table = [
+        // The handler woke it: whatever else happened.
+        ((true, Some(40), true, 50), Woken),
+        ((true, Some(150), true, 160), Woken),
+        ((true, None, true, 160), Woken),
+        // The deadline readied it first; an interrupt brought the input at
+        // or after the deadline, before it ran: late, not missed.
+        ((false, Some(100), true, 160), Late),
+        ((false, Some(130), true, 160), Late),
+        ((false, Some(130), false, 160), Late),
+        // An interrupt before the deadline that didn't wake it (a handler
+        // that queues without waking, k1): found at the deadline.
+        ((false, Some(40), true, 160), InputAtDeadline),
+        ((false, Some(99), true, 100), InputAtDeadline),
+        // No interrupt at all (not routed, a handler that doesn't drain).
+        ((false, None, true, 100), InputAtDeadline),
+        ((false, None, true, 260), InputAtDeadline),
+        // Found at the first look, before any deadline: idle.
+        ((false, None, true, 10), Idle),
+        ((false, Some(5), true, 10), Idle),
+        // Nothing came.
+        ((false, None, false, 160), Idle),
+    ];
+    for ((woken, first, found, now), want) in table {
+        assert_eq!(classify(woken, first, D, found, now), want, "{:?}", (woken, first, found, now));
+    }
+}
+
+#[test]
+fn another_period_only_for_input_in_the_uart_alone_at_the_deadline() {
+    // (found, woken, queued, past the deadline) -> one more period.
+    let table = [
+        ((true, false, false, true), true),
+        // Found at the first look (not past the deadline): read it now.
+        ((true, false, false, false), false),
+        // Woken by the handler, or input queued (an interrupt brought it).
+        ((true, true, false, true), false),
+        ((true, false, true, true), false),
+        // Nothing found.
+        ((false, false, false, true), false),
+    ];
+    for ((found, woken, queued, past), want) in table {
+        assert_eq!(another_period(found, woken, queued, past), want, "{:?}", (found, woken, queued, past));
+    }
 }

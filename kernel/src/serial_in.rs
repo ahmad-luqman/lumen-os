@@ -12,8 +12,10 @@
 //!   character timeout), the input is unmasked, and the bytes that came
 //!   before are queued. A level-triggered or active-low route (a MADT
 //!   override) isn't used: the handler leaves bytes in the UART when the
-//!   queue is full, which a level input would raise again after every EOI,
-//!   and an ISA UART drives its line active high.
+//!   queue is full, which a level input would raise again after every EOI;
+//!   and an active-low override is unexpected for IRQ 4 (ISA's are edge,
+//!   active high), so it isn't trusted. (An override's polarity describes
+//!   the pin after any inversion on the board, not the UART's own line.)
 //! - **Interrupt:** moves the waiting bytes into [`QUEUE`] while it has
 //!   room, and wakes the reader. Bytes past its room stay in the UART
 //!   (QEMU holds the rest back; a real UART overruns and drops them).
@@ -117,10 +119,11 @@ pub fn init() {
     GSI.store(route.gsi(), Ordering::Relaxed);
     VECTOR.store(route.vector(), Ordering::Relaxed);
     if route.trigger() == Trigger::Level || route.polarity() == Polarity::ActiveLow {
-        // Left routed and masked.
+        // Left routed and masked. A level input would storm while bytes
+        // wait; an active-low one is unexpected for IRQ 4, so not trusted.
         warn!(
             target: "serial",
-            "serial input is polled: IRQ {COM1_IRQ} is {:?}, {:?} (GSI {}), not an ISA UART's edge, active high",
+            "serial input is polled: IRQ {COM1_IRQ} is {:?}, {:?} (GSI {}), not ISA's edge, active high",
             route.trigger(),
             route.polarity(),
             route.gsi()
@@ -202,43 +205,29 @@ pub fn wait() {
 /// Block until a byte waits, or at most [`WAIT_NS`]; count how the wait
 /// ended, and warn once if input keeps being found at the deadline.
 fn wait_with_deadline() {
-    let woken = READER_WOKEN.load(Ordering::Relaxed);
+    let woken_before = READER_WOKEN.load(Ordering::Relaxed);
     FIRST_INPUT_IRQ_NS.store(u64::MAX, Ordering::Relaxed);
     let deadline = crate::time::now_ns() + WAIT_NS;
     let found = WAITING.wait_until_or_deadline(deadline, available);
-    if found && READER_WOKEN.load(Ordering::Relaxed) == woken && QUEUE.is_empty() {
-        // Input in the UART only, at the deadline, and its interrupt not
-        // taken: it may be on its way (on a loaded TCG host QEMU's
-        // character timeout was measured arriving 1.6 ms after such a
-        // deadline). One more period for the handler to queue it; if it
-        // doesn't, the input waited a whole period without its interrupt.
+    let woken = || READER_WOKEN.load(Ordering::Relaxed) != woken_before;
+    let past_deadline = crate::time::now_ns() >= deadline;
+    if lumen_uart::another_period(found, woken(), !QUEUE.is_empty(), past_deadline) {
+        // Input in the UART alone at the deadline, its interrupt not taken:
+        // it may be on its way (on a loaded TCG host QEMU's character
+        // timeout was measured arriving 1.6 ms after such a deadline). One
+        // more period for the handler to queue it; if it doesn't, the input
+        // waited a whole period without its interrupt.
         let grace = crate::time::now_ns() + WAIT_NS;
         let _ = WAITING.wait_until_or_deadline(grace, || !QUEUE.is_empty());
     }
-    let first_irq = FIRST_INPUT_IRQ_NS.load(Ordering::Relaxed);
-    let end = if READER_WOKEN.load(Ordering::Relaxed) != woken {
-        // The handler's wake readied this thread (even if it ran only after
-        // the deadline).
-        WOKEN.fetch_add(1, Ordering::Relaxed);
-        WaitEnd::Interrupt
-    } else if first_irq != u64::MAX && first_irq >= deadline {
-        // The deadline readied it first (the only other waker), and then an
-        // interrupt brought the input before it ran: the interrupt came,
-        // only later than the deadline (another thread on this CPU, or the
-        // vCPU, ran meanwhile).
-        LATE.fetch_add(1, Ordering::Relaxed);
-        WaitEnd::Interrupt
-    } else if found && crate::time::now_ns() >= deadline {
-        // A deadline readied it, and input was waiting: no interrupt woke
-        // it for that input (none came, or one came before the deadline
-        // and didn't wake it).
-        AT_DEADLINE.fetch_add(1, Ordering::Relaxed);
-        WaitEnd::InputAtDeadline
-    } else {
-        // Nothing came; or a byte was already waiting at the first look
-        // (its interrupt still pending, interrupts off then): neither says
-        // anything about the interrupt.
-        WaitEnd::Idle
+    let first = FIRST_INPUT_IRQ_NS.load(Ordering::Relaxed);
+    let end =
+        lumen_uart::classify(woken(), (first != u64::MAX).then_some(first), deadline, found, crate::time::now_ns());
+    match end {
+        WaitEnd::Woken => WOKEN.fetch_add(1, Ordering::Relaxed),
+        WaitEnd::Late => LATE.fetch_add(1, Ordering::Relaxed),
+        WaitEnd::InputAtDeadline => AT_DEADLINE.fetch_add(1, Ordering::Relaxed),
+        WaitEnd::Idle => 0,
     };
     if MISSED.lock().note(end) {
         warn!(

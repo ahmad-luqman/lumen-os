@@ -148,9 +148,12 @@ tests (for example `lumen-elf`, the symbol-table reader).
    thread on the CPU, or the vCPU, ran meanwhile: common under load
    during a sound, and not a missed interrupt); or input found at the
    deadline with no interrupt bringing it;
-   a scenario checks that every typed line wakes the shell by interrupt,
-   and that with COM1 moved to IRQ 3 the safety net answers and warns
-   once. An idle boot CPU halts between; each block and wake is two
+   a scenario checks that lines typed while the shell waits wake it by
+   interrupt (at least one woken by the handler, none found at the
+   deadline), and that with COM1 moved to IRQ 3 the safety net answers
+   and warns once; how a wait ended and when it waits one more period
+   are pure functions tested on the host (`lumen_uart::classify`,
+   `another_period`). An idle boot CPU halts between; each block and wake is two
    thread switches in the trace ring, so an idle serial shell records
    about 20 events a second (the deadline's wakes), and the boot CPU's
    4096-event ring wraps in about 3.4 minutes of idling. Without the

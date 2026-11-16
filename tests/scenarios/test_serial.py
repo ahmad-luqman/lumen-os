@@ -150,11 +150,14 @@ def test_the_serial_shell_waits_for_input_by_interrupt(boot):
     # second at the prompt the CPU halts, so the idle thread takes most of
     # the ticks and more than the shell's own `main` thread. (Polling,
     # `main` took every tick and `idle` none: the CPU was 100% busy, and
-    # under TCG so was a host CPU per guest.) Every line typed while it
-    # waits wakes it by interrupt: GSI 4's count goes up, and no wait finds
-    # input at its deadline instead (a handler that queues bytes without
-    # waking the shell, or doesn't queue them, would show there). Lines of
-    # 14+ bytes reach the FIFO's trigger level, not only its timeout.
+    # under TCG so was a host CPU per guest.) Lines typed while it waits
+    # wake it by interrupt: GSI 4's count goes up, at least one wait is
+    # woken by the handler itself (one that queues bytes without waking the
+    # shell never is), every line's wait ends by an interrupt (woken, or
+    # readied by its deadline just before the interrupt came), and none
+    # finds input at its deadline instead (a handler that doesn't wake the
+    # shell, or doesn't queue the bytes, would show there). Lines of 14+
+    # bytes reach the FIFO's trigger level, not only its timeout.
     m = shell(boot)
     first = _com1_interrupts(m)
     _, woken_before, late_before, _ = _serial(m)
@@ -165,7 +168,9 @@ def test_the_serial_shell_waits_for_input_by_interrupt(boot):
     assert _com1_interrupts(m) > first
     brought, woken, late, at_deadline = _serial(m)
     lines = woken - woken_before + late - late_before
-    assert at_deadline == 0 and lines >= 6 and brought >= woken + late, (
+    assert (
+        at_deadline == 0 and woken - woken_before >= 1 and lines >= 6 and brought >= woken + late
+    ), (
         brought,
         woken,
         late,
