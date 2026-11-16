@@ -83,32 +83,38 @@ def test_echo(boot):
 
 
 SCREEN_SHELLS_WAITING = r"DEBUG shell: screen shells waiting for keys: (\d+) of (\d+)\n"
+# The kernel command line under which the readiness line is logged.
+PARKED_CMDLINE = "lumen.log=debug"
+HELD = "WARN  shell: serial prompt held"
 
 
 def expect_screen_shells_parked(m: Machine, timeout: float = 60) -> None:
-    """With `lumen.log=debug`: the kernel's line, just before the serial
-    shell's first prompt, says all four screen shells were blocked waiting
-    for a key when it was written (#119), and no prompt came before it."""
+    """For a machine booted with `PARKED_CMDLINE` (`lumen.log=debug`): the
+    kernel's line, just before the serial shell's first prompt, says all
+    four screen shells were blocked waiting for a key (#119); no prompt came
+    before it, nor the warning that the prompt was held."""
     found = m.expect(SCREEN_SHELLS_WAITING, timeout)
     assert found.groups() == ("4", "4"), found.group(0)
-    assert PROMPT not in m.output[: found.start()], m.output[-2000:]
+    before = m.output[: found.start()]
+    assert PROMPT not in before, before[-2000:]
+    assert HELD not in before, before[-2000:]
 
 
 def test_serial_prompt_waits_for_the_screen_shells(boot):
     # #119: the serial shell's first prompt comes only once all four screen
     # shells are blocked waiting for their first key, so the first line
     # typed on serial runs while they are parked (test_smp's crash_on
-    # relies on it, and checks this line in every boot). The kernel counts
-    # them at that moment, at debug level, just before the prompt. Without
-    # the wait it usually finds fewer (2 of 10 boots of a kernel without it
-    # still read 4 of 4: the shells happened to park first). The wait
-    # itself is checked deterministically by the ktest
-    # sched::yield_until_blocked_returns_once_every_thread_is_blocked.
-    m = boot("qemutest", cmdline="lumen.log=debug")
+    # relies on it, and checks this line in every boot but one). The
+    # kernel logs, at debug level, when the wait starts and, just before the
+    # prompt, what its last check found. The wait itself is checked
+    # deterministically by the ktests
+    # sched::yield_until_blocked_returns_once_every_thread_is_blocked and
+    # shell::the_serial_prompt_waits_on_past_its_warning.
+    m = boot("qemutest", cmdline=PARKED_CMDLINE)
     m.expect(r"DEBUG shell: serial prompt waits for 4 screen shells to wait for keys\n", 60)
     expect_screen_shells_parked(m)
     m.expect(PROMPT, 60)
-    assert "WARN  shell" not in m.output, m.output[-2000:]
+    assert HELD not in m.output, m.output[-2000:]
 
 
 BOOTING = r"INFO  boot: Lumen \d+\.\d+\.\d+ \(x86_64\) booting"

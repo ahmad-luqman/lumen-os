@@ -867,7 +867,16 @@ off. A wake from another CPU queues the thread there and sends the
   wake only moves a thread that is still blocked, and a woken thread takes
   its own leftover entries off (a ktest races the two 200 times). Dropping
   a queue with threads waiting panics, as does a thread joining itself
-  (not tested).
+  (not tested). `Blocked` is set in one place, `WaitQueue`'s wait, under
+  the queue's lock, right after the thread is pushed onto it; from that
+  push until it is woken nothing allocates for it (the deadline's sleeper
+  entry uses room reserved beforehand). `yield_until_blocked(handles,
+  deadline)` yields this CPU until every one of those threads is
+  `Blocked` (each check one pass with interrupts off; true even past the
+  deadline if they all are; `Sleeping` and `Dead` never count; not for the
+  calling thread itself): the serial prompt's wait for the screen shells
+  (#119; a ktest with threads that block in different orders, one after
+  a sleep).
   Where a thread can't block, both waits panic (tested: `wait_until` with
   a lock held; `wait_until_or_deadline` with interrupts off; `wait_until`
   after its own CPU turned interrupts off for good, alone or after another
@@ -1191,25 +1200,32 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   millisecond); the virtual terminals' shells block in `vt::wait_key`.
   The serial shell's first prompt comes only once every screen shell that
   started is blocked waiting for its first key (`sched::yield_until_blocked`
-  on their threads: `Blocked` is set only under a wait queue's lock, right
-  after the thread is queued, its last allocation for the wait; read for
-  all of them at one moment). So when the first line typed on serial runs,
-  the screen shells are parked, and a deliberate crash on another CPU
-  doesn't find one of them mid-allocation with the heap's lock held
-  (#119). The `lumen> ` the harness waits for comes after that. Not
-  covered: other threads on CPU 0, such as the `mouse` and `sound` threads
-  (no scenario attaches those devices by default; `make run` attaches a
-  tablet), and a key typed on the screen, which wakes the shells (they
-  allocate again as they wait again: waking all of a wait queue frees its
-  buffer); one typed during boot holds the serial prompt until that shell
-  waits again. No time bound: after 5 s a warning names the shells not yet
-  waiting (`serial prompt held: shell-vt2 not yet waiting for keys (still
-  waiting)`, not tested), and the wait goes on. Logged at debug level when
-  it starts (`serial prompt waits for 4 screen shells to wait for keys`)
-  and before the prompt (`screen shells waiting for keys: 4 of 4`, the
-  count blocked then), which `test_shell::test_serial_prompt_waits_for_the_screen_shells`
-  and every boot of `test_smp`'s `boot_to_prompt` check; the wait itself
-  is a ktest (`sched::yield_until_blocked_returns_once_every_thread_is_blocked`).
+  on their threads, see Scheduler; any `Blocked` counts, which relies on a
+  screen shell's first wait being the keyboard's). So when the first line
+  typed on serial runs, the screen shells are parked, and a deliberate
+  crash on another CPU doesn't find one of them mid-allocation with the
+  heap's lock held (#119). The `lumen> ` the harness waits for comes after
+  that. Not covered: other threads on CPU 0, such as the `mouse` and
+  `sound` threads (no scenario attaches those devices by default; `make
+  run` attaches a tablet), and a key typed on the screen, which wakes all
+  the shells: `wake_all` takes the queue's buffer and the waker frees it,
+  so the first shell to wait again allocates a new one (the rest fit in
+  it). A key typed during boot holds the serial prompt until they all wait
+  again. No time bound: after 5 s a warning names the shells not yet
+  waiting, each with its state (`serial prompt held: shell-vt2 (ready) not
+  yet waiting for keys (still waiting)`; `(none now)` if they all parked
+  meanwhile), the wait goes on, and its end is logged at info with how
+  long it held (`serial prompt released after 5012 ms: ...`; both checked
+  by a ktest with a 1 ms warning, not at boot). The warning needs CPU 0 to
+  still schedule: a shell spinning with interrupts off would hang it
+  silently. Logged at debug level when it starts (`serial prompt waits for
+  4 screen shells to wait for keys`) and before the prompt (`screen shells
+  waiting for keys: 4 of 4`, what the wait's last check found). Every
+  `test_smp` boot but one (`test_cpus_past_the_limit_are_halted`, at the
+  default log level as shipped) and
+  `test_shell::test_serial_prompt_waits_for_the_screen_shells` check that
+  line, with no prompt and no warning before it; most other scenarios
+  boot at the default level.
   Log lines go to serial and the first virtual terminal. A terminal whose
   shell's thread didn't start says so on it (not tested).
 - **Words** (`lumen_shell::words`): blanks separate words; `'...'` keeps
