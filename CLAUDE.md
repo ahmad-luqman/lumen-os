@@ -209,7 +209,9 @@ own PR that updates that doc first.
   and `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free).
 - `crates/lumen-time`: timekeeping arithmetic: calibration, tick/ns
   conversion, timer counts, log time formats (`Stamp`, `Millis`),
-  percentages and rates, and the RTC's registers as a date (`rtc`)
+  percentages and rates, one clock's reading placed between two reads of
+  another and retaken while too wide (`Bracketed`, `first_narrow`: the
+  ktests' clock cross-checks), and the RTC's registers as a date (`rtc`)
   (host-tested).
 - `crates/lumen-rand`: ChaCha20's block function (RFC 8439 vectors), the
   entropy pool (mixing, fast-key-erasure streams), and pure helpers for
