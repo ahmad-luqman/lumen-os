@@ -131,7 +131,8 @@ def boot_settled(boot):
     is blocked for a key: `top 1` (up to 10 runs) shows each `blocked`.
 
     `shell::run` spawns the screen shells, each on a thread of its own, and
-    then runs the serial shell, so the serial prompt can come first. Until
+    then runs the serial shell, whose first prompt now waits until they are
+    all blocked (#119); this checks the same from outside. Until
     each screen shell has drawn its first prompt (keeping the buffer
     `run_on` writes the editor's output into) and blocked in
     `vt::wait_key` (the keyboard's wait queue allocating its buffer when

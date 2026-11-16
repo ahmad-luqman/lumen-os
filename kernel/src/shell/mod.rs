@@ -315,9 +315,10 @@ crate::ktest!(
             }
         };
         let mut shells: [Option<JoinHandle>; term::VTS] = Default::default();
+        // Read first: the late thread's sleep starts after this.
+        let start = crate::time::now_ns();
         shells[0] = Some(sched::spawn("waits-early", park(&s, 0)).map_err(|_| "spawn failed")?);
         shells[2] = Some(sched::spawn("waits-late", park(&s, LATE_NS)).map_err(|_| "spawn failed")?);
-        let start = crate::time::now_ns();
         let count = wait_for_screen_shells(&shells, 1_000_000);
         let held = crate::time::now_ns() - start;
         let blocked = shells.iter().flatten().all(|h| h.thread().state() == State::Blocked);
@@ -331,8 +332,10 @@ crate::ktest!(
         kassert!(held >= LATE_NS);
         s.1.store(true, Ordering::Release);
         s.0.wake_all();
+        // Bounded: a thread that never finishes fails the test by name
+        // (the wait under test above is unbounded by design).
         for h in shells.into_iter().flatten() {
-            h.join();
+            sched::join_bounded(h)?;
         }
         Ok(())
     }

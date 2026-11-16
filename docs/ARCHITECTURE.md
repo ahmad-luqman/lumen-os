@@ -875,8 +875,8 @@ off. A wake from another CPU queues the thread there and sends the
   `Blocked` (each check one pass with interrupts off; true even past the
   deadline if they all are; `Sleeping` and `Dead` never count; not for the
   calling thread itself): the serial prompt's wait for the screen shells
-  (#119; a ktest with threads that block in different orders, one after
-  a sleep).
+  (#119; a ktest in which each of four threads blocks last in turn,
+  after a sleep).
   Where a thread can't block, both waits panic (tested: `wait_until` with
   a lock held; `wait_until_or_deadline` with interrupts off; `wait_until`
   after its own CPU turned interrupts off for good, alone or after another
@@ -1215,8 +1215,9 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   waiting, each with its state (`serial prompt held: shell-vt2 (ready) not
   yet waiting for keys (still waiting)`; `(none now)` if they all parked
   meanwhile), the wait goes on, and its end is logged at info with how
-  long it held (`serial prompt released after 5012 ms: ...`; both checked
-  by a ktest with a 1 ms warning, not at boot). The warning needs CPU 0 to
+  long it held (`serial prompt released after 5012 ms: ...`; a ktest
+  waits with a 1 ms warning, and test_ktest matches both texts in the
+  ktest boot's output; not at boot). The warning needs CPU 0 to
   still schedule: a shell spinning with interrupts off would hang it
   silently. Logged at debug level when it starts (`serial prompt waits for
   4 screen shells to wait for keys`) and before the prompt (`screen shells

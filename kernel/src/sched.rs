@@ -1149,7 +1149,7 @@ pub(crate) fn yield_until(done: impl Fn() -> bool) -> bool {
 /// `join`, failing instead of hanging if the thread isn't reaped by the test
 /// deadline.
 #[cfg(feature = "ktest")]
-fn join_bounded(h: JoinHandle) -> crate::ktest::TestResult {
+pub(crate) fn join_bounded(h: JoinHandle) -> crate::ktest::TestResult {
     let t = h.thread.clone();
     if !yield_until(|| t.reaped.load(Ordering::Acquire)) {
         crate::ktest::diag(format_args!("{t:?} wasn't reaped"));
@@ -1753,19 +1753,20 @@ crate::ktest!(
 crate::ktest!(
     fn yield_until_blocked_returns_once_every_thread_is_blocked() {
         // The serial prompt's wait for the screen shells (#119), on threads
-        // on this CPU that block at different times: the first after 2
-        // yields, the second only after a 50 ms sleep (`Sleeping`, not
-        // `Blocked`, meanwhile), the third after 8 yields, the fourth at
-        // once. Right after the wait returns, every one is blocked and on
-        // the queue. A wait that returned early (none, or one yield), or
-        // that checked only some of them (the first, the last, any one) or
-        // took a sleeper for blocked, would find the second not yet
-        // blocked: when the wait starts, few if any have run yet. If they
-        // all blocked before the wait even began (this thread preempted
-        // while spawning them), the setup is redone, so a wait that does
-        // nothing can't pass. Once they are woken (none blocked again), a
-        // wait whose deadline has passed returns at once, saying they
-        // aren't all blocked. Then they are joined.
+        // on this CPU that block at different times: after 2 yields, only
+        // after a 50 ms sleep (`Sleeping`, not `Blocked`, meanwhile), after
+        // 8 yields, at once. The plan is run once per rotation, so each
+        // thread is the sleeper, the last to block, once. Right after the
+        // wait returns, every one is blocked and on the queue. A wait that
+        // returned early (none, or one yield), or that checked only some of
+        // them (any subset leaves out the sleeper in some rotation) or took
+        // a sleeper for blocked, would find the sleeper not yet blocked:
+        // when the wait starts, few if any have run yet. If they all
+        // blocked before the wait even began (this thread preempted while
+        // spawning them), the setup is redone, so a wait that does nothing
+        // is very unlikely to pass. Once they are woken (none blocked
+        // again), a wait whose deadline has passed returns at once, saying
+        // they aren't all blocked. Then they are joined.
         use crate::{kassert, kassert_eq};
         const NAMES: [&str; 4] = ["parking-0", "parking-1", "parking-2", "parking-3"];
         // Yields before blocking; `None`: sleep 50 ms instead.
@@ -1786,42 +1787,54 @@ crate::ktest!(
             }
             Ok(())
         };
-        for attempt in 1..=3 {
-            let s = Arc::new((WaitQueue::new(), AtomicBool::new(false)));
-            let mut handles = Vec::new();
-            for (name, plan) in NAMES.into_iter().zip(PLAN) {
-                let t = s.clone();
-                handles.push(spawn_test(cpu, name, move || {
-                    match plan {
-                        Some(yields) => (0..yields).for_each(|_| yield_now()),
-                        None => {
-                            assert!(sleep(SLEEP_NS), "a test thread couldn't sleep");
+        for rotation in 0..PLAN.len() {
+            let mut plan = PLAN;
+            plan.rotate_right(rotation);
+            let mut done = false;
+            for attempt in 1..=3 {
+                let s = Arc::new((WaitQueue::new(), AtomicBool::new(false)));
+                let mut handles = Vec::new();
+                for (name, step) in NAMES.into_iter().zip(plan) {
+                    let t = s.clone();
+                    handles.push(spawn_test(cpu, name, move || {
+                        match step {
+                            Some(yields) => (0..yields).for_each(|_| yield_now()),
+                            None => {
+                                assert!(sleep(SLEEP_NS), "a test thread couldn't sleep");
+                            }
                         }
-                    }
-                    t.0.wait_until(|| t.1.load(Ordering::Acquire));
-                })?);
+                        t.0.wait_until(|| t.1.load(Ordering::Acquire));
+                    })?);
+                }
+                if all_blocked(&handles) {
+                    // Preempted while spawning, long enough for all of them.
+                    crate::ktest::diag(format_args!(
+                        "rotation {rotation}, attempt {attempt}: all blocked before the wait; again"
+                    ));
+                    release(&s, handles)?;
+                    continue;
+                }
+                kassert!(yield_until_blocked(handles.iter(), Some(time::now_ns() + TEST_DEADLINE_NS)));
+                if !all_blocked(&handles) {
+                    crate::ktest::diag(format_args!("rotation {rotation}:"));
+                    states(&handles);
+                }
+                kassert!(all_blocked(&handles));
+                kassert_eq!(s.0.waiters.lock().len(), NAMES.len());
+                s.1.store(true, Ordering::Release);
+                kassert_eq!(s.0.wake_all(), NAMES.len());
+                kassert!(!yield_until_blocked(handles.iter(), Some(0)));
+                for h in handles {
+                    join_bounded(h)?;
+                }
+                done = true;
+                break;
             }
-            if all_blocked(&handles) {
-                // Preempted while spawning, long enough for all of them.
-                crate::ktest::diag(format_args!("attempt {attempt}: all blocked before the wait; again"));
-                release(&s, handles)?;
-                continue;
+            if !done {
+                return Err("the threads blocked before the wait in every attempt");
             }
-            kassert!(yield_until_blocked(handles.iter(), Some(time::now_ns() + TEST_DEADLINE_NS)));
-            if !all_blocked(&handles) {
-                states(&handles);
-            }
-            kassert!(all_blocked(&handles));
-            kassert_eq!(s.0.waiters.lock().len(), NAMES.len());
-            s.1.store(true, Ordering::Release);
-            kassert_eq!(s.0.wake_all(), NAMES.len());
-            kassert!(!yield_until_blocked(handles.iter(), Some(0)));
-            for h in handles {
-                join_bounded(h)?;
-            }
-            return Ok(());
         }
-        Err("the threads blocked before the wait in every attempt")
+        Ok(())
     }
 );
 

@@ -17,7 +17,7 @@ from lumen_harness.qemu import EXIT_CRASH
 from lumen_harness.screen import PROMPT
 from test_crash import SCREEN_DONE
 from test_mm import OVERFLOW, assert_main_stack_overflow
-from test_shell import PARKED_CMDLINE, expect_screen_shells_parked
+from test_shell import HELD, PARKED_CMDLINE, expect_screen_shells_parked
 
 BOOT_TIMEOUT = 60
 ONLINE = re.compile(r"INFO  smp: cpu (\d+) online \(lapic id (\d+)\)\n")
@@ -105,6 +105,8 @@ def test_cpus_past_the_limit_are_halted(boot):
     # At the default log level, as shipped (the one test_smp boot without
     # the readiness check).
     m, online = boot_to_prompt(boot, 10, parked=False)
+    # The serial prompt's warning (#119) is logged at the default level too.
+    assert HELD not in m.output, m.output[-2000:]
     assert online == 8
     assert sorted(int(c) for c, _ in ONLINE.findall(m.output)) == list(range(1, 8))
     # Counted by the halt loop they were sent to, so they got there.
