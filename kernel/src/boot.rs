@@ -102,13 +102,14 @@ pub fn memmap_type_name(kind: EntryType) -> &'static str {
 /// to its request's two IDs (after Limine's common magic).
 ///
 /// These types (`RawRequest` and both responses) exist only because of that
-/// pin: on a bump to `limine` 0.6 or later, delete them for its
+/// pin: on a bump to `limine` 0.6.4 or later, delete them for its
 /// `TscFrequencyRequest` and `BootloaderPerformanceRequest`.
 ///
 /// # Safety
 ///
 /// The implementing type must be laid out as `limine.h`'s response for the
-/// request with `ID` (checked below for the two there are).
+/// request with `ID` (checked below for the two there are), with integer
+/// fields only, so any bytes Limine wrote are a valid value.
 unsafe trait Response: Sync + 'static {
     const ID: [u64; 2];
 }
@@ -125,7 +126,7 @@ struct RawRequest<R: Response> {
 
 // SAFETY: Limine writes `response` before the kernel starts; the kernel
 // only reads it, and the response it points to is `Sync` (`Response`).
-unsafe impl<R: Response + Sync> Sync for RawRequest<R> {}
+unsafe impl<R: Response> Sync for RawRequest<R> {}
 
 impl<R: Response> RawRequest<R> {
     const fn new() -> Self {
@@ -141,9 +142,10 @@ impl<R: Response> RawRequest<R> {
         // compiler's back (the `limine` crate reads its own the same way).
         let ptr = unsafe { core::ptr::read_volatile(self.response.get()) };
         // SAFETY: a non-null pointer is Limine's response: an `R` (its
-        // layout, from `limine.h`, per `Response`'s contract), aligned, in
-        // bootloader-reclaimable memory that the frame allocator keeps
-        // reserved and the HHDM keeps mapped, never written after the
+        // layout, from `limine.h`, integers only, per `Response`'s
+        // contract), aligned, in bootloader-reclaimable memory, which
+        // `mm::frame` never hands out (it allocates only from `usable`
+        // entries) and the HHDM keeps mapped; never written after the
         // handoff.
         unsafe { ptr.as_ref() }
     }
@@ -189,6 +191,13 @@ const _: () = {
     assert!(offset_of!(PerformanceResponse, init_usec) == 16);
     assert!(offset_of!(PerformanceResponse, exec_usec) == 24);
 };
+
+/// Limine's raw TSC-frequency response, for the ktest to check it is what
+/// went into `before_kmain`'s `LimineTimes`.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by a ktest
+pub fn limine_tsc_frequency() -> Option<u64> {
+    TSC_FREQUENCY.get_response().map(|r| r.frequency)
+}
 
 /// Limine's times (its two responses, or which is missing), the kernel's
 /// TSC calibration and the timeline's origin, for the `boot: before kmain:`

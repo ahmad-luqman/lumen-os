@@ -102,7 +102,8 @@ def test_log_lines_are_structured(boot):
 
 
 def test_boot_timeline_printed(boot):
-    """At boot complete, every phase's time since `kmain` began, in order."""
+    """At boot complete, every phase's time since the timeline's origin, in
+    order; then Limine's times, with the origin after Limine's handoff."""
     m = boot("qemutest")
     line = m.expect(TIMELINE, BOOT_TIMEOUT)
     timeline = COMPLETE.fullmatch(line["text"])
@@ -126,6 +127,12 @@ def test_boot_timeline_printed(boot):
     assert before["level"] == "INFO " and before["gap"], what
     assert 0 < micros(before["started"]) < micros(before["handoff"]), what
     assert not before["gap"].startswith("-"), what
+    # The floor, checked here too rather than only through INFO: the kernel
+    # requires the origin at least ceil(hz_limine / 100) ticks (Limine's
+    # 10 ms wait by its own frequency) after the handoff tick, and Limine's
+    # frequency at least half of ours, so the gap in our clock is at least
+    # 5 ms. Starvation only lengthens it: a floor, not a time bound.
+    assert float(before["gap"]) >= 5.0, what
     # In guest time, measured by the TSC: the time phase calibrates the timer
     # against the TSC (`time::WINDOWS` (5) windows of `WINDOW_NS` (10 ms),
     # each waited out on the TSC) and sleeps 10 ms on it for the first tick:

@@ -453,8 +453,9 @@ crate::ktest!(
         // So `tscs` is in `ALL`'s order. Entry is the origin, at or before
         // arch-init (above), and at least Limine's post-handoff wait after
         // its handoff tick (`lumen_time::handoff::BeforeKmain::check`, which
-        // also checks the tick's units and Limine's frequency against ours).
-        // Compared in ticks, so exact however long the boot took (#55).
+        // also checks the tick's units, and that Limine's frequency is at
+        // least half of ours). None of it is a time bound, so it holds
+        // however long the boot took (#55).
         // That bounds the origin between Limine's handoff and arch-init; an
         // origin read later than `kmain`'s first instruction, before
         // arch-init, isn't caught.
@@ -468,6 +469,8 @@ crate::ktest!(
             }
         };
         kassert_eq!(before.entry(), entry);
+        // Limine's frequency is the one Limine reported, not ours.
+        kassert_eq!(Some(before.limine().hz()), crate::boot::limine_tsc_frequency());
         let (clock, limine_hz) = (before.clock(), before.limine().hz());
         crate::ktest::diag(format_args!(
             "arch-init {} after entry; {before}; Limine's TSC {limine_hz} Hz, ours {} Hz",

@@ -5,17 +5,25 @@
 //! it calibrated (its bootloader-performance and TSC-frequency responses;
 //! the kernel reads them in `boot.rs`). [`LimineTimes`] holds them;
 //! [`BeforeKmain`] adds the kernel's origin (`kmain`'s first TSC reading)
-//! and the kernel's own TSC calibration, checks that they are in order
-//! ([`BeforeKmain::check`]) and shows them as the `boot: before kmain:` log
-//! line. Every comparison is in ticks, Limine's microseconds turned back
-//! with Limine's own frequency, so none depends on how fast the boot went
-//! (#55): a starved emulator stretches the gaps but can't reorder them.
+//! and the kernel's own TSC calibration, checks them
+//! ([`BeforeKmain::check`], on every boot) and shows them as the
+//! `boot: before kmain:` log line. None of the checks is a time bound:
+//! Limine's microseconds are turned back into ticks with Limine's own
+//! frequency and compared with ticks, and the one comparison of
+//! frequencies is one-sided, so a starved emulator stretching the boot
+//! can't fail any of them (#55).
 //!
 //! The check bounds the origin from below: at least Limine's post-handoff
 //! stall after its handoff reading. Together with the timeline's own order
 //! (the origin at or before arch-init) that places the origin between
 //! Limine's handoff and arch-init. It doesn't prove the origin is `kmain`'s
 //! first instruction: an origin read later, before arch-init, passes.
+//!
+//! It trusts Limine's microseconds: apart from `0 < started < handoff` and
+//! the handoff being at least [`LIMINE_STALL_US`] after the TSC's 0, nothing
+//! checks that the handoff time is right (the frequency check bounds the
+//! stall's length in our ticks, not where the handoff tick is). Times far
+//! too small would let a too-early origin pass.
 
 use core::fmt;
 
@@ -68,7 +76,11 @@ impl LimineTimes {
         Ok(LimineTimes { clock, started_us, handed_off_us })
     }
 
-    /// Limine's TSC frequency.
+    /// Limine's TSC frequency. Limine takes it from CPUID leaf 0x15 when
+    /// the CPU reports a crystal ratio and frequency there; otherwise
+    /// (always under QEMU, which zeroes leaf 0x15) it times three 10 ms
+    /// firmware `Stall`s and keeps the smallest count, so a stretched
+    /// `Stall` can only make it read high.
     pub fn hz(&self) -> u64 {
         self.clock.hz()
     }
@@ -92,23 +104,26 @@ impl LimineTimes {
     pub fn handoff_tick(&self) -> Option<u64> {
         ticks_at_usec(self.handed_off_us, self.clock.hz())
     }
+
+    /// [`LIMINE_STALL_US`] in Limine's ticks, rounded up as Limine's
+    /// `stall` does (`(tsc_freq * us + 999999) / 1000000`, i.e.
+    /// `ceil(hz / 100)`).
+    pub fn stall_ticks(&self) -> u64 {
+        self.clock.ticks(LIMINE_STALL_US * 1000)
+    }
 }
 
 /// How long Limine (v12.9.4, the pinned version) waits after its handoff
-/// reading before it jumps to the kernel: after `exec_usec = rdtsc_usec()`,
-/// `common_spinup` (after `lgdt`, which serializes) calls `flush_irqs`,
-/// which on x86-64 always runs `stall(10000)`: it reads the TSC and spins
-/// until it has advanced `(tsc_freq * 10000 + 999999) / 1000000` ticks, with
-/// the same `tsc_freq` it reports. So the kernel's first instruction comes
-/// at least that many ticks after the handoff reading. This depends on that
-/// Limine internal: check it again when Limine is bumped.
+/// reading before it jumps to the kernel. After `exec_usec = rdtsc_usec()`,
+/// `common_spinup` (after `lgdt`, which serializes) calls `flush_irqs`.
+/// That stalls only for `IRQ_PIC_APIC_FLUSH`, which `limine.c` sets on
+/// x86-64 just before, unconditionally: `stall(10000)` reads the TSC and
+/// spins until it has advanced `(tsc_freq * 10000 + 999999) / 1000000`
+/// ticks, with the same `tsc_freq` it reports. So the kernel's first
+/// instruction comes at least that many ticks after the handoff reading.
+/// This depends on those Limine internals: check them again when Limine is
+/// bumped.
 pub const LIMINE_STALL_US: u64 = 10_000;
-
-/// [`LIMINE_STALL_US`] in ticks of a `hz` TSC, rounded up as Limine's
-/// `stall` does.
-pub fn limine_stall_ticks(hz: u64) -> u64 {
-    u64::try_from((u128::from(hz) * u128::from(LIMINE_STALL_US)).div_ceil(1_000_000)).unwrap_or(u64::MAX)
-}
 
 /// Limine's times, the kernel's origin (`entry`, the TSC as `kmain` began)
 /// and the kernel's own TSC calibration (`clock`): what the
@@ -121,15 +136,6 @@ pub struct BeforeKmain {
     clock: Clock,
 }
 
-/// Where the origin falls relative to the handoff tick: the sign, once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Gap {
-    /// At or after it, by this many ticks.
-    After(u64),
-    /// Before it, by this many ticks.
-    Before(u64),
-}
-
 /// What [`BeforeKmain::check`] found out of order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Disorder {
@@ -137,19 +143,23 @@ pub enum Disorder {
     StartedAtZero,
     /// Limine says it started at or after it handed off.
     StartedAtOrAfterHandoff,
+    /// Limine says it handed off less than its own post-handoff wait after
+    /// the TSC's 0: not a believable time (the firmware alone takes longer).
+    HandoffTooEarly { handed_off_us: u64 },
     /// Limine's handoff in ticks doesn't fit in 64 bits.
     HandoffOverflows,
     /// The handoff tick, turned back into microseconds, isn't Limine's
-    /// own microsecond (or, rounded down, the one before): the tick isn't
-    /// in Limine's units.
+    /// own microsecond (or one up to `ceil(10^6 / hz)` before it). An
+    /// internal consistency assertion: it fails only if the conversion is
+    /// broken (or `Clock::ns` saturates, some 584 years in).
     UnitsDisagree { back_us: u64 },
-    /// Limine's TSC frequency and the kernel's own calibration differ by
-    /// more than a factor of 2.
-    FrequenciesDisagree,
+    /// Limine's TSC frequency is under half of the kernel's own
+    /// calibration: its 10 ms wait would be under 5 ms of ours.
+    FrequenciesDisagree { limine_hz: u64, ours_hz: u64 },
     /// The origin is before the handoff tick.
     OriginBeforeHandoff,
     /// The origin is after the handoff tick, but by less than Limine's
-    /// wait after it ([`limine_stall_ticks`]).
+    /// wait after it ([`LimineTimes::stall_ticks`]).
     OriginWithinLimineStall { after: u64, stall: u64 },
 }
 
@@ -158,11 +168,17 @@ impl fmt::Display for Disorder {
         match *self {
             Disorder::StartedAtZero => f.write_str("Limine started at the TSC's 0"),
             Disorder::StartedAtOrAfterHandoff => f.write_str("Limine started at or after its handoff"),
+            Disorder::HandoffTooEarly { handed_off_us } => write!(
+                f,
+                "Limine handed off at {handed_off_us} us, sooner after the TSC's 0 than its own {LIMINE_STALL_US} us wait"
+            ),
             Disorder::HandoffOverflows => f.write_str("Limine's handoff time in ticks doesn't fit in 64 bits"),
             Disorder::UnitsDisagree { back_us } => {
                 write!(f, "the handoff tick reads back as {back_us} us, not Limine's microsecond")
             }
-            Disorder::FrequenciesDisagree => f.write_str("Limine's TSC frequency and ours differ by more than 2x"),
+            Disorder::FrequenciesDisagree { limine_hz, ours_hz } => {
+                write!(f, "Limine's TSC frequency {limine_hz} Hz is under half of ours, {ours_hz} Hz")
+            }
             Disorder::OriginBeforeHandoff => f.write_str("the origin is before Limine's handoff"),
             Disorder::OriginWithinLimineStall { after, stall } => {
                 write!(f, "the origin is {after} ticks after Limine's handoff, within its {stall}-tick wait")
@@ -198,18 +214,20 @@ impl BeforeKmain {
         self.clock
     }
 
-    fn gap(&self) -> Option<Gap> {
-        let handoff = self.limine.handoff_tick()?;
-        Some(match self.entry.checked_sub(handoff) {
-            Some(after) => Gap::After(after),
-            None => Gap::Before(handoff - self.entry),
-        })
-    }
-
-    /// Limine started after the TSC's 0 and before its handoff; the handoff
-    /// tick is in Limine's units; Limine's frequency agrees with ours within
-    /// 2x (not a timing check: a frequency); and the origin is at least
-    /// Limine's post-handoff wait after the handoff tick. The first failure.
+    /// The first failure of, in order:
+    /// - Limine started after the TSC's 0 and before its handoff, and
+    ///   handed off at least [`LIMINE_STALL_US`] after the TSC's 0 (beyond
+    ///   these, Limine's microseconds are trusted);
+    /// - the handoff tick fits in 64 bits, and reads back as Limine's
+    ///   microsecond (an internal consistency assertion);
+    /// - Limine's frequency is at least half of ours, so its 10 ms wait is
+    ///   at least 5 ms of ours. One-sided: a high Limine frequency (what a
+    ///   stretched calibration `Stall` gives) only lengthens the wait in
+    ///   our ticks, so it can't make an early origin pass;
+    /// - the origin is at least Limine's wait after the handoff tick.
+    ///
+    /// None is a time bound: it runs on every boot, and a starved boot
+    /// can't fail it.
     pub fn check(&self) -> Result<(), Disorder> {
         let l = &self.limine;
         if l.started_us == 0 {
@@ -218,33 +236,38 @@ impl BeforeKmain {
         if l.started_us >= l.handed_off_us {
             return Err(Disorder::StartedAtOrAfterHandoff);
         }
-        let handoff = l.handoff_tick().ok_or(Disorder::HandoffOverflows)?;
+        if l.handed_off_us < LIMINE_STALL_US {
+            return Err(Disorder::HandoffTooEarly { handed_off_us: l.handed_off_us });
+        }
+        self.check_with(l.handoff_tick().ok_or(Disorder::HandoffOverflows)?)
+    }
+
+    /// The rest of [`check`](Self::check), given the handoff tick.
+    fn check_with(&self, handoff: u64) -> Result<(), Disorder> {
+        let l = &self.limine;
         units_agree(l, handoff)?;
-        let (theirs, ours) = (u128::from(l.hz()), u128::from(self.clock.hz()));
-        if theirs * 2 < ours || theirs > ours * 2 {
-            return Err(Disorder::FrequenciesDisagree);
+        let (limine_hz, ours_hz) = (l.hz(), self.clock.hz());
+        if u128::from(limine_hz) * 2 < u128::from(ours_hz) {
+            return Err(Disorder::FrequenciesDisagree { limine_hz, ours_hz });
         }
-        match self.gap() {
-            Some(Gap::Before(_)) => Err(Disorder::OriginBeforeHandoff),
-            Some(Gap::After(after)) => {
-                let stall = limine_stall_ticks(l.hz());
-                if after < stall { Err(Disorder::OriginWithinLimineStall { after, stall }) } else { Ok(()) }
-            }
-            None => Err(Disorder::HandoffOverflows),
+        let after = self.entry.checked_sub(handoff).ok_or(Disorder::OriginBeforeHandoff)?;
+        let stall = l.stall_ticks();
+        if after < stall {
+            return Err(Disorder::OriginWithinLimineStall { after, stall });
         }
+        Ok(())
     }
 }
 
 /// The handoff tick turned back into microseconds, through `Clock::ns`
 /// rather than the conversion being checked: rounded down twice, so
-/// Limine's own microsecond, or the one before it (at 1 MHz and up; below,
-/// up to a tick's worth of microseconds before it). Anything else means the
-/// tick isn't in Limine's units. Time-free: it holds however fast the boot
-/// went.
+/// Limine's own microsecond, or one up to `ceil(10^6 / hz)` before it (the
+/// one before, at 1 MHz and up). Anything else means the tick isn't in
+/// Limine's units. Time-free: it holds however fast the boot went.
 fn units_agree(l: &LimineTimes, handoff: u64) -> Result<(), Disorder> {
     let back_us = l.clock.ns(handoff) / 1000;
     let slack = 1_000_000u64.div_ceil(l.hz());
-    if back_us > l.handed_off_us || l.handed_off_us - back_us > slack {
+    if !(l.handed_off_us.saturating_sub(slack)..=l.handed_off_us).contains(&back_us) {
         return Err(Disorder::UnitsDisagree { back_us });
     }
     Ok(())
@@ -265,10 +288,12 @@ impl fmt::Display for BeforeKmain {
             ms(l.started_us),
             ms(l.handed_off_us)
         )?;
-        match self.gap() {
-            Some(Gap::After(t)) => write!(f, "{:+} after the handoff", Millis(self.clock.ns(t))),
-            Some(Gap::Before(t)) => write!(f, "-{} after the handoff", Millis(self.clock.ns(t))),
-            None => f.write_str("at an unknown time after the handoff (its time in ticks doesn't fit in 64 bits)"),
+        let Some(handoff) = l.handoff_tick() else {
+            return f.write_str("at an unknown time after the handoff (its time in ticks doesn't fit in 64 bits)");
+        };
+        match self.entry.checked_sub(handoff) {
+            Some(after) => write!(f, "{:+} after the handoff", Millis(self.clock.ns(after))),
+            None => write!(f, "-{} after the handoff", Millis(self.clock.ns(handoff - self.entry))),
         }
     }
 }
@@ -302,6 +327,8 @@ mod tests {
         assert_eq!((l.hz(), l.started_us(), l.handed_off_us()), (GHZ3, 1, 2));
         assert_eq!(Unknown::ZeroHz.to_string(), "Limine's TSC frequency is 0 Hz");
         assert_eq!(Unknown::NoPerformanceTimes.to_string(), "no bootloader performance times from Limine");
+        assert_eq!(Unknown::NoTscFrequency.to_string(), "no TSC frequency from Limine");
+        assert_eq!(Unknown::NoClock.to_string(), "the TSC isn't calibrated");
     }
 
     #[test]
@@ -317,11 +344,17 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::manual_div_ceil)] // Limine's formula, written as Limine writes it
     fn the_stall_is_limines_10_ms_rounded_up() {
-        assert_eq!(limine_stall_ticks(GHZ3), 30_000_000);
-        assert_eq!(limine_stall_ticks(2_899_956_252), 28_999_563, "rounded up");
-        assert_eq!(limine_stall_ticks(100), 1);
-        assert_eq!(limine_stall_ticks(u64::MAX), u64::MAX / 100 + 1);
+        let stall = |hz| limine(hz, 1, 2).stall_ticks();
+        assert_eq!(stall(GHZ3), 30_000_000);
+        assert_eq!(stall(2_899_956_252), 28_999_563, "rounded up");
+        assert_eq!(stall(100), 1);
+        assert_eq!(stall(u64::MAX), u64::MAX / 100 + 1);
+        // Limine's own formula, `(tsc_freq * 10000 + 999999) / 1000000`.
+        for hz in [1_000_000u64, 1_193_182, 999_999_937, 2_899_956_252, 5_123_456_789] {
+            assert_eq!(u128::from(stall(hz)), (u128::from(hz) * 10_000 + 999_999) / 1_000_000, "{hz} Hz");
+        }
     }
 
     #[test]
@@ -330,7 +363,7 @@ mod tests {
         let hz = 2_899_956_252;
         let l = limine(hz, 1_932_697, 2_514_149);
         let handoff = l.handoff_tick().unwrap();
-        let stall = limine_stall_ticks(hz);
+        let stall = l.stall_ticks();
         let b = before(l, handoff + stall, 2_900_000_000);
         assert_eq!(b.check(), Ok(()));
         assert_eq!(
@@ -377,6 +410,9 @@ mod tests {
         assert_eq!(same.check(), Err(Disorder::StartedAtOrAfterHandoff));
         let later = before(limine(GHZ3, 2_000_001, 2_000_000), entry, GHZ3);
         assert_eq!(later.check(), Err(Disorder::StartedAtOrAfterHandoff));
+        assert_eq!(before(limine(GHZ3, 1_999_999, 2_000_000), entry, GHZ3).check(), Ok(()), "a microsecond before");
+        assert_eq!(before(limine(GHZ3, 1, 2_000_000), entry, GHZ3).check(), Ok(()), "a microsecond after the TSC's 0");
+        assert_eq!(Disorder::StartedAtOrAfterHandoff.to_string(), "Limine started at or after its handoff");
         assert_eq!(Disorder::StartedAtZero.to_string(), "Limine started at the TSC's 0");
     }
 
@@ -394,13 +430,22 @@ mod tests {
     }
 
     #[test]
-    fn frequencies_must_agree_within_2x() {
+    fn limines_frequency_must_be_at_least_half_of_ours() {
         let l = limine(GHZ3, 1_000_000, 2_000_000);
         let entry = l.handoff_tick().unwrap() + 40_000_000;
-        assert_eq!(before(l, entry, GHZ3 * 2).check(), Ok(()));
-        assert_eq!(before(l, entry, GHZ3 / 2).check(), Ok(()));
-        assert_eq!(before(l, entry, GHZ3 * 2 + 1).check(), Err(Disorder::FrequenciesDisagree));
-        assert_eq!(before(l, entry, GHZ3 / 2 - 1).check(), Err(Disorder::FrequenciesDisagree));
+        assert_eq!(before(l, entry, GHZ3 * 2).check(), Ok(()), "exactly half");
+        assert_eq!(
+            before(l, entry, GHZ3 * 2 + 1).check(),
+            Err(Disorder::FrequenciesDisagree { limine_hz: GHZ3, ours_hz: GHZ3 * 2 + 1 })
+        );
+        // One-sided: a Limine frequency far above ours (a stretched
+        // calibration `Stall` reads high) passes.
+        assert_eq!(before(l, entry, GHZ3 / 2 - 1).check(), Ok(()));
+        assert_eq!(before(l, entry, GHZ3 / 3).check(), Ok(()), "3x ours");
+        assert_eq!(
+            Disorder::FrequenciesDisagree { limine_hz: 1_000_000_000, ours_hz: 2_100_000_000 }.to_string(),
+            "Limine's TSC frequency 1000000000 Hz is under half of ours, 2100000000 Hz"
+        );
     }
 
     #[test]
@@ -411,7 +456,7 @@ mod tests {
         for hz in [1_000_000, 1_193_182, 14_318_180, 999_999_937, 2_899_956_252, 5_123_456_789] {
             for us in [1_000_001, 2_514_149, 13_565_029, 99_999_999] {
                 let l = limine(hz, 1, us);
-                let entry = l.handoff_tick().unwrap() + limine_stall_ticks(hz);
+                let entry = l.handoff_tick().unwrap() + l.stall_ticks();
                 assert_eq!(before(l, entry, hz).check(), Ok(()), "{hz} Hz, {us} us");
             }
         }
@@ -438,5 +483,27 @@ mod tests {
         let tick = slow.handoff_tick().unwrap();
         assert_eq!(units_agree(&slow, tick), Ok(()));
         assert_eq!(units_agree(&slow, tick - 1), Err(Disorder::UnitsDisagree { back_us: 1_999_996 }));
+    }
+
+    #[test]
+    fn a_handoff_sooner_than_limines_own_wait_is_not_believed() {
+        let entry = 10 * GHZ3;
+        let early = before(limine(GHZ3, 1, LIMINE_STALL_US - 1), entry, GHZ3);
+        assert_eq!(early.check(), Err(Disorder::HandoffTooEarly { handed_off_us: 9_999 }));
+        assert_eq!(before(limine(GHZ3, 1, LIMINE_STALL_US), entry, GHZ3).check(), Ok(()), "exactly the wait");
+        assert_eq!(
+            Disorder::HandoffTooEarly { handed_off_us: 9_999 }.to_string(),
+            "Limine handed off at 9999 us, sooner after the TSC's 0 than its own 10000 us wait"
+        );
+    }
+
+    /// `check` runs the units check on the tick it computes: given a tick in
+    /// microseconds (the mix-up #55's review found), it says so.
+    #[test]
+    fn check_refuses_a_handoff_tick_in_microseconds() {
+        let l = limine(GHZ3, 1_000_000, 2_000_000);
+        let b = before(l, 10 * GHZ3, GHZ3);
+        assert_eq!(b.check_with(l.handoff_tick().unwrap()), Ok(()));
+        assert_eq!(b.check_with(2_000_000), Err(Disorder::UnitsDisagree { back_us: 666 }));
     }
 }
