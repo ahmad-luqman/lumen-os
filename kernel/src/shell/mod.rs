@@ -4,9 +4,9 @@
 //!   (appends and `BS space BS` erases only, never an escape code: the test
 //!   harness reads serial line by line) unless the command line has
 //!   `lumen.ansi`, which gives it the screen shell's editing. It runs on the
-//!   boot CPU's `main` thread (kmain's context), polling serial (no serial
-//!   interrupt yet, #61) and yielding to the CPU's other threads between
-//!   polls.
+//!   boot CPU's `main` thread (kmain's context), blocked until COM1's
+//!   interrupt brings a byte ([`serial_in`], #120; it polls, yielding,
+//!   without that interrupt).
 //! - The screen shells, one per virtual terminal (`term::VTS`), read the
 //!   PS/2 keyboard while their terminal is shown (Alt+F1 to Alt+F4 switch:
 //!   `crate::vt`) and answer on it, with ANSI line editing. Each runs in its
@@ -30,6 +30,7 @@ mod pipe;
 pub(crate) mod sysinfo;
 
 use crate::keyboard::{self, KeyCode};
+use crate::serial_in;
 use crate::term;
 use alloc::string::String;
 use core::fmt::{self, Write};
@@ -212,7 +213,7 @@ pub fn run() -> ! {
     }
     // The serial shell's keys by interrupt from here on (it blocks for
     // them instead of polling).
-    crate::serial_in::init();
+    serial_in::init();
     let mode = if crate::cmdline::has_flag("lumen.ansi") { Mode::Ansi } else { Mode::Plain };
     let max = if mode == Mode::Ansi { max_line(SERIAL_COLUMNS) } else { MAX_LINE };
     run_on(Serial { decoder: Decoder::new() }, Editor::new(PROMPT, mode, max, HISTORY))
@@ -302,12 +303,12 @@ impl Console for Serial {
             }
             // Block until IRQ 4 brings a byte (the CPU halts meanwhile);
             // without the interrupt, yield to the CPU's other threads.
-            crate::serial_in::wait();
+            serial_in::wait();
         }
     }
 
     fn try_key(&mut self) -> Option<Key> {
-        while let Some(byte) = crate::serial_in::read_byte() {
+        while let Some(byte) = serial_in::read_byte() {
             if let Some(key) = self.decoder.feed(byte) {
                 return Some(key);
             }
