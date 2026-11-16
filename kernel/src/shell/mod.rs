@@ -29,7 +29,6 @@ mod crash;
 mod pipe;
 pub(crate) mod sysinfo;
 
-use crate::arch::serial;
 use crate::keyboard::{self, KeyCode};
 use crate::term;
 use alloc::string::String;
@@ -104,8 +103,8 @@ impl<'a> Ctx<'a> {
 
     /// Wait for the next key typed on this console (see [`Self::poll_key`]):
     /// on a virtual terminal the thread sleeps until IRQ 1 (or another
-    /// shell routing it a key); on serial it polls, yielding to the CPU's
-    /// other threads.
+    /// shell routing it a key); on serial until IRQ 4 brings a byte
+    /// (`serial_in`; it polls, yielding, without that interrupt).
     #[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
     pub fn wait_key(&mut self) -> Key {
         self.out.read_key()
@@ -211,6 +210,9 @@ pub fn run() -> ! {
         }
         Err(why) => log::info!(target: "shell", "shell on serial (none on the screen: {why}); type 'help'"),
     }
+    // The serial shell's keys by interrupt from here on (it blocks for
+    // them instead of polling).
+    crate::serial_in::init();
     let mode = if crate::cmdline::has_flag("lumen.ansi") { Mode::Ansi } else { Mode::Plain };
     let max = if mode == Mode::Ansi { max_line(SERIAL_COLUMNS) } else { MAX_LINE };
     run_on(Serial { decoder: Decoder::new() }, Editor::new(PROMPT, mode, max, HISTORY))
@@ -298,14 +300,14 @@ impl Console for Serial {
             if let Some(key) = self.try_key() {
                 return key;
             }
-            // Let the CPU's other threads run (the screen shells, woken by a
-            // key, among them).
-            crate::sched::yield_now();
+            // Block until IRQ 4 brings a byte (the CPU halts meanwhile);
+            // without the interrupt, yield to the CPU's other threads.
+            crate::serial_in::wait();
         }
     }
 
     fn try_key(&mut self) -> Option<Key> {
-        while let Some(byte) = serial::try_read_byte() {
+        while let Some(byte) = crate::serial_in::read_byte() {
             if let Some(key) = self.decoder.feed(byte) {
                 return Some(key);
             }

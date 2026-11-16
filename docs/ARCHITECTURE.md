@@ -113,6 +113,24 @@ tests (for example `lumen-elf`, the symbol-table reader).
    the UART out of loopback before its first line and again once the other
    CPUs are stopped, in case one was in the loopback ktest (the reset is
    ktested, not a crash during that ktest).
+
+   Reading is by interrupt once the shells start (`serial_in`, #120; not
+   in the test kernel, whose loopback ktest reads the UART itself): ISA
+   IRQ 4 is routed like the keyboard's (section 6, "Keyboard"), the UART
+   interrupts when received bytes wait (OUT2 set, the received-data
+   interrupt enabled; with the FIFO's trigger level 14 that is at 14 bytes
+   or after a four-character timeout, a few interrupts per typed line),
+   and the handler moves the waiting
+   bytes into a 256-byte queue (`lumen_queue::ByteQueue`) as far as it has
+   room, waking the serial shell. Bytes past its room stay in the UART
+   (QEMU holds back the rest), so none are dropped; the reader takes the
+   queue's bytes, then the UART's (their interrupt's edge has passed), with
+   interrupts off on the boot CPU, the queue's producer. The serial shell
+   blocks until either has a byte, so an idle boot CPU halts. (It used to
+   poll, keeping the CPU 100% busy; under TCG on a loaded host such a vCPU
+   was put aside for longer than the sound driver's 160 ms queue.)
+   Without a route the shell polls, yielding (not tested). The crash
+   reporter's loopback reset clears OUT2 again: nothing reads input then.
 5. Logger (level from `lumen.log=`), Limine responses checked, the symbol table
    located in our own ELF, a memory-map summary, the frame allocator
    (`INFO  mem: frames: N usable, M reserved`), the kernel's own page tables
@@ -1185,10 +1203,9 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   `shell-vt4`, on the boot CPU, started only with a terminal and a
   keyboard: without a keyboard boot says `shell on serial (none on the
   screen: no keyboard)`, tested with `i8042=off`; without a terminal, or
-  no thread for one, not tested). The serial shell polls serial (no serial
-  interrupt yet), yielding to the CPU's other threads between polls
-  (sleeping instead would switch to the idle thread and trace twice a
-  millisecond); the virtual terminals' shells block in `vt::wait_key`.
+  no thread for one, not tested). The serial shell blocks until COM1's
+  interrupt brings a byte (`serial_in`, section 4, step 4), or polls, yielding,
+  without one; the virtual terminals' shells block in `vt::wait_key`.
   Log lines go to serial and the first virtual terminal. A terminal whose
   shell's thread didn't start says so on it (not tested).
 - **Words** (`lumen_shell::words`): blanks separate words; `'...'` keeps
@@ -1296,8 +1313,8 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
     leaves it idle and checks both), and the threads homed there
     (`sched::threads`, a registry of weak references); then CPUs stuck
     starting, and in the header those halted past `MAX_CPUS` (neither
-    tested). The boot CPU reads nearly 100% busy even when idle: the
-    serial shell polls serial, yielding, and never sleeps.
+    tested). (The boot CPU read nearly 100% busy even when idle until the
+    serial shell stopped polling serial, #120.)
   - `mem`: frames used of those the allocator owns, the heap's counters,
     and the kernel stacks registered, by kind (sizes without their guard
     pages).
@@ -2065,7 +2082,9 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
   one critical section, wakes the thread (a `WaitQueue`) and returns a
   `Sound` (a private id and a cell its `Outcome` lands in: `Played`,
   `Stopped`, `Replaced` or `Failed(why)`, so the outcome is never lost to
-  later sounds). A newer sound cuts the playing one off at its next
+  later sounds). `sound`'s state is `playing` from then on, before the
+  thread has taken the sound (#120: `beep` returns first, and the next
+  command may run before the thread does), until it is over. A newer sound cuts the playing one off at its next
   period (up to 160 ms already queued still plays; a sound that has made
   all its samples plays out); a sound still waiting is dropped.
   `sound::stop(&sound)` fades a sound out (the periods already queued

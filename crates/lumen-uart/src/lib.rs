@@ -4,7 +4,7 @@
 //! model 16550. Everything that decides what to write is here: whether a
 //! UART answers ([`probe`]), how to program it and write to it ([`init`],
 //! [`Mode`]), `\n` as `\r\n` in bursts ([`write_bytes`]), and reading
-//! ([`try_read`]).
+//! ([`try_read`]; by interrupt: [`enable_rx_interrupt`], [`drain`]).
 //!
 //! A burst assumes the transmit FIFO is empty once the line status says so
 //! (THRE), and fills all but one of its slots ([`BURST`]). Two writers
@@ -48,11 +48,18 @@ pub const LSR_TX_IDLE: u8 = 1 << 6;
 pub const LCR_DLAB: u8 = 0x80;
 /// Line control: 8 data bits, no parity, one stop bit.
 pub const LCR_8N1: u8 = 0x03;
-/// FIFO control: enable and clear both FIFOs, receive trigger level 14
-/// (unused: interrupts are off).
+/// FIFO control: enable and clear both FIFOs, receive trigger level 14:
+/// with the received-data interrupt on ([`enable_rx_interrupt`]), it comes
+/// once 14 bytes wait, or after a character timeout (four characters' time
+/// with fewer waiting and none arriving), so a typed line raises a few
+/// interrupts, not one per byte.
 pub const FCR_ENABLE_CLEAR: u8 = 0xc7;
+/// Interrupt enable: received data available.
+pub const IER_RX_DATA: u8 = 1 << 0;
 /// Modem control: DTR and RTS.
 pub const MCR_DTR_RTS: u8 = 0x03;
+/// Modem control: OUT2, which gates the UART's interrupt line on a PC.
+pub const MCR_OUT2: u8 = 1 << 3;
 /// Modem control: loopback (what is sent comes back to the receiver).
 pub const MCR_LOOPBACK: u8 = 1 << 4;
 /// The 16550A's transmit (and receive) FIFO size.
@@ -190,6 +197,33 @@ pub fn try_read(r: &mut impl Registers, mode: Mode) -> Option<u8> {
         return None;
     }
     (r.read(reg::LINE_STATUS) & LSR_DATA_READY != 0).then(|| r.read(reg::DATA))
+}
+
+/// Interrupt when received bytes wait (after [`init`], which leaves DLAB
+/// clear and, with a FIFO, the trigger level at 14: [`FCR_ENABLE_CLEAR`];
+/// without one, with each byte): OUT2 set with DTR and RTS, and the
+/// received-data interrupt enabled. Nothing without a UART; whether it was
+/// enabled.
+pub fn enable_rx_interrupt(r: &mut impl Registers, mode: Mode) -> bool {
+    if mode == Mode::Absent {
+        return false;
+    }
+    r.write(reg::MODEM_CTRL, MCR_DTR_RTS | MCR_OUT2);
+    r.write(reg::INT_ENABLE, IER_RX_DATA);
+    true
+}
+
+/// Hand received bytes to `push` while one is waiting, at most `room`;
+/// how many. Bytes past `room` stay in the UART (nothing is dropped here):
+/// an interrupt handler whose queue is full leaves them for the reader.
+pub fn drain(r: &mut impl Registers, mode: Mode, room: usize, mut push: impl FnMut(u8)) -> usize {
+    let mut n = 0;
+    while n < room {
+        let Some(byte) = try_read(r, mode) else { break };
+        push(byte);
+        n += 1;
+    }
+    n
 }
 
 #[cfg(test)]

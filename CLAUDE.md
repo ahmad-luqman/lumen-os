@@ -186,6 +186,8 @@ own PR that updates that doc first.
   `mouse.rs`: the virtio tablet (#98; bound by class, read by its own
   `mouse` thread, which moves the pointer; `mouse::status` for `mouse`).
   `make run` attaches a tablet.
+  `serial_in.rs`: COM1's input by interrupt (IRQ 4) into the queue the
+  serial shell blocks on (#120; it used to poll).
   `keyboard.rs`: the PS/2 keyboard (8042 init, IRQ 1, `pc-keyboard`
   decoding, `lumen.keymap=`); `arch/x86_64/i8042.rs` its ports.
   `time.rs`: TSC and LAPIC timer calibration, the boot origin
@@ -246,7 +248,8 @@ own PR that updates that doc first.
   fake configuration space).
 - `crates/lumen-uart`: 16550 UART logic: presence probe (scratch or
   interrupt enable register), FIFO detection, `\n` as `\r\n` in 15-byte
-  bursts (one FIFO slot left for the crash reporter's byte) (host-tested
+  bursts (one FIFO slot left for the crash reporter's byte), the receive
+  interrupt's setup and a drain bounded by the reader's room (host-tested
   against a model UART).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,

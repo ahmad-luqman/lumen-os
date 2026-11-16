@@ -399,3 +399,41 @@ fn mode_round_trips_through_u8() {
     }
     assert_eq!(Mode::from_u8(0xff), Mode::Absent);
 }
+
+#[test]
+fn rx_interrupts_are_enabled_with_out2() {
+    // (#120) OUT2 (a PC's interrupt gate) with DTR and RTS, then the
+    // received-data interrupt; the FIFO keeps `init`'s trigger level (14:
+    // a line raises a few interrupts, not one per byte). Nothing at all
+    // without a UART.
+    for iir in [0xc0, 0x00] {
+        let (mut m, mode) = ready(iir);
+        let before = m.writes.len();
+        assert!(enable_rx_interrupt(&mut m, mode));
+        assert_eq!(m.writes[before..], [(reg::MODEM_CTRL, 0x0b), (reg::INT_ENABLE, IER_RX_DATA)]);
+        assert_eq!((m.ier, m.mcr), (0x01, 0x0b));
+    }
+    let (m, _) = ready(0xc0);
+    assert!(m.writes.contains(&(reg::FIFO_CTRL, FCR_ENABLE_CLEAR)));
+    let mut m = Model::new();
+    m.absent = true;
+    assert!(!enable_rx_interrupt(&mut m, Mode::Absent));
+    assert!(m.writes.is_empty());
+}
+
+#[test]
+fn drain_stops_at_room_and_leaves_the_rest_in_the_uart() {
+    // A handler with room for 3 takes 3 bytes in order; the rest stay
+    // waiting (data ready) for the next drain, then nothing is left.
+    let (mut m, mode) = ready(0xc0);
+    m.rx.extend_from_slice(b"hello");
+    let mut got = Vec::new();
+    assert_eq!(drain(&mut m, mode, 3, |b| got.push(b)), 3);
+    assert_eq!(got, b"hel");
+    assert_ne!(m.read(reg::LINE_STATUS) & LSR_DATA_READY, 0);
+    assert_eq!(drain(&mut m, mode, 0, |b| got.push(b)), 0);
+    assert_eq!(drain(&mut m, mode, 16, |b| got.push(b)), 2);
+    assert_eq!(got, b"hello");
+    assert_eq!(drain(&mut m, mode, 16, |b| got.push(b)), 0);
+    assert_eq!(drain(&mut m, Mode::Absent, 16, |b| got.push(b)), 0);
+}

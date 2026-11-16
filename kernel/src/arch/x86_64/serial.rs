@@ -136,6 +136,27 @@ pub fn try_read_byte() -> Option<u8> {
     read_from(&mut com1(), mode())
 }
 
+#[cfg_attr(feature = "ktest", allow(dead_code))] // the serial shell's input
+/// Have COM1 interrupt when received bytes wait (`lumen_uart::enable_rx_interrupt`):
+/// for `serial_in`, once IRQ 4 is routed. Whether there was a UART to do it.
+/// ([`leave_loopback`] clears OUT2 again: the crash reporter reads nothing.)
+pub fn enable_rx_interrupt() -> bool {
+    lumen_uart::enable_rx_interrupt(&mut com1(), mode())
+}
+
+#[cfg_attr(feature = "ktest", allow(dead_code))] // the serial shell's input
+/// Hand up to `room` received bytes to `push` (`lumen_uart::drain`); how
+/// many. The rest stay in the UART.
+pub fn drain(room: usize, push: impl FnMut(u8)) -> usize {
+    lumen_uart::drain(&mut com1(), mode(), room, push)
+}
+
+#[cfg_attr(feature = "ktest", allow(dead_code))] // the serial shell's input
+/// Whether a received byte is waiting (never without a UART).
+pub fn data_ready() -> bool {
+    present() && com1().read(lumen_uart::reg::LINE_STATUS) & lumen_uart::LSR_DATA_READY != 0
+}
+
 /// A byte-by-byte writer without a lock (see the module doc): for the crash
 /// reporter, which can't wait for a lock. Everything else writes through
 /// `klog::LockedSerial`.
