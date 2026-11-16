@@ -4,7 +4,19 @@
 //! model 16550. Everything that decides what to write is here: whether a
 //! UART answers ([`probe`]), how to program it and write to it ([`init`],
 //! [`Mode`]), `\n` as `\r\n` in bursts ([`write_bytes`]), and reading
-//! ([`try_read`]; by interrupt: [`enable_rx_interrupt`], [`drain`]).
+//! ([`data_ready`], [`try_read`]; by interrupt: [`enable_rx_interrupt`],
+//! the handler's [`drain`], and the reader's policy, [`read_next`] and
+//! [`available`]).
+//!
+//! **Reading by interrupt.** The received-data interrupt reaches the CPU
+//! as an edge (ISA IRQ 4 through an I/O APIC): the line rises when bytes
+//! start waiting and stays up until the reader takes them all, so no new
+//! edge comes while any byte waits. The handler drains what its queue has
+//! room for; bytes past that stay in the UART, behind those queued. So the
+//! reader takes the queue first, then the UART ([`read_next`]), and must
+//! not wait while either holds a byte ([`available`]): a byte left in the
+//! UART raises no interrupt of its own. (The tests run this against a
+//! model whose handler runs only on an edge.)
 //!
 //! A burst assumes the transmit FIFO is empty once the line status says so
 //! (THRE), and fills all but one of its slots ([`BURST`]). Two writers
@@ -191,31 +203,46 @@ fn wait_thr_empty(r: &mut impl Registers) {
     }
 }
 
+/// Whether a received byte is waiting (never without a UART).
+pub fn data_ready(r: &mut impl Registers, mode: Mode) -> bool {
+    mode != Mode::Absent && r.read(reg::LINE_STATUS) & LSR_DATA_READY != 0
+}
+
 /// One received byte, if one is waiting (never without a UART).
 pub fn try_read(r: &mut impl Registers, mode: Mode) -> Option<u8> {
-    if mode == Mode::Absent {
-        return None;
-    }
-    (r.read(reg::LINE_STATUS) & LSR_DATA_READY != 0).then(|| r.read(reg::DATA))
+    data_ready(r, mode).then(|| r.read(reg::DATA))
 }
 
 /// Interrupt when received bytes wait (after [`init`], which leaves DLAB
 /// clear and, with a FIFO, the trigger level at 14: [`FCR_ENABLE_CLEAR`];
 /// without one, with each byte): OUT2 set with DTR and RTS, and the
-/// received-data interrupt enabled. Nothing without a UART; whether it was
-/// enabled.
-pub fn enable_rx_interrupt(r: &mut impl Registers, mode: Mode) -> bool {
+/// received-data interrupt enabled. Nothing without a UART.
+pub fn enable_rx_interrupt(r: &mut impl Registers, mode: Mode) {
     if mode == Mode::Absent {
-        return false;
+        return;
     }
     r.write(reg::MODEM_CTRL, MCR_DTR_RTS | MCR_OUT2);
     r.write(reg::INT_ENABLE, IER_RX_DATA);
-    true
+}
+
+/// The reader's next byte (the module doc, "Reading by interrupt"): the
+/// queue's (`pop`, the older bytes), else the UART's (bytes the handler
+/// left there for want of room). Never waits.
+pub fn read_next(r: &mut impl Registers, mode: Mode, pop: impl FnOnce() -> Option<u8>) -> Option<u8> {
+    pop().or_else(|| try_read(r, mode))
+}
+
+/// Whether the reader has a byte to take (`queued`: its queue isn't
+/// empty): the condition its wait for the interrupt must check, since a
+/// byte left in the UART raises no new edge.
+pub fn available(r: &mut impl Registers, mode: Mode, queued: bool) -> bool {
+    queued || data_ready(r, mode)
 }
 
 /// Hand received bytes to `push` while one is waiting, at most `room`;
-/// how many. Bytes past `room` stay in the UART (nothing is dropped here):
-/// an interrupt handler whose queue is full leaves them for the reader.
+/// how many. Bytes past `room` stay in the UART for the reader
+/// ([`read_next`]); the sender's next bytes then wait behind a full FIFO
+/// (QEMU stops feeding it; a real UART overruns and drops them).
 pub fn drain(r: &mut impl Registers, mode: Mode, room: usize, mut push: impl FnMut(u8)) -> usize {
     let mut n = 0;
     while n < room {
