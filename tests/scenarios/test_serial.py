@@ -120,17 +120,20 @@ def _com1_interrupts(m: Machine, allow: str | None = None) -> int:
 
 SERIAL = re.compile(
     r"serial: COM1 input by interrupt \(ISA IRQ 4, GSI 4, vector 0x54\): (\d+) interrupts brought "
-    r"input; waits woken by one: (\d+), input found at the deadline: (\d+)\n"
+    r"input; waits woken by one: (\d+), readied by the deadline first: (\d+), input found at the "
+    r"deadline: (\d+)\n"
 )
 
 
-def _serial(m: Machine, allow: str | None = None) -> tuple[int, int, int]:
+def _serial(m: Machine, allow: str | None = None) -> tuple[int, int, int, int]:
     """`serial`'s counts: interrupts that brought input, waits they woke,
-    and waits that found input at their deadline."""
+    waits their deadline readied first (an interrupt brought the input
+    before the shell ran), and waits that found input at their deadline
+    (no interrupt brought it)."""
     out = run(m, "serial", allow=allow)
     found = SERIAL.fullmatch(out)
     assert found, out
-    return int(found[1]), int(found[2]), int(found[3])
+    return int(found[1]), int(found[2]), int(found[3]), int(found[4])
 
 
 def _idle_second(m: Machine, allow: str | None = None) -> tuple[int, int]:
@@ -154,16 +157,18 @@ def test_the_serial_shell_waits_for_input_by_interrupt(boot):
     # 14+ bytes reach the FIFO's trigger level, not only its timeout.
     m = shell(boot)
     first = _com1_interrupts(m)
-    _, woken_before, _ = _serial(m)
+    _, woken_before, late_before, _ = _serial(m)
     idle, main = _idle_second(m)
     assert idle >= 50 and idle > main, (idle, main)
     for i in range(6):
         assert run(m, f"echo a line typed while waiting {i}") == f"a line typed while waiting {i}\n"
     assert _com1_interrupts(m) > first
-    brought, woken, at_deadline = _serial(m)
-    assert at_deadline == 0 and woken - woken_before >= 6 and brought >= woken, (
+    brought, woken, late, at_deadline = _serial(m)
+    lines = woken - woken_before + late - late_before
+    assert at_deadline == 0 and lines >= 6 and brought >= woken + late, (
         brought,
         woken,
+        late,
         at_deadline,
     )
     assert MISSED_WARNING not in m.output
@@ -188,7 +193,12 @@ def test_the_safety_net_reads_input_when_irq_4_never_comes(boot):
         assert run(m, f"echo more {i}", allow=MISSED_WARNING) == f"more {i}\n"
     assert m.output.count(MISSED_WARNING) == 1, m.output
     assert _com1_interrupts(m, MISSED_WARNING) == 0
-    brought, woken, at_deadline = _serial(m, MISSED_WARNING)
-    assert (brought, woken) == (0, 0) and at_deadline >= 3, (brought, woken, at_deadline)
+    brought, woken, late, at_deadline = _serial(m, MISSED_WARNING)
+    assert (brought, woken, late) == (0, 0, 0) and at_deadline >= 3, (
+        brought,
+        woken,
+        late,
+        at_deadline,
+    )
     idle, main = _idle_second(m, MISSED_WARNING)
     assert idle >= 50 and idle > main, (idle, main)

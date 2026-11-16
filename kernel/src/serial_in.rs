@@ -31,9 +31,13 @@
 //!   ms: input found at the deadline in the UART only, nothing queued, gets
 //!   one more period for a late interrupt to queue it (a race measured
 //!   under load: QEMU's character timeout 1.6 ms after the deadline). Each
-//!   wait's end is counted (`serial` shows them): woken by the handler, or
-//!   input found at the deadline (and, if only in the UART, still there a
-//!   period later). Three of the latter in a row, with no interrupt
+//!   wait's end is counted (`serial` shows them): woken by the handler;
+//!   readied by the deadline first, with an interrupt bringing the input
+//!   after it but before the reader ran (another thread on the CPU, or the
+//!   vCPU, ran meanwhile: common under load during a sound); or input
+//!   found at the deadline (with no interrupt, or one before the deadline
+//!   that didn't wake it; if only in the UART, still there a period
+//!   later). Three of the latter in a row, with no interrupt
 //!   bringing input between, warn once (`lumen_uart::MissedInterrupts`).
 //! - **How it waits** (`lumen_uart::wait_mode`): with the interrupt, block
 //!   with the deadline; without a UART, block for good; either only where
@@ -81,8 +85,15 @@ static INPUT_IRQS: AtomicU64 = AtomicU64::new(0);
 /// Times the handler woke the waiting reader (it was blocked, and this
 /// wake, not its deadline, readied it: `WaitQueue::wake_all`'s count).
 static READER_WOKEN: AtomicU64 = AtomicU64::new(0);
+/// When (`time::now_ns`) the first interrupt that brought input since the
+/// reader last blocked came (`u64::MAX`: none yet).
+static FIRST_INPUT_IRQ_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Waits woken by an interrupt that brought input.
 static WOKEN: AtomicU64 = AtomicU64::new(0);
+/// Waits readied by their deadline, whose input an interrupt then brought
+/// before the reader ran (it was no longer blocked, so the wake didn't
+/// count).
+static LATE: AtomicU64 = AtomicU64::new(0);
 /// Waits that found input at their deadline, no interrupt having brought
 /// any.
 static AT_DEADLINE: AtomicU64 = AtomicU64::new(0);
@@ -139,6 +150,7 @@ pub fn init() {
 fn on_irq() {
     if queue_waiting() > 0 {
         INPUT_IRQS.fetch_add(1, Ordering::Relaxed);
+        FIRST_INPUT_IRQ_NS.fetch_min(crate::time::now_ns(), Ordering::Relaxed);
     }
 }
 
@@ -191,6 +203,7 @@ pub fn wait() {
 /// ended, and warn once if input keeps being found at the deadline.
 fn wait_with_deadline() {
     let woken = READER_WOKEN.load(Ordering::Relaxed);
+    FIRST_INPUT_IRQ_NS.store(u64::MAX, Ordering::Relaxed);
     let deadline = crate::time::now_ns() + WAIT_NS;
     let found = WAITING.wait_until_or_deadline(deadline, available);
     if found && READER_WOKEN.load(Ordering::Relaxed) == woken && QUEUE.is_empty() {
@@ -202,14 +215,23 @@ fn wait_with_deadline() {
         let grace = crate::time::now_ns() + WAIT_NS;
         let _ = WAITING.wait_until_or_deadline(grace, || !QUEUE.is_empty());
     }
+    let first_irq = FIRST_INPUT_IRQ_NS.load(Ordering::Relaxed);
     let end = if READER_WOKEN.load(Ordering::Relaxed) != woken {
         // The handler's wake readied this thread (even if it ran only after
         // the deadline).
         WOKEN.fetch_add(1, Ordering::Relaxed);
         WaitEnd::Interrupt
+    } else if first_irq != u64::MAX && first_irq >= deadline {
+        // The deadline readied it first (the only other waker), and then an
+        // interrupt brought the input before it ran: the interrupt came,
+        // only later than the deadline (another thread on this CPU, or the
+        // vCPU, ran meanwhile).
+        LATE.fetch_add(1, Ordering::Relaxed);
+        WaitEnd::Interrupt
     } else if found && crate::time::now_ns() >= deadline {
         // A deadline readied it, and input was waiting: no interrupt woke
-        // it for that input (none came, or one came and didn't wake).
+        // it for that input (none came, or one came before the deadline
+        // and didn't wake it).
         AT_DEADLINE.fetch_add(1, Ordering::Relaxed);
         WaitEnd::InputAtDeadline
     } else {
@@ -241,11 +263,12 @@ pub fn serial_command(ctx: &mut Ctx<'_>, args: &[String]) {
     } else if BY_INTERRUPT.load(Ordering::Acquire) {
         let _ = writeln!(
             t,
-            "serial: COM1 input by interrupt (ISA IRQ {COM1_IRQ}, GSI {}, vector {:#04x}): {} interrupts brought input; waits woken by one: {}, input found at the deadline: {}",
+            "serial: COM1 input by interrupt (ISA IRQ {COM1_IRQ}, GSI {}, vector {:#04x}): {} interrupts brought input; waits woken by one: {}, readied by the deadline first: {}, input found at the deadline: {}",
             GSI.load(Ordering::Relaxed),
             VECTOR.load(Ordering::Relaxed),
             INPUT_IRQS.load(Ordering::Relaxed),
             WOKEN.load(Ordering::Relaxed),
+            LATE.load(Ordering::Relaxed),
             AT_DEADLINE.load(Ordering::Relaxed)
         );
     } else {

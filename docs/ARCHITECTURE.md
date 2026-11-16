@@ -143,7 +143,11 @@ tests (for example `lumen-elf`, the symbol-table reader).
    measured arriving 1.6 ms after such a deadline), and three waits in a
    row that find input at their deadline (no interrupt bringing input
    between) warn once to check IRQ 4's routing. `serial` counts how the
-   waits ended (woken by the interrupt, or input found at the deadline);
+   waits ended: woken by the interrupt; readied by the deadline first,
+   with an interrupt bringing the input before the shell ran (another
+   thread on the CPU, or the vCPU, ran meanwhile: common under load
+   during a sound, and not a missed interrupt); or input found at the
+   deadline with no interrupt bringing it;
    a scenario checks that every typed line wakes the shell by interrupt,
    and that with COM1 moved to IRQ 3 the safety net answers and warns
    once. An idle boot CPU halts between; each block and wake is two
