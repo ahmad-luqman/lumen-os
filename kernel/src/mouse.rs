@@ -30,7 +30,13 @@
 //!   overrun (warned about once), the state is marked stale until a clean
 //!   batch brings a frame, and the thread looks again at once instead of
 //!   waiting. The count is a lower bound: frames the device dropped
-//!   can't be counted exactly.
+//!   can't be counted exactly. But no dropped frame goes uncounted: when
+//!   one was dropped at most 2 buffers were free, so at least 30 were
+//!   filled (or popped and not yet re-posted), and the batch going on or
+//!   the next reads all of them before it ends (`lumen_input`'s
+//!   `no_dropped_frame_goes_uncounted` models the ring, #124). A batch is
+//!   warned about before its counts are published, so a `mouse` in
+//!   between shows the frames and overruns before it.
 //! - **Failure.** A device that stops being ready (`FAILED`, which for the
 //!   tablet means the status reads all ones or something else gave up on
 //!   it, `DEVICE_NEEDS_RESET`, or `DRIVER_OK` gone after a reset) ends the

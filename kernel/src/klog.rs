@@ -16,6 +16,11 @@
 //! terminal shows lines up to `info` without it, so screenshots stay
 //! comparable, with the level coloured (`crate::term`).
 //!
+//! The line is also an interface: the scenarios take log lines out of a
+//! serial command's output by this format (`lumen_harness.shell`'s
+//! `LOG_LINE`; a line can land between two of the shell's writes, #124):
+//! change both together.
+//!
 //! The tag is the `target:` given at the call site, or else the module path
 //! with the `lumen_kernel::` prefix removed. The level threshold comes from
 //! `lumen.log=<level>` on the command line (default `info`).

@@ -16,8 +16,9 @@ from lumen_harness.image import assert_matches_golden, compare
 from lumen_harness.qemu import Devices, Machine
 from lumen_harness.qmp import QmpClient, QmpError, pointer_move_args, qcodes_for
 from lumen_harness.screen import expect_screen, read_screen
+from lumen_harness.shell import run
 from PIL import Image
-from test_pci import lspci_rows, msix_rows, qdev_addresses, run
+from test_pci import lspci_rows, msix_rows, qdev_addresses
 
 KBD_LINE = r"INFO  kbd: PS/2 keyboard on ISA IRQ 1 \(GSI 1, vector 0x51\), layout {}\n"
 KBD_STATS = re.compile(

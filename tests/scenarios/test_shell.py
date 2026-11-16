@@ -7,11 +7,13 @@ editor, word splitting and completion are tested on the host
 both consoles."""
 
 import re
+import time
 from collections.abc import Sequence
 
 import pytest
 from lumen_harness.qemu import Devices, Machine, default_accel
 from lumen_harness.screen import PROMPT, expect_screen, read_screen
+from lumen_harness.shell import read_output, run
 
 SHELLS = r"INFO  shell: shells on serial and the screen; type 'help'\n"
 
@@ -21,15 +23,6 @@ def shells(boot, cmdline: str | None = None, extra: Sequence[str] = ()) -> Machi
     m.expect(SHELLS, 60)
     m.expect(PROMPT, 60)
     return m
-
-
-def run(m: Machine, line: str) -> str:
-    """Run `line` in the serial shell: what it printed between its echo and
-    the next prompt."""
-    m.send_line(line)
-    echo = m.expect(re.escape(line) + r"\n", 10)
-    end = m.expect(PROMPT, 10)
-    return m.output[echo.end() : end.start()]
 
 
 def test_irqs_lists_msix(boot):
@@ -80,6 +73,38 @@ def test_echo(boot):
     keys(m, "echo 'x  y' \"\\$HOME\" z\n")
     expect_screen(m, r"^lumen> echo 'x  y' \"\\\$HOME\" z\nx  y \$HOME z$")
     assert "\x1b" not in m.output[start:]
+
+
+# Logged (debug: serial only) when a screen's view moves (test_term).
+VIEW_MOVED = r'\[ *\d+\.\d{6}\] DEBUG term: view \d+ lines up, top row "[^"]*"\n'
+
+
+def wait_for_output(m: Machine, start: int, text: str) -> None:
+    """Wait until serial's output from `start` on matches `text` (a regex)
+    (up to 10 s, scaled), without moving `Machine.expect`'s place."""
+    deadline = time.monotonic() + 10 * m.timeout_scale
+    while not re.search(text, m.output[start:]):
+        assert time.monotonic() < deadline, f"no {text!r} in {m.output[start:]!r}"
+        time.sleep(0.05)
+
+
+def test_a_log_line_inside_a_commands_echo_is_not_output(boot):
+    # The serial shell echoes each key in its own write, and a log line can
+    # land between two of them (#124): here Shift+PageUp on the screen (its
+    # view moves over `seq 100`'s lines), logged at debug, comes between
+    # `echo hel` and `lo` typed on serial. The command's output, as
+    # lumen_harness.shell reads it, is without it; the line was there.
+    m = shells(boot, cmdline="lumen.log=debug")
+    keys(m, "seq 100\n")
+    expect_screen(m, r"^100\nlumen>$")
+    start = len(m.output)
+    m.send("echo hel")
+    wait_for_output(m, start, r"echo hel$")
+    m.qmp().send_key(["shift", "pgup"])
+    wait_for_output(m, start, VIEW_MOVED)
+    m.send("lo\r")
+    assert read_output(m, "echo hello") == "hello\n"
+    assert re.match(rf"echo hel{VIEW_MOVED}lo\nhello\n{PROMPT}", m.output[start:]), m.output[start:]
 
 
 BOOTING = r"INFO  boot: Lumen \d+\.\d+\.\d+ \(x86_64\) booting"
@@ -384,7 +409,7 @@ def test_system_commands(boot):
             rf"^  shell-vt{vt} +\d+ +0 +(blocked|ready|running) +\d+$", out, re.MULTILINE
         ), out
 
-    out = run(m, "dmesg")
+    out = run(m, "dmesg", keep_logs=True)
     assert re.match(r"dmesg: the newest \d+ log lines \(all since boot\)\n", out), out
     # Only whole lines, the first of them the boot banner.
     lines = out.splitlines()
@@ -409,7 +434,7 @@ def test_pipe_text(boot):
     # A command's text through filters, on both consoles: `|` outside quotes
     # ends a command; a mistake is one line.
     m = shells(boot)
-    out = run(m, "dmesg | grep time")
+    out = run(m, "dmesg | grep time", keep_logs=True)
     lines = out.splitlines()
     assert lines and all("time" in line for line in lines), out
     assert any("INFO  time: " in line for line in lines), out

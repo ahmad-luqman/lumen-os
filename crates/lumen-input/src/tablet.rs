@@ -568,4 +568,113 @@ mod tests {
         assert!(may_have_lost_frames(32, 32));
         assert!(may_have_lost_frames(100, 32));
     }
+
+    /// QEMU's tablet and the kernel's `mouse` thread sharing a ring, one
+    /// step at a time in a random order. The device sends a frame only if
+    /// it has a buffer for each of its events (QEMU's `virtio_input_send`
+    /// checks the available buffers at the frame's sync, and drops the
+    /// whole frame otherwise, tracing `virtio_input_queue_full`). The
+    /// thread pops a used buffer and re-posts it in two steps (the crate's
+    /// `pop_pending_event`: the device may act in between), and a batch
+    /// ends when nothing is left to pop.
+    struct Ring {
+        size: u64,
+        /// Buffers the device may fill.
+        free: u64,
+        /// Events filled and not yet popped.
+        used: u64,
+        /// A buffer popped and not yet re-posted.
+        held: bool,
+        /// Events this batch has popped.
+        batch: u64,
+        /// Frames dropped since the last batch that may have lost frames.
+        lost: u64,
+        sent: u64,
+        dropped: u64,
+    }
+
+    impl Ring {
+        fn device_sends(&mut self, frame: u64) {
+            if self.free >= frame {
+                self.free -= frame;
+                self.used += frame;
+                self.sent += 1;
+            } else {
+                self.lost += 1;
+                self.dropped += 1;
+            }
+        }
+
+        /// The thread's next step: re-post, pop, or end the batch (whose
+        /// event count goes to `may_have_lost_frames`).
+        fn thread_steps(&mut self) {
+            if self.held {
+                self.held = false;
+                self.free += 1;
+            } else if self.used > 0 {
+                self.used -= 1;
+                self.held = true;
+                self.batch += 1;
+            } else {
+                let counted = may_have_lost_frames(self.batch, self.size);
+                assert!(
+                    self.lost == 0 || counted,
+                    "{} frames dropped, yet the batch read {} events: not counted",
+                    self.lost,
+                    self.batch
+                );
+                if counted {
+                    self.lost = 0;
+                }
+                self.batch = 0;
+            }
+        }
+    }
+
+    #[test]
+    fn no_dropped_frame_goes_uncounted() {
+        // Any frame the device drops lands in a batch that counts as an
+        // overrun (the batch going on, or the next): when it was dropped,
+        // at most 2 buffers were free, so at least 30 of the 32 were filled
+        // or held, and the thread pops all of them before its batch can
+        // end. Moves (3 events) and button changes (2), bursts and pauses.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let (mut sent, mut dropped) = (0, 0);
+        for _ in 0..200 {
+            let mut r = Ring { size: 32, free: 32, used: 0, held: false, batch: 0, lost: 0, sent: 0, dropped: 0 };
+            // How often the device acts against the thread during a burst:
+            // from evenly to many times as often.
+            let device_weight = 1 + next(16);
+            for _ in 0..100 {
+                // A burst, then a pause in which only the thread runs (long
+                // enough, sometimes, to read everything: a batch then ends
+                // right after a burst that filled the ring).
+                for _ in 0..next(100) {
+                    if next(device_weight + 1) == 0 {
+                        r.thread_steps();
+                    } else {
+                        r.device_sends(if next(4) == 0 { 2 } else { MAX_FRAME });
+                    }
+                }
+                for _ in 0..next(3 * r.size) {
+                    r.thread_steps();
+                }
+            }
+            // Drain: the thread's last batches end.
+            for _ in 0..3 * r.size {
+                r.thread_steps();
+            }
+            assert_eq!(r.lost, 0, "frames dropped and never counted");
+            (sent, dropped) = (sent + r.sent, dropped + r.dropped);
+        }
+        // The runs dropped frames and delivered them (the model isn't
+        // vacuous).
+        assert!(sent > 10_000 && dropped > 10_000, "sent {sent}, dropped {dropped}");
+    }
 }

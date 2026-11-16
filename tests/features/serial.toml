@@ -20,3 +20,11 @@ tests = [
     "scenario:test_serial::test_boots_without_a_uart_and_warns_on_screen_golden",
     "harness:test_qemu::test_machine_without_serial_has_no_serial_port",
 ]
+
+[[feature]]
+name = "A serial command's output as the scenarios read it (`lumen_harness.shell.run`): the log's lines (`[seconds.micros] LEVEL tag: message`) taken out wherever one lands, inside the typed line's echo, between the command's writes or before the prompt; `dmesg`'s read with them kept (#124)"
+milestone = "M3"
+tests = [
+    "harness:test_shell_run::*",
+    "scenario:test_shell::test_a_log_line_inside_a_commands_echo_is_not_output",
+]

@@ -17,6 +17,7 @@ import re
 import pytest
 from lumen_harness.qemu import Devices, Machine
 from lumen_harness.screen import PROMPT
+from lumen_harness.shell import run
 
 SHELLS = r"INFO  shell: shells on serial and the screen; type 'help'\n"
 HEX = re.compile(r"[0-9a-f]+")
@@ -31,15 +32,6 @@ def shell(boot, **kwargs) -> Machine:
     m.expect(SHELLS, 60)
     m.expect(PROMPT, 60)
     return m
-
-
-def run(m: Machine, line: str, timeout: float = 10) -> str:
-    """Run `line` in the serial shell: what it printed between its echo and
-    the next prompt."""
-    m.send_line(line)
-    echo = m.expect(re.escape(line) + r"\n", 10)
-    end = m.expect(PROMPT, timeout)
-    return m.output[echo.end() : end.start()]
 
 
 def random_bytes(m: Machine, n: int | None = None) -> str:

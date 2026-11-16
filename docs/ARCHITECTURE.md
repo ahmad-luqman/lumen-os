@@ -1252,6 +1252,17 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   overlong forms; host tested). The serial shell's writes are made holding
   the log's line lock (`klog::LockedSerial`, see step 4 of the boot
   sequence), so a log line can't land inside one (not tested on its own).
+  It can land between two of them, though: inside a typed line's echo (a
+  write per key), between two writes of a command's output, or after the
+  output, before the prompt. The log isn't held while a command prints
+  (#124): a line shows when it is logged, in stamp order, so a warning
+  during a long or stuck command isn't hidden until it ends. The scenarios
+  read a command's output through `lumen_harness.shell.run`, which takes
+  log lines out wherever they start (the format of "Boot timeline and log
+  timestamps": `[seconds.microseconds] LEVEL tag: message`; change both
+  together), except for a command whose output is log lines (`dmesg`,
+  read with `keep_logs`); a harness self-test feeds it #124's failure, and
+  a scenario puts a log line inside a command's echo.
   Each key's output is written to the console in
   one write, so on the screen a log line can't land in the middle of a
   redraw (not tested on its own). A running command reads keys from its
