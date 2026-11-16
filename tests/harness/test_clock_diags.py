@@ -11,10 +11,15 @@ NOW_NS = (
     "# now_ns moved 50000000 ns, the HPET 50001000 ns: 1000 ns apart, of a 1000020 ns budget\n"
 )
 TIMER = (
-    "# bracket widths min/median/max 0/{median}/{max} ns over 14 brackets; 0 of 7 one-shot windows "
+    "# bracket widths min/median/max 0/{median}/{max} ns over {brackets} brackets; 0 of 7 one-shot windows "
     "with brackets over 5% of them\n"
     "# samples [62500000, 62500100, 62499900, 62500000, 62500000, 62500000, 62500000] Hz\n"
     "# timer counts at 62.5 MHz (calibrated 62.5 MHz)\n"
+)
+BOOT_TIMER = (
+    "# timer boot calibration 62500000 Hz [10000000/625000/1/0/0 10000000/625000/1/0/0 "
+    "10000000/625000/1/0/0 10000000/625000/1/0/0 10000000/625000/1/0/0] retook {retook}, {steady} steady, "
+    "median within 100 ppm; window rates [62500000, 62500000, 62500000, 62500000, 62500000] Hz\n"
 )
 HPET_PLACEMENT = (
     "# injected pause: HPET placement {off} ns off (at most 2500000 ns allowed) on try {tries} "
@@ -34,6 +39,10 @@ def run(
     now_ns_case="now_ns_follows_the_hpet",
     extra_line=False,
     timer_max=39000,
+    timer_brackets=14,
+    boot_timer=True,
+    boot_steady=5,
+    boot_retook=7,
     placement_tries=1,
     injected_retries=2,
     hpet_off=5000,
@@ -66,9 +75,13 @@ def run(
         ),
         (
             "the_timer_is_programmed_for_1_khz",
-            TIMER.format(median=min(1000, timer_max), max=timer_max),
+            TIMER.format(median=min(1000, timer_max), max=timer_max, brackets=timer_brackets),
         ),
         ("a_timer_reading_is_placed_at_its_brackets_midpoint", TIMER_PLACEMENT),
+        (
+            "the_boot_timer_calibration_is_the_median_of_mostly_steady_windows",
+            BOOT_TIMER.format(steady=boot_steady, retook=boot_retook) if boot_timer else "",
+        ),
     ]
     if now_ns_case != "now_ns_follows_the_hpet":
         cases.append(("now_ns_follows_the_hpet", ""))
@@ -122,6 +135,29 @@ def test_another_limit_fails():
 def test_timer_brackets_without_width_fail():
     with pytest.raises(AssertionError, match="over 14 brackets"):
         check_clock_diags(*run(timer_max=0))
+
+
+@pytest.mark.parametrize("brackets", [12, 15])
+def test_timer_brackets_other_than_two_per_window_fail(brackets):
+    with pytest.raises(AssertionError, match=f"over {brackets} brackets"):
+        check_clock_diags(*run(timer_brackets=brackets))
+
+
+def test_a_missing_timer_boot_calibration_line_fails():
+    with pytest.raises(AssertionError, match="0 timer boot calibration lines"):
+        check_clock_diags(*run(boot_timer=False))
+
+
+@pytest.mark.parametrize("steady", [0, 2])
+def test_a_timer_boot_calibration_with_most_windows_unsteady_fails(steady):
+    with pytest.raises(AssertionError, match="most windows unsteady"):
+        check_clock_diags(*run(boot_steady=steady))
+
+
+def test_any_number_of_timer_boot_retakes_passes():
+    # Retakes count a loaded host's stalls at boot: not bounded.
+    check_clock_diags(*run(boot_retook=60))
+    check_clock_diags(*run(boot_steady=3, boot_retook=17))
 
 
 def test_a_placement_too_far_off_fails():

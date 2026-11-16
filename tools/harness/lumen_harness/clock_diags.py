@@ -38,6 +38,14 @@ TIMER_BRACKETS = re.compile(
     r"bracket widths min/median/max (?P<min>\d+)/(?P<median>\d+)/(?P<max>\d+) ns over "
     r"(?P<brackets>\d+) brackets; \d+ of 7 one-shot windows with brackets over 5% of them"
 )
+# `the_boot_timer_calibration_is_the_median_of_mostly_steady_windows` prints
+# the local APIC timer's boot calibration (#129): its windows, retakes, how
+# many are steady and how far off the median can be. Retakes aren't bounded:
+# they count how often a loaded host stalled boot, not the code.
+BOOT_TIMER = re.compile(
+    r"timer boot calibration (?P<hz>\d+) Hz \[(?P<windows>[\d/ ]*)\] retook (?P<retook>\d+), "
+    r"(?P<steady>\d+) steady, median within (?P<bound>\d+) ppm; window rates \[(?P<rates>[\d, ]*)\] Hz"
+)
 PLACEMENT = re.compile(
     r"injected pause: (?P<what>HPET|timer) placement (?P<off>\d+) ns off \(at most "
     rf"(?P<allowed>\d+) ns allowed\) on try (?P<try>\d+) of (?P<tries>\d+), {RETRY_SPACING_MS} ms "
@@ -90,6 +98,18 @@ def check_clock_diags(report: tap.TapReport, text: str) -> None:
     t = one_diagnostic(report, "time::the_timer_is_programmed_for_1_khz", TIMER_BRACKETS)
     low, median, high, count = (int(t[k]) for k in ("min", "median", "max", "brackets"))
     assert low <= median <= high and high > 0 and count == 14, t.group(0)
+    # The timer's boot calibration, once in the run: five windows and rates,
+    # most of them steady (so its median is as good as theirs).
+    lines = re.findall(r"^# timer boot calibration ", text, re.MULTILINE)
+    assert len(lines) == 1, f"{len(lines)} timer boot calibration lines"
+    b = one_diagnostic(
+        report,
+        "time::the_boot_timer_calibration_is_the_median_of_mostly_steady_windows",
+        BOOT_TIMER,
+    )
+    windows, rates = b["windows"].split(), _widths(b["rates"])
+    assert len(windows) == 5 and len(rates) == 5, b.group(0)
+    assert 3 <= int(b["steady"]) <= 5, f"most windows unsteady: {b.group(0)}"
     # The placement tests each report one judged try, within their tries
     # and their allowance.
     for name in (

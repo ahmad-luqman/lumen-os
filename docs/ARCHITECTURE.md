@@ -796,9 +796,15 @@ allocates.
   five; boot logs how many if any, and the last. A PIT read-back that
   can't fit how it was programmed is an error. The local APIC timer (divide
   by 16) is calibrated against the TSC as the median of five 10 ms windows
-  too (no retakes: each end reads the timer's count next to the TSC, so a
-  late look doesn't stretch it, but a pause between those two reads isn't
-  detected), and set periodic at 1 kHz. `time::now_ns` (TSC-based, lock-free) and
+  too, each end a register access between two TSC reads (the timer started
+  by one write, its count read), so a window whose ends were paused (gaps
+  over 0.5% of it) is taken again, 20 ms later (stalls come in bursts), up
+  to 20 (#129). If those run out, the least unsteady fill in rather than
+  panicking the boot: with three or more of the five steady the median lies
+  between theirs; otherwise boot warns how far off it may be (the third
+  smallest gap share). The timer only paces preemption and when deadlines
+  are noticed; sleeps and deadlines are TSC times. It is then set periodic
+  at 1 kHz. `time::now_ns` (TSC-based, lock-free) and
   `time::sleep` (blocks the thread once the scheduler runs on its CPU,
   section "Kernel threads"; busy-waits before that, on an idle thread, with
   interrupts off or a lock held), `time::spin` (always busy). The boot CPU
