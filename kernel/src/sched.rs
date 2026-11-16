@@ -1826,8 +1826,9 @@ crate::ktest!(
         // its deadline: true. Then 200 waits a waker races with the
         // deadline, waking it before and after the tick that notices the
         // deadline: never a panic, a lost thread, an early return or an
-        // entry left behind, each side winning sometimes, and every queue
-        // deadline noticed at the first tick after it.
+        // entry left behind, each side winning sometimes (the waker by
+        // waking it), and every queue deadline noticed at the first tick
+        // after it.
         use crate::{kassert, kassert_eq};
         let me = current().ok_or("the ktests run on a thread")?;
         let q = WaitQueue::new();
@@ -2118,7 +2119,13 @@ crate::ktest!(
         ));
         // Every round, if the race went wrong: which side was off (all
         // times from the round's start, its deadline at +1000 µs).
-        let race_ok = first_tick != 0 && !broken && woke > 0 && timed_out > 0 && fired > 0 && late_deadlines == 0;
+        let race_ok = first_tick != 0
+            && !broken
+            && woke > 0
+            && timed_out > 0
+            && waker_won > 0
+            && fired > 0
+            && late_deadlines == 0;
         if !race_ok {
             let at = |t: u64, x: &Round| match t {
                 0 => alloc::string::String::from("never"),
@@ -2148,6 +2155,9 @@ crate::ktest!(
         kassert!(first_tick != 0);
         kassert!(!broken);
         kassert!(woke > 0 && timed_out > 0);
+        // Some rounds were won by the waker itself, not by a deadline tick
+        // that found the mark already set.
+        kassert!(waker_won > 0);
         kassert!(fired > 0 && late_deadlines == 0);
         Ok(())
     }
