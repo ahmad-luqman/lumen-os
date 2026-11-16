@@ -630,8 +630,6 @@ mod tests {
     /// `may_have_lost_frames(events, counted_ring, frame)`.
     #[derive(Default)]
     struct Ring {
-        /// The buffers posted (32, less any lost to the ring).
-        posted: u64,
         /// The ring size and frame bound the thread counts with.
         counted_ring: u64,
         frame: u64,
@@ -653,7 +651,8 @@ mod tests {
 
     impl Ring {
         fn new(posted: u64, counted_ring: u64, frame: u64) -> Ring {
-            Ring { posted, counted_ring, frame, free: posted, ..Ring::default() }
+            // All `posted` buffers (32, less any lost to the ring) start free.
+            Ring { counted_ring, frame, free: posted, ..Ring::default() }
         }
 
         fn device_sends(&mut self, events: u64) {
@@ -723,7 +722,7 @@ mod tests {
                         r.thread_steps();
                     } else {
                         let size = sizes[rng.below(sizes.len() as u64) as usize];
-                    r.device_sends(size);
+                        r.device_sends(size);
                     }
                 }
                 let full = rng.below(2) == 0;
