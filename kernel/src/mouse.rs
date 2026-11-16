@@ -713,12 +713,56 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn a_release_before_the_park_fails_the_hold() {
+        // A hold no thread answers (made-up tablet), released from
+        // elsewhere while it waits: the request is gone, so it fails
+        // `Released` (not `NotParked`), and the tablet reads on.
+        use crate::kassert_eq;
+        let _bound = MadeUp::bind(None)?;
+        let releaser = crate::sched::spawn("hold-ktest-release", || {
+            crate::time::sleep(100_000_000);
+            release();
+        })
+        .map_err(|_| "spawn")?;
+        let got = hold();
+        releaser.join();
+        kassert_eq!(got, Err(HoldError::Released));
+        kassert_eq!(reads(), Reads::Running);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_release_logs_only_a_hold_it_ends() {
+        // With a tablet bound, releasing one that isn't held logs nothing;
+        // releasing a held one logs one `released:` line.
+        use crate::kassert_eq;
+        let released = || {
+            let mut buf = alloc::vec![0u8; 8192];
+            let (n, _) = crate::klog::copy_recent(&mut buf);
+            String::from_utf8_lossy(&buf[..n]).matches("released: the mouse thread reads again").count()
+        };
+        let _bound = MadeUp::bind(None)?;
+        let before = released();
+        release();
+        kassert_eq!(released(), before);
+        READS.store(Reads::Held as u8, Ordering::SeqCst);
+        release();
+        kassert_eq!(released(), before + 1);
+        kassert_eq!(reads(), Reads::Running);
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn a_release_and_a_hold_back_to_back_read_nothing_between() {
         // A stand-in for the `mouse` thread (its loop's hold check, a
-        // "read" counted, a wait for the doorbell) on a made-up tablet.
+        // "read" counted, a wait for the doorbell long past HOLD_WAIT_NS,
+        // so only `hold`'s ring wakes it in time) on a made-up tablet.
         // Held, released and held again with nothing able to run in
         // between: it parks again without reading. A hold while held
-        // returns at once. Released with STOP set, it leaves without
+        // returns at once and leaves it held. Released, it reads on; held
+        // again, it parks. Released with STOP set, it leaves without
         // another read. (The stand-in runs on this CPU: the cross-CPU case
         // rests on the one SeqCst state.)
         use crate::{kassert, kassert_eq};
@@ -726,12 +770,13 @@ crate::ktest!(
         static STOP: AtomicBool = AtomicBool::new(false);
         static READ: AtomicU64 = AtomicU64::new(0);
         /// Stops and joins the stand-in, also on an early return (dropped
-        /// before `_bound`).
+        /// before `_bound`): released and rung, wherever it waits.
         struct Reader(Option<crate::sched::JoinHandle>);
         impl Drop for Reader {
             fn drop(&mut self) {
                 STOP.store(true, Ordering::SeqCst);
                 set_running();
+                BELL.ring();
                 if let Some(t) = self.0.take() {
                     t.join();
                 }
@@ -750,8 +795,9 @@ crate::ktest!(
                     break;
                 }
                 READ.fetch_add(1, Ordering::SeqCst);
-                // Rung or not, it reads again (a look every 10 ms at most).
-                let _ = BELL.wait_after(seen, crate::time::now_ns().saturating_add(10_000_000));
+                // Rung or not, it reads again; only a ring wakes it before
+                // a hold gives up.
+                let _ = BELL.wait_after(seen, crate::time::now_ns().saturating_add(10 * HOLD_WAIT_NS));
             }
         })
         .map_err(|_| "spawn")?;
@@ -766,9 +812,21 @@ crate::ktest!(
         }
         kassert_eq!(wait_parked(crate::time::now_ns().saturating_add(HOLD_WAIT_NS)), (Reads::Held, false));
         kassert_eq!(hold(), Ok(()));
+        kassert_eq!(reads(), Reads::Held);
         kassert_eq!(READ.load(Ordering::SeqCst), before);
+        // Released, it reads on (the deadline only guards against a hang).
+        release();
+        let deadline = crate::time::now_ns().saturating_add(5 * HOLD_WAIT_NS);
+        while READ.load(Ordering::SeqCst) == before && crate::time::now_ns() < deadline {
+            crate::time::sleep(1_000_000);
+        }
+        let after = READ.load(Ordering::SeqCst);
+        kassert!(after > before);
+        kassert_eq!(hold(), Ok(()));
+        kassert_eq!(reads(), Reads::Held);
+        kassert_eq!(READ.load(Ordering::SeqCst), after);
         drop(core::mem::replace(&mut reader, Reader(None)));
-        kassert_eq!(READ.load(Ordering::SeqCst), before);
+        kassert_eq!(READ.load(Ordering::SeqCst), after);
         Ok(())
     }
 );
