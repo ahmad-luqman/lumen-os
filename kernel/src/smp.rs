@@ -294,7 +294,7 @@ pub fn start_all() -> Started {
 }
 
 /// Spin until `done()` or the deadline (`time::now_ns`); whether `done()`.
-fn spin_until(deadline: u64, done: impl Fn() -> bool) -> bool {
+pub(crate) fn spin_until(deadline: u64, done: impl Fn() -> bool) -> bool {
     while !done() {
         if time::now_ns() >= deadline {
             return false;

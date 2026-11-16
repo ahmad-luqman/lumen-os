@@ -9,7 +9,7 @@ use crate::arch;
 use alloc::string::String;
 use core::arch::asm;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 /// What `crash <kind>` accepts.
 pub const KINDS: &[&str] = &[
@@ -29,6 +29,12 @@ pub const KINDS: &[&str] = &[
     "guard",
     "relock",
     "relocklog",
+    "blockheld",
+    "blockirqoff",
+    "selfblock",
+    "bystander",
+    "firstrun",
+    "heldelsewhere",
 ];
 
 /// Writes to serial and to the virtual terminal whose shell ran the
@@ -161,6 +167,12 @@ fn crash_fn(kind: &str) -> Option<fn()> {
         "bigframe" => crash_big_frame_overflow,
         "relock" => crash_relock,
         "relocklog" => crash_relock_log,
+        "blockheld" => crash_block_with_lock_held,
+        "blockirqoff" => crash_block_with_interrupts_off,
+        "selfblock" => crash_block_after_disabling_for_good,
+        "bystander" => crash_with_a_bystander_blocking,
+        "firstrun" => crash_with_a_bystander_starting,
+        "heldelsewhere" => crash_with_a_bystander_holding,
         _ => return None,
     })
 }
@@ -404,6 +416,191 @@ fn crash_relock() {
 fn crash_relock_log() {
     crate::klog::with_line_lock(|| log::info!(target: "crash", "logging under the line lock"));
     let _ = writeln!(Out, "crash: logging under the line lock went unnoticed");
+}
+
+/// Never woken: the faults below wait on it for good, or rather panic or
+/// halt their CPU on the way.
+static NEVER: crate::sched::WaitQueue = crate::sched::WaitQueue::new();
+
+/// Block with a lock held (a critical section open), no crash report under
+/// way: `WaitQueue`'s wait must panic.
+#[inline(never)]
+fn crash_block_with_lock_held() {
+    static HELD: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+    let held = HELD.lock();
+    NEVER.wait_until(|| false);
+    drop(held);
+    let _ = writeln!(Out, "crash: blocking with a lock held went unnoticed");
+}
+
+/// Block with interrupts off but no critical section open, no crash report
+/// under way, in a wait with a deadline: it must panic too (interrupts off
+/// alone don't mean another CPU's report is stopping this one).
+#[inline(never)]
+fn crash_block_with_interrupts_off() {
+    let were_on = arch::irq::disable();
+    NEVER.wait_until_or_deadline(u64::MAX, || false);
+    arch::irq::restore(were_on);
+    let _ = writeln!(Out, "crash: blocking with interrupts off went unnoticed");
+}
+
+/// Turn interrupts off for good here, as this CPU's own crash path or a
+/// reboot would, then block: the wait must panic (a report then follows,
+/// or a crash during this CPU's own report says so), not halt this CPU
+/// quietly as it does for another CPU's report. If another CPU runs
+/// threads, a thread there turns them off for good too once this CPU has
+/// (and spins), before this CPU blocks: as on a report's owner, whose
+/// stopped CPUs run `disable_for_good` after it. All of it in a critical
+/// section here until the wait, so no other thread runs on this CPU
+/// meanwhile.
+#[inline(never)]
+fn crash_block_after_disabling_for_good() {
+    static OFF_THERE: AtomicBool = AtomicBool::new(false);
+    let section = arch::irq::push_off();
+    let other = other_cpu();
+    if let Some(other) = other {
+        let follower = crate::sched::spawn_on(other, "for-good", || {
+            while !arch::irq::disabled_for_good() {
+                core::hint::spin_loop();
+            }
+            arch::irq::disable_for_good();
+            OFF_THERE.store(true, Ordering::Release);
+            loop {
+                core::hint::spin_loop();
+            }
+        });
+        if let Err(e) = follower {
+            drop(section);
+            let _ = writeln!(Out, "crash: no thread on cpu {other}: {e}");
+            return;
+        }
+    }
+    arch::irq::disable_for_good();
+    if let Some(other) = other
+        && !crate::smp::spin_until(crate::time::now_ns() + WAIT_NS, || OFF_THERE.load(Ordering::Acquire))
+    {
+        panic!("cpu {other} didn't turn interrupts off for good within {WAIT_S} s of this one");
+    }
+    // Interrupts stay off.
+    drop(section);
+    NEVER.wait_until(|| false);
+    let _ = writeln!(Out, "crash: blocking with interrupts off for good went unnoticed");
+}
+
+/// How long the faults below wait for another CPU, at most, each time
+/// (each fault's waits add up to less than the shell's 10 s).
+const WAIT_S: u64 = 4;
+const WAIT_NS: u64 = WAIT_S * 1_000_000_000;
+
+/// The highest CPU but this one that runs threads, if any.
+fn other_cpu() -> Option<usize> {
+    let me = arch::cpu_index();
+    (0..arch::MAX_CPUS).rev().find(|&c| c != me && crate::sched::running_on(c))
+}
+
+/// What the thread on the other CPU does in [`crash_with_a_bystander`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bystander {
+    /// Closes its critical section, then blocks.
+    Leaves,
+    /// Closes its section and yields to a new thread, which blocks on its
+    /// first run.
+    FirstRun,
+    /// Blocks with its section still open.
+    Holds,
+}
+
+/// This CPU's crash begins (interrupts off for good) while a thread on
+/// another CPU is in a critical section; that thread then leaves it,
+/// interrupts staying off, and blocks before the report's stop NMI has
+/// reached its CPU: it must halt for this CPU's report, not panic on the
+/// can't-block check (a second crash: #106, where a screen shell on the
+/// boot CPU did so).
+#[inline(never)]
+fn crash_with_a_bystander_blocking() {
+    crash_with_a_bystander(Bystander::Leaves);
+}
+
+/// [`crash_with_a_bystander_blocking`], but the thread that blocks on the
+/// other CPU is a new one, queued there before this CPU's crash begins and
+/// first run after (the first thread yields to it): its entry leaves
+/// interrupts off, as they are off for good.
+#[inline(never)]
+fn crash_with_a_bystander_starting() {
+    crash_with_a_bystander(Bystander::FirstRun);
+}
+
+/// [`crash_with_a_bystander_blocking`], but the thread blocks with its
+/// critical section still open (a lock held): a bug whatever else is
+/// going on, so it must panic and, being first, own the report.
+#[inline(never)]
+fn crash_with_a_bystander_holding() {
+    crash_with_a_bystander(Bystander::Holds);
+}
+
+/// The three above, with the race made certain. A thread on the other CPU
+/// (see [`other_cpu`]) waits in a critical section, so nothing else runs
+/// there, until interrupts are off for good; then it does what `what`
+/// says. This CPU turns interrupts off for good, as its crash path does
+/// before claiming the report, once that thread is in its section (the
+/// other CPU not halted yet, checked), and faults only once the other CPU
+/// has halted for the report to come (with `FirstRun`, after checking it
+/// was the new thread's wait that halted it). With `Holds` the other CPU
+/// must not halt: its panic's report stops this one while it waits. Each
+/// wait is [`WAIT_S`] at most, then it panics saying which.
+fn crash_with_a_bystander(what: Bystander) {
+    static IN_SECTION: AtomicBool = AtomicBool::new(false);
+    static FIRST_RAN: AtomicBool = AtomicBool::new(false);
+    let me = arch::cpu_index();
+    let Some(other) = other_cpu() else {
+        let _ = writeln!(Out, "crash: no other cpu runs threads");
+        return;
+    };
+    let bystander = crate::sched::spawn_on(other, "bystander", move || {
+        let section = arch::irq::push_off();
+        IN_SECTION.store(true, Ordering::Release);
+        while !arch::irq::disabled_for_good() {
+            core::hint::spin_loop();
+        }
+        if what == Bystander::Holds {
+            NEVER.wait_until(|| false);
+        }
+        // Interrupts stay off: they were turned off for good meanwhile.
+        drop(section);
+        if what == Bystander::FirstRun {
+            crate::sched::yield_now();
+        }
+        NEVER.wait_until(|| false);
+    });
+    if let Err(e) = bystander {
+        let _ = writeln!(Out, "crash: no thread on cpu {other}: {e}");
+        return;
+    }
+    if !crate::smp::spin_until(crate::time::now_ns() + WAIT_NS, || IN_SECTION.load(Ordering::Acquire)) {
+        panic!("the bystander thread on cpu {other} wasn't in its critical section within {WAIT_S} s");
+    }
+    if what == Bystander::FirstRun {
+        // Queued behind the bystander, which holds the CPU until it yields.
+        let second = crate::sched::spawn_on(other, "first-run", || {
+            FIRST_RAN.store(true, Ordering::Release);
+            NEVER.wait_until(|| false);
+        });
+        if let Err(e) = second {
+            panic!("no second thread on cpu {other}: {e}");
+        }
+    }
+    assert!(!crate::crash::halted(other), "cpu {other} halted before a crash began");
+    arch::irq::disable_for_good();
+    if !crate::smp::spin_until(crate::time::now_ns() + WAIT_NS, || crate::crash::halted(other)) {
+        panic!("cpu {other} didn't halt within {WAIT_S} s after cpu {me} turned interrupts off for good");
+    }
+    if what == Bystander::Holds {
+        panic!("cpu {other} halted quietly, its thread blocking with a lock held");
+    }
+    if what == Bystander::FirstRun && !FIRST_RAN.load(Ordering::Acquire) {
+        panic!("cpu {other} halted before its new thread first ran");
+    }
+    crash_page_fault();
 }
 
 crate::ktest!(

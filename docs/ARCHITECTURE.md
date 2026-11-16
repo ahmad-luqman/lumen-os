@@ -711,9 +711,10 @@ allocates.
   dropped in any order never turn them on early, and can't be sent to
   another thread), so a maskable interrupt's handler never spins on a lock
   the code it interrupted holds: it may log, and is allowed to allocate.
-  The crash path turns them off for good before anything else; no guard
-  turns them back on, on any CPU. The lock word is the holder (free, or
-  the holding CPU's index + 1), so a CPU that takes a lock it already holds
+  The crash path (after recording its own crash) and `reboot` turn them
+  off for good, recording which CPU did; from then on no guard turns them
+  back on, on any CPU. The lock word is the holder (free, or the holding
+  CPU's index + 1), so a CPU that takes a lock it already holds
   (an exception or NMI handler taking one the code it interrupted holds, or
   plain nesting) panics with the lock's address and type, the CPU, and the
   caller's location, instead of spinning forever (`crash relock`; only
@@ -792,7 +793,9 @@ allocates.
   reporter's own stack, from the registry), `thread: <name> (id N)` (the
   thread that was running, once that CPU's threads are set up; read lock-free) and, with other CPUs online,
   `other cpus stopped: 0 2 3`: those that had halted when the wait ended,
-  without a crash of their own. `!!!` lines name the rest: a CPU that didn't
+  without a crash of their own (or halted on their own first: a thread
+  that would block on a CPU that hasn't turned interrupts off for good
+  itself, after another CPU did, halts its CPU, see "Kernel threads"). `!!!` lines name the rest: a CPU that didn't
   halt in time, one whose NMI couldn't be sent, one that crashed itself
   (`cpu 2 also crashed: #PF page fault (vector 0xe), rip ...` or `a panic at
   line N`), and APs started but not yet online (no NMI; one could still log
@@ -865,7 +868,25 @@ off. A wake from another CPU queues the thread there and sends the
   its own leftover entries off (a ktest races the two 200 times). Dropping
   a queue with threads waiting panics, as does a thread joining itself
   (not tested).
-  Where a thread can't block, both waits panic (not tested) and
+  Where a thread can't block, both waits panic (tested: `wait_until` with
+  a lock held; `wait_until_or_deadline` with interrupts off; `wait_until`
+  after its own CPU turned interrupts off for good, alone or after another
+  CPU did too), except where it can't because a crash report or a reboot
+  on another CPU turned interrupts off for good and its own CPU hasn't.
+  A thread there finds them off once it closes a critical section,
+  switches itself out and back in (a preempted thread returns through
+  `iretq` with them on), or first runs; until the report's stop NMI (or,
+  for a reboot, the reset) arrives, its wait halts the CPU instead, which
+  the report counts as stopped (#106). Tested with a crash report: a
+  thread closing a critical section (`crash bystander`), a thread's first
+  run (`crash firstrun`), and a thread holding a lock, which still panics
+  (`crash heldelsewhere`). Not tested: a thread switched back in after
+  `sleep` or `yield_now`, the idle thread, a CPU without a scheduler, a
+  reboot. Not told apart, so halting too: an interrupt handler, or code
+  that turned interrupts off with `irq::disable`, waiting in that window.
+  The other places that can't block (`run_sized`, `sched::sleep`, a
+  virtio doorbell's wait) refuse or spin instead, and the stop NMI reaches
+  them there. And
   `time::sleep` busy-waits (tested with a lock held, interrupts off, and
   on an idle thread; before the scheduler runs on the CPU, not tested).
 - **Idle and boot:** each CPU's idle thread runs only when nothing is ready

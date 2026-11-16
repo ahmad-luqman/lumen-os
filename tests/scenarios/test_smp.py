@@ -102,7 +102,8 @@ def test_cpus_past_the_limit_are_halted(boot):
 def crash_on(boot, args: str, cpus: int = 4):
     """Boot `cpus` CPUs, run `crash <args>` in the shell, check QEMU exits with the
     crash code after a complete report (no `!!!` line: every other CPU
-    stopped through its stop NMI; the heap line and `interrupts: off` at
+    stopped for the report, through its stop NMI or, if a thread there would
+    block first, by halting itself; the heap line and `interrupts: off` at
     the end; drawn on screen too). Returns (report, the APs' logged stacks)."""
     m, online = boot_to_prompt(boot, cpus)
     assert online == cpus
@@ -173,6 +174,50 @@ def test_touching_a_guard_page_on_an_ap_names_its_own_stack(boot):
         re.MULTILINE,
     )
     assert hit and hit.groups() == (stacks[2].main_bottom, stacks[2].main_top), report
+
+
+def test_a_cpu_blocking_once_a_crash_began_halts_for_its_report(boot):
+    # #106. CPU 2's crash has begun (interrupts off for good), but its stop
+    # NMI hasn't reached CPU 3 yet. A thread on CPU 3 leaves a critical
+    # section (so interrupts stay off there) and blocks. CPU 3 must halt for
+    # CPU 2's report, not panic on the can't-block check: that panic was a
+    # second crash (`!!! cpu 3 also crashed`), or took the report over.
+    # `crash bystander` fixes the order: CPU 2 faults only once CPU 3 has
+    # halted (`crash::halted`, checked inside the kernel by that handshake:
+    # without the halt CPU 2 never faults, and the report is CPU 3's panic).
+    report, _ = crash_on(boot, "bystander 2")
+    assert reported_by(report, 2) and "\nother cpus stopped: 0 1 3\n" in report, report
+    assert "exception: #PF page fault (vector 14," in report, report
+
+
+def test_a_thread_first_run_once_a_crash_began_halts_for_its_report(boot):
+    # As above, but the thread that blocks on CPU 3 is a new one, queued
+    # there before CPU 2's crash began and first run after it (the thread
+    # holding CPU 3 yields to it): its entry leaves interrupts off, as they
+    # are off for good, and its first wait halts CPU 3.
+    report, _ = crash_on(boot, "firstrun 2")
+    assert reported_by(report, 2) and "\nother cpus stopped: 0 1 3\n" in report, report
+    assert "exception: #PF page fault (vector 14," in report, report
+
+
+def test_a_thread_holding_a_lock_once_a_crash_began_still_panics(boot):
+    # As in the bystander test, but the thread on CPU 3 waits with its
+    # critical section still open: a bug whatever else is going on, so it
+    # panics instead of halting CPU 3, and its report (first to claim it)
+    # stops CPU 2, which was waiting for CPU 3 to halt.
+    report, _ = crash_on(boot, "heldelsewhere 2")
+    assert reported_by(report, 3) and "\nother cpus stopped: 0 1 2\n" in report, report
+    assert "\npanic: blocking where a thread can't (" in report, report
+
+
+def test_a_cpu_that_turned_interrupts_off_itself_still_panics_when_it_blocks(boot):
+    # CPU 0 turns interrupts off for good, then CPU 3 does too (and spins),
+    # as a report's stopped CPUs do after its owner; then CPU 0 blocks. CPU
+    # 0 started this itself, so its wait panics and it reports, rather than
+    # halting quietly as if for CPU 3.
+    report, _ = crash_on(boot, "selfblock")
+    assert reported_by(report, 0) and "\nother cpus stopped: 1 2 3\n" in report, report
+    assert "\npanic: blocking where a thread can't (" in report, report
 
 
 @pytest.mark.parametrize(

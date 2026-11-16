@@ -6,16 +6,17 @@
 //! interrupts were on, and only the last to close restores that, so guards
 //! dropped in any order never turn interrupts on while another section is
 //! still open. `IrqOff` can't be sent to another thread: the depth belongs to
-//! the CPU that opened the section. Once [`disable_for_good`] has run (the
-//! crash path), no section turns them back on.
+//! the CPU that opened the section. Once [`disable_for_good`] has run on
+//! any CPU (a crash report or a reboot), no section turns them back on.
 //!
 //! The depth and saved state are per CPU (indexed by
 //! [`percpu::index`](super::percpu::index)); [`disable_for_good`] holds on
-//! every CPU (a crash stops them all).
+//! every CPU (a crash report or a reboot stops them all), and records which
+//! CPU ran it.
 
 use core::arch::asm;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::percpu::{self, MAX_CPUS};
 
@@ -23,8 +24,11 @@ use super::percpu::{self, MAX_CPUS};
 static DEPTH: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 /// Whether interrupts were on when a CPU's outermost section opened.
 static WERE_ON: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
-/// Set by [`disable_for_good`]: interrupts stay off from then on.
-static FOR_GOOD: AtomicBool = AtomicBool::new(false);
+/// The CPUs that ran [`disable_for_good`], a bit each: once any has,
+/// interrupts stay off on every CPU.
+static FOR_GOOD: AtomicU64 = AtomicU64::new(0);
+// One bit per CPU.
+const _: () = assert!(MAX_CPUS <= 64);
 
 /// RFLAGS.IF.
 const IF: u64 = 1 << 9;
@@ -81,7 +85,7 @@ impl Drop for IrqOff {
         let depth = DEPTH[cpu].load(Ordering::Relaxed);
         assert!(depth > 0, "closing a critical section that isn't open");
         DEPTH[cpu].store(depth - 1, Ordering::Relaxed);
-        if depth == 1 && WERE_ON[cpu].load(Ordering::Relaxed) && !FOR_GOOD.load(Ordering::Relaxed) {
+        if depth == 1 && WERE_ON[cpu].load(Ordering::Relaxed) && !disabled_for_good() {
             sti();
         }
     }
@@ -96,7 +100,7 @@ pub fn depth() -> usize {
 /// that handles them is set up).
 pub fn enable() {
     assert_eq!(depth(), 0, "enabling interrupts inside a critical section");
-    assert!(!FOR_GOOD.load(Ordering::Relaxed), "enabling interrupts after disable_for_good");
+    assert!(!disabled_for_good(), "enabling interrupts after disable_for_good");
     sti();
 }
 
@@ -115,7 +119,7 @@ pub fn disable() -> bool {
 /// [`disable_for_good`] hasn't run), outside every critical section.
 pub fn restore(were_on: bool) {
     assert_eq!(depth(), 0, "restoring interrupts inside a critical section");
-    if were_on && !FOR_GOOD.load(Ordering::Relaxed) {
+    if were_on && !disabled_for_good() {
         sti();
     }
 }
@@ -130,7 +134,7 @@ pub fn restore(were_on: bool) {
 pub fn wait_unless(ready: impl FnOnce() -> bool) {
     assert_eq!(depth(), 0, "waiting inside a critical section");
     cli();
-    if FOR_GOOD.load(Ordering::Relaxed) {
+    if disabled_for_good() {
         super::cpu::halt_forever();
     }
     if ready() {
@@ -145,8 +149,35 @@ pub fn wait_unless(ready: impl FnOnce() -> bool) {
 /// Turn interrupts off on this CPU; from now on no CPU turns them back on:
 /// closing sections don't, [`enable`] refuses and [`wait_unless`] halts the
 /// CPU (one already past that check is stopped by the crash reporter's
-/// NMI). For the crash path, which never returns to what it interrupted.
+/// NMI). For the crash path and `power::reboot`, which never return to what
+/// they interrupted.
 pub fn disable_for_good() {
     cli();
-    FOR_GOOD.store(true, Ordering::Relaxed);
+    // `fetch_or`, not `store`: the bits accumulate, so a CPU that ran this
+    // stays told apart from one that didn't, whoever ran it later (every
+    // CPU a crash report stops runs it too, from the stop NMI).
+    FOR_GOOD.fetch_or(this_cpu_bit(), Ordering::Relaxed);
+}
+
+/// This CPU's bit in [`FOR_GOOD`].
+fn this_cpu_bit() -> u64 {
+    1 << percpu::index()
+}
+
+/// Whether [`disable_for_good`] has run, on any CPU (a crash report or a
+/// reboot has begun). On a CPU that didn't run it, interrupts then stay off
+/// once a critical section closes, a thread switches itself out and back
+/// in, or a new thread first runs, until the crash report's stop NMI halts
+/// it (or, for a reboot, the reset comes).
+pub fn disabled_for_good() -> bool {
+    FOR_GOOD.load(Ordering::Relaxed) != 0
+}
+
+/// Whether [`disable_for_good`] has run on some CPU but not on this one:
+/// this CPU didn't start that crash report or reboot, and hasn't been
+/// stopped for it yet (the stop NMI runs it too). False on the report's
+/// owner, the rebooting CPU and every CPU already stopped.
+pub fn disabled_for_good_but_not_here() -> bool {
+    let mask = FOR_GOOD.load(Ordering::Relaxed);
+    mask != 0 && mask & this_cpu_bit() == 0
 }

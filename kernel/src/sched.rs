@@ -523,13 +523,26 @@ pub fn running_here() -> Option<(u64, &'static str)> {
     (!t.is_null()).then(|| unsafe { ((*t).id, (*t).name) })
 }
 
-/// Can the running thread block here? Only once this CPU's scheduler runs,
-/// with interrupts on and no critical section open (so not in an interrupt
-/// handler or with a lock held), and not on its idle thread (which must
-/// always be ready to run). In that order: the run queue's lock is taken
-/// last, only outside every critical section.
+/// Can the running thread block here? Only with interrupts on and
+/// everything [`blockable_but_for_interrupts`] asks.
 fn can_block(cpu: usize) -> bool {
-    running_on(cpu) && arch::irq::enabled() && arch::irq::depth() == 0 && !CPUS[cpu].lock().on_idle()
+    arch::irq::enabled() && blockable_but_for_interrupts(cpu)
+}
+
+/// Could the running thread block here if interrupts were on? For the crash
+/// path (`crash::halt_if_stopping_elsewhere`), with interrupts off.
+pub(crate) fn can_block_with_interrupts_on() -> bool {
+    blockable_but_for_interrupts(arch::cpu_index())
+}
+
+/// Everything [`can_block`] asks but interrupts on: this CPU's scheduler
+/// runs, no critical section is open (a lock held; it doesn't tell an
+/// interrupt handler, which opens none, from a thread), and the running
+/// thread isn't the idle thread (which must always be ready to run). In
+/// that order: the run queue's lock is taken last, only outside every
+/// critical section.
+fn blockable_but_for_interrupts(cpu: usize) -> bool {
+    running_on(cpu) && arch::irq::depth() == 0 && !CPUS[cpu].lock().on_idle()
 }
 
 /// Whether the running thread can block here (see [`can_block`]).
@@ -648,8 +661,10 @@ fn enqueue(thread: Arc<Thread>) {
 /// section open.
 extern "C" fn thread_entry() -> ! {
     finish_switch(arch::cpu_index());
-    // Not `irq::enable`: if another CPU is reporting a crash, interrupts
-    // stay off (and its stop NMI halts this CPU).
+    // Not `irq::enable`: once a crash report or a reboot has begun on
+    // another CPU (interrupts off for good), they stay off here, and a
+    // wait then halts this CPU (`crash::halt_if_stopping_elsewhere`) if
+    // the report's stop NMI (or, for a reboot, the reset) hasn't already.
     arch::irq::restore(true);
     // No reference to itself is kept across the entry (`exit` never
     // returns, so it would never be dropped).
@@ -835,7 +850,11 @@ impl WaitQueue {
     /// [`wake_one`](Self::wake_one) or [`wake_all`](Self::wake_all) can't be
     /// missed; it must not block or take a lock held around a wake. A thread
     /// woken while `ready()` is still false waits again, at the back. Panics
-    /// where the thread can't block (see [`can_block`]).
+    /// where the thread can't block (see [`can_block`]), except where it
+    /// can't because a crash report or a reboot on another CPU turned
+    /// interrupts off for good: then it halts this CPU for it (see
+    /// `crash::halt_if_stopping_elsewhere` for which cases it tells
+    /// apart).
     pub fn wait_until(&self, ready: impl FnMut() -> bool) {
         let woke = self.block(None, ready);
         debug_assert!(woke, "a wait without a deadline returned unready");
@@ -857,10 +876,11 @@ impl WaitQueue {
     /// (false).
     fn block(&self, deadline: Option<u64>, mut ready: impl FnMut() -> bool) -> bool {
         let cpu = arch::cpu_index();
-        assert!(
-            can_block(cpu),
-            "blocking where a thread can't (no scheduler, interrupts off, a lock held, or the idle thread)"
-        );
+        if !can_block(cpu) {
+            // Or halt for another CPU's crash report (#106).
+            crate::crash::halt_if_stopping_elsewhere();
+            panic!("blocking where a thread can't (no scheduler, interrupts off, a lock held, or the idle thread)");
+        }
         let me = CPUS[cpu].lock().running().clone();
         loop {
             let were_on = arch::irq::disable();
