@@ -595,9 +595,10 @@ const HPET_BRACKET_TRIES: usize = 9;
 /// around such a burst.
 #[cfg(feature = "ktest")]
 const RETRY_SPACING_NS: u64 = 20_000_000;
-// Pinned: the docs, the PR and `test_ktest.py`'s retry bound assume 9 tries
-// spaced 20 ms apart, spanning over 150 ms; and a limit over a tenth of the
-// budget would let two wide ends use up a fifth of it.
+// Pinned: 9 tries 20 ms apart span at least 150 ms, more than load-5's burst;
+// `lumen_harness.clock_diags`'s `MOST_HPET_RETRIES = 4` assumes this spacing
+// (one burst of up to about 80 ms costs 4 retries on one end); and a limit
+// over a tenth of the budget would let two wide ends use up a fifth of it.
 #[cfg(feature = "ktest")]
 const _: () = assert!(
     HPET_BRACKET_TRIES == 9
@@ -681,13 +682,31 @@ fn narrow_hpet_reading(
     hpet: &HpetCounter,
     points: [Pause; 2],
     tag: &str,
+    pause: impl FnMut(Pause),
+) -> Result<HpetEnd, &'static str> {
+    narrow_hpet_reading_timed(hpet, points, tag, pause, &mut 0)
+}
+
+/// [`narrow_hpet_reading`], adding to `hpet_ticks` the HPET ticks that
+/// passed over each reading (read just before and after it, not counting
+/// the [`RETRY_SPACING_NS`] between readings): every reading's bracket fits
+/// inside its own, unless `now_ns` itself is off.
+#[cfg(feature = "ktest")]
+fn narrow_hpet_reading_timed(
+    hpet: &HpetCounter,
+    points: [Pause; 2],
+    tag: &str,
     mut pause: impl FnMut(Pause),
+    hpet_ticks: &mut u64,
 ) -> Result<HpetEnd, &'static str> {
     let mut tried = 0;
     let take = || {
         space_retry(tried);
         tried += 1;
-        hpet_between_now_ns(hpet, points, &mut pause)
+        let first = hpet.now();
+        let reading = hpet_between_now_ns(hpet, points, &mut pause);
+        *hpet_ticks = hpet_ticks.saturating_add(hpet.since(first, hpet.now()));
+        reading
     };
     lumen_time::first_narrow(HPET_BRACKET_NS, take).map_err(|b| {
         crate::ktest::diag(format_args!("{tag}{BACKWARDS_IN_BRACKET}: from {} ns to {} ns", b.before, b.after));
@@ -726,13 +745,13 @@ fn now_ns_against_the_hpet(
     mut pause: impl FnMut(Pause),
 ) -> Result<[HpetEnd; 2], &'static str> {
     use crate::kassert;
-    // Each end's readings, and the HPET ticks that passed over all of them
-    // (read just before the first and after the last): their brackets fit
-    // inside that span unless `now_ns` itself is off.
+    // Each end's readings, and the HPET ticks that passed over them (each
+    // reading's own, added up, without the sleeps between them): their
+    // brackets fit inside that unless `now_ns` itself is off.
     let mut read_end = |points| {
-        let first = hpet.now();
-        let end = narrow_hpet_reading(hpet, points, tag, &mut pause)?;
-        Ok::<_, &'static str>((end, hpet.since(first, hpet.now())))
+        let mut hpet_ticks = 0;
+        let end = narrow_hpet_reading_timed(hpet, points, tag, &mut pause, &mut hpet_ticks)?;
+        Ok::<_, &'static str>((end, hpet_ticks))
     };
     let widths = |start: &HpetEnd, end: Option<&HpetEnd>| {
         crate::ktest::diag(format_args!(
@@ -749,9 +768,11 @@ fn now_ns_against_the_hpet(
             "{tag}all {HPET_BRACKET_TRIES} readings at the {which} were wider than {HPET_BRACKET_NS} ns: something \
              between the two now_ns reads took longer than that each time (a vCPU stall, a slow HPET read, or now_ns \
              itself off). Their widths add up to {} ns by now_ns; the HPET counted {span_ticks} ticks ({} ns) over \
-             all of them (the widths fit inside that unless now_ns itself is off)",
+             the same readings, each timed on its own without the {} ms between them (the widths fit inside \
+             that unless now_ns itself is off)",
             readings.widths().iter().fold(0u64, |sum, &w| sum.saturating_add(w)),
             hpet.clock().ns(span_ticks),
+            RETRY_SPACING_NS / 1_000_000,
         ));
         Err(EVERY_BRACKET_WIDE)
     };
@@ -1160,11 +1181,14 @@ crate::ktest!(
         use crate::kassert;
         const BURST_NS: u64 = 50_000_000;
         let hpet = hpet().ok_or("no HPET")?;
-        let mut first_ns = None;
+        let (mut first_ns, mut paused) = (None, 0);
         let r = narrow_hpet_reading(&hpet, START_READING, INJECTED, |p| {
             if p == Pause::StartAfterRead {
                 let now = now_ns();
-                if now - *first_ns.get_or_insert(now) < BURST_NS {
+                // The first two always: a late wake from the first sleep
+                // can't end the burst before the second reading.
+                if now - *first_ns.get_or_insert(now) < BURST_NS || paused < 2 {
+                    paused += 1;
                     spin(STALL_NS);
                 }
             }

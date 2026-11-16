@@ -58,8 +58,9 @@ def run(
         (
             "every_stalled_hpet_bracket_is_a_failure",
             (
-                "# injected pause: bracket widths: start [201000, 201000, 201000, 201000, 201000] "
-                "ns, end [] ns (4 taken again, 20 ms apart; at most 100000 ns trusted)\n"
+                "# injected pause: bracket widths: start [201000, 201000, 201000, 201000, 201000, "
+                "201000, 201000, 201000, 201000] ns, end [] ns (8 taken again, 20 ms apart; at most "
+                "100000 ns trusted)\n"
             ),
         ),
         (
