@@ -1448,7 +1448,11 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
     row: position,
     buttons held, presses so far (summed), wheels, the pointer (`drawn`,
     `hidden` under a canvas, `none` without a terminal), `stale`, and why
-    it failed; `no tablet` and a row of dashes without one.
+    it failed; `no tablet` and a row of dashes without one. `mouse hold`
+    stops the `mouse` thread reading the tablet until `mouse release`
+    (the header ends `, held` meanwhile): events wait in the device's ring
+    and frames that don't fit are dropped, an overrun made on purpose
+    (#142).
   - `dmesg`: the newest whole log lines as serial printed them: the logger
     keeps the last 16 KiB in a `lumen_trace::TextRing` (host-tested
     against a model; not lock-free: `klog`'s `RING` lock, a leaf, taken
@@ -2451,11 +2455,15 @@ ever seen.
   marks the state stale until a clean batch brings a frame. What that
   count guarantees, and its preconditions, are stated once, in
   `lumen_input::may_have_lost_frames`'s doc, and a host model checks them
-  (#124). Scenarios send 300 moves, and 7-event frames until QEMU traces
-  the first drop (at most 300), unpaced while the guest's CPU is busy, and
-  check that frames were lost (as many as QEMU traced), that an overrun
-  was counted, and the overrun warning; the 7-event frames tell the
-  device's bound from moves' 3.
+  (#124). Scenarios hold the `mouse` thread (`mouse hold`), send moves,
+  and 7-event frames, until 5 past the ring's room, release it, and check
+  that QEMU dropped each frame past the room (traced at its send), that
+  the thread read exactly the frames that fit in one batch, that one
+  overrun was counted, and the overrun warning; the 7-event frames tell
+  the device's bound from moves' 3. (Before #142 they waited for a busy
+  guest to fall behind: on KVM runners QMP's ~1 to 3 ms per frame often
+  didn't outpace the `mouse` thread's turn every 10 ms slice, and the
+  ring never filled.)
 - **Keys:** the keyboard's decoded keys (`lumen_shell::Key`, through
   `crate::vt`'s per-terminal rings today). That is a line editor's key
   (characters and editing keys, no key-up, no modifiers on their own),

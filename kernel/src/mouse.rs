@@ -57,12 +57,22 @@
 //!   event"; a buffer it fails to re-post is lost to the ring), and it
 //!   doesn't check the length the device wrote (a short event would read
 //!   the previous contents).
+//! - **Holding.** `mouse hold` ([`hold`]) stops the `mouse` thread reading
+//!   the ring until `mouse release` ([`release`]): it returns once the
+//!   thread is parked (woken by a ring of [`BELL`] with nothing behind it
+//!   if it was waiting), so no event is read from then on, and events wait
+//!   in the ring, where QEMU drops each frame that no longer fits. Released,
+//!   the thread reads them all in one batch. So an overrun can be made on
+//!   purpose, whatever the host's speed (#142: the scenario that waited for
+//!   a busy guest to fall behind didn't always). While held the device's
+//!   status isn't looked at either.
 //! - **The `InputDevice` class** (docs/ARCHITECTURE.md, section 7): the
 //!   tablet's messages are `lumen_input::PointerState`s; M4's desktop
 //!   consumes them.
 
 use alloc::string::String;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use log::{debug, error, info, warn};
 use lumen_input::{AbsAxis, Event, PointerState, Tablet, evdev, frame_bound, has_abs_xy, may_have_lost_frames};
@@ -73,6 +83,7 @@ use virtio_drivers::transport::{DeviceStatus, Transport};
 
 use crate::drivers::Driver;
 use crate::pci::{DeviceInfo, DeviceResources};
+use crate::sched::WaitQueue;
 use crate::sync::SpinLock;
 use crate::virtio::{self, Doorbell, ProbeError, StatusHandle, VirtioHal, VirtioTransport};
 
@@ -90,6 +101,76 @@ static BELL: Doorbell = Doorbell::new();
 
 fn on_interrupt() {
     BELL.ring();
+}
+
+/// Set by [`hold`], cleared by [`release`]: the `mouse` thread reads
+/// nothing while it is set.
+static HOLD: AtomicBool = AtomicBool::new(false);
+/// Set by the `mouse` thread while it is parked for [`HOLD`] (it reads
+/// nothing until [`release`]).
+static PARKED: AtomicBool = AtomicBool::new(false);
+/// Where the `mouse` thread waits for [`release`].
+static RELEASED: WaitQueue = WaitQueue::new();
+/// Where [`hold`] waits for the thread to park.
+static PARKED_NOW: WaitQueue = WaitQueue::new();
+
+/// How long [`hold`] waits for the `mouse` thread to park.
+const HOLD_WAIT_NS: u64 = 1_000_000_000;
+
+/// Why [`hold`] couldn't hold the `mouse` thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldError {
+    /// No tablet is bound.
+    NoTablet,
+    /// The tablet failed: its thread has ended.
+    Failed,
+    /// The thread didn't park within [`HOLD_WAIT_NS`] (a bug).
+    NotParked,
+}
+
+impl fmt::Display for HoldError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            HoldError::NoTablet => "no tablet",
+            HoldError::Failed => "the tablet failed",
+            HoldError::NotParked => "the mouse thread didn't stop reading within 1 s",
+        })
+    }
+}
+
+/// Stop the `mouse` thread reading the ring (see the module doc); returns
+/// once it is parked, so nothing is read from then on. Holding a held
+/// tablet is fine.
+pub fn hold() -> Result<(), HoldError> {
+    match BOUND.lock().as_ref() {
+        None => return Err(HoldError::NoTablet),
+        Some(b) if b.failed.is_some() => return Err(HoldError::Failed),
+        Some(_) => {}
+    }
+    HOLD.store(true, Ordering::Release);
+    // Wake the thread if it waits for the device (a ring with nothing to
+    // read); it parks before it looks at the ring again.
+    BELL.ring();
+    let deadline = crate::time::now_ns().saturating_add(HOLD_WAIT_NS);
+    if PARKED_NOW.wait_until_or_deadline(deadline, || PARKED.load(Ordering::Acquire)) {
+        Ok(())
+    } else {
+        HOLD.store(false, Ordering::Release);
+        RELEASED.wake_all();
+        Err(HoldError::NotParked)
+    }
+}
+
+/// Let the `mouse` thread read again ([`hold`]): it reads what waited in
+/// the ring in one batch.
+pub fn release() {
+    HOLD.store(false, Ordering::Release);
+    RELEASED.wake_all();
+}
+
+/// Whether the `mouse` thread is held ([`hold`]).
+pub fn held() -> bool {
+    HOLD.load(Ordering::Acquire)
 }
 
 /// The event buffers the crate keeps posted (`VirtIOInput`'s queue size).
@@ -304,6 +385,16 @@ fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, a
     let mut rule = virtio::MissedRule::default();
     let mut warned_cannot_block = false;
     loop {
+        // Held: park, reading nothing, until released (`hold` waits for
+        // this). Then look at the flag again before reading: a `hold` that
+        // saw this park before it ended is still honoured.
+        if HOLD.load(Ordering::Acquire) {
+            PARKED.store(true, Ordering::Release);
+            PARKED_NOW.wake_all();
+            RELEASED.wait_until(|| !HOLD.load(Ordering::Acquire));
+            PARKED.store(false, Ordering::Release);
+            continue;
+        }
         // Read before draining, so an interrupt after the drain ends the
         // wait below.
         let seen = BELL.rings();

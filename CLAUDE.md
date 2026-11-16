@@ -184,7 +184,8 @@ own PR that updates that doc first.
   `interrupts.rs`: 8259s masked, local APIC on, I/O APIC inputs masked,
   `route_isa_irq` (MADT overrides, handler registered before unmasking).
   `mouse.rs`: the virtio tablet (#98; bound by class, read by its own
-  `mouse` thread, which moves the pointer; `mouse::status` for `mouse`).
+  `mouse` thread, which moves the pointer; `mouse::status` for `mouse`;
+  `mouse::hold`/`release` stop and resume its reads, for overruns on purpose).
   `make run` attaches a tablet.
   `serial_in.rs`: COM1's input by interrupt (IRQ 4) into the queue the
   serial shell blocks on (a 100 ms deadline as a safety net, counted and
