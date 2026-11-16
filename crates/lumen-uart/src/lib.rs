@@ -5,18 +5,21 @@
 //! UART answers ([`probe`]), how to program it and write to it ([`init`],
 //! [`Mode`]), `\n` as `\r\n` in bursts ([`write_bytes`]), and reading
 //! ([`data_ready`], [`try_read`]; by interrupt: [`enable_rx_interrupt`],
-//! the handler's [`drain`], and the reader's policy, [`read_next`] and
-//! [`available`]).
+//! the handler's [`drain`], the reader's policy, [`read_next`] and
+//! [`available`], how it waits, [`wait_mode`], and when a missing
+//! interrupt is worth a warning, [`MissedInterrupts`]).
 //!
 //! **Reading by interrupt.** The received-data interrupt reaches the CPU
-//! as an edge (ISA IRQ 4 through an I/O APIC): the line rises when bytes
-//! start waiting and stays up until the reader takes them all, so no new
-//! edge comes while any byte waits. The handler drains what its queue has
-//! room for; bytes past that stay in the UART, behind those queued. So the
-//! reader takes the queue first, then the UART ([`read_next`]), and must
-//! not wait while either holds a byte ([`available`]): a byte left in the
-//! UART raises no interrupt of its own. (The tests run this against a
-//! model whose handler runs only on an edge.)
+//! as an edge (ISA IRQ 4 through an I/O APIC). The worst case the design
+//! guards against: the line rises when bytes start waiting and stays up
+//! until the reader takes them all, so no new edge comes while any byte
+//! waits. (QEMU does better, raising it again whenever bytes wait; real
+//! UARTs and interrupt routers may not.) The handler drains what its queue
+//! has room for; bytes past that stay in the UART, behind those queued. So
+//! the reader takes the queue first, then the UART ([`read_next`]), and
+//! must not wait while either holds a byte ([`available`]). The tests run
+//! this against a model of that worst case, whose handler runs only on an
+//! edge.
 //!
 //! A burst assumes the transmit FIFO is empty once the line status says so
 //! (THRE), and fills all but one of its slots ([`BURST`]). Two writers
@@ -225,24 +228,27 @@ pub fn enable_rx_interrupt(r: &mut impl Registers, mode: Mode) {
     r.write(reg::INT_ENABLE, IER_RX_DATA);
 }
 
-/// The reader's next byte (the module doc, "Reading by interrupt"): the
-/// queue's (`pop`, the older bytes), else the UART's (bytes the handler
-/// left there for want of room). Never waits.
-pub fn read_next(r: &mut impl Registers, mode: Mode, pop: impl FnOnce() -> Option<u8>) -> Option<u8> {
-    pop().or_else(|| try_read(r, mode))
+/// The reader's next byte (the module doc, "Reading by interrupt"):
+/// `popped`, the byte it took from the queue (the older bytes), else the
+/// UART's (bytes the handler left there for want of room). Never waits.
+/// The caller keeps the handler from running from its pop to the end of
+/// this call (interrupts off on the handler's CPU), or a byte the handler
+/// queues meanwhile would come after a newer one read here.
+pub fn read_next(r: &mut impl Registers, mode: Mode, popped: Option<u8>) -> Option<u8> {
+    popped.or_else(|| try_read(r, mode))
 }
 
 /// Whether the reader has a byte to take (`queued`: its queue isn't
 /// empty): the condition its wait for the interrupt must check, since a
-/// byte left in the UART raises no new edge.
+/// byte left in the UART may raise no new edge (the module doc).
 pub fn available(r: &mut impl Registers, mode: Mode, queued: bool) -> bool {
     queued || data_ready(r, mode)
 }
 
 /// Hand received bytes to `push` while one is waiting, at most `room`;
 /// how many. Bytes past `room` stay in the UART for the reader
-/// ([`read_next`]); the sender's next bytes then wait behind a full FIFO
-/// (QEMU stops feeding it; a real UART overruns and drops them).
+/// ([`read_next`]). Behind a full FIFO the sender's next bytes are held
+/// back by QEMU; a real UART drops them (an overrun).
 pub fn drain(r: &mut impl Registers, mode: Mode, room: usize, mut push: impl FnMut(u8)) -> usize {
     let mut n = 0;
     while n < room {
@@ -251,6 +257,77 @@ pub fn drain(r: &mut impl Registers, mode: Mode, room: usize, mut push: impl FnM
         n += 1;
     }
     n
+}
+
+/// How the reader waits for input, when it has none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitMode {
+    /// Block for good: there is no UART, so nothing will come.
+    Forever,
+    /// Block until the interrupt brings a byte, at most until a deadline
+    /// (the safety net for an interrupt that doesn't come), then look.
+    Deadline,
+    /// Yield once and look again (polling): the reader can't block here,
+    /// or no interrupt brings the bytes.
+    Yield,
+}
+
+/// How to wait ([`WaitMode`]): with a UART (`present`) whose bytes come by
+/// interrupt (`by_interrupt`), block with a deadline; without a UART, block
+/// for good; either only where the reader's thread can block
+/// (`can_block`); otherwise yield.
+pub fn wait_mode(present: bool, by_interrupt: bool, can_block: bool) -> WaitMode {
+    match (present, by_interrupt, can_block) {
+        (_, _, false) => WaitMode::Yield,
+        (false, _, true) => WaitMode::Forever,
+        (true, true, true) => WaitMode::Deadline,
+        (true, false, true) => WaitMode::Yield,
+    }
+}
+
+/// How a [`WaitMode::Deadline`] wait ended, as far as the warning rule
+/// cares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitEnd {
+    /// An interrupt brought input during the wait.
+    Interrupt,
+    /// The deadline passed and input was waiting, though no interrupt
+    /// brought any: the interrupt may not be reaching the CPU.
+    InputAtDeadline,
+    /// Neither: the deadline passed with nothing to read.
+    Idle,
+}
+
+/// When input found at the deadline is worth a warning: after
+/// [`MissedInterrupts::THRESHOLD`] such waits in a row, with no interrupt
+/// bringing input between them (one alone may be a race with a late
+/// interrupt), once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MissedInterrupts {
+    /// Waits in a row that found input at the deadline.
+    in_a_row: u32,
+    warned: bool,
+}
+
+impl MissedInterrupts {
+    /// Waits in a row that found input at the deadline before the warning.
+    pub const THRESHOLD: u32 = 3;
+
+    pub const fn new() -> Self {
+        MissedInterrupts { in_a_row: 0, warned: false }
+    }
+
+    /// Note how a wait ended; whether to warn now (true once at most).
+    pub fn note(&mut self, end: WaitEnd) -> bool {
+        match end {
+            WaitEnd::Interrupt => self.in_a_row = 0,
+            WaitEnd::Idle => {}
+            WaitEnd::InputAtDeadline => self.in_a_row = self.in_a_row.saturating_add(1),
+        }
+        let warn = !self.warned && self.in_a_row >= Self::THRESHOLD;
+        self.warned |= warn;
+        warn
+    }
 }
 
 #[cfg(test)]
