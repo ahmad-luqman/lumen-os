@@ -385,6 +385,10 @@ fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, a
     let mut rule = virtio::MissedRule::default();
     let mut warned_cannot_block = false;
     loop {
+        // Read before the hold check and the drain, so a ring after either
+        // (an interrupt, or `hold`'s) ends the wait below: a `hold` that
+        // comes after the check can't wait out the idle look.
+        let seen = BELL.rings();
         // Held: park, reading nothing, until released (`hold` waits for
         // this). Then look at the flag again before reading: a `hold` that
         // saw this park before it ended is still honoured.
@@ -395,9 +399,6 @@ fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, a
             PARKED.store(false, Ordering::Release);
             continue;
         }
-        // Read before draining, so an interrupt after the drain ends the
-        // wait below.
-        let seen = BELL.rings();
         let (mut events, mut newest) = (0u64, None);
         while let Some(e) = input.pop_pending_event() {
             events += 1;
