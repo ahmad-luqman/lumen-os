@@ -3,30 +3,8 @@
 import re
 
 from lumen_harness import save_ktest_tap, tap
+from lumen_harness.clock_diags import check_clock_diags
 from lumen_harness.qemu import EXIT_CRASH, EXIT_SUCCESS, Devices
-
-# `now_ns_follows_the_hpet` (#117) takes an HPET reading again when its
-# bracket is over 100 µs. In PR #121's runs it needed none in 60 KVM runs
-# (30 of them on a loaded runner) and at most 1 per run in 30 loaded TCG runs
-# on a busy Mac. More than 2 in one run (of the 8 its two ends may take
-# before failing) means stalls hit readings far more often than ever
-# measured: a host or `now_ns` getting worse, which a pass would hide.
-MOST_HPET_RETRIES = 2
-_HPET_BRACKETS = re.compile(
-    r"bracket widths: start \[(?P<start>[\d, ]+)\] ns, end \[(?P<end>[\d, ]+)\] ns "
-    r"\((?P<retries>\d+) taken again; at most 100000 ns trusted\)"
-)
-_TIMER_BRACKETS = re.compile(
-    r"bracket widths min/median/max (?P<min>\d+)/(?P<median>\d+)/(?P<max>\d+) ns over "
-    r"(?P<brackets>\d+) brackets; windows taken again: \d+ too long; \d+ kept with brackets "
-    r"over 5% of them"
-)
-
-
-def case_diagnostics(report: tap.TapReport, name: str) -> list[str]:
-    """The diagnostics of the ktest `lumen_kernel::<name>`."""
-    (case,) = [c for c in report.cases if c.name == f"lumen_kernel::{name}"]
-    return case.diagnostics
 
 
 def test_in_kernel_tests_pass(boot):
@@ -153,20 +131,6 @@ def test_in_kernel_tests_pass(boot):
     assert re.search(r"^# trace: \d+ TSC ticks per event", out, re.MULTILINE), (
         "no trace cost diagnostic"
     )
-    # #117: the clock cross-checks report their brackets on passing runs too,
-    # where nobody reads the TAP. `now_ns_follows_the_hpet`'s line appears
-    # once, in that test (the injected-pause tests' lines say so), and its
-    # retries are bounded (MOST_HPET_RETRIES).
-    assert len(re.findall(r"^# bracket widths: start ", out, re.MULTILINE)) == 1, (
-        "not one bracket line"
-    )
-    lines = case_diagnostics(report, "time::now_ns_follows_the_hpet")
-    brackets = [m for m in map(_HPET_BRACKETS.fullmatch, lines) if m]
-    assert len(brackets) == 1, lines
-    assert int(brackets[0]["retries"]) <= MOST_HPET_RETRIES, brackets[0].group(0)
-    # The timer test's brackets, each holding an HPET read, have widths.
-    lines = case_diagnostics(report, "time::the_timer_is_programmed_for_1_khz")
-    timer = [m for m in map(_TIMER_BRACKETS.fullmatch, lines) if m]
-    assert len(timer) == 1, lines
-    low, median, high, count = (int(timer[0][k]) for k in ("min", "median", "max", "brackets"))
-    assert low <= median <= high and high > 0 and count >= 14, timer[0].group(0)
+    # #117: the clock cross-checks report their brackets, retries and
+    # placement tries on passing runs too, where nobody reads the TAP.
+    check_clock_diags(report, out)

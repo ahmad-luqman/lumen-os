@@ -38,6 +38,7 @@ tests = [
     "ktest:lumen_kernel::time::the_timer_is_programmed_for_1_khz",
     "ktest:lumen_kernel::time::a_timer_reading_is_placed_at_its_brackets_midpoint",
     "scenario:test_ktest::test_in_kernel_tests_pass",
+    "harness:test_clock_diags::*",
 ]
 
 [[feature]]

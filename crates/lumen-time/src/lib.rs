@@ -68,7 +68,7 @@ pub fn counter_delta(earlier: u64, later: u64, mask: u64) -> u64 {
 /// The midpoint of two readings of a counter `mask` wide, `earlier` then
 /// `later` (less than one wrap apart; rounded down): where a reading of
 /// another clock taken between them is placed.
-pub fn counter_midpoint(earlier: u64, later: u64, mask: u64) -> u64 {
+fn counter_midpoint(earlier: u64, later: u64, mask: u64) -> u64 {
     earlier.wrapping_add(counter_delta(earlier, later, mask) / 2) & mask
 }
 
@@ -80,36 +80,60 @@ pub fn counter_midpoint(earlier: u64, later: u64, mask: u64) -> u64 {
 /// emulated read (under KVM each HPET read exits to QEMU), or the bracketing
 /// clock itself jumping, so a wide one is evidence of something wrong, not a
 /// reading to trust. (A [`Window`]'s `start_gap` and `end_gap` are the same
-/// widths, for a calibration's two ends.) Built by [`Bracketed::between`].
+/// widths, for a calibration's two ends.) Built by [`Bracketed::between`] or
+/// [`Bracketed::checked_between`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Bracketed<T> {
     pub value: T,
     pub at: u64,
     pub width: u64,
 }
 
+/// A clock that doesn't wrap read going backwards across a bracket: `after`
+/// is before `before`. A clock bug, not a stall.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Backwards {
+    pub before: u64,
+    pub after: u64,
+}
+
 impl<T> Bracketed<T> {
     /// `value`, read between `before` and `after`, two reads of a counter
-    /// `mask` wide (`u64::MAX` for one that doesn't wrap, such as `now_ns`;
-    /// `after` before `before` then gives a huge width, so the reading is
-    /// never trusted).
+    /// `mask` wide (`u64::MAX` or `0xffff_ffff`) that may wrap once between
+    /// them.
     pub fn between(before: u64, value: T, after: u64, mask: u64) -> Self {
         Bracketed { value, at: counter_midpoint(before, after, mask), width: counter_delta(before, after, mask) }
+    }
+
+    /// `value`, read between `before` and `after`, two reads of a clock that
+    /// doesn't wrap (such as `now_ns`); [`Backwards`] if `after` is before
+    /// `before`.
+    pub fn checked_between(before: u64, value: T, after: u64) -> Result<Self, Backwards> {
+        if after < before {
+            return Err(Backwards { before, after });
+        }
+        Ok(Self::between(before, value, after, u64::MAX))
     }
 }
 
 /// How [`first_narrow`] went: the first reading at most its limit wide
-/// (`None` if every one of the `N` taken was wider), and the widths of all
-/// the readings it took, in order (the wide ones too, so a stall stays
-/// visible).
+/// ([`reading`](Self::reading)), and the widths of all the readings it took,
+/// in order (the wide ones too, so a stall stays visible).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NarrowReading<T, const N: usize> {
-    pub reading: Option<Bracketed<T>>,
+    reading: Option<Bracketed<T>>,
     widths: [u64; N],
     taken: usize,
 }
 
-impl<T, const N: usize> NarrowReading<T, N> {
+impl<T: Copy, const N: usize> NarrowReading<T, N> {
+    /// The first narrow reading; `None` if every one of the `N` taken was
+    /// wider than the limit.
+    pub fn reading(&self) -> Option<Bracketed<T>> {
+        self.reading
+    }
+
     /// The widths of the readings taken, in order.
     pub fn widths(&self) -> &[u64] {
         &self.widths[..self.taken]
@@ -123,20 +147,44 @@ impl<T, const N: usize> NarrowReading<T, N> {
 }
 
 /// Up to `N` readings from `take`, until one is at most `limit` wide (in the
-/// bracketing clock's units).
-#[must_use]
-pub fn first_narrow<T, const N: usize>(limit: u64, mut take: impl FnMut() -> Bracketed<T>) -> NarrowReading<T, N> {
+/// bracketing clock's units). An error from `take` (a clock going backwards)
+/// is returned at once: it is a bug to report, not a stall to retake.
+pub fn first_narrow<T, E, const N: usize>(
+    limit: u64,
+    mut take: impl FnMut() -> Result<Bracketed<T>, E>,
+) -> Result<NarrowReading<T, N>, E> {
     let mut out = NarrowReading { reading: None, widths: [0; N], taken: 0 };
     while out.taken < N {
-        let r = take();
+        let r = take()?;
         out.widths[out.taken] = r.width;
         out.taken += 1;
         if r.width <= limit {
             out.reading = Some(r);
-            return out;
+            break;
         }
     }
-    out
+    Ok(out)
+}
+
+/// How far off a placement test's try can be, in the bracketing clock's
+/// units: half the reference reading's width, plus half of what a stall added
+/// to the paused reading's (anything over the `2 * pause` its two pauses
+/// make, which can move the read that far off its midpoint), rounded up.
+/// Saturates.
+pub fn placement_uncertainty(reference_width: u64, paused_width: u64, pause: u64) -> u64 {
+    let stalled = paused_width.saturating_sub(pause.saturating_mul(2));
+    reference_width.saturating_add(stalled).div_ceil(2)
+}
+
+/// Whether a placement test's try is judged: its uncertainty
+/// ([`placement_uncertainty`]) and the reference's width are each at most a
+/// quarter of the pause. Then a right placement is at most `pause / 4` off,
+/// and one at either end of its bracket (or outside it) at least
+/// `3 * pause / 4` even with the reference misplaced the same way, either
+/// side of the `pause / 2` the tests allow.
+pub fn placement_is_judged(reference_width: u64, paused_width: u64, pause: u64) -> bool {
+    reference_width.saturating_mul(4) <= pause
+        && placement_uncertainty(reference_width, paused_width, pause).saturating_mul(4) <= pause
 }
 
 /// Ticks a down-counter that reloads to `reload` at 0 counted from reading
@@ -761,15 +809,53 @@ mod tests {
         assert_eq!(Bracketed::between(1_000, (), 999, u64::MAX).width, u64::MAX);
     }
 
+    #[test]
+    fn a_clock_going_backwards_across_a_bracket_is_an_error() {
+        assert_eq!(Bracketed::checked_between(1_000, 'v', 999), Err(Backwards { before: 1_000, after: 999 }));
+        let b = Bracketed::checked_between(1_000, 'v', 1_011).unwrap();
+        assert_eq!((b.value, b.at, b.width), ('v', 1_005, 11));
+        assert_eq!(Bracketed::checked_between(7, (), 7).map(|b| b.width), Ok(0));
+    }
+
+    #[test]
+    fn a_clock_going_backwards_stops_first_narrow_at_once() {
+        let mut taken = 0;
+        let r = first_narrow::<u64, Backwards, 5>(100, || {
+            taken += 1;
+            if taken == 1 { Ok(bracketed(500)) } else { Bracketed::checked_between(10, 0, 9) }
+        });
+        assert_eq!(r, Err(Backwards { before: 10, after: 9 }));
+        assert_eq!(taken, 2, "not retaken like a stall");
+    }
+
+    #[test]
+    fn a_placement_try_is_judged_within_a_quarter_of_the_pause() {
+        // Pause 400: the reference at most 100 wide, and half of it plus half
+        // the paused bracket's excess over 800 at most 100.
+        assert_eq!(placement_uncertainty(100, 800, 400), 50);
+        assert!(placement_is_judged(100, 800, 400));
+        assert!(!placement_is_judged(101, 800, 400), "the reference over a quarter");
+        assert_eq!(placement_uncertainty(0, 1_000, 400), 100);
+        assert!(placement_is_judged(0, 1_000, 400), "exactly a quarter");
+        assert_eq!(placement_uncertainty(0, 1_001, 400), 101, "rounds up");
+        assert!(!placement_is_judged(0, 1_001, 400));
+        assert!(placement_is_judged(100, 900, 400) && !placement_is_judged(100, 901, 400));
+        assert_eq!(placement_uncertainty(0, 700, 400), 0, "narrower than the pauses: no excess");
+        // A wrapped or backwards width doesn't overflow: never judged.
+        assert_eq!(placement_uncertainty(u64::MAX, u64::MAX, 400), u64::MAX / 2 + 1);
+        assert!(!placement_is_judged(0, u64::MAX, 400) && !placement_is_judged(u64::MAX, 800, 400));
+        let _ = placement_is_judged(u64::MAX, u64::MAX, u64::MAX); // no overflow panic
+    }
+
     fn bracketed(width: u64) -> Bracketed<u64> {
-        Bracketed { value: width * 10, at: width * 100, width }
+        Bracketed::between(0, width * 10, width, u64::MAX)
     }
 
     #[test]
     fn the_first_narrow_reading_is_kept() {
         let mut widths = [5, 100, 7].into_iter();
-        let r = first_narrow::<_, 5>(100, || bracketed(widths.next().unwrap()));
-        assert_eq!(r.reading, Some(bracketed(5)));
+        let r = first_narrow::<_, (), 5>(100, || Ok(bracketed(widths.next().unwrap()))).unwrap();
+        assert_eq!(r.reading(), Some(bracketed(5)));
         assert_eq!((r.widths(), r.retries()), (&[5][..], 0));
         assert_eq!(widths.next(), Some(100), "no more readings taken");
     }
@@ -777,8 +863,8 @@ mod tests {
     #[test]
     fn a_wide_reading_is_taken_again_and_its_width_kept() {
         let mut widths = [101, 5_000, 100, 7].into_iter();
-        let r = first_narrow::<_, 5>(100, || bracketed(widths.next().unwrap()));
-        assert_eq!(r.reading, Some(bracketed(100)), "the limit is inclusive");
+        let r = first_narrow::<_, (), 5>(100, || Ok(bracketed(widths.next().unwrap()))).unwrap();
+        assert_eq!(r.reading(), Some(bracketed(100)), "the limit is inclusive");
         assert_eq!((r.widths(), r.retries()), (&[101, 5_000, 100][..], 2));
         assert_eq!(widths.next(), Some(7));
     }
@@ -786,15 +872,16 @@ mod tests {
     #[test]
     fn no_reading_when_every_one_is_wide() {
         let mut taken = 0u64;
-        let r = first_narrow::<_, 3>(100, || {
+        let r = first_narrow::<_, (), 3>(100, || {
             taken += 1;
-            bracketed(1_000 + taken)
-        });
-        assert_eq!(r.reading, None);
+            Ok(bracketed(1_000 + taken))
+        })
+        .unwrap();
+        assert_eq!(r.reading(), None);
         assert_eq!((r.widths(), r.retries()), (&[1_001, 1_002, 1_003][..], 2));
         assert_eq!(taken, 3, "stops after N");
-        let none = first_narrow::<u64, 0>(100, || unreachable!());
-        assert_eq!((none.reading, none.widths(), none.retries()), (None, &[][..], 0));
+        let none = first_narrow::<u64, (), 0>(100, || unreachable!()).unwrap();
+        assert_eq!((none.reading(), none.widths(), none.retries()), (None, &[][..], 0));
     }
 
     #[test]
