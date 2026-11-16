@@ -119,8 +119,10 @@ tests = [
 ]
 
 [[feature]]
-name = "The serial shell's first prompt comes only once every screen shell waits for its first key, so the first line typed on serial (typed ahead or not) runs on a quiet boot CPU: a deliberate crash on another CPU doesn't stop it mid-allocation with the heap's lock held (#119)"
+name = "The serial shell's first prompt comes only after every started screen shell is blocked waiting for a key (#119): the wait returns only once all the threads it waits for are blocked (ktest, deterministic), and every test_smp boot checks the kernel found all four screen shells blocked before the prompt (so the deliberate crashes on other CPUs run with them parked); input typed ahead of the prompt is not tested"
 milestone = "M3"
 tests = [
+    "ktest:lumen_kernel::sched::yield_until_blocked_returns_once_every_thread_is_blocked",
     "scenario:test_shell::test_serial_prompt_waits_for_the_screen_shells",
+    "scenario:test_smp::*",
 ]

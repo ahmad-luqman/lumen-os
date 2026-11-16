@@ -230,6 +230,11 @@ impl Thread {
         self.id
     }
 
+    /// The name it was spawned with.
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
     pub fn state(&self) -> State {
         State::from_raw(self.state.load(Ordering::Acquire)).expect("only a State is stored")
     }
@@ -581,7 +586,6 @@ pub struct JoinHandle {
 }
 
 impl JoinHandle {
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests
     pub fn thread(&self) -> &Thread {
         &self.thread
     }
@@ -684,6 +688,27 @@ pub fn yield_now() {
     let were_on = arch::irq::disable();
     schedule(cpu);
     arch::irq::restore(were_on);
+}
+
+/// Yield this CPU until every thread in `threads` is blocked in a wait, or
+/// until `deadline` (`time::now_ns`) has passed, if there is one: whether
+/// they all were, in one pass over them. `Blocked` is set only in
+/// [`WaitQueue`]'s wait, under the queue's lock, right after the thread is
+/// queued: its last allocation for the wait is done, and it allocates
+/// nothing more until woken. For threads on this CPU (yielding is what lets
+/// them run), each one read as blocked has also switched away. The serial
+/// shell waits this way for the screen shells, whose first wait is for a
+/// key, before its first prompt (#119).
+pub fn yield_until_blocked<'a>(threads: impl Iterator<Item = &'a JoinHandle> + Clone, deadline: Option<u64>) -> bool {
+    loop {
+        if threads.clone().all(|h| h.thread.state() == State::Blocked) {
+            return true;
+        }
+        if deadline.is_some_and(|d| time::now_ns() >= d) {
+            return false;
+        }
+        yield_now();
+    }
 }
 
 /// Block the running thread for at least `ns` nanoseconds (by `now_ns`): the
@@ -898,6 +923,10 @@ impl WaitQueue {
                 // before the thread is blocked: the queue's lock is held
                 // until then.
                 waiters.push_back(me.clone());
+                // Nothing after this push may allocate: the serial prompt's
+                // readiness (#119, `yield_until_blocked`) relies on a
+                // blocked thread having made its last allocation for the
+                // wait. (`Blocked` is set only here.)
                 // A waker on another CPU may make it ready (and queue it)
                 // before this CPU switches away: `schedule` then neither
                 // queues it again nor loses it. The timer can't (interrupts
@@ -947,15 +976,6 @@ impl WaitQueue {
                 }
             }
         }
-    }
-
-    /// How many threads are on the queue. Each was queued and marked blocked
-    /// under the queue's lock, in one step after its last allocation for the
-    /// wait (the push itself), so it is blocked or about to switch away,
-    /// allocating nothing more until woken. (A thread a deadline woke may
-    /// still be counted until it runs.)
-    pub fn waiting(&self) -> usize {
-        self.waiters.lock().len()
     }
 
     /// Wake every waiting thread; how many it woke.
@@ -1712,6 +1732,44 @@ crate::ktest!(
             join_bounded(h)?;
         }
         kassert_eq!(room().0, base);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn yield_until_blocked_returns_once_every_thread_is_blocked() {
+        // The serial prompt's wait for the screen shells (#119), on threads
+        // like them: N threads on this CPU, each yielding YIELDS times
+        // before it blocks on a queue. Right after the wait returns, every
+        // one is blocked and on the queue. A wait that returned early, or
+        // after one yield, would find them still running: each needs YIELDS
+        // turns, and none has run yet. Once they are woken (none blocked
+        // again), a wait whose deadline has passed returns at once, saying
+        // they aren't all blocked. Then they are joined.
+        use crate::{kassert, kassert_eq};
+        const N: usize = 4;
+        const YIELDS: usize = 8;
+        let cpu = arch::cpu_index();
+        let s = Arc::new((WaitQueue::new(), AtomicBool::new(false)));
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let t = s.clone();
+            handles.push(spawn_test(cpu, "parking", move || {
+                for _ in 0..YIELDS {
+                    yield_now();
+                }
+                t.0.wait_until(|| t.1.load(Ordering::Acquire));
+            })?);
+        }
+        kassert!(yield_until_blocked(handles.iter(), Some(time::now_ns() + TEST_DEADLINE_NS)));
+        kassert!(handles.iter().all(|h| h.thread().state() == State::Blocked));
+        kassert_eq!(s.0.waiters.lock().len(), N);
+        s.1.store(true, Ordering::Release);
+        kassert_eq!(s.0.wake_all(), N);
+        kassert!(!yield_until_blocked(handles.iter(), Some(0)));
+        for h in handles {
+            join_bounded(h)?;
+        }
         Ok(())
     }
 );

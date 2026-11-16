@@ -13,8 +13,10 @@
 //!   own thread (`shell-vt1` to `shell-vt4`, on the boot CPU), blocked until
 //!   a key arrives; they start only with a keyboard and a terminal wide
 //!   enough for a 16-column line. The serial shell's first prompt waits
-//!   until every screen shell waits for its first key, so the boot CPU is
-//!   quiet when a line typed on serial runs (#119). Shift+PageUp and
+//!   until every screen shell that started is blocked waiting for its
+//!   first key, read at one moment (#119; see `wait_for_screen_shells`: a
+//!   key typed on the screen during boot can hold it until that shell
+//!   waits again). Shift+PageUp and
 //!   Shift+PageDown scroll the shell's own terminal back and forward by
 //!   half a screen; any key the line editor takes shows its screen again.
 //!
@@ -191,16 +193,15 @@ pub fn run() -> ! {
         // comes after this line on the screen.
         Ok(max) => {
             log::info!(target: "shell", "shells on serial and the screen; type 'help'");
-            let mut started = 0;
+            // Kept (no allocation) until the serial prompt's wait; dropped
+            // after it, as each runs for good.
+            let mut shells: [Option<crate::sched::JoinHandle>; term::VTS] = Default::default();
             for (vt, name) in SCREEN_THREADS.into_iter().enumerate() {
                 let editor = Editor::new(PROMPT, Mode::Ansi, max, HISTORY);
                 // Before it runs: keys typed on it from then on are its own.
                 crate::vt::attach(vt);
                 match crate::sched::spawn(name, move || run_on(Screen { vt }, editor)) {
-                    Ok(handle) => {
-                        drop(handle); // it runs for good
-                        started += 1;
-                    }
+                    Ok(handle) => shells[vt] = Some(handle),
                     Err(e) => {
                         crate::vt::detach(vt);
                         log::error!(target: "shell", "no shell on terminal {} after all: no thread for it: {e}", vt + 1);
@@ -214,7 +215,7 @@ pub fn run() -> ! {
                     }
                 }
             }
-            wait_for_screen_shells(started);
+            wait_for_screen_shells(&shells);
         }
         Err(why) => log::info!(target: "shell", "shell on serial (none on the screen: {why}); type 'help'"),
     }
@@ -223,25 +224,51 @@ pub fn run() -> ! {
     run_on(Serial { decoder: Decoder::new() }, Editor::new(PROMPT, mode, max, HISTORY))
 }
 
-/// Wait until the `started` screen shells all wait for their first key
-/// (each blocked in the keyboard's wait queue), yielding this CPU to them:
-/// they run here, and until then they allocate (their first prompt, their
-/// place on the wait queue). The serial shell's first prompt comes after
-/// this, so a line typed on serial, even typed ahead, runs while they sit
-/// still: a deliberate crash on another CPU doesn't stop this one in the
-/// middle of an allocation, with the heap's lock held (#119). No time
-/// bound: a screen shell that never gets to its first wait is a bug, and
-/// the missing serial prompt shows it. The count found is logged (debug),
-/// and a scenario checks the line comes before the prompt.
-fn wait_for_screen_shells(started: usize) {
-    let waiting = loop {
-        let waiting = keyboard::readers_waiting();
-        if waiting >= started {
-            break waiting;
+/// How long the serial prompt waits for the screen shells before it says
+/// so (it goes on waiting).
+const SHELLS_WARN_AFTER_NS: u64 = 5_000_000_000;
+
+/// Wait until every screen shell that started is blocked waiting for its
+/// first key (`sched::yield_until_blocked`: by thread, not by counting the
+/// keyboard's waiters, so another waiter there can't stand in for one),
+/// yielding this CPU to them: they run here, and until they block they
+/// allocate (their first prompt, their place on the keyboard's wait
+/// queue). The serial shell's first prompt comes after this, so the first
+/// line typed on serial runs while the screen shells are parked: a
+/// deliberate crash on another CPU then finds none of them in the middle
+/// of an allocation with the heap's lock held (#119). Their state is read
+/// at one moment, once all are blocked; a key typed on the screen during
+/// boot wakes them, and holds the serial prompt until that shell waits
+/// again. No time bound: after [`SHELLS_WARN_AFTER_NS`] a warning names the
+/// shells not yet waiting, and the wait goes on. Logged at debug level
+/// when it starts and when it ends (with the count found blocked then,
+/// which the scenarios check before the prompt).
+fn wait_for_screen_shells(shells: &[Option<crate::sched::JoinHandle>]) {
+    use crate::sched::{self, State};
+    let started = || shells.iter().flatten();
+    let count = started().count();
+    log::debug!(target: "shell", "serial prompt waits for {count} screen shells to wait for keys");
+    let warn_at = crate::time::now_ns() + SHELLS_WARN_AFTER_NS;
+    if !sched::yield_until_blocked(started(), Some(warn_at)) {
+        log::warn!(target: "shell", "serial prompt held: {} not yet waiting for keys (still waiting)", NotBlocked(shells));
+        sched::yield_until_blocked(started(), None);
+    }
+    let blocked = started().filter(|h| h.thread().state() == State::Blocked).count();
+    log::debug!(target: "shell", "screen shells waiting for keys: {blocked} of {count}");
+}
+
+/// The names of the started screen shells not blocked now, comma-separated
+/// (formatted as the warning is written, without allocating).
+struct NotBlocked<'a>(&'a [Option<crate::sched::JoinHandle>]);
+
+impl fmt::Display for NotBlocked<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let waiting = self.0.iter().flatten().map(|h| h.thread());
+        for (i, t) in waiting.filter(|t| t.state() != crate::sched::State::Blocked).enumerate() {
+            write!(f, "{}{}", if i == 0 { "" } else { ", " }, t.name())?;
         }
-        crate::sched::yield_now();
-    };
-    log::debug!(target: "shell", "screen shells waiting for keys: {waiting} of {started}");
+        Ok(())
+    }
 }
 
 /// The screen shells' widest line, if there is a terminal and a keyboard.

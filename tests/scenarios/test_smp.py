@@ -16,6 +16,7 @@ from lumen_harness import crash
 from lumen_harness.qemu import EXIT_CRASH
 from test_crash import SCREEN_DONE
 from test_mm import OVERFLOW, assert_main_stack_overflow
+from test_shell import expect_screen_shells_parked
 
 BOOT_TIMEOUT = 60
 ONLINE = re.compile(r"INFO  smp: cpu (\d+) online \(lapic id (\d+)\)\n")
@@ -48,8 +49,13 @@ def ap_stacks(output: str) -> dict[int, ApStacks]:
 
 
 def boot_to_prompt(boot, cpus: int):
-    m = boot("qemutest", extra=["-smp", str(cpus)])
+    """Boot `cpus` CPUs to the serial prompt, checking the screen shells
+    were all parked before it (#119; the debug line, hence `lumen.log=debug`,
+    which adds lines on serial only, not on the screen). Returns (machine,
+    CPUs online)."""
+    m = boot("qemutest", extra=["-smp", str(cpus)], cmdline="lumen.log=debug")
     summary = m.expect(SUMMARY, BOOT_TIMEOUT)
+    expect_screen_shells_parked(m, BOOT_TIMEOUT)
     m.expect(r"lumen> ", BOOT_TIMEOUT)
     return m, int(summary.group(1))
 
@@ -104,11 +110,14 @@ def crash_on(boot, args: str, cpus: int = 4):
     crash code after a complete report (no `!!!` line: every other CPU
     stopped for the report, through its stop NMI or, if a thread there would
     block first, by halting itself; the heap line and `interrupts: off` at
-    the end; drawn on screen too). The heap line is `heap: `, not `heap
-    (lock held; ...)`, because the boot CPU is quiet when the line runs: the
-    serial prompt comes only once every screen shell waits for its first
-    key (#119, test_shell's test_serial_prompt_waits_for_the_screen_shells).
-    Returns (report, the APs' logged stacks)."""
+    the end; drawn on screen too). For a crash on another CPU the heap line
+    is `heap: `, not `heap (lock held; ...)`, because the screen shells
+    were parked when the line ran, so the boot CPU's stop NMI finds none of
+    them mid-allocation: the serial prompt comes only once every screen
+    shell is blocked waiting for its first key (#119, checked in every boot
+    by boot_to_prompt). For a crash on CPU 0 itself (`pf`, `pf 0`,
+    `selfblock`) that CPU reports instead of being stopped, faulting in the
+    serial shell's own command. Returns (report, the APs' logged stacks)."""
     m, online = boot_to_prompt(boot, cpus)
     assert online == cpus
     m.send_line(f"crash {args}")

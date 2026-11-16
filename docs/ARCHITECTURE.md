@@ -1190,13 +1190,26 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   (sleeping instead would switch to the idle thread and trace twice a
   millisecond); the virtual terminals' shells block in `vt::wait_key`.
   The serial shell's first prompt comes only once every screen shell that
-  started is blocked waiting for its first key (counted on the keyboard's
-  wait queue, `keyboard::readers_waiting`; no time bound), so the boot
-  CPU is quiet when the first line typed on serial runs, typed ahead or
-  not: a deliberate crash on another CPU then never stops it mid-allocation
-  with the heap's lock held (#119). The `lumen> ` the harness waits for
-  means exactly that. Logged at debug level (`screen shells waiting for
-  keys: 4 of 4`) before the prompt (tested).
+  started is blocked waiting for its first key (`sched::yield_until_blocked`
+  on their threads: `Blocked` is set only under a wait queue's lock, right
+  after the thread is queued, its last allocation for the wait; read for
+  all of them at one moment). So when the first line typed on serial runs,
+  the screen shells are parked, and a deliberate crash on another CPU
+  doesn't find one of them mid-allocation with the heap's lock held
+  (#119). The `lumen> ` the harness waits for comes after that. Not
+  covered: other threads on CPU 0, such as the `mouse` and `sound` threads
+  (no scenario attaches those devices by default; `make run` attaches a
+  tablet), and a key typed on the screen, which wakes the shells (they
+  allocate again as they wait again: waking all of a wait queue frees its
+  buffer); one typed during boot holds the serial prompt until that shell
+  waits again. No time bound: after 5 s a warning names the shells not yet
+  waiting (`serial prompt held: shell-vt2 not yet waiting for keys (still
+  waiting)`, not tested), and the wait goes on. Logged at debug level when
+  it starts (`serial prompt waits for 4 screen shells to wait for keys`)
+  and before the prompt (`screen shells waiting for keys: 4 of 4`, the
+  count blocked then), which `test_shell::test_serial_prompt_waits_for_the_screen_shells`
+  and every boot of `test_smp`'s `boot_to_prompt` check; the wait itself
+  is a ktest (`sched::yield_until_blocked_returns_once_every_thread_is_blocked`).
   Log lines go to serial and the first virtual terminal. A terminal whose
   shell's thread didn't start says so on it (not tested).
 - **Words** (`lumen_shell::words`): blanks separate words; `'...'` keeps
