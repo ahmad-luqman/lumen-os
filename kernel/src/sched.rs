@@ -2111,24 +2111,46 @@ crate::ktest!(
             let after = queue_deadlines(waiter_cpu);
             *r.deadlines.lock() = core::array::from_fn(|i| after[i] - before[i]);
             // The detector's ticks are live: its CPU's last two ticks, read
-            // with no tick between.
+            // with no tick between. A tick is an interrupt on this CPU, so
+            // this thread sees all of a tick's stores or none of them (it
+            // stores `PREV_TICK_NS` and `LAST_TICK_NS`, then counts itself in
+            // `TICKED`): two equal readings of `TICKED` around other reads
+            // mean no tick ran between them. The compiler fences keep the
+            // compiler from moving those `Relaxed` loads across one another
+            // (x86 doesn't reorder loads with loads, and takes interrupts
+            // between instructions).
+            let fence = || core::sync::atomic::compiler_fence(Ordering::SeqCst);
             *r.ticks_at_end.lock() = loop {
                 let t = ticks();
+                fence();
                 let ends = (PREV_TICK_NS[waiter_cpu].load(Ordering::Relaxed), last_tick());
+                fence();
                 if ticks() == t {
                     break ends;
                 }
             };
             // And not stale: across exactly one tick, `PREV_TICK_NS` takes
-            // the `LAST_TICK_NS` read before it (taken again if the spin
-            // sees two ticks, or one more comes before the reads end).
+            // the `LAST_TICK_NS` before it. `last` is tick `t`'s (`TICKED`
+            // read as `t` on both sides of it), and `prev` is read while
+            // `TICKED` is `t + 1` (on both sides again: the spin's last
+            // reading and the check after), so exactly tick `t + 1` ran
+            // between the two: it moved tick `t`'s value into `prev`. Any
+            // other interleaving is read again.
             let follows = loop {
-                let (t, last) = (ticks(), last_tick());
+                let t = ticks();
+                fence();
+                let last = last_tick();
+                fence();
+                if ticks() != t || last == 0 {
+                    continue;
+                }
                 while ticks() == t {
                     core::hint::spin_loop();
                 }
+                fence();
                 let prev = PREV_TICK_NS[waiter_cpu].load(Ordering::Relaxed);
-                if ticks() == t + 1 && last != 0 {
+                fence();
+                if ticks() == t + 1 {
                     break prev == last;
                 }
             };
