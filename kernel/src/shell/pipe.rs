@@ -130,8 +130,8 @@ fn source(table: &Table<Run>, words: &[String], ctx: &mut Ctx<'_>) -> Option<Dat
         commands::unknown(ctx, name);
         return None;
     };
-    // (With arguments, which none of them takes, it runs and gives its
-    // usage line.)
+    // (With arguments it runs as a command: its usage line, or what the
+    // arguments ask for, e.g. `mouse hold`.)
     if args.is_empty()
         && let Some(records) = sysinfo::records(name)
     {
@@ -214,13 +214,18 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn records_come_from_commands_that_take_no_arguments() {
+    fn records_come_from_commands_given_no_arguments() {
         // Each name in `RECORDS` is a command (a misspelt one would give
-        // text), and given an argument it says its usage, piped or not.
+        // text), and given an argument it doesn't take it says its usage
+        // (its table's usage line), piped or not.
         use crate::kassert_eq;
         for (name, _) in sysinfo::RECORDS {
-            kassert_eq!(commands::COMMANDS.find(name).map(|c| c.name), Some(name));
-            let usage = alloc::format!("usage: {name}\n");
+            let command = commands::COMMANDS.find(name);
+            kassert_eq!(command.map(|c| c.name), Some(name));
+            let usage = match command.map_or("", |c| c.usage) {
+                "" => alloc::format!("usage: {name}\n"),
+                words => alloc::format!("usage: {name} {words}\n"),
+            };
             for line in [alloc::format!("{name} x | count"), alloc::format!("{name} x")] {
                 let (text, ..) = run_line(&line, &[]);
                 if text != usage {

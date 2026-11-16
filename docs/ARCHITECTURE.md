@@ -1505,7 +1505,8 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   `irqs`, `threads`, `lspci` and `mouse` print the same tables alone (under their header line), so the
   text of `cpus` and `irqs` is what it was (tested column by column; one
   difference: a value wider than its column, `stalled`, now widens it for
-  every row). They take no arguments (`usage: cpus`). Any other command
+  every row). Given arguments they run as commands: `usage: cpus`, or
+  what the arguments ask for (`mouse hold`, `mouse release`). Any other command
   runs as alone on a plain console (no escape codes), writing into a
   buffer of 64 KiB reserved before it runs (writing never allocates) whose
   lines go on. Its keys still come from the console, until it writes more
