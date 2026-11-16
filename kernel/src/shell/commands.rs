@@ -149,6 +149,13 @@ pub static COMMANDS: Table<Run> = Table(&[
         run: sysinfo::irqs,
     },
     Command {
+        name: "serial",
+        args: &[],
+        usage: "",
+        about: "how COM1's input comes (by IRQ 4 or polled), and how the serial shell's waits for it ended",
+        run: crate::serial_in::serial_command,
+    },
+    Command {
         name: "lspci",
         args: &[],
         usage: "",

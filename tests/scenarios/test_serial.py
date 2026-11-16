@@ -1,15 +1,21 @@
 """The serial port: COM1 found at boot or not (`lumen-uart`'s probe), and
 its input by interrupt (#120).
 
-The FIFO bursts and the probe are checked by the ktests in
-`arch::x86_64::serial` and by `cargo test -p lumen-uart`. The input path
-is checked here (the shell blocks; IRQ 4 counts typed lines) and by
-`cargo test -p lumen-uart` only: the receive interrupt's setup (OUT2, the
-FIFO's trigger level 14) and the reader's policy against a model whose
-handler runs only on an edge, bytes a full queue left in the UART
-included. Under QEMU that path doesn't show (it raises IRQ 4 again
-whenever bytes wait), and `serial_in::init`'s drain of bytes that came
-before the unmask isn't tested at all.
+Where each part is checked:
+- the FIFO bursts and the probe: the ktests in `arch::x86_64::serial` and
+  `cargo test -p lumen-uart`;
+- the input path end to end, here: the serial shell blocks (the CPU
+  idles), IRQ 4's count goes up, every wait for a typed line is woken by
+  the interrupt (`serial`: none found input at the deadline), and with
+  COM1 moved to IRQ 3 the 100 ms safety net still answers and warns once;
+- the receive interrupt's setup (OUT2, the FIFO's trigger level 14), the
+  reader's policy against a model of an interrupt that comes only on an
+  edge (bytes a full queue left in the UART included), how the shell
+  waits and when it warns: `cargo test -p lumen-uart` only. Under QEMU
+  the bytes-left-in-the-UART path doesn't show (QEMU raises IRQ 4 again
+  whenever bytes wait).
+Not tested: `serial_in::init`'s queuing of bytes that came before the
+unmask, the polling fallback, and blocking for good without a UART.
 """
 
 import re
@@ -98,20 +104,78 @@ def _com1_interrupts(m: Machine) -> int:
     return int(row[1])
 
 
+SERIAL = re.compile(
+    r"serial: COM1 input by interrupt \(ISA IRQ 4, GSI 4, vector 0x54\): (\d+) interrupts brought "
+    r"input; waits woken by one: (\d+), input found at the deadline: (\d+)\n"
+)
+MISSED_WARNING = "WARN  serial: COM1 input found without its interrupt"
+
+
+def _serial(m: Machine) -> tuple[int, int, int]:
+    """`serial`'s counts: interrupts that brought input, waits they woke,
+    and waits that found input at their deadline."""
+    out = run(m, "serial")
+    found = SERIAL.fullmatch(out)
+    assert found, out
+    return int(found[1]), int(found[2]), int(found[3])
+
+
+def _idle_second(m: Machine) -> tuple[int, int]:
+    """The idle and `main` threads' ticks over a second at the prompt."""
+    before = _thread_ticks(m)
+    time.sleep(1)
+    after = _thread_ticks(m)
+    return after["idle"] - before["idle"], after["main"] - before["main"]
+
+
 def test_the_serial_shell_waits_for_input_by_interrupt(boot):
     # (#120) The serial shell blocks for a key until IRQ 4 brings one (or
     # its 100 ms safety-net deadline passes), instead of polling: over a
     # second at the prompt the CPU halts, so the idle thread takes most of
     # the ticks and more than the shell's own `main` thread. (Polling,
     # `main` took every tick and `idle` none: the CPU was 100% busy, and
-    # under TCG so was a host CPU per guest.) Lines typed while the shell
-    # waits come by interrupt: GSI 4 unmasked and counting up.
+    # under TCG so was a host CPU per guest.) Every line typed while it
+    # waits wakes it by interrupt: GSI 4's count goes up, and no wait finds
+    # input at its deadline instead (a handler that queues bytes without
+    # waking the shell, or doesn't queue them, would show there). Lines of
+    # 14+ bytes reach the FIFO's trigger level, not only its timeout.
     m = shell(boot)
     first = _com1_interrupts(m)
-    before = _thread_ticks(m)
-    time.sleep(1)
-    after = _thread_ticks(m)
-    idle = after["idle"] - before["idle"]
-    main = after["main"] - before["main"]
-    assert idle >= 50 and idle > main, (before, after)
+    _, woken_before, _ = _serial(m)
+    idle, main = _idle_second(m)
+    assert idle >= 50 and idle > main, (idle, main)
+    for i in range(6):
+        assert run(m, f"echo a line typed while waiting {i}") == f"a line typed while waiting {i}\n"
     assert _com1_interrupts(m) > first
+    brought, woken, at_deadline = _serial(m)
+    assert at_deadline == 0 and woken - woken_before >= 6 and brought >= woken, (
+        brought,
+        woken,
+        at_deadline,
+    )
+    assert MISSED_WARNING not in m.output
+
+
+def test_the_safety_net_reads_input_when_irq_4_never_comes(boot):
+    # (#120) COM1 moved to IRQ 3 (QEMU's isa-serial), so the IRQ 4 the
+    # kernel routes never comes: the 100 ms deadline still answers every
+    # line, GSI 4's count stays 0, and after a few lines found that way one
+    # warning (once) says to check IRQ 4's routing. The CPU still idles.
+    m = shell(boot, com1_irq=3)
+    for i in range(10):
+        assert run(m, f"echo line {i}") == f"line {i}\n"
+        if MISSED_WARNING in m.output:
+            break
+    assert m.output.count(MISSED_WARNING) == 1, m.output
+    assert re.search(
+        MISSED_WARNING + r" 3 times in a row; check IRQ 4's routing \(GSI 4, vector 0x54\)",
+        m.output,
+    )
+    for i in range(3):
+        assert run(m, f"echo more {i}") == f"more {i}\n"
+    assert m.output.count(MISSED_WARNING) == 1, m.output
+    assert _com1_interrupts(m) == 0
+    brought, woken, at_deadline = _serial(m)
+    assert (brought, woken) == (0, 0) and at_deadline >= 3, (brought, woken, at_deadline)
+    idle, main = _idle_second(m)
+    assert idle >= 50 and idle > main, (idle, main)

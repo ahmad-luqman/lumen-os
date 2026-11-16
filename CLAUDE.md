@@ -187,8 +187,10 @@ own PR that updates that doc first.
   `mouse` thread, which moves the pointer; `mouse::status` for `mouse`).
   `make run` attaches a tablet.
   `serial_in.rs`: COM1's input by interrupt (IRQ 4) into the queue the
-  serial shell blocks on (a 100 ms deadline as a safety net; it polls,
-  yielding, only without that interrupt); the UART's one reader.
+  serial shell blocks on (a 100 ms deadline as a safety net, counted and
+  warned about; `serial` shows it); it polls, yielding, without that
+  interrupt or before the boot CPU's scheduler runs, and blocks for good
+  without a UART; the UART's one reader.
   `keyboard.rs`: the PS/2 keyboard (8042 init, IRQ 1, `pc-keyboard`
   decoding, `lumen.keymap=`); `arch/x86_64/i8042.rs` its ports.
   `time.rs`: TSC and LAPIC timer calibration, the boot origin

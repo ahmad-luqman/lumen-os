@@ -25,9 +25,10 @@
 //! empties hangs its writer.
 //!
 //! **The UART has one reader:** `serial_in` (through [`read_next`],
-//! [`available`] and [`drain`]), plus the loopback ktest in the test
-//! kernel, where `serial_in` isn't set up. Received bytes keep their order
-//! only while that holds.
+//! [`available`] and [`drain`], on the boot CPU, asserted), plus the two
+//! ktests that read COM1 in the test kernel (the loopback round trip and
+//! the absent port), where `serial_in` isn't set up. Received bytes keep
+//! their order only while that holds.
 
 use super::port::{inb, outb};
 use core::fmt;
@@ -146,16 +147,24 @@ pub(crate) fn enable_rx_interrupt() {
 
 #[cfg_attr(feature = "ktest", allow(dead_code))] // the serial shell's input
 /// The interrupt handler's drain: up to `room` received bytes to `push`
-/// (`lumen_uart::drain`); how many. The rest stay in the UART.
+/// (`lumen_uart::drain`); how many. The rest stay in the UART. With
+/// interrupts off, on the boot CPU (asserted).
 pub(crate) fn drain(room: usize, push: impl FnMut(u8)) -> usize {
+    debug_assert!(!super::irq::enabled() && super::percpu::index() == 0, "COM1 is drained on the boot CPU");
     lumen_uart::drain(&mut com1(), mode(), room, push)
 }
 
 #[cfg_attr(feature = "ktest", allow(dead_code))] // the serial shell's input
-/// The reader's next byte: `pop`'s (the handler's queue), else the UART's
-/// (`lumen_uart::read_next`). Never waits.
-pub(crate) fn read_next(pop: impl FnOnce() -> Option<u8>) -> Option<u8> {
-    lumen_uart::read_next(&mut com1(), mode(), pop)
+/// The reader's next byte: `popped` (from the handler's queue), else the
+/// UART's (`lumen_uart::read_next`). Never waits. The caller keeps the
+/// handler from running from its pop to the end of this call: interrupts
+/// off on the boot CPU, where IRQ 4 arrives (asserted).
+pub(crate) fn read_next(popped: Option<u8>) -> Option<u8> {
+    debug_assert!(
+        !super::irq::enabled() && super::percpu::index() == 0,
+        "COM1 is read on the boot CPU, interrupts off"
+    );
+    lumen_uart::read_next(&mut com1(), mode(), popped)
 }
 
 #[cfg_attr(feature = "ktest", allow(dead_code))] // the serial shell's input
@@ -338,7 +347,7 @@ crate::ktest!(
         let mode = lumen_uart::init(&mut com4);
         kassert_eq!(write_to(&mut com4, unserialized(mode), b"hello\n"), 0);
         kassert_eq!(write_to(&mut com4, mode, b"hello\n"), 0);
-        kassert_eq!(lumen_uart::read_next(&mut com4, mode, || None), None);
+        kassert_eq!(lumen_uart::read_next(&mut com4, mode, None), None);
         kassert_eq!(lumen_uart::available(&mut com4, mode, false), false);
         kassert_eq!(
             [Mode::Absent, Mode::Bytes, Mode::Fifo].map(unserialized),

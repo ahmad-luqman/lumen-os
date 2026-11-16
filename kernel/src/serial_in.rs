@@ -6,41 +6,54 @@
 //! queue. That the host descheduled it is inferred.)
 //!
 //! - **Set up** ([`init`], once, on the boot CPU, before the serial shell
-//!   starts; not in the test kernel, whose loopback ktest reads the UART
-//!   itself): IRQ 4 is routed masked, the UART interrupts when bytes wait
+//!   starts; not in the test kernel, whose ktests read COM1 themselves):
+//!   IRQ 4 is routed masked, the UART interrupts when bytes wait
 //!   (`arch::serial::enable_rx_interrupt`: at 14 bytes or after a
 //!   character timeout), the input is unmasked, and the bytes that came
-//!   before are drained. A level-triggered route (a MADT override) isn't
-//!   used: the handler leaves bytes in the UART when the queue is full,
-//!   which would raise the interrupt again after every EOI.
+//!   before are queued. A level-triggered or active-low route (a MADT
+//!   override) isn't used: the handler leaves bytes in the UART when the
+//!   queue is full, which a level input would raise again after every EOI,
+//!   and an ISA UART drives its line active high.
 //! - **Interrupt:** moves the waiting bytes into [`QUEUE`] while it has
 //!   room, and wakes the reader. Bytes past its room stay in the UART
-//!   (QEMU then stops feeding it; a real UART overruns and drops the next
-//!   ones, unseen).
+//!   (QEMU holds the rest back; a real UART overruns and drops them).
 //! - **Reading** ([`read_byte`], the serial shell on the boot CPU's `main`
 //!   thread, with interrupts off so the handler can't run in between): the
-//!   queue first, then the UART, for bytes the handler left there. The
-//!   interrupt is an edge, and no new one comes until the reader lowers
-//!   the line by taking them, so [`wait`] blocks only while neither holds a
-//!   byte (`lumen_uart`'s module doc, "Reading by interrupt"; host-tested
-//!   against a model whose handler runs only on an edge).
+//!   queue first, then the UART, for bytes the handler left there. In the
+//!   worst case the design guards against, the interrupt is an edge and no
+//!   new one comes until the reader lowers the line by taking them, so
+//!   [`wait`] blocks only while neither holds a byte (`lumen_uart`'s crate
+//!   doc, "Reading by interrupt"; host-tested against a model of that
+//!   case).
 //! - **Safety net:** the wait has a deadline ([`WAIT_NS`]), so input whose
-//!   interrupt never comes is still read, late. Found that way while IRQ 4
-//!   has never come, it warns once (a wrong route, or OUT2 ignored).
-//! - **Without the interrupt** (no route, a level-triggered one, or a CPU
-//!   whose scheduler doesn't run yet, where a thread can't block), the
-//!   shell polls, yielding, as before; without a UART it blocks for good.
+//!   interrupt doesn't wake the shell (the UART's interrupt not reaching
+//!   IRQ 4, or a handler that doesn't wake it) is still read, every 100 ms.
+//!   Each wait's end is counted (`serial` shows them): woken by the
+//!   handler, or input found at the deadline. Three of the latter in a row,
+//!   with no interrupt bringing input between, warn once
+//!   (`lumen_uart::MissedInterrupts`).
+//! - **How it waits** (`lumen_uart::wait_mode`): with the interrupt, block
+//!   with the deadline; without a UART, block for good; either only where
+//!   the thread can block (not before the boot CPU's scheduler runs);
+//!   otherwise, or without the interrupt (no route, or one refused), yield
+//!   once per look: the shell polls, as it used to.
 // (The test kernel runs no shell: nothing here is called there.)
 #![cfg_attr(feature = "ktest", allow(dead_code))]
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use alloc::string::String;
+use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use log::{debug, warn};
 use lumen_queue::ByteQueue;
+use lumen_uart::{MissedInterrupts, WaitEnd, WaitMode};
 
 use crate::arch;
+use crate::arch::apic::{Polarity, Trigger};
 use crate::interrupts;
 use crate::sched::WaitQueue;
+use crate::shell::Ctx;
+use crate::sync::SpinLock;
 
 /// The ISA IRQ COM1 interrupts on.
 const COM1_IRQ: u8 = 4;
@@ -49,11 +62,6 @@ const QUEUE_SIZE: usize = 256;
 /// The longest the serial shell blocks between looks at the UART: the
 /// safety net for an interrupt that doesn't come. (The CPU halts between.)
 const WAIT_NS: u64 = 100_000_000;
-/// Deadline wakes that found input, with IRQ 4 never taken, before the
-/// warning: one could be a race with a late interrupt (QEMU's character
-/// timeout runs on its main loop), several in a row with none ever taken
-/// can't.
-const MISSED_BEFORE_WARNING: u64 = 3;
 
 /// Received bytes, from the interrupt handler (the producer: the boot CPU
 /// with interrupts off) to [`read_byte`] (the consumer: the serial shell).
@@ -62,14 +70,25 @@ static QUEUE: ByteQueue<QUEUE_SIZE> = ByteQueue::new();
 static WAITING: WaitQueue = WaitQueue::new();
 /// Whether IRQ 4 brings the bytes (else the shell polls).
 static BY_INTERRUPT: AtomicBool = AtomicBool::new(false);
-/// IRQ 4 interrupts taken.
-static IRQS: AtomicU64 = AtomicU64::new(0);
-/// Deadline wakes that found input with no interrupt taken during the wait.
-static MISSED: AtomicU64 = AtomicU64::new(0);
+/// IRQ 4's GSI and vector, once routed (for `serial` and the warning).
+static GSI: AtomicU32 = AtomicU32::new(0);
+static VECTOR: AtomicU8 = AtomicU8::new(0);
+/// IRQ 4 interrupts that queued input.
+static INPUT_IRQS: AtomicU64 = AtomicU64::new(0);
+/// Times the handler woke the waiting reader (it was blocked, and this
+/// wake, not its deadline, readied it: `WaitQueue::wake_all`'s count).
+static READER_WOKEN: AtomicU64 = AtomicU64::new(0);
+/// Waits woken by an interrupt that brought input.
+static WOKEN: AtomicU64 = AtomicU64::new(0);
+/// Waits that found input at their deadline, no interrupt having brought
+/// any.
+static AT_DEADLINE: AtomicU64 = AtomicU64::new(0);
+/// When those are worth a warning (the serial shell's only).
+static MISSED: SpinLock<MissedInterrupts> = SpinLock::new(MissedInterrupts::new());
 
 /// Route IRQ 4 and have the UART interrupt when bytes wait (the module
-/// doc). On the boot CPU, once; without a UART or a usable route the shell
-/// polls.
+/// doc). On the boot CPU, once. Without a usable route the shell polls;
+/// without a UART it blocks for good where it can block, else yields.
 pub fn init() {
     if !arch::serial::present() {
         return;
@@ -81,9 +100,17 @@ pub fn init() {
             return;
         }
     };
-    if route.level_triggered() {
+    GSI.store(route.gsi(), Ordering::Relaxed);
+    VECTOR.store(route.vector(), Ordering::Relaxed);
+    if route.trigger() == Trigger::Level || route.polarity() == Polarity::ActiveLow {
         // Left routed and masked.
-        warn!(target: "serial", "serial input is polled: IRQ {COM1_IRQ} is level-triggered (GSI {})", route.gsi());
+        warn!(
+            target: "serial",
+            "serial input is polled: IRQ {COM1_IRQ} is {:?}, {:?} (GSI {}), not an ISA UART's edge, active high",
+            route.trigger(),
+            route.polarity(),
+            route.gsi()
+        );
         return;
     }
     arch::serial::enable_rx_interrupt();
@@ -91,10 +118,10 @@ pub fn init() {
     interrupts::set_masked(route, false);
     {
         // A byte that came before the input was unmasked raised its edge
-        // while it was masked: take it now (no new edge comes while it
+        // while it was masked: take it now (no new edge may come while it
         // waits).
         let _off = arch::irq::push_off();
-        drain();
+        queue_waiting();
     }
     debug!(
         target: "serial",
@@ -107,23 +134,25 @@ pub fn init() {
 
 /// IRQ 4 (interrupts off, the boot CPU).
 fn on_irq() {
-    IRQS.fetch_add(1, Ordering::Relaxed);
-    drain();
+    if queue_waiting() > 0 {
+        INPUT_IRQS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Move the waiting bytes into the queue while it has room (the rest stay
-/// in the UART), then wake the reader if any came. With interrupts off, on
-/// the boot CPU: the queue's only producer.
-fn drain() {
-    debug_assert!(!arch::irq::enabled() && arch::cpu_index() == 0, "the serial queue's producer is the boot CPU");
+/// in the UART), then wake the reader if any came (counting a wake that
+/// readied it); how many. With interrupts off, on the boot CPU: the
+/// queue's only producer.
+fn queue_waiting() -> usize {
     let room = QUEUE_SIZE - QUEUE.len();
     let queued = arch::serial::drain(room, |b| {
         let fit = QUEUE.push(b);
         debug_assert!(fit, "drained only as much as the queue has room for");
     });
-    if queued > 0 {
-        WAITING.wake_all();
+    if queued > 0 && WAITING.wake_all() > 0 {
+        READER_WOKEN.fetch_add(1, Ordering::Relaxed);
     }
+    queued
 }
 
 /// Whether a byte waits for [`read_byte`], in the queue or the UART.
@@ -135,37 +164,80 @@ fn available() -> bool {
 /// (the module doc). Never blocks. The serial shell's only (the queue's
 /// one consumer), on the boot CPU.
 pub fn read_byte() -> Option<u8> {
-    debug_assert!(arch::cpu_index() == 0, "the serial queue's consumer runs on the boot CPU");
     let _off = arch::irq::push_off();
-    arch::serial::read_next(|| QUEUE.pop())
+    let popped = QUEUE.pop();
+    arch::serial::read_next(popped)
 }
 
 /// Wait for a received byte (see [`read_byte`]; the caller looks again
-/// afterwards). With the interrupt, where the thread can block: until a
-/// byte waits, or at most [`WAIT_NS`]. Without a UART: for good. Otherwise
-/// yield to the CPU's other threads once (the caller polls).
+/// afterwards), as `lumen_uart::wait_mode` says: block with the deadline,
+/// block for good, or yield once. The serial shell's only, on the boot
+/// CPU.
 pub fn wait() {
-    let can_block = crate::sched::can_block_now();
-    if !arch::serial::present() && can_block {
-        // Nothing will ever come.
-        WAITING.wait_until(|| false);
-    } else if BY_INTERRUPT.load(Ordering::Acquire) && can_block {
-        let irqs = IRQS.load(Ordering::Relaxed);
-        let deadline = crate::time::now_ns() + WAIT_NS;
-        let found = WAITING.wait_until_or_deadline(deadline, available);
-        if found && IRQS.load(Ordering::Relaxed) == irqs && crate::time::now_ns() >= deadline {
-            note_missed();
-        }
-    } else {
-        crate::sched::yield_now();
+    debug_assert!(arch::cpu_index() == 0, "the serial shell waits on the boot CPU");
+    let present = arch::serial::present();
+    let by_interrupt = BY_INTERRUPT.load(Ordering::Acquire);
+    match lumen_uart::wait_mode(present, by_interrupt, crate::sched::can_block_now()) {
+        WaitMode::Forever => WAITING.wait_until(|| false),
+        WaitMode::Deadline => wait_with_deadline(),
+        WaitMode::Yield => crate::sched::yield_now(),
     }
 }
 
-/// A deadline wake found input with no interrupt during the wait: warn
-/// once if it keeps happening while IRQ 4 has never come.
-fn note_missed() {
-    let missed = MISSED.fetch_add(1, Ordering::Relaxed) + 1;
-    if missed == MISSED_BEFORE_WARNING && IRQS.load(Ordering::Relaxed) == 0 {
-        warn!(target: "serial", "COM1 input found without its interrupt; check IRQ {COM1_IRQ}'s routing");
+/// Block until a byte waits, or at most [`WAIT_NS`]; count how the wait
+/// ended, and warn once if input keeps being found at the deadline.
+fn wait_with_deadline() {
+    let woken = READER_WOKEN.load(Ordering::Relaxed);
+    let deadline = crate::time::now_ns() + WAIT_NS;
+    let found = WAITING.wait_until_or_deadline(deadline, available);
+    let end = if READER_WOKEN.load(Ordering::Relaxed) != woken {
+        // The handler's wake readied this thread (even if it ran only after
+        // the deadline).
+        WOKEN.fetch_add(1, Ordering::Relaxed);
+        WaitEnd::Interrupt
+    } else if found && crate::time::now_ns() >= deadline {
+        // The deadline readied it, and input was waiting: no interrupt
+        // woke it for that input (none came, or one came and didn't wake).
+        AT_DEADLINE.fetch_add(1, Ordering::Relaxed);
+        WaitEnd::InputAtDeadline
+    } else {
+        // Nothing came; or a byte was already waiting at the first look
+        // (its interrupt still pending, interrupts off then): neither says
+        // anything about the interrupt.
+        WaitEnd::Idle
+    };
+    if MISSED.lock().note(end) {
+        warn!(
+            target: "serial",
+            "COM1 input found without its interrupt {} times in a row; check IRQ {COM1_IRQ}'s routing (GSI {}, vector {:#04x}): input is read every 100 ms instead",
+            MissedInterrupts::THRESHOLD,
+            GSI.load(Ordering::Relaxed),
+            VECTOR.load(Ordering::Relaxed)
+        );
     }
+}
+
+/// `serial`: how COM1's input comes, and how the serial shell's waits for
+/// it ended.
+pub fn serial_command(ctx: &mut Ctx<'_>, args: &[String]) {
+    if !args.is_empty() {
+        return ctx.fail("usage: serial");
+    }
+    let mut t = String::new();
+    if !arch::serial::present() {
+        t.push_str("serial: no UART at COM1\n");
+    } else if BY_INTERRUPT.load(Ordering::Acquire) {
+        let _ = writeln!(
+            t,
+            "serial: COM1 input by interrupt (ISA IRQ {COM1_IRQ}, GSI {}, vector {:#04x}): {} interrupts brought input; waits woken by one: {}, input found at the deadline: {}",
+            GSI.load(Ordering::Relaxed),
+            VECTOR.load(Ordering::Relaxed),
+            INPUT_IRQS.load(Ordering::Relaxed),
+            WOKEN.load(Ordering::Relaxed),
+            AT_DEADLINE.load(Ordering::Relaxed)
+        );
+    } else {
+        t.push_str("serial: COM1 input polled (no interrupt)\n");
+    }
+    let _ = ctx.out.write_str(&t);
 }

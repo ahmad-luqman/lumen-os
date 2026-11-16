@@ -301,8 +301,10 @@ impl Console for Serial {
             if let Some(key) = self.try_key() {
                 return key;
             }
-            // Block until IRQ 4 brings a byte (the CPU halts meanwhile);
-            // without the interrupt, yield to the CPU's other threads.
+            // `serial_in::wait`: block until IRQ 4 brings a byte (at most
+            // 100 ms; the CPU halts meanwhile), block for good without a
+            // UART, or yield once where the thread can't block or no
+            // interrupt brings the bytes.
             serial_in::wait();
         }
     }
