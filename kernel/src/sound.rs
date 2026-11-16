@@ -978,12 +978,15 @@ struct Row {
     counts: Counts,
 }
 
-/// `sound`'s records: one row, none without a device.
+/// `sound`'s records: one row, none without a device. A sound handed to
+/// [`play`] shows `playing` at once, before the thread has taken it (the
+/// command that started it has returned by then: `beep`), until it is
+/// over.
 pub fn table() -> pipe::Table {
     let now = crate::time::now_ns();
     let mut p = PLAYER.lock();
     let checked = p.check(now);
-    let seen = p.bound.as_ref().map(|b| (b.counts, matches!(b.activity, Activity::Playing { .. })));
+    let seen = p.bound.as_ref().map(|b| (b.counts, b.next.is_some() || matches!(b.activity, Activity::Playing { .. })));
     drop(p);
     let row = seen.map(|(counts, playing)| Row {
         state: match checked.map_err(refusal) {
@@ -1053,6 +1056,34 @@ crate::ktest!(
         kassert_eq!(t.rows().len(), 1);
         kassert_eq!(t.rows()[0][3], Value::Absent("-"));
         kassert_eq!(table_of(None).rows().len(), 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_sound_handed_over_shows_playing_before_the_thread_takes_it() {
+        // (#120) With a made-up bound device (no thread: the sound is never
+        // taken), `sound` says `playing` from the moment `play` returns,
+        // and `idle` again once the sound is kept from starting.
+        use crate::kassert_eq;
+        static STATUS: AtomicU8 = AtomicU8::new(0x0f);
+        let _unbind = Unbind;
+        let format = choose(0, PcmRates::all(), PcmFormats::S16, 1..=2)?;
+        let addr = PciAddr::new(0, 0xff, 0x1f, 7).ok_or("addr")?;
+        PLAYER.lock().bound = Some(Bound {
+            device: Device { addr, format },
+            status: StatusHandle::ktest_reading(&STATUS, None),
+            activity: Activity::Idle,
+            next: None,
+            counts: Counts::default(),
+        });
+        let state = || table().rows()[0][0].clone();
+        kassert_eq!(state(), Value::Text("idle".into()));
+        let tone = lumen_synth::beep(Freq::from_hz(440), Duration::from_millis(10), format.rate).map_err(|_| "tone")?;
+        let sound = play(Box::new(tone)).map_err(|_| "play")?;
+        kassert_eq!(state(), Value::Text("playing".into()));
+        stop(&sound);
+        kassert_eq!(state(), Value::Text("idle".into()));
         Ok(())
     }
 );
