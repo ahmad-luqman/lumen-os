@@ -2341,10 +2341,11 @@ ever seen.
   marks the state stale until a clean batch brings a frame. What that
   count guarantees, and its preconditions, are stated once, in
   `lumen_input::may_have_lost_frames`'s doc, and a host model checks them
-  (#124). Scenarios send 300 frames of 3 and of 7 events unpaced while
-  the guest's CPU is busy, and check that frames were lost (as many as
-  QEMU traced), that an overrun was counted, and the overrun warning;
-  the 7-event frames tell the device's bound from moves' 3.
+  (#124). Scenarios send 300 moves, and 7-event frames until QEMU traces
+  the first drop (at most 300), unpaced while the guest's CPU is busy, and
+  check that frames were lost (as many as QEMU traced), that an overrun
+  was counted, and the overrun warning; the 7-event frames tell the
+  device's bound from moves' 3.
 - **Keys:** the keyboard's decoded keys (`lumen_shell::Key`, through
   `crate::vt`'s per-terminal rings today). That is a line editor's key
   (characters and editing keys, no key-up, no modifiers on their own),

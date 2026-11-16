@@ -173,8 +173,16 @@ def test_trace_events_go_to_the_log_file(tmp_path):
     assert "-trace" not in plain
     with pytest.raises(ValueError, match="need a log file"):
         qemu_args(opts(log_file=None, trace_events=("x",)))
-    (tmp_path / "qemu.log").write_text("virtio_input_queue_full\n")
-    assert m.trace_log() == "virtio_input_queue_full\n"
+    # Without `-d` tracing, the events still get `-D`.
+    alone = qemu_args(opts(log_file=tmp_path / "q.log", trace="", trace_events=("x",)))
+    assert "-d" not in alone and alone[alone.index("-D") + 1] == str(tmp_path / "q.log")
+    assert qemu_args(opts(log_file=tmp_path / "q.log", trace="")).count("-D") == 0
+    (tmp_path / "qemu.log").write_text("first\n")
+    seen = len(m.trace_log())
+    with (tmp_path / "qemu.log").open("a") as f:
+        f.write("virtio_input_queue_full\n")
+    assert m.trace_log() == "first\nvirtio_input_queue_full\n"
+    assert m.trace_log(seen) == "virtio_input_queue_full\n"
 
 
 def test_machine_without_serial_has_no_serial_port(tmp_path):

@@ -463,13 +463,14 @@ def qemu_args(o: QemuOptions) -> list[str]:
         args += ["-display", "none"]
     if o.qmp_socket:
         args += ["-qmp", f"unix:{o.qmp_socket},server=on,wait=off"]
+    if o.trace_events and not o.log_file:
+        raise ValueError("trace events need a log file (they would go to stderr)")
     if o.log_file and o.trace:
-        args += ["-d", o.trace, "-D", str(o.log_file)]
-    if o.trace_events:
-        if not o.log_file:
-            raise ValueError("trace events need a log file (they would go to stderr)")
-        for event in o.trace_events:
-            args += ["-trace", event]
+        args += ["-d", o.trace]
+    if o.log_file and (o.trace or o.trace_events):
+        args += ["-D", str(o.log_file)]
+    for event in o.trace_events:
+        args += ["-trace", event]
     if o.gdb:
         args += ["-s", "-S"]
     # The RTC keeps UTC (the shell's `date` says so; the tests compare it
@@ -700,11 +701,16 @@ class Machine:
             if not any(noise.search(line) for noise in QEMU_NOISE)
         ]
 
-    def trace_log(self) -> str:
+    def trace_log(self, offset: int = 0) -> str:
         """QEMU's log so far (artifacts/qemu.log): its `-d` trace and the
-        `trace_events` asked for."""
+        `trace_events` asked for; from byte `offset` on (a length it
+        returned before, to read only what came since)."""
         log = self.artifacts / "qemu.log"
-        return log.read_text(errors="replace") if log.exists() else ""
+        if not log.exists():
+            return ""
+        with log.open("rb") as f:
+            f.seek(offset)
+            return f.read().decode(errors="replace")
 
     def options(self, vars_file: Path) -> QemuOptions:
         """How start() runs QEMU (separate so the harness tests can check it)."""

@@ -28,7 +28,7 @@
 //!   frame that doesn't fit, without a `SYN_DROPPED`. How big a frame can
 //!   be comes from the device: the probe counts its `EV_BITS`
 //!   (`lumen_input::frame_bound`: 12 on QEMU's tablet), and the boot line
-//!   says it; a bound under 3 or of the ring's size or more is warned
+//!   says it; a bound of the ring's size or more is warned
 //!   about. A batch that read so many events that a frame of that size
 //!   may not have fit (21 or more of 32 on QEMU's tablet) counts as an
 //!   overrun (warned about once), and the state is marked stale until a
@@ -283,9 +283,7 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
     );
     if frame >= RING {
         warn!(target: "mouse", "{addr}: frames of up to {frame} events don't fit the {RING}-buffer ring: every non-empty \
-            batch counts as an overrun, so overruns can't be told");
-    } else if frame < 3 {
-        warn!(target: "mouse", "{addr}: frames of up to {frame} events: too few for a move (X, Y and the sync)");
+            batch counts as an overrun, so overruns can't be told apart");
     }
     let device = Device { addr, name, screen };
     *BOUND.lock() = Some(Bound { device, state: None, counts: Counts::default(), stale: false, failed: None });

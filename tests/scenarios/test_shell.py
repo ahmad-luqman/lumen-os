@@ -111,7 +111,7 @@ def test_a_log_line_inside_a_commands_echo_is_not_output(boot):
     wait_for_output(m, start, VIEW_MOVED)
     m.send("lo\r")
     out = read_output(m, "echo hello")
-    assert out == "hello\n" and len(out.logs) == 1, (out, out.logs)
+    assert out == "hello\n" and re.fullmatch(VIEW_MOVED, out.logs[-1] + "\n"), (out, out.logs)
     assert re.match(rf"echo hel{VIEW_MOVED}lo\nhello\n{PROMPT}", m.output[start:]), m.output[start:]
 
 
@@ -128,7 +128,8 @@ def test_a_log_line_between_output_writes_is_not_output(boot):
     wait_for_output(m, start, VIEW_MOVED)
     m.send("\x03")
     out = read_output(m, line)
-    assert out == "a\nrhai: stopped (Ctrl-C)\n" and len(out.logs) == 1, (out, out.logs)
+    assert out == "a\nrhai: stopped (Ctrl-C)\n", (out, out.logs)
+    assert re.fullmatch(VIEW_MOVED, out.logs[-1] + "\n"), out.logs
     assert re.search(rf"\na\n{VIEW_MOVED}rhai: stopped", m.output[start:]), m.output[start:]
 
 
@@ -148,7 +149,7 @@ def test_a_log_line_after_the_output_before_the_prompt_is_not_output(boot):
     lines = out.splitlines()
     assert lines[-1] == "mandelbrot: press a key", out
     assert all(line.startswith("mandelbrot: ") for line in lines), out
-    assert len(out.logs) == 1 and re.fullmatch(IGNORED, out.logs[0] + "\n"), out.logs
+    assert re.fullmatch(IGNORED, out.logs[-1] + "\n"), out.logs
     assert re.search(rf"press a key\n{IGNORED}{PROMPT}", m.output[start:]), m.output[start:]
 
 

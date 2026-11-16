@@ -124,11 +124,8 @@ def read_output(
     out = output[echo.end() : end.start()]
     if keep_logs:
         return Output(out)
-    # From the prompt the echo follows (not earlier: boot's lines stay out).
-    prompt = output.rfind(PROMPT, 0, echo.start())
-    before = output[prompt + len(PROMPT) : echo.start()] if prompt >= 0 else ""
     text, logs = split_logs(out)
-    logs = split_logs(before)[1] + split_logs(echo[0])[1] + logs
+    logs = _lines_before_output(output, echo) + logs
     check_quiet(line, logs, allow, text)
     return Output(text, logs)
 
@@ -146,20 +143,30 @@ def _echo_and_prompt(m: Machine, line: str, timeout: float) -> tuple[re.Match[st
 def run_dmesg(m: Machine, line: str = "dmesg", *, allow: str | None = None) -> list[str]:
     """Run `line` (`dmesg`, perhaps piped): its lines, less any log line
     logged while it ran, wherever that landed. dmesg copies lines serial
-    printed already, so a log line in its output that serial didn't print
-    before is a live one. A live WARN or ERROR fails the run unless
-    `allow`ed, as in `run`."""
+    printed already (up to its echo's end: it runs after Enter), so a log
+    line in its output that serial didn't print before is a live one. A
+    live WARN or ERROR, or one between the prompt and the end of the echo,
+    fails the run unless `allow`ed, as in `run`."""
     m.send_line(line)
     echo, end = _echo_and_prompt(m, line, 10)
-    before = m.output[: echo.start()]
+    output = m.output
+    before = output[: echo.end()]
     lines, live = [], []
-    for text in m.output[echo.end() : end.start()].splitlines():
+    for text in output[echo.end() : end.start()].splitlines():
         if is_log_line(text) and text + "\n" not in before:
             live.append(text)
         else:
             lines.append(text)
-    check_quiet(line, live, allow, "\n".join(lines))
+    check_quiet(line, _lines_before_output(output, echo) + live, allow, "\n".join(lines))
     return lines
+
+
+def _lines_before_output(output: str, echo: re.Match[str]) -> list[str]:
+    """The log lines from the prompt `echo` follows (not earlier: boot's
+    lines stay out) to the end of the echo."""
+    prompt = output.rfind(PROMPT, 0, echo.start())
+    start = prompt + len(PROMPT) if prompt >= 0 else echo.start()
+    return split_logs(output[start : echo.start()])[1] + split_logs(echo[0])[1]
 
 
 def wait_for_output(m: Machine, start: int, pattern: str, timeout: float = 10) -> re.Match[str]:

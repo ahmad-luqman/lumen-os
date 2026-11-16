@@ -442,9 +442,11 @@ def burst_frame(i: int, frame: int, size: tuple[int, int]) -> dict:
 @pytest.mark.parametrize(("frame", "until_lost"), [(3, False), (7, True)], ids=["moves", "buttons"])
 def test_a_burst_of_moves_counts_overruns(boot, frame, until_lost):
     # A burst (300 moves, or frames with buttons until the first is lost,
-    # at most 300) sent as fast as QMP takes it, while the serial shell's
-    # thread spins (a rhai loop) on the guest's one CPU, so the mouse thread
-    # reads the ring at most once a time slice (under KVM too): QEMU drops
+    # at most 300) sent unpaced while the serial shell's thread spins (a
+    # rhai loop) on the guest's one CPU, so the mouse thread reads the ring
+    # less often (under TCG the ring overflowed in every measured run; under
+    # KVM, 30 fixed 7-event frames lost none, the thread reading every 3 or
+    # 4 frames: hence `until_lost`): QEMU drops
     # whole frames that don't fit in the 32-buffer ring (traced as
     # virtio_input_queue_full, one line per frame) without telling the
     # guest. Frames were lost, each traced; `mouse` counts at least one
@@ -460,8 +462,10 @@ def test_a_burst_of_moves_counts_overruns(boot, frame, until_lost):
     start = len(m.output)
     m.send_line(hog)
     wait_for_output(m, start, echo_pattern(hog))
-    sent = 0
-    while sent < 300 and not (until_lost and "virtio_input_queue_full" in m.trace_log()):
+    sent, log = 0, len(m.trace_log())
+    # Only what QEMU logged since (the log is flushed per line, before QMP
+    # answers the send that dropped a frame).
+    while sent < 300 and not (until_lost and "virtio_input_queue_full" in m.trace_log(log)):
         qmp.send_input(burst_frame(sent, frame, size))
         sent += 1
     m.send("\x03")
@@ -483,6 +487,10 @@ def test_a_burst_of_moves_counts_overruns(boot, frame, until_lost):
     assert events == frame * frames
     assert frames < sent, "no frame lost: the ring never filled"
     assert sent - frames == full, (sent, frames, full)
+    if until_lost:
+        # The send that dropped a frame was the last: its trace line was in
+        # the log before QMP answered.
+        assert full == 1, full
     assert overruns >= 1, (frames, overruns)
     m.move_pointer(640, 400)
     assert wait_mouse(m, OVERRUN_WARN, x="640", y="400").stale == "no"

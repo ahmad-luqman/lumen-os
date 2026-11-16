@@ -168,6 +168,12 @@ def test_run_dmesg_drops_live_lines_and_fails_on_a_live_warning():
         run_dmesg(FakeMachine(printed + f"{WARN}\nlumen> "))
     m = FakeMachine(printed + f"{WARN}\nlumen> ")
     assert run_dmesg(m, allow=OVERRUN) == [head, INFO]
+    # A line logged inside the echo was printed before dmesg ran (it is
+    # dmesg's); a warning there, or between the prompt and the echo, fails.
+    inside = f"lumen> dm{DEBUG}\nesg\n{head}\n{DEBUG}\nlumen> "
+    assert run_dmesg(FakeMachine(inside)) == [head, DEBUG]
+    with pytest.raises(AssertionError, match="WARN  mouse"):
+        run_dmesg(FakeMachine(f"lumen> {WARN}\ndmesg\n{head}\nlumen> "))
 
 
 def test_split_logs_returns_the_lines_in_order():
