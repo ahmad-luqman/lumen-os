@@ -112,6 +112,20 @@ def test_in_kernel_tests_pass(boot):
         out,
     ), "the second offer isn't refused as expected"
     assert "probing never on" not in out
+    # shell::the_serial_prompt_waits_on_past_its_warning: the serial
+    # prompt's warning names the stand-in shell not yet waiting, with its
+    # state (sleeping; ready if the warning came before it first ran, and
+    # then the early one may be named too), and once both wait the release
+    # is logged with how long it held.
+    assert re.search(
+        r"WARN  shell: serial prompt held: (waits-early \(ready\), )?"
+        r"waits-late \((sleeping|ready)\) not yet waiting for keys \(still waiting\)\n",
+        out,
+    ), "the serial prompt's warning"
+    assert re.search(
+        r"INFO  shell: serial prompt released after \d+ ms: every screen shell waits for keys\n",
+        out,
+    ), "the serial prompt's release"
     # The only virtio errors are the refused frees the DMA ktests make on
     # purpose, each saying why.
     errors = re.findall(r"ERROR virtio: (.*)\n", out)

@@ -5,7 +5,7 @@ and lumen_harness.klog's line format."""
 import re
 
 import pytest
-from lumen_harness.klog import LOG_LINE, is_log_line, level_of
+from lumen_harness.klog import LOG_LINE, is_log_line, level_of, stamp_capturing
 from lumen_harness.qemu import ExpectTimeout
 from lumen_harness.shell import (
     Output,
@@ -217,3 +217,13 @@ def test_log_lines_and_their_levels(line, level):
     assert LOG_LINE.fullmatch(line), line
     assert is_log_line(line) and is_log_line(line[:-1])
     assert level_of(line) == level
+
+
+def test_stamp_capturing_takes_the_seconds_without_padding():
+    # test_boot's `micros` reads the group: digits only, None before the
+    # TSC is calibrated.
+    rx = re.compile(stamp_capturing("s"))
+    assert rx.fullmatch("[    0.224043]")["s"] == "0.224043"
+    assert rx.fullmatch("[12345.000001]")["s"] == "12345.000001"
+    assert rx.fullmatch("[    ?.??????]")["s"] is None
+    assert not rx.fullmatch("[0.224043]")

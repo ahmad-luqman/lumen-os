@@ -19,6 +19,14 @@ SECONDS = r"(?=[ \d]{5}) *\d+\.\d{6}"
 # Before the TSC is calibrated.
 UNKNOWN = r"    \?\.\?{6}"
 STAMP = rf"\[(?:{SECONDS}|{UNKNOWN})\]"
+
+
+def stamp_capturing(name: str) -> str:
+    """`STAMP`, capturing a calibrated stamp's `seconds.micros` (without its
+    padding) as group `name`; the group is None for `[    ?.??????]`."""
+    return rf"\[(?:(?=[ \d]{{5}}) *(?P<{name}>\d+\.\d{{6}})|{UNKNOWN})\]"
+
+
 LEVEL = r"(?:ERROR|WARN |INFO |DEBUG|TRACE)"
 # The levels a test should see: they fail a command's output (shell.run).
 LOUD = ("ERROR", "WARN")
