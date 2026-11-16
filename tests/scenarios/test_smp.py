@@ -14,8 +14,10 @@ from typing import NamedTuple
 import pytest
 from lumen_harness import crash
 from lumen_harness.qemu import EXIT_CRASH
+from lumen_harness.screen import PROMPT
 from test_crash import SCREEN_DONE
 from test_mm import OVERFLOW, assert_main_stack_overflow
+from test_shell import HELD, PARKED_CMDLINE, expect_screen_shells_parked
 
 BOOT_TIMEOUT = 60
 ONLINE = re.compile(r"INFO  smp: cpu (\d+) online \(lapic id (\d+)\)\n")
@@ -47,10 +49,18 @@ def ap_stacks(output: str) -> dict[int, ApStacks]:
     return {int(s[0]): ApStacks(*s[1:]) for s in STACKS.findall(output)}
 
 
-def boot_to_prompt(boot, cpus: int):
-    m = boot("qemutest", extra=["-smp", str(cpus)])
+def boot_to_prompt(boot, cpus: int, parked: bool = True):
+    """Boot `cpus` CPUs to the serial prompt. With `parked` (all but one
+    test), boot with `PARKED_CMDLINE` (`lumen.log=debug`: more lines on
+    serial only, none on the screen) and check the screen shells were all
+    parked before the prompt (#119); without it, at the default log level,
+    as shipped. Returns (machine, CPUs online)."""
+    cmdline = PARKED_CMDLINE if parked else None
+    m = boot("qemutest", extra=["-smp", str(cpus)], cmdline=cmdline)
     summary = m.expect(SUMMARY, BOOT_TIMEOUT)
-    m.expect(r"lumen> ", BOOT_TIMEOUT)
+    if parked:
+        expect_screen_shells_parked(m, BOOT_TIMEOUT)
+    m.expect(PROMPT, BOOT_TIMEOUT)
     return m, int(summary.group(1))
 
 
@@ -92,7 +102,11 @@ def test_one_cpu_boots_alone(boot):
 
 
 def test_cpus_past_the_limit_are_halted(boot):
-    m, online = boot_to_prompt(boot, 10)
+    # At the default log level, as shipped (the one test_smp boot without
+    # the readiness check).
+    m, online = boot_to_prompt(boot, 10, parked=False)
+    # The serial prompt's warning (#119) is logged at the default level too.
+    assert HELD not in m.output, m.output[-2000:]
     assert online == 8
     assert sorted(int(c) for c, _ in ONLINE.findall(m.output)) == list(range(1, 8))
     # Counted by the halt loop they were sent to, so they got there.
@@ -104,7 +118,14 @@ def crash_on(boot, args: str, cpus: int = 4):
     crash code after a complete report (no `!!!` line: every other CPU
     stopped for the report, through its stop NMI or, if a thread there would
     block first, by halting itself; the heap line and `interrupts: off` at
-    the end; drawn on screen too). Returns (report, the APs' logged stacks)."""
+    the end; drawn on screen too). For a crash on another CPU the heap line
+    is `heap: `, not `heap (lock held; ...)`, because the screen shells
+    were parked when the line ran, so the boot CPU's stop NMI finds none of
+    them mid-allocation: the serial prompt comes only once every screen
+    shell is blocked waiting for its first key (#119, checked by
+    boot_to_prompt). For a crash on CPU 0 itself (`pf` and `pf 0` fault in
+    the serial shell's own command; `selfblock` panics there) that CPU
+    reports instead of being stopped. Returns (report, the APs' logged stacks)."""
     m, online = boot_to_prompt(boot, cpus)
     assert online == cpus
     m.send_line(f"crash {args}")
