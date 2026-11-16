@@ -223,6 +223,9 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     // Randomness: RDRAND, and the virtio-rng the probe brought up.
     rng::init();
 
+    // In this order, `boot complete` before the last phase and the timeline
+    // after it: test_boot checks that the total falls between the two
+    // lines' stamps (one origin, one unit).
     info!(target: "boot", "boot complete");
     ktrace!(Kind::BootPhase, BootPhase::Complete);
     let timeline = trace::Timeline::boot();

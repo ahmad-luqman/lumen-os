@@ -37,6 +37,9 @@ TIMELINE = re.compile(
     r"\[ *(?P<stamp>\d+\.\d{6})\] (?P<level>INFO |WARN ) boot: timeline: (?P<text>.*)\n"
 )
 COMPLETE = re.compile(r"(?P<phases>.*) \(total (?P<total>\d+\.\d{3}) ms\)")
+# `boot complete`, logged just before the last phase (`complete`) is marked;
+# its stamp.
+BOOT_COMPLETE = re.compile(r"\[ *(\d+\.\d{6})\] INFO  boot: boot complete\n")
 PHASE = re.compile(r"(?P<name>\S+) \+(?P<ms>\d+\.\d{3}) ms")
 PHASES = [
     "entry",
@@ -103,7 +106,8 @@ def test_log_lines_are_structured(boot):
 
 def test_boot_timeline_printed(boot):
     """At boot complete, every phase's time since the timeline's origin, in
-    order; then Limine's times, with the origin after Limine's handoff."""
+    order, the total between the log stamps around it; then Limine's times,
+    with the origin after Limine's handoff."""
     m = boot("qemutest")
     line = m.expect(TIMELINE, BOOT_TIMEOUT)
     timeline = COMPLETE.fullmatch(line["text"])
@@ -143,9 +147,20 @@ def test_boot_timeline_printed(boot):
     # slower, never that slow).
     assert us["time"] - us["interrupts"] >= 60_000, line[0]
     assert total <= 30_000_000, line[0]
-    # The line's own stamp, taken just after the last phase: at or after the
-    # total, by at most 50 ms.
-    assert total <= micros(line["stamp"]) <= total + 50_000, line[0]
+    # The log's stamps count from the timeline's origin in its unit: both
+    # are the boot CPU's TSC since the same entry tick, converted with the
+    # same calibrated clock and truncated to the microsecond
+    # (`time::since_boot_ns`, `Timeline::boot`). `boot complete` is stamped
+    # just before the last phase is marked and this line just after
+    # (kernel/src/main.rs), so the total falls between their stamps. Order
+    # only, no time bound: a starved vCPU widens the gap between the stamps
+    # but can't reverse it (#125). A log origin earlier than the timeline's,
+    # or a faster unit, puts `boot complete` after the total once the error
+    # exceeds that gap; a later origin or a slower unit puts this line
+    # before it.
+    stamps = BOOT_COMPLETE.findall(m.output)
+    assert len(stamps) == 1, stamps
+    assert micros(stamps[0]) <= total <= micros(line["stamp"]), (stamps[0], line[0])
 
 
 def test_serial_input_round_trip(boot):
