@@ -154,17 +154,62 @@ tests (for example `lumen-elf`, the symbol-table reader).
 
 `kmain`'s first statement reads the TSC (a bare `rdtsc`, which can't fault,
 so GDT and IDT setup still come first in effect): the origin of both the
-boot timeline and the log's timestamps. The pinned Limine crate has no
-bootloader-performance request, so the bootloader's own time isn't counted.
-Entry is recorded with the origin's TSC; every other phase records a
+boot timeline and the log's timestamps. Entry is recorded with the
+origin's TSC; every other phase records a
 `BootPhase` trace event when it ends: arch-init, logger, symbols, memory, stacks, acpi, pci, interrupts,
 time (calibration, interrupts on, the first-tick check: 10 ms, up to 100 ms while no tick has come), smp (the
 wait until the other CPUs are online, then the scheduler started on every CPU), framebuffer, complete (which includes setting up the keyboard and probing the drivers). After `boot complete` the kernel prints them from the ring,
-converted with the calibrated TSC:
+converted with the calibrated TSC, and then the bootloader's own times
+(from one TCG boot):
 
 ```
-[    0.139423] INFO  boot: timeline: entry +0.000 ms, arch-init +0.145 ms, ..., complete +139.382 ms (total 139.382 ms)
+[    0.364036] INFO  boot: timeline: entry +0.000 ms, arch-init +0.236 ms, ..., complete +363.470 ms (total 363.470 ms)
+[    0.366511] INFO  boot: before kmain: limine started at 1932.697 ms and handed off at 2514.149 ms (TSC time), kmain began +10.379 ms after the handoff
 ```
+
+The bootloader's time isn't counted in the timeline; the second line
+shows it. `boot.rs` asks Limine for its bootloader-performance and
+TSC-frequency responses (by hand: the pinned `limine` crate has no types
+for them). They give when Limine started (`init_usec`, read just after
+Limine calibrated the TSC) and when it handed off (`exec_usec`, the last
+TSC reading it records before the jump), in whole microseconds of the TSC
+by Limine's calibration, and that frequency. Limine takes the frequency
+from CPUID leaf 0x15 when the CPU reports a crystal ratio and frequency
+there; otherwise it times three 10 ms firmware `Stall`s and keeps the
+smallest count. Under QEMU, which zeroes leaf 0x15, it is always the
+`Stall` calibration, which a starved emulator can only push up.
+
+`lumen_time::handoff` turns the handoff back into ticks with Limine's own
+frequency (rounded down: at or before Limine's reading, by fewer than
+`ceil(hz / 10^6)` + 1 ticks) and checks, on every boot (none of it a time
+bound):
+
+- Limine started after the TSC's 0 and before its handoff, and handed off
+  at least 10 ms after the TSC's 0 (beyond that, Limine's microseconds are
+  trusted);
+- the handoff tick reads back as Limine's microsecond (or one just
+  before): an internal consistency assertion on the conversion;
+- Limine's frequency is at least half of the kernel's own calibration
+  (one-sided: a high Limine frequency only lengthens Limine's wait in our
+  ticks);
+- the origin is at least `ceil(hz / 100)` ticks after the handoff tick.
+  After its handoff reading, Limine v12.9.4's `flush_irqs` spins
+  `stall(10000)` (10 ms by the same frequency) before the jump; it stalls
+  because `limine.c` sets `IRQ_PIC_APIC_FLUSH` just before, on every x86-64
+  boot. This depends on those pinned Limine internals, so check them again
+  on a Limine bump.
+
+Together with the timeline's own order (the origin at or before
+arch-init), that bounds the origin between Limine's handoff and arch-init,
+which rules out the TSC's reset and the firmware's handoff to Limine (both
+before Limine started), without a time bound that a starved emulator could
+overrun (#55). It doesn't prove the origin is `kmain`'s first instruction:
+one read later, before arch-init, passes. Any of Limine's responses
+missing, Limine's 0 Hz, no TSC calibration or no origin logs
+`before kmain: unknown (<why>)` at warn; a failed check logs the line at
+warn with `; out of order: <reason>`; the scenarios fail on either. The
+10 ms after the handoff is Limine's own wait; under KVM it should be about
+the same (not measured).
 
 A phase with no event is named as missing, one stamped before entry or
 before an earlier phase says so, and the total is `complete`'s; an

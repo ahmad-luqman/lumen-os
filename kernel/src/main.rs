@@ -231,7 +231,22 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     } else {
         warn!(target: "boot", "timeline: {timeline}");
     }
+    log_before_kmain();
     after_boot()
+}
+
+/// Limine's times for the boot and where the timeline's origin falls after
+/// its handoff (`lumen_time::handoff`). A warning if any of it is unknown
+/// (a missing Limine response, Limine's 0 Hz, no TSC calibration or no
+/// origin) or out of order (the reason follows the line).
+fn log_before_kmain() {
+    match boot::before_kmain() {
+        Err(why) => warn!(target: "boot", "before kmain: unknown ({why})"),
+        Ok(before) => match before.check() {
+            Ok(()) => info!(target: "boot", "before kmain: {before}"),
+            Err(disorder) => warn!(target: "boot", "before kmain: {before}; out of order: {disorder}"),
+        },
+    }
 }
 
 #[cfg(feature = "ktest")]
