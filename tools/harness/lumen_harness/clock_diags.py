@@ -13,20 +13,24 @@ import re
 from lumen_harness import tap
 
 # `now_ns_follows_the_hpet` takes an HPET reading again when its bracket is
-# over 100 µs, at most 4 times per end. In PR #121 it needed none in 90 KVM
-# runs (45 on a loaded 4-vCPU runner, at e4b2462 and 48345e3), and in 79 TCG
-# runs on a busy Mac (43 loaded, loadavg up to 51) 4 runs needed 1 and none
-# more. More than 2 in one run means stalls hit readings far more often than
-# ever measured: a host or `now_ns` getting worse, which a pass would hide.
-MOST_HPET_RETRIES = 2
+# over 100 µs, up to 8 times per end, 20 ms apart. Before the spacing it
+# needed none in 90 KVM runs (45 on a loaded 4-vCPU runner), and in 79 TCG
+# runs on a busy Mac (43 loaded, loadavg up to 51) 4 runs needed 1. But a
+# loaded KVM runner can slow HPET reads for 60 ms or more (PR #121's load-5),
+# which now costs up to 3 or 4 spaced retries on one end. So a run may take
+# 4: one such burst. More means stalls hit readings far more often than ever
+# measured: a host or `now_ns` getting worse, which a pass would hide.
+MOST_HPET_RETRIES = 4
 # The placement tests' try counts aren't bounded: they measure how often a
 # loaded host stalls an 800 µs or 10 ms spin, not the code (6 of 8 under KVM
 # load in PR #121), and each test already fails when no try can be judged.
 HPET_BRACKET_NS = 100_000
+RETRY_SPACING_MS = 20
 
 HPET_BRACKETS = re.compile(
     r"bracket widths: start \[(?P<start>[\d, ]*)\] ns, end \[(?P<end>[\d, ]*)\] ns "
-    rf"\((?P<retries>\d+) taken again; at most {HPET_BRACKET_NS} ns trusted\)"
+    rf"\((?P<retries>\d+) taken again, {RETRY_SPACING_MS} ms apart; at most {HPET_BRACKET_NS} ns "
+    r"trusted\)"
 )
 TIMER_BRACKETS = re.compile(
     r"bracket widths min/median/max (?P<min>\d+)/(?P<median>\d+)/(?P<max>\d+) ns over "
@@ -35,7 +39,8 @@ TIMER_BRACKETS = re.compile(
 )
 PLACEMENT = re.compile(
     r"injected pause: (?P<what>HPET|timer) placement (?P<off>\d+) ns off \(at most "
-    r"(?P<allowed>\d+) ns allowed\) on try (?P<try>\d+) of (?P<tries>\d+); .*"
+    rf"(?P<allowed>\d+) ns allowed\) on try (?P<try>\d+) of (?P<tries>\d+), {RETRY_SPACING_MS} ms "
+    r"apart; .*"
 )
 
 

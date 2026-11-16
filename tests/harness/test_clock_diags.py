@@ -6,8 +6,8 @@ from lumen_harness import tap
 from lumen_harness.clock_diags import check_clock_diags
 
 NOW_NS = (
-    "# bracket widths: start [{start}] ns, end [{end}] ns ({retries} taken again; "
-    "at most {limit} ns trusted)\n"
+    "# bracket widths: start [{start}] ns, end [{end}] ns ({retries} taken again, 20 ms "
+    "apart; at most {limit} ns trusted)\n"
     "# now_ns moved 50000000 ns, the HPET 50001000 ns: 1000 ns apart, of a 1000020 ns budget\n"
 )
 TIMER = (
@@ -17,10 +17,10 @@ TIMER = (
 )
 HPET_PLACEMENT = (
     "# injected pause: HPET placement {off} ns off (at most 2500000 ns allowed) on try {tries} "
-    "of 8; paused brackets [10048000] ns, the reference's 30000 ns\n"
+    "of 8, 20 ms apart; paused brackets [10048000] ns, the reference's 30000 ns\n"
 )
 TIMER_PLACEMENT = (
-    "# injected pause: timer placement 500 ns off (at most 200000 ns allowed) on try 1 of 8; "
+    "# injected pause: timer placement 500 ns off (at most 200000 ns allowed) on try 1 of 8, 20 ms apart; "
     '427500 ns by the HPET, 428000 ns by the timer; tries (...) [("", 18000, 829000, 427500)]\n'
 )
 
@@ -52,14 +52,14 @@ def run(
             "one_stalled_reading_at_each_end_still_passes",
             (
                 "# injected pause: bracket widths: start [5051000, 1000] ns, end [5028000, 1000] "
-                f"ns ({injected_retries} taken again; at most 100000 ns trusted)\n"
+                f"ns ({injected_retries} taken again, 20 ms apart; at most 100000 ns trusted)\n"
             ),
         ),
         (
             "every_stalled_hpet_bracket_is_a_failure",
             (
                 "# injected pause: bracket widths: start [201000, 201000, 201000, 201000, 201000] "
-                "ns, end [] ns (4 taken again; at most 100000 ns trusted)\n"
+                "ns, end [] ns (4 taken again, 20 ms apart; at most 100000 ns trusted)\n"
             ),
         ),
         (
@@ -80,13 +80,17 @@ def test_a_good_run_passes():
     check_clock_diags(*run())
 
 
-def test_two_retries_pass():
-    check_clock_diags(*run(start="150000, 25000", end="120000, 1000", retries=2))
+def test_four_retries_pass():
+    # One burst of slow reads on one end, sampled around 20 ms apart.
+    start = "150000, 140000, 130000, 120000, 25000"
+    check_clock_diags(*run(start=start, end="1000", retries=4))
 
 
-def test_three_retries_fail():
-    with pytest.raises(AssertionError, match="over 2 retries"):
-        check_clock_diags(*run(start="150000, 140000, 25000", end="120000, 1000", retries=3))
+def test_five_retries_fail():
+    with pytest.raises(AssertionError, match="over 4 retries"):
+        check_clock_diags(
+            *run(start="150000, 140000, 130000, 25000", end="120000, 110000, 1000", retries=5)
+        )
 
 
 def test_a_retry_count_that_doesnt_match_the_readings_fails():

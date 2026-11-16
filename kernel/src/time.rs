@@ -582,14 +582,38 @@ const NOW_NS_BUDGET_NS: u64 = NOW_NS_SPIN_NS / 50;
 #[cfg(feature = "ktest")]
 const HPET_BRACKET_NS: u64 = 100_000;
 /// How many HPET readings [`now_ns_against_the_hpet`] takes at each end
-/// before giving up on a narrow one: 5, so at most 4 retries.
+/// before giving up on a narrow one: 9, so at most 8 retries, spaced
+/// [`RETRY_SPACING_NS`] apart.
 #[cfg(feature = "ktest")]
-const HPET_BRACKET_TRIES: usize = 5;
-// Pinned: the docs, the PR and `test_ktest.py`'s retry bound (8 = two ends
-// of 4 retries) assume 5 tries, and a limit over a tenth of the budget would
-// let two wide ends use up a fifth of it.
+const HPET_BRACKET_TRIES: usize = 9;
+/// How long the clock ktests wait, with interrupts on, before taking a
+/// reading (or a placement try) again: 20 ms. On a loaded KVM runner HPET
+/// reads (each an exit to QEMU) slowed to hundreds of µs in bursts lasting
+/// 60 ms or more (PR #121, run 43786595767's load-5: 436, 320, 189 and
+/// 169 µs back to back); retries taken back to back, about 1 ms apart, all
+/// landed inside one. Spaced, a reading's retries span 160 ms and sample
+/// around such a burst.
 #[cfg(feature = "ktest")]
-const _: () = assert!(HPET_BRACKET_TRIES == 5 && HPET_BRACKET_NS * 10 <= NOW_NS_BUDGET_NS);
+const RETRY_SPACING_NS: u64 = 20_000_000;
+// Pinned: the docs, the PR and `test_ktest.py`'s retry bound assume 9 tries
+// spaced 20 ms apart, spanning over 150 ms; and a limit over a tenth of the
+// budget would let two wide ends use up a fifth of it.
+#[cfg(feature = "ktest")]
+const _: () = assert!(
+    HPET_BRACKET_TRIES == 9
+        && (HPET_BRACKET_TRIES as u64 - 1) * RETRY_SPACING_NS >= 150_000_000
+        && HPET_BRACKET_NS * 10 <= NOW_NS_BUDGET_NS
+);
+
+/// Before try `tried` (from 0) of a reading or a placement: nothing for the
+/// first, else [`RETRY_SPACING_NS`] of [`sleep`] (the thread blocks with
+/// interrupts on). Call outside any bracket and with interrupts on.
+#[cfg(feature = "ktest")]
+fn space_retry(tried: usize) {
+    if tried > 0 {
+        sleep(RETRY_SPACING_NS);
+    }
+}
 /// A pause the ktests inject inside a bracket to make it wide: twice the
 /// widest trusted.
 #[cfg(feature = "ktest")]
@@ -649,7 +673,8 @@ fn hpet_between_now_ns(
 
 /// The first of up to [`HPET_BRACKET_TRIES`] readings from
 /// [`hpet_between_now_ns`] (`points` and `pause` as there) at most
-/// [`HPET_BRACKET_NS`] wide, with every reading's width. `now_ns` going
+/// [`HPET_BRACKET_NS`] wide, each after the one before by
+/// [`RETRY_SPACING_NS`], with every reading's width. `now_ns` going
 /// backwards in one fails at once, named in a diag that starts with `tag`.
 #[cfg(feature = "ktest")]
 fn narrow_hpet_reading(
@@ -658,7 +683,13 @@ fn narrow_hpet_reading(
     tag: &str,
     mut pause: impl FnMut(Pause),
 ) -> Result<HpetEnd, &'static str> {
-    lumen_time::first_narrow(HPET_BRACKET_NS, || hpet_between_now_ns(hpet, points, &mut pause)).map_err(|b| {
+    let mut tried = 0;
+    let take = || {
+        space_retry(tried);
+        tried += 1;
+        hpet_between_now_ns(hpet, points, &mut pause)
+    };
+    lumen_time::first_narrow(HPET_BRACKET_NS, take).map_err(|b| {
         crate::ktest::diag(format_args!("{tag}{BACKWARDS_IN_BRACKET}: from {} ns to {} ns", b.before, b.after));
         BACKWARDS_IN_BRACKET
     })
@@ -682,7 +713,8 @@ fn now_ns_between(earlier: &HpetReading, later: &HpetReading, tag: &str) -> Resu
 /// injected-pause tests spin less): each end a narrow HPET reading placed at
 /// the midpoint of the `now_ns` readings around it, so a stall between the
 /// two clocks' reads shows as a wide bracket (taken again, see
-/// [`HPET_BRACKET_TRIES`]) instead of skewing the interval. `pause` runs
+/// [`HPET_BRACKET_TRIES`] and [`RETRY_SPACING_NS`]) instead of skewing the
+/// interval. `pause` runs
 /// inside every bracket (see [`hpet_between_now_ns`]; a no-op but in tests),
 /// and `tag` starts every diag ([`INJECTED`] in the injected-pause tests).
 /// The ends' readings on a pass.
@@ -704,10 +736,12 @@ fn now_ns_against_the_hpet(
     };
     let widths = |start: &HpetEnd, end: Option<&HpetEnd>| {
         crate::ktest::diag(format_args!(
-            "{tag}bracket widths: start {:?} ns, end {:?} ns ({} taken again; at most {HPET_BRACKET_NS} ns trusted)",
+            "{tag}bracket widths: start {:?} ns, end {:?} ns ({} taken again, {} ms apart; at most {HPET_BRACKET_NS} \
+             ns trusted)",
             start.widths(),
             end.map_or(&[][..], |e| e.widths()),
             start.retries() + end.map_or(0, |e| e.retries()),
+            RETRY_SPACING_NS / 1_000_000,
         ))
     };
     let every_one_wide = |which: &str, readings: &HpetEnd, span_ticks: u64| {
@@ -1016,7 +1050,8 @@ crate::ktest!(
         // says so (its uncertainty and the reference's width each at most a
         // quarter of the pause: a loaded host stalls a 5 ms spin), so a
         // right placement is at most 1.25 ms off and a wrong one at least
-        // 3.75 ms. Other tries are taken again.
+        // 3.75 ms. Other tries are taken again, RETRY_SPACING_NS apart (a
+        // burst of stalls on a loaded host lasts tens of ms).
         use crate::kassert;
         const PAUSE_NS: u64 = 5_000_000;
         const TRIES: usize = 8;
@@ -1031,6 +1066,7 @@ crate::ktest!(
         };
         let mut widths_ns = [0u64; TRIES];
         for tried in 0..TRIES {
+            space_retry(tried);
             let paused = hpet_between_now_ns(&hpet, END_READING, |_| spin(PAUSE_NS)).map_err(|b| {
                 crate::ktest::diag(format_args!("{INJECTED}{BACKWARDS_IN_BRACKET}: {b:?}"));
                 BACKWARDS_IN_BRACKET
@@ -1044,10 +1080,11 @@ crate::ktest!(
             let by_hpet_ns = hpet.clock().ns(hpet.since(reference.value, paused.value));
             let off_ns = by_now_ns.abs_diff(by_hpet_ns);
             crate::ktest::diag(format_args!(
-                "{INJECTED}HPET placement {off_ns} ns off (at most {} ns allowed) on try {} of {TRIES}; paused \
-                 brackets {:?} ns, the reference's {} ns",
+                "{INJECTED}HPET placement {off_ns} ns off (at most {} ns allowed) on try {} of {TRIES}, {} ms apart; \
+                 paused brackets {:?} ns, the reference's {} ns",
                 PAUSE_NS / 2,
                 tried + 1,
+                RETRY_SPACING_NS / 1_000_000,
                 &widths_ns[..=tried],
                 reference.width,
             ));
@@ -1108,6 +1145,37 @@ crate::ktest!(
             kassert_eq!(result.err(), Some(EVERY_BRACKET_WIDE));
             kassert_eq!(paused, HPET_BRACKET_TRIES); // every reading at that end
         }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_burst_of_stalls_is_sampled_around() {
+        // Every reading that starts within 50 ms of the first is paused
+        // STALL_NS inside its bracket, as a burst of slow HPET reads on a
+        // loaded host would (load-5 in PR #121 saw one last 60 ms or more).
+        // Spaced RETRY_SPACING_NS apart, the first three readings fall in it
+        // and a later one after it is kept; taken back to back, every reading
+        // would fall in it.
+        use crate::kassert;
+        const BURST_NS: u64 = 50_000_000;
+        let hpet = hpet().ok_or("no HPET")?;
+        let mut first_ns = None;
+        let r = narrow_hpet_reading(&hpet, START_READING, INJECTED, |p| {
+            if p == Pause::StartAfterRead {
+                let now = now_ns();
+                if now - *first_ns.get_or_insert(now) < BURST_NS {
+                    spin(STALL_NS);
+                }
+            }
+        })?;
+        let widths_ns = r.widths();
+        crate::ktest::diag(format_args!(
+            "{INJECTED}a {BURST_NS} ns burst: bracket widths {widths_ns:?} ns, {} ms apart",
+            RETRY_SPACING_NS / 1_000_000
+        ));
+        kassert!(r.reading().is_some_and(|b| b.width <= HPET_BRACKET_NS));
+        kassert!(r.retries() >= 2 && widths_ns[..2].iter().all(|&w| w >= STALL_NS));
         Ok(())
     }
 );
@@ -1273,8 +1341,8 @@ crate::ktest!(
         // same way it can't make up the difference). The two readings, with
         // that uncertainty, must also be under TIMER_WINDOW_MAX_NS apart: the
         // timer reloads every 1 ms, and its count says nothing about how many
-        // reloads passed. Other tries are taken again, each with its reason
-        // in the diag.
+        // reloads passed. Other tries are taken again, RETRY_SPACING_NS apart,
+        // each with its reason in the diag.
         use crate::kassert;
         const PAUSE_NS: u64 = 400_000;
         const TRIES: usize = 8;
@@ -1286,6 +1354,7 @@ crate::ktest!(
         // HPET ns between the midpoints).
         let mut tried = [("", 0u64, 0u64, 0u64); TRIES];
         for n in 0..TRIES {
+            space_retry(n);
             let _off = arch::irq::push_off();
             let reference = timer_between_hpet(&hpet, || {});
             let paused = timer_between_hpet(&hpet, || spin(PAUSE_NS));
@@ -1308,11 +1377,12 @@ crate::ktest!(
             let by_timer_ns = timer.ns(u64::from(counted));
             let off_ns = by_hpet_ns.abs_diff(by_timer_ns);
             crate::ktest::diag(format_args!(
-                "{INJECTED}timer placement {off_ns} ns off (at most {} ns allowed) on try {} of {TRIES}; \
+                "{INJECTED}timer placement {off_ns} ns off (at most {} ns allowed) on try {} of {TRIES}, {} ms apart; \
                  {by_hpet_ns} ns by the HPET, {by_timer_ns} ns by the timer; tries (taken again because, \
                  reference, paused, by the HPET, in ns) {:?}",
                 PAUSE_NS / 2,
                 n + 1,
+                RETRY_SPACING_NS / 1_000_000,
                 &tried[..=n],
             ));
             kassert!(off_ns * 2 <= PAUSE_NS);
