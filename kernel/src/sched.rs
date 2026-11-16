@@ -358,6 +358,8 @@ impl Cpu {
         let mut i = 0;
         while i < self.sleepers.len() {
             if self.sleepers[i].at <= now {
+                #[cfg(feature = "ktest")]
+                count_fired(cpu, &self.sleepers[i]);
                 let Sleeper { thread, on_queue, .. } = self.sleepers.swap_remove(i);
                 if !on_queue {
                     thread.change(State::Sleeping, State::Ready);
@@ -425,10 +427,41 @@ static THREADS: SpinLock<Vec<Weak<Thread>>> = SpinLock::new(Vec::new());
 static TICKED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static IDLE_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
-/// Ktests: the `now_ns` each CPU's last tick read (where a deadline falls
-/// between ticks).
+/// Ktests: the `now_ns` each CPU's last tick read, and the one before it
+/// (0 until that CPU's scheduler runs: [`tick`] stores them only then). Each
+/// is written only by its own CPU's tick and read on that CPU (a thread
+/// pinned there, or that tick's [`Cpu::wake_sleepers`]), so `Relaxed` is
+/// enough. Where a round starts between ticks, in
+/// `a_wait_with_a_deadline_ends_at_it_or_when_woken`, and whether a queue
+/// deadline fired at the first tick after it ([`DEADLINES_FIRED`]).
 #[cfg(feature = "ktest")]
 static LAST_TICK_NS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+#[cfg(feature = "ktest")]
+static PREV_TICK_NS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// Ktests: per CPU, how many queue-wait deadline entries ([`Sleeper`]s
+/// `on_queue`) a tick found passed, and how many of those the tick before it
+/// had found passed already (a tick late). A deadline must fire at the first
+/// tick after it, so the second count is always 0: such an entry is pushed
+/// (in `WaitQueue::block`, interrupts off since before it checked that its
+/// deadline hadn't passed) after any tick that read a time at or past it,
+/// so the tick before the one that fires it read a time before it. Same
+/// writer and readers as [`LAST_TICK_NS`].
+#[cfg(feature = "ktest")]
+static DEADLINES_FIRED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+#[cfg(feature = "ktest")]
+static DEADLINES_LATE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Ktests: count `s`, which this CPU's tick found passed, in
+/// [`DEADLINES_FIRED`] (and [`DEADLINES_LATE`]) if it is a queue wait's.
+#[cfg(feature = "ktest")]
+fn count_fired(cpu: usize, s: &Sleeper) {
+    if s.on_queue {
+        DEADLINES_FIRED[cpu].fetch_add(1, Ordering::Relaxed);
+        if PREV_TICK_NS[cpu].load(Ordering::Relaxed) >= s.at {
+            DEADLINES_LATE[cpu].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 /// Add `t` to [`THREADS`], dropping the entries of threads gone since.
 /// Not under any other lock (it allocates).
@@ -823,7 +856,10 @@ pub fn tick() {
     assert_eq!(arch::irq::depth(), 0, "a timer interrupt inside a critical section");
     let now = time::now_ns();
     #[cfg(feature = "ktest")]
-    LAST_TICK_NS[cpu].store(now, Ordering::Relaxed);
+    {
+        PREV_TICK_NS[cpu].store(LAST_TICK_NS[cpu].load(Ordering::Relaxed), Ordering::Relaxed);
+        LAST_TICK_NS[cpu].store(now, Ordering::Relaxed);
+    }
     let switch = {
         let mut q = CPUS[cpu].lock();
         // Counted before waking anyone: the thread this tick interrupted.
@@ -1788,8 +1824,10 @@ crate::ktest!(
         // Nobody wakes it: false, no earlier than the deadline, and neither
         // entry is left behind. A waker on another CPU wakes it long before
         // its deadline: true. Then 200 waits a waker races with the
-        // deadline (a wake about when it passes): never a panic, a lost
-        // thread or an entry left behind, each side winning sometimes.
+        // deadline, waking it before and after the tick that notices the
+        // deadline: never a panic, a lost thread, an early return or an
+        // entry left behind, each side winning sometimes, and every queue
+        // deadline noticed at the first tick after it.
         use crate::{kassert, kassert_eq};
         let me = current().ok_or("the ktests run on a thread")?;
         let q = WaitQueue::new();
@@ -1817,73 +1855,105 @@ crate::ktest!(
         // The race, on two other CPUs (so the switches don't fill this
         // CPU's trace ring, which holds the boot's events): each round the
         // racer marks the round and wakes the queue 0, 0.4, 0.8, 1.2 or 1.6
-        // ms after it starts, around the waiter's 1 ms deadline, so each
-        // side wins sometimes (the wait returns true if the racer's mark
-        // came first). Then the waiter blocks again at once on another
-        // queue: a stale wake (the racer may still hold an entry from the
-        // wait before) may wake it, but it waits on until its deadline.
+        // ms after it starts, and the waiter's deadline is 1 ms after the
+        // start (the wait returns true if the racer's mark came first).
+        // Then the waiter blocks again at once on another queue: a stale
+        // wake (the racer may still hold an entry from the wait before) may
+        // wake it, but it waits on until its deadline.
         //
         // A deadline is noticed at the first tick after it, so where between
-        // two ticks a round starts decides when its deadline fires. That
-        // second wait ends at a tick, so rounds started right after it all
-        // put their deadline at one point, a few µs past the next tick:
-        // noticed then if that tick runs a few µs late, else a whole tick
-        // later, after every racer delay (#122: on idle KVM runners, 0 to 2
-        // of a boot's 80 rounds with a 1.2 or 1.6 ms delay timed out in some
-        // boots). So the rounds start 0, 0.2, 0.4, 0.6 or 0.8 ms after the
-        // waiter's last tick, each such phase paired with each racer delay 8
-        // times: however the ticks run (on time under KVM, late under a
-        // loaded TCG), some pairs put the tick that notices the deadline well
-        // before the racer's wake, and others well after it.
-        let phase = |n: u64| n / 5 % 5 * 200_000;
+        // two ticks a round starts decides when its deadline fires, and so
+        // which racer delays it beats. That second wait ends at a tick, so
+        // rounds started right after it would all put their deadline at one
+        // point, a few µs past the next tick: noticed then if that tick runs
+        // a few µs late, else a whole tick later, after every racer delay
+        // (#122). So the rounds start 0, 0.2, 0.4, 0.6 or 0.8 ms after the
+        // waiter's last tick, each such phase paired with each racer delay
+        // equally often: whatever the tick period (on time under KVM, late
+        // under a loaded TCG), some pairs put the tick that notices the
+        // deadline well before the racer's wake, and others well after it.
+        const ROUNDS: u64 = 200;
+        const DEADLINE_NS: u64 = 1_000_000;
+        // The phases step a fifth of a tick, and the delays and the deadline
+        // are set against it: a 1 ms tick.
+        const _: () = assert!(time::TICK_HZ == 1000);
+        const PHASE_STEP_NS: u64 = 200_000;
+        const DELAY_STEP_NS: u64 = 400_000;
+        // Every (phase, delay) pair the same number of times.
+        const _: () = assert!(ROUNDS.is_multiple_of(25));
+        const PER_PAIR: u64 = ROUNDS / 25;
+        /// Round `n`'s phase and racer delay, as indices 0 to 4 (the grid's
+        /// row and column): each pair once in every 25 rounds.
+        fn pair(n: u64) -> (usize, usize) {
+            ((n / 5 % 5) as usize, (n % 5) as usize)
+        }
+        let phase = |n: u64| pair(n).0 as u64 * PHASE_STEP_NS;
+        let delay = |n: u64| pair(n).1 as u64 * DELAY_STEP_NS;
         let cpus = running_cpus();
         let (waiter_cpu, racer_cpu) = match cpus.as_slice() {
             [.., a, b] => (*b, *a),
             _ => return Err("the race needs two CPUs"),
         };
-        use core::sync::atomic::AtomicU64;
+        /// What the racer did in one round: its `now_ns` when it saw the
+        /// round and when it marked it (0: never), and how many threads its
+        /// `wake_all` moved out of `Blocked`.
+        #[derive(Default)]
+        struct Mark {
+            seen: AtomicU64,
+            marked: AtomicU64,
+            woken: AtomicU64,
+        }
         struct Race {
             queue: WaitQueue,
             other: WaitQueue,
             round: AtomicU64,
             marked: AtomicU64,
             done: AtomicBool,
-            woke: AtomicU64,
-            timed_out: AtomicU64,
             broken: AtomicBool,
-            // For the diags, per round (index = round): the racer's
-            // `now_ns` when it saw the round and when it marked it.
-            seen_at: Vec<AtomicU64>,
-            marked_at: Vec<AtomicU64>,
+            /// The waiter CPU's last tick as the waiter began (0: that CPU's
+            /// scheduler never ticked, so every phase would be 0).
+            first_tick: AtomicU64,
+            /// The waiter CPU's queue deadlines fired, and fired a tick late
+            /// ([`DEADLINES_FIRED`], [`DEADLINES_LATE`]), during the race,
+            /// as the waiter counted them on that CPU.
+            fired: AtomicU64,
+            late: AtomicU64,
+            /// For the diags: what the racer did each round (index = round;
+            /// 0 unused), and each round as the waiter saw it, recorded as
+            /// it ends (in room reserved up front: no allocation mid-race).
+            marks: Vec<Mark>,
             rounds: SpinLock<Vec<Round>>,
         }
-        /// One round, as the waiter saw it (`now_ns` values).
+        /// One round as the waiter saw it (`now_ns` values).
         #[derive(Clone, Copy)]
         struct Round {
-            start: u64,
-            /// The waiter CPU's last tick before `start`, and when the wait
-            /// returned (`ticks` ticks later).
+            n: u64,
+            /// The waiter CPU's last tick as its spin to the round's phase
+            /// ended, and as it read `start`: a tick came between the two
+            /// if they differ (the round lost its phase).
+            phase_tick: u64,
             tick_before: u64,
+            start: u64,
+            /// When the wait returned, and the waiter CPU's last tick then,
+            /// `ticks` ticks after `tick_before`.
+            returned: u64,
             tick_after: u64,
             ticks: u64,
-            returned: u64,
             woke: bool,
         }
-        const ROUNDS: u64 = 200;
         let race = Arc::new(Race {
             queue: WaitQueue::new(),
             other: WaitQueue::new(),
             round: AtomicU64::new(0),
             marked: AtomicU64::new(0),
             done: AtomicBool::new(false),
-            woke: AtomicU64::new(0),
-            timed_out: AtomicU64::new(0),
             broken: AtomicBool::new(false),
-            seen_at: (0..=ROUNDS).map(|_| AtomicU64::new(0)).collect(),
-            marked_at: (0..=ROUNDS).map(|_| AtomicU64::new(0)).collect(),
-            rounds: SpinLock::new(Vec::new()),
+            first_tick: AtomicU64::new(0),
+            fired: AtomicU64::new(0),
+            late: AtomicU64::new(0),
+            marks: (0..=ROUNDS).map(|_| Mark::default()).collect(),
+            rounds: SpinLock::new(Vec::with_capacity(ROUNDS as usize)),
         });
-        let delay = |n: u64| n % 5 * 400_000;
         let r = race.clone();
         let racer = spawn_test(racer_cpu, "racer", move || {
             let mut seen = 0;
@@ -1901,10 +1971,11 @@ crate::ktest!(
                     now = time::now_ns();
                 }
                 r.marked.store(n, Ordering::Release);
-                r.queue.wake_all();
-                if let (Some(s), Some(m)) = (r.seen_at.get(n as usize), r.marked_at.get(n as usize)) {
-                    s.store(seen_at, Ordering::Relaxed);
-                    m.store(now, Ordering::Relaxed);
+                let woken = r.queue.wake_all();
+                if let Some(m) = r.marks.get(n as usize) {
+                    m.seen.store(seen_at, Ordering::Relaxed);
+                    m.marked.store(now, Ordering::Relaxed);
+                    m.woken.store(woken as u64, Ordering::Relaxed);
                 }
             }
         })?;
@@ -1915,101 +1986,169 @@ crate::ktest!(
                 return;
             };
             let last_tick = || LAST_TICK_NS[waiter_cpu].load(Ordering::Relaxed);
-            // Reserved, so recording a round doesn't allocate mid-race.
-            let mut rounds = Vec::with_capacity(ROUNDS as usize);
+            let ticks = || TICKED[waiter_cpu].load(Ordering::Relaxed);
+            let deadlines = || {
+                (
+                    DEADLINES_FIRED[waiter_cpu].load(Ordering::Relaxed),
+                    DEADLINES_LATE[waiter_cpu].load(Ordering::Relaxed),
+                )
+            };
+            r.first_tick.store(last_tick(), Ordering::Relaxed);
+            let (fired_before, late_before) = deadlines();
             for n in 1..=ROUNDS {
-                // `now_ns` first: a tick between the two reads makes the
-                // difference negative (0 here), so the spin goes on.
-                while time::now_ns().saturating_sub(last_tick()) < phase(n) {
+                // Spin until `phase(n)` past the last tick. The tick is read
+                // on both sides of `now_ns`, and both are read again if a
+                // tick came between.
+                let phase_tick = loop {
+                    let (before, now, after) = (last_tick(), time::now_ns(), last_tick());
+                    if before == after && now >= after + phase(n) {
+                        break after;
+                    }
                     core::hint::spin_loop();
-                }
+                };
                 r.round.store(n, Ordering::Release);
                 let start = time::now_ns();
-                let (tick_before, ticks_before) = (last_tick(), arch::idt::ticks_on(waiter_cpu));
-                let woke = r.queue.wait_until_or_deadline(start + 1_000_000, || r.marked.load(Ordering::Acquire) == n);
+                let (tick_before, ticks_before) = (last_tick(), ticks());
+                let woke =
+                    r.queue.wait_until_or_deadline(start + DEADLINE_NS, || r.marked.load(Ordering::Acquire) == n);
                 let returned = time::now_ns();
-                rounds.push(Round {
-                    start,
+                r.rounds.lock().push(Round {
+                    n,
+                    phase_tick,
                     tick_before,
-                    tick_after: last_tick(),
-                    ticks: arch::idt::ticks_on(waiter_cpu) - ticks_before,
+                    start,
                     returned,
+                    tick_after: last_tick(),
+                    ticks: ticks() - ticks_before,
                     woke,
                 });
-                if woke {
-                    r.woke.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    r.timed_out.fetch_add(1, Ordering::Relaxed);
-                }
+                // A timed-out wait returns at its deadline at the earliest.
+                let early_timeout = !woke && returned < start + DEADLINE_NS;
                 let d2 = time::now_ns() + 100_000;
                 let early = r.other.wait_until_or_deadline(d2, || false) || time::now_ns() < d2;
                 let left = entries_of(&me, &r.queue) != (false, false) || entries_of(&me, &r.other) != (false, false);
-                if early || left {
+                if early_timeout || early || left {
                     r.broken.store(true, Ordering::Release);
                 }
             }
-            *r.rounds.lock() = rounds;
+            let (fired_after, late_after) = deadlines();
+            r.fired.store(fired_after - fired_before, Ordering::Relaxed);
+            r.late.store(late_after - late_before, Ordering::Relaxed);
         })?;
-        join_bounded(waiter)?;
+        if let Err(e) = join_bounded(waiter) {
+            race.done.store(true, Ordering::Release);
+            drop(racer); // it stops on its own now
+            let rounds = race.rounds.lock();
+            let woke = rounds.iter().filter(|x| x.woke).count();
+            crate::ktest::diag(format_args!(
+                "the waiter didn't finish: in round {} after {} rounds ({woke} woken first, {} timed out), \
+                 the racer's last mark round {}",
+                race.round.load(Ordering::Acquire),
+                rounds.len(),
+                rounds.len() - woke,
+                race.marked.load(Ordering::Acquire)
+            ));
+            return Err(e);
+        }
         race.done.store(true, Ordering::Release);
         join_bounded(racer)?;
-        let (woke, timed_out) = (race.woke.load(Ordering::Relaxed), race.timed_out.load(Ordering::Relaxed));
-        let broken = race.broken.load(Ordering::Acquire);
         let rounds = core::mem::take(&mut *race.rounds.lock());
-        // Timed out, of 8, by phase (rows) and racer delay (columns).
-        let mut grid = [[0u8; 5]; 5];
-        for (n, x) in (1u64..).zip(&rounds) {
-            if !x.woke {
-                grid[(n / 5 % 5) as usize][(n % 5) as usize] += 1;
-            }
+        let broken = race.broken.load(Ordering::Acquire);
+        let first_tick = race.first_tick.load(Ordering::Relaxed);
+        let (fired, late_deadlines) = (race.fired.load(Ordering::Relaxed), race.late.load(Ordering::Relaxed));
+        let woke = rounds.iter().filter(|x| x.woke).count();
+        let timed_out = rounds.len() - woke;
+        let mut grid = [[0u64; 5]; 5];
+        for x in rounds.iter().filter(|x| !x.woke) {
+            let (p, d) = pair(x.n);
+            grid[p][d] += 1;
         }
+        let steps_us = |step: u64| {
+            let v: Vec<_> = (0..5u64).map(|i| alloc::format!("{}", i * step / 1000)).collect();
+            alloc::format!("{} µs", v.join(", "))
+        };
         crate::ktest::diag(format_args!(
-            "of {ROUNDS} racing waits, {woke} were woken first, {timed_out} timed out; timed out of 8 by \
-             phase 0, 0.2, 0.4, 0.6, 0.8 ms (rows) and racer delay 0, 0.4, 0.8, 1.2, 1.6 ms (columns): {grid:?}"
+            "of {ROUNDS} racing waits, {woke} were woken first, {timed_out} timed out; timed out of {PER_PAIR} by \
+             phase {} (rows) and racer delay {} (columns): {grid:?}",
+            steps_us(PHASE_STEP_NS),
+            steps_us(DELAY_STEP_NS)
         ));
         // min / median / max, in µs.
-        let spread = |mut v: Vec<u64>| match (v.iter().min().copied(), v.iter().max().copied()) {
-            (Some(lo), Some(hi)) => {
-                let mid = lumen_time::median(&mut v).unwrap_or(0);
-                alloc::format!("{} / {} / {} µs", lo / 1000, mid / 1000, hi / 1000)
+        let spread_us = |mut v: Vec<i64>| {
+            v.sort_unstable();
+            match v.len() {
+                0 => alloc::string::String::from("none"),
+                len => {
+                    let mid = if len % 2 == 1 { v[len / 2] } else { (v[len / 2 - 1] + v[len / 2]) / 2 };
+                    alloc::format!("{} / {} / {} µs", v[0] / 1000, mid / 1000, v[len - 1] / 1000)
+                }
             }
-            _ => alloc::string::String::from("none"),
         };
-        let past_phase = (1..).zip(&rounds).map(|(n, x)| x.start.saturating_sub(x.tick_before + phase(n))).collect();
-        let late = rounds.iter().filter(|x| !x.woke).map(|x| x.returned.saturating_sub(x.start + 1_000_000)).collect();
-        let marked = (1..)
-            .zip(&rounds)
-            .map(|(n, x)| race.marked_at[n as usize].load(Ordering::Relaxed).saturating_sub(x.start + delay(n)))
+        let since = |t: u64, from: u64| t as i64 - from as i64;
+        let mark = |x: &Round| race.marks.get(x.n as usize);
+        let lost = rounds.iter().filter(|x| x.tick_before != x.phase_tick).count();
+        let past_phase = rounds.iter().map(|x| since(x.start, x.phase_tick + phase(x.n))).collect();
+        let late = rounds.iter().filter(|x| !x.woke).map(|x| since(x.returned, x.start + DEADLINE_NS)).collect();
+        // The rounds the racer saw (it skips one the waiter is done with
+        // before it looks).
+        let seen: Vec<_> = rounds
+            .iter()
+            .filter_map(|x| {
+                let m = mark(x)?;
+                let (s, k) = (m.seen.load(Ordering::Relaxed), m.marked.load(Ordering::Relaxed));
+                (s != 0).then(|| (since(s, x.start), since(k, s + delay(x.n))))
+            })
             .collect();
+        let missed = rounds.len() - seen.len();
+        let waker_won =
+            rounds.iter().filter(|x| x.woke && mark(x).is_some_and(|m| m.woken.load(Ordering::Relaxed) > 0)).count();
         crate::ktest::diag(format_args!(
-            "rounds started {} past their phase; timed-out waits returned {} after their deadline; \
-             the racer marked {} after its delay (min / median / max)",
-            spread(past_phase),
-            spread(late),
-            spread(marked)
+            "rounds started {} past their phase ({lost} lost it: a tick came first); timed-out waits returned {} \
+             after their deadline; the racer saw rounds {} after they started and marked them {} after its delay \
+             ({missed} rounds it never saw); its wake moved the waiter out of Blocked in {waker_won} of the \
+             {woke} rounds woken first (min / median / max)",
+            spread_us(past_phase),
+            spread_us(late),
+            spread_us(seen.iter().map(|s| s.0).collect()),
+            spread_us(seen.iter().map(|s| s.1).collect()),
+        ));
+        crate::ktest::diag(format_args!(
+            "queue deadlines fired on the waiter's cpu {waiter_cpu} during the race: {fired}, \
+             {late_deadlines} of them a tick late (first tick at {first_tick} ns)"
         ));
         // Every round, if the race went wrong: which side was off (all
         // times from the round's start, its deadline at +1000 µs).
-        if broken || woke == 0 || timed_out == 0 {
-            let us = |t: u64, start: u64| (t as i64 - start as i64) / 1000;
-            for (n, x) in (1..).zip(&rounds) {
+        let race_ok = first_tick != 0 && !broken && woke > 0 && timed_out > 0 && fired > 0 && late_deadlines == 0;
+        if !race_ok {
+            let at = |t: u64, x: &Round| match t {
+                0 => alloc::string::String::from("never"),
+                t => alloc::format!("{} µs", since(t, x.start) / 1000),
+            };
+            for x in &rounds {
+                let (s, k) =
+                    mark(x).map_or((0, 0), |m| (m.seen.load(Ordering::Relaxed), m.marked.load(Ordering::Relaxed)));
                 crate::ktest::diag(format_args!(
-                    "round {n}: phase {} µs, delay {} µs, {}; ticks at {} and {} µs ({} apart); returned at {} µs; \
-                     the racer saw it at {} µs, marked it at {} µs",
-                    phase(n) / 1000,
-                    delay(n) / 1000,
+                    "round {}: phase {} µs{}, delay {} µs, {}; ticks at {} and {} ({} ticks apart); returned at {}; \
+                     the racer saw it at {}, marked it at {}",
+                    x.n,
+                    phase(x.n) / 1000,
+                    if x.tick_before != x.phase_tick { " (lost)" } else { "" },
+                    delay(x.n) / 1000,
                     if x.woke { "woken first" } else { "timed out" },
-                    us(x.tick_before, x.start),
-                    us(x.tick_after, x.start),
+                    at(x.tick_before, x),
+                    at(x.tick_after, x),
                     x.ticks,
-                    us(x.returned, x.start),
-                    us(race.seen_at[n as usize].load(Ordering::Relaxed), x.start),
-                    us(race.marked_at[n as usize].load(Ordering::Relaxed), x.start),
+                    at(x.returned, x),
+                    at(s, x),
+                    at(k, x),
                 ));
             }
         }
+        // The sweep ran: the waiter's CPU had ticked, so the phases were real.
+        kassert!(first_tick != 0);
         kassert!(!broken);
         kassert!(woke > 0 && timed_out > 0);
+        kassert!(fired > 0 && late_deadlines == 0);
         Ok(())
     }
 );
