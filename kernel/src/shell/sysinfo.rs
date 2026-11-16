@@ -399,7 +399,10 @@ fn pci_table() -> pipe::Table {
 }
 
 /// `mouse`: the tablet (#98), where it points and what is held: a header
-/// naming the device (or saying there is none) and its row.
+/// naming the device (or saying there is none) and its row. `mouse hold`
+/// stops its thread reading it until `mouse release` (`mouse::hold`: the
+/// hold is every console's; releasing a tablet that isn't held just says
+/// `released`).
 pub fn mouse(ctx: &mut Ctx<'_>, args: &[String]) {
     match args {
         [] => {}
@@ -425,13 +428,18 @@ pub fn mouse(ctx: &mut Ctx<'_>, args: &[String]) {
 
 /// `mouse`'s header line: the device, the screen and the counts (whole
 /// frames are the state's `seq`; overruns the batches that may have lost
-/// frames), whether its reads are held (`mouse hold`) and why it failed; or
+/// frames), whether its reads are held (`mouse hold`: `, held`, or
+/// `, holding` until the thread parks) and why it failed; or
 /// that there is no tablet.
 fn mouse_header(bound: Option<&crate::mouse::Bound>) -> String {
     let Some(b) = bound else { return String::from("mouse: no tablet (QEMU: -device virtio-tablet-pci)") };
     let (d, c) = (&b.device, &b.counts);
     let frames = b.state.map_or(0, |s| s.seq);
-    let held = if crate::mouse::held() { ", held" } else { "" };
+    let held = match crate::mouse::reads() {
+        crate::mouse::Reads::Running => "",
+        crate::mouse::Reads::HoldAsked => ", holding",
+        crate::mouse::Reads::Held => ", held",
+    };
     let failed = b.failed.map_or(String::new(), |why| alloc::format!(", failed: {why}"));
     alloc::format!(
         "mouse: \"{}\" on {}, screen {}x{}, {} events in {frames} frames ({} ignored, {} dropped, {} \

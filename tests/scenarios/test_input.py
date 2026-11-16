@@ -203,7 +203,7 @@ TABLET_LINE = re.compile(
 )
 MOUSE_HEADER = re.compile(
     r'mouse: "QEMU Virtio Tablet" on (\S+), screen 1280x800, (\d+) events in (\d+) frames '
-    r"\((\d+) ignored, (\d+) dropped, (\d+) overruns\)(?:, held)?"
+    r"\((\d+) ignored, (\d+) dropped, (\d+) overruns\)"
 )
 # The terminal's top-left pixel and its cells' size (1280x800, limine.conf).
 GRID_X, GRID_Y, CELL_W, CELL_H = 32, 144, 7, 16
@@ -226,10 +226,16 @@ NOTHING_YET = ("-",) * 9
 
 
 # Said once, by the batch that counted the first overrun (kernel/src/mouse.rs).
-OVERRUN_WARN = (
-    r"WARN  mouse: \S+: \d+ events in one batch: the event ring was nearly full, so frames may "
-    r"have been lost \(said once; `mouse` counts such batches\)"
-)
+def overrun_warn(events: str = r"\d+", after_hold: str = r"(?: after `mouse hold`)?") -> str:
+    """The overrun warning's line: `events` in the batch, and whether it
+    came after `mouse hold` (either, unless given)."""
+    return (
+        rf"WARN  mouse: \S+: {events} events in one batch{after_hold}: the event ring was nearly "
+        r"full, so frames may have been lost \(said once; `mouse` counts such batches\)"
+    )
+
+
+OVERRUN_WARN = overrun_warn()
 
 
 def mouse(m: Machine, allow: str | None = None) -> tuple[str, Mouse]:
@@ -244,10 +250,13 @@ def mouse(m: Machine, allow: str | None = None) -> tuple[str, Mouse]:
     return lines[0], Mouse(*re.split(r"\s{2,}", lines[2].strip()))
 
 
-def mouse_counts(m: Machine, allow: str | None = None) -> tuple[int, ...]:
-    """`mouse`'s header counts: events, frames, ignored, dropped, overruns."""
+def mouse_counts(m: Machine, allow: str | None = None, held: bool = False) -> tuple[int, ...]:
+    """`mouse`'s header counts: events, frames, ignored, dropped, overruns
+    (the header ending `, held` if `held`, and only then)."""
     header = mouse(m, allow)[0]
-    found = MOUSE_HEADER.fullmatch(header)
+    suffix = ", held" if held else ""
+    assert header.endswith(f"overruns){suffix}"), header
+    found = MOUSE_HEADER.fullmatch(header.removesuffix(suffix))
     assert found, header
     return tuple(map(int, found.groups()[1:]))
 
@@ -439,31 +448,31 @@ def burst_frame(i: int, frame: int, size: tuple[int, int]) -> dict:
     return args
 
 
-def overflow_held(m: Machine, qmp: QmpClient, frame: int, size: tuple[int, int]) -> tuple[int, ...]:
+def overflow_held(
+    m: Machine, qmp: QmpClient, frame: int, size: tuple[int, int], warn: bool
+) -> None:
     """Hold the mouse thread, send `frame`-event frames until PAST_THE_RING
     past the ring's room (each of those dropped, traced at its send),
-    release it; `mouse`'s counts once settled."""
+    release it, and wait for `mouse` to show exactly the frames that fit
+    read in one batch and one more overrun. `warn`: the overrun warning
+    (pinned to that batch) may come with the release and the counts after
+    it; otherwise no warning may come at all."""
     assert run(m, "mouse hold") == "mouse: held: reading nothing until `mouse release`\n"
-    before = mouse(m, OVERRUN_WARN)[0]
-    assert before.endswith(", held"), before
+    events, frames, ignored, dropped, overruns = mouse_counts(m, held=True)
     fit = RING // frame
     log = len(m.trace_log())
-    for sent in range(fit + PAST_THE_RING):
-        qmp.send_input(burst_frame(sent, frame, size))
-        dropped = m.trace_log(log).count("virtio_input_queue_full")
+    for i in range(fit + PAST_THE_RING):
+        qmp.send_input(burst_frame(i, frame, size))
+        dropped_now = m.trace_log(log).count("virtio_input_queue_full")
         # Synchronous: the drop of a frame is logged before QMP answers.
-        assert dropped == max(0, sent + 1 - fit), (sent, dropped)
+        assert dropped_now == max(0, i + 1 - fit), (i, dropped_now)
     # Held: nothing was read meanwhile.
-    assert mouse(m, OVERRUN_WARN)[0] == before
-    assert run(m, "mouse release", allow=OVERRUN_WARN) == "mouse: released\n"
-    # Settled: the same counts twice, a little apart.
-    last: list[tuple[int, ...]] = [()]
-
-    def settled(counts: tuple[int, ...]) -> bool:
-        same, last[0] = counts == last[0], counts
-        return same
-
-    return poll(lambda: mouse_counts(m, OVERRUN_WARN), settled, m, 30)
+    assert mouse_counts(m, held=True) == (events, frames, ignored, dropped, overruns)
+    allow = overrun_warn(str(frame * fit), " after `mouse hold`") if warn else None
+    assert run(m, "mouse release", allow=allow) == "mouse: released\n"
+    want = (events + frame * fit, frames + fit, ignored, dropped, overruns + 1)
+    got = poll(lambda: mouse_counts(m, allow), lambda c: c == want, m, 30)
+    assert got == want, (got, want)
 
 
 @pytest.mark.parametrize("frame", [3, 7], ids=["moves", "buttons"])
@@ -477,28 +486,25 @@ def test_a_burst_of_moves_counts_overruns(boot, frame):
     # QMP answers) without telling the guest. Released, the thread reads the
     # full ring in one batch: exactly the frames that fit, every event used
     # (none ignored or SYN_DROPPED), one overrun counted (see
-    # lumen_input::may_have_lost_frames), the state stale (the warning may
-    # come with a `mouse`). A paced move afterwards is a clean frame: the
-    # state isn't stale. A second overrun is counted too, but the warning
-    # was said once.
+    # lumen_input::may_have_lost_frames), the state stale, the warning
+    # naming that batch's events and the hold. A paced move afterwards is a
+    # clean frame: the state isn't stale. A second held overflow is counted
+    # too, but not warned about (once per boot).
     m = boot("qemutest", devices=Devices(tablet=True), trace_events=["virtio_input_queue_full"])
     tablet_ready(m)
     size = m.screen_size()
     qmp = m.qmp()
     fit = RING // frame
-    assert overflow_held(m, qmp, frame, size) == (frame * fit, fit, 0, 0, 1)
-    assert m.trace_log().count("virtio_input_queue_full") == PAST_THE_RING
-    assert mouse(m, OVERRUN_WARN)[1].stale == "yes"
+    overflow_held(m, qmp, frame, size, warn=True)
+    warned = overrun_warn(str(frame * fit), " after `mouse hold`")
+    assert len(re.findall(warned, m.output)) == 1
+    assert mouse(m)[1].stale == "yes"
     m.move_pointer(640, 400)
-    assert wait_mouse(m, OVERRUN_WARN, x="640", y="400").stale == "no"
-    # The warning is logged before its batch's counts are published, so it
-    # is on serial by now.
+    assert wait_mouse(m, x="640", y="400").stale == "no"
+    overflow_held(m, qmp, frame, size, warn=False)
     assert len(re.findall(OVERRUN_WARN, m.output)) == 1
-    events, frames = mouse_counts(m)[:2]
-    again = overflow_held(m, qmp, frame, size)
-    assert again == (events + frame * fit, frames + fit, 0, 0, 2), again
+    # No frame was dropped outside the held windows (the paced move fit).
     assert m.trace_log().count("virtio_input_queue_full") == 2 * PAST_THE_RING
-    assert len(re.findall(OVERRUN_WARN, m.output)) == 1
 
 
 def test_mouse_hold_needs_a_tablet_and_takes_one_word(boot):
