@@ -1451,9 +1451,10 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
     it failed; `no tablet` and a row of dashes without one. `mouse hold`
     stops the `mouse` thread reading the tablet until `mouse release`: it
     returns once the thread has parked (the header ends `, held`, or
-    `, holding` until then), and fails with no tablet, a failed one, a
-    release from elsewhere first, or no park within `HOLD_WAIT_NS` (1 s, a
-    bug, logged). Events wait in the device's ring and frames that don't
+    `, holding` until then), and fails with no tablet, a failed one (also
+    one failing while it waits), the request taken back first (a release,
+    or another console's hold timing out), or no park within
+    `HOLD_WAIT_NS` (1 s, a bug, logged). Events wait in the device's ring and frames that don't
     fit are dropped, an overrun made on purpose (#142). The hold is every
     console's (`mouse hold | ...` holds too), and both are logged at INFO.
   - `dmesg`: the newest whole log lines as serial printed them: the logger

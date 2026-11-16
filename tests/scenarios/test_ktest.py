@@ -126,6 +126,12 @@ def test_in_kernel_tests_pass(boot):
         r"INFO  shell: serial prompt released after \d+ ms: every screen shell waits for keys\n",
         out,
     ), "the serial prompt's release"
+    # The only mouse error is the hold no thread answers, made on purpose by
+    # mouse::a_hold_that_no_thread_answers_is_taken_back (logged as a bug).
+    mouse_errors = re.findall(r"ERROR mouse: (.*)\n", out)
+    assert mouse_errors == [
+        "0000:ff:1e.7: the mouse thread didn't stop reading within 1000 ms (a bug): not held"
+    ], mouse_errors
     # The only virtio errors are the refused frees the DMA ktests make on
     # purpose, each saying why.
     errors = re.findall(r"ERROR virtio: (.*)\n", out)

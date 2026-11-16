@@ -176,7 +176,7 @@ own PR that updates that doc first.
   `virtio-drivers` (the `Hal`: DMA runs from the frame allocator, bounce
   buffers, probe attempts; `transport`, `VirtioTransport` and its MSI-X
   vectors, the device status handle, the `Doorbell` a driver's interrupt
-  rings). `rng.rs`: randomness: `rng::fill`, `u64`, `below`,
+  rings, or the driver itself to wake its thread: `mouse::hold`). `rng.rs`: randomness: `rng::fill`, `u64`, `below`,
   `sources`, `stats` (the shell's `random`, rhai's `random()`), RDRAND and
   the virtio-rng driver (its own queue, one deadline per request, dropped
   on a failed request) feeding a ChaCha20 pool. `power.rs`: `reboot` and `shutdown` (ACPI S5);

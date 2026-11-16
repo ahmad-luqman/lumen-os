@@ -46,7 +46,7 @@
 //! - **Failure.** A device that stops being ready (`FAILED`, which for the
 //!   tablet means the status reads all ones or something else gave up on
 //!   it, `DEVICE_NEEDS_RESET`, or `DRIVER_OK` gone after a reset) ends the
-//!   thread: `mouse` shows it failed (nothing held), the pointer leaves the
+//!   thread: `mouse` shows it failed (no button pressed), the pointer leaves the
 //!   screen, an error gives the DMA runs outstanding in all (the tablet's
 //!   up to 32 posted buffers among them), and `lspci` shows it failed
 //!   (`pci::failed_after_bind`). Not tested: QEMU can't make the device
@@ -63,7 +63,8 @@
 //!   the previous contents).
 //! - **Holding.** `mouse hold` ([`hold`]) stops the `mouse` thread reading
 //!   the ring until `mouse release` ([`release`]): one state ([`Reads`]:
-//!   running, hold asked, held), changed by compare-and-swap. `hold` asks,
+//!   running, hold asked, held): `hold` and the park change it by
+//!   compare-and-swap, `release` sets it back to running. `hold` asks,
 //!   rings [`BELL`] (with nothing behind it) in case the thread waits for
 //!   the device, and returns once the thread has parked, so no event is
 //!   read from then on; events wait in the ring, where QEMU drops each
@@ -71,11 +72,13 @@
 //!   the ring in one batch. So an overrun can be made on purpose, whatever
 //!   the host's speed (#142: the scenario that waited for a busy guest to
 //!   fall behind didn't always). `hold` fails with no tablet, a failed one
-//!   (also one that fails while it waits), a release from elsewhere first,
-//!   or no park within [`HOLD_WAIT_NS`] (a bug, logged). While held the
-//!   device's status isn't looked at either. The state is every
-//!   console's: a hold from one console is released from any, and `mouse
-//!   hold | ...` holds as a side effect. Both are logged at INFO, so a
+//!   (also one that fails while it waits: the thread's failure wakes it),
+//!   the request taken back first (a release, or another console's hold
+//!   timing out), or no park within [`HOLD_WAIT_NS`] (a bug, logged). The
+//!   overrun warning's "after `mouse hold`" covers only the first drain
+//!   after a park. While held the device's status isn't looked at either.
+//!   The state is every console's: a hold from one console is released
+//!   from any, and `mouse hold | ...` holds as a side effect. Both are logged at INFO, so a
 //!   forgotten hold shows in `dmesg`.
 //! - **The `InputDevice` class** (docs/ARCHITECTURE.md, section 7): the
 //!   tablet's messages are `lumen_input::PointerState`s; M4's desktop
@@ -117,9 +120,11 @@ fn on_interrupt() {
 }
 
 /// Whether the `mouse` thread reads the ring: [`hold`] asks it to stop,
-/// the thread parks, [`release`] lets it read again. One state, changed by
-/// compare-and-swap, so `hold` can't see a park the thread is already
-/// leaving. Shared by every console: a hold from one is released by any.
+/// the thread parks, [`release`] lets it read again. One state: `hold`
+/// and the park change it by compare-and-swap, each acting on the value it
+/// replaced (never on a later reading), and `release` sets it back to
+/// `Running`. So `hold` can't take a park the thread is already leaving.
+/// Shared by every console: a hold from one is released by any.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reads {
@@ -132,10 +137,24 @@ pub enum Reads {
     Held = 2,
 }
 
+impl Reads {
+    /// The state [`READS`] holds as a byte (only these three are stored).
+    fn from_u8(v: u8) -> Reads {
+        match v {
+            0 => Reads::Running,
+            1 => Reads::HoldAsked,
+            2 => Reads::Held,
+            _ => unreachable!("READS holds {v}, not a Reads"),
+        }
+    }
+}
+
 static READS: AtomicU8 = AtomicU8::new(Reads::Running as u8);
 /// Where the `mouse` thread waits, parked, for [`release`].
 static RELEASED: WaitQueue = WaitQueue::new();
-/// Where [`hold`] waits for the thread to park.
+/// Where [`hold`] waits for the thread to park (or the tablet to fail).
+/// Its predicate takes [`BOUND`]'s lock, so nothing may wake it with that
+/// lock held.
 static PARKED: WaitQueue = WaitQueue::new();
 
 /// How long [`hold`] waits for the `mouse` thread to park.
@@ -143,16 +162,27 @@ const HOLD_WAIT_NS: u64 = 1_000_000_000;
 
 /// Whether the `mouse` thread reads ([`Reads`]).
 pub fn reads() -> Reads {
-    match READS.load(Ordering::SeqCst) {
-        0 => Reads::Running,
-        1 => Reads::HoldAsked,
-        _ => Reads::Held,
-    }
+    Reads::from_u8(READS.load(Ordering::SeqCst))
 }
 
-/// From `from` to `to`, if it is still `from`; what it was.
+/// `from` to `to`, if it holds `from`; otherwise the value it held instead,
+/// as the compare-and-swap itself read it.
 fn reads_swap(from: Reads, to: Reads) -> Result<(), Reads> {
-    READS.compare_exchange(from as u8, to as u8, Ordering::SeqCst, Ordering::SeqCst).map(drop).map_err(|_| reads())
+    READS.compare_exchange(from as u8, to as u8, Ordering::SeqCst, Ordering::SeqCst).map(drop).map_err(Reads::from_u8)
+}
+
+/// Back to `Running`, waking the parked thread and a hold waiting for it;
+/// the state before.
+fn set_running() -> Reads {
+    let was = Reads::from_u8(READS.swap(Reads::Running as u8, Ordering::SeqCst));
+    wake_hold_waiters();
+    was
+}
+
+/// Wake the parked thread and a hold waiting for it to park.
+fn wake_hold_waiters() {
+    RELEASED.wake_all();
+    PARKED.wake_all();
 }
 
 /// Why [`hold`] couldn't hold the `mouse` thread.
@@ -163,7 +193,9 @@ pub enum HoldError {
     /// The tablet failed (before the hold, or while it waited): its thread
     /// has ended.
     Failed,
-    /// Released (from another console) before the thread parked.
+    /// The request was gone before the thread parked: a release (from any
+    /// console), or another console's hold taking its request back when it
+    /// timed out.
     Released,
     /// The thread didn't park within [`HOLD_WAIT_NS`] (a bug; logged).
     NotParked,
@@ -174,7 +206,9 @@ impl fmt::Display for HoldError {
         match self {
             HoldError::NoTablet => f.write_str("no tablet"),
             HoldError::Failed => f.write_str("the tablet failed"),
-            HoldError::Released => f.write_str("released before the mouse thread stopped reading"),
+            HoldError::Released => f.write_str(
+                "the hold was taken back before the mouse thread parked (a release, or another hold timing out)",
+            ),
             HoldError::NotParked => {
                 write!(f, "the mouse thread didn't stop reading within {} ms", HOLD_WAIT_NS / 1_000_000)
             }
@@ -200,22 +234,29 @@ pub fn hold() -> Result<(), HoldError> {
     if !ask_hold() {
         return Ok(());
     }
-    match wait_parked(crate::time::now_ns().saturating_add(HOLD_WAIT_NS)) {
-        Reads::Held => {
-            info!(target: "mouse", "{addr}: held: the mouse thread reads nothing until `mouse release`");
-            Ok(())
-        }
+    let held = || {
+        info!(target: "mouse", "{addr}: held: the mouse thread reads nothing until `mouse release`");
+        Ok(())
+    };
+    let (seen, failed) = wait_parked(crate::time::now_ns().saturating_add(HOLD_WAIT_NS));
+    match seen {
+        Reads::Held => held(),
         Reads::Running => Err(HoldError::Released),
-        Reads::HoldAsked => {
-            // Not parked in time: take the request back (quietly: it never
-            // held), then find why.
-            set_running();
-            if working_tablet() == Err(HoldError::Failed) {
-                return Err(HoldError::Failed);
+        // Not parked yet (the deadline, or the tablet failed): take the
+        // request back (quietly: it never held), unless the thread parked
+        // just now or someone else took it.
+        Reads::HoldAsked => match reads_swap(Reads::HoldAsked, Reads::Running) {
+            Ok(()) => {
+                wake_hold_waiters();
+                if failed || working_tablet() == Err(HoldError::Failed) {
+                    return Err(HoldError::Failed);
+                }
+                error!(target: "mouse", "{addr}: {} (a bug): not held", HoldError::NotParked);
+                Err(HoldError::NotParked)
             }
-            error!(target: "mouse", "{addr}: {} (a bug): not held", HoldError::NotParked);
-            Err(HoldError::NotParked)
-        }
+            Err(Reads::Held) => held(),
+            Err(_) => Err(HoldError::Released),
+        },
     }
 }
 
@@ -232,48 +273,45 @@ fn ask_hold() -> bool {
     }
 }
 
-/// Wait until the `mouse` thread has parked or the request is gone, at
-/// most until `deadline`; the state then (`HoldAsked` if it ran out).
-fn wait_parked(deadline: u64) -> Reads {
-    PARKED.wait_until_or_deadline(deadline, || reads() != Reads::HoldAsked);
-    reads()
+/// Wait until the `mouse` thread has parked, the request is gone or the
+/// tablet failed, at most until `deadline`: the state and whether the
+/// tablet had failed, as the wait's last look saw them (`HoldAsked` and
+/// not failed if it ran out).
+fn wait_parked(deadline: u64) -> (Reads, bool) {
+    let (mut seen, mut failed) = (Reads::HoldAsked, false);
+    PARKED.wait_until_or_deadline(deadline, || {
+        seen = reads();
+        failed = BOUND.lock().as_ref().is_some_and(|b| b.failed.is_some());
+        seen != Reads::HoldAsked || failed
+    });
+    (seen, failed)
 }
 
 /// Let the `mouse` thread read again ([`hold`]): it reads everything in the
-/// ring in one batch. Releasing a tablet that isn't held only says so.
+/// ring in one batch. A hold still waiting for the thread to park is
+/// cancelled (it fails, `Released`). Releasing a tablet that isn't held
+/// logs nothing (the shell still says `released`).
 pub fn release() {
-    if set_running()
-        && let Some(b) = BOUND.lock().as_ref()
-    {
-        info!(target: "mouse", "{}: released: the mouse thread reads again", b.device.addr);
+    if set_running() != Reads::Running {
+        let addr = BOUND.lock().as_ref().map(|b| b.device.addr);
+        if let Some(addr) = addr {
+            info!(target: "mouse", "{addr}: released: the mouse thread reads again");
+        }
     }
-}
-
-/// Back to `Running`, waking the parked thread and a hold waiting for it
-/// to park; whether it wasn't running.
-fn set_running() -> bool {
-    let was = READS.swap(Reads::Running as u8, Ordering::SeqCst);
-    RELEASED.wake_all();
-    PARKED.wake_all();
-    was != Reads::Running as u8
 }
 
 /// The `mouse` thread's side of a hold, at the top of its loop: if a hold
-/// was asked, park (`HoldAsked` to `Held`) until released; whether it
-/// parked (then it looks again before reading: a release and a new hold
-/// while it slept leave it asked to park once more).
+/// was asked, park (`HoldAsked` to `Held`, by compare-and-swap) and wait
+/// for anything but `Held`; whether it parked (then it looks again before
+/// reading: a release and a new hold while it slept leave it asked to park
+/// once more). Not asked, or a release that won the race: it reads on.
 fn park_if_asked() -> bool {
-    match reads() {
-        Reads::Running => false,
-        Reads::HoldAsked | Reads::Held => {
-            // A release just now leaves it `Running`: read on.
-            if reads_swap(Reads::HoldAsked, Reads::Held).is_ok() || reads() == Reads::Held {
-                PARKED.wake_all();
-                RELEASED.wait_until(|| reads() != Reads::Held);
-            }
-            true
-        }
+    if reads_swap(Reads::HoldAsked, Reads::Held).is_err() {
+        return false;
     }
+    PARKED.wake_all();
+    RELEASED.wait_until(|| reads() != Reads::Held);
+    true
 }
 
 /// The event buffers the crate keeps posted (`VirtIOInput`'s queue size).
@@ -357,7 +395,7 @@ impl fmt::Display for Failure {
 pub struct Bound {
     pub device: Device,
     /// The newest whole frame's state, if one came (its buttons cleared
-    /// once the tablet failed: nothing is held any more).
+    /// once the tablet failed: no button is pressed any more).
     pub state: Option<PointerState>,
     pub counts: Counts,
     /// The newest batch that brought frames may have missed some (an
@@ -483,7 +521,8 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
 /// The `mouse` thread: the device's only user from here on.
 fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, addr: PciAddr) {
     let (mut warned_overrun, mut logged_ignored) = (false, false);
-    // The next batch is the first after a park (`mouse hold`).
+    // The next drain is the first after a real park (`mouse hold`): the
+    // overrun warning, if that drain makes one, says so.
     let mut after_hold = false;
     // Events after a wait that ran to its deadline with no ring, the ring
     // count still unchanged: they came without their interrupt.
@@ -522,9 +561,9 @@ fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, a
             warn!(target: "mouse", "{addr}: {events} events in one batch{held}: the event ring was nearly full, so \
                 frames may have been lost (said once; `mouse` counts such batches)");
         }
-        if events > 0 {
-            after_hold = false;
-        }
+        // Only the first drain after a park is "after `mouse hold`", even
+        // if it read nothing.
+        after_hold = false;
         if events > 0
             && let Some(b) = BOUND.lock().as_mut()
         {
@@ -566,8 +605,21 @@ fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, a
     }
 }
 
+/// Publish that the tablet failed (`why`; no button pressed any more), and
+/// end a hold waiting for the thread to park (`Failed`): woken after
+/// `BOUND`'s lock is dropped (that wait looks at `BOUND`).
+fn mark_failed(why: Failure) {
+    if let Some(b) = BOUND.lock().as_mut() {
+        b.failed = Some(why);
+        if let Some(s) = b.state.as_mut() {
+            s.buttons = lumen_input::Buttons::NONE;
+        }
+    }
+    PARKED.wake_all();
+}
+
 /// The device stopped being ready (`FAILED`, `DEVICE_NEEDS_RESET`, or
-/// `DRIVER_OK` gone): publish it (nothing held any more), drop the driver,
+/// `DRIVER_OK` gone): publish it (no button pressed any more), drop the driver,
 /// say so, and mark the function failed.
 fn fail(input: Input, status: StatusHandle, addr: PciAddr) {
     let (raw, st) = (status.raw(), status.get());
@@ -578,12 +630,7 @@ fn fail(input: Input, status: StatusHandle, addr: PciAddr) {
     } else {
         Failure::Stopped
     };
-    if let Some(b) = BOUND.lock().as_mut() {
-        b.failed = Some(why);
-        if let Some(s) = b.state.as_mut() {
-            s.buttons = lumen_input::Buttons::NONE;
-        }
-    }
+    mark_failed(why);
     crate::term::hide_pointer();
     // (See the module doc for what dropping it does and leaks.)
     drop(input);
@@ -620,7 +667,8 @@ impl MadeUp {
 #[cfg(feature = "ktest")]
 impl Drop for MadeUp {
     fn drop(&mut self) {
-        READS.store(Reads::Running as u8, Ordering::SeqCst);
+        // Through the waking path, so nothing is left parked or waiting.
+        set_running();
         *BOUND.lock() = None;
     }
 }
@@ -630,6 +678,9 @@ crate::ktest!(
         // No tablet, or a failed one: `hold` refuses at once and asks
         // nothing of a thread.
         use crate::kassert_eq;
+        if BOUND.lock().is_some() {
+            return Err("a tablet is bound already: this ktest needs none");
+        }
         kassert_eq!(hold(), Err(HoldError::NoTablet));
         let _bound = MadeUp::bind(Some(Failure::Failed))?;
         kassert_eq!(hold(), Err(HoldError::Failed));
@@ -642,16 +693,15 @@ crate::ktest!(
     fn a_hold_that_no_thread_answers_is_taken_back() {
         // A tablet with no thread to park (made up): `hold` waits
         // HOLD_WAIT_NS, takes the request back and says why: `NotParked`
-        // (logged as a bug), or `Failed` if the tablet failed meanwhile.
+        // (logged as a bug). A tablet that fails while it waits
+        // (`mark_failed`, as the thread does) ends the wait: `Failed`.
         use crate::kassert_eq;
         let _bound = MadeUp::bind(None)?;
         kassert_eq!(hold(), Err(HoldError::NotParked));
         kassert_eq!(reads(), Reads::Running);
         let failer = crate::sched::spawn("hold-ktest-fail", || {
             crate::time::sleep(100_000_000);
-            if let Some(b) = BOUND.lock().as_mut() {
-                b.failed = Some(Failure::Failed);
-            }
+            mark_failed(Failure::Failed);
         })
         .map_err(|_| "spawn")?;
         let got = hold();
@@ -668,11 +718,25 @@ crate::ktest!(
         // "read" counted, a wait for the doorbell) on a made-up tablet.
         // Held, released and held again with nothing able to run in
         // between: it parks again without reading. A hold while held
-        // returns at once. Released for good, it reads on.
+        // returns at once. Released with STOP set, it leaves without
+        // another read. (The stand-in runs on this CPU: the cross-CPU case
+        // rests on the one SeqCst state.)
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::{AtomicBool, AtomicU64};
         static STOP: AtomicBool = AtomicBool::new(false);
         static READ: AtomicU64 = AtomicU64::new(0);
+        /// Stops and joins the stand-in, also on an early return (dropped
+        /// before `_bound`).
+        struct Reader(Option<crate::sched::JoinHandle>);
+        impl Drop for Reader {
+            fn drop(&mut self) {
+                STOP.store(true, Ordering::SeqCst);
+                set_running();
+                if let Some(t) = self.0.take() {
+                    t.join();
+                }
+            }
+        }
         STOP.store(false, Ordering::SeqCst);
         READ.store(0, Ordering::SeqCst);
         let _bound = MadeUp::bind(None)?;
@@ -691,6 +755,7 @@ crate::ktest!(
             }
         })
         .map_err(|_| "spawn")?;
+        let mut reader = Reader(Some(reader));
         kassert_eq!(hold(), Ok(()));
         kassert_eq!(reads(), Reads::Held);
         let before = READ.load(Ordering::SeqCst);
@@ -699,12 +764,10 @@ crate::ktest!(
             release();
             kassert!(ask_hold());
         }
-        kassert_eq!(wait_parked(crate::time::now_ns().saturating_add(HOLD_WAIT_NS)), Reads::Held);
+        kassert_eq!(wait_parked(crate::time::now_ns().saturating_add(HOLD_WAIT_NS)), (Reads::Held, false));
         kassert_eq!(hold(), Ok(()));
         kassert_eq!(READ.load(Ordering::SeqCst), before);
-        STOP.store(true, Ordering::SeqCst);
-        release();
-        reader.join();
+        drop(core::mem::replace(&mut reader, Reader(None)));
         kassert_eq!(READ.load(Ordering::SeqCst), before);
         Ok(())
     }
