@@ -167,10 +167,6 @@ converted with the calibrated TSC, and then the bootloader's own times
 [    0.366511] INFO  boot: before kmain: limine started at 1932.697 ms and handed off at 2514.149 ms (TSC time), kmain began +10.379 ms after the handoff
 ```
 
-`boot complete` is logged just before the complete phase is marked and
-the timeline line just after it, so the total falls between their stamps
-(`test_boot_timeline_printed` checks it: one origin and unit, by order).
-
 The bootloader's time isn't counted in the timeline; the second line
 shows it. `boot.rs` asks Limine for its bootloader-performance and
 TSC-frequency responses (by hand: the pinned `limine` crate has no types
@@ -221,7 +217,12 @@ incomplete timeline is logged as a warning (not tested: every boot's
 timeline is complete; the scenario fails on the warning). Serial log lines
 start with the time since that origin, `[seconds.microseconds]`; every line
 before the TSC is calibrated (before `time: tsc ...`) shows `[    ?.??????]`, not a
-zero that would read as a measurement. The first virtual terminal shows
+zero that would read as a measurement. The stamps and the timeline share
+the origin and the calibrated clock: `boot complete` is logged just before
+the complete phase is marked and the timeline line just after it, so the
+total falls between their stamps (checked by order, with no time bound, in
+`test_boot_timeline_printed`; `trace::log_stamps_count_from_the_timelines_origin`
+checks a stamp between two TSC reads). The first virtual terminal shows
 lines up to `info` without timestamps, so screenshots stay comparable
 (`term::log_lines_are_coloured_by_level` checks the level starts the line).
 

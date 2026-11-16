@@ -12,7 +12,7 @@ pub use self::x86_64::{
     apic, cmos, context,
     cpu::{
         Rdrand, apic_id, enter_kernel_space, halt_forever, rdtsc, read_cr0, read_cr2, read_cr3, read_cr4, read_rbp,
-        read_rsp, switch_stack,
+        read_rsp, serialize, switch_stack,
     },
     gdt, i8042, idt,
     idt::TrapFrame,

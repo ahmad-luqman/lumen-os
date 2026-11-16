@@ -486,6 +486,50 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn log_stamps_count_from_the_timelines_origin() {
+        // The logger's stamp (`time::since_boot_ns`, as klog takes it) read
+        // between two TSC reads, each converted as the timeline converts a
+        // phase: ticks since the ring's entry event, with the calibrated
+        // clock. The entry event, not `boot_tsc()`: it is the timeline's own
+        // origin, and `since_boot_ns` reads `boot_tsc()` itself. Order only:
+        // interrupts off and every read serialized, so it holds however
+        // slowly the CPU runs; a log origin or unit that differs from the
+        // timeline's shows once its error exceeds the gap between the two
+        // reads (test_boot_timeline_printed checks the same on the serial
+        // lines, #125). Like `boot_phases_recorded_in_order`, it relies on
+        // the boot ring not having wrapped.
+        let ring = boot_ring();
+        let entry = (0..ring.written())
+            .filter_map(|seq| ring.read(seq))
+            .find(|e| e.kind == Kind::BootPhase as u16 && e.args[0] == BootPhase::Entry as u64)
+            .ok_or("no entry event in the boot ring")?
+            .tsc;
+        let clock = crate::time::tsc().ok_or("the TSC isn't calibrated")?;
+        let (before, stamp, after) = {
+            let _off = arch::irq::push_off();
+            let before = arch::rdtsc();
+            arch::serialize();
+            let stamp = crate::time::since_boot_ns();
+            arch::serialize();
+            (before, stamp, arch::rdtsc())
+        };
+        let stamp = stamp.ok_or("no log stamp (since_boot_ns is None)")?;
+        let since = |tsc: u64| tsc.checked_sub(entry).map(|ticks| clock.ns(ticks));
+        let (Some(low), Some(high)) = (since(before), since(after)) else {
+            return Err("the TSC reads before the timeline's entry");
+        };
+        if !(low <= stamp && stamp <= high) {
+            crate::ktest::diag(format_args!(
+                "log stamp {stamp} ns, timeline's reads around it {low} ns and {high} ns ({} Hz)",
+                clock.hz()
+            ));
+            return Err("the log's stamp isn't between the timeline's reads around it");
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn the_timeline_says_what_it_lacks() {
         // On rings of our own, with a clock of 1 kHz (a tick is 1 ms).
         use core::fmt::Write;
