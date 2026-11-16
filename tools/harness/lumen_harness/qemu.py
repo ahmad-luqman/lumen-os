@@ -176,6 +176,9 @@ class QemuOptions:
     qmp_socket: Path | None = None
     log_file: Path | None = None
     trace: str = "cpu_reset,guest_errors"
+    # QEMU trace events to enable (`-trace`), e.g. "virtio_input_queue_full":
+    # they go to `log_file` with the `-d` trace, never to stderr.
+    trace_events: tuple[str, ...] = ()
     gdb: bool = False
     # False: `-no-reboot`, so a reset (a triple fault among them) ends QEMU
     # with status 0, which fails a test; the power-off scenario passes on a
@@ -462,6 +465,11 @@ def qemu_args(o: QemuOptions) -> list[str]:
         args += ["-qmp", f"unix:{o.qmp_socket},server=on,wait=off"]
     if o.log_file and o.trace:
         args += ["-d", o.trace, "-D", str(o.log_file)]
+    if o.trace_events:
+        if not o.log_file:
+            raise ValueError("trace events need a log file (they would go to stderr)")
+        for event in o.trace_events:
+            args += ["-trace", event]
     if o.gdb:
         args += ["-s", "-S"]
     # The RTC keeps UTC (the shell's `date` says so; the tests compare it
@@ -515,6 +523,7 @@ class Machine:
         reboot: bool = False,
         devices: Devices = NO_DEVICES,
         cpu: str | None = None,
+        trace_events: Sequence[str] = (),
     ):
         # Read once, before anything starts: a value timeout_scale() rejects fails
         # here, not in the first expect() or wait_exit(). (One so large that it
@@ -534,6 +543,8 @@ class Machine:
         self.reboot = reboot
         self._devices = devices
         self.cpu = cpu
+        # QEMU trace events, logged to the artifacts' qemu.log (`trace_log`).
+        self.trace_events = tuple(trace_events)
         # Guest TCP port -> the host port forwarded to it (on 127.0.0.1),
         # picked by start() just before QEMU starts (see `_pick_forwards`).
         self.forwards: dict[int, int] = {}
@@ -689,6 +700,12 @@ class Machine:
             if not any(noise.search(line) for noise in QEMU_NOISE)
         ]
 
+    def trace_log(self) -> str:
+        """QEMU's log so far (artifacts/qemu.log): its `-d` trace and the
+        `trace_events` asked for."""
+        log = self.artifacts / "qemu.log"
+        return log.read_text(errors="replace") if log.exists() else ""
+
     def options(self, vars_file: Path) -> QemuOptions:
         """How start() runs QEMU (separate so the harness tests can check it)."""
         trace = "cpu_reset,guest_errors" + (",int" if self.trace_interrupts else "")
@@ -699,6 +716,7 @@ class Machine:
             qmp_socket=self.qmp_path,
             log_file=self.artifacts / "qemu.log",
             trace=trace,
+            trace_events=self.trace_events,
             serial="stdio" if self.serial else "none",
             reboot=self.reboot,
             cpu=self.cpu,

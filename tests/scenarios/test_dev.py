@@ -255,7 +255,9 @@ def test_a_virtio_rng_that_turns_to_zeros_is_dropped(boot, tmp_path):
             break
     else:
         pytest.fail("the device answering zeros was never dropped")
-    # Warned about once (rate-limited), then dropped at the 8th in a row.
+    # Warned about once (rate-limited), then dropped at the 8th in a row:
+    # the only two warnings (the ones `random` allowed).
+    assert m.output.count("WARN  rng") == 2
     assert m.output.count("WARN  rng: virtio-rng answered 32 bytes of 0x00; not mixed in") == 1
     assert "(1 such answers since boot)" in m.output
     why = "the device answered 32 bytes of 0x00 8 times running"

@@ -421,7 +421,7 @@ fn mouse_header(bound: Option<&crate::mouse::Bound>) -> String {
     let frames = b.state.map_or(0, |s| s.seq);
     let failed = b.failed.map_or(String::new(), |why| alloc::format!(", failed: {why}"));
     alloc::format!(
-        "mouse: \"{}\" on {}, screen {}x{}, {} events in {frames} frames ({} ignored, {} dropped, at least {} \
+        "mouse: \"{}\" on {}, screen {}x{}, {} events in {frames} frames ({} ignored, {} dropped, {} \
          overruns){failed}",
         d.name,
         d.addr,
@@ -779,7 +779,7 @@ crate::ktest!(
         kassert_eq!(
             mouse_header(Some(&bound)),
             "mouse: \"ktest tablet\" on 0000:00:03.0, screen 1280x800, 9 events in 7 frames (1 ignored, 2 dropped, \
-             at least 3 overruns), failed: FAILED"
+             3 overruns), failed: FAILED"
         );
         let table = mouse_table_of(Some(&bound));
         let row = &table.rows()[0];

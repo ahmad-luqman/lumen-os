@@ -21,16 +21,21 @@ UNKNOWN = r"    \?\.\?{6}"
 STAMP = rf"\[(?:{SECONDS}|{UNKNOWN})\]"
 LEVEL = r"(?:ERROR|WARN |INFO |DEBUG|TRACE)"
 # The levels a test should see: they fail a command's output (shell.run).
-LOUD = ("ERROR", "WARN ")
+LOUD = ("ERROR", "WARN")
 # One whole line, newline included, wherever it starts: one can follow part
 # of a line on serial (a key's echo, a command's write that didn't end its
 # line). No groups, so patterns can repeat it.
 LOG_LINE = re.compile(rf"{STAMP} {LEVEL} [^ \n]+: [^\n]*\n")
 
 
+def is_log_line(text: str) -> bool:
+    """Whether `text` is one whole log line (its newline optional)."""
+    return LOG_LINE.fullmatch(text if text.endswith("\n") else text + "\n") is not None
+
+
 def level_of(line: str) -> str:
-    """A log line's level, as printed (`WARN `, `INFO `, ...)."""
+    """A log line's level: `ERROR`, `WARN`, `INFO`, `DEBUG` or `TRACE`."""
     found = re.match(rf"{STAMP} ({LEVEL}) ", line)
     if not found:
         raise ValueError(f"not a log line: {line!r}")
-    return found[1]
+    return found[1].strip()

@@ -162,6 +162,21 @@ def test_machine_appends_extra_args_last(tmp_path):
     assert "-smp" not in plain
 
 
+def test_trace_events_go_to_the_log_file(tmp_path):
+    # Logged with `-d`'s trace to qemu.log (`-D`), under KVM too: never to
+    # stderr, which `Machine.output` mixes into serial.
+    m = Machine(Path("x.iso"), tmp_path, trace_events=["virtio_input_queue_full"])
+    args = qemu_args(m.options(Path("v.fd")))
+    assert args[args.index("-trace") + 1] == "virtio_input_queue_full"
+    assert args[args.index("-D") + 1] == str(tmp_path / "qemu.log")
+    plain = qemu_args(Machine(Path("x.iso"), tmp_path).options(Path("v.fd")))
+    assert "-trace" not in plain
+    with pytest.raises(ValueError, match="need a log file"):
+        qemu_args(opts(log_file=None, trace_events=("x",)))
+    (tmp_path / "qemu.log").write_text("virtio_input_queue_full\n")
+    assert m.trace_log() == "virtio_input_queue_full\n"
+
+
 def test_machine_without_serial_has_no_serial_port(tmp_path):
     # `-serial none` (not just no output): q35 then creates no COM1 at all.
     args = qemu_args(Machine(Path("x.iso"), tmp_path, serial=False).options(Path("v.fd")))

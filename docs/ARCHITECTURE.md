@@ -1263,13 +1263,15 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   command's output through `lumen_harness.shell.run`: it takes log lines
   out wherever they start (the format of "Boot timeline and log
   timestamps", matched by `lumen_harness.klog`; change it with
-  kernel/src/klog.rs) and keeps them on the result, and a WARN or ERROR
-  among them fails the run unless the test allows that line (a warning is
-  something a test should see). A command whose output is log lines
-  (`dmesg`) is read with `keep_logs`. Scenarios put a debug line inside a
+  kernel/src/klog.rs) and keeps them on the result, from the prompt
+  before the echo on, and a WARN or ERROR among them fails the run unless
+  the test allows that line (a warning is something a test should see). A
+  command whose output is log lines (`dmesg`) is read with `run_dmesg`,
+  which drops (and checks) the lines logged while it ran. Scenarios put a debug line inside a
   command's echo, between two of its output writes, and after its output
-  before the prompt (#124's position); harness self-tests replay #124's
-  serial output.
+  before the prompt (#124's position); harness self-tests cover all three
+  positions on handcrafted text, and the position after the output on
+  #124's recorded output.
   Each key's output is written to the console in
   one write, so on the screen a log line can't land in the middle of a
   redraw (not tested on its own). A running command reads keys from its
@@ -1334,7 +1336,8 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
     saying why any are missing (`pci::status`).
   - `mouse`: the tablet (#98, section 7): a header with its name,
     address, screen and counts (events, frames, ignored, `SYN_DROPPED`s,
-    at least so many overruns, why it failed), and one row: position,
+    overruns: batches that may have lost frames, why it failed), and one
+    row: position,
     buttons held, presses so far (summed), wheels, the pointer (`drawn`,
     `hidden` under a canvas, `none` without a terminal), `stale`, and why
     it failed; `no tablet` and a row of dashes without one.
@@ -2334,15 +2337,14 @@ ever seen.
   most one event per code the device advertises in its `EV_BITS`, and the
   sync (`lumen_input::frame_bound`; 12 on QEMU's tablet; the boot line
   says it). A batch that read enough events that such a frame may not
-  have fit (21 of 32 on QEMU's) counts as an overrun, marks the state
-  stale until a clean batch brings a frame, and the thread looks again at
-  once instead of waiting. The count is of batches that may have lost
-  frames: it can count a batch that lost nothing, and is never 0 when a
-  frame was dropped, while all 32 buffers stay posted and no frame repeats
-  a code (QMP's `input-send-event` can; QEMU's front ends don't): a host
-  model of the ring checks both, and that breaking either precondition
-  loses the guarantee (#124). A scenario sends 300 moves unpaced and
-  checks that lost frames come with an overrun, and the overrun warning.
+  have fit (21 or more of 32 on QEMU's tablet) counts as an overrun and
+  marks the state stale until a clean batch brings a frame. What that
+  count guarantees, and its preconditions, are stated once, in
+  `lumen_input::may_have_lost_frames`'s doc, and a host model checks them
+  (#124). Scenarios send 300 frames of 3 and of 7 events unpaced while
+  the guest's CPU is busy, and check that frames were lost (as many as
+  QEMU traced), that an overrun was counted, and the overrun warning;
+  the 7-event frames tell the device's bound from moves' 3.
 - **Keys:** the keyboard's decoded keys (`lumen_shell::Key`, through
   `crate::vt`'s per-terminal rings today). That is a line editor's key
   (characters and editing keys, no key-up, no modifiers on their own),

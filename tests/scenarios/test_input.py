@@ -12,11 +12,12 @@ import time
 from collections.abc import Callable
 from typing import NamedTuple
 
+import pytest
 from lumen_harness.image import assert_matches_golden, compare
 from lumen_harness.qemu import Devices, Machine
 from lumen_harness.qmp import QmpClient, QmpError, pointer_move_args, qcodes_for
 from lumen_harness.screen import expect_screen, read_screen
-from lumen_harness.shell import run
+from lumen_harness.shell import echo_pattern, read_output, run, wait_for_output
 from PIL import Image
 from test_pci import lspci_rows, msix_rows, qdev_addresses
 
@@ -202,7 +203,7 @@ TABLET_LINE = re.compile(
 )
 MOUSE_HEADER = re.compile(
     r'mouse: "QEMU Virtio Tablet" on (\S+), screen 1280x800, (\d+) events in (\d+) frames '
-    r"\((\d+) ignored, (\d+) dropped, at least (\d+) overruns\)"
+    r"\((\d+) ignored, (\d+) dropped, (\d+) overruns\)"
 )
 # The terminal's top-left pixel and its cells' size (1280x800, limine.conf).
 GRID_X, GRID_Y, CELL_W, CELL_H = 32, 144, 7, 16
@@ -416,23 +417,52 @@ def test_cursor_leaves_no_trail(boot, artifacts):
     assert pixels(after, header) == pixels(before, header)
 
 
-def test_a_burst_of_moves_counts_overruns(boot):
-    # 300 moves sent as fast as QMP takes them (no pacing): QEMU drops a
-    # whole frame that doesn't fit in the 32-buffer ring (traced as
-    # virtio_input_queue_full) without telling the guest. If any frame was
-    # lost, `mouse` counts at least one overrun (it counts batches that may
-    # have lost frames: maybe one that lost nothing, never none when a
-    # frame was lost); none is ignored or SYN_DROPPED. The first overrun
-    # is warned about once (and only then: the warning may come with a
-    # `mouse`). A paced move afterwards is a clean frame: the state isn't
-    # stale.
-    m = boot("qemutest", devices=Devices(tablet=True), extra=["-trace", "virtio_input_queue_full"])
+# A burst's frames by size (events, the sync included): moves (x, y), or
+# moves with 4 buttons pressed and released in turn. A 7-event frame
+# separates the tablet's bound (12: a batch of 21 events or more counts)
+# from moves' (3: 30 or more): the ring holds 4 of them (28 events), so a
+# batch that read a full ring and nothing more counts only by the bound.
+# 30 of them, sent within a few of the mouse thread's looks, make such
+# batches likely (a frame arriving while the thread reads makes a bigger
+# one): a kernel counting with 3 failed 9 of 10 runs, and 4 of 6 with 300.
+BURST_BUTTONS = ("left", "right", "middle", "side")
+
+
+def burst_frame(i: int, frame: int, size: tuple[int, int]) -> dict:
+    """Frame `i` of a burst of `frame`-event frames (3 or 7)."""
+    args = pointer_move_args(100 + i % 2, 100 + i % 500, size)
+    if frame == 7:
+        down = i % 2 == 0
+        buttons = [{"type": "btn", "data": {"down": down, "button": b}} for b in BURST_BUTTONS]
+        args["events"] = buttons + args["events"]
+    return args
+
+
+@pytest.mark.parametrize(("frame", "sent"), [(3, 300), (7, 30)], ids=["moves", "buttons"])
+def test_a_burst_of_moves_counts_overruns(boot, frame, sent):
+    # A burst (300 moves, or 30 frames with buttons) sent as fast as QMP
+    # takes it, while the serial shell's
+    # thread spins (a rhai loop) on the guest's one CPU, so the mouse thread
+    # reads the ring at most once a time slice (under KVM too): QEMU drops
+    # whole frames that don't fit in the 32-buffer ring (traced as
+    # virtio_input_queue_full, one line per frame) without telling the
+    # guest. Frames were lost, each traced; `mouse` counts at least one
+    # overrun (see lumen_input::may_have_lost_frames); every event is used
+    # (none ignored or SYN_DROPPED). The first overrun is warned about once
+    # (and only then: the warning may come with a `mouse`). A paced move
+    # afterwards is a clean frame: the state isn't stale.
+    m = boot("qemutest", devices=Devices(tablet=True), trace_events=["virtio_input_queue_full"])
     tablet_ready(m)
     size = m.screen_size()
     qmp = m.qmp()
-    sent = 300
+    hog = "rhai -e 'loop { }'"
+    start = len(m.output)
+    m.send_line(hog)
+    wait_for_output(m, start, echo_pattern(hog))
     for i in range(sent):
-        qmp.send_input(pointer_move_args(100 + i % 2, 100 + i, size))
+        qmp.send_input(burst_frame(i, frame, size))
+    m.send("\x03")
+    assert read_output(m, hog, 30, allow=OVERRUN_WARN) == "rhai: stopped (Ctrl-C)\n"
     # Settled: the same counts twice, a little apart.
     last: list[tuple[int, ...]] = [()]
 
@@ -442,18 +472,15 @@ def test_a_burst_of_moves_counts_overruns(boot):
 
     counts = poll(lambda: mouse_counts(m, OVERRUN_WARN), settled, m, 30)
     events, frames, ignored, dropped, overruns = counts
-    # The trace goes to `-D`'s qemu.log where the harness sets one (TCG),
-    # else to stderr.
-    log = m.artifacts / "qemu.log"
-    traced = m.qemu_stderr() + (log.read_text(errors="replace") if log.exists() else "")
-    full = traced.count("virtio_input_queue_full")
-    print(f"sent {sent}, read {frames} frames, {overruns} overruns, queue full {full} times")
+    full = m.trace_log().count("virtio_input_queue_full")
+    print(
+        f"{frame}-event frames: sent {sent}, read {frames}, {overruns} overruns, queue full {full}"
+    )
     assert (ignored, dropped) == (0, 0)
-    assert frames <= sent and events == 3 * frames
-    if full:
-        assert frames < sent
-    if frames < sent:
-        assert overruns >= 1, (frames, overruns)
+    assert events == frame * frames
+    assert frames < sent, "no frame lost: the ring never filled"
+    assert sent - frames == full, (sent, frames, full)
+    assert overruns >= 1, (frames, overruns)
     m.move_pointer(640, 400)
     assert wait_mouse(m, OVERRUN_WARN, x="640", y="400").stale == "no"
     # Every batch has been counted by now (the paced move's came after).

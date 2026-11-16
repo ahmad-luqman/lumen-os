@@ -223,23 +223,32 @@ pub fn has_abs_xy(bits: &[u8]) -> bool {
     bits.first().is_some_and(|b| b & xy == xy)
 }
 
+/// The event types a device sends in its frames: `EV_KEY` (keys and
+/// buttons), `EV_REL`, `EV_ABS`, `EV_MSC` and `EV_SW`. The rest of its
+/// `EV_BITS` (LEDs, sound, autorepeat, force feedback) describe output to
+/// the device.
+pub const FRAME_TYPES: core::ops::RangeInclusive<u16> = 0x01..=0x05;
+
 /// The most events one frame can hold on a device whose `EV_BITS`
-/// bitmaps (virtio-input's configuration, one per event type the device
-/// sends: bit n for code n) are `bits`: one event per code it can send,
-/// plus the `SYN_REPORT` ending the frame.
+/// bitmaps (virtio-input's configuration: for an event type, bit n for
+/// code n) are `bits`, as (type, bitmap) pairs: one event per code of a
+/// [`FRAME_TYPES`] type it can send, plus the `SYN_REPORT` ending the
+/// frame. Not capped: compare it with the ring (see
+/// [`may_have_lost_frames`]).
 ///
 /// That holds while a frame carries each code at most once. QEMU's
 /// virtio input device passes on every event its input layer queues
 /// between two syncs (`virtio_input_handle_event`, one virtio event each;
-/// hw/input/virtio-input-hid.c), and its front ends queue what changed
-/// once per sync: SDL a button, X and Y. QMP's `input-send-event` takes
-/// any list of events before its one sync, so a list repeating a code can
-/// make a bigger frame. QEMU's tablet (8.2 to 11, `wheel-axis` on, the
-/// default) advertises 8 buttons (`keymap_button`: left, right, middle,
-/// gear up and down, side, extra, touch), `REL_WHEEL`, `ABS_X` and
-/// `ABS_Y`: frames of up to 12 events.
-pub fn frame_bound<'a>(bits: impl IntoIterator<Item = &'a [u8]>) -> u64 {
-    1 + bits.into_iter().flatten().map(|b| u64::from(b.count_ones())).sum::<u64>()
+/// hw/input/virtio-input-hid.c). QMP's `input-send-event` takes any list
+/// of events before its one sync, so a list repeating a code can make a
+/// bigger frame. QEMU's tablet advertises 8 buttons (`keymap_button`:
+/// left, right, middle, gear up and down, side, extra, touch), `REL_WHEEL`,
+/// `ABS_X` and `ABS_Y` (8.2 to 10.x with `wheel-axis` on, the default,
+/// `virtio_tablet_config_v2`; 11.0 onward, which dropped the property,
+/// `virtio_tablet_config`): frames of up to 12 events.
+pub fn frame_bound<'a>(bits: impl IntoIterator<Item = (u16, &'a [u8])>) -> u64 {
+    let codes = bits.into_iter().filter(|(ty, _)| FRAME_TYPES.contains(ty)).flat_map(|(_, b)| b);
+    1 + codes.map(|b| u64::from(b.count_ones())).sum::<u64>()
 }
 
 /// Whether a batch that read `events` events from a ring of `ring` event
@@ -249,15 +258,22 @@ pub fn frame_bound<'a>(bits: impl IntoIterator<Item = &'a [u8]>) -> u64 {
 /// `SYN_DROPPED` (`virtio_input_send`, hw/input/virtio-input.c, tracing
 /// `virtio_input_queue_full`).
 ///
-/// Counting such batches can count one that lost nothing, and never
-/// misses one that lost a frame, given that every `ring` buffer is posted
-/// (a buffer lost to the ring makes it smaller) and no frame is bigger
-/// than `frame` (a bigger one can be dropped with fewer buffers in use):
-/// when a frame was dropped, at least `ring - frame + 1` buffers were
-/// filled or being re-posted, and the batch that reads them all is the
-/// first to end after the drop (`tests::no_dropped_frame_goes_uncounted`).
+/// This is the one statement of what counting such batches (the kernel's
+/// overruns) guarantees. It can count a batch that lost nothing, and it is
+/// never 0 after a dropped frame: the first batch to end after the drop
+/// counts. That holds given that every `ring` buffer is posted (a buffer
+/// lost to the ring makes it smaller) and no frame is bigger than `frame`
+/// (a bigger one can be dropped with fewer buffers in use): when a frame
+/// was dropped, at least `ring - frame + 1` buffers were filled or being
+/// re-posted, and the first batch to end after the drop reads them all
+/// (`tests::no_dropped_frame_goes_uncounted`; `the_preconditions_are_needed`
+/// shows each precondition is needed).
+///
+/// An empty batch never counts. With a `frame` of `ring` or more every
+/// non-empty batch counts, so overruns can't be told apart, and a frame
+/// too big for the ring is dropped without leaving events to count.
 pub fn may_have_lost_frames(events: u64, ring: u64, frame: u64) -> bool {
-    events + frame > ring
+    events > 0 && events + frame > ring
 }
 
 /// An absolute pointer (virtio's tablet): its axes and the screen it
@@ -582,11 +598,12 @@ mod tests {
         assert!(!has_abs_xy(&[]), "no absolute axes");
     }
 
-    /// QEMU's tablet's `EV_BITS` (hw/input/virtio-input-hid.c, QEMU 8.2
-    /// to 11): `EV_KEY` from `keymap_button` (left, right, middle, side,
-    /// extra 0x110..=0x114, touch 0x14a, gear down and up 0x150 and
-    /// 0x151), `EV_REL` `REL_WHEEL` (`virtio_tablet_config_v2`, with
-    /// `wheel-axis` on, the default), `EV_ABS` `ABS_X` and `ABS_Y`.
+    /// QEMU's tablet's `EV_BITS` (hw/input/virtio-input-hid.c): `EV_KEY`
+    /// from `keymap_button` (left, right, middle, side, extra
+    /// 0x110..=0x114, touch 0x14a, gear down and up 0x150 and 0x151),
+    /// `EV_REL` `REL_WHEEL` and `EV_ABS` `ABS_X` and `ABS_Y`: 8.2 to 10.x
+    /// with `wheel-axis` on (the default; `virtio_tablet_config_v2`), and
+    /// 11.0 onward, which dropped the property (`virtio_tablet_config`).
     fn qemu_tablet_bits() -> [Vec<u8>; 3] {
         let mut key = vec![0u8; 0x151 / 8 + 1];
         for code in [0x110, 0x111, 0x112, 0x113, 0x114, 0x14a, 0x150, 0x151] {
@@ -601,9 +618,32 @@ mod tests {
     #[test]
     fn a_frame_holds_each_code_once_and_a_sync() {
         let bits = qemu_tablet_bits();
-        assert_eq!(frame_bound(bits.iter().map(Vec::as_slice)), QEMU_FRAME);
+        let typed = [(EV_KEY, &bits[0][..]), (EV_REL, &bits[1][..]), (EV_ABS, &bits[2][..])];
+        assert_eq!(frame_bound(typed), QEMU_FRAME);
         assert_eq!(frame_bound([]), 1, "nothing but the sync");
-        assert_eq!(frame_bound([&[0xffu8, 0x01][..], &[][..]]), 10);
+        assert_eq!(frame_bound([(EV_KEY, &[0xffu8, 0x01][..]), (EV_REL, &[][..])]), 10);
+    }
+
+    #[test]
+    fn only_the_types_a_device_sends_count() {
+        // EV_MSC (4) and EV_SW (5) are sent in frames; EV_LED (0x11),
+        // EV_SND (0x12), EV_REP (0x14) and EV_FF (0x15) are output to the
+        // device; EV_SYN (0) is the sync, counted once.
+        let one: &[u8] = &[0b1];
+        assert_eq!(frame_bound([(0x04, one), (0x05, one)]), 3);
+        assert_eq!(frame_bound([(0x00, one), (0x11, one), (0x12, one), (0x14, one), (0x15, one)]), 1);
+    }
+
+    #[test]
+    fn a_frame_too_big_for_the_ring_counts_every_batch() {
+        // A bound of the ring's size or more: any batch that read anything
+        // counts (overruns can't be told apart); an empty one never does.
+        for frame in [32, 33, 1000] {
+            assert!(!may_have_lost_frames(0, 32, frame));
+            assert!(may_have_lost_frames(1, 32, frame));
+        }
+        assert!(!may_have_lost_frames(1, 32, 31), "31 fits with 1 used");
+        assert!(may_have_lost_frames(2, 32, 31));
     }
 
     #[test]
@@ -697,12 +737,20 @@ mod tests {
         }
     }
 
+    /// What [`model`] found.
+    struct Outcome {
+        /// The first batch that ended with frames dropped and wasn't
+        /// counted: (frames dropped, events in the batch).
+        uncounted: Option<(u64, u64)>,
+        /// Frames sent and dropped in all (up to that batch's run).
+        sent: u64,
+        dropped: u64,
+    }
+
     /// 200 runs of bursts and pauses with frames of the sizes `sizes`
     /// (drawn with equal odds), on `posted` buffers, the thread counting
-    /// with a ring of 32 and frames of `frame`: the first batch that ended
-    /// with frames dropped and wasn't counted (frames, events), and the
-    /// frames sent and dropped in all.
-    fn model(sizes: &[u64], posted: u64, frame: u64) -> (Option<(u64, u64)>, u64, u64) {
+    /// with a ring of 32 and frames of `frame`.
+    fn model(sizes: &[u64], posted: u64, frame: u64) -> Outcome {
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);
         let (mut sent, mut dropped) = (0, 0);
         for _ in 0..200 {
@@ -735,33 +783,30 @@ mod tests {
             for _ in 0..3 * posted {
                 r.thread_steps();
             }
+            (sent, dropped) = (sent + r.sent, dropped + r.dropped);
             if r.uncounted.is_some() {
-                return (r.uncounted, sent, dropped);
+                return Outcome { uncounted: r.uncounted, sent, dropped };
             }
             assert_eq!(r.lost, 0, "frames dropped after the last batch");
-            (sent, dropped) = (sent + r.sent, dropped + r.dropped);
         }
-        (None, sent, dropped)
+        Outcome { uncounted: None, sent, dropped }
     }
 
     #[test]
     fn no_dropped_frame_goes_uncounted() {
-        // Every frame the device drops lands in a batch counted as an
-        // overrun (the first batch to end after the drop): when it was
-        // dropped, fewer than 12 buffers were free, so more than 20 of the
-        // 32 were filled or held, and the thread pops all of them before
-        // its batch can end. Frames of every size QEMU's tablet can send,
-        // from a lone sync to all 12 events: a click is 2, a move 3, one
-        // QMP event with a button and both axes 4, two buttons and the
-        // axes 5.
-        let sizes: [u64; 11] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-        let (uncounted, sent, dropped) = model(&sizes, 32, QEMU_FRAME);
-        assert_eq!(uncounted, None, "(frames dropped, events in the batch)");
+        // Every frame the device drops is counted by the first batch to
+        // end after the drop (see `may_have_lost_frames`). Frames of every
+        // size QEMU's tablet can send with each code once, from 2 to all
+        // 12 events: a press or release is 2, a move 3, one QMP event with
+        // a button and both axes 4, two buttons and the axes 5.
+        let sizes: Vec<u64> = (2..=QEMU_FRAME).collect();
+        let all = model(&sizes, 32, QEMU_FRAME);
+        assert_eq!(all.uncounted, None, "(frames dropped, events in the batch)");
         // The runs dropped frames and delivered them (the model isn't
         // vacuous).
-        assert!(sent > 10_000 && dropped > 10_000, "sent {sent}, dropped {dropped}");
-        // Moves and clicks alone, as the burst scenario sends.
-        assert_eq!(model(&[2, 3], 32, QEMU_FRAME).0, None);
+        assert!(all.sent > 10_000 && all.dropped > 10_000, "sent {}, dropped {}", all.sent, all.dropped);
+        // The burst scenario's frames: moves (3), and 4 buttons with a move (7).
+        assert_eq!(model(&[3, 7], 32, QEMU_FRAME).uncounted, None);
     }
 
     #[test]
@@ -770,12 +815,14 @@ mod tests {
         // buffers in use than the bound counts on: it goes uncounted.
         let mut sizes: Vec<u64> = (2..=QEMU_FRAME).collect();
         sizes.push(QEMU_FRAME + 1);
-        assert!(model(&sizes, 32, QEMU_FRAME).0.is_some());
+        assert!(model(&sizes, 32, QEMU_FRAME).uncounted.is_some());
         // So can a 4-event frame when only moves were counted on (3), as
         // before #124's review.
-        assert!(model(&[3, 4], 32, 3).0.is_some());
+        assert!(model(&[3, 4], 32, 3).uncounted.is_some());
+        // And a 7-event frame (the burst scenario's) when 3 was counted on.
+        assert!(model(&[7], 32, 3).uncounted.is_some());
         // A buffer lost to the ring (a re-post that failed) leaves 31
         // posted while the thread counts on 32.
-        assert!(model(&[2, 3, QEMU_FRAME], 31, QEMU_FRAME).0.is_some());
+        assert!(model(&[2, 3, QEMU_FRAME], 31, QEMU_FRAME).uncounted.is_some());
     }
 }

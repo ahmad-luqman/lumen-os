@@ -22,7 +22,7 @@ tests = [
 ]
 
 [[feature]]
-name = "A serial command's output as the scenarios read it (`lumen_harness.shell.run`): the log's lines (`[seconds.micros] LEVEL tag: message`, `lumen_harness.klog`) taken out and kept wherever one lands; checked against the kernel inside the typed line's echo, between two output writes and after the output before the prompt (debug lines made to land there), and on recorded text (#124's serial output) for all of them; a WARN or ERROR among them fails the run unless allowed (host-tested); `dmesg`'s read with them kept (#124)"
+name = "A serial command's output as the scenarios read it (`lumen_harness.shell.run`): the log's lines (`[seconds.micros] LEVEL tag: message`, `lumen_harness.klog`) taken out and kept wherever one lands, from the prompt before the echo on; checked against the kernel inside the typed line's echo, between two output writes and after the output before the prompt (debug lines made to land there), on handcrafted text for all three positions and between the prompt and the echo, and on #124's recorded output for the position after the output; a WARN or ERROR among them fails the run unless allowed (host-tested); `dmesg`'s read with its live lines dropped and checked (#124)"
 milestone = "M3"
 tests = [
     "harness:test_shell_run::*",

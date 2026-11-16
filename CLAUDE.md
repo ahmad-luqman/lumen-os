@@ -198,9 +198,12 @@ own PR that updates that doc first.
   in bands, and Game of Life with its patterns (host-tested).
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
 - `crates/lumen-input`: pointer input: evdev events into whole-frame
-  pointer states, axes scaled to the screen (`Tablet`, `AbsAxis`), and the
-  arrow sprite with its save-under (`Cursor`, over a `Surface`)
-  (host-tested, incl. a randomized model of drawing around it).
+  pointer states, axes scaled to the screen (`Tablet`, `AbsAxis`), a
+  frame's most events from the device's `EV_BITS` (`frame_bound`) and
+  whether a batch may have lost frames (`may_have_lost_frames`, the one
+  statement of what overruns guarantee; a model of QEMU's ring checks
+  it), and the arrow sprite with its save-under (`Cursor`, over a
+  `Surface`) (host-tested, incl. a randomized model of drawing around it).
 - `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, the
   page-table format and mapper (host-tested, incl. a model comparison), the
   window tokens that confine `paging::map`, and the kernel-stack layout and

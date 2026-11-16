@@ -76,11 +76,11 @@ tests = [
 ]
 
 [[feature]]
-name = "Mouse overruns and failure: 300 moves sent unpaced lose frames QEMU drops when the 32-buffer ring is full (no SYN_DROPPED), and `mouse` then counts at least one overrun (batches that may have lost frames: frames hold at most one event per code the device advertises and the sync, 12 on QEMU's tablet as the boot line says, so 21 of 32 events or more), warned about once (and only with an overrun), none ignored or dropped; a later clean frame isn't stale; the frame bound from EV_BITS and the threshold, and that every frame a model of QEMU's ring drops (frames of 2 to 12 events) lands in a counted batch, while a frame one bigger or a buffer lost to the ring can go uncounted (host-tested); a failed tablet's `mouse` header gives every count and why, its row the last position with no pointer, stale and the reason (ktest on a built state: QEMU can't make the device fail)"
+name = "Mouse overruns and failure: 300 frames of 3 events (moves) and of 7 (4 buttons and a move) sent unpaced while the guest's CPU is busy lose frames QEMU drops when the 32-buffer ring is full (no SYN_DROPPED; as many as it traced), and `mouse` then counts an overrun, warned about once (and only with an overrun), none ignored or dropped; a later clean frame isn't stale; frames hold one event per code the device advertises and the sync (12 on QEMU's tablet, as the boot line says), so a batch of 21 or more of 32 counts, which the 7-event frames tell from moves' 3; the bound from EV_BITS (frame types only), the cap at the ring, and what counting guarantees (lumen_input::may_have_lost_frames, checked by a model of QEMU's ring with its preconditions) are host-tested; a failed tablet's `mouse` header gives every count and why, its row the last position with no pointer, stale and the reason (ktest on a built state: QEMU can't make the device fail)"
 milestone = "M3"
 tests = [
     "cargo:lumen-input",
-    "scenario:test_input::test_a_burst_of_moves_counts_overruns",
+    "scenario:test_input::test_a_burst_of_moves_counts_overruns[*]",
     "ktest:lumen_kernel::shell::sysinfo::mouse_shows_a_failed_tablet_and_its_counts",
     "scenario:test_ktest::test_in_kernel_tests_pass",
 ]
