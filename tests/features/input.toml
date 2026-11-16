@@ -76,11 +76,17 @@ tests = [
 ]
 
 [[feature]]
-name = "Mouse overruns and failure: 300 moves, and 7-event frames (4 buttons and a move) until QEMU traces the first drop (at most 300), sent unpaced while the guest's CPU is busy, lose frames QEMU drops when the 32-buffer ring is full (no SYN_DROPPED; as many as it traced), and `mouse` then counts an overrun, warned about once (and only with an overrun), none ignored or dropped; a later clean frame isn't stale; frames hold one event per code the device advertises and the sync (12 on QEMU's tablet, as the boot line says), so a batch of 21 or more of 32 counts, which the 7-event frames tell from moves' 3; the bound from EV_BITS (frame types only), a bound of the ring's size or more (every non-empty batch counts, an empty one never), and what counting guarantees (lumen_input::may_have_lost_frames, checked by a model of QEMU's ring with its preconditions) are host-tested; a failed tablet's `mouse` header gives every count and why, its row the last position with no pointer, stale and the reason (ktest on a built state: QEMU can't make the device fail)"
+name = "Mouse overruns and failure: with the `mouse` thread held (`mouse hold`, shown in `mouse`'s header and gone after `mouse release`, reading nothing until then; a hold needs a working tablet, one no thread answers is taken back (`NotParked`, logged once as an ERROR) or ends as soon as the tablet fails meanwhile (`Failed`), a release before the park fails it (`Released`), a release and a hold back to back read nothing between, and a release logs only a hold it ends (ktests on a made-up tablet); the header says `, held`, `, holding` until the thread parks, or nothing (ktest); hold and release are logged at INFO; `mouse` takes only `hold` or `release`), a burst of moves, or of 7-event frames (4 buttons and a move), fills the 32-buffer ring: QEMU keeps the frames that fit (10 moves, 4 with buttons) and drops each later one, traced at its send (no SYN_DROPPED), and released, the thread reads exactly the frames that fit in one batch, every event used, none ignored or dropped, and `mouse` counts one overrun, the warning naming that batch's events and the hold (a second held overflow counts a second, not warned: once per boot), the state stale until a later clean frame; frames hold one event per code the device advertises and the sync (12 on QEMU's tablet, as the boot line says), so a batch of 21 or more of 32 counts, which the 7-event frames tell from moves' 3; the bound from EV_BITS (frame types only), a bound of the ring's size or more (every non-empty batch counts, an empty one never), and what counting guarantees (lumen_input::may_have_lost_frames, checked by a model of QEMU's ring with its preconditions) are host-tested; a failed tablet's `mouse` header gives every count and why, its row the last position with no pointer, stale and the reason (ktest on a built state: QEMU can't make the device fail)"
 milestone = "M3"
 tests = [
     "cargo:lumen-input",
     "scenario:test_input::test_a_burst_of_moves_counts_overruns[*]",
+    "scenario:test_input::test_mouse_hold_needs_a_tablet_and_takes_one_word",
+    "ktest:lumen_kernel::mouse::a_hold_needs_a_working_tablet",
+    "ktest:lumen_kernel::mouse::a_hold_that_no_thread_answers_is_taken_back",
+    "ktest:lumen_kernel::mouse::a_release_and_a_hold_back_to_back_read_nothing_between",
+    "ktest:lumen_kernel::mouse::a_release_before_the_park_fails_the_hold",
+    "ktest:lumen_kernel::mouse::a_release_logs_only_a_hold_it_ends",
     "ktest:lumen_kernel::shell::sysinfo::mouse_shows_a_failed_tablet_and_its_counts",
     "scenario:test_ktest::test_in_kernel_tests_pass",
 ]

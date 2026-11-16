@@ -164,9 +164,9 @@ pub static COMMANDS: Table<Run> = Table(&[
     },
     Command {
         name: "mouse",
-        args: &[],
-        usage: "",
-        about: "the tablet: where the pointer is, the buttons held, the wheels",
+        args: &[&["hold", "release"]],
+        usage: "[hold|release]",
+        about: "the tablet: where the pointer is, the buttons held, the wheels (hold: stop reading it until release)",
         run: sysinfo::mouse,
     },
     Command {

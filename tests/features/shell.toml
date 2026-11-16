@@ -113,7 +113,7 @@ tests = [
     "ktest:lumen_kernel::shell::pipe::a_command_s_usage_and_errors_reach_the_console_not_the_pipeline",
     "ktest:lumen_kernel::shell::pipe::too_much_output_stops_the_pipeline",
     "ktest:lumen_kernel::shell::pipe::pipeline_mistakes_are_one_line",
-    "ktest:lumen_kernel::shell::pipe::records_come_from_commands_that_take_no_arguments",
+    "ktest:lumen_kernel::shell::pipe::records_come_from_commands_given_no_arguments",
     "ktest:lumen_kernel::shell::pipe::a_wrong_filter_stops_the_pipeline_before_the_command_runs",
     "ktest:lumen_kernel::shell::pipe::a_full_pipeline_stops_a_command_polling_for_a_key",
 ]

@@ -1129,7 +1129,10 @@ impl StatusHandle {
 /// at the device, then [`wait_after`](Self::wait_after) that count: a ring
 /// in between ends the wait at once, so none is lost. The handler rings it
 /// for anything the device signals (a used buffer on any queue, or a
-/// configuration change: one vector per device).
+/// configuration change: one vector per device). A driver may also ring
+/// its own bell to wake its thread (`mouse::hold` does, so the thread
+/// parks); the missed-interrupt rule ([`MissedRule`]) counts such a ring as
+/// an interrupt that came.
 pub struct Doorbell {
     rings: AtomicU64,
     queue: WaitQueue,
