@@ -316,6 +316,13 @@ enum Refusal {
 }
 
 impl Bound {
+    /// Whether a sound is under way: playing, or handed to [`play`] and
+    /// not yet taken by the thread (`sound` says `playing` for both: the
+    /// command that started it has returned by then).
+    fn busy(&self) -> bool {
+        self.next.is_some() || matches!(self.activity, Activity::Playing { .. })
+    }
+
     /// Whether sounds can play: not if the device failed. A thread stuck
     /// (playing with no answer for [`STUCK_NS`]) or an idle device whose
     /// status says it is broken is given up here, for good.
@@ -986,7 +993,7 @@ pub fn table() -> pipe::Table {
     let now = crate::time::now_ns();
     let mut p = PLAYER.lock();
     let checked = p.check(now);
-    let seen = p.bound.as_ref().map(|b| (b.counts, b.next.is_some() || matches!(b.activity, Activity::Playing { .. })));
+    let seen = p.bound.as_ref().map(|b| (b.counts, b.busy()));
     drop(p);
     let row = seen.map(|(counts, playing)| Row {
         state: match checked.map_err(refusal) {

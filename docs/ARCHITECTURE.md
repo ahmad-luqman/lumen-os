@@ -115,22 +115,36 @@ tests (for example `lumen-elf`, the symbol-table reader).
    ktested, not a crash during that ktest).
 
    Reading is by interrupt once the shells start (`serial_in`, #120; not
-   in the test kernel, whose loopback ktest reads the UART itself): ISA
-   IRQ 4 is routed like the keyboard's (section 6, "Keyboard"), the UART
-   interrupts when received bytes wait (OUT2 set, the received-data
-   interrupt enabled; with the FIFO's trigger level 14 that is at 14 bytes
-   or after a four-character timeout, a few interrupts per typed line),
-   and the handler moves the waiting
-   bytes into a 256-byte queue (`lumen_queue::ByteQueue`) as far as it has
-   room, waking the serial shell. Bytes past its room stay in the UART
-   (QEMU holds back the rest), so none are dropped; the reader takes the
-   queue's bytes, then the UART's (their interrupt's edge has passed), with
-   interrupts off on the boot CPU, the queue's producer. The serial shell
-   blocks until either has a byte, so an idle boot CPU halts. (It used to
-   poll, keeping the CPU 100% busy; under TCG on a loaded host such a vCPU
-   was put aside for longer than the sound driver's 160 ms queue.)
-   Without a route the shell polls, yielding (not tested). The crash
-   reporter's loopback reset clears OUT2 again: nothing reads input then.
+   in the test kernel, whose loopback ktest reads the UART itself). The
+   UART has one reader, `serial_in` (plus that ktest in the test kernel):
+   received bytes keep their order only while that holds. ISA IRQ 4 is
+   routed like the keyboard's (section 6, "Keyboard"); a level-triggered
+   route (a MADT override) isn't used (a warning; the shell polls). The
+   UART interrupts when received bytes wait (OUT2 set, the received-data
+   interrupt enabled; with the FIFO's trigger level 14, at 14 bytes or
+   after a four-character timeout: a few interrupts for a line sent at
+   once), and the handler moves the waiting bytes into a 256-byte queue
+   (`lumen_queue::ByteQueue`) as far as it has room, waking the serial
+   shell. Bytes past its room stay in the UART; under QEMU, which stops
+   feeding a full FIFO, none are lost, while a real UART overruns and
+   drops the next ones unseen. The interrupt is an edge, and no new one
+   comes until the reader lowers the line by taking the waiting bytes, so
+   the reader takes the queue's bytes, then the UART's, with interrupts
+   off on the boot CPU (the queue's producer), and the serial shell blocks
+   only while neither holds a byte (`lumen_uart::read_next` and
+   `available`, host-tested against a model whose handler runs only on an
+   edge). The block has a 100 ms deadline as a safety net: input whose
+   interrupt never comes is still read, and if that happens three times
+   while IRQ 4 has never come, a warning says to check its routing. An
+   idle boot CPU halts between. Without the interrupt (no route, a
+   level-triggered one, or no scheduler running on the boot CPU yet) the
+   shell polls, yielding; without a UART it blocks for good (neither
+   tested). The serial shell used to poll, keeping the boot CPU 100%
+   busy; under TCG on a loaded host such a vCPU was measured going
+   without interrupts for longer than the sound driver's 160 ms queue (the
+   host descheduling it is the inferred cause). The crash reporter's
+   loopback reset clears OUT2 too: harmless, as nothing reads input after
+   a crash report.
 5. Logger (level from `lumen.log=`), Limine responses checked, the symbol table
    located in our own ELF, a memory-map summary, the frame allocator
    (`INFO  mem: frames: N usable, M reserved`), the kernel's own page tables
@@ -1313,8 +1327,8 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
     leaves it idle and checks both), and the threads homed there
     (`sched::threads`, a registry of weak references); then CPUs stuck
     starting, and in the header those halted past `MAX_CPUS` (neither
-    tested). (The boot CPU read nearly 100% busy even when idle until the
-    serial shell stopped polling serial, #120.)
+    tested). An idle boot CPU reads nearly 100% busy only where the serial
+    shell polls serial: without COM1's interrupt (`serial_in`, #120).
   - `mem`: frames used of those the allocator owns, the heap's counters,
     and the kernel stacks registered, by kind (sizes without their guard
     pages).
@@ -2641,6 +2655,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/virtio.rs    the adapter for virtio-drivers: the Hal (DMA runs, bounce buffers), transport, VirtioTransport
   src/power.rs     reboot (0xCF9, 8042, triple fault) and ACPI S5 power-off
   src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs, routing ISA IRQs
+  src/serial_in.rs COM1's input by interrupt (IRQ 4) into the queue the serial shell blocks on
   src/keyboard.rs  the PS/2 keyboard: 8042 init, IRQ 1, decoding (pc-keyboard), lumen.keymap
   src/time.rs      TSC and local APIC timer calibration, the boot origin, now_ns, sleep, ticks
   src/smp.rs       starting the other CPUs, run_on

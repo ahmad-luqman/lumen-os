@@ -1,7 +1,15 @@
 """The serial port: COM1 found at boot or not (`lumen-uart`'s probe), and
-its input by interrupt (#120). The FIFO bursts, the probe and the receive
-interrupt's setup and drain are checked by the ktests in
-`arch::x86_64::serial` and by `cargo test -p lumen-uart`.
+its input by interrupt (#120).
+
+The FIFO bursts and the probe are checked by the ktests in
+`arch::x86_64::serial` and by `cargo test -p lumen-uart`. The input path
+is checked here (the shell blocks; IRQ 4 counts typed lines) and by
+`cargo test -p lumen-uart` only: the receive interrupt's setup (OUT2, the
+FIFO's trigger level 14) and the reader's policy against a model whose
+handler runs only on an edge, bytes a full queue left in the UART
+included. Under QEMU that path doesn't show (it raises IRQ 4 again
+whenever bytes wait), and `serial_in::init`'s drain of bytes that came
+before the unmask isn't tested at all.
 """
 
 import re
@@ -9,8 +17,8 @@ import time
 
 from lumen_harness.image import assert_matches_golden, compare, crop, update_requested
 from lumen_harness.qemu import EXIT_CRASH, ExpectTimeout, Machine
-from lumen_harness.screen import PROMPT
 from PIL import Image
+from test_pci import run, shell
 
 # The boot warning's row on the screen: the third log line, after the
 # terminal's and the framebuffer's (the screen shows no timestamps). A new
@@ -73,25 +81,16 @@ def test_boots_without_a_uart_and_warns_on_screen_golden(boot, artifacts, golden
     assert "boot:" not in m.output and "lumen>" not in m.output, m.output
 
 
-def _run(m: Machine, line: str) -> str:
-    """Run `line` in the serial shell: what it printed between its echo and
-    the next prompt."""
-    m.send_line(line)
-    echo = m.expect(re.escape(line) + r"\n", 10)
-    end = m.expect(PROMPT, 10)
-    return m.output[echo.end() : end.start()]
-
-
 def _thread_ticks(m: Machine) -> dict[str, int]:
     """`threads`' tick count per thread name (one CPU: one `idle`)."""
-    rows = re.findall(r"^  (\S+)\s+\d+\s+\d+\s+\w+\s+(\d+)$", _run(m, "threads"), re.MULTILINE)
+    rows = re.findall(r"^  (\S+)\s+\d+\s+\d+\s+\w+\s+(\d+)$", run(m, "threads"), re.MULTILINE)
     return {name: int(ticks) for name, ticks in rows}
 
 
 def _com1_interrupts(m: Machine) -> int:
     """`irqs`' count for COM1's input (ISA IRQ 4: GSI 4 on q35, no
     override), which must be routed and unmasked."""
-    out = _run(m, "irqs")
+    out = run(m, "irqs")
     row = re.search(
         r"^\s+4\s+0x54\s+Fixed\s+edge\s+high\s+0\s+unmasked\s+(\d+)$", out, re.MULTILINE
     )
@@ -100,20 +99,19 @@ def _com1_interrupts(m: Machine) -> int:
 
 
 def test_the_serial_shell_waits_for_input_by_interrupt(boot):
-    # (#120) The serial shell blocks for a key until IRQ 4 brings one,
-    # instead of polling: while it waits at the prompt the CPU halts, so
-    # over a second there the idle thread takes more ticks than the shell's
-    # own `main` thread. (Polling, `main` took every tick and `idle` none:
-    # the CPU was 100% busy, and under TCG so was a host CPU per guest.)
-    # Each typed line comes by interrupt.
-    m = boot("qemutest")
-    m.expect(r"INFO  shell: shells? on serial.*\n", BOOT_TIMEOUT)
-    m.expect(PROMPT, BOOT_TIMEOUT)
+    # (#120) The serial shell blocks for a key until IRQ 4 brings one (or
+    # its 100 ms safety-net deadline passes), instead of polling: over a
+    # second at the prompt the CPU halts, so the idle thread takes most of
+    # the ticks and more than the shell's own `main` thread. (Polling,
+    # `main` took every tick and `idle` none: the CPU was 100% busy, and
+    # under TCG so was a host CPU per guest.) Lines typed while the shell
+    # waits come by interrupt: GSI 4 unmasked and counting up.
+    m = shell(boot)
     first = _com1_interrupts(m)
     before = _thread_ticks(m)
     time.sleep(1)
     after = _thread_ticks(m)
     idle = after["idle"] - before["idle"]
     main = after["main"] - before["main"]
-    assert idle > main, (before, after)
+    assert idle >= 50 and idle > main, (before, after)
     assert _com1_interrupts(m) > first
