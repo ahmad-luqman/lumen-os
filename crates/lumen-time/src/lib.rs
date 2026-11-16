@@ -236,6 +236,13 @@ impl Window {
     pub fn tsc_hz(&self, reference_hz: u64) -> Option<u64> {
         frequency(self.tsc, self.reference, reference_hz)
     }
+
+    /// The other way round: the reference's frequency it gives against a
+    /// TSC counting at `tsc_hz` (the local APIC timer's calibration, where
+    /// the TSC is the known clock).
+    pub fn reference_hz(&self, tsc_hz: u64) -> Option<u64> {
+        frequency(self.reference, self.tsc, tsc_hz)
+    }
 }
 
 impl fmt::Display for Window {
@@ -594,6 +601,8 @@ mod tests {
         let w = Window { tsc: 29_000_000, reference: 1_000_000, polls: 3, start_gap: 4, end_gap: 5 };
         assert_eq!(w.to_string(), "29000000/1000000/3/4/5");
         assert_eq!(w.tsc_hz(100_000_000), Some(2_900_000_000));
+        assert_eq!(w.reference_hz(2_900_000_000), Some(100_000_000));
+        assert_eq!(Window { tsc: 0, ..w }.reference_hz(2_900_000_000), None, "an empty window gives none");
     }
 
     #[test]

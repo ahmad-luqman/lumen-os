@@ -191,10 +191,16 @@ pub fn error_status() -> u32 {
     read(ESR)
 }
 
-/// Run the timer once from `count`, masked (for calibration).
-pub fn timer_one_shot(count: u32) {
+/// Set the timer up to run once, masked (for calibration), without starting
+/// it: [`timer_start`] does, with one register write, so a calibration can
+/// read the TSC on both sides of just that write.
+pub fn timer_prepare_one_shot() {
     write(TIMER_DIVIDE, DIVIDE_BY_16);
     write(LVT_TIMER, LVT_MASKED);
+}
+
+/// Start the timer counting down from `count` (writing its initial count).
+pub fn timer_start(count: u32) {
     write(TIMER_INITIAL, count);
 }
 

@@ -58,8 +58,11 @@ static BOOT_TSC: AtomicU64 = AtomicU64::new(0);
 static HPET: SpinLock<Option<HpetCounter>> = SpinLock::new(None);
 /// The boot calibration (None until [`init`]).
 static BOOT_CALIBRATION: SpinLock<Option<Calibration>> = SpinLock::new(None);
+/// The local APIC timer's boot calibration (None until [`init`]).
+static BOOT_TIMER_CALIBRATION: SpinLock<Option<Calibration>> = SpinLock::new(None);
 
-/// A TSC calibration: the median of its windows' frequencies, the (steady)
+/// A calibration: the median of its windows' frequencies (the TSC's against a
+/// reference, or the local APIC timer's against the TSC), the (steady)
 /// windows in the order they were taken, and how many unsteady ones were set
 /// aside for others (and the last of those).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -259,19 +262,16 @@ pub fn boot_calibration() -> Option<Calibration> {
     *BOOT_CALIBRATION.lock()
 }
 
+/// The local APIC timer's boot calibration, with its windows (None before
+/// [`init`]).
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: a ktest
+pub fn boot_timer_calibration() -> Option<Calibration> {
+    *BOOT_TIMER_CALIBRATION.lock()
+}
+
 /// The HPET, if [`init`] calibrated the TSC against it.
 pub fn hpet() -> Option<HpetCounter> {
     *HPET.lock()
-}
-
-/// The median of [`WINDOWS`] samples taken by `window`; the first failure
-/// if one fails.
-fn median_of_windows(mut window: impl FnMut() -> Result<u64, CalError>) -> Result<u64, CalError> {
-    let mut samples = [0u64; WINDOWS];
-    for s in &mut samples {
-        *s = window()?;
-    }
-    Ok(lumen_time::median(&mut samples).expect("WINDOWS samples"))
 }
 
 /// A TSC calibration against a reference counting at `reference_hz`: the
@@ -355,19 +355,57 @@ pub fn measure(reference: Reference) -> Option<Result<Calibration, CalError>> {
     }
 }
 
-/// The local APIC timer's input frequency against the (calibrated) TSC.
-fn calibrate_lapic_timer(tsc: Clock) -> Result<u64, CalError> {
+/// The local APIC timer's input frequency against the (calibrated) TSC: the
+/// median of [`WINDOWS`] windows from [`timer_window`], kept with them.
+fn calibrate_lapic_timer(tsc: Clock) -> Result<Calibration, CalError> {
     let window = tsc.ticks(WINDOW_NS);
-    median_of_windows(|| {
-        apic::timer_one_shot(u32::MAX);
-        let t0 = arch::rdtsc();
-        while arch::rdtsc() - t0 < window {
-            core::hint::spin_loop();
+    let mut windows = [Window::default(); WINDOWS];
+    for w in &mut windows {
+        *w = timer_window(window, |_| {})?;
+    }
+    let mut hz = [0u64; WINDOWS];
+    for (h, w) in hz.iter_mut().zip(&windows) {
+        *h = w.reference_hz(tsc.hz()).ok_or(CalError::NoCount)?;
+    }
+    let hz = lumen_time::median(&mut hz).expect("WINDOWS samples");
+    Ok(Calibration { hz, windows, retaken: 0, last_retaken: None })
+}
+
+/// One window of the local APIC timer against the TSC, at least `window` TSC
+/// ticks long: the timer started (one-shot, masked, from `u32::MAX`) between
+/// two TSC reads, and its count read between two more, as [`hpet_window`]
+/// reads the HPET. So `reference` is the timer's ticks, and `start_gap` and
+/// `end_gap` are how far off each end can be (a vCPU paused between the
+/// timer's register access and the TSC read next to it widens them). `pause`
+/// is called at the [`Pause`] points (a no-op but in tests). Call with
+/// interrupts off. A count of 0 (it ran out, or reads as 0) says nothing.
+fn timer_window(window: u64, mut pause: impl FnMut(Pause)) -> Result<Window, CalError> {
+    apic::timer_prepare_one_shot();
+    let pre = arch::rdtsc();
+    pause(Pause::StartBeforeRead);
+    apic::timer_start(u32::MAX);
+    pause(Pause::StartAfterRead);
+    let t0 = arch::rdtsc();
+    let before = loop {
+        let now = arch::rdtsc();
+        if now.wrapping_sub(t0) >= window {
+            break now;
         }
-        let (current, t1) = (apic::timer_current(), arch::rdtsc());
-        // 0: it ran out (or reads as 0), so the count says nothing.
-        let counted = u64::from(u32::MAX - current);
-        lumen_time::frequency(counted, t1 - t0, tsc.hz()).filter(|_| current != 0).ok_or(CalError::NoCount)
+        core::hint::spin_loop();
+    };
+    pause(Pause::EndBeforeRead);
+    let current = apic::timer_current();
+    pause(Pause::EndAfterRead);
+    let t = arch::rdtsc();
+    if current == 0 {
+        return Err(CalError::NoCount);
+    }
+    Ok(Window {
+        tsc: t - t0,
+        reference: u64::from(u32::MAX - current),
+        polls: 1,
+        start_gap: t0 - pre,
+        end_gap: t - before,
     })
 }
 
@@ -421,8 +459,10 @@ pub fn init() {
     }
 
     let tsc = Clock::new(hz).expect("calibrated");
-    let timer_hz = calibrate_lapic_timer(tsc)
+    let timer_cal = calibrate_lapic_timer(tsc)
         .unwrap_or_else(|e| panic!("can't calibrate the local APIC timer against the TSC: {e}"));
+    *BOOT_TIMER_CALIBRATION.lock() = Some(timer_cal);
+    let timer_hz = timer_cal.hz;
     let count = lumen_time::periodic_count(timer_hz, TICK_HZ)
         .unwrap_or_else(|| panic!("the local APIC timer, at {}, can't tick at {}", Hz(timer_hz), Hz(TICK_HZ)));
     LAPIC_TIMER_HZ.store(timer_hz, Ordering::Relaxed);
@@ -1271,6 +1311,13 @@ crate::ktest!(
         kassert_eq!(error_lvt & 0x1_00ff, u32::from(idt::LAPIC_ERROR)); // unmasked
         let timer = lapic_timer().ok_or("timer not calibrated")?;
         kassert_eq!(Some(initial), lumen_time::periodic_count(timer.hz(), 1000));
+        // The boot calibration's windows (tsc/reference/polls/start_gap/
+        // end_gap, the reference being the timer), and the rate each gave:
+        // a calibration that was off shows which windows moved it (#129).
+        let boot = boot_timer_calibration().ok_or("no timer calibration")?;
+        let tsc_hz = tsc().ok_or("TSC not calibrated")?.hz();
+        let rates = boot.windows.map(|w| w.reference_hz(tsc_hz).unwrap_or(0));
+        crate::ktest::diag(format_args!("timer boot calibration {boot}; window rates {rates:?} Hz"));
         let hpet = hpet().ok_or("no HPET")?;
         // 750 µs windows (most cross a reload, so that path counts), under
         // the 1 ms period. A window over TIMER_WINDOW_MAX_NS, midpoint to
