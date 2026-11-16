@@ -23,8 +23,8 @@ import time
 
 from lumen_harness.image import assert_matches_golden, compare, crop, update_requested
 from lumen_harness.qemu import EXIT_CRASH, ExpectTimeout, Machine
+from lumen_harness.shell import PROMPT, run
 from PIL import Image
-from test_pci import run, shell
 
 # The boot warning's row on the screen: the third log line, after the
 # terminal's and the framebuffer's (the screen shows no timestamps). A new
@@ -87,16 +87,30 @@ def test_boots_without_a_uart_and_warns_on_screen_golden(boot, artifacts, golden
     assert "boot:" not in m.output and "lumen>" not in m.output, m.output
 
 
-def _thread_ticks(m: Machine) -> dict[str, int]:
+SHELLS = r"INFO  shell: shells? on serial.*; type 'help'\n"
+# The safety net's warning (allowed where a test expects it: `run` fails on
+# any other WARN line).
+MISSED_WARNING = "WARN  serial: COM1 input found without its interrupt"
+
+
+def shell(boot, **kwargs) -> Machine:
+    m = boot("qemutest", **kwargs)
+    m.expect(SHELLS, 60)
+    m.expect(PROMPT, 60)
+    return m
+
+
+def _thread_ticks(m: Machine, allow: str | None = None) -> dict[str, int]:
     """`threads`' tick count per thread name (one CPU: one `idle`)."""
-    rows = re.findall(r"^  (\S+)\s+\d+\s+\d+\s+\w+\s+(\d+)$", run(m, "threads"), re.MULTILINE)
+    out = run(m, "threads", allow=allow)
+    rows = re.findall(r"^  (\S+)\s+\d+\s+\d+\s+\w+\s+(\d+)$", out, re.MULTILINE)
     return {name: int(ticks) for name, ticks in rows}
 
 
-def _com1_interrupts(m: Machine) -> int:
+def _com1_interrupts(m: Machine, allow: str | None = None) -> int:
     """`irqs`' count for COM1's input (ISA IRQ 4: GSI 4 on q35, no
     override), which must be routed and unmasked."""
-    out = run(m, "irqs")
+    out = run(m, "irqs", allow=allow)
     row = re.search(
         r"^\s+4\s+0x54\s+Fixed\s+edge\s+high\s+0\s+unmasked\s+(\d+)$", out, re.MULTILINE
     )
@@ -108,23 +122,22 @@ SERIAL = re.compile(
     r"serial: COM1 input by interrupt \(ISA IRQ 4, GSI 4, vector 0x54\): (\d+) interrupts brought "
     r"input; waits woken by one: (\d+), input found at the deadline: (\d+)\n"
 )
-MISSED_WARNING = "WARN  serial: COM1 input found without its interrupt"
 
 
-def _serial(m: Machine) -> tuple[int, int, int]:
+def _serial(m: Machine, allow: str | None = None) -> tuple[int, int, int]:
     """`serial`'s counts: interrupts that brought input, waits they woke,
     and waits that found input at their deadline."""
-    out = run(m, "serial")
+    out = run(m, "serial", allow=allow)
     found = SERIAL.fullmatch(out)
     assert found, out
     return int(found[1]), int(found[2]), int(found[3])
 
 
-def _idle_second(m: Machine) -> tuple[int, int]:
+def _idle_second(m: Machine, allow: str | None = None) -> tuple[int, int]:
     """The idle and `main` threads' ticks over a second at the prompt."""
-    before = _thread_ticks(m)
+    before = _thread_ticks(m, allow)
     time.sleep(1)
-    after = _thread_ticks(m)
+    after = _thread_ticks(m, allow)
     return after["idle"] - before["idle"], after["main"] - before["main"]
 
 
@@ -163,7 +176,7 @@ def test_the_safety_net_reads_input_when_irq_4_never_comes(boot):
     # warning (once) says to check IRQ 4's routing. The CPU still idles.
     m = shell(boot, com1_irq=3)
     for i in range(10):
-        assert run(m, f"echo line {i}") == f"line {i}\n"
+        assert run(m, f"echo line {i}", allow=MISSED_WARNING) == f"line {i}\n"
         if MISSED_WARNING in m.output:
             break
     assert m.output.count(MISSED_WARNING) == 1, m.output
@@ -172,10 +185,10 @@ def test_the_safety_net_reads_input_when_irq_4_never_comes(boot):
         m.output,
     )
     for i in range(3):
-        assert run(m, f"echo more {i}") == f"more {i}\n"
+        assert run(m, f"echo more {i}", allow=MISSED_WARNING) == f"more {i}\n"
     assert m.output.count(MISSED_WARNING) == 1, m.output
-    assert _com1_interrupts(m) == 0
-    brought, woken, at_deadline = _serial(m)
+    assert _com1_interrupts(m, MISSED_WARNING) == 0
+    brought, woken, at_deadline = _serial(m, MISSED_WARNING)
     assert (brought, woken) == (0, 0) and at_deadline >= 3, (brought, woken, at_deadline)
-    idle, main = _idle_second(m)
+    idle, main = _idle_second(m, MISSED_WARNING)
     assert idle >= 50 and idle > main, (idle, main)
