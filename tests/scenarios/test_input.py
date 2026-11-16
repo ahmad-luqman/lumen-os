@@ -422,9 +422,10 @@ def test_cursor_leaves_no_trail(boot, artifacts):
 # separates the tablet's bound (12: a batch of 21 events or more counts)
 # from moves' (3: 30 or more): the ring holds 4 of them (28 events), so a
 # batch that read a full ring and nothing more counts only by the bound.
-# 30 of them, sent within a few of the mouse thread's looks, make such
-# batches likely (a frame arriving while the thread reads makes a bigger
-# one): a kernel counting with 3 failed 9 of 10 runs, and 4 of 6 with 300.
+# They are sent until QEMU traces the first dropped one (its log is
+# flushed per line, before QMP answers), so the batch that reads the full
+# ring gets nothing more while it reads (a frame arriving then would make
+# a bigger batch, which 3 counts too).
 BURST_BUTTONS = ("left", "right", "middle", "side")
 
 
@@ -438,10 +439,10 @@ def burst_frame(i: int, frame: int, size: tuple[int, int]) -> dict:
     return args
 
 
-@pytest.mark.parametrize(("frame", "sent"), [(3, 300), (7, 30)], ids=["moves", "buttons"])
-def test_a_burst_of_moves_counts_overruns(boot, frame, sent):
-    # A burst (300 moves, or 30 frames with buttons) sent as fast as QMP
-    # takes it, while the serial shell's
+@pytest.mark.parametrize(("frame", "until_lost"), [(3, False), (7, True)], ids=["moves", "buttons"])
+def test_a_burst_of_moves_counts_overruns(boot, frame, until_lost):
+    # A burst (300 moves, or frames with buttons until the first is lost,
+    # at most 300) sent as fast as QMP takes it, while the serial shell's
     # thread spins (a rhai loop) on the guest's one CPU, so the mouse thread
     # reads the ring at most once a time slice (under KVM too): QEMU drops
     # whole frames that don't fit in the 32-buffer ring (traced as
@@ -459,8 +460,10 @@ def test_a_burst_of_moves_counts_overruns(boot, frame, sent):
     start = len(m.output)
     m.send_line(hog)
     wait_for_output(m, start, echo_pattern(hog))
-    for i in range(sent):
-        qmp.send_input(burst_frame(i, frame, size))
+    sent = 0
+    while sent < 300 and not (until_lost and "virtio_input_queue_full" in m.trace_log()):
+        qmp.send_input(burst_frame(sent, frame, size))
+        sent += 1
     m.send("\x03")
     assert read_output(m, hog, 30, allow=OVERRUN_WARN) == "rhai: stopped (Ctrl-C)\n"
     # Settled: the same counts twice, a little apart.
