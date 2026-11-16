@@ -3,8 +3,12 @@
 //! nanoseconds, the counts the PIT and the local APIC timer are programmed
 //! with, how times read in logs (`Stamp`, `Millis`), the rules a
 //! calibration window must meet to be trusted (`Window`, `steady_windows`),
-//! how a PIT channel's two readings become a window (`pit_window`), busy
-//! percentages and rates (`busy_percent`, `percent`, `per_second`), and the
+//! how a PIT channel's two readings become a window (`pit_window`), one
+//! clock's reading placed between two reads of another and retaken while too
+//! wide (`Bracketed`, `first_narrow`: the ktests' clock cross-checks), busy
+//! percentages and rates (`busy_percent`, `percent`, `per_second`), a
+//! bootloader's microseconds back as ticks (`ticks_at_usec`), Limine's boot
+//! times against the timeline's origin ([`handoff`]), and the
 //! CMOS RTC's registers as a date ([`rtc`]). All of it is integer math
 //! (the kernel has no floating point) in `u128` where products can
 //! overflow, so it holds for centuries of uptime (and then saturates).
@@ -13,6 +17,7 @@
 
 use core::fmt;
 
+pub mod handoff;
 pub mod rtc;
 
 pub const NS_PER_SEC: u64 = 1_000_000_000;
@@ -61,6 +66,128 @@ pub fn periodic_count(timer_hz: u64, rate: u64) -> Option<u32> {
 /// wrap.
 pub fn counter_delta(earlier: u64, later: u64, mask: u64) -> u64 {
     later.wrapping_sub(earlier) & mask
+}
+
+/// The midpoint of two readings of a counter `mask` wide, `earlier` then
+/// `later` (less than one wrap apart; rounded down): where a reading of
+/// another clock taken between them is placed.
+fn counter_midpoint(earlier: u64, later: u64, mask: u64) -> u64 {
+    earlier.wrapping_add(counter_delta(earlier, later, mask) / 2) & mask
+}
+
+/// A reading of one clock (`value`) taken between two reads of another (the
+/// bracket), placed at their midpoint: `at` and `width` are in the bracketing
+/// clock's units (its counter value, and the time between its two reads).
+/// Placed at `at`, the reading is off by at most half of `width`, rounded up.
+/// Anything between the two reads widens it: a host stalling the vCPU, a slow
+/// emulated read (under KVM each HPET read exits to QEMU), or the bracketing
+/// clock itself jumping, so a wide one is evidence of something wrong, not a
+/// reading to trust. (A [`Window`]'s `start_gap` and `end_gap` are the same
+/// widths, for a calibration's two ends.) Built by [`Bracketed::between`] or
+/// [`Bracketed::checked_between`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Bracketed<T> {
+    pub value: T,
+    pub at: u64,
+    pub width: u64,
+}
+
+/// A clock that doesn't wrap read going backwards across a bracket: `after`
+/// is before `before`. A clock bug, not a stall.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Backwards {
+    pub before: u64,
+    pub after: u64,
+}
+
+impl<T> Bracketed<T> {
+    /// `value`, read between `before` and `after`, two reads of a counter
+    /// `mask` wide (`u64::MAX` or `0xffff_ffff`) that may wrap once between
+    /// them.
+    pub fn between(before: u64, value: T, after: u64, mask: u64) -> Self {
+        Bracketed { value, at: counter_midpoint(before, after, mask), width: counter_delta(before, after, mask) }
+    }
+
+    /// `value`, read between `before` and `after`, two reads of a clock that
+    /// doesn't wrap (such as `now_ns`); [`Backwards`] if `after` is before
+    /// `before`.
+    pub fn checked_between(before: u64, value: T, after: u64) -> Result<Self, Backwards> {
+        if after < before {
+            return Err(Backwards { before, after });
+        }
+        Ok(Self::between(before, value, after, u64::MAX))
+    }
+}
+
+/// How [`first_narrow`] went: the first reading at most its limit wide
+/// ([`reading`](Self::reading)), and the widths of all the readings it took,
+/// in order (the wide ones too, so a stall stays visible).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NarrowReading<T, const N: usize> {
+    reading: Option<Bracketed<T>>,
+    widths: [u64; N],
+    taken: usize,
+}
+
+impl<T: Copy, const N: usize> NarrowReading<T, N> {
+    /// The first narrow reading; `None` if every one of the `N` taken was
+    /// wider than the limit.
+    pub fn reading(&self) -> Option<Bracketed<T>> {
+        self.reading
+    }
+
+    /// The widths of the readings taken, in order.
+    pub fn widths(&self) -> &[u64] {
+        &self.widths[..self.taken]
+    }
+
+    /// How many readings were taken again because the one before was too
+    /// wide: at most `N - 1`.
+    pub fn retries(&self) -> usize {
+        self.taken.saturating_sub(1)
+    }
+}
+
+/// Up to `N` readings from `take`, until one is at most `limit` wide (in the
+/// bracketing clock's units). An error from `take` (a clock going backwards)
+/// is returned at once: it is a bug to report, not a stall to retake.
+pub fn first_narrow<T, E, const N: usize>(
+    limit: u64,
+    mut take: impl FnMut() -> Result<Bracketed<T>, E>,
+) -> Result<NarrowReading<T, N>, E> {
+    let mut out = NarrowReading { reading: None, widths: [0; N], taken: 0 };
+    while out.taken < N {
+        let r = take()?;
+        out.widths[out.taken] = r.width;
+        out.taken += 1;
+        if r.width <= limit {
+            out.reading = Some(r);
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// How far off a placement test's try can be, in the bracketing clock's
+/// units: half the reference reading's width, plus half of what a stall added
+/// to the paused reading's (anything over the `2 * pause` its two pauses
+/// make, which can move the read that far off its midpoint), rounded up.
+/// Saturates.
+pub fn placement_uncertainty(reference_width: u64, paused_width: u64, pause: u64) -> u64 {
+    let stalled = paused_width.saturating_sub(pause.saturating_mul(2));
+    reference_width.saturating_add(stalled).div_ceil(2)
+}
+
+/// Whether a placement test's try is judged: its uncertainty
+/// ([`placement_uncertainty`]) and the reference's width are each at most a
+/// quarter of the pause. Then a right placement is at most `pause / 4` off,
+/// and one at either end of its bracket (or outside it) at least
+/// `3 * pause / 4` even with the reference misplaced the same way, either
+/// side of the `pause / 2` the tests allow.
+pub fn placement_is_judged(reference_width: u64, paused_width: u64, pause: u64) -> bool {
+    reference_width.saturating_mul(4) <= pause
+        && placement_uncertainty(reference_width, paused_width, pause).saturating_mul(4) <= pause
 }
 
 /// Ticks a down-counter that reloads to `reload` at 0 counted from reading
@@ -123,7 +250,9 @@ impl fmt::Display for Window {
 /// end is a reading of the reference between two TSC reads, paused before or
 /// after the reference is read (either widens that end's gap); `Started` and
 /// `Ended` are only the PIT's (the HPET's first and last readings are its
-/// start and end).
+/// start and end). The kernel's `now_ns`-against-HPET ktests pause at the
+/// same four reading points, in [`Bracketed`] readings of the HPET between
+/// two `now_ns` reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pause {
     /// After the PIT started counting, before its start reading. Harmless:
@@ -368,6 +497,19 @@ impl Clock {
         let ticks = (u128::from(ns) * u128::from(self.hz)).div_ceil(u128::from(NS_PER_SEC));
         u64::try_from(ticks).unwrap_or(u64::MAX)
     }
+}
+
+/// A counter reading a bootloader gave in whole microseconds (Limine's
+/// `rdtsc_usec`: the reading times 10^6 / `hz`, rounded down) back in
+/// ticks, rounded down: at or before the reading it was taken from, never
+/// after, and by fewer than `hz / 10^6 + 1` ticks. (Rounding up would also
+/// stay at or before it, the reading being a whole tick; down is pinned.)
+/// `None` for 0 Hz or a result past `u64`.
+pub fn ticks_at_usec(usec: u64, hz: u64) -> Option<u64> {
+    if hz == 0 {
+        return None;
+    }
+    u64::try_from(u128::from(usec) * u128::from(hz) / 1_000_000).ok()
 }
 
 /// A frequency for humans: rounded to hundredths of the largest unit it
@@ -651,6 +793,114 @@ mod tests {
     }
 
     #[test]
+    fn counter_midpoints_wrap_at_the_counter_width() {
+        assert_eq!(counter_midpoint(10, 30, u64::MAX), 20);
+        assert_eq!(counter_midpoint(10, 31, u64::MAX), 20, "rounds down");
+        assert_eq!(counter_midpoint(7, 7, 0xffff_ffff), 7);
+        assert_eq!(counter_midpoint(0xffff_fff0, 0x10, 0xffff_ffff), 0, "a 32-bit counter wrapped");
+        assert_eq!(counter_midpoint(0xffff_fff0, 0x8, 0xffff_ffff), 0xffff_fffc, "wrapped, midpoint before it");
+        assert_eq!(counter_midpoint(u64::MAX - 1, 4, u64::MAX), 1, "a 64-bit counter wrapped");
+    }
+
+    #[test]
+    fn a_bracketed_reading_is_placed_within_half_its_width_of_both_ends() {
+        let cases = [
+            (10, 30, u64::MAX),
+            (10, 31, u64::MAX),
+            (7, 7, u64::MAX),
+            (0xffff_fff0, 0x10, 0xffff_ffff), // a 32-bit counter wrapped
+            (0xffff_fff0, 0x9, 0xffff_ffff),
+            (u64::MAX - 2, 4, u64::MAX), // a 64-bit one wrapped
+        ];
+        for (before, after, mask) in cases {
+            let b = Bracketed::between(before, 'v', after, mask);
+            assert_eq!((b.value, b.width), ('v', counter_delta(before, after, mask)), "{before} {after}");
+            let half_up = b.width.div_ceil(2);
+            assert!(counter_delta(before, b.at, mask) <= half_up, "{before} {after}: {b:?}");
+            assert!(counter_delta(b.at, after, mask) <= half_up, "{before} {after}: {b:?}");
+            assert_eq!(counter_delta(before, b.at, mask) + counter_delta(b.at, after, mask), b.width);
+        }
+        // A clock read going backwards (`now_ns` jumping back) is a huge
+        // width, never a narrow reading.
+        assert_eq!(Bracketed::between(1_000, (), 999, u64::MAX).width, u64::MAX);
+    }
+
+    #[test]
+    fn a_clock_going_backwards_across_a_bracket_is_an_error() {
+        assert_eq!(Bracketed::checked_between(1_000, 'v', 999), Err(Backwards { before: 1_000, after: 999 }));
+        let b = Bracketed::checked_between(1_000, 'v', 1_011).unwrap();
+        assert_eq!((b.value, b.at, b.width), ('v', 1_005, 11));
+        assert_eq!(Bracketed::checked_between(7, (), 7).map(|b| b.width), Ok(0));
+    }
+
+    #[test]
+    fn a_clock_going_backwards_stops_first_narrow_at_once() {
+        let mut taken = 0;
+        let r = first_narrow::<u64, Backwards, 5>(100, || {
+            taken += 1;
+            if taken == 1 { Ok(bracketed(500)) } else { Bracketed::checked_between(10, 0, 9) }
+        });
+        assert_eq!(r, Err(Backwards { before: 10, after: 9 }));
+        assert_eq!(taken, 2, "not retaken like a stall");
+    }
+
+    #[test]
+    fn a_placement_try_is_judged_within_a_quarter_of_the_pause() {
+        // Pause 400: the reference at most 100 wide, and half of it plus half
+        // the paused bracket's excess over 800 at most 100.
+        assert_eq!(placement_uncertainty(100, 800, 400), 50);
+        assert!(placement_is_judged(100, 800, 400));
+        assert!(!placement_is_judged(101, 800, 400), "the reference over a quarter");
+        assert_eq!(placement_uncertainty(0, 1_000, 400), 100);
+        assert!(placement_is_judged(0, 1_000, 400), "exactly a quarter");
+        assert_eq!(placement_uncertainty(0, 1_001, 400), 101, "rounds up");
+        assert!(!placement_is_judged(0, 1_001, 400));
+        assert!(placement_is_judged(100, 900, 400) && !placement_is_judged(100, 901, 400));
+        assert_eq!(placement_uncertainty(0, 700, 400), 0, "narrower than the pauses: no excess");
+        // A wrapped or backwards width doesn't overflow: never judged.
+        assert_eq!(placement_uncertainty(u64::MAX, u64::MAX, 400), u64::MAX / 2 + 1);
+        assert!(!placement_is_judged(0, u64::MAX, 400) && !placement_is_judged(u64::MAX, 800, 400));
+        let _ = placement_is_judged(u64::MAX, u64::MAX, u64::MAX); // no overflow panic
+    }
+
+    fn bracketed(width: u64) -> Bracketed<u64> {
+        Bracketed::between(0, width * 10, width, u64::MAX)
+    }
+
+    #[test]
+    fn the_first_narrow_reading_is_kept() {
+        let mut widths = [5, 100, 7].into_iter();
+        let r = first_narrow::<_, (), 5>(100, || Ok(bracketed(widths.next().unwrap()))).unwrap();
+        assert_eq!(r.reading(), Some(bracketed(5)));
+        assert_eq!((r.widths(), r.retries()), (&[5][..], 0));
+        assert_eq!(widths.next(), Some(100), "no more readings taken");
+    }
+
+    #[test]
+    fn a_wide_reading_is_taken_again_and_its_width_kept() {
+        let mut widths = [101, 5_000, 100, 7].into_iter();
+        let r = first_narrow::<_, (), 5>(100, || Ok(bracketed(widths.next().unwrap()))).unwrap();
+        assert_eq!(r.reading(), Some(bracketed(100)), "the limit is inclusive");
+        assert_eq!((r.widths(), r.retries()), (&[101, 5_000, 100][..], 2));
+        assert_eq!(widths.next(), Some(7));
+    }
+
+    #[test]
+    fn no_reading_when_every_one_is_wide() {
+        let mut taken = 0u64;
+        let r = first_narrow::<_, (), 3>(100, || {
+            taken += 1;
+            Ok(bracketed(1_000 + taken))
+        })
+        .unwrap();
+        assert_eq!(r.reading(), None);
+        assert_eq!((r.widths(), r.retries()), (&[1_001, 1_002, 1_003][..], 2));
+        assert_eq!(taken, 3, "stops after N");
+        let none = first_narrow::<u64, (), 0>(100, || unreachable!()).unwrap();
+        assert_eq!((none.reading(), none.widths(), none.retries()), (None, &[][..], 0));
+    }
+
+    #[test]
     fn down_counter_deltas_cross_one_reload() {
         assert_eq!(down_counter_delta(60_000, 50_000, 62_500), 10_000);
         assert_eq!(down_counter_delta(5_000, 60_000, 62_500), 7_500, "reloaded once");
@@ -718,6 +968,60 @@ mod tests {
         assert_eq!(Clock::new(1).unwrap().ns(u64::MAX), u64::MAX, "saturates");
         assert_eq!(Clock::new(u64::MAX).unwrap().ticks(u64::MAX), u64::MAX, "saturates");
         assert_eq!(Clock::new(0), None);
+    }
+
+    /// Limine's `rdtsc_usec` (common/sys/cpu.h, v12.9.4), on a given reading.
+    fn limine_usec(ticks: u64, hz: u64) -> u64 {
+        ticks / hz * 1_000_000 + ticks % hz * 1_000_000 / hz
+    }
+
+    #[test]
+    fn a_bootloaders_microseconds_come_back_at_or_before_the_reading() {
+        assert_eq!(ticks_at_usec(1_000_000, 2_900_000_000), Some(2_900_000_000));
+        assert_eq!(ticks_at_usec(1, 2_900_000_001), Some(2_900), "rounds down");
+        assert_eq!(ticks_at_usec(5, 0), None);
+        assert_eq!(ticks_at_usec(u64::MAX, 2_000_000), None, "past u64");
+        assert_eq!(ticks_at_usec(u64::MAX, 1_000_000), Some(u64::MAX), "just fits");
+        // Readings near a microsecond's edges, at frequencies a TSC has (and
+        // odd ones a calibration gives), and pseudo-random ones up to
+        // centuries: never after the reading, never a microsecond before.
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for hz in [1_000_000u64, 1_193_182, 999_999_937, 2_899_956_252, 3_000_000_000, 5_123_456_789] {
+            let per_us = hz.div_ceil(1_000_000);
+            let mut readings = std::vec![0, 1, hz - 1, hz, hz + 1, per_us - 1, per_us, per_us + 1];
+            readings.extend((0..2000).map(|_| next() % (hz * 3_600 * 24 * 365 * 100)));
+            for t in readings {
+                let back = ticks_at_usec(limine_usec(t, hz), hz).unwrap();
+                assert!(back <= t, "after the reading: {back} > {t} at {hz} Hz");
+                assert!(t - back <= per_us, "a microsecond early: {back} for {t} at {hz} Hz");
+            }
+        }
+    }
+
+    #[test]
+    fn a_bootloaders_microseconds_come_back_right_over_a_small_range() {
+        // Every reading below 20000 at every frequency up to 3000 Hz (a tick
+        // spans many microseconds), and every reading below 200000 at
+        // frequencies around 1 MHz (where a tick is about a microsecond).
+        let check = |hz: u64, t: u64| {
+            let back = ticks_at_usec(limine_usec(t, hz), hz).unwrap();
+            assert!(
+                back <= t && u128::from(t - back) * 1_000_000 < u128::from(hz) + 1_000_000,
+                "{t} at {hz} Hz: {back}"
+            );
+        };
+        for hz in 1..=3_000 {
+            (0..20_000).for_each(|t| check(hz, t));
+        }
+        for hz in [999_999, 1_000_000, 1_000_001, 1_193_182, 2_000_003] {
+            (0..200_000).for_each(|t| check(hz, t));
+        }
     }
 
     #[test]

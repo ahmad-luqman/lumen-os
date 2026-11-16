@@ -450,13 +450,37 @@ crate::ktest!(
             }
         }
         kassert_eq!(phases, BootPhase::ALL.map(|p| p as u64));
-        // So `tscs` is in `ALL`'s order. Entry is the origin, and at most
-        // 50 ms before arch-init: not the TSC's reset or firmware handoff
-        // (GDT/IDT setup takes well under 50 ms).
+        // So `tscs` is in `ALL`'s order. Entry is the origin, at or before
+        // arch-init (above), and at least Limine's post-handoff wait after
+        // its handoff tick (`lumen_time::handoff::BeforeKmain::check`, which
+        // also checks the tick's units, and that Limine's frequency is at
+        // least half of ours). None of it is a time bound, so it holds
+        // however long the boot took (#55).
+        // That bounds the origin between Limine's handoff and arch-init; an
+        // origin read later than `kmain`'s first instruction, before
+        // arch-init, isn't caught.
         let (entry, arch_init) = (tscs[BootPhase::Entry.index()], tscs[BootPhase::ArchInit.index()]);
         kassert_eq!(Some(entry), crate::time::boot_tsc());
-        let clock = crate::time::tsc().ok_or("TSC not calibrated")?;
-        kassert!(clock.ns(arch_init - entry) < 50_000_000);
+        let before = match crate::boot::before_kmain() {
+            Ok(before) => before,
+            Err(why) => {
+                crate::ktest::diag(format_args!("before kmain: unknown ({why})"));
+                return Err("Limine's times or the origin are unknown");
+            }
+        };
+        kassert_eq!(before.entry(), entry);
+        // Limine's frequency is the one Limine reported, not ours.
+        kassert_eq!(Some(before.limine().hz()), crate::boot::limine_tsc_frequency());
+        let (clock, limine_hz) = (before.clock(), before.limine().hz());
+        crate::ktest::diag(format_args!(
+            "arch-init {} after entry; {before}; Limine's TSC {limine_hz} Hz, ours {} Hz",
+            lumen_time::Millis(clock.ns(arch_init - entry)),
+            clock.hz()
+        ));
+        if let Err(disorder) = before.check() {
+            crate::ktest::diag(format_args!("out of order: {disorder}"));
+            return Err("the origin is out of order with Limine's handoff");
+        }
         Ok(())
     }
 );
