@@ -532,6 +532,13 @@ pub fn wait_for_bytes_or(ready: impl Fn() -> bool) {
     WAITING.wait_until(|| !QUEUE.is_empty() || ready());
 }
 
+/// How many threads are blocked in [`wait_for_bytes_or`] (see
+/// `sched::WaitQueue::waiting`): the screen shells, once each waits for a
+/// key.
+pub fn readers_waiting() -> usize {
+    WAITING.waiting()
+}
+
 /// Wake every thread waiting in [`wait_for_bytes_or`].
 pub fn wake_readers() {
     WAITING.wake_all();

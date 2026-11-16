@@ -104,7 +104,11 @@ def crash_on(boot, args: str, cpus: int = 4):
     crash code after a complete report (no `!!!` line: every other CPU
     stopped for the report, through its stop NMI or, if a thread there would
     block first, by halting itself; the heap line and `interrupts: off` at
-    the end; drawn on screen too). Returns (report, the APs' logged stacks)."""
+    the end; drawn on screen too). The heap line is `heap: `, not `heap
+    (lock held; ...)`, because the boot CPU is quiet when the line runs: the
+    serial prompt comes only once every screen shell waits for its first
+    key (#119, test_shell's test_serial_prompt_waits_for_the_screen_shells).
+    Returns (report, the APs' logged stacks)."""
     m, online = boot_to_prompt(boot, cpus)
     assert online == cpus
     m.send_line(f"crash {args}")

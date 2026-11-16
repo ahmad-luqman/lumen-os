@@ -1189,6 +1189,14 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   interrupt yet), yielding to the CPU's other threads between polls
   (sleeping instead would switch to the idle thread and trace twice a
   millisecond); the virtual terminals' shells block in `vt::wait_key`.
+  The serial shell's first prompt comes only once every screen shell that
+  started is blocked waiting for its first key (counted on the keyboard's
+  wait queue, `keyboard::readers_waiting`; no time bound), so the boot
+  CPU is quiet when the first line typed on serial runs, typed ahead or
+  not: a deliberate crash on another CPU then never stops it mid-allocation
+  with the heap's lock held (#119). The `lumen> ` the harness waits for
+  means exactly that. Logged at debug level (`screen shells waiting for
+  keys: 4 of 4`) before the prompt (tested).
   Log lines go to serial and the first virtual terminal. A terminal whose
   shell's thread didn't start says so on it (not tested).
 - **Words** (`lumen_shell::words`): blanks separate words; `'...'` keeps

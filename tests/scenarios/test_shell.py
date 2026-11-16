@@ -82,6 +82,24 @@ def test_echo(boot):
     assert "\x1b" not in m.output[start:]
 
 
+SCREEN_SHELLS_WAITING = r"DEBUG shell: screen shells waiting for keys: (\d+) of (\d+)\n"
+
+
+def test_serial_prompt_waits_for_the_screen_shells(boot):
+    # #119: the serial shell's first prompt comes only once all four screen
+    # shells wait for their first key, so the boot CPU is quiet (allocating
+    # nothing) when the first line typed on serial runs; the deliberate
+    # crashes on other CPUs rely on it (test_smp's crash_on). The kernel
+    # logs how many it found waiting, at debug level, just before that
+    # prompt. Without the wait it finds none: the screen shells are queued
+    # behind the serial shell on the boot CPU and haven't run yet.
+    m = boot("qemutest", cmdline="lumen.log=debug")
+    found = m.expect(SCREEN_SHELLS_WAITING, 60)
+    assert found.groups() == ("4", "4"), found.group(0)
+    assert PROMPT not in m.output[: found.start()], m.output[-2000:]
+    m.expect(PROMPT, 60)
+
+
 BOOTING = r"INFO  boot: Lumen \d+\.\d+\.\d+ \(x86_64\) booting"
 
 

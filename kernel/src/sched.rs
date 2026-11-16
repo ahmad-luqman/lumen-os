@@ -949,6 +949,15 @@ impl WaitQueue {
         }
     }
 
+    /// How many threads are on the queue. Each was queued and marked blocked
+    /// under the queue's lock, in one step after its last allocation for the
+    /// wait (the push itself), so it is blocked or about to switch away,
+    /// allocating nothing more until woken. (A thread a deadline woke may
+    /// still be counted until it runs.)
+    pub fn waiting(&self) -> usize {
+        self.waiters.lock().len()
+    }
+
     /// Wake every waiting thread; how many it woke.
     pub fn wake_all(&self) -> usize {
         let all = core::mem::take(&mut *self.waiters.lock());

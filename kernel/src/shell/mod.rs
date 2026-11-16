@@ -12,9 +12,11 @@
 //!   `crate::vt`) and answer on it, with ANSI line editing. Each runs in its
 //!   own thread (`shell-vt1` to `shell-vt4`, on the boot CPU), blocked until
 //!   a key arrives; they start only with a keyboard and a terminal wide
-//!   enough for a 16-column line. Shift+PageUp and Shift+PageDown scroll
-//!   the shell's own terminal back and forward by half a screen; any key
-//!   the line editor takes shows its screen again.
+//!   enough for a 16-column line. The serial shell's first prompt waits
+//!   until every screen shell waits for its first key, so the boot CPU is
+//!   quiet when a line typed on serial runs (#119). Shift+PageUp and
+//!   Shift+PageDown scroll the shell's own terminal back and forward by
+//!   half a screen; any key the line editor takes shows its screen again.
 //!
 //! Log lines go to serial and the first virtual terminal, between the
 //! shells' output. The line
@@ -189,12 +191,16 @@ pub fn run() -> ! {
         // comes after this line on the screen.
         Ok(max) => {
             log::info!(target: "shell", "shells on serial and the screen; type 'help'");
+            let mut started = 0;
             for (vt, name) in SCREEN_THREADS.into_iter().enumerate() {
                 let editor = Editor::new(PROMPT, Mode::Ansi, max, HISTORY);
                 // Before it runs: keys typed on it from then on are its own.
                 crate::vt::attach(vt);
                 match crate::sched::spawn(name, move || run_on(Screen { vt }, editor)) {
-                    Ok(handle) => drop(handle), // it runs for good
+                    Ok(handle) => {
+                        drop(handle); // it runs for good
+                        started += 1;
+                    }
                     Err(e) => {
                         crate::vt::detach(vt);
                         log::error!(target: "shell", "no shell on terminal {} after all: no thread for it: {e}", vt + 1);
@@ -208,12 +214,34 @@ pub fn run() -> ! {
                     }
                 }
             }
+            wait_for_screen_shells(started);
         }
         Err(why) => log::info!(target: "shell", "shell on serial (none on the screen: {why}); type 'help'"),
     }
     let mode = if crate::cmdline::has_flag("lumen.ansi") { Mode::Ansi } else { Mode::Plain };
     let max = if mode == Mode::Ansi { max_line(SERIAL_COLUMNS) } else { MAX_LINE };
     run_on(Serial { decoder: Decoder::new() }, Editor::new(PROMPT, mode, max, HISTORY))
+}
+
+/// Wait until the `started` screen shells all wait for their first key
+/// (each blocked in the keyboard's wait queue), yielding this CPU to them:
+/// they run here, and until then they allocate (their first prompt, their
+/// place on the wait queue). The serial shell's first prompt comes after
+/// this, so a line typed on serial, even typed ahead, runs while they sit
+/// still: a deliberate crash on another CPU doesn't stop this one in the
+/// middle of an allocation, with the heap's lock held (#119). No time
+/// bound: a screen shell that never gets to its first wait is a bug, and
+/// the missing serial prompt shows it. The count found is logged (debug),
+/// and a scenario checks the line comes before the prompt.
+fn wait_for_screen_shells(started: usize) {
+    let waiting = loop {
+        let waiting = keyboard::readers_waiting();
+        if waiting >= started {
+            break waiting;
+        }
+        crate::sched::yield_now();
+    };
+    log::debug!(target: "shell", "screen shells waiting for keys: {waiting} of {started}");
 }
 
 /// The screen shells' widest line, if there is a terminal and a keyboard.
