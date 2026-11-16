@@ -137,8 +137,8 @@ fn emit(ctx: &mut Ctx<'_>, text: &str) {
 
 /// `cpus`: each CPU online, its scheduler's ticks and how busy it has been
 /// since it started, and the threads homed there; then any CPU stuck
-/// starting. (The boot CPU reads nearly 100% busy even when nothing
-/// happens: the serial shell polls serial, yielding, and never sleeps.)
+/// starting. (An idle boot CPU reads nearly 100% busy only where the
+/// serial shell polls: without COM1's interrupt, see `serial_in`.)
 pub fn cpus(ctx: &mut Ctx<'_>, args: &[String]) {
     if extra_args(ctx, "cpus", args) {
         return;

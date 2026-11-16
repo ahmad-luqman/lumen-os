@@ -81,7 +81,8 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
     serial port (keyboard, screendumps and the exit code only). `reboot=True`
     lets a reset boot the machine again (no `-no-reboot`). `devices` attaches
     virtio devices (`Devices(rng=True)`, `Devices.every()`), `cpu` sets the
-    CPU model (`cpu="max"`)."""
+    CPU model (`cpu="max"`), `com1_irq` puts COM1 on another ISA IRQ
+    (`com1_irq=3`)."""
     machines: list[Machine] = []
 
     def _boot(
@@ -93,6 +94,7 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
         reboot: bool = False,
         devices: Devices = NO_DEVICES,
         cpu: str | None = None,
+        com1_irq: int | None = None,
         trace_events: Sequence[str] = (),
     ) -> Machine:
         iso = ISOS[variant]
@@ -114,6 +116,7 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
             reboot=reboot,
             devices=devices,
             cpu=cpu,
+            com1_irq=com1_irq,
             trace_events=trace_events,
         ).start()
         machines.append(m)

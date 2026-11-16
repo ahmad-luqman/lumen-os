@@ -51,10 +51,20 @@ def test_trace_defaults_and_usage(boot):
 
 
 def test_exception_appears_in_trace(boot):
+    # The #BP is the newest event but thread switches: the serial shell
+    # blocks between lines and wakes every 100 ms (two switches each, #120),
+    # and the screen shells may still be settling into their first wait
+    # (#136), so switches can follow it in any number. The whole ring
+    # (nothing dropped yet, a few seconds after boot) is read, switches left
+    # out.
     m = boot("qemutest")
     m.expect(r"lumen> ", BOOT_TIMEOUT)
     m.send_line("int3")
     m.expect(r"breakpoints taken: 1")
-    events, _, _ = trace(m, "3")
-    exceptions = [rest.strip() for _, _, kind, rest in events if kind == "exception"]
-    assert any(re.fullmatch(r"vector=3 rip=0x[0-9a-f]+ error=0x0", e) for e in exceptions), events
+    events, _, dropped = trace(m, "4096")
+    assert dropped == 0
+    others = [(kind, rest.strip()) for _, _, kind, rest in events if kind != "switch"]
+    kind, rest = others[-1]
+    assert kind == "exception" and re.fullmatch(r"vector=3 rip=0x[0-9a-f]+ error=0x0", rest), (
+        others[-5:]
+    )

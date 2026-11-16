@@ -48,6 +48,7 @@ mod rng;
 mod rtc;
 mod sched;
 mod script;
+mod serial_in;
 mod shell;
 mod smp;
 mod sound;

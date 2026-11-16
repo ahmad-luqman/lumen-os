@@ -113,6 +113,59 @@ tests (for example `lumen-elf`, the symbol-table reader).
    the UART out of loopback before its first line and again once the other
    CPUs are stopped, in case one was in the loopback ktest (the reset is
    ktested, not a crash during that ktest).
+
+   Reading is by interrupt once the shells start (`serial_in`, #120; not
+   in the test kernel, whose two ktests that read COM1 read it
+   themselves). The UART has one reader, `serial_in` (plus those ktests in
+   the test kernel; its calls assert the boot CPU): received bytes keep
+   their order only while that holds. ISA IRQ 4 is routed like the
+   keyboard's (section 6, "Keyboard"); a route that is level-triggered or
+   active-low (a MADT override; `Route::trigger` and `polarity` say so)
+   isn't used (a warning; the shell polls; not tested). The UART
+   interrupts when received bytes wait (OUT2 set, the received-data
+   interrupt enabled; with the FIFO's trigger level 14, at 14 bytes or
+   after a four-character timeout: a few interrupts for a line sent at
+   once), and the handler moves the waiting bytes into a 256-byte queue
+   (`lumen_queue::ByteQueue`) as far as it has room, waking the serial
+   shell. Bytes past its room stay in the UART; under QEMU, which stops
+   feeding a full FIFO, none are lost, while a real UART overruns and
+   drops the next ones unseen. The worst case the design guards against
+   is an edge that doesn't come again until the reader lowers the line by
+   taking the waiting bytes (QEMU raises it again whenever bytes wait), so
+   the reader takes the queue's bytes, then the UART's, with interrupts
+   off on the boot CPU (the queue's producer), and the serial shell blocks
+   only while neither holds a byte (`lumen_uart::read_next` and
+   `available`, host-tested against a model of that worst case). The
+   block has a 100 ms deadline as a safety net: input whose interrupt
+   never wakes the shell is still read, within 200 ms (input found at the
+   deadline in the UART only, nothing queued, gets one more period for a
+   late interrupt to queue it: under load QEMU's character timeout was
+   measured arriving 1.6 ms after such a deadline), and three waits in a
+   row that find input at their deadline (no interrupt bringing input
+   between) warn once to check IRQ 4's routing. `serial` counts how the
+   waits ended: woken by the interrupt; readied by the deadline first,
+   with an interrupt bringing the input before the shell ran (another
+   thread on the CPU, or the vCPU, ran meanwhile: common under load
+   during a sound, and not a missed interrupt); or input found at the
+   deadline with no interrupt bringing it;
+   a scenario checks that lines typed while the shell waits wake it by
+   interrupt (at least one woken by the handler, none found at the
+   deadline), and that with COM1 moved to IRQ 3 the safety net answers
+   and warns once; how a wait ended and when it waits one more period
+   are pure functions tested on the host (`lumen_uart::classify`,
+   `another_period`). An idle boot CPU halts between; each block and wake is two
+   thread switches in the trace ring, so an idle serial shell records
+   about 20 events a second (the deadline's wakes), and the boot CPU's
+   4096-event ring wraps in about 3.4 minutes of idling. Without the
+   interrupt (no route, a refused one, or no scheduler running on the
+   boot CPU yet, where a thread can't block) the shell polls, yielding,
+   which records nothing but keeps the CPU busy; without a UART it blocks
+   for good where it can block, else yields (neither tested). The serial
+   shell used to poll, keeping the boot CPU 100% busy; under TCG on a
+   loaded host such a vCPU was measured going without interrupts for
+   longer than the sound driver's 160 ms queue (the host descheduling it
+   is the inferred cause). The crash reporter's loopback reset clears OUT2
+   too: harmless, as nothing reads input after a crash report.
 5. Logger (level from `lumen.log=`), Limine responses checked, the symbol table
    located in our own ELF, a memory-map summary, the frame allocator
    (`INFO  mem: frames: N usable, M reserved`), the kernel's own page tables
@@ -939,7 +992,10 @@ off. A wake from another CPU queues the thread there and sends the
   finds the I/O APIC with an input for that GSI, registers the handler for
   vector `0x50 + gsi` (`idt::set_irq_handler`, while the input is still
   masked) and programs the input masked, for the boot CPU. It returns a
-  `Route`, which only it can make (routes are never undone); the driver
+  `Route`, which only it can make (routes are never undone), with the
+  input's trigger and polarity (`Route::trigger`, `polarity`: a driver can
+  refuse an input its device can't drive, as `serial_in` does a level or
+  active-low IRQ 4); the driver
   unmasks the input with it (`interrupts::set_masked`) once its device is
   ready. Redirection entries are a typed `apic::RedirectionEntry` (vector,
   delivery mode, destination mode, polarity, trigger, mask, destination;
@@ -1202,10 +1258,9 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   `shell-vt4`, on the boot CPU, started only with a terminal and a
   keyboard: without a keyboard boot says `shell on serial (none on the
   screen: no keyboard)`, tested with `i8042=off`; without a terminal, or
-  no thread for one, not tested). The serial shell polls serial (no serial
-  interrupt yet), yielding to the CPU's other threads between polls
-  (sleeping instead would switch to the idle thread and trace twice a
-  millisecond); the virtual terminals' shells block in `vt::wait_key`.
+  no thread for one, not tested). The serial shell blocks until COM1's
+  interrupt brings a byte (`serial_in`, section 4, step 4), or polls, yielding,
+  without one; the virtual terminals' shells block in `vt::wait_key`.
   The serial shell's first prompt comes only once every screen shell that
   started is blocked waiting for its first key (`sched::yield_until_blocked`
   on their threads, see Scheduler; any `Blocked` counts, which relies on a
@@ -1362,8 +1417,8 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
     leaves it idle and checks both), and the threads homed there
     (`sched::threads`, a registry of weak references); then CPUs stuck
     starting, and in the header those halted past `MAX_CPUS` (neither
-    tested). The boot CPU reads nearly 100% busy even when idle: the
-    serial shell polls serial, yielding, and never sleeps.
+    tested). An idle boot CPU reads nearly 100% busy only where the serial
+    shell polls serial: without COM1's interrupt (`serial_in`, #120).
   - `mem`: frames used of those the allocator owns, the heap's counters,
     and the kernel stacks registered, by kind (sizes without their guard
     pages).
@@ -2132,7 +2187,9 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
   one critical section, wakes the thread (a `WaitQueue`) and returns a
   `Sound` (a private id and a cell its `Outcome` lands in: `Played`,
   `Stopped`, `Replaced` or `Failed(why)`, so the outcome is never lost to
-  later sounds). A newer sound cuts the playing one off at its next
+  later sounds). `sound`'s state is `playing` from then on, before the
+  thread has taken the sound (#120: `beep` returns first, and the next
+  command may run before the thread does), until it is over. A newer sound cuts the playing one off at its next
   period (up to 160 ms already queued still plays; a sound that has made
   all its samples plays out); a sound still waiting is dropped.
   `sound::stop(&sound)` fades a sound out (the periods already queued
@@ -2637,7 +2694,8 @@ kernel. The kernel is the trusted computing base.
   Recorded so far: boot phases, CPU exceptions and device interrupts nothing
   handles (not the timer, spurious interrupts or local APIC errors), log
   lines, thread switches (`switch from=<id> to=<id> (<state>)`, the
-  previous thread's state). Later: syscalls, page faults, allocator
+  previous thread's state; an idle boot CPU records about 20 a second,
+  the serial shell's 100 ms safety-net wakes: section 4, step 4). Later: syscalls, page faults, allocator
   activity. Cost per event is printed by
   `ktest:lumen_kernel::trace::trace_overhead_is_small` (tens of TSC ticks
   under TCG locally; TCG's TSC rate depends on the host, so this is not
@@ -2696,6 +2754,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/virtio.rs    the adapter for virtio-drivers: the Hal (DMA runs, bounce buffers), transport, VirtioTransport
   src/power.rs     reboot (0xCF9, 8042, triple fault) and ACPI S5 power-off
   src/interrupts.rs  interrupt controllers: 8259s masked, local APIC, I/O APICs, routing ISA IRQs
+  src/serial_in.rs COM1's input by interrupt (IRQ 4) into the queue the serial shell blocks on
   src/keyboard.rs  the PS/2 keyboard: 8042 init, IRQ 1, decoding (pc-keyboard), lumen.keymap
   src/time.rs      TSC and local APIC timer calibration, the boot origin, now_ns, sleep, ticks
   src/smp.rs       starting the other CPUs, run_on

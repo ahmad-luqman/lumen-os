@@ -1,4 +1,5 @@
-//! 16550 UART on COM1, polled (the logic is `lumen-uart`'s).
+//! 16550 UART on COM1 (the logic is `lumen-uart`'s): written by polling,
+//! read by interrupt once the shells start (`serial_in`).
 //!
 //! This is the kernel's first output device and the test harness's channel:
 //! logs and TAP results go out here, and scenario input comes back in.
@@ -22,6 +23,12 @@
 //!
 //! Waits are unbounded (as on any polled driver): a UART that never
 //! empties hangs its writer.
+//!
+//! **The UART has one reader:** `serial_in` (through [`read_next`],
+//! [`available`] and [`drain`], on the boot CPU, asserted), plus the two
+//! ktests that read COM1 in the test kernel (the loopback round trip and
+//! the absent port), where `serial_in` isn't set up. Received bytes keep
+//! their order only while that holds.
 
 use super::port::{inb, outb};
 use core::fmt;
@@ -70,7 +77,8 @@ impl Registers for Com {
 /// runs before GS is set up, and a lock needs the CPU index GS gives.
 static MODE: AtomicU8 = AtomicU8::new(Mode::Absent.to_u8());
 
-/// Find COM1 and program it for 115200 8N1, FIFOs on, interrupts off.
+/// Find COM1 and program it for 115200 8N1, FIFOs on, interrupts off
+/// (`serial_in` turns the received-data interrupt on later).
 pub fn init() {
     MODE.store(lumen_uart::init(&mut com1()).to_u8(), Ordering::Relaxed);
 }
@@ -101,11 +109,6 @@ fn write_to(com: &mut Com, mode: Mode, bytes: &[u8]) -> usize {
     lumen_uart::write_bytes(com, mode, bytes)
 }
 
-/// One received byte through `com` in `mode` (never when absent).
-fn read_from(com: &mut Com, mode: Mode) -> Option<u8> {
-    lumen_uart::try_read(com, mode)
-}
-
 /// Write `bytes`, each `\n` as `\r\n`, byte by byte (nothing without a
 /// UART), without a lock; the waits (for the ktests). [`SerialWriter`]'s.
 fn write_bytes(bytes: &[u8]) -> usize {
@@ -123,17 +126,52 @@ pub(crate) fn burst_bytes(bytes: &[u8]) -> usize {
 /// Take COM1 out of loopback (a ktest may have left it there when another
 /// CPU's crash stopped it), so the crash report reaches the host. Lock-free;
 /// the crash reporter calls it before its first line and again once the
-/// other CPUs are stopped (one may have entered loopback in between).
+/// other CPUs are stopped (one may have entered loopback in between). It
+/// clears OUT2 too (the received-data interrupt's gate on a PC): harmless,
+/// as nothing reads input after a crash report.
 pub fn leave_loopback() {
     if present() {
         com1().write(lumen_uart::reg::MODEM_CTRL, lumen_uart::MCR_DTR_RTS);
     }
 }
 
+// Reading: for `serial_in` only, the UART's one reader (the module doc).
+
 #[cfg_attr(feature = "ktest", allow(dead_code))] // the serial shell's input
-/// Non-blocking read of one received byte (never without a UART).
-pub fn try_read_byte() -> Option<u8> {
-    read_from(&mut com1(), mode())
+/// Have COM1 interrupt when received bytes wait
+/// (`lumen_uart::enable_rx_interrupt`), once IRQ 4 is routed. Nothing
+/// without a UART.
+pub(crate) fn enable_rx_interrupt() {
+    lumen_uart::enable_rx_interrupt(&mut com1(), mode());
+}
+
+#[cfg_attr(feature = "ktest", allow(dead_code))] // the serial shell's input
+/// The interrupt handler's drain: up to `room` received bytes to `push`
+/// (`lumen_uart::drain`); how many. The rest stay in the UART. With
+/// interrupts off, on the boot CPU (asserted).
+pub(crate) fn drain(room: usize, push: impl FnMut(u8)) -> usize {
+    debug_assert!(!super::irq::enabled() && super::percpu::index() == 0, "COM1 is drained on the boot CPU");
+    lumen_uart::drain(&mut com1(), mode(), room, push)
+}
+
+#[cfg_attr(feature = "ktest", allow(dead_code))] // the serial shell's input
+/// The reader's next byte: `popped` (from the handler's queue), else the
+/// UART's (`lumen_uart::read_next`). Never waits. The caller keeps the
+/// handler from running from its pop to the end of this call: interrupts
+/// off on the boot CPU, where IRQ 4 arrives (asserted).
+pub(crate) fn read_next(popped: Option<u8>) -> Option<u8> {
+    debug_assert!(
+        !super::irq::enabled() && super::percpu::index() == 0,
+        "COM1 is read on the boot CPU, interrupts off"
+    );
+    lumen_uart::read_next(&mut com1(), mode(), popped)
+}
+
+#[cfg_attr(feature = "ktest", allow(dead_code))] // the serial shell's input
+/// Whether the reader has a byte to take (`queued`: the handler's queue
+/// isn't empty), the UART's included (`lumen_uart::available`).
+pub(crate) fn available(queued: bool) -> bool {
+    lumen_uart::available(&mut com1(), mode(), queued)
 }
 
 /// A byte-by-byte writer without a lock (see the module doc): for the crash
@@ -296,11 +334,12 @@ crate::ktest!(
 
 crate::ktest!(
     fn an_absent_uart_is_neither_written_nor_read() {
-        // The kernel's write and read helpers (`write_to`, `read_from`, which
-        // `SerialWriter`, `burst_bytes` and `try_read_byte` use on COM1)
-        // with the mode init gives an empty port (COM4): writes wait for
-        // nothing (an absent port's line status says "empty" and "data
-        // ready" forever), and nothing is read (a read would return 0xff).
+        // The kernel's write helper (`write_to`, which `SerialWriter` and
+        // `burst_bytes` use on COM1) and the reader's policy (`read_next`
+        // and `available`'s, as `serial_in` reads) with the mode init gives
+        // an empty port (COM4): writes wait for nothing (an absent port's
+        // line status says "empty" and "data ready" forever), nothing is
+        // read (a read would return 0xff), and no byte is said to wait.
         // Unserialized writers never burst.
         use crate::kassert_eq;
         // SAFETY: COM4's port range, which nothing claims on q35.
@@ -308,7 +347,8 @@ crate::ktest!(
         let mode = lumen_uart::init(&mut com4);
         kassert_eq!(write_to(&mut com4, unserialized(mode), b"hello\n"), 0);
         kassert_eq!(write_to(&mut com4, mode, b"hello\n"), 0);
-        kassert_eq!(read_from(&mut com4, mode), None);
+        kassert_eq!(lumen_uart::read_next(&mut com4, mode, None), None);
+        kassert_eq!(lumen_uart::available(&mut com4, mode, false), false);
         kassert_eq!(
             [Mode::Absent, Mode::Bytes, Mode::Fifo].map(unserialized),
             [Mode::Absent, Mode::Bytes, Mode::Bytes]

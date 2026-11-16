@@ -171,6 +171,10 @@ class QemuOptions:
     accel: str = field(default_factory=default_accel)
     memory: str = "256M"
     serial: str = "stdio"
+    # COM1 on this ISA IRQ instead of its own 4 (QEMU's `isa-serial` with
+    # `irq=`; with `serial="stdio"` only): the interrupt never reaches the
+    # IRQ the kernel routes, so its safety net reads the input (#120).
+    com1_irq: int | None = None
     # "none" for tests; None when the serial mux (mon:stdio) provides the monitor.
     monitor: str | None = "none"
     qmp_socket: Path | None = None
@@ -441,6 +445,20 @@ def _ports(forwards: dict[int, int]) -> str:
     return ", ".join(f"host {host} for guest {guest}" for guest, host in forwards.items())
 
 
+def _serial_args(o: QemuOptions) -> list[str]:
+    """COM1: QEMU's default one on `o.serial`, or (`o.com1_irq`) none, and an
+    `isa-serial` at COM1's port on stdio, interrupting on that IRQ."""
+    if o.com1_irq is None:
+        return ["-serial", o.serial]
+    if o.serial != "stdio":
+        raise ValueError(f"com1_irq needs serial on stdio, not {o.serial!r}")
+    return [
+        "-serial", "none",
+        "-chardev", "stdio,id=lumen-com1",
+        "-device", f"isa-serial,chardev=lumen-com1,iobase=0x3f8,irq={o.com1_irq}",
+    ]  # fmt: skip
+
+
 def qemu_args(o: QemuOptions) -> list[str]:
     args = [
         qemu_binary(),
@@ -451,7 +469,7 @@ def qemu_args(o: QemuOptions) -> list[str]:
         "-drive", f"if=pflash,format=raw,file={o.vars_file}",
         "-cdrom", str(o.iso),
         "-boot", "d",
-        "-serial", o.serial,
+        *_serial_args(o),
         "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
         # A triple fault must end the run, not silently reboot (but for the
         # reboot scenarios, `reboot=True`).
@@ -524,6 +542,7 @@ class Machine:
         reboot: bool = False,
         devices: Devices = NO_DEVICES,
         cpu: str | None = None,
+        com1_irq: int | None = None,
         trace_events: Sequence[str] = (),
     ):
         # Read once, before anything starts: a value timeout_scale() rejects fails
@@ -542,6 +561,8 @@ class Machine:
         self.serial = serial
         # True: a reset boots the machine again instead of ending QEMU.
         self.reboot = reboot
+        # COM1 on this ISA IRQ instead of 4 (see QemuOptions.com1_irq).
+        self.com1_irq = com1_irq
         self._devices = devices
         self.cpu = cpu
         # QEMU trace events, logged to the artifacts' qemu.log (`trace_log`).
@@ -724,6 +745,7 @@ class Machine:
             trace=trace,
             trace_events=self.trace_events,
             serial="stdio" if self.serial else "none",
+            com1_irq=self.com1_irq,
             reboot=self.reboot,
             cpu=self.cpu,
             virtio_tablet=d.tablet,

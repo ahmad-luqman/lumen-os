@@ -193,6 +193,19 @@ def test_machine_without_serial_has_no_serial_port(tmp_path):
     assert plain[plain.index("-serial") + 1] == "stdio"
 
 
+def test_com1_can_move_to_another_irq(tmp_path):
+    # (#120) No default serial; an isa-serial at COM1's port on stdio, on
+    # IRQ 3. Only with serial on stdio.
+    args = qemu_args(Machine(Path("x.iso"), tmp_path, com1_irq=3).options(Path("v.fd")))
+    assert args[args.index("-serial") + 1] == "none" and args.count("-serial") == 1
+    assert args[args.index("-chardev") + 1] == "stdio,id=lumen-com1"
+    assert args[args.index("-device", args.index("-chardev")) + 1] == (
+        "isa-serial,chardev=lumen-com1,iobase=0x3f8,irq=3"
+    )
+    with pytest.raises(ValueError, match="com1_irq needs serial on stdio"):
+        qemu_args(Machine(Path("x.iso"), tmp_path, serial=False, com1_irq=3).options(Path("v.fd")))
+
+
 def test_live_machines_never_share_a_qmp_socket(tmp_path):
     # Parallel workers are kept apart by the pid in the name; machines in one
     # process (a test that boots twice) by a per-process counter.

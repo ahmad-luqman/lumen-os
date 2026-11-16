@@ -9,7 +9,7 @@ use core::fmt;
 use log::{info, warn};
 use lumen_mm::PhysAddr;
 
-use crate::arch::apic::RedirectionEntry;
+use crate::arch::apic::{Polarity, RedirectionEntry, Trigger};
 use crate::arch::{apic, idt, pic};
 use crate::mm::paging;
 use crate::sync::SpinLock;
@@ -101,6 +101,8 @@ pub struct Route {
     irq: u8,
     gsi: u32,
     vector: u8,
+    trigger: Trigger,
+    polarity: Polarity,
 }
 
 impl Route {
@@ -115,6 +117,19 @@ impl Route {
 
     pub fn vector(self) -> u8 {
         self.vector
+    }
+
+    /// The input's trigger mode: edge (ISA's), or level where a MADT
+    /// override says so (its interrupt then comes again after the EOI for
+    /// as long as the device holds the line up).
+    pub fn trigger(self) -> Trigger {
+        self.trigger
+    }
+
+    /// The input's polarity: active high (ISA's), or low where a MADT
+    /// override says so.
+    pub fn polarity(self) -> Polarity {
+        self.polarity
     }
 }
 
@@ -166,9 +181,10 @@ pub fn route_isa_irq(irq: u8, handler: fn()) -> Result<Route, RouteError> {
         Err(idt::HandlerError::NotAnIoApicVector) => unreachable!("{vector:#x} was checked to be an I/O APIC vector"),
     }
     let dest = u8::try_from(apic::lapic_id()).expect("the boot CPU's APIC id fits an I/O APIC destination");
-    io.regs.set_entry(input, RedirectionEntry::isa(vector, dest, flags, true));
+    let entry = RedirectionEntry::isa(vector, dest, flags, true);
+    io.regs.set_entry(input, entry);
     io.routed |= 1 << input;
-    Ok(Route { irq, gsi, vector })
+    Ok(Route { irq, gsi, vector, trigger: entry.trigger(), polarity: entry.polarity() })
 }
 
 /// Mask or unmask a routed input.
@@ -352,7 +368,16 @@ crate::ktest!(
             crate::ktest::diag(format_args!("{e}"));
             "routing IRQ 0 failed"
         })?;
-        kassert_eq!(route, Route { irq: 0, gsi: 2, vector: idt::IOAPIC_BASE + 2 });
+        kassert_eq!(
+            route,
+            Route {
+                irq: 0,
+                gsi: 2,
+                vector: idt::IOAPIC_BASE + 2,
+                trigger: Trigger::Edge,
+                polarity: Polarity::ActiveHigh
+            }
+        );
         let entry = routed_entry(2).ok_or("no input for GSI 2")?;
         kassert!(entry.masked());
         kassert_eq!((entry.vector(), u32::from(entry.destination())), (route.vector, apic::lapic_id()));
@@ -360,11 +385,13 @@ crate::ktest!(
         kassert_eq!(route_isa_irq(1, nothing), Err(RouteError::Taken(1)));
         // IRQ 9 (ACPI's SCI) is overridden level triggered, active high
         // (flags 0b1101): the override's level trigger reaches the entry
-        // (its polarity is also the default). It stays routed and masked too.
-        use crate::arch::apic::{Polarity, Trigger};
+        // (its polarity is also the default), and its route says so (#120:
+        // `serial_in` won't use a level-triggered IRQ 4). It stays routed
+        // and masked too.
         let sci = route_isa_irq(9, nothing).map_err(|_| "routing IRQ 9 failed")?;
         let entry = routed_entry(sci.gsi).ok_or("no input for IRQ 9")?;
         kassert_eq!((entry.trigger(), entry.polarity(), entry.masked()), (Trigger::Level, Polarity::ActiveHigh, true));
+        kassert_eq!((sci.trigger(), sci.polarity()), (Trigger::Level, Polarity::ActiveHigh));
         Ok(())
     }
 );

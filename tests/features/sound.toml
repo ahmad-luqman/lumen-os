@@ -41,11 +41,12 @@ tests = [
 ]
 
 [[feature]]
-name = "`beep 440 500` plays a 440 Hz tone (within 1%) lasting 500 ms (within 10%) into QEMU's wav audiodev, and returns while it plays (`sound` says `playing` right after); the frames handed to the device are exactly the tone's (a last period's padding not counted: 510 ms), with no underrun reported, also over a 10 s tone (500 periods)"
+name = "`beep 440 500` plays a 440 Hz tone (within 1%) lasting 500 ms (within 10%) into QEMU's wav audiodev, and returns while it plays (`sound` says `playing` right after: from the moment `beep` hands the sound over, so the scenario no longer shows that the thread took it; that the thread plays it is the recording's and the frame counts' to show, and `playing` before it takes it is a ktest with a made-up device); the frames handed to the device are exactly the tone's (a last period's padding not counted: 510 ms), with no underrun reported, also over a 10 s tone (500 periods)"
 milestone = "M3"
 tests = [
     "scenario:test_sound::test_tone_is_captured",
     "scenario:test_sound::test_beep_returns_while_it_plays",
+    "ktest:lumen_kernel::sound::a_sound_handed_over_shows_playing_before_the_thread_takes_it",
     "scenario:test_sound::test_a_padded_last_period_counts_only_the_sound",
     "scenario:test_sound::test_a_long_tone_plays_without_underrun",
 ]

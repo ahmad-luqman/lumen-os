@@ -4,7 +4,23 @@
 //! model 16550. Everything that decides what to write is here: whether a
 //! UART answers ([`probe`]), how to program it and write to it ([`init`],
 //! [`Mode`]), `\n` as `\r\n` in bursts ([`write_bytes`]), and reading
-//! ([`try_read`]).
+//! ([`data_ready`], [`try_read`]; by interrupt: [`enable_rx_interrupt`],
+//! the handler's [`drain`], the reader's policy, [`read_next`] and
+//! [`available`], how it waits, [`wait_mode`], how a wait ended,
+//! [`another_period`] and [`classify`], and when a missing interrupt is
+//! worth a warning, [`MissedInterrupts`]).
+//!
+//! **Reading by interrupt.** The received-data interrupt reaches the CPU
+//! as an edge (ISA IRQ 4 through an I/O APIC). The worst case the design
+//! guards against: the line rises when bytes start waiting and stays up
+//! until the reader takes them all, so no new edge comes while any byte
+//! waits. (QEMU does better, raising it again whenever bytes wait; real
+//! UARTs and interrupt routers may not.) The handler drains what its queue
+//! has room for; bytes past that stay in the UART, behind those queued. So
+//! the reader takes the queue first, then the UART ([`read_next`]), and
+//! must not wait while either holds a byte ([`available`]). The tests run
+//! this against a model of that worst case, whose handler runs only on an
+//! edge.
 //!
 //! A burst assumes the transmit FIFO is empty once the line status says so
 //! (THRE), and fills all but one of its slots ([`BURST`]). Two writers
@@ -48,11 +64,18 @@ pub const LSR_TX_IDLE: u8 = 1 << 6;
 pub const LCR_DLAB: u8 = 0x80;
 /// Line control: 8 data bits, no parity, one stop bit.
 pub const LCR_8N1: u8 = 0x03;
-/// FIFO control: enable and clear both FIFOs, receive trigger level 14
-/// (unused: interrupts are off).
+/// FIFO control: enable and clear both FIFOs, receive trigger level 14:
+/// with the received-data interrupt on ([`enable_rx_interrupt`]), it comes
+/// once 14 bytes wait, or after a character timeout (four characters' time
+/// with fewer waiting and none arriving), so a typed line raises a few
+/// interrupts, not one per byte.
 pub const FCR_ENABLE_CLEAR: u8 = 0xc7;
+/// Interrupt enable: received data available.
+pub const IER_RX_DATA: u8 = 1 << 0;
 /// Modem control: DTR and RTS.
 pub const MCR_DTR_RTS: u8 = 0x03;
+/// Modem control: OUT2, which gates the UART's interrupt line on a PC.
+pub const MCR_OUT2: u8 = 1 << 3;
 /// Modem control: loopback (what is sent comes back to the receiver).
 pub const MCR_LOOPBACK: u8 = 1 << 4;
 /// The 16550A's transmit (and receive) FIFO size.
@@ -184,12 +207,161 @@ fn wait_thr_empty(r: &mut impl Registers) {
     }
 }
 
+/// Whether a received byte is waiting (never without a UART).
+pub fn data_ready(r: &mut impl Registers, mode: Mode) -> bool {
+    mode != Mode::Absent && r.read(reg::LINE_STATUS) & LSR_DATA_READY != 0
+}
+
 /// One received byte, if one is waiting (never without a UART).
 pub fn try_read(r: &mut impl Registers, mode: Mode) -> Option<u8> {
+    data_ready(r, mode).then(|| r.read(reg::DATA))
+}
+
+/// Interrupt when received bytes wait (after [`init`], which leaves DLAB
+/// clear and, with a FIFO, the trigger level at 14: [`FCR_ENABLE_CLEAR`];
+/// without one, with each byte): OUT2 set with DTR and RTS, and the
+/// received-data interrupt enabled. Nothing without a UART.
+pub fn enable_rx_interrupt(r: &mut impl Registers, mode: Mode) {
     if mode == Mode::Absent {
-        return None;
+        return;
     }
-    (r.read(reg::LINE_STATUS) & LSR_DATA_READY != 0).then(|| r.read(reg::DATA))
+    r.write(reg::MODEM_CTRL, MCR_DTR_RTS | MCR_OUT2);
+    r.write(reg::INT_ENABLE, IER_RX_DATA);
+}
+
+/// The reader's next byte (the module doc, "Reading by interrupt"):
+/// `popped`, the byte it took from the queue (the older bytes), else the
+/// UART's (bytes the handler left there for want of room). Never waits.
+/// The caller keeps the handler from running from its pop to the end of
+/// this call (interrupts off on the handler's CPU), or a byte the handler
+/// queues meanwhile would come after a newer one read here.
+pub fn read_next(r: &mut impl Registers, mode: Mode, popped: Option<u8>) -> Option<u8> {
+    popped.or_else(|| try_read(r, mode))
+}
+
+/// Whether the reader has a byte to take (`queued`: its queue isn't
+/// empty): the condition its wait for the interrupt must check, since a
+/// byte left in the UART may raise no new edge (the module doc).
+pub fn available(r: &mut impl Registers, mode: Mode, queued: bool) -> bool {
+    queued || data_ready(r, mode)
+}
+
+/// Hand received bytes to `push` while one is waiting, at most `room`;
+/// how many. Bytes past `room` stay in the UART for the reader
+/// ([`read_next`]). Behind a full FIFO the sender's next bytes are held
+/// back by QEMU; a real UART drops them (an overrun).
+pub fn drain(r: &mut impl Registers, mode: Mode, room: usize, mut push: impl FnMut(u8)) -> usize {
+    let mut n = 0;
+    while n < room {
+        let Some(byte) = try_read(r, mode) else { break };
+        push(byte);
+        n += 1;
+    }
+    n
+}
+
+/// How the reader waits for input, when it has none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitMode {
+    /// Block for good: there is no UART, so nothing will come.
+    Forever,
+    /// Block until the interrupt brings a byte, at most until a deadline
+    /// (the safety net for an interrupt that doesn't come), then look.
+    Deadline,
+    /// Yield once and look again (polling): the reader can't block here,
+    /// or no interrupt brings the bytes.
+    Yield,
+}
+
+/// How to wait ([`WaitMode`]): with a UART (`present`) whose bytes come by
+/// interrupt (`by_interrupt`), block with a deadline; without a UART, block
+/// for good; either only where the reader's thread can block
+/// (`can_block`); otherwise yield.
+pub fn wait_mode(present: bool, by_interrupt: bool, can_block: bool) -> WaitMode {
+    match (present, by_interrupt, can_block) {
+        (_, _, false) => WaitMode::Yield,
+        (false, _, true) => WaitMode::Forever,
+        (true, true, true) => WaitMode::Deadline,
+        (true, false, true) => WaitMode::Yield,
+    }
+}
+
+/// How a [`WaitMode::Deadline`] wait ended ([`classify`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitEnd {
+    /// The interrupt handler's wake readied the reader: an interrupt
+    /// brought input.
+    Woken,
+    /// The deadline readied the reader first, and an interrupt brought the
+    /// input at or after the deadline, before the reader ran (another
+    /// thread, or the vCPU, ran meanwhile): the interrupt came, late.
+    Late,
+    /// The deadline passed and input was waiting with no interrupt having
+    /// brought it, or with one before the deadline that didn't wake the
+    /// reader: the interrupt may not be reaching the CPU, or not waking it.
+    InputAtDeadline,
+    /// Nothing came; or a byte was already waiting at the first look,
+    /// before any deadline (its interrupt still pending): neither says
+    /// anything about the interrupt.
+    Idle,
+}
+
+/// Whether a wait that found input should wait one more period for a late
+/// interrupt: input `found` at the deadline (`past_deadline`), not woken
+/// by the handler (`woken`), with nothing `queued` (so it is in the UART
+/// alone, its interrupt not taken yet; it may be on its way).
+pub fn another_period(found: bool, woken: bool, queued: bool, past_deadline: bool) -> bool {
+    found && past_deadline && !woken && !queued
+}
+
+/// How a deadline wait ended: `woken` by the handler; else the first
+/// interrupt that brought input since the reader blocked
+/// (`first_input_irq_ns`) at or after the `deadline_ns` ([`WaitEnd::Late`]);
+/// else input `found` once `now_ns` is past the deadline
+/// ([`WaitEnd::InputAtDeadline`]: no interrupt, or one before the deadline
+/// that didn't wake the reader); else [`WaitEnd::Idle`].
+pub fn classify(woken: bool, first_input_irq_ns: Option<u64>, deadline_ns: u64, found: bool, now_ns: u64) -> WaitEnd {
+    if woken {
+        WaitEnd::Woken
+    } else if first_input_irq_ns.is_some_and(|t| t >= deadline_ns) {
+        WaitEnd::Late
+    } else if found && now_ns >= deadline_ns {
+        WaitEnd::InputAtDeadline
+    } else {
+        WaitEnd::Idle
+    }
+}
+
+/// When input found at the deadline is worth a warning: after
+/// [`MissedInterrupts::THRESHOLD`] such waits in a row, with no interrupt
+/// bringing input between them (one alone may be a race with a late
+/// interrupt), once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MissedInterrupts {
+    /// Waits in a row that found input at the deadline.
+    in_a_row: u32,
+    warned: bool,
+}
+
+impl MissedInterrupts {
+    /// Waits in a row that found input at the deadline before the warning.
+    pub const THRESHOLD: u32 = 3;
+
+    pub const fn new() -> Self {
+        MissedInterrupts { in_a_row: 0, warned: false }
+    }
+
+    /// Note how a wait ended; whether to warn now (true once at most).
+    pub fn note(&mut self, end: WaitEnd) -> bool {
+        match end {
+            WaitEnd::Woken | WaitEnd::Late => self.in_a_row = 0,
+            WaitEnd::Idle => {}
+            WaitEnd::InputAtDeadline => self.in_a_row = self.in_a_row.saturating_add(1),
+        }
+        let warn = !self.warned && self.in_a_row >= Self::THRESHOLD;
+        self.warned |= warn;
+        warn
+    }
 }
 
 #[cfg(test)]
