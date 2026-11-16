@@ -681,9 +681,12 @@ crate::ktest!(
         if BOUND.lock().is_some() {
             return Err("a tablet is bound already: this ktest needs none");
         }
+        let rings = BELL.rings();
         kassert_eq!(hold(), Err(HoldError::NoTablet));
         let _bound = MadeUp::bind(Some(Failure::Failed))?;
         kassert_eq!(hold(), Err(HoldError::Failed));
+        // Refused before asking: no ring, nothing asked.
+        kassert_eq!(BELL.rings(), rings);
         kassert_eq!(reads(), Reads::Running);
         Ok(())
     }
