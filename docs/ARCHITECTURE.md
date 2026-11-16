@@ -2221,9 +2221,9 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
   then shows `failed: <reason>`, and `beep` and `play` say the device
   failed. A control request around a sound (prepare, start, stop,
   release) that never completes spins forever (the crate's limit) and
-  wedges the thread: the first `sound`, `beep` or `play` over 5 s after
-  the last answer from the device while playing (looked at then, not on
-  a timer) gives the player up for good (a warning; the reason gives the
+  wedges the thread: the first look (`sound`, `beep`, `play`, or `play`
+  polling `format()`) over 5 s after the sound started or the device last
+  answered gives the player up for good (nothing looks on a timer) (a warning; the reason gives the
   device's status if it shows `DEVICE_NEEDS_RESET` or `FAILED`, else `no
   answer from the device for N s`; `lspci` shows it failed), `play` stops
   its sound and returns, and a thread that comes back drops the device
@@ -2231,9 +2231,13 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
   device whose status shows it broken while idle is given up by the next
   sound or `sound`. Whichever way the player is given up, the sound
   waiting to start settles `Failed` with the reason (`Bound::give_up`
-  takes it); the sound playing settles when the thread next gets an
-  answer, so on a thread stuck for good it stays unsettled (callers poll
-  `format()` too). Nothing re-initialises the device. Without a sound
+  takes it); until a stuck thread's look, the waiting sound is unsettled
+  too. The sound playing settles when the thread next gets an answer, so
+  on a thread stuck for good it stays unsettled (callers poll `format()`
+  too). A sound the driver drops without settling (a bug) settles
+  `Outcome::Lost` with an error logged, and `play` says `play: the sound
+  was lost by the driver (a bug)`, not that the device failed. Nothing
+  re-initialises the device. Without a sound
   device they say `no sound device` (with the function's binding if one
   was found but not bound). Underrun and overrun events on the device's
   event queue aren't read. The crate itself warns, on every boot with a
