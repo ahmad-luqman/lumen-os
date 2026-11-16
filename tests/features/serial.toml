@@ -31,3 +31,13 @@ tests = [
     "harness:test_qemu::test_com1_can_move_to_another_irq",
     "ktest:lumen_kernel::interrupts::routing_takes_the_madt_override_and_refuses_twice",
 ]
+
+[[feature]]
+name = "A serial command's output as the scenarios read it (`lumen_harness.shell.run`): the log's lines (`[seconds.micros] LEVEL tag: message`, `lumen_harness.klog`) taken out and kept wherever one lands, from the prompt before the echo on; checked against the kernel inside the typed line's echo, between two output writes and after the output before the prompt (debug lines made to land there), on handcrafted text for all three positions and between the prompt and the echo, and on #124's recorded output for the position after the output; a WARN or ERROR among them fails the run unless allowed (host-tested); `dmesg`'s read with its live lines dropped and checked (#124)"
+milestone = "M3"
+tests = [
+    "harness:test_shell_run::*",
+    "scenario:test_shell::test_a_log_line_inside_a_commands_echo_is_not_output",
+    "scenario:test_shell::test_a_log_line_between_output_writes_is_not_output",
+    "scenario:test_shell::test_a_log_line_after_the_output_before_the_prompt_is_not_output",
+]

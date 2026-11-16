@@ -12,9 +12,13 @@
 //!   `crate::vt`) and answer on it, with ANSI line editing. Each runs in its
 //!   own thread (`shell-vt1` to `shell-vt4`, on the boot CPU), blocked until
 //!   a key arrives; they start only with a keyboard and a terminal wide
-//!   enough for a 16-column line. Shift+PageUp and Shift+PageDown scroll
-//!   the shell's own terminal back and forward by half a screen; any key
-//!   the line editor takes shows its screen again.
+//!   enough for a 16-column line. The serial shell's first prompt waits
+//!   until every screen shell that started is blocked waiting for its
+//!   first key, checked in one pass with interrupts off (#119; see
+//!   `wait_for_screen_shells`: a key typed on the screen during boot can
+//!   hold it until they all wait again). Shift+PageUp and
+//!   Shift+PageDown scroll the shell's own terminal back and forward by
+//!   half a screen; any key the line editor takes shows its screen again.
 //!
 //! Log lines go to serial and the first virtual terminal, between the
 //! shells' output. The line
@@ -189,12 +193,15 @@ pub fn run() -> ! {
         // comes after this line on the screen.
         Ok(max) => {
             log::info!(target: "shell", "shells on serial and the screen; type 'help'");
+            // Kept (no allocation) until the serial prompt's wait; dropped
+            // after it, as each runs for good.
+            let mut shells: [Option<crate::sched::JoinHandle>; term::VTS] = Default::default();
             for (vt, name) in SCREEN_THREADS.into_iter().enumerate() {
                 let editor = Editor::new(PROMPT, Mode::Ansi, max, HISTORY);
                 // Before it runs: keys typed on it from then on are its own.
                 crate::vt::attach(vt);
                 match crate::sched::spawn(name, move || run_on(Screen { vt }, editor)) {
-                    Ok(handle) => drop(handle), // it runs for good
+                    Ok(handle) => shells[vt] = Some(handle),
                     Err(e) => {
                         crate::vt::detach(vt);
                         log::error!(target: "shell", "no shell on terminal {} after all: no thread for it: {e}", vt + 1);
@@ -208,6 +215,7 @@ pub fn run() -> ! {
                     }
                 }
             }
+            wait_for_screen_shells(&shells, SHELLS_WARN_AFTER_NS);
         }
         Err(why) => log::info!(target: "shell", "shell on serial (none on the screen: {why}); type 'help'"),
     }
@@ -218,6 +226,123 @@ pub fn run() -> ! {
     let max = if mode == Mode::Ansi { max_line(SERIAL_COLUMNS) } else { MAX_LINE };
     run_on(Serial { decoder: Decoder::new() }, Editor::new(PROMPT, mode, max, HISTORY))
 }
+
+/// How long the serial prompt waits for the screen shells before it says
+/// so (it goes on waiting).
+const SHELLS_WARN_AFTER_NS: u64 = 5_000_000_000;
+
+/// Wait until every screen shell that started is blocked waiting for its
+/// first key (`sched::yield_until_blocked`: by thread, not by counting the
+/// keyboard's waiters, so another waiter there can't stand in for one),
+/// yielding this CPU to them: they run here, and until they block they
+/// allocate (their first prompt, their place on the keyboard's wait
+/// queue). Any `Blocked` counts: this relies on a screen shell's first wait
+/// being the keyboard's (nothing on its way to its first key waits). The
+/// serial shell's first prompt comes after this, so the first line typed on
+/// serial runs while the screen shells are parked: a deliberate crash on
+/// another CPU then finds none of them in the middle of an allocation with
+/// the heap's lock held (#119). Each check is one pass over them with
+/// interrupts off; a key typed on the screen during boot wakes them all,
+/// and holds the serial prompt until they all wait again. No time bound:
+/// after `warn_after_ns` a warning names the shells not yet waiting, with
+/// their states, and the wait goes on (unbounded: the warning needs this
+/// CPU to still schedule); when it then ends, that is logged at info with
+/// how long it held. Logged at debug level when it starts and when it ends
+/// (`N of N`: the count that last pass found blocked, which the scenarios
+/// check before the prompt). The count of screen shells waited for.
+fn wait_for_screen_shells(shells: &[Option<crate::sched::JoinHandle>], warn_after_ns: u64) -> usize {
+    use crate::sched;
+    let started = || shells.iter().flatten();
+    let count = started().count();
+    let plural = if count == 1 { "" } else { "s" };
+    log::debug!(target: "shell", "serial prompt waits for {count} screen shell{plural} to wait for keys");
+    let start = crate::time::now_ns();
+    if !sched::yield_until_blocked(started(), Some(start + warn_after_ns)) {
+        log::warn!(target: "shell", "serial prompt held: {} not yet waiting for keys (still waiting)", NotBlocked(shells));
+        sched::yield_until_blocked(started(), None);
+        let held_ms = (crate::time::now_ns() - start) / 1_000_000;
+        log::info!(target: "shell", "serial prompt released after {held_ms} ms: every screen shell waits for keys");
+    }
+    // `yield_until_blocked` returned true, so its last pass found all of
+    // them blocked: no second read (it could disagree).
+    log::debug!(target: "shell", "screen shells waiting for keys: {count} of {count}");
+    count
+}
+
+/// The started screen shells not blocked now, each with its state
+/// (`shell-vt2 (ready), shell-vt4 (dead)`), or `(none now)` if they all
+/// blocked since the wait looked; formatted as the warning is written,
+/// without allocating.
+struct NotBlocked<'a>(&'a [Option<crate::sched::JoinHandle>]);
+
+impl fmt::Display for NotBlocked<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use crate::sched::State;
+        let started = self.0.iter().flatten().map(|h| h.thread());
+        let mut named = 0;
+        for t in started {
+            let state = t.state();
+            if state != State::Blocked {
+                write!(f, "{}{} ({})", if named == 0 { "" } else { ", " }, t.name(), state.name())?;
+                named += 1;
+            }
+        }
+        if named == 0 {
+            f.write_str("(none now)")?;
+        }
+        Ok(())
+    }
+}
+
+crate::ktest!(
+    fn the_serial_prompt_waits_on_past_its_warning() {
+        // `wait_for_screen_shells` with a 1 ms warning, on two threads on
+        // this CPU standing in for shells (in two of the four slots): one
+        // blocks at once, the other only after sleeping 30 ms. The warning
+        // fires while the second sleeps (test_ktest checks its text), and
+        // the wait goes on: it returns only once both are blocked, after
+        // the sleep. Then they are woken and joined.
+        use crate::sched::{self, JoinHandle, State, WaitQueue};
+        use crate::{kassert, kassert_eq};
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicBool, Ordering};
+        const LATE_NS: u64 = 30_000_000;
+        let s = Arc::new((WaitQueue::new(), AtomicBool::new(false)));
+        let park = |s: &Arc<(WaitQueue, AtomicBool)>, sleep_ns: u64| {
+            let t = s.clone();
+            move || {
+                if sleep_ns > 0 {
+                    assert!(sched::sleep(sleep_ns), "a test thread couldn't sleep");
+                }
+                t.0.wait_until(|| t.1.load(Ordering::Acquire));
+            }
+        };
+        let mut shells: [Option<JoinHandle>; term::VTS] = Default::default();
+        // Read first: the late thread's sleep starts after this.
+        let start = crate::time::now_ns();
+        shells[0] = Some(sched::spawn("waits-early", park(&s, 0)).map_err(|_| "spawn failed")?);
+        shells[2] = Some(sched::spawn("waits-late", park(&s, LATE_NS)).map_err(|_| "spawn failed")?);
+        let count = wait_for_screen_shells(&shells, 1_000_000);
+        let held = crate::time::now_ns() - start;
+        let blocked = shells.iter().flatten().all(|h| h.thread().state() == State::Blocked);
+        if !blocked {
+            for h in shells.iter().flatten() {
+                crate::ktest::diag(format_args!("{}: {}", h.thread().name(), h.thread().state().name()));
+            }
+        }
+        kassert!(blocked);
+        kassert_eq!(count, 2);
+        kassert!(held >= LATE_NS);
+        s.1.store(true, Ordering::Release);
+        s.0.wake_all();
+        // Bounded: a thread that never finishes fails the test by name
+        // (the wait under test above is unbounded by design).
+        for h in shells.into_iter().flatten() {
+            sched::join_bounded(h)?;
+        }
+        Ok(())
+    }
+);
 
 /// The screen shells' widest line, if there is a terminal and a keyboard.
 fn screen_line_width() -> Result<usize, &'static str> {

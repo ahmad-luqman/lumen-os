@@ -95,6 +95,7 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
         devices: Devices = NO_DEVICES,
         cpu: str | None = None,
         com1_irq: int | None = None,
+        trace_events: Sequence[str] = (),
     ) -> Machine:
         iso = ISOS[variant]
         if not iso.exists():
@@ -116,6 +117,7 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
             devices=devices,
             cpu=cpu,
             com1_irq=com1_irq,
+            trace_events=trace_events,
         ).start()
         machines.append(m)
         return m

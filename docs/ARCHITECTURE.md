@@ -263,7 +263,15 @@ incomplete timeline is logged as a warning (not tested: every boot's
 timeline is complete; the scenario fails on the warning). Serial log lines
 start with the time since that origin, `[seconds.microseconds]`; every line
 before the TSC is calibrated (before `time: tsc ...`) shows `[    ?.??????]`, not a
-zero that would read as a measurement. The first virtual terminal shows
+zero that would read as a measurement. The stamps and the timeline share
+the origin and the calibrated clock, and `boot complete` is logged just
+before the complete phase is marked and the timeline line just after it, so
+the total falls between their stamps (checked by order, with no time bound,
+in `test_boot_timeline_printed`, the only check that klog's printed stamps
+agree with the timeline's origin and unit: the stamps' shape is
+`test_log_lines_are_structured`'s, `Stamp`'s digits lumen-time's;
+`trace::log_stamps_count_from_the_timelines_origin` checks
+`time::since_boot_ns` between two TSC reads). The first virtual terminal shows
 lines up to `info` without timestamps, so screenshots stay comparable
 (`term::log_lines_are_coloured_by_level` checks the level starts the line).
 
@@ -913,7 +921,16 @@ off. A wake from another CPU queues the thread there and sends the
   wake only moves a thread that is still blocked, and a woken thread takes
   its own leftover entries off (a ktest races the two 200 times). Dropping
   a queue with threads waiting panics, as does a thread joining itself
-  (not tested).
+  (not tested). `Blocked` is set in one place, `WaitQueue`'s wait, under
+  the queue's lock, right after the thread is pushed onto it; from that
+  push until it is woken nothing allocates for it (the deadline's sleeper
+  entry uses room reserved beforehand). `yield_until_blocked(handles,
+  deadline)` yields this CPU until every one of those threads is
+  `Blocked` (each check one pass with interrupts off; true even past the
+  deadline if they all are; `Sleeping` and `Dead` never count; not for the
+  calling thread itself): the serial prompt's wait for the screen shells
+  (#119; a ktest in which each of four threads blocks last in turn,
+  after a sleep).
   Where a thread can't block, both waits panic (tested: `wait_until` with
   a lock held; `wait_until_or_deadline` with interrupts off; `wait_until`
   after its own CPU turned interrupts off for good, alone or after another
@@ -1237,6 +1254,35 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   no thread for one, not tested). The serial shell blocks until COM1's
   interrupt brings a byte (`serial_in`, section 4, step 4), or polls, yielding,
   without one; the virtual terminals' shells block in `vt::wait_key`.
+  The serial shell's first prompt comes only once every screen shell that
+  started is blocked waiting for its first key (`sched::yield_until_blocked`
+  on their threads, see Scheduler; any `Blocked` counts, which relies on a
+  screen shell's first wait being the keyboard's). So when the first line
+  typed on serial runs, the screen shells are parked, and a deliberate
+  crash on another CPU doesn't find one of them mid-allocation with the
+  heap's lock held (#119). The `lumen> ` the harness waits for comes after
+  that. Not covered: other threads on CPU 0, such as the `mouse` and
+  `sound` threads (no scenario attaches those devices by default; `make
+  run` attaches a tablet), and a key typed on the screen, which wakes all
+  the shells: `wake_all` takes the queue's buffer and the waker frees it,
+  so the first shell to wait again allocates a new one (the rest fit in
+  it). A key typed during boot holds the serial prompt until they all wait
+  again. No time bound: after 5 s a warning names the shells not yet
+  waiting, each with its state (`serial prompt held: shell-vt2 (ready) not
+  yet waiting for keys (still waiting)`; `(none now)` if they all parked
+  meanwhile), the wait goes on, and its end is logged at info with how
+  long it held (`serial prompt released after 5012 ms: ...`; a ktest
+  waits with a 1 ms warning, and test_ktest matches both texts in the
+  ktest boot's output; not at boot). The warning needs CPU 0 to
+  still schedule: a shell spinning with interrupts off would hang it
+  silently. Logged at debug level when it starts (`serial prompt waits for
+  4 screen shells to wait for keys`) and before the prompt (`screen shells
+  waiting for keys: 4 of 4`, what the wait's last check found). Every
+  `test_smp` boot but one (`test_cpus_past_the_limit_are_halted`, at the
+  default log level as shipped) and
+  `test_shell::test_serial_prompt_waits_for_the_screen_shells` check that
+  line, with no prompt and no warning before it; most other scenarios
+  boot at the default level.
   Log lines go to serial and the first virtual terminal. A terminal whose
   shell's thread didn't start says so on it (not tested).
 - **Words** (`lumen_shell::words`): blanks separate words; `'...'` keeps
@@ -1300,6 +1346,26 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   overlong forms; host tested). The serial shell's writes are made holding
   the log's line lock (`klog::LockedSerial`, see step 4 of the boot
   sequence), so a log line can't land inside one (not tested on its own).
+  Each log line is written whole (the logger holds the line lock for the
+  line; `crash`'s `Out` takes it per piece, and the crash reporter takes
+  none), but one can land between two of the shell's writes: before or
+  inside a typed line's echo (a write per key, Enter's newline its own),
+  between two writes of a command's output, or after the output, before
+  the prompt. The log isn't held while a command prints (#124): a line
+  shows when it is logged, in stamp order, so a warning during a long or
+  stuck command isn't hidden until it ends. The scenarios read a
+  command's output through `lumen_harness.shell.run`: it takes log lines
+  out wherever they start (the format of "Boot timeline and log
+  timestamps", matched by `lumen_harness.klog`; change it with
+  kernel/src/klog.rs) and keeps them on the result, from the prompt
+  before the echo on, and a WARN or ERROR among them fails the run unless
+  the test allows that line (a warning is something a test should see). A
+  command whose output is log lines (`dmesg`) is read with `run_dmesg`,
+  which drops (and checks) the lines logged while it ran. Scenarios put a debug line inside a
+  command's echo, between two of its output writes, and after its output
+  before the prompt (#124's position); harness self-tests cover all three
+  positions on handcrafted text, and the position after the output on
+  #124's recorded output.
   Each key's output is written to the console in
   one write, so on the screen a log line can't land in the middle of a
   redraw (not tested on its own). A running command reads keys from its
@@ -1364,7 +1430,8 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
     saying why any are missing (`pci::status`).
   - `mouse`: the tablet (#98, section 7): a header with its name,
     address, screen and counts (events, frames, ignored, `SYN_DROPPED`s,
-    at least so many overruns, why it failed), and one row: position,
+    overruns: batches that may have lost frames, why it failed), and one
+    row: position,
     buttons held, presses so far (summed), wheels, the pointer (`drawn`,
     `hidden` under a canvas, `none` without a terminal), `stale`, and why
     it failed; `no tablet` and a row of dashes without one.
@@ -2362,12 +2429,19 @@ ever seen.
   (or a wheel turn) that came and went between two looks, while no frame
   was dropped at the device: it sees that a click happened, not where.
 - **Overruns:** the tablet's ring holds 32 event buffers, and QEMU drops a
-  whole frame that doesn't fit, with no `SYN_DROPPED`. A batch that read
-  enough events that a frame may not have fit (30 of 32: a move is 3)
-  counts as an overrun, marks the state stale until a clean batch brings a
-  frame, and the thread looks again at once instead of waiting. The count is a lower bound: frames
-  dropped at the device can't be counted exactly (a scenario sends 300
-  moves unpaced and checks that lost frames come with an overrun).
+  whole frame that doesn't fit, with no `SYN_DROPPED`. A frame holds at
+  most one event per code the device advertises in its `EV_BITS`, and the
+  sync (`lumen_input::frame_bound`; 12 on QEMU's tablet; the boot line
+  says it). A batch that read enough events that such a frame may not
+  have fit (21 or more of 32 on QEMU's tablet) counts as an overrun and
+  marks the state stale until a clean batch brings a frame. What that
+  count guarantees, and its preconditions, are stated once, in
+  `lumen_input::may_have_lost_frames`'s doc, and a host model checks them
+  (#124). Scenarios send 300 moves, and 7-event frames until QEMU traces
+  the first drop (at most 300), unpaced while the guest's CPU is busy, and
+  check that frames were lost (as many as QEMU traced), that an overrun
+  was counted, and the overrun warning; the 7-event frames tell the
+  device's bound from moves' 3.
 - **Keys:** the keyboard's decoded keys (`lumen_shell::Key`, through
   `crate::vt`'s per-terminal rings today). That is a line editor's key
   (characters and editing keys, no key-up, no modifiers on their own),

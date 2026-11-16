@@ -25,12 +25,20 @@
 //!   each button's presses so far (that a click happened, not where). A
 //!   device that can't take its vector fails the probe.
 //! - **Overruns.** The ring holds 32 event buffers and QEMU drops a whole
-//!   frame (a move is 3 events) that doesn't fit, without a `SYN_DROPPED`.
-//!   A batch of 30 events or more may have missed frames: it counts as an
-//!   overrun (warned about once), the state is marked stale until a clean
-//!   batch brings a frame, and the thread looks again at once instead of
-//!   waiting. The count is a lower bound: frames the device dropped
-//!   can't be counted exactly.
+//!   frame that doesn't fit, without a `SYN_DROPPED`. How big a frame can
+//!   be comes from the device: the probe counts its `EV_BITS`
+//!   (`lumen_input::frame_bound`: 12 on QEMU's tablet), and the boot line
+//!   says it; a bound of the ring's size or more is warned
+//!   about. A batch that read so many events that a frame of that size
+//!   may not have fit (21 or more of 32 on QEMU's tablet) counts as an
+//!   overrun (warned about once), and the state is marked stale until a
+//!   clean batch brings a frame. What the count guarantees, and when, is
+//!   `lumen_input::may_have_lost_frames`'s doc (#124); with a bound of the
+//!   ring's size or more every non-empty batch counts, so the state stays
+//!   stale while events come. A batch of 16 events or more (half the ring)
+//!   looks again at once instead of waiting. A batch is warned about
+//!   before its counts are published, so a `mouse` in between shows the
+//!   frames and overruns before it.
 //! - **Failure.** A device that stops being ready (`FAILED`, which for the
 //!   tablet means the status reads all ones or something else gave up on
 //!   it, `DEVICE_NEEDS_RESET`, or `DRIVER_OK` gone after a reset) ends the
@@ -57,7 +65,7 @@ use alloc::string::String;
 use core::fmt;
 
 use log::{debug, error, info, warn};
-use lumen_input::{AbsAxis, Event, PointerState, Tablet, evdev, has_abs_xy, may_have_lost_frames};
+use lumen_input::{AbsAxis, Event, PointerState, Tablet, evdev, frame_bound, has_abs_xy, may_have_lost_frames};
 use lumen_pci::PciAddr;
 use lumen_pci::names::virtio_type;
 use virtio_drivers::device::input::VirtIOInput;
@@ -130,9 +138,9 @@ pub struct Counts {
     /// `SYN_DROPPED`s (the device said it lost a frame).
     pub dropped: u64,
     /// Batches that read so many events that a frame may not have fit in
-    /// the ring (`lumen_input::may_have_lost_frames`): a lower bound on
-    /// trouble, since QEMU drops such frames without saying so and they
-    /// can't be counted exactly.
+    /// the ring: what that guarantees is `lumen_input::may_have_lost_frames`'s
+    /// doc. QEMU drops such frames without saying so, so they can't be
+    /// counted exactly.
     pub overruns: u64,
 }
 
@@ -214,6 +222,19 @@ fn axis(t: &mut VirtioTransport, axis: u16) -> Result<AbsAxis, ProbeError> {
     AbsAxis::new(min, max).map_err(|e| ProbeError::Unusable(alloc::format!("axis {axis}: {e}")))
 }
 
+/// The most events one of the device's frames holds
+/// (`lumen_input::frame_bound` over its `EV_BITS`): the ring's size or
+/// more makes every non-empty batch an overrun (`may_have_lost_frames`).
+fn frame_events(t: &mut VirtioTransport) -> Result<u64, ProbeError> {
+    let mut maps = alloc::vec::Vec::new();
+    for ty in lumen_input::FRAME_TYPES {
+        let mut bits = [0u8; cfg::DATA_LEN];
+        let n = query(t, cfg::EV_BITS, ty as u8, &mut bits)?;
+        maps.push((ty, bits[..n].to_vec()));
+    }
+    Ok(frame_bound(maps.iter().map(|(ty, bits)| (*ty, bits.as_slice()))))
+}
+
 /// Bring up a tablet: decline a second one, or a device without both
 /// absolute axes (before the crate posts any buffer), read the axes'
 /// ranges, start the crate's driver and check it is ready; then publish it
@@ -238,6 +259,7 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
         return Err(ProbeError::NotMine);
     }
     let (x, y) = (axis(&mut t, evdev::ABS_X)?, axis(&mut t, evdev::ABS_Y)?);
+    let frame = frame_events(&mut t)?;
     let mut name = [0u8; cfg::DATA_LEN];
     let len = query(&mut t, cfg::ID_NAME, 0, &mut name)?;
     // A terminating NUL, if counted, is dropped; anything else unprintable
@@ -256,12 +278,16 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
     let tablet = Tablet::new(x, y, screen.0, screen.1);
     info!(
         target: "mouse",
-        "{addr}: \"{name}\", axes {} to {} by {} to {}, scaled to {}x{}",
+        "{addr}: \"{name}\", axes {} to {} by {} to {}, scaled to {}x{}, frames of up to {frame} events",
         x.min(), x.max(), y.min(), y.max(), screen.0, screen.1
     );
+    if frame >= RING {
+        warn!(target: "mouse", "{addr}: frames of up to {frame} events don't fit the {RING}-buffer ring: every non-empty \
+            batch counts as an overrun, so overruns can't be told apart");
+    }
     let device = Device { addr, name, screen };
     *BOUND.lock() = Some(Bound { device, state: None, counts: Counts::default(), stale: false, failed: None });
-    match crate::sched::spawn("mouse", move || run(input, tablet, status, addr)) {
+    match crate::sched::spawn("mouse", move || run(input, tablet, frame, status, addr)) {
         Ok(_) => Ok(()),
         Err(e) => {
             *BOUND.lock() = None;
@@ -271,7 +297,7 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
 }
 
 /// The `mouse` thread: the device's only user from here on.
-fn run(mut input: Input, mut tablet: Tablet, status: StatusHandle, addr: PciAddr) {
+fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, addr: PciAddr) {
     let (mut warned_overrun, mut logged_ignored) = (false, false);
     // Events after a wait that ran to its deadline with no ring, the ring
     // count still unchanged: they came without their interrupt.
@@ -295,7 +321,7 @@ fn run(mut input: Input, mut tablet: Tablet, status: StatusHandle, addr: PciAddr
             logged_ignored = true;
             debug!(target: "mouse", "{addr}: ignoring events a tablet has no use for, first type {kind:#x} code {code:#x}");
         }
-        let overrun = may_have_lost_frames(events, RING);
+        let overrun = may_have_lost_frames(events, RING, frame);
         if overrun && !warned_overrun {
             warned_overrun = true;
             warn!(target: "mouse", "{addr}: {events} events in one batch: the event ring was nearly full, so frames \
