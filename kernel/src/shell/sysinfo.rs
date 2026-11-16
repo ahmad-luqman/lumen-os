@@ -413,8 +413,8 @@ pub fn mouse(ctx: &mut Ctx<'_>, args: &[String]) {
 }
 
 /// `mouse`'s header line: the device, the screen and the counts (whole
-/// frames are the state's `seq`; overruns a lower bound), and why it
-/// failed; or that there is no tablet.
+/// frames are the state's `seq`; overruns the batches that may have lost
+/// frames), and why it failed; or that there is no tablet.
 fn mouse_header(bound: Option<&crate::mouse::Bound>) -> String {
     let Some(b) = bound else { return String::from("mouse: no tablet (QEMU: -device virtio-tablet-pci)") };
     let (d, c) = (&b.device, &b.counts);

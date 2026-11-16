@@ -5,10 +5,11 @@ ktests in kernel/src/script.rs."""
 
 import time
 
-from lumen_harness import shell
 from lumen_harness.image import assert_matches_golden
 from lumen_harness.qemu import Machine
 from lumen_harness.screen import PROMPT, expect_screen
+from lumen_harness.shell import Output
+from lumen_harness.shell import run as shell_run
 from PIL import Image
 
 SHELLS = r"INFO  shell: shells on serial and the screen; type 'help'\n"
@@ -23,9 +24,9 @@ def shells(boot, extra: tuple[str, ...] = ()) -> Machine:
     return m
 
 
-def run(m: Machine, line: str, timeout: float = 30) -> str:
+def run(m: Machine, line: str, timeout: float = 30) -> Output:
     """`lumen_harness.shell.run`, waiting up to 30 s for the prompt."""
-    return shell.run(m, line, timeout)
+    return shell_run(m, line, timeout)
 
 
 def test_rhai_eval(boot):

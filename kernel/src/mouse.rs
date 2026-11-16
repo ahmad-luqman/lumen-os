@@ -25,18 +25,31 @@
 //!   each button's presses so far (that a click happened, not where). A
 //!   device that can't take its vector fails the probe.
 //! - **Overruns.** The ring holds 32 event buffers and QEMU drops a whole
-//!   frame (a move is 3 events) that doesn't fit, without a `SYN_DROPPED`.
-//!   A batch of 30 events or more may have missed frames: it counts as an
-//!   overrun (warned about once), the state is marked stale until a clean
-//!   batch brings a frame, and the thread looks again at once instead of
-//!   waiting. The count is a lower bound: frames the device dropped
-//!   can't be counted exactly. But no dropped frame goes uncounted: when
-//!   one was dropped at most 2 buffers were free, so at least 30 were
-//!   filled (or popped and not yet re-posted), and the batch going on or
-//!   the next reads all of them before it ends (`lumen_input`'s
-//!   `no_dropped_frame_goes_uncounted` models the ring, #124). A batch is
-//!   warned about before its counts are published, so a `mouse` in
-//!   between shows the frames and overruns before it.
+//!   frame that doesn't fit, without a `SYN_DROPPED`. How big a frame can
+//!   be comes from the device: the probe counts its `EV_BITS` (one event
+//!   per code it can send, and the sync: `lumen_input::frame_bound`; 12
+//!   on QEMU's tablet: 8 buttons, the wheel, X and Y), and the boot line
+//!   says it. A batch that read so many events that fewer buffers than
+//!   that were left may have missed frames (21 or more of 32 on QEMU's):
+//!   it counts as an overrun (warned about once), the state is marked
+//!   stale until a clean batch brings a frame, and the thread looks again
+//!   at once instead of waiting. The count is of batches that may have
+//!   lost frames: it can count a batch that lost nothing, and it is never
+//!   0 when a frame was dropped, given that all 32 buffers are still
+//!   posted and no frame holds a code twice (both below). A dropped frame
+//!   left fewer free buffers than its size, so the rest were filled or
+//!   being re-posted, and the first batch to end after the drop reads
+//!   them all (`lumen_input`'s `no_dropped_frame_goes_uncounted` models
+//!   the ring; `the_preconditions_are_needed` shows a frame one bigger,
+//!   or a buffer short, going uncounted; #124). Not covered: a buffer the
+//!   crate fails to re-post (below) shrinks the ring unseen, and QMP's
+//!   `input-send-event` can repeat a code in one frame, making it bigger
+//!   than the bound (QEMU's front ends send each change once). A device
+//!   whose frames could outgrow the ring has its bound cut to the ring's
+//!   size: every batch then counts, but a frame too big for the ring
+//!   is dropped without leaving events to count. A batch is warned about
+//!   before its counts are published, so a `mouse` in between shows the
+//!   frames and overruns before it.
 //! - **Failure.** A device that stops being ready (`FAILED`, which for the
 //!   tablet means the status reads all ones or something else gave up on
 //!   it, `DEVICE_NEEDS_RESET`, or `DRIVER_OK` gone after a reset) ends the
@@ -63,7 +76,7 @@ use alloc::string::String;
 use core::fmt;
 
 use log::{debug, error, info, warn};
-use lumen_input::{AbsAxis, Event, PointerState, Tablet, evdev, has_abs_xy, may_have_lost_frames};
+use lumen_input::{AbsAxis, Event, PointerState, Tablet, evdev, frame_bound, has_abs_xy, may_have_lost_frames};
 use lumen_pci::PciAddr;
 use lumen_pci::names::virtio_type;
 use virtio_drivers::device::input::VirtIOInput;
@@ -136,9 +149,10 @@ pub struct Counts {
     /// `SYN_DROPPED`s (the device said it lost a frame).
     pub dropped: u64,
     /// Batches that read so many events that a frame may not have fit in
-    /// the ring (`lumen_input::may_have_lost_frames`): a lower bound on
-    /// trouble, since QEMU drops such frames without saying so and they
-    /// can't be counted exactly.
+    /// the ring (`lumen_input::may_have_lost_frames`): it can count a
+    /// batch that lost nothing, and is never 0 when a frame was dropped
+    /// (given the module doc's preconditions). QEMU drops such frames
+    /// without saying so, so they can't be counted exactly.
     pub overruns: u64,
 }
 
@@ -220,6 +234,24 @@ fn axis(t: &mut VirtioTransport, axis: u16) -> Result<AbsAxis, ProbeError> {
     AbsAxis::new(min, max).map_err(|e| ProbeError::Unusable(alloc::format!("axis {axis}: {e}")))
 }
 
+/// The event types a device sends in its frames (keys and buttons,
+/// relative and absolute axes, `EV_MSC`, switches); its other `EV_BITS`
+/// (LEDs, sound, autorepeat, force feedback) describe output to it.
+const FRAME_TYPES: core::ops::RangeInclusive<u8> = 0x01..=0x05;
+
+/// The most events one of the device's frames holds
+/// (`lumen_input::frame_bound` over its `EV_BITS`: one per code, and the
+/// sync), at most the ring's size: a frame can't be bigger and still fit.
+fn frame_events(t: &mut VirtioTransport) -> Result<u64, ProbeError> {
+    let mut maps = alloc::vec::Vec::new();
+    for ty in FRAME_TYPES {
+        let mut bits = [0u8; cfg::DATA_LEN];
+        let n = query(t, cfg::EV_BITS, ty, &mut bits)?;
+        maps.push(bits[..n].to_vec());
+    }
+    Ok(frame_bound(maps.iter().map(alloc::vec::Vec::as_slice)).min(RING))
+}
+
 /// Bring up a tablet: decline a second one, or a device without both
 /// absolute axes (before the crate posts any buffer), read the axes'
 /// ranges, start the crate's driver and check it is ready; then publish it
@@ -244,6 +276,7 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
         return Err(ProbeError::NotMine);
     }
     let (x, y) = (axis(&mut t, evdev::ABS_X)?, axis(&mut t, evdev::ABS_Y)?);
+    let frame = frame_events(&mut t)?;
     let mut name = [0u8; cfg::DATA_LEN];
     let len = query(&mut t, cfg::ID_NAME, 0, &mut name)?;
     // A terminating NUL, if counted, is dropped; anything else unprintable
@@ -262,12 +295,12 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
     let tablet = Tablet::new(x, y, screen.0, screen.1);
     info!(
         target: "mouse",
-        "{addr}: \"{name}\", axes {} to {} by {} to {}, scaled to {}x{}",
+        "{addr}: \"{name}\", axes {} to {} by {} to {}, scaled to {}x{}, frames of up to {frame} events",
         x.min(), x.max(), y.min(), y.max(), screen.0, screen.1
     );
     let device = Device { addr, name, screen };
     *BOUND.lock() = Some(Bound { device, state: None, counts: Counts::default(), stale: false, failed: None });
-    match crate::sched::spawn("mouse", move || run(input, tablet, status, addr)) {
+    match crate::sched::spawn("mouse", move || run(input, tablet, frame, status, addr)) {
         Ok(_) => Ok(()),
         Err(e) => {
             *BOUND.lock() = None;
@@ -277,7 +310,7 @@ fn probe(res: DeviceResources) -> Result<(), ProbeError> {
 }
 
 /// The `mouse` thread: the device's only user from here on.
-fn run(mut input: Input, mut tablet: Tablet, status: StatusHandle, addr: PciAddr) {
+fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, addr: PciAddr) {
     let (mut warned_overrun, mut logged_ignored) = (false, false);
     // Events after a wait that ran to its deadline with no ring, the ring
     // count still unchanged: they came without their interrupt.
@@ -301,7 +334,7 @@ fn run(mut input: Input, mut tablet: Tablet, status: StatusHandle, addr: PciAddr
             logged_ignored = true;
             debug!(target: "mouse", "{addr}: ignoring events a tablet has no use for, first type {kind:#x} code {code:#x}");
         }
-        let overrun = may_have_lost_frames(events, RING);
+        let overrun = may_have_lost_frames(events, RING, frame);
         if overrun && !warned_overrun {
             warned_overrun = true;
             warn!(target: "mouse", "{addr}: {events} events in one batch: the event ring was nearly full, so frames \

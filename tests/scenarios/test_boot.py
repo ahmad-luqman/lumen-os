@@ -2,6 +2,7 @@
 
 import re
 
+from lumen_harness.klog import LEVEL, SECONDS, UNKNOWN
 from lumen_harness.qemu import EXIT_SUCCESS
 
 BOOT_TIMEOUT = 60
@@ -25,11 +26,9 @@ def test_boot_reaches_logger(boot):
 
 
 # `[seconds.micro] LEVEL tag: message`, or `[    ?.??????]` before the TSC is
-# calibrated (kernel/src/klog.rs, lumen_time::Stamp).
-LOG_LINE = re.compile(
-    r"^\[(?: *(?P<stamp>\d+\.\d{6})|    \?\.\?{6})\] "
-    r"(?:ERROR|WARN |INFO |DEBUG|TRACE) [a-z0-9_:]+: \S"
-)
+# calibrated (kernel/src/klog.rs, lumen_time::Stamp): lumen_harness.klog's
+# pieces, with the stamp captured and a stricter tag and message.
+LOG_LINE = re.compile(rf"^\[(?:(?P<stamp>{SECONDS})|{UNKNOWN})\] {LEVEL} [a-z0-9_:]+: \S")
 # The timeline line, with its own stamp (kernel/src/trace.rs, `Timeline`).
 # An incomplete one is logged at warn: matched too, so the test fails at once
 # with the line instead of timing out.

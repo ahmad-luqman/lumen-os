@@ -258,6 +258,9 @@ own PR that updates that doc first.
   `move_pointer`/`click` for the tablet), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
   `crash.py` (crash-report parsing), `audio.py` (wav files as QEMU's
   wav audiodev writes them: pitch by zero crossings, Goertzel amplitude),
-  `screen.py` (the screen's rows through the serial shell's `term text`).
+  `screen.py` (the screen's rows through the serial shell's `term text`),
+  `shell.py` (`run`: a serial command's output, the log's lines taken out
+  and kept, a WARN or ERROR failing it unless allowed; `PROMPT`), `klog.py`
+  (the kernel log line's format, as kernel/src/klog.rs prints it).
 - `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests.
   `tests/features/*.toml`: feature → test map (the CI feature gate and STATUS.md).

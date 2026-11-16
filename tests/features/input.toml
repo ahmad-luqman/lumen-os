@@ -76,7 +76,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Mouse overruns and failure: 300 moves sent unpaced lose frames QEMU drops when the 32-buffer ring is full (no SYN_DROPPED), and `mouse` then counts at least one overrun (a lower bound: a batch of 30 events or more), none ignored or dropped; a later clean frame isn't stale; a batch near a full ring may have lost frames from 30 of 32 events, and every frame a model of QEMU's ring drops lands in such a batch (host-tested); a failed tablet's `mouse` header gives every count and why, its row the last position with no pointer, stale and the reason (ktest on a built state: QEMU can't make the device fail)"
+name = "Mouse overruns and failure: 300 moves sent unpaced lose frames QEMU drops when the 32-buffer ring is full (no SYN_DROPPED), and `mouse` then counts at least one overrun (batches that may have lost frames: frames hold at most one event per code the device advertises and the sync, 12 on QEMU's tablet as the boot line says, so 21 of 32 events or more), warned about once (and only with an overrun), none ignored or dropped; a later clean frame isn't stale; the frame bound from EV_BITS and the threshold, and that every frame a model of QEMU's ring drops (frames of 2 to 12 events) lands in a counted batch, while a frame one bigger or a buffer lost to the ring can go uncounted (host-tested); a failed tablet's `mouse` header gives every count and why, its row the last position with no pointer, stale and the reason (ktest on a built state: QEMU can't make the device fail)"
 milestone = "M3"
 tests = [
     "cargo:lumen-input",
