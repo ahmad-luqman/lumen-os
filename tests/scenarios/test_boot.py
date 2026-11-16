@@ -160,9 +160,10 @@ def test_boot_timeline_printed(boot):
     # total, as a correct log stamps them: a log origin early or a unit
     # fast fails the first side once its error exceeds B, one late or slow
     # fails the second once it exceeds A. Starvation widens the gaps, never
-    # reverses them (#125). Only this checks that klog stamps lines with
-    # `time::since_boot_ns` and formats them right; the ktest
-    # `trace::log_stamps_count_from_the_timelines_origin` checks
+    # reverses them (#125). This is the only check that klog's printed
+    # stamps agree with the timeline's origin and unit (the stamps' shape is
+    # test_log_lines_are_structured's, Stamp's digits lumen-time's); the
+    # ktest `trace::log_stamps_count_from_the_timelines_origin` checks
     # `since_boot_ns` itself between two TSC reads.
     earlier = line.string[: line.start()]
     complete_stamps = [micros(c["stamp"]) for c in BOOT_COMPLETE.finditer(earlier)]

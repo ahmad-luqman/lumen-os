@@ -263,7 +263,7 @@ impl Timeline {
         Some((at[BootPhase::Entry.index()]?, self.clock?))
     }
 
-    /// A TSC reading as the timeline shows a phase stamped with it:
+    /// A TSC reading as the timeline converts a phase stamped with it:
     /// nanoseconds since its origin, with its clock. `None` while the
     /// timeline is unavailable, or for a reading before the origin.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: a ktest
@@ -507,17 +507,18 @@ crate::ktest!(
     fn log_stamps_count_from_the_timelines_origin() {
         // `time::since_boot_ns` (the logger's clock), read between two TSC
         // reads that the timeline converts as it converts a phase
-        // (`Timeline::since_origin_ns`). The expected values come from the
-        // timeline's entry event and clock, not from `boot_tsc()`, so they
-        // don't reuse the code under test. Interrupts off keeps the three
-        // reads on one CPU and close together, and `cpuid` fences the
-        // stamp's read from the TSC reads on either side. Order only: it
-        // can't fail on a correct kernel (a wrapped boot ring is reported as
-        // such), and it catches a log origin or unit error larger than its
-        // window (microseconds here, wider if the host stalls between the
-        // reads). It covers `since_boot_ns` and `mark_boot` only: that klog
-        // stamps lines with them, and `Stamp`'s format, are
-        // test_boot_timeline_printed's to check (#125).
+        // (`Timeline::since_origin_ns`). The origin comes from the
+        // timeline's entry event, not `boot_tsc()`, so the expected values
+        // don't reuse the code under test; the clock is shared by design.
+        // Interrupts off keeps the three reads on one CPU and close together,
+        // and `cpuid` fences the stamp's read from the TSC reads on either
+        // side. Order only: it can't fail on a correct kernel unless the boot
+        // ring has wrapped (then it fails, saying so), and it catches a log
+        // origin or unit error larger than its window (microseconds here,
+        // wider if the host stalls between the reads). It covers
+        // `since_boot_ns` and `mark_boot` only: that klog's printed stamps
+        // agree with the timeline is test_boot_timeline_printed's to check
+        // (#125).
         let timeline = Timeline::boot();
         let Some((entry, clock)) = timeline.origin() else {
             crate::ktest::diag(format_args!("timeline: {timeline}"));
