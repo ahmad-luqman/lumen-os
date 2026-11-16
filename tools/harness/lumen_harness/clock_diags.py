@@ -66,10 +66,19 @@ def check_clock_diags(report: tap.TapReport, text: str) -> None:
     # so), in now_ns_follows_the_hpet.
     real = re.findall(r"^# bracket widths: start ", text, re.MULTILINE)
     assert len(real) == 1, f"{len(real)} now_ns bracket lines"
+    # Every bracket line's retry count matches its readings, the injected
+    # tests' too (they retake at the end as well as at the start).
+    for line in re.findall(
+        r"^# (?:injected pause: )?(bracket widths: start .*)$", text, re.MULTILINE
+    ):
+        b = HPET_BRACKETS.fullmatch(line)
+        assert b, f"not a bracket line: {line}"
+        taken = [len(_widths(b[end])) for end in ("start", "end")]
+        expected = sum(max(n - 1, 0) for n in taken)
+        assert int(b["retries"]) == expected, f"retries don't match the readings: {line}"
     m = one_diagnostic(report, "time::now_ns_follows_the_hpet", HPET_BRACKETS)
     start, end, retries = _widths(m["start"]), _widths(m["end"]), int(m["retries"])
     assert start and end, f"an end has no readings: {m.group(0)}"
-    assert retries == len(start) + len(end) - 2, f"retries don't match the readings: {m.group(0)}"
     assert retries <= MOST_HPET_RETRIES, f"over {MOST_HPET_RETRIES} retries: {m.group(0)}"
     assert start[-1] <= HPET_BRACKET_NS and end[-1] <= HPET_BRACKET_NS, m.group(0)
     # The timer test's brackets each hold an HPET read, so they have widths.

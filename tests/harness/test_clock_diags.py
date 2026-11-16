@@ -34,6 +34,7 @@ def run(
     extra_line=False,
     timer_max=39000,
     placement_tries=1,
+    injected_retries=2,
 ):
     now_ns = NOW_NS.format(start=start, end=end, retries=retries, limit=limit)
     cases = [
@@ -45,6 +46,13 @@ def run(
         (
             "a_stalled_hpet_bracket_is_read_again",
             "# injected pause: bracket widths [246000, 101000, 1000] ns\n",
+        ),
+        (
+            "one_stalled_reading_at_each_end_still_passes",
+            (
+                "# injected pause: bracket widths: start [5051000, 1000] ns, end [5028000, 1000] "
+                f"ns ({injected_retries} taken again; at most 100000 ns trusted)\n"
+            ),
         ),
         (
             "every_stalled_hpet_bracket_is_a_failure",
@@ -81,9 +89,12 @@ def test_three_retries_fail():
 
 
 def test_a_retry_count_that_doesnt_match_the_readings_fails():
-    # The diag counting only the start's retries.
+    # The diag counting only the start's retries, in the real check or in an
+    # injected one that retakes both ends.
     with pytest.raises(AssertionError, match="retries don't match"):
         check_clock_diags(*run(start="25000", end="120000, 1000", retries=0))
+    with pytest.raises(AssertionError, match="retries don't match"):
+        check_clock_diags(*run(injected_retries=1))
 
 
 def test_two_bracket_lines_fail():
@@ -97,7 +108,7 @@ def test_the_bracket_line_in_another_case_fails():
 
 
 def test_another_limit_fails():
-    with pytest.raises(AssertionError, match="now_ns_follows_the_hpet: 0 lines"):
+    with pytest.raises(AssertionError, match="not a bracket line"):
         check_clock_diags(*run(limit=50000))
 
 
