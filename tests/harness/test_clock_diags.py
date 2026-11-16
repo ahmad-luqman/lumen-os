@@ -11,8 +11,9 @@ NOW_NS = (
     "# now_ns moved 50000000 ns, the HPET 50001000 ns: 1000 ns apart, of a 1000020 ns budget\n"
 )
 TIMER = (
-    "# bracket widths min/median/max 0/{median}/{max} ns over 14 brackets; windows taken again: "
-    "0 too long; 0 kept with brackets over 5% of them\n"
+    "# bracket widths min/median/max 0/{median}/{max} ns over 14 brackets; 0 of 7 one-shot windows "
+    "with brackets over 5% of them\n"
+    "# samples [62500000, 62500100, 62499900, 62500000, 62500000, 62500000, 62500000] Hz\n"
     "# timer counts at 62.5 MHz (calibrated 62.5 MHz)\n"
 )
 HPET_PLACEMENT = (

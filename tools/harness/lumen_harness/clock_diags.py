@@ -32,10 +32,11 @@ HPET_BRACKETS = re.compile(
     rf"\((?P<retries>\d+) taken again, {RETRY_SPACING_MS} ms apart; at most {HPET_BRACKET_NS} ns "
     r"trusted\)"
 )
+# `the_timer_is_programmed_for_1_khz` measures the timer's rate over 7
+# one-shot windows (#129).
 TIMER_BRACKETS = re.compile(
     r"bracket widths min/median/max (?P<min>\d+)/(?P<median>\d+)/(?P<max>\d+) ns over "
-    r"(?P<brackets>\d+) brackets; windows taken again: \d+ too long; \d+ kept with brackets "
-    r"over 5% of them"
+    r"(?P<brackets>\d+) brackets; \d+ of 7 one-shot windows with brackets over 5% of them"
 )
 PLACEMENT = re.compile(
     r"injected pause: (?P<what>HPET|timer) placement (?P<off>\d+) ns off \(at most "
@@ -88,7 +89,7 @@ def check_clock_diags(report: tap.TapReport, text: str) -> None:
     # The timer test's brackets each hold an HPET read, so they have widths.
     t = one_diagnostic(report, "time::the_timer_is_programmed_for_1_khz", TIMER_BRACKETS)
     low, median, high, count = (int(t[k]) for k in ("min", "median", "max", "brackets"))
-    assert low <= median <= high and high > 0 and count >= 14, t.group(0)
+    assert low <= median <= high and high > 0 and count == 14, t.group(0)
     # The placement tests each report one judged try, within their tries
     # and their allowance.
     for name in (

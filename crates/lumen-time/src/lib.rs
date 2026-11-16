@@ -330,6 +330,66 @@ pub fn steady_windows<E>(
     Ok(aside)
 }
 
+/// How [`steadiest_windows`] went: `N` windows, the steady ones first (in the
+/// order taken), then, if attempts ran out first, the unsteady ones whose
+/// gaps added up to least (least first); how many are steady; and the
+/// unsteady ones taken (how many, and the last).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Steadiest<const N: usize> {
+    pub windows: [Window; N],
+    pub steady: usize,
+    pub aside: SetAside,
+}
+
+impl<const N: usize> Steadiest<N> {
+    /// Whether most windows are steady: then their median lies between the
+    /// steady ones' (whatever the others say), so it is as good as they are.
+    pub fn median_is_steady(&self) -> bool {
+        self.steady * 2 > N
+    }
+}
+
+/// `N` windows from `take`, at most `attempts` (at least `N`) in all: steady
+/// ones as [`steady_windows`] takes them, `pause` called before each window
+/// taken after an unsteady one (so retakes can be spaced past a burst of
+/// stalls). If attempts run out first, the rest are the unsteady windows
+/// whose gaps added up to least, rather than none: the caller judges what
+/// [`Steadiest::steady`] allows. An error from `take` is returned at once.
+pub fn steadiest_windows<E, const N: usize>(
+    attempts: usize,
+    mut take: impl FnMut() -> Result<Window, E>,
+    mut pause: impl FnMut(),
+) -> Result<Steadiest<N>, E> {
+    debug_assert!(attempts >= N, "{attempts} attempts can't fill {N} windows");
+    let gaps = |w: &Window| w.start_gap.saturating_add(w.end_gap);
+    let mut out = Steadiest { windows: [Window::default(); N], steady: 0, aside: SetAside::default() };
+    // The least-gapped unsteady windows so far, least first.
+    let (mut spare, mut spares) = ([Window::default(); N], 0);
+    let mut retake = false;
+    while out.steady < N && out.steady + out.aside.count < attempts {
+        if retake {
+            pause();
+        }
+        let w = take()?;
+        retake = !w.is_steady();
+        if !retake {
+            out.windows[out.steady] = w;
+            out.steady += 1;
+            continue;
+        }
+        out.aside = SetAside { count: out.aside.count + 1, last: Some(w) };
+        let at = spare[..spares].iter().position(|s| gaps(&w) < gaps(s)).unwrap_or(spares);
+        if at < N {
+            spares = (spares + 1).min(N);
+            spare.copy_within(at..spares - 1, at + 1);
+            spare[at] = w;
+        }
+    }
+    let rest = N - out.steady;
+    out.windows[out.steady..].copy_from_slice(&spare[..rest]);
+    Ok(out)
+}
+
 /// PIT ticks between two readings of a channel counting down, `start` then
 /// `end`. In mode 0 it counts on past 0 (wrapping to 0xffff), so this holds
 /// as long as fewer than 65536 ticks passed ([`pit_end_unambiguous`]).
@@ -915,6 +975,74 @@ mod tests {
         assert_eq!(down_counter_delta(5_000, 60_000, 62_500), 7_500, "reloaded once");
         assert_eq!(down_counter_delta(0, 62_500, 62_500), 0, "at 0, then reloaded");
         assert_eq!(down_counter_delta(7, 7, 62_500), 0);
+    }
+
+    fn gapped(tsc: u64, gaps: u64) -> Window {
+        Window { tsc, reference: tsc / 100, polls: 1, start_gap: 0, end_gap: gaps }
+    }
+
+    #[test]
+    fn steadiest_windows_are_the_steady_ones_when_there_are_enough() {
+        // Two unsteady windows first: both set aside, a pause before each
+        // window taken after them (two), and five steady ones kept in order.
+        let mut n = 0u64;
+        let mut pauses = 0;
+        let r = steadiest_windows::<(), 5>(
+            20,
+            || {
+                n += 1;
+                Ok(if n <= 2 { gapped(10_000_000 + n, 1_000_000) } else { gapped(10_000_000 + n, 0) })
+            },
+            || pauses += 1,
+        )
+        .unwrap();
+        assert_eq!((r.steady, r.aside.count, pauses, n), (5, 2, 2, 7));
+        assert_eq!(r.aside.last, Some(gapped(10_000_002, 1_000_000)));
+        assert_eq!(r.windows.map(|w| w.tsc), [10_000_003, 10_000_004, 10_000_005, 10_000_006, 10_000_007]);
+        assert!(r.median_is_steady());
+    }
+
+    #[test]
+    fn steadiest_windows_fill_up_with_the_least_gapped_when_attempts_run_out() {
+        // Steady windows at attempts 3, 9 and 15 of 20; the rest unsteady
+        // with assorted gaps (tens of µs: 70 µs and up). The three steady ones come first, then the two
+        // unsteady with the smallest gaps; a pause before every window after
+        // an unsteady one.
+        let gaps = [9, 8, 0, 7, 60, 61, 70, 55, 0, 80, 51, 90, 52, 99, 0, 98, 97, 96, 95, 94u64];
+        let (mut n, mut pauses) = (0usize, 0);
+        let r = steadiest_windows::<(), 5>(
+            20,
+            || {
+                n += 1;
+                Ok(gapped(10_000_000 + n as u64, gaps[n - 1] * 10_000))
+            },
+            || pauses += 1,
+        )
+        .unwrap();
+        assert_eq!(n, 20);
+        assert_eq!((r.steady, r.aside.count), (3, 17));
+        // 0 µs gaps are steady; 70 µs and up (over 0.5% of 10 ms) aren't.
+        assert_eq!(r.windows.map(|w| w.tsc - 10_000_000), [3, 9, 15, 4, 2], "steady in order, then least gapped");
+        assert_eq!(pauses, 16, "before each window after an unsteady one: none after the last");
+        assert!(r.median_is_steady(), "3 of 5");
+    }
+
+    #[test]
+    fn steadiest_windows_with_none_steady_are_the_least_gapped() {
+        let mut n = 0u64;
+        let r = steadiest_windows::<(), 5>(
+            6,
+            || {
+                n += 1;
+                Ok(gapped(10_000_000, (100 - n) * 1_000))
+            },
+            || {},
+        )
+        .unwrap();
+        assert_eq!((r.steady, r.aside.count), (0, 6));
+        assert_eq!(r.windows.map(|w| w.end_gap / 1_000), [94, 95, 96, 97, 98]);
+        assert!(!r.median_is_steady());
+        assert_eq!(steadiest_windows::<u8, 5>(20, || Err(7), || {}), Err(7), "an error at once");
     }
 
     #[test]

@@ -46,7 +46,7 @@ const ICR_ASSERT: u32 = 1 << 14;
 /// How many times [`send`] polls for the IPI to go out before giving up.
 const ICR_SPINS: u32 = 1_000_000;
 /// Divide configuration 0b0011: the timer counts at the bus clock / 16.
-const DIVIDE_BY_16: u32 = 0b0011;
+pub const DIVIDE_BY_16: u32 = 0b0011;
 /// What [`DIVIDE_BY_16`] divides by.
 pub const TIMER_DIVISOR: u64 = 16;
 
@@ -199,6 +199,13 @@ pub fn timer_prepare_one_shot() {
     write(LVT_TIMER, LVT_MASKED);
 }
 
+/// Make the timer run once, masked, keeping its divider (for ktests that
+/// measure the rate a periodic setup left), without starting it.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))]
+pub fn timer_mask_one_shot() {
+    write(LVT_TIMER, LVT_MASKED);
+}
+
 /// Start the timer counting down from `count` (writing its initial count).
 pub fn timer_start(count: u32) {
     write(TIMER_INITIAL, count);
@@ -215,6 +222,12 @@ pub fn timer_periodic(count: u32) {
     write(TIMER_DIVIDE, DIVIDE_BY_16);
     write(LVT_TIMER, LVT_PERIODIC | u32::from(TIMER));
     write(TIMER_INITIAL, count);
+}
+
+/// The timer's divide configuration register, its low 4 bits (for ktests).
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))]
+pub fn timer_divide_config() -> u32 {
+    read(TIMER_DIVIDE) & 0b1111
 }
 
 /// The timer's LVT entry, error LVT entry and initial count (for ktests).
