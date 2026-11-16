@@ -1,7 +1,7 @@
 # Features: time. See tests/features/README.md for the format.
 
 [[feature]]
-name = "Calibrated TSC (against the HPET, or the PIT without one): each window's ends are reference readings between two TSC reads (the PIT's counter read at both), a window with a paused reading is taken again, and calibration gives up after 20; the shell's clocks lists the windows; the local APIC timer calibrated against the TSC the same way (the timer started, and its count read, each between two TSC reads; a window with a paused end taken again, 20 ms later; short of steady windows after 20, the least unsteady fill in, with a warning saying how far off the median may be unless most are steady); now_ns and sleep"
+name = "Calibrated TSC (against the HPET, or the PIT without one): each window's ends are reference readings between two TSC reads (the PIT's counter read at both), a window with a paused reading is taken again, and calibration gives up after 20; the shell's clocks lists the windows; the local APIC timer calibrated against the TSC the same way (the timer started, and its count read, each between two TSC reads; a window with a paused end taken again, 20 ms later; short of steady windows after 20, the least unsteady fill in: logged at INFO while most are steady, else a warning saying how far off the median may be, and a panic if that is 100% or more); now_ns and sleep"
 milestone = "M1"
 tests = [
     "cargo:lumen-time",
@@ -18,7 +18,7 @@ tests = [
     "ktest:lumen_kernel::time::a_paused_timer_reading_is_not_steady",
     "ktest:lumen_kernel::time::a_timer_calibration_waits_between_retakes",
     "ktest:lumen_kernel::time::a_timer_calibration_short_of_steady_windows_fills_in",
-    "ktest:lumen_kernel::time::the_timer_calibration_warns_only_without_mostly_steady_windows",
+    "ktest:lumen_kernel::time::the_timer_calibration_report_fits_each_outcome",
     "ktest:lumen_kernel::time::the_boot_timer_calibration_is_the_median_of_mostly_steady_windows",
     "ktest:lumen_kernel::time::sleep_10ms_elapses",
     "ktest:lumen_kernel::time::now_ns_follows_the_hpet",

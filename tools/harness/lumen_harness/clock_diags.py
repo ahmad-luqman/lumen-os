@@ -107,9 +107,12 @@ def check_clock_diags(report: tap.TapReport, text: str) -> None:
         "time::the_boot_timer_calibration_is_the_median_of_mostly_steady_windows",
         BOOT_TIMER,
     )
-    windows, rates = b["windows"].split(), _widths(b["rates"])
-    assert len(windows) == 5 and len(rates) == 5, b.group(0)
-    assert 3 <= int(b["steady"]) <= 5, f"most windows unsteady: {b.group(0)}"
+    windows, rates, steady = b["windows"].split(), _widths(b["rates"]), int(b["steady"])
+    assert len(windows) == 5 and len(rates) == 5, f"not 5 windows and rates: {b.group(0)}"
+    assert steady <= len(windows), f"more steady than windows: {b.group(0)}"
+    assert steady * 2 > len(windows), f"most windows unsteady: {b.group(0)}"
+    # Most steady (gaps at most 0.5% each): the median within 0.5%.
+    assert int(b["bound"]) <= 5000, f"median bound over 0.5% with most steady: {b.group(0)}"
     # The placement tests each report one judged try, within their tries
     # and their allowance.
     for name in (

@@ -799,12 +799,13 @@ allocates.
   too, each end a register access between two TSC reads (the timer started
   by one write, its count read), so a window whose ends were paused (gaps
   over 0.5% of it) is taken again, 20 ms later (stalls come in bursts), up
-  to 20 (#129). If those run out, the least unsteady fill in rather than
-  panicking the boot: with three or more of the five steady the median lies
-  between theirs; otherwise boot warns how far off it may be (the third
-  smallest gap share). The timer only paces preemption and when deadlines
-  are noticed; sleeps and deadlines are TSC times. It is then set periodic
-  at 1 kHz. `time::now_ns` (TSC-based, lock-free) and
+  to 20 windows in all (#129). If those run out, the least unsteady fill in
+  rather than panicking the boot: with three or more of the five steady the
+  median lies between theirs (logged at INFO); otherwise boot warns how far
+  off it may be (the third smallest gap share), and panics only if that is
+  100% or more (the rate says nothing). The timer paces preemption, when
+  deadlines are noticed, the cursor's blink and the `ticks` counts; sleeps
+  and deadlines themselves are TSC times. It is then set periodic at 1 kHz. `time::now_ns` (TSC-based, lock-free) and
   `time::sleep` (blocks the thread once the scheduler runs on its CPU,
   section "Kernel threads"; busy-waits before that, on an idle thread, with
   interrupts off or a lock held), `time::spin` (always busy). The boot CPU

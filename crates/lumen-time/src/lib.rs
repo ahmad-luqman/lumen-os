@@ -239,8 +239,10 @@ impl Window {
     }
 
     /// Its gaps added up, as a share of it in parts per million, rounded
-    /// up: how far off (at most) the rate it gives is. `u64::MAX` for an
-    /// empty window or gaps as long as it.
+    /// up: the most the rate it gives can be off, as a share of the true rate
+    /// (high or low; the window's own error only, not that of the clock it
+    /// is counted against). `u64::MAX` for an empty window or gaps as long as
+    /// it.
     pub fn gap_ppm(&self) -> u64 {
         let gaps = u128::from(self.start_gap) + u128::from(self.end_gap);
         if self.tsc == 0 || gaps >= u128::from(self.tsc) {
@@ -250,8 +252,9 @@ impl Window {
     }
 
     /// Orders windows by how much of each its gaps take up, least first
-    /// (exactly: cross-multiplied, not rounded); an empty window after any
-    /// other.
+    /// (exactly: cross-multiplied, not rounded, which holds while each
+    /// window's two gaps add up to less than 2^64 ticks); an empty window
+    /// after any other.
     pub fn cmp_gaps(&self, other: &Window) -> core::cmp::Ordering {
         match (self.tsc, other.tsc) {
             (0, 0) => core::cmp::Ordering::Equal,
@@ -326,9 +329,9 @@ pub enum SteadyError<E> {
     Unsteady { steady: usize, attempts: usize, last: Window },
 }
 
-/// The unsteady windows a calibration took: how many, and the last. Each
-/// was taken again; [`steadiest_windows`] may still keep some, to fill in
-/// when attempts run out.
+/// The unsteady windows a calibration took: how many, and the last. Each was
+/// followed by another window, unless attempts ran out;
+/// [`steadiest_windows`] may still keep some, to fill in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SetAside {
     pub count: usize,
@@ -361,21 +364,23 @@ pub fn median_is_steady(steady: usize, n: usize) -> bool {
 }
 
 /// The most a median of `windows`' rates can be off, in parts per million
-/// of the true rate, rounded up: the `(N + 1) / 2`-th smallest of their
+/// of the true rate, rounded up: the `(N / 2 + 1)`-th smallest of their
 /// [`Window::gap_ppm`]. Each window's rate is off by at most its own (its
-/// error lies inside its gaps), and those `(N + 1) / 2` windows, each within
-/// that much, are most of them, so the median lies between two of theirs.
-/// `u64::MAX` if one of those has gaps as long as itself (no bound).
+/// error lies inside its gaps), and those `N / 2 + 1` windows, each within
+/// that much, are more than half of them, so the median (for even `N`, the
+/// midpoint of the middle two) lies between two of theirs. `u64::MAX` (no
+/// bound) if one of those has gaps as long as itself, or for no windows.
 pub fn median_bound_ppm<const N: usize>(windows: &[Window; N]) -> u64 {
     let mut ppm = windows.map(|w| w.gap_ppm());
     ppm.sort_unstable();
-    ppm.get(N.saturating_sub(1) / 2).copied().unwrap_or(0)
+    ppm.get(N / 2).copied().unwrap_or(u64::MAX)
 }
 
 /// How [`steadiest_windows`] went: `N` windows, the steady ones first (in the
 /// order taken), then, if attempts ran out first, the unsteady ones whose
-/// gaps were the least of them ([`Window::cmp_gaps`], least first); how many
-/// are steady; and the unsteady ones taken (how many, and the last).
+/// gaps were the least of them ([`Window::cmp_gaps`], least first, the
+/// earlier of two equal ones first); how many are steady; and the unsteady
+/// ones taken (how many, and the last).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Steadiest<const N: usize> {
     windows: [Window; N],
@@ -397,11 +402,6 @@ impl<const N: usize> Steadiest<N> {
     /// The unsteady windows taken (some may fill in).
     pub fn aside(&self) -> SetAside {
         self.aside
-    }
-
-    /// See [`median_is_steady`].
-    pub fn median_is_steady(&self) -> bool {
-        median_is_steady(self.steady, N)
     }
 }
 
@@ -1057,7 +1057,7 @@ mod tests {
         assert_eq!((r.steady(), r.aside().count, pauses, n), (5, 2, 2, 7));
         assert_eq!(r.aside().last, Some(gapped(10_000_002, 1_000_000)));
         assert_eq!(r.windows().map(|w| w.tsc), [10_000_003, 10_000_004, 10_000_005, 10_000_006, 10_000_007]);
-        assert!(r.median_is_steady());
+        assert!(median_is_steady(r.steady(), 5));
     }
 
     #[test]
@@ -1082,7 +1082,7 @@ mod tests {
         assert_eq!((r.steady(), r.aside().count), (3, 17));
         assert_eq!(r.windows().map(|w| w.tsc - 10_000_000), [3, 9, 15, 4, 2], "steady in order, then least gapped");
         assert_eq!(pauses, 16, "before each window after an unsteady one: none after the last");
-        assert!(r.median_is_steady(), "3 of 5");
+        assert!(median_is_steady(r.steady(), 5), "3 of 5");
     }
 
     #[test]
@@ -1099,7 +1099,7 @@ mod tests {
         .unwrap();
         assert_eq!((r.steady(), r.aside().count), (0, 6));
         assert_eq!(r.windows().map(|w| w.end_gap / 1_000), [94, 95, 96, 97, 98]);
-        assert!(!r.median_is_steady());
+        assert!(!median_is_steady(r.steady(), 5));
         assert_eq!(steadiest_windows::<u8, 5>(20, || Err(7), || {}), Err(7), "an error at once");
     }
 
@@ -1130,6 +1130,17 @@ mod tests {
         let r = steadiest_windows::<(), 1>(2, || Ok(it.next().unwrap()), || {}).unwrap();
         assert_eq!(r.windows()[0], a);
         assert_eq!(empty.cmp_gaps(&empty), core::cmp::Ordering::Equal);
+        // Both gaps' sum, not the larger: X (0.6% + 0.6%) after Y (1.0% + 0).
+        let x = Window { tsc: 10_000_000, reference: 1, polls: 1, start_gap: 60_000, end_gap: 60_000 };
+        let y = Window { tsc: 10_000_000, reference: 1, polls: 1, start_gap: 100_000, end_gap: 0 };
+        let mut it = [x, y].into_iter();
+        let r = steadiest_windows::<(), 1>(2, || Ok(it.next().unwrap()), || {}).unwrap();
+        assert_eq!(r.windows()[0], y);
+        // Of two with the same share, the earlier is kept first.
+        let (p, q) = (Window { polls: 1, ..x }, Window { polls: 2, ..x });
+        let mut it = [p, q].into_iter();
+        let r = steadiest_windows::<(), 2>(2, || Ok(it.next().unwrap()), || {}).unwrap();
+        assert_eq!(r.windows().map(|w| w.polls), [1, 2]);
     }
 
     #[test]
@@ -1142,6 +1153,10 @@ mod tests {
         assert_eq!(w(u64::MAX, u64::MAX / 2, 0).gap_ppm(), 500_000, "no overflow");
     }
 
+    fn truth_rate() -> u64 {
+        62_500_000
+    }
+
     #[test]
     fn a_median_is_off_by_at_most_its_middle_gap_share() {
         // Gap shares 0.1%, 9%, 0.2%, 50%, 0.3%: the third smallest is 0.3%.
@@ -1149,7 +1164,16 @@ mod tests {
         assert_eq!(median_bound_ppm(&[w(1_000), w(90_000), w(2_000), w(500_000), w(3_000)]), 3_000);
         // Three windows with no bound: none for the median either.
         assert_eq!(median_bound_ppm(&[w(1_000), w(1_000_000), w(2_000), w(1_000_000), w(1_000_000)]), u64::MAX);
-        assert_eq!(median_bound_ppm::<0>(&[]), 0);
+        assert_eq!(median_bound_ppm::<0>(&[]), u64::MAX, "no windows, no bound");
+        // Even N: the median is the midpoint of the middle two, so a bound
+        // needs N / 2 + 1 windows. Shares 0.1%, 0.1%, 50%, 50%: two 50%-off
+        // windows can pull the midpoint 25% off, and the bound says 50%.
+        let four = [w(1_000), w(1_000), w(500_000), w(500_000)];
+        assert_eq!(median_bound_ppm(&four), 500_000);
+        let mut rates = [truth_rate(), truth_rate(), truth_rate() / 2, truth_rate() / 2];
+        let m = median(&mut rates).unwrap();
+        assert!(m.abs_diff(truth_rate()) * 1_000_000 <= truth_rate() * 500_000, "{m}");
+        assert!(m.abs_diff(truth_rate()) * 1_000_000 > truth_rate() * 1_000, "the third smallest would be wrong");
         // The bound holds: rates each off by their own share, the median
         // within the third smallest share of the true rate.
         let truth = 62_500_000u64;
@@ -1173,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn a_timer_calibration_takes_its_first_three_paused_windows_again() {
+    fn made_up_timer_windows_paused_first_are_taken_again() {
         // The first three windows paused at the end (#129's stall: 10% low
         // each, enough to move a median of five), then steady ones at
         // 62.5 MHz: all three are taken again, each after a pause, and the
@@ -1194,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn a_timer_calibration_short_of_steady_windows_fills_in() {
+    fn made_up_timer_windows_short_of_steady_ones_fill_in() {
         // Only 3 (then 2) of 20 windows steady at 62.5 MHz; two unsteady
         // ones 2% low with 200 µs end gaps (2%), the rest 20% low with just
         // over 2 ms (20%): the steady ones and the two 2% ones are kept,
@@ -1226,7 +1250,7 @@ mod tests {
             assert!(fill.eq(core::iter::repeat_n(200, 2).chain(core::iter::repeat_n(2_001, 3 - steady_at.len()))));
             assert_eq!(timer_rate(r.windows()), hz);
             assert_eq!(median_bound_ppm(r.windows()), bound);
-            assert_eq!(r.median_is_steady(), steady_at.len() == 3);
+            assert_eq!(median_is_steady(r.steady(), 5), steady_at.len() == 3);
         }
     }
 

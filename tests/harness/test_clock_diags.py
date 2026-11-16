@@ -17,10 +17,10 @@ TIMER = (
     "# timer counts at 62.5 MHz (calibrated 62.5 MHz)\n"
 )
 BOOT_TIMER = (
-    "# timer boot calibration 62500000 Hz [10000000/625000/1/0/0 10000000/625000/1/0/0 "
-    "10000000/625000/1/0/0 10000000/625000/1/0/0 10000000/625000/1/0/0] retook {retook}, {steady} steady, "
-    "median within 100 ppm; window rates [62500000, 62500000, 62500000, 62500000, 62500000] Hz\n"
+    "# timer boot calibration 62500000 Hz [{windows}] retook {retook}, {steady} steady, "
+    "median within {bound} ppm; window rates [{rates}] Hz\n"
 )
+WINDOW = "10000000/625000/1/0/0"
 HPET_PLACEMENT = (
     "# injected pause: HPET placement {off} ns off (at most 2500000 ns allowed) on try {tries} "
     "of 8, 20 ms apart; paused brackets [10048000] ns, the reference's 30000 ns\n"
@@ -40,9 +40,12 @@ def run(
     extra_line=False,
     timer_max=39000,
     timer_brackets=14,
-    boot_timer=True,
+    boot_lines=1,
+    boot_windows=5,
+    boot_rates=5,
     boot_steady=5,
     boot_retook=7,
+    boot_bound=100,
     placement_tries=1,
     injected_retries=2,
     hpet_off=5000,
@@ -80,7 +83,16 @@ def run(
         ("a_timer_reading_is_placed_at_its_brackets_midpoint", TIMER_PLACEMENT),
         (
             "the_boot_timer_calibration_is_the_median_of_mostly_steady_windows",
-            BOOT_TIMER.format(steady=boot_steady, retook=boot_retook) if boot_timer else "",
+            (
+                BOOT_TIMER.format(
+                    windows=" ".join([WINDOW] * boot_windows),
+                    retook=boot_retook,
+                    steady=boot_steady,
+                    bound=boot_bound,
+                    rates=", ".join(["62500000"] * boot_rates),
+                )
+                * boot_lines
+            ),
         ),
     ]
     if now_ns_case != "now_ns_follows_the_hpet":
@@ -145,13 +157,35 @@ def test_timer_brackets_other_than_two_per_window_fail(brackets):
 
 def test_a_missing_timer_boot_calibration_line_fails():
     with pytest.raises(AssertionError, match="0 timer boot calibration lines"):
-        check_clock_diags(*run(boot_timer=False))
+        check_clock_diags(*run(boot_lines=0))
 
 
 @pytest.mark.parametrize("steady", [0, 2])
 def test_a_timer_boot_calibration_with_most_windows_unsteady_fails(steady):
     with pytest.raises(AssertionError, match="most windows unsteady"):
         check_clock_diags(*run(boot_steady=steady))
+
+
+def test_two_timer_boot_calibration_lines_fail():
+    with pytest.raises(AssertionError, match="2 timer boot calibration lines"):
+        check_clock_diags(*run(boot_lines=2))
+
+
+@pytest.mark.parametrize("windows, rates", [(4, 5), (5, 4), (6, 6)])
+def test_a_timer_boot_calibration_without_5_windows_and_rates_fails(windows, rates):
+    with pytest.raises(AssertionError, match="not 5 windows and rates"):
+        check_clock_diags(*run(boot_windows=windows, boot_rates=rates))
+
+
+def test_a_timer_boot_calibration_with_more_steady_than_windows_fails():
+    with pytest.raises(AssertionError, match="more steady than windows"):
+        check_clock_diags(*run(boot_steady=6))
+
+
+def test_a_timer_boot_calibration_bound_over_half_a_percent_fails():
+    check_clock_diags(*run(boot_bound=5000))
+    with pytest.raises(AssertionError, match="median bound over 0.5%"):
+        check_clock_diags(*run(boot_bound=5001))
 
 
 def test_any_number_of_timer_boot_retakes_passes():

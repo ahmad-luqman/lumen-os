@@ -196,12 +196,11 @@ pub fn error_status() -> u32 {
 /// read the TSC on both sides of just that write.
 pub fn timer_prepare_one_shot() {
     write(TIMER_DIVIDE, DIVIDE_BY_16);
-    write(LVT_TIMER, LVT_MASKED);
+    timer_mask_one_shot();
 }
 
-/// Make the timer run once, masked, keeping its divider (for ktests that
-/// measure the rate a periodic setup left), without starting it.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))]
+/// Make the timer run once, masked, keeping its divider (ktests measure the
+/// rate a periodic setup left with it), without starting it.
 pub fn timer_mask_one_shot() {
     write(LVT_TIMER, LVT_MASKED);
 }
