@@ -25,6 +25,7 @@ import pytest
 from lumen_harness import qemu
 from lumen_harness.qemu import DEVICE_IDS, HOSTFWD_FAILED, Devices, Machine
 from lumen_harness.screen import PROMPT
+from lumen_harness.shell import run
 
 EVERY_DEVICE = set(DEVICE_IDS.values())
 # The PCI vendor id of every virtio device (Red Hat's).
@@ -107,15 +108,6 @@ def shell(boot, **kwargs) -> Machine:
     m.expect(SHELLS, 60)
     m.expect(PROMPT, 60)
     return m
-
-
-def run(m: Machine, line: str) -> str:
-    """Run `line` in the serial shell: what it printed between its echo and
-    the next prompt."""
-    m.send_line(line)
-    echo = m.expect(re.escape(line) + r"\n", 10)
-    end = m.expect(PROMPT, 10)
-    return m.output[echo.end() : end.start()]
 
 
 def lspci_rows(m: Machine) -> dict[str, tuple[int, int, str, str, str]]:

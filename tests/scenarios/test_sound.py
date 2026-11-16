@@ -17,6 +17,7 @@ import pytest
 from lumen_harness import audio
 from lumen_harness.qemu import Devices, Machine
 from lumen_harness.screen import PROMPT
+from lumen_harness.shell import run
 
 SHELLS = r"INFO  shell: shells? on serial.*; type 'help'\n"
 SOUND = Devices(sound=True)
@@ -39,15 +40,6 @@ def rate_of(m: Machine) -> int:
     ready = re.search(READY, m.output)
     assert ready, "no sound line"
     return int(ready[2])
-
-
-def run(m: Machine, line: str, timeout: float = 10) -> str:
-    """Run `line` in the serial shell: what it printed between its echo and
-    the next prompt."""
-    m.send_line(line)
-    echo = m.expect(re.escape(line) + r"\n", 10)
-    end = m.expect(PROMPT, timeout)
-    return m.output[echo.end() : end.start()]
 
 
 def sound_row(m: Machine) -> dict[str, str]:

@@ -17,6 +17,7 @@ import re
 import pytest
 from lumen_harness.qemu import Devices, Machine
 from lumen_harness.screen import PROMPT
+from lumen_harness.shell import run
 
 SHELLS = r"INFO  shell: shells on serial and the screen; type 'help'\n"
 HEX = re.compile(r"[0-9a-f]+")
@@ -31,15 +32,6 @@ def shell(boot, **kwargs) -> Machine:
     m.expect(SHELLS, 60)
     m.expect(PROMPT, 60)
     return m
-
-
-def run(m: Machine, line: str, timeout: float = 10) -> str:
-    """Run `line` in the serial shell: what it printed between its echo and
-    the next prompt."""
-    m.send_line(line)
-    echo = m.expect(re.escape(line) + r"\n", 10)
-    end = m.expect(PROMPT, timeout)
-    return m.output[echo.end() : end.start()]
 
 
 def random_bytes(m: Machine, n: int | None = None) -> str:
@@ -174,10 +166,9 @@ def test_a_virtio_rng_that_stops_answering_is_dropped(boot, cpu, left):
     sources = "RDRAND, virtio-rng" if cpu else "virtio-rng"
     assert f"INFO  rng: sources: {sources}\n" in m.output
     for _ in range(10):
-        out = run(m, "random", timeout=15)
-        # (A warning lands among the output on serial.)
-        answers = [line for line in out.splitlines() if HEX.fullmatch(line)]
-        assert len(answers) == 1 and len(answers[0]) == 32, out
+        # The request that misses its deadline warns while `random` runs.
+        out = run(m, "random", timeout=15, allow=r"WARN  rng: virtio-rng on \S+: ")
+        assert HEX.fullmatch(out.strip()) and len(out.strip()) == 32, out
         if "WARN  rng" in m.output:
             break
     else:
@@ -257,14 +248,16 @@ def test_a_virtio_rng_that_turns_to_zeros_is_dropped(boot, tmp_path):
     )
     assert "INFO  rng: sources: virtio-rng\n" in m.output
     for _ in range(40):
-        out = run(m, "random")
-        answers = [line for line in out.splitlines() if HEX.fullmatch(line)]
-        assert len(answers) == 1 and len(answers[0]) == 32, out
+        # The zeros are warned about (once), and the drop, while `random` runs.
+        out = run(m, "random", allow=r"WARN  rng: virtio-rng ")
+        assert HEX.fullmatch(out.strip()) and len(out.strip()) == 32, out
         if "; dropped" in m.output:
             break
     else:
         pytest.fail("the device answering zeros was never dropped")
-    # Warned about once (rate-limited), then dropped at the 8th in a row.
+    # Warned about once (rate-limited), then dropped at the 8th in a row:
+    # the only two warnings (the ones `random` allowed).
+    assert m.output.count("WARN  rng") == 2
     assert m.output.count("WARN  rng: virtio-rng answered 32 bytes of 0x00; not mixed in") == 1
     assert "(1 such answers since boot)" in m.output
     why = "the device answered 32 bytes of 0x00 8 times running"

@@ -1298,6 +1298,26 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   overlong forms; host tested). The serial shell's writes are made holding
   the log's line lock (`klog::LockedSerial`, see step 4 of the boot
   sequence), so a log line can't land inside one (not tested on its own).
+  Each log line is written whole (the logger holds the line lock for the
+  line; `crash`'s `Out` takes it per piece, and the crash reporter takes
+  none), but one can land between two of the shell's writes: before or
+  inside a typed line's echo (a write per key, Enter's newline its own),
+  between two writes of a command's output, or after the output, before
+  the prompt. The log isn't held while a command prints (#124): a line
+  shows when it is logged, in stamp order, so a warning during a long or
+  stuck command isn't hidden until it ends. The scenarios read a
+  command's output through `lumen_harness.shell.run`: it takes log lines
+  out wherever they start (the format of "Boot timeline and log
+  timestamps", matched by `lumen_harness.klog`; change it with
+  kernel/src/klog.rs) and keeps them on the result, from the prompt
+  before the echo on, and a WARN or ERROR among them fails the run unless
+  the test allows that line (a warning is something a test should see). A
+  command whose output is log lines (`dmesg`) is read with `run_dmesg`,
+  which drops (and checks) the lines logged while it ran. Scenarios put a debug line inside a
+  command's echo, between two of its output writes, and after its output
+  before the prompt (#124's position); harness self-tests cover all three
+  positions on handcrafted text, and the position after the output on
+  #124's recorded output.
   Each key's output is written to the console in
   one write, so on the screen a log line can't land in the middle of a
   redraw (not tested on its own). A running command reads keys from its
@@ -1362,7 +1382,8 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
     saying why any are missing (`pci::status`).
   - `mouse`: the tablet (#98, section 7): a header with its name,
     address, screen and counts (events, frames, ignored, `SYN_DROPPED`s,
-    at least so many overruns, why it failed), and one row: position,
+    overruns: batches that may have lost frames, why it failed), and one
+    row: position,
     buttons held, presses so far (summed), wheels, the pointer (`drawn`,
     `hidden` under a canvas, `none` without a terminal), `stale`, and why
     it failed; `no tablet` and a row of dashes without one.
@@ -2358,12 +2379,19 @@ ever seen.
   (or a wheel turn) that came and went between two looks, while no frame
   was dropped at the device: it sees that a click happened, not where.
 - **Overruns:** the tablet's ring holds 32 event buffers, and QEMU drops a
-  whole frame that doesn't fit, with no `SYN_DROPPED`. A batch that read
-  enough events that a frame may not have fit (30 of 32: a move is 3)
-  counts as an overrun, marks the state stale until a clean batch brings a
-  frame, and the thread looks again at once instead of waiting. The count is a lower bound: frames
-  dropped at the device can't be counted exactly (a scenario sends 300
-  moves unpaced and checks that lost frames come with an overrun).
+  whole frame that doesn't fit, with no `SYN_DROPPED`. A frame holds at
+  most one event per code the device advertises in its `EV_BITS`, and the
+  sync (`lumen_input::frame_bound`; 12 on QEMU's tablet; the boot line
+  says it). A batch that read enough events that such a frame may not
+  have fit (21 or more of 32 on QEMU's tablet) counts as an overrun and
+  marks the state stale until a clean batch brings a frame. What that
+  count guarantees, and its preconditions, are stated once, in
+  `lumen_input::may_have_lost_frames`'s doc, and a host model checks them
+  (#124). Scenarios send 300 moves, and 7-event frames until QEMU traces
+  the first drop (at most 300), unpaced while the guest's CPU is busy, and
+  check that frames were lost (as many as QEMU traced), that an overrun
+  was counted, and the overrun warning; the 7-event frames tell the
+  device's bound from moves' 3.
 - **Keys:** the keyboard's decoded keys (`lumen_shell::Key`, through
   `crate::vt`'s per-terminal rings today). That is a line editor's key
   (characters and editing keys, no key-up, no modifiers on their own),

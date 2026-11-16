@@ -2,6 +2,7 @@
 
 import re
 
+from lumen_harness.klog import LEVEL, stamp_capturing
 from lumen_harness.qemu import EXIT_SUCCESS
 
 BOOT_TIMEOUT = 60
@@ -25,11 +26,10 @@ def test_boot_reaches_logger(boot):
 
 
 # `[seconds.micro] LEVEL tag: message`, or `[    ?.??????]` before the TSC is
-# calibrated (kernel/src/klog.rs, lumen_time::Stamp).
-LOG_LINE = re.compile(
-    r"^\[(?: *(?P<stamp>\d+\.\d{6})|    \?\.\?{6})\] "
-    r"(?:ERROR|WARN |INFO |DEBUG|TRACE) [a-z0-9_:]+: \S"
-)
+# calibrated (kernel/src/klog.rs, lumen_time::Stamp): lumen_harness.klog's
+# pieces, with the stamp captured (without its padding, as `micros` reads
+# it) and a stricter tag and message.
+LOG_LINE = re.compile(rf"^{stamp_capturing('stamp')} {LEVEL} [a-z0-9_:]+: \S")
 # `boot complete`, with its stamp: `kmain` (kernel/src/main.rs) logs it just
 # before it marks the complete phase, and the timeline line just after.
 BOOT_COMPLETE = re.compile(r"\[ *(?P<stamp>\d+\.\d{6})\] INFO  boot: boot complete\n")

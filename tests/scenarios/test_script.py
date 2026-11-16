@@ -3,12 +3,13 @@ drawing on the screen, and Ctrl-C stopping a runaway script on either
 console. The engine's limits (operations, call depth, expression depth) are
 ktests in kernel/src/script.rs."""
 
-import re
 import time
 
 from lumen_harness.image import assert_matches_golden
 from lumen_harness.qemu import Machine
 from lumen_harness.screen import PROMPT, expect_screen
+from lumen_harness.shell import Output
+from lumen_harness.shell import run as shell_run
 from PIL import Image
 
 SHELLS = r"INFO  shell: shells on serial and the screen; type 'help'\n"
@@ -23,13 +24,9 @@ def shells(boot, extra: tuple[str, ...] = ()) -> Machine:
     return m
 
 
-def run(m: Machine, line: str, timeout: float = 30) -> str:
-    """Run `line` in the serial shell: what it printed between its echo and
-    the next prompt."""
-    m.send_line(line)
-    echo = m.expect(re.escape(line) + r"\n", 10)
-    end = m.expect(PROMPT, timeout)
-    return m.output[echo.end() : end.start()]
+def run(m: Machine, line: str, timeout: float = 30) -> Output:
+    """`lumen_harness.shell.run`, waiting up to 30 s for the prompt."""
+    return shell_run(m, line, timeout)
 
 
 def test_rhai_eval(boot):

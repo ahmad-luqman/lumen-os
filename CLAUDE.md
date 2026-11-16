@@ -198,9 +198,12 @@ own PR that updates that doc first.
   in bands, and Game of Life with its patterns (host-tested).
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
 - `crates/lumen-input`: pointer input: evdev events into whole-frame
-  pointer states, axes scaled to the screen (`Tablet`, `AbsAxis`), and the
-  arrow sprite with its save-under (`Cursor`, over a `Surface`)
-  (host-tested, incl. a randomized model of drawing around it).
+  pointer states, axes scaled to the screen (`Tablet`, `AbsAxis`), a
+  frame's most events from the device's `EV_BITS` (`frame_bound`) and
+  whether a batch may have lost frames (`may_have_lost_frames`, the one
+  statement of what overruns guarantee; a model of QEMU's ring checks
+  it), and the arrow sprite with its save-under (`Cursor`, over a
+  `Surface`) (host-tested, incl. a randomized model of drawing around it).
 - `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, the
   page-table format and mapper (host-tested, incl. a model comparison), the
   window tokens that confine `paging::map`, and the kernel-stack layout and
@@ -258,6 +261,9 @@ own PR that updates that doc first.
   `move_pointer`/`click` for the tablet), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
   `crash.py` (crash-report parsing), `audio.py` (wav files as QEMU's
   wav audiodev writes them: pitch by zero crossings, Goertzel amplitude),
-  `screen.py` (the screen's rows through the serial shell's `term text`).
+  `screen.py` (the screen's rows through the serial shell's `term text`),
+  `shell.py` (`run`: a serial command's output, the log's lines taken out
+  and kept, a WARN or ERROR failing it unless allowed; `PROMPT`), `klog.py`
+  (the kernel log line's format, as kernel/src/klog.rs prints it).
 - `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests.
   `tests/features/*.toml`: feature → test map (the CI feature gate and STATUS.md).

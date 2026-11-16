@@ -16,13 +16,14 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from lumen_harness.shell import PROMPT
+
 if TYPE_CHECKING:
     from lumen_harness.qemu import Machine
 
 SUMMARY = re.compile(
     r"^term text: (\d+) rows, cursor (?:\((\d+), (\d+)\)|below the view)\n", re.MULTILINE
 )
-PROMPT = r"lumen> "
 
 
 @dataclass
