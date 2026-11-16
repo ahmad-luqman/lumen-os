@@ -30,6 +30,9 @@ LOG_LINE = re.compile(
     r"^\[(?: *(?P<stamp>\d+\.\d{6})|    \?\.\?{6})\] "
     r"(?:ERROR|WARN |INFO |DEBUG|TRACE) [a-z0-9_:]+: \S"
 )
+# `boot complete`, with its stamp: `kmain` (kernel/src/main.rs) logs it just
+# before it marks the complete phase, and the timeline line just after.
+BOOT_COMPLETE = re.compile(r"\[ *(?P<stamp>\d+\.\d{6})\] INFO  boot: boot complete\n")
 # The timeline line, with its own stamp (kernel/src/trace.rs, `Timeline`).
 # An incomplete one is logged at warn: matched too, so the test fails at once
 # with the line instead of timing out.
@@ -66,6 +69,9 @@ BEFORE_KMAIN = re.compile(
     r"kmain began (?P<gap>[+-]\d+\.\d{3}) ms after the handoff|.*)\n"
 )
 
+# What `micros` reads: unsigned, 3 or 6 decimal places.
+DECIMAL = re.compile(r"(\d+)\.(\d{3}|\d{6})")
+
 
 def kernel_lines(output: str) -> list[str]:
     """The kernel's lines, from its first log line to before the prompt.
@@ -77,8 +83,10 @@ def kernel_lines(output: str) -> list[str]:
 
 def micros(decimal: str) -> int:
     """A decimal number of seconds (6 places) or milliseconds (3 places) as
-    an integer count of microseconds: exact, unlike floats."""
-    whole, frac = decimal.split(".")
+    an integer count of microseconds: exact, unlike floats. No sign."""
+    parts = DECIMAL.fullmatch(decimal)
+    assert parts, decimal
+    whole, frac = parts.groups()
     return int(whole) * 10 ** len(frac) + int(frac)
 
 
@@ -102,8 +110,9 @@ def test_log_lines_are_structured(boot):
 
 
 def test_boot_timeline_printed(boot):
-    """At boot complete, every phase's time since the timeline's origin, in
-    order; then Limine's times, with the origin after Limine's handoff."""
+    """Every phase since the timeline's origin, in order, the total between
+    the log stamps around it; then Limine's times, with the origin after its
+    handoff."""
     m = boot("qemutest")
     line = m.expect(TIMELINE, BOOT_TIMEOUT)
     timeline = COMPLETE.fullmatch(line["text"])
@@ -132,7 +141,7 @@ def test_boot_timeline_printed(boot):
     # 10 ms wait by its own frequency) after the handoff tick, and Limine's
     # frequency at least half of ours, so the gap in our clock is at least
     # 5 ms. Starvation only lengthens it: a floor, not a time bound.
-    assert float(before["gap"]) >= 5.0, what
+    assert micros(before["gap"].removeprefix("+")) >= 5_000, what
     # In guest time, measured by the TSC: the time phase calibrates the timer
     # against the TSC (`time::WINDOWS` (5) windows of `WINDOW_NS` (10 ms),
     # each waited out on the TSC) and sleeps 10 ms on it for the first tick:
@@ -143,9 +152,40 @@ def test_boot_timeline_printed(boot):
     # slower, never that slow).
     assert us["time"] - us["interrupts"] >= 60_000, line[0]
     assert total <= 30_000_000, line[0]
-    # The line's own stamp, taken just after the last phase: at or after the
-    # total, by at most 50 ms.
-    assert total <= micros(line["stamp"]) <= total + 50_000, line[0]
+    # The log's stamps share the timeline's origin and unit. This check is
+    # order only: `boot complete` is stamped before the complete phase is
+    # marked and this line after it, from one entry tick through one clock;
+    # rounding down keeps order (ties possible), hence `<=`. Call B and A
+    # the true gaps, total - stamp(boot complete) and stamp(timeline) -
+    # total, as a correct log stamps them: a log origin early or a unit
+    # fast fails the first side once its error exceeds B, one late or slow
+    # fails the second once it exceeds A. Starvation widens the gaps, never
+    # reverses them (#125). This is the only check that klog's printed
+    # stamps agree with the timeline's origin and unit (the stamps' shape is
+    # test_log_lines_are_structured's, Stamp's digits lumen-time's); the
+    # ktest `trace::log_stamps_count_from_the_timelines_origin` checks
+    # `since_boot_ns` itself between two TSC reads.
+    earlier = line.string[: line.start()]
+    complete_stamps = [micros(c["stamp"]) for c in BOOT_COMPLETE.finditer(earlier)]
+    naming = [t for t in earlier.splitlines() if "boot: boot complete" in t]
+    assert len(complete_stamps) == 1, (
+        f"expected one calibrated INFO `boot complete` line before the timeline, "
+        f"found {len(complete_stamps)}; lines naming it: {naming}"
+    )
+    complete_us, timeline_us = complete_stamps[0], micros(line["stamp"])
+    a, b = timeline_us - total, total - complete_us
+    measured = (
+        f"boot complete at {complete_us} us, total {total} us, timeline line at "
+        f"{timeline_us} us; A = {a} us, B = {b} us"
+    )
+    assert b >= 0, (
+        "`boot complete` stamped after the total (log origin early or unit fast, "
+        f"or kmain's order changed: kernel/src/main.rs): {measured}"
+    )
+    assert a >= 0, (
+        "timeline line stamped before the total (log origin late or unit slow, "
+        f"or kmain's order changed: kernel/src/main.rs): {measured}"
+    )
 
 
 def test_serial_input_round_trip(boot):
