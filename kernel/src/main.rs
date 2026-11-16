@@ -226,7 +226,10 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     // Keep these three together and in this order (`boot complete`, the
     // complete mark, the timeline's line): test_boot_timeline_printed checks
     // that the total falls between the two lines' stamps. Work between them
-    // weakens that check without failing it.
+    // weakens that check without failing it. Moving the timeline's line
+    // above the mark fails it; swapping `boot complete` with the mark fails
+    // it under TCG, but under KVM their reads may round to the same
+    // microsecond and pass.
     info!(target: "boot", "boot complete");
     ktrace!(Kind::BootPhase, BootPhase::Complete);
     let timeline = trace::Timeline::boot();

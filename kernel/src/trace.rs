@@ -239,7 +239,7 @@ impl Timeline {
     /// the timeline is available.
     fn marks(&self) -> Option<(lumen_time::Clock, [Mark; BootPhase::ALL.len()], Option<u64>)> {
         let at = self.phases.as_ref().ok()?;
-        let entry = at[BootPhase::Entry.index()]?;
+        let (entry, clock) = self.origin()?;
         let mut latest = entry;
         let marks = at.map(|tsc| match tsc {
             None => Mark::Missing,
@@ -251,7 +251,25 @@ impl Timeline {
             }
         });
         let total = at[BootPhase::Complete.index()].and_then(|t| t.checked_sub(entry));
-        Some((self.clock?, marks, total))
+        Some((clock, marks, total))
+    }
+
+    /// The origin (the entry event's TSC) and the clock the phases are
+    /// converted with; `None` while the timeline is unavailable (its
+    /// `Display` says why: no clock, the ring wrapped past the boot's events,
+    /// or no entry event).
+    fn origin(&self) -> Option<(u64, lumen_time::Clock)> {
+        let at = self.phases.as_ref().ok()?;
+        Some((at[BootPhase::Entry.index()]?, self.clock?))
+    }
+
+    /// A TSC reading as the timeline shows a phase stamped with it:
+    /// nanoseconds since its origin, with its clock. `None` while the
+    /// timeline is unavailable, or for a reading before the origin.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: a ktest
+    fn since_origin_ns(&self, tsc: u64) -> Option<u64> {
+        let (entry, clock) = self.origin()?;
+        Some(clock.ns(tsc.checked_sub(entry)?))
     }
 
     /// Every phase is there, in order from entry, and can be converted.
@@ -487,40 +505,41 @@ crate::ktest!(
 
 crate::ktest!(
     fn log_stamps_count_from_the_timelines_origin() {
-        // The logger's stamp (`time::since_boot_ns`, as klog takes it) read
-        // between two TSC reads, each converted as the timeline converts a
-        // phase: ticks since the ring's entry event, with the calibrated
-        // clock. The entry event, not `boot_tsc()`: it is the timeline's own
-        // origin, and `since_boot_ns` reads `boot_tsc()` itself. Order only:
-        // interrupts off and every read serialized, so it holds however
-        // slowly the CPU runs; a log origin or unit that differs from the
-        // timeline's shows once its error exceeds the gap between the two
-        // reads (test_boot_timeline_printed checks the same on the serial
-        // lines, #125). Like `boot_phases_recorded_in_order`, it relies on
-        // the boot ring not having wrapped.
-        let ring = boot_ring();
-        let entry = (0..ring.written())
-            .filter_map(|seq| ring.read(seq))
-            .find(|e| e.kind == Kind::BootPhase as u16 && e.args[0] == BootPhase::Entry as u64)
-            .ok_or("no entry event in the boot ring")?
-            .tsc;
-        let clock = crate::time::tsc().ok_or("the TSC isn't calibrated")?;
-        let (before, stamp, after) = {
+        // `time::since_boot_ns` (the logger's clock), read between two TSC
+        // reads that the timeline converts as it converts a phase
+        // (`Timeline::since_origin_ns`). The expected values come from the
+        // timeline's entry event and clock, not from `boot_tsc()`, so they
+        // don't reuse the code under test. Interrupts off keeps the three
+        // reads on one CPU and close together, and `cpuid` fences the
+        // stamp's read from the TSC reads on either side. Order only: it
+        // can't fail on a correct kernel (a wrapped boot ring is reported as
+        // such), and it catches a log origin or unit error larger than its
+        // window (microseconds here, wider if the host stalls between the
+        // reads). It covers `since_boot_ns` and `mark_boot` only: that klog
+        // stamps lines with them, and `Stamp`'s format, are
+        // test_boot_timeline_printed's to check (#125).
+        let timeline = Timeline::boot();
+        let Some((entry, clock)) = timeline.origin() else {
+            crate::ktest::diag(format_args!("timeline: {timeline}"));
+            return Err("the timeline has no origin (the boot ring wrapped, no entry event, or no clock)");
+        };
+        let (earlier, stamp, later) = {
             let _off = arch::irq::push_off();
-            let before = arch::rdtsc();
+            let earlier = arch::rdtsc();
             arch::serialize();
             let stamp = crate::time::since_boot_ns();
             arch::serialize();
-            (before, stamp, arch::rdtsc())
+            (earlier, stamp, arch::rdtsc())
         };
         let stamp = stamp.ok_or("no log stamp (since_boot_ns is None)")?;
-        let since = |tsc: u64| tsc.checked_sub(entry).map(|ticks| clock.ns(ticks));
-        let (Some(low), Some(high)) = (since(before), since(after)) else {
-            return Err("the TSC reads before the timeline's entry");
+        let (Some(low), Some(high)) = (timeline.since_origin_ns(earlier), timeline.since_origin_ns(later)) else {
+            return Err("a TSC read precedes the timeline's entry event");
         };
-        if !(low <= stamp && stamp <= high) {
+        if !(low..=high).contains(&stamp) {
             crate::ktest::diag(format_args!(
-                "log stamp {stamp} ns, timeline's reads around it {low} ns and {high} ns ({} Hz)",
+                "log stamp {stamp} ns; the timeline's reads around it {low} ns and {high} ns; \
+                 entry tick {entry}, boot_tsc {:?}, {} Hz",
+                crate::time::boot_tsc(),
                 clock.hz()
             ));
             return Err("the log's stamp isn't between the timeline's reads around it");

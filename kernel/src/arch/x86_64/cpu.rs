@@ -82,11 +82,16 @@ pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
 }
 
 /// Wait until every earlier instruction has finished before any later one
-/// starts (`cpuid`, which Intel and AMD both define as serializing; a VM exit
-/// under KVM). [`rdtsc`] alone isn't ordered against its neighbours: put
-/// this between two reads that must come in program order.
+/// starts. It runs `cpuid`, which Intel and AMD both define as serializing
+/// (under KVM it also exits to the hypervisor). [`rdtsc`] alone isn't
+/// ordered against its neighbours: put this between two reads that must
+/// come in program order.
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: a ktest
 pub fn serialize() {
+    // The result is unused: this relies on core's `__cpuid_count` being an
+    // `asm!` block not marked `pure`, so the compiler keeps it, and keeps it
+    // in order with the `rdtsc` asm around it (the built ktest kernel shows
+    // `rdtsc; cpuid; call since_boot_ns; cpuid; rdtsc`).
     let _ = cpuid(0);
 }
 
