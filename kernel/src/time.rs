@@ -1223,9 +1223,9 @@ fn timer_between_hpet(hpet: &HpetCounter, mut pause: impl FnMut()) -> lumen_time
 crate::ktest!(
     fn tsc_calibrated_within_tolerance() {
         // Cross-check against the PIT, a different clock from the HPET the
-        // boot calibrated against (the ktest machine has one): within what
-        // the two calibrations' bounds allow (about 1% when both are steady,
-        // up to 2% within their tolerance, TSC_TOLERANCE_PPM each).
+        // boot calibrated against (the ktest machine has one): within 2%
+        // (twice TSC_TOLERANCE_PPM), or what the two calibrations' bounds
+        // allow if more (stalled windows filling in).
         use crate::kassert;
         let hz = tsc().ok_or("TSC not calibrated")?.hz();
         if reference() != Some(Reference::Hpet) {
@@ -1249,20 +1249,26 @@ crate::ktest!(
         }
         let (boot_ppm, pit_ppm) = (boot.median_bound_ppm(), pit.median_bound_ppm());
         crate::ktest::diag(format_args!("bounds: boot {boot_ppm} ppm, pit {pit_ppm} ppm"));
-        kassert!(within_bounds(pit.hz, hz, pit_ppm, boot_ppm));
+        kassert!(within_bounds(pit.hz, hz, pit_ppm, boot_ppm, 2 * TSC_TOLERANCE_PPM));
         Ok(())
     }
 );
 
 /// Whether two measurements of one rate, `a` off by at most `a_ppm` of the
-/// true rate and `b` by at most `b_ppm`, are within those bounds of each
-/// other: `|a - b| ≤ (a_ppm + b_ppm) × true`, where the true rate is at most
-/// `b / (1 - b_ppm)`.
+/// true rate and `b` by at most `b_ppm`, agree: within those bounds of each
+/// other, `|a - b| ≤ (a_ppm + b_ppm) × true` (the true rate is at most
+/// `b / (1 - b_ppm)`), but never held tighter than `floor_ppm`. The floor is
+/// for what the bounds leave out: the two were measured at different times
+/// against different clocks, which QEMU drives from the host's (slewed)
+/// monotonic clock while KVM's TSC isn't slewed, so tens to hundreds of ppm
+/// can come from the host, not the code. Stalled windows can need more than
+/// the floor, which their bounds then give.
 #[cfg(feature = "ktest")]
-fn within_bounds(a: u64, b: u64, a_ppm: u64, b_ppm: u64) -> bool {
+fn within_bounds(a: u64, b: u64, a_ppm: u64, b_ppm: u64, floor_ppm: u64) -> bool {
     const M: u128 = 1_000_000;
-    let (a_ppm, b_ppm) = (u128::from(a_ppm), u128::from(b_ppm));
-    b_ppm < M && u128::from(a.abs_diff(b)) * (M - b_ppm) <= u128::from(b) * (a_ppm + b_ppm)
+    let allowed = u128::from(a_ppm.saturating_add(b_ppm).max(floor_ppm));
+    let b_ppm = u128::from(b_ppm);
+    b_ppm < M && u128::from(a.abs_diff(b)) * (M - b_ppm) <= u128::from(b) * allowed
 }
 
 /// A PIT window paused 2 ms at `at` (Started, Ended or CountRead, which
@@ -1271,9 +1277,9 @@ fn within_bounds(a: u64, b: u64, a_ppm: u64, b_ppm: u64) -> bool {
 /// calibration takes them (steady if one of [`ATTEMPTS`] is, retakes spaced,
 /// else the least unsteady: a loaded host can stall every reading for a
 /// while, #139, which this isn't about) still gives the TSC's frequency,
-/// within what that window's gaps and the boot calibration's allow
-/// ([`Window::tsc_error_ppm`], [`Calibration::median_bound_ppm`]; about 1%
-/// for a steady one). A window that allows 10% or more can't tell: getting
+/// within 1%, or what that window's gaps and the boot calibration's allow
+/// if more ([`Window::tsc_error_ppm`], [`Calibration::median_bound_ppm`],
+/// [`within_bounds`]). A window that allows 10% or more can't tell: getting
 /// these wrong was 20% off.
 #[cfg(feature = "ktest")]
 fn a_pit_window_paused_at_still_gives_the_tsc(at: Pause) -> Result<(), &'static str> {
@@ -1311,11 +1317,11 @@ fn a_pit_window_paused_at_still_gives_the_tsc(at: Pause) -> Result<(), &'static 
     let boot_ppm = boot_calibration().ok_or("no boot calibration")?.median_bound_ppm();
     let allowed_ppm = w.tsc_error_ppm().saturating_add(boot_ppm);
     crate::ktest::diag(format_args!(
-        "{measured} Hz against {hz} Hz; window {w} (steady: {}), {allowed_ppm} ppm allowed ({boot_ppm} for the boot's)",
+        "{measured} Hz against {hz} Hz; window {w} (steady: {}), bounds {allowed_ppm} ppm ({boot_ppm} the boot's)",
         w.is_steady()
     ));
     kassert!(w.tsc_error_ppm() < 100_000); // else it can't tell
-    kassert!(within_bounds(measured, hz, w.tsc_error_ppm(), boot_ppm));
+    kassert!(within_bounds(measured, hz, w.tsc_error_ppm(), boot_ppm, 10_000));
     Ok(())
 }
 
@@ -1407,7 +1413,7 @@ crate::ktest!(
         // the counter and reading the TSC, as a host descheduling the vCPU
         // there would: their ends are 10% uncertain, so both are taken again
         // (a loaded host may add more), and the calibration still gives the
-        // TSC's frequency, within its bound and the boot's.
+        // TSC's frequency, within 1% (or its bound and the boot's, if more).
         use crate::kassert;
         let hz = tsc().ok_or("TSC not calibrated")?.hz();
         let count = lumen_time::pit_count(WINDOW_NS).ok_or("no PIT count")?;
@@ -1429,9 +1435,9 @@ crate::ktest!(
         kassert!(cal.windows.iter().all(Window::is_steady));
         // As clocks shows it (Calibration's Display).
         kassert!(shown.ends_with(&alloc::format!("] retook {}", cal.retaken)));
-        // Within its bound and the boot calibration's (about 1%).
+        // Within 1%, or its bound and the boot calibration's if more.
         let boot_ppm = boot_calibration().ok_or("no boot calibration")?.median_bound_ppm();
-        kassert!(within_bounds(cal.hz, hz, cal.median_bound_ppm(), boot_ppm));
+        kassert!(within_bounds(cal.hz, hz, cal.median_bound_ppm(), boot_ppm, 10_000));
         Ok(())
     }
 );
@@ -1509,8 +1515,8 @@ crate::ktest!(
         // reads were (#139: 250 µs each): 2% of a 10 ms window, unsteady
         // however late it is taken again. Taken again longer, until the same
         // gaps are under 0.5% of it, all five kept windows are steady (none
-        // filling in) and longer than 10 ms, and the rate is within its
-        // bound and the boot's.
+        // filling in) and longer than 10 ms, and the rate is within 1% (or
+        // its bound and the boot's, if more).
         use crate::{kassert, kassert_eq};
         let hpet = hpet().ok_or("no HPET")?;
         let hz = tsc().ok_or("TSC not calibrated")?.hz();
@@ -1523,7 +1529,7 @@ crate::ktest!(
         kassert!(cal.retaken >= 1);
         kassert!(cal.windows.iter().all(|w| w.reference > base && w.reference <= base * MOST_HPET_STRETCH));
         let boot_ppm = boot_calibration().ok_or("no boot calibration")?.median_bound_ppm();
-        kassert!(within_bounds(cal.hz, hz, cal.median_bound_ppm(), boot_ppm));
+        kassert!(within_bounds(cal.hz, hz, cal.median_bound_ppm(), boot_ppm, 10_000));
         Ok(())
     }
 );
@@ -1772,6 +1778,80 @@ crate::ktest!(
         let tsc_unusable = tsc([5_000_000, 5_000_000, 5_000_000, 5_000_000, 5_000_000], 20);
         kassert_eq!((tsc_unusable.verdict, tsc_unusable.level()), (Verdict::Unusable, None));
         kassert!(text(&tsc_unusable).starts_with("can't calibrate the tsc against the HPET: only 0 of 20"));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn the_stalled_boots_seen_on_kvm_report_quietly() {
+        // Windows from the two stalled KVM boots #139 recorded, replayed
+        // through the judgement (both warned before, failing scenarios that
+        // expect no warning):
+        // - CI run 43966495801's timer windows, 0 of 5 steady after 20: the
+        //   bound is the third smallest gap share, 0.7%, inside the timer's
+        //   2%: INFO.
+        // - An idle measurement run's (44062785900) timer windows, every end
+        //   about 25 µs slow (a slowed host, not a burst): 1 steady, 0.5%:
+        //   INFO.
+        // - The HPET windows of the first boot: 4 of 20 read promptly, the
+        //   others like the one its warning showed (40 polls in 10 ms, 3.9%
+        //   of gaps). With the least gapped filling in, the median lies
+        //   between steady windows': INFO, and the HPET kept (it used to give
+        //   way to the PIT).
+        use crate::kassert_eq;
+        let parse = |w: &str| {
+            let mut f = w.split('/').map(|x| x.parse::<u64>().unwrap_or(0));
+            let mut n = || f.next().unwrap_or(0);
+            Window { tsc: n(), reference: n(), polls: n(), start_gap: n(), end_gap: n() }
+        };
+        let timer = |windows: [&str; WINDOWS], retaken| Calibration {
+            hz: 62_500_000,
+            windows: windows.map(parse),
+            retaken,
+            last_retaken: None,
+            measured: Measured::AgainstTsc,
+        };
+        let ci = timer(
+            [
+                "24545668/625907/1/30698/90919",
+                "24497354/626076/1/32806/42630",
+                "24591679/628578/1/31997/136930",
+                "24604051/628884/1/65734/149327",
+                "24829059/629536/1/32781/374262",
+            ],
+            18,
+        );
+        let ci = report(Calibrated::Timer, &ci);
+        kassert_eq!((ci.verdict, ci.bound_ppm, ci.level()), (Verdict::Retook, 6_870, Some(log::Level::Info)));
+        let idle = timer(
+            [
+                "24516562/626599/1/60221/62328",
+                "24517738/626623/1/59314/63504",
+                "24515508/626637/1/62304/61274",
+                "24518522/626698/1/61471/64264",
+                "24518841/626699/1/61397/64631",
+            ],
+            19,
+        );
+        let idle = report(Calibrated::Timer, &idle);
+        kassert_eq!((idle.verdict, idle.bound_ppm), (Verdict::Retook, 5_041));
+        let slow = parse("24547212/1000016/40/436492/529641");
+        let prompt = parse("24547212/1000016/800/30000/30000");
+        let mut taken = 0;
+        let ruler = core::cell::Cell::new(u64::MAX);
+        let hpet = median_tsc_hz_with(
+            100_000_000,
+            || {
+                taken += 1;
+                Ok(if matches!(taken, 3 | 8 | 13 | 19) { prompt } else { slow })
+            },
+            &ruler,
+            || {},
+        )
+        .map_err(|_| "calibrating failed")?;
+        let hpet = report(Calibrated::Tsc(Reference::Hpet), &hpet);
+        kassert_eq!((hpet.cal.steady(), hpet.verdict, hpet.level()), (4, Verdict::Retook, Some(log::Level::Info)));
+        kassert_eq!(hpet.bound_ppm, prompt.tsc_error_ppm());
         Ok(())
     }
 );

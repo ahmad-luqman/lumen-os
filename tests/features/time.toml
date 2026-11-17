@@ -21,6 +21,7 @@ tests = [
     "ktest:lumen_kernel::time::a_timer_calibration_waits_between_retakes",
     "ktest:lumen_kernel::time::a_timer_calibration_short_of_steady_windows_fills_in",
     "ktest:lumen_kernel::time::a_calibration_report_fits_each_outcome",
+    "ktest:lumen_kernel::time::the_stalled_boots_seen_on_kvm_report_quietly",
     "ktest:lumen_kernel::time::the_boot_timer_calibration_is_within_what_the_tick_needs",
     "ktest:lumen_kernel::time::the_boot_tsc_calibration_is_within_what_now_ns_needs",
     "ktest:lumen_kernel::time::sleep_10ms_elapses",
