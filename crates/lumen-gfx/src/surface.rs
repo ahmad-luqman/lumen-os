@@ -10,7 +10,6 @@
 //! surface is skipped, so callers can draw at negative or oversized
 //! positions (a window dragged half off the screen).
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::rect::Rect;
@@ -92,21 +91,37 @@ pub struct Surface {
     pixels: Vec<u32>,
 }
 
+/// How many pixels a `width` x `height` buffer with rows `stride` apart
+/// holds, or `None` if `stride < width`, or the count or its size in bytes
+/// overflows, or the bytes pass `isize::MAX` (more than any allocation
+/// may be, so `vec!` would panic with "capacity overflow").
+pub fn buffer_len(width: u32, height: u32, stride: usize) -> Option<usize> {
+    if stride < width as usize {
+        return None;
+    }
+    let len = stride.checked_mul(height as usize)?;
+    let bytes = len.checked_mul(core::mem::size_of::<u32>())?;
+    (bytes <= isize::MAX as usize).then_some(len)
+}
+
 impl Surface {
     /// A `width` x `height` surface of black (0) pixels, rows packed.
+    /// Panics if [`Surface::with_stride`] would return `None` for it (too
+    /// large, or the allocation fails).
     pub fn new(width: u32, height: u32) -> Surface {
-        Surface::with_stride(width, height, width as usize).expect("a stride of the width fits")
+        Surface::with_stride(width, height, width as usize).expect("a surface too large to allocate")
     }
 
     /// A `width` x `height` surface of black pixels with rows `stride`
-    /// pixels apart, or `None` if `stride < width` or the buffer's size
-    /// overflows.
+    /// pixels apart, or `None` if `stride < width`, the buffer's size in
+    /// bytes overflows or passes `isize::MAX` (the most a `Vec` can hold,
+    /// [`buffer_len`]), or the allocation fails.
     pub fn with_stride(width: u32, height: u32, stride: usize) -> Option<Surface> {
-        if stride < width as usize {
-            return None;
-        }
-        let len = stride.checked_mul(height as usize)?;
-        Some(Surface { width, height, stride, pixels: vec![0; len] })
+        let len = buffer_len(width, height, stride)?;
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(len).ok()?;
+        pixels.resize(len, 0);
+        Some(Surface { width, height, stride, pixels })
     }
 
     /// Width in pixels.
@@ -335,6 +350,37 @@ mod tests {
         let empty = Surface::new(0, 0);
         assert!(empty.bounds().is_empty());
         assert_eq!(empty.pixel(0, 0), None);
+    }
+
+    /// The largest buffer `buffer_len` accepts is `isize::MAX` bytes:
+    /// one pixel more is `None`, not a "capacity overflow" panic in `vec!`.
+    #[test]
+    fn buffer_len_stops_at_isize_max_bytes() {
+        let most = isize::MAX as usize / 4;
+        assert_eq!(buffer_len(1, 1, most), Some(most));
+        assert_eq!(buffer_len(1, 1, most + 1), None);
+        assert_eq!(buffer_len(0, 2, most / 2), Some(most / 2 * 2));
+        assert_eq!(buffer_len(0, 2, most / 2 + 1), None);
+        assert_eq!(buffer_len(4, 2, 3), None);
+        assert_eq!(buffer_len(1, 3, usize::MAX / 2), None);
+        assert_eq!(buffer_len(1280, 800, 1280), Some(1280 * 800));
+    }
+
+    /// Codex's case on PR #159: the pixel count fits a usize, the bytes
+    /// don't fit an isize. Past the bound and right at it (where the
+    /// allocation itself fails), `None` rather than a panic or an abort.
+    #[test]
+    fn with_stride_too_large_is_none() {
+        assert!(Surface::with_stride(1, 1, usize::MAX / 2).is_none());
+        let most = isize::MAX as usize / 4;
+        assert!(Surface::with_stride(1, 1, most + 1).is_none());
+        assert!(Surface::with_stride(1, 1, most).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "a surface too large to allocate")]
+    fn new_too_large_panics_with_a_message() {
+        let _ = Surface::new(u32::MAX, u32::MAX);
     }
 
     #[test]

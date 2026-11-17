@@ -36,4 +36,4 @@ pub mod surface;
 
 pub use damage::Damage;
 pub use rect::{Pieces, Rect};
-pub use surface::{Mask, Surface, Target, blend, blend_channel};
+pub use surface::{Mask, Surface, Target, blend, blend_channel, buffer_len};
