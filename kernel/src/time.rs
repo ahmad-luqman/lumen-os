@@ -1527,7 +1527,10 @@ crate::ktest!(
         crate::ktest::diag(format_args!("{cal}, median within {} ppm", cal.median_bound_ppm()));
         kassert_eq!(cal.steady(), WINDOWS);
         kassert!(cal.retaken >= 1);
-        kassert!(cal.windows.iter().all(|w| w.reference > base && w.reference <= base * MOST_HPET_STRETCH));
+        // Longer than 10 ms, and at most 16 times that: a window ends at the
+        // first poll past its target, so up to a poll (450 µs on loaded KVM)
+        // past it, under one more window.
+        kassert!(cal.windows.iter().all(|w| w.reference > base && w.reference < base * (MOST_HPET_STRETCH + 1)));
         let boot_ppm = boot_calibration().ok_or("no boot calibration")?.median_bound_ppm();
         kassert!(within_bounds(cal.hz, hz, cal.median_bound_ppm(), boot_ppm, 10_000));
         Ok(())
