@@ -1407,8 +1407,17 @@ crate::ktest!(
             || spaced += 1,
         );
         kassert_eq!((got, taken, spaced), (Ok(fine), 3, 2));
-        let never = first_judgeable(4, || Ok(wide), || {});
+        let mut tries = 0;
+        let never = first_judgeable(
+            4,
+            || {
+                tries += 1;
+                Ok(wide)
+            },
+            || {},
+        );
         kassert_eq!(never, Err("the PIT re-measurement couldn't be judged: never within the TSC's tolerance"));
+        kassert_eq!(tries, 4);
         let failing = first_judgeable(2, || Err(CalError::NoCount), || {});
         kassert_eq!(failing, Err("the PIT re-measurement couldn't be judged: every try failed"));
         Ok(())
@@ -1651,7 +1660,7 @@ crate::ktest!(
         // (0.4% + 0.4%), the five B's are kept, a median within 4,018 ppm
         // (the A's, kept by share, would give 7,051). And a measurement whose
         // median has no bound is refused (`measure`, `with_a_bound`).
-        use crate::kassert_eq;
+        use crate::{kassert, kassert_eq};
         let a = Window { tsc: 10_000_000, reference: 1_000_000, polls: 800, start_gap: 0, end_gap: 70_000 };
         let b = Window { start_gap: 40_000, end_gap: 40_000, ..a };
         let mut it = [a, b, a, b, a, b, b, b].into_iter().chain(core::iter::repeat(b));
@@ -1662,6 +1671,19 @@ crate::ktest!(
         let none = Calibration { windows: [Window { end_gap: 5_000_000, ..a }; WINDOWS], ..cal };
         kassert_eq!(with_a_bound(none), Err(CalError::NoInformation));
         kassert_eq!(with_a_bound(cal), Ok(cal));
+        // At exactly 100% (a timer's windows within 999,998 ppm, a TSC within
+        // 1): no bound; just under, one.
+        let gap = |ppm: u64| Window { tsc: 1_000_000, reference: 62_500, polls: 1, start_gap: 0, end_gap: ppm };
+        let timer =
+            |own, tsc_ppm| Calibration { windows: [gap(own); WINDOWS], of: Calibrated::Timer { tsc_ppm }, ..cal };
+        kassert_eq!(timer(999_998, 1).median_bound_ppm(), 1_000_000);
+        kassert_eq!(with_a_bound(timer(999_998, 1)), Err(CalError::NoInformation));
+        kassert!(with_a_bound(timer(999_998, 0)).is_ok());
+        // How a bound reads: tenths rounded up, or none.
+        kassert_eq!(
+            alloc::format!("{} {} {}", Percent(7_000), Percent(7_001), Percent(u64::MAX)),
+            "0.7% 0.8% no bound"
+        );
         Ok(())
     }
 );
@@ -1842,14 +1864,16 @@ crate::ktest!(
         // read both have it. Paused while it doesn't (before the start, or
         // after the read, #129's stall: about 9% low), it can't take the rate
         // high. Each check allows the other gap (a loaded host may stall
-        // there too) and what the boot timer calibration can be off by (its
-        // bound, the TSC's included, at least 1%). All four windows are
-        // taken with the tick stopped (`with_tick_stopped`).
+        // there too), and is against the calibrated rate, itself off by up
+        // to the boot timer calibration's bound B (the TSC's included, at
+        // least 1%): a window off by w of the truth reads (1 + w) / (1 ± B)
+        // - 1 against it, composed, not added (#145 round 2: added, a 1.2%
+        // calibration left 54 ppm). All four windows are taken with the tick
+        // stopped (`with_tick_stopped`).
         use crate::kassert;
         let tsc = tsc().ok_or("TSC not calibrated")?;
         let timer_hz = lapic_timer().ok_or("timer not calibrated")?.hz();
-        let calibration_ppm =
-            boot_timer_calibration().ok_or("no timer calibration")?.median_bound_ppm().max(10_000) as i64;
+        let calibration_ppm = boot_timer_calibration().ok_or("no timer calibration")?.median_bound_ppm().max(10_000);
         let (window, ms) = (tsc.ticks(WINDOW_NS), tsc.ticks(1_000_000));
         const AT: [Pause; 4] =
             [Pause::StartBeforeRead, Pause::StartAfterRead, Pause::EndBeforeRead, Pause::EndAfterRead];
@@ -1867,13 +1891,21 @@ crate::ktest!(
             kassert!(!w.is_steady());
             let start = matches!(at, Pause::StartBeforeRead | Pause::StartAfterRead);
             kassert!(if start { w.start_gap } else { w.end_gap } >= ms); // the pause is in it
-            let (high, low) = (ppm(w.start_gap, &w) + calibration_ppm, ppm(w.end_gap, &w) + calibration_ppm);
-            let paused = ppm(ms, &w);
-            if matches!(at, Pause::StartAfterRead | Pause::EndBeforeRead) {
-                kassert!(off_ppm >= paused - low && off_ppm <= high); // the timer counted the pause
+            let (high, low, paused) = (ppm(w.start_gap, &w), ppm(w.end_gap, &w), ppm(ms, &w));
+            // The window's own error, of the true rate: the timer counted the
+            // pause, or it didn't.
+            let (lo_w, hi_w) = if matches!(at, Pause::StartAfterRead | Pause::EndBeforeRead) {
+                (paused - low, high)
             } else {
-                kassert!(off_ppm >= -low && off_ppm <= high - paused); // it didn't
-            }
+                (-low, high - paused)
+            };
+            // Against a calibration off by up to B either way, rounded out.
+            const M: i128 = 1_000_000;
+            let b = i128::from(calibration_ppm);
+            let lowest = ((M + i128::from(lo_w)) * M / (M + b) - M - 1) as i64;
+            let highest = ((M + i128::from(hi_w)) * M / (M - b) - M + 1) as i64;
+            crate::ktest::diag(format_args!("  allowed {lowest}..={highest} ppm"));
+            kassert!(off_ppm >= lowest && off_ppm <= highest);
         }
         Ok(())
     }
@@ -2081,6 +2113,16 @@ crate::ktest!(
         kassert_eq!(worse.cal.of, Calibrated::Tsc(Reference::Hpet));
         let failed = the_steadier(hpet, || Err(CalError::NoCount));
         kassert_eq!(failed.cal.of, Calibrated::Tsc(Reference::Hpet));
+        // Both past the tolerance, the PIT's smaller: the PIT, though it
+        // warns too.
+        let far = report(&cal(300_000, Calibrated::Tsc(Reference::Hpet)));
+        let nearer = the_steadier(far, || Ok(cal(150_000, Calibrated::Tsc(Reference::Pit))));
+        kassert_eq!((nearer.cal.of, nearer.verdict), (Calibrated::Tsc(Reference::Pit), Verdict::Imprecise));
+        // A tie keeps the HPET; a PIT with no bound too.
+        let tie = the_steadier(hpet, || Ok(cal(130_000, Calibrated::Tsc(Reference::Pit))));
+        kassert_eq!(tie.cal.of, Calibrated::Tsc(Reference::Hpet));
+        let none = the_steadier(hpet, || Ok(cal(6_000_000, Calibrated::Tsc(Reference::Pit))));
+        kassert_eq!(none.cal.of, Calibrated::Tsc(Reference::Hpet));
         Ok(())
     }
 );

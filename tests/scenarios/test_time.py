@@ -20,9 +20,9 @@ TSC_LINE = re.compile(
 )
 TICKS = re.compile(r"ticks: (\d+) \(spurious (\d+), unexpected (\d+), local APIC errors (\d+)\)\n")
 CLOCKS = re.compile(
-    r"clocks: tsc (\d+) Hz \(against the (hpet|pit) at boot, within \d+ ppm\); "
-    r"pit (?:(\d+) Hz within \d+ ppm|none|failed \((.*)\)); "
-    r"hpet (?:(\d+) Hz within \d+ ppm|none|failed \((.*)\))\n"
+    r"clocks: tsc (\d+) Hz \(against the (hpet|pit) at boot, within (?P<boot_ppm>\d+) ppm\); "
+    r"pit (?:(\d+) Hz within (?P<pit_ppm>\d+) ppm|none|failed \((.*)\)); "
+    r"hpet (?:(\d+) Hz within (?P<hpet_ppm>\d+) ppm|none|failed \((.*)\))\n"
 )
 
 
@@ -55,9 +55,9 @@ def clocks_and_windows(m) -> tuple[tuple[int, str, int | None, int | None], dict
     c = m.expect(CLOCKS, 30)
     w = m.expect(r"clocks: windows:(.*)\n", 30)
     m.expect(r"lumen> ")
-    for name, reason in (("pit", c[4]), ("hpet", c[6])):
+    for name, reason in (("pit", c[6]), ("hpet", c[9])):
         assert reason is None, f"measuring against the {name} failed: {reason}"
-    pit, hpet = (None if g is None else int(g) for g in c.group(3, 5))
+    pit, hpet = (None if g is None else int(g) for g in c.group(4, 7))
     # Every segment must be a whole calibration; findall alone would skip a
     # malformed one.
     segments = [seg.strip() for seg in w[1].split(";")]
@@ -68,6 +68,14 @@ def clocks_and_windows(m) -> tuple[tuple[int, str, int | None, int | None], dict
         name, hz, windows, retook = found.groups()
         assert name not in calibrations, f"{name} twice in {w[0]!r}"
         calibrations[name] = Calibration(int(hz), windows, int(retook))
+    # Each bound `clocks` prints is its windows' (the TSC's rate's).
+    for name, cal in calibrations.items():
+        printed = c[f"{name}_ppm"]
+        assert printed is not None and int(printed) == median_bound_ppm(cal), (
+            name,
+            c[0],
+            w[0],
+        )
     return (int(c[1]), c[2], pit, hpet), calibrations
 
 

@@ -1409,6 +1409,11 @@ mod tests {
         let steady = Window { tsc: 10_000_000, reference: 1_000_000, polls: 800, start_gap: 25_000, end_gap: 20_000 };
         assert!(steady.is_steady());
         assert_eq!(stretched_for_gaps(1_000_000, &steady, 16_000_000), 1_000_000);
+        // A gap between one and two poll intervals counts in full: 100 polls
+        // of 100,000 ticks, an end gap of 1.5 of them (1.5%), stretches to
+        // 3.75 windows (capped at one interval it would be 2.5).
+        let between = Window { tsc: 10_000_000, reference: 1_000_000, polls: 100, start_gap: 0, end_gap: 150_000 };
+        assert_eq!(stretched_for_gaps(1_000_000, &between, 16_000_000), 3_750_000);
         // Arithmetic that would overflow asks for the most.
         let huge = Window { tsc: 1, reference: u64::MAX, polls: 1, start_gap: u64::MAX, end_gap: u64::MAX };
         assert_eq!(stretched_for_gaps(1, &huge, 77), 77);
@@ -1441,6 +1446,8 @@ mod tests {
         assert_eq!(compose_ppm(10_000, 10_000), 20_100, "(1.01)(1.01) - 1");
         assert_eq!(compose_ppm(1, 1), 3, "the product rounded up");
         assert_eq!(compose_ppm(NO_INFORMATION_PPM, 0), u64::MAX);
+        assert_eq!(compose_ppm(NO_INFORMATION_PPM - 1, 0), NO_INFORMATION_PPM - 1, "just under: a bound");
+        assert_eq!(compose_ppm(0, NO_INFORMATION_PPM - 1), NO_INFORMATION_PPM - 1);
         assert_eq!(compose_ppm(0, u64::MAX), u64::MAX);
     }
 
@@ -1460,6 +1467,9 @@ mod tests {
         // A measurement with no bound can't be compared, whatever the floor.
         assert!(!within_bounds(1_000_000_000, 1_000_000_000, NO_INFORMATION_PPM, 0, 20_000));
         assert!(!within_bounds(1_000_000_000, 1_000_000_000, 0, u64::MAX, 20_000));
+        assert!(!within_bounds(1_000_000_000, 1_000_000_000, 0, NO_INFORMATION_PPM, 20_000));
+        assert!(!within_bounds(1_000_000_000, 1_000_000_000, NO_INFORMATION_PPM, 0, 20_000));
+        assert!(within_bounds(1_000_000_000, 1_000_000_000, NO_INFORMATION_PPM - 1, 0, 20_000));
     }
 
     #[test]
@@ -1467,6 +1477,7 @@ mod tests {
         assert_eq!(parse_stall("6000"), Some(Stall { end: 6_000, start: 0 }));
         assert_eq!(parse_stall("0,3000000"), Some(Stall { end: 0, start: 3_000_000 }));
         assert_eq!(parse_stall("10000000"), Some(Stall { end: MOST_STALL_PPM, start: 0 }));
+        assert_eq!(parse_stall("0,10000000"), Some(Stall { end: 0, start: MOST_STALL_PPM }));
         for bad in ["", "x", "abc", "1,", ",1", "1,2,3", "-1", "10000001", "0,10000001", "1.5"] {
             assert_eq!(parse_stall(bad), None, "{bad:?}");
         }
