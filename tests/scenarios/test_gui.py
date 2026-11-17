@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import re
 import time
+from pathlib import Path
 
 import pytest
 from lumen_harness import gui
@@ -83,8 +84,11 @@ def test_screenshot_says_when_a_canvas_was_drawing(boot):
 # 16-pixel close box 4 in from the right border).
 WELCOME = (96, 96, 442, 235)
 COLOURS = (440, 300, 402, 235)
+# The wallpaper the desktop draws behind the windows (made by
+# tools/wallpaper.py, embedded by the kernel): 1280x800, so on the screen
+# each of its pixels is at its own place.
+WALLPAPER = Path(__file__).resolve().parents[2] / "assets" / "wallpaper" / "lumen.png"
 # lumen_wm::Theme::LIGHT.
-DESKTOP_RGB = (0x3A, 0x6E, 0xA5)
 TITLE_FOCUSED_RGB = (0x2B, 0x57, 0x97)
 TITLE_RGB = (0xD6, 0xD6, 0xD6)
 CLIENT_RGB = (0xF3, 0xF3, 0xF3)
@@ -93,6 +97,12 @@ POINTER_FILL_RGB = (0xFF, 0xFF, 0xFF)
 SCREEN_PIXELS = 1280 * 800
 # lumen_input::cursor's sprite.
 SPRITE_W, SPRITE_H = 11, 17
+
+
+def wallpaper_rgb(x: int, y: int) -> tuple[int, int, int]:
+    """The desktop's pixel at (x, y) where no window covers it."""
+    with Image.open(WALLPAPER) as img:
+        return img.convert("RGB").getpixel((x, y))
 
 
 def frame_of(w: dict[str, str]) -> tuple[int, int, int, int]:
@@ -129,8 +139,9 @@ def wait_keys(m: Machine, title: str, count: int) -> None:
 
 def test_two_windows_golden(boot, artifacts, golden_dir):
     # `desktop` with no tablet (no pointer drawn): the two demo windows,
-    # the front one (Colours) focused, over the desktop's colour, the whole
-    # screen against a golden, taken while settled and not presenting.
+    # the front one (Colours) focused, their titles in the UI font, over the
+    # wallpaper, the whole screen against a golden, taken while settled and
+    # not presenting.
     # `windows` gives records to a pipeline too.
     m = boot_shells(boot)
     gui.start_desktop(m)
@@ -176,7 +187,9 @@ def test_drag_moves_window(boot, artifacts):
     # The pointer ends inside the moved title bar: move it away first.
     gui.pointer_move(m, 1200, 40)
     shot = gui.settled_screendump(m, "moved.png")
-    assert pixel(shot, x + 20, y + 100) == DESKTOP_RGB, "the old place shows the desktop"
+    assert pixel(shot, x + 20, y + 100) == wallpaper_rgb(x + 20, y + 100), (
+        "the old place shows the desktop"
+    )
     assert pixel(shot, x + 150 + 60, y + 280 + 2) == TITLE_FOCUSED_RGB, "the moved title bar"
     assert gui.desktop_check(m) == (0, 0)
 
@@ -352,8 +365,8 @@ def test_presents_match_a_full_repaint(boot):
     # text (titles drawn clipped to each damaged rectangle), a drag, a
     # raise, a focus change and a close, the back buffer equals a full
     # repaint and the screen the back buffer (outside the pointer's box):
-    # damage-only drawing misses nothing. (A theme switch joins these with
-    # #154.)
+    # damage-only drawing misses nothing. Then a theme switch to dark and
+    # back (everything repainted once, the windows' owners redrawing).
     m = boot_tablet(boot)
     gui.start_desktop(m)
     assert gui.desktop_check(m) == (0, 0)
@@ -387,6 +400,11 @@ def test_presents_match_a_full_repaint(boot):
     gui.wait_settled(m)
     assert gui.window(m, "Colours")["focused"] == "yes"
     assert gui.desktop_check(m) == (0, 0), "after a close"
+    for name in ("dark", "light"):
+        assert run(m, f"theme {name}") == f"theme: {name}\n"
+        gui.wait_settled(m)
+        assert gui.desktop_status(m)["theme"] == name
+        assert gui.desktop_check(m) == (0, 0), f"after the switch to {name}"
 
 
 def test_a_window_behind_drops_and_says_busy(boot):
@@ -433,19 +451,19 @@ def test_a_window_behind_drops_and_says_busy(boot):
 def test_pointer_moves_over_the_desktop(boot):
     # The compositor draws the pointer straight onto the screen: at its
     # tip after a move, then taken off its old place after the next (the
-    # desktop's colour back, the back buffer never touched: `desktop check`
-    # 0 and 0 outside the pointer's box).
+    # wallpaper back, the back buffer never touched: `desktop check` 0 and
+    # 0 outside the pointer's box).
     m = boot_tablet(boot)
     gui.start_desktop(m)
     gui.pointer_move(m, 700, 650)
     shot = gui.settled_screendump(m, "pointer.png")
     assert pixel(shot, 700, 650) == POINTER_OUTLINE_RGB
     assert pixel(shot, 701, 652) == POINTER_FILL_RGB
-    assert pixel(shot, 720, 650) == DESKTOP_RGB
+    assert pixel(shot, 720, 650) == wallpaper_rgb(720, 650)
     gui.pointer_move(m, 1000, 700)
     shot = gui.settled_screendump(m, "moved.png")
-    assert pixel(shot, 700, 650) == DESKTOP_RGB, "taken off its old place"
-    assert pixel(shot, 701, 652) == DESKTOP_RGB
+    assert pixel(shot, 700, 650) == wallpaper_rgb(700, 650), "taken off its old place"
+    assert pixel(shot, 701, 652) == wallpaper_rgb(701, 652)
     assert pixel(shot, 1000, 700) == POINTER_OUTLINE_RGB
     assert gui.desktop_check(m) == (0, 0)
 
@@ -493,7 +511,7 @@ def test_desktop_screenshot_matches_screendump(boot, artifacts):
     # compositor copies it between passes), which never holds the pointer:
     # with the pointer over the desktop it equals QEMU's screendump in
     # every pixel outside the arrow's box, and differs inside it (the
-    # screendump has the arrow; the screenshot, the desktop's colour).
+    # screendump has the arrow; the screenshot, the wallpaper).
     m = boot_tablet(boot)
     gui.start_desktop(m)
     tip = (900, 650)
@@ -508,7 +526,7 @@ def test_desktop_screenshot_matches_screendump(boot, artifacts):
     arrow = (tip[0], tip[1], tip[0] + SPRITE_W, tip[1] + SPRITE_H)
     inside, _ = compare(shot.crop(arrow), dump.crop(arrow), tolerance=0)
     assert inside.differing > 0, "the screenshot shows the pointer: not the back buffer"
-    assert shot.getpixel(tip) == DESKTOP_RGB
+    assert shot.getpixel(tip) == wallpaper_rgb(*tip)
     a, b = shot.copy(), dump.copy()
     for img in (a, b):
         img.paste((0, 0, 0), arrow)
@@ -518,3 +536,103 @@ def test_desktop_screenshot_matches_screendump(boot, artifacts):
     assert diff.differing == 0, (
         f"{diff.differing} pixels differ outside the arrow (see desktop-diff.png)"
     )
+
+
+# -- text, wallpaper, themes (#154) ----------------------------------------------
+
+# The Welcome window's text: its client area (inside its frame: a 1-pixel
+# border, a 24-row title bar) down to where the Colours window's frame
+# starts.
+WELCOME_TEXT = (WELCOME[0] + 1, WELCOME[1] + 24, 440, COLOURS[1] - WELCOME[1] - 24)
+
+
+def test_text_rendering_golden(boot, artifacts, golden_dir):
+    # The Welcome window's text in the UI font (Atkinson Hyperlegible,
+    # anti-aliased) at two sizes: its heading at 24 pixels, its lines at 16,
+    # against a golden of that part of its client area.
+    m = boot_shells(boot)
+    gui.start_desktop(m)
+    shot = gui.settled_screendump(m, "text.png")
+    x, y, w, h = WELCOME_TEXT
+    assert_matches_golden(
+        shot, golden_dir / "desktop-text.png", origin=(x, y), size=(w, h), artifacts=artifacts
+    )
+
+
+def close_window(m: Machine, title: str) -> None:
+    """Click `title`'s close box (its owner closes it)."""
+    x, y, w, _ = frame_of(gui.window(m, title))
+    gui.pointer_move(m, x + w - 1 - 4 - 8, y + 12)
+    gui.pointer_down(m)
+    gui.pointer_up(m)
+
+
+def test_png_wallpaper_golden(boot, artifacts):
+    # The desktop with no windows: both closed by their close boxes, the
+    # pointer moved to the bottom-right pixel (left out of the comparison).
+    # The screen shows the wallpaper, decoded from the PNG the kernel
+    # embeds, in every pixel: the golden is that PNG itself.
+    m = boot_tablet(boot)
+    gui.start_desktop(m)
+    assert "INFO  desktop: wallpaper: 1280x800, " in m.output, "the wallpaper wasn't decoded"
+    close_window(m, "Colours")
+    gui.wait_windows(m, 1)
+    close_window(m, "Welcome")
+    gui.wait_windows(m, 0)
+    gui.pointer_move(m, 1279, 799)
+    shot = gui.settled_screendump(m, "wallpaper.png")
+    region = (0, 0, 1279, 799)
+    with Image.open(shot) as dumped, Image.open(WALLPAPER) as wallpaper:
+        actual, want = dumped.convert("RGB").crop(region), wallpaper.convert("RGB").crop(region)
+    diff, mask = compare(actual, want, tolerance=0)
+    if diff.differing:
+        actual.save(artifacts / "wallpaper.actual.png")
+        mask.save(artifacts / "wallpaper.diff.png")
+    assert diff.differing == 0, (
+        f"{diff.differing} pixels differ from the wallpaper (see wallpaper.diff.png)"
+    )
+    assert gui.desktop_check(m) == (0, 0)
+
+
+def test_dark_theme_golden(boot, artifacts, golden_dir):
+    # `theme dark`, then the two-window desktop: the frames in the dark
+    # palette and the windows' owners redrawing their client areas in it,
+    # against a golden; everything repainted once (`desktop check`). A name
+    # that isn't a theme is refused.
+    m = boot_shells(boot)
+    gui.start_desktop(m)
+    assert run(m, "theme") == "theme: light\n"
+    assert run(m, "theme dark") == "theme: dark\n"
+    assert run(m, "theme dark") == "theme: dark (already)\n"
+    assert run(m, "theme blue") == 'theme: no theme "blue" (light, dark)\n'
+    status = gui.wait_settled(m)
+    assert status["theme"] == "dark", status
+    shot = gui.settled_screendump(m, "dark.png")
+    assert_matches_golden(
+        shot, golden_dir / "desktop-dark.png", origin=(0, 0), size=(1280, 800), artifacts=artifacts
+    )
+    assert gui.desktop_check(m) == (0, 0)
+
+
+def test_theme_boot_flag_picks_dark(boot, artifacts, golden_dir):
+    # `lumen.theme=dark`: said at boot, `theme` says so before the desktop
+    # starts, and the desktop starts dark: the same screen as switching to
+    # it (the dark golden).
+    m = boot_shells(boot, cmdline="lumen.theme=dark")
+    assert "INFO  desktop: theme dark (lumen.theme)" in m.output
+    assert run(m, "theme") == "theme: dark\n"
+    assert gui.desktop_status(m)["theme"] == "dark"
+    gui.start_desktop(m)
+    shot = gui.settled_screendump(m, "dark-at-boot.png")
+    assert_matches_golden(
+        shot, golden_dir / "desktop-dark.png", origin=(0, 0), size=(1280, 800), artifacts=artifacts
+    )
+
+
+def test_a_theme_boot_flag_naming_no_theme_warns(boot):
+    # `lumen.theme=` with a name that isn't a theme: one warning, and the
+    # theme stays light.
+    m = boot("qemutest", cmdline="lumen.theme=blue")
+    m.expect(r"WARN  desktop: lumen.theme=blue: not a theme \(light, dark\), ignored\n", 60)
+    m.expect(PROMPT, 60)
+    assert run(m, "theme") == "theme: light\n"
