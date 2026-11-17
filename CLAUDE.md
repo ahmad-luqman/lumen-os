@@ -229,6 +229,19 @@ own PR that updates that doc first.
   presented to a span at a time (a surface; the front buffer once the
   compositor lands, #153) (host-tested, incl. randomized coverage and
   every-edge clipping).
+- `crates/lumen-wm`: the desktop's window-manager logic (#152): frame
+  geometry (`Metrics`: title bar, close box, client, borders; `Part`),
+  `Wm` (stacking, focus: a click focuses and raises, closing the focused
+  one focuses the front one; hit testing; a drag from a title bar clamped
+  to keep a strip on the screen; the implicit grab of a client press;
+  close-box clicks on release; `interrupt`/`resume` for a pause or a gap
+  so no window keeps a button; every operation returns its `Damage` and
+  `Delivery`s), a window's `EventQueue` (sticky `Lost`/focus/`Close`
+  flags delivered in place, presses, moves and requests rationed past
+  48 of 64, releases only after their press) and the light and dark
+  `Theme`s (host-tested, incl. a randomized model of damage-only
+  repainting with focus, and press-pause-resume-release through the
+  queue).
 - `crates/lumen-input`: pointer input: evdev events into whole-frame
   pointer states, axes scaled to the screen (`Tablet`, `AbsAxis`), a
   frame's most events from the device's `EV_BITS` (`frame_bound`) and

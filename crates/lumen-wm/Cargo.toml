@@ -1,0 +1,13 @@
+[package]
+name = "lumen-wm"
+description = "no_std window-manager logic for the Lumen desktop: stacking, focus, hit testing, dragging and the implicit grab, a window's event queue, and the themes' palettes, host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lumen-gfx.workspace = true
+lumen-input.workspace = true
+
+[lints]
+workspace = true
