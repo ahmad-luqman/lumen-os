@@ -397,13 +397,14 @@ fn kbd(ctx: &mut Ctx<'_>, _: &[String]) {
         (Some(Ok(())), Some(route)) => writeln!(
             out,
             "kbd: layout {}, IRQ {} (vector {:#x}), {} interrupts, {} bytes, {} presses, \
-             {} dropped, {} undecoded, {} line errors, {} skipped at setup",
+             {} held, {} dropped, {} undecoded, {} line errors, {} skipped at setup",
             k.layout,
             route.irq(),
             route.vector(),
             k.irqs,
             k.bytes,
             k.presses,
+            k.held,
             k.dropped,
             k.undecoded,
             k.line_errors,

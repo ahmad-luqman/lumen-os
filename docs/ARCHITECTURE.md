@@ -1108,8 +1108,10 @@ off. A wake from another CPU queues the thread there and sends the
   producer counts set 1 make codes as bytes arrive, queued or dropped,
   before any reader decodes them, under one lock with the push, so a
   press shows with its byte or its drop; prefixes, fake shifts and Pause
-  each one key or none: `lumen_input::Presses`, #149; a ktest drives the
-  producer's step with a full queue), the bytes dropped,
+  each one key or none: `lumen_input::Presses`, #149; it counts every make
+  syntactically, so it matches the decoded presses only while `undecoded`
+  stays flat; a ktest drives the producer's step with a full queue), the
+  keys held now (`held`: pressed, not yet released), the bytes dropped,
   undecoded, flagged, and
   skipped during setup, or why there is no keyboard (and whether IRQ 1 was
   routed); a non-zero skip count is also logged after init.
@@ -1119,12 +1121,16 @@ off. A wake from another CPU queues the thread there and sends the
   word, so `press` paces itself on the time QEMU takes to send each key,
   and `test_a_long_line_of_shifted_keys` checks 150 shifted keys arrive;
   `lumen_harness.gui`'s `confirmed_keys` waits, before the next key, until
-  `kbd` counts exactly the key's presses and bytes with nothing dropped,
-  undecoded or flagged, failing as "key N of M (...) never reached the
-  guest", "... of its N bytes arrived ...: a prefix or release was lost"
-  or "... the keyboard's queue dropped N byte(s) ...": a confirmed key
-  reached IRQ 1 whole and was queued, while a loss in the decoder, the
-  router or a shell still shows only on the screen, #149),
+  `kbd` counts exactly the key's presses and bytes (`gui.KEY_BYTES`, a
+  closed table `test_every_modelled_key_is_confirmed` pins against QEMU;
+  any other key is refused), still exactly once QEMU has sent everything,
+  with no key held and nothing dropped, undecoded or flagged, failing as
+  "key N of M (...) never reached the guest", "... of its N bytes arrived
+  ...: a prefix or release was lost", "... still held: a release was
+  lost ..." or "... the keyboard's queue dropped N byte(s) ...": a
+  confirmed key reached IRQ 1 whole, released, and was queued, while a
+  loss in the decoder, the router or a shell still shows only on the
+  screen, #149),
   and the scenarios read what the screen shells did
   back from the screen (`lumen_harness.screen`, through the serial shell's
   `term text`); a scenario boots with
@@ -2701,8 +2707,10 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   events (default 16) as records (`seq`, then `x`, `y`, `buttons`,
   `after_overrun`; or `code`, `action`, `text`, `mods`). (#149's confirming
   steps, `lumen_harness.gui`, don't need the rings: a pointer step waits
-  for exactly its frame in `mouse`'s count, a key for exactly its
-  `presses` and `bytes` in `kbd`, as the keyboard's section above says.)
+  for exactly its frame in `mouse`'s count and for the `mouse` thread's
+  state to show its effect (the position, or the button held or
+  released); a key waits for exactly its `presses` and `bytes` in `kbd`,
+  as the keyboard's section above says.)
 - **Text mode is unchanged:** the cursor follows the newest state
   (`term::move_pointer`), keys reach the shown terminal's shell through
   `crate::vt`; the rings fill and wrap with no reader.

@@ -926,6 +926,11 @@ class Machine:
         cost = 2 * len(qcodes) * KEY_HOLD_MS / 1000
         self._keys_sent_by = max(self._keys_sent_by, time.monotonic()) + cost
 
+    def keys_sent_by(self) -> float:
+        """When (`time.monotonic()`) QEMU will have sent every key `press`
+        has handed it so far, releases included, by its hold times."""
+        return self._keys_sent_by
+
     def type_text(self, text: str) -> None:
         """Type `text` on the guest's keyboard as a US layout would, a key at
         a time (see `press`)."""

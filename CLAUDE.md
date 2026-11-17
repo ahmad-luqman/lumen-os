@@ -232,8 +232,8 @@ own PR that updates that doc first.
   statement of what overruns guarantee; a model of QEMU's ring checks
   it), the arrow sprite with its save-under (`Cursor`, over a
   `Surface`; a randomized model of drawing around the arrow checks it),
-  and the keys pressed in PS/2 set 1 bytes (`Presses`, for `kbd`'s
-  `presses`) (host-tested).
+  and the keys pressed and held in PS/2 set 1 bytes (`Presses`, for
+  `kbd`'s `presses` and `held`) (host-tested).
 - `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, the
   page-table format and mapper (host-tested, incl. a model comparison), the
   window tokens that confine `paging::map`, and the kernel-stack layout and
@@ -301,7 +301,8 @@ own PR that updates that doc first.
   `screen.py` (the screen's rows through the serial shell's `term text`),
   `gui.py` (input steps confirmed one at a time: `pointer_move`,
   `pointer_down`/`pointer_up`, `drag` against `mouse`'s frames and state,
-  `confirmed_keys`/`type_confirmed` against `kbd`'s presses and bytes),
+  `confirmed_keys`/`type_confirmed` against `kbd`'s presses, bytes and
+  held keys, `KEY_BYTES` the keys it models),
   `shell.py` (`run`: a serial command's output, the log's lines taken out
   and kept, a WARN or ERROR failing it unless allowed; `PROMPT`), `klog.py`
   (the kernel log line's format, as kernel/src/klog.rs prints it).

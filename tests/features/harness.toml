@@ -179,13 +179,14 @@ tests = [
 ]
 
 [[feature]]
-name = "Input steps that confirm each effect (lumen_harness.gui): pointer_move, pointer_down/pointer_up and drag wait until `mouse` counts exactly each step's frame and the mouse thread's state shows its effect (position, button held or released), else fail naming the step and the counts seen; a held or failed tablet fails the step at once, sending nothing; keys typed through confirmed_keys/type_confirmed wait until `kbd` counts exactly each key's presses and bytes (two a key, four with an E0 prefix) with nothing dropped, undecoded or flagged, else fail naming it (\"key N of M ... never reached the guest\", a prefix or release lost, a byte dropped); counts past a step's target fail (input sent earlier still arriving), and each call first waits for earlier input to settle; a failed reading names its step; host-tested on a fake machine and clock incl. the scaled timeout and polling. `kbd` counts the keys pressed among the keyboard's bytes as they arrive, a dropped byte's too (set 1 make codes, prefixes, fake shifts and Pause each one key or none; host-tested; a ktest drives the producer's step with a full queue); test_history_and_line_editing types through it"
+name = "Input steps that confirm each effect (lumen_harness.gui): pointer_move, pointer_down/pointer_up and drag wait until `mouse` counts exactly each step's frame and the mouse thread's state shows its effect (position, button held or released), else fail naming the step and the counts seen; a held or failed tablet fails the step at once, sending nothing; keys typed through confirmed_keys/type_confirmed wait until `kbd` counts exactly each key's presses and bytes (KEY_BYTES, a closed table pinned by sending every key in it, Print Screen and Pause included, through QEMU; any other key refused before typing), still exactly once QEMU sent everything, with no key held and nothing dropped, undecoded or flagged, else fail naming it (\"key N of M ... never reached the guest\", a prefix or release lost, a key still held, a byte dropped); counts past a step's target fail (input sent earlier still arriving), and each call first waits for earlier input to be sent and settle with no key held (a key held across the call, or an unconfirmed burst, doesn't confirm the next); a failed reading names its step and every reading waits only the time the step has left; host-tested on a fake machine and clock incl. the scaled timeout and polling. `kbd` counts the keys pressed and held among the keyboard's bytes as they arrive, a dropped byte's too (set 1 make codes, prefixes, fake shifts and Pause each one key or none; host-tested; a ktest drives the producer's step with a full queue); test_history_and_line_editing types through confirmed_keys"
 milestone = "M4"
 tests = [
     "harness:test_input_steps::*",
     "cargo:lumen-input",
     "scenario:test_input::test_drag_steps_are_confirmed",
     "scenario:test_input::test_keys_via_qmp_send_key",
+    "scenario:test_input::test_every_modelled_key_is_confirmed",
     "scenario:test_shell::test_history_and_line_editing",
     "ktest:lumen_kernel::keyboard::a_key_counts_as_it_arrives_even_when_dropped",
 ]

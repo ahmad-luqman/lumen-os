@@ -10,7 +10,7 @@ import re
 from collections.abc import Sequence
 
 import pytest
-from lumen_harness.gui import confirmed_keys
+from lumen_harness.gui import confirmed_keys, key_steps
 from lumen_harness.klog import SECONDS, is_log_line
 from lumen_harness.qemu import NO_DEVICES, Devices, Machine, default_accel
 from lumen_harness.screen import PROMPT, expect_screen, read_screen
@@ -58,11 +58,8 @@ def test_irqs_lists_msix(boot):
 def keys(m: Machine, *presses: str | list[str]) -> None:
     """Type on the keyboard: a string is typed as text, a list is keys
     pressed together (QEMU's names: `left`, `home`, `ctrl` and `a`...)."""
-    for p in presses:
-        if isinstance(p, str):
-            m.type_text(p)
-        else:
-            m.press(p)
+    for _, qcodes in key_steps(*presses):
+        m.press(qcodes)
 
 
 def test_echo(boot):

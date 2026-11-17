@@ -25,7 +25,7 @@ from test_pci import lspci_rows, msix_rows, qdev_addresses
 KBD_LINE = r"INFO  kbd: PS/2 keyboard on ISA IRQ 1 \(GSI 1, vector 0x51\), layout {}\n"
 KBD_STATS = re.compile(
     r"kbd: layout (\S+), IRQ 1 \(vector 0x51\), (\d+) interrupts, (\d+) bytes, (\d+) presses, "
-    r"(\d+) dropped, "
+    r"(\d+) held, (\d+) dropped, "
     r"(\d+) undecoded, (\d+) line errors, (\d+) skipped at setup\n"
 )
 # Without an 8042 its status reads 0xff: never ready for a command.
@@ -38,6 +38,7 @@ class KbdStats(NamedTuple):
     irqs: int
     bytes: int
     presses: int
+    held: int
     dropped: int
     undecoded: int
     line_errors: int
@@ -104,14 +105,36 @@ def test_keys_via_qmp_send_key(boot):
     assert strays.groups() == ("0", "0", "0")
     # Keys typed just before (unconfirmed, still arriving) don't confirm a
     # confirmed key (the case review reproduced): its step waits until they
-    # settle, then counts exactly its own presses and bytes.
+    # settle, then counts exactly its own presses and bytes. Its counts
+    # show the burst counted before it, all of it.
     burst = "echo abcdefghijklmnop"
     m.type_text(burst)
-    gui.confirmed_keys(m, "x", "\n")
+    got = gui.confirmed_keys(m, "x", "\n")
+    assert got.presses - s.presses == len(burst) + 2, (s.presses, got.presses)
+    assert (got.bytes - s.bytes, got.held) == (2 * (len(burst) + 2), 0), got
     expect_screen(m, rf"^lumen> {burst}x\nabcdefghijklmnopx\nlumen>$")
-    later = kbd_stats(m)
-    assert later.presses - s.presses == len(burst) + 2, (s.presses, later.presses)
+    # A key held when a confirmed one goes (shift, 400 ms, sent past
+    # `press`'s schedule; reproduced in review): the step waits for its
+    # release, then counts its own keys, so shift's release can't stand in
+    # for the key's own.
+    m.qmp().send_key(["shift"], hold_ms=400)
+    gui.confirmed_keys(m, "echo b\n")
+    expect_screen(m, r"^lumen> echo b\nb\nlumen>$")
     assert "WARN" not in m.output
+
+
+def test_every_modelled_key_is_confirmed(boot):
+    # Every key gui.KEY_BYTES models, Print Screen and Pause included, sent
+    # on its own through QEMU: each is confirmed with exactly the presses
+    # and bytes the table says, released, nothing dropped or undecoded.
+    # This pins the table against QEMU's keyboard, which nothing else does.
+    m = boot("qemutest")
+    shells_ready(m, "us")
+    keys = sorted(gui.KEY_BYTES, key=lambda q: q == "ret")  # Enter last
+    for q in keys:
+        gui.confirmed_keys(m, [q])
+    gui.confirmed_keys(m, ["ctrl", "u"], "echo done\n")
+    expect_screen(m, r"^lumen> echo done\ndone\nlumen>$")
 
 
 def test_second_layout(boot):

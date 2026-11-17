@@ -131,9 +131,10 @@ def read_output(
 
 
 def _echo_and_prompt(m: Machine, line: str, timeout: float) -> tuple[re.Match[str], re.Match[str]]:
-    """Wait for `line`'s echo, then the prompt after it (`timeout` s)."""
+    """Wait for `line`'s echo (up to 10 s, or `timeout` if shorter), then
+    the prompt after it (`timeout` s)."""
     try:
-        echo = m.expect(echo_pattern(line), 10)
+        echo = m.expect(echo_pattern(line), min(10, timeout))
     except ExpectTimeout as e:
         tail = m.output[-2000:]
         raise ExpectTimeout(f"no echo of {line!r}\n--- last serial output ---\n{tail}") from e
