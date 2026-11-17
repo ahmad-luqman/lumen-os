@@ -216,6 +216,15 @@ own PR that updates that doc first.
   embedded UI font, Atkinson Hyperlegible (`assets/fonts/`, SIL OFL)
   (host-tested, incl. a model LRU, a `kern` fixture and a golden mask
   whose hash the kernel's ktest also checks).
+- `crates/lumen-gfx`: the desktop's pixel core: `Rect` (signed origin,
+  intersect/union/clip, subtract into at most 4), `Damage` (a fixed-size
+  list that coalesces, a bounding box past its size, never loses
+  coverage), `Surface` (xRGB8888 with a stride: fill, clipped blits,
+  `blend_mask`/`blend_mask_in` for coverage masks such as glyphs, the
+  latter clipped to a damaged rect) and `Target`, what a surface is
+  presented to a span at a time (a surface; the front buffer once the
+  compositor lands, #153) (host-tested, incl. randomized coverage and
+  every-edge clipping).
 - `crates/lumen-input`: pointer input: evdev events into whole-frame
   pointer states, axes scaled to the screen (`Tablet`, `AbsAxis`), a
   frame's most events from the device's `EV_BITS` (`frame_bound`) and

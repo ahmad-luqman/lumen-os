@@ -1,4 +1,9 @@
-# Features: gui (M4's desktop). See tests/features/README.md for the format.
+# Features: gui (the M4 desktop). See tests/features/README.md for the format.
+
+[[feature]]
+name = "Pixel core (lumen-gfx): rectangles with a signed origin (intersect, union, contains, clip, subtract into at most 4), a fixed-size damage list that coalesces and never loses coverage (randomized check), xRGB8888 surfaces with a stride (fill, blits clipped at every edge, presenting spans to a target), coverage-mask blending rounded to the nearest (checked for every input) and clipped to a damaged rectangle (redraw equals one full draw)"
+milestone = "M4"
+tests = ["cargo:lumen-gfx"]
 
 [[feature]]
 name = "Anti-aliased TrueType text (lumen-font, #148): fontdue 0.9.5 without `simd`, linked into both kernels with the flag audit passing; the embedded UI font (Atkinson Hyperlegible, SIL OFL) parses, its bytes unchanged (FNV-1a pinned); one parsed face shared, read-only, with a glyph cache per user; glyphs cached by (glyph, pixel size) within a byte bound (coverage plus a fixed charge per glyph), the least recently used evicted first, agreeing with a model LRU on random lookups; a cache hit never rasterizes (a second render of a line rasterizes nothing), and a glyph bigger than the whole bound is drawn without being cached; a glyph number past the face's end is its missing-glyph box, never a panic; characters the face lacks draw that box and are counted; one-line layout on whole pixels (pen in 64ths, nearest pixel), with kerning from a `kern` table moving only the adjacent pair (checked on a fixture: the embedded font kerns only in GPOS, which fontdue doesn't read, so its own text is unkerned); `measure` (advance width, ascent, descent) agreeing with the layout and rasterizing nothing; a line composited into one mask allocated once from the metrics (each pixel the highest coverage of any glyph; negative x and overlapping glyphs included), refused past a width limit (ink left of the line's start included) with the width it would have had; the sample's mask matches a checked-in golden on the host, and in the booted and ktest kernels its 64-bit hash equals the golden's"

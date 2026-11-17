@@ -16,6 +16,7 @@ lumen-acpi = { path = "crates/lumen-acpi" }
 lumen-demo = { path = "crates/lumen-demo" }
 lumen-elf = { path = "crates/lumen-elf" }
 lumen-font = { path = "crates/lumen-font" }
+lumen-gfx = { path = "crates/lumen-gfx" }
 lumen-heap = { path = "crates/lumen-heap" }
 lumen-input = { path = "crates/lumen-input" }
 lumen-mm = { path = "crates/lumen-mm" }
