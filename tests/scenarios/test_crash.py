@@ -6,14 +6,12 @@ QEMU with status 0 (`-no-reboot`), which fails these tests.
 """
 
 import re
-import time
 
 import pytest
 from lumen_harness import REPO_ROOT, gui
 from lumen_harness.crash import BEGIN, END, backtrace, page_walk
 from lumen_harness.image import assert_matches_golden
 from lumen_harness.qemu import EXIT_CRASH
-from lumen_harness.shell import run
 from PIL import Image
 
 SCREEN_DONE = "(crash report shown on screen)"
@@ -144,13 +142,25 @@ def start_spinning_desktop(m) -> None:
     """The desktop shown, and `desktop spin`'s window committing a changed
     frame (a pure green bar moving) every 20 ms, a few of them presented."""
     m.expect(r"lumen> ", 60)
-    assert run(m, "desktop", 30) == "desktop: started (Alt+F1 shows the terminals)\n"
-    assert re.fullmatch(r"desktop spin: window \d+\n", run(m, "desktop spin"))
+    gui.start_desktop(m)
+    gui.desktop_spin(m)
     first = int(gui.desktop_status(m)["frames"])
-    deadline = time.monotonic() + 10 * m.timeout_scale
-    while int(gui.desktop_status(m)["frames"]) < first + 3:
-        assert time.monotonic() < deadline, "the spinner presented nothing"
-        time.sleep(0.05)
+    gui.wait_for(
+        m,
+        "the spinner's frames",
+        lambda: int(gui.desktop_status(m)["frames"]),
+        lambda n: n >= first + 3,
+    )
+
+
+def colours_of(shot) -> set[tuple[int, int, int]]:
+    with Image.open(shot) as img:
+        colours = img.convert("RGB").getcolors(1 << 24)
+    assert colours is not None
+    return {c for _, c in colours}
+
+
+GREEN = (0, 255, 0)
 
 
 def test_crash_report_over_desktop(boot, artifacts, golden_dir):
@@ -158,7 +168,8 @@ def test_crash_report_over_desktop(boot, artifacts, golden_dir):
     # two CPUs, with a window committing every 20 ms: the full symbolized
     # report and the crash code (first machine), and the crash screen
     # covering the desktop (second machine, without qemu_exit so the screen
-    # stays up): its banner, and not one pixel of the spinner's green.
+    # stays up): its banner, and not one pixel of the spinner's green,
+    # which was on the screen just before.
     m = boot("qemutest", extra=["-smp", "2"])
     start_spinning_desktop(m)
     m.send_line("crash pf")
@@ -174,16 +185,16 @@ def test_crash_report_over_desktop(boot, artifacts, golden_dir):
 
     shown = boot("interactive", extra=["-smp", "2"])
     start_spinning_desktop(shown)
+    assert GREEN in colours_of(shown.screendump("spinning.png")), (
+        "the spinner never reached the screen"
+    )
     shown.send_line("crash pf")
     shown.expect(re.escape(SCREEN_DONE), 30)
     shot = shown.screendump("crash-over-desktop.png")
     assert_matches_golden(
         shot, golden_dir / "crash-banner.png", origin=(0, 0), size=(640, 72), artifacts=artifacts
     )
-    with Image.open(shot) as img:
-        colours = img.convert("RGB").getcolors(1 << 24)
-    assert colours is not None
-    assert (0, 255, 0) not in {c for _, c in colours}, "the spinner's green is still on the screen"
+    assert GREEN not in colours_of(shot), "the spinner's green is still on the screen"
 
 
 @pytest.mark.parametrize("kind", ["panic", "pf"])

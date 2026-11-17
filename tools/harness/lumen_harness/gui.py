@@ -59,6 +59,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 from lumen_harness.qmp import BUTTONS, qcodes_for
@@ -679,6 +680,9 @@ def type_confirmed(
 
 # -- the desktop (#153) --------------------------------------------------------
 
+# kernel/src/desktop.rs `command` (change them together).
+STARTED = "desktop: started (Alt+F1 shows the terminals)\n"
+
 
 def parse_records(out: str) -> list[dict[str, str]]:
     """A records table as the kernel prints it (a header line of column
@@ -719,6 +723,22 @@ def window(m: Machine, title: str, allow: str | None = None) -> dict[str, str]:
     return found[0]
 
 
+def wait_for[T](
+    m: Machine, what: str, read: Callable[[], T], done: Callable[[T], bool], timeout: float = 10
+) -> T:
+    """`poll` that fails, naming `what` and the last reading, if `done`
+    never holds."""
+    got, ok = poll(m, read, done, timeout)
+    if not ok:
+        raise AssertionError(f"{what} never happened in {timeout} s: last {got}")
+    return got
+
+
+def wait_windows(m: Machine, count: int, timeout: float = 30) -> list[dict[str, str]]:
+    """Wait until `windows` lists `count` windows; its rows then."""
+    return wait_for(m, f"{count} windows", lambda: windows(m), lambda w: len(w) == count, timeout)
+
+
 def wait_settled(m: Machine, timeout: float = 30, allow: str | None = None) -> dict[str, str]:
     """Wait until `desktop status` says `settled yes` (every byte typed
     decoded, both input rings read, no damage gathered or pass running, no
@@ -726,14 +746,33 @@ def wait_settled(m: Machine, timeout: float = 30, allow: str | None = None) -> d
     its record then. Poll for the effect a step should have first (a
     `windows` row, say): settling says nothing more is moving, not that
     the step happened."""
-    deadline = time.monotonic() + timeout * m.timeout_scale
-    while True:
-        status = desktop_status(m, allow)
-        if status["settled"] == "yes":
-            return status
-        if time.monotonic() > deadline:
-            raise AssertionError(f"the desktop never settled in {timeout} s: {status}")
-        time.sleep(POLL * 5)
+    return wait_for(
+        m,
+        "a settled desktop",
+        lambda: desktop_status(m, allow),
+        lambda s: s["settled"] == "yes",
+        timeout,
+    )
+
+
+def start_desktop(m: Machine, windows_expected: int = 2) -> None:
+    """`desktop` on the serial shell, then wait for the demo windows and for
+    the desktop to settle."""
+    out = run(m, "desktop", 30)
+    if out != STARTED:
+        raise AssertionError(f"desktop said {out!r}")
+    wait_windows(m, windows_expected)
+    wait_settled(m)
+
+
+def desktop_spin(m: Machine, allow: str | None = None) -> str:
+    """`desktop spin`: the id of its window (a pure green bar moving every
+    20 ms)."""
+    out = run(m, "desktop spin", allow=allow)
+    found = re.fullmatch(r"desktop spin: window (\d+)\n", out)
+    if found is None:
+        raise AssertionError(f"desktop spin said {out!r}")
+    return found[1]
 
 
 def desktop_check(m: Machine, tries: int = 20, allow: str | None = None) -> tuple[int, int]:
@@ -754,14 +793,21 @@ def desktop_check(m: Machine, tries: int = 20, allow: str | None = None) -> tupl
     raise AssertionError(f"desktop check was busy {tries} times")
 
 
-def settled_screendump(m: Machine, name: str, tries: int = 5, allow: str | None = None):
-    """A screendump of a settled desktop: taken between two `desktop
-    status` reads that are both settled with the same `frames` (nothing was
-    presented meanwhile), retaken otherwise; its path."""
+def settled_capture[T](
+    m: Machine, take: Callable[[], T], tries: int = 5, allow: str | None = None
+) -> T:
+    """`take()` on a settled desktop: between two `desktop status` reads
+    that are both settled with the same `frames` (nothing was presented
+    meanwhile), taken again otherwise; fails if no try was bracketed."""
     for _ in range(tries):
         before = wait_settled(m, allow=allow)
-        shot = m.screendump(name)
+        got = take()
         after = desktop_status(m, allow)
         if after["settled"] == "yes" and after["frames"] == before["frames"]:
-            return shot
-    raise AssertionError(f"the desktop presented during each of {tries} screendumps")
+            return got
+    raise AssertionError(f"the desktop presented during each of {tries} captures")
+
+
+def settled_screendump(m: Machine, name: str, tries: int = 5, allow: str | None = None) -> Path:
+    """A screendump of a settled desktop (`settled_capture`); its path."""
+    return settled_capture(m, lambda: m.screendump(name), tries, allow)
