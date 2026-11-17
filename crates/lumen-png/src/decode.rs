@@ -4,16 +4,20 @@
 //! `0x00RRGGBB` pixels, as `lumen-gfx` draws them.
 //!
 //! A file that isn't a PNG, is cut short or corrupt (each chunk's CRC is
-//! checked, and the decoder runs in its strict mode), or is bigger than the
-//! caller allows is an error, never a panic: [`DecodeError`]. Alpha is
-//! dropped (a wallpaper has nothing behind it), and 16-bit samples keep
-//! their top 8 bits.
+//! checked, and the decoder runs in its strict mode: a zlib stream's
+//! Adler-32 too), or is bigger than the caller allows is an error, never a
+//! panic: [`DecodeError`]. Alpha is dropped (a wallpaper has nothing behind
+//! it), and 16-bit samples keep their top 8 bits.
 //!
 //! Memory: the decoder's own buffers (the compressed data gathered, the
-//! inflated rows) are its `Vec`s, an allocation failure there aborting as
-//! any `Vec` does; the decoded samples' buffer and the pixels handed back
-//! are taken with `try_reserve_exact`, so those refuse
-//! ([`DecodeError::OutOfMemory`]).
+//! inflated rows, and the text and colour-profile chunks it inflates while
+//! reading the headers) are its `Vec`s: on a heap that can't hold them the
+//! allocation aborts, as any `Vec`'s does. So the size is checked from
+//! IHDR first, and a compressed `zTXt`, `iTXt` or `iCCP` chunk of more than
+//! [`COMPRESSED_CHUNK_MAX`] bytes is refused before the decoder sees the
+//! file (a small one inflates to a few MiB at most). The decoded samples'
+//! buffer and the pixels handed back are taken with `try_reserve_exact`, so
+//! those refuse ([`DecodeError::OutOfMemory`]).
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -52,6 +56,12 @@ impl Image {
     pub fn pixels(&self) -> &[u32] {
         &self.pixels
     }
+
+    /// The pixels, row after row, given up (no copy: `width * height` of
+    /// them, for `lumen_gfx::Surface::from_pixels`).
+    pub fn into_pixels(self) -> Vec<u32> {
+        self.pixels
+    }
 }
 
 /// Why a PNG didn't decode.
@@ -85,20 +95,54 @@ fn message(e: impl fmt::Display) -> DecodeError {
     DecodeError::Png(text.trim().trim_matches('"').to_string())
 }
 
+/// The most bytes a compressed ancillary chunk (`zTXt`, `iTXt`, `iCCP`) may
+/// hold: the decoder inflates them while reading the headers, into buffers
+/// that abort on a heap that can't hold them, and deflate's best ratio is
+/// about 1032 to 1, so this keeps one under about 4 MiB. A wallpaper needs
+/// none (an sRGB profile compresses to about 3 KB).
+pub const COMPRESSED_CHUNK_MAX: u32 = 4096;
+
+fn be32(png: &[u8], at: usize) -> Option<u32> {
+    png.get(at..at.checked_add(4)?).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
 /// The size IHDR gives, if `png` starts with the signature and an IHDR.
 fn header_size(png: &[u8]) -> Option<(u32, u32)> {
-    let be = |at: usize| png.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
-    (png.get(..8)? == crate::encode::SIGNATURE && png.get(12..16)? == b"IHDR").then_some(())?;
-    Some((be(16)?, be(20)?))
+    if png.get(..8)? != crate::encode::SIGNATURE || png.get(12..16)? != b"IHDR" {
+        return None;
+    }
+    Some((be32(png, 16)?, be32(png, 20)?))
+}
+
+/// A compressed ancillary chunk bigger than [`COMPRESSED_CHUNK_MAX`]: its
+/// type and length. The chunks are walked by their lengths alone (no CRC
+/// or contents looked at); a file cut short ends the walk, for the decoder
+/// to refuse.
+fn big_compressed_chunk(png: &[u8]) -> Option<(&[u8], u32)> {
+    let mut at = 8usize;
+    while let (Some(len), Some(kind)) = (be32(png, at), png.get(at + 4..at + 8)) {
+        if matches!(kind, b"zTXt" | b"iTXt" | b"iCCP") && len > COMPRESSED_CHUNK_MAX {
+            return Some((kind, len));
+        }
+        at = at.checked_add(12)?.checked_add(len as usize)?;
+    }
+    None
 }
 
 /// Decode `png`, refusing an image wider than `max_width` or taller than
-/// `max_height` before anything is inflated.
+/// `max_height` before any image data is inflated (and a compressed
+/// ancillary chunk past [`COMPRESSED_CHUNK_MAX`] before anything is).
 pub fn decode(png: &[u8], max_width: u32, max_height: u32) -> Result<Image, DecodeError> {
     if let Some((width, height)) = header_size(png)
         && (width > max_width || height > max_height)
     {
         return Err(DecodeError::TooBig { width, height, max_width, max_height });
+    }
+    if let Some((kind, len)) = big_compressed_chunk(png) {
+        let kind = core::str::from_utf8(kind).unwrap_or("?");
+        return Err(DecodeError::Png(alloc::format!(
+            "a {kind} chunk of {len} bytes, more than the {COMPRESSED_CHUNK_MAX} a compressed one may hold"
+        )));
     }
     let options = DecoderOptions::default()
         .set_strict_mode(true)
@@ -123,8 +167,8 @@ pub fn decode(png: &[u8], max_width: u32, max_height: u32) -> Result<Image, Deco
         Some(ColorSpace::RGBA) => 4,
         other => return Err(DecodeError::Png(alloc::format!("an unexpected colour space {other:?}"))),
     };
-    // Within the limits both are far inside `usize` (16384 squared times 4
-    // is 2^30); checked all the same.
+    // Checked: the caller's limits may be anything up to `u32::MAX` each,
+    // so the product needn't fit.
     let samples = (w.checked_mul(h).and_then(|n| n.checked_mul(channels))).ok_or(DecodeError::TooBig {
         width,
         height,

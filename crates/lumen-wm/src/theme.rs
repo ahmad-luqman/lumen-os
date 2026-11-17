@@ -2,6 +2,28 @@
 //! light|dark`, `lumen.theme=`). Colours are `0x00RRGGBB`, as `lumen-gfx`
 //! draws them.
 
+/// Which theme: the closed set the desktop switches between (`theme
+/// light|dark`, `lumen.theme=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ThemeId {
+    Light,
+    Dark,
+}
+
+impl ThemeId {
+    /// Every theme, the default (light) first.
+    pub const ALL: [ThemeId; 2] = [ThemeId::Light, ThemeId::Dark];
+
+    /// The theme named `name` (`light`, `dark`; exactly).
+    pub fn by_name(name: &str) -> Option<ThemeId> {
+        ThemeId::ALL.into_iter().find(|id| id.name() == name)
+    }
+
+    pub const fn name(self) -> &'static str {
+        Theme::get(self).name
+    }
+}
+
 /// Every colour the desktop draws with, for one theme.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Theme {
@@ -71,12 +93,20 @@ impl Theme {
         pointer_fill: 0xffffff,
     };
 
-    /// Every theme, the default (light) first.
+    /// Every theme, the default (light) first, in [`ThemeId::ALL`]'s order.
     pub const ALL: [&'static Theme; 2] = [&Theme::LIGHT, &Theme::DARK];
+
+    /// The palette of theme `id`.
+    pub const fn get(id: ThemeId) -> &'static Theme {
+        match id {
+            ThemeId::Light => &Theme::LIGHT,
+            ThemeId::Dark => &Theme::DARK,
+        }
+    }
 
     /// The theme with this name.
     pub fn by_name(name: &str) -> Option<&'static Theme> {
-        Theme::ALL.into_iter().find(|t| t.name == name)
+        ThemeId::by_name(name).map(Theme::get)
     }
 
     /// Every colour with its field's name.
@@ -210,5 +240,17 @@ mod tests {
         assert_eq!(Theme::by_name("Dark"), None);
         assert_eq!(Theme::by_name(""), None);
         assert_eq!(Theme::ALL[0].name, "light");
+    }
+
+    #[test]
+    fn theme_ids_name_their_palettes() {
+        for (id, theme) in ThemeId::ALL.into_iter().zip(Theme::ALL) {
+            assert_eq!(Theme::get(id), theme);
+            assert_eq!(id.name(), theme.name);
+            assert_eq!(ThemeId::by_name(theme.name), Some(id));
+        }
+        assert_eq!(ThemeId::by_name("light"), Some(ThemeId::Light));
+        assert_eq!(ThemeId::by_name("dark"), Some(ThemeId::Dark));
+        assert_eq!(ThemeId::by_name("Dark"), None);
     }
 }

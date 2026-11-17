@@ -96,7 +96,7 @@ fn be32(b: &[u8]) -> u32 {
     u32::from_be_bytes(b[..4].try_into().unwrap())
 }
 
-fn decode(png: &[u8]) -> Decoded {
+fn parse_encoded(png: &[u8]) -> Decoded {
     assert_eq!(png[..8], SIGNATURE, "signature");
     let mut at = 8;
     let (mut chunks, mut ihdr, mut idat) = (Vec::new(), None, Vec::new());
@@ -298,7 +298,7 @@ fn encode_writes_signature_ihdr_idat_iend() {
     assert_eq!(be32(&png[33..]) as usize, png.len() - 41 - 4 - 12);
     // IEND last, exactly as every PNG ends.
     assert_eq!(png[png.len() - 12..], [0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82]);
-    let d = decode(png);
+    let d = parse_encoded(png);
     assert_eq!(d.chunks, [*b"IHDR", *b"IDAT", *b"IEND"]);
 }
 
@@ -308,7 +308,7 @@ fn images_of_every_shape_round_trip() {
     for (w, h) in [(1, 1), (1, 7), (7, 1), (2, 2), (33, 17), (300, 5)] {
         let rows = random_rows(&mut rng, w, h);
         let pixels = all_pixels(&rows);
-        let d = decode(rows.encode().unwrap().bytes());
+        let d = parse_encoded(rows.encode().unwrap().bytes());
         assert_eq!((d.width, d.height), (w, h));
         assert_eq!(d.pixels, pixels, "{w}x{h}");
     }
@@ -322,7 +322,7 @@ fn noise_bigger_than_the_first_buffer_round_trips() {
     let pixels = all_pixels(&rows);
     let png = rows.encode().unwrap();
     assert!(png.bytes().len() > pixels.len(), "{} bytes", png.bytes().len());
-    assert_eq!(decode(png.bytes()).pixels, pixels);
+    assert_eq!(parse_encoded(png.bytes()).pixels, pixels);
 }
 
 #[test]
@@ -335,7 +335,7 @@ fn the_trailer_always_fits_in_the_room_kept_back() {
         for h in 1..=3 {
             let rows = noise_rows(w, h);
             let pixels = all_pixels(&rows);
-            assert_eq!(decode(rows.encode().unwrap().bytes()).pixels, pixels, "{w}x{h}");
+            assert_eq!(parse_encoded(rows.encode().unwrap().bytes()).pixels, pixels, "{w}x{h}");
         }
     }
 }
@@ -367,7 +367,7 @@ fn a_text_screen_compresses_to_a_small_fraction() {
     let pixels = all_pixels(&rows);
     let png = rows.encode().unwrap();
     assert!(png.bytes().len() * 20 < pixels.len(), "{png:?} for {} bytes of pixels", pixels.len());
-    assert_eq!(decode(png.bytes()).pixels, pixels);
+    assert_eq!(parse_encoded(png.bytes()).pixels, pixels);
     // A uniform screen: next to nothing.
     let mut flat = Rows::new(1280, 800).unwrap();
     for y in 0..800 {
@@ -444,7 +444,7 @@ fn the_golden_png_and_its_frame_are_unchanged() {
     let text = frame_text(&png);
     assert!(text.lines().count() >= 5, "several body lines:\n{text}");
     assert_golden("gradient.frame.txt", text.as_bytes());
-    assert_eq!(decode(png.bytes()).pixels, all_pixels(&golden_rows()));
+    assert_eq!(parse_encoded(png.bytes()).pixels, all_pixels(&golden_rows()));
 }
 
 // ---- The frame
@@ -489,7 +489,7 @@ fn the_frame_carries_the_png_whole() {
     let (w, h, back) = unframe(&text);
     assert_eq!((w, h), (320, 200));
     assert_eq!(back, png.bytes());
-    assert_eq!(decode(&back).pixels, pixels);
+    assert_eq!(parse_encoded(&back).pixels, pixels);
 }
 
 #[test]
@@ -618,7 +618,7 @@ fn decode_reads_what_encode_writes() {
 }
 
 #[test]
-fn decode_reads_every_colour_type_and_depth() {
+fn decode_reads_every_colour_type() {
     // Greyscale, 8 bits: two rows, the second Sub-filtered (each byte the
     // difference from the one to its left).
     let grey = png_file(2, 2, 0, 8, &[], &[0, 10, 200, 1, 50, 25]);
@@ -642,7 +642,8 @@ fn decode_reads_every_colour_type_and_depth() {
     assert_eq!(decode_ok(&plte).pixels(), &[rgb(255, 0, 0), rgb(0, 255, 0), rgb(0, 0, 255)]);
 }
 
-/// A small RGB PNG with some structure (several filter types' worth).
+/// A small RGB PNG (the encoder's: filter 0 on every row) with some
+/// structure.
 fn small_png() -> Vec<u8> {
     let mut rng = Rng(5);
     random_rows(&mut rng, 12, 7).encode().unwrap().bytes().to_vec()
@@ -710,12 +711,16 @@ fn an_image_past_the_limits_is_refused_with_its_size() {
 
 #[test]
 fn decode_says_no_when_the_allocator_does() {
-    // The pixels (4 bytes each) are the biggest buffer: refused, it is an
-    // error, not an abort.
+    // Our two buffers refused, each is an error, not an abort: the pixels
+    // (4 bytes each, the biggest), and the samples (3 bytes each, taken
+    // before the decoder inflates anything into them).
     let (w, h) = (64u32, 64u32);
     let png = png_file(w, h, 2, 8, &[], &vec![0u8; (w as usize * 3 + 1) * h as usize]);
     let pixels = w as usize * h as usize * 4;
     let got = refusing_past(pixels - 1, || decode::decode(&png, 4096, 4096));
+    assert_eq!(got, Err(DecodeError::OutOfMemory));
+    let samples = w as usize * h as usize * 3;
+    let got = refusing_past(samples - 1, || decode::decode(&png, 4096, 4096));
     assert_eq!(got, Err(DecodeError::OutOfMemory));
     assert_eq!(DecodeError::OutOfMemory.to_string(), "no memory for its pixels");
     decode_ok(&png);
@@ -730,4 +735,95 @@ fn the_wallpaper_decodes() {
     let img = decode_ok(&bytes);
     assert_eq!((img.width(), img.height()), (1280, 800));
     assert!(bytes.len() < 1024 * 1024, "the wallpaper is {} bytes", bytes.len());
+}
+
+#[test]
+fn a_bad_adler32_is_an_error() {
+    // The zlib stream's checksum wrong inside an IDAT whose chunk CRC is
+    // right: strict mode refuses it.
+    let scanlines = [0u8, 1, 2, 3, 0, 4, 5, 6];
+    let mut zlib = miniz_oxide::deflate::compress_to_vec_zlib(&scanlines, 6);
+    let last = zlib.len() - 1;
+    zlib[last] ^= 0x01;
+    let mut png = SIGNATURE.to_vec();
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&1u32.to_be_bytes());
+    ihdr.extend_from_slice(&2u32.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    chunk(&mut png, b"IHDR", &ihdr);
+    chunk(&mut png, b"IDAT", &zlib);
+    chunk(&mut png, b"IEND", &[]);
+    assert!(matches!(decode::decode(&png, 4096, 4096), Err(DecodeError::Png(_))));
+    decode_ok(&png_file(1, 2, 2, 8, &[], &scanlines));
+}
+
+/// `png_file` with `chunks` inserted right after IHDR.
+fn with_chunks_after_ihdr(png: &[u8], chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+    let ihdr_end = 8 + 12 + 13;
+    let mut out = png[..ihdr_end].to_vec();
+    for (kind, data) in chunks {
+        chunk(&mut out, kind, data);
+    }
+    out.extend_from_slice(&png[ihdr_end..]);
+    out
+}
+
+#[test]
+fn a_compressed_chunk_bomb_is_refused_before_it_is_inflated() {
+    // A zTXt (valid CRC) whose 10 MiB of zeros compress to about 10 KB:
+    // refused by its length before the decoder (which would inflate it
+    // while reading the headers) sees the file; so are iTXt and iCCP. A
+    // small one passes.
+    let png = png_file(1, 1, 0, 8, &[], &[0, 7]);
+    let mut bomb = b"Comment\0\0".to_vec();
+    bomb.extend(miniz_oxide::deflate::compress_to_vec_zlib(&vec![0u8; 10 << 20], 9));
+    assert!(bomb.len() > decode::COMPRESSED_CHUNK_MAX as usize);
+    for kind in [b"zTXt", b"iTXt", b"iCCP"] {
+        let got = decode::decode(&with_chunks_after_ihdr(&png, &[(kind, &bomb)]), 4096, 4096);
+        let Err(DecodeError::Png(why)) = got else { panic!("{kind:?} taken: {got:?}") };
+        assert!(why.contains("more than the 4096 a compressed one may hold"), "{why}");
+    }
+    let mut small = b"Comment\0\0".to_vec();
+    small.extend(miniz_oxide::deflate::compress_to_vec_zlib(b"made by tools/wallpaper.py", 9));
+    assert_eq!(decode_ok(&with_chunks_after_ihdr(&png, &[(b"zTXt", &small)])).pixels(), &[rgb(7, 7, 7)]);
+}
+
+/// An Adam7-interlaced PNG of `pixels` (RGB, `width` x `height`): each of
+/// the seven passes' rows, filter 0, in order (empty passes left out).
+fn adam7(width: u32, height: u32, pixels: &[[u8; 3]]) -> Vec<u8> {
+    const PASSES: [(u32, u32, u32, u32); 7] =
+        [(0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)];
+    let mut scanlines = Vec::new();
+    for (x0, y0, dx, dy) in PASSES {
+        if x0 >= width {
+            continue;
+        }
+        for y in (y0..height).step_by(dy as usize) {
+            scanlines.push(0);
+            for x in (x0..width).step_by(dx as usize) {
+                scanlines.extend_from_slice(&pixels[(y * width + x) as usize]);
+            }
+        }
+    }
+    let mut png = SIGNATURE.to_vec();
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 1]);
+    chunk(&mut png, b"IHDR", &ihdr);
+    chunk(&mut png, b"IDAT", &miniz_oxide::deflate::compress_to_vec_zlib(&scanlines, 6));
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+#[test]
+fn an_interlaced_png_decodes() {
+    // 9x7: every pass has pixels, and the last column and row are partial.
+    let (w, h) = (9u32, 7u32);
+    let pixels: Vec<[u8; 3]> = (0..w * h).map(|i| [i as u8, (i * 3) as u8, (255 - i) as u8]).collect();
+    let img = decode_ok(&adam7(w, h, &pixels));
+    let want: Vec<u32> = pixels.iter().map(|p| rgb(p[0], p[1], p[2])).collect();
+    assert_eq!((img.width(), img.height()), (w, h));
+    assert_eq!(img.pixels(), &want[..]);
+    assert_eq!(img.into_pixels(), want);
 }
