@@ -3404,12 +3404,73 @@ and `date` agree.
 
 ### Screenshot (#150)
 
-#150 records `screenshot`'s wire format here (whichever of #146 and #150
-merges second folds its text into this subsection). While the desktop is
-shown, `screenshot` reads the back buffer: the compositor fills
-`lumen_png::Rows` from it between passes, so it never shows the pointer.
-While the desktop is paused or off, it reads the text screen as in text
-mode. Whichever of #150 and #153 lands second wires that up.
+`screenshot` on the serial shell sends the screen as a PNG over serial (to
+disk once there are files, M6). Capture and encoding are separate steps
+(`kernel/src/screenshot.rs`), so the desktop brings its own source.
+
+**Source.** In text mode the kernel reads the framebuffer once, row by
+row, into `lumen_png::encode::Rows` allocated beforehand (3 MiB at
+1280x800: nothing allocates under the lock), holding the screen's lock
+(`term::read_pixels`), so terminal output, a cursor flip or a pointer
+move can't land halfway through (by design; not tested). The mouse
+pointer is in the image where the terminal drew it (by design; not
+tested: the scenarios run without a tablet). A command holding a
+`term::Canvas` draws without that lock: `read_pixels` then says a canvas
+held the screen (whether or not it was still drawing: a finished
+`mandelbrot` waiting for a key counts), the summary line ends in `, a
+command held the screen (a canvas): may be torn`, and the harness
+refuses such a capture unless asked not to (`allow_torn`). While the
+desktop is shown, `screenshot` reads the back buffer: the compositor
+fills `lumen_png::encode::Rows` from it between passes, so it never shows
+the pointer. While the desktop is paused or off, it reads the text screen
+as in text mode. Whichever of #150 and #153 lands second wires that up.
+
+**Encoding** (`lumen_png::encode`): RGB8, unfiltered (on the text console
+that compressed 16 to 20% smaller than the `Sub` or `Up` filters), zlib
+level 6 from `miniz_oxide`, compressed straight into the file's one
+`IDAT`. The rows' and the file's buffers are taken with
+`try_reserve_exact` (the file doubles as it fills and always keeps the
+16 bytes of its end back, so finishing it never allocates), so a heap
+that can't grow gives an error line, not a crash; the compressor's own
+fixed boxes (about 250 KiB in all, the largest about 83 KiB) are the
+exception. The compressor keeps 64 KiB inline and needs about 72 KiB of
+stack, more than a thread's 64 KiB default, so the kernel encodes on a
+thread with a 256 KiB stack (`sched::run_sized`; a ktest encodes from a
+default-stack thread).
+
+**Wire format** (`lumen_png::frame`; the harness's reader is
+`lumen_harness/screenshot.py`):
+
+```text
+@@png-begin 1280x800 bytes=46835 crc32=e130dd76 lines=521
+@@png iVBORw0KGgoAAAANSUhEUgAABQAAAAMgCAIAAADz...    (base64)
+...
+@@png-end
+screenshot: 1280x800, 46835 bytes of PNG (read 9.455 ms, encoded 62.003 ms, sent 30.954 ms)
+```
+
+- The begin line: the size in pixels, the PNG file's length in bytes, the
+  CRC-32 of the whole file (the algorithm `zlib.crc32` uses; eight
+  lowercase hex digits) and how many body lines follow.
+- Body lines: `@@png ` and the file in standard base64 (RFC 4648, `=`
+  padding), 120 characters (90 bytes) on every line but the last.
+- The end line: `@@png-end` alone. Then a summary line (the same size and
+  length; the times vary; the warning above when a canvas held the screen)
+  and the prompt.
+
+Every frame line starts with `@@png`, which no log line does (they start
+with a timestamp). `frame::write` hands out one line at a time from
+buffers on the stack and the shell writes each whole under the log's line
+lock, so a log line can land between two frame lines but never inside
+one. The reader keeps lines by prefix, checks the line count, the line
+lengths, the length and the CRC, then decodes the PNG with PIL and checks
+it is RGB of the stated size. On a screen shell the command refuses
+(base64 on the screen is no use).
+
+Cost, for example (one TCG run on the text console; the times vary): about
+9 ms reading the pixels (interrupts off, under the lock), 62 to 64 ms
+encoding, 31 to 40 ms sending 47 to 63 KB of PNG. QEMU's UART doesn't pace
+output at the baud rate.
 
 ## 12. The Claude service (planned, M8)
 
@@ -3559,6 +3620,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/rtc.rs       the CMOS RTC: date and time (taken as UTC) for `date`
   src/fb.rs        framebuffer: pixels, glyphs, the hello screen, the crash screen
   src/font.rs      the desktop's anti-aliased text (lumen-font): the UI font parsed once and shared (font::face), the golden sample for `font` and its ktest
+  src/screenshot.rs  `screenshot`: the screen as a PNG (lumen-png) in a base64 frame on serial
   src/term.rs      the virtual terminals on the framebuffer (lumen-term): their grids, drawing the shown one's changed cells, log lines, the cursor, the canvas
   src/vt.rs        the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4
   src/symbols.rs   kernel symbol table (symbolized crash reports)
@@ -3567,7 +3629,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/shell/       the shells (lumen-shell): serial and the virtual terminals' consoles, the commands, system commands (sysinfo.rs), deliberate faults (crash.rs)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
-crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-gfx, lumen-acpi, lumen-pci, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, lumen-font, ...)
+crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-gfx, lumen-acpi, lumen-pci, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, lumen-font, lumen-png, ...)
 assets/fonts/      the desktop's UI font (Atkinson Hyperlegible, SIL OFL 1.1) with its licence and source
 boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, harness/ (Python package)

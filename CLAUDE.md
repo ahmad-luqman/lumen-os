@@ -202,6 +202,10 @@ own PR that updates that doc first.
   `font.rs`: the desktop's anti-aliased text (`lumen-font`): `font::face`,
   the UI font parsed on first use and shared; `font` renders the golden
   sample twice (timings, cache, golden check), as its ktest does.
+  `screenshot.rs`: `screenshot`: the screen captured (the framebuffer
+  read once under the screen's lock, `term::read_pixels`, which says if a
+  canvas held the screen), encoded on a 256 KiB stack, sent as a base64 frame
+  on serial (the format: ARCHITECTURE section 11).
   `sound.rs`: the virtio-sound driver (its `sound` thread owns the device,
   playing `lumen-synth` sources paced by the device), `beep`, `play`,
   `volume` and `sound`.
@@ -288,6 +292,13 @@ own PR that updates that doc first.
   the reader's policy (`read_next`, `available`) (host-tested against a
   model UART, the reader also against an interrupt that comes only on an
   edge).
+- `crates/lumen-png`: PNG for Lumen: the encoder `screenshot` uses
+  (`encode`: RGB8 `Rows` into a `Png`, unfiltered, zlib from
+  `miniz_oxide`, the rows' and the file's buffers refused rather than
+  aborted, the compressor's own boxes excepted), CRC-32, and
+  the base64 frame a PNG travels in over serial, streamed from the stack
+  (host-tested, incl. a refusing allocator and a golden file PIL decodes;
+  decoding is #154's).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
@@ -303,6 +314,8 @@ own PR that updates that doc first.
   `pointer_down`/`pointer_up`, `drag` against `mouse`'s frames and state,
   `confirmed_keys`/`type_confirmed` against `kbd`'s presses, bytes and
   held keys, `KEY_BYTES` the keys it models),
+  `screenshot.py` (`screenshot`'s frame read back and checked;
+  `Machine.screenshot_via_serial`),
   `shell.py` (`run`: a serial command's output, the log's lines taken out
   and kept, a WARN or ERROR failing it unless allowed; `PROMPT`), `klog.py`
   (the kernel log line's format, as kernel/src/klog.rs prints it).

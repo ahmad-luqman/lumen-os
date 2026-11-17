@@ -17,7 +17,15 @@ from lumen_harness import gui
 from lumen_harness.image import assert_matches_golden, compare
 from lumen_harness.qemu import Devices, Machine
 from lumen_harness.qmp import QmpClient, QmpError, pointer_move_args, qcodes_for
-from lumen_harness.screen import expect_screen, read_screen
+from lumen_harness.screen import (
+    CELL_H,
+    CELL_W,
+    GRID_X,
+    GRID_Y,
+    cursor_box,
+    expect_screen,
+    read_screen,
+)
 from lumen_harness.shell import run
 from PIL import Image
 from test_pci import lspci_rows, msix_rows, qdev_addresses
@@ -244,8 +252,6 @@ MOUSE_HEADER = re.compile(
     r'mouse: "QEMU Virtio Tablet" on (\S+), screen 1280x800, (\d+) events in (\d+) frames '
     r"\((\d+) ignored, (\d+) dropped, (\d+) overruns\)"
 )
-# The terminal's top-left pixel and its cells' size (1280x800, limine.conf).
-GRID_X, GRID_Y, CELL_W, CELL_H = 32, 144, 7, 16
 
 
 class Mouse(NamedTuple):
@@ -443,11 +449,9 @@ def test_cursor_leaves_no_trail(boot, artifacts):
     assert after.getpixel(park) == (0, 0, 0)
     assert fresh.getpixel(park) == (0, 0, 0)
     # The text cursor blinks: its cell may differ.
-    assert screen.cursor, screen
-    col, row = screen.cursor
-    cx, cy = GRID_X + col * CELL_W, GRID_Y + row * CELL_H
+    box = cursor_box(screen)
     for img in (after, fresh):
-        img.paste((0, 0, 0), (cx, cy, cx + CELL_W, cy + CELL_H))
+        img.paste((0, 0, 0), box)
     diff, mask = compare(after, fresh, tolerance=0)
     if diff.differing:
         mask.save(artifacts / "trail.diff.png")

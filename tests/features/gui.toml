@@ -6,6 +6,19 @@ milestone = "M4"
 tests = ["cargo:lumen-gfx"]
 
 [[feature]]
+name = "screenshot: the screen as a PNG over serial (lumen-png: RGB8, zlib from miniz_oxide linked with audit passing, the rows' buffer and the file's first buffer and growth refused rather than aborted when the allocator says no (the compressor's own fixed boxes excepted), the file's end always fitting in the room kept back, a golden file PIL decodes; a base64 frame with its size, length, CRC and line count, log lines skipped by prefix), equal to QEMU's screendump in every pixel (the text console after boot and the colour test pattern); a capture while a command holds the screen (a canvas) is flagged as possibly torn and refused by the harness unless allowed; encoding works from a thread with the default stack (on a bigger stack of its own); every way a frame comes back wrong fails the harness saying why; refused on a screen shell"
+milestone = "M4"
+tests = [
+    "cargo:lumen-png",
+    "harness:test_screenshot::*",
+    "scenario:test_gui::test_screenshot_matches_screendump",
+    "scenario:test_gui::test_screenshot_refuses_a_screen_shell",
+    "scenario:test_gui::test_screenshot_says_when_a_canvas_was_drawing",
+    "ktest:lumen_kernel::screenshot::encodes_from_a_thread_with_the_default_stack",
+    "audit:flags",
+]
+
+[[feature]]
 name = "Anti-aliased TrueType text (lumen-font, #148): fontdue 0.9.5 without `simd`, linked into both kernels with the flag audit passing; the embedded UI font (Atkinson Hyperlegible, SIL OFL) parses, its bytes unchanged (FNV-1a pinned); one parsed face shared, read-only, with a glyph cache per user; glyphs cached by (glyph, pixel size) within a byte bound (coverage plus a fixed charge per glyph), the least recently used evicted first, agreeing with a model LRU on random lookups; a cache hit never rasterizes (a second render of a line rasterizes nothing), and a glyph bigger than the whole bound is drawn without being cached; a glyph number past the face's end is its missing-glyph box, never a panic; characters the face lacks draw that box and are counted; one-line layout on whole pixels (pen in 64ths, nearest pixel), with kerning from a `kern` table moving only the adjacent pair (checked on a fixture: the embedded font kerns only in GPOS, which fontdue doesn't read, so its own text is unkerned); `measure` (advance width, ascent, descent) agreeing with the layout and rasterizing nothing; a line composited into one mask allocated once from the metrics (each pixel the highest coverage of any glyph; negative x and overlapping glyphs included), refused past a width limit (ink left of the line's start included) with the width it would have had; the sample's mask matches a checked-in golden on the host, and in the booted and ktest kernels its 64-bit hash equals the golden's"
 milestone = "M4"
 tests = [
