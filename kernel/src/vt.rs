@@ -27,8 +27,9 @@
 //! **The desktop** (#153; ARCHITECTURE section 11, "Desktop mode"): while
 //! it is shown ([`DESKTOP`], set and cleared only under [`ROUTER`]'s lock)
 //! the decoding pass routes only Alt+F1 to F4 to the terminals; every other
-//! press goes to the desktop's key ring alone (every key event already
-//! does: `keyboard::read_key`) and is counted (`Routed::Desktop`). An
+//! press but a bare modifier (skipped, as in text mode) goes to the
+//! desktop's key ring alone (every key event already does:
+//! `keyboard::read_key`) and is counted (`Routed::Desktop`). An
 //! Alt+F`n` press then leaves it ([`term::leave_desktop`]), clears
 //! [`DESKTOP`] and writes the [`CUT`], all before any later key is routed,
 //! so keys after it go to terminal `n`. [`enter_desktop`] (the `desktop`

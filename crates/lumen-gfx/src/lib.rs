@@ -22,7 +22,7 @@
 //!   [`blend_channel`] states).
 //! - **Targets** ([`Target`]): what pixels are presented to, a span of
 //!   xRGB8888 pixels at a time. A [`Surface`] is one; the kernel's front
-//!   buffer is meant to implement it too (the compositor, #153), so
+//!   buffer (`term::ScreenCanvas`, the compositor's, #153) is another, so
 //!   presenting a back buffer's damage is one path ([`Surface::present`]).
 //!
 //! All arithmetic is integer: the kernel is built without SSE, so floating

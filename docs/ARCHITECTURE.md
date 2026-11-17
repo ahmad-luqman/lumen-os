@@ -2751,9 +2751,11 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   need no second decoder.
   Toolkit text fields (#156) insert only a press's non-control `text`.
 - **Order across devices:** the compositor merges the two rings in the
-  order it reads them. Events carry no time stamps in M4, so a key press
-  and a pointer frame that arrive close together (within one compositor
-  pass) may be handled in either order.
+  order it reads them (each pass: the pointer frames read, then the key
+  events). Events carry no time stamps in M4, so a key press and a pointer
+  frame that arrive close together (within one compositor pass) may be
+  handled in either order: a key typed just before a click that moves the
+  focus may reach the newly focused window.
 - **Shell (#151):** `mouse` and `kbd` show each ring's newest `Seq`
   (`newest event N` in `mouse`'s header, `newest key event N` at the end
   of `kbd`'s line), and
@@ -2954,9 +2956,8 @@ tree`, `ui invoke`).
   pause`) until the compositor has acted on the pause before it, so no
   older marks are ever needed.
 - **Leaving: Alt+F1 to F4** show that terminal: the one exception to the
-  canvas rules (today `term::show` refuses while a canvas is held, which
-  `test_term` checks, and nothing redraws the header, drawn inline in
-  `fb::init`). #153 changes `vt.rs`, `term.rs` and `fb.rs`. In the
+  canvas rules (`term::show` still refuses while a canvas is held, which
+  `test_term` checks; the header is redrawn by `fb::draw_header`). In the
   decoding pass, under the router lock, an Alt+F`n` press (the predicate
   `vt::switch_key(code, alt) -> Option<usize>`, which the compositor uses
   too) is pushed to the key ring like any key, then:
@@ -2974,10 +2975,14 @@ tree`, `ui invoke`).
   the Alt+F`n` press (which it recognises with the same predicate: a
   barrier it holds back, events after it kept, until it reads the cut
   that names it) and never that press or anything after it, and the
-  pointer events up to the cut's pointer `Seq`. So a window gets the Alt
-  press of Alt+F1 (then `FocusLost`, which releases it), never the F1
-  press or release; the terminal gets the F1 release and Alt's (which no
-  shell takes). Then the focused window gets `FocusLost` (the
+  pointer events up to the cut's pointer `Seq` (reading both rings again
+  first: a screen shell's decoding pass may have pushed events and written
+  the pause between the compositor's read of the rings and its read of
+  the cut). So a window gets the Alt press of Alt+F1 (then `FocusLost`,
+  which releases it), never the F1 press or release; F1's and Alt's
+  releases come after the cut and are no window's (a release is never
+  routed to a terminal: the decoding pass routes presses only). Then the
+  focused window gets `FocusLost` (the
   grabbing window, if any, is the focused one; `Wm::interrupt`), and
   nothing more is presented.
 - **Paused, not ended:** the windows live on (their threads keep running
@@ -3002,8 +3007,8 @@ until a crash.
 
 - **Its wake-up:** it sleeps on `desktop::WAKE` (a `WaitQueue`) until
   `desktop::PENDING.swap(false) || keyboard::bytes_pending()` (atomics
-  only, no lock). Every waker sets `PENDING` and then calls
-  `desktop::wake()` (which does nothing before the desktop started): IRQ
+  only, no lock). Every waker calls `desktop::wake()`, which sets
+  `PENDING` itself (and does nothing before the desktop started): IRQ
   1's handler when it queued bytes, the `mouse` thread after pushing a
   frame, every commit, every request (a shell command, `ui invoke`), and
   pause and resume. So desktop keys never wait for a screen shell: the
@@ -3031,7 +3036,12 @@ until a crash.
 - **Shell commands:**
   - `desktop`: start or resume (`desktop: started (Alt+F1 shows the
     terminals)`, `desktop: resumed`); while shown it prints `desktop
-    status`.
+    status`. A refusal says `desktop: not started: <reason>` or
+    `desktop: not resumed: <reason> (try again)`; a second `desktop`
+    while one is starting or resuming the desktop is refused with
+    ``another `desktop` is starting or resuming it: try again``, and a
+    resume refused because the compositor hasn't acted on the last pause in
+    5 s also logs a WARN.
   - `desktop status`: one record, below.
   - `desktop check` (for the tests): the compositor runs it right after a
     pass: it recomposes the whole scene into a scratch surface (allocated
@@ -3048,7 +3058,14 @@ until a crash.
     gives up after 20 s, when an answer still coming is dropped): a second
     request meanwhile is refused at once with `desktop check: busy with
     another request (...): try again` (or `screenshot: the desktop's back
-    buffer: busy with ...`), never handed the first one's answer.
+    buffer: busy with ...`), never handed the first one's answer. An
+    asker giving up also logs `WARN desktop: no answer from the
+    compositor in 20 s`. A request still queued when the desktop pauses is
+    answered at the paused pass: ``desktop check: paused (`desktop`
+    resumes it)``, and `screenshot` reads the text screen instead (what is
+    shown then). A check whose screen is taken back (Alt+F`n`) while it
+    reads it says `desktop check: the screen was taken back during the
+    check`.
   - `desktop spin` (for the tests): opens a window whose owner commits a
     changed frame (a pure green bar moving) every 20 ms and reads its
     events.
@@ -3058,8 +3075,10 @@ until a crash.
 
   `desktop check`, `desktop spin` and `desktop hold` refuse while paused.
 
-- **`desktop status`**, one snapshot taken under `COMPOSITOR` (reading it
-  doesn't wake the compositor):
+- **`desktop status`**, one record (reading it doesn't wake the
+  compositor): the desktop's columns under `COMPOSITOR`, the keyboard's
+  count, the rings' `newest()` and the cut read just before it (so not one
+  instant of all of them). Its columns, in order:
 
   | Column | Meaning |
   |---|---|
@@ -3072,9 +3091,10 @@ until a crash.
   | `no_focus_keys` | key events dropped because no window was focused |
   | `stray_forgotten`, `stray_unpressed` | button releases ignored: their press was forgotten (`FocusLost`, `Lost`) or dropped (expected), or the button was never pressed (never expected) |
   | `key_releases_unpaired` | key releases ignored because their press didn't reach that window (expected: keys go to the window focused when they arrive) |
+  | `ignored_presses` | presses not taken as presses on a window: made in an `after_overrun` event, or while buttons held across a pause or gap or at a resume (the first start included) were down |
+  | `rationed`, `overflowed` | presses and moves dropped past a queue's 48 entries, and releases that didn't fit its 64 (each set `Lost`): their sum is `windows`' `lost`, totalled over every window, closed ones too |
   | `grab_ends` | grabs ended before their last button came up (their window closed or lost the focus, or input was interrupted) |
-  | `ignored_presses` | presses not taken as presses on a window: made in an `after_overrun` event, or while buttons held across a pause or gap or at a resume were down |
-  | `dead_pushes` | events and flags for a window that had closed |
+  | `dead_pushes` | events and flags for a window that had closed (its queue killed, or no longer on the list) |
   | `cancelled`, `late` | `ui invoke` requests cancelled at their deadline, and results that came after it |
   | `settled` | `yes` or `no`, below |
 
@@ -3082,7 +3102,8 @@ until a crash.
   the compositor has acted on the cut's generation; every byte the
   keyboard queued has been decoded (the bytes queued, `kbd`'s count kept
   under the keyboard's `ARRIVED` lock, are no more than the bytes the
-  decoder took, an atomic counter: `keyboard::all_decoded`); both readers
+  decoder finished, an atomic counter bumped after each byte's key event
+  is pushed: `keyboard::all_decoded`); both readers
   are at their ring's `newest()` and the compositor holds no event back
   (the Alt+F`n` barrier, or a resume whose screen hasn't come yet); no
   wake is pending, no damage is gathered and no pass is running; no
@@ -3114,7 +3135,11 @@ until a crash.
   `lumen-wm` drops it (the damage of its frame), and its surfaces are
   freed with the last `Arc`.
 - **The desktop's state** (window list, queues, wallpaper loader) is a
-  `desktop::Desktop` value; the live one is in a static.
+  `desktop::State`; the live one is in `COMPOSITOR`, a static private to
+  the module, and `desktop::Desktop` names where one lives (`Desktop::LIVE`,
+  or a test's own). Windows open only once the start completed
+  (`OpenError::NoDesktop` until then), and a start that fails hands its
+  window-id count on, so no id is reused in a boot.
   `Desktop::without_screen()` builds one with no compositor thread and no
   screen, for the ktests `desktop::opening_past_the_window_limit_fails`
   and `desktop::a_bad_wallpaper_falls_back_with_one_warning`, so no ktest
@@ -3259,7 +3284,7 @@ Moves with no button held aren't delivered (no hover in M4).
   `Pointer::from_read` takes a pointer ring's read (#151): the tablet's
   `usize` position (saturating, through `Pointer::from_state`), its
   buttons (`lumen_input::Buttons` into `ButtonSet`, still two types: the
-  merge into one is left for later) and `Read::gap()` (a gap in the ring
+  merge into one is #172, in its own PR before #155) and `Read::gap()` (a gap in the ring
   or `after_overrun`, handled before the event).
 - **Geometry** (`Metrics::DESKTOP`): a 24-row title bar spanning the
   frame (the side borders' top rows are title bar), 1-pixel borders, a
@@ -3288,8 +3313,11 @@ alone releases the owner's buttons, and no window is left holding one.
 
 - **Routing in the decoding pass:** while `vt::DESKTOP` is set, the pass
   routes only Alt+F1 to F4 to `term` (above; `Routed::Left`); every other
-  press goes to the key ring alone and is counted as `Routed::Desktop`
-  (`vt` ends with `N keys to the desktop`).
+  press but a bare modifier (`Routed::Modifier`, as in text mode) goes to
+  the key ring alone and is counted as `Routed::Desktop` (`vt` ends with
+  `N keys to the desktop`); every key event, releases and modifiers
+  included, is in the key ring already (`keyboard::read_key`). Whether
+  the desktop is shown is `vt::desktop_shown()`.
   So typing into a window never reaches the hidden terminal's shell.
 - **The compositor** reads the tablet's ring and the keyboard's ring
   (section 7) with one `Reader` each. Pointer input goes in as
@@ -3325,13 +3353,19 @@ from what they compare.
 | `desktop::COMPOSITOR` | the window list (`lumen-wm`), the gathered damage, the requests, the statistics | a few list operations, a snapshot |
 | a window's lock | its committed surface, its event queue, its flags | 16 rows of a commit or a blit, one queue operation |
 | `vt::CUT` | the cut | a read or a write (a leaf) |
+| `desktop::DONE`'s wait-queue lock | the threads waiting for an answer or for the compositor to catch up | a wake, or a wait's predicate, which takes `COMPOSITOR` (so this lock comes before it, and no wake is made holding `COMPOSITOR`) |
 | `term`'s screen lock | the terminals; and each row the compositor presents | one row of a present: at most 800 holds for a full present |
 
 - **Order:** `COMPOSITOR`, then a window's lock, then the heap's locks
   (the heap, the page tables, the frame allocator), then
   `klog::LINE_LOCK` (any log line), then the screen's lock. The router
   lock comes before the screen's lock (`leave_desktop`, `take_screen`),
-  `vt::CUT` and the input rings' locks (leaves).
+  `vt::CUT` and the input rings' locks (leaves, which may be taken under
+  any of these, `COMPOSITOR` included: the compositor reads the rings
+  again under it when it acts on a pause). The desktop's statics are
+  private to `desktop.rs` and the cut is read only as a copy
+  (`vt::cut()`), so outside those modules nothing can take them out of
+  order.
 - **Never upward:** nothing holding the router lock, `LINE_LOCK` or the
   screen's lock takes `COMPOSITOR` or a window's lock, and nothing holding
   those takes the router lock: the two families are never nested (the
@@ -3807,7 +3841,8 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/sync.rs      SpinLock (interrupts off while held)
   src/klog.rs      logger (levels, subsystem tags, serial timestamps, the ring dmesg reads)
   src/rtc.rs       the CMOS RTC: date and time (taken as UTC) for `date`
-  src/fb.rs        framebuffer: pixels, glyphs, the hello screen, the crash screen
+  src/fb.rs        framebuffer: pixels, glyphs, the hello screen (draw_header), the crash screen
+  src/desktop.rs   the desktop (#153): the compositor thread, windows (open_window, WindowHandle), desktop, windows
   src/font.rs      the desktop's anti-aliased text (lumen-font): the UI font parsed once and shared (font::face), the golden sample for `font` and its ktest
   src/screenshot.rs  `screenshot`: the screen as a PNG (lumen-png) in a base64 frame on serial
   src/term.rs      the virtual terminals on the framebuffer (lumen-term): their grids, drawing the shown one's changed cells, log lines, the cursor, the canvas

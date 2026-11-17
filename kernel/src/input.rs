@@ -11,9 +11,11 @@
 //! overwrites its oldest event. The `mouse` thread pushes each frame
 //! before it publishes the newest state (`crate::mouse`), and the
 //! keyboard's decoding pass each key event it decodes
-//! (`crate::keyboard::read_key`); each pusher then wakes the desktop's
-//! compositor (`crate::desktop::wake`, after the ring's lock), the one
-//! `Reader` of both (#153). Without a desktop only the shell's `mouse
+//! (`crate::keyboard::read_key`). The `mouse` thread then wakes the
+//! desktop's compositor (`crate::desktop::wake`, after the ring's lock),
+//! the one `Reader` of both (#153); the key ring needs no waker of its own:
+//! IRQ 1 wakes the compositor when it queues bytes, and the compositor
+//! runs the decoding pass itself. Without a desktop only the shell's `mouse
 //! events` and `kbd events` look at the newest, and the rings fill and
 //! wrap.
 

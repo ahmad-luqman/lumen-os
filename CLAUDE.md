@@ -216,9 +216,10 @@ own PR that updates that doc first.
   `font.rs`: the desktop's anti-aliased text (`lumen-font`): `font::face`,
   the UI font parsed on first use and shared; `font` renders the golden
   sample twice (timings, cache, golden check), as its ktest does.
-  `screenshot.rs`: `screenshot`: the screen captured (the framebuffer
-  read once under the screen's lock, `term::read_pixels`, which says if a
-  canvas held the screen), encoded on a 256 KiB stack, sent as a base64 frame
+  `screenshot.rs`: `screenshot`: the screen captured (`capture`: the
+  desktop's back buffer while it is shown, `desktop::capture`; else the
+  framebuffer read once under the screen's lock, `term::read_pixels`,
+  which says if a canvas held the screen), encoded on a 256 KiB stack, sent as a base64 frame
   on serial (the format: ARCHITECTURE section 11).
   `sound.rs`: the virtio-sound driver (its `sound` thread owns the device,
   playing `lumen-synth` sources paced by the device), `beep`, `play`,
@@ -240,8 +241,8 @@ own PR that updates that doc first.
   coverage), `Surface` (xRGB8888 with a stride: fill, clipped blits,
   `blend_mask`/`blend_mask_in` for coverage masks such as glyphs, the
   latter clipped to a damaged rect) and `Target`, what a surface is
-  presented to a span at a time (a surface; the front buffer once the
-  compositor lands, #153) (host-tested, incl. randomized coverage and
+  presented to a span at a time (a surface; the desktop's front buffer,
+  `term::ScreenCanvas`) (host-tested, incl. randomized coverage and
   every-edge clipping).
 - `crates/lumen-wm`: the desktop's window-manager logic (#152): frame
   geometry (`Metrics`: title bar, close box, client, borders; `Part`),
