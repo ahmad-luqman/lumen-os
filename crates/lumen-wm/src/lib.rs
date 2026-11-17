@@ -44,6 +44,4 @@ pub use geom::{Metrics, Part};
 pub use queue::{Entry, EventQueue, Held, KeyLike, Next, Pushed, QueueCounts};
 pub use route::{PointerEntry, deliver};
 pub use theme::Theme;
-pub use wm::{
-    Button, ButtonSet, Delivery, Hit, Interruption, Outcome, Pointer, Window, WindowId, Wm, WmCounts, WmDamage,
-};
+pub use wm::{Delivery, Hit, Interruption, Outcome, Pointer, Window, WindowId, Wm, WmCounts, WmDamage};

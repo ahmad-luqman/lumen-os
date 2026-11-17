@@ -271,7 +271,9 @@ own PR that updates that doc first.
   randomized model of damage-only repainting with focus, and
   press-pause-resume-release through the queue).
 - `crates/lumen-input`: pointer input: evdev events into whole-frame
-  pointer states, axes scaled to the screen (`Tablet`, `AbsAxis`), a
+  pointer states, axes scaled to the screen (`Tablet`, `AbsAxis`), the
+  buttons held (`Buttons`, one bit per `Button`: the one button set the
+  tablet and lumen-wm share, #172), a
   frame's most events from the device's `EV_BITS` (`frame_bound`) and
   whether a batch may have lost frames (`may_have_lost_frames`, the one
   statement of what overruns guarantee; a model of QEMU's ring checks
