@@ -13,6 +13,7 @@ tests = [
     "ktest:lumen_kernel::time::a_pit_start_read_after_it_ran_out_is_not_steady",
     "ktest:lumen_kernel::time::a_tsc_calibration_short_of_steady_windows_fills_in",
     "ktest:lumen_kernel::time::a_tsc_calibration_waits_between_retakes",
+    "ktest:lumen_kernel::time::tsc_spares_are_ranked_by_the_tsc_bound",
     "ktest:lumen_kernel::time::an_hpet_slow_to_read_stretches_its_windows_until_steady",
     "ktest:lumen_kernel::time::a_pit_end_read_after_it_could_wrap_is_not_steady",
     "ktest:lumen_kernel::time::a_paused_pit_reading_is_taken_again",
@@ -42,6 +43,7 @@ tests = [
     "scenario:test_time::test_timer_windows_with_no_bound_left_panic",
     "scenario:test_time::test_a_stall_past_ten_windows_is_ignored",
     "scenario:test_ktest::test_in_kernel_tests_pass",
+    "scenario:test_ktest::test_in_kernel_tests_pass_with_calibrations_stalled_within_tolerance",
 ]
 
 [[feature]]

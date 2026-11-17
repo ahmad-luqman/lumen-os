@@ -577,9 +577,13 @@ pub fn measure(reference: Reference) -> Option<Result<Calibration, CalError>> {
         Reference::Hpet => calibrate_with_hpet(&hpet()?, |_| {}),
         Reference::Pit => calibrate_with_pit(|_| {}),
     };
-    Some(cal.and_then(|c| {
-        if c.median_bound_ppm() >= lumen_time::NO_INFORMATION_PPM { Err(CalError::NoInformation) } else { Ok(c) }
-    }))
+    Some(cal.and_then(with_a_bound))
+}
+
+/// `cal`, if its median has a bound under 100%; else
+/// [`CalError::NoInformation`] (its rate says nothing).
+fn with_a_bound(cal: Calibration) -> Result<Calibration, CalError> {
+    if cal.median_bound_ppm() >= lumen_time::NO_INFORMATION_PPM { Err(CalError::NoInformation) } else { Ok(cal) }
 }
 
 /// How long the local APIC timer's calibration waits before taking a window
@@ -1530,6 +1534,29 @@ crate::ktest!(
         kassert_eq!(cal.median_bound_ppm(), w(18).tsc_error_ppm());
         kassert!(cal.median_bound_ppm() > 108_000 && cal.median_bound_ppm() < 110_000);
         kassert_eq!(report(&cal).verdict, Verdict::Imprecise);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn tsc_spares_are_ranked_by_the_tsc_bound() {
+        // The TSC's fill-in ranks unsteady windows by how far off the TSC's
+        // rate from each can be (an end gap counts for more than a start
+        // gap), not by the gap share: of three A's (0 + 0.7%) and five B's
+        // (0.4% + 0.4%), the five B's are kept, a median within 4,018 ppm
+        // (the A's, kept by share, would give 7,051). And a measurement whose
+        // median has no bound is refused (`measure`, `with_a_bound`).
+        use crate::kassert_eq;
+        let a = Window { tsc: 10_000_000, reference: 1_000_000, polls: 800, start_gap: 0, end_gap: 70_000 };
+        let b = Window { start_gap: 40_000, end_gap: 40_000, ..a };
+        let mut it = [a, b, a, b, a, b, b, b].into_iter().chain(core::iter::repeat(b));
+        let cal = median_tsc_hz_with(Reference::Hpet, 100_000_000, || Ok(it.next().unwrap_or(b)), |_| {})
+            .map_err(|_| "calibrating failed")?;
+        kassert_eq!(cal.windows, [b; WINDOWS]);
+        kassert_eq!(cal.median_bound_ppm(), 4_018);
+        let none = Calibration { windows: [Window { end_gap: 5_000_000, ..a }; WINDOWS], ..cal };
+        kassert_eq!(with_a_bound(none), Err(CalError::NoInformation));
+        kassert_eq!(with_a_bound(cal), Ok(cal));
         Ok(())
     }
 );
