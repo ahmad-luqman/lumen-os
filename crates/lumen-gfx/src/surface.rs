@@ -3,9 +3,9 @@
 //!
 //! A pixel is a `u32`, `0xXXRRGGBB`: blue in the low byte, the top byte
 //! unspecified (the display ignores it; the framebuffer's format on q35's
-//! GOP). A
-//! [`Surface`]'s rows are `stride` pixels apart, at least `width`; the
-//! pixels between a row's end and the next row are never written.
+//! GOP). A [`Surface`]'s rows are `stride` pixels apart, at least `width`;
+//! the pixels between a row's end and the next row are never written, and
+//! neither equality nor `Debug` looks at them.
 //!
 //! Drawing is clipped: any part of a rectangle, blit or mask outside the
 //! surface is skipped, so callers can draw at negative or oversized
@@ -28,11 +28,13 @@ pub trait Target {
     fn size(&self) -> (u32, u32);
 
     /// Write `pixels` in row `y` from column `x` on. This crate only calls
-    /// it with non-empty spans inside [`Target::size`]. An implementation
-    /// must never write outside itself: in the kernel it must not panic
-    /// either, and drops a span it can't take (outside it, or while it
-    /// isn't drawing, e.g. after a crash began); a host test's target may
-    /// panic instead, to catch a caller's bug.
+    /// it with non-empty spans inside [`Target::size`]: a span outside is
+    /// a caller's bug, and an implementation must never write outside
+    /// itself for one. An in-memory target (a [`Surface`]) may panic on
+    /// it, as [`Surface::row_mut`] does. A target that can stop taking
+    /// spans while a draw is under way (the front buffer, once a crash
+    /// report begins) must not panic for that: it drops those spans
+    /// silently.
     fn write_span(&mut self, x: u32, y: u32, pixels: &[u32]);
 }
 
@@ -92,7 +94,11 @@ pub const fn blend(src: u32, dst: u32, alpha: u8) -> u32 {
 
 /// An owned `width` x `height` xRGB8888 buffer, rows `stride` pixels
 /// apart.
-#[derive(Clone, PartialEq, Eq, Debug)]
+///
+/// Two surfaces are equal when they have the same size and the same
+/// pixels, whatever their strides and padding. `Debug` prints the size and
+/// stride, not the pixels.
+#[derive(Clone)]
 pub struct Surface {
     width: u32,
     height: u32,
@@ -100,12 +106,33 @@ pub struct Surface {
     pixels: Vec<u32>,
 }
 
+impl PartialEq for Surface {
+    fn eq(&self, other: &Self) -> bool {
+        self.width == other.width
+            && self.height == other.height
+            && (0..self.height).all(|y| self.row(y) == other.row(y))
+    }
+}
+
+impl Eq for Surface {}
+
+impl core::fmt::Debug for Surface {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Surface")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("stride", &self.stride)
+            .finish_non_exhaustive()
+    }
+}
+
 /// How many pixels a `width` x `height` buffer with rows `stride` apart
 /// holds, or `None` if `stride < width`, the width or height passes
 /// `i32::MAX` (where [`Surface::bounds`] would stop short of the surface),
 /// or the count or its size in bytes overflows, or the bytes pass
-/// `isize::MAX` (more than any allocation may be, so `vec!` would panic
-/// with "capacity overflow").
+/// `isize::MAX` (more than any allocation may be). `try_reserve_exact` in
+/// [`Surface::with_stride`] would refuse such a size too; this bound
+/// states it without relying on that.
 fn buffer_len(width: u32, height: u32, stride: usize) -> Option<usize> {
     if stride < width as usize || width > i32::MAX as u32 || height > i32::MAX as u32 {
         return None;
@@ -409,8 +436,9 @@ mod tests {
     }
 
     /// Codex's case on PR #159: the pixel count fits a usize, the bytes
-    /// don't fit an isize. Past the bound and right at it (where the
-    /// allocation itself fails), `None` rather than a panic or an abort.
+    /// don't fit an isize (`vec!` panicked with "capacity overflow"
+    /// there). Past the bound and right at it (where the allocation
+    /// itself fails), `None` rather than a panic or an abort.
     #[test]
     fn with_stride_too_large_is_none() {
         assert!(Surface::with_stride(1, 1, usize::MAX / 2).is_none());
@@ -456,9 +484,25 @@ mod tests {
         assert_eq!(s.row(1), &[11, 12, 13]);
         s.row_mut(2)[0] = 99;
         assert_eq!(s.pixels[10], 99);
-        let mut packed = Surface::new(3, 3);
-        packed.blit(&s, s.bounds(), 0, 0);
-        assert_eq!(packed.pixels, [1, 2, 3, 11, 12, 13, 99, 22, 23]);
+    }
+
+    /// Equality looks at the size and each row's pixels, not the stride or
+    /// what's in the padding; `Debug` shows the shape, not the pixels.
+    #[test]
+    fn equality_ignores_stride_and_padding() {
+        let packed = numbered(3, 2, 7);
+        let mut padded = numbered_strided(3, 2, 7, 5);
+        assert_eq!(packed, padded);
+        padded.pixels[3] = 0xdead;
+        padded.pixels[9] = 0xbeef;
+        assert_eq!(packed, padded, "padding doesn't count");
+        padded.set_pixel(2, 1, 0);
+        assert_ne!(packed, padded);
+        assert_ne!(numbered(3, 2, 7), numbered(2, 3, 7));
+        assert_ne!(numbered(3, 2, 7), numbered(3, 1, 7));
+        assert_ne!(Surface::new(0, 2), Surface::new(0, 3));
+        assert_eq!(Surface::new(0, 2), Surface::with_stride(0, 2, 4).unwrap());
+        assert_eq!(format!("{padded:?}"), "Surface { width: 3, height: 2, stride: 5, .. }");
     }
 
     #[test]
@@ -644,10 +688,6 @@ mod tests {
                             };
                             assert_eq!(raw(&s, px, py), want, "mask at {x},{y} in {clip:?}: pixel {px},{py}");
                         }
-                    }
-                    assert_eq!(s.pixels.len(), model.pixels.len());
-                    for row in 0..h as usize {
-                        assert_eq!(&s.pixels[row * 7 + w as usize..row * 7 + 7], &[0, 0], "padding");
                     }
                 }
             }

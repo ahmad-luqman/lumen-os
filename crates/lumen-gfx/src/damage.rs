@@ -1,9 +1,10 @@
 //! Damage: which rectangles of a surface changed since it was last
 //! presented.
 //!
-//! A [`Damage`] holds at most `N` rectangles in a fixed array, so adding
-//! one never allocates (the compositor adds damage under its lock, where
-//! nothing may allocate). Adding a rectangle:
+//! A [`Damage`] holds at most `N` rectangles in a fixed array: its size is
+//! known up front and adding a rectangle can't fail or allocate, however
+//! much damage arrives (past `N` it degrades to one bounding box instead).
+//! Adding a rectangle:
 //!
 //! 1. ignores it if it's empty;
 //! 2. merges it with each rectangle in the list whose bounding box with
@@ -121,6 +122,7 @@ impl<const N: usize> Damage<N> {
     /// How many times, since [`Damage::new`] or [`Damage::clear`], a full
     /// list collapsed into one bounding box (for the compositor's
     /// statistics: a high count means `N` is too small for the load).
+    /// [`Damage::take`] hands the count over with the damage taken.
     pub const fn collapses(&self) -> u64 {
         self.collapses
     }
@@ -139,7 +141,8 @@ impl<const N: usize> Damage<N> {
         self.collapses = 0;
     }
 
-    /// The damage so far, leaving none behind.
+    /// The damage so far, leaving none behind: the collapse count goes
+    /// with the damage taken, and this list's starts again at 0.
     #[must_use = "the damage taken is lost unless used; to drop it, use clear()"]
     pub fn take(&mut self) -> Self {
         core::mem::take(self)
@@ -291,6 +294,24 @@ mod tests {
         assert_eq!(pieces.rects(), whole.rects());
         assert_eq!(pieces, whole);
         assert_eq!(format!("{pieces:?}"), format!("{whole:?}"));
+        // A list collapsed twice equals the same box added directly: the
+        // count isn't compared, though `Debug` shows it.
+        let mut collapsed = Damage::<1>::new();
+        collapsed.add(Rect::new(0, 0, 1, 1));
+        collapsed.add(Rect::new(4, 4, 1, 1));
+        collapsed.add(Rect::new(7, 7, 1, 1));
+        assert_eq!(collapsed.collapses(), 2);
+        let mut direct = Damage::<1>::new();
+        direct.add(Rect::new(0, 0, 8, 8));
+        assert_eq!(collapsed, direct);
+        assert_eq!(format!("{collapsed:?}"), "Damage { rects: [Rect { x: 0, y: 0, w: 8, h: 8 }], collapses: 2 }");
+        // Lists of different lengths differ, whichever side is longer.
+        let (mut one, mut two) = (Damage::<4>::new(), Damage::<4>::new());
+        one.add(Rect::new(0, 0, 1, 1));
+        two.add(Rect::new(0, 0, 1, 1));
+        two.add(Rect::new(5, 5, 1, 1));
+        assert_ne!(one, two);
+        assert_ne!(two, one);
         // The order of the reported rectangles counts.
         let (mut ab, mut ba) = (Damage::<4>::new(), Damage::<4>::new());
         ab.add(Rect::new(0, 0, 1, 1));
@@ -309,6 +330,12 @@ mod tests {
         let taken = d.take();
         assert!(d.is_empty());
         assert_eq!(taken.rects().len(), 2);
+        // The collapse count goes with the damage taken.
+        let mut d = Damage::<1>::new();
+        d.add(Rect::new(0, 0, 1, 1));
+        d.add(Rect::new(5, 5, 1, 1));
+        let t = d.take();
+        assert_eq!((d.collapses(), t.collapses()), (0, 1));
         let mut t = taken;
         t.clear();
         assert!(t.is_empty());

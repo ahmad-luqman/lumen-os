@@ -106,12 +106,21 @@ impl Rect {
                 && other.bottom() <= self.bottom())
     }
 
-    /// The rectangle moved by (`dx`, `dy`): the origin saturates at
-    /// `i32`'s ends, and the size is shortened as [`Rect::new`] does, so
-    /// moving never overflows (client to screen coordinates, say).
+    /// The pixels moved by (`dx`, `dy`), each edge clamped to `i32`'s
+    /// range, so moving never overflows (client to screen coordinates,
+    /// say) and never covers a pixel the moved rectangle wouldn't: a part
+    /// pushed past either end is cut off. [`Rect::EMPTY`] if nothing is
+    /// left, or the rectangle was empty.
     #[must_use]
-    pub const fn translate(&self, dx: i32, dy: i32) -> Rect {
-        Rect::new(self.x.saturating_add(dx), self.y.saturating_add(dy), self.w, self.h)
+    pub fn translate(&self, dx: i32, dy: i32) -> Rect {
+        let clamp = |v: i64| v.clamp(i32::MIN as i64, i32::MAX as i64);
+        Rect::from_edges(
+            clamp(self.x as i64 + dx as i64),
+            clamp(self.y as i64 + dy as i64),
+            clamp(self.right() as i64 + dx as i64),
+            clamp(self.bottom() as i64 + dy as i64),
+        )
+        .unwrap_or(Rect::EMPTY)
     }
 
     /// The pixels in both, or `None` if there are none.
@@ -259,18 +268,29 @@ mod tests {
     }
 
     #[test]
-    fn translate_moves_and_saturates() {
+    fn translate_moves_and_clamps() {
         assert_eq!(Rect::new(1, 2, 3, 4).translate(-5, 10), Rect::new(-4, 12, 3, 4));
         assert_eq!(Rect::new(1, 2, 3, 4).translate(0, 0), Rect::new(1, 2, 3, 4));
-        // The far edge stops at i32::MAX: the size shrinks, nothing panics.
+        // Past i32::MAX the far edge stops there: the size shrinks.
         let r = Rect::new(i32::MAX - 10, 0, 8, 1).translate(5, 0);
         assert_eq!((r.x(), r.w(), r.right()), (i32::MAX - 5, 5, i32::MAX));
-        let r = Rect::new(0, 0, 8, 8).translate(i32::MAX, i32::MAX);
-        assert_eq!((r.x(), r.y()), (i32::MAX, i32::MAX));
-        assert!(r.is_empty());
-        // The origin saturates at i32::MIN, keeping the size.
-        let r = Rect::new(i32::MIN + 2, -3, 8, 1).translate(-10, i32::MIN);
-        assert_eq!((r.x(), r.y(), r.w(), r.h()), (i32::MIN, i32::MIN, 8, 1));
+        let r = Rect::new(0, i32::MAX - 10, 4, 8).translate(0, 5);
+        assert_eq!((r.y(), r.h(), r.bottom(), r.w()), (i32::MAX - 5, 5, i32::MAX, 4));
+        // Past i32::MIN the near edge stops there: the size shrinks too,
+        // so the result never covers a pixel the moved rect wouldn't.
+        let r = Rect::new(i32::MIN + 2, 0, 8, 1).translate(-5, 0);
+        assert_eq!((r.x(), r.w(), r.right()), (i32::MIN, 5, i32::MIN + 5));
+        let r = Rect::new(0, i32::MIN + 1, 3, 4).translate(0, -3);
+        assert_eq!((r.y(), r.h(), r.bottom(), r.w()), (i32::MIN, 2, i32::MIN + 2, 3));
+        // Pushed entirely past either end, or empty: nothing.
+        assert_eq!(Rect::new(0, 0, 8, 8).translate(i32::MAX, 0), Rect::EMPTY);
+        assert_eq!(Rect::new(0, 0, 8, 8).translate(0, i32::MAX), Rect::EMPTY);
+        assert_eq!(Rect::new(i32::MIN + 2, -3, 8, 1).translate(-10, 0), Rect::EMPTY);
+        assert_eq!(Rect::new(-3, -3, 1, 1).translate(0, i32::MIN), Rect::EMPTY);
+        assert_eq!(Rect::new(5, 5, 0, 3).translate(1, 1), Rect::EMPTY);
+        // The whole plane moved stays clipped to it.
+        let whole = Rect::new(i32::MIN, i32::MIN, u32::MAX, u32::MAX);
+        assert_eq!(whole.translate(10, -10), Rect::new(i32::MIN + 10, i32::MIN, u32::MAX - 10, u32::MAX - 10));
     }
 
     #[test]
