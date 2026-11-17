@@ -2880,8 +2880,10 @@ tree`, `ui invoke`).
   lock (by start, resume and Alt+F`n`), so each key is routed on one side
   of the change.
 - **The cut:** `vt::CUT`, a leaf lock, holds a generation that only grows,
-  whether the desktop is paused, and both rings' `newest()` at the
-  change. Pausing and resuming write it under the router lock, before any
+  whether the desktop is paused, both rings' `newest()` at the change, and
+  the buttons the pointer ring's newest frame holds then (the baseline
+  `Wm::resume` takes; captured here because the ring may overwrite that
+  frame before the compositor reads it). Pausing and resuming write it under the router lock, before any
   later key is pushed; the compositor reads it each pass and moves its
   readers (`Reader::skip_to`).
 - **Leaving: Alt+F1 to F4** show that terminal: the one exception to the
@@ -2904,9 +2906,9 @@ tree`, `ui invoke`).
   The compositor, reading the key ring, forwards the key events before
   the Alt+F`n` press (which it recognises with the same predicate) and
   never that press or anything after it, and the pointer events up to the
-  cut's pointer `Seq`. Then the focused window gets `FocusLost`, every
-  other window with a delivered press not yet released (or a grab) gets
-  `Lost`, and nothing more is presented.
+  cut's pointer `Seq`. Then the focused window gets `FocusLost` (the
+  grabbing window, if any, is the focused one; `Wm::interrupt`), and
+  nothing more is presented.
 - **Paused, not ended:** the windows live on (their threads keep running
   and drawing; their damage gathers). The pointer is the terminals' again
   (`term::move_pointer`). `desktop` resumes, under the router lock: it
@@ -2914,7 +2916,8 @@ tree`, `ui invoke`).
   the screen, writes the cut (not paused, both rings' `newest()`: nothing
   typed in a terminal reaches a window), sets `vt::DESKTOP`, releases the
   lock and wakes the compositor, which sends the focused window
-  `FocusGained` and presents everything once.
+  `FocusGained` (`Wm::resume` with the cut's baseline buttons) and
+  presents everything once.
 - **Not ended in M4:** there is no `desktop off`; windows go when closed. A
   crash ends everything, as always.
 
@@ -2984,9 +2987,11 @@ until a crash.
   | `lost` | events the compositor's readers lost (gaps) |
   | `damage` | rectangles gathered and not yet presented |
   | `no_focus_keys` | key events dropped because no window was focused |
-  | `stray_releases` | releases ignored because their press wasn't delivered to that window |
-  | `grab_ends` | grabs ended because their window closed |
-  | `dead_pushes` | events for a window that had closed |
+  | `stray_forgotten`, `stray_unpressed` | button releases ignored: their press was forgotten (`FocusLost`, `Lost`) or dropped (expected), or the button was never pressed (never expected) |
+  | `key_releases_unpaired` | key releases ignored because their press didn't reach that window (expected: keys go to the window focused when they arrive) |
+  | `grab_ends` | grabs ended before their last button came up (their window closed or lost the focus, or input was interrupted) |
+  | `ignored_presses` | presses not taken as presses on a window: made in an `after_overrun` event, or while buttons held across a pause or gap or at a resume were down |
+  | `dead_pushes` | events and flags for a window that had closed |
   | `cancelled`, `late` | `ui invoke` requests cancelled at their deadline, and results that came after it |
   | `settled` | `yes` or `no`, below |
 
@@ -2994,8 +2999,8 @@ until a crash.
   every byte the keyboard queued has been decoded (two atomic counters,
   bytes queued and bytes decoded); both readers are at their ring's
   `newest()`; no damage is gathered and no pass is running; no commit is
-  under way; every window's queue is empty and its owner is blocked in
-  `wait_event` (an idle bit per window); and no request is `Pending` or
+  under way; every window's queue is idle (no entry and no flag) and its
+  owner is blocked in `wait_event` (an idle bit per window); and no request is `Pending` or
   `Running`. A test first polls for the effect it expects (a `windows` row,
   a `ui tree` value), then calls the harness's `wait_settled(m)`
   (`tools/harness/lumen_harness/gui.py`, #153), and brackets each
@@ -3018,7 +3023,7 @@ until a crash.
   `WindowHandle` holds that `Arc` and the owner's surface; it is `Send`
   (a thread may open a window and hand it to the thread that will own
   it), not `Sync`, not `Clone`. Dropping it destroys the window: its
-  queue closes, every `Pending` request is answered "window closed",
+  queue is killed (dead), every `Pending` request is answered "window closed",
   `lumen-wm` drops it (the damage of its frame), and its surfaces are
   freed with the last `Arc`.
 - **The desktop's state** (window list, queues, wallpaper loader) is a
@@ -3054,38 +3059,74 @@ until a crash.
 ### Window events (#153)
 
 `WindowHandle::next_event()` (non-blocking) and `wait_event()` (which sets
-the window's idle bit while it blocks on an empty queue) return
+the window's idle bit while it blocks on an idle queue) return
 `WindowEvent`s: `Key(KeyEvent)`, `PointerDown`, `PointerMove`,
 `PointerUp` (client coordinates and the buttons held), `FocusGained`,
 `FocusLost`, `Lost` (events for this window were dropped), `Close` (the
 close box, or `ui invoke <root> close`) and `Request` (an automation
 request, #156).
 
-- **Sticky flags, then a queue.** `Lost`, `Close` and the newest focus
-  state are flags beside the queue and need no slot: `next_event` returns
-  `Lost` first, then a focus change, then `Close`, then the queue's
-  oldest entry.
+- **Sticky flags beside the queue.** `Lost`, `Close`, a focus loss and a
+  focus gain are flags beside the queue (`set_lost`, `request_close`,
+  `set_focus`) and need no slot, so they are never dropped. The queue's
+  entries are `lumen_wm::Entry<K, R>`: `Key(K)` (#151's key event, through
+  the `KeyLike` trait: its code and whether it is a press), `Pointer`
+  (`PointerEntry::{Down, Move, Up}`, client coordinates, one `Button`
+  each) and `Request(R)` (#156); it has no variant for a flag, so one
+  can't be pushed. A press or release is of a `Held::{Code(K::Code),
+  Button(Button)}`. Each flag is delivered in its place, after the entries queued
+  before it was set (set again, it moves to the end): delivered ahead of
+  older entries, `FocusLost` or `Lost` would clear the owner's held keys
+  and buttons before a press queued earlier, whose release (a stray by
+  then) never comes. A loss is never folded into a gain: a pause and its
+  resume before the owner reads deliver `FocusLost` then `FocusGained`; a
+  gain then a loss delivers only the loss. Due together, they come in the
+  order `Lost`, `FocusLost`, `FocusGained`, `Close`.
 - **The queue** (`lumen_wm::EventQueue`, a host-tested pure type): 64
   entries. A `PointerMove` replaces a `PointerMove` at the tail. Presses,
   moves, key presses and requests are queued only while fewer than 48
-  entries are; past that a press or move is dropped and a request refused
-  (`ui invoke` says "window <id> busy"). A release is queued (in any free
-  slot) only if the queue delivered that key's or button's press; any
-  other release is ignored and counted (`stray_releases`); `FocusLost` and
-  `Lost` clear the presses it remembers. Anything that
-  still doesn't fit sets `Lost`. Every drop is counted in the window's
-  `lost` (a `windows` column) and logs one `WARN desktop: window <id> is
-  behind: dropping events` per burst (until the queue empties).
+  entries are; past that a press or move is dropped (`rationed`) and a
+  request refused (`ui invoke` says "window <id> busy"). A release is
+  queued (in any free slot) only if the queue took that key's or
+  button's press; any other release is ignored and counted: a key's as
+  `key_releases_unpaired` (expected: keys go to the window focused when
+  they arrive, so Shift held across a click, or the Enter of `desktop`
+  itself, is released in a window that never saw it go down), a button's
+  as `stray_forgotten` if its press was forgotten (`FocusLost`, `Lost`) or
+  dropped, else as `stray_unpressed` (never expected: the window manager
+  delivers a button's release only after its press). A release of a
+  press taken that doesn't fit sets `Lost` (`overflowed`).
+  Every drop is counted in the window's `lost` (`rationed` plus
+  `overflowed`, a `windows` column) and logs one `WARN desktop: window <id>
+  is behind: dropping events` per burst (until the queue empties).
+  `lumen_wm::deliver` puts each `lumen_wm::Delivery` on the queue of its
+  window (`Delivery::window`): a pointer event as an `Entry::Pointer`, the
+  rest as flags.
 - **Held state never goes stale:** on `FocusLost` and `Lost` an owner
-  treats every key and button as released. On a pause, and on a gap in
-  either ring (a `Reader` gap, or an event with `after_overrun`), the
-  focused window gets `FocusLost` (on a pause) or `Lost` (on a gap), and
-  every other window with a delivered press not yet released, or a grab,
-  gets `Lost`; the compositor's own drag and grab state is rebuilt from
-  the next pointer event's `buttons`. A grab whose window closed ends
-  (`grab_ends`).
-- After a window is destroyed its queue is closed: events for it are
-  counted (`dead_pushes`), never queued.
+  treats every key and button as released. The grabbing window is always
+  the focused one (a grab ends when its window loses the focus or closes,
+  or input is interrupted: `grab_ends`). `Wm::interrupt`:
+  - a pause: the focused window gets `FocusLost`; the drag or grab ends;
+  - a gap in the pointer ring (a `Reader` gap, or an event with
+    `after_overrun`): the focused window gets `Lost`; the drag or grab
+    ends; with buttons held, nothing more is delivered until a pointer
+    event reports every button up (a press in the frames lost wasn't
+    seen), and a button down in the `after_overrun` event itself is no
+    press either (`ignored_presses`); with none held, the next press is a
+    press;
+  - a gap in the key ring (`Interruption::KeyGap`: a `Reader` gap on the
+    key ring, `Read::lost_before`, or a key event with `after_drop`, both
+    #151): the focused window gets `Lost` (a key it holds may never be
+    released); a grab on it ends (its buttons ignored until up); a
+    title-bar drag goes on. While paused, pointer events are
+  ignored and focus changes (a window opened or closed meanwhile) aren't
+  delivered. The resume (`Wm::resume(baseline)`, where `baseline` is the
+  buttons of the pointer ring's newest frame at the cut) tells the
+  focused window, as it is then, `FocusGained`; buttons in `baseline`
+  are ignored until a pointer event reports every button up (pressed in
+  the terminal: counted as `ignored_presses` if more come meanwhile).
+- After a window is destroyed its queue is dead (`EventQueue::kill`):
+  events and flags for it are counted (`dead_pushes`), never queued.
 
 ### Stacking, focus and dragging: `lumen-wm` (#152)
 
@@ -3093,18 +3134,65 @@ A host-tested crate with no pixels and no locks. Windows (id, title,
 frame rectangle, client rectangle derived from it) in stacking order;
 hit testing front to back (title bar, close box, client area, desktop);
 focus (a click on a window focuses and raises it; closing the focused one
-focuses the next one down; exactly one is focused unless there are none);
-the drag state machine over pointer events (a press on a title bar starts
-it, moves move the frame, clamped so a strip of the title bar stays on the
-screen, and the release ends it); and the implicit grab (a press on a
-client area, the moves while that button is down, and its release go to
-that window, in client coordinates). Every operation returns the damage it
-causes. A model check runs random operations and compares repainting only
-the reported damage, and the focused window, with repainting everything.
-A host test runs press, pause, resume, release, and the same with a ring
-gap and with `after_overrun` in place of the pause: no window is left
-holding a button. `EventQueue` (#153) and the themes' palettes (#154, one
-struct per theme) live here too.
+focuses the next one down; exactly one is focused, always the one in
+front, unless there are none); the drag state machine over pointer events
+(a left press on a title bar starts it, moves move the frame, clamped so a
+strip of the title bar stays on the screen, and the left button's release
+ends it; other buttons held then are ignored until they are up); and the
+implicit grab (a press on a client area, the moves while it is down, and
+its release go to that window, in client coordinates; other buttons
+pressed meanwhile go there too, and the grab lasts until the last of them
+is released, since the window was told of each press and must be told of
+each release, or until the window loses the focus or closes). A left
+press on the close box and its left release over it is a `Close` for the
+window (other buttons meanwhile are ignored); the owner decides, and
+`Wm::close` removes it. A press on the desktop or a border (or with
+another button on a title bar or close box) does nothing until every
+button is up (a press on a border first focuses and raises the window).
+Moves with no button held aren't delivered (no hover in M4).
+
+- **API:** `Wm::new(w, h, Metrics::DESKTOP)`; `open` (in front, focused,
+  clamped like a move, by the frame's whole width), `close`, `focus`
+  (raise and focus: the taskbar, `ui invoke <root> focus`) and `move_to`
+  (each `None` for a window not open), `pointer(Pointer)`,
+  `interrupt(Interruption::{Pause, Gap, KeyGap})`, `resume(baseline)`, and
+  queries (`windows` back to front, `window`, `id(n)` for a number typed
+  in `ui invoke` or read from `windows`, live windows only, `focused`,
+  `hit`, `client`, `dragging`, `grabbing`, `is_idle`, `is_paused`,
+  `counts`). Each operation returns an `Outcome`: its `Damage` (a moved
+  window's old and new frames, a raised window's frame, both frames of a
+  focus change, since a focused frame is drawn differently) and its
+  `Delivery`s (`PointerDown`/`PointerMove`/`PointerUp` in client
+  coordinates, one `Button` each, `FocusGained`, `FocusLost`, `Lost`,
+  `Close`), which #153 puts on each window's queue with
+  `lumen_wm::deliver`. `Outcome` and the `Option`s are `#[must_use]`.
+- **Coordinates:** screen pixels as `i32`, as `lumen-gfx` uses (a window
+  may hang off the left, right or bottom edge, never the top);
+  `Pointer::from_state` converts the tablet's `usize` position
+  (saturating) and its buttons (`ButtonSet`), and carries #151's
+  `after_overrun` (a gap, handled before the event).
+- **Geometry** (`Metrics::DESKTOP`): a 24-row title bar spanning the
+  frame (the side borders' top rows are title bar), 1-pixel borders, a
+  16-pixel close box 4 pixels in from the right border; a moved frame
+  keeps its title bar's rows on the screen and at least 48 pixels of its
+  width (all of it, if narrower).
+
+A model check runs random operations (opening, closing, focusing,
+moving, pointer events and clicks aimed at title bars, close boxes and
+clients, pauses, pointer and key gaps, `after_overrun`) and checks after
+each: repainting
+only the reported damage equals repainting everything (painter's
+algorithm, each pixel knowing its window, part and whether that window is
+focused); the focused window is the front one and holds any grab; hit
+testing agrees with the picture; a drag follows the pointer, clamped, and
+only while the left button is held; a first press on a client is that
+window's; and, through each window's `EventQueue`, only the grabbing
+window believes buttons are held, and no stray release reaches a queue.
+Host tests run press, pause, resume, release, and the same with a ring
+gap and with `after_overrun` in place of the pause: the interruption
+alone releases the owner's buttons, and no window is left holding one.
+`EventQueue` (#153) and the themes' palettes (#154: `Theme::LIGHT`,
+`Theme::DARK`, `by_name`) live here too.
 
 ### Input on the desktop (#151, #153)
 
@@ -3629,7 +3717,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/shell/       the shells (lumen-shell): serial and the virtual terminals' consoles, the commands, system commands (sysinfo.rs), deliberate faults (crash.rs)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
-crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-gfx, lumen-acpi, lumen-pci, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, lumen-font, lumen-png, ...)
+crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-gfx, lumen-acpi, lumen-pci, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, lumen-font, lumen-png, lumen-wm, ...)
 assets/fonts/      the desktop's UI font (Atkinson Hyperlegible, SIL OFL 1.1) with its licence and source
 boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, harness/ (Python package)
