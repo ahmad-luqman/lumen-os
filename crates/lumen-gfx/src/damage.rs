@@ -14,7 +14,12 @@
 //!    least as many pixels as the box adds; two rectangles with a gap
 //!    between them never qualify;
 //! 3. appends what is left, or, when the list is full, replaces the whole
-//!    list with one bounding box of everything in it plus the new one.
+//!    list with one bounding box of everything in it plus the new one
+//!    (counted: [`Damage::collapses`]).
+//!
+//! After every add no two rectangles in the list would merge (step 2
+//! checks the new one against all the others, and the others were already
+//! checked against each other).
 //!
 //! None of these steps drops a pixel: every pixel of every rectangle added
 //! since the last [`Damage::clear`] stays inside some rectangle that
@@ -24,10 +29,29 @@
 use crate::rect::Rect;
 
 /// At most `N` (at least 1) rectangles covering every pixel added.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// Two lists are equal when they report the same rectangles in the same
+/// order ([`Damage::rects`]); the collapse count isn't compared.
+#[derive(Clone, Copy)]
 pub struct Damage<const N: usize> {
+    /// Live in `..len`; the slots past it are leftovers, never read.
     rects: [Rect; N],
     len: usize,
+    collapses: u64,
+}
+
+impl<const N: usize> PartialEq for Damage<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.rects() == other.rects()
+    }
+}
+
+impl<const N: usize> Eq for Damage<N> {}
+
+impl<const N: usize> core::fmt::Debug for Damage<N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Damage").field("rects", &self.rects()).field("collapses", &self.collapses).finish()
+    }
 }
 
 impl<const N: usize> Default for Damage<N> {
@@ -47,7 +71,7 @@ impl<const N: usize> Damage<N> {
     /// No damage.
     pub const fn new() -> Self {
         const { assert!(N >= 1, "a damage list holds at least one rectangle") };
-        Damage { rects: [Rect::EMPTY; N], len: 0 }
+        Damage { rects: [Rect::EMPTY; N], len: 0, collapses: 0 }
     }
 
     /// Note that the pixels of `r` changed.
@@ -77,9 +101,10 @@ impl<const N: usize> Damage<N> {
             self.rects[self.len] = r;
             self.len += 1;
         } else {
-            let bounds = self.rects.iter().fold(r, |acc, x| acc.union(x));
+            let bounds = self.rects().iter().fold(r, |acc, x| acc.union(x));
             self.rects[0] = bounds;
             self.len = 1;
+            self.collapses += 1;
         }
     }
 
@@ -93,19 +118,29 @@ impl<const N: usize> Damage<N> {
         self.len == 0
     }
 
+    /// How many times, since [`Damage::new`] or [`Damage::clear`], a full
+    /// list collapsed into one bounding box (for the compositor's
+    /// statistics: a high count means `N` is too small for the load).
+    pub const fn collapses(&self) -> u64 {
+        self.collapses
+    }
+
     /// The bounding box of all the damage, or `None` if there is none.
+    #[must_use]
     pub fn bounds(&self) -> Option<Rect> {
         let mut it = self.rects().iter();
         let first = *it.next()?;
         Some(it.fold(first, |acc, x| acc.union(x)))
     }
 
-    /// Forget the damage (after presenting it).
+    /// Forget the damage (after presenting it) and the collapse count.
     pub fn clear(&mut self) {
         self.len = 0;
+        self.collapses = 0;
     }
 
     /// The damage so far, leaving none behind.
+    #[must_use = "the damage taken is lost unless used; to drop it, use clear()"]
     pub fn take(&mut self) -> Self {
         core::mem::take(self)
     }
@@ -115,19 +150,7 @@ impl<const N: usize> Damage<N> {
 mod tests {
     use super::*;
 
-    /// xorshift64: deterministic randomness without a dependency.
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-        fn range(&mut self, lo: i32, hi: i32) -> i32 {
-            lo + (self.next() % (hi - lo) as u64) as i32
-        }
-    }
+    use crate::test_rng::Rng;
 
     #[test]
     fn starts_empty_and_ignores_empty_rects() {
@@ -173,7 +196,8 @@ mod tests {
         d.add(Rect::new(0, 0, 4, 4));
         d.add(Rect::new(1, 1, 4, 4));
         assert_eq!(d.rects(), &[Rect::new(0, 0, 5, 5)]);
-        // Overlapping by 1 pixel, the box adds 30: kept apart.
+        // Overlapping by 1 pixel: a 49-pixel box for 31 pixels drawn adds
+        // 18, more than the 1 shared: kept apart.
         let mut d = Damage::<4>::new();
         d.add(Rect::new(0, 0, 4, 4));
         d.add(Rect::new(3, 3, 4, 4));
@@ -197,9 +221,30 @@ mod tests {
         d.add(Rect::new(0, 0, 2, 2));
         d.add(Rect::new(4, 0, 2, 2));
         assert_eq!(d.rects().len(), 2);
-        // Bridges the gap: merges with the second, then the first.
+        // Bridges the gap: merges with the first, whose slot the second
+        // then moves into and merges too, all in one pass.
         d.add(Rect::new(2, 0, 2, 2));
         assert_eq!(d.rects(), &[Rect::new(0, 0, 6, 2)]);
+        // Here the new rect merges only with the second listed; grown to
+        // (2,0,2,4), it now merges with the first, already passed: only a
+        // second pass over the list finds that.
+        let mut d = Damage::<4>::new();
+        d.add(Rect::new(0, 0, 2, 4));
+        d.add(Rect::new(2, 0, 2, 2));
+        assert_eq!(d.rects().len(), 2);
+        d.add(Rect::new(2, 2, 2, 2));
+        assert_eq!(d.rects(), &[Rect::new(0, 0, 4, 4)]);
+    }
+
+    #[test]
+    fn rects_spanning_the_whole_plane_merge_without_overflow() {
+        // Each area is about 2^64: their sum needs more than a u64.
+        let whole = Rect::new(i32::MIN, i32::MIN, u32::MAX, u32::MAX);
+        let mut d = Damage::<4>::new();
+        d.add(whole);
+        d.add(whole);
+        d.add(Rect::new(i32::MIN, i32::MIN, u32::MAX, u32::MAX - 1));
+        assert_eq!(d.rects(), &[whole]);
     }
 
     #[test]
@@ -208,13 +253,51 @@ mod tests {
         d.add(Rect::new(0, 0, 1, 1));
         d.add(Rect::new(10, 0, 1, 1));
         assert_eq!(d.rects().len(), 2);
+        assert_eq!(d.collapses(), 0);
         d.add(Rect::new(-3, 7, 1, 1));
         assert_eq!(d.rects(), &[Rect::new(-3, 0, 14, 8)]);
-        // One slot: every add after the first collapses into it.
+        assert_eq!(d.collapses(), 1);
+        // One slot: every add after the first that doesn't merge collapses.
         let mut d = Damage::<1>::new();
         d.add(Rect::new(0, 0, 1, 1));
         d.add(Rect::new(5, 5, 1, 1));
         assert_eq!(d.rects(), &[Rect::new(0, 0, 6, 6)]);
+        d.add(Rect::new(1, 1, 1, 1));
+        d.add(Rect::new(-1, 0, 1, 1));
+        assert_eq!(d.rects(), &[Rect::new(-1, 0, 7, 6)]);
+        assert_eq!(d.collapses(), 2);
+        d.clear();
+        assert_eq!(d.collapses(), 0);
+    }
+
+    /// Equality and `Debug` look at the reported rectangles only, never at
+    /// the leftover slots past them.
+    #[test]
+    fn equality_and_debug_ignore_stale_slots() {
+        let mut d = Damage::<4>::new();
+        d.add(Rect::new(0, 0, 1, 1));
+        d.clear();
+        assert_eq!(d, Damage::new());
+        assert_eq!(format!("{d:?}"), format!("{:?}", Damage::<4>::new()));
+        assert_eq!(format!("{d:?}"), "Damage { rects: [], collapses: 0 }");
+        // Merged pieces equal the same rectangle added whole, though the
+        // pieces leave (4,0,2,2) behind in their second slot.
+        let mut pieces = Damage::<4>::new();
+        pieces.add(Rect::new(0, 0, 2, 2));
+        pieces.add(Rect::new(4, 0, 2, 2));
+        pieces.add(Rect::new(2, 0, 2, 2));
+        let mut whole = Damage::<4>::new();
+        whole.add(Rect::new(0, 0, 6, 2));
+        assert_eq!(pieces.rects(), whole.rects());
+        assert_eq!(pieces, whole);
+        assert_eq!(format!("{pieces:?}"), format!("{whole:?}"));
+        // The order of the reported rectangles counts.
+        let (mut ab, mut ba) = (Damage::<4>::new(), Damage::<4>::new());
+        ab.add(Rect::new(0, 0, 1, 1));
+        ab.add(Rect::new(5, 5, 1, 1));
+        ba.add(Rect::new(5, 5, 1, 1));
+        ba.add(Rect::new(0, 0, 1, 1));
+        assert_ne!(ab, ba);
     }
 
     #[test]
@@ -234,7 +317,8 @@ mod tests {
     /// Random rectangles (negative origins, empty ones, a range of list
     /// sizes): after every add, each pixel added so far is covered, nothing
     /// reported is empty or outside the added pixels' bounding box, and
-    /// the list stays within `N`.
+    /// the list stays within `N`, and no two rectangles reported would
+    /// merge.
     fn coverage_is_never_lost<const N: usize>(seed: u64) {
         const LO: i32 = -20;
         const HI: i32 = 40;
@@ -259,9 +343,12 @@ mod tests {
                     }
                 }
                 assert!(d.rects().len() <= N);
-                for rep in d.rects() {
+                for (i, rep) in d.rects().iter().enumerate() {
                     assert!(!rep.is_empty(), "{rep:?} in {:?}", d.rects());
                     assert!(bounds.contains_rect(rep), "{rep:?} outside {bounds:?}");
+                    for other in &d.rects()[i + 1..] {
+                        assert!(merged(rep, other).is_none(), "{rep:?} and {other:?} would merge: {:?}", d.rects());
+                    }
                 }
                 for y in LO..HI {
                     for x in LO..HI {

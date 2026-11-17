@@ -3,7 +3,9 @@
 //! A [`Rect`] covers the pixels `x..x + w` by `y..y + h` (its right and
 //! bottom edges are exclusive). A rectangle with no width or no height is
 //! empty: it covers no pixel, whatever its origin, and every operation
-//! treats all empty rectangles alike.
+//! treats all empty rectangles alike. `==` compares the fields, so two
+//! empty rectangles at different origins are unequal: [`Rect::is_empty`]
+//! is the test for "no pixels".
 //!
 //! [`Rect::new`] shortens a size that would carry an edge past `i32::MAX`,
 //! so every edge fits in an `i32` and the bounding box of any two
@@ -104,7 +106,16 @@ impl Rect {
                 && other.bottom() <= self.bottom())
     }
 
+    /// The rectangle moved by (`dx`, `dy`): the origin saturates at
+    /// `i32`'s ends, and the size is shortened as [`Rect::new`] does, so
+    /// moving never overflows (client to screen coordinates, say).
+    #[must_use]
+    pub const fn translate(&self, dx: i32, dy: i32) -> Rect {
+        Rect::new(self.x.saturating_add(dx), self.y.saturating_add(dy), self.w, self.h)
+    }
+
     /// The pixels in both, or `None` if there are none.
+    #[must_use]
     pub fn intersect(&self, other: &Rect) -> Option<Rect> {
         if self.is_empty() || other.is_empty() {
             return None;
@@ -119,6 +130,7 @@ impl Rect {
 
     /// The smallest rectangle covering both (the other one, if one is
     /// empty).
+    #[must_use]
     pub fn union(&self, other: &Rect) -> Rect {
         if other.is_empty() {
             return *self;
@@ -133,10 +145,11 @@ impl Rect {
             self.right().max(other.right()) as i64,
             self.bottom().max(other.bottom()) as i64,
         )
-        .unwrap_or(Rect::EMPTY)
+        .expect("two non-empty rectangles have a non-empty bounding box")
     }
 
     /// The part inside a `w` x `h` surface at the origin, or `None`.
+    #[must_use]
     pub fn clip(&self, w: u32, h: u32) -> Option<Rect> {
         self.intersect(&Rect::new(0, 0, w, h))
     }
@@ -144,6 +157,7 @@ impl Rect {
     /// The pixels in this rectangle and not in `other`, as at most four
     /// disjoint, non-empty rectangles: the band above `other`, the band
     /// below it, and the parts left and right of it in between.
+    #[must_use]
     pub fn subtract(&self, other: &Rect) -> Pieces {
         let mut out = Pieces { rects: [Rect::EMPTY; 4], len: 0 };
         let Some(hole) = self.intersect(other) else {
@@ -203,22 +217,11 @@ impl<'a> IntoIterator for &'a Pieces {
 mod tests {
     use super::*;
 
-    /// xorshift64: deterministic randomness without a dependency.
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-        fn range(&mut self, lo: i32, hi: i32) -> i32 {
-            lo + (self.next() % (hi - lo) as u64) as i32
-        }
-        /// A rectangle in a small grid around the origin, sometimes empty.
-        fn rect(&mut self) -> Rect {
-            Rect::new(self.range(-8, 12), self.range(-8, 12), self.range(0, 10) as u32, self.range(0, 10) as u32)
-        }
+    use crate::test_rng::Rng;
+
+    /// A rectangle in a small grid around the origin, sometimes empty.
+    fn random_rect(rng: &mut Rng) -> Rect {
+        Rect::new(rng.range(-8, 12), rng.range(-8, 12), rng.range(0, 10) as u32, rng.range(0, 10) as u32)
     }
 
     /// The grid the brute-force checks look at: wider than any rect `Rng`
@@ -253,6 +256,21 @@ mod tests {
         let a = Rect::new(i32::MIN, i32::MIN, 1, 1);
         let b = Rect::new(i32::MAX - 1, i32::MAX - 1, 1, 1);
         assert_eq!(a.union(&b), whole);
+    }
+
+    #[test]
+    fn translate_moves_and_saturates() {
+        assert_eq!(Rect::new(1, 2, 3, 4).translate(-5, 10), Rect::new(-4, 12, 3, 4));
+        assert_eq!(Rect::new(1, 2, 3, 4).translate(0, 0), Rect::new(1, 2, 3, 4));
+        // The far edge stops at i32::MAX: the size shrinks, nothing panics.
+        let r = Rect::new(i32::MAX - 10, 0, 8, 1).translate(5, 0);
+        assert_eq!((r.x(), r.w(), r.right()), (i32::MAX - 5, 5, i32::MAX));
+        let r = Rect::new(0, 0, 8, 8).translate(i32::MAX, i32::MAX);
+        assert_eq!((r.x(), r.y()), (i32::MAX, i32::MAX));
+        assert!(r.is_empty());
+        // The origin saturates at i32::MIN, keeping the size.
+        let r = Rect::new(i32::MIN + 2, -3, 8, 1).translate(-10, i32::MIN);
+        assert_eq!((r.x(), r.y(), r.w(), r.h()), (i32::MIN, i32::MIN, 8, 1));
     }
 
     #[test]
@@ -342,7 +360,7 @@ mod tests {
     fn randomized_against_pixels() {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         for _ in 0..3000 {
-            let (a, b) = (rng.rect(), rng.rect());
+            let (a, b) = (random_rect(&mut rng), random_rect(&mut rng));
             let i = a.intersect(&b);
             let u = a.union(&b);
             let pieces = a.subtract(&b);
@@ -362,6 +380,8 @@ mod tests {
             if !u.is_empty() {
                 let non_empty = [a, b].into_iter().filter(|r| !r.is_empty());
                 assert_eq!(u.x(), non_empty.clone().map(|r| r.x()).min().unwrap());
+                assert_eq!(u.y(), non_empty.clone().map(|r| r.y()).min().unwrap());
+                assert_eq!(u.right(), non_empty.clone().map(|r| r.right()).max().unwrap());
                 assert_eq!(u.bottom(), non_empty.map(|r| r.bottom()).max().unwrap());
             } else {
                 assert!(a.is_empty() && b.is_empty());

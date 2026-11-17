@@ -2,7 +2,8 @@
 //! coverage-mask blending.
 //!
 //! A pixel is a `u32`, `0xXXRRGGBB`: blue in the low byte, the top byte
-//! unused by the display (the framebuffer's format on q35's GOP). A
+//! unspecified (the display ignores it; the framebuffer's format on q35's
+//! GOP). A
 //! [`Surface`]'s rows are `stride` pixels apart, at least `width`; the
 //! pixels between a row's end and the next row are never written.
 //!
@@ -15,15 +16,23 @@ use alloc::vec::Vec;
 use crate::rect::Rect;
 
 /// Something pixels are presented to, a horizontal span at a time: a
-/// [`Surface`], or the kernel's front buffer (the framebuffer, which is
-/// write-combined, so whole spans are what it wants).
+/// [`Surface`], and (once the compositor lands, #153) the kernel's front
+/// buffer, the framebuffer, which is write-combined, so whole spans are
+/// what it wants.
+///
+/// Pixels are xRGB8888, `0xXXRRGGBB`, the top byte unspecified: a target
+/// whose native layout differs (a BGR framebuffer, say) converts each
+/// pixel in [`Target::write_span`].
 pub trait Target {
     /// Width and height in pixels.
     fn size(&self) -> (u32, u32);
 
     /// Write `pixels` in row `y` from column `x` on. This crate only calls
-    /// it with spans inside [`Target::size`]; an implementation must not
-    /// write outside itself for one that isn't (it may panic).
+    /// it with non-empty spans inside [`Target::size`]. An implementation
+    /// must never write outside itself: in the kernel it must not panic
+    /// either, and drops a span it can't take (outside it, or while it
+    /// isn't drawing, e.g. after a crash began); a host test's target may
+    /// panic instead, to catch a caller's bug.
     fn write_span(&mut self, x: u32, y: u32, pixels: &[u32]);
 }
 
@@ -92,11 +101,13 @@ pub struct Surface {
 }
 
 /// How many pixels a `width` x `height` buffer with rows `stride` apart
-/// holds, or `None` if `stride < width`, or the count or its size in bytes
-/// overflows, or the bytes pass `isize::MAX` (more than any allocation
-/// may be, so `vec!` would panic with "capacity overflow").
-pub fn buffer_len(width: u32, height: u32, stride: usize) -> Option<usize> {
-    if stride < width as usize {
+/// holds, or `None` if `stride < width`, the width or height passes
+/// `i32::MAX` (where [`Surface::bounds`] would stop short of the surface),
+/// or the count or its size in bytes overflows, or the bytes pass
+/// `isize::MAX` (more than any allocation may be, so `vec!` would panic
+/// with "capacity overflow").
+fn buffer_len(width: u32, height: u32, stride: usize) -> Option<usize> {
+    if stride < width as usize || width > i32::MAX as u32 || height > i32::MAX as u32 {
         return None;
     }
     let len = stride.checked_mul(height as usize)?;
@@ -113,9 +124,9 @@ impl Surface {
     }
 
     /// A `width` x `height` surface of black pixels with rows `stride`
-    /// pixels apart, or `None` if `stride < width`, the buffer's size in
-    /// bytes overflows or passes `isize::MAX` (the most a `Vec` can hold,
-    /// [`buffer_len`]), or the allocation fails.
+    /// pixels apart, or `None` if `stride < width`, the width or height
+    /// passes `i32::MAX`, the buffer's size in bytes overflows or passes
+    /// `isize::MAX` (the most a `Vec` can hold), or the allocation fails.
     pub fn with_stride(width: u32, height: u32, stride: usize) -> Option<Surface> {
         let len = buffer_len(width, height, stride)?;
         let mut pixels = Vec::new();
@@ -140,6 +151,7 @@ impl Surface {
     }
 
     /// The whole surface as a rectangle at the origin.
+    #[must_use]
     pub const fn bounds(&self) -> Rect {
         Rect::new(0, 0, self.width, self.height)
     }
@@ -190,7 +202,7 @@ impl Surface {
     /// and so is whatever would land outside `dst`; every pixel copied
     /// keeps its offset from `src_rect`'s corner.
     pub fn copy_to(&self, src_rect: Rect, dst: &mut impl Target, dst_x: i32, dst_y: i32) {
-        let Some(s) = src_rect.intersect(&self.bounds()) else { return };
+        let Some(s) = src_rect.clip(self.width, self.height) else { return };
         // A source pixel (x, y) lands at (x + ox, y + oy).
         let ox = dst_x as i64 - src_rect.x() as i64;
         let oy = dst_y as i64 - src_rect.y() as i64;
@@ -229,8 +241,17 @@ impl Surface {
     /// each pixel becomes [`blend`]`(color, pixel, coverage)`. The part of
     /// the mask outside the surface is skipped.
     pub fn blend_mask(&mut self, mask: &Mask<'_>, x: i32, y: i32, color: u32) {
+        self.blend_mask_in(mask, x, y, color, self.bounds());
+    }
+
+    /// [`Surface::blend_mask`], touching only the pixels inside `clip` as
+    /// well as the surface. Blending isn't idempotent (drawing a glyph's
+    /// edge twice darkens it), so a redraw of one damaged rectangle passes
+    /// it as `clip`: pixels outside it, drawn already, stay as they are,
+    /// and redrawing damage only gives what a full repaint gives.
+    pub fn blend_mask_in(&mut self, mask: &Mask<'_>, x: i32, y: i32, color: u32, clip: Rect) {
         let at = Rect::new(x, y, mask.width, mask.height);
-        let Some(c) = at.clip(self.width, self.height) else { return };
+        let Some(c) = at.intersect(&clip).and_then(|c| c.clip(self.width, self.height)) else { return };
         // Mask column and row of the clipped part's corner.
         let mx0 = (c.x() as i64 - x as i64) as usize;
         let my0 = (c.y() as i64 - y as i64) as usize;
@@ -266,15 +287,27 @@ impl Target for Surface {
 mod tests {
     use super::*;
 
-    /// A surface whose every pixel is distinct: `seed` plus its index.
-    fn numbered(w: u32, h: u32, seed: u32) -> Surface {
-        let mut s = Surface::new(w, h);
-        for y in 0..h {
-            for x in 0..w {
-                s.set_pixel(x as i32, y as i32, seed + y * w + x);
+    /// A surface whose every pixel is distinct, `seed + y * w + x`, rows
+    /// `stride` apart, the padding 0. Written straight into the buffer, so
+    /// the accessors under test don't build their own fixtures.
+    fn numbered_strided(w: u32, h: u32, seed: u32, stride: usize) -> Surface {
+        let mut s = Surface::with_stride(w, h, stride).unwrap();
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                s.pixels[y * stride + x] = seed + (y * w as usize + x) as u32;
             }
         }
         s
+    }
+
+    /// [`numbered_strided`] with packed rows.
+    fn numbered(w: u32, h: u32, seed: u32) -> Surface {
+        numbered_strided(w, h, seed, w as usize)
+    }
+
+    /// The pixel at (`x`, `y`) read straight from the buffer.
+    fn raw(s: &Surface, x: i32, y: i32) -> u32 {
+        s.pixels[y as usize * s.stride + x as usize]
     }
 
     #[test]
@@ -364,6 +397,15 @@ mod tests {
         assert_eq!(buffer_len(4, 2, 3), None);
         assert_eq!(buffer_len(1, 3, usize::MAX / 2), None);
         assert_eq!(buffer_len(1280, 800, 1280), Some(1280 * 800));
+        // Past i32::MAX wide or high, `bounds()` couldn't cover it.
+        let big = i32::MAX as u32;
+        assert_eq!(buffer_len(big, 0, big as usize), Some(0));
+        assert_eq!(buffer_len(0, big, 0), Some(0));
+        assert_eq!(buffer_len(big + 1, 0, big as usize + 1), None);
+        assert_eq!(buffer_len(0, big + 1, 0), None);
+        assert_eq!(Surface::with_stride(big, 0, big as usize).map(|s| s.bounds()), Some(Rect::new(0, 0, big, 0)));
+        assert!(Surface::with_stride(big + 1, 0, big as usize + 1).is_none());
+        assert!(Surface::with_stride(0, u32::MAX, 0).is_none());
     }
 
     /// Codex's case on PR #159: the pixel count fits a usize, the bytes
@@ -396,6 +438,27 @@ mod tests {
         }
         s.set_pixel(2, 1, 7);
         assert_eq!(s.pixel(2, 1), Some(7));
+    }
+
+    /// A surface with padding after each row: the accessors and a blit
+    /// from it find each pixel at `y * stride + x`, not `y * width + x`.
+    #[test]
+    fn strided_surface_reads_back_and_blits_from() {
+        let mut s = Surface::with_stride(3, 3, 5).unwrap();
+        for y in 0..3 {
+            for x in 0..3 {
+                s.set_pixel(x, y, (10 * y + x) as u32 + 1);
+            }
+        }
+        assert_eq!(s.pixels, [1, 2, 3, 0, 0, 11, 12, 13, 0, 0, 21, 22, 23, 0, 0], "set_pixel writes at y * stride + x");
+        assert_eq!(s.pixel(1, 2), Some(22));
+        assert_eq!(s.pixel(2, 1), Some(13));
+        assert_eq!(s.row(1), &[11, 12, 13]);
+        s.row_mut(2)[0] = 99;
+        assert_eq!(s.pixels[10], 99);
+        let mut packed = Surface::new(3, 3);
+        packed.blit(&s, s.bounds(), 0, 0);
+        assert_eq!(packed.pixels, [1, 2, 3, 11, 12, 13, 99, 22, 23]);
     }
 
     #[test]
@@ -437,10 +500,10 @@ mod tests {
     /// the source) or untouched.
     #[test]
     fn blit_is_clipped_at_every_edge() {
-        let src = numbered(5, 4, 1);
+        let (sw, sh) = (5u32, 4u32);
         let (dw, dh) = (6u32, 5u32);
         let rects = [
-            src.bounds(),
+            Rect::new(0, 0, sw, sh),
             Rect::new(1, 1, 2, 2),
             Rect::new(-2, -1, 4, 3),
             Rect::new(3, 2, 10, 10),
@@ -448,20 +511,28 @@ mod tests {
             Rect::new(5, 0, 2, 2),
             Rect::new(0, 0, 0, 3),
         ];
-        for sr in rects {
-            for dx in -8..10 {
-                for dy in -7..9 {
-                    let mut dst = numbered(dw, dh, 5000);
-                    dst.blit(&src, sr, dx, dy);
-                    for py in 0..dh as i32 {
-                        for px in 0..dw as i32 {
-                            let (sx, sy) = (px - dx + sr.x(), py - dy + sr.y());
-                            let want = if sr.contains(sx, sy) && src.bounds().contains(sx, sy) {
-                                src.pixel(sx, sy).unwrap()
-                            } else {
-                                5000 + py as u32 * dw + px as u32
-                            };
-                            assert_eq!(dst.pixel(px, py), Some(want), "{sr:?} to {dx},{dy}: at {px},{py}");
+        // Packed and padded rows, on either side.
+        for (src_stride, dst_stride) in [(5, 6), (7, 6), (5, 9), (8, 8)] {
+            let src = numbered_strided(sw, sh, 1, src_stride);
+            for sr in rects {
+                for dx in -8..10 {
+                    for dy in -7..9 {
+                        let mut dst = numbered_strided(dw, dh, 5000, dst_stride);
+                        dst.blit(&src, sr, dx, dy);
+                        for py in 0..dh as i32 {
+                            for px in 0..dw as i32 {
+                                let (sx, sy) = (px - dx + sr.x(), py - dy + sr.y());
+                                let want = if sr.contains(sx, sy) && src.bounds().contains(sx, sy) {
+                                    1 + sy as u32 * sw + sx as u32
+                                } else {
+                                    5000 + py as u32 * dw + px as u32
+                                };
+                                assert_eq!(
+                                    raw(&dst, px, py),
+                                    want,
+                                    "strides {src_stride}/{dst_stride}: {sr:?} to {dx},{dy}: at {px},{py}"
+                                );
+                            }
                         }
                     }
                 }
@@ -504,14 +575,19 @@ mod tests {
 
     #[test]
     fn present_writes_damaged_spans_at_the_same_place() {
-        let back = numbered(8, 6, 0);
-        let mut front = Spans { w: 8, h: 6, spans: Vec::new() };
-        back.present(&[Rect::new(1, 2, 3, 2), Rect::new(-2, 5, 4, 9), Rect::new(8, 0, 1, 1)], &mut front);
-        assert_eq!(front.spans, vec![(1, 2, vec![17, 18, 19]), (1, 3, vec![25, 26, 27]), (0, 5, vec![40, 41])]);
-        // A smaller target clips the spans, never overruns it.
-        let mut small = Spans { w: 3, h: 3, spans: Vec::new() };
-        back.present(&[back.bounds()], &mut small);
-        assert_eq!(small.spans, vec![(0, 0, vec![0, 1, 2]), (0, 1, vec![8, 9, 10]), (0, 2, vec![16, 17, 18])]);
+        // A back buffer with packed rows and one with padding.
+        for stride in [8, 11] {
+            let back = numbered_strided(8, 6, 0, stride);
+            let mut front = Spans { w: 8, h: 6, spans: Vec::new() };
+            back.present(&[Rect::new(1, 2, 3, 2), Rect::new(-2, 5, 4, 9), Rect::new(8, 0, 1, 1)], &mut front);
+            assert_eq!(front.spans, vec![(1, 2, vec![17, 18, 19]), (1, 3, vec![25, 26, 27]), (0, 5, vec![40, 41])]);
+            // A smaller target clips the spans, never overruns it, and a
+            // rect inside the back buffer but past the target's right or
+            // bottom edge writes no span at all, not an empty one.
+            let mut small = Spans { w: 3, h: 3, spans: Vec::new() };
+            back.present(&[back.bounds(), Rect::new(3, 0, 2, 2), Rect::new(0, 3, 2, 2)], &mut small);
+            assert_eq!(small.spans, vec![(0, 0, vec![0, 1, 2]), (0, 1, vec![8, 9, 10]), (0, 2, vec![16, 17, 18])]);
+        }
     }
 
     #[test]
@@ -524,34 +600,81 @@ mod tests {
         assert_eq!((m.width(), m.height()), (3, 2));
     }
 
-    /// `blend_mask` against a per-pixel model at every offset around the
-    /// surface: inside, each pixel is `blend(color, old, coverage)` for
-    /// the mask byte at its offset; 0 leaves it and 255 paints it.
+    /// `blend_mask_in` (and `blend_mask`, with the surface as its clip)
+    /// against a per-pixel model at every offset around the surface, for
+    /// clips inside, across and outside it: inside the mask, the clip and
+    /// the surface, each pixel is `blend(color, old, coverage)` for the
+    /// mask byte at its offset (0 leaves it, 255 paints it, the colour's
+    /// top byte too); every other pixel stays as it was.
     #[test]
     fn blend_mask_is_clipped_and_blends_each_pixel() {
         let (mw, mh) = (4u32, 3u32);
         let coverage: Vec<u8> = vec![0, 1, 127, 128, 254, 255, 64, 0, 255, 200, 0, 32];
         let mask = Mask::new(mw, mh, &coverage).unwrap();
-        let color = 0x00_ff_80_10;
+        let color = 0xab_ff_80_10;
         let (w, h) = (5u32, 4u32);
-        for x in -6..7 {
-            for y in -5..6 {
-                let model = numbered(w, h, 0x0040_2000);
-                let mut s = model.clone();
-                s.blend_mask(&mask, x, y, color);
-                for py in 0..h as i32 {
-                    for px in 0..w as i32 {
-                        let old = model.pixel(px, py).unwrap();
-                        let (mx, my) = (px - x, py - y);
-                        let want = if (0..mw as i32).contains(&mx) && (0..mh as i32).contains(&my) {
-                            blend(color, old, coverage[(my as u32 * mw + mx as u32) as usize])
-                        } else {
-                            old
-                        };
-                        assert_eq!(s.pixel(px, py), Some(want), "mask at {x},{y}: pixel {px},{py}");
+        let clips = [
+            None,
+            Some(Rect::new(0, 0, w, h)),
+            Some(Rect::new(1, 1, 2, 2)),
+            Some(Rect::new(-3, -3, 4, 5)),
+            Some(Rect::new(2, 0, 10, 2)),
+            Some(Rect::EMPTY),
+            Some(Rect::new(10, 10, 3, 3)),
+        ];
+        for clip in clips {
+            for x in -6..7 {
+                for y in -5..6 {
+                    let model = numbered_strided(w, h, 0x0040_2000, 7);
+                    let mut s = model.clone();
+                    match clip {
+                        None => s.blend_mask(&mask, x, y, color),
+                        Some(c) => s.blend_mask_in(&mask, x, y, color, c),
+                    }
+                    for py in 0..h as i32 {
+                        for px in 0..w as i32 {
+                            let old = raw(&model, px, py);
+                            let (mx, my) = (px - x, py - y);
+                            let in_mask = (0..mw as i32).contains(&mx) && (0..mh as i32).contains(&my);
+                            let in_clip = clip.is_none_or(|c| c.contains(px, py));
+                            let want = if in_mask && in_clip {
+                                blend(color, old, coverage[(my as u32 * mw + mx as u32) as usize])
+                            } else {
+                                old
+                            };
+                            assert_eq!(raw(&s, px, py), want, "mask at {x},{y} in {clip:?}: pixel {px},{py}");
+                        }
+                    }
+                    assert_eq!(s.pixels.len(), model.pixels.len());
+                    for row in 0..h as usize {
+                        assert_eq!(&s.pixels[row * 7 + w as usize..row * 7 + 7], &[0, 0], "padding");
                     }
                 }
             }
         }
+    }
+
+    /// Why `blend_mask_in` exists: redrawing one damaged rectangle with
+    /// the clip leaves the pixels around it as one full draw left them;
+    /// without the clip, a glyph crossing the rectangle's edge is blended
+    /// twice outside it.
+    #[test]
+    fn redrawing_damage_with_a_clip_matches_one_full_draw() {
+        let coverage = [128u8; 16];
+        let mask = Mask::new(4, 4, &coverage).unwrap();
+        let mut once = Surface::new(8, 8);
+        once.fill(0x00_90_90_90);
+        once.blend_mask(&mask, 2, 2, 0x00_ff_ff_ff);
+        let damaged = Rect::new(0, 0, 4, 4);
+        // The redraw: background, then the glyph, inside the damage only.
+        let mut redrawn = once.clone();
+        redrawn.fill_rect(damaged, 0x00_90_90_90);
+        redrawn.blend_mask_in(&mask, 2, 2, 0x00_ff_ff_ff, damaged);
+        assert_eq!(redrawn, once);
+        let mut unclipped = once.clone();
+        unclipped.fill_rect(damaged, 0x00_90_90_90);
+        unclipped.blend_mask(&mask, 2, 2, 0x00_ff_ff_ff);
+        assert_eq!(once.pixel(5, 5), Some(0x00_c8_c8_c8));
+        assert_ne!(unclipped.pixel(5, 5), once.pixel(5, 5), "blended twice outside the damage");
     }
 }
