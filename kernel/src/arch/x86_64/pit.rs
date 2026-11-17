@@ -47,7 +47,7 @@ unsafe fn read(pause: &mut impl FnMut(Pause), before: Pause, after: Pause) -> Pi
 /// it has run out, with its counter read at both ends ([`PitWait`]): a late
 /// look at the end doesn't stretch the window, since the counter says how far
 /// past the end it was. `pause` is called at each [`Pause`] point (a no-op
-/// but in tests). Busy-waits (up to about 55 ms with a working PIT); call
+/// but in tests and stalled scenarios, `time`'s `stall_window_ends`). Busy-waits (up to about 55 ms with a working PIT); call
 /// with interrupts off. `None` if there is no working PIT: its output didn't
 /// go low when programmed (a missing PIT's ports read all ones), or didn't go
 /// high again within [`BOUND_TSC`] TSC ticks.

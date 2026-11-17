@@ -20,6 +20,11 @@ BOOT_TIMER = (
     "# timer boot calibration 62500000 Hz [{windows}] retook {retook}, {steady} steady, "
     "median within {bound} ppm; window rates [{rates}] Hz\n"
 )
+BOOT_TSC = (
+    "# tsc boot calibration (hpet) 2457600000 Hz [{windows}] retook {retook}, {steady} steady, "
+    "median within {bound} ppm; window rates [{rates}] Hz\n"
+)
+TSC_WINDOW = "24576000/1000000/2000/1000/1000"
 WINDOW = "10000000/625000/1/0/0"
 HPET_PLACEMENT = (
     "# injected pause: HPET placement {off} ns off (at most 2500000 ns allowed) on try {tries} "
@@ -46,6 +51,9 @@ def run(
     boot_steady=5,
     boot_retook=7,
     boot_bound=100,
+    tsc_lines=1,
+    tsc_steady=5,
+    tsc_bound=100,
     placement_tries=1,
     injected_retries=2,
     hpet_off=5000,
@@ -82,7 +90,7 @@ def run(
         ),
         ("a_timer_reading_is_placed_at_its_brackets_midpoint", TIMER_PLACEMENT),
         (
-            "the_boot_timer_calibration_is_the_median_of_mostly_steady_windows",
+            "the_boot_timer_calibration_is_within_what_the_tick_needs",
             (
                 BOOT_TIMER.format(
                     windows=" ".join([WINDOW] * boot_windows),
@@ -92,6 +100,19 @@ def run(
                     rates=", ".join(["62500000"] * boot_rates),
                 )
                 * boot_lines
+            ),
+        ),
+        (
+            "the_boot_tsc_calibration_is_within_what_now_ns_needs",
+            (
+                BOOT_TSC.format(
+                    windows=" ".join([TSC_WINDOW] * 5),
+                    retook=0,
+                    steady=tsc_steady,
+                    bound=tsc_bound,
+                    rates=", ".join(["2457600000"] * 5),
+                )
+                * tsc_lines
             ),
         ),
     ]
@@ -161,9 +182,10 @@ def test_a_missing_timer_boot_calibration_line_fails():
 
 
 @pytest.mark.parametrize("steady", [0, 2])
-def test_a_timer_boot_calibration_with_most_windows_unsteady_fails(steady):
-    with pytest.raises(AssertionError, match="most windows unsteady"):
-        check_clock_diags(*run(boot_steady=steady))
+def test_a_boot_calibration_with_most_windows_unsteady_passes_within_its_tolerance(steady):
+    # Least-unsteady windows filled in (#139): the bound decides, not the count.
+    check_clock_diags(*run(boot_steady=steady, boot_bound=7000))
+    check_clock_diags(*run(tsc_steady=steady, tsc_bound=7000))
 
 
 def test_two_timer_boot_calibration_lines_fail():
@@ -182,10 +204,27 @@ def test_a_timer_boot_calibration_with_more_steady_than_windows_fails():
         check_clock_diags(*run(boot_steady=6))
 
 
-def test_a_timer_boot_calibration_bound_over_half_a_percent_fails():
-    check_clock_diags(*run(boot_bound=5000))
-    with pytest.raises(AssertionError, match="median bound over 0.5%"):
-        check_clock_diags(*run(boot_bound=5001))
+def test_a_timer_boot_calibration_bound_over_its_tolerance_fails():
+    check_clock_diags(*run(boot_bound=20000))
+    with pytest.raises(AssertionError, match="timer median bound over 20000 ppm"):
+        check_clock_diags(*run(boot_bound=20001))
+
+
+def test_a_tsc_boot_calibration_bound_over_its_tolerance_fails():
+    check_clock_diags(*run(tsc_bound=10000))
+    with pytest.raises(AssertionError, match="tsc median bound over 10000 ppm"):
+        check_clock_diags(*run(tsc_bound=10001))
+
+
+@pytest.mark.parametrize("lines", [0, 2])
+def test_other_than_one_tsc_boot_calibration_line_fails(lines):
+    with pytest.raises(AssertionError, match=f"{lines} tsc boot calibration lines"):
+        check_clock_diags(*run(tsc_lines=lines))
+
+
+def test_a_tsc_boot_calibration_with_more_steady_than_windows_fails():
+    with pytest.raises(AssertionError, match="more steady than windows"):
+        check_clock_diags(*run(tsc_steady=6))
 
 
 def test_any_number_of_timer_boot_retakes_passes():

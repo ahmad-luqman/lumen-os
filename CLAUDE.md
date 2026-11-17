@@ -194,7 +194,9 @@ own PR that updates that doc first.
   without a UART; the UART's one reader.
   `keyboard.rs`: the PS/2 keyboard (8042 init, IRQ 1, `pc-keyboard`
   decoding, `lumen.keymap=`); `arch/x86_64/i8042.rs` its ports.
-  `time.rs`: TSC and LAPIC timer calibration, the boot origin
+  `time.rs`: TSC and LAPIC timer calibration (judged by each clock's
+  tolerance; `lumen.stall_tsc_windows=`/`lumen.stall_timer_windows=` stall
+  them for scenarios), the boot origin
   (`mark_boot`, `since_boot_ns`), `now_ns`, `sleep`, `ticks`.
   `demo.rs`: the `mandelbrot` (bands on every CPU) and `life` commands.
   `sound.rs`: the virtio-sound driver (its `sound` thread owns the device,
@@ -218,7 +220,11 @@ own PR that updates that doc first.
   coalescing; host-tested, incl. a randomized stress test against a shadow map).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads),
   and `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free).
-- `crates/lumen-time`: timekeeping arithmetic: calibration, tick/ns
+- `crates/lumen-time`: timekeeping arithmetic: calibration (windows'
+  steadiness, the ones with the smallest bounds filling in, how far off a
+  median can be for either rate, `tsc_error_ppm`, a window slow to read
+  stretched, the verdict against each clock's tolerance, `within_bounds`,
+  the stall knobs' parser), tick/ns
   conversion, timer counts, log time formats (`Stamp`, `Millis`),
   percentages and rates, one clock's reading placed between two reads of
   another and retaken while too wide (`Bracketed`, `first_narrow`: the
