@@ -22,11 +22,11 @@ use core::fmt;
 
 use lumen_font::{Font, Px};
 use lumen_gfx::{Mask, Rect, Surface};
-use lumen_input::{KeyAction, KeyCode, KeyEvent};
+use lumen_input::{Button, KeyAction, KeyCode, KeyEvent};
 use lumen_shell::pipe::{self, Align, Column, Kind, Value};
 use lumen_ui::counter::{Counter, Then};
 use lumen_ui::{Action, AutomationNode, Input, Key, Outcome, Palette, Reply, Text, Ui, UiEvent};
-use lumen_wm::{Button, Refused};
+use lumen_wm::Refused;
 
 use crate::desktop::{self, NodeAt, TreeRow, WindowEvent, WindowHandle};
 use crate::sched::WaitQueue;
