@@ -10,6 +10,7 @@ import re
 from collections.abc import Sequence
 
 import pytest
+from lumen_harness.gui import confirmed_keys, key_steps
 from lumen_harness.klog import SECONDS, is_log_line
 from lumen_harness.qemu import NO_DEVICES, Devices, Machine, default_accel
 from lumen_harness.screen import PROMPT, expect_screen, read_screen
@@ -57,11 +58,8 @@ def test_irqs_lists_msix(boot):
 def keys(m: Machine, *presses: str | list[str]) -> None:
     """Type on the keyboard: a string is typed as text, a list is keys
     pressed together (QEMU's names: `left`, `home`, `ctrl` and `a`...)."""
-    for p in presses:
-        if isinstance(p, str):
-            m.type_text(p)
-        else:
-            m.press(p)
+    for _, qcodes in key_steps(*presses):
+        m.press(qcodes)
 
 
 def test_echo(boot):
@@ -274,33 +272,40 @@ def test_shutdown_powers_off(boot):
 def test_history_and_line_editing(boot):
     # On the screen (QMP keys): history with Up/Down, the cursor keys,
     # Home/End, Ctrl-A/E/K/U/W/C; `history` lists the lines entered there.
+    # Each key is confirmed before the next goes (lumen_harness.gui,
+    # #149): its bytes reached IRQ 1 whole and were queued, or the step
+    # fails naming the key. A key lost on the way in (#128) then fails
+    # there; one lost later, in the decoder, router or shell, still shows
+    # only as a wrong screen.
     m = shells(boot)
-    keys(m, "echo one\n", "echo two\n", ["up"], ["up"], ["ret"])
+    confirmed_keys(m, "echo one\n", "echo two\n", ["up"], ["up"], ["ret"])
     expect_screen(m, r"^two\nlumen> echo one\none\nlumen>$")
     # Down goes back to a newer line ("echo one" again: a repeat of the
     # newest, not kept twice).
-    keys(m, ["up"], ["up"], ["down"], ["ret"])
+    confirmed_keys(m, ["up"], ["up"], ["down"], ["ret"])
     expect_screen(m, r"^lumen> echo one\none\nlumen> echo one\none\nlumen>$")
     # Delete takes the character at the cursor, Right moves past one.
-    keys(m, "echo abXc", ["left"], ["left"], ["delete"], ["right"], "d\n")
+    confirmed_keys(m, "echo abXc", ["left"], ["left"], ["delete"], ["right"], "d\n")
     expect_screen(m, r"^lumen> echo abcd\nabcd$")
     # Edits anywhere in the line: "cho wrld" becomes "echo world".
-    keys(m, "cho wrld", ["home"], "e", ["end"], ["left"], ["left"], ["left"], "o")
-    keys(m, ["ctrl", "e"], " xyz", ["ctrl", "w"], ["ret"])
+    confirmed_keys(m, "cho wrld", ["home"], "e", ["end"], ["left"], ["left"], ["left"], "o")
+    confirmed_keys(m, ["ctrl", "e"], " xyz", ["ctrl", "w"], ["ret"])
     # (The screen's rows come without trailing blanks.)
     expect_screen(m, r"^lumen> echo world\nworld$")
     # Ctrl-U deletes before the cursor, Ctrl-K after it.
-    keys(m, "junk echo ", *[["left"]] * 5, ["ctrl", "u"], ["end"], "kept\n")
+    confirmed_keys(m, "junk echo ", *[["left"]] * 5, ["ctrl", "u"], ["end"], "kept\n")
     expect_screen(m, r"^lumen> echo kept\nkept$")
     # Ctrl-K deletes after the cursor; Ctrl-A goes to the start and Ctrl-F
     # one on ("eho cut" becomes "echo cut" only if both move).
-    keys(m, "eho cut junk", *[["left"]] * 5, ["ctrl", "k"], ["ctrl", "a"], ["ctrl", "f"], "c\n")
+    confirmed_keys(
+        m, "eho cut junk", *[["left"]] * 5, ["ctrl", "k"], ["ctrl", "a"], ["ctrl", "f"], "c\n"
+    )
     expect_screen(m, r"^lumen> echo cut\ncut$")
     # Ctrl-C drops the line; nothing runs.
-    keys(m, "echo dropped", ["ctrl", "c"], "echo after\n")
+    confirmed_keys(m, "echo dropped", ["ctrl", "c"], "echo after\n")
     expect_screen(m, r"^lumen> echo dropped\^C\nlumen> echo after\nafter$")
     assert not re.search(r"^dropped$", read_screen(m).text, re.MULTILINE)
-    keys(m, "history\n")
+    confirmed_keys(m, "history\n")
     expect_screen(
         m,
         r"^ +1  echo one\n +2  echo two\n +3  echo one\n +4  echo abcd\n +5  echo world\n"

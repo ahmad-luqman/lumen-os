@@ -13,6 +13,7 @@ from collections.abc import Callable
 from typing import NamedTuple
 
 import pytest
+from lumen_harness import gui
 from lumen_harness.image import assert_matches_golden, compare
 from lumen_harness.qemu import Devices, Machine
 from lumen_harness.qmp import QmpClient, QmpError, pointer_move_args, qcodes_for
@@ -31,7 +32,8 @@ from test_pci import lspci_rows, msix_rows, qdev_addresses
 
 KBD_LINE = r"INFO  kbd: PS/2 keyboard on ISA IRQ 1 \(GSI 1, vector 0x51\), layout {}\n"
 KBD_STATS = re.compile(
-    r"kbd: layout (\S+), IRQ 1 \(vector 0x51\), (\d+) interrupts, (\d+) bytes, (\d+) dropped, "
+    r"kbd: layout (\S+), IRQ 1 \(vector 0x51\), (\d+) interrupts, (\d+) bytes, (\d+) presses, "
+    r"(\d+) held, (\d+) dropped, "
     r"(\d+) undecoded, (\d+) line errors, (\d+) skipped at setup\n"
 )
 # Without an 8042 its status reads 0xff: never ready for a command.
@@ -43,6 +45,8 @@ class KbdStats(NamedTuple):
     layout: str
     irqs: int
     bytes: int
+    presses: int
+    held: int
     dropped: int
     undecoded: int
     line_errors: int
@@ -79,8 +83,9 @@ def test_keys_via_qmp_send_key(boot):
     # Typed on the keyboard (shift included), a command runs in the screen's
     # shell, which answers on the screen (serial only sees the rows `term
     # text` prints). Every key held made two scancodes (press, release), all
-    # queued; they raised IRQ 1 (one interrupt can move several, so at least
-    # once a character), and nothing was dropped, undecoded or unexpected.
+    # queued, and counts as one press; they raised IRQ 1 (one interrupt can
+    # move several, so at least once a character), and nothing was dropped,
+    # undecoded or unexpected.
     text = "echo Hello, World!\n"
     m = boot("qemutest")
     shells_ready(m, "us")
@@ -97,13 +102,47 @@ def test_keys_via_qmp_send_key(boot):
         time.sleep(0.05)
     assert (s.layout, s.dropped, s.undecoded, s.line_errors) == ("us", 0, 0, 0)
     assert s.bytes == want, (before.bytes, s.bytes, want)
+    # `presses` counts each key pressed once (shift too), not its release.
+    pressed = sum(len(qcodes_for(c)) for c in text)
+    assert s.presses - before.presses == pressed, (before.presses, s.presses, pressed)
     assert s.irqs - before.irqs >= len(text), (before.irqs, s.irqs)
     m.send_line("ticks")
     strays = m.expect(
         r"ticks: \d+ \(spurious (\d+), unexpected (\d+), local APIC errors (\d+)\)", 10
     )
     assert strays.groups() == ("0", "0", "0")
+    # Keys typed just before (unconfirmed, still arriving) don't confirm a
+    # confirmed key (the case review reproduced): its step waits until they
+    # settle, then counts exactly its own presses and bytes. Its counts
+    # show the burst counted before it, all of it.
+    burst = "echo abcdefghijklmnop"
+    m.type_text(burst)
+    got = gui.confirmed_keys(m, "x", "\n")
+    assert got.presses - s.presses == len(burst) + 2, (s.presses, got.presses)
+    assert (got.bytes - s.bytes, got.held) == (2 * (len(burst) + 2), 0), got
+    expect_screen(m, rf"^lumen> {burst}x\nabcdefghijklmnopx\nlumen>$")
+    # A key held when a confirmed one goes (shift, 400 ms, sent past
+    # `press`'s schedule; reproduced in review): the step waits for its
+    # release, then counts its own keys, so shift's release can't stand in
+    # for the key's own.
+    m.qmp().send_key(["shift"], hold_ms=400)
+    gui.confirmed_keys(m, "echo b\n")
+    expect_screen(m, r"^lumen> echo b\nb\nlumen>$")
     assert "WARN" not in m.output
+
+
+def test_every_modelled_key_is_confirmed(boot):
+    # Every key gui.KEY_BYTES models, Print Screen and Pause included, sent
+    # on its own through QEMU: each is confirmed with exactly the presses
+    # and bytes the table says, released, nothing dropped or undecoded.
+    # This pins the table against QEMU's keyboard, which nothing else does.
+    m = boot("qemutest")
+    shells_ready(m, "us")
+    keys = sorted(gui.KEY_BYTES, key=lambda q: q == "ret")  # Enter last
+    for q in keys:
+        gui.confirmed_keys(m, [q])
+    gui.confirmed_keys(m, ["ctrl", "u"], "echo done\n")
+    expect_screen(m, r"^lumen> echo done\ndone\nlumen>$")
 
 
 def test_second_layout(boot):
@@ -270,13 +309,8 @@ def mouse_counts(m: Machine, allow: str | None = None, held: bool = False) -> tu
 
 def poll[T](what: Callable[[], T], done: Callable[[T], bool], m: Machine, timeout: float = 10) -> T:
     """Call `what()` until `done(result)` (up to `timeout` seconds, scaled);
-    the last result."""
-    deadline = time.monotonic() + timeout * m.timeout_scale
-    while True:
-        got = what()
-        if done(got) or time.monotonic() > deadline:
-            return got
-        time.sleep(0.05)
+    the last result (`gui.poll`)."""
+    return gui.poll(m, what, done, timeout)[0]
 
 
 def wait_mouse(m: Machine, allow: str | None = None, **want: str) -> Mouse:
@@ -515,6 +549,37 @@ def test_a_burst_of_moves_counts_overruns(boot, frame):
     assert len(re.findall(overrun_warn(), m.output)) == 1
     # No frame was dropped outside the held windows (the paced move fit).
     assert m.trace_log().count("virtio_input_queue_full") == 2 * PAST_THE_RING
+
+
+def test_drag_steps_are_confirmed(boot):
+    # lumen_harness.gui's drag (#149) waits for each frame to be read
+    # before the next: a drag across the screen in 12 steps is 15 frames
+    # (the move to its start, the press, the steps, the release), each one
+    # counted by `mouse` and nothing else read, every event used, no
+    # overrun; the pointer ends at the drag's end with the button released
+    # and its press counted. A step the guest can't read (the mouse thread
+    # held: `mouse hold`) fails at once, naming the step and the counts it
+    # saw, and sends nothing; once released, the step goes through.
+    m = boot("qemutest", devices=Devices(tablet=True))
+    tablet_ready(m)
+    before = gui.read_pointer(m)
+    assert before.frames == 0 and before.position is None, before
+    end = gui.drag(m, (40, 60), (1240, 740), 12)
+    assert end.frames - before.frames == 12 + 3, end
+    assert (end.position, end.buttons) == ((1240, 740), ()), end
+    assert (end.events, end.ignored, end.dropped, end.overruns) == (3 * 13 + 2 + 2, 0, 0, 0), end
+    row = mouse(m)[1]
+    assert (row.presses, row.stale) == ("1", "no"), row
+    assert run(m, "mouse hold") == "mouse: held: reading nothing until `mouse release`\n"
+    with pytest.raises(gui.StepNotConfirmed) as e:
+        gui.pointer_move(m, 640, 400, timeout=1)
+    assert str(e.value) == (
+        "move to (640, 400): the guest can't read its frame (the tablet is held or failed): "
+        "mouse counted 15 frames (43 events, 0 ignored, 0 dropped, 0 overruns), held"
+    ), e.value
+    assert run(m, "mouse release") == "mouse: released\n"
+    after = gui.pointer_move(m, 640, 400)
+    assert (after.frames, after.position) == (16, (640, 400)), after
 
 
 def test_mouse_hold_needs_a_tablet_and_takes_one_word(boot):

@@ -1104,14 +1104,33 @@ off. A wake from another CPU queues the thread there and sends the
   (`vt::read_key`/`vt::wait_key`, section "Terminal"): every keyboard
   scenario goes through it. The shell's
   `kbd` shows the layout, the route, the
-  interrupts taken, the bytes queued, dropped, undecoded, flagged, and
+  interrupts taken, the bytes queued, the keys pressed (`presses`: the
+  producer counts set 1 make codes as bytes arrive, queued or dropped,
+  before any reader decodes them, under one lock with the push, so a
+  press shows with its byte or its drop; prefixes, fake shifts and Pause
+  each one key or none: `lumen_input::Presses`, #149; it counts every make
+  syntactically, so it matches the decoded presses only while `undecoded`
+  stays flat; a ktest drives the producer's step with a full queue), the
+  keys held now (`held`: pressed, not yet released), the bytes dropped,
+  undecoded, flagged, and
   skipped during setup, or why there is no keyboard (and whether IRQ 1 was
   routed); a non-zero skip count is also logged after init.
 - **Tests:** QMP `send-key` drives the keyboard (`Machine.type_text` and
   `press`; QEMU queues each key behind the last one, so they arrive in
   order; its input queue holds 1024 entries and drops the rest without a
   word, so `press` paces itself on the time QEMU takes to send each key,
-  and `test_a_long_line_of_shifted_keys` checks 150 shifted keys arrive),
+  and `test_a_long_line_of_shifted_keys` checks 150 shifted keys arrive;
+  `lumen_harness.gui`'s `confirmed_keys` waits, before the next key, until
+  `kbd` counts exactly the key's presses and bytes (`gui.KEY_BYTES`, a
+  closed table `test_every_modelled_key_is_confirmed` pins against QEMU;
+  any other key is refused), still exactly once QEMU has sent everything,
+  with no key held and nothing dropped, undecoded or flagged, failing as
+  "key N of M (...) never reached the guest", "... of its N bytes arrived
+  ...: a prefix or release was lost", "... still held: a release was
+  lost ..." or "... the keyboard's queue dropped N byte(s) ...": a
+  confirmed key reached IRQ 1 whole, released, and was queued, while a
+  loss in the decoder, the router or a shell still shows only on the
+  screen, #149),
   and the scenarios read what the screen shells did
   back from the screen (`lumen_harness.screen`, through the serial shell's
   `term text`); a scenario boots with
@@ -2687,9 +2706,11 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   `mouse events [n]` and `kbd events [n]` print the ring's newest `n`
   events (default 16) as records (`seq`, then `x`, `y`, `buttons`,
   `after_overrun`; or `code`, `action`, `text`, `mods`). (#149's confirming
-  steps don't need the rings: they count `mouse`'s frames and `kbd`'s
-  `presses` (added by #149), which the keyboard's interrupt counts from
-  the scancodes, `lumen_input::Presses`.)
+  steps, `lumen_harness.gui`, don't need the rings: a pointer step waits
+  for exactly its frame in `mouse`'s count and for the `mouse` thread's
+  state to show its effect (the position, or the button held or
+  released); a key waits for exactly its `presses` and `bytes` in `kbd`,
+  as the keyboard's section above says.)
 - **Text mode is unchanged:** the cursor follows the newest state
   (`term::move_pointer`), keys reach the shown terminal's shell through
   `crate::vt`; the rings fill and wrap with no reader.
@@ -3547,7 +3568,7 @@ kernel. The kernel is the trusted computing base.
 |---|---|---|
 | Pure logic | `cargo test` on `no_std` crates | `crates/*` |
 | Kernel internals | `ktest!` in-kernel tests → TAP over serial → `isa-debug-exit` | anywhere in `kernel/src` |
-| Whole system | pytest scenarios: boot QEMU headless, `expect` on serial with timeouts, `send_line`, keys over QMP (`press`, `type_text`), exit codes; run in parallel (pytest-xdist, one worker per CPU) | `tests/scenarios` |
+| Whole system | pytest scenarios: boot QEMU headless, `expect` on serial with timeouts, `send_line`, keys and the tablet over QMP (`press`, `type_text`, `move_pointer`, `click`; `lumen_harness.gui`'s steps wait for each to show exactly in `kbd`'s and `mouse`'s counters before the next), exit codes; run in parallel (pytest-xdist, one worker per CPU) | `tests/scenarios` |
 | Screens | QMP `screendump` compared to golden PNG regions | `tests/golden` |
 | Codegen | `make audit`: disassembly and LLVM IR checks | `tools/harness/lumen_harness/audit.py` |
 | Harness itself | self-tests that the TAP parser, audit and image diff catch failures, and that the QEMU command line, artifact layout, CI wiring and status generation behave | `tests/harness` |
