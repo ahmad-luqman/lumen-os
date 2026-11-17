@@ -1,0 +1,9 @@
+[package]
+name = "lumen-gfx"
+description = "no_std pixel core for the Lumen desktop: rectangles, damage, xRGB8888 surfaces, blits and coverage-mask blending, host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

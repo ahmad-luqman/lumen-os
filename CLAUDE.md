@@ -203,6 +203,13 @@ own PR that updates that doc first.
 - `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs
   in bands, and Game of Life with its patterns (host-tested).
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
+- `crates/lumen-gfx`: the desktop's pixel core: `Rect` (signed origin,
+  intersect/union/clip, subtract into at most 4), `Damage` (a fixed-size
+  list that coalesces, a bounding box past its size, never loses
+  coverage), `Surface` (xRGB8888 with a stride: fill, clipped blits,
+  `blend_mask` for coverage masks such as glyphs) and `Target`, what a
+  surface is presented to a span at a time (a surface, the front buffer)
+  (host-tested, incl. randomized coverage and every-edge clipping).
 - `crates/lumen-input`: pointer input: evdev events into whole-frame
   pointer states, axes scaled to the screen (`Tablet`, `AbsAxis`), a
   frame's most events from the device's `EV_BITS` (`frame_bound`) and
