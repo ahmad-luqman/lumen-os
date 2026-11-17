@@ -3211,8 +3211,9 @@ request, #156).
   `set_focus`) and need no slot, so they are never dropped. The queue's
   entries are `lumen_wm::Entry<K, R>`: `Key(K)` (#151's key event, through
   the `KeyLike` trait: its code and whether it is a press), `Pointer`
-  (`PointerEntry::{Down, Move, Up}`, client coordinates, one `Button`
-  each) and `Request(R)` (#156); it has no variant for a flag, so one
+  (`PointerEntry::{Down, Move, Up}`, client coordinates, one
+  `lumen_input::Button` each) and `Request(R)` (#156); it has no variant
+  for a flag, so one
   can't be pushed. A press or release is of a `Held::{Code(K::Code),
   Button(Button)}`. Each flag is delivered in its place, after the entries queued
   before it was set (set again, it moves to the end): delivered ahead of
@@ -3310,11 +3311,9 @@ Moves with no button held aren't delivered (no hover in M4).
   may hang off the left, right or bottom edge, never the top);
   `Pointer::from_read` takes a pointer ring's read (#151): the tablet's
   `usize` position (saturating, through `Pointer::from_state`), its
-  buttons as they are (`lumen_input::Buttons`, the one button set the
-  tablet and the window manager share, with `lumen_input::Button` for one
-  button; #172 merged lumen-wm's own `ButtonSet` into it) and
-  `Read::gap()` (a gap in the ring or `after_overrun`, handled before the
-  event).
+  buttons (`lumen_input::Buttons`, the one button set the tablet and the
+  window manager share) and `Read::gap()` (a gap in the ring or
+  `after_overrun`, handled before the event).
 - **Geometry** (`Metrics::DESKTOP`): a 24-row title bar spanning the
   frame (the side borders' top rows are title bar), 1-pixel borders, a
   16-pixel close box 4 pixels in from the right border; a moved frame

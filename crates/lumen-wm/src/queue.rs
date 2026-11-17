@@ -45,8 +45,9 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-use crate::route::PointerEntry;
 use lumen_input::Button;
+
+use crate::route::PointerEntry;
 
 /// Entries the queue holds.
 pub const CAPACITY: usize = 64;

@@ -7,12 +7,12 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use lumen_gfx::Rect;
+use lumen_input::{Button, Buttons};
 
 use crate::geom::{Metrics, Part};
 use crate::queue::{Entry, EventQueue, KeyLike, Next};
 use crate::route::{PointerEntry, deliver};
 use crate::wm::{Delivery, Hit, Interruption, Outcome, Pointer, WindowId, Wm};
-use lumen_input::{Button, Buttons};
 
 const M: Metrics = Metrics { title_h: 4, border: 1, close: 2, close_margin: 0, strip: 3 };
 const W: u32 = 40;
@@ -451,12 +451,9 @@ fn a_press_on_a_border_focuses_and_raises_and_nothing_more() {
 
 #[test]
 fn tablet_positions_are_converted_saturating() {
-    let mut s = lumen_input::PointerState { x: 12, y: usize::MAX, ..Default::default() };
-    s.buttons = Buttons::RIGHT;
+    let s = lumen_input::PointerState { x: 12, y: usize::MAX, buttons: R, ..Default::default() };
     let p = Pointer::from_state(&s, true);
     assert_eq!((p.x, p.y, p.buttons, p.after_overrun), (12, i32::MAX, R, true));
-    let s = lumen_input::PointerState { buttons: Buttons::EXTRA, ..Default::default() };
-    assert_eq!(Pointer::from_state(&s, false).buttons, Buttons::EXTRA);
 }
 
 #[test]

@@ -21,9 +21,9 @@ use alloc::vec::Vec;
 use core::num::NonZeroU32;
 
 use lumen_gfx::{Damage, Rect};
+use lumen_input::{Button, Buttons};
 
 use crate::geom::{Metrics, Part};
-use lumen_input::{Button, Buttons};
 
 /// The damage one operation reports: a few frames at most, so 8
 /// rectangles never collapse in practice.
@@ -65,7 +65,7 @@ impl Pointer {
     }
 
     /// A tablet state as the window manager takes it: the `usize`
-    /// position converted to `i32` (saturating), the buttons as they are.
+    /// position converted to `i32` (saturating).
     pub fn from_state(s: &lumen_input::PointerState, after_overrun: bool) -> Pointer {
         let c = |v: usize| i32::try_from(v).unwrap_or(i32::MAX);
         Pointer { x: c(s.x), y: c(s.y), buttons: s.buttons, after_overrun }

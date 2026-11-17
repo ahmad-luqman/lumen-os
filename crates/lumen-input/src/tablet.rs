@@ -111,7 +111,9 @@ impl AbsAxis {
     }
 }
 
-/// One pointer button, in [`Buttons`]' bit order (left first).
+/// One pointer button: the one place the buttons' order is spelled (their
+/// bits in [`Buttons`], their slots in [`PointerState::presses`], their
+/// names and evdev codes all come from here).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Button {
     Left,
@@ -123,52 +125,68 @@ pub enum Button {
 
 impl Button {
     pub const ALL: [Button; 5] = [Button::Left, Button::Right, Button::Middle, Button::Side, Button::Extra];
+
+    /// Its slot in [`PointerState::presses`] (left first), and the place
+    /// of its bit in [`Buttons`].
+    pub const fn index(self) -> usize {
+        match self {
+            Button::Left => 0,
+            Button::Right => 1,
+            Button::Middle => 2,
+            Button::Side => 3,
+            Button::Extra => 4,
+        }
+    }
+
+    /// The set holding this button alone.
+    pub const fn bit(self) -> Buttons {
+        Buttons(1 << self.index())
+    }
+
+    /// Its name, as `mouse` prints it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Button::Left => "left",
+            Button::Right => "right",
+            Button::Middle => "middle",
+            Button::Side => "side",
+            Button::Extra => "extra",
+        }
+    }
+
+    /// The button an `EV_KEY` code names, if it is a pointer's.
+    pub const fn from_code(code: u16) -> Option<Button> {
+        match code {
+            BTN_LEFT => Some(Button::Left),
+            BTN_RIGHT => Some(Button::Right),
+            BTN_MIDDLE => Some(Button::Middle),
+            BTN_SIDE => Some(Button::Side),
+            BTN_EXTRA => Some(Button::Extra),
+            _ => None,
+        }
+    }
 }
 
 impl From<Button> for Buttons {
     fn from(b: Button) -> Buttons {
-        Buttons(1 << b as u8)
+        b.bit()
     }
 }
 
-/// The buttons held down, one bit per [`Button`]: the tablet's state and
-/// the desktop's window manager both use this set.
+/// The buttons held down: the tablet's state and the desktop's window
+/// manager both use this set. It holds only [`Button`]s' bits (every way
+/// to make one starts from a [`Button`]), so [`Buttons::each`] lists all of
+/// it: lumen-wm's `Wm` keeps what is held through `each`.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct Buttons(u8);
 
 impl Buttons {
     pub const NONE: Buttons = Buttons(0);
-    pub const LEFT: Buttons = Buttons(1 << 0);
-    pub const RIGHT: Buttons = Buttons(1 << 1);
-    pub const MIDDLE: Buttons = Buttons(1 << 2);
-    pub const SIDE: Buttons = Buttons(1 << 3);
-    pub const EXTRA: Buttons = Buttons(1 << 4);
-
-    const NAMES: [(Buttons, &'static str); 5] = [
-        (Buttons::LEFT, "left"),
-        (Buttons::RIGHT, "right"),
-        (Buttons::MIDDLE, "middle"),
-        (Buttons::SIDE, "side"),
-        (Buttons::EXTRA, "extra"),
-    ];
-
-    /// The button an `EV_KEY` code names, if it is a pointer's: its index
-    /// in [`PointerState::presses`] and its bit.
-    fn from_code(code: u16) -> Option<(usize, Buttons)> {
-        let i = match code {
-            BTN_LEFT => 0,
-            BTN_RIGHT => 1,
-            BTN_MIDDLE => 2,
-            BTN_SIDE => 3,
-            BTN_EXTRA => 4,
-            _ => return None,
-        };
-        Some((i, Buttons::NAMES[i].0))
-    }
-
-    pub const fn bits(self) -> u8 {
-        self.0
-    }
+    pub const LEFT: Buttons = Button::Left.bit();
+    pub const RIGHT: Buttons = Button::Right.bit();
+    pub const MIDDLE: Buttons = Button::Middle.bit();
+    pub const SIDE: Buttons = Button::Side.bit();
+    pub const EXTRA: Buttons = Button::Extra.bit();
 
     pub const fn is_empty(self) -> bool {
         self.0 == 0
@@ -197,29 +215,21 @@ impl Buttons {
     }
 
     fn set(&mut self, b: Buttons, down: bool) {
-        if down {
-            self.0 |= b.0;
-        } else {
-            self.0 &= !b.0;
-        }
+        *self = if down { self.with(b) } else { self.without(b) };
     }
 }
 
 /// The buttons' names, space-separated (`left right`), or `none`.
 impl fmt::Display for Buttons {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0 == 0 {
+        if self.is_empty() {
             return f.write_str("none");
         }
-        let mut first = true;
-        for (b, name) in Buttons::NAMES {
-            if self.contains(b) {
-                if !first {
-                    f.write_str(" ")?;
-                }
-                f.write_str(name)?;
-                first = false;
+        for (i, b) in self.each().enumerate() {
+            if i > 0 {
+                f.write_str(" ")?;
             }
+            f.write_str(b.name())?;
         }
         Ok(())
     }
@@ -242,9 +252,9 @@ pub struct PointerState {
     /// horizontal wheel's (right positive).
     pub wheel: i64,
     pub hwheel: i64,
-    /// Each button's presses so far (left, right, middle, side, extra): a
-    /// press and release between two looks shows here although
-    /// [`PointerState::buttons`] has it up again.
+    /// Each button's presses so far, indexed by [`Button::index`] (left,
+    /// right, middle, side, extra): a press and release between two looks
+    /// shows here although [`PointerState::buttons`] has it up again.
     pub presses: [u64; 5],
     /// Whole frames so far, this one included (1 for the first).
     pub seq: u64,
@@ -258,7 +268,7 @@ impl PointerState {
 
     /// Button `b`'s presses so far (all of `b`'s, if it names several).
     pub fn presses_of(&self, b: Buttons) -> u64 {
-        Buttons::NAMES.iter().zip(self.presses).filter(|((n, _), _)| b.contains(*n)).map(|(_, p)| p).sum()
+        b.each().map(|button| self.presses[button.index()]).sum()
     }
 }
 
@@ -383,14 +393,15 @@ impl Tablet {
             (EV_ABS, ABS_Y) => self.pending.y = self.y.scale(e.value, self.height),
             (EV_REL, REL_WHEEL) => self.pending.wheel += i64::from(e.value),
             (EV_REL, REL_HWHEEL) => self.pending.hwheel += i64::from(e.value),
-            (EV_KEY, code) => match Buttons::from_code(code) {
-                Some((i, b)) => {
+            (EV_KEY, code) => match Button::from_code(code) {
+                Some(button) => {
+                    let b = button.bit();
                     // 0 released, 1 pressed, 2 held (autorepeat). A press
                     // counts even if the button seems held (its release was
                     // in a dropped frame); an autorepeat only if it doesn't.
                     let down = e.value != 0;
                     if e.value == 1 || (down && !self.pending.buttons.contains(b)) {
-                        self.pending.presses[i] += 1;
+                        self.pending.presses[button.index()] += 1;
                     }
                     self.pending.buttons.set(b, down);
                 }
@@ -536,21 +547,33 @@ mod tests {
 
     #[test]
     fn each_button_is_its_own_bit_in_the_named_order() {
-        // The desktop's window manager speaks `Button`s and the tablet
-        // `Buttons`' constants: one set for both (#172), so each `Button`
-        // must be exactly the constant of its name, and the set ops agree.
+        // `Button` is the one place the order is spelled: each must be the
+        // `Buttons` constant of its name, the name `mouse` prints, and its
+        // own `presses` slot when pressed alone (side and extra apart), and
+        // the set operations must agree on overlapping sets.
         let named = [Buttons::LEFT, Buttons::RIGHT, Buttons::MIDDLE, Buttons::SIDE, Buttons::EXTRA];
-        for (b, set) in Button::ALL.into_iter().zip(named) {
-            assert_eq!(Buttons::from(b), set, "{b:?}");
+        let codes = [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA];
+        let names = ["left", "right", "middle", "side", "extra"];
+        for (i, b) in Button::ALL.into_iter().enumerate() {
+            let set = named[i];
+            assert_eq!((Buttons::from(b), b.index(), b.name()), (set, i, names[i]), "{b:?}");
+            assert_eq!(Button::from_code(codes[i]), Some(b));
             assert!(set.has(b) && !set.is_empty(), "{b:?}");
             assert_eq!(set.each().collect::<Vec<_>>(), [b]);
             assert_eq!(Buttons::NONE.with(set).without(set), Buttons::NONE);
+            let mut t = Tablet::new(QEMU, QEMU, 100, 100);
+            let s = feed_all(&mut t, &[key(codes[i], true), SYN])[0];
+            let mut alone = [0; 5];
+            alone[i] = 1;
+            assert_eq!((s.buttons, s.presses, s.buttons.to_string()), (set, alone, names[i].into()), "{b:?}");
         }
+        assert_eq!(Button::from_code(BTN_EXTRA + 1), None);
         assert!(Buttons::NONE.is_empty() && Buttons::NONE.each().next().is_none());
         let lr = Buttons::LEFT.with(Buttons::RIGHT);
-        assert_eq!(lr.bits(), 0b11);
         assert_eq!(lr.each().collect::<Vec<_>>(), [Button::Left, Button::Right]);
+        assert_eq!(lr.with(Buttons::LEFT), lr, "with a button already held");
         assert_eq!(lr.without(Buttons::LEFT), Buttons::RIGHT);
+        assert_eq!(Buttons::LEFT.without(Buttons::RIGHT), Buttons::LEFT, "without a button not held");
         assert!(lr.contains(Buttons::RIGHT) && !lr.contains(Buttons::MIDDLE));
     }
 

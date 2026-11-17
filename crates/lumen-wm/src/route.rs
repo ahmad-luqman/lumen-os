@@ -4,9 +4,10 @@
 //!
 //! [`Outcome`]: crate::Outcome
 
+use lumen_input::{Button, Buttons};
+
 use crate::queue::{Entry, EventQueue, KeyLike, Pushed};
 use crate::wm::Delivery;
-use lumen_input::{Button, Buttons};
 
 /// A pointer event as a window's queue holds it (client coordinates).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
