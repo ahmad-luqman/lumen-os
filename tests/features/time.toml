@@ -44,7 +44,7 @@ tests = [
     "scenario:test_time::test_timer_windows_with_no_bound_left_panic",
     "scenario:test_time::test_a_stall_past_ten_windows_is_ignored",
     "scenario:test_ktest::test_in_kernel_tests_pass",
-    "scenario:test_ktest::test_in_kernel_tests_pass_with_calibrations_stalled_within_tolerance",
+    "scenario:test_ktest::test_in_kernel_tests_pass_with_calibrations_stalled_within_tolerance[*]",
 ]
 
 [[feature]]

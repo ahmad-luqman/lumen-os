@@ -2,6 +2,7 @@
 
 import re
 
+import pytest
 from lumen_harness import save_ktest_tap, tap
 from lumen_harness.clock_diags import check_clock_diags
 from lumen_harness.qemu import EXIT_CRASH, EXIT_SUCCESS, Devices
@@ -169,25 +170,25 @@ def test_in_kernel_tests_pass(boot):
     check_clock_diags(report, out)
 
 
-def test_in_kernel_tests_pass_with_calibrations_stalled_within_tolerance(boot):
-    # Every check moves together (#139): a boot whose calibrations filled in
-    # (each window's end stalled 0.6%, so none steady) but stayed within
-    # their tolerances (the TSC about 0.6%, under its 1%; the timer about
-    # 0.6% plus the TSC's, under its 2%) logs no warning, and every ktest
-    # that compares a measurement with the boot's calibration still passes,
-    # as do the clock diagnostics' bounds.
-    stalls = "lumen.stall_tsc_windows=6000 lumen.stall_timer_windows=6000"
-    out, report = finished(boot_ktests(boot, cmdline=stalls))
-    for key in ("tsc", "timer"):
-        assert (
-            f"INFO  time: stalling calibration windows by 6000,0 ppm (lumen.stall_{key}_windows)\n"
-            in out
-        )
-    assert re.search(
-        r"INFO  time: tsc calibration took 20 windows again, 0 of 5 kept steady", out
-    ), out
-    assert re.search(
-        r"INFO  time: local APIC timer calibration took 20 windows again, 0 of 5 kept steady", out
+@pytest.mark.parametrize(
+    "key, ppm", [("tsc", 6000), ("timer", 12000)], ids=["tsc-0.6%", "timer-1.2%"]
+)
+def test_in_kernel_tests_pass_with_calibrations_stalled_within_tolerance(boot, key, ppm):
+    # Every check moves together (#139): a boot whose calibration filled in
+    # (each window's end stalled, so none steady) but stayed within its
+    # tolerance logs no warning, and every ktest that compares a measurement
+    # with the boot's calibration still passes, as do the clock diagnostics'
+    # bounds. The TSC at 0.6% (under its 1%); the timer at 1.2%, which with
+    # the TSC's bound is still under its 2% but leaves its rate about 1.2% off
+    # (a ktest budgeting the calibration 1% fails here).
+    name = {"tsc": "tsc", "timer": "local APIC timer"}[key]
+    out, report = finished(boot_ktests(boot, cmdline=f"lumen.stall_{key}_windows={ppm}"))
+    assert (
+        f"INFO  time: stalling calibration windows by {ppm},0 ppm (lumen.stall_{key}_windows)\n"
+        in out
     )
+    assert re.search(
+        rf"INFO  time: {name} calibration took 20 windows again, 0 of 5 kept steady", out
+    ), out
     assert "WARN  time" not in out, out
     check_clock_diags(report, out)
