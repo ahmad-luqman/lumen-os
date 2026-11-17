@@ -3171,7 +3171,8 @@ A host-tested `no_std` crate every desktop part draws with. Pixels are
 
 - `Rect`: signed origin, unsigned size; intersection, bounding box,
   containment, clipping, subtraction into at most four disjoint pieces,
-  and `translate(dx, dy)` (saturating).
+  and `translate(dx, dy)` (each edge clamped to `i32`'s range: a part
+  pushed past either end is cut off, never kept at its size).
 - `Damage`: a fixed-size list that never allocates. A rectangle added
   merges with those it overlaps or touches only when the merged box costs
   no more pixels than drawing both; past the list's size everything
