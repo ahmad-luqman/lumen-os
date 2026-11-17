@@ -145,6 +145,14 @@ impl Pointer {
         let c = |v: usize| i32::try_from(v).unwrap_or(i32::MAX);
         Pointer { x: c(s.x), y: c(s.y), buttons: s.buttons.into(), after_overrun }
     }
+
+    /// A frame as the pointer ring's reader got it (#151): its state, and a
+    /// gap before it either way (`Read::gap`: this reader fell behind the
+    /// ring, or frames were lost at the device), so the compositor never
+    /// has to interrupt with [`Interruption::Gap`] apart for pointer input.
+    pub fn from_read(r: &lumen_input::Read<lumen_input::PointerEvent>) -> Pointer {
+        Pointer::from_state(&r.event.state, r.gap())
+    }
 }
 
 /// What a window is told. Pointer positions are in its client area's

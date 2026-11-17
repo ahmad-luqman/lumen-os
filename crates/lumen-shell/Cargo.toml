@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 unicode-width.workspace = true
+# Key codes and modifiers for `Key::from_press` (#151).
+lumen-input.workspace = true
 
 [dev-dependencies]
 # The splitter is checked against shlex on random lines (tests/split_oracle.rs).

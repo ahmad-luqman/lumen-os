@@ -375,6 +375,35 @@ impl Tablet {
     }
 }
 
+/// Marks the tablet's frames that may follow frames lost at the device
+/// (`crate::PointerEvent::after_overrun`): every frame of a batch that counted as
+/// an overrun ([`may_have_lost_frames`]) except its first, and the first
+/// frame of the next batch that brings one (virtio re-posts each buffer as
+/// it is popped, so a frame can be dropped while the batch is still being
+/// read, i.e. anywhere after its first frame, or just after its last).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AfterOverrun {
+    /// The next frame follows a possible loss: the last batch that brought
+    /// frames counted as an overrun, or one since (bringing none) did.
+    carry: bool,
+}
+
+impl AfterOverrun {
+    pub const fn new() -> Self {
+        Self { carry: false }
+    }
+
+    /// Whether each of a batch's `frames` follows a possible loss, in
+    /// order, given whether the batch counted as an `overrun`; then
+    /// remembers the batch for the next one.
+    pub fn batch(&mut self, frames: usize, overrun: bool) -> impl Iterator<Item = bool> + use<> {
+        let carry = self.carry;
+        // A batch with no frame passes a loss on to the next frame.
+        self.carry = overrun || (carry && frames == 0);
+        (0..frames).map(move |i| if i == 0 { carry } else { overrun })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,5 +853,26 @@ mod tests {
         // A buffer lost to the ring (a re-post that failed) leaves 31
         // posted while the thread counts on 32.
         assert!(model(&[2, 3, QEMU_FRAME], 31, QEMU_FRAME).uncounted.is_some());
+    }
+
+    #[test]
+    fn after_overrun_marks_an_overrun_batch_after_its_first_and_the_next_batch_s_first() {
+        let mut marks = AfterOverrun::new();
+        let batch = |m: &mut AfterOverrun, frames, overrun| m.batch(frames, overrun).collect::<Vec<_>>();
+        assert_eq!(batch(&mut marks, 2, false), [false, false]);
+        assert_eq!(batch(&mut marks, 3, true), [false, true, true]);
+        assert_eq!(batch(&mut marks, 2, false), [true, false]);
+        assert_eq!(batch(&mut marks, 1, false), [false]);
+        // An overrun batch with no frame passes the mark on, across empty
+        // batches, to the next frame.
+        assert_eq!(batch(&mut marks, 0, true), Vec::<bool>::new());
+        assert_eq!(batch(&mut marks, 0, false), Vec::<bool>::new());
+        assert_eq!(batch(&mut marks, 2, false), [true, false]);
+        // Back-to-back overruns: the second's first frame follows the
+        // first's loss.
+        assert_eq!(batch(&mut marks, 2, true), [false, true]);
+        assert_eq!(batch(&mut marks, 2, true), [true, true]);
+        assert_eq!(batch(&mut marks, 1, false), [true]);
+        assert_eq!(batch(&mut marks, 1, false), [false]);
     }
 }

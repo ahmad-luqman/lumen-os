@@ -34,7 +34,7 @@ KBD_LINE = r"INFO  kbd: PS/2 keyboard on ISA IRQ 1 \(GSI 1, vector 0x51\), layou
 KBD_STATS = re.compile(
     r"kbd: layout (\S+), IRQ 1 \(vector 0x51\), (\d+) interrupts, (\d+) bytes, (\d+) presses, "
     r"(\d+) held, (\d+) dropped, "
-    r"(\d+) undecoded, (\d+) line errors, (\d+) skipped at setup\n"
+    r"(\d+) undecoded, (\d+) line errors, (\d+) skipped at setup, newest key event \d+\n"
 )
 # Without an 8042 its status reads 0xff: never ready for a command.
 NO_8042 = r"no reply in time \(command 0xad: the controller to take it\)"
@@ -235,13 +235,17 @@ def test_a_long_line_of_shifted_keys(boot):
 def test_no_8042_is_a_warning(boot):
     # Without the controller the keyboard is skipped with a warning naming
     # the command, the serial shell says why there is none (IRQ 1 stays
-    # routed, masked), and only the serial shell runs.
+    # routed, masked), and only the serial shell runs. `kbd events` says
+    # the same, piped or not.
     m = boot("qemutest", extra=["-machine", "q35,i8042=off"])
     m.expect(rf"WARN  kbd: no PS/2 keyboard: {NO_8042}\n", 60)
     m.expect(r"INFO  shell: shell on serial \(none on the screen: no keyboard\); type 'help'\n", 60)
     m.expect(r"lumen> ", 60)
-    m.send_line("kbd")
-    m.expect(rf"kbd: no keyboard \({NO_8042}\); IRQ 1 routed \(vector 0x51\), masked\n", 10)
+    no_keyboard = rf"kbd: no keyboard \({NO_8042}\); IRQ 1 routed \(vector 0x51\), masked\n"
+    for command in ["kbd", "kbd events", "kbd events | count"]:
+        m.send_line(command)
+        m.expect(no_keyboard, 10)
+        m.expect(r"lumen> ", 10)
 
 
 TABLET_LINE = re.compile(
@@ -250,7 +254,7 @@ TABLET_LINE = re.compile(
 )
 MOUSE_HEADER = re.compile(
     r'mouse: "QEMU Virtio Tablet" on (\S+), screen 1280x800, (\d+) events in (\d+) frames '
-    r"\((\d+) ignored, (\d+) dropped, (\d+) overruns\)"
+    r"\((\d+) ignored, (\d+) dropped, (\d+) overruns, newest event \d+\)"
 )
 
 
@@ -537,16 +541,25 @@ def test_a_burst_of_moves_counts_overruns(boot, frame):
     # (see lumen_input::may_have_lost_frames), the state stale, the warning
     # naming that batch's events and the hold. A paced move afterwards is a
     # clean frame: the state isn't stale. A second held overflow is counted
-    # too, but not warned about (once per boot).
+    # too, but not warned about (once per boot). In the desktop's pointer
+    # ring (#151) the overrun batch's frames after its first are marked
+    # `after_overrun` (frames may have been lost before them), and so is
+    # the next batch's first frame (the paced move); the second overflow's
+    # batch is marked the same way.
     m = boot("qemutest", devices=Devices(tablet=True), trace_events=["virtio_input_queue_full"])
     tablet_ready(m)
+    fit = RING // frame
+    marked = ["no"] + ["yes"] * (fit - 1)
     overflow_held(m, frame, warn=True)
     assert len(re.findall(held_overrun_warn(frame), m.output)) == 1
     assert mouse(m)[1].stale == "yes"
+    assert [r[4] for r in events(m, f"mouse events {fit}")] == marked
     m.move_pointer(640, 400)
     assert wait_mouse(m, x="640", y="400").stale == "no"
+    assert events(m, "mouse events 1")[0][1:] == ["640", "400", "none", "yes"]
     overflow_held(m, frame, warn=False)
     assert len(re.findall(overrun_warn(), m.output)) == 1
+    assert [r[4] for r in events(m, f"mouse events {fit}")] == marked
     # No frame was dropped outside the held windows (the paced move fit).
     assert m.trace_log().count("virtio_input_queue_full") == 2 * PAST_THE_RING
 
@@ -582,15 +595,97 @@ def test_drag_steps_are_confirmed(boot):
     assert (after.frames, after.position) == (16, (640, 400)), after
 
 
-def test_mouse_hold_needs_a_tablet_and_takes_one_word(boot):
-    # `mouse hold` without a tablet fails and says why; `mouse` takes only
-    # `hold` or `release`; `mouse release` without a hold is harmless.
+def events(m: Machine, command: str) -> list[list[str]]:
+    """`mouse events n` or `kbd events n`: its rows, each split into its
+    cells (the header checked against the columns)."""
+    lines = run(m, command).splitlines()
+    columns = {
+        "mouse": ["seq", "x", "y", "buttons", "after_overrun"],
+        "kbd": ["seq", "code", "action", "text", "mods", "after_drop"],
+    }[command.split()[0]]
+    assert lines and lines[0].split() == columns, lines
+    return [re.split(r"\s{2,}", line.strip()) for line in lines[1:]]
+
+
+def test_click_position_is_kept(boot):
+    # (#151) With the mouse thread held, a move to (x1, y1), a press there,
+    # a move to (x2, y2) and a release there wait in the device's ring;
+    # released, the thread reads them all in one batch, yet the pointer
+    # ring has a frame for each, in order, numbered one after another: the
+    # press where it was pressed and the release where it was released,
+    # none marked as following frames lost at the device. `mouse` shows the
+    # ring's newest number.
+    m = boot("qemutest", devices=Devices(tablet=True))
+    tablet_ready(m)
+    assert run(m, "mouse events") == "  seq     x     y  buttons  after_overrun\n"
+    assert run(m, "mouse hold") == "mouse: held: reading nothing until `mouse release`\n"
+    (x1, y1), (x2, y2) = (100, 200), (900, 600)
+    m.move_pointer(x1, y1)
+    m.click("left", release=False)
+    m.move_pointer(x2, y2)
+    m.release("left")
+    assert run(m, "mouse release") == "mouse: released\n"
+    end = poll(lambda: gui.read_pointer(m), lambda r: r.frames >= 4, m)
+    assert (end.frames, end.position, end.buttons, end.overruns) == (4, (x2, y2), (), 0), end
+    rows = events(m, "mouse events 8")
+    assert rows == [
+        ["1", str(x1), str(y1), "none", "no"],
+        ["2", str(x1), str(y1), "left", "no"],
+        ["3", str(x2), str(y2), "left", "no"],
+        ["4", str(x2), str(y2), "none", "no"],
+    ], rows
+    assert ", newest event 4)" in run(m, "mouse").splitlines()[0]
+    assert run(m, "mouse events 0") == "usage: mouse events [n]\n"
+    # A later batch adds its frame after them, numbered on (nothing pushed
+    # twice).
+    m.move_pointer(300, 300)
+    poll(lambda: gui.read_pointer(m), lambda r: r.frames >= 5, m)
+    rows = events(m, "mouse events 8")
+    assert [r[0] for r in rows] == ["1", "2", "3", "4", "5"], rows
+    assert rows[4] == ["5", "300", "300", "none", "no"], rows
+    # In a pipeline the same events are records.
+    assert run(m, "mouse events | where buttons = left | select seq x y") == (
+        f"  seq     x     y\n    2  {x1:>4}  {y1:>4}\n    3  {x2:>4}  {y2:>4}\n"
+    )
+
+
+def test_key_events_have_releases_and_modifiers(boot):
+    # (#151) Shift+a typed on the keyboard is four key events in the key
+    # ring, each with the modifiers after it: press LShift (shifted), press
+    # A (shifted, text 'A'), release A (shifted), release LShift (not
+    # shifted). Num Lock is on (pc-keyboard's start). The screen's shell
+    # still gets its 'A' as before, and `kbd` shows the ring's newest
+    # number.
+    m = boot("qemutest")
+    shells_ready(m, "us")
+    assert run(m, "kbd events") == "  seq  code        action   text    mods       after_drop\n"
+    m.press(["shift", "a"])
+    rows = poll(lambda: events(m, "kbd events 8"), lambda r: len(r) >= 4, m)
+    assert rows == [
+        ["1", "LShift", "press", "-", "shift+num", "no"],
+        ["2", "A", "press", "'A'", "shift+num", "no"],
+        ["3", "A", "release", "-", "shift+num", "no"],
+        ["4", "LShift", "release", "-", "num", "no"],
+    ], rows
+    expect_screen(m, r"^lumen> A$")
+    assert re.search(r", newest key event 4\n", run(m, "kbd"))
+    assert run(m, "kbd events 2 | where action = press | count") == "0\n"
+    assert run(m, "kbd events 4 | where action = press | count") == "2\n"
+
+
+def test_mouse_hold_needs_a_tablet_and_takes_its_words(boot):
+    # `mouse hold` without a tablet fails and says why, as do `mouse events`
+    # and `mouse events 3` (the line `mouse` gives); `mouse` takes only
+    # `hold`, `release` or `events [n]`; `mouse release` without a hold is
+    # harmless.
     m = boot("qemutest")
     shells_ready(m, "us")
     assert run(m, "mouse hold") == "mouse: can't hold: no tablet\n"
     assert run(m, "mouse release") == "mouse: released\n"
     for bad in ["mouse up", "mouse hold now"]:
-        assert run(m, bad) == "usage: mouse [hold|release]\n", bad
+        assert run(m, bad) == "usage: mouse [hold|release|events [n]]\n", bad
+    for command in ["mouse events", "mouse events 3"]:
+        assert run(m, command) == "mouse: no tablet (QEMU: -device virtio-tablet-pci)\n", command
 
 
 def test_a_pointer_move_raises_the_tablets_interrupt(boot):

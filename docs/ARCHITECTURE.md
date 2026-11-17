@@ -1092,10 +1092,12 @@ off. A wake from another CPU queues the thread there and sends the
   `pc-keyboard` in the layout `lumen.keymap=` names into a `Key`: a
   character (Ctrl and a letter make a control character, Ctrl-A U+0001;
   a ktest decodes Ctrl-A, Ctrl-W and, on a German keyboard, Ctrl-Z), or
-  another key pressed (arrows, PageUp, modifiers) with whether shift is
-  held; releases are skipped, and bytes the decoder refuses are counted
-  (the keyboard's overrun code among them); Alt is reported with keys
-  that make no character (a ktest decodes Alt+F2).
+  another key pressed (arrows, PageUp, modifiers) with the modifiers
+  after it (`lumen_input::Mods`); releases are skipped for the terminals
+  (every key event, releases included, also goes to the desktop's key
+  ring: section 7), and bytes the decoder refuses are counted (the
+  keyboard's overrun code among them); Alt shows with keys that make no
+  character (a ktest decodes Alt+F2).
   `keyboard::wait_for_bytes_or(ready)` blocks the calling thread until
   bytes are queued or `ready()` holds: the producer wakes the keyboard's
   wait queue whenever it queued a byte, and the waiter checks under the
@@ -1113,8 +1115,10 @@ off. A wake from another CPU queues the thread there and sends the
   stays flat; a ktest drives the producer's step with a full queue), the
   keys held now (`held`: pressed, not yet released), the bytes dropped,
   undecoded, flagged, and
-  skipped during setup, or why there is no keyboard (and whether IRQ 1 was
-  routed); a non-zero skip count is also logged after init.
+  skipped during setup, and the desktop's key ring's newest event number
+  (`newest key event`, #151, section 7), or why there is no keyboard (and
+  whether IRQ 1 was routed); a non-zero skip count is also logged after
+  init. `kbd events [n]` lists the key ring's newest events.
 - **Tests:** QMP `send-key` drives the keyboard (`Machine.type_text` and
   `press`; QEMU queues each key behind the last one, so they arrive in
   order; its input queue holds 1024 entries and drops the rest without a
@@ -1505,7 +1509,8 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
     saying why any are missing (`pci::status`).
   - `mouse`: the tablet (#98, section 7): a header with its name,
     address, screen and counts (events, frames, ignored, `SYN_DROPPED`s,
-    overruns: batches that may have lost frames, why it failed), and one
+    overruns: batches that may have lost frames, the pointer ring's newest
+    event number (#151, section 7), why it failed), and one
     row: position,
     buttons held, presses so far (summed), wheels, the pointer (`drawn`,
     `hidden` under a canvas, `none` without a terminal), `stale`, and why
@@ -1518,6 +1523,7 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
     `HOLD_WAIT_NS` (1 s, a bug, logged). Events wait in the device's ring and frames that don't
     fit are dropped, an overrun made on purpose (#142). The hold is every
     console's (`mouse hold | ...` holds too), and both are logged at INFO.
+    `mouse events [n]` lists the pointer ring's newest frames (#151).
   - `dmesg`: the newest whole log lines as serial printed them: the logger
     keeps the last 16 KiB in a `lumen_trace::TextRing` (host-tested
     against a model; not lock-free: `klog`'s `RING` lock, a leaf, taken
@@ -2550,10 +2556,11 @@ ever seen.
   KVM runners QMP's roughly 0.7 to 3 ms per frame sometimes didn't
   outpace it, so the ring never filled.)
 - **Keys:** the keyboard's decoded presses (`crate::keyboard::Key`: a
-  character, or a raw code with Shift and Alt), routed into `crate::vt`'s
+  character, or a raw code with its modifiers), routed into `crate::vt`'s
   per-terminal rings; each screen shell turns them into the line editor's
   `lumen_shell::Key` (`shell::screen_key`). No releases and no modifiers
-  on their own: not a desktop's key event. M4 adds one, `KeyEvent` below.
+  on their own there: not a desktop's key event, hence `KeyEvent` below
+  (#151).
 - **Delivery (M3):** the device's owner thread reads a batch of events each
   time its interrupt wakes it (or its 1 s status look; not while held)
   and publishes the newest state with the batch's counts (`mouse::
@@ -2564,7 +2571,8 @@ ever seen.
   needs every pointer frame with its position (a click's place, a drag)
   and real key events, hence the trait.
 
-**The trait (M4: designed in #146, built in #151).** Each input device
+**The trait (M4: designed in #146, built in #151; the desktop that
+reads it comes with #153).** Each input device
 keeps a ring of its newest events, numbered in order from 1, and a
 reader asks for the first event after the last one it saw. In
 `lumen-input` (host-tested), which gains the workspace's `pc-keyboard`
@@ -2598,14 +2606,20 @@ pub struct Reader<D: InputDevice + 'static> { device: &'static D, after: Seq, lo
 impl<D: InputDevice + 'static> Reader<D> {
     /// Starting after the device's newest event.
     pub fn from_now(device: &'static D) -> Reader<D>;
-    /// The next event, counting a gap's events in `lost`.
-    pub fn next(&mut self) -> Option<D::Event>;
-    /// Skip to after `seq` (never backwards): the desktop's cut (section
-    /// 11).
+    /// The next event with its number and the gap just before it (also
+    /// counted in `lost`); `None` once caught up.
+    pub fn read(&mut self) -> Option<Read<D::Event>>;
+    /// Skip to after `seq`, never backwards and never past the device's
+    /// newest: the desktop's cut (section 11). A number past this ring's
+    /// newest (one from the other ring, say) is a bug a `debug_assert`
+    /// catches (every profile keeps them); a smaller foreign number isn't
+    /// detected.
     pub fn skip_to(&mut self, seq: Seq);
     pub fn after(&self) -> Seq;
     pub fn lost(&self) -> u64;
 }
+/// One event a reader got.
+pub struct Read<E> { pub seq: Seq, pub lost_before: u64, pub event: E }
 
 /// A tablet frame, and whether frames may have been lost at the device
 /// before it.
@@ -2617,6 +2631,7 @@ pub struct KeyEvent {
     pub code: pc_keyboard::KeyCode, // the physical key
     pub action: KeyAction,
     pub mods: Mods,                 // after this event
+    pub after_drop: bool,           // the keyboard's queue dropped bytes before it
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyAction {
@@ -2627,17 +2642,30 @@ pub enum KeyAction {
     Release,
 }
 /// The modifier state (`pc_keyboard::Modifiers` isn't `Copy` in 0.9.0).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Mods(u8);
 impl Mods {
-    pub fn is_shifted(self) -> bool;
-    pub fn is_ctrl(self) -> bool;
-    pub fn is_alt(self) -> bool;   // either Alt
-    pub fn is_altgr(self) -> bool; // right Alt, or Ctrl with left Alt
-    pub fn capslock(self) -> bool;
-    pub fn numlock(self) -> bool;
+    pub const NONE: Mods;
+    pub const fn is_shifted(self) -> bool;
+    pub const fn is_ctrl(self) -> bool;
+    pub const fn is_alt(self) -> bool;   // either Alt
+    pub const fn is_altgr(self) -> bool; // right Alt, or Ctrl with left Alt
+    pub const fn capslock(self) -> bool;
+    pub const fn numlock(self) -> bool;
+    // Builders, for states made without pc-keyboard (tests, other
+    // crates): left Shift, left Ctrl, left Alt held, Num Lock on.
+    pub const fn with_shift(self) -> Mods;
+    pub const fn with_ctrl(self) -> Mods;
+    pub const fn with_alt(self) -> Mods;
+    pub const fn with_numlock(self) -> Mods;
 }
 impl From<&pc_keyboard::Modifiers> for Mods { /* ... */ }
+
+/// Events lost just before one, other than a gap in the ring's numbers:
+/// `PointerEvent::after_overrun`, `KeyEvent::after_drop`. `Read::gap()`
+/// is `lost_before > 0 || event.follows_loss()`: the one check a reader
+/// needs (derived, not stored).
+pub trait MarksLoss { fn follows_loss(&self) -> bool; }
 
 /// The compositor's merge of both rings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2648,10 +2676,13 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   events and the next number; `push` overwrites the oldest and returns
   the `Seq` it gave. In the kernel each ring is a static behind one
   `SpinLock`, a leaf: nothing is taken under it and nothing allocates, so
-  it may be taken under any other lock. Reading takes nothing out, so
-  several `Reader`s can read one ring. A pusher sets `desktop::PENDING`
-  and calls `desktop::wake()` (section 11) after releasing the ring's
-  lock.
+  it may be taken under any other lock (`crate::input::LockedRing`, the
+  `InputDevice`; `input::POINTER` and `input::KEYS`). Reading takes
+  nothing out, so several `Reader`s can read one ring. Once the desktop
+  exists (#153), a pusher sets `desktop::PENDING` and calls
+  `desktop::wake()` (section 11) after releasing the ring's lock; until
+  then no `Reader` follows them (only the shell's `events` commands look
+  at the newest).
 - **Two kinds of loss, kept apart.** A gap in `Seq` means only that
   *this reader* fell behind the ring (counted in `Reader::lost`). Frames
   QEMU dropped at the device never reach the ring and leave no gap:
@@ -2669,7 +2700,10 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   separate frames (QEMU syncs after each call), so two events, each at its
   own position. A ring of 256 (QMP sends a frame every 0.7 to 3 ms, so a
   burst fills it in under a second; the compositor reads each time it
-  wakes).
+  wakes). A frame the device says it lost (`SYN_DROPPED`) isn't marked:
+  QEMU never sends one. When the tablet fails, a last frame at the last
+  position with every button released, marked `after_overrun`, ends a
+  reader's drag.
 - **Key events:** the keyboard's decoding pass (under `crate::vt`'s router
   lock, run by whichever reader wakes first, as today) pushes a `KeyEvent`
   for every key event `pc-keyboard` decodes, presses and releases, bare
@@ -2681,31 +2715,54 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   makes. pc-keyboard's pseudo-keys: `RAlt2` (the fake shift `E0 2A`/`E0
   AA` QEMU sends around Print Screen) is not pushed, and the other fake
   shift (`E0 36`) doesn't decode at all (counted as undecoded, as today);
-  Pause (`E1 1D 45 E1 9D C5`) is pushed as one press of
-  `KeyCode::PauseBreak` with no release, its pieces (`RControl2`, that
-  `NumpadLock` press and both releases) not pushed; a `KeyState::SingleShot`
-  key is pushed as a press then a release. Typematic repeat shows up as
-  repeated presses with no release between. A ring of 128 key events, the
+  Pause (`E1 1D 45 E1 9D C5`; nothing when let go) is pushed as one press
+  of `KeyCode::PauseBreak` and its release at once (so no reader thinks it
+  held), its pieces (`RControl2`, that `NumpadLock` press and both
+  releases) not pushed; Ctrl+Pause sends `E0 46` (`E0 C6` released),
+  which `pc-keyboard` 0.9.0 doesn't map: every `E0` goes to `pc-keyboard`
+  as it comes, and its refusal of a `46` right after one is taken as Pause
+  instead (the same press and release; `E0 C6` swallowed; the terminals
+  get a raw `PauseBreak`, which no shell takes, where it used to be counted
+  undecoded); a `KeyState::SingleShot` key would be pushed as a press then
+  a release (unreachable with set 1, which makes none). The decoding is
+  `lumen_input::KeyDecoder` (host-tested): one key is one press, as
+  `kbd`'s `presses` counts it, wherever `pc-keyboard` refuses no byte (a
+  host test feeds both one corpus; the one exception, a Pause cut off after
+  its `E1 1D`, is listed there). Typematic repeat shows up as repeated
+  presses with no release between. The first key event decoded from
+  bytes queued after the keyboard's queue dropped one (full: the byte
+  coming in is the one dropped) is marked `after_drop`
+  (`lumen_input::AfterDrop`): a consumer-side count of the bytes still
+  queued when the drop count moved, so the mark may be late (a stray
+  release), never early (a key left held); a reader treats it as a gap
+  (the desktop interrupts with `KeyGap`). A ring of 128 key events, the
   same size as a terminal's (but read, not taken: a full ring overwrites
   its oldest).
 - **One mapping to the line editor:** `lumen_shell::Key::from_press(text:
   Option<char>, code: Option<KeyCode>, mods: Mods) -> Option<Key>`
   (host-tested; `lumen-shell` gains `lumen-input`), moved out of
-  `shell::screen_key`: the text first (Enter, Backspace, Delete, Tab,
-  Ctrl with a letter, printable characters), else the code (the arrows,
-  Home, End). Text mode calls it from `crate::keyboard::Key` (`Char(c)`
-  as `(Some(c), None, ..)`, `Raw { code, shift, alt }` as `(None,
-  Some(code), ..)` with those modifiers), and terminal windows (#155)
-  from a `KeyEvent` press's text and code, so they need no second decoder.
+  `shell::screen_key`: from the text if the press has one (Enter,
+  Backspace, Delete, Tab, Ctrl with a letter, printable characters; other
+  control characters nothing), else from the code (the arrows, Home, End).
+  Text mode calls it from `crate::keyboard::Key` (`Char(c)` as `(Some(c),
+  None, ..)`, `Raw { code, mods }` as `(None, Some(code), mods)`: a raw
+  key carries the modifiers its key event does), and terminal windows
+  (with #155) from a `KeyEvent` press's text, code and modifiers, so they
+  need no second decoder.
   Toolkit text fields (#156) insert only a press's non-control `text`.
 - **Order across devices:** the compositor merges the two rings in the
   order it reads them. Events carry no time stamps in M4, so a key press
   and a pointer frame that arrive close together (within one compositor
   pass) may be handled in either order.
-- **Shell (#151):** `mouse` and `kbd` show each ring's newest `Seq`, and
+- **Shell (#151):** `mouse` and `kbd` show each ring's newest `Seq`
+  (`newest event N` in `mouse`'s header, `newest key event N` at the end
+  of `kbd`'s line), and
   `mouse events [n]` and `kbd events [n]` print the ring's newest `n`
   events (default 16) as records (`seq`, then `x`, `y`, `buttons`,
-  `after_overrun`; or `code`, `action`, `text`, `mods`). (#149's confirming
+  `after_overrun`; or `code`, `action`, `text`, `mods`, `after_drop`);
+  without the device they say what `mouse` or `kbd` says, and with no
+  screen shell running (they run the decoding pass) `kbd events` says so
+  above its table. (#149's confirming
   steps, `lumen_harness.gui`, don't need the rings: a pointer step waits
   for exactly its frame in `mouse`'s count and for the `mouse` thread's
   state to show its effect (the position, or the button held or
@@ -2713,7 +2770,8 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   as the keyboard's section above says.)
 - **Text mode is unchanged:** the cursor follows the newest state
   (`term::move_pointer`), keys reach the shown terminal's shell through
-  `crate::vt`; the rings fill and wrap with no reader.
+  `crate::vt`; no `Reader` follows the rings (they fill and wrap): only the
+  shell's `mouse events` and `kbd events` look at the newest.
 
 **virtio first** (rng, input, sound in M3; blk, 9p in M6; net in M7) under
 QEMU; real-hardware drivers (NVMe, AHCI, xHCI HID, a common NIC) in M12
@@ -3201,10 +3259,14 @@ alone releases the owner's buttons, and no window is left holding one.
   the key ring alone and is counted as `Routed::Desktop` (shown by `vt`).
   So typing into a window never reaches the hidden terminal's shell.
 - **The compositor** reads the tablet's ring and the keyboard's ring
-  (section 7) with one `Reader` each. Pointer events go through `lumen-wm`
-  (focus, drag, close box, or a window's `PointerDown`/`PointerMove`/
-  `PointerUp`). Key events go to the focused window's queue; with none
-  focused they are dropped (`no_focus_keys`).
+  (section 7) with one `Reader` each. Pointer input goes in as
+  `lumen_wm::Pointer::from_read(&read)`, which carries `read.gap()` (a
+  gap in the ring or a frame after an overrun), so no separate `Gap`
+  interruption is needed; through `lumen-wm` it becomes focus, a drag, the
+  close box, or a window's `PointerDown`/`PointerMove`/`PointerUp`. For
+  keys, `if read.gap() { wm.interrupt(KeyGap) }` first; then the key event
+  (a `lumen_wm::KeyLike`) goes to the focused window's queue; with none
+  focused it is dropped (`no_focus_keys`).
 
 ### The pointer (#153)
 

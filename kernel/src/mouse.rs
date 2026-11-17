@@ -81,15 +81,28 @@
 //!   from any, and `mouse hold | ...` holds as a side effect. Both are logged at INFO, so a
 //!   forgotten hold shows in `dmesg`.
 //! - **The `InputDevice` class** (docs/ARCHITECTURE.md, section 7): the
-//!   tablet's messages are `lumen_input::PointerState`s; M4's desktop
-//!   consumes them.
+//!   tablet's messages are `lumen_input::PointerState`s. After each batch
+//!   the thread pushes every frame it read, in order, into the desktop's
+//!   ring (`crate::input::POINTER`, #151) before it publishes the newest
+//!   state, each marked `after_overrun` when frames may have been lost at
+//!   the device before it (`lumen_input::AfterOverrun`: every frame of an
+//!   overrun batch but its first, and the next batch's first). So a press
+//!   and a release inside one batch are two events, each at its own
+//!   position; `mouse events` shows them. A frame the device said it lost
+//!   (`SYN_DROPPED`, counted in `dropped`) isn't marked: QEMU never sends
+//!   one. When the tablet fails, a last frame with every button released
+//!   (marked) ends a reader's drag.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use log::{debug, error, info, warn};
-use lumen_input::{AbsAxis, Event, PointerState, Tablet, evdev, frame_bound, has_abs_xy, may_have_lost_frames};
+use lumen_input::{
+    AbsAxis, AfterOverrun, Event, PointerEvent, PointerState, Tablet, evdev, frame_bound, has_abs_xy,
+    may_have_lost_frames,
+};
 use lumen_pci::PciAddr;
 use lumen_pci::names::virtio_type;
 use virtio_drivers::device::input::VirtIOInput;
@@ -528,6 +541,10 @@ fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, a
     // count still unchanged: they came without their interrupt.
     let mut rule = virtio::MissedRule::default();
     let mut warned_cannot_block = false;
+    // A batch's frames (kept from batch to batch: the thread holds no lock,
+    // so it may allocate), and which follow frames lost at the device.
+    let mut frames: Vec<PointerState> = Vec::new();
+    let mut marks = AfterOverrun::new();
     loop {
         // The doorbell's count, read before the hold check and the drain:
         // a doorbell ring after either (an interrupt, or `hold`'s) then
@@ -540,13 +557,15 @@ fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, a
             after_hold = true;
             continue;
         }
-        let (mut events, mut newest) = (0u64, None);
+        let mut events = 0u64;
+        frames.clear();
         while let Some(e) = input.pop_pending_event() {
             events += 1;
             if let Some(s) = tablet.feed(Event::new(e.event_type, e.code, e.value as i32)) {
-                newest = Some(s);
+                frames.push(s);
             }
         }
+        let newest = frames.last().copied();
         if events > 0 && rule.answered(seen) {
             BELL.note_missed(Some(addr));
         }
@@ -564,6 +583,11 @@ fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, a
         // Only the first drain after a park is "after `mouse hold`", even
         // if it read nothing.
         after_hold = false;
+        // Every frame into the desktop's ring, in order, before the state
+        // is published: a state `mouse` shows is already in the ring.
+        for (&state, after_overrun) in frames.iter().zip(marks.batch(frames.len(), overrun)) {
+            crate::input::POINTER.push(PointerEvent { state, after_overrun });
+        }
         if events > 0
             && let Some(b) = BOUND.lock().as_mut()
         {
@@ -610,17 +634,32 @@ fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, a
 /// `BOUND`'s lock is dropped (that wait looks at `BOUND`).
 fn mark_failed(why: Failure) {
     if let Some(b) = BOUND.lock().as_mut() {
-        b.failed = Some(why);
-        if let Some(s) = b.state.as_mut() {
-            s.buttons = lumen_input::Buttons::NONE;
+        // The ring's frame first, under `BOUND`'s lock (the ring is a leaf):
+        // a reader sees the drag end no later than `mouse` shows the
+        // failure.
+        if let Some(last) = failed_frame(b) {
+            crate::input::POINTER.push(last);
         }
+        b.failed = Some(why);
     }
     PARKED.wake_all();
 }
 
+/// A failed tablet's last state, every button released (`mouse` shows
+/// none held), and the frame that tells the desktop's ring so, marked as
+/// following a loss (`after_overrun`: whatever the device did last is
+/// gone), so a reader's drag ends; `None` before any frame came.
+fn failed_frame(b: &mut Bound) -> Option<PointerEvent> {
+    let state = b.state.as_mut()?;
+    state.buttons = lumen_input::Buttons::NONE;
+    Some(PointerEvent { state: *state, after_overrun: true })
+}
+
 /// The device stopped being ready (`FAILED`, `DEVICE_NEEDS_RESET`, or
-/// `DRIVER_OK` gone): publish it (no button pressed any more), drop the driver,
-/// say so, and mark the function failed.
+/// `DRIVER_OK` gone): publish it (no button pressed any more; for the
+/// desktop's ring a last frame at the last position with every button
+/// released, marked `after_overrun`, so a reader's drag ends), drop the
+/// driver, say so, and mark the function failed.
 fn fail(input: Input, status: StatusHandle, addr: PciAddr) {
     let (raw, st) = (status.raw(), status.get());
     let why = if st.contains(DeviceStatus::FAILED) {
@@ -644,6 +683,30 @@ fn fail(input: Input, status: StatusHandle, addr: PciAddr) {
         warn!(target: "mouse", "{addr}: couldn't record the tablet as failed: the function isn't bound to it");
     }
 }
+
+crate::ktest!(
+    fn a_failed_tablet_s_last_frame_releases_every_button() {
+        // Built on a made-up bound tablet holding the left button: the
+        // last frame is its last position with no button, marked
+        // `after_overrun`, and the state `mouse` shows has none held too;
+        // with no frame yet there is none to push.
+        use crate::kassert_eq;
+        use lumen_input::Buttons;
+        let addr = PciAddr::new(0, 0, 3, 0).ok_or("addr")?;
+        let device = Device { addr, name: String::from("ktest tablet"), screen: (1280, 800) };
+        let state = PointerState { x: 5, y: 6, buttons: Buttons::LEFT, seq: 4, ..Default::default() };
+        let mut b = Bound { device, state: Some(state), counts: Counts::default(), stale: false, failed: None };
+        let frame = failed_frame(&mut b).ok_or("no frame")?;
+        kassert_eq!(
+            (frame.state.x, frame.state.y, frame.state.buttons, frame.after_overrun),
+            (5, 6, Buttons::NONE, true)
+        );
+        kassert_eq!(b.state.map(|s| s.buttons), Some(Buttons::NONE));
+        b.state = None;
+        kassert_eq!(failed_frame(&mut b), None);
+        Ok(())
+    }
+);
 
 /// A made-up bound tablet for the hold ktests (the ktest boot binds none;
 /// no thread reads it): the hold state and `BOUND` are put back on drop.

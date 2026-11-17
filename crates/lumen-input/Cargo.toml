@@ -1,9 +1,13 @@
 [package]
 name = "lumen-input"
-description = "no_std pointer input for the Lumen kernel: evdev events into pointer states scaled to the screen, a save-under cursor sprite, and key presses counted in PS/2 set 1 bytes, host-tested"
+description = "no_std pointer input for the Lumen kernel: evdev events into pointer states scaled to the screen, a save-under cursor sprite, key presses counted in PS/2 set 1 bytes, and input events in numbered rings with a set 1 key decoder, host-tested"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+# KeyCode, and decoding set 1 bytes into key events (#151).
+pc-keyboard.workspace = true
 
 [lints]
 workspace = true

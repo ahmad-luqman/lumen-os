@@ -130,17 +130,24 @@ fn source(table: &Table<Run>, words: &[String], ctx: &mut Ctx<'_>) -> Option<Dat
         commands::unknown(ctx, name);
         return None;
     };
-    // (With arguments it runs as a command: its usage line, or what the
-    // arguments ask for, e.g. `mouse hold`.)
-    if args.is_empty()
-        && let Some(records) = sysinfo::records(name)
+    // (Arguments it gives no records for run it as a command: its usage
+    // line, or what they ask for, e.g. `mouse hold`.)
+    if let Some(make) = sysinfo::records(name)
+        && let Some(records) = make(args)
     {
+        let table = match records {
+            Ok(table) => table,
+            Err(e) => {
+                ctx.fail(e);
+                return None;
+            }
+        };
         // A caveat the records can't carry goes to the console first
         // (`lspci`: why devices are missing).
         if let Some(note) = sysinfo::records_note(name) {
             let _ = writeln!(ctx.out, "{note}");
         }
-        return Some(Data::Table(records()));
+        return Some(Data::Table(table));
     }
     let mut capture = Capture::new(&mut *ctx.out);
     // `false`: no escape codes into a pipeline (`colors` and `clear`
@@ -216,12 +223,15 @@ crate::ktest!(
 crate::ktest!(
     fn records_come_from_commands_given_no_arguments() {
         // Each name in `RECORDS` is a command (a misspelt one would give
-        // text), and given an argument it doesn't take it says its usage
-        // (its table's usage line), piped or not.
-        use crate::kassert_eq;
-        for (name, _) in sysinfo::RECORDS {
+        // text), it gives no records for an argument it doesn't take (its
+        // maker says `None`: it runs as a command), and as a command it
+        // then says its usage (its table's usage line), piped or not.
+        use crate::{kassert, kassert_eq};
+        let x = [alloc::string::String::from("x")];
+        for (name, make) in sysinfo::RECORDS {
             let command = commands::COMMANDS.find(name);
             kassert_eq!(command.map(|c| c.name), Some(name));
+            kassert!(make(&x).is_none());
             let usage = match command.map_or("", |c| c.usage) {
                 "" => alloc::format!("usage: {name}\n"),
                 words => alloc::format!("usage: {name} {words}\n"),
@@ -234,6 +244,36 @@ crate::ktest!(
                 kassert_eq!(text, usage);
             }
         }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn records_come_from_commands_with_the_arguments_they_take() {
+        // `mouse events` and `kbd events [n]` give the rings' records in a
+        // pipeline; a bad count says the usage and ends it; `mouse hold`
+        // and `mouse release` still run as commands (`None`). Without a
+        // tablet (the ktest machine has none) `mouse events` says so as
+        // `mouse` does; with no screen shell running (none in the test
+        // kernel) `kbd events` first says nothing fills its ring.
+        use crate::{kassert, kassert_eq};
+        let s = |w: &[&str]| w.iter().map(|w| alloc::string::String::from(*w)).collect::<Vec<_>>();
+        let make = |name| sysinfo::records(name).expect("a records command");
+        kassert!(make("mouse")(&s(&["hold"])).is_none() && make("mouse")(&s(&["release"])).is_none());
+        kassert!(make("kbd")(&[]).is_none());
+        kassert!(matches!(make("kbd")(&s(&["events", "3"])), Some(Ok(_))));
+        kassert_eq!(run_line("kbd events 0 | count", &[]).0.as_str(), "usage: kbd events [n]\n");
+        kassert_eq!(run_line("kbd events 1 2", &[]).0.as_str(), "usage: kbd events [n]\n");
+        let no_tablet = "mouse: no tablet (QEMU: -device virtio-tablet-pci)\n";
+        kassert!(crate::mouse::status().is_none());
+        kassert_eq!(run_line("mouse events | count", &[]).0.as_str(), no_tablet);
+        kassert_eq!(run_line("mouse events 3", &[]).0.as_str(), no_tablet);
+        kassert_eq!(crate::vt::readers(), 0);
+        let note = "kbd: key events are decoded by the screen shells; none run (none started)\n";
+        let (text, ..) = run_line("kbd events | count", &[]);
+        kassert_eq!(text, alloc::format!("{note}{}\n", crate::input::KEYS.recent(16).len()));
+        let (text, ..) = run_line("kbd events", &[]);
+        kassert!(text.starts_with(note) && text.lines().nth(1).is_some_and(|h| h.trim_start().starts_with("seq")));
         Ok(())
     }
 );

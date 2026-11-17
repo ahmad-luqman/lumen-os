@@ -619,3 +619,37 @@ fn the_terminal_shows_what_the_editor_holds_after_a_listing() {
     assert_eq!(row(2).trim_end(), "> c");
     assert_eq!(vec![term.cursor().col, term.cursor().row], [3, 2]);
 }
+
+#[test]
+fn key_from_press_takes_the_text_first_then_the_code() {
+    use lumen_input::{KeyCode, Mods};
+    let none = Mods::NONE;
+    let text = |c| Key::from_press(Some(c), None, none);
+    assert_eq!(text('a'), Some(Key::Char('a')));
+    assert_eq!(text('é'), Some(Key::Char('é')));
+    assert_eq!(text('\n'), Some(Key::Enter));
+    assert_eq!(text('\r'), Some(Key::Enter));
+    assert_eq!(text('\u{8}'), Some(Key::Backspace));
+    assert_eq!(text('\u{7f}'), Some(Key::Delete));
+    assert_eq!(text('\t'), Some(Key::Tab));
+    assert_eq!(text('\u{1}'), Some(Key::Ctrl('a')));
+    assert_eq!(text('\u{3}'), Some(Key::Ctrl('c')));
+    assert_eq!(text('\u{1a}'), Some(Key::Ctrl('z')));
+    // Escape and other control characters: no key.
+    assert_eq!(text('\u{1b}'), None);
+    assert_eq!(text('\u{0}'), None);
+    let code = |c| Key::from_press(None, Some(c), none);
+    assert_eq!(code(KeyCode::ArrowLeft), Some(Key::Left));
+    assert_eq!(code(KeyCode::ArrowRight), Some(Key::Right));
+    assert_eq!(code(KeyCode::ArrowUp), Some(Key::Up));
+    assert_eq!(code(KeyCode::ArrowDown), Some(Key::Down));
+    assert_eq!(code(KeyCode::Home), Some(Key::Home));
+    assert_eq!(code(KeyCode::End), Some(Key::End));
+    assert_eq!(code(KeyCode::F1), None);
+    assert_eq!(code(KeyCode::LShift), None);
+    // The text wins over the code (a key event press carries both: Enter
+    // is the Return key with text '\n').
+    assert_eq!(Key::from_press(Some('\n'), Some(KeyCode::Return), none), Some(Key::Enter));
+    assert_eq!(Key::from_press(Some('\u{1b}'), Some(KeyCode::ArrowLeft), none), None);
+    assert_eq!(Key::from_press(None, None, none), None);
+}
