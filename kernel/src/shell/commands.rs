@@ -89,9 +89,9 @@ pub static COMMANDS: Table<Run> = Table(&[
     },
     Command {
         name: "desktop",
-        args: &[&["status", "check", "spin", "hold", "release"]],
-        usage: "[status|check|spin|hold <window>|release <window>]",
-        about: "start or resume the desktop (status: one record; check, spin, hold, release: for the tests)",
+        args: &[&["status", "check", "spin", "counter", "hold", "release"]],
+        usage: "[status|check|spin|counter|hold <window>|release <window>]",
+        about: "start or resume the desktop (status: one record; counter: the toolkit's demo; check, spin, hold, release: for the tests)",
         run: crate::desktop::command,
     },
     Command {
@@ -100,6 +100,13 @@ pub static COMMANDS: Table<Run> = Table(&[
         usage: "",
         about: "the desktop's windows, front to back: id, title, frame, z, focus, owner, events lost, keys",
         run: crate::desktop::windows_command,
+    },
+    Command {
+        name: "ui",
+        args: &[&["tree", "invoke"]],
+        usage: "tree [window] | invoke <node> <action> [args]",
+        about: "the desktop's automation tree: its nodes as records, or an action on one (press, set_value, select, focus, close)",
+        run: crate::ui::command,
     },
     Command {
         name: "mandelbrot",

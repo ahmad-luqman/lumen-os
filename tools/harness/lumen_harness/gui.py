@@ -59,6 +59,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -819,3 +820,90 @@ def settled_capture[T](
 def settled_screendump(m: Machine, name: str, tries: int = 5, allow: str | None = None) -> Path:
     """A screendump of a settled desktop (`settled_capture`); its path."""
     return settled_capture(m, lambda: m.screendump(name), tries, allow)
+
+
+# -- the automation tree (#156) ------------------------------------------------
+
+# kernel/src/ui.rs `invoke`'s lines (change them together).
+INVOKE_CANCELLED = "ui invoke: cancelled"
+INVOKE_LATE = "ui invoke: ran late"
+
+
+def ui_tree(
+    m: Machine, window: str | int | None = None, allow: str | None = None
+) -> list[dict[str, str]]:
+    """`ui tree [window]`'s rows: every node, depth first, each window's
+    root (depth 0) first, front to back; none without a desktop."""
+    line = "ui tree" if window is None else f"ui tree {window}"
+    out = run(m, line, allow=allow)
+    if out.strip() == "ui tree: no desktop":
+        return []
+    return parse_records(out)
+
+
+def node(rows: list[dict[str, str]], role: str, name: str) -> dict[str, str]:
+    """The one row of `rows` with this role and name."""
+    found = [r for r in rows if r["role"] == role and r["name"] == name]
+    if len(found) != 1:
+        raise AssertionError(f"{len(found)} {role} nodes named {name!r} in {rows}")
+    return found[0]
+
+
+def wait_ui(
+    m: Machine,
+    what: str,
+    done: Callable[[list[dict[str, str]]], bool],
+    window: str | int | None = None,
+    timeout: float = 10,
+) -> list[dict[str, str]]:
+    """Wait until `ui tree [window]`'s rows satisfy `done`; the rows then."""
+    return wait_for(m, what, lambda: ui_tree(m, window), done, timeout)
+
+
+@dataclass(frozen=True)
+class Invoked:
+    """What `ui invoke` said: the node's row after the action (`late` if it
+    ran after the first deadline), or a message (a window closed, busy, an
+    error)."""
+
+    row: dict[str, str] | None
+    message: str | None
+    late: bool = False
+
+
+def parse_invoke(out: str) -> Invoked | None:
+    """`ui invoke`'s output read: `None` for a request cancelled at its
+    deadline (to retry: it never ran), else what it said."""
+    lines = [line for line in out.splitlines() if line.strip()]
+    if lines and lines[0].startswith(INVOKE_CANCELLED):
+        return None
+    late = bool(lines) and lines[0] == INVOKE_LATE
+    body = lines[1:] if late else lines
+    if body and body[0].split()[:1] == ["id"]:
+        rows = parse_records("\n".join(body))
+        if len(rows) != 1:
+            raise AssertionError(f"ui invoke gave {len(rows)} rows:\n{out}")
+        return Invoked(rows[0], None, late)
+    if late:
+        raise AssertionError(f"ui invoke ran late but gave no row:\n{out}")
+    return Invoked(None, out.strip())
+
+
+def invoke(
+    m: Machine,
+    node_id: str | int,
+    action: str,
+    *args: str,
+    tries: int = 5,
+    allow: str | None = None,
+) -> Invoked:
+    """`ui invoke <node> <action> [args]`: retried while cancelled at its
+    deadline (a cancelled request never ran, so a retry can't act twice);
+    "ran late" with its row counts as done (`Invoked.late`)."""
+    line = " ".join(["ui invoke", str(node_id), action, *args])
+    for _ in range(tries):
+        got = parse_invoke(run(m, line, 10, allow=allow))
+        if got is not None:
+            return got
+        time.sleep(0.2)
+    raise AssertionError(f"{line} was cancelled {tries} times")

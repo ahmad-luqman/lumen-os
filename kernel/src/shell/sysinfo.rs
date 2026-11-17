@@ -73,7 +73,7 @@ pub type MakeTable = fn(&[String]) -> Option<Result<pipe::Table, String>>;
 
 /// The system commands that give records in a pipeline (instead of their
 /// text), and the tables they give.
-pub const RECORDS: [(&str, MakeTable); 10] = [
+pub const RECORDS: [(&str, MakeTable); 11] = [
     ("cpus", |a| no_args(a, cpu_table)),
     ("desktop", crate::desktop::records),
     ("irqs", |a| no_args(a, vector_table)),
@@ -83,6 +83,7 @@ pub const RECORDS: [(&str, MakeTable); 10] = [
     ("mouse", mouse_records),
     ("sound", |a| no_args(a, crate::sound::table)),
     ("threads", |a| no_args(a, thread_table)),
+    ("ui", crate::ui::records),
     ("windows", crate::desktop::windows_records),
 ];
 
@@ -943,18 +944,21 @@ crate::ktest!(
         use crate::kassert;
         let events = [String::from("events")];
         let status = [String::from("status")];
+        let tree = [String::from("tree")];
         for (name, make) in RECORDS {
             // Each with no arguments, `events` for the two that take it
-            // (`kbd` gives records only for that) and `status` for
-            // `desktop`. Without a device the events are its line instead
-            // (the ktest machine has no tablet), and without a desktop (the
-            // test kernel starts none) `windows` says so.
-            for args in [&[][..], &events[..], &status[..]] {
+            // (`kbd` gives records only for that), `status` for `desktop`
+            // and `tree` for `ui`. Without a device the events are its line
+            // instead (the ktest machine has no tablet), and without a
+            // desktop (the test kernel starts none) `windows` and `ui tree`
+            // say so.
+            for args in [&[][..], &events[..], &status[..], &tree[..]] {
                 let Some(table) = make(args) else { continue };
                 let table = match table {
                     Ok(table) => table,
                     Err(e) if name == "mouse" && e == NO_TABLET => continue,
                     Err(e) if name == "windows" && e == "windows: no desktop" => continue,
+                    Err(e) if name == "ui" && e == "ui tree: no desktop" => continue,
                     Err(_) => return Err("a records error"),
                 };
                 let rows = table.rows().len();
