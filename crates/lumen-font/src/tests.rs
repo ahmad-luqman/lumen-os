@@ -75,14 +75,14 @@ fn known_glyphs_metrics_and_advances() {
 
     // 'x' sits on the baseline with x-height 12; 'g' hangs below it.
     let x = face.rasterize(face.glyph_index('x'), px(24));
-    assert_eq!((x.width, x.height, x.left, x.top), (12, 12, 0, 12));
+    assert_eq!((x.ink.width, x.ink.height, x.ink.left, x.ink.top), (12, 12, 0, 12));
     assert_eq!(x.coverage.len(), 12 * 12);
     let g = face.rasterize(face.glyph_index('g'), px(24));
-    assert_eq!((g.width, g.height, g.top), (12, 18, 13));
-    assert!(i32::from(g.height) > i32::from(g.top), "g descends below the baseline");
+    assert_eq!((g.ink.width, g.ink.height, g.ink.top), (12, 18, 13));
+    assert!(g.ink.height as i32 > g.ink.top, "g descends below the baseline");
     // A space advances but has no ink.
     let space = face.rasterize(face.glyph_index(' '), px(24));
-    assert_eq!((space.width, space.height, space.coverage.len()), (0, 0, 0));
+    assert_eq!((space.ink.width, space.ink.height, space.coverage.len()), (0, 0, 0));
 }
 
 #[test]
@@ -109,10 +109,8 @@ fn the_ink_box_from_the_metrics_is_the_rasterized_box() {
         for glyph in 0..face.glyph_count() {
             let ink = face.ink_box(glyph, px(size));
             let g = face.rasterize(glyph, px(size));
-            assert_eq!((ink.width, ink.height), (u32::from(g.width), u32::from(g.height)), "glyph {glyph} at {size}");
-            if g.width > 0 {
-                assert_eq!((ink.left, ink.top), (i32::from(g.left), i32::from(g.top)), "glyph {glyph} at {size}");
-            }
+            assert_eq!(ink, g.ink, "glyph {glyph} at {size}");
+            assert_eq!(g.coverage.len(), g.ink.area(), "glyph {glyph} at {size}");
         }
     }
 }
@@ -151,10 +149,10 @@ fn glyphs_are_placed_on_the_baseline_at_their_pen_positions() {
     // A glyph's mask starts `left` pixels from its pen: 'j' reaches left
     // of its origin.
     let j = face.rasterize(face.glyph_index('j'), px(24));
-    assert!(j.left < 0, "j's tail reaches left of the pen: {}", j.left);
-    assert_eq!(placed(&mut font, "j", px(24))[0].0, i32::from(j.left));
+    assert!(j.ink.left < 0, "j's tail reaches left of the pen: {}", j.ink.left);
+    assert_eq!(placed(&mut font, "j", px(24))[0].0, j.ink.left);
     let after_x = placed(&mut font, "xj", px(24));
-    assert_eq!(after_x[1].0, 11 + i32::from(j.left));
+    assert_eq!(after_x[1].0, 11 + j.ink.left);
 }
 
 #[test]
@@ -173,6 +171,9 @@ fn the_pen_rounds_to_the_nearest_pixel_and_kerns() {
     assert_eq!(pen.kern(-100), -2); // -1.56 px is nearest -2
     assert_eq!(pen.kern(10), -1); // -1.40 px
     assert_eq!(pen.width(), 0);
+    let mut pen = Pen::default();
+    assert_eq!(pen.kern(-200), -3); // -3.13 px
+    assert_eq!(pen.width(), 0, "a pen left of the start is no width, not a huge one");
     // The embedded face has no `kern` table, so every pair kerns by 0.
     let face = face();
     let (a, v) = (face.glyph_index('A'), face.glyph_index('V'));
@@ -236,19 +237,15 @@ fn a_kern_pair_moves_the_right_glyph_and_the_measure() {
     let kerned_bytes = with_kern_pair(UI_FONT, a, v, -150);
     let kerned = Face::parse(&kerned_bytes).expect("the fixture parses");
     let size = px(24);
-    // -150 units at 24 px with 1000 units per em ('head', offset 18).
-    let head = (0..usize::from(be16(UI_FONT, 4))).map(|i| 12 + 16 * i).find(|&r| &UI_FONT[r..r + 4] == b"head");
-    let units_per_em = f32::from(be16(UI_FONT, be32(UI_FONT, head.unwrap() + 8) + 18));
-    assert_eq!(units_per_em, 1000.0);
-    let kern = to_64ths(-150.0 * (24.0 / units_per_em));
-    assert_eq!(kern, -230); // -3.6 px
+    // -150 units at 24 px, 1000 units per em: -3.6 px.
+    let kern = -230;
     assert_eq!(kerned.kern(a, v, size), kern);
     // Only that pair, in that order.
     assert_eq!(kerned.kern(v, a, size), 0);
     assert_eq!(kerned.kern(a, a, size), 0);
 
     let (adv_a, adv_v, adv_space) = (plain.advance(a, size), plain.advance(v, size), plain.advance(space, size));
-    let v_left = i32::from(plain.rasterize(v, size).left);
+    let v_left = plain.rasterize(v, size).ink.left;
     let x_of = |face: &Face, text: &str, nth: usize| {
         let mut font = Font::new(face, MIB);
         placed(&mut font, text, size)[nth].0
@@ -330,11 +327,12 @@ fn the_least_recently_used_glyph_is_evicted_first() {
     let index = |c: char| face.glyph_index(c);
     let cost_of = |c: char| cost(&face.rasterize(index(c), px(24)));
     // Room for 'a', 'b' and 'c' exactly.
-    let mut cache = GlyphCache::new(cost_of('a') + cost_of('b') + cost_of('c'));
+    let bound = cost_of('a') + cost_of('b') + cost_of('c');
+    let mut cache = GlyphCache::new(bound);
     for c in ['a', 'b', 'c'] {
         cache.with(&face, index(c), px(24), |_| ());
     }
-    assert_eq!(cache.used(), cache.bound());
+    assert_eq!(cache.used(), bound);
     assert_eq!(cache.stats().evictions, 0);
     // Use 'a' again, so 'b' is now the oldest.
     cache.with(&face, index('a'), px(24), |_| ());
@@ -343,7 +341,7 @@ fn the_least_recently_used_glyph_is_evicted_first() {
     assert!(!cache.contains(index('b'), px(24)));
     assert!(cache.contains(index('a'), px(24)), "recently used, kept");
     assert!(cache.contains(index('d'), px(24)));
-    assert!(cache.used() <= cache.bound());
+    assert!(cache.used() <= bound);
     assert!(cache.stats().evictions >= 1);
     // An evicted glyph comes back by rasterizing it again (a miss), with
     // the same mask.
@@ -358,7 +356,7 @@ fn a_glyph_bigger_than_the_whole_cache_is_used_and_dropped() {
     let face = face();
     let m = face.glyph_index('M');
     let mut cache = GlyphCache::new(ENTRY_OVERHEAD); // room for no ink at all
-    let width = cache.with(&face, m, px(24), |g| g.width);
+    let width = cache.with(&face, m, px(24), |g| g.ink.width);
     assert_eq!(width, 17, "still handed out");
     assert_eq!((cache.used(), cache.len()), (0, 0));
     assert_eq!(cache.stats().uncached, 1);
@@ -409,8 +407,9 @@ fn the_cache_agrees_with_a_model_lru_and_never_exceeds_its_bound() {
             let c = chars[rng.below(chars.len() as u64) as usize];
             let s = sizes[rng.below(sizes.len() as u64) as usize];
             let key = (face.glyph_index(c), s);
-            let was_miss = !model.contains(&key);
-            if let Some(at) = model.iter().position(|k| *k == key) {
+            let found = model.iter().position(|k| *k == key);
+            let was_miss = found.is_none();
+            if let Some(at) = found {
                 hits += 1;
                 model.remove(at);
                 model.push_back(key);
@@ -522,13 +521,19 @@ fn render_mask_refuses_a_line_wider_than_its_limit() {
     let mut font = Font::new(&face, MIB);
     let width = font.render_mask("xxx", px(24), 4096).unwrap().width();
     assert_eq!(width, 34);
-    assert!(font.render_mask("xxx", px(24), 34).is_some());
-    assert_eq!(font.render_mask("xxx", px(24), 33), None);
+    assert!(font.render_mask("xxx", px(24), 34).is_ok());
+    assert_eq!(font.render_mask("xxx", px(24), 33), Err(TooWide { width: 34 }));
+    // The ink left of the line's start counts: "jT"'s mask starts left of
+    // the pen, and its whole width is what's checked.
+    let jt = font.render_mask("jT", px(24), 4096).unwrap();
+    assert!(jt.x() < 0);
+    assert!(font.render_mask("jT", px(24), jt.width()).is_ok());
+    assert_eq!(font.render_mask("jT", px(24), jt.width() - 1), Err(TooWide { width: u64::from(jt.width()) }));
     let stats = font.stats();
     // Refused from the metrics: nothing rasterized, no cache touched.
     let before = rasterized();
     let long: std::string::String = "x".repeat(100_000);
-    assert_eq!(font.render_mask(&long, px(MAX_PX), 1 << 20), None);
+    assert!(matches!(font.render_mask(&long, px(MAX_PX), 1 << 20), Err(TooWide { width }) if width > 1 << 20));
     assert_eq!(rasterized(), before);
     assert_eq!(font.stats(), stats);
 }

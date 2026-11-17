@@ -26,27 +26,48 @@ pub struct LineMetrics {
     pub line_gap: i32,
 }
 
-/// One rasterized glyph: its coverage mask (`width * height` bytes,
-/// row-major; none for a glyph without ink, such as a space) and where it
-/// sits against the pen: `left` pixels right of it, its top row `top`
-/// pixels above the baseline. Only the cache and the layout see these.
+/// One rasterized glyph: where its ink goes against the pen and its
+/// coverage, exactly `ink.width * ink.height` bytes, row-major (none for a
+/// glyph without ink, such as a space). Only the cache and the layout see
+/// it; [`Face::rasterize`] is the only maker, and it keeps that size.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Glyph {
-    pub(crate) width: u16,
-    pub(crate) height: u16,
-    pub(crate) left: i16,
-    pub(crate) top: i16,
+    pub(crate) ink: InkBox,
     pub(crate) coverage: Vec<u8>,
 }
 
-/// Where a glyph's ink goes against the pen, from the metrics alone: the
-/// same box [`Face::rasterize`] fills (a host test checks every glyph).
+/// Where a glyph's ink goes against the pen: `left` pixels right of it,
+/// its top row `top` pixels above the baseline, `width` by `height` pixels
+/// (both 0 for a glyph without ink, and each at most `u16::MAX`).
+/// [`Face::ink_box`] reads it from the metrics alone, [`Face::rasterize`]
+/// from the metrics fontdue returns with the mask, both through
+/// [`InkBox::of`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InkBox {
     pub(crate) left: i32,
     pub(crate) top: i32,
     pub(crate) width: u32,
     pub(crate) height: u32,
+}
+
+impl InkBox {
+    /// The box fontdue's metrics give. A glyph is at most a few em squares
+    /// wide and an em at most MAX_PX pixels, so both sides fit `u16`; if a
+    /// broken face says otherwise, the glyph has no ink.
+    fn of(m: &fontdue::Metrics) -> InkBox {
+        let fits = |n: usize| n > 0 && n <= usize::from(u16::MAX);
+        if !(fits(m.width) && fits(m.height)) {
+            return InkBox { left: m.xmin, top: m.ymin, width: 0, height: 0 };
+        }
+        let (width, height) = (m.width as u32, m.height as u32);
+        // `ymin` is the ink's bottom row's offset above the baseline.
+        InkBox { left: m.xmin, top: m.ymin.saturating_add(height as i32), width, height }
+    }
+
+    /// Bytes of coverage a box this size holds.
+    pub(crate) fn area(&self) -> usize {
+        self.width as usize * self.height as usize
+    }
 }
 
 // How many glyphs this thread has rasterized: the tests' proof that a cache
@@ -70,8 +91,9 @@ impl fmt::Debug for Face {
 }
 
 impl Face {
-    /// Parse a face. `fontdue` reads every glyph's outline now, so this is
-    /// the slow part of loading a font (soft-float in the kernel: about
+    /// Parse a face. `fontdue` reads the outline of every glyph the face's
+    /// `cmap` maps (343 of [`crate::UI_FONT`]'s 369) now, so this is the
+    /// slow part of loading a font (soft-float in the kernel: about
     /// 60 ms for [`crate::UI_FONT`] under QEMU's TCG).
     pub fn parse(data: &[u8]) -> Result<Face, Error> {
         let settings = FontSettings {
@@ -151,12 +173,7 @@ impl Face {
 
     /// Where `glyph`'s ink goes at `px`, from the metrics alone.
     pub(crate) fn ink_box(&self, glyph: u16, px: Px) -> InkBox {
-        let m = self.font.metrics_indexed(self.checked(glyph), f32::from(px.get()));
-        let (width, height) = (m.width as u32, m.height as u32);
-        if width == 0 || height == 0 || width > u32::from(u16::MAX) || height > u32::from(u16::MAX) {
-            return InkBox { left: m.xmin, top: m.ymin, width: 0, height: 0 };
-        }
-        InkBox { left: m.xmin, top: m.ymin.saturating_add(height as i32), width, height }
+        InkBox::of(&self.font.metrics_indexed(self.checked(glyph), f32::from(px.get())))
     }
 
     /// The kerning between `left` and `right` at `px`, in 64ths of a pixel
@@ -166,27 +183,18 @@ impl Face {
         self.font.horizontal_kern_indexed(left, right, f32::from(px.get())).map_or(0, to_64ths)
     }
 
-    /// Rasterize `glyph` at `px` (the slow path the cache saves).
+    /// Rasterize `glyph` at `px` (the slow path the cache saves). The
+    /// coverage is exactly the box's size: if fontdue's mask isn't (never
+    /// seen), the glyph draws without ink rather than out of bounds.
     pub(crate) fn rasterize(&self, glyph: u16, px: Px) -> Glyph {
         #[cfg(test)]
         RASTERIZED.with(|n| n.set(n.get() + 1));
         let (metrics, coverage) = self.font.rasterize_indexed(self.checked(glyph), f32::from(px.get()));
-        // fontdue's mask is width * height bytes. A glyph is at most a few
-        // em squares wide and an em at most MAX_PX pixels, so both fit u16;
-        // if a broken face says otherwise, the glyph draws without ink.
-        debug_assert_eq!(metrics.width * metrics.height, coverage.len());
-        let (width, height, coverage) = match (u16::try_from(metrics.width), u16::try_from(metrics.height)) {
-            (Ok(w), Ok(h)) if w > 0 && h > 0 => (w, h, coverage),
-            _ => (0, 0, Vec::new()),
-        };
-        Glyph {
-            width,
-            height,
-            left: saturate_i16(metrics.xmin),
-            // `ymin` is the mask's bottom row's offset above the baseline.
-            top: saturate_i16(metrics.ymin.saturating_add(i32::from(height))),
-            coverage,
+        let ink = InkBox::of(&metrics);
+        if coverage.len() != ink.area() || ink.area() == 0 {
+            return Glyph { ink: InkBox { width: 0, height: 0, ..ink }, coverage: Vec::new() };
         }
+        Glyph { ink, coverage }
     }
 }
 
@@ -218,20 +226,11 @@ impl Pen {
         self.at += i64::from(advance);
     }
 
-    /// Where the pen is, in 64ths of a pixel.
-    pub(crate) fn at(&self) -> i64 {
-        self.at
-    }
-
     /// Where the pen ended, in whole pixels, rounded up (0 if kerning took
     /// it back past the start).
     pub(crate) fn width(&self) -> u32 {
         u32::try_from((self.at.max(0) + 63) / 64).unwrap_or(u32::MAX)
     }
-}
-
-fn saturate_i16(v: i32) -> i16 {
-    v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
 }
 
 /// `x` pixels in 64ths of a pixel, the nearest (halves away from zero).

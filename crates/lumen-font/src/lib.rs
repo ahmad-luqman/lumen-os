@@ -16,10 +16,13 @@
 //! has no SSE, so its floating point is soft-float library calls, slow but
 //! IEEE 754 exact. The host and the kernel then make the same masks (the
 //! [`sample`]'s hash pins it), because both run fontdue's portable
-//! (non-`simd`) code with the same `libm` (through `ttf-parser`'s
-//! `core_maths`), basic `f32` operations are correctly rounded on both,
-//! and Rust doesn't contract `a * b + c` into a fused multiply-add.
-//! Turning `simd` on for the host would break that agreement. Rasterizing
+//! (non-`simd`) code: its `sqrt`, `atan2`, `floor` and the like are its
+//! own pure-Rust functions (`platform::float`), not `libm` (`ttf-parser`
+//! uses `core_maths` only for COLR transforms, which nothing here reads);
+//! basic `f32` operations are correctly rounded on both; and Rust doesn't
+//! contract `a * b + c` into a fused multiply-add. Turning `simd` on for an
+//! x86-64 host (CI's) would swap in SSE versions of those functions and
+//! break that agreement (it changes nothing on other hosts). Rasterizing
 //! is slow, which is why the cache exists: a glyph is rasterized once per
 //! pixel size, then reused for as long as it stays cached.
 //!
@@ -97,8 +100,8 @@ impl Px {
 pub struct Placed<'a> {
     x: i32,
     y: i32,
-    width: u16,
-    height: u16,
+    width: u32,
+    height: u32,
     coverage: &'a [u8],
 }
 
@@ -112,14 +115,14 @@ impl<'a> Placed<'a> {
     }
 
     pub fn width(&self) -> u32 {
-        u32::from(self.width)
+        self.width
     }
 
     pub fn height(&self) -> u32 {
-        u32::from(self.height)
+        self.height
     }
 
-    /// `width * height` bytes, row-major.
+    /// Exactly `width * height` bytes, row-major.
     pub fn coverage(&self) -> &'a [u8] {
         self.coverage
     }
@@ -165,7 +168,7 @@ impl LineMask {
         self.height
     }
 
-    /// `width * height` bytes, row-major.
+    /// Exactly `width * height` bytes, row-major.
     pub fn coverage(&self) -> &[u8] {
         &self.coverage
     }
@@ -243,10 +246,10 @@ impl<'f> Font<'f> {
             cache.with(face, glyph, px, |g| {
                 if !g.coverage.is_empty() {
                     draw(Placed {
-                        x: at.saturating_add(i32::from(g.left)),
-                        y: ascent - i32::from(g.top),
-                        width: g.width,
-                        height: g.height,
+                        x: at.saturating_add(g.ink.left),
+                        y: ascent.saturating_sub(g.ink.top),
+                        width: g.ink.width,
+                        height: g.ink.height,
                         coverage: &g.coverage,
                     });
                 }
@@ -256,11 +259,12 @@ impl<'f> Font<'f> {
 
     /// `text` at `px` composited into one mask: each pixel the highest
     /// coverage any glyph gives it (overlapping glyphs, as kerning can
-    /// make, don't darken where they meet). `None` if the mask would be
-    /// wider than `max_width` pixels (a line that long has no business in
-    /// one allocation). The mask's box comes from the metrics, so it is
-    /// allocated once before anything is drawn.
-    pub fn render_mask(&mut self, text: &str, px: Px, max_width: u32) -> Option<LineMask> {
+    /// make, don't darken where they meet). The mask's box comes from the
+    /// metrics, so it is allocated once before anything is drawn, and a
+    /// line whose mask would be wider than `max_width` pixels (counting any
+    /// ink left of the line's start) is refused before anything is
+    /// rasterized: [`TooWide`] says how wide it would have been.
+    pub fn render_mask(&mut self, text: &str, px: Px, max_width: u32) -> Result<LineMask, TooWide> {
         let face = self.face;
         let metrics = face.line_metrics(px);
         // The bounding box of the line box and every glyph's ink, in i64 so
@@ -279,22 +283,29 @@ impl<'f> Font<'f> {
                 y1 = y1.max(y + i64::from(ink.height));
             }
         });
-        x1 = x1.max((pen.at().max(0) + 63) / 64);
-        let width = u32::try_from(x1 - x0).ok().filter(|&w| w <= max_width)?;
-        let height = u32::try_from(y1 - y0).ok()?;
-        let (x0, y0) = (i32::try_from(x0).ok()?, i32::try_from(y0).ok()?);
+        x1 = x1.max(i64::from(pen.width()));
+        let too_wide = TooWide { width: u64::try_from(x1 - x0).unwrap_or(u64::MAX) };
+        let width = u32::try_from(x1 - x0).ok().filter(|&w| w <= max_width).ok_or(too_wide)?;
+        // A line box and glyphs a few ems tall: far inside u32 and i32.
+        let height = u32::try_from(y1 - y0).map_err(|_| too_wide)?;
+        let (x0, y0) = (i32::try_from(x0).map_err(|_| too_wide)?, i32::try_from(y0).map_err(|_| too_wide)?);
         let mut coverage = vec![0_u8; width as usize * height as usize];
         self.render(text, px, |g| {
             // Inside the box by construction (the ink box is the mask's);
             // clipped all the same, so a disagreement can't write outside.
             let (gx, gy) = (i64::from(g.x) - i64::from(x0), i64::from(g.y) - i64::from(y0));
-            debug_assert!(gx >= 0 && gy >= 0 && gx + i64::from(g.width) <= i64::from(width));
-            for row in 0..g.height() as usize {
+            debug_assert!(
+                gx >= 0
+                    && gy >= 0
+                    && gx + i64::from(g.width) <= i64::from(width)
+                    && gy + i64::from(g.height) <= i64::from(height)
+            );
+            for row in 0..g.height as usize {
                 let y = gy + row as i64;
                 if y < 0 || y >= i64::from(height) {
                     continue;
                 }
-                let src = &g.coverage[row * usize::from(g.width)..][..usize::from(g.width)];
+                let src = &g.coverage[row * g.width as usize..][..g.width as usize];
                 for (col, s) in src.iter().enumerate() {
                     let x = gx + col as i64;
                     if x >= 0 && x < i64::from(width) {
@@ -304,9 +315,34 @@ impl<'f> Font<'f> {
                 }
             }
         });
-        Some(LineMask { x: x0, y: y0, width, height, coverage })
+        Ok(LineMask { x: x0, y: y0, width, height, coverage })
     }
 }
+
+/// [`Font::render_mask`] refused a line: its mask would be `width` pixels
+/// wide, more than the limit it was given.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TooWide {
+    pub width: u64,
+}
+
+impl core::fmt::Display for TooWide {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "the line would be {} pixels wide, more than its limit", self.width)
+    }
+}
+
+// One parsed face is shared by every thread that draws text (behind a
+// `&'static`), and a `Font` or a mask may move to the thread that uses it:
+// a change that made any of them unsafe to share fails to build here.
+const _: () = {
+    const fn send_sync<T: Send + Sync>() {}
+    const fn send<T: Send>() {}
+    send_sync::<Face>();
+    send_sync::<LineMask>();
+    send::<Font<'static>>();
+};
 
 #[cfg(test)]
 mod tests;

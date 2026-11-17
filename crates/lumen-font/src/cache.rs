@@ -12,6 +12,7 @@
 use crate::Px;
 use crate::face::{Face, Glyph};
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 
 /// Bytes counted for each cached glyph besides its coverage.
 pub(crate) const ENTRY_OVERHEAD: usize = 64;
@@ -45,9 +46,10 @@ struct Entry {
     used_at: u64,
 }
 
-/// Rasterized glyphs of one face. A lookup is O(log n); an eviction scans
-/// every entry for the least recently used (a few hundred at most, and
-/// only on a miss that needs room).
+/// Rasterized glyphs of one face. A lookup is O(log n). A miss that needs
+/// room sorts the entries by last use once, O(n log n), and drops the
+/// oldest until the glyph fits; n is at most `bound / ENTRY_OVERHEAD` (4096
+/// for the kernel's 256 KiB).
 #[derive(Debug)]
 pub(crate) struct GlyphCache {
     bound: usize,
@@ -82,11 +84,6 @@ impl GlyphCache {
     }
 
     #[cfg(test)]
-    pub(crate) fn bound(&self) -> usize {
-        self.bound
-    }
-
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.glyphs.len()
     }
@@ -116,22 +113,28 @@ impl GlyphCache {
             self.stats.uncached += 1;
             return f(&rasterized);
         }
-        while self.used + cost > self.bound && self.evict_oldest() {}
+        if self.used + cost > self.bound {
+            self.make_room(cost);
+        }
         self.used += cost;
         let entry = self.glyphs.entry(key).or_insert(Entry { glyph: rasterized, used_at: now });
         f(&entry.glyph)
     }
 
-    /// Drop the least recently used glyph; false if there is none (only
-    /// when the cache is empty, so a glyph that fits the bound fits then).
-    fn evict_oldest(&mut self) -> bool {
-        let Some(key) = self.glyphs.iter().min_by_key(|(_, e)| e.used_at).map(|(k, _)| *k) else {
-            return false;
-        };
-        if let Some(entry) = self.glyphs.remove(&key) {
-            self.used -= cost(&entry.glyph);
-            self.stats.evictions += 1;
+    /// Drop the least recently used glyphs until `needed` more bytes fit:
+    /// one sort by last use, then the oldest first. `needed` is at most the
+    /// bound, so emptying the cache always makes room.
+    fn make_room(&mut self, needed: usize) {
+        let mut by_use: Vec<(u64, Key)> = self.glyphs.iter().map(|(k, e)| (e.used_at, *k)).collect();
+        by_use.sort_unstable();
+        for (_, key) in by_use {
+            if self.used + needed <= self.bound {
+                break;
+            }
+            if let Some(entry) = self.glyphs.remove(&key) {
+                self.used -= cost(&entry.glyph);
+                self.stats.evictions += 1;
+            }
         }
-        true
     }
 }

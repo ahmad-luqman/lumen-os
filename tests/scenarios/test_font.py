@@ -37,7 +37,7 @@ def test_font_command_renders_the_golden_and_caches(boot):
         lines[1],
     ), out
     assert re.fullmatch(
-        rf"font: cache 25 hits, 17 misses, 0 evictions, \d+ of 262144 bytes; "
+        rf"font: cache 25 hits, 17 misses, 0 evictions, 4114 of 262144 bytes; "
         rf"mask fnv1a {GOLDEN} \(the golden\)",
         lines[2],
     ), out
