@@ -15,6 +15,7 @@ repository = "https://github.com/ahmad-luqman/lumen-os"
 lumen-acpi = { path = "crates/lumen-acpi" }
 lumen-demo = { path = "crates/lumen-demo" }
 lumen-elf = { path = "crates/lumen-elf" }
+lumen-font = { path = "crates/lumen-font" }
 lumen-heap = { path = "crates/lumen-heap" }
 lumen-input = { path = "crates/lumen-input" }
 lumen-mm = { path = "crates/lumen-mm" }
@@ -46,6 +47,11 @@ shlex = { version = "=2.0.1", default-features = false }
 # the engine).
 rhai = { version = "=1.27.0", default-features = false, features = ["no_std", "no_float", "only_i64", "no_module", "no_time", "no_closure"] }
 noto-sans-mono-bitmap = { version = "=0.4.0", default-features = false, features = ["regular", "bold", "size_16", "size_32", "unicode-basic-latin"] }
+# TrueType rasterizing for the desktop's text (#148, lumen-font). Without
+# its default `simd` feature: that one uses SSE intrinsics, and the kernel
+# is built without SSE (floats are soft-float library calls). `hashbrown`
+# is what makes it `no_std`.
+fontdue = { version = "=0.9.5", default-features = false, features = ["hashbrown"] }
 # virtio devices over PCI (#95): virtqueues and device protocols; Lumen
 # supplies the transport and the `Hal` (kernel/src/virtio.rs). `alloc`
 # because input and sound use `Box`/`Vec`; no `embedded-io`.
