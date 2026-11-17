@@ -2694,15 +2694,25 @@ crate::ktest!(
 crate::ktest!(
     fn a_theme_switch_repaints_everything_and_tells_each_window() {
         // On a desktop with no screen: switching to dark damages the whole
-        // screen and tells the window's owner first (`Theme(dark)`, once);
-        // a switch to the theme already shown changes nothing. Light again
-        // at the end (the theme is the kernel's, not the test desktop's).
+        // screen and tells the window's owner once, before the key queued
+        // earlier (`Theme(dark)`, then the key); a switch to the theme
+        // already shown changes nothing. Light again at the end (the theme
+        // is the kernel's, not the test desktop's).
         use crate::{kassert, kassert_eq};
         let d = Desktop::without_screen();
         let mut w = d.open_window("w", 16, 16).map_err(|_| "no window")?;
         while w.next_event().is_some() {}
+        let key = KeyEvent {
+            code: lumen_input::KeyCode::A,
+            action: KeyAction::Press { text: Some('a') },
+            mods: lumen_input::Mods::NONE,
+            after_drop: false,
+        };
         if let Some(s) = d.home.lock().as_mut() {
             let _ = s.damage.take();
+            let mut after = After::default();
+            let id = w.win.id;
+            kassert_eq!(s.push(id, &mut after, |q| Some(q.push(Entry::Key(key)))), Some(Pushed::Queued));
         }
         let result = (|| {
             kassert!(switch_theme(&d.home, &Theme::DARK));
@@ -2712,6 +2722,7 @@ crate::ktest!(
             kassert!(w.win.theme_behind());
             kassert!(matches!(w.next_event(), Some(WindowEvent::Theme(t)) if t.name == "dark"));
             kassert!(!w.win.theme_behind());
+            kassert!(matches!(w.next_event(), Some(WindowEvent::Key(k)) if k == key));
             kassert!(w.next_event().is_none());
             kassert!(!switch_theme(&d.home, &Theme::DARK));
             kassert!(d.home.lock().as_ref().is_some_and(|s| s.damage.is_empty()));

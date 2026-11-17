@@ -662,8 +662,8 @@ fn a_bad_png_is_an_error() {
         let png = png_file(1, 1, color_type, depth, &[], &[0, 0, 0, 0]);
         assert!(decode::decode(&png, 4096, 4096).is_err(), "colour type {color_type}, depth {depth}");
     }
-    // A palette image with no palette: the decoder takes it (as black),
-    // and it doesn't panic.
+    // A palette image with no palette: the decoder takes it, and doesn't
+    // panic.
     let png = png_file(1, 1, 3, 8, &[], &[0, 0]);
     let _either = decode::decode(&png, 4096, 4096);
     // Not enough rows in IDAT for the header's height.

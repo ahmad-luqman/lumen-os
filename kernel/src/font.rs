@@ -1,9 +1,10 @@
 //! The desktop's anti-aliased text (`lumen-font`, #148) in the kernel: the
-//! UI font, parsed once and shared ([`face`]). The desktop doesn't draw
-//! with it yet (M4's compositor will); for now it renders the golden
-//! sample for the shell's `font` and its ktest, which show how long
-//! `fontdue`'s soft-float parsing and rasterizing take here and that the
-//! kernel's mask hashes to the host golden's value.
+//! UI font, parsed once and shared ([`face`]); the desktop's titles and
+//! windows draw with it (each thread its own glyph cache: `crate::desktop`,
+//! #154). Here it also renders the golden sample for the shell's `font` and
+//! its ktest, which show how long `fontdue`'s soft-float parsing and
+//! rasterizing take and that the kernel's mask hashes to the host golden's
+//! value.
 
 use crate::shell::Ctx;
 use crate::time;

@@ -457,7 +457,9 @@ for scenarios, said at INFO, section 6, "Time"), `lumen.desktop` (start the
 desktop before the serial prompt; section 11) and
 `lumen.desktop_cut_delay_ms=<ms>` (a deliberate delay for scenarios between
 the compositor's reads of the input rings and of the cut, said at INFO,
-capped at 2000 ms; section 11).
+capped at 2000 ms; section 11), and `lumen.theme=<light|dark>` (the
+desktop's theme, said at INFO; a name that isn't a theme is warned about
+and ignored; section 11).
 
 ## 5. Memory layout
 
@@ -3102,6 +3104,7 @@ until a crash.
   | Column | Meaning |
   |---|---|
   | `state` | `off`, `shown` or `paused` |
+  | `theme` | the theme drawn with: `light` or `dark` (also while `off`) |
   | `windows` | windows open |
   | `frames`, `rects`, `pixels`, `present_ms` | passes that presented, rectangles presented, the sum of their areas (clipped to the screen; an overlap counted in each, so what `present` set out to copy, not a count of pixels written), time spent copying |
   | `pointer_read`, `pointer_newest`, `keys_read`, `keys_newest` | the compositor's `Reader::after` on each ring, and the ring's `newest()` |
@@ -3158,8 +3161,8 @@ until a crash.
   (`lumen_wm::Wm`), the open windows, the gathered damage, the
   statistics, the counts of closed windows' queues, the commits under
   way, whether the start completed, the compositor's view of the cut and
-  its readers' places, the screen handed over for a resume, and the
-  request slot (#154 adds the wallpaper). The live one is in
+  its readers' places, the screen handed over for a resume, the request
+  slot, and the wallpaper (#154). The live one is in
   `COMPOSITOR`, a static private to the module, and `desktop::Desktop`
   names where one lives (`Desktop::LIVE`, or a test's own). Windows open
   only once the start completed (`OpenError::NoDesktop` until then), so a
@@ -3168,9 +3171,11 @@ until a crash.
   screen, for the ktests (`desktop::opening_past_the_window_limit_fails`,
   `desktop::a_closed_window_s_deliveries_count_as_dead_pushes`,
   `desktop::a_second_request_is_refused_while_the_first_waits`,
-  `desktop::a_request_queued_when_the_desktop_pauses_is_answered_paused`;
-  #154 adds `desktop::a_bad_wallpaper_falls_back_with_one_warning`), so no
-  ktest leaves a desktop running.
+  `desktop::a_request_queued_when_the_desktop_pauses_is_answered_paused`,
+  `desktop::a_bad_wallpaper_falls_back_with_one_warning`,
+  `desktop::a_title_drawn_again_rasterizes_nothing`,
+  `desktop::a_theme_switch_repaints_everything_and_tells_each_window`), so
+  no ktest leaves a desktop running.
 - **Two surfaces per window**, each of its client size: the *owner's*,
   inside the handle (`surface_mut(&mut self)`), drawn with no lock at the
   owner's pace; and the *committed* one, behind the window's lock, which
@@ -3203,8 +3208,19 @@ the window's idle bit while it blocks on an idle queue) return
 enum until #156 gives it variants, so no request can be queued yet): `Key(KeyEvent)`, `PointerDown`, `PointerMove`,
 `PointerUp` (client coordinates and the buttons held), `FocusGained`,
 `FocusLost`, `Lost` (events for this window were dropped), `Close` (the
-close box, or `ui invoke <root> close`) and `Request` (an automation
-request, #156).
+close box, or `ui invoke <root> close`), `Request` (an automation
+request, #156) and `Theme(&'static Theme)` (#154: the desktop's theme
+changed; the owner redraws its client area in `desktop::theme()`'s
+colours).
+
+- **A theme switch reaches every owner.** It isn't a queue entry or a
+  flag: each window keeps the count of switches its owner has been told
+  of, and `next_event` returns `Theme` first (before anything queued)
+  while that count is behind the desktop's, which `wait_event` wakes for
+  too. So it is never dropped, and several switches before the owner
+  reads give one `Theme` (the current one). A window's count is behind
+  until its owner reads it, and `settled` needs every window's count
+  current: a test after `theme` waits for the owners' redraws too.
 
 - **Sticky flags beside the queue.** `Lost`, `Close`, a focus loss and a
   focus gain are flags beside the queue (`set_lost`, `request_close`,
@@ -3479,12 +3495,37 @@ A host-tested `no_std` crate every desktop part draws with. Pixels are
   `lumen_gfx::Mask::new(width, height, coverage)`; if that returns `None`
   (the sizes disagree, a bug), the line isn't drawn and one `WARN` says so;
   nothing panics. The terminals keep the bitmap font.
-- **Wallpaper** (#154): a PNG decoded once with `zune-png` in `lumen-png`
-  (an error for a bad or truncated file, never a panic); if it doesn't
-  decode, the desktop uses a flat colour and logs `WARN desktop: wallpaper
-  not shown: <reason>` once.
-- **Themes** (#154): `theme light|dark` and `lumen.theme=`; switching
-  repaints everything once.
+- **Text on the desktop** (#154): the compositor owns a `Font<'static>`
+  for the titles (15 pixels), and each demo window's owner its own (16
+  pixels, the Welcome window's heading 24). Each glyph's `Placed` mask goes
+  through `Mask::new` and `blend_mask_in` with the clip it is drawn in
+  (titles: the damaged rectangle being recomposed, once each), so no
+  line mask is allocated; a mask `Mask::new` refuses (a bug) isn't drawn,
+  with one `WARN` a boot. Redrawing a title rasterizes nothing (its
+  glyphs are cached: `desktop::a_title_drawn_again_rasterizes_nothing`). If
+  the UI font doesn't load, one `WARN` says so and no text is drawn.
+- **Wallpaper** (#154): `assets/wallpaper/lumen.png` (1280x800, about 150
+  KB, original: `tools/wallpaper.py` makes it), embedded in the kernel and
+  decoded once, when the desktop first starts, before the back buffer is
+  allocated (said at INFO with its size and the time it took), by
+  `lumen_png::decode` over `zune-png` (`=0.5.2`, without its `std` and
+  `sse` features; strict mode, every chunk's CRC checked): any PNG into
+  `0x00RRGGBB` pixels, alpha dropped and 16-bit samples cut to their top 8
+  bits; not a PNG, cut short, corrupt or bigger than the screen is an
+  error, never a panic (host-tested: every truncation and every flipped
+  byte of a small file). It is drawn centred (the theme's `desktop`
+  colour around it if it is smaller); if it doesn't decode, the desktop
+  uses that colour and logs `WARN desktop: wallpaper not shown: <reason>`
+  once. One wallpaper for both themes.
+- **Themes** (#154): `lumen-wm`'s `Theme::LIGHT` and `Theme::DARK`. `theme`
+  prints the current one (`theme: light`); `theme light|dark` switches
+  (`theme: dark`, or `theme: dark (already)`; another name is refused),
+  before the desktop starts too (it starts in that theme), and
+  `lumen.theme=` picks one at boot. A switch, under `COMPOSITOR`, changes
+  the theme and its count and damages the whole screen (one full repaint,
+  frames and wallpaper); each window's owner is then told (`Theme`, above)
+  and redraws. `desktop status` shows it (`theme`). `desktop::theme()` is
+  what owners draw with.
 
 ### Terminal windows (#155)
 
