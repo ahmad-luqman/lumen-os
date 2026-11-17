@@ -347,7 +347,7 @@ crate::ktest!(
             ("clear | count", "clear: escape codes don't go into a pipeline\n"),
             ("reboot | count", "reboot: not in a pipeline\n"),
             ("shutdown | count", "shutdown: not in a pipeline\n"),
-            ("term nope | count", "usage: term [text]\n"),
+            ("term nope | count", "usage: term [text [window]]\n"),
         ];
         for (line, want) in cases {
             let (text, ..) = run_line(line, &[]);

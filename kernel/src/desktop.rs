@@ -190,9 +190,11 @@ pub struct Window {
     /// outside the lock, stored under it after every change, so the
     /// owner's wake-up check reads it without the lock.
     queued: AtomicBool,
-    /// Set while the owner waits in [`WindowHandle::wait_event`] (an atomic
-    /// outside the lock).
+    /// Set while the owner waits in [`WindowHandle::wait_event`] or
+    /// [`WindowHandle::wait_event_until`] (an atomic outside the lock).
     idle: AtomicBool,
+    /// Set by a [`Waker`]: the owner's wait ends (output to draw, #155).
+    poked: AtomicBool,
     /// Its owner waits here.
     events: WaitQueue,
     /// `desktop hold`: a `desktop spin` window's owner stops reading its
@@ -649,6 +651,7 @@ impl Desktop {
                 inner: SpinLock::new(WindowInner { committed, queue: Queue::new(), owner }),
                 queued: AtomicBool::new(false),
                 idle: AtomicBool::new(false),
+                poked: AtomicBool::new(false),
                 events: WaitQueue::new(),
                 held: AtomicBool::new(false),
                 spin,
@@ -668,6 +671,30 @@ impl Desktop {
 #[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "its first callers are #155-#157's windows"))]
 pub fn open_window(title: &str, width: u32, height: u32) -> Result<WindowHandle, OpenError> {
     Desktop::LIVE.open_window(title, width, height)
+}
+
+/// [`open_window`] with its frame's corner at (`x`, `y`) (clamped like a
+/// move, so a strip of its title bar stays on the screen): terminal windows
+/// (#155) side by side.
+pub fn open_window_at(title: &str, width: u32, height: u32, x: i32, y: i32) -> Result<WindowHandle, OpenError> {
+    Desktop::LIVE.open(title, width, height, Some((x, y)), false)
+}
+
+/// Ends a window owner's wait ([`WindowHandle::wait_event_until`]) from
+/// another thread, with no event: a terminal window's shell has output for
+/// its owner to draw (#155). Cloned freely; waking a closed window does
+/// nothing. It keeps the window's shared part (and its committed surface)
+/// alive until the last one goes.
+#[derive(Clone)]
+pub struct Waker(Arc<Window>);
+
+impl Waker {
+    /// End the owner's wait (or the next one, if it isn't waiting). Takes
+    /// only the window's wait queue's lock: call it holding no desktop lock.
+    pub fn wake(&self) {
+        self.0.poked.store(true, Ordering::Release);
+        self.0.events.wake_all();
+    }
 }
 
 /// The bands of at most [`BAND`] rows `r` is copied in, top to bottom (one
@@ -742,14 +769,45 @@ impl WindowHandle {
     /// meanwhile: `desktop status`'s `settled`).
     pub fn wait_event(&mut self) -> WindowEvent {
         loop {
-            if let Some(e) = self.next_event() {
+            if let Some(e) = self.wait_event_until(None) {
                 return e;
             }
-            self.win.idle.store(true, Ordering::Release);
-            let win = &self.win;
-            win.events.wait_until(|| win.queued.load(Ordering::Acquire));
-            self.win.idle.store(false, Ordering::Release);
         }
+    }
+
+    /// The next event, waiting for one until `deadline` (`time::now_ns`;
+    /// `None`: no deadline) or until a [`Waker`] of this window wakes it:
+    /// `None` then (and at once if one woke it since the last wait). The
+    /// window counts as idle while it waits, as in [`Self::wait_event`]: a
+    /// terminal window's owner waits here for keys, its shell's output and
+    /// its cursor's next blink (#155).
+    pub fn wait_event_until(&mut self, deadline: Option<u64>) -> Option<WindowEvent> {
+        if let Some(e) = self.next_event() {
+            return Some(e);
+        }
+        if self.win.poked.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        self.win.idle.store(true, Ordering::Release);
+        let win = &self.win;
+        let ready = || win.queued.load(Ordering::Acquire) || win.poked.load(Ordering::Acquire);
+        match deadline {
+            None => win.events.wait_until(ready),
+            Some(d) => {
+                let _ = win.events.wait_until_or_deadline(d, ready);
+            }
+        }
+        self.win.idle.store(false, Ordering::Release);
+        let e = self.next_event();
+        if e.is_none() {
+            self.win.poked.store(false, Ordering::Release);
+        }
+        e
+    }
+
+    /// A [`Waker`] for this window's owner.
+    pub fn waker(&self) -> Waker {
+        Waker(self.win.clone())
     }
 
     /// Whether `desktop hold` holds this window (a `desktop spin` one).
@@ -2348,6 +2406,53 @@ crate::ktest!(
         kassert!(capture_answer(Err(JobError::Paused)).is_none());
         kassert!(matches!(capture_answer(Ok(Answer::WrongSize)), Some(Err(_))));
         kassert!(matches!(capture_answer(Err(JobError::Busy)), Some(Err(_))));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn wait_event_until_ends_at_its_deadline_or_a_wake() {
+        // A terminal window's owner (#155) waits for events, its shell's
+        // output (a `Waker`) and its cursor's next blink (a deadline): the
+        // deadline passing ends the wait with no event; a wake from another
+        // thread ends it at once (the window idle while it waited), and so
+        // does one made before the wait; an event queued is returned.
+        use crate::{kassert, kassert_eq};
+        let d = Desktop::without_screen();
+        let mut h = d.open_window("w", 16, 16).map_err(|_| "a window")?;
+        while h.next_event().is_some() {}
+        let start = crate::time::now_ns();
+        kassert!(h.wait_event_until(Some(start + 20_000_000)).is_none());
+        kassert!(crate::time::now_ns() >= start + 20_000_000);
+        let waker = h.waker();
+        waker.wake();
+        let start = crate::time::now_ns();
+        kassert!(h.wait_event_until(Some(start + 5_000_000_000)).is_none());
+        kassert!(crate::time::now_ns() < start + 1_000_000_000);
+        let saw_idle = Arc::new(AtomicBool::new(false));
+        let (w, seen) = (waker.clone(), saw_idle.clone());
+        let t = crate::sched::spawn("ktest-waker", move || {
+            let _ = crate::sched::sleep(10_000_000);
+            seen.store(w.0.idle.load(Ordering::Acquire), Ordering::Release);
+            w.wake();
+        })
+        .map_err(|_| "spawn failed")?;
+        let start = crate::time::now_ns();
+        kassert!(h.wait_event_until(Some(start + 5_000_000_000)).is_none());
+        kassert!(crate::time::now_ns() < start + 1_000_000_000);
+        crate::sched::join_bounded(t)?;
+        kassert!(saw_idle.load(Ordering::Acquire));
+        kassert!(!h.win.idle.load(Ordering::Acquire));
+        {
+            let mut g = d.home.lock();
+            let s = g.as_mut().ok_or("the state")?;
+            let id = s.wm.id(h.id()).ok_or("its id")?;
+            let mut after = After::default();
+            let _ = s.push(id, &mut after, |q| Some(q.push(Entry::Key(test_key()))));
+        }
+        let got = h.wait_event_until(Some(crate::time::now_ns() + 5_000_000_000));
+        kassert!(matches!(got, Some(WindowEvent::Key(_))));
+        kassert_eq!(h.next_event().is_none(), true);
         Ok(())
     }
 );

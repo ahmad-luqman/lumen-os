@@ -59,6 +59,7 @@ mod sound;
 mod symbols;
 mod sync;
 mod term;
+mod termwin;
 mod time;
 mod trace;
 mod virtio;

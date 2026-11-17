@@ -60,9 +60,16 @@ pub static COMMANDS: Table<Run> = Table(&[
     Command {
         name: "term",
         args: &[&["text"]],
-        usage: "[text]",
-        about: "the shown terminal: size, cursor, scrollback (text: its rows)",
+        usage: "[text [window]]",
+        about: "the shown terminal: size, cursor, scrollback (text: its rows, or a terminal window's)",
         run: term,
+    },
+    Command {
+        name: "terminal",
+        args: &[],
+        usage: "",
+        about: "open a terminal window on the desktop (its own shell)",
+        run: terminal,
     },
     Command { name: "clear", args: &[], usage: "", about: "clear the screen and its scrollback", run: clear },
     Command {
@@ -489,18 +496,43 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
             };
         }
         [arg] if arg == "text" => match crate::term::view_text() {
-            Some(view) => {
-                for row in &view.rows {
-                    let _ = writeln!(out, "|{row}");
-                }
-                let _ = match view.cursor {
-                    Some(c) => writeln!(out, "term text: {} rows, cursor ({}, {})", view.rows.len(), c.col, c.row),
-                    None => writeln!(out, "term text: {} rows, cursor below the view", view.rows.len()),
-                };
-            }
+            Some(view) => write_view(out, &view),
             None => ctx.fail(NONE),
         },
-        _ => ctx.fail("usage: term [text]"),
+        [arg, id] if arg == "text" => {
+            match id.parse().map_err(|_| String::from(TERM_USAGE)).and_then(crate::termwin::view_text) {
+                Ok(view) => write_view(out, &view),
+                Err(e) => ctx.fail(format_args!("term text: {e}")),
+            }
+        }
+        _ => ctx.fail(TERM_USAGE),
+    }
+}
+
+const TERM_USAGE: &str = "usage: term [text [window]]";
+
+/// `term text`'s rows, each after a `|`, then its summary line (parsed by
+/// tools/harness/lumen_harness/screen.py: change them together).
+fn write_view(out: &mut dyn super::Console, view: &crate::term::ViewText) {
+    for row in &view.rows {
+        let _ = writeln!(out, "|{row}");
+    }
+    let _ = match view.cursor {
+        Some(c) => writeln!(out, "term text: {} rows, cursor ({}, {})", view.rows.len(), c.col, c.row),
+        None => writeln!(out, "term text: {} rows, cursor below the view", view.rows.len()),
+    };
+}
+
+/// `terminal`: open a terminal window (#155).
+fn terminal(ctx: &mut Ctx<'_>, args: &[String]) {
+    if !args.is_empty() {
+        return ctx.fail("usage: terminal");
+    }
+    match crate::termwin::open() {
+        Ok(id) => {
+            let _ = writeln!(ctx.out, "terminal: window {id}");
+        }
+        Err(e) => ctx.fail(format_args!("terminal: {e}")),
     }
 }
 

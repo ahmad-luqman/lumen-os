@@ -75,9 +75,14 @@ pub struct Ctx<'a> {
 impl<'a> Ctx<'a> {
     /// A context for running commands on `out`: each run gets its own
     /// canvas owner, on `out`'s virtual terminal if it is one (its canvas
-    /// brings that terminal to the front).
+    /// brings that terminal to the front), or in its terminal window (no
+    /// canvas then: `term::CanvasError::InWindow`).
     pub fn new(out: &'a mut dyn Console, ansi: bool, history: &'a History) -> Ctx<'a> {
-        let owner = out.vt().map_or_else(term::Owner::new, term::Owner::on_vt);
+        let owner = match (out.vt(), out.window()) {
+            (_, Some(_)) => term::Owner::in_window(),
+            (Some(vt), None) => term::Owner::on_vt(vt),
+            (None, None) => term::Owner::new(),
+        };
         Ctx { out, ansi, history, owner }
     }
 
@@ -150,6 +155,17 @@ pub trait Console: Write + Send {
     /// brings it to the front).
     fn vt(&self) -> Option<usize> {
         None
+    }
+    /// The desktop window it is, if it is one (a terminal window, #155: its
+    /// commands get no canvas).
+    fn window(&self) -> Option<u32> {
+        None
+    }
+    /// Whether it has gone (its window closed): the shell on it ends after
+    /// the key or command under way. Until then, a console that closes
+    /// gives Ctrl-C for every key asked, so a command waiting for one ends.
+    fn closed(&self) -> bool {
+        false
     }
     /// Whether what is written goes to the next command in a pipeline.
     /// (A console overrides both this and [`Console::fail`], or neither.)
@@ -367,17 +383,33 @@ fn max_line(cols: usize) -> usize {
     MAX_LINE.min(cols.saturating_sub(PROMPT.len() + 3))
 }
 
-/// A shell's loop: a line, its command, again. What the editor writes for a
-/// key goes to the console in one write (on the screen: drawn whole, without
-/// a log line in the middle of a redraw).
-fn run_on(mut console: impl Console, mut editor: Editor) -> ! {
+/// A shell's loop on a console that never closes (serial, a virtual
+/// terminal).
+fn run_on(console: impl Console, editor: Editor) -> ! {
+    run_lines(console, editor);
+    unreachable!("a console that never closes closed");
+}
+
+/// A shell in a terminal window (#155) `cols` columns wide, with the
+/// screen shells' editing, until its console closes ([`Console::closed`]).
+pub fn run_in_window(console: impl Console, cols: usize) {
+    run_lines(console, Editor::new(PROMPT, Mode::Ansi, max_line(cols), HISTORY));
+}
+
+/// A shell's loop: a line, its command, again, until the console closes.
+/// What the editor writes for a key goes to the console in one write (on
+/// the screen: drawn whole, without a log line in the middle of a redraw).
+fn run_lines(mut console: impl Console, mut editor: Editor) {
     let ansi = editor.mode() == Mode::Ansi;
     let mut shown = String::new();
-    loop {
+    while !console.closed() {
         let _ = editor.start(&mut shown);
         flush(&mut console, &mut shown);
         let line = loop {
             let key = console.read_key();
+            if console.closed() {
+                return;
+            }
             let event = editor.key(key, &commands::COMMANDS, &mut shown);
             flush(&mut console, &mut shown);
             match event {
