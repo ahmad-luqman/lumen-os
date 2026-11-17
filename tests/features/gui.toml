@@ -91,3 +91,22 @@ tests = [
     "scenario:test_gui::test_a_screenshot_queued_as_the_desktop_pauses_reads_the_text_screen",
     "ktest:lumen_kernel::desktop::a_request_queued_when_the_desktop_pauses_is_answered_paused",
 ]
+
+[[feature]]
+name = "Toolkit (lumen-ui) with the automation tree (#156): a retained widget tree (stacks, labels, buttons, checkboxes, text fields, lists) laid out at preferred sizes, hit tested (list rows too), the primary button's press and release (only where it went down and came up; a forgotten press does nothing), keys to the focused widget and Tab to move the focus, painted through a text trait (the UI font in the kernel); every widget an automation node made from the widget itself: ids from one counter, never reused and stable across changes and repaints; each role's value kind, actions and the flags it may carry (the table in ARCHITECTURE section 11), a list's selection deciding its items' flags; `ui invoke` runs the handler a click reaches, so invoking and clicking give the same state, and its errors (no such node, an action the role doesn't list, a disabled node, wrong arguments) change nothing; the reply slot: answered in time, cancelled at its deadline and then skipped by the owner (the state unchanged), taken then answered late, still running, answered \"window closed\" when its window closes or it is dropped unanswered; in the kernel the toolkit text measures what it draws; refused and drained requests are handed back by the window's queue (never dropped under its lock); on the desktop, `desktop counter` opens the Counter app, `ui tree [window]` lists every window's root and its widgets as records (`where role = button` finds Add, Reset and Quit, inside the window on the screen), `ui invoke <Add> press` answers Add's row and the count shows 1 in the tree and on the screen (golden), a real click on Add then gives 2; a window's root takes `focus` and `close` (closing through its owner), after which its nodes name nothing; Quit's handler closes its own window (\"ran; window <id> closed\"); a held window's request is cancelled at its 1 s deadline (counted in `desktop status`) and skipped once released, and with its queue full a request is refused as busy"
+milestone = "M4"
+tests = [
+    "cargo:lumen-ui",
+    "cargo:lumen-wm",
+    "harness:test_ui_tree::*",
+    "scenario:test_gui::test_automation_tree_lists_buttons",
+    "scenario:test_gui::test_invoke_press_changes_state",
+    "scenario:test_gui::test_invoke_on_a_closed_window_fails",
+    "scenario:test_gui::test_invoke_quit_closes_its_window",
+    "scenario:test_gui::test_a_window_behind_drops_and_says_busy",
+    "ktest:lumen_kernel::ui::a_request_dropped_unanswered_answers_window_closed",
+    "ktest:lumen_kernel::ui::the_toolkit_text_measures_what_it_draws",
+    "ktest:lumen_kernel::desktop::settled_needs_every_one_of_its_conditions",
+    "ktest:lumen_kernel::shell::sysinfo::every_record_table_fits_its_columns",
+    "ktest:lumen_kernel::shell::pipe::records_come_from_commands_given_no_arguments",
+]
