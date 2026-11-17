@@ -54,8 +54,10 @@ fn paint(dx: usize, dy: usize) -> Paint {
 /// Paint the arrow with its tip at `tip` into `pixels`, a `size.0` x
 /// `size.1` buffer whose rows are `stride` pixels apart: its outline in
 /// `outline`, its fill in `fill`, its clear pixels left as they are.
-/// Clipped to `size` (and to `pixels`: a buffer too short for `size` and
-/// `stride` loses the rows past its end, never panics). Draw-only: nothing
+/// Clipped to `size` and to `stride` (a stride narrower than `size.0`
+/// clips at the stride, never wrapping into the next row), and to
+/// `pixels` (a buffer too short for them loses the rows past its end,
+/// never panics). Draw-only: nothing
 /// is read or kept, unlike [`Cursor::show`]. The desktop's compositor
 /// (#153) copies its back buffer's pixels under the arrow's box into a
 /// small array, paints the arrow there and copies the array to the screen;
@@ -68,7 +70,9 @@ pub fn draw_arrow(
     outline: u32,
     fill: u32,
 ) {
-    let (w, h) = clipped(tip.0, tip.1, size.0, size.1);
+    // No wider than a row: a stride narrower than `size.0` would carry
+    // the arrow into the next row.
+    let (w, h) = clipped(tip.0, tip.1, size.0.min(stride), size.1);
     for dy in 0..h {
         for dx in 0..w {
             let value = match paint(dx, dy) {
@@ -390,5 +394,25 @@ mod tests {
         draw_arrow(&mut short, stride, (stride, 10), (0, 0), OUT, FILL);
         assert_eq!(short[0], OUT);
         assert_eq!(short[2 * stride], OUT, "row 2 starts with the outline");
+    }
+
+    #[test]
+    fn draw_arrow_never_wraps_past_a_narrow_stride() {
+        // A stride of 4 with a size 11 wide: the arrow is clipped at
+        // column 4 of each row, so row 0 holds only its tip (row 1 isn't
+        // painted from row 0's overflow), and every painted pixel is the
+        // arrow's at that place.
+        let stride = 4;
+        let mut px = vec![0u32; stride * SPRITE_H];
+        draw_arrow(&mut px, stride, (SPRITE_W, SPRITE_H), (0, 0), OUT, FILL);
+        for (i, &v) in px.iter().enumerate() {
+            let (x, y) = (i % stride, i / stride);
+            let want = match paint(x, y) {
+                Paint::Outline => OUT,
+                Paint::Fill => FILL,
+                Paint::Clear => 0,
+            };
+            assert_eq!(v, want, "({x}, {y})");
+        }
     }
 }
