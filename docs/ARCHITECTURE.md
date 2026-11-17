@@ -3219,8 +3219,8 @@ unanswered). `WindowEvent` derives `Debug` only (owners match it with
   once the queue is dead), `desktop::push_request` does the same for a
   window no longer on the list, and `EventQueue::kill` returns the
   requests still queued; each is answered once the locks are released
-  (the asker prints "busy" or "no node", `WindowHandle`'s drop answers
-  "window closed").
+  (the asker prints "busy" or "window <id> closed", `WindowHandle`'s drop
+  answers "window closed").
 
 - **Sticky flags beside the queue.** `Lost`, `Close`, a focus loss and a
   focus gain are flags beside the queue (`set_lost`, `request_close`,
@@ -3396,9 +3396,10 @@ from what they compare.
 | Lock | Holds | Held for |
 |---|---|---|
 | `desktop::COMPOSITOR` | the window list (`lumen-wm`), the gathered damage, the requests, the statistics | a few list operations, a snapshot |
-| a window's lock | its committed surface, its event queue, its flags | 16 rows of a commit or a blit, one queue operation |
+| a window's lock | its committed surface, its event queue, its flags, its toolkit's published tree | 16 rows of a commit or a blit, one queue operation, swapping in a tree |
+| a `ui invoke` reply's lock (`ui::ReplyCell`, #156) | the reply's state | one transition (a leaf: taken under its wait queue's lock by the asker's wake-up check, and never held across a wake) |
 | `vt::CUT` | the cut | a read or a write (a leaf) |
-| `desktop::DONE`'s wait-queue lock | the threads waiting for an answer or for the compositor to catch up | a wake, or a wait's predicate, which takes `COMPOSITOR` (so this lock comes before it, and no wake is made holding `COMPOSITOR`) |
+| `desktop::DONE`'s wait-queue lock | the threads waiting for an answer, for the compositor to catch up, or for a window `ui invoke <root> close` closes (`close_window`) | a wake, or a wait's predicate, which takes `COMPOSITOR` (so this lock comes before it, and no wake is made holding `COMPOSITOR`) |
 | `term`'s screen lock | the terminals; and each row the compositor presents | one row of a present: at most 800 holds for a full present |
 
 - **Order:** `COMPOSITOR`, then a window's lock, then the heap's locks
@@ -3536,7 +3537,8 @@ pub enum ActionKind { Press, SetValue, Select, Focus, Close, Minimize, Restore }
 impl Role { pub fn actions(self) -> &'static [ActionKind]; }
 ```
 
-- **`lumen_ui::NodeId` is global** (always written qualified: the VFS's
+- **`lumen_ui::NodeId` is global** (always written qualified, the kernel's
+  `desktop.rs` included: the VFS's
   `NodeId`, section 9, is another type). `NodeId::fresh()` is one counter
   for the whole system and an id is never reused in a boot. Lookups go by
   the raw number (`NodeId::get()`): `ui invoke 12 press` looks up 12, and
@@ -3558,10 +3560,10 @@ impl Role { pub fn actions(self) -> &'static [ActionKind]; }
   | `label` | `Text` | none | `disabled` | |
   | `button` | none | `press`, `focus` | `focused`, `disabled` | the owner |
   | `checkbox` | `Checked` | `press` (toggles), `focus` | `focused`, `disabled` | the owner |
-  | `textfield` | `Text` | `set_value <text>`, `focus` | `focused`, `disabled` | the owner |
+  | `textfield` | `Text` | `set_value <text>` (replaces the text, as one edit, not keystrokes), `focus` | `focused`, `disabled` | the owner |
   | `list` | `Selected` | `focus` | `focused`, `disabled` | the owner |
   | `listitem` | none | `select`, `press` | `selected`, `disabled` | the owner |
-  | `menu` | none | `press` | `focused`, `disabled`, `expanded` | the owner |
+  | `menu` | none | `press`, `focus` | `focused`, `disabled`, `expanded` | the owner |
   | `menuitem` | none | `press` | `disabled` | the owner |
 
   Values print as the text, `checked`/`unchecked`, or the index (`-` for
@@ -3569,25 +3571,40 @@ impl Role { pub fn actions(self) -> &'static [ActionKind]; }
   focused widget inside it.
 - **Same path as a click:** an action runs the handler a real click or
   key reaches after hit testing, on the owner's thread (`cargo:lumen-ui`
-  checks `press` and a click give the same state). Errors change nothing:
-  a node that doesn't exist (or whose window closed), an action its role
-  doesn't list, a `disabled` node, wrong arguments, and "window <id> busy"
-  (its queue is full).
-- **A request is a reply slot** (`lumen_ui::Reply`), written once: from
-  `Pending` to `Running` (the owner, by compare-and-swap, when it takes
-  the request) or `Cancelled` (the asker, by compare-and-swap, at its 1 s
-  deadline), and from `Running` to `Done(result)`; each write wakes the
-  asker. The owner skips a cancelled request (`cancelled`). If the asker's
+  checks `press` and a click give the same state, and that every action a
+  widget's role lists reaches a handler). Errors change nothing. The
+  asker's own come first: no desktop, a node that doesn't exist (or whose
+  window closed), wrong arguments (`set_value` takes one, the others
+  none), an action a window's root doesn't take, "window <id> busy" (its
+  queue is full) and "window <id> closed". The owner's: an action its
+  role doesn't list, a `disabled` node, and a node it no longer has. An
+  action that ran and then lost its node answers that it ran (`ran; node
+  <n> is gone`), so a retry never acts twice.
+- **Publish before answering:** a toolkit window's owner hands each event
+  to its tree, then (if anything changed) repaints, commits and publishes
+  the tree, and only then answers a request (`ui::Toolkit::step`). So once
+  `ui invoke` returns, `ui tree` shows its effect, and a window its action
+  closed is gone (the request is answered after the handle is dropped).
+- **A request is a reply slot** (`lumen_ui::Reply`, its state private),
+  each transition made once and checked, under the reply's lock, against
+  the state it starts from: `Pending` to `Running` (the owner, when it
+  takes the request: `ui::Request::start` gives a `Started`, the only
+  thing that can answer it) or `Cancelled` (the asker, at its 1 s
+  deadline); `Running` to `Done(result)`; `Done` to `Taken` (the asker
+  takes it). Each answer (`Done`) wakes the asker. The owner skips a
+  cancelled request (`cancelled`). If the asker's
   swap fails because the owner already runs it, the asker waits a second
   1 s: a result then is printed as "ran late" with the row (`late`
-  counts it), and none gives "still running". Destroying the window
-  answers its `Pending` requests with "window closed"; a request dropped
-  unanswered answers itself the same way in its `Drop`; an action that
+  counts it), and none gives "still running" (its answer, if it comes,
+  lands for nobody: not counted). Destroying the window answers its
+  `Pending` requests with "window closed"; a request dropped before it ran
+  answers itself the same way in its `Drop`, and a `Started` dropped
+  unanswered answers "dropped while running" (a bug); an action that
   closed its own window (a Quit button) answers "ran; window <id>
   closed". So `ui invoke` always ends, and a retry after "cancelled"
   can't press twice. The harness's `invoke(m, node, action)` (`gui.py`,
-  #156) retries a cancelled request and takes "ran late" with its row as
-  success. `cargo:lumen-ui` checks that a request cancelled at its
+  #156) retries a cancelled request (counting the retries) and takes "ran
+  late" with its row, or with its message, as done. `cargo:lumen-ui` checks that a request cancelled at its
   deadline and then reached by the owner leaves the state unchanged.
 - **Reading the tree:** a toolkit window publishes a snapshot of its tree
   after each change (`WindowHandle::publish`: built, then swapped in under
@@ -3598,16 +3615,26 @@ impl Role { pub fn actions(self) -> &'static [ActionKind]; }
   cache per owner thread), the palette from the desktop's theme, painting,
   committing and publishing after a change, and the window's events handed
   to the tree (the left button's press and release, key presses, focus;
-  `FocusLost` and `Lost` cancel an armed press); `ui::serve` runs a
-  request: `Reply::start` (a cancelled one is skipped), `Ui::invoke`, the
-  app's handling of what it reported, then the node's row (laid out
-  again) or the error. `lumen_ui::Reply` is the state machine; the kernel
-  keeps it behind a lock with the asker's wait queue. The harness's
-  `ui_tree`, `node`, `wait_ui`, `invoke` and `parse_invoke` are in
-  `gui.py`.
+  `FocusLost` and `Lost` cancel an armed press). `ui::Toolkit<A:
+  lumen_ui::App>` is one step per event (above, "Publish before
+  answering"); `lumen_ui::serve` runs a request on the app (`Ui::invoke`,
+  the app's handling of what it reported, then the node's row, laid out
+  again, the error, "ran; node gone" or "closed its window"), the same
+  code the host tests run. `lumen_ui::Reply` is the state machine; the
+  kernel keeps it behind a lock with the asker's wait queue
+  (`ui::ReplyCell`). The palette comes from the desktop's theme
+  (`ui::palette(&Theme)`). The harness's `ui_tree`, `node`, `wait_ui`,
+  `invoke`, `parse_invoke` and `desktop_counter` are in `gui.py`.
 
 **The commands** print records, so the pipelines work on them (`where`
-compares with `=`):
+compares with `=`). **Records quote** (every records command, from the
+shared printer, `lumen_shell::pipe::quoted`): a text cell that is empty,
+contains whitespace, or is exactly `-` prints double-quoted (`"` and `\`
+escaped by a backslash), as the shell's word splitting reads it back, so
+each row splits into its cells (the harness's `parse_records` uses
+`shlex`) and `where name = "File name"` works; a bare `-` is always an
+absent value. `cpus`' "not started", `lspci`'s names and drivers and
+`irqs`' MSI-X uses print quoted for this.
 
 - `windows`, one row per window, front to back:
 
@@ -3631,7 +3658,7 @@ compares with `=`):
   | `id`, `window`, `depth` | the node, its window, 0 for a root |
   | `role`, `name`, `value` | as above (`-` without a value) |
   | `state` | the set flags joined by `,` (`-` for none) |
-  | `actions` | joined by `,` |
+  | `actions` | joined by `,` (`-` for none) |
   | `x`, `y`, `w`, `h` | its bounds in screen pixels |
 
   So `ui tree | where role = button` lists the buttons, and the bounds let
@@ -3641,15 +3668,21 @@ compares with `=`):
   it answers (`focus`, `minimize`, `restore`). A successful `close` prints
   `ui invoke: window <id> closed` (it succeeds only once the window is
   destroyed; an owner that keeps it open gives "window <id> still open" at
-  the deadline). On an error it prints why. Its other lines: `ui invoke:
-  ran late` above the row; `ui invoke: ran; window <id> closed`; `ui
-  invoke: window <id> busy`; `ui invoke: no node <n>` (none, or its
-  window closed); `ui invoke: cancelled: window <id> didn't take it in 1
-  s (try again)`; `ui invoke: still running (window <id>)`; `ui invoke:
-  window <id> closed before it ran`; and the owner's errors (`ui invoke:
-  a label doesn't take press`, `the node is disabled`, `wrong arguments
-  ...`). `ui tree <window>` with no such window says `ui tree: no window
-  <n>`, and without a desktop `ui tree: no desktop`.
+  the deadline: `ui invoke: window <id> still open (its close is still
+  queued)`, since the owner reads it when it can and the window closes
+  then). On an error it prints why. Its other lines: `ui invoke: ran late`
+  above the row or message; `ui invoke: ran; window <id> closed`; `ui
+  invoke: ran; node <n> is gone`; `ui invoke: window <id> busy (try
+  again)`; `ui invoke: window <id> closed` (a widget's window closed as
+  it was asked); `ui invoke: no node <n>` (none, or its window closed,
+  from the asker or the owner); `ui invoke: no desktop`; `ui invoke:
+  cancelled: window <id> didn't take it in 1 s (try again)`; `ui invoke:
+  still running (window <id>)`; `ui invoke: window <id> closed before it
+  ran`; `ui invoke: dropped while running (window <id>): a bug`; and the
+  owner's other errors (`ui invoke: a label doesn't take press`, `the
+  node is disabled`) and the asker's (`wrong arguments ...`). `ui tree
+  <window>` with no such window says `ui tree: no window <n>`, and without
+  a desktop `ui tree: no desktop`.
 - **Records with arguments:** today `sysinfo::MakeTable` is `fn() ->
   pipe::Table`, and the ktest `records_come_from_commands_given_no_arguments`
   checks that every records command, given an argument it doesn't take,

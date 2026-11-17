@@ -166,8 +166,9 @@ own PR that updates that doc first.
   demo windows, `desktop` (`status`, `check`, `spin`, `counter`, `hold`/`release`) and `windows`, and the tree's
   accessors for `ui.rs` (`tree_rows`, `find_node`, `push_request`: a refused request handed back);
   `lumen.desktop_cut_delay_ms=` widens the race at a pause for the scenarios. `ui.rs`: the toolkit in a window
-  (#156: `Toolkit`, `UiText` over `lumen-font`, `serve`), `ui invoke`'s `Request` (its reply slot, answering
-  "window closed" if dropped), Counter's owner, and `ui tree`/`ui invoke`. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
+  (#156: `Toolkit<A: lumen_ui::App>`, one step per event that publishes before it answers; `UiText` over
+  `lumen-font`), `ui invoke`'s `Request` (its reply slot; `start` gives the `Started` that answers; either
+  answers for itself if dropped), Counter's owner, and `ui tree`/`ui invoke`. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -276,8 +277,10 @@ own PR that updates that doc first.
   tests), every widget an automation node (`NodeId` from one counter,
   `Role` with its actions, value kind and flags, `Value`, `Action`,
   `StateFlags`, `AutomationNode`), `Ui::invoke` through the click's own
-  handler, `Reply` (`ui invoke`'s reply slot: pending, running,
-  cancelled, done) and `counter` (the demo app's logic) (host-tested).
+  handler, `App` and `serve` (a request run on an app, what to answer),
+  `Reply` (`ui invoke`'s reply slot, its state private: pending, running,
+  cancelled, done, taken) and `counter` (the demo app's logic)
+  (host-tested).
 - `crates/lumen-input`: pointer input: evdev events into whole-frame
   pointer states, axes scaled to the screen (`Tablet`, `AbsAxis`), the
   buttons held (`Buttons`, one bit per `Button`: the one button set the
@@ -329,7 +332,8 @@ own PR that updates that doc first.
 - `crates/lumen-shell`: shell core: word splitting with quotes (checked
   against `shlex`; commands split at `|`), the line editor (history,
   completion; ANSI and plain output), the command table (names, completion
-  words, usage and help lines), pipelines (text or records in tables, the
+  words, usage and help lines), pipelines (text or records in tables, a
+  cell that is empty, spaced or a text `-` printed quoted (`quoted`); the
   filters `grep`, `where`, `sort`, `first`, `count`, `select`), serial
   bytes to keys, a key press to the line editor's key (`Key::from_press`,
   shared by text mode and terminal windows, with #155) (host-tested).
@@ -375,7 +379,8 @@ own PR that updates that doc first.
   `confirmed_keys`/`type_confirmed` against `kbd`'s presses, bytes and
   held keys, `KEY_BYTES` the keys it models; the desktop's `windows`,
   `desktop_status`, `wait_settled`, `desktop_check`, `settled_screendump`;
-  the automation tree's `ui_tree`, `node`, `wait_ui`, `invoke`),
+  the automation tree's `ui_tree`, `node`, `wait_ui`, `invoke`,
+  `desktop_counter`; `parse_records` reads quoted cells with `shlex`),
   `screenshot.py` (`screenshot`'s frame read back and checked;
   `Machine.screenshot_via_serial`),
   `shell.py` (`run`: a serial command's output, the log's lines taken out
