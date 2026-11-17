@@ -100,6 +100,20 @@ pub enum Calibrated {
 }
 
 impl Calibrated {
+    /// The rate `w` gives against the clock known to count at `known_hz` (the
+    /// reference for the TSC, the TSC for the timer): for the TSC, an
+    /// implausible frequency or none is an error.
+    fn rate(self, w: &Window, known_hz: u64) -> Result<u64, CalError> {
+        match self {
+            Calibrated::Tsc(_) => match w.tsc_hz(known_hz) {
+                Some(hz) if lumen_time::plausible_tsc_hz(hz) => Ok(hz),
+                Some(hz) => Err(CalError::Implausible(hz)),
+                None => Err(CalError::NoCount),
+            },
+            Calibrated::Timer { .. } => w.reference_hz(known_hz).ok_or(CalError::NoCount),
+        }
+    }
+
     /// The most one window's rate can be off, in ppm of the true rate.
     fn window_bound(self, w: &Window) -> u64 {
         match self {
@@ -160,15 +174,20 @@ impl Calibration {
         self.windows.iter().filter(|w| w.is_steady()).count()
     }
 
-    /// The most its median can be off, in ppm of the true rate: the
-    /// `(N / 2 + 1)`-th smallest of its windows' bounds
-    /// ([`lumen_time::median_bound_ppm_by`]), with, for the timer, the TSC's
-    /// added.
+    /// The most its windows' median can be off, in ppm, on their own: the
+    /// `(N / 2 + 1)`-th smallest of their bounds
+    /// ([`lumen_time::median_bound_ppm`]).
+    pub fn windows_bound_ppm(&self) -> u64 {
+        lumen_time::median_bound_ppm(&self.windows, |w| self.of.window_bound(w))
+    }
+
+    /// The most its median can be off, in ppm of the true rate: its windows'
+    /// bound ([`windows_bound_ppm`](Self::windows_bound_ppm)), with, for the
+    /// timer, the TSC's added.
     pub fn median_bound_ppm(&self) -> u64 {
-        let own = lumen_time::median_bound_ppm_by(&self.windows, |w| self.of.window_bound(w));
         match self.of {
-            Calibrated::Tsc(_) => own,
-            Calibrated::Timer { tsc_ppm } => lumen_time::compose_ppm(own, tsc_ppm),
+            Calibrated::Tsc(_) => self.windows_bound_ppm(),
+            Calibrated::Timer { tsc_ppm } => lumen_time::compose_ppm(self.windows_bound_ppm(), tsc_ppm),
         }
     }
 }
@@ -221,7 +240,8 @@ pub enum CalError {
     /// It gave this implausible frequency.
     Implausible(u64),
     /// Its windows' stalls left the median with no bound under 100%: the
-    /// rate it gives says nothing ([`Verdict::Unusable`]).
+    /// rate it gives says nothing ([`Verdict::Unusable`]). Only the TSC's
+    /// calibrations give it.
     NoInformation,
     /// The PIT's counter read back values that don't fit how it was
     /// programmed.
@@ -233,9 +253,9 @@ impl fmt::Display for CalError {
         match self {
             CalError::NoCount => f.write_str("it didn't count through a window"),
             CalError::Implausible(hz) => write!(f, "it gave an implausible TSC frequency, {}", Hz(*hz)),
-            CalError::NoInformation => {
-                f.write_str("its windows were stalled as long as themselves, so the rate it gives says nothing")
-            }
+            CalError::NoInformation => f.write_str(
+                "its windows' end stalls were as long as the rest of them, so the rate it gives says nothing",
+            ),
             CalError::BadReadback(e) => write!(f, "{e}"),
         }
     }
@@ -358,46 +378,45 @@ pub fn boot_timer_calibration() -> Option<Calibration> {
     *BOOT_TIMER_CALIBRATION.lock()
 }
 
-/// The HPET, if [`init`] calibrated the TSC against it.
+/// The HPET, if it counted at [`init`] (whichever clock calibrated the TSC:
+/// [`reference`] says which).
 pub fn hpet() -> Option<HpetCounter> {
     *HPET.lock()
 }
 
-/// A TSC calibration against `reference`, counting at `reference_hz`: the
-/// median frequency of [`WINDOWS`] windows from `take`. An unsteady one is
-/// set aside and another taken after [`tsc_retake_pause`], up to [`ATTEMPTS`]
-/// in all; if attempts run out first, the ones with the smallest bounds fill
-/// the rest ([`lumen_time::steadiest_windows`], ranked by
-/// [`Window::tsc_error_ppm`]) and [`report`] judges how far off the median
-/// can be (#139: a slowed host's reads outlast every retake). An implausible
-/// frequency, or a reference that didn't count, fails.
+/// A calibration `of` a clock from up to [`ATTEMPTS`] windows from `take`,
+/// against the clock known to count at `known_hz`: the median rate of
+/// [`WINDOWS`] of them ([`median_calibration`]). An unsteady one is set aside
+/// and another taken after `pause` (given the ruler,
+/// [`lumen_time::steadiest_windows`]); if attempts run out first, the ones
+/// with the smallest bounds for that rate fill the rest, and [`report`]
+/// judges how far off the median can be (#139: a slowed host's reads
+/// outlast every retake). Ranking and building use the same `of`.
+fn calibrate(
+    of: Calibrated,
+    known_hz: u64,
+    take: impl FnMut() -> Result<Window, CalError>,
+    pause: impl FnMut(u64),
+) -> Result<Calibration, CalError> {
+    let got = lumen_time::steadiest_windows::<CalError, WINDOWS>(ATTEMPTS, take, |w| of.window_bound(w), pause)?;
+    median_calibration(&got, of, known_hz)
+}
+
+/// The TSC against `reference`, counting at `reference_hz` ([`calibrate`]),
+/// retakes spaced by [`tsc_retake_pause`].
 fn median_tsc_hz(
     reference: Reference,
     reference_hz: u64,
     take: impl FnMut() -> Result<Window, CalError>,
 ) -> Result<Calibration, CalError> {
-    median_tsc_hz_with(reference, reference_hz, take, tsc_retake_pause)
-}
-
-/// [`median_tsc_hz`] with its own wait before a retake (ktests count them),
-/// given the ruler ([`lumen_time::steadiest_windows`]'s fewest TSC ticks a
-/// window spanned).
-fn median_tsc_hz_with(
-    reference: Reference,
-    reference_hz: u64,
-    take: impl FnMut() -> Result<Window, CalError>,
-    pause: impl FnMut(u64),
-) -> Result<Calibration, CalError> {
-    let of = Calibrated::Tsc(reference);
-    let got = lumen_time::steadiest_windows::<CalError, WINDOWS>(ATTEMPTS, take, |w| of.window_bound(w), pause)?;
-    median_calibration(&got, of, reference_hz)
+    calibrate(Calibrated::Tsc(reference), reference_hz, take, tsc_retake_pause)
 }
 
 /// How many windows' worth of TSC ticks the TSC's calibration waits before a
 /// window taken again: the TSC isn't calibrated yet, but every window spans
 /// at least [`WINDOW_NS`] of the reference from its start reading, so the
-/// fewest TSC ticks any spanned (a stall only adds) is at least that long:
-/// two of them, about 20 ms, as the local APIC timer's retakes wait
+/// fewest TSC ticks any spanned (a stall only adds) is about that long: two
+/// of them, about 20 ms, as the local APIC timer's retakes wait
 /// ([`TIMER_RETRY_SPACING_NS`], where #129's loaded KVM boots showed
 /// back-to-back retakes running out inside one burst of stalls and spaced
 /// ones not).
@@ -410,8 +429,11 @@ fn tsc_retake_pause(ruler: u64) {
 }
 
 /// Busy-wait `ticks` raw TSC ticks (before the TSC is calibrated too;
-/// interrupts are off at boot).
+/// interrupts are off at boot). `u64::MAX` (no ruler yet) waits not at all.
 fn spin_ticks(ticks: u64) {
+    if ticks == u64::MAX {
+        return;
+    }
     let start = arch::rdtsc();
     while arch::rdtsc().wrapping_sub(start) < ticks {
         core::hint::spin_loop();
@@ -419,21 +441,19 @@ fn spin_ticks(ticks: u64) {
 }
 
 /// A calibration of `of` from `got`: the median of the rates its windows
-/// give against the clock known to count at `known_hz` (the reference for
-/// the TSC, the TSC for the timer), or the first error (for the TSC, an
-/// implausible frequency or none).
+/// give against the clock known to count at `known_hz` ([`Calibrated::rate`]),
+/// or the first error from a window with a bound. A window with none (a
+/// filled-in one that can't be placed) counts as 0: with fewer than half of
+/// them the median lies between bounded windows' rates whatever it is, and
+/// with more the calibration has no bound itself ([`report`]).
 fn median_calibration(got: &Steadiest<WINDOWS>, of: Calibrated, known_hz: u64) -> Result<Calibration, CalError> {
-    let rate = |w: &Window| match of {
-        Calibrated::Tsc(_) => match w.tsc_hz(known_hz) {
-            Some(hz) if lumen_time::plausible_tsc_hz(hz) => Ok(hz),
-            Some(hz) => Err(CalError::Implausible(hz)),
-            None => Err(CalError::NoCount),
-        },
-        Calibrated::Timer { .. } => w.reference_hz(known_hz).ok_or(CalError::NoCount),
-    };
     let mut hz = [0u64; WINDOWS];
     for (h, w) in hz.iter_mut().zip(got.windows()) {
-        *h = rate(w)?;
+        *h = match of.rate(w, known_hz) {
+            Ok(rate) => rate,
+            Err(_) if of.window_bound(w) >= lumen_time::NO_INFORMATION_PPM => 0,
+            Err(e) => return Err(e),
+        };
     }
     let hz = lumen_time::median(&mut hz).expect("WINDOWS samples");
     let aside = got.aside();
@@ -443,7 +463,9 @@ fn median_calibration(got: &Steadiest<WINDOWS>, of: Calibrated, known_hz: u64) -
 /// A [`Pause`] hook that stalls each window's end by `stall.end` parts per
 /// million of how long it ran, and its start (from the second window) by
 /// `stall.start` ppm of how long the previous one ran, busy, by raw TSC
-/// ticks ([`spin_ticks`]). The boot's calibrations take it from
+/// ticks ([`spin_ticks`]). A window's run counts for at most the first
+/// one's, so a stretched window doesn't stall longer (the stall stays a
+/// share of an unstretched window). The boot's calibrations take it from
 /// `lumen.stall_tsc_windows=<end ppm>[,<start ppm>]` and
 /// `lumen.stall_timer_windows=...` ([`stall_from_cmdline`]: a deliberate fault
 /// for scenarios, like the shell's `crash`), so a real boot reaches the
@@ -452,7 +474,7 @@ fn median_calibration(got: &Steadiest<WINDOWS>, of: Calibrated, known_hz: u64) -
 /// it: a start stall can.) With both 0 it does nothing (no TSC read inside a
 /// bracket).
 fn stall_window_ends(stall: Stall) -> impl FnMut(Pause) {
-    let (mut started, mut last_run) = (0u64, 0u64);
+    let (mut started, mut last_run, mut first_run) = (0u64, 0u64, None::<u64>);
     let share =
         |ticks: u64, ppm: u64| u64::try_from(u128::from(ticks) * u128::from(ppm) / 1_000_000).unwrap_or(u64::MAX);
     move |at| match at {
@@ -461,8 +483,8 @@ fn stall_window_ends(stall: Stall) -> impl FnMut(Pause) {
             started = arch::rdtsc();
         }
         Pause::EndAfterRead if stall != Stall::default() => {
-            let now = arch::rdtsc();
-            last_run = now.wrapping_sub(started);
+            let run = arch::rdtsc().wrapping_sub(started);
+            last_run = run.min(*first_run.get_or_insert(run));
             spin_ticks(share(last_run, stall.end));
         }
         _ => {}
@@ -498,8 +520,10 @@ fn stall_from_cmdline(key: &str) -> Stall {
 const MOST_HPET_STRETCH: u64 = 16;
 
 // Pinned: interrupts are off through a calibration, so its longest (20
-// windows at the cap, about 3.2 s) is part of what this allows; KVM's
-// loaded runs reached the cap (#139) and stayed steady there.
+// windows at the cap and 19 waits, about 3.6 s, as `measure` says) is part
+// of what this allows. KVM's loaded runs reached the cap before the burst
+// cap (e116d8a's, #139) and stayed steady there; since, they stretched to
+// 36 ms at most.
 const _: () = assert!(MOST_HPET_STRETCH == 16);
 
 /// The TSC's frequency against the HPET, `pause` called at each window's
@@ -567,10 +591,9 @@ fn pit_window(count: u16, pause: impl FnMut(Pause)) -> Result<Window, CalError> 
 /// interrupts off meanwhile: at least 50 ms; at most, with every window
 /// retaken, 20 windows and 19 waits of about 20 ms each, about 0.6 s against
 /// the PIT and 3.6 s against the HPET (its windows stretched to 160 ms).
-/// `None` if there is no such clock (no HPET the TSC was calibrated
-/// against), else what calibrating against it gave, a rate with no bound
-/// under 100% being [`CalError::NoInformation`]. For cross-checking the boot
-/// calibration (the shell's `clocks`, ktests).
+/// `None` if there is no such clock (no HPET that counts), else what
+/// calibrating against it gave ([`with_a_bound`]). For cross-checking the
+/// boot calibration (the shell's `clocks`, ktests).
 pub fn measure(reference: Reference) -> Option<Result<Calibration, CalError>> {
     let _off = arch::irq::push_off();
     let cal = match reference {
@@ -594,13 +617,10 @@ fn with_a_bound(cal: Calibration) -> Result<Calibration, CalError> {
 const TIMER_RETRY_SPACING_NS: u64 = 20_000_000;
 
 /// The local APIC timer's input frequency against the (calibrated) TSC, off
-/// by up to `tsc_ppm`: the median of [`WINDOWS`] windows from
-/// [`timer_window`], `pause` called at each one's [`Pause`] points. A window
-/// with a paused end is taken again, after [`timer_retake_pause`], up to
-/// [`ATTEMPTS`] in all; if attempts run out first, the least unsteady
-/// windows make up the rest ([`lumen_time::steadiest_windows`]), and [`init`]
-/// judges how far off the median can be, the TSC's error included
-/// ([`report`]). Call with interrupts off.
+/// by up to `tsc_ppm`: [`calibrate`] with windows from [`timer_window`],
+/// `pause` called at each one's [`Pause`] points, retakes after
+/// [`timer_retake_pause`]; [`init`] judges how far off the median can be, the
+/// TSC's error included ([`report`]). Call with interrupts off.
 fn calibrate_lapic_timer(tsc: Clock, tsc_ppm: u64, mut pause: impl FnMut(Pause)) -> Result<Calibration, CalError> {
     let window = tsc.ticks(WINDOW_NS);
     calibrate_timer_with(tsc, tsc_ppm, || timer_window(window, &mut pause))
@@ -613,14 +633,7 @@ fn calibrate_timer_with(
     tsc_ppm: u64,
     take: impl FnMut() -> Result<Window, CalError>,
 ) -> Result<Calibration, CalError> {
-    let of = Calibrated::Timer { tsc_ppm };
-    let got = lumen_time::steadiest_windows::<CalError, WINDOWS>(
-        ATTEMPTS,
-        take,
-        |w| of.window_bound(w),
-        |_| timer_retake_pause(tsc),
-    )?;
-    median_calibration(&got, of, tsc.hz())
+    calibrate(Calibrated::Timer { tsc_ppm }, tsc.hz(), take, |_| timer_retake_pause(tsc))
 }
 
 /// The wait before a timer calibration window taken again:
@@ -645,7 +658,7 @@ struct Report {
 /// (filling in is fine then); past it, a warning (a rate off by a few percent
 /// still runs the system); with no bound under 100% the rate says nothing (a
 /// tick from it could come arbitrarily fast or slow, a `sleep` last any
-/// time): the HPET then gives way to the PIT, otherwise `init` panics, as
+/// time): the HPET then gives way to the PIT, otherwise boot panics, as
 /// when a clock doesn't count at all.
 fn report(cal: &Calibration) -> Report {
     let bound_ppm = cal.median_bound_ppm();
@@ -674,13 +687,17 @@ impl Report {
     }
 }
 
-/// `ppm` as a percentage, rounded up to a tenth: `0.7`.
+/// A bound in ppm as a percentage, rounded up to a tenth (`0.7%`), or `no
+/// bound` from [`lumen_time::NO_INFORMATION_PPM`] on.
 struct Percent(u64);
 
 impl fmt::Display for Percent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0 >= lumen_time::NO_INFORMATION_PPM {
+            return f.write_str("no bound");
+        }
         let tenths = self.0.div_ceil(1_000);
-        write!(f, "{}.{}", tenths / 10, tenths % 10)
+        write!(f, "{}.{}%", tenths / 10, tenths % 10)
     }
 }
 
@@ -689,26 +706,45 @@ impl fmt::Display for Report {
         let Report { cal, bound_ppm, .. } = *self;
         let of = cal.of;
         let (name, steady, bound) = (of.name(), cal.steady(), Percent(bound_ppm));
-        match self.verdict {
-            Verdict::Clean => write!(f, "{name} calibration: every window steady"),
-            Verdict::Retook => write!(
+        // The windows taken: the steady ones and the unsteady ones (at most
+        // ATTEMPTS).
+        let taken = steady + cal.retaken;
+        let tolerance = Percent(of.tolerance_ppm());
+        match (self.verdict, of) {
+            (Verdict::Clean, _) => write!(f, "{name} calibration: every window steady"),
+            (Verdict::Retook, _) => write!(
                 f,
                 "{name} calibration took {} windows again, {steady} of {WINDOWS} kept steady, median within \
-                 {bound}% (read too late to trust; the last, tsc/reference/polls/start_gap/end_gap: {})",
+                 {bound} (read too late to trust; the last, tsc/reference/polls/start_gap/end_gap: {})",
                 cal.retaken,
                 cal.last_retaken.unwrap_or_default()
             ),
-            Verdict::Imprecise => write!(
+            // The timer's own windows within its tolerance: the TSC it was
+            // measured against is what takes it past.
+            (Verdict::Imprecise, Calibrated::Timer { tsc_ppm }) if cal.windows_bound_ppm() <= of.tolerance_ppm() => {
+                write!(
+                    f,
+                    "{name} calibration: {steady} of {taken} windows read promptly, but the TSC it is measured \
+                     against may be off by up to {}, so its rate may be off by up to {bound}, over the {tolerance} \
+                     allowed (tsc/reference/polls/start_gap/end_gap: {cal})",
+                    Percent(tsc_ppm)
+                )
+            }
+            (Verdict::Imprecise, _) => {
+                write!(
+                    f,
+                    "{name} calibration: only {steady} of {taken} windows read promptly ({WINDOWS} wanted; a stall \
+                     next to {}), so its rate may be off by up to {bound}",
+                    of.reads()
+                )?;
+                if let Calibrated::Timer { tsc_ppm: tsc_ppm @ 1.. } = of {
+                    write!(f, " ({} of it the TSC's calibration)", Percent(tsc_ppm))?;
+                }
+                write!(f, ", over the {tolerance} allowed (tsc/reference/polls/start_gap/end_gap: {cal})")
+            }
+            (Verdict::Unusable, _) => write!(
                 f,
-                "{name} calibration: only {steady} of {ATTEMPTS} windows read promptly ({WINDOWS} wanted; a stall \
-                 next to {}), so its rate may be off by up to {bound}%, over the {}% allowed \
-                 (tsc/reference/polls/start_gap/end_gap: {cal})",
-                of.reads(),
-                Percent(of.tolerance_ppm())
-            ),
-            Verdict::Unusable => write!(
-                f,
-                "can't calibrate the {name} against {}: only {steady} of {ATTEMPTS} windows read promptly \
+                "can't calibrate the {name} against {}: only {steady} of {taken} windows read promptly \
                  ({WINDOWS} wanted), and {}, so the rate says nothing (tsc/reference/polls/start_gap/end_gap: {cal})",
                 of.against(),
                 of.no_information()
@@ -757,15 +793,15 @@ fn timer_window(window: u64, mut pause: impl FnMut(Pause)) -> Result<Window, Cal
     })
 }
 
-/// The TSC calibrated, and judged: against the HPET ACPI lists (kept for
-/// [`hpet`] if used), or against the PIT if there is none, it doesn't count,
-/// or its rate says nothing (warned about), with `stall` stalled into each
-/// window ([`stall_window_ends`]; none but in scenarios). An HPET whose
-/// windows were stalled is still used, its windows filled in or stretched
-/// (#139); one past the TSC's tolerance is weighed against the PIT
-/// ([`the_steadier`]). Panics if neither counts; [`init`] acts on the
-/// report.
-fn calibrate_tsc(stall: Stall) -> Report {
+/// The TSC calibrated, judged, and against what: against the HPET ACPI
+/// lists, or against the PIT if there is none, it doesn't count, or its rate
+/// says nothing (warned about), with `stall` stalled into each window
+/// ([`stall_window_ends`]; none but in scenarios). An HPET whose windows were
+/// stalled is still used, its windows filled in or stretched (#139); one past
+/// the TSC's tolerance is weighed against the PIT ([`the_steadier`]). An HPET
+/// that counted is kept for [`hpet`] whichever calibrated the TSC. Panics if
+/// neither counts, or the PIT's rate says nothing.
+fn calibrate_tsc(stall: Stall) -> (Report, Reference) {
     let mut hpet_error = None;
     if let Some(addr) = crate::acpi::info().and_then(|i| i.hpet).map(|h| h.address) {
         let calibrated = HpetCounter::new(addr).and_then(|hpet| {
@@ -773,21 +809,21 @@ fn calibrate_tsc(stall: Stall) -> Report {
         });
         match calibrated {
             Ok((hpet, cal)) => {
+                // It counts: a second clock for `clocks` and the ktests,
+                // whatever calibrates the TSC.
+                *HPET.lock() = Some(hpet);
                 let judged = report(&cal);
-                let kept = match judged.verdict {
-                    Verdict::Clean | Verdict::Retook => judged,
-                    Verdict::Imprecise => the_steadier(judged, || calibrate_with_pit(stall_window_ends(stall))),
+                match judged.verdict {
+                    Verdict::Clean | Verdict::Retook => return (judged, Reference::Hpet),
+                    Verdict::Imprecise => {
+                        let kept = the_steadier(judged, || calibrate_with_pit(stall_window_ends(stall)));
+                        let Calibrated::Tsc(reference) = kept.cal.of else { unreachable!("a TSC calibration") };
+                        return (kept, reference);
+                    }
                     Verdict::Unusable => {
                         warn!(target: "time", "{judged}; calibrating against the PIT");
                         hpet_error = Some(HpetError::Window(CalError::NoInformation));
-                        judged
                     }
-                };
-                if kept.verdict != Verdict::Unusable {
-                    if kept.cal.of == Calibrated::Tsc(Reference::Hpet) {
-                        *HPET.lock() = Some(hpet);
-                    }
-                    return kept;
                 }
             }
             Err(e) => {
@@ -797,39 +833,54 @@ fn calibrate_tsc(stall: Stall) -> Report {
         }
     }
     match (calibrate_with_pit(stall_window_ends(stall)), hpet_error) {
-        (Ok(cal), _) => report(&cal),
+        (Ok(cal), _) => {
+            let judged = report(&cal);
+            if judged.action() == Action::Panic {
+                panic!("{judged}");
+            }
+            (judged, Reference::Pit)
+        }
         (Err(e), Some(h)) => panic!("can't calibrate the TSC: the HPET is unusable ({h}), and against the PIT {e}"),
         (Err(e), None) => panic!("can't calibrate the TSC: no HPET, and against the PIT {e}"),
     }
 }
 
 /// An HPET calibration past the TSC's tolerance (`hpet`, judged), weighed
-/// against one taken against the PIT now (`pit`): whichever's median can be
-/// off less. A slowed host stalls the PIT too, so the HPET isn't given up
-/// on its own word, nor kept on it. Says which it kept and why, at INFO (the
-/// verdict on that one is logged after); the HPET if the PIT fails.
+/// against one taken against the PIT now (`pit`, [`with_a_bound`]): whichever's
+/// median can be off less. A slowed host stalls the PIT too, so the HPET isn't
+/// given up on its own word, nor kept on it. Says which it kept and why, at
+/// INFO (the verdict on that one is logged after); the HPET if the PIT has no
+/// bound, and if it doesn't count or reads back wrong (a broken PIT, a
+/// WARN).
 fn the_steadier(hpet: Report, pit: impl FnOnce() -> Result<Calibration, CalError>) -> Report {
     let past = Percent(lumen_time::TSC_TOLERANCE_PPM);
-    match pit() {
+    let against_the_hpet = Percent(hpet.bound_ppm);
+    match pit().and_then(with_a_bound) {
         Ok(cal) => {
             let pit = report(&cal);
             let kept = if pit.bound_ppm < hpet.bound_ppm { pit } else { hpet };
             info!(
                 target: "time",
-                "tsc calibration: against the HPET within {}% (past the {past}% allowed), against the PIT within \
-                 {}%: kept {}",
-                Percent(hpet.bound_ppm),
+                "tsc calibration: against the HPET within {against_the_hpet} (past the {past} allowed), against the \
+                 PIT within {}: kept {}",
                 Percent(pit.bound_ppm),
                 kept.cal.of.against()
             );
             kept
         }
-        Err(e) => {
+        Err(CalError::NoInformation) => {
             info!(
                 target: "time",
-                "tsc calibration: against the HPET within {}% (past the {past}% allowed), against the PIT it failed \
-                 ({e}): kept the HPET",
-                Percent(hpet.bound_ppm)
+                "tsc calibration: against the HPET within {against_the_hpet} (past the {past} allowed), against the \
+                 PIT with no bound: kept the HPET"
+            );
+            hpet
+        }
+        Err(e) => {
+            warn!(
+                target: "time",
+                "tsc calibration: against the HPET within {against_the_hpet} (past the {past} allowed), against the \
+                 PIT it failed ({e}): kept the HPET"
             );
             hpet
         }
@@ -856,12 +907,8 @@ fn act_on(judged: &Report) {
 /// 1 kHz.
 pub fn init() {
     assert!(!arch::irq::enabled(), "time::init with interrupts on");
-    let tsc_report = calibrate_tsc(stall_from_cmdline("lumen.stall_tsc_windows"));
-    if tsc_report.action() == Action::Panic {
-        panic!("{tsc_report}");
-    }
+    let (tsc_report, reference) = calibrate_tsc(stall_from_cmdline("lumen.stall_tsc_windows"));
     let cal = tsc_report.cal;
-    let Calibrated::Tsc(reference) = cal.of else { unreachable!("a TSC calibration") };
     let hz = cal.hz;
     *BOOT_CALIBRATION.lock() = Some(cal);
     TSC_HZ.store(hz, Ordering::Relaxed);
@@ -971,12 +1018,7 @@ pub fn sleep(ns: u64) {
 /// timer calibration waits with [`timer_retake_pause`] instead, on the clock
 /// it was given). Panics before [`init`].
 pub fn spin(ns: u64) {
-    let tsc = tsc().expect("time::spin before time::init");
-    let start = arch::rdtsc();
-    let ticks = tsc.ticks(ns);
-    while arch::rdtsc().wrapping_sub(start) < ticks {
-        core::hint::spin_loop();
-    }
+    spin_ticks(tsc().expect("time::spin before time::init").ticks(ns));
 }
 
 /// The boot CPU's local APIC timer interrupts so far. Lock-free.
@@ -1286,8 +1328,11 @@ crate::ktest!(
         // was off.
         let boot = boot_calibration().ok_or("no boot calibration")?;
         crate::ktest::diag(format_args!("tsc boot (hpet) {boot}"));
-        let pit = first_judgeable(PIT_TRIES, || measure(Reference::Pit).ok_or("no PIT"), || spin(RETRY_SPACING_NS))?
-            .ok_or("the PIT re-measurement couldn't be judged: never within the TSC's tolerance")?;
+        let pit = first_judgeable(
+            PIT_TRIES,
+            || measure(Reference::Pit).unwrap_or(Err(CalError::NoCount)),
+            || spin(RETRY_SPACING_NS),
+        )?;
         match measure(Reference::Hpet) {
             Some(Ok(hpet)) => crate::ktest::diag(format_args!("tsc now against the hpet {hpet}")),
             Some(Err(e)) => crate::ktest::diag(format_args!("tsc now against the hpet: failed ({e})")),
@@ -1295,37 +1340,44 @@ crate::ktest!(
         }
         let (boot_ppm, pit_ppm) = (boot.median_bound_ppm(), pit.median_bound_ppm());
         crate::ktest::diag(format_args!("bounds: boot {boot_ppm} ppm, pit {pit_ppm} ppm"));
-        kassert!(lumen_time::within_bounds(pit.hz, hz, pit_ppm, boot_ppm, 20_000));
+        kassert!(lumen_time::within_bounds(pit.hz, hz, pit_ppm, boot_ppm, PIT_CROSS_CHECK_FLOOR_PPM));
         Ok(())
     }
 );
 
 /// The first of up to `tries` calibrations from `measure` (`space` called
 /// between them) whose median is within the TSC's tolerance, each shown as
-/// a diag; `None` if none is. A cross-check against a wider one could pass
-/// on its bound alone, which proves nothing.
+/// a diag; an error saying whether every try failed or every one was too
+/// wide (a cross-check against a wider one could pass on its bound alone,
+/// which proves nothing).
 #[cfg(feature = "ktest")]
 fn first_judgeable(
     tries: usize,
-    mut measure: impl FnMut() -> Result<Result<Calibration, CalError>, &'static str>,
+    mut measure: impl FnMut() -> Result<Calibration, CalError>,
     mut space: impl FnMut(),
-) -> Result<Option<Calibration>, &'static str> {
+) -> Result<Calibration, &'static str> {
+    let mut wide = false;
     for tried in 0..tries {
         if tried > 0 {
             space();
         }
-        match measure()? {
+        match measure() {
             Ok(cal) => {
                 let ppm = cal.median_bound_ppm();
                 crate::ktest::diag(format_args!("tsc now against the pit {cal}, median within {ppm} ppm"));
                 if ppm <= lumen_time::TSC_TOLERANCE_PPM {
-                    return Ok(Some(cal));
+                    return Ok(cal);
                 }
+                wide = true;
             }
             Err(e) => crate::ktest::diag(format_args!("against the pit: {e}")),
         }
     }
-    Ok(None)
+    Err(if wide {
+        "the PIT re-measurement couldn't be judged: never within the TSC's tolerance"
+    } else {
+        "the PIT re-measurement couldn't be judged: every try failed"
+    })
 }
 
 crate::ktest!(
@@ -1350,16 +1402,24 @@ crate::ktest!(
             4,
             || {
                 taken += 1;
-                Ok(queue.next().unwrap_or(Ok(wide)))
+                queue.next().unwrap_or(Ok(wide))
             },
             || spaced += 1,
-        )?;
-        kassert_eq!((got, taken, spaced), (Some(fine), 3, 2));
-        let never = first_judgeable(4, || Ok(Ok(wide)), || {})?;
-        kassert_eq!(never, None);
+        );
+        kassert_eq!((got, taken, spaced), (Ok(fine), 3, 2));
+        let never = first_judgeable(4, || Ok(wide), || {});
+        kassert_eq!(never, Err("the PIT re-measurement couldn't be judged: never within the TSC's tolerance"));
+        let failing = first_judgeable(2, || Err(CalError::NoCount), || {});
+        kassert_eq!(failing, Err("the PIT re-measurement couldn't be judged: every try failed"));
         Ok(())
     }
 );
+
+/// The least the boot calibration and the PIT measured again may differ by
+/// in `tsc_calibrated_within_tolerance`, in ppm: 2%, twice the TSC's
+/// tolerance, half for each clock's calibration.
+#[cfg(feature = "ktest")]
+const PIT_CROSS_CHECK_FLOOR_PPM: u64 = 2 * lumen_time::TSC_TOLERANCE_PPM;
 
 /// The least a ktest comparing a measurement now with the boot calibration
 /// allows them to differ by, in ppm (1%): their bounds leave out the host's
@@ -1559,8 +1619,8 @@ crate::ktest!(
             end_gap: 1_000_000 - 1_000 * taken,
         };
         let (mut taken, mut rulers) = (0, alloc::vec::Vec::new());
-        let cal = median_tsc_hz_with(
-            Reference::Pit,
+        let cal = calibrate(
+            Calibrated::Tsc(Reference::Pit),
             PIT_HZ,
             || {
                 taken += 1;
@@ -1595,7 +1655,7 @@ crate::ktest!(
         let a = Window { tsc: 10_000_000, reference: 1_000_000, polls: 800, start_gap: 0, end_gap: 70_000 };
         let b = Window { start_gap: 40_000, end_gap: 40_000, ..a };
         let mut it = [a, b, a, b, a, b, b, b].into_iter().chain(core::iter::repeat(b));
-        let cal = median_tsc_hz_with(Reference::Hpet, 100_000_000, || Ok(it.next().unwrap_or(b)), |_| {})
+        let cal = calibrate(Calibrated::Tsc(Reference::Hpet), 100_000_000, || Ok(it.next().unwrap_or(b)), |_| {})
             .map_err(|_| "calibrating failed")?;
         kassert_eq!(cal.windows, [b; WINDOWS]);
         kassert_eq!(cal.median_bound_ppm(), 4_018);
@@ -1658,6 +1718,57 @@ crate::ktest!(
         kassert!(cal.windows.iter().all(|w| w.reference > base && w.reference < base * (MOST_HPET_STRETCH + 1)));
         let boot_ppm = boot_calibration().ok_or("no boot calibration")?.median_bound_ppm();
         kassert!(lumen_time::within_bounds(cal.hz, hz, cal.median_bound_ppm(), boot_ppm, CROSS_CHECK_FLOOR_PPM));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn an_unplaceable_window_filling_in_doesnt_fail_the_calibration() {
+        // Four steady PIT windows in 20, the rest unplaceable (no reference
+        // ticks: no rate, no bound): one fills in, its rate counted as 0, and
+        // the median (between steady windows') stands, within a steady
+        // window's bound, where it used to fail the calibration.
+        use crate::kassert_eq;
+        let steady = Window { tsc: 24_500_000, reference: 11_932, polls: 900, start_gap: 1_000, end_gap: 1_000 };
+        let unplaced = Window { reference: 0, end_gap: 24_500_000, ..steady };
+        let mut taken = 0;
+        let cal = calibrate(
+            Calibrated::Tsc(Reference::Pit),
+            PIT_HZ,
+            || {
+                taken += 1;
+                Ok(if taken <= 4 { steady } else { unplaced })
+            },
+            |_| {},
+        )
+        .map_err(|e| {
+            crate::ktest::diag(format_args!("{e}"));
+            "calibrating failed"
+        })?;
+        kassert_eq!((cal.steady(), cal.windows[4]), (4, unplaced));
+        kassert_eq!(Some(cal.hz), steady.tsc_hz(PIT_HZ));
+        kassert_eq!(cal.median_bound_ppm(), steady.tsc_error_ppm());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_start_stall_doesnt_stretch_hpet_windows() {
+        // Each HPET window's start held up half as long as the last one ran
+        // (lumen.stall_tsc_windows=0,500000): the reference counts the stall
+        // but the TSC window doesn't, which made the window's gaps look like
+        // a slow host's and stretched it (#139 round 2: 5 ms took the next to
+        // 18.7 ms, 10 ms to the 160 ms cap, for good). Over the TSC ticks the
+        // reference counted (tsc + start_gap), no window stretches: each is
+        // its 10 ms target and a stall past it at most.
+        use crate::kassert;
+        let hpet = hpet().ok_or("no HPET")?;
+        let base = hpet.clock().ticks(WINDOW_NS);
+        let cal = off_or_diag("calibrating against the HPET failed", || {
+            calibrate_with_hpet(&hpet, stall_window_ends(Stall { end: 0, start: 500_000 }))
+        })?;
+        crate::ktest::diag(format_args!("{cal}"));
+        kassert!(cal.windows.iter().all(|w| w.reference < base + base / 5));
         Ok(())
     }
 );
@@ -1894,9 +2005,30 @@ crate::ktest!(
             "local APIC timer calibration: only 2 of 20 windows read promptly (5 wanted; a stall next to the timer's \
              register accesses), so its rate may be off by up to 2.1%, over the 2.0% allowed ("
         ));
-        // 1.5% windows, fine alone, against a TSC within 1%: 2.5%, past it.
+        // 1.5% windows, fine alone, against a TSC within 1%: 2.5%, past it,
+        // and the text says the TSC is what took it past.
         let against = report(&cal([150_000; WINDOWS], 20, Calibrated::Timer { tsc_ppm: 10_000 }));
         kassert_eq!((against.bound_ppm, against.verdict), (25_150, Verdict::Imprecise));
+        kassert!(text(&against).starts_with(
+            "local APIC timer calibration: 0 of 20 windows read promptly, but the TSC it is measured against may be \
+             off by up to 1.0%, so its rate may be off by up to 2.6%, over the 2.0% allowed"
+        ));
+        // Every window steady, at once, against a TSC within 1.9%: 2.2%,
+        // the TSC's doing, not the timer's register accesses.
+        let steady_but = report(&cal([20_000; WINDOWS], 0, Calibrated::Timer { tsc_ppm: 19_000 }));
+        kassert_eq!((steady_but.bound_ppm, steady_but.verdict), (21_038, Verdict::Imprecise));
+        let said = text(&steady_but);
+        kassert!(said.starts_with(
+            "local APIC timer calibration: 5 of 5 windows read promptly, but the TSC it is measured against may be \
+             off by up to 1.9%, so its rate may be off by up to 2.2%, over the 2.0% allowed"
+        ));
+        kassert!(!said.contains("register accesses"));
+        // Its own windows past it too: both named, the TSC's share said.
+        let both = report(&cal([1_000, 2_000, 250_000, 300_000, 400_000], 18, Calibrated::Timer { tsc_ppm: 5_000 }));
+        kassert!(text(&both).contains(
+            "a stall next to the timer's register accesses), so its rate may be off by up to 3.1% (0.5% of it the \
+             TSC's calibration), over the 2.0% allowed"
+        ));
         let unusable = timer([1_000, 2_000, 10_000_000, 10_000_000, 20_000_000], 18);
         kassert_eq!((unusable.verdict, unusable.action()), (Verdict::Unusable, Action::Panic));
         kassert!(text(&unusable).starts_with(
@@ -2014,8 +2146,8 @@ crate::ktest!(
         let slow = parse("24547212/1000016/40/436492/529641");
         let prompt = parse("24547212/1000016/800/30000/30000");
         let mut taken = 0;
-        let hpet = median_tsc_hz_with(
-            Reference::Hpet,
+        let hpet = calibrate(
+            Calibrated::Tsc(Reference::Hpet),
             100_000_000,
             || {
                 taken += 1;

@@ -89,9 +89,11 @@ def tsc_error_ppm(tsc: int, ref: int, start_gap: int, end_gap: int) -> int:
 def within_bounds(a: int, b: int, a_ppm: int, b_ppm: int) -> bool:
     """Whether `a` (off by at most `a_ppm` of the true rate) and `b` (at most
     `b_ppm`) can measure the same rate: `|a - b| <= (a_ppm + b_ppm) * true`,
-    the true rate being at most `b / (1 - b_ppm)` (as kernel/src/time.rs's
-    within_bounds, without its floor)."""
-    return b_ppm < 1_000_000 and abs(a - b) * (1_000_000 - b_ppm) <= b * (a_ppm + b_ppm)
+    the true rate being at most `b / (1 - b_ppm)`; never with a measurement
+    that has no bound (as lumen_time::within_bounds, without its floor)."""
+    if a_ppm >= 1_000_000 or b_ppm >= 1_000_000:
+        return False
+    return abs(a - b) * (1_000_000 - b_ppm) <= b * (a_ppm + b_ppm)
 
 
 def window_fields(w: str) -> tuple[int, int, int, int, int]:
@@ -212,9 +214,10 @@ def test_boot_calibration_agrees_with_both_clocks(boot):
 # `lumen.stall_*_windows=<end ppm>[,<start ppm>]`, a deliberate fault like the
 # shell's `crash`), so a real boot reaches the fill-in, its warning and its
 # panic (#139). An end stall of over 0.5% makes every window unsteady: all 20
-# are taken and the least gapped five fill in; the median's bound is then
-# about the stall. Its verdict is by each clock's tolerance (the TSC's 1%,
-# the timer's 2%).
+# are taken and the five with the smallest bounds fill in; the median's bound
+# is then about the stall (one delayed read is a burst, not a slow host, so
+# windows don't stretch for it). Its verdict is by each clock's tolerance
+# (lumen_time's: the TSC's 1%, the timer's 2%, the TSC's error included).
 FILLED = r"took 20 windows again, 0 of 5 kept steady, median within (\d+\.\d)%"
 PANIC = re.compile(r"\npanic: (.*)\n")
 
@@ -250,6 +253,9 @@ def test_tsc_windows_stalled_past_steady_fill_in_within_tolerance(boot):
     assert "WARN" not in out, out
     (tsc, _, _, hpet), cals = clocks_and_windows(m)
     boot_ppm, hpet_ppm = median_bound_ppm(cals["boot"]), median_bound_ppm(cals["hpet"])
+    # The unstalled measurement must be within the TSC's tolerance itself, or
+    # the comparison could pass on its bound alone.
+    assert hpet_ppm <= TSC_TOLERANCE_PPM, (hpet_ppm, cals["hpet"])
     assert within_bounds(tsc, hpet, boot_ppm, hpet_ppm), (
         tsc,
         hpet,
@@ -288,6 +294,31 @@ def test_tsc_windows_stalled_past_tolerance_warn(boot):
     assert said, out
     assert 1.5 <= float(said[1]) <= 2.0, said[0]
     assert float(said[1]) == min(hpet_pc, pit_pc), (said[0], chose[0])
+    # The timer, its own windows fine, with the TSC's 1.5-2% on top is still
+    # within its 2%, or says the TSC is why not (never its own reads).
+    assert "a stall next to the timer's register accesses" not in out, out
+    # The HPET counted, so it stays a second clock whichever was kept.
+    (_, reference, pit, hpet), _ = clocks_and_windows(m)
+    assert reference == kept.lower() and pit is not None and hpet is not None, (
+        reference,
+        pit,
+        hpet,
+    )
+
+
+def test_a_timer_off_through_the_tsc_says_so(boot):
+    # The TSC stalled 3% (past its 1%: a warning) and the timer not: the
+    # timer's windows are fine, but measured against that TSC its rate may be
+    # off by over its 2%. Its warning says the TSC is why, not its own reads.
+    m = boot("qemutest", cmdline="lumen.stall_tsc_windows=30000")
+    out = boot_messages(m)
+    assert re.search(
+        r"WARN  time: local APIC timer calibration: (\d) of (\d+) windows read promptly, but the TSC it is "
+        r"measured against may be off by up to (\d+\.\d)%, so its rate may be off by up to (\d+\.\d)%, over the "
+        r"2\.0% allowed",
+        out,
+    ), out
+    assert "a stall next to the timer's register accesses" not in out, out
 
 
 def test_tsc_windows_with_no_bound_left_panic(boot):
@@ -360,8 +391,8 @@ def test_timer_windows_stalled_past_tolerance_warn(boot):
     out = boot_messages(m)
     said = re.search(
         r"WARN  time: local APIC timer calibration: only 0 of 20 windows read promptly \(5 wanted; a stall "
-        r"next to the timer's register accesses\), so its rate may be off by up to (\d+\.\d)%, over the "
-        r"2\.0% allowed",
+        r"next to the timer's register accesses\), so its rate may be off by up to (\d+\.\d)% "
+        r"\(\d+\.\d% of it the TSC's calibration\), over the 2\.0% allowed",
         out,
     )
     assert said, out

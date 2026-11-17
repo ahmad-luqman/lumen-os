@@ -1,7 +1,7 @@
 # Features: time. See tests/features/README.md for the format.
 
 [[feature]]
-name = "Calibrated TSC (against the HPET, or the PIT without one or with one whose rate says nothing, or with a better bound than one past the TSC's tolerance): each window's ends are reference readings between two TSC reads (the PIT's counter read at both); a window with a paused reading is taken again after a wait of two windows' TSC ticks, and an HPET window slow to read (each poll slow, not one burst) is taken again longer (up to 16 windows' worth) until the same gaps would be steady; short of steady windows after 20, the ones with the smallest bounds fill in; the shell's clocks lists the windows; the local APIC timer calibrated against the TSC the same way (the timer started, and its count read, each between two TSC reads; retakes 20 ms apart); each boot calibration judged by how far off its median can be (for the TSC, each window's end gap over the rest of it plus a reference tick; for the timer, its gaps' share plus the TSC's bound) against its clock's tolerance (the TSC 1%, the timer 2%): within it at most an INFO line, past it a warning saying how far off, with no bound left a panic (the HPET first giving way to the PIT); stalls injected at boot (`lumen.stall_tsc_windows`, `lumen.stall_timer_windows`, said at INFO; over 10 windows' worth warned about and ignored) reach the fill-in, the HPET-or-PIT choice, the warning and the panic in a real boot; the shell's clocks shows each measurement's bound; now_ns and sleep"
+name = "Calibrated TSC (against the HPET, or the PIT without one or with one whose rate says nothing, or with a better bound than one past the TSC's tolerance): each window's ends are reference readings between two TSC reads (the PIT's counter read at both); a window with a paused reading is taken again after a wait of two windows' TSC ticks, and an HPET window slow to read (each poll slow, not one burst at either end) is taken again longer (up to 16 windows' worth) until the same gaps would be steady; short of steady windows after 20, the ones with the smallest bounds fill in; the shell's clocks lists the windows; the local APIC timer calibrated against the TSC the same way (the timer started, and its count read, each between two TSC reads; retakes 20 ms apart); each boot calibration judged by how far off its median can be (for the TSC, each window's end gap over the rest of it plus a reference tick; for the timer, its gaps' share plus the TSC's bound) against its clock's tolerance (the TSC 1%, the timer 2%): within it at most an INFO line, past it a warning saying how far off, with no bound left a panic (the HPET first giving way to the PIT); a timer past its tolerance only through the TSC's error says so; stalls injected at boot (`lumen.stall_tsc_windows`, `lumen.stall_timer_windows`, said at INFO; over 10 windows' worth warned about and ignored) reach the fill-in, the HPET-or-PIT choice, the warning and the panic in a real boot; the shell's clocks shows each measurement's bound; now_ns and sleep"
 milestone = "M1"
 tests = [
     "cargo:lumen-time",
@@ -16,6 +16,8 @@ tests = [
     "ktest:lumen_kernel::time::a_tsc_calibration_waits_between_retakes",
     "ktest:lumen_kernel::time::tsc_spares_are_ranked_by_the_tsc_bound",
     "ktest:lumen_kernel::time::an_hpet_slow_to_read_stretches_its_windows_until_steady",
+    "ktest:lumen_kernel::time::a_start_stall_doesnt_stretch_hpet_windows",
+    "ktest:lumen_kernel::time::an_unplaceable_window_filling_in_doesnt_fail_the_calibration",
     "ktest:lumen_kernel::time::a_pit_end_read_after_it_could_wrap_is_not_steady",
     "ktest:lumen_kernel::time::a_paused_pit_reading_is_taken_again",
     "ktest:lumen_kernel::time::a_paused_hpet_reading_is_not_steady",
@@ -43,6 +45,7 @@ tests = [
     "scenario:test_time::test_timer_windows_stalled_past_tolerance_warn",
     "scenario:test_time::test_timer_windows_with_no_bound_left_panic",
     "scenario:test_time::test_a_stall_past_ten_windows_is_ignored",
+    "scenario:test_time::test_a_timer_off_through_the_tsc_says_so",
     "scenario:test_ktest::test_in_kernel_tests_pass",
     "scenario:test_ktest::test_in_kernel_tests_pass_with_calibrations_stalled_within_tolerance[*]",
 ]

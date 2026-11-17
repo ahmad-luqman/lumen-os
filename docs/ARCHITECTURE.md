@@ -453,7 +453,7 @@ terminal taken to be 80 columns wide; plain text without it, section 6,
 "Shell"), and `lumen.stall_tsc_windows=<end ppm>[,<start ppm>]` and
 `lumen.stall_timer_windows=...` (each boot calibration window's end, and
 start, stalled by a share of it, up to 10 windows' worth; a deliberate fault
-for scenarios, said at INFO, section 4, "Time").
+for scenarios, said at INFO, section 6, "Time").
 
 ## 5. Memory layout
 
@@ -796,41 +796,48 @@ allocates.
   or end reading was itself paused (the gaps between the TSC reads around
   them add up to more than 0.5% of the window), or, for the PIT, whose end
   was read too late to place, is set aside and another taken after a wait
-  of two windows' worth of TSC ticks (the fewest any window took: the TSC
-  isn't calibrated yet, but every window spans 10 ms of the reference), up
-  to 20 for five. An HPET window whose ends were slow to read is taken again
+  of two windows' worth of TSC ticks (the fewest any window with a bound
+  spanned from its start reading: the TSC isn't calibrated yet, but every
+  window spans 10 ms of the reference), up to 20 for five. An HPET window whose ends were slow to read is taken again
   longer, until the same gaps would be 0.4% of it, up to 160 ms (#139: on
   KVM a normal window's gaps already take 0.23% of it, and a slowed host's
-  HPET reads took 20 times as long, 16 of 20 windows unsteady however late
-  they were taken). A read slow to come back slows every poll, a burst of
-  stalls one read: each end's gap counts for at most two mean poll
-  intervals, so one burst barely stretches a window. The PIT can't stretch
+  HPET reads took 20 times as long: 16 of 20 windows taken back to back were
+  unsteady, and the timer's, 20 ms apart, failed 18 of 20). A read slow to
+  come back slows every poll, a burst of stalls one read: each end's gap
+  counts for at most two mean poll intervals, and the gaps are a share of
+  the TSC ticks the reference counted over (with the start gap, so a stall
+  at the start doesn't inflate them), so one burst at either end barely
+  stretches a window. The PIT can't stretch
   past 13,107 ticks, about 11 ms, the most its 16-bit counter can be shown
   not to have wrapped. If attempts run
-  out, the least unsteady fill in. A PIT read-back that can't fit how it was
+  out, the unsteady windows with the smallest bounds fill in. A PIT read-back that can't fit how it was
   programmed is an error, and so is an HPET that doesn't count, which gives
   way to the PIT (warned). The local APIC timer (divide
   by 16) is calibrated against the TSC as the median of five 10 ms windows
   too, each end a register access between two TSC reads (the timer started
   by one write, its count read), so a window whose ends were paused (gaps
   over 0.5% of it) is taken again, 20 ms later (stalls come in bursts), up
-  to 20 windows in all (#129), the least unsteady filling in if those run
-  out, the ones with the smallest bounds filling in. Each boot calibration
+  to 20 windows in all (#129), the ones with the smallest bounds filling in
+  if those run out. Each boot calibration
   is then judged by how far off its median can be: the third smallest of
   its windows' bounds, each window off by at most what its gaps allow (for
   the timer's rate, its gaps' share of it, and the TSC's own bound on top,
   since the timer is measured against it; for the TSC's, measured against
   the reference, the end gap over the rest of the window, which it
   stretched, plus one reference tick). Within its clock's tolerance (the TSC
-  1%, half the 2% its tightest cross-checks allow; the timer 2%, which with
-  the TSC's 1% leaves the 1 kHz check's 5% room for its own measurement),
+  1%, half the 2% its tightest cross-checks allow; the timer 2%, the TSC's
+  error included, which leaves the 1 kHz check's 5% room for its own
+  measurement),
   boot logs at most an INFO line with the bound when it took windows again;
   past it, a warning saying how far off; with no bound under 100% the rate
   says nothing (a TSC window's end gap as long as the rest of it, a timer
   window's gaps as long as itself). An HPET past the TSC's tolerance is
   weighed against the PIT, measured then too, and the one whose median can
-  be off less is kept (said at INFO); an HPET with no bound gives way to the
-  PIT; otherwise boot panics. The old rule, a warning unless most windows
+  be off less is kept (said at INFO; a PIT that fails then is a warning); an
+  HPET with no bound gives way to the PIT; otherwise boot panics. An HPET
+  that counted is kept as a second clock (`time::hpet`, `clocks`) whichever
+  calibrated the TSC (`time::reference`). A timer whose own windows are within
+  its tolerance but whose bound is past it through the TSC's says so. The old rule, a warning unless most windows
   were steady, failed scenarios on a boot whose timer was within 0.7%
   (#139). Scenarios stall each window with `lumen.stall_tsc_windows` and
   `lumen.stall_timer_windows` (section 4) to reach the fill-in, the choice,
@@ -846,7 +853,8 @@ allocates.
   `sleep <ms>`, `uptime`, and `clocks` (the TSC measured again against the
   PIT and the HPET, which the tests compare with the boot calibration: a
   wrong calibration would cancel out in tick counts, since the timer is
-  calibrated against the TSC). A second line lists the windows behind each:
+  calibrated against the TSC; each `within <n> ppm`, how far off its median
+  can be, and a measurement with no bound shown as failed). A second line lists the windows behind each:
   `clocks: windows: boot <cal>; pit <cal>; hpet <cal>`, each `<cal>` being
   `<hz> Hz [<w> <w> <w> <w> <w>] retook <n>` with each window `<w>` as
   `tsc/reference/polls/start_gap/end_gap`; a failed or missing measurement
@@ -859,8 +867,8 @@ allocates.
   only that ticks arrive (at least one, none stray; the ktest also caps them
   at 150 per 100 ms), and never assert on host time. Every
   calibration poll is bounded: an HPET that doesn't count, calibrates
-  implausibly or has no five steady windows in 20 is warned about (with why)
-  and the PIT used; a PIT whose
+  implausibly, or whose median has no bound under 100% is warned about (with
+  why) and the PIT used; a PIT whose
   output doesn't go low when programmed, or high again within 2^32 TSC
   ticks (over 4 s at 1 GHz), counts as missing; calibration results outside
   10 MHz to 100 GHz are rejected.

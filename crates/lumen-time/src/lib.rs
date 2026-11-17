@@ -228,7 +228,11 @@ pub const STEADY: u64 = 200;
 
 impl Window {
     /// Were both its ends read promptly enough to trust it (see [`STEADY`])?
-    /// An empty window isn't.
+    /// An empty window isn't. This is about the reads (their gaps' share of
+    /// the window), the same for either rate taken from it: how far off a
+    /// rate can be is the caller's bound ([`Window::tsc_error_ppm`],
+    /// [`Window::gap_ppm`]), which ranks the unsteady ones and judges the
+    /// median.
     pub fn is_steady(&self) -> bool {
         self.tsc > 0 && self.start_gap.saturating_add(self.end_gap).saturating_mul(STEADY) <= self.tsc
     }
@@ -352,14 +356,17 @@ pub struct SetAside {
 }
 
 /// The most a median of `windows`' rates can be off, in parts per million
-/// of the true rate, rounded up: the `(N / 2 + 1)`-th smallest of their
-/// [`Window::gap_ppm`]. Each window's rate is off by at most its own (its
-/// error lies inside its gaps), and those `N / 2 + 1` windows, each within
-/// that much, are more than half of them, so the median (for even `N`, the
-/// midpoint of the middle two) lies between two of theirs. `u64::MAX` (no
-/// bound) if one of those has gaps as long as itself, or for no windows.
-pub fn median_bound_ppm<const N: usize>(windows: &[Window; N]) -> u64 {
-    median_bound_ppm_by(windows, Window::gap_ppm)
+/// of the true rate, rounded up: the `(N / 2 + 1)`-th smallest of their own
+/// bounds, from `bound` (the most the rate taken from a window can be off:
+/// [`Window::tsc_error_ppm`] for the TSC's rate against a reference,
+/// [`Window::gap_ppm`] for a reference's against the TSC). Those `N / 2 + 1`
+/// windows, each within that much, are more than half of them, so the median
+/// (for even `N`, the midpoint of the middle two) lies between two of theirs.
+/// `u64::MAX` (no bound) if one of those has none, or for no windows.
+pub fn median_bound_ppm<const N: usize>(windows: &[Window; N], bound: impl Fn(&Window) -> u64) -> u64 {
+    let mut ppm = windows.map(|w| bound(&w));
+    ppm.sort_unstable();
+    ppm.get(N / 2).copied().unwrap_or(u64::MAX)
 }
 
 /// How long, in reference ticks, the next window should be after `window`
@@ -371,33 +378,31 @@ pub fn median_bound_ppm<const N: usize>(windows: &[Window; N]) -> u64 {
 /// it (`1 / (STEADY · 5/4)`, a fifth under [`STEADY`]'s 0.5%), never shorter
 /// than `current` nor longer than `most`. A slow read slows every poll, but
 /// a burst of stalls hits one read: each end's gap counts for at most two of
-/// the window's mean poll intervals (`tsc / polls`), what slow reads explain,
-/// so one 2 ms burst at an end barely stretches it. A steady window keeps
-/// `current`; so does an empty one. `most` if the arithmetic would overflow.
+/// the window's mean poll intervals (`tsc / polls`, the polls being what
+/// `tsc` spans), what slow reads explain, so one burst at either end barely
+/// stretches it; and the gaps are a share of the TSC ticks the reference
+/// counted over (`tsc + start_gap`: a stall before `tsc` starts still counts
+/// in `reference`), so a stall at the start, however long, doesn't inflate
+/// the share. A steady window keeps
+/// `current`; so does an empty one, and one with no polls (nothing to tell a
+/// slow read by). `most` if the arithmetic would overflow.
 pub fn stretched_for_gaps(current: u64, window: &Window, most: u64) -> u64 {
     if window.is_steady() || window.tsc == 0 || window.polls == 0 {
         return current;
     }
     let two_polls = (u128::from(window.tsc) * 2).div_ceil(u128::from(window.polls));
     let gaps = u128::from(window.start_gap).min(two_polls) + u128::from(window.end_gap).min(two_polls);
+    // The TSC ticks the reference counted over: from its start reading, so
+    // with the start gap (a stall there counts in `reference`, not `tsc`).
+    let span = u128::from(window.tsc) + u128::from(window.start_gap);
     // The reference ticks over which `gaps` (TSC ticks) are 1/(STEADY·5/4).
     let needed = u128::from(window.reference)
         .checked_mul(gaps)
         .and_then(|x| x.checked_mul(u128::from(STEADY) * 5))
-        .map(|x| x.div_ceil(4 * u128::from(window.tsc)))
+        .map(|x| x.div_ceil(4 * span))
         .and_then(|x| u64::try_from(x).ok())
         .unwrap_or(most);
     needed.clamp(current, most.max(current))
-}
-
-/// [`median_bound_ppm`] with each window's own bound from `bound`: for the
-/// TSC's rate against a reference, [`Window::tsc_error_ppm`]. The argument is
-/// the same: the `(N / 2 + 1)`-th smallest window bound holds for more than
-/// half of them, so for the median.
-pub fn median_bound_ppm_by<const N: usize>(windows: &[Window; N], bound: impl Fn(&Window) -> u64) -> u64 {
-    let mut ppm = windows.map(|w| bound(&w));
-    ppm.sort_unstable();
-    ppm.get(N / 2).copied().unwrap_or(u64::MAX)
 }
 
 /// How [`steadiest_windows`] went: `N` windows, the steady ones first (in the
@@ -431,12 +436,14 @@ impl<const N: usize> Steadiest<N> {
 /// `N` windows from `take`, at most `attempts` (at least `N`) in all: steady
 /// ones, an unsteady one set aside, and `pause` called before each window
 /// taken after an unsteady one (so retakes can be spaced past a burst of
-/// stalls), given the fewest TSC ticks any window taken so far spanned from
-/// its start reading (`tsc + start_gap`: a ruler for a TSC not calibrated
-/// yet). If attempts run out first, the rest are the unsteady windows whose
+/// stalls), given the fewest TSC ticks any window taken so far with a bound
+/// spanned from its start reading (`tsc + start_gap`: a ruler for a TSC not
+/// calibrated yet; `u64::MAX` before one; a window that can't be placed
+/// doesn't count, and a PIT window whose start was read late spans only the
+/// part it counted, so the ruler can come out short of the window by that). If attempts run out first, the rest are the unsteady windows whose
 /// `bound` (the most the rate the caller takes from them can be off) was the
 /// smallest, rather than none: the caller judges the median's
-/// ([`median_bound_ppm_by`] with the same bound). An error from `take` is
+/// ([`median_bound_ppm`] with the same bound). An error from `take` is
 /// returned at once.
 pub fn steadiest_windows<E, const N: usize>(
     attempts: usize,
@@ -454,7 +461,9 @@ pub fn steadiest_windows<E, const N: usize>(
             pause(shortest);
         }
         let w = take()?;
-        shortest = shortest.min(w.tsc.saturating_add(w.start_gap));
+        if bound(&w) < NO_INFORMATION_PPM {
+            shortest = shortest.min(w.tsc.saturating_add(w.start_gap));
+        }
         retake = !w.is_steady();
         if !retake {
             out.windows[out.steady] = w;
@@ -562,8 +571,9 @@ pub struct Stall {
     pub start: u64,
 }
 
-/// The most a [`Stall`] may ask for, in ppm: 10 windows' worth, more than
-/// any no-information case needs (twice), and short of a hang.
+/// The most a [`Stall`] may ask for, in ppm: 10 windows' worth, over three
+/// times the most a scenario asks (3,000,000 for the timer's start), short of
+/// a hang.
 pub const MOST_STALL_PPM: u64 = 10_000_000;
 
 /// `<end ppm>[,<start ppm>]` as a [`Stall`]; `None` for anything else, or a
@@ -1259,10 +1269,10 @@ mod tests {
             *steadiest_windows::<(), 5>(8, || Ok(it.next().unwrap()), bound, |_| {}).unwrap().windows()
         };
         let by_share = kept(Window::gap_ppm);
-        assert_eq!(median_bound_ppm_by(&by_share, Window::tsc_error_ppm), 7_051);
+        assert_eq!(median_bound_ppm(&by_share, Window::tsc_error_ppm), 7_051);
         let by_bound = kept(Window::tsc_error_ppm);
         assert_eq!(by_bound, [b; 5]);
-        assert_eq!(median_bound_ppm_by(&by_bound, Window::tsc_error_ppm), 4_018);
+        assert_eq!(median_bound_ppm(&by_bound, Window::tsc_error_ppm), 4_018);
     }
 
     #[test]
@@ -1289,6 +1299,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&rulers[..n], &[10_000_000, 10_000_000, 9_000_000], "after each unsteady window");
+        // A window with no bound (its end gap as long as it) doesn't shorten
+        // the ruler: before any other, there is none.
+        let unplaced = Window { tsc: 1_000, reference: 1, polls: 1, start_gap: 0, end_gap: 1_000 };
+        let mut it =
+            [unplaced, gapped(10_000_000, 900_000)].into_iter().chain(core::iter::repeat(gapped(10_000_000, 0)));
+        let (mut seen, mut k) = ([0u64; 4], 0);
+        steadiest_windows::<(), 3>(
+            10,
+            || Ok(it.next().unwrap()),
+            Window::gap_ppm,
+            |r| {
+                seen[k] = r;
+                k += 1;
+            },
+        )
+        .unwrap();
+        assert_eq!(&seen[..k], &[u64::MAX, 10_000_000]);
     }
 
     #[test]
@@ -1322,10 +1349,7 @@ mod tests {
         assert_eq!(w(1 << 40, 1 << 40, 0, 0).tsc_error_ppm(), 1, "large but in range");
         // The median's: the third smallest of five.
         let ws = [0, 90_000, 20_000, 500_000, 30_000].map(|e| w(10_000_000, 1_000_000, 0, e));
-        assert_eq!(
-            median_bound_ppm_by(&ws, Window::tsc_error_ppm),
-            w(10_000_000, 1_000_000, 0, 30_000).tsc_error_ppm()
-        );
+        assert_eq!(median_bound_ppm(&ws, Window::tsc_error_ppm), w(10_000_000, 1_000_000, 0, 30_000).tsc_error_ppm());
     }
 
     #[test]
@@ -1335,7 +1359,7 @@ mod tests {
         // same gaps are 0.4% of a window 9.8 times as long.
         let slow = Window { tsc: 24_547_212, reference: 1_000_016, polls: 40, start_gap: 436_492, end_gap: 529_641 };
         let next = stretched_for_gaps(1_000_000, &slow, 16_000_000);
-        assert_eq!(next, 9_839_697);
+        assert_eq!(next, 9_667_787);
         // Taken that long with the same gaps, it is steady.
         let longer = Window { tsc: slow.tsc * next / 1_000_016, reference: next, ..slow };
         assert!(longer.is_steady(), "{longer}");
@@ -1348,7 +1372,7 @@ mod tests {
         assert_eq!(stretched_for_gaps(1_000_000, &Window::default(), 16_000_000), 1_000_000);
         // Just unsteady (0.6%): a little longer.
         let just = Window { tsc: 10_000_000, reference: 1_000_000, polls: 1, start_gap: 30_000, end_gap: 30_000 };
-        assert_eq!(stretched_for_gaps(1_000_000, &just, 16_000_000), 1_500_000);
+        assert_eq!(stretched_for_gaps(1_000_000, &just, 16_000_000), 1_495_514, "over tsc + start_gap");
     }
 
     #[test]
@@ -1357,13 +1381,30 @@ mod tests {
         // 5 ms burst at its end: the burst hits one read, not every poll, so
         // the end gap counts for two mean poll intervals (57,243 ticks) and
         // the window keeps its length; uncapped it would jump to the 16x cap
-        // and stay there. The same gaps from 40 polls (every read slow, the
-        // sighting) stretch it.
+        // and stay there. The sighting's gaps from 40 polls (every read slow)
+        // stretch it.
         let burst = Window { tsc: 24_500_000, reference: 1_000_000, polls: 856, start_gap: 3_000, end_gap: 12_250_000 };
         assert!(!burst.is_steady());
         assert_eq!(stretched_for_gaps(1_000_000, &burst, 16_000_000), 1_000_000);
         let slow = Window { polls: 40, start_gap: 436_492, end_gap: 529_641, ..burst };
         assert!(stretched_for_gaps(1_000_000, &slow, 16_000_000) > 9_000_000);
+        // A stall between the start reading and the TSC read after it, of
+        // any length, counts in `reference` but not in `tsc` or `polls`: the
+        // gaps are taken over `tsc + start_gap`, so it keeps its length.
+        // (3 GHz TSC, 100 MHz HPET, 12.5 us per poll, each gap one poll.)
+        let poll = 37_500u64;
+        for stall_ms in [2u64, 5, 8, 10, 12, 50] {
+            let ref_stall = stall_ms * 100_000;
+            let (polls, reference) = if ref_stall >= 1_000_000 {
+                (1, ref_stall + 1_250)
+            } else {
+                ((1_000_000 - ref_stall) / 1_250 + 1, 1_000_000)
+            };
+            let w =
+                Window { tsc: polls * poll, reference, polls, start_gap: stall_ms * 3_000_000 + poll, end_gap: poll };
+            assert!(!w.is_steady() || stall_ms < 5, "{stall_ms} ms");
+            assert_eq!(stretched_for_gaps(1_000_000, &w, 16_000_000), 1_000_000, "{stall_ms} ms: {w}");
+        }
         // A steady window (0.45% of gaps) isn't stretched.
         let steady = Window { tsc: 10_000_000, reference: 1_000_000, polls: 800, start_gap: 25_000, end_gap: 20_000 };
         assert!(steady.is_steady());
@@ -1405,9 +1446,9 @@ mod tests {
 
     #[test]
     fn two_measurements_agree_within_their_bounds_or_the_floor() {
-        // Three windows 0.6% low and two 0.6% high are consistent with the
-        // truth: their bounds are shares of the true rate, which can be up to
-        // b / (1 - b_ppm).
+        // A window 0.6% high against a median 0.6% low, each within its bound
+        // (about 0.6%) of the truth, agree: the bounds are shares of the true
+        // rate, which can be up to b / (1 - b_ppm).
         assert!(within_bounds(1_006_000_000, 994_000_000, 6_002, 6_001, 0));
         assert!(!within_bounds(1_006_000_000, 994_000_000, 5_000, 5_000, 0));
         // The floor: never held tighter than it.
@@ -1481,15 +1522,18 @@ mod tests {
     fn a_median_is_off_by_at_most_its_middle_gap_share() {
         // Gap shares 0.1%, 9%, 0.2%, 50%, 0.3%: the third smallest is 0.3%.
         let w = |end_gap| Window { tsc: 1_000_000, reference: 1, polls: 1, start_gap: 0, end_gap };
-        assert_eq!(median_bound_ppm(&[w(1_000), w(90_000), w(2_000), w(500_000), w(3_000)]), 3_000);
+        assert_eq!(median_bound_ppm(&[w(1_000), w(90_000), w(2_000), w(500_000), w(3_000)], Window::gap_ppm), 3_000);
         // Three windows with no bound: none for the median either.
-        assert_eq!(median_bound_ppm(&[w(1_000), w(1_000_000), w(2_000), w(1_000_000), w(1_000_000)]), u64::MAX);
-        assert_eq!(median_bound_ppm::<0>(&[]), u64::MAX, "no windows, no bound");
+        assert_eq!(
+            median_bound_ppm(&[w(1_000), w(1_000_000), w(2_000), w(1_000_000), w(1_000_000)], Window::gap_ppm),
+            u64::MAX
+        );
+        assert_eq!(median_bound_ppm::<0>(&[], Window::gap_ppm), u64::MAX, "no windows, no bound");
         // Even N: the median is the midpoint of the middle two, so a bound
         // needs N / 2 + 1 windows. Shares 0.1%, 0.1%, 50%, 50%: two 50%-off
         // windows can pull the midpoint 25% off, and the bound says 50%.
         let four = [w(1_000), w(1_000), w(500_000), w(500_000)];
-        assert_eq!(median_bound_ppm(&four), 500_000);
+        assert_eq!(median_bound_ppm(&four, Window::gap_ppm), 500_000);
         let mut rates = [truth_rate(), truth_rate(), truth_rate() / 2, truth_rate() / 2];
         let m = median(&mut rates).unwrap();
         assert!(m.abs_diff(truth_rate()) * 1_000_000 <= truth_rate() * 500_000, "{m}");
@@ -1534,7 +1578,7 @@ mod tests {
         .unwrap();
         assert_eq!((r.steady(), r.aside().count, pauses, taken), (5, 3, 3, 8));
         assert_eq!(timer_rate(r.windows()), 62_500_000);
-        assert_eq!(median_bound_ppm(r.windows()), 1_000, "10 µs of 10 ms");
+        assert_eq!(median_bound_ppm(r.windows(), Window::gap_ppm), 1_000, "10 µs of 10 ms");
     }
 
     #[test]
@@ -1570,7 +1614,7 @@ mod tests {
             // The 20% ones' least end gap is the first window's, 2,001 µs.
             assert!(fill.eq(core::iter::repeat_n(200, 2).chain(core::iter::repeat_n(2_001, 3 - steady_at.len()))));
             assert_eq!(timer_rate(r.windows()), hz);
-            assert_eq!(median_bound_ppm(r.windows()), bound);
+            assert_eq!(median_bound_ppm(r.windows(), Window::gap_ppm), bound);
         }
     }
 

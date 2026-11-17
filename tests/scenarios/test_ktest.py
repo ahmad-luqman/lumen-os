@@ -190,5 +190,7 @@ def test_in_kernel_tests_pass_with_calibrations_stalled_within_tolerance(boot, k
     assert re.search(
         rf"INFO  time: {name} calibration took 20 windows again, 0 of 5 kept steady", out
     ), out
-    assert "WARN  time" not in out, out
+    # Boot's own lines (the ktests warn on purpose, e.g. a PIT made to fail).
+    boot_lines = out[: out.index("TAP version")]
+    assert "WARN  time" not in boot_lines, boot_lines
     check_clock_diags(report, out)

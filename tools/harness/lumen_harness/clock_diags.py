@@ -42,7 +42,7 @@ TIMER_BRACKETS = re.compile(
 # and the TSC's (#139), each with its windows, retakes, how many are steady
 # and how far off the median can be. Retakes and the steady count aren't
 # bounded: they count how often a loaded host stalled boot, not the code. The
-# bound is, by each clock's tolerance (kernel/src/time.rs's
+# bound is, by each clock's tolerance (lumen_time's
 # TIMER_TOLERANCE_PPM and TSC_TOLERANCE_PPM): past it, boot warned.
 TIMER_TOLERANCE_PPM = 20_000
 TSC_TOLERANCE_PPM = 10_000
