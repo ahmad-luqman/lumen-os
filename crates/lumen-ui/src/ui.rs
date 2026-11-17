@@ -11,7 +11,7 @@ use lumen_gfx::{Rect, Surface};
 use crate::node::{Action, ActionKind, AutomationNode, InvokeError, NodeId, Role};
 use crate::text::Text;
 
-/// Padding around the whole tree and inside a stack's edge.
+/// Padding around the whole tree (stacks add none of their own).
 pub const PAD: u32 = 8;
 /// Space between a stack's children.
 pub const GAP: u32 = 8;
@@ -139,8 +139,10 @@ impl W {
     }
 }
 
-/// A retained widget tree: see the module's doc.
-#[derive(Clone, Debug, Default)]
+/// A retained widget tree: see the module's doc. `Clone` only in tests: a
+/// copy would share its widgets' node ids.
+#[derive(Debug, Default)]
+#[cfg_attr(test, derive(Clone))]
 pub struct Ui {
     widgets: Vec<W>,
     /// The widgets with no parent, top to bottom.
@@ -280,43 +282,52 @@ impl Ui {
     }
 
     /// Whether anything shown changed since the last call (the owner then
-    /// lays out, repaints, commits and publishes its tree).
+    /// repaints, commits and publishes its tree).
     pub fn take_changed(&mut self) -> bool {
         core::mem::take(&mut self.changed)
+    }
+
+    /// Mark the whole tree changed: repainted at the next
+    /// [`Ui::take_changed`] (a new palette, say).
+    pub fn invalidate(&mut self) {
+        self.changed = true;
     }
 
     // -- layout --------------------------------------------------------------
 
     /// Each widget at its preferred size, the top ones down from `area`'s
-    /// corner (padded), each stack's children one after another.
+    /// corner (padded), each stack's children one after another. Marks the
+    /// tree changed only if a widget moved or changed size.
     pub fn layout(&mut self, area: Rect, text: &mut dyn Text) {
+        // A widget's children come after it (made after their stack), so one
+        // pass from the last widget to the first sizes every child first.
         let mut sizes = alloc::vec![(0u32, 0u32); self.widgets.len()];
-        for i in 0..self.widgets.len() {
-            self.size(i, text, &mut sizes);
+        for i in (0..self.widgets.len()).rev() {
+            sizes[i] = self.size(i, text, &sizes);
         }
-        let (mut x, mut y) = (area.x() + PAD as i32, area.y() + PAD as i32);
+        let before: Vec<Rect> = self.widgets.iter().map(|w| w.bounds).collect();
+        let x = area.x() + PAD as i32;
+        let mut y = area.y() + PAD as i32;
         let top = self.top.clone();
         for i in top {
             self.place(i, x, y, &sizes);
             y += (sizes[i].1 + GAP) as i32;
-            x = area.x() + PAD as i32;
         }
-        self.changed = true;
+        if self.widgets.iter().zip(&before).any(|(w, b)| w.bounds != *b) {
+            self.changed = true;
+        }
     }
 
-    /// Widget `i`'s preferred size (memoized in `sizes`: a stack's children
-    /// come after it, so a size of 0 means not computed yet).
-    fn size(&self, i: usize, text: &mut dyn Text, sizes: &mut [(u32, u32)]) -> (u32, u32) {
-        if sizes[i] != (0, 0) {
-            return sizes[i];
-        }
+    /// Widget `i`'s preferred size, its children's in `sizes` already.
+    fn size(&self, i: usize, text: &mut dyn Text, sizes: &[(u32, u32)]) -> (u32, u32) {
         let line = text.line_height();
         let w = &self.widgets[i];
-        let size = match &w.kind {
+        match &w.kind {
             Kind::Stack(dir) => {
                 let mut size = (0u32, 0u32);
                 for (n, &c) in w.children.iter().enumerate() {
-                    let (cw, ch) = self.size(c, text, sizes);
+                    debug_assert!(c > i, "a child made before its stack");
+                    let (cw, ch) = sizes[c];
                     let gap = if n == 0 { 0 } else { GAP };
                     size = match dir {
                         Dir::Down => (size.0.max(cw), size.1 + gap + ch),
@@ -333,9 +344,7 @@ impl Ui {
                 let widest = items.iter().map(|(_, s)| text.width(s)).max().unwrap_or(0);
                 (widest + 2 * FIELD_PAD, items.len() as u32 * (line + 2 * ROW_PAD))
             }
-        };
-        sizes[i] = size;
-        size
+        }
     }
 
     fn place(&mut self, i: usize, x: i32, y: i32, sizes: &[(u32, u32)]) {
@@ -522,15 +531,21 @@ impl Ui {
         })
     }
 
-    /// The widgets in tree order (depth first, the top ones in turn).
-    fn order(&self) -> Vec<usize> {
+    /// The widgets in tree order (depth first, the top ones in turn), each
+    /// with its depth (1 for a top one).
+    fn walk(&self) -> Vec<(usize, u32)> {
         let mut out = Vec::with_capacity(self.widgets.len());
-        let mut stack: Vec<usize> = self.top.iter().rev().copied().collect();
-        while let Some(i) = stack.pop() {
-            out.push(i);
-            stack.extend(self.widgets[i].children.iter().rev());
+        let mut stack: Vec<(usize, u32)> = self.top.iter().rev().map(|&i| (i, 1)).collect();
+        while let Some((i, depth)) = stack.pop() {
+            out.push((i, depth));
+            stack.extend(self.widgets[i].children.iter().rev().map(|&c| (c, depth + 1)));
         }
         out
+    }
+
+    /// The widgets in tree order.
+    fn order(&self) -> Vec<usize> {
+        self.walk().into_iter().map(|(i, _)| i).collect()
     }
 
     // -- the automation tree ---------------------------------------------------
@@ -544,8 +559,7 @@ impl Ui {
     /// window's root, 0, is the compositor's). Client coordinates.
     pub fn nodes(&self) -> Vec<(u32, AutomationNode)> {
         let mut out = Vec::new();
-        let mut stack: Vec<(usize, u32)> = self.top.iter().rev().map(|&i| (i, 1)).collect();
-        while let Some((i, depth)) = stack.pop() {
+        for (i, depth) in self.walk() {
             let w = &self.widgets[i];
             let focused = self.window_focused && self.focus == Some(i);
             let node = match &w.kind {
@@ -569,7 +583,6 @@ impl Ui {
                     out.push((depth + 1, AutomationNode::list_item(*id, name, r, *selected, row, w.disabled)));
                 }
             }
-            stack.extend(w.children.iter().rev().map(|&c| (c, depth + 1)));
         }
         out
     }
@@ -595,8 +608,8 @@ impl Ui {
                 Kind::Button => {
                     let (bg, ink) = if w.disabled { (p.disabled, p.background) } else { (p.accent, p.accent_text) };
                     s.fill_rect(b, bg);
-                    let x = b.x() + ((b.w() as i32 - text.width(&w.name) as i32) / 2);
-                    text.draw(s, x, b.y() + (b.h() as i32 - line) / 2, &w.name, ink, b);
+                    let x = b.x() + centred(b.w(), text.width(&w.name));
+                    text.draw(s, x, b.y() + centred(b.h(), line as u32), &w.name, ink, b);
                 }
                 Kind::Checkbox(checked) => {
                     let boxed = Rect::new(b.x(), b.y() + (b.h() - BOX) as i32 / 2, BOX, BOX);
@@ -606,7 +619,7 @@ impl Ui {
                         s.fill_rect(Rect::new(boxed.x() + 3, boxed.y() + 3, BOX - 6, BOX - 6), p.accent);
                     }
                     let x = b.x() + (BOX + BOX_GAP) as i32;
-                    text.draw(s, x, b.y() + (b.h() as i32 - line) / 2, &w.name, fg, b);
+                    text.draw(s, x, b.y() + centred(b.h(), line as u32), &w.name, fg, b);
                 }
                 Kind::TextField(t) => {
                     s.fill_rect(b, p.field);
@@ -635,6 +648,11 @@ impl Ui {
             }
         }
     }
+}
+
+/// Where something `inner` long starts to sit centred in `outer`.
+fn centred(outer: u32, inner: u32) -> i32 {
+    (outer as i32 - inner as i32) / 2
 }
 
 /// A one-pixel outline of `r`.

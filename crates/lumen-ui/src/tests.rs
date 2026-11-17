@@ -7,9 +7,10 @@ use alloc::vec::Vec;
 
 use lumen_gfx::{Rect, Surface};
 
-use crate::counter::{Counter, Then};
+use crate::app::{Served, Then, serve};
+use crate::counter::Counter;
 use crate::node::{Action, ActionKind, InvokeError, Role, StateFlags, Value};
-use crate::reply::{NotStarted, Outcome, Reply};
+use crate::reply::{First, NotStarted, Reply};
 use crate::text::{FixedText, Text};
 use crate::ui::{GAP, Input, Key, PAD, Palette, Ui, UiEvent, Widget};
 
@@ -30,6 +31,11 @@ fn laid_out() -> Counter {
     c.ui_mut().layout(AREA, &mut FixedText);
     c.ui_mut().set_window_focused(true);
     c
+}
+
+/// Every node's raw id, in tree order.
+fn ids(ui: &Ui) -> Vec<u64> {
+    ui.nodes().iter().map(|(_, n)| n.id().get()).collect()
 }
 
 fn centre(r: Rect) -> (i32, i32) {
@@ -121,7 +127,7 @@ fn a_click_presses_only_where_it_went_down_and_came_up() {
     assert!(c.ui_mut().handle(Input::Up { x: ax, y: ay }).is_empty());
     assert_eq!(click(&mut c, |c| c.reset), Then::Carry);
     assert_eq!(c.count(), 0);
-    assert_eq!(click(&mut c, |c| c.quit), Then::Quit);
+    assert_eq!(click(&mut c, |c| c.quit), Then::Close);
 }
 
 #[test]
@@ -198,7 +204,7 @@ fn the_tree_lists_each_widget_with_its_role_value_and_state() {
         ]
     );
     // A group's children are its widgets' ids; the top ids are the root's.
-    let ids: Vec<u64> = nodes.iter().map(|(_, n)| n.id().get()).collect();
+    let ids = ids(c.ui());
     assert_eq!(c.ui().top_ids().iter().map(|i| i.get()).collect::<Vec<_>>(), [ids[0], ids[3], ids[7]]);
     assert_eq!(nodes[3].1.children().iter().map(|i| i.get()).collect::<Vec<_>>(), &ids[4..7]);
     // Unfocused, the window's focused widget doesn't say so.
@@ -209,7 +215,7 @@ fn the_tree_lists_each_widget_with_its_role_value_and_state() {
 #[test]
 fn ids_stay_the_same_across_changes_and_repaints() {
     let mut c = laid_out();
-    let before: Vec<u64> = c.ui().nodes().iter().map(|(_, n)| n.id().get()).collect();
+    let before = ids(c.ui());
     let mut s = Surface::new(400, 200);
     for _ in 0..3 {
         click(&mut c, |c| c.add);
@@ -217,11 +223,11 @@ fn ids_stay_the_same_across_changes_and_repaints() {
         c.ui_mut().layout(AREA, &mut FixedText);
         c.ui().paint(&mut s, &mut FixedText, &PALETTE);
     }
-    let after: Vec<u64> = c.ui().nodes().iter().map(|(_, n)| n.id().get()).collect();
+    let after = ids(c.ui());
     assert_eq!(before, after);
     // Another tree's ids are new ones.
     let other = laid_out();
-    let theirs: Vec<u64> = other.ui().nodes().iter().map(|(_, n)| n.id().get()).collect();
+    let theirs = ids(other.ui());
     assert!(theirs.iter().all(|id| !before.contains(id)));
 }
 
@@ -296,37 +302,126 @@ fn set_value_and_focus_act_like_typing_and_clicking() {
     assert_eq!(ui.focused(), Some(ok));
 }
 
-/// What a window's owner does with a request: run it only if it can take
-/// it (`Reply::start`), then answer.
-fn serve(c: &mut Counter, reply: &mut Reply<Result<Value, InvokeError>>, node: u64, action: &Action) {
+/// What a window's owner does with a request: run it (the real [`serve`])
+/// only if it can take it (`Reply::start`), then answer.
+fn owner(c: &mut Counter, reply: &mut Reply<Served>, node: u64, action: &Action) {
     if reply.start().is_err() {
         return;
     }
-    let result = c.ui_mut().invoke(node, action).map(|events| {
-        c.apply(&events);
-        Value::Text(String::from(c.ui().text(c.count_label).unwrap_or("")))
-    });
-    reply.finish(result);
+    let served = serve(c, &mut FixedText, AREA, node, action);
+    assert!(reply.finish(served));
 }
 
 #[test]
 fn a_request_cancelled_at_its_deadline_then_reached_by_the_owner_leaves_the_state_unchanged() {
     // `ui invoke <Add> press`: the asker's deadline passes before the owner
     // takes the request (cancelled), the owner reaches it afterwards and
-    // skips it: Add was not pressed. A retry then presses once.
+    // skips it: Add was not pressed. A retry then presses once, answering
+    // Add's row.
     let mut c = laid_out();
     let add = c.ui().id(c.add).get();
     let before = shown(c.ui());
     let mut reply = Reply::new();
-    assert_eq!(reply.after_deadline(), Outcome::Cancelled);
-    serve(&mut c, &mut reply, add, &Action::Press);
+    assert_eq!(reply.after_first_deadline(), First::Cancelled);
+    owner(&mut c, &mut reply, add, &Action::Press);
     assert_eq!(shown(c.ui()), before);
     assert_eq!(c.count(), 0);
     assert_eq!(reply.start(), Err(NotStarted::Cancelled));
     let mut retry = Reply::new();
-    serve(&mut c, &mut retry, add, &Action::Press);
-    assert_eq!(retry.after_deadline(), Outcome::Answered(Ok(Value::Text(String::from("1")))));
+    owner(&mut c, &mut retry, add, &Action::Press);
+    match retry.after_first_deadline() {
+        First::Answered(Served::Row { depth, node }) => {
+            assert_eq!((depth, node.id().get(), node.name()), (2, add, "Add"));
+        }
+        other => panic!("{other:?}"),
+    }
     assert_eq!(c.count(), 1);
+}
+
+#[test]
+fn serve_answers_the_row_the_error_or_that_the_window_closed() {
+    let mut c = laid_out();
+    let count = c.ui().id(c.count_label).get();
+    let quit = c.ui().id(c.quit).get();
+    assert_eq!(
+        serve(&mut c, &mut FixedText, AREA, count, &Action::Press),
+        Served::Error(InvokeError::NotAllowed(Role::Label, ActionKind::Press))
+    );
+    assert_eq!(serve(&mut c, &mut FixedText, AREA, 0, &Action::Press), Served::Error(InvokeError::NoNode));
+    assert_eq!(serve(&mut c, &mut FixedText, AREA, quit, &Action::Press), Served::ClosedItsWindow);
+}
+
+#[test]
+fn an_action_that_removes_its_node_answers_that_it_ran() {
+    // An app whose button's press removes the button (its handler builds a
+    // new tree): it ran, so the answer says so rather than "changed
+    // nothing" (a retry would press twice).
+    struct Vanishing {
+        ui: Ui,
+        pressed: u32,
+    }
+    impl crate::app::App for Vanishing {
+        fn ui(&mut self) -> &mut Ui {
+            &mut self.ui
+        }
+        fn apply(&mut self, events: &[UiEvent]) -> Then {
+            if !events.is_empty() {
+                self.pressed += 1;
+                self.ui = Ui::new();
+                self.ui.label(None, "Done", "yes");
+            }
+            Then::Carry
+        }
+    }
+    let mut ui = Ui::new();
+    let gone = ui.button(None, "Once");
+    ui.layout(AREA, &mut FixedText);
+    let id = ui.id(gone).get();
+    let mut app = Vanishing { ui, pressed: 0 };
+    assert_eq!(serve(&mut app, &mut FixedText, AREA, id, &Action::Press), Served::RanNodeGone);
+    assert_eq!(app.pressed, 1);
+}
+
+#[test]
+fn every_action_a_widget_role_lists_reaches_a_handler() {
+    // For each role a widget has, every action `Role::actions` lists runs
+    // (no `NotAllowed`). The window root's actions are the kernel's
+    // (`ui::root_action`, a ktest); `menu` and `menuitem` have no widget
+    // yet.
+    let mut ui = Ui::new();
+    let button = ui.button(None, "B");
+    let checkbox = ui.checkbox(None, "C", false);
+    let field = ui.text_field(None, "T", "");
+    let list = ui.list(None, "L", &["a", "b"]);
+    ui.layout(AREA, &mut FixedText);
+    let item = ui.nodes().iter().find(|(_, n)| n.role() == Role::ListItem).map(|(_, n)| n.id()).expect("an item");
+    let nodes = [
+        (Role::Button, ui.id(button)),
+        (Role::Checkbox, ui.id(checkbox)),
+        (Role::TextField, ui.id(field)),
+        (Role::List, ui.id(list)),
+        (Role::ListItem, item),
+    ];
+    for (role, id) in nodes {
+        for &kind in role.actions() {
+            let action = if kind == ActionKind::SetValue {
+                Action::SetValue(String::from("v"))
+            } else {
+                Action::parse(kind.name(), &[]).expect("an action")
+            };
+            assert!(ui.invoke(id.get(), &action).is_ok(), "{role:?} {kind:?}");
+        }
+    }
+    // Labels and stacks list none; anything else is refused.
+    assert!(Role::Label.actions().is_empty() && Role::Group.actions().is_empty());
+}
+
+#[test]
+fn every_role_and_action_kind_is_listed_once() {
+    // `ALL` holds each variant once, in order (its order is also checked at
+    // compile time); a new variant must join it.
+    assert_eq!(Role::ALL.len(), Role::MenuItem.index() + 1);
+    assert_eq!(ActionKind::ALL.len(), ActionKind::Restore.index() + 1);
 }
 
 #[test]
@@ -355,6 +450,21 @@ fn painting_draws_each_widget_inside_its_bounds() {
 #[test]
 fn changes_are_reported_once() {
     let mut c = laid_out();
+    assert!(c.ui_mut().take_changed());
+    assert!(!c.ui_mut().take_changed());
+    // Laid out again with nothing moved: nothing changed.
+    c.ui_mut().layout(AREA, &mut FixedText);
+    assert!(!c.ui_mut().take_changed());
+    // A count that widens its label moves nothing else but the label.
+    for _ in 0..10 {
+        click(&mut c, |c| c.add);
+    }
+    let _ = c.ui_mut().take_changed();
+    let before = c.ui().bounds(c.count_label);
+    c.ui_mut().layout(AREA, &mut FixedText);
+    assert!(c.ui_mut().take_changed(), "the label grew");
+    assert!(c.ui().bounds(c.count_label).w() > before.w());
+    c.ui_mut().invalidate();
     assert!(c.ui_mut().take_changed());
     assert!(!c.ui_mut().take_changed());
     click(&mut c, |c| c.add);

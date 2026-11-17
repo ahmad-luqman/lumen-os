@@ -18,6 +18,9 @@
 //! - **Actions** ([`Ui::invoke`]) run the handler a real click or key
 //!   reaches, so `press` and a click leave the same state; errors change
 //!   nothing.
+//! - **An app** ([`App`]): a window's tree and what it does with what the
+//!   tree reports; [`serve`] runs a request on it (the same handler a click
+//!   reaches) and says what to answer once the tree is published.
 //! - **Counter** ([`counter`]): the demo app, its logic here so tests
 //!   drive the app the scenarios use.
 //! - **A request's reply** ([`Reply`]): the state machine of `ui invoke`'s
@@ -27,6 +30,7 @@
 
 extern crate alloc;
 
+pub mod app;
 pub mod counter;
 pub mod node;
 pub mod reply;
@@ -36,7 +40,8 @@ pub mod ui;
 #[cfg(test)]
 mod tests;
 
+pub use app::{App, Served, Then, serve};
 pub use node::{Action, ActionKind, AutomationNode, InvokeError, NodeId, Role, StateFlags, Value, ValueKind};
-pub use reply::{NotStarted, Outcome, Reply};
+pub use reply::{First, NotStarted, Phase, Reply, Second};
 pub use text::{FixedText, Text};
 pub use ui::{Input, Key, Palette, Ui, UiEvent, Widget};

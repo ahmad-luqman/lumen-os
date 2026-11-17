@@ -81,6 +81,11 @@ impl Role {
         Role::MenuItem,
     ];
 
+    /// Its place in [`Role::ALL`] (checked at compile time).
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
     /// The name `ui tree` prints (`where role = button`).
     pub fn name(self) -> &'static str {
         match self {
@@ -108,7 +113,8 @@ impl Role {
             Role::TextField => &[A::SetValue, A::Focus],
             Role::List => &[A::Focus],
             Role::ListItem => &[A::Select, A::Press],
-            Role::Menu | Role::MenuItem => &[A::Press],
+            Role::Menu => &[A::Press, A::Focus],
+            Role::MenuItem => &[A::Press],
         }
     }
 
@@ -134,6 +140,22 @@ impl Role {
         }
     }
 }
+
+// Every role and every action kind at its own place in its `ALL`, in
+// declaration order (one put in twice or out of order fails to compile;
+// the host tests check each list's length against its variants).
+const _: () = {
+    let mut i = 0;
+    while i < Role::ALL.len() {
+        assert!(Role::ALL[i].index() == i);
+        i += 1;
+    }
+    let mut i = 0;
+    while i < ActionKind::ALL.len() {
+        assert!(ActionKind::ALL[i].index() == i);
+        i += 1;
+    }
+};
 
 /// A node's value.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -203,6 +225,11 @@ impl ActionKind {
         ActionKind::Restore,
     ];
 
+    /// Its place in [`ActionKind::ALL`] (checked at compile time).
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
     /// The word `ui invoke` takes and `ui tree` prints.
     pub fn name(self) -> &'static str {
         match self {
@@ -266,7 +293,7 @@ pub enum InvokeError {
 impl fmt::Display for InvokeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            InvokeError::NoNode => f.write_str("no such node"),
+            InvokeError::NoNode => f.write_str("no node"),
             InvokeError::NoSuchAction => {
                 f.write_str("no such action (press, set_value, select, focus, close, minimize, restore)")
             }
@@ -565,7 +592,7 @@ mod tests {
             (Role::TextField, Some(V::Text), &[A::SetValue, A::Focus], f.with(d)),
             (Role::List, Some(V::Selected), &[A::Focus], f.with(d)),
             (Role::ListItem, None, &[A::Select, A::Press], s.with(d)),
-            (Role::Menu, None, &[A::Press], f.with(d).with(e)),
+            (Role::Menu, None, &[A::Press, A::Focus], f.with(d).with(e)),
             (Role::MenuItem, None, &[A::Press], d),
         ];
         assert_eq!(table.map(|row| row.0), Role::ALL);

@@ -118,11 +118,12 @@ fn a_table_prints_as_the_system_commands_lay_out_rows() {
     cpus().render(&mut out);
     assert_eq!(
         out,
-        // ("stalled" makes busy 7 wide.)
-        "  cpu  scheduler    ticks          busy\n\
-         \x20   0  running      1234            97%\n\
-         \x20   1  running      1200        stalled\n\
-         \x20   2  not started  0                 -\n"
+        // ("stalled" makes busy 7 wide; "not started", quoted for its
+        // space, makes scheduler 13.)
+        "  cpu  scheduler      ticks          busy\n\
+         \x20   0  running        1234            97%\n\
+         \x20   1  running        1200        stalled\n\
+         \x20   2  \"not started\"  0                 -\n"
     );
     let mut out = String::new();
     vectors().render(&mut out);
@@ -138,7 +139,7 @@ fn a_wide_value_widens_its_column_for_every_row() {
     t.render(&mut out);
     assert_eq!(
         out,
-        "  use                         count\n  a name longer than sixteen  1\n  short                       2\n"
+        "  use                           count\n  \"a name longer than sixteen\"  1\n  short                         2\n"
     );
 }
 
@@ -521,4 +522,40 @@ fn chunks_are_whole_lines_of_about_a_size() {
     assert_eq!(pipe::chunks("", 512).count(), 0);
     // A line longer than the size ends the piece it is in.
     assert_eq!(pipe::chunks("a\nbbbbbb\nc\n", 3).collect::<Vec<_>>(), ["a\nbbbbbb\n", "c\n"]);
+}
+
+#[test]
+fn a_text_cell_that_would_not_read_back_as_one_word_is_quoted() {
+    // Empty, holding whitespace, or a text `-` (an absent value's mark):
+    // double-quoted, `"` and `\` escaped; the shell's word splitting reads
+    // every row back into its cells. Other cells, and an absent `-`, print
+    // as they are.
+    let columns = [
+        Column::new("name", Kind::Text, Align::Left, 0),
+        Column::new("value", Kind::Text, Align::Left, 0),
+        Column::new("n", Kind::Int, Align::Right, 0),
+    ];
+    let mut t = Table::new(&columns);
+    let cells = [
+        ("File name", Value::Text(String::new())),
+        ("Add", Value::Text(String::from("-"))),
+        ("say \"hi\" \\ there", Value::Absent("-")),
+        ("plain", Value::Text(String::from("x"))),
+    ];
+    for (name, value) in &cells {
+        t.push(vec![Value::Text(name.to_string()), value.clone(), Value::Int(7)]);
+    }
+    let mut out = String::new();
+    t.render(&mut out);
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[1].starts_with("  \"File name\"  ") && lines[1].contains("  \"\"  "), "{out}");
+    assert!(lines[2].contains("  \"-\"  ") && lines[3].contains("  -  "), "{out}");
+    assert!(lines[4].starts_with("  plain  ") && !lines[4].contains('"'), "{out}");
+    let read: Vec<Vec<String>> = lines[1..].iter().map(|l| words::split(l).expect("splits")).collect();
+    assert_eq!(read[0], strings(&["File name", "", "7"]));
+    assert_eq!(read[1], strings(&["Add", "-", "7"]));
+    assert_eq!(read[2], strings(&["say \"hi\" \\ there", "-", "7"]));
+    assert_eq!(read[3], strings(&["plain", "x", "7"]));
+    assert_eq!(pipe::quoted("x"), "x");
+    assert_eq!(pipe::quoted(""), "\"\"");
 }

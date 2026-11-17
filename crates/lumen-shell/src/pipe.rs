@@ -115,6 +115,26 @@ impl Value {
     }
 }
 
+/// A text cell as a records table prints it: as it is, unless it is empty,
+/// holds whitespace or is exactly `-` (an absent value's mark), then in
+/// double quotes with `"` and `\` escaped by a backslash, as the shell's
+/// word splitting (and POSIX `shlex`) reads it back.
+pub fn quoted(text: &str) -> String {
+    if !text.is_empty() && text != "-" && !text.chars().any(char::is_whitespace) {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
 /// Records: rows of values under named columns. Column names are unique,
 /// and every row has a value for each column, of the kind the column holds
 /// (or [`Value::Absent`]).
@@ -162,10 +182,24 @@ impl Table {
     /// The headings, then a line per row: each line indented by two spaces,
     /// the columns two spaces apart, each as wide as its widest value (or
     /// heading, or [`Column::width`]); a left-aligned last column isn't
-    /// padded on the right.
+    /// padded on the right. A text value that is empty, holds whitespace or
+    /// is exactly `-` is printed double-quoted ([`quoted`]), so every row
+    /// splits into its cells as the shell's words do (and `-` stays an
+    /// absent value's).
     pub fn render(&self, out: &mut String) {
-        let cells: Vec<Vec<String>> =
-            self.rows.iter().map(|row| row.iter().zip(&self.columns).map(|(v, c)| v.show(c.kind)).collect()).collect();
+        let cells: Vec<Vec<String>> = self
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .zip(&self.columns)
+                    .map(|(v, c)| match v {
+                        Value::Text(t) => quoted(t),
+                        _ => v.show(c.kind),
+                    })
+                    .collect()
+            })
+            .collect();
         let widths: Vec<usize> = self
             .columns
             .iter()
