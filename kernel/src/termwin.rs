@@ -372,10 +372,10 @@ crate::ktest!(
         let deadline = crate::time::now_ns() + 5_000_000_000;
         let ran = |s: &Shared| term::view_text_of(&s.term.lock()).rows.iter().any(|r| r == "from-the-window");
         while !ran(&shared) {
-            kassert!(crate::time::now_ns() < deadline);
             // The shell's output pokes the owner: its wait ends with no
-            // event.
+            // event, long before the deadline.
             kassert!(h.wait_event_until(Some(deadline)).is_none());
+            kassert!(crate::time::now_ns() < deadline);
         }
         kassert!(shared.output.load(Ordering::Acquire));
         shared.closed.store(true, Ordering::Release);

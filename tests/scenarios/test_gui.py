@@ -551,7 +551,9 @@ def click(m: Machine, x: int, y: int) -> None:
 
 
 def wait_focused(m: Machine, title: str) -> None:
-    gui.wait_for(m, f"{title} focused", lambda: gui.window(m, title)["focused"], lambda f: f == "yes")
+    gui.wait_for(
+        m, f"{title} focused", lambda: gui.window(m, title)["focused"], lambda f: f == "yes"
+    )
 
 
 def thread_names(m: Machine) -> list[str]:
@@ -560,7 +562,9 @@ def thread_names(m: Machine) -> list[str]:
 
 
 def heap_used(m: Machine) -> int:
-    found = re.search(r"^heap: \d+ bytes mapped at 0x[0-9a-f]+, (\d+) used", run(m, "heap"), re.MULTILINE)
+    found = re.search(
+        r"^heap: \d+ bytes mapped at 0x[0-9a-f]+, (\d+) used", run(m, "heap"), re.MULTILINE
+    )
     assert found, "no heap line"
     return int(found[1])
 
@@ -642,7 +646,9 @@ def test_closing_a_terminal_window_frees_it(boot):
             m,
             f"{title} closed",
             lambda: ([w["title"] for w in gui.windows(m)], thread_names(m)),
-            lambda got: title not in got[0] and "terminal" not in got[1] and "term-shell" not in got[1],
+            lambda got: (
+                title not in got[0] and "terminal" not in got[1] and "term-shell" not in got[1]
+            ),
             30,
         )
         gui.pointer_move(m, 1200, 790)
