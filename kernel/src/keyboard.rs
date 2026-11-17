@@ -29,7 +29,12 @@
 //! single-consumer queue (`lumen_queue::ByteQueue`), discarding bytes from
 //! the second port (a mouse) and counting and discarding those flagged with
 //! a parity or timeout error, then wakes the threads waiting for a key
-//! ([`wait_for_bytes_or`]). Readers ([`read_key`]: the virtual terminals'
+//! ([`wait_for_bytes_or`]). It also counts the keys pressed among port 1's
+//! bytes, queued or dropped (`lumen_input::Presses`: one per key, whatever
+//! its prefix), as they arrive, before any reader decodes them, under one
+//! lock with the push (a ktest checks a dropped byte's press counts),
+//! and the keys held now: `kbd`'s `presses` and `held`, by which the
+//! harness confirms each key it typed reached IRQ 1, released (#149). Readers ([`read_key`]: the virtual terminals'
 //! router, `crate::vt`) decode them with the `pc-keyboard` crate under a
 //! lock, in the layout `lumen.keymap=` names (`us` without one, or for a
 //! name it doesn't know, with a warning), into characters (Ctrl and a
@@ -41,6 +46,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use log::{debug, info, warn};
+use lumen_input::Presses;
 use lumen_queue::ByteQueue;
 use pc_keyboard::layouts::{
     AnyLayout, Azerty, Colemak, De105Key, Dvorak104Key, FiSe105Key, Jis109Key, No105Key, Uk105Key, Us104Key,
@@ -98,8 +104,18 @@ static KEYBOARD: SpinLock<Option<Keyboard>> = SpinLock::new(None);
 static STATUS: SpinLock<Option<Status>> = SpinLock::new(None);
 /// Keyboard interrupts taken.
 static IRQS: AtomicU64 = AtomicU64::new(0);
-/// Bytes put on the queue.
-static BYTES: AtomicU64 = AtomicU64::new(0);
+/// What the queue's producer ([`take`]) counted of port 1's bytes, under
+/// one lock with each byte's push, so [`stats`] never shows a press without
+/// its byte queued or dropped.
+static ARRIVED: SpinLock<Arrived> = SpinLock::new(Arrived { presses: Presses::new(), bytes: 0 });
+
+struct Arrived {
+    /// Keys pressed among the bytes, queued or dropped (and the prefix
+    /// seen so far).
+    presses: Presses,
+    /// Bytes put on the queue.
+    bytes: u64,
+}
 /// Bytes the controller flagged with a parity or timeout error (discarded).
 static LINE_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Bytes the decoder refused (the keyboard's own overrun code 0xff among
@@ -464,27 +480,44 @@ fn on_irq() {
 }
 
 /// Move up to [`BYTES_PER_IRQ`] waiting bytes from the controller into the
-/// queue, discarding the second port's and those with a line error, then
-/// wake the threads waiting for a key if any byte was queued. With
-/// interrupts off, on the boot CPU: the queue's only producer.
+/// queue ([`take`]: counting the keys pressed, discarding the second port's
+/// bytes and those with a line error), then wake the threads waiting for a
+/// key if any byte was queued. With interrupts off, on the boot CPU: the
+/// queue's only producer.
 fn drain() {
-    let before = BYTES.load(Ordering::Relaxed);
     debug_assert!(!arch::irq::enabled() && arch::cpu_index() == 0, "the keyboard queue's producer is the boot CPU");
+    let mut queued = false;
     for _ in 0..BYTES_PER_IRQ {
         let status = i8042::status();
         if status & i8042::OUTPUT_FULL == 0 {
             break;
         }
-        let byte = i8042::read_data();
-        if status & i8042::LINE_ERROR != 0 {
-            LINE_ERRORS.fetch_add(1, Ordering::Relaxed);
-        } else if status & i8042::FROM_PORT2 == 0 && QUEUE.push(byte) {
-            BYTES.fetch_add(1, Ordering::Relaxed); // (a full queue counts it: `dropped`)
-        }
+        queued |= take(status, i8042::read_data());
     }
-    if BYTES.load(Ordering::Relaxed) != before {
+    if queued {
         WAITING.wake_all();
     }
+}
+
+/// The producer's step for one byte read from the controller with its
+/// `status`: a line error is counted and discarded, a byte from port 2
+/// discarded; any other is fed to the press count and pushed onto the
+/// queue (a full queue drops it and counts that: `dropped`), both under
+/// [`ARRIVED`]'s lock. True if it was queued. (The producer: boot CPU,
+/// interrupts off.)
+fn take(status: u8, byte: u8) -> bool {
+    if status & i8042::LINE_ERROR != 0 {
+        LINE_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    if status & i8042::FROM_PORT2 != 0 {
+        return false;
+    }
+    let mut arrived = ARRIVED.lock();
+    arrived.presses.feed(byte);
+    let queued = QUEUE.push(byte);
+    arrived.bytes += u64::from(queued);
+    queued
 }
 
 pub use pc_keyboard::KeyCode;
@@ -570,6 +603,11 @@ pub struct Stats {
     pub irqs: u64,
     /// Bytes put on the queue.
     pub bytes: u64,
+    /// Keys pressed among the bytes that arrived (queued or dropped), as
+    /// the producer's step ([`take`]) counts them (`lumen_input::Presses`).
+    pub presses: u64,
+    /// Keys held now among those: pressed, not yet released.
+    pub held: u32,
     /// Bytes dropped because the queue was full.
     pub dropped: u64,
     pub undecoded: u64,
@@ -580,18 +618,71 @@ pub struct Stats {
 
 pub fn stats() -> Stats {
     let status = *STATUS.lock();
+    // Under the producer's lock: a press, its byte and its drop together.
+    let (presses, held, bytes, dropped) = {
+        let arrived = ARRIVED.lock();
+        (arrived.presses.count(), arrived.presses.held(), arrived.bytes, QUEUE.dropped())
+    };
     Stats {
         layout: KEYBOARD.lock().as_ref().map_or("none", |k| k.layout),
         route: status.and_then(|s| s.route),
         result: status.map(|s| s.result),
         irqs: IRQS.load(Ordering::Relaxed),
-        bytes: BYTES.load(Ordering::Relaxed),
-        dropped: QUEUE.dropped(),
+        bytes,
+        presses,
+        held,
+        dropped,
         undecoded: UNDECODED.load(Ordering::Relaxed),
         line_errors: LINE_ERRORS.load(Ordering::Relaxed),
         skipped: SKIPPED.load(Ordering::Relaxed),
     }
 }
+
+crate::ktest!(
+    fn a_key_counts_as_it_arrives_even_when_dropped() {
+        // The producer's step counts a press as its byte arrives, before
+        // any reader decodes it, and also when the queue has no room for
+        // it (dropped), and holds the key until its release arrives; a
+        // release is queued but no press; a byte with a line error, or
+        // from port 2, is neither (a line error is counted as one). (The
+        // queue's producer runs with interrupts off on the boot CPU, as
+        // here; nothing reads the queue in the test kernel meanwhile.)
+        use crate::{kassert, kassert_eq};
+        /// Empties the queue however the test ends.
+        struct Drained;
+        impl Drop for Drained {
+            fn drop(&mut self) {
+                while QUEUE.pop().is_some() {}
+            }
+        }
+        let _off = arch::irq::push_off();
+        let _drained = Drained;
+        while queue_for_test(&[0x9e]) {}
+        let before = stats();
+        kassert!(!take(0, 0x1e)); // (no room)
+        let full = stats();
+        kassert_eq!(
+            (full.presses, full.held, full.bytes, full.dropped),
+            (before.presses + 1, before.held + 1, before.bytes, before.dropped + 1)
+        );
+        while QUEUE.pop().is_some() {}
+        kassert!(take(0, 0x9e) && take(0, 0x30));
+        let unread = stats();
+        kassert_eq!(
+            (unread.presses, unread.held, unread.bytes, unread.dropped),
+            (full.presses + 1, before.held + 1, full.bytes + 2, full.dropped)
+        );
+        kassert!(take(0, 0xb0));
+        kassert_eq!(stats().held, before.held);
+        kassert!(!take(i8042::LINE_ERROR, 0x1e) && !take(i8042::FROM_PORT2, 0x1e));
+        let after = stats();
+        kassert_eq!(
+            (after.presses, after.held, after.bytes, after.line_errors),
+            (unread.presses, before.held, unread.bytes + 1, unread.line_errors + 1)
+        );
+        Ok(())
+    }
+);
 
 /// Every character set-1 scancodes `bytes` make in layout `name`.
 #[cfg(feature = "ktest")]
