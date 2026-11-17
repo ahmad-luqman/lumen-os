@@ -42,9 +42,16 @@ impl Metrics {
     /// The frame whose client area is `client_w` by `client_h` with its
     /// top-left corner at (`x`, `y`).
     pub fn frame_for(&self, x: i32, y: i32, client_w: u32, client_h: u32) -> Rect {
+        let (w, h) = self.frame_size(client_w, client_h);
+        Rect::new(x, y, w, h)
+    }
+
+    /// The size of a frame around a `client_w` by `client_h` client area,
+    /// before [`Rect::new`] shortens it to keep its edges in `i32`.
+    pub fn frame_size(&self, client_w: u32, client_h: u32) -> (u32, u32) {
         let w = client_w.saturating_add(self.border.saturating_mul(2));
         let h = client_h.saturating_add(self.title_h).saturating_add(self.border);
-        Rect::new(x, y, w, h)
+        (w, h)
     }
 
     /// The title bar: the frame's top `title_h` rows.

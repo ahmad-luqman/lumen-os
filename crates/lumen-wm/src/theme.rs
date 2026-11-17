@@ -80,6 +80,7 @@ impl Theme {
     }
 
     /// Every colour with its field's name.
+    #[cfg(test)]
     pub fn colours(&self) -> [(&'static str, u32); 17] {
         [
             ("desktop", self.desktop),
@@ -105,6 +106,7 @@ impl Theme {
     /// The colours drawn on each other (foreground, background), each with
     /// the least contrast ratio it must have, in tenths (WCAG's: 4.5 for
     /// text, 3 for a glyph or an outline).
+    #[cfg(test)]
     pub fn pairs(&self) -> [(&'static str, u32, u32, u32); 7] {
         [
             ("title_focused_text on title_focused", self.title_focused_text, self.title_focused, 45),
@@ -140,7 +142,8 @@ mod tests {
     fn both_palettes_are_complete_and_readable() {
         for t in Theme::ALL {
             // Naming every field without `..`: a field added to `Theme`
-            // fails to compile here until `colours` lists it too.
+            // fails to compile here, and the array below then needs it, and
+            // the comparison with `colours()` makes that list it too.
             let Theme {
                 name: _,
                 desktop,

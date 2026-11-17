@@ -232,13 +232,16 @@ own PR that updates that doc first.
 - `crates/lumen-wm`: the desktop's window-manager logic (#152): frame
   geometry (`Metrics`: title bar, close box, client, borders; `Part`),
   `Wm` (stacking, focus: a click focuses and raises, closing the focused
-  one focuses the front one; hit testing; a drag from a title bar clamped
-  to keep a strip on the screen; the implicit grab of a client press;
-  close-box clicks on release; `interrupt`/`resume` for a pause or a gap
-  so no window keeps a button; every operation returns its `Damage` and
-  `Delivery`s), a window's `EventQueue` (sticky `Lost`/focus/`Close`
-  flags delivered in place, presses, moves and requests rationed past
-  48 of 64, releases only after their press) and the light and dark
+  one focuses the front one; hit testing; a left drag from a title bar
+  clamped to keep a strip on the screen; the implicit grab of a client
+  press, until its last button is up or it loses the focus; close-box
+  clicks on a left release; `interrupt`/`resume(baseline)` for a pause or
+  a gap so no window keeps a button, focus changes held back while
+  paused; every operation returns its `Damage` and `Delivery`s), a
+  window's `EventQueue` (sticky `Lost`/focus/`Close` flags delivered in
+  place and never pushable, presses, moves and requests rationed past 48
+  of 64, releases only after their press, strays counted apart),
+  `deliver` (a `Delivery` onto its window's queue) and the light and dark
   `Theme`s (host-tested, incl. a randomized model of damage-only
   repainting with focus, and press-pause-resume-release through the
   queue).
