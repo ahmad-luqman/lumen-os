@@ -223,8 +223,10 @@ def test_boot_calibration_agrees_with_both_clocks(boot):
 # shell's `crash`), so a real boot reaches the fill-in, its warning and its
 # panic (#139). An end stall of over 0.5% makes every window unsteady: all 20
 # are taken and the five with the smallest bounds fill in; the median's bound
-# is then about the stall (one delayed read is a burst, not a slow host, so
-# windows don't stretch for it). Its verdict is by each clock's tolerance
+# is then about the stall. (A stalled end counts for at most two reads, so
+# HPET windows stretch for it only where reads are slow, as on KVM, and a
+# little; each window stalls a share of its own run, so the bound stays about
+# the stall either way.) Its verdict is by each clock's tolerance
 # (lumen_time's: the TSC's 1%, the timer's 2%, the TSC's error included).
 FILLED = r"took 20 windows again, 0 of 5 kept steady, median within (\d+\.\d)%"
 PANIC = re.compile(r"\npanic: (.*)\n")

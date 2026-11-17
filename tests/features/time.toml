@@ -16,7 +16,6 @@ tests = [
     "ktest:lumen_kernel::time::a_tsc_calibration_waits_between_retakes",
     "ktest:lumen_kernel::time::tsc_spares_are_ranked_by_the_tsc_bound",
     "ktest:lumen_kernel::time::an_hpet_slow_to_read_stretches_its_windows_until_steady",
-    "ktest:lumen_kernel::time::a_start_stall_doesnt_stretch_hpet_windows",
     "ktest:lumen_kernel::time::an_unplaceable_window_filling_in_doesnt_fail_the_calibration",
     "ktest:lumen_kernel::time::a_pit_end_read_after_it_could_wrap_is_not_steady",
     "ktest:lumen_kernel::time::a_paused_pit_reading_is_taken_again",

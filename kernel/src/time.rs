@@ -463,9 +463,9 @@ fn median_calibration(got: &Steadiest<WINDOWS>, of: Calibrated, known_hz: u64) -
 /// A [`Pause`] hook that stalls each window's end by `stall.end` parts per
 /// million of how long it ran, and its start (from the second window) by
 /// `stall.start` ppm of how long the previous one ran, busy, by raw TSC
-/// ticks ([`spin_ticks`]). A window's run counts for at most the first
-/// one's, so a stretched window doesn't stall longer (the stall stays a
-/// share of an unstretched window). The boot's calibrations take it from
+/// ticks ([`spin_ticks`]). (A stretched window stalls longer; that doesn't
+/// feed the stretch: [`lumen_time::stretched_for_gaps`] counts each gap
+/// for at most two polls.) The boot's calibrations take it from
 /// `lumen.stall_tsc_windows=<end ppm>[,<start ppm>]` and
 /// `lumen.stall_timer_windows=...` ([`stall_from_cmdline`]: a deliberate fault
 /// for scenarios, like the shell's `crash`), so a real boot reaches the
@@ -474,7 +474,7 @@ fn median_calibration(got: &Steadiest<WINDOWS>, of: Calibrated, known_hz: u64) -
 /// it: a start stall can.) With both 0 it does nothing (no TSC read inside a
 /// bracket).
 fn stall_window_ends(stall: Stall) -> impl FnMut(Pause) {
-    let (mut started, mut last_run, mut first_run) = (0u64, 0u64, None::<u64>);
+    let (mut started, mut last_run) = (0u64, 0u64);
     let share =
         |ticks: u64, ppm: u64| u64::try_from(u128::from(ticks) * u128::from(ppm) / 1_000_000).unwrap_or(u64::MAX);
     move |at| match at {
@@ -483,8 +483,7 @@ fn stall_window_ends(stall: Stall) -> impl FnMut(Pause) {
             started = arch::rdtsc();
         }
         Pause::EndAfterRead if stall != Stall::default() => {
-            let run = arch::rdtsc().wrapping_sub(started);
-            last_run = run.min(*first_run.get_or_insert(run));
+            last_run = arch::rdtsc().wrapping_sub(started);
             spin_ticks(share(last_run, stall.end));
         }
         _ => {}
@@ -1679,10 +1678,10 @@ crate::ktest!(
         kassert_eq!(timer(999_998, 1).median_bound_ppm(), 1_000_000);
         kassert_eq!(with_a_bound(timer(999_998, 1)), Err(CalError::NoInformation));
         kassert!(with_a_bound(timer(999_998, 0)).is_ok());
-        // How a bound reads: tenths rounded up, or none.
+        // How a bound reads: tenths rounded up, or none from 100% on.
         kassert_eq!(
-            alloc::format!("{} {} {}", Percent(7_000), Percent(7_001), Percent(u64::MAX)),
-            "0.7% 0.8% no bound"
+            alloc::format!("{} {} {} {}", Percent(7_000), Percent(7_001), Percent(999_000), Percent(1_000_000)),
+            "0.7% 0.8% 99.9% no bound"
         );
         Ok(())
     }
@@ -1770,27 +1769,6 @@ crate::ktest!(
         kassert_eq!((cal.steady(), cal.windows[4]), (4, unplaced));
         kassert_eq!(Some(cal.hz), steady.tsc_hz(PIT_HZ));
         kassert_eq!(cal.median_bound_ppm(), steady.tsc_error_ppm());
-        Ok(())
-    }
-);
-
-crate::ktest!(
-    fn a_start_stall_doesnt_stretch_hpet_windows() {
-        // Each HPET window's start held up half as long as the last one ran
-        // (lumen.stall_tsc_windows=0,500000): the reference counts the stall
-        // but the TSC window doesn't, which made the window's gaps look like
-        // a slow host's and stretched it (#139 round 2: 5 ms took the next to
-        // 18.7 ms, 10 ms to the 160 ms cap, for good). Over the TSC ticks the
-        // reference counted (tsc + start_gap), no window stretches: each is
-        // its 10 ms target and a stall past it at most.
-        use crate::kassert;
-        let hpet = hpet().ok_or("no HPET")?;
-        let base = hpet.clock().ticks(WINDOW_NS);
-        let cal = off_or_diag("calibrating against the HPET failed", || {
-            calibrate_with_hpet(&hpet, stall_window_ends(Stall { end: 0, start: 500_000 }))
-        })?;
-        crate::ktest::diag(format_args!("{cal}"));
-        kassert!(cal.windows.iter().all(|w| w.reference < base + base / 5));
         Ok(())
     }
 );

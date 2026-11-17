@@ -382,8 +382,10 @@ pub fn median_bound_ppm<const N: usize>(windows: &[Window; N], bound: impl Fn(&W
 /// `tsc` spans), what slow reads explain, so one burst at either end barely
 /// stretches it; and the gaps are a share of the TSC ticks the reference
 /// counted over (`tsc + start_gap`: a stall before `tsc` starts still counts
-/// in `reference`), so a stall at the start, however long, doesn't inflate
-/// the share. A steady window keeps
+/// in `reference`), so a stall at the start, however long, counts no more
+/// than two slow reads (which, with few polls, may stretch it a little; a
+/// window that also lost its CPU mid-way has fewer polls, so more). A
+/// steady window keeps
 /// `current`; so does an empty one, and one with no polls (nothing to tell a
 /// slow read by). `most` if the arithmetic would overflow.
 pub fn stretched_for_gaps(current: u64, window: &Window, most: u64) -> u64 {
