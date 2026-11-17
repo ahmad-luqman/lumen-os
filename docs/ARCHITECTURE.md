@@ -3304,8 +3304,8 @@ Moves with no button held aren't delivered (no hover in M4).
   window's old and new frames, a raised window's frame, both frames of a
   focus change, since a focused frame is drawn differently) and its
   `Delivery`s (`PointerDown`/`PointerMove`/`PointerUp` in client
-  coordinates, one `Button` each, `FocusGained`, `FocusLost`, `Lost`,
-  `Close`), which #153 puts on each window's queue with
+  coordinates, one `lumen_input::Button` each, `FocusGained`,
+  `FocusLost`, `Lost`, `Close`), which #153 puts on each window's queue with
   `lumen_wm::deliver`. `Outcome` and the `Option`s are `#[must_use]`.
 - **Coordinates:** screen pixels as `i32`, as `lumen-gfx` uses (a window
   may hang off the left, right or bottom edge, never the top);
