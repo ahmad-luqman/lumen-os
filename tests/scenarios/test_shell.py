@@ -336,7 +336,14 @@ def test_tab_completion(boot):
     expect_screen(m, r"^lumen> crash p\npanic  pf\nlumen> crash p$")
     keys(m, "a", ["tab"])
     expect_screen(m, r"^lumen> crash panic$")
-    keys(m, ["ctrl", "u"], "te", ["tab"], ["tab"])
+    # `term` and `terminal` (#155) share their first four letters: Tab
+    # stops there, a second lists both, then a space and Tab complete
+    # `term`'s argument.
+    keys(m, ["ctrl", "u"], "te", ["tab"])
+    expect_screen(m, r"^lumen> term$")
+    keys(m, ["tab"])
+    expect_screen(m, r"^term  terminal\nlumen> term$")
+    keys(m, " ", ["tab"])
     expect_screen(m, r"^lumen> term text$")
     keys(m, ["ctrl", "u"], "cl", ["tab"])
     expect_screen(m, r"^clear  clocks\nlumen> cl$")
