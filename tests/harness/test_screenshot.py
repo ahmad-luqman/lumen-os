@@ -106,6 +106,8 @@ def test_lines_between_the_frames_lines_are_skipped():
             lambda ls: [ls[0].replace("crc32=", "crc32=x"), *ls[1:]],
             "doesn't start with its begin line",
         ),
+        # Anything after the begin line's fields.
+        (lambda ls: [ls[0] + " junk", *ls[1:]], "doesn't start with its begin line"),
         # Two frames: the second's begin line is no body line.
         (lambda ls: ls[:-1] + ls, "isn't one"),
     ],
