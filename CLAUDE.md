@@ -199,12 +199,32 @@ own PR that updates that doc first.
   them for scenarios), the boot origin
   (`mark_boot`, `since_boot_ns`), `now_ns`, `sleep`, `ticks`.
   `demo.rs`: the `mandelbrot` (bands on every CPU) and `life` commands.
+  `font.rs`: the desktop's anti-aliased text (`lumen-font`): `font::face`,
+  the UI font parsed on first use and shared; `font` renders the golden
+  sample twice (timings, cache, golden check), as its ktest does.
   `sound.rs`: the virtio-sound driver (its `sound` thread owns the device,
   playing `lumen-synth` sources paced by the device), `beep`, `play`,
   `volume` and `sound`.
 - `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs
   in bands, and Game of Life with its patterns (host-tested).
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
+- `crates/lumen-font`: anti-aliased TrueType text: `fontdue` (no `simd`)
+  behind `Face` (parsed once, shared read-only; `measure`) and `Font`
+  (a face plus its own glyph cache keyed by (glyph, pixel size), bounded
+  in bytes, least recently used evicted), one-line layout (`render`,
+  `render_mask` into a `LineMask`) into plain coverage masks, and the
+  embedded UI font, Atkinson Hyperlegible (`assets/fonts/`, SIL OFL)
+  (host-tested, incl. a model LRU, a `kern` fixture and a golden mask
+  whose hash the kernel's ktest also checks).
+- `crates/lumen-gfx`: the desktop's pixel core: `Rect` (signed origin,
+  intersect/union/clip, subtract into at most 4), `Damage` (a fixed-size
+  list that coalesces, a bounding box past its size, never loses
+  coverage), `Surface` (xRGB8888 with a stride: fill, clipped blits,
+  `blend_mask`/`blend_mask_in` for coverage masks such as glyphs, the
+  latter clipped to a damaged rect) and `Target`, what a surface is
+  presented to a span at a time (a surface; the front buffer once the
+  compositor lands, #153) (host-tested, incl. randomized coverage and
+  every-edge clipping).
 - `crates/lumen-input`: pointer input: evdev events into whole-frame
   pointer states, axes scaled to the screen (`Tablet`, `AbsAxis`), a
   frame's most events from the device's `EV_BITS` (`frame_bound`) and
