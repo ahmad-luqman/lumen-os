@@ -616,3 +616,56 @@ crate::ktest!(
         Ok(())
     }
 );
+
+/// Clears [`DESKTOP`] when dropped: a ktest that shows the desktop keeps
+/// one, so failing half-way doesn't leave the next tests' keys the
+/// desktop's.
+#[cfg(feature = "ktest")]
+struct DesktopOffAfter;
+
+#[cfg(feature = "ktest")]
+impl Drop for DesktopOffAfter {
+    fn drop(&mut self) {
+        DESKTOP.store(false, Ordering::Release);
+    }
+}
+
+crate::ktest!(
+    fn keys_while_the_desktop_is_shown_are_its_own_until_alt_f_leaves_it() {
+        // `enter_desktop` takes the whole screen and writes the cut (one
+        // generation on, shown, the rings' newest); a command's canvas is
+        // refused meanwhile. While shown, a key goes to the desktop alone
+        // (counted), a bare modifier is skipped, Alt+F2 leaves it: the
+        // screen given back with terminal 2 shown, `DESKTOP` clear, the cut
+        // paused at the rings' newest. Then keys go to the terminals again
+        // and a canvas can be taken.
+        use crate::{kassert, kassert_eq};
+        const ALL: usize = (1 << VTS) - 1;
+        kassert_eq!(term::shown(), 0);
+        let _first = term::ShowFirstAfter;
+        let _off = DesktopOffAfter;
+        let mut r = Rings::new();
+        let before = CUT.lock().generation;
+        let owner = Owner::new();
+        let screen = enter_desktop(owner).map_err(|_| "no screen")?;
+        let cut = *CUT.lock();
+        kassert_eq!((cut.generation, cut.owner), (before + 1, Some(owner)));
+        kassert_eq!(cut.resume, Marks::now());
+        kassert!(DESKTOP.load(Ordering::Acquire));
+        kassert!(matches!(term::canvas(Owner::new()), Err(CanvasError::InUse)));
+        let sent = stats().to_desktop;
+        kassert_eq!(route_key(&mut r, Key::Char('a'), ALL), Routed::Desktop);
+        kassert_eq!(route_key(&mut r, raw_key(KeyCode::LShift, false), ALL), Routed::Modifier);
+        kassert_eq!(stats().to_desktop, sent + 1);
+        kassert_eq!(route_key(&mut r, raw_key(KeyCode::F2, true), ALL), Routed::Left(1));
+        kassert!(!DESKTOP.load(Ordering::Acquire) && !screen.is_live());
+        kassert_eq!(term::shown(), 1);
+        let cut = *CUT.lock();
+        kassert_eq!((cut.generation, cut.pause), (before + 2, Marks::now()));
+        drop(screen);
+        kassert_eq!(route_key(&mut r, Key::Char('b'), ALL), Routed::To(1));
+        kassert_eq!(r.mask(), 1 << 1);
+        drop(term::canvas(Owner::new()).map_err(|_| "no canvas after the desktop")?);
+        Ok(())
+    }
+);

@@ -60,6 +60,7 @@ tests = [
     "scenario:test_gui::test_boot_flag_starts_the_desktop",
     "scenario:test_gui::test_boot_flag_without_a_screen_warns",
     "ktest:lumen_kernel::desktop::opening_past_the_window_limit_fails",
+    "ktest:lumen_kernel::vt::keys_while_the_desktop_is_shown_are_its_own_until_alt_f_leaves_it",
 ]
 
 [[feature]]
