@@ -275,9 +275,11 @@ def test_shutdown_powers_off(boot):
 def test_history_and_line_editing(boot):
     # On the screen (QMP keys): history with Up/Down, the cursor keys,
     # Home/End, Ctrl-A/E/K/U/W/C; `history` lists the lines entered there.
-    # Each key is confirmed to reach the guest before the next goes
-    # (lumen_harness.gui, #149): a key lost under load (#128) fails naming
-    # it, not later as a wrong screen.
+    # Each key is confirmed before the next goes (lumen_harness.gui,
+    # #149): its bytes reached IRQ 1 whole and were queued, or the step
+    # fails naming the key. A key lost on the way in (#128) then fails
+    # there; one lost later, in the decoder, router or shell, still shows
+    # only as a wrong screen.
     m = shells(boot)
     confirmed_keys(m, "echo one\n", "echo two\n", ["up"], ["up"], ["ret"])
     expect_screen(m, r"^two\nlumen> echo one\none\nlumen>$")

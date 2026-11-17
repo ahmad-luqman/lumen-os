@@ -1064,8 +1064,10 @@ off. A wake from another CPU queues the thread there and sends the
   `kbd` shows the layout, the route, the
   interrupts taken, the bytes queued, the keys pressed (`presses`: the
   producer counts set 1 make codes as bytes arrive, queued or dropped,
-  before any reader decodes them; prefixes, fake shifts and Pause each
-  one key or none: `lumen_input::Presses`, #149), the bytes dropped,
+  before any reader decodes them, under one lock with the push, so a
+  press shows with its byte or its drop; prefixes, fake shifts and Pause
+  each one key or none: `lumen_input::Presses`, #149; a ktest drives the
+  producer's step with a full queue), the bytes dropped,
   undecoded, flagged, and
   skipped during setup, or why there is no keyboard (and whether IRQ 1 was
   routed); a non-zero skip count is also logged after init.
@@ -1074,9 +1076,13 @@ off. A wake from another CPU queues the thread there and sends the
   order; its input queue holds 1024 entries and drops the rest without a
   word, so `press` paces itself on the time QEMU takes to send each key,
   and `test_a_long_line_of_shifted_keys` checks 150 shifted keys arrive;
-  `lumen_harness.gui`'s `confirmed_keys` waits for `kbd`'s `presses` to
-  count each key before the next, failing as "key N of M never reached
-  the guest", #149),
+  `lumen_harness.gui`'s `confirmed_keys` waits, before the next key, until
+  `kbd` counts exactly the key's presses and bytes with nothing dropped,
+  undecoded or flagged, failing as "key N of M (...) never reached the
+  guest", "... of its N bytes arrived ...: a prefix or release was lost"
+  or "... the keyboard's queue dropped N byte(s) ...": a confirmed key
+  reached IRQ 1 whole and was queued, while a loss in the decoder, the
+  router or a shell still shows only on the screen, #149),
   and the scenarios read what the screen shells did
   back from the screen (`lumen_harness.screen`, through the serial shell's
   `term text`); a scenario boots with
@@ -2764,7 +2770,7 @@ kernel. The kernel is the trusted computing base.
 |---|---|---|
 | Pure logic | `cargo test` on `no_std` crates | `crates/*` |
 | Kernel internals | `ktest!` in-kernel tests → TAP over serial → `isa-debug-exit` | anywhere in `kernel/src` |
-| Whole system | pytest scenarios: boot QEMU headless, `expect` on serial with timeouts, `send_line`, keys and the tablet over QMP (`press`, `type_text`, `move_pointer`, `click`; `lumen_harness.gui`'s steps confirm each against `kbd`'s and `mouse`'s counters before the next), exit codes; run in parallel (pytest-xdist, one worker per CPU) | `tests/scenarios` |
+| Whole system | pytest scenarios: boot QEMU headless, `expect` on serial with timeouts, `send_line`, keys and the tablet over QMP (`press`, `type_text`, `move_pointer`, `click`; `lumen_harness.gui`'s steps wait for each to show exactly in `kbd`'s and `mouse`'s counters before the next), exit codes; run in parallel (pytest-xdist, one worker per CPU) | `tests/scenarios` |
 | Screens | QMP `screendump` compared to golden PNG regions | `tests/golden` |
 | Codegen | `make audit`: disassembly and LLVM IR checks | `tools/harness/lumen_harness/audit.py` |
 | Harness itself | self-tests that the TAP parser, audit and image diff catch failures, and that the QEMU command line, artifact layout, CI wiring and status generation behave | `tests/harness` |

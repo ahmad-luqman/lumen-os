@@ -380,6 +380,9 @@ fn ticks(ctx: &mut Ctx<'_>, _: &[String]) {
     );
 }
 
+/// `kbd`: the keyboard's layout, route and counts, or why there is none.
+/// Its line is parsed by `KBD_STATS` (tests/scenarios/test_input.py) and
+/// `KBD_COUNTS` (tools/harness/lumen_harness/gui.py): change them together.
 fn kbd(ctx: &mut Ctx<'_>, _: &[String]) {
     let k = crate::keyboard::stats();
     let out = &mut *ctx.out;

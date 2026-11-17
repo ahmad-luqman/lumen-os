@@ -102,6 +102,15 @@ def test_keys_via_qmp_send_key(boot):
         r"ticks: \d+ \(spurious (\d+), unexpected (\d+), local APIC errors (\d+)\)", 10
     )
     assert strays.groups() == ("0", "0", "0")
+    # Keys typed just before (unconfirmed, still arriving) don't confirm a
+    # confirmed key (the case review reproduced): its step waits until they
+    # settle, then counts exactly its own presses and bytes.
+    burst = "echo abcdefghijklmnop"
+    m.type_text(burst)
+    gui.confirmed_keys(m, "x", "\n")
+    expect_screen(m, rf"^lumen> {burst}x\nabcdefghijklmnopx\nlumen>$")
+    later = kbd_stats(m)
+    assert later.presses - s.presses == len(burst) + 2, (s.presses, later.presses)
     assert "WARN" not in m.output
 
 
@@ -271,13 +280,8 @@ def mouse_counts(m: Machine, allow: str | None = None, held: bool = False) -> tu
 
 def poll[T](what: Callable[[], T], done: Callable[[T], bool], m: Machine, timeout: float = 10) -> T:
     """Call `what()` until `done(result)` (up to `timeout` seconds, scaled);
-    the last result."""
-    deadline = time.monotonic() + timeout * m.timeout_scale
-    while True:
-        got = what()
-        if done(got) or time.monotonic() > deadline:
-            return got
-        time.sleep(0.05)
+    the last result (`gui.poll`)."""
+    return gui.poll(m, what, done, timeout)[0]
 
 
 def wait_mouse(m: Machine, allow: str | None = None, **want: str) -> Mouse:
@@ -526,9 +530,9 @@ def test_drag_steps_are_confirmed(boot):
     # (the move to its start, the press, the steps, the release), each one
     # counted by `mouse` and nothing else read, every event used, no
     # overrun; the pointer ends at the drag's end with the button released
-    # and its press counted. A step the guest doesn't read (the mouse thread
-    # held: `mouse hold`) fails, naming the step and the counts it saw; once
-    # released, the frame is read.
+    # and its press counted. A step the guest can't read (the mouse thread
+    # held: `mouse hold`) fails at once, naming the step and the counts it
+    # saw, and sends nothing; once released, the step goes through.
     m = boot("qemutest", devices=Devices(tablet=True))
     tablet_ready(m)
     before = gui.read_pointer(m)
@@ -536,20 +540,19 @@ def test_drag_steps_are_confirmed(boot):
     end = gui.drag(m, (40, 60), (1240, 740), 12)
     assert end.frames - before.frames == 12 + 3, end
     assert (end.position, end.buttons) == ((1240, 740), ()), end
-    assert (end.events, end.dropped, end.overruns) == (3 * 13 + 2 * 1 + 2 * 1, 0, 0), end
+    assert (end.events, end.ignored, end.dropped, end.overruns) == (3 * 13 + 2 + 2, 0, 0, 0), end
     row = mouse(m)[1]
     assert (row.presses, row.stale) == ("1", "no"), row
     assert run(m, "mouse hold") == "mouse: held: reading nothing until `mouse release`\n"
     with pytest.raises(gui.StepNotConfirmed) as e:
         gui.pointer_move(m, 640, 400, timeout=1)
-    assert re.match(
-        r"move to \(640, 400\): the guest never read its frame in [^:]+: mouse counted "
-        r"15 frames \(\d+ events, 0 dropped, 0 overruns\), held, expected 16 frames "
-        r"\(15 before the step\); it shows at \(1240, 740\), buttons none$",
-        str(e.value),
+    assert str(e.value) == (
+        "move to (640, 400): the guest can't read its frame (the tablet is held or failed): "
+        "mouse counted 15 frames (43 events, 0 ignored, 0 dropped, 0 overruns), held"
     ), e.value
     assert run(m, "mouse release") == "mouse: released\n"
-    wait_mouse(m, x="640", y="400")
+    after = gui.pointer_move(m, 640, 400)
+    assert (after.frames, after.position) == (16, (640, 400)), after
 
 
 def test_mouse_hold_needs_a_tablet_and_takes_one_word(boot):
