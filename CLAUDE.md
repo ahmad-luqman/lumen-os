@@ -221,8 +221,10 @@ own PR that updates that doc first.
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads),
   and `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free).
 - `crates/lumen-time`: timekeeping arithmetic: calibration (windows'
-  steadiness, the least unsteady filling in, how far off a median can be
-  for either rate, `tsc_error_ppm`, a window slow to read stretched), tick/ns
+  steadiness, the ones with the smallest bounds filling in, how far off a
+  median can be for either rate, `tsc_error_ppm`, a window slow to read
+  stretched, the verdict against each clock's tolerance, `within_bounds`,
+  the stall knobs' parser), tick/ns
   conversion, timer counts, log time formats (`Stamp`, `Millis`),
   percentages and rates, one clock's reading placed between two reads of
   another and retaken while too wide (`Bracketed`, `first_narrow`: the

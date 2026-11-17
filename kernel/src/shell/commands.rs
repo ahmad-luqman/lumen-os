@@ -614,18 +614,20 @@ fn uptime(ctx: &mut Ctx<'_>, _: &[String]) {
 }
 
 /// The TSC's boot calibration, and its frequency measured again now against
-/// the PIT and the HPET (the tests compare them).
+/// the PIT and the HPET (the tests compare them), each with how far off its
+/// median can be (`time::Calibration::median_bound_ppm`).
 fn clocks(ctx: &mut Ctx<'_>, _: &[String]) {
     use crate::time::{self, Reference};
     let (Some(tsc), Some(reference)) = (time::tsc(), time::reference()) else {
         return ctx.fail("clocks: the TSC isn't calibrated");
     };
     let out = &mut *ctx.out;
-    let _ = write!(out, "clocks: tsc {} Hz (against the {reference} at boot)", tsc.hz());
+    let boot_ppm = time::boot_calibration().map_or(u64::MAX, |c| c.median_bound_ppm());
+    let _ = write!(out, "clocks: tsc {} Hz (against the {reference} at boot, within {boot_ppm} ppm)", tsc.hz());
     let measured = [Reference::Pit, Reference::Hpet].map(|r| (r, time::measure(r)));
     for (r, m) in &measured {
         let _ = match m {
-            Some(Ok(cal)) => write!(out, "; {r} {} Hz", cal.hz),
+            Some(Ok(cal)) => write!(out, "; {r} {} Hz within {} ppm", cal.hz, cal.median_bound_ppm()),
             Some(Err(e)) => write!(out, "; {r} failed ({e})"),
             None => write!(out, "; {r} none"),
         };

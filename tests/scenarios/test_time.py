@@ -10,6 +10,7 @@ asserted on: TCG and KVM run at different speeds.
 import re
 from typing import NamedTuple
 
+from lumen_harness.clock_diags import TSC_TOLERANCE_PPM
 from lumen_harness.qemu import EXIT_CRASH
 
 BOOT_TIMEOUT = 60
@@ -18,8 +19,9 @@ TSC_LINE = re.compile(
 )
 TICKS = re.compile(r"ticks: (\d+) \(spurious (\d+), unexpected (\d+), local APIC errors (\d+)\)\n")
 CLOCKS = re.compile(
-    r"clocks: tsc (\d+) Hz \(against the (hpet|pit) at boot\); "
-    r"pit (?:(\d+) Hz|none|failed \((.*)\)); hpet (?:(\d+) Hz|none|failed \((.*)\))\n"
+    r"clocks: tsc (\d+) Hz \(against the (hpet|pit) at boot, within \d+ ppm\); "
+    r"pit (?:(\d+) Hz within \d+ ppm|none|failed \((.*)\)); "
+    r"hpet (?:(\d+) Hz within \d+ ppm|none|failed \((.*)\))\n"
 )
 
 
@@ -71,11 +73,6 @@ def clocks_and_windows(m) -> tuple[tuple[int, str, int | None, int | None], dict
 def assert_close(a: int, b: int) -> None:
     """Within 2%: the tolerance for two calibrations of the same TSC."""
     assert abs(a - b) * 50 <= a, (a, b)
-
-
-# How far off the TSC's calibration may be before boot warns
-# (kernel/src/time.rs's TSC_TOLERANCE_PPM): 1%.
-TSC_TOLERANCE_PPM = 10_000
 
 
 def tsc_error_ppm(tsc: int, ref: int, start_gap: int, end_gap: int) -> int:
@@ -255,38 +252,66 @@ def test_tsc_windows_stalled_past_steady_fill_in_within_tolerance(boot):
 
 
 def test_tsc_windows_stalled_past_tolerance_warn(boot):
-    # 1.5%: past the TSC's 1%, a warning with the bound, and the boot goes on
-    # against the HPET.
+    # 1.5%: past the TSC's 1%. The HPET isn't kept on its own word: the PIT
+    # is tried too (stalled the same way here) and whichever's median can be
+    # off less is kept, said at INFO; then a warning with that one's bound,
+    # and the boot goes on.
     m = boot("qemutest", cmdline="lumen.stall_tsc_windows=15000")
     out = boot_messages(m)
-    assert TSC_LINE.search(out)[3] == "hpet", out
+    assert (
+        "INFO  time: stalling calibration windows by 15000,0 ppm (lumen.stall_tsc_windows)\n" in out
+    ), out
+    chose = re.search(
+        r"INFO  time: tsc calibration: against the HPET within (\d+\.\d)% \(past the 1\.0% allowed\), "
+        r"against the PIT within (\d+\.\d)%: kept the (HPET|PIT)\n",
+        out,
+    )
+    assert chose, out
+    hpet_pc, pit_pc, kept = float(chose[1]), float(chose[2]), chose[3]
+    assert kept == ("PIT" if pit_pc < hpet_pc else "HPET") or hpet_pc == pit_pc, chose[0]
+    assert TSC_LINE.search(out)[3] == kept.lower(), out
     said = re.search(
-        r"WARN  time: tsc calibration: only 0 of 20 windows read promptly \(5 wanted; a stall next to "
-        r"the HPET's reads\), so its rate may be off by up to (\d+\.\d)%, over the 1\.0% allowed",
+        rf"WARN  time: tsc calibration: only 0 of 20 windows read promptly \(5 wanted; a stall next to "
+        rf"the {kept}'s reads\), so its rate may be off by up to (\d+\.\d)%, over the 1\.0% allowed",
         out,
     )
     assert said, out
     assert 1.5 <= float(said[1]) <= 2.0, said[0]
+    assert float(said[1]) == min(hpet_pc, pit_pc), (said[0], chose[0])
 
 
 def test_tsc_windows_with_no_bound_left_panic(boot):
-    # Each window's end stalled twice as long as it ran: the median's bound is
-    # over 100%, the rate says nothing. The HPET gives way to the PIT
-    # (warned), which stalls too, and boot panics saying why.
+    # Each window's end stalled twice as long as it ran: the end gap is more
+    # than the rest of the window, so the median's bound is over 100% and
+    # the rate says nothing. The HPET gives way to the PIT (warned), which
+    # stalls too, and boot panics saying why.
     m = boot("qemutest", cmdline="lumen.stall_tsc_windows=2000000")
     assert m.wait_exit(BOOT_TIMEOUT) == EXIT_CRASH
     out = m.output
+    no_information = (
+        r"only 0 of 20 windows read promptly \(5 wanted\), and the middle ones' end stalls were as long as the "
+        r"rest of their windows, so the rate says nothing"
+    )
     assert re.search(
-        r"WARN  time: can't calibrate the tsc against the HPET: only 0 of 20 windows read promptly .*"
-        r"so the rate says nothing .*; calibrating against the PIT\n",
+        rf"WARN  time: can't calibrate the tsc against the HPET: {no_information} .*; calibrating against the PIT\n",
         out,
     ), out
     said = PANIC.search(out)
     assert said, out
-    assert said[1].startswith(
-        "can't calibrate the tsc against the PIT: only 0 of 20 windows read promptly (5 wanted), and the "
-        "middle ones' stalls were as long as themselves, so the rate says nothing"
-    ), said[0]
+    assert re.match(rf"can't calibrate the tsc against the PIT: {no_information}", said[1]), said[0]
+
+
+def test_a_stall_past_ten_windows_is_ignored(boot):
+    # Over lumen_time::MOST_STALL_PPM (10 windows' worth): warned about and
+    # ignored, so the calibration is a normal one.
+    m = boot("qemutest", cmdline="lumen.stall_tsc_windows=20000000")
+    out = boot_messages(m)
+    assert (
+        "WARN  time: lumen.stall_tsc_windows=20000000: not <end ppm>[,<start ppm>], each at most 10000000; "
+        "ignored\n" in out
+    ), out
+    assert "stalling calibration windows" not in out, out
+    assert TSC_LINE.search(out)[3] == "hpet", out
 
 
 def test_tsc_windows_stalled_without_an_hpet_fill_in_against_the_pit(boot):
