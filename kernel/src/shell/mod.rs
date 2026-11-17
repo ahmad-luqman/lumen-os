@@ -574,29 +574,16 @@ impl Console for Captured {
     }
 }
 
-/// The line editor's key for a key from the keyboard, if it takes one.
-/// (`pc-keyboard` makes Enter `\n`, Backspace U+0008, Delete U+007F, Tab
-/// `\t`, Escape U+001B and Ctrl with a letter U+0001 to U+001A.)
+/// The line editor's key for a key from the keyboard, if it takes one:
+/// `lumen_shell::Key::from_press`, the mapping terminal windows share
+/// (ARCHITECTURE section 7), a character as its text and any other key as
+/// its code.
 fn screen_key(key: keyboard::Key) -> Option<Key> {
     use keyboard::Key as K;
-    Some(match key {
-        K::Char('\n' | '\r') => Key::Enter,
-        K::Char('\u{8}') => Key::Backspace,
-        K::Char('\u{7f}') => Key::Delete,
-        K::Char('\t') => Key::Tab,
-        K::Char(c @ '\u{1}'..='\u{1a}') => Key::Ctrl(char::from(b'a' + c as u8 - 1)),
-        K::Char(c) if !c.is_control() => Key::Char(c),
-        K::Raw { code, .. } => match code {
-            KeyCode::ArrowLeft => Key::Left,
-            KeyCode::ArrowRight => Key::Right,
-            KeyCode::ArrowUp => Key::Up,
-            KeyCode::ArrowDown => Key::Down,
-            KeyCode::Home => Key::Home,
-            KeyCode::End => Key::End,
-            _ => return None,
-        },
-        K::Char(_) => return None,
-    })
+    match key {
+        K::Char(c) => Key::from_press(Some(c), None, lumen_input::Mods::NONE),
+        K::Raw { code, .. } => Key::from_press(None, Some(code), lumen_input::Mods::NONE),
+    }
 }
 
 crate::ktest!(

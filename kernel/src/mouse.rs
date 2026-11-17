@@ -81,15 +81,25 @@
 //!   from any, and `mouse hold | ...` holds as a side effect. Both are logged at INFO, so a
 //!   forgotten hold shows in `dmesg`.
 //! - **The `InputDevice` class** (docs/ARCHITECTURE.md, section 7): the
-//!   tablet's messages are `lumen_input::PointerState`s; M4's desktop
-//!   consumes them.
+//!   tablet's messages are `lumen_input::PointerState`s. After each batch
+//!   the thread pushes every frame it read, in order, into the desktop's
+//!   ring (`crate::input::POINTER`, #151) before it publishes the newest
+//!   state, each marked `after_overrun` when frames may have been lost at
+//!   the device before it (`lumen_input::AfterOverrun`: every frame of an
+//!   overrun batch but its first, and the next batch's first). So a press
+//!   and a release inside one batch are two events, each at its own
+//!   position; `mouse events` shows them.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use log::{debug, error, info, warn};
-use lumen_input::{AbsAxis, Event, PointerState, Tablet, evdev, frame_bound, has_abs_xy, may_have_lost_frames};
+use lumen_input::{
+    AbsAxis, AfterOverrun, Event, PointerEvent, PointerState, Tablet, evdev, frame_bound, has_abs_xy,
+    may_have_lost_frames,
+};
 use lumen_pci::PciAddr;
 use lumen_pci::names::virtio_type;
 use virtio_drivers::device::input::VirtIOInput;
@@ -528,6 +538,10 @@ fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, a
     // count still unchanged: they came without their interrupt.
     let mut rule = virtio::MissedRule::default();
     let mut warned_cannot_block = false;
+    // A batch's frames (kept from batch to batch: the thread holds no lock,
+    // so it may allocate), and which follow frames lost at the device.
+    let mut frames: Vec<PointerState> = Vec::new();
+    let mut marks = AfterOverrun::new();
     loop {
         // The doorbell's count, read before the hold check and the drain:
         // a doorbell ring after either (an interrupt, or `hold`'s) then
@@ -540,13 +554,15 @@ fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, a
             after_hold = true;
             continue;
         }
-        let (mut events, mut newest) = (0u64, None);
+        let mut events = 0u64;
+        frames.clear();
         while let Some(e) = input.pop_pending_event() {
             events += 1;
             if let Some(s) = tablet.feed(Event::new(e.event_type, e.code, e.value as i32)) {
-                newest = Some(s);
+                frames.push(s);
             }
         }
+        let newest = frames.last().copied();
         if events > 0 && rule.answered(seen) {
             BELL.note_missed(Some(addr));
         }
@@ -564,6 +580,11 @@ fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, a
         // Only the first drain after a park is "after `mouse hold`", even
         // if it read nothing.
         after_hold = false;
+        // Every frame into the desktop's ring, in order, before the state
+        // is published: a state `mouse` shows is already in the ring.
+        for (&state, after_overrun) in frames.iter().zip(marks.batch(frames.len(), overrun)) {
+            crate::input::POINTER.push(PointerEvent { state, after_overrun });
+        }
         if events > 0
             && let Some(b) = BOUND.lock().as_mut()
         {

@@ -5,6 +5,8 @@
 //! ([`RECORDS`]): `cpus`, `threads`, `lspci` and `mouse` the table they
 //! print (under their header), `irqs` its per-vector table only (not the
 //! I/O APIC's inputs), `mem` a table of what its prose says (in bytes).
+//! `mouse events [n]` and `kbd events [n]` give the desktop's input rings'
+//! newest events (#151), printed as a table or, piped, as records.
 //! Output with rows is made into a `String` first and written in one write
 //! (no log line lands inside it, and nothing allocating is formatted under
 //! the screen's lock); `dmesg` writes its lines in chunks
@@ -62,20 +64,141 @@ fn text(s: &str) -> Value {
 /// No value, printed `-`.
 const DASH: Value = Value::Absent("-");
 
-/// What makes a system command's records.
-pub type MakeTable = fn() -> pipe::Table;
+/// What makes a system command's records from its arguments: `None` if
+/// the command doesn't give records for these arguments (it runs as a
+/// command: its usage line, or what they ask for, e.g. `mouse hold`), else
+/// the table, or why there is none (said on the console, ending the
+/// pipeline).
+pub type MakeTable = fn(&[String]) -> Option<Result<pipe::Table, String>>;
 
 /// The system commands that give records in a pipeline (instead of their
 /// text), and the tables they give.
-pub const RECORDS: [(&str, MakeTable); 7] = [
-    ("cpus", cpu_table),
-    ("irqs", vector_table),
-    ("lspci", pci_table),
-    ("mem", mem_table),
-    ("mouse", mouse_table),
-    ("sound", crate::sound::table),
-    ("threads", thread_table),
+pub const RECORDS: [(&str, MakeTable); 8] = [
+    ("cpus", |a| no_args(a, cpu_table)),
+    ("irqs", |a| no_args(a, vector_table)),
+    ("kbd", kbd_records),
+    ("lspci", |a| no_args(a, pci_table)),
+    ("mem", |a| no_args(a, mem_table)),
+    ("mouse", mouse_records),
+    ("sound", |a| no_args(a, crate::sound::table)),
+    ("threads", |a| no_args(a, thread_table)),
 ];
+
+/// A command's records when it takes no arguments: `table`'s, given none.
+fn no_args(args: &[String], table: fn() -> pipe::Table) -> Option<Result<pipe::Table, String>> {
+    args.is_empty().then(|| Ok(table()))
+}
+
+/// `mouse`'s records: its row, or (`events [n]`) the pointer ring's newest
+/// events; `hold`, `release` and anything else run as the command.
+fn mouse_records(args: &[String]) -> Option<Result<pipe::Table, String>> {
+    match args {
+        [] => Some(Ok(mouse_table())),
+        [what, ..] if what == "events" => Some(events_count("mouse", &args[1..]).map(pointer_events_table)),
+        _ => None,
+    }
+}
+
+/// `kbd`'s records: (`events [n]`) the key ring's newest events; `kbd`
+/// itself is a line of text.
+fn kbd_records(args: &[String]) -> Option<Result<pipe::Table, String>> {
+    match args {
+        [what, ..] if what == "events" => Some(events_count("kbd", &args[1..]).map(key_events_table)),
+        _ => None,
+    }
+}
+
+/// How many events `<name> events [n]` asks for: `n` (1 or more), 16
+/// without it.
+fn events_count(name: &str, args: &[String]) -> Result<usize, String> {
+    match args {
+        [] => Ok(EVENTS_SHOWN),
+        [n] => n.parse().ok().filter(|&n| n > 0).ok_or_else(|| alloc::format!("usage: {name} events [n]")),
+        _ => Err(alloc::format!("usage: {name} events [n]")),
+    }
+}
+
+/// How many events `mouse events` and `kbd events` show by default.
+const EVENTS_SHOWN: usize = 16;
+
+/// The pointer ring's newest `n` events (`crate::input::POINTER`), oldest
+/// first: each frame's number, position, buttons held and whether frames
+/// may have been lost at the device before it.
+fn pointer_events_table(n: usize) -> pipe::Table {
+    const COLUMNS: [Column; 5] = [
+        Column::new("seq", Kind::Int, Align::Right, 3),
+        Column::new("x", Kind::Int, Align::Right, 4),
+        Column::new("y", Kind::Int, Align::Right, 4),
+        Column::new("buttons", Kind::Text, Align::Left, 7),
+        Column::new("after_overrun", Kind::Text, Align::Left, 0),
+    ];
+    let mut t = pipe::Table::new(&COLUMNS);
+    for (seq, e) in crate::input::POINTER.recent(n) {
+        t.push(vec![
+            int(seq.get()),
+            int(e.state.x),
+            int(e.state.y),
+            Value::Text(e.state.buttons.to_string()),
+            text(if e.after_overrun { "yes" } else { "no" }),
+        ]);
+    }
+    t
+}
+
+/// The key ring's newest `n` events (`crate::input::KEYS`), oldest first:
+/// each event's number, key, press or release, the press's text (quoted,
+/// escaped; `-` for none) and the modifiers after it.
+fn key_events_table(n: usize) -> pipe::Table {
+    const COLUMNS: [Column; 5] = [
+        Column::new("seq", Kind::Int, Align::Right, 3),
+        Column::new("code", Kind::Text, Align::Left, 10),
+        Column::new("action", Kind::Text, Align::Left, 7),
+        Column::new("text", Kind::Text, Align::Left, 6),
+        Column::new("mods", Kind::Text, Align::Left, 0),
+    ];
+    let mut t = pipe::Table::new(&COLUMNS);
+    for (seq, e) in crate::input::KEYS.recent(n) {
+        let (action, typed) = match e.action {
+            lumen_input::KeyAction::Press { text: Some(c) } => ("press", Value::Text(alloc::format!("{c:?}"))),
+            lumen_input::KeyAction::Press { text: None } => ("press", DASH),
+            lumen_input::KeyAction::Release => ("release", DASH),
+        };
+        t.push(vec![
+            int(seq.get()),
+            Value::Text(alloc::format!("{:?}", e.code)),
+            text(action),
+            typed,
+            Value::Text(mods_text(e.mods)),
+        ]);
+    }
+    t
+}
+
+/// The modifiers as names joined by `+` (`shift+ctrl`), `-` for none.
+fn mods_text(m: lumen_input::Mods) -> String {
+    let names = [
+        (m.is_shifted(), "shift"),
+        (m.is_ctrl(), "ctrl"),
+        (m.is_alt(), "alt"),
+        (m.is_altgr(), "altgr"),
+        (m.capslock(), "caps"),
+        (m.numlock(), "num"),
+    ];
+    let on: Vec<&str> = names.iter().filter(|(on, _)| *on).map(|(_, n)| *n).collect();
+    if on.is_empty() { String::from("-") } else { on.join("+") }
+}
+
+/// Write a table (or why there is none) to the console, as text.
+pub fn print_table(ctx: &mut Ctx<'_>, table: Result<pipe::Table, String>) {
+    match table {
+        Ok(t) => {
+            let mut out = String::new();
+            t.render(&mut out);
+            emit(ctx, &out);
+        }
+        Err(e) => ctx.fail(e),
+    }
+}
 
 /// A line for the console when `name`'s records come with a caveat the
 /// table can't carry: `lspci`'s when PCI devices are missing, `sound`'s
@@ -91,7 +214,8 @@ pub fn records_note(name: &str) -> Option<String> {
     }
 }
 
-/// The records `name` gives in a pipeline, if it is one of [`RECORDS`].
+/// What makes the records `name` gives in a pipeline, if it is one of
+/// [`RECORDS`].
 pub fn records(name: &str) -> Option<MakeTable> {
     RECORDS.iter().find(|(n, _)| *n == name).map(|&(_, table)| table)
 }
@@ -416,7 +540,10 @@ pub fn mouse(ctx: &mut Ctx<'_>, args: &[String]) {
             crate::mouse::release();
             return emit(ctx, "mouse: released\n");
         }
-        _ => return ctx.fail("usage: mouse [hold|release]"),
+        [a, rest @ ..] if a == "events" => {
+            return print_table(ctx, events_count("mouse", rest).map(pointer_events_table));
+        }
+        _ => return ctx.fail("usage: mouse [hold|release|events [n]]"),
     }
     // One snapshot for the header and the row.
     let bound = crate::mouse::status();
@@ -441,9 +568,10 @@ fn mouse_header(bound: Option<&crate::mouse::Bound>, reads: crate::mouse::Reads)
         crate::mouse::Reads::Held => ", held",
     };
     let failed = b.failed.map_or(String::new(), |why| alloc::format!(", failed: {why}"));
+    let newest = lumen_input::InputDevice::newest(&crate::input::POINTER).get();
     alloc::format!(
         "mouse: \"{}\" on {}, screen {}x{}, {} events in {frames} frames ({} ignored, {} dropped, {} \
-         overruns){held}{failed}",
+         overruns, newest event {newest}){held}{failed}",
         d.name,
         d.addr,
         d.screen.0,
@@ -765,13 +893,40 @@ crate::ktest!(
         // prompt): the records each system command gives, and `irqs`'
         // table of inputs.
         use crate::kassert;
-        for (name, table) in RECORDS {
-            let rows = table().rows().len();
-            crate::ktest::diag(format_args!("{name}: {rows} rows"));
-            // (`sound` has a row only with a device, and the ktest machine
-            // has none: `sound::the_record_fits_its_columns` checks one.)
-            kassert!(rows > 0 || name == "sound");
+        let events = [String::from("events")];
+        for (name, make) in RECORDS {
+            // Each with no arguments, and `events` for the two that take it
+            // (`kbd` gives records only for that).
+            for args in [&[][..], &events[..]] {
+                let Some(table) = make(args) else { continue };
+                let rows = table.map_err(|_| "a records error")?.rows().len();
+                crate::ktest::diag(format_args!("{name} {args:?}: {rows} rows"));
+                // (`sound` has a row only with a device, and the ktest
+                // machine has none: `sound::the_record_fits_its_columns`
+                // checks one. The rings are empty with nothing typed or
+                // moved.)
+                kassert!(rows > 0 || name == "sound" || !args.is_empty());
+            }
         }
+        // Rows of both rings fit their columns.
+        let pointer = lumen_input::PointerState {
+            x: 1,
+            y: 2,
+            buttons: lumen_input::Buttons::LEFT,
+            wheel: 0,
+            hwheel: 0,
+            presses: [1, 0, 0, 0, 0],
+            seq: 1,
+        };
+        crate::input::POINTER.push(lumen_input::PointerEvent { state: pointer, after_overrun: true });
+        kassert!(pointer_events_table(1).rows().len() == 1);
+        let key = lumen_input::KeyEvent {
+            code: lumen_input::KeyCode::A,
+            action: lumen_input::KeyAction::Press { text: Some('\n') },
+            mods: lumen_input::Mods::NONE,
+        };
+        crate::input::KEYS.push(key);
+        kassert!(key_events_table(1).rows().len() == 1);
         kassert!(records("dmesg").is_none());
         let inputs = crate::interrupts::inputs();
         kassert!(input_table(&inputs).rows().len() == inputs.len());
@@ -797,10 +952,14 @@ crate::ktest!(
             stale: true,
             failed: Some(Failure::Failed),
         };
+        // (The pointer ring's newest number: whatever earlier tests pushed.)
+        let newest = lumen_input::InputDevice::newest(&crate::input::POINTER).get();
         kassert_eq!(
             mouse_header(Some(&bound), crate::mouse::Reads::Running),
-            "mouse: \"ktest tablet\" on 0000:00:03.0, screen 1280x800, 9 events in 7 frames (1 ignored, 2 dropped, \
-             3 overruns), failed: FAILED"
+            alloc::format!(
+                "mouse: \"ktest tablet\" on 0000:00:03.0, screen 1280x800, 9 events in 7 frames (1 ignored, 2 \
+                 dropped, 3 overruns, newest event {newest}), failed: FAILED"
+            )
         );
         let table = mouse_table_of(Some(&bound));
         let row = &table.rows()[0];
@@ -813,7 +972,7 @@ crate::ktest!(
         // The hold shows at the end, before why it failed: held, or holding
         // until the thread parks; nothing while it reads.
         use crate::mouse::Reads;
-        let counts = "9 events in 7 frames (1 ignored, 2 dropped, 3 overruns)";
+        let counts = alloc::format!("9 events in 7 frames (1 ignored, 2 dropped, 3 overruns, newest event {newest})");
         for (reads, suffix) in [(Reads::Running, ""), (Reads::HoldAsked, ", holding"), (Reads::Held, ", held")] {
             let header = mouse_header(Some(&bound), reads);
             kassert_eq!(

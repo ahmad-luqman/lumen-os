@@ -1,5 +1,6 @@
-//! Pointer input for the Lumen kernel (#98), and key presses counted in
-//! PS/2 bytes (#149), host-tested:
+//! Pointer input for the Lumen kernel (#98), key presses counted in PS/2
+//! bytes (#149), and the desktop's input events in rings (#151),
+//! host-tested:
 //!
 //! - **Events into pointer states** ([`tablet`]): virtio-input delivers
 //!   Linux evdev events ([`Event`]: a type, a code and a value); a
@@ -16,14 +17,27 @@
 //!   keys pressed in a stream of scancode set 1 bytes (prefixes, fake
 //!   shifts and Pause each taken as one key or none), for `kbd`'s
 //!   `presses` (#149).
+//! - **Input devices as rings** ([`ring`], #151): a device keeps its
+//!   newest events numbered in order ([`Ring`], [`Seq`]); a [`Reader`] asks
+//!   for the first after the last it saw and counts a gap as lost
+//!   ([`InputDevice`]). [`AfterOverrun`] marks the tablet's frames that may
+//!   follow frames lost at the device.
+//! - **Desktop events** ([`keys`], #151): [`PointerEvent`], [`KeyEvent`]
+//!   (press or release, with the modifiers after it, [`Mods`]) and
+//!   [`InputEvent`]; [`KeyDecoder`] turns set 1 bytes into key events (one
+//!   press per key, as [`Presses`] counts them) through `pc-keyboard`.
 
 #![cfg_attr(not(test), no_std)]
 
 pub mod cursor;
+pub mod keys;
+pub mod ring;
 pub mod scancode;
 pub mod tablet;
 
 pub use cursor::{Cursor, Surface};
+pub use keys::{InputEvent, KeyAction, KeyCode, KeyDecoder, KeyEvent, Mods, PointerEvent};
+pub use ring::{AfterOverrun, InputDevice, Reader, Ring, Seq};
 pub use scancode::Presses;
 pub use tablet::{
     AbsAxis, AxisError, Buttons, Event, FRAME_TYPES, PointerState, Tablet, evdev, frame_bound, has_abs_xy,

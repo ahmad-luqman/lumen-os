@@ -1113,8 +1113,10 @@ off. A wake from another CPU queues the thread there and sends the
   stays flat; a ktest drives the producer's step with a full queue), the
   keys held now (`held`: pressed, not yet released), the bytes dropped,
   undecoded, flagged, and
-  skipped during setup, or why there is no keyboard (and whether IRQ 1 was
-  routed); a non-zero skip count is also logged after init.
+  skipped during setup, and the desktop's key ring's newest event number
+  (`newest key event`, #151, section 7), or why there is no keyboard (and
+  whether IRQ 1 was routed); a non-zero skip count is also logged after
+  init. `kbd events [n]` lists the key ring's newest events.
 - **Tests:** QMP `send-key` drives the keyboard (`Machine.type_text` and
   `press`; QEMU queues each key behind the last one, so they arrive in
   order; its input queue holds 1024 entries and drops the rest without a
@@ -1505,7 +1507,8 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
     saying why any are missing (`pci::status`).
   - `mouse`: the tablet (#98, section 7): a header with its name,
     address, screen and counts (events, frames, ignored, `SYN_DROPPED`s,
-    overruns: batches that may have lost frames, why it failed), and one
+    overruns: batches that may have lost frames, the pointer ring's newest
+    event number (#151, section 7), why it failed), and one
     row: position,
     buttons held, presses so far (summed), wheels, the pointer (`drawn`,
     `hidden` under a canvas, `none` without a terminal), `stale`, and why
@@ -1518,6 +1521,7 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
     `HOLD_WAIT_NS` (1 s, a bug, logged). Events wait in the device's ring and frames that don't
     fit are dropped, an overrun made on purpose (#142). The hold is every
     console's (`mouse hold | ...` holds too), and both are logged at INFO.
+    `mouse events [n]` lists the pointer ring's newest frames (#151).
   - `dmesg`: the newest whole log lines as serial printed them: the logger
     keeps the last 16 KiB in a `lumen_trace::TextRing` (host-tested
     against a model; not lock-free: `klog`'s `RING` lock, a leaf, taken
@@ -2564,7 +2568,8 @@ ever seen.
   needs every pointer frame with its position (a click's place, a drag)
   and real key events, hence the trait.
 
-**The trait (M4: designed in #146, built in #151).** Each input device
+**The trait (M4: designed in #146, built in #151; the desktop that
+reads it comes with #153).** Each input device
 keeps a ring of its newest events, numbered in order from 1, and a
 reader asks for the first event after the last one it saw. In
 `lumen-input` (host-tested), which gains the workspace's `pc-keyboard`
@@ -2598,8 +2603,8 @@ pub struct Reader<D: InputDevice + 'static> { device: &'static D, after: Seq, lo
 impl<D: InputDevice + 'static> Reader<D> {
     /// Starting after the device's newest event.
     pub fn from_now(device: &'static D) -> Reader<D>;
-    /// The next event, counting a gap's events in `lost`.
-    pub fn next(&mut self) -> Option<D::Event>;
+    // (`next`: it is an `Iterator` of `D::Event`s; the next event,
+    // counting a gap's events in `lost`, `None` once caught up.)
     /// Skip to after `seq` (never backwards): the desktop's cut (section
     /// 11).
     pub fn skip_to(&mut self, seq: Seq);
@@ -2648,10 +2653,12 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   events and the next number; `push` overwrites the oldest and returns
   the `Seq` it gave. In the kernel each ring is a static behind one
   `SpinLock`, a leaf: nothing is taken under it and nothing allocates, so
-  it may be taken under any other lock. Reading takes nothing out, so
-  several `Reader`s can read one ring. A pusher sets `desktop::PENDING`
-  and calls `desktop::wake()` (section 11) after releasing the ring's
-  lock.
+  it may be taken under any other lock (`crate::input::LockedRing`, the
+  `InputDevice`; `input::POINTER` and `input::KEYS`). Reading takes
+  nothing out, so several `Reader`s can read one ring. Once the desktop
+  exists (#153), a pusher sets `desktop::PENDING` and calls
+  `desktop::wake()` (section 11) after releasing the ring's lock; until
+  then nothing reads the rings but the shell.
 - **Two kinds of loss, kept apart.** A gap in `Seq` means only that
   *this reader* fell behind the ring (counted in `Reader::lost`). Frames
   QEMU dropped at the device never reach the ring and leave no gap:
@@ -2683,8 +2690,16 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   shift (`E0 36`) doesn't decode at all (counted as undecoded, as today);
   Pause (`E1 1D 45 E1 9D C5`) is pushed as one press of
   `KeyCode::PauseBreak` with no release, its pieces (`RControl2`, that
-  `NumpadLock` press and both releases) not pushed; a `KeyState::SingleShot`
-  key is pushed as a press then a release. Typematic repeat shows up as
+  `NumpadLock` press and both releases) not pushed; Ctrl+Pause sends `E0
+  46` (`E0 C6` released), which `pc-keyboard` 0.9.0 doesn't map: the
+  decoder takes it before `pc-keyboard` sees it, as one press of
+  `KeyCode::PauseBreak` (its release not pushed; the terminals get it as a
+  raw `PauseBreak`, which no shell takes, where it used to be counted
+  undecoded); a `KeyState::SingleShot` key is pushed as a press then a
+  release. The decoding is `lumen_input::KeyDecoder` (host-tested): so one
+  key is one press, as `kbd`'s `presses` counts it, wherever the decoder
+  refuses nothing (a host test feeds both one corpus; the one exception, a
+  Pause cut off after its `E1 1D`, is listed there). Typematic repeat shows up as
   repeated presses with no release between. A ring of 128 key events, the
   same size as a terminal's (but read, not taken: a full ring overwrites
   its oldest).
@@ -2702,7 +2717,9 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   order it reads them. Events carry no time stamps in M4, so a key press
   and a pointer frame that arrive close together (within one compositor
   pass) may be handled in either order.
-- **Shell (#151):** `mouse` and `kbd` show each ring's newest `Seq`, and
+- **Shell (#151):** `mouse` and `kbd` show each ring's newest `Seq`
+  (`newest event N` in `mouse`'s header, `newest key event N` at the end
+  of `kbd`'s line), and
   `mouse events [n]` and `kbd events [n]` print the ring's newest `n`
   events (default 16) as records (`seq`, then `x`, `y`, `buttons`,
   `after_overrun`; or `code`, `action`, `text`, `mods`). (#149's confirming

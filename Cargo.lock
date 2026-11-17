@@ -265,6 +265,9 @@ version = "0.0.1"
 [[package]]
 name = "lumen-input"
 version = "0.0.1"
+dependencies = [
+ "pc-keyboard",
+]
 
 [[package]]
 name = "lumen-kernel"
@@ -324,6 +327,7 @@ version = "0.0.1"
 name = "lumen-shell"
 version = "0.0.1"
 dependencies = [
+ "lumen-input",
  "lumen-term",
  "shlex",
  "unicode-width",

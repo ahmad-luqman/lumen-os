@@ -140,3 +140,28 @@ tests = [
     "ktest:lumen_kernel::virtio::transport_brings_up_a_virtio_device_through_the_hal",
     "scenario:test_ktest::test_in_kernel_tests_pass",
 ]
+
+[[feature]]
+name = "The desktop's input rings (#151, ARCHITECTURE section 7): every tablet frame goes into a numbered ring of 256 (`lumen_input::Ring` behind a leaf lock, an `InputDevice`) before the mouse thread publishes the newest state, so a press and a release read in one batch (the thread held meanwhile) are two events, each at its own position, none marked as following a loss at the device (`after_overrun`: set on every frame of an overrun batch but its first, and on the next batch's first); every key event the keyboard's decoding pass decodes goes into a ring of 128 (`lumen_input::KeyDecoder` over pc-keyboard: presses and releases, bare modifiers included, with the modifiers after each: Shift+a is press LShift, press A with text 'A', release A, release LShift; RAlt2 dropped, Pause and Ctrl+Pause (E0 46) one PauseBreak press, typematic repeat repeated presses; the press counts agreeing with `kbd`'s `presses` wherever pc-keyboard refuses no byte, one listed exception), and the terminals still get their keys as before; a `Reader` reads a ring in order and counts what the ring overwrote before it looked, and skips to a number never backwards; `mouse events [n]` and `kbd events [n]` list each ring's newest events (records in a pipeline), and `mouse` and `kbd` show each ring's newest number"
+milestone = "M4"
+tests = [
+    "cargo:lumen-input",
+    "ktest:lumen_kernel::input::a_reader_reads_a_ring_in_order_and_counts_what_it_missed",
+    "ktest:lumen_kernel::shell::pipe::records_come_from_commands_with_the_arguments_they_take",
+    "ktest:lumen_kernel::shell::sysinfo::every_record_table_fits_its_columns",
+    "ktest:lumen_kernel::keyboard::scancodes_decode_per_layout",
+    "ktest:lumen_kernel::keyboard::other_keys_come_with_the_shift_and_alt_state",
+    "scenario:test_input::test_click_position_is_kept",
+    "scenario:test_input::test_key_events_have_releases_and_modifiers",
+    "scenario:test_ktest::test_in_kernel_tests_pass",
+]
+
+[[feature]]
+name = "One mapping from a key press to the line editor's key (`lumen_shell::Key::from_press`): the press's text first (Enter, Backspace, Delete, Tab, Ctrl with a letter, printable characters; other control characters none), else its key code (the arrows, Home, End); the screen shells take their keys through it"
+milestone = "M4"
+tests = [
+    "cargo:lumen-shell",
+    "ktest:lumen_kernel::shell::keyboard_keys_reach_the_line_editor",
+    "scenario:test_input::test_keys_via_qmp_send_key",
+    "scenario:test_ktest::test_in_kernel_tests_pass",
+]

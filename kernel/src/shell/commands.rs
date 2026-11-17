@@ -50,7 +50,13 @@ pub static COMMANDS: Table<Run> = Table(&[
         about: "the boot CPU's timer interrupts (and stray ones)",
         run: ticks,
     },
-    Command { name: "kbd", args: &[], usage: "", about: "the keyboard's layout and interrupts", run: kbd },
+    Command {
+        name: "kbd",
+        args: &[&["events"]],
+        usage: "[events [n]]",
+        about: "the keyboard's layout and interrupts (events: the newest key events, presses and releases)",
+        run: kbd,
+    },
     Command {
         name: "term",
         args: &[&["text"]],
@@ -178,9 +184,10 @@ pub static COMMANDS: Table<Run> = Table(&[
     },
     Command {
         name: "mouse",
-        args: &[&["hold", "release"]],
-        usage: "[hold|release]",
-        about: "the tablet: where the pointer is, the buttons held, the wheels (hold: stop reading it until release)",
+        args: &[&["hold", "release", "events"]],
+        usage: "[hold|release|events [n]]",
+        about: "the tablet: where the pointer is, the buttons held, the wheels (hold: stop reading it until release; \
+                events: the newest frames)",
         run: sysinfo::mouse,
     },
     Command {
@@ -394,17 +401,28 @@ fn ticks(ctx: &mut Ctx<'_>, _: &[String]) {
     );
 }
 
-/// `kbd`: the keyboard's layout, route and counts, or why there is none.
-/// Its line is parsed by `KBD_STATS` (tests/scenarios/test_input.py) and
-/// `KBD_COUNTS` (tools/harness/lumen_harness/gui.py): change them together.
-fn kbd(ctx: &mut Ctx<'_>, _: &[String]) {
+/// `kbd`: the keyboard's layout, route and counts (and its ring's newest
+/// key event), or why there is none; `kbd events [n]`: the key ring's
+/// newest events. Its line is parsed by `KBD_STATS`
+/// (tests/scenarios/test_input.py) and `KBD_COUNTS`
+/// (tools/harness/lumen_harness/gui.py): change them together.
+fn kbd(ctx: &mut Ctx<'_>, args: &[String]) {
+    match args {
+        [] => {}
+        [a, ..] if a == "events" => {
+            let records = sysinfo::records("kbd").and_then(|make| make(args));
+            return sysinfo::print_table(ctx, records.unwrap_or_else(|| Err(String::from("usage: kbd events [n]"))));
+        }
+        _ => return ctx.fail("usage: kbd [events [n]]"),
+    }
     let k = crate::keyboard::stats();
+    let newest = lumen_input::InputDevice::newest(&crate::input::KEYS).get();
     let out = &mut *ctx.out;
     let _ = match (k.result, k.route) {
         (Some(Ok(())), Some(route)) => writeln!(
             out,
             "kbd: layout {}, IRQ {} (vector {:#x}), {} interrupts, {} bytes, {} presses, \
-             {} held, {} dropped, {} undecoded, {} line errors, {} skipped at setup",
+             {} held, {} dropped, {} undecoded, {} line errors, {} skipped at setup, newest key event {newest}",
             k.layout,
             route.irq(),
             route.vector(),

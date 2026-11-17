@@ -42,7 +42,7 @@ def mouse_text(
     tail = held + (f", failed: {failed}" if failed else "")
     header = (
         f'mouse: "QEMU Virtio Tablet" on 0000:00:03.0, screen 1280x800, {3 * frames} events in '
-        f"{frames} frames (0 ignored, 0 dropped, 0 overruns){tail}"
+        f"{frames} frames (0 ignored, 0 dropped, 0 overruns, newest event {frames}){tail}"
     )
     if xy is None:
         row = "  0000:00:03.0     -     -  -              -      -       -  -        -      -"
@@ -67,7 +67,7 @@ def kbd_text(k: KeyCounts) -> str:
     return (
         f"kbd: layout us, IRQ 1 (vector 0x51), {k.bytes} interrupts, {k.bytes} bytes, "
         f"{k.presses} presses, {k.held} held, {k.dropped} dropped, {k.undecoded} undecoded, "
-        f"{k.line_errors} line errors, 0 skipped at setup\n"
+        f"{k.line_errors} line errors, 0 skipped at setup, newest key event {k.presses}\n"
     )
 
 

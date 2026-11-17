@@ -37,6 +37,7 @@ mod demo;
 mod drivers;
 mod fb;
 mod font;
+mod input;
 mod interrupts;
 mod keyboard;
 mod klog;

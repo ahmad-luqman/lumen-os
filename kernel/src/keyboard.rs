@@ -46,12 +46,12 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use log::{debug, info, warn};
-use lumen_input::Presses;
+use lumen_input::{KeyDecoder, Presses};
 use lumen_queue::ByteQueue;
 use pc_keyboard::layouts::{
     AnyLayout, Azerty, Colemak, De105Key, Dvorak104Key, FiSe105Key, Jis109Key, No105Key, Uk105Key, Us104Key,
 };
-use pc_keyboard::{DecodedKey, HandleControl, PS2Keyboard, ScancodeSet1};
+use pc_keyboard::{DecodedKey, HandleControl};
 
 use crate::arch::i8042;
 use crate::interrupts::{self, Route};
@@ -75,7 +75,9 @@ const LAYOUTS: [NamedLayout; 9] = [
     ("colemak", || AnyLayout::Colemak(Colemak)),
 ];
 
-type Decoder = PS2Keyboard<AnyLayout, ScancodeSet1>;
+/// `pc-keyboard`'s set 1 decoder, with the key events for the desktop's
+/// ring (`lumen_input::KeyDecoder`, #151).
+type Decoder = KeyDecoder<AnyLayout>;
 
 /// The decoder and the name of its layout.
 struct Keyboard {
@@ -233,7 +235,7 @@ fn choose_layout(value: Option<&str>) -> (&'static str, AnyLayout, bool) {
 }
 
 fn new_decoder(layout: AnyLayout) -> Decoder {
-    Decoder::new(ScancodeSet1::new(), layout, HandleControl::MapLettersToUnicode)
+    Decoder::new(layout, HandleControl::MapLettersToUnicode)
 }
 
 /// Set up the decoder in the layout `lumen.keymap=` names, then IRQ 1 and
@@ -534,12 +536,20 @@ pub enum Key {
 }
 
 /// The next key pressed, if one is waiting (releases are consumed and
-/// skipped). Never blocks.
+/// skipped). Never blocks. Every key event decoded on the way, presses and
+/// releases, bare modifiers included, goes to the desktop's key ring
+/// (`crate::input::KEYS`, #151) first.
 /// (A byte the queue dropped can leave the decoder out of step, e.g. shift
 /// still held, until the key is pressed again; `kbd` counts drops.)
 pub fn read_key() -> Option<Key> {
     let mut keyboard = KEYBOARD.lock();
-    decode(&mut keyboard.as_mut()?.decoder, || QUEUE.pop())
+    decode(
+        &mut keyboard.as_mut()?.decoder,
+        || QUEUE.pop(),
+        |event| {
+            crate::input::KEYS.push(event);
+        },
+    )
 }
 
 /// Queue `bytes` as if IRQ 1 had (for the tests: nothing else produces
@@ -571,18 +581,19 @@ pub fn wake_readers() {
 }
 
 /// Feed `next()`'s bytes to `decoder` until one completes a key press;
-/// bytes it refuses are counted.
-fn decode(decoder: &mut Decoder, mut next: impl FnMut() -> Option<u8>) -> Option<Key> {
+/// each key event decoded goes to `push`; bytes it refuses are counted.
+fn decode(
+    decoder: &mut Decoder,
+    mut next: impl FnMut() -> Option<u8>,
+    mut push: impl FnMut(lumen_input::KeyEvent),
+) -> Option<Key> {
     while let Some(byte) = next() {
-        match decoder.add_byte(byte) {
-            Ok(Some(event)) => match decoder.process_keyevent(event) {
-                Some(DecodedKey::Unicode(c)) => return Some(Key::Char(c)),
-                Some(DecodedKey::RawKey(code)) => {
-                    let m = decoder.get_modifiers();
-                    return Some(Key::Raw { code, shift: m.is_shifted(), alt: m.is_alt() });
-                }
-                None => {}
-            },
+        match decoder.add_byte(byte, &mut push) {
+            Ok(Some(DecodedKey::Unicode(c))) => return Some(Key::Char(c)),
+            Ok(Some(DecodedKey::RawKey(code))) => {
+                let m = decoder.modifiers();
+                return Some(Key::Raw { code, shift: m.is_shifted(), alt: m.is_alt() });
+            }
             Ok(None) => {}
             Err(_) => {
                 UNDECODED.fetch_add(1, Ordering::Relaxed);
@@ -689,7 +700,7 @@ crate::ktest!(
 fn decode_all(name: &str, bytes: &[u8]) -> alloc::string::String {
     let mut decoder = new_decoder(choose_layout(Some(name)).1);
     let mut it = bytes.iter().copied();
-    core::iter::from_fn(|| decode(&mut decoder, || it.next()))
+    core::iter::from_fn(|| decode(&mut decoder, || it.next(), |_| {}))
         .filter_map(|k| match k {
             Key::Char(c) => Some(c),
             Key::Raw { .. } => None,
@@ -733,7 +744,7 @@ crate::ktest!(
             0x2a, 0xe0, 0x49, 0xe0, 0xc9, 0xaa, 0xe0, 0x51, 0xe0, 0xd1, 0x1e, 0x9e, 0x38, 0x3c, 0xbc, 0xb8, 0x3c, 0xbc,
         ];
         let mut it = bytes.iter().copied();
-        let keys: alloc::vec::Vec<Key> = core::iter::from_fn(|| decode(&mut decoder, || it.next())).collect();
+        let keys: alloc::vec::Vec<Key> = core::iter::from_fn(|| decode(&mut decoder, || it.next(), |_| {})).collect();
         let raw = |code, shift, alt| Key::Raw { code, shift, alt };
         kassert_eq!(
             keys,

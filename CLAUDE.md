@@ -185,15 +185,20 @@ own PR that updates that doc first.
   `route_isa_irq` (MADT overrides, handler registered before unmasking).
   `mouse.rs`: the virtio tablet (#98; bound by class, read by its own
   `mouse` thread, which moves the pointer; `mouse::status` for `mouse`;
-  `mouse::hold`/`release` stop and resume its reads, for overruns on purpose).
+  `mouse::hold`/`release` stop and resume its reads, for overruns on purpose;
+  each frame also into `input::POINTER`).
   `make run` attaches a tablet.
+  `input.rs`: the desktop's input rings (#151): `POINTER` (every tablet
+  frame) and `KEYS` (every key event), `lumen_input::Ring`s behind leaf
+  locks (`LockedRing`, an `InputDevice`); `mouse events`, `kbd events`.
   `serial_in.rs`: COM1's input by interrupt (IRQ 4) into the queue the
   serial shell blocks on (a 100 ms deadline as a safety net, counted and
   warned about; `serial` shows it); it polls, yielding, without that
   interrupt or before the boot CPU's scheduler runs, and blocks for good
   without a UART; the UART's one reader.
   `keyboard.rs`: the PS/2 keyboard (8042 init, IRQ 1, `pc-keyboard`
-  decoding, `lumen.keymap=`); `arch/x86_64/i8042.rs` its ports.
+  decoding through `lumen_input::KeyDecoder`, each key event into
+  `input::KEYS`, `lumen.keymap=`); `arch/x86_64/i8042.rs` its ports.
   `time.rs`: TSC and LAPIC timer calibration (judged by each clock's
   tolerance; `lumen.stall_tsc_windows=`/`lumen.stall_timer_windows=` stall
   them for scenarios), the boot origin
@@ -236,8 +241,13 @@ own PR that updates that doc first.
   statement of what overruns guarantee; a model of QEMU's ring checks
   it), the arrow sprite with its save-under (`Cursor`, over a
   `Surface`; a randomized model of drawing around the arrow checks it),
-  and the keys pressed and held in PS/2 set 1 bytes (`Presses`, for
-  `kbd`'s `presses` and `held`) (host-tested).
+  the keys pressed and held in PS/2 set 1 bytes (`Presses`, for
+  `kbd`'s `presses` and `held`), and the desktop's input (#151): numbered
+  event rings (`Ring`, `Seq`, `InputDevice`, a `Reader` counting what it
+  missed), `PointerEvent` (with `AfterOverrun` marking frames that may
+  follow a loss at the device), `KeyEvent`/`KeyAction`/`Mods` from set 1
+  bytes (`KeyDecoder` over `pc-keyboard`: one press per key, agreeing with
+  `Presses`) (host-tested).
 - `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, the
   page-table format and mapper (host-tested, incl. a model comparison), the
   window tokens that confine `paging::map`, and the kernel-stack layout and
@@ -272,7 +282,8 @@ own PR that updates that doc first.
   completion; ANSI and plain output), the command table (names, completion
   words, usage and help lines), pipelines (text or records in tables, the
   filters `grep`, `where`, `sort`, `first`, `count`, `select`), serial
-  bytes to keys (host-tested).
+  bytes to keys, a key press to the line editor's key (`Key::from_press`,
+  shared by text mode and terminal windows) (host-tested).
 - `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET, MCFG,
   FADT (PM1 control blocks) and the DSDT's `_S5_` by byte search
   (host-tested on handcrafted tables).

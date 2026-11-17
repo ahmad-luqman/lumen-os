@@ -80,14 +80,16 @@ HELD_BUTTONS = tuple(b for b in BUTTONS if not b.startswith("wheel-"))
 # kernel/src/shell/sysinfo.rs `mouse_header` (change them together).
 MOUSE_HEADER = re.compile(
     r'mouse: "[^"]*" on \S+, screen \d+x\d+, (\d+) events in (\d+) frames '
-    r"\((\d+) ignored, (\d+) dropped, (\d+) overruns\)(?:, (holding|held))?(?:, failed: (.+))?"
+    r"\((\d+) ignored, (\d+) dropped, (\d+) overruns, newest event \d+\)(?:, (holding|held))?"
+    r"(?:, failed: (.+))?"
 )
 NO_TABLET = "mouse: no tablet"
 # kernel/src/shell/commands.rs `kbd` (change them together).
 KBD_COUNTS = re.compile(
     r"kbd: layout \S+, IRQ \d+ \(vector 0x[0-9a-f]+\), \d+ interrupts, (?P<bytes>\d+) bytes, "
     r"(?P<presses>\d+) presses, (?P<held>\d+) held, (?P<dropped>\d+) dropped, "
-    r"(?P<undecoded>\d+) undecoded, (?P<line_errors>\d+) line errors, \d+ skipped at setup"
+    r"(?P<undecoded>\d+) undecoded, (?P<line_errors>\d+) line errors, \d+ skipped at setup, "
+    r"newest key event \d+"
 )
 
 _PLAIN_KEYS = (
