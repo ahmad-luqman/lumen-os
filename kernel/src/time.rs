@@ -1286,24 +1286,8 @@ crate::ktest!(
         // was off.
         let boot = boot_calibration().ok_or("no boot calibration")?;
         crate::ktest::diag(format_args!("tsc boot (hpet) {boot}"));
-        let mut judged = None;
-        for tried in 0..PIT_TRIES {
-            if tried > 0 {
-                spin(RETRY_SPACING_NS);
-            }
-            match measure(Reference::Pit).ok_or("no PIT")? {
-                Ok(cal) => {
-                    let ppm = cal.median_bound_ppm();
-                    crate::ktest::diag(format_args!("tsc now against the pit {cal}, median within {ppm} ppm"));
-                    if ppm <= lumen_time::TSC_TOLERANCE_PPM {
-                        judged = Some(cal);
-                        break;
-                    }
-                }
-                Err(e) => crate::ktest::diag(format_args!("against the pit: {e}")),
-            }
-        }
-        let pit = judged.ok_or("the PIT re-measurement couldn't be judged: never within the TSC's tolerance")?;
+        let pit = first_judgeable(PIT_TRIES, || measure(Reference::Pit).ok_or("no PIT"), || spin(RETRY_SPACING_NS))?
+            .ok_or("the PIT re-measurement couldn't be judged: never within the TSC's tolerance")?;
         match measure(Reference::Hpet) {
             Some(Ok(hpet)) => crate::ktest::diag(format_args!("tsc now against the hpet {hpet}")),
             Some(Err(e)) => crate::ktest::diag(format_args!("tsc now against the hpet: failed ({e})")),
@@ -1312,6 +1296,67 @@ crate::ktest!(
         let (boot_ppm, pit_ppm) = (boot.median_bound_ppm(), pit.median_bound_ppm());
         crate::ktest::diag(format_args!("bounds: boot {boot_ppm} ppm, pit {pit_ppm} ppm"));
         kassert!(lumen_time::within_bounds(pit.hz, hz, pit_ppm, boot_ppm, 20_000));
+        Ok(())
+    }
+);
+
+/// The first of up to `tries` calibrations from `measure` (`space` called
+/// between them) whose median is within the TSC's tolerance, each shown as
+/// a diag; `None` if none is. A cross-check against a wider one could pass
+/// on its bound alone, which proves nothing.
+#[cfg(feature = "ktest")]
+fn first_judgeable(
+    tries: usize,
+    mut measure: impl FnMut() -> Result<Result<Calibration, CalError>, &'static str>,
+    mut space: impl FnMut(),
+) -> Result<Option<Calibration>, &'static str> {
+    for tried in 0..tries {
+        if tried > 0 {
+            space();
+        }
+        match measure()? {
+            Ok(cal) => {
+                let ppm = cal.median_bound_ppm();
+                crate::ktest::diag(format_args!("tsc now against the pit {cal}, median within {ppm} ppm"));
+                if ppm <= lumen_time::TSC_TOLERANCE_PPM {
+                    return Ok(Some(cal));
+                }
+            }
+            Err(e) => crate::ktest::diag(format_args!("against the pit: {e}")),
+        }
+    }
+    Ok(None)
+}
+
+crate::ktest!(
+    fn a_cross_check_measures_again_until_it_can_judge() {
+        // A PIT measurement past the TSC's tolerance (or one that failed) is
+        // taken again, spaced, until one is within it; never within it, none
+        // (tsc_calibrated_within_tolerance then fails saying it couldn't
+        // judge, instead of passing on a wide bound).
+        use crate::kassert_eq;
+        let w = |end_gap| Window { tsc: 10_000_000, reference: 11_932, polls: 900, start_gap: 0, end_gap };
+        let cal = |end_gap| Calibration {
+            hz: 2_500_000_000,
+            windows: [w(end_gap); WINDOWS],
+            retaken: 0,
+            last_retaken: None,
+            of: Calibrated::Tsc(Reference::Pit),
+        };
+        let (wide, fine) = (cal(200_000), cal(1_000));
+        let mut queue = [Err(CalError::NoCount), Ok(wide), Ok(fine)].into_iter();
+        let (mut taken, mut spaced) = (0, 0);
+        let got = first_judgeable(
+            4,
+            || {
+                taken += 1;
+                Ok(queue.next().unwrap_or(Ok(wide)))
+            },
+            || spaced += 1,
+        )?;
+        kassert_eq!((got, taken, spaced), (Some(fine), 3, 2));
+        let never = first_judgeable(4, || Ok(Ok(wide)), || {})?;
+        kassert_eq!(never, None);
         Ok(())
     }
 );
