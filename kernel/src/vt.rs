@@ -72,7 +72,13 @@ static TO_DESKTOP: AtomicU64 = AtomicU64::new(0);
 /// Set while the desktop is shown (its `ScreenCanvas` live): set and
 /// cleared only under [`ROUTER`]'s lock ([`enter_desktop`], and an Alt+F`n`
 /// in the decoding pass), so each key is routed on one side of the change.
-pub static DESKTOP: AtomicBool = AtomicBool::new(false);
+/// Read through [`desktop_shown`].
+static DESKTOP: AtomicBool = AtomicBool::new(false);
+
+/// Whether the desktop is shown (keys are its own until Alt+F`n`).
+pub fn desktop_shown() -> bool {
+    DESKTOP.load(Ordering::Acquire)
+}
 
 /// Both input rings' newest events at a change of the desktop's state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -92,40 +98,116 @@ impl Marks {
 
 /// The cut: where each change of the desktop's state falls in the input
 /// rings, so the compositor knows which events were the desktop's. Written
-/// under [`ROUTER`]'s lock before any later key is routed; the compositor
-/// reads it each pass. A leaf lock.
+/// under [`ROUTER`]'s lock before any later key is routed ([`Cut::paused`],
+/// [`Cut::resumed`]); read as a copy ([`cut`]) each pass. Its lock is a
+/// leaf.
 ///
-/// Every change counts one `generation` (0 before the desktop ever
-/// started; odd while shown, even while paused). The latest pause's marks
-/// and the latest start's or resume's are both kept, so a compositor that
-/// sees a resume and then a pause in one look still has the marks of each
-/// (a resume waits until the compositor has seen the pause before it, so
-/// no older marks are ever needed).
+/// Every change counts one generation (0 before the desktop ever started;
+/// odd while shown, even while paused). The latest pause's marks and the
+/// latest start's or resume's are both kept, so a compositor that sees a
+/// resume and then a pause in one look still has the marks of each (a
+/// resume waits until the compositor has seen the pause before it, so no
+/// older marks are ever needed).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Cut {
-    pub generation: u64,
+    generation: u64,
     /// At the latest pause (Alt+F`n`): the rings' newest, the Alt+F`n`
     /// press itself the newest key event.
-    pub pause: Marks,
+    pause: Marks,
     /// At the latest start or resume (`desktop`).
-    pub resume: Marks,
+    resume: Marks,
     /// The buttons the pointer ring's newest frame held at the latest
     /// start or resume: the baseline `Wm::resume` takes (captured here, as
     /// the ring may overwrite that frame before the compositor reads it).
-    pub baseline: Buttons,
+    baseline: Buttons,
     /// Who holds the desktop's `ScreenCanvas` (the compositor's owner,
     /// made once when the desktop starts).
-    pub owner: Option<Owner>,
+    owner: Option<Owner>,
+}
+
+impl Cut {
+    const NEVER: Cut = Cut {
+        generation: 0,
+        pause: Marks { keys: Seq::ZERO, pointer: Seq::ZERO },
+        resume: Marks { keys: Seq::ZERO, pointer: Seq::ZERO },
+        baseline: Buttons::NONE,
+        owner: None,
+    };
+
+    /// A pause at `marks`: the generation goes from odd (shown) to even.
+    fn paused(&mut self, marks: Marks) {
+        debug_assert!(!self.generation.is_multiple_of(2), "a pause while not shown (generation {})", self.generation);
+        self.generation += 1;
+        self.pause = marks;
+    }
+
+    /// A start or resume at `marks`: the generation goes from even
+    /// (paused, or never started) to odd.
+    fn resumed(&mut self, marks: Marks, baseline: Buttons, owner: Owner) {
+        debug_assert!(self.generation.is_multiple_of(2), "a resume while shown (generation {})", self.generation);
+        self.generation += 1;
+        self.resume = marks;
+        self.baseline = baseline;
+        self.owner = Some(owner);
+    }
+
+    /// Every change so far (odd while shown).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The baseline buttons of the latest start or resume.
+    pub fn baseline(&self) -> Buttons {
+        self.baseline
+    }
+
+    /// Who holds the desktop's screen, once it started.
+    pub fn owner(&self) -> Option<Owner> {
+        self.owner
+    }
+
+    /// The latest pause's marks.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "the ktests check them"))]
+    pub fn pause(&self) -> Marks {
+        self.pause
+    }
+
+    /// The latest start's or resume's marks.
+    pub fn resume(&self) -> Marks {
+        self.resume
+    }
+
+    /// Whether the pointer frame `seq` was the desktop's before the latest
+    /// pause (frames up to its mark were).
+    pub fn pause_owns_pointer(&self, seq: Seq) -> bool {
+        seq <= self.pause.pointer
+    }
+
+    /// Whether the key event `seq` was the desktop's before the latest
+    /// pause (events before the Alt+F`n` press, its mark, were).
+    pub fn pause_owns_key(&self, seq: Seq) -> bool {
+        seq < self.pause.keys
+    }
+
+    /// Whether the pointer frame `seq` came after the latest start or
+    /// resume.
+    pub fn after_resume_pointer(&self, seq: Seq) -> bool {
+        seq > self.resume.pointer
+    }
+
+    /// Whether the key event `seq` came after the latest start or resume.
+    pub fn after_resume_key(&self, seq: Seq) -> bool {
+        seq > self.resume.keys
+    }
 }
 
 /// The cut (see [`Cut`]).
-pub static CUT: SpinLock<Cut> = SpinLock::new(Cut {
-    generation: 0,
-    pause: Marks { keys: Seq::ZERO, pointer: Seq::ZERO },
-    resume: Marks { keys: Seq::ZERO, pointer: Seq::ZERO },
-    baseline: Buttons::NONE,
-    owner: None,
-});
+static CUT: SpinLock<Cut> = SpinLock::new(Cut::NEVER);
+
+/// A copy of the cut, read under its leaf lock.
+pub fn cut() -> Cut {
+    *CUT.lock()
+}
 
 /// Alt+F`n` shows terminal `n` (from 1; the first [`VTS`] of them).
 const SWITCH_KEYS: [KeyCode; 4] = [KeyCode::F1, KeyCode::F2, KeyCode::F3, KeyCode::F4];
@@ -372,9 +454,7 @@ fn leave_desktop(to: usize) {
     }
     DESKTOP.store(false, Ordering::Release);
     let marks = Marks::now();
-    let mut cut = CUT.lock();
-    cut.generation += 1;
-    cut.pause = marks;
+    CUT.lock().paused(marks);
 }
 
 /// Show the desktop (start or resume it; `crate::desktop`): under
@@ -394,12 +474,7 @@ pub fn enter_desktop(owner: Owner) -> Result<ScreenCanvas, CanvasError> {
         if taken.is_ok() {
             let marks = Marks::now();
             let baseline = crate::input::POINTER.newest_event().map_or(Buttons::NONE, |(_, e)| e.state.buttons);
-            let mut cut = CUT.lock();
-            cut.generation += 1;
-            cut.resume = marks;
-            cut.baseline = baseline;
-            cut.owner = Some(owner);
-            drop(cut);
+            CUT.lock().resumed(marks, baseline, owner);
             DESKTOP.store(true, Ordering::Release);
         }
         (taken, pass)
@@ -645,12 +720,12 @@ crate::ktest!(
         let _first = term::ShowFirstAfter;
         let _off = DesktopOffAfter;
         let mut r = Rings::new();
-        let before = CUT.lock().generation;
+        let before = cut().generation();
         let owner = Owner::new();
         let screen = enter_desktop(owner).map_err(|_| "no screen")?;
-        let cut = *CUT.lock();
-        kassert_eq!((cut.generation, cut.owner), (before + 1, Some(owner)));
-        kassert_eq!(cut.resume, Marks::now());
+        let c = cut();
+        kassert_eq!((c.generation(), c.owner()), (before + 1, Some(owner)));
+        kassert_eq!(c.resume(), Marks::now());
         kassert!(DESKTOP.load(Ordering::Acquire));
         kassert!(matches!(term::canvas(Owner::new()), Err(CanvasError::InUse)));
         let sent = stats().to_desktop;
@@ -660,8 +735,9 @@ crate::ktest!(
         kassert_eq!(route_key(&mut r, raw_key(KeyCode::F2, true), ALL), Routed::Left(1));
         kassert!(!DESKTOP.load(Ordering::Acquire) && !screen.is_live());
         kassert_eq!(term::shown(), 1);
-        let cut = *CUT.lock();
-        kassert_eq!((cut.generation, cut.pause), (before + 2, Marks::now()));
+        let c = cut();
+        kassert_eq!((c.generation(), c.pause()), (before + 2, Marks::now()));
+        kassert!(c.pause_owns_key(Seq::ZERO) == (c.pause().keys > Seq::ZERO));
         drop(screen);
         kassert_eq!(route_key(&mut r, Key::Char('b'), ALL), Routed::To(1));
         kassert_eq!(r.mask(), 1 << 1);

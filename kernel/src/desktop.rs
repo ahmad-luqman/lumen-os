@@ -16,21 +16,28 @@
 //!   geometry and the theme. Events reach the owner through the window's
 //!   `lumen_wm::EventQueue` ([`WindowHandle::next_event`],
 //!   [`WindowHandle::wait_event`]).
-//! - **A pass** ([`Compositor::pass`]): the keyboard's decoding pass
-//!   (`vt::decode_pending`, holding none of the desktop's locks), both
-//!   input rings read (pointer frames through `lumen_wm::Wm` into focus,
-//!   drags, the close box and windows' pointer events; key events to the
-//!   focused window), the cut acted on (a pause or a resume), then under
-//!   [`COMPOSITOR`] the damage and a snapshot of the stacking order taken;
-//!   only the damaged rectangles are recomposed in the back buffer and
-//!   copied to the screen, then the pointer is drawn straight onto the
-//!   screen (never into the back buffer).
+//! - **A pass** ([`Compositor::pass`], after the keyboard's decoding pass,
+//!   `vt::decode_pending`, which [`Compositor::run`] calls holding none of
+//!   the desktop's locks): both input rings read (pointer frames through
+//!   `lumen_wm::Wm` into focus, drags, the close box and windows' pointer
+//!   events; key events to the focused window), the cut acted on (a pause
+//!   or a resume), then under [`COMPOSITOR`] the damage and a snapshot of
+//!   the stacking order taken; only the damaged rectangles are recomposed
+//!   in the back buffer and copied to the screen, then the pointer is drawn
+//!   straight onto the screen (never into the back buffer).
+//! - **The live state** is a [`State`] in [`COMPOSITOR`]; the statics are
+//!   private to this module, so the lock order below holds by construction
+//!   outside it.
 //! - **Locks**, in order: [`COMPOSITOR`] (the window manager, the damage,
 //!   the statistics), a window's lock (its committed surface and queue),
-//!   the heap's, the log's line lock, the screen's. Nothing holding the
-//!   router lock (`crate::vt`), the log's or the screen's takes one of the
-//!   desktop's, and the desktop takes the router lock holding none of its
-//!   own. Every wake happens after the lock that guarded the change.
+//!   the heap's, the log's line lock, the screen's. The input rings' and
+//!   the cut's locks are leaves, taken under any of them. Nothing holding
+//!   the router lock (`crate::vt`), the log's or the screen's takes one of
+//!   the desktop's, and the desktop takes the router lock holding none of
+//!   its own. A wait queue's lock comes before [`COMPOSITOR`] (`desktop`
+//!   and a request's asker check [`COMPOSITOR`] in their wake-up
+//!   predicates, under [`DONE`]'s lock); every wake happens after the lock
+//!   that guarded the change, so no wake is ever made holding it.
 //! - **The crash screen still wins**: `crash::enter` calls `term::stop`,
 //!   which ends the `ScreenCanvas` (no present row starts after it), and
 //!   nothing on the crash path takes a desktop lock.
@@ -43,11 +50,11 @@ use alloc::vec::Vec;
 use core::cell::Cell;
 use core::fmt;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use lumen_gfx::{Damage, Mask, Rect, Surface, Target};
 use lumen_input::cursor::{SPRITE_H, SPRITE_W, draw_arrow};
-use lumen_input::{KeyAction, KeyEvent, PointerEvent, Read, Reader};
+use lumen_input::{KeyAction, KeyEvent, PointerEvent, Read, Reader, Seq};
 use lumen_png::encode::Rows;
 use lumen_wm::{
     Button, ButtonSet, Entry, EventQueue, Interruption, Metrics, Next, Outcome, Pointer, PointerEntry, Pushed,
@@ -72,26 +79,26 @@ type Gathered = Damage<32>;
 
 /// The compositor sleeps here until [`PENDING`] is set or the keyboard
 /// has bytes waiting.
-pub static WAKE: WaitQueue = WaitQueue::new();
-/// Set by every waker before it calls [`wake`]; the compositor clears it
-/// as it wakes.
-pub static PENDING: AtomicBool = AtomicBool::new(false);
+static WAKE: WaitQueue = WaitQueue::new();
+/// Set by [`wake`]; the compositor clears it as it wakes.
+static PENDING: AtomicBool = AtomicBool::new(false);
 /// Set once the compositor thread exists: [`wake`] does nothing before.
 static RUNNING: AtomicBool = AtomicBool::new(false);
-/// The job's answer is in ([`Slot::Answered`]).
-static ANSWERED: AtomicBool = AtomicBool::new(false);
-/// Woken after every pass: a job's asker, and `desktop` waiting for the
-/// compositor to catch up with the cut.
+/// Woken after every pass: a request's asker, and `desktop` waiting for
+/// the compositor to catch up with the cut. Their predicates read
+/// [`COMPOSITOR`].
 static DONE: WaitQueue = WaitQueue::new();
-
 /// The live desktop's state: `None` until it starts (it never ends in M4).
-pub static COMPOSITOR: SpinLock<Option<State>> = SpinLock::new(None);
+static COMPOSITOR: SpinLock<Option<State>> = SpinLock::new(None);
+/// The id the next live desktop's first window gets: a start that failed
+/// hands its count on, so no window id is ever reused in a boot.
+static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(1);
 
 /// Wake the compositor (nothing before the desktop started): IRQ 1 when
 /// it queued bytes, the `mouse` thread after pushing frames, every commit
-/// and request, a pause or a resume. Sets [`PENDING`] first. Called with
-/// no desktop lock held (any other lock is fine: it takes only the wait
-/// queue's).
+/// and request, a pause or a resume. It sets [`PENDING`] itself. Called
+/// with no desktop lock held (any other lock is fine: it takes only the
+/// wait queue's).
 pub fn wake() {
     if RUNNING.load(Ordering::Acquire) {
         PENDING.store(true, Ordering::Release);
@@ -104,12 +111,14 @@ const THEME: &Theme = &Theme::LIGHT;
 /// The frames' geometry.
 const METRICS: Metrics = Metrics::DESKTOP;
 /// The bitmap font the titles and the demo windows use (TrueType comes
-/// with #154).
+/// with #154), and its height in pixels.
 const FONT: RasterHeight = RasterHeight::Size16;
+const FONT_PX: i32 = 16;
 
 /// An automation request (#156 fills this in): none can be made yet, so
-/// no window's queue ever holds one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// no window's queue ever holds one. Not `Clone`: #156's requests answer
+/// for themselves when dropped, so a copy would answer twice.
+#[derive(Debug)]
 pub enum Request {}
 
 /// A window's event queue.
@@ -117,8 +126,10 @@ type Queue = EventQueue<KeyEvent, Request>;
 
 /// What a window's owner is told ([`WindowHandle::next_event`]). Pointer
 /// positions are in its client area's coordinates (outside it while a
-/// grab follows the pointer).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// grab follows the pointer). Not `Clone` and not compared (it may carry a
+/// [`Request`]): match it (`matches!(e, WindowEvent::Close)`).
+#[derive(Debug)]
+#[allow(dead_code, reason = "the pointer events' fields are read by #155-#157's owners; the demos read keys only")]
 pub enum WindowEvent {
     Key(KeyEvent),
     PointerDown {
@@ -178,11 +189,12 @@ pub struct Window {
     id: WindowId,
     title: String,
     inner: SpinLock<WindowInner>,
-    /// Whether the queue holds an entry or a flag (`!is_idle()`), stored
-    /// under the window's lock after every change: the owner's wake-up
-    /// check reads it without the lock.
+    /// Whether the queue holds an entry or a flag (`!is_idle()`): an atomic
+    /// outside the lock, stored under it after every change, so the
+    /// owner's wake-up check reads it without the lock.
     queued: AtomicBool,
-    /// Set while the owner waits in [`WindowHandle::wait_event`].
+    /// Set while the owner waits in [`WindowHandle::wait_event`] (an atomic
+    /// outside the lock).
     idle: AtomicBool,
     /// Its owner waits here.
     events: WaitQueue,
@@ -207,7 +219,7 @@ struct WindowInner {
 /// Why [`open_window`] failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenError {
-    /// The desktop hasn't started.
+    /// The desktop hasn't started (or is still starting).
     NoDesktop,
     /// [`MAX_WINDOWS`] are open.
     TooMany,
@@ -236,9 +248,9 @@ enum Job {
     Capture(Box<Rows>),
 }
 
-/// The one job slot, reserved from the moment a request is accepted until
-/// its asker takes the answer (or gives up), so a second request meanwhile
-/// is refused and no asker ever gets another's answer.
+/// The one request slot, reserved from the moment a request is accepted
+/// until its asker takes the answer (or gives up), so a second request
+/// meanwhile is refused and no asker ever gets another's answer.
 enum Slot {
     Free,
     /// Accepted, waiting for the compositor's next pass.
@@ -252,28 +264,29 @@ enum Slot {
     Answered(Answer),
 }
 
-/// Why a request wasn't accepted: another holds the slot.
-const SLOT_BUSY: &str = "busy with another request (`desktop check` or `screenshot`): try again";
+/// A job taken out of the slot to run: only it can finish the slot, so an
+/// answer can't land in a slot whose job wasn't started.
+struct Ticket(());
 
 impl Slot {
     /// Accept `job` if the slot is free.
-    fn accept(&mut self, job: Job) -> Result<(), &'static str> {
+    fn accept(&mut self, job: Job) -> Result<(), JobError> {
         match self {
             Slot::Free => {
                 *self = Slot::Queued(job);
                 Ok(())
             }
-            _ => Err(SLOT_BUSY),
+            _ => Err(JobError::Busy),
         }
     }
 
     /// The compositor takes the queued job to run it (the slot stays
     /// reserved, `Running`).
-    fn start(&mut self) -> Option<Job> {
+    fn start(&mut self) -> Option<(Job, Ticket)> {
         match core::mem::replace(self, Slot::Free) {
             Slot::Queued(job) => {
                 *self = Slot::Running { abandoned: false };
-                Some(job)
+                Some((job, Ticket(())))
             }
             other => {
                 *self = other;
@@ -282,13 +295,21 @@ impl Slot {
         }
     }
 
-    /// The compositor's answer: for the asker, or dropped (the slot freed)
-    /// if the asker gave up meanwhile.
-    fn finish(&mut self, answer: Answer) {
-        *self = match self {
-            Slot::Running { abandoned: true } => Slot::Free,
-            _ => Slot::Answered(answer),
-        };
+    /// The answer of the job `_ticket` started: for the asker, or dropped
+    /// (the slot freed) if the asker gave up meanwhile.
+    fn finish(&mut self, _ticket: Ticket, answer: Answer) {
+        match self {
+            Slot::Running { abandoned: true } => *self = Slot::Free,
+            Slot::Running { abandoned: false } => *self = Slot::Answered(answer),
+            // Only a started job has a ticket, and nothing else leaves
+            // `Running`.
+            Slot::Free | Slot::Queued(_) | Slot::Answered(_) => debug_assert!(false, "a ticket for no running job"),
+        }
+    }
+
+    /// Whether an answer waits for its asker.
+    fn is_answered(&self) -> bool {
+        matches!(self, Slot::Answered(_))
     }
 
     /// The asker takes its answer, freeing the slot (`None`, changing
@@ -312,6 +333,14 @@ impl Slot {
             Slot::Free => {}
         }
     }
+
+    /// A paused pass (nothing presented: no check or capture to make)
+    /// answers a queued job `Paused` at once.
+    fn answer_paused(&mut self) {
+        if let Some((_, ticket)) = self.start() {
+            self.finish(ticket, Answer::Paused);
+        }
+    }
 }
 
 /// A job's answer.
@@ -323,10 +352,37 @@ enum Answer {
     },
     /// Damage or a commit arrived meanwhile: try again.
     Busy,
+    /// The screen was taken back (Alt+F`n`) while the check read it.
+    ScreenTaken,
+    /// The desktop was paused before the job ran.
+    Paused,
     Capture {
         rows: Box<Rows>,
         ns: u64,
     },
+    /// The rows aren't the back buffer's size.
+    WrongSize,
+}
+
+/// Why a request got no answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JobError {
+    NoDesktop,
+    Paused,
+    /// Another request holds the slot.
+    Busy,
+    NoAnswer,
+}
+
+impl fmt::Display for JobError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            JobError::NoDesktop => "no desktop",
+            JobError::Paused => "paused (`desktop` resumes it)",
+            JobError::Busy => "busy with another request (`desktop check` or `screenshot`): try again",
+            JobError::NoAnswer => "no answer from the compositor in 20 s",
+        })
+    }
 }
 
 /// What `desktop status` counts.
@@ -337,11 +393,13 @@ struct Stats {
     pixels: u64,
     present_ns: u64,
     no_focus_keys: u64,
+    /// Deliveries for a window that had closed.
+    dead_pushes: u64,
 }
 
 /// The desktop's state behind [`COMPOSITOR`] (or a test's own lock:
 /// [`Desktop::without_screen`]).
-pub struct State {
+struct State {
     wm: Wm,
     /// The open windows (in no order: found by id).
     windows: Vec<Arc<Window>>,
@@ -356,13 +414,15 @@ pub struct State {
     committed: u64,
     /// A pass between its snapshot and its end.
     passing: bool,
+    /// Whether the start completed (windows may open only then).
+    started: bool,
     /// Whether the compositor presents (its view of the cut), and the cut's
     /// generation it has acted on.
     shown: bool,
     seen_generation: u64,
     /// The readers' places and gaps, published after each pass.
-    pointer_read: lumen_input::Seq,
-    keys_read: lumen_input::Seq,
+    pointer_read: Seq,
+    keys_read: Seq,
     lost: u64,
     /// Events read but held back (a key ring barrier, or a resume whose
     /// screen hasn't come yet).
@@ -373,18 +433,17 @@ pub struct State {
     abort: bool,
     /// `desktop check`'s and `screenshot`'s requests (see [`Slot`]).
     slot: Slot,
-    /// The compositor's own owner of the screen.
-    owner: Owner,
 }
 
 impl State {
-    fn new(width: u32, height: u32, owner: Owner) -> State {
+    /// A `width` x `height` desktop whose first window gets id `next_id`.
+    fn new(width: u32, height: u32, next_id: u32) -> State {
         // Paused until the compositor acts on the first cut, so the first
         // entry is a resume like every later one: `Wm::resume` with the
         // cut's baseline ignores the buttons held then (pressed in the
         // terminal) until every button is up. (Nothing to deliver: no
         // window yet.)
-        let mut wm = Wm::new(width, height, METRICS);
+        let mut wm = Wm::new(width, height, METRICS).with_next_id(next_id);
         let _no_windows = wm.interrupt(Interruption::Pause);
         State {
             wm,
@@ -397,16 +456,16 @@ impl State {
             commits: 0,
             committed: 0,
             passing: false,
+            started: false,
             shown: false,
             seen_generation: 0,
-            pointer_read: lumen_input::Seq::ZERO,
-            keys_read: lumen_input::Seq::ZERO,
+            pointer_read: Seq::ZERO,
+            keys_read: Seq::ZERO,
             lost: 0,
             held_back: false,
             screen: None,
             abort: false,
             slot: Slot::Free,
-            owner,
         }
     }
 
@@ -415,8 +474,8 @@ impl State {
     }
 
     /// Repaint `out`'s damage and put its deliveries on their windows'
-    /// queues: the windows to wake (after the locks) into `wakes`, the
-    /// windows whose queue began dropping into `behind`.
+    /// queues (the owners to wake and the warnings go into `after`, for
+    /// once the locks are released).
     fn apply(&mut self, out: Outcome, after: &mut After) {
         for r in out.damage.rects() {
             self.damage.add(*r);
@@ -426,9 +485,13 @@ impl State {
         }
     }
 
-    /// Change window `id`'s queue with `f` (nothing if it isn't open).
+    /// Change window `id`'s queue with `f`; for a window that had closed,
+    /// count a dead push instead.
     fn push(&mut self, id: WindowId, after: &mut After, f: impl FnOnce(&mut Queue) -> Option<Pushed>) {
-        let Some(win) = self.window(id) else { return };
+        let Some(win) = self.window(id) else {
+            self.stats.dead_pushes += 1;
+            return;
+        };
         let pushed = {
             let mut inner = win.inner.lock();
             let pushed = f(&mut inner.queue);
@@ -484,8 +547,9 @@ impl Home {
     }
 }
 
-/// A desktop: the live one ([`open_window`]) or one with no compositor
-/// thread and no screen, for the ktests, so none leaves a desktop running.
+/// A desktop: the live one ([`Desktop::LIVE`], [`open_window`]) or one
+/// with no compositor thread and no screen, for the ktests, so none leaves
+/// a desktop running.
 pub struct Desktop {
     home: Home,
 }
@@ -495,16 +559,20 @@ pub struct Desktop {
     allow(dead_code, reason = "the ktests' desktop; windows' owners come with #155-#157")
 )]
 impl Desktop {
-    /// A 1280x800 desktop with no compositor and no screen: windows open
-    /// and close, nothing is drawn.
+    /// The live desktop.
+    const LIVE: Desktop = Desktop { home: Home::Live };
+
+    /// A 1280x800 desktop with no compositor and no screen, started:
+    /// windows open and close, nothing is drawn.
     pub fn without_screen() -> Desktop {
-        let state = State::new(1280, 800, Owner::new());
+        let mut state = State::new(1280, 800, 1);
+        state.started = true;
         Desktop { home: Home::Own(Arc::new(SpinLock::new(Some(state)))) }
     }
 
     /// Open a window of `width` x `height` client pixels titled `title`,
     /// in front and focused, its frame's corner placed by how many are
-    /// open.
+    /// open. `NoDesktop` until the desktop's start completed.
     pub fn open_window(&self, title: &str, width: u32, height: u32) -> Result<WindowHandle, OpenError> {
         self.open(title, width, height, None, false)
     }
@@ -519,7 +587,7 @@ impl Desktop {
     ) -> Result<WindowHandle, OpenError> {
         let (sw, sh) = {
             let g = self.home.lock();
-            let s = g.as_ref().ok_or(OpenError::NoDesktop)?;
+            let s = g.as_ref().filter(|s| s.started).ok_or(OpenError::NoDesktop)?;
             if s.windows.len() >= MAX_WINDOWS {
                 return Err(OpenError::TooMany);
             }
@@ -537,7 +605,7 @@ impl Desktop {
         let mut after = After::default();
         let win = {
             let mut g = self.home.lock();
-            let s = g.as_mut().ok_or(OpenError::NoDesktop)?;
+            let s = g.as_mut().filter(|s| s.started).ok_or(OpenError::NoDesktop)?;
             if s.windows.len() >= MAX_WINDOWS {
                 return Err(OpenError::TooMany);
             }
@@ -565,11 +633,18 @@ impl Desktop {
     }
 }
 
-/// Open a window on the live desktop (see [`Desktop::open_window`]):
-/// `NoDesktop` until it started.
+/// Open a window on the live desktop (see [`Desktop::open_window`]).
 #[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "its first callers are #155-#157's windows"))]
 pub fn open_window(title: &str, width: u32, height: u32) -> Result<WindowHandle, OpenError> {
-    Desktop { home: Home::Live }.open_window(title, width, height)
+    Desktop::LIVE.open_window(title, width, height)
+}
+
+/// The bands of at most [`BAND`] rows `r` is copied in, top to bottom (one
+/// hold of a window's lock each).
+fn bands(r: Rect) -> impl Iterator<Item = Rect> {
+    (r.y()..r.bottom())
+        .step_by(BAND as usize)
+        .map(move |y| Rect::new(r.x(), y, r.w(), BAND.min((r.bottom() - y) as u32)))
 }
 
 /// A window's owner side: its own surface (drawn with no lock), commits,
@@ -606,14 +681,8 @@ impl WindowHandle {
         if let Some(s) = self.home.lock().as_mut() {
             s.commits += 1;
         }
-        for r in rects.iter().filter_map(|r| r.intersect(&bounds)) {
-            let mut y = r.y();
-            while y < r.bottom() {
-                let rows = BAND.min((r.bottom() - y) as u32);
-                let band = Rect::new(r.x(), y, r.w(), rows);
-                self.win.inner.lock().committed.blit(&self.surface, band, r.x(), y);
-                y += rows as i32;
-            }
+        for band in rects.iter().filter_map(|r| r.intersect(&bounds)).flat_map(bands) {
+            self.win.inner.lock().committed.blit(&self.surface, band, band.x(), band.y());
         }
         if let Some(s) = self.home.lock().as_mut() {
             s.commits -= 1;
@@ -660,35 +729,30 @@ impl WindowHandle {
 
 impl Drop for WindowHandle {
     fn drop(&mut self) {
-        let counts = {
-            let mut inner = self.win.inner.lock();
-            inner.queue.kill();
-            self.win.queued.store(false, Ordering::Release);
-            inner.queue.counts()
-        };
+        // In one hold of the desktop's lock: off the list (so nothing more
+        // is delivered to its queue), then its queue killed and its counts
+        // kept, then out of the window manager.
         let mut after = After::default();
-        if let Some(s) = self.home.lock().as_mut() {
+        let mut g = self.home.lock();
+        if let Some(s) = g.as_mut() {
             s.windows.retain(|w| !Arc::ptr_eq(w, &self.win));
-            add_counts(&mut s.closed, &counts);
+            let counts = {
+                let mut inner = self.win.inner.lock();
+                inner.queue.kill();
+                self.win.queued.store(false, Ordering::Release);
+                inner.queue.counts()
+            };
+            s.closed += &counts;
             if let Some(out) = s.wm.close(self.win.id) {
                 s.apply(out, &mut after);
             }
+        } else {
+            self.win.inner.lock().queue.kill();
         }
+        drop(g);
         after.finish();
         self.home.wake();
     }
-}
-
-/// `into += from`, field by field.
-fn add_counts(into: &mut QueueCounts, from: &QueueCounts) {
-    into.rationed += from.rationed;
-    into.overflowed += from.overflowed;
-    into.busy += from.busy;
-    into.stray_forgotten += from.stray_forgotten;
-    into.stray_unpressed += from.stray_unpressed;
-    into.key_releases_unpaired += from.key_releases_unpaired;
-    into.dead_pushes += from.dead_pushes;
-    into.merged += from.merged;
 }
 
 // -- drawing -----------------------------------------------------------------
@@ -720,17 +784,18 @@ fn draw_text(s: &mut Surface, x: i32, y: i32, text: &str, color: u32, weight: Fo
 
 /// The close box's cross: a 16x16 coverage mask, two diagonals two pixels
 /// wide, 4 in from each edge.
-fn cross() -> [u8; 256] {
+const CROSS: [u8; 256] = {
     let mut m = [0u8; 256];
-    for i in 4..12 {
-        for (x, y) in [(i, i), (i + 1, i), (15 - i, i), (14 - i, i)] {
-            if x < 16 {
-                m[y * 16 + x] = 255;
-            }
-        }
+    let mut i = 4;
+    while i < 12 {
+        m[i * 16 + i] = 255;
+        m[i * 16 + i + 1] = 255;
+        m[i * 16 + 15 - i] = 255;
+        m[i * 16 + 14 - i] = 255;
+        i += 1;
     }
     m
-}
+};
 
 /// One window in a snapshot of the stacking order.
 struct Snap {
@@ -747,35 +812,28 @@ struct Snap {
 fn compose(target: &mut Surface, r: Rect, scene: &[Snap]) {
     let Some(r) = r.clip(target.width(), target.height()) else { return };
     target.fill_rect(r, THEME.desktop);
-    let cross = cross();
     for snap in scene {
-        if snap.frame.intersect(&r).is_none() {
-            continue;
-        }
-        paint_frame(target, snap, r, &cross);
+        let Some(f) = snap.frame.intersect(&r) else { continue };
+        paint_frame(target, snap, f);
         let client = METRICS.client(&snap.frame);
         let Some(c) = client.intersect(&r) else { continue };
-        let mut y = c.y();
-        while y < c.bottom() {
-            let rows = BAND.min((c.bottom() - y) as u32);
-            let src = Rect::new(c.x() - client.x(), y - client.y(), c.w(), rows);
-            target.blit(&snap.win.inner.lock().committed, src, c.x(), y);
-            y += rows as i32;
+        for band in bands(c) {
+            let src = band.translate(-client.x(), -client.y());
+            target.blit(&snap.win.inner.lock().committed, src, band.x(), band.y());
         }
     }
 }
 
-/// A window's frame, the part of it inside `clip`: the border, the title
-/// bar with its title, the close box with its cross.
-fn paint_frame(target: &mut Surface, snap: &Snap, clip: Rect, cross: &[u8; 256]) {
+/// The part `clip` (inside the frame) of a window's frame: the border, the
+/// title bar with its title, the close box with its cross.
+fn paint_frame(target: &mut Surface, snap: &Snap, clip: Rect) {
     let (border, title_bg, title_fg) = if snap.focused {
         (THEME.border_focused, THEME.title_focused, THEME.title_focused_text)
     } else {
         (THEME.border, THEME.title, THEME.title_text)
     };
     let frame = snap.frame;
-    let Some(f) = frame.intersect(&clip) else { return };
-    target.fill_rect(f, border);
+    target.fill_rect(clip, border);
     let bar = METRICS.title_bar(&frame);
     if let Some(b) = bar.intersect(&clip) {
         target.fill_rect(b, title_bg);
@@ -783,7 +841,7 @@ fn paint_frame(target: &mut Surface, snap: &Snap, clip: Rect, cross: &[u8; 256])
     let close = METRICS.close_box(&frame);
     if let Some(c) = close.intersect(&clip) {
         target.fill_rect(c, THEME.close);
-        if let Some(mask) = Mask::new(16, 16, cross) {
+        if let Some(mask) = Mask::new(16, 16, &CROSS) {
             target.blend_mask_in(&mask, close.x(), close.y(), THEME.close_glyph, c);
         }
     }
@@ -791,7 +849,7 @@ fn paint_frame(target: &mut Surface, snap: &Snap, clip: Rect, cross: &[u8; 256])
     let text_right = close.x().saturating_sub(4).max(bar.x());
     let area = Rect::new(bar.x(), bar.y(), (text_right - bar.x()).max(0) as u32, bar.h());
     if let Some(a) = area.intersect(&clip) {
-        let y = bar.y() + (METRICS.title_h as i32 - 16) / 2;
+        let y = bar.y() + (METRICS.title_h as i32 - FONT_PX) / 2;
         draw_text(target, bar.x() + 8, y, &snap.win.title, title_fg, FontWeight::Bold, a);
     }
 }
@@ -802,7 +860,7 @@ type PointerRing = LockedRing<PointerEvent, POINTER_EVENTS>;
 type KeyRing = LockedRing<KeyEvent, KEY_EVENTS>;
 
 /// The compositor thread's own state: touched by it alone, so no lock.
-pub struct Compositor {
+struct Compositor {
     back: Surface,
     screen: Option<ScreenCanvas>,
     pointers: Reader<PointerRing>,
@@ -816,6 +874,19 @@ pub struct Compositor {
     /// The newest pointer position read, and where the arrow is drawn.
     pointer: Option<(i32, i32)>,
     drawn: Option<(i32, i32)>,
+    /// For the scenarios: a wait between reading the rings and reading the
+    /// cut (`lumen.desktop_cut_delay_ms=`), widening the window a pause
+    /// can be written in.
+    cut_delay_ns: u64,
+}
+
+/// What a presenting pass did, for `desktop status`.
+struct Presented {
+    rects: u64,
+    pixels: u64,
+    ns: u64,
+    /// Whether anything reached the screen (a rectangle or the pointer).
+    frame: bool,
 }
 
 /// Whether `e` is an Alt+F`n` press: the cut's barrier in the key ring.
@@ -836,6 +907,10 @@ fn position(e: &PointerEvent) -> (i32, i32) {
 
 impl Compositor {
     fn new(back: Surface) -> Compositor {
+        let delay_ms = crate::cmdline::value("lumen.desktop_cut_delay_ms").and_then(|v| v.parse::<u64>().ok());
+        if let Some(ms) = delay_ms.filter(|&ms| ms > 0) {
+            log::info!(target: "desktop", "waiting {ms} ms between reading input and the cut (lumen.desktop_cut_delay_ms)");
+        }
         Compositor {
             back,
             screen: None,
@@ -847,6 +922,7 @@ impl Compositor {
             shown: false,
             pointer: None,
             drawn: None,
+            cut_delay_ns: delay_ms.unwrap_or(0).saturating_mul(1_000_000),
         }
     }
 
@@ -864,8 +940,8 @@ impl Compositor {
         }
     }
 
-    /// One pass (see the module doc).
-    fn pass(&mut self) {
+    /// Both rings' new events into the queues.
+    fn drain(&mut self) {
         while let Some(r) = self.pointers.read() {
             self.pointer = Some(position(&r.event));
             self.pointer_queue.push_back(r);
@@ -873,9 +949,19 @@ impl Compositor {
         while let Some(r) = self.keys.read() {
             self.key_queue.push_back(r);
         }
+    }
+
+    /// One pass (see the module doc).
+    fn pass(&mut self) {
+        self.drain();
+        if self.cut_delay_ns > 0 {
+            let _ = crate::sched::sleep(self.cut_delay_ns);
+        }
         // After reading the rings: a pause written after this read has
-        // marks past every event read, so those were the desktop's.
-        let cut = *vt::CUT.lock();
+        // marks past every event read, so those were the desktop's. (One
+        // written between the read and here is handled by reading again in
+        // the pause: `input`.)
+        let cut = vt::cut();
         let mut after = After::default();
         let (damage, scene) = {
             let mut g = COMPOSITOR.lock();
@@ -885,8 +971,10 @@ impl Compositor {
             s.shown = self.shown;
             s.held_back = !self.key_queue.is_empty() || !self.pointer_queue.is_empty();
             if !self.shown {
-                // Paused: the damage gathers until the resume, which
-                // presents everything.
+                // Paused: nothing is presented, and the damage gathers
+                // until the resume, which presents everything. A request
+                // waiting can't be answered from the screen.
+                s.slot.answer_paused();
                 drop(g);
                 after.finish();
                 self.publish(None);
@@ -915,24 +1003,28 @@ impl Compositor {
                 .map(|r| r.area())
                 .sum();
         }
-        let present_ns = crate::time::now_ns().saturating_sub(start);
+        let ns = crate::time::now_ns().saturating_sub(start);
         let pointer_moved = self.place_pointer(damage.rects());
-        let presented = !damage.is_empty() || pointer_moved;
-        self.publish(Some((damage.rects().len() as u64, pixels, present_ns, presented)));
-        self.run_job();
+        let frame = !damage.is_empty() || pointer_moved;
+        self.publish(Some(Presented { rects: damage.rects().len() as u64, pixels, ns, frame }));
+        self.run_queued_job();
     }
 
     /// Act on the input read and the cut (under [`COMPOSITOR`]): whether the
     /// whole screen must be presented (a resume).
     fn input(&mut self, s: &mut State, cut: &vt::Cut, after: &mut After) -> bool {
         let mut full = false;
-        while self.generation < cut.generation {
+        while self.generation < cut.generation() {
             if self.shown {
                 // A pause: the events up to it were the desktop's (keys
-                // before the Alt+F`n` press), the rest the terminal's.
-                let marks = cut.pause;
-                self.feed_pointer(s, after, |seq| seq <= marks.pointer);
-                self.feed_keys(s, after, |seq| seq < marks.keys);
+                // before the Alt+F`n` press), the rest the terminal's. Read
+                // the rings again first: a screen shell's decoding pass may
+                // have pushed events and written the pause after `pass`
+                // read them, and every event up to the marks is in the
+                // rings now.
+                self.drain();
+                self.feed_pointer(s, after, |seq| cut.pause_owns_pointer(seq));
+                self.feed_keys(s, after, |seq| cut.pause_owns_key(seq));
                 let out = s.wm.interrupt(Interruption::Pause);
                 s.apply(out, after);
                 self.pointer_queue.clear();
@@ -945,12 +1037,15 @@ impl Compositor {
                 // A resume (or the start): its screen comes from `desktop`
                 // after the cut; until then, wait.
                 let Some(screen) = s.screen.take() else { return full };
-                let marks = cut.resume;
+                // (`skip_to` is redundant with the `retain`s here and the
+                // queues cleared while paused; it keeps the reader's place
+                // where the cut is, not wherever the last read left it.)
+                let marks = cut.resume();
                 self.pointers.skip_to(marks.pointer);
                 self.keys.skip_to(marks.keys);
-                self.pointer_queue.retain(|r| r.seq > marks.pointer);
-                self.key_queue.retain(|r| r.seq > marks.keys);
-                let out = s.wm.resume(cut.baseline.into());
+                self.pointer_queue.retain(|r| cut.after_resume_pointer(r.seq));
+                self.key_queue.retain(|r| cut.after_resume_key(r.seq));
+                let out = s.wm.resume(cut.baseline().into());
                 s.apply(out, after);
                 self.screen = Some(screen);
                 self.shown = true;
@@ -971,7 +1066,7 @@ impl Compositor {
     }
 
     /// Pointer frames numbered `upto` into the window manager.
-    fn feed_pointer(&mut self, s: &mut State, after: &mut After, upto: impl Fn(lumen_input::Seq) -> bool) {
+    fn feed_pointer(&mut self, s: &mut State, after: &mut After, upto: impl Fn(Seq) -> bool) {
         while let Some(r) = self.pointer_queue.front() {
             if !upto(r.seq) {
                 break;
@@ -984,9 +1079,10 @@ impl Compositor {
     }
 
     /// Key events numbered `upto` to the focused window, stopping at an
-    /// Alt+F`n` press (the pause's own: the cut that names it comes in the
-    /// same pass of the router, read next time).
-    fn feed_keys(&mut self, s: &mut State, after: &mut After, upto: impl Fn(lumen_input::Seq) -> bool) {
+    /// Alt+F`n` press: the router writes the cut naming it in the same pass
+    /// that pushed it, so a later pass reads that cut and acts on the
+    /// pause.
+    fn feed_keys(&mut self, s: &mut State, after: &mut After, upto: impl Fn(Seq) -> bool) {
         while let Some(r) = self.key_queue.front() {
             if !upto(r.seq) || is_switch(&r.event) {
                 break;
@@ -1029,20 +1125,20 @@ impl Compositor {
         if let Some(d) = self.drawn.take() {
             self.back.copy_to(arrow_box(d), screen, d.0, d.1);
         }
-        if let Some((x, y)) = want
+        // A tip on the screen (the arrow drawn from it, clipped at the
+        // right and bottom edges).
+        if let Some((x, y)) = want.filter(|&(x, y)| self.back.bounds().contains(x, y))
             && let Some(b) = arrow_box((x, y)).clip(self.back.width(), self.back.height())
-            && b.x() == x
-            && b.y() == y
         {
             let (w, h) = (b.w() as usize, b.h() as usize);
             let mut px = [0u32; SPRITE_W * SPRITE_H];
             for row in 0..h {
-                let src = &self.back.row(b.y() as u32 + row as u32)[b.x() as usize..b.x() as usize + w];
+                let src = &self.back.row(y as u32 + row as u32)[x as usize..x as usize + w];
                 px[row * SPRITE_W..row * SPRITE_W + w].copy_from_slice(src);
             }
             draw_arrow(&mut px, SPRITE_W, (w, h), (0, 0), THEME.pointer_outline, THEME.pointer_fill);
             for row in 0..h {
-                screen.write_span(b.x() as u32, b.y() as u32 + row as u32, &px[row * SPRITE_W..row * SPRITE_W + w]);
+                screen.write_span(x as u32, y as u32 + row as u32, &px[row * SPRITE_W..row * SPRITE_W + w]);
             }
             self.drawn = Some((x, y));
         }
@@ -1050,85 +1146,87 @@ impl Compositor {
     }
 
     /// The pass is over: its statistics and the readers' places.
-    fn publish(&self, presented: Option<(u64, u64, u64, bool)>) {
+    fn publish(&self, presented: Option<Presented>) {
         let mut g = COMPOSITOR.lock();
         let Some(s) = g.as_mut() else { return };
         s.passing = false;
         s.pointer_read = self.pointers.after();
         s.keys_read = self.keys.after();
         s.lost = self.pointers.lost() + self.keys.lost();
-        if let Some((rects, pixels, ns, frame)) = presented {
-            s.stats.rects += rects;
-            s.stats.pixels += pixels;
-            s.stats.present_ns += ns;
-            s.stats.frames += u64::from(frame);
+        if let Some(p) = presented {
+            s.stats.rects += p.rects;
+            s.stats.pixels += p.pixels;
+            s.stats.present_ns += p.ns;
+            s.stats.frames += u64::from(p.frame);
         }
     }
 
-    /// A job asked for meanwhile (`desktop check`, `screenshot`), run right
-    /// after the pass.
-    fn run_job(&mut self) {
-        let (job, scene, committed) = {
+    /// A request accepted meanwhile (`desktop check`, `screenshot`), run
+    /// right after a presenting pass.
+    fn run_queued_job(&mut self) {
+        let (job, ticket, scene, committed) = {
             let mut g = COMPOSITOR.lock();
             let Some(s) = g.as_mut() else { return };
-            let Some(job) = s.slot.start() else { return };
-            // A check compares with a full repaint of the scene as it is:
-            // damage or a commit since the pass makes that a moving target.
-            // (A capture copies the back buffer as the pass left it.)
-            if matches!(job, Job::Check(_)) && (!s.damage.is_empty() || s.commits > 0) {
-                s.slot.finish(Answer::Busy);
-                drop(g);
-                ANSWERED.store(true, Ordering::Release);
-                return;
-            }
-            (job, snapshot(s), s.committed)
+            let Some((job, ticket)) = s.slot.start() else { return };
+            (job, ticket, snapshot(s), s.committed)
         };
         let answer = match job {
-            Job::Check(mut scratch) => {
-                let all = scratch.bounds();
-                compose(&mut scratch, all, &scene);
-                let repaint = (0..self.back.height())
-                    .map(|y| {
-                        self.back
-                            .row(y)
-                            .iter()
-                            .zip(scratch.row(y))
-                            .filter(|(a, b)| (**a ^ **b) & 0xff_ffff != 0)
-                            .count() as u64
-                    })
-                    .sum();
-                let screen = self.screen_differences();
-                let g = COMPOSITOR.lock();
-                let busy = g.as_ref().is_none_or(|s| !s.damage.is_empty() || s.commits > 0 || s.committed != committed);
-                if busy { Answer::Busy } else { Answer::Check { repaint, screen } }
-            }
-            Job::Capture(mut rows) => {
-                let start = crate::time::now_ns();
-                for y in 0..rows.height().min(self.back.height()) {
-                    let src = self.back.row(y);
-                    for (out, &p) in rows.row_mut(y).iter_mut().zip(src) {
-                        *out = [(p >> 16) as u8, (p >> 8) as u8, p as u8];
-                    }
-                }
-                Answer::Capture { rows, ns: crate::time::now_ns().saturating_sub(start) }
-            }
+            Job::Check(scratch) => self.check(scratch, &scene, committed),
+            Job::Capture(rows) => self.capture(rows),
         };
         if let Some(s) = COMPOSITOR.lock().as_mut() {
-            s.slot.finish(answer);
+            s.slot.finish(ticket, answer);
         }
-        ANSWERED.store(true, Ordering::Release);
+    }
+
+    /// `desktop check`: the scene recomposed whole into `scratch` against
+    /// the back buffer, and the screen read back against it. Damage or a
+    /// commit since the pass (`committed` its count then) makes that a
+    /// moving target: `Busy`.
+    fn check(&self, mut scratch: Box<Surface>, scene: &[Snap], committed: u64) -> Answer {
+        let moving = |s: &State| !s.damage.is_empty() || s.commits > 0 || s.committed != committed;
+        if COMPOSITOR.lock().as_ref().is_none_or(moving) {
+            return Answer::Busy;
+        }
+        let all = scratch.bounds();
+        compose(&mut scratch, all, scene);
+        let repaint = (0..self.back.height())
+            .map(|y| {
+                let differ = self.back.row(y).iter().zip(scratch.row(y)).filter(|(a, b)| (**a ^ **b) & 0xff_ffff != 0);
+                differ.count() as u64
+            })
+            .sum();
+        let Some(screen) = self.screen_differences() else { return Answer::ScreenTaken };
+        if COMPOSITOR.lock().as_ref().is_none_or(moving) {
+            return Answer::Busy;
+        }
+        Answer::Check { repaint, screen }
+    }
+
+    /// `screenshot`: the back buffer, as the pass left it, into `rows`.
+    fn capture(&self, mut rows: Box<Rows>) -> Answer {
+        if (rows.width(), rows.height()) != (self.back.width(), self.back.height()) {
+            return Answer::WrongSize;
+        }
+        let start = crate::time::now_ns();
+        for y in 0..rows.height() {
+            for (out, &p) in rows.row_mut(y).iter_mut().zip(self.back.row(y)) {
+                *out = [(p >> 16) as u8, (p >> 8) as u8, p as u8];
+            }
+        }
+        Answer::Capture { rows, ns: crate::time::now_ns().saturating_sub(start) }
     }
 
     /// Pixels on the screen that differ from the back buffer, outside the
-    /// pointer's box.
-    fn screen_differences(&self) -> u64 {
-        let Some(screen) = self.screen.as_ref() else { return u64::MAX };
+    /// pointer's box; `None` if the screen was taken back meanwhile.
+    fn screen_differences(&self) -> Option<u64> {
+        let screen = self.screen.as_ref()?;
         let arrow = self.drawn.map(arrow_box);
         let mut row = alloc::vec![0u32; self.back.width() as usize];
         let mut differ = 0;
         for y in 0..self.back.height() {
             if !screen.read_span(0, y as usize, &mut row) {
-                return u64::MAX;
+                return None;
             }
             for (x, (a, b)) in self.back.row(y).iter().zip(&row).enumerate() {
                 if (a ^ b) & 0xff_ffff != 0 && !arrow.is_some_and(|r| r.contains(x as i32, y as i32)) {
@@ -1136,7 +1234,7 @@ impl Compositor {
                 }
             }
         }
-        differ
+        Some(differ)
     }
 }
 
@@ -1152,7 +1250,7 @@ fn snapshot(s: &State) -> Vec<Snap> {
         .collect()
 }
 
-// -- starting, resuming, the commands --------------------------------------------
+// -- starting, resuming, the requests --------------------------------------------
 
 /// Why the desktop didn't start or resume.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1167,6 +1265,8 @@ pub enum StartError {
     Screen(CanvasError),
     /// The compositor hasn't caught up with the last pause.
     Behind,
+    /// Another `desktop` is starting or resuming it.
+    Busy,
 }
 
 impl fmt::Display for StartError {
@@ -1177,6 +1277,25 @@ impl fmt::Display for StartError {
             StartError::NoThread(e) => write!(f, "no thread for the compositor: {e}"),
             StartError::Screen(e) => write!(f, "{e}"),
             StartError::Behind => f.write_str("the compositor hasn't caught up with the last pause"),
+            StartError::Busy => f.write_str("another `desktop` is starting or resuming it: try again"),
+        }
+    }
+}
+
+/// A start or resume refused: why, and which it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Refused {
+    /// The desktop had started (this was a resume).
+    pub resuming: bool,
+    pub why: StartError,
+}
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.resuming {
+            write!(f, "not resumed: {} (try again)", self.why)
+        } else {
+            write!(f, "not started: {}", self.why)
         }
     }
 }
@@ -1195,21 +1314,14 @@ pub enum Shown {
 static START_BUSY: AtomicBool = AtomicBool::new(false);
 
 /// Start the desktop, or resume it (see the module doc).
-pub fn start() -> Result<Shown, StartError> {
+pub fn start() -> Result<Shown, Refused> {
+    let started = COMPOSITOR.lock().as_ref().is_some_and(|s| s.started);
     if START_BUSY.swap(true, Ordering::AcqRel) {
-        return Err(StartError::Screen(CanvasError::InUse));
+        return Err(Refused { resuming: started, why: StartError::Busy });
     }
-    let result = start_or_resume();
+    let result = if started { resume() } else { first_start() };
     START_BUSY.store(false, Ordering::Release);
-    result
-}
-
-fn start_or_resume() -> Result<Shown, StartError> {
-    let state = COMPOSITOR.lock().as_ref().map(|s| s.owner);
-    match state {
-        Some(owner) => resume(owner),
-        None => first_start(),
-    }
+    result.map_err(|why| Refused { resuming: started, why })
 }
 
 /// The first `desktop`.
@@ -1218,12 +1330,17 @@ fn first_start() -> Result<Shown, StartError> {
     let (w, h) = (w as u32, h as u32);
     let back = Surface::with_stride(w, h, w as usize).ok_or(StartError::NoMemory)?;
     let owner = Owner::new();
-    *COMPOSITOR.lock() = Some(State::new(w, h, owner));
+    *COMPOSITOR.lock() = Some(State::new(w, h, NEXT_WINDOW_ID.load(Ordering::Relaxed)));
+    let undo = || {
+        if let Some(s) = COMPOSITOR.lock().take() {
+            NEXT_WINDOW_ID.store(s.wm.next_id(), Ordering::Relaxed);
+        }
+    };
     let compositor = Compositor::new(back);
     let thread = match crate::sched::spawn("compositor", move || compositor.run()) {
         Ok(t) => t,
         Err(e) => {
-            *COMPOSITOR.lock() = None;
+            undo();
             return Err(StartError::NoThread(e));
         }
     };
@@ -1232,6 +1349,7 @@ fn first_start() -> Result<Shown, StartError> {
         Ok(screen) => {
             if let Some(s) = COMPOSITOR.lock().as_mut() {
                 s.screen = Some(screen);
+                s.started = true;
             }
             drop(thread);
             wake();
@@ -1247,28 +1365,30 @@ fn first_start() -> Result<Shown, StartError> {
             WAKE.wake_all();
             thread.join();
             RUNNING.store(false, Ordering::Release);
-            *COMPOSITOR.lock() = None;
+            undo();
             Err(StartError::Screen(e))
         }
     }
 }
 
 /// `desktop` while started: resume it if paused.
-fn resume(owner: Owner) -> Result<Shown, StartError> {
-    if vt::DESKTOP.load(Ordering::Acquire) {
+fn resume() -> Result<Shown, StartError> {
+    if vt::desktop_shown() {
         return Ok(Shown::Already);
     }
     // The compositor acts on the pause before this resume writes the next
     // cut, so the cut never needs more than its latest marks.
     let deadline = crate::time::now_ns().saturating_add(5_000_000_000);
     let caught_up = || {
-        let generation = vt::CUT.lock().generation;
+        let generation = vt::cut().generation();
         COMPOSITOR.lock().as_ref().is_some_and(|s| s.seen_generation == generation)
     };
     wake();
     if !DONE.wait_until_or_deadline(deadline, caught_up) && !caught_up() {
+        log::warn!(target: "desktop", "the compositor hasn't acted on the last pause in 5 s: is it stuck?");
         return Err(StartError::Behind);
     }
+    let owner = vt::cut().owner().ok_or(StartError::NoScreen)?;
     let screen = vt::enter_desktop(owner).map_err(StartError::Screen)?;
     if let Some(s) = COMPOSITOR.lock().as_mut() {
         s.screen = Some(screen);
@@ -1284,56 +1404,76 @@ pub fn start_at_boot() {
         return;
     }
     if let Err(e) = start() {
-        log::warn!(target: "desktop", "not started: {e}");
+        log::warn!(target: "desktop", "{e}");
     }
 }
 
 /// Whether the desktop is shown (its screen live).
 pub fn is_shown() -> bool {
-    vt::DESKTOP.load(Ordering::Acquire)
+    vt::desktop_shown()
 }
 
-/// Hand `job` to the compositor and wait (up to 20 s) for its answer:
-/// `Err` with why it wasn't run. One request at a time: the slot stays
-/// reserved until this asker takes its answer or gives up, and another
-/// request meanwhile is refused ([`SLOT_BUSY`]).
-fn run_job(job: Job) -> Result<Answer, &'static str> {
-    {
-        let mut g = COMPOSITOR.lock();
-        let s = g.as_mut().ok_or("no desktop")?;
-        if !is_shown() {
-            return Err("paused (`desktop` resumes it)");
-        }
-        s.slot.accept(job)?;
-        // Only the slot's holder waits on it, so the flag is this one's.
-        ANSWERED.store(false, Ordering::Release);
+/// Accept `job` on `home`'s desktop: refused without one, while the live
+/// one is paused, or while another request holds the slot.
+fn submit(home: &Home, job: Job) -> Result<(), JobError> {
+    let mut g = home.lock();
+    let s = g.as_mut().ok_or(JobError::NoDesktop)?;
+    if matches!(home, Home::Live) && !is_shown() {
+        return Err(JobError::Paused);
     }
-    wake();
+    s.slot.accept(job)
+}
+
+/// Wait (up to 20 s) for the answer to the request this asker holds the
+/// slot with; giving up frees the slot (a late answer is dropped) and
+/// warns.
+fn await_answer(home: &Home) -> Result<Answer, JobError> {
     let deadline = crate::time::now_ns().saturating_add(20_000_000_000);
-    let _ = DONE.wait_until_or_deadline(deadline, || ANSWERED.load(Ordering::Acquire));
-    let mut g = COMPOSITOR.lock();
-    let s = g.as_mut().ok_or("no desktop")?;
-    match s.slot.take() {
-        Some(answer) => Ok(answer),
-        None => {
+    let answered = || home.lock().as_ref().is_none_or(|s| s.slot.is_answered());
+    let _ = DONE.wait_until_or_deadline(deadline, answered);
+    let taken = {
+        let mut g = home.lock();
+        let s = g.as_mut().ok_or(JobError::NoDesktop)?;
+        let answer = s.slot.take();
+        if answer.is_none() {
             s.slot.abandon();
-            Err("no answer from the compositor in 20 s")
         }
-    }
+        answer
+    };
+    taken.ok_or_else(|| {
+        log::warn!(target: "desktop", "no answer from the compositor in 20 s");
+        JobError::NoAnswer
+    })
 }
 
-/// The back buffer as RGB rows (`screenshot` while the desktop is shown):
-/// `None` if it isn't (then the text screen is the source), with how long
-/// the copy took.
-pub fn capture(rows: Rows) -> Option<Result<(Rows, u64), &'static str>> {
+/// Hand `job` to the live compositor and wait for its answer. One request
+/// at a time: the slot stays reserved until this asker takes its answer or
+/// gives up, and another request meanwhile is refused (`JobError::Busy`).
+fn run_job(job: Job) -> Result<Answer, JobError> {
+    submit(&Home::Live, job)?;
+    wake();
+    await_answer(&Home::Live)
+}
+
+/// The back buffer as RGB rows (`screenshot` while the desktop is shown),
+/// with how long the copy took: `None` if it isn't shown (or was paused
+/// before the copy), so the text screen is the source.
+pub fn capture(rows: Rows) -> Option<Result<(Rows, u64), String>> {
     if !is_shown() {
         return None;
     }
-    Some(match run_job(Job::Capture(Box::new(rows))) {
-        Ok(Answer::Capture { rows, ns }) => Ok((*rows, ns)),
-        Ok(_) => Err("the compositor answered something else"),
-        Err(e) => Err(e),
-    })
+    capture_answer(run_job(Job::Capture(Box::new(rows))))
+}
+
+/// What a capture request's outcome means for `screenshot`.
+fn capture_answer(outcome: Result<Answer, JobError>) -> Option<Result<(Rows, u64), String>> {
+    match outcome {
+        Ok(Answer::Capture { rows, ns }) => Some(Ok((*rows, ns))),
+        Ok(Answer::Paused) | Err(JobError::Paused) | Err(JobError::NoDesktop) => None,
+        Ok(Answer::WrongSize) => Some(Err(String::from("the rows aren't the back buffer's size"))),
+        Ok(_) => Some(Err(String::from("the compositor answered something else"))),
+        Err(e) => Some(Err(alloc::format!("{e}"))),
+    }
 }
 
 // -- the demo windows and `desktop spin` --------------------------------------------
@@ -1360,7 +1500,7 @@ fn open_demo_windows() {
         (Demo::Colours, "Colours", 400, 210, (440, 300), "desktop-colours"),
     ];
     for (demo, title, w, h, at, thread) in demos {
-        let handle = match (Desktop { home: Home::Live }).open(title, w, h, Some(at), false) {
+        let handle = match Desktop::LIVE.open(title, w, h, Some(at), false) {
             Ok(h) => h,
             Err(e) => {
                 log::warn!(target: "desktop", "no {title} window: {e}");
@@ -1445,7 +1585,7 @@ fn spin_owner(mut h: WindowHandle) {
         x = (x + 8) % (bounds.w() as i32 - 40).max(1);
         if !h.held() {
             while let Some(e) = h.next_event() {
-                if e == WindowEvent::Close {
+                if matches!(e, WindowEvent::Close) {
                     return;
                 }
             }
@@ -1456,9 +1596,7 @@ fn spin_owner(mut h: WindowHandle) {
 
 /// `desktop spin`: open its window and start its owner.
 fn spin() -> Result<u32, String> {
-    let h = (Desktop { home: Home::Live })
-        .open("spin", 200, 60, None, true)
-        .map_err(|e| alloc::format!("no window: {e}"))?;
+    let h = Desktop::LIVE.open("spin", 200, 60, None, true).map_err(|e| alloc::format!("no window: {e}"))?;
     let id = h.id();
     let _detached =
         crate::sched::spawn("desktop-spin", move || spin_owner(h)).map_err(|e| alloc::format!("no thread: {e}"))?;
@@ -1571,7 +1709,9 @@ pub fn windows_table() -> Result<pipe::Table, String> {
     Ok(t)
 }
 
-/// `desktop status`: one record.
+/// `desktop status`: one record. The keyboard's count, the rings' newest
+/// and the cut are read just before the desktop's lock, the rest under it:
+/// a snapshot of the desktop, not of all of them at one instant.
 pub fn status_table() -> pipe::Table {
     const COLUMNS: [Column; 24] = [
         Column::new("state", Kind::Text, Align::Left, 5),
@@ -1600,11 +1740,9 @@ pub fn status_table() -> pipe::Table {
         Column::new("settled", Kind::Text, Align::Left, 7),
     ];
     let mut t = pipe::Table::new(&COLUMNS);
-    // Read before the desktop's lock: the keyboard's, the rings' and the
-    // cut's (none of them is taken under it).
     let all_decoded = crate::keyboard::all_decoded();
     let (pointer_newest, keys_newest) = (POINTER.newest(), KEYS.newest());
-    let cut = *vt::CUT.lock();
+    let generation = vt::cut().generation();
     let pending = PENDING.load(Ordering::Acquire);
     let g = COMPOSITOR.lock();
     let Some(s) = g.as_ref() else {
@@ -1618,13 +1756,13 @@ pub fn status_table() -> pipe::Table {
     let mut windows_idle = true;
     for w in &s.windows {
         let inner = w.inner.lock();
-        add_counts(&mut counts, &inner.queue.counts());
+        counts += &inner.queue.counts();
         windows_idle &= inner.queue.is_idle() && w.idle.load(Ordering::Acquire);
     }
-    let shown = vt::DESKTOP.load(Ordering::Acquire);
+    let shown = vt::desktop_shown();
     let settled = shown
         && s.shown
-        && s.seen_generation == cut.generation
+        && s.seen_generation == generation
         && all_decoded
         && s.pointer_read == pointer_newest
         && s.keys_read == keys_newest
@@ -1658,7 +1796,7 @@ pub fn status_table() -> pipe::Table {
         int(counts.rationed),
         int(counts.overflowed),
         int(wm.grab_ends),
-        int(counts.dead_pushes),
+        int(counts.dead_pushes + s.stats.dead_pushes),
         int(0),
         int(0),
         yes(settled),
@@ -1681,31 +1819,32 @@ pub fn windows_records(args: &[String]) -> Option<Result<pipe::Table, String>> {
 
 /// The shell's `desktop`.
 pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
-    let print = |ctx: &mut crate::shell::Ctx<'_>, t: pipe::Table| {
-        let mut out = String::new();
-        t.render(&mut out);
-        let _ = ctx.out.write_str(&out);
-    };
-    match args {
+    use crate::shell::sysinfo::print_table;
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    // `check`, `spin`, `hold` and `release` need the desktop shown.
+    if let [what, ..] = words[..]
+        && matches!(what, "check" | "spin" | "hold" | "release")
+        && let Some(why) = refused_while_paused()
+    {
+        return ctx.fail(why);
+    }
+    match words[..] {
         [] => match start() {
-            Ok(Shown::Already) => print(ctx, status_table()),
+            Ok(Shown::Already) => print_table(ctx, Ok(status_table())),
             Ok(Shown::Now) => {
                 let _ = writeln!(ctx.out, "desktop: started (Alt+F1 shows the terminals)");
             }
             Ok(Shown::Resumed) => {
                 let _ = writeln!(ctx.out, "desktop: resumed");
             }
-            Err(e) => ctx.fail(format_args!("desktop: not started: {e}")),
+            Err(e) => ctx.fail(format_args!("desktop: {e}")),
         },
-        [what] if what == "status" => print(ctx, status_table()),
-        [what] if what == "check" => {
-            if let Some(why) = refused_while_paused() {
-                return ctx.fail(why);
-            }
-            let Some(scratch) = COMPOSITOR.lock().as_ref().map(|s| (s.width, s.height)) else {
+        ["status"] => print_table(ctx, Ok(status_table())),
+        ["check"] => {
+            let Some((w, h)) = COMPOSITOR.lock().as_ref().map(|s| (s.width, s.height)) else {
                 return ctx.fail("desktop: no desktop");
             };
-            let Some(scratch) = Surface::with_stride(scratch.0, scratch.1, scratch.0 as usize) else {
+            let Some(scratch) = Surface::with_stride(w, h, w as usize) else {
                 return ctx.fail("desktop check: no memory for the scratch surface");
             };
             match run_job(Job::Check(Box::new(scratch))) {
@@ -1718,32 +1857,26 @@ pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
                 Ok(Answer::Busy) => {
                     let _ = writeln!(ctx.out, "desktop check: busy");
                 }
-                Ok(Answer::Capture { .. }) => ctx.fail("desktop check: the compositor answered something else"),
+                Ok(Answer::ScreenTaken) => ctx.fail("desktop check: the screen was taken back during the check"),
+                Ok(Answer::Paused) | Err(JobError::Paused) => ctx.fail("desktop check: paused (`desktop` resumes it)"),
+                Ok(Answer::Capture { .. } | Answer::WrongSize) => {
+                    ctx.fail("desktop check: the compositor answered something else")
+                }
                 Err(e) => ctx.fail(format_args!("desktop check: {e}")),
             }
         }
-        [what] if what == "spin" => {
-            if let Some(why) = refused_while_paused() {
-                return ctx.fail(why);
+        ["spin"] => match spin() {
+            Ok(id) => {
+                let _ = writeln!(ctx.out, "desktop spin: window {id}");
             }
-            match spin() {
-                Ok(id) => {
-                    let _ = writeln!(ctx.out, "desktop spin: window {id}");
-                }
-                Err(e) => ctx.fail(format_args!("desktop spin: {e}")),
+            Err(e) => ctx.fail(format_args!("desktop spin: {e}")),
+        },
+        [what @ ("hold" | "release"), id] => match hold(id, what == "hold") {
+            Ok(()) => {
+                let _ = writeln!(ctx.out, "desktop {what}: window {id}");
             }
-        }
-        [what, id] if what == "hold" || what == "release" => {
-            if let Some(why) = refused_while_paused() {
-                return ctx.fail(why);
-            }
-            match hold(id, what == "hold") {
-                Ok(()) => {
-                    let _ = writeln!(ctx.out, "desktop {what}: window {id}");
-                }
-                Err(e) => ctx.fail(format_args!("desktop {what}: {e}")),
-            }
-        }
+            Err(e) => ctx.fail(format_args!("desktop {what}: {e}")),
+        },
         _ => ctx.fail(USAGE),
     }
 }
@@ -1751,7 +1884,7 @@ pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
 /// Why `desktop check`, `spin`, `hold` and `release` refuse now, if they
 /// do.
 fn refused_while_paused() -> Option<&'static str> {
-    let started = COMPOSITOR.lock().is_some();
+    let started = COMPOSITOR.lock().as_ref().is_some_and(|s| s.started);
     if !started {
         Some("desktop: not started (`desktop` starts it)")
     } else if !is_shown() {
@@ -1761,17 +1894,14 @@ fn refused_while_paused() -> Option<&'static str> {
     }
 }
 
-/// The shell's `windows`.
+/// The shell's `windows` (without a desktop, the plain line `windows: no
+/// desktop`, which §11 and the harness match).
 pub fn windows_command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
     if !args.is_empty() {
         return ctx.fail("usage: windows");
     }
     match windows_table() {
-        Ok(t) => {
-            let mut out = String::new();
-            t.render(&mut out);
-            let _ = ctx.out.write_str(&out);
-        }
+        Ok(t) => crate::shell::sysinfo::print_table(ctx, Ok(t)),
         Err(e) => {
             let _ = writeln!(ctx.out, "{e}");
         }
@@ -1806,6 +1936,59 @@ crate::ktest!(
         Ok(())
     }
 );
+
+crate::ktest!(
+    fn a_window_opens_only_once_the_start_completed() {
+        // A desktop whose start hasn't completed (its screen not taken yet)
+        // refuses windows, so none outlives a start that fails; a desktop
+        // made again carries on the window ids.
+        use crate::{kassert, kassert_eq};
+        let home = Home::Own(Arc::new(SpinLock::new(Some(State::new(1280, 800, 7)))));
+        let d = Desktop { home };
+        kassert_eq!(d.open_window("w", 16, 16).err(), Some(OpenError::NoDesktop));
+        if let Some(s) = d.home.lock().as_mut() {
+            s.started = true;
+        }
+        let w = d.open_window("w", 16, 16).map_err(|_| "a window once started")?;
+        kassert_eq!(w.id(), 7);
+        kassert!(d.open_window("w", 16, 16).is_ok_and(|w| w.id() == 8));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_closed_window_s_deliveries_count_as_dead_pushes() {
+        // A delivery for a window no longer on the list (closed) is
+        // counted, not lost silently; the closed window's own queue counts
+        // are kept in the totals.
+        use crate::kassert_eq;
+        let d = Desktop::without_screen();
+        let w = d.open_window("w", 16, 16).map_err(|_| "a window")?;
+        let id = {
+            let g = d.home.lock();
+            g.as_ref().and_then(|s| s.wm.id(w.id())).ok_or("its id")?
+        };
+        drop(w);
+        let mut g = d.home.lock();
+        let s = g.as_mut().ok_or("the state")?;
+        let mut after = After::default();
+        s.push(id, &mut after, |q| Some(q.push(Entry::Key(test_key()))));
+        kassert_eq!(s.stats.dead_pushes, 1);
+        kassert_eq!(after.wake.len(), 0);
+        Ok(())
+    }
+);
+
+/// A key press for the ktests.
+#[cfg(feature = "ktest")]
+fn test_key() -> KeyEvent {
+    KeyEvent {
+        code: lumen_input::KeyCode::A,
+        action: KeyAction::Press { text: Some('a') },
+        mods: lumen_input::Mods::NONE,
+        after_drop: false,
+    }
+}
 
 crate::ktest!(
     fn a_present_stops_at_the_next_row_once_the_canvas_dies() {
@@ -1863,7 +2046,7 @@ crate::ktest!(
         // button pressed meanwhile is counted, not delivered. Once every
         // button is up, a press on the title bar drags as usual.
         use crate::{kassert, kassert_eq};
-        let mut s = State::new(1280, 800, Owner::new());
+        let mut s = State::new(1280, 800, 1);
         let (id, _) = s.wm.open("w", 200, 100, 100, 100);
         let frame = s.wm.window(id).ok_or("no window")?.frame();
         let _ = s.wm.resume(ButtonSet::LEFT);
@@ -1885,37 +2068,87 @@ crate::ktest!(
     }
 );
 
+/// A one-pixel capture job for the ktests.
+#[cfg(feature = "ktest")]
+fn test_job() -> Job {
+    Job::Capture(Box::new(Rows::new(1, 1).expect("one pixel")))
+}
+
 crate::ktest!(
     fn a_request_holds_the_slot_until_its_asker_takes_the_answer() {
-        // The job slot `desktop check` and `screenshot` share: a second
+        // The request slot `desktop check` and `screenshot` share: a second
         // request is refused while the first is queued, while the
         // compositor runs it (taken out of the slot) and while its answer
         // waits, so no asker gets another's answer; taking the answer frees
         // it. An asker that gives up withdraws a queued job, and a running
         // one's late answer is dropped, freeing the slot.
         use crate::{kassert, kassert_eq};
-        let job = || Job::Capture(Box::new(Rows::new(1, 1).expect("one pixel")));
         let mut slot = Slot::Free;
-        kassert!(slot.accept(job()).is_ok());
-        kassert_eq!(slot.accept(job()).err(), Some(SLOT_BUSY));
-        kassert!(slot.start().is_some());
+        kassert!(slot.accept(test_job()).is_ok());
+        kassert_eq!(slot.accept(test_job()).err(), Some(JobError::Busy));
+        let (_, ticket) = slot.start().ok_or("not started")?;
         kassert!(slot.start().is_none());
-        kassert_eq!(slot.accept(job()).err(), Some(SLOT_BUSY));
-        kassert!(slot.take().is_none());
-        slot.finish(Answer::Busy);
-        kassert_eq!(slot.accept(job()).err(), Some(SLOT_BUSY));
+        kassert_eq!(slot.accept(test_job()).err(), Some(JobError::Busy));
+        kassert!(slot.take().is_none() && !slot.is_answered());
+        slot.finish(ticket, Answer::Busy);
+        kassert!(slot.is_answered());
+        kassert_eq!(slot.accept(test_job()).err(), Some(JobError::Busy));
         kassert!(matches!(slot.take(), Some(Answer::Busy)));
         kassert!(matches!(slot, Slot::Free));
         // Given up while queued: withdrawn.
-        kassert!(slot.accept(job()).is_ok());
+        kassert!(slot.accept(test_job()).is_ok());
         slot.abandon();
         kassert!(matches!(slot, Slot::Free) && slot.start().is_none());
         // Given up while running: the late answer is dropped.
-        kassert!(slot.accept(job()).is_ok() && slot.start().is_some());
+        kassert!(slot.accept(test_job()).is_ok());
+        let (_, ticket) = slot.start().ok_or("not started")?;
         slot.abandon();
-        kassert_eq!(slot.accept(job()).err(), Some(SLOT_BUSY));
-        slot.finish(Answer::Busy);
+        kassert_eq!(slot.accept(test_job()).err(), Some(JobError::Busy));
+        slot.finish(ticket, Answer::Busy);
         kassert!(matches!(slot, Slot::Free) && slot.take().is_none());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_second_request_is_refused_while_the_first_waits() {
+        // Through the asker's own path (`submit`, as `run_job` makes it)
+        // on a desktop of its own: the first request is accepted, a second
+        // meanwhile is refused as busy and never queued; once the first's
+        // answer is taken, the next is accepted.
+        use crate::{kassert, kassert_eq};
+        let d = Desktop::without_screen();
+        kassert!(submit(&d.home, test_job()).is_ok());
+        kassert_eq!(submit(&d.home, test_job()).err(), Some(JobError::Busy));
+        {
+            let mut g = d.home.lock();
+            let s = g.as_mut().ok_or("the state")?;
+            let (_, ticket) = s.slot.start().ok_or("the first request")?;
+            s.slot.finish(ticket, Answer::Busy);
+        }
+        kassert!(matches!(await_answer(&d.home), Ok(Answer::Busy)));
+        kassert!(submit(&d.home, test_job()).is_ok());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_request_queued_when_the_desktop_pauses_is_answered_paused() {
+        // A request accepted just before Alt+F`n`: the paused pass answers
+        // it at once (`Slot::answer_paused`), freeing the asker rather
+        // than leaving it 20 s; for `screenshot` that answer, like a
+        // request refused while paused, means "read the text screen".
+        use crate::kassert;
+        let mut slot = Slot::Free;
+        slot.answer_paused();
+        kassert!(matches!(slot, Slot::Free));
+        kassert!(slot.accept(test_job()).is_ok());
+        slot.answer_paused();
+        kassert!(matches!(slot.take(), Some(Answer::Paused)));
+        kassert!(capture_answer(Ok(Answer::Paused)).is_none());
+        kassert!(capture_answer(Err(JobError::Paused)).is_none());
+        kassert!(matches!(capture_answer(Ok(Answer::WrongSize)), Some(Err(_))));
+        kassert!(matches!(capture_answer(Err(JobError::Busy)), Some(Err(_))));
         Ok(())
     }
 );

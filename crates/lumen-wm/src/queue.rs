@@ -176,6 +176,31 @@ impl QueueCounts {
     }
 }
 
+/// Field by field: a closed window's counts added to the totals (`desktop
+/// status`, #153).
+impl core::ops::AddAssign<&QueueCounts> for QueueCounts {
+    fn add_assign(&mut self, other: &QueueCounts) {
+        let QueueCounts {
+            rationed,
+            overflowed,
+            busy,
+            stray_forgotten,
+            stray_unpressed,
+            key_releases_unpaired,
+            dead_pushes,
+            merged,
+        } = *other;
+        self.rationed += rationed;
+        self.overflowed += overflowed;
+        self.busy += busy;
+        self.stray_forgotten += stray_forgotten;
+        self.stray_unpressed += stray_unpressed;
+        self.key_releases_unpaired += key_releases_unpaired;
+        self.dead_pushes += dead_pushes;
+        self.merged += merged;
+    }
+}
+
 /// A window's event queue: see the module's doc.
 #[derive(Clone, Debug)]
 pub struct EventQueue<K: KeyLike, R> {
@@ -734,5 +759,35 @@ mod tests {
         let got: Vec<_> = core::iter::from_fn(|| q.next_event()).collect();
         assert_eq!(got, [Next::Event(Entry::Key(a_down)), Next::Event(Entry::Key(a_up))]);
         assert_eq!(q.counts().key_releases_unpaired, 1);
+    }
+
+    #[test]
+    fn counts_add_field_by_field() {
+        let a = QueueCounts {
+            rationed: 1,
+            overflowed: 2,
+            busy: 3,
+            stray_forgotten: 4,
+            stray_unpressed: 5,
+            key_releases_unpaired: 6,
+            dead_pushes: 7,
+            merged: 8,
+        };
+        let mut sum = a;
+        sum += &a;
+        assert_eq!(
+            sum,
+            QueueCounts {
+                rationed: 2,
+                overflowed: 4,
+                busy: 6,
+                stray_forgotten: 8,
+                stray_unpressed: 10,
+                key_releases_unpaired: 12,
+                dead_pushes: 14,
+                merged: 16,
+            }
+        );
+        assert_eq!(sum.lost(), 6);
     }
 }

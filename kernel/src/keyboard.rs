@@ -130,8 +130,9 @@ static UNDECODED: AtomicU64 = AtomicU64::new(0);
 /// Bytes skipped during init: not the awaited reply, from port 2, or
 /// flushed.
 static SKIPPED: AtomicU64 = AtomicU64::new(0);
-/// Bytes taken off the queue by the decoder (`desktop status`'s `settled`
-/// compares it with [`ARRIVED`]'s bytes queued).
+/// Bytes the decoder finished (each counted after its key event, if any,
+/// was pushed): `desktop status`'s `settled` compares it with
+/// [`ARRIVED`]'s bytes queued.
 static DECODED: AtomicU64 = AtomicU64::new(0);
 
 // Controller commands (port 0x64).
@@ -558,11 +559,7 @@ pub fn read_key() -> Option<Key> {
     let Keyboard { decoder, drops, .. } = keyboard.as_mut()?;
     decode(
         decoder,
-        || {
-            let byte = QUEUE.pop();
-            DECODED.fetch_add(u64::from(byte.is_some()), Ordering::Relaxed);
-            byte
-        },
+        || QUEUE.pop(),
         drops,
         |event| {
             crate::input::KEYS.push(event);
@@ -586,11 +583,12 @@ pub fn bytes_pending() -> bool {
     !QUEUE.is_empty()
 }
 
-/// Whether every byte the keyboard queued has been decoded: the bytes
-/// queued ([`ARRIVED`]'s count, read first under its lock) are no more
-/// than the bytes the decoder took. (`desktop status`'s `settled`; the
-/// ktests' `queue_for_test` bytes are decoded without being counted as
-/// queued, so this compares with `<=`.)
+/// Whether every byte the keyboard queued has been decoded, its key event
+/// pushed: the bytes queued ([`ARRIVED`]'s count, read first under its
+/// lock) are no more than the bytes the decoder finished. (`desktop
+/// status`'s `settled`. The ktests' `queue_for_test` bytes are decoded
+/// without being counted as queued, and other ktests decode bytes of
+/// their own through the same decoder, so this compares with `<=`.)
 pub fn all_decoded() -> bool {
     let queued = ARRIVED.lock().bytes;
     queued <= DECODED.load(Ordering::Relaxed)
@@ -634,7 +632,11 @@ fn decode(
             event.after_drop = drops.mark();
             push(event);
         };
-        match decoder.add_byte(byte, marked) {
+        let decoded = decoder.add_byte(byte, marked);
+        // Counted once the byte's key event is in the ring (`all_decoded`:
+        // nothing is mid-decode then).
+        DECODED.fetch_add(1, Ordering::Relaxed);
+        match decoded {
             Ok(Some(DecodedKey::Unicode(c))) => return Some(Key::Char(c)),
             Ok(Some(DecodedKey::RawKey(code))) => {
                 return Some(Key::Raw { code, mods: Mods::from(decoder.modifiers()) });

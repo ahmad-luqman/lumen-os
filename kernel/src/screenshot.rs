@@ -45,7 +45,7 @@ pub enum Error {
     /// No thread to encode on.
     NoThread(crate::sched::SpawnError),
     /// The desktop's compositor didn't copy its back buffer (why).
-    Desktop(&'static str),
+    Desktop(String),
 }
 
 impl fmt::Display for Error {
@@ -82,7 +82,8 @@ pub fn capture() -> Result<Capture, Error> {
     match crate::desktop::capture(rows) {
         Some(Ok((rows, read_ns))) => Ok(Capture { rows, canvas_held: false, read_ns }),
         Some(Err(why)) => Err(Error::Desktop(why)),
-        // Left meanwhile: the text screen it is.
+        // Paused meanwhile (before the copy, or answered `Paused` by the
+        // paused pass): the text screen is what is shown.
         None => capture_framebuffer(),
     }
 }
