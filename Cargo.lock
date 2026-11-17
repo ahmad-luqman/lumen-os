@@ -358,6 +358,14 @@ name = "lumen-uart"
 version = "0.0.1"
 
 [[package]]
+name = "lumen-wm"
+version = "0.0.1"
+dependencies = [
+ "lumen-gfx",
+ "lumen-input",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
