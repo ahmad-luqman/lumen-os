@@ -2700,9 +2700,9 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   `mouse events [n]` and `kbd events [n]` print the ring's newest `n`
   events (default 16) as records (`seq`, then `x`, `y`, `buttons`,
   `after_overrun`; or `code`, `action`, `text`, `mods`). (#149's confirming
-  steps don't need the rings: they count `mouse`'s frames and `kbd`'s
-  `presses` (added by #149), which the keyboard's interrupt counts from
-  the scancodes, `lumen_input::Presses`.)
+  steps, `lumen_harness.gui`, don't need the rings: a pointer step waits
+  for exactly its frame in `mouse`'s count, a key for exactly its
+  `presses` and `bytes` in `kbd`, as the keyboard's section above says.)
 - **Text mode is unchanged:** the cursor follows the newest state
   (`term::move_pointer`), keys reach the shown terminal's shell through
   `crate::vt`; the rings fill and wrap with no reader.
