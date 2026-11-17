@@ -121,13 +121,23 @@ history, tab completion, pipes, live system views and a scripting language.
 
 ## M4: Desktop
 
+Opt-in: the text console stays the default boot; `desktop` (or the
+`lumen.desktop` boot flag, `make run DESKTOP=1`) starts the desktop, and
+Alt+F1 to F4 leave it. The design is ARCHITECTURE section 11 (and section
+7's `InputDevice`); test names below follow issues #147 to #157 and may
+still change in the PR that adds each test.
+
 | Feature | Exit criteria (tests) |
 |---|---|
-| Compositor: double-buffered framebuffer, windows, stacking, focus, drag with the mouse | `scenario:test_gui::test_two_windows_golden`, `scenario:test_gui::test_drag_moves_window` |
-| Fonts and images: TrueType text with anti-aliasing (`fontdue`, glyph cache), PNG (`zune-png`), wallpaper, light and dark themes | `scenario:test_gui::test_text_rendering_golden`, `scenario:test_gui::test_png_wallpaper_golden`, `scenario:test_gui::test_dark_theme_golden` |
-| Toolkit (`lumen-ui`) **with the automation tree** (ARCHITECTURE section 11) | `cargo:lumen-ui` (layout, tree), `scenario:test_gui::test_automation_tree_lists_buttons`, `scenario:test_gui::test_invoke_press_changes_state` |
-| Terminal windows: the M2 terminal runs in a window, several at once | `scenario:test_gui::test_terminal_window_runs_shell` |
-| `screenshot` (the screen as PNG: to disk after M6, out over serial now) | `scenario:test_gui::test_screenshot_matches_screendump` |
+| Harness: pointer and key steps that confirm each effect (`drag`, `pointer_down`/`pointer_up`, keys confirmed through a kernel counter) | `tests/harness` (the steps' commands and their failure messages), `scenario:test_input::test_drag_steps_are_confirmed` |
+| Input events for the desktop: `InputDevice` rings, every pointer frame with its position (no lost click), key events with releases and modifiers | `cargo:lumen-input` (the ring: order, loss counting, a reader that falls behind; press and release inside one batch), `scenario:test_input::test_click_position_is_kept`, `scenario:test_input::test_key_events_have_releases_and_modifiers` |
+| Compositor: double-buffered framebuffer, windows, stacking, focus, drag with the mouse; opt-in desktop mode, left with Alt+F1 to F4 and resumed with `desktop` | `cargo:lumen-gfx` (rectangles, damage that never loses coverage, clipped blits, blend rounding), `cargo:lumen-wm` (hit testing, focus, the drag state machine, damage against a full repaint), `scenario:test_gui::test_two_windows_golden`, `scenario:test_gui::test_drag_moves_window`, `scenario:test_gui::test_click_focuses_and_raises`, `scenario:test_gui::test_leaving_and_resuming_the_desktop`, a ktest that the screen equals the back buffer over every presented rectangle |
+| The crash screen over the desktop: a crash while the desktop runs still shows the whole report | `scenario:test_gui::test_crash_report_over_desktop` (exit code 37, symbolized report, crash banner on screen) |
+| Fonts and images: TrueType text with anti-aliasing (`fontdue`, glyph cache), PNG (`zune-png`), wallpaper, light and dark themes | `cargo:lumen-font` (metrics, cache hits and byte bound, `measure`, a golden coverage mask), `ktest:lumen_kernel::font::renders_and_caches`, `audit:flags` with `fontdue` and `zune-png` linked, `scenario:test_gui::test_text_rendering_golden`, `scenario:test_gui::test_png_wallpaper_golden`, `scenario:test_gui::test_dark_theme_golden` |
+| Toolkit (`lumen-ui`) **with the automation tree** (ARCHITECTURE section 11): `windows`, `ui tree`, `ui invoke` | `cargo:lumen-ui` (layout, hit testing, dispatch, tree, stable ids, invoke errors, invoke and click giving the same state), `scenario:test_gui::test_automation_tree_lists_buttons`, `scenario:test_gui::test_invoke_press_changes_state` |
+| Terminal windows: the M2 terminal runs in a window, several at once | `scenario:test_gui::test_terminal_window_runs_shell`, `scenario:test_gui::test_closing_a_terminal_window_frees_it`; the `test_term` goldens unchanged |
+| `screenshot` (the screen as PNG: to disk after M6, out over serial now) | `cargo:` the PNG writer and its framing, `audit:flags` with `miniz_oxide` linked, `scenario:test_gui::test_screenshot_matches_screendump` |
+| Desktop shell: taskbar with a clock, launcher, minimize, the demos (Mandelbrot, Life) in windows | `scenario:test_gui::test_launcher_opens_terminal`, `scenario:test_gui::test_taskbar_focuses_window`, `scenario:test_gui::test_minimize_and_restore`, `scenario:test_gui::test_mandelbrot_window_golden`, `scenario:test_gui::test_taskbar_clock_matches_rtc` |
 
 ## M5: Apps
 
