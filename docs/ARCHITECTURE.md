@@ -805,9 +805,12 @@ allocates.
   unsteady, and the timer's, 20 ms apart, failed 18 of 20). A read slow to
   come back slows every poll, a burst of stalls one read: each end's gap
   counts for at most two mean poll intervals, and the gaps are a share of
-  the TSC ticks the reference counted over (with the start gap, so a stall
-  at the start doesn't inflate them), so one burst at either end barely
-  stretches a window. The PIT can't stretch
+  the TSC ticks the reference counted over (with the start gap, which the
+  reference counts), so one burst or stall at either end counts no more
+  than two slow reads. Where reads are slow that can still stretch a window
+  a little (KVM gives about 850 per 10 ms window, fewer under load: up to
+  3x seen with a stall), and more if the window also lost its CPU mid-way
+  (fewer polls, so a longer mean interval). The PIT can't stretch
   past 13,107 ticks, about 11 ms, the most its 16-bit counter can be shown
   not to have wrapped. If attempts run
   out, the unsteady windows with the smallest bounds fill in. A PIT read-back that can't fit how it was
