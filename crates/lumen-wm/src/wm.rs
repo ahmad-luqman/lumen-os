@@ -36,6 +36,32 @@ impl WindowId {
     pub const fn get(self) -> u32 {
         self.0.get()
     }
+
+    /// The first id a [`Wm`] gives, for tests that need one.
+    #[cfg(test)]
+    pub(crate) const fn first() -> WindowId {
+        WindowId(NonZeroU32::MIN)
+    }
+}
+
+/// One pointer button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Button {
+    Left,
+    Right,
+    Middle,
+    Side,
+    Extra,
+}
+
+impl Button {
+    pub const ALL: [Button; 5] = [Button::Left, Button::Right, Button::Middle, Button::Side, Button::Extra];
+}
+
+impl From<Button> for ButtonSet {
+    fn from(b: Button) -> ButtonSet {
+        ButtonSet(1 << b as u8)
+    }
 }
 
 /// The pointer buttons held, one bit each as [`lumen_input::Buttons`]
@@ -50,7 +76,6 @@ impl ButtonSet {
     pub const MIDDLE: ButtonSet = ButtonSet(1 << 2);
     pub const SIDE: ButtonSet = ButtonSet(1 << 3);
     pub const EXTRA: ButtonSet = ButtonSet(1 << 4);
-    const ALL: [ButtonSet; 5] = [Self::LEFT, Self::RIGHT, Self::MIDDLE, Self::SIDE, Self::EXTRA];
 
     pub const fn bits(self) -> u8 {
         self.0
@@ -64,6 +89,11 @@ impl ButtonSet {
         self.0 & other.0 == other.0
     }
 
+    /// Whether `b` is held.
+    pub fn has(self, b: Button) -> bool {
+        self.contains(b.into())
+    }
+
     pub const fn with(self, other: ButtonSet) -> ButtonSet {
         ButtonSet(self.0 | other.0)
     }
@@ -72,14 +102,9 @@ impl ButtonSet {
         ButtonSet(self.0 & !other.0)
     }
 
-    /// Exactly one button.
-    pub const fn is_one(self) -> bool {
-        self.0.count_ones() == 1
-    }
-
-    /// Each button in the set on its own, left first.
-    pub fn each(self) -> impl Iterator<Item = ButtonSet> {
-        Self::ALL.into_iter().filter(move |b| self.contains(*b))
+    /// Each button in the set, left first.
+    pub fn each(self) -> impl Iterator<Item = Button> {
+        Button::ALL.into_iter().filter(move |b| self.has(*b))
     }
 }
 
@@ -88,9 +113,9 @@ impl From<lumen_input::Buttons> for ButtonSet {
         use lumen_input::Buttons as B;
         [B::LEFT, B::RIGHT, B::MIDDLE, B::SIDE, B::EXTRA]
             .into_iter()
-            .zip(ButtonSet::ALL)
+            .zip(Button::ALL)
             .filter(|(input, _)| b.contains(*input))
-            .fold(ButtonSet::NONE, |set, (_, ours)| set.with(ours))
+            .fold(ButtonSet::NONE, |set, (_, ours)| set.with(ours.into()))
     }
 }
 
@@ -124,7 +149,7 @@ impl Pointer {
 
 /// What a window is told. Pointer positions are in its client area's
 /// coordinates (negative or past its size while a grab follows the
-/// pointer outside it); `button` is always one button.
+/// pointer outside it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Delivery {
     /// `button` went down; `buttons` is everything held now (with it).
@@ -132,7 +157,7 @@ pub enum Delivery {
         window: WindowId,
         x: i32,
         y: i32,
-        button: ButtonSet,
+        button: Button,
         buttons: ButtonSet,
     },
     PointerMove {
@@ -146,7 +171,7 @@ pub enum Delivery {
         window: WindowId,
         x: i32,
         y: i32,
-        button: ButtonSet,
+        button: Button,
         buttons: ButtonSet,
     },
     FocusGained(WindowId),
@@ -177,6 +202,7 @@ impl Delivery {
 
 /// What an operation did: the damage to repaint and what to tell windows.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[must_use = "its damage must be repainted and its deliveries queued"]
 pub struct Outcome {
     pub damage: WmDamage,
     pub deliveries: Vec<Delivery>,
@@ -197,9 +223,14 @@ pub enum Interruption {
     /// The desktop was left (Alt+F1 to F4): input goes to a terminal
     /// until it is resumed ([`Wm::resume`]).
     Pause,
-    /// Pointer events were lost: a gap in the reader's sequence, or one
-    /// marked `after_overrun`.
+    /// Pointer events were lost: a gap in the pointer reader's sequence,
+    /// or one marked `after_overrun`.
     Gap,
+    /// Key events were lost: a gap in the key reader's sequence
+    /// (`Read::lost_before`, #151), or a key event marked `after_drop`
+    /// (bytes dropped before it). The focused window may hold a key
+    /// whose release is gone.
+    KeyGap,
 }
 
 /// What a point on the screen is.
@@ -261,21 +292,26 @@ enum Gesture {
         id: WindowId,
     },
     /// Nothing until every button is up: a press on the desktop or a
-    /// border; another button than the left on a title bar or close box;
-    /// the buttons still held when a drag, a close-box press or a grab
-    /// ended early; or buttons held across a gap or at a resume (pressed
-    /// in a terminal or in frames lost, not on a window).
+    /// border (after it focused and raised the window); another button
+    /// than the left on a title bar or close box; the buttons still held
+    /// when a drag, a close-box press or a grab ended early.
     Ignore,
+    /// Nothing until every button is up, for buttons held across a pause
+    /// or a pointer gap, at a resume, or pressed in an `after_overrun`
+    /// event: pressed in a terminal or in frames lost, not on a window.
+    /// Presses meanwhile are counted (`ignored_presses`).
+    Held,
 }
 
 /// Counts of things worth showing (`desktop status`, #153).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WmCounts {
     /// Grabs that ended before their last button came up (their window
-    /// closed or lost the focus).
+    /// closed or lost the focus, or input was interrupted).
     pub grab_ends: u64,
-    /// Presses ignored because buttons were held across a gap or at a
-    /// resume.
+    /// Presses not taken as presses on a window: made in an
+    /// `after_overrun` event, or while buttons held across a pause or gap
+    /// or at a resume were still down.
     pub ignored_presses: u64,
 }
 
@@ -292,9 +328,6 @@ pub struct Wm {
     held: ButtonSet,
     last: (i32, i32),
     gesture: Gesture,
-    /// The current `Ignore` comes from buttons held across a gap or at a
-    /// resume (presses then are counted).
-    after_interruption: bool,
     /// Between [`Wm::interrupt`] with a pause and [`Wm::resume`].
     paused: bool,
     counts: WmCounts,
@@ -313,7 +346,6 @@ impl Wm {
             held: ButtonSet::NONE,
             last: (0, 0),
             gesture: Gesture::None,
-            after_interruption: false,
             paused: false,
             counts: WmCounts::default(),
         }
@@ -413,6 +445,7 @@ impl Wm {
     /// Removes a window (`None` if it isn't open). If it was focused, the
     /// window in front of the rest gets the focus; a drag, grab or
     /// close-box press on it ends.
+    #[must_use = "its damage must be repainted and its deliveries queued"]
     pub fn close(&mut self, id: WindowId) -> Option<Outcome> {
         let at = self.windows.iter().position(|w| w.id == id)?;
         let mut out = Outcome::default();
@@ -436,6 +469,7 @@ impl Wm {
 
     /// Raises a window to the front and focuses it (a click, the taskbar,
     /// `ui invoke <root> focus`); `None` if it isn't open.
+    #[must_use = "its damage must be repainted and its deliveries queued"]
     pub fn focus(&mut self, id: WindowId) -> Option<Outcome> {
         self.window(id)?;
         let mut out = Outcome::default();
@@ -448,6 +482,7 @@ impl Wm {
     /// the whole title bar visible, and at least `strip` pixels of its
     /// width (or all of it, if narrower) on the screen. `None` if it isn't
     /// open.
+    #[must_use = "its damage must be repainted and its deliveries queued"]
     pub fn move_to(&mut self, id: WindowId, x: i32, y: i32) -> Option<Outcome> {
         let at = self.windows.iter().position(|w| w.id == id)?;
         let mut out = Outcome::default();
@@ -462,46 +497,54 @@ impl Wm {
         Some(out)
     }
 
-    /// Input was interrupted (see [`Interruption`]); the drag or grab in
-    /// progress ends.
+    /// Input was interrupted (see [`Interruption`]).
     ///
-    /// - **A pause:** the focused window is told `FocusLost`. Until
-    ///   [`Wm::resume`], pointer events are ignored and focus changes
-    ///   (a window opened or closed meanwhile) aren't delivered; the
-    ///   resume delivers the focus as it is then. A second pause does
-    ///   nothing.
-    /// - **A gap:** the focused window (the grabbing one, if any) is told
-    ///   `Lost`. If buttons were held, nothing more is delivered until a
-    ///   pointer event reports every button up (a press meanwhile, in the
-    ///   frames lost, wasn't seen); if none were, the next press is a press
-    ///   as usual.
+    /// - **A pause:** the focused window is told `FocusLost`, and the drag
+    ///   or grab ends. Until [`Wm::resume`], pointer events are ignored
+    ///   and focus changes (a window opened or closed meanwhile) aren't
+    ///   delivered; the resume delivers the focus as it is then.
+    /// - **A pointer gap:** the focused window (the grabbing one, if any)
+    ///   is told `Lost`, and the drag or grab ends. If buttons were held,
+    ///   nothing more is delivered until a pointer event reports every
+    ///   button up (a press meanwhile, in the frames lost, wasn't seen);
+    ///   if none were, the next press is a press as usual.
+    /// - **A key gap:** the focused window is told `Lost` (it releases its
+    ///   keys, and its buttons too); a grab on it ends (its buttons are
+    ///   ignored until up), a title-bar drag goes on.
+    ///
+    /// While paused, nothing (a second pause does nothing either).
     pub fn interrupt(&mut self, why: Interruption) -> Outcome {
         let mut out = Outcome::default();
         if self.paused {
             return out;
         }
-        if let Some(f) = self.focused {
-            out.deliveries.push(match why {
-                Interruption::Pause => Delivery::FocusLost(f),
-                Interruption::Gap => Delivery::Lost(f),
-            });
-        }
+        out.deliveries.extend(self.focused.map(match why {
+            Interruption::Pause => Delivery::FocusLost,
+            Interruption::Gap | Interruption::KeyGap => Delivery::Lost,
+        }));
+        let grabbing = matches!(self.gesture, Gesture::Grab { .. });
         match why {
             Interruption::Pause => {
                 self.paused = true;
-                self.gesture = Gesture::Ignore;
+                self.gesture = Gesture::Held;
             }
             Interruption::Gap => self.ignore_held(),
+            Interruption::KeyGap if grabbing => self.gesture = Gesture::Ignore,
+            Interruption::KeyGap => {}
+        }
+        if grabbing {
+            self.counts.grab_ends += 1;
         }
         out
     }
 
     /// The desktop is shown again after a pause. `baseline` is what the
-    /// pointer ring's newest frame holds at the cut (buttons pressed or
-    /// released while the terminal had the input): buttons held then are
-    /// ignored until a pointer event reports every button up. The focused
-    /// window, as it is now, is told `FocusGained`. Without a pause before,
-    /// it does nothing.
+    /// pointer ring's newest frame held at the cut (captured with the cut,
+    /// as the ring may overwrite that frame): buttons pressed or released
+    /// while the terminal had the input. Buttons held then are ignored
+    /// until a pointer event reports every button up. The focused window,
+    /// as it is now, is told `FocusGained`. Without a pause before, it
+    /// does nothing.
     pub fn resume(&mut self, baseline: ButtonSet) -> Outcome {
         let mut out = Outcome::default();
         if !self.paused {
@@ -510,9 +553,7 @@ impl Wm {
         self.paused = false;
         self.held = baseline;
         self.ignore_held();
-        if let Some(f) = self.focused {
-            out.deliveries.push(Delivery::FocusGained(f));
-        }
+        out.deliveries.extend(self.focused.map(Delivery::FocusGained));
         out
     }
 
@@ -526,15 +567,20 @@ impl Wm {
         }
         if p.after_overrun {
             out.merge(self.interrupt(Interruption::Gap));
+            // A button down in this event went down in the frames lost:
+            // not a press on a window.
+            if !p.buttons.without(self.held).is_empty() {
+                self.gesture = Gesture::Held;
+            }
         }
         let pressed = p.buttons.without(self.held);
         let released = self.held.without(p.buttons);
         if (p.x, p.y) != self.last {
             match self.gesture {
                 Gesture::Drag { id, dx, dy } => {
-                    if let Some(moved) = self.move_to(id, p.x.saturating_sub(dx), p.y.saturating_sub(dy)) {
-                        out.merge(moved);
-                    }
+                    let moved = self.move_to(id, p.x.saturating_sub(dx), p.y.saturating_sub(dy));
+                    debug_assert!(moved.is_some(), "a drag of a window not open");
+                    out.merge(moved.unwrap_or_default());
                 }
                 Gesture::Grab { id } => self.send(&mut out, id, p.x, p.y, Sent::Move),
                 _ => {}
@@ -542,20 +588,20 @@ impl Wm {
         }
         self.last = (p.x, p.y);
         for b in pressed.each() {
-            self.held = self.held.with(b);
+            self.held = self.held.with(b.into());
             match self.gesture {
                 Gesture::None => self.start(b, p.x, p.y, &mut out),
                 Gesture::Grab { id } => self.send(&mut out, id, p.x, p.y, Sent::Down(b)),
-                Gesture::Ignore if self.after_interruption => self.counts.ignored_presses += 1,
+                Gesture::Held => self.counts.ignored_presses += 1,
                 _ => {}
             }
         }
         for b in released.each() {
-            self.held = self.held.without(b);
+            self.held = self.held.without(b.into());
             match self.gesture {
                 Gesture::Grab { id } => self.send(&mut out, id, p.x, p.y, Sent::Up(b)),
-                Gesture::Drag { .. } if b == ButtonSet::LEFT => self.gesture = Gesture::Ignore,
-                Gesture::CloseBox { id } if b == ButtonSet::LEFT => {
+                Gesture::Drag { .. } if b == Button::Left => self.gesture = Gesture::Ignore,
+                Gesture::CloseBox { id } if b == Button::Left => {
                     if self.hit(p.x, p.y) == Hit::Window(id, Part::CloseBox) {
                         out.deliveries.push(Delivery::Close(id));
                     }
@@ -566,7 +612,6 @@ impl Wm {
         }
         if self.held.is_empty() {
             self.gesture = Gesture::None;
-            self.after_interruption = false;
         }
         out
     }
@@ -574,20 +619,18 @@ impl Wm {
     /// After a gap or at a resume: nothing until every button is up if any
     /// is held, else ready for the next press.
     fn ignore_held(&mut self) {
-        let held = !self.held.is_empty();
-        self.gesture = if held { Gesture::Ignore } else { Gesture::None };
-        self.after_interruption = held;
+        self.gesture = if self.held.is_empty() { Gesture::None } else { Gesture::Held };
     }
 
     /// The first button pressed with none held: what is under the pointer
     /// decides the gesture.
-    fn start(&mut self, b: ButtonSet, x: i32, y: i32, out: &mut Outcome) {
+    fn start(&mut self, b: Button, x: i32, y: i32, out: &mut Outcome) {
         let Hit::Window(id, part) = self.hit(x, y) else {
             self.gesture = Gesture::Ignore;
             return;
         };
         self.raise_and_focus(id, out);
-        self.gesture = match (part, b == ButtonSet::LEFT) {
+        self.gesture = match (part, b == Button::Left) {
             (Part::TitleBar, true) => {
                 let f = self.window(id).expect("the window just hit").frame;
                 Gesture::Drag { id, dx: x.saturating_sub(f.x()), dy: y.saturating_sub(f.y()) }
@@ -605,18 +648,19 @@ impl Wm {
     /// in its client coordinates.
     fn send(&self, out: &mut Outcome, id: WindowId, x: i32, y: i32, what: Sent) {
         let Some(c) = self.client(id) else {
+            debug_assert!(false, "a pointer delivery for a window not open");
             return;
         };
         let (x, y) = (x.saturating_sub(c.x()), y.saturating_sub(c.y()));
         let buttons = self.held;
         out.deliveries.push(match what {
             Sent::Down(button) => {
-                debug_assert!(button.is_one() && buttons.contains(button), "{button:?} of {buttons:?}");
+                debug_assert!(buttons.has(button), "{button:?} of {buttons:?}");
                 Delivery::PointerDown { window: id, x, y, button, buttons }
             }
             Sent::Move => Delivery::PointerMove { window: id, x, y, buttons },
             Sent::Up(button) => {
-                debug_assert!(button.is_one() && !buttons.contains(button), "{button:?} of {buttons:?}");
+                debug_assert!(!buttons.has(button), "{button:?} of {buttons:?}");
                 Delivery::PointerUp { window: id, x, y, button, buttons }
             }
         });
@@ -624,6 +668,7 @@ impl Wm {
 
     fn raise_and_focus(&mut self, id: WindowId, out: &mut Outcome) {
         let Some(at) = self.windows.iter().position(|w| w.id == id) else {
+            debug_assert!(false, "raising a window not open");
             return;
         };
         if at + 1 != self.windows.len() {
@@ -678,7 +723,7 @@ impl Wm {
 /// What [`Wm::send`] delivers.
 #[derive(Clone, Copy)]
 enum Sent {
-    Down(ButtonSet),
+    Down(Button),
     Move,
-    Up(ButtonSet),
+    Up(Button),
 }

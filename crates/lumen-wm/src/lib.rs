@@ -15,15 +15,16 @@
 //!   A click focuses and raises a window; closing the focused one focuses
 //!   the one in front of the rest. Every operation returns the damage it
 //!   caused and what to tell windows ([`Outcome`]). A pause or a gap in
-//!   pointer input ([`Interruption`]) tells the focused window and ends the
-//!   gesture, so no window is left holding a button; while paused, focus
-//!   changes wait for the resume. Moves with no button held aren't
+//!   pointer input, or a gap in key input ([`Interruption`]), tells the
+//!   focused window and ends the grab, so no window is left holding a
+//!   button or key; while paused, focus changes wait for the resume. Moves with no button held aren't
 //!   delivered (no hover in M4).
-//! - **A window's event queue** ([`queue`]): [`EventQueue`], with `Lost`,
-//!   focus and `Close` as flags beside it that are never dropped, presses,
-//!   moves and requests rationed past [`queue::RATIONED`] entries, and a
-//!   release queued only after its press was; [`deliver`] puts a
-//!   [`Delivery`] on it.
+//! - **A window's event queue** ([`queue`]): [`EventQueue`] of [`Entry`]s
+//!   (key events, pointer events, requests), with `Lost`, focus and
+//!   `Close` as flags beside it that are never dropped and can't be
+//!   pushed, presses, moves and requests rationed past
+//!   [`queue::RATIONED`] entries, and a release queued only after its press
+//!   was; [`deliver`] puts a [`Delivery`] on it.
 //! - **Themes** ([`theme`]): the light and dark palettes.
 
 #![cfg_attr(not(test), no_std)]
@@ -40,7 +41,9 @@ pub mod wm;
 mod model;
 
 pub use geom::{Metrics, Part};
-pub use queue::{Class, EventQueue, Next, Pushed, QueueCounts, QueueEvent};
+pub use queue::{Entry, EventQueue, Held, KeyLike, Next, Pushed, QueueCounts};
 pub use route::{PointerEntry, deliver};
 pub use theme::Theme;
-pub use wm::{ButtonSet, Delivery, Hit, Interruption, Outcome, Pointer, Window, WindowId, Wm, WmCounts, WmDamage};
+pub use wm::{
+    Button, ButtonSet, Delivery, Hit, Interruption, Outcome, Pointer, Window, WindowId, Wm, WmCounts, WmDamage,
+};

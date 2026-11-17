@@ -9,9 +9,9 @@ use alloc::vec::Vec;
 use lumen_gfx::Rect;
 
 use crate::geom::{Metrics, Part};
-use crate::queue::{Class, EventQueue, Next, QueueEvent};
+use crate::queue::{Entry, EventQueue, KeyLike, Next};
 use crate::route::{PointerEntry, deliver};
-use crate::wm::{ButtonSet, Delivery, Hit, Interruption, Outcome, Pointer, WindowId, Wm};
+use crate::wm::{Button, ButtonSet, Delivery, Hit, Interruption, Outcome, Pointer, WindowId, Wm};
 
 const M: Metrics = Metrics { title_h: 4, border: 1, close: 2, close_margin: 0, strip: 3 };
 const W: u32 = 40;
@@ -19,6 +19,8 @@ const H: u32 = 30;
 const L: ButtonSet = ButtonSet::LEFT;
 const R: ButtonSet = ButtonSet::RIGHT;
 const NONE: ButtonSet = ButtonSet::NONE;
+const LB: Button = Button::Left;
+const RB: Button = Button::Right;
 
 fn wm() -> Wm {
     Wm::new(W, H, M)
@@ -60,7 +62,7 @@ fn opening_focuses_and_raises_and_ids_count_from_1_never_reused() {
     assert_eq!(b.get(), 2);
     assert_eq!(out.deliveries, [Delivery::FocusLost(a), Delivery::FocusGained(b)]);
     assert!(covers(&out, frame(&wm, a)) && covers(&out, frame(&wm, b)), "both frames redrawn (focus is drawn)");
-    wm.close(b).expect("open");
+    let _ = wm.close(b).expect("open");
     let (c, _) = wm.open("c", 1, 1, 0, 0);
     assert_eq!(c.get(), 3);
     assert_eq!(wm.windows().iter().map(|w| w.id()).collect::<Vec<_>>(), [a, c]);
@@ -73,7 +75,7 @@ fn ids_name_open_windows_only() {
     let a = open(&mut wm, 0, 0, 5, 5);
     let b = open(&mut wm, 10, 0, 5, 5);
     assert_eq!((wm.id(1), wm.id(2), wm.id(3), wm.id(0)), (Some(a), Some(b), None, None));
-    wm.close(a).expect("open");
+    let _ = wm.close(a).expect("open");
     assert_eq!(wm.id(1), None);
     // Operations on a window that isn't open say so.
     assert_eq!(wm.close(a), None);
@@ -97,14 +99,14 @@ fn a_click_focuses_and_raises() {
         [
             Delivery::FocusLost(b),
             Delivery::FocusGained(a),
-            Delivery::PointerDown { window: a, x: 2 - client.x(), y: 5 - client.y(), button: L, buttons: L },
+            Delivery::PointerDown { window: a, x: 2 - client.x(), y: 5 - client.y(), button: LB, buttons: L },
         ]
     );
     assert!(covers(&out, frame(&wm, a)) && covers(&out, frame(&wm, b)));
     // Where they overlap, A is in front now.
     assert_eq!(wm.hit(8, 8), Hit::Window(a, Part::Client));
     // A click on the focused window in front changes nothing to repaint.
-    wm.pointer(at(2, 5, NONE));
+    let _ = wm.pointer(at(2, 5, NONE));
     let out = wm.pointer(at(2, 5, L));
     assert!(out.damage.is_empty());
     assert!(matches!(out.deliveries[..], [Delivery::PointerDown { .. }]));
@@ -112,13 +114,13 @@ fn a_click_focuses_and_raises() {
 
 #[test]
 fn a_right_or_middle_press_on_a_client_grabs_too() {
-    for b in [R, ButtonSet::MIDDLE] {
+    for b in [RB, Button::Middle] {
         let mut wm = wm();
         let a = open(&mut wm, 10, 10, 10, 8);
         let c = wm.client(a).expect("open");
         assert_eq!(
-            wm.pointer(at(c.x() + 2, c.y() + 1, b)).deliveries,
-            [Delivery::PointerDown { window: a, x: 2, y: 1, button: b, buttons: b }]
+            wm.pointer(at(c.x() + 2, c.y() + 1, b.into())).deliveries,
+            [Delivery::PointerDown { window: a, x: 2, y: 1, button: b, buttons: b.into() }]
         );
         assert_eq!(wm.grabbing(), Some(a));
         assert_eq!(
@@ -176,7 +178,7 @@ fn a_drag_moves_the_window_by_the_pointers_moves() {
     assert_eq!(wm.dragging(), None);
     assert!(out.damage.is_empty() && out.deliveries.is_empty());
     // A move with nothing held moves nothing.
-    wm.pointer(at(30, 20, NONE));
+    let _ = wm.pointer(at(30, 20, NONE));
     assert_eq!(frame(&wm, a), moved);
 }
 
@@ -184,11 +186,11 @@ fn a_drag_moves_the_window_by_the_pointers_moves() {
 fn another_buttons_click_during_a_drag_doesnt_end_it() {
     let mut wm = wm();
     let a = open(&mut wm, 5, 5, 10, 8);
-    wm.pointer(at(7, 6, L));
+    let _ = wm.pointer(at(7, 6, L));
     assert_eq!(wm.pointer(at(7, 6, L.with(R))), Outcome::default());
     assert_eq!(wm.pointer(at(7, 6, L)), Outcome::default());
     assert_eq!(wm.dragging(), Some(a));
-    wm.pointer(at(10, 8, L));
+    let _ = wm.pointer(at(10, 8, L));
     assert_eq!((frame(&wm, a).x(), frame(&wm, a).y()), (8, 7));
 }
 
@@ -204,7 +206,7 @@ fn a_drag_is_clamped_to_keep_a_strip_of_the_title_bar_on_screen() {
         ((5, 100), (5, 30 - 4)),  // bottom: the whole title bar stays on
         ((-100, 100), (-9, 26)),
     ] {
-        wm.move_to(a, to.0, to.1).expect("open");
+        let _ = wm.move_to(a, to.0, to.1).expect("open");
         assert_eq!((frame(&wm, a).x(), frame(&wm, a).y()), want, "move to {to:?}");
         assert_eq!((frame(&wm, a).w(), frame(&wm, a).h()), (f.w(), f.h()));
     }
@@ -223,9 +225,9 @@ fn a_window_narrower_than_the_strip_stays_whole_on_screen() {
     let mut wm = wm();
     let a = open(&mut wm, 5, 5, 0, 3); // frame 2 wide, under the strip of 3
     assert_eq!(frame(&wm, a).w(), 2);
-    wm.move_to(a, -100, 5).expect("open");
+    let _ = wm.move_to(a, -100, 5).expect("open");
     assert_eq!(frame(&wm, a).x(), 0);
-    wm.move_to(a, 100, 5).expect("open");
+    let _ = wm.move_to(a, 100, 5).expect("open");
     assert_eq!(frame(&wm, a).x(), W as i32 - 2);
 }
 
@@ -234,9 +236,9 @@ fn releasing_the_left_button_ends_a_drag_even_with_another_held() {
     let mut wm = wm();
     let a = open(&mut wm, 5, 5, 10, 8);
     let b = open(&mut wm, 25, 15, 8, 8);
-    wm.focus(a).expect("open");
+    let _ = wm.focus(a).expect("open");
     // Left on A's title bar, right pressed too, left released.
-    wm.pointer(at(7, 6, L));
+    let _ = wm.pointer(at(7, 6, L));
     assert_eq!(wm.pointer(at(9, 7, L.with(R))).deliveries, []);
     let moved = frame(&wm, a);
     assert_eq!(wm.pointer(at(9, 7, R)), Outcome::default());
@@ -252,7 +254,7 @@ fn releasing_the_left_button_ends_a_drag_even_with_another_held() {
         window: b,
         x: 1,
         y: 1,
-        button: L,
+        button: LB,
         buttons: L
     }));
 }
@@ -261,9 +263,9 @@ fn releasing_the_left_button_ends_a_drag_even_with_another_held() {
 fn closing_a_window_mid_drag_ends_the_drag() {
     let mut wm = wm();
     let a = open(&mut wm, 5, 5, 10, 8);
-    wm.pointer(at(7, 6, L));
+    let _ = wm.pointer(at(7, 6, L));
     assert_eq!(wm.dragging(), Some(a));
-    wm.close(a).expect("open");
+    let _ = wm.close(a).expect("open");
     assert_eq!(wm.dragging(), None);
     assert_eq!(wm.pointer(at(20, 20, L)), Outcome::default());
 }
@@ -273,16 +275,16 @@ fn a_grab_lasts_until_its_last_button_is_released() {
     let mut wm = wm();
     let a = open(&mut wm, 5, 5, 10, 8);
     let b = open(&mut wm, 25, 15, 8, 8);
-    wm.focus(a).expect("open");
+    let _ = wm.focus(a).expect("open");
     let c = wm.client(a).expect("open");
     let bc = wm.client(b).expect("open");
-    wm.pointer(at(c.x(), c.y(), L));
-    wm.pointer(at(c.x(), c.y(), L.with(R)));
+    let _ = wm.pointer(at(c.x(), c.y(), L));
+    let _ = wm.pointer(at(c.x(), c.y(), L.with(R)));
     // Left released: A is told, and still holds the grab (it was told of
     // the right press, so it must be told of its release too).
     assert_eq!(
         wm.pointer(at(c.x(), c.y(), R)).deliveries,
-        [Delivery::PointerUp { window: a, x: 0, y: 0, button: L, buttons: R }]
+        [Delivery::PointerUp { window: a, x: 0, y: 0, button: LB, buttons: R }]
     );
     assert_eq!(wm.grabbing(), Some(a));
     // A move over B's client with the right button held is A's.
@@ -293,7 +295,7 @@ fn a_grab_lasts_until_its_last_button_is_released() {
     );
     assert_eq!(
         wm.pointer(at(bc.x(), bc.y(), NONE)).deliveries,
-        [Delivery::PointerUp { window: a, x: dx, y: dy, button: R, buttons: NONE }]
+        [Delivery::PointerUp { window: a, x: dx, y: dy, button: RB, buttons: NONE }]
     );
     assert_eq!(wm.grabbing(), None);
 }
@@ -304,7 +306,7 @@ fn a_grab_ends_when_its_window_loses_the_focus() {
     let mut o = Owners::default();
     let a = open(&mut wm, 0, 0, 10, 8);
     let b = open(&mut wm, 25, 15, 8, 8);
-    wm.focus(a).expect("open");
+    let _ = wm.focus(a).expect("open");
     let c = wm.client(a).expect("open");
     o.deliver(&wm.pointer(at(c.x() + 1, c.y() + 1, L)));
     // The taskbar focuses B while A still holds the grab.
@@ -325,8 +327,8 @@ fn a_grab_ends_when_its_window_loses_the_focus() {
 fn a_release_outside_the_screen_ends_the_drag_clamped() {
     let mut wm = wm();
     let a = open(&mut wm, 5, 5, 10, 8);
-    wm.pointer(at(7, 6, L));
-    wm.pointer(at(-500, -500, NONE));
+    let _ = wm.pointer(at(7, 6, L));
+    let _ = wm.pointer(at(-500, -500, NONE));
     assert_eq!(wm.dragging(), None);
     assert_eq!((frame(&wm, a).x(), frame(&wm, a).y()), (-9, 0));
     // The next press there is on the desktop.
@@ -358,7 +360,7 @@ fn the_grab_follows_the_pointer_out_of_the_window() {
     let mut wm = wm();
     let a = open(&mut wm, 10, 10, 10, 8);
     let c = wm.client(a).expect("open");
-    wm.pointer(at(c.x() + 1, c.y() + 1, L));
+    let _ = wm.pointer(at(c.x() + 1, c.y() + 1, L));
     assert_eq!(wm.grabbing(), Some(a));
     // Out of the window and off the screen: client coordinates go
     // negative; the second button goes to the grab too.
@@ -369,16 +371,19 @@ fn the_grab_follows_the_pointer_out_of_the_window() {
         out.deliveries,
         [
             Delivery::PointerMove { window: a, x: -7 - c.x(), y: 3 - c.y(), buttons: L },
-            Delivery::PointerDown { window: a, x: -7 - c.x(), y: 3 - c.y(), button: R, buttons: L.with(R) },
+            Delivery::PointerDown { window: a, x: -7 - c.x(), y: 3 - c.y(), button: RB, buttons: L.with(R) },
         ]
     );
     let out = wm.pointer(at(-7, 3, R));
-    assert_eq!(out.deliveries, [Delivery::PointerUp { window: a, x: -7 - c.x(), y: 3 - c.y(), button: L, buttons: R }]);
+    assert_eq!(
+        out.deliveries,
+        [Delivery::PointerUp { window: a, x: -7 - c.x(), y: 3 - c.y(), button: LB, buttons: R }]
+    );
     assert_eq!(wm.grabbing(), Some(a));
     let out = wm.pointer(at(-7, 3, NONE));
     assert_eq!(
         out.deliveries,
-        [Delivery::PointerUp { window: a, x: -7 - c.x(), y: 3 - c.y(), button: R, buttons: NONE }]
+        [Delivery::PointerUp { window: a, x: -7 - c.x(), y: 3 - c.y(), button: RB, buttons: NONE }]
     );
     assert_eq!(wm.grabbing(), None);
     // Moves with nothing held aren't delivered (no hover).
@@ -390,8 +395,8 @@ fn a_grab_whose_window_closes_ends() {
     let mut wm = wm();
     let a = open(&mut wm, 10, 10, 10, 8);
     let c = wm.client(a).expect("open");
-    wm.pointer(at(c.x(), c.y(), L));
-    wm.close(a).expect("open");
+    let _ = wm.pointer(at(c.x(), c.y(), L));
+    let _ = wm.close(a).expect("open");
     assert_eq!((wm.grabbing(), wm.counts().grab_ends), (None, 1));
     assert_eq!(wm.pointer(at(1, 1, L)), Outcome::default());
     assert_eq!(wm.pointer(at(1, 1, NONE)), Outcome::default());
@@ -404,22 +409,22 @@ fn the_close_box_clicks_on_a_left_release_over_it() {
     let b = wm.metrics().close_box(&frame(&wm, a));
     let (x, y) = (b.x(), b.y());
     assert_eq!(wm.hit(x, y), Hit::Window(a, Part::CloseBox));
-    wm.pointer(at(x, y, L));
+    let _ = wm.pointer(at(x, y, L));
     assert_eq!(wm.pointer(at(x + 1, y + 1, NONE)).deliveries, [Delivery::Close(a)]);
     // Pressed on it, released elsewhere: no click.
-    wm.pointer(at(x, y, L));
+    let _ = wm.pointer(at(x, y, L));
     assert!(wm.pointer(at(x - 5, y, NONE)).deliveries.is_empty());
     // The right button on it: no click, even with a left click on it
     // while the right is down.
-    wm.pointer(at(x, y, R));
+    let _ = wm.pointer(at(x, y, R));
     assert!(wm.pointer(at(x, y, NONE)).deliveries.is_empty());
-    wm.pointer(at(x, y, R));
-    wm.pointer(at(x, y, R.with(L)));
+    let _ = wm.pointer(at(x, y, R));
+    let _ = wm.pointer(at(x, y, R.with(L)));
     assert_eq!(wm.pointer(at(x, y, R)), Outcome::default());
     assert_eq!(wm.pointer(at(x, y, NONE)), Outcome::default());
     // Another button clicked while the left is down on it is ignored: the
     // left release still clicks.
-    wm.pointer(at(x, y, L));
+    let _ = wm.pointer(at(x, y, L));
     assert_eq!(wm.pointer(at(x, y, L.with(R))), Outcome::default());
     assert_eq!(wm.pointer(at(x, y, L)), Outcome::default());
     assert_eq!(wm.pointer(at(x, y, NONE)).deliveries, [Delivery::Close(a)]);
@@ -453,32 +458,15 @@ fn tablet_positions_are_converted_saturating() {
     assert_eq!(Pointer::from_state(&s, false).buttons, ButtonSet::EXTRA);
 }
 
-/// A window's events as #153 queues them (a stand-in for `WindowEvent`).
+/// No keys in these tests (the window manager deals in pointer events).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ev {
-    Down(ButtonSet),
-    Up(ButtonSet),
-    Move,
-}
+struct NoKey;
 
-impl QueueEvent for Ev {
-    type Key = u8;
-    fn class(&self) -> Class<u8> {
-        match *self {
-            Ev::Down(b) => Class::Press(b.bits()),
-            Ev::Up(b) => Class::Release(b.bits()),
-            Ev::Move => Class::Move,
-        }
-    }
-}
-
-impl From<PointerEntry> for Ev {
-    fn from(e: PointerEntry) -> Ev {
-        match e {
-            PointerEntry::Down { button, .. } => Ev::Down(button),
-            PointerEntry::Up { button, .. } => Ev::Up(button),
-            PointerEntry::Move { .. } => Ev::Move,
-        }
+impl KeyLike for NoKey {
+    type Code = ();
+    fn code(&self) {}
+    fn is_press(&self) -> bool {
+        true
     }
 }
 
@@ -486,7 +474,7 @@ impl From<PointerEntry> for Ev {
 /// thinks are held after reading everything.
 #[derive(Default)]
 struct Owners {
-    queues: BTreeMap<WindowId, EventQueue<Ev>>,
+    queues: BTreeMap<WindowId, EventQueue<NoKey, ()>>,
     held: BTreeMap<WindowId, ButtonSet>,
 }
 
@@ -495,7 +483,7 @@ impl Owners {
     /// window's queue.
     fn deliver(&mut self, out: &Outcome) {
         for d in &out.deliveries {
-            deliver(self.queues.entry(d.window()).or_default(), d);
+            let _ = deliver(self.queues.entry(d.window()).or_default(), d);
         }
     }
 
@@ -512,9 +500,10 @@ impl Owners {
             while let Some(n) = q.next_event() {
                 match n {
                     Next::Lost | Next::Focus(false) => *held = NONE,
-                    Next::Event(Ev::Down(b)) => *held = held.with(b),
-                    Next::Event(Ev::Up(b)) => *held = held.without(b),
-                    Next::Focus(true) | Next::Close | Next::Event(Ev::Move) => {}
+                    Next::Event(Entry::Pointer(PointerEntry::Down { button, .. })) => *held = held.with(button.into()),
+                    Next::Event(Entry::Pointer(PointerEntry::Up { button, .. })) => *held = held.without(button.into()),
+                    Next::Focus(true) | Next::Close | Next::Event(Entry::Pointer(PointerEntry::Move { .. })) => {}
+                    Next::Event(Entry::Key(_) | Entry::Request(())) => unreachable!("no keys or requests here"),
                 }
             }
         }
@@ -558,7 +547,7 @@ fn press_interrupt_release(interrupt: impl Fn(&mut Wm, WindowId) -> Outcome, res
     o.deliver(&wm.pointer(at(c.x() + 1, c.y() + 1, L)));
     o.read();
     assert_eq!(o.holding(), [(a, L)]);
-    assert_eq!(o.strays().1, 0);
+    assert_eq!(o.strays(), (0, 0));
 }
 
 #[test]
@@ -611,13 +600,13 @@ fn the_first_click_after_a_resume_or_a_gap_is_a_click() {
         if gap {
             assert_eq!(wm.interrupt(Interruption::Gap).deliveries, [Delivery::Lost(a)]);
         } else {
-            wm.interrupt(Interruption::Pause);
-            wm.resume(NONE);
+            let _ = wm.interrupt(Interruption::Pause);
+            let _ = wm.resume(NONE);
         }
         // A press with no move first, as the harness's click sends it.
         assert_eq!(
             wm.pointer(at(c.x() + 1, c.y() + 1, L)).deliveries,
-            [Delivery::PointerDown { window: a, x: 1, y: 1, button: L, buttons: L }],
+            [Delivery::PointerDown { window: a, x: 1, y: 1, button: LB, buttons: L }],
             "gap {gap}"
         );
         assert_eq!(wm.counts().ignored_presses, 0);
@@ -633,8 +622,8 @@ fn a_button_held_at_the_resume_is_ignored_until_every_button_is_up() {
         let mut wm = wm();
         let a = open(&mut wm, 10, 10, 10, 8);
         let f = frame(&wm, a);
-        wm.interrupt(Interruption::Pause);
-        wm.resume(L);
+        let _ = wm.interrupt(Interruption::Pause);
+        let _ = wm.resume(L);
         assert_eq!(wm.pointer(at(x, y, L)), Outcome::default(), "({x}, {y})");
         assert_eq!(wm.pointer(at(x + 4, y + 2, L.with(R))), Outcome::default());
         assert_eq!(wm.counts().ignored_presses, 1);
@@ -667,6 +656,118 @@ fn while_paused_focus_changes_wait_for_the_resume() {
     assert_eq!(wm.resume(NONE).deliveries, [Delivery::FocusGained(b)]);
     assert!(!wm.is_paused());
     assert_eq!(wm.resume(NONE), Outcome::default(), "a resume without a pause");
+}
+
+#[test]
+fn a_key_gap_ends_a_grab_and_leaves_a_drag() {
+    // A grab: the focused window is told, the grab ends, its buttons are
+    // ignored until up (not counted as presses after an interruption).
+    let mut wm = wm();
+    let a = open(&mut wm, 10, 10, 10, 8);
+    let c = wm.client(a).expect("open");
+    let _ = wm.pointer(at(c.x(), c.y(), L));
+    assert_eq!(wm.interrupt(Interruption::KeyGap).deliveries, [Delivery::Lost(a)]);
+    assert_eq!((wm.grabbing(), wm.counts().grab_ends), (None, 1));
+    assert_eq!(wm.pointer(at(c.x() + 2, c.y(), L.with(R))), Outcome::default());
+    assert_eq!(wm.pointer(at(c.x() + 2, c.y(), NONE)), Outcome::default());
+    assert_eq!(wm.counts().ignored_presses, 0);
+    assert!(matches!(wm.pointer(at(c.x(), c.y(), L)).deliveries[..], [Delivery::PointerDown { .. }]));
+    // A drag: told too, and the drag goes on.
+    let mut wm = Wm::new(W, H, M);
+    let a = open(&mut wm, 5, 5, 10, 8);
+    let _ = wm.pointer(at(7, 6, L));
+    assert_eq!(wm.interrupt(Interruption::KeyGap).deliveries, [Delivery::Lost(a)]);
+    assert_eq!((wm.dragging(), wm.counts().grab_ends), (Some(a), 0));
+    let _ = wm.pointer(at(10, 8, L));
+    assert_eq!((frame(&wm, a).x(), frame(&wm, a).y()), (8, 7));
+    // While paused, and with no window, nobody is told.
+    let _ = wm.interrupt(Interruption::Pause);
+    assert_eq!(wm.interrupt(Interruption::KeyGap), Outcome::default());
+    let mut empty = Wm::new(W, H, M);
+    assert_eq!(empty.interrupt(Interruption::KeyGap), Outcome::default());
+}
+
+#[test]
+fn a_pause_or_a_gap_ends_a_grab_and_counts_it() {
+    for why in [Interruption::Pause, Interruption::Gap] {
+        let mut wm = wm();
+        let a = open(&mut wm, 10, 10, 10, 8);
+        let c = wm.client(a).expect("open");
+        let _ = wm.pointer(at(c.x(), c.y(), L));
+        let _ = wm.interrupt(why);
+        assert_eq!((wm.grabbing(), wm.counts().grab_ends), (None, 1), "{why:?}");
+    }
+}
+
+#[test]
+fn a_press_in_an_event_after_an_overrun_isnt_a_press() {
+    let mut wm = wm();
+    let a = open(&mut wm, 10, 10, 10, 8);
+    let c = wm.client(a).expect("open");
+    // Nothing held before; the event after the overrun holds the left
+    // button, pressed in the frames lost.
+    let out = wm.pointer(Pointer { after_overrun: true, ..at(c.x(), c.y(), L) });
+    assert_eq!(out.deliveries, [Delivery::Lost(a)]);
+    assert_eq!((wm.grabbing(), wm.counts().ignored_presses), (None, 1));
+    assert_eq!(wm.pointer(at(c.x(), c.y(), NONE)), Outcome::default());
+    assert!(matches!(wm.pointer(at(c.x(), c.y(), L)).deliveries[..], [Delivery::PointerDown { .. }]));
+}
+
+#[test]
+fn presses_are_counted_as_ignored_only_after_an_interruption() {
+    let mut wm = wm();
+    let _a = open(&mut wm, 10, 10, 10, 8);
+    let _ = wm.interrupt(Interruption::Pause);
+    let _ = wm.resume(L);
+    // Each press while the baseline's buttons are down counts once.
+    let _ = wm.pointer(at(1, 1, L.with(R)));
+    let _ = wm.pointer(at(1, 1, L));
+    let _ = wm.pointer(at(1, 1, L.with(R)));
+    assert_eq!(wm.counts().ignored_presses, 2);
+    let _ = wm.pointer(at(1, 1, NONE));
+    // A press on the desktop and another button with it: ignored, not
+    // counted.
+    let _ = wm.pointer(at(1, 1, L));
+    let _ = wm.pointer(at(1, 1, L.with(R)));
+    let _ = wm.pointer(at(1, 1, NONE));
+    assert_eq!(wm.counts().ignored_presses, 2);
+}
+
+#[test]
+fn a_focus_loss_while_paused_is_held_back() {
+    let mut wm = wm();
+    let _a = open(&mut wm, 0, 0, 5, 5);
+    let b = open(&mut wm, 10, 0, 5, 5);
+    assert_eq!(wm.interrupt(Interruption::Pause).deliveries, [Delivery::FocusLost(b)]);
+    // Opening C moves the focus from B to C: neither is told now.
+    let (c, out) = wm.open("c", 5, 5, 20, 0);
+    assert_eq!(out.deliveries, []);
+    assert_eq!(wm.resume(NONE).deliveries, [Delivery::FocusGained(c)]);
+}
+
+#[test]
+fn every_tablet_button_converts_to_its_own() {
+    use lumen_input::Buttons as B;
+    for (input, ours) in [
+        (B::LEFT, ButtonSet::LEFT),
+        (B::RIGHT, ButtonSet::RIGHT),
+        (B::MIDDLE, ButtonSet::MIDDLE),
+        (B::SIDE, ButtonSet::SIDE),
+        (B::EXTRA, ButtonSet::EXTRA),
+    ] {
+        assert_eq!(ButtonSet::from(input), ours, "{input:?}");
+    }
+    assert_eq!(ButtonSet::from(B::NONE), NONE);
+    for (b, set) in Button::ALL.into_iter().zip([
+        ButtonSet::LEFT,
+        ButtonSet::RIGHT,
+        ButtonSet::MIDDLE,
+        ButtonSet::SIDE,
+        ButtonSet::EXTRA,
+    ]) {
+        assert_eq!(ButtonSet::from(b), set, "{b:?}");
+        assert_eq!(set.each().collect::<Vec<_>>(), [b]);
+    }
 }
 
 /// What the picture shows at a pixel: the painter's algorithm, back to
@@ -709,12 +810,32 @@ impl Rng {
     fn one_in(&mut self, n: u64) -> bool {
         self.next().is_multiple_of(n)
     }
+    /// A random pixel of `r` (its corner if it is empty).
+    fn point_in(&mut self, r: Rect) -> (i32, i32) {
+        (r.x() + self.range(0, r.w().max(1) as i32), r.y() + self.range(0, r.h().max(1) as i32))
+    }
+}
+
+/// An owner answering a close-box click: it closes its window now and
+/// then. Returns how many clicks there were.
+fn answer_closes(wm: &mut Wm, rng: &mut Rng, out: &Outcome, outs: &mut Vec<Outcome>) -> u32 {
+    let mut clicks = 0;
+    for d in &out.deliveries {
+        if let Delivery::Close(id) = *d {
+            clicks += 1;
+            if rng.one_in(2) {
+                outs.extend(wm.close(id));
+            }
+        }
+    }
+    clicks
 }
 
 #[test]
 fn repainting_only_the_damage_matches_repainting_everything() {
     let buttons = [L, R, ButtonSet::MIDDLE];
     let (mut clicks, mut drags, mut follows, mut downs) = (0, 0, 0, 0);
+    let (mut grab_seconds, mut held_resumes) = (0, 0);
     for seed in [1, 0xdead_beef, 0x1234_5678_9abc_def1, 42] {
         let mut rng = Rng(seed);
         let mut wm = wm();
@@ -742,30 +863,35 @@ fn repainting_only_the_damage_matches_repainting_everything() {
                     rng.pick(&ids_now)
                         .and_then(|id| wm.move_to(id, rng.range(-50, W as i32 + 50), rng.range(-50, H as i32 + 50))),
                 ),
-                5 => outs.push(wm.interrupt(if rng.one_in(2) { Interruption::Pause } else { Interruption::Gap })),
-                6 => outs.push(wm.resume(held)),
+                5 => outs.push(wm.interrupt(match rng.range(0, 3) {
+                    0 => Interruption::Pause,
+                    1 => Interruption::Gap,
+                    _ => Interruption::KeyGap,
+                })),
+                6 => {
+                    if wm.is_paused() && !held.is_empty() {
+                        held_resumes += 1;
+                    }
+                    outs.push(wm.resume(held));
+                }
                 // A click (press and release at one place, as the
                 // harness's `click` sends it) on a window's close box,
                 // title bar or client.
                 7 if held.is_empty() && !ids_now.is_empty() => {
                     let id = rng.pick(&ids_now).expect("a window");
                     let f = frame(&wm, id);
-                    let aim = match rng.range(0, 3) {
+                    let kind = rng.range(0, 3);
+                    let aim = match kind {
                         0 => wm.metrics().close_box(&f),
                         1 => wm.metrics().title_bar(&f),
                         _ => wm.metrics().client(&f),
                     };
-                    let (x, y) =
-                        (aim.x() + rng.range(0, aim.w().max(1) as i32), aim.y() + rng.range(0, aim.h().max(1) as i32));
+                    let (x, y) = rng.point_in(aim);
                     for b in [L, NONE] {
                         let out = wm.pointer(at(x, y, b));
-                        for d in &out.deliveries {
-                            if let Delivery::Close(id) = *d {
-                                clicks += 1;
-                                if rng.one_in(2) {
-                                    outs.extend(wm.close(id));
-                                }
-                            }
+                        let n = answer_closes(&mut wm, &mut rng, &out, &mut outs);
+                        if kind == 0 {
+                            clicks += n;
                         }
                         outs.push(out);
                     }
@@ -785,13 +911,13 @@ fn repainting_only_the_damage_matches_repainting_everything() {
                                 1 => wm.metrics().close_box(&f),
                                 _ => f,
                             };
-                            (
-                                aim.x() + rng.range(0, aim.w().max(1) as i32),
-                                aim.y() + rng.range(0, aim.h().max(1) as i32),
-                            )
+                            rng.point_in(aim)
                         }
                         None => (rng.range(-8, W as i32 + 8), rng.range(-8, H as i32 + 8)),
                     };
+                    if wm.grabbing().is_some() && !held.without(wm.buttons()).is_empty() {
+                        grab_seconds += 1;
+                    }
                     let p = Pointer { after_overrun: rng.one_in(40), ..at(x, y, held) };
                     // A first press on a client is that window's.
                     let first = (wm.is_idle() && !wm.is_paused() && wm.buttons().is_empty())
@@ -824,16 +950,7 @@ fn repainting_only_the_damage_matches_repainting_everything() {
                         }
                         (None, _) => drag = None,
                     }
-                    // An owner closes its window on a close-box click, now
-                    // and then.
-                    for d in &out.deliveries {
-                        if let Delivery::Close(id) = *d {
-                            clicks += 1;
-                            if rng.one_in(2) {
-                                outs.extend(wm.close(id));
-                            }
-                        }
-                    }
+                    answer_closes(&mut wm, &mut rng, &out, &mut outs);
                     outs.insert(0, out);
                 }
             }
@@ -885,13 +1002,14 @@ fn repainting_only_the_damage_matches_repainting_everything() {
                     wm.buttons()
                 );
             }
-            assert_eq!(o.strays().1, 0, "seed {seed:#x} step {step}: a release of nothing pressed");
+            assert_eq!(o.strays(), (0, 0), "seed {seed:#x} step {step}: a stray release reached a queue");
             o.keep(&wm);
         }
     }
     // The model reached what it checks.
     assert!(
-        clicks >= 10 && drags >= 10 && follows >= 20 && downs >= 20,
-        "clicks {clicks}, drags {drags} (followed {follows} times), first presses {downs}"
+        clicks >= 10 && drags >= 10 && follows >= 20 && downs >= 20 && grab_seconds >= 10 && held_resumes >= 5,
+        "close-box clicks {clicks}, drags {drags} (followed {follows} times), first presses {downs}, \
+         second buttons in a grab {grab_seconds}, resumes with buttons held {held_resumes}"
     );
 }
