@@ -360,6 +360,13 @@ name = "lumen-uart"
 version = "0.0.1"
 
 [[package]]
+name = "lumen-ui"
+version = "0.0.1"
+dependencies = [
+ "lumen-gfx",
+]
+
+[[package]]
 name = "lumen-wm"
 version = "0.0.1"
 dependencies = [
