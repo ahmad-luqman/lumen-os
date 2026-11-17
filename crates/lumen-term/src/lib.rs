@@ -4,7 +4,7 @@
 //! [`Terminal::write`] runs the bytes through `vte`'s parser (ANSI/VT
 //! escapes, UTF-8) into a `cols` x `rows` grid of [`Cell`]s, with lines that
 //! scroll off the top kept in a scrollback ring. The kernel draws the grid on
-//! the framebuffer; tests read it back.
+//! the framebuffer and in terminal windows ([`render`]); tests read it back.
 //!
 //! Everything is allocated in [`Terminal::new`]: writing never allocates, so
 //! the kernel can log while it holds the frame allocator's or the page
