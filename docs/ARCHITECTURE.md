@@ -3537,6 +3537,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/klog.rs      logger (levels, subsystem tags, serial timestamps, the ring dmesg reads)
   src/rtc.rs       the CMOS RTC: date and time (taken as UTC) for `date`
   src/fb.rs        framebuffer: pixels, glyphs, the hello screen, the crash screen
+  src/font.rs      the desktop's anti-aliased text (lumen-font): the UI font parsed once and shared (font::face), the golden sample for `font` and its ktest
   src/term.rs      the virtual terminals on the framebuffer (lumen-term): their grids, drawing the shown one's changed cells, log lines, the cursor, the canvas
   src/vt.rs        the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4
   src/symbols.rs   kernel symbol table (symbolized crash reports)
@@ -3545,7 +3546,8 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/shell/       the shells (lumen-shell): serial and the virtual terminals' consoles, the commands, system commands (sysinfo.rs), deliberate faults (crash.rs)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
-crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-gfx, lumen-acpi, lumen-pci, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, ...)
+crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-gfx, lumen-acpi, lumen-pci, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, lumen-font, ...)
+assets/fonts/      the desktop's UI font (Atkinson Hyperlegible, SIL OFL 1.1) with its licence and source
 boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml

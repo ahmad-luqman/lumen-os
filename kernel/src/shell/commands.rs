@@ -68,6 +68,13 @@ pub static COMMANDS: Table<Run> = Table(&[
     },
     Command { name: "colors", args: &[], usage: "", about: "a colour test pattern", run: colors },
     Command {
+        name: "font",
+        args: &[],
+        usage: "",
+        about: "render the desktop font's sample twice: timings, cache, golden check",
+        run: crate::font::command,
+    },
+    Command {
         name: "mandelbrot",
         args: &[],
         usage: "",
