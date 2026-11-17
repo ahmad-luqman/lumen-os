@@ -156,13 +156,14 @@ own PR that updates that doc first.
   and the mouse pointer, a save-under arrow that drawing over it takes off and puts back;
   `take_screen`: the desktop's `ScreenCanvas`, the whole screen, a row per hold of the screen's lock;
   `leave_desktop`). `vt.rs`: the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4 switching;
-  the decoding pass (`decode_pending`), `DESKTOP` (keys the desktop's alone while set), `CUT` (where each
-  pause and resume falls in the input rings) and `enter_desktop`.
+  the decoding pass (`decode_pending`), `desktop_shown()` (keys the desktop's alone while it is), `cut()` (a
+  copy of where each pause and resume falls in the input rings, with the `pause_owns_*`/`after_resume_*`
+  predicates) and `enter_desktop`.
   `desktop.rs`: the desktop (#153): the `compositor` thread (the back buffer, damage-only presents, the
   pointer drawn on the screen only, both input rings through `lumen_wm::Wm`, the cut), windows
   (`open_window`, `WindowHandle`: an owner's surface and a committed one, `commit`, `next_event`/`wait_event`,
   `Desktop::without_screen` for the ktests), the two demo windows, `desktop` (`status`, `check`, `spin`,
-  `hold`/`release`) and `windows`. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
+  `hold`/`release`) and `windows`; `lumen.desktop_cut_delay_ms=` widens the race at a pause for the scenarios. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
