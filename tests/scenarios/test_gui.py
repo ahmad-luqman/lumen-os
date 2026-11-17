@@ -590,6 +590,23 @@ def test_terminal_window_runs_shell(boot):
     gui.type_confirmed(m, "echo hello\n")
     expect_window(m, second, r"^lumen> echo hello\nhello\nlumen>$")
     assert read_window(m, first) == before
+    # Drawn in the second window's row of "hello" (some pixel of its five
+    # cells isn't the background), and not in the first's same row.
+    row = read_window(m, second).rows.index("hello")
+
+    def inked(frame: tuple[int, int, int, int], shot) -> bool:
+        x0 = frame[0] + 1 + TERM_PAD
+        y0 = frame[1] + TITLE_H + TERM_PAD + row * TERM_CELL_H
+        with Image.open(shot) as img:
+            rgb = img.convert("RGB")
+            return any(
+                rgb.getpixel((x, y)) != TERM_BG_RGB
+                for x in range(x0, x0 + 5 * TERM_CELL_W)
+                for y in range(y0, y0 + TERM_CELL_H)
+            )
+
+    shot = m.screendump("hello.png")
+    assert inked(two, shot) and not inked(one, shot)
     gui.type_confirmed(m, "life\n")
     expect_window(m, second, "^" + re.escape(NO_CANVAS) + r"\nlumen>$")
     assert read_window(m, first) == before
