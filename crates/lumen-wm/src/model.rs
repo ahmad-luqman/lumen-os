@@ -11,14 +11,15 @@ use lumen_gfx::Rect;
 use crate::geom::{Metrics, Part};
 use crate::queue::{Entry, EventQueue, KeyLike, Next};
 use crate::route::{PointerEntry, deliver};
-use crate::wm::{Button, ButtonSet, Delivery, Hit, Interruption, Outcome, Pointer, WindowId, Wm};
+use crate::wm::{Delivery, Hit, Interruption, Outcome, Pointer, WindowId, Wm};
+use lumen_input::{Button, Buttons};
 
 const M: Metrics = Metrics { title_h: 4, border: 1, close: 2, close_margin: 0, strip: 3 };
 const W: u32 = 40;
 const H: u32 = 30;
-const L: ButtonSet = ButtonSet::LEFT;
-const R: ButtonSet = ButtonSet::RIGHT;
-const NONE: ButtonSet = ButtonSet::NONE;
+const L: Buttons = Buttons::LEFT;
+const R: Buttons = Buttons::RIGHT;
+const NONE: Buttons = Buttons::NONE;
 const LB: Button = Button::Left;
 const RB: Button = Button::Right;
 
@@ -26,7 +27,7 @@ fn wm() -> Wm {
     Wm::new(W, H, M)
 }
 
-fn at(x: i32, y: i32, b: ButtonSet) -> Pointer {
+fn at(x: i32, y: i32, b: Buttons) -> Pointer {
     Pointer::at(x, y, b)
 }
 
@@ -451,11 +452,11 @@ fn a_press_on_a_border_focuses_and_raises_and_nothing_more() {
 #[test]
 fn tablet_positions_are_converted_saturating() {
     let mut s = lumen_input::PointerState { x: 12, y: usize::MAX, ..Default::default() };
-    s.buttons = lumen_input::Buttons::RIGHT;
+    s.buttons = Buttons::RIGHT;
     let p = Pointer::from_state(&s, true);
     assert_eq!((p.x, p.y, p.buttons, p.after_overrun), (12, i32::MAX, R, true));
-    let s = lumen_input::PointerState { buttons: lumen_input::Buttons::EXTRA, ..Default::default() };
-    assert_eq!(Pointer::from_state(&s, false).buttons, ButtonSet::EXTRA);
+    let s = lumen_input::PointerState { buttons: Buttons::EXTRA, ..Default::default() };
+    assert_eq!(Pointer::from_state(&s, false).buttons, Buttons::EXTRA);
 }
 
 #[test]
@@ -464,7 +465,7 @@ fn a_read_frame_carries_its_gap_either_way() {
     // the reader fell behind the ring or the frame says frames were lost
     // at the device (all four combinations).
     use lumen_input::{PointerEvent, PointerState, Read, Ring};
-    let state = PointerState { x: 7, y: 9, buttons: lumen_input::Buttons::LEFT, ..Default::default() };
+    let state = PointerState { x: 7, y: 9, buttons: Buttons::LEFT, ..Default::default() };
     let mut ring = Ring::<PointerEvent, 2>::new();
     let seq = ring.push(PointerEvent { state, after_overrun: false });
     for (lost_before, marked, gap) in [(0, false, false), (0, true, true), (3, false, true), (3, true, true)] {
@@ -491,7 +492,7 @@ impl KeyLike for NoKey {
 #[derive(Default)]
 struct Owners {
     queues: BTreeMap<WindowId, EventQueue<NoKey, ()>>,
-    held: BTreeMap<WindowId, ButtonSet>,
+    held: BTreeMap<WindowId, Buttons>,
 }
 
 impl Owners {
@@ -525,7 +526,7 @@ impl Owners {
         }
     }
 
-    fn holding(&self) -> Vec<(WindowId, ButtonSet)> {
+    fn holding(&self) -> Vec<(WindowId, Buttons)> {
         self.held.iter().filter(|(_, b)| !b.is_empty()).map(|(w, b)| (*w, *b)).collect()
     }
 
@@ -761,31 +762,6 @@ fn a_focus_loss_while_paused_is_held_back() {
     assert_eq!(wm.resume(NONE).deliveries, [Delivery::FocusGained(c)]);
 }
 
-#[test]
-fn every_tablet_button_converts_to_its_own() {
-    use lumen_input::Buttons as B;
-    for (input, ours) in [
-        (B::LEFT, ButtonSet::LEFT),
-        (B::RIGHT, ButtonSet::RIGHT),
-        (B::MIDDLE, ButtonSet::MIDDLE),
-        (B::SIDE, ButtonSet::SIDE),
-        (B::EXTRA, ButtonSet::EXTRA),
-    ] {
-        assert_eq!(ButtonSet::from(input), ours, "{input:?}");
-    }
-    assert_eq!(ButtonSet::from(B::NONE), NONE);
-    for (b, set) in Button::ALL.into_iter().zip([
-        ButtonSet::LEFT,
-        ButtonSet::RIGHT,
-        ButtonSet::MIDDLE,
-        ButtonSet::SIDE,
-        ButtonSet::EXTRA,
-    ]) {
-        assert_eq!(ButtonSet::from(b), set, "{b:?}");
-        assert_eq!(set.each().collect::<Vec<_>>(), [b]);
-    }
-}
-
 /// What the picture shows at a pixel: the painter's algorithm, back to
 /// front, the last window covering it wins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -849,7 +825,7 @@ fn answer_closes(wm: &mut Wm, rng: &mut Rng, out: &Outcome, outs: &mut Vec<Outco
 
 #[test]
 fn repainting_only_the_damage_matches_repainting_everything() {
-    let buttons = [L, R, ButtonSet::MIDDLE];
+    let buttons = [L, R, Buttons::MIDDLE];
     let (mut clicks, mut drags, mut follows, mut downs) = (0, 0, 0, 0);
     let (mut grab_seconds, mut held_resumes) = (0, 0);
     for seed in [1, 0xdead_beef, 0x1234_5678_9abc_def1, 42] {

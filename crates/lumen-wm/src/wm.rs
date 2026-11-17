@@ -23,6 +23,7 @@ use core::num::NonZeroU32;
 use lumen_gfx::{Damage, Rect};
 
 use crate::geom::{Metrics, Part};
+use lumen_input::{Button, Buttons};
 
 /// The damage one operation reports: a few frames at most, so 8
 /// rectangles never collapse in practice.
@@ -44,88 +45,13 @@ impl WindowId {
     }
 }
 
-/// One pointer button.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Button {
-    Left,
-    Right,
-    Middle,
-    Side,
-    Extra,
-}
-
-impl Button {
-    pub const ALL: [Button; 5] = [Button::Left, Button::Right, Button::Middle, Button::Side, Button::Extra];
-}
-
-impl From<Button> for ButtonSet {
-    fn from(b: Button) -> ButtonSet {
-        ButtonSet(1 << b as u8)
-    }
-}
-
-/// The pointer buttons held, one bit each as [`lumen_input::Buttons`]
-/// names them (left, right, middle, side, extra).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ButtonSet(u8);
-
-impl ButtonSet {
-    pub const NONE: ButtonSet = ButtonSet(0);
-    pub const LEFT: ButtonSet = ButtonSet(1 << 0);
-    pub const RIGHT: ButtonSet = ButtonSet(1 << 1);
-    pub const MIDDLE: ButtonSet = ButtonSet(1 << 2);
-    pub const SIDE: ButtonSet = ButtonSet(1 << 3);
-    pub const EXTRA: ButtonSet = ButtonSet(1 << 4);
-
-    pub const fn bits(self) -> u8 {
-        self.0
-    }
-
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
-    pub const fn contains(self, other: ButtonSet) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    /// Whether `b` is held.
-    pub fn has(self, b: Button) -> bool {
-        self.contains(b.into())
-    }
-
-    pub const fn with(self, other: ButtonSet) -> ButtonSet {
-        ButtonSet(self.0 | other.0)
-    }
-
-    pub const fn without(self, other: ButtonSet) -> ButtonSet {
-        ButtonSet(self.0 & !other.0)
-    }
-
-    /// Each button in the set, left first.
-    pub fn each(self) -> impl Iterator<Item = Button> {
-        Button::ALL.into_iter().filter(move |b| self.has(*b))
-    }
-}
-
-impl From<lumen_input::Buttons> for ButtonSet {
-    fn from(b: lumen_input::Buttons) -> ButtonSet {
-        use lumen_input::Buttons as B;
-        [B::LEFT, B::RIGHT, B::MIDDLE, B::SIDE, B::EXTRA]
-            .into_iter()
-            .zip(Button::ALL)
-            .filter(|(input, _)| b.contains(*input))
-            .fold(ButtonSet::NONE, |set, (_, ours)| set.with(ours.into()))
-    }
-}
-
 /// One pointer event as the window manager takes it: where the pointer is
 /// and what is held after a whole frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Pointer {
     pub x: i32,
     pub y: i32,
-    pub buttons: ButtonSet,
+    pub buttons: Buttons,
     /// Frames may have been lost at the device just before this one
     /// (`PointerEvent::after_overrun`, #151): handled as a gap
     /// ([`Wm::interrupt`] with [`Interruption::Gap`]) before this event.
@@ -134,16 +60,15 @@ pub struct Pointer {
 
 impl Pointer {
     /// The pointer at (`x`, `y`) holding `buttons`.
-    pub const fn at(x: i32, y: i32, buttons: ButtonSet) -> Pointer {
+    pub const fn at(x: i32, y: i32, buttons: Buttons) -> Pointer {
         Pointer { x, y, buttons, after_overrun: false }
     }
 
     /// A tablet state as the window manager takes it: the `usize`
-    /// position converted to `i32` (saturating), the buttons to a
-    /// [`ButtonSet`].
+    /// position converted to `i32` (saturating), the buttons as they are.
     pub fn from_state(s: &lumen_input::PointerState, after_overrun: bool) -> Pointer {
         let c = |v: usize| i32::try_from(v).unwrap_or(i32::MAX);
-        Pointer { x: c(s.x), y: c(s.y), buttons: s.buttons.into(), after_overrun }
+        Pointer { x: c(s.x), y: c(s.y), buttons: s.buttons, after_overrun }
     }
 
     /// A frame as the pointer ring's reader got it (#151): its state, and a
@@ -166,13 +91,13 @@ pub enum Delivery {
         x: i32,
         y: i32,
         button: Button,
-        buttons: ButtonSet,
+        buttons: Buttons,
     },
     PointerMove {
         window: WindowId,
         x: i32,
         y: i32,
-        buttons: ButtonSet,
+        buttons: Buttons,
     },
     /// `button` came up; `buttons` is what is still held (without it).
     PointerUp {
@@ -180,7 +105,7 @@ pub enum Delivery {
         x: i32,
         y: i32,
         button: Button,
-        buttons: ButtonSet,
+        buttons: Buttons,
     },
     FocusGained(WindowId),
     FocusLost(WindowId),
@@ -333,7 +258,7 @@ pub struct Wm {
     windows: Vec<Window>,
     next_id: u32,
     focused: Option<WindowId>,
-    held: ButtonSet,
+    held: Buttons,
     last: (i32, i32),
     gesture: Gesture,
     /// Between [`Wm::interrupt`] with a pause and [`Wm::resume`].
@@ -351,7 +276,7 @@ impl Wm {
             windows: Vec::new(),
             next_id: 1,
             focused: None,
-            held: ButtonSet::NONE,
+            held: Buttons::NONE,
             last: (0, 0),
             gesture: Gesture::None,
             paused: false,
@@ -392,7 +317,7 @@ impl Wm {
     }
 
     /// The buttons held, as of the last pointer event (or the resume).
-    pub fn buttons(&self) -> ButtonSet {
+    pub fn buttons(&self) -> Buttons {
         self.held
     }
 
@@ -553,7 +478,7 @@ impl Wm {
     /// until a pointer event reports every button up. The focused window,
     /// as it is now, is told `FocusGained`. Without a pause before, it
     /// does nothing.
-    pub fn resume(&mut self, baseline: ButtonSet) -> Outcome {
+    pub fn resume(&mut self, baseline: Buttons) -> Outcome {
         let mut out = Outcome::default();
         if !self.paused {
             return out;

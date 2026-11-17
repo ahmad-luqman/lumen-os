@@ -111,7 +111,28 @@ impl AbsAxis {
     }
 }
 
-/// The buttons held down.
+/// One pointer button, in [`Buttons`]' bit order (left first).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Button {
+    Left,
+    Right,
+    Middle,
+    Side,
+    Extra,
+}
+
+impl Button {
+    pub const ALL: [Button; 5] = [Button::Left, Button::Right, Button::Middle, Button::Side, Button::Extra];
+}
+
+impl From<Button> for Buttons {
+    fn from(b: Button) -> Buttons {
+        Buttons(1 << b as u8)
+    }
+}
+
+/// The buttons held down, one bit per [`Button`]: the tablet's state and
+/// the desktop's window manager both use this set.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct Buttons(u8);
 
@@ -145,8 +166,34 @@ impl Buttons {
         Some((i, Buttons::NAMES[i].0))
     }
 
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
     pub const fn contains(self, other: Buttons) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    /// Whether `b` is held.
+    pub fn has(self, b: Button) -> bool {
+        self.contains(b.into())
+    }
+
+    pub const fn with(self, other: Buttons) -> Buttons {
+        Buttons(self.0 | other.0)
+    }
+
+    pub const fn without(self, other: Buttons) -> Buttons {
+        Buttons(self.0 & !other.0)
+    }
+
+    /// Each button in the set, left first.
+    pub fn each(self) -> impl Iterator<Item = Button> {
+        Button::ALL.into_iter().filter(move |b| self.has(*b))
     }
 
     fn set(&mut self, b: Buttons, down: bool) {
@@ -485,6 +532,26 @@ mod tests {
         // (each its own sequence number).
         assert_eq!(feed_all(&mut t, &[abs(ABS_X, 0), SYN]), [PointerState { x: 0, seq: 2, ..s }]);
         assert_eq!(feed_all(&mut t, &[SYN]), [PointerState { x: 0, seq: 3, ..s }]);
+    }
+
+    #[test]
+    fn each_button_is_its_own_bit_in_the_named_order() {
+        // The desktop's window manager speaks `Button`s and the tablet
+        // `Buttons`' constants: one set for both (#172), so each `Button`
+        // must be exactly the constant of its name, and the set ops agree.
+        let named = [Buttons::LEFT, Buttons::RIGHT, Buttons::MIDDLE, Buttons::SIDE, Buttons::EXTRA];
+        for (b, set) in Button::ALL.into_iter().zip(named) {
+            assert_eq!(Buttons::from(b), set, "{b:?}");
+            assert!(set.has(b) && !set.is_empty(), "{b:?}");
+            assert_eq!(set.each().collect::<Vec<_>>(), [b]);
+            assert_eq!(Buttons::NONE.with(set).without(set), Buttons::NONE);
+        }
+        assert!(Buttons::NONE.is_empty() && Buttons::NONE.each().next().is_none());
+        let lr = Buttons::LEFT.with(Buttons::RIGHT);
+        assert_eq!(lr.bits(), 0b11);
+        assert_eq!(lr.each().collect::<Vec<_>>(), [Button::Left, Button::Right]);
+        assert_eq!(lr.without(Buttons::LEFT), Buttons::RIGHT);
+        assert!(lr.contains(Buttons::RIGHT) && !lr.contains(Buttons::MIDDLE));
     }
 
     #[test]

@@ -5,7 +5,8 @@
 //! [`Outcome`]: crate::Outcome
 
 use crate::queue::{Entry, EventQueue, KeyLike, Pushed};
-use crate::wm::{Button, ButtonSet, Delivery};
+use crate::wm::Delivery;
+use lumen_input::{Button, Buttons};
 
 /// A pointer event as a window's queue holds it (client coordinates).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,19 +16,19 @@ pub enum PointerEntry {
         x: i32,
         y: i32,
         button: Button,
-        buttons: ButtonSet,
+        buttons: Buttons,
     },
     Move {
         x: i32,
         y: i32,
-        buttons: ButtonSet,
+        buttons: Buttons,
     },
     /// `button` came up; `buttons` is what is still held (without it).
     Up {
         x: i32,
         y: i32,
         button: Button,
-        buttons: ButtonSet,
+        buttons: Buttons,
     },
 }
 
@@ -87,12 +88,12 @@ mod tests {
     #[test]
     fn every_delivery_lands_on_the_queue_exactly() {
         let w = WindowId::first();
-        let (l, lr) = (Button::Left, ButtonSet::LEFT.with(ButtonSet::RIGHT));
+        let (l, lr) = (Button::Left, Buttons::LEFT.with(Buttons::RIGHT));
         let mut q = Q::new();
         // Pointer events are pushed whole (coordinates and buttons kept).
         let down = Delivery::PointerDown { window: w, x: 3, y: -7, button: l, buttons: lr };
         let mv = Delivery::PointerMove { window: w, x: -2, y: 9, buttons: lr };
-        let up = Delivery::PointerUp { window: w, x: 5, y: 6, button: l, buttons: ButtonSet::RIGHT };
+        let up = Delivery::PointerUp { window: w, x: 5, y: 6, button: l, buttons: Buttons::RIGHT };
         assert_eq!(deliver(&mut q, &down), Some(Pushed::Queued));
         assert_eq!(deliver(&mut q, &mv), Some(Pushed::Queued));
         assert_eq!(deliver(&mut q, &up), Some(Pushed::Queued));
@@ -101,7 +102,7 @@ mod tests {
             [
                 Next::Event(Entry::Pointer(PointerEntry::Down { x: 3, y: -7, button: l, buttons: lr })),
                 Next::Event(Entry::Pointer(PointerEntry::Move { x: -2, y: 9, buttons: lr })),
-                Next::Event(Entry::Pointer(PointerEntry::Up { x: 5, y: 6, button: l, buttons: ButtonSet::RIGHT })),
+                Next::Event(Entry::Pointer(PointerEntry::Up { x: 5, y: 6, button: l, buttons: Buttons::RIGHT })),
             ]
         );
         // Each of the rest sets its own flag and pushes nothing.
@@ -124,9 +125,9 @@ mod tests {
     fn a_delivery_names_its_window() {
         let w = WindowId::first();
         for d in [
-            Delivery::PointerDown { window: w, x: 0, y: 0, button: Button::Left, buttons: ButtonSet::LEFT },
-            Delivery::PointerMove { window: w, x: 0, y: 0, buttons: ButtonSet::NONE },
-            Delivery::PointerUp { window: w, x: 0, y: 0, button: Button::Left, buttons: ButtonSet::NONE },
+            Delivery::PointerDown { window: w, x: 0, y: 0, button: Button::Left, buttons: Buttons::LEFT },
+            Delivery::PointerMove { window: w, x: 0, y: 0, buttons: Buttons::NONE },
+            Delivery::PointerUp { window: w, x: 0, y: 0, button: Button::Left, buttons: Buttons::NONE },
             Delivery::FocusGained(w),
             Delivery::FocusLost(w),
             Delivery::Lost(w),

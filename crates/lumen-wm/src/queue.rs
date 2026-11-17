@@ -46,7 +46,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::route::PointerEntry;
-use crate::wm::Button;
+use lumen_input::Button;
 
 /// Entries the queue holds.
 pub const CAPACITY: usize = 64;
@@ -458,7 +458,7 @@ fn remove<T: PartialEq>(set: &mut Vec<T>, x: T) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wm::ButtonSet;
+    use lumen_input::Buttons;
 
     /// A key event: its code, and whether it is a press.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -484,7 +484,7 @@ mod tests {
         Entry::Key(Key(k, false))
     }
     fn mv(x: i32) -> E {
-        Entry::Pointer(PointerEntry::Move { x, y: 0, buttons: ButtonSet::NONE })
+        Entry::Pointer(PointerEntry::Move { x, y: 0, buttons: Buttons::NONE })
     }
     fn ask(i: u32) -> E {
         Entry::Request(i)
@@ -493,7 +493,7 @@ mod tests {
         Entry::Pointer(PointerEntry::Down { x: 0, y: 0, button: b, buttons: b.into() })
     }
     fn bup(b: Button) -> E {
-        Entry::Pointer(PointerEntry::Up { x: 0, y: 0, button: b, buttons: ButtonSet::NONE })
+        Entry::Pointer(PointerEntry::Up { x: 0, y: 0, button: b, buttons: Buttons::NONE })
     }
 
     fn drain(q: &mut Q) -> Vec<Next<E>> {

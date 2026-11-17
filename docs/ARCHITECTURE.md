@@ -3310,9 +3310,11 @@ Moves with no button held aren't delivered (no hover in M4).
   may hang off the left, right or bottom edge, never the top);
   `Pointer::from_read` takes a pointer ring's read (#151): the tablet's
   `usize` position (saturating, through `Pointer::from_state`), its
-  buttons (`lumen_input::Buttons` into `ButtonSet`, still two types: the
-  merge into one is #172, in its own PR before #155) and `Read::gap()` (a gap in the ring
-  or `after_overrun`, handled before the event).
+  buttons as they are (`lumen_input::Buttons`, the one button set the
+  tablet and the window manager share, with `lumen_input::Button` for one
+  button; #172 merged lumen-wm's own `ButtonSet` into it) and
+  `Read::gap()` (a gap in the ring or `after_overrun`, handled before the
+  event).
 - **Geometry** (`Metrics::DESKTOP`): a 24-row title bar spanning the
   frame (the side borders' top rows are title bar), 1-pixel borders, a
   16-pixel close box 4 pixels in from the right border; a moved frame
