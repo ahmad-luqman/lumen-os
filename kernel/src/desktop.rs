@@ -54,11 +54,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use lumen_gfx::{Damage, Mask, Rect, Surface, Target};
 use lumen_input::cursor::{SPRITE_H, SPRITE_W, draw_arrow};
-use lumen_input::{KeyAction, KeyEvent, PointerEvent, Read, Reader, Seq};
+use lumen_input::{Button, Buttons, KeyAction, KeyEvent, PointerEvent, Read, Reader, Seq};
 use lumen_png::encode::Rows;
 use lumen_wm::{
-    Button, ButtonSet, Entry, EventQueue, Interruption, Metrics, Next, Outcome, Pointer, PointerEntry, Pushed,
-    QueueCounts, Theme, WindowId, Wm,
+    Entry, EventQueue, Interruption, Metrics, Next, Outcome, Pointer, PointerEntry, Pushed, QueueCounts, Theme,
+    WindowId, Wm,
 };
 use noto_sans_mono_bitmap::{FontWeight, RasterHeight, get_raster, get_raster_width};
 
@@ -133,18 +133,18 @@ pub enum WindowEvent {
         x: i32,
         y: i32,
         button: Button,
-        buttons: ButtonSet,
+        buttons: Buttons,
     },
     PointerMove {
         x: i32,
         y: i32,
-        buttons: ButtonSet,
+        buttons: Buttons,
     },
     PointerUp {
         x: i32,
         y: i32,
         button: Button,
-        buttons: ButtonSet,
+        buttons: Buttons,
     },
     FocusGained,
     /// Lost the focus: every key and button counts as released.
@@ -1098,7 +1098,7 @@ impl Compositor {
                 self.keys.skip_to(marks.keys);
                 self.pointer_queue.retain(|r| cut.after_resume_pointer(r.seq));
                 self.key_queue.retain(|r| cut.after_resume_key(r.seq));
-                let out = s.wm.resume(cut.baseline().into());
+                let out = s.wm.resume(cut.baseline());
                 s.apply(out, after);
                 self.screen = Some(screen);
                 self.shown = true;
@@ -2242,19 +2242,19 @@ crate::ktest!(
         let mut s = State::new(1280, 800);
         let (id, _) = s.wm.open("w", 200, 100, 100, 100);
         let frame = s.wm.window(id).ok_or("no window")?.frame();
-        let _ = s.wm.resume(ButtonSet::LEFT);
+        let _ = s.wm.resume(Buttons::LEFT);
         let bar = (frame.x() + 50, frame.y() + 10);
         let ignored = s.wm.counts().ignored_presses;
-        let out = s.wm.pointer(Pointer::at(bar.0, bar.1, ButtonSet::LEFT));
+        let out = s.wm.pointer(Pointer::at(bar.0, bar.1, Buttons::LEFT));
         kassert!(out.deliveries.is_empty());
-        let _ = s.wm.pointer(Pointer::at(bar.0 + 40, bar.1 + 40, ButtonSet::LEFT));
-        let _ = s.wm.pointer(Pointer::at(bar.0 + 40, bar.1 + 40, ButtonSet::LEFT.with(ButtonSet::RIGHT)));
+        let _ = s.wm.pointer(Pointer::at(bar.0 + 40, bar.1 + 40, Buttons::LEFT));
+        let _ = s.wm.pointer(Pointer::at(bar.0 + 40, bar.1 + 40, Buttons::LEFT.with(Buttons::RIGHT)));
         kassert_eq!(s.wm.dragging(), None);
         kassert_eq!(s.wm.window(id).ok_or("no window")?.frame(), frame);
         kassert_eq!(s.wm.counts().ignored_presses, ignored + 1);
-        let _ = s.wm.pointer(Pointer::at(bar.0 + 40, bar.1 + 40, ButtonSet::NONE));
-        let _ = s.wm.pointer(Pointer::at(bar.0, bar.1, ButtonSet::LEFT));
-        let _ = s.wm.pointer(Pointer::at(bar.0 + 10, bar.1 + 20, ButtonSet::LEFT));
+        let _ = s.wm.pointer(Pointer::at(bar.0 + 40, bar.1 + 40, Buttons::NONE));
+        let _ = s.wm.pointer(Pointer::at(bar.0, bar.1, Buttons::LEFT));
+        let _ = s.wm.pointer(Pointer::at(bar.0 + 10, bar.1 + 20, Buttons::LEFT));
         kassert_eq!(s.wm.dragging(), Some(id));
         kassert_eq!(s.wm.window(id).ok_or("no window")?.frame().x(), frame.x() + 10);
         Ok(())
