@@ -163,6 +163,64 @@ fn a_drag_is_clamped_to_keep_a_strip_of_the_title_bar_on_screen() {
 }
 
 #[test]
+fn releasing_the_left_button_ends_a_drag_even_with_another_held() {
+    let mut wm = wm();
+    let a = open(&mut wm, 5, 5, 10, 8);
+    let b = open(&mut wm, 25, 15, 8, 8);
+    wm.focus(a);
+    // Left on A's title bar, right pressed too, left released.
+    wm.pointer(at(7, 6, L));
+    assert_eq!(wm.pointer(at(9, 7, L.with(R))).deliveries, []);
+    let moved = frame(&wm, a);
+    assert_eq!(wm.pointer(at(9, 7, R)), Outcome::default());
+    assert_eq!(wm.dragging(), None);
+    // Moves with only the right button held move nothing, even over B's
+    // client, and its release goes nowhere.
+    let bc = wm.client(b).expect("open");
+    assert_eq!(wm.pointer(at(bc.x() + 1, bc.y() + 1, R)), Outcome::default());
+    assert_eq!(wm.pointer(at(bc.x() + 1, bc.y() + 1, NONE)), Outcome::default());
+    assert_eq!(frame(&wm, a), moved);
+    // Then a press on B's client is B's.
+    assert!(wm.pointer(at(bc.x() + 1, bc.y() + 1, L)).deliveries.contains(&Delivery::PointerDown {
+        window: b,
+        x: 1,
+        y: 1,
+        button: L,
+        buttons: L
+    }));
+}
+
+#[test]
+fn a_grab_lasts_until_its_last_button_is_released() {
+    let mut wm = wm();
+    let a = open(&mut wm, 5, 5, 10, 8);
+    let b = open(&mut wm, 25, 15, 8, 8);
+    wm.focus(a);
+    let c = wm.client(a).expect("open");
+    let bc = wm.client(b).expect("open");
+    wm.pointer(at(c.x(), c.y(), L));
+    wm.pointer(at(c.x(), c.y(), L.with(R)));
+    // Left released: A is told, and still holds the grab (it was told of
+    // the right press, so it must be told of its release too).
+    assert_eq!(
+        wm.pointer(at(c.x(), c.y(), R)).deliveries,
+        [Delivery::PointerUp { window: a, x: 0, y: 0, button: L, buttons: R }]
+    );
+    assert_eq!(wm.grabbing(), Some(a));
+    // A move over B's client with the right button held is A's.
+    let (dx, dy) = (bc.x() - c.x(), bc.y() - c.y());
+    assert_eq!(
+        wm.pointer(at(bc.x(), bc.y(), R)).deliveries,
+        [Delivery::PointerMove { window: a, x: dx, y: dy, buttons: R }]
+    );
+    assert_eq!(
+        wm.pointer(at(bc.x(), bc.y(), NONE)).deliveries,
+        [Delivery::PointerUp { window: a, x: dx, y: dy, button: R, buttons: NONE }]
+    );
+    assert_eq!(wm.grabbing(), None);
+}
+
+#[test]
 fn a_release_outside_the_screen_ends_the_drag_clamped() {
     let mut wm = wm();
     let a = open(&mut wm, 5, 5, 10, 8);
@@ -560,6 +618,10 @@ fn repainting_only_the_damage_matches_repainting_everything() {
                 }
             }
             assert_eq!(screen, full(&wm), "seed {seed:#x} step {step}: damage missed a change");
+            // A drag lasts only while the left button is held.
+            if wm.dragging().is_some() {
+                assert!(wm.buttons().contains(L), "seed {seed:#x} step {step}: a drag without the left button");
+            }
             // Exactly one window is focused (the one in front), or none.
             assert_eq!(wm.focused(), wm.windows().last().map(|w| w.id()), "seed {seed:#x} step {step}");
             // Hit testing agrees with the picture.

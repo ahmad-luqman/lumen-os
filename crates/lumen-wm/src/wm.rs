@@ -221,15 +221,20 @@ impl Window {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Gesture {
     None,
-    /// A press on a title bar: moves move the window, keeping the pointer
-    /// at (`dx`, `dy`) from the frame's corner.
+    /// A left press on a title bar: moves move the window, keeping the
+    /// pointer at (`dx`, `dy`) from the frame's corner, until the left
+    /// button is released (other buttons held then are ignored until they
+    /// are up too).
     Drag {
         id: WindowId,
         dx: i32,
         dy: i32,
     },
     /// A press on a client area: every button change and move goes to
-    /// that window (the implicit grab).
+    /// that window (the implicit grab), until the last button is released.
+    /// It doesn't end at the first button's release: the window was told
+    /// of every press since, so each release must reach it too, or it
+    /// would hold a button for good.
     Grab {
         id: WindowId,
     },
@@ -491,6 +496,7 @@ impl Wm {
                         out.deliveries.push(Delivery::PointerUp { window: id, x, y, button: b, buttons: self.held });
                     }
                 }
+                Gesture::Drag { .. } if b == ButtonSet::LEFT => self.gesture = Gesture::Ignore,
                 Gesture::CloseBox { id } if b == ButtonSet::LEFT => {
                     if self.hit(p.x, p.y) == Hit::Window(id, Part::CloseBox) {
                         out.deliveries.push(Delivery::Close(id));

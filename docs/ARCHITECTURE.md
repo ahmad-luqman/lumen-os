@@ -3102,12 +3102,14 @@ frame rectangle, client rectangle derived from it) in stacking order;
 hit testing front to back (title bar, close box, client area, desktop);
 focus (a click on a window focuses and raises it; closing the focused one
 focuses the next one down; exactly one is focused unless there are none);
-the drag state machine over pointer events (a press on a title bar starts
-it, moves move the frame, clamped so a strip of the title bar stays on the
-screen, and the release ends it); and the implicit grab (a press on a
-client area, the moves while that button is down, and its release go to
-that window, in client coordinates; other buttons pressed meanwhile go
-there too). A left press on the close box and its release over it is a
+the drag state machine over pointer events (a left press on a title bar
+starts it, moves move the frame, clamped so a strip of the title bar stays
+on the screen, and the left button's release ends it; other buttons held
+then are ignored until they are up); and the implicit grab (a press on a
+client area, the moves while it is down, and its release go to that
+window, in client coordinates; other buttons pressed meanwhile go there
+too, and the grab lasts until the last of them is released, since the
+window was told of each press and must be told of each release). A left press on the close box and its release over it is a
 `Close` for the window; the owner decides, and `Wm::close` removes it. A
 press on the desktop or a border (or with another button on a title bar
 or close box) does nothing until every button is up. Moves with no button
