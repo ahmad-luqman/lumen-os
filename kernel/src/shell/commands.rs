@@ -75,6 +75,13 @@ pub static COMMANDS: Table<Run> = Table(&[
         run: crate::screenshot::command,
     },
     Command {
+        name: "font",
+        args: &[],
+        usage: "",
+        about: "render the desktop font's sample twice: timings, cache, golden check",
+        run: crate::font::command,
+    },
+    Command {
         name: "mandelbrot",
         args: &[],
         usage: "",
