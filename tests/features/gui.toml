@@ -1,16 +1,17 @@
 # Features: gui (M4's desktop). See tests/features/README.md for the format.
 
 [[feature]]
-name = "Anti-aliased TrueType text (lumen-font, #148): fontdue 0.9.5 without `simd`, linked into both kernels with the flag audit passing; the embedded UI font (Atkinson Hyperlegible, SIL OFL) parses; glyphs cached by (glyph, pixel size) within a byte bound (coverage plus a fixed overhead per glyph), the least recently used evicted first, agreeing with a model LRU on random lookups; a cached glyph is never rasterized again (a second render of a line rasterizes nothing), and a glyph bigger than the whole bound is drawn without being cached; one-line layout on whole pixels (pen in 64ths, nearest pixel; kerning from a `kern` table, which this font lacks, so its text is unkerned), `measure` (advance width, ascent, descent) agreeing with the layout and rasterizing nothing; a line composited into one mask (each pixel the highest coverage of any glyph); the sample's mask matches a checked-in golden on the host and, byte for byte, in the kernel"
+name = "Anti-aliased TrueType text (lumen-font, #148): fontdue 0.9.5 without `simd`, linked into both kernels with the flag audit passing; the embedded UI font (Atkinson Hyperlegible, SIL OFL) parses, its bytes unchanged (FNV-1a pinned); one parsed face shared, read-only, with a glyph cache per user; glyphs cached by (glyph, pixel size) within a byte bound (coverage plus a fixed charge per glyph), the least recently used evicted first, agreeing with a model LRU on random lookups; a cache hit never rasterizes (a second render of a line rasterizes nothing), and a glyph bigger than the whole bound is drawn without being cached; a glyph number past the face's end is its missing-glyph box, never a panic; characters the face lacks draw that box and are counted; one-line layout on whole pixels (pen in 64ths, nearest pixel), with kerning from a `kern` table moving only the adjacent pair (checked on a fixture: the embedded font kerns only in GPOS, which fontdue doesn't read, so its own text is unkerned); `measure` (advance width, ascent, descent) agreeing with the layout and rasterizing nothing; a line composited into one mask allocated once from the metrics (each pixel the highest coverage of any glyph; negative x and overlapping glyphs included), refused past a width limit; the sample's mask matches a checked-in golden on the host, and in the booted and ktest kernels its 64-bit hash equals the golden's"
 milestone = "M4"
 tests = [
     "cargo:lumen-font",
     "audit:flags",
     "ktest:lumen_kernel::font::renders_and_caches",
+    "scenario:test_font::test_font_command_renders_the_golden_and_caches",
 ]
 
 [[feature]]
-name = "`font` renders the desktop font's sample twice in the booted kernel: the face's name and glyph count, how long parsing and each render took, the glyphs rasterized the first time and none the second, the cache's counters and bytes, and the mask's hash, the host's golden"
+name = "`font` renders the desktop font's sample twice in the booted kernel: the face's name and glyph count, how long parsing took on first use (the face parsed once and shared after), how long each render took, the glyphs rasterized the first time and none the second, the cache's counters and bytes, and the mask's hash, the host's golden"
 milestone = "M4"
 tests = [
     "scenario:test_font::test_font_command_renders_the_golden_and_caches",

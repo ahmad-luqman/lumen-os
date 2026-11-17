@@ -1,6 +1,7 @@
-//! A parsed face: `fontdue`'s font behind integer metrics.
+//! A parsed face: `fontdue`'s font behind integer metrics, and the pen that
+//! lays a line out on it.
 
-use crate::Px;
+use crate::{Measure, Px};
 use alloc::vec::Vec;
 use core::fmt;
 use fontdue::{Font as Fontdue, FontSettings};
@@ -25,39 +26,39 @@ pub struct LineMetrics {
     pub line_gap: i32,
 }
 
-/// One rasterized glyph: its coverage mask, where the mask sits against
-/// the pen (`left` pixels right of it, its top row `top` pixels above the
-/// baseline) and how far the pen moves after it, in 64ths of a pixel.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Glyph {
-    pub width: u16,
-    pub height: u16,
-    pub left: i16,
-    pub top: i16,
-    pub advance: i32,
-    coverage: Vec<u8>,
+/// One rasterized glyph: its coverage mask (`width * height` bytes,
+/// row-major; none for a glyph without ink, such as a space) and where it
+/// sits against the pen: `left` pixels right of it, its top row `top`
+/// pixels above the baseline. Only the cache and the layout see these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Glyph {
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) left: i16,
+    pub(crate) top: i16,
+    pub(crate) coverage: Vec<u8>,
 }
 
-impl Glyph {
-    /// `width * height` coverage bytes, row-major (empty for a glyph
-    /// without ink, such as a space).
-    pub fn coverage(&self) -> &[u8] {
-        &self.coverage
-    }
+/// Where a glyph's ink goes against the pen, from the metrics alone: the
+/// same box [`Face::rasterize`] fills (a host test checks every glyph).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InkBox {
+    pub(crate) left: i32,
+    pub(crate) top: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
-impl fmt::Debug for Glyph {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Glyph")
-            .field("width", &self.width)
-            .field("height", &self.height)
-            .field("left", &self.left)
-            .field("top", &self.top)
-            .field("advance", &self.advance)
-            .finish_non_exhaustive()
-    }
+// How many glyphs this thread has rasterized: the tests' proof that a cache
+// hit rasterizes nothing.
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static RASTERIZED: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
 }
 
+/// A parsed face. Immutable once parsed, so one face can be shared (behind
+/// a `&`) by every thread drawing text, each with its own glyph cache
+/// ([`crate::Font`]).
 pub struct Face {
     font: Fontdue,
 }
@@ -70,17 +71,23 @@ impl fmt::Debug for Face {
 
 impl Face {
     /// Parse a face. `fontdue` reads every glyph's outline now, so this is
-    /// the slow part of loading a font (soft-float in the kernel).
+    /// the slow part of loading a font (soft-float in the kernel: about
+    /// 60 ms for [`crate::UI_FONT`] under QEMU's TCG).
     pub fn parse(data: &[u8]) -> Result<Face, Error> {
         let settings = FontSettings {
             collection_index: 0,
-            // The size outlines are flattened for: text on the desktop is
-            // 12 to 32 pixels.
-            scale: 24.0,
+            // The size outlines are flattened for: the top of the desktop's
+            // 12 to 32 pixels, so the largest text keeps smooth curves.
+            scale: 32.0,
             // No GSUB substitutions: nothing shapes text yet.
             load_substitutions: false,
         };
         Fontdue::from_bytes(data, settings).map(|font| Face { font }).map_err(Error)
+    }
+
+    /// [`crate::UI_FONT`].
+    pub fn ui() -> Result<Face, Error> {
+        Face::parse(crate::UI_FONT)
     }
 
     /// The face's full name, if it has one.
@@ -106,37 +113,120 @@ impl Face {
         }
     }
 
+    /// `text`'s size as one line at `px`, from the metrics alone (nothing
+    /// is rasterized, and no cache is needed). It agrees with
+    /// [`crate::Font::render`]: both lay the line out with [`Face::layout`].
+    pub fn measure(&self, text: &str, px: Px) -> Measure {
+        let metrics = self.line_metrics(px);
+        let pen = self.layout(text, px, |_, _| ());
+        Measure { width: pen.width(), ascent: metrics.ascent, descent: metrics.descent }
+    }
+
+    /// Lay `text` out as one line at `px`: call `each` with every
+    /// character's glyph and the whole pixel its origin goes on, left to
+    /// right, and return the pen where the line ends. The one layout that
+    /// measuring, rendering and compositing share.
+    pub(crate) fn layout(&self, text: &str, px: Px, mut each: impl FnMut(u16, i32)) -> Pen {
+        let mut pen = Pen::default();
+        for c in text.chars() {
+            let glyph = self.glyph_index(c);
+            let at = pen.kern_to(self, glyph, px);
+            each(glyph, at);
+            pen.advance(self.advance(glyph, px));
+        }
+        pen
+    }
+
+    /// `glyph` if the face has it, else 0 (the missing-glyph box): fontdue
+    /// indexes its glyphs without checking, and panics past the end.
+    fn checked(&self, glyph: u16) -> u16 {
+        if glyph < self.glyph_count() { glyph } else { 0 }
+    }
+
     /// How far the pen moves after `glyph` at `px`, in 64ths of a pixel,
     /// from the metrics alone (nothing rasterized).
-    pub fn advance(&self, glyph: u16, px: Px) -> i32 {
-        to_64ths(self.font.metrics_indexed(glyph, f32::from(px.get())).advance_width)
+    pub(crate) fn advance(&self, glyph: u16, px: Px) -> i32 {
+        to_64ths(self.font.metrics_indexed(self.checked(glyph), f32::from(px.get())).advance_width)
+    }
+
+    /// Where `glyph`'s ink goes at `px`, from the metrics alone.
+    pub(crate) fn ink_box(&self, glyph: u16, px: Px) -> InkBox {
+        let m = self.font.metrics_indexed(self.checked(glyph), f32::from(px.get()));
+        let (width, height) = (m.width as u32, m.height as u32);
+        if width == 0 || height == 0 || width > u32::from(u16::MAX) || height > u32::from(u16::MAX) {
+            return InkBox { left: m.xmin, top: m.ymin, width: 0, height: 0 };
+        }
+        InkBox { left: m.xmin, top: m.ymin.saturating_add(height as i32), width, height }
     }
 
     /// The kerning between `left` and `right` at `px`, in 64ths of a pixel
-    /// (0 if the face's `kern` table has no pair for them).
-    pub fn kern(&self, left: u16, right: u16, px: Px) -> i32 {
+    /// (0 if the face's `kern` table has no pair for them, or it has no
+    /// `kern` table: `fontdue` doesn't read `GPOS`).
+    pub(crate) fn kern(&self, left: u16, right: u16, px: Px) -> i32 {
         self.font.horizontal_kern_indexed(left, right, f32::from(px.get())).map_or(0, to_64ths)
     }
 
     /// Rasterize `glyph` at `px` (the slow path the cache saves).
-    pub fn rasterize(&self, glyph: u16, px: Px) -> Glyph {
-        let (metrics, coverage) = self.font.rasterize_indexed(glyph, f32::from(px.get()));
-        // A glyph is at most a few em squares wide, and an em is at most
-        // MAX_PX pixels, so each of these fits; saturate rather than wrap
-        // if a broken face says otherwise.
-        let width = u16::try_from(metrics.width).unwrap_or(0);
-        let height = u16::try_from(metrics.height).unwrap_or(0);
-        let coverage = if usize::from(width) * usize::from(height) == coverage.len() { coverage } else { Vec::new() };
-        let (width, height) = if coverage.is_empty() { (0, 0) } else { (width, height) };
+    pub(crate) fn rasterize(&self, glyph: u16, px: Px) -> Glyph {
+        #[cfg(test)]
+        RASTERIZED.with(|n| n.set(n.get() + 1));
+        let (metrics, coverage) = self.font.rasterize_indexed(self.checked(glyph), f32::from(px.get()));
+        // fontdue's mask is width * height bytes. A glyph is at most a few
+        // em squares wide and an em at most MAX_PX pixels, so both fit u16;
+        // if a broken face says otherwise, the glyph draws without ink.
+        debug_assert_eq!(metrics.width * metrics.height, coverage.len());
+        let (width, height, coverage) = match (u16::try_from(metrics.width), u16::try_from(metrics.height)) {
+            (Ok(w), Ok(h)) if w > 0 && h > 0 => (w, h, coverage),
+            _ => (0, 0, Vec::new()),
+        };
         Glyph {
             width,
             height,
             left: saturate_i16(metrics.xmin),
             // `ymin` is the mask's bottom row's offset above the baseline.
             top: saturate_i16(metrics.ymin.saturating_add(i32::from(height))),
-            advance: to_64ths(metrics.advance_width),
             coverage,
         }
+    }
+}
+
+/// The pen moving along a line, in 64ths of a pixel.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Pen {
+    at: i64,
+    previous: Option<u16>,
+}
+
+impl Pen {
+    /// Kern from the previous glyph to `glyph`, and return the whole pixel
+    /// `glyph`'s origin goes on.
+    pub(crate) fn kern_to(&mut self, face: &Face, glyph: u16, px: Px) -> i32 {
+        let kern = self.previous.map_or(0, |left| face.kern(left, glyph, px));
+        self.previous = Some(glyph);
+        self.kern(kern)
+    }
+
+    /// Move by `kern` 64ths (before a glyph) and return the whole pixel
+    /// nearest the pen (halves round up).
+    pub(crate) fn kern(&mut self, kern: i32) -> i32 {
+        self.at += i64::from(kern);
+        i32::try_from((self.at + 32).div_euclid(64)).unwrap_or(i32::MAX)
+    }
+
+    /// Move by a glyph's advance, in 64ths.
+    pub(crate) fn advance(&mut self, advance: i32) {
+        self.at += i64::from(advance);
+    }
+
+    /// Where the pen is, in 64ths of a pixel.
+    pub(crate) fn at(&self) -> i64 {
+        self.at
+    }
+
+    /// Where the pen ended, in whole pixels, rounded up (0 if kerning took
+    /// it back past the start).
+    pub(crate) fn width(&self) -> u32 {
+        u32::try_from((self.at.max(0) + 63) / 64).unwrap_or(u32::MAX)
     }
 }
 
