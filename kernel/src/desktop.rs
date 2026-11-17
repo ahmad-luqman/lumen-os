@@ -1097,13 +1097,13 @@ impl fmt::Display for StartError {
     }
 }
 
-/// What `start` did.
+/// What `start` did: the desktop is shown, since now (started), again
+/// (resumed), or already.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Started {
-    Started,
+pub enum Shown {
+    Now,
     Resumed,
-    /// It was shown already.
-    Shown,
+    Already,
 }
 
 /// Set while a start or resume runs (two shells typing `desktop` at once:
@@ -1111,7 +1111,7 @@ pub enum Started {
 static START_BUSY: AtomicBool = AtomicBool::new(false);
 
 /// Start the desktop, or resume it (see the module doc).
-pub fn start() -> Result<Started, StartError> {
+pub fn start() -> Result<Shown, StartError> {
     if START_BUSY.swap(true, Ordering::AcqRel) {
         return Err(StartError::Screen(CanvasError::InUse));
     }
@@ -1120,7 +1120,7 @@ pub fn start() -> Result<Started, StartError> {
     result
 }
 
-fn start_or_resume() -> Result<Started, StartError> {
+fn start_or_resume() -> Result<Shown, StartError> {
     let state = COMPOSITOR.lock().as_ref().map(|s| s.owner);
     match state {
         Some(owner) => resume(owner),
@@ -1129,7 +1129,7 @@ fn start_or_resume() -> Result<Started, StartError> {
 }
 
 /// The first `desktop`.
-fn first_start() -> Result<Started, StartError> {
+fn first_start() -> Result<Shown, StartError> {
     let (w, h) = term::screen_size().ok_or(StartError::NoScreen)?;
     let (w, h) = (w as u32, h as u32);
     let back = Surface::with_stride(w, h, w as usize).ok_or(StartError::NoMemory)?;
@@ -1153,7 +1153,7 @@ fn first_start() -> Result<Started, StartError> {
             wake();
             open_demo_windows();
             log::info!(target: "desktop", "started on {w}x{h}");
-            Ok(Started::Started)
+            Ok(Shown::Now)
         }
         Err(e) => {
             if let Some(s) = COMPOSITOR.lock().as_mut() {
@@ -1170,9 +1170,9 @@ fn first_start() -> Result<Started, StartError> {
 }
 
 /// `desktop` while started: resume it if paused.
-fn resume(owner: Owner) -> Result<Started, StartError> {
+fn resume(owner: Owner) -> Result<Shown, StartError> {
     if vt::DESKTOP.load(Ordering::Acquire) {
-        return Ok(Started::Shown);
+        return Ok(Shown::Already);
     }
     // The compositor acts on the pause before this resume writes the next
     // cut, so the cut never needs more than its latest marks.
@@ -1190,7 +1190,7 @@ fn resume(owner: Owner) -> Result<Started, StartError> {
         s.screen = Some(screen);
     }
     wake();
-    Ok(Started::Resumed)
+    Ok(Shown::Resumed)
 }
 
 /// Start the desktop for the `lumen.desktop` boot flag (a warning if it
@@ -1602,11 +1602,11 @@ pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
     };
     match args {
         [] => match start() {
-            Ok(Started::Shown) => print(ctx, status_table()),
-            Ok(Started::Started) => {
+            Ok(Shown::Already) => print(ctx, status_table()),
+            Ok(Shown::Now) => {
                 let _ = writeln!(ctx.out, "desktop: started (Alt+F1 shows the terminals)");
             }
-            Ok(Started::Resumed) => {
+            Ok(Shown::Resumed) => {
                 let _ = writeln!(ctx.out, "desktop: resumed");
             }
             Err(e) => ctx.fail(format_args!("desktop: not started: {e}")),

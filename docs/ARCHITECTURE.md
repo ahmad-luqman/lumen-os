@@ -2937,13 +2937,22 @@ tree`, `ui invoke`).
   set while shown; it is set and cleared only under `crate::vt`'s router
   lock (by start, resume and Alt+F`n`), so each key is routed on one side
   of the change.
-- **The cut:** `vt::CUT`, a leaf lock, holds a generation that only grows,
-  whether the desktop is paused, both rings' `newest()` at the change, and
-  the buttons the pointer ring's newest frame holds then (the baseline
-  `Wm::resume` takes; captured here because the ring may overwrite that
-  frame before the compositor reads it). Pausing and resuming write it under the router lock, before any
-  later key is pushed; the compositor reads it each pass and moves its
-  readers (`Reader::skip_to`).
+- **The cut:** `vt::CUT`, a leaf lock, holds a generation that only grows
+  (one per change: 0 before the first start, odd while shown, even while
+  paused), both rings' `newest()` at the latest pause and at the latest
+  start or resume (`vt::Marks`, kept apart, so a compositor that sees a
+  resume and then a pause in one look still has the marks of each), the
+  buttons the pointer ring's newest frame holds at the latest start or
+  resume (the baseline `Wm::resume` takes; captured here because the ring
+  may overwrite that frame before the compositor reads it), and the
+  compositor's `term::Owner`. Pausing and resuming write it under the
+  router lock, before any later key is pushed; the compositor reads it
+  each pass, after reading both rings (so a pause written after that read
+  has marks past every event read: those were the desktop's), and moves
+  its readers (`Reader::skip_to`). A resume first waits (up to 5 s, else
+  `desktop: not started: the compositor hasn't caught up with the last
+  pause`) until the compositor has acted on the pause before it, so no
+  older marks are ever needed.
 - **Leaving: Alt+F1 to F4** show that terminal: the one exception to the
   canvas rules (today `term::show` refuses while a canvas is held, which
   `test_term` checks, and nothing redraws the header, drawn inline in
@@ -2962,9 +2971,13 @@ tree`, `ui invoke`).
      released, it sets `desktop::PENDING` and calls `desktop::wake()`.
 
   The compositor, reading the key ring, forwards the key events before
-  the Alt+F`n` press (which it recognises with the same predicate) and
-  never that press or anything after it, and the pointer events up to the
-  cut's pointer `Seq`. Then the focused window gets `FocusLost` (the
+  the Alt+F`n` press (which it recognises with the same predicate: a
+  barrier it holds back, events after it kept, until it reads the cut
+  that names it) and never that press or anything after it, and the
+  pointer events up to the cut's pointer `Seq`. So a window gets the Alt
+  press of Alt+F1 (then `FocusLost`, which releases it), never the F1
+  press or release; the terminal gets the F1 release and Alt's (which no
+  shell takes). Then the focused window gets `FocusLost` (the
   grabbing window, if any, is the focused one; `Wm::interrupt`), and
   nothing more is presented.
 - **Paused, not ended:** the windows live on (their threads keep running
@@ -3013,7 +3026,9 @@ until a crash.
   resume, a theme switch) copies 4 MiB, slow under TCG; everything else
   copies only what changed.
 - **Shell commands:**
-  - `desktop`: start or resume; while shown it prints `desktop status`.
+  - `desktop`: start or resume (`desktop: started (Alt+F1 shows the
+    terminals)`, `desktop: resumed`); while shown it prints `desktop
+    status`.
   - `desktop status`: one record, below.
   - `desktop check` (for the tests): the compositor runs it right after a
     pass: it recomposes the whole scene into a scratch surface (allocated
@@ -3053,13 +3068,17 @@ until a crash.
   | `cancelled`, `late` | `ui invoke` requests cancelled at their deadline, and results that came after it |
   | `settled` | `yes` or `no`, below |
 
-  **`settled`** is `yes` when all of these hold: the state is `shown`;
-  every byte the keyboard queued has been decoded (two atomic counters,
-  bytes queued and bytes decoded); both readers are at their ring's
-  `newest()`; no damage is gathered and no pass is running; no commit is
-  under way; every window's queue is idle (no entry and no flag) and its
-  owner is blocked in `wait_event` (an idle bit per window); and no request is `Pending` or
-  `Running`. A test first polls for the effect it expects (a `windows` row,
+  **`settled`** is `yes` when all of these hold: the state is `shown` and
+  the compositor has acted on the cut's generation; every byte the
+  keyboard queued has been decoded (the bytes queued, `kbd`'s count kept
+  under the keyboard's `ARRIVED` lock, are no more than the bytes the
+  decoder took, an atomic counter: `keyboard::all_decoded`); both readers
+  are at their ring's `newest()` and the compositor holds no event back
+  (the Alt+F`n` barrier, or a resume whose screen hasn't come yet); no
+  wake is pending, no damage is gathered and no pass is running; no
+  commit is under way; every window's queue is idle (no entry and no
+  flag) and its owner is blocked in `wait_event` (an idle bit per window);
+  and no request is `Pending` or `Running` (none exist until #156). A test first polls for the effect it expects (a `windows` row,
   a `ui tree` value), then calls the harness's `wait_settled(m)`
   (`tools/harness/lumen_harness/gui.py`, #153), and brackets each
   screendump between two `desktop status` reads with the same `frames`.
@@ -3118,7 +3137,8 @@ until a crash.
 
 `WindowHandle::next_event()` (non-blocking) and `wait_event()` (which sets
 the window's idle bit while it blocks on an idle queue) return
-`WindowEvent`s: `Key(KeyEvent)`, `PointerDown`, `PointerMove`,
+`WindowEvent`s (the queue's request type is `desktop::Request`, an empty
+enum until #156 gives it variants, so no request can be queued yet): `Key(KeyEvent)`, `PointerDown`, `PointerMove`,
 `PointerUp` (client coordinates and the buttons held), `FocusGained`,
 `FocusLost`, `Lost` (events for this window were dropped), `Close` (the
 close box, or `ui invoke <root> close`) and `Request` (an automation
@@ -3226,9 +3246,11 @@ Moves with no button held aren't delivered (no hover in M4).
   `lumen_wm::deliver`. `Outcome` and the `Option`s are `#[must_use]`.
 - **Coordinates:** screen pixels as `i32`, as `lumen-gfx` uses (a window
   may hang off the left, right or bottom edge, never the top);
-  `Pointer::from_state` converts the tablet's `usize` position
-  (saturating) and its buttons (`ButtonSet`), and carries #151's
-  `after_overrun` (a gap, handled before the event).
+  `Pointer::from_read` takes a pointer ring's read (#151): the tablet's
+  `usize` position (saturating, through `Pointer::from_state`), its
+  buttons (`lumen_input::Buttons` into `ButtonSet`, still two types: the
+  merge into one is left for later) and `Read::gap()` (a gap in the ring
+  or `after_overrun`, handled before the event).
 - **Geometry** (`Metrics::DESKTOP`): a 24-row title bar spanning the
   frame (the side borders' top rows are title bar), 1-pixel borders, a
   16-pixel close box 4 pixels in from the right border; a moved frame
@@ -3255,8 +3277,9 @@ alone releases the owner's buttons, and no window is left holding one.
 ### Input on the desktop (#151, #153)
 
 - **Routing in the decoding pass:** while `vt::DESKTOP` is set, the pass
-  routes only Alt+F1 to F4 to `term` (above); every other press goes to
-  the key ring alone and is counted as `Routed::Desktop` (shown by `vt`).
+  routes only Alt+F1 to F4 to `term` (above; `Routed::Left`); every other
+  press goes to the key ring alone and is counted as `Routed::Desktop`
+  (`vt` ends with `N keys to the desktop`).
   So typing into a window never reaches the hidden terminal's shell.
 - **The compositor** reads the tablet's ring and the keyboard's ring
   (section 7) with one `Reader` each. Pointer input goes in as
@@ -3329,11 +3352,12 @@ Nothing on the crash path takes a desktop lock.
 Tests: `ktest:lumen_kernel::desktop::a_present_stops_at_the_next_row_once_the_canvas_dies`
 drives the real span path (`ScreenCanvas::write_span`) with a test hook
 that changes the epoch after `k` rows, and reads back that the later rows
-are unchanged; `scenario:test_gui::test_crash_report_over_desktop` (under
+are unchanged; `scenario:test_crash::test_crash_report_over_desktop` (under
 `-smp 2`, with `desktop spin` committing, a fault from the serial shell)
-checks for a full symbolized report, exit code 37, and the crash screen
-covering the desktop: the banner, and not one pixel of the spinner's
-green.
+checks for a full symbolized report and exit code 37 on one machine, and
+on a second one booted without `lumen.qemu_exit` (so the screen stays up)
+the crash screen covering the desktop: the banner, and not one pixel of
+the spinner's green.
 
 ### Pixels: `lumen-gfx` (#147)
 
@@ -3363,10 +3387,13 @@ A host-tested `no_std` crate every desktop part draws with. Pixels are
   once per damaged rectangle it recomposes, never with `blend_mask`, or
   `desktop check` (damage-only against a full repaint) fails.
 - `Target`: `size() -> (u32, u32)` and `write_span(x: u32, y: u32,
-  pixels: &[u32])`. A `Surface` is one; the kernel's `ScreenCanvas` is
-  another, converting each pixel to the framebuffer's channel layout. Its
+  pixels: &[u32])`. `lumen-gfx` only calls it with spans inside `size()`;
+  a span outside is the caller's bug, and no target writes outside itself
+  for one. An in-memory target (a `Surface`) may panic on such a span, as
+  `Surface::row_mut` does. The kernel's `ScreenCanvas`, the front buffer,
+  converts each pixel to the framebuffer's channel layout, and its
   `write_span` never panics: it drops spans it can't take (outside the
-  screen, or once the canvas isn't live).
+  screen, or once the canvas isn't live or no longer holds the screen).
 
 ### Text and images (#148, #154)
 
@@ -3488,8 +3515,9 @@ compares with `=`):
   | `x`, `y`, `w`, `h` | its frame, decoration included, in screen pixels |
   | `z` | 0 is the front |
   | `focused`, `minimized` | `yes` or `no` (`minimized` is `no` until #157) |
-  | `owner` | the owner thread's name |
+  | `owner` | the thread that last read its events (its opener's until then) |
   | `lost` | events its queue dropped |
+  | `keys` | key events its queue took (#153's scenarios check where keys went with it) |
 
   Without a desktop it prints `windows: no desktop` and no rows.
 - `ui tree [window]`, one row per node, depth first, each window's root
@@ -3570,10 +3598,11 @@ held the screen (whether or not it was still drawing: a finished
 `mandelbrot` waiting for a key counts), the summary line ends in `, a
 command held the screen (a canvas): may be torn`, and the harness
 refuses such a capture unless asked not to (`allow_torn`). While the
-desktop is shown, `screenshot` reads the back buffer: the compositor
-fills `lumen_png::encode::Rows` from it between passes, so it never shows
-the pointer. While the desktop is paused or off, it reads the text screen
-as in text mode. Whichever of #150 and #153 lands second wires that up.
+desktop is shown, `screenshot` reads the back buffer
+(`screenshot::capture` asks `desktop::capture`): the compositor fills
+`lumen_png::encode::Rows` (allocated by the command) from it right after
+a pass, so it never shows the pointer. While the desktop is paused or off,
+it reads the text screen as in text mode (`capture_framebuffer`).
 
 **Encoding** (`lumen_png::encode`): RGB8, unfiltered (on the text console
 that compressed 16 to 20% smaller than the `Sub` or `Up` filters), zlib

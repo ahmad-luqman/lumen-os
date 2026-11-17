@@ -9,7 +9,7 @@ milestones with test-based exit criteria; `docs/STATUS.md` is generated.
 ```bash
 make deps            # pinned Limine + OVMF into build/deps (sha256-checked)
 make build           # both kernels: build/lumen-kernel, build/lumen-kernel-ktest
-make run             # QEMU with a window, serial on your terminal (Ctrl-A x quits; HEADLESS=1; SOUND=1 for beep/play)
+make run             # QEMU with a window, serial on your terminal (Ctrl-A x quits; HEADLESS=1; SOUND=1 for beep/play; DESKTOP=1 starts the desktop)
 make debug           # QEMU paused + gdb attached, stopped at kmain
 make test            # everything CI runs: host tests, flag audit, QEMU scenarios
 make test-host       # cargo test + harness self-tests (fast, no QEMU)
@@ -150,10 +150,19 @@ own PR that updates that doc first.
   through `canvas`), their commands (`commands.rs`: each row carries its
   help line; the system ones in `sysinfo.rs`), pipelines (`pipe.rs`: `cpus |
   where busy > 50`) and deliberate faults (`crash.rs`). `fb.rs`:
-  framebuffer pixels, the header and the crash screen. `term.rs`: the
+  framebuffer pixels, the header (`draw_header`, again when the desktop is left) and the crash screen. `term.rs`: the
   terminals on the framebuffer (four virtual ones, one shown: log lines on the first, the screen shells, scrollback, `view_text`, and
   `Canvas`: the pixels below the header for one command, the terminals paused meanwhile;
-  and the mouse pointer, a save-under arrow that drawing over it takes off and puts back). `vt.rs`: the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4 switching. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
+  and the mouse pointer, a save-under arrow that drawing over it takes off and puts back;
+  `take_screen`: the desktop's `ScreenCanvas`, the whole screen, a row per hold of the screen's lock;
+  `leave_desktop`). `vt.rs`: the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4 switching;
+  the decoding pass (`decode_pending`), `DESKTOP` (keys the desktop's alone while set), `CUT` (where each
+  pause and resume falls in the input rings) and `enter_desktop`.
+  `desktop.rs`: the desktop (#153): the `compositor` thread (the back buffer, damage-only presents, the
+  pointer drawn on the screen only, both input rings through `lumen_wm::Wm`, the cut), windows
+  (`open_window`, `WindowHandle`: an owner's surface and a committed one, `commit`, `next_event`/`wait_event`,
+  `Desktop::without_screen` for the ktests), the two demo windows, `desktop` (`status`, `check`, `spin`,
+  `hold`/`release`) and `windows`. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -347,7 +356,8 @@ own PR that updates that doc first.
   `gui.py` (input steps confirmed one at a time: `pointer_move`,
   `pointer_down`/`pointer_up`, `drag` against `mouse`'s frames and state,
   `confirmed_keys`/`type_confirmed` against `kbd`'s presses, bytes and
-  held keys, `KEY_BYTES` the keys it models),
+  held keys, `KEY_BYTES` the keys it models; the desktop's `windows`,
+  `desktop_status`, `wait_settled`, `desktop_check`, `settled_screendump`),
   `screenshot.py` (`screenshot`'s frame read back and checked;
   `Machine.screenshot_via_serial`),
   `shell.py` (`run`: a serial command's output, the log's lines taken out

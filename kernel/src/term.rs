@@ -104,6 +104,9 @@ struct Screen {
     /// The canvas held is a [`ScreenCanvas`] (the desktop's: the whole
     /// screen, header included), not a command's [`Canvas`].
     whole: bool,
+    /// The epoch the [`ScreenCanvas`] held was taken at: which take it is
+    /// (the desktop takes the screen with one owner each time it resumes).
+    whole_epoch: u64,
     /// Where the mouse pointer's tip should be (framebuffer pixels), if the
     /// tablet reported a position (and the pointer wasn't hidden since).
     pointer_at: Option<(usize, usize)>,
@@ -151,6 +154,7 @@ pub fn init(fb: Framebuffer) {
         cells_drawn: 0,
         canvas: None,
         whole: false,
+        whole_epoch: 0,
         pointer_at: None,
         pointer: lumen_input::Cursor::default(),
     };
@@ -780,6 +784,7 @@ pub fn take_screen(owner: Owner) -> Result<ScreenCanvas, CanvasError> {
         }
         s.canvas = Some(owner);
         s.whole = true;
+        s.whole_epoch = epoch;
         // (`drawing` takes the terminals' pointer off now.)
         Ok(ScreenCanvas {
             owner,
@@ -859,12 +864,13 @@ impl lumen_gfx::Target for ScreenCanvas {
 
 impl Drop for ScreenCanvas {
     fn drop(&mut self) {
-        // Still the holder (not taken back by `leave_desktop`): give the
-        // screen back, live or not (a ktest's hook may have changed the
-        // epoch without taking it back). After a crash report started,
-        // nothing (`with_screen` refuses).
+        // This take still holds the screen (not taken back by
+        // `leave_desktop`, after which a resume's newer take may hold it
+        // for the same owner): give it back, live or not (a ktest's hook
+        // may have changed the epoch without taking it back). After a crash
+        // report started, nothing (`with_screen` refuses).
         let _ = with_screen(|s| {
-            if s.canvas == Some(self.owner) && s.whole {
+            if s.canvas == Some(self.owner) && s.whole && s.whole_epoch == self.epoch {
                 s.canvas = None;
                 s.whole = false;
                 s.redraw_all();
