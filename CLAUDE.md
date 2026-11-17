@@ -244,7 +244,9 @@ own PR that updates that doc first.
   a pointer gap, a key gap) and `resume(baseline)` so no window keeps a
   button or key, focus changes held back while paused; every operation
   returns its `Damage` and `Delivery`s, `#[must_use]`), a window's
-  `EventQueue` of `Entry`s (key events through `KeyLike`, pointer events,
+  `EventQueue` of `Entry`s (key events through `KeyLike`, which
+  `lumen_input::KeyEvent` implements; pointer events (`Pointer::from_read`
+  carries a ring read's gap, #151),
   requests; sticky `Lost`/focus/`Close` flags delivered in place and never
   pushable, presses, moves and requests rationed past 48 of 64, releases
   only after their press, unpaired releases counted apart: keys, buttons
@@ -266,7 +268,9 @@ own PR that updates that doc first.
   follow a loss at the device), `KeyEvent`/`KeyAction`/`Mods` from set 1
   bytes (`KeyDecoder` over `pc-keyboard`: one press per key, agreeing with
   `Presses` wherever pc-keyboard refuses no byte, one listed exception;
-  `AfterDrop` marks the first event after dropped bytes) (host-tested).
+  `AfterDrop` marks the first event decoded from bytes queued after a
+  drop, maybe late, never early; `MarksLoss`/`Read::gap` the one loss
+  check) (host-tested).
 - `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, the
   page-table format and mapper (host-tested, incl. a model comparison), the
   window tokens that confine `paging::map`, and the kernel-stack layout and
@@ -302,7 +306,7 @@ own PR that updates that doc first.
   words, usage and help lines), pipelines (text or records in tables, the
   filters `grep`, `where`, `sort`, `first`, `count`, `select`), serial
   bytes to keys, a key press to the line editor's key (`Key::from_press`,
-  shared by text mode and terminal windows) (host-tested).
+  shared by text mode and terminal windows, with #155) (host-tested).
 - `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET, MCFG,
   FADT (PM1 control blocks) and the DSDT's `_S5_` by byte search
   (host-tested on handcrafted tables).

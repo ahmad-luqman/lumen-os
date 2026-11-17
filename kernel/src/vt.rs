@@ -260,16 +260,19 @@ pub fn stats() -> Stats {
     }
 }
 
+/// A raw key for the ktests: `code`, with Alt held or not.
+#[cfg(feature = "ktest")]
+fn raw_key(code: KeyCode, alt: bool) -> Key {
+    Key::Raw { code, mods: if alt { lumen_input::Mods::NONE.with_alt() } else { lumen_input::Mods::NONE } }
+}
+
 crate::ktest!(
     fn alt_f1_to_f4_switch_terminals() {
         // Alt with F1 to F4 is a switch to terminals 0 to 3; F5, or F1
         // without Alt, or a character typed with Alt, isn't. Modifiers on
         // their own are skipped; other keys aren't.
         use crate::{kassert, kassert_eq};
-        let raw = |code, alt: bool| Key::Raw {
-            code,
-            mods: if alt { lumen_input::Mods::NONE.with_alt() } else { lumen_input::Mods::NONE },
-        };
+        let raw = raw_key;
         kassert_eq!(switch_key(raw(KeyCode::F1, true)), Some(0));
         kassert_eq!(switch_key(raw(KeyCode::F4, true)), Some(3));
         kassert_eq!(switch_key(raw(KeyCode::F5, true)), None);
@@ -293,10 +296,7 @@ crate::ktest!(
         use crate::kassert_eq;
         use term::Owner;
         const ALL: usize = (1 << VTS) - 1;
-        let raw = |code, alt: bool| Key::Raw {
-            code,
-            mods: if alt { lumen_input::Mods::NONE.with_alt() } else { lumen_input::Mods::NONE },
-        };
+        let raw = raw_key;
         let mut r = Rings::new();
         kassert_eq!(term::shown(), 0);
         let _first = term::ShowFirstAfter;

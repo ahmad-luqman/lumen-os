@@ -575,9 +575,9 @@ impl Console for Captured {
 }
 
 /// The line editor's key for a key from the keyboard, if it takes one:
-/// `lumen_shell::Key::from_press`, the mapping terminal windows share
-/// (ARCHITECTURE section 7), a character as its text and any other key as
-/// its code with its modifiers.
+/// `lumen_shell::Key::from_press`, the mapping terminal windows (with
+/// #155) share (ARCHITECTURE section 7), a character as its text and any
+/// other key as its code with its modifiers.
 fn screen_key(key: keyboard::Key) -> Option<Key> {
     use keyboard::Key as K;
     match key {

@@ -54,15 +54,26 @@ pub const CAPACITY: usize = 64;
 /// this are.
 pub const RATIONED: usize = 48;
 
-/// A key event as the queue needs to see it. lumen-wm implements it for
-/// #151's key event once that lands; until then #153 may wrap its key
-/// event in a local type.
+/// A key event as the queue needs to see it: implemented for the desktop's
+/// key event, `lumen_input::KeyEvent` (#151), below.
 pub trait KeyLike {
     /// Names a key, to pair a release with its press.
     type Code: Copy + PartialEq;
     fn code(&self) -> Self::Code;
     /// A press (a typematic repeat is a press too), not a release.
     fn is_press(&self) -> bool;
+}
+
+/// The desktop's key event (#151): named by its physical key, a press
+/// (typematic repeats included) or a release.
+impl KeyLike for lumen_input::KeyEvent {
+    type Code = lumen_input::KeyCode;
+    fn code(&self) -> lumen_input::KeyCode {
+        self.code
+    }
+    fn is_press(&self) -> bool {
+        matches!(self.action, lumen_input::KeyAction::Press { .. })
+    }
 }
 
 /// One entry of a window's queue.
@@ -703,5 +714,25 @@ mod tests {
         q.request_close();
         assert_eq!(q.counts().dead_pushes, 5);
         assert_eq!(drain(&mut q), [Next::Event(down(1))]);
+    }
+
+    #[test]
+    fn the_desktop_s_key_event_is_a_key_like() {
+        // `lumen_input::KeyEvent` as the queue sees it: its key names it, a
+        // press is a press; a press and its release go through a queue of
+        // them in order, and a release whose press was never queued is a
+        // stray, counted.
+        use lumen_input::{KeyAction, KeyCode, KeyEvent, Mods};
+        let ev = |code, action| KeyEvent { code, action, mods: Mods::NONE, after_drop: false };
+        let a_down = ev(KeyCode::A, KeyAction::Press { text: Some('a') });
+        let a_up = ev(KeyCode::A, KeyAction::Release);
+        assert_eq!((a_down.code(), a_down.is_press(), a_up.is_press()), (KeyCode::A, true, false));
+        let mut q = EventQueue::<KeyEvent, ()>::new();
+        assert_eq!(q.push(Entry::Key(a_down)), Pushed::Queued);
+        assert_eq!(q.push(Entry::Key(a_up)), Pushed::Queued);
+        assert_eq!(q.push(Entry::Key(ev(KeyCode::B, KeyAction::Release))), Pushed::Stray);
+        let got: Vec<_> = core::iter::from_fn(|| q.next_event()).collect();
+        assert_eq!(got, [Next::Event(Entry::Key(a_down)), Next::Event(Entry::Key(a_up))]);
+        assert_eq!(q.counts().key_releases_unpaired, 1);
     }
 }

@@ -235,13 +235,17 @@ def test_a_long_line_of_shifted_keys(boot):
 def test_no_8042_is_a_warning(boot):
     # Without the controller the keyboard is skipped with a warning naming
     # the command, the serial shell says why there is none (IRQ 1 stays
-    # routed, masked), and only the serial shell runs.
+    # routed, masked), and only the serial shell runs. `kbd events` says
+    # the same, piped or not.
     m = boot("qemutest", extra=["-machine", "q35,i8042=off"])
     m.expect(rf"WARN  kbd: no PS/2 keyboard: {NO_8042}\n", 60)
     m.expect(r"INFO  shell: shell on serial \(none on the screen: no keyboard\); type 'help'\n", 60)
     m.expect(r"lumen> ", 60)
-    m.send_line("kbd")
-    m.expect(rf"kbd: no keyboard \({NO_8042}\); IRQ 1 routed \(vector 0x51\), masked\n", 10)
+    no_keyboard = rf"kbd: no keyboard \({NO_8042}\); IRQ 1 routed \(vector 0x51\), masked\n"
+    for command in ["kbd", "kbd events", "kbd events | count"]:
+        m.send_line(command)
+        m.expect(no_keyboard, 10)
+        m.expect(r"lumen> ", 10)
 
 
 TABLET_LINE = re.compile(
@@ -631,6 +635,7 @@ def test_click_position_is_kept(boot):
         ["4", str(x2), str(y2), "none", "no"],
     ], rows
     assert ", newest event 4)" in run(m, "mouse").splitlines()[0]
+    assert run(m, "mouse events 0") == "usage: mouse events [n]\n"
     # A later batch adds its frame after them, numbered on (nothing pushed
     # twice).
     m.move_pointer(300, 300)
@@ -679,8 +684,8 @@ def test_mouse_hold_needs_a_tablet_and_takes_its_words(boot):
     assert run(m, "mouse release") == "mouse: released\n"
     for bad in ["mouse up", "mouse hold now"]:
         assert run(m, bad) == "usage: mouse [hold|release|events [n]]\n", bad
-    for events in ["mouse events", "mouse events 3"]:
-        assert run(m, events) == "mouse: no tablet (QEMU: -device virtio-tablet-pci)\n", events
+    for command in ["mouse events", "mouse events 3"]:
+        assert run(m, command) == "mouse: no tablet (QEMU: -device virtio-tablet-pci)\n", command
 
 
 def test_a_pointer_move_raises_the_tablets_interrupt(boot):

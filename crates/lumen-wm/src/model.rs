@@ -458,6 +458,22 @@ fn tablet_positions_are_converted_saturating() {
     assert_eq!(Pointer::from_state(&s, false).buttons, ButtonSet::EXTRA);
 }
 
+#[test]
+fn a_read_frame_carries_its_gap_either_way() {
+    // `Pointer::from_read`: the frame's state, and `after_overrun` set when
+    // the reader fell behind the ring or the frame says frames were lost
+    // at the device (all four combinations).
+    use lumen_input::{PointerEvent, PointerState, Read, Ring};
+    let state = PointerState { x: 7, y: 9, buttons: lumen_input::Buttons::LEFT, ..Default::default() };
+    let mut ring = Ring::<PointerEvent, 2>::new();
+    let seq = ring.push(PointerEvent { state, after_overrun: false });
+    for (lost_before, marked, gap) in [(0, false, false), (0, true, true), (3, false, true), (3, true, true)] {
+        let read = Read { seq, lost_before, event: PointerEvent { state, after_overrun: marked } };
+        let p = Pointer::from_read(&read);
+        assert_eq!((p.x, p.y, p.buttons, p.after_overrun), (7, 9, L, gap), "{lost_before} {marked}");
+    }
+}
+
 /// No keys in these tests (the window manager deals in pointer events).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct NoKey;

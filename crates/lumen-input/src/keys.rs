@@ -8,7 +8,8 @@
 //! after it), and a press also comes back as `pc-keyboard`'s
 //! `DecodedKey` for the terminals, as before #151. `pc-keyboard`'s
 //! pseudo-keys are handled so that one key is one press, as `kbd`'s
-//! `presses` ([`crate::Presses`]) counts it:
+//! `presses` ([`crate::Presses`]) counts it, wherever `pc-keyboard`
+//! refuses no byte (except for a Pause cut off after its `E1 1D`):
 //!
 //! - `RAlt2`, the fake shift QEMU sends around Print Screen (`E0 2A`, `E0
 //!   AA`), is not pushed;
@@ -24,8 +25,9 @@
 //!   release (unreachable with set 1, which makes none).
 //!
 //! Typematic repeat shows as repeated presses with no release between. The
-//! kernel marks the first key event decoded after its byte queue dropped
-//! bytes ([`KeyEvent::after_drop`], [`AfterDrop`]).
+//! kernel marks the first key event decoded from bytes queued after its
+//! byte queue dropped one ([`KeyEvent::after_drop`], [`AfterDrop`]: may be
+//! late, never early).
 
 pub use pc_keyboard::KeyCode;
 use pc_keyboard::{DecodedKey, HandleControl, KeyState, KeyboardLayout, Modifiers, PS2Keyboard, ScancodeSet1};
@@ -51,8 +53,9 @@ pub struct KeyEvent {
     /// The modifier state after this event.
     pub mods: Mods,
     /// Bytes were dropped before this event (the keyboard's queue was full:
-    /// [`AfterDrop`]): a release may be missing, so a reader treats it as a
-    /// gap (the desktop sends `Lost`).
+    /// [`AfterDrop`]; the first event decoded from bytes queued after the
+    /// gap, possibly a little late): a release may be missing, so a reader
+    /// treats it as a gap (the desktop interrupts with `KeyGap`).
     pub after_drop: bool,
 }
 
@@ -132,16 +135,6 @@ impl Mods {
         Mods(self.0 | Self::LALT)
     }
 
-    /// With right Alt (AltGr) held too.
-    pub const fn with_altgr(self) -> Mods {
-        Mods(self.0 | Self::RALT)
-    }
-
-    /// With Caps Lock on too.
-    pub const fn with_capslock(self) -> Mods {
-        Mods(self.0 | Self::CAPSLOCK)
-    }
-
     /// With Num Lock on too.
     pub const fn with_numlock(self) -> Mods {
         Mods(self.0 | Self::NUMLOCK)
@@ -171,27 +164,76 @@ pub enum InputEvent {
     Pointer(PointerEvent),
 }
 
-/// Marks the first key event after the keyboard's byte queue dropped
-/// bytes ([`KeyEvent::after_drop`]): the kernel gives it the queue's drop
-/// count as each event is decoded.
+/// Marks the first key event decoded from bytes queued after the
+/// keyboard's byte queue dropped one ([`KeyEvent::after_drop`]): may be
+/// late, never early.
+///
+/// A full queue drops the byte coming in, so every byte still queued when
+/// the drop count moves came before the gap: the consumer calls
+/// [`AfterDrop::pop`] before each byte it takes, with the drop count and
+/// the bytes queued then, and the gap is passed once that many bytes have
+/// been taken (bytes queued after the drop but counted here only make the
+/// mark later). [`AfterDrop::mark`] then marks the next event finished. A
+/// late mark is the safe direction: a reader may see a stray release,
+/// never a key it thinks held whose release was dropped.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AfterDrop {
-    /// The drop count the last event saw.
+    /// The drop count last seen.
     seen: u64,
+    /// Bytes still to take before the gap is passed.
+    ahead: usize,
+    /// A drop seen, its mark not given yet.
+    pending: bool,
+    /// The byte just taken came after the gap.
+    after_gap: bool,
 }
 
 impl AfterDrop {
     /// Starting from the queue's drop count now (drops before don't mark).
     pub const fn new(dropped: u64) -> Self {
-        Self { seen: dropped }
+        Self { seen: dropped, ahead: 0, pending: false, after_gap: false }
     }
 
-    /// Whether an event decoded now, with the queue's drop count at
-    /// `dropped`, comes after a drop the last one didn't see.
-    pub fn mark(&mut self, dropped: u64) -> bool {
-        let after = dropped != self.seen;
-        self.seen = dropped;
-        after
+    /// Before taking a byte from the queue: its drop count and the bytes it
+    /// holds now (the one about to be taken included).
+    pub fn pop(&mut self, dropped: u64, queued: usize) {
+        if dropped != self.seen {
+            self.seen = dropped;
+            self.ahead = self.ahead.max(queued);
+            self.pending = true;
+        }
+        self.after_gap = self.pending && self.ahead == 0;
+        self.ahead = self.ahead.saturating_sub(1);
+    }
+
+    /// Whether the key event just finished (by the last byte taken) is the
+    /// first after a gap.
+    pub fn mark(&mut self) -> bool {
+        let first = self.pending && self.after_gap;
+        if first {
+            self.pending = false;
+        }
+        first
+    }
+}
+
+/// Whether an event says events may have been lost just before it, other
+/// than as a gap in its ring's numbers: a tablet frame after an overrun
+/// ([`PointerEvent::after_overrun`]), a key event after the keyboard's
+/// queue dropped bytes ([`KeyEvent::after_drop`]).
+pub trait MarksLoss {
+    fn follows_loss(&self) -> bool;
+}
+
+impl MarksLoss for PointerEvent {
+    fn follows_loss(&self) -> bool {
+        self.after_overrun
+    }
+}
+
+impl MarksLoss for KeyEvent {
+    fn follows_loss(&self) -> bool {
+        self.after_drop
     }
 }
 
@@ -445,7 +487,16 @@ mod tests {
         // is back at its start: the bytes after it decode exactly as bare
         // pc-keyboard decodes them, every press with its release (holding
         // the E0 back once swallowed the next byte here).
-        for bytes in [&[0xE1, 0xE0, 0x1E, 0x9E][..], &[0xE1, 0xE0, 0x4B, 0xE0, 0xCB], &[0xE1, 0xE0, 0xE0, 0x1D]] {
+        // Likewise a 46 or C6 after an E1 (not Ctrl+Pause: only after E0).
+        let cases: [&[u8]; 6] = [
+            &[0xE1, 0xE0, 0x1E, 0x9E],
+            &[0xE1, 0xE0, 0x4B, 0xE0, 0xCB],
+            &[0xE1, 0xE0, 0xE0, 0x1D],
+            &[0xE1, 0x46],
+            &[0xE1, 0xC6],
+            &[0xE0, 0x4B, 0xE1, 0x46],
+        ];
+        for bytes in cases {
             let (got, refused) = events(bytes);
             let ours: Vec<(KeyCode, bool)> =
                 got.iter().map(|e| (e.code, matches!(e.action, KeyAction::Press { .. }))).collect();
@@ -455,16 +506,98 @@ mod tests {
         assert_eq!(events(&[0xE1, 0xE0, 0x1E, 0x9E]), (a.to_vec(), 1));
     }
 
+    /// A model of the keyboard's queue (`capacity` bytes, dropping the one
+    /// coming in when full) and its consumer with an [`AfterDrop`]: `ops`
+    /// push (`true`, a byte numbered in order) or take (`false`, one byte,
+    /// each taken byte one event). The events marked, by the number of
+    /// the byte that made them, and the bytes dropped.
+    fn model(capacity: usize, ops: &[bool]) -> (Vec<u64>, Vec<u64>) {
+        let mut queue = std::collections::VecDeque::new();
+        let (mut next, mut dropped, mut marks) = (0u64, Vec::new(), Vec::new());
+        let mut drops = AfterDrop::new(0);
+        for &push in ops {
+            if push {
+                if queue.len() == capacity {
+                    dropped.push(next);
+                } else {
+                    queue.push_back(next);
+                }
+                next += 1;
+            } else if let Some(&byte) = queue.front() {
+                drops.pop(dropped.len() as u64, queue.len());
+                queue.pop_front();
+                if drops.mark() {
+                    marks.push(byte);
+                }
+            }
+        }
+        (marks, dropped)
+    }
+
     #[test]
-    fn after_drop_marks_the_first_event_after_a_drop() {
-        let mut marks = AfterDrop::new(3);
-        assert!(!marks.mark(3));
-        assert!(marks.mark(4));
-        assert!(!marks.mark(4));
-        assert!(marks.mark(9));
-        assert!(!marks.mark(9));
-        // Events the decoder pushes leave it clear: the kernel sets it.
-        assert!(events(&[0x1E, 0x9E]).0.iter().all(|e| !e.after_drop));
+    fn after_drop_marks_an_event_from_after_the_gap_never_before() {
+        // Fill a 4-byte queue (0..3), drop 4, push 5 once there's room:
+        // 0 to 3 came before the gap, 5 is the first after it.
+        let (t, f) = (true, false);
+        let (marks, dropped) = model(4, &[t, t, t, t, t, f, t, f, f, f, f, f]);
+        assert_eq!((marks, dropped), (vec![5], vec![4]));
+        // Two drops before the first is reached (2, then 4): one mark,
+        // after both (3, pushed between them, counts as before the gap: a
+        // little late, never early).
+        let (marks, dropped) = model(2, &[t, t, t, f, t, t, f, f, t, f, f]);
+        assert_eq!(dropped, vec![2, 4]);
+        assert_eq!(marks, vec![5]);
+        // No drop, no mark.
+        assert_eq!(model(4, &[t, f, t, f]).0, Vec::<u64>::new());
+        // Randomly, on queues of 1 to 6 bytes: a mark is never early (the
+        // marked byte was pushed after a drop no earlier mark answered),
+        // and never missing (more bytes taken after the last drop than
+        // the queue holds means that drop got a mark after it).
+        let mut seed = 0x2545_f491u32;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for round in 0..3000 {
+            let capacity = 1 + round % 6;
+            let ops: Vec<bool> = (0..60).map(|_| random() % 3 != 0).collect();
+            let (marks, dropped) = model(capacity, &ops);
+            let mut answered = None;
+            for &m in &marks {
+                assert!(
+                    dropped.iter().any(|&d| d < m && answered.is_none_or(|a| d > a)),
+                    "mark {m} with no new drop before it: {ops:?}"
+                );
+                answered = Some(m);
+            }
+            if let Some(&last) = dropped.last() {
+                // Bytes taken after the last drop (pushed after it).
+                let taken_after = taken_after_last_drop(capacity, &ops);
+                if taken_after > capacity {
+                    assert!(marks.last().is_some_and(|&m| m > last), "drop {last} never marked: {ops:?}");
+                }
+            }
+        }
+    }
+
+    /// How many bytes the model's consumer took after the last drop.
+    fn taken_after_last_drop(capacity: usize, ops: &[bool]) -> usize {
+        let (mut len, mut taken) = (0usize, 0usize);
+        for &push in ops {
+            if push {
+                if len == capacity {
+                    taken = 0;
+                } else {
+                    len += 1;
+                }
+            } else if len > 0 {
+                len -= 1;
+                taken += 1;
+            }
+        }
+        taken
     }
 
     #[test]
@@ -473,8 +606,6 @@ mod tests {
         assert!(n.with_shift().is_shifted() && !n.with_shift().is_ctrl());
         assert!(n.with_ctrl().is_ctrl() && !n.with_ctrl().is_alt());
         assert!(n.with_alt().is_alt() && !n.with_alt().is_altgr());
-        assert!(n.with_altgr().is_altgr() && n.with_altgr().is_alt());
-        assert!(n.with_capslock().capslock() && !n.with_capslock().numlock());
         assert!(n.with_numlock().numlock() && !n.with_numlock().is_shifted());
         // The same bits as pc-keyboard's left keys.
         let m = Modifiers { lshift: true, lctrl: true, numlock: true, ..Default::default() };
@@ -577,9 +708,6 @@ mod tests {
         corpus.push(vec![0x1D, 0xE0, 0x46, 0xE0, 0xC6, 0x9D]); // Ctrl+Pause
         corpus.push(vec![0x1E, 0x1E, 0x1E, 0x9E]); // typematic repeat
         corpus.push(vec![0x2A, 0x1E, 0x9E, 0xAA]); // Shift+a
-        corpus.push(vec![0xE1, 0xE0, 0x1E, 0x9E]); // a stray E1, then E0
-        corpus.push(vec![0xE1, 0xE0, 0x4B, 0xE0, 0xCB]);
-        corpus.push(vec![0xE1, 0xE0, 0xE0, 0x1D]);
         // The known exceptions, where both decode without error but count
         // differently: Pause cut off after its first byte past E1 (Presses
         // counts at 0x1D, the decoder at 0x45, where pc-keyboard tells

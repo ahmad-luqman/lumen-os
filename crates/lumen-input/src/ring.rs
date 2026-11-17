@@ -76,8 +76,6 @@ impl<D: InputDevice + 'static> Reader<D> {
     /// Events skipped this way aren't counted as lost.
     pub fn skip_to(&mut self, seq: Seq) {
         let newest = self.device.newest();
-        // (Not in this crate's host tests, which check the clamp itself.)
-        #[cfg(not(test))]
         debug_assert!(seq <= newest, "skip_to {seq:?} past the device's newest {newest:?}");
         self.after = self.after.max(seq.min(newest));
     }
@@ -100,6 +98,16 @@ pub struct Read<E> {
     pub seq: Seq,
     pub lost_before: u64,
     pub event: E,
+}
+
+impl<E: crate::MarksLoss> Read<E> {
+    /// Whether events may have been lost just before this one, either way:
+    /// a gap in the ring's numbers (this reader fell behind), or the event's
+    /// own mark (lost at the device: [`crate::MarksLoss`]). The one check a
+    /// reader needs; derived, not stored.
+    pub fn gap(&self) -> bool {
+        self.lost_before > 0 || self.event.follows_loss()
+    }
 }
 
 /// The newest `N` events of one device, and the number the next one gets.
@@ -253,10 +261,10 @@ mod tests {
             push(d, e);
         }
         // 2 and 3 were overwritten (the ring holds 4, 5, 6): the read says
-        // so with the event it comes before.
+        // so with the event it comes before, and only that one.
         assert_eq!(r.read(), Some(Read { seq: Seq(4), lost_before: 2, event: 4 }));
+        assert_eq!(r.read(), Some(Read { seq: Seq(5), lost_before: 0, event: 5 }));
         assert_eq!(r.lost(), 2);
-        assert_eq!(ev(&mut r), Some(5));
         assert_eq!(ev(&mut r), Some(6));
         assert_eq!(ev(&mut r), None);
         assert_eq!((r.after(), r.lost()), (Seq(6), 2));
@@ -286,18 +294,39 @@ mod tests {
     }
 
     #[test]
-    fn skip_to_stops_at_the_newest() {
-        // A number from another ring, past this one's newest (a bug, which
-        // a `debug_assert` catches outside these tests): the reader stops at
-        // the newest and still gets the next event pushed.
+    #[should_panic(expected = "past the device's newest")]
+    fn skip_to_past_the_newest_is_caught() {
+        // A number from another ring, past this one's newest: a bug, which
+        // the `debug_assert` catches (every profile here keeps debug
+        // assertions; without them the reader would stop at the newest).
         let other = device::<8>();
         let far = (0..5).map(|e| push(other, e)).last().unwrap();
         let d = device::<8>();
         push(d, 10);
         let mut r = Reader::from_now(d);
         r.skip_to(far);
-        assert_eq!(r.after(), Seq(1));
-        push(d, 11);
-        assert_eq!(ev(&mut r), Some(11));
+    }
+
+    /// A tablet frame or key event for the `gap` tests, marked or not.
+    fn marked(mark: bool) -> (crate::PointerEvent, crate::KeyEvent) {
+        let pointer = crate::PointerEvent { state: Default::default(), after_overrun: mark };
+        let key = crate::KeyEvent {
+            code: crate::KeyCode::A,
+            action: crate::KeyAction::Release,
+            mods: crate::Mods::NONE,
+            after_drop: mark,
+        };
+        (pointer, key)
+    }
+
+    #[test]
+    fn a_gap_is_either_kind_of_loss() {
+        // For both event kinds, all four combinations of a gap in the
+        // ring's numbers and the event's own mark.
+        for (lost_before, mark, gap) in [(0, false, false), (0, true, true), (2, false, true), (2, true, true)] {
+            let (pointer, key) = marked(mark);
+            assert_eq!(Read { seq: Seq(3), lost_before, event: pointer }.gap(), gap, "{lost_before} {mark}");
+            assert_eq!(Read { seq: Seq(3), lost_before, event: key }.gap(), gap, "{lost_before} {mark}");
+        }
     }
 }

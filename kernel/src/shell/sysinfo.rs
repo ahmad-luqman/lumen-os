@@ -120,9 +120,7 @@ pub fn mouse_events(args: &[String]) -> Result<pipe::Table, String> {
 /// `kbd events [n]`: the key ring's newest events, or (no keyboard) the
 /// line plain `kbd` gives.
 pub fn kbd_events(args: &[String]) -> Result<pipe::Table, String> {
-    if let Some(problem) = kbd_problem() {
-        return Err(problem);
-    }
+    kbd_route(&crate::keyboard::stats())?;
     Ok(key_events_table(&crate::input::KEYS.recent(events_count("kbd", args)?)))
 }
 
@@ -142,18 +140,18 @@ const EVENTS_SHOWN: usize = 16;
 /// What `mouse` says without a tablet.
 const NO_TABLET: &str = "mouse: no tablet (QEMU: -device virtio-tablet-pci)";
 
-/// Why there is no keyboard, as `kbd` says it, or `None` with one.
-pub fn kbd_problem() -> Option<String> {
-    let k = crate::keyboard::stats();
+/// The keyboard's route from a `kbd` snapshot, or why there is no
+/// keyboard, as `kbd` says it.
+pub fn kbd_route(k: &crate::keyboard::Stats) -> Result<crate::interrupts::Route, String> {
     match (k.result, k.route) {
-        (Some(Ok(())), Some(_)) => None,
-        (Some(Err(e)), Some(route)) => Some(alloc::format!(
+        (Some(Ok(())), Some(route)) => Ok(route),
+        (Some(Err(e)), Some(route)) => Err(alloc::format!(
             "kbd: no keyboard ({e}); IRQ {} routed (vector {:#x}), masked",
             route.irq(),
             route.vector()
         )),
-        (Some(Err(e)), None) => Some(alloc::format!("kbd: no keyboard ({e})")),
-        _ => Some(String::from("kbd: not set up")),
+        (Some(Err(e)), None) => Err(alloc::format!("kbd: no keyboard ({e})")),
+        _ => Err(String::from("kbd: not set up")),
     }
 }
 
@@ -250,7 +248,8 @@ pub fn print_table(ctx: &mut Ctx<'_>, table: Result<pipe::Table, String>) {
 
 /// A line for the console when `name`'s records come with a caveat the
 /// table can't carry: `lspci`'s when PCI devices are missing, `sound`'s
-/// when there is no sound device.
+/// when there is no sound device, `kbd`'s (its events) when no screen
+/// shell runs to decode keys.
 pub fn records_note(name: &str) -> Option<String> {
     match name {
         "lspci" => {
@@ -957,8 +956,8 @@ crate::ktest!(
                 crate::ktest::diag(format_args!("{name} {args:?}: {rows} rows"));
                 // (`sound` has a row only with a device, and the ktest
                 // machine has none: `sound::the_record_fits_its_columns`
-                // checks one. The rings are empty with nothing typed or
-                // moved.)
+                // checks one. The rings may be empty: nothing typed or
+                // moved, though other ktests push keys.)
                 kassert!(rows > 0 || name == "sound" || !args.is_empty());
             }
         }

@@ -420,12 +420,14 @@ fn kbd(ctx: &mut Ctx<'_>, args: &[String]) {
         }
         _ => return ctx.fail("usage: kbd [events [n]]"),
     }
-    if let Some(problem) = sysinfo::kbd_problem() {
-        let _ = writeln!(ctx.out, "{problem}");
-        return;
-    }
     let k = crate::keyboard::stats();
-    let Some(route) = k.route else { return };
+    let route = match sysinfo::kbd_route(&k) {
+        Ok(route) => route,
+        Err(why) => {
+            let _ = writeln!(ctx.out, "{why}");
+            return;
+        }
+    };
     let _ = writeln!(
         ctx.out,
         "kbd: layout {}, IRQ {} (vector {:#x}), {} interrupts, {} bytes, {} presses, {} held, {} dropped, {} \

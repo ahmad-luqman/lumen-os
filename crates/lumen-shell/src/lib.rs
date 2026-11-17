@@ -15,7 +15,7 @@
 //!   the arrows, UTF-8) to [`Key`]s.
 //! - [`Key::from_press`]: a key press from the keyboard (its text and code)
 //!   to the line editor's key, the one mapping text mode and terminal
-//!   windows share.
+//!   windows (with #155) share.
 //! - [`pipe`]: pipelines (`cpus | where busy > 50`): text or records
 //!   ([`pipe::Table`]) handed along, and the filters that take them.
 //!
@@ -62,9 +62,10 @@ impl Key {
     /// The line editor's key for a key press, if it takes one: from the
     /// press's text if it has one (`pc-keyboard` makes Enter `\n`,
     /// Backspace U+0008, Delete U+007F, Tab `\t`, Escape U+001B and Ctrl
-    /// with a letter U+0001 to U+001A; a printable character is itself;
-    /// other control characters make nothing), else from its key code (the
-    /// arrows, Home, End). The one mapping text mode and terminal windows
+    /// with a letter U+0001 to U+001A, so Ctrl+H, Ctrl+I, Ctrl+J and Ctrl+M
+    /// come out as Backspace, Tab, Enter and Enter; a printable character
+    /// is itself; Escape and any other control character make nothing),
+    /// else from its key code (the arrows, Home, End). The one mapping text mode and terminal windows
     /// (with #155) share (ARCHITECTURE section 7): text mode passes a
     /// `Char(c)` as `(Some(c), None, ..)` and a raw key as `(None,
     /// Some(code), mods)`; a terminal window a key event press's text, code

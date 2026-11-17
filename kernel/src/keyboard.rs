@@ -39,7 +39,9 @@
 //! lock, in the layout `lumen.keymap=` names (`us` without one, or for a
 //! name it doesn't know, with a warning), into characters (Ctrl and a
 //! letter making a control character: Ctrl-A is U+0001) and other keys
-//! (with the shift and Alt state).
+//! (with the modifiers after them); every key event decoded on the way,
+//! releases and bare modifiers included, also goes to the desktop's key
+//! ring (`crate::input::KEYS`, #151).
 //! The shell's `kbd` shows how it went ([`stats`]).
 
 use core::fmt;
@@ -542,8 +544,8 @@ pub enum Key {
 /// The next key pressed, if one is waiting (releases are consumed and
 /// skipped). Never blocks. Every key event decoded on the way, presses and
 /// releases, bare modifiers included, goes to the desktop's key ring
-/// (`crate::input::KEYS`, #151) first, the first after the queue dropped
-/// bytes marked `after_drop`.
+/// (`crate::input::KEYS`, #151) first, the first decoded from bytes queued
+/// after the queue dropped one marked `after_drop`.
 /// (A byte the queue dropped can leave the decoder out of step, e.g. shift
 /// still held, until the key is pressed again; `kbd` counts drops.)
 pub fn read_key() -> Option<Key> {
@@ -588,21 +590,26 @@ pub fn wake_readers() {
 }
 
 /// Feed `next()`'s bytes to `decoder` until one completes a key press;
-/// each key event decoded goes to `push`, the first after the queue
-/// dropped bytes (`drops`) marked `after_drop`; bytes it refuses are
-/// counted.
+/// each key event decoded goes to `push`, the first decoded from bytes
+/// queued after the queue dropped one marked `after_drop` (`drops`: may
+/// be late, never early); bytes it refuses are counted.
 fn decode(
     decoder: &mut Decoder,
     mut next: impl FnMut() -> Option<u8>,
     drops: &mut AfterDrop,
     mut push: impl FnMut(lumen_input::KeyEvent),
 ) -> Option<Key> {
-    let mut marked = |mut event: lumen_input::KeyEvent| {
-        event.after_drop = drops.mark(QUEUE.dropped());
-        push(event);
-    };
-    while let Some(byte) = next() {
-        match decoder.add_byte(byte, &mut marked) {
+    loop {
+        // The queue's drop count and length before the byte is taken: the
+        // bytes queued when a drop is seen all came before the gap.
+        let (dropped, queued) = (QUEUE.dropped(), QUEUE.len());
+        let Some(byte) = next() else { break };
+        drops.pop(dropped, queued);
+        let marked = |mut event: lumen_input::KeyEvent| {
+            event.after_drop = drops.mark();
+            push(event);
+        };
+        match decoder.add_byte(byte, marked) {
             Ok(Some(DecodedKey::Unicode(c))) => return Some(Key::Char(c)),
             Ok(Some(DecodedKey::RawKey(code))) => {
                 return Some(Key::Raw { code, mods: Mods::from(decoder.modifiers()) });
@@ -710,39 +717,44 @@ crate::ktest!(
 
 crate::ktest!(
     fn a_key_event_after_dropped_bytes_says_so() {
-        // Keys decoded from the queue carry no mark until the queue drops a
-        // byte (full: the producer counts it); the first key event decoded
-        // after that is marked `after_drop`, the rest not. (The queue's
-        // producer runs with interrupts off on the boot CPU, as here;
-        // nothing reads the queue in the test kernel meanwhile.)
+        // Through `read_key` itself (the keyboard's own decoder and marks):
+        // an A press, B presses until the queue drops one, then (room made)
+        // a B release and a C tap. Every event decoded from a byte queued
+        // before the drop is unmarked, the first after the gap (the B
+        // release) marked, and the C after it in the same call not. (The
+        // queue's producer runs with interrupts off on the boot CPU, as
+        // here; nothing else reads the queue in the test kernel.)
         use crate::{kassert, kassert_eq};
+        use lumen_input::{KeyAction, KeyCode};
         struct Drained;
         impl Drop for Drained {
             fn drop(&mut self) {
+                while read_key().is_some() {}
                 while QUEUE.pop().is_some() {}
             }
         }
         let _off = arch::irq::push_off();
         let _drained = Drained;
-        while QUEUE.pop().is_some() {}
-        let mut decoder = new_decoder(choose_layout(Some("us")).1);
-        let mut drops = AfterDrop::new(QUEUE.dropped());
-        let mut drain = |drops: &mut AfterDrop| {
-            let mut events = alloc::vec::Vec::new();
-            while decode(&mut decoder, || QUEUE.pop(), drops, |e| events.push(e)).is_some() {}
-            events
-        };
+        while read_key().is_some() {}
+        kassert!(QUEUE.is_empty());
+        let start = crate::input::KEYS.newest();
         kassert!(queue_for_test(&[0x1e, 0x9e]));
-        let clean = drain(&mut drops);
-        kassert_eq!(clean.len(), 2);
-        kassert!(clean.iter().all(|e| !e.after_drop));
-        // Fill the queue with S presses (0x1f) until one is dropped.
         let dropped = QUEUE.dropped();
-        while queue_for_test(&[0x1f]) {}
+        while queue_for_test(&[0x30]) {}
         kassert_eq!(QUEUE.dropped(), dropped + 1);
-        let after = drain(&mut drops);
-        kassert!(after.len() > 1);
-        kassert!(after[0].after_drop && after[1..].iter().all(|e| !e.after_drop));
+        // Room for the bytes after the gap: two B presses read.
+        kassert_eq!(read_key(), Some(Key::Char('a')));
+        kassert_eq!(read_key(), Some(Key::Char('b')));
+        kassert!(queue_for_test(&[0xb0, 0x2e, 0xae]));
+        while read_key().is_some() {}
+        let events: alloc::vec::Vec<_> =
+            crate::input::KEYS.recent(usize::MAX).into_iter().filter(|(seq, _)| *seq > start).map(|(_, e)| e).collect();
+        let marked: alloc::vec::Vec<usize> = (0..events.len()).filter(|&i| events[i].after_drop).collect();
+        kassert_eq!(marked.len(), 1);
+        let first = marked[0];
+        kassert_eq!((events[first].code, events[first].action), (KeyCode::B, KeyAction::Release));
+        kassert!(events[..first].iter().all(|e| e.code != KeyCode::C));
+        kassert!(events[first + 1..].iter().any(|e| e.code == KeyCode::C && !e.after_drop));
         Ok(())
     }
 );

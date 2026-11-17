@@ -634,12 +634,25 @@ fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, a
 /// `BOUND`'s lock is dropped (that wait looks at `BOUND`).
 fn mark_failed(why: Failure) {
     if let Some(b) = BOUND.lock().as_mut() {
-        b.failed = Some(why);
-        if let Some(s) = b.state.as_mut() {
-            s.buttons = lumen_input::Buttons::NONE;
+        // The ring's frame first, under `BOUND`'s lock (the ring is a leaf):
+        // a reader sees the drag end no later than `mouse` shows the
+        // failure.
+        if let Some(last) = failed_frame(b) {
+            crate::input::POINTER.push(last);
         }
+        b.failed = Some(why);
     }
     PARKED.wake_all();
+}
+
+/// A failed tablet's last state, every button released (`mouse` shows
+/// none held), and the frame that tells the desktop's ring so, marked as
+/// following a loss (`after_overrun`: whatever the device did last is
+/// gone), so a reader's drag ends; `None` before any frame came.
+fn failed_frame(b: &mut Bound) -> Option<PointerEvent> {
+    let state = b.state.as_mut()?;
+    state.buttons = lumen_input::Buttons::NONE;
+    Some(PointerEvent { state: *state, after_overrun: true })
 }
 
 /// The device stopped being ready (`FAILED`, `DEVICE_NEEDS_RESET`, or
@@ -657,10 +670,6 @@ fn fail(input: Input, status: StatusHandle, addr: PciAddr) {
         Failure::Stopped
     };
     mark_failed(why);
-    let last = BOUND.lock().as_ref().and_then(|b| b.state);
-    if let Some(state) = last {
-        crate::input::POINTER.push(PointerEvent { state, after_overrun: true });
-    }
     crate::term::hide_pointer();
     // (See the module doc for what dropping it does and leaks.)
     drop(input);
@@ -674,6 +683,30 @@ fn fail(input: Input, status: StatusHandle, addr: PciAddr) {
         warn!(target: "mouse", "{addr}: couldn't record the tablet as failed: the function isn't bound to it");
     }
 }
+
+crate::ktest!(
+    fn a_failed_tablet_s_last_frame_releases_every_button() {
+        // Built on a made-up bound tablet holding the left button: the
+        // last frame is its last position with no button, marked
+        // `after_overrun`, and the state `mouse` shows has none held too;
+        // with no frame yet there is none to push.
+        use crate::kassert_eq;
+        use lumen_input::Buttons;
+        let addr = PciAddr::new(0, 0, 3, 0).ok_or("addr")?;
+        let device = Device { addr, name: String::from("ktest tablet"), screen: (1280, 800) };
+        let state = PointerState { x: 5, y: 6, buttons: Buttons::LEFT, seq: 4, ..Default::default() };
+        let mut b = Bound { device, state: Some(state), counts: Counts::default(), stale: false, failed: None };
+        let frame = failed_frame(&mut b).ok_or("no frame")?;
+        kassert_eq!(
+            (frame.state.x, frame.state.y, frame.state.buttons, frame.after_overrun),
+            (5, 6, Buttons::NONE, true)
+        );
+        kassert_eq!(b.state.map(|s| s.buttons), Some(Buttons::NONE));
+        b.state = None;
+        kassert_eq!(failed_frame(&mut b), None);
+        Ok(())
+    }
+);
 
 /// A made-up bound tablet for the hold ktests (the ktest boot binds none;
 /// no thread reads it): the hold state and `BOUND` are put back on drop.

@@ -25,7 +25,10 @@
 //! - **Desktop events** ([`keys`], #151): [`PointerEvent`], [`KeyEvent`]
 //!   (press or release, with the modifiers after it, [`Mods`]) and
 //!   [`InputEvent`]; [`KeyDecoder`] turns set 1 bytes into key events (one
-//!   press per key, as [`Presses`] counts them) through `pc-keyboard`.
+//!   press per key, as [`Presses`] counts them, wherever `pc-keyboard`
+//!   refuses no byte, except for a Pause cut off after its `E1 1D`) through
+//!   `pc-keyboard`; [`MarksLoss`] and [`Read::gap`] say whether events may
+//!   have been lost before one, either way.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -36,7 +39,7 @@ pub mod scancode;
 pub mod tablet;
 
 pub use cursor::{Cursor, Surface};
-pub use keys::{AfterDrop, InputEvent, KeyAction, KeyCode, KeyDecoder, KeyEvent, Mods, PointerEvent};
+pub use keys::{AfterDrop, InputEvent, KeyAction, KeyCode, KeyDecoder, KeyEvent, MarksLoss, Mods, PointerEvent};
 pub use ring::{InputDevice, Read, Reader, Ring, Seq};
 pub use scancode::Presses;
 pub use tablet::{

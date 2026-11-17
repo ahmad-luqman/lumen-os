@@ -93,6 +93,9 @@ crate::ktest!(
         // says so.
         let read = reader.read().ok_or("no event")?;
         kassert_eq!((read.seq.get(), read.lost_before, read.event), (4, 2, 4));
+        // The gap goes with the event after it, and only that one.
+        let next = reader.read().ok_or("no event")?;
+        kassert_eq!((next.seq.get(), next.lost_before, next.event), (5, 0, 5));
         kassert_eq!(reader.lost(), 2);
         let recent: Vec<u32> = RING.recent(2).into_iter().map(|(_, e)| e).collect();
         kassert_eq!(recent, alloc::vec![6, 7]);

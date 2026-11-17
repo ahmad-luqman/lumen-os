@@ -142,7 +142,7 @@ tests = [
 ]
 
 [[feature]]
-name = "The desktop's input rings (#151, ARCHITECTURE section 7): every tablet frame goes into a numbered ring of 256 (`lumen_input::Ring` behind a leaf lock, an `InputDevice`) before the mouse thread publishes the newest state, so a press and a release read in one batch (the thread held meanwhile) are two events, each at its own position, and a later batch's frames follow them numbered on; an overrun batch's frames after its first, and the next batch's first, are marked `after_overrun`; every key event the keyboard's decoding pass decodes goes into a ring of 128 (`lumen_input::KeyDecoder` over pc-keyboard: presses and releases, bare modifiers included, with the modifiers after each: Shift+a is press LShift, press A with text 'A', release A, release LShift; RAlt2 dropped, Pause and Ctrl+Pause (E0 46) a PauseBreak press and its release, typematic repeat repeated presses, an E0 after a stray E1 losing no key; one press per key as `kbd`'s `presses` counts it wherever pc-keyboard refuses no byte, one listed exception), the first after the keyboard's queue dropped bytes marked `after_drop`, and the terminals still get their keys as before; a `Reader` reads a ring in order, each event with its number and the gap before it, counts what the ring overwrote before it looked, and skips to a number never backwards nor past the newest; `mouse events [n]` and `kbd events [n]` list each ring's newest events (records in a pipeline; without the device, what `mouse` or `kbd` says; with no screen shell decoding, `kbd events` says so), and `mouse` and `kbd` show each ring's newest number"
+name = "The desktop's input rings (#151, ARCHITECTURE section 7): every tablet frame goes into a numbered ring of 256 (`lumen_input::Ring` behind a leaf lock, an `InputDevice`) before the mouse thread publishes the newest state, so a press and a release read in one batch (the thread held meanwhile) are two events, each at its own position, and a later batch's frames follow them numbered on; an overrun batch's frames after its first, and the next batch's first, are marked `after_overrun`; every key event the keyboard's decoding pass decodes goes into a ring of 128 (`lumen_input::KeyDecoder` over pc-keyboard: presses and releases, bare modifiers included, with the modifiers after each: Shift+a is press LShift, press A with text 'A', release A, release LShift; RAlt2 dropped, Pause and Ctrl+Pause (E0 46) a PauseBreak press and its release, typematic repeat repeated presses, an E0 after a stray E1 losing no key; one press per key as `kbd`'s `presses` counts it wherever pc-keyboard refuses no byte, one listed exception), the first decoded from bytes queued after the keyboard's queue dropped one marked `after_drop` (may be late, never early), and the terminals still get their keys as before; a failed tablet's last frame releases every button; a `Reader` reads a ring in order, each event with its number and the gap before it (`Read::gap`: that gap or the event's own loss mark), counts what the ring overwrote before it looked, and skips to a number never backwards (one past the newest is caught as a bug); `mouse events [n]` and `kbd events [n]` list each ring's newest events (records in a pipeline; without the device, what `mouse` or `kbd` says; with no screen shell decoding, `kbd events` says so), and `mouse` and `kbd` show each ring's newest number"
 milestone = "M4"
 tests = [
     "cargo:lumen-input",
@@ -157,15 +157,19 @@ tests = [
     "scenario:test_input::test_key_events_have_releases_and_modifiers",
     "scenario:test_input::test_a_burst_of_moves_counts_overruns[*]",
     "scenario:test_input::test_mouse_hold_needs_a_tablet_and_takes_its_words",
+    "scenario:test_input::test_no_8042_is_a_warning",
+    "ktest:lumen_kernel::mouse::a_failed_tablet_s_last_frame_releases_every_button",
     "scenario:test_ktest::test_in_kernel_tests_pass",
 ]
 
 [[feature]]
-name = "One mapping from a key press to the line editor's key (`lumen_shell::Key::from_press`): from the press's text if it has one (Enter, Backspace, Delete, Tab, Ctrl with a letter, printable characters; other control characters none), else from its key code (the arrows, Home, End); the screen shells take their keys through it, a raw key with the modifiers its key event carries (Shift+PageUp scrolls back)"
+name = "One mapping from a key press to the line editor's key (`lumen_shell::Key::from_press`): from the press's text if it has one (Enter, Backspace, Delete, Tab, Ctrl with a letter (Ctrl+H, I, J and M as Backspace, Tab, Enter and Enter), printable characters; Escape and other control characters nothing), else from its key code (the arrows, Home, End); the screen shells take their keys through it, a raw key with the modifiers its key event carries (Shift+PageUp scrolls back)"
 milestone = "M4"
 tests = [
     "cargo:lumen-shell",
     "ktest:lumen_kernel::shell::keyboard_keys_reach_the_line_editor",
+    "ktest:lumen_kernel::shell::a_terminal_s_scroll_keys_scroll_it_even_when_hidden",
+    "scenario:test_term::test_scrollback",
     "scenario:test_input::test_keys_via_qmp_send_key",
     "scenario:test_ktest::test_in_kernel_tests_pass",
 ]
