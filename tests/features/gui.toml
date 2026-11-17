@@ -41,3 +41,53 @@ tests = [
 name = "Window-manager logic (lumen-wm): frame geometry hit at every edge (title bar, close box, client, borders); a click focuses and raises, closing the focused window focuses the one in front, exactly one focused (the front one) unless none, ids naming open windows only; a left drag from a title bar follows the pointer clamped to keep a strip of the title bar on the screen (opening too, by the whole width), ends at the left release even with another button held (then ignored until up), off the screen or when its window closes; a press starting on the desktop does nothing, one on a border focuses and raises and nothing more, until released; the implicit grab sends a client press (any button) and its moves, other buttons and releases to that window in client coordinates, out of it too, until its last button is up, it loses the focus or input is interrupted; the close box clicks on a left release over it; repainting only the reported damage equals repainting everything, focus included (randomized, with clicks, drags and first presses checked as they happen); press, pause, resume, release (and with a gap or an event after an overrun): the interruption releases the owner's buttons and no window is left holding one; a key gap tells the focused window and ends a grab but not a drag; the first click after a resume or a gap is a click, buttons held at the resume or pressed in an event after an overrun are ignored until up (counted), focus changes while paused wait for the resume; a window's event queue of key, pointer and request entries keeps Lost, focus changes and Close as flags (never dropped, never pushable, delivered in place, a focus loss never folded into a gain), drops presses and moves and refuses requests past 48 of 64, queues a release only after its press, sets Lost for one that doesn't fit, and counts unpaired releases apart (keys; buttons forgotten vs never pressed); deliver routes each delivery to it exactly; the light and dark palettes complete and readable"
 milestone = "M4"
 tests = ["cargo:lumen-wm"]
+
+[[feature]]
+name = "Desktop mode and the compositor (#153): opt-in (`desktop`, tested from the serial shell; the `lumen.desktop` boot flag; `make run DESKTOP=1` passes that flag, by design, not tested; the text console stays the default), refused while a command draws on a canvas (the start undone after its compositor thread began) and keeping commands' canvases out while shown; with no screen the boot flag warns once and the boot goes on; windows open only once the start completed, so window ids are never reused in a boot (a failed start opens none), and a first start never replaces a desktop already there; two demo windows with frames (title bar, border, close box) drawn by the compositor, the front one focused; a click focuses and raises, a title-bar drag moves the frame by exactly the drag and repaints the old place, the close box closes a window and focuses the next; a button held when the desktop first starts is ignored until every button is up, as at a resume; only the damaged rectangles are recomposed and presented (one key typed: the rectangles presented add under a tenth of the screen's pixels), and after a frame edge through another window's title (titles drawn clipped to each damaged rectangle), a drag, a raise, a focus change and a close the back buffer equals a full repaint and the screen the back buffer outside the pointer's box (`desktop check`); the pointer drawn straight onto the screen and taken off its old place; keys go to the focused window and never reach a terminal while the desktop is shown (on two CPUs too), keys typed just before Alt+F1 still reach the window, Alt+F1 leaves it (keys then reach the terminal, never a window) and `desktop` resumes it; `settled` is no while a key isn't acted on or a window never idles, and needs each of its conditions; a window whose owner stops reading drops events past its queue's ration, counted in `windows`' `lost` with one warning per burst, and reads them again once released; a delivery for a closed window counts as a dead push; `desktop check` and `screenshot` share one request slot held until the asker takes its answer (a second request meanwhile refused), and a `desktop check` queued as the desktop pauses is answered `paused` at once (a request given up on while it runs makes later ones fail as stuck); at most 32 windows (a 33rd refused, room again after a close); `windows` and `desktop status` as records (`windows | where focused = yes`)"
+milestone = "M4"
+tests = [
+    "cargo:lumen-gfx",
+    "cargo:lumen-wm",
+    "cargo:lumen-input",
+    "scenario:test_gui::test_two_windows_golden",
+    "scenario:test_gui::test_drag_moves_window",
+    "scenario:test_gui::test_click_focuses_and_raises",
+    "scenario:test_gui::test_a_button_held_at_the_start_is_ignored",
+    "scenario:test_gui::test_leaving_and_resuming_the_desktop",
+    "scenario:test_gui::test_keys_just_before_alt_f_reach_the_window",
+    "scenario:test_gui::test_a_check_queued_as_the_desktop_pauses_is_answered_paused",
+    "scenario:test_gui::test_presents_match_a_full_repaint",
+    "scenario:test_gui::test_a_window_behind_drops_and_says_busy",
+    "scenario:test_gui::test_pointer_moves_over_the_desktop",
+    "scenario:test_gui::test_desktop_and_canvas_exclude_each_other",
+    "scenario:test_gui::test_boot_flag_starts_the_desktop",
+    "scenario:test_gui::test_boot_flag_without_a_screen_warns",
+    "ktest:lumen_kernel::desktop::opening_past_the_window_limit_fails",
+    "ktest:lumen_kernel::desktop::a_window_opens_only_once_the_start_completed",
+    "ktest:lumen_kernel::desktop::a_first_start_over_a_live_desktop_is_refused",
+    "ktest:lumen_kernel::desktop::settled_needs_every_one_of_its_conditions",
+    "ktest:lumen_kernel::desktop::a_closed_window_s_deliveries_count_as_dead_pushes",
+    "ktest:lumen_kernel::desktop::a_button_held_at_the_first_entry_is_ignored_until_released",
+    "ktest:lumen_kernel::desktop::a_request_holds_the_slot_until_its_asker_takes_the_answer",
+    "ktest:lumen_kernel::desktop::a_second_request_is_refused_while_the_first_waits",
+    "ktest:lumen_kernel::desktop::a_request_queued_when_the_desktop_pauses_is_answered_paused",
+    "ktest:lumen_kernel::vt::keys_while_the_desktop_is_shown_are_its_own_until_alt_f_leaves_it",
+    "ktest:lumen_kernel::shell::sysinfo::every_record_table_fits_its_columns",
+]
+
+[[feature]]
+name = "The crash screen over the desktop (#153): a deliberate fault from the serial shell while the desktop presents (two CPUs, a window committing every 20 ms whose green is on the screen just before) gives the full symbolized report and the crash code, and the crash screen covers the desktop (its banner, none of the spinner's green left); the compositor stops presenting first: a present stops at the next row once its canvas dies (the real span path, the epoch changed after 3 rows, every later row unchanged)"
+milestone = "M4"
+tests = [
+    "scenario:test_crash::test_crash_report_over_desktop",
+    "ktest:lumen_kernel::desktop::a_present_stops_at_the_next_row_once_the_canvas_dies",
+]
+
+[[feature]]
+name = "`screenshot` while the desktop is shown reads its back buffer (the compositor copies it between passes), so the pointer is never in it: with the pointer over the desktop it equals QEMU's screendump outside the arrow's box and differs inside it; a screenshot queued as the desktop pauses reads the text screen instead"
+milestone = "M4"
+tests = [
+    "scenario:test_gui::test_desktop_screenshot_matches_screendump",
+    "scenario:test_gui::test_a_screenshot_queued_as_the_desktop_pauses_reads_the_text_screen",
+    "ktest:lumen_kernel::desktop::a_request_queued_when_the_desktop_pauses_is_answered_paused",
+]

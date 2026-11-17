@@ -73,8 +73,9 @@ pub type MakeTable = fn(&[String]) -> Option<Result<pipe::Table, String>>;
 
 /// The system commands that give records in a pipeline (instead of their
 /// text), and the tables they give.
-pub const RECORDS: [(&str, MakeTable); 8] = [
+pub const RECORDS: [(&str, MakeTable); 10] = [
     ("cpus", |a| no_args(a, cpu_table)),
+    ("desktop", crate::desktop::records),
     ("irqs", |a| no_args(a, vector_table)),
     ("kbd", kbd_records),
     ("lspci", |a| no_args(a, pci_table)),
@@ -82,6 +83,7 @@ pub const RECORDS: [(&str, MakeTable); 8] = [
     ("mouse", mouse_records),
     ("sound", |a| no_args(a, crate::sound::table)),
     ("threads", |a| no_args(a, thread_table)),
+    ("windows", crate::desktop::windows_records),
 ];
 
 /// A command's records when it takes no arguments: `table`'s, given none.
@@ -940,16 +942,19 @@ crate::ktest!(
         // table of inputs.
         use crate::kassert;
         let events = [String::from("events")];
+        let status = [String::from("status")];
         for (name, make) in RECORDS {
-            // Each with no arguments, and `events` for the two that take it
-            // (`kbd` gives records only for that). Without a device the
-            // events are its line instead (the ktest machine has no
-            // tablet).
-            for args in [&[][..], &events[..]] {
+            // Each with no arguments, `events` for the two that take it
+            // (`kbd` gives records only for that) and `status` for
+            // `desktop`. Without a device the events are its line instead
+            // (the ktest machine has no tablet), and without a desktop (the
+            // test kernel starts none) `windows` says so.
+            for args in [&[][..], &events[..], &status[..]] {
                 let Some(table) = make(args) else { continue };
                 let table = match table {
                     Ok(table) => table,
                     Err(e) if name == "mouse" && e == NO_TABLET => continue,
+                    Err(e) if name == "windows" && e == "windows: no desktop" => continue,
                     Err(_) => return Err("a records error"),
                 };
                 let rows = table.rows().len();

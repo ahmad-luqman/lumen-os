@@ -59,6 +59,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 from lumen_harness.qmp import BUTTONS, qcodes_for
@@ -675,3 +676,146 @@ def type_confirmed(
     """Type `text` as a US layout would, confirming each character's keys
     (`confirmed_keys`)."""
     return confirmed_keys(m, text, timeout=timeout, allow=allow)
+
+
+# -- the desktop (#153) --------------------------------------------------------
+
+# kernel/src/desktop.rs `command` (change them together).
+STARTED = "desktop: started (Alt+F1 shows the terminals)\n"
+
+
+def parse_records(out: str) -> list[dict[str, str]]:
+    """A records table as the kernel prints it (a header line of column
+    names, then a row per record; the values have no spaces): one dict per
+    row, column name to text."""
+    lines = [line.split() for line in out.splitlines() if line.strip()]
+    if not lines:
+        raise AssertionError(f"no table in {out!r}")
+    header, rows = lines[0], lines[1:]
+    for row in rows:
+        if len(row) != len(header):
+            raise AssertionError(f"a row of {len(row)} values under {len(header)} columns:\n{out}")
+    return [dict(zip(header, row, strict=True)) for row in rows]
+
+
+def desktop_status(m: Machine, allow: str | None = None) -> dict[str, str]:
+    """`desktop status`'s one record."""
+    rows = parse_records(run(m, "desktop status", allow=allow))
+    if len(rows) != 1:
+        raise AssertionError(f"desktop status gave {len(rows)} records")
+    return rows[0]
+
+
+def windows(m: Machine, allow: str | None = None) -> list[dict[str, str]]:
+    """`windows`' rows, front to back (none without a desktop: it says so
+    instead of a table)."""
+    out = run(m, "windows", allow=allow)
+    if out.strip() == "windows: no desktop":
+        return []
+    return parse_records(out)
+
+
+def window(m: Machine, title: str, allow: str | None = None) -> dict[str, str]:
+    """The `windows` row titled `title` (exactly one)."""
+    found = [w for w in windows(m, allow) if w["title"] == title]
+    if len(found) != 1:
+        raise AssertionError(f"{len(found)} windows titled {title!r}")
+    return found[0]
+
+
+def wait_for[T](
+    m: Machine, what: str, read: Callable[[], T], done: Callable[[T], bool], timeout: float = 10
+) -> T:
+    """`poll` that fails, naming `what` and the last reading, if `done`
+    never holds."""
+    got, ok = poll(m, read, done, timeout)
+    if not ok:
+        raise AssertionError(f"{what} never happened in {_said(m, timeout)}: last {got}")
+    return got
+
+
+def wait_windows(m: Machine, count: int, timeout: float = 30) -> list[dict[str, str]]:
+    """Wait until `windows` lists `count` windows; its rows then."""
+    return wait_for(m, f"{count} windows", lambda: windows(m), lambda w: len(w) == count, timeout)
+
+
+def wait_settled(m: Machine, timeout: float = 30, allow: str | None = None) -> dict[str, str]:
+    """Wait until `desktop status` says `settled yes` (every byte typed
+    decoded, both input rings read, no damage gathered or pass running, no
+    commit under way, every window's queue empty with its owner waiting);
+    its record then. Poll for the effect a step should have first (a
+    `windows` row, say): settling says nothing more is moving, not that
+    the step happened."""
+    return wait_for(
+        m,
+        "a settled desktop",
+        lambda: desktop_status(m, allow),
+        lambda s: s["settled"] == "yes",
+        timeout,
+    )
+
+
+def start_desktop(m: Machine) -> None:
+    """`desktop` on the serial shell, then wait for the two demo windows and
+    for the desktop to settle."""
+    out = run(m, "desktop", 30)
+    if out != STARTED:
+        raise AssertionError(f"desktop said {out!r}")
+    wait_windows(m, 2)
+    wait_settled(m)
+
+
+def wait_desktop_state(m: Machine, state: str, timeout: float = 10) -> dict[str, str]:
+    """Wait until `desktop status` says `state` (`shown`, `paused`); its
+    record then."""
+    return wait_for(
+        m, f"the desktop {state}", lambda: desktop_status(m), lambda s: s["state"] == state, timeout
+    )
+
+
+def desktop_spin(m: Machine, allow: str | None = None) -> str:
+    """`desktop spin`: the id of its window (a pure green bar moving every
+    20 ms)."""
+    out = run(m, "desktop spin", allow=allow)
+    found = re.fullmatch(r"desktop spin: window (\d+)\n", out)
+    if found is None:
+        raise AssertionError(f"desktop spin said {out!r}")
+    return found[1]
+
+
+def desktop_check(m: Machine, tries: int = 20, allow: str | None = None) -> tuple[int, int]:
+    """`desktop check` (retried while it says `busy`, up to `tries`
+    times): the pixels that differ from a full repaint, and from the screen
+    (outside the pointer's box)."""
+    for _ in range(tries):
+        out = run(m, "desktop check", 60, allow=allow)
+        if out.strip() == "desktop check: busy":
+            time.sleep(0.2)
+            continue
+        found = re.fullmatch(
+            r"desktop check: (\d+) pixels differ from a full repaint, (\d+) from the screen\n", out
+        )
+        if found is None:
+            raise AssertionError(f"desktop check said {out!r}")
+        return int(found[1]), int(found[2])
+    raise AssertionError(f"desktop check was busy {tries} times")
+
+
+def settled_capture[T](
+    m: Machine, take: Callable[[], T], tries: int = 5, allow: str | None = None
+) -> T:
+    """`take()` on a settled desktop: between two `desktop status` reads
+    that are both settled with the same `frames` (nothing was presented
+    meanwhile), taken again otherwise; fails if no try was bracketed."""
+    for _ in range(tries):
+        before = wait_settled(m, allow=allow)
+        got = take()
+        after = desktop_status(m, allow)
+        if after["settled"] == "yes" and after["frames"] == before["frames"]:
+            return got
+    raise AssertionError(f"the desktop presented during each of {tries} captures")
+
+
+def settled_screendump(m: Machine, name: str, tries: int = 5, allow: str | None = None) -> Path:
+    """A screendump of a settled desktop (`settled_capture`); its path."""
+    return settled_capture(m, lambda: m.screendump(name), tries, allow)

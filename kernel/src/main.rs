@@ -34,6 +34,7 @@ mod boot;
 mod cmdline;
 mod crash;
 mod demo;
+mod desktop;
 mod drivers;
 mod fb;
 mod font;

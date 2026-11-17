@@ -588,6 +588,9 @@ fn run(mut input: Input, mut tablet: Tablet, frame: u64, status: StatusHandle, a
         for (&state, after_overrun) in frames.iter().zip(marks.batch(frames.len(), overrun)) {
             crate::input::POINTER.push(PointerEvent { state, after_overrun });
         }
+        if !frames.is_empty() {
+            crate::desktop::wake();
+        }
         if events > 0
             && let Some(b) = BOUND.lock().as_mut()
         {
@@ -643,6 +646,7 @@ fn mark_failed(why: Failure) {
         b.failed = Some(why);
     }
     PARKED.wake_all();
+    crate::desktop::wake();
 }
 
 /// A failed tablet's last state, every button released (`mouse` shows

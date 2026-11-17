@@ -130,6 +130,10 @@ static UNDECODED: AtomicU64 = AtomicU64::new(0);
 /// Bytes skipped during init: not the awaited reply, from port 2, or
 /// flushed.
 static SKIPPED: AtomicU64 = AtomicU64::new(0);
+/// Bytes the decoder finished (each counted after its key event, if any,
+/// was pushed): `desktop status`'s `settled` compares it with
+/// [`ARRIVED`]'s bytes queued.
+static DECODED: AtomicU64 = AtomicU64::new(0);
 
 // Controller commands (port 0x64).
 const READ_CONFIG: u8 = 0x20;
@@ -503,6 +507,8 @@ fn drain() {
     }
     if queued {
         WAITING.wake_all();
+        // The compositor decodes the keyboard's bytes itself (#153).
+        crate::desktop::wake();
     }
 }
 
@@ -571,6 +577,23 @@ pub fn queue_for_test(bytes: &[u8]) -> bool {
     bytes.iter().all(|&b| QUEUE.push(b))
 }
 
+/// Whether bytes are queued, waiting to be decoded (an atomic look, no
+/// lock: the compositor's wake-up check, #153).
+pub fn bytes_pending() -> bool {
+    !QUEUE.is_empty()
+}
+
+/// Whether every byte the keyboard queued has been decoded, its key event
+/// pushed: the bytes queued ([`ARRIVED`]'s count, read first under its
+/// lock) are no more than the bytes the decoder finished. (`desktop
+/// status`'s `settled`. The ktests' `queue_for_test` bytes are decoded
+/// without being counted as queued, and other ktests decode bytes of
+/// their own through the same decoder, so this compares with `<=`.)
+pub fn all_decoded() -> bool {
+    let queued = ARRIVED.lock().bytes;
+    queued <= DECODED.load(Ordering::Relaxed)
+}
+
 /// Block the calling thread until bytes are queued or `ready()` holds.
 /// Both are checked under the wait queue's lock with interrupts off, so
 /// `ready` must not block or allocate, and a byte queued after the caller
@@ -609,7 +632,11 @@ fn decode(
             event.after_drop = drops.mark();
             push(event);
         };
-        match decoder.add_byte(byte, marked) {
+        let decoded = decoder.add_byte(byte, marked);
+        // Counted once the byte's key event is in the ring (`all_decoded`:
+        // nothing is mid-decode then).
+        DECODED.fetch_add(1, Ordering::Relaxed);
+        match decoded {
             Ok(Some(DecodedKey::Unicode(c))) => return Some(Key::Char(c)),
             Ok(Some(DecodedKey::RawKey(code))) => {
                 return Some(Key::Raw { code, mods: Mods::from(decoder.modifiers()) });

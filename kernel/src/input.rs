@@ -11,9 +11,13 @@
 //! overwrites its oldest event. The `mouse` thread pushes each frame
 //! before it publishes the newest state (`crate::mouse`), and the
 //! keyboard's decoding pass each key event it decodes
-//! (`crate::keyboard::read_key`). Until the desktop (#153) no `Reader`
-//! follows them: only the shell's `mouse events` and `kbd events` look at
-//! the newest, and the rings fill and wrap.
+//! (`crate::keyboard::read_key`). The `mouse` thread then wakes the
+//! desktop's compositor (`crate::desktop::wake`, after the ring's lock),
+//! the one `Reader` of both (#153); the key ring needs no waker of its own:
+//! IRQ 1 wakes the compositor when it queues bytes, and the compositor
+//! runs the decoding pass itself. Without a desktop only the shell's `mouse
+//! events` and `kbd events` look at the newest, and the rings fill and
+//! wrap.
 
 use alloc::vec::Vec;
 
@@ -37,6 +41,13 @@ impl<E: Copy, const N: usize> LockedRing<E, N> {
     /// The newest event's number (`Seq::ZERO` before the first).
     pub fn newest(&self) -> Seq {
         self.0.lock().newest()
+    }
+
+    /// The newest event with its number, if there is one (nothing
+    /// allocates: the desktop's cut reads it under `crate::vt`'s router
+    /// lock).
+    pub fn newest_event(&self) -> Option<(Seq, E)> {
+        self.0.lock().recent(1).next()
     }
 
     /// The newest `n` events (fewer if the ring holds fewer), oldest

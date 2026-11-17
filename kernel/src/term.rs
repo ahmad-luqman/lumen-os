@@ -31,6 +31,13 @@
 //! command on serial (on no terminal) leaves the shown one, and its keys,
 //! where they are.
 //!
+//! The desktop (#153) takes the whole screen, header included, the same
+//! way ([`take_screen`]: a [`ScreenCanvas`], whose rows are written under
+//! the screen's lock, one row per hold, and only while it is live). Alt+F1
+//! to F4 give the screen back from it ([`leave_desktop`], called by
+//! `crate::vt` under its router lock): the one way a terminal is shown
+//! while a canvas is held.
+//!
 //! The terminal takes `\n` as a line feed only: [`write_str_to`],
 //! [`write_fmt_to`] and log lines turn it into CR LF.
 //!
@@ -91,8 +98,8 @@ struct Screen {
     /// Cells drawn so far (the shell's `term` shows it; the tests count redraws
     /// with it).
     cells_drawn: u64,
-    /// Whose [`Canvas`] has the pixels, if one has: draw nothing then.
-    canvas: Option<Owner>,
+    /// Who has the pixels, if anyone: draw nothing then.
+    holder: Option<Holder>,
     /// Where the mouse pointer's tip should be (framebuffer pixels), if the
     /// tablet reported a position (and the pointer wasn't hidden since).
     pointer_at: Option<(usize, usize)>,
@@ -138,7 +145,7 @@ pub fn init(fb: Framebuffer) {
         cursor_drawn: None,
         blink_on: true,
         cells_drawn: 0,
-        canvas: None,
+        holder: None,
         pointer_at: None,
         pointer: lumen_input::Cursor::default(),
     };
@@ -208,7 +215,7 @@ pub fn stop() {
 pub fn read_pixels(f: impl FnOnce(&Framebuffer)) -> Option<bool> {
     with_screen(|s| {
         f(&s.fb);
-        s.canvas.is_some()
+        s.holder.is_some()
     })
 }
 
@@ -263,7 +270,7 @@ impl Screen {
         }
         self.shown = vt;
         self.draw_tabs();
-        if self.canvas.is_none() {
+        if self.holder.is_none() {
             self.redraw();
         }
     }
@@ -294,7 +301,7 @@ impl Screen {
     /// Draw what changed since the last time (nothing while a [`Canvas`]
     /// has the pixels: [`Self::resume`] draws every cell afterwards).
     fn render(&mut self) {
-        if self.canvas.is_some() {
+        if self.holder.is_some() {
             return;
         }
         let cols = self.term().cols();
@@ -347,7 +354,17 @@ impl Screen {
     /// ([`reclaim_canvas`]): clear what it drew (everything below the
     /// header) and draw every cell of the terminal again.
     fn resume(&mut self) {
-        self.canvas = None;
+        self.holder = None;
+        self.redraw();
+    }
+
+    /// The desktop gave the whole screen back: draw the header, the
+    /// terminals' boxes and the shown terminal, all of it.
+    fn redraw_all(&mut self) {
+        let w = self.fb.width();
+        self.uncover(0, 0, w, fb::CONSOLE_TOP);
+        fb::draw_header(&self.fb);
+        self.draw_tabs();
         self.redraw();
     }
 
@@ -409,7 +426,7 @@ impl Screen {
     /// The one place that decides whether the pointer shows.
     fn place_pointer(&mut self) {
         let px = &mut Pixels(&self.fb);
-        match self.pointer_at.filter(|_| self.canvas.is_none()) {
+        match self.pointer_at.filter(|_| self.holder.is_none()) {
             Some((x, y)) => {
                 let (outline, fill) = (self.fb.encode(POINTER_OUTLINE), self.fb.encode(POINTER_FILL));
                 self.pointer.show(px, x, y, outline, fill);
@@ -559,12 +576,45 @@ impl fmt::Display for CanvasError {
 /// keys go there: `crate::vt` follows [`shown`]), and while the canvas is
 /// held no other terminal can be shown ([`show`]).
 pub fn canvas(owner: Owner) -> Result<Canvas, CanvasError> {
+    claim(
+        |_| Holder::Command(owner),
+        |s, epoch| {
+            // Drawn when the canvas goes (`resume`); the header's tabs now.
+            if let Some(vt) = owner.vt {
+                s.switch(vt);
+            }
+            // (`drawing` takes the pointer off now: `place_pointer`.)
+            // SAFETY: the terminal's handle draws nothing while the canvas
+            // is live (`Screen::holder`), so the two never draw at the same
+            // time (see `Canvas`'s `Sync` for a canvas no longer live).
+            let fb = unsafe { s.fb.alias() };
+            let (width, height) = canvas_dims(&fb);
+            Canvas { fb, width, height, epoch }
+        },
+    )
+}
+
+/// Who has the pixels instead of the terminals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Holder {
+    /// A command's [`Canvas`] (below the header).
+    Command(Owner),
+    /// The desktop's [`ScreenCanvas`] (the whole screen), taken at
+    /// `epoch`: which take it is (the desktop takes the screen with one
+    /// owner each time it resumes).
+    Whole { owner: Owner, epoch: u64 },
+}
+
+/// Claim the pixels for the holder `holder` makes of the current epoch,
+/// then `make` the canvas, all under the screen's lock: refused if anyone
+/// holds them, with no terminal, or once a crash report started.
+fn claim<T>(holder: impl FnOnce(u64) -> Holder, make: impl FnOnce(&mut Screen, u64) -> T) -> Result<T, CanvasError> {
     // `with_screen` refuses on a CPU already drawing too: never one taking
     // a canvas, as drawing holds the screen's lock with interrupts off
     // (which is why that case has no error of its own).
     debug_assert!(!drawing_here());
     let taken = with_screen(|s| {
-        if s.canvas.is_some() {
+        if s.holder.is_some() {
             return Err(CanvasError::InUse);
         }
         // Changed only under the screen's lock, or by `stop`: an epoch read
@@ -574,18 +624,11 @@ pub fn canvas(owner: Owner) -> Result<Canvas, CanvasError> {
         if STOPPED.load(Ordering::Acquire) {
             return Err(CanvasError::Stopped);
         }
-        s.canvas = Some(owner);
-        // Drawn when the canvas goes (`resume`); the header's tabs now.
-        if let Some(vt) = owner.vt {
-            s.switch(vt);
-        }
-        // (`drawing` takes the pointer off now: `place_pointer`.)
-        // SAFETY: the terminal's handle draws nothing while the canvas is
-        // live (`Screen::canvas`), so the two never draw at the same time
-        // (see `Canvas`'s `Sync` for a canvas no longer live).
-        let fb = unsafe { s.fb.alias() };
-        let (width, height) = canvas_dims(&fb);
-        Ok(Canvas { fb, width, height, epoch })
+        // The holder is set before `make` runs: the switch a command's
+        // canvas makes (`Screen::switch`) then draws no cells while the
+        // pixels are held.
+        s.holder = Some(holder(epoch));
+        Ok(make(s, epoch))
     });
     match taken {
         Some(result) => result,
@@ -706,11 +749,168 @@ impl Drop for Canvas {
 /// one.
 pub fn reclaim_canvas(owner: Owner) -> bool {
     with_screen(|s| {
-        if s.canvas != Some(owner) {
+        if s.holder != Some(Holder::Command(owner)) {
             return false;
         }
         CANVAS_EPOCH.fetch_add(1, Ordering::AcqRel);
         s.resume();
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// The whole screen, header included, for the desktop (#153): a
+/// [`Canvas`]'s rules (one holder at a time, the terminals drawing nothing
+/// meanwhile but still taking output, their pointer off, its draws ending
+/// when the epoch changes), but it draws through the screen's lock: each
+/// row of [`ScreenCanvas::write_span`] takes the lock, checks the canvas is
+/// still live and still the holder, and writes the row or drops it. So a
+/// present preempted halfway can't land a stale row on the terminal
+/// [`leave_desktop`] redrew under the same lock, and once a crash report
+/// begins (`stop`, which changes the epoch) no row starts.
+///
+/// Its pixels are `lumen_gfx`'s (`0xXXRRGGBB`), converted to the
+/// framebuffer's channel layout as they are written. Dropping it gives the
+/// screen back (the header and the shown terminal are drawn again) if it
+/// still holds it; [`leave_desktop`] does that without dropping it.
+pub struct ScreenCanvas {
+    owner: Owner,
+    width: usize,
+    height: usize,
+    /// [`CANVAS_EPOCH`] when it was taken.
+    epoch: u64,
+    /// For the ktests: change the epoch after this many more rows written
+    /// (`a_present_stops_at_the_next_row_once_the_canvas_dies`).
+    #[cfg(feature = "ktest")]
+    kill_after: Option<usize>,
+}
+
+/// Take the whole screen for `owner` (the desktop's): refused while a
+/// command holds a [`Canvas`] (`CanvasError::InUse`), with no terminal, or
+/// once a crash report started.
+pub fn take_screen(owner: Owner) -> Result<ScreenCanvas, CanvasError> {
+    // (`drawing` takes the terminals' pointer off once it is claimed.)
+    claim(
+        |epoch| Holder::Whole { owner, epoch },
+        |s, epoch| ScreenCanvas {
+            owner,
+            width: s.fb.width(),
+            height: s.fb.height(),
+            epoch,
+            #[cfg(feature = "ktest")]
+            kill_after: None,
+        },
+    )
+}
+
+impl ScreenCanvas {
+    /// Whether its rows are still written: false once [`leave_desktop`]
+    /// took the screen back or a crash report started.
+    pub fn is_live(&self) -> bool {
+        CANVAS_EPOCH.load(Ordering::Acquire) == self.epoch
+    }
+
+    /// Whether this take still holds the screen (on `s`, under its lock).
+    fn holds(&self, s: &Screen) -> bool {
+        s.holder == Some(Holder::Whole { owner: self.owner, epoch: self.epoch })
+    }
+
+    /// Whether row `y` may be read or written now (on `s`, under its lock):
+    /// live, still the holder, and inside the screen.
+    fn holds_row(&self, s: &Screen, y: usize) -> bool {
+        self.is_live() && self.holds(s) && y < self.height
+    }
+
+    /// Row `y` from column `x` on, as `0x00RRGGBB` pixels, into `out` (as
+    /// many as fit, at most to the row's end), read under the screen's
+    /// lock: `desktop check` compares the screen with the back buffer.
+    /// False, reading nothing, once it isn't live.
+    pub fn read_span(&self, x: usize, y: usize, out: &mut [u32]) -> bool {
+        with_screen(|s| {
+            if !self.holds_row(s, y) {
+                return false;
+            }
+            for (i, px) in out.iter_mut().take(self.width.saturating_sub(x)).enumerate() {
+                *px = s.fb.decode(s.fb.pixel(x + i, y));
+            }
+            true
+        })
+        .unwrap_or(false)
+    }
+
+    /// For the ktests: the epoch changes (as `leave_desktop` or a crash
+    /// would change it) once `rows` more rows were written.
+    #[cfg(feature = "ktest")]
+    pub fn kill_after(&mut self, rows: usize) {
+        self.kill_after = Some(rows);
+    }
+}
+
+impl lumen_gfx::Target for ScreenCanvas {
+    fn size(&self) -> (u32, u32) {
+        (self.width as u32, self.height as u32)
+    }
+
+    /// One row under the screen's lock, dropped (never a panic) outside
+    /// the screen or once the canvas isn't live. Nothing allocates.
+    fn write_span(&mut self, x: u32, y: u32, pixels: &[u32]) {
+        let (x, y) = (x as usize, y as usize);
+        let _ = with_screen(|s| {
+            if !self.holds_row(s, y) {
+                return;
+            }
+            for (i, &p) in pixels.iter().take(self.width.saturating_sub(x)).enumerate() {
+                s.fb.put_encoded(x + i, y, s.fb.encode(p));
+            }
+        });
+        #[cfg(feature = "ktest")]
+        if let Some(n) = self.kill_after.as_mut() {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.kill_after = None;
+                CANVAS_EPOCH.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
+impl Drop for ScreenCanvas {
+    fn drop(&mut self) {
+        // This take still holds the screen (not taken back by
+        // `leave_desktop`, after which a resume's newer take may hold it
+        // for the same owner): give it back, live or not (a ktest's hook
+        // may have changed the epoch without taking it back). After a crash
+        // report started, nothing (`with_screen` refuses).
+        let _ = with_screen(|s| {
+            if self.holds(s) {
+                s.holder = None;
+                s.redraw_all();
+            }
+        });
+    }
+}
+
+/// Alt+F`n` while the desktop is shown (`crate::vt`, under its router
+/// lock): if `owner` holds the [`ScreenCanvas`], under the screen's lock,
+/// change the canvas epoch (no desktop row is written after this), give
+/// the screen back, show terminal `vt` and draw the header, the boxes and
+/// that terminal. True if it did; false (nothing changed) if `owner`
+/// doesn't hold the whole screen (another holder's canvas still refuses
+/// the switch, as `show` does), there is no terminal, or a crash report
+/// started.
+///
+/// # Panics
+/// If `vt >= VTS`.
+pub fn leave_desktop(owner: Owner, vt: usize) -> bool {
+    assert!(vt < VTS, "no virtual terminal {vt}");
+    with_screen(|s| {
+        if !matches!(s.holder, Some(Holder::Whole { owner: o, .. }) if o == owner) {
+            return false;
+        }
+        CANVAS_EPOCH.fetch_add(1, Ordering::AcqRel);
+        s.holder = None;
+        s.shown = vt;
+        s.redraw_all();
         true
     })
     .unwrap_or(false)
@@ -797,7 +997,7 @@ pub fn show(vt: usize) -> Result<(), ShowError> {
         return Err(ShowError::NoSuchTerminal);
     }
     with_screen(|s| {
-        if s.canvas.is_some() && vt != s.shown {
+        if s.holder.is_some() && vt != s.shown {
             return Err(ShowError::InUse);
         }
         s.switch(vt);
@@ -886,7 +1086,7 @@ fn move_view(vt: usize, scroll: impl FnOnce(&mut Terminal) -> bool) {
     let moved = with_screen(|s| {
         // The view stays put while a canvas has the screen (nothing would
         // show the move; the terminal comes back as it was left).
-        if s.canvas.is_some() || !scroll(&mut s.terms[vt]) {
+        if s.holder.is_some() || !scroll(&mut s.terms[vt]) {
             return None;
         }
         if vt == s.shown {
@@ -973,7 +1173,7 @@ pub fn status() -> Option<Status> {
             view: t.view_offset(),
             top_row: top_row(t),
             cells_drawn: s.cells_drawn,
-            paused: s.canvas.is_some(),
+            paused: s.holder.is_some(),
             shown: s.shown,
         }
     })
@@ -1471,7 +1671,7 @@ crate::ktest!(
                     }
                 })
             });
-            (s.canvas.is_some(), cells_match && all_inked, [ink(BEFORE), ink(UNDER)])
+            (s.holder.is_some(), cells_match && all_inked, [ink(BEFORE), ink(UNDER)])
         })
         .ok_or("no terminal")?;
         kassert!(!paused);
@@ -1594,7 +1794,7 @@ crate::ktest!(
         kassert_eq!(shown(), 2);
         drop(c);
         let (paused, cells_match) =
-            with_screen(|s| (s.canvas.is_some(), s.shadow_matches_grid())).ok_or("no terminal")?;
+            with_screen(|s| (s.holder.is_some(), s.shadow_matches_grid())).ok_or("no terminal")?;
         kassert!(!paused && cells_match);
         kassert_eq!(shown(), 2);
         show(0).map_err(|_| "no switch back")?;

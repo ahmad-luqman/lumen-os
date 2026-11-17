@@ -4,16 +4,17 @@
 //!
 //! Two steps, kept apart so the desktop can bring its own source:
 //!
-//! - **Capture** ([`capture_framebuffer`]): the framebuffer's pixels into
+//! - **Capture** ([`capture`]): the desktop's back buffer while it is
+//!   shown, else [`capture_framebuffer`]: the framebuffer's pixels into
 //!   `lumen_png` rows allocated beforehand, read once under the screen's
 //!   lock ([`term::read_pixels`]), so terminal output, a cursor flip or a
 //!   pointer move can't land halfway through (by design; not tested). A
 //!   command holding a `term::Canvas` draws without that lock: the capture
 //!   then says a command held the screen, and the summary line warns that
 //!   the image may be torn. The framebuffer is write-combined: reads are slow there, but
-//!   this reads it once. In desktop mode (#153) the source is a copy the
-//!   compositor makes between passes into a buffer the command allocated,
-//!   so it never shows the pointer; the compositor fills the rows directly.
+//!   this reads it once. While the desktop is shown (#153) the source is a
+//!   copy the compositor makes between passes into rows the command
+//!   allocated (`desktop::capture`), so it never shows the pointer.
 //! - **Encoding** ([`encode`]): on a thread with an [`ENCODE_STACK`] stack
 //!   (the compressor needs about 72 KiB, more than a thread's default),
 //!   the rows' and the file's buffers refused rather than aborted when the
@@ -43,6 +44,8 @@ pub enum Error {
     Png(png::Error),
     /// No thread to encode on.
     NoThread(crate::sched::SpawnError),
+    /// The desktop's compositor didn't copy its back buffer (why).
+    Desktop(String),
 }
 
 impl fmt::Display for Error {
@@ -51,6 +54,7 @@ impl fmt::Display for Error {
             Error::NoScreen => write!(f, "no screen to capture"),
             Error::Png(e) => write!(f, "{e}"),
             Error::NoThread(e) => write!(f, "no thread to encode on: {e}"),
+            Error::Desktop(why) => write!(f, "the desktop's back buffer: {why}"),
         }
     }
 }
@@ -63,6 +67,25 @@ pub struct Capture {
     pub canvas_held: bool,
     /// How long filling the rows took (under the screen's lock).
     pub read_ns: u64,
+}
+
+/// Capture the screen: the desktop's back buffer while it is shown (the
+/// compositor copies it into the rows between passes, so the pointer is
+/// never in it), the framebuffer otherwise (paused, or no desktop).
+pub fn capture() -> Result<Capture, Error> {
+    if !crate::desktop::is_shown() {
+        return capture_framebuffer();
+    }
+    let (w, h) = term::screen_size().ok_or(Error::NoScreen)?;
+    let dimension = |n: usize| u32::try_from(n).map_err(|_| Error::Png(png::Error::TooLarge));
+    let rows = Rows::new(dimension(w)?, dimension(h)?).map_err(Error::Png)?;
+    match crate::desktop::capture(rows) {
+        Some(Ok((rows, read_ns))) => Ok(Capture { rows, canvas_held: false, read_ns }),
+        Some(Err(why)) => Err(Error::Desktop(why)),
+        // Paused meanwhile (before the copy, or answered `Paused` by the
+        // paused pass): the text screen is what is shown.
+        None => capture_framebuffer(),
+    }
 }
 
 /// Capture the framebuffer (the text console's screen).
@@ -104,7 +127,7 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
         // A screen full of base64 is no use; the harness reads serial.
         return ctx.fail("screenshot: run it on serial (the PNG comes out as text)");
     }
-    let capture = match capture_framebuffer() {
+    let capture = match capture() {
         Ok(capture) => capture,
         Err(e) => return ctx.fail(format_args!("screenshot: {e}")),
     };

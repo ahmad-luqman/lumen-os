@@ -16,8 +16,8 @@ use alloc::vec::Vec;
 use crate::rect::Rect;
 
 /// Something pixels are presented to, a horizontal span at a time: a
-/// [`Surface`], and (once the compositor lands, #153) the kernel's front
-/// buffer, the framebuffer, which is write-combined, so whole spans are
+/// [`Surface`], and the kernel's front buffer (the desktop's
+/// `term::ScreenCanvas`, #153), the framebuffer, which is write-combined, so whole spans are
 /// what it wants.
 ///
 /// Pixels are xRGB8888, `0xXXRRGGBB`, the top byte unspecified: a target
