@@ -195,6 +195,17 @@ pub fn stop() {
     CANVAS_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 
+/// Run `f` on the screen's pixels with the screen's lock held, so nothing
+/// draws through it meanwhile: no terminal output, cursor flip or pointer
+/// move lands halfway through what `f` reads (the `screenshot`'s capture).
+/// A live [`Canvas`] draws without the lock, so what it draws meanwhile
+/// may show in part. `f` must not allocate (see the module comment), and
+/// runs with interrupts off: keep it short. `None` without a terminal, or
+/// once a crash report started.
+pub fn read_pixels<R>(f: impl FnOnce(&Framebuffer) -> R) -> Option<R> {
+    with_screen(|s| f(&s.fb))
+}
+
 /// The boot CPU's timer tick `tick` (in its interrupt handler): flip the
 /// cursor every [`BLINK_TICKS`]. It never waits: if another CPU is drawing,
 /// the flip is retried on the next tick.

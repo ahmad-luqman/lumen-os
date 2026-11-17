@@ -19,6 +19,7 @@ lumen-heap = { path = "crates/lumen-heap" }
 lumen-input = { path = "crates/lumen-input" }
 lumen-mm = { path = "crates/lumen-mm" }
 lumen-pci = { path = "crates/lumen-pci" }
+lumen-png = { path = "crates/lumen-png" }
 lumen-queue = { path = "crates/lumen-queue" }
 lumen-rand = { path = "crates/lumen-rand" }
 lumen-shell = { path = "crates/lumen-shell" }
@@ -54,6 +55,9 @@ virtio-drivers = { version = "=0.13.0", default-features = false, features = ["a
 # virtio-drivers doesn't re-export them: pinned to the version Cargo.lock
 # already resolves for virtio-drivers (and rhai).
 zerocopy = { version = "=0.8.63", default-features = false }
+# zlib for the screenshot's PNG (#150). Not zune-png's encoder: 0.5.2 writes
+# only stored (uncompressed) deflate blocks. No `simd` (adler32 by SIMD).
+miniz_oxide = { version = "=0.9.1", default-features = false, features = ["with-alloc"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

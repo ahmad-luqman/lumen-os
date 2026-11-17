@@ -197,6 +197,9 @@ own PR that updates that doc first.
   `time.rs`: TSC and LAPIC timer calibration, the boot origin
   (`mark_boot`, `since_boot_ns`), `now_ns`, `sleep`, `ticks`.
   `demo.rs`: the `mandelbrot` (bands on every CPU) and `life` commands.
+  `screenshot.rs`: `screenshot`, the screen read once under the
+  screen's lock (`term::read_pixels`), as a PNG in a base64 frame on serial
+  (the format: ARCHITECTURE section 11).
   `sound.rs`: the virtio-sound driver (its `sound` thread owns the device,
   playing `lumen-synth` sources paced by the device), `beep`, `play`,
   `volume` and `sound`.
@@ -260,6 +263,9 @@ own PR that updates that doc first.
   the reader's policy (`read_next`, `available`) (host-tested against a
   model UART, the reader also against an interrupt that comes only on an
   edge).
+- `crates/lumen-png`: the screenshot's PNG writer: RGB8 rows filtered in
+  place, zlib from `miniz_oxide`, CRC-32, and the base64 frame it travels
+  in over serial (host-tested, incl. a decoder for the round trips).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
@@ -271,6 +277,8 @@ own PR that updates that doc first.
   `crash.py` (crash-report parsing), `audio.py` (wav files as QEMU's
   wav audiodev writes them: pitch by zero crossings, Goertzel amplitude),
   `screen.py` (the screen's rows through the serial shell's `term text`),
+  `screenshot.py` (`screenshot`'s frame read back and checked;
+  `Machine.screenshot_via_serial`),
   `shell.py` (`run`: a serial command's output, the log's lines taken out
   and kept, a WARN or ERROR failing it unless allowed; `PROMPT`), `klog.py`
   (the kernel log line's format, as kernel/src/klog.rs prints it).

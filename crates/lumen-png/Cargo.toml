@@ -1,0 +1,12 @@
+[package]
+name = "lumen-png"
+description = "no_std PNG writer for the Lumen kernel's screenshots: RGB8 rows filtered in place, zlib from miniz_oxide, CRC32, and the base64 frame the screenshot travels in over serial; host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+miniz_oxide.workspace = true
+
+[lints]
+workspace = true

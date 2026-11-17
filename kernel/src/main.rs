@@ -47,6 +47,7 @@ mod power;
 mod rng;
 mod rtc;
 mod sched;
+mod screenshot;
 mod script;
 mod serial_in;
 mod shell;

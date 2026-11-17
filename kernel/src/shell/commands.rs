@@ -1,7 +1,7 @@
 //! The shell's commands: kmon's, with their names and output (`echo`
 //! joins its words with single spaces; `clear` and `colors` need a console
 //! that takes escape codes), plus `history`, `term text`, `vt`, `reboot`,
-//! `shutdown`, `random`, the system commands (`cpus`, `mem`, `irqs`, `threads`,
+//! `shutdown`, `random`, `screenshot` (`crate::screenshot`), the system commands (`cpus`, `mem`, `irqs`, `threads`,
 //! `lspci`, `mouse`, `dmesg`, `date`, `top`: `sysinfo.rs`) and the filters that come after a
 //! `|` (`grep`, `where`, `sort`, `first`, `count`, `select`: `pipe.rs`). A
 //! table the line editor completes from. Each writes to the console that
@@ -67,6 +67,13 @@ pub static COMMANDS: Table<Run> = Table(&[
         run: vt,
     },
     Command { name: "colors", args: &[], usage: "", about: "a colour test pattern", run: colors },
+    Command {
+        name: "screenshot",
+        args: &[],
+        usage: "",
+        about: "the screen as a PNG, in base64 lines framed for the harness (serial only)",
+        run: crate::screenshot::command,
+    },
     Command {
         name: "mandelbrot",
         args: &[],

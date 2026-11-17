@@ -2653,6 +2653,53 @@ pub struct AutomationNode {
   screenshots plus tree assertions together make UI tests robust.
 - **X-ray mode** is an app (and an overlay) that reads the `Trace` capability.
 
+### Screenshot (built in M4, #150; text mode)
+
+`screenshot` on the serial shell sends the screen as a PNG over serial (to
+disk once there are files, M6). The kernel reads the framebuffer once, row
+by row, under the screen's lock (`term::read_pixels`): no terminal output,
+cursor flip or pointer move lands halfway through, and the image is one
+moment of the screen, the mouse pointer included where it is drawn (as in
+QEMU's `screendump`). Only a command drawing on a `term::Canvas` (without
+the lock) can still change pixels mid-read. Nothing allocates under the
+lock: the rows (`lumen_png::Rows`, 3 MiB at 1280x800) are allocated first.
+With the lock dropped, `lumen-png` encodes them: RGB8, unfiltered (on the
+text console that compresses about 20% better than `Sub` or `Up`), zlib
+level 6 from `miniz_oxide`, one `IDAT`. The desktop (#153) will read the
+compositor's back buffer instead, and needs no lock on the screen's
+terminal then; whichever of #150 and #153 lands second wires that up.
+
+**Wire format** (`lumen_png::frame`; the harness's reader is
+`lumen_harness/screenshot.py`):
+
+```text
+@@png-begin 1280x800 bytes=57857 crc32=0a1b2c3d lines=643
+@@png iVBORw0KGgoAAAANSUhEUgAABQAAAAMgCAIAAADK...    (base64)
+...
+@@png-end
+screenshot: 1280x800, 57857 bytes of PNG (read 10.888 ms, encoded 80.513 ms, sent 64.915 ms)
+```
+
+- The begin line: the size in pixels, the PNG's length in bytes, its
+  CRC-32 (PNG's, eight lowercase hex digits) and how many body lines follow.
+- Body lines: `@@png ` and the PNG in standard base64 (RFC 4648, `=`
+  padding), 120 characters (90 bytes) on every line but the last.
+- The end line: `@@png-end` alone. Then a summary line (the same size and
+  length; the times vary) and the prompt.
+
+Every frame line starts with `@@png`, which no log line does (they start
+with a timestamp). The frame goes out in chunks of whole lines under the
+log's line lock (`shell::write_in_chunks`), so a log line can land between
+two frame lines but never inside one; the reader keeps lines by prefix and
+checks the line count, the length and the CRC, then decodes the PNG with
+PIL and checks its size. On a screen shell the command refuses (base64 on
+the screen is no use).
+
+Cost, measured under TCG on the text console: about 11 ms reading the
+pixels (interrupts off, under the lock), 80 to 95 ms encoding, and 65 to
+95 ms sending 58 to 75 KB of PNG: QEMU's UART doesn't pace output at the
+baud rate.
+
 ## 12. The Claude service (planned, M8)
 
 - **Keychain service:** holds the API key, which is entered at setup and stored
@@ -2800,6 +2847,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/klog.rs      logger (levels, subsystem tags, serial timestamps, the ring dmesg reads)
   src/rtc.rs       the CMOS RTC: date and time (taken as UTC) for `date`
   src/fb.rs        framebuffer: pixels, glyphs, the hello screen, the crash screen
+  src/screenshot.rs  `screenshot`: the screen as a PNG (lumen-png) in a base64 frame on serial
   src/term.rs      the virtual terminals on the framebuffer (lumen-term): their grids, drawing the shown one's changed cells, log lines, the cursor, the canvas
   src/vt.rs        the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4
   src/symbols.rs   kernel symbol table (symbolized crash reports)
@@ -2808,7 +2856,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/shell/       the shells (lumen-shell): serial and the virtual terminals' consoles, the commands, system commands (sysinfo.rs), deliberate faults (crash.rs)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
-crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-pci, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, ...)
+crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-acpi, lumen-pci, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, lumen-png, ...)
 boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml

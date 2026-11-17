@@ -13,7 +13,8 @@ and 9p (a shared host folder). `Machine(cpu=...)` sets the CPU model.
 for output (`expect`, with a timeout, never fixed sleeps), type input
 (`send_line` on serial, `type_text` and `press` on the keyboard through QMP,
 `move_pointer`, `click` and `release` on a tablet through QMP),
-take screenshots over QMP (`screendump`), and collect the exit
+take screenshots over QMP (`screendump`) or from the kernel itself
+(`screenshot_via_serial`, its `screenshot` command), and collect the exit
 status that the kernel sets through `isa-debug-exit`.
 
 Every `Machine` run writes its artifacts to a directory: `serial.log`
@@ -980,6 +981,13 @@ class Machine:
         except QmpError as e:
             tail = self.output[-2000:]
             raise QmpError(f"{e}\n--- last serial output ---\n{tail}") from e
+
+    def screenshot_via_serial(self, timeout: float = 60) -> Image.Image:
+        """The kernel's own `screenshot` of the screen, run at the serial
+        shell's prompt and checked (lumen_harness.screenshot)."""
+        from .screenshot import screenshot_via_serial
+
+        return screenshot_via_serial(self, timeout)
 
     def screendump(self, name: str) -> Path:
         """Save the current screen as PNG in the artifacts directory."""
