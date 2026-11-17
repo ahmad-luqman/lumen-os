@@ -3382,59 +3382,65 @@ and `date` agree.
 
 ### Screenshot (#150)
 
-#150 records `screenshot`'s wire format here (whichever of #146 and #150
-merges second folds its text into this subsection). While the desktop is
+`screenshot` on the serial shell sends the screen as a PNG over serial (to
+disk once there are files, M6). Capture and encoding are separate steps
+(`kernel/src/screenshot.rs`), so the desktop brings its own source.
+
+**Source.** In text mode the kernel reads the framebuffer once, row by
+row, into `lumen_png::encode::Rows` allocated beforehand (3 MiB at
+1280x800: nothing allocates under the lock), holding the screen's lock
+(`term::read_pixels`), so terminal output, a cursor flip or a pointer
+move can't land halfway through. The mouse pointer is in the image where
+the terminal drew it. A command drawing on a `term::Canvas` draws without
+that lock: `read_pixels` then says a canvas was drawing, the summary line
+ends in `, a canvas was drawing: may be torn`, and the harness refuses
+such a capture unless asked not to (`allow_torn`). While the desktop is
 shown, `screenshot` reads the back buffer: the compositor fills
 `lumen_png::Rows` from it between passes, so it never shows the pointer.
 While the desktop is paused or off, it reads the text screen as in text
 mode. Whichever of #150 and #153 lands second wires that up.
 
-### Screenshot (built in M4, #150; text mode)
-
-`screenshot` on the serial shell sends the screen as a PNG over serial (to
-disk once there are files, M6). The kernel reads the framebuffer once, row
-by row, under the screen's lock (`term::read_pixels`): no terminal output,
-cursor flip or pointer move lands halfway through, and the image is one
-moment of the screen, the mouse pointer included where it is drawn (as in
-QEMU's `screendump`). Only a command drawing on a `term::Canvas` (without
-the lock) can still change pixels mid-read. Nothing allocates under the
-lock: the rows (`lumen_png::Rows`, 3 MiB at 1280x800) are allocated first.
-With the lock dropped, `lumen-png` encodes them: RGB8, unfiltered (on the
-text console that compresses about 20% better than `Sub` or `Up`), zlib
-level 6 from `miniz_oxide`, one `IDAT`. The desktop (#153) will read the
-compositor's back buffer instead, and needs no lock on the screen's
-terminal then; whichever of #150 and #153 lands second wires that up.
+**Encoding** (`lumen_png::encode`): RGB8, unfiltered (on the text console
+that compressed 16 to 20% smaller than the `Sub` or `Up` filters), zlib
+level 6 from `miniz_oxide`, compressed straight into the file's one
+`IDAT`. Every buffer is taken with `try_reserve`, so a heap that can't
+grow gives an error line, not a crash; the compressor's own fixed boxes
+(about 170 KiB) are the exception. The compressor keeps 64 KiB inline and
+needs about 75 KiB of stack, more than a thread's default, so the kernel
+encodes on a thread with a 256 KiB stack (`sched::run_sized`).
 
 **Wire format** (`lumen_png::frame`; the harness's reader is
 `lumen_harness/screenshot.py`):
 
 ```text
-@@png-begin 1280x800 bytes=57857 crc32=0a1b2c3d lines=643
-@@png iVBORw0KGgoAAAANSUhEUgAABQAAAAMgCAIAAADK...    (base64)
+@@png-begin 1280x800 bytes=46835 crc32=e130dd76 lines=521
+@@png iVBORw0KGgoAAAANSUhEUgAABQAAAAMgCAIAAADz...    (base64)
 ...
 @@png-end
-screenshot: 1280x800, 57857 bytes of PNG (read 10.888 ms, encoded 80.513 ms, sent 64.915 ms)
+screenshot: 1280x800, 46835 bytes of PNG (read 9.455 ms, encoded 62.003 ms, sent 30.954 ms)
 ```
 
-- The begin line: the size in pixels, the PNG's length in bytes, its
-  CRC-32 (PNG's, eight lowercase hex digits) and how many body lines follow.
-- Body lines: `@@png ` and the PNG in standard base64 (RFC 4648, `=`
+- The begin line: the size in pixels, the PNG file's length in bytes, the
+  CRC-32 of the whole file (the algorithm `zlib.crc32` uses; eight
+  lowercase hex digits) and how many body lines follow.
+- Body lines: `@@png ` and the file in standard base64 (RFC 4648, `=`
   padding), 120 characters (90 bytes) on every line but the last.
 - The end line: `@@png-end` alone. Then a summary line (the same size and
-  length; the times vary) and the prompt.
+  length; the times vary; the torn warning above) and the prompt.
 
 Every frame line starts with `@@png`, which no log line does (they start
-with a timestamp). The frame goes out in chunks of whole lines under the
-log's line lock (`shell::write_in_chunks`), so a log line can land between
-two frame lines but never inside one; the reader keeps lines by prefix and
-checks the line count, the length and the CRC, then decodes the PNG with
-PIL and checks its size. On a screen shell the command refuses (base64 on
-the screen is no use).
+with a timestamp). `frame::write` hands out one line at a time from
+buffers on the stack and the shell writes each whole under the log's line
+lock, so a log line can land between two frame lines but never inside
+one. The reader keeps lines by prefix, checks the line count, the line
+lengths, the length and the CRC, then decodes the PNG with PIL and checks
+it is RGB of the stated size. On a screen shell the command refuses
+(base64 on the screen is no use).
 
-Cost, measured under TCG on the text console: about 11 ms reading the
-pixels (interrupts off, under the lock), 80 to 95 ms encoding, and 65 to
-95 ms sending 58 to 75 KB of PNG: QEMU's UART doesn't pace output at the
-baud rate.
+Cost, for example (one TCG run on the text console; the times vary): about
+9 ms reading the pixels (interrupts off, under the lock), 62 to 64 ms
+encoding, 31 to 40 ms sending 47 to 63 KB of PNG. QEMU's UART doesn't pace
+output at the baud rate.
 
 ## 12. The Claude service (planned, M8)
 

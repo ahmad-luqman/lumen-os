@@ -1,12 +1,13 @@
 # Features: gui. See tests/features/README.md for the format.
 
 [[feature]]
-name = "screenshot: the screen as a PNG over serial (lumen-png: RGB8, zlib from miniz_oxide linked with audit passing, CRC-32; a base64 frame with its size, length, CRC and line count, log lines skipped by prefix), read once under the screen's lock and equal to QEMU's screendump pixel for pixel but the blinking cursor's cell (the text console after boot and the colour test pattern); every way a frame comes back wrong fails the harness saying why; refused on a screen shell"
+name = "screenshot: the screen as a PNG over serial (lumen-png: RGB8, zlib from miniz_oxide linked with audit passing, every buffer refused rather than aborted when the allocator says no, a golden file PIL decodes; a base64 frame with its size, length, CRC and line count, log lines skipped by prefix), equal to QEMU's screendump in every pixel (the text console after boot and the colour test pattern); a capture while a canvas draws is flagged as possibly torn and refused by the harness unless allowed; every way a frame comes back wrong fails the harness saying why; refused on a screen shell"
 milestone = "M4"
 tests = [
     "cargo:lumen-png",
     "harness:test_screenshot::*",
     "scenario:test_gui::test_screenshot_matches_screendump",
     "scenario:test_gui::test_screenshot_refuses_a_screen_shell",
+    "scenario:test_gui::test_screenshot_says_when_a_canvas_was_drawing",
     "audit:flags",
 ]

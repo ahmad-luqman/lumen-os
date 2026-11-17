@@ -199,9 +199,10 @@ own PR that updates that doc first.
   them for scenarios), the boot origin
   (`mark_boot`, `since_boot_ns`), `now_ns`, `sleep`, `ticks`.
   `demo.rs`: the `mandelbrot` (bands on every CPU) and `life` commands.
-  `screenshot.rs`: `screenshot`, the screen read once under the
-  screen's lock (`term::read_pixels`), as a PNG in a base64 frame on serial
-  (the format: ARCHITECTURE section 11).
+  `screenshot.rs`: `screenshot`: the screen captured (the framebuffer
+  read once under the screen's lock, `term::read_pixels`, which says if a
+  canvas was drawing), encoded on a 256 KiB stack, sent as a base64 frame
+  on serial (the format: ARCHITECTURE section 11).
   `sound.rs`: the virtio-sound driver (its `sound` thread owns the device,
   playing `lumen-synth` sources paced by the device), `beep`, `play`,
   `volume` and `sound`.
@@ -269,9 +270,12 @@ own PR that updates that doc first.
   the reader's policy (`read_next`, `available`) (host-tested against a
   model UART, the reader also against an interrupt that comes only on an
   edge).
-- `crates/lumen-png`: the screenshot's PNG writer: RGB8 rows filtered in
-  place, zlib from `miniz_oxide`, CRC-32, and the base64 frame it travels
-  in over serial (host-tested, incl. a decoder for the round trips).
+- `crates/lumen-png`: PNG for Lumen: the encoder `screenshot` uses
+  (`encode`: RGB8 `Rows` into a `Png`, unfiltered, zlib from
+  `miniz_oxide`, every buffer refused rather than aborted), CRC-32, and
+  the base64 frame a PNG travels in over serial, streamed from the stack
+  (host-tested, incl. a refusing allocator and a golden file PIL decodes;
+  decoding is #154's).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
