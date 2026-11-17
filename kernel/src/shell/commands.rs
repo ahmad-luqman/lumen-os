@@ -386,13 +386,14 @@ fn kbd(ctx: &mut Ctx<'_>, _: &[String]) {
     let _ = match (k.result, k.route) {
         (Some(Ok(())), Some(route)) => writeln!(
             out,
-            "kbd: layout {}, IRQ {} (vector {:#x}), {} interrupts, {} bytes, \
+            "kbd: layout {}, IRQ {} (vector {:#x}), {} interrupts, {} bytes, {} presses, \
              {} dropped, {} undecoded, {} line errors, {} skipped at setup",
             k.layout,
             route.irq(),
             route.vector(),
             k.irqs,
             k.bytes,
+            k.presses,
             k.dropped,
             k.undecoded,
             k.line_errors,

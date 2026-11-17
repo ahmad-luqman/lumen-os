@@ -1062,14 +1062,21 @@ off. A wake from another CPU queues the thread there and sends the
   (`vt::read_key`/`vt::wait_key`, section "Terminal"): every keyboard
   scenario goes through it. The shell's
   `kbd` shows the layout, the route, the
-  interrupts taken, the bytes queued, dropped, undecoded, flagged, and
+  interrupts taken, the bytes queued, the keys pressed (`presses`: the
+  producer counts set 1 make codes as bytes arrive, queued or dropped,
+  before any reader decodes them; prefixes, fake shifts and Pause each
+  one key or none: `lumen_input::Presses`, #149), the bytes dropped,
+  undecoded, flagged, and
   skipped during setup, or why there is no keyboard (and whether IRQ 1 was
   routed); a non-zero skip count is also logged after init.
 - **Tests:** QMP `send-key` drives the keyboard (`Machine.type_text` and
   `press`; QEMU queues each key behind the last one, so they arrive in
   order; its input queue holds 1024 entries and drops the rest without a
   word, so `press` paces itself on the time QEMU takes to send each key,
-  and `test_a_long_line_of_shifted_keys` checks 150 shifted keys arrive),
+  and `test_a_long_line_of_shifted_keys` checks 150 shifted keys arrive;
+  `lumen_harness.gui`'s `confirmed_keys` waits for `kbd`'s `presses` to
+  count each key before the next, failing as "key N of M never reached
+  the guest", #149),
   and the scenarios read what the screen shells did
   back from the screen (`lumen_harness.screen`, through the serial shell's
   `term text`); a scenario boots with
@@ -2757,7 +2764,7 @@ kernel. The kernel is the trusted computing base.
 |---|---|---|
 | Pure logic | `cargo test` on `no_std` crates | `crates/*` |
 | Kernel internals | `ktest!` in-kernel tests → TAP over serial → `isa-debug-exit` | anywhere in `kernel/src` |
-| Whole system | pytest scenarios: boot QEMU headless, `expect` on serial with timeouts, `send_line`, keys over QMP (`press`, `type_text`), exit codes; run in parallel (pytest-xdist, one worker per CPU) | `tests/scenarios` |
+| Whole system | pytest scenarios: boot QEMU headless, `expect` on serial with timeouts, `send_line`, keys and the tablet over QMP (`press`, `type_text`, `move_pointer`, `click`; `lumen_harness.gui`'s steps confirm each against `kbd`'s and `mouse`'s counters before the next), exit codes; run in parallel (pytest-xdist, one worker per CPU) | `tests/scenarios` |
 | Screens | QMP `screendump` compared to golden PNG regions | `tests/golden` |
 | Codegen | `make audit`: disassembly and LLVM IR checks | `tools/harness/lumen_harness/audit.py` |
 | Harness itself | self-tests that the TAP parser, audit and image diff catch failures, and that the QEMU command line, artifact layout, CI wiring and status generation behave | `tests/harness` |

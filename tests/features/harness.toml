@@ -177,3 +177,14 @@ tests = [
     "harness:test_devices::test_one_device_attaches_exactly_its_own[rng_no_msix]",
     "scenario:test_dev::test_a_virtio_rng_without_msix_fails_its_probe",
 ]
+
+[[feature]]
+name = "Input steps that confirm each effect (lumen_harness.gui): pointer_move, pointer_down/pointer_up and drag wait until `mouse` counts each step's frame and shows its effect (position, button held or released), else fail naming the step and the counts seen (a held mouse thread fails the step; released, the frame is read); keys typed through confirmed_keys/type_confirmed wait until `kbd`'s presses count each key (and no byte was dropped), else fail with \"key N of M ... never reached the guest\"; `kbd` counts the keys pressed among the keyboard's bytes as they arrive (set 1 make codes, prefixes, fake shifts and Pause each one key or none; host-tested); test_history_and_line_editing types through it"
+milestone = "M4"
+tests = [
+    "harness:test_gui::*",
+    "cargo:lumen-input",
+    "scenario:test_input::test_drag_steps_are_confirmed",
+    "scenario:test_input::test_keys_via_qmp_send_key",
+    "scenario:test_shell::test_history_and_line_editing",
+]

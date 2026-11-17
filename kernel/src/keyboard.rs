@@ -29,7 +29,11 @@
 //! single-consumer queue (`lumen_queue::ByteQueue`), discarding bytes from
 //! the second port (a mouse) and counting and discarding those flagged with
 //! a parity or timeout error, then wakes the threads waiting for a key
-//! ([`wait_for_bytes_or`]). Readers ([`read_key`]: the virtual terminals'
+//! ([`wait_for_bytes_or`]). It also counts the keys pressed among port 1's
+//! bytes, queued or dropped (`lumen_input::Presses`: one per key, whatever
+//! its prefix), as they arrive, before any reader decodes them: `kbd`'s
+//! `presses`, by which a test confirms each key it typed reached the guest
+//! (#149). Readers ([`read_key`]: the virtual terminals'
 //! router, `crate::vt`) decode them with the `pc-keyboard` crate under a
 //! lock, in the layout `lumen.keymap=` names (`us` without one, or for a
 //! name it doesn't know, with a warning), into characters (Ctrl and a
@@ -41,6 +45,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use log::{debug, info, warn};
+use lumen_input::Presses;
 use lumen_queue::ByteQueue;
 use pc_keyboard::layouts::{
     AnyLayout, Azerty, Colemak, De105Key, Dvorak104Key, FiSe105Key, Jis109Key, No105Key, Uk105Key, Us104Key,
@@ -100,6 +105,9 @@ static STATUS: SpinLock<Option<Status>> = SpinLock::new(None);
 static IRQS: AtomicU64 = AtomicU64::new(0);
 /// Bytes put on the queue.
 static BYTES: AtomicU64 = AtomicU64::new(0);
+/// Keys pressed among port 1's bytes (queued or dropped), and the prefix
+/// seen so far: only the queue's producer ([`drain`]) feeds it.
+static PRESSES: SpinLock<(u64, Presses)> = SpinLock::new((0, Presses::new()));
 /// Bytes the controller flagged with a parity or timeout error (discarded).
 static LINE_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Bytes the decoder refused (the keyboard's own overrun code 0xff among
@@ -478,8 +486,15 @@ fn drain() {
         let byte = i8042::read_data();
         if status & i8042::LINE_ERROR != 0 {
             LINE_ERRORS.fetch_add(1, Ordering::Relaxed);
-        } else if status & i8042::FROM_PORT2 == 0 && QUEUE.push(byte) {
-            BYTES.fetch_add(1, Ordering::Relaxed); // (a full queue counts it: `dropped`)
+        } else if status & i8042::FROM_PORT2 == 0 {
+            let mut presses = PRESSES.lock();
+            if presses.1.feed(byte) {
+                presses.0 += 1;
+            }
+            drop(presses);
+            if QUEUE.push(byte) {
+                BYTES.fetch_add(1, Ordering::Relaxed); // (a full queue counts it: `dropped`)
+            }
         }
     }
     if BYTES.load(Ordering::Relaxed) != before {
@@ -570,6 +585,9 @@ pub struct Stats {
     pub irqs: u64,
     /// Bytes put on the queue.
     pub bytes: u64,
+    /// Keys pressed among the bytes that arrived (queued or dropped), as
+    /// [`drain`] counts them (`lumen_input::Presses`).
+    pub presses: u64,
     /// Bytes dropped because the queue was full.
     pub dropped: u64,
     pub undecoded: u64,
@@ -586,6 +604,7 @@ pub fn stats() -> Stats {
         result: status.map(|s| s.result),
         irqs: IRQS.load(Ordering::Relaxed),
         bytes: BYTES.load(Ordering::Relaxed),
+        presses: PRESSES.lock().0,
         dropped: QUEUE.dropped(),
         undecoded: UNDECODED.load(Ordering::Relaxed),
         line_errors: LINE_ERRORS.load(Ordering::Relaxed),

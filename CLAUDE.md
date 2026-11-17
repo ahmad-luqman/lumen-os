@@ -208,8 +208,10 @@ own PR that updates that doc first.
   frame's most events from the device's `EV_BITS` (`frame_bound`) and
   whether a batch may have lost frames (`may_have_lost_frames`, the one
   statement of what overruns guarantee; a model of QEMU's ring checks
-  it), and the arrow sprite with its save-under (`Cursor`, over a
-  `Surface`) (host-tested, incl. a randomized model of drawing around it).
+  it), the arrow sprite with its save-under (`Cursor`, over a
+  `Surface`), and the keys pressed in PS/2 set 1 bytes (`Presses`, for
+  `kbd`'s `presses`) (host-tested, incl. a randomized model of drawing
+  around it).
 - `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, the
   page-table format and mapper (host-tested, incl. a model comparison), the
   window tokens that confine `paging::map`, and the kernel-stack layout and
@@ -271,6 +273,9 @@ own PR that updates that doc first.
   `crash.py` (crash-report parsing), `audio.py` (wav files as QEMU's
   wav audiodev writes them: pitch by zero crossings, Goertzel amplitude),
   `screen.py` (the screen's rows through the serial shell's `term text`),
+  `gui.py` (input steps confirmed one at a time: `pointer_move`,
+  `pointer_down`/`pointer_up`, `drag` against `mouse`'s frames,
+  `confirmed_keys`/`type_confirmed` against `kbd`'s presses),
   `shell.py` (`run`: a serial command's output, the log's lines taken out
   and kept, a WARN or ERROR failing it unless allowed; `PROMPT`), `klog.py`
   (the kernel log line's format, as kernel/src/klog.rs prints it).
