@@ -675,3 +675,93 @@ def type_confirmed(
     """Type `text` as a US layout would, confirming each character's keys
     (`confirmed_keys`)."""
     return confirmed_keys(m, text, timeout=timeout, allow=allow)
+
+
+# -- the desktop (#153) --------------------------------------------------------
+
+
+def parse_records(out: str) -> list[dict[str, str]]:
+    """A records table as the kernel prints it (a header line of column
+    names, then a row per record; the values have no spaces): one dict per
+    row, column name to text."""
+    lines = [line.split() for line in out.splitlines() if line.strip()]
+    if not lines:
+        raise AssertionError(f"no table in {out!r}")
+    header, rows = lines[0], lines[1:]
+    for row in rows:
+        if len(row) != len(header):
+            raise AssertionError(f"a row of {len(row)} values under {len(header)} columns:\n{out}")
+    return [dict(zip(header, row, strict=True)) for row in rows]
+
+
+def desktop_status(m: Machine, allow: str | None = None) -> dict[str, str]:
+    """`desktop status`'s one record."""
+    rows = parse_records(run(m, "desktop status", allow=allow))
+    if len(rows) != 1:
+        raise AssertionError(f"desktop status gave {len(rows)} records")
+    return rows[0]
+
+
+def windows(m: Machine, allow: str | None = None) -> list[dict[str, str]]:
+    """`windows`' rows, front to back (none without a desktop: it says so
+    instead of a table)."""
+    out = run(m, "windows", allow=allow)
+    if out.strip() == "windows: no desktop":
+        return []
+    return parse_records(out)
+
+
+def window(m: Machine, title: str, allow: str | None = None) -> dict[str, str]:
+    """The `windows` row titled `title` (exactly one)."""
+    found = [w for w in windows(m, allow) if w["title"] == title]
+    if len(found) != 1:
+        raise AssertionError(f"{len(found)} windows titled {title!r}")
+    return found[0]
+
+
+def wait_settled(m: Machine, timeout: float = 30, allow: str | None = None) -> dict[str, str]:
+    """Wait until `desktop status` says `settled yes` (every byte typed
+    decoded, both input rings read, no damage gathered or pass running, no
+    commit under way, every window's queue empty with its owner waiting);
+    its record then. Poll for the effect a step should have first (a
+    `windows` row, say): settling says nothing more is moving, not that
+    the step happened."""
+    deadline = time.monotonic() + timeout * m.timeout_scale
+    while True:
+        status = desktop_status(m, allow)
+        if status["settled"] == "yes":
+            return status
+        if time.monotonic() > deadline:
+            raise AssertionError(f"the desktop never settled in {timeout} s: {status}")
+        time.sleep(POLL * 5)
+
+
+def desktop_check(m: Machine, tries: int = 20, allow: str | None = None) -> tuple[int, int]:
+    """`desktop check` (retried while it says `busy`, up to `tries`
+    times): the pixels that differ from a full repaint, and from the screen
+    (outside the pointer's box)."""
+    for _ in range(tries):
+        out = run(m, "desktop check", 60, allow=allow)
+        if out.strip() == "desktop check: busy":
+            time.sleep(0.2)
+            continue
+        found = re.fullmatch(
+            r"desktop check: (\d+) pixels differ from a full repaint, (\d+) from the screen\n", out
+        )
+        if found is None:
+            raise AssertionError(f"desktop check said {out!r}")
+        return int(found[1]), int(found[2])
+    raise AssertionError(f"desktop check was busy {tries} times")
+
+
+def settled_screendump(m: Machine, name: str, tries: int = 5, allow: str | None = None):
+    """A screendump of a settled desktop: taken between two `desktop
+    status` reads that are both settled with the same `frames` (nothing was
+    presented meanwhile), retaken otherwise; its path."""
+    for _ in range(tries):
+        before = wait_settled(m, allow=allow)
+        shot = m.screendump(name)
+        after = desktop_status(m, allow)
+        if after["settled"] == "yes" and after["frames"] == before["frames"]:
+            return shot
+    raise AssertionError(f"the desktop presented during each of {tries} screendumps")

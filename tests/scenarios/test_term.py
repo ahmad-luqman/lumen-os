@@ -136,7 +136,7 @@ TABS_ORIGIN, TABS_SIZE = (1112, 32), (144, 32)
 VT_STATUS = re.compile(
     r"vt: terminal (\d) of 4 shown \(Alt\+F1 to F4 switch\); "
     r"keys dropped (\d+) (\d+) (\d+) (\d+), discarded (\d+) (\d+) (\d+) (\d+); "
-    r"(\d+) switches refused\n"
+    r"(\d+) switches refused, \d+ keys to the desktop\n"
 )
 
 

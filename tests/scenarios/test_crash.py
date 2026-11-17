@@ -6,12 +6,15 @@ QEMU with status 0 (`-no-reboot`), which fails these tests.
 """
 
 import re
+import time
 
 import pytest
-from lumen_harness import REPO_ROOT
+from lumen_harness import REPO_ROOT, gui
 from lumen_harness.crash import BEGIN, END, backtrace, page_walk
 from lumen_harness.image import assert_matches_golden
 from lumen_harness.qemu import EXIT_CRASH
+from lumen_harness.shell import run
+from PIL import Image
 
 SCREEN_DONE = "(crash report shown on screen)"
 
@@ -135,6 +138,52 @@ def test_crash_screen_golden(boot, artifacts, golden_dir):
     assert_matches_golden(
         shot, golden_dir / "crash-banner.png", origin=(0, 0), size=(640, 72), artifacts=artifacts
     )
+
+
+def start_spinning_desktop(m) -> None:
+    """The desktop shown, and `desktop spin`'s window committing a changed
+    frame (a pure green bar moving) every 20 ms, a few of them presented."""
+    m.expect(r"lumen> ", 60)
+    assert run(m, "desktop", 30) == "desktop: started (Alt+F1 shows the terminals)\n"
+    assert re.fullmatch(r"desktop spin: window \d+\n", run(m, "desktop spin"))
+    first = int(gui.desktop_status(m)["frames"])
+    deadline = time.monotonic() + 10 * m.timeout_scale
+    while int(gui.desktop_status(m)["frames"]) < first + 3:
+        assert time.monotonic() < deadline, "the spinner presented nothing"
+        time.sleep(0.05)
+
+
+def test_crash_report_over_desktop(boot, artifacts, golden_dir):
+    # A deliberate fault from the serial shell while the desktop runs, on
+    # two CPUs, with a window committing every 20 ms: the full symbolized
+    # report and the crash code (first machine), and the crash screen
+    # covering the desktop (second machine, without qemu_exit so the screen
+    # stays up): its banner, and not one pixel of the spinner's green.
+    m = boot("qemutest", extra=["-smp", "2"])
+    start_spinning_desktop(m)
+    m.send_line("crash pf")
+    m.expect(re.escape(END), 30)
+    assert m.wait_exit(10) == EXIT_CRASH
+    out = m.output
+    report = out[out.index(BEGIN) : out.index(END) + len(END)]
+    assert re.search(FAULTS["pf"][0], report), report
+    frames = backtrace(report)
+    assert FAULTS["pf"][1] in frames[0], report
+    assert "<unknown>" not in report and "!!!" not in report, report
+    assert SCREEN_DONE in out[out.index(END) :]
+
+    shown = boot("interactive", extra=["-smp", "2"])
+    start_spinning_desktop(shown)
+    shown.send_line("crash pf")
+    shown.expect(re.escape(SCREEN_DONE), 30)
+    shot = shown.screendump("crash-over-desktop.png")
+    assert_matches_golden(
+        shot, golden_dir / "crash-banner.png", origin=(0, 0), size=(640, 72), artifacts=artifacts
+    )
+    with Image.open(shot) as img:
+        colours = img.convert("RGB").getcolors(1 << 24)
+    assert colours is not None
+    assert (0, 255, 0) not in {c for _, c in colours}, "the spinner's green is still on the screen"
 
 
 @pytest.mark.parametrize("kind", ["panic", "pf"])

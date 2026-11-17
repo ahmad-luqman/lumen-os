@@ -942,16 +942,19 @@ crate::ktest!(
         // table of inputs.
         use crate::kassert;
         let events = [String::from("events")];
+        let status = [String::from("status")];
         for (name, make) in RECORDS {
-            // Each with no arguments, and `events` for the two that take it
-            // (`kbd` gives records only for that). Without a device the
-            // events are its line instead (the ktest machine has no
-            // tablet).
-            for args in [&[][..], &events[..]] {
+            // Each with no arguments, `events` for the two that take it
+            // (`kbd` gives records only for that) and `status` for
+            // `desktop`. Without a device the events are its line instead
+            // (the ktest machine has no tablet), and without a desktop (the
+            // test kernel starts none) `windows` says so.
+            for args in [&[][..], &events[..], &status[..]] {
                 let Some(table) = make(args) else { continue };
                 let table = match table {
                     Ok(table) => table,
                     Err(e) if name == "mouse" && e == NO_TABLET => continue,
+                    Err(e) if name == "windows" && e == "windows: no desktop" => continue,
                     Err(_) => return Err("a records error"),
                 };
                 let rows = table.rows().len();

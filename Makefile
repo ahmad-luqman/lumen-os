@@ -48,6 +48,8 @@ build: $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest ## Build both kernels
 ISO_DEPS := tools/mkiso.sh boot/limine.conf $(BUILD)/deps/limine/.version
 $(BUILD)/lumen.iso: $(BUILD)/lumen-kernel $(ISO_DEPS)
 	tools/mkiso.sh $< $@ $(CMDLINE)
+$(BUILD)/lumen-desktop.iso: $(BUILD)/lumen-kernel $(ISO_DEPS)
+	tools/mkiso.sh $< $@ $(CMDLINE) lumen.desktop
 $(BUILD)/lumen-qemutest.iso: $(BUILD)/lumen-kernel $(ISO_DEPS)
 	tools/mkiso.sh $< $@ lumen.qemu_exit
 $(BUILD)/lumen-ktest.iso: $(BUILD)/lumen-kernel-ktest $(ISO_DEPS)
@@ -55,7 +57,11 @@ $(BUILD)/lumen-ktest.iso: $(BUILD)/lumen-kernel-ktest $(ISO_DEPS)
 
 iso: $(BUILD)/lumen.iso $(BUILD)/lumen-qemutest.iso $(BUILD)/lumen-ktest.iso ## Build all bootable ISOs
 
-run: $(BUILD)/lumen.iso ## Boot in QEMU with a window; serial on this terminal (HEADLESS=1: no window; SOUND=1: virtio-sound on the host's audio; any value counts, 0 too)
+# `make run DESKTOP=1`: the same kernel with `lumen.desktop` (the desktop
+# shown from the boot on).
+RUN_ISO := $(if $(DESKTOP),$(BUILD)/lumen-desktop.iso,$(BUILD)/lumen.iso)
+
+run: $(RUN_ISO) ## Boot in QEMU with a window; serial on this terminal (HEADLESS=1: no window; SOUND=1: virtio-sound on the host's audio; DESKTOP=1: start the desktop; any value counts, 0 too)
 	$(HARNESS) run --iso $< $(if $(HEADLESS),--headless) $(if $(SOUND),--sound)
 
 debug: $(BUILD)/lumen.iso ## Boot paused with a gdb stub on :1234, then attach gdb (stops at kmain)
