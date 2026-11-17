@@ -229,7 +229,7 @@ impl Style {
     }
 }
 
-fn blend(bg: u32, fg: u32, alpha: u8) -> u32 {
+pub(crate) fn blend(bg: u32, fg: u32, alpha: u8) -> u32 {
     let a = u32::from(alpha);
     let ch = |shift: u32| {
         let b = (bg >> shift) & 0xff;

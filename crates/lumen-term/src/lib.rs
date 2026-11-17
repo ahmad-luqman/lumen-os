@@ -40,7 +40,8 @@
 //! holds them (`CSI 3 J` empties the ring and shows the screen).
 //!
 //! [`vt::Router`] keeps one keyboard's keys for several terminals'
-//! readers, each terminal's in a ring of its own.
+//! readers, each terminal's in a ring of its own. [`render::Renderer`]
+//! draws a terminal on a [`render::CellTarget`], only what changed.
 
 #![no_std]
 
@@ -48,6 +49,7 @@ extern crate alloc;
 
 mod cell;
 pub mod palette;
+pub mod render;
 pub mod vt;
 
 use alloc::vec;
