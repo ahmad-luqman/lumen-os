@@ -8,14 +8,18 @@ from __future__ import annotations
 import base64
 import io
 import re
+import struct
 import zlib
 from pathlib import Path
 
 import pytest
+from lumen_harness.screen import Screen, cursor_box
 from lumen_harness.screenshot import (
     LINE_CHARS,
+    TORN,
     Frame,
     FrameError,
+    assert_matches_screendump,
     parse_frame,
     screenshot_via_serial,
 )
@@ -133,6 +137,31 @@ def test_a_png_that_doesnt_decode_fails():
         parse_frame(text(frame_lines(junk, (5, 3)))).image()
 
 
+def cut_idat(png: bytes) -> bytes:
+    """`png` with its (one) IDAT chunk's data cut in half, the chunk's
+    length and CRC recomputed: a file whose header reads fine and whose
+    pixels don't."""
+    at = png.index(b"IDAT") - 4
+    (length,) = struct.unpack(">I", png[at : at + 4])
+    data = png[at + 8 : at + 8 + length][: length // 2]
+    chunk = (
+        struct.pack(">I", len(data))
+        + b"IDAT"
+        + data
+        + struct.pack(">I", zlib.crc32(b"IDAT" + data))
+    )
+    return png[:at] + chunk + png[at + 12 + length :]
+
+
+def test_a_png_whose_pixels_dont_decode_fails():
+    # Opening reads only the header: the pixels must be decoded too.
+    png = cut_idat(png_bytes(noise()))
+    Image.open(io.BytesIO(png))  # the header alone is fine
+    frame = parse_frame(text(frame_lines(png, (40, 30))))
+    with pytest.raises(FrameError, match="the frame's PNG doesn't decode"):
+        frame.image()
+
+
 def test_lumen_pngs_golden_decodes_in_pil():
     # Written by lumen-png's encoder (its test
     # the_golden_png_and_its_frame_are_unchanged pins it byte for byte):
@@ -141,7 +170,7 @@ def test_lumen_pngs_golden_decodes_in_pil():
     img.load()
     assert (img.size, img.mode) == ((32, 16), "RGB")
     want = [(x * 8 % 256, y * 16 % 256, (x ^ y) * 9 % 256) for y in range(16) for x in range(32)]
-    assert list(img.getdata()) == want
+    assert img.tobytes() == bytes(c for px in want for c in px)
 
 
 def test_lumen_pngs_frame_parses_into_its_golden():
@@ -149,7 +178,6 @@ def test_lumen_pngs_frame_parses_into_its_golden():
     # harness's reader.
     frame = parse_frame((GOLDEN / "gradient.frame.txt").read_text())
     assert frame == Frame(32, 16, (GOLDEN / "gradient.png").read_bytes())
-    assert frame.image().size == (32, 16)
 
 
 def serial(png: bytes, size: tuple[int, int], summary: str) -> str:
@@ -165,11 +193,23 @@ def test_screenshot_via_serial_runs_the_command_and_checks_it():
     assert got.tobytes() == img.tobytes()
 
 
-def test_screenshot_via_serial_fails_when_the_summary_disagrees():
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "screenshot: 6x3, {n} bytes of PNG (x)",
+        "screenshot: 5x4, {n} bytes of PNG (x)",
+        "screenshot: 5x3, {n_plus_1} bytes of PNG (x)",
+    ],
+)
+def test_screenshot_via_serial_fails_when_the_summary_disagrees(summary):
     png = png_bytes(small())
-    m = FakeMachine(serial(png, (5, 3), f"screenshot: 5x3, {len(png) + 1} bytes of PNG (x)"))
+    line = summary.format(n=len(png), n_plus_1=len(png) + 1)
     with pytest.raises(FrameError, match="disagrees with the frame"):
-        screenshot_via_serial(m)
+        screenshot_via_serial(FakeMachine(serial(png, (5, 3), line)))
+
+
+def test_screenshot_via_serial_fails_without_a_summary():
+    png = png_bytes(small())
     m = FakeMachine(serial(png, (5, 3), "screenshot: no screen to capture"))
     with pytest.raises(FrameError, match="no summary line"):
         screenshot_via_serial(m)
@@ -178,10 +218,89 @@ def test_screenshot_via_serial_fails_when_the_summary_disagrees():
 def test_a_capture_flagged_torn_fails_unless_allowed():
     img = small()
     png = png_bytes(img)
-    torn = (
-        f"screenshot: 5x3, {len(png)} bytes of PNG (read 1 ms), a canvas was drawing: may be torn"
-    )
-    with pytest.raises(FrameError, match="a canvas was drawing during the capture"):
+    torn = f"screenshot: 5x3, {len(png)} bytes of PNG (read 1 ms){TORN}"
+    with pytest.raises(FrameError, match="a command held the screen during the capture"):
         screenshot_via_serial(FakeMachine(serial(png, (5, 3), torn)))
     got = screenshot_via_serial(FakeMachine(serial(png, (5, 3), torn)), allow_torn=True)
     assert got.tobytes() == img.tobytes()
+
+
+def test_cursor_box_is_the_cursors_cell():
+    # Column 7, row 10 of the 7x16 grid from (32, 144).
+    assert cursor_box(Screen(["lumen>"], (7, 10))) == (81, 304, 88, 320)
+    assert cursor_box(Screen(["lumen>"], (0, 0))) == (32, 144, 39, 160)
+    with pytest.raises(AssertionError, match="below the view"):
+        cursor_box(Screen(["lumen>"], None))
+
+
+# ---- assert_matches_screendump against a machine whose screenshot and
+# screendumps are given.
+
+SCREEN = Screen(["lumen> colors", "lumen>"], (7, 10))
+CELL = cursor_box(SCREEN)
+
+
+class DumpMachine:
+    def __init__(self, tmp: Path, shot: Image.Image, dumps: list[Image.Image]) -> None:
+        self.tmp, self.shot, self.dumps, self.taken = tmp, shot, list(dumps), []
+
+    def screenshot_via_serial(self) -> Image.Image:
+        return self.shot
+
+    def screendump(self, name: str) -> Path:
+        path = self.tmp / name
+        self.dumps.pop(0).save(path)
+        self.taken.append(name)
+        return path
+
+
+def screen_image(cursor_on: bool = False, dot: tuple[int, int] | None = None) -> Image.Image:
+    img = Image.new("RGB", (200, 400), (15, 20, 32))
+    if cursor_on:
+        img.paste((230, 230, 230), CELL)
+    if dot:
+        img.putpixel(dot, (255, 0, 0))
+    return img
+
+
+def check(tmp_path: Path, shot: Image.Image, dumps: list[Image.Image], screens=None) -> DumpMachine:
+    m = DumpMachine(tmp_path, shot, dumps)
+    readings = iter(screens or [SCREEN, SCREEN])
+    assert_matches_screendump(m, tmp_path, "t", read=lambda _: next(readings), pause=0)
+    return m
+
+
+def test_a_matching_screendump_passes_at_once(tmp_path):
+    m = check(tmp_path, screen_image(), [screen_image()] * 4)
+    assert m.taken == ["t-screendump-1.png"]
+
+
+def test_a_blink_caught_out_of_phase_is_retaken(tmp_path):
+    # The screenshot caught the cursor on, the first screendump off.
+    m = check(
+        tmp_path, screen_image(cursor_on=True), [screen_image(), screen_image(cursor_on=True)]
+    )
+    assert m.taken == ["t-screendump-1.png", "t-screendump-2.png"]
+
+
+def test_one_pixel_outside_the_cursor_fails(tmp_path):
+    with pytest.raises(
+        AssertionError, match="1 pixels differ from each of 4 screendumps, 1 of them outside"
+    ):
+        check(tmp_path, screen_image(), [screen_image(dot=(5, 5))] * 4)
+    assert (tmp_path / "t-diff.png").exists()
+
+
+def test_a_cursor_cell_that_never_matches_fails(tmp_path):
+    # Inside the cell only, but in every screendump: not a blink.
+    with pytest.raises(AssertionError, match="0 of them outside the cursor's cell"):
+        check(tmp_path, screen_image(dot=(CELL[0] + 1, CELL[1] + 1)), [screen_image()] * 4)
+
+
+def test_a_screen_that_changed_meanwhile_fails(tmp_path):
+    later = Screen(["lumen> colors", "lumen> x"], (8, 10))
+    with pytest.raises(
+        AssertionError,
+        match=r"(?s)changed during the capture.*row 1: 'lumen>' -> 'lumen> x'.*cursor: \(7, 10\) -> \(8, 10\)",
+    ):
+        check(tmp_path, screen_image(), [screen_image()], screens=[SCREEN, later])

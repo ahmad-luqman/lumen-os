@@ -3412,24 +3412,31 @@ disk once there are files, M6). Capture and encoding are separate steps
 row, into `lumen_png::encode::Rows` allocated beforehand (3 MiB at
 1280x800: nothing allocates under the lock), holding the screen's lock
 (`term::read_pixels`), so terminal output, a cursor flip or a pointer
-move can't land halfway through. The mouse pointer is in the image where
-the terminal drew it. A command drawing on a `term::Canvas` draws without
-that lock: `read_pixels` then says a canvas was drawing, the summary line
-ends in `, a canvas was drawing: may be torn`, and the harness refuses
-such a capture unless asked not to (`allow_torn`). While the desktop is
-shown, `screenshot` reads the back buffer: the compositor fills
-`lumen_png::Rows` from it between passes, so it never shows the pointer.
-While the desktop is paused or off, it reads the text screen as in text
-mode. Whichever of #150 and #153 lands second wires that up.
+move can't land halfway through (by design; not tested). The mouse
+pointer is in the image where the terminal drew it (by design; not
+tested: the scenarios run without a tablet). A command holding a
+`term::Canvas` draws without that lock: `read_pixels` then says a canvas
+held the screen (whether or not it was still drawing: a finished
+`mandelbrot` waiting for a key counts), the summary line ends in `, a
+command held the screen (a canvas): may be torn`, and the harness
+refuses such a capture unless asked not to (`allow_torn`). While the
+desktop is shown, `screenshot` reads the back buffer: the compositor
+fills `lumen_png::encode::Rows` from it between passes, so it never shows
+the pointer. While the desktop is paused or off, it reads the text screen
+as in text mode. Whichever of #150 and #153 lands second wires that up.
 
 **Encoding** (`lumen_png::encode`): RGB8, unfiltered (on the text console
 that compressed 16 to 20% smaller than the `Sub` or `Up` filters), zlib
 level 6 from `miniz_oxide`, compressed straight into the file's one
-`IDAT`. Every buffer is taken with `try_reserve`, so a heap that can't
-grow gives an error line, not a crash; the compressor's own fixed boxes
-(about 170 KiB) are the exception. The compressor keeps 64 KiB inline and
-needs about 75 KiB of stack, more than a thread's default, so the kernel
-encodes on a thread with a 256 KiB stack (`sched::run_sized`).
+`IDAT`. The rows' and the file's buffers are taken with
+`try_reserve_exact` (the file doubles as it fills and always keeps the
+16 bytes of its end back, so finishing it never allocates), so a heap
+that can't grow gives an error line, not a crash; the compressor's own
+fixed boxes (about 250 KiB in all, the largest about 83 KiB) are the
+exception. The compressor keeps 64 KiB inline and needs about 72 KiB of
+stack, more than a thread's 64 KiB default, so the kernel encodes on a
+thread with a 256 KiB stack (`sched::run_sized`; a ktest encodes from a
+default-stack thread).
 
 **Wire format** (`lumen_png::frame`; the harness's reader is
 `lumen_harness/screenshot.py`):
@@ -3448,7 +3455,8 @@ screenshot: 1280x800, 46835 bytes of PNG (read 9.455 ms, encoded 62.003 ms, sent
 - Body lines: `@@png ` and the file in standard base64 (RFC 4648, `=`
   padding), 120 characters (90 bytes) on every line but the last.
 - The end line: `@@png-end` alone. Then a summary line (the same size and
-  length; the times vary; the torn warning above) and the prompt.
+  length; the times vary; the warning above when a canvas held the screen)
+  and the prompt.
 
 Every frame line starts with `@@png`, which no log line does (they start
 with a timestamp). `frame::write` hands out one line at a time from

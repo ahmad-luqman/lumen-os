@@ -7,16 +7,17 @@
 //! - **Capture** ([`capture_framebuffer`]): the framebuffer's pixels into
 //!   `lumen_png` rows allocated beforehand, read once under the screen's
 //!   lock ([`term::read_pixels`]), so terminal output, a cursor flip or a
-//!   pointer move can't land halfway through. A command drawing on a
-//!   `term::Canvas` draws without that lock: the capture then says a
-//!   canvas was drawing, and the summary line warns that the image may be
-//!   torn. The framebuffer is write-combined: reads are slow there, but
+//!   pointer move can't land halfway through (by design; not tested). A
+//!   command holding a `term::Canvas` draws without that lock: the capture
+//!   then says a command held the screen, and the summary line warns that
+//!   the image may be torn. The framebuffer is write-combined: reads are slow there, but
 //!   this reads it once. In desktop mode (#153) the source is a copy the
 //!   compositor makes between passes into a buffer the command allocated,
 //!   so it never shows the pointer; the compositor fills the rows directly.
 //! - **Encoding** ([`encode`]): on a thread with an [`ENCODE_STACK`] stack
-//!   (the compressor needs about 75 KiB, more than a thread's default),
-//!   every buffer refused rather than aborted when the heap is out
+//!   (the compressor needs about 72 KiB, more than a thread's default),
+//!   the rows' and the file's buffers refused rather than aborted when the
+//!   heap is out, the compressor's own fixed boxes excepted
 //!   (`lumen_png::encode`).
 //!
 //! The frame is then written a line at a time, each line whole, so log
@@ -31,7 +32,7 @@ use lumen_png::encode::{self as png, Png, Rows};
 use lumen_time::Millis;
 
 /// The encoding thread's stack: the compressor keeps 64 KiB inline and
-/// needs about 75 KiB in all (as `script.rs` runs rhai on a bigger one).
+/// needs about 72 KiB in all (as `script.rs` runs rhai on a bigger one).
 const ENCODE_STACK: u64 = 256 * 1024;
 
 /// Why there is no screenshot.
@@ -57,28 +58,29 @@ impl fmt::Display for Error {
 /// The screen's pixels, captured.
 pub struct Capture {
     pub rows: Rows,
-    /// A canvas drew meanwhile: the image may be torn.
-    pub canvas_drawing: bool,
-    /// How long reading them took (under the screen's lock).
+    /// A command held the screen (a canvas) during the capture: it draws
+    /// without the screen's lock, so the image may be torn.
+    pub canvas_held: bool,
+    /// How long filling the rows took (under the screen's lock).
     pub read_ns: u64,
 }
 
 /// Capture the framebuffer (the text console's screen).
 pub fn capture_framebuffer() -> Result<Capture, Error> {
-    let size = term::read_pixels(|fb| (fb.width(), fb.height())).ok_or(Error::NoScreen)?.value;
+    let (w, h) = term::screen_size().ok_or(Error::NoScreen)?;
     let dimension = |n: usize| u32::try_from(n).map_err(|_| Error::Png(png::Error::TooLarge));
     // Allocated before taking the lock (nothing allocates under it); the
     // framebuffer's size never changes.
-    let mut rows = Rows::new(dimension(size.0)?, dimension(size.1)?).map_err(Error::Png)?;
+    let mut rows = Rows::new(dimension(w)?, dimension(h)?).map_err(Error::Png)?;
     let start = crate::time::now_ns();
-    let read = term::read_pixels(|fb| {
+    let canvas_held = term::read_pixels(|fb| {
         for y in 0..rows.height() {
             fb.rgb_row(y as usize, rows.row_mut(y));
         }
     })
     .ok_or(Error::NoScreen)?;
     let read_ns = crate::time::now_ns().saturating_sub(start);
-    Ok(Capture { rows, canvas_drawing: read.canvas_drawing, read_ns })
+    Ok(Capture { rows, canvas_held, read_ns })
 }
 
 /// Encode `rows` as PNG on a thread with an [`ENCODE_STACK`] stack; with
@@ -102,9 +104,12 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
         // A screen full of base64 is no use; the harness reads serial.
         return ctx.fail("screenshot: run it on serial (the PNG comes out as text)");
     }
-    let shot = capture_framebuffer().and_then(|c| Ok((encode(c.rows)?, c.canvas_drawing, c.read_ns)));
-    let ((png, encode_ns), canvas_drawing, read_ns) = match shot {
-        Ok(shot) => shot,
+    let capture = match capture_framebuffer() {
+        Ok(capture) => capture,
+        Err(e) => return ctx.fail(format_args!("screenshot: {e}")),
+    };
+    let (png, encode_ns) = match encode(capture.rows) {
+        Ok(encoded) => encoded,
         Err(e) => return ctx.fail(format_args!("screenshot: {e}")),
     };
     let start = crate::time::now_ns();
@@ -118,9 +123,34 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
         png.width(),
         png.height(),
         png.bytes().len(),
-        Millis(read_ns),
+        Millis(capture.read_ns),
         Millis(encode_ns),
         Millis(sent_ns),
-        if canvas_drawing { ", a canvas was drawing: may be torn" } else { "" }
+        if capture.canvas_held { ", a command held the screen (a canvas): may be torn" } else { "" }
     );
 }
+
+crate::ktest!(
+    fn encodes_from_a_thread_with_the_default_stack() {
+        use crate::kassert;
+        use core::sync::atomic::{AtomicBool, Ordering};
+        // The compressor needs about 72 KiB of stack, more than a thread's
+        // default (`mm::stack::STACK_SIZE`, 64 KiB): `encode` runs it on a
+        // thread of its own. Called from a thread with the default stack,
+        // as a shell's command is, it must still come back with a PNG
+        // (without the bigger thread it would run into the guard page: a
+        // crash report).
+        static ENCODED: AtomicBool = AtomicBool::new(false);
+        let rows = Rows::new(1280, 800).map_err(|_| "no memory for the rows")?;
+        let h = crate::sched::spawn("screenshot-test", move || {
+            let ok = encode(rows).is_ok_and(|(png, _)| {
+                (png.width(), png.height()) == (1280, 800) && png.bytes().starts_with(&png::SIGNATURE)
+            });
+            ENCODED.store(ok, Ordering::Release);
+        })
+        .map_err(|_| "no thread for the test")?;
+        crate::sched::join_bounded(h)?;
+        kassert!(ENCODED.load(Ordering::Acquire));
+        Ok(())
+    }
+);

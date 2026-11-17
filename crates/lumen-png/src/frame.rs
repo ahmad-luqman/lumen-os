@@ -2,7 +2,7 @@
 //! "Screenshot"; `tools/harness/lumen_harness/screenshot.py` reads it):
 //!
 //! ```text
-//! @@png-begin 1280x800 bytes=46726 crc32=0a1b2c3d lines=520
+//! @@png-begin 1280x800 bytes=46835 crc32=e130dd76 lines=521
 //! @@png iVBORw0KGgoAAAANSUhEUgAABQAAAAMgCAIAAADz...   (base64, LINE_CHARS a line)
 //! ...
 //! @@png-end
@@ -52,7 +52,7 @@ pub const fn body_lines(bytes: usize) -> usize {
 }
 
 /// A line formatted on the stack.
-struct Line<const N: usize> {
+pub(crate) struct Line<const N: usize> {
     buf: [u8; N],
     len: usize,
 }
@@ -67,7 +67,7 @@ impl<const N: usize> Write for Line<N> {
 }
 
 impl<const N: usize> Line<N> {
-    fn as_str(&self) -> Result<&str, fmt::Error> {
+    pub(crate) fn as_str(&self) -> Result<&str, fmt::Error> {
         core::str::from_utf8(&self.buf[..self.len]).map_err(|_| fmt::Error)
     }
 }
@@ -76,16 +76,7 @@ impl<const N: usize> Line<N> {
 /// stops at the first error `line` returns.
 pub fn write(png: &Png, mut line: impl FnMut(&str) -> fmt::Result) -> fmt::Result {
     let bytes = png.bytes();
-    let mut begin = Line { buf: [0; BEGIN_MAX], len: 0 };
-    writeln!(
-        begin,
-        "{BEGIN}{}x{} bytes={} crc32={:08x} lines={}",
-        png.width(),
-        png.height(),
-        bytes.len(),
-        crc32(bytes),
-        body_lines(bytes.len())
-    )?;
+    let begin = begin_line(png.width(), png.height(), bytes.len(), crc32(bytes), body_lines(bytes.len()))?;
     line(begin.as_str()?)?;
     let mut body = Line { buf: [0; BODY.len() + LINE_CHARS + 1], len: BODY.len() };
     body.buf[..BODY.len()].copy_from_slice(BODY.as_bytes());
@@ -96,4 +87,18 @@ pub fn write(png: &Png, mut line: impl FnMut(&str) -> fmt::Result) -> fmt::Resul
         line(body.as_str()?)?;
     }
     line(END_LINE)
+}
+
+/// The begin line, with its newline, on the stack (an error only if it
+/// didn't fit, which [`BEGIN_MAX`] rules out).
+pub(crate) fn begin_line(
+    width: u32,
+    height: u32,
+    bytes: usize,
+    crc: u32,
+    lines: usize,
+) -> Result<Line<BEGIN_MAX>, fmt::Error> {
+    let mut begin = Line { buf: [0; BEGIN_MAX], len: 0 };
+    writeln!(begin, "{BEGIN}{width}x{height} bytes={bytes} crc32={crc:08x} lines={lines}")?;
+    Ok(begin)
 }

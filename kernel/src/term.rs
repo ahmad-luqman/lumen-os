@@ -195,25 +195,21 @@ pub fn stop() {
     CANVAS_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 
-/// What [`read_pixels`] read.
-pub struct PixelsRead<R> {
-    pub value: R,
-    /// Whether a [`Canvas`] had the pixels meanwhile: it draws without the
-    /// screen's lock, so what it drew during the read may show in part
-    /// (a torn image). Canvases come and go under the lock, so this held
-    /// for the whole read.
-    pub canvas_drawing: bool,
-}
-
 /// Run `f` on the screen's pixels with the screen's lock held, so nothing
 /// draws through it meanwhile (no terminal output, cursor flip or pointer
-/// move; a live [`Canvas`] still may, and the result says so): the
-/// `screenshot`'s capture. `f` must not allocate (see the module comment),
-/// and runs with interrupts off: keep it short. `None` without a terminal,
-/// once a crash report started, or when this CPU is already drawing (see
-/// [`with_screen`]).
-pub fn read_pixels<R>(f: impl FnOnce(&Framebuffer) -> R) -> Option<PixelsRead<R>> {
-    with_screen(|s| PixelsRead { value: f(&s.fb), canvas_drawing: s.canvas.is_some() })
+/// move): the `screenshot`'s capture. Returns whether a [`Canvas`] held
+/// the pixels meanwhile: its command draws without the lock, so the read
+/// may be torn (canvases come and go under the lock, so the answer holds
+/// for the whole read; a command that holds one but has stopped drawing,
+/// such as a finished `mandelbrot` waiting for a key, counts too). `f`
+/// must not allocate (see the module comment), and runs with interrupts
+/// off: keep it short. `None` without a terminal, once a crash report
+/// started, or when this CPU is already drawing (see [`with_screen`]).
+pub fn read_pixels(f: impl FnOnce(&Framebuffer)) -> Option<bool> {
+    with_screen(|s| {
+        f(&s.fb);
+        s.canvas.is_some()
+    })
 }
 
 /// The boot CPU's timer tick `tick` (in its interrupt handler): flip the

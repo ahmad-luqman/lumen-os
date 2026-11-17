@@ -2,16 +2,19 @@
 //! into a PNG file ([`Png`]): the signature, `IHDR`, one `IDAT` (the rows,
 //! unfiltered, zlib at [`LEVEL`] from `miniz_oxide`), `IEND`.
 //!
-//! **Memory.** Every buffer the encoder needs is taken with `try_reserve`:
-//! the rows ([`Rows::new`], 3 MiB at 1280x800, allocated up front so the
-//! caller can fill them where it mustn't allocate) and the file, which the
-//! compressor writes into directly and which grows by doubling. An
-//! allocator that says no gives [`Error::OutOfMemory`], not an abort. The
-//! exceptions are the compressor's own few fixed boxes (about 170 KiB; its
-//! hash tables), which `miniz_oxide` allocates infallibly.
+//! **Memory.** The encoder's own buffers are taken with
+//! `try_reserve_exact`: the rows ([`Rows::new`], 3 MiB at 1280x800,
+//! allocated up front so the caller can fill them where it mustn't
+//! allocate) and the file, which the compressor writes into directly, which
+//! doubles when it fills, and which always keeps [`TRAILER`] bytes back, so
+//! finishing the file never allocates. An allocator that says no gives
+//! [`Error::OutOfMemory`] with the size refused, not an abort. The
+//! exceptions are the compressor's own fixed boxes (about 250 KiB in all:
+//! its hash tables, an 85 KB output buffer and its Huffman tables; the
+//! largest about 83 KiB), which `miniz_oxide` allocates infallibly.
 //!
 //! **Stack.** The compressor keeps a 64 KiB buffer inline, so
-//! [`Rows::encode`] needs about 75 KiB of stack: more than a kernel thread's
+//! [`Rows::encode`] needs about 72 KiB of stack: more than a kernel thread's
 //! default (the kernel runs it on a bigger stack, `screenshot.rs`).
 //!
 //! **No filter.** Every row is written as it is (filter type 0). On the
@@ -40,8 +43,9 @@ pub const LEVEL: u8 = 6;
 /// Bytes before the compressed data: the signature, the `IHDR` chunk (12
 /// bytes of framing, 13 of data), the `IDAT` chunk's length and type.
 const HEADER: usize = SIGNATURE.len() + 12 + 13 + 8;
-/// Bytes after it: the `IDAT` chunk's CRC and the `IEND` chunk.
-const TRAILER: usize = 4 + 12;
+/// Bytes after it: the `IDAT` chunk's CRC and the `IEND` chunk (kept back
+/// from the compressor, so they always fit).
+pub const TRAILER: usize = 4 + 12;
 /// The compressor is handed at least this much room each time.
 const MIN_ROOM: usize = 64;
 
@@ -134,7 +138,7 @@ impl Rows {
         self.data[start + 1..start + stride].as_chunks().0
     }
 
-    /// The PNG file. Needs about 75 KiB of stack (see the module comment).
+    /// The PNG file. Needs about 72 KiB of stack (see the module comment).
     pub fn encode(self) -> Result<Png, Error> {
         let (width, height) = (self.width, self.height);
         let mut png = Vec::new();
@@ -162,13 +166,14 @@ impl Rows {
         compressor.set_format_and_level(DataFormat::Zlib, LEVEL);
         let mut input = &self.data[..];
         loop {
-            if png.capacity() - png.len() < MIN_ROOM {
+            if png.capacity() - png.len() < MIN_ROOM + TRAILER {
                 let double = png.capacity();
                 reserve(&mut png, double)?;
             }
             let at = png.len();
-            // Within the capacity: no allocation.
-            png.resize(png.capacity(), 0);
+            // Within the capacity, the trailer's bytes kept back: no
+            // allocation.
+            png.resize(png.capacity() - TRAILER, 0);
             let (status, read, written) = compress(&mut compressor, input, &mut png[at..], TDEFLFlush::Finish);
             png.truncate(at + written);
             input = &input[read..];
@@ -182,7 +187,8 @@ impl Rows {
         let len = u32::try_from(png.len() - data).ok().filter(|&l| l <= MAX_DIMENSION);
         png[data - 8..data - 4].copy_from_slice(&len.ok_or(Error::TooLarge)?.to_be_bytes());
         let crc = crc32(&png[data - 4..]);
-        reserve(&mut png, TRAILER)?;
+        // The room kept back: finishing the file allocates nothing.
+        assert!(png.capacity() - png.len() >= TRAILER, "no room kept back for the trailer");
         png.extend_from_slice(&crc.to_be_bytes());
         png.extend_from_slice(&[0, 0, 0, 0]);
         png.extend_from_slice(b"IEND");
@@ -191,9 +197,9 @@ impl Rows {
     }
 }
 
-/// Room for `extra` more bytes in `buf`, or the size refused.
+/// Room for exactly `extra` more bytes in `buf`, or the size refused.
 fn reserve(buf: &mut Vec<u8>, extra: usize) -> Result<(), Error> {
-    buf.try_reserve(extra).map_err(|_| Error::OutOfMemory(buf.len().saturating_add(extra)))
+    buf.try_reserve_exact(extra).map_err(|_| Error::OutOfMemory(buf.len().saturating_add(extra)))
 }
 
 /// A PNG file and the size of the image in it.

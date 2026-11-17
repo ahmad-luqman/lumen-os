@@ -3,8 +3,9 @@
 //! it can be tested on the host:
 //!
 //! - [`encode`]: an RGB8 image ([`encode::Rows`]) into a PNG file
-//!   ([`encode::Png`]), zlib from `miniz_oxide`, every allocation refused
-//!   rather than aborted when the allocator says no.
+//!   ([`encode::Png`]), zlib from `miniz_oxide`; the rows' and the file's
+//!   buffers are refused rather than aborted when the allocator says no
+//!   (the compressor's own fixed boxes excepted).
 //! - [`crc32`]: the CRC PNG's chunks carry (and the frame's check).
 //! - [`base64`] and [`frame`]: how a PNG travels over serial, as lines the
 //!   harness picks out from between log lines.

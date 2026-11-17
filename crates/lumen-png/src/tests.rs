@@ -1,6 +1,6 @@
 extern crate std;
 
-use crate::encode::{BYTES_PER_PIXEL, Error, MAX_DIMENSION, Png, Rows, SIGNATURE};
+use crate::encode::{Error, MAX_DIMENSION, Png, Rows, SIGNATURE};
 use crate::{base64, crc32, frame};
 use alloc::string::String;
 use alloc::vec;
@@ -88,7 +88,6 @@ impl Rng {
 struct Decoded {
     width: u32,
     height: u32,
-    header: [u8; 5],
     chunks: Vec<[u8; 4]>,
     pixels: Vec<u8>,
 }
@@ -127,7 +126,7 @@ fn decode(png: &[u8]) -> Decoded {
         assert_eq!(row[0], 0, "every row unfiltered");
         pixels.extend_from_slice(&row[1..]);
     }
-    Decoded { width, height, header: ihdr[8..13].try_into().unwrap(), chunks, pixels }
+    Decoded { width, height, chunks, pixels }
 }
 
 /// Every pixel's bytes, row after row.
@@ -262,7 +261,6 @@ fn rows_start_black_and_keep_what_is_written() {
     assert_eq!(rows.row(1), [[1, 2, 3], [4, 5, 6], [7, 8, 9]]);
     assert_eq!(rows.row(0), [[42, 0, 0], [0, 0, 0], [0, 0, 0]]);
     assert_eq!(std::format!("{rows:?}"), "Rows(3x2)");
-    assert_eq!(BYTES_PER_PIXEL, 3);
 }
 
 #[test]
@@ -302,7 +300,6 @@ fn encode_writes_signature_ihdr_idat_iend() {
     assert_eq!(png[png.len() - 12..], [0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82]);
     let d = decode(png);
     assert_eq!(d.chunks, [*b"IHDR", *b"IDAT", *b"IEND"]);
-    assert_eq!(d.header, [8, 2, 0, 0, 0]);
 }
 
 #[test]
@@ -326,6 +323,21 @@ fn noise_bigger_than_the_first_buffer_round_trips() {
     let png = rows.encode().unwrap();
     assert!(png.bytes().len() > pixels.len(), "{} bytes", png.bytes().len());
     assert_eq!(decode(png.bytes()).pixels, pixels);
+}
+
+#[test]
+fn the_trailer_always_fits_in_the_room_kept_back() {
+    // Small noise images end their compressed data at every offset of the
+    // file's buffer, the last 16 bytes included (6x3, 19x1 to 24x1, ...
+    // without the room kept back): finishing the file must never need
+    // more room than was kept (it asserts so), and every one round-trips.
+    for w in 1..80 {
+        for h in 1..=3 {
+            let rows = noise_rows(w, h);
+            let pixels = all_pixels(&rows);
+            assert_eq!(decode(rows.encode().unwrap().bytes()).pixels, pixels, "{w}x{h}");
+        }
+    }
 }
 
 /// A screen-like image: a dark background with rows of "glyphs" (a few
@@ -371,9 +383,9 @@ fn encode_says_no_when_the_file_cant_grow() {
     let rows = text_screen(1280, 800);
     let first = 8 + 25 + 8 + (1280 * 3 + 1) * 800 / 16 + 16 + 64;
     assert_eq!(refusing_past(150 << 10, || rows.encode().unwrap_err()), Error::OutOfMemory(first));
-    // The file growing past 1 MiB (noise compresses to about 3 MiB): the
-    // compressor's own boxes (under 200 KiB) are given, the file's growth
-    // isn't.
+    // The file growing past 1 MiB (noise compresses to about 3 MiB): each
+    // of the compressor's boxes (the largest about 83 KiB) is given, the
+    // file's growth isn't.
     let noise = noise_rows(1280, 800);
     let err = refusing_past(1 << 20, || noise.encode().unwrap_err());
     let Error::OutOfMemory(bytes) = err else { panic!("{err:?}") };
@@ -492,13 +504,18 @@ fn write_hands_out_whole_lines_and_stops_at_an_error() {
     // One call per line, each ending in its one newline.
     assert_eq!(lines.len(), 1 + frame::body_lines(1000) + 1);
     assert!(lines.iter().all(|l| l.ends_with('\n') && l.matches('\n').count() == 1), "{lines:?}");
-    let mut calls = 0;
-    let r = frame::write(&png, |_| {
-        calls += 1;
-        if calls == 3 { Err(core::fmt::Error) } else { Ok(()) }
-    });
-    assert!(r.is_err());
-    assert_eq!(calls, 3, "nothing written after the error");
+    // An error at the begin line, at a body line, at the end line: no call
+    // after it.
+    let total = lines.len();
+    for fail_at in [1, 3, total] {
+        let mut calls = 0;
+        let r = frame::write(&png, |_| {
+            calls += 1;
+            if calls == fail_at { Err(core::fmt::Error) } else { Ok(()) }
+        });
+        assert!(r.is_err(), "failing at call {fail_at}");
+        assert_eq!(calls, fail_at, "nothing written after the error");
+    }
 }
 
 #[test]
@@ -519,7 +536,16 @@ fn the_begin_line_states_size_length_crc_and_lines() {
 
 #[test]
 fn the_longest_begin_line_fits_its_buffer() {
-    // Numbers at their widest (an empty file: no body lines).
+    // Every number at its widest.
+    let line = frame::begin_line(u32::MAX, u32::MAX, usize::MAX, u32::MAX, usize::MAX).unwrap();
+    assert_eq!(
+        line.as_str().unwrap(),
+        std::format!("@@png-begin {0}x{0} bytes={1} crc32=ffffffff lines={1}\n", u32::MAX, usize::MAX)
+    );
+}
+
+#[test]
+fn an_empty_file_frames_as_its_begin_and_end_lines() {
     let png = Png::from_parts(u32::MAX, u32::MAX, Vec::new());
     assert_eq!(
         frame_text(&png),

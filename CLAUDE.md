@@ -204,7 +204,7 @@ own PR that updates that doc first.
   sample twice (timings, cache, golden check), as its ktest does.
   `screenshot.rs`: `screenshot`: the screen captured (the framebuffer
   read once under the screen's lock, `term::read_pixels`, which says if a
-  canvas was drawing), encoded on a 256 KiB stack, sent as a base64 frame
+  canvas held the screen), encoded on a 256 KiB stack, sent as a base64 frame
   on serial (the format: ARCHITECTURE section 11).
   `sound.rs`: the virtio-sound driver (its `sound` thread owns the device,
   playing `lumen-synth` sources paced by the device), `beep`, `play`,
@@ -294,7 +294,8 @@ own PR that updates that doc first.
   edge).
 - `crates/lumen-png`: PNG for Lumen: the encoder `screenshot` uses
   (`encode`: RGB8 `Rows` into a `Png`, unfiltered, zlib from
-  `miniz_oxide`, every buffer refused rather than aborted), CRC-32, and
+  `miniz_oxide`, the rows' and the file's buffers refused rather than
+  aborted, the compressor's own boxes excepted), CRC-32, and
   the base64 frame a PNG travels in over serial, streamed from the stack
   (host-tested, incl. a refusing allocator and a golden file PIL decodes;
   decoding is #154's).
