@@ -792,18 +792,39 @@ allocates.
   counts from when it is programmed, not from the gate (measured under TCG). A window whose start
   or end reading was itself paused (the gaps between the TSC reads around
   them add up to more than 0.5% of the window), or, for the PIT, whose end
-  was read too late to place, is set aside and another taken, up to 20 for
-  five; boot logs how many if any, and the last. A PIT read-back that
-  can't fit how it was programmed is an error. The local APIC timer (divide
+  was read too late to place, is set aside and another taken after a wait
+  of two windows' worth of TSC ticks (the fewest any window took: the TSC
+  isn't calibrated yet, but every window spans 10 ms of the reference), up
+  to 20 for five. An HPET window whose ends were slow to read is taken again
+  longer, until the same gaps would be 0.4% of it, up to 160 ms (#139: on
+  KVM a normal window's gaps already take 0.23% of it, and a slowed host's
+  HPET reads took 20 times as long, every window unsteady however late it
+  was taken; the PIT's 16-bit counter can't run past 11 ms). If attempts run
+  out, the least unsteady fill in. A PIT read-back that can't fit how it was
+  programmed is an error, and so is an HPET that doesn't count, which gives
+  way to the PIT (warned). The local APIC timer (divide
   by 16) is calibrated against the TSC as the median of five 10 ms windows
   too, each end a register access between two TSC reads (the timer started
   by one write, its count read), so a window whose ends were paused (gaps
   over 0.5% of it) is taken again, 20 ms later (stalls come in bursts), up
-  to 20 windows in all (#129). If those run out, the least unsteady fill in
-  rather than panicking the boot: with three or more of the five steady the
-  median lies between theirs (logged at INFO); otherwise boot warns how far
-  off it may be (the third smallest gap share), and panics only if that is
-  100% or more (the rate says nothing). The timer paces preemption, when
+  to 20 windows in all (#129), the least unsteady filling in if those run
+  out. Each boot calibration is then judged by how far off its median can
+  be: the third smallest of its windows' bounds, each window off by at most
+  what its gaps allow (for the timer's rate, its gaps' share of it; for the
+  TSC's, measured against the reference, the end gap over the rest of the
+  window, which it stretched, plus one reference tick). Within its clock's
+  tolerance (the TSC 1%, half the 2% its tightest cross-checks allow; the
+  timer 2%, which with the TSC's 1% leaves the 1 kHz check's 5% room for its
+  own measurement), boot logs at most an INFO line with the bound when it
+  took windows again; past it, a warning saying how far off; with no bound
+  under 100% (the middle windows' stalls as long as themselves) the rate
+  says nothing: an HPET then gives way to the PIT, and otherwise boot
+  panics. The old rule, a warning unless most windows were steady, failed
+  scenarios on a boot whose timer was within 0.7% (#139). A boot can be
+  made to stall each window's end (and start) by a share of it,
+  `lumen.stall_tsc_windows=<end ppm>[,<start ppm>]` and
+  `lumen.stall_timer_windows=...`, a deliberate fault like the shell's
+  `crash`, so scenarios reach the fill-in, the warning and the panic. The timer paces preemption, when
   deadlines are noticed, the cursor's blink and the `ticks` counts; sleeps
   and deadlines themselves are TSC times. It is then set periodic at 1 kHz. `time::now_ns` (TSC-based, lock-free) and
   `time::sleep` (blocks the thread once the scheduler runs on its CPU,

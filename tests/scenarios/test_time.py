@@ -10,6 +10,8 @@ asserted on: TCG and KVM run at different speeds.
 import re
 from typing import NamedTuple
 
+from lumen_harness.qemu import EXIT_CRASH
+
 BOOT_TIMEOUT = 60
 TSC_LINE = re.compile(
     r"INFO  time: tsc (\d+(?:\.\d+)?) (GHz|MHz) \(calibrated against (hpet|pit)\)\n"
@@ -71,26 +73,63 @@ def assert_close(a: int, b: int) -> None:
     assert abs(a - b) * 50 <= a, (a, b)
 
 
-def check_calibration(cal: Calibration, reference_hz: int) -> None:
-    """The frequency is exactly what the kernel computes from the windows:
-    the median of five, each steady (the gaps at its start and end add up to
-    at most 0.5% of it) and so within 1% of the median (a steady window is off
-    by at most its gaps), with at most MOST_RETAKEN taken again."""
-    hz = []
+# How far off the TSC's calibration may be before boot warns
+# (kernel/src/time.rs's TSC_TOLERANCE_PPM): 1%.
+TSC_TOLERANCE_PPM = 10_000
+
+
+def tsc_error_ppm(tsc: int, ref: int, start_gap: int, end_gap: int) -> int:
+    """How far off (at most, ppm of the true rate) the TSC rate a window gives
+    can be: lumen_time's Window::tsc_error_ppm, rounded up the same way."""
+    if tsc == 0 or end_gap >= tsc or ref < 2:
+        return 2**64 - 1
+    high = -(-(tsc + end_gap * ref) * 1_000_000 // ((tsc - end_gap) * ref))
+    low = -(-(tsc + start_gap * ref) * 1_000_000 // ((tsc + start_gap) * ref))
+    return max(high, low)
+
+
+def window_fields(w: str) -> tuple[int, int, int, int, int]:
+    """`tsc/reference/polls/start_gap/end_gap` as numbers."""
+    fields = w.split("/")
+    assert len(fields) == 5, f"not tsc/reference/polls/start_gap/end_gap: {w}"
+    return tuple(int(x) for x in fields)  # type: ignore[return-value]
+
+
+def median_bound_ppm(cal: Calibration) -> int:
+    """The most the median of `cal`'s windows can be off: the third smallest
+    window bound (lumen_time::median_bound_ppm_by)."""
+    bounds = []
     for w in cal.windows.split():
-        fields = w.split("/")
-        assert len(fields) == 5, f"not tsc/reference/polls/start_gap/end_gap: {w}"
-        tsc, ref, polls, start_gap, end_gap = (int(x) for x in fields)
+        tsc, ref, _, start_gap, end_gap = window_fields(w)
+        bounds.append(tsc_error_ppm(tsc, ref, start_gap, end_gap))
+    return sorted(bounds)[2]
+
+
+def check_calibration(cal: Calibration, reference_hz: int) -> None:
+    """The frequency is exactly what the kernel computes from the windows: the
+    median of five (steady ones first, then, if attempts ran out, the least
+    unsteady filling in, #139), its bound within the TSC's tolerance, and each
+    window within its own bound plus the median's of it (each is off from the
+    true rate by at most its bound), with at most MOST_RETAKEN taken again
+    unless some filled in."""
+    hz, bounds = [], []
+    for w in cal.windows.split():
+        tsc, ref, polls, start_gap, end_gap = window_fields(w)
         assert ref > 0 and polls > 0, w
-        assert (start_gap + end_gap) * 200 <= tsc, f"not steady: {w}"
         hz.append(tsc * reference_hz // ref)
+        bounds.append(tsc_error_ppm(tsc, ref, start_gap, end_gap))
     assert len(hz) == 5, cal
     assert sorted(hz)[2] == cal.hz, cal
-    for one in hz:
-        assert abs(one - cal.hz) * 100 <= cal.hz, (
-            f"a window {one} Hz, the median {cal.hz} Hz: {cal}"
+    median_ppm = median_bound_ppm(cal)
+    assert median_ppm <= TSC_TOLERANCE_PPM, f"median within {median_ppm} ppm: {cal}"
+    for one, ppm in zip(hz, bounds, strict=True):
+        assert abs(one - cal.hz) * 1_000_000 <= cal.hz * (ppm + median_ppm + 1), (
+            f"a window {one} Hz ({ppm} ppm), the median {cal.hz} Hz ({median_ppm} ppm): {cal}"
         )
-    assert cal.retook <= MOST_RETAKEN, cal
+    steady = sum(
+        (sg + eg) * 200 <= t for t, _, _, sg, eg in map(window_fields, cal.windows.split())
+    )
+    assert cal.retook <= MOST_RETAKEN or steady < 5, cal
 
 
 def check_retake_line(m, cal: Calibration) -> None:
@@ -160,3 +199,144 @@ def test_boot_calibration_agrees_with_both_clocks(boot):
     assert pit is not None and hpet is not None
     assert_close(tsc, pit)
     assert_close(tsc, hpet)
+
+
+# Stalls injected into the boot's calibration windows (time::stall_window_ends:
+# `lumen.stall_*_windows=<end ppm>[,<start ppm>]`, a deliberate fault like the
+# shell's `crash`), so a real boot reaches the fill-in, its warning and its
+# panic (#139). An end stall of over 0.5% makes every window unsteady: all 20
+# are taken and the least gapped five fill in; the median's bound is then
+# about the stall. Its verdict is by each clock's tolerance (the TSC's 1%,
+# the timer's 2%).
+FILLED = r"took 20 windows again, 0 of 5 kept steady, median within (\d+\.\d)%"
+PANIC = re.compile(r"panic: (.*)\n")
+
+
+def boot_messages(m) -> str:
+    """The boot's output up to the first prompt."""
+    m.expect(r"lumen> ", BOOT_TIMEOUT)
+    return m.output[: m.output.index("lumen> ")]
+
+
+def test_tsc_windows_stalled_past_steady_fill_in_within_tolerance(boot):
+    # 0.6% at each window's end: none steady, the median within 0.6% and a
+    # bit (rounded up to a tenth), so an INFO line, no warning, and the HPET
+    # kept (an unsteady HPET used to give way to the PIT, which stalls with
+    # it). The bound is honest: the stall makes the boot's rate high by about
+    # that much, and the HPET measured again (unstalled) agrees within the
+    # two bounds.
+    m = boot("qemutest", cmdline="lumen.stall_tsc_windows=6000")
+    out = boot_messages(m)
+    assert TSC_LINE.search(out)[3] == "hpet", out
+    said = re.search(r"INFO  time: tsc calibration " + FILLED, out)
+    assert said, out
+    assert 0.6 <= float(said[1]) <= 1.0, said[0]
+    assert "WARN" not in out, out
+    (tsc, _, _, hpet), cals = clocks_and_windows(m)
+    boot_ppm, hpet_ppm = median_bound_ppm(cals["boot"]), median_bound_ppm(cals["hpet"])
+    assert abs(tsc - hpet) * 1_000_000 <= hpet * (boot_ppm + hpet_ppm + 1), (
+        tsc,
+        hpet,
+        boot_ppm,
+        hpet_ppm,
+    )
+    assert (tsc - hpet) * 1_000_000 >= hpet * 3_000, (
+        f"the stall didn't move the rate: {tsc} against {hpet}"
+    )
+
+
+def test_tsc_windows_stalled_past_tolerance_warn(boot):
+    # 1.5%: past the TSC's 1%, a warning with the bound, and the boot goes on
+    # against the HPET.
+    m = boot("qemutest", cmdline="lumen.stall_tsc_windows=15000")
+    out = boot_messages(m)
+    assert TSC_LINE.search(out)[3] == "hpet", out
+    said = re.search(
+        r"WARN  time: tsc calibration: only 0 of 20 windows read promptly \(5 wanted; a stall next to "
+        r"the HPET's reads\), so its rate may be off by up to (\d+\.\d)%, over the 1\.0% allowed",
+        out,
+    )
+    assert said, out
+    assert 1.5 <= float(said[1]) <= 2.0, said[0]
+
+
+def test_tsc_windows_with_no_bound_left_panic(boot):
+    # Each window's end stalled twice as long as it ran: the median's bound is
+    # over 100%, the rate says nothing. The HPET gives way to the PIT
+    # (warned), which stalls too, and boot panics saying why.
+    m = boot("qemutest", cmdline="lumen.stall_tsc_windows=2000000")
+    assert m.wait_exit(BOOT_TIMEOUT) == EXIT_CRASH
+    out = m.output
+    assert re.search(
+        r"WARN  time: can't calibrate the tsc against the HPET: only 0 of 20 windows read promptly .*"
+        r"so the rate says nothing .*; calibrating against the PIT\n",
+        out,
+    ), out
+    said = PANIC.search(out)
+    assert said, out
+    assert said[1].startswith(
+        "can't calibrate the tsc against the PIT: only 0 of 20 windows read promptly (5 wanted), and the "
+        "middle ones' stalls were as long as themselves, so the rate says nothing"
+    ), said[0]
+
+
+def test_tsc_windows_stalled_without_an_hpet_fill_in_against_the_pit(boot):
+    # No HPET: the PIT's windows fill in the same way.
+    m = boot(
+        "qemutest",
+        extra=["-machine", "q35,hpet=off"],
+        cmdline="lumen.stall_tsc_windows=6000",
+    )
+    out = boot_messages(m)
+    assert TSC_LINE.search(out)[3] == "pit", out
+    said = re.search(r"INFO  time: tsc calibration " + FILLED, out)
+    assert said, out
+    assert 0.6 <= float(said[1]) <= 1.0, said[0]
+    assert "WARN  time" not in out, out
+
+
+def test_timer_windows_stalled_past_steady_fill_in_within_tolerance(boot):
+    # 1% at each timer window's end: none steady, the median within 1% and a
+    # bit, inside the timer's 2%: an INFO line, no warning, and the timer
+    # ticks (#139: the 0.7% one seen on loaded KVM used to warn).
+    m = boot("qemutest", cmdline="lumen.stall_timer_windows=10000")
+    out = boot_messages(m)
+    said = re.search(r"INFO  time: local APIC timer calibration " + FILLED, out)
+    assert said, out
+    assert 1.0 <= float(said[1]) <= 1.5, said[0]
+    assert "WARN" not in out, out
+    m.send_line("sleep 100")
+    m.expect(r"slept 100 ms\n")
+    m.expect(r"lumen> ")
+    assert ticks(m)[0] > 0
+
+
+def test_timer_windows_stalled_past_tolerance_warn(boot):
+    # 3%: past the timer's 2%, a warning with the bound, and the boot goes on.
+    m = boot("qemutest", cmdline="lumen.stall_timer_windows=30000")
+    out = boot_messages(m)
+    said = re.search(
+        r"WARN  time: local APIC timer calibration: only 0 of 20 windows read promptly \(5 wanted; a stall "
+        r"next to the timer's register accesses\), so its rate may be off by up to (\d+\.\d)%, over the "
+        r"2\.0% allowed",
+        out,
+    )
+    assert said, out
+    assert 2.9 <= float(said[1]) <= 3.5, said[0]
+
+
+def test_timer_windows_with_no_bound_left_panic(boot):
+    # From the second window on, each one's start stalled three times as long
+    # as the last ran: its gaps outlast it (an end stall alone can't: the
+    # window counts it), so the median's bound is gone and boot panics.
+    m = boot("qemutest", cmdline="lumen.stall_timer_windows=0,3000000")
+    assert m.wait_exit(BOOT_TIMEOUT) == EXIT_CRASH
+    said = PANIC.search(m.output)
+    assert said, m.output
+    # The first window (no stall) may be steady or not: TCG's timer reads alone
+    # can take 1% of a window.
+    assert re.match(
+        r"can't calibrate the local APIC timer against the TSC: only [01] of 20 windows read promptly "
+        r"\(5 wanted\), and the middle ones' stalls were as long as themselves, so the rate says nothing",
+        said[1],
+    ), said[0]
