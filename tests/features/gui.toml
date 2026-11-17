@@ -1,0 +1,6 @@
+# Features: gui (the M4 desktop). See tests/features/README.md for the format.
+
+[[feature]]
+name = "Pixel core (lumen-gfx): rectangles with a signed origin (intersect, union, contains, clip, subtract into at most 4), a fixed-size damage list that coalesces and never loses coverage (randomized check), xRGB8888 surfaces with a stride (fill, blits clipped at every edge, presenting spans to a target), coverage-mask blending rounded to the nearest (checked for every input) and clipped to a damaged rectangle (redraw equals one full draw)"
+milestone = "M4"
+tests = ["cargo:lumen-gfx"]
