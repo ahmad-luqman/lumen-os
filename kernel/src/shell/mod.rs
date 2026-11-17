@@ -219,6 +219,9 @@ pub fn run() -> ! {
         }
         Err(why) => log::info!(target: "shell", "shell on serial (none on the screen: {why}); type 'help'"),
     }
+    // `lumen.desktop`: after the screen shells (keys typed before it went
+    // to them), before the serial prompt.
+    crate::desktop::start_at_boot();
     // The serial shell's keys by interrupt from here on (it blocks for
     // them instead of polling).
     serial_in::init();

@@ -130,6 +130,9 @@ static UNDECODED: AtomicU64 = AtomicU64::new(0);
 /// Bytes skipped during init: not the awaited reply, from port 2, or
 /// flushed.
 static SKIPPED: AtomicU64 = AtomicU64::new(0);
+/// Bytes taken off the queue by the decoder (`desktop status`'s `settled`
+/// compares it with [`ARRIVED`]'s bytes queued).
+static DECODED: AtomicU64 = AtomicU64::new(0);
 
 // Controller commands (port 0x64).
 const READ_CONFIG: u8 = 0x20;
@@ -503,6 +506,8 @@ fn drain() {
     }
     if queued {
         WAITING.wake_all();
+        // The compositor decodes the keyboard's bytes itself (#153).
+        crate::desktop::wake();
     }
 }
 
@@ -553,7 +558,11 @@ pub fn read_key() -> Option<Key> {
     let Keyboard { decoder, drops, .. } = keyboard.as_mut()?;
     decode(
         decoder,
-        || QUEUE.pop(),
+        || {
+            let byte = QUEUE.pop();
+            DECODED.fetch_add(u64::from(byte.is_some()), Ordering::Relaxed);
+            byte
+        },
         drops,
         |event| {
             crate::input::KEYS.push(event);
@@ -569,6 +578,22 @@ pub fn queue_for_test(bytes: &[u8]) -> bool {
     debug_assert!(arch::cpu_index() == 0, "the keyboard queue's producer is the boot CPU");
     let _off = arch::irq::push_off();
     bytes.iter().all(|&b| QUEUE.push(b))
+}
+
+/// Whether bytes are queued, waiting to be decoded (an atomic look, no
+/// lock: the compositor's wake-up check, #153).
+pub fn bytes_pending() -> bool {
+    !QUEUE.is_empty()
+}
+
+/// Whether every byte the keyboard queued has been decoded: the bytes
+/// queued ([`ARRIVED`]'s count, read first under its lock) are no more
+/// than the bytes the decoder took. (`desktop status`'s `settled`; the
+/// ktests' `queue_for_test` bytes are decoded without being counted as
+/// queued, so this compares with `<=`.)
+pub fn all_decoded() -> bool {
+    let queued = ARRIVED.lock().bytes;
+    queued <= DECODED.load(Ordering::Relaxed)
 }
 
 /// Block the calling thread until bytes are queued or `ready()` holds.

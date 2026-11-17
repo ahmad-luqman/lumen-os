@@ -88,6 +88,20 @@ pub static COMMANDS: Table<Run> = Table(&[
         run: crate::font::command,
     },
     Command {
+        name: "desktop",
+        args: &[&["status", "check", "spin", "hold", "release"]],
+        usage: "[status|check|spin|hold <window>|release <window>]",
+        about: "start or resume the desktop (status: one record; check, spin, hold, release: for the tests)",
+        run: crate::desktop::command,
+    },
+    Command {
+        name: "windows",
+        args: &[],
+        usage: "",
+        about: "the desktop's windows, front to back: id, title, frame, z, focus, owner, events lost, keys",
+        run: crate::desktop::windows_command,
+    },
+    Command {
         name: "mandelbrot",
         args: &[],
         usage: "",
@@ -521,7 +535,7 @@ fn vt(ctx: &mut Ctx<'_>, args: &[String]) {
             for d in s.discarded {
                 let _ = write!(out, " {d}");
             }
-            let _ = writeln!(out, "; {} switches refused", s.refused);
+            let _ = writeln!(out, "; {} switches refused, {} keys to the desktop", s.refused, s.to_desktop);
         }
         Some(n) => match crate::vt::show(n - 1) {
             Ok(()) => {

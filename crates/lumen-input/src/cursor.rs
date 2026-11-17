@@ -51,6 +51,39 @@ fn paint(dx: usize, dy: usize) -> Paint {
     }
 }
 
+/// Paint the arrow with its tip at `tip` into `pixels`, a `size.0` x
+/// `size.1` buffer whose rows are `stride` pixels apart: its outline in
+/// `outline`, its fill in `fill`, its clear pixels left as they are.
+/// Clipped to `size` (and to `pixels`: a buffer too short for `size` and
+/// `stride` loses the rows past its end, never panics). Draw-only: nothing
+/// is read or kept, unlike [`Cursor::show`]. The desktop's compositor
+/// (#153) copies its back buffer's pixels under the arrow's box into a
+/// small array, paints the arrow there and copies the array to the screen;
+/// taking it off is copying the back buffer's box again.
+pub fn draw_arrow(
+    pixels: &mut [u32],
+    stride: usize,
+    size: (usize, usize),
+    tip: (usize, usize),
+    outline: u32,
+    fill: u32,
+) {
+    let (w, h) = clipped(tip.0, tip.1, size.0, size.1);
+    for dy in 0..h {
+        for dx in 0..w {
+            let value = match paint(dx, dy) {
+                Paint::Outline => outline,
+                Paint::Fill => fill,
+                Paint::Clear => continue,
+            };
+            let at = (tip.1 + dy).checked_mul(stride).and_then(|row| row.checked_add(tip.0 + dx));
+            if let Some(p) = at.and_then(|i| pixels.get_mut(i)) {
+                *p = value;
+            }
+        }
+    }
+}
+
 /// Pixels the cursor draws on and reads back: the values are the
 /// surface's own (the kernel's are framebuffer-encoded colours).
 pub trait Surface {
@@ -321,5 +354,41 @@ mod tests {
             }
             assert_eq!(screen, expected(&model, at), "step {step}");
         }
+    }
+
+    #[test]
+    fn draw_arrow_paints_what_show_paints_and_reads_nothing() {
+        // The arrow drawn into an array at any tip, clipped at every edge,
+        // equals what `Cursor::show` draws on a surface with the same
+        // pixels; the clear pixels keep what was there.
+        let (w, h) = (24, 30);
+        for (x, y) in [(0, 0), (3, 4), (w - 11, h - 17), (w - 5, 2), (1, h - 6), (w - 1, h - 1), (w, h), (w + 3, 0)] {
+            let model = Grid::new(w, h, 11);
+            let mut px = model.px.clone();
+            draw_arrow(&mut px, w, (w, h), (x, y), OUT, FILL);
+            assert_eq!(px, expected(&model, Some((x, y))).px, "tip at ({x}, {y})");
+        }
+    }
+
+    #[test]
+    fn draw_arrow_keeps_to_the_size_its_stride_and_the_buffer() {
+        // A 5x4 area inside rows 8 apart: nothing right of column 5 (the
+        // padding) or below row 4 changes. A buffer shorter than its
+        // stride and size say loses only the rows past its end.
+        let (stride, size) = (8, (5, 4));
+        let mut px = vec![0u32; stride * 6];
+        draw_arrow(&mut px, stride, size, (1, 1), OUT, FILL);
+        for (i, &v) in px.iter().enumerate() {
+            let (x, y) = (i % stride, i / stride);
+            if x >= size.0 || y >= size.1 {
+                assert_eq!(v, 0, "({x}, {y}) is outside the area");
+            }
+        }
+        assert_eq!(px[stride + 1], OUT, "the tip");
+        assert_eq!(px[3 * stride + 2], FILL, "a fill pixel inside the area");
+        let mut short = vec![0u32; stride * 2 + 3];
+        draw_arrow(&mut short, stride, (stride, 10), (0, 0), OUT, FILL);
+        assert_eq!(short[0], OUT);
+        assert_eq!(short[2 * stride], OUT, "row 2 starts with the outline");
     }
 }

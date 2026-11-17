@@ -73,8 +73,9 @@ pub type MakeTable = fn(&[String]) -> Option<Result<pipe::Table, String>>;
 
 /// The system commands that give records in a pipeline (instead of their
 /// text), and the tables they give.
-pub const RECORDS: [(&str, MakeTable); 8] = [
+pub const RECORDS: [(&str, MakeTable); 10] = [
     ("cpus", |a| no_args(a, cpu_table)),
+    ("desktop", crate::desktop::records),
     ("irqs", |a| no_args(a, vector_table)),
     ("kbd", kbd_records),
     ("lspci", |a| no_args(a, pci_table)),
@@ -82,6 +83,7 @@ pub const RECORDS: [(&str, MakeTable); 8] = [
     ("mouse", mouse_records),
     ("sound", |a| no_args(a, crate::sound::table)),
     ("threads", |a| no_args(a, thread_table)),
+    ("windows", crate::desktop::windows_records),
 ];
 
 /// A command's records when it takes no arguments: `table`'s, given none.

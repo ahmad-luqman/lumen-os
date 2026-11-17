@@ -1,7 +1,9 @@
 //! Boot framebuffer: pixels, glyphs, the "hello" header, and the crash
 //! screen. Below the header, the shown virtual terminal (`crate::term`)
 //! draws log lines or a screen shell, or a command draws on a
-//! `term::Canvas` while the terminals are paused.
+//! `term::Canvas` while the terminals are paused. The desktop (#153) takes
+//! the whole screen, header included (`term::ScreenCanvas`), and
+//! [`draw_header`] draws the header again when it is left.
 //!
 //! Text uses pre-rasterized Noto Sans Mono glyphs (anti-aliased, so we blend
 //! each pixel between background and foreground). This is deliberately the
@@ -73,6 +75,13 @@ impl Framebuffer {
     pub(crate) fn encode(&self, rgb: u32) -> u32 {
         let (r, g, b) = ((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
         (r << self.red_shift) | (g << self.green_shift) | (b << self.blue_shift)
+    }
+
+    /// A stored pixel value back as `0x00RRGGBB` ([`Framebuffer::encode`]
+    /// undone): `desktop check` compares the screen with its back buffer.
+    pub(crate) fn decode(&self, value: u32) -> u32 {
+        let ch = |shift: u8| (value >> shift) & 0xff;
+        (ch(self.red_shift) << 16) | (ch(self.green_shift) << 8) | ch(self.blue_shift)
     }
 
     /// Set one pixel (nothing outside the framebuffer). Takes `&self`: the
@@ -337,10 +346,7 @@ pub fn init(fb: &limine::framebuffer::Framebuffer<'_>) -> Result<(usize, usize),
     };
     let (w, h) = (f.width, f.height);
     f.fill_rect(0, 0, w, h, BG);
-    f.text(MARGIN, 28, "Lumen", Style::new(FontWeight::Bold, RasterHeight::Size32, TITLE, BG));
-    f.text(MARGIN, 72, "hello from the kernel", Style::new(FontWeight::Regular, RasterHeight::Size16, TEXT, BG));
-    f.text(MARGIN, 94, "milestone 0 - x86-64 - limine", Style::new(FontWeight::Regular, RasterHeight::Size16, DIM, BG));
-    f.fill_rect(MARGIN, 124, 576, 2, ACCENT);
+    draw_header(&f);
 
     // SAFETY: the crash screen's handle draws only after the crash path
     // stopped the terminal (`with_crash_screen`; a `term::Canvas` on a CPU
@@ -349,6 +355,19 @@ pub fn init(fb: &limine::framebuffer::Framebuffer<'_>) -> Result<(usize, usize),
     *FRAMEBUFFER.lock() = Some(crash);
     crate::term::init(f);
     Ok((w, h))
+}
+
+/// Draw the header (its whole width, down to [`CONSOLE_TOP`]): the
+/// "Lumen" title, its two lines and the rule, on the background. At boot,
+/// and again when the desktop, which owns the whole screen, is left
+/// (`term::leave_desktop`, which draws the terminals' boxes over its right
+/// end afterwards).
+pub fn draw_header(f: &Framebuffer) {
+    f.fill_rect(0, 0, f.width, CONSOLE_TOP.min(f.height), BG);
+    f.text(MARGIN, 28, "Lumen", Style::new(FontWeight::Bold, RasterHeight::Size32, TITLE, BG));
+    f.text(MARGIN, 72, "hello from the kernel", Style::new(FontWeight::Regular, RasterHeight::Size16, TEXT, BG));
+    f.text(MARGIN, 94, "milestone 0 - x86-64 - limine", Style::new(FontWeight::Regular, RasterHeight::Size16, DIM, BG));
+    f.fill_rect(MARGIN, 124, 576, 2, ACCENT);
 }
 
 /// Switch the screen to the crash screen and run `f` with a writer for it.
