@@ -19,6 +19,7 @@ warning and the reason in `lspci`'s header. The decoding itself is host-tested (
 """
 
 import re
+import shlex
 import socket
 
 import pytest
@@ -121,7 +122,8 @@ def lspci_rows(m: Machine) -> dict[str, tuple[int, int, str, str, str]]:
     assert re.fullmatch(r"  addr\s+vendor\s+device\s+class\s+name\s+driver", lines[1]), out
     rows = {}
     for line in lines[2:]:
-        addr, vendor, device, cls, name, driver = re.split(r"\s{2,}", line.strip())
+        # A cell with a space (a name, the driver) comes quoted: split as words.
+        addr, vendor, device, cls, name, driver = shlex.split(line)
         assert re.fullmatch(r"0x[0-9a-f]{4}", vendor) and re.fullmatch(r"0x[0-9a-f]{4}", device), (
             line
         )
@@ -139,7 +141,8 @@ def pci_address(d: dict) -> str:
     return f"0000:{d['bus']:02x}:{d['slot']:02x}.{d['function']:x}"
 
 
-MSIX_ROW = re.compile(r"^  (0x[0-9a-f]{2})\s+msix (\S+) #(\d+)\s+(\d+)$", re.MULTILINE)
+# The use cell has spaces, so it comes quoted.
+MSIX_ROW = re.compile(r'^  (0x[0-9a-f]{2})\s+"msix (\S+) #(\d+)"\s+(\d+)$', re.MULTILINE)
 
 
 def msix_rows(m: Machine) -> dict[str, tuple[int, int, int]]:

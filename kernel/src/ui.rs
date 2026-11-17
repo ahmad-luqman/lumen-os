@@ -1,13 +1,15 @@
 //! The desktop's toolkit in the kernel and the automation tree's commands
 //! (#156; ARCHITECTURE section 11, "Toolkit and the automation tree"):
 //!
-//! - [`Toolkit`]: a `lumen_ui::Ui` in a window: text through `lumen-font`
-//!   ([`UiText`]), painting, committing and publishing its tree, and its
-//!   window's events (the primary button, keys, focus, requests) handed to
-//!   it, requests answered by the handler a click reaches ([`serve`]).
+//! - [`Toolkit`]: a `lumen_ui::App` in a window, one step per event: the
+//!   event handed to the tree, then (if it changed) repainted, committed
+//!   and published, and only then a request answered, so once `ui invoke`
+//!   returns, `ui tree` shows its effect (and a window its action closed is
+//!   gone). Text through `lumen-font` ([`UiText`]).
 //! - [`Request`]: `ui invoke`'s request in a window's queue, with its reply
-//!   slot (`lumen_ui::Reply` behind a lock, and the asker's wait queue). It
-//!   answers "window closed" if dropped unanswered.
+//!   slot (`lumen_ui::Reply` behind a lock, and the asker's wait queue).
+//!   [`Request::start`] gives a [`Started`], the only thing that can answer
+//!   it; dropped unanswered, either answers for itself.
 //! - Counter, the demo app (`desktop counter`; its logic is
 //!   `lumen_ui::counter`).
 //! - `ui tree [window]` and `ui invoke <node> <action> [args]`.
@@ -19,17 +21,21 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use lumen_font::{Font, Px};
 use lumen_gfx::{Mask, Rect, Surface};
 use lumen_input::{Button, KeyAction, KeyCode, KeyEvent};
 use lumen_shell::pipe::{self, Align, Column, Kind, Value};
-use lumen_ui::counter::{Counter, Then};
-use lumen_ui::{Action, AutomationNode, Input, Key, Outcome, Palette, Reply, Text, Ui, UiEvent};
-use lumen_wm::Refused;
+use lumen_ui::counter::Counter;
+use lumen_ui::{
+    Action, ActionKind, App, First, Input, InvokeError, Key, Palette, Phase, Reply, Second, Served, Text, Then, serve,
+};
+use lumen_wm::{Refused, Theme};
 
 use crate::desktop::{self, NodeAt, TreeRow, WindowEvent, WindowHandle};
 use crate::sched::WaitQueue;
+use crate::shell::sysinfo::{int, text};
 use crate::sync::SpinLock;
 
 /// How long `ui invoke` waits for an answer, and again once the owner took
@@ -38,36 +44,71 @@ const DEADLINE_NS: u64 = 1_000_000_000;
 
 // -- requests --------------------------------------------------------------------
 
-/// What a request's owner answered.
+/// What a request's asker is told.
 #[derive(Debug)]
 pub enum Answer {
-    /// Done: the node as it is after the action (client coordinates).
-    Row { depth: u32, node: AutomationNode },
-    /// Refused (it changed nothing): why.
-    Error(String),
-    /// Done, and the action closed its window (a Quit button).
-    ClosedItsWindow,
-    /// Its window closed before the request ran (or the request was
-    /// dropped unanswered).
+    /// It ran (or was refused, changing nothing): what `serve` said.
+    Ran(Served),
+    /// Its window closed before it ran (or it was dropped unrun).
     WindowClosed,
+    /// The owner dropped it while running it, unanswered (a bug).
+    Dropped,
 }
 
-/// A request's reply slot, shared by its asker and the request.
-struct ReplyCell {
+/// A request's reply slot, shared by its asker and the request: the reply
+/// behind a leaf lock (taken under the wait queue's lock by the asker's
+/// wake-up check, never held across a wake), and the queue its asker
+/// waits on, woken after each answer.
+pub struct ReplyCell {
     reply: SpinLock<Reply<Answer>>,
-    /// The asker waits here; woken after every write.
     done: WaitQueue,
 }
 
+impl ReplyCell {
+    /// Where the reply is (for the ktests).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "for the ktests"))]
+    pub fn phase(&self) -> Phase {
+        self.reply.lock().phase()
+    }
+
+    /// The asker takes the answer (for the ktests).
+    #[cfg(feature = "ktest")]
+    pub fn take(&self) -> Option<Answer> {
+        self.reply.lock().take()
+    }
+
+    /// Answer with `write` if it applies; wake the asker if it did.
+    fn answer(&self, write: impl FnOnce(&mut Reply<Answer>) -> bool) {
+        let wrote = write(&mut self.reply.lock());
+        if wrote {
+            self.done.wake_all();
+        }
+    }
+}
+
 /// `ui invoke`'s request in a window's queue: the node and the action, and
-/// its reply. Not `Clone`; answers "window closed" if dropped unanswered
-/// (so `ui invoke` always ends). Dropped only with no desktop lock held.
+/// its reply. Not `Clone`; answers "window closed" if dropped before it
+/// ran (so `ui invoke` always ends). Dropped only with no desktop lock
+/// held (the queue hands refused and drained requests back).
 pub struct Request {
     node: u64,
     action: Action,
-    /// `None` once answered.
+    /// `None` once started.
     cell: Option<Arc<ReplyCell>>,
 }
+
+/// A request the owner took ([`Request::start`]): the only thing that can
+/// answer it ([`Started::finish`]); dropped unanswered, it answers
+/// "dropped while running".
+pub struct Started {
+    node: u64,
+    action: Action,
+    cell: Option<Arc<ReplyCell>>,
+}
+
+/// A request cancelled at its asker's deadline: the owner skips it.
+#[derive(Debug)]
+pub struct Skipped;
 
 impl fmt::Debug for Request {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -76,32 +117,55 @@ impl fmt::Debug for Request {
 }
 
 impl Request {
-    fn new(node: u64, action: Action) -> (Request, Arc<ReplyCell>) {
+    /// A request for `action` on node `node`, and its reply's cell (the
+    /// asker's side).
+    pub(crate) fn new(node: u64, action: Action) -> (Request, Arc<ReplyCell>) {
         let cell = Arc::new(ReplyCell { reply: SpinLock::new(Reply::new()), done: WaitQueue::new() });
         (Request { node, action, cell: Some(cell.clone()) }, cell)
     }
 
-    /// The owner takes it: false if it may not run (cancelled at the
-    /// asker's deadline: skip it, `cancelled` counted it).
-    pub fn start(&self) -> bool {
-        self.cell.as_ref().is_some_and(|c| c.reply.lock().start().is_ok())
-    }
-
-    /// The owner's answer, which wakes the asker.
-    pub fn finish(mut self, answer: Answer) {
-        if let Some(cell) = self.cell.take() {
-            let _ = cell.reply.lock().finish(answer);
-            cell.done.wake_all();
+    /// The owner takes it: a [`Started`] to answer, or [`Skipped`] if it
+    /// was cancelled at the asker's deadline (`cancelled` counted it).
+    pub fn start(mut self) -> Result<Started, Skipped> {
+        let Some(cell) = self.cell.take() else { return Err(Skipped) };
+        let action = core::mem::replace(&mut self.action, Action::Press);
+        if cell.reply.lock().start().is_ok() {
+            Ok(Started { node: self.node, action, cell: Some(cell) })
+        } else {
+            Err(Skipped)
         }
     }
 }
 
 impl Drop for Request {
     fn drop(&mut self) {
-        if let Some(cell) = self.cell.take()
-            && cell.reply.lock().answer_unrun(Answer::WindowClosed)
-        {
-            cell.done.wake_all();
+        if let Some(cell) = self.cell.take() {
+            cell.answer(|r| r.answer_unrun(Answer::WindowClosed));
+        }
+    }
+}
+
+impl Started {
+    pub fn node(&self) -> u64 {
+        self.node
+    }
+
+    pub fn action(&self) -> &Action {
+        &self.action
+    }
+
+    /// The owner's answer, which wakes the asker.
+    pub fn finish(mut self, answer: Answer) {
+        if let Some(cell) = self.cell.take() {
+            cell.answer(|r| r.finish(answer));
+        }
+    }
+}
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        if let Some(cell) = self.cell.take() {
+            cell.answer(|r| r.answer_dropped(Answer::Dropped));
         }
     }
 }
@@ -125,6 +189,9 @@ pub struct UiText {
     line: u32,
 }
 
+/// Whether a line too wide to draw was warned about (once a boot).
+static TOO_WIDE_SAID: AtomicBool = AtomicBool::new(false);
+
 impl UiText {
     /// The UI font at the toolkit's size (`Err` if it doesn't parse).
     pub fn new() -> Result<UiText, String> {
@@ -145,7 +212,15 @@ impl Text for UiText {
     }
 
     fn draw(&mut self, surface: &mut Surface, x: i32, y: i32, text: &str, color: u32, clip: Rect) {
-        let Ok(line) = self.font.render_mask(text, PX, MAX_WIDTH) else { return };
+        let line = match self.font.render_mask(text, PX, MAX_WIDTH) {
+            Ok(line) => line,
+            Err(e) => {
+                if !TOO_WIDE_SAID.swap(true, Ordering::Relaxed) {
+                    log::warn!(target: "ui", "a line too wide to draw ({e}): not drawn (said once)");
+                }
+                return;
+            }
+        };
         match Mask::new(line.width(), line.height(), line.coverage()) {
             Some(mask) => surface.blend_mask_in(&mask, x + line.x(), y + line.y(), color, clip),
             None => log::warn!(target: "ui", "a line's mask doesn't match its size: not drawn"),
@@ -153,9 +228,8 @@ impl Text for UiText {
     }
 }
 
-/// The toolkit's palette from the desktop's theme.
-pub fn palette() -> Palette {
-    let t = desktop::theme();
+/// The toolkit's palette from a theme.
+pub fn palette(t: &Theme) -> Palette {
     Palette {
         background: t.client,
         text: t.client_text,
@@ -167,97 +241,126 @@ pub fn palette() -> Palette {
     }
 }
 
-/// A window's app: its tree, and what it does with what the tree reports.
-pub trait App {
-    fn ui(&mut self) -> &mut Ui;
-    /// Act on `events`: whether the window closes now.
-    fn apply(&mut self, events: &[UiEvent]) -> bool;
-}
-
-/// Counter, the toolkit's demo app.
-impl App for Counter {
-    fn ui(&mut self) -> &mut Ui {
-        self.ui_mut()
-    }
-
-    fn apply(&mut self, events: &[UiEvent]) -> bool {
-        Counter::apply(self, events) == Then::Quit
-    }
-}
-
-/// A toolkit window's drawing state.
-pub struct Toolkit {
-    pub text: UiText,
-    pub palette: Palette,
+/// A toolkit window's app and drawing state: see the module's doc.
+pub struct Toolkit<A: App> {
+    app: A,
+    text: UiText,
+    palette: Palette,
     /// Where the tree is laid out (client coordinates).
-    pub area: Rect,
+    area: Rect,
 }
 
-/// What an event did to a toolkit window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Flow {
+/// What a step did.
+#[must_use = "a window asked to close must be closed"]
+pub enum Step {
     Carry,
-    /// Close the window (drop its handle).
-    Close,
+    /// Close the window: drop its handle, then (if its action closed it)
+    /// answer the request that did ([`close`]).
+    Close(Option<Started>),
 }
 
-impl Toolkit {
-    pub fn new(area: Rect) -> Result<Toolkit, String> {
-        Ok(Toolkit { text: UiText::new()?, palette: palette(), area })
+impl<A: App> Toolkit<A> {
+    pub fn new(app: A, area: Rect) -> Result<Toolkit<A>, String> {
+        Ok(Toolkit { app, text: UiText::new()?, palette: palette(desktop::theme()), area })
     }
 
-    /// Lay `ui` out and paint it into the owner's surface (not committed).
-    pub fn paint(&mut self, h: &mut WindowHandle, ui: &mut Ui) {
-        ui.layout(self.area, &mut self.text);
-        ui.paint(h.surface_mut(), &mut self.text, &self.palette);
+    pub fn app_mut(&mut self) -> &mut A {
+        &mut self.app
     }
 
-    /// Publish `ui`'s tree as the window's.
-    pub fn publish(h: &mut WindowHandle, ui: &Ui) {
-        h.publish(ui.top_ids(), ui.nodes());
-    }
-
-    /// If `ui` changed: lay it out, paint, commit the whole client area and
-    /// publish its tree.
-    pub fn refresh(&mut self, h: &mut WindowHandle, ui: &mut Ui) {
-        if !ui.take_changed() {
-            return;
+    /// Lay the tree out and paint it (and the app's frame over it) into
+    /// the owner's surface, then commit the client area; publish the tree
+    /// if it changed. Every frame of an animation.
+    pub fn frame(&mut self, h: &mut WindowHandle) {
+        let changed = self.lay_out();
+        self.paint_and_commit(h);
+        if changed {
+            h.publish(self.app.ui().top_ids(), self.app.ui().nodes());
         }
-        self.paint(h, ui);
-        let _ = ui.take_changed();
-        let bounds = h.surface_mut().bounds();
-        h.commit(&[bounds]);
-        Toolkit::publish(h, ui);
     }
 
-    /// Hand window event `e` to `app`'s tree.
-    pub fn handle(&mut self, app: &mut dyn App, e: WindowEvent) -> Flow {
-        let input = match e {
-            WindowEvent::Close => return Flow::Close,
-            WindowEvent::Request(req) => {
-                return if serve(req, app, &mut self.text, self.area) { Flow::Close } else { Flow::Carry };
-            }
+    /// As [`Toolkit::frame`], only if the tree changed.
+    pub fn refresh(&mut self, h: &mut WindowHandle) {
+        if self.lay_out() {
+            self.paint_and_commit(h);
+            h.publish(self.app.ui().top_ids(), self.app.ui().nodes());
+        }
+    }
+
+    /// Lay out: whether anything shown changed since the last paint.
+    fn lay_out(&mut self) -> bool {
+        self.app.ui().layout(self.area, &mut self.text);
+        self.app.ui().take_changed()
+    }
+
+    fn paint_and_commit(&mut self, h: &mut WindowHandle) {
+        let s = h.surface_mut();
+        self.app.ui().paint(s, &mut self.text, &self.palette);
+        self.app.paint_over(s);
+        let bounds = s.bounds();
+        h.commit(&[bounds]);
+    }
+
+    /// One step: hand window event `e` to the tree; then, if it changed,
+    /// repaint, commit and publish; then answer a request it ran, so its
+    /// asker sees the effect in `ui tree`. A window to close is
+    /// [`Step::Close`] (its request answered once it is gone).
+    pub fn step(&mut self, h: &mut WindowHandle, e: WindowEvent) -> Step {
+        let mut answer = None;
+        let then = match e {
+            WindowEvent::Close => Then::Close,
+            WindowEvent::Request(req) => match req.start() {
+                Err(Skipped) => Then::Carry,
+                Ok(started) => {
+                    let served = serve(&mut self.app, &mut self.text, self.area, started.node(), started.action());
+                    if served == Served::ClosedItsWindow {
+                        return Step::Close(Some(started));
+                    }
+                    answer = Some((started, served));
+                    Then::Carry
+                }
+            },
             WindowEvent::FocusGained => {
-                app.ui().set_window_focused(true);
-                return Flow::Carry;
+                self.app.ui().set_window_focused(true);
+                Then::Carry
             }
             WindowEvent::FocusLost => {
-                app.ui().set_window_focused(false);
-                Input::Cancel
+                self.app.ui().set_window_focused(false);
+                self.input(Input::Cancel)
             }
-            WindowEvent::Lost => Input::Cancel,
-            WindowEvent::PointerDown { x, y, button: Button::Left, .. } => Input::Down { x, y },
-            WindowEvent::PointerUp { x, y, button: Button::Left, .. } => Input::Up { x, y },
+            WindowEvent::Lost => self.input(Input::Cancel),
+            WindowEvent::PointerDown { x, y, button: Button::Left, .. } => self.input(Input::Down { x, y }),
+            WindowEvent::PointerUp { x, y, button: Button::Left, .. } => self.input(Input::Up { x, y }),
             WindowEvent::Key(k) => match key(&k) {
-                Some(k) => Input::Key(k),
-                None => return Flow::Carry,
+                Some(k) => self.input(Input::Key(k)),
+                None => Then::Carry,
             },
             WindowEvent::PointerDown { .. } | WindowEvent::PointerUp { .. } | WindowEvent::PointerMove { .. } => {
-                return Flow::Carry;
+                Then::Carry
             }
         };
-        let events = app.ui().handle(input);
-        if app.apply(&events) { Flow::Close } else { Flow::Carry }
+        if then == Then::Close {
+            return Step::Close(None);
+        }
+        self.refresh(h);
+        if let Some((started, served)) = answer {
+            started.finish(Answer::Ran(served));
+        }
+        Step::Carry
+    }
+
+    fn input(&mut self, input: Input) -> Then {
+        let events = self.app.ui().handle(input);
+        self.app.apply(&events)
+    }
+}
+
+/// Close a window ([`Step::Close`]): drop its handle (the window goes),
+/// then answer the request whose action closed it.
+pub fn close(h: WindowHandle, closing: Option<Started>) {
+    drop(h);
+    if let Some(started) = closing {
+        started.finish(Answer::Ran(Served::ClosedItsWindow));
     }
 }
 
@@ -275,36 +378,6 @@ fn key(k: &KeyEvent) -> Option<Key> {
     }
 }
 
-/// Run request `req` on `app`'s tree, if it may still run: the node's row
-/// after the action (laid out in `area`), the error that changed nothing,
-/// or (the action closed the window) "ran; window closed". Whether the
-/// window closes now.
-pub fn serve(req: Request, app: &mut dyn App, text: &mut dyn Text, area: Rect) -> bool {
-    if !req.start() {
-        return false;
-    }
-    let node = req.node;
-    match app.ui().invoke(node, &req.action) {
-        Ok(events) => {
-            if app.apply(&events) {
-                req.finish(Answer::ClosedItsWindow);
-                return true;
-            }
-            app.ui().layout(area, text);
-            let answer = match app.ui().node(node) {
-                Some((depth, node)) => Answer::Row { depth, node },
-                None => Answer::Error(String::from("the node went away")),
-            };
-            req.finish(answer);
-            false
-        }
-        Err(e) => {
-            req.finish(Answer::Error(e.to_string()));
-            false
-        }
-    }
-}
-
 // -- Counter ------------------------------------------------------------------------------
 
 /// The Counter window's client size.
@@ -313,7 +386,7 @@ const COUNTER_SIZE: (u32, u32) = (300, 140);
 /// `desktop counter`: open the Counter window and start its owner; its id.
 pub fn open_counter() -> Result<u32, String> {
     let (w, h) = COUNTER_SIZE;
-    let toolkit = Toolkit::new(Rect::new(0, 0, w, h))?;
+    let toolkit = Toolkit::new(Counter::new(), Rect::new(0, 0, w, h))?;
     let handle = desktop::open_window("Counter", w, h).map_err(|e| alloc::format!("no window: {e}"))?;
     let id = handle.id();
     let _detached = crate::sched::spawn("desktop-counter", move || counter_owner(handle, toolkit))
@@ -323,13 +396,12 @@ pub fn open_counter() -> Result<u32, String> {
 
 /// The Counter window's owner: its tree drawn and published after every
 /// change, until it closes (its close box, `ui invoke <root> close`, Quit).
-fn counter_owner(mut h: WindowHandle, mut tk: Toolkit) {
-    let mut app = Counter::new();
+fn counter_owner(mut h: WindowHandle, mut tk: Toolkit<Counter>) {
+    tk.refresh(&mut h);
     loop {
-        tk.refresh(&mut h, app.ui_mut());
         let e = h.wait_event();
-        if tk.handle(&mut app, e) == Flow::Close {
-            return;
+        if let Step::Close(closing) = tk.step(&mut h, e) {
+            return close(h, closing);
         }
     }
 }
@@ -338,7 +410,8 @@ fn counter_owner(mut h: WindowHandle, mut tk: Toolkit) {
 
 pub const USAGE: &str = "usage: ui tree [window] | invoke <node> <action> [args]";
 
-const COLUMNS: [Column; 12] = [
+/// `ui tree`'s columns (ARCHITECTURE section 11, in this order).
+pub const COLUMNS: [Column; 12] = [
     Column::new("id", Kind::Int, Align::Right, 3),
     Column::new("window", Kind::Int, Align::Right, 6),
     Column::new("depth", Kind::Int, Align::Right, 5),
@@ -353,9 +426,8 @@ const COLUMNS: [Column; 12] = [
     Column::new("h", Kind::Int, Align::Right, 4),
 ];
 
-fn int(n: u64) -> Value {
-    i64::try_from(n).map_or(Value::Absent("-"), Value::Int)
-}
+/// No value (`-`, never matched by `where`).
+const DASH: Value = Value::Absent("-");
 
 /// A node's record (screen coordinates).
 fn record(r: &TreeRow) -> Vec<Value> {
@@ -366,11 +438,11 @@ fn record(r: &TreeRow) -> Vec<Value> {
         int(n.id().get()),
         int(u64::from(r.window)),
         int(u64::from(r.depth)),
-        Value::Text(String::from(n.role().name())),
-        Value::Text(String::from(n.name())),
-        Value::Text(n.value().map_or(String::from("-"), |v| v.to_string())),
-        Value::Text(n.state().to_string()),
-        Value::Text(if actions.is_empty() { String::from("-") } else { actions.join(",") }),
+        text(n.role().name()),
+        text(n.name()),
+        n.value().map_or(DASH, |v| Value::Text(v.to_string())),
+        if n.state().is_empty() { DASH } else { Value::Text(n.state().to_string()) },
+        if actions.is_empty() { DASH } else { Value::Text(actions.join(",")) },
         Value::Int(i64::from(b.x())),
         Value::Int(i64::from(b.y())),
         int(u64::from(b.w())),
@@ -422,8 +494,13 @@ pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
     }
 }
 
-/// `ui invoke <node> <action>`: see ARCHITECTURE section 11.
+/// `ui invoke <node> <action>`: see ARCHITECTURE section 11. The asker's
+/// own errors (no desktop, no node, a root's action) come first; a widget's
+/// action is the owner's.
 fn invoke(ctx: &mut crate::shell::Ctx<'_>, node: u64, action: Action) {
+    if !desktop::started() {
+        return ctx.fail("ui invoke: no desktop");
+    }
     match desktop::find_node(node) {
         None => ctx.fail(format_args!("ui invoke: no node {node}")),
         Some(NodeAt::Root(window)) => invoke_root(ctx, window, &action),
@@ -431,25 +508,41 @@ fn invoke(ctx: &mut crate::shell::Ctx<'_>, node: u64, action: Action) {
     }
 }
 
-/// An action on a window's root: `focus` the compositor answers; `close`
-/// asks the owner (its `Close`) and waits for the window to go.
+/// What a window's root does with each action: the compositor answers
+/// `focus`, the owner `close` (its `Close`); none takes the others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RootAction {
+    Focus,
+    Close,
+}
+
+fn root_action(kind: ActionKind) -> Option<RootAction> {
+    match kind {
+        ActionKind::Focus => Some(RootAction::Focus),
+        ActionKind::Close => Some(RootAction::Close),
+        // `minimize` and `restore` come with #157.
+        ActionKind::Press | ActionKind::SetValue | ActionKind::Select | ActionKind::Minimize | ActionKind::Restore => {
+            None
+        }
+    }
+}
+
+/// An action on a window's root.
 fn invoke_root(ctx: &mut crate::shell::Ctx<'_>, window: u32, action: &Action) {
-    match action {
-        Action::Focus => match desktop::focus_window(window) {
+    let kind = action.kind();
+    match root_action(kind) {
+        None => ctx.fail(format_args!("ui invoke: {}", InvokeError::NotAllowed(lumen_ui::Role::Window, kind))),
+        Some(RootAction::Focus) => match desktop::focus_window(window) {
             Some(row) => print_rows(ctx, &[row]),
-            None => ctx.fail(format_args!("ui invoke: no window {window}")),
+            None => ctx.fail(format_args!("ui invoke: window {window} closed")),
         },
-        Action::Close => {
+        Some(RootAction::Close) => {
             if desktop::close_window(window, DEADLINE_NS) {
                 let _ = writeln!(ctx.out, "ui invoke: window {window} closed");
             } else {
-                ctx.fail(format_args!("ui invoke: window {window} still open"));
+                ctx.fail(format_args!("ui invoke: window {window} still open (its close is still queued)"));
             }
         }
-        other => ctx.fail(format_args!(
-            "ui invoke: {}",
-            lumen_ui::InvokeError::NotAllowed(lumen_ui::Role::Window, other.kind())
-        )),
     }
 }
 
@@ -461,11 +554,11 @@ fn invoke_widget(ctx: &mut crate::shell::Ctx<'_>, window: u32, node: u64, action
         Ok(()) => {}
         Err(Refused::Busy(req)) => {
             drop(req);
-            return ctx.fail(format_args!("ui invoke: window {window} busy"));
+            return ctx.fail(format_args!("ui invoke: window {window} busy (try again)"));
         }
         Err(Refused::Dead(req)) => {
             drop(req);
-            return ctx.fail(format_args!("ui invoke: no node {node}"));
+            return ctx.fail(format_args!("ui invoke: window {window} closed"));
         }
     }
     let wait = || {
@@ -473,35 +566,44 @@ fn invoke_widget(ctx: &mut crate::shell::Ctx<'_>, window: u32, node: u64, action
         let _ = cell.done.wait_until_or_deadline(deadline, || cell.reply.lock().is_done());
     };
     wait();
-    let mut outcome = cell.reply.lock().after_deadline();
-    if matches!(outcome, Outcome::Running) {
-        wait();
-        outcome = cell.reply.lock().after_second_deadline();
-    }
-    desktop::request_finished(matches!(outcome, Outcome::Cancelled), matches!(outcome, Outcome::Late(_)));
-    match outcome {
-        Outcome::Answered(answer) => print_answer(ctx, window, answer, false),
-        Outcome::Late(answer) => print_answer(ctx, window, answer, true),
-        Outcome::Cancelled => {
-            ctx.fail(format_args!("ui invoke: cancelled: window {window} didn't take it in 1 s (try again)"))
+    let first = cell.reply.lock().after_first_deadline();
+    let (answer, late) = match first {
+        First::Answered(answer) => (Some(answer), false),
+        First::Cancelled => (None, false),
+        First::Running => {
+            wait();
+            match cell.reply.lock().after_second_deadline() {
+                Second::Late(answer) => (Some(answer), true),
+                Second::StillRunning => {
+                    desktop::request_finished(false, false);
+                    return ctx.fail(format_args!("ui invoke: still running (window {window})"));
+                }
+            }
         }
-        Outcome::StillRunning | Outcome::Running => {
-            ctx.fail(format_args!("ui invoke: still running (window {window})"))
-        }
+    };
+    desktop::request_finished(answer.is_none(), late);
+    match answer {
+        Some(answer) => print_answer(ctx, window, node, answer, late),
+        None => ctx.fail(format_args!("ui invoke: cancelled: window {window} didn't take it in 1 s (try again)")),
     }
 }
 
-fn print_answer(ctx: &mut crate::shell::Ctx<'_>, window: u32, answer: Answer, late: bool) {
+fn print_answer(ctx: &mut crate::shell::Ctx<'_>, window: u32, node: u64, answer: Answer, late: bool) {
     if late {
         let _ = writeln!(ctx.out, "ui invoke: ran late");
     }
     match answer {
-        Answer::Row { depth, node } => print_rows(ctx, &[desktop::node_row(window, depth, node)]),
-        Answer::Error(e) => ctx.fail(format_args!("ui invoke: {e}")),
-        Answer::ClosedItsWindow => {
+        Answer::Ran(Served::Row { depth, node }) => print_rows(ctx, &[desktop::node_row(window, depth, node)]),
+        Answer::Ran(Served::Error(InvokeError::NoNode)) => ctx.fail(format_args!("ui invoke: no node {node}")),
+        Answer::Ran(Served::Error(e)) => ctx.fail(format_args!("ui invoke: {e}")),
+        Answer::Ran(Served::RanNodeGone) => {
+            let _ = writeln!(ctx.out, "ui invoke: ran; node {node} is gone");
+        }
+        Answer::Ran(Served::ClosedItsWindow) => {
             let _ = writeln!(ctx.out, "ui invoke: ran; window {window} closed");
         }
         Answer::WindowClosed => ctx.fail(format_args!("ui invoke: window {window} closed before it ran")),
+        Answer::Dropped => ctx.fail(format_args!("ui invoke: dropped while running (window {window}): a bug")),
     }
 }
 
@@ -512,42 +614,66 @@ fn print_rows(ctx: &mut crate::shell::Ctx<'_>, rows: &[TreeRow]) {
 // -- ktests -----------------------------------------------------------------------------------
 
 crate::ktest!(
-    fn a_request_dropped_unanswered_answers_window_closed() {
-        // A request the owner never answers (its window closed, or it was
-        // dropped) answers itself, waking its asker; one cancelled first
-        // stays cancelled; a finished one isn't answered again.
+    fn a_request_answers_for_itself_when_dropped() {
+        // Dropped before it ran (its window closed): "window closed";
+        // dropped while running: "dropped"; cancelled first: skipped and
+        // never answered; started and finished: answered once.
         use crate::kassert;
         let (req, cell) = Request::new(1, Action::Press);
         drop(req);
         kassert!(matches!(cell.reply.lock().take(), Some(Answer::WindowClosed)));
         let (req, cell) = Request::new(2, Action::Press);
-        kassert!(cell.reply.lock().cancel());
-        kassert!(!req.start());
-        drop(req);
-        kassert!(matches!(*cell.reply.lock(), Reply::Cancelled));
+        let started = req.start().map_err(|_| "not started")?;
+        drop(started);
+        kassert!(matches!(cell.reply.lock().take(), Some(Answer::Dropped)));
         let (req, cell) = Request::new(3, Action::Press);
-        kassert!(req.start());
-        req.finish(Answer::Error(String::from("no")));
-        kassert!(matches!(cell.reply.lock().take(), Some(Answer::Error(_))));
+        kassert!(cell.reply.lock().cancel());
+        kassert!(req.start().is_err());
+        kassert!(cell.phase() == Phase::Cancelled);
+        let (req, cell) = Request::new(4, Action::Press);
+        let started = req.start().map_err(|_| "not started")?;
+        kassert!(started.node() == 4 && *started.action() == Action::Press);
+        started.finish(Answer::Ran(Served::RanNodeGone));
+        kassert!(matches!(cell.reply.lock().take(), Some(Answer::Ran(Served::RanNodeGone))));
         Ok(())
     }
 );
 
 crate::ktest!(
-    fn the_toolkit_text_measures_what_it_draws() {
-        // The UI font through lumen-ui's `Text`: a line's width grows with
-        // its text, and drawing "Add" puts ink inside the clip only.
+    fn every_root_action_reaches_a_handler() {
+        // Each action a window's root lists is answered (focus by the
+        // compositor, close by the owner); the others aren't taken.
+        use crate::kassert;
+        for &kind in lumen_ui::Role::Window.actions() {
+            kassert!(root_action(kind).is_some());
+        }
+        kassert!(root_action(ActionKind::Press).is_none());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn the_toolkit_text_draws_as_wide_as_it_measures() {
+        // The UI font through lumen-ui's `Text`: a longer line measures
+        // wider, a line drawn unclipped inks up to its measured width (and
+        // not past it), and a clip keeps ink inside it.
         use crate::kassert;
         let mut t = UiText::new().map_err(|_| "no font")?;
         kassert!(t.line_height() >= 16);
-        kassert!(t.width("Add") > 0 && t.width("Add more") > t.width("Add"));
-        let mut s = Surface::new(80, 40);
+        let width = t.width("Add more");
+        kassert!(width > t.width("Add") && t.width("Add") > 0);
+        let mut s = Surface::new(200, 40);
         s.fill(0xffffff);
-        let clip = Rect::new(0, 0, 40, 40);
-        t.draw(&mut s, 4, 4, "Add more", 0x000000, clip);
-        let inked = |x0: u32, x1: u32| (0..40).any(|y| (x0..x1).any(|x| s.row(y)[x as usize] != 0xffffff));
-        kassert!(inked(0, 40));
-        kassert!(!inked(40, 80));
+        let all = s.bounds();
+        t.draw(&mut s, 4, 4, "Add more", 0x000000, all);
+        let right =
+            (0..200u32).rev().find(|&x| (0..40u32).any(|y| s.row(y)[x as usize] != 0xffffff)).ok_or("no ink")?;
+        crate::ktest::diag(format_args!("width {width}, rightmost ink at {}", right - 4));
+        kassert!(right - 4 <= width + 1 && right - 4 + 4 >= width);
+        let mut s = Surface::new(200, 40);
+        s.fill(0xffffff);
+        t.draw(&mut s, 4, 4, "Add more", 0x000000, Rect::new(0, 0, 30, 40));
+        kassert!((0..40u32).all(|y| s.row(y)[30..].iter().all(|&p| p == 0xffffff)));
         Ok(())
     }
 );

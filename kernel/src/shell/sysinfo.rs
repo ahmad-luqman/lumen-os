@@ -53,12 +53,18 @@ fn busy(cpu: usize, ticks: CpuTicks) -> Value {
 }
 
 /// `n` as a table's number (absent, `-`, past `i64::MAX`).
-fn int(n: impl TryInto<i64>) -> Value {
+pub fn int(n: impl TryInto<i64>) -> Value {
     n.try_into().map_or(DASH, Value::Int)
 }
 
-fn text(s: &str) -> Value {
+pub fn text(s: &str) -> Value {
     Value::Text(String::from(s))
+}
+
+/// `s` as a text cell, or the absent value if it is `-` (a text `-` would
+/// print quoted, since records quote a cell that reads as absent).
+fn text_or_dash(s: String) -> Value {
+    if s == "-" { DASH } else { Value::Text(s) }
 }
 
 /// No value, printed `-`.
@@ -216,7 +222,7 @@ fn key_events_table(events: &[(lumen_input::Seq, lumen_input::KeyEvent)]) -> pip
             Value::Text(alloc::format!("{:?}", e.code)),
             text(action),
             typed,
-            Value::Text(mods_text(e.mods)),
+            text_or_dash(mods_text(e.mods)),
             text(if e.after_drop { "yes" } else { "no" }),
         ]);
     }
@@ -680,7 +686,7 @@ fn mouse_table_of(bound: Option<&crate::mouse::Bound>) -> pipe::Table {
                 int(s.total_presses()),
                 int(s.wheel),
                 int(s.hwheel),
-                text(pointer),
+                text_or_dash(String::from(pointer)),
                 text(if stale { "yes" } else { "no" }),
                 failed_cell,
             ]
@@ -1028,7 +1034,7 @@ crate::ktest!(
         let row = &table.rows()[0];
         kassert_eq!(row[0], Value::Text(String::from("0000:00:03.0")));
         kassert_eq!((row[1].clone(), row[2].clone(), row[4].clone()), (Value::Int(5), Value::Int(6), Value::Int(3)));
-        kassert_eq!(row[7], text("-"));
+        kassert_eq!(row[7], DASH);
         kassert_eq!(row[8], text("yes"));
         kassert_eq!(row[9], text("FAILED"));
         // Without a tablet: one row of dashes.
