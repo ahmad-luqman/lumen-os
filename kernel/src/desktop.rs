@@ -50,18 +50,18 @@ use alloc::vec::Vec;
 use core::cell::Cell;
 use core::fmt;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
-use lumen_font::{Font, Px};
 use lumen_gfx::{Damage, Mask, Rect, Surface, Target};
 use lumen_input::cursor::{SPRITE_H, SPRITE_W, draw_arrow};
 use lumen_input::{Button, Buttons, KeyAction, KeyEvent, PointerEvent, Read, Reader, Seq};
 use lumen_png::encode::Rows;
 use lumen_wm::{
     Entry, EventQueue, Interruption, Metrics, Next, Outcome, Pointer, PointerEntry, Pushed, QueueCounts, Theme,
-    WindowId, Wm,
+    ThemeId, WindowId, Wm,
 };
 
+use crate::font::{HEADING_PX, TEXT_PX, TITLE_PX, Text};
 use crate::input::{KEY_EVENTS, KEYS, LockedRing, POINTER, POINTER_EVENTS};
 use crate::sched::WaitQueue;
 use crate::sync::{SpinLock, SpinLockGuard};
@@ -108,57 +108,51 @@ const METRICS: Metrics = Metrics::DESKTOP;
 
 // -- the look: the theme, the text, the wallpaper (#154) ---------------------------
 
-/// The theme drawn with, an index into `Theme::ALL`: light, until
-/// `lumen.theme=` or `theme` picks another ([`switch_theme`]).
-static THEME: AtomicUsize = AtomicUsize::new(0);
+/// The theme drawn with (a [`ThemeId`] as a byte): light, until
+/// `lumen.theme=` or `theme` picks another ([`switch_theme`]). One for the
+/// kernel: there is one screen.
+static THEME: AtomicU8 = AtomicU8::new(ThemeId::Light as u8);
 /// Bumped by every switch: a window whose count is behind is told
-/// ([`WindowEvent::Theme`]) before anything else, and redraws.
+/// ([`WindowEvent::Theme`]) before anything else, and redraws. Every window
+/// starts one behind, so its first event is the theme to draw with.
 static THEME_GEN: AtomicU64 = AtomicU64::new(0);
 
-/// The theme the desktop draws with now (owners draw their client areas
-/// with it, and redraw on [`WindowEvent::Theme`]).
-pub fn theme() -> &'static Theme {
-    Theme::ALL[THEME.load(Ordering::Acquire).min(Theme::ALL.len() - 1)]
+fn theme_id() -> ThemeId {
+    if THEME.load(Ordering::Acquire) == ThemeId::Dark as u8 { ThemeId::Dark } else { ThemeId::Light }
 }
 
-/// The UI font's sizes: a title, a window's text and its heading.
-const TITLE_PX: Px = px(15);
-const TEXT_PX: Px = px(16);
-const HEADING_PX: Px = px(24);
-
-const fn px(n: u16) -> Px {
-    match Px::new(n) {
-        Some(px) => px,
-        None => panic!("a text size out of range"),
-    }
+/// The theme drawn with now: the compositor's, `desktop status`'s and
+/// `theme`'s. A window's owner draws with the theme its
+/// [`WindowEvent::Theme`] hands it (its first event), not this.
+pub(crate) fn theme() -> &'static Theme {
+    Theme::get(theme_id())
 }
 
-/// Each drawing thread's glyph cache (the compositor's and each owner's):
-/// far more than the few sizes and glyphs here take, so a redraw hits.
-const FONT_CACHE: usize = 128 * 1024;
+/// The compositor's text: the titles' glyph cache and their line height
+/// (worked out once).
+struct Titles {
+    text: Text,
+    line: i32,
+}
 
-/// Set once one of the warnings below is said (each said once a boot).
-static NO_FONT_SAID: AtomicBool = AtomicBool::new(false);
-static BAD_MASK_SAID: AtomicBool = AtomicBool::new(false);
-
-/// A glyph cache over the shared UI font (`crate::font::face`, parsed on
-/// first use), or `None` if the font didn't load (one warning: then no text
-/// is drawn).
-fn text_font() -> Option<Font<'static>> {
-    match crate::font::face() {
-        Ok(loaded) => Some(Font::new(loaded.face(), FONT_CACHE)),
-        Err(e) => {
-            if !NO_FONT_SAID.swap(true, Ordering::Relaxed) {
-                log::warn!(target: "desktop", "no text: the UI font didn't load: {e}");
-            }
-            None
-        }
+impl Titles {
+    fn new() -> Option<Titles> {
+        let text = Text::new()?;
+        let line = text.line_height(TITLE_PX);
+        Some(Titles { text, line })
     }
 }
 
 /// The wallpaper the kernel embeds (`tools/wallpaper.py` made it), decoded
-/// once when the desktop starts.
+/// once a boot, at the desktop's first start ([`boot_wallpaper`]).
 static WALLPAPER_PNG: &[u8] = include_bytes!("../../assets/wallpaper/lumen.png");
+/// The largest wallpaper decoded, each way (a sanity bound on the memory a
+/// file can ask for; one bigger than the screen is drawn centred and cut).
+const WALLPAPER_MAX: u32 = 4096;
+/// The embedded wallpaper's decode, once a boot: `None` until the first
+/// start, then what it gave (`Some(None)`: it didn't decode, warned about
+/// once).
+static BOOT_WALLPAPER: SpinLock<Option<Option<Arc<Surface>>>> = SpinLock::new(None);
 
 /// An automation request (#156 fills this in): none can be made yet, so
 /// no window's queue ever holds one. Not `Clone`: #156's requests answer
@@ -205,9 +199,12 @@ pub enum WindowEvent {
     Close,
     /// An automation request (#156).
     Request(Request),
-    /// The desktop's theme changed (`theme`, #154): redraw the client area
-    /// in its colours. Delivered before anything queued, never dropped (a
-    /// count per window, not a queue entry).
+    /// The theme to draw the client area with (#154): a window's first
+    /// event, and again after each switch (`theme`). Delivered ahead of
+    /// anything queued (entries, `Close` and requests included), never
+    /// dropped (a count per window, not a queue entry); several switches
+    /// before the owner reads give at least one, the last carrying the
+    /// current theme.
     Theme(&'static Theme),
 }
 
@@ -260,9 +257,16 @@ pub struct Window {
 }
 
 impl Window {
-    /// Whether a theme switch hasn't reached its owner yet.
+    /// Whether a theme switch (or the first theme) hasn't reached its owner
+    /// yet.
     fn theme_behind(&self) -> bool {
         self.theme_seen.load(Ordering::Acquire) != THEME_GEN.load(Ordering::Acquire)
+    }
+
+    /// Whether its owner has an event to read: one queued, or a theme to
+    /// be told of. What every wait for an event must wake for.
+    fn has_event(&self) -> bool {
+        self.queued.load(Ordering::Acquire) || self.theme_behind()
     }
 }
 
@@ -482,6 +486,9 @@ struct Stats {
     no_focus_keys: u64,
     /// Deliveries for a window that had closed.
     dead_pushes: u64,
+    /// Glyphs the compositor rasterized for the titles (its cache's
+    /// misses): flat once every title's glyphs are cached.
+    glyph_misses: u64,
 }
 
 /// The desktop's state behind [`COMPOSITOR`] (or a test's own lock:
@@ -667,19 +674,22 @@ impl Desktop {
         Desktop { home: Home::Own(Arc::new(SpinLock::new(Some(state)))) }
     }
 
-    /// Decode `png` as this desktop's wallpaper, as a start does: whether
-    /// it is shown (if not, the theme's flat colour, and one warning). The
-    /// whole screen is damaged either way.
-    pub fn set_wallpaper(&self, png: &[u8]) -> bool {
-        let Some((w, h)) = self.home.lock().as_ref().map(|s| (s.width, s.height)) else { return false };
-        let wallpaper = load_wallpaper(png, w, h);
-        let shown = wallpaper.is_some();
+    /// Decode `png` as this desktop's wallpaper, as a start decodes the
+    /// embedded one (not cached): `Err` with why if it isn't shown, the
+    /// theme's flat colour drawn instead and one warning logged (`Err("no
+    /// desktop")`, with no warning, for a desktop not started). The whole
+    /// screen is damaged either way.
+    pub fn set_wallpaper(&self, png: &[u8]) -> Result<(), String> {
+        if self.home.lock().is_none() {
+            return Err(String::from("no desktop"));
+        }
+        let wallpaper = load_wallpaper(png);
         if let Some(s) = self.home.lock().as_mut() {
-            s.wallpaper = wallpaper;
+            s.wallpaper = wallpaper.as_ref().ok().cloned();
             s.damage.add(Rect::new(0, 0, s.width, s.height));
         }
         self.home.wake();
-        shown
+        wallpaper.map(|_| ())
     }
 
     /// Open a window of `width` x `height` client pixels titled `title`,
@@ -712,7 +722,6 @@ impl Desktop {
         // error, not a panic).
         let surface = Surface::with_stride(width, height, width as usize).ok_or(OpenError::OutOfMemory)?;
         let mut committed = Surface::with_stride(width, height, width as usize).ok_or(OpenError::OutOfMemory)?;
-        committed.fill(theme().client);
         let owner = crate::sched::running_here().map_or("boot", |(_, name)| name);
         let mut after = After::default();
         let win = {
@@ -724,6 +733,12 @@ impl Desktop {
             let n = s.windows.len() as i32;
             let (x, y) = at.unwrap_or((96 + 32 * (n % 8), 80 + 32 * (n % 8)));
             let (id, out) = s.wm.open(title, width, height, x, y);
+            // Its client area until the owner's first commit: the theme's
+            // colour, read under the lock every switch holds, with the
+            // switch count (one behind it: the owner's first event is that
+            // theme, so a switch either comes before, and is drawn from the
+            // start, or after, and is told).
+            committed.fill(theme().client);
             let win = Arc::new(Window {
                 id,
                 title: String::from(title),
@@ -734,10 +749,7 @@ impl Desktop {
                 held: AtomicBool::new(false),
                 spin,
                 keys: AtomicU64::new(0),
-                // Read under the desktop's lock, which every switch holds:
-                // a switch is either before (its theme drawn from the
-                // start) or after (told).
-                theme_seen: AtomicU64::new(THEME_GEN.load(Ordering::Acquire)),
+                theme_seen: AtomicU64::new(THEME_GEN.load(Ordering::Acquire).wrapping_sub(1)),
             });
             s.windows.push(win.clone());
             s.apply(out, &mut after);
@@ -812,8 +824,9 @@ impl WindowHandle {
         self.home.wake();
     }
 
-    /// The next event, if one is waiting (never blocks): a theme switch
-    /// first, then the queue's.
+    /// The next event, if one is waiting (never blocks): the theme to draw
+    /// with first (the window's first event, then after each switch), then
+    /// the queue's.
     pub fn next_event(&mut self) -> Option<WindowEvent> {
         let switches = THEME_GEN.load(Ordering::Acquire);
         if self.win.theme_seen.swap(switches, Ordering::AcqRel) != switches {
@@ -837,7 +850,7 @@ impl WindowHandle {
             }
             self.win.idle.store(true, Ordering::Release);
             let win = &self.win;
-            win.events.wait_until(|| win.queued.load(Ordering::Acquire) || win.theme_behind());
+            win.events.wait_until(|| win.has_event());
             self.win.idle.store(false, Ordering::Release);
         }
     }
@@ -878,31 +891,6 @@ impl Drop for WindowHandle {
 
 // -- drawing -----------------------------------------------------------------
 
-/// Draw `text` in the UI font at `px`, its line box's top-left corner at
-/// (`x`, `y`), in `color`, touching only pixels inside `clip` (blending
-/// isn't idempotent: a redraw of one damaged rectangle passes it, so each
-/// pixel is drawn once per recompose); returns the pen's position after
-/// it. Glyphs come from `font`'s cache, rasterized only the first time.
-#[allow(clippy::too_many_arguments, reason = "a line of text: where, what, how big, which colour, inside what")]
-fn draw_text(s: &mut Surface, font: &mut Font<'_>, x: i32, y: i32, text: &str, px: Px, color: u32, clip: Rect) -> i32 {
-    font.render(text, px, |g| match Mask::new(g.width(), g.height(), g.coverage()) {
-        Some(mask) => s.blend_mask_in(&mask, x + g.x(), y + g.y(), color, clip),
-        None => {
-            // `lumen-font` promises a mask of its size: a bug, not drawn.
-            if !BAD_MASK_SAID.swap(true, Ordering::Relaxed) {
-                log::warn!(target: "desktop", "a glyph's mask doesn't match its size: not drawn");
-            }
-        }
-    });
-    x.saturating_add(i32::try_from(font.face().measure(text, px).width).unwrap_or(i32::MAX))
-}
-
-/// A line's height at `px` (ascent and descent).
-fn line_height(font: &Font<'_>, px: Px) -> i32 {
-    let m = font.face().line_metrics(px);
-    m.ascent + m.descent
-}
-
 /// The close box's cross: a 16x16 coverage mask, two diagonals two pixels
 /// wide, 4 in from each edge.
 const CROSS: [u8; 256] = {
@@ -933,7 +921,8 @@ struct Scene {
     wallpaper: Option<Arc<Surface>>,
 }
 
-/// Where a `wallpaper` goes on a `target`: centred (cut where it is bigger).
+/// Where a `wallpaper` goes on a `target`: centred, cut where it is
+/// bigger (it may be up to [`WALLPAPER_MAX`] each way).
 fn wallpaper_place(wallpaper: &Surface, target: &Surface) -> Rect {
     let x = (i64::from(target.width()) - i64::from(wallpaper.width())) / 2;
     let y = (i64::from(target.height()) - i64::from(wallpaper.height())) / 2;
@@ -946,26 +935,12 @@ fn wallpaper_place(wallpaper: &Surface, target: &Surface) -> Rect {
 /// overlapping it from back to front, its frame then its committed surface
 /// (blitted [`BAND`] rows per hold of the window's lock). Everything drawn
 /// stays inside `r`, so damage-only recomposition equals a full one.
-fn compose(target: &mut Surface, r: Rect, scene: &Scene, font: &mut Option<Font<'static>>) {
+fn compose(target: &mut Surface, r: Rect, scene: &Scene, titles: &mut Option<Titles>) {
     let Some(r) = r.clip(target.width(), target.height()) else { return };
-    match scene.wallpaper.as_deref() {
-        Some(wp) => {
-            let at = wallpaper_place(wp, target);
-            match at.intersect(&r) {
-                Some(w) => {
-                    for piece in &r.subtract(&w) {
-                        target.fill_rect(*piece, scene.theme.desktop);
-                    }
-                    target.blit(wp, w.translate(-at.x(), -at.y()), w.x(), w.y());
-                }
-                None => target.fill_rect(r, scene.theme.desktop),
-            }
-        }
-        None => target.fill_rect(r, scene.theme.desktop),
-    }
+    paint_desktop(target, r, scene);
     for snap in &scene.windows {
         let Some(f) = snap.frame.intersect(&r) else { continue };
-        paint_frame(target, snap, f, scene.theme, font.as_mut());
+        paint_frame(target, snap, f, scene.theme, titles.as_mut());
         let client = METRICS.client(&snap.frame);
         let Some(c) = client.intersect(&r) else { continue };
         for band in bands(c) {
@@ -975,10 +950,27 @@ fn compose(target: &mut Surface, r: Rect, scene: &Scene, font: &mut Option<Font<
     }
 }
 
+/// `r` (on the target) of what is behind the windows: the wallpaper where
+/// it is, the theme's colour elsewhere (each pixel drawn once).
+fn paint_desktop(target: &mut Surface, r: Rect, scene: &Scene) {
+    let covered = scene.wallpaper.as_deref().and_then(|wp| {
+        let at = wallpaper_place(wp, target);
+        at.intersect(&r).map(|w| (wp, at, w))
+    });
+    let Some((wp, at, w)) = covered else {
+        target.fill_rect(r, scene.theme.desktop);
+        return;
+    };
+    for piece in &r.subtract(&w) {
+        target.fill_rect(*piece, scene.theme.desktop);
+    }
+    target.blit(wp, w.translate(-at.x(), -at.y()), w.x(), w.y());
+}
+
 /// The part `clip` (inside the frame) of a window's frame: the border, the
 /// title bar with its title (none without a font), the close box with its
 /// cross.
-fn paint_frame(target: &mut Surface, snap: &Snap, clip: Rect, theme: &Theme, font: Option<&mut Font<'static>>) {
+fn paint_frame(target: &mut Surface, snap: &Snap, clip: Rect, theme: &Theme, titles: Option<&mut Titles>) {
     let (border, title_bg, title_fg) = if snap.focused {
         (theme.border_focused, theme.title_focused, theme.title_focused_text)
     } else {
@@ -1000,9 +992,9 @@ fn paint_frame(target: &mut Surface, snap: &Snap, clip: Rect, theme: &Theme, fon
     // The title, left of the close box, never over it.
     let text_right = close.x().saturating_sub(4).max(bar.x());
     let area = Rect::new(bar.x(), bar.y(), (text_right - bar.x()).max(0) as u32, bar.h());
-    if let (Some(a), Some(font)) = (area.intersect(&clip), font) {
-        let y = bar.y() + (METRICS.title_h as i32 - line_height(font, TITLE_PX)) / 2;
-        draw_text(target, font, bar.x() + 8, y, &snap.win.title, TITLE_PX, title_fg, a);
+    if let (Some(a), Some(t)) = (area.intersect(&clip), titles) {
+        let y = bar.y() + (METRICS.title_h as i32 - t.line) / 2;
+        t.text.draw(target, bar.x() + 8, y, &snap.win.title, TITLE_PX, title_fg, a);
     }
 }
 
@@ -1030,8 +1022,8 @@ struct Compositor {
     /// cut (`lumen.desktop_cut_delay_ms=`), widening the window a pause
     /// can be written in.
     cut_delay_ns: u64,
-    /// The titles' glyph cache (the compositor's own).
-    font: Option<Font<'static>>,
+    /// The titles' text (the compositor's own glyph cache).
+    titles: Option<Titles>,
     /// Whether the first presenting pass was timed (said at INFO once).
     timed: bool,
 }
@@ -1098,7 +1090,7 @@ impl Compositor {
             pointer: None,
             drawn: None,
             cut_delay_ns: delay_ms.saturating_mul(1_000_000),
-            font: text_font(),
+            titles: Titles::new(),
             timed: false,
         }
     }
@@ -1170,7 +1162,7 @@ impl Compositor {
         after.finish();
         let composing = crate::time::now_ns();
         for r in damage.rects() {
-            compose(&mut self.back, *r, &scene, &mut self.font);
+            compose(&mut self.back, *r, &scene, &mut self.titles);
         }
         let composed_ns = crate::time::now_ns().saturating_sub(composing);
         let start = crate::time::now_ns();
@@ -1185,12 +1177,13 @@ impl Compositor {
                 .sum();
         }
         let ns = crate::time::now_ns().saturating_sub(start);
-        let pointer_moved = self.place_pointer(damage.rects());
+        let pointer_moved = self.place_pointer(damage.rects(), scene.theme);
         let frame = !damage.is_empty() || pointer_moved;
         if !self.timed && pixels > 0 {
-            // The first present is the whole screen: how long the wallpaper,
-            // the frames and the titles (rasterized now, cached after) took
-            // to compose, and the copy to the screen.
+            // The first present is the whole screen (the start's full
+            // damage): how long it took to compose (the wallpaper, and any
+            // window already open: the demo windows open just after the
+            // start, so usually none) and to copy to the screen.
             self.timed = true;
             let (c, p) = (lumen_time::Millis(composed_ns), lumen_time::Millis(ns));
             log::info!(target: "desktop", "first frame: composed in {c}, presented in {p}");
@@ -1301,7 +1294,7 @@ impl Compositor {
     /// off (the back buffer's pixels copied back), the back buffer's pixels
     /// under its new box copied into an array, the arrow painted there, the
     /// array copied to the screen. Whether it changed anything.
-    fn place_pointer(&mut self, presented: &[Rect]) -> bool {
+    fn place_pointer(&mut self, presented: &[Rect], theme: &Theme) -> bool {
         let want = self.pointer.filter(|_| self.shown);
         let touched = self.drawn.is_some_and(|d| presented.iter().any(|r| r.intersect(&arrow_box(d)).is_some()));
         if want == self.drawn && !touched {
@@ -1322,7 +1315,6 @@ impl Compositor {
                 let src = &self.back.row(y as u32 + row as u32)[x as usize..x as usize + w];
                 px[row * SPRITE_W..row * SPRITE_W + w].copy_from_slice(src);
             }
-            let theme = theme();
             draw_arrow(&mut px, SPRITE_W, (w, h), (0, 0), theme.pointer_outline, theme.pointer_fill);
             for row in 0..h {
                 screen.write_span(x as u32, y as u32 + row as u32, &px[row * SPRITE_W..row * SPRITE_W + w]);
@@ -1340,6 +1332,7 @@ impl Compositor {
         s.pointer_read = self.pointers.after();
         s.keys_read = self.keys.after();
         s.lost = self.pointers.lost() + self.keys.lost();
+        s.stats.glyph_misses = self.titles.as_ref().map_or(0, |t| t.text.stats().misses);
         if let Some(p) = presented {
             s.stats.rects += p.rects;
             s.stats.pixels += p.pixels;
@@ -1377,7 +1370,7 @@ impl Compositor {
             return Answer::Busy;
         }
         let all = scratch.bounds();
-        compose(&mut scratch, all, scene, &mut self.font);
+        compose(&mut scratch, all, scene, &mut self.titles);
         let repaint = (0..self.back.height())
             .map(|y| {
                 let differ = self.back.row(y).iter().zip(scratch.row(y)).filter(|(a, b)| (**a ^ **b) & 0xff_ffff != 0);
@@ -1521,33 +1514,43 @@ pub fn start() -> Result<Shown, Refused> {
 }
 
 /// `png` as a surface to draw behind the windows: refused (`Err`, why)
-/// unless it decodes and fits a `w` x `h` screen.
-fn decode_wallpaper(png: &[u8], w: u32, h: u32) -> Result<Surface, String> {
-    let image = lumen_png::decode::decode(png, w, h).map_err(|e| alloc::format!("{e}"))?;
-    let mut s = Surface::with_stride(image.width(), image.height(), image.width() as usize)
-        .ok_or_else(|| String::from("no memory for it"))?;
-    for y in 0..image.height() {
-        s.row_mut(y).copy_from_slice(image.row(y));
-    }
-    Ok(s)
+/// unless it decodes within [`WALLPAPER_MAX`] each way. Its pixels become
+/// the surface's (no copy). The decoder's own buffers abort on a heap that
+/// can't hold them (`lumen_png::decode`); the pixels refuse.
+fn decode_wallpaper(png: &[u8]) -> Result<Surface, String> {
+    let image = lumen_png::decode::decode(png, WALLPAPER_MAX, WALLPAPER_MAX).map_err(|e| alloc::format!("{e}"))?;
+    let (w, h) = (image.width(), image.height());
+    Surface::from_pixels(w, h, image.into_pixels()).ok_or_else(|| String::from("its pixels aren't its size"))
 }
 
-/// The wallpaper for a `w` x `h` desktop from `png`, or `None` (the
-/// theme's flat colour) with one warning saying why: `WARN desktop:
-/// wallpaper not shown: <reason>`.
-fn load_wallpaper(png: &[u8], w: u32, h: u32) -> Option<Arc<Surface>> {
+/// The wallpaper from `png`, or why not, with one warning saying why:
+/// `WARN desktop: wallpaper not shown: <reason>` (then the theme's flat
+/// colour is drawn).
+fn load_wallpaper(png: &[u8]) -> Result<Arc<Surface>, String> {
     let start = crate::time::now_ns();
-    match decode_wallpaper(png, w, h) {
+    match decode_wallpaper(png) {
         Ok(s) => {
             let took = lumen_time::Millis(crate::time::now_ns().saturating_sub(start));
             log::info!(target: "desktop", "wallpaper: {}x{}, {} bytes of PNG decoded in {took}", s.width(), s.height(), png.len());
-            Some(Arc::new(s))
+            Ok(Arc::new(s))
         }
         Err(why) => {
             log::warn!(target: "desktop", "wallpaper not shown: {why}");
-            None
+            Err(why)
         }
     }
+}
+
+/// The embedded wallpaper, decoded at the first call of a boot and kept
+/// (so one warning a boot if it doesn't decode, however many starts
+/// fail). Called by `desktop`'s first start, with no lock held (the
+/// decode takes tens of milliseconds); starts are one at a time.
+fn boot_wallpaper() -> Option<Arc<Surface>> {
+    if let Some(done) = BOOT_WALLPAPER.lock().clone() {
+        return done;
+    }
+    let decoded = load_wallpaper(WALLPAPER_PNG).ok();
+    BOOT_WALLPAPER.lock().get_or_insert(decoded).clone()
 }
 
 /// The first `desktop`.
@@ -1559,10 +1562,11 @@ fn first_start() -> Result<Shown, StartError> {
     }
     let (w, h) = term::screen_size().ok_or(StartError::NoScreen)?;
     let (w, h) = (w as u32, h as u32);
-    // Decoded before the back buffer, with no lock held (a warning, and the
+    // The back buffer first (the desktop needs it; the wallpaper is
+    // optional), then the wallpaper, with no lock held (a warning, and the
     // theme's flat colour, if it doesn't decode).
-    let wallpaper = load_wallpaper(WALLPAPER_PNG, w, h);
     let back = Surface::with_stride(w, h, w as usize).ok_or(StartError::NoMemory)?;
+    let wallpaper = boot_wallpaper();
     let owner = Owner::new();
     {
         let mut g = COMPOSITOR.lock();
@@ -1639,40 +1643,47 @@ fn resume() -> Result<Shown, StartError> {
 fn theme_at_boot() {
     const KEY: &str = "lumen.theme";
     let Some(name) = crate::cmdline::value(KEY) else { return };
-    match Theme::by_name(name) {
-        Some(t) => {
-            let _ = switch_theme(&Home::Live, t);
-            log::info!(target: "desktop", "theme {} ({KEY})", t.name);
+    match ThemeId::by_name(name) {
+        Some(id) => {
+            let _ = switch_theme(&Home::Live, id);
+            log::info!(target: "desktop", "theme {} ({KEY})", id.name());
         }
         None => log::warn!(target: "desktop", "{KEY}={name}: not a theme (light, dark), ignored"),
     }
 }
 
-/// Switch to `t` (`theme`, `lumen.theme=`): under `home`'s lock, the theme
-/// and its count change and the whole screen is damaged (one full
-/// repaint); after it, every window's owner is woken to be told
-/// ([`WindowEvent::Theme`]), and the compositor. Whether it changed.
-fn switch_theme(home: &Home, t: &'static Theme) -> bool {
-    let Some(index) = Theme::ALL.iter().position(|a| a.name == t.name) else { return false };
-    let windows = {
-        let mut g = home.lock();
-        if THEME.load(Ordering::Acquire) == index {
+/// Switch to theme `id` (`theme`, `lumen.theme=`), whether it changed. The
+/// theme is the kernel's (one screen): under the live desktop's lock, the
+/// theme and its count change and the live desktop's whole screen is
+/// damaged (one full repaint); `home`'s too when it is another (a test's
+/// desktop). After the locks, every window's owner there is woken to be
+/// told ([`WindowEvent::Theme`]), and the compositor.
+fn switch_theme(home: &Home, id: ThemeId) -> bool {
+    let full = |s: &mut State, windows: &mut Vec<Arc<Window>>| {
+        s.damage.add(Rect::new(0, 0, s.width, s.height));
+        windows.extend(s.windows.iter().cloned());
+    };
+    let mut windows = Vec::new();
+    {
+        let mut live = COMPOSITOR.lock();
+        if theme_id() == id {
             return false;
         }
-        THEME.store(index, Ordering::Release);
+        THEME.store(id as u8, Ordering::Release);
         THEME_GEN.fetch_add(1, Ordering::AcqRel);
-        match g.as_mut() {
-            Some(s) => {
-                s.damage.add(Rect::new(0, 0, s.width, s.height));
-                s.windows.clone()
-            }
-            None => Vec::new(),
+        if let Some(s) = live.as_mut() {
+            full(s, &mut windows);
         }
-    };
+    }
+    if let Home::Own(_) = home
+        && let Some(s) = home.lock().as_mut()
+    {
+        full(s, &mut windows);
+    }
     for w in &windows {
         w.events.wake_all();
     }
-    home.wake();
+    wake();
     true
 }
 
@@ -1683,18 +1694,16 @@ pub fn theme_command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
         [] => {
             let _ = writeln!(ctx.out, "theme: {}", theme().name);
         }
-        [name] => match Theme::by_name(name) {
-            Some(t) => {
-                let note = if switch_theme(&Home::Live, t) { "" } else { " (already)" };
-                let _ = writeln!(ctx.out, "theme: {}{note}", t.name);
+        [name] => match ThemeId::by_name(name) {
+            Some(id) => {
+                let note = if switch_theme(&Home::Live, id) { "" } else { " (already)" };
+                let _ = writeln!(ctx.out, "theme: {}{note}", id.name());
             }
             None => ctx.fail(format_args!("theme: no theme {name:?} (light, dark)")),
         },
-        _ => ctx.fail(format_args!("{THEME_USAGE}")),
+        _ => ctx.fail("usage: theme [light|dark]"),
     }
 }
-
-pub const THEME_USAGE: &str = "usage: theme [light|dark]";
 
 /// At boot: the theme `lumen.theme=` names, then the desktop for the
 /// `lumen.desktop` boot flag (a warning if it can't start, and the boot
@@ -1825,44 +1834,51 @@ fn open_demo_windows() {
 /// The row of a demo window's "last key" line.
 const LAST_KEY_Y: i32 = 180;
 
-/// A demo window's owner: draw it, then show the last key typed in it
-/// until its close box is clicked; a theme switch redraws it all.
+/// A demo window's owner: draw it in the theme its first event hands it,
+/// then show the last key typed in it until its close box is clicked; each
+/// theme switch redraws it all in the theme it hands over.
 fn demo_owner(mut h: WindowHandle, demo: Demo) {
-    let mut font = text_font();
+    let mut text = Text::new();
+    let mut theme: Option<&'static Theme> = None;
     let mut last: Option<(lumen_input::KeyCode, Option<char>)> = None;
-    draw_demo(&mut h, demo, font.as_mut(), last);
     loop {
         match h.wait_event() {
             WindowEvent::Close => return,
-            WindowEvent::Theme(_) => draw_demo(&mut h, demo, font.as_mut(), last),
-            WindowEvent::Key(KeyEvent { code, action: KeyAction::Press { text }, .. }) => {
-                last = Some((code, text));
-                let line = draw_last_key(&mut h, font.as_mut(), last);
-                h.commit(&[line]);
+            WindowEvent::Theme(t) => {
+                theme = Some(t);
+                draw_demo(&mut h, demo, t, text.as_mut(), last);
+            }
+            WindowEvent::Key(KeyEvent { code, action: KeyAction::Press { text: typed }, .. }) => {
+                last = Some((code, typed));
+                // (A theme always comes first: a window's first event.)
+                if let Some(t) = theme {
+                    let line = draw_last_key(&mut h, t, text.as_mut(), last);
+                    h.commit(&[line]);
+                }
             }
             _ => {}
         }
     }
 }
 
-/// A demo window drawn whole, in the theme's colours, and committed.
+/// A demo window drawn whole in `theme`, and committed.
 fn draw_demo(
     h: &mut WindowHandle,
     demo: Demo,
-    mut font: Option<&mut Font<'static>>,
+    theme: &Theme,
+    mut text: Option<&mut Text>,
     last: Option<(lumen_input::KeyCode, Option<char>)>,
 ) {
-    let theme = theme();
     let bounds = h.surface_mut().bounds();
     {
         let s = h.surface_mut();
         s.fill(theme.client);
         match demo {
             Demo::Welcome => {
-                if let Some(font) = font.as_deref_mut() {
-                    draw_text(s, font, 16, 12, WELCOME_HEADING, HEADING_PX, theme.client_text, bounds);
+                if let Some(t) = text.as_deref_mut() {
+                    t.draw(s, 16, 12, WELCOME_HEADING, HEADING_PX, theme.client_text, bounds);
                     for (i, line) in WELCOME_LINES.iter().enumerate() {
-                        draw_text(s, font, 16, 60 + 26 * i as i32, line, TEXT_PX, theme.client_text, bounds);
+                        t.draw(s, 16, 60 + 26 * i as i32, line, TEXT_PX, theme.client_text, bounds);
                     }
                 }
             }
@@ -1876,54 +1892,59 @@ fn draw_demo(
             }
         }
     }
-    draw_last_key(h, font, last);
+    draw_last_key(h, theme, text, last);
     h.commit(&[bounds]);
 }
 
-/// The "last key: ..." line of a demo window; the rectangle drawn.
+/// The "last key: ..." line of a demo window in `theme`; the rectangle
+/// drawn.
 fn draw_last_key(
     h: &mut WindowHandle,
-    font: Option<&mut Font<'static>>,
+    theme: &Theme,
+    text: Option<&mut Text>,
     key: Option<(lumen_input::KeyCode, Option<char>)>,
 ) -> Rect {
-    let theme = theme();
     let s = h.surface_mut();
     let line = Rect::new(0, LAST_KEY_Y, s.width(), 24);
     s.fill_rect(line, theme.client);
-    let mut text = String::from("last key: ");
+    let mut said = String::from("last key: ");
     match key {
-        None => text.push('-'),
-        Some((_, Some(c))) if !c.is_control() => text.push(c),
+        None => said.push('-'),
+        Some((_, Some(c))) if !c.is_control() => said.push(c),
         Some((code, _)) => {
             use core::fmt::Write;
-            let _ = write!(text, "{code:?}");
+            let _ = write!(said, "{code:?}");
         }
     }
-    if let Some(font) = font {
-        draw_text(s, font, 16, LAST_KEY_Y + 2, &text, TEXT_PX, theme.client_text, line);
+    if let Some(t) = text {
+        t.draw(s, 16, LAST_KEY_Y + 2, &said, TEXT_PX, theme.client_text, line);
     }
     line
 }
 
-/// `desktop spin`'s window: a pure green bar moving every 20 ms, its
-/// events read meanwhile (not while `desktop hold` holds it).
+/// `desktop spin`'s window: a pure green bar moving every 20 ms over the
+/// theme its events hand it, its events read meanwhile (not while
+/// `desktop hold` holds it; then it keeps the theme it had).
 fn spin_owner(mut h: WindowHandle) {
     const GREEN: u32 = 0x00ff00;
     let bounds = h.surface_mut().bounds();
     let mut x = 0i32;
+    let mut client = Theme::LIGHT.client;
     loop {
-        let s = h.surface_mut();
-        s.fill(theme().client);
-        s.fill_rect(Rect::new(x, 20, 40, 20), GREEN);
-        h.commit(&[bounds]);
-        x = (x + 8) % (bounds.w() as i32 - 40).max(1);
         if !h.held() {
             while let Some(e) = h.next_event() {
-                if matches!(e, WindowEvent::Close) {
-                    return;
+                match e {
+                    WindowEvent::Close => return,
+                    WindowEvent::Theme(t) => client = t.client,
+                    _ => {}
                 }
             }
         }
+        let s = h.surface_mut();
+        s.fill(client);
+        s.fill_rect(Rect::new(x, 20, 40, 20), GREEN);
+        h.commit(&[bounds]);
+        x = (x + 8) % (bounds.w() as i32 - 40).max(1);
         let _ = crate::sched::sleep(20_000_000);
     }
 }
@@ -2047,7 +2068,7 @@ pub fn windows_table() -> Result<pipe::Table, String> {
 /// and the cut are read just before the desktop's lock, the rest under it:
 /// a snapshot of the desktop, not of all of them at one instant.
 pub fn status_table() -> pipe::Table {
-    const COLUMNS: [Column; 25] = [
+    const COLUMNS: [Column; 27] = [
         Column::new("state", Kind::Text, Align::Left, 5),
         Column::new("theme", Kind::Text, Align::Left, 5),
         Column::new("windows", Kind::Int, Align::Right, 7),
@@ -2070,6 +2091,8 @@ pub fn status_table() -> pipe::Table {
         Column::new("overflowed", Kind::Int, Align::Right, 10),
         Column::new("grab_ends", Kind::Int, Align::Right, 9),
         Column::new("dead_pushes", Kind::Int, Align::Right, 11),
+        Column::new("glyph_misses", Kind::Int, Align::Right, 12),
+        Column::new("glyphs_dropped", Kind::Int, Align::Right, 14),
         Column::new("cancelled", Kind::Int, Align::Right, 9),
         Column::new("late", Kind::Int, Align::Right, 4),
         Column::new("settled", Kind::Text, Align::Left, 7),
@@ -2088,12 +2111,10 @@ pub fn status_table() -> pipe::Table {
         return t;
     };
     let mut counts = s.closed;
-    let mut windows_idle = true;
     for w in &s.windows {
-        let inner = w.inner.lock();
-        counts += &inner.queue.counts();
-        windows_idle &= inner.queue.is_idle() && w.idle.load(Ordering::Acquire) && !w.theme_behind();
+        counts += &w.inner.lock().queue.counts();
     }
+    let (windows_idle, themes_told) = windows_quiet(s);
     let shown = vt::desktop_shown();
     let settled = Settled {
         shown,
@@ -2108,6 +2129,7 @@ pub fn status_table() -> pipe::Table {
         committing: s.commits > 0,
         pending,
         windows_idle,
+        themes_told,
     }
     .holds();
     let wm = s.wm.counts();
@@ -2136,11 +2158,31 @@ pub fn status_table() -> pipe::Table {
         int(counts.overflowed),
         int(wm.grab_ends),
         int(counts.dead_pushes + s.stats.dead_pushes),
+        int(s.stats.glyph_misses),
+        int(crate::font::glyphs_dropped()),
         int(0),
         int(0),
         yes(settled),
     ]);
     t
+}
+
+/// Whether every window's queue is idle with its owner waiting, and
+/// whether every owner has been told of the last theme switch: in that
+/// order for each window, the work first, the owner's idle bit last. An
+/// owner told of a switch clears its idle bit before it takes the theme
+/// (`wait_event` stores it before `next_event`), so a look that finds the
+/// theme told and then the bit set saw the owner wait again after
+/// redrawing, never mid-redraw.
+fn windows_quiet(s: &State) -> (bool, bool) {
+    let (mut idle, mut told) = (true, true);
+    for w in &s.windows {
+        let queue_idle = w.inner.lock().queue.is_idle();
+        let this_told = !w.theme_behind();
+        told &= this_told;
+        idle &= queue_idle && this_told && w.idle.load(Ordering::Acquire);
+    }
+    (idle, told)
 }
 
 /// What `desktop status`'s `settled` is made of (§11): each a look taken
@@ -2167,6 +2209,8 @@ struct Settled {
     pending: bool,
     /// Every window's queue is idle and its owner waits.
     windows_idle: bool,
+    /// Every window's owner has been told of the last theme switch.
+    themes_told: bool,
 }
 
 impl Settled {
@@ -2183,6 +2227,7 @@ impl Settled {
             && !self.committing
             && !self.pending
             && self.windows_idle
+            && self.themes_told
     }
 }
 
@@ -2385,9 +2430,10 @@ crate::ktest!(
             committing: false,
             pending: false,
             windows_idle: true,
+            themes_told: true,
         };
         kassert!(all.holds());
-        let broken: [fn(&mut Settled); 12] = [
+        let broken: [fn(&mut Settled); 13] = [
             |s| s.shown = false,
             |s| s.compositor_shown = false,
             |s| s.acted_on_cut = false,
@@ -2400,6 +2446,7 @@ crate::ktest!(
             |s| s.committing = true,
             |s| s.pending = true,
             |s| s.windows_idle = false,
+            |s| s.themes_told = false,
         ];
         for (i, f) in broken.iter().enumerate() {
             let mut one = all;
@@ -2638,30 +2685,67 @@ crate::ktest!(
     fn a_bad_wallpaper_falls_back_with_one_warning() {
         // On a desktop with no screen: a wallpaper that doesn't decode (not
         // a PNG, cut short) leaves the theme's flat colour, one warning
-        // each, and a recompose draws that colour; the embedded one decodes
-        // to the screen's size, with no warning, and a recompose draws its
-        // pixels.
+        // each, and a recompose draws that colour at every pixel of the
+        // rectangle; the embedded one decodes to the screen's size, with no
+        // warning, and a recompose draws its pixels. A desktop not started
+        // says so, with no warning.
         use crate::{kassert, kassert_eq};
         const SAID: &str = "WARN  desktop: wallpaper not shown: ";
         let d = Desktop::without_screen();
         let before = logged(SAID)?;
-        kassert!(!d.set_wallpaper(b"not a PNG at all"));
+        kassert!(d.set_wallpaper(b"not a PNG at all").is_err());
         kassert_eq!(logged(SAID)?, before + 1);
-        kassert!(!d.set_wallpaper(&WALLPAPER_PNG[..WALLPAPER_PNG.len() / 2]));
+        kassert!(d.set_wallpaper(&WALLPAPER_PNG[..WALLPAPER_PNG.len() / 2]).is_err());
         kassert_eq!(logged(SAID)?, before + 2);
-        let mut font = None;
+        let mut titles = None;
         let mut target = Surface::with_stride(1280, 800, 1280).ok_or("no memory for a screen")?;
         let scene = d.home.lock().as_ref().map(snapshot).ok_or("no state")?;
         kassert!(scene.wallpaper.is_none());
-        compose(&mut target, Rect::new(100, 100, 64, 32), &scene, &mut font);
-        kassert_eq!(target.pixel(130, 110), Some(theme().desktop));
-        kassert!(d.set_wallpaper(WALLPAPER_PNG));
+        let r = Rect::new(100, 100, 64, 32);
+        compose(&mut target, r, &scene, &mut titles);
+        let flat =
+            (r.y()..r.bottom()).all(|y| target.row(y as u32)[100..164].iter().all(|&p| p == scene.theme.desktop));
+        kassert!(flat);
+        kassert!(d.set_wallpaper(WALLPAPER_PNG).is_ok());
         kassert_eq!(logged(SAID)?, before + 2);
         let scene = d.home.lock().as_ref().map(snapshot).ok_or("no state")?;
         let wp = scene.wallpaper.clone().ok_or("the embedded wallpaper isn't shown")?;
         kassert_eq!((wp.width(), wp.height()), (1280, 800));
-        compose(&mut target, Rect::new(100, 100, 64, 32), &scene, &mut font);
-        kassert_eq!(target.pixel(130, 110), wp.pixel(130, 110));
+        compose(&mut target, r, &scene, &mut titles);
+        let same = (r.y()..r.bottom()).all(|y| target.row(y as u32)[100..164] == wp.row(y as u32)[100..164]);
+        kassert!(same);
+        let unstarted = Desktop { home: Home::Own(Arc::new(SpinLock::new(None))) };
+        kassert_eq!(unstarted.set_wallpaper(WALLPAPER_PNG), Err(String::from("no desktop")));
+        kassert_eq!(logged(SAID)?, before + 2);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_smaller_wallpaper_is_drawn_centred_over_the_flat_colour() {
+        // A 64x32 wallpaper (made with lumen-png's encoder) on a 1280x800
+        // desktop: centred, the theme's colour around it.
+        use crate::{kassert, kassert_eq};
+        let mut rows = Rows::new(64, 32).map_err(|_| "no rows")?;
+        for y in 0..32 {
+            for (x, p) in rows.row_mut(y).iter_mut().enumerate() {
+                *p = [x as u8 * 4, y as u8 * 8, 0x80];
+            }
+        }
+        let png = rows.encode().map_err(|_| "no PNG")?;
+        let d = Desktop::without_screen();
+        kassert!(d.set_wallpaper(png.bytes()).is_ok());
+        let scene = d.home.lock().as_ref().map(snapshot).ok_or("no state")?;
+        let mut target = Surface::with_stride(1280, 800, 1280).ok_or("no memory")?;
+        let all = target.bounds();
+        compose(&mut target, all, &scene, &mut None);
+        let (x0, y0) = ((1280 - 64) / 2, (800 - 32) / 2);
+        kassert_eq!(target.pixel(0, 0), Some(scene.theme.desktop));
+        kassert_eq!(target.pixel(x0 - 1, y0), Some(scene.theme.desktop));
+        kassert_eq!(target.pixel(x0, y0), Some(0x0000_0080));
+        kassert_eq!(target.pixel(x0 + 10, y0 + 3), Some((40 << 16) | (24 << 8) | 0x80));
+        kassert_eq!(target.pixel(x0 + 63, y0 + 31), Some((252 << 16) | (248 << 8) | 0x80));
+        kassert_eq!(target.pixel(x0 + 64, y0 + 31), Some(scene.theme.desktop));
         Ok(())
     }
 );
@@ -2674,20 +2758,62 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         let d = Desktop::without_screen();
         let _w = d.open_window("Rasterized once", 200, 80).map_err(|_| "no window")?;
-        let mut font = Some(text_font().ok_or("no UI font")?);
+        let mut titles = Some(Titles::new().ok_or("no UI font")?);
         let scene = d.home.lock().as_ref().map(snapshot).ok_or("no state")?;
         let frame = scene.windows.first().ok_or("no window in the scene")?.frame;
+        let misses = |t: &Option<Titles>| t.as_ref().map(|t| t.text.stats()).ok_or("no font");
         let mut first = Surface::with_stride(1280, 800, 1280).ok_or("no memory")?;
-        compose(&mut first, frame, &scene, &mut font);
-        let after_first = font.as_ref().map(|f| f.stats()).ok_or("no font")?;
+        compose(&mut first, frame, &scene, &mut titles);
+        let after_first = misses(&titles)?;
         kassert!(after_first.misses > 0);
         let mut second = Surface::with_stride(1280, 800, 1280).ok_or("no memory")?;
-        compose(&mut second, frame, &scene, &mut font);
-        let after_second = font.as_ref().map(|f| f.stats()).ok_or("no font")?;
+        compose(&mut second, frame, &scene, &mut titles);
+        let after_second = misses(&titles)?;
         kassert_eq!(after_second.misses, after_first.misses);
         kassert!(after_second.hits > after_first.hits);
         kassert!((0..800).all(|y| first.row(y) == second.row(y)));
         Ok(())
+    }
+);
+
+/// A key event for the ktests: `a` pressed.
+#[cfg(feature = "ktest")]
+fn key_a() -> KeyEvent {
+    KeyEvent {
+        code: lumen_input::KeyCode::A,
+        action: KeyAction::Press { text: Some('a') },
+        mods: lumen_input::Mods::NONE,
+        after_drop: false,
+    }
+}
+
+/// Run `f`, then switch the theme back to light (the theme is the
+/// kernel's, not a test desktop's).
+#[cfg(feature = "ktest")]
+fn then_light(f: impl FnOnce() -> Result<(), &'static str>) -> Result<(), &'static str> {
+    let result = f();
+    let _ = switch_theme(&Home::Live, ThemeId::Light);
+    result
+}
+
+crate::ktest!(
+    fn a_window_s_first_event_is_the_theme_to_draw_with() {
+        // Every window is told the theme first (even one opened with the
+        // dark theme already on), so its owner draws with the theme it is
+        // handed; after that, only a switch tells it again.
+        use crate::kassert;
+        then_light(|| {
+            let d = Desktop::without_screen();
+            let mut light = d.open_window("light", 16, 16).map_err(|_| "no window")?;
+            kassert!(matches!(light.next_event(), Some(WindowEvent::Theme(t)) if t.name == "light"));
+            kassert!(light.next_event().is_none());
+            kassert!(switch_theme(&d.home, ThemeId::Dark));
+            let mut dark = d.open_window("dark", 16, 16).map_err(|_| "no window")?;
+            kassert!(matches!(dark.next_event(), Some(WindowEvent::Theme(t)) if t.name == "dark"));
+            kassert!(dark.next_event().is_none());
+            kassert!(matches!(light.next_event(), Some(WindowEvent::Theme(t)) if t.name == "dark"));
+            Ok(())
+        })
     }
 );
 
@@ -2696,39 +2822,73 @@ crate::ktest!(
         // On a desktop with no screen: switching to dark damages the whole
         // screen and tells the window's owner once, before the key queued
         // earlier (`Theme(dark)`, then the key); a switch to the theme
-        // already shown changes nothing. Light again at the end (the theme
-        // is the kernel's, not the test desktop's).
+        // already shown changes nothing.
         use crate::{kassert, kassert_eq};
-        let d = Desktop::without_screen();
-        let mut w = d.open_window("w", 16, 16).map_err(|_| "no window")?;
-        while w.next_event().is_some() {}
-        let key = KeyEvent {
-            code: lumen_input::KeyCode::A,
-            action: KeyAction::Press { text: Some('a') },
-            mods: lumen_input::Mods::NONE,
-            after_drop: false,
-        };
-        if let Some(s) = d.home.lock().as_mut() {
-            let _ = s.damage.take();
-            let mut after = After::default();
-            let id = w.win.id;
-            kassert_eq!(s.push(id, &mut after, |q| Some(q.push(Entry::Key(key)))), Some(Pushed::Queued));
-        }
-        let result = (|| {
-            kassert!(switch_theme(&d.home, &Theme::DARK));
+        then_light(|| {
+            let d = Desktop::without_screen();
+            let mut w = d.open_window("w", 16, 16).map_err(|_| "no window")?;
+            while w.next_event().is_some() {}
+            if let Some(s) = d.home.lock().as_mut() {
+                let _ = s.damage.take();
+                let mut after = After::default();
+                let id = w.win.id;
+                kassert_eq!(s.push(id, &mut after, |q| Some(q.push(Entry::Key(key_a())))), Some(Pushed::Queued));
+            }
+            kassert!(switch_theme(&d.home, ThemeId::Dark));
             kassert_eq!(theme().name, "dark");
             let full = d.home.lock().as_mut().map(|s| s.damage.take()).ok_or("no state")?;
             kassert!(full.rects().iter().any(|r| *r == Rect::new(0, 0, 1280, 800)));
-            kassert!(w.win.theme_behind());
+            kassert!(w.win.theme_behind() && w.win.has_event());
             kassert!(matches!(w.next_event(), Some(WindowEvent::Theme(t)) if t.name == "dark"));
             kassert!(!w.win.theme_behind());
-            kassert!(matches!(w.next_event(), Some(WindowEvent::Key(k)) if k == key));
-            kassert!(w.next_event().is_none());
-            kassert!(!switch_theme(&d.home, &Theme::DARK));
+            kassert!(matches!(w.next_event(), Some(WindowEvent::Key(k)) if k == key_a()));
+            kassert!(w.next_event().is_none() && !w.win.has_event());
+            kassert!(!switch_theme(&d.home, ThemeId::Dark));
             kassert!(d.home.lock().as_ref().is_some_and(|s| s.damage.is_empty()));
             Ok(())
-        })();
-        let _ = switch_theme(&d.home, &Theme::LIGHT);
-        result
+        })
+    }
+);
+
+crate::ktest!(
+    fn switches_before_the_owner_reads_end_with_the_current_theme() {
+        // Dark then light before the owner reads: it is told once more, and
+        // the last `Theme` it gets carries light; nothing follows.
+        use crate::kassert;
+        then_light(|| {
+            let d = Desktop::without_screen();
+            let mut w = d.open_window("w", 16, 16).map_err(|_| "no window")?;
+            while w.next_event().is_some() {}
+            kassert!(switch_theme(&d.home, ThemeId::Dark));
+            kassert!(switch_theme(&d.home, ThemeId::Light));
+            let mut last = None;
+            while let Some(e) = w.next_event() {
+                let WindowEvent::Theme(t) = e else { return Err("not a theme") };
+                last = Some(t.name);
+            }
+            kassert!(last == Some("light"));
+            Ok(())
+        })
+    }
+);
+
+crate::ktest!(
+    fn settled_waits_for_every_owner_to_be_told_of_a_switch() {
+        // An owner waiting (its idle bit set) with nothing queued: quiet. A
+        // switch makes it not quiet (not told) until it reads the theme.
+        use crate::kassert;
+        then_light(|| {
+            let d = Desktop::without_screen();
+            let mut w = d.open_window("w", 16, 16).map_err(|_| "no window")?;
+            while w.next_event().is_some() {}
+            w.win.idle.store(true, Ordering::Release);
+            let quiet = || d.home.lock().as_ref().map(windows_quiet).ok_or("no state");
+            kassert!(quiet()? == (true, true));
+            kassert!(switch_theme(&d.home, ThemeId::Dark));
+            kassert!(quiet()? == (false, false));
+            kassert!(matches!(w.next_event(), Some(WindowEvent::Theme(_))));
+            kassert!(quiet()? == (true, true));
+            Ok(())
+        })
     }
 );

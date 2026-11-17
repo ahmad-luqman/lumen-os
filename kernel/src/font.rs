@@ -12,8 +12,9 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use core::fmt;
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use lumen_font::{Face, Font, Px, Stats, TooWide, sample};
+use lumen_gfx::{Mask, Rect, Surface};
 use lumen_time::Millis;
 
 /// The glyph cache's bound for the sample: far more than its glyphs take,
@@ -93,6 +94,104 @@ pub fn face() -> Result<&'static Loaded, lumen_font::Error> {
             // `Box::into_raw` and is never freed, as above.
             Ok(unsafe { &*theirs })
         }
+    }
+}
+
+// -- text on the desktop ------------------------------------------------------
+
+/// The desktop's text sizes, in pixels per em: a window's title, its text,
+/// and a heading.
+pub const TITLE_PX: Px = px(15);
+pub const TEXT_PX: Px = px(16);
+pub const HEADING_PX: Px = px(24);
+
+const fn px(n: u16) -> Px {
+    match Px::new(n) {
+        Some(px) => px,
+        None => panic!("a text size out of range"),
+    }
+}
+
+/// Each [`Text`]'s glyph cache: far more than a few sizes of the glyphs on a
+/// desktop take, so a redraw hits.
+const TEXT_CACHE_BYTES: usize = 128 * 1024;
+
+/// Glyphs [`Text::draw`] left out because `lumen_gfx::Mask::new` refused
+/// their mask (a bug in `lumen-font`: its masks are always their size),
+/// counted for `desktop status` (`glyphs_dropped`); the first is warned
+/// about, naming its sizes.
+static GLYPHS_DROPPED: AtomicU64 = AtomicU64::new(0);
+/// Set once the UI font failing to load has been warned about.
+static NO_FONT_SAID: AtomicBool = AtomicBool::new(false);
+
+/// Glyphs left out so far (see [`GLYPHS_DROPPED`]).
+pub fn glyphs_dropped() -> u64 {
+    GLYPHS_DROPPED.load(Ordering::Relaxed)
+}
+
+/// One drawing thread's text (#154): its own glyph cache over the shared UI
+/// font, so drawing takes no shared lock and a glyph is rasterized once per
+/// size, then drawn from the cache. The compositor has one for the titles;
+/// each window's owner makes its own.
+pub struct Text {
+    font: Font<'static>,
+}
+
+impl Text {
+    /// A glyph cache over the UI font (parsed on first use: call it from a
+    /// thread), or `None` if the font didn't load (one warning a boot: then
+    /// no text is drawn).
+    pub fn new() -> Option<Text> {
+        match face() {
+            Ok(loaded) => Some(Text { font: Font::new(loaded.face(), TEXT_CACHE_BYTES) }),
+            Err(e) => {
+                if !NO_FONT_SAID.swap(true, Ordering::Relaxed) {
+                    log::warn!(target: "desktop", "no text: the UI font didn't load: {e}");
+                }
+                None
+            }
+        }
+    }
+
+    /// Draw `text` at `px` with its line box's top-left corner at (`x`,
+    /// `y`), in `color`, touching only pixels inside `clip`: each glyph's
+    /// mask blended on its own (no line mask allocated), clipped. Blending
+    /// isn't idempotent, so a redraw of one damaged rectangle passes that
+    /// rectangle and the pixels outside it stay as they were.
+    #[allow(clippy::too_many_arguments, reason = "a line of text: where, what, how big, which colour, inside what")]
+    pub fn draw(&mut self, s: &mut Surface, x: i32, y: i32, text: &str, px: Px, color: u32, clip: Rect) {
+        self.font.render(text, px, |g| match Mask::new(g.width(), g.height(), g.coverage()) {
+            Some(mask) => s.blend_mask_in(&mask, x.saturating_add(g.x()), y.saturating_add(g.y()), color, clip),
+            None => {
+                if GLYPHS_DROPPED.fetch_add(1, Ordering::Relaxed) == 0 {
+                    log::warn!(
+                        target: "desktop",
+                        "a glyph's mask doesn't match its size ({}x{}, {} bytes): not drawn (counted in desktop status)",
+                        g.width(),
+                        g.height(),
+                        g.coverage().len()
+                    );
+                }
+            }
+        });
+    }
+
+    /// `text`'s advance width at `px`, from the metrics alone (nothing
+    /// rasterized).
+    #[allow(dead_code, reason = "its first users are #156's widgets, laying out their labels")]
+    pub fn measure(&self, text: &str, px: Px) -> u32 {
+        self.font.face().measure(text, px).width
+    }
+
+    /// A line's height at `px`: the face's ascent and descent.
+    pub fn line_height(&self, px: Px) -> i32 {
+        let m = self.font.face().line_metrics(px);
+        m.ascent + m.descent
+    }
+
+    /// The glyph cache's counters (`misses`: glyphs rasterized).
+    pub fn stats(&self) -> Stats {
+        self.font.stats()
     }
 }
 

@@ -101,8 +101,7 @@ SPRITE_W, SPRITE_H = 11, 17
 
 def wallpaper_rgb(x: int, y: int) -> tuple[int, int, int]:
     """The desktop's pixel at (x, y) where no window covers it."""
-    with Image.open(WALLPAPER) as img:
-        return img.convert("RGB").getpixel((x, y))
+    return pixel(WALLPAPER, x, y)
 
 
 def frame_of(w: dict[str, str]) -> tuple[int, int, int, int]:
@@ -112,6 +111,14 @@ def frame_of(w: dict[str, str]) -> tuple[int, int, int, int]:
 def pixel(shot, x: int, y: int) -> tuple[int, int, int]:
     with Image.open(shot) as img:
         return img.convert("RGB").getpixel((x, y))
+
+
+def close_window(m: Machine, title: str) -> None:
+    """Click `title`'s close box (its owner closes it)."""
+    x, y, w, _ = frame_of(gui.window(m, title))
+    gui.pointer_move(m, x + w - 1 - 4 - 8, y + 12)
+    gui.pointer_down(m)
+    gui.pointer_up(m)
 
 
 def boot_tablet(boot, **kwargs) -> Machine:
@@ -366,7 +373,8 @@ def test_presents_match_a_full_repaint(boot):
     # raise, a focus change and a close, the back buffer equals a full
     # repaint and the screen the back buffer (outside the pointer's box):
     # damage-only drawing misses nothing. Then a theme switch to dark and
-    # back (everything repainted once, the windows' owners redrawing).
+    # back (the whole screen damaged and recomposed; that the owners redraw
+    # in the new colours is the dark golden's to show).
     m = boot_tablet(boot)
     gui.start_desktop(m)
     assert gui.desktop_check(m) == (0, 0)
@@ -391,11 +399,7 @@ def test_presents_match_a_full_repaint(boot):
     assert gui.desktop_check(m) == (0, 0), "after a raise and focus change"
     # The Welcome window's close box: its owner closes it, the Colours
     # window gets the focus.
-    wx, wy, ww, _ = welcome
-    close = (wx + ww - 1 - 4 - 8, wy + 12)
-    gui.pointer_move(m, *close)
-    gui.pointer_down(m)
-    gui.pointer_up(m)
+    close_window(m, "Welcome")
     gui.wait_windows(m, 1)
     gui.wait_settled(m)
     assert gui.window(m, "Colours")["focused"] == "yes"
@@ -559,19 +563,12 @@ def test_text_rendering_golden(boot, artifacts, golden_dir):
     )
 
 
-def close_window(m: Machine, title: str) -> None:
-    """Click `title`'s close box (its owner closes it)."""
-    x, y, w, _ = frame_of(gui.window(m, title))
-    gui.pointer_move(m, x + w - 1 - 4 - 8, y + 12)
-    gui.pointer_down(m)
-    gui.pointer_up(m)
-
-
 def test_png_wallpaper_golden(boot, artifacts):
     # The desktop with no windows: both closed by their close boxes, the
-    # pointer moved to the bottom-right pixel (left out of the comparison).
-    # The screen shows the wallpaper, decoded from the PNG the kernel
-    # embeds, in every pixel: the golden is that PNG itself.
+    # pointer moved to the bottom-right pixel. The screen shows the
+    # wallpaper, decoded from the PNG the kernel embeds, in every pixel
+    # (the one under the parked arrow's tip taken from the PNG): the golden
+    # is that PNG itself.
     m = boot_tablet(boot)
     gui.start_desktop(m)
     assert "INFO  desktop: wallpaper: 1280x800, " in m.output, "the wallpaper wasn't decoded"
@@ -581,9 +578,10 @@ def test_png_wallpaper_golden(boot, artifacts):
     gui.wait_windows(m, 0)
     gui.pointer_move(m, 1279, 799)
     shot = gui.settled_screendump(m, "wallpaper.png")
-    region = (0, 0, 1279, 799)
     with Image.open(shot) as dumped, Image.open(WALLPAPER) as wallpaper:
-        actual, want = dumped.convert("RGB").crop(region), wallpaper.convert("RGB").crop(region)
+        actual, want = dumped.convert("RGB"), wallpaper.convert("RGB")
+    assert actual.size == want.size == (1280, 800)
+    actual.putpixel((1279, 799), want.getpixel((1279, 799)))
     diff, mask = compare(actual, want, tolerance=0)
     if diff.differing:
         actual.save(artifacts / "wallpaper.actual.png")
@@ -594,13 +592,23 @@ def test_png_wallpaper_golden(boot, artifacts):
     assert gui.desktop_check(m) == (0, 0)
 
 
+def typed_before_the_switch(m: Machine) -> None:
+    """Type `x` into the focused (Colours) window, which shows it as its
+    last key."""
+    gui.type_confirmed(m, "x")
+    wait_keys(m, "Colours", 2)
+    gui.wait_settled(m)
+
+
 def test_dark_theme_golden(boot, artifacts, golden_dir):
     # `theme dark`, then the two-window desktop: the frames in the dark
-    # palette and the windows' owners redrawing their client areas in it,
-    # against a golden; everything repainted once (`desktop check`). A name
-    # that isn't a theme is refused.
+    # palette and the windows' owners redrawing their client areas in it
+    # (the golden: the Colours window still showing the key typed before
+    # the switch), and `desktop check` 0 and 0. A name that isn't a theme
+    # is refused.
     m = boot_shells(boot)
     gui.start_desktop(m)
+    typed_before_the_switch(m)
     assert run(m, "theme") == "theme: light\n"
     assert run(m, "theme dark") == "theme: dark\n"
     assert run(m, "theme dark") == "theme: dark (already)\n"
@@ -617,12 +625,13 @@ def test_dark_theme_golden(boot, artifacts, golden_dir):
 def test_theme_boot_flag_picks_dark(boot, artifacts, golden_dir):
     # `lumen.theme=dark`: said at boot, `theme` says so before the desktop
     # starts, and the desktop starts dark: the same screen as switching to
-    # it (the dark golden).
+    # it (the dark golden, the same key typed).
     m = boot_shells(boot, cmdline="lumen.theme=dark")
     assert "INFO  desktop: theme dark (lumen.theme)" in m.output
     assert run(m, "theme") == "theme: dark\n"
     assert gui.desktop_status(m)["theme"] == "dark"
     gui.start_desktop(m)
+    typed_before_the_switch(m)
     shot = gui.settled_screendump(m, "dark-at-boot.png")
     assert_matches_golden(
         shot, golden_dir / "desktop-dark.png", origin=(0, 0), size=(1280, 800), artifacts=artifacts
