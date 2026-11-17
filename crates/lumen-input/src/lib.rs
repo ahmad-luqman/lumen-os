@@ -43,6 +43,6 @@ pub use keys::{AfterDrop, InputEvent, KeyAction, KeyCode, KeyDecoder, KeyEvent, 
 pub use ring::{InputDevice, Read, Reader, Ring, Seq};
 pub use scancode::Presses;
 pub use tablet::{
-    AbsAxis, AfterOverrun, AxisError, Buttons, Event, FRAME_TYPES, PointerState, Tablet, evdev, frame_bound,
+    AbsAxis, AfterOverrun, AxisError, Button, Buttons, Event, FRAME_TYPES, PointerState, Tablet, evdev, frame_bound,
     has_abs_xy, may_have_lost_frames,
 };
