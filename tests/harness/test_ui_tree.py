@@ -71,5 +71,14 @@ def test_invoke_outputs_are_told_apart():
     ]:
         got = gui.parse_invoke(message + "\n")
         assert got == gui.Invoked(None, message)
-    with pytest.raises(AssertionError, match="ran late but gave no row"):
+    with pytest.raises(AssertionError, match="ran late but said nothing more"):
         gui.parse_invoke("ui invoke: ran late\n")
+
+
+def test_a_late_answer_may_be_a_message():
+    # Answered after the first deadline with a message, not a row: Quit
+    # closing its window, or the owner's refusal; both kept as late.
+    closed = gui.parse_invoke("ui invoke: ran late\nui invoke: ran; window 3 closed\n")
+    assert closed == gui.Invoked(None, "ui invoke: ran; window 3 closed", late=True)
+    refused = gui.parse_invoke("ui invoke: ran late\nui invoke: the node is disabled\n")
+    assert refused == gui.Invoked(None, "ui invoke: the node is disabled", late=True)

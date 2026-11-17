@@ -873,7 +873,8 @@ class Invoked:
 
 def parse_invoke(out: str) -> Invoked | None:
     """`ui invoke`'s output read: `None` for a request cancelled at its
-    deadline (to retry: it never ran), else what it said."""
+    deadline (to retry: it never ran), else what it said: a row or a
+    message, either after `ui invoke: ran late` (`late`)."""
     lines = [line for line in out.splitlines() if line.strip()]
     if lines and lines[0].startswith(INVOKE_CANCELLED):
         return None
@@ -885,7 +886,10 @@ def parse_invoke(out: str) -> Invoked | None:
             raise AssertionError(f"ui invoke gave {len(rows)} rows:\n{out}")
         return Invoked(rows[0], None, late)
     if late:
-        raise AssertionError(f"ui invoke ran late but gave no row:\n{out}")
+        # Answered late with a message: a refusal, or its window closed.
+        if not body:
+            raise AssertionError(f"ui invoke ran late but said nothing more:\n{out}")
+        return Invoked(None, "\n".join(body).strip(), late)
     return Invoked(None, out.strip())
 
 
