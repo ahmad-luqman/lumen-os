@@ -41,7 +41,7 @@ pub mod wm;
 mod model;
 
 pub use geom::{Metrics, Part};
-pub use queue::{Entry, EventQueue, Held, KeyLike, Next, Pushed, QueueCounts};
+pub use queue::{Entry, EventQueue, Held, KeyLike, Next, Pushed, QueueCounts, Refused};
 pub use route::{PointerEntry, deliver};
 pub use theme::Theme;
 pub use wm::{
