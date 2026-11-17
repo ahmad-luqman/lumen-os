@@ -11,6 +11,7 @@ import re
 from typing import NamedTuple
 
 from lumen_harness.clock_diags import TSC_TOLERANCE_PPM
+from lumen_harness.crash import BEGIN, END
 from lumen_harness.qemu import EXIT_CRASH
 
 BOOT_TIMEOUT = 60
@@ -215,7 +216,16 @@ def test_boot_calibration_agrees_with_both_clocks(boot):
 # about the stall. Its verdict is by each clock's tolerance (the TSC's 1%,
 # the timer's 2%).
 FILLED = r"took 20 windows again, 0 of 5 kept steady, median within (\d+\.\d)%"
-PANIC = re.compile(r"panic: (.*)\n")
+PANIC = re.compile(r"\npanic: (.*)\n")
+
+
+def panic_message(out: str) -> str:
+    """The `panic:` line of the crash report in `out` (between its BEGIN and
+    END markers, as test_crash reads it)."""
+    report = out[out.index(BEGIN) : out.index(END) + len(END)]
+    said = PANIC.search(report)
+    assert said, report
+    return said[1]
 
 
 def boot_messages(m) -> str:
@@ -296,9 +306,8 @@ def test_tsc_windows_with_no_bound_left_panic(boot):
         rf"WARN  time: can't calibrate the tsc against the HPET: {no_information} .*; calibrating against the PIT\n",
         out,
     ), out
-    said = PANIC.search(out)
-    assert said, out
-    assert re.match(rf"can't calibrate the tsc against the PIT: {no_information}", said[1]), said[0]
+    said = panic_message(out)
+    assert re.match(rf"can't calibrate the tsc against the PIT: {no_information}", said), said
 
 
 def test_a_stall_past_ten_windows_is_ignored(boot):
@@ -365,12 +374,11 @@ def test_timer_windows_with_no_bound_left_panic(boot):
     # window counts it), so the median's bound is gone and boot panics.
     m = boot("qemutest", cmdline="lumen.stall_timer_windows=0,3000000")
     assert m.wait_exit(BOOT_TIMEOUT) == EXIT_CRASH
-    said = PANIC.search(m.output)
-    assert said, m.output
+    said = panic_message(m.output)
     # The first window (no stall) may be steady or not: TCG's timer reads alone
     # can take 1% of a window.
     assert re.match(
         r"can't calibrate the local APIC timer against the TSC: only [01] of 20 windows read promptly "
         r"\(5 wanted\), and the middle ones' stalls were as long as themselves, so the rate says nothing",
-        said[1],
-    ), said[0]
+        said,
+    ), said

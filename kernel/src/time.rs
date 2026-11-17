@@ -497,6 +497,11 @@ fn stall_from_cmdline(key: &str) -> Stall {
 /// windows' worth, 160 ms (the 32-bit counter wraps after 43 s).
 const MOST_HPET_STRETCH: u64 = 16;
 
+// Pinned: interrupts are off through a calibration, so its longest (20
+// windows at the cap, about 3.2 s) is part of what this allows; KVM's
+// loaded runs reached the cap (#139) and stayed steady there.
+const _: () = assert!(MOST_HPET_STRETCH == 16);
+
 /// The TSC's frequency against the HPET, `pause` called at each window's
 /// [`Pause`] points (see [`hpet_window`]). A window whose ends were slow to
 /// read (each read slow, not one burst: [`lumen_time::stretched_for_gaps`])
@@ -1572,7 +1577,9 @@ crate::ktest!(
         })?;
         crate::ktest::diag(format_args!("{cal}, median within {} ppm", cal.median_bound_ppm()));
         kassert_eq!(cal.steady(), WINDOWS);
-        kassert!(cal.retaken >= 1);
+        // Taken again once or so, not every other time: a stretched window
+        // keeps its length (the next one starts from it, not from 10 ms).
+        kassert!(cal.retaken >= 1 && cal.retaken < WINDOWS);
         // Longer than 10 ms, and at most 16 times that: a window ends at the
         // first poll past its target, so up to a poll (450 µs on loaded KVM)
         // past it, under one more window.
@@ -1652,11 +1659,14 @@ crate::ktest!(
         // read both have it. Paused while it doesn't (before the start, or
         // after the read, #129's stall: about 9% low), it can't take the rate
         // high. Each check allows the other gap (a loaded host may stall
-        // there too) and 1% for the calibration. All four windows are taken
-        // with the tick stopped (`with_tick_stopped`).
+        // there too) and what the boot timer calibration can be off by (its
+        // bound, the TSC's included, at least 1%). All four windows are
+        // taken with the tick stopped (`with_tick_stopped`).
         use crate::kassert;
         let tsc = tsc().ok_or("TSC not calibrated")?;
         let timer_hz = lapic_timer().ok_or("timer not calibrated")?.hz();
+        let calibration_ppm =
+            boot_timer_calibration().ok_or("no timer calibration")?.median_bound_ppm().max(10_000) as i64;
         let (window, ms) = (tsc.ticks(WINDOW_NS), tsc.ticks(1_000_000));
         const AT: [Pause; 4] =
             [Pause::StartBeforeRead, Pause::StartAfterRead, Pause::EndBeforeRead, Pause::EndAfterRead];
@@ -1674,7 +1684,8 @@ crate::ktest!(
             kassert!(!w.is_steady());
             let start = matches!(at, Pause::StartBeforeRead | Pause::StartAfterRead);
             kassert!(if start { w.start_gap } else { w.end_gap } >= ms); // the pause is in it
-            let (high, low, paused) = (ppm(w.start_gap, &w) + 10_000, ppm(w.end_gap, &w) + 10_000, ppm(ms, &w));
+            let (high, low) = (ppm(w.start_gap, &w) + calibration_ppm, ppm(w.end_gap, &w) + calibration_ppm);
+            let paused = ppm(ms, &w);
             if matches!(at, Pause::StartAfterRead | Pause::EndBeforeRead) {
                 kassert!(off_ppm >= paused - low && off_ppm <= high); // the timer counted the pause
             } else {
@@ -1882,11 +1893,13 @@ crate::ktest!(
         // - An idle measurement run's (44062785900) timer windows, every end
         //   about 25 µs slow (a slowed host, not a burst), 1 steady after 20
         //   (19 taken again): 0.5% and the TSC's: INFO.
-        // - The HPET windows of the first boot: 4 of 20 read promptly, the
-        //   others like the one its warning showed (40 polls in 10 ms, 3.9%
-        //   of gaps). With the smallest bounds filling in, the median lies
-        //   between steady windows': INFO, and the HPET kept (it used to give
-        //   way to the PIT).
+        // - The HPET windows of the first boot, made up from what its warning
+        //   showed: 4 of 20 read promptly (made-up prompt windows), the others
+        //   like the one shown (40 polls in 10 ms, 3.9% of gaps), fed to
+        //   median_tsc_hz directly (not calibrate_with_hpet, so the stretch
+        //   isn't replayed). With the smallest bounds filling in, the median
+        //   lies between steady windows': INFO (it used to give way to the
+        //   PIT).
         use crate::kassert_eq;
         let parse = |w: &str| {
             let mut f = w.split('/').map(|x| x.parse::<u64>().unwrap_or(0));

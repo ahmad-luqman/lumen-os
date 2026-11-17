@@ -1364,6 +1364,10 @@ mod tests {
         assert_eq!(stretched_for_gaps(1_000_000, &burst, 16_000_000), 1_000_000);
         let slow = Window { polls: 40, start_gap: 436_492, end_gap: 529_641, ..burst };
         assert!(stretched_for_gaps(1_000_000, &slow, 16_000_000) > 9_000_000);
+        // A steady window (0.45% of gaps) isn't stretched.
+        let steady = Window { tsc: 10_000_000, reference: 1_000_000, polls: 800, start_gap: 25_000, end_gap: 20_000 };
+        assert!(steady.is_steady());
+        assert_eq!(stretched_for_gaps(1_000_000, &steady, 16_000_000), 1_000_000);
         // Arithmetic that would overflow asks for the most.
         let huge = Window { tsc: 1, reference: u64::MAX, polls: 1, start_gap: u64::MAX, end_gap: u64::MAX };
         assert_eq!(stretched_for_gaps(1, &huge, 77), 77);
@@ -1376,6 +1380,8 @@ mod tests {
         assert_eq!(verdict(10_000, TSC_TOLERANCE_PPM, 20), Verdict::Retook, "at the tolerance");
         assert_eq!(verdict(10_001, TSC_TOLERANCE_PPM, 20), Verdict::Imprecise);
         assert_eq!(verdict(10_001, TSC_TOLERANCE_PPM, 0), Verdict::Imprecise, "past it even without retakes");
+        assert_eq!(verdict(20_000, TIMER_TOLERANCE_PPM, 20), Verdict::Retook, "at the timer's tolerance");
+        assert_eq!(verdict(20_001, TIMER_TOLERANCE_PPM, 20), Verdict::Imprecise);
         assert_eq!(verdict(999_999, TIMER_TOLERANCE_PPM, 20), Verdict::Imprecise);
         assert_eq!(verdict(NO_INFORMATION_PPM, TIMER_TOLERANCE_PPM, 20), Verdict::Unusable);
         assert_eq!(verdict(u64::MAX, TIMER_TOLERANCE_PPM, 0), Verdict::Unusable);
@@ -1407,6 +1413,9 @@ mod tests {
         // The floor: never held tighter than it.
         assert!(within_bounds(1_009_000_000, 1_000_000_000, 100, 100, 10_000));
         assert!(!within_bounds(1_011_000_000, 1_000_000_000, 100, 100, 10_000));
+        // 3% apart: too far for small bounds, fine when theirs add up to it.
+        assert!(!within_bounds(1_030_000_000, 1_000_000_000, 100, 100, 10_000));
+        assert!(within_bounds(1_030_000_000, 1_000_000_000, 15_000, 15_000, 0));
         // A measurement with no bound can't be compared, whatever the floor.
         assert!(!within_bounds(1_000_000_000, 1_000_000_000, NO_INFORMATION_PPM, 0, 20_000));
         assert!(!within_bounds(1_000_000_000, 1_000_000_000, 0, u64::MAX, 20_000));
@@ -1417,7 +1426,7 @@ mod tests {
         assert_eq!(parse_stall("6000"), Some(Stall { end: 6_000, start: 0 }));
         assert_eq!(parse_stall("0,3000000"), Some(Stall { end: 0, start: 3_000_000 }));
         assert_eq!(parse_stall("10000000"), Some(Stall { end: MOST_STALL_PPM, start: 0 }));
-        for bad in ["", "x", "1,", ",1", "1,2,3", "-1", "10000001", "0,10000001", "1.5"] {
+        for bad in ["", "x", "abc", "1,", ",1", "1,2,3", "-1", "10000001", "0,10000001", "1.5"] {
             assert_eq!(parse_stall(bad), None, "{bad:?}");
         }
     }
