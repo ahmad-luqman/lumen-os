@@ -345,7 +345,7 @@ crate::ktest!(
 );
 
 /// The screen shells' widest line, if there is a terminal and a keyboard.
-fn screen_line_width() -> Result<usize, &'static str> {
+pub(super) fn screen_line_width() -> Result<usize, &'static str> {
     let cols = crate::term::status().ok_or("no terminal")?.cols;
     if keyboard::stats().result != Some(Ok(())) {
         return Err("no keyboard");
@@ -475,11 +475,11 @@ impl Screen {
     /// brings its view back to the bottom and is the editor's key.
     fn take(&self, key: keyboard::Key) -> Option<Key> {
         match key {
-            keyboard::Key::Raw { code: KeyCode::PageUp, shift: true, .. } => {
+            keyboard::Key::Raw { code: KeyCode::PageUp, mods } if mods.is_shifted() => {
                 crate::term::scroll_half_pages(self.vt, 1);
                 None
             }
-            keyboard::Key::Raw { code: KeyCode::PageDown, shift: true, .. } => {
+            keyboard::Key::Raw { code: KeyCode::PageDown, mods } if mods.is_shifted() => {
                 crate::term::scroll_half_pages(self.vt, -1);
                 None
             }
@@ -577,12 +577,12 @@ impl Console for Captured {
 /// The line editor's key for a key from the keyboard, if it takes one:
 /// `lumen_shell::Key::from_press`, the mapping terminal windows share
 /// (ARCHITECTURE section 7), a character as its text and any other key as
-/// its code.
+/// its code with its modifiers.
 fn screen_key(key: keyboard::Key) -> Option<Key> {
     use keyboard::Key as K;
     match key {
         K::Char(c) => Key::from_press(Some(c), None, lumen_input::Mods::NONE),
-        K::Raw { code, .. } => Key::from_press(None, Some(code), lumen_input::Mods::NONE),
+        K::Raw { code, mods } => Key::from_press(None, Some(code), mods),
     }
 }
 
@@ -590,7 +590,7 @@ crate::ktest!(
     fn keyboard_keys_reach_the_line_editor() {
         use crate::kassert_eq;
         use keyboard::Key as K;
-        let raw = |code| K::Raw { code, shift: false, alt: false };
+        let raw = |code| K::Raw { code, mods: lumen_input::Mods::NONE };
         let cases = [
             (K::Char('a'), Some(Key::Char('a'))),
             (K::Char('é'), Some(Key::Char('é'))),
@@ -664,7 +664,7 @@ crate::ktest!(
         }
         let second = Screen { vt: 1 };
         kassert_eq!(second.vt(), Some(1));
-        let page_up = keyboard::Key::Raw { code: KeyCode::PageUp, shift: true, alt: false };
+        let page_up = keyboard::Key::Raw { code: KeyCode::PageUp, mods: lumen_input::Mods::NONE.with_shift() };
         kassert_eq!(second.take(page_up), None);
         let views = || term::view_offset(0).zip(term::view_offset(1)).ok_or("no terminal");
         let (first, scrolled) = views()?;

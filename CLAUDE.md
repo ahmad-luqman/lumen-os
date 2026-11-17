@@ -247,7 +247,8 @@ own PR that updates that doc first.
   missed), `PointerEvent` (with `AfterOverrun` marking frames that may
   follow a loss at the device), `KeyEvent`/`KeyAction`/`Mods` from set 1
   bytes (`KeyDecoder` over `pc-keyboard`: one press per key, agreeing with
-  `Presses`) (host-tested).
+  `Presses` wherever pc-keyboard refuses no byte, one listed exception;
+  `AfterDrop` marks the first event after dropped bytes) (host-tested).
 - `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, the
   page-table format and mapper (host-tested, incl. a model comparison), the
   window tokens that confine `paging::map`, and the kernel-stack layout and

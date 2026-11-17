@@ -252,32 +252,28 @@ crate::ktest!(
     fn records_come_from_commands_with_the_arguments_they_take() {
         // `mouse events` and `kbd events [n]` give the rings' records in a
         // pipeline; a bad count says the usage and ends it; `mouse hold`
-        // and `mouse release` still run as commands (`None`).
+        // and `mouse release` still run as commands (`None`). Without a
+        // tablet (the ktest machine has none) `mouse events` says so as
+        // `mouse` does; with no screen shell running (none in the test
+        // kernel) `kbd events` first says nothing fills its ring.
         use crate::{kassert, kassert_eq};
         let s = |w: &[&str]| w.iter().map(|w| alloc::string::String::from(*w)).collect::<Vec<_>>();
         let make = |name| sysinfo::records(name).expect("a records command");
         kassert!(make("mouse")(&s(&["hold"])).is_none() && make("mouse")(&s(&["release"])).is_none());
         kassert!(make("kbd")(&[]).is_none());
-        kassert!(matches!(make("mouse")(&s(&["events"])), Some(Ok(_))));
         kassert!(matches!(make("kbd")(&s(&["events", "3"])), Some(Ok(_))));
         kassert_eq!(run_line("kbd events 0 | count", &[]).0.as_str(), "usage: kbd events [n]\n");
-        kassert_eq!(run_line("mouse events x | count", &[]).0.as_str(), "usage: mouse events [n]\n");
-        // The key ring's newest events, through the filters: one pushed
-        // here is the last row.
-        let pressed = lumen_input::KeyEvent {
-            code: lumen_input::KeyCode::F12,
-            action: lumen_input::KeyAction::Press { text: None },
-            mods: lumen_input::Mods::NONE,
-        };
-        let seq = crate::input::KEYS.push(pressed);
-        let (text, ..) = run_line("kbd events 1 | select seq code action text mods", &[]);
-        kassert_eq!(
-            text,
-            alloc::format!(
-                "  seq  code        action   text    mods\n  {:>3}  F12         press    -       -\n",
-                seq.get()
-            )
-        );
+        kassert_eq!(run_line("kbd events 1 2", &[]).0.as_str(), "usage: kbd events [n]\n");
+        let no_tablet = "mouse: no tablet (QEMU: -device virtio-tablet-pci)\n";
+        kassert!(crate::mouse::status().is_none());
+        kassert_eq!(run_line("mouse events | count", &[]).0.as_str(), no_tablet);
+        kassert_eq!(run_line("mouse events 3", &[]).0.as_str(), no_tablet);
+        kassert_eq!(crate::vt::readers(), 0);
+        let note = "kbd: key events are decoded by the screen shells; none run (none started)\n";
+        let (text, ..) = run_line("kbd events | count", &[]);
+        kassert_eq!(text, alloc::format!("{note}{}\n", crate::input::KEYS.recent(16).len()));
+        let (text, ..) = run_line("kbd events", &[]);
+        kassert!(text.starts_with(note) && text.lines().nth(1).is_some_and(|h| h.trim_start().starts_with("seq")));
         Ok(())
     }
 );

@@ -60,15 +60,16 @@ pub enum Key {
 
 impl Key {
     /// The line editor's key for a key press, if it takes one: from the
-    /// press's text first (`pc-keyboard` makes Enter `\n`, Backspace
-    /// U+0008, Delete U+007F, Tab `\t`, Escape U+001B and Ctrl with a
-    /// letter U+0001 to U+001A; a printable character is itself), else from
-    /// its key code (the arrows, Home, End). The one mapping text mode and
-    /// terminal windows share (ARCHITECTURE section 7): text mode passes a
-    /// `Char(c)` as `(Some(c), None, ..)` and a raw code as `(None,
-    /// Some(code), ..)`; a terminal window a key event press's text and
-    /// code. `mods` are the modifiers with the press (no key takes them
-    /// yet).
+    /// press's text if it has one (`pc-keyboard` makes Enter `\n`,
+    /// Backspace U+0008, Delete U+007F, Tab `\t`, Escape U+001B and Ctrl
+    /// with a letter U+0001 to U+001A; a printable character is itself;
+    /// other control characters make nothing), else from its key code (the
+    /// arrows, Home, End). The one mapping text mode and terminal windows
+    /// (with #155) share (ARCHITECTURE section 7): text mode passes a
+    /// `Char(c)` as `(Some(c), None, ..)` and a raw key as `(None,
+    /// Some(code), mods)`; a terminal window a key event press's text, code
+    /// and modifiers. `mods` are the modifiers with the press (no key takes
+    /// them yet).
     pub fn from_press(text: Option<char>, code: Option<KeyCode>, mods: Mods) -> Option<Key> {
         let _ = mods;
         if let Some(c) = text {

@@ -12,15 +12,20 @@
 //!
 //! - `RAlt2`, the fake shift QEMU sends around Print Screen (`E0 2A`, `E0
 //!   AA`), is not pushed;
-//! - Pause (`E1 1D 45 E1 9D C5`) is pushed as one press of
-//!   `KeyCode::PauseBreak` with no release: its pieces (`RControl2`, the
-//!   `NumpadLock` press with it held, and both releases) are not;
+//! - Pause (`E1 1D 45 E1 9D C5`, nothing when let go) is pushed as one
+//!   press of `KeyCode::PauseBreak` and its release right after, so no
+//!   reader thinks it held: its pieces (`RControl2`, the `NumpadLock` press
+//!   with it held, and both releases) are not pushed;
 //! - Ctrl+Pause sends `E0 46` (`E0 C6` released), which `pc-keyboard`
-//!   0.9.0 doesn't map: the decoder takes it before `pc-keyboard` sees it,
-//!   as one press of `KeyCode::PauseBreak` (its release not pushed);
-//! - a `KeyState::SingleShot` key is pushed as a press then a release.
+//!   0.9.0 doesn't map: its refusal of the `46` after an `E0` is taken as
+//!   Pause instead (a press and a release; its own release, `E0 C6`,
+//!   swallowed), so neither counts as undecoded;
+//! - a `KeyState::SingleShot` key would be pushed as a press then a
+//!   release (unreachable with set 1, which makes none).
 //!
-//! Typematic repeat shows as repeated presses with no release between.
+//! Typematic repeat shows as repeated presses with no release between. The
+//! kernel marks the first key event decoded after its byte queue dropped
+//! bytes ([`KeyEvent::after_drop`], [`AfterDrop`]).
 
 pub use pc_keyboard::KeyCode;
 use pc_keyboard::{DecodedKey, HandleControl, KeyState, KeyboardLayout, Modifiers, PS2Keyboard, ScancodeSet1};
@@ -45,6 +50,10 @@ pub struct KeyEvent {
     pub action: KeyAction,
     /// The modifier state after this event.
     pub mods: Mods,
+    /// Bytes were dropped before this event (the keyboard's queue was full:
+    /// [`AfterDrop`]): a release may be missing, so a reader treats it as a
+    /// gap (the desktop sends `Lost`).
+    pub after_drop: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +115,37 @@ impl Mods {
     pub const fn numlock(self) -> bool {
         self.has(Self::NUMLOCK)
     }
+
+    /// These modifiers with left Shift held too (for tests and other
+    /// crates building a state without `pc-keyboard`).
+    pub const fn with_shift(self) -> Mods {
+        Mods(self.0 | Self::LSHIFT)
+    }
+
+    /// With left Ctrl held too.
+    pub const fn with_ctrl(self) -> Mods {
+        Mods(self.0 | Self::LCTRL)
+    }
+
+    /// With left Alt held too.
+    pub const fn with_alt(self) -> Mods {
+        Mods(self.0 | Self::LALT)
+    }
+
+    /// With right Alt (AltGr) held too.
+    pub const fn with_altgr(self) -> Mods {
+        Mods(self.0 | Self::RALT)
+    }
+
+    /// With Caps Lock on too.
+    pub const fn with_capslock(self) -> Mods {
+        Mods(self.0 | Self::CAPSLOCK)
+    }
+
+    /// With Num Lock on too.
+    pub const fn with_numlock(self) -> Mods {
+        Mods(self.0 | Self::NUMLOCK)
+    }
 }
 
 impl From<&Modifiers> for Mods {
@@ -131,6 +171,30 @@ pub enum InputEvent {
     Pointer(PointerEvent),
 }
 
+/// Marks the first key event after the keyboard's byte queue dropped
+/// bytes ([`KeyEvent::after_drop`]): the kernel gives it the queue's drop
+/// count as each event is decoded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AfterDrop {
+    /// The drop count the last event saw.
+    seen: u64,
+}
+
+impl AfterDrop {
+    /// Starting from the queue's drop count now (drops before don't mark).
+    pub const fn new(dropped: u64) -> Self {
+        Self { seen: dropped }
+    }
+
+    /// Whether an event decoded now, with the queue's drop count at
+    /// `dropped`, comes after a drop the last one didn't see.
+    pub fn mark(&mut self, dropped: u64) -> bool {
+        let after = dropped != self.seen;
+        self.seen = dropped;
+        after
+    }
+}
+
 /// The extended-key prefix in set 1.
 const E0: u8 = 0xE0;
 /// Ctrl+Pause's code after `E0` (`0xC6` released).
@@ -139,9 +203,9 @@ const CTRL_PAUSE: u8 = 0x46;
 /// Scancode set 1 bytes into key events (see the module doc).
 pub struct KeyDecoder<L: KeyboardLayout> {
     keyboard: PS2Keyboard<L, ScancodeSet1>,
-    /// An `E0` held back from `pc-keyboard`: Ctrl+Pause's (`E0 46`) or
-    /// any other extended key's, which the next byte tells.
-    held_e0: bool,
+    /// The last byte was an `E0` that started an extended key (so a refused
+    /// `46` or `C6` next is Ctrl+Pause's).
+    after_e0: bool,
     /// A Pause press was pushed: its `NumpadLock` release, which comes
     /// after `RControl2`'s, isn't.
     pause_release_due: bool,
@@ -151,7 +215,7 @@ impl<L: KeyboardLayout> KeyDecoder<L> {
     pub const fn new(layout: L, handle_ctrl: HandleControl) -> Self {
         Self {
             keyboard: PS2Keyboard::new(ScancodeSet1::new(), layout, handle_ctrl),
-            held_e0: false,
+            after_e0: false,
             pause_release_due: false,
         }
     }
@@ -162,34 +226,34 @@ impl<L: KeyboardLayout> KeyDecoder<L> {
     }
 
     /// Feed one byte: `push` gets each key event it finishes (none, one, or
-    /// two for a single-shot key); a press also comes back as
-    /// `pc-keyboard`'s decoding of it (a character, or a raw key code), as
-    /// the terminals take keys. An error is a byte `pc-keyboard` refused.
+    /// two: Pause's press and release), each with `after_drop` clear; a
+    /// press also comes back as `pc-keyboard`'s decoding of it (a
+    /// character, or a raw key code), as the terminals take keys. An error
+    /// is a byte `pc-keyboard` refused.
     pub fn add_byte(
         &mut self,
         byte: u8,
         mut push: impl FnMut(KeyEvent),
     ) -> Result<Option<DecodedKey>, pc_keyboard::Error> {
-        if self.held_e0 {
-            self.held_e0 = false;
-            match byte {
-                CTRL_PAUSE => {
-                    self.pause_release_due = false;
-                    push(self.event(KeyCode::PauseBreak, KeyAction::Press { text: None }));
-                    return Ok(Some(DecodedKey::RawKey(KeyCode::PauseBreak)));
-                }
-                b if b == CTRL_PAUSE | 0x80 => return Ok(None),
-                _ => {
-                    // Not Ctrl+Pause: `pc-keyboard` gets the prefix after all.
-                    let none = self.keyboard.add_byte(E0)?;
-                    debug_assert!(none.is_none(), "E0 only starts a key");
-                }
+        let after_e0 = core::mem::replace(&mut self.after_e0, false);
+        let raw = match self.keyboard.add_byte(byte) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => {
+                // (`pc-keyboard` returns to its start before it looks up an
+                // extended code, so an `E0` that returned nothing started
+                // one.)
+                self.after_e0 = byte == E0;
+                return Ok(None);
             }
-        } else if byte == E0 {
-            self.held_e0 = true;
-            return Ok(None);
-        }
-        let Some(raw) = self.keyboard.add_byte(byte)? else { return Ok(None) };
+            // Ctrl+Pause: `pc-keyboard` 0.9.0 has no code for `E0 46`.
+            Err(_) if after_e0 && byte == CTRL_PAUSE => {
+                self.pause_release_due = false;
+                self.push_pause(&mut push);
+                return Ok(Some(DecodedKey::RawKey(KeyCode::PauseBreak)));
+            }
+            Err(_) if after_e0 && byte == CTRL_PAUSE | 0x80 => return Ok(None),
+            Err(e) => return Err(e),
+        };
         // Pause: `NumpadLock` pressed with `RControl2` held.
         let pause = raw.code == KeyCode::NumpadLock && raw.state == KeyState::Down && self.modifiers().rctrl2;
         let decoded = self.keyboard.process_keyevent(raw.clone());
@@ -202,10 +266,11 @@ impl<L: KeyboardLayout> KeyDecoder<L> {
             (KeyCode::NumpadLock, KeyState::Up) if releasing_pause => {}
             (_, KeyState::Down) if pause => {
                 self.pause_release_due = true;
-                push(self.event(KeyCode::PauseBreak, KeyAction::Press { text: None }));
+                self.push_pause(&mut push);
             }
             (code, KeyState::Down) => push(self.event(code, KeyAction::Press { text: text_of(decoded) })),
             (code, KeyState::Up) => push(self.event(code, KeyAction::Release)),
+            // (Unreachable with set 1, which makes no single-shot key.)
             (code, KeyState::SingleShot) => {
                 push(self.event(code, KeyAction::Press { text: text_of(decoded) }));
                 push(self.event(code, KeyAction::Release));
@@ -218,7 +283,13 @@ impl<L: KeyboardLayout> KeyDecoder<L> {
     }
 
     fn event(&self, code: KeyCode, action: KeyAction) -> KeyEvent {
-        KeyEvent { code, action, mods: Mods::from(self.modifiers()) }
+        KeyEvent { code, action, mods: Mods::from(self.modifiers()), after_drop: false }
+    }
+
+    /// Pause: a press and, at once, its release (the keyboard sends none).
+    fn push_pause(&self, push: &mut impl FnMut(KeyEvent)) {
+        push(self.event(KeyCode::PauseBreak, KeyAction::Press { text: None }));
+        push(self.event(KeyCode::PauseBreak, KeyAction::Release));
     }
 }
 
@@ -255,11 +326,11 @@ mod tests {
     }
 
     fn press(code: KeyCode, text: Option<char>, mods: Mods) -> KeyEvent {
-        KeyEvent { code, action: KeyAction::Press { text }, mods }
+        KeyEvent { code, action: KeyAction::Press { text }, mods, after_drop: false }
     }
 
     fn release(code: KeyCode, mods: Mods) -> KeyEvent {
-        KeyEvent { code, action: KeyAction::Release, mods }
+        KeyEvent { code, action: KeyAction::Release, mods, after_drop: false }
     }
 
     fn mods(m: Modifiers) -> Mods {
@@ -303,10 +374,15 @@ mod tests {
     }
 
     #[test]
-    fn pause_is_one_press() {
+    fn pause_is_one_press_and_its_release() {
         let (got, refused) = events(&[0xE1, 0x1D, 0x45, 0xE1, 0x9D, 0xC5]);
         assert_eq!(refused, 0);
-        assert_eq!(got, [press(KeyCode::PauseBreak, None, BASE)]);
+        let pause = [press(KeyCode::PauseBreak, None, BASE), release(KeyCode::PauseBreak, BASE)];
+        assert_eq!(got, pause);
+        // The terminals get it as a raw key, as before.
+        let mut d = us();
+        let returned: Vec<_> = [0xE1, 0x1D, 0x45].iter().map(|&b| d.add_byte(b, |_| {})).collect();
+        assert_eq!(returned[2], Ok(Some(DecodedKey::RawKey(KeyCode::PauseBreak))));
         // Num Lock is untouched, and a later Num Lock press and release
         // are both pushed.
         let (got, _) = events(&[0xE1, 0x1D, 0x45, 0xE1, 0x9D, 0xC5, 0x45, 0xC5]);
@@ -315,6 +391,7 @@ mod tests {
             got,
             [
                 press(KeyCode::PauseBreak, None, BASE),
+                release(KeyCode::PauseBreak, BASE),
                 press(KeyCode::NumpadLock, None, Mods::NONE),
                 release(KeyCode::NumpadLock, Mods::NONE),
             ]
@@ -322,20 +399,86 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_pause_is_one_press() {
+    fn ctrl_pause_is_one_press_and_its_release() {
         // Ctrl held, then Pause: E0 46 (E0 C6 released), which pc-keyboard
         // refuses on its own.
         let (got, refused) = events(&[0x1D, 0xE0, 0x46, 0xE0, 0xC6, 0x9D]);
         assert_eq!(refused, 0);
-        let ctrl = Mods(Mods::NUMLOCK | Mods::LCTRL);
+        let ctrl = BASE.with_ctrl();
         assert_eq!(
             got,
             [
                 press(KeyCode::LControl, None, ctrl),
                 press(KeyCode::PauseBreak, None, ctrl),
+                release(KeyCode::PauseBreak, ctrl),
                 release(KeyCode::LControl, BASE),
             ]
         );
+        // The terminals get a raw PauseBreak for the 46, nothing for C6.
+        let mut d = us();
+        assert_eq!(d.add_byte(0xE0, |_| {}), Ok(None));
+        assert_eq!(d.add_byte(0x46, |_| {}), Ok(Some(DecodedKey::RawKey(KeyCode::PauseBreak))));
+        assert_eq!(d.add_byte(0xE0, |_| {}), Ok(None));
+        assert_eq!(d.add_byte(0xC6, |_| {}), Ok(None));
+        // A 46 without the E0 is Num Lock's neighbour, the Scroll Lock key.
+        assert_eq!(events(&[0x46]).0, [press(KeyCode::ScrollLock, None, BASE)]);
+    }
+
+    /// What bare `pc-keyboard` makes of `bytes`: each event's code and
+    /// whether it is a press, and how many bytes it refused.
+    fn bare(bytes: &[u8]) -> (Vec<(KeyCode, bool)>, usize) {
+        let mut kb = PS2Keyboard::new(ScancodeSet1::new(), Us104Key, HandleControl::MapLettersToUnicode);
+        let (mut out, mut refused) = (Vec::new(), 0);
+        for &b in bytes {
+            match kb.add_byte(b) {
+                Ok(Some(e)) => out.push((e.code, e.state == KeyState::Down)),
+                Ok(None) => {}
+                Err(_) => refused += 1,
+            }
+        }
+        (out, refused)
+    }
+
+    #[test]
+    fn an_e0_after_a_stray_e1_loses_no_key() {
+        // pc-keyboard refuses an E0 met in the middle of an E1 sequence and
+        // is back at its start: the bytes after it decode exactly as bare
+        // pc-keyboard decodes them, every press with its release (holding
+        // the E0 back once swallowed the next byte here).
+        for bytes in [&[0xE1, 0xE0, 0x1E, 0x9E][..], &[0xE1, 0xE0, 0x4B, 0xE0, 0xCB], &[0xE1, 0xE0, 0xE0, 0x1D]] {
+            let (got, refused) = events(bytes);
+            let ours: Vec<(KeyCode, bool)> =
+                got.iter().map(|e| (e.code, matches!(e.action, KeyAction::Press { .. }))).collect();
+            assert_eq!((ours, refused), bare(bytes), "{bytes:02x?}");
+        }
+        let a = [press(KeyCode::A, Some('a'), BASE), release(KeyCode::A, BASE)];
+        assert_eq!(events(&[0xE1, 0xE0, 0x1E, 0x9E]), (a.to_vec(), 1));
+    }
+
+    #[test]
+    fn after_drop_marks_the_first_event_after_a_drop() {
+        let mut marks = AfterDrop::new(3);
+        assert!(!marks.mark(3));
+        assert!(marks.mark(4));
+        assert!(!marks.mark(4));
+        assert!(marks.mark(9));
+        assert!(!marks.mark(9));
+        // Events the decoder pushes leave it clear: the kernel sets it.
+        assert!(events(&[0x1E, 0x9E]).0.iter().all(|e| !e.after_drop));
+    }
+
+    #[test]
+    fn mods_builders_set_their_own_state() {
+        let n = Mods::NONE;
+        assert!(n.with_shift().is_shifted() && !n.with_shift().is_ctrl());
+        assert!(n.with_ctrl().is_ctrl() && !n.with_ctrl().is_alt());
+        assert!(n.with_alt().is_alt() && !n.with_alt().is_altgr());
+        assert!(n.with_altgr().is_altgr() && n.with_altgr().is_alt());
+        assert!(n.with_capslock().capslock() && !n.with_capslock().numlock());
+        assert!(n.with_numlock().numlock() && !n.with_numlock().is_shifted());
+        // The same bits as pc-keyboard's left keys.
+        let m = Modifiers { lshift: true, lctrl: true, numlock: true, ..Default::default() };
+        assert_eq!(Mods::from(&m), n.with_shift().with_ctrl().with_numlock());
     }
 
     #[test]
@@ -434,6 +577,9 @@ mod tests {
         corpus.push(vec![0x1D, 0xE0, 0x46, 0xE0, 0xC6, 0x9D]); // Ctrl+Pause
         corpus.push(vec![0x1E, 0x1E, 0x1E, 0x9E]); // typematic repeat
         corpus.push(vec![0x2A, 0x1E, 0x9E, 0xAA]); // Shift+a
+        corpus.push(vec![0xE1, 0xE0, 0x1E, 0x9E]); // a stray E1, then E0
+        corpus.push(vec![0xE1, 0xE0, 0x4B, 0xE0, 0xCB]);
+        corpus.push(vec![0xE1, 0xE0, 0xE0, 0x1D]);
         // The known exceptions, where both decode without error but count
         // differently: Pause cut off after its first byte past E1 (Presses
         // counts at 0x1D, the decoder at 0x45, where pc-keyboard tells

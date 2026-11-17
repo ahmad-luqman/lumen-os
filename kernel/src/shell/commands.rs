@@ -409,38 +409,40 @@ fn ticks(ctx: &mut Ctx<'_>, _: &[String]) {
 fn kbd(ctx: &mut Ctx<'_>, args: &[String]) {
     match args {
         [] => {}
-        [a, ..] if a == "events" => {
-            let records = sysinfo::records("kbd").and_then(|make| make(args));
-            return sysinfo::print_table(ctx, records.unwrap_or_else(|| Err(String::from("usage: kbd events [n]"))));
+        [a, rest @ ..] if a == "events" => {
+            let table = sysinfo::kbd_events(rest);
+            // (The note only above a table: a usage line or a missing
+            // keyboard says it all.)
+            if let (Ok(_), Some(note)) = (&table, sysinfo::records_note("kbd")) {
+                let _ = writeln!(ctx.out, "{note}");
+            }
+            return sysinfo::print_table(ctx, table);
         }
         _ => return ctx.fail("usage: kbd [events [n]]"),
     }
+    if let Some(problem) = sysinfo::kbd_problem() {
+        let _ = writeln!(ctx.out, "{problem}");
+        return;
+    }
     let k = crate::keyboard::stats();
-    let newest = lumen_input::InputDevice::newest(&crate::input::KEYS).get();
-    let out = &mut *ctx.out;
-    let _ = match (k.result, k.route) {
-        (Some(Ok(())), Some(route)) => writeln!(
-            out,
-            "kbd: layout {}, IRQ {} (vector {:#x}), {} interrupts, {} bytes, {} presses, \
-             {} held, {} dropped, {} undecoded, {} line errors, {} skipped at setup, newest key event {newest}",
-            k.layout,
-            route.irq(),
-            route.vector(),
-            k.irqs,
-            k.bytes,
-            k.presses,
-            k.held,
-            k.dropped,
-            k.undecoded,
-            k.line_errors,
-            k.skipped
-        ),
-        (Some(Err(e)), Some(route)) => {
-            writeln!(out, "kbd: no keyboard ({e}); IRQ {} routed (vector {:#x}), masked", route.irq(), route.vector())
-        }
-        (Some(Err(e)), None) => writeln!(out, "kbd: no keyboard ({e})"),
-        _ => writeln!(out, "kbd: not set up"),
-    };
+    let Some(route) = k.route else { return };
+    let _ = writeln!(
+        ctx.out,
+        "kbd: layout {}, IRQ {} (vector {:#x}), {} interrupts, {} bytes, {} presses, {} held, {} dropped, {} \
+         undecoded, {} line errors, {} skipped at setup, newest key event {}",
+        k.layout,
+        route.irq(),
+        route.vector(),
+        k.irqs,
+        k.bytes,
+        k.presses,
+        k.held,
+        k.dropped,
+        k.undecoded,
+        k.line_errors,
+        k.skipped,
+        crate::input::KEYS.newest().get()
+    );
 }
 
 /// `term`: the shown virtual terminal; `term text`: its rows, each after a

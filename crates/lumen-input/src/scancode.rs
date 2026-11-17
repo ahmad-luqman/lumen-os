@@ -23,10 +23,12 @@
 //! release never came from one whose release did ([`Presses::held`]).
 //!
 //! The counting is syntactic: every make counts, including bytes the
-//! kernel's decoder (`pc-keyboard`) then rejects (it counts those as
-//! `undecoded`; Ctrl+Pause's `E0 46` is one), and Pause completes on its
-//! first byte after `E1`, not where the decoder completes it. So `presses`
-//! matches the presses decoded only while `undecoded` stays flat.
+//! kernel's decoder (`pc-keyboard`, through [`crate::KeyDecoder`]) then
+//! rejects (it counts those as `undecoded`; Ctrl+Pause's `E0 46` is not
+//! one: the decoder takes it as Pause), and Pause completes on its first
+//! byte after `E1`, not where the decoder completes it. So `presses`
+//! matches the presses decoded only while `undecoded` stays flat (and but
+//! for a Pause cut off after its `E1 1D`).
 
 /// Counts the presses in set 1 bytes fed one at a time. The prefix seen so
 /// far is carried from byte to byte (and so from one interrupt to the

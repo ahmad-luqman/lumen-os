@@ -2603,14 +2603,18 @@ pub struct Reader<D: InputDevice + 'static> { device: &'static D, after: Seq, lo
 impl<D: InputDevice + 'static> Reader<D> {
     /// Starting after the device's newest event.
     pub fn from_now(device: &'static D) -> Reader<D>;
-    // (`next`: it is an `Iterator` of `D::Event`s; the next event,
-    // counting a gap's events in `lost`, `None` once caught up.)
-    /// Skip to after `seq` (never backwards): the desktop's cut (section
-    /// 11).
+    /// The next event with its number and the gap just before it (also
+    /// counted in `lost`); `None` once caught up.
+    pub fn read(&mut self) -> Option<Read<D::Event>>;
+    /// Skip to after `seq`, never backwards and never past the device's
+    /// newest (a number from another device's ring stops there; a
+    /// `debug_assert` catches it): the desktop's cut (section 11).
     pub fn skip_to(&mut self, seq: Seq);
     pub fn after(&self) -> Seq;
     pub fn lost(&self) -> u64;
 }
+/// One event a reader got.
+pub struct Read<E> { pub seq: Seq, pub lost_before: u64, pub event: E }
 
 /// A tablet frame, and whether frames may have been lost at the device
 /// before it.
@@ -2622,6 +2626,7 @@ pub struct KeyEvent {
     pub code: pc_keyboard::KeyCode, // the physical key
     pub action: KeyAction,
     pub mods: Mods,                 // after this event
+    pub after_drop: bool,           // the keyboard's queue dropped bytes before it
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyAction {
@@ -2658,7 +2663,8 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   nothing out, so several `Reader`s can read one ring. Once the desktop
   exists (#153), a pusher sets `desktop::PENDING` and calls
   `desktop::wake()` (section 11) after releasing the ring's lock; until
-  then nothing reads the rings but the shell.
+  then no `Reader` follows them (only the shell's `events` commands look
+  at the newest).
 - **Two kinds of loss, kept apart.** A gap in `Seq` means only that
   *this reader* fell behind the ring (counted in `Reader::lost`). Frames
   QEMU dropped at the device never reach the ring and leave no gap:
@@ -2676,7 +2682,10 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   separate frames (QEMU syncs after each call), so two events, each at its
   own position. A ring of 256 (QMP sends a frame every 0.7 to 3 ms, so a
   burst fills it in under a second; the compositor reads each time it
-  wakes).
+  wakes). A frame the device says it lost (`SYN_DROPPED`) isn't marked:
+  QEMU never sends one. When the tablet fails, a last frame at the last
+  position with every button released, marked `after_overrun`, ends a
+  reader's drag.
 - **Key events:** the keyboard's decoding pass (under `crate::vt`'s router
   lock, run by whichever reader wakes first, as today) pushes a `KeyEvent`
   for every key event `pc-keyboard` decodes, presses and releases, bare
@@ -2688,30 +2697,37 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   makes. pc-keyboard's pseudo-keys: `RAlt2` (the fake shift `E0 2A`/`E0
   AA` QEMU sends around Print Screen) is not pushed, and the other fake
   shift (`E0 36`) doesn't decode at all (counted as undecoded, as today);
-  Pause (`E1 1D 45 E1 9D C5`) is pushed as one press of
-  `KeyCode::PauseBreak` with no release, its pieces (`RControl2`, that
-  `NumpadLock` press and both releases) not pushed; Ctrl+Pause sends `E0
-  46` (`E0 C6` released), which `pc-keyboard` 0.9.0 doesn't map: the
-  decoder takes it before `pc-keyboard` sees it, as one press of
-  `KeyCode::PauseBreak` (its release not pushed; the terminals get it as a
-  raw `PauseBreak`, which no shell takes, where it used to be counted
-  undecoded); a `KeyState::SingleShot` key is pushed as a press then a
-  release. The decoding is `lumen_input::KeyDecoder` (host-tested): so one
-  key is one press, as `kbd`'s `presses` counts it, wherever the decoder
-  refuses nothing (a host test feeds both one corpus; the one exception, a
-  Pause cut off after its `E1 1D`, is listed there). Typematic repeat shows up as
-  repeated presses with no release between. A ring of 128 key events, the
+  Pause (`E1 1D 45 E1 9D C5`; nothing when let go) is pushed as one press
+  of `KeyCode::PauseBreak` and its release at once (so no reader thinks it
+  held), its pieces (`RControl2`, that `NumpadLock` press and both
+  releases) not pushed; Ctrl+Pause sends `E0 46` (`E0 C6` released),
+  which `pc-keyboard` 0.9.0 doesn't map: every `E0` goes to `pc-keyboard`
+  as it comes, and its refusal of a `46` right after one is taken as Pause
+  instead (the same press and release; `E0 C6` swallowed; the terminals
+  get a raw `PauseBreak`, which no shell takes, where it used to be counted
+  undecoded); a `KeyState::SingleShot` key would be pushed as a press then
+  a release (unreachable with set 1, which makes none). The decoding is
+  `lumen_input::KeyDecoder` (host-tested): one key is one press, as
+  `kbd`'s `presses` counts it, wherever `pc-keyboard` refuses no byte (a
+  host test feeds both one corpus; the one exception, a Pause cut off after
+  its `E1 1D`, is listed there). Typematic repeat shows up as repeated
+  presses with no release between. The first key event decoded after the
+  keyboard's queue dropped bytes (full) is marked `after_drop`
+  (`lumen_input::AfterDrop`): a release may be missing, so a reader treats
+  it as a gap (the desktop sends `Lost`). A ring of 128 key events, the
   same size as a terminal's (but read, not taken: a full ring overwrites
   its oldest).
 - **One mapping to the line editor:** `lumen_shell::Key::from_press(text:
   Option<char>, code: Option<KeyCode>, mods: Mods) -> Option<Key>`
   (host-tested; `lumen-shell` gains `lumen-input`), moved out of
-  `shell::screen_key`: the text first (Enter, Backspace, Delete, Tab,
-  Ctrl with a letter, printable characters), else the code (the arrows,
-  Home, End). Text mode calls it from `crate::keyboard::Key` (`Char(c)`
-  as `(Some(c), None, ..)`, `Raw { code, shift, alt }` as `(None,
-  Some(code), ..)` with those modifiers), and terminal windows (#155)
-  from a `KeyEvent` press's text and code, so they need no second decoder.
+  `shell::screen_key`: from the text if the press has one (Enter,
+  Backspace, Delete, Tab, Ctrl with a letter, printable characters; other
+  control characters nothing), else from the code (the arrows, Home, End).
+  Text mode calls it from `crate::keyboard::Key` (`Char(c)` as `(Some(c),
+  None, ..)`, `Raw { code, mods }` as `(None, Some(code), mods)`: a raw
+  key carries the modifiers its key event does), and terminal windows
+  (with #155) from a `KeyEvent` press's text, code and modifiers, so they
+  need no second decoder.
   Toolkit text fields (#156) insert only a press's non-control `text`.
 - **Order across devices:** the compositor merges the two rings in the
   order it reads them. Events carry no time stamps in M4, so a key press
@@ -2722,7 +2738,10 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   of `kbd`'s line), and
   `mouse events [n]` and `kbd events [n]` print the ring's newest `n`
   events (default 16) as records (`seq`, then `x`, `y`, `buttons`,
-  `after_overrun`; or `code`, `action`, `text`, `mods`). (#149's confirming
+  `after_overrun`; or `code`, `action`, `text`, `mods`, `after_drop`);
+  without the device they say what `mouse` or `kbd` says, and with no
+  screen shell running (they run the decoding pass) `kbd events` says so
+  above its table. (#149's confirming
   steps, `lumen_harness.gui`, don't need the rings: a pointer step waits
   for exactly its frame in `mouse`'s count and for the `mouse` thread's
   state to show its effect (the position, or the button held or
@@ -2730,7 +2749,8 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   as the keyboard's section above says.)
 - **Text mode is unchanged:** the cursor follows the newest state
   (`term::move_pointer`), keys reach the shown terminal's shell through
-  `crate::vt`; the rings fill and wrap with no reader.
+  `crate::vt`; no `Reader` follows the rings (they fill and wrap): only the
+  shell's `mouse events` and `kbd events` look at the newest.
 
 **virtio first** (rng, input, sound in M3; blk, 9p in M6; net in M7) under
 QEMU; real-hardware drivers (NVMe, AHCI, xHCI HID, a common NIC) in M12

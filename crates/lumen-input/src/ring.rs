@@ -10,9 +10,10 @@
 //!   rings behind a lock).
 //! - [`Reader`]: one reader's place in one device's ring; a gap in the
 //!   numbers (the ring overwrote events before this reader got to them) is
-//!   counted in [`Reader::lost`]. That is the only loss a gap means:
-//!   frames QEMU dropped at the device never reach the ring
-//!   ([`AfterOverrun`] marks the frames after them instead).
+//!   counted in [`Reader::lost`] and given with the event after it
+//!   ([`Read::lost_before`]). That is the only loss a gap means: frames
+//!   QEMU dropped at the device never reach the ring
+//!   ([`crate::AfterOverrun`] marks the frames after them instead).
 
 /// An event's number on its device: 1 for the first, never reused in a
 /// boot. [`Seq::ZERO`] is "before the first event".
@@ -56,10 +57,29 @@ impl<D: InputDevice + 'static> Reader<D> {
         Reader { device, after: device.newest(), lost: 0 }
     }
 
-    /// Skip to after `seq`, never backwards (the desktop's cut, section
-    /// 11). Events skipped this way aren't counted as lost.
+    /// The next event, with its number and the events the ring
+    /// overwrote between it and the last one this reader got (also counted
+    /// in [`Reader::lost`]); `None` once it has caught up (a later event
+    /// makes it give more).
+    pub fn read(&mut self) -> Option<Read<D::Event>> {
+        let (seq, event) = self.device.next(self.after)?;
+        let lost_before = seq.0 - self.after.0 - 1;
+        self.lost += lost_before;
+        self.after = seq;
+        Some(Read { seq, lost_before, event })
+    }
+
+    /// Skip to after `seq`, never backwards and never past the device's
+    /// newest event (the desktop's cut, section 11; a number from another
+    /// device's ring, past this one's newest, is a bug: it stops at the
+    /// newest rather than make the reader wait for the ring to catch up).
+    /// Events skipped this way aren't counted as lost.
     pub fn skip_to(&mut self, seq: Seq) {
-        self.after = self.after.max(seq);
+        let newest = self.device.newest();
+        // (Not in this crate's host tests, which check the clamp itself.)
+        #[cfg(not(test))]
+        debug_assert!(seq <= newest, "skip_to {seq:?} past the device's newest {newest:?}");
+        self.after = self.after.max(seq.min(newest));
     }
 
     /// The number of the last event this reader got (or skipped to).
@@ -73,18 +93,13 @@ impl<D: InputDevice + 'static> Reader<D> {
     }
 }
 
-/// A reader is an iterator over its device's events: `next` gives the next
-/// event, counting a gap's events in [`Reader::lost`], and `None` when it
-/// has caught up (a later event makes it give more).
-impl<D: InputDevice + 'static> Iterator for Reader<D> {
-    type Item = D::Event;
-
-    fn next(&mut self) -> Option<D::Event> {
-        let (seq, event) = self.device.next(self.after)?;
-        self.lost += seq.0 - self.after.0 - 1;
-        self.after = seq;
-        Some(event)
-    }
+/// One event a [`Reader`] got: its number, the events the ring overwrote
+/// just before it (a gap this reader fell behind into), and the event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Read<E> {
+    pub seq: Seq,
+    pub lost_before: u64,
+    pub event: E,
 }
 
 /// The newest `N` events of one device, and the number the next one gets.
@@ -154,34 +169,6 @@ impl<E: Copy, const N: usize> Ring<E, N> {
     }
 }
 
-/// Marks the tablet's frames that may follow frames lost at the device
-/// (`PointerEvent::after_overrun`): every frame of a batch that counted as
-/// an overrun (`may_have_lost_frames`) except its first, and the first
-/// frame of the next batch that brings one (virtio re-posts each buffer as
-/// it is popped, so a frame can be dropped while the batch is still being
-/// read, i.e. anywhere after its first frame, or just after its last).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AfterOverrun {
-    /// The last batch with an overrun brought no frame after its loss yet.
-    carry: bool,
-}
-
-impl AfterOverrun {
-    pub const fn new() -> Self {
-        Self { carry: false }
-    }
-
-    /// Whether each of a batch's `frames` follows a possible loss, in
-    /// order, given whether the batch counted as an `overrun`; then
-    /// remembers the batch for the next one.
-    pub fn batch(&mut self, frames: usize, overrun: bool) -> impl Iterator<Item = bool> + use<> {
-        let carry = self.carry;
-        // A batch with no frame passes a loss on to the next frame.
-        self.carry = overrun || (carry && frames == 0);
-        (0..frames).map(move |i| if i == 0 { carry } else { overrun })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -208,6 +195,10 @@ mod tests {
 
     fn push<const N: usize>(d: &Device<N>, e: u32) -> Seq {
         d.0.lock().unwrap().push(e)
+    }
+
+    fn ev<const N: usize>(r: &mut Reader<Device<N>>) -> Option<u32> {
+        r.read().map(|read| read.event)
     }
 
     #[test]
@@ -257,16 +248,17 @@ mod tests {
         push(d, 1);
         let mut r = Reader::from_now(d);
         assert_eq!(r.after(), Seq(1));
-        assert_eq!(r.next(), None);
+        assert_eq!(ev(&mut r), None);
         for e in 2..=6 {
             push(d, e);
         }
-        // 2 and 3 were overwritten (the ring holds 4, 5, 6).
-        assert_eq!(r.next(), Some(4));
+        // 2 and 3 were overwritten (the ring holds 4, 5, 6): the read says
+        // so with the event it comes before.
+        assert_eq!(r.read(), Some(Read { seq: Seq(4), lost_before: 2, event: 4 }));
         assert_eq!(r.lost(), 2);
-        assert_eq!(r.next(), Some(5));
-        assert_eq!(r.next(), Some(6));
-        assert_eq!(r.next(), None);
+        assert_eq!(ev(&mut r), Some(5));
+        assert_eq!(ev(&mut r), Some(6));
+        assert_eq!(ev(&mut r), None);
         assert_eq!((r.after(), r.lost()), (Seq(6), 2));
     }
 
@@ -275,8 +267,8 @@ mod tests {
         let d = device::<8>();
         let (mut a, mut b) = (Reader::from_now(d), Reader::from_now(d));
         push(d, 7);
-        assert_eq!(a.next(), Some(7));
-        assert_eq!(b.next(), Some(7));
+        assert_eq!(ev(&mut a), Some(7));
+        assert_eq!(ev(&mut b), Some(7));
         assert_eq!((a.lost(), b.lost()), (0, 0));
     }
 
@@ -286,31 +278,26 @@ mod tests {
         let mut r = Reader::from_now(d);
         let seqs: Vec<Seq> = (0..5).map(|e| push(d, e)).collect();
         r.skip_to(seqs[2]);
-        assert_eq!(r.next(), Some(3));
+        assert_eq!(ev(&mut r), Some(3));
         r.skip_to(seqs[0]);
         assert_eq!(r.after(), seqs[3]);
-        assert_eq!(r.next(), Some(4));
+        assert_eq!(r.read(), Some(Read { seq: seqs[4], lost_before: 0, event: 4 }));
         assert_eq!(r.lost(), 0);
     }
 
     #[test]
-    fn after_overrun_marks_an_overrun_batch_after_its_first_and_the_next_batch_s_first() {
-        let mut marks = AfterOverrun::new();
-        let batch = |m: &mut AfterOverrun, frames, overrun| m.batch(frames, overrun).collect::<Vec<_>>();
-        assert_eq!(batch(&mut marks, 2, false), [false, false]);
-        assert_eq!(batch(&mut marks, 3, true), [false, true, true]);
-        assert_eq!(batch(&mut marks, 2, false), [true, false]);
-        assert_eq!(batch(&mut marks, 1, false), [false]);
-        // An overrun batch with no frame passes the mark on, across empty
-        // batches, to the next frame.
-        assert_eq!(batch(&mut marks, 0, true), Vec::<bool>::new());
-        assert_eq!(batch(&mut marks, 0, false), Vec::<bool>::new());
-        assert_eq!(batch(&mut marks, 2, false), [true, false]);
-        // Back-to-back overruns: the second's first frame follows the
-        // first's loss.
-        assert_eq!(batch(&mut marks, 2, true), [false, true]);
-        assert_eq!(batch(&mut marks, 2, true), [true, true]);
-        assert_eq!(batch(&mut marks, 1, false), [true]);
-        assert_eq!(batch(&mut marks, 1, false), [false]);
+    fn skip_to_stops_at_the_newest() {
+        // A number from another ring, past this one's newest (a bug, which
+        // a `debug_assert` catches outside these tests): the reader stops at
+        // the newest and still gets the next event pushed.
+        let other = device::<8>();
+        let far = (0..5).map(|e| push(other, e)).last().unwrap();
+        let d = device::<8>();
+        push(d, 10);
+        let mut r = Reader::from_now(d);
+        r.skip_to(far);
+        assert_eq!(r.after(), Seq(1));
+        push(d, 11);
+        assert_eq!(ev(&mut r), Some(11));
     }
 }

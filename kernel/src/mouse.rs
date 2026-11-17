@@ -88,7 +88,10 @@
 //!   the device before it (`lumen_input::AfterOverrun`: every frame of an
 //!   overrun batch but its first, and the next batch's first). So a press
 //!   and a release inside one batch are two events, each at its own
-//!   position; `mouse events` shows them.
+//!   position; `mouse events` shows them. A frame the device said it lost
+//!   (`SYN_DROPPED`, counted in `dropped`) isn't marked: QEMU never sends
+//!   one. When the tablet fails, a last frame with every button released
+//!   (marked) ends a reader's drag.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -640,8 +643,10 @@ fn mark_failed(why: Failure) {
 }
 
 /// The device stopped being ready (`FAILED`, `DEVICE_NEEDS_RESET`, or
-/// `DRIVER_OK` gone): publish it (no button pressed any more), drop the driver,
-/// say so, and mark the function failed.
+/// `DRIVER_OK` gone): publish it (no button pressed any more; for the
+/// desktop's ring a last frame at the last position with every button
+/// released, marked `after_overrun`, so a reader's drag ends), drop the
+/// driver, say so, and mark the function failed.
 fn fail(input: Input, status: StatusHandle, addr: PciAddr) {
     let (raw, st) = (status.raw(), status.get());
     let why = if st.contains(DeviceStatus::FAILED) {
@@ -652,6 +657,10 @@ fn fail(input: Input, status: StatusHandle, addr: PciAddr) {
         Failure::Stopped
     };
     mark_failed(why);
+    let last = BOUND.lock().as_ref().and_then(|b| b.state);
+    if let Some(state) = last {
+        crate::input::POINTER.push(PointerEvent { state, after_overrun: true });
+    }
     crate::term::hide_pointer();
     // (See the module doc for what dropping it does and leaks.)
     drop(input);

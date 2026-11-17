@@ -20,8 +20,8 @@
 //! - **Input devices as rings** ([`ring`], #151): a device keeps its
 //!   newest events numbered in order ([`Ring`], [`Seq`]); a [`Reader`] asks
 //!   for the first after the last it saw and counts a gap as lost
-//!   ([`InputDevice`]). [`AfterOverrun`] marks the tablet's frames that may
-//!   follow frames lost at the device.
+//!   ([`InputDevice`], [`Read`]). [`AfterOverrun`] (with the tablet)
+//!   marks the frames that may follow frames lost at the device.
 //! - **Desktop events** ([`keys`], #151): [`PointerEvent`], [`KeyEvent`]
 //!   (press or release, with the modifiers after it, [`Mods`]) and
 //!   [`InputEvent`]; [`KeyDecoder`] turns set 1 bytes into key events (one
@@ -36,10 +36,10 @@ pub mod scancode;
 pub mod tablet;
 
 pub use cursor::{Cursor, Surface};
-pub use keys::{InputEvent, KeyAction, KeyCode, KeyDecoder, KeyEvent, Mods, PointerEvent};
-pub use ring::{AfterOverrun, InputDevice, Reader, Ring, Seq};
+pub use keys::{AfterDrop, InputEvent, KeyAction, KeyCode, KeyDecoder, KeyEvent, Mods, PointerEvent};
+pub use ring::{InputDevice, Read, Reader, Ring, Seq};
 pub use scancode::Presses;
 pub use tablet::{
-    AbsAxis, AxisError, Buttons, Event, FRAME_TYPES, PointerState, Tablet, evdev, frame_bound, has_abs_xy,
-    may_have_lost_frames,
+    AbsAxis, AfterOverrun, AxisError, Buttons, Event, FRAME_TYPES, PointerState, Tablet, evdev, frame_bound,
+    has_abs_xy, may_have_lost_frames,
 };

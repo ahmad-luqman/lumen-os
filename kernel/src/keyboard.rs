@@ -46,7 +46,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use log::{debug, info, warn};
-use lumen_input::{KeyDecoder, Presses};
+use lumen_input::{AfterDrop, KeyDecoder, Mods, Presses};
 use lumen_queue::ByteQueue;
 use pc_keyboard::layouts::{
     AnyLayout, Azerty, Colemak, De105Key, Dvorak104Key, FiSe105Key, Jis109Key, No105Key, Uk105Key, Us104Key,
@@ -79,10 +79,12 @@ const LAYOUTS: [NamedLayout; 9] = [
 /// ring (`lumen_input::KeyDecoder`, #151).
 type Decoder = KeyDecoder<AnyLayout>;
 
-/// The decoder and the name of its layout.
+/// The decoder, the name of its layout, and the queue's drop count the
+/// last key event saw (its next event after a drop says so).
 struct Keyboard {
     decoder: Decoder,
     layout: &'static str,
+    drops: AfterDrop,
 }
 
 /// How [`init`] went.
@@ -249,7 +251,8 @@ pub fn init() {
         let names: alloc::vec::Vec<&str> = LAYOUTS.iter().map(|(n, _)| *n).collect();
         warn!(target: "kbd", "unknown keymap '{asked}' (known: {}); using us", names.join(" "));
     }
-    *KEYBOARD.lock() = Some(Keyboard { decoder: new_decoder(layout), layout: name });
+    *KEYBOARD.lock() =
+        Some(Keyboard { decoder: new_decoder(layout), layout: name, drops: AfterDrop::new(QUEUE.dropped()) });
     let status = start();
     match (status.route, status.result) {
         (Some(route), Ok(())) => info!(
@@ -530,22 +533,26 @@ pub use pc_keyboard::KeyCode;
 pub enum Key {
     /// A key making a character, in the layout.
     Char(char),
-    /// Any other key pressed (an arrow, PageUp, F1, a modifier), and
-    /// whether shift and Alt were held.
-    Raw { code: KeyCode, shift: bool, alt: bool },
+    /// Any other key pressed (an arrow, PageUp, F1, a modifier), with the
+    /// modifiers after it (the same state its key event in the desktop's
+    /// ring carries).
+    Raw { code: KeyCode, mods: Mods },
 }
 
 /// The next key pressed, if one is waiting (releases are consumed and
 /// skipped). Never blocks. Every key event decoded on the way, presses and
 /// releases, bare modifiers included, goes to the desktop's key ring
-/// (`crate::input::KEYS`, #151) first.
+/// (`crate::input::KEYS`, #151) first, the first after the queue dropped
+/// bytes marked `after_drop`.
 /// (A byte the queue dropped can leave the decoder out of step, e.g. shift
 /// still held, until the key is pressed again; `kbd` counts drops.)
 pub fn read_key() -> Option<Key> {
     let mut keyboard = KEYBOARD.lock();
+    let Keyboard { decoder, drops, .. } = keyboard.as_mut()?;
     decode(
-        &mut keyboard.as_mut()?.decoder,
+        decoder,
         || QUEUE.pop(),
+        drops,
         |event| {
             crate::input::KEYS.push(event);
         },
@@ -581,18 +588,24 @@ pub fn wake_readers() {
 }
 
 /// Feed `next()`'s bytes to `decoder` until one completes a key press;
-/// each key event decoded goes to `push`; bytes it refuses are counted.
+/// each key event decoded goes to `push`, the first after the queue
+/// dropped bytes (`drops`) marked `after_drop`; bytes it refuses are
+/// counted.
 fn decode(
     decoder: &mut Decoder,
     mut next: impl FnMut() -> Option<u8>,
+    drops: &mut AfterDrop,
     mut push: impl FnMut(lumen_input::KeyEvent),
 ) -> Option<Key> {
+    let mut marked = |mut event: lumen_input::KeyEvent| {
+        event.after_drop = drops.mark(QUEUE.dropped());
+        push(event);
+    };
     while let Some(byte) = next() {
-        match decoder.add_byte(byte, &mut push) {
+        match decoder.add_byte(byte, &mut marked) {
             Ok(Some(DecodedKey::Unicode(c))) => return Some(Key::Char(c)),
             Ok(Some(DecodedKey::RawKey(code))) => {
-                let m = decoder.modifiers();
-                return Some(Key::Raw { code, shift: m.is_shifted(), alt: m.is_alt() });
+                return Some(Key::Raw { code, mods: Mods::from(decoder.modifiers()) });
             }
             Ok(None) => {}
             Err(_) => {
@@ -695,12 +708,51 @@ crate::ktest!(
     }
 );
 
+crate::ktest!(
+    fn a_key_event_after_dropped_bytes_says_so() {
+        // Keys decoded from the queue carry no mark until the queue drops a
+        // byte (full: the producer counts it); the first key event decoded
+        // after that is marked `after_drop`, the rest not. (The queue's
+        // producer runs with interrupts off on the boot CPU, as here;
+        // nothing reads the queue in the test kernel meanwhile.)
+        use crate::{kassert, kassert_eq};
+        struct Drained;
+        impl Drop for Drained {
+            fn drop(&mut self) {
+                while QUEUE.pop().is_some() {}
+            }
+        }
+        let _off = arch::irq::push_off();
+        let _drained = Drained;
+        while QUEUE.pop().is_some() {}
+        let mut decoder = new_decoder(choose_layout(Some("us")).1);
+        let mut drops = AfterDrop::new(QUEUE.dropped());
+        let mut drain = |drops: &mut AfterDrop| {
+            let mut events = alloc::vec::Vec::new();
+            while decode(&mut decoder, || QUEUE.pop(), drops, |e| events.push(e)).is_some() {}
+            events
+        };
+        kassert!(queue_for_test(&[0x1e, 0x9e]));
+        let clean = drain(&mut drops);
+        kassert_eq!(clean.len(), 2);
+        kassert!(clean.iter().all(|e| !e.after_drop));
+        // Fill the queue with S presses (0x1f) until one is dropped.
+        let dropped = QUEUE.dropped();
+        while queue_for_test(&[0x1f]) {}
+        kassert_eq!(QUEUE.dropped(), dropped + 1);
+        let after = drain(&mut drops);
+        kassert!(after.len() > 1);
+        kassert!(after[0].after_drop && after[1..].iter().all(|e| !e.after_drop));
+        Ok(())
+    }
+);
+
 /// Every character set-1 scancodes `bytes` make in layout `name`.
 #[cfg(feature = "ktest")]
 fn decode_all(name: &str, bytes: &[u8]) -> alloc::string::String {
     let mut decoder = new_decoder(choose_layout(Some(name)).1);
     let mut it = bytes.iter().copied();
-    core::iter::from_fn(|| decode(&mut decoder, || it.next(), |_| {}))
+    core::iter::from_fn(|| decode(&mut decoder, || it.next(), &mut AfterDrop::new(QUEUE.dropped()), |_| {}))
         .filter_map(|k| match k {
             Key::Char(c) => Some(c),
             Key::Raw { .. } => None,
@@ -744,8 +796,15 @@ crate::ktest!(
             0x2a, 0xe0, 0x49, 0xe0, 0xc9, 0xaa, 0xe0, 0x51, 0xe0, 0xd1, 0x1e, 0x9e, 0x38, 0x3c, 0xbc, 0xb8, 0x3c, 0xbc,
         ];
         let mut it = bytes.iter().copied();
-        let keys: alloc::vec::Vec<Key> = core::iter::from_fn(|| decode(&mut decoder, || it.next(), |_| {})).collect();
-        let raw = |code, shift, alt| Key::Raw { code, shift, alt };
+        let keys: alloc::vec::Vec<Key> =
+            core::iter::from_fn(|| decode(&mut decoder, || it.next(), &mut AfterDrop::new(QUEUE.dropped()), |_| {}))
+                .collect();
+        // (pc-keyboard starts with Num Lock on.)
+        let raw = |code, shift: bool, alt: bool| {
+            let mods = Mods::NONE.with_numlock();
+            let mods = if shift { mods.with_shift() } else { mods };
+            Key::Raw { code, mods: if alt { mods.with_alt() } else { mods } }
+        };
         kassert_eq!(
             keys,
             alloc::vec![
