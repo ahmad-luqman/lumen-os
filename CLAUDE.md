@@ -164,11 +164,11 @@ own PR that updates that doc first.
   (`open_window`, `WindowHandle`: an owner's surface and a committed one, `commit`, `next_event`/`wait_event`,
   `Desktop::without_screen` for the ktests), the two demo windows, `desktop` (`status`, `check`, `spin`,
   `hold`/`release`) and `windows`; `lumen.desktop_cut_delay_ms=` widens the race at a pause for the scenarios;
-  the look (#154): titles and the demos' text in the UI font (`text_font`, `draw_text`: each glyph
-  blended inside its clip), the embedded wallpaper (`assets/wallpaper/lumen.png`, made by
-  `tools/wallpaper.py`; decoded once at the first start, a flat colour and one warning if it
-  doesn't), and the themes (`theme()`, `theme light|dark`, `lumen.theme=`: a switch repaints
-  everything and tells each owner, `WindowEvent::Theme`). `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
+  the look (#154): titles and the demos' text in the UI font (`font::Text`), the embedded
+  wallpaper (`assets/wallpaper/lumen.png`, made by `tools/wallpaper.py`; decoded once a boot at
+  the first start, a flat colour and one warning if it doesn't), and the themes (`ThemeId`;
+  `theme light|dark`, `lumen.theme=`: a switch damages the whole screen and tells each owner; a
+  window's first event is `WindowEvent::Theme`, the theme its owner draws with). `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -220,8 +220,11 @@ own PR that updates that doc first.
   (`mark_boot`, `since_boot_ns`), `now_ns`, `sleep`, `ticks`.
   `demo.rs`: the `mandelbrot` (bands on every CPU) and `life` commands.
   `font.rs`: the desktop's anti-aliased text (`lumen-font`): `font::face`,
-  the UI font parsed on first use and shared; `font` renders the golden
-  sample twice (timings, cache, golden check), as its ktest does.
+  the UI font parsed on first use and shared; `font::Text`, one drawing
+  thread's glyph cache over it (`draw` glyph by glyph inside a clip,
+  `measure`, `line_height`; `TITLE_PX`, `TEXT_PX`, `HEADING_PX`); `font`
+  renders the golden sample twice (timings, cache, golden check), as its
+  ktest does.
   `screenshot.rs`: `screenshot`: the screen captured (`capture`: the
   desktop's back buffer while it is shown, `desktop::capture`; else the
   framebuffer read once under the screen's lock, `term::read_pixels`,

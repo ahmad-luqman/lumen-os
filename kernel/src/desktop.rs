@@ -1,9 +1,11 @@
-//! The desktop (#153; ARCHITECTURE section 11): windows on the whole
+//! The desktop (#153, #154; ARCHITECTURE section 11): windows on the whole
 //! screen, composed by one kernel thread, `compositor`.
 //!
 //! - **Opt-in.** The text console stays the default. `desktop` (from any
 //!   shell) or the `lumen.desktop` boot flag starts it: the back buffer is
-//!   allocated, the compositor thread started, then the screen taken
+//!   allocated, the embedded wallpaper decoded (once a boot: a flat colour
+//!   and one warning if it doesn't decode), the compositor thread started,
+//!   then the screen taken
 //!   (`crate::vt::enter_desktop`: a `term::ScreenCanvas`); a step that
 //!   fails undoes the ones before it (`desktop: not started: <reason>`).
 //!   Alt+F1 to F4 leave it (`crate::vt`), `desktop` resumes it: its windows
@@ -13,9 +15,14 @@
 //!   window's committed surface (at most 16 rows per hold of the window's
 //!   lock); the compositor reads only the committed one. The frame (title
 //!   bar, border, close box) is the compositor's, from `lumen-wm`'s
-//!   geometry and the theme. Events reach the owner through the window's
-//!   `lumen_wm::EventQueue` ([`WindowHandle::next_event`],
-//!   [`WindowHandle::wait_event`]).
+//!   geometry and the theme, its title in the UI font (`font::Text`). Events
+//!   reach the owner through the window's `lumen_wm::EventQueue`
+//!   ([`WindowHandle::next_event`], [`WindowHandle::wait_event`]); the first
+//!   is always [`WindowEvent::Theme`], the theme to draw with.
+//! - **The look** (#154): the theme (`lumen_wm::ThemeId`: `theme
+//!   light|dark`, `lumen.theme=`) is the kernel's; a switch damages the
+//!   whole screen and tells every owner again. The wallpaper is drawn
+//!   centred behind the windows.
 //! - **A pass** ([`Compositor::pass`], after the keyboard's decoding pass,
 //!   `vt::decode_pending`, which [`Compositor::run`] calls holding none of
 //!   the desktop's locks): both input rings read (pointer frames through

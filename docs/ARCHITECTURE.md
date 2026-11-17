@@ -454,10 +454,10 @@ terminal taken to be 80 columns wide; plain text without it, section 6,
 `lumen.stall_timer_windows=...` (each boot calibration window's end, and
 start, stalled by a share of it, up to 10 windows' worth; a deliberate fault
 for scenarios, said at INFO, section 6, "Time"), `lumen.desktop` (start the
-desktop before the serial prompt; section 11) and
+desktop before the serial prompt; section 11),
 `lumen.desktop_cut_delay_ms=<ms>` (a deliberate delay for scenarios between
 the compositor's reads of the input rings and of the cut, said at INFO,
-capped at 2000 ms; section 11), and `lumen.theme=<light|dark>` (the
+capped at 2000 ms; section 11) and `lumen.theme=<light|dark>` (the
 desktop's theme, said at INFO; a name that isn't a theme is warned about
 and ignored; section 11).
 
@@ -3117,6 +3117,8 @@ until a crash.
   | `rationed`, `overflowed` | presses and moves dropped past a queue's 48 entries, and releases that didn't fit its 64 (each set `Lost`): their sum is `windows`' `lost`, totalled over every window, closed ones too |
   | `grab_ends` | grabs ended before their last button came up (their window closed or lost the focus, or input was interrupted) |
   | `dead_pushes` | events and flags for a window that had closed: its queue's own count after it was killed, plus deliveries whose window is no longer on the list (0 today by construction: the list and `lumen-wm` change in one hold; kept for #156's requests) |
+  | `glyph_misses` | glyphs the compositor rasterized for the titles (its glyph cache's misses): flat once every title's glyphs are cached (#154) |
+  | `glyphs_dropped` | glyphs `font::Text` left out because `lumen_gfx::Mask::new` refused their mask (a bug; the first warned about with its sizes) (#154) |
   | `cancelled`, `late` | `ui invoke` requests cancelled at their deadline, and results that came after it |
   | `settled` | `yes` or `no`, below |
 
@@ -3130,8 +3132,10 @@ until a crash.
   (the Alt+F`n` barrier, or a resume whose screen hasn't come yet); no
   wake is pending, no damage is gathered and no pass is running; no
   commit is under way; every window's queue is idle (no entry and no
-  flag) and its owner is blocked in `wait_event` (an idle bit per window);
-  and no `ui invoke` request is `Pending` or `Running` (none exist until
+  flag), its owner has been told of the last theme switch, and it is
+  blocked in `wait_event` (an idle bit per window, read after the other
+  two, so a look never takes an owner mid-redraw for a waiting one); and
+  no `ui invoke` request is `Pending` or `Running` (none exist until
   #156; the `desktop check`/`screenshot` slot doesn't count). A test first polls for the effect it expects (a `windows` row,
   a `ui tree` value), then calls the harness's `wait_settled(m)`
   (`tools/harness/lumen_harness/gui.py`, #153), and brackets each
@@ -3209,18 +3213,27 @@ enum until #156 gives it variants, so no request can be queued yet): `Key(KeyEve
 `PointerUp` (client coordinates and the buttons held), `FocusGained`,
 `FocusLost`, `Lost` (events for this window were dropped), `Close` (the
 close box, or `ui invoke <root> close`), `Request` (an automation
-request, #156) and `Theme(&'static Theme)` (#154: the desktop's theme
-changed; the owner redraws its client area in `desktop::theme()`'s
-colours).
+request, #156) and `Theme(&'static Theme)` (#154: the theme to draw the
+client area with, a window's first event and again after each switch).
 
-- **A theme switch reaches every owner.** It isn't a queue entry or a
-  flag: each window keeps the count of switches its owner has been told
-  of, and `next_event` returns `Theme` first (before anything queued)
-  while that count is behind the desktop's, which `wait_event` wakes for
-  too. So it is never dropped, and several switches before the owner
-  reads give one `Theme` (the current one). A window's count is behind
-  until its owner reads it, and `settled` needs every window's count
-  current: a test after `theme` waits for the owners' redraws too.
+- **The theme reaches every owner, first.** `Theme` isn't a queue entry
+  or a flag: each window keeps the count of theme switches its owner has
+  been told of, starting one behind the desktop's, so a window's first
+  event is always `Theme(current)` (an owner's first draw and every
+  redraw are one path, and nothing it read before opening can be stale).
+  While the count is behind, `next_event` returns `Theme` ahead of
+  anything queued (entries, `Close` and requests included, unlike the
+  flags below, which keep their place), and `Window::has_event()`
+  (something queued, or a theme to tell) is what every wait for an event
+  wakes for (`wait_event`; #155's `wait_event_until` too). So it is never
+  dropped; several switches before the owner reads give at least one
+  `Theme`, the last carrying the current theme (a switch between the
+  owner's read of the count and of the theme gives a second). An owner
+  draws its client area with the `&'static Theme` it is handed, not
+  `desktop::theme()` (crate-private: the compositor's, `desktop
+  status`'s and `theme`'s). A window's count is behind until its owner
+  reads it, and `settled` needs every owner told of the last switch: a
+  test after `theme` waits for the owners' redraws too.
 
 - **Sticky flags beside the queue.** `Lost`, `Close`, a focus loss and a
   focus gain are flags beside the queue (`set_lost`, `request_close`,
@@ -3495,38 +3508,61 @@ A host-tested `no_std` crate every desktop part draws with. Pixels are
   and coverage through getters), which reaches the surface through
   `lumen_gfx::Mask::new(width, height, coverage)`; if that returns `None`
   (the sizes disagree, a bug), the line isn't drawn and one `WARN` says so;
-  nothing panics. The terminals keep the bitmap font.
-- **Text on the desktop** (#154): the compositor owns a `Font<'static>`
-  for the titles (15 pixels), and each demo window's owner its own (16
-  pixels, the Welcome window's heading 24). Each glyph's `Placed` mask goes
-  through `Mask::new` and `blend_mask_in` with the clip it is drawn in
-  (titles: the damaged rectangle being recomposed, once each), so no
-  line mask is allocated; a mask `Mask::new` refuses (a bug) isn't drawn,
-  with one `WARN` a boot. Redrawing a title rasterizes nothing (its
-  glyphs are cached: `desktop::a_title_drawn_again_rasterizes_nothing`). If
-  the UI font doesn't load, one `WARN` says so and no text is drawn.
+  nothing panics. The desktop draws glyph by glyph instead (below), with
+  no line mask. The terminals keep the bitmap font.
+- **Text on the desktop** (#154): `font::Text` (`kernel/src/font.rs`) is
+  one drawing thread's text: its own `Font<'static>` glyph cache over the
+  shared face, `draw(surface, x, y, text, px, colour, clip)` (returning
+  nothing), `measure` and `line_height`, at the public sizes `TITLE_PX`
+  (15), `TEXT_PX` (16) and `HEADING_PX` (24). The compositor has one for
+  the titles (their line height worked out once), each window's owner its
+  own (#156's widgets use it too). Each glyph's `Placed` mask goes through
+  `Mask::new` and `blend_mask_in` with the clip it is drawn in (titles:
+  the damaged rectangle being recomposed, once each), so no line mask is
+  allocated. Redrawing a title rasterizes nothing (its glyphs are cached:
+  `desktop::a_title_drawn_again_rasterizes_nothing`; `desktop status`'s
+  `glyph_misses` shows the compositor's count). A mask `Mask::new`
+  refuses (a bug) isn't drawn: counted (`glyphs_dropped`), the first
+  warned about with its sizes (not tested: `lumen-font`'s masks are
+  always their size). If the UI font doesn't load, one `WARN` says so and
+  no text is drawn (not tested: the embedded font loads).
 - **Wallpaper** (#154): `assets/wallpaper/lumen.png` (1280x800, about 150
-  KB, original: `tools/wallpaper.py` makes it), embedded in the kernel and
-  decoded once, when the desktop first starts, before the back buffer is
-  allocated (said at INFO with its size and the time it took), by
-  `lumen_png::decode` over `zune-png` (`=0.5.2`, without its `std` and
-  `sse` features; strict mode, every chunk's CRC checked): any PNG into
+  KB, original: `tools/wallpaper.py` makes it, `assets/wallpaper/README.md`),
+  embedded in the kernel and decoded once a boot, at the desktop's first
+  start, after the back buffer is allocated (the desktop needs that; the
+  wallpaper is optional), said at INFO with its size and the time it
+  took; the result, or the failure, is kept, so a start that fails after
+  it doesn't decode or warn again. `lumen_png::decode` over `zune-png`
+  (`=0.5.2`, without its `std` and `sse` features; strict mode: every
+  chunk's CRC and the zlib stream's Adler-32 checked): any PNG into
   `0x00RRGGBB` pixels, alpha dropped and 16-bit samples cut to their top 8
-  bits; not a PNG, cut short, corrupt or bigger than the screen is an
-  error, never a panic (host-tested: every truncation and every flipped
-  byte of a small file). It is drawn centred (the theme's `desktop`
-  colour around it if it is smaller); if it doesn't decode, the desktop
-  uses that colour and logs `WARN desktop: wallpaper not shown: <reason>`
-  once. One wallpaper for both themes.
-- **Themes** (#154): `lumen-wm`'s `Theme::LIGHT` and `Theme::DARK`. `theme`
+  bits, its pixels handed to the surface with no copy
+  (`Image::into_pixels`, `Surface::from_pixels`); not a PNG, cut short,
+  corrupt or bigger than 4096 pixels each way is an error, never a panic
+  (host-tested: every truncation and every flipped byte of a small file,
+  an Adam7 file). The size is checked from IHDR before any image data is
+  inflated, and a compressed `zTXt`, `iTXt` or `iCCP` chunk of more than
+  4096 bytes is refused before the decoder sees the file (it inflates
+  them while reading the headers). The decoder's own buffers abort on a
+  heap that can't hold them (`Vec`s); the samples' and the pixels' refuse.
+  It is drawn centred: cut where it is bigger than the screen, the
+  theme's `desktop` colour around it where it is smaller
+  (`desktop::a_smaller_wallpaper_is_drawn_centred_over_the_flat_colour`).
+  If it doesn't decode, the desktop uses that colour and logs `WARN
+  desktop: wallpaper not shown: <reason>` once a boot. One wallpaper for
+  both themes.
+- **Themes** (#154): `lumen-wm`'s `ThemeId::{Light, Dark}` and their
+  palettes (`Theme::get(id)`, `Theme::LIGHT`, `Theme::DARK`). `theme`
   prints the current one (`theme: light`); `theme light|dark` switches
   (`theme: dark`, or `theme: dark (already)`; another name is refused),
   before the desktop starts too (it starts in that theme), and
-  `lumen.theme=` picks one at boot. A switch, under `COMPOSITOR`, changes
-  the theme and its count and damages the whole screen (one full repaint,
-  frames and wallpaper); each window's owner is then told (`Theme`, above)
-  and redraws. `desktop status` shows it (`theme`). `desktop::theme()` is
-  what owners draw with.
+  `lumen.theme=` picks one at boot. The theme is the kernel's (one
+  screen): a switch, under `COMPOSITOR`, changes it and its count and
+  damages the live desktop's whole screen (one full recompose: frames
+  and wallpaper); each window's owner is then told (`Theme`, above) and
+  redraws its client area in the theme it is handed. `desktop status`
+  shows it (`theme`). The terminals keep their own palette (#155 decides
+  whether terminal windows follow the theme).
 
 ### Terminal windows (#155)
 
@@ -3912,8 +3948,8 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/klog.rs      logger (levels, subsystem tags, serial timestamps, the ring dmesg reads)
   src/rtc.rs       the CMOS RTC: date and time (taken as UTC) for `date`
   src/fb.rs        framebuffer: pixels, glyphs, the hello screen (draw_header), the crash screen
-  src/desktop.rs   the desktop (#153): the compositor thread, windows (open_window, WindowHandle), desktop, windows
-  src/font.rs      the desktop's anti-aliased text (lumen-font): the UI font parsed once and shared (font::face), the golden sample for `font` and its ktest
+  src/desktop.rs   the desktop (#153, #154): the compositor thread, windows (open_window, WindowHandle), desktop, windows, the themes (theme), the wallpaper
+  src/font.rs      the desktop's anti-aliased text (lumen-font): the UI font parsed once and shared (font::face), font::Text (a thread's glyph cache, drawing glyph by glyph), the golden sample for `font` and its ktest
   src/screenshot.rs  `screenshot`: the screen as a PNG (lumen-png) in a base64 frame on serial
   src/term.rs      the virtual terminals on the framebuffer (lumen-term): their grids, drawing the shown one's changed cells, log lines, the cursor, the canvas
   src/vt.rs        the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4
@@ -3925,8 +3961,9 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   linker.ld        layout at -2 GiB, .ktests section
 crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-gfx, lumen-acpi, lumen-pci, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, lumen-font, lumen-png, lumen-wm, ...)
 assets/fonts/      the desktop's UI font (Atkinson Hyperlegible, SIL OFL 1.1) with its licence and source
+assets/wallpaper/  the desktop's wallpaper (original, made by tools/wallpaper.py; README.md)
 boot/limine.conf   bootloader config template
-tools/             fetch-deps.sh, mkiso.sh, harness/ (Python package)
+tools/             fetch-deps.sh, mkiso.sh, wallpaper.py (makes the wallpaper), harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml
 docs/              ARCHITECTURE.md, ROADMAP.md, STATUS.md (generated)
 ```
