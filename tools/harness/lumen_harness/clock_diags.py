@@ -38,14 +38,22 @@ TIMER_BRACKETS = re.compile(
     r"bracket widths min/median/max (?P<min>\d+)/(?P<median>\d+)/(?P<max>\d+) ns over "
     r"(?P<brackets>\d+) brackets; \d+ of 7 one-shot windows with brackets over 5% of them"
 )
-# `the_boot_timer_calibration_is_the_median_of_mostly_steady_windows` prints
-# the local APIC timer's boot calibration (#129): its windows, retakes, how
-# many are steady and how far off the median can be. Retakes aren't bounded:
-# they count how often a loaded host stalled boot, not the code.
-BOOT_TIMER = re.compile(
-    r"timer boot calibration (?P<hz>\d+) Hz \[(?P<windows>[\d/ ]*)\] retook (?P<retook>\d+), "
+# The boot ktests print the boot calibrations: the local APIC timer's (#129)
+# and the TSC's (#139), each with its windows, retakes, how many are steady
+# and how far off the median can be. Retakes and the steady count aren't
+# bounded: they count how often a loaded host stalled boot, not the code. The
+# bound is, by each clock's tolerance (lumen_time's
+# TIMER_TOLERANCE_PPM and TSC_TOLERANCE_PPM): past it, boot warned.
+TIMER_TOLERANCE_PPM = 20_000
+TSC_TOLERANCE_PPM = 10_000
+_BOOT_FIELDS = (
+    r"(?P<hz>\d+) Hz \[(?P<windows>[\d/ ]*)\] retook (?P<retook>\d+), "
     r"(?P<steady>\d+) steady, median within (?P<bound>\d+) ppm; window rates \[(?P<rates>[\d, ]*)\] Hz"
 )
+BOOT_TIMER = re.compile(r"timer boot calibration " + _BOOT_FIELDS)
+BOOT_TSC = re.compile(r"tsc boot calibration \((?P<reference>hpet|pit)\) " + _BOOT_FIELDS)
+BOOT_TIMER_CASE = "time::the_boot_timer_calibration_is_within_what_the_tick_needs"
+BOOT_TSC_CASE = "time::the_boot_tsc_calibration_is_within_what_now_ns_needs"
 PLACEMENT = re.compile(
     r"injected pause: (?P<what>HPET|timer) placement (?P<off>\d+) ns off \(at most "
     rf"(?P<allowed>\d+) ns allowed\) on try (?P<try>\d+) of (?P<tries>\d+), {RETRY_SPACING_MS} ms "
@@ -66,6 +74,28 @@ def one_diagnostic(report: tap.TapReport, name: str, pattern: re.Pattern[str]) -
     found = [m for m in map(pattern.fullmatch, lines) if m]
     assert len(found) == 1, f"{name}: {len(found)} lines like {pattern.pattern!r}: {lines}"
     return found[0]
+
+
+def _check_boot_calibration(
+    report: tap.TapReport,
+    text: str,
+    clock: str,
+    case: str,
+    pattern: re.Pattern[str],
+    tolerance_ppm: int,
+) -> None:
+    """The `clock` boot calibration's line: once in the run, in `case`, with
+    five windows and rates, and its median within `tolerance_ppm` (however
+    many windows are steady: enough least-unsteady ones may fill in)."""
+    lines = re.findall(rf"^# {clock} boot calibration ", text, re.MULTILINE)
+    assert len(lines) == 1, f"{len(lines)} {clock} boot calibration lines"
+    b = one_diagnostic(report, case, pattern)
+    windows, rates, steady = b["windows"].split(), _widths(b["rates"]), int(b["steady"])
+    assert len(windows) == 5 and len(rates) == 5, f"not 5 windows and rates: {b.group(0)}"
+    assert steady <= len(windows), f"more steady than windows: {b.group(0)}"
+    assert int(b["bound"]) <= tolerance_ppm, (
+        f"{clock} median bound over {tolerance_ppm} ppm: {b.group(0)}"
+    )
 
 
 def _widths(field: str) -> list[int]:
@@ -98,21 +128,9 @@ def check_clock_diags(report: tap.TapReport, text: str) -> None:
     t = one_diagnostic(report, "time::the_timer_is_programmed_for_1_khz", TIMER_BRACKETS)
     low, median, high, count = (int(t[k]) for k in ("min", "median", "max", "brackets"))
     assert low <= median <= high and high > 0 and count == 14, t.group(0)
-    # The timer's boot calibration, once in the run: five windows and rates,
-    # most of them steady (so its median is as good as theirs).
-    lines = re.findall(r"^# timer boot calibration ", text, re.MULTILINE)
-    assert len(lines) == 1, f"{len(lines)} timer boot calibration lines"
-    b = one_diagnostic(
-        report,
-        "time::the_boot_timer_calibration_is_the_median_of_mostly_steady_windows",
-        BOOT_TIMER,
-    )
-    windows, rates, steady = b["windows"].split(), _widths(b["rates"]), int(b["steady"])
-    assert len(windows) == 5 and len(rates) == 5, f"not 5 windows and rates: {b.group(0)}"
-    assert steady <= len(windows), f"more steady than windows: {b.group(0)}"
-    assert steady * 2 > len(windows), f"most windows unsteady: {b.group(0)}"
-    # Most steady (gaps at most 0.5% each): the median within 0.5%.
-    assert int(b["bound"]) <= 5000, f"median bound over 0.5% with most steady: {b.group(0)}"
+    # The boot calibrations, once each in the run.
+    _check_boot_calibration(report, text, "timer", BOOT_TIMER_CASE, BOOT_TIMER, TIMER_TOLERANCE_PPM)
+    _check_boot_calibration(report, text, "tsc", BOOT_TSC_CASE, BOOT_TSC, TSC_TOLERANCE_PPM)
     # The placement tests each report one judged try, within their tries
     # and their allowance.
     for name in (

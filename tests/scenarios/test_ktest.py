@@ -2,19 +2,21 @@
 
 import re
 
+import pytest
 from lumen_harness import save_ktest_tap, tap
 from lumen_harness.clock_diags import check_clock_diags
 from lumen_harness.qemu import EXIT_CRASH, EXIT_SUCCESS, Devices
 
 
-def test_in_kernel_tests_pass(boot):
-    # With other CPUs online (idle), so the per-CPU state, the heap, the
-    # stack registry and the frame allocator are tested with their stacks and
-    # state in place, as on any multi-CPU machine. With virtio devices no
-    # driver takes in M3 (network, block, 9p, a memory balloon, a console,
-    # SCSI, four keyboards and a mouse), for the virtio adapter's and
-    # MSI-X's ktests to claim and probe, and virtio-rng, bound at boot, for the rng ktests (on the
-    # default CPU: no RDRAND, so they use virtio-rng) and its MSI-X vector.
+def boot_ktests(boot, cmdline=None):
+    """The ktest machine: with other CPUs online (idle), so the per-CPU
+    state, the heap, the stack registry and the frame allocator are tested
+    with their stacks and state in place, as on any multi-CPU machine. With
+    virtio devices no driver takes in M3 (network, block, 9p, a memory
+    balloon, a console, SCSI, four keyboards and a mouse), for the virtio
+    adapter's and MSI-X's ktests to claim and probe, and virtio-rng, bound at
+    boot, for the rng ktests (on the default CPU: no RDRAND, so they use
+    virtio-rng) and its MSI-X vector."""
     extra = ["-smp", "4"]
     for device in (
         "virtio-balloon-pci",
@@ -26,17 +28,24 @@ def test_in_kernel_tests_pass(boot):
         "virtio-keyboard-pci",
     ):
         extra += ["-device", device]
-    m = boot(
+    return boot(
         "ktest",
         extra=extra,
+        cmdline=cmdline,
         devices=Devices(blk_mib=1, net=True, share=True, rng=True, keyboard=True),
     )
+
+
+def finished(m, save=False):
+    """The ktest run's output and TAP report, every test passed; `save` keeps
+    the TAP for `make status`."""
     code = m.wait_exit(120)
     out = m.output
     report = tap.parse(out)
     # Saved for `make status` (each ktest is listed individually in STATUS.md);
     # a re-run's (LUMEN_ARTIFACTS_DIR) is kept apart: see save_ktest_tap.
-    save_ktest_tap(out[out.find("TAP version") :] if "TAP version" in out else "")
+    if save:
+        save_ktest_tap(out[out.find("TAP version") :] if "TAP version" in out else "")
     if code == EXIT_CRASH:
         crash = out[out.find("==== LUMEN CRASH REPORT") :]
         last = report.cases[-1].name if report.cases else "(before the first test)"
@@ -44,6 +53,11 @@ def test_in_kernel_tests_pass(boot):
     assert report.complete, f"incomplete TAP stream: {report.summary()}\n{out[-2000:]}"
     assert report.all_passed, report.summary()
     assert code == EXIT_SUCCESS, f"QEMU exit {code}, expected {EXIT_SUCCESS}"
+    return out, report
+
+
+def test_in_kernel_tests_pass(boot):
+    out, report = finished(boot_ktests(boot), save=True)
     # The other CPUs really were online while the tests ran.
     assert "INFO  smp: 4 CPUs online\n" in out, "the APs didn't come online"
     assert len(report.cases) >= 7
@@ -153,4 +167,30 @@ def test_in_kernel_tests_pass(boot):
     )
     # #117: the clock cross-checks report their brackets, retries and
     # placement tries on passing runs too, where nobody reads the TAP.
+    check_clock_diags(report, out)
+
+
+@pytest.mark.parametrize(
+    "key, ppm", [("tsc", 6000), ("timer", 12000)], ids=["tsc-0.6%", "timer-1.2%"]
+)
+def test_in_kernel_tests_pass_with_calibrations_stalled_within_tolerance(boot, key, ppm):
+    # Every check moves together (#139): a boot whose calibration filled in
+    # (each window's end stalled, so none steady) but stayed within its
+    # tolerance logs no warning, and every ktest that compares a measurement
+    # with the boot's calibration still passes, as do the clock diagnostics'
+    # bounds. The TSC at 0.6% (under its 1%); the timer at 1.2%, which with
+    # the TSC's bound is still under its 2% but leaves its rate about 1.2% off
+    # (a ktest budgeting the calibration 1% fails here).
+    name = {"tsc": "tsc", "timer": "local APIC timer"}[key]
+    out, report = finished(boot_ktests(boot, cmdline=f"lumen.stall_{key}_windows={ppm}"))
+    assert (
+        f"INFO  time: stalling calibration windows by {ppm},0 ppm (lumen.stall_{key}_windows)\n"
+        in out
+    )
+    assert re.search(
+        rf"INFO  time: {name} calibration took 20 windows again, 0 of 5 kept steady", out
+    ), out
+    # Boot's own lines (the ktests warn on purpose, e.g. a PIT made to fail).
+    boot_lines = out[: out.index("TAP version")]
+    assert "WARN  time" not in boot_lines, boot_lines
     check_clock_diags(report, out)

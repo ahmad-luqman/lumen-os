@@ -5,7 +5,8 @@
 //!
 //! Text uses pre-rasterized Noto Sans Mono glyphs (anti-aliased, so we blend
 //! each pixel between background and foreground). This is deliberately the
-//! simplest thing that works; the real compositor and font renderer are M5.
+//! simplest thing that works; the compositor and the TrueType fonts are M4
+//! (docs/ARCHITECTURE.md section 11).
 //!
 //! The header area (top-left 640x136 pixels) is deterministic and checked
 //! against `tests/golden/boot-hello.png` by the screendump test.
