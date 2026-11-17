@@ -982,12 +982,15 @@ class Machine:
             tail = self.output[-2000:]
             raise QmpError(f"{e}\n--- last serial output ---\n{tail}") from e
 
-    def screenshot_via_serial(self, timeout: float = 60) -> Image.Image:
+    def screenshot_via_serial(
+        self, timeout: float = 60, *, allow_torn: bool = False
+    ) -> Image.Image:
         """The kernel's own `screenshot` of the screen, run at the serial
-        shell's prompt and checked (lumen_harness.screenshot)."""
+        shell's prompt and checked (lumen_harness.screenshot; a capture
+        flagged as possibly torn fails unless `allow_torn`)."""
         from .screenshot import screenshot_via_serial
 
-        return screenshot_via_serial(self, timeout)
+        return screenshot_via_serial(self, timeout, allow_torn=allow_torn)
 
     def screendump(self, name: str) -> Path:
         """Save the current screen as PNG in the artifacts directory."""

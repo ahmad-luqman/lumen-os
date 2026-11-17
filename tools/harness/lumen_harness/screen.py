@@ -21,6 +21,10 @@ from lumen_harness.shell import PROMPT
 if TYPE_CHECKING:
     from lumen_harness.qemu import Machine
 
+# The terminal's grid on the 1280x800 screen (kernel/src/term.rs, limine.conf):
+# its top-left pixel and its cells' size.
+GRID_X, GRID_Y, CELL_W, CELL_H = 32, 144, 7, 16
+
 SUMMARY = re.compile(
     r"^term text: (\d+) rows, cursor (?:\((\d+), (\d+)\)|below the view)\n", re.MULTILINE
 )
@@ -34,6 +38,17 @@ class Screen:
     @property
     def text(self) -> str:
         return "\n".join(self.rows)
+
+
+def cursor_box(screen: Screen) -> tuple[int, int, int, int]:
+    """The pixels of the cursor's cell as a PIL box (left, top, right,
+    bottom; the last two exclusive). The cursor blinks every 500 ms, so two
+    screenshots may each catch it on or off there."""
+    if screen.cursor is None:
+        raise AssertionError("the cursor is below the view (scrolled back)")
+    col, row = screen.cursor
+    x, y = GRID_X + col * CELL_W, GRID_Y + row * CELL_H
+    return (x, y, x + CELL_W, y + CELL_H)
 
 
 def parse_term_text(out: str, summary: re.Match[str]) -> Screen:

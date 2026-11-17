@@ -16,6 +16,7 @@ from lumen_harness.shell import (
     run_dmesg,
     split_logs,
 )
+from qemu_fakes import FakeMachine
 
 WARN = (
     "[    0.589291] WARN  mouse: 0000:00:03.0: 30 events in one batch: the event ring was nearly "
@@ -36,26 +37,6 @@ RUN_26 = "lumen> mouse\n" + "".join(f"{line}\n" for line in RUN_26_LINES) + f"{W
 INFO = "[   12.000001] INFO  drivers: probing virtio-tablet on 0000:00:03.0"
 DEBUG = '[   12.000002] DEBUG term: view 20 lines up, top row "81"'
 ERROR = "[    1.000000] ERROR mm: something else"
-
-
-class FakeMachine:
-    """Serial output given up front; `expect` searches it from the previous
-    match, like `Machine.expect` (without waiting: no match times out)."""
-
-    def __init__(self, output: str) -> None:
-        self.output = output
-        self.sent: list[str] = []
-        self._pos = 0
-
-    def send_line(self, line: str) -> None:
-        self.sent.append(line)
-
-    def expect(self, pattern: str, timeout: float = 30) -> re.Match[str]:
-        found = re.compile(pattern).search(self.output, self._pos)
-        if not found:
-            raise ExpectTimeout(f"timeout waiting for {pattern!r}")
-        self._pos = found.end()
-        return found
 
 
 def test_a_warning_fails_the_run_unless_allowed():

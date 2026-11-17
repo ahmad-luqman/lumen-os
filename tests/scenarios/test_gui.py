@@ -3,17 +3,19 @@ scenarios (M4) join it here."""
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
+import pytest
+from lumen_harness.image import compare
 from lumen_harness.qemu import Machine
-from lumen_harness.screen import Screen, expect_screen, read_screen
-from lumen_harness.shell import PROMPT
-from PIL import Image, ImageChops, ImageDraw
+from lumen_harness.screen import cursor_box, expect_screen, read_screen
+from lumen_harness.screenshot import FrameError
+from lumen_harness.shell import PROMPT, run
+from PIL import Image
 
 SHELLS = r"INFO  shell: shells on serial and the screen; type 'help'\n"
-# The terminal's grid on the 1280x800 screen (kernel/src/term.rs): its
-# top-left pixel and its 7x16 cells.
-GRID_X, GRID_Y, CELL_W, CELL_H = 32, 144, 7, 16
+PAUSED = ", paused (a command is drawing)"
 
 
 def boot_shells(boot) -> Machine:
@@ -24,46 +26,38 @@ def boot_shells(boot) -> Machine:
     return m
 
 
-def cursor_box(screen: Screen) -> tuple[int, int, int, int]:
-    """The pixels of the terminal cursor's cell (left, top, right, bottom,
-    exclusive): the cursor blinks every 500 ms, so the screenshot and the
-    screendump may each catch it on or off."""
-    assert screen.cursor is not None, "the view isn't scrolled back"
-    col, row = screen.cursor
-    x, y = GRID_X + col * CELL_W, GRID_Y + row * CELL_H
-    return (x, y, x + CELL_W, y + CELL_H)
-
-
 def assert_screenshot_matches_screendump(m: Machine, artifacts: Path, name: str) -> None:
-    """`screenshot` over serial equals QEMU's screendump, pixel for pixel,
-    except exactly the cursor's cell; the screen (as `term text` reads it)
-    is the same before and after both, so nothing else changed meanwhile."""
+    """`screenshot` over serial equals QEMU's screendump, every pixel. The
+    cursor blinks every 500 ms, so the screendump is retaken (up to four
+    times, 300 ms apart) until it caught the cursor in the screenshot's
+    phase; the screen (as `term text` reads it) is the same before and
+    after, so nothing else changed meanwhile."""
     before = read_screen(m)
     shot = m.screenshot_via_serial()
     shot.save(artifacts / f"{name}-screenshot.png")
-    dump = Image.open(m.screendump(f"{name}-screendump.png")).convert("RGB")
+    assert shot.size == (1280, 800), shot.size
+    for attempt in range(1, 5):
+        dump = Image.open(m.screendump(f"{name}-screendump-{attempt}.png")).convert("RGB")
+        diff, mask = compare(shot, dump, tolerance=0)
+        if diff.differing == 0:
+            break
+        time.sleep(0.3)
     after = read_screen(m)
     assert (after.rows, after.cursor) == (before.rows, before.cursor), (
         "the screen changed during the capture"
     )
-    assert shot.size == dump.size == (1280, 800), (shot.size, dump.size)
-    box = cursor_box(before)
-    diff = ImageChops.difference(shot, dump)
-    # Everything outside the cursor's cell must match exactly: blank the
-    # cell in the difference, then nothing may be left.
-    outside = diff.copy()
-    ImageDraw.Draw(outside).rectangle((box[0], box[1], box[2] - 1, box[3] - 1), fill=(0, 0, 0))
-    if outside.getbbox() is not None:
-        diff.point(lambda v: 255 if v else 0).save(artifacts / f"{name}-diff.png")
-        differing = sum(1 for p in outside.getdata() if p != (0, 0, 0))
+    if diff.differing:
+        # Say whether more than the cursor's cell differs.
+        box = cursor_box(before)
+        a, b = shot.copy(), dump.copy()
+        for img in (a, b):
+            img.paste((0, 0, 0), box)
+        outside, _ = compare(a, b, tolerance=0)
+        mask.save(artifacts / f"{name}-diff.png")
         raise AssertionError(
-            f"{differing} pixels differ outside the cursor's cell {box}, "
-            f"within {outside.getbbox()} (see {name}-diff.png)"
+            f"{diff.differing} pixels differ from each of 4 screendumps, {outside.differing} "
+            f"of them outside the cursor's cell {box} (see {name}-diff.png)"
         )
-    # The cell itself differs only if the blink caught the cursor in
-    # different phases: then both images hold one of the cell's two looks.
-    cell = (box[0], box[1], box[2], box[3])
-    assert diff.crop(cell).getbbox() is None or shot.crop(cell) != dump.crop(cell)
 
 
 def test_screenshot_matches_screendump(boot, artifacts):
@@ -85,3 +79,27 @@ def test_screenshot_refuses_a_screen_shell(boot):
     m.type_text("screenshot\n")
     expect_screen(m, r"^screenshot: run it on serial \(the PNG comes out as text\)\nlumen>$")
     assert "@@png" not in read_screen(m).text
+
+
+def wait_paused(m: Machine, paused: bool, timeout: float = 30) -> None:
+    """Wait until `term` says a command is drawing on a canvas (or not)."""
+    deadline = time.monotonic() + timeout * m.timeout_scale
+    while (PAUSED in run(m, "term")) != paused:
+        if time.monotonic() > deadline:
+            raise AssertionError(f"the terminal never became {'paused' if paused else 'unpaused'}")
+        time.sleep(0.1)
+
+
+def test_screenshot_says_when_a_canvas_was_drawing(boot):
+    # `life` on the screen draws on a canvas, without the screen's lock: a
+    # screenshot meanwhile may be torn, says so, and the harness refuses it
+    # unless told otherwise. Once life ends, the flag is gone.
+    m = boot_shells(boot)
+    m.type_text("life\n")
+    wait_paused(m, True)
+    with pytest.raises(FrameError, match="a canvas was drawing during the capture"):
+        m.screenshot_via_serial()
+    assert m.screenshot_via_serial(allow_torn=True).size == (1280, 800)
+    m.type_text(" ")
+    wait_paused(m, False)
+    assert m.screenshot_via_serial().size == (1280, 800)

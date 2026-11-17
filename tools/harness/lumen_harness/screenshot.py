@@ -6,7 +6,9 @@ together; ARCHITECTURE section 11, "Screenshot"):
     @@png <base64>            (k lines; all but the last 120 characters)
     @@png-end
 
-then `screenshot: <w>x<h>, <n> bytes of PNG (...)` and the prompt. Log
+then `screenshot: <w>x<h>, <n> bytes of PNG (...)` (with `, a canvas was
+drawing: may be torn` after it when a command drew on the screen without
+the screen's lock meanwhile) and the prompt. Log
 lines may land between the frame's lines (never inside one): `shell.run`
 takes them out, and `parse_frame` keeps only lines starting with `@@png`
 anyway. Every way a frame can come back wrong (a line lost, a byte
@@ -35,7 +37,10 @@ BEGIN = re.compile(r"@@png-begin (\d+)x(\d+) bytes=(\d+) crc32=([0-9a-f]{8}) lin
 BODY = "@@png "
 END = "@@png-end"
 LINE_CHARS = 120
-SUMMARY = re.compile(r"^screenshot: (\d+)x(\d+), (\d+) bytes of PNG \(.*\)$", re.MULTILINE)
+SUMMARY = re.compile(
+    r"^screenshot: (\d+)x(\d+), (\d+) bytes of PNG \([^)]*\)(, a canvas was drawing: may be torn)?$",
+    re.MULTILINE,
+)
 
 
 class FrameError(AssertionError):
@@ -99,10 +104,14 @@ def parse_frame(text: str) -> Frame:
     return Frame(width, height, png)
 
 
-def screenshot_via_serial(m: Machine, timeout: float = 60) -> Image.Image:
+def screenshot_via_serial(
+    m: Machine, timeout: float = 60, *, allow_torn: bool = False
+) -> Image.Image:
     """Run `screenshot` at the serial shell's prompt (back at the prompt
     afterwards) and return the screen it sent, checked (`parse_frame`,
-    `Frame.image`, and the summary line naming the same size)."""
+    `Frame.image`, and the summary line naming the same size). A capture
+    the kernel flags as possibly torn (a canvas was drawing) fails unless
+    `allow_torn`."""
     out = run(m, "screenshot", timeout)
     frame = parse_frame(out)
     summary = SUMMARY.search(out)
@@ -114,4 +123,6 @@ def screenshot_via_serial(m: Machine, timeout: float = 60) -> Image.Image:
         len(frame.png),
     ):
         raise FrameError(f"the summary {summary[0]!r} disagrees with the frame")
+    if summary[4] and not allow_torn:
+        raise FrameError(f"a canvas was drawing during the capture: {summary[0]!r}")
     return frame.image()

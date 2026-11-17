@@ -135,8 +135,8 @@ impl Framebuffer {
     /// `out` (as many pixels as fit in it, at most the row's width; nothing
     /// for a row past the bottom): the screenshot's source. Reads the
     /// write-combined pixels once each.
-    pub fn rgb_row(&self, y: usize, out: &mut [u8]) {
-        for (x, rgb) in out.as_chunks_mut::<3>().0.iter_mut().take(self.width).enumerate() {
+    pub fn rgb_row(&self, y: usize, out: &mut [[u8; 3]]) {
+        for (x, rgb) in out.iter_mut().take(self.width).enumerate() {
             let Some(pixel) = self.pixel_at(x, y) else { return };
             let v = pixel.load(Ordering::Relaxed);
             for (byte, shift) in rgb.iter_mut().zip([self.red_shift, self.green_shift, self.blue_shift]) {
