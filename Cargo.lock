@@ -212,6 +212,10 @@ name = "lumen-elf"
 version = "0.0.1"
 
 [[package]]
+name = "lumen-gfx"
+version = "0.0.1"
+
+[[package]]
 name = "lumen-heap"
 version = "0.0.1"
 

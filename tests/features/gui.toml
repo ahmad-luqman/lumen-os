@@ -1,4 +1,9 @@
-# Features: gui. See tests/features/README.md for the format.
+# Features: gui (the M4 desktop). See tests/features/README.md for the format.
+
+[[feature]]
+name = "Pixel core (lumen-gfx): rectangles with a signed origin (intersect, union, contains, clip, subtract into at most 4), a fixed-size damage list that coalesces and never loses coverage (randomized check), xRGB8888 surfaces with a stride (fill, blits clipped at every edge, presenting spans to a target), coverage-mask blending rounded to the nearest (checked for every input) and clipped to a damaged rectangle (redraw equals one full draw)"
+milestone = "M4"
+tests = ["cargo:lumen-gfx"]
 
 [[feature]]
 name = "screenshot: the screen as a PNG over serial (lumen-png: RGB8, zlib from miniz_oxide linked with audit passing, every buffer refused rather than aborted when the allocator says no, a golden file PIL decodes; a base64 frame with its size, length, CRC and line count, log lines skipped by prefix), equal to QEMU's screendump in every pixel (the text console after boot and the colour test pattern); a capture while a canvas draws is flagged as possibly torn and refused by the harness unless allowed; every way a frame comes back wrong fails the harness saying why; refused on a screen shell"
