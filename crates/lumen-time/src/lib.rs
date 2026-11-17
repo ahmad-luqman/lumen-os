@@ -239,16 +239,53 @@ impl Window {
     }
 
     /// Its gaps added up, as a share of it in parts per million, rounded
-    /// up: the most the rate it gives can be off, as a share of the true rate
-    /// (high or low; the window's own error only, not that of the clock it
-    /// is counted against). `u64::MAX` for an empty window or gaps as long as
-    /// it.
+    /// up: the most the rate [`reference_hz`](Self::reference_hz) gives can be
+    /// off, as a share of the true rate (high or low; the window's own error
+    /// only, not that of the TSC it is counted against, nor the reference's
+    /// last tick, which is under 2 ppm for the local APIC timer). For
+    /// [`tsc_hz`](Self::tsc_hz), see [`tsc_error_ppm`](Self::tsc_error_ppm).
+    /// `u64::MAX` for an empty window or gaps as long as it.
     pub fn gap_ppm(&self) -> u64 {
         let gaps = u128::from(self.start_gap) + u128::from(self.end_gap);
         if self.tsc == 0 || gaps >= u128::from(self.tsc) {
             return u64::MAX;
         }
         u64::try_from((gaps * 1_000_000).div_ceil(u128::from(self.tsc))).unwrap_or(u64::MAX)
+    }
+
+    /// The most the rate [`tsc_hz`](Self::tsc_hz) gives can be off, as a
+    /// share of the true rate in parts per million, rounded up (the window's
+    /// own error only, not that of the reference's frequency).
+    ///
+    /// The reference was read somewhere inside each end's gap, so the TSC
+    /// ticks between its two reads, `S`, lie in `[T - end_gap, T + start_gap]`
+    /// (`T` is `tsc`); and between those reads it ticked `R ± 1` times (`R` is
+    /// `reference`: a counter's ticks, its last one partly elapsed). The rate
+    /// it gives, `T / R`, against the true `S / (R ± 1)`, is off by at most
+    /// `(T + end_gap·R) / ((T − end_gap)·R)` high, or
+    /// `(T + start_gap·R) / ((T + start_gap)·R)` low. Unlike
+    /// [`gap_ppm`](Self::gap_ppm) the end's gap counts for more than its share
+    /// (the window it stretches is in the divisor), and the reference's tick
+    /// adds `1/R`: 84 ppm for a 10 ms PIT window, 1 ppm for the HPET's.
+    /// `u64::MAX` (no bound) for an empty window, an end gap as long as it,
+    /// fewer than 2 reference ticks, or values so large the arithmetic would
+    /// overflow 128 bits (real windows are about 2^25 TSC ticks against at
+    /// most 2^20 reference ticks).
+    pub fn tsc_error_ppm(&self) -> u64 {
+        let (t, r) = (u128::from(self.tsc), u128::from(self.reference));
+        let (s, e) = (u128::from(self.start_gap), u128::from(self.end_gap));
+        if t == 0 || e >= t || r < 2 {
+            return u64::MAX;
+        }
+        // ceil(1e6 · (t + gap·r) / (span·r)), or None on overflow.
+        let ppm = |gap: u128, span: u128| {
+            let num = gap.checked_mul(r)?.checked_add(t)?.checked_mul(1_000_000)?;
+            Some(num.div_ceil(span.checked_mul(r)?))
+        };
+        match (ppm(e, t - e), t.checked_add(s).and_then(|span| ppm(s, span))) {
+            (Some(high), Some(low)) => u64::try_from(high.max(low)).unwrap_or(u64::MAX),
+            _ => u64::MAX,
+        }
     }
 
     /// Orders windows by how much of each its gaps take up, least first
@@ -371,7 +408,33 @@ pub fn median_is_steady(steady: usize, n: usize) -> bool {
 /// midpoint of the middle two) lies between two of theirs. `u64::MAX` (no
 /// bound) if one of those has gaps as long as itself, or for no windows.
 pub fn median_bound_ppm<const N: usize>(windows: &[Window; N]) -> u64 {
-    let mut ppm = windows.map(|w| w.gap_ppm());
+    median_bound_ppm_by(windows, Window::gap_ppm)
+}
+
+/// How long, in reference ticks, the next window should be after `window`
+/// (taken `current` ticks long), to be steady with the same gaps: a stalled
+/// window keeps its length, but one whose ends were merely slow to read (a
+/// gap is a read's latency, so it stays the same whatever the window's
+/// length: #139's loaded KVM host took 250 µs per HPET read) gets longer, until
+/// those gaps would be 0.4% of it (`5/4` of the way under [`STEADY`]'s 0.5%),
+/// never shorter than `current` nor longer than `most`. A steady window keeps
+/// `current`.
+pub fn stretched_for_gaps(current: u64, window: &Window, most: u64) -> u64 {
+    if window.is_steady() || window.tsc == 0 {
+        return current;
+    }
+    let gaps = u128::from(window.start_gap) + u128::from(window.end_gap);
+    // The reference ticks over which `gaps` (TSC ticks) are 1/(STEADY·4/5).
+    let needed = (u128::from(window.reference) * gaps * u128::from(STEADY) * 5).div_ceil(4 * u128::from(window.tsc));
+    u64::try_from(needed).unwrap_or(u64::MAX).clamp(current, most.max(current))
+}
+
+/// [`median_bound_ppm`] with each window's own bound from `bound`: for the
+/// TSC's rate against a reference, [`Window::tsc_error_ppm`]. The argument is
+/// the same: the `(N / 2 + 1)`-th smallest window bound holds for more than
+/// half of them, so for the median.
+pub fn median_bound_ppm_by<const N: usize>(windows: &[Window; N], bound: impl Fn(&Window) -> u64) -> u64 {
+    let mut ppm = windows.map(|w| bound(&w));
     ppm.sort_unstable();
     ppm.get(N / 2).copied().unwrap_or(u64::MAX)
 }
@@ -1151,6 +1214,98 @@ mod tests {
         assert_eq!(w(10, 5, 5).gap_ppm(), u64::MAX, "gaps as long as the window");
         assert_eq!(w(0, 0, 0).gap_ppm(), u64::MAX, "an empty window");
         assert_eq!(w(u64::MAX, u64::MAX / 2, 0).gap_ppm(), 500_000, "no overflow");
+    }
+
+    #[test]
+    fn a_tsc_rate_is_off_by_at_most_its_end_gap_over_the_rest_plus_a_reference_tick() {
+        let w = |tsc, reference, start_gap, end_gap| Window { tsc, reference, polls: 1, start_gap, end_gap };
+        // 10 ms against the HPET (1,000,000 ticks), a 0.5% end gap: the
+        // window it stretches is in the divisor, so 0.5026%, not 0.5%.
+        assert_eq!(w(10_000_000, 1_000_000, 0, 50_000).tsc_error_ppm(), 5_027);
+        assert!(w(10_000_000, 1_000_000, 0, 50_000).gap_ppm() < 5_027);
+        // The same gap at the start counts for a little less than its share.
+        assert_eq!(w(10_000_000, 1_000_000, 50_000, 0).tsc_error_ppm(), 4_977);
+        // No gaps: one reference tick, 84 ppm for a 10 ms PIT window.
+        assert_eq!(w(24_500_000, 11_932, 0, 0).tsc_error_ppm(), 84);
+        // No bound: an end gap as long as the window, an empty window, a
+        // reference that ticked less than twice.
+        assert_eq!(w(10, 1_000, 0, 10).tsc_error_ppm(), u64::MAX);
+        assert_eq!(w(0, 1_000, 0, 0).tsc_error_ppm(), u64::MAX);
+        assert_eq!(w(10_000_000, 1, 0, 0).tsc_error_ppm(), u64::MAX);
+        // Arithmetic that would overflow claims no bound rather than a wrong one.
+        assert_eq!(w(u64::MAX, u64::MAX, u64::MAX, 0).tsc_error_ppm(), u64::MAX);
+        assert_eq!(w(1 << 40, 1 << 40, 0, 0).tsc_error_ppm(), 1, "large but in range");
+        // The median's: the third smallest of five.
+        let ws = [0, 90_000, 20_000, 500_000, 30_000].map(|e| w(10_000_000, 1_000_000, 0, e));
+        assert_eq!(
+            median_bound_ppm_by(&ws, Window::tsc_error_ppm),
+            w(10_000_000, 1_000_000, 0, 30_000).tsc_error_ppm()
+        );
+    }
+
+    #[test]
+    fn a_window_slow_to_read_is_stretched_until_its_gaps_would_be_steady() {
+        // #139's loaded KVM boot: 10 ms against the HPET (1,000,000 ticks,
+        // 24,547,212 TSC ticks), 436,492 + 529,641 ticks of gaps (3.9%): the
+        // same gaps are 0.4% of a window 9.8 times as long.
+        let slow = Window { tsc: 24_547_212, reference: 1_000_016, polls: 40, start_gap: 436_492, end_gap: 529_641 };
+        let next = stretched_for_gaps(1_000_000, &slow, 16_000_000);
+        assert_eq!(next, 9_839_697);
+        // Taken that long with the same gaps, it is steady.
+        let longer = Window { tsc: slow.tsc * next / 1_000_016, reference: next, ..slow };
+        assert!(longer.is_steady(), "{longer}");
+        // At most `most`, never shorter than it is now; a steady window keeps
+        // its length; so does an empty one.
+        assert_eq!(stretched_for_gaps(1_000_000, &slow, 4_000_000), 4_000_000);
+        assert_eq!(stretched_for_gaps(12_000_000, &slow, 16_000_000), 12_000_000);
+        let steady = Window { start_gap: 1_000, end_gap: 1_000, ..slow };
+        assert_eq!(stretched_for_gaps(1_000_000, &steady, 16_000_000), 1_000_000);
+        assert_eq!(stretched_for_gaps(1_000_000, &Window::default(), 16_000_000), 1_000_000);
+        // Just unsteady (0.6%): a little longer.
+        let just = Window { tsc: 10_000_000, reference: 1_000_000, polls: 1, start_gap: 30_000, end_gap: 30_000 };
+        assert_eq!(stretched_for_gaps(1_000_000, &just, 16_000_000), 1_500_000);
+    }
+
+    #[test]
+    fn a_tsc_rate_stays_within_its_bound_wherever_the_reads_fell() {
+        // A model: a TSC at 2.4576 GHz and a reference at 1.193182 MHz (the
+        // PIT) or 100 MHz (the HPET), counted from a random phase. Each end
+        // is a reference read at an instant somewhere inside a gap of TSC
+        // reads; the window is what the kernel records. The rate the window
+        // gives is always within its bound of the true 2.4576 GHz, and the
+        // bound isn't loose: windows come within 10% of it.
+        let tsc_hz = 2_457_600_000u128;
+        let mut seed = 0x139u64;
+        let mut next = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let mut closest = 0f64;
+        for i in 0..20_000 {
+            let reference_hz: u128 = if i % 2 == 0 { 1_193_182 } else { 100_000_000 };
+            // The reference counter at TSC tick `x`, from a phase in [0, 1).
+            let phase = u128::from(next(1_000_000));
+            let counter = |x: u128| (x * reference_hz * 1_000_000 + phase * tsc_hz) / (tsc_hz * 1_000_000);
+            let a = 1_000_000_000 + u128::from(next(100_000_000)); // the start read
+            let span = 24_000_000 + u128::from(next(1_000_000)); // to the end read
+            let (before_a, after_a) = (u128::from(next(200_000)), u128::from(next(200_000)));
+            let (before_b, after_b) = (u128::from(next(400_000)), u128::from(next(400_000)));
+            let b = a + span;
+            let (pre, t0, before, t) = (a - before_a, a + after_a, b - before_b, b + after_b);
+            let window = Window {
+                tsc: (t - t0) as u64,
+                reference: (counter(b) - counter(a)) as u64,
+                polls: 1,
+                start_gap: (t0 - pre) as u64,
+                end_gap: (t - before) as u64,
+            };
+            let measured = u128::from(window.tsc_hz(reference_hz as u64).unwrap());
+            let bound = u128::from(window.tsc_error_ppm());
+            let off_ppm = measured.abs_diff(tsc_hz) * 1_000_000;
+            assert!(off_ppm <= bound * tsc_hz, "{window}: {measured} Hz, bound {bound} ppm");
+            closest = closest.max(off_ppm as f64 / (bound * tsc_hz) as f64);
+        }
+        assert!(closest > 0.9, "the bound is loose: windows come within {closest:.3} of it");
     }
 
     fn truth_rate() -> u64 {
