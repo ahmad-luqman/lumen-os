@@ -93,15 +93,54 @@ KBD_COUNTS = re.compile(
 _PLAIN_KEYS = (
     [chr(c) for c in range(ord("a"), ord("z") + 1)]
     + [str(d) for d in range(10)]
-    + "spc ret minus equal bracket_left bracket_right backslash semicolon apostrophe".split()
-    + "grave_accent comma dot slash esc tab backspace shift shift_r ctrl alt".split()
+    + [
+        "spc",
+        "ret",
+        "minus",
+        "equal",
+        "bracket_left",
+        "bracket_right",
+        "backslash",
+        "semicolon",
+        "apostrophe",
+    ]
+    + [
+        "grave_accent",
+        "comma",
+        "dot",
+        "slash",
+        "esc",
+        "tab",
+        "backspace",
+        "shift",
+        "shift_r",
+        "ctrl",
+        "alt",
+    ]
     + [f"f{n}" for n in range(1, 13)]
 )
 # Keys QEMU's PS/2 keyboard sends with an `0xE0` prefix (set 2, translated
 # to set 1: two bytes pressed, two released).
 EXTENDED_KEYS = frozenset(
-    "ctrl_r alt_r meta_l meta_r compose kp_divide kp_enter up down left right home end pgup pgdn "
-    "insert delete".split()
+    [
+        "ctrl_r",
+        "alt_r",
+        "meta_l",
+        "meta_r",
+        "compose",
+        "kp_divide",
+        "kp_enter",
+        "up",
+        "down",
+        "left",
+        "right",
+        "home",
+        "end",
+        "pgup",
+        "pgdn",
+        "insert",
+        "delete",
+    ]
 )
 # The bytes QEMU's PS/2 keyboard sends, through the 8042's translation,
 # for each key pressed on its own and released: two for a key, four for an
