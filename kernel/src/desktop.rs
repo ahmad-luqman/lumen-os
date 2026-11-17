@@ -78,7 +78,7 @@ pub static WAKE: WaitQueue = WaitQueue::new();
 pub static PENDING: AtomicBool = AtomicBool::new(false);
 /// Set once the compositor thread exists: [`wake`] does nothing before.
 static RUNNING: AtomicBool = AtomicBool::new(false);
-/// A job's answer is in ([`State::answer`]).
+/// The job's answer is in ([`Slot::Answered`]).
 static ANSWERED: AtomicBool = AtomicBool::new(false);
 /// Woken after every pass: a job's asker, and `desktop` waiting for the
 /// compositor to catch up with the cut.
@@ -236,6 +236,84 @@ enum Job {
     Capture(Box<Rows>),
 }
 
+/// The one job slot, reserved from the moment a request is accepted until
+/// its asker takes the answer (or gives up), so a second request meanwhile
+/// is refused and no asker ever gets another's answer.
+enum Slot {
+    Free,
+    /// Accepted, waiting for the compositor's next pass.
+    Queued(Job),
+    /// The compositor is running it (taken out of the slot, the lock
+    /// released); `abandoned` once its asker gave up waiting.
+    Running {
+        abandoned: bool,
+    },
+    /// Done, waiting for its asker.
+    Answered(Answer),
+}
+
+/// Why a request wasn't accepted: another holds the slot.
+const SLOT_BUSY: &str = "busy with another request (`desktop check` or `screenshot`): try again";
+
+impl Slot {
+    /// Accept `job` if the slot is free.
+    fn accept(&mut self, job: Job) -> Result<(), &'static str> {
+        match self {
+            Slot::Free => {
+                *self = Slot::Queued(job);
+                Ok(())
+            }
+            _ => Err(SLOT_BUSY),
+        }
+    }
+
+    /// The compositor takes the queued job to run it (the slot stays
+    /// reserved, `Running`).
+    fn start(&mut self) -> Option<Job> {
+        match core::mem::replace(self, Slot::Free) {
+            Slot::Queued(job) => {
+                *self = Slot::Running { abandoned: false };
+                Some(job)
+            }
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+
+    /// The compositor's answer: for the asker, or dropped (the slot freed)
+    /// if the asker gave up meanwhile.
+    fn finish(&mut self, answer: Answer) {
+        *self = match self {
+            Slot::Running { abandoned: true } => Slot::Free,
+            _ => Slot::Answered(answer),
+        };
+    }
+
+    /// The asker takes its answer, freeing the slot (`None`, changing
+    /// nothing, before it is answered).
+    fn take(&mut self) -> Option<Answer> {
+        match core::mem::replace(self, Slot::Free) {
+            Slot::Answered(answer) => Some(answer),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+
+    /// The asker gives up waiting: a queued job is withdrawn, a running
+    /// one's answer will be dropped when it comes.
+    fn abandon(&mut self) {
+        match self {
+            Slot::Queued(_) | Slot::Answered(_) => *self = Slot::Free,
+            Slot::Running { abandoned } => *abandoned = true,
+            Slot::Free => {}
+        }
+    }
+}
+
 /// A job's answer.
 enum Answer {
     /// Pixels that differ from a full repaint, and from the screen.
@@ -293,16 +371,23 @@ pub struct State {
     screen: Option<ScreenCanvas>,
     /// The compositor should end (its start failed after it began).
     abort: bool,
-    job: Option<Job>,
-    answer: Option<Answer>,
+    /// `desktop check`'s and `screenshot`'s requests (see [`Slot`]).
+    slot: Slot,
     /// The compositor's own owner of the screen.
     owner: Owner,
 }
 
 impl State {
     fn new(width: u32, height: u32, owner: Owner) -> State {
+        // Paused until the compositor acts on the first cut, so the first
+        // entry is a resume like every later one: `Wm::resume` with the
+        // cut's baseline ignores the buttons held then (pressed in the
+        // terminal) until every button is up. (Nothing to deliver: no
+        // window yet.)
+        let mut wm = Wm::new(width, height, METRICS);
+        let _no_windows = wm.interrupt(Interruption::Pause);
         State {
-            wm: Wm::new(width, height, METRICS),
+            wm,
             windows: Vec::new(),
             damage: Gathered::new(),
             width,
@@ -320,8 +405,7 @@ impl State {
             held_back: false,
             screen: None,
             abort: false,
-            job: None,
-            answer: None,
+            slot: Slot::Free,
             owner,
         }
     }
@@ -987,12 +1071,12 @@ impl Compositor {
         let (job, scene, committed) = {
             let mut g = COMPOSITOR.lock();
             let Some(s) = g.as_mut() else { return };
-            let Some(job) = s.job.take() else { return };
+            let Some(job) = s.slot.start() else { return };
             // A check compares with a full repaint of the scene as it is:
             // damage or a commit since the pass makes that a moving target.
             // (A capture copies the back buffer as the pass left it.)
             if matches!(job, Job::Check(_)) && (!s.damage.is_empty() || s.commits > 0) {
-                s.answer = Some(Answer::Busy);
+                s.slot.finish(Answer::Busy);
                 drop(g);
                 ANSWERED.store(true, Ordering::Release);
                 return;
@@ -1030,7 +1114,7 @@ impl Compositor {
             }
         };
         if let Some(s) = COMPOSITOR.lock().as_mut() {
-            s.answer = Some(answer);
+            s.slot.finish(answer);
         }
         ANSWERED.store(true, Ordering::Release);
     }
@@ -1210,7 +1294,9 @@ pub fn is_shown() -> bool {
 }
 
 /// Hand `job` to the compositor and wait (up to 20 s) for its answer:
-/// `Err` with why it wasn't run.
+/// `Err` with why it wasn't run. One request at a time: the slot stays
+/// reserved until this asker takes its answer or gives up, and another
+/// request meanwhile is refused ([`SLOT_BUSY`]).
 fn run_job(job: Job) -> Result<Answer, &'static str> {
     {
         let mut g = COMPOSITOR.lock();
@@ -1218,22 +1304,22 @@ fn run_job(job: Job) -> Result<Answer, &'static str> {
         if !is_shown() {
             return Err("paused (`desktop` resumes it)");
         }
-        if s.job.is_some() || s.answer.is_some() {
-            return Err("busy with another request");
-        }
+        s.slot.accept(job)?;
+        // Only the slot's holder waits on it, so the flag is this one's.
         ANSWERED.store(false, Ordering::Release);
-        s.job = Some(job);
     }
     wake();
     let deadline = crate::time::now_ns().saturating_add(20_000_000_000);
-    let answered = DONE.wait_until_or_deadline(deadline, || ANSWERED.load(Ordering::Acquire));
+    let _ = DONE.wait_until_or_deadline(deadline, || ANSWERED.load(Ordering::Acquire));
     let mut g = COMPOSITOR.lock();
     let s = g.as_mut().ok_or("no desktop")?;
-    if !answered && s.answer.is_none() {
-        s.job = None;
-        return Err("no answer from the compositor in 20 s");
+    match s.slot.take() {
+        Some(answer) => Ok(answer),
+        None => {
+            s.slot.abandon();
+            Err("no answer from the compositor in 20 s")
+        }
     }
-    s.answer.take().ok_or("no answer from the compositor")
 }
 
 /// The back buffer as RGB rows (`screenshot` while the desktop is shown):
@@ -1764,6 +1850,72 @@ crate::ktest!(
         kassert!(first.iter().all(|&p| p == encoded));
         kassert!(rest == &before[width * written..]);
         kassert!(before.iter().any(|&p| p != encoded));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_button_held_at_the_first_entry_is_ignored_until_released() {
+        // The state the desktop starts with, entered as the compositor
+        // enters it (`Wm::resume` with the cut's baseline): the left button
+        // held at the start (pressed in the terminal) is no press on the
+        // window under it: a move with it held drags nothing, a second
+        // button pressed meanwhile is counted, not delivered. Once every
+        // button is up, a press on the title bar drags as usual.
+        use crate::{kassert, kassert_eq};
+        let mut s = State::new(1280, 800, Owner::new());
+        let (id, _) = s.wm.open("w", 200, 100, 100, 100);
+        let frame = s.wm.window(id).ok_or("no window")?.frame();
+        let _ = s.wm.resume(ButtonSet::LEFT);
+        let bar = (frame.x() + 50, frame.y() + 10);
+        let ignored = s.wm.counts().ignored_presses;
+        let out = s.wm.pointer(Pointer::at(bar.0, bar.1, ButtonSet::LEFT));
+        kassert!(out.deliveries.is_empty());
+        let _ = s.wm.pointer(Pointer::at(bar.0 + 40, bar.1 + 40, ButtonSet::LEFT));
+        let _ = s.wm.pointer(Pointer::at(bar.0 + 40, bar.1 + 40, ButtonSet::LEFT.with(ButtonSet::RIGHT)));
+        kassert_eq!(s.wm.dragging(), None);
+        kassert_eq!(s.wm.window(id).ok_or("no window")?.frame(), frame);
+        kassert_eq!(s.wm.counts().ignored_presses, ignored + 1);
+        let _ = s.wm.pointer(Pointer::at(bar.0 + 40, bar.1 + 40, ButtonSet::NONE));
+        let _ = s.wm.pointer(Pointer::at(bar.0, bar.1, ButtonSet::LEFT));
+        let _ = s.wm.pointer(Pointer::at(bar.0 + 10, bar.1 + 20, ButtonSet::LEFT));
+        kassert_eq!(s.wm.dragging(), Some(id));
+        kassert_eq!(s.wm.window(id).ok_or("no window")?.frame().x(), frame.x() + 10);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_request_holds_the_slot_until_its_asker_takes_the_answer() {
+        // The job slot `desktop check` and `screenshot` share: a second
+        // request is refused while the first is queued, while the
+        // compositor runs it (taken out of the slot) and while its answer
+        // waits, so no asker gets another's answer; taking the answer frees
+        // it. An asker that gives up withdraws a queued job, and a running
+        // one's late answer is dropped, freeing the slot.
+        use crate::{kassert, kassert_eq};
+        let job = || Job::Capture(Box::new(Rows::new(1, 1).expect("one pixel")));
+        let mut slot = Slot::Free;
+        kassert!(slot.accept(job()).is_ok());
+        kassert_eq!(slot.accept(job()).err(), Some(SLOT_BUSY));
+        kassert!(slot.start().is_some());
+        kassert!(slot.start().is_none());
+        kassert_eq!(slot.accept(job()).err(), Some(SLOT_BUSY));
+        kassert!(slot.take().is_none());
+        slot.finish(Answer::Busy);
+        kassert_eq!(slot.accept(job()).err(), Some(SLOT_BUSY));
+        kassert!(matches!(slot.take(), Some(Answer::Busy)));
+        kassert!(matches!(slot, Slot::Free));
+        // Given up while queued: withdrawn.
+        kassert!(slot.accept(job()).is_ok());
+        slot.abandon();
+        kassert!(matches!(slot, Slot::Free) && slot.start().is_none());
+        // Given up while running: the late answer is dropped.
+        kassert!(slot.accept(job()).is_ok() && slot.start().is_some());
+        slot.abandon();
+        kassert_eq!(slot.accept(job()).err(), Some(SLOT_BUSY));
+        slot.finish(Answer::Busy);
+        kassert!(matches!(slot, Slot::Free) && slot.take().is_none());
         Ok(())
     }
 );

@@ -2988,7 +2988,10 @@ tree`, `ui invoke`).
   typed in a terminal reaches a window), sets `vt::DESKTOP`, releases the
   lock and wakes the compositor, which sends the focused window
   `FocusGained` (`Wm::resume` with the cut's baseline buttons) and
-  presents everything once.
+  presents everything once. The first start is entered the same way:
+  the window manager starts paused, so `Wm::resume` with the first cut's
+  baseline ignores a button held when `desktop` runs (pressed in the
+  terminal) until every button is up.
 - **Not ended in M4:** there is no `desktop off`; windows go when closed. A
   crash ends everything, as always.
 
@@ -3039,6 +3042,13 @@ until a crash.
     `desktop check: <n> pixels differ from a full repaint, <m> from the
     screen`, or `desktop check: busy` if damage or a commit arrived since
     the pass (the harness retries, a bounded number of times).
+    `desktop check` and `screenshot` (while the desktop is shown) share
+    one request slot, reserved from
+    the moment a request is accepted until its asker takes the answer (or
+    gives up after 20 s, when an answer still coming is dropped): a second
+    request meanwhile is refused at once with `desktop check: busy with
+    another request (...): try again` (or `screenshot: the desktop's back
+    buffer: busy with ...`), never handed the first one's answer.
   - `desktop spin` (for the tests): opens a window whose owner commits a
     changed frame (a pure green bar moving) every 20 ms and reads its
     events.

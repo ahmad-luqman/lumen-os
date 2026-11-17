@@ -167,6 +167,37 @@ def test_drag_moves_window(boot, artifacts):
     assert gui.desktop_check(m) == (0, 0)
 
 
+def test_a_button_held_at_the_start_is_ignored(boot):
+    # The left button pressed (in the terminal) where the Colours window's
+    # title bar will be, and held while `desktop` starts: the first entry
+    # takes it as held across the start, so moving with it and letting it
+    # go drags nothing and presses nothing; once it is up, a drag there
+    # moves the window as usual.
+    m = boot_tablet(boot)
+    x, y, w, h = COLOURS
+    bar = (x + 100, y + 10)
+    gui.pointer_move(m, *bar)
+    gui.pointer_down(m)
+    start_desktop(m)
+    # The first frame the desktop reads is still on the title bar (taken
+    # as a press there, it would start a drag), the next far off it.
+    gui.pointer_move(m, bar[0] + 5, bar[1])
+    gui.pointer_move(m, bar[0] + 200, bar[1] + 150)
+    gui.pointer_up(m)
+    gui.wait_settled(m)
+    rows = gui.windows(m)
+    assert [(r["title"], frame_of(r), r["focused"]) for r in rows] == [
+        ("Colours", COLOURS, "yes"),
+        ("Welcome", WELCOME, "no"),
+    ], rows
+    status = gui.desktop_status(m)
+    assert (status["grab_ends"], status["stray_unpressed"]) == ("0", "0"), status
+    assert gui.desktop_check(m) == (0, 0)
+    gui.drag(m, bar, (bar[0] + 30, bar[1] + 40), 2)
+    gui.wait_settled(m)
+    assert frame_of(gui.window(m, "Colours")) == (x + 30, y + 40, w, h)
+
+
 def test_click_focuses_and_raises(boot):
     # A click on the back window's client area focuses it and raises it to
     # the front; both title bars show it (the focused one's colour moves).
