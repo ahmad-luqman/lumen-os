@@ -88,6 +88,14 @@ def tsc_error_ppm(tsc: int, ref: int, start_gap: int, end_gap: int) -> int:
     return max(high, low)
 
 
+def within_bounds(a: int, b: int, a_ppm: int, b_ppm: int) -> bool:
+    """Whether `a` (off by at most `a_ppm` of the true rate) and `b` (at most
+    `b_ppm`) can measure the same rate: `|a - b| <= (a_ppm + b_ppm) * true`,
+    the true rate being at most `b / (1 - b_ppm)` (as kernel/src/time.rs's
+    within_bounds, without its floor)."""
+    return b_ppm < 1_000_000 and abs(a - b) * (1_000_000 - b_ppm) <= b * (a_ppm + b_ppm)
+
+
 def window_fields(w: str) -> tuple[int, int, int, int, int]:
     """`tsc/reference/polls/start_gap/end_gap` as numbers."""
     fields = w.split("/")
@@ -110,7 +118,8 @@ def check_calibration(cal: Calibration, reference_hz: int) -> None:
     median of five (steady ones first, then, if attempts ran out, the least
     unsteady filling in, #139), its bound within the TSC's tolerance, and each
     window within its own bound plus the median's of it (each is off from the
-    true rate by at most its bound), with at most MOST_RETAKEN taken again
+    true rate by at most its bound, so the two within their bounds' sum of
+    it), with at most MOST_RETAKEN taken again
     unless some filled in."""
     hz, bounds = [], []
     for w in cal.windows.split():
@@ -123,7 +132,7 @@ def check_calibration(cal: Calibration, reference_hz: int) -> None:
     median_ppm = median_bound_ppm(cal)
     assert median_ppm <= TSC_TOLERANCE_PPM, f"median within {median_ppm} ppm: {cal}"
     for one, ppm in zip(hz, bounds, strict=True):
-        assert abs(one - cal.hz) * 1_000_000 <= cal.hz * (ppm + median_ppm + 1), (
+        assert within_bounds(one, cal.hz, ppm, median_ppm), (
             f"a window {one} Hz ({ppm} ppm), the median {cal.hz} Hz ({median_ppm} ppm): {cal}"
         )
     steady = sum(
@@ -234,7 +243,7 @@ def test_tsc_windows_stalled_past_steady_fill_in_within_tolerance(boot):
     assert "WARN" not in out, out
     (tsc, _, _, hpet), cals = clocks_and_windows(m)
     boot_ppm, hpet_ppm = median_bound_ppm(cals["boot"]), median_bound_ppm(cals["hpet"])
-    assert abs(tsc - hpet) * 1_000_000 <= hpet * (boot_ppm + hpet_ppm + 1), (
+    assert within_bounds(tsc, hpet, boot_ppm, hpet_ppm), (
         tsc,
         hpet,
         boot_ppm,
