@@ -15,6 +15,8 @@ from lumen_harness.qemu import EXIT_CRASH
 from PIL import Image
 
 SCREEN_DONE = "(crash report shown on screen)"
+# `desktop spin`'s bar (kernel/src/desktop.rs `spin_owner`).
+GREEN = (0, 255, 0)
 
 # kind -> (exception line regex, function the rip must resolve to)
 FAULTS = {
@@ -158,9 +160,6 @@ def colours_of(shot) -> set[tuple[int, int, int]]:
         colours = img.convert("RGB").getcolors(1 << 24)
     assert colours is not None
     return {c for _, c in colours}
-
-
-GREEN = (0, 255, 0)
 
 
 def test_crash_report_over_desktop(boot, artifacts, golden_dir):

@@ -26,8 +26,8 @@
 //!   in the back buffer and copied to the screen, then the pointer is drawn
 //!   straight onto the screen (never into the back buffer).
 //! - **The live state** is a [`State`] in [`COMPOSITOR`]; the statics are
-//!   private to this module, so the lock order below holds by construction
-//!   outside it.
+//!   private to this module, so outside it the lock order below holds as
+//!   long as callers of its functions hold none of those locks.
 //! - **Locks**, in order: [`COMPOSITOR`] (the window manager, the damage,
 //!   the statistics), a window's lock (its committed surface and queue),
 //!   the heap's, the log's line lock, the screen's. The input rings' and
@@ -50,7 +50,7 @@ use alloc::vec::Vec;
 use core::cell::Cell;
 use core::fmt;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use lumen_gfx::{Damage, Mask, Rect, Surface, Target};
 use lumen_input::cursor::{SPRITE_H, SPRITE_W, draw_arrow};
@@ -90,9 +90,6 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 static DONE: WaitQueue = WaitQueue::new();
 /// The live desktop's state: `None` until it starts (it never ends in M4).
 static COMPOSITOR: SpinLock<Option<State>> = SpinLock::new(None);
-/// The id the next live desktop's first window gets: a start that failed
-/// hands its count on, so no window id is ever reused in a boot.
-static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(1);
 
 /// Wake the compositor (nothing before the desktop started): IRQ 1 when
 /// it queued bytes, the `mouse` thread after pushing frames, every commit
@@ -113,7 +110,7 @@ const METRICS: Metrics = Metrics::DESKTOP;
 /// The bitmap font the titles and the demo windows use (TrueType comes
 /// with #154), and its height in pixels.
 const FONT: RasterHeight = RasterHeight::Size16;
-const FONT_PX: i32 = 16;
+const FONT_PX: i32 = FONT.val() as i32;
 
 /// An automation request (#156 fills this in): none can be made yet, so
 /// no window's queue ever holds one. Not `Clone`: #156's requests answer
@@ -240,150 +237,178 @@ impl fmt::Display for OpenError {
     }
 }
 
-/// What the compositor is asked to do right after a pass.
-enum Job {
-    /// `desktop check`, with its scratch surface.
-    Check(Box<Surface>),
-    /// `screenshot`: the back buffer into these rows.
-    Capture(Box<Rows>),
-}
+/// `desktop check`'s and `screenshot`'s one request slot, its jobs and
+/// answers: a module of their own, so only [`Slot::start`] makes a
+/// [`Ticket`].
+mod slot {
+    use super::{Box, Rows, Surface, fmt};
 
-/// The one request slot, reserved from the moment a request is accepted
-/// until its asker takes the answer (or gives up), so a second request
-/// meanwhile is refused and no asker ever gets another's answer.
-enum Slot {
-    Free,
-    /// Accepted, waiting for the compositor's next pass.
-    Queued(Job),
-    /// The compositor is running it (taken out of the slot, the lock
-    /// released); `abandoned` once its asker gave up waiting.
-    Running {
-        abandoned: bool,
-    },
-    /// Done, waiting for its asker.
-    Answered(Answer),
-}
-
-/// A job taken out of the slot to run: only it can finish the slot, so an
-/// answer can't land in a slot whose job wasn't started.
-struct Ticket(());
-
-impl Slot {
-    /// Accept `job` if the slot is free.
-    fn accept(&mut self, job: Job) -> Result<(), JobError> {
-        match self {
-            Slot::Free => {
-                *self = Slot::Queued(job);
-                Ok(())
-            }
-            _ => Err(JobError::Busy),
-        }
+    /// What the compositor is asked to do right after a pass.
+    pub(super) enum Job {
+        /// `desktop check`, with its scratch surface.
+        Check(Box<Surface>),
+        /// `screenshot`: the back buffer into these rows.
+        Capture(Box<Rows>),
     }
 
-    /// The compositor takes the queued job to run it (the slot stays
-    /// reserved, `Running`).
-    fn start(&mut self) -> Option<(Job, Ticket)> {
-        match core::mem::replace(self, Slot::Free) {
-            Slot::Queued(job) => {
-                *self = Slot::Running { abandoned: false };
-                Some((job, Ticket(())))
-            }
-            other => {
-                *self = other;
-                None
+    /// The one request slot, reserved from the moment a request is accepted
+    /// until its asker takes the answer (or gives up), so a second request
+    /// meanwhile is refused and no asker ever gets another's answer.
+    pub(super) enum Slot {
+        Free,
+        /// Accepted, waiting for the compositor's next pass.
+        Queued(Job),
+        /// The compositor is running it (taken out of the slot, the lock
+        /// released); `abandoned` once its asker gave up waiting.
+        Running {
+            abandoned: bool,
+        },
+        /// Done, waiting for its asker.
+        Answered(Answer),
+    }
+
+    /// A job taken out of the slot to run: only it can finish the slot, so an
+    /// answer can't land in a slot whose job wasn't started (only this module
+    /// makes one).
+    #[must_use = "a started job's ticket finishes the slot"]
+    pub(super) struct Ticket(());
+
+    impl Slot {
+        /// Accept `job` if the slot is free: refused as busy while another
+        /// request holds it, or as stuck while the compositor still runs one
+        /// its asker gave up on.
+        pub(super) fn accept(&mut self, job: Job) -> Result<(), JobError> {
+            match self {
+                Slot::Free => {
+                    *self = Slot::Queued(job);
+                    Ok(())
+                }
+                Slot::Running { abandoned: true } => Err(JobError::Stuck),
+                _ => Err(JobError::Busy),
             }
         }
-    }
 
-    /// The answer of the job `_ticket` started: for the asker, or dropped
-    /// (the slot freed) if the asker gave up meanwhile.
-    fn finish(&mut self, _ticket: Ticket, answer: Answer) {
-        match self {
-            Slot::Running { abandoned: true } => *self = Slot::Free,
-            Slot::Running { abandoned: false } => *self = Slot::Answered(answer),
-            // Only a started job has a ticket, and nothing else leaves
-            // `Running`.
-            Slot::Free | Slot::Queued(_) | Slot::Answered(_) => debug_assert!(false, "a ticket for no running job"),
+        /// The compositor takes the queued job to run it (the slot stays
+        /// reserved, `Running`).
+        #[must_use = "a started job must be finished"]
+        pub(super) fn start(&mut self) -> Option<(Job, Ticket)> {
+            match core::mem::replace(self, Slot::Free) {
+                Slot::Queued(job) => {
+                    *self = Slot::Running { abandoned: false };
+                    Some((job, Ticket(())))
+                }
+                other => {
+                    *self = other;
+                    None
+                }
+            }
         }
-    }
 
-    /// Whether an answer waits for its asker.
-    fn is_answered(&self) -> bool {
-        matches!(self, Slot::Answered(_))
-    }
+        /// The answer of the job `_ticket` started: for the asker, or dropped
+        /// (the slot freed) if the asker gave up meanwhile; whether it was
+        /// dropped.
+        pub(super) fn finish(&mut self, _ticket: Ticket, answer: Answer) -> bool {
+            match self {
+                Slot::Running { abandoned: true } => {
+                    *self = Slot::Free;
+                    true
+                }
+                Slot::Running { abandoned: false } => {
+                    *self = Slot::Answered(answer);
+                    false
+                }
+                // Only a started job has a ticket, and nothing else leaves
+                // `Running`.
+                Slot::Free | Slot::Queued(_) | Slot::Answered(_) => {
+                    debug_assert!(false, "a ticket for no running job");
+                    false
+                }
+            }
+        }
 
-    /// The asker takes its answer, freeing the slot (`None`, changing
-    /// nothing, before it is answered).
-    fn take(&mut self) -> Option<Answer> {
-        match core::mem::replace(self, Slot::Free) {
-            Slot::Answered(answer) => Some(answer),
-            other => {
-                *self = other;
-                None
+        /// Whether an answer waits for its asker.
+        pub(super) fn is_answered(&self) -> bool {
+            matches!(self, Slot::Answered(_))
+        }
+
+        /// The asker takes its answer, freeing the slot (`None`, changing
+        /// nothing, before it is answered).
+        pub(super) fn take(&mut self) -> Option<Answer> {
+            match core::mem::replace(self, Slot::Free) {
+                Slot::Answered(answer) => Some(answer),
+                other => {
+                    *self = other;
+                    None
+                }
+            }
+        }
+
+        /// The asker gives up waiting: a queued job is withdrawn, a running
+        /// one's answer will be dropped when it comes.
+        pub(super) fn abandon(&mut self) {
+            match self {
+                Slot::Queued(_) | Slot::Answered(_) => *self = Slot::Free,
+                Slot::Running { abandoned } => *abandoned = true,
+                Slot::Free => {}
+            }
+        }
+
+        /// A paused pass (nothing presented: no check or capture to make)
+        /// answers a queued job `Paused` at once.
+        pub(super) fn answer_paused(&mut self) {
+            if let Some((_, ticket)) = self.start() {
+                let _ = self.finish(ticket, Answer::Paused);
             }
         }
     }
 
-    /// The asker gives up waiting: a queued job is withdrawn, a running
-    /// one's answer will be dropped when it comes.
-    fn abandon(&mut self) {
-        match self {
-            Slot::Queued(_) | Slot::Answered(_) => *self = Slot::Free,
-            Slot::Running { abandoned } => *abandoned = true,
-            Slot::Free => {}
+    /// A job's answer.
+    pub(super) enum Answer {
+        /// Pixels that differ from a full repaint, and from the screen.
+        Check {
+            repaint: u64,
+            screen: u64,
+        },
+        /// Damage or a commit arrived meanwhile: try again.
+        Busy,
+        /// The screen was taken back (Alt+F`n`) while the check read it.
+        ScreenTaken,
+        /// The desktop was paused before the job ran.
+        Paused,
+        Capture {
+            rows: Box<Rows>,
+            ns: u64,
+        },
+        /// The rows aren't the back buffer's size.
+        WrongSize,
+    }
+
+    /// Why a request got no answer.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum JobError {
+        NoDesktop,
+        Paused,
+        /// Another request holds the slot.
+        Busy,
+        /// The compositor still runs a request its asker gave up on.
+        Stuck,
+        NoAnswer,
+    }
+
+    impl fmt::Display for JobError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(match self {
+                JobError::NoDesktop => "no desktop",
+                JobError::Paused => "paused (`desktop` resumes it)",
+                JobError::Busy => "busy with another request (`desktop check` or `screenshot`): try again",
+                JobError::Stuck => "the compositor hasn't finished a request given up on (stuck?)",
+                JobError::NoAnswer => "no answer from the compositor in 20 s",
+            })
         }
     }
-
-    /// A paused pass (nothing presented: no check or capture to make)
-    /// answers a queued job `Paused` at once.
-    fn answer_paused(&mut self) {
-        if let Some((_, ticket)) = self.start() {
-            self.finish(ticket, Answer::Paused);
-        }
-    }
 }
 
-/// A job's answer.
-enum Answer {
-    /// Pixels that differ from a full repaint, and from the screen.
-    Check {
-        repaint: u64,
-        screen: u64,
-    },
-    /// Damage or a commit arrived meanwhile: try again.
-    Busy,
-    /// The screen was taken back (Alt+F`n`) while the check read it.
-    ScreenTaken,
-    /// The desktop was paused before the job ran.
-    Paused,
-    Capture {
-        rows: Box<Rows>,
-        ns: u64,
-    },
-    /// The rows aren't the back buffer's size.
-    WrongSize,
-}
-
-/// Why a request got no answer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum JobError {
-    NoDesktop,
-    Paused,
-    /// Another request holds the slot.
-    Busy,
-    NoAnswer,
-}
-
-impl fmt::Display for JobError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            JobError::NoDesktop => "no desktop",
-            JobError::Paused => "paused (`desktop` resumes it)",
-            JobError::Busy => "busy with another request (`desktop check` or `screenshot`): try again",
-            JobError::NoAnswer => "no answer from the compositor in 20 s",
-        })
-    }
-}
+use slot::{Answer, Job, JobError, Slot};
 
 /// What `desktop status` counts.
 #[derive(Clone, Copy, Default)]
@@ -436,14 +461,14 @@ struct State {
 }
 
 impl State {
-    /// A `width` x `height` desktop whose first window gets id `next_id`.
-    fn new(width: u32, height: u32, next_id: u32) -> State {
+    /// A `width` x `height` desktop, not started yet.
+    fn new(width: u32, height: u32) -> State {
         // Paused until the compositor acts on the first cut, so the first
         // entry is a resume like every later one: `Wm::resume` with the
         // cut's baseline ignores the buttons held then (pressed in the
         // terminal) until every button is up. (Nothing to deliver: no
         // window yet.)
-        let mut wm = Wm::new(width, height, METRICS).with_next_id(next_id);
+        let mut wm = Wm::new(width, height, METRICS);
         let _no_windows = wm.interrupt(Interruption::Pause);
         State {
             wm,
@@ -481,16 +506,21 @@ impl State {
             self.damage.add(*r);
         }
         for d in &out.deliveries {
-            self.push(d.window(), after, |q| lumen_wm::deliver(q, d));
+            let _ = self.push(d.window(), after, |q| lumen_wm::deliver(q, d));
         }
     }
 
-    /// Change window `id`'s queue with `f`; for a window that had closed,
-    /// count a dead push instead.
-    fn push(&mut self, id: WindowId, after: &mut After, f: impl FnOnce(&mut Queue) -> Option<Pushed>) {
+    /// Change window `id`'s queue with `f`, returning what it did; for a
+    /// window no longer on the list, count a dead push instead (`None`).
+    fn push(
+        &mut self,
+        id: WindowId,
+        after: &mut After,
+        f: impl FnOnce(&mut Queue) -> Option<Pushed>,
+    ) -> Option<Pushed> {
         let Some(win) = self.window(id) else {
             self.stats.dead_pushes += 1;
-            return;
+            return None;
         };
         let pushed = {
             let mut inner = win.inner.lock();
@@ -502,6 +532,7 @@ impl State {
             after.behind.push(id.get());
         }
         after.wake.push(win.clone());
+        pushed
     }
 }
 
@@ -565,7 +596,7 @@ impl Desktop {
     /// A 1280x800 desktop with no compositor and no screen, started:
     /// windows open and close, nothing is drawn.
     pub fn without_screen() -> Desktop {
-        let mut state = State::new(1280, 800, 1);
+        let mut state = State::new(1280, 800);
         state.started = true;
         Desktop { home: Home::Own(Arc::new(SpinLock::new(Some(state)))) }
     }
@@ -889,6 +920,28 @@ struct Presented {
     frame: bool,
 }
 
+/// The most `lumen.desktop_cut_delay_ms=` waits: under the 5 s a resume
+/// waits for the compositor.
+const CUT_DELAY_MAX_MS: u64 = 2000;
+
+/// `lumen.desktop_cut_delay_ms=<ms>`, for the scenarios (0 without it): a
+/// wait between reading the rings and reading the cut, said at INFO; a
+/// value that doesn't parse is warned about and ignored, one past
+/// [`CUT_DELAY_MAX_MS`] capped.
+fn cut_delay_ms() -> u64 {
+    const KEY: &str = "lumen.desktop_cut_delay_ms";
+    let Some(v) = crate::cmdline::value(KEY) else { return 0 };
+    let Ok(ms) = v.parse::<u64>() else {
+        log::warn!(target: "desktop", "{KEY}={v}: not a number of milliseconds, ignored");
+        return 0;
+    };
+    let ms = ms.min(CUT_DELAY_MAX_MS);
+    if ms > 0 {
+        log::info!(target: "desktop", "waiting {ms} ms between reading input and the cut ({KEY})");
+    }
+    ms
+}
+
 /// Whether `e` is an Alt+F`n` press: the cut's barrier in the key ring.
 fn is_switch(e: &KeyEvent) -> bool {
     matches!(e.action, KeyAction::Press { .. }) && vt::switch_key(e.code, e.mods.is_alt()).is_some()
@@ -907,10 +960,7 @@ fn position(e: &PointerEvent) -> (i32, i32) {
 
 impl Compositor {
     fn new(back: Surface) -> Compositor {
-        let delay_ms = crate::cmdline::value("lumen.desktop_cut_delay_ms").and_then(|v| v.parse::<u64>().ok());
-        if let Some(ms) = delay_ms.filter(|&ms| ms > 0) {
-            log::info!(target: "desktop", "waiting {ms} ms between reading input and the cut (lumen.desktop_cut_delay_ms)");
-        }
+        let delay_ms = cut_delay_ms();
         Compositor {
             back,
             screen: None,
@@ -922,7 +972,7 @@ impl Compositor {
             shown: false,
             pointer: None,
             drawn: None,
-            cut_delay_ns: delay_ms.unwrap_or(0).saturating_mul(1_000_000),
+            cut_delay_ns: delay_ms.saturating_mul(1_000_000),
         }
     }
 
@@ -958,9 +1008,8 @@ impl Compositor {
             let _ = crate::sched::sleep(self.cut_delay_ns);
         }
         // After reading the rings: a pause written after this read has
-        // marks past every event read, so those were the desktop's. (One
-        // written between the read and here is handled by reading again in
-        // the pause: `input`.)
+        // marks past every event read, so those were the desktop's (one
+        // written between the read and here: see `input`'s pause).
         let cut = vt::cut();
         let mut after = After::default();
         let (damage, scene) = {
@@ -971,10 +1020,13 @@ impl Compositor {
             s.shown = self.shown;
             s.held_back = !self.key_queue.is_empty() || !self.pointer_queue.is_empty();
             if !self.shown {
-                // Paused: nothing is presented, and the damage gathers
-                // until the resume, which presents everything. A request
+                // Not shown: nothing is presented, and the damage gathers
+                // until the resume, which presents everything. Really
+                // paused (not a resume waiting for its screen), a request
                 // waiting can't be answered from the screen.
-                s.slot.answer_paused();
+                if cut.is_paused() {
+                    s.slot.answer_paused();
+                }
                 drop(g);
                 after.finish();
                 self.publish(None);
@@ -1027,8 +1079,9 @@ impl Compositor {
                 self.feed_keys(s, after, |seq| cut.pause_owns_key(seq));
                 let out = s.wm.interrupt(Interruption::Pause);
                 s.apply(out, after);
-                self.pointer_queue.clear();
-                self.key_queue.clear();
+                // (Events past the marks were the terminal's: the
+                // trailing branch below drops them unless a resume in this
+                // same look keeps those after its own marks.)
                 self.shown = false;
                 // `leave_desktop` took the screen back and redrew it.
                 self.screen = None;
@@ -1095,13 +1148,9 @@ impl Compositor {
             }
             match s.wm.focused() {
                 Some(id) => {
-                    let mut took = false;
-                    s.push(id, after, |q| {
-                        let pushed = q.push(Entry::Key(r.event));
-                        took = pushed == Pushed::Queued;
-                        Some(pushed)
-                    });
-                    if took && let Some(w) = s.window(id) {
+                    if s.push(id, after, |q| Some(q.push(Entry::Key(r.event)))) == Some(Pushed::Queued)
+                        && let Some(w) = s.window(id)
+                    {
                         w.keys.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -1174,8 +1223,9 @@ impl Compositor {
             Job::Check(scratch) => self.check(scratch, &scene, committed),
             Job::Capture(rows) => self.capture(rows),
         };
-        if let Some(s) = COMPOSITOR.lock().as_mut() {
-            s.slot.finish(ticket, answer);
+        let dropped = COMPOSITOR.lock().as_mut().is_some_and(|s| s.slot.finish(ticket, answer));
+        if dropped {
+            log::info!(target: "desktop", "a request's answer came after its asker gave up: dropped");
         }
     }
 
@@ -1277,7 +1327,7 @@ impl fmt::Display for StartError {
             StartError::NoThread(e) => write!(f, "no thread for the compositor: {e}"),
             StartError::Screen(e) => write!(f, "{e}"),
             StartError::Behind => f.write_str("the compositor hasn't caught up with the last pause"),
-            StartError::Busy => f.write_str("another `desktop` is starting or resuming it: try again"),
+            StartError::Busy => f.write_str("another `desktop` is starting or resuming it"),
         }
     }
 }
@@ -1315,27 +1365,38 @@ static START_BUSY: AtomicBool = AtomicBool::new(false);
 
 /// Start the desktop, or resume it (see the module doc).
 pub fn start() -> Result<Shown, Refused> {
-    let started = COMPOSITOR.lock().as_ref().is_some_and(|s| s.started);
+    let started = || COMPOSITOR.lock().as_ref().is_some_and(|s| s.started);
+    // Win the flag first, then look: a look before it could be stale by the
+    // time the other `desktop` finished, and pick a first start over a live
+    // desktop.
     if START_BUSY.swap(true, Ordering::AcqRel) {
-        return Err(Refused { resuming: started, why: StartError::Busy });
+        return Err(Refused { resuming: started(), why: StartError::Busy });
     }
+    let started = started();
     let result = if started { resume() } else { first_start() };
     START_BUSY.store(false, Ordering::Release);
     result.map_err(|why| Refused { resuming: started, why })
 }
 
 /// The first `desktop`.
+/// Never over a desktop already there (a state, started or starting):
+/// that is refused as busy, the live one untouched.
 fn first_start() -> Result<Shown, StartError> {
+    if COMPOSITOR.lock().is_some() {
+        return Err(StartError::Busy);
+    }
     let (w, h) = term::screen_size().ok_or(StartError::NoScreen)?;
     let (w, h) = (w as u32, h as u32);
     let back = Surface::with_stride(w, h, w as usize).ok_or(StartError::NoMemory)?;
     let owner = Owner::new();
-    *COMPOSITOR.lock() = Some(State::new(w, h, NEXT_WINDOW_ID.load(Ordering::Relaxed)));
-    let undo = || {
-        if let Some(s) = COMPOSITOR.lock().take() {
-            NEXT_WINDOW_ID.store(s.wm.next_id(), Ordering::Relaxed);
+    {
+        let mut g = COMPOSITOR.lock();
+        if g.is_some() {
+            return Err(StartError::Busy);
         }
-    };
+        *g = Some(State::new(w, h));
+    }
+    let undo = || *COMPOSITOR.lock() = None;
     let compositor = Compositor::new(back);
     let thread = match crate::sched::spawn("compositor", move || compositor.run()) {
         Ok(t) => t,
@@ -1361,8 +1422,7 @@ fn first_start() -> Result<Shown, StartError> {
             if let Some(s) = COMPOSITOR.lock().as_mut() {
                 s.abort = true;
             }
-            PENDING.store(true, Ordering::Release);
-            WAKE.wake_all();
+            wake();
             thread.join();
             RUNNING.store(false, Ordering::Release);
             undo();
@@ -1440,10 +1500,14 @@ fn await_answer(home: &Home) -> Result<Answer, JobError> {
         }
         answer
     };
-    taken.ok_or_else(|| {
-        log::warn!(target: "desktop", "no answer from the compositor in 20 s");
-        JobError::NoAnswer
-    })
+    match taken {
+        Some(Answer::Paused) => Err(JobError::Paused),
+        Some(answer) => Ok(answer),
+        None => {
+            log::warn!(target: "desktop", "no answer from the compositor in 20 s");
+            Err(JobError::NoAnswer)
+        }
+    }
 }
 
 /// Hand `job` to the live compositor and wait for its answer. One request
@@ -1469,7 +1533,7 @@ pub fn capture(rows: Rows) -> Option<Result<(Rows, u64), String>> {
 fn capture_answer(outcome: Result<Answer, JobError>) -> Option<Result<(Rows, u64), String>> {
     match outcome {
         Ok(Answer::Capture { rows, ns }) => Some(Ok((*rows, ns))),
-        Ok(Answer::Paused) | Err(JobError::Paused) | Err(JobError::NoDesktop) => None,
+        Err(JobError::Paused | JobError::NoDesktop) => None,
         Ok(Answer::WrongSize) => Some(Err(String::from("the rows aren't the back buffer's size"))),
         Ok(_) => Some(Err(String::from("the compositor answered something else"))),
         Err(e) => Some(Err(alloc::format!("{e}"))),
@@ -1760,18 +1824,21 @@ pub fn status_table() -> pipe::Table {
         windows_idle &= inner.queue.is_idle() && w.idle.load(Ordering::Acquire);
     }
     let shown = vt::desktop_shown();
-    let settled = shown
-        && s.shown
-        && s.seen_generation == generation
-        && all_decoded
-        && s.pointer_read == pointer_newest
-        && s.keys_read == keys_newest
-        && !s.held_back
-        && s.damage.is_empty()
-        && !s.passing
-        && s.commits == 0
-        && !pending
-        && windows_idle;
+    let settled = Settled {
+        shown,
+        compositor_shown: s.shown,
+        acted_on_cut: s.seen_generation == generation,
+        all_decoded,
+        pointer_read: s.pointer_read == pointer_newest,
+        keys_read: s.keys_read == keys_newest,
+        held_back: s.held_back,
+        damage: !s.damage.is_empty(),
+        passing: s.passing,
+        committing: s.commits > 0,
+        pending,
+        windows_idle,
+    }
+    .holds();
     let wm = s.wm.counts();
     let ms = s.stats.present_ns / 1_000_000;
     let us = (s.stats.present_ns / 1_000) % 1_000;
@@ -1802,6 +1869,49 @@ pub fn status_table() -> pipe::Table {
         yes(settled),
     ]);
     t
+}
+
+/// What `desktop status`'s `settled` is made of (§11): each a look taken
+/// for that record.
+#[derive(Clone, Copy)]
+struct Settled {
+    /// The desktop is shown (`vt::desktop_shown`).
+    shown: bool,
+    /// The compositor presents, and has acted on the cut's generation.
+    compositor_shown: bool,
+    acted_on_cut: bool,
+    /// Every byte the keyboard queued is decoded.
+    all_decoded: bool,
+    /// Each reader is at its ring's newest.
+    pointer_read: bool,
+    keys_read: bool,
+    /// The compositor holds events back.
+    held_back: bool,
+    /// Damage is gathered, a pass is running, a commit is under way, a wake
+    /// is pending.
+    damage: bool,
+    passing: bool,
+    committing: bool,
+    pending: bool,
+    /// Every window's queue is idle and its owner waits.
+    windows_idle: bool,
+}
+
+impl Settled {
+    fn holds(&self) -> bool {
+        self.shown
+            && self.compositor_shown
+            && self.acted_on_cut
+            && self.all_decoded
+            && self.pointer_read
+            && self.keys_read
+            && !self.held_back
+            && !self.damage
+            && !self.passing
+            && !self.committing
+            && !self.pending
+            && self.windows_idle
+    }
 }
 
 /// `desktop`'s records: `desktop status`'s.
@@ -1858,8 +1968,7 @@ pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
                     let _ = writeln!(ctx.out, "desktop check: busy");
                 }
                 Ok(Answer::ScreenTaken) => ctx.fail("desktop check: the screen was taken back during the check"),
-                Ok(Answer::Paused) | Err(JobError::Paused) => ctx.fail("desktop check: paused (`desktop` resumes it)"),
-                Ok(Answer::Capture { .. } | Answer::WrongSize) => {
+                Ok(Answer::Paused | Answer::Capture { .. } | Answer::WrongSize) => {
                     ctx.fail("desktop check: the compositor answered something else")
                 }
                 Err(e) => ctx.fail(format_args!("desktop check: {e}")),
@@ -1940,18 +2049,94 @@ crate::ktest!(
 crate::ktest!(
     fn a_window_opens_only_once_the_start_completed() {
         // A desktop whose start hasn't completed (its screen not taken yet)
-        // refuses windows, so none outlives a start that fails; a desktop
-        // made again carries on the window ids.
+        // refuses windows, so a start that fails opens none and no window
+        // id is ever reused in a boot.
         use crate::{kassert, kassert_eq};
-        let home = Home::Own(Arc::new(SpinLock::new(Some(State::new(1280, 800, 7)))));
+        let home = Home::Own(Arc::new(SpinLock::new(Some(State::new(1280, 800)))));
         let d = Desktop { home };
         kassert_eq!(d.open_window("w", 16, 16).err(), Some(OpenError::NoDesktop));
         if let Some(s) = d.home.lock().as_mut() {
             s.started = true;
         }
-        let w = d.open_window("w", 16, 16).map_err(|_| "a window once started")?;
-        kassert_eq!(w.id(), 7);
-        kassert!(d.open_window("w", 16, 16).is_ok_and(|w| w.id() == 8));
+        kassert!(d.open_window("w", 16, 16).is_ok_and(|w| w.id() == 1));
+        Ok(())
+    }
+);
+
+/// Puts the live desktop's state back to none when dropped: a ktest that
+/// sets one keeps one, so failing half-way leaves no desktop behind.
+#[cfg(feature = "ktest")]
+struct NoDesktopAfter;
+
+#[cfg(feature = "ktest")]
+impl Drop for NoDesktopAfter {
+    fn drop(&mut self) {
+        *COMPOSITOR.lock() = None;
+    }
+}
+
+crate::ktest!(
+    fn a_first_start_over_a_live_desktop_is_refused() {
+        // A second `desktop` that (from a stale look) takes the first-start
+        // path while a desktop is there, started or starting, is refused as
+        // busy and leaves that desktop's state as it was: never a second
+        // state over it, its compositor never told to end.
+        use crate::kassert;
+        kassert!(COMPOSITOR.lock().is_none());
+        let _none = NoDesktopAfter;
+        let mut live = State::new(321, 123);
+        live.started = true;
+        *COMPOSITOR.lock() = Some(live);
+        kassert!(matches!(first_start(), Err(StartError::Busy)));
+        let g = COMPOSITOR.lock();
+        let s = g.as_ref().ok_or("the state was taken")?;
+        kassert!((s.width, s.height, s.started, s.abort) == (321, 123, true, false));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn settled_needs_every_one_of_its_conditions() {
+        // `desktop status`'s `settled`: yes with every condition met, and
+        // no as soon as any one of them isn't (a pass running included).
+        use crate::kassert;
+        let all = Settled {
+            shown: true,
+            compositor_shown: true,
+            acted_on_cut: true,
+            all_decoded: true,
+            pointer_read: true,
+            keys_read: true,
+            held_back: false,
+            damage: false,
+            passing: false,
+            committing: false,
+            pending: false,
+            windows_idle: true,
+        };
+        kassert!(all.holds());
+        let broken: [fn(&mut Settled); 12] = [
+            |s| s.shown = false,
+            |s| s.compositor_shown = false,
+            |s| s.acted_on_cut = false,
+            |s| s.all_decoded = false,
+            |s| s.pointer_read = false,
+            |s| s.keys_read = false,
+            |s| s.held_back = true,
+            |s| s.damage = true,
+            |s| s.passing = true,
+            |s| s.committing = true,
+            |s| s.pending = true,
+            |s| s.windows_idle = false,
+        ];
+        for (i, f) in broken.iter().enumerate() {
+            let mut one = all;
+            f(&mut one);
+            if one.holds() {
+                crate::ktest::diag(format_args!("condition {i} ignored"));
+                return Err("settled with a condition unmet");
+            }
+        }
         Ok(())
     }
 );
@@ -1960,13 +2145,20 @@ crate::ktest!(
     fn a_closed_window_s_deliveries_count_as_dead_pushes() {
         // A delivery for a window no longer on the list (closed) is
         // counted, not lost silently; the closed window's own queue counts
-        // are kept in the totals.
+        // are kept in the totals (its rationed key press, here).
         use crate::kassert_eq;
         let d = Desktop::without_screen();
         let w = d.open_window("w", 16, 16).map_err(|_| "a window")?;
         let id = {
-            let g = d.home.lock();
-            g.as_ref().and_then(|s| s.wm.id(w.id())).ok_or("its id")?
+            let mut g = d.home.lock();
+            let s = g.as_mut().ok_or("the state")?;
+            let id = s.wm.id(w.id()).ok_or("its id")?;
+            // Fill its queue to the ration, then one press more: rationed.
+            let mut after = After::default();
+            for _ in 0..=lumen_wm::queue::RATIONED {
+                let _ = s.push(id, &mut after, |q| Some(q.push(Entry::Key(test_key()))));
+            }
+            id
         };
         drop(w);
         let mut g = d.home.lock();
@@ -1975,6 +2167,7 @@ crate::ktest!(
         s.push(id, &mut after, |q| Some(q.push(Entry::Key(test_key()))));
         kassert_eq!(s.stats.dead_pushes, 1);
         kassert_eq!(after.wake.len(), 0);
+        kassert_eq!(s.closed.rationed, 1);
         Ok(())
     }
 );
@@ -2046,7 +2239,7 @@ crate::ktest!(
         // button pressed meanwhile is counted, not delivered. Once every
         // button is up, a press on the title bar drags as usual.
         use crate::{kassert, kassert_eq};
-        let mut s = State::new(1280, 800, 1);
+        let mut s = State::new(1280, 800);
         let (id, _) = s.wm.open("w", 200, 100, 100, 100);
         let frame = s.wm.window(id).ok_or("no window")?.frame();
         let _ = s.wm.resume(ButtonSet::LEFT);
@@ -2090,7 +2283,7 @@ crate::ktest!(
         kassert!(slot.start().is_none());
         kassert_eq!(slot.accept(test_job()).err(), Some(JobError::Busy));
         kassert!(slot.take().is_none() && !slot.is_answered());
-        slot.finish(ticket, Answer::Busy);
+        kassert!(!slot.finish(ticket, Answer::Busy));
         kassert!(slot.is_answered());
         kassert_eq!(slot.accept(test_job()).err(), Some(JobError::Busy));
         kassert!(matches!(slot.take(), Some(Answer::Busy)));
@@ -2103,8 +2296,10 @@ crate::ktest!(
         kassert!(slot.accept(test_job()).is_ok());
         let (_, ticket) = slot.start().ok_or("not started")?;
         slot.abandon();
-        kassert_eq!(slot.accept(test_job()).err(), Some(JobError::Busy));
-        slot.finish(ticket, Answer::Busy);
+        // Not "busy with another request": the one given up on still runs.
+        kassert_eq!(slot.accept(test_job()).err(), Some(JobError::Stuck));
+        // The late answer is dropped.
+        kassert!(slot.finish(ticket, Answer::Busy));
         kassert!(matches!(slot, Slot::Free) && slot.take().is_none());
         Ok(())
     }
@@ -2112,10 +2307,11 @@ crate::ktest!(
 
 crate::ktest!(
     fn a_second_request_is_refused_while_the_first_waits() {
-        // Through the asker's own path (`submit`, as `run_job` makes it)
-        // on a desktop of its own: the first request is accepted, a second
-        // meanwhile is refused as busy and never queued; once the first's
-        // answer is taken, the next is accepted.
+        // Through the asker's own steps, `submit` and `await_answer` (what
+        // `run_job` calls on the live desktop), on a desktop of its own: the
+        // first request is accepted, a second meanwhile is refused as busy
+        // and never queued; once the first's answer is taken, the next is
+        // accepted.
         use crate::{kassert, kassert_eq};
         let d = Desktop::without_screen();
         kassert!(submit(&d.home, test_job()).is_ok());
@@ -2124,7 +2320,7 @@ crate::ktest!(
             let mut g = d.home.lock();
             let s = g.as_mut().ok_or("the state")?;
             let (_, ticket) = s.slot.start().ok_or("the first request")?;
-            s.slot.finish(ticket, Answer::Busy);
+            let _ = s.slot.finish(ticket, Answer::Busy);
         }
         kassert!(matches!(await_answer(&d.home), Ok(Answer::Busy)));
         kassert!(submit(&d.home, test_job()).is_ok());
@@ -2136,16 +2332,19 @@ crate::ktest!(
     fn a_request_queued_when_the_desktop_pauses_is_answered_paused() {
         // A request accepted just before Alt+F`n`: the paused pass answers
         // it at once (`Slot::answer_paused`), freeing the asker rather
-        // than leaving it 20 s; for `screenshot` that answer, like a
-        // request refused while paused, means "read the text screen".
+        // than leaving it 20 s; the asker takes it as `JobError::Paused`,
+        // which for `screenshot`, like a request refused while paused,
+        // means "read the text screen".
         use crate::kassert;
+        let d = Desktop::without_screen();
         let mut slot = Slot::Free;
         slot.answer_paused();
         kassert!(matches!(slot, Slot::Free));
-        kassert!(slot.accept(test_job()).is_ok());
-        slot.answer_paused();
-        kassert!(matches!(slot.take(), Some(Answer::Paused)));
-        kassert!(capture_answer(Ok(Answer::Paused)).is_none());
+        kassert!(submit(&d.home, test_job()).is_ok());
+        if let Some(s) = d.home.lock().as_mut() {
+            s.slot.answer_paused();
+        }
+        kassert!(matches!(await_answer(&d.home), Err(JobError::Paused)));
         kassert!(capture_answer(Err(JobError::Paused)).is_none());
         kassert!(matches!(capture_answer(Ok(Answer::WrongSize)), Some(Err(_))));
         kassert!(matches!(capture_answer(Err(JobError::Busy)), Some(Err(_))));

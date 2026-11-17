@@ -624,6 +624,9 @@ fn claim<T>(holder: impl FnOnce(u64) -> Holder, make: impl FnOnce(&mut Screen, u
         if STOPPED.load(Ordering::Acquire) {
             return Err(CanvasError::Stopped);
         }
+        // The holder is set before `make` runs: the switch a command's
+        // canvas makes (`Screen::switch`) then draws no cells while the
+        // pixels are held.
         s.holder = Some(holder(epoch));
         Ok(make(s, epoch))
     });

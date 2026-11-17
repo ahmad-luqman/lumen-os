@@ -12,17 +12,17 @@ from lumen_harness import gui
 from lumen_harness.image import assert_matches_golden, compare
 from lumen_harness.qemu import Devices, Machine
 from lumen_harness.screen import expect_screen, read_screen
-from lumen_harness.screenshot import FrameError, assert_matches_screendump
-from lumen_harness.shell import PROMPT, run
+from lumen_harness.screenshot import FrameError, assert_matches_screendump, parse_frame
+from lumen_harness.shell import PROMPT, read_output, run
 from PIL import Image
 
 SHELLS = r"INFO  shell: shells on serial and the screen; type 'help'\n"
 PAUSED = ", paused (a command is drawing)"
 
 
-def boot_shells(boot) -> Machine:
-    # No tablet: no mouse pointer on the screen.
-    m = boot("qemutest")
+def boot_shells(boot, **kwargs) -> Machine:
+    # No tablet (unless `devices` says so): no mouse pointer on the screen.
+    m = boot("qemutest", **kwargs)
     m.expect(SHELLS, 60)
     m.expect(PROMPT, 60)
     return m
@@ -105,9 +105,17 @@ def pixel(shot, x: int, y: int) -> tuple[int, int, int]:
 
 
 def boot_tablet(boot, **kwargs) -> Machine:
-    m = boot("qemutest", devices=Devices(tablet=True), **kwargs)
-    m.expect(SHELLS, 60)
-    m.expect(PROMPT, 60)
+    return boot_shells(boot, devices=Devices(tablet=True), **kwargs)
+
+
+def boot_cut_delay(boot, ms: int) -> Machine:
+    """A machine whose compositor waits `ms` between reading the rings and
+    reading the cut (`lumen.desktop_cut_delay_ms`), its desktop started;
+    the knob's INFO line checked, so a typo can't silently skip the race."""
+    m = boot_shells(boot, cmdline=f"lumen.desktop_cut_delay_ms={ms}")
+    gui.start_desktop(m)
+    said = f"INFO  desktop: waiting {ms} ms between reading input and the cut (lumen.desktop_cut_delay_ms)"
+    assert said in m.output, "the cut delay wasn't taken"
     return m
 
 
@@ -135,6 +143,9 @@ def test_two_windows_golden(boot, artifacts, golden_dir):
     focused = gui.parse_records(run(m, "windows | where focused = yes"))
     assert [w["title"] for w in focused] == ["Colours"], focused
     assert run(m, "windows | where focused = no | count") == "1\n"
+    assert gui.parse_records(run(m, "desktop status | select state windows")) == [
+        {"state": "shown", "windows": "2"}
+    ]
     shot = gui.settled_screendump(m, "desktop.png")
     assert_matches_golden(
         shot,
@@ -244,14 +255,14 @@ def to_desktop(m: Machine) -> int:
 def test_leaving_and_resuming_the_desktop(boot):
     # On two CPUs. Keys typed while the desktop is shown go to the focused
     # window and never reach terminal 1's shell (`term text`, and `vt`'s
-    # count of keys to the desktop); one key redraws only its line (far
-    # fewer pixels than the screen); Alt+F1 leaves it (the F1 press and
-    # release reach neither side: the window gets only the Alt press before
-    # it, then loses the focus); keys typed in the terminal then never reach
-    # a window; `desktop` resumes it, focus back on the same window.
-    m = boot("qemutest", extra=["-smp", "2"])
-    m.expect(SHELLS, 60)
-    m.expect(PROMPT, 60)
+    # count of keys to the desktop); one key's rectangles presented add
+    # under a tenth of the screen's pixels; Alt+F1 leaves it (the F1 press
+    # and release reach neither side: the window gets only the Alt press
+    # before it, then `FocusLost` in its queue, while `windows` still shows
+    # it focused, to give it back at the resume); keys typed in the terminal
+    # then never reach a window; `desktop` resumes it, focus back on the
+    # same window.
+    m = boot_shells(boot, extra=["-smp", "2"])
     gui.start_desktop(m)
     terminal = read_screen(m)
     sent = to_desktop(m)
@@ -261,7 +272,7 @@ def test_leaving_and_resuming_the_desktop(boot):
     assert to_desktop(m) == sent + 2
     assert read_screen(m).rows == terminal.rows
     gui.confirmed_keys(m, ["alt", "f1"])
-    gui.wait_for(m, "the pause", lambda: gui.desktop_status(m)["state"], lambda s: s == "paused")
+    gui.wait_desktop_state(m, "paused")
     # (The compositor acts on the pause at its next pass.)
     wait_keys(m, "Colours", 5)
     assert gui.window(m, "Colours")["focused"] == "yes"
@@ -295,17 +306,45 @@ def test_keys_just_before_alt_f_reach_the_window(boot):
     # window still gets every event before the Alt+F1 press: `x`'s press
     # and release and the Alt press. And while the compositor hasn't acted
     # on a key that reached IRQ 1, the desktop isn't settled.
-    m = boot("qemutest", cmdline="lumen.desktop_cut_delay_ms=500")
-    m.expect(SHELLS, 60)
-    m.expect(PROMPT, 60)
-    gui.start_desktop(m)
+    m = boot_cut_delay(boot, 500)
     gui.confirmed_keys(m, "y")
     assert gui.desktop_status(m)["settled"] == "no", "settled with a key not acted on"
     wait_keys(m, "Colours", 2)
     gui.wait_settled(m)
     gui.confirmed_keys(m, "x", ["alt", "f1"])
-    gui.wait_for(m, "the pause", lambda: gui.desktop_status(m)["state"], lambda s: s == "paused")
+    gui.wait_desktop_state(m, "paused")
     wait_keys(m, "Colours", 5)
+
+
+def pause_while(m: Machine, line: str) -> None:
+    """Send `line` on the serial shell while the compositor waits between
+    reading the rings and reading the cut (a key wakes it into that
+    wait), then Alt+F1: the request `line` makes is accepted while the
+    desktop is shown and still queued when the pause comes."""
+    m.press(["y"])
+    time.sleep(0.3)
+    m.send_line(line)
+    m.press(["alt", "f1"])
+
+
+def test_a_check_queued_as_the_desktop_pauses_is_answered_paused(boot):
+    # `desktop check` accepted just before Alt+F1: the paused pass answers
+    # it at once (within 10 s, not after the asker's 20 s), and no WARN.
+    m = boot_cut_delay(boot, 1500)
+    pause_while(m, "desktop check")
+    assert read_output(m, "desktop check", 10) == "desktop check: paused (`desktop` resumes it)\n"
+    gui.wait_desktop_state(m, "paused")
+
+
+def test_a_screenshot_queued_as_the_desktop_pauses_reads_the_text_screen(boot):
+    # `screenshot` accepted just before Alt+F1: answered at the paused
+    # pass, it reads the text screen instead (what is shown then: the
+    # header's background where the desktop was blue), and no WARN.
+    m = boot_cut_delay(boot, 1500)
+    pause_while(m, "screenshot")
+    frame = parse_frame(read_output(m, "screenshot", 60))
+    assert frame.image().getpixel((5, 5)) == (0x0F, 0x14, 0x20), "not the text screen"
+    gui.wait_desktop_state(m, "paused")
 
 
 def test_presents_match_a_full_repaint(boot):
@@ -361,7 +400,6 @@ def test_a_window_behind_drops_and_says_busy(boot):
     m = boot_tablet(boot)
     gui.start_desktop(m)
     spin = gui.desktop_spin(m)
-    time.sleep(0.2)
     assert gui.desktop_status(m)["settled"] == "no", "settled with a window that never idles"
     assert run(m, f"desktop hold {spin}") == f"desktop hold: window {spin}\n"
     row = gui.window(m, "spin")
@@ -460,13 +498,12 @@ def test_desktop_screenshot_matches_screendump(boot, artifacts):
     gui.start_desktop(m)
     tip = (900, 650)
     gui.pointer_move(m, *tip)
-    shot, dump = gui.settled_capture(
-        m,
-        lambda: (
-            m.screenshot_via_serial(),
-            Image.open(m.screendump("desktop-dump.png")).convert("RGB"),
-        ),
-    )
+
+    def take():
+        with Image.open(m.screendump("desktop-dump.png")) as dumped:
+            return m.screenshot_via_serial(), dumped.convert("RGB")
+
+    shot, dump = gui.settled_capture(m, take)
     shot.save(artifacts / "desktop-screenshot.png")
     arrow = (tip[0], tip[1], tip[0] + SPRITE_W, tip[1] + SPRITE_H)
     inside, _ = compare(shot.crop(arrow), dump.crop(arrow), tolerance=0)

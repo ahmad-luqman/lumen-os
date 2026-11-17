@@ -109,7 +109,7 @@ impl Marks {
 /// resume and then a pause in one look still has the marks of each (a
 /// resume waits until the compositor has seen the pause before it, so no
 /// older marks are ever needed).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct Cut {
     generation: u64,
     /// At the latest pause (Alt+F`n`): the rings' newest, the Alt+F`n`
@@ -138,6 +138,11 @@ impl Cut {
     /// A pause at `marks`: the generation goes from odd (shown) to even.
     fn paused(&mut self, marks: Marks) {
         debug_assert!(!self.generation.is_multiple_of(2), "a pause while not shown (generation {})", self.generation);
+        debug_assert!(
+            marks.keys >= self.resume.keys.max(self.pause.keys)
+                && marks.pointer >= self.resume.pointer.max(self.pause.pointer),
+            "a pause's marks {marks:?} before the cut's {self:?}"
+        );
         self.generation += 1;
         self.pause = marks;
     }
@@ -146,6 +151,7 @@ impl Cut {
     /// (paused, or never started) to odd.
     fn resumed(&mut self, marks: Marks, baseline: Buttons, owner: Owner) {
         debug_assert!(self.generation.is_multiple_of(2), "a resume while shown (generation {})", self.generation);
+        debug_assert!(self.owner.is_none_or(|o| o == owner), "the desktop's owner changed");
         self.generation += 1;
         self.resume = marks;
         self.baseline = baseline;
@@ -155,6 +161,12 @@ impl Cut {
     /// Every change so far (odd while shown).
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Whether the latest change was a pause (the desktop started, then
+    /// left; not a start or resume still waiting to show).
+    pub fn is_paused(&self) -> bool {
+        self.generation > 0 && self.generation.is_multiple_of(2)
     }
 
     /// The baseline buttons of the latest start or resume.
@@ -466,6 +478,10 @@ fn leave_desktop(to: usize) {
 /// [`DESKTOP`]: nothing typed before reaches a window, nothing typed after
 /// reaches a terminal. On an error nothing changes but the decoding. The
 /// caller wakes the compositor.
+///
+/// Precondition: the caller has seen the compositor act on the latest
+/// pause (`desktop`'s resume waits for it), so the cut's latest pause marks
+/// are never overwritten unread.
 pub fn enter_desktop(owner: Owner) -> Result<ScreenCanvas, CanvasError> {
     let (taken, pass) = {
         let mut router = ROUTER.lock();
@@ -738,7 +754,13 @@ crate::ktest!(
         kassert_eq!(term::shown(), 1);
         let c = cut();
         kassert_eq!((c.generation(), c.pause()), (before + 2, Marks::now()));
-        kassert!(c.pause_owns_key(Seq::ZERO) == (c.pause().keys > Seq::ZERO));
+        // The pause's own mark (the Alt+F2 press) is the terminal's, the
+        // event before it the desktop's; a pointer frame at its mark is the
+        // desktop's.
+        let at = c.pause();
+        kassert!(!c.pause_owns_key(at.keys) && c.pause_owns_pointer(at.pointer));
+        kassert!(at.keys.get() == 0 || c.pause_owns_key(Seq::ZERO));
+        kassert!(c.is_paused());
         drop(screen);
         kassert_eq!(route_key(&mut r, Key::Char('b'), ALL), Routed::To(1));
         kassert_eq!(r.mask(), 1 << 1);

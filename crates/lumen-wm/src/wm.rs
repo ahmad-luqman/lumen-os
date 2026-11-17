@@ -359,19 +359,6 @@ impl Wm {
         }
     }
 
-    /// The same, its next window id `next` (from 1; ids never go back):
-    /// a desktop made again in one boot (#153's first start failing, then
-    /// another) carries on the old one's count, so no id is ever reused.
-    pub fn with_next_id(mut self, next: u32) -> Wm {
-        self.next_id = next.max(self.next_id);
-        self
-    }
-
-    /// The id the next window opened gets.
-    pub fn next_id(&self) -> u32 {
-        self.next_id
-    }
-
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
     }
@@ -747,23 +734,4 @@ enum Sent {
     Down(Button),
     Move,
     Up(Button),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_window_manager_made_again_carries_on_the_ids() {
-        // Ids from 1; a second window manager told the first's next id
-        // gives no id the first gave, and never goes back below its own.
-        let mut first = Wm::new(800, 600, Metrics::DESKTOP);
-        let (a, _) = first.open("a", 10, 10, 0, 0);
-        let (b, _) = first.open("b", 10, 10, 0, 0);
-        assert_eq!((a.get(), b.get(), first.next_id()), (1, 2, 3));
-        let mut second = Wm::new(800, 600, Metrics::DESKTOP).with_next_id(first.next_id());
-        let (c, _) = second.open("c", 10, 10, 0, 0);
-        assert_eq!(c.get(), 3);
-        assert_eq!(second.with_next_id(1).next_id(), 4, "never back");
-    }
 }

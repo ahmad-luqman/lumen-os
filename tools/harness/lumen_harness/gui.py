@@ -730,7 +730,7 @@ def wait_for[T](
     never holds."""
     got, ok = poll(m, read, done, timeout)
     if not ok:
-        raise AssertionError(f"{what} never happened in {timeout} s: last {got}")
+        raise AssertionError(f"{what} never happened in {_said(m, timeout)}: last {got}")
     return got
 
 
@@ -755,14 +755,22 @@ def wait_settled(m: Machine, timeout: float = 30, allow: str | None = None) -> d
     )
 
 
-def start_desktop(m: Machine, windows_expected: int = 2) -> None:
-    """`desktop` on the serial shell, then wait for the demo windows and for
-    the desktop to settle."""
+def start_desktop(m: Machine) -> None:
+    """`desktop` on the serial shell, then wait for the two demo windows and
+    for the desktop to settle."""
     out = run(m, "desktop", 30)
     if out != STARTED:
         raise AssertionError(f"desktop said {out!r}")
-    wait_windows(m, windows_expected)
+    wait_windows(m, 2)
     wait_settled(m)
+
+
+def wait_desktop_state(m: Machine, state: str, timeout: float = 10) -> dict[str, str]:
+    """Wait until `desktop status` says `state` (`shown`, `paused`); its
+    record then."""
+    return wait_for(
+        m, f"the desktop {state}", lambda: desktop_status(m), lambda s: s["state"] == state, timeout
+    )
 
 
 def desktop_spin(m: Machine, allow: str | None = None) -> str:
