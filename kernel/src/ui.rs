@@ -33,7 +33,7 @@ use lumen_wm::{Refused, Theme};
 
 use crate::desktop::{self, NodeAt, TreeRow, WindowEvent, WindowHandle};
 use crate::sched::WaitQueue;
-use crate::shell::sysinfo::{int, text};
+use crate::shell::sysinfo::{DASH, int, text, text_or_dash};
 use crate::sync::SpinLock;
 
 /// How long `ui invoke` waits for an answer, and again once the owner took
@@ -127,10 +127,15 @@ impl Request {
     pub fn start(mut self) -> Result<Started, Skipped> {
         let Some(cell) = self.cell.take() else { return Err(Skipped) };
         let action = core::mem::replace(&mut self.action, Action::Press);
-        if cell.reply.lock().start().is_ok() {
-            Ok(Started { node: self.node, action, cell: Some(cell) })
-        } else {
-            Err(Skipped)
+        let started = cell.reply.lock().start();
+        match started {
+            Ok(()) => Ok(Started { node: self.node, action, cell: Some(cell) }),
+            Err(why) => {
+                // Only the asker's cancel takes a request out of `Pending`
+                // before its owner reads it.
+                debug_assert_eq!(why, lumen_ui::NotStarted::Cancelled);
+                Err(Skipped)
+            }
         }
     }
 }
@@ -163,6 +168,7 @@ impl Started {
 impl Drop for Started {
     fn drop(&mut self) {
         if let Some(cell) = self.cell.take() {
+            log::error!(target: "ui", "a request on node {} was dropped while running, unanswered (a bug)", self.node);
             cell.answer(|r| r.answer_dropped(Answer::Dropped));
         }
     }
@@ -238,7 +244,7 @@ impl<A: App> Toolkit<A> {
         let changed = self.lay_out();
         self.paint_and_commit(h);
         if changed {
-            h.publish(self.app.ui().top_ids(), self.app.ui().nodes());
+            self.publish(h);
         }
     }
 
@@ -246,19 +252,24 @@ impl<A: App> Toolkit<A> {
     pub fn refresh(&mut self, h: &mut WindowHandle) {
         if self.lay_out() {
             self.paint_and_commit(h);
-            h.publish(self.app.ui().top_ids(), self.app.ui().nodes());
+            self.publish(h);
         }
+    }
+
+    fn publish(&mut self, h: &mut WindowHandle) {
+        let ui = self.app.ui_mut();
+        h.publish(ui.top_ids(), ui.nodes());
     }
 
     /// Lay out: whether anything shown changed since the last paint.
     fn lay_out(&mut self) -> bool {
-        self.app.ui().layout(self.area, &mut self.text);
-        self.app.ui().take_changed()
+        self.app.ui_mut().layout(self.area, &mut self.text);
+        self.app.ui_mut().take_changed()
     }
 
     fn paint_and_commit(&mut self, h: &mut WindowHandle) {
         let s = h.surface_mut();
-        self.app.ui().paint(s, &mut self.text, &self.palette);
+        self.app.ui_mut().paint(s, &mut self.text, &self.palette);
         self.app.paint_over(s);
         let bounds = s.bounds();
         h.commit(&[bounds]);
@@ -269,32 +280,21 @@ impl<A: App> Toolkit<A> {
     /// asker sees the effect in `ui tree`. A window to close is
     /// [`Step::Close`] (its request answered once it is gone).
     pub fn step(&mut self, h: &mut WindowHandle, e: WindowEvent) -> Step {
-        let mut answer = None;
         let then = match e {
             WindowEvent::Close => Then::Close,
-            WindowEvent::Request(req) => match req.start() {
-                Err(Skipped) => Then::Carry,
-                Ok(started) => {
-                    let served = serve(&mut self.app, &mut self.text, self.area, started.node(), started.action());
-                    if served == Served::ClosedItsWindow {
-                        return Step::Close(Some(started));
-                    }
-                    answer = Some((started, served));
-                    Then::Carry
-                }
-            },
+            WindowEvent::Request(req) => return self.request(h, req),
             WindowEvent::Theme(theme) => {
                 // "Redraw": the whole tree in the theme handed over.
                 self.palette = palette(theme);
-                self.app.ui().invalidate();
+                self.app.ui_mut().invalidate();
                 Then::Carry
             }
             WindowEvent::FocusGained => {
-                self.app.ui().set_window_focused(true);
+                self.app.ui_mut().set_window_focused(true);
                 Then::Carry
             }
             WindowEvent::FocusLost => {
-                self.app.ui().set_window_focused(false);
+                self.app.ui_mut().set_window_focused(false);
                 self.input(Input::Cancel)
             }
             WindowEvent::Lost => self.input(Input::Cancel),
@@ -312,14 +312,24 @@ impl<A: App> Toolkit<A> {
             return Step::Close(None);
         }
         self.refresh(h);
-        if let Some((started, served)) = answer {
-            started.finish(Answer::Ran(served));
+        Step::Carry
+    }
+
+    /// A request: run it (unless cancelled), publish what it changed, then
+    /// answer; one that closed its window is answered once it is gone.
+    fn request(&mut self, h: &mut WindowHandle, req: Request) -> Step {
+        let Ok(started) = req.start() else { return Step::Carry };
+        let served = serve(&mut self.app, &mut self.text, self.area, started.node(), started.action());
+        if served == Served::ClosedItsWindow {
+            return Step::Close(Some(started));
         }
+        self.refresh(h);
+        started.finish(Answer::Ran(served));
         Step::Carry
     }
 
     fn input(&mut self, input: Input) -> Then {
-        let events = self.app.ui().handle(input);
+        let events = self.app.ui_mut().handle(input);
         self.app.apply(&events)
     }
 }
@@ -396,9 +406,6 @@ pub const COLUMNS: [Column; 12] = [
     Column::new("h", Kind::Int, Align::Right, 4),
 ];
 
-/// No value (`-`, never matched by `where`).
-const DASH: Value = Value::Absent("-");
-
 /// A node's record (screen coordinates).
 fn record(r: &TreeRow) -> Vec<Value> {
     let n = &r.node;
@@ -406,17 +413,17 @@ fn record(r: &TreeRow) -> Vec<Value> {
     let actions: Vec<&str> = n.actions().iter().map(|a| a.name()).collect();
     alloc::vec![
         int(n.id().get()),
-        int(u64::from(r.window)),
-        int(u64::from(r.depth)),
+        int(r.window),
+        int(r.depth),
         text(n.role().name()),
         text(n.name()),
         n.value().map_or(DASH, |v| Value::Text(v.to_string())),
-        if n.state().is_empty() { DASH } else { Value::Text(n.state().to_string()) },
+        text_or_dash(n.state().to_string()),
         if actions.is_empty() { DASH } else { Value::Text(actions.join(",")) },
-        Value::Int(i64::from(b.x())),
-        Value::Int(i64::from(b.y())),
-        int(u64::from(b.w())),
-        int(u64::from(b.h())),
+        int(b.x()),
+        int(b.y()),
+        int(b.w()),
+        int(b.h()),
     ]
 }
 
@@ -520,42 +527,53 @@ fn invoke_root(ctx: &mut crate::shell::Ctx<'_>, window: u32, action: &Action) {
 /// owner (see [`Reply`]'s steps).
 fn invoke_widget(ctx: &mut crate::shell::Ctx<'_>, window: u32, node: u64, action: Action) {
     let (req, cell) = Request::new(node, action);
-    match desktop::push_request(window, req) {
-        Ok(()) => {}
-        Err(Refused::Busy(req)) => {
-            drop(req);
-            return ctx.fail(format_args!("ui invoke: window {window} busy (try again)"));
-        }
-        Err(Refused::Dead(req)) => {
-            drop(req);
-            return ctx.fail(format_args!("ui invoke: window {window} closed"));
-        }
+    if let Err(refused) = desktop::push_request(window, req) {
+        let busy = matches!(refused, Refused::Busy(_));
+        // Dropped here, with no desktop lock held: it answers a reply
+        // nobody reads.
+        drop(refused);
+        return if busy {
+            ctx.fail(format_args!("ui invoke: window {window} busy (try again)"))
+        } else {
+            ctx.fail(format_args!("ui invoke: window {window} closed"))
+        };
     }
     let wait = || {
         let deadline = crate::time::now_ns().saturating_add(DEADLINE_NS);
         let _ = cell.done.wait_until_or_deadline(deadline, || cell.reply.lock().is_done());
     };
     wait();
+    // (Each reply read is bound first: its guard is never held past it.)
     let first = cell.reply.lock().after_first_deadline();
-    let (answer, late) = match first {
-        First::Answered(answer) => (Some(answer), false),
-        First::Cancelled => (None, false),
+    let asked = match first {
+        First::Answered(answer) => Asked::Answered(answer),
+        First::Cancelled => Asked::Cancelled,
         First::Running => {
             wait();
-            match cell.reply.lock().after_second_deadline() {
-                Second::Late(answer) => (Some(answer), true),
-                Second::StillRunning => {
-                    desktop::request_finished(false, false);
-                    return ctx.fail(format_args!("ui invoke: still running (window {window})"));
-                }
+            let second = cell.reply.lock().after_second_deadline();
+            match second {
+                Second::Late(answer) => Asked::Late(answer),
+                Second::StillRunning => Asked::StillRunning,
             }
         }
     };
-    desktop::request_finished(answer.is_none(), late);
-    match answer {
-        Some(answer) => print_answer(ctx, window, node, answer, late),
-        None => ctx.fail(format_args!("ui invoke: cancelled: window {window} didn't take it in 1 s (try again)")),
+    desktop::request_finished(matches!(asked, Asked::Cancelled), matches!(asked, Asked::Late(_)));
+    match asked {
+        Asked::Answered(answer) => print_answer(ctx, window, node, answer, false),
+        Asked::Late(answer) => print_answer(ctx, window, node, answer, true),
+        Asked::Cancelled => {
+            ctx.fail(format_args!("ui invoke: cancelled: window {window} didn't take it in 1 s (try again)"))
+        }
+        Asked::StillRunning => ctx.fail(format_args!("ui invoke: still running (window {window})")),
     }
+}
+
+/// How a request's asker came out of its deadlines.
+enum Asked {
+    Answered(Answer),
+    Late(Answer),
+    Cancelled,
+    StillRunning,
 }
 
 fn print_answer(ctx: &mut crate::shell::Ctx<'_>, window: u32, node: u64, answer: Answer, late: bool) {
@@ -563,7 +581,13 @@ fn print_answer(ctx: &mut crate::shell::Ctx<'_>, window: u32, node: u64, answer:
         let _ = writeln!(ctx.out, "ui invoke: ran late");
     }
     match answer {
-        Answer::Ran(Served::Row { depth, node }) => print_rows(ctx, &[desktop::node_row(window, depth, node)]),
+        Answer::Ran(Served::Row { depth, node }) => match desktop::node_row(window, depth, node) {
+            Some(row) => print_rows(ctx, &[row]),
+            // Closed between the answer and the row: it ran.
+            None => {
+                let _ = writeln!(ctx.out, "ui invoke: ran; window {window} closed");
+            }
+        },
         Answer::Ran(Served::Error(InvokeError::NoNode)) => ctx.fail(format_args!("ui invoke: no node {node}")),
         Answer::Ran(Served::Error(e)) => ctx.fail(format_args!("ui invoke: {e}")),
         Answer::Ran(Served::RanNodeGone) => {
@@ -625,9 +649,10 @@ crate::ktest!(
 crate::ktest!(
     fn the_toolkit_text_draws_as_wide_as_it_measures() {
         // The UI font through lumen-ui's `Text` (`font::Text` at
-        // `TEXT_PX`): a longer line measures wider, a line drawn unclipped
-        // inks up to its measured width (and not past it), and a clip keeps
-        // ink inside it.
+        // `TEXT_PX`): a longer line measures wider; a line drawn unclipped
+        // has its rightmost ink between 4 pixels short of its measured
+        // width (the last glyph's right bearing) and 1 past it (rounding);
+        // a clip keeps ink inside it.
         use crate::kassert;
         let mut t = crate::font::Text::new().map_err(|_| "no font")?;
         let t: &mut dyn Text = &mut t;
@@ -646,6 +671,65 @@ crate::ktest!(
         s.fill(0xffffff);
         t.draw(&mut s, 4, 4, "Add more", 0x000000, Rect::new(0, 0, 30, 40));
         kassert!((0..40u32).all(|y| s.row(y)[30..].iter().all(|&p| p == 0xffffff)));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_request_is_answered_only_after_its_effect_is_published() {
+        // `Toolkit::step` on a desktop with no screen, with a probe app whose
+        // `paint_over` records the reply's phase while the tree is painted:
+        // `Running` then (the repaint and publish come first), `Done` once
+        // the step returns. A press whose action closes the window comes
+        // back unanswered (`Step::Close`), answered by `close` only after the
+        // handle is dropped (the window gone).
+        use crate::kassert;
+        use lumen_ui::{Ui, UiEvent, Widget};
+        struct Probe {
+            ui: Ui,
+            button: Widget,
+            cell: Option<Arc<ReplyCell>>,
+            seen: Option<Phase>,
+            closes: bool,
+        }
+        impl App for Probe {
+            fn ui_mut(&mut self) -> &mut Ui {
+                &mut self.ui
+            }
+            fn apply(&mut self, events: &[UiEvent]) -> Then {
+                if self.closes && events.contains(&UiEvent::Pressed(self.button)) { Then::Close } else { Then::Carry }
+            }
+            fn paint_over(&mut self, _: &mut Surface) {
+                if let Some(cell) = &self.cell {
+                    self.seen = Some(cell.phase());
+                }
+            }
+        }
+        let d = desktop::Desktop::without_screen();
+        let mut h = d.open_window("probe", 120, 60).map_err(|_| "a window")?;
+        let mut ui = Ui::new();
+        let button = ui.button(None, "Go");
+        let app = Probe { ui, button, cell: None, seen: None, closes: false };
+        let mut tk = Toolkit::new(app, Rect::new(0, 0, 120, 60), h.theme()).map_err(|_| "no font")?;
+        while let Some(e) = h.next_event() {
+            kassert!(matches!(tk.step(&mut h, e), Step::Carry));
+        }
+        let id = tk.app_mut().ui.id(button).get();
+        // A press that focuses the button: the tree changes, so it repaints.
+        let (req, cell) = Request::new(id, Action::Press);
+        tk.app_mut().cell = Some(cell.clone());
+        kassert!(matches!(tk.step(&mut h, WindowEvent::Request(req)), Step::Carry));
+        kassert!(tk.app_mut().seen == Some(Phase::Running));
+        kassert!(cell.phase() == Phase::Done);
+        // A press that closes its window.
+        tk.app_mut().closes = true;
+        let (req, cell) = Request::new(id, Action::Press);
+        let Step::Close(Some(started)) = tk.step(&mut h, WindowEvent::Request(req)) else {
+            return Err("not closing with its request");
+        };
+        kassert!(cell.phase() == Phase::Running);
+        close(h, Some(started));
+        kassert!(matches!(cell.take(), Some(Answer::Ran(Served::ClosedItsWindow))));
         Ok(())
     }
 );

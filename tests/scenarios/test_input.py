@@ -604,12 +604,9 @@ def events(m: Machine, command: str) -> list[list[str]]:
         "kbd": ["seq", "code", "action", "text", "mods", "after_drop"],
     }[command.split()[0]]
     assert lines and lines[0].split() == columns, lines
-    # Cells two spaces apart; one with a space (buttons `left right`) comes
-    # double-quoted (a key's text, `'a'`, keeps its single quotes).
-    return [
-        [shlex.split(c)[0] if c.startswith('"') else c for c in re.split(r"\s{2,}", line.strip())]
-        for line in lines[1:]
-    ]
+    # Split as the shell's words: a cell with a space or a quote comes
+    # double-quoted (buttons `left right`, a key's text `'a'`).
+    return [shlex.split(line) for line in lines[1:]]
 
 
 def test_click_position_is_kept(boot):

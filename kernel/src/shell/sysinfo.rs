@@ -63,12 +63,12 @@ pub fn text(s: &str) -> Value {
 
 /// `s` as a text cell, or the absent value if it is `-` (a text `-` would
 /// print quoted, since records quote a cell that reads as absent).
-fn text_or_dash(s: String) -> Value {
+pub fn text_or_dash(s: String) -> Value {
     if s == "-" { DASH } else { Value::Text(s) }
 }
 
 /// No value, printed `-`.
-const DASH: Value = Value::Absent("-");
+pub const DASH: Value = Value::Absent("-");
 
 /// What makes a system command's records from its arguments: `None` if
 /// the command doesn't give records for these arguments (it runs as a
@@ -222,15 +222,16 @@ fn key_events_table(events: &[(lumen_input::Seq, lumen_input::KeyEvent)]) -> pip
             Value::Text(alloc::format!("{:?}", e.code)),
             text(action),
             typed,
-            text_or_dash(mods_text(e.mods)),
+            mods_cell(e.mods),
             text(if e.after_drop { "yes" } else { "no" }),
         ]);
     }
     t
 }
 
-/// The modifiers as names joined by `+` (`shift+ctrl`), `-` for none.
-fn mods_text(m: lumen_input::Mods) -> String {
+/// The modifiers as names joined by `+` (`shift+ctrl`), absent (`-`) for
+/// none.
+fn mods_cell(m: lumen_input::Mods) -> Value {
     let names = [
         (m.is_shifted(), "shift"),
         (m.is_ctrl(), "ctrl"),
@@ -240,7 +241,7 @@ fn mods_text(m: lumen_input::Mods) -> String {
         (m.numlock(), "num"),
     ];
     let on: Vec<&str> = names.iter().filter(|(on, _)| *on).map(|(_, n)| *n).collect();
-    if on.is_empty() { String::from("-") } else { on.join("+") }
+    if on.is_empty() { DASH } else { Value::Text(on.join("+")) }
 }
 
 /// Write a table (or why there is none) to the console, as text.
@@ -670,13 +671,13 @@ fn mouse_table_of(bound: Option<&crate::mouse::Bound>) -> pipe::Table {
     let row = match bound.and_then(|b| b.state.map(|s| (s, b.stale))) {
         Some((s, stale)) => {
             let pointer = if failed.is_some() {
-                "-"
+                DASH
             } else if crate::term::screen_size().is_none() {
-                "none"
+                text("none")
             } else if crate::term::pointer_drawn().is_some() {
-                "drawn"
+                text("drawn")
             } else {
-                "hidden"
+                text("hidden")
             };
             vec![
                 device,
@@ -686,7 +687,7 @@ fn mouse_table_of(bound: Option<&crate::mouse::Bound>) -> pipe::Table {
                 int(s.total_presses()),
                 int(s.wheel),
                 int(s.hwheel),
-                text_or_dash(String::from(pointer)),
+                pointer,
                 text(if stale { "yes" } else { "no" }),
                 failed_cell,
             ]

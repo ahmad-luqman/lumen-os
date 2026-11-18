@@ -92,6 +92,8 @@ WALLPAPER = Path(__file__).resolve().parents[2] / "assets" / "wallpaper" / "lume
 TITLE_FOCUSED_RGB = (0x2B, 0x57, 0x97)
 TITLE_RGB = (0xD6, 0xD6, 0xD6)
 CLIENT_RGB = (0xF3, 0xF3, 0xF3)
+# lumen_wm::Theme::DARK's client colour.
+DARK_CLIENT_RGB = (0x1F, 0x1F, 0x1F)
 POINTER_OUTLINE_RGB = (0, 0, 0)
 POINTER_FILL_RGB = (0xFF, 0xFF, 0xFF)
 SCREEN_PIXELS = 1280 * 800
@@ -418,12 +420,17 @@ def test_presents_match_a_full_repaint(boot):
 def drained(m: Machine, node: dict[str, str], allow: str | None = None) -> None:
     """Wait until a released window's owner has read its whole queue: a
     `focus` request on one of its nodes is answered only after everything
-    queued before it (refused as busy while the queue is still full)."""
+    queued before it (refused as busy while the queue is still full: only
+    that is retried; any other message fails)."""
+
+    def answered(got: gui.Invoked) -> bool:
+        if got.row is not None:
+            return True
+        assert got.message is not None and got.message.endswith("busy (try again)"), got
+        return False
+
     gui.wait_for(
-        m,
-        "the queue drained",
-        lambda: gui.invoke(m, node["id"], "focus", allow=allow),
-        lambda got: got.row is not None,
+        m, "the queue drained", lambda: gui.invoke(m, node["id"], "focus", allow=allow), answered
     )
 
 
@@ -472,9 +479,10 @@ def test_a_window_behind_drops_and_says_busy(boot):
     # next is refused as busy (never queued). Released, the owner skips the
     # cancelled press: the window is still open once its queue drained.
     assert run(m, f"desktop hold {spin}") == f"desktop hold: window {spin}\n"
+    cancelled = int(gui.desktop_status(m)["cancelled"])
     out = run(m, f"ui invoke {stop['id']} press")
     assert out == f"ui invoke: cancelled: window {spin} didn't take it in 1 s (try again)\n", out
-    assert gui.desktop_status(m)["cancelled"] == "1"
+    assert int(gui.desktop_status(m)["cancelled"]) == cancelled + 1
     gui.type_confirmed(m, "abcdefghijklmnopqrstuvwxyz0123", allow=warn)
     gui.wait_for(
         m,
@@ -751,7 +759,7 @@ def test_automation_tree_lists_buttons(boot):
     assert all(b["actions"] == "press,focus" and b["window"] == wid for b in buttons), buttons
     x, y, w, h = frame_of(gui.window(m, "Counter"))
     for b in buttons:
-        bx, by, bw, bh = int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"])
+        bx, by, bw, bh = frame_of(b)
         assert x < bx and bx + bw < x + w and y + 24 < by and by + bh < y + h, (b, (x, y, w, h))
     count = gui.node(rows, "label", "Count")
     assert count["value"] == "0" and count["actions"] == "-", count
@@ -785,7 +793,8 @@ def test_invoke_press_changes_state(boot, artifacts, golden_dir):
     got = gui.invoke(m, add["id"], "press")
     assert got.row is not None and (got.row["id"], got.row["name"]) == (add["id"], "Add"), got
     assert not got.late
-    gui.wait_for(m, "the count at 1", lambda: count_of(m, wid), lambda v: v == "1")
+    # Published before it was answered: read at once, no poll.
+    assert count_of(m, wid) == "1"
     frame = frame_of(gui.window(m, "Counter"))
     shot = gui.settled_screendump(m, "counter.png")
     assert_matches_golden(
@@ -814,10 +823,13 @@ def test_invoke_on_a_closed_window_fails(boot):
     # close` closes the window through its owner, and its nodes then name
     # nothing.
     m = boot_shells(boot)
+    assert run(m, "ui invoke 1 focus") == "ui invoke: no desktop\n"
     gui.start_desktop(m)
     wid, rows = start_counter(m)
     add, lock = gui.node(rows, "button", "Add"), gui.node(rows, "checkbox", "Lock")
     count = gui.node(rows, "label", "Count")
+    assert run(m, f"ui invoke {rows[0]['id']} press") == "ui invoke: a window doesn't take press\n"
+    assert run(m, f"ui invoke {add['id']} fly").startswith("ui invoke: no such action (press, ")
     # The owner's refusals (through `gui.invoke`, which retries a request
     # cancelled at its deadline), then the asker's own (wrong arguments).
     assert gui.invoke(m, count["id"], "press").message == "ui invoke: a label doesn't take press"
@@ -846,6 +858,32 @@ def test_invoke_quit_closes_its_window(boot):
     quit_button = gui.node(rows, "button", "Quit")
     got = gui.invoke(m, quit_button["id"], "press")
     assert got.message == f"ui invoke: ran; window {wid} closed", got
-    assert [w["title"] for w in gui.wait_windows(m, 2)] == ["Colours", "Welcome"]
+    # Answered once the window was gone: read at once, no poll.
+    assert [w["title"] for w in gui.windows(m)] == ["Colours", "Welcome"]
     gui.wait_settled(m)
+    assert gui.desktop_check(m) == (0, 0)
+
+
+def test_a_toolkit_window_repaints_in_a_new_theme(boot):
+    # Counter open: `theme dark` reaches its owner as a `Theme` event, and
+    # it repaints its whole tree in the dark palette (its client background
+    # the dark theme's `client`); back to light, the light one.
+    m = boot_shells(boot)
+    gui.start_desktop(m)
+    _, rows = start_counter(m)
+    x, y, w, h = frame_of(gui.window(m, "Counter"))
+    # A pixel of Counter's client background: inside its frame, below the
+    # last widget (Quit), clear of every widget.
+    quit_button = gui.node(rows, "button", "Quit")
+    _, qy, _, qh = frame_of(quit_button)
+    probe = (x + w - 20, qy + qh + 4)
+    assert probe[1] < y + h - 2, (probe, (x, y, w, h))
+    light = pixel(gui.settled_screendump(m, "counter-light.png"), *probe)
+    assert light == CLIENT_RGB, light
+    assert run(m, "theme dark") == "theme: dark\n"
+    gui.wait_settled(m)
+    assert pixel(gui.settled_screendump(m, "counter-dark.png"), *probe) == DARK_CLIENT_RGB
+    assert run(m, "theme light") == "theme: light\n"
+    gui.wait_settled(m)
+    assert pixel(gui.settled_screendump(m, "counter-light-again.png"), *probe) == CLIENT_RGB
     assert gui.desktop_check(m) == (0, 0)

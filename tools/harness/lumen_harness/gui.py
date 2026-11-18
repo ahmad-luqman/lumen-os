@@ -693,12 +693,18 @@ def parse_records(out: str, first: str | None = None) -> list[dict[str, str]]:
     that is empty, holds whitespace or is a text `-` comes double-quoted):
     one dict per row, column name to text. With `first`, the header must
     start with that column (so an error line isn't taken for a table)."""
-    lines = [shlex.split(line) for line in out.splitlines() if line.strip()]
-    if not lines:
+    text = [line for line in out.splitlines() if line.strip()]
+    if not text:
         raise AssertionError(f"no table in {out!r}")
-    header, rows = lines[0], lines[1:]
-    if first is not None and header[:1] != [first]:
+    # The header first, by plain words: an error line (`ui tree: no window
+    # 9`, or one with an apostrophe) is said as itself, not as a split error.
+    if first is not None and text[0].split()[:1] != [first]:
         raise AssertionError(f"not a table starting with {first!r}:\n{out}")
+    try:
+        lines = [shlex.split(line) for line in text]
+    except ValueError as e:
+        raise AssertionError(f"a row that doesn't split as words ({e}):\n{out}") from e
+    header, rows = lines[0], lines[1:]
     for row in rows:
         if len(row) != len(header):
             raise AssertionError(f"a row of {len(row)} values under {len(header)} columns:\n{out}")
@@ -762,8 +768,9 @@ def wait_windows(m: Machine, count: int, timeout: float = 30) -> list[dict[str, 
 def wait_settled(m: Machine, timeout: float = 30, allow: str | None = None) -> dict[str, str]:
     """Wait until `desktop status` says `settled yes` (every byte typed
     decoded, both input rings read, no damage gathered or pass running, no
-    commit under way, every window's queue empty with its owner waiting);
-    its record then. Poll for the effect a step should have first (a
+    commit under way, every window's queue empty with its owner waiting and
+    told of the last theme switch, no `ui invoke` request outstanding); its
+    record then. Poll for the effect a step should have first (a
     `windows` row, say): settling says nothing more is moving, not that
     the step happened."""
     return wait_for(
@@ -930,7 +937,7 @@ def invoke(
     deadline (a cancelled request never ran, so a retry can't act twice);
     "ran late" with its row or message counts as done (`Invoked.late`), and
     `Invoked.retries` says how many were cancelled first."""
-    line = " ".join(["ui invoke", str(node_id), action, *args])
+    line = shlex.join(["ui", "invoke", str(node_id), action, *args])
     for retries in range(tries):
         got = parse_invoke(run(m, line, 10, allow=allow))
         if got is not None:

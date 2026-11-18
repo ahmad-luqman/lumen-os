@@ -8,9 +8,10 @@ from __future__ import annotations
 import pytest
 from lumen_harness import gui
 
-# As kernel/src/ui.rs prints them (lumen-shell's table: two spaces in,
-# columns two apart and padded; `Count:` and its value fall one apart only
-# because the value column is as wide as its widest value).
+# Hand-written in the shape kernel/src/ui.rs prints (lumen-shell's table:
+# two spaces in, columns two apart and padded); the widths here are
+# illustrative, not the kernel's, and `Count:` sits one space from the
+# next cell only to show the reader splits on any blanks.
 TREE = """\
    id  window  depth  role      name      value  state    actions       x    y    w    h
     9       3      0  window    Counter   -      focused  focus,close  161  169  300  140
@@ -19,6 +20,8 @@ TREE = """\
    14       3      2  label     Count     1      -        -            225  177    8   21
    17       3      2  button    Add       -      focused  press,focus  169  206   50   33
 """
+
+CANCELLED = "ui invoke: cancelled: window 3 didn't take it in 1 s (try again)\n"
 
 ROW = """\
    id  window  depth  role      name      value  state    actions       x    y    w    h
@@ -60,14 +63,11 @@ def test_invoke_outputs_are_told_apart():
     assert got is not None and got.row is not None and got.row["name"] == "Add" and not got.late
     late = gui.parse_invoke("ui invoke: ran late\n" + ROW)
     assert late is not None and late.late and late.row is not None and late.row["id"] == "17"
-    assert (
-        gui.parse_invoke("ui invoke: cancelled: window 3 didn't take it in 1 s (try again)\n")
-        is None
-    )
+    assert gui.parse_invoke(CANCELLED) is None
     for message in [
         "ui invoke: window 3 closed",
         "ui invoke: ran; window 3 closed",
-        "ui invoke: window 3 busy",
+        "ui invoke: window 3 busy (try again)",
         "ui invoke: no node 17",
         "ui invoke: still running (window 3)",
     ]:
@@ -97,6 +97,17 @@ def test_quoted_cells_are_one_value_each():
     rows = gui.parse_records(out, "id")
     assert rows[0] == {"id": "1", "name": "File name", "value": "", "state": "-"}
     assert rows[1]["value"] == "-"
+    # An apostrophe, a backslash and a leading `#` come quoted too (bare,
+    # they would open a quote, vanish, or start a comment).
+    tricky = """  id  name
+   3  "it's"
+   4  "a\\\\b"
+   5  "#tag"
+"""
+    assert [r["name"] for r in gui.parse_records(tricky, "id")] == ["it's", "a\\b", "#tag"]
+    # A row that doesn't split (an unclosed quote) fails, showing the output.
+    with pytest.raises(AssertionError, match="doesn't split as words"):
+        gui.parse_records("  id  name\n   6  it's\n", "id")
 
 
 def test_an_error_line_is_not_a_table():
@@ -125,8 +136,7 @@ def test_ui_tree_fails_on_its_errors_but_not_without_a_desktop(monkeypatch):
 
 def test_invoke_retries_a_cancelled_request(monkeypatch):
     # Cancelled (it never ran), then answered: the row, after one retry.
-    cancelled = "ui invoke: cancelled: window 3 didn't take it in 1 s (try again)\n"
-    shell = FakeShell([cancelled, ROW])
+    shell = FakeShell([CANCELLED, ROW])
     monkeypatch.setattr(gui, "run", shell)
     monkeypatch.setattr(gui.time, "sleep", lambda s: None)
     got = gui.invoke(None, 17, "press")
@@ -134,9 +144,16 @@ def test_invoke_retries_a_cancelled_request(monkeypatch):
     assert shell.lines == ["ui invoke 17 press", "ui invoke 17 press"]
 
 
+def test_invoke_quotes_its_arguments(monkeypatch):
+    # `set_value "File name"` is one argument to the kernel's shell.
+    shell = FakeShell([ROW])
+    monkeypatch.setattr(gui, "run", shell)
+    gui.invoke(None, 5, "set_value", "File name")
+    assert shell.lines == ["ui invoke 5 set_value 'File name'"]
+
+
 def test_invoke_gives_up_after_its_tries(monkeypatch):
-    cancelled = "ui invoke: cancelled: window 3 didn't take it in 1 s (try again)\n"
-    monkeypatch.setattr(gui, "run", FakeShell([cancelled] * 3))
+    monkeypatch.setattr(gui, "run", FakeShell([CANCELLED] * 3))
     monkeypatch.setattr(gui.time, "sleep", lambda s: None)
     with pytest.raises(AssertionError, match="cancelled 3 times"):
         gui.invoke(None, 17, "press", tries=3)

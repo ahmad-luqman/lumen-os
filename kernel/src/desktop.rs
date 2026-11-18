@@ -2024,15 +2024,11 @@ pub fn find_node(n: u64) -> Option<NodeAt> {
 }
 
 /// A row of window `window`'s node `node` (client coordinates) on the
-/// screen, at depth `depth`.
-pub fn node_row(window: u32, depth: u32, node: AutomationNode) -> TreeRow {
+/// screen, at depth `depth` (`None`: the window has closed since).
+pub fn node_row(window: u32, depth: u32, node: AutomationNode) -> Option<TreeRow> {
     let g = COMPOSITOR.lock();
-    let client = g.as_ref().and_then(|s| s.wm.id(window).and_then(|id| s.wm.client(id)));
-    let node = match client {
-        Some(c) => node.translated(c.x(), c.y()),
-        None => node,
-    };
-    TreeRow { window, depth, node }
+    let client = g.as_ref().and_then(|s| s.wm.id(window).and_then(|id| s.wm.client(id)))?;
+    Some(TreeRow { window, depth, node: node.translated(client.x(), client.y()) })
 }
 
 /// `ui invoke <root> focus`: raise and focus window `window` (the
@@ -2263,7 +2259,7 @@ struct Spin {
 }
 
 impl lumen_ui::App for Spin {
-    fn ui(&mut self) -> &mut lumen_ui::Ui {
+    fn ui_mut(&mut self) -> &mut lumen_ui::Ui {
         &mut self.ui
     }
 
@@ -2306,11 +2302,11 @@ fn spin() -> Result<u32, String> {
     let mut ui = lumen_ui::Ui::new();
     let stop = ui.button(None, "Stop");
     let area = Rect::new(0, SPIN_STRIP as i32, w, h - SPIN_STRIP);
-    let h = Desktop::LIVE.open("spin", w, h, None, true).map_err(|e| alloc::format!("no window: {e}"))?;
-    let tk = crate::ui::Toolkit::new(Spin { ui, stop, x: 0 }, area, h.theme())?;
-    let id = h.id();
-    let _detached =
-        crate::sched::spawn("desktop-spin", move || spin_owner(h, tk)).map_err(|e| alloc::format!("no thread: {e}"))?;
+    let handle = Desktop::LIVE.open("spin", w, h, None, true).map_err(|e| alloc::format!("no window: {e}"))?;
+    let tk = crate::ui::Toolkit::new(Spin { ui, stop, x: 0 }, area, handle.theme())?;
+    let id = handle.id();
+    let _detached = crate::sched::spawn("desktop-spin", move || spin_owner(handle, tk))
+        .map_err(|e| alloc::format!("no thread: {e}"))?;
     Ok(id)
 }
 
@@ -2680,8 +2676,7 @@ pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
 /// Why `desktop check`, `spin`, `counter`, `hold` and `release` refuse
 /// now, if they do.
 fn refused_while_paused() -> Option<&'static str> {
-    let started = COMPOSITOR.lock().as_ref().is_some_and(|s| s.started);
-    if !started {
+    if !started() {
         Some("desktop: not started (`desktop` starts it)")
     } else if !is_shown() {
         Some("desktop: paused (`desktop` resumes it)")
