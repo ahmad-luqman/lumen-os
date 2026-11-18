@@ -47,8 +47,10 @@ def mouse_text(
     if xy is None:
         row = "  0000:00:03.0     -     -  -              -      -       -  -        -      -"
     else:
+        # A cell with a space comes double-quoted, as records print it.
+        cell = f'"{buttons}"' if " " in buttons else buttons
         row = (
-            f"  0000:00:03.0  {xy[0]:>4}  {xy[1]:>4}  {buttons:<7}        0      0       0  "
+            f"  0000:00:03.0  {xy[0]:>4}  {xy[1]:>4}  {cell:<7}        0      0       0  "
             "drawn    no     -"
         )
     return f"{header}\n{COLUMNS}\n{row}\n"

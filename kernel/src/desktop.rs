@@ -63,6 +63,7 @@ use lumen_gfx::{Damage, Mask, Rect, Surface, Target};
 use lumen_input::cursor::{SPRITE_H, SPRITE_W, draw_arrow};
 use lumen_input::{Button, Buttons, KeyAction, KeyEvent, PointerEvent, Read, Reader, Seq};
 use lumen_png::encode::Rows;
+use lumen_ui::AutomationNode;
 use lumen_wm::{
     Entry, EventQueue, Interruption, Metrics, Next, Outcome, Pointer, PointerEntry, Pushed, QueueCounts, Theme,
     ThemeId, WindowId, Wm,
@@ -178,11 +179,11 @@ type WallpaperCache = SpinLock<Option<WallpaperResult>>;
 /// The embedded wallpaper's decode, once a boot ([`boot_wallpaper`]).
 static BOOT_WALLPAPER: WallpaperCache = SpinLock::new(None);
 
-/// An automation request (#156 fills this in): none can be made yet, so
-/// no window's queue ever holds one. Not `Clone`: #156's requests answer
-/// for themselves when dropped, so a copy would answer twice.
-#[derive(Debug)]
-pub enum Request {}
+/// An automation request (`ui invoke`, #156: `crate::ui::Request`). Not
+/// `Clone`: it answers for itself when dropped, so a copy would answer
+/// twice; never dropped under a desktop lock (the queue hands refused and
+/// drained ones back: `push_request`, [`WindowHandle`]'s drop).
+pub use crate::ui::Request;
 
 /// A window's event queue.
 type Queue = EventQueue<KeyEvent, Request>;
@@ -218,8 +219,8 @@ pub enum WindowEvent {
     /// Events for this window were dropped: every key and button counts as
     /// released.
     Lost,
-    /// The close box was clicked: the owner decides (dropping the handle
-    /// closes the window).
+    /// The close box was clicked, or `ui invoke <root> close`: the owner
+    /// decides (dropping the handle closes the window).
     Close,
     /// An automation request (#156).
     Request(Request),
@@ -257,6 +258,8 @@ impl From<Next<Entry<KeyEvent, Request>>> for WindowEvent {
 /// A window as the compositor and its owner share it.
 pub struct Window {
     id: WindowId,
+    /// Its root in the automation tree (role `window`: the compositor's).
+    root: lumen_ui::NodeId,
     title: String,
     inner: SpinLock<WindowInner>,
     /// What its owner has to read (see [`pending::Pending`]).
@@ -347,6 +350,11 @@ struct WindowInner {
     queue: Queue,
     /// The thread that last read its events (the opener's until then).
     owner: &'static str,
+    /// Its toolkit's tree as last published ([`WindowHandle::publish`]):
+    /// the root's children, and every node below it with its depth (from
+    /// 1), client coordinates. Empty for a window without a toolkit.
+    top: Vec<lumen_ui::NodeId>,
+    nodes: Vec<(u32, AutomationNode)>,
 }
 
 /// Why [`open_window`] failed.
@@ -554,8 +562,13 @@ struct Stats {
     pixels: u64,
     present_ns: u64,
     no_focus_keys: u64,
-    /// Deliveries for a window that had closed.
+    /// Deliveries and `ui invoke` requests for a window no longer on the
+    /// list (closed).
     dead_pushes: u64,
+    /// `ui invoke` requests cancelled at their deadline, and answers that
+    /// came after it ("ran late").
+    cancelled: u64,
+    late: u64,
     /// Glyphs the compositor rasterized for the titles (its own cache's
     /// misses): flat once every title's glyphs are cached; `None` with no
     /// UI font.
@@ -598,6 +611,8 @@ struct State {
     abort: bool,
     /// `desktop check`'s and `screenshot`'s requests (see [`Slot`]).
     slot: Slot,
+    /// `ui invoke` requests queued and not finished by their askers.
+    requests: u32,
     /// The wallpaper drawn behind the windows, centred, or why there is
     /// none (then the theme's flat colour): `desktop status`'s `wallpaper`.
     wallpaper: WallpaperResult,
@@ -634,6 +649,7 @@ impl State {
             screen: None,
             abort: false,
             slot: Slot::Free,
+            requests: 0,
             wallpaper: Err(Arc::new(NotShown { word: "none", why: String::from("none set") })),
         }
     }
@@ -661,6 +677,8 @@ impl State {
 
     /// Change window `id`'s queue with `f`, returning what it did; for a
     /// window no longer on the list, count a dead push instead (`None`).
+    /// Never for requests: `f` would be dropped here, under the lock, with
+    /// the request it holds ([`push_request`] hands one back instead).
     fn push(
         &mut self,
         id: WindowId,
@@ -671,18 +689,22 @@ impl State {
             self.stats.dead_pushes += 1;
             return None;
         };
-        let pushed = {
-            let mut inner = win.inner.lock();
-            let pushed = f(&mut inner.queue);
-            win.pending.set_queued(!inner.queue.is_idle());
-            pushed
-        };
+        let pushed = with_queue(win, f);
         if let Some(Pushed::Dropped { first_in_burst: true }) = pushed {
             after.behind.push(id.get());
         }
         after.wake.push(win.clone());
         pushed
     }
+}
+
+/// Change `win`'s queue with `f` under its lock (`f` always runs), keeping
+/// the `queued` flag the owner's wake-up check reads.
+fn with_queue<T>(win: &Window, f: impl FnOnce(&mut Queue) -> T) -> T {
+    let mut inner = win.inner.lock();
+    let out = f(&mut inner.queue);
+    win.pending.set_queued(!inner.queue.is_idle());
+    out
 }
 
 /// Work for after the locks: owners to wake, warnings to log.
@@ -822,8 +844,15 @@ impl Desktop {
             let (switches, theme) = (THEME_GEN.load(Ordering::Acquire), theme());
             let win = Arc::new(Window {
                 id,
+                root: lumen_ui::NodeId::fresh(),
                 title: String::from(title),
-                inner: SpinLock::new(WindowInner { committed, queue: Queue::new(), owner }),
+                inner: SpinLock::new(WindowInner {
+                    committed,
+                    queue: Queue::new(),
+                    owner,
+                    top: Vec::new(),
+                    nodes: Vec::new(),
+                }),
                 pending: pending::Pending::new(switches),
                 idle: AtomicBool::new(false),
                 events: WaitQueue::new(),
@@ -945,6 +974,18 @@ impl WindowHandle {
         }
     }
 
+    /// Publish its toolkit's tree (`ui tree` reads it without asking the
+    /// owner): `top`, the root's children, and every node below the root
+    /// with its depth (from 1), client coordinates. Built by the owner,
+    /// then swapped in under the window's lock.
+    pub fn publish(&mut self, top: Vec<lumen_ui::NodeId>, nodes: Vec<(u32, AutomationNode)>) {
+        let (old_top, old_nodes) = {
+            let mut inner = self.win.inner.lock();
+            (core::mem::replace(&mut inner.top, top), core::mem::replace(&mut inner.nodes, nodes))
+        };
+        drop((old_top, old_nodes));
+    }
+
     /// Whether `desktop hold` holds this window (a `desktop spin` one).
     fn held(&self) -> bool {
         self.win.held.load(Ordering::Acquire)
@@ -956,24 +997,28 @@ impl Drop for WindowHandle {
         // In one hold of the desktop's lock: off the list (so nothing more
         // is delivered to its queue), then its queue killed and its counts
         // kept, then out of the window manager.
+        // The requests still queued come back from the queue, answered
+        // ("window closed") once every lock is released.
         let mut after = After::default();
         let mut g = self.home.lock();
-        if let Some(s) = g.as_mut() {
+        let unanswered = if let Some(s) = g.as_mut() {
             s.windows.retain(|w| !Arc::ptr_eq(w, &self.win));
-            let counts = {
+            let (counts, unanswered) = {
                 let mut inner = self.win.inner.lock();
-                inner.queue.kill();
+                let unanswered = inner.queue.kill();
                 self.win.pending.set_queued(false);
-                inner.queue.counts()
+                (inner.queue.counts(), unanswered)
             };
             s.closed += &counts;
             if let Some(out) = s.wm.close(self.win.id) {
                 s.apply(out, &mut after);
             }
+            unanswered
         } else {
-            self.win.inner.lock().queue.kill();
-        }
+            self.win.inner.lock().queue.kill()
+        };
         drop(g);
+        drop(unanswered);
         after.finish();
         self.home.wake();
     }
@@ -1905,6 +1950,172 @@ fn capture_answer(outcome: Result<Answer, JobError>) -> Option<Result<(Rows, u64
     }
 }
 
+// -- the automation tree (#156; `crate::ui` prints it) ---------------------------------
+
+/// A node of `ui tree`: its window, its depth (0 for the root) and the node,
+/// its bounds on the screen.
+pub struct TreeRow {
+    pub window: u32,
+    pub depth: u32,
+    pub node: AutomationNode,
+}
+
+/// Where a node is: a window's root, or a node of its published tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeAt {
+    Root(u32),
+    Widget(u32),
+}
+
+/// Window `id`'s root's row: its root node (role `window`, named by its
+/// title, its children its toolkit's top nodes), bounds its client area on
+/// the screen, depth 0.
+fn root_row(s: &State, id: WindowId) -> Option<TreeRow> {
+    let w = s.wm.window(id)?;
+    let win = s.window(id)?;
+    let client = s.wm.client(id)?;
+    let top = win.inner.lock().top.clone();
+    let node = AutomationNode::window(win.root, w.title(), client, s.wm.focused() == Some(id), top);
+    Some(TreeRow { window: id.get(), depth: 0, node })
+}
+
+/// Whether the desktop has started.
+pub fn started() -> bool {
+    COMPOSITOR.lock().as_ref().is_some_and(|s| s.started)
+}
+
+/// `ui tree [window]`'s rows: front to back, each window's root then its
+/// published nodes, on the screen. `Err` without a desktop, or for a
+/// window number that names none.
+pub fn tree_rows(window: Option<u32>) -> Result<Vec<TreeRow>, String> {
+    let g = COMPOSITOR.lock();
+    let s = g.as_ref().filter(|s| s.started).ok_or_else(|| String::from("no desktop"))?;
+    if let Some(n) = window
+        && s.wm.id(n).is_none()
+    {
+        return Err(alloc::format!("no window {n}"));
+    }
+    let mut rows = Vec::new();
+    for w in s.wm.windows().iter().rev() {
+        if window.is_some_and(|n| n != w.id().get()) {
+            continue;
+        }
+        let (Some(root), Some(win)) = (root_row(s, w.id()), s.window(w.id())) else { continue };
+        let client = root.node.bounds();
+        rows.push(root);
+        for (depth, node) in &win.inner.lock().nodes {
+            rows.push(TreeRow { window: w.id().get(), depth: *depth, node: node.translated(client.x(), client.y()) });
+        }
+    }
+    Ok(rows)
+}
+
+/// Where node number `n` is (`None`: no node, or its window closed).
+pub fn find_node(n: u64) -> Option<NodeAt> {
+    let g = COMPOSITOR.lock();
+    let s = g.as_ref()?;
+    s.windows.iter().find_map(|win| {
+        if win.root.get() == n {
+            return Some(NodeAt::Root(win.id.get()));
+        }
+        let inner = win.inner.lock();
+        inner.nodes.iter().any(|(_, node)| node.id().get() == n).then_some(NodeAt::Widget(win.id.get()))
+    })
+}
+
+/// A row of window `window`'s node `node` (client coordinates) on the
+/// screen, at depth `depth` (`None`: the window has closed since).
+pub fn node_row(window: u32, depth: u32, node: AutomationNode) -> Option<TreeRow> {
+    let g = COMPOSITOR.lock();
+    let client = g.as_ref().and_then(|s| s.wm.id(window).and_then(|id| s.wm.client(id)))?;
+    Some(TreeRow { window, depth, node: node.translated(client.x(), client.y()) })
+}
+
+/// `ui invoke <root> focus`: raise and focus window `window` (the
+/// compositor answers it); its root's row after (`None`: no such window).
+pub fn focus_window(window: u32) -> Option<TreeRow> {
+    let mut after = After::default();
+    let row = {
+        let mut g = COMPOSITOR.lock();
+        let s = g.as_mut()?;
+        let id = s.wm.id(window)?;
+        // Nothing returns early once the focus changed: its damage and
+        // deliveries go out, and the compositor is woken, below.
+        if let Some(out) = s.wm.focus(id) {
+            s.apply(out, &mut after);
+        }
+        root_row(s, id)
+    };
+    after.finish();
+    wake();
+    row
+}
+
+/// `ui invoke <root> close`: ask window `window`'s owner to close it (its
+/// `Close`), then wait up to `timeout_ns` for it to go; whether it went (if
+/// not, its close stays queued: the owner reads it when it can).
+pub fn close_window(window: u32, timeout_ns: u64) -> bool {
+    let mut after = After::default();
+    {
+        let mut g = COMPOSITOR.lock();
+        let Some(s) = g.as_mut() else { return true };
+        let Some(id) = s.wm.id(window) else { return true };
+        let _ = s.push(id, &mut after, |q| {
+            q.request_close();
+            None
+        });
+    }
+    after.finish();
+    wake();
+    // (`DONE`'s waiter: its predicate takes `COMPOSITOR` under the wait
+    // queue's lock, as `resume`'s does.)
+    let gone = || COMPOSITOR.lock().as_ref().is_none_or(|s| s.wm.id(window).is_none());
+    let deadline = crate::time::now_ns().saturating_add(timeout_ns);
+    DONE.wait_until_or_deadline(deadline, gone) || gone()
+}
+
+/// Queue `ui invoke`'s request on the live desktop's window `window` (see
+/// [`Desktop::push_request`]).
+pub fn push_request(window: u32, req: Request) -> Result<(), lumen_wm::Refused<Request>> {
+    Desktop::LIVE.push_request(window, req)
+}
+
+impl Desktop {
+    /// Queue `ui invoke`'s request on window `window`, waking its owner; a
+    /// refused one is handed back (busy, or the window gone: not on the
+    /// list), to be dropped (answered) with no desktop lock held.
+    pub fn push_request(&self, window: u32, req: Request) -> Result<(), lumen_wm::Refused<Request>> {
+        let mut after = After::default();
+        let result = 'push: {
+            let mut g = self.home.lock();
+            let Some(s) = g.as_mut() else { break 'push Err(lumen_wm::Refused::Dead(req)) };
+            let Some(win) = s.wm.id(window).and_then(|id| s.window(id)).cloned() else {
+                s.stats.dead_pushes += 1;
+                break 'push Err(lumen_wm::Refused::Dead(req));
+            };
+            let pushed = with_queue(&win, |q| q.push_request(req));
+            if pushed.is_ok() {
+                s.requests += 1;
+                after.wake.push(win);
+            }
+            pushed
+        };
+        after.finish();
+        result
+    }
+}
+
+/// A request's asker is done with it (`settled` waits for none to be);
+/// count it if it was cancelled at its deadline or answered late.
+pub fn request_finished(cancelled: bool, late: bool) {
+    if let Some(s) = COMPOSITOR.lock().as_mut() {
+        debug_assert!(s.requests > 0, "a request finished that was never counted");
+        s.requests = s.requests.saturating_sub(1);
+        s.stats.cancelled += u64::from(cancelled);
+        s.stats.late += u64::from(late);
+    }
+}
+
 // -- the demo windows and `desktop spin` --------------------------------------------
 
 /// The two windows the desktop starts with.
@@ -2034,37 +2245,68 @@ fn draw_last_key(
     line
 }
 
-/// `desktop spin`'s window: a pure green bar moving every 20 ms over
-/// [`WindowHandle::theme`]'s client colour, its events read meanwhile (not
-/// while `desktop hold` holds it: then it keeps the theme it was told of).
-fn spin_owner(mut h: WindowHandle) {
-    const GREEN: u32 = 0x00ff00;
-    let bounds = h.surface_mut().bounds();
-    let mut x = 0i32;
+/// `desktop spin`'s client: the bar's strip, then the Stop button's.
+const SPIN_SIZE: (u32, u32) = (200, 100);
+const SPIN_STRIP: u32 = 60;
+
+/// `desktop spin`'s app: one button, Stop, which closes the window (a
+/// request its queue can refuse as busy while `desktop hold` holds it),
+/// under a pure green bar moving every frame.
+struct Spin {
+    ui: lumen_ui::Ui,
+    stop: lumen_ui::Widget,
+    x: i32,
+}
+
+impl lumen_ui::App for Spin {
+    fn ui_mut(&mut self) -> &mut lumen_ui::Ui {
+        &mut self.ui
+    }
+
+    fn apply(&mut self, events: &[lumen_ui::UiEvent]) -> lumen_ui::Then {
+        if events.contains(&lumen_ui::UiEvent::Pressed(self.stop)) {
+            lumen_ui::Then::Close
+        } else {
+            lumen_ui::Then::Carry
+        }
+    }
+
+    fn paint_over(&mut self, s: &mut Surface) {
+        const GREEN: u32 = 0x00ff00;
+        s.fill_rect(Rect::new(self.x, 20, 40, 20), GREEN);
+    }
+}
+
+/// `desktop spin`'s window: a frame every 20 ms (the bar moved), its
+/// events read meanwhile (not while `desktop hold` holds it).
+fn spin_owner(mut h: WindowHandle, mut tk: crate::ui::Toolkit<Spin>) {
+    let width = h.surface_mut().width() as i32;
     loop {
-        if !h.held() {
-            while let Some(e) = h.next_event() {
-                if matches!(e, WindowEvent::Close) {
-                    return;
-                }
+        tk.frame(&mut h);
+        let app = tk.app_mut();
+        app.x = (app.x + 8) % (width - 40).max(1);
+        while !h.held()
+            && let Some(e) = h.next_event()
+        {
+            if let crate::ui::Step::Close(closing) = tk.step(&mut h, e) {
+                return crate::ui::close(h, closing);
             }
         }
-        let client = h.theme().client;
-        let s = h.surface_mut();
-        s.fill(client);
-        s.fill_rect(Rect::new(x, 20, 40, 20), GREEN);
-        h.commit(&[bounds]);
-        x = (x + 8) % (bounds.w() as i32 - 40).max(1);
         let _ = crate::sched::sleep(20_000_000);
     }
 }
 
 /// `desktop spin`: open its window and start its owner.
 fn spin() -> Result<u32, String> {
-    let h = Desktop::LIVE.open("spin", 200, 60, None, true).map_err(|e| alloc::format!("no window: {e}"))?;
-    let id = h.id();
-    let _detached =
-        crate::sched::spawn("desktop-spin", move || spin_owner(h)).map_err(|e| alloc::format!("no thread: {e}"))?;
+    let (w, h) = SPIN_SIZE;
+    let mut ui = lumen_ui::Ui::new();
+    let stop = ui.button(None, "Stop");
+    let area = Rect::new(0, SPIN_STRIP as i32, w, h - SPIN_STRIP);
+    let handle = Desktop::LIVE.open("spin", w, h, None, true).map_err(|e| alloc::format!("no window: {e}"))?;
+    let tk = crate::ui::Toolkit::new(Spin { ui, stop, x: 0 }, area, handle.theme())?;
+    let id = handle.id();
+    let _detached = crate::sched::spawn("desktop-spin", move || spin_owner(handle, tk))
+        .map_err(|e| alloc::format!("no thread: {e}"))?;
     Ok(id)
 }
 
@@ -2081,7 +2323,7 @@ fn hold(id: &str, held: bool) -> Result<(), String> {
     Ok(())
 }
 
-pub const USAGE: &str = "usage: desktop [status|check|spin|hold <window>|release <window>]";
+pub const USAGE: &str = "usage: desktop [status|check|spin|counter|hold <window>|release <window>]";
 
 // -- records -----------------------------------------------------------------------
 
@@ -2240,6 +2482,7 @@ pub fn status_table() -> pipe::Table {
         committing: s.commits > 0,
         pending,
         windows_idle,
+        requesting: s.requests > 0,
         themes_told,
     }
     .holds();
@@ -2275,8 +2518,8 @@ pub fn status_table() -> pipe::Table {
             Ok(_) => "shown",
             Err(not) => not.word,
         }),
-        int(0),
-        int(0),
+        int(s.stats.cancelled),
+        int(s.stats.late),
         yes(settled),
     ]);
     t
@@ -2324,6 +2567,9 @@ struct Settled {
     /// Every window's queue is idle and its owner waits (blocked in
     /// `wait_event`); read after `themes_told` for each window.
     windows_idle: bool,
+    /// A `ui invoke` request was pushed and its asker isn't done with it
+    /// yet.
+    requesting: bool,
     /// Every window's owner has been told of the last theme switch.
     themes_told: bool,
 }
@@ -2342,6 +2588,7 @@ impl Settled {
             && !self.committing
             && !self.pending
             && self.windows_idle
+            && !self.requesting
             && self.themes_told
     }
 }
@@ -2363,9 +2610,10 @@ pub fn windows_records(args: &[String]) -> Option<Result<pipe::Table, String>> {
 pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
     use crate::shell::sysinfo::print_table;
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
-    // `check`, `spin`, `hold` and `release` need the desktop shown.
+    // `check`, `spin`, `counter`, `hold` and `release` need the desktop
+    // shown.
     if let [what, ..] = words[..]
-        && matches!(what, "check" | "spin" | "hold" | "release")
+        && matches!(what, "check" | "spin" | "counter" | "hold" | "release")
         && let Some(why) = refused_while_paused()
     {
         return ctx.fail(why);
@@ -2406,12 +2654,15 @@ pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
                 Err(e) => ctx.fail(format_args!("desktop check: {e}")),
             }
         }
-        ["spin"] => match spin() {
-            Ok(id) => {
-                let _ = writeln!(ctx.out, "desktop spin: window {id}");
+        [what @ ("spin" | "counter")] => {
+            let opened = if what == "spin" { spin() } else { crate::ui::open_counter() };
+            match opened {
+                Ok(id) => {
+                    let _ = writeln!(ctx.out, "desktop {what}: window {id}");
+                }
+                Err(e) => ctx.fail(format_args!("desktop {what}: {e}")),
             }
-            Err(e) => ctx.fail(format_args!("desktop spin: {e}")),
-        },
+        }
         [what @ ("hold" | "release"), id] => match hold(id, what == "hold") {
             Ok(()) => {
                 let _ = writeln!(ctx.out, "desktop {what}: window {id}");
@@ -2422,11 +2673,10 @@ pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
     }
 }
 
-/// Why `desktop check`, `spin`, `hold` and `release` refuse now, if they
-/// do.
+/// Why `desktop check`, `spin`, `counter`, `hold` and `release` refuse
+/// now, if they do.
 fn refused_while_paused() -> Option<&'static str> {
-    let started = COMPOSITOR.lock().as_ref().is_some_and(|s| s.started);
-    if !started {
+    if !started() {
         Some("desktop: not started (`desktop` starts it)")
     } else if !is_shown() {
         Some("desktop: paused (`desktop` resumes it)")
@@ -2545,10 +2795,11 @@ crate::ktest!(
             committing: false,
             pending: false,
             windows_idle: true,
+            requesting: false,
             themes_told: true,
         };
         kassert!(all.holds());
-        let broken: [fn(&mut Settled); 13] = [
+        let broken: [fn(&mut Settled); 14] = [
             |s| s.shown = false,
             |s| s.compositor_shown = false,
             |s| s.acted_on_cut = false,
@@ -2561,6 +2812,7 @@ crate::ktest!(
             |s| s.committing = true,
             |s| s.pending = true,
             |s| s.windows_idle = false,
+            |s| s.requesting = true,
             |s| s.themes_told = false,
         ];
         for (i, f) in broken.iter().enumerate() {
@@ -2782,6 +3034,47 @@ crate::ktest!(
         kassert!(capture_answer(Err(JobError::Paused)).is_none());
         kassert!(matches!(capture_answer(Ok(Answer::WrongSize)), Some(Err(_))));
         kassert!(matches!(capture_answer(Err(JobError::Busy)), Some(Err(_))));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn closing_a_window_answers_its_queued_requests() {
+        // A request still queued when its window closes comes back from the
+        // queue and is answered "window closed" once the locks are released
+        // (its asker would print "window <id> closed before it ran").
+        use crate::kassert;
+        use lumen_ui::Phase;
+        let d = Desktop::without_screen();
+        let w = d.open_window("w", 16, 16).map_err(|_| "a window")?;
+        let (req, cell) = crate::ui::Request::new(1, lumen_ui::Action::Press);
+        kassert!(d.push_request(w.id(), req).is_ok());
+        kassert!(cell.phase() == Phase::Pending);
+        drop(w);
+        kassert!(matches!(cell.take(), Some(crate::ui::Answer::WindowClosed)));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_request_for_a_closed_window_is_handed_back_unanswered() {
+        // A window no longer on the list: the request comes back as dead,
+        // still pending (never dropped under the desktop's lock), and the
+        // miss is counted; dropped then, it answers "window closed".
+        use crate::{kassert, kassert_eq};
+        use lumen_ui::Phase;
+        let d = Desktop::without_screen();
+        let w = d.open_window("w", 16, 16).map_err(|_| "a window")?;
+        let id = w.id();
+        drop(w);
+        let (req, cell) = crate::ui::Request::new(1, lumen_ui::Action::Press);
+        let Err(lumen_wm::Refused::Dead(back)) = d.push_request(id, req) else {
+            return Err("not handed back as dead");
+        };
+        kassert!(cell.phase() == Phase::Pending);
+        kassert_eq!(d.home.lock().as_ref().map(|s| s.stats.dead_pushes), Some(1));
+        drop(back);
+        kassert!(cell.phase() == Phase::Done);
         Ok(())
     }
 );

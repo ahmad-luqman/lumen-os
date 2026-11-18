@@ -23,8 +23,8 @@
 //!   tail).
 //! - Presses, moves and requests are queued only while fewer than
 //!   [`RATIONED`] entries are: past that a press or move is dropped
-//!   (counted in `rationed`) and a request refused ([`Pushed::Busy`]: `ui
-//!   invoke` says "window <id> busy").
+//!   (counted in `rationed`) and a request refused ([`Refused::Busy`],
+//!   handed back: `ui invoke` says "window <id> busy (try again)").
 //! - A release is queued, in any free slot, only if the queue took that
 //!   key's or button's press. Any other release is ignored and counted: a
 //!   key's as `key_releases_unpaired` (expected: keys go to the window
@@ -39,8 +39,17 @@
 //! The first drop since the queue last emptied is [`Pushed::Dropped`] with
 //! `first_in_burst` set, for #153's one `WARN desktop: window <id> is
 //! behind: dropping events` per burst. After the window is destroyed the
-//! queue is dead ([`EventQueue::kill`]): pushes and flags are counted
-//! (`dead_pushes`), never queued.
+//! queue is dead ([`EventQueue::kill`], which drains what was queued):
+//! pushes and flags are counted (`dead_pushes`), never queued.
+//!
+//! **Requests answer for themselves** (#156: a `ui invoke` request answers
+//! "window closed" when dropped unanswered, and wakes its asker), so none
+//! is ever dropped inside the queue, where its window's lock is held:
+//! [`EventQueue::push_request`] hands a refused one back
+//! ([`Refused::Busy`], [`Refused::Dead`]) and [`EventQueue::kill`] returns
+//! the ones still queued, for the caller to answer once its locks are
+//! released. (`push` of an [`Entry::Request`] is a bug, a `debug_assert`:
+//! a refused one would be dropped there.)
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -145,6 +154,17 @@ pub enum Pushed {
     Stray,
     /// The queue is dead (its window destroyed).
     Dead,
+}
+
+/// A request [`EventQueue::push_request`] refused, handed back so its
+/// caller can answer it after releasing its locks.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refused<R> {
+    /// [`RATIONED`] entries are queued: `ui invoke` says "window <id> busy
+    /// (try again)".
+    Busy(R),
+    /// The queue is dead (its window destroyed).
+    Dead(R),
 }
 
 /// What the queue counted.
@@ -312,12 +332,15 @@ impl<K: KeyLike, R> EventQueue<K, R> {
                 }
             }
             Class::Request => {
-                if len < RATIONED {
-                    self.entries.push_back(e);
-                    Pushed::Queued
-                } else {
-                    self.counts.busy += 1;
-                    Pushed::Busy
+                // A refused request would be dropped here, under the
+                // window's lock: requests answer for themselves (#156), so
+                // they go through `push_request`, which hands one back.
+                debug_assert!(false, "a request pushed with `push`: use `push_request`");
+                let Entry::Request(r) = e else { unreachable!("a request's class") };
+                match self.push_request(r) {
+                    Ok(()) => Pushed::Queued,
+                    Err(Refused::Busy(_)) => Pushed::Busy,
+                    Err(Refused::Dead(_)) => Pushed::Dead,
                 }
             }
             Class::Release(h) => {
@@ -338,6 +361,22 @@ impl<K: KeyLike, R> EventQueue<K, R> {
                     self.dropped()
                 }
             }
+        }
+    }
+
+    /// Queues request `r` while fewer than [`RATIONED`] entries are queued
+    /// (counted in `busy` otherwise); a refused one is handed back.
+    pub fn push_request(&mut self, r: R) -> Result<(), Refused<R>> {
+        if self.dead {
+            self.counts.dead_pushes += 1;
+            return Err(Refused::Dead(r));
+        }
+        if self.entries.len() < RATIONED {
+            self.entries.push_back(Entry::Request(r));
+            Ok(())
+        } else {
+            self.counts.busy += 1;
+            Err(Refused::Busy(r))
         }
     }
 
@@ -378,9 +417,22 @@ impl<K: KeyLike, R> EventQueue<K, R> {
         self.close = Some(self.entries.len());
     }
 
-    /// The window was destroyed: nothing is queued from now on.
-    pub fn kill(&mut self) {
+    /// The window was destroyed: nothing is queued from now on, and what was
+    /// queued is gone. The requests among it come back, in order, for the
+    /// caller to answer once its locks are released.
+    #[must_use = "the requests still queued must be answered (after the locks)"]
+    pub fn kill(&mut self) -> Vec<R> {
         self.dead = true;
+        for flag in [&mut self.lost, &mut self.focus_lost, &mut self.focus_gained, &mut self.close] {
+            *flag = None;
+        }
+        self.entries
+            .drain(..)
+            .filter_map(|e| match e {
+                Entry::Request(r) => Some(r),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The next thing to deliver: a flag that is due, else the oldest
@@ -518,7 +570,7 @@ mod tests {
     fn rationed() -> Q {
         let mut q = Q::new();
         for i in 0..RATIONED as u32 {
-            assert_eq!(q.push(ask(i)), Pushed::Queued);
+            assert_eq!(q.push_request(i), Ok(()));
         }
         q
     }
@@ -544,17 +596,17 @@ mod tests {
     fn presses_moves_and_requests_fit_until_48_are_queued() {
         let mut q = Q::new();
         for i in 0..RATIONED as u32 - 1 {
-            q.push(ask(i));
+            let _ = q.push_request(i);
         }
         // At 47 a move, then (at 48) a press, a move and a request don't.
         assert_eq!(q.push(mv(1)), Pushed::Queued);
         assert_eq!(q.push(down(1)), Pushed::Dropped { first_in_burst: true });
-        assert_eq!(q.push(ask(1)), Pushed::Busy);
+        assert_eq!(q.push_request(1), Err(Refused::Busy(1)));
         // A move at the tail still merges at 48.
         assert_eq!(q.push(mv(2)), Pushed::Merged);
         let mut q = Q::new();
         for i in 0..RATIONED as u32 - 1 {
-            q.push(ask(i));
+            let _ = q.push_request(i);
         }
         assert_eq!(q.push(down(1)), Pushed::Queued);
         assert_eq!(q.push(mv(1)), Pushed::Dropped { first_in_burst: true });
@@ -568,7 +620,7 @@ mod tests {
         }
         assert_eq!(q.push(bdown(Button::Left)), Pushed::Queued);
         for i in 9..RATIONED as u32 {
-            assert_eq!(q.push(ask(i)), Pushed::Queued);
+            assert_eq!(q.push_request(i), Ok(()));
         }
         assert_eq!(q.len(), RATIONED);
         // Past the threshold: a press and a move are dropped, the first
@@ -596,7 +648,7 @@ mod tests {
         assert_eq!(got.last(), Some(&Next::Event(bup(Button::Left))));
         // Emptied: the next drop is a new burst.
         for i in 0..RATIONED as u32 {
-            q.push(ask(i));
+            let _ = q.push_request(i);
         }
         assert_eq!(q.push(down(1)), Pushed::Dropped { first_in_burst: true });
     }
@@ -624,7 +676,7 @@ mod tests {
         let mut q = Q::new();
         q.push(bdown(Button::Left));
         for i in 1..RATIONED as u32 {
-            q.push(ask(i));
+            let _ = q.push_request(i);
         }
         assert_eq!(q.push(bdown(Button::Left)), Pushed::Dropped { first_in_burst: true });
         assert_eq!(q.push(bup(Button::Left)), Pushed::Queued);
@@ -644,10 +696,10 @@ mod tests {
     #[test]
     fn a_request_past_the_threshold_is_refused_as_busy() {
         let mut q = rationed();
-        assert_eq!(q.push(ask(99)), Pushed::Busy);
+        assert_eq!(q.push_request(99), Err(Refused::Busy(99)));
         assert_eq!((q.counts().busy, q.counts().lost()), (1, 0));
         q.next_event();
-        assert_eq!(q.push(ask(100)), Pushed::Queued);
+        assert_eq!(q.push_request(100), Ok(()));
     }
 
     #[test]
@@ -731,15 +783,15 @@ mod tests {
     fn a_dead_queue_counts_pushes_and_flags_and_takes_none() {
         let mut q = Q::new();
         q.push(down(1));
-        q.kill();
+        assert_eq!(q.kill(), Vec::<u32>::new(), "no request was queued");
         assert!(q.is_dead());
         assert_eq!(q.push(up(1)), Pushed::Dead);
-        assert_eq!(q.push(ask(1)), Pushed::Dead);
+        assert_eq!(q.push_request(1), Err(Refused::Dead(1)));
         q.set_lost();
         q.set_focus(false);
         q.request_close();
         assert_eq!(q.counts().dead_pushes, 5);
-        assert_eq!(drain(&mut q), [Next::Event(down(1))]);
+        assert_eq!(drain(&mut q), [], "what was queued went with it");
     }
 
     #[test]
@@ -790,5 +842,45 @@ mod tests {
             }
         );
         assert_eq!(sum.lost(), 6);
+    }
+
+    #[test]
+    fn a_refused_request_is_handed_back() {
+        // Past the ration a request comes back as busy; once the queue is
+        // dead, as dead; queued otherwise. None is dropped in the queue.
+        let mut q = rationed();
+        assert_eq!(q.push_request(99), Err(Refused::Busy(99)));
+        assert_eq!(q.counts().busy, 1);
+        let mut q = Q::new();
+        assert_eq!(q.push_request(1), Ok(()));
+        assert_eq!(q.next_event(), Some(Next::Event(ask(1))));
+        assert_eq!(q.kill(), Vec::<u32>::new());
+        assert_eq!(q.push_request(2), Err(Refused::Dead(2)));
+        assert_eq!(q.counts().dead_pushes, 1);
+    }
+
+    #[test]
+    fn killing_a_queue_hands_back_its_requests_in_order() {
+        // Its requests come back to be answered ("window closed"); the
+        // other entries and the flags go; nothing is delivered after.
+        let mut q = Q::new();
+        assert_eq!(q.push(down(1)), Pushed::Queued);
+        assert_eq!(q.push_request(10), Ok(()));
+        q.set_focus(true);
+        assert_eq!(q.push(mv(3)), Pushed::Queued);
+        assert_eq!(q.push_request(11), Ok(()));
+        q.request_close();
+        assert_eq!(q.kill(), [10, 11]);
+        assert!(q.is_dead() && q.is_idle());
+        assert_eq!(q.next_event(), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "use `push_request`")]
+    fn a_request_pushed_with_push_is_a_bug() {
+        // It would be dropped inside the queue if refused: requests go
+        // through `push_request`.
+        let mut q = Q::new();
+        let _ = q.push(ask(1));
     }
 }

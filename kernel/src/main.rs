@@ -61,6 +61,7 @@ mod sync;
 mod term;
 mod time;
 mod trace;
+mod ui;
 mod virtio;
 mod vt;
 

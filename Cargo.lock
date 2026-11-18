@@ -293,6 +293,7 @@ dependencies = [
  "lumen-time",
  "lumen-trace",
  "lumen-uart",
+ "lumen-ui",
  "lumen-wm",
  "noto-sans-mono-bitmap",
  "pc-keyboard",
@@ -360,6 +361,13 @@ version = "0.0.1"
 [[package]]
 name = "lumen-uart"
 version = "0.0.1"
+
+[[package]]
+name = "lumen-ui"
+version = "0.0.1"
+dependencies = [
+ "lumen-gfx",
+]
 
 [[package]]
 name = "lumen-wm"

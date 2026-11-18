@@ -13,6 +13,7 @@ the driver checked in-kernel (`lumen_kernel::rng::*`).
 
 import os
 import re
+import shlex
 
 import pytest
 from lumen_harness.qemu import Devices, Machine
@@ -117,7 +118,8 @@ def lspci_driver(m: Machine, name: str) -> list[str]:
     out = run(m, f"lspci | where name = '{name}' | select driver")
     lines = out.splitlines()
     assert re.fullmatch(r"\s*driver", lines[0]), out
-    return [line.strip() for line in lines[1:]]
+    # A driver line with spaces comes quoted: read as one word.
+    return [shlex.split(line)[0] for line in lines[1:]]
 
 
 def test_lspci_shows_rng_bound(boot):

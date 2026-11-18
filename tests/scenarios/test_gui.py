@@ -92,6 +92,8 @@ WALLPAPER = Path(__file__).resolve().parents[2] / "assets" / "wallpaper" / "lume
 TITLE_FOCUSED_RGB = (0x2B, 0x57, 0x97)
 TITLE_RGB = (0xD6, 0xD6, 0xD6)
 CLIENT_RGB = (0xF3, 0xF3, 0xF3)
+# lumen_wm::Theme::DARK's client colour.
+DARK_CLIENT_RGB = (0x1F, 0x1F, 0x1F)
 POINTER_OUTLINE_RGB = (0, 0, 0)
 POINTER_FILL_RGB = (0xFF, 0xFF, 0xFF)
 SCREEN_PIXELS = 1280 * 800
@@ -415,6 +417,23 @@ def test_presents_match_a_full_repaint(boot):
         assert gui.desktop_check(m) == (0, 0), f"after the switch to {name}"
 
 
+def drained(m: Machine, node: dict[str, str], allow: str | None = None) -> None:
+    """Wait until a released window's owner has read its whole queue: a
+    `focus` request on one of its nodes is answered only after everything
+    queued before it (refused as busy while the queue is still full: only
+    that is retried; any other message fails)."""
+
+    def answered(got: gui.Invoked) -> bool:
+        if got.row is not None:
+            return True
+        assert got.message is not None and got.message.endswith("busy (try again)"), got
+        return False
+
+    gui.wait_for(
+        m, "the queue drained", lambda: gui.invoke(m, node["id"], "focus", allow=allow), answered
+    )
+
+
 def test_a_window_behind_drops_and_says_busy(boot):
     # `desktop spin`'s window, never idle (the desktop never settles while
     # it runs), held (`desktop hold`: its owner stops reading its events),
@@ -427,6 +446,7 @@ def test_a_window_behind_drops_and_says_busy(boot):
     gui.start_desktop(m)
     spin = gui.desktop_spin(m)
     assert gui.desktop_status(m)["settled"] == "no", "settled with a window that never idles"
+    stop = gui.node(gui.wait_ui(m, "spin's tree", lambda r: len(r) > 1, spin), "button", "Stop")
     assert run(m, f"desktop hold {spin}") == f"desktop hold: window {spin}\n"
     row = gui.window(m, "spin")
     sx, sy = int(row["x"]), int(row["y"])
@@ -448,12 +468,41 @@ def test_a_window_behind_drops_and_says_busy(boot):
     assert run(m, f"desktop release {spin}") == f"desktop release: window {spin}\n"
     # Its queue drained, a key typed now is queued (held, it would be
     # rationed).
-    time.sleep(0.5)
+    drained(m, stop)
     gui.type_confirmed(m, "z")
     wait_keys(m, "spin", keys + 2)
     assert int(gui.window(m, "spin")["lost"]) == lost
     # Other windows refuse a hold.
     assert run(m, "desktop hold 1") == "desktop hold: window 1 isn't a `desktop spin` window\n"
+    # Held again, its Stop button's `ui invoke` is queued but never taken:
+    # cancelled at its 1 s deadline (counted). With the queue full, the
+    # next is refused as busy (never queued). Released, the owner skips the
+    # cancelled press: the window is still open once its queue drained.
+    assert run(m, f"desktop hold {spin}") == f"desktop hold: window {spin}\n"
+    cancelled = int(gui.desktop_status(m)["cancelled"])
+    out = run(m, f"ui invoke {stop['id']} press")
+    assert out == f"ui invoke: cancelled: window {spin} didn't take it in 1 s (try again)\n", out
+    assert int(gui.desktop_status(m)["cancelled"]) == cancelled + 1
+    gui.type_confirmed(m, "abcdefghijklmnopqrstuvwxyz0123", allow=warn)
+    gui.wait_for(
+        m,
+        "a full queue",
+        lambda: int(gui.window(m, "spin", allow=warn)["lost"]),
+        lambda n: n > lost,
+    )
+    busy = f"ui invoke: window {spin} busy (try again)\n"
+    assert run(m, f"ui invoke {stop['id']} press", allow=warn) == busy
+    assert run(m, f"desktop release {spin}", allow=warn) == f"desktop release: window {spin}\n"
+    drained(m, stop, allow=warn)
+    assert "spin" in [w["title"] for w in gui.windows(m, allow=warn)], "the cancelled press ran"
+    # Held, its root's `close` times out: still open, its close still
+    # queued; released, the owner reads it and the window goes.
+    root = gui.ui_tree(m, spin)[0]
+    assert run(m, f"desktop hold {spin}") == f"desktop hold: window {spin}\n"
+    still_open = f"ui invoke: window {spin} still open (its close is still queued)\n"
+    assert run(m, f"ui invoke {root['id']} close") == still_open
+    assert run(m, f"desktop release {spin}") == f"desktop release: window {spin}\n"
+    assert [w["title"] for w in gui.wait_windows(m, 2)] == ["Colours", "Welcome"]
 
 
 def test_pointer_moves_over_the_desktop(boot):
@@ -650,3 +699,191 @@ def test_a_theme_boot_flag_naming_no_theme_warns(boot):
     m.expect(r"WARN  desktop: lumen.theme=blue: not a theme \(light, dark\), ignored\n", 60)
     m.expect(PROMPT, 60)
     assert run(m, "theme") == "theme: light\n"
+
+
+# -- the toolkit and the automation tree (#156) ----------------------------------------
+
+
+def start_counter(m: Machine) -> tuple[str, list[dict[str, str]]]:
+    """`desktop counter`: its window's id, and its tree once published,
+    the desktop settled."""
+    wid = gui.desktop_counter(m)
+    gui.wait_ui(m, "the Counter's tree", lambda r: any(n["name"] == "Quit" for n in r), window=wid)
+    gui.wait_settled(m)
+    return wid, gui.ui_tree(m, wid)
+
+
+def count_of(m: Machine, wid: str) -> str:
+    return gui.node(gui.ui_tree(m, wid), "label", "Count")["value"]
+
+
+# ARCHITECTURE section 11's `ui tree` columns, in order.
+UI_TREE_COLUMNS = [
+    "id",
+    "window",
+    "depth",
+    "role",
+    "name",
+    "value",
+    "state",
+    "actions",
+    "x",
+    "y",
+    "w",
+    "h",
+]
+
+
+def test_automation_tree_lists_buttons(boot):
+    # The Counter window's tree: its root (role window, named by its
+    # title, focused, in front), then its widgets; `where role = button`
+    # finds Add, Reset and Quit by name, each taking press and focus, each
+    # inside the window's client area on the screen. `ui tree` lists every
+    # window's root, front to back, under section 11's columns. A back
+    # window's root takes `focus`: raised, focused, and the Counter's root
+    # no longer focused.
+    m = boot_shells(boot)
+    gui.start_desktop(m)
+    wid, rows = start_counter(m)
+    assert run(m, f"ui tree {wid}").splitlines()[0].split() == UI_TREE_COLUMNS
+    root = rows[0]
+    assert (root["role"], root["name"], root["depth"], root["state"], root["actions"]) == (
+        "window",
+        "Counter",
+        "0",
+        "focused",
+        "focus,close",
+    ), root
+    buttons = gui.parse_records(run(m, f"ui tree {wid} | where role = button"))
+    assert [b["name"] for b in buttons] == ["Add", "Reset", "Quit"], buttons
+    assert all(b["actions"] == "press,focus" and b["window"] == wid for b in buttons), buttons
+    x, y, w, h = frame_of(gui.window(m, "Counter"))
+    for b in buttons:
+        bx, by, bw, bh = frame_of(b)
+        assert x < bx and bx + bw < x + w and y + 24 < by and by + bh < y + h, (b, (x, y, w, h))
+    count = gui.node(rows, "label", "Count")
+    assert count["value"] == "0" and count["actions"] == "-", count
+    lock = gui.node(rows, "checkbox", "Lock")
+    assert lock["value"] == "unchecked", lock
+    roots = [r["name"] for r in gui.ui_tree(m) if r["depth"] == "0"]
+    assert roots == ["Counter", "Colours", "Welcome"], roots
+    assert run(m, "ui tree 99") == "ui tree: no window 99\n"
+    welcome = gui.node(gui.ui_tree(m), "window", "Welcome")
+    got = gui.invoke(m, welcome["id"], "focus")
+    assert got.row is not None and (got.row["name"], got.row["state"]) == ("Welcome", "focused"), (
+        got
+    )
+    front = gui.windows(m)[0]
+    assert (front["title"], front["z"], front["focused"]) == ("Welcome", "0", "yes"), front
+    assert gui.node(gui.ui_tree(m), "window", "Counter")["state"] == "-"
+    gui.wait_settled(m)
+    assert gui.desktop_check(m) == (0, 0)
+
+
+def test_invoke_press_changes_state(boot, artifacts, golden_dir):
+    # `ui invoke <Add> press` runs the button's own handler: the reply is
+    # Add's row, the Count label's value is 1 in the tree, and the screen
+    # shows it (a golden of the window, the pointer never drawn yet). A
+    # real click on Add then (the confirming pointer steps) reaches the same
+    # handler: 2.
+    m = boot_tablet(boot)
+    gui.start_desktop(m)
+    wid, rows = start_counter(m)
+    add = gui.node(rows, "button", "Add")
+    got = gui.invoke(m, add["id"], "press")
+    assert got.row is not None and (got.row["id"], got.row["name"]) == (add["id"], "Add"), got
+    assert not got.late
+    # Published before it was answered: read at once, no poll.
+    assert count_of(m, wid) == "1"
+    frame = frame_of(gui.window(m, "Counter"))
+    shot = gui.settled_screendump(m, "counter.png")
+    assert_matches_golden(
+        shot,
+        golden_dir / "desktop-counter-1.png",
+        origin=frame[:2],
+        size=frame[2:],
+        artifacts=artifacts,
+    )
+    cx, cy = int(add["x"]) + int(add["w"]) // 2, int(add["y"]) + int(add["h"]) // 2
+    gui.pointer_move(m, cx, cy)
+    gui.pointer_down(m)
+    gui.pointer_up(m)
+    gui.wait_for(m, "the count at 2", lambda: count_of(m, wid), lambda v: v == "2")
+    gui.pointer_move(m, 1200, 760)
+    status = gui.wait_settled(m)
+    # A press cancelled at its deadline (a loaded host) is retried by
+    # `gui.invoke` and counted: never run, so the count is still exact.
+    assert (status["cancelled"], status["late"]) == (str(got.retries), "0"), status
+    assert gui.desktop_check(m) == (0, 0)
+
+
+def test_invoke_on_a_closed_window_fails(boot):
+    # Errors change nothing (an action a role doesn't list, a disabled
+    # node, wrong arguments, a node that doesn't exist); `ui invoke <root>
+    # close` closes the window through its owner, and its nodes then name
+    # nothing.
+    m = boot_shells(boot)
+    assert run(m, "ui invoke 1 focus") == "ui invoke: no desktop\n"
+    gui.start_desktop(m)
+    wid, rows = start_counter(m)
+    add, lock = gui.node(rows, "button", "Add"), gui.node(rows, "checkbox", "Lock")
+    count = gui.node(rows, "label", "Count")
+    assert run(m, f"ui invoke {rows[0]['id']} press") == "ui invoke: a window doesn't take press\n"
+    assert run(m, f"ui invoke {add['id']} fly").startswith("ui invoke: no such action (press, ")
+    # The owner's refusals (through `gui.invoke`, which retries a request
+    # cancelled at its deadline), then the asker's own (wrong arguments).
+    assert gui.invoke(m, count["id"], "press").message == "ui invoke: a label doesn't take press"
+    got = gui.invoke(m, add["id"], "set_value", "3")
+    assert got.message == "ui invoke: a button doesn't take set_value", got
+    assert run(m, f"ui invoke {add['id']} press now").startswith("ui invoke: wrong arguments")
+    assert gui.invoke(m, lock["id"], "press").row["value"] == "checked"
+    assert gui.invoke(m, add["id"], "press").message == "ui invoke: the node is disabled"
+    assert count_of(m, wid) == "0"
+    root = rows[0]
+    assert run(m, f"ui invoke {root['id']} close") == f"ui invoke: window {wid} closed\n"
+    gui.wait_windows(m, 2)
+    assert run(m, f"ui invoke {add['id']} press") == f"ui invoke: no node {add['id']}\n"
+    assert run(m, f"ui invoke {root['id']} focus") == f"ui invoke: no node {root['id']}\n"
+    assert all(r["window"] != wid for r in gui.ui_tree(m))
+    gui.wait_settled(m)
+    assert gui.desktop_check(m) == (0, 0)
+
+
+def test_invoke_quit_closes_its_window(boot):
+    # Quit's own handler closes its window: the reply says it ran and the
+    # window closed, and the window is gone.
+    m = boot_shells(boot)
+    gui.start_desktop(m)
+    wid, rows = start_counter(m)
+    quit_button = gui.node(rows, "button", "Quit")
+    got = gui.invoke(m, quit_button["id"], "press")
+    assert got.message == f"ui invoke: ran; window {wid} closed", got
+    # Answered once the window was gone: read at once, no poll.
+    assert [w["title"] for w in gui.windows(m)] == ["Colours", "Welcome"]
+    gui.wait_settled(m)
+    assert gui.desktop_check(m) == (0, 0)
+
+
+def test_a_toolkit_window_repaints_in_a_new_theme(boot):
+    # Counter open: `theme dark` reaches its owner as a `Theme` event, and
+    # it repaints its whole tree in the dark palette (its client background
+    # the dark theme's `client`); back to light, the light one.
+    m = boot_shells(boot)
+    gui.start_desktop(m)
+    _, rows = start_counter(m)
+    x, y, w, h = frame_of(gui.window(m, "Counter"))
+    # A pixel of Counter's client background: inside its frame, below the
+    # last widget (Quit), clear of every widget.
+    quit_button = gui.node(rows, "button", "Quit")
+    _, qy, _, qh = frame_of(quit_button)
+    probe = (x + w - 20, qy + qh + 4)
+    assert probe[1] < y + h - 2, (probe, (x, y, w, h))
+    light = pixel(gui.settled_screendump(m, "counter-light.png"), *probe)
+    assert light == CLIENT_RGB, light
+    assert run(m, "theme dark") == "theme: dark\n"
+    gui.wait_settled(m)
+    assert pixel(gui.settled_screendump(m, "counter-dark.png"), *probe) == DARK_CLIENT_RGB
+    assert run(m, "theme light") == "theme: light\n"
+    gui.wait_settled(m)
+    assert pixel(gui.settled_screendump(m, "counter-light-again.png"), *probe) == CLIENT_RGB
+    assert gui.desktop_check(m) == (0, 0)
