@@ -55,12 +55,16 @@ BOOT_TSC_CASE = "time::the_boot_tsc_calibration_is_within_what_now_ns_needs"
 # bracket) and judge a try only when its reference bracket and its
 # uncertainty are each at most a quarter of the pause (lumen_time's
 # placement_is_judged), taking it again otherwise, 8 tries at most. How many
-# tries a run took isn't bounded: that counts how often a loaded host
+# of those 8 a run took isn't held lower: that counts how often a loaded host
 # stalled a bracket, not the code, and each test fails when none can be
 # judged. What is checked is that the try it judged, and the ones it took
-# again, follow from the widths it printed.
+# again, follow from the widths it printed; and, for the HPET test (its pause
+# and bracket both on the TSC), that no paused bracket is short of its pauses
+# by more than PAUSE_SLACK_NS, the kernel's rounding allowance. (The timer
+# test's floor also allows the boot TSC calibration's bound, not printed.)
 PLACEMENT_PAUSE_NS = 20_000_000
 PLACEMENT_TRIES = 8
+PAUSE_SLACK_NS = 10_000
 PLACEMENT = re.compile(
     r"injected pause: (?P<what>HPET|timer) placement (?P<off>\d+) ns off \(at most "
     rf"(?P<allowed>\d+) ns allowed\) on try (?P<try>\d+) of (?P<tries>\d+), {RETRY_SPACING_MS} ms "
@@ -72,23 +76,26 @@ PLACEMENT_TRY = re.compile(r"\((\d+), (\d+), (\d+), (\d+)\)")
 
 def placement_is_judged(reference: int, paused: int, pause: int) -> bool:
     """lumen_time's `placement_is_judged`: the reference bracket and the
-    uncertainty (half the reference's width plus what a stall added to the
+    uncertainty (half of the reference's width plus what a stall added to the
     paused one's, rounded up) each at most a quarter of the pause."""
     stalled = max(paused - 2 * pause, 0)
-    return 4 * reference <= pause and 4 * -(-(reference + stalled) // 2) <= pause
+    return 4 * reference <= pause and 4 * ((reference + stalled + 1) // 2) <= pause
 
 
 def _check_placement(p: re.Match[str], what: str) -> None:
     """A placement test's judged line: its clock, tries and allowance as the
     kernel's constants say; one listed try per try taken; the last one judged
     and the ones before it not (else the kernel stopped too late or too
-    soon); and `off` that last try's two times apart, within the allowance."""
+    soon); `off` that last try's two times apart, within the allowance; and
+    the HPET test's paused brackets within rounding of their pauses."""
     line = p.group(0)
     assert p["what"] == what, f"{what} test printed another clock's line: {line}"
-    allowed, taken = int(p["allowed"]), int(p["try"])
-    assert (allowed, int(p["tries"])) == (PLACEMENT_PAUSE_NS // 2, PLACEMENT_TRIES), line
+    allowed, taken, off = int(p["allowed"]), int(p["try"]), int(p["off"])
+    assert (allowed, int(p["tries"])) == (PLACEMENT_PAUSE_NS // 2, PLACEMENT_TRIES), (
+        f"not the kernel's pause and try count: {line}"
+    )
     tries = [tuple(map(int, t)) for t in PLACEMENT_TRY.findall(p["list"])]
-    listed = ", ".join(f"({a}, {b}, {c}, {d})" for a, b, c, d in tries)
+    listed = ", ".join(map(str, tries))
     assert listed == p["list"] and len(tries) == taken and 1 <= taken <= PLACEMENT_TRIES, (
         f"not one listed try per try taken: {line}"
     )
@@ -99,10 +106,12 @@ def _check_placement(p: re.Match[str], what: str) -> None:
     assert not any(placement_is_judged(r, q, PLACEMENT_PAUSE_NS) for r, q, _, _ in before), (
         f"took a try again that could be judged: {line}"
     )
-    assert int(p["off"]) == abs(by_brackets - by_read), (
-        f"off isn't its try's two times apart: {line}"
-    )
-    assert int(p["off"]) <= allowed, f"placed too far off: {line}"
+    assert off == abs(by_brackets - by_read), f"off isn't its try's two times apart: {line}"
+    assert off <= allowed, f"placed too far off: {line}"
+    if what == "HPET":
+        assert all(q + PAUSE_SLACK_NS >= 2 * PLACEMENT_PAUSE_NS for _, q, _, _ in tries), (
+            f"a paused bracket short of its pauses: {line}"
+        )
 
 
 def case_diagnostics(report: tap.TapReport, name: str) -> list[str]:

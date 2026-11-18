@@ -27,21 +27,31 @@ BOOT_TSC = (
 TSC_WINDOW = "24576000/1000000/2000/1000/1000"
 WINDOW = "10000000/625000/1/0/0"
 PLACEMENT = (
-    "# injected pause: {what} placement {off} ns off (at most 10000000 ns allowed) on try {taken} "
-    "of 8, 20 ms apart; tries (reference, paused, by the brackets, by the read, in ns) [{tries}]\n"
+    "# injected pause: {what} placement {off} ns off (at most {allowed} ns allowed) on try {taken} "
+    "of {of}, 20 ms apart; tries (reference, paused, by the brackets, by the read, in ns) [{tries}]\n"
 )
-# A try a 20 ms stall keeps from being judged, and one judged.
+# A try a 20 ms stall keeps from being judged.
 STALLED_TRY = (30000, 60000000, 20000000, 20000000)
 
 
 def placement(
-    what="HPET", before=(), last=(30000, 40048000, 20000000, 20005000), off=None, taken=None
+    what="HPET",
+    before=(),
+    last=(30000, 40048000, 20000000, 20005000),
+    off=None,
+    taken=None,
+    allowed=10000000,
+    of=8,
+    listed=None,
 ):
-    """A placement test's judged line: the tries `before` it, then `last`."""
+    """A placement test's judged line: the tries `before` it, then `last`
+    (`listed` in place of the list as the kernel prints it)."""
     tries = [*before, last]
     off = abs(last[2] - last[3]) if off is None else off
-    listed = ", ".join(f"({a}, {b}, {c}, {d})" for a, b, c, d in tries)
-    return PLACEMENT.format(what=what, off=off, taken=taken or len(tries), tries=listed)
+    listed = ", ".join(map(str, tries)) if listed is None else listed
+    return PLACEMENT.format(
+        what=what, off=off, taken=taken or len(tries), tries=listed, allowed=allowed, of=of
+    )
 
 
 def run(
@@ -247,6 +257,7 @@ def test_any_number_of_timer_boot_retakes_passes():
 
 def test_a_placement_too_far_off_fails():
     check_clock_diags(*run(hpet_placement=placement(last=(30000, 40048000, 20000000, 30000000))))
+    check_clock_diags(*run(hpet_placement=placement(last=(30000, 40048000, 30000000, 20000000))))
     with pytest.raises(AssertionError, match="placed too far off"):
         check_clock_diags(
             *run(hpet_placement=placement(last=(30000, 40048000, 20000000, 30000001)))
@@ -259,25 +270,79 @@ def test_a_placement_on_its_last_try_passes():
     check_clock_diags(*run(timer_placement=placement("timer", before=[STALLED_TRY] * 7)))
 
 
-def test_a_placement_line_must_follow_from_its_tries():
-    bad = {
-        "another clock's line": {"timer_placement": placement("HPET")},
-        "not one listed try per try taken": {"hpet_placement": placement(taken=2)},
-        "judged a try it can't": {"hpet_placement": placement(last=STALLED_TRY)},
-        "took a try again that could be judged": {
-            "hpet_placement": placement(before=[(30000, 40048000, 20000000, 20000000)])
-        },
-        "off isn't its try's two times apart": {"hpet_placement": placement(off=4999)},
-    }
-    for match, kwargs in bad.items():
-        with pytest.raises(AssertionError, match=match):
-            check_clock_diags(*run(**kwargs))
+@pytest.mark.parametrize(
+    ("match", "kwargs"),
+    [
+        ("another clock's line", {"timer_placement": placement("HPET")}),
+        ("not one listed try per try taken", {"hpet_placement": placement(taken=2)}),
+        ("judged a try it can't", {"hpet_placement": placement(last=STALLED_TRY)}),
+        (
+            "took a try again that could be judged",
+            {"hpet_placement": placement(before=[(30000, 40048000, 20000000, 20000000)])},
+        ),
+        ("off isn't its try's two times apart", {"hpet_placement": placement(off=4999)}),
+        (
+            "off isn't its try's two times apart",
+            {"hpet_placement": placement(last=(30000, 40048000, 20005000, 20000000), off=0)},
+        ),
+        (
+            "took a try again that could be judged",
+            {
+                "hpet_placement": placement(
+                    before=[STALLED_TRY, (30000, 40048000, 20000000, 20000000)]
+                )
+            },
+        ),
+        (
+            "took a try again that could be judged",
+            {
+                "hpet_placement": placement(
+                    before=[(30000, 40048000, 20000000, 20000000), STALLED_TRY]
+                )
+            },
+        ),
+        (
+            "not one listed try per try taken",
+            {"hpet_placement": placement(listed="(1, 2, 3, 4), x")},
+        ),
+        ("pause and try count", {"hpet_placement": placement(allowed=9000000)}),
+        ("pause and try count", {"hpet_placement": placement(of=7)}),
+        (
+            "a paused bracket short of its pauses",
+            {"hpet_placement": placement(last=(30000, 39989999, 20000000, 20000000))},
+        ),
+    ],
+)
+def test_a_placement_line_must_follow_from_its_tries(match, kwargs):
+    with pytest.raises(AssertionError, match=match):
+        check_clock_diags(*run(**kwargs))
 
 
-def test_the_harness_judges_tries_as_lumen_time_does():
+def test_a_paused_bracket_at_its_floor_passes():
+    # Rounding's allowance, for the HPET test; the timer test's floor isn't
+    # checked here (it also allows the boot TSC calibration's bound).
+    check_clock_diags(*run(hpet_placement=placement(last=(30000, 39990000, 20000000, 20000000))))
+    check_clock_diags(
+        *run(timer_placement=placement("timer", last=(30000, 39600000, 20000000, 20000000)))
+    )
+
+
+@pytest.mark.parametrize(
+    ("reference", "paused", "judged"),
+    [
+        (100, 800, True),
+        (101, 800, False),
+        (0, 1000, True),
+        (0, 1001, False),
+        (100, 900, True),
+        (100, 901, False),
+        (0, 700, True),
+        (0, 2**64 - 1, False),
+        (2**64 - 1, 800, False),
+    ],
+)
+def test_the_harness_judges_tries_as_lumen_time_does(reference, paused, judged):
     # crates/lumen-time's a_placement_try_is_judged_within_a_quarter_of_the_pause,
-    # case for case.
-    assert placement_is_judged(100, 800, 400)
-    assert not placement_is_judged(101, 800, 400)
-    assert placement_is_judged(0, 1000, 400)
-    assert not placement_is_judged(0, 1001, 400)
+    # case for case (pause 400; Python's ints don't overflow, so its
+    # saturating cases need no care).
+    assert placement_is_judged(reference, paused, 400) == judged
