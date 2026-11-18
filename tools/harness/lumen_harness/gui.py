@@ -16,7 +16,9 @@ serial shell, before the next step goes:
   step's effect: the position, or the button held or not. That is the
   state a reader of the tablet sees, not yet anything drawn. A held or
   failed tablet fails the step at once.
-- **Keys** (the PS/2 keyboard): `confirmed_keys` and `type_confirmed`. On
+- **Keys** (the PS/2 keyboard): `confirmed_keys` and `type_confirmed`, the
+  way scenarios type (a raw press says why not: tests/harness/
+  test_scenario_typing.py). On
   IRQ 1 the kernel counts the keys pressed among the bytes it reads
   (`kbd`'s `presses`, `lumen_input::Presses`), the keys held now (`held`:
   pressed, not yet released), before any shell decodes them, and the

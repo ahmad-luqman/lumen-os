@@ -14,6 +14,7 @@ from lumen_harness.qmp import (
     button_args,
     pointer_move_args,
     qcodes_for,
+    refuse_key_events,
     send_key_args,
 )
 
@@ -53,6 +54,16 @@ def test_send_key_presses_together_and_holds():
     }
     with pytest.raises(ValueError):
         send_key_args([], 20)
+
+
+def test_input_events_refuse_keys():
+    move = pointer_move_args(10, 20, (100, 100))
+    assert refuse_key_events(move) == move
+    key = {
+        "events": [{"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "a"}}}]
+    }
+    with pytest.raises(ValueError, match="send_key"):
+        refuse_key_events(key)
 
 
 def kernel_scale(value: int, pixels: int) -> int:
