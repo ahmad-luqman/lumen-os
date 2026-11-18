@@ -13,15 +13,12 @@ import re
 from lumen_harness import tap
 
 # `now_ns_follows_the_hpet` takes an HPET reading again when its bracket is
-# over 100 µs, up to 8 times per end, 20 ms apart. Before the spacing it
-# needed none in 90 KVM runs (45 on a loaded 4-vCPU runner), and in 79 TCG
-# runs on a busy Mac (43 loaded, loadavg up to 51) 4 runs needed 1. But a
-# loaded KVM runner can slow HPET reads for 60 ms or more (PR #121's load-5),
-# which now costs up to 3 or 4 spaced retries on one end. So a run may take
-# 4: one such burst. More means stalls hit readings far more often than ever
-# measured: a host or `now_ns` getting worse, which a pass would hide.
-MOST_HPET_RETRIES = 4
-HPET_BRACKET_NS = 100_000
+# over 1 ms (kernel/src/time.rs's HPET_BRACKET_NS), up to 8 times per end,
+# 20 ms apart. How many it took isn't bounded: that counts how often a
+# loaded host stalled a bracket, not the code (the ktest fails when every
+# reading at one end was wide). What is checked is that the count matches
+# the readings and the kept ones are within the limit.
+HPET_BRACKET_NS = 1_000_000
 RETRY_SPACING_MS = 20
 
 HPET_BRACKETS = re.compile(
@@ -175,7 +172,6 @@ def check_clock_diags(report: tap.TapReport, text: str) -> None:
     m = one_diagnostic(report, "time::now_ns_follows_the_hpet", HPET_BRACKETS)
     start, end, retries = _widths(m["start"]), _widths(m["end"]), int(m["retries"])
     assert start and end, f"an end has no readings: {m.group(0)}"
-    assert retries <= MOST_HPET_RETRIES, f"over {MOST_HPET_RETRIES} retries: {m.group(0)}"
     assert start[-1] <= HPET_BRACKET_NS and end[-1] <= HPET_BRACKET_NS, m.group(0)
     # The timer test's brackets each hold an HPET read, so they have widths.
     t = one_diagnostic(report, "time::the_timer_is_programmed_for_1_khz", TIMER_BRACKETS)

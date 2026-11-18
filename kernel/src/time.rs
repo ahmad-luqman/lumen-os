@@ -1068,22 +1068,29 @@ fn off_or_diag<T>(what: &'static str, take: impl FnOnce() -> Result<T, CalError>
     })
 }
 
-/// The spin `now_ns_follows_the_hpet` checks `now_ns` across: 50 ms.
+/// The spin `now_ns_follows_the_hpet` checks `now_ns` across: 500 ms, so
+/// its budget leaves room for brackets as wide as a loaded host makes them
+/// ([`HPET_BRACKET_NS`]).
 #[cfg(feature = "ktest")]
-const NOW_NS_SPIN_NS: u64 = 50_000_000;
-/// That check's budget, 2% of its spin: 1 ms. Used only to bound
+const NOW_NS_SPIN_NS: u64 = 500_000_000;
+/// That check's budget, 2% of its spin: 10 ms. Used only to bound
 /// [`HPET_BRACKET_NS`] at compile time; at run time the check takes 2% of
 /// what the HPET measured.
 #[cfg(feature = "ktest")]
 const NOW_NS_BUDGET_NS: u64 = NOW_NS_SPIN_NS / 50;
 /// The widest bracket (in ns, between its two `now_ns` reads)
-/// [`now_ns_against_the_hpet`] trusts around an HPET reading: 100 µs, a
-/// tenth of the 1 ms budget (both ends that wide put the interval off by at
-/// most 100 µs). Under KVM a bracket is about one exit to QEMU: 8 to 64 µs
-/// in PR #121's KVM runs, loaded or not. A wider one means something took
-/// longer than this between the two reads.
+/// [`now_ns_against_the_hpet`] trusts around an HPET reading: 1 ms, a tenth
+/// of the 10 ms budget (both ends that wide put the interval off by at most
+/// 1 ms). Under KVM a bracket is about one exit to QEMU, 15 µs idle; a
+/// loaded host makes them wider: in #158's runs (44357565152 and
+/// 44360252519), at load up to 6.7, 1.2% of 1,361 brackets were over 100 µs
+/// and 0.07% over 1 ms; at load up to 9, 26% of 106 were over 100 µs, 2.8%
+/// over 500 µs and none over 1 ms. The old 100 µs limit (with a 50 ms spin)
+/// failed `now_ns_follows_the_hpet` when all 9 readings at one end were
+/// wider, twice in CI in a week and once in 40 loaded KVM boots. A wider
+/// one means something took longer than this between the two reads.
 #[cfg(feature = "ktest")]
-const HPET_BRACKET_NS: u64 = 100_000;
+const HPET_BRACKET_NS: u64 = 1_000_000;
 /// How many HPET readings [`now_ns_against_the_hpet`] takes at each end
 /// before giving up on a narrow one: 9, so at most 8 retries, spaced
 /// [`RETRY_SPACING_NS`] apart.
@@ -1099,9 +1106,8 @@ const HPET_BRACKET_TRIES: usize = 9;
 #[cfg(feature = "ktest")]
 const RETRY_SPACING_NS: u64 = 20_000_000;
 // Pinned: 9 tries 20 ms apart span at least 150 ms, more than load-5's burst;
-// `lumen_harness.clock_diags`'s `MOST_HPET_RETRIES = 4` assumes this spacing
-// (one burst of up to about 80 ms costs 4 retries on one end); and a limit
-// over a tenth of the budget would let two wide ends use up a fifth of it.
+// and a limit over a tenth of the budget would let two wide ends use up a
+// fifth of it.
 #[cfg(feature = "ktest")]
 const _: () = assert!(
     HPET_BRACKET_TRIES == 9
@@ -1230,8 +1236,8 @@ fn now_ns_between(earlier: &HpetReading, later: &HpetReading, tag: &str) -> Resu
     })
 }
 
-/// `now_ns_follows_the_hpet` across a spin of `ns` (50 ms in the real
-/// check, whose 2% is the 1 ms budget the bracket limit is a tenth of; the
+/// `now_ns_follows_the_hpet` across a spin of `ns` (500 ms in the real
+/// check, whose 2% is the 10 ms budget the bracket limit is a tenth of; the
 /// injected-pause tests spin less): each end a narrow HPET reading placed at
 /// the midpoint of the `now_ns` readings around it, so a stall between the
 /// two clocks' reads shows as a wide bracket (taken again, see
@@ -2313,8 +2319,8 @@ crate::ktest!(
 
 crate::ktest!(
     fn now_ns_follows_the_hpet() {
-        // `now_ns` is the TSC converted; across a 50 ms spin it moves as
-        // far as the HPET says, within 2% (a 1 ms budget). Each HPET reading
+        // `now_ns` is the TSC converted; across a 500 ms spin it moves as
+        // far as the HPET says, within 2% (a 10 ms budget). Each HPET reading
         // is bracketed by `now_ns` readings (see `now_ns_against_the_hpet`).
         // Read one after the other, the two clocks came out 1.63 ms apart
         // once under KVM (#117); a stall of about that much between two of
@@ -2622,14 +2628,14 @@ crate::ktest!(
 
 crate::ktest!(
     fn one_stalled_reading_at_each_end_still_passes() {
-        // The full 50 ms check with the first reading at each end paused
-        // 5 ms: at the start after its HPET read, at the end before it.
-        // Kept, the start's HPET value would be 2.5 ms before its midpoint
-        // and the end's 2.5 ms after, so the clocks would come out 5 ms
-        // apart, over the 1 ms budget. Each is read again, and the check
+        // The full 500 ms check with the first reading at each end paused
+        // 25 ms: at the start after its HPET read, at the end before it.
+        // Kept, the start's HPET value would be 12.5 ms before its midpoint
+        // and the end's 12.5 ms after, so the clocks would come out 25 ms
+        // apart, over the 10 ms budget. Each is read again, and the check
         // passes on the narrow readings.
         use crate::kassert;
-        const PAUSE_NS: u64 = 5_000_000;
+        const PAUSE_NS: u64 = 25_000_000;
         let hpet = hpet().ok_or("no HPET")?;
         let mut paused = [false; 2];
         let [start, end] = now_ns_against_the_hpet(&hpet, NOW_NS_SPIN_NS, INJECTED, |p| {

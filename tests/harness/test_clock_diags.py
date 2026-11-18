@@ -58,7 +58,7 @@ def run(
     start="25000",
     end="1000",
     retries=0,
-    limit=100000,
+    limit=1000000,
     now_ns_case="now_ns_follows_the_hpet",
     extra_line=False,
     timer_max=39000,
@@ -89,21 +89,21 @@ def run(
         ),
         (
             "a_stalled_hpet_bracket_is_read_again",
-            "# injected pause: bracket widths [246000, 101000, 1000] ns\n",
+            "# injected pause: bracket widths [2460000, 1001000, 1000] ns\n",
         ),
         (
             "one_stalled_reading_at_each_end_still_passes",
             (
-                "# injected pause: bracket widths: start [5051000, 1000] ns, end [5028000, 1000] "
-                f"ns ({injected_retries} taken again, 20 ms apart; at most 100000 ns trusted)\n"
+                "# injected pause: bracket widths: start [25051000, 1000] ns, end [25028000, 1000] "
+                f"ns ({injected_retries} taken again, 20 ms apart; at most 1000000 ns trusted)\n"
             ),
         ),
         (
             "every_stalled_hpet_bracket_is_a_failure",
             (
-                "# injected pause: bracket widths: start [201000, 201000, 201000, 201000, 201000, "
-                "201000, 201000, 201000, 201000] ns, end [] ns (8 taken again, 20 ms apart; at most "
-                "100000 ns trusted)\n"
+                "# injected pause: bracket widths: start [2001000, 2001000, 2001000, 2001000, 2001000, "
+                "2001000, 2001000, 2001000, 2001000] ns, end [] ns (8 taken again, 20 ms apart; at most "
+                "1000000 ns trusted)\n"
             ),
         ),
         (
@@ -150,24 +150,22 @@ def test_a_good_run_passes():
     check_clock_diags(*run())
 
 
-def test_four_retries_pass():
-    # One burst of slow reads on one end, sampled around 20 ms apart.
-    start = "150000, 140000, 130000, 120000, 25000"
-    check_clock_diags(*run(start=start, end="1000", retries=4))
+def test_any_number_of_retries_passes():
+    # Retries count a loaded host's stalls: not bounded (#158's audit).
+    start = "1500000, 1400000, 1300000, 1200000, 25000"
+    check_clock_diags(*run(start=start, end="1100000, 1050000, 1020000, 1000", retries=7))
 
 
-def test_five_retries_fail():
-    with pytest.raises(AssertionError, match="over 4 retries"):
-        check_clock_diags(
-            *run(start="150000, 140000, 130000, 25000", end="120000, 110000, 1000", retries=5)
-        )
+def test_a_kept_reading_over_the_limit_fails():
+    with pytest.raises(AssertionError):
+        check_clock_diags(*run(start="1000001", end="1000", retries=0))
 
 
 def test_a_retry_count_that_doesnt_match_the_readings_fails():
     # The diag counting only the start's retries, in the real check or in an
     # injected one that retakes both ends.
     with pytest.raises(AssertionError, match="retries don't match"):
-        check_clock_diags(*run(start="25000", end="120000, 1000", retries=0))
+        check_clock_diags(*run(start="25000", end="1200000, 1000", retries=0))
     with pytest.raises(AssertionError, match="retries don't match"):
         check_clock_diags(*run(injected_retries=1))
 
