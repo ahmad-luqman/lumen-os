@@ -4,8 +4,8 @@
 //! Each one places a [`KTest`] descriptor in the `.ktests` linker section, so
 //! adding a test never means editing a shared list (important when several
 //! agents add tests in parallel). With `--features ktest` the kernel runs
-//! every test after boot, prints TAP version 14 over serial, and exits QEMU
-//! with `Success` or `Failure`.
+//! every test after boot (or those `lumen.ktest=` selects), prints TAP
+//! version 14 over serial, and exits QEMU with `Success` or `Failure`.
 //!
 //! A test returns `Ok(())` or `Err(reason)`. A panic or CPU exception inside a
 //! test is caught by the crash reporter, which exits with `Crash`; the harness
@@ -107,34 +107,31 @@ fn registered() -> &'static [KTest] {
 }
 
 /// Is the test `name` run, with `lumen.ktest=` set to `only` (a
-/// comma-separated list of name prefixes, e.g.
-/// `lumen_kernel::time::,lumen_kernel::sched::`; without it, every test)?
+/// comma-separated list of name prefixes, each ending in `::` to mean a
+/// module, e.g. `lumen_kernel::time::,lumen_kernel::sched::`; without it,
+/// every test)? An empty item (a stray comma) matches no test, so a bare
+/// `lumen.ktest=` selects none.
 #[cfg(feature = "ktest")]
 fn selected(name: &str, only: Option<&str>) -> bool {
     only.is_none_or(|prefixes| prefixes.split(',').any(|p| !p.is_empty() && name.starts_with(p)))
 }
 
-/// Run every registered test (or those `lumen.ktest=` selects: a scenario
-/// that checks only some of them, so the rest don't run under conditions
-/// they don't claim to hold up in); returns true if all passed, and false
-/// if a filter selects none.
+/// Run every registered test, or only those `lumen.ktest=` selects (for a
+/// scenario that checks only some, so the rest don't run under conditions
+/// they don't claim to hold up in). Returns true if all passed; false if
+/// any failed or none was selected.
 #[cfg(feature = "ktest")]
 pub fn run_all() -> bool {
     let only = crate::cmdline::value("lumen.ktest");
-    let tests: alloc::vec::Vec<&KTest> = registered().iter().filter(|t| selected(t.name, only)).collect();
+    let all = registered();
+    let tests = || all.iter().filter(move |t| selected(t.name, only));
+    let count = tests().count();
     // Each line whole, under the log's line lock.
     let mut out = LockedSerial;
     let _ = writeln!(out, "TAP version 14");
-    if let Some(prefixes) = only {
-        let _ = writeln!(out, "# ktest: only {prefixes}: {} of {}", tests.len(), registered().len());
-    }
-    let _ = writeln!(out, "1..{}", tests.len());
-    if tests.is_empty() {
-        let _ = writeln!(out, "# ktest: no test selected");
-        return false;
-    }
+    let _ = writeln!(out, "1..{count}");
     let mut failed = 0;
-    for (i, t) in tests.iter().enumerate() {
+    for (i, t) in tests().enumerate() {
         match (t.func)() {
             Ok(()) => {
                 let _ = writeln!(out, "ok {} - {}", i + 1, t.name);
@@ -148,8 +145,13 @@ pub fn run_all() -> bool {
             }
         }
     }
-    let _ = writeln!(out, "# ktest: {} passed, {} failed", tests.len() - failed, failed);
-    failed == 0
+    let _ = writeln!(out, "# ktest: {} passed, {} failed", count - failed, failed);
+    // After the results, so the TAP parser takes it for no test's
+    // diagnostic. A filter that selects nothing checks nothing: a failure.
+    if let Some(prefixes) = only {
+        let _ = writeln!(out, "# ktest: only {prefixes}: {count} of {}", all.len());
+    }
+    count > 0 && failed == 0
 }
 
 crate::ktest!(
@@ -166,9 +168,13 @@ crate::ktest!(
         crate::kassert!(selected(name, Some("lumen_kernel::time::")));
         crate::kassert!(selected(name, Some("lumen_kernel::sched::,lumen_kernel::time::")));
         crate::kassert!(!selected(name, Some("lumen_kernel::sched::")));
-        // An empty prefix (a stray comma) selects nothing.
+        // A prefix, not a part of the name.
+        crate::kassert!(!selected(name, Some("time::")));
+        crate::kassert!(!selected(name, Some("sleep")));
+        // An empty item (a stray comma) matches no test, not every test.
         crate::kassert!(!selected(name, Some("")));
         crate::kassert!(!selected(name, Some(",lumen_kernel::sched::,")));
+        crate::kassert!(selected(name, Some("lumen_kernel::time::,")));
         Ok(())
     }
 );

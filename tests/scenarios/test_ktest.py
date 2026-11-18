@@ -5,7 +5,7 @@ import re
 import pytest
 from lumen_harness import save_ktest_tap, tap
 from lumen_harness.clock_diags import check_clock_diags
-from lumen_harness.qemu import EXIT_CRASH, EXIT_SUCCESS, Devices
+from lumen_harness.qemu import EXIT_CRASH, EXIT_FAILURE, EXIT_SUCCESS, Devices
 
 
 def boot_ktests(boot, cmdline=None):
@@ -170,11 +170,12 @@ def test_in_kernel_tests_pass(boot):
     check_clock_diags(report, out)
 
 
-# The ktests that measure against the boot's calibration (its TSC rate, the
-# timer's, the tick): time's and the scheduler's. The stalled runs run only
-# these (`lumen.ktest=`): the claim is about them, and the other ~230 would
-# only meet a busy host three times per CI run instead of once (#183, #184
-# were found that way).
+# The ktests whose claims are tight to the boot's calibration (its TSC rate,
+# the timer's, the tick): time's and the scheduler's (others use it, if at
+# all, against loose bounds or the same clock on both sides). The stalled
+# runs run only these (`lumen.ktest=`): the claim is about them, and the
+# rest would only meet a busy host three times per CI run instead of once
+# (#183 was found that way).
 CALIBRATION_KTESTS = ("lumen_kernel::time::", "lumen_kernel::sched::")
 
 
@@ -196,10 +197,14 @@ def test_in_kernel_tests_pass_with_calibrations_stalled_within_tolerance(boot, k
     out, report = finished(
         boot_ktests(boot, cmdline=f"lumen.stall_{key}_windows={ppm} lumen.ktest={only}")
     )
-    # Only those ran, and all of them did.
+    # Only those ran, some of each, as many as the kernel says it selected,
+    # and fewer than all.
     said = re.search(rf"^# ktest: only {re.escape(only)}: (\d+) of (\d+)$", out, re.MULTILINE)
-    assert said and int(said[1]) == len(report.cases) < int(said[2]), (said, report.summary())
+    assert said, "no filter comment"
+    assert int(said[1]) == report.planned < int(said[2]), (said[0], report.summary())
     assert all(c.name.startswith(CALIBRATION_KTESTS) for c in report.cases), report.summary()
+    ran = {p for p in CALIBRATION_KTESTS for c in report.cases if c.name.startswith(p)}
+    assert ran == set(CALIBRATION_KTESTS), (ran, report.summary())
     assert (
         f"INFO  time: stalling calibration windows by {ppm},0 ppm (lumen.stall_{key}_windows)\n"
         in out
@@ -211,3 +216,16 @@ def test_in_kernel_tests_pass_with_calibrations_stalled_within_tolerance(boot, k
     boot_lines = out[: out.index("TAP version")]
     assert "WARN  time" not in boot_lines, boot_lines
     check_clock_diags(report, out)
+
+
+def test_a_ktest_filter_that_selects_nothing_fails(boot):
+    # `lumen.ktest=` matching no test checks nothing: the run fails (a `1..0`
+    # plan alone is TAP's "skip all", which would read as a pass).
+    m = boot_ktests(boot, cmdline="lumen.ktest=lumen_kernel::no_such_module::")
+    code = m.wait_exit(120)
+    report = tap.parse(m.output)
+    assert report.planned == 0 and not report.cases, report.summary()
+    assert re.search(
+        r"^# ktest: only lumen_kernel::no_such_module::: 0 of \d+$", m.output, re.MULTILINE
+    )
+    assert code == EXIT_FAILURE, f"QEMU exit {code}, expected {EXIT_FAILURE}"

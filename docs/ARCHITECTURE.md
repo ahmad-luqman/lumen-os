@@ -457,9 +457,11 @@ for scenarios, said at INFO, section 6, "Time"), `lumen.desktop` (start the
 desktop before the serial prompt; section 11),
 `lumen.desktop_cut_delay_ms=<ms>` (a deliberate delay for scenarios between
 the compositor's reads of the input rings and of the cut, said at INFO,
-capped at 2000 ms; section 11) and `lumen.theme=<light|dark>` (the
+capped at 2000 ms; section 11), `lumen.theme=<light|dark>` (the
 desktop's theme, said at INFO; a name that isn't a theme is warned about
-and ignored; section 11).
+and ignored; section 11) and, in the test kernel,
+`lumen.ktest=<prefix>[,<prefix>...]` (run only the ktests whose names start
+with one of them, said in a TAP comment; none selected fails the run).
 
 ## 5. Memory layout
 
