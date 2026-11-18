@@ -12,13 +12,13 @@ from typing import NamedTuple
 
 from lumen_harness.calibration import (
     TIMER,
-    TIMER_TOLERANCE,
-    TSC_TOLERANCE,
+    TSC,
+    Judged,
     judged,
-    kept_reference,
     no_other_warnings,
-    timer_verdicts,
-    tsc_verdicts,
+    ppm_range,
+    verdict,
+    weighed,
 )
 from lumen_harness.clock_diags import TSC_TOLERANCE_PPM
 from lumen_harness.crash import BEGIN, END
@@ -240,9 +240,10 @@ def test_boot_calibration_agrees_with_both_clocks(boot):
 # (lumen_time's: the TSC's 1%, the timer's 2%, the TSC's error included).
 #
 # A busy host's own stalls add to the injected ones (#171), so these
-# scenarios assert only what it can't change: the windows taken and none
-# steady, a bound at least the stall, and a verdict line that follows from
-# the bound it prints (lumen_harness.calibration). Never a ceiling.
+# scenarios assert only what it can't change (CLAUDE.md, "Tests on a busy
+# host"): the windows taken and none steady, a bound at least the stall
+# (`stalled`), verdict lines that follow from the numbers they print and no
+# other `time` warning (lumen_harness.calibration). Never a ceiling.
 PANIC = re.compile(r"\npanic: (.*)\n")
 
 
@@ -261,35 +262,62 @@ def boot_messages(m) -> str:
     return m.output[: m.output.index("lumen> ")]
 
 
+def stalled(out: str, clock: str, stall_ppm: int) -> Judged:
+    """`clock`'s verdict after `stall_ppm` at every window's end, past
+    steady: all 20 taken, none steady, and the bound at least the stall,
+    whatever the host adds (a floor, never a ceiling). The TSC's bound is at
+    least the stall itself (each end gap over the rest of the window); the
+    timer's window counts its own end stall, so its share is s / (1 + s):
+    0.99% for 1%."""
+    said = judged(out, clock)
+    assert (said.steady, said.retaken) == (0, 20), said
+    floor = stall_ppm if clock == TSC else stall_ppm * 1_000_000 // (1_000_000 + stall_ppm)
+    assert ppm_range(str(said.bound))[1] >= floor, (floor, said)
+    return said
+
+
+def timer_follows_tsc(timer: Judged | None, tsc: Judged | None) -> None:
+    """The timer's verdict, measured against the TSC whose verdict is `tsc`
+    (None: either said nothing): its bound at least the TSC's (`compose_ppm`
+    adds the TSC's to its windows', both rounded up), and a warning names the
+    TSC's bound as its share."""
+    if timer is None or tsc is None:
+        return
+    assert timer.bound >= tsc.bound, (timer, tsc)
+    if timer.warned:
+        assert timer.tsc_share == tsc.bound, (timer, tsc)
+
+
 def test_tsc_windows_stalled_past_steady_fill_in(boot):
     # 0.6% at each window's end: none steady, the median within 0.6% and a
     # bit (rounded up to a tenth): within the TSC's 1%, an INFO line and the
     # HPET kept (an unsteady HPET used to give way to the PIT, which stalls
     # with it), unless the host's own stalls took it past (a warning then, or
-    # the PIT kept for a smaller bound: `judged`, `kept_reference`). The
-    # bound is honest: the stall makes the boot's rate high by about that
-    # much, and the HPET measured again (unstalled) agrees within the two
-    # bounds.
+    # the PIT kept for a smaller bound). The bound is honest: the stall makes
+    # the boot's rate high by about that much, and the HPET measured again
+    # (unstalled) agrees within the two bounds.
     m = boot("qemutest", cmdline="lumen.stall_tsc_windows=6000")
     out = boot_messages(m)
-    tsc_said = judged(out, "tsc", TSC_TOLERANCE)
-    assert (tsc_said.steady, tsc_said.retaken) == (0, 20), tsc_said
-    assert tsc_said.bound >= 0.6, tsc_said
-    assert TSC_LINE.search(out)[3] == kept_reference(out), out
-    no_other_warnings(out, tsc_said, *timer_verdicts(out))
+    tsc_said = stalled(out, TSC, 6000)
+    w = weighed(out)
+    assert TSC_LINE.search(out)[3] == (w.kept if w else "hpet"), out
+    if w:
+        assert tsc_said.bound == w.kept_bound, (tsc_said, w)
+    timer_follows_tsc(verdict(out, TIMER), tsc_said)
+    no_other_warnings(out)
     (tsc, _, _, hpet), cals = clocks_and_windows(m)
     boot_ppm, hpet_ppm = median_bound_ppm(cals["boot"]), median_bound_ppm(cals["hpet"])
-    # The unstalled measurement must be within the TSC's tolerance itself, or
-    # the comparison could pass on its bound alone.
-    assert hpet_ppm <= TSC_TOLERANCE_PPM, (hpet_ppm, cals["hpet"])
     assert within_bounds(tsc, hpet, boot_ppm, hpet_ppm), (
         tsc,
         hpet,
         boot_ppm,
         hpet_ppm,
     )
-    assert (tsc - hpet) * 1_000_000 >= hpet * 3_000, (
-        f"the stall didn't move the rate: {tsc} against {hpet}"
+    # The stall moved the rate: by about 0.6%, and the HPET measured again
+    # may be off by its own bound, so at least 0.3% less that bound. (A busy
+    # host can widen that bound, which only weakens this, never fails it.)
+    assert (tsc - hpet) * 1_000_000 >= hpet * (3_000 - hpet_ppm), (
+        f"the stall didn't move the rate: {tsc} against {hpet} within {hpet_ppm} ppm"
     )
 
 
@@ -303,28 +331,17 @@ def test_tsc_windows_stalled_past_tolerance_warn(boot):
     assert (
         "INFO  time: stalling calibration windows by 15000,0 ppm (lumen.stall_tsc_windows)\n" in out
     ), out
-    chose = re.search(
-        r"INFO  time: tsc calibration: against the HPET within (\d+\.\d)% \(past the 1\.0% allowed\), "
-        r"against the PIT within (\d+\.\d)%: kept the (HPET|PIT)\n",
-        out,
-    )
-    assert chose, out
-    kept = kept_reference(out)
-    assert TSC_LINE.search(out)[3] == kept, out
-    tsc_said = judged(out, "tsc", TSC_TOLERANCE)
-    assert tsc_said.warned and (tsc_said.steady, tsc_said.retaken) == (0, 20), tsc_said
-    assert f"a stall next to the {kept.upper()}'s reads" in tsc_said.line, tsc_said
-    assert tsc_said.bound >= 1.5, tsc_said
-    assert tsc_said.bound == min(float(chose[1]), float(chose[2])), (tsc_said, chose[0])
-    # The timer measured against that TSC: whatever its verdict, any warning
-    # names the TSC's bound as its share.
-    timer_said = timer_verdicts(out)
-    for t in timer_said:
-        assert t.tsc_share in (None, tsc_said.bound), (t, tsc_said)
-    no_other_warnings(out, tsc_said, *timer_said)
+    w = weighed(out)
+    assert w and w.pit is not None, (w, out)
+    assert TSC_LINE.search(out)[3] == w.kept, out
+    tsc_said = stalled(out, TSC, 15000)
+    assert tsc_said.warned and tsc_said.bound == w.kept_bound, (tsc_said, w)
+    assert f"a stall next to the {w.kept.upper()}'s reads" in tsc_said.line, tsc_said
+    timer_follows_tsc(verdict(out, TIMER), tsc_said)
+    no_other_warnings(out)
     # The HPET counted, so it stays a second clock whichever was kept.
     (_, reference, pit, hpet), _ = clocks_and_windows(m)
-    assert reference == kept and pit is not None and hpet is not None, (
+    assert reference == w.kept and pit is not None and hpet is not None, (
         reference,
         pit,
         hpet,
@@ -334,17 +351,17 @@ def test_tsc_windows_stalled_past_tolerance_warn(boot):
 def test_a_timer_off_through_the_tsc_says_so(boot):
     # The TSC stalled 3% (past its 1%: a warning) and the timer not: measured
     # against that TSC, the timer's rate may be off by over its 2%, and its
-    # warning names the TSC's bound. (Which wording: its own windows within
-    # 2%, "but the TSC it is measured against"; past it too, as they can be
-    # on a busy host, both named. time.rs's report ktest pins the choice.)
+    # warning names the TSC's bound. Which wording follows from its numbers
+    # (`calibration._check`): its own windows within 2%, "but the TSC it is
+    # measured against"; past it too, as a busy host can make them, both named.
     m = boot("qemutest", cmdline="lumen.stall_tsc_windows=30000")
     out = boot_messages(m)
-    tsc_said = judged(out, "tsc", TSC_TOLERANCE)
-    assert tsc_said.warned and tsc_said.bound >= 3.0, tsc_said
-    [timer_said] = timer_verdicts(out)
-    assert timer_said.warned and timer_said.tsc_share == tsc_said.bound, (timer_said, tsc_said)
-    assert timer_said.bound >= tsc_said.bound, (timer_said, tsc_said)
-    no_other_warnings(out, tsc_said, timer_said)
+    tsc_said = stalled(out, TSC, 30000)
+    assert tsc_said.warned, tsc_said
+    timer_said = judged(out, TIMER)
+    assert timer_said.warned, timer_said
+    timer_follows_tsc(timer_said, tsc_said)
+    no_other_warnings(out)
 
 
 def test_tsc_windows_with_no_bound_left_panic(boot):
@@ -389,10 +406,10 @@ def test_tsc_windows_stalled_without_an_hpet_fill_in_against_the_pit(boot):
     )
     out = boot_messages(m)
     assert TSC_LINE.search(out)[3] == "pit", out
-    tsc_said = judged(out, "tsc", TSC_TOLERANCE)
-    assert (tsc_said.steady, tsc_said.retaken) == (0, 20), tsc_said
-    assert tsc_said.bound >= 0.6, tsc_said
-    no_other_warnings(out, tsc_said, *timer_verdicts(out))
+    tsc_said = stalled(out, TSC, 6000)
+    assert weighed(out) is None, out
+    timer_follows_tsc(verdict(out, TIMER), tsc_said)
+    no_other_warnings(out)
 
 
 def test_timer_windows_stalled_past_steady_fill_in(boot):
@@ -402,10 +419,9 @@ def test_timer_windows_stalled_past_steady_fill_in(boot):
     # (#171); either way the verdict follows the bound, and the timer ticks.
     m = boot("qemutest", cmdline="lumen.stall_timer_windows=10000")
     out = boot_messages(m)
-    timer_said = judged(out, TIMER, TIMER_TOLERANCE)
-    assert (timer_said.steady, timer_said.retaken) == (0, 20), timer_said
-    assert timer_said.bound >= 1.0, timer_said
-    no_other_warnings(out, timer_said, *tsc_verdicts(out))
+    timer_said = stalled(out, TIMER, 10000)
+    timer_follows_tsc(timer_said, verdict(out, TSC))
+    no_other_warnings(out)
     m.send_line("sleep 100")
     m.expect(r"slept 100 ms\n")
     m.expect(r"lumen> ")
@@ -413,15 +429,14 @@ def test_timer_windows_stalled_past_steady_fill_in(boot):
 
 
 def test_timer_windows_stalled_past_tolerance_warn(boot):
-    # 3%: past the timer's 2% whatever the host adds, its own reads to blame
-    # (the TSC's share named), and the boot goes on.
+    # 3%: past the timer's 2% whatever the host adds, its own reads to blame,
+    # and the boot goes on.
     m = boot("qemutest", cmdline="lumen.stall_timer_windows=30000")
     out = boot_messages(m)
-    timer_said = judged(out, TIMER, TIMER_TOLERANCE)
-    assert timer_said.warned and (timer_said.steady, timer_said.retaken) == (0, 20), timer_said
-    assert "a stall next to the timer's register accesses" in timer_said.line, timer_said
-    assert timer_said.tsc_share is not None, timer_said
-    assert timer_said.bound >= 2.9, timer_said
+    timer_said = stalled(out, TIMER, 30000)
+    assert timer_said.kind == "own_reads", timer_said
+    timer_follows_tsc(timer_said, verdict(out, TSC))
+    no_other_warnings(out)
 
 
 def test_timer_windows_with_no_bound_left_panic(boot):

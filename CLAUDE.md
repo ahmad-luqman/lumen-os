@@ -129,17 +129,21 @@ own PR that updates that doc first.
   reason is `guest-shutdown` (a triple fault's is `guest-reset`).
 - **Tests on a busy host.** A guest's clocks run on while the host stalls
   its vCPU, so a loaded laptop or CI runner adds time to anything timed
-  (#139, #158, #165, #170, #171 all came from this). A scenario or ktest
-  asserts only what the host can't change:
-  - a floor (an injected stall is at least in the bound);
-  - a decision that follows from the numbers the kernel printed;
+  (measured in #139 and #171). A scenario or ktest asserts only what the
+  host can't change:
+  - a floor (the printed bound is at least the injected stall);
+  - a decision that follows from the numbers the kernel printed
+    (`lumen_harness.calibration`);
   - an effect confirmed before the next step (`gui.py`'s steps, `mouse hold`).
 
-  Never a ceiling or a % range on something timed, nor a "no WARN at boot"
+  Not a ceiling or a % range on something timed, nor a "no WARN at boot"
   that a slow boot trips. Exact numbers and texts for given inputs belong in
-  host tests or ktests over made-up windows. Reviewers: don't ask a scenario
-  for timing ranges. A mutant that only a slower result would show stays on
-  the not-tested list, or gets a deterministic seam.
+  host tests or ktests over made-up inputs. A claim that only means
+  something within a tolerance (test_ktest's stalled-within-tolerance runs)
+  keeps its precondition, and its PR says it is at risk on a busy host.
+  Reviewers: don't ask a scenario for timing ranges. A mutant that only a
+  slower result would show goes in the PR's not-tested notes, or gets a
+  deterministic seam.
 - **Golden images** live in `tests/golden/`. Re-record with `make golden` only
   when the change to the screen is intended, and open the PNG to check it.
 
@@ -432,6 +436,10 @@ own PR that updates that doc first.
   `desktop_status`, `wait_settled`, `desktop_check`, `settled_screendump`;
   the automation tree's `ui_tree`, `node`, `wait_ui`, `invoke`,
   `desktop_counter`; `parse_records` reads quoted cells with `shlex`),
+  `calibration.py` (a boot calibration's verdict line, and the TSC's
+  HPET-or-PIT choice, read back and checked against the numbers they print:
+  `judged`, `verdict`, `weighed`, `no_other_warnings`), `clock_diags.py` (the
+  clock cross-check ktests' diagnostics, `check_clock_diags`),
   `screenshot.py` (`screenshot`'s frame read back and checked;
   `Machine.screenshot_via_serial`),
   `shell.py` (`run`: a serial command's output, the log's lines taken out
