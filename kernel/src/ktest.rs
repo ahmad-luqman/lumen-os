@@ -106,14 +106,33 @@ fn registered() -> &'static [KTest] {
     unsafe { core::slice::from_raw_parts(start, count) }
 }
 
-/// Run every registered test; returns true if all passed.
+/// Is the test `name` run, with `lumen.ktest=` set to `only` (a
+/// comma-separated list of name prefixes, e.g.
+/// `lumen_kernel::time::,lumen_kernel::sched::`; without it, every test)?
+#[cfg(feature = "ktest")]
+fn selected(name: &str, only: Option<&str>) -> bool {
+    only.is_none_or(|prefixes| prefixes.split(',').any(|p| !p.is_empty() && name.starts_with(p)))
+}
+
+/// Run every registered test (or those `lumen.ktest=` selects: a scenario
+/// that checks only some of them, so the rest don't run under conditions
+/// they don't claim to hold up in); returns true if all passed, and false
+/// if a filter selects none.
 #[cfg(feature = "ktest")]
 pub fn run_all() -> bool {
-    let tests = registered();
+    let only = crate::cmdline::value("lumen.ktest");
+    let tests: alloc::vec::Vec<&KTest> = registered().iter().filter(|t| selected(t.name, only)).collect();
     // Each line whole, under the log's line lock.
     let mut out = LockedSerial;
     let _ = writeln!(out, "TAP version 14");
+    if let Some(prefixes) = only {
+        let _ = writeln!(out, "# ktest: only {prefixes}: {} of {}", tests.len(), registered().len());
+    }
     let _ = writeln!(out, "1..{}", tests.len());
+    if tests.is_empty() {
+        let _ = writeln!(out, "# ktest: no test selected");
+        return false;
+    }
     let mut failed = 0;
     for (i, t) in tests.iter().enumerate() {
         match (t.func)() {
@@ -136,6 +155,20 @@ pub fn run_all() -> bool {
 crate::ktest!(
     fn ktest_registry_is_populated() {
         crate::kassert!(registered().len() >= 2);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_filter_selects_tests_by_name_prefix() {
+        let name = "lumen_kernel::time::sleep_10ms_elapses";
+        crate::kassert!(selected(name, None));
+        crate::kassert!(selected(name, Some("lumen_kernel::time::")));
+        crate::kassert!(selected(name, Some("lumen_kernel::sched::,lumen_kernel::time::")));
+        crate::kassert!(!selected(name, Some("lumen_kernel::sched::")));
+        // An empty prefix (a stray comma) selects nothing.
+        crate::kassert!(!selected(name, Some("")));
+        crate::kassert!(!selected(name, Some(",lumen_kernel::sched::,")));
         Ok(())
     }
 );

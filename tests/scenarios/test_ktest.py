@@ -170,6 +170,14 @@ def test_in_kernel_tests_pass(boot):
     check_clock_diags(report, out)
 
 
+# The ktests that measure against the boot's calibration (its TSC rate, the
+# timer's, the tick): time's and the scheduler's. The stalled runs run only
+# these (`lumen.ktest=`): the claim is about them, and the other ~230 would
+# only meet a busy host three times per CI run instead of once (#183, #184
+# were found that way).
+CALIBRATION_KTESTS = ("lumen_kernel::time::", "lumen_kernel::sched::")
+
+
 @pytest.mark.parametrize(
     "key, ppm", [("tsc", 6000), ("timer", 12000)], ids=["tsc-0.6%", "timer-1.2%"]
 )
@@ -180,9 +188,18 @@ def test_in_kernel_tests_pass_with_calibrations_stalled_within_tolerance(boot, k
     # with the boot's calibration still passes, as do the clock diagnostics'
     # bounds. The TSC at 0.6% (under its 1%); the timer at 1.2%, which with
     # the TSC's bound is still under its 2% but leaves its rate about 1.2% off
-    # (a ktest budgeting the calibration 1% fails here).
+    # (a ktest budgeting the calibration 1% fails here). At risk on a busy
+    # host (CLAUDE.md, "Tests on a busy host"): its own stalls can take the
+    # boot past its tolerance, which this claim doesn't cover.
     name = {"tsc": "tsc", "timer": "local APIC timer"}[key]
-    out, report = finished(boot_ktests(boot, cmdline=f"lumen.stall_{key}_windows={ppm}"))
+    only = ",".join(CALIBRATION_KTESTS)
+    out, report = finished(
+        boot_ktests(boot, cmdline=f"lumen.stall_{key}_windows={ppm} lumen.ktest={only}")
+    )
+    # Only those ran, and all of them did.
+    said = re.search(rf"^# ktest: only {re.escape(only)}: (\d+) of (\d+)$", out, re.MULTILINE)
+    assert said and int(said[1]) == len(report.cases) < int(said[2]), (said, report.summary())
+    assert all(c.name.startswith(CALIBRATION_KTESTS) for c in report.cases), report.summary()
     assert (
         f"INFO  time: stalling calibration windows by {ppm},0 ppm (lumen.stall_{key}_windows)\n"
         in out
