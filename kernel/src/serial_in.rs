@@ -41,6 +41,9 @@
 //!   that didn't wake it; if only in the UART, still there a period
 //!   later). Three of the latter in a row, with no interrupt
 //!   bringing input between, warn once (`lumen_uart::MissedInterrupts`).
+//!   Input already there when the shell looks, before it blocks (or before
+//!   it waits at all: a line that arrives while it is still busy), is none
+//!   of these (`WaitEnd::Idle`), and neither is a wait that found nothing.
 //! - **How it waits** (`lumen_uart::wait_mode`): with the interrupt, block
 //!   with the deadline; without a UART, block for good; either only where
 //!   the thread can block (not before the boot CPU's scheduler runs);

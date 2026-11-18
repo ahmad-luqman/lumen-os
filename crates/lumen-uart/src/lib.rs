@@ -301,8 +301,9 @@ pub enum WaitEnd {
     /// reader: the interrupt may not be reaching the CPU, or not waking it.
     InputAtDeadline,
     /// Nothing came; or a byte was already waiting at the first look,
-    /// before any deadline (its interrupt still pending): neither says
-    /// anything about the interrupt.
+    /// before any deadline (its interrupt pending, or taken before the
+    /// reader could block: a line that arrives before the reader waits
+    /// again): neither says anything about the interrupt.
     Idle,
 }
 
@@ -335,7 +336,8 @@ pub fn classify(woken: bool, first_input_irq_ns: Option<u64>, deadline_ns: u64, 
 /// When input found at the deadline is worth a warning: after
 /// [`MissedInterrupts::THRESHOLD`] such waits in a row, with no interrupt
 /// bringing input between them (one alone may be a race with a late
-/// interrupt), once.
+/// interrupt), once. An [`WaitEnd::Idle`] wait neither counts nor breaks
+/// the row.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MissedInterrupts {
     /// Waits in a row that found input at the deadline.
