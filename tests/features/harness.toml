@@ -190,3 +190,10 @@ tests = [
     "scenario:test_shell::test_history_and_line_editing",
     "ktest:lumen_kernel::keyboard::a_key_counts_as_it_arrives_even_when_dropped",
 ]
+
+[[feature]]
+name = "The flake census: how often CI's first attempt went red, per day and in all, and which scenarios and ktests failed those runs, read from the runs' logs (`make census`; weekly into the `flake-census` workflow's summary, its run not itself tested)"
+milestone = "M4"
+tests = [
+    "harness:test_census::*",
+]

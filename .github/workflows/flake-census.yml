@@ -1,0 +1,29 @@
+name: flake-census
+
+# Weekly: how often CI's first attempt went red, and which tests failed it
+# (lumen_harness.census, into the job summary). Reads only.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "days back"
+        default: "7"
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.2
+      - name: Census
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PYTHONPATH=tools/harness uv run --frozen python -m lumen_harness census \
+            --days "${{ inputs.days || '7' }}" --repo "${{ github.repository }}" >> "$GITHUB_STEP_SUMMARY"

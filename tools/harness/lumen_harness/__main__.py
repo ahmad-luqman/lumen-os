@@ -1,4 +1,4 @@
-"""Command line: `python -m lumen_harness {run,debug,audit,status}`."""
+"""Command line: `python -m lumen_harness {run,debug,audit,status,census}`."""
 
 from __future__ import annotations
 
@@ -129,6 +129,23 @@ def cmd_audit(a: argparse.Namespace) -> int:
     return run_audit([Path(p) for p in a.kernels])
 
 
+def cmd_census(a: argparse.Namespace) -> int:
+    from .census import collect, summary
+
+    repo = (
+        a.repo
+        or subprocess.run(
+            ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    print(f"## CI's first attempts over the last {a.days} days ({repo})\n")
+    print(summary(collect(repo, a.days)))
+    return 0
+
+
 def cmd_status(a: argparse.Namespace) -> int:
     from .status import run_status
 
@@ -164,6 +181,13 @@ def main() -> int:
     g.add_argument("--write", action="store_true")
     g.add_argument("--check", action="store_true")
     st.set_defaults(func=cmd_status)
+
+    ce = sub.add_parser(
+        "census", help="CI's red first attempts and the tests behind them (needs gh)"
+    )
+    ce.add_argument("--days", type=int, default=7)
+    ce.add_argument("--repo", help="owner/name (default: the current repository, through gh)")
+    ce.set_defaults(func=cmd_census)
 
     a = p.parse_args()
     return a.func(a)
