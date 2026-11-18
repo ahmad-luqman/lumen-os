@@ -63,7 +63,10 @@ impl Write for Out {
 pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
     // Stored only once the fault will run (a remote one's after its job is
     // claimed): an earlier refusal leaves a fault under way where it was.
-    let vt = ctx.out.vt().unwrap_or(0);
+    let vt = match ctx.out.place() {
+        crate::term::Place::Vt(vt) => vt,
+        _ => 0,
+    };
     let kind = args.first().map_or("", String::as_str);
     let Some(fault) = crash_fn(kind) else {
         return ctx.fail(format_args!("crash: unknown kind '{kind}' ({})", KINDS.join(" ")));

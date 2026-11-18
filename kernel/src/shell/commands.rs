@@ -102,6 +102,13 @@ pub static COMMANDS: Table<Run> = Table(&[
         run: crate::desktop::command,
     },
     Command {
+        name: "theme",
+        args: &[&["light", "dark"]],
+        usage: "[light|dark]",
+        about: "the desktop's theme, or switch it (light, dark)",
+        run: crate::desktop::theme_command,
+    },
+    Command {
         name: "windows",
         args: &[],
         usage: "",
@@ -499,12 +506,13 @@ fn term(ctx: &mut Ctx<'_>, args: &[String]) {
             Some(view) => write_view(out, &view),
             None => ctx.fail(NONE),
         },
-        [arg, id] if arg == "text" => {
-            match id.parse().map_err(|_| String::from(TERM_USAGE)).and_then(crate::termwin::view_text) {
+        [arg, id] if arg == "text" => match id.parse() {
+            Ok(id) => match crate::termwin::view_text(id) {
                 Ok(view) => write_view(out, &view),
                 Err(e) => ctx.fail(format_args!("term text: {e}")),
-            }
-        }
+            },
+            Err(_) => ctx.fail(TERM_USAGE),
+        },
         _ => ctx.fail(TERM_USAGE),
     }
 }

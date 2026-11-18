@@ -757,6 +757,11 @@ impl Terminal {
         if line < g.len { g.history[(g.head + line) % g.capacity * g.cols + col] } else { g.at(col, line - g.len) }
     }
 
+    /// The view's cells, row by row (`cols() * rows()` of them).
+    pub fn view_cells(&self) -> impl Iterator<Item = Cell> + '_ {
+        (0..self.rows()).flat_map(move |r| (0..self.cols()).map(move |c| self.cell(c, r)))
+    }
+
     /// The screen's cursor (scrolling the view back doesn't move it).
     pub fn cursor(&self) -> Cursor {
         Cursor { col: self.grid.col, row: self.grid.row, visible: self.grid.cursor_visible }

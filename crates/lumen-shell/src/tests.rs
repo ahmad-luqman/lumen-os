@@ -321,6 +321,11 @@ fn a_closed_console_ends_the_line_and_writes_nothing() {
         assert_eq!(t.editor.line(), "");
         assert_eq!(t.editor.history().len(), 0);
     }
+    // It stops a command as Ctrl-C does; nothing else does.
+    assert!(Key::Closed.interrupts() && Key::Ctrl('c').interrupts());
+    for k in [Key::Ctrl('d'), Key::Char('c'), Key::Char('q'), Key::Enter] {
+        assert!(!k.interrupts(), "{k:?}");
+    }
     // Nothing a person types makes it.
     for c in ['\0', '\u{4}', '\u{1b}', 'x'] {
         assert_ne!(Key::from_press(Some(c), None, lumen_input::Mods::NONE), Some(Key::Closed));

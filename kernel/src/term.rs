@@ -238,13 +238,7 @@ pub fn on_tick(tick: u64) {
 impl Screen {
     /// Feed `s` to virtual terminal `vt`, `\n` as CR LF (not drawn yet).
     fn feed(&mut self, vt: usize, s: &str) {
-        let term = &mut self.terms[vt];
-        for (i, line) in s.split('\n').enumerate() {
-            if i > 0 {
-                term.write(b"\r\n");
-            }
-            term.write(line.as_bytes());
-        }
+        write_text(&mut self.terms[vt], s);
         if vt == self.shown {
             self.show_cursor();
         }
@@ -415,8 +409,9 @@ pub trait Pixels {
     /// One glyph of the console font (`?` for one it lacks) in `ink`, at
     /// most `max_w` pixels of it wide; its advance, clipped to `max_w`.
     fn glyph(&mut self, x: usize, y: usize, c: char, ink: Ink, max_w: usize) -> usize;
-    /// Move the pixel rows `[from, from + len)` to `[to, to + len)`.
-    fn move_rows(&mut self, from: usize, to: usize, len: usize);
+    /// Move the pixel rows `[from, from + len)` to `[to, to + len)` (rows of
+    /// pixels, where `CellTarget::move_rows` counts rows of cells).
+    fn move_pixel_rows(&mut self, from: usize, to: usize, len: usize);
 }
 
 /// How a glyph is drawn: its weight, in `fg` over `bg`.
@@ -425,6 +420,13 @@ pub struct Ink {
     pub weight: FontWeight,
     pub fg: u32,
     pub bg: u32,
+}
+
+impl Ink {
+    /// The console font's style for it.
+    pub fn style(self) -> Style {
+        Style::new(self.weight, fb::CONSOLE_SIZE, self.fg, self.bg)
+    }
 }
 
 /// A terminal's cells on [`Pixels`]: the grid's top-left pixel and its
@@ -469,7 +471,7 @@ impl<P: Pixels> CellTarget for Cells<'_, P> {
         let bottom = self.y0 + (from.max(to) + count) * CELL_H;
         // The pixels move: the pointer mustn't move with them.
         self.px.uncover(0, top, self.px.width(), bottom - top);
-        self.px.move_rows(self.y0 + from * CELL_H, self.y0 + to * CELL_H, count * CELL_H);
+        self.px.move_pixel_rows(self.y0 + from * CELL_H, self.y0 + to * CELL_H, count * CELL_H);
     }
 }
 
@@ -496,10 +498,10 @@ impl Pixels for OnFramebuffer<'_> {
     }
 
     fn glyph(&mut self, x: usize, y: usize, c: char, ink: Ink, max_w: usize) -> usize {
-        self.fb.glyph_clipped(x, y, c, Style::new(ink.weight, fb::CONSOLE_SIZE, ink.fg, ink.bg), max_w)
+        self.fb.glyph_clipped(x, y, c, ink.style(), max_w)
     }
 
-    fn move_rows(&mut self, from: usize, to: usize, len: usize) {
+    fn move_pixel_rows(&mut self, from: usize, to: usize, len: usize) {
         self.fb.move_rows(from, to, len);
     }
 }
@@ -530,43 +532,53 @@ fn tab_x(width: usize, vt: usize) -> Option<usize> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Owner {
     id: NonZeroU64,
-    vt: Option<usize>,
-    /// A command in a terminal window (#155): it gets no canvas.
-    window: bool,
+    place: Place,
+}
+
+/// Where a console is, and so where its commands may draw: anywhere (serial,
+/// whose commands take the screen as it is), on a virtual terminal (which a
+/// canvas brings to the front) or in a terminal window (#155: no canvas).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    Anywhere,
+    Vt(usize),
+    Window(u32),
 }
 
 impl Owner {
     /// A new owner, equal to no other, on no virtual terminal (a command on
     /// serial).
     pub fn new() -> Owner {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        Owner {
-            id: NonZeroU64::new(NEXT.fetch_add(1, Ordering::Relaxed)).expect("2^64 owners"),
-            vt: None,
-            window: false,
-        }
+        Owner::at(Place::Anywhere)
     }
 
     /// A new owner for a command on virtual terminal `vt`.
     ///
     /// # Panics
     /// If `vt >= VTS`.
+    #[cfg(feature = "ktest")]
     pub fn on_vt(vt: usize) -> Owner {
-        assert!(vt < VTS, "no virtual terminal {vt}");
-        Owner { vt: Some(vt), ..Owner::new() }
+        Owner::at(Place::Vt(vt))
     }
 
-    /// A new owner for a command in a terminal window (#155): a canvas
-    /// is refused to it ([`CanvasError::InWindow`]), as the screen isn't
-    /// the window's.
-    pub fn in_window() -> Owner {
-        Owner { window: true, ..Owner::new() }
+    /// A new owner, equal to no other, for a command at `place`: in a
+    /// terminal window (#155) a canvas is refused to it
+    /// ([`CanvasError::InWindow`]), as the screen isn't the window's.
+    ///
+    /// # Panics
+    /// If `place` is a virtual terminal past [`VTS`].
+    pub fn at(place: Place) -> Owner {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        if let Place::Vt(vt) = place {
+            assert!(vt < VTS, "no virtual terminal {vt}");
+        }
+        Owner { id: NonZeroU64::new(NEXT.fetch_add(1, Ordering::Relaxed)).expect("2^64 owners"), place }
     }
 
-    /// A new owner, equal to no other, on the same virtual terminal or in
-    /// a window as this one (or neither): for each command a shell runs.
+    /// A new owner, equal to no other, at the same place as this one: for
+    /// each command a shell runs.
     pub fn renew(self) -> Owner {
-        Owner { vt: self.vt, window: self.window, ..Owner::new() }
+        Owner::at(self.place)
     }
 }
 
@@ -640,14 +652,14 @@ impl fmt::Display for CanvasError {
 /// held no other terminal can be shown ([`show`]). An owner in a terminal
 /// window gets none ([`CanvasError::InWindow`]).
 pub fn canvas(owner: Owner) -> Result<Canvas, CanvasError> {
-    if owner.window {
+    if let Place::Window(_) = owner.place {
         return Err(CanvasError::InWindow);
     }
     claim(
         |_| Holder::Command(owner),
         |s, epoch| {
             // Drawn when the canvas goes (`resume`); the header's tabs now.
-            if let Some(vt) = owner.vt {
+            if let Place::Vt(vt) = owner.place {
                 s.switch(vt);
             }
             // (`drawing` takes the pointer off now: `place_pointer`.)
@@ -1173,7 +1185,25 @@ fn move_view(vt: usize, scroll: impl FnOnce(&mut Terminal) -> bool) {
 /// Scroll virtual terminal `vt`'s view back (`pages` > 0) or forward by
 /// `pages` half screens.
 pub fn scroll_half_pages(vt: usize, pages: isize) {
-    move_view(vt, |t| t.scroll_view(pages * (t.rows() as isize / 2).max(1)));
+    move_view(vt, |t| scroll_half_pages_of(t, pages));
+}
+
+/// Scroll `t`'s view back (`pages` > 0) or forward by `pages` half screens
+/// (Shift+PageUp/PageDown, on a virtual terminal or in a terminal window);
+/// whether it moved.
+pub fn scroll_half_pages_of(t: &mut Terminal, pages: isize) -> bool {
+    t.scroll_view(pages * (t.rows() as isize / 2).max(1))
+}
+
+/// Feed `s` to `t`, each `\n` as CR LF (the terminal takes `\n` as a line
+/// feed only): the virtual terminals' and the terminal windows' writes.
+pub fn write_text(t: &mut Terminal, s: &str) {
+    for (i, line) in s.split('\n').enumerate() {
+        if i > 0 {
+            t.write(b"\r\n");
+        }
+        t.write(line.as_bytes());
+    }
 }
 
 /// Show virtual terminal `vt`'s screen again (typing does).
@@ -1259,7 +1289,7 @@ fn view_cells() -> Option<(usize, Vec<Cell>, Option<Cursor>)> {
     let cursor = with_screen(|s| {
         let t = s.term();
         // The size never changes: this fits the capacity.
-        cells.extend((0..rows).flat_map(|r| (0..cols).map(move |c| t.cell(c, r))));
+        cells.extend(t.view_cells());
         view_cursor(t)
     })?;
     Some((cols, cells, cursor))
@@ -1267,7 +1297,7 @@ fn view_cells() -> Option<(usize, Vec<Cell>, Option<Cursor>)> {
 
 /// `t`'s cursor, its row counted in the view, if the view shows it (shown
 /// or hidden).
-fn view_cursor(t: &Terminal) -> Option<Cursor> {
+pub fn view_cursor(t: &Terminal) -> Option<Cursor> {
     let c = t.cursor();
     let row = c.row + t.view_offset();
     (row < t.rows()).then_some(Cursor { row, ..c })
@@ -1302,12 +1332,12 @@ pub fn view_text() -> Option<ViewText> {
     Some(ViewText { rows: rows_text(cols, &cells), cursor })
 }
 
-/// `t`'s view as text, as [`view_text`] gives the shown terminal's: a
-/// terminal window's (`term text <window>`, #155). It allocates, so never
-/// under the screen's lock (a window's grid has a lock of its own).
-pub fn view_text_of(t: &Terminal) -> ViewText {
-    let cells: Vec<Cell> = (0..t.rows()).flat_map(|r| (0..t.cols()).map(move |c| t.cell(c, r))).collect();
-    ViewText { rows: rows_text(t.cols(), &cells), cursor: view_cursor(t) }
+/// A view as text from its cells (`cols` wide, row by row) and its cursor
+/// ([`view_cursor`]), as [`view_text`] gives the shown terminal's: a
+/// terminal window's (`term text <window>`, #155), its cells copied out of
+/// its grid's lock first. It allocates.
+pub fn view_text_from(cols: usize, cells: &[Cell], cursor: Option<Cursor>) -> ViewText {
+    ViewText { rows: rows_text(cols, cells), cursor }
 }
 
 /// The bottom-most row of the view holding `needle`.
@@ -1927,7 +1957,7 @@ crate::ktest!(
         // terminal shown, nothing paused); so is every later command there
         // (`renew`); the canvas is free for anyone else meanwhile.
         use crate::kassert;
-        let owner = Owner::in_window();
+        let owner = Owner::at(Place::Window(7));
         kassert!(matches!(canvas(owner), Err(CanvasError::InWindow)));
         kassert!(matches!(canvas(owner.renew()), Err(CanvasError::InWindow)));
         kassert!(status().is_some_and(|s| !s.paused && s.shown == 0));

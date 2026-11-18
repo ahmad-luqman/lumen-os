@@ -1069,7 +1069,7 @@ pub fn play_command(ctx: &mut Ctx<'_>, args: &[String]) {
         if let Some(outcome) = sound.outcome() {
             break outcome;
         }
-        if !stopped && let Some(Key::Char('q') | Key::Ctrl('c') | Key::Closed) = ctx.poll_key() {
+        if !stopped && ctx.poll_key().is_some_and(|k| k == Key::Char('q') || k.interrupts()) {
             stop(&sound);
             stopped = true;
         }

@@ -789,7 +789,7 @@ pub fn top(ctx: &mut Ctx<'_>, args: &[String]) {
     loop {
         let until = prev.ns + NS_PER_SEC;
         while crate::time::now_ns() < until {
-            if let Some(Key::Char('q') | Key::Ctrl('c') | Key::Closed) = ctx.poll_key() {
+            if ctx.poll_key().is_some_and(|k| k == Key::Char('q') || k.interrupts()) {
                 let _ = writeln!(ctx.out, "top: quit after {frame} frames");
                 return;
             }
@@ -868,8 +868,8 @@ fn render(frame: u64, prev: &Sample, now: &Sample, ansi: bool) -> String {
 crate::ktest!(
     fn top_shows_a_frame_and_quits_on_q() {
         // `top 1` prints one frame (a CPU row for the boot CPU, the main
-        // thread) and stops; `q` or Ctrl-C waiting stops it before any
-        // frame.
+        // thread) and stops; `q`, Ctrl-C or a closed console (a terminal
+        // window, #155) waiting stops it before any frame.
         use crate::kassert;
         let history = lumen_shell::History::new(0);
         let mut console = super::Captured::default();
@@ -882,7 +882,7 @@ crate::ktest!(
         kassert!(text.lines().any(|l| l.starts_with("  main ")));
         kassert!(text.ends_with("top: done after 1 frames\n"));
         kassert!(!text.contains('\x1b'));
-        for key in [Key::Char('q'), Key::Ctrl('c')] {
+        for key in [Key::Char('q'), Key::Ctrl('c'), Key::Closed] {
             let mut console = super::Captured::default();
             console.keys.push_back(key);
             top(&mut Ctx::new(&mut console, false, &history), &[]);

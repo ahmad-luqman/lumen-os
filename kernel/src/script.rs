@@ -295,9 +295,7 @@ impl State {
             self.next_poll.set(now.saturating_add(self.limits.poll_ns));
             // A closed console (a terminal window, #155) stops it as Ctrl-C
             // does; it gives `Closed` for good, so `any` ends on it.
-            let ctrl_c = self
-                .console
-                .with(|c| core::iter::from_fn(|| c.try_key()).any(|k| matches!(k, Key::Ctrl('c') | Key::Closed)));
+            let ctrl_c = self.console.with(|c| core::iter::from_fn(|| c.try_key()).any(Key::interrupts));
             if ctrl_c == Some(true) {
                 self.stop.set(Some(Stop::CtrlC));
                 return true;

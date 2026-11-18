@@ -38,6 +38,7 @@ pub trait CellTarget {
 /// A terminal's view as drawn on one target.
 pub struct Renderer {
     cols: usize,
+    rows: usize,
     /// What each cell of the view was last drawn as (row by row).
     shadow: Vec<Cell>,
     /// Where the cursor is drawn, if it is.
@@ -50,7 +51,7 @@ impl Renderer {
     /// A renderer for a `cols` x `rows` terminal whose target shows blank
     /// cells (it was just cleared to the default background).
     pub fn new(cols: usize, rows: usize) -> Renderer {
-        Renderer { cols, shadow: vec![Cell::BLANK; cols * rows], cursor_drawn: None, cells_drawn: 0 }
+        Renderer { cols, rows, shadow: vec![Cell::BLANK; cols * rows], cursor_drawn: None, cells_drawn: 0 }
     }
 
     /// Cells drawn so far.
@@ -61,9 +62,7 @@ impl Renderer {
     /// The target was cleared to blank cells: forget what was drawn, and
     /// mark every row of `t` to be drawn again.
     pub fn forget(&mut self, t: &mut Terminal) {
-        self.shadow.fill(Cell::BLANK);
-        self.cursor_drawn = None;
-        t.touch_all();
+        self.reset(t, Cell::BLANK);
     }
 
     /// What the target shows is unknown (drawn over by someone else): the
@@ -71,7 +70,13 @@ impl Renderer {
     /// first).
     pub fn invalidate(&mut self, t: &mut Terminal) {
         // No cell holds U+0001 (a control character is never printed).
-        self.shadow.fill(Cell { ch: '\u{1}', ..Cell::BLANK });
+        self.reset(t, Cell { ch: '\u{1}', ..Cell::BLANK });
+    }
+
+    /// The target shows `shown` in every cell and no cursor; every row of
+    /// `t` is to be drawn again.
+    fn reset(&mut self, t: &mut Terminal, shown: Cell) {
+        self.shadow.fill(shown);
         self.cursor_drawn = None;
         t.touch_all();
     }
@@ -89,7 +94,7 @@ impl Renderer {
     /// If `t` isn't the size the renderer was made for.
     pub fn render(&mut self, t: &mut Terminal, target: &mut impl CellTarget, cursor: Option<CursorLook>) {
         let cols = self.cols;
-        assert_eq!(t.cols() * t.rows(), self.shadow.len(), "a terminal of another size");
+        assert_eq!((t.cols(), t.rows()), (self.cols, self.rows), "a terminal of another size");
         // Take the cursor off first, as the shadow has the cell (the
         // terminal may already hold other cells there, before the scroll
         // below moves what was drawn).

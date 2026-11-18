@@ -65,6 +65,14 @@ pub enum Key {
 }
 
 impl Key {
+    /// Whether a command running until a key stops on this one: Ctrl-C, or
+    /// [`Key::Closed`] (its console is gone). The one stop set every
+    /// command polling for a key uses (`top`, `play`, a script's Ctrl-C
+    /// check); the line editor tells the two apart.
+    pub const fn interrupts(self) -> bool {
+        matches!(self, Key::Ctrl('c') | Key::Closed)
+    }
+
     /// The line editor's key for a key press, if it takes one: from the
     /// press's text if it has one (`pc-keyboard` makes Enter `\n`,
     /// Backspace U+0008, Delete U+007F, Tab `\t`, Escape U+001B and Ctrl

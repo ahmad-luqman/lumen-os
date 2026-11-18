@@ -123,8 +123,9 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
     if !args.is_empty() {
         return ctx.fail("usage: screenshot");
     }
-    if ctx.out.vt().is_some() {
-        // A screen full of base64 is no use; the harness reads serial.
+    if ctx.out.place() != crate::term::Place::Anywhere {
+        // A screen (or a terminal window) full of base64 is no use; the
+        // harness reads serial.
         return ctx.fail("screenshot: run it on serial (the PNG comes out as text)");
     }
     let capture = match capture() {

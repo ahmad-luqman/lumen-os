@@ -78,11 +78,7 @@ impl<'a> Ctx<'a> {
     /// brings that terminal to the front), or in its terminal window (no
     /// canvas then: `term::CanvasError::InWindow`).
     pub fn new(out: &'a mut dyn Console, ansi: bool, history: &'a History) -> Ctx<'a> {
-        let owner = match (out.vt(), out.window()) {
-            (_, Some(_)) => term::Owner::in_window(),
-            (Some(vt), None) => term::Owner::on_vt(vt),
-            (None, None) => term::Owner::new(),
-        };
+        let owner = term::Owner::at(out.place());
         Ctx { out, ansi, history, owner }
     }
 
@@ -153,16 +149,11 @@ pub trait Console: Write + Send {
     /// Where its keys are typed, for a prompt shown elsewhere ("press a key
     /// on serial").
     fn name(&self) -> &'static str;
-    /// The virtual terminal it is, if it is one (a canvas its command takes
-    /// brings it to the front).
-    fn vt(&self) -> Option<usize> {
-        None
-    }
-    /// The desktop window it is, if it is one (a terminal window, #155: its
-    /// commands get no canvas).
-    fn window(&self) -> Option<u32> {
-        None
-    }
+    /// Where it is: anywhere (serial), on a virtual terminal (a canvas its
+    /// command takes brings it to the front) or in a terminal window (#155:
+    /// its commands get no canvas). No default: a console wrapping another
+    /// (a pipeline's capture) says the one it wraps.
+    fn place(&self) -> term::Place;
     /// Whether it has gone (its window closed): from then on it gives
     /// `Key::Closed` for every key asked (`read_key` and `try_key`), which
     /// every reader stops on, and the shell on it ends after the key or
@@ -456,6 +447,10 @@ impl Write for Serial {
 }
 
 impl Console for Serial {
+    fn place(&self) -> term::Place {
+        term::Place::Anywhere
+    }
+
     fn name(&self) -> &'static str {
         "serial"
     }
@@ -536,8 +531,8 @@ impl Console for Screen {
         "the keyboard"
     }
 
-    fn vt(&self) -> Option<usize> {
-        Some(self.vt)
+    fn place(&self) -> term::Place {
+        term::Place::Vt(self.vt)
     }
 
     fn read_key(&mut self) -> Key {
@@ -594,6 +589,10 @@ impl Write for Captured {
 
 #[cfg(feature = "ktest")]
 impl Console for Captured {
+    fn place(&self) -> term::Place {
+        term::Place::Anywhere
+    }
+
     fn name(&self) -> &'static str {
         "the test console"
     }
@@ -702,7 +701,7 @@ crate::ktest!(
             kassert!(term::write_str_to(1, &alloc::format!("second {i}\n")));
         }
         let second = Screen { vt: 1 };
-        kassert_eq!(second.vt(), Some(1));
+        kassert_eq!(second.place(), term::Place::Vt(1));
         let page_up = keyboard::Key::Raw { code: KeyCode::PageUp, mods: lumen_input::Mods::NONE.with_shift() };
         kassert_eq!(second.take(page_up), None);
         let views = || term::view_offset(0).zip(term::view_offset(1)).ok_or("no terminal");
