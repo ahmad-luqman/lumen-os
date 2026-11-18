@@ -192,13 +192,6 @@ pub fn placement_is_judged(reference_width: u64, paused_width: u64, pause: u64) 
         && placement_uncertainty(reference_width, paused_width, pause).saturating_mul(4) <= pause
 }
 
-/// Ticks a down-counter that reloads to `reload` at 0 counted from reading
-/// `earlier` to reading `later`: correct across one reload (two readings
-/// less than a period apart).
-pub fn down_counter_delta(earlier: u32, later: u32, reload: u32) -> u32 {
-    if later <= earlier { earlier - later } else { earlier + (reload - later) }
-}
-
 /// Is `hz` a believable TSC frequency? A miscounted reference gives wild
 /// values. Real TSCs run between tens of MHz and a few GHz; the bounds (10 MHz
 /// to 100 GHz) are generous, so only a broken reference fails.
@@ -1153,14 +1146,6 @@ mod tests {
         assert_eq!(taken, 3, "stops after N");
         let none = first_narrow::<u64, (), 0>(100, || unreachable!()).unwrap();
         assert_eq!((none.reading(), none.widths(), none.retries()), (None, &[][..], 0));
-    }
-
-    #[test]
-    fn down_counter_deltas_cross_one_reload() {
-        assert_eq!(down_counter_delta(60_000, 50_000, 62_500), 10_000);
-        assert_eq!(down_counter_delta(5_000, 60_000, 62_500), 7_500, "reloaded once");
-        assert_eq!(down_counter_delta(0, 62_500, 62_500), 0, "at 0, then reloaded");
-        assert_eq!(down_counter_delta(7, 7, 62_500), 0);
     }
 
     /// A window of `tsc` made-up ticks with `gaps` ticks of end gap.

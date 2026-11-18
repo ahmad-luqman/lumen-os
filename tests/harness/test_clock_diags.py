@@ -27,12 +27,12 @@ BOOT_TSC = (
 TSC_WINDOW = "24576000/1000000/2000/1000/1000"
 WINDOW = "10000000/625000/1/0/0"
 HPET_PLACEMENT = (
-    "# injected pause: HPET placement {off} ns off (at most 2500000 ns allowed) on try {tries} "
-    "of 8, 20 ms apart; paused brackets [10048000] ns, the reference's 30000 ns\n"
+    "# injected pause: HPET placement {off} ns off (at most 10000000 ns allowed) on try {tries} "
+    "of 8, 20 ms apart; tries (reference, paused, off, in ns) [(30000, 40048000, {off})]\n"
 )
 TIMER_PLACEMENT = (
-    "# injected pause: timer placement 500 ns off (at most 200000 ns allowed) on try 1 of 8, 20 ms apart; "
-    '427500 ns by the HPET, 428000 ns by the timer; tries (...) [("", 18000, 829000, 427500)]\n'
+    "# injected pause: timer placement 500 ns off (at most 10000000 ns allowed) on try 1 of 8, 20 ms "
+    "apart; tries (reference, paused, off, in ns) [(18000, 40029000, 500)]\n"
 )
 
 
@@ -236,4 +236,4 @@ def test_any_number_of_timer_boot_retakes_passes():
 def test_a_placement_too_far_off_fails():
     check_clock_diags(*run(placement_tries=8))
     with pytest.raises(AssertionError, match="placed too far off"):
-        check_clock_diags(*run(hpet_off=2500001))
+        check_clock_diags(*run(hpet_off=10000001))

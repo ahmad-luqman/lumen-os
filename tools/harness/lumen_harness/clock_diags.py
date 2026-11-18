@@ -22,8 +22,8 @@ from lumen_harness import tap
 # measured: a host or `now_ns` getting worse, which a pass would hide.
 MOST_HPET_RETRIES = 4
 # The placement tests' try counts aren't bounded: they measure how often a
-# loaded host stalls an 800 µs or 10 ms spin, not the code (6 of 8 under KVM
-# load in PR #121), and each test already fails when no try can be judged.
+# loaded host stalls a 10 ms spin, not the code, and each test already fails
+# when no try can be judged.
 HPET_BRACKET_NS = 100_000
 RETRY_SPACING_MS = 20
 
