@@ -66,6 +66,9 @@ crate::ktest!(
         crate::kassert_eq!(value_in(line, "lumen.log"), Some("debug"));
         crate::kassert_eq!(value_in(line, "lumen.lo"), None);
         crate::kassert_eq!(value_in("", "x"), None);
+        // A key with nothing after `=` has an empty value (a bare
+        // `lumen.ktest=` selects no ktest), not none.
+        crate::kassert_eq!(value_in("lumen.ktest=", "lumen.ktest"), Some(""));
         Ok(())
     }
 );

@@ -457,9 +457,11 @@ for scenarios, said at INFO, section 6, "Time"), `lumen.desktop` (start the
 desktop before the serial prompt; section 11),
 `lumen.desktop_cut_delay_ms=<ms>` (a deliberate delay for scenarios between
 the compositor's reads of the input rings and of the cut, said at INFO,
-capped at 2000 ms; section 11) and `lumen.theme=<light|dark>` (the
+capped at 2000 ms; section 11), `lumen.theme=<light|dark>` (the
 desktop's theme, said at INFO; a name that isn't a theme is warned about
-and ignored; section 11).
+and ignored; section 11) and, in the test kernel,
+`lumen.ktest=<prefix>[,<prefix>...]` (run only the ktests whose names start
+with one of them, said in a TAP comment; none selected fails the run).
 
 ## 5. Memory layout
 
@@ -4296,7 +4298,7 @@ kernel. The kernel is the trusted computing base.
 | Harness itself | self-tests that the TAP parser, audit and image diff catch failures, and that the QEMU command line, artifact layout, CI wiring and status generation behave | `tests/harness` |
 | Feature gate | every feature in `tests/features/*.toml` must pass (CI); `docs/STATUS.md` generated from the same data | `make status-check`, `make status` |
 
-QEMU exit codes: 33 = tests passed, 35 = a test failed, 37 = crash report.
+QEMU exit codes: 33 = tests passed, 35 = a test failed (or `lumen.ktest=` selected none), 37 = crash report.
 A triple fault exits with 0 (`-no-reboot`) and therefore fails; the power-off
 scenario alone accepts 0, with a QMP `SHUTDOWN` event whose reason is
 `guest-shutdown`. Each scenario
