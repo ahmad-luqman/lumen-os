@@ -21,9 +21,6 @@ from lumen_harness import tap
 # 4: one such burst. More means stalls hit readings far more often than ever
 # measured: a host or `now_ns` getting worse, which a pass would hide.
 MOST_HPET_RETRIES = 4
-# The placement tests' try counts aren't bounded: they measure how often a
-# loaded host stalls a 10 ms spin, not the code, and each test already fails
-# when no try can be judged.
 HPET_BRACKET_NS = 100_000
 RETRY_SPACING_MS = 20
 
@@ -54,11 +51,58 @@ BOOT_TIMER = re.compile(r"timer boot calibration " + _BOOT_FIELDS)
 BOOT_TSC = re.compile(r"tsc boot calibration \((?P<reference>hpet|pit)\) " + _BOOT_FIELDS)
 BOOT_TIMER_CASE = "time::the_boot_timer_calibration_is_within_what_the_tick_needs"
 BOOT_TSC_CASE = "time::the_boot_tsc_calibration_is_within_what_now_ns_needs"
+# The placement tests (#158) pause 20 ms on each side of a read (a 40 ms
+# bracket) and judge a try only when its reference bracket and its
+# uncertainty are each at most a quarter of the pause (lumen_time's
+# placement_is_judged), taking it again otherwise, 8 tries at most. How many
+# tries a run took isn't bounded: that counts how often a loaded host
+# stalled a bracket, not the code, and each test fails when none can be
+# judged. What is checked is that the try it judged, and the ones it took
+# again, follow from the widths it printed.
+PLACEMENT_PAUSE_NS = 20_000_000
+PLACEMENT_TRIES = 8
 PLACEMENT = re.compile(
     r"injected pause: (?P<what>HPET|timer) placement (?P<off>\d+) ns off \(at most "
     rf"(?P<allowed>\d+) ns allowed\) on try (?P<try>\d+) of (?P<tries>\d+), {RETRY_SPACING_MS} ms "
-    r"apart; .*"
+    r"apart; tries \(reference, paused, by the brackets, by the read, in ns\) \[(?P<list>.*)\]"
 )
+# One try in that list: (reference, paused, by the brackets, by the read).
+PLACEMENT_TRY = re.compile(r"\((\d+), (\d+), (\d+), (\d+)\)")
+
+
+def placement_is_judged(reference: int, paused: int, pause: int) -> bool:
+    """lumen_time's `placement_is_judged`: the reference bracket and the
+    uncertainty (half the reference's width plus what a stall added to the
+    paused one's, rounded up) each at most a quarter of the pause."""
+    stalled = max(paused - 2 * pause, 0)
+    return 4 * reference <= pause and 4 * -(-(reference + stalled) // 2) <= pause
+
+
+def _check_placement(p: re.Match[str], what: str) -> None:
+    """A placement test's judged line: its clock, tries and allowance as the
+    kernel's constants say; one listed try per try taken; the last one judged
+    and the ones before it not (else the kernel stopped too late or too
+    soon); and `off` that last try's two times apart, within the allowance."""
+    line = p.group(0)
+    assert p["what"] == what, f"{what} test printed another clock's line: {line}"
+    allowed, taken = int(p["allowed"]), int(p["try"])
+    assert (allowed, int(p["tries"])) == (PLACEMENT_PAUSE_NS // 2, PLACEMENT_TRIES), line
+    tries = [tuple(map(int, t)) for t in PLACEMENT_TRY.findall(p["list"])]
+    listed = ", ".join(f"({a}, {b}, {c}, {d})" for a, b, c, d in tries)
+    assert listed == p["list"] and len(tries) == taken and 1 <= taken <= PLACEMENT_TRIES, (
+        f"not one listed try per try taken: {line}"
+    )
+    *before, (reference, paused, by_brackets, by_read) = tries
+    assert placement_is_judged(reference, paused, PLACEMENT_PAUSE_NS), (
+        f"judged a try it can't: {line}"
+    )
+    assert not any(placement_is_judged(r, q, PLACEMENT_PAUSE_NS) for r, q, _, _ in before), (
+        f"took a try again that could be judged: {line}"
+    )
+    assert int(p["off"]) == abs(by_brackets - by_read), (
+        f"off isn't its try's two times apart: {line}"
+    )
+    assert int(p["off"]) <= allowed, f"placed too far off: {line}"
 
 
 def case_diagnostics(report: tap.TapReport, name: str) -> list[str]:
@@ -131,12 +175,9 @@ def check_clock_diags(report: tap.TapReport, text: str) -> None:
     # The boot calibrations, once each in the run.
     _check_boot_calibration(report, text, "timer", BOOT_TIMER_CASE, BOOT_TIMER, TIMER_TOLERANCE_PPM)
     _check_boot_calibration(report, text, "tsc", BOOT_TSC_CASE, BOOT_TSC, TSC_TOLERANCE_PPM)
-    # The placement tests each report one judged try, within their tries
-    # and their allowance.
-    for name in (
-        "time::an_hpet_reading_is_placed_at_its_brackets_midpoint",
-        "time::a_timer_reading_is_placed_at_its_brackets_midpoint",
+    # The placement tests each report one judged try (_check_placement).
+    for name, what in (
+        ("time::an_hpet_reading_is_placed_at_its_brackets_midpoint", "HPET"),
+        ("time::a_timer_reading_is_placed_at_its_brackets_midpoint", "timer"),
     ):
-        p = one_diagnostic(report, name, PLACEMENT)
-        assert 1 <= int(p["try"]) <= int(p["tries"]), p.group(0)
-        assert int(p["off"]) <= int(p["allowed"]), f"placed too far off: {p.group(0)}"
+        _check_placement(one_diagnostic(report, name, PLACEMENT), what)
