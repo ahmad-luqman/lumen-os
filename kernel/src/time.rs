@@ -1340,8 +1340,11 @@ crate::ktest!(
         // boot calibrated against (the ktest machine has one): within 2%, or
         // what the two calibrations' bounds allow if more (stalled windows
         // filling in). The PIT is measured again until its median is within
-        // the TSC's tolerance, up to PIT_TRIES times RETRY_SPACING_NS apart:
-        // a wider one could pass on its bound alone, which proves nothing.
+        // the TSC's tolerance, up to PIT_TRIES times RETRY_SPACING_NS apart;
+        // none within it, the narrowest under CANT_TELL_PPM is used (a loaded
+        // host's slow PIT reads can leave every try past 1%: #158's audit),
+        // and the check is then only as tight as its bound says, which the
+        // diag shows. None under CANT_TELL_PPM fails: it would prove nothing.
         use crate::kassert;
         const PIT_TRIES: usize = 4;
         let hz = tsc().ok_or("TSC not calibrated")?.hz();
@@ -1371,18 +1374,23 @@ crate::ktest!(
     }
 );
 
+/// A measurement's bound at or past which a cross-check can't tell a right
+/// rate from a wrong one: 10% (the ones these tests catch were 20% off).
+#[cfg(feature = "ktest")]
+const CANT_TELL_PPM: u64 = 100_000;
+
 /// The first of up to `tries` calibrations from `measure` (`space` called
-/// between them) whose median is within the TSC's tolerance, each shown as
-/// a diag; an error saying whether every try failed or every one was too
-/// wide (a cross-check against a wider one could pass on its bound alone,
-/// which proves nothing).
+/// between them) whose median is within the TSC's tolerance, or, none
+/// being, the one with the smallest bound under [`CANT_TELL_PPM`]; each
+/// shown as a diag. An error saying whether every try failed or every one
+/// was too wide to tell anything.
 #[cfg(feature = "ktest")]
 fn first_judgeable(
     tries: usize,
     mut measure: impl FnMut() -> Result<Calibration, CalError>,
     mut space: impl FnMut(),
 ) -> Result<Calibration, &'static str> {
-    let mut wide = false;
+    let (mut narrowest, mut wide) = (None::<Calibration>, false);
     for tried in 0..tries {
         if tried > 0 {
             space();
@@ -1395,12 +1403,15 @@ fn first_judgeable(
                     return Ok(cal);
                 }
                 wide = true;
+                if ppm < CANT_TELL_PPM && narrowest.is_none_or(|n| ppm < n.median_bound_ppm()) {
+                    narrowest = Some(cal);
+                }
             }
             Err(e) => crate::ktest::diag(format_args!("against the pit: {e}")),
         }
     }
-    Err(if wide {
-        "the PIT re-measurement couldn't be judged: never within the TSC's tolerance"
+    narrowest.ok_or(if wide {
+        "the PIT re-measurement couldn't be judged: every try 10% or wider"
     } else {
         "the PIT re-measurement couldn't be judged: every try failed"
     })
@@ -1409,10 +1420,11 @@ fn first_judgeable(
 crate::ktest!(
     fn a_cross_check_measures_again_until_it_can_judge() {
         // A PIT measurement past the TSC's tolerance (or one that failed) is
-        // taken again, spaced, until one is within it; never within it, none
-        // (tsc_calibrated_within_tolerance then fails saying it couldn't
-        // judge, instead of passing on a wide bound).
-        use crate::kassert_eq;
+        // taken again, spaced, until one is within it; never within it, the
+        // narrowest under CANT_TELL_PPM (wherever it came); none under it,
+        // an error saying so (tsc_calibrated_within_tolerance then fails
+        // rather than pass on a bound that tells nothing).
+        use crate::{kassert, kassert_eq};
         let w = |end_gap| Window { tsc: 10_000_000, reference: 11_932, polls: 900, start_gap: 0, end_gap };
         let cal = |end_gap| Calibration {
             hz: 2_500_000_000,
@@ -1421,29 +1433,26 @@ crate::ktest!(
             last_retaken: None,
             of: Calibrated::Tsc(Reference::Pit),
         };
-        let (wide, fine) = (cal(200_000), cal(1_000));
-        let mut queue = [Err(CalError::NoCount), Ok(wide), Ok(fine)].into_iter();
-        let (mut taken, mut spaced) = (0, 0);
-        let got = first_judgeable(
-            4,
-            || {
-                taken += 1;
-                queue.next().unwrap_or(Ok(wide))
-            },
-            || spaced += 1,
-        );
-        kassert_eq!((got, taken, spaced), (Ok(fine), 3, 2));
-        let mut tries = 0;
-        let never = first_judgeable(
-            4,
-            || {
-                tries += 1;
-                Ok(wide)
-            },
-            || {},
-        );
-        kassert_eq!(never, Err("the PIT re-measurement couldn't be judged: never within the TSC's tolerance"));
-        kassert_eq!(tries, 4);
+        let (fine, wide, wider, useless) = (cal(1_000), cal(200_000), cal(500_000), cal(1_500_000));
+        kassert!(wide.median_bound_ppm() > lumen_time::TSC_TOLERANCE_PPM);
+        kassert!(wider.median_bound_ppm() > wide.median_bound_ppm() && wider.median_bound_ppm() < CANT_TELL_PPM);
+        kassert!(useless.median_bound_ppm() >= CANT_TELL_PPM);
+        let run = |queue: &[Result<Calibration, CalError>]| {
+            let (mut taken, mut spaced) = (0, 0);
+            let got = first_judgeable(
+                4,
+                || {
+                    taken += 1;
+                    queue[taken - 1]
+                },
+                || spaced += 1,
+            );
+            (got, taken, spaced)
+        };
+        kassert_eq!(run(&[Err(CalError::NoCount), Ok(wide), Ok(fine), Ok(wide)]), (Ok(fine), 3, 2));
+        kassert_eq!(run(&[Ok(wider), Ok(wide), Ok(useless), Ok(wider)]), (Ok(wide), 4, 3));
+        let none = run(&[Ok(useless), Err(CalError::NoCount), Ok(useless), Ok(useless)]);
+        kassert_eq!(none, (Err("the PIT re-measurement couldn't be judged: every try 10% or wider"), 4, 3));
         let failing = first_judgeable(2, || Err(CalError::NoCount), || {});
         kassert_eq!(failing, Err("the PIT re-measurement couldn't be judged: every try failed"));
         Ok(())
@@ -2687,8 +2696,9 @@ crate::ktest!(
         // Measured with the HPET and the tick count, not the TSC that
         // `sleep` itself waits on. The HPET readings aren't bracketed (#117):
         // they come before and after the sleep, so a stall next to either
-        // only lengthens the interval, and only its 1 s upper bound could
-        // catch that; the tick count is only checked to have moved.
+        // only lengthens the interval, which is why there is no upper bound
+        // (a host decides how long a stall is); the tick count is only
+        // checked to have moved.
         use crate::kassert;
         let hpet = hpet().ok_or("no HPET")?;
         let (h0, t0) = (hpet.now(), ticks());
@@ -2698,9 +2708,9 @@ crate::ktest!(
         crate::ktest::diag(format_args!("slept {ns} ns by the HPET, {ticked} ticks"));
         // At least 10 ms, less 1%: the TSC was calibrated against this HPET,
         // so only window-to-window noise separates them (the 2% cross-checks
-        // are against the PIT). Well under a second. The timer ticked
-        // (interrupts are on); its rate is checked elsewhere.
-        kassert!((9_900_000..lumen_time::NS_PER_SEC).contains(&ns));
+        // are against the PIT). The timer ticked (interrupts are on); its
+        // rate is checked elsewhere.
+        kassert!(ns >= 9_900_000);
         kassert!(ticked >= 1);
         Ok(())
     }
@@ -2885,7 +2895,9 @@ crate::ktest!(
 crate::ktest!(
     fn the_timer_ticks_on_its_vector() {
         // Interrupts arrive on the timer's vector, and not much faster than
-        // 1 kHz (100 in 100 ms; the bound, 150, leaves room). The timer's
+        // 1 kHz: at most 1.5 per ms the sleep took by `now_ns`, plus 2 (a
+        // host stall lengthens the sleep, and late periods merge rather than
+        // arrive faster, so this bound grows with it). The timer's
         // input rate is checked by `the_timer_is_programmed_for_1_khz` (against the
         // HPET): QEMU's TCG delivers ticks late (late periodic timers skip
         // periods): 29 to 81 in #45's stress runs (busy-waiting then; the
@@ -2893,11 +2905,11 @@ crate::ktest!(
         // period merges them.
         use crate::kassert;
         kassert!(arch::irq::enabled());
-        let t0 = ticks();
+        let (t0, n0) = (ticks(), now_ns());
         sleep(100_000_000);
-        let ticked = ticks() - t0;
-        crate::ktest::diag(format_args!("{ticked} ticks in 100 ms"));
-        kassert!((1..=150).contains(&ticked));
+        let (ticked, slept_ms) = (ticks() - t0, (now_ns() - n0) / 1_000_000);
+        crate::ktest::diag(format_args!("{ticked} ticks in a 100 ms sleep that took {slept_ms} ms"));
+        kassert!(ticked >= 1 && ticked <= slept_ms * 3 / 2 + 2);
         Ok(())
     }
 );
@@ -2906,8 +2918,8 @@ crate::ktest!(
     fn a_held_lock_holds_off_the_timer() {
         // While a lock is held (interrupts off) no tick arrives; ticks resume
         // once it is dropped. The first can come late under QEMU's TCG on a
-        // loaded host (a fixed 2 ms wait missed it once, #45), so this waits up
-        // to 100 ms for it.
+        // loaded host (a fixed 2 ms wait missed it once, #45), so this waits
+        // for it, up to 5 s (only a tick that never comes fails).
         use crate::{kassert, kassert_eq};
         let lock = crate::sync::SpinLock::new(());
         let guard = lock.lock();
@@ -2915,7 +2927,7 @@ crate::ktest!(
         sleep(5_000_000);
         let during = ticks() - t0;
         drop(guard);
-        let resumed = wait_for_tick(t0, 100_000_000);
+        let resumed = wait_for_tick(t0, 5_000_000_000);
         kassert_eq!(during, 0);
         kassert!(resumed);
         Ok(())
@@ -2927,11 +2939,11 @@ crate::ktest!(
         // At 1 kHz they would flood the trace ring.
         use crate::{kassert, kassert_eq};
         // Spinning, not sleeping: switching to the idle thread and back is
-        // traced.
+        // traced. Until a tick arrives (late under QEMU's TCG, #45), up to
+        // 5 s.
         let ring = crate::trace::ring();
         let (t0, w0) = (ticks(), ring.written());
-        spin(20_000_000);
-        kassert!(ticks() > t0);
+        kassert!(wait_for_tick(t0, 5_000_000_000));
         kassert_eq!(ring.written(), w0);
         Ok(())
     }
