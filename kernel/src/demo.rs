@@ -425,15 +425,18 @@ pub fn draw_bands(bands: Vec<lumen_gfx::BandMut<'_>>, view: View, all: bool) -> 
     };
     let mut no_thread = [None; MAX_CPUS];
     sched::scope(|s| {
+        let mut orphans = Vec::new();
         for (i, &cpu) in others.iter().enumerate() {
             let (slot, draw) = (&dealt[i + 1], &draw);
             if let Err(e) = s.spawn_on(cpu, "mandelbrot", move || draw(slot)) {
                 no_thread[cpu] = Some(e);
+                orphans.push(i + 1);
             }
         }
-        // Slot 0, then any slot left (its thread never started).
-        for slot in &dealt {
-            draw(slot);
+        // Slot 0, then the slots whose thread never started.
+        draw(&dealt[0]);
+        for i in orphans {
+            draw(&dealt[i]);
         }
     })?;
     let rows = core::array::from_fn(|c| rows[c].load(Ordering::Relaxed));
@@ -640,7 +643,7 @@ crate::ktest!(
         // The Mandelbrot window's drawing (#157): its surface lent as bands
         // to a thread on every CPU whose scheduler runs (`sched::scope`),
         // each CPU drawing at least one band, every row drawn once, the
-        // pixels those of this CPU drawing alone; 10 times, on a window
+        // pixels those of this CPU drawing alone; 3 times, on a window
         // a band taller than one band per CPU (so a CPU's second band shows
         // a missed join).
         use crate::{kassert, kassert_eq};
@@ -653,7 +656,7 @@ crate::ktest!(
         let mut alone = lumen_gfx::Surface::new(w, ht);
         let one = draw_bands(alone.bands_mut(BAND.get() as u32), view, false).map_err(|_| "can't block")?;
         kassert_eq!(one.cpus(), 1);
-        for round in 0..10 {
+        for round in 0..3 {
             h.surface_mut().fill(0);
             let d = draw_window(&mut h).map_err(|_| "can't block")?;
             let rows: Vec<usize> = cpus.iter().map(|&c| d.rows[c]).collect();

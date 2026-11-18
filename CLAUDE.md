@@ -139,7 +139,7 @@ own PR that updates that doc first.
   `lumen.log=debug`). `sync.rs`: `SpinLock` (interrupts off while held).
   `smp.rs`: starting the other CPUs, `run_on`. `sched.rs`: kernel threads
   (per-CPU run queues, preemption on the timer, `sleep`, `WaitQueue`
-  with or without a deadline, `spawn`/`join`); `arch/x86_64/context.rs` switches threads.
+  with or without a deadline, `spawn`/`join`, `scope`: threads borrowing from the caller, joined before it returns); `arch/x86_64/context.rs` switches threads.
   `arch/x86_64/`: GDT/TSS (per CPU), IDT, entry
   stubs and the vector map, `percpu.rs` (GS base, CPU index), `irq.rs` (nested interrupt disable), local and
   I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
@@ -165,8 +165,10 @@ own PR that updates that doc first.
   pointer drawn on the screen only, both input rings through `lumen_wm::Wm`, the cut), windows
   (`open_window`, `open_window_at`, `WindowHandle`: an owner's surface and a committed one, `commit`,
   `next_event`/`wait_event`/`wait_event_until`, a `Waker` for another thread, `Desktop::without_screen` for the
-  ktests; `publish`: a toolkit's tree), each window's root node, the two demo windows, `desktop` (`status`,
-  `check`, `spin`, `counter`, `hold`/`release`) and `windows`, and the tree's accessors for `ui.rs`
+  ktests; `publish`: a toolkit's tree; `bands_mut`), each window's root node, the two demo windows, panels
+  (#157: `open_panel`, the taskbar: frameless, in front, never focused, left out of `windows`), minimized
+  windows (not composed; `minimize_window`/`restore_window`), `desktop` (`status`,
+  `check`, `spin`, `counter`, `tick`, `hold`/`release`) and `windows`, and the tree's accessors for `ui.rs`
   (`tree_rows`, `find_node`, `push_request`: a refused request handed back);
   `lumen.desktop_cut_delay_ms=` widens the race at a pause for the scenarios;
   the look (#154): titles and the demos' text in the UI font (`font::Text`), the embedded
@@ -176,10 +178,14 @@ own PR that updates that doc first.
   window's first event is `WindowEvent::Theme`; owners redraw on it with `WindowHandle::theme()`,
   and every wait goes through `Window::wait`, which wakes for `has_event()`). `ui.rs`: the toolkit in a window
   (#156: `Toolkit<A: lumen_ui::App>`, one step per event that publishes before it answers, its palette from the
-  `Theme` it is handed, its text `font::Text`), `ui invoke`'s `Request` (its reply slot; `start` gives the
+  `Theme` it is handed (`with_palette`: `taskbar_palette`, #157), its text `font::Text`, `refresh` committing
+  only the damaged widgets), `ui invoke`'s `Request` (its reply slot; `start` gives the
   `Started` that answers; either answers for itself if dropped), Counter's owner, and `ui tree`/`ui invoke`. `termwin.rs`: terminal windows (#155): `terminal` opens one, its
   owner thread (`terminal`: draws the grid, hands keys over, blinks the focused one's cursor) and its shell
-  (`term-shell`, `shell::run_in_window` on a closable console), joined on close; `term text <window>`. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
+  (`term-shell`, `shell::run_in_window` on a closable console), joined on close; `term text <window>`.
+  `taskbar.rs`: the desktop shell's taskbar (#157): a panel along the bottom, its `Launcher` menu
+  (Terminal, Mandelbrot, Life, Counter), a button per window, the `Clock` (the RTC polled every
+  second; `desktop tick` moves it a minute ahead), its `taskbar` owner thread. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -229,7 +235,9 @@ own PR that updates that doc first.
   tolerance; `lumen.stall_tsc_windows=`/`lumen.stall_timer_windows=` stall
   them for scenarios), the boot origin
   (`mark_boot`, `since_boot_ns`), `now_ns`, `sleep`, `ticks`.
-  `demo.rs`: the `mandelbrot` (bands on every CPU) and `life` commands.
+  `demo.rs`: the `mandelbrot` (bands on every CPU) and `life` commands, and
+  the launcher's Mandelbrot window (`draw_bands`: a window's surface lent
+  as bands to a thread per CPU through `sched::scope`) and Life window (#157).
   `font.rs`: the desktop's anti-aliased text (`lumen-font`): `font::face`,
   the UI font parsed on first use and shared; `font::Text`, one drawing
   thread's glyph cache over it (`draw` glyph by glyph inside a clip,
@@ -260,12 +268,15 @@ own PR that updates that doc first.
   list that coalesces, a bounding box past its size, never loses
   coverage), `Surface` (xRGB8888 with a stride: fill, clipped blits, `move_rows` (a scroll),
   `blend_mask`/`blend_mask_in` for coverage masks such as glyphs, the
-  latter clipped to a damaged rect) and `Target`, what a surface is
+  latter clipped to a damaged rect, `bands_mut`: disjoint row bands,
+  `BandMut`, for threads) and `Target`, what a surface is
   presented to a span at a time (a surface; the desktop's front buffer,
   `term::ScreenCanvas`) (host-tested, incl. randomized coverage and
   every-edge clipping).
 - `crates/lumen-wm`: the desktop's window-manager logic (#152): frame
-  geometry (`Metrics`: title bar, close box, client, borders; `Part`),
+  geometry (`Metrics`: title bar, close and minimize boxes, client, borders; `Part`),
+  minimize/restore and panels (#157: `open_panel`, frameless, kept in front, never
+  focused, its rows reserved),
   `Wm` (stacking, focus: a click focuses and raises, closing the focused
   one focuses the front one; hit testing; a left drag from a title bar
   clamped to keep a strip on the screen; the implicit grab of a client
@@ -286,7 +297,10 @@ own PR that updates that doc first.
   randomized model of damage-only repainting with focus, and
   press-pause-resume-release through the queue).
 - `crates/lumen-ui`: the desktop's toolkit (#156): a retained widget tree
-  (`Ui`: stacks, labels, buttons, checkboxes, text fields, lists; layout,
+  (`Ui`: stacks (`Stack` handles), labels (`fixed_label`), buttons, checkboxes, text fields, lists,
+  menus with items (#157); `Ui::bar` (across, one widget pinned right); `remove`
+  (generational `Widget`s: a freed slot taken again); per-widget damage (`take_damage`,
+  `paint_in`); layout,
   hit testing, dispatch, painting through a `Text` trait, `FixedText` for
   tests), every widget an automation node (`NodeId` from one counter,
   `Role` with its actions, value kind and flags, `Value`, `Action`,

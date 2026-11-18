@@ -3906,7 +3906,9 @@ meaning none (`kbd events`' mods) is an absent value, unquoted.
   queued)`, since the owner reads it when it can and the window closes
   then). On an error it prints why. Its other lines: `ui invoke: ran late`
   above the row or message; `ui invoke: ran; window <id> closed`; `ui
-  invoke: ran; node <n> is gone`; `ui invoke: window <id> busy (try
+  invoke: ran; node <n> is gone` (a launcher item's: the menu folds);
+  `ui invoke: window <id> is minimized already` and `... isn't
+  minimized` (#157); `ui invoke: window <id> busy (try
   again)`; `ui invoke: window <id> closed` (a widget's window closed as
   it was asked); `ui invoke: no node <n>` (none, or its window closed,
   from the asker or the owner); `ui invoke: no desktop`; `ui invoke:
@@ -3965,7 +3967,8 @@ close, and the demos in windows of their own. All of it is built with
   window gets: its first event and every switch's `Theme`, requests
   (`ui invoke` on its buttons), its tree published, `settled`'s
   conditions, `desktop check`. The compositor opens it when the desktop
-  first starts, after the demo windows: 32 rows high, across the
+  first starts, after the demo windows: as high as a button plus 4
+  pixels above and below (40 rows with the UI font), across the
   screen's whole width, at its bottom, titled `Taskbar`. `windows`
   doesn't list it (it is the desktop's, like the frames) and `desktop
   status`'s `windows` doesn't count it; `ui tree` lists it, its root a
@@ -3987,10 +3990,11 @@ close, and the demos in windows of their own. All of it is built with
 - **Its owner**, the `taskbar` thread, waits with
   `wait_event_until(the next second, Animating::No)` (so it settles
   between polls). The desktop wakes it through its `Waker` when its
-  windows change (one opened, closed, minimized or restored, or the
-  focus moved), and it rebuilds its buttons: a button for a window gone is
-  removed from its tree (its node id names nothing after), one for a new
-  window added.
+  windows change (one opened or closed), and it brings its buttons in
+  line (and reads the clock): a button for a window gone is removed from
+  its tree (its node id names nothing after), one for a new window added.
+  A launcher item brings them in line itself, before its request is
+  answered, so `ui tree` after `ui invoke` shows the new window's button.
 - **The clock** polls the RTC every 1000 ms and redraws the label when the
   minute changes, damaging only its bounds (the toolkit's per-widget
   damage: a minute's change adds the label's rectangle to `desktop
@@ -4008,11 +4012,34 @@ close, and the demos in windows of their own. All of it is built with
   minimized gets it). `Wm::restore` brings it back raised and focused, and
   `Wm::focus` on a minimized window restores it. `windows` shows it
   (`minimized yes`); its root takes `minimize` and `restore` (answered by
-  the compositor, printing the root's row; `restore` of a window that
-  isn't minimized, and `minimize` of one that is, refused).
-- **The demos in windows:** the launcher's `Mandelbrot` opens a window
-  drawn once by every CPU (`sched::scope` and `WindowHandle::bands_mut`,
-  below), then waiting for its close; `Life` opens a window stepping the
+  the compositor, printing the root's row; `ui invoke: window <id> is
+  minimized already` and `ui invoke: window <id> isn't minimized` when
+  there is nothing to do). A minimized window's commits queue no damage
+  (Life runs on, presenting nothing).
+- **`lumen-ui` for the shell:** `Stack`, the handle stacks are (only a
+  stack takes children); `Ui::remove` (a widget and all in it; its node
+  ids name nothing after, focus and a press on it dropped, what it covered
+  repainted); `Widget` is a slot and its generation: a freed slot is taken
+  again by a later widget under a new generation and a new node id (so
+  the taskbar's tree doesn't grow with every window opened, and an old
+  handle reads removed: `id` is `None`, its setters do nothing), the
+  layout sizing in reversed tree order rather than by slot; `menu` (its
+  items are sub-rows with node ids of their own, as a list's are, listed
+  only while it is expanded); `fixed_label`; `Ui::bar(pad)` (top widgets
+  across, centred in the bar's height, one `pin_right`, the others
+  hidden, bounds empty, where they would pass it); per-widget damage
+  (`take_damage`: `Nothing`, `All` after a move or a new palette, or the
+  rectangles of the widgets whose look changed, focus rings included;
+  `paint_in(clip)` paints exactly what `paint` does there; a randomized
+  host test repaints only the damage against a full repaint). The kernel's
+  `Toolkit::refresh` commits only those rectangles; `Toolkit::frame` (an
+  animation) commits everything; `Toolkit::with_palette(.., choose)` makes
+  the palette from each theme (`ui::taskbar_palette`).
+- **The demos in windows:** the launcher's `Mandelbrot` opens a 480x320
+  window drawn once by every CPU (`sched::scope` and
+  `WindowHandle::bands_mut`, below; its rows by CPU logged as `INFO
+  demo: mandelbrot window <id>: <n> CPUs in <ms> ms, rows by CPU: cpu0=<rows>
+  ...`), then waiting for its close; `Life` opens a window stepping the
   `gun` pattern ten times a second, focused or not (its waits are
   animating: it never settles), until it is closed. Closing either stops
   it. `mandelbrot` and `life` typed in a shell are as before (a canvas;

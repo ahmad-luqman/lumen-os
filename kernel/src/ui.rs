@@ -312,6 +312,9 @@ impl<A: App> Toolkit<A> {
                 for r in &rects {
                     self.app.ui_mut().paint_in(s, &mut self.text, &self.palette, *r);
                 }
+                // The app's frame over it again (what it draws outside the
+                // rectangles is committed with its next full paint).
+                self.app.paint_over(s);
                 h.commit(&rects);
             }
         }
