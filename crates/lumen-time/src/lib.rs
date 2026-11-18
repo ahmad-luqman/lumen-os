@@ -592,8 +592,10 @@ pub fn parse_stall(v: &str) -> Option<Stall> {
 
 /// The TSC ticks a stall of `ppm` (parts per million) of `ticks` lasts,
 /// rounded down: what `lumen.stall_*_windows=` spins at a window's end (of
-/// its run so far) or start (of the last one's), so a scenario's floor on the
-/// bound holds; `u64::MAX` past that.
+/// its run so far) or start (of the last one's). The scenarios' floor on the
+/// bound rests on it (`lumen_harness.calibration.stalled`): the window's gap
+/// holds this and its reads. `u64::MAX` if the product overflows a u64,
+/// which needs a run of over 2^60 ticks.
 pub fn stall_ticks(ticks: u64, ppm: u64) -> u64 {
     u64::try_from(u128::from(ticks) * u128::from(ppm) / 1_000_000).unwrap_or(u64::MAX)
 }
@@ -1495,7 +1497,7 @@ mod tests {
 
     #[test]
     fn a_stall_lasts_its_share_of_the_window() {
-        // #171's 1% timer stall on a 24,818,280-tick window, a 0.6% TSC one.
+        // 1% of a 24,818,280-tick run (#171's timer windows), 0.6% of 10,000,000.
         assert_eq!(stall_ticks(24_818_280, 10_000), 248_182);
         assert_eq!(stall_ticks(10_000_000, 6_000), 60_000);
         assert_eq!(stall_ticks(999_999, 1), 0, "rounded down");

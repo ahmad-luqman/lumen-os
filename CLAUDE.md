@@ -129,8 +129,10 @@ own PR that updates that doc first.
   reason is `guest-shutdown` (a triple fault's is `guest-reset`).
 - **Tests on a busy host.** A guest's clocks run on while the host stalls
   its vCPU, so a loaded laptop or CI runner adds time to anything timed
-  (measured in #139 and #171). A scenario or ktest asserts only what the
-  host can't change:
+  (measured in #139, #165, #170 and #171). A new or changed scenario or
+  ktest asserts only what the host can't change (older checks, such as
+  test_time's ceilings on unstalled calibrations, come in line when they
+  are next changed):
   - a floor (the printed bound is at least the injected stall);
   - a decision that follows from the numbers the kernel printed
     (`lumen_harness.calibration`);
@@ -359,7 +361,7 @@ own PR that updates that doc first.
   steadiness, the ones with the smallest bounds filling in, how far off a
   median can be for either rate, `tsc_error_ppm`, a window slow to read
   stretched, the verdict against each clock's tolerance, `within_bounds`,
-  the stall knobs' parser), tick/ns
+  the stall knobs' parser and `stall_ticks`, their share of a window), tick/ns
   conversion, timer counts, log time formats (`Stamp`, `Millis`),
   percentages and rates, one clock's reading placed between two reads of
   another and retaken while too wide (`Bracketed`, `first_narrow`: the

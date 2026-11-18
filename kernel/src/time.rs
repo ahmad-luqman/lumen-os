@@ -491,8 +491,8 @@ fn stall_window_ends(stall: Stall) -> impl FnMut(Pause) {
 /// The `lumen.stall_*_windows=<end ppm>[,<start ppm>]` value for `key`
 /// ([`lumen_time::parse_stall`], up to [`lumen_time::MOST_STALL_PPM`]), none
 /// without one. One that doesn't parse is warned about and ignored; one in
-/// effect is said once at INFO, not as a warning: the scenarios allow a
-/// `time` warning only from a calibration's verdict
+/// effect is said once at INFO, not as a warning: test_time's stall
+/// scenarios allow a `time` warning only from a calibration's verdict
 /// (`lumen_harness.calibration.no_other_warnings`).
 fn stall_from_cmdline(key: &str) -> Stall {
     let Some(v) = crate::cmdline::value(key) else { return Stall::default() };
