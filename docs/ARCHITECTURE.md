@@ -3205,15 +3205,16 @@ until a crash.
   part way through it (old rows below new ones for one frame); the
   commit's damage, queued after its last rows, makes the next pass draw it
   whole. An owner never waits for a present.
-- **Lent bands (#157):** the Mandelbrot window draws with every CPU.
-  #157 adds `sched::scope` (it joins every thread it started before
-  returning, `run_sized`'s argument applied to several threads) and
-  `WindowHandle::bands_mut(&mut self, n) -> [BandMut<'_>]`
-  (`split_at_mut`-style disjoint row bands, each with `row_mut` and `impl
-  lumen_gfx::Target`). Because `surface_mut` and `commit` take `&mut
-  self`, the compiler refuses a commit while bands are lent.
+- **Lent bands (#157):** the Mandelbrot window draws with every CPU:
+  `WindowHandle::bands_mut(rows)` lends its surface as disjoint row
+  bands (`lumen_gfx::BandMut`: `row_mut`, `impl lumen_gfx::Target`), and
+  `sched::scope` joins every thread it started before returning
+  (`run_sized`'s argument applied to several threads); see "The desktop
+  shell". Because the bands borrow the handle, as `surface_mut` and
+  `commit` take `&mut self`, the compiler refuses a commit while bands
+  are lent.
 - **Who may draw where:** an owner draws only into its own surface (its
-  client area); the frame (title bar, border, close box, later minimize)
+  client area); the frame (title bar, border, close and minimize boxes)
   is drawn by the compositor from `lumen-wm`'s geometry and the theme. The
   compositor alone writes the back buffer and, while the desktop is shown,
   the screen.
@@ -3262,9 +3263,8 @@ client area with, a window's first event and again after each switch).
   private to the compositor, `desktop status` and `theme`. A window's
   count is behind until its owner reads it, and `settled` needs every
   owner told of the last switch: a test after `theme` waits for the
-  owners' redraws too. Only windows hear a switch: something drawn
-  outside a window (#157's taskbar, if it isn't one) needs a count of its
-  own.
+  owners' redraws too. Only windows hear a switch, so #157's taskbar is
+  a window (a panel).
 
 - **Requests are never dropped under a desktop lock** (a dropped one
   answers and wakes its asker): `EventQueue::push_request` hands a refused
@@ -3359,12 +3359,19 @@ window (other buttons meanwhile are ignored); the owner decides, and
 `Wm::close` removes it. A press on the desktop or a border (or with
 another button on a title bar or close box) does nothing until every
 button is up (a press on a border first focuses and raises the window).
-Moves with no button held aren't delivered (no hover in M4).
+Moves with no button held aren't delivered (no hover in M4). A left
+press on the minimize box and its left release over it minimize the
+window (#157). A panel (#157, the taskbar) is frameless, in front of every
+other window, never focused or raised; "the front window" in the focus
+rules is the front one that is neither a panel nor minimized.
 
-- **API:** `Wm::new(w, h, Metrics::DESKTOP)`; `open` (in front, focused,
+- **API:** `Wm::new(w, h, Metrics::DESKTOP)`; `open` (in front of the
+  other windows, behind the panels, focused,
   clamped like a move, by the frame's whole width), `close`, `focus`
-  (raise and focus: the taskbar, `ui invoke <root> focus`) and `move_to`
-  (each `None` for a window not open), `pointer(Pointer)`,
+  (raise and focus: the taskbar, `ui invoke <root> focus`; it restores
+  a minimized window), `move_to`, `minimize` and `restore` (#157; each
+  `None` for a window not open, or not in that state), `open_panel`
+  (#157), `pointer(Pointer)`,
   `interrupt(Interruption::{Pause, Gap, KeyGap})`, `resume(baseline)`, and
   queries (`windows` back to front, `window`, `id(n)` for a number typed
   in `ui invoke` or read from `windows`, live windows only, `focused`,
@@ -3385,9 +3392,10 @@ Moves with no button held aren't delivered (no hover in M4).
   `after_overrun`, handled before the event).
 - **Geometry** (`Metrics::DESKTOP`): a 24-row title bar spanning the
   frame (the side borders' top rows are title bar), 1-pixel borders, a
-  16-pixel close box 4 pixels in from the right border; a moved frame
-  keeps its title bar's rows on the screen and at least 48 pixels of its
-  width (all of it, if narrower).
+  16-pixel close box 4 pixels in from the right border, the minimize box
+  (#157) as big, 4 pixels left of it; a moved frame
+  keeps its title bar's rows on the screen (above the panels' rows) and at
+  least 48 pixels of its width (all of it, if narrower).
 
 A model check runs random operations (opening, closing, focusing,
 moving, pointer events and clicks aimed at title bars, close boxes and
@@ -3769,8 +3777,8 @@ impl Role { pub fn actions(self) -> &'static [ActionKind]; }
 
   | Role | Value | Actions | Flags it may carry | Answered by |
   |---|---|---|---|---|
-  | `window` (a root) | none | `focus`, `close`; `minimize`, `restore` (#157) | `focused` | `focus`, `minimize`, `restore`: the compositor; `close`: the owner (a `Close` event) |
-  | `group` (a stack, the taskbar) | none | none | `disabled` | |
+  | `window` (a root) | none | `focus`, `close`, `minimize`, `restore` (#157) | `focused` | `focus`, `minimize`, `restore`: the compositor; `close`: the owner (a `Close` event) |
+  | `group` (a stack; the taskbar's root, #157) | none | none | `disabled` | |
   | `label` | `Text` | none | `disabled` | |
   | `button` | none | `press`, `focus` | `focused`, `disabled` | the owner |
   | `checkbox` | `Checked` | `press` (toggles), `focus` | `focused`, `disabled` | the owner |
@@ -3869,7 +3877,7 @@ meaning none (`kbd events`' mods) is an absent value, unquoted.
   | `id`, `title` | the window |
   | `x`, `y`, `w`, `h` | its frame, decoration included, in screen pixels |
   | `z` | 0 is the front |
-  | `focused`, `minimized` | `yes` or `no` (`minimized` is `no` until #157) |
+  | `focused`, `minimized` | `yes` or `no` |
   | `owner` | the thread that last read its events (its opener's until then) |
   | `lost` | events its queue dropped |
   | `keys` | key events its queue took (#153's scenarios check where keys went with it) |
@@ -3939,15 +3947,86 @@ actions. The same tree powers accessibility (a screen reader) and GUI
 tests (golden screenshots plus tree assertions). **X-ray mode** is an app
 (and an overlay) that reads the `Trace` capability.
 
-### The taskbar clock (#157)
+### The desktop shell (#157)
 
-A `label` named `Clock`, of a fixed size, that draws only inside its
-bounds. The desktop shell polls the RTC every 1000 ms and redraws the
-label when the minute changes, damaging only its bounds (a test checks
-the `rects` and `pixels` it adds in `desktop status`). Desktop goldens
-mask its bounds (from `ui tree`); `test_taskbar_clock_matches_rtc`
-accepts the minute of its first `date` minus 1 s, or polls until the label
-and `date` agree.
+The layer that makes the desktop something to play with: a taskbar along
+the bottom (a launcher, a button per window, a clock), minimize beside
+close, and the demos in windows of their own. All of it is built with
+`lumen-ui`, so it is in the automation tree too.
+
+- **The taskbar is a window, a panel.** `Wm::open_panel(title, frame)`
+  opens a frameless window (its frame is its client area: no title bar,
+  no border, no close box) that the window manager keeps in front of
+  every other window, never focuses and never raises: a press on it is an
+  implicit grab without a focus change (so clicking a taskbar button
+  doesn't take the focus from the window it is about), and keys never go
+  to it. It reserves its rows: windows are opened and moved (clamped) so
+  their title bar stays above it. Being a window, it gets what every
+  window gets: its first event and every switch's `Theme`, requests
+  (`ui invoke` on its buttons), its tree published, `settled`'s
+  conditions, `desktop check`. The compositor opens it when the desktop
+  first starts, after the demo windows: 32 rows high, across the
+  screen's whole width, at its bottom, titled `Taskbar`. `windows`
+  doesn't list it (it is the desktop's, like the frames) and `desktop
+  status`'s `windows` doesn't count it; `ui tree` lists it, its root a
+  `group` named `Taskbar` (no actions) under its own window number. It
+  takes one of the `MAX_WINDOWS` (32) slots. A `Desktop::without_screen`
+  (the ktests' desktop) has none.
+- **What is on it** (left to right; the taskbar's colours, `taskbar` and
+  `taskbar_text`, through the toolkit's palette choice):
+  - a `menu` named `Launcher`: `press` (or a click) toggles it
+    (`expanded`); expanded, its `menuitem`s follow it: `Terminal`,
+    `Mandelbrot`, `Life` and `Counter`, each opening that window and
+    folding the menu again;
+  - one `button` per window (named by its title, in the order they were
+    opened): a click or `press` restores it if minimized, then raises and
+    focuses it;
+  - at its right end a `label` named `Clock`, of a fixed size (its
+    neighbours never move when it changes), showing the RTC's time as
+    `HH:MM`.
+- **Its owner**, the `taskbar` thread, waits with
+  `wait_event_until(the next second, Animating::No)` (so it settles
+  between polls). The desktop wakes it through its `Waker` when its
+  windows change (one opened, closed, minimized or restored, or the
+  focus moved), and it rebuilds its buttons: a button for a window gone is
+  removed from its tree (its node id names nothing after), one for a new
+  window added.
+- **The clock** polls the RTC every 1000 ms and redraws the label when the
+  minute changes, damaging only its bounds (the toolkit's per-widget
+  damage: a minute's change adds the label's rectangle to `desktop
+  status`'s `rects` and its pixels to `pixels`, a test checks).
+  `desktop tick` (for the tests) moves the clock's minute ahead by one now
+  (a skew on its readings from then on), so a test needn't wait for a
+  real minute. Desktop goldens mask its bounds (from `ui tree`);
+  `test_taskbar_clock_matches_rtc` (no skew) accepts the minute of its
+  first `date` minus 1 s, or polls until the label and `date` agree.
+- **Minimize:** a minimize box (`Metrics::minimize_box`: the close box's
+  size, `close_margin` left of it, drawn as a bar) beside the close box. A
+  left press on it and its left release over it minimize the window
+  (`Wm::minimize`): it leaves the screen (not drawn, not hit), keeps its
+  place and size, and loses the focus (the front window that isn't
+  minimized gets it). `Wm::restore` brings it back raised and focused, and
+  `Wm::focus` on a minimized window restores it. `windows` shows it
+  (`minimized yes`); its root takes `minimize` and `restore` (answered by
+  the compositor, printing the root's row; `restore` of a window that
+  isn't minimized, and `minimize` of one that is, refused).
+- **The demos in windows:** the launcher's `Mandelbrot` opens a window
+  drawn once by every CPU (`sched::scope` and `WindowHandle::bands_mut`,
+  below), then waiting for its close; `Life` opens a window stepping the
+  `gun` pattern ten times a second, focused or not (its waits are
+  animating: it never settles), until it is closed. Closing either stops
+  it. `mandelbrot` and `life` typed in a shell are as before (a canvas;
+  refused in a terminal window).
+- **Lent bands:** `lumen_gfx::Surface::bands_mut(rows)` splits a surface
+  into disjoint bands of `rows` rows (`BandMut`: `row_mut`, `impl
+  Target`), `WindowHandle::bands_mut` lends the owner's surface's, and
+  `sched::scope(|s| ..)` runs threads (`Scope::spawn_on(cpu, name, f)`,
+  `f` borrowing from the caller) and joins every one before it returns.
+  The Mandelbrot window deals the bands round-robin to the CPUs whose
+  scheduler runs (the caller drawing slot 0, and the slot of a CPU whose
+  thread couldn't be spawned), then commits the whole surface once they
+  are joined; because the bands borrow the handle, no commit can happen
+  while one is lent.
 
 ### Screenshot (#150)
 
