@@ -1,8 +1,8 @@
-//! #157's additions against the fixed-width fake text: removal (slots
-//! never reused), menus and their items, the fixed-size label, bars (a
-//! pinned widget, the rest hidden past it), and per-widget damage, checked
-//! by a randomized model: repainting only the damage gives the pixels of
-//! repainting everything.
+//! #157's additions against the fixed-width fake text: removal (a freed
+//! slot taken again under a new generation), menus and their items, the
+//! fixed-size label, bars (a pinned widget, the rest hidden past it), and
+//! per-widget damage, checked by a randomized model: repainting only the
+//! damage gives the pixels of repainting everything.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -40,7 +40,7 @@ fn names(ui: &Ui) -> Vec<(Role, String)> {
 }
 
 #[test]
-fn a_removed_widget_names_nothing_and_its_slot_is_never_reused() {
+fn a_removed_widget_names_nothing_and_reads_empty() {
     let mut ui = Ui::new();
     let row = ui.hstack(None, "Row");
     let a = ui.button(Some(row), "A");
@@ -91,7 +91,7 @@ fn a_removed_widget_names_nothing_and_its_slot_is_never_reused() {
     assert_eq!(ui.text(c), None);
     assert_eq!(ui.invoke(c_id, &Action::SetValue(String::from("y"))), Err(InvokeError::NoNode));
     assert_eq!(names(&ui), [(Role::Group, String::from("Row")), (Role::Button, String::from("A"))]);
-    // A new widget takes a new slot and a new id.
+    // A new widget: a new handle (its slot maybe a freed one) and a new id.
     let d = ui.button(Some(row), "D");
     assert!(d != b && d != c && d != inner.widget());
     assert!(ui.id(d).expect("not removed").get() > c_id);
