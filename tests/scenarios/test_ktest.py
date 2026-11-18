@@ -170,12 +170,13 @@ def test_in_kernel_tests_pass(boot):
     check_clock_diags(report, out)
 
 
-# The ktests whose claims are tight to the boot's calibration (its TSC rate,
-# the timer's, the tick): time's and the scheduler's (others use it, if at
-# all, against loose bounds or the same clock on both sides). The stalled
+# The modules holding the ktests whose claims are tight to the boot's
+# calibration (its TSC rate, the timer's, the tick): time and the scheduler
+# (others use it, if at all, against loose bounds or the same clock on both
+# sides). The stalled
 # runs run only these (`lumen.ktest=`): the claim is about them, and the
 # rest would only meet a busy host three times per CI run instead of once
-# (#183 was found that way).
+# (#183 failed there first).
 CALIBRATION_KTESTS = ("lumen_kernel::time::", "lumen_kernel::sched::")
 
 
@@ -185,13 +186,14 @@ CALIBRATION_KTESTS = ("lumen_kernel::time::", "lumen_kernel::sched::")
 def test_in_kernel_tests_pass_with_calibrations_stalled_within_tolerance(boot, key, ppm):
     # Every check moves together (#139): a boot whose calibration filled in
     # (each window's end stalled, so none steady) but stayed within its
-    # tolerance logs no warning, and every ktest that compares a measurement
-    # with the boot's calibration still passes, as do the clock diagnostics'
-    # bounds. The TSC at 0.6% (under its 1%); the timer at 1.2%, which with
+    # tolerance logs no warning, and the ktests whose claims are tight to the
+    # boot's calibration (`CALIBRATION_KTESTS`) still pass, as do the clock
+    # diagnostics' bounds. The TSC at 0.6% (under its 1%); the timer at 1.2%, which with
     # the TSC's bound is still under its 2% but leaves its rate about 1.2% off
     # (a ktest budgeting the calibration 1% fails here). At risk on a busy
-    # host (CLAUDE.md, "Tests on a busy host"): its own stalls can take the
-    # boot past its tolerance, which this claim doesn't cover.
+    # host (CLAUDE.md, "Tests on a busy host"): the host's own stalls, on top
+    # of the injected one, can take the boot's calibration past its
+    # tolerance, which this claim doesn't cover.
     name = {"tsc": "tsc", "timer": "local APIC timer"}[key]
     only = ",".join(CALIBRATION_KTESTS)
     out, report = finished(
@@ -223,9 +225,11 @@ def test_a_ktest_filter_that_selects_nothing_fails(boot):
     # plan alone is TAP's "skip all", which would read as a pass).
     m = boot_ktests(boot, cmdline="lumen.ktest=lumen_kernel::no_such_module::")
     code = m.wait_exit(120)
-    report = tap.parse(m.output)
-    assert report.planned == 0 and not report.cases, report.summary()
-    assert re.search(
-        r"^# ktest: only lumen_kernel::no_such_module::: 0 of \d+$", m.output, re.MULTILINE
-    )
+    out = m.output
+    assert code != EXIT_CRASH, out[out.find("==== LUMEN CRASH REPORT") :]
+    report = tap.parse(out)
+    assert report.planned == 0 and not report.cases, (report.summary(), out[-2000:])
+    said = r"^# ktest: only lumen_kernel::no_such_module::: 0 of \d+$"
+    assert re.search(said, out, re.MULTILINE), out[-2000:]
+    assert "# ktest: no test selected, a failure\n" in out, out[-2000:]
     assert code == EXIT_FAILURE, f"QEMU exit {code}, expected {EXIT_FAILURE}"

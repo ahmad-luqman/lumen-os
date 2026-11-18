@@ -4291,7 +4291,7 @@ kernel. The kernel is the trusted computing base.
 | Harness itself | self-tests that the TAP parser, audit and image diff catch failures, and that the QEMU command line, artifact layout, CI wiring and status generation behave | `tests/harness` |
 | Feature gate | every feature in `tests/features/*.toml` must pass (CI); `docs/STATUS.md` generated from the same data | `make status-check`, `make status` |
 
-QEMU exit codes: 33 = tests passed, 35 = a test failed, 37 = crash report.
+QEMU exit codes: 33 = tests passed, 35 = a test failed (or `lumen.ktest=` selected none), 37 = crash report.
 A triple fault exits with 0 (`-no-reboot`) and therefore fails; the power-off
 scenario alone accepts 0, with a QMP `SHUTDOWN` event whose reason is
 `guest-shutdown`. Each scenario

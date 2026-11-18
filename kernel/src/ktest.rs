@@ -5,7 +5,8 @@
 //! adding a test never means editing a shared list (important when several
 //! agents add tests in parallel). With `--features ktest` the kernel runs
 //! every test after boot (or those `lumen.ktest=` selects), prints TAP
-//! version 14 over serial, and exits QEMU with `Success` or `Failure`.
+//! version 14 over serial, and, with `lumen.qemu_exit`, exits QEMU with
+//! `Success` or `Failure` (else halts).
 //!
 //! A test returns `Ok(())` or `Err(reason)`. A panic or CPU exception inside a
 //! test is caught by the crash reporter, which exits with `Crash`; the harness
@@ -107,9 +108,10 @@ fn registered() -> &'static [KTest] {
 }
 
 /// Is the test `name` run, with `lumen.ktest=` set to `only` (a
-/// comma-separated list of name prefixes, each ending in `::` to mean a
-/// module, e.g. `lumen_kernel::time::,lumen_kernel::sched::`; without it,
-/// every test)? An empty item (a stray comma) matches no test, so a bare
+/// comma-separated list of name prefixes, e.g.
+/// `lumen_kernel::time::,lumen_kernel::sched::`; without it, every test)? A
+/// prefix should end in `::` to mean a whole module: `lumen_kernel::time`
+/// would also select a `lumen_kernel::timer`. An empty item (a stray comma) matches no test, so a bare
 /// `lumen.ktest=` selects none.
 #[cfg(feature = "ktest")]
 fn selected(name: &str, only: Option<&str>) -> bool {
@@ -118,8 +120,8 @@ fn selected(name: &str, only: Option<&str>) -> bool {
 
 /// Run every registered test, or only those `lumen.ktest=` selects (for a
 /// scenario that checks only some, so the rest don't run under conditions
-/// they don't claim to hold up in). Returns true if all passed; false if
-/// any failed or none was selected.
+/// they don't claim to hold up in). Returns true if at least one test ran
+/// and every one that ran passed.
 #[cfg(feature = "ktest")]
 pub fn run_all() -> bool {
     let only = crate::cmdline::value("lumen.ktest");
@@ -146,11 +148,14 @@ pub fn run_all() -> bool {
         }
     }
     let _ = writeln!(out, "# ktest: {} passed, {} failed", count - failed, failed);
-    // After the results, so the TAP parser takes it for no test's
-    // diagnostic. A filter that selects nothing checks nothing: a failure.
+    // After the results, so `lumen_harness.tap` attaches them to no test.
     if let Some(prefixes) = only {
         let _ = writeln!(out, "# ktest: only {prefixes}: {count} of {}", all.len());
     }
+    if count == 0 {
+        let _ = writeln!(out, "# ktest: no test selected, a failure");
+    }
+    // A run that tests nothing checks nothing: a failure.
     count > 0 && failed == 0
 }
 
@@ -168,7 +173,7 @@ crate::ktest!(
         crate::kassert!(selected(name, Some("lumen_kernel::time::")));
         crate::kassert!(selected(name, Some("lumen_kernel::sched::,lumen_kernel::time::")));
         crate::kassert!(!selected(name, Some("lumen_kernel::sched::")));
-        // A prefix, not a part of the name.
+        // A prefix of the whole path, not a piece inside it.
         crate::kassert!(!selected(name, Some("time::")));
         crate::kassert!(!selected(name, Some("sleep")));
         // An empty item (a stray comma) matches no test, not every test.
