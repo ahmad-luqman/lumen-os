@@ -176,7 +176,6 @@ impl Text {
     /// `text`'s advance width at `px`, from the metrics alone (nothing
     /// rasterized): where [`Text::draw`]'s ink ends, give or take a glyph's
     /// side bearing.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "its first users are #156's widgets"))]
     pub fn measure(&self, text: &str, px: Px) -> u32 {
         self.font.face().measure(text, px).width
     }

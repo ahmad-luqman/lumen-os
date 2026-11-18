@@ -1,0 +1,12 @@
+[package]
+name = "lumen-ui"
+description = "no_std retained-mode toolkit for the Lumen desktop where every widget is an automation node: layout, hit testing, dispatch, painting, the automation tree, invoke and the reply slot, host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lumen-gfx.workspace = true
+
+[lints]
+workspace = true

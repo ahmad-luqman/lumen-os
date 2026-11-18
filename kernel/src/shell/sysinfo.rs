@@ -53,16 +53,22 @@ fn busy(cpu: usize, ticks: CpuTicks) -> Value {
 }
 
 /// `n` as a table's number (absent, `-`, past `i64::MAX`).
-fn int(n: impl TryInto<i64>) -> Value {
+pub fn int(n: impl TryInto<i64>) -> Value {
     n.try_into().map_or(DASH, Value::Int)
 }
 
-fn text(s: &str) -> Value {
+pub fn text(s: &str) -> Value {
     Value::Text(String::from(s))
 }
 
+/// `s` as a text cell, or the absent value if it is `-` (a text `-` would
+/// print quoted, since records quote a cell that reads as absent).
+pub fn text_or_dash(s: String) -> Value {
+    if s == "-" { DASH } else { Value::Text(s) }
+}
+
 /// No value, printed `-`.
-const DASH: Value = Value::Absent("-");
+pub const DASH: Value = Value::Absent("-");
 
 /// What makes a system command's records from its arguments: `None` if
 /// the command doesn't give records for these arguments (it runs as a
@@ -73,7 +79,7 @@ pub type MakeTable = fn(&[String]) -> Option<Result<pipe::Table, String>>;
 
 /// The system commands that give records in a pipeline (instead of their
 /// text), and the tables they give.
-pub const RECORDS: [(&str, MakeTable); 10] = [
+pub const RECORDS: [(&str, MakeTable); 11] = [
     ("cpus", |a| no_args(a, cpu_table)),
     ("desktop", crate::desktop::records),
     ("irqs", |a| no_args(a, vector_table)),
@@ -83,6 +89,7 @@ pub const RECORDS: [(&str, MakeTable); 10] = [
     ("mouse", mouse_records),
     ("sound", |a| no_args(a, crate::sound::table)),
     ("threads", |a| no_args(a, thread_table)),
+    ("ui", crate::ui::records),
     ("windows", crate::desktop::windows_records),
 ];
 
@@ -215,15 +222,16 @@ fn key_events_table(events: &[(lumen_input::Seq, lumen_input::KeyEvent)]) -> pip
             Value::Text(alloc::format!("{:?}", e.code)),
             text(action),
             typed,
-            Value::Text(mods_text(e.mods)),
+            mods_cell(e.mods),
             text(if e.after_drop { "yes" } else { "no" }),
         ]);
     }
     t
 }
 
-/// The modifiers as names joined by `+` (`shift+ctrl`), `-` for none.
-fn mods_text(m: lumen_input::Mods) -> String {
+/// The modifiers as names joined by `+` (`shift+ctrl`), absent (`-`) for
+/// none.
+fn mods_cell(m: lumen_input::Mods) -> Value {
     let names = [
         (m.is_shifted(), "shift"),
         (m.is_ctrl(), "ctrl"),
@@ -233,7 +241,7 @@ fn mods_text(m: lumen_input::Mods) -> String {
         (m.numlock(), "num"),
     ];
     let on: Vec<&str> = names.iter().filter(|(on, _)| *on).map(|(_, n)| *n).collect();
-    if on.is_empty() { String::from("-") } else { on.join("+") }
+    if on.is_empty() { DASH } else { Value::Text(on.join("+")) }
 }
 
 /// Write a table (or why there is none) to the console, as text.
@@ -663,13 +671,13 @@ fn mouse_table_of(bound: Option<&crate::mouse::Bound>) -> pipe::Table {
     let row = match bound.and_then(|b| b.state.map(|s| (s, b.stale))) {
         Some((s, stale)) => {
             let pointer = if failed.is_some() {
-                "-"
+                DASH
             } else if crate::term::screen_size().is_none() {
-                "none"
+                text("none")
             } else if crate::term::pointer_drawn().is_some() {
-                "drawn"
+                text("drawn")
             } else {
-                "hidden"
+                text("hidden")
             };
             vec![
                 device,
@@ -679,7 +687,7 @@ fn mouse_table_of(bound: Option<&crate::mouse::Bound>) -> pipe::Table {
                 int(s.total_presses()),
                 int(s.wheel),
                 int(s.hwheel),
-                text(pointer),
+                pointer,
                 text(if stale { "yes" } else { "no" }),
                 failed_cell,
             ]
@@ -943,18 +951,21 @@ crate::ktest!(
         use crate::kassert;
         let events = [String::from("events")];
         let status = [String::from("status")];
+        let tree = [String::from("tree")];
         for (name, make) in RECORDS {
             // Each with no arguments, `events` for the two that take it
-            // (`kbd` gives records only for that) and `status` for
-            // `desktop`. Without a device the events are its line instead
-            // (the ktest machine has no tablet), and without a desktop (the
-            // test kernel starts none) `windows` says so.
-            for args in [&[][..], &events[..], &status[..]] {
+            // (`kbd` gives records only for that), `status` for `desktop`
+            // and `tree` for `ui`. Without a device the events are its line
+            // instead (the ktest machine has no tablet), and without a
+            // desktop (the test kernel starts none) `windows` and `ui tree`
+            // say so.
+            for args in [&[][..], &events[..], &status[..], &tree[..]] {
                 let Some(table) = make(args) else { continue };
                 let table = match table {
                     Ok(table) => table,
                     Err(e) if name == "mouse" && e == NO_TABLET => continue,
                     Err(e) if name == "windows" && e == "windows: no desktop" => continue,
+                    Err(e) if name == "ui" && e == "ui tree: no desktop" => continue,
                     Err(_) => return Err("a records error"),
                 };
                 let rows = table.rows().len();
@@ -1024,7 +1035,7 @@ crate::ktest!(
         let row = &table.rows()[0];
         kassert_eq!(row[0], Value::Text(String::from("0000:00:03.0")));
         kassert_eq!((row[1].clone(), row[2].clone(), row[4].clone()), (Value::Int(5), Value::Int(6), Value::Int(3)));
-        kassert_eq!(row[7], text("-"));
+        kassert_eq!(row[7], DASH);
         kassert_eq!(row[8], text("yes"));
         kassert_eq!(row[9], text("FAILED"));
         // Without a tablet: one row of dashes.

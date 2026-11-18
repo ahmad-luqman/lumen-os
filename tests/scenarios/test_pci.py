@@ -19,6 +19,7 @@ warning and the reason in `lspci`'s header. The decoding itself is host-tested (
 """
 
 import re
+import shlex
 import socket
 
 import pytest
@@ -121,7 +122,8 @@ def lspci_rows(m: Machine) -> dict[str, tuple[int, int, str, str, str]]:
     assert re.fullmatch(r"  addr\s+vendor\s+device\s+class\s+name\s+driver", lines[1]), out
     rows = {}
     for line in lines[2:]:
-        addr, vendor, device, cls, name, driver = re.split(r"\s{2,}", line.strip())
+        # A cell with a space (a name, the driver) comes quoted: split as words.
+        addr, vendor, device, cls, name, driver = shlex.split(line)
         assert re.fullmatch(r"0x[0-9a-f]{4}", vendor) and re.fullmatch(r"0x[0-9a-f]{4}", device), (
             line
         )
@@ -139,7 +141,8 @@ def pci_address(d: dict) -> str:
     return f"0000:{d['bus']:02x}:{d['slot']:02x}.{d['function']:x}"
 
 
-MSIX_ROW = re.compile(r"^  (0x[0-9a-f]{2})\s+msix (\S+) #(\d+)\s+(\d+)$", re.MULTILINE)
+# The use cell has spaces, so it comes quoted.
+MSIX_ROW = re.compile(r'^  (0x[0-9a-f]{2})\s+"msix (\S+) #(\d+)"\s+(\d+)$', re.MULTILINE)
 
 
 def msix_rows(m: Machine) -> dict[str, tuple[int, int, int]]:
@@ -217,7 +220,7 @@ def test_lspci_records_filter(boot):
     rows = lspci(m)
     assert run(m, "lspci | where vendor = 0x1af4 | count") == "3\n"
     out = run(m, "lspci | where vendor = 0x1af4 | select name addr")
-    picked = re.findall(r"^  (virtio \w+)\s+(\S+)$", out, re.MULTILINE)
+    picked = re.findall(r'^  "(virtio \w+)"\s+(\S+)$', out, re.MULTILINE)
     assert sorted(picked) == sorted(
         (name, addr) for addr, (vendor, _, _, name) in rows.items() if vendor == VIRTIO_VENDOR
     ), out
@@ -229,7 +232,7 @@ def test_lspci_records_filter(boot):
     out = run(m, "lspci | select addr class name")
     lines = out.splitlines()
     assert lines[0].split() == ["addr", "class", "name"], out
-    assert [re.split(r"\s{2,}", line.strip()) for line in lines[1:]] == [
+    assert [shlex.split(line) for line in lines[1:]] == [
         [addr, cls, name] for addr, (_, _, cls, name) in rows.items()
     ], out
     bridges = sum(1 for _, _, cls, _ in rows.values() if "bridge" in cls)

@@ -164,15 +164,20 @@ own PR that updates that doc first.
   `desktop.rs`: the desktop (#153): the `compositor` thread (the back buffer, damage-only presents, the
   pointer drawn on the screen only, both input rings through `lumen_wm::Wm`, the cut), windows
   (`open_window`, `open_window_at`, `WindowHandle`: an owner's surface and a committed one, `commit`,
-  `next_event`/`wait_event`/`wait_event_until`, a `Waker` for another thread,
-  `Desktop::without_screen` for the ktests), the two demo windows, `desktop` (`status`, `check`, `spin`,
-  `hold`/`release`) and `windows`; `lumen.desktop_cut_delay_ms=` widens the race at a pause for the scenarios;
+  `next_event`/`wait_event`/`wait_event_until`, a `Waker` for another thread, `Desktop::without_screen` for the
+  ktests; `publish`: a toolkit's tree), each window's root node, the two demo windows, `desktop` (`status`,
+  `check`, `spin`, `counter`, `hold`/`release`) and `windows`, and the tree's accessors for `ui.rs`
+  (`tree_rows`, `find_node`, `push_request`: a refused request handed back);
+  `lumen.desktop_cut_delay_ms=` widens the race at a pause for the scenarios;
   the look (#154): titles and the demos' text in the UI font (`font::Text`), the embedded
   wallpaper (`assets/wallpaper/lumen.png`, made by `tools/wallpaper.py`; decoded once a boot at
   the first start, a flat colour and one warning if it doesn't), and the themes (`ThemeId`;
   `theme light|dark`, `lumen.theme=`: a switch damages the whole screen and tells each owner; a
   window's first event is `WindowEvent::Theme`; owners redraw on it with `WindowHandle::theme()`,
-  and every wait goes through `Window::wait`, which wakes for `has_event()`). `termwin.rs`: terminal windows (#155): `terminal` opens one, its
+  and every wait goes through `Window::wait`, which wakes for `has_event()`). `ui.rs`: the toolkit in a window
+  (#156: `Toolkit<A: lumen_ui::App>`, one step per event that publishes before it answers, its palette from the
+  `Theme` it is handed, its text `font::Text`), `ui invoke`'s `Request` (its reply slot; `start` gives the
+  `Started` that answers; either answers for itself if dropped), Counter's owner, and `ui tree`/`ui invoke`. `termwin.rs`: terminal windows (#155): `terminal` opens one, its
   owner thread (`terminal`: draws the grid, hands keys over, blinks the focused one's cursor) and its shell
   (`term-shell`, `shell::run_in_window` on a closable console), joined on close; `term text <window>`. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
@@ -272,13 +277,24 @@ own PR that updates that doc first.
   `EventQueue` of `Entry`s (key events through `KeyLike`, which
   `lumen_input::KeyEvent` implements; pointer events (`Pointer::from_read`
   carries a ring read's gap, #151),
-  requests; sticky `Lost`/focus/`Close` flags delivered in place and never
+  requests, a refused one handed back by `push_request` and the queued
+  ones returned by `kill`; sticky `Lost`/focus/`Close` flags delivered in place and never
   pushable, presses, moves and requests rationed past 48 of 64, releases
   only after their press, unpaired releases counted apart: keys, buttons
   forgotten, buttons never pressed), `deliver` (a `Delivery` onto its
   window's queue) and the light and dark `Theme`s (host-tested, incl. a
   randomized model of damage-only repainting with focus, and
   press-pause-resume-release through the queue).
+- `crates/lumen-ui`: the desktop's toolkit (#156): a retained widget tree
+  (`Ui`: stacks, labels, buttons, checkboxes, text fields, lists; layout,
+  hit testing, dispatch, painting through a `Text` trait, `FixedText` for
+  tests), every widget an automation node (`NodeId` from one counter,
+  `Role` with its actions, value kind and flags, `Value`, `Action`,
+  `StateFlags`, `AutomationNode`), `Ui::invoke` through the click's own
+  handler, `App` (`ui_mut`, `apply`, `paint_over`) and `serve` (a request run on an app, what to answer),
+  `Reply` (`ui invoke`'s reply slot, its state private: pending, running,
+  cancelled, done, taken) and `counter` (the demo app's logic)
+  (host-tested).
 - `crates/lumen-input`: pointer input: evdev events into whole-frame
   pointer states, axes scaled to the screen (`Tablet`, `AbsAxis`), the
   buttons held (`Buttons`, one bit per `Button`: the one button set the
@@ -332,7 +348,8 @@ own PR that updates that doc first.
 - `crates/lumen-shell`: shell core: word splitting with quotes (checked
   against `shlex`; commands split at `|`), the line editor (history,
   completion; ANSI and plain output), the command table (names, completion
-  words, usage and help lines), pipelines (text or records in tables, the
+  words, usage and help lines), pipelines (text or records in tables, a
+  cell that wouldn't read back as one word printed quoted (`quoted`); the
   filters `grep`, `where`, `sort`, `first`, `count`, `select`), serial
   bytes to keys, a key press to the line editor's key (`Key::from_press`,
   shared by text mode and terminal windows), `Key::Closed`/`Event::Closed`
@@ -383,7 +400,9 @@ own PR that updates that doc first.
   `pointer_down`/`pointer_up`, `drag` against `mouse`'s frames and state,
   `confirmed_keys`/`type_confirmed` against `kbd`'s presses, bytes and
   held keys, `KEY_BYTES` the keys it models; the desktop's `windows`,
-  `desktop_status`, `wait_settled`, `desktop_check`, `settled_screendump`),
+  `desktop_status`, `wait_settled`, `desktop_check`, `settled_screendump`;
+  the automation tree's `ui_tree`, `node`, `wait_ui`, `invoke`,
+  `desktop_counter`; `parse_records` reads quoted cells with `shlex`),
   `screenshot.py` (`screenshot`'s frame read back and checked;
   `Machine.screenshot_via_serial`),
   `shell.py` (`run`: a serial command's output, the log's lines taken out

@@ -245,7 +245,17 @@ impl View {
             WindowEvent::Lost => {}
             // No mouse in a terminal yet.
             WindowEvent::PointerDown { .. } | WindowEvent::PointerMove { .. } | WindowEvent::PointerUp { .. } => {}
-            WindowEvent::Request(r) => match r {},
+            // A terminal window publishes no nodes: `ui invoke` reaches only
+            // its root, whose `focus` the compositor answers and whose
+            // `close` comes as `Close`, so no widget request can arrive.
+            // One that does is answered as `ui invoke` answers a node it
+            // can't find, never dropped (a dropped request would answer
+            // "closed before it ran").
+            WindowEvent::Request(req) => {
+                if let Ok(started) = req.start() {
+                    started.finish(crate::ui::Answer::Ran(lumen_ui::Served::Error(lumen_ui::InvokeError::NoNode)));
+                }
+            }
         }
         false
     }

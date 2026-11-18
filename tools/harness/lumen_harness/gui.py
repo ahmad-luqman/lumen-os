@@ -57,8 +57,10 @@ until the step's deadline (its timeout, scaled by LUMEN_TIMEOUT_SCALE like
 from __future__ import annotations
 
 import re
+import shlex
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -237,7 +239,8 @@ def parse_mouse(out: str) -> PointerReport:
     if not header:
         raise AssertionError(f"mouse: a header this doesn't know:\n{out}")
     events, frames, ignored, dropped, overruns, held, failed = header.groups()
-    cells = re.split(r"\s{2,}", lines[2].strip())
+    # A cell with a space (buttons `left right`) comes quoted: split as words.
+    cells = shlex.split(lines[2])
     # device, x, y, buttons, presses, wheel, hwheel, pointer, stale, failed
     if len(cells) != 10:
         raise AssertionError(f"mouse: a row of {len(cells)} cells, not 10:\n{out}")
@@ -695,13 +698,23 @@ def type_confirmed(
 STARTED = "desktop: started (Alt+F1 shows the terminals)\n"
 
 
-def parse_records(out: str) -> list[dict[str, str]]:
+def parse_records(out: str, first: str | None = None) -> list[dict[str, str]]:
     """A records table as the kernel prints it (a header line of column
-    names, then a row per record; the values have no spaces): one dict per
-    row, column name to text."""
-    lines = [line.split() for line in out.splitlines() if line.strip()]
-    if not lines:
+    names, then a row per record, each split as the shell's words: a cell
+    that is empty, holds whitespace or is a text `-` comes double-quoted):
+    one dict per row, column name to text. With `first`, the header must
+    start with that column (so an error line isn't taken for a table)."""
+    text = [line for line in out.splitlines() if line.strip()]
+    if not text:
         raise AssertionError(f"no table in {out!r}")
+    # The header first, by plain words: an error line (`ui tree: no window
+    # 9`, or one with an apostrophe) is said as itself, not as a split error.
+    if first is not None and text[0].split()[:1] != [first]:
+        raise AssertionError(f"not a table starting with {first!r}:\n{out}")
+    try:
+        lines = [shlex.split(line) for line in text]
+    except ValueError as e:
+        raise AssertionError(f"a row that doesn't split as words ({e}):\n{out}") from e
     header, rows = lines[0], lines[1:]
     for row in rows:
         if len(row) != len(header):
@@ -711,27 +724,40 @@ def parse_records(out: str) -> list[dict[str, str]]:
 
 def desktop_status(m: Machine, allow: str | None = None) -> dict[str, str]:
     """`desktop status`'s one record."""
-    rows = parse_records(run(m, "desktop status", allow=allow))
+    rows = parse_records(run(m, "desktop status", allow=allow), "state")
     if len(rows) != 1:
         raise AssertionError(f"desktop status gave {len(rows)} records")
     return rows[0]
 
 
+def records_or_none(
+    m: Machine, line: str, first: str, allow: str | None = None
+) -> list[dict[str, str]]:
+    """`line`'s records (a table starting with column `first`), or none if
+    it says `<command>: no desktop`; any other line it says is an error."""
+    out = run(m, line, allow=allow)
+    if out.strip().endswith(": no desktop"):
+        return []
+    return parse_records(out, first)
+
+
+def one(rows: list[dict[str, str]], what: str, **want: str) -> dict[str, str]:
+    """The one row of `rows` whose columns have the values in `want`."""
+    found = [r for r in rows if all(r[k] == v for k, v in want.items())]
+    if len(found) != 1:
+        raise AssertionError(f"{len(found)} {what} in {rows}")
+    return found[0]
+
+
 def windows(m: Machine, allow: str | None = None) -> list[dict[str, str]]:
     """`windows`' rows, front to back (none without a desktop: it says so
     instead of a table)."""
-    out = run(m, "windows", allow=allow)
-    if out.strip() == "windows: no desktop":
-        return []
-    return parse_records(out)
+    return records_or_none(m, "windows", "id", allow)
 
 
 def window(m: Machine, title: str, allow: str | None = None) -> dict[str, str]:
     """The `windows` row titled `title` (exactly one)."""
-    found = [w for w in windows(m, allow) if w["title"] == title]
-    if len(found) != 1:
-        raise AssertionError(f"{len(found)} windows titled {title!r}")
-    return found[0]
+    return one(windows(m, allow), f"windows titled {title!r}", title=title)
 
 
 def wait_for[T](
@@ -753,8 +779,9 @@ def wait_windows(m: Machine, count: int, timeout: float = 30) -> list[dict[str, 
 def wait_settled(m: Machine, timeout: float = 30, allow: str | None = None) -> dict[str, str]:
     """Wait until `desktop status` says `settled yes` (every byte typed
     decoded, both input rings read, no damage gathered or pass running, no
-    commit under way, every window's queue empty with its owner waiting);
-    its record then. Poll for the effect a step should have first (a
+    commit under way, every window's queue empty with its owner waiting and
+    told of the last theme switch, no `ui invoke` request outstanding); its
+    record then. Poll for the effect a step should have first (a
     `windows` row, say): settling says nothing more is moving, not that
     the step happened."""
     return wait_for(
@@ -830,3 +857,101 @@ def settled_capture[T](
 def settled_screendump(m: Machine, name: str, tries: int = 5, allow: str | None = None) -> Path:
     """A screendump of a settled desktop (`settled_capture`); its path."""
     return settled_capture(m, lambda: m.screendump(name), tries, allow)
+
+
+# -- the automation tree (#156) ------------------------------------------------
+
+# kernel/src/ui.rs `invoke`'s lines (change them together).
+INVOKE_CANCELLED = "ui invoke: cancelled"
+INVOKE_LATE = "ui invoke: ran late"
+
+
+def ui_tree(
+    m: Machine, window: str | int | None = None, allow: str | None = None
+) -> list[dict[str, str]]:
+    """`ui tree [window]`'s rows: every node, depth first, each window's
+    root (depth 0) first, front to back; none without a desktop. Any other
+    error (`ui tree: no window 9`) fails."""
+    line = "ui tree" if window is None else f"ui tree {window}"
+    return records_or_none(m, line, "id", allow)
+
+
+def node(rows: list[dict[str, str]], role: str, name: str) -> dict[str, str]:
+    """The one row of `rows` with this role and name."""
+    return one(rows, f"{role} nodes named {name!r}", role=role, name=name)
+
+
+def desktop_counter(m: Machine) -> str:
+    """`desktop counter`: the id of its window (the toolkit's demo)."""
+    out = run(m, "desktop counter")
+    found = re.fullmatch(r"desktop counter: window (\d+)\n", out)
+    if found is None:
+        raise AssertionError(f"desktop counter said {out!r}")
+    return found[1]
+
+
+def wait_ui(
+    m: Machine,
+    what: str,
+    done: Callable[[list[dict[str, str]]], bool],
+    window: str | int | None = None,
+    timeout: float = 10,
+) -> list[dict[str, str]]:
+    """Wait until `ui tree [window]`'s rows satisfy `done`; the rows then."""
+    return wait_for(m, what, lambda: ui_tree(m, window), done, timeout)
+
+
+@dataclass(frozen=True)
+class Invoked:
+    """What `ui invoke` said: the node's row after the action, or a message
+    (a window closed, busy, an error); `late` if either came after the first
+    deadline (`ui invoke: ran late` above it), `retries` how many tries
+    before it were cancelled."""
+
+    row: dict[str, str] | None
+    message: str | None
+    late: bool = False
+    retries: int = 0
+
+
+def parse_invoke(out: str) -> Invoked | None:
+    """`ui invoke`'s output read: `None` for a request cancelled at its
+    deadline (to retry: it never ran), else what it said: a row or a
+    message, either after `ui invoke: ran late` (`late`)."""
+    lines = [line for line in out.splitlines() if line.strip()]
+    if lines and lines[0].startswith(INVOKE_CANCELLED):
+        return None
+    late = bool(lines) and lines[0] == INVOKE_LATE
+    body = lines[1:] if late else lines
+    if body and body[0].split()[:1] == ["id"]:
+        rows = parse_records("\n".join(body), "id")
+        if len(rows) != 1:
+            raise AssertionError(f"ui invoke gave {len(rows)} rows:\n{out}")
+        return Invoked(rows[0], None, late)
+    if late:
+        # Answered late with a message: a refusal, or its window closed.
+        if not body:
+            raise AssertionError(f"ui invoke ran late but said nothing more:\n{out}")
+        return Invoked(None, "\n".join(body).strip(), late)
+    return Invoked(None, out.strip())
+
+
+def invoke(
+    m: Machine,
+    node_id: str | int,
+    action: str,
+    *args: str,
+    tries: int = 5,
+    allow: str | None = None,
+) -> Invoked:
+    """`ui invoke <node> <action> [args]`: retried while cancelled at its
+    deadline (a cancelled request never ran, so a retry can't act twice);
+    "ran late" with its row or message counts as done (`Invoked.late`), and
+    `Invoked.retries` says how many were cancelled first."""
+    line = shlex.join(["ui", "invoke", str(node_id), action, *args])
+    for retries in range(tries):
+        got = parse_invoke(run(m, line, 10, allow=allow))
+        if got is not None:
+            return replace(got, retries=retries)
+        time.sleep(0.2)
+    raise AssertionError(f"{line} was cancelled {tries} times")

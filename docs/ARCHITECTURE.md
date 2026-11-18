@@ -1623,7 +1623,9 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   write holds the log's line lock with interrupts off): text as lines, a
   table as its
   headings and rows (two-space indent, columns two spaces apart and as
-  wide as the widest value, a left-aligned last one unpadded). Alone, a
+  wide as the widest value, a left-aligned last one unpadded; a text cell
+  that wouldn't read back as one word is double-quoted: section 11,
+  "Records quote"). Alone, a
   filter says it goes after a `|`. After a `|`, Tab completes only the
   filters' names.
 - **Tests:** `cargo:lumen-shell`; `test_shell` (echo with quotes on both
@@ -3091,14 +3093,18 @@ until a crash.
     reads it says `desktop check: the screen was taken back during the
     check`.
   - `desktop spin` (for the tests): opens a window whose owner commits a
-    changed frame (a pure green bar moving) every 20 ms and reads its
-    events.
+    changed frame (a pure green bar moving) every 20 ms above a toolkit
+    Stop button (which closes it: a request its queue can refuse as busy,
+    #156) and reads its events.
+  - `desktop counter` (#156): opens Counter, the toolkit's demo app (a
+    count, Add and Reset buttons, a Lock checkbox that disables Add, and
+    a Quit button that closes it; its logic is `lumen_ui::counter`).
   - `desktop hold <window>` and `desktop release <window>` (for the
     tests): a `desktop spin` window's owner stops, then resumes, reading
     its event queue (other windows refuse).
 
-  `desktop check`, `desktop spin`, `desktop hold` and `desktop release`
-  refuse while paused.
+  `desktop check`, `desktop spin`, `desktop counter`, `desktop hold` and
+  `desktop release` refuse while paused.
 
 - **`desktop status`**, one record (reading it doesn't wake the
   compositor): the desktop's columns under `COMPOSITOR`, the keyboard's
@@ -3120,7 +3126,7 @@ until a crash.
   | `ignored_presses` | presses not taken as presses on a window: made in an `after_overrun` event, or while buttons held across a pause or gap or at a resume (the first start included) were down |
   | `rationed`, `overflowed` | presses and moves dropped past a queue's 48 entries, and releases that didn't fit its 64 (each set `Lost`): their sum is `windows`' `lost`, totalled over every window, closed ones too |
   | `grab_ends` | grabs ended before their last button came up (their window closed or lost the focus, or input was interrupted) |
-  | `dead_pushes` | events and flags for a window that had closed: its queue's own count after it was killed, plus deliveries whose window is no longer on the list (0 today by construction: the list and `lumen-wm` change in one hold; kept for #156's requests) |
+  | `dead_pushes` | events and flags for a window that had closed: its queue's own count after it was killed, plus deliveries and `ui invoke` requests whose window is no longer on the list (a delivery: 0 by construction, the list and `lumen-wm` change in one hold; a request: one asked for as its window closed) |
   | `glyph_misses` | glyphs the compositor rasterized for the titles (its own glyph cache's misses, not the windows'): flat once every title's glyphs are cached; `-` with no UI font (#154) |
   | `glyphs_dropped` | glyphs any `font::Text` in the kernel left out because `lumen_gfx::Mask::new` refused their mask (a bug; the first warned about with its sizes) (#154) |
   | `wallpaper` | `shown`, or why not: `unreadable` (not a PNG, cut short, corrupt), `too-big`, `no-memory`, `none` (#154) |
@@ -3145,8 +3151,9 @@ until a crash.
   after the others, so a look never takes an owner mid-redraw for a
   waiting one; an animating wait, `desktop::Animating::Yes`, such as a
   focused terminal window's cursor blink, never sets it); and
-  no `ui invoke` request is `Pending` or `Running` (none exist until
-  #156; the `desktop check`/`screenshot` slot doesn't count). A test first polls for the effect it expects (a `windows` row,
+  no `ui invoke` request is outstanding (from its push to its asker's
+  end, answered or not; the `desktop check`/`screenshot` slot doesn't
+  count). A test first polls for the effect it expects (a `windows` row,
   a `ui tree` value), then calls the harness's `wait_settled(m)`
   (`tools/harness/lumen_harness/gui.py`, #153), and brackets each
   screendump between two `desktop status` reads with the same `frames`.
@@ -3218,13 +3225,15 @@ the same, but `None` once `deadline` passes, `time::now_ns`, or a
 `desktop::Waker` of the window, from `WindowHandle::waker()`, wakes it
 from another thread: a terminal window's shell has output to draw; see
 "Settling" below for `animating`) return
-`WindowEvent`s (the queue's request type is `desktop::Request`, an empty
-enum until #156 gives it variants, so no request can be queued yet): `Key(KeyEvent)`, `PointerDown`, `PointerMove`,
+`WindowEvent`s: `Key(KeyEvent)`, `PointerDown`, `PointerMove`,
 `PointerUp` (client coordinates and the buttons held), `FocusGained`,
 `FocusLost`, `Lost` (events for this window were dropped), `Close` (the
-close box, or `ui invoke <root> close`), `Request` (an automation
-request, #156) and `Theme(&'static Theme)` (#154: the theme to draw the
+close box, or `ui invoke <root> close`), `Request` (a `ui invoke`
+request, `crate::ui::Request`, #156: the node, the action and its reply
+slot; not `Clone`, and it answers "window closed" if dropped
+unanswered) and `Theme(&'static Theme)` (#154: the theme to draw the
 client area with, a window's first event and again after each switch).
+`WindowEvent` derives `Debug` only (owners match it with `matches!`).
 
 - **The theme reaches every owner, first.** `Theme` isn't a queue entry
   or a flag: each window keeps the count of theme switches its owner has
@@ -3250,6 +3259,15 @@ client area with, a window's first event and again after each switch).
   owners' redraws too. Only windows hear a switch: something drawn
   outside a window (#157's taskbar, if it isn't one) needs a count of its
   own.
+
+- **Requests are never dropped under a desktop lock** (a dropped one
+  answers and wakes its asker): `EventQueue::push_request` hands a refused
+  request back (`lumen_wm::Refused::Busy` past the ration, `Refused::Dead`
+  once the queue is dead), `desktop::push_request` does the same for a
+  window no longer on the list, and `EventQueue::kill` returns the
+  requests still queued; each is answered once the locks are released
+  (the asker prints "busy" or "window <id> closed", `WindowHandle`'s drop
+  answers "window closed").
 
 - **Sticky flags beside the queue.** `Lost`, `Close`, a focus loss and a
   focus gain are flags beside the queue (`set_lost`, `request_close`,
@@ -3425,13 +3443,14 @@ from what they compare.
 | Lock | Holds | Held for |
 |---|---|---|
 | `desktop::COMPOSITOR` | the window list (`lumen-wm`), the gathered damage, the requests, the statistics | a few list operations, a snapshot |
-| a window's lock | its committed surface, its event queue, its flags | 16 rows of a commit or a blit, one queue operation |
+| a window's lock | its committed surface, its event queue, its flags, its toolkit's published tree | 16 rows of a commit or a blit, one queue operation, putting a tree in place, copying a tree for `ui tree` or scanning it for a node |
+| a `ui invoke` reply's lock (`ui::ReplyCell`, #156) | the reply's state | one transition (a leaf: taken under its wait queue's lock by the asker's wake-up check, and never held across a wake) |
 | `vt::CUT` | the cut | a read or a write (a leaf) |
 | a terminal window's grid (#155) | its `Terminal` | a write of the shell's output, a drawing of what changed, a copy of its cells (a leaf: nothing taken or allocated under it) |
 | a terminal window's keys (#155) | the keys for its shell (at most 128) | a push or a pop (a leaf) |
 | a terminal window's `key_wait` | the shell waiting for a key | a wait or a wake (its predicate takes the keys' lock) |
 | `desktop::BOOT_WALLPAPER` | the embedded wallpaper's decode, once done (#154) | a read or a write of two `Arc`s (a leaf: nothing allocated or freed under it) |
-| `desktop::DONE`'s wait-queue lock | the threads waiting for an answer or for the compositor to catch up | a wake, or a wait's predicate, which takes `COMPOSITOR` (so this lock comes before it, and no wake is made holding `COMPOSITOR`) |
+| `desktop::DONE`'s wait-queue lock | the threads waiting for an answer, for the compositor to catch up, or for a window `ui invoke <root> close` closes (`close_window`) | a wake, or a wait's predicate, which takes `COMPOSITOR` (so this lock comes before it, and no wake is made holding `COMPOSITOR`) |
 | `term`'s screen lock | the terminals; and each row the compositor presents | one row of a present: at most 800 holds for a full present |
 
 - **Order:** `COMPOSITOR`, then a window's lock, then the heap's locks
@@ -3710,7 +3729,8 @@ pub enum ActionKind { Press, SetValue, Select, Focus, Close, Minimize, Restore }
 impl Role { pub fn actions(self) -> &'static [ActionKind]; }
 ```
 
-- **`lumen_ui::NodeId` is global** (always written qualified: the VFS's
+- **`lumen_ui::NodeId` is global** (always written qualified, the kernel's
+  `desktop.rs` included: the VFS's
   `NodeId`, section 9, is another type). `NodeId::fresh()` is one counter
   for the whole system and an id is never reused in a boot. Lookups go by
   the raw number (`NodeId::get()`): `ui invoke 12 press` looks up 12, and
@@ -3732,10 +3752,10 @@ impl Role { pub fn actions(self) -> &'static [ActionKind]; }
   | `label` | `Text` | none | `disabled` | |
   | `button` | none | `press`, `focus` | `focused`, `disabled` | the owner |
   | `checkbox` | `Checked` | `press` (toggles), `focus` | `focused`, `disabled` | the owner |
-  | `textfield` | `Text` | `set_value <text>`, `focus` | `focused`, `disabled` | the owner |
+  | `textfield` | `Text` | `set_value <text>` (replaces the text, as one edit, not keystrokes), `focus` | `focused`, `disabled` | the owner |
   | `list` | `Selected` | `focus` | `focused`, `disabled` | the owner |
   | `listitem` | none | `select`, `press` | `selected`, `disabled` | the owner |
-  | `menu` | none | `press` | `focused`, `disabled`, `expanded` | the owner |
+  | `menu` | none | `press`, `focus` | `focused`, `disabled`, `expanded` | the owner |
   | `menuitem` | none | `press` | `disabled` | the owner |
 
   Values print as the text, `checked`/`unchecked`, or the index (`-` for
@@ -3743,32 +3763,82 @@ impl Role { pub fn actions(self) -> &'static [ActionKind]; }
   focused widget inside it.
 - **Same path as a click:** an action runs the handler a real click or
   key reaches after hit testing, on the owner's thread (`cargo:lumen-ui`
-  checks `press` and a click give the same state). Errors change nothing:
-  a node that doesn't exist (or whose window closed), an action its role
-  doesn't list, a `disabled` node, wrong arguments, and "window <id> busy"
-  (its queue is full).
-- **A request is a reply slot** (`lumen_ui::Reply`), written once: from
-  `Pending` to `Running` (the owner, by compare-and-swap, when it takes
-  the request) or `Cancelled` (the asker, by compare-and-swap, at its 1 s
-  deadline), and from `Running` to `Done(result)`; each write wakes the
-  asker. The owner skips a cancelled request (`cancelled`). If the asker's
-  swap fails because the owner already runs it, the asker waits a second
-  1 s: a result then is printed as "ran late" with the row (`late`
-  counts it), and none gives "still running". Destroying the window
-  answers its `Pending` requests with "window closed"; a request dropped
-  unanswered answers itself the same way in its `Drop`; an action that
+  checks `press` and a click give the same state, and that every action a
+  widget's role lists reaches a handler). Errors change nothing. The
+  asker's own come first: no desktop, a node that doesn't exist (or whose
+  window closed), wrong arguments (`set_value` takes one, the others
+  none), an action a window's root doesn't take, "window <id> busy" (its
+  queue is full) and "window <id> closed". The owner's: an action its
+  role doesn't list, a `disabled` node, and a node it no longer has. An
+  action that ran and then lost its node answers that it ran (`ran; node
+  <n> is gone`), so a retry never acts twice.
+- **Publish before answering:** a toolkit window's owner hands each event
+  to its tree, then (if anything changed) repaints, commits and publishes
+  the tree, and only then answers a request (`ui::Toolkit::step`). So once
+  `ui invoke` returns, `ui tree` shows its effect, and a window its action
+  closed is gone (the request is answered after the handle is dropped).
+- **A request is a reply slot** (`lumen_ui::Reply`, its state private),
+  each transition made once and checked, under the reply's lock, against
+  the state it starts from: `Pending` to `Running` (the owner, when it
+  takes the request: `ui::Request::start` gives a `Started`, the only
+  thing that can answer it) or `Cancelled` (the asker, at its 1 s
+  deadline); `Pending` to `Done` (its window closed, or it was dropped,
+  before it ran); `Running` to `Done(result)`; `Done` to `Taken` (the
+  asker takes it). Each answer (`Done`) wakes the asker. The owner skips a
+  cancelled request; the asker counts it (`cancelled`). If the asker's
+  cancel fails because the owner already runs it, the asker waits a second
+  1 s: a result then is printed with "ran late" above its row or message
+  (`late` counts it), and none gives "still running" (its answer, if it comes,
+  lands for nobody: not counted). Destroying the window answers its
+  `Pending` requests with "window closed"; a request dropped before it ran
+  answers itself the same way in its `Drop`, and a `Started` dropped
+  unanswered answers "dropped while running" (a bug); an action that
   closed its own window (a Quit button) answers "ran; window <id>
   closed". So `ui invoke` always ends, and a retry after "cancelled"
   can't press twice. The harness's `invoke(m, node, action)` (`gui.py`,
-  #156) retries a cancelled request and takes "ran late" with its row as
-  success. `cargo:lumen-ui` checks that a request cancelled at its
+  #156) retries a cancelled request (counting the retries) and takes "ran
+  late" with its row, or with its message, as done. `cargo:lumen-ui` checks that a request cancelled at its
   deadline and then reached by the owner leaves the state unchanged.
 - **Reading the tree:** a toolkit window publishes a snapshot of its tree
-  after each change (built, then swapped in under the window's lock), so
-  `ui tree` reads it without asking the owner.
+  after each change (`WindowHandle::publish`: built by the owner, then
+  put in place under the window's lock), so `ui tree` reads it without
+  asking the owner. A
+  window's root's bounds are its client area.
+- **In the kernel** (`kernel/src/ui.rs`): `ui::Toolkit` is a toolkit in a
+  window: the UI font through `lumen_ui::Text` (`font::Text` at
+  `TEXT_PX`, a glyph cache per owner thread: the desktop's one text path),
+  the palette from the `Theme` its window was handed, painting,
+  committing and publishing after a change, and the window's events handed
+  to the tree (the left button's press and release, key presses, focus;
+  `FocusLost` and `Lost` cancel an armed press). `ui::Toolkit<A:
+  lumen_ui::App>` is one step per event (above, "Publish before
+  answering"); `lumen_ui::serve` runs a request on the app (`Ui::invoke`,
+  the app's handling of what it reported, then the node's row, laid out
+  again, the error, "ran; node gone" or "closed its window"), the same
+  code the host tests run. `lumen_ui::Reply` is the state machine; the
+  kernel keeps it behind a lock with the asker's wait queue
+  (`ui::ReplyCell`). The palette starts from `WindowHandle::theme()` and
+  follows every `Theme` event (`ui::palette(&Theme)`, then
+  `Ui::invalidate()` repaints the whole tree): Counter's first event,
+  `Theme`, is its first draw (`desktop spin`'s window draws a frame of its
+  bar first, then reads its events). The harness's `ui_tree`, `node`, `wait_ui`,
+  `invoke`, `parse_invoke` and `desktop_counter` are in `gui.py`.
 
 **The commands** print records, so the pipelines work on them (`where`
-compares with `=`):
+compares with `=`). **Records quote** (every records command, from the
+shared printer, `lumen_shell::pipe::quoted`): a text cell that is empty,
+is exactly `-`, or holds whitespace, a quote (`'`, `"`), a backslash, a
+`#` or a control character prints double-quoted, with `"` and `\` escaped
+by a backslash (the only escapes both the shell's splitter and POSIX
+`shlex` take inside double quotes) and each control character printed as
+U+FFFD (neither has an escape for one). So every row reads back into its
+cells, as the shell's words or `shlex` split them (a randomized host test;
+the harness's `parse_records` uses `shlex`), and `where name = "File
+name"` works; a bare `-` is always an absent value. The cells it quotes
+today: `cpus`' "not started", `lspci`'s names, classes and drivers,
+`irqs`' uses ("local APIC timer", "msix <addr> #0"), `mouse`'s buttons
+("left right"), `sound`'s state, and `kbd events`' text (`"'a'"`); a `-`
+meaning none (`kbd events`' mods) is an absent value, unquoted.
 
 - `windows`, one row per window, front to back:
 
@@ -3792,7 +3862,7 @@ compares with `=`):
   | `id`, `window`, `depth` | the node, its window, 0 for a root |
   | `role`, `name`, `value` | as above (`-` without a value) |
   | `state` | the set flags joined by `,` (`-` for none) |
-  | `actions` | joined by `,` |
+  | `actions` | joined by `,` (`-` for none) |
   | `x`, `y`, `w`, `h` | its bounds in screen pixels |
 
   So `ui tree | where role = button` lists the buttons, and the bounds let
@@ -3802,7 +3872,21 @@ compares with `=`):
   it answers (`focus`, `minimize`, `restore`). A successful `close` prints
   `ui invoke: window <id> closed` (it succeeds only once the window is
   destroyed; an owner that keeps it open gives "window <id> still open" at
-  the deadline). On an error it prints why.
+  the deadline: `ui invoke: window <id> still open (its close is still
+  queued)`, since the owner reads it when it can and the window closes
+  then). On an error it prints why. Its other lines: `ui invoke: ran late`
+  above the row or message; `ui invoke: ran; window <id> closed`; `ui
+  invoke: ran; node <n> is gone`; `ui invoke: window <id> busy (try
+  again)`; `ui invoke: window <id> closed` (a widget's window closed as
+  it was asked); `ui invoke: no node <n>` (none, or its window closed,
+  from the asker or the owner); `ui invoke: no desktop`; `ui invoke:
+  cancelled: window <id> didn't take it in 1 s (try again)`; `ui invoke:
+  still running (window <id>)`; `ui invoke: window <id> closed before it
+  ran`; `ui invoke: dropped while running (window <id>): a bug`; and the
+  owner's other errors (`ui invoke: a label doesn't take press`, `the
+  node is disabled`) and the asker's (`wrong arguments ...`). `ui tree
+  <window>` with no such window says `ui tree: no window <n>`, and without
+  a desktop `ui tree: no desktop`.
 - **Records with arguments:** today `sysinfo::MakeTable` is `fn() ->
   pipe::Table`, and the ktest `records_come_from_commands_given_no_arguments`
   checks that every records command, given an argument it doesn't take,

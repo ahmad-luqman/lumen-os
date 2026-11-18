@@ -11,6 +11,7 @@ are ktests (`lumen_kernel::sound::*`).
 """
 
 import re
+import shlex
 import time
 
 import pytest
@@ -47,7 +48,7 @@ def sound_row(m: Machine) -> dict[str, str]:
     out = run(m, "sound | select " + " ".join(COLUMNS))
     header, row = out.splitlines()
     assert header.split() == COLUMNS, out
-    return dict(zip(COLUMNS, re.split(r"\s{2,}", row.strip()), strict=True))
+    return dict(zip(COLUMNS, shlex.split(row), strict=True))
 
 
 def wait_played(m: Machine, n: int, timeout: float = 30) -> dict[str, str]:
@@ -238,7 +239,7 @@ def test_play_honours_the_volume(boot):
 def test_lspci_shows_sound_bound(boot):
     m = shell(boot)
     out = run(m, "lspci | where name = 'virtio sound' | select driver")
-    assert out == "  driver\n  sound: bound\n", out
+    assert out == '  driver\n  "sound: bound"\n', out
     out = run(m, "sound")
     assert re.fullmatch(
         r"sound: virtio sound at \S+, stream 0: signed 16-bit, \d channels?, \d+ Hz, 20 ms periods\n"
@@ -266,7 +267,7 @@ def test_a_second_sound_device_is_declined(boot, tmp_path):
         ],
     )  # fmt: skip
     out = run(m, "lspci | where name = 'virtio sound' | select driver")
-    assert out == "  driver\n  sound: bound\n  no driver (sound declined it)\n", out
+    assert out == '  driver\n  "sound: bound"\n  "no driver (sound declined it)"\n', out
     declined = r"INFO  sound: \S+: another sound device is bound; Lumen plays on one\n"
     assert re.search(declined, m.output)
     assert len(re.findall(READY, m.output)) == 1

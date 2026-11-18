@@ -118,7 +118,7 @@ mod tests {
             assert_eq!(drain(&mut q), [want], "{d:?}");
         }
         // What a push did comes back.
-        q.kill();
+        let _ = q.kill();
         assert_eq!(deliver(&mut q, &mv), Some(Pushed::Dead));
     }
 

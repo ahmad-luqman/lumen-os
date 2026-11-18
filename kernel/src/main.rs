@@ -62,6 +62,7 @@ mod term;
 mod termwin;
 mod time;
 mod trace;
+mod ui;
 mod virtio;
 mod vt;
 
