@@ -247,6 +247,10 @@ pub fn run() -> ! {
 /// so (it goes on waiting).
 const SHELLS_WARN_AFTER_NS: u64 = 5_000_000_000;
 
+/// What the serial prompt's warning, when screen shells keep it waiting,
+/// starts with (after the level and target; the ktest waits for it).
+const HELD: &str = "serial prompt held: ";
+
 /// Wait until every screen shell that started is blocked waiting for its
 /// first key (`sched::yield_until_blocked`: by thread, not by counting the
 /// keyboard's waiters, so another waiter there can't stand in for one),
@@ -274,7 +278,7 @@ fn wait_for_screen_shells(shells: &[Option<crate::sched::JoinHandle>], warn_afte
     log::debug!(target: "shell", "serial prompt waits for {count} screen shell{plural} to wait for keys");
     let start = crate::time::now_ns();
     if !sched::yield_until_blocked(started(), Some(start + warn_after_ns)) {
-        log::warn!(target: "shell", "serial prompt held: {} not yet waiting for keys (still waiting)", NotBlocked(shells));
+        log::warn!(target: "shell", "{HELD}{} not yet waiting for keys (still waiting)", NotBlocked(shells));
         sched::yield_until_blocked(started(), None);
         let held_ms = (crate::time::now_ns() - start) / 1_000_000;
         log::info!(target: "shell", "serial prompt released after {held_ms} ms: every screen shell waits for keys");
@@ -318,15 +322,13 @@ crate::ktest!(
         // (test_ktest checks its text). So the warning fires while the
         // second isn't waiting, whatever a host stalls, and the wait goes
         // on: it returns only once both are blocked. Then they are woken and
-        // joined. (It used to sleep 30 ms instead: a stall before the
-        // wait's first look let the second block first, with no warning.)
+        // joined. (Not a fixed sleep: a stall before the wait's first look
+        // would let the second block first, with no warning.)
         use crate::sched::{self, JoinHandle, State, WaitQueue};
         use crate::{kassert, kassert_eq};
         use alloc::sync::Arc;
         use core::sync::atomic::{AtomicBool, Ordering};
-        /// What the warning starts with (kept in step with
-        /// `wait_for_screen_shells` by test_ktest's check of the line).
-        const WARNING: &[u8] = b"WARN  shell: serial prompt held: ";
+        let warning = alloc::format!("WARN  shell: {HELD}");
         let s = Arc::new((WaitQueue::new(), AtomicBool::new(false)));
         let saw_warning = Arc::new(AtomicBool::new(false));
         let (_, mark) = crate::klog::copy_recent(&mut []);
@@ -339,13 +341,19 @@ crate::ktest!(
         );
         shells[2] = Some(
             sched::spawn("waits-late", move || {
-                // Until a line logged since `mark` is the warning (up to 5 s).
+                // Until the warning is among the bytes logged since `mark`
+                // (up to 5 s, then one more look).
                 let deadline = crate::time::now_ns() + 5_000_000_000;
                 let mut recent = [0u8; 1024];
-                while crate::time::now_ns() < deadline {
+                loop {
+                    let late = crate::time::now_ns() >= deadline;
                     let (n, written) = crate::klog::copy_recent(&mut recent);
-                    if written > mark && recent[..n].windows(WARNING.len()).any(|w| w == WARNING) {
+                    let new = usize::try_from(written.saturating_sub(mark)).unwrap_or(usize::MAX).min(n);
+                    if recent[n - new..n].windows(warning.len()).any(|w| w == warning.as_bytes()) {
                         saw.store(true, Ordering::Release);
+                        break;
+                    }
+                    if late {
                         break;
                     }
                     assert!(sched::sleep(1_000_000), "a test thread couldn't sleep");

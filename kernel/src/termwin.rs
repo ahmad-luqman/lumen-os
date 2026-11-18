@@ -610,11 +610,16 @@ crate::ktest!(
         // restart `rhai`'s prompt), then the shell, so the owner's join
         // returns (bounded here): `rhai`'s REPL waiting for a line, `top`
         // polling for q between frames, a script in a loop (its Ctrl-C
-        // check). The window is busy while a command runs, not while the
-        // shell (or the REPL) waits for a key.
+        // check). The window is busy while a command runs (checked once the
+        // command showed it runs: `top`'s header, the script's second
+        // count, which a script that returned after its first wouldn't
+        // print), not while the shell (or the REPL) waits for a key.
         let d = desktop::Desktop::without_screen();
-        let cases =
-            [("rhai", "rhai>", false), ("top", "top:", true), ("rhai -e loop{}", "lumen> rhai -e loop{}", true)];
+        let cases = [
+            ("rhai", "rhai>", false),
+            ("top", "top:", true),
+            ("rhai -e 'let n = 0; loop { n += 1; if n % 2000 == 0 { print(n) } }'", "4000", true),
+        ];
         for (command, started, busy) in cases {
             let (shared, h) = test_shared(&d)?;
             let _close = CloseAfter(shared.clone());
@@ -623,11 +628,15 @@ crate::ktest!(
             type_text(&shared, command)?;
             type_text(&shared, "\n")?;
             wait_until("the command never started", || shared.view_text().rows.iter().any(|r| r.starts_with(started)))?;
-            // The keys taken and the window busy (or not) as the command
-            // has it: waited for, not assumed after a sleep.
-            wait_until("the keys weren't taken, or the window not busy as the command is", || {
-                shared.keys.lock().queue.is_empty() && h.is_busy() == busy
-            })?;
+            if busy {
+                // It runs until closed, so busy now and from here on.
+                crate::kassert!(shared.keys.lock().queue.is_empty() && h.is_busy());
+            } else {
+                // The keys taken and the REPL waiting for one: not busy.
+                wait_until("the keys weren't taken, or the window stayed busy", || {
+                    shared.keys.lock().queue.is_empty() && !h.is_busy()
+                })?;
+            }
             shared.close();
             sched::join_bounded(shell)?;
             drop(h);

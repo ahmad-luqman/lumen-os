@@ -1659,7 +1659,7 @@ crate::ktest!(
         // on it; a wait whose device answers only at the deadline, with no
         // ring, counts a missed interrupt.
         static BELL: Doorbell = Doorbell::new();
-        let (t0, mut looks) = (crate::time::now_ns(), 0);
+        let (t0, mut looks, wakes) = (crate::time::now_ns(), 0, crate::sched::deadline_wakes());
         let Err(WaitError::Timeout { waited_ns, status: 0x01 }) = status.wait_for(&BELL, 20_000_000, || {
             looks += 1;
             false
@@ -1668,10 +1668,12 @@ crate::ktest!(
         };
         let took = crate::time::now_ns() - t0;
         kassert!(waited_ns >= 20_000_000 && took >= 20_000_000);
-        // Looks come with wakes (the first, then the deadline's), not with
-        // time passing: a stall adds none.
+        // Looks come at the start, after each wake and once more at the
+        // deadline (normally 3), not with time passing: a stall can only skip
+        // the block, never add a look.
         kassert!((2..=4).contains(&looks));
-        kassert_eq!(BELL.missed(), 0);
+        // The timer ended its block (and so counts the ones below).
+        kassert_eq!((BELL.missed(), crate::sched::deadline_wakes()), (0, wakes + 1));
         let rung = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
         let r = rung.clone();
         let other = if crate::arch::cpu_index() == 0 { 1 } else { 0 };
@@ -1681,19 +1683,21 @@ crate::ktest!(
             BELL.ring();
         })
         .map_err(|_| "no ringer thread")?;
-        // Ok well before its 5 s deadline would be Timeout: the ring ended it.
+        // The ring ended it: the timer ended no wait at its 5 s deadline
+        // (`sched::deadline_wakes`; a lost wake would still return Ok,
+        // looking again there).
+        let wakes = crate::sched::deadline_wakes();
         kassert_eq!(status.wait_for(&BELL, 5_000_000_000, || rung.load(Ordering::Acquire)), Ok(()));
         ringer.join();
-        kassert_eq!(BELL.missed(), 0);
+        kassert_eq!((BELL.missed(), crate::sched::deadline_wakes()), (0, wakes));
         let t1 = crate::time::now_ns();
         kassert_eq!(status.wait_for(&BELL, 5_000_000, || crate::time::now_ns() >= t1 + 5_000_000), Ok(()));
         kassert_eq!(BELL.missed(), 1);
         // A ring during the first look (rung by `ready` itself): the wait
-        // read the ring count before looking, so it doesn't block: `ready`
-        // is asked exactly twice (a wait that blocked to its deadline would
-        // ask it a third time there), with no miss.
+        // read the ring count before looking, so the timer ends no wait at
+        // its deadline, and `ready` is asked twice, with no miss.
         static EARLY: Doorbell = Doorbell::new();
-        let mut calls = 0;
+        let (mut calls, wakes) = (0, crate::sched::deadline_wakes());
         let early = status.wait_for(&EARLY, 5_000_000_000, || {
             calls += 1;
             if calls == 1 {
@@ -1702,7 +1706,7 @@ crate::ktest!(
             calls > 1
         });
         kassert_eq!(early, Ok(()));
-        kassert_eq!((calls, EARLY.missed()), (2, 0));
+        kassert_eq!((calls, EARLY.missed(), crate::sched::deadline_wakes()), (2, 0, wakes));
         kassert_eq!(status.wait_until(1_000_000, || true), Ok(()));
         // `ready` is asked once more at the deadline.
         let t1 = crate::time::now_ns();

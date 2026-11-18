@@ -3380,27 +3380,30 @@ crate::ktest!(
         // `Deadline`; a wake from another thread ends it at once as `Woken`,
         // and so does one made before the wait; an event queued is returned.
         // A wait that isn't animating counts as idle while it lasts, an
-        // animating one never does. (Woken, not Deadline, against a 5 s
-        // deadline is what shows a wake ended it: no bound on how soon,
-        // which a host stalling the vCPU decides.)
+        // animating one never does. A wake ended a wait if the timer ended
+        // none at its deadline (`sched::deadline_wakes`): a wait looks again
+        // there, so a lost wake would still return Woken.
         use crate::kassert;
         let d = Desktop::without_screen();
         let mut h = d.open_window("w", 16, 16).map_err(|_| "a window")?;
         while h.next_event().is_some() {}
-        let start = crate::time::now_ns();
+        let (start, wakes) = (crate::time::now_ns(), crate::sched::deadline_wakes());
         kassert!(matches!(h.wait_event_until(Some(start + 20_000_000), Animating::No), Wait::Deadline));
         kassert!(crate::time::now_ns() >= start + 20_000_000);
+        // The timer ended that one (and so counts the ones below).
+        crate::kassert_eq!(crate::sched::deadline_wakes(), wakes + 1);
         let waker = h.waker();
         waker.wake();
+        let wakes = crate::sched::deadline_wakes();
         let start = crate::time::now_ns();
         kassert!(matches!(h.wait_event_until(Some(start + 5_000_000_000), Animating::No), Wait::Woken));
         for (animating, idles) in [(Animating::No, true), (Animating::Yes, false)] {
             let saw_idle = Arc::new(AtomicBool::new(!idles));
             let (w, seen, win) = (waker.clone(), saw_idle.clone(), h.win.clone());
             let t = crate::sched::spawn("ktest-waker", move || {
-                // Not animating: until the wait is idle (up to 5 s; a wait
-                // that never is fails). Animating: 10 ms in, it isn't (nor
-                // before it started: no wait can be early).
+                // Not animating: once the wait is idle (up to 5 s; a wait
+                // that never is fails). Animating: looked at 10 ms in, idle
+                // must read false whether or not the wait has started.
                 let deadline = crate::time::now_ns() + 5_000_000_000;
                 if idles {
                     while !win.idle.load(Ordering::Acquire) && crate::time::now_ns() < deadline {
@@ -3419,6 +3422,7 @@ crate::ktest!(
             kassert!(saw_idle.load(Ordering::Acquire) == idles);
             kassert!(!h.win.idle.load(Ordering::Acquire));
         }
+        crate::kassert_eq!(crate::sched::deadline_wakes(), wakes);
         d.push_key(h.id(), test_key())?;
         let got = h.wait_event_until(Some(crate::time::now_ns() + 5_000_000_000), Animating::No);
         kassert!(matches!(got, Wait::Event(WindowEvent::Key(_))));

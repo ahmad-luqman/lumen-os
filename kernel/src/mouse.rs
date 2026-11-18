@@ -759,15 +759,17 @@ crate::ktest!(
     }
 );
 
-/// Ktests: wait, yielding, until [`hold`] has asked the thread to stop
-/// (up to 5 s: a hold that never asks then fails its test on its own).
+/// Ktests: wait, yielding, until [`hold`] has asked the thread to stop;
+/// whether it did. `hold` keeps asking only HOLD_WAIT_NS, so a helper
+/// stalled that long misses the ask (at risk on a busy host).
 #[cfg(feature = "ktest")]
-fn wait_for_the_ask() {
-    let deadline = crate::time::now_ns() + 5_000_000_000;
-    while reads() != Reads::HoldAsked && crate::time::now_ns() < deadline {
-        crate::sched::yield_now();
-    }
+fn wait_for_the_ask() -> bool {
+    crate::sched::yield_until(|| reads() == Reads::HoldAsked)
 }
+
+/// Ktests: the error when a helper never saw [`hold`] ask.
+#[cfg(feature = "ktest")]
+const MISSED_THE_ASK: &str = "the helper never saw hold ask (stalled past HOLD_WAIT_NS?)";
 
 crate::ktest!(
     fn a_hold_that_no_thread_answers_is_taken_back() {
@@ -779,15 +781,20 @@ crate::ktest!(
         let _bound = MadeUp::bind(None)?;
         kassert_eq!(hold(), Err(HoldError::NotParked));
         kassert_eq!(reads(), Reads::Running);
-        // Once `hold` has asked (not after a fixed sleep: a host could stall
-        // it past the wait, or start it before the ask).
-        let failer = crate::sched::spawn("hold-ktest-fail", || {
-            wait_for_the_ask();
+        // Only once `hold` has asked: a failure before the ask makes `hold`
+        // fail at once, skipping the wait under test.
+        let saw = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let s = saw.clone();
+        let failer = crate::sched::spawn("hold-ktest-fail", move || {
+            s.store(wait_for_the_ask(), core::sync::atomic::Ordering::Release);
             mark_failed(Failure::Failed);
         })
         .map_err(|_| "spawn")?;
         let got = hold();
         failer.join();
+        if !saw.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(MISSED_THE_ASK);
+        }
         kassert_eq!(got, Err(HoldError::Failed));
         kassert_eq!(reads(), Reads::Running);
         Ok(())
@@ -801,13 +808,19 @@ crate::ktest!(
         // `Released` (not `NotParked`), and the tablet reads on.
         use crate::kassert_eq;
         let _bound = MadeUp::bind(None)?;
-        let releaser = crate::sched::spawn("hold-ktest-release", || {
-            wait_for_the_ask();
+        // Only once `hold` has asked: a release before the ask does nothing.
+        let saw = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let s = saw.clone();
+        let releaser = crate::sched::spawn("hold-ktest-release", move || {
+            s.store(wait_for_the_ask(), core::sync::atomic::Ordering::Release);
             release();
         })
         .map_err(|_| "spawn")?;
         let got = hold();
         releaser.join();
+        if !saw.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(MISSED_THE_ASK);
+        }
         kassert_eq!(got, Err(HoldError::Released));
         kassert_eq!(reads(), Reads::Running);
         Ok(())
