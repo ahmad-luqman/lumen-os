@@ -1730,9 +1730,18 @@ crate::ktest!(
         })?;
         crate::ktest::diag(format_args!("{cal}, median within {} ppm", cal.median_bound_ppm()));
         kassert_eq!(cal.steady(), WINDOWS);
-        // Taken again once or so, not every other time: a stretched window
-        // keeps its length (the next one starts from it, not from 10 ms).
-        kassert!(cal.retaken >= 1 && cal.retaken < WINDOWS);
+        // Taken again at least once (the first, 10 ms window was too slow to
+        // read), and a stretched window keeps its length: the next one
+        // starts from it, not from 10 ms. So any window taken again after
+        // the first was a stretched one, set aside for a stall of its own
+        // (a busy host's: as many as it likes, #184), never a 10 ms one
+        // again, as alternating lengths would leave it; the last set aside
+        // shows which.
+        kassert!(cal.retaken >= 1);
+        if cal.retaken > 1 {
+            let last = cal.last_retaken.ok_or("no window set aside")?;
+            kassert!(last.reference > 2 * base);
+        }
         // Longer than 10 ms, and at most 16 times that: a window ends at the
         // first poll past its target, so up to a poll (450 µs on loaded KVM)
         // past it, under one more window.
