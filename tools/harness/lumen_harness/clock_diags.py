@@ -34,10 +34,11 @@ TIMER_BRACKETS = re.compile(
 )
 # The boot ktests print the boot calibrations: the local APIC timer's (#129)
 # and the TSC's (#139), each with its windows, retakes, how many are steady
-# and how far off the median can be. Retakes and the steady count aren't
-# bounded: they count how often a loaded host stalled boot, not the code. The
-# bound is, by each clock's tolerance (lumen_time's
-# TIMER_TOLERANCE_PPM and TSC_TOLERANCE_PPM): past it, boot warned.
+# and how far off the median can be. None of those is bounded: a loaded host
+# decides them (#158's audit: a timer bound of 2.03% in 1 of 40 loaded KVM
+# boots). What is checked is the code's: boot warned exactly when the bound
+# was past the clock's tolerance (lumen_time's TIMER_TOLERANCE_PPM and
+# TSC_TOLERANCE_PPM), its verdict line read back by lumen_harness.calibration.
 TIMER_TOLERANCE_PPM = 20_000
 TSC_TOLERANCE_PPM = 10_000
 _BOOT_FIELDS = (
@@ -46,8 +47,8 @@ _BOOT_FIELDS = (
 )
 BOOT_TIMER = re.compile(r"timer boot calibration " + _BOOT_FIELDS)
 BOOT_TSC = re.compile(r"tsc boot calibration \((?P<reference>hpet|pit)\) " + _BOOT_FIELDS)
-BOOT_TIMER_CASE = "time::the_boot_timer_calibration_is_within_what_the_tick_needs"
-BOOT_TSC_CASE = "time::the_boot_tsc_calibration_is_within_what_now_ns_needs"
+BOOT_TIMER_CASE = "time::the_boot_timer_calibration_is_the_ticks_rate"
+BOOT_TSC_CASE = "time::the_boot_tsc_calibration_is_now_ns_rate"
 # The placement tests (#158) pause 20 ms on each side of a read (a 40 ms
 # bracket) and judge a try only when its reference bracket and its
 # uncertainty are each at most a quarter of the pause (lumen_time's
@@ -135,16 +136,22 @@ def _check_boot_calibration(
     tolerance_ppm: int,
 ) -> None:
     """The `clock` boot calibration's line: once in the run, in `case`, with
-    five windows and rates, and its median within `tolerance_ppm` (however
-    many windows are steady: enough least-unsteady ones may fill in)."""
+    five windows and rates; and boot's verdict on it (in `text`) a warning
+    exactly when its median's bound is past `tolerance_ppm` (however many
+    windows are steady: enough least-unsteady ones may fill in)."""
     lines = re.findall(rf"^# {clock} boot calibration ", text, re.MULTILINE)
     assert len(lines) == 1, f"{len(lines)} {clock} boot calibration lines"
     b = one_diagnostic(report, case, pattern)
     windows, rates, steady = b["windows"].split(), _widths(b["rates"]), int(b["steady"])
     assert len(windows) == 5 and len(rates) == 5, f"not 5 windows and rates: {b.group(0)}"
     assert steady <= len(windows), f"more steady than windows: {b.group(0)}"
-    assert int(b["bound"]) <= tolerance_ppm, (
-        f"{clock} median bound over {tolerance_ppm} ppm: {b.group(0)}"
+    from lumen_harness import calibration  # it imports this module's tolerances
+
+    said = calibration.verdict(text, {"tsc": calibration.TSC, "timer": calibration.TIMER}[clock])
+    warned = said is not None and said.warned
+    assert warned == (int(b["bound"]) > tolerance_ppm), (
+        f"{clock} median bound {b['bound']} ppm (tolerance {tolerance_ppm}) but boot "
+        f"{'warned' if warned else 'did not warn'}: {b.group(0)}"
     )
 
 

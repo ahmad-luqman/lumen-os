@@ -24,6 +24,22 @@ BOOT_TSC = (
     "# tsc boot calibration (hpet) 2457600000 Hz [{windows}] retook {retook}, {steady} steady, "
     "median within {bound} ppm; window rates [{rates}] Hz\n"
 )
+# Boot's verdict lines when a calibration was past its tolerance, in the
+# kernel's words (as in test_calibration.py).
+TIMER_WARNED = (
+    "[    1.313905] WARN  time: local APIC timer calibration: only 0 of 20 windows read promptly (5 wanted; a "
+    "stall next to the timer's register accesses), so its rate may be off by up to 3.8% (0.2% of it the TSC's "
+    "calibration), over the 2.0% allowed (tsc/reference/polls/start_gap/end_gap: 60659182 Hz "
+    "[25270182/626985/1/79649/821387 25272877/627039/1/79257/824106 25260235/627270/1/92316/811440 "
+    "25296642/627193/1/78963/847822 25304598/627753/1/88225/839370] retook 20)\n"
+)
+TSC_WARNED = (
+    "[    1.170000] WARN  time: tsc calibration: only 0 of 20 windows read promptly (5 wanted; a stall next to "
+    "the PIT's reads), so its rate may be off by up to 1.6%, over the 1.0% allowed (tsc/reference/polls/"
+    "start_gap/end_gap: 2457600000 Hz [24576000/12000/2000/1000/400000 24576000/12000/2000/1000/400000 "
+    "24576000/12000/2000/1000/400000 24576000/12000/2000/1000/400000 24576000/12000/2000/1000/400000] "
+    "retook 20)\n"
+)
 TSC_WINDOW = "24576000/1000000/2000/1000/1000"
 WINDOW = "10000000/625000/1/0/0"
 PLACEMENT = (
@@ -75,6 +91,7 @@ def run(
     hpet_placement=None,
     timer_placement=None,
     injected_retries=2,
+    boot_log="",
 ):
     hpet_placement = hpet_placement or placement("HPET")
     timer_placement = timer_placement or placement(
@@ -112,7 +129,7 @@ def run(
         ),
         ("a_timer_reading_is_placed_at_its_brackets_midpoint", timer_placement),
         (
-            "the_boot_timer_calibration_is_within_what_the_tick_needs",
+            "the_boot_timer_calibration_is_the_ticks_rate",
             (
                 BOOT_TIMER.format(
                     windows=" ".join([WINDOW] * boot_windows),
@@ -125,7 +142,7 @@ def run(
             ),
         ),
         (
-            "the_boot_tsc_calibration_is_within_what_now_ns_needs",
+            "the_boot_tsc_calibration_is_now_ns_rate",
             (
                 BOOT_TSC.format(
                     windows=" ".join([TSC_WINDOW] * 5),
@@ -140,7 +157,7 @@ def run(
     ]
     if now_ns_case != "now_ns_follows_the_hpet":
         cases.append(("now_ns_follows_the_hpet", ""))
-    text = f"TAP version 14\n1..{len(cases)}\n"
+    text = f"{boot_log}TAP version 14\n1..{len(cases)}\n"
     for n, (name, diags) in enumerate(cases, 1):
         text += f"{diags}ok {n} - lumen_kernel::time::{name}\n"
     return tap.parse(text), text
@@ -224,16 +241,23 @@ def test_a_timer_boot_calibration_with_more_steady_than_windows_fails():
         check_clock_diags(*run(boot_steady=6))
 
 
-def test_a_timer_boot_calibration_bound_over_its_tolerance_fails():
+def test_a_timer_boot_calibration_past_its_tolerance_must_have_warned():
+    # Not bounded (a loaded host decides it): warned exactly when past.
     check_clock_diags(*run(boot_bound=20000))
-    with pytest.raises(AssertionError, match="timer median bound over 20000 ppm"):
+    check_clock_diags(*run(boot_bound=38000, boot_log=TIMER_WARNED))
+    with pytest.raises(AssertionError, match="timer median bound 20001 ppm .* did not warn"):
         check_clock_diags(*run(boot_bound=20001))
+    with pytest.raises(AssertionError, match="timer median bound 20000 ppm .* warned"):
+        check_clock_diags(*run(boot_bound=20000, boot_log=TIMER_WARNED))
 
 
-def test_a_tsc_boot_calibration_bound_over_its_tolerance_fails():
+def test_a_tsc_boot_calibration_past_its_tolerance_must_have_warned():
     check_clock_diags(*run(tsc_bound=10000))
-    with pytest.raises(AssertionError, match="tsc median bound over 10000 ppm"):
+    check_clock_diags(*run(tsc_bound=16000, boot_log=TSC_WARNED))
+    with pytest.raises(AssertionError, match="tsc median bound 10001 ppm .* did not warn"):
         check_clock_diags(*run(tsc_bound=10001))
+    with pytest.raises(AssertionError, match="tsc median bound 10000 ppm .* warned"):
+        check_clock_diags(*run(tsc_bound=10000, boot_log=TSC_WARNED))
 
 
 @pytest.mark.parametrize("lines", [0, 2])

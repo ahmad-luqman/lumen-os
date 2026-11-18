@@ -15,7 +15,8 @@ import re
 import pytest
 from test_time import (
     PIT_HZ,
-    assert_close,
+    assert_agree,
+    check_boot_verdict,
     check_calibration,
     check_retake_line,
     clocks_and_windows,
@@ -52,9 +53,9 @@ def test_no_hpet_is_a_warning(boot):
     line = m.expect(ACPI_LINE, BOOT_TIMEOUT)
     assert line[0] == f"INFO  acpi: 1 CPU, LAPIC at {LAPIC:#x}, no HPET\n"
     # Timekeeping falls back to the PIT, and the PIT calibration repeats:
-    # measured again against the PIT, within 2% (the same clock, so not an
-    # independent check; the default boot cross-checks the PIT against the
-    # HPET).
+    # measured again against the PIT, within 2% or their bounds (the same
+    # clock, so not an independent check; the default boot cross-checks the
+    # PIT against the HPET).
     m.expect(r"INFO  time: tsc .* \(calibrated against pit\)\n", BOOT_TIMEOUT)
     m.expect(r"INFO  boot: boot complete", BOOT_TIMEOUT)
     m.expect(r"lumen> ", BOOT_TIMEOUT)
@@ -63,15 +64,16 @@ def test_no_hpet_is_a_warning(boot):
     (tsc, reference, pit, hpet), cals = clocks_and_windows(m)
     assert (reference, hpet) == ("pit", None)
     assert pit is not None
-    assert_close(tsc, pit)
-    # Both calibrations' windows are steady and give exactly what they say
+    # Both calibrations give exactly what their windows say
     # (the configuration whose boot calibration came out 11.8% high under KVM
     # in CI, #45).
     assert sorted(cals) == ["boot", "pit"]
     assert (cals["boot"].hz, cals["pit"].hz) == (tsc, pit)
     check_calibration(cals["boot"], PIT_HZ)
     check_calibration(cals["pit"], PIT_HZ)
+    assert_agree(cals["boot"], cals["pit"])
     check_retake_line(m, cals["boot"])
+    check_boot_verdict(m, cals["boot"])
 
 
 def test_no_madt_boots_without_acpi(boot):

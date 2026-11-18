@@ -2285,13 +2285,13 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn the_boot_timer_calibration_is_within_what_the_tick_needs() {
-        // Expected, not guaranteed: the boot's median is within the timer's
-        // tolerance (lumen_time::TIMER_TOLERANCE_PPM), the TSC's error
-        // included, as its steady windows' or enough least-unsteady ones
-        // filling in allow, and the timer runs at it. A boot whose bound was
-        // past it warned, and fails this on purpose: its rate may be off by
-        // more than the tick allows.
+    fn the_boot_timer_calibration_is_the_ticks_rate() {
+        // The boot's timer calibration, its steady windows first, the rate
+        // their median, and the timer runs at it. Its bound isn't held to the
+        // timer's tolerance here: a loaded host decides it (#158's audit:
+        // 1 of 40 loaded KVM boots came out at 2.03%). A boot past the
+        // tolerance warned, and `lumen_harness.clock_diags` checks that the
+        // warning came exactly then (and the bound is in its diag).
         use crate::{kassert, kassert_eq};
         let cal = boot_timer_calibration().ok_or("no timer calibration")?;
         let tsc_hz = tsc().ok_or("TSC not calibrated")?.hz();
@@ -2307,7 +2307,7 @@ crate::ktest!(
         kassert_eq!(cal.windows.iter().take_while(|w| w.is_steady()).count(), cal.steady());
         let boot_tsc_ppm = boot_calibration().ok_or("no boot calibration")?.median_bound_ppm();
         kassert_eq!(cal.of, Calibrated::Timer { tsc_ppm: boot_tsc_ppm });
-        kassert!(cal.median_bound_ppm() <= lumen_time::TIMER_TOLERANCE_PPM);
+        kassert!(report(&cal).verdict != Verdict::Unusable);
         kassert_eq!(lumen_time::median(&mut rates), Some(cal.hz));
         kassert_eq!(lapic_timer().map(|c| c.hz()), Some(cal.hz));
         Ok(())
@@ -2315,11 +2315,12 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn the_boot_tsc_calibration_is_within_what_now_ns_needs() {
-        // Expected, not guaranteed: the boot's TSC median is within the
-        // TSC's tolerance (lumen_time::TSC_TOLERANCE_PPM, 1%), its steady
-        // windows first, the frequency their median, and now_ns runs at it.
-        // A boot past it warned, and fails this on purpose.
+    fn the_boot_tsc_calibration_is_now_ns_rate() {
+        // The boot's TSC calibration, its steady windows first, the frequency
+        // their median, and now_ns runs at it. Its bound isn't held to the
+        // TSC's tolerance here: a loaded host decides it. A boot past the
+        // tolerance warned, and `lumen_harness.clock_diags` checks that the
+        // warning came exactly then.
         use crate::{kassert, kassert_eq};
         let cal = boot_calibration().ok_or("no boot calibration")?;
         let reference = reference().ok_or("no reference")?;
@@ -2335,7 +2336,7 @@ crate::ktest!(
         ));
         kassert_eq!(cal.windows.iter().take_while(|w| w.is_steady()).count(), cal.steady());
         kassert_eq!(cal.of, Calibrated::Tsc(reference));
-        kassert!(cal.median_bound_ppm() <= lumen_time::TSC_TOLERANCE_PPM);
+        kassert!(report(&cal).verdict != Verdict::Unusable);
         kassert_eq!(lumen_time::median(&mut rates), Some(cal.hz));
         kassert_eq!(tsc().map(|c| c.hz()), Some(cal.hz));
         Ok(())
