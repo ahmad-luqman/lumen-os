@@ -1632,16 +1632,17 @@ crate::ktest!(
             "the device status reads 0x07 after setup: FEATURES_OK clear: the device refused the negotiated features"
         );
         kassert_eq!(why(0x0b), "the device status reads 0x0b after setup: DRIVER_OK clear");
-        // A bounded wait gives up on time (at least the timeout, well under
-        // a second), re-polling `ready`; or when the status shows
-        // DEVICE_NEEDS_RESET (which the device sets) or FAILED (a driver).
+        // A bounded wait gives up on time (at least the timeout; how much
+        // more is the host's to decide), re-polling `ready`; or when the
+        // status shows DEVICE_NEEDS_RESET (which the device sets) or FAILED
+        // (a driver).
         t.set_status(DeviceStatus::ACKNOWLEDGE);
         let t0 = crate::time::now_ns();
         let Err(WaitError::Timeout { waited_ns, status: 0x01 }) = status.wait_until(2_000_000, || false) else {
             return Err("no timeout");
         };
         let took = crate::time::now_ns() - t0;
-        kassert!(waited_ns >= 2_000_000 && (2_000_000..1_000_000_000).contains(&took));
+        kassert!(waited_ns >= 2_000_000 && took >= 2_000_000);
         let mut polls = 0;
         kassert_eq!(
             status.wait_until(1_000_000_000, || {
@@ -1659,47 +1660,71 @@ crate::ktest!(
         // ring, counts a missed interrupt.
         static BELL: Doorbell = Doorbell::new();
         let (t0, mut looks) = (crate::time::now_ns(), 0);
-        let Err(WaitError::Timeout { waited_ns, status: 0x01 }) = status.wait_for(&BELL, 20_000_000, || {
-            looks += 1;
-            false
-        }) else {
+        let (got, timer_ended) = crate::sched::deadline_wakes_in(|| {
+            status.wait_for(&BELL, 20_000_000, || {
+                looks += 1;
+                false
+            })
+        });
+        let Err(WaitError::Timeout { waited_ns, status: 0x01 }) = got else {
             return Err("no timeout blocking");
         };
         let took = crate::time::now_ns() - t0;
-        kassert!(waited_ns >= 20_000_000 && (20_000_000..1_000_000_000).contains(&took));
+        kassert!(waited_ns >= 20_000_000 && took >= 20_000_000);
+        // Looks come at the start, after each wake and once more at the
+        // deadline (normally 3), not with time passing: a stall can only skip
+        // the block, never add a look.
         kassert!((2..=4).contains(&looks));
-        kassert_eq!(BELL.missed(), 0);
+        // The timer ended its block, if it blocked (a stall past 20 ms
+        // before it skips the block: 2 looks, none counted); that the count
+        // works is sched's `a_lost_wake_is_ended_by_the_timer_and_counted`.
+        kassert!(BELL.missed() == 0 && timer_ended <= 1 && (looks == 2) == (timer_ended == 0));
         let rung = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
         let r = rung.clone();
         let other = if crate::arch::cpu_index() == 0 { 1 } else { 0 };
+        let me = crate::sched::current().ok_or("no thread")?;
         let ringer = crate::sched::spawn_on(other, "ringer", move || {
-            let _ = crate::sched::sleep(2_000_000);
+            // Once the wait blocks (a ring before it proves nothing).
+            let _ = crate::sched::yield_until(|| me.state() == crate::sched::State::Blocked);
             r.store(true, Ordering::Release);
             BELL.ring();
         })
         .map_err(|_| "no ringer thread")?;
-        let t0 = crate::time::now_ns();
-        kassert_eq!(status.wait_for(&BELL, 5_000_000_000, || rung.load(Ordering::Acquire)), Ok(()));
-        kassert!(crate::time::now_ns() - t0 < 1_000_000_000);
+        // The ring ended it, not the timer at its 5 s deadline.
+        let got =
+            crate::sched::deadline_wakes_in(|| status.wait_for(&BELL, 5_000_000_000, || rung.load(Ordering::Acquire)));
+        kassert_eq!(got, (Ok(()), 0));
         ringer.join();
         kassert_eq!(BELL.missed(), 0);
-        let t1 = crate::time::now_ns();
-        kassert_eq!(status.wait_for(&BELL, 5_000_000, || crate::time::now_ns() >= t1 + 5_000_000), Ok(()));
-        kassert_eq!(BELL.missed(), 1);
-        // A ring during the first look (rung by `ready` itself): the wait
-        // read the ring count before looking, so it doesn't block, and
-        // returns well before its deadline, with no miss.
-        static EARLY: Doorbell = Doorbell::new();
-        let (t2, mut calls) = (crate::time::now_ns(), 0);
-        let early = status.wait_for(&EARLY, 5_000_000_000, || {
-            calls += 1;
-            if calls == 1 {
-                EARLY.ring();
+        // An answer only at the deadline, with no ring: a missed interrupt
+        // (if the wait blocked: a stall past 5 ms before it skips the block,
+        // and the try is taken again, up to 5 times).
+        let mut counted = false;
+        for _ in 0..5 {
+            let t1 = crate::time::now_ns();
+            kassert_eq!(status.wait_for(&BELL, 5_000_000, || crate::time::now_ns() >= t1 + 5_000_000), Ok(()));
+            kassert!(BELL.missed() <= 1);
+            if BELL.missed() == 1 {
+                counted = true;
+                break;
             }
-            calls > 1
+        }
+        kassert!(counted);
+        // A ring during the first look (rung by `ready` itself): the wait
+        // read the ring count before looking, so the timer ends no wait at
+        // its deadline, and `ready` is asked twice, with no miss.
+        static EARLY: Doorbell = Doorbell::new();
+        let mut calls = 0;
+        let early = crate::sched::deadline_wakes_in(|| {
+            status.wait_for(&EARLY, 5_000_000_000, || {
+                calls += 1;
+                if calls == 1 {
+                    EARLY.ring();
+                }
+                calls > 1
+            })
         });
-        kassert_eq!(early, Ok(()));
-        kassert!(crate::time::now_ns() - t2 < 1_000_000_000);
+        kassert_eq!(early, (Ok(()), 0));
         kassert_eq!((calls, EARLY.missed()), (2, 0));
         kassert_eq!(status.wait_until(1_000_000, || true), Ok(()));
         // `ready` is asked once more at the deadline.

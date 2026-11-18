@@ -287,6 +287,9 @@ const _: () = assert!(IOAPIC_LAST - IOAPIC_BASE + 1 >= 24 && MSI_LAST - MSI_BASE
 /// started: the boot CPU's from `time::init`, each AP's from its idle
 /// thread; its first tick after that starts the CPU's scheduler).
 static TICKS: [AtomicU64; super::percpu::MAX_CPUS] = [const { AtomicU64::new(0) }; super::percpu::MAX_CPUS];
+/// WAKEUP IPIs taken, per CPU (for the ktests).
+#[cfg(feature = "ktest")]
+static WAKEUPS: [AtomicU64; super::percpu::MAX_CPUS] = [const { AtomicU64::new(0) }; super::percpu::MAX_CPUS];
 /// Spurious interrupts (local APIC, or 8259 IRQ 7 or 15) taken.
 static SPURIOUS_IRQS: AtomicU64 = AtomicU64::new(0);
 /// Interrupts on vectors nothing handles, taken ([`unexpected`]).
@@ -393,6 +396,12 @@ pub fn ticks() -> u64 {
 /// doesn't exist).
 pub fn ticks_on(cpu: usize) -> u64 {
     TICKS.get(cpu).map_or(0, |t| t.load(Ordering::Relaxed))
+}
+
+/// CPU `cpu`'s WAKEUP IPIs so far (0 for a CPU index that doesn't exist).
+#[cfg(feature = "ktest")]
+pub fn wakeups_on(cpu: usize) -> u64 {
+    WAKEUPS.get(cpu).map_or(0, |t| t.load(Ordering::Relaxed))
 }
 
 /// Interrupts taken on `vector` so far, all CPUs together.
@@ -560,7 +569,11 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
         SPURIOUS => {
             SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);
         }
-        WAKEUP => super::apic::eoi(),
+        WAKEUP => {
+            #[cfg(feature = "ktest")]
+            WAKEUPS[super::percpu::index()].fetch_add(1, Ordering::Relaxed);
+            super::apic::eoi();
+        }
         v @ PIC_BASE..=PIC_LAST if super::apic::in_service(v) => {
             // Delivered through the local APIC (an MSI or a routed input on
             // the 8259s' vectors), not by the 8259s: its EOI is the APIC's.

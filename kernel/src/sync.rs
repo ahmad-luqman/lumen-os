@@ -210,24 +210,39 @@ crate::ktest!(
 
 crate::ktest!(
     fn a_lock_held_by_another_cpu_is_waited_for() {
-        // CPU 1 takes the lock and holds it for a while: there it is held,
-        // here it isn't, and `lock` here waits for CPU 1 to let go instead
-        // of reporting a re-lock.
+        // CPU 1 takes the lock and holds it until this CPU is about to call
+        // `lock` (and a while after, so `lock` most likely spins): there it
+        // is held, here it isn't, and `lock` here returns only once CPU 1 let
+        // go, instead of reporting a re-lock. A handshake, not a fixed hold:
+        // a host can stall this vCPU past any fixed hold.
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::{AtomicBool, AtomicU8};
         const NOT_TAKEN: u8 = 0;
         const HELD_THERE: u8 = 1; // CPU 1 holds it and saw it held there
         const HELD_UNSEEN: u8 = 2; // CPU 1 holds it but didn't see that
-        /// How long CPU 1 holds it: far longer than this CPU takes to see
-        /// that it is held and call `lock` (measured under TCG: under 0.3 ms).
+        /// How long CPU 1 holds it after this CPU sets `LOCKING`: long enough
+        /// that `lock`, called right after, finds it still held unless this
+        /// vCPU stalls longer than that in between. Nothing checked depends
+        /// on it.
         const HOLD_NS: u64 = 100_000_000;
+        /// How long CPU 1 waits for `LOCKING` before going on with its hold
+        /// anyway (a stall of this vCPU that long before it reads
+        /// `RELEASING` fails the test: `contended` is false).
+        const WAIT_NS: u64 = 5_000_000_000;
         static SHARED: SpinLock<()> = SpinLock::new(());
         static STEP: AtomicU8 = AtomicU8::new(NOT_TAKEN);
+        /// Set by this CPU just before it calls `lock`.
+        static LOCKING: AtomicBool = AtomicBool::new(false);
+        /// Set by CPU 1 if it waited WAIT_NS for `LOCKING` and went on.
+        static WAITED_OUT: AtomicBool = AtomicBool::new(false);
         /// Set by CPU 1 just before it lets go.
         static RELEASING: AtomicBool = AtomicBool::new(false);
         fn on_cpu_1() {
             let held = SHARED.lock();
             STEP.store(if SHARED.held_here() { HELD_THERE } else { HELD_UNSEEN }, Ordering::Release);
+            if !crate::smp::spin_until(crate::time::now_ns() + WAIT_NS, || LOCKING.load(Ordering::Acquire)) {
+                WAITED_OUT.store(true, Ordering::Relaxed);
+            }
             crate::time::spin(HOLD_NS);
             RELEASING.store(true, Ordering::Relaxed); // published by the release
             drop(held);
@@ -236,12 +251,19 @@ crate::ktest!(
         kassert!(crate::smp::job_reached(1, || STEP.load(Ordering::Acquire) != NOT_TAKEN));
         let seen = (STEP.load(Ordering::Acquire), SHARED.held_here(), SHARED.try_lock().is_none());
         let contended = !RELEASING.load(Ordering::Relaxed);
+        LOCKING.store(true, Ordering::Release);
         let here = SHARED.lock();
         let after = (RELEASING.load(Ordering::Relaxed), SHARED.held_here());
         drop(here);
         // Still held just before `lock` was called (so `seen` is from while
-        // CPU 1 held it, and `lock` had to wait), and taken only once CPU 1
-        // let go.
+        // CPU 1 held it, and `lock` most likely had to wait), and taken only
+        // once CPU 1 let go.
+        if !contended {
+            crate::ktest::diag(format_args!(
+                "cpu 1 let go before this cpu said it was locking (cpu 1 waited it out: {})",
+                WAITED_OUT.load(Ordering::Relaxed)
+            ));
+        }
         kassert!(contended);
         kassert_eq!(seen, (HELD_THERE, false, true));
         kassert_eq!(after, (true, true));

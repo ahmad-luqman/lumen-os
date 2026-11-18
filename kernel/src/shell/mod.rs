@@ -247,6 +247,11 @@ pub fn run() -> ! {
 /// so (it goes on waiting).
 const SHELLS_WARN_AFTER_NS: u64 = 5_000_000_000;
 
+/// What the serial prompt's warning, when screen shells keep it waiting,
+/// starts with (after the level and target): the ktest waits for it, and
+/// test_ktest, test_shell and ARCHITECTURE.md quote the whole line.
+const HELD: &str = "serial prompt held: ";
+
 /// Wait until every screen shell that started is blocked waiting for its
 /// first key (`sched::yield_until_blocked`: by thread, not by counting the
 /// keyboard's waiters, so another waiter there can't stand in for one),
@@ -274,7 +279,7 @@ fn wait_for_screen_shells(shells: &[Option<crate::sched::JoinHandle>], warn_afte
     log::debug!(target: "shell", "serial prompt waits for {count} screen shell{plural} to wait for keys");
     let start = crate::time::now_ns();
     if !sched::yield_until_blocked(started(), Some(start + warn_after_ns)) {
-        log::warn!(target: "shell", "serial prompt held: {} not yet waiting for keys (still waiting)", NotBlocked(shells));
+        log::warn!(target: "shell", "{HELD}{} not yet waiting for keys (still waiting)", NotBlocked(shells));
         sched::yield_until_blocked(started(), None);
         let held_ms = (crate::time::now_ns() - start) / 1_000_000;
         log::info!(target: "shell", "serial prompt released after {held_ms} ms: every screen shell waits for keys");
@@ -314,32 +319,56 @@ crate::ktest!(
     fn the_serial_prompt_waits_on_past_its_warning() {
         // `wait_for_screen_shells` with a 1 ms warning, on two threads on
         // this CPU standing in for shells (in two of the four slots): one
-        // blocks at once, the other only after sleeping 30 ms. The warning
-        // fires while the second sleeps (test_ktest checks its text), and
-        // the wait goes on: it returns only once both are blocked, after
-        // the sleep. Then they are woken and joined.
+        // blocks at once, the other only once the warning is in the log
+        // (test_ktest checks its text). So the warning fires while the
+        // second isn't waiting, whatever a host stalls, and the wait goes
+        // on: it returns only once both are blocked. Then they are woken and
+        // joined. (Not a fixed sleep: a stall before the wait's first look
+        // would let the second block first, with no warning.)
         use crate::sched::{self, JoinHandle, State, WaitQueue};
         use crate::{kassert, kassert_eq};
         use alloc::sync::Arc;
         use core::sync::atomic::{AtomicBool, Ordering};
-        const LATE_NS: u64 = 30_000_000;
+        /// Whether `needle` is among the log bytes written since `mark` (a
+        /// `klog::copy_recent` total) that `recent` holds.
+        fn logged_since(mark: u64, needle: &[u8], recent: &mut [u8]) -> bool {
+            let (n, written) = crate::klog::copy_recent(recent);
+            let new = usize::try_from(written.saturating_sub(mark)).unwrap_or(usize::MAX).min(n);
+            recent[n - new..n].windows(needle.len()).any(|w| w == needle)
+        }
+        let warning = alloc::format!("WARN  shell: {HELD}");
         let s = Arc::new((WaitQueue::new(), AtomicBool::new(false)));
-        let park = |s: &Arc<(WaitQueue, AtomicBool)>, sleep_ns: u64| {
+        let park = |s: &Arc<(WaitQueue, AtomicBool)>| {
             let t = s.clone();
-            move || {
-                if sleep_ns > 0 {
-                    assert!(sched::sleep(sleep_ns), "a test thread couldn't sleep");
-                }
-                t.0.wait_until(|| t.1.load(Ordering::Acquire));
-            }
+            move || t.0.wait_until(|| t.1.load(Ordering::Acquire))
         };
+        let saw_warning = Arc::new(AtomicBool::new(false));
+        let (_, mark) = crate::klog::copy_recent(&mut []);
+        let (park_late, saw) = (park(&s), saw_warning.clone());
         let mut shells: [Option<JoinHandle>; term::VTS] = Default::default();
-        // Read first: the late thread's sleep starts after this.
-        let start = crate::time::now_ns();
-        shells[0] = Some(sched::spawn("waits-early", park(&s, 0)).map_err(|_| "spawn failed")?);
-        shells[2] = Some(sched::spawn("waits-late", park(&s, LATE_NS)).map_err(|_| "spawn failed")?);
+        shells[0] = Some(sched::spawn("waits-early", park(&s)).map_err(|_| "spawn failed")?);
+        shells[2] = Some(
+            sched::spawn("waits-late", move || {
+                // Until the warning is logged after `mark` (up to 5 s, then
+                // one more look).
+                let deadline = crate::time::now_ns() + 5_000_000_000;
+                let mut recent = [0u8; 1024];
+                let seen = loop {
+                    let last_look = crate::time::now_ns() >= deadline;
+                    if logged_since(mark, warning.as_bytes(), &mut recent) {
+                        break true;
+                    }
+                    if last_look {
+                        break false;
+                    }
+                    assert!(sched::sleep(1_000_000), "a test thread couldn't sleep");
+                };
+                saw.store(seen, Ordering::Release);
+                park_late();
+            })
+            .map_err(|_| "spawn failed")?,
+        );
         let count = wait_for_screen_shells(&shells, 1_000_000);
-        let held = crate::time::now_ns() - start;
         let blocked = shells.iter().flatten().all(|h| h.thread().state() == State::Blocked);
         if !blocked {
             for h in shells.iter().flatten() {
@@ -348,7 +377,11 @@ crate::ktest!(
         }
         kassert!(blocked);
         kassert_eq!(count, 2);
-        kassert!(held >= LATE_NS);
+        kassert!(saw_warning.load(Ordering::Acquire));
+        // Both already waiting: the wait returns with no warning.
+        let (_, mark) = crate::klog::copy_recent(&mut []);
+        kassert_eq!(wait_for_screen_shells(&shells, 1_000_000), 2);
+        kassert!(!logged_since(mark, alloc::format!("WARN  shell: {HELD}").as_bytes(), &mut [0u8; 1024]));
         s.1.store(true, Ordering::Release);
         s.0.wake_all();
         // Bounded: a thread that never finishes fails the test by name

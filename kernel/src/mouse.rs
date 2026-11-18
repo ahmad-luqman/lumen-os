@@ -759,6 +759,36 @@ crate::ktest!(
     }
 );
 
+/// Ktests: [`hold`]'s result, with a helper thread on this CPU that waits
+/// (yielding, up to the test deadline) until `hold` has asked the thread to
+/// stop and then calls `then`; an error if the helper never saw the ask,
+/// or if `hold`'s wait ran to its HOLD_WAIT_NS deadline (`then` didn't wake
+/// it, or came over a second late: a stall that long is at risk).
+#[cfg(feature = "ktest")]
+fn hold_with(name: &'static str, then: fn()) -> Result<Result<(), HoldError>, &'static str> {
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicBool;
+    let saw = Arc::new(AtomicBool::new(false));
+    let s = saw.clone();
+    let helper = crate::sched::spawn(name, move || {
+        s.store(crate::sched::yield_until(|| reads() == Reads::HoldAsked), Ordering::Release);
+        then();
+    })
+    .map_err(|_| "spawn")?;
+    let (got, timer_ended) = crate::sched::deadline_wakes_in(hold);
+    helper.join();
+    if !saw.load(Ordering::Acquire) || timer_ended != 0 {
+        crate::ktest::diag(format_args!(
+            "hold gave {got:?}, its wait ended by its deadline {timer_ended} times, the helper saw the ask: {}, \
+             reads now {:?}",
+            saw.load(Ordering::Acquire),
+            reads()
+        ));
+        return Err("the helper never saw hold ask, or didn't end hold's wait");
+    }
+    Ok(got)
+}
+
 crate::ktest!(
     fn a_hold_that_no_thread_answers_is_taken_back() {
         // A tablet with no thread to park (made up): `hold` waits
@@ -769,13 +799,9 @@ crate::ktest!(
         let _bound = MadeUp::bind(None)?;
         kassert_eq!(hold(), Err(HoldError::NotParked));
         kassert_eq!(reads(), Reads::Running);
-        let failer = crate::sched::spawn("hold-ktest-fail", || {
-            crate::time::sleep(100_000_000);
-            mark_failed(Failure::Failed);
-        })
-        .map_err(|_| "spawn")?;
-        let got = hold();
-        failer.join();
+        // Failed only once `hold` has asked: a failure before the ask makes
+        // `hold` fail at once, skipping the wait under test.
+        let got = hold_with("hold-ktest-fail", || mark_failed(Failure::Failed))?;
         kassert_eq!(got, Err(HoldError::Failed));
         kassert_eq!(reads(), Reads::Running);
         Ok(())
@@ -789,13 +815,9 @@ crate::ktest!(
         // `Released` (not `NotParked`), and the tablet reads on.
         use crate::kassert_eq;
         let _bound = MadeUp::bind(None)?;
-        let releaser = crate::sched::spawn("hold-ktest-release", || {
-            crate::time::sleep(100_000_000);
-            release();
-        })
-        .map_err(|_| "spawn")?;
-        let got = hold();
-        releaser.join();
+        // Released only once `hold` has asked: a release before the ask
+        // does nothing.
+        let got = hold_with("hold-ktest-release", release)?;
         kassert_eq!(got, Err(HoldError::Released));
         kassert_eq!(reads(), Reads::Running);
         Ok(())

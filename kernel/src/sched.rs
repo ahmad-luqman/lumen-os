@@ -185,6 +185,10 @@ pub struct Thread {
     exited: WaitQueue,
     /// Timer ticks that found it running.
     ticks: AtomicU64,
+    /// Its [`WaitQueue`] waits that the timer ended at their deadline, not
+    /// a waker (for the ktests: [`deadline_wakes_in`]).
+    #[cfg(feature = "ktest")]
+    deadline_wakes: AtomicU64,
 }
 
 impl Thread {
@@ -224,6 +228,8 @@ impl Thread {
             reaped: AtomicBool::new(false),
             exited: WaitQueue::new(),
             ticks: AtomicU64::new(0),
+            #[cfg(feature = "ktest")]
+            deadline_wakes: AtomicU64::new(0),
         }
     }
 
@@ -372,6 +378,8 @@ impl Cpu {
                     thread.change(State::Sleeping, State::Ready);
                     self.push_ready(cpu, thread);
                 } else if thread.try_change(State::Blocked, State::Ready) {
+                    #[cfg(feature = "ktest")]
+                    thread.deadline_wakes.fetch_add(1, Ordering::Relaxed);
                     self.push_ready(cpu, thread);
                 }
             } else {
@@ -604,6 +612,21 @@ static START_WAIT_OVER: AtomicBool = AtomicBool::new(false);
 /// Whether CPU `cpu`'s scheduler runs (threads can be spawned there).
 pub fn running_on(cpu: usize) -> bool {
     RUNNING.get(cpu).is_some_and(|r| r.load(Ordering::Acquire))
+}
+
+/// Ktests: `f`'s result, and how many of the running thread's queue waits
+/// the timer ended at their deadline while it ran. 0 for a wait that
+/// returned ready proves a waker ended it (or it never blocked), unless the
+/// wake came after the deadline: its result can't, since it looks once more
+/// at its deadline, so a lost wake still returns ready. Sound only if `f`
+/// makes no other wait with a deadline on this thread.
+#[cfg(feature = "ktest")]
+pub(crate) fn deadline_wakes_in<R>(f: impl FnOnce() -> R) -> (R, u64) {
+    let me = current().expect("ktests run on a thread");
+    let count = || me.deadline_wakes.load(Ordering::Relaxed);
+    let before = count();
+    let r = f();
+    (r, count() - before)
 }
 
 /// The thread running on this CPU, once its threads are set up.
@@ -1532,7 +1555,9 @@ crate::ktest!(
         let spinner = spawn_test(cpu, "busy-test", move || *result.lock() = Some(take_ticks()))?;
         join_bounded(spinner)?;
         let busy: Span = span.lock().ok_or("the spinner didn't report")?;
-        kassert!(check("spinning", busy) && busy.counted.busy_percent() >= 80);
+        // The spinner is always ready there, so no tick of its span finds the
+        // CPU idle: none counted idle (a floor would let a few through).
+        kassert!(check("spinning", busy) && busy.idle == 0);
         let idle = take_ticks();
         kassert!(check("idle", idle) && idle.counted.busy_percent() <= 20);
         Ok(())
@@ -2161,15 +2186,21 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn a_remote_wake_does_not_wait_for_a_tick() {
-        // Waking a thread on an idle CPU sends it the WAKEUP IPI: the thread
-        // runs before that CPU's next tick in at least 5 of 20 tries
-        // (without the IPI, never: only the tick would find it; 12 to 20 of
-        // 20 seen under heavy emulated load).
+    fn a_remote_wake_sends_its_cpu_the_wakeup_ipi() {
+        // Waking a thread on another CPU sends that CPU the WAKEUP IPI, both
+        // ways (this CPU to the last, and the last to this one): in each of
+        // 20 tries that CPU's own WAKEUP count rises after the wake (waited
+        // for: the IPI can land after the thread ran and was joined; another
+        // wake to that CPU could stand in, never hide one). How often the
+        // thread ran before its CPU's next tick is reported, not judged: a
+        // host stalling the vCPU decides it, and it often does without the
+        // IPI.
         use crate::kassert;
         let cpu = last_cpu()?;
+        let here = arch::cpu_index();
+        kassert!(cpu != here);
         let mut before_tick = 0;
-        for _ in 0..20 {
+        for tried in 1..=20 {
             let s = Arc::new((WaitQueue::new(), AtomicBool::new(false), AtomicU64::new(u64::MAX)));
             let t = s.clone();
             let h = spawn_test(cpu, "woken", move || {
@@ -2178,16 +2209,74 @@ crate::ktest!(
             })?;
             kassert!(yield_until(|| s.0.waiters.lock().len() == 1));
             s.1.store(true, Ordering::Release);
-            let t0 = arch::idt::ticks_on(cpu);
+            let (t0, ipis) = (arch::idt::ticks_on(cpu), arch::idt::wakeups_on(cpu));
             s.0.wake_all();
             join_bounded(h)?;
             if s.2.load(Ordering::Acquire) == t0 {
                 before_tick += 1;
             }
+            if !yield_until(|| arch::idt::wakeups_on(cpu) != ipis) {
+                crate::ktest::diag(format_args!("try {tried}: cpu {cpu} took no WAKEUP IPI after the wake"));
+                return Err("a remote wake sent its CPU no WAKEUP IPI");
+            }
+            // The other way: a thread on the last CPU wakes one on this CPU
+            // (here, only yielding meanwhile).
+            let s = Arc::new((WaitQueue::new(), AtomicBool::new(false)));
+            let (t, w) = (s.clone(), s.clone());
+            let woken = spawn_test(here, "woken-here", move || t.0.wait_until(|| t.1.load(Ordering::Acquire)))?;
+            kassert!(yield_until(|| s.0.waiters.lock().len() == 1));
+            let ipis = arch::idt::wakeups_on(here);
+            join_bounded(spawn_test(cpu, "waker", move || {
+                w.1.store(true, Ordering::Release);
+                w.0.wake_all();
+            })?)?;
+            join_bounded(woken)?;
+            if !yield_until(|| arch::idt::wakeups_on(here) != ipis) {
+                crate::ktest::diag(format_args!("try {tried}: cpu {here} took no WAKEUP IPI after cpu {cpu}'s wake"));
+                return Err("a remote wake sent its CPU no WAKEUP IPI");
+            }
         }
-        crate::ktest::diag(format_args!("woken before the next tick {before_tick} of 20 times"));
-        kassert!(before_tick >= 5);
+        crate::ktest::diag(format_args!(
+            "woken before the next tick {before_tick} of 20 times, each with a WAKEUP IPI"
+        ));
         Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_lost_wake_is_ended_by_the_timer_and_counted() {
+        // `deadline_wakes_in`, the other ktests' proof that a wake ended a
+        // wait: a wait whose condition is made true without waking it (a
+        // lost wake, by a thread on this CPU once the wait is on its queue)
+        // returns ready at its deadline, and counts one deadline wake; a
+        // sleep between counts none. A try where the wait didn't block
+        // before its 20 ms deadline (a host stall) proves nothing: taken
+        // again, up to 5 times.
+        use crate::{kassert, kassert_eq};
+        kassert_eq!(deadline_wakes_in(|| sleep(2_000_000)).1, 0);
+        for tried in 1..=5 {
+            let s = Arc::new((WaitQueue::new(), AtomicBool::new(false)));
+            let t = s.clone();
+            let loser = spawn("lost-wake", move || {
+                // Once the wait is on the queue (or over): true, and no wake.
+                let _ = yield_until(|| t.0.waiters.lock().len() == 1 || t.1.load(Ordering::Acquire));
+                t.1.store(true, Ordering::Release);
+            })
+            .map_err(|_| "spawn failed")?;
+            let deadline = time::now_ns() + 20_000_000;
+            let (woke, ended) =
+                deadline_wakes_in(|| s.0.wait_until_or_deadline(deadline, || s.1.load(Ordering::Acquire)));
+            s.1.store(true, Ordering::Release);
+            join_bounded(loser)?;
+            crate::ktest::diag(format_args!("try {tried}: returned {woke}, ended by the timer {ended} times"));
+            kassert!(ended <= 1);
+            if woke {
+                // Only the timer could end it: the condition came with no
+                // wake.
+                return if ended == 1 { Ok(()) } else { Err("the timer ended a wait, uncounted") };
+            }
+        }
+        Err("no try's wait blocked before its deadline")
     }
 );
 
@@ -2732,43 +2821,60 @@ crate::ktest!(
             join_bounded(spawn_test(cpu, "counts", move || *g.lock() = queue_deadlines(cpu))?)?;
             Ok(*got.lock())
         };
-        let before = counts()?;
-        let deadline = time::now_ns() + 100_000_000;
-        let results = Arc::new(SpinLock::new(Vec::with_capacity(WAITERS)));
-        let mut handles = Vec::new();
-        for _ in 0..WAITERS {
-            let res = results.clone();
-            handles.push(spawn_test(cpu, "due", move || {
-                let q = WaitQueue::new();
-                let woke = q.wait_until_or_deadline(deadline, || false);
-                res.lock().push((woke, time::now_ns() >= deadline));
-            })?);
+        // "All on one tick" is judged only on a try whose three all blocked
+        // before the deadline (their entries counted, then a time read
+        // before it); a host stalling the spawning past it means another
+        // try with a fresh deadline, up to TRIES. Every try checks what
+        // holds however late they blocked: none fired early or a tick late,
+        // and each wait returned false no earlier than its deadline.
+        const TRIES: usize = 5;
+        for tried in 1..=TRIES {
+            let before = counts()?;
+            let deadline = time::now_ns() + 100_000_000;
+            let results = Arc::new(SpinLock::new(Vec::with_capacity(WAITERS)));
+            let mut handles = Vec::new();
+            for _ in 0..WAITERS {
+                let res = results.clone();
+                handles.push(spawn_test(cpu, "due", move || {
+                    let q = WaitQueue::new();
+                    let (woke, ended) = deadline_wakes_in(|| q.wait_until_or_deadline(deadline, || false));
+                    res.lock().push((woke, time::now_ns() >= deadline, ended));
+                })?);
+            }
+            let threads: Vec<_> = handles.iter().map(|h| h.thread.clone()).collect();
+            let deadline_entries = || {
+                let q = CPUS[cpu].lock();
+                threads.iter().filter(|t| q.sleepers.iter().any(|s| s.on_queue && Arc::ptr_eq(&s.thread, t))).count()
+            };
+            let (entries, in_time) = loop {
+                let entries = deadline_entries();
+                let before = time::now_ns() < deadline;
+                if entries == WAITERS || !before {
+                    break (entries, entries == WAITERS && before);
+                }
+                yield_now();
+            };
+            for h in handles {
+                join_bounded(h)?;
+            }
+            let after = counts()?;
+            let [fired, late, early]: [u64; 3] = core::array::from_fn(|i| after[i] - before[i]);
+            crate::ktest::diag(format_args!(
+                "cpu {cpu}: {fired} queue deadlines fired, {late} a tick late, {early} early (try {tried}; {entries} of \
+                 {WAITERS} seen blocked before the deadline; each waiter's ended by the timer: {:?})",
+                results.lock().iter().map(|r| r.2).collect::<Vec<_>>()
+            ));
+            kassert_eq!(results.lock().len(), WAITERS);
+            // A deadline ends a wait once at most: a deadline firing early
+            // wakes a waiter that blocks again, to be fired again.
+            kassert!(results.lock().iter().all(|&(woke, after_deadline, ended)| !woke && after_deadline && ended <= 1));
+            kassert!(late == 0 && early == 0);
+            if in_time {
+                kassert!(fired >= WAITERS as u64 && results.lock().iter().all(|r| r.2 == 1));
+                return Ok(());
+            }
         }
-        let threads: Vec<_> = handles.iter().map(|h| h.thread.clone()).collect();
-        let deadline_entries = || {
-            let q = CPUS[cpu].lock();
-            threads.iter().filter(|t| q.sleepers.iter().any(|s| s.on_queue && Arc::ptr_eq(&s.thread, t))).count()
-        };
-        // All three blocked before the deadline, so one tick passes it for
-        // all: their entries were counted, then the time read was before it.
-        let in_time = core::cell::Cell::new(false);
-        kassert!(yield_until(|| {
-            let all = deadline_entries() == WAITERS;
-            let before = time::now_ns() < deadline;
-            in_time.set(all && before);
-            all || !before
-        }));
-        kassert!(in_time.get());
-        for h in handles {
-            join_bounded(h)?;
-        }
-        let after = counts()?;
-        let [fired, late, early]: [u64; 3] = core::array::from_fn(|i| after[i] - before[i]);
-        crate::ktest::diag(format_args!("cpu {cpu}: {fired} queue deadlines fired, {late} a tick late, {early} early"));
-        kassert_eq!(results.lock().len(), WAITERS);
-        kassert!(results.lock().iter().all(|&r| r == (false, true)));
-        kassert!(fired >= WAITERS as u64 && late == 0 && early == 0);
-        Ok(())
+        Err("the waiters never all blocked before their deadline")
     }
 );
 
