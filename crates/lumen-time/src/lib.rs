@@ -346,16 +346,13 @@ pub enum Pause {
     CountRead,
 }
 
-/// The unsteady windows a calibration took: how many, the first, the last,
-/// and the shortest (by reference ticks) after the first. Each was followed
-/// by another window, unless attempts ran out; [`steadiest_windows`] may
-/// still keep some, to fill in.
+/// The unsteady windows a calibration took: how many, and the last. Each was
+/// followed by another window, unless attempts ran out;
+/// [`steadiest_windows`] may still keep some, to fill in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SetAside {
     pub count: usize,
-    pub first: Option<Window>,
     pub last: Option<Window>,
-    pub shortest_after_first: Option<Window>,
 }
 
 /// The most a median of `windows`' rates can be off, in parts per million
@@ -475,17 +472,7 @@ pub fn steadiest_windows<E, const N: usize>(
             out.steady += 1;
             continue;
         }
-        let a = out.aside;
-        out.aside = SetAside {
-            count: a.count + 1,
-            first: a.first.or(Some(w)),
-            last: Some(w),
-            shortest_after_first: match (a.first, a.shortest_after_first) {
-                (None, _) => None,
-                (Some(_), Some(s)) if s.reference <= w.reference => Some(s),
-                (Some(_), _) => Some(w),
-            },
-        };
+        out.aside = SetAside { count: out.aside.count + 1, last: Some(w) };
         let at = spare[..spares].iter().position(|s| bound(&w) < bound(s)).unwrap_or(spares);
         if at < N {
             spares = (spares + 1).min(N);
@@ -867,27 +854,6 @@ mod tests {
     }
 
     #[test]
-    fn the_windows_set_aside_are_counted_first_last_and_shortest_after_the_first() {
-        // Unsteady windows of 100, 500, 300 and 900 reference ticks among
-        // steady ones: the first is the 100, the last the 900, and the
-        // shortest after the first the 300 (the first doesn't count).
-        let unsteady = |reference| Window { tsc: 1_000, reference, polls: 1, start_gap: 0, end_gap: 500 };
-        let steady = |reference| Window { tsc: 1_000_000, reference, polls: 1, start_gap: 0, end_gap: 0 };
-        let mut taken = [unsteady(100), steady(1), unsteady(500), unsteady(300), steady(2), unsteady(900), steady(3)]
-            .into_iter();
-        let r = steadiest_windows::<(), 3>(10, || Ok(taken.next().unwrap()), Window::gap_ppm, |_| {}).unwrap();
-        let aside = r.aside();
-        assert_eq!(aside.count, 4);
-        assert_eq!(aside.first.map(|w| w.reference), Some(100));
-        assert_eq!(aside.last.map(|w| w.reference), Some(900));
-        assert_eq!(aside.shortest_after_first.map(|w| w.reference), Some(300));
-        // One set aside: no shortest after it.
-        let mut taken = [unsteady(100), steady(1), steady(2), steady(3)].into_iter();
-        let r = steadiest_windows::<(), 3>(10, || Ok(taken.next().unwrap()), Window::gap_ppm, |_| {}).unwrap();
-        assert_eq!((r.aside().count, r.aside().shortest_after_first), (1, None));
-    }
-
-    #[test]
     fn a_window_is_steady_within_half_a_percent() {
         assert!(window(10_000_000, 0, 0).is_steady());
         assert!(window(10_000_000, 20_000, 30_000).is_steady()); // exactly 0.5%
@@ -918,13 +884,7 @@ mod tests {
             .into_iter()
             .chain((104..).map(|t| window(t, 0, 0)));
         let r = steadiest_windows::<(), 3>(10, || Ok(taken.next().unwrap()), Window::gap_ppm, |_| {}).unwrap();
-        let aside = SetAside {
-            count: 2,
-            first: Some(window(101, 0, 50)),
-            last: Some(window(103, 9, 0)),
-            shortest_after_first: Some(window(103, 9, 0)),
-        };
-        assert_eq!((r.steady(), r.aside()), (3, aside));
+        assert_eq!((r.steady(), r.aside()), (3, SetAside { count: 2, last: Some(window(103, 9, 0)) }));
         assert_eq!(r.windows().map(|w| w.tsc), [100, 102, 104]);
         let r = steadiest_windows::<(), 3>(3, || Ok(window(7, 0, 0)), Window::gap_ppm, |_| {}).unwrap();
         assert_eq!((r.steady(), r.aside()), (3, SetAside::default()));

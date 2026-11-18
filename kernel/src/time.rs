@@ -76,17 +76,13 @@ static BOOT_TIMER_CALIBRATION: SpinLock<Option<Calibration>> = SpinLock::new(Non
 /// windows (the steady ones first, in the order they were taken; if attempts
 /// ran out, the unsteady ones with the smallest bounds fill the rest), and
 /// how many unsteady windows were taken (each followed by another, unless
-/// attempts ran out; filling in, some are kept), the first of those and the
-/// last.
+/// attempts ran out; filling in, some are kept) and the last of those.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Calibration {
     pub hz: u64,
     pub windows: [Window; WINDOWS],
     pub retaken: usize,
-    pub first_retaken: Option<Window>,
     pub last_retaken: Option<Window>,
-    /// The shortest unsteady window (by reference ticks) after the first.
-    pub shortest_retaken_after_first: Option<Window>,
     pub of: Calibrated,
 }
 
@@ -461,15 +457,7 @@ fn median_calibration(got: &Steadiest<WINDOWS>, of: Calibrated, known_hz: u64) -
     }
     let hz = lumen_time::median(&mut hz).expect("WINDOWS samples");
     let aside = got.aside();
-    Ok(Calibration {
-        hz,
-        windows: *got.windows(),
-        retaken: aside.count,
-        first_retaken: aside.first,
-        last_retaken: aside.last,
-        shortest_retaken_after_first: aside.shortest_after_first,
-        of,
-    })
+    Ok(Calibration { hz, windows: *got.windows(), retaken: aside.count, last_retaken: aside.last, of })
 }
 
 /// A [`Pause`] hook that stalls each window's end by `stall.end` parts per
@@ -545,14 +533,22 @@ const _: () = assert!(MOST_HPET_STRETCH == 16);
 /// reads took 20 times as long, 16 of 20 windows unsteady however late they
 /// were taken; the PIT can't stretch past `pit_end_unambiguous`'s 13,107
 /// ticks, about 11 ms). Call with interrupts off.
-fn calibrate_with_hpet(hpet: &HpetCounter, mut pause: impl FnMut(Pause)) -> Result<Calibration, CalError> {
+fn calibrate_with_hpet(hpet: &HpetCounter, pause: impl FnMut(Pause)) -> Result<Calibration, CalError> {
+    median_tsc_hz(Reference::Hpet, hpet.clock().hz(), hpet_windows(hpet, pause))
+}
+
+/// HPET windows, as [`calibrate_with_hpet`] takes them: the first
+/// [`WINDOW_NS`] long, each next one at least as long as
+/// [`lumen_time::stretched_for_gaps`] made the target from the last (which
+/// only grows, up to [`MOST_HPET_STRETCH`] windows' worth).
+fn hpet_windows(hpet: &HpetCounter, mut pause: impl FnMut(Pause)) -> impl FnMut() -> Result<Window, CalError> {
     let base = hpet.clock().ticks(WINDOW_NS);
     let mut target = base;
-    median_tsc_hz(Reference::Hpet, hpet.clock().hz(), || {
+    move || {
         let w = hpet_window(hpet, target, &mut pause)?;
         target = lumen_time::stretched_for_gaps(target, &w, base.saturating_mul(MOST_HPET_STRETCH));
         Ok(w)
-    })
+    }
 }
 
 /// One window of at least `target` HPET ticks, each end a counter read between
@@ -1403,9 +1399,7 @@ crate::ktest!(
             hz: 2_500_000_000,
             windows: [w(end_gap); WINDOWS],
             retaken: 0,
-            first_retaken: None,
             last_retaken: None,
-            shortest_retaken_after_first: None,
             of: Calibrated::Tsc(Reference::Pit),
         };
         let (wide, fine) = (cal(200_000), cal(1_000));
@@ -1739,27 +1733,39 @@ crate::ktest!(
         let hpet = hpet().ok_or("no HPET")?;
         let hz = tsc().ok_or("TSC not calibrated")?.hz();
         let base = hpet.clock().ticks(WINDOW_NS);
+        // The windows as the calibration takes them, the unsteady ones (set
+        // aside) watched: the first, and the shortest after it.
+        let (mut first, mut shortest) = (None::<Window>, None::<Window>);
+        let mut take = hpet_windows(&hpet, sleep_at(Pause::EndBeforeRead, 200_000));
         let cal = off_or_diag("calibrating against the HPET failed", || {
-            calibrate_with_hpet(&hpet, sleep_at(Pause::EndBeforeRead, 200_000))
+            median_tsc_hz(Reference::Hpet, hpet.clock().hz(), || {
+                let w = take()?;
+                if !w.is_steady() {
+                    if first.is_none() {
+                        first = Some(w);
+                    } else if shortest.is_none_or(|s| w.reference < s.reference) {
+                        shortest = Some(w);
+                    }
+                }
+                Ok(w)
+            })
         })?;
         crate::ktest::diag(format_args!("{cal}, median within {} ppm", cal.median_bound_ppm()));
         kassert_eq!(cal.steady(), WINDOWS);
         // Taken again at least once: the first, 10 ms window can't be steady
         // with 200 µs reads. And a stretched window keeps its length (the
-        // target only grows): after the first window set aside, every
-        // window is at least as long as `stretched_for_gaps` made the target
-        // from it, so every later one set aside (a busy host's stall: as
-        // many as it likes, #184), the shortest of them too, is that long:
-        // never a 10 ms one again, nor one grown too slowly. (The stretch is
-        // judged from that first window's own gaps, so a host stall in it,
-        // which can make it small, can't fail this; nor can a long window
-        // set aside last hide a short one before it.)
+        // target only grows): after the first window set aside, every window
+        // is at least as long as `stretched_for_gaps` made the target from
+        // it, so the shortest later one set aside (a busy host's stall: as
+        // many as it likes, #184) is too: never a 10 ms one again, nor one
+        // grown too slowly. The stretch is judged from that first window's
+        // own gaps, so a host stall in it can't fail this, and a long window
+        // set aside last can't hide a short one before it.
         kassert!(cal.retaken >= 1);
-        if cal.retaken > 1 {
-            let first = cal.first_retaken.ok_or("no first window set aside")?;
-            let shortest = cal.shortest_retaken_after_first.ok_or("no later window set aside")?;
-            let stretched = lumen_time::stretched_for_gaps(base, &first, base.saturating_mul(MOST_HPET_STRETCH));
-            crate::ktest::diag(format_args!("first set aside {first}, shortest after it {shortest}; stretched to {stretched}"));
+        let first = first.ok_or("no window set aside")?;
+        let stretched = lumen_time::stretched_for_gaps(base, &first, base.saturating_mul(MOST_HPET_STRETCH));
+        crate::ktest::diag(format_args!("first set aside {first}, then shortest {shortest:?}; stretched to {stretched}"));
+        if let Some(shortest) = shortest {
             kassert!(shortest.reference >= stretched);
         }
         // Longer than 10 ms: every window is at least its target. (Not a
@@ -2012,9 +2018,7 @@ crate::ktest!(
             hz: 62_500_000,
             windows: gaps.map(w),
             retaken,
-            first_retaken: Some(w(60_000)),
             last_retaken: Some(w(60_000)),
-            shortest_retaken_after_first: None,
             of,
         };
         let timer = |gaps, retaken| report(&cal(gaps, retaken, Calibrated::Timer { tsc_ppm: 0 }));
@@ -2119,9 +2123,7 @@ crate::ktest!(
             hz: 2_500_000_000,
             windows: [Window { tsc: 10_000_000, reference: 1_000_000, polls: 800, start_gap: 0, end_gap }; WINDOWS],
             retaken: 20,
-            first_retaken: None,
             last_retaken: None,
-            shortest_retaken_after_first: None,
             of,
         };
         let hpet = report(&cal(130_000, Calibrated::Tsc(Reference::Hpet)));
@@ -2175,9 +2177,7 @@ crate::ktest!(
             hz: 62_500_000,
             windows: windows.map(parse),
             retaken,
-            first_retaken: None,
             last_retaken: None,
-            shortest_retaken_after_first: None,
             of: Calibrated::Timer { tsc_ppm: 1_200 },
         };
         let ci = timer(
