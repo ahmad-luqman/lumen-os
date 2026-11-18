@@ -85,6 +85,8 @@ pub struct Calibration {
     pub retaken: usize,
     pub first_retaken: Option<Window>,
     pub last_retaken: Option<Window>,
+    /// The shortest unsteady window (by reference ticks) after the first.
+    pub shortest_retaken_after_first: Option<Window>,
     pub of: Calibrated,
 }
 
@@ -465,6 +467,7 @@ fn median_calibration(got: &Steadiest<WINDOWS>, of: Calibrated, known_hz: u64) -
         retaken: aside.count,
         first_retaken: aside.first,
         last_retaken: aside.last,
+        shortest_retaken_after_first: aside.shortest_after_first,
         of,
     })
 }
@@ -1402,6 +1405,7 @@ crate::ktest!(
             retaken: 0,
             first_retaken: None,
             last_retaken: None,
+            shortest_retaken_after_first: None,
             of: Calibrated::Tsc(Reference::Pit),
         };
         let (wide, fine) = (cal(200_000), cal(1_000));
@@ -1744,18 +1748,19 @@ crate::ktest!(
         // with 200 µs reads. And a stretched window keeps its length (the
         // target only grows): after the first window set aside, every
         // window is at least as long as `stretched_for_gaps` made the target
-        // from it, so any later one set aside (a busy host's stall: as many
-        // as it likes, #184) is that long too, never a 10 ms one again, as
-        // lengths falling back after a steady window would leave it. (The
-        // stretch itself is judged from that first window's own gaps, so a
-        // host stall in it, which can make it small, can't fail this.)
+        // from it, so every later one set aside (a busy host's stall: as
+        // many as it likes, #184), the shortest of them too, is that long:
+        // never a 10 ms one again, nor one grown too slowly. (The stretch is
+        // judged from that first window's own gaps, so a host stall in it,
+        // which can make it small, can't fail this; nor can a long window
+        // set aside last hide a short one before it.)
         kassert!(cal.retaken >= 1);
         if cal.retaken > 1 {
             let first = cal.first_retaken.ok_or("no first window set aside")?;
-            let last = cal.last_retaken.ok_or("no window set aside")?;
+            let shortest = cal.shortest_retaken_after_first.ok_or("no later window set aside")?;
             let stretched = lumen_time::stretched_for_gaps(base, &first, base.saturating_mul(MOST_HPET_STRETCH));
-            crate::ktest::diag(format_args!("first set aside {first}, last {last}; stretched to {stretched}"));
-            kassert!(last.reference >= stretched);
+            crate::ktest::diag(format_args!("first set aside {first}, shortest after it {shortest}; stretched to {stretched}"));
+            kassert!(shortest.reference >= stretched);
         }
         // Longer than 10 ms: every window is at least its target. (Not a
         // ceiling: a window ends at its first poll past the target, and a host
@@ -2009,6 +2014,7 @@ crate::ktest!(
             retaken,
             first_retaken: Some(w(60_000)),
             last_retaken: Some(w(60_000)),
+            shortest_retaken_after_first: None,
             of,
         };
         let timer = |gaps, retaken| report(&cal(gaps, retaken, Calibrated::Timer { tsc_ppm: 0 }));
@@ -2115,6 +2121,7 @@ crate::ktest!(
             retaken: 20,
             first_retaken: None,
             last_retaken: None,
+            shortest_retaken_after_first: None,
             of,
         };
         let hpet = report(&cal(130_000, Calibrated::Tsc(Reference::Hpet)));
@@ -2170,6 +2177,7 @@ crate::ktest!(
             retaken,
             first_retaken: None,
             last_retaken: None,
+            shortest_retaken_after_first: None,
             of: Calibrated::Timer { tsc_ppm: 1_200 },
         };
         let ci = timer(
