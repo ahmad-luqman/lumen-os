@@ -203,6 +203,8 @@ def test_in_kernel_tests_pass_with_calibrations_stalled_within_tolerance(boot, k
     # and fewer than all.
     said = re.search(rf"^# ktest: only {re.escape(only)}: (\d+) of (\d+)$", out, re.MULTILINE)
     assert said, "no filter comment"
+    # After the results, so it is no test's diagnostic.
+    assert out.index("# ktest: only") > out.rindex("\nok "), out[-2000:]
     assert int(said[1]) == report.planned < int(said[2]), (said[0], report.summary())
     assert all(c.name.startswith(CALIBRATION_KTESTS) for c in report.cases), report.summary()
     ran = {p for p in CALIBRATION_KTESTS for c in report.cases if c.name.startswith(p)}
