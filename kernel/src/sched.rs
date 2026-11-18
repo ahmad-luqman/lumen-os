@@ -1426,19 +1426,28 @@ fn last_cpu() -> Result<usize, &'static str> {
 
 crate::ktest!(
     fn busy_and_idle_ticks_are_counted() {
-        // On the last CPU: a thread spinning there for 100 ms reads that
-        // span busy (it reads the CPU's ticks itself at its start and end,
-        // so the span is only its spinning), then 100 ms with nothing to run
-        // there reads idle.
+        // On the last CPU: a thread spinning there until the CPU has taken
+        // TICKS ticks reads them busy (it reads the CPU's ticks itself at its
+        // start and end, so the span is only its spinning); then, with
+        // nothing to run there, the CPU's next TICKS ticks read idle. Counted
+        // in ticks, not over a fixed time: a loaded host delivers a vCPU it
+        // stalls fewer ticks than 1 kHz (#134: 18 in a 100 ms spin, and 12 in
+        // a 100 ms sleep), which says nothing about how they're counted.
+        // TICKS is what 100 ms gives at 1 kHz, so the shares keep the
+        // granularity they had over 100 ms. DEADLINE_NS only keeps a CPU
+        // whose ticks stopped from hanging the run (the tick's rate is
+        // `the_timer_ticks_on_its_vector`'s): half the test deadline, so the
+        // spinner is done before `join_bounded` gives up on it.
         use crate::kassert;
-        const SPAN_NS: u64 = 100_000_000;
+        const TICKS: u64 = 100;
+        const DEADLINE_NS: u64 = TEST_DEADLINE_NS / 2;
         let cpu = last_cpu()?;
         let span: Arc<SpinLock<Option<CpuTicks>>> = Arc::new(SpinLock::new(None));
         let result = span.clone();
         let spinner = spawn_test(cpu, "busy-test", move || {
             let start = cpu_ticks(cpu);
-            let end = time::now_ns() + SPAN_NS;
-            while time::now_ns() < end {
+            let deadline = time::now_ns() + DEADLINE_NS;
+            while cpu_ticks(cpu).since(start).ticks < TICKS && time::now_ns() < deadline {
                 core::hint::spin_loop();
             }
             *result.lock() = Some(cpu_ticks(cpu).since(start));
@@ -1446,17 +1455,21 @@ crate::ktest!(
         join_bounded(spinner)?;
         let busy = span.lock().ok_or("the spinner didn't report")?;
         let before = cpu_ticks(cpu);
-        time::sleep(SPAN_NS);
+        let deadline = time::now_ns() + DEADLINE_NS;
+        while cpu_ticks(cpu).since(before).ticks < TICKS && time::now_ns() < deadline {
+            time::sleep(1_000_000);
+        }
         let idle = cpu_ticks(cpu).since(before);
         crate::ktest::diag(format_args!(
-            "cpu {cpu}: spinning {}% of {} ticks, sleeping {}% of {}",
+            "cpu {cpu}: spinning {}% of {} ticks, sleeping {}% of {} (each until {TICKS} ticks, or {} ms)",
             busy.busy_percent(),
             busy.ticks,
             idle.busy_percent(),
-            idle.ticks
+            idle.ticks,
+            DEADLINE_NS / 1_000_000,
         ));
-        kassert!(busy.ticks >= 20 && busy.busy_percent() >= 80);
-        kassert!(idle.ticks >= 20 && idle.busy_percent() <= 20);
+        kassert!(busy.ticks >= TICKS && busy.busy_percent() >= 80);
+        kassert!(idle.ticks >= TICKS && idle.busy_percent() <= 20);
         Ok(())
     }
 );
