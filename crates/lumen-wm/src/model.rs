@@ -249,6 +249,14 @@ fn a_panel_opened_later_moves_the_windows_under_its_rows_above_them() {
 }
 
 #[test]
+fn a_panel_taller_than_the_screen_is_cut_to_it() {
+    let mut wm = wm();
+    let (p, _) = wm.open_panel("panel", H + 10);
+    assert_eq!(frame(&wm, p), Rect::new(0, 0, W, H));
+    assert_eq!(wm.work_height(), 0);
+}
+
+#[test]
 fn minimizing_ends_a_grab_and_a_drag_on_it() {
     let mut wm = wm();
     let _a = open(&mut wm, 0, 0, 12, 10);

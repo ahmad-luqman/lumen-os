@@ -595,3 +595,128 @@ fn a_failed_action_answers_failed_through_serve() {
     // A focus, which presses nothing, is served as a row.
     assert!(matches!(serve(&mut app, &mut FixedText, AREA, id, &Action::Focus), Served::Row { .. }));
 }
+
+/// A bar whose focused `target` (made by `make` before a label that can
+/// widen) is then pushed past the pinned clock by the label growing.
+fn pushed_out(make: impl FnOnce(&mut Ui, crate::ui::Stack) -> Widget) -> (Ui, Widget) {
+    let mut ui = Ui::bar(4);
+    let row = ui.hstack(None, "Windows");
+    let wide = ui.label(Some(row), "Wide", "ab");
+    let target = make(&mut ui, row);
+    let clock = ui.fixed_label(None, "Clock", "00:00", 40);
+    assert!(ui.pin_right(clock));
+    let area = Rect::new(0, 0, 400, 40);
+    ui.set_window_focused(true);
+    ui.layout(area, &mut FixedText);
+    let _ = ui.invoke(ui.id(target).expect("live").get(), &Action::Focus);
+    assert_eq!(ui.focused(), Some(target));
+    ui.set_text(wide, &"x".repeat(60));
+    ui.layout(area, &mut FixedText);
+    let id = ui.id(target).expect("live").get();
+    assert!(ui.node(id).expect("listed").1.state().contains(StateFlags::HIDDEN));
+    (ui, target)
+}
+
+#[test]
+fn a_focused_widget_pushed_out_loses_the_focus_and_takes_no_key() {
+    // A button: Enter and Space press nothing.
+    let (mut ui, go) = pushed_out(|ui, row| ui.button(Some(row), "Go"));
+    assert_eq!(ui.focused(), None);
+    assert_eq!(ui.handle(Input::Key(Key::Enter)), alloc::vec![]);
+    assert_eq!(ui.handle(Input::Key(Key::Char(' '))), alloc::vec![]);
+    assert!(!ui.is_removed(go));
+    // A text field: typing changes nothing.
+    let (mut ui, field) = pushed_out(|ui, row| ui.text_field(Some(row), "Field", "ab"));
+    assert_eq!(ui.handle(Input::Key(Key::Char('z'))), alloc::vec![]);
+    assert_eq!(ui.handle(Input::Key(Key::Backspace)), alloc::vec![]);
+    assert_eq!(ui.text(field), Some("ab"));
+    // A menu: Enter doesn't expand it.
+    let (mut ui, menu) = pushed_out(|ui, row| ui.menu(Some(row), "Launcher", &["Terminal"]));
+    assert_eq!(ui.handle(Input::Key(Key::Enter)), alloc::vec![]);
+    assert_eq!(ui.expanded(menu), Some(false));
+}
+
+#[test]
+fn a_clicked_menu_that_folds_and_fits_again_keeps_the_focus() {
+    // Expanded by a click (focusing it), it no longer fits: the first pass
+    // hides and folds it, the second shows it folded, still focused.
+    let mut ui = Ui::bar(4);
+    let menu = ui.menu(None, "Launcher", &["Terminal", "Mandelbrot", "Life", "Counter"]);
+    let clock = ui.fixed_label(None, "Clock", "00:00", 40);
+    assert!(ui.pin_right(clock));
+    let area = Rect::new(0, 0, 260, 40);
+    ui.set_window_focused(true);
+    ui.layout(area, &mut FixedText);
+    let at = centre(ui.bounds(menu));
+    let events = click_at(&mut ui, at);
+    assert_eq!(events, [UiEvent::Expanded(menu, true)]);
+    ui.layout(area, &mut FixedText);
+    assert_eq!(ui.expanded(menu), Some(false));
+    assert!(!ui.bounds(menu).is_empty());
+    assert_eq!(ui.focused(), Some(menu));
+    assert_eq!(ui.handle(Input::Key(Key::Enter)), [UiEvent::Expanded(menu, true)]);
+}
+
+#[test]
+fn a_stack_none_of_which_shows_is_hidden() {
+    let mut ui = Ui::bar(4);
+    let first = ui.button(None, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    let row = ui.hstack(None, "Windows");
+    let inner = ui.button(Some(row), "B");
+    let clock = ui.fixed_label(None, "Clock", "00:00", 40);
+    assert!(ui.pin_right(clock));
+    ui.layout(Rect::new(0, 0, 400, 40), &mut FixedText);
+    assert!(!ui.bounds(first).is_empty());
+    for w in [row.widget(), inner] {
+        let node = ui.node(ui.id(w).expect("live").get()).expect("listed").1;
+        assert!(node.state().contains(StateFlags::HIDDEN), "{:?}", node.role());
+        assert!(ui.bounds(w).is_empty());
+    }
+    // Room for it: shown.
+    ui.layout(Rect::new(0, 0, 900, 40), &mut FixedText);
+    let node = ui.node(ui.id(row.widget()).expect("live").get()).expect("listed").1;
+    assert!(!node.state().contains(StateFlags::HIDDEN));
+}
+
+#[test]
+fn every_older_handle_stays_removed_across_reuses_of_its_slot() {
+    let mut ui = Ui::bar(4);
+    let row = ui.hstack(None, "Windows");
+    let mut old: Vec<Widget> = Vec::new();
+    let mut live = ui.button(Some(row), "B0");
+    for n in 1..6 {
+        assert!(ui.remove(live));
+        old.push(live);
+        live = ui.button(Some(row), &alloc::format!("B{n}"));
+        for &o in &old {
+            assert!(ui.is_removed(o), "reuse {n}: an older handle reaches the widget in its slot");
+        }
+        assert!(!ui.is_removed(live));
+    }
+}
+
+#[test]
+fn a_menu_folded_by_a_hide_disarms_its_items() {
+    // An item pressed, then the menu pushed out (hidden, folded), then room
+    // again and unfolded: the release over the item does nothing.
+    let mut ui = Ui::bar(4);
+    let wide = ui.label(None, "Wide", "ab");
+    let menu = ui.menu(None, "Launcher", &["Terminal", "Life"]);
+    let clock = ui.fixed_label(None, "Clock", "00:00", 40);
+    assert!(ui.pin_right(clock));
+    let area = Rect::new(0, 0, 600, 40);
+    ui.layout(area, &mut FixedText);
+    let _ = ui.invoke(ui.id(menu).expect("live").get(), &Action::Press);
+    ui.layout(area, &mut FixedText);
+    let life = ui.item_id(menu, 1).expect("item").get();
+    let (x, y) = centre(ui.node(life).expect("shown").1.bounds());
+    let _ = ui.handle(Input::Down { x, y });
+    ui.set_text(wide, &"x".repeat(70));
+    ui.layout(area, &mut FixedText);
+    assert_eq!(ui.expanded(menu), Some(false), "pushed out: folded");
+    ui.set_text(wide, "ab");
+    ui.layout(area, &mut FixedText);
+    ui.set_expanded(menu, true);
+    ui.layout(area, &mut FixedText);
+    assert_eq!(ui.handle(Input::Up { x, y }), alloc::vec![]);
+}

@@ -166,7 +166,11 @@ mod tests {
         let narrow = M.frame_for(0, 0, 4, 10);
         assert!(M.minimize_box(&narrow).is_empty());
         assert!(!M.close_box(&narrow).is_empty());
-        for f in [M.frame_for(0, 0, 0, 0), M.frame_for(i32::MAX - 3, i32::MIN, u32::MAX, u32::MAX)] {
+        // At the far left a narrow frame's boxes, cut to the title bar, could
+        // meet: the minimize box gives way.
+        let far = M.frame_for(i32::MIN, 0, 1, 20);
+        assert!(M.minimize_box(&far).intersect(&M.close_box(&far)).is_none());
+        for f in [M.frame_for(0, 0, 0, 0), M.frame_for(i32::MAX - 3, i32::MIN, u32::MAX, u32::MAX), far] {
             assert!(f.contains_rect(&M.minimize_box(&f)) || M.minimize_box(&f).is_empty());
         }
     }

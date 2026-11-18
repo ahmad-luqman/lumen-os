@@ -543,8 +543,8 @@ impl Ui {
             && *expanded != to
         {
             *expanded = to;
-            if !to && self.armed.is_some_and(|(a, item)| a == i && item.is_some()) {
-                self.armed = None;
+            if !to {
+                self.disarm_items(i);
             }
             self.touch(i);
         }
@@ -641,18 +641,29 @@ impl Ui {
 
     /// Each widget at its preferred size, the top ones from `area`'s
     /// corner (padded), down (or, in a [`Ui::bar`], across, with the pinned
-    /// one at the right), each stack's children one after another. A
-    /// widget that doesn't fit across is hidden (its bounds empty). If a
-    /// widget moved or changed size, everything is repainted and the tree
-    /// changed.
+    /// one at the right), each stack's children one after another. Past
+    /// the pinned widget a leaf is hidden (its bounds empty; a menu folded,
+    /// and the tree laid out again so it may show folded), a stack cut to
+    /// what shows of it (hidden if none does), and the focus leaves a
+    /// widget that ended up hidden. If a widget moved, changed size or was
+    /// hidden or shown, everything is repainted and the tree changed.
     pub fn layout(&mut self, area: Rect, text: &mut dyn Text) {
         let before = self.geometry();
         // Twice at most: a menu hidden in the first pass is folded, and its
         // smaller size may fit in the second.
         for _ in 0..2 {
-            if !self.place_all(area, text) {
+            let expanded = self.expanded_menus();
+            self.place_all(area, text);
+            if self.expanded_menus() == expanded {
                 break;
             }
+        }
+        // The focus leaves a widget that ended up hidden (after both passes:
+        // a menu a click expanded and focused may be folded in the first
+        // and fit again, folded, in the second, keeping it).
+        if let Some(f) = self.focus.filter(|&f| self.widgets[f].hidden) {
+            self.focus = None;
+            self.touch(f);
         }
         if self.geometry() != before {
             self.changed = true;
@@ -677,18 +688,23 @@ impl Ui {
             .collect()
     }
 
-    /// One layout pass; whether it folded a menu it hid.
-    fn place_all(&mut self, area: Rect, text: &mut dyn Text) -> bool {
+    /// How many menus are expanded (a layout pass that changes it folded
+    /// one it hid).
+    fn expanded_menus(&self) -> usize {
+        self.widgets.iter().filter(|w| !w.removed && matches!(w.kind, Kind::Menu { expanded: true, .. })).count()
+    }
+
+    /// One layout pass.
+    fn place_all(&mut self, area: Rect, text: &mut dyn Text) {
+        self.measure_menus(text);
         // Each widget after everything in it (the tree's order reversed:
         // a reused slot may come before its stack's).
         let mut sizes = alloc::vec![(0u32, 0u32); self.widgets.len()];
         for (i, _) in self.walk().into_iter().rev() {
             sizes[i] = self.size(i, text, &sizes);
         }
-        self.measure_menus(text);
         let pad = self.pad as i32;
         let top = self.top.clone();
-        let mut folded = false;
         match self.arrange {
             Arrange::Bar { pinned } => {
                 let right = area.right() - pad;
@@ -696,14 +712,14 @@ impl Ui {
                 let limit = match pinned {
                     Some(p) => {
                         let x = right - sizes[p].0 as i32;
-                        folded |= self.place(p, x, centred_y(sizes[p].1), &sizes, right);
+                        self.place(p, x, centred_y(sizes[p].1), &sizes, right);
                         x - GAP as i32
                     }
                     None => right,
                 };
                 let mut x = area.x() + pad;
                 for i in top.into_iter().filter(|&i| Some(i) != pinned) {
-                    folded |= self.place(i, x, centred_y(sizes[i].1), &sizes, limit);
+                    self.place(i, x, centred_y(sizes[i].1), &sizes, limit);
                     x += (sizes[i].0 + GAP) as i32;
                 }
             }
@@ -711,12 +727,11 @@ impl Ui {
                 let x = area.x() + pad;
                 let mut y = area.y() + pad;
                 for i in top {
-                    folded |= self.place(i, x, y, &sizes, i32::MAX);
+                    self.place(i, x, y, &sizes, i32::MAX);
                     y += (sizes[i].1 + GAP) as i32;
                 }
             }
         }
-        folded
     }
 
     /// Widget `i`'s preferred size, its children's in `sizes` already.
@@ -744,14 +759,15 @@ impl Ui {
                 let widest = items.iter().map(|i| text.width(&i.name)).max().unwrap_or(0);
                 (widest + 2 * FIELD_PAD, items.len() as u32 * (line + 2 * ROW_PAD))
             }
-            Kind::Menu { items, expanded, .. } => {
-                let (mut mw, h) = button_size(text, &w.name);
+            Kind::Menu { items, expanded, head } => {
+                // Measured by `measure_menus` (before the sizes).
+                let mut mw = head.w();
                 if *expanded {
                     for item in items {
-                        mw += GAP + button_size(text, &item.name).0;
+                        mw += GAP + item.width;
                     }
                 }
-                (mw, h)
+                (mw, head.h())
             }
         }
     }
@@ -772,8 +788,8 @@ impl Ui {
     /// Place widget `i` at (`x`, `y`). A leaf that would cross `limit` (a
     /// pinned widget's left, in a bar) is hidden; a stack that would is cut
     /// to what shows of it, each of its children placed (or hidden) in
-    /// turn. Whether it folded a menu it hid.
-    fn place(&mut self, i: usize, x: i32, y: i32, sizes: &[(u32, u32)], limit: i32) -> bool {
+    /// turn, and hidden itself if none of it shows.
+    fn place(&mut self, i: usize, x: i32, y: i32, sizes: &[(u32, u32)], limit: i32) {
         let (w, h) = sizes[i];
         let fits = i64::from(x) + i64::from(w) <= i64::from(limit);
         let leaf = !matches!(self.widgets[i].kind, Kind::Stack(_));
@@ -782,23 +798,24 @@ impl Ui {
         }
         self.widgets[i].hidden = false;
         self.widgets[i].bounds = Rect::new(x, y, w, h);
-        let mut folded = false;
         match &mut self.widgets[i].kind {
             Kind::Stack(dir) => {
                 let dir = *dir;
                 let children = self.widgets[i].children.clone();
                 let (mut cx, mut cy) = (x, y);
                 for c in children {
-                    folded |= self.place(c, cx, cy, sizes, limit);
+                    self.place(c, cx, cy, sizes, limit);
                     match dir {
                         Dir::Down => cy += (sizes[c].1 + GAP) as i32,
                         Dir::Across => cx += (sizes[c].0 + GAP) as i32,
                     }
                 }
                 if !fits {
-                    // What still shows of it.
+                    // What still shows of it (none: hidden).
                     let shown = (i64::from(limit) - i64::from(x)).clamp(0, i64::from(w)) as u32;
-                    self.widgets[i].bounds = Rect::new(x, y, shown, h);
+                    let s = &mut self.widgets[i];
+                    s.hidden = shown == 0;
+                    s.bounds = if s.hidden { Rect::EMPTY } else { Rect::new(x, y, shown, h) };
                 }
             }
             Kind::List { items, .. } => {
@@ -824,32 +841,35 @@ impl Ui {
             }
             _ => {}
         }
-        folded
     }
 
     /// Hide widget `i` and all it holds (bounds empty), folding a menu (its
-    /// items mustn't stay listed or chosen); whether it folded one.
-    fn hide(&mut self, i: usize) -> bool {
+    /// items mustn't stay listed or chosen).
+    fn hide(&mut self, i: usize) {
         let w = &mut self.widgets[i];
         w.hidden = true;
         w.bounds = Rect::EMPTY;
-        let mut folded = false;
         match &mut w.kind {
             Kind::List { items, .. } => items.iter_mut().for_each(|it| it.bounds = Rect::EMPTY),
             Kind::Menu { items, head, expanded } => {
                 items.iter_mut().for_each(|it| it.bounds = Rect::EMPTY);
                 *head = Rect::EMPTY;
-                folded = core::mem::replace(expanded, false);
+                if core::mem::replace(expanded, false) {
+                    self.disarm_items(i);
+                }
             }
             _ => {}
         }
-        if folded && self.armed.is_some_and(|(a, item)| a == i && item.is_some()) {
+        for c in self.widgets[i].children.clone() {
+            self.hide(c);
+        }
+    }
+
+    /// A press on one of widget `i`'s items is forgotten (its menu folded).
+    fn disarm_items(&mut self, i: usize) {
+        if self.armed.is_some_and(|(a, item)| a == i && item.is_some()) {
             self.armed = None;
         }
-        for c in self.widgets[i].children.clone() {
-            folded |= self.hide(c);
-        }
-        folded
     }
 
     // -- hit testing and dispatch ----------------------------------------------
@@ -995,7 +1015,8 @@ impl Ui {
     /// Run `action` on the node numbered `node` (a widget, or an item
     /// shown): the handler a click or key reaches, so the state after is
     /// the same as after the click. Errors change nothing: no such node,
-    /// an action its role doesn't list, a disabled node.
+    /// an action its role doesn't list, a disabled node, a hidden node
+    /// ([`InvokeError::Hidden`]).
     pub fn invoke(&mut self, node: u64, action: &Action) -> Result<Vec<UiEvent>, InvokeError> {
         let (i, item) = self.find(node).ok_or(InvokeError::NoNode)?;
         let role = match (item, &self.widgets[i].kind) {

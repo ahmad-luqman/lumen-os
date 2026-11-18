@@ -457,19 +457,10 @@ impl Wm {
         self.windows.push(Window { id, title: String::from(title), frame, minimized: false, panel: true });
         let mut out = Outcome::default();
         out.damage.add(frame);
-        for at in 0..self.windows.len() {
-            let w = &self.windows[at];
-            if w.panel {
-                continue;
-            }
-            let old = w.frame;
-            let (x, y) = self.clamp(old.w(), old.x(), old.y());
-            let new = Rect::new(x, y, old.w(), old.h());
-            if new != old {
-                self.windows[at].frame = new;
-                out.damage.add(old);
-                out.damage.add(new);
-            }
+        let placed: Vec<(WindowId, Rect)> = self.windows.iter().map(|w| (w.id, w.frame)).collect();
+        for (w, f) in placed {
+            // (`move_to` refuses the panel itself.)
+            out.merge(self.move_to(w, f.x(), f.y()).unwrap_or_default());
         }
         (id, out)
     }
@@ -613,12 +604,13 @@ impl Wm {
         // leaves it alone (a panel has no keys); a pause or a pointer gap
         // ends it, the panel told it lost its buttons.
         let panel_grab = grab.filter(|&g| Some(g) != self.focused);
-        let grabbing = grab.is_some() && !(why == Interruption::KeyGap && panel_grab.is_some());
-        if let Some(p) = panel_grab
-            && why != Interruption::KeyGap
-        {
+        if let Some(p) = panel_grab {
+            if why == Interruption::KeyGap {
+                return out;
+            }
             out.deliveries.push(Delivery::Lost(p));
         }
+        let grabbing = grab.is_some();
         match why {
             Interruption::Pause => {
                 self.paused = true;
