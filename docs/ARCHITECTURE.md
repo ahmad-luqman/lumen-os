@@ -2924,8 +2924,9 @@ tree`, `ui invoke`).
   `tests/golden/` and every scenario stays as it is. The desktop starts
   with the `desktop` command (from any shell, serial included) or the
   `lumen.desktop` boot flag; `make run DESKTOP=1` passes the flag.
-  Starting allocates the back buffer, then starts the `compositor`
-  thread, then takes the screen; if a step fails, what was done is undone
+  Starting allocates the back buffer, then decodes the wallpaper (once a
+  boot: a failure warns and the theme's colour is drawn instead; #154),
+  then starts the `compositor` thread, then takes the screen; if a step fails, what was done is undone
   and the command prints `desktop: not started: <reason>` (the boot flag
   logs it as `WARN desktop: not started: <reason>` once and the boot goes
   on in text mode).
@@ -3117,8 +3118,9 @@ until a crash.
   | `rationed`, `overflowed` | presses and moves dropped past a queue's 48 entries, and releases that didn't fit its 64 (each set `Lost`): their sum is `windows`' `lost`, totalled over every window, closed ones too |
   | `grab_ends` | grabs ended before their last button came up (their window closed or lost the focus, or input was interrupted) |
   | `dead_pushes` | events and flags for a window that had closed: its queue's own count after it was killed, plus deliveries whose window is no longer on the list (0 today by construction: the list and `lumen-wm` change in one hold; kept for #156's requests) |
-  | `glyph_misses` | glyphs the compositor rasterized for the titles (its glyph cache's misses): flat once every title's glyphs are cached (#154) |
-  | `glyphs_dropped` | glyphs `font::Text` left out because `lumen_gfx::Mask::new` refused their mask (a bug; the first warned about with its sizes) (#154) |
+  | `glyph_misses` | glyphs the compositor rasterized for the titles (its own glyph cache's misses, not the windows'): flat once every title's glyphs are cached; `-` with no UI font (#154) |
+  | `glyphs_dropped` | glyphs any `font::Text` in the kernel left out because `lumen_gfx::Mask::new` refused their mask (a bug; the first warned about with its sizes) (#154) |
+  | `wallpaper` | `shown`, or why not: `unreadable` (not a PNG, cut short, corrupt), `too-big`, `no-memory`, `none` (#154) |
   | `cancelled`, `late` | `ui invoke` requests cancelled at their deadline, and results that came after it |
   | `settled` | `yes` or `no`, below |
 
@@ -3172,14 +3174,9 @@ until a crash.
   only once the start completed (`OpenError::NoDesktop` until then), so a
   start that fails opens none and window ids are never reused in a boot.
   `Desktop::without_screen()` builds one with no compositor thread and no
-  screen, for the ktests (`desktop::opening_past_the_window_limit_fails`,
-  `desktop::a_closed_window_s_deliveries_count_as_dead_pushes`,
-  `desktop::a_second_request_is_refused_while_the_first_waits`,
-  `desktop::a_request_queued_when_the_desktop_pauses_is_answered_paused`,
-  `desktop::a_bad_wallpaper_falls_back_with_one_warning`,
-  `desktop::a_title_drawn_again_rasterizes_nothing`,
-  `desktop::a_theme_switch_repaints_everything_and_tells_each_window`), so
-  no ktest leaves a desktop running.
+  screen, for the `desktop::` ktests (the window limit, dead pushes, the
+  request slot, the wallpaper, the titles' cache, the theme's delivery),
+  so no ktest leaves a desktop running.
 - **Two surfaces per window**, each of its client size: the *owner's*,
   inside the handle (`surface_mut(&mut self)`), drawn with no lock at the
   owner's pace; and the *committed* one, behind the window's lock, which
@@ -3207,7 +3204,8 @@ until a crash.
 ### Window events (#153)
 
 `WindowHandle::next_event()` (non-blocking) and `wait_event()` (which sets
-the window's idle bit while it blocks on an idle queue) return
+the window's idle bit while it blocks until the owner has an event:
+`has_event()`, below) return
 `WindowEvent`s (the queue's request type is `desktop::Request`, an empty
 enum until #156 gives it variants, so no request can be queued yet): `Key(KeyEvent)`, `PointerDown`, `PointerMove`,
 `PointerUp` (client coordinates and the buttons held), `FocusGained`,
@@ -3223,17 +3221,23 @@ client area with, a window's first event and again after each switch).
   redraw are one path, and nothing it read before opening can be stale).
   While the count is behind, `next_event` returns `Theme` ahead of
   anything queued (entries, `Close` and requests included, unlike the
-  flags below, which keep their place), and `Window::has_event()`
-  (something queued, or a theme to tell) is what every wait for an event
-  wakes for (`wait_event`; #155's `wait_event_until` too). So it is never
-  dropped; several switches before the owner reads give at least one
-  `Theme`, the last carrying the current theme (a switch between the
-  owner's read of the count and of the theme gives a second). An owner
-  draws its client area with the `&'static Theme` it is handed, not
-  `desktop::theme()` (crate-private: the compositor's, `desktop
-  status`'s and `theme`'s). A window's count is behind until its owner
-  reads it, and `settled` needs every owner told of the last switch: a
-  test after `theme` waits for the owners' redraws too.
+  flags below, which keep their place). What an owner has to read (the
+  queue's state and the count) is private to one small module, which
+  answers only `has_event()` (something queued, or a theme to tell);
+  every wait goes through one private `Window::wait(deadline, also)` that
+  always ORs it in (`wait_event`; #155's `wait_event_until` builds on it,
+  never on a predicate of its own). So it is never dropped; several
+  switches before the owner reads give at least one `Theme`, the last
+  carrying the current theme (a switch between the owner's read of the
+  count and of the theme gives a second). An owner treats `Theme` as
+  "redraw" and draws with `WindowHandle::theme()`, the theme it was last
+  told of (the theme at the open until the first); `desktop::theme()` is
+  private to the compositor, `desktop status` and `theme`. A window's
+  count is behind until its owner reads it, and `settled` needs every
+  owner told of the last switch: a test after `theme` waits for the
+  owners' redraws too. Only windows hear a switch: something drawn
+  outside a window (#157's taskbar, if it isn't one) needs a count of its
+  own.
 
 - **Sticky flags beside the queue.** `Lost`, `Close`, a focus loss and a
   focus gain are flags beside the queue (`set_lost`, `request_close`,
@@ -3411,6 +3415,7 @@ from what they compare.
 | `desktop::COMPOSITOR` | the window list (`lumen-wm`), the gathered damage, the requests, the statistics | a few list operations, a snapshot |
 | a window's lock | its committed surface, its event queue, its flags | 16 rows of a commit or a blit, one queue operation |
 | `vt::CUT` | the cut | a read or a write (a leaf) |
+| `desktop::BOOT_WALLPAPER` | the embedded wallpaper's decode, once done (#154) | a read or a write of two `Arc`s (a leaf: nothing allocated or freed under it) |
 | `desktop::DONE`'s wait-queue lock | the threads waiting for an answer or for the compositor to catch up | a wake, or a wait's predicate, which takes `COMPOSITOR` (so this lock comes before it, and no wake is made holding `COMPOSITOR`) |
 | `term`'s screen lock | the terminals; and each row the compositor presents | one row of a present: at most 800 holds for a full present |
 
@@ -3512,8 +3517,10 @@ A host-tested `no_std` crate every desktop part draws with. Pixels are
   no line mask. The terminals keep the bitmap font.
 - **Text on the desktop** (#154): `font::Text` (`kernel/src/font.rs`) is
   one drawing thread's text: its own `Font<'static>` glyph cache over the
-  shared face, `draw(surface, x, y, text, px, colour, clip)` (returning
-  nothing), `measure` and `line_height`, at the public sizes `TITLE_PX`
+  shared face (`Text::new()`, which says why if the font didn't load),
+  `draw(surface, x, y, text, px, colour, clip)` (returning nothing),
+  `measure` (checked against the drawn ink: `font::text_ends_where_measure_says`)
+  and `line_height` (a `u32`), at the public sizes `TITLE_PX`
   (15), `TEXT_PX` (16) and `HEADING_PX` (24). The compositor has one for
   the titles (their line height worked out once), each window's owner its
   own (#156's widgets use it too). Each glyph's `Placed` mask goes through
@@ -3531,26 +3538,35 @@ A host-tested `no_std` crate every desktop part draws with. Pixels are
   embedded in the kernel and decoded once a boot, at the desktop's first
   start, after the back buffer is allocated (the desktop needs that; the
   wallpaper is optional), said at INFO with its size and the time it
-  took; the result, or the failure, is kept, so a start that fails after
-  it doesn't decode or warn again. `lumen_png::decode` over `zune-png`
-  (`=0.5.2`, without its `std` and `sse` features; strict mode: every
-  chunk's CRC and the zlib stream's Adler-32 checked): any PNG into
-  `0x00RRGGBB` pixels, alpha dropped and 16-bit samples cut to their top 8
-  bits, its pixels handed to the surface with no copy
-  (`Image::into_pixels`, `Surface::from_pixels`); not a PNG, cut short,
-  corrupt or bigger than 4096 pixels each way is an error, never a panic
-  (host-tested: every truncation and every flipped byte of a small file,
-  an Adam7 file). The size is checked from IHDR before any image data is
-  inflated, and a compressed `zTXt`, `iTXt` or `iCCP` chunk of more than
-  4096 bytes is refused before the decoder sees the file (it inflates
-  them while reading the headers). The decoder's own buffers abort on a
-  heap that can't hold them (`Vec`s); the samples' and the pixels' refuse.
-  It is drawn centred: cut where it is bigger than the screen, the
-  theme's `desktop` colour around it where it is smaller
+  took. The result, or why it failed, is kept (`BOOT_WALLPAPER`), so a
+  start that fails after it doesn't decode or warn again; a decode the
+  heap couldn't hold isn't kept, and is tried (and warned about) again at
+  the next start (`desktop::a_wallpaper_is_decoded_and_warned_about_once`).
+  `lumen_png::decode` over `zune-png` (`=0.5.2`, without its `std` and
+  `sse` features; strict mode: every chunk's CRC and the zlib stream's
+  Adler-32 checked): any PNG into `0x00RRGGBB` pixels, alpha dropped and
+  16-bit samples cut to their top 8 bits, its pixels handed to the
+  surface with no copy (`Image::into_pixels`, `Surface::from_pixels`).
+  Only the image's own chunks reach the decoder: IHDR, PLTE, the IDATs
+  and IEND are copied whole into a buffer of their own, and every
+  ancillary chunk is dropped, so nothing but the image data is ever
+  inflated (zune-png inflates text and colour-profile chunks while
+  reading the headers, and its parsers don't always take what a chunk
+  declares; host-tested with hidden and many-chunk bombs under a refusing
+  heap). The size is checked from IHDR before any image data is inflated:
+  either side past 2048 pixels is refused (a 2048x2048 RGBA file peaks at
+  about 40 MiB while it decodes, since the decoder's inflated rows are
+  `Vec`s that abort on a heap that can't hold them; the copy, the
+  samples' and the pixels' buffers refuse). Not a PNG, cut short,
+  corrupt, an unknown critical chunk or too big is an error, never a
+  panic (host-tested: every truncation and every flipped byte of a small
+  file, an Adam7 file). It is drawn centred: cut where it is bigger than
+  the screen (`desktop::a_wallpaper_bigger_than_the_screen_is_cut_centred`),
+  the theme's `desktop` colour around it where it is smaller
   (`desktop::a_smaller_wallpaper_is_drawn_centred_over_the_flat_colour`).
   If it doesn't decode, the desktop uses that colour and logs `WARN
-  desktop: wallpaper not shown: <reason>` once a boot. One wallpaper for
-  both themes.
+  desktop: wallpaper not shown: <reason>`, and `desktop status`'s
+  `wallpaper` says why in a word. One wallpaper for both themes.
 - **Themes** (#154): `lumen-wm`'s `ThemeId::{Light, Dark}` and their
   palettes (`Theme::get(id)`, `Theme::LIGHT`, `Theme::DARK`). `theme`
   prints the current one (`theme: light`); `theme light|dark` switches
@@ -3560,7 +3576,9 @@ A host-tested `no_std` crate every desktop part draws with. Pixels are
   screen): a switch, under `COMPOSITOR`, changes it and its count and
   damages the live desktop's whole screen (one full recompose: frames
   and wallpaper); each window's owner is then told (`Theme`, above) and
-  redraws its client area in the theme it is handed. `desktop status`
+  redraws its client area in `WindowHandle::theme()`. Themes are named by
+  `ThemeId` (`index`/`from_index` checked at compile time; a `Theme`
+  carries its `id`). `desktop status`
   shows it (`theme`). The terminals keep their own palette (#155 decides
   whether terminal windows follow the theme).
 

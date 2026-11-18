@@ -168,7 +168,8 @@ own PR that updates that doc first.
   wallpaper (`assets/wallpaper/lumen.png`, made by `tools/wallpaper.py`; decoded once a boot at
   the first start, a flat colour and one warning if it doesn't), and the themes (`ThemeId`;
   `theme light|dark`, `lumen.theme=`: a switch damages the whole screen and tells each owner; a
-  window's first event is `WindowEvent::Theme`, the theme its owner draws with). `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
+  window's first event is `WindowEvent::Theme`; owners redraw on it with `WindowHandle::theme()`,
+  and every wait goes through `Window::wait`, which wakes for `has_event()`). `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -352,8 +353,8 @@ own PR that updates that doc first.
   `miniz_oxide`, the rows' and the file's buffers refused rather than
   aborted, the compressor's own boxes excepted), the decoder the
   wallpaper uses (`decode`: any PNG into `0x00RRGGBB` pixels with
-  `zune-png`, a bad, truncated, corrupt or too big file an error, never a
-  panic), CRC-32, and
+  `zune-png`, only the image's own chunks handed to it; a bad, truncated,
+  corrupt or too big file an error, never a panic), CRC-32, and
   the base64 frame a PNG travels in over serial, streamed from the stack
   (host-tested, incl. a refusing allocator, a golden file PIL decodes,
   every truncation and every flipped byte of a file).
