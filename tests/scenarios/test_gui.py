@@ -569,6 +569,25 @@ def heap_used(m: Machine) -> int:
     return int(found[1])
 
 
+def close_terminal(
+    m: Machine, title: str, threads: tuple[str, ...] = ("terminal", "term-shell")
+) -> None:
+    """Click terminal window `title`'s close box; wait until the window is
+    gone from `windows` and none of `threads` is in `threads`."""
+    x, y, w, _ = frame_of(gui.window(m, title))
+    # The close box: 16 pixels, 4 in from the right border, centred in the
+    # title bar.
+    click(m, x + w - 1 - 4 - 8, y + TITLE_H // 2)
+    gui.wait_for(
+        m,
+        f"{title} closed",
+        lambda: ([w["title"] for w in gui.windows(m)], thread_names(m)),
+        lambda got: title not in got[0] and not set(threads) & set(got[1]),
+        30,
+    )
+    gui.pointer_move(m, 1200, 790)
+
+
 def test_terminal_window_runs_shell(boot):
     # Two terminal windows, each its own shell. The second opens in front
     # and focused; a click on the first's client area focuses it, a click on
@@ -637,31 +656,29 @@ def test_closing_a_terminal_window_frees_it(boot):
     m = boot_tablet(boot)
     gui.start_desktop(m)
 
-    def close(title: str) -> None:
-        x, y, w, _ = frame_of(gui.window(m, title))
-        # The close box: 16 pixels, 4 in from the right border, centred in
-        # the title bar.
-        click(m, x + w - 1 - 4 - 8, y + TITLE_H // 2)
-        gui.wait_for(
-            m,
-            f"{title} closed",
-            lambda: ([w["title"] for w in gui.windows(m)], thread_names(m)),
-            lambda got: (
-                title not in got[0] and "terminal" not in got[1] and "term-shell" not in got[1]
-            ),
-            30,
-        )
-        gui.pointer_move(m, 1200, 790)
-
     open_terminal(m)
-    close("Terminal-1")
+    close_terminal(m, "Terminal-1")
     before = heap_used(m)
     open_terminal(m)
     names = thread_names(m)
     assert "terminal" in names and "term-shell" in names, names
     opened = heap_used(m)
-    close("Terminal-2")
+    close_terminal(m, "Terminal-2")
     after = heap_used(m)
     assert opened - before > 1024 * 1024, (before, opened)
     assert after - before <= 16 * 1024, (before, opened, after)
     assert gui.desktop_check(m) == (0, 0)
+
+
+def test_closing_a_terminal_window_ends_its_rhai(boot):
+    # `rhai`'s REPL waiting for a line in a terminal window when its close
+    # box is clicked: the REPL ends (a closed console is no Ctrl-C, which
+    # would only give a new prompt), then the shell, so the window's owner
+    # joins it: `rhai`, `term-shell` and `terminal` all leave `threads`.
+    m = boot_tablet(boot)
+    gui.start_desktop(m)
+    window = open_terminal(m)
+    gui.type_confirmed(m, "rhai\n")
+    expect_window(m, window, r"^rhai> $|^rhai>$")
+    assert "rhai" in thread_names(m)
+    close_terminal(m, "Terminal-1", ("rhai", "terminal", "term-shell"))

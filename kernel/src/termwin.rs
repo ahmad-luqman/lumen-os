@@ -23,9 +23,10 @@
 //!   `life`, a script's drawing) is refused in a terminal window
 //!   (`term::CanvasError::InWindow`); `top` writes text, and runs.
 //! - **Closing** (the close box): the owner tells the shell (its console
-//!   closes: every key asked is Ctrl-C, and the shell ends after the key or
-//!   command under way), closes the window at once, joins the shell, then
-//!   frees the terminal and ends. A command that never asks for a key keeps
+//!   closes: every key asked is `Key::Closed` from then on, which the line
+//!   editor, the shell, `rhai`'s REPL and every command reading keys stop
+//!   on), closes the window at once, joins the shell, then frees the
+//!   terminal and ends. A command that never asks for a key keeps
 //!   the shell (and its thread) until it returns.
 //! - `term text <window>` prints a terminal window's view as `term text`
 //!   prints the screen's ([`view_text`]).
@@ -308,7 +309,7 @@ impl crate::shell::Console for WindowConsole {
 
     fn try_key(&mut self) -> Option<Key> {
         if self.closed() {
-            return Some(Key::Ctrl('c'));
+            return Some(Key::Closed);
         }
         self.shared.keys.lock().pop_front()
     }
@@ -383,8 +384,56 @@ crate::ktest!(
         sched::join_bounded(shell)?;
         let mut console = WindowConsole { shared: shared.clone() };
         kassert!(crate::shell::Console::closed(&console));
-        kassert_eq!(crate::shell::Console::try_key(&mut console), Some(Key::Ctrl('c')));
+        kassert_eq!(crate::shell::Console::try_key(&mut console), Some(Key::Closed));
+        kassert_eq!(crate::shell::Console::read_key(&mut console), Key::Closed);
         kassert_eq!(crate::shell::Console::window(&console), Some(h.id()));
+        Ok(())
+    }
+);
+
+/// A window console's shared part on a desktop with no screen, for the
+/// ktests: `(shared, its window)`.
+#[cfg(feature = "ktest")]
+fn test_shared(d: &desktop::Desktop) -> Result<(Arc<Shared>, WindowHandle), &'static str> {
+    let h = d.open_window("t", 64, 64).map_err(|_| "a window")?;
+    let shared = Arc::new(Shared {
+        id: h.id(),
+        term: SpinLock::new(Terminal::new(COLS, ROWS, SCROLLBACK)),
+        keys: SpinLock::new(VecDeque::new()),
+        key_wait: WaitQueue::new(),
+        closed: AtomicBool::new(false),
+        output: AtomicBool::new(false),
+        owner: h.waker(),
+    });
+    Ok((shared, h))
+}
+
+crate::ktest!(
+    fn closing_a_window_ends_rhai_s_repl_and_its_shell() {
+        // `rhai`'s REPL waiting for a line in a terminal window when the
+        // window closes: the closed console's `Key::Closed` ends the REPL
+        // (where Ctrl-C would only restart its prompt), then the shell, so
+        // the owner's join returns (bounded here).
+        use crate::kassert;
+        let d = desktop::Desktop::without_screen();
+        let (shared, _h) = test_shared(&d)?;
+        let console = WindowConsole { shared: shared.clone() };
+        let shell = sched::spawn("ktest-term-shell", move || crate::shell::run_in_window(console, COLS))
+            .map_err(|_| "spawn failed")?;
+        for c in "rhai\n".chars() {
+            let key = Key::from_press(Some(c), None, lumen_input::Mods::NONE).ok_or("a key")?;
+            shared.keys.lock().push_back(key);
+        }
+        shared.key_wait.wake_all();
+        let deadline = crate::time::now_ns() + 10_000_000_000;
+        let in_repl = |s: &Shared| term::view_text_of(&s.term.lock()).rows.iter().any(|r| r.starts_with("rhai>"));
+        while !in_repl(&shared) {
+            kassert!(crate::time::now_ns() < deadline);
+            let _ = sched::sleep(5_000_000);
+        }
+        shared.closed.store(true, Ordering::Release);
+        shared.key_wait.wake_all();
+        sched::join_bounded(shell)?;
         Ok(())
     }
 );

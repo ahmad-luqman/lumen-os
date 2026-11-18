@@ -306,6 +306,28 @@ fn ctrl_w_deletes_the_word_before_the_cursor() {
 }
 
 #[test]
+fn a_closed_console_ends_the_line_and_writes_nothing() {
+    // `Key::Closed` (a terminal window closed, #155): the line is dropped,
+    // not kept in the history, nothing written (nothing would show it),
+    // and the event says to stop reading, unlike Ctrl-C's `Cancelled`.
+    for mode in [Mode::Ansi, Mode::Plain] {
+        let mut t = Typist::new(mode);
+        t.text("echo x");
+        t.take();
+        let mut out = String::new();
+        let event = t.editor.key(Key::Closed, &TABLE, &mut out).unwrap();
+        assert_eq!(event, Some(Event::Closed));
+        assert_eq!(out, "");
+        assert_eq!(t.editor.line(), "");
+        assert_eq!(t.editor.history().len(), 0);
+    }
+    // Nothing a person types makes it.
+    for c in ['\0', '\u{4}', '\u{1b}', 'x'] {
+        assert_ne!(Key::from_press(Some(c), None, lumen_input::Mods::NONE), Some(Key::Closed));
+    }
+}
+
+#[test]
 fn ctrl_c_drops_the_line_and_ctrl_l_shows_it_again() {
     use Key::*;
     let mut t = Typist::new(Mode::Ansi);

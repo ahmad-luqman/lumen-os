@@ -101,6 +101,8 @@ impl<'a> Ctx<'a> {
 
     /// The next key typed on this console, if one is waiting (never
     /// blocks): for a command that runs until a key (`q`, Ctrl-C) stops it.
+    /// `Key::Closed` means the console is gone (a terminal window closed):
+    /// stop as for Ctrl-C (it comes for every key asked from then on).
     /// On a virtual terminal, the keyboard's keys routed to it (routed while
     /// it was shown: `crate::vt`); Shift+PageUp/PageDown still scroll it and
     /// aren't returned, and keys the line editor doesn't take (Esc, F1) are
@@ -161,9 +163,10 @@ pub trait Console: Write + Send {
     fn window(&self) -> Option<u32> {
         None
     }
-    /// Whether it has gone (its window closed): the shell on it ends after
-    /// the key or command under way. Until then, a console that closes
-    /// gives Ctrl-C for every key asked, so a command waiting for one ends.
+    /// Whether it has gone (its window closed): from then on it gives
+    /// `Key::Closed` for every key asked (`read_key` and `try_key`), which
+    /// every reader stops on, and the shell on it ends after the key or
+    /// command under way.
     fn closed(&self) -> bool {
         false
     }
@@ -415,6 +418,7 @@ fn run_lines(mut console: impl Console, mut editor: Editor) {
             match event {
                 Ok(Some(Event::Line(line))) => break Some(line),
                 Ok(Some(Event::Cancelled)) => break None,
+                Ok(Some(Event::Closed)) => return,
                 _ => {}
             }
         };

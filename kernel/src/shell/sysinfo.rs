@@ -789,7 +789,7 @@ pub fn top(ctx: &mut Ctx<'_>, args: &[String]) {
     loop {
         let until = prev.ns + NS_PER_SEC;
         while crate::time::now_ns() < until {
-            if let Some(Key::Char('q') | Key::Ctrl('c')) = ctx.poll_key() {
+            if let Some(Key::Char('q') | Key::Ctrl('c') | Key::Closed) = ctx.poll_key() {
                 let _ = writeln!(ctx.out, "top: quit after {frame} frames");
                 return;
             }

@@ -56,6 +56,12 @@ pub enum Key {
     End,
     /// Ctrl and a letter (`'a'` to `'z'`).
     Ctrl(char),
+    /// The console's input ended for good (its terminal window closed,
+    /// #155): no key comes after it, and a console that gave it gives it
+    /// for every key asked from then on. Never typed: no decoder or
+    /// [`Key::from_press`] makes it. Every reader stops on it: the line
+    /// editor ends the line with [`Event::Closed`].
+    Closed,
 }
 
 impl Key {

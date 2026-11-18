@@ -3532,8 +3532,11 @@ scrollback, placed side by side (left, then right, a step lower each pair:
   `life` and a script's drawing refuse there with that line; `top` writes
   text, and runs. (The demos get windows of their own with #157.)
 - **Closing** (the close box): the owner closes the shell's console (from
-  then on every key it asks for is Ctrl-C, and the shell ends after the
-  key or command under way: `shell::Console::closed`), drops its
+  then on every key it asks for is `lumen_shell::Key::Closed`, never
+  typed: the line editor ends the line with `Event::Closed`, and the shell,
+  `rhai`'s REPL, `top`, `play` and a script's Ctrl-C check all stop on it,
+  where Ctrl-C would only restart a prompt; `shell::Console::closed`),
+  drops its
   `WindowHandle` (the window goes at once), joins the shell, frees the
   terminal and ends. A command that never asks for a key keeps the shell,
   and the owner's join, until it returns.
@@ -3548,7 +3551,10 @@ focus by clicking; `echo hello` typed lands in the second only; `life`
 refused there; the unfocused first's cursor hollow and steady),
 `scenario:test_gui::test_closing_a_terminal_window_frees_it` (both threads
 gone from `threads`, the heap back within 16 KiB, `desktop check` 0 and
-0), `cargo:lumen-term` (the renderer), `ktest:lumen_kernel::termwin::*`,
+0), `scenario:test_gui::test_closing_a_terminal_window_ends_its_rhai`
+(`rhai`'s REPL waiting in it: `rhai`, `term-shell` and `terminal` all
+end), `cargo:lumen-term` (the renderer), `cargo:lumen-shell`
+(`Key::Closed` ends the line), `ktest:lumen_kernel::termwin::*`,
 `ktest:lumen_kernel::desktop::wait_event_until_ends_at_its_deadline_or_a_wake`,
 `ktest:lumen_kernel::term::a_terminal_window_s_commands_get_no_canvas`, and
 the `test_term` goldens.
