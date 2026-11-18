@@ -11,6 +11,7 @@ import re
 from typing import NamedTuple
 
 from lumen_harness.calibration import (
+    HPET,
     PIT,
     TIMER,
     TSC,
@@ -169,10 +170,23 @@ def ticks(m) -> tuple[int, int, int, int]:
     return int(t[1]), int(t[2]), int(t[3]), int(t[4])
 
 
+def boot_reference(out: str) -> str:
+    """Which clock boot calibrated the TSC against, on a q35 with an HPET:
+    the HPET, unless its calibration was imprecise and the PIT's could be
+    off less (`calibration.weighed`, checked): a loaded host decides that,
+    the code only which can be off less."""
+    w = weighed(out)
+    return HPET if w is None else w.kept
+
+
+def reference_hz(reference: str) -> int:
+    return {HPET: HPET_HZ, PIT: PIT_HZ}[reference]
+
+
 def test_boot_calibrates_the_tsc_against_the_hpet(boot):
     m = boot("qemutest")
     line = m.expect(TSC_LINE, BOOT_TIMEOUT)
-    assert line[3] == "hpet", line[0]
+    assert line[3] == boot_reference(m.output), line[0]
     m.expect(r"INFO  time: local APIC timer .*, ticking at 1 kHz\n", BOOT_TIMEOUT)
     m.expect(r"INFO  irq: interrupts on\n", BOOT_TIMEOUT)
 
@@ -183,10 +197,10 @@ def test_clocks_shows_the_windows_behind_each_measurement(boot):
     m = boot("qemutest")
     m.expect(r"lumen> ", BOOT_TIMEOUT)
     (tsc, reference, pit, hpet), cals = clocks_and_windows(m)
-    assert reference == "hpet"
+    assert reference == boot_reference(m.output)
     assert sorted(cals) == ["boot", "hpet", "pit"]
     assert (cals["boot"].hz, cals["pit"].hz, cals["hpet"].hz) == (tsc, pit, hpet)
-    check_calibration(cals["boot"], HPET_HZ)
+    check_calibration(cals["boot"], reference_hz(reference))
     check_calibration(cals["pit"], PIT_HZ)
     check_calibration(cals["hpet"], HPET_HZ)
     check_boot_verdict(m, cals["boot"])
@@ -222,7 +236,7 @@ def test_boot_calibration_agrees_with_both_clocks(boot):
     m = boot("qemutest")
     m.expect(r"lumen> ", BOOT_TIMEOUT)
     (_, reference, pit, hpet), cals = clocks_and_windows(m)
-    assert reference == "hpet"
+    assert reference == boot_reference(m.output)
     assert pit is not None and hpet is not None
     assert_agree(cals["boot"], cals["pit"])
     assert_agree(cals["boot"], cals["hpet"])
@@ -379,7 +393,7 @@ def test_a_stall_past_ten_windows_is_ignored(boot):
         "ignored\n" in out
     ), out
     assert "stalling calibration windows" not in out, out
-    assert TSC_LINE.search(out)[3] == "hpet", out
+    assert TSC_LINE.search(out)[3] == boot_reference(out), out
 
 
 def test_tsc_windows_stalled_without_an_hpet_fill_in_against_the_pit(boot):

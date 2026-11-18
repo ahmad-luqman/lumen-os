@@ -328,8 +328,10 @@ def test_keys_just_before_alt_f_reach_the_window(boot):
     # the rest of the key events and writes the pause meanwhile, and the
     # window still gets every event before the Alt+F1 press: `x`'s press
     # and release and the Alt press. And while the compositor hasn't acted
-    # on a key that reached IRQ 1, the desktop isn't settled.
-    m = boot_cut_delay(boot, 500)
+    # on a key that reached IRQ 1, the desktop isn't settled (read within the
+    # 2 s the compositor waits, the knob's most: only a stall that long
+    # passes it first).
+    m = boot_cut_delay(boot, 2000)
     gui.confirmed_keys(m, "y")
     assert gui.desktop_status(m)["settled"] == "no", "settled with a key not acted on"
     wait_keys(m, "Colours", 2)

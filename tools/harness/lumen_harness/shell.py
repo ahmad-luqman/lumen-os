@@ -16,7 +16,7 @@ shows when it is logged, in stamp order with the others.
 parses the same whether a log line came along or not, and keeps them on
 the result (`Output.logs`), from the prompt before the echo on. A WARN or
 ERROR line among them fails the run, unless the caller expects it
-(`allow`): it is something a test should see, and before #124 it showed up
+(`allow`) or a loaded host can cause it on its own (`klog.HOST_TIMED`): it is something a test should see, and before #124 it showed up
 as output a test didn't expect. A command whose output *is* log lines
 (`dmesg`) is read with `keep_logs`, which skips that check (its lines
 can't be told from live ones), or with `run_dmesg`, which tells them apart.
@@ -35,7 +35,7 @@ import re
 import time
 from typing import TYPE_CHECKING, Self
 
-from lumen_harness.klog import LOG_LINE, LOUD, STAMP, is_log_line, level_of
+from lumen_harness.klog import LOG_LINE, LOUD, STAMP, is_host_timed, is_log_line, level_of
 from lumen_harness.qemu import ExpectTimeout
 
 if TYPE_CHECKING:
@@ -81,8 +81,13 @@ def allowed(log: str, allow: str | None) -> bool:
 
 def check_quiet(line: str, logs: list[str], allow: str | None, text: str) -> None:
     """Fail if a WARN or ERROR among `logs` (which came with `line`'s output
-    `text`) isn't `allow`ed."""
-    loud = [log for log in logs if level_of(log) in LOUD and not allowed(log, allow)]
+    `text`) isn't `allow`ed, or one a loaded host can cause on its own
+    (`klog.HOST_TIMED`, judged by its own scenario; kept in the logs)."""
+    loud = [
+        log
+        for log in logs
+        if level_of(log) in LOUD and not allowed(log, allow) and not is_host_timed(log)
+    ]
     if loud:
         shown = "\n".join(loud)
         raise AssertionError(

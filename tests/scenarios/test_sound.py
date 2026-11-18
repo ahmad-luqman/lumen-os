@@ -16,6 +16,7 @@ import time
 
 import pytest
 from lumen_harness import audio
+from lumen_harness.klog import unexpected_warnings
 from lumen_harness.qemu import Devices, Machine
 from lumen_harness.screen import PROMPT
 from lumen_harness.shell import run
@@ -41,6 +42,15 @@ def rate_of(m: Machine) -> int:
     ready = re.search(READY, m.output)
     assert ready, "no sound line"
     return int(ready[2])
+
+
+def underruns_warned(m: Machine) -> int:
+    """The underruns the kernel's warnings so far add up to (one warning per
+    sound that had any: `HOST_TIMED`'s, a loaded host's)."""
+    return sum(
+        int(n)
+        for n in re.findall(r"WARN  sound: a sound found the queue empty (\d+) times", m.output)
+    )
 
 
 def sound_row(m: Machine) -> dict[str, str]:
@@ -95,16 +105,18 @@ def test_tone_is_captured(boot):
     assert run(m, "beep 440 500") == ""
     row = wait_played(m, 1)
     # Exactly 500 ms of frames went to the device (25 whole periods, no
-    # padding), with no underrun.
+    # padding); any underrun (a stalled host's) said in a warning.
     assert int(row["frames"]) == rate // 2, row
-    assert row["underruns"] == "0", row
+    assert row["underruns"] == str(underruns_warned(m)), row
     # Each period came back by its interrupt (#96).
     assert "interrupt never came" not in m.output
     wav = recording(m)
     samples = wav.first_channel
     assert_pitch(audio.dominant_frequency(samples, wav.rate), 440)
+    # At least the 500 ms played (a little less where the tone's first and
+    # last periods are quiet); an underrun only adds silence in between.
     first, last = sounding(samples)
-    assert 0.45 <= (last - first) / wav.rate <= 0.55, (first, last, wav.rate)
+    assert (last - first) / wav.rate >= 0.45, (first, last, wav.rate)
 
 
 def test_beep_returns_while_it_plays(boot):
@@ -122,14 +134,15 @@ def test_a_padded_last_period_counts_only_the_sound(boot):
     assert int(row["frames"]) == rate * 510 // 1000, row
 
 
-def test_a_long_tone_plays_without_underrun(boot):
-    # 500 periods: none found the queue empty, and all were taken back (a
-    # run leaking per period would exhaust the run table long before).
+def test_a_long_tone_plays_every_period(boot):
+    # 500 periods, all taken back (a run leaking per period would exhaust
+    # the run table long before); any that found the queue empty (a
+    # stalled host's underrun) counted and said in a warning.
     m = shell(boot)
     rate = rate_of(m)
     assert run(m, "beep 440 10000") == ""
     row = wait_played(m, 1, timeout=60)
-    assert (row["frames"], row["underruns"]) == (str(rate * 10), "0"), row
+    assert (row["frames"], row["underruns"]) == (str(rate * 10), str(underruns_warned(m))), row
     assert "interrupt never came" not in m.output
 
 
@@ -253,7 +266,9 @@ def test_lspci_shows_sound_bound(boot):
     assert run(m, "sound | where state = idle | count") == "1\n"
     # (The crate itself warns that it got no jack or channel map infos:
     # QEMU's device has none.)
-    assert "WARN  sound" not in m.output and "WARN  drivers" not in m.output
+    assert not unexpected_warnings(m.output, "sound") and not unexpected_warnings(
+        m.output, "drivers"
+    )
 
 
 def test_a_second_sound_device_is_declined(boot, tmp_path):

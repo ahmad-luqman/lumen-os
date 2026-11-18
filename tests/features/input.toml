@@ -128,7 +128,7 @@ tests = [
     "scenario:test_shell::test_irqs_lists_msix",
     "scenario:test_input::test_a_pointer_move_raises_the_tablets_interrupt",
     "scenario:test_sound::test_tone_is_captured",
-    "scenario:test_sound::test_a_long_tone_plays_without_underrun",
+    "scenario:test_sound::test_a_long_tone_plays_every_period",
     "scenario:test_dev::test_random_with_only_virtio_rng",
 ]
 

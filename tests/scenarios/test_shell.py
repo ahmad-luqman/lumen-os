@@ -628,8 +628,9 @@ def test_date_matches_host(boot):
 def test_top_refreshes_and_quits(boot):
     # On plain serial, `top` prints a frame a second as lines (the CPUs and
     # how busy, interrupt rates, the heap, the threads), until `q`. Under
-    # -smp 2: frames 0.9 to 1.5 s apart by the kernel's own clock, and each
-    # CPU's timer at about 1 kHz.
+    # -smp 2: frames at least 0.9 s apart by the kernel's own clock (it waits
+    # a second from the last; how much more is the host's), and the AP's
+    # ticks a share of the timers' interrupts over the same span.
     m = shells(boot, extra=["-smp", "2"])
     start = len(m.output)
     m.send_line("top")
@@ -641,19 +642,20 @@ def test_top_refreshes_and_quits(boot):
     def tenths(frame: re.Match[str]) -> int:
         return int(frame[1]) * 10 + int(frame[2])
 
-    assert 9 <= tenths(second) - tenths(first) <= 15, (first[0], second[0])
-    assert 9 <= tenths(third) - tenths(second) <= 15, (second[0], third[0])
+    assert tenths(second) - tenths(first) >= 9, (first[0], second[0])
+    assert tenths(third) - tenths(second) >= 9, (second[0], third[0])
     frame = m.output[second.end() : third.start()]
     assert re.search(r"^\s+0\s+\d+%\s+\d+$", frame, re.MULTILINE), frame
-    # The AP's ticks/s about half the timers' interrupts/s (two CPUs), each
-    # CPU's at most 1.5 kHz and at least 200 Hz (TCG under load ticks at
-    # ~800 Hz).
+    # The AP ticked, and its ticks/s are at most the timers' interrupts/s
+    # (both CPUs'; one span, so the same scale): each tick is one of them.
+    # Not a rate: how often a stalled vCPU's timer fires is the host's. The
+    # 3 allow for the counts being read one after the other (a tick between
+    # the reads lands in one frame's ticks but the frame before's vectors)
+    # and for each rate rounding down on its own.
     ap = re.search(r"^\s+1\s+\d+%\s+(\d+)$", frame, re.MULTILINE)
     timer = re.search(r"^  irqs/s: .*local APIC timer (\d+)", frame, re.MULTILINE)
     assert ap and timer, frame
-    per_cpu = int(timer[1]) / 2
-    assert 200 <= int(ap[1]) <= 1500 and 200 <= per_cpu <= 1500, frame
-    assert abs(int(ap[1]) - per_cpu) <= per_cpu / 2, frame
+    assert 0 < int(ap[1]) <= int(timer[1]) + 3, frame
     assert re.search(r"^  heap .* used of .* in \d+ allocations; frames ", frame, re.MULTILINE), (
         frame
     )

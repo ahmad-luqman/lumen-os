@@ -207,3 +207,12 @@ milestone = "M4"
 tests = [
     "harness:test_scenario_typing::*",
 ]
+
+[[feature]]
+name = "A run's \"no warning\" checks leave out the warnings a loaded host can cause on its own (lumen_harness.klog.HOST_TIMED: the calibration verdicts and the TSC's PIT fallbacks, no timer interrupt in 100 ms, the serial prompt held, sound underruns; each tied by a test to the kernel's text, each judged by its own scenario): `unexpected_warnings` (whole runs: test_boot, test_dev, test_input, test_sound) and a serial command's check (`shell.run`, the warning kept in its logs); any other WARN or ERROR, found wherever its line starts, still fails"
+milestone = "M4"
+tests = [
+    "harness:test_klog::*",
+    "harness:test_shell_run::test_a_host_timed_warning_doesnt_fail_the_run_and_stays_in_its_logs",
+    "scenario:test_boot::test_boot_reaches_logger",
+]

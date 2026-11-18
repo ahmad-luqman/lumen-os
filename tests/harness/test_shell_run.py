@@ -47,6 +47,17 @@ def test_a_warning_fails_the_run_unless_allowed():
     assert isinstance(out, Output) and out.logs == [WARN]
 
 
+def test_a_host_timed_warning_doesnt_fail_the_run_and_stays_in_its_logs():
+    # A loaded host's underrun (klog.HOST_TIMED) lands in `sound`'s output.
+    underrun = "[    9.330000] WARN  sound: a sound found the queue empty 3 times (underruns)"
+    out = run(FakeMachine(f"lumen> sound\n{underrun}\nidle\nlumen> "), "sound")
+    assert out == "idle\n" and out.logs == [underrun]
+    # Beside another warning, that one still fails it, alone.
+    with pytest.raises(AssertionError) as e:
+        run(FakeMachine(f"lumen> sound\n{underrun}\n{ERROR}\nidle\nlumen> "), "sound")
+    assert str(e.value).split("\n--- output ---")[0].splitlines()[1:] == [ERROR]
+
+
 def test_allow_lets_only_its_lines_through():
     m = FakeMachine(f"lumen> x\n{WARN}\n{ERROR}\nok\nlumen> ")
     with pytest.raises(AssertionError) as e:
