@@ -953,7 +953,8 @@ own run queue (a FIFO) and only that CPU takes
 threads off it, so once its spawner has laid out its first frame, a
 thread's saved registers are touched only by its home CPU with interrupts
 off. A wake from another CPU queues the thread there and sends the
-`WAKEUP` IPI, so a halted CPU runs it before its next tick.
+`WAKEUP` IPI, so a halted CPU needn't wait for its next tick to run it (the
+IPI is tested; how soon the thread runs isn't, a loaded host decides it).
 
 - **Switching** (`arch::context::switch`, naked asm): pushes the
   callee-saved registers (rbx, rbp, r12-r15), saves `rsp`, loads the next

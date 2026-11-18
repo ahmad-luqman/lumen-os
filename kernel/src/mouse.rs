@@ -759,17 +759,35 @@ crate::ktest!(
     }
 );
 
-/// Ktests: wait, yielding, until [`hold`] has asked the thread to stop;
-/// whether it did. `hold` keeps asking only HOLD_WAIT_NS, so a helper
-/// stalled that long misses the ask (at risk on a busy host).
+/// Ktests: [`hold`]'s result, with a helper thread on this CPU that waits
+/// (yielding, up to the test deadline) until `hold` has asked the thread to
+/// stop and then calls `then`; an error if the helper never saw the ask,
+/// or if `hold`'s wait ran to its HOLD_WAIT_NS deadline (`then` didn't wake
+/// it, or came over a second late: a stall that long is at risk).
 #[cfg(feature = "ktest")]
-fn wait_for_the_ask() -> bool {
-    crate::sched::yield_until(|| reads() == Reads::HoldAsked)
+fn hold_with(name: &'static str, then: fn()) -> Result<Result<(), HoldError>, &'static str> {
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicBool;
+    let saw = Arc::new(AtomicBool::new(false));
+    let s = saw.clone();
+    let helper = crate::sched::spawn(name, move || {
+        s.store(crate::sched::yield_until(|| reads() == Reads::HoldAsked), Ordering::Release);
+        then();
+    })
+    .map_err(|_| "spawn")?;
+    let (got, timer_ended) = crate::sched::deadline_wakes_in(hold);
+    helper.join();
+    if !saw.load(Ordering::Acquire) || timer_ended != 0 {
+        crate::ktest::diag(format_args!(
+            "hold gave {got:?}, its wait ended by its deadline {timer_ended} times, the helper saw the ask: {}, \
+             reads now {:?}",
+            saw.load(Ordering::Acquire),
+            reads()
+        ));
+        return Err("the helper never saw hold ask, or didn't end hold's wait");
+    }
+    Ok(got)
 }
-
-/// Ktests: the error when a helper never saw [`hold`] ask.
-#[cfg(feature = "ktest")]
-const MISSED_THE_ASK: &str = "the helper never saw hold ask (stalled past HOLD_WAIT_NS?)";
 
 crate::ktest!(
     fn a_hold_that_no_thread_answers_is_taken_back() {
@@ -781,20 +799,9 @@ crate::ktest!(
         let _bound = MadeUp::bind(None)?;
         kassert_eq!(hold(), Err(HoldError::NotParked));
         kassert_eq!(reads(), Reads::Running);
-        // Only once `hold` has asked: a failure before the ask makes `hold`
-        // fail at once, skipping the wait under test.
-        let saw = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-        let s = saw.clone();
-        let failer = crate::sched::spawn("hold-ktest-fail", move || {
-            s.store(wait_for_the_ask(), core::sync::atomic::Ordering::Release);
-            mark_failed(Failure::Failed);
-        })
-        .map_err(|_| "spawn")?;
-        let got = hold();
-        failer.join();
-        if !saw.load(core::sync::atomic::Ordering::Acquire) {
-            return Err(MISSED_THE_ASK);
-        }
+        // Failed only once `hold` has asked: a failure before the ask makes
+        // `hold` fail at once, skipping the wait under test.
+        let got = hold_with("hold-ktest-fail", || mark_failed(Failure::Failed))?;
         kassert_eq!(got, Err(HoldError::Failed));
         kassert_eq!(reads(), Reads::Running);
         Ok(())
@@ -808,19 +815,9 @@ crate::ktest!(
         // `Released` (not `NotParked`), and the tablet reads on.
         use crate::kassert_eq;
         let _bound = MadeUp::bind(None)?;
-        // Only once `hold` has asked: a release before the ask does nothing.
-        let saw = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-        let s = saw.clone();
-        let releaser = crate::sched::spawn("hold-ktest-release", move || {
-            s.store(wait_for_the_ask(), core::sync::atomic::Ordering::Release);
-            release();
-        })
-        .map_err(|_| "spawn")?;
-        let got = hold();
-        releaser.join();
-        if !saw.load(core::sync::atomic::Ordering::Acquire) {
-            return Err(MISSED_THE_ASK);
-        }
+        // Released only once `hold` has asked: a release before the ask
+        // does nothing.
+        let got = hold_with("hold-ktest-release", release)?;
         kassert_eq!(got, Err(HoldError::Released));
         kassert_eq!(reads(), Reads::Running);
         Ok(())

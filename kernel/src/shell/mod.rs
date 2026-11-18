@@ -248,7 +248,8 @@ pub fn run() -> ! {
 const SHELLS_WARN_AFTER_NS: u64 = 5_000_000_000;
 
 /// What the serial prompt's warning, when screen shells keep it waiting,
-/// starts with (after the level and target; the ktest waits for it).
+/// starts with (after the level and target): the ktest waits for it, and
+/// test_ktest, test_shell and ARCHITECTURE.md quote the whole line.
 const HELD: &str = "serial prompt held: ";
 
 /// Wait until every screen shell that started is blocked waiting for its
@@ -328,37 +329,42 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         use alloc::sync::Arc;
         use core::sync::atomic::{AtomicBool, Ordering};
+        /// Whether `needle` is among the log bytes written since `mark` (a
+        /// `klog::copy_recent` total) that `recent` holds.
+        fn logged_since(mark: u64, needle: &[u8], recent: &mut [u8]) -> bool {
+            let (n, written) = crate::klog::copy_recent(recent);
+            let new = usize::try_from(written.saturating_sub(mark)).unwrap_or(usize::MAX).min(n);
+            recent[n - new..n].windows(needle.len()).any(|w| w == needle)
+        }
         let warning = alloc::format!("WARN  shell: {HELD}");
         let s = Arc::new((WaitQueue::new(), AtomicBool::new(false)));
+        let park = |s: &Arc<(WaitQueue, AtomicBool)>| {
+            let t = s.clone();
+            move || t.0.wait_until(|| t.1.load(Ordering::Acquire))
+        };
         let saw_warning = Arc::new(AtomicBool::new(false));
         let (_, mark) = crate::klog::copy_recent(&mut []);
-        let early = s.clone();
-        let (late, saw) = (s.clone(), saw_warning.clone());
+        let (park_late, saw) = (park(&s), saw_warning.clone());
         let mut shells: [Option<JoinHandle>; term::VTS] = Default::default();
-        shells[0] = Some(
-            sched::spawn("waits-early", move || early.0.wait_until(|| early.1.load(Ordering::Acquire)))
-                .map_err(|_| "spawn failed")?,
-        );
+        shells[0] = Some(sched::spawn("waits-early", park(&s)).map_err(|_| "spawn failed")?);
         shells[2] = Some(
             sched::spawn("waits-late", move || {
-                // Until the warning is among the bytes logged since `mark`
-                // (up to 5 s, then one more look).
+                // Until the warning is logged after `mark` (up to 5 s, then
+                // one more look).
                 let deadline = crate::time::now_ns() + 5_000_000_000;
                 let mut recent = [0u8; 1024];
-                loop {
-                    let late = crate::time::now_ns() >= deadline;
-                    let (n, written) = crate::klog::copy_recent(&mut recent);
-                    let new = usize::try_from(written.saturating_sub(mark)).unwrap_or(usize::MAX).min(n);
-                    if recent[n - new..n].windows(warning.len()).any(|w| w == warning.as_bytes()) {
-                        saw.store(true, Ordering::Release);
-                        break;
+                let seen = loop {
+                    let last_look = crate::time::now_ns() >= deadline;
+                    if logged_since(mark, warning.as_bytes(), &mut recent) {
+                        break true;
                     }
-                    if late {
-                        break;
+                    if last_look {
+                        break false;
                     }
                     assert!(sched::sleep(1_000_000), "a test thread couldn't sleep");
-                }
-                late.0.wait_until(|| late.1.load(Ordering::Acquire));
+                };
+                saw.store(seen, Ordering::Release);
+                park_late();
             })
             .map_err(|_| "spawn failed")?,
         );
@@ -372,6 +378,10 @@ crate::ktest!(
         kassert!(blocked);
         kassert_eq!(count, 2);
         kassert!(saw_warning.load(Ordering::Acquire));
+        // Both already waiting: the wait returns with no warning.
+        let (_, mark) = crate::klog::copy_recent(&mut []);
+        kassert_eq!(wait_for_screen_shells(&shells, 1_000_000), 2);
+        kassert!(!logged_since(mark, alloc::format!("WARN  shell: {HELD}").as_bytes(), &mut [0u8; 1024]));
         s.1.store(true, Ordering::Release);
         s.0.wake_all();
         // Bounded: a thread that never finishes fails the test by name

@@ -48,7 +48,7 @@ tests = [
     "ktest:lumen_kernel::sched::wait_queue_wakes_a_blocked_thread",
     "ktest:lumen_kernel::sched::wait_queue_ping_pong_across_cpus_loses_no_wakeup",
     "ktest:lumen_kernel::sched::wake_one_is_fifo_and_wake_all_wakes_every_waiter",
-    "ktest:lumen_kernel::sched::a_remote_wake_does_not_wait_for_a_tick",
+    "ktest:lumen_kernel::sched::a_remote_wake_sends_its_cpu_the_wakeup_ipi",
 ]
 
 [[feature]]
@@ -96,7 +96,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Queue waits on one CPU whose deadlines pass on the same tick all fire on that tick: none a tick late, none before its deadline, each wait returning false no earlier than it"
+name = "Queue waits on one CPU whose deadlines pass on the same tick all fire on that tick: none a tick late, none before its deadline, each wait returning false no earlier than it and ended by its deadline once (a waiter blocked again by an early firing would count more)"
 milestone = "M3"
 tests = [
     "ktest:lumen_kernel::sched::queue_deadlines_due_on_one_tick_all_fire_on_it",
@@ -109,4 +109,12 @@ milestone = "M3"
 tests = [
     "scenario:test_crash::test_blocking_where_a_thread_cant_panics[*]",
     "scenario:test_smp::test_a_cpu_that_turned_interrupts_off_itself_still_panics_when_it_blocks",
+]
+
+[[feature]]
+name = "A queue wait the timer ends at its deadline is counted for its thread (`sched::deadline_wakes_in`, the ktests' proof that a wake, not the deadline, ended a wait that returned ready): a lost wake (the condition made true with no wake) returns ready at the deadline and counts one; a sleep counts none"
+milestone = "M4"
+tests = [
+    "ktest:lumen_kernel::sched::a_lost_wake_is_ended_by_the_timer_and_counted",
+    "scenario:test_ktest::test_in_kernel_tests_pass",
 ]

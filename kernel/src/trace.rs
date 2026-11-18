@@ -673,7 +673,7 @@ crate::ktest!(
         static BENCH: TraceRing<EVENTS> = TraceRing::new();
         const N: u64 = 1_000;
         const BATCHES: u64 = 20;
-        let mut per_event = u64::MAX;
+        let (mut per_event, mut slowest) = (u64::MAX, 0);
         for b in 0..BATCHES {
             if b > 0 {
                 crate::time::spin(1_000_000);
@@ -682,15 +682,17 @@ crate::ktest!(
             for i in 0..N {
                 record_in(&BENCH, Kind::Test, [b * N + i, 0, 0, 0]);
             }
-            per_event = per_event.min((arch::rdtsc() - t0) / N);
+            let this = (arch::rdtsc() - t0) / N;
+            (per_event, slowest) = (per_event.min(this), slowest.max(this));
         }
         crate::ktest::diag(format_args!(
-            "trace: {per_event} TSC ticks per event (the fastest of {BATCHES} batches of {N})"
+            "trace: {per_event} TSC ticks per event (the fastest of {BATCHES} batches of {N}; the slowest {slowest})"
         ));
         // Loose bounds: catches gross regressions such as waiting or doing
         // I/O (e.g. serial output) on every event, and a TSC that doesn't
-        // move; not a cost paid once in many events (the fastest batch can
-        // miss it), nor an added uncontended lock. Under TCG the TSC follows
+        // move; not a cost paid less often than once per N events (some
+        // batch has none, and the fastest is taken), nor an added
+        // uncontended lock. Under TCG the TSC follows
         // a host clock, not guest cycles. At risk on a host slowing the vCPU
         // through every batch.
         crate::kassert!(per_event > 0 && per_event < 5_000);

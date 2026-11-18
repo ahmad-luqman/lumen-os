@@ -611,14 +611,16 @@ crate::ktest!(
         // returns (bounded here): `rhai`'s REPL waiting for a line, `top`
         // polling for q between frames, a script in a loop (its Ctrl-C
         // check). The window is busy while a command runs (checked once the
-        // command showed it runs: `top`'s header, the script's second
-        // count, which a script that returned after its first wouldn't
-        // print), not while the shell (or the REPL) waits for a key.
+        // command showed it runs: `top`'s header, the script's second count,
+        // which a script that returned after its first wouldn't print; it
+        // prints just the two, so they stay on the screen), not while the
+        // shell (or the REPL) waits for a key. Closing, not the script
+        // itself, ended the script: no `rhai:` line from it but the stop.
         let d = desktop::Desktop::without_screen();
         let cases = [
             ("rhai", "rhai>", false),
             ("top", "top:", true),
-            ("rhai -e 'let n = 0; loop { n += 1; if n % 2000 == 0 { print(n) } }'", "4000", true),
+            ("rhai -e 'let n=0; loop { n+=1; if n==2000 || n==4000 { print(n) } }'", "4000", true),
         ];
         for (command, started, busy) in cases {
             let (shared, h) = test_shared(&d)?;
@@ -627,18 +629,25 @@ crate::ktest!(
             wait_prompt(&shared, &h)?;
             type_text(&shared, command)?;
             type_text(&shared, "\n")?;
-            wait_until("the command never started", || shared.view_text().rows.iter().any(|r| r.starts_with(started)))?;
+            let rows = || shared.view_text().rows;
+            if let Err(e) = wait_until("the command never started", || rows().iter().any(|r| r.starts_with(started))) {
+                crate::ktest::diag(format_args!("{command}: the screen: {:?}", rows()));
+                return Err(e);
+            }
+            crate::kassert!(shared.keys.lock().queue.is_empty());
             if busy {
                 // It runs until closed, so busy now and from here on.
-                crate::kassert!(shared.keys.lock().queue.is_empty() && h.is_busy());
+                crate::kassert!(h.is_busy());
             } else {
-                // The keys taken and the REPL waiting for one: not busy.
-                wait_until("the keys weren't taken, or the window stayed busy", || {
-                    shared.keys.lock().queue.is_empty() && !h.is_busy()
-                })?;
+                // The REPL waiting for a key: not busy.
+                wait_until("the window stayed busy with the REPL waiting", || !h.is_busy())?;
             }
             shared.close();
             sched::join_bounded(shell)?;
+            if command.starts_with("rhai -e") {
+                let ended = rows().into_iter().filter(|r| r.starts_with("rhai: ") && r != "rhai: stopped (Ctrl-C)");
+                crate::kassert_eq!(ended.collect::<Vec<_>>(), Vec::<String>::new());
+            }
             drop(h);
         }
         Ok(())

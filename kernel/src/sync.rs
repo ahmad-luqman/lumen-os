@@ -233,12 +233,16 @@ crate::ktest!(
         static STEP: AtomicU8 = AtomicU8::new(NOT_TAKEN);
         /// Set by this CPU just before it calls `lock`.
         static LOCKING: AtomicBool = AtomicBool::new(false);
+        /// Set by CPU 1 if it waited WAIT_NS for `LOCKING` and went on.
+        static WAITED_OUT: AtomicBool = AtomicBool::new(false);
         /// Set by CPU 1 just before it lets go.
         static RELEASING: AtomicBool = AtomicBool::new(false);
         fn on_cpu_1() {
             let held = SHARED.lock();
             STEP.store(if SHARED.held_here() { HELD_THERE } else { HELD_UNSEEN }, Ordering::Release);
-            let _ = crate::smp::spin_until(crate::time::now_ns() + WAIT_NS, || LOCKING.load(Ordering::Acquire));
+            if !crate::smp::spin_until(crate::time::now_ns() + WAIT_NS, || LOCKING.load(Ordering::Acquire)) {
+                WAITED_OUT.store(true, Ordering::Relaxed);
+            }
             crate::time::spin(HOLD_NS);
             RELEASING.store(true, Ordering::Relaxed); // published by the release
             drop(held);
@@ -254,6 +258,12 @@ crate::ktest!(
         // Still held just before `lock` was called (so `seen` is from while
         // CPU 1 held it, and `lock` most likely had to wait), and taken only
         // once CPU 1 let go.
+        if !contended {
+            crate::ktest::diag(format_args!(
+                "cpu 1 let go before this cpu said it was locking (cpu 1 waited it out: {})",
+                WAITED_OUT.load(Ordering::Relaxed)
+            ));
+        }
         kassert!(contended);
         kassert_eq!(seen, (HELD_THERE, false, true));
         kassert_eq!(after, (true, true));

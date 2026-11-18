@@ -3380,23 +3380,31 @@ crate::ktest!(
         // `Deadline`; a wake from another thread ends it at once as `Woken`,
         // and so does one made before the wait; an event queued is returned.
         // A wait that isn't animating counts as idle while it lasts, an
-        // animating one never does. A wake ended a wait if the timer ended
-        // none at its deadline (`sched::deadline_wakes`): a wait looks again
-        // there, so a lost wake would still return Woken.
+        // animating one never does. A wake, not the timer, ended a Woken
+        // wait (`sched::deadline_wakes_in`).
         use crate::kassert;
         let d = Desktop::without_screen();
         let mut h = d.open_window("w", 16, 16).map_err(|_| "a window")?;
         while h.next_event().is_some() {}
-        let (start, wakes) = (crate::time::now_ns(), crate::sched::deadline_wakes());
-        kassert!(matches!(h.wait_event_until(Some(start + 20_000_000), Animating::No), Wait::Deadline));
+        // Waits until 5 s from now: what it returned, and whether the timer
+        // ended it.
+        let wait = |h: &mut WindowHandle, animating| {
+            crate::sched::deadline_wakes_in(|| {
+                h.wait_event_until(Some(crate::time::now_ns() + 5_000_000_000), animating)
+            })
+        };
+        let start = crate::time::now_ns();
+        let (got, timer_ended) =
+            crate::sched::deadline_wakes_in(|| h.wait_event_until(Some(start + 20_000_000), Animating::No));
+        kassert!(matches!(got, Wait::Deadline));
         kassert!(crate::time::now_ns() >= start + 20_000_000);
-        // The timer ended that one (and so counts the ones below).
-        crate::kassert_eq!(crate::sched::deadline_wakes(), wakes + 1);
+        // The timer ended that one, if it blocked (a stall past 20 ms before
+        // it skips the block); that the count works is sched's
+        // `a_lost_wake_is_ended_by_the_timer_and_counted`.
+        kassert!(timer_ended <= 1);
         let waker = h.waker();
         waker.wake();
-        let wakes = crate::sched::deadline_wakes();
-        let start = crate::time::now_ns();
-        kassert!(matches!(h.wait_event_until(Some(start + 5_000_000_000), Animating::No), Wait::Woken));
+        kassert!(matches!(wait(&mut h, Animating::No), (Wait::Woken, 0)));
         for (animating, idles) in [(Animating::No, true), (Animating::Yes, false)] {
             let saw_idle = Arc::new(AtomicBool::new(!idles));
             let (w, seen, win) = (waker.clone(), saw_idle.clone(), h.win.clone());
@@ -3416,13 +3424,11 @@ crate::ktest!(
                 w.wake();
             })
             .map_err(|_| "spawn failed")?;
-            let start = crate::time::now_ns();
-            kassert!(matches!(h.wait_event_until(Some(start + 5_000_000_000), animating), Wait::Woken));
+            kassert!(matches!(wait(&mut h, animating), (Wait::Woken, 0)));
             crate::sched::join_bounded(t)?;
             kassert!(saw_idle.load(Ordering::Acquire) == idles);
             kassert!(!h.win.idle.load(Ordering::Acquire));
         }
-        crate::kassert_eq!(crate::sched::deadline_wakes(), wakes);
         d.push_key(h.id(), test_key())?;
         let got = h.wait_event_until(Some(crate::time::now_ns() + 5_000_000_000), Animating::No);
         kassert!(matches!(got, Wait::Event(WindowEvent::Key(_))));
