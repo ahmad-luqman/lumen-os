@@ -206,7 +206,6 @@ impl Text for crate::font::Text {
     }
 }
 
-/// The toolkit's palette from a theme.
 /// The taskbar's palette (#157): its own colours; its buttons in the
 /// title bars' colours.
 pub fn taskbar_palette(t: &Theme) -> Palette {
@@ -221,6 +220,7 @@ pub fn taskbar_palette(t: &Theme) -> Palette {
     }
 }
 
+/// The toolkit's palette from a theme.
 pub fn palette(t: &Theme) -> Palette {
     Palette {
         background: t.client,
@@ -283,14 +283,19 @@ impl<A: App> Toolkit<A> {
     pub fn frame(&mut self, h: &mut WindowHandle) {
         let changed = self.lay_out();
         let _all = self.app.ui_mut().take_damage();
+        self.paint_all(h);
+        if changed {
+            self.publish(h);
+        }
+    }
+
+    /// Paint the whole tree and the app's frame over it, and commit it.
+    fn paint_all(&mut self, h: &mut WindowHandle) {
         let s = h.surface_mut();
         self.app.ui_mut().paint(s, &mut self.text, &self.palette);
         self.app.paint_over(s);
         let bounds = s.bounds();
         h.commit(&[bounds]);
-        if changed {
-            self.publish(h);
-        }
     }
 
     /// Lay the tree out; repaint and commit only what changed (the widgets
@@ -300,13 +305,7 @@ impl<A: App> Toolkit<A> {
         let changed = self.lay_out();
         match self.app.ui_mut().take_damage() {
             Repaint::Nothing => {}
-            Repaint::All => {
-                let s = h.surface_mut();
-                self.app.ui_mut().paint(s, &mut self.text, &self.palette);
-                self.app.paint_over(s);
-                let bounds = s.bounds();
-                h.commit(&[bounds]);
-            }
+            Repaint::All => self.paint_all(h),
             Repaint::Rects(rects) => {
                 let s = h.surface_mut();
                 for r in &rects {
@@ -367,7 +366,7 @@ impl<A: App> Toolkit<A> {
                 Then::Carry
             }
         };
-        if then == Then::Close {
+        if matches!(then, Then::Close) {
             return Step::Close(None);
         }
         self.refresh(h);
@@ -575,6 +574,7 @@ fn invoke_root(ctx: &mut crate::shell::Ctx<'_>, window: u32, action: &Action) {
         Ok(row) => print_rows(ctx, &[row]),
         Err(desktop::NotChanged::Closed) => ctx.fail(format_args!("ui invoke: window {window} closed")),
         Err(desktop::NotChanged::Already) => ctx.fail(format_args!("ui invoke: window {window} {already}")),
+        Err(desktop::NotChanged::Taskbar) => ctx.fail(format_args!("ui invoke: window {window} is the taskbar")),
     };
     match what {
         None => ctx.fail(format_args!("ui invoke: {}", InvokeError::NotAllowed(role, kind))),
@@ -667,6 +667,7 @@ fn print_answer(ctx: &mut crate::shell::Ctx<'_>, window: u32, node: u64, answer:
         Answer::Ran(Served::ClosedItsWindow) => {
             let _ = writeln!(ctx.out, "ui invoke: ran; window {window} closed");
         }
+        Answer::Ran(Served::Failed(why)) => ctx.fail(format_args!("ui invoke: {why}")),
         Answer::WindowClosed => ctx.fail(format_args!("ui invoke: window {window} closed before it ran")),
         Answer::Dropped => ctx.fail(format_args!("ui invoke: dropped while running (window {window}): a bug")),
     }

@@ -962,10 +962,10 @@ def invoke(
 # -- the desktop shell (#157) --------------------------------------------------
 
 
-def taskbar(m: Machine, allow: str | None = None) -> list[dict[str, str]]:
+def taskbar(m: Machine) -> list[dict[str, str]]:
     """The taskbar's nodes in `ui tree` (its root, a `group` named
     `Taskbar` at depth 0, first), screen coordinates."""
-    rows = ui_tree(m, allow=allow)
+    rows = ui_tree(m)
     root = one(rows, "taskbar roots", role="group", name="Taskbar", depth="0")
     return [r for r in rows if r["window"] == root["window"]]
 
@@ -976,20 +976,27 @@ def bounds(row: dict[str, str]) -> tuple[int, int, int, int]:
 
 
 def centre(row: dict[str, str]) -> tuple[int, int]:
-    """The middle of a tree row's bounds (where a click lands on it)."""
+    """The middle of a tree row's bounds (where a click lands on it); a
+    row with no bounds (a hidden node) fails."""
     x, y, w, h = bounds(row)
+    assert w > 0 and h > 0, f"nothing to click: {row}"
     return x + w // 2, y + h // 2
+
+
+def clock(m: Machine) -> dict[str, str]:
+    """The taskbar clock's row in `ui tree` (its text in `value`)."""
+    return node(taskbar(m), "label", "Clock")
 
 
 def clock_mask(m: Machine) -> tuple[tuple[int, int, int, int], ...]:
     """The taskbar clock's bounds, for a golden's `masks` (its text
     changes with the time)."""
-    return (bounds(node(taskbar(m), "label", "Clock")),)
+    return (bounds(clock(m)),)
 
 
 def clock_text(m: Machine) -> str:
     """The taskbar clock's text (`HH:MM`)."""
-    return node(taskbar(m), "label", "Clock")["value"]
+    return clock(m)["value"]
 
 
 def quiet_for(m: Machine, seconds: float, tries: int = 3) -> dict[str, str]:

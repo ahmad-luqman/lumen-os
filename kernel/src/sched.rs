@@ -696,7 +696,9 @@ pub fn run_sized<'a>(name: &'static str, stack_size: u64, f: impl FnOnce() + Sen
 /// (`'env`), and join every thread it started before returning
 /// ([`run_sized`]'s argument applied to several threads): #157's Mandelbrot
 /// window lends each CPU a band of its surface. `Err(CantWait)` (and `f`
-/// unrun) if the calling thread can't block to join them.
+/// unrun) if the calling thread can't block to join them. `f` must return
+/// where the caller can still block (the joins follow it): never with a
+/// lock guard it returns, or one it leaves held.
 pub fn scope<'env, R>(f: impl FnOnce(&Scope<'env>) -> R) -> Result<R, SpawnError> {
     // The SAFETY argument in `Scope::spawn_on` needs a panic to end the
     // kernel, not unwind past the joins.
@@ -718,7 +720,13 @@ pub fn scope<'env, R>(f: impl FnOnce(&Scope<'env>) -> R) -> Result<R, SpawnError
 /// threads can't reach it (only the caller spawns).
 pub struct Scope<'env> {
     threads: core::cell::RefCell<Vec<JoinHandle>>,
-    /// Invariant in `'env`, as `std::thread::Scope` is.
+    /// Invariant in `'env`, as `std::thread::Scope` is. This is what makes
+    /// `spawn_on` sound: if `Scope<'env>` were covariant (a
+    /// `PhantomData<&'env ()>`), a `&Scope<'long>` would coerce to a
+    /// `&Scope<'short>` inside `f`, and a thread could borrow a local of
+    /// `f` that dies before the joins (a use after free; it compiles, and
+    /// no test in the kernel would catch it). Invariance pins `'env` to
+    /// the lifetime chosen at the `scope` call, which outlives the joins.
     _env: core::marker::PhantomData<&'env mut &'env ()>,
 }
 
@@ -731,11 +739,13 @@ impl<'env> Scope<'env> {
         // SAFETY: only the closure's lifetime bound changes (same layout).
         // `scope` joins every thread pushed below before it returns (a join
         // has no timeout, and nothing kills a thread), and `'env` outlives
-        // that call (it is a parameter of `scope`, and `&Scope` can't leave
-        // `f`, its lifetime higher-ranked), so `f` and what it borrows are
-        // used only while those borrows are alive; a panic aborts the
-        // kernel, so nothing unwinds past the joins. If spawning fails,
-        // `spawn_with` drops `f` before returning.
+        // that call: it is a parameter of `scope`, `Scope` is invariant in
+        // it (see `_env`: covariance would let `'env` shrink to a local of
+        // `scope`'s closure), and `&Scope` can't leave that closure (its
+        // lifetime is higher-ranked). So `f` and what it borrows are used
+        // only while those borrows are alive; a panic aborts the kernel, so
+        // nothing unwinds past the joins. If spawning fails, `spawn_with`
+        // drops `f` before returning.
         let f: Entry = unsafe { core::mem::transmute::<Box<dyn FnOnce() + Send + 'env>, Entry>(f) };
         let thread = spawn_with(cpu, name, STACK_SIZE, f)?;
         self.threads.borrow_mut().push(thread);
@@ -2670,6 +2680,29 @@ crate::ktest!(
             kassert!(r == Err(SpawnError::NotRunning));
         }
         kassert!(!ran_unstarted.load(Ordering::Acquire));
+        // Each thread in turn the only slow one: a join skipped for any of
+        // them (not only the first) shows in its round, its flag unset.
+        for slow in 0..cpus.len() {
+            let done = [const { AtomicBool::new(false) }; MAX_CPUS];
+            scope(|s| {
+                for (k, &cpu) in cpus.iter().enumerate() {
+                    let flag = &done[k];
+                    let _ = s.spawn_on(cpu, "scoped", move || {
+                        if k == slow {
+                            let _ = sleep(30_000_000);
+                        }
+                        flag.store(true, Ordering::Release);
+                    });
+                }
+            })
+            .map_err(|_| "this thread can block")?;
+            for (k, flag) in done.iter().enumerate().take(cpus.len()) {
+                if !flag.load(Ordering::Acquire) {
+                    crate::ktest::diag(format_args!("round {slow}: thread {k} not joined"));
+                }
+                kassert!(flag.load(Ordering::Acquire));
+            }
+        }
         // Every scoped thread has exited. (Its record may still be listed:
         // `finish_switch` on its CPU sets `reaped` and wakes the joiner while
         // still holding the dead thread's `Arc`, dropped only as it returns,

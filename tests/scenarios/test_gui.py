@@ -106,8 +106,8 @@ def wallpaper_rgb(x: int, y: int) -> tuple[int, int, int]:
     return pixel(WALLPAPER, x, y)
 
 
-def frame_of(w: dict[str, str]) -> tuple[int, int, int, int]:
-    return int(w["x"]), int(w["y"]), int(w["w"]), int(w["h"])
+# A `windows` row's frame: x, y, w, h.
+frame_of = gui.bounds
 
 
 def pixel(shot, x: int, y: int) -> tuple[int, int, int]:
@@ -898,10 +898,9 @@ def test_text_rendering_golden(boot, artifacts, golden_dir):
 def test_png_wallpaper_golden(boot, artifacts):
     # The desktop with no windows: both closed by their close boxes, the
     # pointer moved to the right end of the last row above the taskbar.
-    # The screen above the taskbar
-    # shows the wallpaper, decoded from the PNG the kernel embeds, in every
-    # pixel (the one under the parked arrow's tip taken from the PNG): the
-    # golden is that PNG itself.
+    # The screen above the taskbar shows the wallpaper, decoded from the
+    # PNG the kernel embeds, in every pixel (the one under the parked
+    # arrow's tip taken from the PNG): the golden is that PNG itself.
     m = boot_tablet(boot)
     gui.start_desktop(m)
     assert "INFO  desktop: wallpaper: 1280x800, " in m.output, "the wallpaper wasn't decoded"
@@ -1476,7 +1475,7 @@ def test_taskbar_clock_matches_rtc(boot):
         return found[1], gui.clock_text(m)
 
     gui.wait_for(m, "the clock showing date's minute", date_and_clock, lambda dc: dc[0] == dc[1])
-    clock = gui.node(gui.taskbar(m), "label", "Clock")
+    clock = gui.clock(m)
     _, _, w, h = gui.bounds(clock)
     assert (clock["role"], clock["actions"]) == ("label", "-")
     for _ in range(3):
@@ -1487,9 +1486,59 @@ def test_taskbar_clock_matches_rtc(boot):
         after = gui.wait_settled(m)
         if gui.clock_text(m) != plus_minute(shown):
             continue  # a real minute turned as well: measure again
-        assert gui.bounds(gui.node(gui.taskbar(m), "label", "Clock")) == gui.bounds(clock)
+        assert gui.bounds(gui.clock(m)) == gui.bounds(clock)
         presented = {k: int(after[k]) - int(before[k]) for k in ("frames", "rects", "pixels")}
         assert presented == {"frames": 1, "rects": 1, "pixels": w * h}, presented
         break
     else:
         raise AssertionError("a real minute turned during each of 3 ticks")
+
+
+def test_a_window_opened_from_the_shell_gets_a_taskbar_button(boot):
+    # Windows the launcher didn't open (`desktop counter` on the serial
+    # shell) get their button too: the open pokes the taskbar. Then Counter
+    # through the launcher: a second button of the same name.
+    m = boot_tablet(boot)
+    gui.start_desktop(m)
+    assert taskbar_buttons(m) == ["Welcome", "Colours"]
+    gui.desktop_counter(m)
+    gui.wait_for(
+        m,
+        "Counter's button",
+        lambda: taskbar_buttons(m),
+        lambda b: b == ["Welcome", "Colours", "Counter"],
+    )
+    launch(m, "Counter")
+    assert taskbar_buttons(m) == ["Welcome", "Colours", "Counter", "Counter"]
+    assert [w["title"] for w in gui.windows(m)][:2] == ["Counter", "Counter"]
+    assert gui.desktop_status(m)["taskbar"] == "yes"
+
+
+def test_a_launch_while_paused_is_refused(boot):
+    # The launcher unfolded, then Alt+F1: `press` on its Mandelbrot item is
+    # refused as `terminal` is while the desktop is paused, `ui invoke`
+    # saying why and failing, and no window opens.
+    m = boot_tablet(boot)
+    gui.start_desktop(m)
+    launcher = gui.node(gui.taskbar(m), "menu", "Launcher")
+    assert gui.invoke(m, launcher["id"], "press").row is not None
+    entry = gui.node(gui.taskbar(m), "menuitem", "Mandelbrot")
+    gui.confirmed_keys(m, ["alt", "f1"])
+    gui.wait_desktop_state(m, "paused")
+    warn = r"WARN  taskbar: Mandelbrot: desktop: paused"
+    got = gui.invoke(m, entry["id"], "press", allow=warn)
+    assert got.message == "ui invoke: Mandelbrot: desktop: paused (`desktop` resumes it)", got
+    assert [w["title"] for w in gui.windows(m)] == ["Colours", "Welcome"]
+    assert run(m, "desktop", 30) == "desktop: resumed\n"
+    assert "Mandelbrot" not in taskbar_buttons(m)
+
+
+def test_the_launcher_answers_with_the_new_window_s_button(boot):
+    # With the taskbar's handling of a poke held back 2 s
+    # (`lumen.taskbar_wake_delay_ms`), the new window's button is there as
+    # soon as `ui invoke` on the launcher's item returns: the launcher
+    # brings the buttons in line itself before it answers, not the poke.
+    m = boot_tablet(boot, cmdline="lumen.taskbar_wake_delay_ms=2000")
+    gui.start_desktop(m)
+    launch(m, "Counter")
+    assert taskbar_buttons(m) == ["Welcome", "Colours", "Counter"]
