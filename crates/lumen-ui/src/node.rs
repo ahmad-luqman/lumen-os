@@ -142,8 +142,9 @@ impl Role {
 }
 
 // Every role and every action kind at its own place in its `ALL`, in
-// declaration order (one put in twice or out of order fails to compile;
-// the host tests check each list's length against its variants).
+// declaration order: one put in twice or out of order fails to compile.
+// (One left out isn't caught here: the host tests check that every action
+// a role lists parses, and each list's length against its last variant.)
 const _: () = {
     let mut i = 0;
     while i < Role::ALL.len() {
@@ -295,7 +296,14 @@ impl fmt::Display for InvokeError {
         match self {
             InvokeError::NoNode => f.write_str("no node"),
             InvokeError::NoSuchAction => {
-                f.write_str("no such action (press, set_value, select, focus, close, minimize, restore)")
+                f.write_str("no such action (")?;
+                for (i, kind) in ActionKind::ALL.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(kind.name())?;
+                }
+                f.write_str(")")
             }
             InvokeError::NotAllowed(role, action) => write!(f, "a {} doesn't take {}", role.name(), action.name()),
             InvokeError::Disabled => f.write_str("the node is disabled"),

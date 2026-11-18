@@ -19,7 +19,7 @@ pub enum Then {
 
 /// A window's app.
 pub trait App {
-    fn ui(&mut self) -> &mut Ui;
+    fn ui_mut(&mut self) -> &mut Ui;
     /// Act on what the tree reported.
     fn apply(&mut self, events: &[UiEvent]) -> Then;
     /// Drawn over the painted tree (an animation's frame); nothing by
@@ -47,15 +47,15 @@ pub enum Served {
 /// click reaches, then let the app act on what happened; the tree laid out
 /// again in `area` for the node's row.
 pub fn serve(app: &mut dyn App, text: &mut dyn Text, area: Rect, node: u64, action: &Action) -> Served {
-    let events = match app.ui().invoke(node, action) {
+    let events = match app.ui_mut().invoke(node, action) {
         Ok(events) => events,
         Err(e) => return Served::Error(e),
     };
     if app.apply(&events) == Then::Close {
         return Served::ClosedItsWindow;
     }
-    app.ui().layout(area, text);
-    match app.ui().node(node) {
+    app.ui_mut().layout(area, text);
+    match app.ui_mut().node(node) {
         Some((depth, row)) => Served::Row { depth, node: row },
         None => Served::RanNodeGone,
     }

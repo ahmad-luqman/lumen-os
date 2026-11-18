@@ -115,17 +115,25 @@ impl Value {
     }
 }
 
-/// A text cell as a records table prints it: as it is, unless it is empty,
-/// holds whitespace or is exactly `-` (an absent value's mark), then in
-/// double quotes with `"` and `\` escaped by a backslash, as the shell's
-/// word splitting (and POSIX `shlex`) reads it back.
+/// A text cell as a records table prints it, so that the shell's word
+/// splitting (and POSIX `shlex`) reads every row back into its cells: as it
+/// is, unless it is empty, is exactly `-` (an absent value's mark), or
+/// holds whitespace, a quote (`'`, `"`), a backslash, a `#` or a control
+/// character; then in double quotes, with `"` and `\` escaped by a
+/// backslash (the only escapes both readers take inside them) and each
+/// control character printed as U+FFFD (neither reader has an escape for
+/// one).
 pub fn quoted(text: &str) -> String {
-    if !text.is_empty() && text != "-" && !text.chars().any(char::is_whitespace) {
+    let plain = !text.is_empty()
+        && text != "-"
+        && !text.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '\'' | '"' | '\\' | '#'));
+    if plain {
         return text.to_owned();
     }
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
     for c in text.chars() {
+        let c = if c.is_control() { '\u{fffd}' } else { c };
         if c == '"' || c == '\\' {
             out.push('\\');
         }
@@ -182,9 +190,10 @@ impl Table {
     /// The headings, then a line per row: each line indented by two spaces,
     /// the columns two spaces apart, each as wide as its widest value (or
     /// heading, or [`Column::width`]); a left-aligned last column isn't
-    /// padded on the right. A text value that is empty, holds whitespace or
-    /// is exactly `-` is printed double-quoted ([`quoted`]), so every row
-    /// splits into its cells as the shell's words do (and `-` stays an
+    /// padded on the right. A text value that wouldn't read back as one word
+    /// (empty, `-`, whitespace, a quote, a backslash, `#`, a control
+    /// character) is printed double-quoted ([`quoted`]), so every row splits
+    /// into its cells as the shell's words do (and a bare `-` stays an
     /// absent value's).
     pub fn render(&self, out: &mut String) {
         let cells: Vec<Vec<String>> = self

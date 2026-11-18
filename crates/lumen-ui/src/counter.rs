@@ -77,7 +77,7 @@ impl Counter {
 }
 
 impl App for Counter {
-    fn ui(&mut self) -> &mut Ui {
+    fn ui_mut(&mut self) -> &mut Ui {
         &mut self.ui
     }
 

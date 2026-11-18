@@ -559,3 +559,61 @@ fn a_text_cell_that_would_not_read_back_as_one_word_is_quoted() {
     assert_eq!(pipe::quoted("x"), "x");
     assert_eq!(pipe::quoted(""), "\"\"");
 }
+
+/// Each rendered row of `rows` (text cells) split back as the shell does.
+fn read_back(rows: &[Vec<String>]) -> Vec<Vec<String>> {
+    let columns = [
+        Column::new("a", Kind::Text, Align::Left, 0),
+        Column::new("b", Kind::Text, Align::Right, 0),
+        Column::new("c", Kind::Text, Align::Left, 0),
+    ];
+    let mut t = Table::new(&columns);
+    for row in rows {
+        t.push(row.iter().map(|c| Value::Text(c.clone())).collect());
+    }
+    let mut out = String::new();
+    t.render(&mut out);
+    out.lines().skip(1).map(|l| words::split(l).expect("a rendered row splits")).collect()
+}
+
+/// A cell as it reads back: control characters print as U+FFFD.
+fn shown(cell: &str) -> String {
+    cell.chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).collect()
+}
+
+#[test]
+fn every_text_cell_reads_back_as_itself() {
+    // Random cells from the characters that matter (blanks, both quotes, a
+    // backslash, `#`, `$`, a backtick, `|`, `-`, control characters, a
+    // wide letter): rendered, then split as the shell's words, each row
+    // gives back its cells (control characters as U+FFFD).
+    const ALPHABET: [char; 18] =
+        ['a', 'b', ' ', '\t', '\'', '"', '\\', '#', '$', '`', '|', '-', 'é', '\n', '\u{1}', '\u{7f}', '漢', '\u{a0}'];
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for _ in 0..400 {
+        let rows: Vec<Vec<String>> = (0..3)
+            .map(|_| {
+                (0..3)
+                    .map(|_| {
+                        let len = (next() % 6) as usize;
+                        (0..len).map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize]).collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        let want: Vec<Vec<String>> = rows.iter().map(|r| r.iter().map(|c| shown(c)).collect()).collect();
+        assert_eq!(read_back(&rows), want, "{rows:?}");
+    }
+    // The cases that used to print bare.
+    let tricky = vec![vec![String::from("it's"), String::from("a\\b"), String::from("#tag")]];
+    assert_eq!(read_back(&tricky), tricky);
+    assert_eq!(pipe::quoted("'a'"), "\"'a'\"");
+    assert_eq!(pipe::quoted("a\u{1}b"), "\"a\u{fffd}b\"");
+    assert_eq!(pipe::quoted("plain"), "plain");
+}

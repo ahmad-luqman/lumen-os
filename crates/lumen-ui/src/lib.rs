@@ -24,7 +24,7 @@
 //! - **Counter** ([`counter`]): the demo app, its logic here so tests
 //!   drive the app the scenarios use.
 //! - **A request's reply** ([`Reply`]): the state machine of `ui invoke`'s
-//!   reply slot (`Pending`, `Running`, `Cancelled`, `Done`).
+//!   reply slot (`Pending`, `Running`, `Cancelled`, `Done`, `Taken`).
 
 #![cfg_attr(not(test), no_std)]
 

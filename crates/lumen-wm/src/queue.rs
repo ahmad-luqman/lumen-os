@@ -24,7 +24,7 @@
 //! - Presses, moves and requests are queued only while fewer than
 //!   [`RATIONED`] entries are: past that a press or move is dropped
 //!   (counted in `rationed`) and a request refused ([`Refused::Busy`],
-//!   handed back: `ui invoke` says "window <id> busy").
+//!   handed back: `ui invoke` says "window <id> busy (try again)").
 //! - A release is queued, in any free slot, only if the queue took that
 //!   key's or button's press. Any other release is ignored and counted: a
 //!   key's as `key_releases_unpaired` (expected: keys go to the window
@@ -160,7 +160,8 @@ pub enum Pushed {
 /// caller can answer it after releasing its locks.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refused<R> {
-    /// [`RATIONED`] entries are queued: `ui invoke` says "window <id> busy".
+    /// [`RATIONED`] entries are queued: `ui invoke` says "window <id> busy
+    /// (try again)".
     Busy(R),
     /// The queue is dead (its window destroyed).
     Dead(R),

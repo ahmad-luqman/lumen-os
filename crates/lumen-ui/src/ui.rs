@@ -436,7 +436,7 @@ impl Ui {
     /// Focus the next (or previous) enabled widget that takes the focus,
     /// in tree order, wrapping around.
     fn focus_step(&mut self, forward: bool) -> Vec<UiEvent> {
-        let order: Vec<usize> = self.order().into_iter().filter(|&i| self.takes_focus(i)).collect();
+        let order: Vec<usize> = self.walk().into_iter().map(|(i, _)| i).filter(|&i| self.takes_focus(i)).collect();
         if order.is_empty() {
             return Vec::new();
         }
@@ -543,11 +543,6 @@ impl Ui {
         out
     }
 
-    /// The widgets in tree order.
-    fn order(&self) -> Vec<usize> {
-        self.walk().into_iter().map(|(i, _)| i).collect()
-    }
-
     // -- the automation tree ---------------------------------------------------
 
     /// The top widgets' node ids (a window root's children).
@@ -597,7 +592,7 @@ impl Ui {
     /// Paint the whole tree into `s` (its background first).
     pub fn paint(&self, s: &mut Surface, text: &mut dyn Text, p: &Palette) {
         s.fill(p.background);
-        let line = text.line_height() as i32;
+        let line = text.line_height();
         for (i, w) in self.widgets.iter().enumerate() {
             let b = w.bounds;
             let fg = if w.disabled { p.disabled } else { p.text };
@@ -609,17 +604,17 @@ impl Ui {
                     let (bg, ink) = if w.disabled { (p.disabled, p.background) } else { (p.accent, p.accent_text) };
                     s.fill_rect(b, bg);
                     let x = b.x() + centred(b.w(), text.width(&w.name));
-                    text.draw(s, x, b.y() + centred(b.h(), line as u32), &w.name, ink, b);
+                    text.draw(s, x, b.y() + centred(b.h(), line), &w.name, ink, b);
                 }
                 Kind::Checkbox(checked) => {
-                    let boxed = Rect::new(b.x(), b.y() + (b.h() - BOX) as i32 / 2, BOX, BOX);
+                    let boxed = Rect::new(b.x(), b.y() + centred(b.h(), BOX), BOX, BOX);
                     s.fill_rect(boxed, p.field);
                     stroke(s, boxed, p.border);
                     if *checked {
                         s.fill_rect(Rect::new(boxed.x() + 3, boxed.y() + 3, BOX - 6, BOX - 6), p.accent);
                     }
                     let x = b.x() + (BOX + BOX_GAP) as i32;
-                    text.draw(s, x, b.y() + centred(b.h(), line as u32), &w.name, fg, b);
+                    text.draw(s, x, b.y() + centred(b.h(), line), &w.name, fg, b);
                 }
                 Kind::TextField(t) => {
                     s.fill_rect(b, p.field);

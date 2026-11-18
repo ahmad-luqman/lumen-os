@@ -288,9 +288,11 @@ fn invoke_and_a_click_give_the_same_state() {
 }
 
 #[test]
-fn set_value_and_focus_act_like_typing_and_clicking() {
+fn set_value_replaces_the_text_and_focus_focuses() {
+    // `set_value` replaces a field's text as one edit (here "old"
+    // goes), focusing the field; `focus` moves the focus.
     let mut ui = Ui::new();
-    let field = ui.text_field(None, "Name", "");
+    let field = ui.text_field(None, "Name", "old");
     let ok = ui.button(None, "OK");
     ui.layout(AREA, &mut FixedText);
     ui.set_window_focused(true);
@@ -361,7 +363,7 @@ fn an_action_that_removes_its_node_answers_that_it_ran() {
         pressed: u32,
     }
     impl crate::app::App for Vanishing {
-        fn ui(&mut self) -> &mut Ui {
+        fn ui_mut(&mut self) -> &mut Ui {
             &mut self.ui
         }
         fn apply(&mut self, events: &[UiEvent]) -> Then {
@@ -412,16 +414,31 @@ fn every_action_a_widget_role_lists_reaches_a_handler() {
             assert!(ui.invoke(id.get(), &action).is_ok(), "{role:?} {kind:?}");
         }
     }
-    // Labels and stacks list none; anything else is refused.
+    // Labels and stacks list none, and an action a role doesn't list is
+    // refused.
     assert!(Role::Label.actions().is_empty() && Role::Group.actions().is_empty());
+    assert_eq!(
+        ui.invoke(ui.id(button).get(), &Action::Select),
+        Err(InvokeError::NotAllowed(Role::Button, ActionKind::Select))
+    );
 }
 
 #[test]
 fn every_role_and_action_kind_is_listed_once() {
     // `ALL` holds each variant once, in order (its order is also checked at
-    // compile time); a new variant must join it.
+    // compile time), up to the last variant; every action any role lists
+    // parses by its name (an `ActionKind` left out of `ALL` wouldn't), and
+    // `NoSuchAction` names them all.
     assert_eq!(Role::ALL.len(), Role::MenuItem.index() + 1);
     assert_eq!(ActionKind::ALL.len(), ActionKind::Restore.index() + 1);
+    for role in Role::ALL {
+        for &kind in role.actions() {
+            let args: &[&str] = if kind == ActionKind::SetValue { &["v"] } else { &[] };
+            assert_eq!(Action::parse(kind.name(), args).map(|a| a.kind()), Ok(kind), "{role:?} {kind:?}");
+        }
+    }
+    let said = alloc::format!("{}", InvokeError::NoSuchAction);
+    assert!(ActionKind::ALL.iter().all(|k| said.contains(k.name())), "{said}");
 }
 
 #[test]

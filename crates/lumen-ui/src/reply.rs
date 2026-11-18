@@ -172,6 +172,10 @@ impl<T> Reply<T> {
     /// The asker's second deadline passed (or it was woken answered): ran
     /// late, or still running.
     pub fn after_second_deadline(&mut self) -> Second<T> {
+        debug_assert!(
+            matches!(self.phase(), Phase::Running | Phase::Done),
+            "a second deadline only after the first found it running"
+        );
         match self.take() {
             Some(t) => Second::Late(t),
             None => Second::StillRunning,
