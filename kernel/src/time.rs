@@ -76,12 +76,14 @@ static BOOT_TIMER_CALIBRATION: SpinLock<Option<Calibration>> = SpinLock::new(Non
 /// windows (the steady ones first, in the order they were taken; if attempts
 /// ran out, the unsteady ones with the smallest bounds fill the rest), and
 /// how many unsteady windows were taken (each followed by another, unless
-/// attempts ran out; filling in, some are kept) and the last of those.
+/// attempts ran out; filling in, some are kept), the first of those and the
+/// last.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Calibration {
     pub hz: u64,
     pub windows: [Window; WINDOWS],
     pub retaken: usize,
+    pub first_retaken: Option<Window>,
     pub last_retaken: Option<Window>,
     pub of: Calibrated,
 }
@@ -457,7 +459,14 @@ fn median_calibration(got: &Steadiest<WINDOWS>, of: Calibrated, known_hz: u64) -
     }
     let hz = lumen_time::median(&mut hz).expect("WINDOWS samples");
     let aside = got.aside();
-    Ok(Calibration { hz, windows: *got.windows(), retaken: aside.count, last_retaken: aside.last, of })
+    Ok(Calibration {
+        hz,
+        windows: *got.windows(),
+        retaken: aside.count,
+        first_retaken: aside.first,
+        last_retaken: aside.last,
+        of,
+    })
 }
 
 /// A [`Pause`] hook that stalls each window's end by `stall.end` parts per
@@ -1391,6 +1400,7 @@ crate::ktest!(
             hz: 2_500_000_000,
             windows: [w(end_gap); WINDOWS],
             retaken: 0,
+            first_retaken: None,
             last_retaken: None,
             of: Calibrated::Tsc(Reference::Pit),
         };
@@ -1730,22 +1740,27 @@ crate::ktest!(
         })?;
         crate::ktest::diag(format_args!("{cal}, median within {} ppm", cal.median_bound_ppm()));
         kassert_eq!(cal.steady(), WINDOWS);
-        // Taken again at least once (the first, 10 ms window was too slow to
-        // read), and a stretched window keeps its length: the next one
-        // starts from it, not from 10 ms. So any window taken again after
-        // the first was a stretched one, set aside for a stall of its own
-        // (a busy host's: as many as it likes, #184), never a 10 ms one
-        // again, as alternating lengths would leave it; the last set aside
-        // shows which.
+        // Taken again at least once: the first, 10 ms window can't be steady
+        // with 200 µs reads. And a stretched window keeps its length (the
+        // target only grows): after the first window set aside, every
+        // window is at least as long as `stretched_for_gaps` made the target
+        // from it, so any later one set aside (a busy host's stall: as many
+        // as it likes, #184) is that long too, never a 10 ms one again, as
+        // lengths falling back after a steady window would leave it. (The
+        // stretch itself is judged from that first window's own gaps, so a
+        // host stall in it, which can make it small, can't fail this.)
         kassert!(cal.retaken >= 1);
         if cal.retaken > 1 {
+            let first = cal.first_retaken.ok_or("no first window set aside")?;
             let last = cal.last_retaken.ok_or("no window set aside")?;
-            kassert!(last.reference > 2 * base);
+            let stretched = lumen_time::stretched_for_gaps(base, &first, base.saturating_mul(MOST_HPET_STRETCH));
+            crate::ktest::diag(format_args!("first set aside {first}, last {last}; stretched to {stretched}"));
+            kassert!(last.reference >= stretched);
         }
-        // Longer than 10 ms, and at most 16 times that: a window ends at the
-        // first poll past its target, so up to a poll (450 µs on loaded KVM)
-        // past it, under one more window.
-        kassert!(cal.windows.iter().all(|w| w.reference > base && w.reference < base * (MOST_HPET_STRETCH + 1)));
+        // Longer than 10 ms: every window is at least its target. (Not a
+        // ceiling: a window ends at its first poll past the target, and a host
+        // stall before that poll lengthens it.)
+        kassert!(cal.windows.iter().all(|w| w.reference > base));
         let boot_ppm = boot_calibration().ok_or("no boot calibration")?.median_bound_ppm();
         kassert!(lumen_time::within_bounds(cal.hz, hz, cal.median_bound_ppm(), boot_ppm, CROSS_CHECK_FLOOR_PPM));
         Ok(())
@@ -1992,6 +2007,7 @@ crate::ktest!(
             hz: 62_500_000,
             windows: gaps.map(w),
             retaken,
+            first_retaken: Some(w(60_000)),
             last_retaken: Some(w(60_000)),
             of,
         };
@@ -2097,6 +2113,7 @@ crate::ktest!(
             hz: 2_500_000_000,
             windows: [Window { tsc: 10_000_000, reference: 1_000_000, polls: 800, start_gap: 0, end_gap }; WINDOWS],
             retaken: 20,
+            first_retaken: None,
             last_retaken: None,
             of,
         };
@@ -2151,6 +2168,7 @@ crate::ktest!(
             hz: 62_500_000,
             windows: windows.map(parse),
             retaken,
+            first_retaken: None,
             last_retaken: None,
             of: Calibrated::Timer { tsc_ppm: 1_200 },
         };

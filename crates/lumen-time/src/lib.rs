@@ -346,12 +346,13 @@ pub enum Pause {
     CountRead,
 }
 
-/// The unsteady windows a calibration took: how many, and the last. Each was
-/// followed by another window, unless attempts ran out;
+/// The unsteady windows a calibration took: how many, the first and the
+/// last. Each was followed by another window, unless attempts ran out;
 /// [`steadiest_windows`] may still keep some, to fill in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SetAside {
     pub count: usize,
+    pub first: Option<Window>,
     pub last: Option<Window>,
 }
 
@@ -472,7 +473,7 @@ pub fn steadiest_windows<E, const N: usize>(
             out.steady += 1;
             continue;
         }
-        out.aside = SetAside { count: out.aside.count + 1, last: Some(w) };
+        out.aside = SetAside { count: out.aside.count + 1, first: out.aside.first.or(Some(w)), last: Some(w) };
         let at = spare[..spares].iter().position(|s| bound(&w) < bound(s)).unwrap_or(spares);
         if at < N {
             spares = (spares + 1).min(N);
@@ -884,7 +885,8 @@ mod tests {
             .into_iter()
             .chain((104..).map(|t| window(t, 0, 0)));
         let r = steadiest_windows::<(), 3>(10, || Ok(taken.next().unwrap()), Window::gap_ppm, |_| {}).unwrap();
-        assert_eq!((r.steady(), r.aside()), (3, SetAside { count: 2, last: Some(window(103, 9, 0)) }));
+        let aside = SetAside { count: 2, first: Some(window(101, 0, 50)), last: Some(window(103, 9, 0)) };
+        assert_eq!((r.steady(), r.aside()), (3, aside));
         assert_eq!(r.windows().map(|w| w.tsc), [100, 102, 104]);
         let r = steadiest_windows::<(), 3>(3, || Ok(window(7, 0, 0)), Window::gap_ppm, |_| {}).unwrap();
         assert_eq!((r.steady(), r.aside()), (3, SetAside::default()));
