@@ -957,3 +957,62 @@ def invoke(
             return replace(got, retries=retries)
         time.sleep(0.2)
     raise AssertionError(f"{line} was cancelled {tries} times")
+
+
+# -- the desktop shell (#157) --------------------------------------------------
+
+
+def taskbar(m: Machine) -> list[dict[str, str]]:
+    """The taskbar's nodes in `ui tree` (its root, a `group` named
+    `Taskbar` at depth 0, first), screen coordinates."""
+    rows = ui_tree(m)
+    root = one(rows, "taskbar roots", role="group", name="Taskbar", depth="0")
+    return [r for r in rows if r["window"] == root["window"]]
+
+
+def bounds(row: dict[str, str]) -> tuple[int, int, int, int]:
+    """A tree row's bounds: x, y, w, h."""
+    return int(row["x"]), int(row["y"]), int(row["w"]), int(row["h"])
+
+
+def centre(row: dict[str, str]) -> tuple[int, int]:
+    """The middle of a tree row's bounds (where a click lands on it); a
+    row with no bounds (a hidden node) fails."""
+    x, y, w, h = bounds(row)
+    assert w > 0 and h > 0, f"nothing to click: {row}"
+    return x + w // 2, y + h // 2
+
+
+def clock(m: Machine) -> dict[str, str]:
+    """The taskbar clock's row in `ui tree` (its text in `value`)."""
+    return node(taskbar(m), "label", "Clock")
+
+
+def clock_mask(m: Machine) -> tuple[tuple[int, int, int, int], ...]:
+    """The taskbar clock's bounds, for a golden's `masks` (its text
+    changes with the time)."""
+    return (bounds(clock(m)),)
+
+
+def clock_text(m: Machine) -> str:
+    """The taskbar clock's text (`HH:MM`)."""
+    return clock(m)["value"]
+
+
+def quiet_for(m: Machine, seconds: float, tries: int = 3) -> dict[str, str]:
+    """A settled desktop that presents nothing for `seconds`: `settled`
+    read before and after with the same `frames`. Tried again (up to
+    `tries`) only when the taskbar clock's minute turned meanwhile (its
+    redraw is a present) or the after read caught an owner between two
+    waits (the clock polls the RTC every second); `desktop status`'s
+    record after."""
+    for _ in range(tries):
+        clock = clock_text(m)
+        before = wait_settled(m)
+        time.sleep(seconds)
+        after = desktop_status(m)
+        if after["frames"] == before["frames"] and after["settled"] == "yes":
+            return after
+        if clock_text(m) == clock and after["frames"] != before["frames"]:
+            raise AssertionError(f"presented while quiet: {before} then {after}")
+    raise AssertionError(f"never quiet for {seconds} s in {tries} tries")

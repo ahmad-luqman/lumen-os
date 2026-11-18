@@ -96,9 +96,9 @@ pub static COMMANDS: Table<Run> = Table(&[
     },
     Command {
         name: "desktop",
-        args: &[&["status", "check", "spin", "counter", "hold", "release"]],
-        usage: "[status|check|spin|counter|hold <window>|release <window>]",
-        about: "start or resume the desktop (status: one record; counter: the toolkit's demo; check, spin, hold, release: for the tests)",
+        args: &[&["status", "check", "spin", "counter", "tick", "hold", "release"]],
+        usage: "[status|check|spin|counter|tick|hold <window>|release <window>]",
+        about: "start or resume the desktop (status: one record; counter: the toolkit's demo; check, spin, tick, hold, release: for the tests)",
         run: crate::desktop::command,
     },
     Command {

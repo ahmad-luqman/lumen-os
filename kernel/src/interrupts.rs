@@ -438,15 +438,28 @@ crate::ktest!(
 crate::ktest!(
     fn an_unexpected_storm_is_reported_sparsely() {
         // 2048 interrupts on a free vector: reported at the 1st, 1024th and
-        // 2048th only (test_ktest counts the lines), each counted.
+        // 2048th only (test_ktest counts the lines), each counted. Raised on
+        // another CPU when there is one: each is a trace event on the CPU
+        // that takes it, and 2048 on the boot CPU would fill half its ring,
+        // which the boot timeline's ktests need unwrapped (whether they ran
+        // before or after this depended on the tests' link order).
         use crate::arch::idt;
         use crate::kassert_eq;
         const V: u8 = idt::UNUSED + 1;
+        fn storm() {
+            for _ in 0..2048 {
+                // SAFETY: a software interrupt on a vector the dispatcher
+                // handles and returns from; the entry stub saves every
+                // register.
+                unsafe { core::arch::asm!("int {v}", v = const V) };
+            }
+        }
         let before = idt::strays().unexpected;
-        for _ in 0..2048 {
-            // SAFETY: a software interrupt on a vector the dispatcher
-            // handles and returns from; the entry stub saves every register.
-            unsafe { core::arch::asm!("int {v}", v = const V) };
+        let here = crate::arch::cpu_index();
+        let other = (0..crate::arch::MAX_CPUS).rev().find(|&c| c != here && crate::sched::running_on(c));
+        match other.map(|cpu| crate::sched::spawn_on(cpu, "storm", storm)) {
+            Some(Ok(t)) => t.join(),
+            _ => storm(),
         }
         kassert_eq!(idt::strays().unexpected, before + 2048);
         Ok(())

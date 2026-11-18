@@ -2,6 +2,8 @@
 //! reports) and running a request on it ([`serve`]). The kernel's
 //! `ui::Toolkit` drives both; host tests run the same code.
 
+use alloc::string::String;
+
 use lumen_gfx::{Rect, Surface};
 
 use crate::node::{Action, AutomationNode, InvokeError};
@@ -9,12 +11,16 @@ use crate::text::Text;
 use crate::ui::{Ui, UiEvent};
 
 /// What a window does after an event.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Then {
     /// Carry on (repaint if its tree changed).
     Carry,
     /// Close the window (its owner drops the handle).
     Close,
+    /// Carry on, but what the event asked for failed, and why (#157: a
+    /// launcher item whose window didn't open): a request that reached
+    /// it answers [`Served::Failed`].
+    Failed(String),
 }
 
 /// A window's app.
@@ -41,6 +47,9 @@ pub enum Served {
     RanNodeGone,
     /// Done, and the action closed its window (a Quit button).
     ClosedItsWindow,
+    /// The node took the action, but what it was for failed, and why
+    /// ([`Then::Failed`]).
+    Failed(String),
 }
 
 /// Run `action` on node `node` of `app`'s tree, through the handler a
@@ -51,10 +60,13 @@ pub fn serve(app: &mut dyn App, text: &mut dyn Text, area: Rect, node: u64, acti
         Ok(events) => events,
         Err(e) => return Served::Error(e),
     };
-    if app.apply(&events) == Then::Close {
-        return Served::ClosedItsWindow;
-    }
+    let then = app.apply(&events);
     app.ui_mut().layout(area, text);
+    match then {
+        Then::Close => return Served::ClosedItsWindow,
+        Then::Failed(why) => return Served::Failed(why),
+        Then::Carry => {}
+    }
     match app.ui_mut().node(node) {
         Some((depth, row)) => Served::Row { depth, node: row },
         None => Served::RanNodeGone,

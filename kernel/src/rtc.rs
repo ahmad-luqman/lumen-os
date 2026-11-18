@@ -62,6 +62,23 @@ impl fmt::Display for RtcError {
 /// The date and time the RTC holds. A clock whose registers aren't a date
 /// is also logged (a warning, with the registers).
 pub fn now() -> Result<DateTime, RtcError> {
+    read().map_err(|(e, registers)| {
+        if let Some(r) = registers {
+            log::warn!(target: "rtc", "the clock gave no date ({e}): {r:x?}");
+        }
+        e
+    })
+}
+
+/// [`now`] logging nothing: for a reader that polls (the taskbar clock,
+/// #157) and says itself, once, when reads start failing.
+pub fn now_quiet() -> Result<DateTime, RtcError> {
+    read().map_err(|(e, _)| e)
+}
+
+/// The RTC read: the date, or why not (with the registers when they
+/// aren't a date).
+fn read() -> Result<DateTime, (RtcError, Option<Registers>)> {
     let wait_ready = || rtc::wait_ready(|| cmos::lock().read(STATUS_A), crate::time::now_ns, UPDATE_WAIT_NS);
     let registers = || {
         let c = cmos::lock();
@@ -77,16 +94,16 @@ pub fn now() -> Result<DateTime, RtcError> {
             status_d: c.read(STATUS_D),
         }
     };
-    let r = rtc::read_stable(wait_ready, registers, TRIES).map_err(|e| match e {
-        Unsteady::NotReady(NotReady::Absent) => RtcError::Absent,
-        Unsteady::NotReady(NotReady::Stopped) => RtcError::Stopped,
-        Unsteady::NotReady(NotReady::Busy) => RtcError::Busy,
-        Unsteady::NeverAgreed => RtcError::NeverAgreed,
+    let r = rtc::read_stable(wait_ready, registers, TRIES).map_err(|e| {
+        let e = match e {
+            Unsteady::NotReady(NotReady::Absent) => RtcError::Absent,
+            Unsteady::NotReady(NotReady::Stopped) => RtcError::Stopped,
+            Unsteady::NotReady(NotReady::Busy) => RtcError::Busy,
+            Unsteady::NeverAgreed => RtcError::NeverAgreed,
+        };
+        (e, None)
     })?;
-    rtc::decode(&r).map_err(|e| {
-        log::warn!(target: "rtc", "the clock gave no date ({e}): {r:x?}");
-        RtcError::Decode(e)
-    })
+    rtc::decode(&r).map_err(|e| (RtcError::Decode(e), Some(r)))
 }
 
 crate::ktest!(

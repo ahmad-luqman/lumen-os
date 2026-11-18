@@ -338,9 +338,128 @@ impl Target for Surface {
     }
 }
 
+impl Surface {
+    /// The surface cut into bands of `rows` rows (the last one shorter if
+    /// `rows` doesn't divide the height), top to bottom, each borrowing its
+    /// own rows: disjoint, so each may go to another thread (#157's
+    /// Mandelbrot window draws with every CPU). Panics if `rows` is 0.
+    pub fn bands_mut(&mut self, rows: u32) -> Vec<BandMut<'_>> {
+        assert!(rows > 0, "a band holds at least one row");
+        let (width, stride, height) = (self.width, self.stride, self.height);
+        let mut bands = Vec::with_capacity(height.div_ceil(rows) as usize);
+        // Exactly `height` rows (no slack past the last).
+        let pixels = &mut self.pixels[..stride * height as usize];
+        let step = stride * rows as usize;
+        for (n, chunk) in pixels.chunks_mut(step.max(1)).enumerate() {
+            let y = n as u32 * rows;
+            let h = rows.min(height - y);
+            bands.push(BandMut { y, width, height: h, stride, pixels: chunk });
+        }
+        bands
+    }
+}
+
+/// A band of a [`Surface`]'s rows, lent by [`Surface::bands_mut`]: its own
+/// row numbers from 0 ([`BandMut::y`] says where it is on the surface).
+pub struct BandMut<'a> {
+    y: u32,
+    width: u32,
+    height: u32,
+    stride: usize,
+    pixels: &'a mut [u32],
+}
+
+impl BandMut<'_> {
+    /// Its first row's number on the surface.
+    pub const fn y(&self) -> u32 {
+        self.y
+    }
+
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Its rows.
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Its row `y` (0 its first), `width` pixels (never the padding past
+    /// them). Panics if `y` is outside the band.
+    pub fn row_mut(&mut self, y: u32) -> &mut [u32] {
+        assert!(y < self.height, "row {y} of a band of {}", self.height);
+        let start = y as usize * self.stride;
+        &mut self.pixels[start..start + self.width as usize]
+    }
+}
+
+impl Target for BandMut<'_> {
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    fn write_span(&mut self, x: u32, y: u32, pixels: &[u32]) {
+        let x = x as usize;
+        self.row_mut(y)[x..x + pixels.len()].copy_from_slice(pixels);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bands_cover_the_surface_once_and_never_its_padding() {
+        for (w, h, stride, rows) in
+            [(5, 7, 5, 3), (5, 7, 9, 3), (4, 8, 4, 8), (4, 8, 6, 100), (3, 1, 3, 1), (2, 0, 2, 4)]
+        {
+            let mut s = Surface::with_stride(w, h, stride).expect("small");
+            let mut want = Surface::with_stride(w, h, stride).expect("small");
+            let mut bands = s.bands_mut(rows);
+            assert_eq!(bands.len() as u32, h.div_ceil(rows), "{w}x{h} by {rows}");
+            let mut next = 0;
+            for b in &mut bands {
+                assert_eq!((b.y(), b.width()), (next, w));
+                assert!(b.height() >= 1 && b.height() <= rows);
+                for r in 0..b.height() {
+                    let y = b.y() + r;
+                    for (x, p) in b.row_mut(r).iter_mut().enumerate() {
+                        *p = y * 1000 + x as u32 + 1;
+                    }
+                }
+                next += b.height();
+            }
+            assert_eq!(next, h);
+            for y in 0..h {
+                for x in 0..w {
+                    want.set_pixel(x as i32, y as i32, y * 1000 + x + 1);
+                }
+            }
+            assert_eq!(s, want);
+            // The padding past each row's width is untouched.
+            assert!(s.pixels.chunks(stride).all(|row| row[w as usize..].iter().all(|&p| p == 0)));
+        }
+    }
+
+    #[test]
+    fn a_band_is_a_target_in_its_own_rows() {
+        let mut s = Surface::new(6, 5);
+        let src = Surface::from_pixels(6, 5, (0..30).collect()).expect("30 pixels");
+        for mut b in s.bands_mut(2) {
+            assert_eq!(b.size(), (6, b.height()));
+            let r = Rect::new(0, b.y() as i32, 6, b.height());
+            src.copy_to(r, &mut b, 0, 0);
+        }
+        assert_eq!(s, src);
+    }
+
+    #[test]
+    #[should_panic(expected = "row 2 of a band of 2")]
+    fn a_band_refuses_a_row_outside_it() {
+        let mut s = Surface::new(3, 6);
+        let mut bands = s.bands_mut(2);
+        let _ = bands[1].row_mut(2);
+    }
 
     /// A surface whose every pixel is distinct, `seed + y * w + x`, rows
     /// `stride` apart, the padding 0. Written straight into the buffer, so

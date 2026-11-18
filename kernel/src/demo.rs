@@ -364,6 +364,227 @@ pub fn life(ctx: &mut Ctx<'_>, args: &[String]) {
     }
 }
 
+// -- the demos in windows (#157) ------------------------------------------------
+
+/// The Mandelbrot window's client size.
+const MANDEL_WINDOW: (u32, u32) = (480, 320);
+/// The Life window's client size (cells of [`CELL`] pixels).
+const LIFE_WINDOW: (u32, u32) = (400, 280);
+/// Life's generations a second in its window.
+const LIFE_WINDOW_HZ: u64 = 10;
+
+/// What a drawing in a window did: rows by CPU, and the CPUs whose thread
+/// couldn't be started (their bands drawn by the caller).
+#[derive(Clone, Copy, Debug)]
+pub struct WindowDrawn {
+    pub ns: u64,
+    pub rows: [usize; MAX_CPUS],
+    pub caller: usize,
+    pub no_thread: [Option<SpawnError>; MAX_CPUS],
+}
+
+impl WindowDrawn {
+    pub fn cpus(&self) -> usize {
+        self.rows.iter().filter(|&&r| r > 0).count()
+    }
+}
+
+/// The CPUs other than this one whose scheduler runs (where
+/// [`draw_bands`] puts its helper threads).
+fn other_cpus() -> Vec<usize> {
+    let caller = arch::cpu_index();
+    (0..MAX_CPUS).filter(|&c| c != caller && sched::running_on(c)).collect()
+}
+
+/// Draw `view` into `bands` of one surface (rows numbered as on it),
+/// dealt round-robin to this CPU (slot 0) and a thread on each of
+/// `others` (`sched::scope`, joined before this returns); the caller draws
+/// the slot of a CPU whose thread couldn't be started (`no_thread` says
+/// which and why). `Err` if this thread can't block to join them (nothing
+/// drawn).
+fn draw_bands(bands: Vec<lumen_gfx::BandMut<'_>>, view: View, others: &[usize]) -> Result<WindowDrawn, SpawnError> {
+    use crate::sync::SpinLock;
+    let start = crate::time::now_ns();
+    let caller = arch::cpu_index();
+    let slots = 1 + others.len();
+    // Each slot's bands, behind a lock its thread takes them from (so a
+    // slot whose thread never starts is still there for the caller).
+    let dealt: Vec<SpinLock<Vec<lumen_gfx::BandMut<'_>>>> = (0..slots).map(|_| SpinLock::new(Vec::new())).collect();
+    for (k, band) in bands.into_iter().enumerate() {
+        dealt[k % slots].lock().push(band);
+    }
+    let rows: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+    let draw = |slot: &SpinLock<Vec<lumen_gfx::BandMut<'_>>>| {
+        let mut mine = core::mem::take(&mut *slot.lock());
+        let mut drawn = 0;
+        for band in &mut mine {
+            for r in 0..band.height() {
+                let y = (band.y() + r) as usize;
+                for (x, p) in band.row_mut(r).iter_mut().enumerate() {
+                    *p = mandel::color(view.escape_at(x, y), view.max_iter);
+                }
+                drawn += 1;
+            }
+        }
+        rows[arch::cpu_index()].fetch_add(drawn, Ordering::Relaxed);
+    };
+    let mut no_thread = [None; MAX_CPUS];
+    sched::scope(|s| {
+        let mut orphans = Vec::new();
+        for (i, &cpu) in others.iter().enumerate() {
+            let (slot, draw) = (&dealt[i + 1], &draw);
+            if let Err(e) = s.spawn_on(cpu, "mandelbrot", move || draw(slot)) {
+                no_thread[cpu] = Some(e);
+                orphans.push(i + 1);
+            }
+        }
+        // Slot 0, then the slots whose thread never started.
+        draw(&dealt[0]);
+        for i in orphans {
+            draw(&dealt[i]);
+        }
+    })?;
+    let rows = core::array::from_fn(|c| rows[c].load(Ordering::Relaxed));
+    Ok(WindowDrawn { ns: crate::time::now_ns() - start, rows, caller, no_thread })
+}
+
+/// Open a `size` window titled `title` and start its owner, thread
+/// `thread` running `owner`; the window's id.
+fn open_owned(
+    title: &str,
+    size: (u32, u32),
+    thread: &'static str,
+    owner: fn(crate::desktop::WindowHandle),
+) -> Result<u32, String> {
+    let handle = crate::desktop::open_window(title, size.0, size.1).map_err(|e| format!("no window: {e}"))?;
+    let id = handle.id();
+    let _detached = sched::spawn(thread, move || owner(handle)).map_err(|e| format!("no thread: {e}"))?;
+    Ok(id)
+}
+
+/// The launcher's `Mandelbrot`: a window drawn once by every CPU; its id.
+pub fn open_mandelbrot_window() -> Result<u32, String> {
+    open_owned("Mandelbrot", MANDEL_WINDOW, "desktop-mandelbrot", mandelbrot_owner)
+}
+
+/// Draw the set into `h`'s surface with this CPU and `others` and commit
+/// it; what the drawing did (`Err`: this thread can't block, nothing
+/// drawn).
+fn draw_window(h: &mut crate::desktop::WindowHandle, others: &[usize]) -> Result<WindowDrawn, SpawnError> {
+    let s = h.surface_mut();
+    let (view, bounds) = (View::fit(s.width() as usize, s.height() as usize, MAX_ITER), s.bounds());
+    let drawn = draw_bands(s.bands_mut(BAND.get() as u32), view, others)?;
+    h.commit(&[bounds]);
+    Ok(drawn)
+}
+
+/// Say which CPUs got no thread for a drawing (the caller drew their
+/// rows); how many.
+fn report_no_thread(d: &WindowDrawn) -> usize {
+    let mut n = 0;
+    for (cpu, e) in d.no_thread.iter().enumerate() {
+        if let Some(e) = e {
+            log::warn!(target: "demo", "mandelbrot window: cpu{cpu} got no thread ({e}); cpu{} drew its rows", d.caller);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The Mandelbrot window's owner: draws it once (logging which CPUs drew
+/// which rows), then waits for its close. Its pixels follow no theme.
+fn mandelbrot_owner(mut h: crate::desktop::WindowHandle) {
+    use crate::desktop::WindowEvent;
+    match draw_window(&mut h, &other_cpus()) {
+        Ok(d) => {
+            let mut per_cpu = String::new();
+            for (cpu, rows) in d.rows.iter().enumerate().filter(|&(_, &r)| r > 0) {
+                let _ = write!(per_cpu, " cpu{cpu}={rows}");
+            }
+            log::info!(
+                target: "demo",
+                "mandelbrot window {}: {} in {} ms, rows by CPU:{per_cpu}",
+                h.id(),
+                Cpus(d.cpus()),
+                d.ns / 1_000_000
+            );
+            report_no_thread(&d);
+        }
+        Err(e) => log::warn!(target: "demo", "mandelbrot window {}: not drawn ({e})", h.id()),
+    }
+    loop {
+        match h.wait_event() {
+            WindowEvent::Close => return,
+            WindowEvent::Request(r) => crate::ui::refuse(r),
+            WindowEvent::Theme(_)
+            | WindowEvent::Key(_)
+            | WindowEvent::PointerDown { .. }
+            | WindowEvent::PointerMove { .. }
+            | WindowEvent::PointerUp { .. }
+            | WindowEvent::FocusGained
+            | WindowEvent::FocusLost
+            | WindowEvent::Lost => {}
+        }
+    }
+}
+
+/// The launcher's `Life`: a window stepping the `gun` pattern ten times a
+/// second, focused or not, until it closes; its id.
+pub fn open_life_window() -> Result<u32, String> {
+    open_owned("Life", LIFE_WINDOW, "desktop-life", life_owner)
+}
+
+/// The Life window's owner: a generation every 100 ms (an animating wait:
+/// the desktop never settles while it runs), committing only the cells
+/// that changed, until its close.
+fn life_owner(mut h: crate::desktop::WindowHandle) {
+    use crate::desktop::{Animating, Wait, WindowEvent};
+    use lumen_gfx::Rect;
+    let s = h.surface_mut();
+    let mut grid = Life::new(s.width() as usize / CELL, s.height() as usize / CELL);
+    let pattern = life::pattern(DEFAULT_PATTERN).expect("the default pattern exists");
+    let (x0, y0) = pattern.origin(grid.width(), grid.height());
+    grid.place(pattern, x0, y0);
+    let cell_rect =
+        |x: usize, y: usize| Rect::new((x * CELL) as i32, (y * CELL) as i32, CELL as u32 - 1, CELL as u32 - 1);
+    {
+        let s = h.surface_mut();
+        s.fill(DEAD);
+        for y in 0..grid.height() {
+            for x in 0..grid.width() {
+                if grid.get(x, y) {
+                    s.fill_rect(cell_rect(x, y), ALIVE);
+                }
+            }
+        }
+        let b = s.bounds();
+        h.commit(&[b]);
+    }
+    let period = 1_000_000_000 / LIFE_WINDOW_HZ;
+    let mut next = crate::time::now_ns().saturating_add(period);
+    loop {
+        match h.wait_event_until(Some(next), Animating::Yes) {
+            Wait::Event(WindowEvent::Close) => return,
+            Wait::Event(WindowEvent::Request(r)) => crate::ui::refuse(r),
+            Wait::Event(_) | Wait::Woken => {}
+            Wait::Deadline => {
+                // The changed cells' bounding box is committed.
+                let mut changed: Option<Rect> = None;
+                let s = h.surface_mut();
+                grid.step(|x, y, alive| {
+                    let r = cell_rect(x, y);
+                    s.fill_rect(r, if alive { ALIVE } else { DEAD });
+                    changed = Some(changed.map_or(r, |c| c.union(&r)));
+                });
+                if let Some(c) = changed {
+                    h.commit(&[c]);
+                }
+                next = next.saturating_add(period).max(crate::time::now_ns());
+            }
+        }
+    }
+}
+
 /// For [`every_cpu_rendered_rows`]: draw a `width` x `height` view alone,
 /// then `rounds` times on every CPU, checking each parallel drawing right
 /// as it returns.
@@ -433,5 +654,75 @@ crate::ktest!(
         let cpus = (0..MAX_CPUS).filter(|&c| crate::smp::online_lapic_id(c).is_some()).count();
         draws_alike(&canvas, width, cpus * BAND.get(), 20)?;
         draws_alike(&canvas, width, 197, 1)
+    }
+);
+
+crate::ktest!(
+    fn every_cpu_rendered_rows_in_a_window() {
+        // The Mandelbrot window's drawing (#157): its surface lent as bands
+        // to a thread on every CPU whose scheduler runs (`sched::scope`),
+        // each CPU drawing at least one band, every row drawn once, the
+        // pixels those of this CPU drawing alone; 3 times, on a window
+        // a band taller than one band per CPU (so a CPU's second band shows
+        // a missed join).
+        use crate::{kassert, kassert_eq};
+        let cpus: Vec<usize> = (0..MAX_CPUS).filter(|&c| sched::running_on(c)).collect();
+        kassert!(cpus.len() > 1);
+        let (w, ht) = (96u32, (cpus.len() + 1) as u32 * BAND.get() as u32 + 3);
+        let desktop = crate::desktop::Desktop::without_screen();
+        let mut h = desktop.open_window("Mandelbrot", w, ht).map_err(|_| "no window")?;
+        let view = View::fit(w as usize, ht as usize, MAX_ITER);
+        let mut alone = lumen_gfx::Surface::new(w, ht);
+        let one = draw_bands(alone.bands_mut(BAND.get() as u32), view, &[]).map_err(|_| "can't block")?;
+        kassert_eq!(one.cpus(), 1);
+        for round in 0..3 {
+            h.surface_mut().fill(0);
+            let d = draw_window(&mut h, &other_cpus()).map_err(|_| "can't block")?;
+            let rows: Vec<usize> = cpus.iter().map(|&c| d.rows[c]).collect();
+            let same = *h.surface_mut() == alone;
+            if round == 0 || !same || rows.contains(&0) {
+                crate::ktest::diag(format_args!(
+                    "{w}x{ht} round {round}: rows per CPU {rows:?}, same pixels {same}, {} us",
+                    d.ns / 1000
+                ));
+            }
+            kassert!(same);
+            kassert!(rows.iter().all(|&r| r > 0));
+            kassert_eq!(d.rows.iter().sum::<usize>(), ht as usize);
+            kassert!(d.no_thread.iter().all(Option::is_none));
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn the_caller_draws_the_slot_of_a_cpu_that_got_no_thread() {
+        // A CPU with no scheduler among the helpers: its thread can't be
+        // started (`NotRunning`), so the caller draws its slot too; every
+        // row is drawn once, the pixels those of one CPU drawing alone, and
+        // the drawing's report warns about that CPU, once.
+        use crate::{kassert, kassert_eq};
+        let Some(missing) = (0..MAX_CPUS).find(|&c| !sched::running_on(c)) else {
+            return Err("every CPU runs a scheduler: no CPU to leave out");
+        };
+        let mut others = other_cpus();
+        others.push(missing);
+        let (w, ht) = (64u32, (others.len() + 1) as u32 * BAND.get() as u32 + 5);
+        let desktop = crate::desktop::Desktop::without_screen();
+        let mut h = desktop.open_window("Mandelbrot", w, ht).map_err(|_| "no window")?;
+        let view = View::fit(w as usize, ht as usize, MAX_ITER);
+        let mut alone = lumen_gfx::Surface::new(w, ht);
+        draw_bands(alone.bands_mut(BAND.get() as u32), view, &[]).map_err(|_| "can't block")?;
+        let d = draw_window(&mut h, &others).map_err(|_| "can't block")?;
+        kassert!(d.no_thread[missing] == Some(SpawnError::NotRunning));
+        kassert_eq!(d.no_thread.iter().filter(|e| e.is_some()).count(), 1);
+        kassert_eq!(d.rows.iter().sum::<usize>(), ht as usize);
+        kassert_eq!(d.rows[missing], 0);
+        kassert!(*h.surface_mut() == alone);
+        let line = alloc::format!("mandelbrot window: cpu{missing} got no thread");
+        let before = crate::desktop::logged(&line)?;
+        kassert_eq!(report_no_thread(&d), 1);
+        kassert_eq!(crate::desktop::logged(&line)?, before + 1);
+        Ok(())
     }
 );

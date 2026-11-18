@@ -58,6 +58,7 @@ mod smp;
 mod sound;
 mod symbols;
 mod sync;
+mod taskbar;
 mod term;
 mod termwin;
 mod time;

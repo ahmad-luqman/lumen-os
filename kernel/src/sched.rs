@@ -624,8 +624,8 @@ pub enum SpawnError {
     NotRunning,
     /// No stack for it.
     Stack(StackError),
-    /// [`run_sized`] on a thread that can't wait for another (an interrupt
-    /// handler, a lock held, interrupts off, the idle thread).
+    /// [`run_sized`] or [`scope`] on a thread that can't wait for another
+    /// (an interrupt handler, a lock held, interrupts off, the idle thread).
     CantWait,
 }
 
@@ -690,6 +690,68 @@ pub fn run_sized<'a>(name: &'static str, stack_size: u64, f: impl FnOnce() + Sen
     let f: Entry = unsafe { core::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Entry>(f) };
     spawn_with(cpu, name, stack_size, f)?.join();
     Ok(())
+}
+
+/// Run `f` with a [`Scope`] whose threads may borrow from the caller
+/// (`'env`), and join every thread it started before returning
+/// ([`run_sized`]'s argument applied to several threads): #157's Mandelbrot
+/// window lends each CPU a band of its surface. `Err(CantWait)` (and `f`
+/// unrun) if the calling thread can't block to join them. `f` must return
+/// where the caller can still block (the joins follow it): with a lock
+/// guard returned or left held, the join would panic. That is liveness, not
+/// a safety obligation (the joins are never skipped).
+pub fn scope<'env, R>(f: impl FnOnce(&Scope<'env>) -> R) -> Result<R, SpawnError> {
+    // The SAFETY argument in `Scope::spawn_on` needs a panic to end the
+    // kernel, not unwind past the joins.
+    #[cfg(not(panic = "abort"))]
+    compile_error!("sched::scope relies on panic = \"abort\"");
+    if !can_block(arch::cpu_index()) {
+        return Err(SpawnError::CantWait);
+    }
+    let scope = Scope { threads: core::cell::RefCell::new(Vec::new()), _env: core::marker::PhantomData };
+    let out = f(&scope);
+    for t in scope.threads.into_inner() {
+        t.join();
+    }
+    Ok(out)
+}
+
+/// The threads of a [`scope`]: each joined before `scope` returns, so
+/// they may borrow what outlives the call (`'env`). Not `Sync`: its
+/// threads can't reach it (only the caller spawns).
+pub struct Scope<'env> {
+    threads: core::cell::RefCell<Vec<JoinHandle>>,
+    /// Invariant in `'env`, as `std::thread::Scope` is. This is what makes
+    /// `spawn_on` sound: if `Scope<'env>` were covariant (a
+    /// `PhantomData<&'env ()>`), a `&Scope<'long>` would coerce to a
+    /// `&Scope<'short>` inside `f`, and a thread could borrow a local of
+    /// `f` that dies before the joins (a use after free; it compiles, and
+    /// no test in the kernel would catch it). Invariance pins `'env` to
+    /// the lifetime chosen at the `scope` call, which outlives the joins.
+    _env: core::marker::PhantomData<&'env mut &'env ()>,
+}
+
+impl<'env> Scope<'env> {
+    /// Start a thread running `f` on CPU `cpu` (see [`spawn_on`]), joined
+    /// when the scope ends. If it can't be started, `f` is dropped unrun
+    /// and the threads already started still run (and are joined).
+    pub fn spawn_on(&self, cpu: usize, name: &'static str, f: impl FnOnce() + Send + 'env) -> Result<(), SpawnError> {
+        let f: Box<dyn FnOnce() + Send + 'env> = Box::new(f);
+        // SAFETY: only the closure's lifetime bound changes (same layout).
+        // `scope` joins every thread pushed below before it returns (a join
+        // has no timeout, and nothing kills a thread), and `'env` outlives
+        // that call: it is a parameter of `scope`, `Scope` is invariant in
+        // it (see `_env`: covariance would let `'env` shrink to a local of
+        // `scope`'s closure), and `&Scope` can't leave that closure (its
+        // lifetime is higher-ranked). So `f` and what it borrows are used
+        // only while those borrows are alive; a panic aborts the kernel, so
+        // nothing unwinds past the joins. If spawning fails, `spawn_with`
+        // drops `f` before returning.
+        let f: Entry = unsafe { core::mem::transmute::<Box<dyn FnOnce() + Send + 'env>, Entry>(f) };
+        let thread = spawn_with(cpu, name, STACK_SIZE, f)?;
+        self.threads.borrow_mut().push(thread);
+        Ok(())
+    }
 }
 
 /// Start a thread running `f` on CPU `cpu`, where it will always run. It is
@@ -2576,6 +2638,80 @@ crate::ktest!(
         kassert!(s.0.wake_one());
         join_bounded(h)?;
         kassert!(times_on(&me, &s.0) == 0 && times_on(&th, &s.0) == 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_scope_joins_every_thread_before_it_returns() {
+        // Threads on every CPU whose scheduler runs borrow the caller's
+        // array (no `Arc`, no `'static`), each sleeping first so a missing
+        // join shows: when `scope` returns every slot is written and every
+        // thread has exited. A spawn on a CPU without a scheduler fails
+        // (its closure dropped unrun) and the others still run.
+        use crate::{kassert, kassert_eq};
+        let cpus: Vec<usize> = (0..MAX_CPUS).filter(|&c| running_on(c)).collect();
+        kassert!(cpus.len() > 1);
+        let slots = [const { AtomicUsize::new(0) }; MAX_CPUS];
+        let ran_unstarted = AtomicBool::new(false);
+        let missing = (0..MAX_CPUS).find(|&c| !running_on(c));
+        let (started, refused) = scope(|s| {
+            let mut started = 0;
+            for &cpu in &cpus {
+                let slot = &slots[cpu];
+                if s.spawn_on(cpu, "scoped", move || {
+                    let _ = sleep(20_000_000);
+                    slot.store(arch::cpu_index() + 1, Ordering::Release);
+                })
+                .is_ok()
+                {
+                    started += 1;
+                }
+            }
+            let refused =
+                missing.map(|cpu| s.spawn_on(cpu, "nowhere", || ran_unstarted.store(true, Ordering::Release)));
+            (started, refused)
+        })
+        .map_err(|_| "this thread can block")?;
+        kassert_eq!(started, cpus.len());
+        for &cpu in &cpus {
+            kassert_eq!(slots[cpu].load(Ordering::Acquire), cpu + 1);
+        }
+        if let Some(r) = refused {
+            kassert!(r == Err(SpawnError::NotRunning));
+        }
+        kassert!(!ran_unstarted.load(Ordering::Acquire));
+        // Each thread in turn the only slow one: a join skipped for any of
+        // them (not only the first) shows in its round, its flag unset.
+        for slow in 0..cpus.len() {
+            let done = [const { AtomicBool::new(false) }; MAX_CPUS];
+            scope(|s| {
+                for (k, &cpu) in cpus.iter().enumerate() {
+                    let flag = &done[k];
+                    s.spawn_on(cpu, "scoped", move || {
+                        if k == slow {
+                            let _ = sleep(30_000_000);
+                        }
+                        flag.store(true, Ordering::Release);
+                    })
+                    .map_err(|_| "spawn failed")?;
+                }
+                Ok::<(), &'static str>(())
+            })
+            .map_err(|_| "this thread can block")??;
+            for (k, flag) in done.iter().enumerate().take(cpus.len()) {
+                let joined = flag.load(Ordering::Acquire);
+                if !joined {
+                    crate::ktest::diag(format_args!("round {slow}: thread {k} not joined"));
+                }
+                kassert!(joined);
+            }
+        }
+        // Every scoped thread has exited. (Its record may still be listed:
+        // `finish_switch` on its CPU sets `reaped` and wakes the joiner while
+        // still holding the dead thread's `Arc`, dropped only as it returns,
+        // so `threads()` can see it, dead, for a moment after `scope`.)
+        kassert!(threads().iter().all(|t| t.name != "scoped" || t.state == State::Dead));
         Ok(())
     }
 );
