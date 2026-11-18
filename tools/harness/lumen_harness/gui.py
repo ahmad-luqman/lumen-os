@@ -779,8 +779,10 @@ def wait_windows(m: Machine, count: int, timeout: float = 30) -> list[dict[str, 
 def wait_settled(m: Machine, timeout: float = 30, allow: str | None = None) -> dict[str, str]:
     """Wait until `desktop status` says `settled yes` (every byte typed
     decoded, both input rings read, no damage gathered or pass running, no
-    commit under way, every window's queue empty with its owner waiting and
-    told of the last theme switch, no `ui invoke` request outstanding); its
+    commit under way, every window's queue empty with its owner waiting (not
+    animating) and told of the last theme switch, none marked busy or
+    woken by another thread, no `ui invoke` request outstanding: the full
+    list is ARCHITECTURE section 11's); its
     record then. Poll for the effect a step should have first (a
     `windows` row, say): settling says nothing more is moving, not that
     the step happened."""

@@ -157,7 +157,7 @@ own PR that updates that doc first.
   and the mouse pointer, a save-under arrow that drawing over it takes off and puts back;
   `take_screen`: the desktop's `ScreenCanvas`, the whole screen, a row per hold of the screen's lock;
   `leave_desktop`; `Cells` over `Pixels`: a cell's pixels, the console's and the terminal windows', drawn by
-  `lumen_term::render::Renderer`; `view_text_of`). `vt.rs`: the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4 switching;
+  `lumen_term::render::Renderer`; `view_text_from`). `vt.rs`: the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4 switching;
   the decoding pass (`decode_pending`), `desktop_shown()` (keys the desktop's alone while it is), `cut()` (a
   copy of where each pause and resume falls in the input rings, with the `pause_owns_*`/`after_resume_*`
   predicates) and `enter_desktop`.

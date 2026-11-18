@@ -1185,9 +1185,11 @@ drawing the shown one) and `kernel/src/vt.rs` (routing keys to them);
   marked rows shows exactly the view: a randomized host test checks that
   against a model renderer after every write.
 - **Drawing** (`term.rs`, 176x41 cells of 7x16 pixels below the header at
-  1280x800): under the screen's lock, the cursor is taken off, a pending
-  scroll moves the pixels (`Framebuffer::move_rows`) and the shadow (a copy
-  of every cell drawn) together, and in each marked row only the cells that
+  1280x800; the shadow and the diff are `lumen_term::render::Renderer`'s,
+  shared with the terminal windows, #155): under the screen's lock, the
+  cursor is taken off, a pending scroll moves the pixels
+  (`Framebuffer::move_rows`) and the shadow (a copy of every cell drawn)
+  together, and in each marked row only the cells that
   differ from the shadow are drawn (a ktest counts them: a line feed at the
   bottom draws fewer cells than one row, not the screen; another draws
   scrolls up and down, of the screen and of a region, and checks the
@@ -2759,8 +2761,8 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   Text mode calls it from `crate::keyboard::Key` (`Char(c)` as `(Some(c),
   None, ..)`, `Raw { code, mods }` as `(None, Some(code), mods)`: a raw
   key carries the modifiers its key event does), and terminal windows
-  (with #155) from a `KeyEvent` press's text, code and modifiers, so they
-  need no second decoder.
+  (#155) from a `KeyEvent` press's text, code and modifiers, so they need
+  no second decoder.
   Toolkit text fields (#156) insert only a press's non-control `text`.
 - **Order across devices:** the compositor merges the two rings in the
   order it reads them (each pass: the pointer frames read, then the key
@@ -3158,8 +3160,8 @@ until a crash.
   (`tools/harness/lumen_harness/gui.py`, #153), and brackets each
   screendump between two `desktop status` reads with the same `frames`.
   Windows that animate (a blinking cursor, `desktop spin`, Life) never
-  idle: tests close them first or mask them, and their goldens leave them
-  out. A scenario that only checks state ends with `desktop check`
+  idle: tests close them first, mask them or (a terminal window) unfocus
+  them, and their goldens leave them out. A scenario that only checks state ends with `desktop check`
   reporting 0 and 0.
 
 ### Windows and who draws (#153)
@@ -3220,11 +3222,15 @@ until a crash.
 
 `WindowHandle::next_event()` (non-blocking), `wait_event()` (which sets
 the window's idle bit while it blocks until the owner has an event:
-`has_event()`, below) and `wait_event_until(deadline, animating)` (#155:
-the same, but `None` once `deadline` passes, `time::now_ns`, or a
-`desktop::Waker` of the window, from `WindowHandle::waker()`, wakes it
-from another thread: a terminal window's shell has output to draw; see
-"Settling" below for `animating`) return
+`has_event()`, below; built on the next) and `wait_event_until(deadline,
+animating) -> desktop::Wait` (#155: `Event` with an event; `Woken` when a
+`desktop::Waker` of the window, from `WindowHandle::waker()`, woke it from
+another thread, such as a terminal window's shell with output to draw,
+meaning only "look at your own state again"; `Deadline` once `deadline`,
+`time::now_ns`, passed; `#[must_use]`; idle while it waits unless
+`animating`, `desktop::Animating::Yes`, which needs a deadline: the
+`settled` rule above. `wait_event` takes a `Waker`'s pokes and ignores
+them, so an owner that waits there hands none out) return
 `WindowEvent`s: `Key(KeyEvent)`, `PointerDown`, `PointerMove`,
 `PointerUp` (client coordinates and the buttons held), `FocusGained`,
 `FocusLost`, `Lost` (events for this window were dropped), `Close` (the
@@ -3446,6 +3452,7 @@ from what they compare.
 | a window's lock | its committed surface, its event queue, its flags, its toolkit's published tree | 16 rows of a commit or a blit, one queue operation, putting a tree in place, copying a tree for `ui tree` or scanning it for a node |
 | a `ui invoke` reply's lock (`ui::ReplyCell`, #156) | the reply's state | one transition (a leaf: taken under its wait queue's lock by the asker's wake-up check, and never held across a wake) |
 | `vt::CUT` | the cut | a read or a write (a leaf) |
+| `termwin::OPEN` (#155) | the terminal windows open, weakly, for `term text <window>` | a push or a look-up (a leaf) |
 | a terminal window's grid (#155) | its `Terminal` | a write of the shell's output, a drawing of what changed, a copy of its cells (a leaf: nothing taken or allocated under it) |
 | a terminal window's keys (#155) | the keys for its shell (at most 128) | a push or a pop (a leaf) |
 | a terminal window's `key_wait` | the shell waiting for a key | a wait or a wake (its predicate takes the keys' lock) |
@@ -3655,6 +3662,12 @@ step lower each pair: `desktop::open_window_at`). `kernel/src/termwin.rs`.
   Shift+PageUp/PageDown scroll the window's view by half a screen, as on a
   virtual terminal (not tested), and any other key the line editor takes
   brings it back.
+- **Busy, one writer at a time:** the owner sets its window busy
+  (`Waker::live` then `set_busy`, under the keys' lock) as it queues a key
+  for the shell; the shell clears it under that lock once it finds the
+  queue empty, waiting for a key; so "a key queued or the shell running"
+  and "busy" agree at every instant, and `settled` reads busy after the
+  idle bit.
 - **The cursor and settling:** only the focused terminal window's cursor
   blinks (every 500 ms; output shows it solid at once), its owner waiting
   with the blink as its deadline in an animating wait (`wait_event_until
@@ -3683,6 +3696,11 @@ step lower each pair: `desktop::open_window_at`). `kernel/src/termwin.rs`.
   and the owner's join until it returns (not tested).
 - `term text <window>` prints a terminal window's rows as `term text` does
   the screen's (the harness's `screen.read_window`/`expect_window`).
+- **Requests:** a terminal window has no toolkit and publishes no nodes, so
+  `ui invoke` reaches only its root (the compositor answers `focus`;
+  `close` comes as `WindowEvent::Close`); a request that still reaches its
+  owner is answered "no node" (`ui::refuse`, as the demo windows do),
+  never dropped.
 - Not yet: the mouse in a terminal window (pointer events are ignored),
   theme colours, resizing. Not tested: a failed spawn of either thread.
 
@@ -3697,8 +3715,12 @@ opened and closed: both threads gone each time, the heap back within 2
 KiB, `desktop check` 0 and 0),
 `scenario:test_gui::test_closing_a_terminal_window_ends_what_runs_in_it`
 (`rhai`'s REPL, `top`, a script's loop: every thread gone),
-`scenario:test_gui::test_a_terminal_window_scrolls`, `cargo:lumen-term`
-(the renderer), `cargo:lumen-shell` (`Key::Closed`, `Key::interrupts`),
+`scenario:test_gui::test_a_terminal_window_scrolls`,
+`scenario:test_gui::test_terminal_is_refused_unless_the_desktop_is_shown`,
+`scenario:test_gui::test_a_terminal_window_refuses_screenshot_and_keeps_its_colours`
+(and a theme switch), `cargo:lumen-term` (the renderer), `cargo:lumen-gfx`
+(`Surface::move_rows`), `cargo:lumen-shell` (`Key::Closed`,
+`Key::interrupts`), `harness:test_screen_text::*`,
 `ktest:lumen_kernel::termwin::*`,
 `ktest:lumen_kernel::desktop::wait_event_until_ends_at_its_deadline_or_a_wake`,
 `ktest:lumen_kernel::desktop::settled_waits_for_a_busy_or_woken_window`,

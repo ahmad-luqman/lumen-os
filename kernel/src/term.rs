@@ -1329,7 +1329,7 @@ fn rows_text(cols: usize, cells: &[Cell]) -> Vec<String> {
 /// prints, and how the tests read what the screen shells did.
 pub fn view_text() -> Option<ViewText> {
     let (cols, cells, cursor) = view_cells()?;
-    Some(ViewText { rows: rows_text(cols, &cells), cursor })
+    Some(view_text_from(cols, &cells, cursor))
 }
 
 /// A view as text from its cells (`cols` wide, row by row) and its cursor
