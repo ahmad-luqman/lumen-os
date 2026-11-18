@@ -11,6 +11,11 @@ The exact bounds, verdicts and texts for given windows are pinned by
 lumen-time's host tests and time.rs's report ktest. Self-tested in
 tests/harness/test_calibration.py, on the lines #171's two boots printed
 and made-up ones in the kernel's words.
+
+It also holds the clocks' tolerances and the checks a calibration's numbers
+decide (`warned_exactly_when_past`; `agree`, with `within_bounds` and
+`CANT_TELL_PPM`), shared by lumen_harness.clock_diags and the time
+scenarios.
 """
 
 from __future__ import annotations
@@ -18,15 +23,21 @@ from __future__ import annotations
 import re
 from typing import NamedTuple
 
-from lumen_harness.clock_diags import TIMER_TOLERANCE_PPM, TSC_TOLERANCE_PPM
 from lumen_harness.klog import STAMP
 
 TSC = "tsc"
 TIMER = "local APIC timer"
 HPET = "hpet"
 PIT = "pit"
-# Each clock's tolerance in ppm (lumen_time's).
+# Each clock's tolerance in ppm (lumen_time's TSC_TOLERANCE_PPM and
+# TIMER_TOLERANCE_PPM): past it, boot warns.
+TSC_TOLERANCE_PPM = 10_000
+TIMER_TOLERANCE_PPM = 20_000
 TOLERANCE_PPM = {TSC: TSC_TOLERANCE_PPM, TIMER: TIMER_TOLERANCE_PPM}
+# The least two measurements' bounds may add up to before a cross-check on
+# them tells nothing: kernel/src/time.rs's CANT_TELL_PPM, 9% (under 9.5%
+# `within_bounds` refuses #45's 11.8% whichever side is high).
+CANT_TELL_PPM = 90_000
 # Windows a calibration keeps and takes at most (time::WINDOWS, ATTEMPTS).
 WINDOWS = 5
 ATTEMPTS = 20
@@ -287,3 +298,66 @@ def no_other_warnings(out: str) -> None:
         if re.match(rf"{STAMP} (?:ERROR|WARN ) time: ", line) and line not in allowed
     ]
     assert not others, (others, out)
+
+
+def warned_exactly_when_past(
+    out: str, clock: str, bound_ppm: int, retook: int | None = None, steady: int | None = None
+) -> None:
+    """Boot's verdict on `clock`'s calibration (in `out`) a warning exactly
+    when the calibration's median bound, `bound_ppm` (as a ktest's diag or
+    `clocks` gives it), is past the clock's tolerance; and a verdict line,
+    if any, printing that bound. Given the windows it took again (`retook`)
+    and kept steady (`steady`), also a line exactly when it took any again
+    or was past the tolerance (lumen_time's `verdict`: only a clean one is
+    silent), saying both counts. A loaded host can put the bound past the
+    tolerance (#158's audit); the warning following from it is the code's."""
+    said = verdict(out, clock)
+    warned = said is not None and said.warned
+    tolerance = TOLERANCE_PPM[clock]
+    assert warned == (bound_ppm > tolerance), (
+        f"{clock} median bound {bound_ppm} ppm (tolerance {tolerance}) but boot "
+        f"{'warned' if warned else 'did not warn'}: {said.line if said else 'no verdict line'}"
+    )
+    if said is not None:
+        low, high = ppm_range(said.bound)
+        assert low < bound_ppm <= high, (
+            f"{clock} verdict prints {said.bound}%, not {bound_ppm} ppm: {said.line}"
+        )
+    if retook is not None:
+        silent = retook == 0 and bound_ppm <= TOLERANCE_PPM[clock]
+        assert (said is None) == silent, (
+            f"{clock}: {retook} windows taken again, bound {bound_ppm} ppm, but "
+            f"{said.line if said else 'no verdict line'}"
+        )
+        if said is not None:
+            assert (said.retaken, said.steady) == (retook, steady), (
+                f"{clock} verdict says {said.retaken} taken again and {said.steady} steady, "
+                f"not {retook} and {steady}: {said.line}"
+            )
+
+
+def within_bounds(a: int, b: int, a_ppm: int, b_ppm: int, floor_ppm: int = 0) -> bool:
+    """Whether `a` (off by at most `a_ppm` of the true rate) and `b` (at most
+    `b_ppm`) can measure the same rate: `|a - b| <= allowed * true`, allowed
+    being their bounds' sum or `floor_ppm` if more, and the true rate at most
+    `b / (1 - b_ppm)`; never with a measurement that has no bound (as
+    lumen_time::within_bounds)."""
+    if a_ppm >= 1_000_000 or b_ppm >= 1_000_000:
+        return False
+    return abs(a - b) * (1_000_000 - b_ppm) <= b * max(a_ppm + b_ppm, floor_ppm)
+
+
+def agree(a_hz: int, b_hz: int, a_ppm: int, b_ppm: int) -> None:
+    """Two calibrations of the same TSC (`b` the reference, as the kernel's
+    `pit_agrees` takes the boot) agree: within 2% (twice the TSC's
+    tolerance), whatever their bounds; else within their bounds, which must
+    then add up to under `CANT_TELL_PPM` (more would tell nothing). A loaded
+    host can leave a measurement's bound past 1% (slow PIT reads)."""
+    if within_bounds(a_hz, b_hz, 0, 0, 2 * TSC_TOLERANCE_PPM):
+        return
+    assert a_ppm + b_ppm < CANT_TELL_PPM, (
+        f"bounds {a_ppm} + {b_ppm} ppm: too wide to tell {a_hz} Hz and {b_hz} Hz apart"
+    )
+    assert within_bounds(a_hz, b_hz, a_ppm, b_ppm), (
+        f"{a_hz} Hz (within {a_ppm} ppm) and {b_hz} Hz (within {b_ppm} ppm) disagree"
+    )

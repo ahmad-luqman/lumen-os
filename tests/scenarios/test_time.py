@@ -14,14 +14,17 @@ from lumen_harness.calibration import (
     PIT,
     TIMER,
     TSC,
+    agree,
     follows_the_tsc,
     judged,
     no_other_warnings,
     stalled,
+    warned_exactly_when_past,
     weighed,
+    within_bounds,
 )
-from lumen_harness.clock_diags import TSC_TOLERANCE_PPM
 from lumen_harness.crash import BEGIN, END
+from lumen_harness.klog import STAMP
 from lumen_harness.qemu import EXIT_CRASH
 
 BOOT_TIMEOUT = 60
@@ -49,12 +52,6 @@ class Calibration(NamedTuple):
     hz: int
     windows: str
     retook: int
-
-
-def clocks(m) -> tuple[int, str, int | None, int | None]:
-    """the shell's `clocks`: the TSC's boot frequency and reference, and the TSC
-    measured again against the PIT and the HPET (None: no such clock)."""
-    return clocks_and_windows(m)[0]
 
 
 def clocks_and_windows(m) -> tuple[tuple[int, str, int | None, int | None], dict[str, Calibration]]:
@@ -89,9 +86,22 @@ def clocks_and_windows(m) -> tuple[tuple[int, str, int | None, int | None], dict
     return (int(c[1]), c[2], pit, hpet), calibrations
 
 
-def assert_close(a: int, b: int) -> None:
-    """Within 2%: the tolerance for two calibrations of the same TSC."""
-    assert abs(a - b) * 50 <= a, (a, b)
+def assert_agree(a: Calibration, b: Calibration) -> None:
+    """Two calibrations of the same TSC agree (`lumen_harness.calibration.
+    agree`: within 2%, or their bounds, `median_bound_ppm`, where wider and
+    under the can't-tell limit)."""
+    agree(a.hz, b.hz, median_bound_ppm(a), median_bound_ppm(b))
+
+
+def check_boot_verdict(m, cal: Calibration) -> None:
+    """Boot warned on its TSC calibration exactly when the median's bound
+    was past the TSC's tolerance, its verdict line (there exactly when it
+    took windows again or warned) printing that bound and its counts
+    (`lumen_harness.calibration.warned_exactly_when_past`)."""
+    steady = sum(
+        (sg + eg) * 200 <= t for t, _, _, sg, eg in map(window_fields, cal.windows.split())
+    )
+    warned_exactly_when_past(m.output, TSC, median_bound_ppm(cal), cal.retook, steady)
 
 
 def tsc_error_ppm(tsc: int, ref: int, start_gap: int, end_gap: int) -> int:
@@ -104,21 +114,17 @@ def tsc_error_ppm(tsc: int, ref: int, start_gap: int, end_gap: int) -> int:
     return max(high, low)
 
 
-def within_bounds(a: int, b: int, a_ppm: int, b_ppm: int) -> bool:
-    """Whether `a` (off by at most `a_ppm` of the true rate) and `b` (at most
-    `b_ppm`) can measure the same rate: `|a - b| <= (a_ppm + b_ppm) * true`,
-    the true rate being at most `b / (1 - b_ppm)`; never with a measurement
-    that has no bound (as lumen_time::within_bounds, without its floor)."""
-    if a_ppm >= 1_000_000 or b_ppm >= 1_000_000:
-        return False
-    return abs(a - b) * (1_000_000 - b_ppm) <= b * (a_ppm + b_ppm)
-
-
 def window_fields(w: str) -> tuple[int, int, int, int, int]:
     """`tsc/reference/polls/start_gap/end_gap` as numbers."""
     fields = w.split("/")
     assert len(fields) == 5, f"not tsc/reference/polls/start_gap/end_gap: {w}"
     return tuple(int(x) for x in fields)  # type: ignore[return-value]
+
+
+def steady_windows(cal: Calibration) -> int:
+    """How many of `cal`'s windows are steady: their gaps at most 0.5% of the
+    window (lumen_time's `Window::is_steady`)."""
+    return sum((sg + eg) * 200 <= t for t, _, _, sg, eg in map(window_fields, cal.windows.split()))
 
 
 def median_bound_ppm(cal: Calibration) -> int:
@@ -132,13 +138,12 @@ def median_bound_ppm(cal: Calibration) -> int:
 
 
 def check_calibration(cal: Calibration, reference_hz: int) -> None:
-    """The frequency is exactly what the kernel computes from the windows: the
-    median of five (steady ones first, then, if attempts ran out, the least
-    unsteady filling in, #139), its bound within the TSC's tolerance, and each
-    window within its own bound plus the median's of it (each is off from the
-    true rate by at most its bound, so the two within their bounds' sum of
-    it), with at most MOST_RETAKEN taken again
-    unless some filled in."""
+    """The frequency is exactly what the kernel computes from the windows:
+    the median of five (steady ones first, then, if attempts ran out, the
+    least unsteady filling in, #139), each window within its own bound plus
+    the median's of it (each is off from the true rate by at most its bound,
+    so the two within their bounds' sum of it), with at most MOST_RETAKEN
+    taken again unless some filled in."""
     hz, bounds = [], []
     for w in cal.windows.split():
         tsc, ref, polls, start_gap, end_gap = window_fields(w)
@@ -148,21 +153,11 @@ def check_calibration(cal: Calibration, reference_hz: int) -> None:
     assert len(hz) == 5, cal
     assert sorted(hz)[2] == cal.hz, cal
     median_ppm = median_bound_ppm(cal)
-    assert median_ppm <= TSC_TOLERANCE_PPM, f"median within {median_ppm} ppm: {cal}"
     for one, ppm in zip(hz, bounds, strict=True):
         assert within_bounds(one, cal.hz, ppm, median_ppm), (
             f"a window {one} Hz ({ppm} ppm), the median {cal.hz} Hz ({median_ppm} ppm): {cal}"
         )
-    steady = sum(
-        (sg + eg) * 200 <= t for t, _, _, sg, eg in map(window_fields, cal.windows.split())
-    )
-    assert cal.retook <= MOST_RETAKEN or steady < 5, cal
-
-
-def check_retake_line(m, cal: Calibration) -> None:
-    """Boot logs how many windows it took again exactly when it took any."""
-    line = f"INFO  time: tsc calibration took {cal.retook} windows again"
-    assert (line in m.output) == (cal.retook > 0), (cal.retook, line)
+    assert cal.retook <= MOST_RETAKEN or steady_windows(cal) < 5, cal
 
 
 def ticks(m) -> tuple[int, int, int, int]:
@@ -194,7 +189,7 @@ def test_clocks_shows_the_windows_behind_each_measurement(boot):
     check_calibration(cals["boot"], HPET_HZ)
     check_calibration(cals["pit"], PIT_HZ)
     check_calibration(cals["hpet"], HPET_HZ)
-    check_retake_line(m, cals["boot"])
+    check_boot_verdict(m, cals["boot"])
 
 
 def test_timer_interrupts_counted(boot):
@@ -212,7 +207,12 @@ def test_timer_interrupts_counted(boot):
     # sleep busy-waited then; it now halts in the idle thread).
     assert after - before >= 1, (before, after)
     assert strays == [0, 0, 0]
-    assert "WARN  irq" not in m.output
+    # No irq warning but the one a slow first tick logs (main.rs: no tick in
+    # 100 ms, which a host stalling boot can cause).
+    irq = [line for line in m.output.splitlines() if "WARN  irq" in line]
+    assert all(
+        re.fullmatch(rf"{STAMP} WARN  irq: no timer interrupt in 100 ms", line) for line in irq
+    ), irq
 
 
 def test_boot_calibration_agrees_with_both_clocks(boot):
@@ -221,11 +221,11 @@ def test_boot_calibration_agrees_with_both_clocks(boot):
     # the local APIC timer is calibrated against the TSC).
     m = boot("qemutest")
     m.expect(r"lumen> ", BOOT_TIMEOUT)
-    tsc, reference, pit, hpet = clocks(m)
+    (_, reference, pit, hpet), cals = clocks_and_windows(m)
     assert reference == "hpet"
     assert pit is not None and hpet is not None
-    assert_close(tsc, pit)
-    assert_close(tsc, hpet)
+    assert_agree(cals["boot"], cals["pit"])
+    assert_agree(cals["boot"], cals["hpet"])
 
 
 # Stalls injected into the boot's calibration windows (time::stall_window_ends:

@@ -10,18 +10,16 @@ from __future__ import annotations
 
 import re
 
-from lumen_harness import tap
+from lumen_harness import calibration, tap
 
 # `now_ns_follows_the_hpet` takes an HPET reading again when its bracket is
-# over 100 µs, up to 8 times per end, 20 ms apart. Before the spacing it
-# needed none in 90 KVM runs (45 on a loaded 4-vCPU runner), and in 79 TCG
-# runs on a busy Mac (43 loaded, loadavg up to 51) 4 runs needed 1. But a
-# loaded KVM runner can slow HPET reads for 60 ms or more (PR #121's load-5),
-# which now costs up to 3 or 4 spaced retries on one end. So a run may take
-# 4: one such burst. More means stalls hit readings far more often than ever
-# measured: a host or `now_ns` getting worse, which a pass would hide.
-MOST_HPET_RETRIES = 4
-HPET_BRACKET_NS = 100_000
+# over 1 ms (kernel/src/time.rs's HPET_BRACKET_NS), up to 8 times per end,
+# 20 ms apart. How many it took isn't bounded: that counts how often a
+# loaded host stalled a bracket, not the code (the ktest fails when every
+# reading at one end was wide). What is checked is that the count matches
+# the readings, only readings over the limit were taken again, and the kept
+# ones are within it.
+HPET_BRACKET_NS = 1_000_000
 RETRY_SPACING_MS = 20
 
 HPET_BRACKETS = re.compile(
@@ -37,20 +35,19 @@ TIMER_BRACKETS = re.compile(
 )
 # The boot ktests print the boot calibrations: the local APIC timer's (#129)
 # and the TSC's (#139), each with its windows, retakes, how many are steady
-# and how far off the median can be. Retakes and the steady count aren't
-# bounded: they count how often a loaded host stalled boot, not the code. The
-# bound is, by each clock's tolerance (lumen_time's
-# TIMER_TOLERANCE_PPM and TSC_TOLERANCE_PPM): past it, boot warned.
-TIMER_TOLERANCE_PPM = 20_000
-TSC_TOLERANCE_PPM = 10_000
+# and how far off the median can be. None of those is bounded: a loaded host
+# decides them (#158's audit: a timer bound of 2.03% in 1 of 40 loaded KVM
+# boots). What is checked is the code's: boot warned exactly when the bound
+# was past the clock's tolerance, its verdict line read back by
+# lumen_harness.calibration (warned_exactly_when_past).
 _BOOT_FIELDS = (
     r"(?P<hz>\d+) Hz \[(?P<windows>[\d/ ]*)\] retook (?P<retook>\d+), "
     r"(?P<steady>\d+) steady, median within (?P<bound>\d+) ppm; window rates \[(?P<rates>[\d, ]*)\] Hz"
 )
 BOOT_TIMER = re.compile(r"timer boot calibration " + _BOOT_FIELDS)
 BOOT_TSC = re.compile(r"tsc boot calibration \((?P<reference>hpet|pit)\) " + _BOOT_FIELDS)
-BOOT_TIMER_CASE = "time::the_boot_timer_calibration_is_within_what_the_tick_needs"
-BOOT_TSC_CASE = "time::the_boot_tsc_calibration_is_within_what_now_ns_needs"
+BOOT_TIMER_CASE = "time::the_boot_timer_calibration_is_the_timers_rate"
+BOOT_TSC_CASE = "time::the_boot_tsc_calibration_is_now_ns_s_rate"
 # The placement tests (#158) pause 20 ms on each side of a read (a 40 ms
 # bracket) and judge a try only when its reference bracket and its
 # uncertainty are each at most a quarter of the pause (lumen_time's
@@ -135,20 +132,26 @@ def _check_boot_calibration(
     clock: str,
     case: str,
     pattern: re.Pattern[str],
-    tolerance_ppm: int,
+    judged_as: str,
 ) -> None:
     """The `clock` boot calibration's line: once in the run, in `case`, with
-    five windows and rates, and its median within `tolerance_ppm` (however
-    many windows are steady: enough least-unsteady ones may fill in)."""
+    five windows and rates (however many are steady: enough least-unsteady
+    ones may fill in), its counts where a calibration stops (5 steady, or 20
+    windows in all); and boot's verdict on it (in `text`, as `judged_as`:
+    `calibration.TSC` or `TIMER`) a warning exactly when its median's bound
+    is past that clock's tolerance, printing that bound, and a line exactly
+    when windows were taken again or it warned, saying the counts."""
     lines = re.findall(rf"^# {clock} boot calibration ", text, re.MULTILINE)
     assert len(lines) == 1, f"{len(lines)} {clock} boot calibration lines"
     b = one_diagnostic(report, case, pattern)
     windows, rates, steady = b["windows"].split(), _widths(b["rates"]), int(b["steady"])
     assert len(windows) == 5 and len(rates) == 5, f"not 5 windows and rates: {b.group(0)}"
     assert steady <= len(windows), f"more steady than windows: {b.group(0)}"
-    assert int(b["bound"]) <= tolerance_ppm, (
-        f"{clock} median bound over {tolerance_ppm} ppm: {b.group(0)}"
+    retook = int(b["retook"])
+    assert steady + retook <= 20 and (steady == 5 or steady + retook == 20), (
+        f"not what a calibration stops at (5 steady, or 20 windows): {b.group(0)}"
     )
+    calibration.warned_exactly_when_past(text, judged_as, int(b["bound"]), retook, steady)
 
 
 def _widths(field: str) -> list[int]:
@@ -157,7 +160,8 @@ def _widths(field: str) -> list[int]:
 
 def check_clock_diags(report: tap.TapReport, text: str) -> None:
     """Assert the clock cross-checks' diagnostics in `report` (parsed from
-    serial output `text`) are there, once each, and within their bounds."""
+    serial output `text`) are there, once each, and follow from their
+    numbers (the boot calibrations' warnings from their bounds)."""
     # One real bracket line in the whole run (the injected-pause tests' say
     # so), in now_ns_follows_the_hpet.
     real = re.findall(r"^# bracket widths: start ", text, re.MULTILINE)
@@ -173,17 +177,22 @@ def check_clock_diags(report: tap.TapReport, text: str) -> None:
         expected = sum(max(n - 1, 0) for n in taken)
         assert int(b["retries"]) == expected, f"retries don't match the readings: {line}"
     m = one_diagnostic(report, "time::now_ns_follows_the_hpet", HPET_BRACKETS)
-    start, end, retries = _widths(m["start"]), _widths(m["end"]), int(m["retries"])
+    start, end = _widths(m["start"]), _widths(m["end"])
     assert start and end, f"an end has no readings: {m.group(0)}"
-    assert retries <= MOST_HPET_RETRIES, f"over {MOST_HPET_RETRIES} retries: {m.group(0)}"
-    assert start[-1] <= HPET_BRACKET_NS and end[-1] <= HPET_BRACKET_NS, m.group(0)
+    assert start[-1] <= HPET_BRACKET_NS and end[-1] <= HPET_BRACKET_NS, (
+        f"a kept reading over {HPET_BRACKET_NS} ns: {m.group(0)}"
+    )
+    # Taken again only past the limit (a decision from the printed widths).
+    assert all(w > HPET_BRACKET_NS for w in start[:-1] + end[:-1]), (
+        f"a reading within {HPET_BRACKET_NS} ns taken again: {m.group(0)}"
+    )
     # The timer test's brackets each hold an HPET read, so they have widths.
     t = one_diagnostic(report, "time::the_timer_is_programmed_for_1_khz", TIMER_BRACKETS)
     low, median, high, count = (int(t[k]) for k in ("min", "median", "max", "brackets"))
     assert low <= median <= high and high > 0 and count == 14, t.group(0)
     # The boot calibrations, once each in the run.
-    _check_boot_calibration(report, text, "timer", BOOT_TIMER_CASE, BOOT_TIMER, TIMER_TOLERANCE_PPM)
-    _check_boot_calibration(report, text, "tsc", BOOT_TSC_CASE, BOOT_TSC, TSC_TOLERANCE_PPM)
+    _check_boot_calibration(report, text, "timer", BOOT_TIMER_CASE, BOOT_TIMER, calibration.TIMER)
+    _check_boot_calibration(report, text, "tsc", BOOT_TSC_CASE, BOOT_TSC, calibration.TSC)
     # The placement tests each report one judged try (_check_placement).
     for name, what in (
         ("time::an_hpet_reading_is_placed_at_its_brackets_midpoint", "HPET"),

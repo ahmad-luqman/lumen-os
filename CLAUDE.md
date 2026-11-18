@@ -131,9 +131,8 @@ own PR that updates that doc first.
 - **Tests on a busy host.** A guest's clocks run on while the host stalls
   its vCPU, so a loaded laptop or CI runner adds time to anything timed
   (measured in #139, #165, #170 and #171). A new or changed scenario or
-  ktest asserts only what the host can't change (older checks, such as
-  test_time's ceilings on unstalled calibrations, come in line when they
-  are next changed):
+  ktest asserts only what the host can't change (older checks come in
+  line when they are next changed):
   - a floor (the printed bound is at least the injected stall);
   - a decision that follows from the numbers the kernel printed
     (`lumen_harness.calibration`);
@@ -441,7 +440,9 @@ own PR that updates that doc first.
   `desktop_counter`; `parse_records` reads quoted cells with `shlex`),
   `calibration.py` (a boot calibration's verdict line, and the TSC's
   HPET-or-PIT choice, read back and checked against the numbers they print:
-  `judged`, `verdict`, `weighed`, `no_other_warnings`), `clock_diags.py` (the
+  `judged`, `verdict`, `weighed`, `no_other_warnings`, `warned_exactly_when_past`;
+  the clocks' tolerances, and `agree`: two rates within 2% or their bounds,
+  `CANT_TELL_PPM` the most those may add up to), `clock_diags.py` (the
   clock cross-check ktests' diagnostics, `check_clock_diags`),
   `census.py` (the flake census: CI's red first attempts per day, how many
   passed on a re-run, and the tests that failed them, from the failed jobs'

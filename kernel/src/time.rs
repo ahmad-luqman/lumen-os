@@ -174,6 +174,22 @@ impl Calibration {
         self.windows.iter().filter(|w| w.is_steady()).count()
     }
 
+    /// Whether every kept window is steady (`lumen_time::steadiest_windows`
+    /// takes windows until [`WINDOWS`] are steady or the attempts run out),
+    /// or it ran out of [`ATTEMPTS`] and the least unsteady filled in. A
+    /// loaded host can make nearly every window of a run unsteady (#158's
+    /// audit: at load up to 9, slow PIT reads left each window's gaps at
+    /// 0.25% to 0.97%, 0 to 2 of 20 steady, so the least unsteady filled
+    /// in, in 22 of 40 boots), so which of the two a run took is the host's; that
+    /// it is one of them is the code's. True by construction for what
+    /// `calibrate` returns: on a real calibration it checks the plumbing
+    /// (`retaken` copied right), and the made-up cases in
+    /// `a_tsc_calibration_short_of_steady_windows_fills_in` pin the rule.
+    #[cfg(feature = "ktest")]
+    fn steady_or_out_of_attempts(&self) -> bool {
+        self.steady() == WINDOWS || self.steady() + self.retaken == ATTEMPTS
+    }
+
     /// The most its windows' median can be off, in ppm, on their own: the
     /// `(N / 2 + 1)`-th smallest of their bounds
     /// ([`lumen_time::median_bound_ppm`]).
@@ -1068,22 +1084,30 @@ fn off_or_diag<T>(what: &'static str, take: impl FnOnce() -> Result<T, CalError>
     })
 }
 
-/// The spin `now_ns_follows_the_hpet` checks `now_ns` across: 50 ms.
+/// The spin `now_ns_follows_the_hpet` checks `now_ns` across: 500 ms, so
+/// its budget leaves room for a 1 ms bracket limit ([`HPET_BRACKET_NS`];
+/// wider ones are read again).
 #[cfg(feature = "ktest")]
-const NOW_NS_SPIN_NS: u64 = 50_000_000;
-/// That check's budget, 2% of its spin: 1 ms. Used only to bound
+const NOW_NS_SPIN_NS: u64 = 500_000_000;
+/// That check's budget, 2% of its spin: 10 ms. Used only to bound
 /// [`HPET_BRACKET_NS`] at compile time; at run time the check takes 2% of
 /// what the HPET measured.
 #[cfg(feature = "ktest")]
 const NOW_NS_BUDGET_NS: u64 = NOW_NS_SPIN_NS / 50;
 /// The widest bracket (in ns, between its two `now_ns` reads)
-/// [`now_ns_against_the_hpet`] trusts around an HPET reading: 100 µs, a
-/// tenth of the 1 ms budget (both ends that wide put the interval off by at
-/// most 100 µs). Under KVM a bracket is about one exit to QEMU: 8 to 64 µs
-/// in PR #121's KVM runs, loaded or not. A wider one means something took
-/// longer than this between the two reads.
+/// [`now_ns_against_the_hpet`] trusts around an HPET reading: 1 ms, a tenth
+/// of the 10 ms budget (both ends that wide put the interval off by at most
+/// 1 ms). Under KVM a bracket is about one exit to QEMU (15 µs at the median
+/// on an idle runner, 63 µs at most); a loaded host makes them wider. In
+/// #158's runs, 44357565152 at load 4.8 to 6.7: 1.2% of 1,361 brackets over
+/// 100 µs and 0.07% over 1 ms (2.66 ms at most); 44360252519 at load 4.7 to
+/// 9: 26% of 106 over 100 µs, 2.8% over 500 µs, none over 1 ms. The old
+/// 100 µs limit (with a 50 ms spin) failed `now_ns_follows_the_hpet` when
+/// all 9 readings at one end were wider: in CI on 2026-11-14 and 11-15, and
+/// once in 40 loaded KVM boots. A wider one means something took longer
+/// than this between the two reads.
 #[cfg(feature = "ktest")]
-const HPET_BRACKET_NS: u64 = 100_000;
+const HPET_BRACKET_NS: u64 = 1_000_000;
 /// How many HPET readings [`now_ns_against_the_hpet`] takes at each end
 /// before giving up on a narrow one: 9, so at most 8 retries, spaced
 /// [`RETRY_SPACING_NS`] apart.
@@ -1093,15 +1117,15 @@ const HPET_BRACKET_TRIES: usize = 9;
 /// reading (or a placement try) again: 20 ms. On a loaded KVM runner HPET
 /// reads (each an exit to QEMU) slowed to hundreds of µs in bursts lasting
 /// 60 ms or more (PR #121, run 43786595767's load-5: 436, 320, 189 and
-/// 169 µs back to back); retries taken back to back, about 1 ms apart, all
+/// 169 µs back to back, all under today's 1 ms limit, but over the 100 µs
+/// one of the time); retries taken back to back, about 1 ms apart, all
 /// landed inside one. Spaced, a reading's retries span 160 ms and sample
 /// around such a burst.
 #[cfg(feature = "ktest")]
 const RETRY_SPACING_NS: u64 = 20_000_000;
 // Pinned: 9 tries 20 ms apart span at least 150 ms, more than load-5's burst;
-// `lumen_harness.clock_diags`'s `MOST_HPET_RETRIES = 4` assumes this spacing
-// (one burst of up to about 80 ms costs 4 retries on one end); and a limit
-// over a tenth of the budget would let two wide ends use up a fifth of it.
+// and a limit over a tenth of the budget would let two wide ends use up a
+// fifth of it.
 #[cfg(feature = "ktest")]
 const _: () = assert!(
     HPET_BRACKET_TRIES == 9
@@ -1230,16 +1254,17 @@ fn now_ns_between(earlier: &HpetReading, later: &HpetReading, tag: &str) -> Resu
     })
 }
 
-/// `now_ns_follows_the_hpet` across a spin of `ns` (50 ms in the real
-/// check, whose 2% is the 1 ms budget the bracket limit is a tenth of; the
-/// injected-pause tests spin less): each end a narrow HPET reading placed at
-/// the midpoint of the `now_ns` readings around it, so a stall between the
-/// two clocks' reads shows as a wide bracket (taken again, see
-/// [`HPET_BRACKET_TRIES`] and [`RETRY_SPACING_NS`]) instead of skewing the
-/// interval. `pause` runs
-/// inside every bracket (see [`hpet_between_now_ns`]; a no-op but in tests),
-/// and `tag` starts every diag ([`INJECTED`] in the injected-pause tests).
-/// The ends' readings on a pass.
+/// `now_ns_follows_the_hpet` across a spin of `ns` (500 ms in the real check
+/// and in `one_stalled_reading_at_each_end_still_passes`, whose 2% is the
+/// 10 ms budget the bracket limit is a tenth of;
+/// `every_stalled_hpet_bracket_is_a_failure` spins 1 ms): each end a narrow
+/// HPET reading placed at the midpoint of the `now_ns` readings around it, so
+/// a stall between the two clocks' reads shows as a wide bracket (taken
+/// again, see [`HPET_BRACKET_TRIES`] and [`RETRY_SPACING_NS`]) instead of
+/// skewing the interval. `pause` runs inside every bracket (see
+/// [`hpet_between_now_ns`]; a no-op but in tests), and `tag` starts every
+/// diag ([`INJECTED`] in the injected-pause tests). The ends' readings on a
+/// pass.
 #[cfg(feature = "ktest")]
 fn now_ns_against_the_hpet(
     hpet: &HpetCounter,
@@ -1316,14 +1341,18 @@ fn timer_between_hpet(hpet: &HpetCounter, mut pause: impl FnMut()) -> lumen_time
 }
 
 crate::ktest!(
-    fn tsc_calibrated_within_tolerance() {
+    fn the_tsc_agrees_with_the_pit() {
         // Cross-check against the PIT, a different clock from the HPET the
         // boot calibrated against (the ktest machine has one): within 2%, or
         // what the two calibrations' bounds allow if more (stalled windows
         // filling in). The PIT is measured again until its median is within
-        // the TSC's tolerance, up to PIT_TRIES times RETRY_SPACING_NS apart:
-        // a wider one could pass on its bound alone, which proves nothing.
-        use crate::kassert;
+        // the TSC's tolerance, up to PIT_TRIES times RETRY_SPACING_NS apart;
+        // none within it, the narrowest under CANT_TELL_PPM is used (a loaded
+        // host's slow PIT reads can leave every try past 1%: #158's audit),
+        // and the check is then only as tight as its bound says, which the
+        // diag shows. An allowance (its bound and the boot's) of
+        // CANT_TELL_PPM or more fails, past the 2% floor: it would prove
+        // nothing. Each outcome says which (`pit_agrees`).
         const PIT_TRIES: usize = 4;
         let hz = tsc().ok_or("TSC not calibrated")?.hz();
         if reference() != Some(Reference::Hpet) {
@@ -1346,24 +1375,66 @@ crate::ktest!(
             None => crate::ktest::diag(format_args!("tsc now against the hpet: no HPET")),
         }
         let (boot_ppm, pit_ppm) = (boot.median_bound_ppm(), pit.median_bound_ppm());
-        crate::ktest::diag(format_args!("bounds: boot {boot_ppm} ppm, pit {pit_ppm} ppm"));
-        kassert!(lumen_time::within_bounds(pit.hz, hz, pit_ppm, boot_ppm, PIT_CROSS_CHECK_FLOOR_PPM));
+        crate::ktest::diag(format_args!(
+            "bounds: boot {boot_ppm} ppm, pit {pit_ppm} ppm{}",
+            if pit_ppm > lumen_time::TSC_TOLERANCE_PPM { " (no try within 1%: judged by the narrowest)" } else { "" }
+        ));
+        if let Err(why) = pit_agrees(pit.hz, pit_ppm, hz, boot_ppm) {
+            crate::ktest::diag(format_args!(
+                "{why}: the pit {} Hz, the boot {hz} Hz, {} ppm apart; bounds adding up to {} ppm (cap \
+                 {CANT_TELL_PPM})",
+                pit.hz,
+                u128::from(pit.hz.abs_diff(hz)) * 1_000_000 / u128::from(hz.max(1)),
+                boot_ppm.saturating_add(pit_ppm)
+            ));
+            return Err(why);
+        }
         Ok(())
     }
 );
 
+/// The least two measurements' bounds may add up to before a cross-check on
+/// them tells nothing: 9% (and one bound past it alone, the same). #45's
+/// boot calibration was 11.8% high (test_acpi), and `within_bounds` lets
+/// two rates differ by the bounds' sum of the larger over one less the wider
+/// bound: under 9.5% that refuses 11.8% whichever side is high, so 9%
+/// leaves room. (`lumen_harness.calibration.CANT_TELL_PPM` copies it.)
+#[cfg(feature = "ktest")]
+const CANT_TELL_PPM: u64 = 90_000;
+// Pinned: first_judgeable's message says "9%".
+#[cfg(feature = "ktest")]
+const _: () = assert!(CANT_TELL_PPM == 90_000);
+
+/// Whether a PIT re-measurement of `pit_hz` (its bound `pit_ppm`; each rate
+/// paired with its own bound, unlike `within_bounds`) agrees with the TSC's
+/// boot `hz` (its bound `boot_ppm`): within [`PIT_CROSS_CHECK_FLOOR_PPM`],
+/// whatever the bounds; else within their bounds, if those add up to under
+/// [`CANT_TELL_PPM`] (more would tell nothing). Why not, if not.
+#[cfg(feature = "ktest")]
+fn pit_agrees(pit_hz: u64, pit_ppm: u64, hz: u64, boot_ppm: u64) -> Result<(), &'static str> {
+    if lumen_time::within_bounds(pit_hz, hz, 0, 0, PIT_CROSS_CHECK_FLOOR_PPM) {
+        Ok(())
+    } else if boot_ppm.saturating_add(pit_ppm) >= CANT_TELL_PPM {
+        Err("the PIT and boot bounds are too wide to tell the rates apart")
+    } else if lumen_time::within_bounds(pit_hz, hz, pit_ppm, boot_ppm, 0) {
+        Ok(())
+    } else {
+        Err("the PIT re-measurement and the boot calibration disagree")
+    }
+}
+
 /// The first of up to `tries` calibrations from `measure` (`space` called
-/// between them) whose median is within the TSC's tolerance, each shown as
-/// a diag; an error saying whether every try failed or every one was too
-/// wide (a cross-check against a wider one could pass on its bound alone,
-/// which proves nothing).
+/// between them) whose median is within the TSC's tolerance, or, none
+/// being, the one with the smallest bound (the earliest on a tie) if under
+/// [`CANT_TELL_PPM`]; each shown as a diag. An error saying whether every
+/// try failed or none was narrow enough to tell anything.
 #[cfg(feature = "ktest")]
 fn first_judgeable(
     tries: usize,
     mut measure: impl FnMut() -> Result<Calibration, CalError>,
     mut space: impl FnMut(),
 ) -> Result<Calibration, &'static str> {
-    let mut wide = false;
+    let mut narrowest: Option<Calibration> = None;
     for tried in 0..tries {
         if tried > 0 {
             space();
@@ -1375,25 +1446,28 @@ fn first_judgeable(
                 if ppm <= lumen_time::TSC_TOLERANCE_PPM {
                     return Ok(cal);
                 }
-                wide = true;
+                if narrowest.is_none_or(|n| ppm < n.median_bound_ppm()) {
+                    narrowest = Some(cal);
+                }
             }
             Err(e) => crate::ktest::diag(format_args!("against the pit: {e}")),
         }
     }
-    Err(if wide {
-        "the PIT re-measurement couldn't be judged: never within the TSC's tolerance"
-    } else {
-        "the PIT re-measurement couldn't be judged: every try failed"
-    })
+    match narrowest {
+        Some(cal) if cal.median_bound_ppm() < CANT_TELL_PPM => Ok(cal),
+        Some(_) => Err("the PIT re-measurement couldn't be judged: no try under 9%"),
+        None => Err("the PIT re-measurement couldn't be judged: every try failed"),
+    }
 }
 
 crate::ktest!(
     fn a_cross_check_measures_again_until_it_can_judge() {
         // A PIT measurement past the TSC's tolerance (or one that failed) is
-        // taken again, spaced, until one is within it; never within it, none
-        // (tsc_calibrated_within_tolerance then fails saying it couldn't
-        // judge, instead of passing on a wide bound).
-        use crate::kassert_eq;
+        // taken again, spaced, until one is within it; never within it, the
+        // narrowest under CANT_TELL_PPM (wherever it came); none under it,
+        // an error saying so (tsc_calibrated_within_tolerance then fails
+        // rather than pass on a bound that tells nothing).
+        use crate::{kassert, kassert_eq};
         let w = |end_gap| Window { tsc: 10_000_000, reference: 11_932, polls: 900, start_gap: 0, end_gap };
         let cal = |end_gap| Calibration {
             hz: 2_500_000_000,
@@ -1402,31 +1476,45 @@ crate::ktest!(
             last_retaken: None,
             of: Calibrated::Tsc(Reference::Pit),
         };
-        let (wide, fine) = (cal(200_000), cal(1_000));
-        let mut queue = [Err(CalError::NoCount), Ok(wide), Ok(fine)].into_iter();
-        let (mut taken, mut spaced) = (0, 0);
-        let got = first_judgeable(
-            4,
-            || {
-                taken += 1;
-                queue.next().unwrap_or(Ok(wide))
-            },
-            || spaced += 1,
-        );
-        kassert_eq!((got, taken, spaced), (Ok(fine), 3, 2));
-        let mut tries = 0;
-        let never = first_judgeable(
-            4,
-            || {
-                tries += 1;
-                Ok(wide)
-            },
-            || {},
-        );
-        kassert_eq!(never, Err("the PIT re-measurement couldn't be judged: never within the TSC's tolerance"));
-        kassert_eq!(tries, 4);
-        let failing = first_judgeable(2, || Err(CalError::NoCount), || {});
-        kassert_eq!(failing, Err("the PIT re-measurement couldn't be judged: every try failed"));
+        let (fine, wide, wider, useless) = (cal(1_000), cal(200_000), cal(500_000), cal(1_500_000));
+        kassert!(wide.median_bound_ppm() > lumen_time::TSC_TOLERANCE_PPM);
+        kassert!(wider.median_bound_ppm() > wide.median_bound_ppm() && wider.median_bound_ppm() < CANT_TELL_PPM);
+        kassert!(useless.median_bound_ppm() >= CANT_TELL_PPM);
+        let run = |queue: &[Result<Calibration, CalError>]| {
+            let (mut taken, mut spaced) = (0, 0);
+            let got = first_judgeable(
+                4,
+                || {
+                    taken += 1;
+                    queue[taken - 1]
+                },
+                || spaced += 1,
+            );
+            (got, taken, spaced)
+        };
+        kassert_eq!(run(&[Err(CalError::NoCount), Ok(wide), Ok(fine), Ok(wide)]), (Ok(fine), 3, 2));
+        kassert_eq!(run(&[Ok(wider), Ok(wide), Ok(useless), Ok(wider)]), (Ok(wide), 4, 3));
+        let none = run(&[Ok(useless), Err(CalError::NoCount), Ok(useless), Ok(useless)]);
+        kassert_eq!(none, (Err("the PIT re-measurement couldn't be judged: no try under 9%"), 4, 3));
+        let failing = run(&[Err(CalError::NoCount); 4]);
+        kassert_eq!(failing, (Err("the PIT re-measurement couldn't be judged: every try failed"), 4, 3));
+        // Then the agreement (pit, its bound, boot, its bound).
+        const WIDE: Result<(), &str> = Err("the PIT and boot bounds are too wide to tell the rates apart");
+        const APART: Result<(), &str> = Err("the PIT re-measurement and the boot calibration disagree");
+        let hz = 1_000_000_000;
+        // Within 2%: whatever the bounds.
+        kassert_eq!(pit_agrees(1_020_000_000, 1_000, hz, 1_000), Ok(()));
+        kassert_eq!(pit_agrees(hz, 60_000, hz, 40_000), Ok(()));
+        kassert_eq!(pit_agrees(1_021_000_000, 1_000, hz, 1_000), APART);
+        // Past it: within the bounds (each its own), under the cap.
+        kassert_eq!(pit_agrees(1_040_000_000, 30_000, hz, 20_000), Ok(()));
+        kassert_eq!(pit_agrees(1_049_000_000, 30_000, hz, 20_000), Ok(()));
+        kassert_eq!(pit_agrees(1_060_000_000, 30_000, hz, 20_000), APART);
+        kassert_eq!(pit_agrees(1_080_000_000, 60_000, hz, 25_000), Ok(()));
+        kassert_eq!(pit_agrees(1_030_000_000, 60_000, hz, 30_000), WIDE);
+        // #45's 11.8%, with bounds just under the cap, either side high.
+        kassert_eq!(pit_agrees(1_118_000_000, 60_000, hz, 29_000), APART);
+        kassert_eq!(pit_agrees(hz, 1_000, 1_118_000_000, 88_000), APART);
         Ok(())
     }
 );
@@ -1494,7 +1582,7 @@ fn a_pit_window_paused_at_still_gives_the_tsc(at: Pause) -> Result<(), &'static 
         "{measured} Hz against {hz} Hz; window {w} (steady: {}), bounds {allowed_ppm} ppm ({boot_ppm} the boot's)",
         w.is_steady()
     ));
-    kassert!(w.tsc_error_ppm() < 100_000); // else it can't tell
+    kassert!(w.tsc_error_ppm() < CANT_TELL_PPM); // else it can't tell
     kassert!(lumen_time::within_bounds(measured, hz, w.tsc_error_ppm(), boot_ppm, CROSS_CHECK_FLOOR_PPM));
     Ok(())
 }
@@ -1586,18 +1674,23 @@ crate::ktest!(
         // The first two windows' end readings are paused 1 ms between latching
         // the counter and reading the TSC, as a host descheduling the vCPU
         // there would: their ends are 10% uncertain, so both are taken again
-        // (a loaded host may add more), and the calibration still gives the
-        // TSC's frequency, within 1% (or its bound and the boot's, if more:
-        // CROSS_CHECK_FLOOR_PPM).
+        // (a loaded host may add more), neither is kept, and the calibration
+        // still gives the TSC's frequency, within 1% (or its bound and the
+        // boot's, if more: CROSS_CHECK_FLOOR_PPM). Its kept windows are
+        // steady, or it ran out of attempts and the least unsteady filled in
+        // (`Calibration::steady_or_out_of_attempts`: a loaded host's slow PIT
+        // reads can leave every window unsteady).
         use crate::kassert;
         let hz = tsc().ok_or("TSC not calibrated")?.hz();
         let count = lumen_time::pit_count(WINDOW_NS).ok_or("no PIT count")?;
-        let mut taken = 0;
+        let (mut taken, mut paused) = (0, [None::<Window>; 2]);
         let cal = off_or_diag("calibrating against the PIT failed", || {
             median_tsc_hz(Reference::Pit, PIT_HZ, || {
                 taken += 1;
                 if taken <= 2 {
-                    pit_window(count, sleep_at(Pause::EndAfterRead, 1_000_000))
+                    let w = pit_window(count, sleep_at(Pause::EndAfterRead, 1_000_000))?;
+                    paused[taken - 1] = Some(w);
+                    Ok(w)
                 } else {
                     pit_window(count, |_| {})
                 }
@@ -1605,9 +1698,11 @@ crate::ktest!(
         })?;
         let shown = alloc::format!("{cal}");
         crate::ktest::diag(format_args!("{shown}"));
+        crate::ktest::diag(format_args!("paused windows {paused:?}"));
         kassert!(cal.retaken >= 2);
         kassert!(cal.last_retaken.is_some_and(|w| !w.is_steady()));
-        kassert!(cal.windows.iter().all(Window::is_steady));
+        kassert!(paused.iter().all(|p| p.is_some_and(|p| !cal.windows.contains(&p))));
+        kassert!(cal.steady_or_out_of_attempts());
         // As clocks shows it (Calibration's Display).
         kassert!(shown.ends_with(&alloc::format!("] retook {}", cal.retaken)));
         // Within CROSS_CHECK_FLOOR_PPM, or its bound and the boot's if more.
@@ -1655,6 +1750,22 @@ crate::ktest!(
         kassert_eq!(cal.median_bound_ppm(), w(18).tsc_error_ppm());
         kassert!(cal.median_bound_ppm() > 108_000 && cal.median_bound_ppm() < 110_000);
         kassert_eq!(report(&cal).verdict, Verdict::Imprecise);
+        // Out of attempts: unsteady windows kept is what it may do then, and
+        // only then.
+        kassert!(cal.steady_or_out_of_attempts());
+        kassert!(!Calibration { retaken: ATTEMPTS - 1, ..cal }.steady_or_out_of_attempts());
+        // With `steady` of the five kept windows steady (the first ones).
+        let kept = |steady: usize, retaken| {
+            let mut windows = cal.windows;
+            windows[..steady].fill(Window { end_gap: 1_000, ..w(1) });
+            Calibration { windows, retaken, ..cal }
+        };
+        kassert_eq!(kept(5, 3).steady(), WINDOWS);
+        kassert!(kept(5, 3).steady_or_out_of_attempts());
+        kassert!(kept(3, 17).steady_or_out_of_attempts());
+        kassert!(!kept(4, 1).steady_or_out_of_attempts());
+        kassert!(!kept(4, 15).steady_or_out_of_attempts());
+        kassert!(!kept(4, 17).steady_or_out_of_attempts()); // past ATTEMPTS: never
         Ok(())
     }
 );
@@ -1721,15 +1832,17 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn an_hpet_slow_to_read_stretches_its_windows_until_steady() {
+    fn an_hpet_slow_to_read_stretches_its_windows() {
         // Every poll's read held up 200 µs, as a slowed host's HPET reads
         // were (#139: 250 µs each, 40 polls in 10 ms): the end gap is 2% of a
         // 10 ms window, unsteady however late it is taken again. Taken again
         // longer (the gap is one poll's worth, a slow read, not a burst),
-        // until the same gaps are under 0.5% of it, all five kept windows are
-        // steady (none filling in) and longer than 10 ms, and the rate is
-        // within 1% (or its bound and the boot's, if more).
-        use crate::{kassert, kassert_eq};
+        // until the same gaps are under 0.5% of it, the kept windows are
+        // steady (or, a loaded host stalling every window too, the attempts
+        // ran out and the least unsteady filled in:
+        // `Calibration::steady_or_out_of_attempts`) and longer than 10 ms,
+        // and the rate is within 1% (or its bound and the boot's, if more).
+        use crate::kassert;
         let hpet = hpet().ok_or("no HPET")?;
         let hz = tsc().ok_or("TSC not calibrated")?.hz();
         let base = hpet.clock().ticks(WINDOW_NS);
@@ -1752,19 +1865,19 @@ crate::ktest!(
             })
         })?;
         crate::ktest::diag(format_args!("{cal}, median within {} ppm", cal.median_bound_ppm()));
-        kassert_eq!(cal.steady(), WINDOWS);
+        kassert!(cal.steady_or_out_of_attempts());
         // Taken again at least once: a 10 ms window is almost never steady
         // with 200 µs reads (a host stall outside its gaps can make one so,
         // and it is kept: the target stays 10 ms). Until the first window set
-        // aside the target is still 10 ms (a steady window keeps it), and from
-        // it the target only grows: every later window is at least as long as
-        // `stretched_for_gaps(base, first)`, so the shortest later one set
-        // aside (for host stalls, or a stretch not yet enough; at most 15,
-        // above) is too. Unless a stall in that first window kept its stretch
-        // near 10 ms, that is never a 10 ms window again, nor one grown slower
-        // than the kernel's own stretch. Judged from the first window's own
-        // gaps, a host stall can't fail it; and a long window set aside last
-        // can't hide a short one before it.
+        // aside the target is still 10 ms (a steady window keeps it), and
+        // from it the target only grows: every later window is at least as
+        // long as `stretched_for_gaps(base, first)`, so the shortest later
+        // one set aside (for host stalls, or a stretch not yet enough) is
+        // too. Unless a stall in that first window kept its stretch near
+        // 10 ms, that is never a 10 ms window again, nor one grown slower than
+        // the kernel's own stretch. Judged from the first window's own gaps,
+        // a host stall can't fail it; and a long window set aside last can't
+        // hide a short one before it.
         kassert!(cal.retaken >= 1);
         let first = first.ok_or("no window set aside")?;
         let most = base.saturating_mul(MOST_HPET_STRETCH);
@@ -1777,10 +1890,10 @@ crate::ktest!(
         if let Some(shortest) = shortest {
             kassert!(shortest.reference >= stretched);
         }
-        // Longer than 10 ms: every window is at least its target, and a kept
-        // one is steady, so at least 200 times its 200 µs end gap. (Not a
-        // ceiling: a window ends at its first poll past the target, and a host
-        // stall before that poll lengthens it.)
+        // Longer than 10 ms: every window is at least its target (a kept one,
+        // steady or filling in). (Not a ceiling: a window ends at its first
+        // poll past the target, and a host stall before that poll lengthens
+        // it.)
         kassert!(cal.windows.iter().all(|w| w.reference > base));
         let boot_ppm = boot_calibration().ok_or("no boot calibration")?.median_bound_ppm();
         kassert!(lumen_time::within_bounds(cal.hz, hz, cal.median_bound_ppm(), boot_ppm, CROSS_CHECK_FLOOR_PPM));
@@ -2254,14 +2367,14 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn the_boot_timer_calibration_is_within_what_the_tick_needs() {
-        // Expected, not guaranteed: the boot's median is within the timer's
-        // tolerance (lumen_time::TIMER_TOLERANCE_PPM), the TSC's error
-        // included, as its steady windows' or enough least-unsteady ones
-        // filling in allow, and the timer runs at it. A boot whose bound was
-        // past it warned, and fails this on purpose: its rate may be off by
-        // more than the tick allows.
-        use crate::{kassert, kassert_eq};
+    fn the_boot_timer_calibration_is_the_timers_rate() {
+        // The boot's timer calibration, its steady windows first, the rate
+        // their median, and the timer runs at it. Its bound isn't held to the
+        // timer's tolerance here: a loaded host decides it (#158's audit:
+        // 1 of 40 loaded KVM boots came out at 2.03%). A boot past the
+        // tolerance warned, and `lumen_harness.clock_diags` checks that the
+        // warning came exactly then (and the bound is in its diag).
+        use crate::kassert_eq;
         let cal = boot_timer_calibration().ok_or("no timer calibration")?;
         let tsc_hz = tsc().ok_or("TSC not calibrated")?.hz();
         // Its windows (tsc/timer/polls/start_gap/end_gap) and each one's
@@ -2276,7 +2389,6 @@ crate::ktest!(
         kassert_eq!(cal.windows.iter().take_while(|w| w.is_steady()).count(), cal.steady());
         let boot_tsc_ppm = boot_calibration().ok_or("no boot calibration")?.median_bound_ppm();
         kassert_eq!(cal.of, Calibrated::Timer { tsc_ppm: boot_tsc_ppm });
-        kassert!(cal.median_bound_ppm() <= lumen_time::TIMER_TOLERANCE_PPM);
         kassert_eq!(lumen_time::median(&mut rates), Some(cal.hz));
         kassert_eq!(lapic_timer().map(|c| c.hz()), Some(cal.hz));
         Ok(())
@@ -2284,12 +2396,13 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn the_boot_tsc_calibration_is_within_what_now_ns_needs() {
-        // Expected, not guaranteed: the boot's TSC median is within the
-        // TSC's tolerance (lumen_time::TSC_TOLERANCE_PPM, 1%), its steady
-        // windows first, the frequency their median, and now_ns runs at it.
-        // A boot past it warned, and fails this on purpose.
-        use crate::{kassert, kassert_eq};
+    fn the_boot_tsc_calibration_is_now_ns_s_rate() {
+        // The boot's TSC calibration, its steady windows first, the frequency
+        // their median, and now_ns runs at it. Its bound isn't held to the
+        // TSC's tolerance here: a loaded host decides it. A boot past the
+        // tolerance warned, and `lumen_harness.clock_diags` checks that the
+        // warning came exactly then.
+        use crate::kassert_eq;
         let cal = boot_calibration().ok_or("no boot calibration")?;
         let reference = reference().ok_or("no reference")?;
         let reference_hz = match reference {
@@ -2304,7 +2417,6 @@ crate::ktest!(
         ));
         kassert_eq!(cal.windows.iter().take_while(|w| w.is_steady()).count(), cal.steady());
         kassert_eq!(cal.of, Calibrated::Tsc(reference));
-        kassert!(cal.median_bound_ppm() <= lumen_time::TSC_TOLERANCE_PPM);
         kassert_eq!(lumen_time::median(&mut rates), Some(cal.hz));
         kassert_eq!(tsc().map(|c| c.hz()), Some(cal.hz));
         Ok(())
@@ -2313,8 +2425,8 @@ crate::ktest!(
 
 crate::ktest!(
     fn now_ns_follows_the_hpet() {
-        // `now_ns` is the TSC converted; across a 50 ms spin it moves as
-        // far as the HPET says, within 2% (a 1 ms budget). Each HPET reading
+        // `now_ns` is the TSC converted; across a 500 ms spin it moves as
+        // far as the HPET says, within 2% (a 10 ms budget). Each HPET reading
         // is bracketed by `now_ns` readings (see `now_ns_against_the_hpet`).
         // Read one after the other, the two clocks came out 1.63 ms apart
         // once under KVM (#117); a stall of about that much between two of
@@ -2591,7 +2703,7 @@ crate::ktest!(
         // Every reading that starts within 50 ms of the first is paused
         // STALL_NS inside its bracket, as a burst of slow HPET reads on a
         // loaded host would (load-5 in PR #121 saw one last 60 ms or more).
-        // Spaced RETRY_SPACING_NS apart, the first three readings fall in it
+        // Spaced RETRY_SPACING_NS apart, the first two or three readings fall in it
         // and a later one after it is kept; taken back to back, every reading
         // would fall in it.
         use crate::kassert;
@@ -2622,14 +2734,14 @@ crate::ktest!(
 
 crate::ktest!(
     fn one_stalled_reading_at_each_end_still_passes() {
-        // The full 50 ms check with the first reading at each end paused
-        // 5 ms: at the start after its HPET read, at the end before it.
-        // Kept, the start's HPET value would be 2.5 ms before its midpoint
-        // and the end's 2.5 ms after, so the clocks would come out 5 ms
-        // apart, over the 1 ms budget. Each is read again, and the check
+        // The full 500 ms check with the first reading at each end paused
+        // 25 ms: at the start after its HPET read, at the end before it.
+        // Kept, the start's HPET value would be 12.5 ms before its midpoint
+        // and the end's 12.5 ms after, so the clocks would come out 25 ms
+        // apart, over the 10 ms budget. Each is read again, and the check
         // passes on the narrow readings.
         use crate::kassert;
-        const PAUSE_NS: u64 = 5_000_000;
+        const PAUSE_NS: u64 = 25_000_000;
         let hpet = hpet().ok_or("no HPET")?;
         let mut paused = [false; 2];
         let [start, end] = now_ns_against_the_hpet(&hpet, NOW_NS_SPIN_NS, INJECTED, |p| {
@@ -2655,21 +2767,27 @@ crate::ktest!(
         // Measured with the HPET and the tick count, not the TSC that
         // `sleep` itself waits on. The HPET readings aren't bracketed (#117):
         // they come before and after the sleep, so a stall next to either
-        // only lengthens the interval, and only its 1 s upper bound could
-        // catch that; the tick count is only checked to have moved.
+        // only lengthens the interval: no upper bound on it (a host decides
+        // how long a stall is). Its floor is 10 ms less the boot TSC
+        // calibration's bound (at least 1%): the TSC was calibrated against
+        // this HPET, and a boot past 1% warned. The ticks counted have an
+        // upper bound a stall can't break: a sleep wakes on the first tick
+        // past its deadline, the 11th of 10 ms (then read before the HPET,
+        // so its slow read isn't counted), and a stall merges ticks rather
+        // than adding any; allowing one more each for a tick between the
+        // `ticks()` read and the deadline's, a stall there, and a timer up
+        // to 2% fast: 14. A sleep waiting twice as long counts about 20.
         use crate::kassert;
         let hpet = hpet().ok_or("no HPET")?;
+        let boot_ppm = boot_calibration().ok_or("no boot calibration")?.median_bound_ppm();
+        let floor_ns = 10_000_000 - lumen_time::stall_ticks(10_000_000, boot_ppm.max(lumen_time::TSC_TOLERANCE_PPM));
         let (h0, t0) = (hpet.now(), ticks());
         sleep(10_000_000);
-        let (elapsed, ticked) = (hpet.since(h0, hpet.now()), ticks() - t0);
-        let ns = hpet.clock().ns(elapsed);
-        crate::ktest::diag(format_args!("slept {ns} ns by the HPET, {ticked} ticks"));
-        // At least 10 ms, less 1%: the TSC was calibrated against this HPET,
-        // so only window-to-window noise separates them (the 2% cross-checks
-        // are against the PIT). Well under a second. The timer ticked
-        // (interrupts are on); its rate is checked elsewhere.
-        kassert!((9_900_000..lumen_time::NS_PER_SEC).contains(&ns));
-        kassert!(ticked >= 1);
+        let ticked = ticks() - t0;
+        let ns = hpet.clock().ns(hpet.since(h0, hpet.now()));
+        crate::ktest::diag(format_args!("slept {ns} ns by the HPET (at least {floor_ns}), {ticked} ticks"));
+        kassert!(ns >= floor_ns);
+        kassert!((1..=14).contains(&ticked));
         Ok(())
     }
 );
@@ -2853,19 +2971,21 @@ crate::ktest!(
 crate::ktest!(
     fn the_timer_ticks_on_its_vector() {
         // Interrupts arrive on the timer's vector, and not much faster than
-        // 1 kHz (100 in 100 ms; the bound, 150, leaves room). The timer's
-        // input rate is checked by `the_timer_is_programmed_for_1_khz` (against the
+        // 1 kHz: at most 1.5 per ms the sleep took by `now_ns`, plus 2 (a
+        // host stall lengthens the sleep, and late periods merge rather than
+        // arrive faster, so this bound grows with it). The timer's input rate
+        // is checked by `the_timer_is_programmed_for_1_khz` (against the
         // HPET): QEMU's TCG delivers ticks late (late periodic timers skip
-        // periods): 29 to 81 in #45's stress runs (busy-waiting then; the
+        // periods): 29 to 81 ticks in 100 ms in #45's stress runs (busy-waiting then; the
         // sleep now halts in the idle thread), and a lock held across a
         // period merges them.
         use crate::kassert;
         kassert!(arch::irq::enabled());
-        let t0 = ticks();
+        let (t0, n0) = (ticks(), now_ns());
         sleep(100_000_000);
-        let ticked = ticks() - t0;
-        crate::ktest::diag(format_args!("{ticked} ticks in 100 ms"));
-        kassert!((1..=150).contains(&ticked));
+        let (ticked, slept_ms) = (ticks() - t0, (now_ns() - n0) / 1_000_000);
+        crate::ktest::diag(format_args!("{ticked} ticks in a 100 ms sleep that took {slept_ms} ms"));
+        kassert!((1..=slept_ms * 3 / 2 + 2).contains(&ticked));
         Ok(())
     }
 );
@@ -2874,8 +2994,8 @@ crate::ktest!(
     fn a_held_lock_holds_off_the_timer() {
         // While a lock is held (interrupts off) no tick arrives; ticks resume
         // once it is dropped. The first can come late under QEMU's TCG on a
-        // loaded host (a fixed 2 ms wait missed it once, #45), so this waits up
-        // to 100 ms for it.
+        // loaded host (a fixed 2 ms wait missed it once, #45), so this waits
+        // for it, up to 5 s (only a tick that never comes fails).
         use crate::{kassert, kassert_eq};
         let lock = crate::sync::SpinLock::new(());
         let guard = lock.lock();
@@ -2883,7 +3003,7 @@ crate::ktest!(
         sleep(5_000_000);
         let during = ticks() - t0;
         drop(guard);
-        let resumed = wait_for_tick(t0, 100_000_000);
+        let resumed = wait_for_tick(t0, 5_000_000_000);
         kassert_eq!(during, 0);
         kassert!(resumed);
         Ok(())
@@ -2893,13 +3013,24 @@ crate::ktest!(
 crate::ktest!(
     fn timer_ticks_are_not_traced() {
         // At 1 kHz they would flood the trace ring.
-        use crate::{kassert, kassert_eq};
+        use crate::kassert_eq;
         // Spinning, not sleeping: switching to the idle thread and back is
-        // traced.
+        // traced. Over 20 ticks, each waited for up to 5 s (late under QEMU's
+        // TCG, #45), so a tick traced now and then shows too.
         let ring = crate::trace::ring();
-        let (t0, w0) = (ticks(), ring.written());
-        spin(20_000_000);
-        kassert!(ticks() > t0);
+        let w0 = ring.written();
+        for n in 0..20 {
+            let t = ticks();
+            if !wait_for_tick(t, 5_000_000_000) {
+                crate::ktest::diag(format_args!("no tick in 5 s after {n} of 20 (ticks at {t})"));
+                return Err("the timer stopped ticking");
+            }
+        }
+        for seq in w0..ring.written() {
+            if let Some(e) = ring.read(seq) {
+                crate::ktest::diag(format_args!("traced while spinning: kind {:#x} args {:x?}", e.kind, e.args));
+            }
+        }
         kassert_eq!(ring.written(), w0);
         Ok(())
     }

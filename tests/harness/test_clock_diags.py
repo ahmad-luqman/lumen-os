@@ -3,12 +3,14 @@ cross-checks' diagnostics can go wrong (#117), on synthetic TAP."""
 
 import pytest
 from lumen_harness import tap
+from lumen_harness.calibration import TIMER_TOLERANCE_PPM, TSC_TOLERANCE_PPM, percent
 from lumen_harness.clock_diags import check_clock_diags, placement_is_judged
+from test_calibration import TIMER_FILLED, TIMER_OWN, TSC_OWN
 
 NOW_NS = (
     "# bracket widths: start [{start}] ns, end [{end}] ns ({retries} taken again, 20 ms "
     "apart; at most {limit} ns trusted)\n"
-    "# now_ns moved 50000000 ns, the HPET 50001000 ns: 1000 ns apart, of a 1000020 ns budget\n"
+    "# now_ns moved 500000000 ns, the HPET 500001000 ns: 1000 ns apart, of a 10000020 ns budget\n"
 )
 TIMER = (
     "# bracket widths min/median/max 0/{median}/{max} ns over {brackets} brackets; 0 of 7 one-shot windows "
@@ -54,11 +56,21 @@ def placement(
     )
 
 
+def retook_line(name, retook, steady, bound):
+    """Boot's INFO verdict on a calibration that took windows again within
+    its tolerance."""
+    return (
+        f"[    1.781000] INFO  time: {name} calibration took {retook} windows again, {steady} of 5 kept "
+        f"steady, median within {percent(bound)} (read too late to trust; the last, "
+        "tsc/reference/polls/start_gap/end_gap: 24818280/627810/1/109564/366569)\n"
+    )
+
+
 def run(
     start="25000",
     end="1000",
     retries=0,
-    limit=100000,
+    limit=1000000,
     now_ns_case="now_ns_follows_the_hpet",
     extra_line=False,
     timer_max=39000,
@@ -75,6 +87,8 @@ def run(
     hpet_placement=None,
     timer_placement=None,
     injected_retries=2,
+    boot_log=None,
+    tsc_retook=0,
 ):
     hpet_placement = hpet_placement or placement("HPET")
     timer_placement = timer_placement or placement(
@@ -89,21 +103,21 @@ def run(
         ),
         (
             "a_stalled_hpet_bracket_is_read_again",
-            "# injected pause: bracket widths [246000, 101000, 1000] ns\n",
+            "# injected pause: bracket widths [2460000, 1001000, 1000] ns\n",
         ),
         (
             "one_stalled_reading_at_each_end_still_passes",
             (
-                "# injected pause: bracket widths: start [5051000, 1000] ns, end [5028000, 1000] "
-                f"ns ({injected_retries} taken again, 20 ms apart; at most 100000 ns trusted)\n"
+                "# injected pause: bracket widths: start [25051000, 1000] ns, end [25028000, 1000] "
+                f"ns ({injected_retries} taken again, 20 ms apart; at most 1000000 ns trusted)\n"
             ),
         ),
         (
             "every_stalled_hpet_bracket_is_a_failure",
             (
-                "# injected pause: bracket widths: start [201000, 201000, 201000, 201000, 201000, "
-                "201000, 201000, 201000, 201000] ns, end [] ns (8 taken again, 20 ms apart; at most "
-                "100000 ns trusted)\n"
+                "# injected pause: bracket widths: start [2001000, 2001000, 2001000, 2001000, 2001000, "
+                "2001000, 2001000, 2001000, 2001000] ns, end [] ns (8 taken again, 20 ms apart; at most "
+                "1000000 ns trusted)\n"
             ),
         ),
         (
@@ -112,7 +126,7 @@ def run(
         ),
         ("a_timer_reading_is_placed_at_its_brackets_midpoint", timer_placement),
         (
-            "the_boot_timer_calibration_is_within_what_the_tick_needs",
+            "the_boot_timer_calibration_is_the_timers_rate",
             (
                 BOOT_TIMER.format(
                     windows=" ".join([WINDOW] * boot_windows),
@@ -125,11 +139,11 @@ def run(
             ),
         ),
         (
-            "the_boot_tsc_calibration_is_within_what_now_ns_needs",
+            "the_boot_tsc_calibration_is_now_ns_s_rate",
             (
                 BOOT_TSC.format(
                     windows=" ".join([TSC_WINDOW] * 5),
-                    retook=0,
+                    retook=tsc_retook,
                     steady=tsc_steady,
                     bound=tsc_bound,
                     rates=", ".join(["2457600000"] * 5),
@@ -140,7 +154,15 @@ def run(
     ]
     if now_ns_case != "now_ns_follows_the_hpet":
         cases.append(("now_ns_follows_the_hpet", ""))
-    text = f"TAP version 14\n1..{len(cases)}\n"
+    if boot_log is None:
+        # The INFO lines boot logs for windows taken again within the
+        # tolerance, in the kernel's words (calibration.verdict reads them).
+        boot_log = ""
+        if boot_retook and boot_bound <= TIMER_TOLERANCE_PPM:
+            boot_log += retook_line("local APIC timer", boot_retook, boot_steady, boot_bound)
+        if tsc_retook and tsc_bound <= TSC_TOLERANCE_PPM:
+            boot_log += retook_line("tsc", tsc_retook, tsc_steady, tsc_bound)
+    text = f"{boot_log}TAP version 14\n1..{len(cases)}\n"
     for n, (name, diags) in enumerate(cases, 1):
         text += f"{diags}ok {n} - lumen_kernel::time::{name}\n"
     return tap.parse(text), text
@@ -150,24 +172,38 @@ def test_a_good_run_passes():
     check_clock_diags(*run())
 
 
-def test_four_retries_pass():
-    # One burst of slow reads on one end, sampled around 20 ms apart.
-    start = "150000, 140000, 130000, 120000, 25000"
-    check_clock_diags(*run(start=start, end="1000", retries=4))
+def test_any_number_of_retries_passes():
+    # Retries count a loaded host's stalls: not bounded (#158's audit).
+    start = "1500000, 1400000, 1300000, 1200000, 25000"
+    check_clock_diags(*run(start=start, end="1100000, 1050000, 1020000, 1000", retries=7))
 
 
-def test_five_retries_fail():
-    with pytest.raises(AssertionError, match="over 4 retries"):
-        check_clock_diags(
-            *run(start="150000, 140000, 130000, 25000", end="120000, 110000, 1000", retries=5)
-        )
+def test_a_kept_reading_at_the_limit_passes():
+    check_clock_diags(*run(start="1000000", end="1000", retries=0))
+
+
+def test_a_kept_reading_over_the_limit_fails():
+    with pytest.raises(AssertionError, match="a kept reading over 1000000 ns"):
+        check_clock_diags(*run(start="1000001", end="1000", retries=0))
+    with pytest.raises(AssertionError, match="a kept reading over 1000000 ns"):
+        check_clock_diags(*run(start="1000", end="1000001", retries=0))
+
+
+def test_a_reading_within_the_limit_taken_again_fails():
+    with pytest.raises(AssertionError, match="within 1000000 ns taken again"):
+        check_clock_diags(*run(start="2000000, 500000, 1000", end="1000", retries=2))
+    # Taken again only past the limit, at either end.
+    with pytest.raises(AssertionError, match="within 1000000 ns taken again"):
+        check_clock_diags(*run(start="500000, 1000", end="1000", retries=1))
+    with pytest.raises(AssertionError, match="within 1000000 ns taken again"):
+        check_clock_diags(*run(start="1000", end="1000000, 1000", retries=1))
 
 
 def test_a_retry_count_that_doesnt_match_the_readings_fails():
     # The diag counting only the start's retries, in the real check or in an
     # injected one that retakes both ends.
     with pytest.raises(AssertionError, match="retries don't match"):
-        check_clock_diags(*run(start="25000", end="120000, 1000", retries=0))
+        check_clock_diags(*run(start="25000", end="1200000, 1000", retries=0))
     with pytest.raises(AssertionError, match="retries don't match"):
         check_clock_diags(*run(injected_retries=1))
 
@@ -206,8 +242,8 @@ def test_a_missing_timer_boot_calibration_line_fails():
 @pytest.mark.parametrize("steady", [0, 2])
 def test_a_boot_calibration_with_most_windows_unsteady_passes_within_its_tolerance(steady):
     # Least-unsteady windows filled in (#139): the bound decides, not the count.
-    check_clock_diags(*run(boot_steady=steady, boot_bound=7000))
-    check_clock_diags(*run(tsc_steady=steady, tsc_bound=7000))
+    check_clock_diags(*run(boot_steady=steady, boot_retook=20 - steady, boot_bound=7000))
+    check_clock_diags(*run(tsc_steady=steady, tsc_retook=20 - steady, tsc_bound=7000))
 
 
 def test_two_timer_boot_calibration_lines_fail():
@@ -226,16 +262,36 @@ def test_a_timer_boot_calibration_with_more_steady_than_windows_fails():
         check_clock_diags(*run(boot_steady=6))
 
 
-def test_a_timer_boot_calibration_bound_over_its_tolerance_fails():
+def test_a_timer_boot_calibration_past_its_tolerance_must_have_warned():
+    # Not bounded (a loaded host decides it): warned exactly when past.
+    filled = {"boot_steady": 0, "boot_retook": 20}
     check_clock_diags(*run(boot_bound=20000))
-    with pytest.raises(AssertionError, match="timer median bound over 20000 ppm"):
-        check_clock_diags(*run(boot_bound=20001))
+    check_clock_diags(*run(boot_bound=38000, boot_log=TIMER_OWN, **filled))
+    with pytest.raises(AssertionError, match="timer median bound 20001 ppm .* did not warn"):
+        check_clock_diags(*run(boot_bound=20001, boot_log="", **filled))
+    with pytest.raises(AssertionError, match="timer median bound 20000 ppm .* warned"):
+        check_clock_diags(*run(boot_bound=20000, boot_log=TIMER_OWN, **filled))
+    # A verdict within the tolerance (INFO: windows taken again) is no warning.
+    check_clock_diags(*run(boot_bound=14000, boot_log=TIMER_FILLED, **filled))
+    with pytest.raises(AssertionError, match="verdict prints 3.8%"):
+        check_clock_diags(*run(boot_bound=30000, boot_log=TIMER_OWN, **filled))
+    # Windows taken again within the tolerance: a line, saying the counts.
+    with pytest.raises(
+        AssertionError, match="7 windows taken again, bound 100 ppm, but no verdict line"
+    ):
+        check_clock_diags(*run(boot_log=""))
+    with pytest.raises(AssertionError, match="says 20 taken again and 0 steady, not 7 and 5"):
+        check_clock_diags(*run(boot_bound=14000, boot_log=TIMER_FILLED))
 
 
-def test_a_tsc_boot_calibration_bound_over_its_tolerance_fails():
+def test_a_tsc_boot_calibration_past_its_tolerance_must_have_warned():
+    filled = {"tsc_steady": 0, "tsc_retook": 20, "boot_retook": 0}
     check_clock_diags(*run(tsc_bound=10000))
-    with pytest.raises(AssertionError, match="tsc median bound over 10000 ppm"):
-        check_clock_diags(*run(tsc_bound=10001))
+    check_clock_diags(*run(tsc_bound=16000, boot_log=TSC_OWN, **filled))
+    with pytest.raises(AssertionError, match="tsc median bound 10001 ppm .* did not warn"):
+        check_clock_diags(*run(tsc_bound=10001, boot_log="", **filled))
+    with pytest.raises(AssertionError, match="tsc median bound 10000 ppm .* warned"):
+        check_clock_diags(*run(tsc_bound=10000, boot_log=TSC_OWN, **filled))
 
 
 @pytest.mark.parametrize("lines", [0, 2])
@@ -250,9 +306,13 @@ def test_a_tsc_boot_calibration_with_more_steady_than_windows_fails():
 
 
 def test_any_number_of_timer_boot_retakes_passes():
-    # Retakes count a loaded host's stalls at boot: not bounded.
-    check_clock_diags(*run(boot_retook=60))
+    # Retakes count a loaded host's stalls at boot: not bounded, but a
+    # calibration stops at 5 steady windows or 20 in all.
+    check_clock_diags(*run(boot_retook=15))
     check_clock_diags(*run(boot_steady=3, boot_retook=17))
+    for steady, retook in ((5, 16), (4, 2), (3, 18)):
+        with pytest.raises(AssertionError, match="not what a calibration stops at"):
+            check_clock_diags(*run(boot_steady=steady, boot_retook=retook))
 
 
 def test_a_placement_too_far_off_fails():
