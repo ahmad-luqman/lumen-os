@@ -39,11 +39,12 @@
 //!   vCPU, ran meanwhile: common under load during a sound); or input
 //!   found at the deadline (with no interrupt, or one before the deadline
 //!   that didn't wake it; if only in the UART, still there a period
-//!   later). Three of the latter in a row, with no interrupt
-//!   bringing input between, warn once (`lumen_uart::MissedInterrupts`).
-//!   Input already there when the shell looks, before it blocks (or before
-//!   it waits at all: a line that arrives while it is still busy), is none
-//!   of these (`WaitEnd::Idle`), and neither is a wait that found nothing.
+//!   later). Three of the latter in a row, with no wait an interrupt ended
+//!   between, warn once (`lumen_uart::MissedInterrupts`). Input already
+//!   there at the wait's first look, before it blocks, is none of these
+//!   (`WaitEnd::Idle`), and neither is a wait that found nothing; a line
+//!   that arrives while the shell is still busy is read before it waits at
+//!   all, with no wait to count.
 //! - **How it waits** (`lumen_uart::wait_mode`): with the interrupt, block
 //!   with the deadline; without a UART, block for good; either only where
 //!   the thread can block (not before the boot CPU's scheduler runs);
@@ -100,7 +101,7 @@ static WOKEN: AtomicU64 = AtomicU64::new(0);
 /// count).
 static LATE: AtomicU64 = AtomicU64::new(0);
 /// Waits that found input at their deadline, no interrupt having brought
-/// any.
+/// any (or one having, without waking the reader).
 static AT_DEADLINE: AtomicU64 = AtomicU64::new(0);
 /// When those are worth a warning (the serial shell's only).
 static MISSED: SpinLock<MissedInterrupts> = SpinLock::new(MissedInterrupts::new());
