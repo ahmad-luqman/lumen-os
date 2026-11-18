@@ -537,7 +537,7 @@ fn calibrate_with_hpet(hpet: &HpetCounter, pause: impl FnMut(Pause)) -> Result<C
     median_tsc_hz(Reference::Hpet, hpet.clock().hz(), hpet_windows(hpet, pause))
 }
 
-/// HPET windows, as [`calibrate_with_hpet`] takes them: the first
+/// HPET windows, as [`calibrate_with_hpet`] takes them: the first at least
 /// [`WINDOW_NS`] long, each next one at least as long as
 /// [`lumen_time::stretched_for_gaps`] made the target from the last (which
 /// only grows, up to [`MOST_HPET_STRETCH`] windows' worth).
@@ -1740,6 +1740,7 @@ crate::ktest!(
         let cal = off_or_diag("calibrating against the HPET failed", || {
             median_tsc_hz(Reference::Hpet, hpet.clock().hz(), || {
                 let w = take()?;
+                // Set aside exactly when unsteady, as `steadiest_windows` does.
                 if !w.is_steady() {
                     if first.is_none() {
                         first = Some(w);
@@ -1752,23 +1753,32 @@ crate::ktest!(
         })?;
         crate::ktest::diag(format_args!("{cal}, median within {} ppm", cal.median_bound_ppm()));
         kassert_eq!(cal.steady(), WINDOWS);
-        // Taken again at least once: the first, 10 ms window can't be steady
-        // with 200 µs reads. And a stretched window keeps its length (the
-        // target only grows): after the first window set aside, every window
-        // is at least as long as `stretched_for_gaps` made the target from
-        // it, so the shortest later one set aside (a busy host's stall: as
-        // many as it likes, #184) is too: never a 10 ms one again, nor one
-        // grown too slowly. The stretch is judged from that first window's
-        // own gaps, so a host stall in it can't fail this, and a long window
-        // set aside last can't hide a short one before it.
+        // Taken again at least once: a 10 ms window is almost never steady
+        // with 200 µs reads (a host stall outside its gaps can make one so,
+        // and it is kept: the target stays 10 ms). Until the first window set
+        // aside the target is still 10 ms (a steady window keeps it), and from
+        // it the target only grows: every later window is at least as long as
+        // `stretched_for_gaps(base, first)`, so the shortest later one set
+        // aside (for host stalls, or a stretch not yet enough; at most 15,
+        // above) is too. Unless a stall in that first window kept its stretch
+        // near 10 ms, that is never a 10 ms window again, nor one grown slower
+        // than the kernel's own stretch. Judged from the first window's own
+        // gaps, a host stall can't fail it; and a long window set aside last
+        // can't hide a short one before it.
         kassert!(cal.retaken >= 1);
         let first = first.ok_or("no window set aside")?;
-        let stretched = lumen_time::stretched_for_gaps(base, &first, base.saturating_mul(MOST_HPET_STRETCH));
-        crate::ktest::diag(format_args!("first set aside {first}, then shortest {shortest:?}; stretched to {stretched}"));
+        let most = base.saturating_mul(MOST_HPET_STRETCH);
+        let stretched = lumen_time::stretched_for_gaps(base, &first, most);
+        let shortest_text = shortest.map(|w| alloc::format!("{w}"));
+        crate::ktest::diag(format_args!(
+            "first set aside {first}, then shortest {}; stretched to {stretched}",
+            shortest_text.as_deref().unwrap_or("none")
+        ));
         if let Some(shortest) = shortest {
             kassert!(shortest.reference >= stretched);
         }
-        // Longer than 10 ms: every window is at least its target. (Not a
+        // Longer than 10 ms: every window is at least its target, and a kept
+        // one is steady, so at least 200 times its 200 µs end gap. (Not a
         // ceiling: a window ends at its first poll past the target, and a host
         // stall before that poll lengthens it.)
         kassert!(cal.windows.iter().all(|w| w.reference > base));
