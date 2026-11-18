@@ -391,7 +391,7 @@ impl WindowDrawn {
 
 /// The CPUs other than this one whose scheduler runs (where
 /// [`draw_bands`] puts its helper threads).
-pub fn other_cpus() -> Vec<usize> {
+fn other_cpus() -> Vec<usize> {
     let caller = arch::cpu_index();
     (0..MAX_CPUS).filter(|&c| c != caller && sched::running_on(c)).collect()
 }
@@ -402,7 +402,7 @@ pub fn other_cpus() -> Vec<usize> {
 /// the slot of a CPU whose thread couldn't be started (`no_thread` says
 /// which and why). `Err` if this thread can't block to join them (nothing
 /// drawn).
-pub fn draw_bands(bands: Vec<lumen_gfx::BandMut<'_>>, view: View, others: &[usize]) -> Result<WindowDrawn, SpawnError> {
+fn draw_bands(bands: Vec<lumen_gfx::BandMut<'_>>, view: View, others: &[usize]) -> Result<WindowDrawn, SpawnError> {
     use crate::sync::SpinLock;
     let start = crate::time::now_ns();
     let caller = arch::cpu_index();
@@ -470,7 +470,7 @@ pub fn open_mandelbrot_window() -> Result<u32, String> {
 /// Draw the set into `h`'s surface with this CPU and `others` and commit
 /// it; what the drawing did (`Err`: this thread can't block, nothing
 /// drawn).
-pub fn draw_window(h: &mut crate::desktop::WindowHandle, others: &[usize]) -> Result<WindowDrawn, SpawnError> {
+fn draw_window(h: &mut crate::desktop::WindowHandle, others: &[usize]) -> Result<WindowDrawn, SpawnError> {
     let s = h.surface_mut();
     let (view, bounds) = (View::fit(s.width() as usize, s.height() as usize, MAX_ITER), s.bounds());
     let drawn = draw_bands(s.bands_mut(BAND.get() as u32), view, others)?;
@@ -703,8 +703,7 @@ crate::ktest!(
         // the drawing's report warns about that CPU, once.
         use crate::{kassert, kassert_eq};
         let Some(missing) = (0..MAX_CPUS).find(|&c| !sched::running_on(c)) else {
-            crate::ktest::diag(format_args!("every CPU runs a scheduler: nothing to test"));
-            return Ok(());
+            return Err("every CPU runs a scheduler: no CPU to leave out");
         };
         let mut others = other_cpus();
         others.push(missing);

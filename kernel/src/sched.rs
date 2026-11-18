@@ -624,8 +624,8 @@ pub enum SpawnError {
     NotRunning,
     /// No stack for it.
     Stack(StackError),
-    /// [`run_sized`] on a thread that can't wait for another (an interrupt
-    /// handler, a lock held, interrupts off, the idle thread).
+    /// [`run_sized`] or [`scope`] on a thread that can't wait for another
+    /// (an interrupt handler, a lock held, interrupts off, the idle thread).
     CantWait,
 }
 
@@ -697,8 +697,9 @@ pub fn run_sized<'a>(name: &'static str, stack_size: u64, f: impl FnOnce() + Sen
 /// ([`run_sized`]'s argument applied to several threads): #157's Mandelbrot
 /// window lends each CPU a band of its surface. `Err(CantWait)` (and `f`
 /// unrun) if the calling thread can't block to join them. `f` must return
-/// where the caller can still block (the joins follow it): never with a
-/// lock guard it returns, or one it leaves held.
+/// where the caller can still block (the joins follow it): with a lock
+/// guard returned or left held, the join would panic. That is liveness, not
+/// a safety obligation (the joins are never skipped).
 pub fn scope<'env, R>(f: impl FnOnce(&Scope<'env>) -> R) -> Result<R, SpawnError> {
     // The SAFETY argument in `Scope::spawn_on` needs a panic to end the
     // kernel, not unwind past the joins.
@@ -2687,20 +2688,23 @@ crate::ktest!(
             scope(|s| {
                 for (k, &cpu) in cpus.iter().enumerate() {
                     let flag = &done[k];
-                    let _ = s.spawn_on(cpu, "scoped", move || {
+                    s.spawn_on(cpu, "scoped", move || {
                         if k == slow {
                             let _ = sleep(30_000_000);
                         }
                         flag.store(true, Ordering::Release);
-                    });
+                    })
+                    .map_err(|_| "spawn failed")?;
                 }
+                Ok::<(), &'static str>(())
             })
-            .map_err(|_| "this thread can block")?;
+            .map_err(|_| "this thread can block")??;
             for (k, flag) in done.iter().enumerate().take(cpus.len()) {
-                if !flag.load(Ordering::Acquire) {
+                let joined = flag.load(Ordering::Acquire);
+                if !joined {
                     crate::ktest::diag(format_args!("round {slow}: thread {k} not joined"));
                 }
-                kassert!(flag.load(Ordering::Acquire));
+                kassert!(joined);
             }
         }
         // Every scoped thread has exited. (Its record may still be listed:

@@ -3934,7 +3934,11 @@ meaning none (`kbd events`' mods) is an absent value, unquoted.
   above the row or message; `ui invoke: ran; window <id> closed`; `ui
   invoke: ran; node <n> is gone` (a launcher item's: the menu folds);
   `ui invoke: window <id> is minimized already` and `... isn't
-  minimized` (#157); `ui invoke: window <id> busy (try
+  minimized` and `ui invoke: window <id> is the taskbar` (#157); `ui
+  invoke: <why>` (an action that failed: a launcher item's, `<item>:
+  <why>`, or a press on a just-closed window's button, `window <id>
+  closed`, #157); `ui invoke: not shown: it doesn't fit` (a hidden node,
+  #157); `ui invoke: window <id> busy (try
   again)`; `ui invoke: window <id> closed` (a widget's window closed as
   it was asked); `ui invoke: no node <n>` (none, or its window closed,
   from the asker or the owner); `ui invoke: no desktop`; `ui invoke:
@@ -4059,7 +4063,7 @@ close, and the demos in windows of their own. All of it is built with
   the compositor, printing the root's row; `ui invoke: window <id> is
   minimized already` and `ui invoke: window <id> isn't minimized` when
   there is nothing to do). A minimized window's commits queue no damage
-  (Life runs on, presenting nothing).
+  (Life presents nothing while minimized).
 - **`lumen-ui` for the shell:** `Stack`, the handle stacks are (only a
   stack takes children); `Ui::remove` (a widget and all in it; its node
   ids name nothing after, focus and a press on it dropped, what it covered

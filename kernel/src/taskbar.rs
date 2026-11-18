@@ -22,7 +22,6 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use lumen_gfx::Rect;
 use lumen_ui::{App, Stack, Text, Then, Ui, UiEvent, Widget};
 
 use crate::desktop::{self, Animating, Wait, WindowEvent, WindowHandle};
@@ -47,11 +46,10 @@ const WAKE_DELAY_MAX_MS: u64 = 5000;
 /// `desktop tick`: move the clock ahead by a minute from now on, and wake
 /// the taskbar to show it; whether there is a taskbar (else nothing moves).
 pub fn tick() -> bool {
-    if !desktop::has_taskbar() {
-        return false;
-    }
+    let Some(taskbar) = desktop::taskbar() else { return false };
     SKEW_MINUTES.fetch_add(1, Ordering::Relaxed);
-    desktop::wake_taskbar()
+    taskbar.wake();
+    true
 }
 
 /// `lumen.taskbar_wake_delay_ms=<ms>`, for the scenarios (0 without it):
@@ -59,12 +57,7 @@ pub fn tick() -> bool {
 /// line, so a test can tell the launcher's own sync from the poke's.
 fn wake_delay_ms() -> u64 {
     const KEY: &str = "lumen.taskbar_wake_delay_ms";
-    let Some(v) = crate::cmdline::value(KEY) else { return 0 };
-    let Ok(ms) = v.parse::<u64>() else {
-        log::warn!(target: "taskbar", "{KEY}={v}: not a number of milliseconds, ignored");
-        return 0;
-    };
-    let ms = ms.min(WAKE_DELAY_MAX_MS);
+    let ms = crate::cmdline::millis(KEY, WAKE_DELAY_MAX_MS);
     if ms > 0 {
         log::info!(target: "taskbar", "waiting {ms} ms after each poke ({KEY})");
     }
@@ -99,7 +92,13 @@ impl Clock {
             }
             Err(e) => {
                 if self.failures == 0 {
-                    log::warn!(target: "taskbar", "the clock can't read the RTC ({e}); it keeps its last reading");
+                    match self.last {
+                        Some(_) => log::warn!(
+                            target: "taskbar",
+                            "the clock can't read the RTC ({e}); it keeps its last reading for now"
+                        ),
+                        None => log::warn!(target: "taskbar", "the clock can't read the RTC ({e}); it shows --:--"),
+                    }
                 }
                 self.failures = self.failures.saturating_add(1);
                 match &self.last {
@@ -206,6 +205,7 @@ impl App for Taskbar {
                         if desktop::focus_window(id).is_none() {
                             log::debug!(target: "taskbar", "window {id} closed before its button's press");
                             self.sync();
+                            return Then::Failed(format!("window {id} closed"));
                         }
                     }
                 }
@@ -218,16 +218,16 @@ impl App for Taskbar {
 }
 
 /// Open the taskbar along the bottom of the live desktop and start its
-/// owner (the desktop's first start, after the demo windows).
+/// owner (`desktop::ensure_taskbar`, at each `desktop` start that finds
+/// none: the first, after its demo windows).
 pub fn open() -> Result<u32, String> {
-    let (sw, _) = desktop::screen_size().ok_or("no desktop")?;
     let mut text = crate::font::Text::new().map_err(|e| format!("no font: {e}"))?;
     // As high as a button with `PAD` above and below; the clock as wide as
     // its widest time.
     let height = lumen_ui::ui::button_height(Text::line_height(&text)) + 2 * PAD;
     let clock_width = (0..10).map(|d| Text::width(&mut text, &format!("{d}{d}:{d}{d}"))).max().unwrap_or(0) + 4;
-    let handle = desktop::open_panel("Taskbar", height).map_err(|e| format!("no window: {e}"))?;
-    let area = Rect::new(0, 0, sw, height);
+    let mut handle = desktop::open_panel("Taskbar", height).map_err(|e| format!("no window: {e}"))?;
+    let area = handle.surface_mut().bounds();
     let tk = Toolkit::with_palette(Taskbar::new(clock_width), area, handle.theme(), crate::ui::taskbar_palette)?;
     let id = handle.id();
     let _detached = crate::sched::spawn("taskbar", move || owner(handle, tk)).map_err(|e| format!("no thread: {e}"))?;

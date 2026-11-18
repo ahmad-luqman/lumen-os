@@ -40,6 +40,19 @@ pub fn value(key: &str) -> Option<&'static str> {
     value_in(get(), key)
 }
 
+/// `key=<ms>`, a number of milliseconds for a scenario's knob, at most
+/// `max`: 0 without it, or (warned about) when it isn't a number.
+pub fn millis(key: &str, max: u64) -> u64 {
+    let Some(v) = value(key) else { return 0 };
+    match v.parse::<u64>() {
+        Ok(ms) => ms.min(max),
+        Err(_) => {
+            log::warn!(target: "cmdline", "{key}={v}: not a number of milliseconds, ignored");
+            0
+        }
+    }
+}
+
 /// Whether the kernel may end QEMU through `isa-debug-exit`.
 pub fn qemu_exit_enabled() -> bool {
     has_flag("lumen.qemu_exit")

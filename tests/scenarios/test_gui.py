@@ -106,7 +106,7 @@ def wallpaper_rgb(x: int, y: int) -> tuple[int, int, int]:
     return pixel(WALLPAPER, x, y)
 
 
-# A `windows` row's frame: x, y, w, h.
+# A row's bounds (a `windows` row's frame): x, y, w, h.
 frame_of = gui.bounds
 
 
@@ -1410,11 +1410,11 @@ def test_mandelbrot_window_golden(boot, artifacts, golden_dir):
 
 
 def test_life_window_runs_unfocused_and_stops_when_closed(boot):
-    # The launcher's Life: it steps ten times a second (an animating wait:
-    # the desktop never settles), and keeps stepping when another window
-    # takes the focus (its client area changes between screendumps);
-    # minimized it still runs but presents nothing; its close ends its
-    # owner, and the desktop settles again.
+    # The launcher's Life: it keeps stepping (an animating wait: the desktop
+    # never settles), also when another window takes the focus (its client
+    # area changes between screendumps); minimized it presents nothing (its
+    # thread still there); its close ends its owner, and the desktop
+    # settles again.
     m = boot_tablet(boot)
     gui.start_desktop(m)
     launch(m, "Life")
@@ -1515,22 +1515,24 @@ def test_a_window_opened_from_the_shell_gets_a_taskbar_button(boot):
 
 
 def test_a_launch_while_paused_is_refused(boot):
-    # The launcher unfolded, then Alt+F1: `press` on its Mandelbrot item is
-    # refused as `terminal` is while the desktop is paused, `ui invoke`
-    # saying why and failing, and no window opens.
+    # Alt+F1, then each launcher item in turn (the launcher unfolded first
+    # each time: choosing one folds it): `press` is refused as `terminal`
+    # is while the desktop is paused, `ui invoke` saying why, and no window
+    # opens.
     m = boot_tablet(boot)
     gui.start_desktop(m)
-    launcher = gui.node(gui.taskbar(m), "menu", "Launcher")
-    assert gui.invoke(m, launcher["id"], "press").row is not None
-    entry = gui.node(gui.taskbar(m), "menuitem", "Mandelbrot")
     gui.confirmed_keys(m, ["alt", "f1"])
     gui.wait_desktop_state(m, "paused")
-    warn = r"WARN  taskbar: Mandelbrot: desktop: paused"
-    got = gui.invoke(m, entry["id"], "press", allow=warn)
-    assert got.message == "ui invoke: Mandelbrot: desktop: paused (`desktop` resumes it)", got
+    for item in LAUNCHER_ITEMS:
+        launcher = gui.node(gui.taskbar(m), "menu", "Launcher")
+        assert gui.invoke(m, launcher["id"], "press").row is not None
+        entry = gui.node(gui.taskbar(m), "menuitem", item)
+        warn = rf"WARN  taskbar: {item}: desktop: paused"
+        got = gui.invoke(m, entry["id"], "press", allow=warn)
+        assert got.message == f"ui invoke: {item}: desktop: paused (`desktop` resumes it)", got
     assert [w["title"] for w in gui.windows(m)] == ["Colours", "Welcome"]
     assert run(m, "desktop", 30) == "desktop: resumed\n"
-    assert "Mandelbrot" not in taskbar_buttons(m)
+    assert taskbar_buttons(m) == ["Welcome", "Colours"]
 
 
 def test_the_launcher_answers_with_the_new_window_s_button(boot):
@@ -1540,5 +1542,7 @@ def test_the_launcher_answers_with_the_new_window_s_button(boot):
     # brings the buttons in line itself before it answers, not the poke.
     m = boot_tablet(boot, cmdline="lumen.taskbar_wake_delay_ms=2000")
     gui.start_desktop(m)
+    said = "INFO  taskbar: waiting 2000 ms after each poke (lumen.taskbar_wake_delay_ms)"
+    assert said in m.output, "the knob wasn't taken"
     launch(m, "Counter")
     assert taskbar_buttons(m) == ["Welcome", "Colours", "Counter"]

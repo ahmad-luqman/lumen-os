@@ -671,8 +671,7 @@ impl State {
     /// released.
     fn list_changed(&mut self, after: &mut After) {
         let Some(t) = &self.taskbar else { return };
-        // Found on the list, not upgraded: no reference to drop here.
-        if let Some(win) = self.windows.iter().find(|w| core::ptr::eq(t.0.as_ptr(), Arc::as_ptr(w))) {
+        if let Some(win) = self.windows.iter().find(|w| t.wakes(w)) {
             win.poked.store(true, Ordering::Release);
         }
         after.taskbar = Some(t.clone());
@@ -965,6 +964,12 @@ impl Waker {
         }
     }
 
+    /// Whether this wakes `win`'s owner: compared by pointer, never
+    /// upgraded (so no reference is made, or dropped, under a lock).
+    fn wakes(&self, win: &Arc<Window>) -> bool {
+        core::ptr::eq(self.0.as_ptr(), Arc::as_ptr(win))
+    }
+
     /// End the owner's wait, `poked` already set (by `State::list_changed`,
     /// under the desktop's lock).
     fn wake_only(&self) {
@@ -1207,7 +1212,7 @@ impl Drop for WindowHandle {
             if let Some(out) = s.wm.close(self.win.id) {
                 s.apply(out, &mut after);
             }
-            if s.taskbar.as_ref().is_some_and(|t| core::ptr::eq(t.0.as_ptr(), Arc::as_ptr(&self.win))) {
+            if s.taskbar.as_ref().is_some_and(|t| t.wakes(&self.win)) {
                 s.taskbar = None;
             }
             s.list_changed(&mut after);
@@ -1396,12 +1401,7 @@ const CUT_DELAY_MAX_MS: u64 = 2000;
 /// [`CUT_DELAY_MAX_MS`] capped.
 fn cut_delay_ms() -> u64 {
     const KEY: &str = "lumen.desktop_cut_delay_ms";
-    let Some(v) = crate::cmdline::value(KEY) else { return 0 };
-    let Ok(ms) = v.parse::<u64>() else {
-        log::warn!(target: "desktop", "{KEY}={v}: not a number of milliseconds, ignored");
-        return 0;
-    };
-    let ms = ms.min(CUT_DELAY_MAX_MS);
+    let ms = crate::cmdline::millis(KEY, CUT_DELAY_MAX_MS);
     if ms > 0 {
         log::info!(target: "desktop", "waiting {ms} ms between reading input and the cut ({KEY})");
     }
@@ -1859,6 +1859,11 @@ pub fn start() -> Result<Shown, Refused> {
     }
     let started = started();
     let result = if started { resume() } else { first_start() };
+    if result.is_ok() {
+        // Each start (the first, after its demo windows; a resume; one that
+        // found it shown) opens the taskbar if there is none.
+        ensure_taskbar();
+    }
     START_BUSY.store(false, Ordering::Release);
     result.map_err(|why| Refused { resuming: started, why })
 }
@@ -1971,7 +1976,6 @@ fn first_start() -> Result<Shown, StartError> {
             drop(thread);
             wake();
             open_demo_windows();
-            ensure_taskbar();
             log::info!(target: "desktop", "started on {w}x{h}");
             Ok(Shown::Now)
         }
@@ -1991,7 +1995,6 @@ fn first_start() -> Result<Shown, StartError> {
 /// `desktop` while started: resume it if paused.
 fn resume() -> Result<Shown, StartError> {
     if vt::desktop_shown() {
-        ensure_taskbar();
         return Ok(Shown::Already);
     }
     // The compositor acts on the pause before this resume writes the next
@@ -2012,7 +2015,6 @@ fn resume() -> Result<Shown, StartError> {
         s.screen = Some(screen);
     }
     wake();
-    ensure_taskbar();
     Ok(Shown::Resumed)
 }
 
@@ -2261,27 +2263,15 @@ pub fn open_panel(title: &str, rows: u32) -> Result<WindowHandle, OpenError> {
     Desktop::LIVE.open_panel(title, rows)
 }
 
-/// The live desktop's screen size, once it exists.
-pub fn screen_size() -> Option<(u32, u32)> {
-    COMPOSITOR.lock().as_ref().map(|s| (s.width, s.height))
-}
-
-/// Poke the taskbar's owner (`desktop tick`: its clock moved); whether
-/// there is one.
-pub fn wake_taskbar() -> bool {
-    let taskbar = COMPOSITOR.lock().as_ref().and_then(|s| s.taskbar.clone());
-    taskbar.map(|t| t.wake()).is_some()
-}
-
-/// Whether the live desktop has its taskbar.
-pub fn has_taskbar() -> bool {
-    COMPOSITOR.lock().as_ref().is_some_and(|s| s.taskbar.is_some())
+/// The live desktop's taskbar owner's [`Waker`], if it has a taskbar.
+pub fn taskbar() -> Option<Waker> {
+    COMPOSITOR.lock().as_ref().and_then(|s| s.taskbar.clone())
 }
 
 /// Open the taskbar if the desktop has none (each start: the first, and a
 /// resume after a first that couldn't), warning if it can't.
 fn ensure_taskbar() {
-    if has_taskbar() {
+    if taskbar().is_some() {
         return;
     }
     if let Err(e) = crate::taskbar::open() {
