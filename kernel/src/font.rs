@@ -1,10 +1,10 @@
 //! The desktop's anti-aliased text (`lumen-font`, #148) in the kernel: the
-//! UI font, parsed once and shared ([`face`]); the desktop's titles and
-//! windows draw with it (each thread its own glyph cache: `crate::desktop`,
-//! #154). Here it also renders the golden sample for the shell's `font` and
-//! its ktest, which show how long `fontdue`'s soft-float parsing and
-//! rasterizing take and that the kernel's mask hashes to the host golden's
-//! value.
+//! UI font, parsed once and shared ([`face`]), and [`Text`], one drawing
+//! thread's glyph cache over it, which the desktop's titles and windows
+//! draw with (#154). Here it also renders the golden sample for the
+//! shell's `font` and its ktest, which show how long `fontdue`'s soft-float
+//! parsing and rasterizing take and that the kernel's mask hashes to the
+//! host golden's value.
 
 use crate::shell::Ctx;
 use crate::time;
@@ -24,10 +24,7 @@ const CACHE_BYTES: usize = 256 * 1024;
 /// The widest line the sample's mask may take.
 const MAX_WIDTH: u32 = 4096;
 
-const PX: Px = match Px::new(sample::PX) {
-    Some(px) => px,
-    None => panic!("the sample's size is out of range"),
-};
+const PX: Px = px(sample::PX);
 
 /// The parsed UI font and how long parsing it took. Only [`face`] makes
 /// one.
@@ -139,16 +136,16 @@ pub struct Text {
 
 impl Text {
     /// A glyph cache over the UI font (parsed on first use: call it from a
-    /// thread), or `None` if the font didn't load (one warning a boot: then
-    /// no text is drawn).
-    pub fn new() -> Option<Text> {
+    /// thread), or why the font didn't load (warned about once a boot: then
+    /// the caller draws no text).
+    pub fn new() -> Result<Text, lumen_font::Error> {
         match face() {
-            Ok(loaded) => Some(Text { font: Font::new(loaded.face(), TEXT_CACHE_BYTES) }),
+            Ok(loaded) => Ok(Text { font: Font::new(loaded.face(), TEXT_CACHE_BYTES) }),
             Err(e) => {
                 if !NO_FONT_SAID.swap(true, Ordering::Relaxed) {
                     log::warn!(target: "desktop", "no text: the UI font didn't load: {e}");
                 }
-                None
+                Err(e)
             }
         }
     }
@@ -177,16 +174,17 @@ impl Text {
     }
 
     /// `text`'s advance width at `px`, from the metrics alone (nothing
-    /// rasterized).
-    #[allow(dead_code, reason = "its first users are #156's widgets, laying out their labels")]
+    /// rasterized): where [`Text::draw`]'s ink ends, give or take a glyph's
+    /// side bearing.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "its first users are #156's widgets"))]
     pub fn measure(&self, text: &str, px: Px) -> u32 {
         self.font.face().measure(text, px).width
     }
 
     /// A line's height at `px`: the face's ascent and descent.
-    pub fn line_height(&self, px: Px) -> i32 {
+    pub fn line_height(&self, px: Px) -> u32 {
         let m = self.font.face().line_metrics(px);
-        m.ascent + m.descent
+        u32::try_from(m.ascent + m.descent).unwrap_or(0)
     }
 
     /// The glyph cache's counters (`misses`: glyphs rasterized).
@@ -399,6 +397,29 @@ crate::ktest!(
         let text = run(&both);
         kassert!(text.ends_with(&alloc::format!("\n{DIFFERS}{NOT_GOLDEN}")));
         kassert_eq!(text.lines().count(), 5);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn text_ends_where_measure_says() {
+        // A line drawn with `Text::draw` (glyph by glyph, clipped) has its
+        // ink from where it starts to about its measured width: past it by
+        // no more than a side bearing, short of it by no more than one.
+        use crate::kassert;
+        let mut text = Text::new().map_err(|_| "no UI font")?;
+        let mut s = Surface::with_stride(400, 40, 400).ok_or("no memory")?;
+        let (x, line) = (10, "Lumen: measure me");
+        let all = s.bounds();
+        text.draw(&mut s, x, 4, line, TEXT_PX, 0x00ff_ffff, all);
+        let width = i32::try_from(text.measure(line, TEXT_PX)).map_err(|_| "too wide")?;
+        let inked = |col: u32| (0..40).any(|y| s.row(y)[col as usize] != 0);
+        let left = (0..400).find(|&c| inked(c)).ok_or("nothing drawn")? as i32;
+        let right = (0..400).rev().find(|&c| inked(c)).ok_or("nothing drawn")? as i32 + 1;
+        crate::ktest::diag(format_args!("measured {width}, ink {left}..{right}"));
+        kassert!(left >= x && left <= x + 2);
+        kassert!(right <= x + width + 2 && right >= x + width - 3);
+        kassert!(text.line_height(TEXT_PX) >= 16);
         Ok(())
     }
 );

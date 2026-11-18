@@ -404,10 +404,14 @@ def test_presents_match_a_full_repaint(boot):
     gui.wait_settled(m)
     assert gui.window(m, "Colours")["focused"] == "yes"
     assert gui.desktop_check(m) == (0, 0), "after a close"
+    # The titles' glyphs are cached: a switch (new colours, the same
+    # glyphs) rasterizes none, and no glyph is ever dropped.
+    misses = gui.desktop_status(m)["glyph_misses"]
     for name in ("dark", "light"):
         assert run(m, f"theme {name}") == f"theme: {name}\n"
-        gui.wait_settled(m)
-        assert gui.desktop_status(m)["theme"] == name
+        status = gui.wait_settled(m)
+        assert status["theme"] == name
+        assert (status["glyph_misses"], status["glyphs_dropped"]) == (misses, "0"), status
         assert gui.desktop_check(m) == (0, 0), f"after the switch to {name}"
 
 
@@ -577,6 +581,7 @@ def test_png_wallpaper_golden(boot, artifacts):
     close_window(m, "Welcome")
     gui.wait_windows(m, 0)
     gui.pointer_move(m, 1279, 799)
+    assert gui.desktop_status(m)["wallpaper"] == "shown"
     shot = gui.settled_screendump(m, "wallpaper.png")
     with Image.open(shot) as dumped, Image.open(WALLPAPER) as wallpaper:
         actual, want = dumped.convert("RGB"), wallpaper.convert("RGB")
@@ -592,7 +597,7 @@ def test_png_wallpaper_golden(boot, artifacts):
     assert gui.desktop_check(m) == (0, 0)
 
 
-def typed_before_the_switch(m: Machine) -> None:
+def type_x_into_colours(m: Machine) -> None:
     """Type `x` into the focused (Colours) window, which shows it as its
     last key."""
     gui.type_confirmed(m, "x")
@@ -608,7 +613,7 @@ def test_dark_theme_golden(boot, artifacts, golden_dir):
     # is refused.
     m = boot_shells(boot)
     gui.start_desktop(m)
-    typed_before_the_switch(m)
+    type_x_into_colours(m)
     assert run(m, "theme") == "theme: light\n"
     assert run(m, "theme dark") == "theme: dark\n"
     assert run(m, "theme dark") == "theme: dark (already)\n"
@@ -631,7 +636,7 @@ def test_theme_boot_flag_picks_dark(boot, artifacts, golden_dir):
     assert run(m, "theme") == "theme: dark\n"
     assert gui.desktop_status(m)["theme"] == "dark"
     gui.start_desktop(m)
-    typed_before_the_switch(m)
+    type_x_into_colours(m)
     shot = gui.settled_screendump(m, "dark-at-boot.png")
     assert_matches_golden(
         shot, golden_dir / "desktop-dark.png", origin=(0, 0), size=(1280, 800), artifacts=artifacts
@@ -639,7 +644,7 @@ def test_theme_boot_flag_picks_dark(boot, artifacts, golden_dir):
 
 
 def test_a_theme_boot_flag_naming_no_theme_warns(boot):
-    # `lumen.theme=` with a name that isn't a theme: one warning, and the
+    # `lumen.theme=` with a name that isn't a theme: a warning, and the
     # theme stays light.
     m = boot("qemutest", cmdline="lumen.theme=blue")
     m.expect(r"WARN  desktop: lumen.theme=blue: not a theme \(light, dark\), ignored\n", 60)
