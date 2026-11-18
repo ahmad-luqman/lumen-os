@@ -177,10 +177,10 @@ impl Calibration {
     /// Whether every kept window is steady (`lumen_time::steadiest_windows`
     /// takes windows until [`WINDOWS`] are steady or the attempts run out),
     /// or it ran out of [`ATTEMPTS`] and the least unsteady filled in. A
-    /// loaded host can make every window of a run unsteady (#158's audit:
-    /// at load up to 9, slow PIT reads left each gap of every window at
-    /// 0.25% to 0.97%, so after 20 windows the least unsteady filled in, in
-    /// 22 of 40 boots), so which of the two a run took is the host's; that
+    /// loaded host can make nearly every window of a run unsteady (#158's
+    /// audit: at load up to 9, slow PIT reads left each window's gaps at
+    /// 0.25% to 0.97%, 0 to 2 of 20 steady, so the least unsteady filled
+    /// in, in 22 of 40 boots), so which of the two a run took is the host's; that
     /// it is one of them is the code's. True by construction for what
     /// `calibrate` returns: on a real calibration it checks the plumbing
     /// (`retaken` copied right), and the made-up cases in
@@ -1254,18 +1254,17 @@ fn now_ns_between(earlier: &HpetReading, later: &HpetReading, tag: &str) -> Resu
     })
 }
 
-/// `now_ns_follows_the_hpet` across a spin of `ns` (500 ms in the real
-/// check and in `one_stalled_reading_at_each_end_still_passes`, whose 2% is
-/// the 10 ms budget the bracket limit is a tenth of;
+/// `now_ns_follows_the_hpet` across a spin of `ns` (500 ms in the real check
+/// and in `one_stalled_reading_at_each_end_still_passes`, whose 2% is the
+/// 10 ms budget the bracket limit is a tenth of;
 /// `every_stalled_hpet_bracket_is_a_failure` spins 1 ms): each end a narrow
-/// HPET reading placed at
-/// the midpoint of the `now_ns` readings around it, so a stall between the
-/// two clocks' reads shows as a wide bracket (taken again, see
-/// [`HPET_BRACKET_TRIES`] and [`RETRY_SPACING_NS`]) instead of skewing the
-/// interval. `pause` runs
-/// inside every bracket (see [`hpet_between_now_ns`]; a no-op but in tests),
-/// and `tag` starts every diag ([`INJECTED`] in the injected-pause tests).
-/// The ends' readings on a pass.
+/// HPET reading placed at the midpoint of the `now_ns` readings around it, so
+/// a stall between the two clocks' reads shows as a wide bracket (taken
+/// again, see [`HPET_BRACKET_TRIES`] and [`RETRY_SPACING_NS`]) instead of
+/// skewing the interval. `pause` runs inside every bracket (see
+/// [`hpet_between_now_ns`]; a no-op but in tests), and `tag` starts every
+/// diag ([`INJECTED`] in the injected-pause tests). The ends' readings on a
+/// pass.
 #[cfg(feature = "ktest")]
 fn now_ns_against_the_hpet(
     hpet: &HpetCounter,
@@ -1342,7 +1341,7 @@ fn timer_between_hpet(hpet: &HpetCounter, mut pause: impl FnMut()) -> lumen_time
 }
 
 crate::ktest!(
-    fn tsc_calibrated_within_tolerance() {
+    fn the_tsc_agrees_with_the_pit() {
         // Cross-check against the PIT, a different clock from the HPET the
         // boot calibrated against (the ktest machine has one): within 2%, or
         // what the two calibrations' bounds allow if more (stalled windows
@@ -1352,8 +1351,8 @@ crate::ktest!(
         // host's slow PIT reads can leave every try past 1%: #158's audit),
         // and the check is then only as tight as its bound says, which the
         // diag shows. An allowance (its bound and the boot's) of
-        // CANT_TELL_PPM or more fails: it would prove nothing.
-        use crate::kassert;
+        // CANT_TELL_PPM or more fails, past the 2% floor: it would prove
+        // nothing. Each outcome says which (`pit_agrees`).
         const PIT_TRIES: usize = 4;
         let hz = tsc().ok_or("TSC not calibrated")?.hz();
         if reference() != Some(Reference::Hpet) {
@@ -1380,29 +1379,48 @@ crate::ktest!(
             "bounds: boot {boot_ppm} ppm, pit {pit_ppm} ppm{}",
             if pit_ppm > lumen_time::TSC_TOLERANCE_PPM { " (no try within 1%: judged by the narrowest)" } else { "" }
         ));
-        kassert!(pit_agrees(pit.hz, pit_ppm, hz, boot_ppm));
+        if let Err(why) = pit_agrees(pit.hz, pit_ppm, hz, boot_ppm) {
+            crate::ktest::diag(format_args!(
+                "{why}: the pit {} Hz, the boot {hz} Hz, {} ppm apart; bounds adding up to {} ppm (cap \
+                 {CANT_TELL_PPM})",
+                pit.hz,
+                u128::from(pit.hz.abs_diff(hz)) * 1_000_000 / u128::from(hz.max(1)),
+                boot_ppm.saturating_add(pit_ppm)
+            ));
+            return Err(why);
+        }
         Ok(())
     }
 );
 
-/// The least a cross-check's allowance (two measurements' bounds added up)
-/// that can't tell a right rate from a wrong one: 10%. The PIT-window ktests
-/// catch rates 20% off, and #45's boot calibration was 11.8% high
-/// (test_acpi): an allowance under 10% still tells those apart.
+/// The least two measurements' bounds may add up to before a cross-check on
+/// them tells nothing: 9% (and one bound past it alone, the same). #45's
+/// boot calibration was 11.8% high (test_acpi), and `within_bounds` lets
+/// two rates differ by the bounds' sum of the larger over one less the wider
+/// bound: under 9.5% that refuses 11.8% whichever side is high, so 9%
+/// leaves room. (`lumen_harness.calibration.CANT_TELL_PPM` copies it.)
 #[cfg(feature = "ktest")]
-const CANT_TELL_PPM: u64 = 100_000;
-// Pinned: first_judgeable's message says "10%".
+const CANT_TELL_PPM: u64 = 90_000;
+// Pinned: first_judgeable's message says "9%".
 #[cfg(feature = "ktest")]
-const _: () = assert!(CANT_TELL_PPM == 100_000);
+const _: () = assert!(CANT_TELL_PPM == 90_000);
 
-/// Whether a PIT re-measurement of `pit_hz` (its bound `pit_ppm`) agrees
-/// with the TSC's boot `hz` (its bound `boot_ppm`): within
-/// [`PIT_CROSS_CHECK_FLOOR_PPM`], or their bounds where wider, as long as
-/// those add up to under [`CANT_TELL_PPM`] (more tells nothing).
+/// Whether a PIT re-measurement of `pit_hz` (its bound `pit_ppm`; each rate
+/// paired with its own bound, unlike `within_bounds`) agrees with the TSC's
+/// boot `hz` (its bound `boot_ppm`): within [`PIT_CROSS_CHECK_FLOOR_PPM`],
+/// whatever the bounds; else within their bounds, if those add up to under
+/// [`CANT_TELL_PPM`] (more would tell nothing). Why not, if not.
 #[cfg(feature = "ktest")]
-fn pit_agrees(pit_hz: u64, pit_ppm: u64, hz: u64, boot_ppm: u64) -> bool {
-    boot_ppm.saturating_add(pit_ppm) < CANT_TELL_PPM
-        && lumen_time::within_bounds(pit_hz, hz, pit_ppm, boot_ppm, PIT_CROSS_CHECK_FLOOR_PPM)
+fn pit_agrees(pit_hz: u64, pit_ppm: u64, hz: u64, boot_ppm: u64) -> Result<(), &'static str> {
+    if lumen_time::within_bounds(pit_hz, hz, 0, 0, PIT_CROSS_CHECK_FLOOR_PPM) {
+        Ok(())
+    } else if boot_ppm.saturating_add(pit_ppm) >= CANT_TELL_PPM {
+        Err("the PIT and boot bounds are too wide to tell the rates apart")
+    } else if lumen_time::within_bounds(pit_hz, hz, pit_ppm, boot_ppm, 0) {
+        Ok(())
+    } else {
+        Err("the PIT re-measurement and the boot calibration disagree")
+    }
 }
 
 /// The first of up to `tries` calibrations from `measure` (`space` called
@@ -1437,7 +1455,7 @@ fn first_judgeable(
     }
     match narrowest {
         Some(cal) if cal.median_bound_ppm() < CANT_TELL_PPM => Ok(cal),
-        Some(_) => Err("the PIT re-measurement couldn't be judged: no try under 10%"),
+        Some(_) => Err("the PIT re-measurement couldn't be judged: no try under 9%"),
         None => Err("the PIT re-measurement couldn't be judged: every try failed"),
     }
 }
@@ -1477,18 +1495,26 @@ crate::ktest!(
         kassert_eq!(run(&[Err(CalError::NoCount), Ok(wide), Ok(fine), Ok(wide)]), (Ok(fine), 3, 2));
         kassert_eq!(run(&[Ok(wider), Ok(wide), Ok(useless), Ok(wider)]), (Ok(wide), 4, 3));
         let none = run(&[Ok(useless), Err(CalError::NoCount), Ok(useless), Ok(useless)]);
-        kassert_eq!(none, (Err("the PIT re-measurement couldn't be judged: no try under 10%"), 4, 3));
+        kassert_eq!(none, (Err("the PIT re-measurement couldn't be judged: no try under 9%"), 4, 3));
         let failing = run(&[Err(CalError::NoCount); 4]);
         kassert_eq!(failing, (Err("the PIT re-measurement couldn't be judged: every try failed"), 4, 3));
-        // Then the agreement: 2% apart passes on the floor; 4% on bounds of
-        // 5%; #45's 11.8% fails on bounds adding up to 10% or more, which
-        // would allow it.
+        // Then the agreement (pit, its bound, boot, its bound).
+        const WIDE: Result<(), &str> = Err("the PIT and boot bounds are too wide to tell the rates apart");
+        const APART: Result<(), &str> = Err("the PIT re-measurement and the boot calibration disagree");
         let hz = 1_000_000_000;
-        kassert!(pit_agrees(1_020_000_000, 1_000, hz, 1_000));
-        kassert!(!pit_agrees(1_021_000_000, 1_000, hz, 1_000));
-        kassert!(pit_agrees(1_040_000_000, 30_000, hz, 20_000));
-        kassert!(!pit_agrees(1_118_000_000, 90_000, hz, 30_000));
-        kassert!(!pit_agrees(hz, 60_000, hz, 40_000));
+        // Within 2%: whatever the bounds.
+        kassert_eq!(pit_agrees(1_020_000_000, 1_000, hz, 1_000), Ok(()));
+        kassert_eq!(pit_agrees(hz, 60_000, hz, 40_000), Ok(()));
+        kassert_eq!(pit_agrees(1_021_000_000, 1_000, hz, 1_000), APART);
+        // Past it: within the bounds (each its own), under the cap.
+        kassert_eq!(pit_agrees(1_040_000_000, 30_000, hz, 20_000), Ok(()));
+        kassert_eq!(pit_agrees(1_049_000_000, 30_000, hz, 20_000), Ok(()));
+        kassert_eq!(pit_agrees(1_060_000_000, 30_000, hz, 20_000), APART);
+        kassert_eq!(pit_agrees(1_080_000_000, 60_000, hz, 25_000), Ok(()));
+        kassert_eq!(pit_agrees(1_030_000_000, 60_000, hz, 30_000), WIDE);
+        // #45's 11.8%, with bounds just under the cap, either side high.
+        kassert_eq!(pit_agrees(1_118_000_000, 60_000, hz, 29_000), APART);
+        kassert_eq!(pit_agrees(hz, 1_000, 1_118_000_000, 88_000), APART);
         Ok(())
     }
 );
@@ -1739,6 +1765,7 @@ crate::ktest!(
         kassert!(kept(3, 17).steady_or_out_of_attempts());
         kassert!(!kept(4, 1).steady_or_out_of_attempts());
         kassert!(!kept(4, 15).steady_or_out_of_attempts());
+        kassert!(!kept(4, 17).steady_or_out_of_attempts()); // past ATTEMPTS: never
         Ok(())
     }
 );
@@ -1842,14 +1869,15 @@ crate::ktest!(
         // Taken again at least once: a 10 ms window is almost never steady
         // with 200 µs reads (a host stall outside its gaps can make one so,
         // and it is kept: the target stays 10 ms). Until the first window set
-        // aside the target is still 10 ms (a steady window keeps it), and from
-        // it the target only grows: every later window is at least as long as
-        // `stretched_for_gaps(base, first)`, so the shortest later one set
-        // aside (for host stalls, or a stretch not yet enough) is too. Unless a stall in that first window kept its stretch
-        // near 10 ms, that is never a 10 ms window again, nor one grown slower
-        // than the kernel's own stretch. Judged from the first window's own
-        // gaps, a host stall can't fail it; and a long window set aside last
-        // can't hide a short one before it.
+        // aside the target is still 10 ms (a steady window keeps it), and
+        // from it the target only grows: every later window is at least as
+        // long as `stretched_for_gaps(base, first)`, so the shortest later
+        // one set aside (for host stalls, or a stretch not yet enough) is
+        // too. Unless a stall in that first window kept its stretch near
+        // 10 ms, that is never a 10 ms window again, nor one grown slower than
+        // the kernel's own stretch. Judged from the first window's own gaps,
+        // a host stall can't fail it; and a long window set aside last can't
+        // hide a short one before it.
         kassert!(cal.retaken >= 1);
         let first = first.ok_or("no window set aside")?;
         let most = base.saturating_mul(MOST_HPET_STRETCH);
@@ -2739,26 +2767,27 @@ crate::ktest!(
         // Measured with the HPET and the tick count, not the TSC that
         // `sleep` itself waits on. The HPET readings aren't bracketed (#117):
         // they come before and after the sleep, so a stall next to either
-        // only lengthens the interval, which is why there is no upper bound
-        // (a host decides how long a stall is); the tick count is only
-        // checked to have moved.
+        // only lengthens the interval: no upper bound on it (a host decides
+        // how long a stall is). Its floor is 10 ms less the boot TSC
+        // calibration's bound (at least 1%): the TSC was calibrated against
+        // this HPET, and a boot past 1% warned. The ticks counted have an
+        // upper bound a stall can't break: a sleep wakes on the first tick
+        // past its deadline, the 11th of 10 ms (then read before the HPET,
+        // so its slow read isn't counted), and a stall merges ticks rather
+        // than adding any; allowing one more each for a tick between the
+        // `ticks()` read and the deadline's, a stall there, and a timer up
+        // to 2% fast: 14. A sleep waiting twice as long counts about 20.
         use crate::kassert;
         let hpet = hpet().ok_or("no HPET")?;
+        let boot_ppm = boot_calibration().ok_or("no boot calibration")?.median_bound_ppm();
+        let floor_ns = 10_000_000 - lumen_time::stall_ticks(10_000_000, boot_ppm.max(lumen_time::TSC_TOLERANCE_PPM));
         let (h0, t0) = (hpet.now(), ticks());
         sleep(10_000_000);
-        let (elapsed, ticked) = (hpet.since(h0, hpet.now()), ticks() - t0);
-        let ns = hpet.clock().ns(elapsed);
-        crate::ktest::diag(format_args!("slept {ns} ns by the HPET, {ticked} ticks"));
-        // At least 10 ms, less 1%: the TSC was calibrated against this HPET,
-        // so only window-to-window noise separates them (the 2% cross-checks
-        // are against the PIT; a boot calibration past 1% warned, and this
-        // could then be short). The timer ticked (interrupts are on), and at
-        // most 10 + 2 times: a sleep wakes on the first tick past its
-        // deadline, and a host stall merges ticks rather than adding any, so
-        // a sleep that overslept (by now_ns: waiting for ten times as many
-        // ticks, say) is caught without a bound on time.
-        kassert!(ns >= 9_900_000);
-        kassert!((1..=12).contains(&ticked));
+        let ticked = ticks() - t0;
+        let ns = hpet.clock().ns(hpet.since(h0, hpet.now()));
+        crate::ktest::diag(format_args!("slept {ns} ns by the HPET (at least {floor_ns}), {ticked} ticks"));
+        kassert!(ns >= floor_ns);
+        kassert!((1..=14).contains(&ticked));
         Ok(())
     }
 );
@@ -2995,6 +3024,11 @@ crate::ktest!(
             if !wait_for_tick(t, 5_000_000_000) {
                 crate::ktest::diag(format_args!("no tick in 5 s after {n} of 20 (ticks at {t})"));
                 return Err("the timer stopped ticking");
+            }
+        }
+        for seq in w0..ring.written() {
+            if let Some(e) = ring.read(seq) {
+                crate::ktest::diag(format_args!("traced while spinning: kind {:#x} args {:x?}", e.kind, e.args));
             }
         }
         kassert_eq!(ring.written(), w0);

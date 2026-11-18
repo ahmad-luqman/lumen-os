@@ -440,7 +440,9 @@ own PR that updates that doc first.
   `desktop_counter`; `parse_records` reads quoted cells with `shlex`),
   `calibration.py` (a boot calibration's verdict line, and the TSC's
   HPET-or-PIT choice, read back and checked against the numbers they print:
-  `judged`, `verdict`, `weighed`, `no_other_warnings`), `clock_diags.py` (the
+  `judged`, `verdict`, `weighed`, `no_other_warnings`, `warned_exactly_when_past`;
+  the clocks' tolerances, and `agree`: two rates within 2% or their bounds,
+  `CANT_TELL_PPM` the most those may add up to), `clock_diags.py` (the
   clock cross-check ktests' diagnostics, `check_clock_diags`),
   `census.py` (the flake census: CI's red first attempts per day, how many
   passed on a re-run, and the tests that failed them, from the failed jobs'

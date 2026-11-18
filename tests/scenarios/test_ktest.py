@@ -188,12 +188,13 @@ def test_in_kernel_tests_pass_with_calibrations_stalled_within_tolerance(boot, k
     # (each window's end stalled, so none steady) but stayed within its
     # tolerance logs no warning, and the ktests whose claims are tight to the
     # boot's calibration (`CALIBRATION_KTESTS`) still pass, as do the clock
-    # diagnostics' checks (each warning following from its bound). The TSC at 0.6% (under its 1%); the timer at 1.2%, which with
-    # the TSC's bound is still under its 2% but leaves its rate about 1.2% off
-    # (a ktest budgeting the calibration 1% fails here). At risk on a busy
-    # host (CLAUDE.md, "Tests on a busy host"): the host's own stalls, on top
-    # of the injected one, can take the boot's calibration past its
-    # tolerance, which this claim doesn't cover.
+    # diagnostics' checks (each warning following from its bound). The TSC at
+    # 0.6% (under its 1%); the timer at 1.2%, which with the TSC's bound is
+    # still under its 2% but leaves its rate about 1.2% off (a ktest budgeting
+    # the calibration 1% fails here). At risk on a busy host (CLAUDE.md, "Tests
+    # on a busy host"): the host's own stalls, on top of the injected one, can
+    # take the boot's calibration past its tolerance, which this claim doesn't
+    # cover.
     name = {"tsc": "tsc", "timer": "local APIC timer"}[key]
     only = ",".join(CALIBRATION_KTESTS)
     out, report = finished(

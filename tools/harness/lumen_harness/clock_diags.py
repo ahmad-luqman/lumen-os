@@ -17,7 +17,8 @@ from lumen_harness import calibration, tap
 # 20 ms apart. How many it took isn't bounded: that counts how often a
 # loaded host stalled a bracket, not the code (the ktest fails when every
 # reading at one end was wide). What is checked is that the count matches
-# the readings and the kept ones are within the limit.
+# the readings, only readings over the limit were taken again, and the kept
+# ones are within it.
 HPET_BRACKET_NS = 1_000_000
 RETRY_SPACING_MS = 20
 
@@ -134,18 +135,23 @@ def _check_boot_calibration(
     judged_as: str,
 ) -> None:
     """The `clock` boot calibration's line: once in the run, in `case`, with
-    five windows and rates; and boot's verdict on it (in `text`, as
-    `judged_as`: `calibration.TSC` or `TIMER`) a warning exactly when its
-    median's bound is past that clock's tolerance, printing that bound
-    (however many windows are steady: enough least-unsteady ones may fill
-    in)."""
+    five windows and rates (however many are steady: enough least-unsteady
+    ones may fill in), its counts where a calibration stops (5 steady, or 20
+    windows in all); and boot's verdict on it (in `text`, as `judged_as`:
+    `calibration.TSC` or `TIMER`) a warning exactly when its median's bound
+    is past that clock's tolerance, printing that bound, and a line exactly
+    when windows were taken again or it warned, saying the counts."""
     lines = re.findall(rf"^# {clock} boot calibration ", text, re.MULTILINE)
     assert len(lines) == 1, f"{len(lines)} {clock} boot calibration lines"
     b = one_diagnostic(report, case, pattern)
     windows, rates, steady = b["windows"].split(), _widths(b["rates"]), int(b["steady"])
     assert len(windows) == 5 and len(rates) == 5, f"not 5 windows and rates: {b.group(0)}"
     assert steady <= len(windows), f"more steady than windows: {b.group(0)}"
-    calibration.warned_exactly_when_past(text, judged_as, int(b["bound"]))
+    retook = int(b["retook"])
+    assert steady + retook <= 20 and (steady == 5 or steady + retook == 20), (
+        f"not what a calibration stops at (5 steady, or 20 windows): {b.group(0)}"
+    )
+    calibration.warned_exactly_when_past(text, judged_as, int(b["bound"]), retook, steady)
 
 
 def _widths(field: str) -> list[int]:

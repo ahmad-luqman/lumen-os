@@ -5,7 +5,7 @@ name = "Calibrated TSC (against the HPET, or the PIT without one or with one who
 milestone = "M1"
 tests = [
     "cargo:lumen-time",
-    "ktest:lumen_kernel::time::tsc_calibrated_within_tolerance",
+    "ktest:lumen_kernel::time::the_tsc_agrees_with_the_pit",
     "ktest:lumen_kernel::time::a_cross_check_measures_again_until_it_can_judge",
     "ktest:lumen_kernel::time::a_late_look_at_the_pit_doesnt_stretch_its_window",
     "ktest:lumen_kernel::time::a_late_start_reading_doesnt_shift_a_pit_window",

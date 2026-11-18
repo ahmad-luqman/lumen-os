@@ -24,6 +24,7 @@ from lumen_harness.calibration import (
     within_bounds,
 )
 from lumen_harness.crash import BEGIN, END
+from lumen_harness.klog import STAMP
 from lumen_harness.qemu import EXIT_CRASH
 
 BOOT_TIMEOUT = 60
@@ -94,9 +95,13 @@ def assert_agree(a: Calibration, b: Calibration) -> None:
 
 def check_boot_verdict(m, cal: Calibration) -> None:
     """Boot warned on its TSC calibration exactly when the median's bound
-    was past the TSC's tolerance, its verdict line printing that bound
+    was past the TSC's tolerance, its verdict line (there exactly when it
+    took windows again or warned) printing that bound and its counts
     (`lumen_harness.calibration.warned_exactly_when_past`)."""
-    warned_exactly_when_past(m.output, TSC, median_bound_ppm(cal))
+    steady = sum(
+        (sg + eg) * 200 <= t for t, _, _, sg, eg in map(window_fields, cal.windows.split())
+    )
+    warned_exactly_when_past(m.output, TSC, median_bound_ppm(cal), cal.retook, steady)
 
 
 def tsc_error_ppm(tsc: int, ref: int, start_gap: int, end_gap: int) -> int:
@@ -114,6 +119,12 @@ def window_fields(w: str) -> tuple[int, int, int, int, int]:
     fields = w.split("/")
     assert len(fields) == 5, f"not tsc/reference/polls/start_gap/end_gap: {w}"
     return tuple(int(x) for x in fields)  # type: ignore[return-value]
+
+
+def steady_windows(cal: Calibration) -> int:
+    """How many of `cal`'s windows are steady: their gaps at most 0.5% of the
+    window (lumen_time's `Window::is_steady`)."""
+    return sum((sg + eg) * 200 <= t for t, _, _, sg, eg in map(window_fields, cal.windows.split()))
 
 
 def median_bound_ppm(cal: Calibration) -> int:
@@ -146,10 +157,7 @@ def check_calibration(cal: Calibration, reference_hz: int) -> None:
         assert within_bounds(one, cal.hz, ppm, median_ppm), (
             f"a window {one} Hz ({ppm} ppm), the median {cal.hz} Hz ({median_ppm} ppm): {cal}"
         )
-    steady = sum(
-        (sg + eg) * 200 <= t for t, _, _, sg, eg in map(window_fields, cal.windows.split())
-    )
-    assert cal.retook <= MOST_RETAKEN or steady < 5, cal
+    assert cal.retook <= MOST_RETAKEN or steady_windows(cal) < 5, cal
 
 
 def check_retake_line(m, cal: Calibration) -> None:
@@ -209,7 +217,9 @@ def test_timer_interrupts_counted(boot):
     # No irq warning but the one a slow first tick logs (main.rs: no tick in
     # 100 ms, which a host stalling boot can cause).
     irq = [line for line in m.output.splitlines() if "WARN  irq" in line]
-    assert all("no timer interrupt in 100 ms" in line for line in irq), irq
+    assert all(
+        re.fullmatch(rf"{STAMP} WARN  irq: no timer interrupt in 100 ms", line) for line in irq
+    ), irq
 
 
 def test_boot_calibration_agrees_with_both_clocks(boot):
