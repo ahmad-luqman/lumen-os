@@ -60,7 +60,9 @@ pub struct Ctx<'a> {
     /// is formatted first, then drawn under one lock; on serial it is
     /// formatted under the log's line lock, so a `Display` that logs would
     /// take that lock again, a re-lock crash report: make such text before
-    /// the call). While a command holds the canvas
+    /// the call; in a terminal window, #155, it reaches the window's grid in
+    /// pieces, so its owner may draw half of it before the rest). While a
+    /// command holds the canvas
     /// (`term::status().paused`), output to the terminals reaches them but
     /// isn't drawn.
     pub out: &'a mut dyn Console,
@@ -75,9 +77,10 @@ pub struct Ctx<'a> {
 impl<'a> Ctx<'a> {
     /// A context for running commands on `out`: each run gets its own
     /// canvas owner, on `out`'s virtual terminal if it is one (its canvas
-    /// brings that terminal to the front).
+    /// brings that terminal to the front), or in its terminal window (no
+    /// canvas then: `term::CanvasError::InWindow`).
     pub fn new(out: &'a mut dyn Console, ansi: bool, history: &'a History) -> Ctx<'a> {
-        let owner = out.vt().map_or_else(term::Owner::new, term::Owner::on_vt);
+        let owner = term::Owner::at(out.place());
         Ctx { out, ansi, history, owner }
     }
 
@@ -96,6 +99,8 @@ impl<'a> Ctx<'a> {
 
     /// The next key typed on this console, if one is waiting (never
     /// blocks): for a command that runs until a key (`q`, Ctrl-C) stops it.
+    /// `Key::Closed` means the console is gone (a terminal window closed):
+    /// stop as for Ctrl-C (it comes for every key asked from then on).
     /// On a virtual terminal, the keyboard's keys routed to it (routed while
     /// it was shown: `crate::vt`); Shift+PageUp/PageDown still scroll it and
     /// aren't returned, and keys the line editor doesn't take (Esc, F1) are
@@ -109,7 +114,9 @@ impl<'a> Ctx<'a> {
     /// Wait for the next key typed on this console (see [`Self::poll_key`]):
     /// on a virtual terminal the thread sleeps until IRQ 1 (or another
     /// shell routing it a key); on serial until IRQ 4 brings a byte
-    /// (`serial_in`; it polls, yielding, without that interrupt).
+    /// (`serial_in`; it polls, yielding, without that interrupt); in a
+    /// terminal window (#155) until its owner hands it one, or at once with
+    /// `Key::Closed` once the window closed.
     #[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
     pub fn wait_key(&mut self) -> Key {
         self.out.read_key()
@@ -146,11 +153,17 @@ pub trait Console: Write + Send {
     /// Where its keys are typed, for a prompt shown elsewhere ("press a key
     /// on serial").
     fn name(&self) -> &'static str;
-    /// The virtual terminal it is, if it is one (a canvas its command takes
-    /// brings it to the front).
-    fn vt(&self) -> Option<usize> {
-        None
-    }
+    /// Where it is: anywhere (serial), on a virtual terminal (a canvas its
+    /// command takes brings it to the front) or in a terminal window (#155:
+    /// its commands get no canvas). No default: a console wrapping another
+    /// (a pipeline's capture) says the one it wraps.
+    fn place(&self) -> term::Place;
+    /// Whether it has gone (its window closed): from then on it gives
+    /// `Key::Closed` for every key asked (`read_key` and `try_key`), which
+    /// every reader stops on, and the shell on it ends after the key or
+    /// command under way. No default: a console wrapping another says the
+    /// one it wraps.
+    fn closed(&self) -> bool;
     /// Whether what is written goes to the next command in a pipeline.
     /// (A console overrides both this and [`Console::fail`], or neither.)
     fn piped(&self) -> bool {
@@ -367,22 +380,43 @@ fn max_line(cols: usize) -> usize {
     MAX_LINE.min(cols.saturating_sub(PROMPT.len() + 3))
 }
 
-/// A shell's loop: a line, its command, again. What the editor writes for a
-/// key goes to the console in one write (on the screen: drawn whole, without
-/// a log line in the middle of a redraw).
-fn run_on(mut console: impl Console, mut editor: Editor) -> ! {
+/// A shell's loop on a console that never closes (serial, a virtual
+/// terminal).
+fn run_on(console: impl Console, editor: Editor) -> ! {
+    run_lines(console, editor);
+    unreachable!("a console that never closes closed");
+}
+
+/// A shell in a terminal window (#155) `cols` columns wide, with the
+/// screen shells' editing, until its console closes ([`Console::closed`]).
+pub fn run_in_window(console: impl Console, cols: usize) {
+    run_lines(console, Editor::new(PROMPT, Mode::Ansi, max_line(cols), HISTORY));
+}
+
+/// A shell's loop: a line, its command, again, until the console closes.
+/// What the editor writes for a key goes to the console in one write (on
+/// the screen: drawn whole, without a log line in the middle of a redraw).
+fn run_lines(mut console: impl Console, mut editor: Editor) {
     let ansi = editor.mode() == Mode::Ansi;
     let mut shown = String::new();
-    loop {
+    while !console.closed() {
         let _ = editor.start(&mut shown);
         flush(&mut console, &mut shown);
         let line = loop {
             let key = console.read_key();
+            // A console that closed gives `Key::Closed`, which ends the line
+            // below too; this check stops before the editor sees any key
+            // read at the close (and the loop's own check, before a prompt
+            // nobody would see).
+            if console.closed() {
+                return;
+            }
             let event = editor.key(key, &commands::COMMANDS, &mut shown);
             flush(&mut console, &mut shown);
             match event {
                 Ok(Some(Event::Line(line))) => break Some(line),
                 Ok(Some(Event::Cancelled)) => break None,
+                Ok(Some(Event::Closed)) => return,
                 _ => {}
             }
         };
@@ -420,6 +454,14 @@ impl Write for Serial {
 }
 
 impl Console for Serial {
+    fn place(&self) -> term::Place {
+        term::Place::Anywhere
+    }
+
+    fn closed(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str {
         "serial"
     }
@@ -500,8 +542,12 @@ impl Console for Screen {
         "the keyboard"
     }
 
-    fn vt(&self) -> Option<usize> {
-        Some(self.vt)
+    fn place(&self) -> term::Place {
+        term::Place::Vt(self.vt)
+    }
+
+    fn closed(&self) -> bool {
+        false
     }
 
     fn read_key(&mut self) -> Key {
@@ -533,6 +579,11 @@ pub struct Captured {
     pub text: String,
     pub keys: alloc::collections::VecDeque<Key>,
     pub ran_dry: bool,
+    /// How many polls in a row may find no key before one gives Ctrl-C
+    /// ([`Captured::DRY_POLLS`] if `None`): a test expecting its own key to
+    /// stop a command at once sets a few, so a regression fails by name
+    /// rather than spinning through the default.
+    pub dry_polls: Option<u32>,
     /// Polls in a row that found no key.
     empty_polls: u32,
 }
@@ -558,6 +609,14 @@ impl Write for Captured {
 
 #[cfg(feature = "ktest")]
 impl Console for Captured {
+    fn place(&self) -> term::Place {
+        term::Place::Anywhere
+    }
+
+    fn closed(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str {
         "the test console"
     }
@@ -569,7 +628,7 @@ impl Console for Captured {
     fn try_key(&mut self) -> Option<Key> {
         let key = self.keys.pop_front();
         self.empty_polls = if key.is_some() { 0 } else { self.empty_polls + 1 };
-        if self.empty_polls >= Self::DRY_POLLS {
+        if self.empty_polls >= self.dry_polls.unwrap_or(Self::DRY_POLLS) {
             self.empty_polls = 0;
             return Some(self.dry());
         }
@@ -666,7 +725,7 @@ crate::ktest!(
             kassert!(term::write_str_to(1, &alloc::format!("second {i}\n")));
         }
         let second = Screen { vt: 1 };
-        kassert_eq!(second.vt(), Some(1));
+        kassert_eq!(second.place(), term::Place::Vt(1));
         let page_up = keyboard::Key::Raw { code: KeyCode::PageUp, mods: lumen_input::Mods::NONE.with_shift() };
         kassert_eq!(second.take(page_up), None);
         let views = || term::view_offset(0).zip(term::view_offset(1)).ok_or("no terminal");

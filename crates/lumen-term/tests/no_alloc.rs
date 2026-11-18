@@ -1,18 +1,34 @@
 //! Writing to a terminal never allocates (the kernel logs while holding the
 //! frame allocator's lock): a counting allocator sees no allocation after
-//! `Terminal::new`, whatever is written.
+//! `Terminal::new`, whatever is written. Only the test's own thread counts:
+//! the test harness's other threads allocate when they like (CI once saw 4
+//! such allocations land during the writes).
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Counting;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
+thread_local! {
+    /// Whether this thread's allocations count (a const-initialized `Cell`:
+    /// reading it never allocates).
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Count one allocation if this thread counts.
+fn count() {
+    if COUNTING.with(Cell::get) {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 // SAFETY: forwards to the system allocator, only counting calls.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        count();
         // SAFETY: same contract as ours.
         unsafe { System.alloc(layout) }
     }
@@ -23,7 +39,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        count();
         // SAFETY: same contract as ours.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -49,6 +65,7 @@ fn writing_never_allocates() {
         input.push(0xff); // invalid UTF-8
     }
     let mut t = lumen_term::Terminal::new(80, 25, 200);
+    COUNTING.with(|c| c.set(true));
     let before = ALLOCATIONS.load(Ordering::Relaxed);
     for chunk in input.chunks(7) {
         t.write(chunk);
@@ -58,6 +75,7 @@ fn writing_never_allocates() {
     t.reset_view();
     t.write(b"\x1b[2J\x1b[3J\x1bc");
     let after = ALLOCATIONS.load(Ordering::Relaxed);
+    COUNTING.with(|c| c.set(false));
     assert_eq!(after - before, 0, "writing allocated {} times", after - before);
     assert_eq!(t.scrollback_len(), 0);
 }

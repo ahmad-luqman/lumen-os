@@ -64,6 +64,9 @@ pub enum Event {
     /// Ctrl-C, or Enter on a line too long (a character didn't fit): the
     /// line was dropped.
     Cancelled,
+    /// [`Key::Closed`]: the console's input ended; the line was dropped,
+    /// nothing written. Stop reading.
+    Closed,
 }
 
 /// One console's line editor and history.
@@ -161,6 +164,10 @@ impl Editor {
                 self.newline(out)?;
                 self.clear();
                 return Ok(Some(Event::Cancelled));
+            }
+            Key::Closed => {
+                self.clear();
+                return Ok(Some(Event::Closed));
             }
             Key::Backspace => {
                 if self.cursor > 0 {

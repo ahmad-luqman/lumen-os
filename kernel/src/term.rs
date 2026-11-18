@@ -7,11 +7,14 @@
 //! which one is shown. Writing to a hidden one draws nothing; showing it
 //! draws all of it.
 //!
-//! Drawing keeps a copy of every cell it drew (the shadow) and draws only
-//! the cells that differ from it, in the rows the terminal marked as changed.
-//! A scroll moves the pixels (`Framebuffer::move_rows`) and the shadow
-//! together, so a line feed at the bottom draws one new line, not the whole
-//! screen. The cursor flips every 500 ms (the boot CPU's timer interrupt
+//! Drawing is `lumen_term::render::Renderer`'s, shared with the terminal
+//! windows (#155, `crate::termwin`): it keeps a copy of every cell it drew
+//! (the shadow) and draws only the cells that differ from it, in the rows
+//! the terminal marked as changed. A scroll moves the pixels
+//! (`Framebuffer::move_rows`) and the shadow together, so a line feed at the
+//! bottom draws one new line, not the whole screen. How a cell looks in
+//! pixels ([`Cells`], over any [`Pixels`]: the framebuffer here, a window's
+//! surface there) is this module's. The cursor flips every 500 ms (the boot CPU's timer interrupt
 //! does it: no thread, so nothing switches or traces for it) and shows
 //! solid while output arrives; it isn't drawn while the view is scrolled
 //! back (Shift+PageUp/PageDown in a screen shell).
@@ -56,12 +59,12 @@
 use crate::fb::{self, Framebuffer, Style};
 use crate::sync::SpinLock;
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use log::Level;
+use lumen_term::render::{CellTarget, CursorLook, Renderer};
 use lumen_term::{Cell, Color, Cursor, Flags, Terminal, palette};
 use noto_sans_mono_bitmap::{FontWeight, get_raster_width};
 
@@ -76,7 +79,8 @@ const _: () = assert!(VTS == 4, "four virtual terminals");
 /// How long the cursor stays on, then off, in the boot CPU's timer ticks
 /// (1 kHz).
 const BLINK_TICKS: u64 = 500;
-const CELL_H: usize = 16;
+/// A cell's height in pixels (the console font's).
+pub const CELL_H: usize = 16;
 
 /// The terminals and what is drawn of the shown one.
 struct Screen {
@@ -85,19 +89,15 @@ struct Screen {
     terms: [Terminal; VTS],
     /// Which virtual terminal is shown (0 is the first).
     shown: usize,
-    /// What each cell of the view was last drawn as (row by row).
-    shadow: Vec<Cell>,
+    /// What is drawn of the shown terminal (its cells drawn so far, which
+    /// the shell's `term` shows and the tests count redraws with).
+    renderer: Renderer,
     /// Top-left pixel of the grid.
     x0: usize,
     y0: usize,
     cell_w: usize,
-    /// Where the cursor is drawn, if it is.
-    cursor_drawn: Option<(usize, usize)>,
     /// The blink phase: the cursor is drawn while on.
     blink_on: bool,
-    /// Cells drawn so far (the shell's `term` shows it; the tests count redraws
-    /// with it).
-    cells_drawn: u64,
     /// Who has the pixels, if anyone: draw nothing then.
     holder: Option<Holder>,
     /// Where the mouse pointer's tip should be (framebuffer pixels), if the
@@ -122,8 +122,7 @@ static CANVAS_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Start the terminal below the header of `fb` (called by `fb::init`).
 pub fn init(fb: Framebuffer) {
-    let cell_w = get_raster_width(FontWeight::Regular, fb::CONSOLE_SIZE)
-        .max(get_raster_width(FontWeight::Bold, fb::CONSOLE_SIZE));
+    let cell_w = cell_width();
     let (x0, y0) = (fb::MARGIN, fb::CONSOLE_TOP);
     let cols = fb.width().saturating_sub(x0 + fb::MARGIN / 2) / cell_w;
     let rows = fb.height().saturating_sub(y0) / CELL_H;
@@ -133,18 +132,16 @@ pub fn init(fb: Framebuffer) {
     }
     // Allocated here, before taking the lock (see the module comment).
     let terms = core::array::from_fn(|_| Terminal::new(cols, rows, SCROLLBACK));
-    let shadow = vec![Cell::BLANK; cols * rows];
+    let renderer = Renderer::new(cols, rows);
     let mut screen = Screen {
         fb,
         terms,
         shown: 0,
-        shadow,
+        renderer,
         x0,
         y0,
         cell_w,
-        cursor_drawn: None,
         blink_on: true,
-        cells_drawn: 0,
         holder: None,
         pointer_at: None,
         pointer: lumen_input::Cursor::default(),
@@ -241,13 +238,7 @@ pub fn on_tick(tick: u64) {
 impl Screen {
     /// Feed `s` to virtual terminal `vt`, `\n` as CR LF (not drawn yet).
     fn feed(&mut self, vt: usize, s: &str) {
-        let term = &mut self.terms[vt];
-        for (i, line) in s.split('\n').enumerate() {
-            if i > 0 {
-                term.write(b"\r\n");
-            }
-            term.write(line.as_bytes());
-        }
+        write_text(&mut self.terms[vt], s);
         if vt == self.shown {
             self.show_cursor();
         }
@@ -258,6 +249,7 @@ impl Screen {
         &self.terms[self.shown]
     }
 
+    #[cfg(feature = "ktest")]
     fn term_mut(&mut self) -> &mut Terminal {
         &mut self.terms[self.shown]
     }
@@ -304,50 +296,11 @@ impl Screen {
         if self.holder.is_some() {
             return;
         }
-        let cols = self.term().cols();
-        // Take the cursor off first, as the shadow has the cell (the
-        // terminal may already hold other cells there, before the scroll
-        // below moves the pixels).
-        if let Some((c, r)) = self.cursor_drawn.take() {
-            self.draw(c, r, self.shadow[r * cols + c], false);
-        }
-        if let Some(s) = self.term_mut().take_scroll() {
-            let n = s.lines.unsigned_abs();
-            let (top, bottom) = (self.y0 + s.top * CELL_H, self.y0 + s.bottom * CELL_H);
-            let len = (s.bottom - s.top - n) * CELL_H;
-            let shift = n * CELL_H;
-            let rows = s.top * cols..s.bottom * cols;
-            // The pixels move: the pointer mustn't move with them.
-            self.uncover(0, top, self.fb.width(), bottom - top);
-            if s.lines > 0 {
-                self.fb.move_rows(top + shift, top, len);
-                self.shadow[rows].copy_within(n * cols.., 0);
-            } else {
-                self.fb.move_rows(top, top + shift, len);
-                let end = rows.len() - n * cols;
-                self.shadow[rows].copy_within(..end, n * cols);
-            }
-            debug_assert!(bottom <= self.fb.height());
-        }
-        for r in 0..self.term().rows() {
-            if !self.term_mut().take_dirty(r) {
-                continue;
-            }
-            for c in 0..cols {
-                let cell = self.term().cell(c, r);
-                if self.shadow[r * cols + c] != cell {
-                    self.draw(c, r, cell, false);
-                    self.shadow[r * cols + c] = cell;
-                }
-            }
-        }
-        if self.blink_on
-            && self.term().view_offset() == 0
-            && let Some((c, r)) = self.term().cursor_in_view()
-        {
-            self.draw(c, r, self.term().cell(c, r), true);
-            self.cursor_drawn = Some((c, r));
-        }
+        let look = self.blink_on.then_some(CursorLook::Solid);
+        let Screen { fb, terms, shown, renderer, x0, y0, cell_w, pointer, .. } = self;
+        let mut px = OnFramebuffer { fb, pointer };
+        let mut cells = Cells { px: &mut px, x0: *x0, y0: *y0, cell_w: *cell_w };
+        renderer.render(&mut terms[*shown], &mut cells, look);
     }
 
     /// A [`Canvas`] gave the pixels back, or the shell took them back
@@ -375,9 +328,7 @@ impl Screen {
         self.uncover(0, fb::CONSOLE_TOP, w, h.saturating_sub(fb::CONSOLE_TOP));
         self.fb.fill_rect(0, fb::CONSOLE_TOP, w, h.saturating_sub(fb::CONSOLE_TOP), fb::BG);
         // A blank cell draws as the background just filled in.
-        self.shadow.fill(Cell::BLANK);
-        self.cursor_drawn = None;
-        self.term_mut().touch_all();
+        self.renderer.forget(&mut self.terms[self.shown]);
         self.render();
     }
 
@@ -385,30 +336,14 @@ impl Screen {
     /// for cell (for the tests).
     #[cfg(feature = "ktest")]
     fn shadow_matches_grid(&self) -> bool {
-        let t = self.term();
-        let cols = t.cols();
-        (0..t.rows()).all(|r| (0..cols).all(|c| self.shadow[r * cols + c] == t.cell(c, r)))
+        self.renderer.matches(self.term())
     }
 
-    /// Draw `cell` at (`col`, `row`), colours swapped for inverse or for the
-    /// cursor (not for both).
-    fn draw(&mut self, col: usize, row: usize, cell: Cell, cursor: bool) {
-        let (mut fg, mut bg) = (rgb(cell.fg, fb::TEXT), rgb(cell.bg, fb::BG));
-        if cell.flags.contains(Flags::INVERSE) != cursor {
-            core::mem::swap(&mut fg, &mut bg);
-        }
-        let (x, y, w) = (self.x0 + col * self.cell_w, self.y0 + row * CELL_H, self.cell_w);
-        self.uncover(x, y, w, CELL_H);
-        if cell.ch == ' ' || cell.flags.contains(Flags::SPACER) {
-            self.fb.fill_rect(x, y, w, CELL_H, bg);
-        } else {
-            let weight = if cell.flags.contains(Flags::BOLD) { FontWeight::Bold } else { FontWeight::Regular };
-            let drawn = self.fb.glyph_clipped(x, y, cell.ch, Style::new(weight, fb::CONSOLE_SIZE, fg, bg), w);
-            if drawn < w {
-                self.fb.fill_rect(x + drawn, y, w - drawn, CELL_H, bg);
-            }
-        }
-        self.cells_drawn += 1;
+    /// Forget what was drawn: the next render draws every cell (for the
+    /// tests).
+    #[cfg(feature = "ktest")]
+    fn invalidate(&mut self) {
+        self.renderer.invalidate(&mut self.terms[self.shown]);
     }
 
     /// About to draw the `w` x `h` pixels at (`x`, `y`): take the mouse
@@ -416,7 +351,7 @@ impl Screen {
     /// [`drawing`] draws it again afterwards).
     fn uncover(&mut self, x: usize, y: usize, w: usize, h: usize) {
         if self.pointer.overlaps(x, y, w, h) {
-            self.pointer.hide(&mut Pixels(&self.fb));
+            self.pointer.hide(&mut Encoded(&self.fb));
         }
     }
 
@@ -425,7 +360,7 @@ impl Screen {
     /// draws without the lock, so the arrow can't be kept out of its way).
     /// The one place that decides whether the pointer shows.
     fn place_pointer(&mut self) {
-        let px = &mut Pixels(&self.fb);
+        let px = &mut Encoded(&self.fb);
         match self.pointer_at.filter(|_| self.holder.is_none()) {
             Some((x, y)) => {
                 let (outline, fill) = (self.fb.encode(POINTER_OUTLINE), self.fb.encode(POINTER_FILL));
@@ -441,9 +376,9 @@ const POINTER_OUTLINE: u32 = 0x000000;
 const POINTER_FILL: u32 = 0xffffff;
 
 /// The framebuffer as the pointer's save-under sees it: encoded pixels.
-struct Pixels<'a>(&'a Framebuffer);
+struct Encoded<'a>(&'a Framebuffer);
 
-impl lumen_input::Surface for Pixels<'_> {
+impl lumen_input::Surface for Encoded<'_> {
     fn size(&self) -> (usize, usize) {
         (self.0.width(), self.0.height())
     }
@@ -454,6 +389,120 @@ impl lumen_input::Surface for Pixels<'_> {
 
     fn set(&mut self, x: usize, y: usize, value: u32) {
         self.0.put_encoded(x, y, value);
+    }
+}
+
+/// A cell's width in pixels: the console font's widest (regular or bold).
+pub fn cell_width() -> usize {
+    get_raster_width(FontWeight::Regular, fb::CONSOLE_SIZE).max(get_raster_width(FontWeight::Bold, fb::CONSOLE_SIZE))
+}
+
+/// What terminal cells are drawn on, in pixels (`0xRRGGBB`): the
+/// framebuffer (the text console) or a terminal window's surface (#155).
+pub trait Pixels {
+    /// The width in pixels.
+    fn width(&self) -> usize;
+    /// About to draw the `w` x `h` pixels at (`x`, `y`) (the console takes
+    /// the mouse pointer off there).
+    fn uncover(&mut self, x: usize, y: usize, w: usize, h: usize);
+    fn fill(&mut self, x: usize, y: usize, w: usize, h: usize, rgb: u32);
+    /// One glyph of the console font (`?` for one it lacks) in `ink`, at
+    /// most `max_w` pixels of it wide; its advance, clipped to `max_w`.
+    fn glyph(&mut self, x: usize, y: usize, c: char, ink: Ink, max_w: usize) -> usize;
+    /// Move the pixel rows `[from, from + len)` to `[to, to + len)` (rows of
+    /// pixels, where `CellTarget::move_rows` counts rows of cells).
+    fn move_pixel_rows(&mut self, from: usize, to: usize, len: usize);
+}
+
+/// How a glyph is drawn: its weight, in `fg` over `bg`.
+#[derive(Clone, Copy)]
+pub struct Ink {
+    pub weight: FontWeight,
+    pub fg: u32,
+    pub bg: u32,
+}
+
+impl Ink {
+    /// The console font's style for it.
+    pub fn style(self) -> Style {
+        Style::new(self.weight, fb::CONSOLE_SIZE, self.fg, self.bg)
+    }
+}
+
+/// A terminal's cells on [`Pixels`]: the grid's top-left pixel and its
+/// cells' width (their height is [`CELL_H`]). One look for the console and
+/// the windows: a cell's colours (the defaults `fb::TEXT` on `fb::BG`),
+/// swapped for inverse or for a solid cursor (not both); a hollow cursor
+/// outlines the cell in its foreground colour.
+pub struct Cells<'a, P: Pixels> {
+    pub px: &'a mut P,
+    pub x0: usize,
+    pub y0: usize,
+    pub cell_w: usize,
+}
+
+impl<P: Pixels> CellTarget for Cells<'_, P> {
+    fn draw_cell(&mut self, col: usize, row: usize, cell: Cell, cursor: Option<CursorLook>) {
+        let (mut fg, mut bg) = (rgb(cell.fg, fb::TEXT), rgb(cell.bg, fb::BG));
+        if cell.flags.contains(Flags::INVERSE) != (cursor == Some(CursorLook::Solid)) {
+            core::mem::swap(&mut fg, &mut bg);
+        }
+        let (x, y, w) = (self.x0 + col * self.cell_w, self.y0 + row * CELL_H, self.cell_w);
+        self.px.uncover(x, y, w, CELL_H);
+        if cell.ch == ' ' || cell.flags.contains(Flags::SPACER) {
+            self.px.fill(x, y, w, CELL_H, bg);
+        } else {
+            let weight = if cell.flags.contains(Flags::BOLD) { FontWeight::Bold } else { FontWeight::Regular };
+            let drawn = self.px.glyph(x, y, cell.ch, Ink { weight, fg, bg }, w);
+            if drawn < w {
+                self.px.fill(x + drawn, y, w - drawn, CELL_H, bg);
+            }
+        }
+        if cursor == Some(CursorLook::Hollow) {
+            self.px.fill(x, y, w, 1, fg);
+            self.px.fill(x, y + CELL_H - 1, w, 1, fg);
+            self.px.fill(x, y, 1, CELL_H, fg);
+            self.px.fill(x + w - 1, y, 1, CELL_H, fg);
+        }
+    }
+
+    fn move_rows(&mut self, from: usize, to: usize, count: usize) {
+        let top = self.y0 + from.min(to) * CELL_H;
+        let bottom = self.y0 + (from.max(to) + count) * CELL_H;
+        // The pixels move: the pointer mustn't move with them.
+        self.px.uncover(0, top, self.px.width(), bottom - top);
+        self.px.move_pixel_rows(self.y0 + from * CELL_H, self.y0 + to * CELL_H, count * CELL_H);
+    }
+}
+
+/// The framebuffer as [`Pixels`], taking the mouse pointer off where it
+/// draws (the end of the drawing step puts it back: [`drawing`]).
+struct OnFramebuffer<'a> {
+    fb: &'a mut Framebuffer,
+    pointer: &'a mut lumen_input::Cursor,
+}
+
+impl Pixels for OnFramebuffer<'_> {
+    fn width(&self) -> usize {
+        self.fb.width()
+    }
+
+    fn uncover(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        if self.pointer.overlaps(x, y, w, h) {
+            self.pointer.hide(&mut Encoded(self.fb));
+        }
+    }
+
+    fn fill(&mut self, x: usize, y: usize, w: usize, h: usize, rgb: u32) {
+        self.fb.fill_rect(x, y, w, h, rgb);
+    }
+
+    fn glyph(&mut self, x: usize, y: usize, c: char, ink: Ink, max_w: usize) -> usize {
+        self.fb.glyph_clipped(x, y, c, ink.style(), max_w)
+    }
+
+    fn move_pixel_rows(&mut self, from: usize, to: usize, len: usize) {
+        self.fb.move_rows(from, to, len);
     }
 }
 
@@ -483,30 +532,53 @@ fn tab_x(width: usize, vt: usize) -> Option<usize> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Owner {
     id: NonZeroU64,
-    vt: Option<usize>,
+    place: Place,
+}
+
+/// Where a console is, and so where its commands may draw: anywhere (serial,
+/// whose commands take the screen as it is), on a virtual terminal (which a
+/// canvas brings to the front) or in a terminal window (#155: no canvas).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    Anywhere,
+    Vt(usize),
+    Window(u32),
 }
 
 impl Owner {
     /// A new owner, equal to no other, on no virtual terminal (a command on
     /// serial).
     pub fn new() -> Owner {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        Owner { id: NonZeroU64::new(NEXT.fetch_add(1, Ordering::Relaxed)).expect("2^64 owners"), vt: None }
+        Owner::at(Place::Anywhere)
     }
 
     /// A new owner for a command on virtual terminal `vt`.
     ///
     /// # Panics
     /// If `vt >= VTS`.
+    #[cfg(feature = "ktest")]
     pub fn on_vt(vt: usize) -> Owner {
-        assert!(vt < VTS, "no virtual terminal {vt}");
-        Owner { vt: Some(vt), ..Owner::new() }
+        Owner::at(Place::Vt(vt))
     }
 
-    /// A new owner, equal to no other, on the same virtual terminal as this
-    /// one (or none): for each command a shell runs.
+    /// A new owner, equal to no other, for a command at `place`: in a
+    /// terminal window (#155) a canvas is refused to it
+    /// ([`CanvasError::InWindow`]), as the screen isn't the window's.
+    ///
+    /// # Panics
+    /// If `place` is a virtual terminal past [`VTS`].
+    pub fn at(place: Place) -> Owner {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        if let Place::Vt(vt) = place {
+            assert!(vt < VTS, "no virtual terminal {vt}");
+        }
+        Owner { id: NonZeroU64::new(NEXT.fetch_add(1, Ordering::Relaxed)).expect("2^64 owners"), place }
+    }
+
+    /// A new owner, equal to no other, at the same place as this one: for
+    /// each command a shell runs.
     pub fn renew(self) -> Owner {
-        Owner { vt: self.vt, ..Owner::new() }
+        Owner::at(self.place)
     }
 }
 
@@ -559,6 +631,8 @@ pub enum CanvasError {
     Stopped,
     /// Another command has the canvas.
     InUse,
+    /// The command runs in a terminal window (#155), which has no canvas.
+    InWindow,
 }
 
 impl fmt::Display for CanvasError {
@@ -567,6 +641,7 @@ impl fmt::Display for CanvasError {
             CanvasError::NoTerminal => "no screen to draw on",
             CanvasError::Stopped => "the screen shows a crash report",
             CanvasError::InUse => "the screen is in use by another command",
+            CanvasError::InWindow => "a terminal window has no canvas: run it on a virtual terminal (Alt+F1)",
         })
     }
 }
@@ -574,13 +649,17 @@ impl fmt::Display for CanvasError {
 /// Take the pixels below the header for `owner` (see [`Canvas`]; commands
 /// use `Ctx::canvas`). An owner on a virtual terminal shows it first (its
 /// keys go there: `crate::vt` follows [`shown`]), and while the canvas is
-/// held no other terminal can be shown ([`show`]).
+/// held no other terminal can be shown ([`show`]). An owner in a terminal
+/// window gets none ([`CanvasError::InWindow`]).
 pub fn canvas(owner: Owner) -> Result<Canvas, CanvasError> {
+    if let Place::Window(_) = owner.place {
+        return Err(CanvasError::InWindow);
+    }
     claim(
         |_| Holder::Command(owner),
         |s, epoch| {
             // Drawn when the canvas goes (`resume`); the header's tabs now.
-            if let Some(vt) = owner.vt {
+            if let Place::Vt(vt) = owner.place {
                 s.switch(vt);
             }
             // (`drawing` takes the pointer off now: `place_pointer`.)
@@ -1106,7 +1185,25 @@ fn move_view(vt: usize, scroll: impl FnOnce(&mut Terminal) -> bool) {
 /// Scroll virtual terminal `vt`'s view back (`pages` > 0) or forward by
 /// `pages` half screens.
 pub fn scroll_half_pages(vt: usize, pages: isize) {
-    move_view(vt, |t| t.scroll_view(pages * (t.rows() as isize / 2).max(1)));
+    move_view(vt, |t| scroll_half_pages_of(t, pages));
+}
+
+/// Scroll `t`'s view back (`pages` > 0) or forward by `pages` half screens
+/// (Shift+PageUp/PageDown, on a virtual terminal or in a terminal window);
+/// whether it moved.
+pub fn scroll_half_pages_of(t: &mut Terminal, pages: isize) -> bool {
+    t.scroll_view(pages * (t.rows() as isize / 2).max(1))
+}
+
+/// Feed `s` to `t`, each `\n` as CR LF (the terminal takes `\n` as a line
+/// feed only): the virtual terminals' and the terminal windows' writes.
+pub fn write_text(t: &mut Terminal, s: &str) {
+    for (i, line) in s.split('\n').enumerate() {
+        if i > 0 {
+            t.write(b"\r\n");
+        }
+        t.write(line.as_bytes());
+    }
 }
 
 /// Show virtual terminal `vt`'s screen again (typing does).
@@ -1172,7 +1269,7 @@ pub fn status() -> Option<Status> {
             capacity: t.scrollback_capacity(),
             view: t.view_offset(),
             top_row: top_row(t),
-            cells_drawn: s.cells_drawn,
+            cells_drawn: s.renderer.cells_drawn(),
             paused: s.holder.is_some(),
             shown: s.shown,
         }
@@ -1192,12 +1289,18 @@ fn view_cells() -> Option<(usize, Vec<Cell>, Option<Cursor>)> {
     let cursor = with_screen(|s| {
         let t = s.term();
         // The size never changes: this fits the capacity.
-        cells.extend((0..rows).flat_map(|r| (0..cols).map(move |c| t.cell(c, r))));
-        let c = t.cursor();
-        let row = c.row + t.view_offset();
-        (row < rows).then_some(Cursor { row, ..c })
+        cells.extend(t.view_cells());
+        view_cursor(t)
     })?;
     Some((cols, cells, cursor))
+}
+
+/// `t`'s cursor, its row counted in the view, if the view shows it (shown
+/// or hidden).
+pub fn view_cursor(t: &Terminal) -> Option<Cursor> {
+    let c = t.cursor();
+    let row = c.row + t.view_offset();
+    (row < t.rows()).then_some(Cursor { row, ..c })
 }
 
 /// The view's rows as text, and the cursor if it is in the view.
@@ -1211,18 +1314,30 @@ pub struct ViewText {
     pub cursor: Option<Cursor>,
 }
 
-/// The shown virtual terminal's view as text: what the shell's `term text`
-/// prints, and how the tests read what the screen shells did.
-pub fn view_text() -> Option<ViewText> {
-    let (cols, cells, cursor) = view_cells()?;
-    let rows = cells
+/// `cols`-wide rows of `cells` as text (see [`ViewText::rows`]).
+fn rows_text(cols: usize, cells: &[Cell]) -> Vec<String> {
+    cells
         .chunks(cols)
         .map(|row| {
             let text: String = row.iter().filter(|c| !c.flags.contains(Flags::SPACER)).map(|c| c.ch).collect();
             String::from(text.trim_end())
         })
-        .collect();
-    Some(ViewText { rows, cursor })
+        .collect()
+}
+
+/// The shown virtual terminal's view as text: what the shell's `term text`
+/// prints, and how the tests read what the screen shells did.
+pub fn view_text() -> Option<ViewText> {
+    let (cols, cells, cursor) = view_cells()?;
+    Some(view_text_from(cols, &cells, cursor))
+}
+
+/// A view as text from its cells (`cols` wide, row by row) and its cursor
+/// ([`view_cursor`]), as [`view_text`] gives the shown terminal's: a
+/// terminal window's (`term text <window>`, #155), its cells copied out of
+/// its grid's lock first. It allocates.
+pub fn view_text_from(cols: usize, cells: &[Cell], cursor: Option<Cursor>) -> ViewText {
+    ViewText { rows: rows_text(cols, cells), cursor }
 }
 
 /// The bottom-most row of the view holding `needle`.
@@ -1278,10 +1393,10 @@ crate::ktest!(
         let setup = alloc::format!("\x1b[{rows};1H\x1b[2K");
         let counts = with_screen(|s| {
             let mut count = |bytes: &[u8]| {
-                let before = s.cells_drawn;
+                let before = s.renderer.cells_drawn();
                 s.term_mut().write(bytes);
                 s.render();
-                s.cells_drawn - before
+                s.renderer.cells_drawn() - before
             };
             count(setup.as_bytes());
             let two = count(b"ab");
@@ -1363,13 +1478,12 @@ crate::ktest!(
             }
             let ok = s.shadow_matches_grid();
             snapshot(s, &mut drawn);
-            // Forget what was drawn (no cell holds U+0001) and draw it all.
-            s.shadow.fill(Cell { ch: '\u{1}', ..Cell::BLANK });
-            s.term_mut().touch_all();
-            let before = s.cells_drawn;
+            // Forget what was drawn and draw it all.
+            s.invalidate();
+            let before = s.renderer.cells_drawn();
             s.render();
             snapshot(s, &mut fresh);
-            (ok, s.cells_drawn - before)
+            (ok, s.renderer.cells_drawn() - before)
         })
         .ok_or("no terminal")?;
         kassert!(shadow_ok);
@@ -1510,14 +1624,14 @@ crate::ktest!(
             s.term_mut().write(b"\x1b[r\x1b[999;1H\r\nx\x1b[H");
             s.blink_on = true;
             s.render();
-            let before = s.cursor_drawn.is_some();
+            let before = s.renderer.cursor_drawn().is_some();
             let moved = s.term_mut().scroll_view(1);
             s.blink_on = true;
             s.render();
-            let hidden = s.cursor_drawn.is_none() && s.term().cursor_in_view().is_some();
+            let hidden = s.renderer.cursor_drawn().is_none() && s.term().cursor_in_view().is_some();
             let _ = s.term_mut().reset_view();
             s.render();
-            (before, moved, hidden, s.cursor_drawn.is_some())
+            (before, moved, hidden, s.renderer.cursor_drawn().is_some())
         })
         .ok_or("no terminal")?;
         kassert!(before && moved && hidden && back);
@@ -1832,6 +1946,22 @@ crate::ktest!(
         kassert_eq!(drawn()?, before);
         reset_view(1);
         kassert_eq!(view_offset(1).ok_or("no terminal")?, 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_terminal_window_s_commands_get_no_canvas() {
+        // A command in a terminal window (#155) is refused the canvas, with
+        // its own reason, before anything on the screen changes (no
+        // terminal shown, nothing paused); so is every later command there
+        // (`renew`); the canvas is free for anyone else meanwhile.
+        use crate::kassert;
+        let owner = Owner::at(Place::Window(7));
+        kassert!(matches!(canvas(owner), Err(CanvasError::InWindow)));
+        kassert!(matches!(canvas(owner.renew()), Err(CanvasError::InWindow)));
+        kassert!(status().is_some_and(|s| !s.paused && s.shown == 0));
+        kassert!(canvas(Owner::new()).is_ok());
         Ok(())
     }
 );

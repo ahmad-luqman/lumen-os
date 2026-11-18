@@ -56,9 +56,23 @@ pub enum Key {
     End,
     /// Ctrl and a letter (`'a'` to `'z'`).
     Ctrl(char),
+    /// The console's input ended for good (its terminal window closed,
+    /// #155): no key comes after it, and a console that gave it gives it
+    /// for every key asked from then on. Never typed: no decoder or
+    /// [`Key::from_press`] makes it. Every reader stops on it: the line
+    /// editor ends the line with [`Event::Closed`].
+    Closed,
 }
 
 impl Key {
+    /// Whether a command running until a key stops on this one: Ctrl-C, or
+    /// [`Key::Closed`] (its console is gone). The one stop set every
+    /// command polling for a key uses (`top`, `play`, a script's Ctrl-C
+    /// check); the line editor tells the two apart.
+    pub const fn interrupts(self) -> bool {
+        matches!(self, Key::Ctrl('c') | Key::Closed)
+    }
+
     /// The line editor's key for a key press, if it takes one: from the
     /// press's text if it has one (`pc-keyboard` makes Enter `\n`,
     /// Backspace U+0008, Delete U+007F, Tab `\t`, Escape U+001B and Ctrl

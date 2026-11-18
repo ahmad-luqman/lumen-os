@@ -50,6 +50,12 @@ impl<'a> Capture<'a> {
     fn new(console: &'a mut dyn Console) -> Capture<'a> {
         Capture { text: String::with_capacity(CAPTURE_LIMIT), overflowed: false, failed: false, console }
     }
+
+    /// The key an overflowed pipeline's command is given: Ctrl-C, or
+    /// `Key::Closed` once its console closed (a terminal window, #155).
+    fn stop_key(&self) -> Key {
+        if self.console.closed() { Key::Closed } else { Key::Ctrl('c') }
+    }
 }
 
 impl Write for Capture<'_> {
@@ -65,11 +71,11 @@ impl Write for Capture<'_> {
 
 impl Console for Capture<'_> {
     fn read_key(&mut self) -> Key {
-        if self.overflowed { Key::Ctrl('c') } else { self.console.read_key() }
+        if self.overflowed { self.stop_key() } else { self.console.read_key() }
     }
 
     fn try_key(&mut self) -> Option<Key> {
-        if self.overflowed { Some(Key::Ctrl('c')) } else { self.console.try_key() }
+        if self.overflowed { Some(self.stop_key()) } else { self.console.try_key() }
     }
 
     fn name(&self) -> &'static str {
@@ -77,9 +83,17 @@ impl Console for Capture<'_> {
     }
 
     /// The console's: a command at the start of a pipeline on a virtual
-    /// terminal that takes the canvas brings that terminal to the front.
-    fn vt(&self) -> Option<usize> {
-        self.console.vt()
+    /// terminal that takes the canvas brings that terminal to the front, and
+    /// in a terminal window (#155) gets none.
+    fn place(&self) -> crate::term::Place {
+        self.console.place()
+    }
+
+    /// The console's (a terminal window's, #155, closing): so the shell on
+    /// it ends after a pipeline as after a command, and an overflowed
+    /// pipeline's key is `Key::Closed` rather than Ctrl-C once it closed.
+    fn closed(&self) -> bool {
+        self.console.closed()
     }
 
     fn piped(&self) -> bool {
@@ -347,7 +361,7 @@ crate::ktest!(
             ("clear | count", "clear: escape codes don't go into a pipeline\n"),
             ("reboot | count", "reboot: not in a pipeline\n"),
             ("shutdown | count", "shutdown: not in a pipeline\n"),
-            ("term nope | count", "usage: term [text]\n"),
+            ("term nope | count", "usage: term [text [window]]\n"),
         ];
         for (line, want) in cases {
             let (text, ..) = run_line(line, &[]);
@@ -467,6 +481,50 @@ crate::ktest!(
             kassert_eq!(text.lines().count(), 1);
             kassert!(!text.starts_with("top") && !ran_dry && left == 1);
         }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_pipeline_in_a_terminal_window_gets_no_canvas() {
+        // A command at the head of a pipeline typed in a terminal window
+        // (#155) runs on a capture wrapping the window's console: it is in
+        // the window all the same (no canvas: drawing over the screen from
+        // a window would leave a picture no key can take away), and closed
+        // with it.
+        use crate::kassert;
+        use crate::term::{CanvasError, Place};
+        struct InWindow {
+            closed: bool,
+        }
+        impl Write for InWindow {
+            fn write_str(&mut self, _: &str) -> fmt::Result {
+                Ok(())
+            }
+        }
+        impl Console for InWindow {
+            fn read_key(&mut self) -> Key {
+                Key::Closed
+            }
+            fn try_key(&mut self) -> Option<Key> {
+                None
+            }
+            fn name(&self) -> &'static str {
+                "a window"
+            }
+            fn place(&self) -> Place {
+                Place::Window(3)
+            }
+            fn closed(&self) -> bool {
+                self.closed
+            }
+        }
+        let mut window = InWindow { closed: true };
+        let mut capture = Capture::new(&mut window);
+        kassert!(capture.place() == Place::Window(3) && capture.closed());
+        let history = lumen_shell::History::new(0);
+        let ctx = Ctx::new(&mut capture, false, &history);
+        kassert!(matches!(ctx.canvas(), Err(CanvasError::InWindow)));
         Ok(())
     }
 );

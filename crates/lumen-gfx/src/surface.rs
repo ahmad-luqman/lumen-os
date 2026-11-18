@@ -231,6 +231,26 @@ impl Surface {
         self.fill_rect(self.bounds(), color);
     }
 
+    /// Move the `count` rows from row `from` to row `to`, up or down (the
+    /// ranges may overlap: a scroll); rows that would come from or land
+    /// outside the surface are skipped, and the rows moved away from keep
+    /// their pixels.
+    pub fn move_rows(&mut self, from: u32, to: u32, count: u32) {
+        let count = count.min(self.height.saturating_sub(from.max(to)));
+        let (w, stride) = (self.width as usize, self.stride);
+        let mut step = |i: u32| {
+            let (src, dst) = ((from + i) as usize * stride, (to + i) as usize * stride);
+            self.pixels.copy_within(src..src + w, dst);
+        };
+        // Moving down, the bottom row first, so no row is overwritten
+        // before it is read.
+        if to > from {
+            (0..count).rev().for_each(&mut step);
+        } else {
+            (0..count).for_each(&mut step);
+        }
+    }
+
     /// Copy the pixels of `src_rect` (in this surface's coordinates) to
     /// `dst`, its top-left corner landing at (`dst_x`, `dst_y`). Clipped on
     /// both sides: the part of `src_rect` outside this surface is skipped,
@@ -355,6 +375,27 @@ mod tests {
     /// The pixel at (`x`, `y`) read straight from the buffer.
     fn raw(s: &Surface, x: i32, y: i32) -> u32 {
         s.pixels[y as usize * s.stride + x as usize]
+    }
+
+    #[test]
+    fn move_rows_moves_rows_up_and_down_within_the_surface() {
+        // Up and down, overlapping, in a strided surface (the padding
+        // untouched); a range past the bottom is cut short; rows moved
+        // away from keep their pixels.
+        for (from, to, count) in [(2u32, 0u32, 3u32), (0, 2, 3), (1, 1, 4), (3, 0, 10), (0, 4, 10), (5, 0, 1)] {
+            let mut s = numbered_strided(4, 5, 100, 6);
+            let before = s.clone();
+            s.move_rows(from, to, count);
+            let n = count.min(5u32.saturating_sub(from.max(to)));
+            for y in 0..5i32 {
+                for x in 0..4i32 {
+                    let moved = (y as u32) >= to && (y as u32) < to + n;
+                    let src = if moved { y - to as i32 + from as i32 } else { y };
+                    assert_eq!(raw(&s, x, y), raw(&before, x, src), "({from}, {to}, {count}) at ({x}, {y})");
+                }
+                assert_eq!(&s.pixels[y as usize * 6 + 4..y as usize * 6 + 6], &[0, 0]);
+            }
+        }
     }
 
     #[test]

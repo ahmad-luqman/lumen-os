@@ -145,8 +145,9 @@ own PR that updates that doc first.
   I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
   reporter. `ktest.rs`: test runner. `script.rs`: rhai scripts (the shell's
   `rhai`; built-in scripts in `script/`). `shell/`: the shells, one on serial
-  (plain text unless `lumen.ansi`) and one on each virtual terminal (keyboard): `mod.rs`
-  the consoles and `Ctx` (keys through `poll_key`/`wait_key`, the screen
+  (plain text unless `lumen.ansi`), one on each virtual terminal (keyboard) and one in each terminal
+  window (`run_in_window`, #155): `mod.rs` the consoles (`Console::place`: anywhere, a virtual terminal
+  or a window; `closed`) and `Ctx` (keys through `poll_key`/`wait_key`, the screen
   through `canvas`), their commands (`commands.rs`: each row carries its
   help line; the system ones in `sysinfo.rs`), pipelines (`pipe.rs`: `cpus |
   where busy > 50`) and deliberate faults (`crash.rs`). `fb.rs`:
@@ -155,16 +156,18 @@ own PR that updates that doc first.
   `Canvas`: the pixels below the header for one command, the terminals paused meanwhile;
   and the mouse pointer, a save-under arrow that drawing over it takes off and puts back;
   `take_screen`: the desktop's `ScreenCanvas`, the whole screen, a row per hold of the screen's lock;
-  `leave_desktop`). `vt.rs`: the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4 switching;
+  `leave_desktop`; `Cells` over `Pixels`: a cell's pixels, the console's and the terminal windows', drawn by
+  `lumen_term::render::Renderer`; `view_text_from`). `vt.rs`: the keyboard's keys to the shown virtual terminal's shell, Alt+F1 to F4 switching;
   the decoding pass (`decode_pending`), `desktop_shown()` (keys the desktop's alone while it is), `cut()` (a
   copy of where each pause and resume falls in the input rings, with the `pause_owns_*`/`after_resume_*`
   predicates) and `enter_desktop`.
   `desktop.rs`: the desktop (#153): the `compositor` thread (the back buffer, damage-only presents, the
   pointer drawn on the screen only, both input rings through `lumen_wm::Wm`, the cut), windows
-  (`open_window`, `WindowHandle`: an owner's surface and a committed one, `commit`, `next_event`/`wait_event`,
-  `Desktop::without_screen` for the ktests; `publish`: a toolkit's tree), each window's root node, the two
-  demo windows, `desktop` (`status`, `check`, `spin`, `counter`, `hold`/`release`) and `windows`, and the tree's
-  accessors for `ui.rs` (`tree_rows`, `find_node`, `push_request`: a refused request handed back);
+  (`open_window`, `open_window_at`, `WindowHandle`: an owner's surface and a committed one, `commit`,
+  `next_event`/`wait_event`/`wait_event_until`, a `Waker` for another thread, `Desktop::without_screen` for the
+  ktests; `publish`: a toolkit's tree), each window's root node, the two demo windows, `desktop` (`status`,
+  `check`, `spin`, `counter`, `hold`/`release`) and `windows`, and the tree's accessors for `ui.rs`
+  (`tree_rows`, `find_node`, `push_request`: a refused request handed back);
   `lumen.desktop_cut_delay_ms=` widens the race at a pause for the scenarios;
   the look (#154): titles and the demos' text in the UI font (`font::Text`), the embedded
   wallpaper (`assets/wallpaper/lumen.png`, made by `tools/wallpaper.py`; decoded once a boot at
@@ -174,7 +177,9 @@ own PR that updates that doc first.
   and every wait goes through `Window::wait`, which wakes for `has_event()`). `ui.rs`: the toolkit in a window
   (#156: `Toolkit<A: lumen_ui::App>`, one step per event that publishes before it answers, its palette from the
   `Theme` it is handed, its text `font::Text`), `ui invoke`'s `Request` (its reply slot; `start` gives the
-  `Started` that answers; either answers for itself if dropped), Counter's owner, and `ui tree`/`ui invoke`. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
+  `Started` that answers; either answers for itself if dropped), Counter's owner, and `ui tree`/`ui invoke`. `termwin.rs`: terminal windows (#155): `terminal` opens one, its
+  owner thread (`terminal`: draws the grid, hands keys over, blinks the focused one's cursor) and its shell
+  (`term-shell`, `shell::run_in_window` on a closable console), joined on close; `term text <window>`. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -253,7 +258,7 @@ own PR that updates that doc first.
 - `crates/lumen-gfx`: the desktop's pixel core: `Rect` (signed origin,
   intersect/union/clip, subtract into at most 4), `Damage` (a fixed-size
   list that coalesces, a bounding box past its size, never loses
-  coverage), `Surface` (xRGB8888 with a stride: fill, clipped blits,
+  coverage), `Surface` (xRGB8888 with a stride: fill, clipped blits, `move_rows` (a scroll),
   `blend_mask`/`blend_mask_in` for coverage masks such as glyphs, the
   latter clipped to a damaged rect) and `Target`, what a surface is
   presented to a span at a time (a surface; the desktop's front buffer,
@@ -336,7 +341,9 @@ own PR that updates that doc first.
   queue (interrupt handler to thread; host-tested, incl. threads).
 - `crates/lumen-term`: terminal emulator core: `vte` escapes into a cell
   grid, scrollback, damage tracking (host-tested, incl. a randomized model
-  renderer), and `vt::Router`, a key ring per virtual terminal (the
+  renderer), `render::Renderer` (drawing only what changed on a
+  `CellTarget`, the cursor solid or hollow: the console's and the
+  terminal windows' renderer, #155), and `vt::Router`, a key ring per virtual terminal (the
   kernel fills them with each key routed to the terminal shown then).
 - `crates/lumen-shell`: shell core: word splitting with quotes (checked
   against `shlex`; commands split at `|`), the line editor (history,
@@ -345,7 +352,9 @@ own PR that updates that doc first.
   cell that wouldn't read back as one word printed quoted (`quoted`); the
   filters `grep`, `where`, `sort`, `first`, `count`, `select`), serial
   bytes to keys, a key press to the line editor's key (`Key::from_press`,
-  shared by text mode and terminal windows, with #155) (host-tested).
+  shared by text mode and terminal windows), `Key::Closed`/`Event::Closed`
+  (a closed console's input) and `Key::interrupts` (Ctrl-C or Closed: what
+  commands polling for a key stop on) (host-tested).
 - `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET, MCFG,
   FADT (PM1 control blocks) and the DSDT's `_S5_` by byte search
   (host-tested on handcrafted tables).
@@ -385,7 +394,8 @@ own PR that updates that doc first.
   `move_pointer`/`click` for the tablet), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
   `crash.py` (crash-report parsing), `audio.py` (wav files as QEMU's
   wav audiodev writes them: pitch by zero crossings, Goertzel amplitude),
-  `screen.py` (the screen's rows through the serial shell's `term text`),
+  `screen.py` (the screen's rows through the serial shell's `term text`, a
+  terminal window's through `term text <window>`),
   `gui.py` (input steps confirmed one at a time: `pointer_move`,
   `pointer_down`/`pointer_up`, `drag` against `mouse`'s frames and state,
   `confirmed_keys`/`type_confirmed` against `kbd`'s presses, bytes and

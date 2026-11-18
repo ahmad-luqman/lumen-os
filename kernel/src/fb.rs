@@ -166,14 +166,7 @@ impl Framebuffer {
     /// Draw one glyph (`?` for one the font lacks), at most `max_w` pixels
     /// of it wide; returns its advance in pixels, clipped to `max_w`.
     pub fn glyph_clipped(&self, x: usize, y: usize, c: char, st: Style, max_w: usize) -> usize {
-        let raster = get_raster(c, st.weight, st.size).or_else(|| get_raster('?', st.weight, st.size));
-        let Some(raster) = raster else { return get_raster_width(st.weight, st.size).min(max_w) };
-        for (dy, row) in raster.rows().enumerate() {
-            for (dx, &a) in row.iter().take(max_w).enumerate() {
-                self.put(x + dx, y + dy, blend(st.bg, st.fg, a));
-            }
-        }
-        raster.width().min(max_w)
+        glyph_pixels(c, st, max_w, |dx, dy, rgb| self.put(x + dx, y + dy, rgb)).0
     }
 
     /// Draw `s` from (`x`, `y`), clipped at the right edge; returns the
@@ -229,7 +222,24 @@ impl Style {
     }
 }
 
-fn blend(bg: u32, fg: u32, alpha: u8) -> u32 {
+/// One glyph of `st`'s font (`?` for one it lacks), at most `max_w`
+/// pixels of it wide, a pixel at a time: `put(dx, dy, rgb)`, offsets from
+/// its top-left corner, each pixel `st`'s foreground blended over its
+/// background by the glyph's coverage. Its advance clipped to `max_w`, and
+/// its height. The one way glyphs are drawn on the framebuffer and on a
+/// terminal window's surface (#155), so the two agree pixel for pixel.
+pub fn glyph_pixels(c: char, st: Style, max_w: usize, mut put: impl FnMut(usize, usize, u32)) -> (usize, usize) {
+    let raster = get_raster(c, st.weight, st.size).or_else(|| get_raster('?', st.weight, st.size));
+    let Some(raster) = raster else { return (get_raster_width(st.weight, st.size).min(max_w), 0) };
+    for (dy, row) in raster.rows().enumerate() {
+        for (dx, &a) in row.iter().take(max_w).enumerate() {
+            put(dx, dy, blend(st.bg, st.fg, a));
+        }
+    }
+    (raster.width().min(max_w), raster.height())
+}
+
+pub(crate) fn blend(bg: u32, fg: u32, alpha: u8) -> u32 {
     let a = u32::from(alpha);
     let ch = |shift: u32| {
         let b = (bg >> shift) & 0xff;

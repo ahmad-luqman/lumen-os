@@ -63,7 +63,11 @@ impl Write for Out {
 pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
     // Stored only once the fault will run (a remote one's after its job is
     // claimed): an earlier refusal leaves a fault under way where it was.
-    let vt = ctx.out.vt().unwrap_or(0);
+    // The crash screen's terminal: the shell's own, or the first.
+    let vt = match ctx.out.place() {
+        crate::term::Place::Vt(vt) => vt,
+        crate::term::Place::Anywhere | crate::term::Place::Window(_) => 0,
+    };
     let kind = args.first().map_or("", String::as_str);
     let Some(fault) = crash_fn(kind) else {
         return ctx.fail(format_args!("crash: unknown kind '{kind}' ({})", KINDS.join(" ")));

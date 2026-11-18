@@ -293,7 +293,9 @@ impl State {
         let now = crate::time::now_ns();
         if now >= self.next_poll.get() {
             self.next_poll.set(now.saturating_add(self.limits.poll_ns));
-            let ctrl_c = self.console.with(|c| core::iter::from_fn(|| c.try_key()).any(|k| k == Key::Ctrl('c')));
+            // A closed console (a terminal window, #155) stops it as Ctrl-C
+            // does; it gives `Closed` for good, so `any` ends on it.
+            let ctrl_c = self.console.with(|c| core::iter::from_fn(|| c.try_key()).any(Key::interrupts));
             if ctrl_c == Some(true) {
                 self.stop.set(Some(Stop::CtrlC));
                 return true;
@@ -1013,6 +1015,8 @@ fn repl(console: &mut dyn Console, owner: Owner, limits: Limits, ansi: bool) {
             match event {
                 Ok(Some(Event::Line(line))) => break Some(line),
                 Ok(Some(Event::Cancelled)) => break None,
+                // The console is gone (its terminal window closed).
+                Ok(Some(Event::Closed)) => return,
                 _ => {}
             }
         };
