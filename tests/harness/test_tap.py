@@ -42,3 +42,11 @@ def test_missing_plan_is_not_success():
 def test_lines_before_tap_header_are_ignored():
     r = tap.parse("ok 99 - not a test\n" + GOOD)
     assert [c.number for c in r.cases] == [1, 2]
+
+
+def test_comments_after_the_last_result_belong_to_no_test():
+    # The ktest runner prints its summary and `lumen.ktest=` comment there.
+    r = tap.parse(
+        "TAP version 14\n1..1\nok 1 - a\n# ktest: 1 passed, 0 failed\n# ktest: only a: 1 of 3\n"
+    )
+    assert r.complete and r.cases[-1].diagnostics == []

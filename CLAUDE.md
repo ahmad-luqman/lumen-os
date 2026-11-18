@@ -19,6 +19,7 @@ make lint fmt        # clippy -D warnings + ruff; rustfmt + ruff format
 make status-check    # feature gate: every feature in tests/features/ passes (CI runs this)
 make status          # regenerate docs/STATUS.md from the last test results (on main)
 make golden          # re-record golden screenshots (look at them before committing!)
+make census          # CI's red first attempts over the last week and the tests behind them (DAYS=7; needs gh)
 ```
 
 One scenario: `uv run pytest tests/scenarios/test_crash.py -k pf -v`.
@@ -162,7 +163,7 @@ own PR that updates that doc first.
   `arch/x86_64/`: GDT/TSS (per CPU), IDT, entry
   stubs and the vector map, `percpu.rs` (GS base, CPU index), `irq.rs` (nested interrupt disable), local and
   I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
-  reporter. `ktest.rs`: test runner. `script.rs`: rhai scripts (the shell's
+  reporter. `ktest.rs`: test runner (`lumen.ktest=` runs only the tests with given name prefixes). `script.rs`: rhai scripts (the shell's
   `rhai`; built-in scripts in `script/`). `shell/`: the shells, one on serial
   (plain text unless `lumen.ansi`), one on each virtual terminal (keyboard) and one in each terminal
   window (`run_in_window`, #155): `mod.rs` the consoles (`Console::place`: anywhere, a virtual terminal
@@ -442,6 +443,10 @@ own PR that updates that doc first.
   HPET-or-PIT choice, read back and checked against the numbers they print:
   `judged`, `verdict`, `weighed`, `no_other_warnings`), `clock_diags.py` (the
   clock cross-check ktests' diagnostics, `check_clock_diags`),
+  `census.py` (the flake census: CI's red first attempts per day, how many
+  passed on a re-run, and the tests that failed them, from the failed jobs'
+  logs through `gh`; `make census`, and weekly in the `flake-census`
+  workflow's summary),
   `screenshot.py` (`screenshot`'s frame read back and checked;
   `Machine.screenshot_via_serial`),
   `shell.py` (`run`: a serial command's output, the log's lines taken out

@@ -20,7 +20,7 @@ KERNEL_SRCS := $(shell find kernel crates -name '*.rs' -o -name '*.toml' -o -nam
 # their recipes must never run concurrently (`make -j`).
 .NOTPARALLEL:
 
-.PHONY: help deps build iso run debug test test-host test-scenarios audit lint fmt fmt-check status status-check golden clean
+.PHONY: help deps build iso run debug test test-host test-scenarios audit lint fmt fmt-check status status-check census golden clean
 
 help: ## Show this help
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-15s %s\n", $$1, $$2}'
@@ -114,6 +114,10 @@ status: ## Regenerate docs/STATUS.md from the last test results
 
 status-check: ## Feature gate: fail unless every feature in tests/features/ passes
 	$(HARNESS) status --check
+
+DAYS ?= 7
+census: ## CI's red first attempts over the last DAYS days, and the tests behind them (needs gh)
+	$(HARNESS) census --days $(DAYS)
 
 golden: iso ## Re-record golden screenshots (review the diff before committing!)
 	LUMEN_UPDATE_GOLDEN=1 uv run --frozen pytest tests/scenarios -k golden -v
