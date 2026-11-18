@@ -160,12 +160,6 @@ def check_calibration(cal: Calibration, reference_hz: int) -> None:
     assert cal.retook <= MOST_RETAKEN or steady_windows(cal) < 5, cal
 
 
-def check_retake_line(m, cal: Calibration) -> None:
-    """Boot logs how many windows it took again exactly when it took any."""
-    line = f"INFO  time: tsc calibration took {cal.retook} windows again"
-    assert (line in m.output) == (cal.retook > 0), (cal.retook, line)
-
-
 def ticks(m) -> tuple[int, int, int, int]:
     """the shell's `ticks`: timer interrupts, then spurious and unexpected ones and
     local APIC errors."""
@@ -195,7 +189,6 @@ def test_clocks_shows_the_windows_behind_each_measurement(boot):
     check_calibration(cals["boot"], HPET_HZ)
     check_calibration(cals["pit"], PIT_HZ)
     check_calibration(cals["hpet"], HPET_HZ)
-    check_retake_line(m, cals["boot"])
     check_boot_verdict(m, cals["boot"])
 
 

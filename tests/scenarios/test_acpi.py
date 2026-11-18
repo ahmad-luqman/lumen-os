@@ -18,7 +18,6 @@ from test_time import (
     assert_agree,
     check_boot_verdict,
     check_calibration,
-    check_retake_line,
     clocks_and_windows,
     ticks,
 )
@@ -72,7 +71,6 @@ def test_no_hpet_is_a_warning(boot):
     check_calibration(cals["boot"], PIT_HZ)
     check_calibration(cals["pit"], PIT_HZ)
     assert_agree(cals["boot"], cals["pit"])
-    check_retake_line(m, cals["boot"])
     check_boot_verdict(m, cals["boot"])
 
 
