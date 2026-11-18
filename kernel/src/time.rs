@@ -475,16 +475,14 @@ fn median_calibration(got: &Steadiest<WINDOWS>, of: Calibrated, known_hz: u64) -
 /// bracket).
 fn stall_window_ends(stall: Stall) -> impl FnMut(Pause) {
     let (mut started, mut last_run) = (0u64, 0u64);
-    let share =
-        |ticks: u64, ppm: u64| u64::try_from(u128::from(ticks) * u128::from(ppm) / 1_000_000).unwrap_or(u64::MAX);
     move |at| match at {
         Pause::StartAfterRead if stall != Stall::default() => {
-            spin_ticks(share(last_run, stall.start));
+            spin_ticks(lumen_time::stall_ticks(last_run, stall.start));
             started = arch::rdtsc();
         }
         Pause::EndAfterRead if stall != Stall::default() => {
             last_run = arch::rdtsc().wrapping_sub(started);
-            spin_ticks(share(last_run, stall.end));
+            spin_ticks(lumen_time::stall_ticks(last_run, stall.end));
         }
         _ => {}
     }
@@ -493,7 +491,9 @@ fn stall_window_ends(stall: Stall) -> impl FnMut(Pause) {
 /// The `lumen.stall_*_windows=<end ppm>[,<start ppm>]` value for `key`
 /// ([`lumen_time::parse_stall`], up to [`lumen_time::MOST_STALL_PPM`]), none
 /// without one. One that doesn't parse is warned about and ignored; one in
-/// effect is said once at INFO (scenarios that use it expect no warning).
+/// effect is said once at INFO, not as a warning: test_time's stall
+/// scenarios allow a `time` warning only from a calibration's verdict
+/// (`lumen_harness.calibration.no_other_warnings`).
 fn stall_from_cmdline(key: &str) -> Stall {
     let Some(v) = crate::cmdline::value(key) else { return Stall::default() };
     match lumen_time::parse_stall(v) {
@@ -2039,6 +2039,14 @@ crate::ktest!(
             "a stall next to the timer's register accesses), so its rate may be off by up to 3.1% (0.5% of it the \
              TSC's calibration), over the 2.0% allowed"
         ));
+        // At the edge: its own windows at exactly 2% are within it, so the
+        // TSC is what takes it past, and named; a ppm more, its own reads.
+        let at_edge = report(&cal([200_000; WINDOWS], 20, Calibrated::Timer { tsc_ppm: 1_000 }));
+        kassert_eq!((at_edge.cal.windows_bound_ppm(), at_edge.verdict), (20_000, Verdict::Imprecise));
+        kassert!(text(&at_edge).contains("but the TSC it is measured against may be off by up to 0.1%, so"));
+        let past_edge = report(&cal([200_010; WINDOWS], 20, Calibrated::Timer { tsc_ppm: 1_000 }));
+        kassert_eq!(past_edge.cal.windows_bound_ppm(), 20_001);
+        kassert!(text(&past_edge).contains("a stall next to the timer's register accesses"));
         let unusable = timer([1_000, 2_000, 10_000_000, 10_000_000, 20_000_000], 18);
         kassert_eq!((unusable.verdict, unusable.action()), (Verdict::Unusable, Action::Panic));
         kassert!(text(&unusable).starts_with(

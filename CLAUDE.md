@@ -127,6 +127,25 @@ own PR that updates that doc first.
   (including 0 from a triple fault with `-no-reboot`) is a failure. The one
   exception: 0 in the power-off scenario, with a QMP `SHUTDOWN` event whose
   reason is `guest-shutdown` (a triple fault's is `guest-reset`).
+- **Tests on a busy host.** A guest's clocks run on while the host stalls
+  its vCPU, so a loaded laptop or CI runner adds time to anything timed
+  (measured in #139, #165, #170 and #171). A new or changed scenario or
+  ktest asserts only what the host can't change (older checks, such as
+  test_time's ceilings on unstalled calibrations, come in line when they
+  are next changed):
+  - a floor (the printed bound is at least the injected stall);
+  - a decision that follows from the numbers the kernel printed
+    (`lumen_harness.calibration`);
+  - an effect confirmed before the next step (`gui.py`'s steps, `mouse hold`).
+
+  Not a ceiling or a % range on something timed, nor a "no WARN at boot"
+  that a slow boot trips. Exact numbers and texts for given inputs belong in
+  host tests or ktests over made-up inputs. A claim that only means
+  something within a tolerance (test_ktest's stalled-within-tolerance runs)
+  keeps its precondition, and its PR says it is at risk on a busy host.
+  Reviewers: don't ask a scenario for timing ranges. A mutant that only a
+  slower result would show goes in the PR's not-tested notes, or gets a
+  deterministic seam.
 - **Golden images** live in `tests/golden/`. Re-record with `make golden` only
   when the change to the screen is intended, and open the PNG to check it.
 
@@ -342,7 +361,7 @@ own PR that updates that doc first.
   steadiness, the ones with the smallest bounds filling in, how far off a
   median can be for either rate, `tsc_error_ppm`, a window slow to read
   stretched, the verdict against each clock's tolerance, `within_bounds`,
-  the stall knobs' parser), tick/ns
+  the stall knobs' parser and `stall_ticks`, their share of a window), tick/ns
   conversion, timer counts, log time formats (`Stamp`, `Millis`),
   percentages and rates, one clock's reading placed between two reads of
   another and retaken while too wide (`Bracketed`, `first_narrow`: the
@@ -419,6 +438,10 @@ own PR that updates that doc first.
   `desktop_status`, `wait_settled`, `desktop_check`, `settled_screendump`;
   the automation tree's `ui_tree`, `node`, `wait_ui`, `invoke`,
   `desktop_counter`; `parse_records` reads quoted cells with `shlex`),
+  `calibration.py` (a boot calibration's verdict line, and the TSC's
+  HPET-or-PIT choice, read back and checked against the numbers they print:
+  `judged`, `verdict`, `weighed`, `no_other_warnings`), `clock_diags.py` (the
+  clock cross-check ktests' diagnostics, `check_clock_diags`),
   `screenshot.py` (`screenshot`'s frame read back and checked;
   `Machine.screenshot_via_serial`),
   `shell.py` (`run`: a serial command's output, the log's lines taken out
