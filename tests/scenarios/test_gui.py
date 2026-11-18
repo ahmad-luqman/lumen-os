@@ -344,12 +344,13 @@ def pause_while(m: Machine, line: str) -> None:
     reading the rings and reading the cut (a key wakes it into that
     wait), then Alt+F1: the request `line` makes is accepted while the
     desktop is shown and still queued when the pause comes."""
-    # unconfirmed: a race on purpose (the request lands between the key
-    # and Alt+F1), and the serial shell is busy with `line`
+    # unconfirmed: a race on purpose: `y` must wake the compositor just
+    # before `line` lands (and Alt+F1 goes while the serial shell is busy
+    # with it)
     m.press(["y"])
     time.sleep(0.3)
     m.send_line(line)
-    m.press(["alt", "f1"])
+    m.press(["alt", "f1"])  # unconfirmed: the same race, `line` still running
 
 
 def test_a_check_queued_as_the_desktop_pauses_is_answered_paused(boot):

@@ -452,5 +452,5 @@ own PR that updates that doc first.
   `shell.py` (`run`: a serial command's output, the log's lines taken out
   and kept, a WARN or ERROR failing it unless allowed; `PROMPT`), `klog.py`
   (the kernel log line's format, as kernel/src/klog.rs prints it).
-- `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests.
+- `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests (and `test_scenario_typing.py`, a lint: raw keys in scenarios need `# unconfirmed: <why>`).
   `tests/features/*.toml`: feature → test map (the CI feature gate and STATUS.md).

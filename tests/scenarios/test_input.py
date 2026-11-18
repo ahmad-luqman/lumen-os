@@ -90,7 +90,7 @@ def test_keys_via_qmp_send_key(boot):
     shells_ready(m, "us")
     before = kbd_stats(m)
     start = len(m.output)
-    # unconfirmed: this test counts the keys itself, after the burst
+    # unconfirmed: this test counts the keys itself, once they are typed
     m.type_text(text)
     expect_screen(m, r"^lumen> echo Hello, World!\nHello, World!\nlumen>$")
     assert not re.search(r"^Hello", m.output[start:], re.MULTILINE)
@@ -116,15 +116,13 @@ def test_keys_via_qmp_send_key(boot):
     # settle, then counts exactly its own presses and bytes. Its counts
     # show the burst counted before it, all of it.
     burst = "echo abcdefghijklmnop"
-    # unconfirmed: the burst still arriving is what the next step is about
-    m.type_text(burst)
+    m.type_text(burst)  # unconfirmed: the burst still arriving is the point
     got = gui.confirmed_keys(m, "x", "\n")
     assert got.presses - s.presses == len(burst) + 2, (s.presses, got.presses)
     assert (got.bytes - s.bytes, got.held) == (2 * (len(burst) + 2), 0), got
     expect_screen(m, rf"^lumen> {burst}x\nabcdefghijklmnopx\nlumen>$")
-    # unconfirmed: a key held when a confirmed one goes is the point here.
-    # A key held when a confirmed one goes (shift, 400 ms, sent past
-    # `press`'s schedule; reproduced in review): the step waits for its
+    # unconfirmed: a key held when a confirmed one goes (shift, 400 ms, sent
+    # past `press`'s schedule; reproduced in review): the step waits for its
     # release, then counts its own keys, so shift's release can't stand in
     # for the key's own.
     m.qmp().send_key(["shift"], hold_ms=400)
@@ -662,8 +660,7 @@ def test_key_events_have_releases_and_modifiers(boot):
     m = boot("qemutest")
     shells_ready(m, "us")
     assert run(m, "kbd events") == "  seq  code        action   text    mods       after_drop\n"
-    # unconfirmed: the ring's events, read next, confirm it
-    m.press(["shift", "a"])
+    gui.confirmed_keys(m, ["shift", "a"])
     rows = poll(lambda: events(m, "kbd events 8"), lambda r: len(r) >= 4, m)
     assert rows == [
         ["1", "LShift", "press", "-", "shift+num", "no"],

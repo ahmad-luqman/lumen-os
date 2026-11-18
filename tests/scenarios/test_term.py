@@ -96,14 +96,14 @@ def test_scrollback(boot, artifacts, golden_dir):
     # The scrollback's line i is `i` (line 0 the command), and the view's top
     # row is line scrollback - view.
     scrollback = before.scrollback
-    # unconfirmed: each key's debug line, read next, confirms it (a confirmed
-    # step's `kbd` would read past that line)
+    # Each key's debug line, read next, confirms it: a confirmed step's `kbd`
+    # would read past that line.
     qmp = m.qmp()
-    qmp.send_key(["shift", "pgup"])
+    qmp.send_key(["shift", "pgup"])  # unconfirmed: its debug line confirms it
     assert view_moved(m) == (half, str(scrollback - half))
-    qmp.send_key(["shift", "pgup"])
+    qmp.send_key(["shift", "pgup"])  # unconfirmed: its debug line confirms it
     assert view_moved(m) == (2 * half, str(scrollback - 2 * half))
-    qmp.send_key(["shift", "pgdn"])
+    qmp.send_key(["shift", "pgdn"])  # unconfirmed: its debug line confirms it
     assert view_moved(m) == (half, str(scrollback - half))
     still = term_status(m)
     assert (still.view, still.top_row) == (half, str(scrollback - half)), still
@@ -234,9 +234,11 @@ def test_a_command_drawing_brings_its_terminal_to_the_front(boot):
     # A script typed in terminal 1 waits, then draws; meanwhile Alt+F2 shows
     # terminal 2. When it draws, terminal 1 comes back to the front (its
     # "press a key" line in its grid, which `term text` now reads), and the
-    # key typed then reaches it there.
+    # key typed then reaches it there. Alt+F2 must land within the script's
+    # 8 s sleep, by the guest's clock (at risk on a host that stalls the
+    # guest that long between Enter and Alt+F2, each a confirmed step).
     m = boot_term(boot)
-    confirmed_keys(m, "rhai -e 'sleep(4000); draw_rect(0, 0, 50, 50, 0x00ff00)'\n", ["alt", "f2"])
+    confirmed_keys(m, "rhai -e 'sleep(8000); draw_rect(0, 0, 50, 50, 0x00ff00)'\n", ["alt", "f2"])
     expect_screen(m, r"\Alumen>\s*\Z")
     assert vt_status(m).shown == 2
     expect_screen(m, r"^rhai: press a key on the keyboard$", 30)

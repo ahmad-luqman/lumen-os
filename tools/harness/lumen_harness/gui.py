@@ -6,7 +6,8 @@ screen. When a key typed under load went missing (#128: `echo abcd` read
 as `echo abc`), a test that typed a burst and then looked at the screen
 could only say that the screen was wrong. The steps here check each event
 against counters the kernel keeps as the events arrive, read through the
-serial shell, before the next step goes:
+serial shell, before the next step goes. Scenarios type only through
+`confirmed_keys`, or say why not (tests/harness/test_scenario_typing.py):
 
 - **Pointer** (a virtio tablet, `Devices(tablet=True)`): `pointer_move`,
   `pointer_down`, `pointer_up` and `drag`. Each QMP `input-send-event` is

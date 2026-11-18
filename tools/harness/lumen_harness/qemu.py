@@ -910,7 +910,9 @@ class Machine:
         pressed back to back arrive in order. The shown virtual terminal's
         shell answers them on the screen, not on serial: wait for what they
         did with
-        `lumen_harness.screen.expect_screen`.
+        `lumen_harness.screen.expect_screen`. Scenarios type through
+        `gui.confirmed_keys` instead: a raw press there needs an
+        `# unconfirmed: <why>` comment (tests/harness/test_scenario_typing.py).
 
         QEMU's input queue holds 1024 entries and silently drops the rest
         (`ui/input.c`): a `send-key` of n keys takes 6n (each key's press

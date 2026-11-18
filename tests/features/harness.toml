@@ -202,7 +202,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Every key a scenario types goes through confirmed_keys, or says why not: a raw Machine.press, type_text or QMP send_key in tests/scenarios needs an `# unconfirmed: <why>` comment in its paragraph (#128)"
+name = "Scenario typing is confirmed or says why (#128): each statement in tests/scenarios that calls or names `.press`, `.type_text` or `.send_key`, or sends QMP's `send-key`, has its own `# unconfirmed: <why>` comment (on its line or in the comment block directly above), found with ast/tokenize, not in strings; in lumen_harness only the functions implementing those paths use them; the scan fails if it finds no scenario files"
 milestone = "M4"
 tests = [
     "harness:test_scenario_typing::*",
