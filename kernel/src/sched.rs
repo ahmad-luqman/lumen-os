@@ -452,6 +452,10 @@ static HELD_JOINERS: AtomicU64 = AtomicU64::new(u64::MAX);
 /// up after 1 s).
 #[cfg(feature = "ktest")]
 static HELD_SAW_JOINER: AtomicBool = AtomicBool::new(false);
+/// Ktests: how long the last hold lasted, past seeing its joiner (ns, by
+/// `now_ns`).
+#[cfg(feature = "ktest")]
+static HELD_NS: AtomicU64 = AtomicU64::new(0);
 /// Ticks each CPU's scheduler has taken (from its start), and how many of
 /// them found the idle thread running. A tick is counted in `TICKED` before
 /// `IDLE_TICKS` (whose increment releases it), and [`cpu_ticks`] reads them
@@ -1047,7 +1051,9 @@ fn hold_if_asked(r: &Released) {
     }
     HELD_SAW_JOINER.store(PAST_REAPED.load(Ordering::Acquire) == id, Ordering::Relaxed);
     HELD_JOINERS.store(r.joiners.len() as u64, Ordering::Relaxed);
+    let start = time::now_ns();
     time::spin(20_000_000);
+    HELD_NS.store(time::now_ns() - start, Ordering::Relaxed);
 }
 
 /// The timer interrupt on this CPU (interrupts off, EOI sent): the first
@@ -2775,6 +2781,7 @@ crate::ktest!(
         let id = h.thread.id;
         HELD_JOINERS.store(u64::MAX, Ordering::Relaxed);
         HELD_SAW_JOINER.store(false, Ordering::Relaxed);
+        HELD_NS.store(0, Ordering::Relaxed);
         HOLD_FINISHING.store(id, Ordering::Relaxed);
         // A plain `join`, which blocks on the thread's queue (polling, as
         // `join_bounded` does, never would). Bounded all the same: the thread
@@ -2783,9 +2790,10 @@ crate::ktest!(
         let heap = crate::mm::heap::stats();
         HOLD_FINISHING.store(0, Ordering::Relaxed);
         kassert!(threads().iter().all(|t| t.id != id));
-        // The hold applied, with its one joiner past its wait.
+        // The hold applied, with its one joiner past its wait, all 20 ms.
         kassert_eq!(HELD_JOINERS.load(Ordering::Relaxed), 1);
         kassert!(HELD_SAW_JOINER.load(Ordering::Relaxed));
+        kassert!(HELD_NS.load(Ordering::Relaxed) >= 20_000_000);
         // `join` read the right CPU's slot.
         kassert!(FINISHING[cpu].load(Ordering::Acquire) != id);
         let _ = sleep(50_000_000);
