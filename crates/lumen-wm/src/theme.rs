@@ -2,10 +2,66 @@
 //! light|dark`, `lumen.theme=`). Colours are `0x00RRGGBB`, as `lumen-gfx`
 //! draws them.
 
+/// Which theme: the closed set the desktop switches between (`theme
+/// light|dark`, `lumen.theme=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ThemeId {
+    Light,
+    Dark,
+}
+
+impl ThemeId {
+    /// Every theme, the default (light) first, each at its
+    /// [`ThemeId::index`].
+    pub const ALL: [ThemeId; 2] = [ThemeId::Light, ThemeId::Dark];
+
+    /// Its place in [`ThemeId::ALL`] (what the kernel keeps in a byte).
+    pub const fn index(self) -> u8 {
+        match self {
+            ThemeId::Light => 0,
+            ThemeId::Dark => 1,
+        }
+    }
+
+    /// The theme at `index` in [`ThemeId::ALL`], `None` past its end.
+    pub const fn from_index(index: u8) -> Option<ThemeId> {
+        match index {
+            0 => Some(ThemeId::Light),
+            1 => Some(ThemeId::Dark),
+            _ => None,
+        }
+    }
+
+    /// The theme named `name` (`light`, `dark`; exactly).
+    pub fn by_name(name: &str) -> Option<ThemeId> {
+        ThemeId::ALL.into_iter().find(|id| id.name() == name)
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            ThemeId::Light => "light",
+            ThemeId::Dark => "dark",
+        }
+    }
+}
+
+// Every theme at its index, both ways: a variant added out of order, or
+// left out of one of the matches, fails to build here.
+const _: () = {
+    let mut i = 0;
+    while i < ThemeId::ALL.len() {
+        assert!(ThemeId::ALL[i].index() as usize == i);
+        assert!(matches!(ThemeId::from_index(i as u8), Some(id) if id.index() as usize == i));
+        i += 1;
+    }
+    assert!(ThemeId::from_index(ThemeId::ALL.len() as u8).is_none());
+};
+
 /// Every colour the desktop draws with, for one theme.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Theme {
-    pub name: &'static str,
+    pub id: ThemeId,
     /// The flat colour behind the windows when there is no wallpaper.
     pub desktop: u32,
     pub border_focused: u32,
@@ -30,7 +86,7 @@ pub struct Theme {
 
 impl Theme {
     pub const LIGHT: Theme = Theme {
-        name: "light",
+        id: ThemeId::Light,
         desktop: 0x3a6ea5,
         border_focused: 0x2b5797,
         border: 0x9a9a9a,
@@ -51,7 +107,7 @@ impl Theme {
     };
 
     pub const DARK: Theme = Theme {
-        name: "dark",
+        id: ThemeId::Dark,
         desktop: 0x1e2430,
         border_focused: 0x4c8ed0,
         border: 0x3c3c3c,
@@ -71,12 +127,12 @@ impl Theme {
         pointer_fill: 0xffffff,
     };
 
-    /// Every theme, the default (light) first.
-    pub const ALL: [&'static Theme; 2] = [&Theme::LIGHT, &Theme::DARK];
-
-    /// The theme with this name.
-    pub fn by_name(name: &str) -> Option<&'static Theme> {
-        Theme::ALL.into_iter().find(|t| t.name == name)
+    /// The palette of theme `id`.
+    pub const fn get(id: ThemeId) -> &'static Theme {
+        match id {
+            ThemeId::Light => &Theme::LIGHT,
+            ThemeId::Dark => &Theme::DARK,
+        }
     }
 
     /// Every colour with its field's name.
@@ -140,12 +196,12 @@ mod tests {
 
     #[test]
     fn both_palettes_are_complete_and_readable() {
-        for t in Theme::ALL {
+        for t in ThemeId::ALL.map(Theme::get) {
             // Naming every field without `..`: a field added to `Theme`
             // fails to compile here, and the array below then needs it, and
             // the comparison with `colours()` makes that list it too.
             let Theme {
-                name: _,
+                id: _,
                 desktop,
                 border_focused,
                 border,
@@ -184,20 +240,20 @@ mod tests {
                 pointer_fill,
             ];
             let colours = t.colours();
-            assert_eq!(colours.map(|(_, c)| c), fields, "{}: colours() in field order", t.name);
+            assert_eq!(colours.map(|(_, c)| c), fields, "{}: colours() in field order", t.id.name());
             for (n, c) in colours {
-                assert_eq!(c >> 24, 0, "{}.{n} has a top byte", t.name);
+                assert_eq!(c >> 24, 0, "{}.{n} has a top byte", t.id.name());
             }
             let mut names = colours.map(|(n, _)| n);
             names.sort_unstable();
-            assert!(names.windows(2).all(|w| w[0] != w[1]), "{}: a colour named twice", t.name);
+            assert!(names.windows(2).all(|w| w[0] != w[1]), "{}: a colour named twice", t.id.name());
             for (what, fg, bg, least) in t.pairs() {
                 let ratio = contrast(fg, bg);
-                assert!(ratio * 10.0 >= f64::from(least), "{}: {what} is {ratio:.2}:1", t.name);
+                assert!(ratio * 10.0 >= f64::from(least), "{}: {what} is {ratio:.2}:1", t.id.name());
             }
             // A focused window's frame looks different from the others'.
-            assert_ne!(t.title_focused, t.title, "{}", t.name);
-            assert_ne!(t.border_focused, t.border, "{}", t.name);
+            assert_ne!(t.title_focused, t.title, "{}", t.id.name());
+            assert_ne!(t.border_focused, t.border, "{}", t.id.name());
         }
         assert_ne!(Theme::LIGHT.desktop, Theme::DARK.desktop);
         assert_ne!(Theme::LIGHT.client, Theme::DARK.client);
@@ -205,10 +261,24 @@ mod tests {
 
     #[test]
     fn themes_are_found_by_name() {
-        assert_eq!(Theme::by_name("light"), Some(&Theme::LIGHT));
-        assert_eq!(Theme::by_name("dark"), Some(&Theme::DARK));
-        assert_eq!(Theme::by_name("Dark"), None);
-        assert_eq!(Theme::by_name(""), None);
-        assert_eq!(Theme::ALL[0].name, "light");
+        assert_eq!(ThemeId::by_name("light"), Some(ThemeId::Light));
+        assert_eq!(ThemeId::by_name("dark"), Some(ThemeId::Dark));
+        assert_eq!(ThemeId::by_name("Dark"), None);
+        assert_eq!(ThemeId::by_name(""), None);
+        assert_eq!(ThemeId::ALL[0], ThemeId::Light);
+    }
+
+    #[test]
+    fn theme_ids_name_their_palettes() {
+        for (i, id) in ThemeId::ALL.into_iter().enumerate() {
+            assert_eq!(Theme::get(id).id, id);
+            assert_eq!(ThemeId::by_name(id.name()), Some(id));
+            assert_eq!(id.index() as usize, i);
+            assert_eq!(ThemeId::from_index(id.index()), Some(id));
+        }
+        assert_eq!(ThemeId::from_index(2), None);
+        assert_eq!(ThemeId::from_index(u8::MAX), None);
+        assert_eq!(Theme::LIGHT.id.name(), "light");
+        assert_eq!(Theme::DARK.id.name(), "dark");
     }
 }

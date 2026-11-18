@@ -1,7 +1,11 @@
-//! PNG for Lumen: the encoder the kernel's `screenshot` uses ([`encode`]);
-//! decoding is #154's (the wallpaper). Kept free of kernel dependencies so
-//! it can be tested on the host:
+//! PNG for Lumen: the encoder the kernel's `screenshot` uses ([`encode`])
+//! and the decoder the desktop's wallpaper uses ([`decode`]). Kept free of
+//! kernel dependencies so it can be tested on the host:
 //!
+//! - [`decode`]: any PNG into `0x00RRGGBB` pixels ([`decode::Image`]),
+//!   with `zune-png`; a file that isn't a PNG, is cut short or corrupt, or
+//!   is bigger than allowed is an error ([`decode::DecodeError`]), never a
+//!   panic.
 //! - [`encode`]: an RGB8 image ([`encode::Rows`]) into a PNG file
 //!   ([`encode::Png`]), zlib from `miniz_oxide`; the rows' and the file's
 //!   buffers are refused rather than aborted when the allocator says no
@@ -10,13 +14,15 @@
 //! - [`base64`] and [`frame`]: how a PNG travels over serial, as lines the
 //!   harness picks out from between log lines.
 //!
-//! Integers only: nothing here is floating point (the kernel has no SSE).
+//! Integers only in this crate: nothing here is floating point (the kernel
+//! has no SSE).
 
 #![no_std]
 
 extern crate alloc;
 
 pub mod base64;
+pub mod decode;
 pub mod encode;
 pub mod frame;
 

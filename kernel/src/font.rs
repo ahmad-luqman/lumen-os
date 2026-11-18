@@ -1,9 +1,10 @@
 //! The desktop's anti-aliased text (`lumen-font`, #148) in the kernel: the
-//! UI font, parsed once and shared ([`face`]). The desktop doesn't draw
-//! with it yet (M4's compositor will); for now it renders the golden
-//! sample for the shell's `font` and its ktest, which show how long
-//! `fontdue`'s soft-float parsing and rasterizing take here and that the
-//! kernel's mask hashes to the host golden's value.
+//! UI font, parsed once and shared ([`face`]), and [`Text`], one drawing
+//! thread's glyph cache over it, which the desktop's titles and windows
+//! draw with (#154). Here it also renders the golden sample for the
+//! shell's `font` and its ktest, which show how long `fontdue`'s soft-float
+//! parsing and rasterizing take and that the kernel's mask hashes to the
+//! host golden's value.
 
 use crate::shell::Ctx;
 use crate::time;
@@ -11,8 +12,9 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use core::fmt;
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use lumen_font::{Face, Font, Px, Stats, TooWide, sample};
+use lumen_gfx::{Mask, Rect, Surface};
 use lumen_time::Millis;
 
 /// The glyph cache's bound for the sample: far more than its glyphs take,
@@ -22,10 +24,7 @@ const CACHE_BYTES: usize = 256 * 1024;
 /// The widest line the sample's mask may take.
 const MAX_WIDTH: u32 = 4096;
 
-const PX: Px = match Px::new(sample::PX) {
-    Some(px) => px,
-    None => panic!("the sample's size is out of range"),
-};
+const PX: Px = px(sample::PX);
 
 /// The parsed UI font and how long parsing it took. Only [`face`] makes
 /// one.
@@ -92,6 +91,105 @@ pub fn face() -> Result<&'static Loaded, lumen_font::Error> {
             // `Box::into_raw` and is never freed, as above.
             Ok(unsafe { &*theirs })
         }
+    }
+}
+
+// -- text on the desktop ------------------------------------------------------
+
+/// The desktop's text sizes, in pixels per em: a window's title, its text,
+/// and a heading.
+pub const TITLE_PX: Px = px(15);
+pub const TEXT_PX: Px = px(16);
+pub const HEADING_PX: Px = px(24);
+
+const fn px(n: u16) -> Px {
+    match Px::new(n) {
+        Some(px) => px,
+        None => panic!("a text size out of range"),
+    }
+}
+
+/// Each [`Text`]'s glyph cache: far more than a few sizes of the glyphs on a
+/// desktop take, so a redraw hits.
+const TEXT_CACHE_BYTES: usize = 128 * 1024;
+
+/// Glyphs [`Text::draw`] left out because `lumen_gfx::Mask::new` refused
+/// their mask (a bug in `lumen-font`: its masks are always their size),
+/// counted for `desktop status` (`glyphs_dropped`); the first is warned
+/// about, naming its sizes.
+static GLYPHS_DROPPED: AtomicU64 = AtomicU64::new(0);
+/// Set once the UI font failing to load has been warned about.
+static NO_FONT_SAID: AtomicBool = AtomicBool::new(false);
+
+/// Glyphs left out so far (see [`GLYPHS_DROPPED`]).
+pub fn glyphs_dropped() -> u64 {
+    GLYPHS_DROPPED.load(Ordering::Relaxed)
+}
+
+/// One drawing thread's text (#154): its own glyph cache over the shared UI
+/// font, so drawing takes no shared lock and a glyph is rasterized once per
+/// size, then drawn from the cache. The compositor has one for the titles;
+/// each window's owner makes its own.
+pub struct Text {
+    font: Font<'static>,
+}
+
+impl Text {
+    /// A glyph cache over the UI font (parsed on first use: call it from a
+    /// thread), or why the font didn't load (warned about once a boot: then
+    /// the caller draws no text).
+    pub fn new() -> Result<Text, lumen_font::Error> {
+        match face() {
+            Ok(loaded) => Ok(Text { font: Font::new(loaded.face(), TEXT_CACHE_BYTES) }),
+            Err(e) => {
+                if !NO_FONT_SAID.swap(true, Ordering::Relaxed) {
+                    log::warn!(target: "desktop", "no text: the UI font didn't load: {e}");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Draw `text` at `px` with its line box's top-left corner at (`x`,
+    /// `y`), in `color`, touching only pixels inside `clip`: each glyph's
+    /// mask blended on its own (no line mask allocated), clipped. Blending
+    /// isn't idempotent, so a redraw of one damaged rectangle passes that
+    /// rectangle and the pixels outside it stay as they were.
+    #[allow(clippy::too_many_arguments, reason = "a line of text: where, what, how big, which colour, inside what")]
+    pub fn draw(&mut self, s: &mut Surface, x: i32, y: i32, text: &str, px: Px, color: u32, clip: Rect) {
+        self.font.render(text, px, |g| match Mask::new(g.width(), g.height(), g.coverage()) {
+            Some(mask) => s.blend_mask_in(&mask, x.saturating_add(g.x()), y.saturating_add(g.y()), color, clip),
+            None => {
+                if GLYPHS_DROPPED.fetch_add(1, Ordering::Relaxed) == 0 {
+                    log::warn!(
+                        target: "desktop",
+                        "a glyph's mask doesn't match its size ({}x{}, {} bytes): not drawn (counted in desktop status)",
+                        g.width(),
+                        g.height(),
+                        g.coverage().len()
+                    );
+                }
+            }
+        });
+    }
+
+    /// `text`'s advance width at `px`, from the metrics alone (nothing
+    /// rasterized): where [`Text::draw`]'s ink ends, give or take a glyph's
+    /// side bearing.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code, reason = "its first users are #156's widgets"))]
+    pub fn measure(&self, text: &str, px: Px) -> u32 {
+        self.font.face().measure(text, px).width
+    }
+
+    /// A line's height at `px`: the face's ascent and descent.
+    pub fn line_height(&self, px: Px) -> u32 {
+        let m = self.font.face().line_metrics(px);
+        u32::try_from(m.ascent + m.descent).unwrap_or(0)
+    }
+
+    /// The glyph cache's counters (`misses`: glyphs rasterized).
+    pub fn stats(&self) -> Stats {
+        self.font.stats()
     }
 }
 
@@ -299,6 +397,29 @@ crate::ktest!(
         let text = run(&both);
         kassert!(text.ends_with(&alloc::format!("\n{DIFFERS}{NOT_GOLDEN}")));
         kassert_eq!(text.lines().count(), 5);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn text_ends_where_measure_says() {
+        // A line drawn with `Text::draw` (glyph by glyph, clipped) has its
+        // ink from where it starts to about its measured width: past it by
+        // no more than a side bearing, short of it by no more than one.
+        use crate::kassert;
+        let mut text = Text::new().map_err(|_| "no UI font")?;
+        let mut s = Surface::with_stride(400, 40, 400).ok_or("no memory")?;
+        let (x, line) = (10, "Lumen: measure me");
+        let all = s.bounds();
+        text.draw(&mut s, x, 4, line, TEXT_PX, 0x00ff_ffff, all);
+        let width = i32::try_from(text.measure(line, TEXT_PX)).map_err(|_| "too wide")?;
+        let inked = |col: u32| (0..40).any(|y| s.row(y)[col as usize] != 0);
+        let left = (0..400).find(|&c| inked(c)).ok_or("nothing drawn")? as i32;
+        let right = (0..400).rev().find(|&c| inked(c)).ok_or("nothing drawn")? as i32 + 1;
+        crate::ktest::diag(format_args!("measured {width}, ink {left}..{right}"));
+        kassert!(left >= x && left <= x + 2);
+        kassert!(right <= x + width + 2 && right >= x + width - 3);
+        kassert!(text.line_height(TEXT_PX) >= 16);
         Ok(())
     }
 );
