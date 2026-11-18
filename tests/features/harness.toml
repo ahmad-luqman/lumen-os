@@ -192,7 +192,7 @@ tests = [
 ]
 
 [[feature]]
-name = "The flake census: how often CI's first attempt went red (cancelled, skipped and unapproved runs left out), per day and in all, how many of those passed on a re-run, and which scenarios, ktests and host tests failed them, read from their failed jobs' logs (the TCG re-run's part left out; a log that can't be read said as such) (`make census`, with the GitHub API faked in its tests; weekly into the `flake-census` workflow's summary, its run not itself tested)"
+name = "The flake census: how often CI's first attempt went red (cancelled, skipped, unapproved and job-less runs left out), per day and in all, how many of those passed on a re-run (a floor on the flakes), and which pytest tests, ktests and host tests (should-panic tests and doctests too) failed them, read from every job of theirs that didn't pass (the TCG re-run's part left out; a step cut short read from its progress lines; a log that can't be read said as such; GitHub's cap on a listing said) (`make census`, with the GitHub API faked in its tests; weekly into the `flake-census` workflow's summary, its run not itself tested)"
 milestone = "M4"
 tests = [
     "harness:test_census::*",

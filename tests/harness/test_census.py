@@ -11,6 +11,8 @@ from lumen_harness.census import LOG_UNAVAILABLE, Run, failures_in_log, summary
 LOG = """\
 2026-11-18T04:00:00.0Z ##[group]Run make test-host
 2026-11-18T04:00:01.0Z test tests::writing_never_allocates ... FAILED
+2026-11-18T04:00:01.1Z test surface::tests::row_outside_panics - should panic ... FAILED
+2026-11-18T04:00:01.2Z test crates/lumen-mm/src/window.rs - window::Window (line 34) ... FAILED
 2026-11-18T04:00:02.0Z ##[group]Run make test-scenarios
 2026-11-18T04:11:44.5Z E           not ok 25 - lumen_kernel::sched::a_scope_joins_every_thread_before_it_returns
 2026-11-18T04:11:44.6Z     not ok 25 - lumen_kernel::sched::a_scope_joins_every_thread_before_it_returns
@@ -19,7 +21,6 @@ LOG = """\
 2026-11-18T04:11:45.1Z FAILED tests/scenarios/test_serial.py::test_the_safety_net - AssertionError
 2026-11-18T04:11:45.2Z ERROR tests/scenarios/test_gui.py::test_a_teardown_failed - OSError
 2026-11-18T04:11:45.3Z FAILED tests/scenarios/test_serial.py::test_the_safety_net - again
-2026-11-18T04:11:45.4Z FAILED tests/scenarios/test_boot.py::test_x - build/lumen-qemutest.iso not found; run `make iso` first
 2026-11-18T04:12:00.0Z ##[group]Run rc=0
 2026-11-18T04:12:00.1Z rc=0
 2026-11-18T04:12:00.2Z LUMEN_ACCEL=tcg LUMEN_ARTIFACTS_DIR=build/test-artifacts-tcg \\
@@ -31,11 +32,56 @@ LOG = """\
 def test_a_log_s_failures_are_read_once_each_in_order():
     assert failures_in_log(LOG) == [
         "cargo:tests::writing_never_allocates",
+        "cargo:surface::tests::row_outside_panics",
+        "cargo:crates/lumen-mm/src/window.rs - window::Window (line 34)",
         "lumen_kernel::sched::a_scope_joins_every_thread_before_it_returns",
         "tests/scenarios/test_acpi.py::test_cpu_count_matches_qemu[1-1 CPU]",
         "tests/scenarios/test_serial.py::test_the_safety_net",
         "tests/scenarios/test_gui.py::test_a_teardown_failed",
     ]
+
+
+def test_early_ci_s_tcg_step_is_left_out_too():
+    # Before PR #46 the TCG step's header named it, and with no ISO built it
+    # failed every scenario.
+    log = (
+        "2026-11-12T04:00:00Z ##[group]Run make test-host\n"
+        "2026-11-12T04:00:01Z test tests::torn ... FAILED\n"
+        "2026-11-12T04:01:00Z ##[group]Run LUMEN_ACCEL=tcg uv run pytest tests/scenarios --last-failed\n"
+        "2026-11-12T04:01:30Z FAILED tests/scenarios/test_boot.py::test_x - build/lumen-qemutest.iso "
+        "not found; run `make iso` first\n"
+    )
+    assert failures_in_log(log) == ["cargo:tests::torn"]
+
+
+def test_a_step_cut_short_is_read_from_its_progress_lines():
+    # pytest killed before its summary: xdist's progress lines are all there is.
+    cut = (
+        "##[group]Run make test-scenarios\n"
+        "[gw1] [ 10%] PASSED tests/scenarios/test_a.py::fine\n"
+        "[gw2] [ 54%] FAILED tests/scenarios/test_b.py::hung_neighbour\n"
+        "##[error]The job has exceeded the maximum execution time\n"
+    )
+    assert failures_in_log(cut) == ["tests/scenarios/test_b.py::hung_neighbour"]
+    # With a summary, the summary is the record.
+    summed = cut + "FAILED tests/scenarios/test_c.py::summed - x\n"
+    assert failures_in_log(summed) == ["tests/scenarios/test_c.py::summed"]
+
+
+def test_the_tcg_marker_is_ci_s_rerun_step_and_only_it():
+    # ci.yml names it once, in the step that re-runs the failed scenarios,
+    # near enough its script's start to be in the echo `failures_in_log` reads.
+    import pathlib
+
+    ci = pathlib.Path(__file__).parents[2].joinpath(".github/workflows/ci.yml").read_text()
+    assert ci.count(census.TCG_RERUN) == 1, "the TCG marker must name one step"
+    step = ci[ci.rindex("- name:", 0, ci.index(census.TCG_RERUN)) :]
+    step = step[: step.find("\n      - ", 1) if "\n      - " in step[1:] else len(step)]
+    assert "--last-failed" in step, step
+    script = step[step.index("run: |") :]
+    head = script[: script.index(census.TCG_RERUN)]
+    # Each echoed line carries a timestamp of about 30 characters.
+    assert len(head) + 30 * (head.count("\n") + 2) < census.SCRIPT_ECHO, head
 
 
 def test_a_log_with_nothing_failed_has_no_failures():
@@ -165,6 +211,7 @@ def test_only_red_conclusions_count_and_the_rest_are_left_out(github):
             ]
         ],
         attempts={6: _run(6, "cancelled"), 7: _run(7, "failure")},
+        jobs={i: [{"id": i * 10, "conclusion": "failure"}] for i in (7, 8, 9)},
     )
     runs = census.collect(REPO, 7)
     assert [(r.red, r.rerun_passed) for r in runs] == [(True, False)] * 3
@@ -192,6 +239,35 @@ def test_failed_and_timed_out_jobs_logs_are_read_and_a_run_counts_a_test_once(gi
     assert f.logs_read == [11, 12]
 
 
+def test_a_red_attempt_with_no_jobs_never_ran_and_is_left_out(github):
+    github(pages=[[_run(1, "failure"), _run(2, "success")]], jobs={1: []})
+    assert census.collect(REPO, 7) == [Run("2026-11-17", False)]
+
+
+def test_a_cancelled_job_in_a_red_attempt_is_read(github):
+    f = github(
+        pages=[[_run(1, "failure")]],
+        jobs={1: [{"id": 10, "conclusion": "cancelled"}, {"id": 11, "conclusion": "skipped"}]},
+        logs={10: "[gw0] [ 50%] FAILED tests/scenarios/a.py::hang\n"},
+    )
+    assert census.collect(REPO, 7) == [Run("2026-11-17", True, ("tests/scenarios/a.py::hang",))]
+    assert f.logs_read == [10]
+
+
+def test_github_s_cap_on_a_listing_is_said(github, monkeypatch, capsys):
+    f = github(pages=[[_run(1, "success")]])
+
+    def capped(path):
+        got = f.json(path)
+        if "/workflows/" in path:
+            got["total_count"] = 1500
+        return got
+
+    monkeypatch.setattr(census, "_json", capped)
+    census.collect(REPO, 30)
+    assert "GitHub listed 1 of 1500 runs" in capsys.readouterr().err
+
+
 def test_a_log_that_cant_be_read_is_said_not_taken_for_no_failure(github):
     github(
         pages=[[_run(1, "failure")]],
@@ -204,7 +280,10 @@ def test_a_log_that_cant_be_read_is_said_not_taken_for_no_failure(github):
 def test_pages_are_read_until_a_short_one_and_a_run_shifted_onto_two_counts_once(github):
     first = [_run(i, "success") for i in range(100)]
     # A new run during paging pushes run 99 onto page 2 as well.
-    f = github(pages=[first, [_run(99, "success"), _run(100, "failure")]])
+    f = github(
+        pages=[first, [_run(99, "success"), _run(100, "failure")]],
+        jobs={100: [{"id": 1000, "conclusion": "failure"}]},
+    )
     assert len(census.collect(REPO, 7)) == 101
     listed = [c.rsplit("page=", 1)[1] for c in f.calls if "/workflows/" in c]
     assert listed == ["1", "2"]
@@ -246,19 +325,52 @@ def test_gh_is_tried_again_and_its_last_error_raised(monkeypatch):
         census._gh("p")
 
 
-def test_a_log_falls_back_to_a_gh_without_allow_escape_sequences(monkeypatch, capsys):
-    monkeypatch.setattr(census.time, "sleep", lambda s: None)
+def test_a_log_is_asked_for_with_allow_escape_sequences_first(monkeypatch):
     seen = []
 
     def run(args, **k):
         seen.append(args)
-        return (
-            _proc(1, err="unknown flag") if "--allow-escape-sequences" in args else _proc(0, "LOG")
-        )
+        return _proc(0, "LOG")
+
+    monkeypatch.setattr(census.subprocess, "run", run)
+    assert census._log(REPO, 7) == "LOG"
+    assert seen == [["gh", "api", "--allow-escape-sequences", f"repos/{REPO}/actions/jobs/7/logs"]]
+
+
+def test_a_log_is_tried_again_through_gh_s_retries(monkeypatch):
+    answers = [_proc(1, err="502"), _proc(0, "LOG")]
+    monkeypatch.setattr(census.subprocess, "run", lambda *a, **k: answers.pop(0))
+    slept = []
+    monkeypatch.setattr(census.time, "sleep", slept.append)
+    assert census._log(REPO, 7) == "LOG"
+    assert slept == [2]
+
+
+def test_a_log_falls_back_to_a_gh_without_allow_escape_sequences(monkeypatch, capsys):
+    monkeypatch.setattr(census.time, "sleep", lambda s: None)
+    seen = []
+    unknown = "unknown flag: --allow-escape-sequences"
+
+    def run(args, **k):
+        seen.append(args)
+        return _proc(1, err=unknown) if "--allow-escape-sequences" in args else _proc(0, "LOG")
 
     monkeypatch.setattr(census.subprocess, "run", run)
     assert census._log(REPO, 7) == "LOG"
     assert seen[-1] == ["gh", "api", f"repos/{REPO}/actions/jobs/7/logs"]
-    monkeypatch.setattr(census.subprocess, "run", lambda *a, **k: _proc(1, err="404"))
+    # Any other error is the real one, said as it was, with no fallback.
+    monkeypatch.setattr(census.subprocess, "run", lambda *a, **k: _proc(1, err="HTTP 410: gone"))
     assert census._log(REPO, 7) is None
-    assert "job 7's log couldn't be read" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "job 7's log couldn't be read" in err and "410" in err
+
+
+def test_the_census_command_names_the_repository_and_its_days(monkeypatch, capsys):
+    asked = []
+    monkeypatch.setattr(census, "collect", lambda repo, days: asked.append((repo, days)) or [])
+    monkeypatch.setattr(census, "_gh", lambda *a, **k: "found/repo\n")
+    assert census.run_census(None, 3) == 0
+    assert census.run_census("o/r", 30) == 0
+    assert asked == [("found/repo", 3), ("o/r", 30)]
+    out = capsys.readouterr().out
+    assert "last 3 days (found/repo)" in out and "last 30 days (o/r)" in out

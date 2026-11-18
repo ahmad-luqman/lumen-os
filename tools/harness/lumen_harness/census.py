@@ -1,11 +1,12 @@
 """The flake census: how often CI's first attempt goes red, and on what.
 
 A run's first attempt is what a pull request meets. A red one is a flake
-when re-running the same commit passes, or a fault in that push (fixed, if
-at all, by a later one); the census counts both, and how many of them
-passed on a re-run (the plainest flake signal). Each red first attempt's
-failing scenarios, ktests and host tests are read from its failed jobs'
-logs, so the census says which tests keep failing, not only how often
+when re-running the same commit passes; one whose re-run failed too, or
+that wasn't re-run, may be either a flake or a fault in that push. So the
+census counts every red first attempt and, of those, how many passed on a
+re-run: a floor on the flakes. Each red first attempt's failing pytest
+tests, ktests and host tests are read from its failed jobs' logs, so the
+census says which tests keep failing, not only how often
 (`make census`, through `gh`; CI's weekly `flake-census` workflow writes it
 to the job summary). Self-tested in tests/harness/test_census.py, with the
 GitHub API faked.
@@ -23,54 +24,64 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-# What a CI log names as failed, each line prefixed with a timestamp:
+# What a CI log names as failed, each line maybe prefixed with a timestamp:
 # - pytest's short summary, `FAILED tests/x.py::name - why` (or `ERROR` for
-#   a setup error; an id may hold spaces, `[1-1 CPU]`). xdist's progress
-#   lines (`[gw3] [ 54%] FAILED ...`) aren't matched: the summary is the
-#   record;
+#   a setup error; an id may hold spaces, `[1-1 CPU]`; scenarios and harness
+#   self-tests alike);
 # - a ktest's TAP line, as pytest prints it (`E   not ok 25 - name`);
-# - a host test, as cargo prints it (`test name ... FAILED`).
+# - a host test, as cargo prints it (`test name ... FAILED`, with
+#   ` - should panic` for one, or a doctest's `src/x.rs - f (line 3)`).
 FAILED = re.compile(
     r"^(?:\S+ )?(?:"
     r"(?:FAILED|ERROR) (?P<scenario>tests/.+?)(?: - .*)?"
     r"|(?:E\s+)?not ok \d+ - (?P<ktest>\S+)"
-    r"|test (?P<cargo>\S+) \.\.\. FAILED"
+    r"|test (?P<cargo>.+?)(?: - should panic)? \.\.\. FAILED"
     r")$",
     re.MULTILINE,
+)
+# xdist's progress lines (`[gw3] [ 54%] FAILED tests/...`): read only from a
+# step with no short summary (pytest cut short: a timeout, a killed runner);
+# else the summary is the record.
+PROGRESS = re.compile(
+    r"^(?:\S+ )?\[gw\d+\] \[ *\d+%\] (?:FAILED|ERROR) (?P<scenario>tests/\S+)", re.MULTILINE
 )
 # Colour codes in pytest's output.
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # Where each step's part of a job's log starts.
 STEP = re.compile(r"^(?:\S+ )?##\[group\]Run ", re.MULTILINE)
-# CI's re-run of failed scenarios under TCG: it never decides a run, so what
-# it prints isn't what failed the run.
+# CI's re-run of failed scenarios under TCG (`.github/workflows/ci.yml`'s
+# `--last-failed` step, whose script starts with it; tied by a test): it
+# never decides a run, so what it prints isn't what failed the run. (Early
+# CI's version of it, before PR #46, ran every scenario with no ISO built.)
 TCG_RERUN = "LUMEN_ACCEL=tcg"
-# Early CI ran every scenario after any failed step, with no ISO built
-# (before PR #46): such a line names no failure of the test.
-NO_ISO = "run `make iso` first"
-# A red run whose failed jobs' logs couldn't be read.
+# How far into a step's part its echoed script can name TCG_RERUN.
+SCRIPT_ECHO = 2000
+# A failed job whose log couldn't be read.
 LOG_UNAVAILABLE = "(a failed job's log couldn't be read)"
-# First-attempt conclusions that are a red run; others are left out:
-# cancelled (a newer push replaced it), skipped, neutral, action_required (it
-# didn't really run), and None (not finished).
+# Conclusions that make a first attempt red; others are left out: cancelled
+# (a newer push replaced it), skipped, neutral, action_required (it didn't
+# really run), and None (not finished). A red attempt with no jobs at all
+# never ran either, and is left out too. Within a red attempt, every job
+# that didn't pass (or wasn't skipped) has its log read.
 RED = ("failure", "timed_out", "startup_failure")
+PASSED = ("success", "skipped")
 
 
 def failures_in_log(log: str) -> list[str]:
     """The tests a CI job's log says failed, each once, in the order the log
-    first names them: scenarios as `tests/...`, ktests by name, host tests
-    as `cargo:<name>`. The TCG re-run's part of the log is left out."""
-    log = ANSI.sub("", log)
-    starts = [m.start() for m in STEP.finditer(log)]
-    parts = [log[a:b] for a, b in zip([0, *starts], [*starts, len(log)], strict=True)]
+    first names them: pytest tests as `tests/...`, ktests by name, host
+    tests as `cargo:<name>`. The TCG re-run's part of the log is left out."""
     found = []
-    for part in parts:
+    for part in STEP.split(ANSI.sub("", log)):
         # The step's own script is echoed at its start.
-        if TCG_RERUN in part[:2000]:
+        if TCG_RERUN in part[:SCRIPT_ECHO]:
             continue
-        for m in FAILED.finditer(part):
-            if NO_ISO not in m[0]:
-                found.append(m["scenario"] or m["ktest"] or f"cargo:{m['cargo']}")
+        named = [
+            m["scenario"] or m["ktest"] or f"cargo:{m['cargo']}" for m in FAILED.finditer(part)
+        ]
+        if not any(n.startswith("tests/") for n in named):
+            named += [m["scenario"] for m in PROGRESS.finditer(part)]
+        found += named
     return list(dict.fromkeys(found))
 
 
@@ -112,10 +123,7 @@ def summary(runs: list[Run]) -> str:
     lines += ["", "| Failed on a first attempt | Runs |", "|---|---|"]
     lines += [f"| `{t}` | {n} |" for t, n in sorted(tests.items(), key=lambda kv: (-kv[1], kv[0]))]
     if unnamed:
-        lines.append(
-            f"| (red, no test named in its logs: setup, fmt, lint, build, audit, "
-            f"feature gate) | {unnamed} |"
-        )
+        lines.append(f"| (red, no test named in its logs) | {unnamed} |")
     return "\n".join(lines) + "\n"
 
 
@@ -135,13 +143,17 @@ def _json(path: str) -> Any:
 
 
 def _log(repo: str, job_id: int) -> str | None:
-    """A job's log, or None (said on stderr) if it can't be had. Newer gh
-    refuses to print colour codes without --allow-escape-sequences; older gh
-    doesn't know the flag."""
+    """A job's log, or None (said on stderr, with why) if it can't be had.
+    Newer gh refuses to print colour codes without --allow-escape-sequences;
+    an older one that doesn't know the flag is asked without it."""
     path = f"repos/{repo}/actions/jobs/{job_id}/logs"
-    for args in (("--allow-escape-sequences", path), (path,)):
+    try:
+        return _gh("--allow-escape-sequences", path)
+    except RuntimeError as e:
+        error = e
+    if "unknown flag" in str(error):
         try:
-            return _gh(*args)
+            return _gh(path)
         except RuntimeError as e:
             error = e
     print(f"census: job {job_id}'s log couldn't be read: {error}", file=sys.stderr)
@@ -154,12 +166,15 @@ def collect(repo: str, days: int, workflow: str = "ci.yml") -> list[Run]:
     really run left out (`RED`)."""
     since = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     runs: dict[int, Run] = {}
+    listed: set[int] = set()
     page = 1
     while True:
-        batch = _json(
+        response = _json(
             f"repos/{repo}/actions/workflows/{workflow}/runs"
             f"?created=>={since}&per_page=100&page={page}"
-        )["workflow_runs"]
+        )
+        batch = response["workflow_runs"]
+        listed |= {r["id"] for r in batch}
         for r in batch:
             # Runs created while paging shift the pages: one may come twice.
             if r["id"] in runs:
@@ -173,8 +188,10 @@ def collect(repo: str, days: int, workflow: str = "ci.yml") -> list[Run]:
             if first["conclusion"] in RED:
                 failures: list[str] = []
                 jobs = _json(f"repos/{repo}/actions/runs/{r['id']}/attempts/1/jobs")["jobs"]
+                if not jobs:
+                    continue
                 for job in jobs:
-                    if job["conclusion"] in RED:
+                    if job["conclusion"] not in PASSED:
                         log = _log(repo, job["id"])
                         failures += [LOG_UNAVAILABLE] if log is None else failures_in_log(log)
                 rerun_passed = r["run_attempt"] > 1 and r["conclusion"] == "success"
@@ -182,6 +199,13 @@ def collect(repo: str, days: int, workflow: str = "ci.yml") -> list[Run]:
             elif first["conclusion"] == "success":
                 runs[r["id"]] = Run(day, False)
         if len(batch) < 100:
+            # GitHub lists at most 1000 runs for a filter: say if it cut some.
+            if len(listed) < response.get("total_count", 0):
+                print(
+                    f"census: GitHub listed {len(listed)} of {response['total_count']} runs; "
+                    "the oldest are missing (ask for fewer days)",
+                    file=sys.stderr,
+                )
             return list(runs.values())
         page += 1
 
