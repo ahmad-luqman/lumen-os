@@ -944,10 +944,10 @@ blocked or dead. (`main` and the APs' idle threads run on stacks they don't
 own.) `sched::spawn(name, f)` starts one on this CPU and `spawn_on(cpu, ..)`
 on another; both return a `JoinHandle`, whose `join` blocks until the
 thread has finished and its CPU's `finish_switch` is done with it (its
-stack and joiners' list freed, its reference dropped), so nothing is freed
-for it after `join` returns but by the caller's own references (#183). A
-thread **never moves between
-CPUs**: each CPU has its own run queue (a FIFO) and only that CPU takes
+stack and joiners' list freed, its reference dropped), so nothing that CPU
+frees for it lands after `join` returns (#183; its record goes when a later
+spawn prunes it). A thread **never moves between CPUs**: each CPU has its
+own run queue (a FIFO) and only that CPU takes
 threads off it, so once its spawner has laid out its first frame, a
 thread's saved registers are touched only by its home CPU with interrupts
 off. A wake from another CPU queues the thread there and sends the
