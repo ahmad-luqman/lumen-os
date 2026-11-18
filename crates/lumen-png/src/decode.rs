@@ -9,15 +9,21 @@
 //! panic: [`DecodeError`]. Alpha is dropped (a wallpaper has nothing behind
 //! it), and 16-bit samples keep their top 8 bits.
 //!
+//! Only the image's own chunks reach the decoder: IHDR, PLTE, the IDATs
+//! and IEND are copied whole (length, type, data, CRC) into a buffer of
+//! their own, and every ancillary chunk is dropped (text, colour profiles,
+//! tRNS: alpha is dropped anyway), so nothing but the image data is ever
+//! inflated (zune-png would inflate `zTXt`, `iTXt` and `iCCP` while reading
+//! the headers, and its parsers don't always take what a chunk declares).
+//! An unknown critical chunk is an error.
+//!
 //! Memory: the decoder's own buffers (the compressed data gathered, the
-//! inflated rows, and the text and colour-profile chunks it inflates while
-//! reading the headers) are its `Vec`s: on a heap that can't hold them the
+//! inflated rows) are its `Vec`s: on a heap that can't hold them the
 //! allocation aborts, as any `Vec`'s does. So the size is checked from
-//! IHDR first, and a compressed `zTXt`, `iTXt` or `iCCP` chunk of more than
-//! [`COMPRESSED_CHUNK_MAX`] bytes is refused before the decoder sees the
-//! file (a small one inflates to a few MiB at most). The decoded samples'
-//! buffer and the pixels handed back are taken with `try_reserve_exact`, so
-//! those refuse ([`DecodeError::OutOfMemory`]).
+//! IHDR before any image data is inflated, and the caller's limits bound
+//! what the image can ask for. The copy of the image's chunks, the decoded
+//! samples' buffer and the pixels handed back are taken with
+//! `try_reserve_exact`, so those refuse ([`DecodeError::OutOfMemory`]).
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -95,13 +101,6 @@ fn message(e: impl fmt::Display) -> DecodeError {
     DecodeError::Png(text.trim().trim_matches('"').to_string())
 }
 
-/// The most bytes a compressed ancillary chunk (`zTXt`, `iTXt`, `iCCP`) may
-/// hold: the decoder inflates them while reading the headers, into buffers
-/// that abort on a heap that can't hold them, and deflate's best ratio is
-/// about 1032 to 1, so this keeps one under about 4 MiB. A wallpaper needs
-/// none (an sRGB profile compresses to about 3 KB).
-pub const COMPRESSED_CHUNK_MAX: u32 = 4096;
-
 fn be32(png: &[u8], at: usize) -> Option<u32> {
     png.get(at..at.checked_add(4)?).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
@@ -114,36 +113,53 @@ fn header_size(png: &[u8]) -> Option<(u32, u32)> {
     Some((be32(png, 16)?, be32(png, 20)?))
 }
 
-/// A compressed ancillary chunk bigger than [`COMPRESSED_CHUNK_MAX`]: its
-/// type and length. The chunks are walked by their lengths alone (no CRC
-/// or contents looked at); a file cut short ends the walk, for the decoder
-/// to refuse.
-fn big_compressed_chunk(png: &[u8]) -> Option<(&[u8], u32)> {
-    let mut at = 8usize;
-    while let (Some(len), Some(kind)) = (be32(png, at), png.get(at + 4..at + 8)) {
-        if matches!(kind, b"zTXt" | b"iTXt" | b"iCCP") && len > COMPRESSED_CHUNK_MAX {
-            return Some((kind, len));
-        }
-        at = at.checked_add(12)?.checked_add(len as usize)?;
+/// The image's own chunks of `png` (IHDR, PLTE, the IDATs, IEND), each
+/// copied whole with its CRC (which the decoder checks), after the
+/// signature, up to IEND; every ancillary chunk (a type starting with a
+/// small letter) dropped. A file cut short, a chunk type that isn't four
+/// letters, an unknown critical chunk or a PLTE that isn't 1 to 256
+/// colours is an error. Only the chunks' lengths are looked at.
+fn image_chunks(png: &[u8]) -> Result<Vec<u8>, DecodeError> {
+    if png.get(..8) != Some(&crate::encode::SIGNATURE[..]) {
+        return Err(DecodeError::Png("no PNG signature".into()));
     }
-    None
+    let mut out = Vec::new();
+    out.try_reserve_exact(png.len()).map_err(|_| DecodeError::OutOfMemory)?;
+    out.extend_from_slice(&png[..8]);
+    let mut at = 8usize;
+    loop {
+        let (Some(len), Some(kind)) = (be32(png, at), png.get(at + 4..at + 8)) else {
+            return Err(DecodeError::Png("cut short: no IEND".into()));
+        };
+        let name = core::str::from_utf8(kind).ok().filter(|k| k.bytes().all(|b| b.is_ascii_alphabetic()));
+        let Some(name) = name else { return Err(DecodeError::Png("a chunk type that isn't four letters".into())) };
+        let end = at.checked_add(12).and_then(|n| n.checked_add(len as usize)).filter(|&e| e <= png.len());
+        let Some(end) = end else { return Err(DecodeError::Png(alloc::format!("cut short in a {name} chunk"))) };
+        match kind {
+            b"PLTE" if len == 0 || len % 3 != 0 || len > 768 => {
+                return Err(DecodeError::Png(alloc::format!("a PLTE of {len} bytes")));
+            }
+            b"IHDR" | b"PLTE" | b"IDAT" | b"IEND" => out.extend_from_slice(&png[at..end]),
+            _ if kind[0].is_ascii_lowercase() => {}
+            _ => return Err(DecodeError::Png(alloc::format!("an unknown critical chunk {name}"))),
+        }
+        if kind == b"IEND" {
+            return Ok(out);
+        }
+        at = end;
+    }
 }
 
 /// Decode `png`, refusing an image wider than `max_width` or taller than
-/// `max_height` before any image data is inflated (and a compressed
-/// ancillary chunk past [`COMPRESSED_CHUNK_MAX`] before anything is).
+/// `max_height` before any image data is inflated; only the image's own
+/// chunks reach the decoder (see the module doc).
 pub fn decode(png: &[u8], max_width: u32, max_height: u32) -> Result<Image, DecodeError> {
     if let Some((width, height)) = header_size(png)
         && (width > max_width || height > max_height)
     {
         return Err(DecodeError::TooBig { width, height, max_width, max_height });
     }
-    if let Some((kind, len)) = big_compressed_chunk(png) {
-        let kind = core::str::from_utf8(kind).unwrap_or("?");
-        return Err(DecodeError::Png(alloc::format!(
-            "a {kind} chunk of {len} bytes, more than the {COMPRESSED_CHUNK_MAX} a compressed one may hold"
-        )));
-    }
+    let png = image_chunks(png)?;
     let options = DecoderOptions::default()
         .set_strict_mode(true)
         .png_set_confirm_crc(true)
@@ -153,7 +169,7 @@ pub fn decode(png: &[u8], max_width: u32, max_height: u32) -> Result<Image, Deco
         // the decoder checks them too (a header it reads differently).
         .set_max_width(max_width.max(1) as usize)
         .set_max_height(max_height.max(1) as usize);
-    let mut decoder = PngDecoder::new_with_options(ZCursor::new(png), options);
+    let mut decoder = PngDecoder::new_with_options(ZCursor::new(&png[..]), options);
     decoder.decode_headers().map_err(message)?;
     let (w, h) = decoder.dimensions().ok_or_else(|| DecodeError::Png("no header".into()))?;
     let (width, height) = (u32::try_from(w).unwrap_or(u32::MAX), u32::try_from(h).unwrap_or(u32::MAX));
@@ -169,11 +185,8 @@ pub fn decode(png: &[u8], max_width: u32, max_height: u32) -> Result<Image, Deco
     };
     // Checked: the caller's limits may be anything up to `u32::MAX` each,
     // so the product needn't fit.
-    let samples = (w.checked_mul(h).and_then(|n| n.checked_mul(channels))).ok_or(DecodeError::TooBig {
-        width,
-        height,
-        max_width,
-        max_height,
+    let samples = (w.checked_mul(h).and_then(|n| n.checked_mul(channels))).ok_or_else(|| {
+        DecodeError::Png(alloc::format!("{width}x{height} pixels of {channels} samples: too many to count"))
     })?;
     // The decoder writes 8 bits a sample (16-bit images stripped): its own
     // size for the buffer must agree.

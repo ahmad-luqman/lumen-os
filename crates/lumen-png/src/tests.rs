@@ -570,29 +570,33 @@ fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&crc32(&crced).to_be_bytes());
 }
 
-/// A PNG of `width` x `height` with IHDR's `color_type` and `depth`,
-/// `scanlines` (each row's filter byte, then its samples) compressed into
-/// one IDAT, and `extra` chunks (PLTE, tRNS) before it.
-fn png_file(
-    width: u32,
-    height: u32,
-    color_type: u8,
-    depth: u8,
-    extra: &[(&[u8; 4], &[u8])],
-    scanlines: &[u8],
-) -> Vec<u8> {
+/// The chunks to put between IHDR and IDAT: type and data.
+type Extra<'a> = &'a [(&'a [u8; 4], &'a [u8])];
+
+/// A PNG of `width` x `height` with IHDR's `color_type`, `depth` and
+/// `interlace`, `extra` chunks after IHDR, and `idat` (a zlib stream, as
+/// given) in one IDAT.
+fn png_raw(width: u32, height: u32, ihdr_tail: [u8; 3], extra: Extra<'_>, idat: &[u8]) -> Vec<u8> {
+    let [depth, color_type, interlace] = ihdr_tail;
     let mut out = SIGNATURE.to_vec();
     let mut ihdr = Vec::new();
     ihdr.extend_from_slice(&width.to_be_bytes());
     ihdr.extend_from_slice(&height.to_be_bytes());
-    ihdr.extend_from_slice(&[depth, color_type, 0, 0, 0]);
+    ihdr.extend_from_slice(&[depth, color_type, 0, 0, interlace]);
     chunk(&mut out, b"IHDR", &ihdr);
     for (kind, data) in extra {
         chunk(&mut out, kind, data);
     }
-    chunk(&mut out, b"IDAT", &miniz_oxide::deflate::compress_to_vec_zlib(scanlines, 6));
+    chunk(&mut out, b"IDAT", idat);
     chunk(&mut out, b"IEND", &[]);
     out
+}
+
+/// [`png_raw`] not interlaced, with `scanlines` (each row's filter byte,
+/// then its samples) compressed into the IDAT.
+fn png_file(width: u32, height: u32, color_type: u8, depth: u8, extra: Extra<'_>, scanlines: &[u8]) -> Vec<u8> {
+    let idat = miniz_oxide::deflate::compress_to_vec_zlib(scanlines, 6);
+    png_raw(width, height, [depth, color_type, 0], extra, &idat)
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> u32 {
@@ -745,47 +749,93 @@ fn a_bad_adler32_is_an_error() {
     let mut zlib = miniz_oxide::deflate::compress_to_vec_zlib(&scanlines, 6);
     let last = zlib.len() - 1;
     zlib[last] ^= 0x01;
-    let mut png = SIGNATURE.to_vec();
-    let mut ihdr = Vec::new();
-    ihdr.extend_from_slice(&1u32.to_be_bytes());
-    ihdr.extend_from_slice(&2u32.to_be_bytes());
-    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
-    chunk(&mut png, b"IHDR", &ihdr);
-    chunk(&mut png, b"IDAT", &zlib);
-    chunk(&mut png, b"IEND", &[]);
+    let png = png_raw(1, 2, [8, 2, 0], &[], &zlib);
     assert!(matches!(decode::decode(&png, 4096, 4096), Err(DecodeError::Png(_))));
     decode_ok(&png_file(1, 2, 2, 8, &[], &scanlines));
 }
 
-/// `png_file` with `chunks` inserted right after IHDR.
-fn with_chunks_after_ihdr(png: &[u8], chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
-    let ihdr_end = 8 + 12 + 13;
-    let mut out = png[..ihdr_end].to_vec();
-    for (kind, data) in chunks {
-        chunk(&mut out, kind, data);
+/// A zTXt's data: a keyword, compression method 0, then `inflated` zero
+/// bytes compressed.
+fn ztxt_of_zeros(inflated: usize) -> Vec<u8> {
+    let mut data = b"Comment\0\0".to_vec();
+    data.extend(miniz_oxide::deflate::compress_to_vec_zlib(&vec![0u8; inflated], 9));
+    data
+}
+
+/// The heap a decode may take here, past its own file (the tests' images
+/// are 1x1): far less than any bomb below inflates to.
+const BOMB_HEAP: usize = 16 << 20;
+
+#[test]
+fn ancillary_chunks_never_reach_the_decoder() {
+    // zTXt, iTXt and iCCP bombs (10 MiB of zeros each, valid CRCs) are
+    // dropped, not inflated: each file decodes with the heap kept small. A
+    // large ordinary iTXt (an XMP packet's size) decodes too.
+    let pixel = [0u8, 7];
+    let bomb = ztxt_of_zeros(10 << 20);
+    for kind in [b"zTXt", b"iTXt", b"iCCP"] {
+        let png = png_file(1, 1, 0, 8, &[(kind, &bomb)], &pixel);
+        let got = refusing_past(BOMB_HEAP, || decode::decode(&png, 4096, 4096));
+        assert_eq!(got.map(|i| i.pixels().to_vec()), Ok(vec![rgb(7, 7, 7)]), "{kind:?}");
     }
-    out.extend_from_slice(&png[ihdr_end..]);
-    out
+    let mut xmp = b"XML:com.adobe.xmp\0\0\0\0\0".to_vec();
+    xmp.extend(core::iter::repeat_n(b'x', 200_000));
+    assert_eq!(decode_ok(&png_file(1, 1, 0, 8, &[(b"iTXt", &xmp)], &pixel)).pixels(), &[rgb(7, 7, 7)]);
 }
 
 #[test]
-fn a_compressed_chunk_bomb_is_refused_before_it_is_inflated() {
-    // A zTXt (valid CRC) whose 10 MiB of zeros compress to about 10 KB:
-    // refused by its length before the decoder (which would inflate it
-    // while reading the headers) sees the file; so are iTXt and iCCP. A
-    // small one passes.
+fn chunks_zune_would_misread_hide_no_bomb() {
+    // zune-png's own parsers take more than a short iTXt, zTXt or tRNS
+    // declares, so a walk beside it could see one chunk where it sees
+    // another: a hidden zTXt bomb. Only the image's chunks are handed to
+    // it, so whatever the file says, the heap stays small and the answer is
+    // an image or an error, never an abort.
     let png = png_file(1, 1, 0, 8, &[], &[0, 7]);
-    let mut bomb = b"Comment\0\0".to_vec();
-    bomb.extend(miniz_oxide::deflate::compress_to_vec_zlib(&vec![0u8; 10 << 20], 9));
-    assert!(bomb.len() > decode::COMPRESSED_CHUNK_MAX as usize);
-    for kind in [b"zTXt", b"iTXt", b"iCCP"] {
-        let got = decode::decode(&with_chunks_after_ihdr(&png, &[(kind, &bomb)]), 4096, 4096);
-        let Err(DecodeError::Png(why)) = got else { panic!("{kind:?} taken: {got:?}") };
-        assert!(why.contains("more than the 4096 a compressed one may hold"), "{why}");
+    let ihdr_end = 8 + 12 + 13;
+    let bomb = ztxt_of_zeros(64 << 20);
+    let hidden = |first: &[u8; 4], data: &[u8], skipped: &[u8]| {
+        let mut out = png[..ihdr_end].to_vec();
+        chunk(&mut out, first, data);
+        out.extend_from_slice(skipped);
+        chunk(&mut out, b"zTXt", &bomb);
+        out.extend_from_slice(&png[ihdr_end..]);
+        out
+    };
+    for file in [
+        hidden(b"iTXt", b"k\0", &[0x7f, 0xff, 0xff, 0xff]),
+        hidden(b"zTXt", b"k\0", &[0x7f]),
+        hidden(b"tRNS", b"", &[0x7f, 0xff]),
+    ] {
+        let _image_or_error = refusing_past(BOMB_HEAP, || decode::decode(&file, 4096, 4096));
     }
-    let mut small = b"Comment\0\0".to_vec();
-    small.extend(miniz_oxide::deflate::compress_to_vec_zlib(b"made by tools/wallpaper.py", 9));
-    assert_eq!(decode_ok(&with_chunks_after_ihdr(&png, &[(b"zTXt", &small)])).pixels(), &[rgb(7, 7, 7)]);
+    // Many small zTXt chunks (each about 4 MiB inflated): dropped too.
+    let small = ztxt_of_zeros(4 << 20);
+    let many: Vec<(&[u8; 4], &[u8])> = (0..64).map(|_| (b"zTXt", small.as_slice())).collect();
+    let file = png_file(1, 1, 0, 8, &many, &[0, 7]);
+    let got = refusing_past(BOMB_HEAP, || decode::decode(&file, 4096, 4096));
+    assert_eq!(got.map(|i| i.pixels().to_vec()), Ok(vec![rgb(7, 7, 7)]));
+}
+
+#[test]
+fn an_unknown_critical_chunk_or_a_bad_palette_is_an_error() {
+    let pixel = [0u8, 7];
+    let cases: [(&[u8; 4], &[u8], &str); 4] = [
+        (b"ABCD", &[], "an unknown critical chunk ABCD"),
+        (b"PLTE", &[1, 2], "a PLTE of 2 bytes"),
+        (b"PLTE", &[0; 771], "a PLTE of 771 bytes"),
+        (b"PLTE", &[], "a PLTE of 0 bytes"),
+    ];
+    for (kind, data, why) in cases {
+        let got = decode::decode(&png_file(1, 1, 0, 8, &[(kind, data)], &pixel), 4096, 4096);
+        assert_eq!(got, Err(DecodeError::Png(why.into())));
+    }
+    let bad_type = png_file(1, 1, 0, 8, &[(b"a1bc", &[])], &pixel);
+    let got = decode::decode(&bad_type, 4096, 4096);
+    assert_eq!(got, Err(DecodeError::Png("a chunk type that isn't four letters".into())));
+    // A chunk declaring more than the file holds.
+    let mut huge = png_file(1, 1, 0, 8, &[], &pixel);
+    huge[8..12].copy_from_slice(&0x7fff_ffffu32.to_be_bytes());
+    assert_eq!(decode::decode(&huge, 4096, 4096), Err(DecodeError::Png("cut short in a IHDR chunk".into())));
 }
 
 /// An Adam7-interlaced PNG of `pixels` (RGB, `width` x `height`): each of
@@ -805,15 +855,7 @@ fn adam7(width: u32, height: u32, pixels: &[[u8; 3]]) -> Vec<u8> {
             }
         }
     }
-    let mut png = SIGNATURE.to_vec();
-    let mut ihdr = Vec::new();
-    ihdr.extend_from_slice(&width.to_be_bytes());
-    ihdr.extend_from_slice(&height.to_be_bytes());
-    ihdr.extend_from_slice(&[8, 2, 0, 0, 1]);
-    chunk(&mut png, b"IHDR", &ihdr);
-    chunk(&mut png, b"IDAT", &miniz_oxide::deflate::compress_to_vec_zlib(&scanlines, 6));
-    chunk(&mut png, b"IEND", &[]);
-    png
+    png_raw(width, height, [8, 2, 1], &[], &miniz_oxide::deflate::compress_to_vec_zlib(&scanlines, 6))
 }
 
 #[test]
