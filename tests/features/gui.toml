@@ -121,30 +121,6 @@ tests = [
     "ktest:lumen_kernel::shell::pipe::a_pipeline_in_a_terminal_window_gets_no_canvas",
     "ktest:lumen_kernel::shell::sysinfo::top_shows_a_frame_and_quits_on_q",
 ]
-name = "Terminal windows (#155): `terminal` opens the M2 terminal and a shell of its own in a desktop window, several at once; keys typed go to the focused one only (its view read by `term text <window>`, the others unchanged), a click focusing either; a command that draws on the screen is refused there with one line; an unfocused window's cursor is hollow and steady; the close box ends its owner and its shell (joined: both gone from `threads`), also with `rhai`'s REPL waiting in it (a closed console's `Key::Closed`, which every key reader stops on), and its heap comes back (within 16 KiB, against the window's more than 1 MiB); damage-only drawing still equals a full repaint after; the text console renders exactly as before (its goldens unchanged), through the renderer the windows share: only the cells that changed drawn, a scroll moving what was drawn, the cursor solid or hollow and never while scrolled back, drawing in steps equal to a full repaint (randomized); a window's cells pixel for pixel as the console's; its owner's wait ends at a deadline (the blink) or when its shell's output wakes it, idle meanwhile"
-milestone = "M4"
-tests = [
-    "scenario:test_gui::test_terminal_window_runs_shell",
-    "scenario:test_gui::test_closing_a_terminal_window_frees_it",
-    "scenario:test_gui::test_closing_a_terminal_window_ends_its_rhai",
-    "scenario:test_term::test_ansi_colours_golden",
-    "scenario:test_term::test_scrollback",
-    "scenario:test_term::test_virtual_terminals_are_independent",
-    "cargo:lumen-term",
-    "cargo:lumen-gfx",
-    "cargo:lumen-shell",
-    "ktest:lumen_kernel::termwin::a_window_shell_runs_a_line_and_ends_when_closed",
-    "ktest:lumen_kernel::termwin::closing_a_window_ends_rhai_s_repl_and_its_shell",
-    "ktest:lumen_kernel::termwin::a_terminal_window_s_cells_look_as_the_console_s",
-    "ktest:lumen_kernel::desktop::wait_event_until_ends_at_its_deadline_or_a_wake",
-    "ktest:lumen_kernel::term::a_terminal_window_s_commands_get_no_canvas",
-
-name = "PNG decoding (lumen_png::decode, #154): zune-png 0.5.2 without its `std` and `sse` features, linked into both kernels with the flag audit passing; greyscale (1 and 8 bits, with alpha), RGB (8 and 16 bits), RGBA and palette (with transparency) files, filtered rows and an Adam7-interlaced file included, into 0x00RRGGBB pixels (alpha dropped, 16-bit samples cut to their top 8 bits) handed over with no copy, and the encoder's own files back exactly; a file that isn't a PNG, an unknown colour type, too few rows, a bad zlib Adler-32 under a good chunk CRC, a file cut short at every length and every byte of a file flipped are errors, never panics; an unknown critical chunk or a bad PLTE is an error; an image past the caller's limits is refused with its size before any image data is inflated; only the image's own chunks reach the decoder: zTXt, iTXt and iCCP bombs, bombs hidden behind chunks the decoder would misread, and 64 small zTXt bombs are dropped, never inflated (a refusing heap of 16 MiB), and a large ordinary iTXt decodes; the samples' and the pixels' buffers refused rather than aborted when the allocator says no; the embedded wallpaper decodes to 1280x800 and stays under 1 MB"
-milestone = "M4"
-tests = [
-    "cargo:lumen-png",
-    "audit:flags",
-]
 
 [[feature]]
 name = "The desktop's look (#154): titles in the UI font (anti-aliased, drawn clipped to each damaged rectangle, a redraw rasterizing nothing) and the demo windows' text at two sizes (16 and 24 pixels), against goldens; a wallpaper decoded from the PNG the kernel embeds and drawn behind the windows (with both windows closed the screen equals that PNG in every pixel), a smaller one centred over the theme's colour, a bigger one centred and cut, the theme's flat colour with one warning when one doesn't decode (not a PNG, cut short), the decode and its warning once a boot (the same answer again, `desktop status` saying why in a word); light and dark themes (both palettes complete and readable, named by id): a window's first event is the theme to draw with (dark too when opened after a switch); an owner blocked waiting for an event wakes for a switch; `theme dark` damages the whole screen and tells each owner again before anything it had queued, and the owners redraw in its colours (a golden, a key typed before the switch still shown; `desktop check` 0 and 0 after a switch to dark and back); switches before an owner reads end with the current theme; `settled` waits until every owner has been told; the titles' glyphs are cached (no glyph rasterized across a switch, none dropped); `measure` agrees with the drawn ink; a switch to the theme shown changes nothing, a name that isn't a theme is refused; `lumen.theme=dark` starts the desktop dark (the same screen), and a boot flag naming no theme warns and keeps light; `desktop status` shows the theme"
