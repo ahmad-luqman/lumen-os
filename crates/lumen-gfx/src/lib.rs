@@ -38,7 +38,7 @@ pub mod surface;
 
 pub use damage::Damage;
 pub use rect::{Pieces, Rect};
-pub use surface::{Mask, Surface, Target, blend, blend_channel};
+pub use surface::{BandMut, Mask, Surface, Target, blend, blend_channel};
 
 /// Deterministic randomness for the randomized tests, without a
 /// dependency.
