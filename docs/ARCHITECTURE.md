@@ -3706,8 +3706,9 @@ impl Role { pub fn actions(self) -> &'static [ActionKind]; }
   the window's lock), so `ui tree` reads it without asking the owner. A
   window's root's bounds are its client area.
 - **In the kernel** (`kernel/src/ui.rs`): `ui::Toolkit` is a toolkit in a
-  window: the UI font through `lumen_ui::Text` (`ui::UiText`, a glyph
-  cache per owner thread), the palette from the desktop's theme, painting,
+  window: the UI font through `lumen_ui::Text` (`font::Text` at
+  `TEXT_PX`, a glyph cache per owner thread: the desktop's one text path),
+  the palette from the `Theme` its window was handed, painting,
   committing and publishing after a change, and the window's events handed
   to the tree (the left button's press and release, key presses, focus;
   `FocusLost` and `Lost` cancel an armed press). `ui::Toolkit<A:
@@ -3717,8 +3718,10 @@ impl Role { pub fn actions(self) -> &'static [ActionKind]; }
   again, the error, "ran; node gone" or "closed its window"), the same
   code the host tests run. `lumen_ui::Reply` is the state machine; the
   kernel keeps it behind a lock with the asker's wait queue
-  (`ui::ReplyCell`). The palette comes from the desktop's theme
-  (`ui::palette(&Theme)`). The harness's `ui_tree`, `node`, `wait_ui`,
+  (`ui::ReplyCell`). The palette starts from `WindowHandle::theme()` and
+  follows every `Theme` event (`ui::palette(&Theme)`, then
+  `Ui::invalidate()` repaints the whole tree): a toolkit window's first
+  event, `Theme`, is its first draw. The harness's `ui_tree`, `node`, `wait_ui`,
   `invoke`, `parse_invoke` and `desktop_counter` are in `gui.py`.
 
 **The commands** print records, so the pipelines work on them (`where`
