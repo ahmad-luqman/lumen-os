@@ -6,8 +6,7 @@ screen. When a key typed under load went missing (#128: `echo abcd` read
 as `echo abc`), a test that typed a burst and then looked at the screen
 could only say that the screen was wrong. The steps here check each event
 against counters the kernel keeps as the events arrive, read through the
-serial shell, before the next step goes. Scenarios type only through
-`confirmed_keys`, or say why not (tests/harness/test_scenario_typing.py):
+serial shell, before the next step goes:
 
 - **Pointer** (a virtio tablet, `Devices(tablet=True)`): `pointer_move`,
   `pointer_down`, `pointer_up` and `drag`. Each QMP `input-send-event` is
@@ -17,7 +16,9 @@ serial shell, before the next step goes. Scenarios type only through
   step's effect: the position, or the button held or not. That is the
   state a reader of the tablet sees, not yet anything drawn. A held or
   failed tablet fails the step at once.
-- **Keys** (the PS/2 keyboard): `confirmed_keys` and `type_confirmed`. On
+- **Keys** (the PS/2 keyboard): `confirmed_keys` and `type_confirmed`, the
+  way scenarios type (a raw press says why not: tests/harness/
+  test_scenario_typing.py). On
   IRQ 1 the kernel counts the keys pressed among the bytes it reads
   (`kbd`'s `presses`, `lumen_input::Presses`), the keys held now (`held`:
   pressed, not yet released), before any shell decodes them, and the

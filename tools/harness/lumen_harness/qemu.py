@@ -911,7 +911,7 @@ class Machine:
         shell answers them on the screen, not on serial: wait for what they
         did with
         `lumen_harness.screen.expect_screen`. Scenarios type through
-        `gui.confirmed_keys` instead: a raw press there needs an
+        `gui.confirmed_keys` rather than this: a raw press there needs an
         `# unconfirmed: <why>` comment (tests/harness/test_scenario_typing.py).
 
         QEMU's input queue holds 1024 entries and silently drops the rest

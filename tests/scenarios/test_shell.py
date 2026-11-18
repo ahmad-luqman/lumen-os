@@ -98,8 +98,8 @@ def test_a_log_line_inside_a_commands_echo_is_not_output(boot):
     start = len(m.output)
     m.send("echo hel")
     wait_for_output(m, start, r"echo hel$")
-    # unconfirmed: a command is half typed on serial, so no `kbd`; its log
-    # line, read next, confirms it
+    # unconfirmed: a command is half typed on serial, so no `kbd`;
+    # Shift+PgUp's debug line, read next, confirms it
     m.press(["shift", "pgup"])
     wait_for_output(m, start, VIEW_MOVED)
     m.send("lo\r")
@@ -117,8 +117,8 @@ def test_a_log_line_between_output_writes_is_not_output(boot):
     line = "rhai -e 'print(\"a\"); loop { sleep(1000) }'"
     m.send_line(line)
     wait_for_output(m, start, r"\na\n$")
-    # unconfirmed: a script runs on serial, so no `kbd`; its log line, read
-    # next, confirms it
+    # unconfirmed: a script runs on serial, so no `kbd`; Shift+PgUp's debug
+    # line, read next, confirms it
     m.press(["shift", "pgup"])
     wait_for_output(m, start, VIEW_MOVED)
     m.send("\x03")

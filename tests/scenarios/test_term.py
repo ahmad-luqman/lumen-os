@@ -97,7 +97,7 @@ def test_scrollback(boot, artifacts, golden_dir):
     # row is line scrollback - view.
     scrollback = before.scrollback
     # Each key's debug line, read next, confirms it: a confirmed step's `kbd`
-    # would read past that line.
+    # reading would take that line into its own output.
     qmp = m.qmp()
     qmp.send_key(["shift", "pgup"])  # unconfirmed: its debug line confirms it
     assert view_moved(m) == (half, str(scrollback - half))
@@ -123,7 +123,7 @@ def test_scrollback(boot, artifacts, golden_dir):
         artifacts=artifacts,
     )
     # unconfirmed: its debug line, read next, confirms it (a confirmed
-    # step's `kbd` would read past that line)
+    # step's `kbd` reading would take that line into its own output)
     m.press(["spc"])
     assert view_moved(m)[0] == 0
     back = term_status(m)
@@ -217,7 +217,7 @@ def test_a_command_drawing_keeps_its_terminal_shown(boot):
     confirmed_keys(m, "life\n")
     expect_screen(m, r"^life: gun on 160x80 cells; a key quits$")
     # unconfirmed: its log line, read next, confirms it (a confirmed step's
-    # `kbd` would read past that line)
+    # `kbd` reading would take that line into its own output)
     m.press(["alt", "f2"])
     m.expect(r"INFO  term: not showing terminal 2: a command has the screen\n", 10)
     m.send_line("vt 2")

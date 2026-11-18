@@ -122,7 +122,7 @@ def test_keys_via_qmp_send_key(boot):
     assert (got.bytes - s.bytes, got.held) == (2 * (len(burst) + 2), 0), got
     expect_screen(m, rf"^lumen> {burst}x\nabcdefghijklmnopx\nlumen>$")
     # unconfirmed: a key held when a confirmed one goes (shift, 400 ms, sent
-    # past `press`'s schedule; reproduced in review): the step waits for its
+    # past `press`'s schedule): the step waits for its
     # release, then counts its own keys, so shift's release can't stand in
     # for the key's own.
     m.qmp().send_key(["shift"], hold_ms=400)

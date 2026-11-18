@@ -53,6 +53,15 @@ def qcodes_for(ch: str) -> list[str]:
     raise ValueError(f"no US key types {ch!r}")
 
 
+def refuse_key_events(args: dict[str, Any]) -> dict[str, Any]:
+    """`args` for `input-send-event`, unless it holds a key event: keys go
+    through `send-key` (`QmpClient.send_key`), the one raw key path
+    tests/harness/test_scenario_typing.py watches."""
+    if any(event.get("type") == "key" for event in args.get("events", ())):
+        raise ValueError("key events go through send_key (send-key), not input-send-event")
+    return args
+
+
 def send_key_args(qcodes: Sequence[str], hold_ms: int) -> dict[str, Any]:
     """The arguments of QMP's `send-key`: press `qcodes` together, hold them
     `hold_ms`, release them."""
@@ -213,8 +222,9 @@ class QmpClient:
 
     def send_input(self, args: dict[str, Any]) -> None:
         """Send input events (`pointer_move_args`, `button_args`); QEMU ends
-        them with a sync, so the guest sees them as one frame."""
-        self.command("input-send-event", **args)
+        them with a sync, so the guest sees them as one frame. Key events
+        are refused (`refuse_key_events`)."""
+        self.command("input-send-event", **refuse_key_events(args))
 
     def close(self) -> None:
         try:

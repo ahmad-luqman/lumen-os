@@ -2,20 +2,25 @@
 
 Keys typed with `Machine.press`, `Machine.type_text` or QMP's `send-key`
 go to QEMU and return; a key lost under load then shows only as a wrong
-screen. Where #128's keys were lost wasn't found; the likely place is the
-keyboard's own queue, which only the guest drains, filling while QEMU sends
-keys to a stalled guest. `lumen_harness.gui.confirmed_keys` sends the next
-key only once the guest counted the last (and fails naming a lost one).
+screen. Where #128's keys were lost wasn't found; the likely place is QEMU's
+emulated PS/2 keyboard queue, which only the guest drains, filling while
+keys are sent to a stalled guest (not the input queue `Machine.press`
+paces, nor the kernel's, whose drops `kbd` counts).
+`lumen_harness.gui.confirmed_keys` sends the next key only once the guest
+counted the last (and fails naming a lost one).
 
 So in tests/scenarios, each statement that uses a raw key path (calls or
-names `.press`, `.type_text` or `.send_key`, or sends QMP's `"send-key"`)
-needs an `# unconfirmed: <why>` comment of its own: on its line, or in the
-comment block directly above it. The reasons: a race on purpose, no serial
+names `.press`, `.type_text` or `.send_key`, or names QMP's `send-key`
+anywhere, as a string) needs an `# unconfirmed: <why>` comment of its own:
+on its line, or in the comment-only block directly above it. Reasons such
+as: a race on purpose, raw typing being what the test is about, no serial
 shell free to run `kbd`, or an effect read next that a confirmed step's
-`kbd` would read past. In tools/harness/lumen_harness only the functions
-that implement those paths may use them (`RAW_ALLOWED`), so a helper
-scenarios call can't type raw unseen. (Keys sent as `input-send-event`
-key events aren't looked for: nothing sends any.)
+`kbd` reading would take into its own output. In tools/harness/lumen_harness
+and tests/conftest.py only `RAW_ALLOWED`'s functions may use them (the ones
+implementing the raw paths, and `confirmed_keys`, which confirms each
+press), so a helper scenarios call can't type raw unseen. (QMP
+`input-send-event` key events can't be sent: `QmpClient.send_input` refuses
+them.)
 """
 
 from __future__ import annotations
@@ -31,48 +36,42 @@ SCENARIOS = TESTS / "scenarios"
 HARNESS = TESTS.parent / "tools" / "harness" / "lumen_harness"
 RAW_ATTRS = {"press", "type_text", "send_key"}
 MARK = re.compile(r"#\s*unconfirmed:\s*\S")
-# The harness functions that implement the raw paths, by file.
+# Per harness file, the functions (qualified by class) allowed raw paths;
+# exactly these must use them, so a stale entry is noticed.
 RAW_ALLOWED = {
-    "qemu.py": {"press", "type_text"},
-    "qmp.py": {"send_key"},
+    "qemu.py": {"Machine.press", "Machine.type_text"},
+    "qmp.py": {"QmpClient.send_key"},
     "gui.py": {"confirmed_keys"},
 }
 
 
 def raw_lines(source: str) -> dict[int, str]:
     """The first line of each statement in `source` that uses a raw key
-    path, with the innermost function it's in ("" at module level)."""
+    path, with the innermost function it's in, qualified by its class ("" at
+    module level). A function's own body is in it; its decorators,
+    defaults and annotations are in the enclosing scope."""
     found: dict[int, str] = {}
 
     def raw(node: ast.AST) -> bool:
-        if isinstance(node, ast.Attribute) and node.attr in RAW_ATTRS:
-            return True
-        return (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "command"
-            and bool(node.args)
-            and isinstance(node.args[0], ast.Constant)
-            and node.args[0].value == "send-key"
-        )
+        if isinstance(node, ast.Attribute):
+            return node.attr in RAW_ATTRS
+        return isinstance(node, ast.Constant) and node.value == "send-key"
 
-    def visit(node: ast.AST, function: str) -> None:
+    def visit(node: ast.AST, line: int, function: str, cls: str) -> None:
+        if isinstance(node, ast.stmt):
+            line = node.lineno
+        if raw(node):
+            found.setdefault(line, function)
+        is_def = isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
         for child in ast.iter_child_nodes(node):
-            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
-                # Its decorators and defaults belong to the enclosing scope.
-                outer = [*child.decorator_list, *child.args.defaults, *child.args.kw_defaults]
-                if any(raw(n) for expr in outer if expr is not None for n in ast.walk(expr)):
-                    found.setdefault(child.lineno, function)
-                visit(child, child.name)
-            elif isinstance(child, ast.stmt) and not isinstance(child, ast.ClassDef):
-                own = [n for n in ast.iter_child_nodes(child) if not isinstance(n, ast.stmt)]
-                if any(raw(n) for expr in own for n in ast.walk(expr)):
-                    found.setdefault(child.lineno, function)
-                visit(child, function)
+            if is_def and isinstance(child, ast.stmt):
+                visit(child, line, f"{cls}.{node.name}" if cls else node.name, "")
+            elif isinstance(node, ast.ClassDef) and isinstance(child, ast.stmt):
+                visit(child, line, function, node.name)
             else:
-                visit(child, function)
+                visit(child, line, function, cls)
 
-    visit(ast.parse(source), "")
+    visit(ast.parse(source), 0, "", "")
     return found
 
 
@@ -85,20 +84,21 @@ def marks(source: str) -> set[int]:
 
 def unmarked(source: str) -> list[int]:
     """The raw-key statements of `source` (`raw_lines`) without a mark on
-    their line or in the comment block directly above them."""
+    their line or in the comment-only block directly above them (a code
+    line's trailing mark is its own statement's, not the next one's)."""
     lines, marked = source.splitlines(), marks(source)
     bad = []
     for n in sorted(raw_lines(source)):
-        above = n - 1
-        while above >= 1 and above not in marked and lines[above - 1].lstrip().startswith("#"):
-            above -= 1
-        if n not in marked and above not in marked:
+        top = n
+        while top > 1 and lines[top - 2].lstrip().startswith("#"):
+            top -= 1
+        if marked.isdisjoint(range(top, n + 1)):
             bad.append(n)
     return bad
 
 
 def test_every_raw_key_in_the_scenarios_says_why():
-    files = sorted(SCENARIOS.glob("test_*.py"))
+    files = sorted(SCENARIOS.glob("*.py"))
     assert len(files) >= 15 and SCENARIOS / "test_input.py" in files, f"scanned {files}"
     bad = []
     for path in files:
@@ -110,16 +110,37 @@ def test_every_raw_key_in_the_scenarios_says_why():
     )
 
 
+def harness_problem(name: str, source: str) -> str | None:
+    """Why harness file `name` (`source`) breaks `RAW_ALLOWED`, or None: the
+    functions using raw key paths must be exactly the ones listed for it (a
+    listed one that no longer does is a stale entry, which would let a later
+    function of that name through)."""
+    used, allowed = set(raw_lines(source).values()), RAW_ALLOWED.get(name, set())
+    if used == allowed:
+        return None
+    return (
+        f"{name}: raw keys in {sorted(used)}, allowed {sorted(allowed)}: type through "
+        "gui.confirmed_keys, or (implementing a raw path) list the function in RAW_ALLOWED"
+    )
+
+
 def test_the_harness_types_raw_only_where_it_implements_it():
-    files = sorted(HARNESS.glob("*.py"))
-    assert HARNESS / "gui.py" in files, f"scanned {files}"
-    bad = [
-        f"{path.name}:{n} (in {function or 'module'})"
-        for path in files
-        for n, function in raw_lines(path.read_text()).items()
-        if function not in RAW_ALLOWED.get(path.name, set())
-    ]
-    assert not bad, "raw keys in a harness helper scenarios call:\n" + "\n".join(bad)
+    files = [*sorted(HARNESS.glob("*.py")), TESTS / "conftest.py"]
+    assert HARNESS / "gui.py" in files and all(f.exists() for f in files), f"scanned {files}"
+    problems = [p for f in files if (p := harness_problem(f.name, f.read_text()))]
+    assert not problems, "\n".join(problems)
+
+
+def test_a_harness_file_uses_raw_keys_exactly_where_listed():
+    gui = "def confirmed_keys(m):\n    m.press(['x'])\n"
+    assert harness_problem("gui.py", gui) is None
+    assert harness_problem("gui.py", gui + "def helper(m):\n    m.press(['y'])\n"), (
+        "an extra function"
+    )
+    assert harness_problem("gui.py", "def confirmed_keys(m):\n    pass\n"), "a stale entry"
+    assert harness_problem("conftest.py", "def boot(m):\n    m.type_text('x')\n"), (
+        "none allowed there"
+    )
 
 
 def test_a_raw_key_needs_its_own_mark():
@@ -129,7 +150,15 @@ def test_a_raw_key_needs_its_own_mark():
     # A mark covers only the statement right below its comment block.
     assert unmarked('# unconfirmed: a race\nm.press(["x"])\nm.type_text("y")\n') == [3]
     assert unmarked('# unconfirmed: a race\nx = 1\nm.press(["x"])\n') == [3]
+    # A code line's trailing mark is its own statement's only.
+    assert unmarked('m.press(["a"])  # unconfirmed: a race\nm.press(["b"])\n') == [2]
+    assert unmarked('x = 1  # unconfirmed: a race\n# more\nm.press(["b"])\n') == [3]
+    assert unmarked("for k in ks:  # unconfirmed: a race\n    m.press([k])\n") == [2]
     assert unmarked('# unconfirmed:\nm.press(["x"])\n') == [2], "a reason is required"
+    assert unmarked('# unconfirmed:   \nm.press(["x"])\n') == [2], "spaces aren't a reason"
+    assert unmarked('# unconfirmed: a race\n\nm.press(["x"])\n') == [3], (
+        "a blank line ends the block"
+    )
     assert unmarked('m.send_line("# unconfirmed: no")\nm.press(["x"])\n') == [2], "not in a string"
 
 
@@ -142,13 +171,30 @@ def test_every_raw_key_path_is_seen():
         'm.qmp().command("send-key", keys=[])\n',
         "m.qmp().send_key(['a'], hold_ms=1)\n",
         "m.press(\n    ['x'],\n)\n",
+        'm.qmp().command(name="send-key", keys=[])\n',
+        'K = "send-key"\n',
+        "class A(B, k=m.press):\n    pass\n",
     ):
         assert unmarked(source) == [1], source
+    # Nested in compound statements' bodies, each at its own line.
+    assert unmarked("with boot() as m:\n    for k in 'ab':\n        m.press([k])\n") == [3]
+    # Only the statement itself, not one nested in its except or case.
+    for source in (
+        "try:\n    pass\nexcept OSError:\n    m.press(['x'])  # unconfirmed: y\n",
+        "match k:\n    case 1:\n        m.press(['x'])  # unconfirmed: y\n",
+    ):
+        assert unmarked(source) == [], source
     assert unmarked('got.presses\nm.qmp().command("query-pci")\nconfirmed_keys(m, "x")\n') == []
+    assert unmarked('"""How send-key works."""\nraise ValueError("send-key needs a key")\n') == []
 
 
 def test_a_harness_helper_is_judged_by_its_function():
-    assert raw_lines("class M:\n    def press(self, q):\n        self.qmp().send_key(q)\n") == {
-        3: "press"
-    }
-    assert raw_lines("def helper(m):\n    m.press(['x'])\n") == {2: "helper"}
+    m_press = "class M:\n    def press(self, q):\n        self.qmp().send_key(q)\n"
+    assert raw_lines(m_press) == {3: "M.press"}
+    assert raw_lines("def press(m):\n    m.press(['x'])\n") == {2: "press"}, "not Machine's"
+    assert raw_lines("def helper(m):\n    def inner():\n        m.press(['x'])\n") == {3: "inner"}
+    # Its defaults and decorators are the enclosing scope's.
+    assert raw_lines("def helper(m, k=m.press):\n    pass\n") == {1: ""}
+    assert raw_lines("@d(m.press)\ndef press():\n    pass\n") == {2: ""}
+    assert raw_lines("def press(k=m.press): m.press()\n") == {1: ""}
+    assert unmarked("def f(k=m.press):\n    pass\n") == [1]
