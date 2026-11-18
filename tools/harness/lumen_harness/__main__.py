@@ -130,20 +130,9 @@ def cmd_audit(a: argparse.Namespace) -> int:
 
 
 def cmd_census(a: argparse.Namespace) -> int:
-    from .census import collect, summary
+    from .census import run_census
 
-    repo = (
-        a.repo
-        or subprocess.run(
-            ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    )
-    print(f"## CI's first attempts over the last {a.days} days ({repo})\n")
-    print(summary(collect(repo, a.days)))
-    return 0
+    return run_census(a.repo, a.days)
 
 
 def cmd_status(a: argparse.Namespace) -> int:

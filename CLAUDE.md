@@ -443,9 +443,10 @@ own PR that updates that doc first.
   HPET-or-PIT choice, read back and checked against the numbers they print:
   `judged`, `verdict`, `weighed`, `no_other_warnings`), `clock_diags.py` (the
   clock cross-check ktests' diagnostics, `check_clock_diags`),
-  `census.py` (the flake census: CI's red first attempts per day and the
-  tests that failed them, from the run logs through `gh`; `make census`, and
-  weekly in the `flake-census` workflow's summary),
+  `census.py` (the flake census: CI's red first attempts per day, how many
+  passed on a re-run, and the tests that failed them, from the failed jobs'
+  logs through `gh`; `make census`, and weekly in the `flake-census`
+  workflow's summary),
   `screenshot.py` (`screenshot`'s frame read back and checked;
   `Machine.screenshot_via_serial`),
   `shell.py` (`run`: a serial command's output, the log's lines taken out

@@ -1,54 +1,264 @@
-"""The flake census reads CI logs' failures and summarizes red first
-attempts (lumen_harness.census)."""
+"""The flake census (lumen_harness.census): what a CI log says failed, the
+summary, and collecting first attempts, with the GitHub API faked."""
 
-from lumen_harness.census import Run, failures_in_log, summary
+import subprocess
+from datetime import UTC, datetime
+
+import pytest
+from lumen_harness import census
+from lumen_harness.census import LOG_UNAVAILABLE, Run, failures_in_log, summary
 
 LOG = """\
-2026-11-18T04:11:44.5981918Z E           not ok 25 - lumen_kernel::sched::a_scope_joins_every_thread_before_it_returns
-2026-11-18T04:11:44.6003643Z     not ok 25 - lumen_kernel::sched::a_scope_joins_every_thread_before_it_returns
-2026-11-18T04:11:44.7Z FAILED tests/scenarios/test_ktest.py::test_in_kernel_tests_pass[tsc-0.6%] - AssertionError: planned 304
-2026-11-18T04:11:45.0Z FAILED tests/scenarios/test_serial.py::test_the_safety_net_reads_input_when_irq_4_never_comes
-2026-11-18T04:11:45.1Z [gw3] [ 54%] FAILED tests/scenarios/test_time.py::test_x
-2026-11-18T04:11:45.2Z ok 26 - lumen_kernel::sched::fine
+2026-11-18T04:00:00.0Z ##[group]Run make test-host
+2026-11-18T04:00:01.0Z test tests::writing_never_allocates ... FAILED
+2026-11-18T04:00:02.0Z ##[group]Run make test-scenarios
+2026-11-18T04:11:44.5Z E           not ok 25 - lumen_kernel::sched::a_scope_joins_every_thread_before_it_returns
+2026-11-18T04:11:44.6Z     not ok 25 - lumen_kernel::sched::a_scope_joins_every_thread_before_it_returns
+2026-11-18T04:11:44.7Z [gw3] [ 54%] FAILED tests/scenarios/test_time.py::progress_lines_are_not_the_record
+2026-11-18T04:11:45.0Z \x1b[31mFAILED\x1b[0m tests/scenarios/test_acpi.py::test_cpu_count_matches_qemu[1-1 CPU] - boom
+2026-11-18T04:11:45.1Z FAILED tests/scenarios/test_serial.py::test_the_safety_net - AssertionError
+2026-11-18T04:11:45.2Z ERROR tests/scenarios/test_gui.py::test_a_teardown_failed - OSError
+2026-11-18T04:11:45.3Z FAILED tests/scenarios/test_serial.py::test_the_safety_net - again
+2026-11-18T04:11:45.4Z FAILED tests/scenarios/test_boot.py::test_x - build/lumen-qemutest.iso not found; run `make iso` first
+2026-11-18T04:12:00.0Z ##[group]Run rc=0
+2026-11-18T04:12:00.1Z rc=0
+2026-11-18T04:12:00.2Z LUMEN_ACCEL=tcg LUMEN_ARTIFACTS_DIR=build/test-artifacts-tcg \\
+2026-11-18T04:12:30.0Z FAILED tests/scenarios/test_time.py::only_under_tcg - the re-run's failure
+2026-11-18T04:12:30.1Z ok 26 - lumen_kernel::sched::fine
 """
 
 
-def test_a_log_s_failures_are_read_once_each():
+def test_a_log_s_failures_are_read_once_each_in_order():
     assert failures_in_log(LOG) == [
-        "tests/scenarios/test_ktest.py::test_in_kernel_tests_pass[tsc-0.6%]",
-        "tests/scenarios/test_serial.py::test_the_safety_net_reads_input_when_irq_4_never_comes",
+        "cargo:tests::writing_never_allocates",
         "lumen_kernel::sched::a_scope_joins_every_thread_before_it_returns",
+        "tests/scenarios/test_acpi.py::test_cpu_count_matches_qemu[1-1 CPU]",
+        "tests/scenarios/test_serial.py::test_the_safety_net",
+        "tests/scenarios/test_gui.py::test_a_teardown_failed",
     ]
-
-
-def test_colour_codes_are_ignored():
-    assert failures_in_log("\x1b[31mFAILED\x1b[0m tests/x.py::y - boom\n") == ["tests/x.py::y"]
 
 
 def test_a_log_with_nothing_failed_has_no_failures():
-    assert failures_in_log("ok 1 - a\nPASSED tests/x.py::y\n1 passed\n") == []
+    assert failures_in_log("ok 1 - a\nPASSED tests/x.py::y\ntest t ... ok\n1 passed\n") == []
 
 
-def test_the_summary_counts_red_first_attempts_and_ranks_their_tests():
+def test_the_summary_counts_red_first_attempts_flakes_and_their_tests():
     runs = [
-        Run("2026-11-17", "a", False),
-        Run("2026-11-17", "b", True, ["lumen_kernel::mm::heap::fragmentation_stress"]),
-        Run(
-            "2026-11-18",
-            "c",
-            True,
-            ["lumen_kernel::mm::heap::fragmentation_stress", "tests/x.py::y"],
-        ),
-        Run("2026-11-18", "d", True),
-        Run("2026-11-18", "e", False),
+        Run("2026-11-18", False),
+        Run("2026-11-18", True, ("k::heap", "tests/x.py::y"), rerun_passed=True),
+        Run("2026-11-18", True),
+        Run("2026-11-17", False),
+        Run("2026-11-17", True, ("k::heap",)),
+        Run("2026-11-17", False),
     ]
     text = summary(runs)
-    assert "| 2026-11-17 | 2 | 1 (50%) |" in text
-    assert "| 2026-11-18 | 3 | 2 (66%) |" in text
-    assert "| **all** | 5 | 3 (60%) |" in text
-    assert text.index("fragmentation_stress` | 2 |") < text.index("`tests/x.py::y` | 1 |")
-    assert "(red with no failing test in its logs: build, lint or audit) | 1 |" in text
+    # Days in order, whatever order the runs came in; shares round down.
+    assert text.index("2026-11-17") < text.index("2026-11-18")
+    assert "| 2026-11-17 | 3 | 1 (33%) | 0 |" in text
+    assert "| 2026-11-18 | 3 | 2 (66%) | 1 |" in text
+    assert "| **all** | 6 | 3 (50%) | 1 |" in text
+    assert text.index("`k::heap` | 2 |") < text.index("`tests/x.py::y` | 1 |")
+    assert "(red, no test named in its logs" in text and text.rstrip().endswith("| 1 |")
+
+
+def test_the_unnamed_row_is_left_out_when_every_red_run_names_a_test():
+    assert "no test named" not in summary([Run("2026-11-18", True, ("t",))])
 
 
 def test_no_runs_is_no_division_by_zero():
-    assert "| **all** | 0 | 0 (0%) |" in summary([])
+    assert "| **all** | 0 | 0 (0%) | 0 |" in summary([])
+
+
+REPO = "o/r"
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """No test here reaches GitHub: gh fails loudly unless a fake stands in."""
+
+    def refuse(*a, **k):
+        raise AssertionError(f"a test ran a real command: {a}")
+
+    monkeypatch.setattr(census.subprocess, "run", refuse)
+
+
+def _run(id, conclusion, attempt=1, day="2026-11-17"):
+    return {
+        "id": id,
+        "run_attempt": attempt,
+        "conclusion": conclusion,
+        "created_at": f"{day}T10:00:00Z",
+    }
+
+
+class FakeGitHub:
+    """`_json` and `_log` over canned answers; records every call."""
+
+    def __init__(self, pages, attempts=None, jobs=None, logs=None):
+        self.pages = pages  # [[run, ...], ...], page 1 first
+        self.attempts = attempts or {}  # run id -> attempt 1's run
+        self.jobs = jobs or {}  # run id -> attempt 1's jobs
+        self.logs = logs or {}  # job id -> log text, or None: unreadable
+        self.calls: list[str] = []
+        self.logs_read: list[int] = []
+
+    def json(self, path):
+        self.calls.append(path)
+        if "/workflows/" in path:
+            page = int(path.rsplit("page=", 1)[1])
+            return {"workflow_runs": self.pages[page - 1] if page <= len(self.pages) else []}
+        run_id = int(path.split("/runs/")[1].split("/")[0])
+        if path.endswith("/attempts/1/jobs"):
+            return {"jobs": self.jobs.get(run_id, [])}
+        if path.endswith("/attempts/1"):
+            return self.attempts[run_id]
+        raise AssertionError(f"unexpected gh api {path}")
+
+    def log(self, repo, job_id):
+        assert repo == REPO
+        self.logs_read.append(job_id)
+        return self.logs.get(job_id, "")
+
+
+@pytest.fixture
+def github(monkeypatch):
+    def make(**kw):
+        f = FakeGitHub(**kw)
+        monkeypatch.setattr(census, "_json", f.json)
+        monkeypatch.setattr(census, "_log", f.log)
+        return f
+
+    return make
+
+
+def test_a_rerun_counts_by_its_first_attempt(github):
+    # Run 2's first attempt was red and its re-run passed: red, a flake, its
+    # failures from attempt 1's jobs. Run 3 went red only on a re-run.
+    f = github(
+        pages=[[_run(1, "success"), _run(2, "success", attempt=2), _run(3, "failure", attempt=2)]],
+        attempts={2: _run(2, "failure"), 3: _run(3, "success")},
+        jobs={2: [{"id": 20, "conclusion": "failure"}]},
+        logs={20: "FAILED tests/scenarios/a.py::t - boom\n"},
+    )
+    assert census.collect(REPO, 7) == [
+        Run("2026-11-17", False),
+        Run("2026-11-17", True, ("tests/scenarios/a.py::t",), rerun_passed=True),
+        Run("2026-11-17", False),
+    ]
+    assert f"repos/{REPO}/actions/runs/2/attempts/1/jobs" in f.calls
+    assert not any("runs/1/attempts" in c for c in f.calls), "a first attempt fetched again"
+
+
+def test_only_red_conclusions_count_and_the_rest_are_left_out(github):
+    github(
+        pages=[
+            [
+                _run(1, "cancelled"),
+                _run(2, "skipped"),
+                _run(3, None),
+                _run(4, "action_required"),
+                _run(5, "neutral"),
+                _run(6, "success", attempt=2),  # a re-run of a cancelled first attempt
+                _run(7, "cancelled", attempt=2),  # a red first attempt, its re-run cancelled
+                _run(8, "timed_out"),
+                _run(9, "startup_failure"),
+            ]
+        ],
+        attempts={6: _run(6, "cancelled"), 7: _run(7, "failure")},
+    )
+    runs = census.collect(REPO, 7)
+    assert [(r.red, r.rerun_passed) for r in runs] == [(True, False)] * 3
+
+
+def test_failed_and_timed_out_jobs_logs_are_read_and_a_run_counts_a_test_once(github):
+    f = github(
+        pages=[[_run(1, "failure", day="2026-11-18")]],
+        jobs={
+            1: [
+                {"id": 10, "conclusion": "success"},
+                {"id": 11, "conclusion": "failure"},
+                {"id": 12, "conclusion": "timed_out"},
+            ]
+        },
+        logs={
+            10: "FAILED tests/never.py::read\n",
+            11: "FAILED tests/a.py::t\nE   not ok 3 - k::t\n",
+            12: "FAILED tests/a.py::t\nFAILED tests/b.py::u\n",
+        },
+    )
+    assert census.collect(REPO, 7) == [
+        Run("2026-11-18", True, ("tests/a.py::t", "k::t", "tests/b.py::u"))
+    ]
+    assert f.logs_read == [11, 12]
+
+
+def test_a_log_that_cant_be_read_is_said_not_taken_for_no_failure(github):
+    github(
+        pages=[[_run(1, "failure")]],
+        jobs={1: [{"id": 10, "conclusion": "failure"}]},
+        logs={10: None},
+    )
+    assert census.collect(REPO, 7) == [Run("2026-11-17", True, (LOG_UNAVAILABLE,))]
+
+
+def test_pages_are_read_until_a_short_one_and_a_run_shifted_onto_two_counts_once(github):
+    first = [_run(i, "success") for i in range(100)]
+    # A new run during paging pushes run 99 onto page 2 as well.
+    f = github(pages=[first, [_run(99, "success"), _run(100, "failure")]])
+    assert len(census.collect(REPO, 7)) == 101
+    listed = [c.rsplit("page=", 1)[1] for c in f.calls if "/workflows/" in c]
+    assert listed == ["1", "2"]
+
+
+def test_a_full_last_page_stops_at_the_empty_one(github):
+    f = github(pages=[[_run(i, "success") for i in range(100)]])
+    assert len(census.collect(REPO, 7)) == 100
+    assert len([c for c in f.calls if "/workflows/" in c]) == 2
+
+
+def test_the_window_is_the_last_days_to_the_second(github, monkeypatch):
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 11, 18, 3, 4, 5, tzinfo=UTC)
+
+    monkeypatch.setattr(census, "datetime", Frozen)
+    f = github(pages=[])
+    assert census.collect(REPO, 3) == []
+    assert f.calls == [
+        f"repos/{REPO}/actions/workflows/ci.yml/runs?created=>=2026-11-15T03:04:05Z&per_page=100&page=1"
+    ]
+
+
+def _proc(rc, out="", err=""):
+    return subprocess.CompletedProcess([], rc, out, err)
+
+
+def test_gh_is_tried_again_and_its_last_error_raised(monkeypatch):
+    answers = [_proc(1, err="502"), _proc(1, err="502"), _proc(0, '{"ok": 1}')]
+    monkeypatch.setattr(census.subprocess, "run", lambda *a, **k: answers.pop(0))
+    slept = []
+    monkeypatch.setattr(census.time, "sleep", slept.append)
+    assert census._json("p") == {"ok": 1}
+    assert slept == [2, 4]
+    monkeypatch.setattr(census.subprocess, "run", lambda *a, **k: _proc(1, err="gone"))
+    with pytest.raises(RuntimeError, match="gh api p: gone"):
+        census._gh("p")
+
+
+def test_a_log_falls_back_to_a_gh_without_allow_escape_sequences(monkeypatch, capsys):
+    monkeypatch.setattr(census.time, "sleep", lambda s: None)
+    seen = []
+
+    def run(args, **k):
+        seen.append(args)
+        return (
+            _proc(1, err="unknown flag") if "--allow-escape-sequences" in args else _proc(0, "LOG")
+        )
+
+    monkeypatch.setattr(census.subprocess, "run", run)
+    assert census._log(REPO, 7) == "LOG"
+    assert seen[-1] == ["gh", "api", f"repos/{REPO}/actions/jobs/7/logs"]
+    monkeypatch.setattr(census.subprocess, "run", lambda *a, **k: _proc(1, err="404"))
+    assert census._log(REPO, 7) is None
+    assert "job 7's log couldn't be read" in capsys.readouterr().err
