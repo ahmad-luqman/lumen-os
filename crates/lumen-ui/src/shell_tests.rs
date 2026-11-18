@@ -49,7 +49,11 @@ fn a_removed_widget_names_nothing_and_its_slot_is_never_reused() {
     let c = ui.text_field(Some(inner), "C", "text");
     ui.layout(AREA, &mut FixedText);
     ui.set_window_focused(true);
-    let (a_id, b_id, c_id) = (ui.id(a).get(), ui.id(b).get(), ui.id(c).get());
+    let (a_id, b_id, c_id) = (
+        ui.id(a).expect("not removed").get(),
+        ui.id(b).expect("not removed").get(),
+        ui.id(c).expect("not removed").get(),
+    );
     // B focused and armed (pressed, not yet released), then removed.
     let at = centre(ui.bounds(b));
     let _ = ui.handle(Input::Down { x: at.0, y: at.1 });
@@ -90,11 +94,45 @@ fn a_removed_widget_names_nothing_and_its_slot_is_never_reused() {
     // A new widget takes a new slot and a new id.
     let d = ui.button(Some(row), "D");
     assert!(d != b && d != c && d != inner.widget());
-    assert!(ui.id(d).get() > c_id);
+    assert!(ui.id(d).expect("not removed").get() > c_id);
     assert_eq!(ui.invoke(a_id, &Action::Press), Ok(alloc::vec![UiEvent::Pressed(a)]));
     // A child added to a removed stack is removed too.
     let e = ui.button(Some(inner), "E");
     assert!(ui.is_removed(e));
+}
+
+#[test]
+fn a_freed_slot_is_taken_again_under_a_new_generation() {
+    // A taskbar's buttons come and go with its windows: the tree doesn't
+    // grow, and an old handle never reaches the widget in its slot now.
+    let mut ui = Ui::bar(4);
+    let row = ui.hstack(None, "Windows");
+    let first = ui.button(Some(row), "First");
+    let first_id = ui.id(first).expect("live").get();
+    assert!(ui.remove(first));
+    let second = ui.label(Some(row), "Second", "two");
+    assert_ne!(first, second);
+    assert!(ui.is_removed(first) && !ui.is_removed(second));
+    assert_eq!(ui.id(first), None);
+    assert_eq!(ui.text(first), None);
+    ui.set_text(first, "changed through a stale handle");
+    assert_eq!(ui.text(second), Some("two"));
+    assert!(!ui.remove(first), "a stale handle removes nothing");
+    assert!(!ui.is_removed(second));
+    assert_eq!(ui.invoke(first_id, &Action::Press), Err(InvokeError::NoNode));
+    assert!(ui.id(second).expect("live").get() > first_id, "a new node id");
+    let slots = ui.slots();
+    for n in 0..1000 {
+        let b = ui.button(Some(row), &alloc::format!("Window {n}"));
+        ui.layout(Rect::new(0, 0, 800, 40), &mut FixedText);
+        assert!(ui.remove(b));
+    }
+    assert!(ui.slots() <= slots + 1, "{} slots after 1000 windows", ui.slots());
+    // A child of a stack that is gone is born removed.
+    assert!(ui.remove(row.widget()));
+    let orphan = ui.button(Some(row), "Orphan");
+    assert!(ui.is_removed(orphan));
+    assert!(ui.nodes().is_empty());
 }
 
 #[test]
@@ -103,7 +141,7 @@ fn a_menu_shows_its_items_only_while_expanded_and_choosing_one_folds_it() {
     let menu = ui.menu(None, "Launcher", &["Terminal", "Life"]);
     let after = ui.button(None, "After");
     ui.layout(Rect::new(0, 0, 600, 40), &mut FixedText);
-    let menu_id = ui.id(menu).get();
+    let menu_id = ui.id(menu).expect("not removed").get();
     let life = ui.item_id(menu, 1).expect("an item").get();
     // Folded: no items in the tree, and they name nothing.
     let node = ui.node(menu_id).expect("listed").1;
@@ -295,7 +333,11 @@ fn repainting_only_the_damage_matches_repainting_everything() {
                 (8, Some(w)) => {
                     // Every action on a node of it (or an item).
                     let ids: Vec<u64> = ui.nodes().iter().map(|(_, n)| n.id().get()).collect();
-                    let id = if rng.below(2) == 0 { ui.id(w).get() } else { ids[rng.below(ids.len())] };
+                    let id = if rng.below(2) == 0 {
+                        ui.id(w).expect("not removed").get()
+                    } else {
+                        ids[rng.below(ids.len())]
+                    };
                     let actions = [Action::Press, Action::Focus, Action::Select, Action::SetValue(String::from("v"))];
                     let _ = ui.invoke(id, &actions[rng.below(actions.len())]);
                 }

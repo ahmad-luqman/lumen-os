@@ -137,7 +137,7 @@ fn a_disabled_widget_takes_no_click_key_or_action() {
     assert_eq!(c.ui().checked(c.lock), Some(true));
     assert!(c.ui().is_disabled(c.add));
     click(&mut c, |c| c.add);
-    let add = c.ui().id(c.add).get();
+    let add = c.ui().id(c.add).expect("not removed").get();
     assert_eq!(c.ui_mut().invoke(add, &Action::Press), Err(InvokeError::Disabled));
     assert_eq!(c.count(), 0);
     // Tab skips it.
@@ -235,8 +235,8 @@ fn ids_stay_the_same_across_changes_and_repaints() {
 fn invoke_errors_change_nothing() {
     let mut c = laid_out();
     let before = shown(c.ui());
-    let label = c.ui().id(c.count_label).get();
-    let add = c.ui().id(c.add).get();
+    let label = c.ui().id(c.count_label).expect("not removed").get();
+    let add = c.ui().id(c.add).expect("not removed").get();
     let ui = c.ui_mut();
     assert_eq!(ui.invoke(u64::MAX, &Action::Press), Err(InvokeError::NoNode));
     assert_eq!(ui.invoke(label, &Action::Press), Err(InvokeError::NotAllowed(Role::Label, ActionKind::Press)));
@@ -264,7 +264,7 @@ fn invoke_and_a_click_give_the_same_state() {
     for step in steps {
         let w = step(&clicked);
         click(&mut clicked, |_| w);
-        let id = invoked.ui().id(step(&invoked)).get();
+        let id = invoked.ui().id(step(&invoked)).expect("not removed").get();
         let events = invoked.ui_mut().invoke(id, &Action::Press).expect("pressable");
         invoked.apply(&events);
         assert_eq!(shown(clicked.ui()), shown(invoked.ui()));
@@ -296,11 +296,11 @@ fn set_value_replaces_the_text_and_focus_focuses() {
     let ok = ui.button(None, "OK");
     ui.layout(AREA, &mut FixedText);
     ui.set_window_focused(true);
-    let id = ui.id(field).get();
+    let id = ui.id(field).expect("not removed").get();
     assert_eq!(ui.invoke(id, &Action::SetValue(String::from("lumen"))), Ok(alloc::vec![UiEvent::Edited(field)]));
     assert_eq!(ui.text(field), Some("lumen"));
     assert_eq!(ui.focused(), Some(field));
-    assert_eq!(ui.invoke(ui.id(ok).get(), &Action::Focus), Ok(alloc::vec![UiEvent::Focused(ok)]));
+    assert_eq!(ui.invoke(ui.id(ok).expect("not removed").get(), &Action::Focus), Ok(alloc::vec![UiEvent::Focused(ok)]));
     assert_eq!(ui.focused(), Some(ok));
 }
 
@@ -321,7 +321,7 @@ fn a_request_cancelled_at_its_deadline_then_reached_by_the_owner_leaves_the_stat
     // skips it: Add was not pressed. A retry then presses once, answering
     // Add's row.
     let mut c = laid_out();
-    let add = c.ui().id(c.add).get();
+    let add = c.ui().id(c.add).expect("not removed").get();
     let before = shown(c.ui());
     let mut reply = Reply::new();
     assert_eq!(reply.after_first_deadline(), First::Cancelled);
@@ -343,8 +343,8 @@ fn a_request_cancelled_at_its_deadline_then_reached_by_the_owner_leaves_the_stat
 #[test]
 fn serve_answers_the_row_the_error_or_that_the_window_closed() {
     let mut c = laid_out();
-    let count = c.ui().id(c.count_label).get();
-    let quit = c.ui().id(c.quit).get();
+    let count = c.ui().id(c.count_label).expect("not removed").get();
+    let quit = c.ui().id(c.quit).expect("not removed").get();
     assert_eq!(
         serve(&mut c, &mut FixedText, AREA, count, &Action::Press),
         Served::Error(InvokeError::NotAllowed(Role::Label, ActionKind::Press))
@@ -378,7 +378,7 @@ fn an_action_that_removes_its_node_answers_that_it_ran() {
     let mut ui = Ui::new();
     let gone = ui.button(None, "Once");
     ui.layout(AREA, &mut FixedText);
-    let id = ui.id(gone).get();
+    let id = ui.id(gone).expect("not removed").get();
     let mut app = Vanishing { ui, pressed: 0 };
     assert_eq!(serve(&mut app, &mut FixedText, AREA, id, &Action::Press), Served::RanNodeGone);
     assert_eq!(app.pressed, 1);
@@ -398,10 +398,10 @@ fn every_action_a_widget_role_lists_reaches_a_handler() {
     ui.layout(AREA, &mut FixedText);
     let item = ui.nodes().iter().find(|(_, n)| n.role() == Role::ListItem).map(|(_, n)| n.id()).expect("an item");
     let nodes = [
-        (Role::Button, ui.id(button)),
-        (Role::Checkbox, ui.id(checkbox)),
-        (Role::TextField, ui.id(field)),
-        (Role::List, ui.id(list)),
+        (Role::Button, ui.id(button).expect("not removed")),
+        (Role::Checkbox, ui.id(checkbox).expect("not removed")),
+        (Role::TextField, ui.id(field).expect("not removed")),
+        (Role::List, ui.id(list).expect("not removed")),
         (Role::ListItem, item),
     ];
     for (role, id) in nodes {
@@ -418,7 +418,7 @@ fn every_action_a_widget_role_lists_reaches_a_handler() {
     // refused.
     assert!(Role::Label.actions().is_empty() && Role::Group.actions().is_empty());
     assert_eq!(
-        ui.invoke(ui.id(button).get(), &Action::Select),
+        ui.invoke(ui.id(button).expect("not removed").get(), &Action::Select),
         Err(InvokeError::NotAllowed(Role::Button, ActionKind::Select))
     );
 }

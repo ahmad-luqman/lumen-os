@@ -27,11 +27,15 @@ const FIELD_PAD: u32 = 4;
 /// A list row's padding around its item.
 const ROW_PAD: u32 = 2;
 
-/// A widget of one [`Ui`] (an index into it: meaningless in another).
-/// Slots are never reused: once [`Ui::remove`]d, a widget stays removed,
-/// its node id names nothing, and no later widget takes its place.
+/// A widget of one [`Ui`] (meaningless in another): a slot and the
+/// slot's generation. Once [`Ui::remove`]d a widget stays removed and its
+/// node id names nothing; a later widget may take its slot, under a new
+/// generation (and a new node id), so the old handle still reads removed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Widget(usize);
+pub struct Widget {
+    slot: usize,
+    generation: u32,
+}
 
 /// A stack (a widget whose children go one after another): the only kind
 /// of widget a child can be added to, so a child can't land at the top
@@ -175,6 +179,8 @@ enum Kind {
 #[derive(Clone, Debug)]
 struct W {
     id: NodeId,
+    /// Bumped each time the slot is taken again.
+    generation: u32,
     name: String,
     kind: Kind,
     disabled: bool,
@@ -249,6 +255,8 @@ pub struct Ui {
     across: bool,
     /// A top widget placed at the area's right edge (across only).
     pinned: Option<usize>,
+    /// Slots of removed widgets, free to take again.
+    free: Vec<usize>,
 }
 
 impl Default for Ui {
@@ -265,6 +273,7 @@ impl Default for Ui {
             pad: PAD,
             across: false,
             pinned: None,
+            free: Vec::new(),
         }
     }
 }
@@ -281,25 +290,62 @@ impl Ui {
     }
 
     fn add(&mut self, parent: Option<Stack>, name: &str, kind: Kind) -> Widget {
-        let i = self.widgets.len();
-        let parent = parent.map(|Stack(Widget(p))| p);
+        // A child of a stack removed is made removed (its slot freed again
+        // at once): nothing shows it, its handle reads removed.
+        let parent = match parent {
+            None => None,
+            Some(Stack(p)) => match self.at(p) {
+                Some(p) => Some(p),
+                None => return self.dead(),
+            },
+        };
         debug_assert!(parent.is_none_or(|p| matches!(self.widgets[p].kind, Kind::Stack(_))));
-        self.widgets.push(W {
+        let w = W {
             id: NodeId::fresh(),
+            generation: 0,
             name: String::from(name),
             kind,
             disabled: false,
-            removed: parent.is_some_and(|p| self.widgets[p].removed),
+            removed: false,
             bounds: Rect::EMPTY,
             children: Vec::new(),
             parent,
-        });
+        };
+        let i = match self.free.pop() {
+            Some(i) => {
+                let generation = self.widgets[i].generation.wrapping_add(1);
+                self.widgets[i] = W { generation, ..w };
+                i
+            }
+            None => {
+                self.widgets.push(w);
+                self.widgets.len() - 1
+            }
+        };
         match parent {
             Some(p) => self.widgets[p].children.push(i),
             None => self.top.push(i),
         }
         self.changed = true;
-        Widget(i)
+        self.widget(i)
+    }
+
+    /// A handle that reads removed (for a child of a removed stack).
+    fn dead(&mut self) -> Widget {
+        let w = self.add(None, "", Kind::Label { text: String::new(), width: None });
+        self.remove(w);
+        w
+    }
+
+    /// The handle of the widget in slot `i` now.
+    fn widget(&self, i: usize) -> Widget {
+        Widget { slot: i, generation: self.widgets[i].generation }
+    }
+
+    /// `w`'s slot, if it is still there (not removed, its generation the
+    /// slot's).
+    fn at(&self, w: Widget) -> Option<usize> {
+        self.widgets.get(w.slot).filter(|x| x.generation == w.generation && !x.removed).map(|_| w.slot)
     }
 
     /// A stack whose children go top to bottom.
@@ -351,8 +397,10 @@ impl Ui {
     /// Place top widget `w` at the area's right edge (in a [`Ui::bar`]);
     /// the others stop short of it, those that don't fit hidden.
     pub fn pin_right(&mut self, w: Widget) {
-        debug_assert!(self.top.contains(&w.0), "only a top widget is pinned");
-        self.pinned = Some(w.0);
+        if let Some(i) = self.at(w) {
+            debug_assert!(self.top.contains(&i), "only a top widget is pinned");
+            self.pinned = Some(i);
+        }
     }
 
     /// Remove `w` and everything in it (a stack's children): from then on
@@ -360,24 +408,28 @@ impl Ui {
     /// listed, its accessors read as empty and its setters do nothing.
     /// What it covered is repainted. Whether it was there to remove.
     pub fn remove(&mut self, w: Widget) -> bool {
-        if self.widgets[w.0].removed {
-            return false;
-        }
-        let mut gone = alloc::vec![w.0];
+        let Some(slot) = self.at(w) else { return false };
+        let mut gone = alloc::vec![slot];
         let mut n = 0;
         while n < gone.len() {
             gone.extend(self.widgets[gone[n]].children.iter().copied());
             n += 1;
         }
+        match self.widgets[slot].parent {
+            Some(p) => self.widgets[p].children.retain(|&c| c != slot),
+            None => self.top.retain(|&c| c != slot),
+        }
         for &i in &gone {
             self.touch(i);
+            // What it held freed now; the slot kept for the next widget.
             let w = &mut self.widgets[i];
             w.removed = true;
             w.bounds = Rect::EMPTY;
-        }
-        match self.widgets[w.0].parent {
-            Some(p) => self.widgets[p].children.retain(|&c| c != w.0),
-            None => self.top.retain(|&c| c != w.0),
+            w.name = String::new();
+            w.kind = Kind::Label { text: String::new(), width: None };
+            w.children = Vec::new();
+            w.parent = None;
+            self.free.push(i);
         }
         if self.focus.is_some_and(|f| gone.contains(&f)) {
             self.focus = None;
@@ -391,24 +443,29 @@ impl Ui {
         true
     }
 
-    pub fn is_removed(&self, w: Widget) -> bool {
-        self.widgets[w.0].removed
+    /// How many slots the tree holds (live and free), for the tests.
+    #[cfg(test)]
+    pub(crate) fn slots(&self) -> usize {
+        self.widgets.len()
     }
 
-    pub fn id(&self, w: Widget) -> NodeId {
-        self.widgets[w.0].id
+    pub fn is_removed(&self, w: Widget) -> bool {
+        self.at(w).is_none()
+    }
+
+    /// Its node id (`None` once removed: it names nothing then).
+    pub fn id(&self, w: Widget) -> Option<NodeId> {
+        self.at(w).map(|i| self.widgets[i].id)
     }
 
     /// Its bounds (empty once removed, or while hidden: not fitting a bar).
     pub fn bounds(&self, w: Widget) -> Rect {
-        self.widgets[w.0].bounds
+        self.at(w).map_or(Rect::EMPTY, |i| self.widgets[i].bounds)
     }
 
     /// A label's or a text field's text.
     pub fn text(&self, w: Widget) -> Option<&str> {
-        let w = &self.widgets[w.0];
-        match &w.kind {
-            _ if w.removed => None,
+        match &self.widgets[self.at(w)?].kind {
             Kind::Label { text: t, .. } | Kind::TextField(t) => Some(t),
             _ => None,
         }
@@ -416,28 +473,24 @@ impl Ui {
 
     /// Set a label's or a text field's text (others ignore it).
     pub fn set_text(&mut self, w: Widget, text: &str) {
-        if self.widgets[w.0].removed {
-            return;
-        }
-        if let Kind::Label { text: t, .. } | Kind::TextField(t) = &mut self.widgets[w.0].kind
+        let Some(i) = self.at(w) else { return };
+        if let Kind::Label { text: t, .. } | Kind::TextField(t) = &mut self.widgets[i].kind
             && t != text
         {
             *t = String::from(text);
-            self.touch(w.0);
+            self.touch(i);
         }
     }
 
     pub fn checked(&self, w: Widget) -> Option<bool> {
-        match self.widgets[w.0].kind {
-            _ if self.widgets[w.0].removed => None,
+        match self.widgets[self.at(w)?].kind {
             Kind::Checkbox(c) => Some(c),
             _ => None,
         }
     }
 
     pub fn selected(&self, w: Widget) -> Option<usize> {
-        match &self.widgets[w.0].kind {
-            _ if self.widgets[w.0].removed => None,
+        match &self.widgets[self.at(w)?].kind {
             Kind::List { selected, .. } => *selected,
             _ => None,
         }
@@ -445,8 +498,7 @@ impl Ui {
 
     /// Whether a menu is expanded.
     pub fn expanded(&self, w: Widget) -> Option<bool> {
-        match &self.widgets[w.0].kind {
-            _ if self.widgets[w.0].removed => None,
+        match &self.widgets[self.at(w)?].kind {
             Kind::Menu { expanded, .. } => Some(*expanded),
             _ => None,
         }
@@ -454,51 +506,49 @@ impl Ui {
 
     /// Fold (or unfold) a menu.
     pub fn set_expanded(&mut self, w: Widget, to: bool) {
-        if self.widgets[w.0].removed {
-            return;
-        }
-        if let Kind::Menu { expanded, .. } = &mut self.widgets[w.0].kind
+        let Some(i) = self.at(w) else { return };
+        if let Kind::Menu { expanded, .. } = &mut self.widgets[i].kind
             && *expanded != to
         {
             *expanded = to;
-            if !to && self.armed.is_some_and(|(a, item)| a == w.0 && item.is_some()) {
+            if !to && self.armed.is_some_and(|(a, item)| a == i && item.is_some()) {
                 self.armed = None;
             }
-            self.touch(w.0);
+            self.touch(i);
         }
     }
 
     /// A list's or a menu's item `index`'s node id.
     pub fn item_id(&self, w: Widget, index: usize) -> Option<NodeId> {
-        match &self.widgets[w.0].kind {
-            _ if self.widgets[w.0].removed => None,
+        match &self.widgets[self.at(w)?].kind {
             Kind::List { items, .. } | Kind::Menu { items, .. } => items.get(index).map(|i| i.id),
             _ => None,
         }
     }
 
     pub fn is_disabled(&self, w: Widget) -> bool {
-        self.widgets[w.0].disabled
+        self.at(w).is_some_and(|i| self.widgets[i].disabled)
     }
 
     /// Disable (or enable) a widget: a disabled one takes no click, key or
     /// action, and loses the focus.
     pub fn set_disabled(&mut self, w: Widget, disabled: bool) {
-        if !self.widgets[w.0].removed && self.widgets[w.0].disabled != disabled {
-            self.widgets[w.0].disabled = disabled;
-            if disabled && self.focus == Some(w.0) {
+        let Some(i) = self.at(w) else { return };
+        if self.widgets[i].disabled != disabled {
+            self.widgets[i].disabled = disabled;
+            if disabled && self.focus == Some(i) {
                 self.focus = None;
             }
-            if disabled && self.armed.is_some_and(|(a, _)| a == w.0) {
+            if disabled && self.armed.is_some_and(|(a, _)| a == i) {
                 self.armed = None;
             }
-            self.touch(w.0);
+            self.touch(i);
         }
     }
 
     /// The widget with the focus.
     pub fn focused(&self) -> Option<Widget> {
-        self.focus.map(Widget)
+        self.focus.map(|i| self.widget(i))
     }
 
     /// Whether the window has the focus (the focused widget shows it, and
@@ -564,13 +614,11 @@ impl Ui {
     /// widget moved or changed size, everything is repainted and the tree
     /// changed.
     pub fn layout(&mut self, area: Rect, text: &mut dyn Text) {
-        // A widget's children come after it (made after their stack), so one
-        // pass from the last widget to the first sizes every child first.
+        // Each widget after everything in it (the tree's order reversed:
+        // a reused slot may come before its stack's).
         let mut sizes = alloc::vec![(0u32, 0u32); self.widgets.len()];
-        for i in (0..self.widgets.len()).rev() {
-            if !self.widgets[i].removed {
-                sizes[i] = self.size(i, text, &sizes);
-            }
+        for (i, _) in self.walk().into_iter().rev() {
+            sizes[i] = self.size(i, text, &sizes);
         }
         let before: Vec<(Rect, Vec<Rect>)> =
             self.widgets.iter().map(|w| (w.bounds, w.shown_items().iter().map(|i| i.bounds).collect())).collect();
@@ -623,7 +671,6 @@ impl Ui {
             Kind::Stack(dir) => {
                 let mut size = (0u32, 0u32);
                 for (n, &c) in w.children.iter().enumerate() {
-                    debug_assert!(c > i, "a child made before its stack");
                     let (cw, ch) = sizes[c];
                     let gap = if n == 0 { 0 } else { GAP };
                     size = match dir {
@@ -746,12 +793,16 @@ impl Ui {
     /// The widget (not a stack) under (`x`, `y`), and the item there (a
     /// list's row; an expanded menu's item: `None` on its head).
     pub fn hit(&self, x: i32, y: i32) -> Option<(Widget, Option<usize>)> {
+        self.hit_slot(x, y).map(|(i, item)| (self.widget(i), item))
+    }
+
+    fn hit_slot(&self, x: i32, y: i32) -> Option<(usize, Option<usize>)> {
         self.widgets.iter().enumerate().filter(|(_, w)| !w.removed).find_map(|(i, w)| {
             let item = w.shown_items().iter().position(|it| it.bounds.contains(x, y));
             match &w.kind {
                 Kind::Stack(_) => None,
-                Kind::Menu { head, .. } => (head.contains(x, y) || item.is_some()).then_some((Widget(i), item)),
-                _ => w.bounds.contains(x, y).then_some((Widget(i), item)),
+                Kind::Menu { head, .. } => (head.contains(x, y) || item.is_some()).then_some((i, item)),
+                _ => w.bounds.contains(x, y).then_some((i, item)),
             }
         })
     }
@@ -761,7 +812,7 @@ impl Ui {
         match input {
             Input::Down { x, y } => {
                 self.armed = None;
-                if let Some((Widget(i), row)) = self.hit(x, y)
+                if let Some((i, row)) = self.hit_slot(x, y)
                     && !self.widgets[i].disabled
                 {
                     self.focus_on(i);
@@ -770,7 +821,7 @@ impl Ui {
                 Vec::new()
             }
             Input::Up { x, y } => match self.armed.take() {
-                Some((i, row)) if self.hit(x, y) == Some((Widget(i), row)) => self.activate(i, row),
+                Some((i, row)) if self.hit_slot(x, y) == Some((i, row)) => self.activate(i, row),
                 _ => Vec::new(),
             },
             Input::Cancel => {
@@ -795,12 +846,12 @@ impl Ui {
                     (Kind::TextField(t), Key::Char(c)) if !c.is_control() => {
                         t.push(c);
                         self.touch(i);
-                        alloc::vec![UiEvent::Edited(Widget(i))]
+                        alloc::vec![UiEvent::Edited(self.widget(i))]
                     }
                     (Kind::TextField(t), Key::Backspace) => {
                         if t.pop().is_some() {
                             self.touch(i);
-                            alloc::vec![UiEvent::Edited(Widget(i))]
+                            alloc::vec![UiEvent::Edited(self.widget(i))]
                         } else {
                             Vec::new()
                         }
@@ -826,7 +877,7 @@ impl Ui {
             (Some(p), false) => (p + order.len() - 1) % order.len(),
         };
         self.focus_on(order[next]);
-        alloc::vec![UiEvent::Focused(Widget(order[next]))]
+        alloc::vec![UiEvent::Focused(self.widget(order[next]))]
     }
 
     fn takes_focus(&self, i: usize) -> bool {
@@ -847,7 +898,7 @@ impl Ui {
     /// list item's `select`) on it: the one handler both reach.
     fn activate(&mut self, i: usize, item: Option<usize>) -> Vec<UiEvent> {
         self.focus_on(i);
-        let w = Widget(i);
+        let w = self.widget(i);
         let events = match &mut self.widgets[i].kind {
             Kind::Button => return alloc::vec![UiEvent::Pressed(w)],
             Kind::Checkbox(c) => {
@@ -899,11 +950,11 @@ impl Ui {
             Action::Press | Action::Select => Ok(self.activate(i, item)),
             Action::Focus => {
                 self.focus_on(i);
-                Ok(alloc::vec![UiEvent::Focused(Widget(i))])
+                Ok(alloc::vec![UiEvent::Focused(self.widget(i))])
             }
             Action::SetValue(v) => {
                 self.focus_on(i);
-                let w = Widget(i);
+                let w = self.widget(i);
                 self.set_text(w, v);
                 Ok(alloc::vec![UiEvent::Edited(w)])
             }

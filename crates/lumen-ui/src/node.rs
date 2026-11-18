@@ -102,12 +102,11 @@ impl Role {
         }
     }
 
-    /// The actions a node of this role takes. A window's `minimize` and
-    /// `restore` come with #157.
+    /// The actions a node of this role takes.
     pub fn actions(self) -> &'static [ActionKind] {
         use ActionKind as A;
         match self {
-            Role::Window => &[A::Focus, A::Close],
+            Role::Window => &[A::Focus, A::Close, A::Minimize, A::Restore],
             Role::Group | Role::Label => &[],
             Role::Button | Role::Checkbox => &[A::Press, A::Focus],
             Role::TextField => &[A::SetValue, A::Focus],
@@ -592,7 +591,7 @@ mod tests {
         use ValueKind as V;
         let (f, d, s, e) = (StateFlags::FOCUSED, StateFlags::DISABLED, StateFlags::SELECTED, StateFlags::EXPANDED);
         let table: [(Role, Option<V>, &[A], StateFlags); 10] = [
-            (Role::Window, None, &[A::Focus, A::Close], f),
+            (Role::Window, None, &[A::Focus, A::Close, A::Minimize, A::Restore], f),
             (Role::Group, None, &[], d),
             (Role::Label, Some(V::Text), &[], d),
             (Role::Button, None, &[A::Press, A::Focus], f.with(d)),
