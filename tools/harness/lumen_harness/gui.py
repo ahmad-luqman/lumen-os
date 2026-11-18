@@ -239,7 +239,8 @@ def parse_mouse(out: str) -> PointerReport:
     if not header:
         raise AssertionError(f"mouse: a header this doesn't know:\n{out}")
     events, frames, ignored, dropped, overruns, held, failed = header.groups()
-    cells = re.split(r"\s{2,}", lines[2].strip())
+    # A cell with a space (buttons `left right`) comes quoted: split as words.
+    cells = shlex.split(lines[2])
     # device, x, y, buttons, presses, wheel, hwheel, pointer, stale, failed
     if len(cells) != 10:
         raise AssertionError(f"mouse: a row of {len(cells)} cells, not 10:\n{out}")

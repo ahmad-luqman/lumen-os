@@ -3633,8 +3633,10 @@ contains whitespace, or is exactly `-` prints double-quoted (`"` and `\`
 escaped by a backslash), as the shell's word splitting reads it back, so
 each row splits into its cells (the harness's `parse_records` uses
 `shlex`) and `where name = "File name"` works; a bare `-` is always an
-absent value. `cpus`' "not started", `lspci`'s names and drivers and
-`irqs`' MSI-X uses print quoted for this.
+absent value. So `cpus`' "not started", `lspci`'s names and drivers,
+`irqs`' uses ("local APIC timer", "msix <addr> #0"), `mouse`'s buttons
+("left right") and `sound`'s formats print quoted (a `-` meaning none, as
+in `kbd events`' mods, is an absent value, unquoted).
 
 - `windows`, one row per window, front to back:
 

@@ -220,7 +220,7 @@ def test_lspci_records_filter(boot):
     rows = lspci(m)
     assert run(m, "lspci | where vendor = 0x1af4 | count") == "3\n"
     out = run(m, "lspci | where vendor = 0x1af4 | select name addr")
-    picked = re.findall(r"^  (virtio \w+)\s+(\S+)$", out, re.MULTILINE)
+    picked = re.findall(r'^  "(virtio \w+)"\s+(\S+)$', out, re.MULTILINE)
     assert sorted(picked) == sorted(
         (name, addr) for addr, (vendor, _, _, name) in rows.items() if vendor == VIRTIO_VENDOR
     ), out
@@ -232,7 +232,7 @@ def test_lspci_records_filter(boot):
     out = run(m, "lspci | select addr class name")
     lines = out.splitlines()
     assert lines[0].split() == ["addr", "class", "name"], out
-    assert [re.split(r"\s{2,}", line.strip()) for line in lines[1:]] == [
+    assert [shlex.split(line) for line in lines[1:]] == [
         [addr, cls, name] for addr, (_, _, cls, name) in rows.items()
     ], out
     bridges = sum(1 for _, _, cls, _ in rows.values() if "bridge" in cls)

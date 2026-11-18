@@ -299,7 +299,7 @@ def mouse(m: Machine, allow: str | None = None) -> tuple[str, Mouse]:
         r"  device\s+x\s+y\s+buttons\s+presses\s+wheel\s+hwheel\s+pointer\s+stale\s+failed",
         lines[1],
     ), lines
-    return lines[0], Mouse(*re.split(r"\s{2,}", lines[2].strip()))
+    return lines[0], Mouse(*shlex.split(lines[2]))
 
 
 def mouse_counts(m: Machine, allow: str | None = None, held: bool = False) -> tuple[int, ...]:
@@ -604,7 +604,12 @@ def events(m: Machine, command: str) -> list[list[str]]:
         "kbd": ["seq", "code", "action", "text", "mods", "after_drop"],
     }[command.split()[0]]
     assert lines and lines[0].split() == columns, lines
-    return [re.split(r"\s{2,}", line.strip()) for line in lines[1:]]
+    # Cells two spaces apart; one with a space (buttons `left right`) comes
+    # double-quoted (a key's text, `'a'`, keeps its single quotes).
+    return [
+        [shlex.split(c)[0] if c.startswith('"') else c for c in re.split(r"\s{2,}", line.strip())]
+        for line in lines[1:]
+    ]
 
 
 def test_click_position_is_kept(boot):

@@ -458,7 +458,8 @@ def test_system_commands(boot):
     assert lines[1] == "  gsi  vector  delivery        trigger  polarity  dest  state     count", (
         out
     )
-    vectors = lines.index("  vector  use               count")
+    # (A use with a space comes quoted, so the column is as wide as that.)
+    vectors = next(i for i, line in enumerate(lines) if re.fullmatch(r"  vector  use +count", line))
     for row in lines[2:vectors]:
         if row.endswith("masked    -"):
             # An input no driver routed: its number and `masked`.
@@ -480,11 +481,11 @@ def test_system_commands(boot):
                 ],
             )
     for row in lines[vectors + 1 :]:
-        assert_laid_out(row, [(6, "<"), (16, "<"), (None, "<")])
+        assert re.fullmatch(r'  0x[0-9a-f]{2}    ("[^"]+"|\S+) +\d+', row), row
     assert re.search(
         r"^\s+1\s+0x51\s+Fixed\s+edge\s+high\s+0\s+unmasked\s+\d+$", out, re.MULTILINE
     ), out
-    timer = re.search(r"^\s+0x40\s+local APIC timer\s+(\d+)$", out, re.MULTILINE)
+    timer = re.search(r'^\s+0x40\s+"local APIC timer"\s+(\d+)$', out, re.MULTILINE)
     assert timer and int(timer[1]) > 0, out
 
     out = run(m, "threads")
@@ -559,18 +560,19 @@ def test_where_sort_first(boot):
     # interrupts, but some.
     out = run(m, "irqs | where count > 0 | sort count | first 3")
     lines = out.splitlines()
-    assert lines[0] == "  vector  use               count", out
+    assert re.fullmatch(r"  vector  use +count", lines[0]), out
     counts = [int(line.rsplit(maxsplit=1)[1]) for line in lines[1:]]
     assert 1 <= len(counts) <= 3 and counts == sorted(counts) and counts[0] > 0, out
     out = run(m, "irqs | where count > 0 | sort count desc | first 3")
     lines = out.splitlines()
-    assert lines[0] == "  vector  use               count", out
-    rows = [re.fullmatch(r"  (0x[0-9a-f]{2})    (.{16})  (\d+)", line) for line in lines[1:]]
+    assert re.fullmatch(r"  vector  use +count", lines[0]), out
+    # (A use with a space comes quoted.)
+    rows = [re.fullmatch(r'  (0x[0-9a-f]{2})    ("[^"]+"|\S+) +(\d+)', line) for line in lines[1:]]
     assert 1 <= len(rows) <= 3 and all(rows), out
     counts = [int(r[3]) for r in rows]
     assert counts == sorted(counts, reverse=True) and counts[-1] > 0, out
     # The timer interrupts most.
-    assert rows[0][2].strip() == "local APIC timer", out
+    assert rows[0][2] == '"local APIC timer"', out
 
     assert run(m, "cpus | count") == "2\n"
     out = run(m, "cpus | where cpu >= 1 | select cpu scheduler busy")
