@@ -1030,7 +1030,10 @@ struct Released {
 
 impl Drop for Released {
     fn drop(&mut self) {
-        // The fields are dropped after this returns.
+        // The fields are dropped after this returns, so `FINISHING` must not
+        // be cleared here: that would come before the list's free and the
+        // reference drop, reopening #183, and no hold could show it (nothing
+        // runs between the end of this and the free).
         #[cfg(feature = "ktest")]
         hold_if_asked(self);
     }
