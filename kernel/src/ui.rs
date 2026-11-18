@@ -5,7 +5,7 @@
 //!   event handed to the tree, then (if it changed) repainted, committed
 //!   and published, and only then a request answered, so once `ui invoke`
 //!   returns, `ui tree` shows its effect (and a window its action closed is
-//!   gone). Text through `lumen-font` ([`UiText`]).
+//!   gone). Text through `crate::font::Text`, the desktop's one text path.
 //! - [`Request`]: `ui invoke`'s request in a window's queue, with its reply
 //!   slot (`lumen_ui::Reply` behind a lock, and the asker's wait queue).
 //!   [`Request::start`] gives a [`Started`], the only thing that can answer
@@ -21,10 +21,8 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicBool, Ordering};
 
-use lumen_font::{Font, Px};
-use lumen_gfx::{Mask, Rect, Surface};
+use lumen_gfx::{Rect, Surface};
 use lumen_input::{Button, KeyAction, KeyCode, KeyEvent};
 use lumen_shell::pipe::{self, Align, Column, Kind, Value};
 use lumen_ui::counter::Counter;
@@ -172,59 +170,20 @@ impl Drop for Started {
 
 // -- the toolkit in a window ---------------------------------------------------------
 
-/// The size the toolkit's text is drawn at.
-const PX: Px = match Px::new(16) {
-    Some(px) => px,
-    None => panic!("16 px is in range"),
-};
-/// Each window's glyph cache.
-const CACHE_BYTES: usize = 64 * 1024;
-/// The widest line drawn.
-const MAX_WIDTH: u32 = 2048;
-
-/// The toolkit's text: the UI font (`crate::font::face`), one cache per
-/// drawing thread.
-pub struct UiText {
-    font: Font<'static>,
-    line: u32,
-}
-
-/// Whether a line too wide to draw was warned about (once a boot).
-static TOO_WIDE_SAID: AtomicBool = AtomicBool::new(false);
-
-impl UiText {
-    /// The UI font at the toolkit's size (`Err` if it doesn't parse).
-    pub fn new() -> Result<UiText, String> {
-        let face = crate::font::face().map_err(|e| alloc::format!("no font: {e}"))?.face();
-        let m = face.line_metrics(PX);
-        let line = u32::try_from(m.ascent + m.descent).unwrap_or(16);
-        Ok(UiText { font: Font::new(face, CACHE_BYTES), line })
-    }
-}
-
-impl Text for UiText {
+/// The toolkit's text: `crate::font::Text` (the UI font, one glyph cache
+/// per drawing thread) at `TEXT_PX`, the one text path the desktop draws
+/// with.
+impl Text for crate::font::Text {
     fn line_height(&self) -> u32 {
-        self.line
+        crate::font::Text::line_height(self, crate::font::TEXT_PX)
     }
 
     fn width(&mut self, text: &str) -> u32 {
-        self.font.face().measure(text, PX).width
+        self.measure(text, crate::font::TEXT_PX)
     }
 
     fn draw(&mut self, surface: &mut Surface, x: i32, y: i32, text: &str, color: u32, clip: Rect) {
-        let line = match self.font.render_mask(text, PX, MAX_WIDTH) {
-            Ok(line) => line,
-            Err(e) => {
-                if !TOO_WIDE_SAID.swap(true, Ordering::Relaxed) {
-                    log::warn!(target: "ui", "a line too wide to draw ({e}): not drawn (said once)");
-                }
-                return;
-            }
-        };
-        match Mask::new(line.width(), line.height(), line.coverage()) {
-            Some(mask) => surface.blend_mask_in(&mask, x + line.x(), y + line.y(), color, clip),
-            None => log::warn!(target: "ui", "a line's mask doesn't match its size: not drawn"),
-        }
+        crate::font::Text::draw(self, surface, x, y, text, crate::font::TEXT_PX, color, clip);
     }
 }
 
@@ -244,7 +203,8 @@ pub fn palette(t: &Theme) -> Palette {
 /// A toolkit window's app and drawing state: see the module's doc.
 pub struct Toolkit<A: App> {
     app: A,
-    text: UiText,
+    text: crate::font::Text,
+    /// From the theme its window was last told of (`WindowEvent::Theme`).
     palette: Palette,
     /// Where the tree is laid out (client coordinates).
     area: Rect,
@@ -260,8 +220,11 @@ pub enum Step {
 }
 
 impl<A: App> Toolkit<A> {
-    pub fn new(app: A, area: Rect) -> Result<Toolkit<A>, String> {
-        Ok(Toolkit { app, text: UiText::new()?, palette: palette(desktop::theme()), area })
+    /// `app` laid out in `area`, drawn with `theme` (its window's,
+    /// `WindowHandle::theme`) until a `Theme` event says otherwise.
+    pub fn new(app: A, area: Rect, theme: &Theme) -> Result<Toolkit<A>, String> {
+        let text = crate::font::Text::new().map_err(|e| alloc::format!("no font: {e}"))?;
+        Ok(Toolkit { app, text, palette: palette(theme), area })
     }
 
     pub fn app_mut(&mut self) -> &mut A {
@@ -320,6 +283,12 @@ impl<A: App> Toolkit<A> {
                     Then::Carry
                 }
             },
+            WindowEvent::Theme(theme) => {
+                // "Redraw": the whole tree in the theme handed over.
+                self.palette = palette(theme);
+                self.app.ui().invalidate();
+                Then::Carry
+            }
             WindowEvent::FocusGained => {
                 self.app.ui().set_window_focused(true);
                 Then::Carry
@@ -386,8 +355,9 @@ const COUNTER_SIZE: (u32, u32) = (300, 140);
 /// `desktop counter`: open the Counter window and start its owner; its id.
 pub fn open_counter() -> Result<u32, String> {
     let (w, h) = COUNTER_SIZE;
-    let toolkit = Toolkit::new(Counter::new(), Rect::new(0, 0, w, h))?;
     let handle = desktop::open_window("Counter", w, h).map_err(|e| alloc::format!("no window: {e}"))?;
+    // (Without a font the window goes again, dropped with its handle.)
+    let toolkit = Toolkit::new(Counter::new(), Rect::new(0, 0, w, h), handle.theme())?;
     let id = handle.id();
     let _detached = crate::sched::spawn("desktop-counter", move || counter_owner(handle, toolkit))
         .map_err(|e| alloc::format!("no thread: {e}"))?;
@@ -395,9 +365,9 @@ pub fn open_counter() -> Result<u32, String> {
 }
 
 /// The Counter window's owner: its tree drawn and published after every
-/// change, until it closes (its close box, `ui invoke <root> close`, Quit).
+/// change (its first event, `Theme`, draws it), until it closes (its close
+/// box, `ui invoke <root> close`, Quit).
 fn counter_owner(mut h: WindowHandle, mut tk: Toolkit<Counter>) {
-    tk.refresh(&mut h);
     loop {
         let e = h.wait_event();
         if let Step::Close(closing) = tk.step(&mut h, e) {
@@ -654,11 +624,13 @@ crate::ktest!(
 
 crate::ktest!(
     fn the_toolkit_text_draws_as_wide_as_it_measures() {
-        // The UI font through lumen-ui's `Text`: a longer line measures
-        // wider, a line drawn unclipped inks up to its measured width (and
-        // not past it), and a clip keeps ink inside it.
+        // The UI font through lumen-ui's `Text` (`font::Text` at
+        // `TEXT_PX`): a longer line measures wider, a line drawn unclipped
+        // inks up to its measured width (and not past it), and a clip keeps
+        // ink inside it.
         use crate::kassert;
-        let mut t = UiText::new().map_err(|_| "no font")?;
+        let mut t = crate::font::Text::new().map_err(|_| "no font")?;
+        let t: &mut dyn Text = &mut t;
         kassert!(t.line_height() >= 16);
         let width = t.width("Add more");
         kassert!(width > t.width("Add") && t.width("Add") > 0);

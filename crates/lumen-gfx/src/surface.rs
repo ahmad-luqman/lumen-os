@@ -162,6 +162,14 @@ impl Surface {
         Some(Surface { width, height, stride, pixels })
     }
 
+    /// A `width` x `height` surface over `pixels`, rows packed (no copy):
+    /// `None` unless it holds exactly `width * height` pixels (and that
+    /// size is one [`Surface::with_stride`] takes).
+    pub fn from_pixels(width: u32, height: u32, pixels: Vec<u32>) -> Option<Surface> {
+        let len = buffer_len(width, height, width as usize)?;
+        (pixels.len() == len).then_some(Surface { width, height, stride: width as usize, pixels })
+    }
+
     /// Width in pixels.
     pub const fn width(&self) -> u32 {
         self.width
@@ -325,6 +333,18 @@ mod tests {
             }
         }
         s
+    }
+
+    #[test]
+    fn from_pixels_takes_exactly_its_size() {
+        let px: Vec<u32> = (0..6).collect();
+        let s = Surface::from_pixels(3, 2, px.clone()).unwrap();
+        assert_eq!((s.width(), s.height(), s.stride()), (3, 2, 3));
+        assert_eq!(s.row(1), &[3, 4, 5]);
+        assert!(Surface::from_pixels(3, 2, px[..5].to_vec()).is_none());
+        assert!(Surface::from_pixels(2, 2, px).is_none());
+        assert!(Surface::from_pixels(0, 0, Vec::new()).is_some());
+        assert!(Surface::from_pixels(u32::MAX, 1, Vec::new()).is_none());
     }
 
     /// [`numbered_strided`] with packed rows.

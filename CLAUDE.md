@@ -165,10 +165,16 @@ own PR that updates that doc first.
   `Desktop::without_screen` for the ktests; `publish`: a toolkit's tree), each window's root node, the two
   demo windows, `desktop` (`status`, `check`, `spin`, `counter`, `hold`/`release`) and `windows`, and the tree's
   accessors for `ui.rs` (`tree_rows`, `find_node`, `push_request`: a refused request handed back);
-  `lumen.desktop_cut_delay_ms=` widens the race at a pause for the scenarios. `ui.rs`: the toolkit in a window
-  (#156: `Toolkit<A: lumen_ui::App>`, one step per event that publishes before it answers; `UiText` over
-  `lumen-font`), `ui invoke`'s `Request` (its reply slot; `start` gives the `Started` that answers; either
-  answers for itself if dropped), Counter's owner, and `ui tree`/`ui invoke`. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
+  `lumen.desktop_cut_delay_ms=` widens the race at a pause for the scenarios;
+  the look (#154): titles and the demos' text in the UI font (`font::Text`), the embedded
+  wallpaper (`assets/wallpaper/lumen.png`, made by `tools/wallpaper.py`; decoded once a boot at
+  the first start, a flat colour and one warning if it doesn't), and the themes (`ThemeId`;
+  `theme light|dark`, `lumen.theme=`: a switch damages the whole screen and tells each owner; a
+  window's first event is `WindowEvent::Theme`; owners redraw on it with `WindowHandle::theme()`,
+  and every wait goes through `Window::wait`, which wakes for `has_event()`). `ui.rs`: the toolkit in a window
+  (#156: `Toolkit<A: lumen_ui::App>`, one step per event that publishes before it answers, its palette from the
+  `Theme` it is handed, its text `font::Text`), `ui invoke`'s `Request` (its reply slot; `start` gives the
+  `Started` that answers; either answers for itself if dropped), Counter's owner, and `ui tree`/`ui invoke`. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -220,8 +226,11 @@ own PR that updates that doc first.
   (`mark_boot`, `since_boot_ns`), `now_ns`, `sleep`, `ticks`.
   `demo.rs`: the `mandelbrot` (bands on every CPU) and `life` commands.
   `font.rs`: the desktop's anti-aliased text (`lumen-font`): `font::face`,
-  the UI font parsed on first use and shared; `font` renders the golden
-  sample twice (timings, cache, golden check), as its ktest does.
+  the UI font parsed on first use and shared; `font::Text`, one drawing
+  thread's glyph cache over it (`draw` glyph by glyph inside a clip,
+  `measure`, `line_height`; `TITLE_PX`, `TEXT_PX`, `HEADING_PX`); `font`
+  renders the golden sample twice (timings, cache, golden check), as its
+  ktest does.
   `screenshot.rs`: `screenshot`: the screen captured (`capture`: the
   desktop's back buffer while it is shown, `desktop::capture`; else the
   framebuffer read once under the screen's lock, `term::read_pixels`,
@@ -359,10 +368,13 @@ own PR that updates that doc first.
 - `crates/lumen-png`: PNG for Lumen: the encoder `screenshot` uses
   (`encode`: RGB8 `Rows` into a `Png`, unfiltered, zlib from
   `miniz_oxide`, the rows' and the file's buffers refused rather than
-  aborted, the compressor's own boxes excepted), CRC-32, and
+  aborted, the compressor's own boxes excepted), the decoder the
+  wallpaper uses (`decode`: any PNG into `0x00RRGGBB` pixels with
+  `zune-png`, only the image's own chunks handed to it; a bad, truncated,
+  corrupt or too big file an error, never a panic), CRC-32, and
   the base64 frame a PNG travels in over serial, streamed from the stack
-  (host-tested, incl. a refusing allocator and a golden file PIL decodes;
-  decoding is #154's).
+  (host-tested, incl. a refusing allocator, a golden file PIL decodes,
+  every truncation and every flipped byte of a file).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation

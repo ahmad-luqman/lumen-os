@@ -114,3 +114,37 @@ tests = [
     "ktest:lumen_kernel::shell::sysinfo::every_record_table_fits_its_columns",
     "ktest:lumen_kernel::shell::pipe::records_come_from_commands_given_no_arguments",
 ]
+
+[[feature]]
+name = "PNG decoding (lumen_png::decode, #154): zune-png 0.5.2 without its `std` and `sse` features, linked into both kernels with the flag audit passing; greyscale (1 and 8 bits, with alpha), RGB (8 and 16 bits), RGBA and palette (with transparency) files, filtered rows and an Adam7-interlaced file included, into 0x00RRGGBB pixels (alpha dropped, 16-bit samples cut to their top 8 bits) handed over with no copy, and the encoder's own files back exactly; a file that isn't a PNG, an unknown colour type, too few rows, a bad zlib Adler-32 under a good chunk CRC, a file cut short at every length and every byte of a file flipped are errors, never panics; an unknown critical chunk or a bad PLTE is an error; an image past the caller's limits is refused with its size before any image data is inflated; only the image's own chunks reach the decoder: zTXt, iTXt and iCCP bombs, bombs hidden behind chunks the decoder would misread, and 64 small zTXt bombs are dropped, never inflated (a refusing heap of 16 MiB), and a large ordinary iTXt decodes; the samples' and the pixels' buffers refused rather than aborted when the allocator says no; the embedded wallpaper decodes to 1280x800 and stays under 1 MB"
+milestone = "M4"
+tests = [
+    "cargo:lumen-png",
+    "audit:flags",
+]
+
+[[feature]]
+name = "The desktop's look (#154): titles in the UI font (anti-aliased, drawn clipped to each damaged rectangle, a redraw rasterizing nothing) and the demo windows' text at two sizes (16 and 24 pixels), against goldens; a wallpaper decoded from the PNG the kernel embeds and drawn behind the windows (with both windows closed the screen equals that PNG in every pixel), a smaller one centred over the theme's colour, a bigger one centred and cut, the theme's flat colour with one warning when one doesn't decode (not a PNG, cut short), the decode and its warning once a boot (the same answer again, `desktop status` saying why in a word); light and dark themes (both palettes complete and readable, named by id): a window's first event is the theme to draw with (dark too when opened after a switch); an owner blocked waiting for an event wakes for a switch; `theme dark` damages the whole screen and tells each owner again before anything it had queued, and the owners redraw in its colours (a golden, a key typed before the switch still shown; `desktop check` 0 and 0 after a switch to dark and back); switches before an owner reads end with the current theme; `settled` waits until every owner has been told; the titles' glyphs are cached (no glyph rasterized across a switch, none dropped); `measure` agrees with the drawn ink; a switch to the theme shown changes nothing, a name that isn't a theme is refused; `lumen.theme=dark` starts the desktop dark (the same screen), and a boot flag naming no theme warns and keeps light; `desktop status` shows the theme"
+milestone = "M4"
+tests = [
+    "scenario:test_gui::test_two_windows_golden",
+    "scenario:test_gui::test_text_rendering_golden",
+    "scenario:test_gui::test_png_wallpaper_golden",
+    "scenario:test_gui::test_dark_theme_golden",
+    "scenario:test_gui::test_theme_boot_flag_picks_dark",
+    "scenario:test_gui::test_a_theme_boot_flag_naming_no_theme_warns",
+    "scenario:test_gui::test_presents_match_a_full_repaint",
+    "ktest:lumen_kernel::desktop::a_bad_wallpaper_falls_back_with_one_warning",
+    "ktest:lumen_kernel::desktop::a_smaller_wallpaper_is_drawn_centred_over_the_flat_colour",
+    "ktest:lumen_kernel::desktop::a_title_drawn_again_rasterizes_nothing",
+    "ktest:lumen_kernel::desktop::a_window_s_first_event_is_the_theme_to_draw_with",
+    "ktest:lumen_kernel::desktop::a_theme_switch_repaints_everything_and_tells_each_window",
+    "ktest:lumen_kernel::desktop::switches_before_the_owner_reads_end_with_the_current_theme",
+    "ktest:lumen_kernel::desktop::settled_waits_for_every_owner_to_be_told_of_a_switch",
+    "ktest:lumen_kernel::desktop::a_wallpaper_is_decoded_and_warned_about_once",
+    "ktest:lumen_kernel::desktop::a_wallpaper_bigger_than_the_screen_is_cut_centred",
+    "ktest:lumen_kernel::desktop::an_owner_blocked_for_an_event_wakes_for_a_switch",
+    "ktest:lumen_kernel::font::text_ends_where_measure_says",
+    "ktest:lumen_kernel::desktop::settled_needs_every_one_of_its_conditions",
+    "cargo:lumen-wm",
+]

@@ -67,6 +67,11 @@ zerocopy = { version = "=0.8.63", default-features = false }
 # zlib for the screenshot's PNG (#150). Not zune-png's encoder: 0.5.2 writes
 # only stored (uncompressed) deflate blocks. No `simd` (adler32 by SIMD).
 miniz_oxide = { version = "=0.9.1", default-features = false, features = ["with-alloc"] }
+# PNG decoding for the desktop's wallpaper (#154, lumen_png::decode).
+# Without its default features: `std`, and `sse` (SSE intrinsics; the
+# kernel is built without SSE).
+zune-png = { version = "=0.5.2", default-features = false }
+zune-core = { version = "=0.5.3", default-features = false }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

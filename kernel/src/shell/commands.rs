@@ -95,6 +95,13 @@ pub static COMMANDS: Table<Run> = Table(&[
         run: crate::desktop::command,
     },
     Command {
+        name: "theme",
+        args: &[&["light", "dark"]],
+        usage: "[light|dark]",
+        about: "the desktop's theme, or switch it (light, dark)",
+        run: crate::desktop::theme_command,
+    },
+    Command {
         name: "windows",
         args: &[],
         usage: "",
