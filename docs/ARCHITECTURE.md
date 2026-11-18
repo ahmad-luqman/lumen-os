@@ -730,10 +730,12 @@ logs (a log argument that allocates would re-enter it under the logger's
 lock) and formats its shell and crash line from a copy taken under the
 lock. Like every `SpinLock`, it keeps interrupts off while held, so an
 interrupt handler is allowed to allocate. The timer interrupt can free
-(in `sched::finish_switch`): a detached dead thread's record and its
-joiners' list (its stack goes back through the page tables and frame
-allocator); the scheduler reserves room in its queues so the timer never
-allocates.
+(in `sched::finish_switch`) a dead thread's joiners' list (its stack goes
+back through the page tables and frame allocator; its record is freed when
+`sched::register` prunes its `Weak`, once the last reference is gone). For
+a joined thread this happens before `join` returns: `join` waits for
+`finish_switch` to be done with it (`FINISHING`, #183). The scheduler
+reserves room in its queues so the timer never allocates.
 
 ## 6. Interrupts, exceptions and crash reports (built)
 
@@ -941,8 +943,11 @@ from `mm::stack` (a guard page below it, hard rule 4; registered as a
 blocked or dead. (`main` and the APs' idle threads run on stacks they don't
 own.) `sched::spawn(name, f)` starts one on this CPU and `spawn_on(cpu, ..)`
 on another; both return a `JoinHandle`, whose `join` blocks until the
-thread has finished and its stack is freed. A thread **never moves between
-CPUs**: each CPU has its own run queue (a FIFO) and only that CPU takes
+thread has finished and its CPU's `finish_switch` is done with it (its
+stack and joiners' list freed, its reference dropped), so nothing that CPU
+frees for it lands after `join` returns (#183; its record goes when a later
+spawn prunes it). A thread **never moves between CPUs**: each CPU has its
+own run queue (a FIFO) and only that CPU takes
 threads off it, so once its spawner has laid out its first frame, a
 thread's saved registers are touched only by its home CPU with interrupts
 off. A wake from another CPU queues the thread there and sends the
@@ -1034,7 +1039,9 @@ off. A wake from another CPU queues the thread there and sends the
 - **Exit:** only a spawned thread can exit, not `main` or an idle thread
   (asserted, not tested). Its stack is freed by the next thread to run on
   its CPU (the unmap's TLB flush is local; see "Other CPUs" on the
-  spawner's entry); only then does `join` return.
+  spawner's entry), which then wakes the joiners, frees their list and
+  drops its reference; only once it is done (`FINISHING`) does `join`
+  return.
 - **Observability:** every switch records a `switch` trace event (previous
   and next thread's ids, the previous thread's state), and the serial crash
   report names the running thread (`thread: <name> (id N)`).
