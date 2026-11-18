@@ -74,8 +74,7 @@ def echo_physical_yz(m: Machine, typed: str) -> None:
     """Press the keys labelled e c h o space Y Z Enter on a US keyboard; the
     guest reads `typed` for Y Z (one character each), and the screen shows
     the line typed and `echo`'s answer."""
-    for key in ["e", "c", "h", "o", "spc", "y", "z", "ret"]:
-        m.press([key])
+    gui.confirmed_keys(m, *[[key] for key in ["e", "c", "h", "o", "spc", "y", "z", "ret"]])
     expect_screen(m, rf"^lumen> echo {typed}\n{typed}$")
 
 
@@ -91,6 +90,7 @@ def test_keys_via_qmp_send_key(boot):
     shells_ready(m, "us")
     before = kbd_stats(m)
     start = len(m.output)
+    # unconfirmed: this test counts the keys itself, after the burst
     m.type_text(text)
     expect_screen(m, r"^lumen> echo Hello, World!\nHello, World!\nlumen>$")
     assert not re.search(r"^Hello", m.output[start:], re.MULTILINE)
@@ -116,11 +116,13 @@ def test_keys_via_qmp_send_key(boot):
     # settle, then counts exactly its own presses and bytes. Its counts
     # show the burst counted before it, all of it.
     burst = "echo abcdefghijklmnop"
+    # unconfirmed: the burst still arriving is what the next step is about
     m.type_text(burst)
     got = gui.confirmed_keys(m, "x", "\n")
     assert got.presses - s.presses == len(burst) + 2, (s.presses, got.presses)
     assert (got.bytes - s.bytes, got.held) == (2 * (len(burst) + 2), 0), got
     expect_screen(m, rf"^lumen> {burst}x\nabcdefghijklmnopx\nlumen>$")
+    # unconfirmed: a key held when a confirmed one goes is the point here.
     # A key held when a confirmed one goes (shift, 400 ms, sent past
     # `press`'s schedule; reproduced in review): the step waits for its
     # release, then counts its own keys, so shift's release can't stand in
@@ -180,6 +182,7 @@ def test_keys_held_during_boot_leave_a_working_keyboard(boot):
     def press_until_set_up() -> None:
         try:
             while not done.is_set() and "kbd: " not in m.output:
+                # unconfirmed: pressed while the keyboard is set up, on purpose
                 qmp.send_key(["a"], hold_ms=1)
                 presses[0] += 1
                 done.wait(0.002)
@@ -203,7 +206,7 @@ def test_keys_held_during_boot_leave_a_working_keyboard(boot):
     m.expect(r"lumen> ", 60)
     # Whatever reached the screen's shell before the presses stopped makes
     # one line of a's: end it, then the keyboard types normally.
-    m.press(["ret"])
+    gui.confirmed_keys(m, ["ret"])
     echo_physical_yz(m, "yz")
     assert kbd_stats(m).skipped > 0
     assert "WARN" not in m.output
@@ -216,9 +219,7 @@ def test_every_printable_character_and_backspace(boot):
     every = "".join(chr(c) for c in range(0x21, 0x7F)) + " end"
     m = boot("qemutest")
     shells_ready(m, "us")
-    m.type_text("echo " + shlex.quote(every) + "X")
-    m.press(["backspace"])
-    m.press(["ret"])
+    gui.confirmed_keys(m, "echo " + shlex.quote(every) + "X", ["backspace"], ["ret"])
     expect_screen(m, "^" + re.escape(every) + "$")
 
 
@@ -228,6 +229,7 @@ def test_a_long_line_of_shifted_keys(boot):
     # paces them, and every one arrives.
     m = boot("qemutest")
     shells_ready(m, "us")
+    # unconfirmed: back to back on purpose, for `Machine.press`'s pacing
     m.type_text("echo " + "A" * 150 + "\n")
     expect_screen(m, r"^A{150}$", 30)
 
@@ -405,8 +407,7 @@ def test_cursor_leaves_no_trail(boot, artifacts):
     # the header exactly what it was before the arrow ever showed.
     m = boot("qemutest", devices=Devices(tablet=True))
     tablet_ready(m)
-    m.type_text("clear\n")
-    m.type_text("seq 20\n")
+    gui.confirmed_keys(m, "clear\n", "seq 20\n")
     expect_screen(m, r"^20\nlumen>$")
     # Row 0 the command, rows 1-20 its output, row 21 the prompt.
     prompt_row = 21
@@ -428,15 +429,15 @@ def test_cursor_leaves_no_trail(boot, artifacts):
         wait_mouse(m, x=str(x), y=str(y), pointer="drawn")
     # Typed below the arrow (its tip on the prompt row): the line, then
     # its output and a new prompt are drawn under and around it.
-    m.type_text("echo under the pointer\n")
+    gui.confirmed_keys(m, "echo under the pointer\n")
     expect_screen(m, r"^lumen> echo under the pointer\nunder the pointer\nlumen>$")
     assert read_screen(m).rows[prompt_row] == "lumen> echo under the pointer"
     wait_mouse(m, pointer="drawn")
     # A command drawing on the screen: hidden meanwhile, back after.
-    m.type_text("life glider 40\n")
+    gui.confirmed_keys(m, "life glider 40\n")
     expect_screen(m, r"^life: press a key$", 120)
     wait_mouse(m, pointer="hidden")
-    m.press(["x"])
+    gui.confirmed_keys(m, "x")
     expect_screen(m, r"^life: press a key\nlumen>$")
     wait_mouse(m, pointer="drawn")
     park = (1200, 720)
@@ -661,6 +662,7 @@ def test_key_events_have_releases_and_modifiers(boot):
     m = boot("qemutest")
     shells_ready(m, "us")
     assert run(m, "kbd events") == "  seq  code        action   text    mods       after_drop\n"
+    # unconfirmed: the ring's events, read next, confirm it
     m.press(["shift", "a"])
     rows = poll(lambda: events(m, "kbd events 8"), lambda r: len(r) >= 4, m)
     assert rows == [

@@ -10,7 +10,7 @@ import re
 from collections.abc import Sequence
 
 import pytest
-from lumen_harness.gui import confirmed_keys, key_steps
+from lumen_harness.gui import confirmed_keys
 from lumen_harness.klog import SECONDS, is_log_line
 from lumen_harness.qemu import NO_DEVICES, Devices, Machine, default_accel
 from lumen_harness.screen import PROMPT, expect_screen, read_screen
@@ -55,13 +55,6 @@ def test_irqs_lists_msix(boot):
     assert run(m, "irqs | where use ~ 'MSI ' | count") == "0\n"
 
 
-def keys(m: Machine, *presses: str | list[str]) -> None:
-    """Type on the keyboard: a string is typed as text, a list is keys
-    pressed together (QEMU's names: `left`, `home`, `ctrl` and `a`...)."""
-    for _, qcodes in key_steps(*presses):
-        m.press(qcodes)
-
-
 def test_echo(boot):
     # Quoting as in a POSIX shell, on both consoles; the serial shell echoes
     # what is typed, in plain text.
@@ -70,7 +63,7 @@ def test_echo(boot):
     assert run(m, "echo 'a  b' \"c d\" e\\ f  g") == "a  b c d e f g\n"
     assert run(m, "echo one # a comment") == "one\n"
     assert run(m, "echo '' x") == " x\n"
-    keys(m, "echo 'x  y' \"\\$HOME\" z\n")
+    confirmed_keys(m, "echo 'x  y' \"\\$HOME\" z\n")
     expect_screen(m, r"^lumen> echo 'x  y' \"\\\$HOME\" z\nx  y \$HOME z$")
     assert "\x1b" not in m.output[start:]
 
@@ -90,7 +83,7 @@ def scrolled_back_ready(boot) -> Machine:
     """Shells at debug level, the screen's shell with lines to scroll back
     over (`seq 100`): Shift+PageUp then logs its move on serial."""
     m = shells(boot, cmdline="lumen.log=debug")
-    keys(m, "seq 100\n")
+    confirmed_keys(m, "seq 100\n")
     expect_screen(m, r"^100\nlumen>$")
     return m
 
@@ -105,6 +98,8 @@ def test_a_log_line_inside_a_commands_echo_is_not_output(boot):
     start = len(m.output)
     m.send("echo hel")
     wait_for_output(m, start, r"echo hel$")
+    # unconfirmed: a command is half typed on serial, so no `kbd`; its log
+    # line, read next, confirms it
     m.press(["shift", "pgup"])
     wait_for_output(m, start, VIEW_MOVED)
     m.send("lo\r")
@@ -122,6 +117,8 @@ def test_a_log_line_between_output_writes_is_not_output(boot):
     line = "rhai -e 'print(\"a\"); loop { sleep(1000) }'"
     m.send_line(line)
     wait_for_output(m, start, r"\na\n$")
+    # unconfirmed: a script runs on serial, so no `kbd`; its log line, read
+    # next, confirms it
     m.press(["shift", "pgup"])
     wait_for_output(m, start, VIEW_MOVED)
     m.send("\x03")
@@ -330,24 +327,24 @@ def test_tab_completion(boot):
     # full (and a space), several up to where they differ or, if they
     # already do, listed.
     m = shells(boot)
-    keys(m, "ec", ["tab"], "hi\n")
+    confirmed_keys(m, "ec", ["tab"], "hi\n")
     expect_screen(m, r"^lumen> echo hi\nhi$")
-    keys(m, "crash p", ["tab"])
+    confirmed_keys(m, "crash p", ["tab"])
     expect_screen(m, r"^lumen> crash p\npanic  pf\nlumen> crash p$")
-    keys(m, "a", ["tab"])
+    confirmed_keys(m, "a", ["tab"])
     expect_screen(m, r"^lumen> crash panic$")
     # `term` and `terminal` (#155) share their first four letters: Tab
     # stops there, a second lists both, then a space and Tab complete
     # `term`'s argument.
-    keys(m, ["ctrl", "u"], "te", ["tab"])
+    confirmed_keys(m, ["ctrl", "u"], "te", ["tab"])
     expect_screen(m, r"^lumen> term$")
-    keys(m, ["tab"])
+    confirmed_keys(m, ["tab"])
     expect_screen(m, r"^term  terminal\nlumen> term$")
-    keys(m, " ", ["tab"])
+    confirmed_keys(m, " ", ["tab"])
     expect_screen(m, r"^lumen> term text$")
-    keys(m, ["ctrl", "u"], "cl", ["tab"])
+    confirmed_keys(m, ["ctrl", "u"], "cl", ["tab"])
     expect_screen(m, r"^clear  clocks\nlumen> cl$")
-    keys(m, "o", ["tab"])
+    confirmed_keys(m, "o", ["tab"])
     expect_screen(m, r"^lumen> clocks$")
     # On serial, in plain text: a completion is appended, a listing is a
     # line of its own followed by the prompt and the line again (the serial
@@ -377,7 +374,7 @@ def test_unknown_command_single_error(boot):
     assert run(m, "echo 'open") == "syntax error: unclosed ' quote\n"
     assert run(m, "echo end\\") == "syntax error: a backslash at the end of the line\n"
     start = len(m.output)
-    keys(m, "frob\n")
+    confirmed_keys(m, "frob\n")
     expect_screen(m, r"^lumen> frob\nunknown command: frob \(try 'help'\)\nlumen>$")
     # Nothing about it on serial but the screen's rows.
     assert not re.search(r"^unknown", m.output[start:], re.MULTILINE)
@@ -554,7 +551,7 @@ def test_pipe_text(boot):
     # Text that is a number compares as one.
     assert run(m, "seq 12 | where line > 5 | count") == "7\n"
     # On the screen, typed on the keyboard.
-    keys(m, "seq 30 | grep 2 | count\n")
+    confirmed_keys(m, "seq 30 | grep 2 | count\n")
     expect_screen(m, r"^lumen> seq 30 \| grep 2 \| count\n12\nlumen>$")
 
 

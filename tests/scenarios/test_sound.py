@@ -203,6 +203,8 @@ def test_play_says_when_a_newer_sound_cut_it_off(boot):
     m.send_line("play t=60 C4/1 C4/1")
     m.expect(r"play t=60 C4/1 C4/1\n", 10)
     time.sleep(1)
+    # unconfirmed: the serial shell is busy playing, so no `kbd`; the
+    # melody's answer, read next, confirms the beep came
     m.type_text("beep 880 100\n")
     m.expect(r"play: interrupted by a newer sound\n" + PROMPT, 10)
     row = wait_played(m, 1)

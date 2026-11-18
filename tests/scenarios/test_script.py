@@ -5,6 +5,7 @@ ktests in kernel/src/script.rs."""
 
 import time
 
+from lumen_harness.gui import confirmed_keys
 from lumen_harness.image import assert_matches_golden
 from lumen_harness.qemu import Machine
 from lumen_harness.screen import PROMPT, expect_screen
@@ -114,9 +115,9 @@ def test_runaway_script_is_stopped(boot):
     assert run(m, "echo still here") == "still here\n"
     # The same on the screen's shell, with Ctrl-C on the keyboard; and
     # `sleep` stops too.
-    m.type_text("rhai -e 'loop { sleep(1000) }'\n")
+    confirmed_keys(m, "rhai -e 'loop { sleep(1000) }'\n")
     expect_screen(m, r"^lumen> rhai -e 'loop \{ sleep\(1000\) \}'$")
-    m.press(["ctrl", "c"])
+    confirmed_keys(m, ["ctrl", "c"])
     expect_screen(m, r"^rhai: stopped \(Ctrl-C\)\nlumen>$")
 
 
@@ -129,11 +130,11 @@ def test_screen_shell_scripts(boot, artifacts):
     # strip at the bottom of what it drew, and a key brings the terminal
     # back.
     m = shells(boot)
-    m.type_text('rhai -e \'[Fn("cpus"), #{f: Fn("x")}]\'\n')
+    confirmed_keys(m, 'rhai -e \'[Fn("cpus"), #{f: Fn("x")}]\'\n')
     expect_screen(m, r'^\[Fn\("cpus"\), #\{"f": Fn\("x"\)\}\]\nlumen>$')
-    m.type_text("rhai -e 'screen_width()'\n")
+    confirmed_keys(m, "rhai -e 'screen_width()'\n")
     expect_screen(m, r"^1280\nlumen>$")
-    m.type_text("rhai -e 'draw_rect(0, 0, 100, 100, 0x00ff00)'\n")
+    confirmed_keys(m, "rhai -e 'draw_rect(0, 0, 100, 100, 0x00ff00)'\n")
     # (The terminal holds the line, drawn once the screen is given back.)
     expect_screen(m, r"^rhai: press a key on the keyboard$")
     shot = m.screendump("drawn.png")
@@ -144,5 +145,5 @@ def test_screen_shell_scripts(boot, artifacts):
     # The strip's text: some pixels lighter than the strip.
     strip = [img.getpixel((x, y)) for x in range(8, 150) for y in range(height - 20, height - 4)]
     assert any(p[0] > 0x80 for p in strip)
-    m.type_text(" ")
+    confirmed_keys(m, " ")
     expect_screen(m, r"^rhai: press a key on the keyboard\nlumen>$")

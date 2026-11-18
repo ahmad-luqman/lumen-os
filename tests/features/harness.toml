@@ -200,3 +200,10 @@ milestone = "M4"
 tests = [
     "harness:test_census::*",
 ]
+
+[[feature]]
+name = "Every key a scenario types goes through confirmed_keys, or says why not: a raw Machine.press, type_text or QMP send_key in tests/scenarios needs an `# unconfirmed: <why>` comment in its paragraph (#128)"
+milestone = "M4"
+tests = [
+    "harness:test_scenario_typing::*",
+]

@@ -5,6 +5,7 @@ terminals (Alt+F1 to F4, `vt`)."""
 import re
 from typing import NamedTuple
 
+from lumen_harness.gui import confirmed_keys
 from lumen_harness.image import assert_matches_golden
 from lumen_harness.qemu import Machine
 from lumen_harness.screen import expect_screen, read_screen
@@ -53,8 +54,7 @@ def test_ansi_colours_golden(boot, artifacts, golden_dir):
     # prompt with the blinking cursor) are left out.
     m = boot_term(boot)
     start = len(m.output)
-    m.type_text("clear\n")
-    m.type_text("colors\n")
+    confirmed_keys(m, "clear\n", "colors\n")
     expect_screen(m, r"^colors: done\nlumen>$")
     shot = m.screendump("colors.png")
     assert_matches_golden(
@@ -88,8 +88,7 @@ def test_scrollback(boot, artifacts, golden_dir):
     # thing writing there besides log lines, takes keys only between
     # commands.)
     m = boot_term(boot, cmdline="lumen.log=debug")
-    m.type_text("clear\n")
-    m.type_text("seq 100\n")
+    confirmed_keys(m, "clear\n", "seq 100\n")
     expect_screen(m, r"^100\nlumen>$")
     before = term_status(m)
     assert before.view == 0, before
@@ -97,6 +96,8 @@ def test_scrollback(boot, artifacts, golden_dir):
     # The scrollback's line i is `i` (line 0 the command), and the view's top
     # row is line scrollback - view.
     scrollback = before.scrollback
+    # unconfirmed: each key's debug line, read next, confirms it (a confirmed
+    # step's `kbd` would read past that line)
     qmp = m.qmp()
     qmp.send_key(["shift", "pgup"])
     assert view_moved(m) == (half, str(scrollback - half))
@@ -121,6 +122,8 @@ def test_scrollback(boot, artifacts, golden_dir):
         size=(320, before.rows * CELL_H),
         artifacts=artifacts,
     )
+    # unconfirmed: its debug line, read next, confirms it (a confirmed
+    # step's `kbd` would read past that line)
     m.press(["spc"])
     assert view_moved(m)[0] == 0
     back = term_status(m)
@@ -164,13 +167,12 @@ def test_virtual_terminals_are_independent(boot, artifacts, golden_dir):
     # golden: its first two rows, above the blinking cursor's). The header
     # marks the shown one (a golden of its boxes with 2 shown).
     m = boot_term(boot)
-    m.type_text("clear\n")
-    m.type_text("echo one\n")
+    confirmed_keys(m, "clear\n", "echo one\n")
     expect_screen(m, r"\Alumen> echo one\none\nlumen>\s*\Z")
-    m.press(["alt", "f2"])
+    confirmed_keys(m, ["alt", "f2"])
     expect_screen(m, r"\Alumen>\s*\Z")
     assert vt_status(m).shown == 2
-    m.type_text("echo two\n")
+    confirmed_keys(m, "echo two\n")
     expect_screen(m, r"\Alumen> echo two\ntwo\nlumen>\s*\Z")
     shot = m.screendump("vt2.png")
     assert_matches_golden(
@@ -180,7 +182,7 @@ def test_virtual_terminals_are_independent(boot, artifacts, golden_dir):
         size=TABS_SIZE,
         artifacts=artifacts,
     )
-    m.press(["alt", "f1"])
+    confirmed_keys(m, ["alt", "f1"])
     expect_screen(m, r"\Alumen> echo one\none\nlumen>\s*\Z")
     assert vt_status(m).shown == 1
     shot = m.screendump("vt1.png")
@@ -196,7 +198,7 @@ def test_virtual_terminals_are_independent(boot, artifacts, golden_dir):
     m.send_line("vt 3")
     m.expect(r"vt: terminal 3 shown\n", 10)
     expect_screen(m, r"\Alumen>\s*\Z")
-    m.type_text("echo three\n")
+    confirmed_keys(m, "echo three\n")
     expect_screen(m, r"\Alumen> echo three\nthree\nlumen>\s*\Z")
     m.send_line("vt 1")
     m.expect(r"vt: terminal 1 shown\n", 10)
@@ -212,8 +214,10 @@ def test_a_command_drawing_keeps_its_terminal_shown(boot):
     # don't switch (both counted; Alt+F2's logged, `vt 2`'s answered on its
     # console): the key that ends it still reaches it, in terminal 1.
     m = boot_term(boot)
-    m.type_text("life\n")
+    confirmed_keys(m, "life\n")
     expect_screen(m, r"^life: gun on 160x80 cells; a key quits$")
+    # unconfirmed: its log line, read next, confirms it (a confirmed step's
+    # `kbd` would read past that line)
     m.press(["alt", "f2"])
     m.expect(r"INFO  term: not showing terminal 2: a command has the screen\n", 10)
     m.send_line("vt 2")
@@ -221,7 +225,7 @@ def test_a_command_drawing_keeps_its_terminal_shown(boot):
     m.expect(r"lumen> ", 10)
     status = vt_status(m)
     assert (status.shown, status.refused) == (1, 2), status
-    m.press(["x"])
+    confirmed_keys(m, "x")
     expect_screen(m, r"^life: generation \d+, \d+ alive\nlumen>$")
     assert vt_status(m).shown == 1
 
@@ -232,12 +236,11 @@ def test_a_command_drawing_brings_its_terminal_to_the_front(boot):
     # "press a key" line in its grid, which `term text` now reads), and the
     # key typed then reaches it there.
     m = boot_term(boot)
-    m.type_text("rhai -e 'sleep(4000); draw_rect(0, 0, 50, 50, 0x00ff00)'\n")
-    m.press(["alt", "f2"])
+    confirmed_keys(m, "rhai -e 'sleep(4000); draw_rect(0, 0, 50, 50, 0x00ff00)'\n", ["alt", "f2"])
     expect_screen(m, r"\Alumen>\s*\Z")
     assert vt_status(m).shown == 2
     expect_screen(m, r"^rhai: press a key on the keyboard$", 30)
     assert vt_status(m).shown == 1
-    m.press(["spc"])
+    confirmed_keys(m, " ")
     expect_screen(m, r"^rhai: press a key on the keyboard\nlumen>$")
     assert vt_status(m).shown == 1

@@ -74,6 +74,7 @@ def test_boots_without_a_uart_and_warns_on_screen_golden(boot, artifacts, golden
     assert_matches_golden(shot, golden, artifacts=artifacts, **WARNING_ROW)
 
     for _ in range(ATTEMPTS):
+        # unconfirmed: no serial port, so no `kbd` to confirm keys with
         m.press(["ctrl", "u"])
         m.type_text("crash panic\n")
         try:

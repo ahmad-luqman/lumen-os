@@ -38,7 +38,7 @@ def test_screenshot_matches_screendump(boot, artifacts):
     # matches).
     m = boot_shells(boot)
     assert_matches_screendump(m, artifacts, "boot")
-    m.type_text("colors\n")
+    gui.confirmed_keys(m, "colors\n")
     expect_screen(m, r"^colors: done\nlumen>$")
     assert_matches_screendump(m, artifacts, "colors")
 
@@ -47,7 +47,7 @@ def test_screenshot_refuses_a_screen_shell(boot):
     # On a virtual terminal the PNG's text would only fill the screen: the
     # command says to use serial, and draws no frame.
     m = boot_shells(boot)
-    m.type_text("screenshot\n")
+    gui.confirmed_keys(m, "screenshot\n")
     expect_screen(m, r"^screenshot: run it on serial \(the PNG comes out as text\)\nlumen>$")
     assert "@@png" not in read_screen(m).text
 
@@ -66,12 +66,12 @@ def test_screenshot_says_when_a_canvas_was_drawing(boot):
     # lock: a screenshot meanwhile may be torn, says so, and the harness
     # refuses it unless told otherwise. Once life ends, the flag is gone.
     m = boot_shells(boot)
-    m.type_text("life\n")
+    gui.confirmed_keys(m, "life\n")
     wait_paused(m, True)
     with pytest.raises(FrameError, match="a command held the screen during the capture"):
         m.screenshot_via_serial()
     assert m.screenshot_via_serial(allow_torn=True).size == (1280, 800)
-    m.type_text(" ")
+    gui.confirmed_keys(m, " ")
     wait_paused(m, False)
     assert m.screenshot_via_serial().size == (1280, 800)
 
@@ -344,6 +344,8 @@ def pause_while(m: Machine, line: str) -> None:
     reading the rings and reading the cut (a key wakes it into that
     wait), then Alt+F1: the request `line` makes is accepted while the
     desktop is shown and still queued when the pause comes."""
+    # unconfirmed: a race on purpose (the request lands between the key
+    # and Alt+F1), and the serial shell is busy with `line`
     m.press(["y"])
     time.sleep(0.3)
     m.send_line(line)
@@ -531,11 +533,11 @@ def test_desktop_and_canvas_exclude_each_other(boot):
     # after its compositor thread began, and is undone), and the desktop
     # keeps a command's canvas out.
     m = boot_shells(boot)
-    m.type_text("life\n")
+    gui.confirmed_keys(m, "life\n")
     wait_paused(m, True)
     assert run(m, "desktop") == "desktop: not started: the screen is in use by another command\n"
     assert gui.desktop_status(m)["state"] == "off"
-    m.type_text(" ")
+    gui.confirmed_keys(m, " ")
     wait_paused(m, False)
     gui.start_desktop(m)
     assert run(m, "mandelbrot") == "mandelbrot: the screen is in use by another command\n"
@@ -836,7 +838,7 @@ def test_terminal_is_refused_unless_the_desktop_is_shown(boot):
     assert run(m, "terminal") == "terminal: desktop: not started (`desktop` starts it)\n"
     gui.start_desktop(m)
     open_terminal(m)
-    m.press(["alt", "f1"])
+    gui.confirmed_keys(m, ["alt", "f1"])
     gui.wait_desktop_state(m, "paused")
     assert run(m, "terminal") == "terminal: desktop: paused (`desktop` resumes it)\n"
     assert [w["title"] for w in gui.windows(m)] == ["Terminal-1", "Colours", "Welcome"]
