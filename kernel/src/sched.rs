@@ -2670,7 +2670,11 @@ crate::ktest!(
             kassert!(r == Err(SpawnError::NotRunning));
         }
         kassert!(!ran_unstarted.load(Ordering::Acquire));
-        kassert!(threads().iter().all(|t| t.name != "scoped"));
+        // Every scoped thread has exited. (Its record may still be listed:
+        // `finish_switch` on its CPU sets `reaped` and wakes the joiner while
+        // still holding the dead thread's `Arc`, dropped only as it returns,
+        // so `threads()` can see it, dead, for a moment after `scope`.)
+        kassert!(threads().iter().all(|t| t.name != "scoped" || t.state == State::Dead));
         Ok(())
     }
 );
