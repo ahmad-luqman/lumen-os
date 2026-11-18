@@ -62,30 +62,31 @@ impl Metrics {
     /// The close box, inside the title bar at its right end (empty if the
     /// frame is too narrow or short for any of it).
     pub fn close_box(&self, frame: &Rect) -> Rect {
-        let title = self.title_bar(frame);
-        let inset = i64::from(self.border) + i64::from(self.close_margin) + i64::from(self.close);
-        let x = (i64::from(frame.right()) - inset).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
-        let y = frame.y().saturating_add((self.title_h.saturating_sub(self.close) / 2) as i32);
-        Rect::new(x, y, self.close, self.close).intersect(&title).unwrap_or(Rect::EMPTY)
+        self.title_box(frame, 0)
     }
 
     /// The minimize box (#157): as big as the close box, `close_margin`
     /// left of it, inside the title bar (empty if the frame is too narrow
-    /// or short for any of it).
+    /// or short for any of it, and never over the close box).
     pub fn minimize_box(&self, frame: &Rect) -> Rect {
-        let title = self.title_bar(frame);
-        let close = self.close_box(frame);
-        let step = i64::from(self.close_margin) + i64::from(self.close);
-        let right =
-            i64::from(frame.right()) - i64::from(self.border) - i64::from(self.close_margin) - i64::from(self.close);
-        let x = (right - step).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
-        let y = frame.y().saturating_add((self.title_h.saturating_sub(self.close) / 2) as i32);
-        let r = Rect::new(x, y, self.close, self.close).intersect(&title).unwrap_or(Rect::EMPTY);
-        // Never over the close box (a frame narrower than both).
-        match r.intersect(&close) {
+        let r = self.title_box(frame, 1);
+        match r.intersect(&self.close_box(frame)) {
             Some(_) => Rect::EMPTY,
             None => r,
         }
+    }
+
+    /// The title bar's `n`th box from the right (0 the close box, 1 the
+    /// minimize box): `close` pixels square, `close_margin` in from the
+    /// right border and from each other, centred in the title bar's rows,
+    /// cut to the title bar.
+    fn title_box(&self, frame: &Rect, n: u32) -> Rect {
+        let title = self.title_bar(frame);
+        let step = i64::from(self.close_margin) + i64::from(self.close);
+        let inset = i64::from(self.border) + step * (i64::from(n) + 1);
+        let x = (i64::from(frame.right()) - inset).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        let y = frame.y().saturating_add((self.title_h.saturating_sub(self.close) / 2) as i32);
+        Rect::new(x, y, self.close, self.close).intersect(&title).unwrap_or(Rect::EMPTY)
     }
 
     /// The client area: inside the borders, below the title bar.

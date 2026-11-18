@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 
 use lumen_gfx::{Rect, Surface};
 
+use crate::app::{App, Served, Then, serve};
 use crate::node::{Action, InvokeError, Role, StateFlags};
 use crate::text::{FixedText, Text};
 use crate::ui::{Input, Key, Palette, Repaint, Ui, UiEvent, Widget, button_height};
@@ -383,4 +384,214 @@ fn the_text_draw_is_clipped_by_paint_in() {
     }
     let mut t = FixedText;
     assert!(t.width("wwwwwwww") == b.w());
+}
+
+#[test]
+fn a_press_on_a_removed_widget_never_activates_the_widget_in_its_slot_next() {
+    let mut ui = Ui::bar(4);
+    let row = ui.hstack(None, "Windows");
+    let a = ui.button(Some(row), "A");
+    let area = Rect::new(0, 0, 400, 40);
+    ui.layout(area, &mut FixedText);
+    let at = centre(ui.bounds(a));
+    let _ = ui.handle(Input::Down { x: at.0, y: at.1 });
+    assert!(ui.remove(a));
+    let b = ui.button(Some(row), "B");
+    ui.layout(area, &mut FixedText);
+    assert!(ui.bounds(b).contains(at.0, at.1), "B took A's place");
+    assert_eq!(ui.handle(Input::Up { x: at.0, y: at.1 }), alloc::vec![]);
+}
+
+#[test]
+fn changes_past_the_damage_list_s_size_repaint_everything() {
+    let mut ui = Ui::new();
+    let col = ui.vstack(None, "Col");
+    let boxes: Vec<Widget> = (0..20).map(|n| ui.checkbox(Some(col), &alloc::format!("B{n}"), false)).collect();
+    let area = Rect::new(0, 0, 300, 800);
+    ui.layout(area, &mut FixedText);
+    let mut shown = Surface::new(area.w(), area.h());
+    ui.paint(&mut shown, &mut FixedText, &PALETTE);
+    let _ = (ui.take_changed(), ui.take_damage());
+    for &b in &boxes {
+        let id = ui.id(b).expect("live").get();
+        let _ = ui.invoke(id, &Action::Press);
+    }
+    ui.layout(area, &mut FixedText);
+    match ui.take_damage() {
+        Repaint::Nothing => {}
+        Repaint::All => ui.paint(&mut shown, &mut FixedText, &PALETTE),
+        Repaint::Rects(rects) => {
+            for r in rects {
+                ui.paint_in(&mut shown, &mut FixedText, &PALETTE, r);
+            }
+        }
+    }
+    let mut full = Surface::new(area.w(), area.h());
+    ui.paint(&mut full, &mut FixedText, &PALETTE);
+    assert!(shown == full, "a change past the damage list's size was lost");
+}
+
+#[test]
+fn paint_in_touches_nothing_outside_its_clip_for_every_kind() {
+    let mut ui = Ui::new();
+    let col = ui.vstack(None, "Col");
+    let ws = [
+        ui.button(Some(col), "Button text"),
+        ui.checkbox(Some(col), "Check", true),
+        ui.text_field(Some(col), "Field", "some text"),
+        ui.list(Some(col), "List", &["one", "two"]),
+        ui.menu(Some(col), "Menu", &["a", "b"]),
+    ];
+    let _ = ui.invoke(ui.id(ws[4]).expect("live").get(), &Action::Press);
+    ui.set_window_focused(true);
+    ui.layout(AREA, &mut FixedText);
+    for &w in &ws {
+        let b = ui.bounds(w);
+        let clip = Rect::new(b.x() + b.w() as i32 / 3, b.y() + 1, b.w() / 3, b.h().saturating_sub(2).max(1));
+        let mut s = Surface::new(AREA.w(), AREA.h());
+        s.fill(0x123456);
+        ui.paint_in(&mut s, &mut FixedText, &PALETTE, clip);
+        for y in 0..AREA.h() as i32 {
+            for x in 0..AREA.w() as i32 {
+                if !clip.contains(x, y) {
+                    assert_eq!(s.pixel(x, y), Some(0x123456), "({x}, {y}) outside {clip:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn removing_the_pinned_widget_unpins_its_slot() {
+    let mut ui = Ui::bar(4);
+    let left = ui.button(None, "Left");
+    let clock = ui.fixed_label(None, "Clock", "00:00", 40);
+    assert!(ui.pin_right(clock));
+    let area = Rect::new(0, 0, 400, 40);
+    ui.layout(area, &mut FixedText);
+    assert!(ui.remove(clock));
+    let next = ui.button(None, "Next");
+    ui.layout(area, &mut FixedText);
+    assert!(ui.bounds(next).x() > ui.bounds(left).right());
+    assert!(ui.bounds(next).right() < 400 - 4, "a new widget isn't pinned by the removed one's slot");
+}
+
+#[test]
+fn only_a_bar_s_top_widget_is_pinned() {
+    let mut down = Ui::new();
+    let w = down.label(None, "L", "x");
+    assert!(!down.pin_right(w), "not a bar");
+    let mut bar = Ui::bar(4);
+    let row = bar.hstack(None, "Row");
+    let inner = bar.label(Some(row), "Inner", "x");
+    assert!(!bar.pin_right(inner), "not a top widget");
+    assert!(bar.pin_right(row.widget()));
+    bar.remove(row.widget());
+    assert!(!bar.pin_right(row.widget()), "removed");
+}
+
+#[test]
+fn a_press_on_an_item_folded_then_unfolded_does_nothing() {
+    let mut ui = Ui::bar(4);
+    let menu = ui.menu(None, "Launcher", &["Terminal", "Life"]);
+    let area = Rect::new(0, 0, 600, 40);
+    ui.layout(area, &mut FixedText);
+    let _ = ui.invoke(ui.id(menu).expect("live").get(), &Action::Press);
+    ui.layout(area, &mut FixedText);
+    let life = ui.item_id(menu, 1).expect("item").get();
+    let (x, y) = centre(ui.node(life).expect("shown").1.bounds());
+    let _ = ui.handle(Input::Down { x, y });
+    ui.set_expanded(menu, false);
+    ui.layout(area, &mut FixedText);
+    ui.set_expanded(menu, true);
+    ui.layout(area, &mut FixedText);
+    assert_eq!(ui.handle(Input::Up { x, y }), alloc::vec![]);
+}
+
+#[test]
+fn a_widget_past_the_pinned_one_is_hidden_listed_so_and_takes_no_action() {
+    let mut ui = Ui::bar(4);
+    let row = ui.hstack(None, "Windows");
+    let buttons: Vec<Widget> = (0..12).map(|n| ui.button(Some(row), &alloc::format!("Window {n}"))).collect();
+    let clock = ui.fixed_label(None, "Clock", "00:00", 40);
+    assert!(ui.pin_right(clock));
+    let area = Rect::new(0, 0, 400, 40);
+    ui.layout(area, &mut FixedText);
+    let hidden = *buttons.last().expect("buttons");
+    let shown = buttons[0];
+    let id = ui.id(hidden).expect("live").get();
+    let node = ui.node(id).expect("listed").1;
+    assert!(node.state().contains(StateFlags::HIDDEN), "{:?}", node.state());
+    assert!(!ui.node(ui.id(shown).expect("live").get()).expect("listed").1.state().contains(StateFlags::HIDDEN));
+    assert_eq!(ui.invoke(id, &Action::Press), Err(InvokeError::Hidden));
+    assert_eq!(ui.invoke(id, &Action::Focus), Err(InvokeError::Hidden));
+    assert_eq!(alloc::format!("{}", InvokeError::Hidden), "not shown: it doesn't fit");
+    // Nothing hits it (its bounds are empty), Tab skips it.
+    assert!(ui.hit(0, 0).is_none_or(|(w, _)| w != hidden));
+    for _ in 0..30 {
+        let _ = ui.handle(Input::Key(Key::Tab));
+        assert_ne!(ui.focused(), Some(hidden));
+    }
+    // Room again: shown and taking actions.
+    for &b in &buttons[..10] {
+        ui.remove(b);
+    }
+    ui.layout(area, &mut FixedText);
+    assert!(!ui.node(id).expect("listed").1.state().contains(StateFlags::HIDDEN));
+    assert_eq!(ui.invoke(id, &Action::Press), Ok(alloc::vec![UiEvent::Pressed(hidden)]));
+}
+
+#[test]
+fn a_menu_pushed_past_the_pinned_widget_folds() {
+    // Expanded, then hidden (a window's button before it widened): it
+    // folds, so its items are neither listed nor chosen; folded, it fits
+    // again and shows.
+    let mut ui = Ui::bar(4);
+    let wide = ui.button(None, "A wide button before the menu");
+    let menu = ui.menu(None, "Launcher", &["Terminal", "Mandelbrot", "Life", "Counter"]);
+    let clock = ui.fixed_label(None, "Clock", "00:00", 40);
+    assert!(ui.pin_right(clock));
+    let area = Rect::new(0, 0, 420, 40);
+    ui.layout(area, &mut FixedText);
+    assert!(!ui.bounds(menu).is_empty(), "folded, it fits");
+    let _ = ui.invoke(ui.id(menu).expect("live").get(), &Action::Press);
+    let life = ui.item_id(menu, 2).expect("item").get();
+    ui.layout(area, &mut FixedText);
+    assert_eq!(ui.expanded(menu), Some(false), "it didn't fit expanded: folded");
+    assert!(!ui.bounds(menu).is_empty(), "and shown folded, in the same layout");
+    assert!(ui.node(life).is_none());
+    assert_eq!(ui.invoke(life, &Action::Press), Err(InvokeError::NoNode));
+    assert!(!ui.bounds(wide).is_empty());
+}
+
+#[test]
+fn a_failed_action_answers_failed_through_serve() {
+    // An app whose button's action fails (a launcher item whose window
+    // didn't open): `serve` answers `Failed` with why; the tree is laid out
+    // again all the same.
+    struct Launch {
+        ui: Ui,
+        go: Widget,
+    }
+    impl App for Launch {
+        fn ui_mut(&mut self) -> &mut Ui {
+            &mut self.ui
+        }
+        fn apply(&mut self, events: &[UiEvent]) -> Then {
+            if events.contains(&UiEvent::Pressed(self.go)) {
+                Then::Failed(String::from("Life: desktop: paused"))
+            } else {
+                Then::Carry
+            }
+        }
+    }
+    let mut ui = Ui::new();
+    let go = ui.button(None, "Go");
+    let id = ui.id(go).expect("live").get();
+    let mut app = Launch { ui, go };
+    let served = serve(&mut app, &mut FixedText, AREA, id, &Action::Press);
+    assert_eq!(served, Served::Failed(String::from("Life: desktop: paused")));
+    assert!(!app.ui.bounds(go).is_empty());
+    // A focus, which presses nothing, is served as a row.
+    assert!(matches!(serve(&mut app, &mut FixedText, AREA, id, &Action::Focus), Served::Row { .. }));
 }

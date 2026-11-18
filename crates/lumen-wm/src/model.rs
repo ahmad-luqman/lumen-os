@@ -178,7 +178,7 @@ fn a_click_on_the_minimize_box_minimizes_and_a_release_elsewhere_doesnt() {
 fn a_panel_is_in_front_never_focused_and_a_press_on_it_grabs_without_focusing() {
     let mut wm = wm();
     let a = open(&mut wm, 0, 0, 12, 10);
-    let (p, out) = wm.open_panel("panel", Rect::new(0, 26, W, 4));
+    let (p, out) = wm.open_panel("panel", 4);
     assert!(out.deliveries.is_empty(), "the focus doesn't move");
     assert_eq!(wm.focused(), Some(a));
     let w = wm.window(p).expect("open");
@@ -209,12 +209,72 @@ fn a_panel_is_in_front_never_focused_and_a_press_on_it_grabs_without_focusing() 
     assert_eq!(out.deliveries, [Delivery::Lost(a), Delivery::Lost(p)]);
     assert_eq!(wm.grabbing(), None);
     let _ = (b, wm.pointer(at(3, 27, NONE)));
+    // It is docked: never moved.
+    assert_eq!(wm.move_to(p, 0, 0), None);
+    assert_eq!(frame(&wm, p), Rect::new(0, 26, W, 4));
+}
+
+#[test]
+fn a_key_gap_leaves_a_panels_grab_alone() {
+    // A press on the taskbar, then a key gap (keys lost: the panel has
+    // none): the focused window is told `Lost`, the panel's grab goes on
+    // and its release is delivered, so the click isn't lost.
+    let mut wm = wm();
+    let a = open(&mut wm, 0, 0, 12, 10);
+    let (p, _) = wm.open_panel("panel", 4);
+    let _ = wm.pointer(at(3, 27, L));
+    assert_eq!(wm.grabbing(), Some(p));
+    let out = wm.interrupt(Interruption::KeyGap);
+    assert_eq!(out.deliveries, [Delivery::Lost(a)]);
+    assert_eq!(wm.grabbing(), Some(p));
+    let out = wm.pointer(at(3, 27, NONE));
+    assert_eq!(out.deliveries, [Delivery::PointerUp { window: p, x: 3, y: 1, button: LB, buttons: NONE }]);
+}
+
+#[test]
+fn a_panel_opened_later_moves_the_windows_under_its_rows_above_them() {
+    let mut wm = wm();
+    let low = open(&mut wm, 2, 25, 10, 4);
+    let high = open(&mut wm, 2, 2, 10, 4);
+    let (was_low, was_high) = (frame(&wm, low), frame(&wm, high));
+    assert_eq!(was_low.y(), 25);
+    let (_, out) = wm.open_panel("panel", 4);
+    // Its title bar's last row just above the panel (row 26).
+    let now = frame(&wm, low);
+    assert_eq!((now.x(), now.y(), now.w(), now.h()), (2, 26 - M.title_h as i32, was_low.w(), was_low.h()));
+    assert_eq!(frame(&wm, high), was_high, "a window above the rows stays");
+    assert!(covers(&out, was_low) && covers(&out, now), "its old and new places repainted");
+    assert!(covers(&out, Rect::new(0, 26, W, 4)));
+    assert!(out.deliveries.is_empty());
+}
+
+#[test]
+fn minimizing_ends_a_grab_and_a_drag_on_it() {
+    let mut wm = wm();
+    let _a = open(&mut wm, 0, 0, 12, 10);
+    let b = open(&mut wm, 14, 2, 12, 10);
+    let c = wm.client(b).expect("open");
+    let _ = wm.pointer(at(c.x(), c.y(), L));
+    assert_eq!(wm.grabbing(), Some(b));
+    let _ = wm.minimize(b).expect("shown");
+    assert_eq!(wm.grabbing(), None, "a grab on a window minimized ends");
+    let out = wm.pointer(at(c.x(), c.y(), NONE));
+    assert!(!out.deliveries.iter().any(|d| matches!(*d, Delivery::PointerUp { window, .. } if window == b)));
+    let _ = wm.restore(b).expect("minimized");
+    let f = frame(&wm, b);
+    let tb = wm.metrics().title_bar(&f);
+    let _ = wm.pointer(at(tb.x() + 1, tb.y() + 1, L));
+    assert_eq!(wm.dragging(), Some(b));
+    let _ = wm.minimize(b).expect("shown");
+    assert_eq!(wm.dragging(), None, "a drag of a window minimized ends");
+    let _ = wm.pointer(at(tb.x() + 5, tb.y() + 5, L));
+    assert_eq!(frame(&wm, b), f, "a minimized window isn't moved");
 }
 
 #[test]
 fn windows_keep_their_title_bar_above_a_panel() {
     let mut wm = wm();
-    let _ = wm.open_panel("panel", Rect::new(0, 26, W, 4));
+    let _ = wm.open_panel("panel", 4);
     assert_eq!(wm.work_height(), 26);
     // Opened or moved as low as possible: the title bar's last row is
     // just above the panel.
@@ -956,7 +1016,7 @@ fn repainting_only_the_damage_matches_repainting_everything() {
         let mut rng = Rng(seed);
         let mut wm = wm();
         // Half the seeds with a panel along the bottom (#157's taskbar).
-        let panel = (n % 2 == 1).then(|| wm.open_panel("panel", Rect::new(0, H as i32 - 4, W, 4)).0);
+        let panel = (n % 2 == 1).then(|| wm.open_panel("panel", 4).0);
         let work = wm.work_height();
         let mut o = Owners::default();
         let mut screen = full(&wm);

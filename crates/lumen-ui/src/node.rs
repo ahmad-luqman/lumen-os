@@ -130,12 +130,15 @@ impl Role {
     /// The state flags its nodes may carry.
     pub fn flags(self) -> StateFlags {
         let (f, d, s, e) = (StateFlags::FOCUSED, StateFlags::DISABLED, StateFlags::SELECTED, StateFlags::EXPANDED);
+        // Every widget may be hidden (#157: past a bar's pinned widget); a
+        // window's root never is.
+        let h = StateFlags::HIDDEN;
         match self {
             Role::Window => f,
-            Role::Group | Role::Label | Role::MenuItem => d,
-            Role::Button | Role::Checkbox | Role::TextField | Role::List => f.with(d),
-            Role::ListItem => s.with(d),
-            Role::Menu => f.with(d).with(e),
+            Role::Group | Role::Label | Role::MenuItem => d.with(h),
+            Role::Button | Role::Checkbox | Role::TextField | Role::List => f.with(d).with(h),
+            Role::ListItem => s.with(d).with(h),
+            Role::Menu => f.with(d).with(e).with(h),
         }
     }
 }
@@ -286,6 +289,8 @@ pub enum InvokeError {
     NotAllowed(Role, ActionKind),
     /// The node is disabled.
     Disabled,
+    /// The node isn't shown (#157: it doesn't fit its bar).
+    Hidden,
     /// Wrong arguments for the action.
     Arguments,
 }
@@ -306,6 +311,7 @@ impl fmt::Display for InvokeError {
             }
             InvokeError::NotAllowed(role, action) => write!(f, "a {} doesn't take {}", role.name(), action.name()),
             InvokeError::Disabled => f.write_str("the node is disabled"),
+            InvokeError::Hidden => f.write_str("not shown: it doesn't fit"),
             InvokeError::Arguments => f.write_str("wrong arguments (set_value takes one, the others none)"),
         }
     }
@@ -321,11 +327,15 @@ impl StateFlags {
     pub const DISABLED: StateFlags = StateFlags(2);
     pub const SELECTED: StateFlags = StateFlags(4);
     pub const EXPANDED: StateFlags = StateFlags(8);
-    const NAMES: [(StateFlags, &'static str); 4] = [
+    /// Laid out with no room (#157: past a bar's pinned widget): not
+    /// drawn, not hit, takes no action.
+    pub const HIDDEN: StateFlags = StateFlags(16);
+    const NAMES: [(StateFlags, &'static str); 5] = [
         (StateFlags::FOCUSED, "focused"),
         (StateFlags::DISABLED, "disabled"),
         (StateFlags::SELECTED, "selected"),
         (StateFlags::EXPANDED, "expanded"),
+        (StateFlags::HIDDEN, "hidden"),
     ];
 
     pub const fn with(self, other: StateFlags) -> StateFlags {
@@ -501,6 +511,12 @@ impl AutomationNode {
         AutomationNode::new(id, Role::Menu, name, None, state, bounds, items)
     }
 
+    /// The same node, marked hidden if `hidden` (and its role allows it).
+    pub fn hidden_if(mut self, hidden: bool) -> AutomationNode {
+        self.state = self.state.with_if(StateFlags::HIDDEN, hidden).within(self.role.flags());
+        self
+    }
+
     pub fn menu_item(id: NodeId, name: &str, bounds: Rect, disabled: bool) -> AutomationNode {
         let state = StateFlags::NONE.with_if(StateFlags::DISABLED, disabled);
         AutomationNode::new(id, Role::MenuItem, name, None, state, bounds, Vec::new())
@@ -562,7 +578,7 @@ mod tests {
     fn every_role() -> Vec<AutomationNode> {
         let id = NodeId::fresh;
         let items = alloc::vec![id(), id()];
-        alloc::vec![
+        let nodes = alloc::vec![
             AutomationNode::window(id(), "w", r(), true, Vec::new()),
             AutomationNode::group(id(), "g", r(), true, Vec::new()),
             AutomationNode::label(id(), "l", "text", r(), true),
@@ -573,7 +589,8 @@ mod tests {
             AutomationNode::list_item(id(), "i", 1, Some(1), r(), true),
             AutomationNode::menu(id(), "m", r(), true, true, true, Vec::new()),
             AutomationNode::menu_item(id(), "mi", r(), true),
-        ]
+        ];
+        nodes.into_iter().map(|n| n.hidden_if(true)).collect()
     }
 
     #[test]
@@ -590,17 +607,18 @@ mod tests {
         use ActionKind as A;
         use ValueKind as V;
         let (f, d, s, e) = (StateFlags::FOCUSED, StateFlags::DISABLED, StateFlags::SELECTED, StateFlags::EXPANDED);
+        let h = StateFlags::HIDDEN;
         let table: [(Role, Option<V>, &[A], StateFlags); 10] = [
             (Role::Window, None, &[A::Focus, A::Close, A::Minimize, A::Restore], f),
-            (Role::Group, None, &[], d),
-            (Role::Label, Some(V::Text), &[], d),
-            (Role::Button, None, &[A::Press, A::Focus], f.with(d)),
-            (Role::Checkbox, Some(V::Checked), &[A::Press, A::Focus], f.with(d)),
-            (Role::TextField, Some(V::Text), &[A::SetValue, A::Focus], f.with(d)),
-            (Role::List, Some(V::Selected), &[A::Focus], f.with(d)),
-            (Role::ListItem, None, &[A::Select, A::Press], s.with(d)),
-            (Role::Menu, None, &[A::Press, A::Focus], f.with(d).with(e)),
-            (Role::MenuItem, None, &[A::Press], d),
+            (Role::Group, None, &[], d.with(h)),
+            (Role::Label, Some(V::Text), &[], d.with(h)),
+            (Role::Button, None, &[A::Press, A::Focus], f.with(d).with(h)),
+            (Role::Checkbox, Some(V::Checked), &[A::Press, A::Focus], f.with(d).with(h)),
+            (Role::TextField, Some(V::Text), &[A::SetValue, A::Focus], f.with(d).with(h)),
+            (Role::List, Some(V::Selected), &[A::Focus], f.with(d).with(h)),
+            (Role::ListItem, None, &[A::Select, A::Press], s.with(d).with(h)),
+            (Role::Menu, None, &[A::Press, A::Focus], f.with(d).with(e).with(h)),
+            (Role::MenuItem, None, &[A::Press], d.with(h)),
         ];
         assert_eq!(table.map(|row| row.0), Role::ALL);
         for (role, value, actions, flags) in table {

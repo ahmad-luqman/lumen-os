@@ -49,12 +49,6 @@ impl Stack {
     }
 }
 
-impl From<Stack> for Widget {
-    fn from(s: Stack) -> Widget {
-        s.0
-    }
-}
-
 /// The colours a [`Ui`] paints with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Palette {
@@ -185,12 +179,32 @@ struct W {
     kind: Kind,
     disabled: bool,
     removed: bool,
+    /// Laid out with no room (past a bar's pinned widget): bounds empty,
+    /// not hit, takes no action, listed `hidden`.
+    hidden: bool,
     bounds: Rect,
     children: Vec<usize>,
     parent: Option<usize>,
 }
 
 impl W {
+    /// A removed widget's slot, whole (nothing of the widget outlives it),
+    /// keeping only the generation for the next to bump.
+    fn tombstone(generation: u32) -> W {
+        W {
+            id: NodeId::fresh(),
+            generation,
+            name: String::new(),
+            kind: Kind::Label { text: String::new(), width: None },
+            disabled: false,
+            removed: true,
+            hidden: false,
+            bounds: Rect::EMPTY,
+            children: Vec::new(),
+            parent: None,
+        }
+    }
+
     fn role(&self) -> Role {
         match self.kind {
             Kind::Stack(_) => Role::Group,
@@ -212,10 +226,7 @@ impl W {
     /// them if it takes the focus.
     fn painted(&self) -> Rect {
         let b = self.bounds;
-        if b.is_empty() || !self.focusable() {
-            return b;
-        }
-        Rect::new(b.x() - RING, b.y() - RING, b.w() + 2 * RING as u32, b.h() + 2 * RING as u32)
+        if b.is_empty() || !self.focusable() { b } else { ring(b) }
     }
 
     /// The items shown (a list's; an expanded menu's).
@@ -230,6 +241,31 @@ impl W {
 
 /// How far outside a widget its focus ring is drawn.
 const RING: i32 = 2;
+
+/// The focus ring around `r` ([`RING`] pixels outside it).
+fn ring(r: Rect) -> Rect {
+    Rect::new(r.x() - RING, r.y() - RING, r.w() + 2 * RING as u32, r.h() + 2 * RING as u32)
+}
+
+/// What a layout decided for one widget (compared before and after: a
+/// change repaints everything).
+#[derive(Debug, PartialEq, Eq)]
+struct Geometry {
+    bounds: Rect,
+    head: Rect,
+    items: Vec<Rect>,
+    hidden: bool,
+}
+
+/// How a tree's top widgets are placed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Arrange {
+    /// Down from the area's corner.
+    Down,
+    /// Across, each centred in the area's height, `pinned` (a top widget)
+    /// at the right edge and the others stopping short of it.
+    Bar { pinned: Option<usize> },
+}
 
 /// A retained widget tree: see the module's doc. `Clone` only in tests: a
 /// copy would share its widgets' node ids.
@@ -250,11 +286,7 @@ pub struct Ui {
     damage: Vec<Rect>,
     /// Padding around the whole tree.
     pad: u32,
-    /// The top widgets go across (each centred in the area's height), not
-    /// down.
-    across: bool,
-    /// A top widget placed at the area's right edge (across only).
-    pinned: Option<usize>,
+    arrange: Arrange,
     /// Slots of removed widgets, free to take again.
     free: Vec<usize>,
 }
@@ -271,8 +303,7 @@ impl Default for Ui {
             all: true,
             damage: Vec::new(),
             pad: PAD,
-            across: false,
-            pinned: None,
+            arrange: Arrange::Down,
             free: Vec::new(),
         }
     }
@@ -286,7 +317,7 @@ impl Ui {
     /// A bar: the top widgets across (each centred in the area's height),
     /// `pad` pixels in from its edges (a taskbar).
     pub fn bar(pad: u32) -> Ui {
-        Ui { pad, across: true, ..Ui::default() }
+        Ui { pad, arrange: Arrange::Bar { pinned: None }, ..Ui::default() }
     }
 
     fn add(&mut self, parent: Option<Stack>, name: &str, kind: Kind) -> Widget {
@@ -307,6 +338,7 @@ impl Ui {
             kind,
             disabled: false,
             removed: false,
+            hidden: false,
             bounds: Rect::EMPTY,
             children: Vec::new(),
             parent,
@@ -396,10 +428,14 @@ impl Ui {
 
     /// Place top widget `w` at the area's right edge (in a [`Ui::bar`]);
     /// the others stop short of it, those that don't fit hidden.
-    pub fn pin_right(&mut self, w: Widget) {
-        if let Some(i) = self.at(w) {
-            debug_assert!(self.top.contains(&i), "only a top widget is pinned");
-            self.pinned = Some(i);
+    /// Whether it was pinned: only a top widget of a bar is.
+    pub fn pin_right(&mut self, w: Widget) -> bool {
+        match (self.at(w), &mut self.arrange) {
+            (Some(i), Arrange::Bar { pinned }) if self.top.contains(&i) => {
+                *pinned = Some(i);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -422,13 +458,7 @@ impl Ui {
         for &i in &gone {
             self.touch(i);
             // What it held freed now; the slot kept for the next widget.
-            let w = &mut self.widgets[i];
-            w.removed = true;
-            w.bounds = Rect::EMPTY;
-            w.name = String::new();
-            w.kind = Kind::Label { text: String::new(), width: None };
-            w.children = Vec::new();
-            w.parent = None;
+            self.widgets[i] = W::tombstone(self.widgets[i].generation);
             self.free.push(i);
         }
         if self.focus.is_some_and(|f| gone.contains(&f)) {
@@ -437,8 +467,10 @@ impl Ui {
         if self.armed.is_some_and(|(a, _)| gone.contains(&a)) {
             self.armed = None;
         }
-        if self.pinned.is_some_and(|p| gone.contains(&p)) {
-            self.pinned = None;
+        if let Arrange::Bar { pinned } = &mut self.arrange
+            && pinned.is_some_and(|p| gone.contains(&p))
+        {
+            *pinned = None;
         }
         true
     }
@@ -614,53 +646,77 @@ impl Ui {
     /// widget moved or changed size, everything is repainted and the tree
     /// changed.
     pub fn layout(&mut self, area: Rect, text: &mut dyn Text) {
+        let before = self.geometry();
+        // Twice at most: a menu hidden in the first pass is folded, and its
+        // smaller size may fit in the second.
+        for _ in 0..2 {
+            if !self.place_all(area, text) {
+                break;
+            }
+        }
+        if self.geometry() != before {
+            self.changed = true;
+            self.all = true;
+        }
+    }
+
+    /// What layout decides: each widget's bounds, a menu's head, the items
+    /// shown, whether it is hidden.
+    fn geometry(&self) -> Vec<Geometry> {
+        self.widgets
+            .iter()
+            .map(|w| Geometry {
+                bounds: w.bounds,
+                head: match &w.kind {
+                    Kind::Menu { head, .. } => *head,
+                    _ => Rect::EMPTY,
+                },
+                items: w.shown_items().iter().map(|i| i.bounds).collect(),
+                hidden: w.hidden,
+            })
+            .collect()
+    }
+
+    /// One layout pass; whether it folded a menu it hid.
+    fn place_all(&mut self, area: Rect, text: &mut dyn Text) -> bool {
         // Each widget after everything in it (the tree's order reversed:
         // a reused slot may come before its stack's).
         let mut sizes = alloc::vec![(0u32, 0u32); self.widgets.len()];
         for (i, _) in self.walk().into_iter().rev() {
             sizes[i] = self.size(i, text, &sizes);
         }
-        let before: Vec<(Rect, Vec<Rect>)> =
-            self.widgets.iter().map(|w| (w.bounds, w.shown_items().iter().map(|i| i.bounds).collect())).collect();
-        let heads: Vec<Rect> = self.widgets.iter().map(|w| head_of(&w.kind)).collect();
         self.measure_menus(text);
         let pad = self.pad as i32;
         let top = self.top.clone();
-        if self.across {
-            let right = area.right() - pad;
-            let centred_y = |h: u32| area.y() + centred(area.h(), h);
-            let limit = match self.pinned {
-                Some(p) => {
-                    let x = right - sizes[p].0 as i32;
-                    self.place(p, x, centred_y(sizes[p].1), &sizes, right);
-                    x - GAP as i32
+        let mut folded = false;
+        match self.arrange {
+            Arrange::Bar { pinned } => {
+                let right = area.right() - pad;
+                let centred_y = |h: u32| area.y() + centred(area.h(), h);
+                let limit = match pinned {
+                    Some(p) => {
+                        let x = right - sizes[p].0 as i32;
+                        folded |= self.place(p, x, centred_y(sizes[p].1), &sizes, right);
+                        x - GAP as i32
+                    }
+                    None => right,
+                };
+                let mut x = area.x() + pad;
+                for i in top.into_iter().filter(|&i| Some(i) != pinned) {
+                    folded |= self.place(i, x, centred_y(sizes[i].1), &sizes, limit);
+                    x += (sizes[i].0 + GAP) as i32;
                 }
-                None => right,
-            };
-            let mut x = area.x() + pad;
-            let pinned = self.pinned;
-            for i in top.into_iter().filter(|&i| Some(i) != pinned) {
-                self.place(i, x, centred_y(sizes[i].1), &sizes, limit);
-                x += (sizes[i].0 + GAP) as i32;
             }
-        } else {
-            let x = area.x() + pad;
-            let mut y = area.y() + pad;
-            for i in top {
-                self.place(i, x, y, &sizes, i32::MAX);
-                y += (sizes[i].1 + GAP) as i32;
+            Arrange::Down => {
+                let x = area.x() + pad;
+                let mut y = area.y() + pad;
+                for i in top {
+                    folded |= self.place(i, x, y, &sizes, i32::MAX);
+                    y += (sizes[i].1 + GAP) as i32;
+                }
             }
         }
-        let moved = self.widgets.iter().zip(&before).zip(&heads).any(|((w, (b, items)), head)| {
-            w.bounds != *b
-                || head_of(&w.kind) != *head
-                || w.shown_items().len() != items.len()
-                || w.shown_items().iter().zip(items).any(|(i, b)| i.bounds != *b)
-        });
-        if moved {
-            self.changed = true;
-            self.all = true;
-        }
+        folded
     }
 
     /// Widget `i`'s preferred size, its children's in `sizes` already.
@@ -713,25 +769,27 @@ impl Ui {
         }
     }
 
-    /// Place widget `i` at (`x`, `y`): hidden (with all it holds) if it
-    /// would cross `limit` (a pinned widget's left, in a bar).
-    fn place(&mut self, i: usize, x: i32, y: i32, sizes: &[(u32, u32)], limit: i32) {
+    /// Place widget `i` at (`x`, `y`). A leaf that would cross `limit` (a
+    /// pinned widget's left, in a bar) is hidden; a stack that would is cut
+    /// to what shows of it, each of its children placed (or hidden) in
+    /// turn. Whether it folded a menu it hid.
+    fn place(&mut self, i: usize, x: i32, y: i32, sizes: &[(u32, u32)], limit: i32) -> bool {
         let (w, h) = sizes[i];
         let fits = i64::from(x) + i64::from(w) <= i64::from(limit);
         let leaf = !matches!(self.widgets[i].kind, Kind::Stack(_));
         if leaf && !fits {
-            self.hide(i);
-            return;
+            return self.hide(i);
         }
+        self.widgets[i].hidden = false;
         self.widgets[i].bounds = Rect::new(x, y, w, h);
-        let line_h = h;
+        let mut folded = false;
         match &mut self.widgets[i].kind {
             Kind::Stack(dir) => {
                 let dir = *dir;
                 let children = self.widgets[i].children.clone();
                 let (mut cx, mut cy) = (x, y);
                 for c in children {
-                    self.place(c, cx, cy, sizes, limit);
+                    folded |= self.place(c, cx, cy, sizes, limit);
                     match dir {
                         Dir::Down => cy += (sizes[c].1 + GAP) as i32,
                         Dir::Across => cx += (sizes[c].0 + GAP) as i32,
@@ -752,11 +810,11 @@ impl Ui {
             }
             Kind::Menu { items, expanded, head } => {
                 // The widths were measured before (`measure_menus`).
-                *head = Rect::new(x, y, head.w(), line_h);
+                *head = Rect::new(x, y, head.w(), h);
                 let mut cx = head.right();
                 for item in items.iter_mut() {
                     item.bounds = if *expanded {
-                        let r = Rect::new(cx + GAP as i32, y, item.width, line_h);
+                        let r = Rect::new(cx + GAP as i32, y, item.width, h);
                         cx = r.right();
                         r
                     } else {
@@ -766,26 +824,32 @@ impl Ui {
             }
             _ => {}
         }
+        folded
     }
 
-    /// Hide widget `i` and all it holds (bounds empty, at its place).
-    fn hide(&mut self, i: usize) {
+    /// Hide widget `i` and all it holds (bounds empty), folding a menu (its
+    /// items mustn't stay listed or chosen); whether it folded one.
+    fn hide(&mut self, i: usize) -> bool {
         let w = &mut self.widgets[i];
+        w.hidden = true;
         w.bounds = Rect::EMPTY;
+        let mut folded = false;
         match &mut w.kind {
-            Kind::List { items, .. } | Kind::Menu { items, .. } => {
-                for item in items {
-                    item.bounds = Rect::EMPTY;
-                }
-                if let Kind::Menu { head, .. } = &mut w.kind {
-                    *head = Rect::EMPTY;
-                }
+            Kind::List { items, .. } => items.iter_mut().for_each(|it| it.bounds = Rect::EMPTY),
+            Kind::Menu { items, head, expanded } => {
+                items.iter_mut().for_each(|it| it.bounds = Rect::EMPTY);
+                *head = Rect::EMPTY;
+                folded = core::mem::replace(expanded, false);
             }
             _ => {}
         }
-        for c in self.widgets[i].children.clone() {
-            self.hide(c);
+        if folded && self.armed.is_some_and(|(a, item)| a == i && item.is_some()) {
+            self.armed = None;
         }
+        for c in self.widgets[i].children.clone() {
+            folded |= self.hide(c);
+        }
+        folded
     }
 
     // -- hit testing and dispatch ----------------------------------------------
@@ -797,7 +861,7 @@ impl Ui {
     }
 
     fn hit_slot(&self, x: i32, y: i32) -> Option<(usize, Option<usize>)> {
-        self.widgets.iter().enumerate().filter(|(_, w)| !w.removed).find_map(|(i, w)| {
+        self.widgets.iter().enumerate().filter(|(_, w)| !w.removed && !w.hidden).find_map(|(i, w)| {
             let item = w.shown_items().iter().position(|it| it.bounds.contains(x, y));
             match &w.kind {
                 Kind::Stack(_) => None,
@@ -882,7 +946,7 @@ impl Ui {
 
     fn takes_focus(&self, i: usize) -> bool {
         let w = &self.widgets[i];
-        w.focusable() && !w.disabled && !w.removed
+        w.focusable() && !w.disabled && !w.removed && !w.hidden
     }
 
     fn focus_on(&mut self, i: usize) {
@@ -945,6 +1009,9 @@ impl Ui {
         }
         if self.widgets[i].disabled {
             return Err(InvokeError::Disabled);
+        }
+        if self.widgets[i].hidden {
+            return Err(InvokeError::Hidden);
         }
         match action {
             Action::Press | Action::Select => Ok(self.activate(i, item)),
@@ -1018,12 +1085,12 @@ impl Ui {
                     AutomationNode::menu(w.id, &w.name, *head, focused, w.disabled, *expanded, ids)
                 }
             };
-            out.push((depth, node));
+            out.push((depth, node.hidden_if(w.hidden)));
             match &w.kind {
                 Kind::List { items, selected } => {
                     for (r, it) in items.iter().enumerate() {
                         let node = AutomationNode::list_item(it.id, &it.name, r, *selected, it.bounds, w.disabled);
-                        out.push((depth + 1, node));
+                        out.push((depth + 1, node.hidden_if(w.hidden)));
                     }
                 }
                 Kind::Menu { .. } => {
@@ -1119,8 +1186,7 @@ impl Ui {
                     Kind::Menu { head, .. } => *head,
                     _ => b,
                 };
-                let ring = Rect::new(r.x() - RING, r.y() - RING, r.w() + 4, r.h() + 4);
-                pen.stroke(ring, p.text);
+                pen.stroke(ring(r), p.text);
             }
         }
     }
@@ -1131,15 +1197,7 @@ const MAX_DAMAGE: usize = 16;
 
 /// A button's size for its name.
 fn button_size(text: &mut dyn Text, name: &str) -> (u32, u32) {
-    (text.width(name) + 2 * BUTTON_PAD_X, text.line_height() + 2 * BUTTON_PAD_Y)
-}
-
-/// A menu's head (empty for anything else).
-fn head_of(k: &Kind) -> Rect {
-    match k {
-        Kind::Menu { head, .. } => *head,
-        _ => Rect::EMPTY,
-    }
+    (text.width(name) + 2 * BUTTON_PAD_X, button_height(text.line_height()))
 }
 
 /// The height of a button (and of a bar's widgets) at a line height.

@@ -376,7 +376,7 @@ impl Wm {
 
     /// The part of window `w` at (`x`, `y`), or `None` outside it (or if
     /// it is minimized): what the picture shows there.
-    pub fn part_at(&self, w: &Window, x: i32, y: i32) -> Option<Part> {
+    fn part_at(&self, w: &Window, x: i32, y: i32) -> Option<Part> {
         if w.minimized {
             None
         } else if w.panel {
@@ -422,8 +422,7 @@ impl Wm {
     /// frame's corner at (`x`, `y`) (moved as [`Wm::move_to`] would to keep
     /// its title bar reachable), in front (behind the panels) and focused.
     pub fn open(&mut self, title: &str, client_w: u32, client_h: u32, x: i32, y: i32) -> (WindowId, Outcome) {
-        let id = WindowId(NonZeroU32::new(self.next_id).expect("window ids start at 1"));
-        self.next_id = self.next_id.checked_add(1).expect("fewer than 2^32 windows in one boot");
+        let id = self.take_id();
         // Clamped by its whole width: at x near i32::MAX, Rect::new would
         // shorten the frame and the strip would land off the screen.
         let (w, _) = self.metrics.frame_size(client_w, client_h);
@@ -437,17 +436,57 @@ impl Wm {
         (id, out)
     }
 
-    /// Opens a panel (#157, the taskbar) at `frame` (its client area: no
-    /// title bar, no border): in front of every window, never focused or
-    /// raised; windows keep their title bar above its rows. Nothing is
-    /// told (the focus doesn't move).
-    pub fn open_panel(&mut self, title: &str, frame: Rect) -> (WindowId, Outcome) {
+    /// The next window id (from 1, never reused).
+    fn take_id(&mut self) -> WindowId {
         let id = WindowId(NonZeroU32::new(self.next_id).expect("window ids start at 1"));
         self.next_id = self.next_id.checked_add(1).expect("fewer than 2^32 windows in one boot");
+        id
+    }
+
+    /// Opens a panel (#157, the taskbar) docked along the bottom of the
+    /// screen, `rows` high and the screen's whole width (its frame is its
+    /// client area: no title bar, no border): in front of every window,
+    /// never focused, raised or moved. Its rows are reserved: every window
+    /// is clamped again so its title bar stays above them (their damage is
+    /// in the outcome), as later opens and moves are. Nothing is told (the
+    /// focus doesn't move).
+    pub fn open_panel(&mut self, title: &str, rows: u32) -> (WindowId, Outcome) {
+        let id = self.take_id();
+        let rows = rows.min(self.height);
+        let frame = Rect::new(0, (self.height - rows) as i32, self.width, rows);
         self.windows.push(Window { id, title: String::from(title), frame, minimized: false, panel: true });
         let mut out = Outcome::default();
         out.damage.add(frame);
+        for at in 0..self.windows.len() {
+            let w = &self.windows[at];
+            if w.panel {
+                continue;
+            }
+            let old = w.frame;
+            let (x, y) = self.clamp(old.w(), old.x(), old.y());
+            let new = Rect::new(x, y, old.w(), old.h());
+            if new != old {
+                self.windows[at].frame = new;
+                out.damage.add(old);
+                out.damage.add(new);
+            }
+        }
         (id, out)
+    }
+
+    /// A drag, grab or box press on window `id` ends (it closed or was
+    /// minimized).
+    fn end_gesture_on(&mut self, id: WindowId) {
+        match self.gesture {
+            Gesture::Grab { id: g } if g == id => {
+                self.counts.grab_ends += 1;
+                self.gesture = Gesture::Ignore;
+            }
+            Gesture::Drag { id: g, .. } | Gesture::CloseBox { id: g } | Gesture::MinimizeBox { id: g } if g == id => {
+                self.gesture = Gesture::Ignore
+            }
+            _ => {}
+        }
     }
 
     /// Removes a window (`None` if it isn't open). If it was focused, the
@@ -459,16 +498,7 @@ impl Wm {
         let mut out = Outcome::default();
         let w = self.windows.remove(at);
         out.damage.add(w.frame);
-        match self.gesture {
-            Gesture::Grab { id: g } if g == id => {
-                self.counts.grab_ends += 1;
-                self.gesture = Gesture::Ignore;
-            }
-            Gesture::Drag { id: g, .. } | Gesture::CloseBox { id: g } | Gesture::MinimizeBox { id: g } if g == id => {
-                self.gesture = Gesture::Ignore
-            }
-            _ => {}
-        }
+        self.end_gesture_on(id);
         if self.focused == Some(id) {
             self.focused = None;
             let next = self.front();
@@ -504,16 +534,7 @@ impl Wm {
         let mut out = Outcome::default();
         self.windows[at].minimized = true;
         out.damage.add(self.windows[at].frame);
-        match self.gesture {
-            Gesture::Grab { id: g } if g == id => {
-                self.counts.grab_ends += 1;
-                self.gesture = Gesture::Ignore;
-            }
-            Gesture::Drag { id: g, .. } | Gesture::CloseBox { id: g } | Gesture::MinimizeBox { id: g } if g == id => {
-                self.gesture = Gesture::Ignore
-            }
-            _ => {}
-        }
+        self.end_gesture_on(id);
         if self.focused == Some(id) {
             let next = self.front();
             self.set_focus(next, &mut out);
@@ -538,10 +559,10 @@ impl Wm {
     /// the whole title bar visible above the panels' rows
     /// ([`Wm::work_height`]), and at least `strip` pixels of its
     /// width (or all of it, if narrower) on the screen. `None` if it isn't
-    /// open.
+    /// open, or is a panel (docked).
     #[must_use = "its damage must be repainted and its deliveries queued"]
     pub fn move_to(&mut self, id: WindowId, x: i32, y: i32) -> Option<Outcome> {
-        let at = self.windows.iter().position(|w| w.id == id)?;
+        let at = self.windows.iter().position(|w| w.id == id && !w.panel)?;
         let mut out = Outcome::default();
         let old = self.windows[at].frame;
         let (x, y) = self.clamp(old.w(), x, y);
@@ -567,7 +588,12 @@ impl Wm {
     ///   if none were, the next press is a press as usual.
     /// - **A key gap:** the focused window is told `Lost` (it releases its
     ///   keys, and its buttons too); a grab on it ends (its buttons are
-    ///   ignored until up), a title-bar drag goes on.
+    ///   ignored until up), a title-bar drag goes on. A panel's grab goes
+    ///   on too (a panel has no keys).
+    ///
+    /// A panel's grab (#157: a press on the taskbar, which isn't the
+    /// focused window) ends on a pause or a pointer gap, the panel told
+    /// `Lost`.
     ///
     /// While paused, nothing (a second pause does nothing either).
     pub fn interrupt(&mut self, why: Interruption) -> Outcome {
@@ -579,13 +605,19 @@ impl Wm {
             Interruption::Pause => Delivery::FocusLost,
             Interruption::Gap | Interruption::KeyGap => Delivery::Lost,
         }));
-        let grabbing = matches!(self.gesture, Gesture::Grab { .. });
-        // A panel's grab (#157) isn't the focused window's: the panel is
-        // told it lost its buttons too.
-        if let Gesture::Grab { id } = self.gesture
-            && Some(id) != self.focused
+        let grab = match self.gesture {
+            Gesture::Grab { id } => Some(id),
+            _ => None,
+        };
+        // A panel's grab (#157) isn't the focused window's. A key gap
+        // leaves it alone (a panel has no keys); a pause or a pointer gap
+        // ends it, the panel told it lost its buttons.
+        let panel_grab = grab.filter(|&g| Some(g) != self.focused);
+        let grabbing = grab.is_some() && !(why == Interruption::KeyGap && panel_grab.is_some());
+        if let Some(p) = panel_grab
+            && why != Interruption::KeyGap
         {
-            out.deliveries.push(Delivery::Lost(id));
+            out.deliveries.push(Delivery::Lost(p));
         }
         match why {
             Interruption::Pause => {
@@ -750,8 +782,9 @@ impl Wm {
             return;
         };
         if at + 1 != self.front_slot() {
-            // The focused window is always the front one (behind the
-            // panels), so a raise comes with a focus change, whose damage
+            // The focused window is always the front one that isn't
+            // minimized (behind the panels), so a raise comes with a focus
+            // change, whose damage
             // covers this frame too; this keeps a raise correct on its own.
             let w = self.windows.remove(at);
             out.damage.add(w.frame);
