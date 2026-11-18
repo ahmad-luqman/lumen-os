@@ -1620,7 +1620,9 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   write holds the log's line lock with interrupts off): text as lines, a
   table as its
   headings and rows (two-space indent, columns two spaces apart and as
-  wide as the widest value, a left-aligned last one unpadded). Alone, a
+  wide as the widest value, a left-aligned last one unpadded; a text cell
+  that wouldn't read back as one word is double-quoted: section 11,
+  "Records quote"). Alone, a
   filter says it goes after a `|`. After a `|`, Tab completes only the
   filters' names.
 - **Tests:** `cargo:lumen-shell`; `test_shell` (echo with quotes on both
@@ -3429,7 +3431,7 @@ from what they compare.
 | Lock | Holds | Held for |
 |---|---|---|
 | `desktop::COMPOSITOR` | the window list (`lumen-wm`), the gathered damage, the requests, the statistics | a few list operations, a snapshot |
-| a window's lock | its committed surface, its event queue, its flags, its toolkit's published tree | 16 rows of a commit or a blit, one queue operation, swapping in a tree |
+| a window's lock | its committed surface, its event queue, its flags, its toolkit's published tree | 16 rows of a commit or a blit, one queue operation, putting a tree in place, copying a tree for `ui tree` or scanning it for a node |
 | a `ui invoke` reply's lock (`ui::ReplyCell`, #156) | the reply's state | one transition (a leaf: taken under its wait queue's lock by the asker's wake-up check, and never held across a wake) |
 | `vt::CUT` | the cut | a read or a write (a leaf) |
 | `desktop::BOOT_WALLPAPER` | the embedded wallpaper's decode, once done (#154) | a read or a write of two `Arc`s (a leaf: nothing allocated or freed under it) |
@@ -3685,12 +3687,13 @@ impl Role { pub fn actions(self) -> &'static [ActionKind]; }
   the state it starts from: `Pending` to `Running` (the owner, when it
   takes the request: `ui::Request::start` gives a `Started`, the only
   thing that can answer it) or `Cancelled` (the asker, at its 1 s
-  deadline); `Running` to `Done(result)`; `Done` to `Taken` (the asker
-  takes it). Each answer (`Done`) wakes the asker. The owner skips a
-  cancelled request (`cancelled`). If the asker's
-  swap fails because the owner already runs it, the asker waits a second
-  1 s: a result then is printed as "ran late" with the row (`late`
-  counts it), and none gives "still running" (its answer, if it comes,
+  deadline); `Pending` to `Done` (its window closed, or it was dropped,
+  before it ran); `Running` to `Done(result)`; `Done` to `Taken` (the
+  asker takes it). Each answer (`Done`) wakes the asker. The owner skips a
+  cancelled request; the asker counts it (`cancelled`). If the asker's
+  cancel fails because the owner already runs it, the asker waits a second
+  1 s: a result then is printed with "ran late" above its row or message
+  (`late` counts it), and none gives "still running" (its answer, if it comes,
   lands for nobody: not counted). Destroying the window answers its
   `Pending` requests with "window closed"; a request dropped before it ran
   answers itself the same way in its `Drop`, and a `Started` dropped
@@ -3702,8 +3705,9 @@ impl Role { pub fn actions(self) -> &'static [ActionKind]; }
   late" with its row, or with its message, as done. `cargo:lumen-ui` checks that a request cancelled at its
   deadline and then reached by the owner leaves the state unchanged.
 - **Reading the tree:** a toolkit window publishes a snapshot of its tree
-  after each change (`WindowHandle::publish`: built, then swapped in under
-  the window's lock), so `ui tree` reads it without asking the owner. A
+  after each change (`WindowHandle::publish`: built by the owner, then
+  put in place under the window's lock), so `ui tree` reads it without
+  asking the owner. A
   window's root's bounds are its client area.
 - **In the kernel** (`kernel/src/ui.rs`): `ui::Toolkit` is a toolkit in a
   window: the UI font through `lumen_ui::Text` (`font::Text` at
@@ -3720,21 +3724,26 @@ impl Role { pub fn actions(self) -> &'static [ActionKind]; }
   kernel keeps it behind a lock with the asker's wait queue
   (`ui::ReplyCell`). The palette starts from `WindowHandle::theme()` and
   follows every `Theme` event (`ui::palette(&Theme)`, then
-  `Ui::invalidate()` repaints the whole tree): a toolkit window's first
-  event, `Theme`, is its first draw. The harness's `ui_tree`, `node`, `wait_ui`,
+  `Ui::invalidate()` repaints the whole tree): Counter's first event,
+  `Theme`, is its first draw (`desktop spin`'s window draws a frame of its
+  bar first, then reads its events). The harness's `ui_tree`, `node`, `wait_ui`,
   `invoke`, `parse_invoke` and `desktop_counter` are in `gui.py`.
 
 **The commands** print records, so the pipelines work on them (`where`
 compares with `=`). **Records quote** (every records command, from the
 shared printer, `lumen_shell::pipe::quoted`): a text cell that is empty,
-contains whitespace, or is exactly `-` prints double-quoted (`"` and `\`
-escaped by a backslash), as the shell's word splitting reads it back, so
-each row splits into its cells (the harness's `parse_records` uses
-`shlex`) and `where name = "File name"` works; a bare `-` is always an
-absent value. So `cpus`' "not started", `lspci`'s names and drivers,
+is exactly `-`, or holds whitespace, a quote (`'`, `"`), a backslash, a
+`#` or a control character prints double-quoted, with `"` and `\` escaped
+by a backslash (the only escapes both the shell's splitter and POSIX
+`shlex` take inside double quotes) and each control character printed as
+U+FFFD (neither has an escape for one). So every row reads back into its
+cells, as the shell's words or `shlex` split them (a randomized host test;
+the harness's `parse_records` uses `shlex`), and `where name = "File
+name"` works; a bare `-` is always an absent value. The cells it quotes
+today: `cpus`' "not started", `lspci`'s names, classes and drivers,
 `irqs`' uses ("local APIC timer", "msix <addr> #0"), `mouse`'s buttons
-("left right") and `sound`'s formats print quoted (a `-` meaning none, as
-in `kbd events`' mods, is an absent value, unquoted).
+("left right"), `sound`'s state, and `kbd events`' text (`"'a'"`); a `-`
+meaning none (`kbd events`' mods) is an absent value, unquoted.
 
 - `windows`, one row per window, front to back:
 
