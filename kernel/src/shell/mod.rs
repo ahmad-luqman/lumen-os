@@ -161,10 +161,9 @@ pub trait Console: Write + Send {
     /// Whether it has gone (its window closed): from then on it gives
     /// `Key::Closed` for every key asked (`read_key` and `try_key`), which
     /// every reader stops on, and the shell on it ends after the key or
-    /// command under way.
-    fn closed(&self) -> bool {
-        false
-    }
+    /// command under way. No default: a console wrapping another says the
+    /// one it wraps.
+    fn closed(&self) -> bool;
     /// Whether what is written goes to the next command in a pipeline.
     /// (A console overrides both this and [`Console::fail`], or neither.)
     fn piped(&self) -> bool {
@@ -459,6 +458,10 @@ impl Console for Serial {
         term::Place::Anywhere
     }
 
+    fn closed(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str {
         "serial"
     }
@@ -543,6 +546,10 @@ impl Console for Screen {
         term::Place::Vt(self.vt)
     }
 
+    fn closed(&self) -> bool {
+        false
+    }
+
     fn read_key(&mut self) -> Key {
         loop {
             if let Some(key) = self.take(crate::vt::wait_key(self.vt)) {
@@ -572,6 +579,11 @@ pub struct Captured {
     pub text: String,
     pub keys: alloc::collections::VecDeque<Key>,
     pub ran_dry: bool,
+    /// How many polls in a row may find no key before one gives Ctrl-C
+    /// ([`Captured::DRY_POLLS`] if `None`): a test expecting its own key to
+    /// stop a command at once sets a few, so a regression fails by name
+    /// rather than spinning through the default.
+    pub dry_polls: Option<u32>,
     /// Polls in a row that found no key.
     empty_polls: u32,
 }
@@ -601,6 +613,10 @@ impl Console for Captured {
         term::Place::Anywhere
     }
 
+    fn closed(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str {
         "the test console"
     }
@@ -612,7 +628,7 @@ impl Console for Captured {
     fn try_key(&mut self) -> Option<Key> {
         let key = self.keys.pop_front();
         self.empty_polls = if key.is_some() { 0 } else { self.empty_polls + 1 };
-        if self.empty_polls >= Self::DRY_POLLS {
+        if self.empty_polls >= self.dry_polls.unwrap_or(Self::DRY_POLLS) {
             self.empty_polls = 0;
             return Some(self.dry());
         }

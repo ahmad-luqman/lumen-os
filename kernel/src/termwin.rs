@@ -103,7 +103,10 @@ struct Shared {
 }
 
 impl Shared {
+    /// A new window's: busy (`Waker::set_busy`) until its shell first waits
+    /// for a key with none queued.
     fn new(id: u32, owner: Waker) -> Arc<Shared> {
+        owner.set_busy(true);
         Arc::new(Shared {
             id,
             term: SpinLock::new(Terminal::new(COLS, ROWS, SCROLLBACK)),
@@ -121,19 +124,33 @@ impl Shared {
         self.key_wait.wake_all();
     }
 
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     /// Queue `key` for the shell and wake it; a key past [`KEYS_MAX`] is
-    /// dropped and counted, the window's first drop warned about.
+    /// dropped and counted, the window's first drop warned about. The
+    /// window is marked busy under the keys' lock with the key queued, so
+    /// "a key queued or the shell running" and "busy" agree at every
+    /// instant (the window held first, so its last reference never goes
+    /// under that lock).
     fn give(&self, key: Key) {
+        let live = self.owner.live();
         let first_drop = {
             let mut k = self.keys.lock();
-            if k.queue.len() < KEYS_MAX {
+            let first_drop = if k.queue.len() < KEYS_MAX {
                 k.queue.push_back(key);
                 false
             } else {
                 k.dropped += 1;
                 k.dropped == 1
+            };
+            if let Some(w) = &live {
+                w.set_busy(true);
             }
+            first_drop
         };
+        drop(live);
         self.key_wait.wake_all();
         if first_drop {
             log::warn!(target: "termwin", "terminal window {}: its shell isn't reading: dropping keys", self.id);
@@ -165,7 +182,7 @@ fn client_size() -> (u32, u32) {
 }
 
 /// The `n`th (from 1) terminal window's frame corner.
-fn place(n: u32) -> (i32, i32) {
+fn corner(n: u32) -> (i32, i32) {
     let k = (n.saturating_sub(1) % 16) as i32;
     (FIRST_AT.0 + (k % 2) * STEP.0, FIRST_AT.1 + (k / 2) * STEP.1)
 }
@@ -179,7 +196,7 @@ pub fn open() -> Result<u32, String> {
     let n = OPENED.fetch_add(1, Ordering::Relaxed) + 1;
     let title = format!("Terminal-{n}");
     let (w, h) = client_size();
-    let (x, y) = place(n);
+    let (x, y) = corner(n);
     let handle = match desktop::open_window_at(&title, w, h, x, y) {
         Ok(handle) => handle,
         Err(e) => {
@@ -200,8 +217,6 @@ pub fn open() -> Result<u32, String> {
         open.retain(|w| w.strong_count() > 0);
         open.push(Arc::downgrade(&shared));
     }
-    // Busy until its shell first waits for a key.
-    shared.owner.set_busy(true);
     // The shell first (its prompt waits in the grid for the owner's first
     // drawing); a failure drops the handle, which closes the window.
     let console = WindowConsole { shared: shared.clone() };
@@ -229,12 +244,11 @@ struct View {
 impl View {
     /// Take one event from the window; whether it is the close.
     fn take(&mut self, shared: &Shared, e: WindowEvent) -> bool {
-        let now = crate::time::now_ns();
         match e {
             WindowEvent::Close => return true,
             WindowEvent::Key(k) => take_key(shared, k),
             WindowEvent::FocusGained => {
-                (self.focused, self.blink_on, self.next_blink) = (true, true, now + BLINK_NS);
+                (self.focused, self.blink_on, self.next_blink) = (true, true, crate::time::now_ns() + BLINK_NS);
             }
             WindowEvent::FocusLost => self.focused = false,
             // The terminal keeps the console's palette whatever the theme
@@ -245,17 +259,8 @@ impl View {
             WindowEvent::Lost => {}
             // No mouse in a terminal yet.
             WindowEvent::PointerDown { .. } | WindowEvent::PointerMove { .. } | WindowEvent::PointerUp { .. } => {}
-            // A terminal window publishes no nodes: `ui invoke` reaches only
-            // its root, whose `focus` the compositor answers and whose
-            // `close` comes as `Close`, so no widget request can arrive.
-            // One that does is answered as `ui invoke` answers a node it
-            // can't find, never dropped (a dropped request would answer
-            // "closed before it ran").
-            WindowEvent::Request(req) => {
-                if let Ok(started) = req.start() {
-                    started.finish(crate::ui::Answer::Ran(lumen_ui::Served::Error(lumen_ui::InvokeError::NoNode)));
-                }
-            }
+            // No toolkit, no nodes: only its root takes actions (`ui::refuse`).
+            WindowEvent::Request(req) => crate::ui::refuse(req),
         }
         false
     }
@@ -315,9 +320,13 @@ fn owner(mut h: WindowHandle, shared: Arc<Shared>, shell: sched::JoinHandle) {
     // finish a command.
     drop(h);
     shell.join();
-    let id = shared.id;
+    let (id, dropped) = (shared.id, shared.keys.lock().dropped);
     drop(shared);
-    log::debug!(target: "termwin", "terminal window {id} closed, its shell joined");
+    if dropped > 0 {
+        log::warn!(target: "termwin", "terminal window {id} closed, its shell joined; {dropped} keys typed in it were dropped");
+    } else {
+        log::debug!(target: "termwin", "terminal window {id} closed, its shell joined");
+    }
 }
 
 /// A key press from the window: Shift+PageUp/PageDown scroll its view,
@@ -426,9 +435,21 @@ impl crate::shell::Console for WindowConsole {
                 return key;
             }
             let s = &self.shared;
-            s.owner.set_busy(false);
-            s.key_wait.wait_until(|| s.closed.load(Ordering::Acquire) || !s.keys.lock().queue.is_empty());
-            s.owner.set_busy(true);
+            // Not busy from here: cleared under the keys' lock, only if the
+            // queue is still empty (`give` sets it there with a key) and the
+            // console open.
+            let live = s.owner.live();
+            {
+                let k = s.keys.lock();
+                if k.queue.is_empty()
+                    && !s.is_closed()
+                    && let Some(w) = &live
+                {
+                    w.set_busy(false);
+                }
+            }
+            drop(live);
+            s.key_wait.wait_until(|| s.is_closed() || !s.keys.lock().queue.is_empty());
         }
     }
 
@@ -448,7 +469,7 @@ impl crate::shell::Console for WindowConsole {
     }
 
     fn closed(&self) -> bool {
-        self.shared.closed.load(Ordering::Acquire)
+        self.shared.is_closed()
     }
 }
 
@@ -460,7 +481,7 @@ pub fn view_text(id: u32) -> Result<ViewText, String> {
         .lock()
         .iter()
         .filter_map(Weak::upgrade)
-        .find(|s| s.id == id && !s.closed.load(Ordering::Acquire))
+        .find(|s| s.id == id && !s.is_closed())
         .ok_or_else(|| format!("no terminal window {id}"))?;
     Ok(shared.view_text())
 }
@@ -486,8 +507,6 @@ fn test_shared(d: &desktop::Desktop) -> Result<(Arc<Shared>, WindowHandle), &'st
     let mut h = d.open_window("t", 64, 64).map_err(|_| "a window")?;
     while h.next_event().is_some() {}
     let shared = Shared::new(h.id(), h.waker());
-    // Busy until its shell first waits for a key, as `open` makes it.
-    shared.owner.set_busy(true);
     Ok((shared, h))
 }
 
@@ -507,17 +526,26 @@ fn type_text(shared: &Shared, text: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Wait (polling, at most 10 s) until `done` holds of `shared`'s view.
+/// Wait (polling, at most 10 s) until `done` holds.
 #[cfg(feature = "ktest")]
-fn wait_view(shared: &Shared, done: impl Fn(&ViewText) -> bool) -> Result<(), &'static str> {
+fn wait_until(what: &'static str, done: impl Fn() -> bool) -> Result<(), &'static str> {
     let deadline = crate::time::now_ns() + 10_000_000_000;
-    while !done(&shared.view_text()) {
+    while !done() {
         if crate::time::now_ns() >= deadline {
-            return Err("the view never showed it");
+            return Err(what);
         }
         let _ = sched::sleep(5_000_000);
     }
     Ok(())
+}
+
+/// Wait until `shared`'s shell waits at its prompt with no key queued (its
+/// window not busy).
+#[cfg(feature = "ktest")]
+fn wait_prompt(shared: &Shared, h: &WindowHandle) -> Result<(), &'static str> {
+    wait_until("the shell never waited at its prompt", || {
+        !h.is_busy() && shared.view_text().rows.iter().any(|r| r == "lumen>")
+    })
 }
 
 crate::ktest!(
@@ -555,14 +583,35 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn a_key_given_to_the_shell_makes_its_window_busy_at_once() {
+        // "A key queued or the shell running" and "busy" agree at every
+        // instant: a new window is busy until its shell waits at its prompt,
+        // and a key handed to it marks the window busy before the shell has
+        // run at all (no yield between).
+        use crate::kassert;
+        let d = desktop::Desktop::without_screen();
+        let (shared, h) = test_shared(&d)?;
+        kassert!(h.is_busy());
+        let _close = CloseAfter(shared.clone());
+        let shell = test_shell(&shared)?;
+        wait_prompt(&shared, &h)?;
+        shared.give(Key::Char('x'));
+        kassert!(h.is_busy());
+        shared.close();
+        sched::join_bounded(shell)?;
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn closing_a_window_ends_what_its_shell_runs() {
         // Each command waiting in a terminal window when the window closes
         // ends on its console's `Key::Closed` (where Ctrl-C would only
         // restart `rhai`'s prompt), then the shell, so the owner's join
         // returns (bounded here): `rhai`'s REPL waiting for a line, `top`
         // polling for q between frames, a script in a loop (its Ctrl-C
-        // check). Meanwhile the shell keeps its window busy while a command
-        // runs (not while the REPL waits for a key: idle).
+        // check). The window is busy while a command runs, not while the
+        // shell (or the REPL) waits for a key.
         use crate::kassert;
         let d = desktop::Desktop::without_screen();
         let cases =
@@ -571,9 +620,10 @@ crate::ktest!(
             let (shared, h) = test_shared(&d)?;
             let _close = CloseAfter(shared.clone());
             let shell = test_shell(&shared)?;
+            wait_prompt(&shared, &h)?;
             type_text(&shared, command)?;
             type_text(&shared, "\n")?;
-            wait_view(&shared, |v| v.rows.iter().any(|r| r.starts_with(started)))?;
+            wait_until("the command never started", || shared.view_text().rows.iter().any(|r| r.starts_with(started)))?;
             let _ = sched::sleep(50_000_000);
             kassert!(shared.keys.lock().queue.is_empty());
             kassert!(h.is_busy() == busy);
@@ -600,12 +650,12 @@ crate::ktest!(
         let shell = sched::spawn("ktest-busy-shell", move || r.0.wait_until(|| r.1.load(Ordering::Acquire)))
             .map_err(|_| "spawn failed")?;
         let id = h.id();
-        let (o, closer) = (shared.clone(), desktop::test_closer(&d, id));
+        let o = shared.clone();
         let owner_thread = sched::spawn("ktest-owner", move || owner(h, o, shell)).map_err(|_| "spawn failed")?;
         let _ = sched::sleep(20_000_000);
-        closer()?;
+        d.request_close(id)?;
         let _ = sched::sleep(50_000_000);
-        kassert!(shared.closed.load(Ordering::Acquire));
+        kassert!(shared.is_closed());
         kassert!(owner_thread.thread().state() != sched::State::Dead);
         release.1.store(true, Ordering::Release);
         release.0.wake_all();
@@ -617,16 +667,50 @@ crate::ktest!(
 crate::ktest!(
     fn keys_past_the_queue_s_room_are_dropped_and_counted() {
         // A shell that doesn't read (a long `sleep`) while keys come: the
-        // queue keeps `KEYS_MAX`, drops the rest and counts them.
+        // queue keeps `KEYS_MAX`, drops the rest and counts them, and the
+        // first drop is warned about once.
         use crate::kassert_eq;
+        const SAID: &str = "its shell isn't reading: dropping keys";
         let d = desktop::Desktop::without_screen();
         let (shared, _h) = test_shared(&d)?;
+        let before = desktop::logged(SAID)?;
         for _ in 0..KEYS_MAX + 3 {
             shared.give(Key::Char('x'));
         }
-        let k = shared.keys.lock();
-        kassert_eq!(k.queue.len(), KEYS_MAX);
-        kassert_eq!(k.dropped, 3);
+        {
+            let k = shared.keys.lock();
+            kassert_eq!(k.queue.len(), KEYS_MAX);
+            kassert_eq!(k.dropped, 3);
+        }
+        kassert_eq!(desktop::logged(SAID)? - before, 1);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_request_to_a_terminal_window_is_answered_no_node() {
+        // A terminal window has no toolkit: a request that reaches its
+        // owner (`ui invoke` reaches only its root, so none should) is
+        // answered "no node", not dropped.
+        use crate::kassert;
+        let d = desktop::Desktop::without_screen();
+        let (shared, mut h) = test_shared(&d)?;
+        let (req, cell) = crate::ui::Request::new(1, lumen_ui::Action::Press);
+        kassert!(d.push_request(h.id(), req).is_ok());
+        let mut view = View {
+            renderer: Renderer::new(COLS, ROWS),
+            cell_w: term::cell_width(),
+            focused: false,
+            blink_on: true,
+            next_blink: 0,
+        };
+        let e = h.next_event().ok_or("no request queued")?;
+        kassert!(!view.take(&shared, e));
+        let served = cell.take();
+        kassert!(matches!(
+            served,
+            Some(crate::ui::Answer::Ran(lumen_ui::Served::Error(lumen_ui::InvokeError::NoNode)))
+        ));
         Ok(())
     }
 );
@@ -665,18 +749,22 @@ crate::ktest!(
 
 crate::ktest!(
     fn a_window_s_scrolled_pixels_match_a_full_repaint() {
-        // More lines than the grid's rows, drawn a line at a time (each line
-        // feed at the bottom moving the surface's rows), then the same
-        // terminal drawn whole on a fresh surface: every pixel equal.
+        // More lines than the grid's rows, each drawn twice: once its text
+        // (on a coloured background, up to the last pixel row of its
+        // cells), then again after its line feed (at the bottom, the
+        // surface's rows moved); then the same terminal drawn whole on a
+        // fresh surface: every pixel equal.
         use crate::kassert;
         let cell_w = term::cell_width();
-        let (w, h) = ((COLS * cell_w + 2 * PAD) as u32, (ROWS * CELL_H + 2 * PAD) as u32);
+        let (w, h) = client_size();
         let mut stepped = Surface::new(w, h);
         stepped.fill(fb::BG);
         let mut t = Terminal::new(COLS, ROWS, SCROLLBACK);
         let mut r = Renderer::new(COLS, ROWS);
         for i in 0..ROWS + 7 {
-            term::write_text(&mut t, &format!("line {i}: \x1b[3{}m{}\x1b[0m\n", i % 8, "#".repeat(i % 20)));
+            term::write_text(&mut t, &format!("\x1b[4{}mline {i}: {}\x1b[0m", i % 8, "#".repeat(i % 20)));
+            let _ = render_on(&mut stepped, &mut r, &mut t, cell_w, Some(CursorLook::Solid));
+            term::write_text(&mut t, "\n");
             let _ = render_on(&mut stepped, &mut r, &mut t, cell_w, Some(CursorLook::Solid));
         }
         let mut whole = Surface::new(w, h);

@@ -915,11 +915,32 @@ impl Waker {
 
     /// Mark the window busy (work for it is under way on another thread)
     /// or not: `desktop status`'s `settled` waits for every window to be
-    /// clear of it. A window opens not busy.
+    /// clear of it. A window opens not busy. One writer at a time: the
+    /// thread that hands off the work sets it before the hand-off is seen
+    /// (a terminal window's owner giving its shell a key), and the thread
+    /// that ends it clears it once nothing is left (the shell, waiting for
+    /// a key with none queued); no third party touches it.
     pub fn set_busy(&self, busy: bool) {
-        if let Some(w) = self.0.upgrade() {
-            w.busy.store(busy, Ordering::Release);
+        if let Some(w) = self.live() {
+            w.set_busy(busy);
         }
+    }
+
+    /// The window, held for a moment, if it is still open: so a caller can
+    /// set its busy bit under a lock of its own without the last reference
+    /// to the window going (and the window being freed) under that lock.
+    pub fn live(&self) -> Option<LiveWindow> {
+        self.0.upgrade().map(LiveWindow)
+    }
+}
+
+/// A window held for a moment through its [`Waker`] (see [`Waker::live`]).
+pub struct LiveWindow(Arc<Window>);
+
+impl LiveWindow {
+    /// [`Waker::set_busy`], on the window held.
+    pub fn set_busy(&self, busy: bool) {
+        self.0.busy.store(busy, Ordering::Release);
     }
 }
 
@@ -934,12 +955,16 @@ pub enum Animating {
     No,
 }
 
-/// How a [`WindowHandle::wait_event_until`] ended.
+/// How a [`WindowHandle::wait_event_until`] ended. An event must be
+/// taken; the other two say only that the owner should look again at its
+/// own state (what another thread changed, the time).
 #[derive(Debug)]
+#[must_use = "an event the wait returned must be taken, or it is lost"]
 pub enum Wait {
     /// An event for the owner.
     Event(WindowEvent),
-    /// A [`Waker`] woke it: look at what the other thread changed.
+    /// A [`Waker`] woke it (or one did since the last wait): re-check your
+    /// own state.
     Woken,
     /// The deadline passed.
     Deadline,
@@ -1031,6 +1056,8 @@ impl WindowHandle {
     /// The next event, waiting for one: blocked until the owner has one
     /// (something queued, or a theme to be told of), the window counting as
     /// idle meanwhile (`desktop status`'s `settled`).
+    /// Built on [`Self::wait_event_until`], it takes (and ignores) a
+    /// [`Waker`]'s pokes: an owner that waits here hands no `Waker` out.
     pub fn wait_event(&mut self) -> WindowEvent {
         loop {
             if let Wait::Event(e) = self.wait_event_until(None, Animating::No) {
@@ -1047,21 +1074,20 @@ impl WindowHandle {
     /// terminal window's owner (#155) waits here for keys, its shell's
     /// output and, while focused, its cursor's next blink (animating).
     pub fn wait_event_until(&mut self, deadline: Option<u64>, animating: Animating) -> Wait {
+        debug_assert!(
+            deadline.is_some() || animating == Animating::No,
+            "an animating wait needs its next frame's deadline"
+        );
         if let Some(e) = self.next_event() {
             return Wait::Event(e);
         }
         if self.win.poked.swap(false, Ordering::AcqRel) {
             return Wait::Woken;
         }
-        let idle = animating == Animating::No;
-        if idle {
-            self.win.idle.store(true, Ordering::Release);
-        }
+        self.win.idle.store(animating == Animating::No, Ordering::Release);
         let win = &self.win;
         let woke = win.wait(deadline, || win.poked.load(Ordering::Acquire));
-        if idle {
-            self.win.idle.store(false, Ordering::Release);
-        }
+        self.win.idle.store(false, Ordering::Release);
         if let Some(e) = self.next_event() {
             return Wait::Event(e);
         }
@@ -2284,6 +2310,8 @@ fn demo_owner(mut h: WindowHandle, demo: Demo) {
                 let line = draw_last_key(&mut h, theme, text.as_mut(), last);
                 h.commit(&[line]);
             }
+            // No toolkit, no nodes: only its root takes actions.
+            WindowEvent::Request(req) => crate::ui::refuse(req),
             _ => {}
         }
     }
@@ -2644,8 +2672,14 @@ fn windows_quiet(s: &State) -> (bool, bool) {
     for w in &s.windows {
         let queue_idle = w.inner.lock().queue.is_idle();
         told &= !w.pending.theme_behind();
+        let waiting = w.idle.load(Ordering::Acquire);
+        // After the idle bit: whoever hands work to the window's other
+        // thread (its owner giving a terminal's shell a key) sets busy
+        // before the owner can idle again, so a look that finds the owner
+        // idle finds that busy too; and a wake a thread made before the
+        // owner idled is still set if the owner hasn't taken it.
         let clear = !w.busy.load(Ordering::Acquire) && !w.poked.load(Ordering::Acquire);
-        idle &= queue_idle && clear && w.idle.load(Ordering::Acquire);
+        idle &= queue_idle && waiting && clear;
     }
     (idle, told)
 }
@@ -2673,7 +2707,9 @@ struct Settled {
     committing: bool,
     pending: bool,
     /// Every window's queue is idle and its owner waits (blocked in
-    /// `wait_event`); read after `themes_told` for each window.
+    /// `wait_event` or a `wait_event_until` that isn't animating), no
+    /// other thread marks it busy and no wake waits to be taken (#155);
+    /// read after `themes_told` for each window (`windows_quiet`).
     windows_idle: bool,
     /// A `ui invoke` request was pushed and its asker isn't done with it
     /// yet.
@@ -3183,13 +3219,7 @@ crate::ktest!(
             kassert!(saw_idle.load(Ordering::Acquire) == idles);
             kassert!(!h.win.idle.load(Ordering::Acquire));
         }
-        {
-            let mut g = d.home.lock();
-            let s = g.as_mut().ok_or("the state")?;
-            let id = s.wm.id(h.id()).ok_or("its id")?;
-            let mut after = After::default();
-            let _ = s.push(id, &mut after, |q| Some(q.push(Entry::Key(test_key()))));
-        }
+        d.push_key(h.id(), test_key())?;
         let got = h.wait_event_until(Some(crate::time::now_ns() + 5_000_000_000), Animating::No);
         kassert!(matches!(got, Wait::Event(WindowEvent::Key(_))));
         kassert!(h.next_event().is_none());
@@ -3268,22 +3298,30 @@ crate::ktest!(
     }
 );
 
-/// Something that clicks window `id`'s close box on `d` (its `Close`
-/// queued, its owner woken), for the ktests of owners on a desktop with no
-/// screen.
 #[cfg(feature = "ktest")]
-pub fn test_closer(d: &Desktop, id: u32) -> impl FnOnce() -> Result<(), &'static str> {
-    let home = d.home.clone();
-    move || {
+impl Desktop {
+    /// Click window `id`'s close box (its `Close` queued, its owner woken),
+    /// for the ktests of owners on a desktop with no screen.
+    pub fn request_close(&self, id: u32) -> Result<(), &'static str> {
+        self.push_entry(id, |q| {
+            q.request_close();
+            None
+        })
+    }
+
+    /// Queue key event `k` for window `id`, as the compositor delivers one
+    /// (for the ktests).
+    pub fn push_key(&self, id: u32, k: KeyEvent) -> Result<(), &'static str> {
+        self.push_entry(id, |q| Some(q.push(Entry::Key(k))))
+    }
+
+    fn push_entry(&self, id: u32, f: impl FnOnce(&mut Queue) -> Option<Pushed>) -> Result<(), &'static str> {
         let mut after = After::default();
         {
-            let mut g = home.lock();
+            let mut g = self.home.lock();
             let s = g.as_mut().ok_or("the state")?;
             let wid = s.wm.id(id).ok_or("no such window")?;
-            let _ = s.push(wid, &mut after, |q| {
-                q.request_close();
-                None
-            });
+            let _ = s.push(wid, &mut after, f);
         }
         after.finish();
         Ok(())
@@ -3293,7 +3331,7 @@ pub fn test_closer(d: &Desktop, id: u32) -> impl FnOnce() -> Result<(), &'static
 /// How many lines of the kernel log (as much as its ring holds) contain
 /// `what`: compared before and after, to tell a warning was logged.
 #[cfg(feature = "ktest")]
-fn logged(what: &str) -> Result<usize, &'static str> {
+pub(crate) fn logged(what: &str) -> Result<usize, &'static str> {
     let mut log = alloc::vec![0u8; crate::klog::RING_BYTES];
     let (n, _) = crate::klog::copy_recent(&mut log);
     let log = core::str::from_utf8(&log[..n]).map_err(|_| "the log isn't UTF-8")?;

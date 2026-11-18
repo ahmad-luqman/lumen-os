@@ -891,7 +891,9 @@ crate::ktest!(
         kassert!(text.ends_with("top: done after 1 frames\n"));
         kassert!(!text.contains('\x1b'));
         for key in [Key::Char('q'), Key::Ctrl('c'), Key::Closed] {
-            let mut console = super::Captured::default();
+            // A few polls without a key, not 100 000 (each sleeping): a top
+            // that misses its key fails here by name.
+            let mut console = super::Captured { dry_polls: Some(3), ..Default::default() };
             console.keys.push_back(key);
             top(&mut Ctx::new(&mut console, false, &history), &[]);
             kassert!(!console.ran_dry);

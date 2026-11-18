@@ -165,6 +165,18 @@ impl Started {
     }
 }
 
+/// Answer `req` for a window without a toolkit (a demo, a terminal window,
+/// #155): it publishes no nodes, so `ui invoke` reaches only its root (whose
+/// `focus` the compositor answers and whose `close` comes as `Close`), and
+/// a request that still arrives is answered as `ui invoke` answers a node
+/// it can't find: never dropped (that would answer "closed before it
+/// ran"). One cancelled at its asker's deadline is skipped.
+pub fn refuse(req: Request) {
+    if let Ok(started) = req.start() {
+        started.finish(Answer::Ran(Served::Error(InvokeError::NoNode)));
+    }
+}
+
 impl Drop for Started {
     fn drop(&mut self) {
         if let Some(cell) = self.cell.take() {

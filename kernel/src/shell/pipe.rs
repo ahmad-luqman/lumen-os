@@ -50,6 +50,12 @@ impl<'a> Capture<'a> {
     fn new(console: &'a mut dyn Console) -> Capture<'a> {
         Capture { text: String::with_capacity(CAPTURE_LIMIT), overflowed: false, failed: false, console }
     }
+
+    /// The key an overflowed pipeline's command is given: Ctrl-C, or
+    /// `Key::Closed` once its console closed (a terminal window, #155).
+    fn stop_key(&self) -> Key {
+        if self.console.closed() { Key::Closed } else { Key::Ctrl('c') }
+    }
 }
 
 impl Write for Capture<'_> {
@@ -65,11 +71,11 @@ impl Write for Capture<'_> {
 
 impl Console for Capture<'_> {
     fn read_key(&mut self) -> Key {
-        if self.overflowed { Key::Ctrl('c') } else { self.console.read_key() }
+        if self.overflowed { self.stop_key() } else { self.console.read_key() }
     }
 
     fn try_key(&mut self) -> Option<Key> {
-        if self.overflowed { Some(Key::Ctrl('c')) } else { self.console.try_key() }
+        if self.overflowed { Some(self.stop_key()) } else { self.console.try_key() }
     }
 
     fn name(&self) -> &'static str {
@@ -83,8 +89,9 @@ impl Console for Capture<'_> {
         self.console.place()
     }
 
-    /// The console's: a pipeline in a terminal window that closed stops on
-    /// its `Key::Closed` too.
+    /// The console's (a terminal window's, #155, closing): so the shell on
+    /// it ends after a pipeline as after a command, and an overflowed
+    /// pipeline's key is `Key::Closed` rather than Ctrl-C once it closed.
     fn closed(&self) -> bool {
         self.console.closed()
     }

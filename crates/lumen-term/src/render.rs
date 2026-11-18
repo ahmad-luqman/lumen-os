@@ -136,7 +136,11 @@ impl Renderer {
     }
 
     /// Whether what was drawn (the shadow) is `t`'s view, cell for cell.
+    ///
+    /// # Panics
+    /// If `t` isn't the size the renderer was made for.
     pub fn matches(&self, t: &Terminal) -> bool {
+        assert_eq!((t.cols(), t.rows()), (self.cols, self.rows), "a terminal of another size");
         let cols = self.cols;
         (0..t.rows()).all(|r| (0..cols).all(|c| self.shadow[r * cols + c] == t.cell(c, r)))
     }
