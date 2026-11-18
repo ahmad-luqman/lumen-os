@@ -151,26 +151,25 @@ def test_the_serial_shell_waits_for_input_by_interrupt(boot):
     # the ticks and more than the shell's own `main` thread. (Polling,
     # `main` took every tick and `idle` none: the CPU was 100% busy, and
     # under TCG so was a host CPU per guest.) Lines typed while it waits
-    # wake it by interrupt: GSI 4's count goes up, at least one wait is
-    # woken by the handler itself (one that queues bytes without waking the
-    # shell never is), every line's wait ends by an interrupt (woken, or
-    # readied by its deadline just before the interrupt came), and none
-    # finds input at its deadline instead (a handler that doesn't wake the
-    # shell, or doesn't queue the bytes, would show there). Lines of 14+
-    # bytes reach the FIFO's trigger level, not only its timeout.
+    # wake it by interrupt: GSI 4's count goes up, the handler itself wakes
+    # at least one wait (the line typed after that second, when the shell is
+    # surely blocked; a handler that queues bytes without waking it never
+    # would), and no wait finds input at its deadline instead (a handler that
+    # doesn't wake the shell, or doesn't queue the bytes, would show there).
+    # Not every line's wait is counted: a line that arrives before the shell
+    # blocks again is found at its first look, which says nothing about the
+    # interrupt (`WaitEnd::Idle`; on a loaded KVM runner 2-4% of lines, #170).
+    # Lines of 14+ bytes reach the FIFO's trigger level, not only its timeout.
     m = shell(boot)
     first = _com1_interrupts(m)
-    _, woken_before, late_before, _ = _serial(m)
+    _, woken_before, _, _ = _serial(m)
     idle, main = _idle_second(m)
     assert idle >= 50 and idle > main, (idle, main)
     for i in range(6):
         assert run(m, f"echo a line typed while waiting {i}") == f"a line typed while waiting {i}\n"
     assert _com1_interrupts(m) > first
     brought, woken, late, at_deadline = _serial(m)
-    lines = woken - woken_before + late - late_before
-    assert (
-        at_deadline == 0 and woken - woken_before >= 1 and lines >= 6 and brought >= woken + late
-    ), (
+    assert at_deadline == 0 and woken - woken_before >= 1 and brought >= woken + late, (
         brought,
         woken,
         late,
@@ -179,16 +178,33 @@ def test_the_serial_shell_waits_for_input_by_interrupt(boot):
     assert MISSED_WARNING not in m.output
 
 
+# Lines the safety-net scenario types, at most, for three to be found at
+# their deadline (#165: a line that arrives before the shell blocks isn't).
+MOST_LINES = 20
+
+
 def test_the_safety_net_reads_input_when_irq_4_never_comes(boot):
     # (#120) COM1 moved to IRQ 3 (QEMU's isa-serial), so the IRQ 4 the
     # kernel routes never comes: the 100 ms deadline still answers every
-    # line, GSI 4's count stays 0, and after a few lines found that way one
-    # warning (once) says to check IRQ 4's routing. The CPU still idles.
+    # line, GSI 4's count stays 0, and once three waits in a row have found
+    # input at their deadline one warning (once) says to check IRQ 4's
+    # routing. The CPU still idles. The warning follows from `serial`'s
+    # count of those waits, read after each line: with no interrupt every
+    # such wait is one more in a row, so it is there exactly when the count
+    # reaches 3. Not every line makes one: a line that arrives before the
+    # shell blocks again is found at its first look (`WaitEnd::Idle`; on a
+    # loaded KVM runner 2-4% of lines, #165), so lines go on until three have.
     m = shell(boot, com1_irq=3)
-    for i in range(10):
+    lines = 0
+    for i in range(MOST_LINES):
         assert run(m, f"echo line {i}", allow=MISSED_WARNING) == f"line {i}\n"
-        if MISSED_WARNING in m.output:
+        brought, woken, late, at_deadline = _serial(m, MISSED_WARNING)
+        lines += 2
+        assert (brought, woken, late) == (0, 0, 0), (brought, woken, late, at_deadline)
+        assert (MISSED_WARNING in m.output) == (at_deadline >= 3), (at_deadline, m.output)
+        if at_deadline >= 3:
             break
+    assert at_deadline >= 3, f"only {at_deadline} of {lines} lines were found at their deadline"
     assert m.output.count(MISSED_WARNING) == 1, m.output
     assert re.search(
         MISSED_WARNING + r" 3 times in a row; check IRQ 4's routing \(GSI 4, vector 0x54\)",
@@ -198,12 +214,5 @@ def test_the_safety_net_reads_input_when_irq_4_never_comes(boot):
         assert run(m, f"echo more {i}", allow=MISSED_WARNING) == f"more {i}\n"
     assert m.output.count(MISSED_WARNING) == 1, m.output
     assert _com1_interrupts(m, MISSED_WARNING) == 0
-    brought, woken, late, at_deadline = _serial(m, MISSED_WARNING)
-    assert (brought, woken, late) == (0, 0, 0) and at_deadline >= 3, (
-        brought,
-        woken,
-        late,
-        at_deadline,
-    )
     idle, main = _idle_second(m, MISSED_WARNING)
     assert idle >= 50 and idle > main, (idle, main)
