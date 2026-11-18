@@ -3,7 +3,7 @@ cross-checks' diagnostics can go wrong (#117), on synthetic TAP."""
 
 import pytest
 from lumen_harness import tap
-from lumen_harness.clock_diags import check_clock_diags
+from lumen_harness.clock_diags import check_clock_diags, placement_is_judged
 
 NOW_NS = (
     "# bracket widths: start [{start}] ns, end [{end}] ns ({retries} taken again, 20 ms "
@@ -26,14 +26,32 @@ BOOT_TSC = (
 )
 TSC_WINDOW = "24576000/1000000/2000/1000/1000"
 WINDOW = "10000000/625000/1/0/0"
-HPET_PLACEMENT = (
-    "# injected pause: HPET placement {off} ns off (at most 2500000 ns allowed) on try {tries} "
-    "of 8, 20 ms apart; paused brackets [10048000] ns, the reference's 30000 ns\n"
+PLACEMENT = (
+    "# injected pause: {what} placement {off} ns off (at most {allowed} ns allowed) on try {taken} "
+    "of {of}, 20 ms apart; tries (reference, paused, by the brackets, by the read, in ns) [{tries}]\n"
 )
-TIMER_PLACEMENT = (
-    "# injected pause: timer placement 500 ns off (at most 200000 ns allowed) on try 1 of 8, 20 ms apart; "
-    '427500 ns by the HPET, 428000 ns by the timer; tries (...) [("", 18000, 829000, 427500)]\n'
-)
+# A try a 20 ms stall keeps from being judged.
+STALLED_TRY = (30000, 60000000, 20000000, 20000000)
+
+
+def placement(
+    what="HPET",
+    before=(),
+    last=(30000, 40048000, 20000000, 20005000),
+    off=None,
+    taken=None,
+    allowed=10000000,
+    of=8,
+    listed=None,
+):
+    """A placement test's judged line: the tries `before` it, then `last`
+    (`listed` in place of the list as the kernel prints it)."""
+    tries = [*before, last]
+    off = abs(last[2] - last[3]) if off is None else off
+    listed = ", ".join(map(str, tries)) if listed is None else listed
+    return PLACEMENT.format(
+        what=what, off=off, taken=taken or len(tries), tries=listed, allowed=allowed, of=of
+    )
 
 
 def run(
@@ -54,16 +72,20 @@ def run(
     tsc_lines=1,
     tsc_steady=5,
     tsc_bound=100,
-    placement_tries=1,
+    hpet_placement=None,
+    timer_placement=None,
     injected_retries=2,
-    hpet_off=5000,
 ):
+    hpet_placement = hpet_placement or placement("HPET")
+    timer_placement = timer_placement or placement(
+        "timer", last=(18000, 40029000, 20000000, 20000500)
+    )
     now_ns = NOW_NS.format(start=start, end=end, retries=retries, limit=limit)
     cases = [
         (now_ns_case, now_ns + (now_ns if extra_line else "")),
         (
             "an_hpet_reading_is_placed_at_its_brackets_midpoint",
-            HPET_PLACEMENT.format(tries=placement_tries, off=hpet_off),
+            hpet_placement,
         ),
         (
             "a_stalled_hpet_bracket_is_read_again",
@@ -88,7 +110,7 @@ def run(
             "the_timer_is_programmed_for_1_khz",
             TIMER.format(median=min(1000, timer_max), max=timer_max, brackets=timer_brackets),
         ),
-        ("a_timer_reading_is_placed_at_its_brackets_midpoint", TIMER_PLACEMENT),
+        ("a_timer_reading_is_placed_at_its_brackets_midpoint", timer_placement),
         (
             "the_boot_timer_calibration_is_within_what_the_tick_needs",
             (
@@ -234,6 +256,93 @@ def test_any_number_of_timer_boot_retakes_passes():
 
 
 def test_a_placement_too_far_off_fails():
-    check_clock_diags(*run(placement_tries=8))
+    check_clock_diags(*run(hpet_placement=placement(last=(30000, 40048000, 20000000, 30000000))))
+    check_clock_diags(*run(hpet_placement=placement(last=(30000, 40048000, 30000000, 20000000))))
     with pytest.raises(AssertionError, match="placed too far off"):
-        check_clock_diags(*run(hpet_off=2500001))
+        check_clock_diags(
+            *run(hpet_placement=placement(last=(30000, 40048000, 20000000, 30000001)))
+        )
+
+
+def test_a_placement_on_its_last_try_passes():
+    # Any number of tries taken again (a loaded host's stalls), each one
+    # that couldn't be judged: not bounded.
+    check_clock_diags(*run(timer_placement=placement("timer", before=[STALLED_TRY] * 7)))
+
+
+@pytest.mark.parametrize(
+    ("match", "kwargs"),
+    [
+        ("another clock's line", {"timer_placement": placement("HPET")}),
+        ("not one listed try per try taken", {"hpet_placement": placement(taken=2)}),
+        ("judged a try it can't", {"hpet_placement": placement(last=STALLED_TRY)}),
+        (
+            "took a try again that could be judged",
+            {"hpet_placement": placement(before=[(30000, 40048000, 20000000, 20000000)])},
+        ),
+        ("off isn't its try's two times apart", {"hpet_placement": placement(off=4999)}),
+        (
+            "off isn't its try's two times apart",
+            {"hpet_placement": placement(last=(30000, 40048000, 20005000, 20000000), off=0)},
+        ),
+        (
+            "took a try again that could be judged",
+            {
+                "hpet_placement": placement(
+                    before=[STALLED_TRY, (30000, 40048000, 20000000, 20000000)]
+                )
+            },
+        ),
+        (
+            "took a try again that could be judged",
+            {
+                "hpet_placement": placement(
+                    before=[(30000, 40048000, 20000000, 20000000), STALLED_TRY]
+                )
+            },
+        ),
+        (
+            "not one listed try per try taken",
+            {"hpet_placement": placement(listed="(1, 2, 3, 4), x")},
+        ),
+        ("pause and try count", {"hpet_placement": placement(allowed=9000000)}),
+        ("pause and try count", {"hpet_placement": placement(of=7)}),
+        (
+            "a paused bracket short of its pauses",
+            {"hpet_placement": placement(last=(30000, 39989999, 20000000, 20000000))},
+        ),
+    ],
+)
+def test_a_placement_line_must_follow_from_its_tries(match, kwargs):
+    with pytest.raises(AssertionError, match=match):
+        check_clock_diags(*run(**kwargs))
+
+
+def test_a_paused_bracket_at_its_floor_passes():
+    # Rounding's allowance, for the HPET test; the timer test's floor isn't
+    # checked here (it also allows the boot TSC calibration's bound).
+    check_clock_diags(*run(hpet_placement=placement(last=(30000, 39990000, 20000000, 20000000))))
+    check_clock_diags(
+        *run(timer_placement=placement("timer", last=(30000, 39600000, 20000000, 20000000)))
+    )
+
+
+@pytest.mark.parametrize(
+    ("reference", "paused", "judged"),
+    [
+        (100, 800, True),
+        (101, 800, False),
+        (0, 1000, True),
+        (0, 1001, False),
+        (100, 900, True),
+        (100, 901, False),
+        (0, 700, True),
+        (0, 2**64 - 1, False),
+        (2**64 - 1, 800, False),
+    ],
+)
+def test_the_harness_judges_tries_as_lumen_time_does(reference, paused, judged):
+    # crates/lumen-time's a_placement_try_is_judged_within_a_quarter_of_the_pause,
+    # case for case (pause 400; Python's ints don't overflow, so its
+    # saturating cases need no care).
+    assert placement_is_judged(reference, paused, 400) == judged

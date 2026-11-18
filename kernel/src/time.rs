@@ -1845,7 +1845,7 @@ crate::ktest!(
 
 /// Runs `f` with interrupts off and this CPU's local APIC timer free for a
 /// ktest to run once, masked (which stops its 1 kHz tick: [`timer_window`],
-/// or the 1 kHz check's one-shot windows), then restarts the tick before
+/// or [`with_one_shot_timer`]), then restarts the tick before
 /// interrupts come back, and checks the timer's registers (LVT, error LVT,
 /// initial count, divider) read as they did before: `f`'s result if they do.
 /// Interrupts stay off throughout, so the thread neither waits for a tick
@@ -1872,6 +1872,20 @@ fn with_tick_stopped<T>(f: impl FnOnce() -> T) -> Result<T, &'static str> {
     };
     kassert_eq!(after, before); // the tick restarted as it was
     Ok(out)
+}
+
+/// [`with_tick_stopped`], with the timer masked and one-shot from
+/// `u32::MAX` before `f` runs, keeping the divider the periodic setup left:
+/// 68 s at 62.5 MHz (QEMU's) before it would reach 0, so a count over
+/// anything a ktest times is exact (#129: periodic, it reloads every 1 ms,
+/// and a count says nothing about how many reloads passed).
+#[cfg(feature = "ktest")]
+fn with_one_shot_timer<T>(f: impl FnOnce() -> T) -> Result<T, &'static str> {
+    with_tick_stopped(|| {
+        apic::timer_mask_one_shot();
+        apic::timer_start(u32::MAX);
+        f()
+    })
 }
 
 crate::ktest!(
@@ -2311,79 +2325,214 @@ crate::ktest!(
 );
 
 /// How far below twice its pause a placement test's paused bracket may
-/// measure: the clocks' rounding and calibration (a pause spins the TSC for
-/// at least that long). Narrower means a pause didn't run, or the clocks
-/// disagree.
+/// measure on clocks' rounding alone (the timer test adds the TSC's
+/// calibration: `a_timer_reading_is_placed_at_its_brackets_midpoint`).
+/// Narrower means a pause didn't run, or the clocks disagree.
 #[cfg(feature = "ktest")]
 const PAUSE_SLACK_NS: u64 = 10_000;
-/// The longest stretch `a_timer_reading_is_placed_at_its_brackets_midpoint`
-/// trusts the periodic local APIC timer's count over: under its 1 ms reload
-/// period, with room, since the count can't tell how many reloads passed.
-/// (`the_timer_is_programmed_for_1_khz` measures one-shot, without reloads.)
-#[cfg(feature = "ktest")]
-const TIMER_WINDOW_MAX_NS: u64 = 950_000;
 /// How long each of `the_timer_is_programmed_for_1_khz`'s one-shot windows
 /// is, by the HPET.
 #[cfg(feature = "ktest")]
 const TIMER_ONE_SHOT_WINDOW_NS: u64 = 20_000_000;
 
+/// The pause each placement test injects on each side of its paused
+/// reading's read: 20 ms (a 40 ms bracket), so a try is judged with up to
+/// 5 ms of uncertainty ([`lumen_time::placement_is_judged`]). A loaded KVM
+/// host stalls the vCPU for milliseconds at a time (#158, run 44357565152:
+/// 40 boots at load 4.8 to 6.7, a bracket's stall 1.7 to 4.9 ms at p99
+/// across the pauses tried, 11 ms at most), which a 400 µs pause's 100 µs
+/// couldn't take: about 1 try in 8 couldn't be judged, up to 4 in a row in
+/// one boot, and all 8 in #158's. With 20 ms, 1 timer try in 320 couldn't be
+/// judged and no HPET try (with 5 ms, about 1 in 27; with 2 ms, 1 in 6.5).
+#[cfg(feature = "ktest")]
+const PLACEMENT_PAUSE_NS: u64 = 20_000_000;
+/// The most tries a placement test takes, [`RETRY_SPACING_NS`] apart, for
+/// one it can judge.
+#[cfg(feature = "ktest")]
+const PLACEMENT_TRIES: usize = 8;
+/// What the placement diags' list of tries holds (`lumen_harness.clock_diags`
+/// reads it).
+#[cfg(feature = "ktest")]
+const TRIES_ARE: &str = "tries (reference, paused, by the brackets, by the read, in ns)";
+
+/// One try of a placement test, in ns: the reference reading's bracket
+/// width, the paused reading's, and the time from the reference reading to
+/// the paused one by each clock: by the brackets' midpoints, and by the
+/// clock read inside them. Shown as a tuple in that order.
+#[cfg(feature = "ktest")]
+#[derive(Clone, Copy, Default)]
+struct PlacementTry {
+    reference_ns: u64,
+    paused_ns: u64,
+    by_brackets_ns: u64,
+    by_read_ns: u64,
+}
+
+#[cfg(feature = "ktest")]
+impl PlacementTry {
+    /// How far the two clocks disagree on the time between the readings.
+    fn off_ns(&self) -> u64 {
+        self.by_brackets_ns.abs_diff(self.by_read_ns)
+    }
+}
+
+#[cfg(feature = "ktest")]
+impl fmt::Debug for PlacementTry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (self.reference_ns, self.paused_ns, self.by_brackets_ns, self.by_read_ns).fmt(f)
+    }
+}
+
+/// Up to [`PLACEMENT_TRIES`] tries from `take`, [`RETRY_SPACING_NS`] apart,
+/// until one can be judged ([`lumen_time::placement_is_judged`] with
+/// [`PLACEMENT_PAUSE_NS`]), which must be placed at most half the pause off.
+/// Every diag starts with `tag` and `what` (the clock read: `HPET` or
+/// `timer` in the real tests) and ends with the tries taken (a failed try
+/// has none to show). Each paused bracket must measure at least twice the
+/// pause less `floor_slack_ns`: narrower, a pause didn't run. A try that
+/// fails (`take`'s error) fails the test at once: a clock bug, not a stall.
+/// No try judged fails too: a placement that can't be told from a wrong one
+/// proves nothing.
+#[cfg(feature = "ktest")]
+fn placed_at_the_midpoint(
+    tag: &str,
+    what: &str,
+    floor_slack_ns: u64,
+    mut take: impl FnMut() -> Result<PlacementTry, &'static str>,
+) -> crate::ktest::TestResult {
+    const PAUSE: u64 = PLACEMENT_PAUSE_NS;
+    let diag = |outcome: fmt::Arguments<'_>, tried: &[PlacementTry]| {
+        crate::ktest::diag(format_args!("{tag}{what} placement {outcome}; {TRIES_ARE} {tried:?}"))
+    };
+    let mut tries = [PlacementTry::default(); PLACEMENT_TRIES];
+    for n in 0..PLACEMENT_TRIES {
+        space_retry(n);
+        let t = take()
+            .inspect_err(|e| diag(format_args!("try {} failed ({e}); the ones before it", n + 1), &tries[..n]))?;
+        tries[n] = t;
+        let tried = &tries[..=n];
+        if t.paused_ns.saturating_add(floor_slack_ns) < 2 * PAUSE {
+            diag(
+                format_args!(
+                    "try {}: its paused bracket is under twice the {PAUSE} ns pause less {floor_slack_ns} ns (a pause \
+                     didn't run, or the clocks disagree)",
+                    n + 1
+                ),
+                tried,
+            );
+            return Err("a paused bracket was narrower than its pauses");
+        }
+        if lumen_time::placement_is_judged(t.reference_ns, t.paused_ns, PAUSE) {
+            diag(
+                format_args!(
+                    "{} ns off (at most {} ns allowed) on try {} of {PLACEMENT_TRIES}, {} ms apart",
+                    t.off_ns(),
+                    PAUSE / 2,
+                    n + 1,
+                    RETRY_SPACING_NS / 1_000_000
+                ),
+                tried,
+            );
+            return if t.off_ns() <= PAUSE / 2 { Ok(()) } else { Err("a placement was over half the pause off") };
+        }
+    }
+    diag(format_args!("never judged in {PLACEMENT_TRIES} tries"), &tries);
+    Err("no placement try could be judged")
+}
+
+/// The timer placement test's floor slack, for a boot TSC calibration
+/// bound of `tsc_ppm`: [`PAUSE_SLACK_NS`] plus that bound (at least the
+/// TSC's 1% tolerance) of the paused bracket, capped at half a pause so a
+/// pause that didn't run is still caught.
+#[cfg(feature = "ktest")]
+fn timer_floor_slack_ns(tsc_ppm: u64) -> u64 {
+    let calibration_ns = lumen_time::stall_ticks(2 * PLACEMENT_PAUSE_NS, tsc_ppm.max(lumen_time::TSC_TOLERANCE_PPM));
+    PAUSE_SLACK_NS.saturating_add(calibration_ns).min(PLACEMENT_PAUSE_NS / 2)
+}
+
+crate::ktest!(
+    fn a_placement_is_judged_only_on_a_try_that_can_tell() {
+        // `placed_at_the_midpoint` on made-up tries (its diags start
+        // `made-up tries:`; the failing cases' are expected): a try that
+        // can't be judged (a whole pause of stall in its paused bracket, or a
+        // reference over a quarter of the pause) is taken again, and the next
+        // one judged, which passes at exactly half the pause off either way
+        // with its bracket exactly at its floor (the floor given, the timer
+        // test's larger one too). 1 ns more off fails, either way, as does a
+        // bracket 1 ns short of its floor (before judging: even a try that
+        // couldn't be judged), a try's own error (at once, not taken again),
+        // and PLACEMENT_TRIES tries none of which can be judged. On a quiet
+        // host the first try is judged, so only this reaches the retakes.
+        use crate::kassert_eq;
+        const P: u64 = PLACEMENT_PAUSE_NS;
+        const TAG: &str = "made-up tries: ";
+        let t = |paused_ns, by_read_ns| PlacementTry { reference_ns: 30_000, paused_ns, by_brackets_ns: P, by_read_ns };
+        let (right, stalled) = (t(2 * P - PAUSE_SLACK_NS, P + P / 2), t(3 * P, P));
+        let run_with = |slack_ns, queue: &[Result<PlacementTry, &'static str>]| {
+            let mut taken = 0;
+            let got = placed_at_the_midpoint(TAG, "clock", slack_ns, || {
+                taken += 1;
+                queue.get(taken - 1).copied().unwrap_or(Ok(stalled))
+            });
+            (got, taken)
+        };
+        let run = |queue: &[Result<PlacementTry, &'static str>]| run_with(PAUSE_SLACK_NS, queue);
+        kassert_eq!(run(&[Ok(stalled), Ok(right)]), (Ok(()), 2));
+        let wide_reference = PlacementTry { reference_ns: P / 4 + 1, ..right };
+        kassert_eq!(run(&[Ok(wide_reference), Ok(right)]), (Ok(()), 2));
+        let early = PlacementTry { by_read_ns: P - P / 2, ..right };
+        kassert_eq!(run(&[Ok(early)]), (Ok(()), 1));
+        const OFF: Result<(), &str> = Err("a placement was over half the pause off");
+        kassert_eq!(run(&[Ok(PlacementTry { by_read_ns: P + P / 2 + 1, ..right })]), (OFF, 1));
+        kassert_eq!(run(&[Ok(PlacementTry { by_read_ns: P - P / 2 - 1, ..right })]), (OFF, 1));
+        const NARROW: Result<(), &str> = Err("a paused bracket was narrower than its pauses");
+        let short = PlacementTry { paused_ns: 2 * P - PAUSE_SLACK_NS - 1, ..right };
+        kassert_eq!(run(&[Ok(stalled), Ok(short)]), (NARROW, 2));
+        kassert_eq!(run(&[Ok(PlacementTry { reference_ns: P / 4 + 1, ..short })]), (NARROW, 1));
+        let slack_ns = timer_floor_slack_ns(lumen_time::TSC_TOLERANCE_PPM);
+        kassert_eq!(slack_ns, PAUSE_SLACK_NS + 2 * P / 100); // 1% of the bracket
+        kassert_eq!(timer_floor_slack_ns(u64::MAX), P / 2);
+        let at_floor = PlacementTry { paused_ns: 2 * P - slack_ns, ..right };
+        kassert_eq!(run_with(slack_ns, &[Ok(at_floor)]), (Ok(()), 1));
+        let below = PlacementTry { paused_ns: 2 * P - slack_ns - 1, ..right };
+        kassert_eq!(run_with(slack_ns, &[Ok(below)]), (NARROW, 1));
+        kassert_eq!(run(&[Ok(stalled), Err("a clock bug")]), (Err("a clock bug"), 2));
+        kassert_eq!(run(&[]), (Err("no placement try could be judged"), PLACEMENT_TRIES));
+        Ok(())
+    }
+);
+
 crate::ktest!(
     fn an_hpet_reading_is_placed_at_its_brackets_midpoint() {
-        // A reading paused 5 ms before and 5 ms after its HPET read (a 10 ms
-        // bracket) is placed at its midpoint, where the HPET was read: from
-        // a narrow reference reading, the placed `now_ns` and the HPET agree
-        // to under 2.5 ms (half the pause). Reading the HPET outside the
-        // bracket, or placing the reading at either end of it, puts it 5 ms
-        // off. A try is judged only if `lumen_time::placement_is_judged`
-        // says so (its uncertainty and the reference's width each at most a
-        // quarter of the pause: a loaded host stalls a 5 ms spin), so a
-        // right placement is at most 1.25 ms off and a wrong one at least
-        // 3.75 ms. Other tries are taken again, RETRY_SPACING_NS apart (a
-        // burst of stalls on a loaded host lasts tens of ms).
-        use crate::kassert;
-        const PAUSE_NS: u64 = 5_000_000;
-        const TRIES: usize = 8;
+        // A reading paused 20 ms before and 20 ms after its HPET read (a
+        // 40 ms bracket) is placed at its midpoint, where the HPET was read:
+        // from an unpaused reference reading, the placed `now_ns` and the
+        // HPET agree to within 10 ms (half the pause). Reading the HPET
+        // outside the bracket, or placing the reading at either end of it,
+        // puts it 20 ms off. Each try takes both readings, and is judged only
+        // if `lumen_time::placement_is_judged` says so
+        // (`placed_at_the_midpoint`: its uncertainty and the reference's
+        // width each at most a quarter of the pause), so a right placement is
+        // at most 5 ms off, and a wrong one at least 15 ms, each give or take
+        // the TSC's calibration over the time between the readings, about
+        // 30 ms at most on a judged try (0.3 ms at its 1% tolerance). The
+        // pause spins the TSC and `now_ns` times the bracket, so the floor
+        // needs only rounding's slack.
         let hpet = hpet().ok_or("no HPET")?;
-        let reference = narrow_hpet_reading(&hpet, START_READING, INJECTED, |_| {})?;
-        let Some(reference) = reference.reading() else {
-            crate::ktest::diag(format_args!(
-                "{INJECTED}no narrow reference reading: widths {:?} ns",
-                reference.widths()
-            ));
-            return Err("no narrow reference reading");
+        let backwards = |b| {
+            crate::ktest::diag(format_args!("{INJECTED}{BACKWARDS_IN_BRACKET}: {b:?}"));
+            BACKWARDS_IN_BRACKET
         };
-        let mut widths_ns = [0u64; TRIES];
-        for tried in 0..TRIES {
-            space_retry(tried);
-            let paused = hpet_between_now_ns(&hpet, END_READING, |_| spin(PAUSE_NS)).map_err(|b| {
-                crate::ktest::diag(format_args!("{INJECTED}{BACKWARDS_IN_BRACKET}: {b:?}"));
-                BACKWARDS_IN_BRACKET
-            })?;
-            widths_ns[tried] = paused.width;
-            kassert!(paused.width.saturating_add(PAUSE_SLACK_NS) >= 2 * PAUSE_NS);
-            if !lumen_time::placement_is_judged(reference.width, paused.width, PAUSE_NS) {
-                continue;
-            }
-            let by_now_ns = now_ns_between(&reference, &paused, INJECTED)?;
-            let by_hpet_ns = hpet.clock().ns(hpet.since(reference.value, paused.value));
-            let off_ns = by_now_ns.abs_diff(by_hpet_ns);
-            crate::ktest::diag(format_args!(
-                "{INJECTED}HPET placement {off_ns} ns off (at most {} ns allowed) on try {} of {TRIES}, {} ms apart; \
-                 paused brackets {:?} ns, the reference's {} ns",
-                PAUSE_NS / 2,
-                tried + 1,
-                RETRY_SPACING_NS / 1_000_000,
-                &widths_ns[..=tried],
-                reference.width,
-            ));
-            kassert!(off_ns * 2 <= PAUSE_NS);
-            return Ok(());
-        }
-        crate::ktest::diag(format_args!(
-            "{INJECTED}every paused reading had a natural stall too: brackets {widths_ns:?} ns, the reference's {} ns",
-            reference.width
-        ));
-        Err("every paused HPET reading was stalled as well")
+        placed_at_the_midpoint(INJECTED, "HPET", PAUSE_SLACK_NS, || {
+            let reference = hpet_between_now_ns(&hpet, START_READING, |_| {}).map_err(backwards)?;
+            let paused = hpet_between_now_ns(&hpet, END_READING, |_| spin(PLACEMENT_PAUSE_NS)).map_err(backwards)?;
+            Ok(PlacementTry {
+                reference_ns: reference.width,
+                paused_ns: paused.width,
+                by_brackets_ns: now_ns_between(&reference, &paused, INJECTED)?,
+                by_read_ns: hpet.clock().ns(hpet.since(reference.value, paused.value)),
+            })
+        })
     }
 );
 
@@ -2561,8 +2710,9 @@ crate::ktest!(
         // each), 0.175% of it, and one a burst of wide brackets throws off is
         // a sample the median absorbs. How many windows' brackets added up
         // to over 5% of them is reported, with the widths and every sample.
-        // It runs with the tick stopped (`with_tick_stopped`, which checks
-        // the timer's registers read as before afterwards). A window over
+        // It runs on the one-shot timer (`with_one_shot_timer`, through
+        // `with_tick_stopped`, which checks the timer's registers read as
+        // before afterwards). A window over
         // which the timer counted nothing (or up), or over which the HPET
         // didn't reach 20 ms within 1 s by the TSC, fails the test there.
         const ONE_SHOT_WINDOWS: usize = 7;
@@ -2571,9 +2721,7 @@ crate::ktest!(
         let mut samples_hz = [0u64; ONE_SHOT_WINDOWS];
         let mut widths_ticks = [0u64; 2 * ONE_SHOT_WINDOWS];
         let mut wide = 0;
-        let during = with_tick_stopped(|| {
-            apic::timer_mask_one_shot();
-            apic::timer_start(u32::MAX);
+        let during = with_one_shot_timer(|| {
             for i in 0..ONE_SHOT_WINDOWS {
                 let start = timer_between_hpet(&hpet, || {});
                 let waiting = arch::rdtsc();
@@ -2637,69 +2785,58 @@ crate::ktest!(
 
 crate::ktest!(
     fn a_timer_reading_is_placed_at_its_brackets_midpoint() {
-        // A timer reading paused 400 µs before and 400 µs after its count is
-        // read (an 800 µs bracket) is placed at its midpoint, where the timer
-        // was read: from a reference reading, the HPET midpoints and the
-        // timer's count (at its calibrated rate) agree to under 200 µs (half
-        // the pause). Reading the timer outside its bracket, or placing it at
-        // either end, puts it 400 µs off. As for the HPET's placement test, a
-        // try is judged only if `lumen_time::placement_is_judged` says so, so
-        // a right placement is at most 100 µs off and a wrong one at least
-        // 300 µs (the reference at most 100 µs wide, so even misplaced the
-        // same way it can't make up the difference). The two readings, with
-        // that uncertainty, must also be under TIMER_WINDOW_MAX_NS apart: the
-        // timer reloads every 1 ms, and its count says nothing about how many
-        // reloads passed. Other tries are taken again, RETRY_SPACING_NS apart,
-        // each with its reason in the diag.
-        use crate::kassert;
-        const PAUSE_NS: u64 = 400_000;
-        const TRIES: usize = 8;
-        let (_, _, initial) = apic::timer_registers();
+        // A local APIC timer reading paused 20 ms before and 20 ms after its
+        // count is read (a 40 ms bracket of HPET reads) is placed at its
+        // midpoint, where the timer was read: from an unpaused reference
+        // reading, the HPET midpoints and the timer's count (at its
+        // calibrated rate) agree to within 10 ms (half the pause). Reading
+        // the timer outside its bracket, or placing it at either end, puts
+        // it 20 ms off. Judged as for the HPET's placement test
+        // (`placed_at_the_midpoint`), give or take the timer's calibration
+        // over what it counted, up to 30 ms on a judged try (0.6 ms at its
+        // 2% tolerance). Each try runs on the one-shot timer
+        // (`with_one_shot_timer`), so its count is exact (#158: the periodic
+        // one's 1 ms reload capped the pause at 400 µs; see
+        // PLACEMENT_PAUSE_NS). The paused bracket is timed by the HPET while
+        // the pause spins the TSC, so its floor also allows the boot TSC
+        // calibration's bound (at least its 1% tolerance) of it, capped at
+        // half a pause so a pause that didn't run is still caught (a bound
+        // past 1% already warned at boot). A bracket over half the HPET's
+        // counter is a read going backwards inside it (wrapped): a clock bug,
+        // failed, not taken again; a stall, however long, is only not judged.
         let timer = lapic_timer().ok_or("timer not calibrated")?;
         let hpet = hpet().ok_or("no HPET")?;
         let clock = hpet.clock();
-        // Each try's (why it was taken again, reference width, paused width,
-        // HPET ns between the midpoints).
-        let mut tried = [("", 0u64, 0u64, 0u64); TRIES];
-        for n in 0..TRIES {
-            space_retry(n);
-            let _off = arch::irq::push_off();
-            let reference = timer_between_hpet(&hpet, || {});
-            let paused = timer_between_hpet(&hpet, || spin(PAUSE_NS));
-            let by_hpet_ns = clock.ns(hpet.since(reference.at, paused.at));
-            let (reference_ns, paused_ns) = (clock.ns(reference.width), clock.ns(paused.width));
-            kassert!(paused_ns.saturating_add(PAUSE_SLACK_NS) >= 2 * PAUSE_NS);
-            let uncertainty_ns = lumen_time::placement_uncertainty(reference_ns, paused_ns, PAUSE_NS);
-            let why = if !lumen_time::placement_is_judged(reference_ns, paused_ns, PAUSE_NS) {
-                "stalled"
-            } else if by_hpet_ns.saturating_add(uncertainty_ns) >= TIMER_WINDOW_MAX_NS {
-                "near a reload"
-            } else {
-                ""
-            };
-            tried[n] = (why, reference_ns, paused_ns, by_hpet_ns);
-            if !why.is_empty() {
-                continue;
+        let slack_ns = timer_floor_slack_ns(boot_calibration().ok_or("no boot calibration")?.median_bound_ppm());
+        placed_at_the_midpoint(INJECTED, "timer", slack_ns, || {
+            let (reference, paused) = with_one_shot_timer(|| {
+                let reference = timer_between_hpet(&hpet, || {});
+                let paused = timer_between_hpet(&hpet, || spin(PLACEMENT_PAUSE_NS));
+                (reference, paused)
+            })?;
+            if reference.width.max(paused.width) > hpet.mask / 2 {
+                const WHY: &str = "the HPET went backwards inside a bracket around a timer read";
+                crate::ktest::diag(format_args!(
+                    "{INJECTED}{WHY}: brackets of {} and {} ticks, over half its counter",
+                    reference.width, paused.width
+                ));
+                return Err(WHY);
             }
-            let counted = lumen_time::down_counter_delta(reference.value, paused.value, initial);
-            let by_timer_ns = timer.ns(u64::from(counted));
-            let off_ns = by_hpet_ns.abs_diff(by_timer_ns);
-            crate::ktest::diag(format_args!(
-                "{INJECTED}timer placement {off_ns} ns off (at most {} ns allowed) on try {} of {TRIES}, {} ms apart; \
-                 {by_hpet_ns} ns by the HPET, {by_timer_ns} ns by the timer; tries (taken again because, \
-                 reference, paused, by the HPET, in ns) {:?}",
-                PAUSE_NS / 2,
-                n + 1,
-                RETRY_SPACING_NS / 1_000_000,
-                &tried[..=n],
-            ));
-            kassert!(off_ns * 2 <= PAUSE_NS);
-            return Ok(());
-        }
-        crate::ktest::diag(format_args!(
-            "{INJECTED}no try could be judged: (taken again because, reference, paused, by the HPET, in ns) {tried:?}"
-        ));
-        Err("no timer placement try could be judged")
+            let (reference_ns, paused_ns) = (clock.ns(reference.width), clock.ns(paused.width));
+            let Some(counted) = reference.value.checked_sub(paused.value) else {
+                crate::ktest::diag(format_args!(
+                    "{INJECTED}the one-shot timer counted up: {} then {}",
+                    reference.value, paused.value
+                ));
+                return Err("the one-shot timer counted up");
+            };
+            Ok(PlacementTry {
+                reference_ns,
+                paused_ns,
+                by_brackets_ns: clock.ns(hpet.since(reference.at, paused.at)),
+                by_read_ns: timer.ns(u64::from(counted)),
+            })
+        })
     }
 );
 

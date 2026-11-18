@@ -57,6 +57,7 @@ tests = [
     "cargo:lumen-time",
     "ktest:lumen_kernel::time::now_ns_follows_the_hpet",
     "ktest:lumen_kernel::time::an_hpet_reading_is_placed_at_its_brackets_midpoint",
+    "ktest:lumen_kernel::time::a_placement_is_judged_only_on_a_try_that_can_tell",
     "ktest:lumen_kernel::time::a_stalled_hpet_bracket_is_read_again",
     "ktest:lumen_kernel::time::every_stalled_hpet_bracket_is_a_failure",
     "ktest:lumen_kernel::time::a_burst_of_stalls_is_sampled_around",
