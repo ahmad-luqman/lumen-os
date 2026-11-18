@@ -16,7 +16,7 @@ import re
 import shlex
 
 import pytest
-from lumen_harness.klog import unexpected_warnings
+from lumen_harness.calibration import unexpected_boot_warnings
 from lumen_harness.qemu import Devices, Machine
 from lumen_harness.screen import PROMPT
 from lumen_harness.shell import run
@@ -148,7 +148,7 @@ def test_a_second_virtio_rng_is_declined(boot):
         r"INFO  drivers: 1 bound, 0 failed, 1 declined, 0 not probed \(\d+ driver rows?\)\n",
         m.output,
     )
-    assert not unexpected_warnings(m.output), m.output
+    assert not (bad := unexpected_boot_warnings(m.output)), "\n".join(bad)
     assert_random_works(m)
 
 

@@ -17,6 +17,8 @@ from lumen_harness.calibration import (
     percent,
     ppm_range,
     stalled,
+    tsc_reference,
+    unexpected_boot_warnings,
     verdict,
     warned_exactly_when_past,
     weighed,
@@ -461,3 +463,28 @@ def test_two_calibrations_agree_within_2_or_their_bounds_under_9():
         agree(1_118_000_000, hz, 60_000, 29_000)
     with pytest.raises(AssertionError, match="disagree"):
         agree(hz, 1_118_000_000, 1_000, 88_000)
+
+
+FALLBACK = (
+    "[    1.204210] WARN  time: can't calibrate the tsc against the HPET: only 0 of 20 windows read promptly "
+    "(5 wanted), and the middle ones' end stalls were as long as the rest of their windows, so the rate says "
+    "nothing (tsc/reference/polls/start_gap/end_gap: 1/2/3/4/5); calibrating against the PIT\n"
+)
+
+
+def test_the_tsc_reference_is_the_kernels_choice():
+    assert tsc_reference("") == HPET
+    assert tsc_reference(TSC_OWN + WEIGHED) == PIT
+    assert tsc_reference(TSC_OWN + NO_BOUND) == HPET
+    # The HPET's calibration said nothing: the PIT, with no weighing.
+    assert tsc_reference(FALLBACK) == PIT
+
+
+def test_unexpected_boot_warnings_checks_the_calibration_lines():
+    # Well-formed verdicts and weighing: left out.
+    assert unexpected_boot_warnings(TSC_OWN + WEIGHED + TIMER_OWN) == []
+    # A broken PIT's warning is not the host's.
+    assert unexpected_boot_warnings(TSC_OWN + PIT_FAILED) == [PIT_FAILED.rstrip("\n")]
+    # A verdict that contradicts its own numbers fails, though host-timed.
+    with pytest.raises(AssertionError):
+        unexpected_boot_warnings(TSC_OWN.replace("1.6%", "0.2%"))

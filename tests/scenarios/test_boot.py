@@ -2,7 +2,8 @@
 
 import re
 
-from lumen_harness.klog import LEVEL, stamp_capturing, unexpected_warnings
+from lumen_harness.calibration import unexpected_boot_warnings
+from lumen_harness.klog import LEVEL, stamp_capturing
 from lumen_harness.qemu import EXIT_SUCCESS
 
 BOOT_TIMEOUT = 60
@@ -21,9 +22,10 @@ def test_boot_reaches_logger(boot):
     # Then Limine's times (at warn if unknown or out of order).
     m.expect(r"boot: before kmain: .*\n")
     # No warning or error, but those a loaded host can cause on its own
-    # (each judged in its own scenario: lumen_harness.klog.HOST_TIMED).
+    # (lumen_harness.klog.HOST_TIMED; the calibrations' checked against their
+    # own numbers), and no "ERROR" anywhere, log line or not.
     out = m.output
-    assert not unexpected_warnings(out), out
+    assert not (bad := unexpected_boot_warnings(out)), "\n".join(bad)
     assert "ERROR" not in out, "boot logged an error"
 
 

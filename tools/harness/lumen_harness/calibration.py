@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 from typing import NamedTuple
 
-from lumen_harness.klog import STAMP
+from lumen_harness.klog import STAMP, unexpected_warnings
 
 TSC = "tsc"
 TIMER = "local APIC timer"
@@ -284,6 +284,34 @@ def weighed(out: str) -> Weighed | None:
     elif pit != hpet:
         assert w.kept == (PIT if pit < hpet else HPET), w
     return w
+
+
+# The fallback when the HPET's calibration said nothing (klog.HOST_TIMED's).
+PIT_FALLBACK = re.compile(
+    rf"(?m)^{STAMP} WARN  time: can't calibrate the tsc against the HPET: [^\n]*; calibrating against the PIT$"
+)
+
+
+def tsc_reference(out: str) -> str:
+    """Which clock boot calibrated the TSC against, on a machine with an
+    HPET: the PIT if the HPET's calibration said nothing, or was imprecise
+    and the PIT's could be off less (`weighed`, checked); else the HPET. A
+    loaded host can make either happen; which follows is the code's."""
+    if PIT_FALLBACK.search(out):
+        return PIT
+    w = weighed(out)
+    return HPET if w is None else w.kept
+
+
+def unexpected_boot_warnings(out: str) -> list[str]:
+    """`klog.unexpected_warnings` for a boot's output (one boot), its
+    calibration lines first checked against the numbers they print
+    (`verdict` for each clock, `weighed`): a loaded host decides whether
+    they are logged, not what they say."""
+    verdict(out, TSC)
+    verdict(out, TIMER)
+    weighed(out)
+    return unexpected_warnings(out)
 
 
 def no_other_warnings(out: str) -> None:

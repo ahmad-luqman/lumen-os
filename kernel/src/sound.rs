@@ -868,6 +868,11 @@ fn record(played: Played, ended: Ended, settle: Settle) {
     // thread waited on a control request that then completed): the sound
     // still played to `ended` (`pcm_release` answered), so it settles as
     // that; the thread then finds the player given up and drops the device.
+    // Warned before counted: whoever reads the count (`sound`) finds the
+    // warning already logged.
+    if played.underruns > 0 {
+        warn!(target: "sound", "a sound found the queue empty {} times (underruns)", played.underruns);
+    }
     let mut p = PLAYER.lock();
     if let Some(b) = p.bound.as_mut() {
         if let Activity::Playing { .. } = b.activity {
@@ -881,9 +886,6 @@ fn record(played: Played, ended: Ended, settle: Settle) {
         }
     }
     drop(p);
-    if played.underruns > 0 {
-        warn!(target: "sound", "a sound found the queue empty {} times (underruns)", played.underruns);
-    }
     settle.settle(ended.into());
 }
 

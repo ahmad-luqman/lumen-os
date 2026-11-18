@@ -451,10 +451,12 @@ own PR that updates that doc first.
   `screenshot.py` (`screenshot`'s frame read back and checked;
   `Machine.screenshot_via_serial`),
   `shell.py` (`run`: a serial command's output, the log's lines taken out
-  and kept, a WARN or ERROR failing it unless allowed or host-timed; `PROMPT`), `klog.py`
-  (the kernel log line's format, as kernel/src/klog.rs prints it; `HOST_TIMED`, the warnings a loaded
-  host can cause on its own, each tied to the kernel's text, and `unexpected_warnings`, a run's
-  "no warning" check without them).
+  and kept, a WARN or ERROR failing it unless allowed or host-timed;
+  `PROMPT`), `klog.py` (the kernel log line's format, as kernel/src/klog.rs
+  prints it; `HOST_TIMED`, the warnings a loaded host can cause on its own,
+  each tied to the kernel's text, and `unexpected_warnings`, a run's "no
+  warning" check without them; `calibration.unexpected_boot_warnings` checks
+  a boot's calibration lines first).
 - `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests,
   and `test_scenario_typing.py`, a lint: a raw key in a scenario needs
   `# unconfirmed: <why>`, and lumen_harness types raw only where it

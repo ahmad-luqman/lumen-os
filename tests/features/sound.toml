@@ -46,7 +46,7 @@ tests = [
 ]
 
 [[feature]]
-name = "`beep 440 500` plays a 440 Hz tone (within 1%) sounding at least 450 ms into QEMU's wav audiodev, and returns while it plays (`sound` says `playing` right after: from the moment `beep` hands the sound over, so the scenario no longer shows that the thread took it; that the thread plays it is the recording's and the frame counts' to show, and `playing` before it takes it is a ktest with a made-up device); the frames handed to the device are exactly the tone's (a last period's padding not counted: 510 ms), also over a 10 s tone (500 periods), each underrun (a stalled host's) counted in `sound` and said in its warning; that none comes on an idle host is not tested"
+name = "`beep 440 500` plays a 440 Hz tone (within 1%) sounding at least 450 ms into QEMU's wav audiodev, and returns while it plays (`sound` says `playing` right after: from the moment `beep` hands the sound over, so the scenario no longer shows that the thread took it; that the thread plays it is the recording's and the frame counts' to show, and `playing` before it takes it is a ktest with a made-up device); the frames handed to the device are exactly the tone's (a last period's padding not counted: 510 ms), also over a 10 s tone (500 periods), each underrun (a stalled host's) counted in `sound` and said in its warning, logged before it is counted, and at most one per 8 periods (the queue's depth: a driver underrunning every period fails); that none comes on an idle host is not tested"
 milestone = "M3"
 tests = [
     "scenario:test_sound::test_tone_is_captured",

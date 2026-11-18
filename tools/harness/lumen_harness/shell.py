@@ -16,10 +16,13 @@ shows when it is logged, in stamp order with the others.
 parses the same whether a log line came along or not, and keeps them on
 the result (`Output.logs`), from the prompt before the echo on. A WARN or
 ERROR line among them fails the run, unless the caller expects it
-(`allow`) or a loaded host can cause it on its own (`klog.HOST_TIMED`): it is something a test should see, and before #124 it showed up
-as output a test didn't expect. A command whose output *is* log lines
-(`dmesg`) is read with `keep_logs`, which skips that check (its lines
-can't be told from live ones), or with `run_dmesg`, which tells them apart.
+(`allow`): it is something a test should see, and before #124 it showed up
+as output a test didn't expect. One a loaded host can cause on its own
+(`klog.HOST_TIMED`; in practice a sound's late underrun, the others come
+before the first prompt) doesn't fail it, and stays in the logs. A command
+whose output *is* log lines (`dmesg`) is read with `keep_logs`, which
+skips that check (its lines can't be told from live ones), or with
+`run_dmesg`, which tells them apart.
 
 Limits: the serial shell in plain text only (`lumen.ansi`'s editor
 redraws lines with escapes, which the echo pattern doesn't follow); a log
@@ -35,7 +38,7 @@ import re
 import time
 from typing import TYPE_CHECKING, Self
 
-from lumen_harness.klog import LOG_LINE, LOUD, STAMP, is_host_timed, is_log_line, level_of
+from lumen_harness.klog import LOG_LINE, LOUD, is_host_timed, is_log_line, level_of, without_stamp
 from lumen_harness.qemu import ExpectTimeout
 
 if TYPE_CHECKING:
@@ -76,13 +79,13 @@ def echo_pattern(line: str) -> str:
 def allowed(log: str, allow: str | None) -> bool:
     """Whether log line `log` matches `allow`, a regex matched from the
     level on (`WARN  mouse: ...`)."""
-    return allow is not None and re.match(allow, re.sub(rf"^{STAMP} ", "", log)) is not None
+    return allow is not None and re.match(allow, without_stamp(log)) is not None
 
 
 def check_quiet(line: str, logs: list[str], allow: str | None, text: str) -> None:
     """Fail if a WARN or ERROR among `logs` (which came with `line`'s output
-    `text`) isn't `allow`ed, or one a loaded host can cause on its own
-    (`klog.HOST_TIMED`, judged by its own scenario; kept in the logs)."""
+    `text`) is neither `allow`ed nor one a loaded host can cause on its own
+    (`klog.HOST_TIMED`; such a line stays in the logs)."""
     loud = [
         log
         for log in logs
