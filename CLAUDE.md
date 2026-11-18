@@ -286,7 +286,7 @@ own PR that updates that doc first.
   tests), every widget an automation node (`NodeId` from one counter,
   `Role` with its actions, value kind and flags, `Value`, `Action`,
   `StateFlags`, `AutomationNode`), `Ui::invoke` through the click's own
-  handler, `App` and `serve` (a request run on an app, what to answer),
+  handler, `App` (`ui_mut`, `apply`, `paint_over`) and `serve` (a request run on an app, what to answer),
   `Reply` (`ui invoke`'s reply slot, its state private: pending, running,
   cancelled, done, taken) and `counter` (the demo app's logic)
   (host-tested).
@@ -342,7 +342,7 @@ own PR that updates that doc first.
   against `shlex`; commands split at `|`), the line editor (history,
   completion; ANSI and plain output), the command table (names, completion
   words, usage and help lines), pipelines (text or records in tables, a
-  cell that is empty, spaced or a text `-` printed quoted (`quoted`); the
+  cell that wouldn't read back as one word printed quoted (`quoted`); the
   filters `grep`, `where`, `sort`, `first`, `count`, `select`), serial
   bytes to keys, a key press to the line editor's key (`Key::from_press`,
   shared by text mode and terminal windows, with #155) (host-tested).
