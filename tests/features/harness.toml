@@ -1,11 +1,14 @@
 # Features: harness. See tests/features/README.md for the format.
 
 [[feature]]
-name = "In-kernel test runner (TAP over serial, isa-debug-exit)"
+name = "In-kernel test runner (TAP over serial, isa-debug-exit); `lumen.ktest=<prefix>[,<prefix>...]` runs only the tests whose names start with one of the prefixes (said in a TAP comment; none selected fails the run), as the stalled-calibration runs do"
 milestone = "M0"
 tests = [
     "scenario:test_ktest::test_in_kernel_tests_pass",
+    "scenario:test_ktest::test_in_kernel_tests_pass_with_calibrations_stalled_within_tolerance[*]",
     "ktest:lumen_kernel::ktest::ktest_registry_is_populated",
+    "ktest:lumen_kernel::ktest::a_filter_selects_tests_by_name_prefix",
+    "scenario:test_ktest::test_a_ktest_filter_that_selects_nothing_fails",
     "harness:test_tap::*",
 ]
 
