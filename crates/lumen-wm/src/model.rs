@@ -46,10 +46,10 @@ fn covers(out: &Outcome, r: Rect) -> bool {
 }
 
 /// Where a moved frame of width `w` lands: [`Wm::move_to`]'s clamp, stated
-/// again.
-fn clamped(w: u32, x: i32, y: i32) -> (i32, i32) {
+/// again (`work`: the rows above the panels, `H` with none).
+fn clamped(w: u32, work: u32, x: i32, y: i32) -> (i32, i32) {
     let strip = M.strip.min(w) as i32;
-    (x.clamp(strip - w as i32, W as i32 - strip), y.clamp(0, (H - M.title_h) as i32))
+    (x.clamp(strip - w as i32, W as i32 - strip), y.clamp(0, (work.saturating_sub(M.title_h)) as i32))
 }
 
 #[test]
@@ -111,6 +111,121 @@ fn a_click_focuses_and_raises() {
     let out = wm.pointer(at(2, 5, L));
     assert!(out.damage.is_empty());
     assert!(matches!(out.deliveries[..], [Delivery::PointerDown { .. }]));
+}
+
+#[test]
+fn minimizing_hides_and_unfocuses_and_restoring_raises_and_focuses() {
+    let mut wm = wm();
+    let a = open(&mut wm, 0, 0, 12, 10);
+    let b = open(&mut wm, 6, 6, 12, 10);
+    let fb = frame(&wm, b);
+    let out = wm.minimize(b).expect("open and shown");
+    assert!(covers(&out, fb), "its frame is repainted (to what was behind)");
+    assert_eq!(out.deliveries, [Delivery::FocusLost(b), Delivery::FocusGained(a)]);
+    assert!(wm.window(b).expect("still open").is_minimized());
+    assert_eq!(frame(&wm, b), fb, "its place is kept");
+    // Not hit: what was behind it shows.
+    assert_eq!(wm.hit(8, 8), Hit::Window(a, Part::Client));
+    assert_eq!(wm.hit(16, 14), Hit::Desktop);
+    // Minimizing again, or restoring a window shown, is refused.
+    assert_eq!(wm.minimize(b), None);
+    assert_eq!(wm.restore(a), None);
+    // Minimizing the last shown window leaves none focused.
+    let _ = wm.minimize(a).expect("shown");
+    assert_eq!(wm.focused(), None);
+    let out = wm.restore(b).expect("minimized");
+    assert!(covers(&out, fb));
+    assert_eq!(out.deliveries, [Delivery::FocusGained(b)]);
+    assert_eq!(wm.focused(), Some(b));
+    assert_eq!(wm.hit(16, 14), Hit::Window(b, Part::Client));
+    // Focus restores a minimized window, raised and focused.
+    let out = wm.focus(a).expect("open");
+    assert!(!wm.window(a).expect("open").is_minimized());
+    assert_eq!(out.deliveries, [Delivery::FocusLost(b), Delivery::FocusGained(a)]);
+    assert_eq!(wm.windows().last().map(|w| w.id()), Some(a));
+    // A window closed is neither minimized nor restored.
+    let _ = wm.close(a).expect("open");
+    assert_eq!((wm.minimize(a), wm.restore(a)), (None, None));
+}
+
+#[test]
+fn a_click_on_the_minimize_box_minimizes_and_a_release_elsewhere_doesnt() {
+    let mut wm = wm();
+    let a = open(&mut wm, 0, 0, 12, 10);
+    let b = open(&mut wm, 14, 2, 12, 10);
+    let mb = M.minimize_box(&frame(&wm, a));
+    assert!(!mb.is_empty());
+    assert_eq!(wm.hit(mb.x(), mb.y()), Hit::Window(a, Part::MinimizeBox));
+    // Pressed on it, released off it: nothing (but the press focused it).
+    let _ = wm.pointer(at(mb.x(), mb.y(), L));
+    assert_eq!(wm.focused(), Some(a));
+    let out = wm.pointer(at(30, 25, NONE));
+    assert!(!wm.window(a).expect("open").is_minimized());
+    assert!(out.deliveries.is_empty());
+    // Pressed and released on it: minimized, B focused.
+    let _ = wm.pointer(at(mb.x(), mb.y(), L));
+    let out = wm.pointer(at(mb.x(), mb.y(), NONE));
+    assert!(wm.window(a).expect("open").is_minimized());
+    assert_eq!(out.deliveries, [Delivery::FocusLost(a), Delivery::FocusGained(b)]);
+    // A right press on it does nothing until the buttons are up.
+    let mb = M.minimize_box(&frame(&wm, b));
+    let _ = wm.pointer(at(mb.x(), mb.y(), R));
+    let _ = wm.pointer(at(mb.x(), mb.y(), NONE));
+    assert!(!wm.window(b).expect("open").is_minimized());
+}
+
+#[test]
+fn a_panel_is_in_front_never_focused_and_a_press_on_it_grabs_without_focusing() {
+    let mut wm = wm();
+    let a = open(&mut wm, 0, 0, 12, 10);
+    let (p, out) = wm.open_panel("panel", Rect::new(0, 26, W, 4));
+    assert!(out.deliveries.is_empty(), "the focus doesn't move");
+    assert_eq!(wm.focused(), Some(a));
+    let w = wm.window(p).expect("open");
+    assert!(w.is_panel() && !w.is_minimized());
+    // Frameless: its frame is its client area, all of it client.
+    assert_eq!(wm.client(p), Some(Rect::new(0, 26, W, 4)));
+    assert_eq!(wm.hit(0, 26), Hit::Window(p, Part::Client));
+    assert_eq!(wm.hit(39, 29), Hit::Window(p, Part::Client));
+    // Windows opened or raised later stay behind it.
+    let b = open(&mut wm, 6, 20, 12, 10);
+    assert_eq!(wm.windows().last().map(|w| w.id()), Some(p));
+    let _ = wm.focus(a).expect("open");
+    assert_eq!(wm.windows().last().map(|w| w.id()), Some(p));
+    assert_eq!(wm.focused(), Some(a));
+    // It is never focused, minimized or restored.
+    assert_eq!((wm.focus(p), wm.minimize(p), wm.restore(p)), (None, None, None));
+    // A press on it is its grab; the focus stays.
+    let out = wm.pointer(at(3, 27, L));
+    assert_eq!(out.deliveries, [Delivery::PointerDown { window: p, x: 3, y: 1, button: LB, buttons: L }]);
+    assert!(out.damage.is_empty());
+    assert_eq!(wm.focused(), Some(a));
+    assert_eq!(wm.grabbing(), Some(p));
+    let out = wm.pointer(at(3, 27, NONE));
+    assert_eq!(out.deliveries, [Delivery::PointerUp { window: p, x: 3, y: 1, button: LB, buttons: NONE }]);
+    // A pause or gap during its grab tells it (it isn't the focused one).
+    let _ = wm.pointer(at(3, 27, L));
+    let out = wm.interrupt(Interruption::Gap);
+    assert_eq!(out.deliveries, [Delivery::Lost(a), Delivery::Lost(p)]);
+    assert_eq!(wm.grabbing(), None);
+    let _ = (b, wm.pointer(at(3, 27, NONE)));
+}
+
+#[test]
+fn windows_keep_their_title_bar_above_a_panel() {
+    let mut wm = wm();
+    let _ = wm.open_panel("panel", Rect::new(0, 26, W, 4));
+    assert_eq!(wm.work_height(), 26);
+    // Opened or moved as low as possible: the title bar's last row is
+    // just above the panel.
+    let a = open(&mut wm, 0, 29, 12, 10);
+    assert_eq!(frame(&wm, a).y(), 26 - M.title_h as i32);
+    let _ = wm.move_to(a, 0, 100).expect("open");
+    assert_eq!(frame(&wm, a).y(), 22);
+    // Dragged down by its title bar: the same.
+    let _ = wm.pointer(at(2, 23, L));
+    let _ = wm.pointer(at(2, 29, L));
+    assert_eq!(frame(&wm, a).y(), 22);
 }
 
 #[test]
@@ -769,12 +884,23 @@ enum Px {
 
 fn painted(wm: &Wm, x: i32, y: i32) -> Px {
     let mut px = Px::Desktop;
-    for w in wm.windows() {
-        if let Some(part) = wm.metrics().part_at(&w.frame(), x, y) {
+    for w in wm.windows().iter().filter(|w| !w.is_minimized()) {
+        // A panel is frameless: all client.
+        let part = if w.is_panel() {
+            w.frame().contains(x, y).then_some(Part::Client)
+        } else {
+            wm.metrics().part_at(&w.frame(), x, y)
+        };
+        if let Some(part) = part {
             px = Px::Window { id: w.id(), part, focused: wm.focused() == Some(w.id()) };
         }
     }
     px
+}
+
+/// The front window that takes the focus: neither a panel nor minimized.
+fn front(wm: &Wm) -> Option<WindowId> {
+    wm.windows().iter().rev().find(|w| !w.is_panel() && !w.is_minimized()).map(|w| w.id())
 }
 
 fn full(wm: &Wm) -> Vec<Px> {
@@ -825,9 +951,13 @@ fn repainting_only_the_damage_matches_repainting_everything() {
     let buttons = [L, R, Buttons::MIDDLE];
     let (mut clicks, mut drags, mut follows, mut downs) = (0, 0, 0, 0);
     let (mut grab_seconds, mut held_resumes) = (0, 0);
-    for seed in [1, 0xdead_beef, 0x1234_5678_9abc_def1, 42] {
+    let (mut minimized, mut restored, mut panel_presses) = (0, 0, 0);
+    for (n, seed) in [1, 0xdead_beef, 0x1234_5678_9abc_def1, 42, 7, 0x5eed].into_iter().enumerate() {
         let mut rng = Rng(seed);
         let mut wm = wm();
+        // Half the seeds with a panel along the bottom (#157's taskbar).
+        let panel = (n % 2 == 1).then(|| wm.open_panel("panel", Rect::new(0, H as i32 - 4, W, 4)).0);
+        let work = wm.work_height();
         let mut o = Owners::default();
         let mut screen = full(&wm);
         // What the tablet holds (it goes on while the desktop is paused).
@@ -836,9 +966,12 @@ fn repainting_only_the_damage_matches_repainting_everything() {
         // A drag's offset from the frame's corner, as it started.
         let mut drag: Option<(WindowId, i32, i32)> = None;
         for step in 0..4000 {
-            let ids_now: Vec<WindowId> = wm.windows().iter().map(|w| w.id()).collect();
+            // The windows (not the panel), on the screen or minimized.
+            let ids_now: Vec<WindowId> = wm.windows().iter().filter(|w| !w.is_panel()).map(|w| w.id()).collect();
+            let shown: Vec<WindowId> =
+                wm.windows().iter().filter(|w| !w.is_panel() && !w.is_minimized()).map(|w| w.id()).collect();
             let mut outs = Vec::new();
-            match rng.range(0, 16) {
+            match rng.range(0, 18) {
                 0 | 1 if ids_now.len() < 6 => {
                     let (x, y) = (rng.range(-10, W as i32 + 5), rng.range(-10, H as i32 + 5));
                     let (id, out) = wm.open("w", rng.range(0, 20) as u32, rng.range(0, 14) as u32, x, y);
@@ -847,6 +980,18 @@ fn repainting_only_the_damage_matches_repainting_everything() {
                 }
                 // Sometimes an id already closed.
                 2 => outs.extend(rng.pick(&ids).and_then(|id| wm.close(id))),
+                // Minimize or restore one (sometimes in the wrong state:
+                // nothing).
+                16 => {
+                    let got = rng.pick(&ids_now).and_then(|id| wm.minimize(id));
+                    minimized += u32::from(got.is_some());
+                    outs.extend(got);
+                }
+                17 => {
+                    let got = rng.pick(&ids_now).and_then(|id| wm.restore(id));
+                    restored += u32::from(got.is_some());
+                    outs.extend(got);
+                }
                 3 => outs.extend(rng.pick(&ids_now).and_then(|id| wm.focus(id))),
                 4 => outs.extend(
                     rng.pick(&ids_now)
@@ -866,13 +1011,14 @@ fn repainting_only_the_damage_matches_repainting_everything() {
                 // A click (press and release at one place, as the
                 // harness's `click` sends it) on a window's close box,
                 // title bar or client.
-                7 if held.is_empty() && !ids_now.is_empty() => {
-                    let id = rng.pick(&ids_now).expect("a window");
+                7 if held.is_empty() && !shown.is_empty() => {
+                    let id = rng.pick(&shown).expect("a window");
                     let f = frame(&wm, id);
-                    let kind = rng.range(0, 3);
+                    let kind = rng.range(0, 4);
                     let aim = match kind {
                         0 => wm.metrics().close_box(&f),
                         1 => wm.metrics().title_bar(&f),
+                        2 => wm.metrics().minimize_box(&f),
                         _ => wm.metrics().client(&f),
                     };
                     let (x, y) = rng.point_in(aim);
@@ -892,24 +1038,30 @@ fn repainting_only_the_damage_matches_repainting_everything() {
                     }
                     // Aim at a window's parts often, so drags, grabs and
                     // close-box clicks happen.
-                    let (x, y) = match rng.pick(&ids_now).filter(|_| rng.one_in(2)) {
+                    let (x, y) = match rng.pick(&shown).filter(|_| rng.one_in(2)) {
                         Some(id) => {
                             let f = frame(&wm, id);
-                            let aim = match rng.range(0, 3) {
+                            let aim = match rng.range(0, 4) {
                                 0 => wm.metrics().title_bar(&f),
                                 1 => wm.metrics().close_box(&f),
+                                2 => wm.metrics().minimize_box(&f),
                                 _ => f,
                             };
                             rng.point_in(aim)
                         }
-                        None => (rng.range(-8, W as i32 + 8), rng.range(-8, H as i32 + 8)),
+                        None => match panel.filter(|_| rng.one_in(4)) {
+                            Some(p) => rng.point_in(frame(&wm, p)),
+                            None => (rng.range(-8, W as i32 + 8), rng.range(-8, H as i32 + 8)),
+                        },
                     };
                     if wm.grabbing().is_some() && !held.without(wm.buttons()).is_empty() {
                         grab_seconds += 1;
                     }
                     let p = Pointer { after_overrun: rng.one_in(40), ..at(x, y, held) };
-                    // A first press on a client is that window's.
-                    let first = (wm.is_idle() && !wm.is_paused() && wm.buttons().is_empty())
+                    // A first press on a client is that window's (unless the
+                    // event follows an overrun: then it went down in the
+                    // frames lost, not a press).
+                    let first = (wm.is_idle() && !wm.is_paused() && wm.buttons().is_empty() && !p.after_overrun)
                         .then(|| held.each().next())
                         .flatten()
                         .and_then(|b| match wm.hit(x, y) {
@@ -917,6 +1069,9 @@ fn repainting_only_the_damage_matches_repainting_everything() {
                             _ => None,
                         });
                     let out = wm.pointer(p);
+                    if first.is_some_and(|(id, _)| Some(id) == panel) {
+                        panel_presses += 1;
+                    }
                     if let Some((id, b)) = first {
                         assert!(
                             out.deliveries.iter().any(|d| matches!(*d, Delivery::PointerDown { window, button, .. } if window == id && button == b)),
@@ -929,7 +1084,11 @@ fn repainting_only_the_damage_matches_repainting_everything() {
                     match (wm.dragging(), drag) {
                         (Some(id), Some((was, dx, dy))) if id == was => {
                             let f = frame(&wm, id);
-                            assert_eq!((f.x(), f.y()), clamped(f.w(), x - dx, y - dy), "seed {seed:#x} step {step}");
+                            assert_eq!(
+                                (f.x(), f.y()),
+                                clamped(f.w(), work, x - dx, y - dy),
+                                "seed {seed:#x} step {step}"
+                            );
                             follows += 1;
                         }
                         (Some(id), _) => {
@@ -964,11 +1123,16 @@ fn repainting_only_the_damage_matches_repainting_everything() {
             if wm.dragging().is_some() {
                 assert!(wm.buttons().contains(L), "seed {seed:#x} step {step}: a drag without the left button");
             }
-            // Exactly one window is focused (the one in front), or none;
-            // a grab is always the focused window's.
-            assert_eq!(wm.focused(), wm.windows().last().map(|w| w.id()), "seed {seed:#x} step {step}");
+            // Exactly one window is focused (the front one that is neither
+            // a panel nor minimized), or none; a grab is always the focused
+            // window's, or a panel's (a press on it doesn't focus).
+            assert_eq!(wm.focused(), front(&wm), "seed {seed:#x} step {step}");
             if let Some(g) = wm.grabbing() {
-                assert_eq!(wm.focused(), Some(g), "seed {seed:#x} step {step}");
+                assert!(wm.focused() == Some(g) || Some(g) == panel, "seed {seed:#x} step {step}");
+            }
+            // The panel stays in front of every window.
+            if let Some(p) = panel {
+                assert_eq!(wm.windows().last().map(|w| w.id()), Some(p), "seed {seed:#x} step {step}");
             }
             // Hit testing agrees with the picture.
             for _ in 0..4 {
@@ -997,8 +1161,17 @@ fn repainting_only_the_damage_matches_repainting_everything() {
     }
     // The model reached what it checks.
     assert!(
-        clicks >= 10 && drags >= 10 && follows >= 20 && downs >= 20 && grab_seconds >= 10 && held_resumes >= 5,
+        clicks >= 10
+            && drags >= 10
+            && follows >= 20
+            && downs >= 20
+            && grab_seconds >= 10
+            && held_resumes >= 5
+            && minimized >= 10
+            && restored >= 10
+            && panel_presses >= 10,
         "close-box clicks {clicks}, drags {drags} (followed {follows} times), first presses {downs}, \
-         second buttons in a grab {grab_seconds}, resumes with buttons held {held_resumes}"
+         second buttons in a grab {grab_seconds}, resumes with buttons held {held_resumes}, \
+         minimized {minimized}, restored {restored}, presses on the panel {panel_presses}"
     );
 }

@@ -3,7 +3,7 @@
 //! ```text
 //! frame.x                                   frame.right()
 //!   +-----------------------------------------+  frame.y
-//!   | title bar (title_h rows, whole width) [x]|  <- close box
+//!   | title bar (title_h rows, whole width)[_][x]  <- minimize, close
 //!   +-+-------------------------------------+-+  frame.y + title_h
 //!   | |                                     | |
 //!   | |  client (the owner's surface)       | |  border columns
@@ -69,6 +69,25 @@ impl Metrics {
         Rect::new(x, y, self.close, self.close).intersect(&title).unwrap_or(Rect::EMPTY)
     }
 
+    /// The minimize box (#157): as big as the close box, `close_margin`
+    /// left of it, inside the title bar (empty if the frame is too narrow
+    /// or short for any of it).
+    pub fn minimize_box(&self, frame: &Rect) -> Rect {
+        let title = self.title_bar(frame);
+        let close = self.close_box(frame);
+        let step = i64::from(self.close_margin) + i64::from(self.close);
+        let right =
+            i64::from(frame.right()) - i64::from(self.border) - i64::from(self.close_margin) - i64::from(self.close);
+        let x = (right - step).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        let y = frame.y().saturating_add((self.title_h.saturating_sub(self.close) / 2) as i32);
+        let r = Rect::new(x, y, self.close, self.close).intersect(&title).unwrap_or(Rect::EMPTY);
+        // Never over the close box (a frame narrower than both).
+        match r.intersect(&close) {
+            Some(_) => Rect::EMPTY,
+            None => r,
+        }
+    }
+
     /// The client area: inside the borders, below the title bar.
     pub fn client(&self, frame: &Rect) -> Rect {
         let b = self.border;
@@ -87,6 +106,8 @@ impl Metrics {
             None
         } else if self.close_box(frame).contains(x, y) {
             Some(Part::CloseBox)
+        } else if self.minimize_box(frame).contains(x, y) {
+            Some(Part::MinimizeBox)
         } else if self.title_bar(frame).contains(x, y) {
             Some(Part::TitleBar)
         } else if self.client(frame).contains(x, y) {
@@ -101,6 +122,8 @@ impl Metrics {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Part {
     CloseBox,
+    /// The minimize box (#157), left of the close box.
+    MinimizeBox,
     TitleBar,
     Client,
     /// The left, right or bottom border.
@@ -121,6 +144,30 @@ mod tests {
         assert_eq!(M.title_bar(&f), Rect::new(5, 7, 44, 10));
         // Right border 2, margin 1, box 6: x = 49 - 9 = 40; centred in 10 rows.
         assert_eq!(M.close_box(&f), Rect::new(40, 9, 6, 6));
+        // The minimize box: as big, a margin (1) left of the close box.
+        assert_eq!(M.minimize_box(&f), Rect::new(33, 9, 6, 6));
+    }
+
+    #[test]
+    fn the_minimize_box_is_hit_at_every_edge_and_never_over_the_close_box() {
+        let f = M.frame_for(5, 7, 40, 30);
+        let at = |x, y| M.part_at(&f, x, y);
+        for (x, y) in [(33, 9), (38, 9), (33, 14), (38, 14)] {
+            assert_eq!(at(x, y), Some(Part::MinimizeBox), "({x}, {y})");
+        }
+        // One past each edge: title bar (the margin, then the close box).
+        for (x, y) in [(32, 9), (33, 8), (33, 15)] {
+            assert_eq!(at(x, y), Some(Part::TitleBar), "({x}, {y})");
+        }
+        assert_eq!(at(39, 9), Some(Part::TitleBar), "the margin between the boxes");
+        assert_eq!(at(40, 9), Some(Part::CloseBox));
+        // Too narrow for both: no minimize box, the close box kept.
+        let narrow = M.frame_for(0, 0, 4, 10);
+        assert!(M.minimize_box(&narrow).is_empty());
+        assert!(!M.close_box(&narrow).is_empty());
+        for f in [M.frame_for(0, 0, 0, 0), M.frame_for(i32::MAX - 3, i32::MIN, u32::MAX, u32::MAX)] {
+            assert!(f.contains_rect(&M.minimize_box(&f)) || M.minimize_box(&f).is_empty());
+        }
     }
 
     #[test]
