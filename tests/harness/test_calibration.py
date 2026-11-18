@@ -10,6 +10,7 @@ from lumen_harness.calibration import (
     TIMER,
     TSC,
     Judged,
+    agree,
     follows_the_tsc,
     judged,
     no_other_warnings,
@@ -17,6 +18,7 @@ from lumen_harness.calibration import (
     ppm_range,
     stalled,
     verdict,
+    warned_exactly_when_past,
     weighed,
 )
 
@@ -409,3 +411,32 @@ def test_the_verdicts_follow_the_tsc_clocks_prints():
     # A timer INFO line under the TSC's bound.
     with pytest.raises(AssertionError):
         follows_the_tsc(TIMER_FILLED.replace("1.4%", "0.2%"), 3_000)
+
+
+def test_a_warning_comes_exactly_when_the_bound_is_past_the_tolerance():
+    warned_exactly_when_past("", TSC, 10_000)
+    warned_exactly_when_past(TSC_OWN, TSC, 16_000)
+    warned_exactly_when_past(TIMER_FILLED, TIMER, 14_000)
+    with pytest.raises(AssertionError, match="did not warn"):
+        warned_exactly_when_past("", TSC, 10_001)
+    with pytest.raises(AssertionError, match="did not warn"):
+        warned_exactly_when_past(TIMER_FILLED, TIMER, 20_001)
+    with pytest.raises(AssertionError, match="but boot warned"):
+        warned_exactly_when_past(TSC_OWN, TSC, 10_000)
+    # The line prints the bound it was given (rounded up to a tenth).
+    with pytest.raises(AssertionError, match="verdict prints 1.6%"):
+        warned_exactly_when_past(TSC_OWN, TSC, 15_000)
+
+
+def test_two_calibrations_agree_within_2_or_their_bounds_under_10():
+    agree(1_000_000_000, 1_020_000_000, 1_000, 1_000)  # 2% apart: the floor
+    agree(1_000_000_000, 1_040_000_000, 20_000, 30_000)  # 4% apart, bounds 5%
+    with pytest.raises(AssertionError, match="disagree"):
+        agree(1_000_000_000, 1_021_000_000, 1_000, 1_000)
+    with pytest.raises(AssertionError, match="disagree"):
+        agree(1_000_000_000, 1_060_000_000, 20_000, 30_000)
+    # Bounds adding up to 10% or more tell nothing: #45's 11.8% would pass.
+    with pytest.raises(AssertionError, match="too wide to tell"):
+        agree(1_000_000_000, 1_118_000_000, 60_000, 60_000)
+    with pytest.raises(AssertionError, match="too wide to tell"):
+        agree(1_000_000_000, 1_000_000_000, 50_000, 50_000)

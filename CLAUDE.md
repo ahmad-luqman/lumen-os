@@ -131,9 +131,8 @@ own PR that updates that doc first.
 - **Tests on a busy host.** A guest's clocks run on while the host stalls
   its vCPU, so a loaded laptop or CI runner adds time to anything timed
   (measured in #139, #165, #170 and #171). A new or changed scenario or
-  ktest asserts only what the host can't change (older checks, such as
-  test_time's ceilings on unstalled calibrations, come in line when they
-  are next changed):
+  ktest asserts only what the host can't change (older checks come in
+  line when they are next changed):
   - a floor (the printed bound is at least the injected stall);
   - a decision that follows from the numbers the kernel printed
     (`lumen_harness.calibration`);
