@@ -93,6 +93,34 @@ tests = [
 ]
 
 [[feature]]
+name = "Terminal windows (#155): `terminal` opens the M2 terminal and a shell of its own in a desktop window, several at once (refused while the desktop isn't shown); keys typed go to the focused one only (its view read by `term text <window>` and drawn there, the others unchanged), a click focusing either; more lines than its rows scroll it (its pixels as a full repaint's); a command that draws on the screen is refused there with one line, also at the head of a pipeline; the focused window's cursor blinks, an unfocused one's is hollow and steady; `settled`: an unfocused window idle settles (nothing presented for over a second), a focused one or one running `top` never does (an animating wait never idles; a window busy while its shell runs a command; a wake not yet taken); the close box ends its owner and its shell (joined: both gone from `threads`), also with `rhai`'s REPL waiting in it, `top` running or a script in a loop (a closed console's `Key::Closed`, which every key reader stops on: `Key::interrupts`), and four windows opened and closed bring the heap back within 2 KiB, each having held more than 1 MiB; keys past its queue's room are dropped and counted; damage-only drawing still equals a full repaint after; the text console renders exactly as before (its goldens unchanged, its scrolled pixels as a full redraw's), through the renderer the windows share: only the cells that changed drawn, a scroll moving what was drawn, the cursor solid or hollow and never while scrolled back, drawing in steps equal to a full repaint (randomized); a window's cells pixel for pixel as the console's; its owner's wait ends at a deadline (the blink) or when its shell's output wakes it"
+milestone = "M4"
+tests = [
+    "scenario:test_gui::test_terminal_window_runs_shell",
+    "scenario:test_gui::test_terminal_windows_settle_only_when_idle",
+    "scenario:test_gui::test_closing_a_terminal_window_frees_it",
+    "scenario:test_gui::test_closing_a_terminal_window_ends_what_runs_in_it[*]",
+    "scenario:test_gui::test_a_terminal_window_scrolls",
+    "scenario:test_term::test_ansi_colours_golden",
+    "scenario:test_term::test_scrollback",
+    "scenario:test_term::test_virtual_terminals_are_independent",
+    "cargo:lumen-term",
+    "cargo:lumen-gfx",
+    "cargo:lumen-shell",
+    "harness:test_screen_text::*",
+    "ktest:lumen_kernel::termwin::a_window_shell_runs_a_line_and_ends_when_closed",
+    "ktest:lumen_kernel::termwin::closing_a_window_ends_what_its_shell_runs",
+    "ktest:lumen_kernel::termwin::a_window_s_owner_joins_its_shell_before_it_ends",
+    "ktest:lumen_kernel::termwin::keys_past_the_queue_s_room_are_dropped_and_counted",
+    "ktest:lumen_kernel::termwin::a_terminal_window_s_cells_look_as_the_console_s",
+    "ktest:lumen_kernel::termwin::a_window_s_scrolled_pixels_match_a_full_repaint",
+    "ktest:lumen_kernel::desktop::wait_event_until_ends_at_its_deadline_or_a_wake",
+    "ktest:lumen_kernel::desktop::settled_waits_for_a_busy_or_woken_window",
+    "ktest:lumen_kernel::term::a_terminal_window_s_commands_get_no_canvas",
+    "ktest:lumen_kernel::term::scrolled_pixels_match_a_full_redraw",
+    "ktest:lumen_kernel::shell::pipe::a_pipeline_in_a_terminal_window_gets_no_canvas",
+    "ktest:lumen_kernel::shell::sysinfo::top_shows_a_frame_and_quits_on_q",
+]
 name = "Terminal windows (#155): `terminal` opens the M2 terminal and a shell of its own in a desktop window, several at once; keys typed go to the focused one only (its view read by `term text <window>`, the others unchanged), a click focusing either; a command that draws on the screen is refused there with one line; an unfocused window's cursor is hollow and steady; the close box ends its owner and its shell (joined: both gone from `threads`), also with `rhai`'s REPL waiting in it (a closed console's `Key::Closed`, which every key reader stops on), and its heap comes back (within 16 KiB, against the window's more than 1 MiB); damage-only drawing still equals a full repaint after; the text console renders exactly as before (its goldens unchanged), through the renderer the windows share: only the cells that changed drawn, a scroll moving what was drawn, the cursor solid or hollow and never while scrolled back, drawing in steps equal to a full repaint (randomized); a window's cells pixel for pixel as the console's; its owner's wait ends at a deadline (the blink) or when its shell's output wakes it, idle meanwhile"
 milestone = "M4"
 tests = [

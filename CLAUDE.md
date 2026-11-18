@@ -145,8 +145,9 @@ own PR that updates that doc first.
   I/O APIC, 8259 and PIT registers, serial, IST stacks. `crash.rs`: crash
   reporter. `ktest.rs`: test runner. `script.rs`: rhai scripts (the shell's
   `rhai`; built-in scripts in `script/`). `shell/`: the shells, one on serial
-  (plain text unless `lumen.ansi`) and one on each virtual terminal (keyboard): `mod.rs`
-  the consoles and `Ctx` (keys through `poll_key`/`wait_key`, the screen
+  (plain text unless `lumen.ansi`), one on each virtual terminal (keyboard) and one in each terminal
+  window (`run_in_window`, #155): `mod.rs` the consoles (`Console::place`: anywhere, a virtual terminal
+  or a window; `closed`) and `Ctx` (keys through `poll_key`/`wait_key`, the screen
   through `canvas`), their commands (`commands.rs`: each row carries its
   help line; the system ones in `sysinfo.rs`), pipelines (`pipe.rs`: `cpus |
   where busy > 50`) and deliberate faults (`crash.rs`). `fb.rs`:
@@ -334,7 +335,9 @@ own PR that updates that doc first.
   words, usage and help lines), pipelines (text or records in tables, the
   filters `grep`, `where`, `sort`, `first`, `count`, `select`), serial
   bytes to keys, a key press to the line editor's key (`Key::from_press`,
-  shared by text mode and terminal windows, with #155) (host-tested).
+  shared by text mode and terminal windows), `Key::Closed`/`Event::Closed`
+  (a closed console's input) and `Key::interrupts` (Ctrl-C or Closed: what
+  commands polling for a key stop on) (host-tested).
 - `crates/lumen-acpi`: ACPI table parser: RSDP, XSDT/RSDT, MADT, HPET, MCFG,
   FADT (PM1 control blocks) and the DSDT's `_S5_` by byte search
   (host-tested on handcrafted tables).

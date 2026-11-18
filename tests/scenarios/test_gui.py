@@ -14,7 +14,7 @@ from lumen_harness.image import assert_matches_golden, compare
 from lumen_harness.qemu import Devices, Machine
 from lumen_harness.screen import expect_screen, expect_window, read_screen, read_window
 from lumen_harness.screenshot import FrameError, assert_matches_screendump, parse_frame
-from lumen_harness.shell import PROMPT, read_output, run
+from lumen_harness.shell import PROMPT, heap_line, read_output, run
 from PIL import Image
 
 SHELLS = r"INFO  shell: shells on serial and the screen; type 'help'\n"
@@ -557,6 +557,7 @@ TERM_TEXT_RGB = (0xE6, 0xE6, 0xE6)
 TERM_BG_RGB = (0x0F, 0x14, 0x20)
 TITLE_H = 24
 NO_CANVAS = "life: a terminal window has no canvas: run it on a virtual terminal (Alt+F1)"
+TERM_THREADS = ("terminal", "term-shell")
 
 
 def open_terminal(m: Machine) -> int:
@@ -570,10 +571,19 @@ def open_terminal(m: Machine) -> int:
     return window
 
 
-def click(m: Machine, x: int, y: int) -> None:
-    gui.pointer_move(m, x, y)
-    gui.pointer_down(m)
-    gui.pointer_up(m)
+def cell_xy(frame: tuple[int, int, int, int], col: int, row: int) -> tuple[int, int]:
+    """The top-left pixel of cell (`col`, `row`) of the terminal window whose
+    frame is `frame`."""
+    return (
+        frame[0] + 1 + TERM_PAD + col * TERM_CELL_W,
+        frame[1] + TITLE_H + TERM_PAD + row * TERM_CELL_H,
+    )
+
+
+def close_box(frame: tuple[int, int, int, int]) -> tuple[int, int]:
+    """The middle of a frame's close box (16 pixels, 4 in from the right
+    border, centred in the title bar)."""
+    return frame[0] + frame[2] - 1 - 4 - 8, frame[1] + TITLE_H // 2
 
 
 def wait_focused(m: Machine, title: str) -> None:
@@ -588,22 +598,13 @@ def thread_names(m: Machine) -> list[str]:
 
 
 def heap_used(m: Machine) -> int:
-    found = re.search(
-        r"^heap: \d+ bytes mapped at 0x[0-9a-f]+, (\d+) used", run(m, "heap"), re.MULTILINE
-    )
-    assert found, "no heap line"
-    return int(found[1])
+    return int(heap_line(run(m, "heap"))["used"])
 
 
-def close_terminal(
-    m: Machine, title: str, threads: tuple[str, ...] = ("terminal", "term-shell")
-) -> None:
+def close_terminal(m: Machine, title: str, threads: tuple[str, ...] = TERM_THREADS) -> None:
     """Click terminal window `title`'s close box; wait until the window is
     gone from `windows` and none of `threads` is in `threads`."""
-    x, y, w, _ = frame_of(gui.window(m, title))
-    # The close box: 16 pixels, 4 in from the right border, centred in the
-    # title bar.
-    click(m, x + w - 1 - 4 - 8, y + TITLE_H // 2)
+    gui.click(m, *close_box(frame_of(gui.window(m, title))))
     gui.wait_for(
         m,
         f"{title} closed",
@@ -614,25 +615,36 @@ def close_terminal(
     gui.pointer_move(m, 1200, 790)
 
 
+def poll_screendump(m: Machine, name: str, done, timeout: float = 5) -> Path:
+    """Take screendumps until `done(path)` holds (at most `timeout`
+    seconds, scaled); the last one's path."""
+    deadline = time.monotonic() + timeout * m.timeout_scale
+    while True:
+        shot = m.screendump(name)
+        if done(shot):
+            return shot
+        assert time.monotonic() < deadline, f"{name}: never so in {timeout} s"
+        time.sleep(0.05)
+
+
 def test_terminal_window_runs_shell(boot):
     # Two terminal windows, each its own shell. The second opens in front
     # and focused; a click on the first's client area focuses it, a click on
     # the second's title bar focuses the second again. Keys typed (confirmed
     # one at a time) run `echo hello` in the second only: its view (`term
-    # text <window>`) shows the output, the first's is unchanged. A command
-    # that draws on the screen is refused there with one line. The
-    # unfocused first window's cursor is hollow and steady: outlined in the
-    # text colour, its middle the background, in two screendumps more than
-    # a blink apart.
+    # text <window>`) shows the output and it is drawn there, while the
+    # first's view and pixels are unchanged. A command that draws on the
+    # screen is refused there with one line. The focused window's cursor
+    # blinks: both looks of its cell show within 2 s.
     m = boot_tablet(boot)
     gui.start_desktop(m)
     first, second = open_terminal(m), open_terminal(m)
     assert second != first
     one, two = frame_of(gui.window(m, "Terminal-1")), frame_of(gui.window(m, "Terminal-2"))
     assert gui.window(m, "Terminal-2")["focused"] == "yes"
-    click(m, one[0] + 100, one[1] + 200)
+    gui.click(m, one[0] + 100, one[1] + 200)
     wait_focused(m, "Terminal-1")
-    click(m, two[0] + 200, two[1] + 8)
+    gui.click(m, two[0] + 200, two[1] + 8)
     wait_focused(m, "Terminal-2")
     gui.pointer_move(m, 1200, 790)
     before = read_window(m, first)
@@ -640,12 +652,12 @@ def test_terminal_window_runs_shell(boot):
     expect_window(m, second, r"^lumen> echo hello\nhello\nlumen>$")
     assert read_window(m, first) == before
     # Drawn in the second window's row of "hello" (some pixel of its five
-    # cells isn't the background), and not in the first's same row.
+    # cells isn't the background), once its owner has drawn it, and never
+    # in the first's same row.
     row = read_window(m, second).rows.index("hello")
 
     def inked(frame: tuple[int, int, int, int], shot) -> bool:
-        x0 = frame[0] + 1 + TERM_PAD
-        y0 = frame[1] + TITLE_H + TERM_PAD + row * TERM_CELL_H
+        x0, y0 = cell_xy(frame, 0, row)
         with Image.open(shot) as img:
             rgb = img.convert("RGB")
             return any(
@@ -654,60 +666,126 @@ def test_terminal_window_runs_shell(boot):
                 for y in range(y0, y0 + TERM_CELL_H)
             )
 
-    shot = m.screendump("hello.png")
-    assert inked(two, shot) and not inked(one, shot)
+    shot = poll_screendump(m, "hello.png", lambda shot: inked(two, shot))
+    assert not inked(one, shot)
     gui.type_confirmed(m, "life\n")
     expect_window(m, second, "^" + re.escape(NO_CANVAS) + r"\nlumen>$")
     assert read_window(m, first) == before
-    assert before.cursor is not None
-    col, row = before.cursor
-    x = one[0] + 1 + TERM_PAD + col * TERM_CELL_W
-    y = one[1] + TITLE_H + TERM_PAD + row * TERM_CELL_H
-    for name in ("cursor-a.png", "cursor-b.png"):
-        shot = m.screendump(name)
-        assert pixel(shot, x + 3, y) == TERM_TEXT_RGB, name
-        assert pixel(shot, x, y + 8) == TERM_TEXT_RGB, name
-        assert pixel(shot, x + 3, y + 8) == TERM_BG_RGB, name
-        time.sleep(0.7)
+    # The focused second window's cursor: on (the cell inverted: its middle
+    # the text colour) and off (the background), both within 2 s.
+    cursor = read_window(m, second).cursor
+    assert cursor is not None
+    x, y = cell_xy(two, *cursor)
+    seen = set()
+    poll_screendump(
+        m,
+        "blink.png",
+        lambda shot: seen.add(pixel(shot, x + 3, y + 8)) or {TERM_TEXT_RGB, TERM_BG_RGB} <= seen,
+        2,
+    )
+
+
+def test_terminal_windows_settle_only_when_idle(boot):
+    # `desktop status`'s `settled` and terminal windows. An unfocused
+    # terminal window whose shell waits for a key settles, its owner idle:
+    # its cursor hollow (outlined in the text colour, the background in its
+    # middle) and steady, nothing presented for over a second. A focused one
+    # never settles (its cursor blinks). One running `top` never settles
+    # either, unfocused (its shell is busy, its output keeps coming).
+    m = boot_tablet(boot)
+    gui.start_desktop(m)
+    window = open_terminal(m)
+    frame = frame_of(gui.window(m, "Terminal-1"))
+    reads = [gui.desktop_status(m)["settled"] for _ in range(8)]
+    assert reads == ["no"] * 8, reads
+    # Unfocused: a click on the Colours window.
+    gui.click(m, COLOURS[0] + 200, COLOURS[1] + 150)
+    wait_focused(m, "Colours")
+    gui.pointer_move(m, 1200, 790)
+    settled = gui.wait_settled(m)
+    time.sleep(1.2)
+    later = gui.desktop_status(m)
+    assert later["settled"] == "yes" and later["frames"] == settled["frames"], (settled, later)
+    cursor = read_window(m, window).cursor
+    assert cursor is not None
+    x, y = cell_xy(frame, *cursor)
+    shot = gui.settled_screendump(m, "hollow.png")
+    assert pixel(shot, x + 3, y) == TERM_TEXT_RGB
+    assert pixel(shot, x, y + 8) == TERM_TEXT_RGB
+    assert pixel(shot, x + 3, y + 8) == TERM_BG_RGB
+    # `top`, typed in it focused, then left running unfocused.
+    gui.click(m, frame[0] + 200, frame[1] + 200)
+    wait_focused(m, "Terminal-1")
+    gui.type_confirmed(m, "top\n")
+    expect_window(m, window, r"^top: frame", 10)
+    gui.click(m, COLOURS[0] + 200, COLOURS[1] + 150)
+    wait_focused(m, "Colours")
+    gui.pointer_move(m, 1200, 790)
+    reads = []
+    for _ in range(8):
+        reads.append(gui.desktop_status(m)["settled"])
+        time.sleep(0.2)
+    assert reads == ["no"] * 8, reads
 
 
 def test_closing_a_terminal_window_frees_it(boot):
     # The close box ends a terminal window: the window goes, its owner and
-    # its shell end (joined: neither in `threads`), and the heap is back
-    # within 16 KiB of what it was before the window opened (it held its
-    # grid and scrollback, two surfaces and its shell, well over 1 MiB;
-    # the serial shell's own history grows by the lines typed meanwhile).
-    # One window opened and closed first, so first-use allocations don't
-    # count. Then damage-only drawing still equals a full repaint.
+    # its shell end (joined: neither in `threads`). One window is opened and
+    # closed first, so first-use allocations don't count; then four, one at
+    # a time, each holding well over 1 MiB (its grid and scrollback, two
+    # surfaces, its shell): the heap after all four is back within 2 KiB of
+    # before (the serial shell's own history grows by the lines typed). Then
+    # damage-only drawing still equals a full repaint.
     m = boot_tablet(boot)
     gui.start_desktop(m)
-
     open_terminal(m)
     close_terminal(m, "Terminal-1")
     before = heap_used(m)
-    open_terminal(m)
-    names = thread_names(m)
-    assert "terminal" in names and "term-shell" in names, names
-    opened = heap_used(m)
-    close_terminal(m, "Terminal-2")
+    for n in range(2, 6):
+        open_terminal(m)
+        names = thread_names(m)
+        assert "terminal" in names and "term-shell" in names, names
+        assert heap_used(m) - before > 1024 * 1024, n
+        close_terminal(m, f"Terminal-{n}")
     after = heap_used(m)
-    assert opened - before > 1024 * 1024, (before, opened)
-    assert after - before <= 16 * 1024, (before, opened, after)
+    assert after - before <= 2 * 1024, (before, after)
     assert gui.desktop_check(m) == (0, 0)
 
 
-def test_closing_a_terminal_window_ends_its_rhai(boot):
-    # `rhai`'s REPL waiting for a line in a terminal window when its close
-    # box is clicked: the REPL ends (a closed console is no Ctrl-C, which
-    # would only give a new prompt), then the shell, so the window's owner
-    # joins it: `rhai`, `term-shell` and `terminal` all leave `threads`.
+@pytest.mark.parametrize(
+    ("command", "started", "threads"),
+    [
+        ("rhai", r"^rhai> ?$", ("rhai", *TERM_THREADS)),
+        ("top", r"^top: frame", TERM_THREADS),
+        ("rhai -e loop{}", r"^lumen> rhai -e loop\{\}$", ("rhai", *TERM_THREADS)),
+    ],
+    ids=["rhai-repl", "top", "script-loop"],
+)
+def test_closing_a_terminal_window_ends_what_runs_in_it(boot, command, started, threads):
+    # A command running in a terminal window when its close box is
+    # clicked: `rhai`'s REPL waiting for a line (a closed console is no
+    # Ctrl-C, which would only give a new prompt), `top` between frames, a
+    # script in a loop (its Ctrl-C check). Each stops on the closed
+    # console's `Key::Closed`, then the shell, so the owner joins it: the
+    # command's thread, `term-shell` and `terminal` all leave `threads`.
     m = boot_tablet(boot)
     gui.start_desktop(m)
     window = open_terminal(m)
-    gui.type_confirmed(m, "rhai\n")
-    expect_window(m, window, r"^rhai> $|^rhai>$")
-    assert "rhai" in thread_names(m)
-    close_terminal(m, "Terminal-1", ("rhai", "terminal", "term-shell"))
+    gui.type_confirmed(m, command + "\n")
+    expect_window(m, window, started, 10)
+    close_terminal(m, "Terminal-1", threads)
+
+
+def test_a_terminal_window_scrolls(boot):
+    # More lines than its 24 rows: the view shows the last ones, its pixels
+    # moved up (a ktest compares them with a full repaint).
+    m = boot_tablet(boot)
+    gui.start_desktop(m)
+    window = open_terminal(m)
+    gui.type_confirmed(m, "seq 40\n")
+    expect_window(m, window, r"^38\n39\n40\nlumen>$")
+    screen = read_window(m, window)
+    assert screen.rows[0] == "18", screen.rows
 
 
 # -- text, wallpaper, themes (#154) ----------------------------------------------

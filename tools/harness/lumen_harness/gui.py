@@ -517,6 +517,17 @@ def pointer_up(
     return _press_or_release(m, button, False, timeout, allow)
 
 
+def click(
+    m: Machine, x: int, y: int, button: str = "left", timeout: float = 10, allow: str | None = None
+) -> PointerReport:
+    """Move the pointer to (`x`, `y`), then press and release `button`
+    there, each step confirmed (`pointer_move`, `pointer_down`,
+    `pointer_up`). (`Machine.click` sends the same frames unconfirmed.)"""
+    pointer_move(m, x, y, timeout=timeout, allow=allow)
+    pointer_down(m, button, timeout=timeout, allow=allow)
+    return pointer_up(m, button, timeout=timeout, allow=allow)
+
+
 def drag_path(start: tuple[int, int], end: tuple[int, int], steps: int) -> list[tuple[int, int]]:
     """The `steps` positions a drag from `start` moves through to `end`,
     evenly spaced (rounded to pixels), the last one `end`."""

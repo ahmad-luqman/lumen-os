@@ -181,3 +181,24 @@ def wait_for_output(m: Machine, start: int, pattern: str, timeout: float = 10) -
             raise AssertionError(f"no {pattern!r} in {m.output[start:]!r}")
         time.sleep(0.05)
     return found
+
+
+# The heap's one-line summary (the shell's `heap`, crash reports), written by
+# `Snapshot::write` in kernel/src/mm/heap.rs. This matches only the plain
+# form with an intact free list: a crash with the heap's lock held labels it
+# "heap (lock held; may be mid-update)", and a failed walk replaces the
+# "in N blocks" part.
+HEAP_LINE = re.compile(
+    r"^heap: (?P<mapped>\d+) bytes mapped at (?P<base>0x[0-9a-f]+), (?P<used>\d+) used in "
+    r"(?P<live>\d+) allocations, (?P<free>\d+) free in (?P<blocks>\d+) blocks \(largest (?P<largest>\d+)\)"
+    r"(?:; last growth failed for (?P<fail_size>\d+) bytes \(align (?P<fail_align>\d+)\): (?P<error>.+))?$",
+    re.MULTILINE,
+)
+
+
+def heap_line(text: str) -> dict[str, str]:
+    """The fields of the heap line in `text` (the shell's `heap`, a crash
+    report)."""
+    m = HEAP_LINE.search(text)
+    assert m, f"no heap line in:\n{text}"
+    return m.groupdict()

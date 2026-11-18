@@ -60,7 +60,9 @@ pub struct Ctx<'a> {
     /// is formatted first, then drawn under one lock; on serial it is
     /// formatted under the log's line lock, so a `Display` that logs would
     /// take that lock again, a re-lock crash report: make such text before
-    /// the call). While a command holds the canvas
+    /// the call; in a terminal window, #155, it reaches the window's grid in
+    /// pieces, so its owner may draw half of it before the rest). While a
+    /// command holds the canvas
     /// (`term::status().paused`), output to the terminals reaches them but
     /// isn't drawn.
     pub out: &'a mut dyn Console,
@@ -112,7 +114,9 @@ impl<'a> Ctx<'a> {
     /// Wait for the next key typed on this console (see [`Self::poll_key`]):
     /// on a virtual terminal the thread sleeps until IRQ 1 (or another
     /// shell routing it a key); on serial until IRQ 4 brings a byte
-    /// (`serial_in`; it polls, yielding, without that interrupt).
+    /// (`serial_in`; it polls, yielding, without that interrupt); in a
+    /// terminal window (#155) until its owner hands it one, or at once with
+    /// `Key::Closed` once the window closed.
     #[allow(dead_code, reason = "the first users are the demos and scripts (#67, #68)")]
     pub fn wait_key(&mut self) -> Key {
         self.out.read_key()
@@ -401,6 +405,10 @@ fn run_lines(mut console: impl Console, mut editor: Editor) {
         flush(&mut console, &mut shown);
         let line = loop {
             let key = console.read_key();
+            // A console that closed gives `Key::Closed`, which ends the line
+            // below too; this check stops before the editor sees any key
+            // read at the close (and the loop's own check, before a prompt
+            // nobody would see).
             if console.closed() {
                 return;
             }
