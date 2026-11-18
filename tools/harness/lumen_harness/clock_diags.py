@@ -170,7 +170,7 @@ def check_clock_diags(report: tap.TapReport, text: str) -> None:
         expected = sum(max(n - 1, 0) for n in taken)
         assert int(b["retries"]) == expected, f"retries don't match the readings: {line}"
     m = one_diagnostic(report, "time::now_ns_follows_the_hpet", HPET_BRACKETS)
-    start, end, retries = _widths(m["start"]), _widths(m["end"]), int(m["retries"])
+    start, end = _widths(m["start"]), _widths(m["end"])
     assert start and end, f"an end has no readings: {m.group(0)}"
     assert start[-1] <= HPET_BRACKET_NS and end[-1] <= HPET_BRACKET_NS, m.group(0)
     # The timer test's brackets each hold an HPET read, so they have widths.

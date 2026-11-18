@@ -174,6 +174,19 @@ impl Calibration {
         self.windows.iter().filter(|w| w.is_steady()).count()
     }
 
+    /// Whether every kept window is steady, as a calibration that stopped
+    /// before [`ATTEMPTS`] windows has (`lumen_time::steadiest_windows`
+    /// takes windows until [`WINDOWS`] are steady or the attempts run out),
+    /// or it ran out of attempts and the least unsteady filled in. A loaded
+    /// host can make every window of a run unsteady (#158's audit: at load
+    /// up to 9, slow PIT reads left both gaps of every window at 0.25% to
+    /// 0.97% after 20 windows, in 22 of 40 boots), so which of the two a
+    /// run took is the host's; that it is one of them is the code's.
+    #[cfg(feature = "ktest")]
+    fn steady_or_out_of_attempts(&self) -> bool {
+        self.steady() == WINDOWS || self.steady() + self.retaken == ATTEMPTS
+    }
+
     /// The most its windows' median can be off, in ppm, on their own: the
     /// `(N / 2 + 1)`-th smallest of their bounds
     /// ([`lumen_time::median_bound_ppm`]).
@@ -1592,18 +1605,23 @@ crate::ktest!(
         // The first two windows' end readings are paused 1 ms between latching
         // the counter and reading the TSC, as a host descheduling the vCPU
         // there would: their ends are 10% uncertain, so both are taken again
-        // (a loaded host may add more), and the calibration still gives the
-        // TSC's frequency, within 1% (or its bound and the boot's, if more:
-        // CROSS_CHECK_FLOOR_PPM).
+        // (a loaded host may add more), neither is kept, and the calibration
+        // still gives the TSC's frequency, within 1% (or its bound and the
+        // boot's, if more: CROSS_CHECK_FLOOR_PPM). Its kept windows are
+        // steady, or it ran out of attempts and the least unsteady filled in
+        // (`Calibration::steady_or_out_of_attempts`: a loaded host's slow PIT
+        // reads can leave every window unsteady).
         use crate::kassert;
         let hz = tsc().ok_or("TSC not calibrated")?.hz();
         let count = lumen_time::pit_count(WINDOW_NS).ok_or("no PIT count")?;
-        let mut taken = 0;
+        let (mut taken, mut paused) = (0, [None::<Window>; 2]);
         let cal = off_or_diag("calibrating against the PIT failed", || {
             median_tsc_hz(Reference::Pit, PIT_HZ, || {
                 taken += 1;
                 if taken <= 2 {
-                    pit_window(count, sleep_at(Pause::EndAfterRead, 1_000_000))
+                    let w = pit_window(count, sleep_at(Pause::EndAfterRead, 1_000_000))?;
+                    paused[taken - 1] = Some(w);
+                    Ok(w)
                 } else {
                     pit_window(count, |_| {})
                 }
@@ -1613,7 +1631,8 @@ crate::ktest!(
         crate::ktest::diag(format_args!("{shown}"));
         kassert!(cal.retaken >= 2);
         kassert!(cal.last_retaken.is_some_and(|w| !w.is_steady()));
-        kassert!(cal.windows.iter().all(Window::is_steady));
+        kassert!(paused.iter().all(|p| p.is_some_and(|p| !cal.windows.contains(&p))));
+        kassert!(cal.steady_or_out_of_attempts());
         // As clocks shows it (Calibration's Display).
         kassert!(shown.ends_with(&alloc::format!("] retook {}", cal.retaken)));
         // Within CROSS_CHECK_FLOOR_PPM, or its bound and the boot's if more.
@@ -1661,6 +1680,10 @@ crate::ktest!(
         kassert_eq!(cal.median_bound_ppm(), w(18).tsc_error_ppm());
         kassert!(cal.median_bound_ppm() > 108_000 && cal.median_bound_ppm() < 110_000);
         kassert_eq!(report(&cal).verdict, Verdict::Imprecise);
+        // Out of attempts: unsteady windows kept is what it may do then, and
+        // only then.
+        kassert!(cal.steady_or_out_of_attempts());
+        kassert!(!Calibration { retaken: ATTEMPTS - 1, ..cal }.steady_or_out_of_attempts());
         Ok(())
     }
 );
@@ -1732,10 +1755,12 @@ crate::ktest!(
         // were (#139: 250 µs each, 40 polls in 10 ms): the end gap is 2% of a
         // 10 ms window, unsteady however late it is taken again. Taken again
         // longer (the gap is one poll's worth, a slow read, not a burst),
-        // until the same gaps are under 0.5% of it, all five kept windows are
-        // steady (none filling in) and longer than 10 ms, and the rate is
-        // within 1% (or its bound and the boot's, if more).
-        use crate::{kassert, kassert_eq};
+        // until the same gaps are under 0.5% of it, the kept windows are
+        // steady (or, a loaded host stalling every window too, the attempts
+        // ran out and the least unsteady filled in:
+        // `Calibration::steady_or_out_of_attempts`) and longer than 10 ms,
+        // and the rate is within 1% (or its bound and the boot's, if more).
+        use crate::kassert;
         let hpet = hpet().ok_or("no HPET")?;
         let hz = tsc().ok_or("TSC not calibrated")?.hz();
         let base = hpet.clock().ticks(WINDOW_NS);
@@ -1758,7 +1783,7 @@ crate::ktest!(
             })
         })?;
         crate::ktest::diag(format_args!("{cal}, median within {} ppm", cal.median_bound_ppm()));
-        kassert_eq!(cal.steady(), WINDOWS);
+        kassert!(cal.steady_or_out_of_attempts());
         // Taken again at least once: a 10 ms window is almost never steady
         // with 200 µs reads (a host stall outside its gaps can make one so,
         // and it is kept: the target stays 10 ms). Until the first window set
