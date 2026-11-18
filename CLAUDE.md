@@ -165,7 +165,7 @@ own PR that updates that doc first.
   pointer drawn on the screen only, both input rings through `lumen_wm::Wm`, the cut), windows
   (`open_window`, `open_window_at`, `WindowHandle`: an owner's surface and a committed one, `commit`,
   `next_event`/`wait_event`/`wait_event_until`, a `Waker` for another thread, `Desktop::without_screen` for the
-  ktests; `publish`: a toolkit's tree; `bands_mut`), each window's root node, the two demo windows, panels
+  ktests; `publish`: a toolkit's tree), each window's root node, the two demo windows, panels
   (#157: `open_panel`, the taskbar: frameless, in front, never focused, left out of `windows`), minimized
   windows (not composed; `minimize_window`/`restore_window`), `desktop` (`status`,
   `check`, `spin`, `counter`, `tick`, `hold`/`release`) and `windows`, and the tree's accessors for `ui.rs`
@@ -184,8 +184,10 @@ own PR that updates that doc first.
   owner thread (`terminal`: draws the grid, hands keys over, blinks the focused one's cursor) and its shell
   (`term-shell`, `shell::run_in_window` on a closable console), joined on close; `term text <window>`.
   `taskbar.rs`: the desktop shell's taskbar (#157): a panel along the bottom, its `Launcher` menu
-  (Terminal, Mandelbrot, Life, Counter), a button per window, the `Clock` (the RTC polled every
-  second; `desktop tick` moves it a minute ahead), its `taskbar` owner thread. `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
+  (Terminal, Mandelbrot, Life, Counter; refused while paused, a failure answered `Then::Failed`), a
+  button per window, the `Clock` (the RTC polled without animating, `rtc::now_quiet`, its last reading kept
+  on errors; `desktop tick` moves it a minute ahead), its `taskbar` owner thread
+  (`lumen.taskbar_wake_delay_ms=` holds back a poke's handling, for the scenarios). `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`, `now_quiet` for pollers; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
