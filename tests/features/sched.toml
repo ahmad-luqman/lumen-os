@@ -52,10 +52,11 @@ tests = [
 ]
 
 [[feature]]
-name = "join blocks until the thread has finished and its stack is freed"
+name = "join blocks until the thread has finished, its stack is freed and its CPU holds it no more (the joiner releases it: a CPU held up 20 ms after waking the joiner still lets go before join returns)"
 milestone = "M2"
 tests = [
     "ktest:lumen_kernel::sched::join_blocks_until_the_thread_is_reaped",
+    "ktest:lumen_kernel::sched::a_joined_thread_is_released_before_join_returns",
     "ktest:lumen_kernel::sched::a_dead_threads_stack_is_freed",
     "ktest:lumen_kernel::sched::a_thread_dying_into_a_fresh_one_is_reaped",
 ]

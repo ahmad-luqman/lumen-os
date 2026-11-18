@@ -732,7 +732,8 @@ lock. Like every `SpinLock`, it keeps interrupts off while held, so an
 interrupt handler is allowed to allocate. The timer interrupt can free
 (in `sched::finish_switch`): a detached dead thread's record and its
 joiners' list (its stack goes back through the page tables and frame
-allocator); the scheduler reserves room in its queues so the timer never
+allocator; a joined thread's are freed by its joiner, as `join` waits for
+`finish_switch` to let go of it); the scheduler reserves room in its queues so the timer never
 allocates.
 
 ## 6. Interrupts, exceptions and crash reports (built)
@@ -941,7 +942,9 @@ from `mm::stack` (a guard page below it, hard rule 4; registered as a
 blocked or dead. (`main` and the APs' idle threads run on stacks they don't
 own.) `sched::spawn(name, f)` starts one on this CPU and `spawn_on(cpu, ..)`
 on another; both return a `JoinHandle`, whose `join` blocks until the
-thread has finished and its stack is freed. A thread **never moves between
+thread has finished, its stack is freed and its CPU holds it no more, so
+the joiner holds the last reference and whatever releasing the thread frees
+is freed there (#183). A thread **never moves between
 CPUs**: each CPU has its own run queue (a FIFO) and only that CPU takes
 threads off it, so once its spawner has laid out its first frame, a
 thread's saved registers are touched only by its home CPU with interrupts
@@ -1034,7 +1037,8 @@ off. A wake from another CPU queues the thread there and sends the
 - **Exit:** only a spawned thread can exit, not `main` or an idle thread
   (asserted, not tested). Its stack is freed by the next thread to run on
   its CPU (the unmap's TLB flush is local; see "Other CPUs" on the
-  spawner's entry); only then does `join` return.
+  spawner's entry); only then, and once that thread has dropped its
+  reference to the dead one (`FINISHING`), does `join` return.
 - **Observability:** every switch records a `switch` trace event (previous
   and next thread's ids, the previous thread's state), and the serial crash
   report names the running thread (`thread: <name> (id N)`).

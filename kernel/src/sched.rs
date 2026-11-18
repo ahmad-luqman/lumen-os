@@ -424,6 +424,17 @@ pub fn next_thread_id() -> u64 {
 /// must never be taken under the heap's, the page tables' or the frame
 /// allocator's locks.
 static THREADS: SpinLock<Vec<Weak<Thread>>> = SpinLock::new(Vec::new());
+/// The id of the dead thread each CPU's [`finish_switch`] still holds a
+/// reference to (0: none). It wakes the joiners before it drops that
+/// reference, so [`JoinHandle::join`] waits for this to clear: the joiner's
+/// reference is then the last, and what dropping the thread frees is freed
+/// there, not on that CPU some time later (#183: a joiner's 32-byte wait
+/// queue freed inside the next ktest's heap accounting on loaded KVM).
+static FINISHING: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// How long [`finish_switch`] holds a dead thread after waking its joiners
+/// (0: not at all), to widen that window for a ktest.
+#[cfg(feature = "ktest")]
+static FINISH_DELAY_NS: AtomicU64 = AtomicU64::new(0);
 /// Ticks each CPU's scheduler has taken (from its start), and how many of
 /// them found the idle thread running. A tick is counted in `TICKED` before
 /// `IDLE_TICKS` (whose increment releases it), and [`cpu_ticks`] reads them
@@ -651,12 +662,20 @@ impl JoinHandle {
         &self.thread
     }
 
-    /// Wait until the thread has finished and its stack is freed. Blocks the
-    /// calling thread (see [`WaitQueue::wait_until`] for where it can).
+    /// Wait until the thread has finished, its stack is freed and its CPU
+    /// holds it no more ([`FINISHING`]): the last reference to it is then the
+    /// caller's (this handle's, or a clone's), so it is released here, not
+    /// later on its CPU. Blocks the calling thread (see
+    /// [`WaitQueue::wait_until`] for where it can).
     pub fn join(self) {
         let t = &self.thread;
         assert!(!current().is_some_and(|c| Arc::ptr_eq(&c, t)), "thread {t:?} joining itself");
         t.exited.wait_until(|| t.reaped.load(Ordering::Acquire));
+        // Its CPU let go right after waking us, unless held up (a vCPU the
+        // host paused there); a moment at most.
+        while FINISHING[t.cpu].load(Ordering::Acquire) == t.id {
+            yield_now();
+        }
     }
 }
 
@@ -949,10 +968,23 @@ fn schedule(cpu: usize) {
 fn finish_switch(cpu: usize) {
     let prev = CPUS[cpu].lock().take_switched_from();
     let Some(prev) = prev.filter(|p| p.state() == State::Dead) else { return };
+    // Published before `reaped` (its Release orders this store), so a
+    // joiner that sees `reaped` sees this or the clearing below.
+    FINISHING[cpu].store(prev.id, Ordering::Relaxed);
     let stack = prev.stack.lock().take();
     drop(stack);
     prev.reaped.store(true, Ordering::Release);
     prev.exited.wake_all();
+    #[cfg(feature = "ktest")]
+    {
+        let delay = FINISH_DELAY_NS.load(Ordering::Relaxed);
+        let until = time::now_ns().saturating_add(delay);
+        while delay > 0 && time::now_ns() < until {
+            core::hint::spin_loop();
+        }
+    }
+    drop(prev);
+    FINISHING[cpu].store(0, Ordering::Release);
 }
 
 /// The timer interrupt on this CPU (interrupts off, EOI sent): the first
@@ -2643,6 +2675,30 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn a_joined_thread_is_released_before_join_returns() {
+        // #183: a dying thread's CPU wakes its joiner and only then drops its
+        // own reference to it. With that CPU held up 20 ms there
+        // (`FINISH_DELAY_NS`), `join` still returns only once it has let go,
+        // so the handle's reference is the last: dropped here, the thread
+        // is gone from `threads()` at once (and the wait queue its joiner
+        // was on is freed here, not inside whatever runs next).
+        use crate::kassert;
+        let me = arch::cpu_index();
+        let cpu = (0..MAX_CPUS).find(|&c| c != me && running_on(c)).ok_or("needs a second CPU")?;
+        let h = spawn_test(cpu, "released", || {
+            let _ = sleep(5_000_000);
+        })?;
+        let id = h.thread.id;
+        FINISH_DELAY_NS.store(20_000_000, Ordering::Relaxed);
+        // Blocks (the thread sleeps first), so it is on the thread's queue.
+        h.join();
+        FINISH_DELAY_NS.store(0, Ordering::Relaxed);
+        kassert!(threads().iter().all(|t| t.id != id));
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn a_scope_joins_every_thread_before_it_returns() {
         // Threads on every CPU whose scheduler runs borrow the caller's
         // array (no `Arc`, no `'static`), each sleeping first so a missing
@@ -2707,11 +2763,9 @@ crate::ktest!(
                 kassert!(joined);
             }
         }
-        // Every scoped thread has exited. (Its record may still be listed:
-        // `finish_switch` on its CPU sets `reaped` and wakes the joiner while
-        // still holding the dead thread's `Arc`, dropped only as it returns,
-        // so `threads()` can see it, dead, for a moment after `scope`.)
-        kassert!(threads().iter().all(|t| t.name != "scoped" || t.state == State::Dead));
+        // Every scoped thread has exited and been released: `join` waits
+        // for its CPU to let go of it, and `scope` drops the handles.
+        kassert!(threads().iter().all(|t| t.name != "scoped"));
         Ok(())
     }
 );
