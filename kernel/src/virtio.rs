@@ -1632,8 +1632,9 @@ crate::ktest!(
             "the device status reads 0x07 after setup: FEATURES_OK clear: the device refused the negotiated features"
         );
         kassert_eq!(why(0x0b), "the device status reads 0x0b after setup: DRIVER_OK clear");
-        // A bounded wait gives up on time (at least the timeout, well under
-        // a second), re-polling `ready`; or when the status shows
+        // A bounded wait gives up on time (at least the timeout: no bound on
+        // how much more, which a host stalling the vCPU decides), re-polling
+        // `ready`; or when the status shows
         // DEVICE_NEEDS_RESET (which the device sets) or FAILED (a driver).
         t.set_status(DeviceStatus::ACKNOWLEDGE);
         let t0 = crate::time::now_ns();
@@ -1641,7 +1642,7 @@ crate::ktest!(
             return Err("no timeout");
         };
         let took = crate::time::now_ns() - t0;
-        kassert!(waited_ns >= 2_000_000 && (2_000_000..1_000_000_000).contains(&took));
+        kassert!(waited_ns >= 2_000_000 && took >= 2_000_000);
         let mut polls = 0;
         kassert_eq!(
             status.wait_until(1_000_000_000, || {
@@ -1666,7 +1667,9 @@ crate::ktest!(
             return Err("no timeout blocking");
         };
         let took = crate::time::now_ns() - t0;
-        kassert!(waited_ns >= 20_000_000 && (20_000_000..1_000_000_000).contains(&took));
+        kassert!(waited_ns >= 20_000_000 && took >= 20_000_000);
+        // Looks come with wakes (the first, then the deadline's), not with
+        // time passing: a stall adds none.
         kassert!((2..=4).contains(&looks));
         kassert_eq!(BELL.missed(), 0);
         let rung = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
@@ -1678,19 +1681,19 @@ crate::ktest!(
             BELL.ring();
         })
         .map_err(|_| "no ringer thread")?;
-        let t0 = crate::time::now_ns();
+        // Ok well before its 5 s deadline would be Timeout: the ring ended it.
         kassert_eq!(status.wait_for(&BELL, 5_000_000_000, || rung.load(Ordering::Acquire)), Ok(()));
-        kassert!(crate::time::now_ns() - t0 < 1_000_000_000);
         ringer.join();
         kassert_eq!(BELL.missed(), 0);
         let t1 = crate::time::now_ns();
         kassert_eq!(status.wait_for(&BELL, 5_000_000, || crate::time::now_ns() >= t1 + 5_000_000), Ok(()));
         kassert_eq!(BELL.missed(), 1);
         // A ring during the first look (rung by `ready` itself): the wait
-        // read the ring count before looking, so it doesn't block, and
-        // returns well before its deadline, with no miss.
+        // read the ring count before looking, so it doesn't block: `ready`
+        // is asked exactly twice (a wait that blocked to its deadline would
+        // ask it a third time there), with no miss.
         static EARLY: Doorbell = Doorbell::new();
-        let (t2, mut calls) = (crate::time::now_ns(), 0);
+        let mut calls = 0;
         let early = status.wait_for(&EARLY, 5_000_000_000, || {
             calls += 1;
             if calls == 1 {
@@ -1699,7 +1702,6 @@ crate::ktest!(
             calls > 1
         });
         kassert_eq!(early, Ok(()));
-        kassert!(crate::time::now_ns() - t2 < 1_000_000_000);
         kassert_eq!((calls, EARLY.missed()), (2, 0));
         kassert_eq!(status.wait_until(1_000_000, || true), Ok(()));
         // `ready` is asked once more at the deadline.

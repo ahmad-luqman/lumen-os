@@ -759,6 +759,16 @@ crate::ktest!(
     }
 );
 
+/// Ktests: wait, yielding, until [`hold`] has asked the thread to stop
+/// (up to 5 s: a hold that never asks then fails its test on its own).
+#[cfg(feature = "ktest")]
+fn wait_for_the_ask() {
+    let deadline = crate::time::now_ns() + 5_000_000_000;
+    while reads() != Reads::HoldAsked && crate::time::now_ns() < deadline {
+        crate::sched::yield_now();
+    }
+}
+
 crate::ktest!(
     fn a_hold_that_no_thread_answers_is_taken_back() {
         // A tablet with no thread to park (made up): `hold` waits
@@ -769,8 +779,10 @@ crate::ktest!(
         let _bound = MadeUp::bind(None)?;
         kassert_eq!(hold(), Err(HoldError::NotParked));
         kassert_eq!(reads(), Reads::Running);
+        // Once `hold` has asked (not after a fixed sleep: a host could stall
+        // it past the wait, or start it before the ask).
         let failer = crate::sched::spawn("hold-ktest-fail", || {
-            crate::time::sleep(100_000_000);
+            wait_for_the_ask();
             mark_failed(Failure::Failed);
         })
         .map_err(|_| "spawn")?;
@@ -790,7 +802,7 @@ crate::ktest!(
         use crate::kassert_eq;
         let _bound = MadeUp::bind(None)?;
         let releaser = crate::sched::spawn("hold-ktest-release", || {
-            crate::time::sleep(100_000_000);
+            wait_for_the_ask();
             release();
         })
         .map_err(|_| "spawn")?;

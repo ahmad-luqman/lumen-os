@@ -612,7 +612,6 @@ crate::ktest!(
         // polling for q between frames, a script in a loop (its Ctrl-C
         // check). The window is busy while a command runs, not while the
         // shell (or the REPL) waits for a key.
-        use crate::kassert;
         let d = desktop::Desktop::without_screen();
         let cases =
             [("rhai", "rhai>", false), ("top", "top:", true), ("rhai -e loop{}", "lumen> rhai -e loop{}", true)];
@@ -624,9 +623,11 @@ crate::ktest!(
             type_text(&shared, command)?;
             type_text(&shared, "\n")?;
             wait_until("the command never started", || shared.view_text().rows.iter().any(|r| r.starts_with(started)))?;
-            let _ = sched::sleep(50_000_000);
-            kassert!(shared.keys.lock().queue.is_empty());
-            kassert!(h.is_busy() == busy);
+            // The keys taken and the window busy (or not) as the command
+            // has it: waited for, not assumed after a sleep.
+            wait_until("the keys weren't taken, or the window not busy as the command is", || {
+                shared.keys.lock().queue.is_empty() && h.is_busy() == busy
+            })?;
             shared.close();
             sched::join_bounded(shell)?;
             drop(h);
@@ -654,8 +655,7 @@ crate::ktest!(
         let owner_thread = sched::spawn("ktest-owner", move || owner(h, o, shell)).map_err(|_| "spawn failed")?;
         let _ = sched::sleep(20_000_000);
         d.request_close(id)?;
-        let _ = sched::sleep(50_000_000);
-        kassert!(shared.is_closed());
+        wait_until("the owner never closed the shell's console", || shared.is_closed())?;
         kassert!(owner_thread.thread().state() != sched::State::Dead);
         release.1.store(true, Ordering::Release);
         release.0.wake_all();

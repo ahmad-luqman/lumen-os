@@ -3380,7 +3380,9 @@ crate::ktest!(
         // `Deadline`; a wake from another thread ends it at once as `Woken`,
         // and so does one made before the wait; an event queued is returned.
         // A wait that isn't animating counts as idle while it lasts, an
-        // animating one never does.
+        // animating one never does. (Woken, not Deadline, against a 5 s
+        // deadline is what shows a wake ended it: no bound on how soon,
+        // which a host stalling the vCPU decides.)
         use crate::kassert;
         let d = Desktop::without_screen();
         let mut h = d.open_window("w", 16, 16).map_err(|_| "a window")?;
@@ -3392,19 +3394,27 @@ crate::ktest!(
         waker.wake();
         let start = crate::time::now_ns();
         kassert!(matches!(h.wait_event_until(Some(start + 5_000_000_000), Animating::No), Wait::Woken));
-        kassert!(crate::time::now_ns() < start + 1_000_000_000);
         for (animating, idles) in [(Animating::No, true), (Animating::Yes, false)] {
             let saw_idle = Arc::new(AtomicBool::new(!idles));
             let (w, seen, win) = (waker.clone(), saw_idle.clone(), h.win.clone());
             let t = crate::sched::spawn("ktest-waker", move || {
-                let _ = crate::sched::sleep(10_000_000);
+                // Not animating: until the wait is idle (up to 5 s; a wait
+                // that never is fails). Animating: 10 ms in, it isn't (nor
+                // before it started: no wait can be early).
+                let deadline = crate::time::now_ns() + 5_000_000_000;
+                if idles {
+                    while !win.idle.load(Ordering::Acquire) && crate::time::now_ns() < deadline {
+                        let _ = crate::sched::sleep(1_000_000);
+                    }
+                } else {
+                    let _ = crate::sched::sleep(10_000_000);
+                }
                 seen.store(win.idle.load(Ordering::Acquire), Ordering::Release);
                 w.wake();
             })
             .map_err(|_| "spawn failed")?;
             let start = crate::time::now_ns();
             kassert!(matches!(h.wait_event_until(Some(start + 5_000_000_000), animating), Wait::Woken));
-            kassert!(crate::time::now_ns() < start + 1_000_000_000);
             crate::sched::join_bounded(t)?;
             kassert!(saw_idle.load(Ordering::Acquire) == idles);
             kassert!(!h.win.idle.load(Ordering::Acquire));

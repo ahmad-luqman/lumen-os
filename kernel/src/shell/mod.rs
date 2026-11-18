@@ -314,32 +314,47 @@ crate::ktest!(
     fn the_serial_prompt_waits_on_past_its_warning() {
         // `wait_for_screen_shells` with a 1 ms warning, on two threads on
         // this CPU standing in for shells (in two of the four slots): one
-        // blocks at once, the other only after sleeping 30 ms. The warning
-        // fires while the second sleeps (test_ktest checks its text), and
-        // the wait goes on: it returns only once both are blocked, after
-        // the sleep. Then they are woken and joined.
+        // blocks at once, the other only once the warning is in the log
+        // (test_ktest checks its text). So the warning fires while the
+        // second isn't waiting, whatever a host stalls, and the wait goes
+        // on: it returns only once both are blocked. Then they are woken and
+        // joined. (It used to sleep 30 ms instead: a stall before the
+        // wait's first look let the second block first, with no warning.)
         use crate::sched::{self, JoinHandle, State, WaitQueue};
         use crate::{kassert, kassert_eq};
         use alloc::sync::Arc;
         use core::sync::atomic::{AtomicBool, Ordering};
-        const LATE_NS: u64 = 30_000_000;
+        /// What the warning starts with (kept in step with
+        /// `wait_for_screen_shells` by test_ktest's check of the line).
+        const WARNING: &[u8] = b"WARN  shell: serial prompt held: ";
         let s = Arc::new((WaitQueue::new(), AtomicBool::new(false)));
-        let park = |s: &Arc<(WaitQueue, AtomicBool)>, sleep_ns: u64| {
-            let t = s.clone();
-            move || {
-                if sleep_ns > 0 {
-                    assert!(sched::sleep(sleep_ns), "a test thread couldn't sleep");
-                }
-                t.0.wait_until(|| t.1.load(Ordering::Acquire));
-            }
-        };
+        let saw_warning = Arc::new(AtomicBool::new(false));
+        let (_, mark) = crate::klog::copy_recent(&mut []);
+        let early = s.clone();
+        let (late, saw) = (s.clone(), saw_warning.clone());
         let mut shells: [Option<JoinHandle>; term::VTS] = Default::default();
-        // Read first: the late thread's sleep starts after this.
-        let start = crate::time::now_ns();
-        shells[0] = Some(sched::spawn("waits-early", park(&s, 0)).map_err(|_| "spawn failed")?);
-        shells[2] = Some(sched::spawn("waits-late", park(&s, LATE_NS)).map_err(|_| "spawn failed")?);
+        shells[0] = Some(
+            sched::spawn("waits-early", move || early.0.wait_until(|| early.1.load(Ordering::Acquire)))
+                .map_err(|_| "spawn failed")?,
+        );
+        shells[2] = Some(
+            sched::spawn("waits-late", move || {
+                // Until a line logged since `mark` is the warning (up to 5 s).
+                let deadline = crate::time::now_ns() + 5_000_000_000;
+                let mut recent = [0u8; 1024];
+                while crate::time::now_ns() < deadline {
+                    let (n, written) = crate::klog::copy_recent(&mut recent);
+                    if written > mark && recent[..n].windows(WARNING.len()).any(|w| w == WARNING) {
+                        saw.store(true, Ordering::Release);
+                        break;
+                    }
+                    assert!(sched::sleep(1_000_000), "a test thread couldn't sleep");
+                }
+                late.0.wait_until(|| late.1.load(Ordering::Acquire));
+            })
+            .map_err(|_| "spawn failed")?,
+        );
         let count = wait_for_screen_shells(&shells, 1_000_000);
-        let held = crate::time::now_ns() - start;
         let blocked = shells.iter().flatten().all(|h| h.thread().state() == State::Blocked);
         if !blocked {
             for h in shells.iter().flatten() {
@@ -348,7 +363,7 @@ crate::ktest!(
         }
         kassert!(blocked);
         kassert_eq!(count, 2);
-        kassert!(held >= LATE_NS);
+        kassert!(saw_warning.load(Ordering::Acquire));
         s.1.store(true, Ordering::Release);
         s.0.wake_all();
         // Bounded: a thread that never finishes fails the test by name

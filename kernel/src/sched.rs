@@ -1532,7 +1532,9 @@ crate::ktest!(
         let spinner = spawn_test(cpu, "busy-test", move || *result.lock() = Some(take_ticks()))?;
         join_bounded(spinner)?;
         let busy: Span = span.lock().ok_or("the spinner didn't report")?;
-        kassert!(check("spinning", busy) && busy.counted.busy_percent() >= 80);
+        // The spinner is always ready there, so no tick of its span finds the
+        // CPU idle: none counted idle (an 80% floor let 1 in 6 through).
+        kassert!(check("spinning", busy) && busy.idle == 0);
         let idle = take_ticks();
         kassert!(check("idle", idle) && idle.counted.busy_percent() <= 20);
         Ok(())
@@ -2162,13 +2164,16 @@ crate::ktest!(
 
 crate::ktest!(
     fn a_remote_wake_does_not_wait_for_a_tick() {
-        // Waking a thread on an idle CPU sends it the WAKEUP IPI: the thread
-        // runs before that CPU's next tick in at least 5 of 20 tries
-        // (without the IPI, never: only the tick would find it; 12 to 20 of
-        // 20 seen under heavy emulated load).
+        // Waking a thread on an idle CPU sends it the WAKEUP IPI: in each of
+        // 20 tries the WAKEUP vector is taken at least once between the wake
+        // and the thread running (counted on every CPU, so another CPU's wake
+        // could add one but none can take one away; without the IPI only the
+        // tick would find the thread). How often it ran before that CPU's
+        // next tick is reported, not judged: a host stalling the vCPU decides
+        // it (it was "at least 5 of 20" before #158's audit).
         use crate::kassert;
         let cpu = last_cpu()?;
-        let mut before_tick = 0;
+        let (mut before_tick, mut no_ipi) = (0, 0);
         for _ in 0..20 {
             let s = Arc::new((WaitQueue::new(), AtomicBool::new(false), AtomicU64::new(u64::MAX)));
             let t = s.clone();
@@ -2178,15 +2183,20 @@ crate::ktest!(
             })?;
             kassert!(yield_until(|| s.0.waiters.lock().len() == 1));
             s.1.store(true, Ordering::Release);
-            let t0 = arch::idt::ticks_on(cpu);
+            let (t0, ipis) = (arch::idt::ticks_on(cpu), arch::idt::vector_count(arch::idt::WAKEUP));
             s.0.wake_all();
             join_bounded(h)?;
             if s.2.load(Ordering::Acquire) == t0 {
                 before_tick += 1;
             }
+            if arch::idt::vector_count(arch::idt::WAKEUP) == ipis {
+                no_ipi += 1;
+            }
         }
-        crate::ktest::diag(format_args!("woken before the next tick {before_tick} of 20 times"));
-        kassert!(before_tick >= 5);
+        crate::ktest::diag(format_args!(
+            "woken before the next tick {before_tick} of 20 times; {no_ipi} of 20 without a WAKEUP IPI"
+        ));
+        kassert!(no_ipi == 0);
         Ok(())
     }
 );
@@ -2732,43 +2742,56 @@ crate::ktest!(
             join_bounded(spawn_test(cpu, "counts", move || *g.lock() = queue_deadlines(cpu))?)?;
             Ok(*got.lock())
         };
-        let before = counts()?;
-        let deadline = time::now_ns() + 100_000_000;
-        let results = Arc::new(SpinLock::new(Vec::with_capacity(WAITERS)));
-        let mut handles = Vec::new();
-        for _ in 0..WAITERS {
-            let res = results.clone();
-            handles.push(spawn_test(cpu, "due", move || {
-                let q = WaitQueue::new();
-                let woke = q.wait_until_or_deadline(deadline, || false);
-                res.lock().push((woke, time::now_ns() >= deadline));
-            })?);
+        // A try whose three didn't all block before the deadline (a host
+        // stalled the spawning past it) can't be judged: taken again with a
+        // fresh deadline, up to TRIES times.
+        const TRIES: usize = 5;
+        for tried in 1..=TRIES {
+            let before = counts()?;
+            let deadline = time::now_ns() + 100_000_000;
+            let results = Arc::new(SpinLock::new(Vec::with_capacity(WAITERS)));
+            let mut handles = Vec::new();
+            for _ in 0..WAITERS {
+                let res = results.clone();
+                handles.push(spawn_test(cpu, "due", move || {
+                    let q = WaitQueue::new();
+                    let woke = q.wait_until_or_deadline(deadline, || false);
+                    res.lock().push((woke, time::now_ns() >= deadline));
+                })?);
+            }
+            let threads: Vec<_> = handles.iter().map(|h| h.thread.clone()).collect();
+            let deadline_entries = || {
+                let q = CPUS[cpu].lock();
+                threads.iter().filter(|t| q.sleepers.iter().any(|s| s.on_queue && Arc::ptr_eq(&s.thread, t))).count()
+            };
+            // All three blocked before the deadline, so one tick passes it
+            // for all: their entries were counted, then the time read was
+            // before it.
+            let in_time = core::cell::Cell::new(false);
+            kassert!(yield_until(|| {
+                let all = deadline_entries() == WAITERS;
+                let before = time::now_ns() < deadline;
+                in_time.set(all && before);
+                all || !before
+            }));
+            for h in handles {
+                join_bounded(h)?;
+            }
+            if !in_time.get() {
+                crate::ktest::diag(format_args!("try {tried}: not all {WAITERS} blocked before the deadline"));
+                continue;
+            }
+            let after = counts()?;
+            let [fired, late, early]: [u64; 3] = core::array::from_fn(|i| after[i] - before[i]);
+            crate::ktest::diag(format_args!(
+                "cpu {cpu}: {fired} queue deadlines fired, {late} a tick late, {early} early (try {tried})"
+            ));
+            kassert_eq!(results.lock().len(), WAITERS);
+            kassert!(results.lock().iter().all(|&r| r == (false, true)));
+            kassert!(fired >= WAITERS as u64 && late == 0 && early == 0);
+            return Ok(());
         }
-        let threads: Vec<_> = handles.iter().map(|h| h.thread.clone()).collect();
-        let deadline_entries = || {
-            let q = CPUS[cpu].lock();
-            threads.iter().filter(|t| q.sleepers.iter().any(|s| s.on_queue && Arc::ptr_eq(&s.thread, t))).count()
-        };
-        // All three blocked before the deadline, so one tick passes it for
-        // all: their entries were counted, then the time read was before it.
-        let in_time = core::cell::Cell::new(false);
-        kassert!(yield_until(|| {
-            let all = deadline_entries() == WAITERS;
-            let before = time::now_ns() < deadline;
-            in_time.set(all && before);
-            all || !before
-        }));
-        kassert!(in_time.get());
-        for h in handles {
-            join_bounded(h)?;
-        }
-        let after = counts()?;
-        let [fired, late, early]: [u64; 3] = core::array::from_fn(|i| after[i] - before[i]);
-        crate::ktest::diag(format_args!("cpu {cpu}: {fired} queue deadlines fired, {late} a tick late, {early} early"));
-        kassert_eq!(results.lock().len(), WAITERS);
-        kassert!(results.lock().iter().all(|&r| r == (false, true)));
-        kassert!(fired >= WAITERS as u64 && late == 0 && early == 0);
-        Ok(())
+        Err("the waiters never all blocked before their deadline")
     }
 );
 

@@ -666,20 +666,34 @@ crate::ktest!(
 
 crate::ktest!(
     fn trace_overhead_is_small() {
-        // The cost per event, in TSC ticks, printed for the record. Uses its
-        // own ring so the kernel's ring keeps its boot events.
+        // The cost per event, in TSC ticks, printed for the record: the
+        // fastest of BATCHES batches of N events, 1 ms apart, so a host
+        // stalling the vCPU must slow every batch to move it (one stall used
+        // to cover the whole 2 ms loop). Uses its own ring so the kernel's
+        // ring keeps its boot events.
         static BENCH: TraceRing<EVENTS> = TraceRing::new();
-        const N: u64 = 20_000;
-        let t0 = arch::rdtsc();
-        for i in 0..N {
-            record_in(&BENCH, Kind::Test, [i, 0, 0, 0]);
+        const N: u64 = 1_000;
+        const BATCHES: u64 = 20;
+        let mut fastest = u64::MAX;
+        for b in 0..BATCHES {
+            if b > 0 {
+                crate::time::spin(1_000_000);
+            }
+            let t0 = arch::rdtsc();
+            for i in 0..N {
+                record_in(&BENCH, Kind::Test, [b * N + i, 0, 0, 0]);
+            }
+            fastest = fastest.min((arch::rdtsc() - t0) / N);
         }
-        let per_event = (arch::rdtsc() - t0) / N;
-        crate::ktest::diag(format_args!("trace: {per_event} TSC ticks per event ({N} events)"));
+        let per_event = fastest;
+        crate::ktest::diag(format_args!(
+            "trace: {per_event} TSC ticks per event (the fastest of {BATCHES} batches of {N})"
+        ));
         // Loose bounds: catches gross regressions such as waiting or doing
         // I/O (e.g. serial output) per event, and a TSC that doesn't move. An
         // added uncontended lock would not trip it. Under TCG the TSC follows
-        // a host clock, not guest cycles.
+        // a host clock, not guest cycles. At risk only on a host slowing the
+        // vCPU through every batch (CLAUDE.md, "Tests on a busy host").
         crate::kassert!(per_event > 0 && per_event < 5_000);
         crate::kassert_eq!(BENCH.dropped(), 0);
         Ok(())
