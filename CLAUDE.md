@@ -127,6 +127,19 @@ own PR that updates that doc first.
   (including 0 from a triple fault with `-no-reboot`) is a failure. The one
   exception: 0 in the power-off scenario, with a QMP `SHUTDOWN` event whose
   reason is `guest-shutdown` (a triple fault's is `guest-reset`).
+- **Tests on a busy host.** A guest's clocks run on while the host stalls
+  its vCPU, so a loaded laptop or CI runner adds time to anything timed
+  (#139, #158, #165, #170, #171 all came from this). A scenario or ktest
+  asserts only what the host can't change:
+  - a floor (an injected stall is at least in the bound);
+  - a decision that follows from the numbers the kernel printed;
+  - an effect confirmed before the next step (`gui.py`'s steps, `mouse hold`).
+
+  Never a ceiling or a % range on something timed, nor a "no WARN at boot"
+  that a slow boot trips. Exact numbers and texts for given inputs belong in
+  host tests or ktests over made-up windows. Reviewers: don't ask a scenario
+  for timing ranges. A mutant that only a slower result would show stays on
+  the not-tested list, or gets a deterministic seam.
 - **Golden images** live in `tests/golden/`. Re-record with `make golden` only
   when the change to the screen is intended, and open the PNG to check it.
 
