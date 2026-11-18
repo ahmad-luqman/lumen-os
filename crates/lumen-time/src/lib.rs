@@ -590,6 +590,16 @@ pub fn parse_stall(v: &str) -> Option<Stall> {
     (stall.end <= MOST_STALL_PPM && stall.start <= MOST_STALL_PPM).then_some(stall)
 }
 
+/// The TSC ticks a stall of `ppm` (parts per million) of `ticks` lasts,
+/// rounded down: what `lumen.stall_*_windows=` spins at a window's end (of
+/// its run so far) or start (of the last one's). The scenarios' floor on the
+/// bound rests on it (`lumen_harness.calibration.stalled`): the window's gap
+/// holds this and its reads. `u64::MAX` if the product overflows a u64,
+/// which needs a run of over 2^60 ticks.
+pub fn stall_ticks(ticks: u64, ppm: u64) -> u64 {
+    u64::try_from(u128::from(ticks) * u128::from(ppm) / 1_000_000).unwrap_or(u64::MAX)
+}
+
 /// PIT ticks between two readings of a channel counting down, `start` then
 /// `end`. In mode 0 it counts on past 0 (wrapping to 0xffff), so this holds
 /// as long as fewer than 65536 ticks passed ([`pit_end_unambiguous`]).
@@ -1483,6 +1493,17 @@ mod tests {
         for bad in ["", "x", "abc", "1,", ",1", "1,2,3", "-1", "10000001", "0,10000001", "1.5"] {
             assert_eq!(parse_stall(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_stall_lasts_its_share_of_the_window() {
+        // 1% of a 24,818,280-tick run (#171's timer windows), 0.6% of 10,000,000.
+        assert_eq!(stall_ticks(24_818_280, 10_000), 248_182);
+        assert_eq!(stall_ticks(10_000_000, 6_000), 60_000);
+        assert_eq!(stall_ticks(999_999, 1), 0, "rounded down");
+        assert_eq!(stall_ticks(10_000_000, MOST_STALL_PPM), 100_000_000, "ten windows");
+        assert_eq!((stall_ticks(0, 6_000), stall_ticks(10_000_000, 0)), (0, 0));
+        assert_eq!(stall_ticks(u64::MAX, MOST_STALL_PPM), u64::MAX, "saturates");
     }
 
     #[test]
