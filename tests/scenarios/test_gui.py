@@ -173,6 +173,7 @@ def test_two_windows_golden(boot, artifacts, golden_dir):
         origin=(0, 0),
         size=(1280, 800),
         artifacts=artifacts,
+        masks=gui.clock_mask(m),
     )
     assert gui.desktop_check(m) == (0, 0)
 
@@ -760,10 +761,7 @@ def test_terminal_windows_settle_only_when_idle(boot):
     frame = frame_of(gui.window(m, "Terminal-1"))
     never_settled(m)
     click_to_focus(m, "Colours", COLOURS[0] + 200, COLOURS[1] + 150)
-    settled = gui.wait_settled(m)
-    time.sleep(1.2)
-    later = gui.desktop_status(m)
-    assert later["settled"] == "yes" and later["frames"] == settled["frames"], (settled, later)
+    gui.quiet_for(m, 1.2)
     cursor = read_window(m, window).cursor
     assert cursor is not None
     x, y = cell_xy(frame, *cursor)
@@ -899,10 +897,11 @@ def test_text_rendering_golden(boot, artifacts, golden_dir):
 
 def test_png_wallpaper_golden(boot, artifacts):
     # The desktop with no windows: both closed by their close boxes, the
-    # pointer moved to the bottom-right pixel. The screen shows the
-    # wallpaper, decoded from the PNG the kernel embeds, in every pixel
-    # (the one under the parked arrow's tip taken from the PNG): the golden
-    # is that PNG itself.
+    # pointer moved to the right end of the last row above the taskbar.
+    # The screen above the taskbar
+    # shows the wallpaper, decoded from the PNG the kernel embeds, in every
+    # pixel (the one under the parked arrow's tip taken from the PNG): the
+    # golden is that PNG itself.
     m = boot_tablet(boot)
     gui.start_desktop(m)
     assert "INFO  desktop: wallpaper: 1280x800, " in m.output, "the wallpaper wasn't decoded"
@@ -910,13 +909,18 @@ def test_png_wallpaper_golden(boot, artifacts):
     gui.wait_windows(m, 1)
     close_window(m, "Welcome")
     gui.wait_windows(m, 0)
-    gui.pointer_move(m, 1279, 799)
+    # The arrow's tip on the last row above the taskbar: the rest of it
+    # falls on the taskbar, outside the comparison.
+    top = gui.bounds(gui.taskbar(m)[0])[1]
+    tip = (1279, top - 1)
+    gui.pointer_move(m, *tip)
     assert gui.desktop_status(m)["wallpaper"] == "shown"
     shot = gui.settled_screendump(m, "wallpaper.png")
     with Image.open(shot) as dumped, Image.open(WALLPAPER) as wallpaper:
         actual, want = dumped.convert("RGB"), wallpaper.convert("RGB")
     assert actual.size == want.size == (1280, 800)
-    actual.putpixel((1279, 799), want.getpixel((1279, 799)))
+    actual.putpixel(tip, want.getpixel(tip))
+    actual, want = actual.crop((0, 0, 1280, top)), want.crop((0, 0, 1280, top))
     diff, mask = compare(actual, want, tolerance=0)
     if diff.differing:
         actual.save(artifacts / "wallpaper.actual.png")
@@ -952,7 +956,12 @@ def test_dark_theme_golden(boot, artifacts, golden_dir):
     assert status["theme"] == "dark", status
     shot = gui.settled_screendump(m, "dark.png")
     assert_matches_golden(
-        shot, golden_dir / "desktop-dark.png", origin=(0, 0), size=(1280, 800), artifacts=artifacts
+        shot,
+        golden_dir / "desktop-dark.png",
+        origin=(0, 0),
+        size=(1280, 800),
+        artifacts=artifacts,
+        masks=gui.clock_mask(m),
     )
     assert gui.desktop_check(m) == (0, 0)
 
@@ -969,7 +978,12 @@ def test_theme_boot_flag_picks_dark(boot, artifacts, golden_dir):
     type_x_into_colours(m)
     shot = gui.settled_screendump(m, "dark-at-boot.png")
     assert_matches_golden(
-        shot, golden_dir / "desktop-dark.png", origin=(0, 0), size=(1280, 800), artifacts=artifacts
+        shot,
+        golden_dir / "desktop-dark.png",
+        origin=(0, 0),
+        size=(1280, 800),
+        artifacts=artifacts,
+        masks=gui.clock_mask(m),
     )
 
 
@@ -1033,7 +1047,7 @@ def test_automation_tree_lists_buttons(boot):
         "Counter",
         "0",
         "focused",
-        "focus,close",
+        "focus,close,minimize,restore",
     ), root
     buttons = gui.parse_records(run(m, f"ui tree {wid} | where role = button"))
     assert [b["name"] for b in buttons] == ["Add", "Reset", "Quit"], buttons
@@ -1046,8 +1060,15 @@ def test_automation_tree_lists_buttons(boot):
     assert count["value"] == "0" and count["actions"] == "-", count
     lock = gui.node(rows, "checkbox", "Lock")
     assert lock["value"] == "unchecked", lock
-    roots = [r["name"] for r in gui.ui_tree(m) if r["depth"] == "0"]
-    assert roots == ["Counter", "Colours", "Welcome"], roots
+    # Front to back: the taskbar (a panel, in front of every window), then
+    # the windows.
+    roots = [(r["role"], r["name"]) for r in gui.ui_tree(m) if r["depth"] == "0"]
+    assert roots == [
+        ("group", "Taskbar"),
+        ("window", "Counter"),
+        ("window", "Colours"),
+        ("window", "Welcome"),
+    ], roots
     assert run(m, "ui tree 99") == "ui tree: no window 99\n"
     welcome = gui.node(gui.ui_tree(m), "window", "Welcome")
     got = gui.invoke(m, welcome["id"], "focus")
@@ -1168,3 +1189,307 @@ def test_a_toolkit_window_repaints_in_a_new_theme(boot):
     gui.wait_settled(m)
     assert pixel(gui.settled_screendump(m, "counter-light-again.png"), *probe) == CLIENT_RGB
     assert gui.desktop_check(m) == (0, 0)
+
+
+# -- the desktop shell (#157) ---------------------------------------------------
+
+LAUNCHER_ITEMS = ["Terminal", "Mandelbrot", "Life", "Counter"]
+# kernel/src/demo.rs `mandelbrot_owner`'s line.
+MANDEL_WINDOW = re.compile(
+    r"INFO  demo: mandelbrot window (\d+): (\d+) CPUs? in \d+ ms, rows by CPU:((?: cpu\d+=\d+)+)\n"
+)
+MANDEL_CLIENT = (480, 320)
+
+
+def taskbar_buttons(m: Machine) -> list[str]:
+    return [r["name"] for r in gui.taskbar(m) if r["role"] == "button"]
+
+
+def minimize_box(frame: tuple[int, int, int, int]) -> tuple[int, int]:
+    """The middle of a frame's minimize box (as big as the close box, 4
+    pixels left of it)."""
+    x, y = close_box(frame)
+    return x - 16 - 4, y
+
+
+def launch(m: Machine, item: str) -> gui.Invoked:
+    """Open launcher item `item` through `ui invoke`: the menu's `press`
+    unfolds it, its item's `press` opens the window (and folds it, so the
+    item's node is gone after)."""
+    launcher = gui.node(gui.taskbar(m), "menu", "Launcher")
+    unfolded = gui.invoke(m, launcher["id"], "press")
+    assert unfolded.row is not None and unfolded.row["state"] == "expanded", unfolded
+    entry = gui.node(gui.taskbar(m), "menuitem", item)
+    got = gui.invoke(m, entry["id"], "press")
+    assert got.message == f"ui invoke: ran; node {entry['id']} is gone", got
+    return got
+
+
+def test_launcher_opens_terminal(boot):
+    # The taskbar's launcher, through `ui invoke` then through confirming
+    # clicks: `press` unfolds it (`expanded`, its four items after it in
+    # the tree), its Terminal item opens a terminal window, focused in
+    # front, and folds it; the window's button is on the taskbar as soon as
+    # `ui invoke` returns (published before the answer). The same by clicks
+    # on the launcher's head and on its item.
+    m = boot_tablet(boot)
+    gui.start_desktop(m)
+    bar = gui.taskbar(m)
+    assert (bar[0]["role"], bar[0]["actions"], bar[0]["state"]) == ("group", "-", "-"), bar[0]
+    assert taskbar_buttons(m) == ["Welcome", "Colours"]
+    launcher = gui.node(bar, "menu", "Launcher")
+    assert (launcher["state"], launcher["actions"]) == ("-", "press,focus"), launcher
+    assert not [r for r in bar if r["role"] == "menuitem"]
+    unfolded = gui.invoke(m, launcher["id"], "press")
+    assert unfolded.row is not None and unfolded.row["state"] == "expanded", unfolded
+    items = [r for r in gui.taskbar(m) if r["role"] == "menuitem"]
+    assert [r["name"] for r in items] == LAUNCHER_ITEMS, items
+    assert all(r["actions"] == "press" and r["depth"] == "2" for r in items), items
+    entry = gui.node(items, "menuitem", "Terminal")
+    got = gui.invoke(m, entry["id"], "press")
+    assert got.message == f"ui invoke: ran; node {entry['id']} is gone", got
+    # At once: the window, focused in front, and its button.
+    rows = gui.windows(m)
+    assert (rows[0]["title"], rows[0]["z"], rows[0]["focused"]) == ("Terminal-1", "0", "yes"), rows
+    assert taskbar_buttons(m) == ["Welcome", "Colours", "Terminal-1"]
+    assert not [r for r in gui.taskbar(m) if r["role"] == "menuitem"], "folded again"
+    expect_window(m, int(rows[0]["id"]), r"^lumen>$", 30)
+    # Clicks: the launcher's head, then its Terminal item.
+    gui.click(m, *gui.centre(gui.node(gui.taskbar(m), "menu", "Launcher")))
+    bar = gui.wait_for(
+        m,
+        "the launcher unfolded",
+        lambda: gui.taskbar(m),
+        lambda b: [r["name"] for r in b if r["role"] == "menuitem"] == LAUNCHER_ITEMS,
+    )
+    gui.click(m, *gui.centre(gui.node(bar, "menuitem", "Terminal")))
+    rows = gui.wait_for(
+        m, "Terminal-2 open", lambda: gui.windows(m), lambda w: w[0]["title"] == "Terminal-2"
+    )
+    assert rows[0]["focused"] == "yes", rows
+    expect_window(m, int(rows[0]["id"]), r"^lumen>$", 30)
+    gui.wait_for(
+        m,
+        "Terminal-2's button",
+        lambda: taskbar_buttons(m),
+        lambda b: b == ["Welcome", "Colours", "Terminal-1", "Terminal-2"],
+    )
+    gui.pointer_move(m, *PARK)
+
+
+def test_taskbar_focuses_window(boot):
+    # A click on the taskbar's button for the back window (Welcome) raises
+    # and focuses it; `press` on Colours' button does the same for Colours,
+    # its effect in `windows` as soon as `ui invoke` returns. The taskbar
+    # never takes the focus (its root, a group, takes no action), and a
+    # closed window's button goes (its node then names nothing). Ends with
+    # the screen a full repaint would draw.
+    m = boot_tablet(boot)
+    gui.start_desktop(m)
+    bar = gui.taskbar(m)
+    gui.click(m, *gui.centre(gui.node(bar, "button", "Welcome")))
+    rows = gui.wait_for(
+        m, "Welcome focused", lambda: gui.windows(m), lambda r: r[0]["title"] == "Welcome"
+    )
+    assert [(w["title"], w["z"], w["focused"]) for w in rows] == [
+        ("Welcome", "0", "yes"),
+        ("Colours", "1", "no"),
+    ], rows
+    got = gui.invoke(m, gui.node(bar, "button", "Colours")["id"], "press")
+    assert got.row is not None and got.row["name"] == "Colours", got
+    rows = gui.windows(m)
+    assert [(w["title"], w["focused"]) for w in rows] == [("Colours", "yes"), ("Welcome", "no")]
+    root = bar[0]
+    assert run(m, f"ui invoke {root['id']} focus") == "ui invoke: a group doesn't take focus\n"
+    assert (
+        run(m, f"ui invoke {root['id']} minimize") == "ui invoke: a group doesn't take minimize\n"
+    )
+    # A closed window's button goes, and its node names nothing.
+    welcome = gui.node(gui.taskbar(m), "button", "Welcome")
+    close_window(m, "Welcome")
+    gui.wait_for(m, "Welcome's button gone", lambda: taskbar_buttons(m), lambda b: b == ["Colours"])
+    assert run(m, f"ui invoke {welcome['id']} press") == f"ui invoke: no node {welcome['id']}\n"
+    gui.pointer_move(m, *PARK)
+    gui.wait_settled(m)
+    assert gui.desktop_check(m) == (0, 0)
+
+
+def test_minimize_and_restore(boot):
+    # Colours' minimize box: it leaves the screen (`minimized yes`, the
+    # wallpaper where it was) and Welcome gets the focus; its taskbar
+    # button brings it back, raised and focused. Then the root's
+    # `minimize` and `restore` through `ui invoke`, each refused when there
+    # is nothing to do. Each step ends with the screen a full repaint
+    # would draw.
+    m = boot_tablet(boot)
+    gui.start_desktop(m)
+    wid = gui.window(m, "Colours")["id"]
+    gui.click(m, *minimize_box(COLOURS))
+    rows = gui.wait_for(
+        m,
+        "Colours minimized",
+        lambda: gui.windows(m),
+        lambda r: gui.one(r, "Colours rows", title="Colours")["minimized"] == "yes",
+    )
+    assert [(w["title"], w["focused"], w["minimized"]) for w in rows] == [
+        ("Colours", "no", "yes"),
+        ("Welcome", "yes", "no"),
+    ], rows
+    assert gui.desktop_status(m)["windows"] == "2"
+    gui.pointer_move(m, *PARK)
+    shot = gui.settled_screendump(m, "minimized.png")
+    # Inside where Colours was and clear of Welcome: the wallpaper.
+    for x, y in [(700, 450), (COLOURS[0] + COLOURS[2] - 2, COLOURS[1] + 2)]:
+        assert pixel(shot, x, y) == wallpaper_rgb(x, y), (x, y)
+    assert gui.desktop_check(m) == (0, 0)
+    # Its taskbar button restores it.
+    gui.click(m, *gui.centre(gui.node(gui.taskbar(m), "button", "Colours")))
+    rows = gui.wait_for(
+        m, "Colours restored", lambda: gui.windows(m), lambda r: r[0]["title"] == "Colours"
+    )
+    assert [(w["title"], w["z"], w["focused"], w["minimized"]) for w in rows] == [
+        ("Colours", "0", "yes", "no"),
+        ("Welcome", "1", "no", "no"),
+    ], rows
+    assert frame_of(rows[0]) == COLOURS
+    gui.pointer_move(m, *PARK)
+    gui.wait_settled(m)
+    assert gui.desktop_check(m) == (0, 0)
+    # The root's actions.
+    root = gui.node(gui.ui_tree(m), "window", "Colours")
+    assert root["actions"] == "focus,close,minimize,restore", root
+    got = gui.invoke(m, root["id"], "minimize")
+    assert got.row is not None and got.row["state"] == "-", got
+    assert gui.window(m, "Colours")["minimized"] == "yes"
+    assert (
+        run(m, f"ui invoke {root['id']} minimize")
+        == f"ui invoke: window {wid} is minimized already\n"
+    )
+    got = gui.invoke(m, root["id"], "restore")
+    assert got.row is not None and got.row["state"] == "focused", got
+    assert (gui.window(m, "Colours")["minimized"], gui.windows(m)[0]["title"]) == ("no", "Colours")
+    assert run(m, f"ui invoke {root['id']} restore") == f"ui invoke: window {wid} isn't minimized\n"
+    gui.wait_settled(m)
+    assert gui.desktop_check(m) == (0, 0)
+
+
+def test_mandelbrot_window_golden(boot, artifacts, golden_dir):
+    # The launcher's Mandelbrot with four CPUs: the window's surface lent as
+    # bands to a thread on each (`sched::scope`), every CPU drawing rows and
+    # every row drawn once (its line on serial); the client area against a
+    # golden (the same pixels as `mandelbrot` on one CPU: View::fit at
+    # 64 iterations); its owner waits without animating (the desktop
+    # settles), and closing the window ends it.
+    m = boot_shells(boot, extra=["-smp", "4"])
+    assert "INFO  smp: 4 CPUs online" in m.output
+    gui.start_desktop(m)
+    launch(m, "Mandelbrot")
+    found = gui.wait_for(
+        m, "the Mandelbrot window drawn", lambda: MANDEL_WINDOW.search(m.output), bool, 60
+    )
+    rows = {int(cpu): int(n) for cpu, n in re.findall(r"cpu(\d+)=(\d+)", found[3])}
+    assert int(found[2]) == 4 and sorted(rows) == [0, 1, 2, 3], found[0]
+    assert sum(rows.values()) == MANDEL_CLIENT[1], found[0]
+    window = gui.window(m, "Mandelbrot")
+    assert window["id"] == found[1] and window["focused"] == "yes", window
+    x, y, _, _ = frame_of(window)
+    shot = gui.settled_screendump(m, "mandelbrot.png")
+    assert_matches_golden(
+        shot,
+        golden_dir / "desktop-mandelbrot-window.png",
+        origin=(x + 1, y + TITLE_H),
+        size=MANDEL_CLIENT,
+        artifacts=artifacts,
+    )
+    assert gui.desktop_check(m) == (0, 0)
+    root = gui.node(gui.ui_tree(m), "window", "Mandelbrot")
+    assert run(m, f"ui invoke {root['id']} close") == f"ui invoke: window {found[1]} closed\n"
+    gui.wait_for(
+        m, "its owner gone", lambda: thread_names(m), lambda t: "desktop-mandelbrot" not in t
+    )
+    assert "Mandelbrot" not in taskbar_buttons(m)
+
+
+def test_life_window_runs_unfocused_and_stops_when_closed(boot):
+    # The launcher's Life: it steps ten times a second (an animating wait:
+    # the desktop never settles), and keeps stepping when another window
+    # takes the focus (its client area changes between screendumps);
+    # minimized it still runs but presents nothing; its close ends its
+    # owner, and the desktop settles again.
+    m = boot_tablet(boot)
+    gui.start_desktop(m)
+    launch(m, "Life")
+    life = gui.wait_for(m, "Life open", lambda: gui.windows(m), lambda r: r[0]["title"] == "Life")[
+        0
+    ]
+    assert "desktop-life" in thread_names(m)
+    click_to_focus(m, "Colours", COLOURS[0] + 200, COLOURS[1] + 150)
+    assert gui.window(m, "Life")["focused"] == "no"
+    never_settled(m, 4)
+    x, y, w, h = frame_of(gui.window(m, "Life"))
+    box = (x + 1, y + TITLE_H, x + w - 1, y + h - 1)
+
+    def client(name: str) -> bytes:
+        with Image.open(m.screendump(name)) as img:
+            return img.convert("RGB").crop(box).tobytes()
+
+    first = client("life-1.png")
+    gui.wait_for(m, "Life's next generations", lambda: client("life-2.png"), lambda c: c != first)
+    # Minimized, it presents nothing (nothing else moves).
+    root = gui.node(gui.ui_tree(m), "window", "Life")
+    assert gui.invoke(m, root["id"], "minimize").row is not None
+    # (Read again if something else presented: the minimize's own redraw,
+    # or the clock's minute; Life presenting would show in every try.)
+    tries = []
+    for _ in range(3):
+        before = gui.desktop_status(m)
+        time.sleep(0.5)
+        after = gui.desktop_status(m)
+        tries.append((before["frames"], after["frames"]))
+        if after["frames"] == before["frames"]:
+            break
+    else:
+        raise AssertionError(f"presented while Life was minimized: {tries}")
+    assert "desktop-life" in thread_names(m)
+    assert run(m, f"ui invoke {root['id']} close") == f"ui invoke: window {life['id']} closed\n"
+    gui.wait_for(m, "Life's owner gone", lambda: thread_names(m), lambda t: "desktop-life" not in t)
+    gui.wait_settled(m)
+
+
+def plus_minute(hhmm: str) -> str:
+    h, mm = map(int, hhmm.split(":"))
+    t = (h * 60 + mm + 1) % (24 * 60)
+    return f"{t // 60:02}:{t % 60:02}"
+
+
+def test_taskbar_clock_matches_rtc(boot):
+    # The taskbar's Clock (a fixed-size label) shows `date`'s hour and
+    # minute (polled until they agree: the clock reads the RTC every
+    # second). `desktop tick` moves it a minute ahead: the redraw is one
+    # present of one rectangle, the label's bounds, and nothing else.
+    m = boot_shells(boot)
+    gui.start_desktop(m)
+
+    def date_and_clock() -> tuple[str, str]:
+        found = re.fullmatch(r"date: \d{4}-\d\d-\d\d (\d\d:\d\d):\d\d UTC\n", run(m, "date"))
+        assert found, "date's format"
+        return found[1], gui.clock_text(m)
+
+    gui.wait_for(m, "the clock showing date's minute", date_and_clock, lambda dc: dc[0] == dc[1])
+    clock = gui.node(gui.taskbar(m), "label", "Clock")
+    _, _, w, h = gui.bounds(clock)
+    assert (clock["role"], clock["actions"]) == ("label", "-")
+    for _ in range(3):
+        shown = gui.clock_text(m)
+        before = gui.wait_settled(m)
+        assert run(m, "desktop tick") == "desktop tick: the clock moved a minute ahead\n"
+        gui.wait_for(m, "the clock moved", lambda: gui.clock_text(m), lambda t, s=shown: t != s)
+        after = gui.wait_settled(m)
+        if gui.clock_text(m) != plus_minute(shown):
+            continue  # a real minute turned as well: measure again
+        assert gui.bounds(gui.node(gui.taskbar(m), "label", "Clock")) == gui.bounds(clock)
+        presented = {k: int(after[k]) - int(before[k]) for k in ("frames", "rects", "pixels")}
+        assert presented == {"frames": 1, "rects": 1, "pixels": w * h}, presented
+        break
+    else:
+        raise AssertionError("a real minute turned during each of 3 ticks")

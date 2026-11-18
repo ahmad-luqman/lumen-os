@@ -27,7 +27,8 @@ use lumen_input::{Button, KeyAction, KeyCode, KeyEvent};
 use lumen_shell::pipe::{self, Align, Column, Kind, Value};
 use lumen_ui::counter::Counter;
 use lumen_ui::{
-    Action, ActionKind, App, First, Input, InvokeError, Key, Palette, Phase, Reply, Second, Served, Text, Then, serve,
+    Action, ActionKind, App, First, Input, InvokeError, Key, Palette, Phase, Repaint, Reply, Second, Served, Text,
+    Then, serve,
 };
 use lumen_wm::{Refused, Theme};
 
@@ -206,6 +207,20 @@ impl Text for crate::font::Text {
 }
 
 /// The toolkit's palette from a theme.
+/// The taskbar's palette (#157): its own colours; its buttons in the
+/// title bars' colours.
+pub fn taskbar_palette(t: &Theme) -> Palette {
+    Palette {
+        background: t.taskbar,
+        text: t.taskbar_text,
+        accent: t.title,
+        accent_text: t.title_text,
+        border: t.border,
+        disabled: t.border,
+        field: t.client,
+    }
+}
+
 pub fn palette(t: &Theme) -> Palette {
     Palette {
         background: t.client,
@@ -224,6 +239,8 @@ pub struct Toolkit<A: App> {
     text: crate::font::Text,
     /// From the theme its window was last told of (`WindowEvent::Theme`).
     palette: Palette,
+    /// How a theme becomes its palette ([`palette`], [`taskbar_palette`]).
+    choose: fn(&Theme) -> Palette,
     /// Where the tree is laid out (client coordinates).
     area: Rect,
 }
@@ -241,29 +258,64 @@ impl<A: App> Toolkit<A> {
     /// `app` laid out in `area`, drawn with `theme` (its window's,
     /// `WindowHandle::theme`) until a `Theme` event says otherwise.
     pub fn new(app: A, area: Rect, theme: &Theme) -> Result<Toolkit<A>, String> {
+        Toolkit::with_palette(app, area, theme, palette)
+    }
+
+    /// [`Toolkit::new`] with the palette made from each theme by `choose`
+    /// (the taskbar's colours, #157).
+    pub fn with_palette(
+        app: A,
+        area: Rect,
+        theme: &Theme,
+        choose: fn(&Theme) -> Palette,
+    ) -> Result<Toolkit<A>, String> {
         let text = crate::font::Text::new().map_err(|e| alloc::format!("no font: {e}"))?;
-        Ok(Toolkit { app, text, palette: palette(theme), area })
+        Ok(Toolkit { app, text, palette: choose(theme), choose, area })
     }
 
     pub fn app_mut(&mut self) -> &mut A {
         &mut self.app
     }
 
-    /// Lay the tree out and paint it (and the app's frame over it) into
-    /// the owner's surface, then commit the client area; publish the tree
-    /// if it changed. Every frame of an animation.
+    /// Lay the tree out and paint all of it (and the app's frame over
+    /// it) into the owner's surface, then commit the client area; publish
+    /// the tree if it changed. Every frame of an animation.
     pub fn frame(&mut self, h: &mut WindowHandle) {
         let changed = self.lay_out();
-        self.paint_and_commit(h);
+        let _all = self.app.ui_mut().take_damage();
+        let s = h.surface_mut();
+        self.app.ui_mut().paint(s, &mut self.text, &self.palette);
+        self.app.paint_over(s);
+        let bounds = s.bounds();
+        h.commit(&[bounds]);
         if changed {
             self.publish(h);
         }
     }
 
-    /// As [`Toolkit::frame`], only if the tree changed.
+    /// Lay the tree out; repaint and commit only what changed (the widgets
+    /// whose look changed, or everything after a move or a new palette),
+    /// then publish the tree if it changed.
     pub fn refresh(&mut self, h: &mut WindowHandle) {
-        if self.lay_out() {
-            self.paint_and_commit(h);
+        let changed = self.lay_out();
+        match self.app.ui_mut().take_damage() {
+            Repaint::Nothing => {}
+            Repaint::All => {
+                let s = h.surface_mut();
+                self.app.ui_mut().paint(s, &mut self.text, &self.palette);
+                self.app.paint_over(s);
+                let bounds = s.bounds();
+                h.commit(&[bounds]);
+            }
+            Repaint::Rects(rects) => {
+                let s = h.surface_mut();
+                for r in &rects {
+                    self.app.ui_mut().paint_in(s, &mut self.text, &self.palette, *r);
+                }
+                h.commit(&rects);
+            }
+        }
+        if changed {
             self.publish(h);
         }
     }
@@ -273,18 +325,10 @@ impl<A: App> Toolkit<A> {
         h.publish(ui.top_ids(), ui.nodes());
     }
 
-    /// Lay out: whether anything shown changed since the last paint.
+    /// Lay out: whether the tree changed since the last publish.
     fn lay_out(&mut self) -> bool {
         self.app.ui_mut().layout(self.area, &mut self.text);
         self.app.ui_mut().take_changed()
-    }
-
-    fn paint_and_commit(&mut self, h: &mut WindowHandle) {
-        let s = h.surface_mut();
-        self.app.ui_mut().paint(s, &mut self.text, &self.palette);
-        self.app.paint_over(s);
-        let bounds = s.bounds();
-        h.commit(&[bounds]);
     }
 
     /// One step: hand window event `e` to the tree; then, if it changed,
@@ -297,7 +341,7 @@ impl<A: App> Toolkit<A> {
             WindowEvent::Request(req) => return self.request(h, req),
             WindowEvent::Theme(theme) => {
                 // "Redraw": the whole tree in the theme handed over.
-                self.palette = palette(theme);
+                self.palette = (self.choose)(theme);
                 self.app.ui_mut().invalidate();
                 Then::Carry
             }
@@ -498,33 +542,45 @@ fn invoke(ctx: &mut crate::shell::Ctx<'_>, node: u64, action: Action) {
 }
 
 /// What a window's root does with each action: the compositor answers
-/// `focus`, the owner `close` (its `Close`); none takes the others.
+/// `focus`, `minimize` and `restore`, the owner `close` (its `Close`);
+/// none takes the others.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RootAction {
     Focus,
     Close,
+    Minimize,
+    Restore,
 }
 
 fn root_action(kind: ActionKind) -> Option<RootAction> {
     match kind {
         ActionKind::Focus => Some(RootAction::Focus),
         ActionKind::Close => Some(RootAction::Close),
-        // `minimize` and `restore` come with #157.
-        ActionKind::Press | ActionKind::SetValue | ActionKind::Select | ActionKind::Minimize | ActionKind::Restore => {
-            None
-        }
+        ActionKind::Minimize => Some(RootAction::Minimize),
+        ActionKind::Restore => Some(RootAction::Restore),
+        ActionKind::Press | ActionKind::SetValue | ActionKind::Select => None,
     }
 }
 
-/// An action on a window's root.
+/// An action on a window's root (a panel's, the taskbar's, is a group's:
+/// it takes none).
 fn invoke_root(ctx: &mut crate::shell::Ctx<'_>, window: u32, action: &Action) {
     let kind = action.kind();
-    match root_action(kind) {
-        None => ctx.fail(format_args!("ui invoke: {}", InvokeError::NotAllowed(lumen_ui::Role::Window, kind))),
+    let role = desktop::root_role(window).unwrap_or(lumen_ui::Role::Window);
+    let what = if role.actions().contains(&kind) { root_action(kind) } else { None };
+    let changed = |ctx: &mut crate::shell::Ctx<'_>, r: Result<desktop::TreeRow, desktop::NotChanged>, already| match r {
+        Ok(row) => print_rows(ctx, &[row]),
+        Err(desktop::NotChanged::Closed) => ctx.fail(format_args!("ui invoke: window {window} closed")),
+        Err(desktop::NotChanged::Already) => ctx.fail(format_args!("ui invoke: window {window} {already}")),
+    };
+    match what {
+        None => ctx.fail(format_args!("ui invoke: {}", InvokeError::NotAllowed(role, kind))),
         Some(RootAction::Focus) => match desktop::focus_window(window) {
             Some(row) => print_rows(ctx, &[row]),
             None => ctx.fail(format_args!("ui invoke: window {window} closed")),
         },
+        Some(RootAction::Minimize) => changed(ctx, desktop::minimize_window(window), "is minimized already"),
+        Some(RootAction::Restore) => changed(ctx, desktop::restore_window(window), "isn't minimized"),
         Some(RootAction::Close) => {
             if desktop::close_window(window, DEADLINE_NS) {
                 let _ = writeln!(ctx.out, "ui invoke: window {window} closed");
@@ -726,7 +782,7 @@ crate::ktest!(
         while let Some(e) = h.next_event() {
             kassert!(matches!(tk.step(&mut h, e), Step::Carry));
         }
-        let id = tk.app_mut().ui.id(button).get();
+        let id = tk.app_mut().ui.id(button).ok_or("removed")?.get();
         // A press that focuses the button: the tree changes, so it repaints.
         let (req, cell) = Request::new(id, Action::Press);
         tk.app_mut().cell = Some(cell.clone());

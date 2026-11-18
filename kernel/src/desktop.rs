@@ -624,6 +624,8 @@ struct State {
     /// The wallpaper drawn behind the windows, centred, or why there is
     /// none (then the theme's flat colour): `desktop status`'s `wallpaper`.
     wallpaper: WallpaperResult,
+    /// The taskbar's owner (#157), woken when a window opens or closes.
+    taskbar: Option<Waker>,
 }
 
 impl State {
@@ -659,7 +661,20 @@ impl State {
             slot: Slot::Free,
             requests: 0,
             wallpaper: Err(Arc::new(NotShown { word: "none", why: String::from("none set") })),
+            taskbar: None,
         }
+    }
+
+    /// A window opened or closed: the taskbar's owner is told, once the
+    /// locks are released.
+    fn list_changed(&mut self, after: &mut After) {
+        after.taskbar = self.taskbar.clone();
+    }
+
+    /// The windows that aren't panels (the taskbar), on the screen or
+    /// minimized.
+    fn ordinary(&self) -> usize {
+        self.wm.windows().iter().filter(|w| !w.is_panel()).count()
     }
 
     /// Damage the whole screen (a full recompose at the next pass).
@@ -720,12 +735,17 @@ fn with_queue<T>(win: &Window, f: impl FnOnce(&mut Queue) -> T) -> T {
 struct After {
     wake: Vec<Arc<Window>>,
     behind: Vec<u32>,
+    /// The taskbar's owner, to tell its windows changed.
+    taskbar: Option<Waker>,
 }
 
 impl After {
     fn finish(self) {
         for w in &self.wake {
             w.events.wake_all();
+        }
+        if let Some(t) = &self.taskbar {
+            t.wake();
         }
         for id in self.behind {
             log::warn!(target: "desktop", "window {id} is behind: dropping events");
@@ -803,17 +823,22 @@ impl Desktop {
     /// in front and focused, its frame's corner placed by how many are
     /// open. `NoDesktop` until the desktop's start completed.
     pub fn open_window(&self, title: &str, width: u32, height: u32) -> Result<WindowHandle, OpenError> {
-        self.open(title, width, height, None, false)
+        self.open(title, width, height, Place::Auto, false)
     }
 
-    fn open(
-        &self,
-        title: &str,
-        width: u32,
-        height: u32,
-        at: Option<(i32, i32)>,
-        spin: bool,
-    ) -> Result<WindowHandle, OpenError> {
+    /// Open a panel (#157, the taskbar) at `frame` on the screen: a
+    /// frameless window in front of every other, never focused (see
+    /// `lumen_wm::Wm::open_panel`). Its owner is woken (a [`Waker`] poke)
+    /// whenever a window opens or closes.
+    pub fn open_panel(&self, title: &str, frame: Rect) -> Result<WindowHandle, OpenError> {
+        let h = self.open(title, frame.w(), frame.h(), Place::Panel(frame), false)?;
+        if let Some(s) = self.home.lock().as_mut() {
+            s.taskbar = Some(h.waker());
+        }
+        Ok(h)
+    }
+
+    fn open(&self, title: &str, width: u32, height: u32, at: Place, spin: bool) -> Result<WindowHandle, OpenError> {
         let (sw, sh) = {
             let g = self.home.lock();
             let s = g.as_ref().filter(|s| s.started).ok_or(OpenError::NoDesktop)?;
@@ -842,9 +867,13 @@ impl Desktop {
             if s.windows.len() >= MAX_WINDOWS {
                 return Err(OpenError::TooMany);
             }
-            let n = s.windows.len() as i32;
-            let (x, y) = at.unwrap_or((96 + 32 * (n % 8), 80 + 32 * (n % 8)));
-            let (id, out) = s.wm.open(title, width, height, x, y);
+            // Placed by how many windows (not panels) are open.
+            let n = s.ordinary() as i32;
+            let (id, out) = match at {
+                Place::Panel(frame) => s.wm.open_panel(title, frame),
+                Place::At(x, y) => s.wm.open(title, width, height, x, y),
+                Place::Auto => s.wm.open(title, width, height, 96 + 32 * (n % 8), 80 + 32 * (n % 8)),
+            };
             // The theme and its count, read together under the live
             // desktop's lock (every switch holds it); a test desktop's isn't
             // that lock, and needn't be: the count starts one behind, so the
@@ -872,6 +901,7 @@ impl Desktop {
             });
             s.windows.push(win.clone());
             s.apply(out, &mut after);
+            s.list_changed(&mut after);
             (win, theme)
         };
         let (win, theme) = win;
@@ -891,7 +921,18 @@ pub fn open_window(title: &str, width: u32, height: u32) -> Result<WindowHandle,
 /// move, so a strip of its title bar stays on the screen): terminal windows
 /// (#155) side by side.
 pub fn open_window_at(title: &str, width: u32, height: u32, x: i32, y: i32) -> Result<WindowHandle, OpenError> {
-    Desktop::LIVE.open(title, width, height, Some((x, y)), false)
+    Desktop::LIVE.open(title, width, height, Place::At(x, y), false)
+}
+
+/// Where [`Desktop::open`] puts a window.
+#[derive(Clone, Copy)]
+enum Place {
+    /// By how many are open.
+    Auto,
+    /// Its frame's corner there (clamped like a move).
+    At(i32, i32),
+    /// A panel with this frame.
+    Panel(Rect),
 }
 
 /// Another thread's handle on a window's owner (#155: a terminal window's
@@ -1009,6 +1050,13 @@ impl WindowHandle {
         &mut self.surface
     }
 
+    /// The owner's surface lent as bands of `rows` rows (#157: one per CPU
+    /// at a time, `sched::scope`); while they are lent nothing else of the
+    /// handle can be used (no commit). Panics if `rows` is 0.
+    pub fn bands_mut(&mut self, rows: u32) -> Vec<lumen_gfx::BandMut<'_>> {
+        self.surface.bands_mut(rows)
+    }
+
     /// Copy `rects` (client coordinates, clipped to it) of the owner's
     /// surface to the committed one, at most [`BAND`] rows per hold of the
     /// window's lock, then queue them as damage (moved to the window's
@@ -1027,7 +1075,10 @@ impl WindowHandle {
         if let Some(s) = self.home.lock().as_mut() {
             s.commits -= 1;
             s.committed += 1;
-            if let Some(client) = s.wm.client(self.win.id) {
+            // A minimized window isn't on the screen: nothing to redraw
+            // (its restore damages its whole frame).
+            let shown = s.wm.window(self.win.id).is_some_and(|w| !w.is_minimized());
+            if let Some(client) = s.wm.client(self.win.id).filter(|_| shown) {
                 for r in rects.iter().filter_map(|r| r.intersect(&bounds)) {
                     s.damage.add(r.translate(client.x(), client.y()));
                 }
@@ -1144,6 +1195,10 @@ impl Drop for WindowHandle {
             if let Some(out) = s.wm.close(self.win.id) {
                 s.apply(out, &mut after);
             }
+            if s.taskbar.as_ref().is_some_and(|t| Weak::ptr_eq(&t.0, &Arc::downgrade(&self.win))) {
+                s.taskbar = None;
+            }
+            s.list_changed(&mut after);
             unanswered
         } else {
             self.win.inner.lock().queue.kill()
@@ -1177,6 +1232,8 @@ struct Snap {
     win: Arc<Window>,
     frame: Rect,
     focused: bool,
+    /// A panel (#157): no frame drawn, its client area its frame.
+    panel: bool,
 }
 
 /// What a pass draws: the windows back to front, the theme and the
@@ -1206,8 +1263,12 @@ fn compose(target: &mut Surface, r: Rect, scene: &Scene, titles: &mut Option<Tit
     paint_desktop(target, r, scene);
     for snap in &scene.windows {
         let Some(f) = snap.frame.intersect(&r) else { continue };
-        paint_frame(target, snap, f, scene.theme, titles.as_mut());
-        let client = METRICS.client(&snap.frame);
+        let client = if snap.panel {
+            snap.frame
+        } else {
+            paint_frame(target, snap, f, scene.theme, titles.as_mut());
+            METRICS.client(&snap.frame)
+        };
         let Some(c) = client.intersect(&r) else { continue };
         for band in bands(c) {
             let src = band.translate(-client.x(), -client.y());
@@ -1255,8 +1316,18 @@ fn paint_frame(target: &mut Surface, snap: &Snap, clip: Rect, theme: &Theme, tit
             target.blend_mask_in(&mask, close.x(), close.y(), theme.close_glyph, c);
         }
     }
-    // The title, left of the close box, never over it.
-    let text_right = close.x().saturating_sub(4).max(bar.x());
+    // The minimize box (#157): a bar along its bottom, in the title's
+    // colour.
+    let minimize = METRICS.minimize_box(&frame);
+    if !minimize.is_empty() {
+        let line = Rect::new(minimize.x() + 4, minimize.bottom() - 5, minimize.w().saturating_sub(8), 2);
+        if let Some(l) = line.intersect(&clip) {
+            target.fill_rect(l, title_fg);
+        }
+    }
+    // The title, left of the boxes, never over them.
+    let first_box = if minimize.is_empty() { close } else { minimize };
+    let text_right = first_box.x().saturating_sub(4).max(bar.x());
     let area = Rect::new(bar.x(), bar.y(), (text_right - bar.x()).max(0) as u32, bar.h());
     if let (Some(a), Some(t)) = (area.intersect(&clip), titles) {
         let y = bar.y() + (METRICS.title_h as i32 - t.line as i32) / 2;
@@ -1693,9 +1764,10 @@ fn snapshot(s: &State) -> Scene {
     let windows =
         s.wm.windows()
             .iter()
+            .filter(|w| !w.is_minimized())
             .filter_map(|w| {
                 let win = s.window(w.id())?.clone();
-                Some(Snap { win, frame: w.frame(), focused: focused == Some(w.id()) })
+                Some(Snap { win, frame: w.frame(), focused: focused == Some(w.id()), panel: w.is_panel() })
             })
             .collect();
     Scene { windows, theme: theme(), wallpaper: s.wallpaper.as_ref().ok().cloned() }
@@ -1887,6 +1959,9 @@ fn first_start() -> Result<Shown, StartError> {
             drop(thread);
             wake();
             open_demo_windows();
+            if let Err(e) = crate::taskbar::open() {
+                log::warn!(target: "desktop", "no taskbar: {e}");
+            }
             log::info!(target: "desktop", "started on {w}x{h}");
             Ok(Shown::Now)
         }
@@ -2106,8 +2181,94 @@ fn root_row(s: &State, id: WindowId) -> Option<TreeRow> {
     let win = s.window(id)?;
     let client = s.wm.client(id)?;
     let top = win.inner.lock().top.clone();
-    let node = AutomationNode::window(win.root, w.title(), client, s.wm.focused() == Some(id), top);
+    let node = if w.is_panel() {
+        // The taskbar's root is a group: no actions (it can't be focused,
+        // minimized or closed).
+        AutomationNode::group(win.root, w.title(), client, false, top)
+    } else {
+        AutomationNode::window(win.root, w.title(), client, s.wm.focused() == Some(id), top)
+    };
     Some(TreeRow { window: id.get(), depth: 0, node })
+}
+
+/// The role of window `window`'s root: `window`, or `group` for a panel
+/// (the taskbar); `None` if it isn't open.
+pub fn root_role(window: u32) -> Option<lumen_ui::Role> {
+    let g = COMPOSITOR.lock();
+    let s = g.as_ref()?;
+    let w = s.wm.window(s.wm.id(window)?)?;
+    Some(if w.is_panel() { lumen_ui::Role::Group } else { lumen_ui::Role::Window })
+}
+
+/// Why [`minimize_window`] or [`restore_window`] did nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotChanged {
+    Closed,
+    /// Minimized already (a minimize), or not minimized (a restore).
+    Already,
+}
+
+/// Minimize (`to`) or restore window `window` (`ui invoke <root>
+/// minimize|restore`, the taskbar): its root's row after.
+fn set_minimized(window: u32, to: bool) -> Result<TreeRow, NotChanged> {
+    let mut after = After::default();
+    let row = {
+        let mut g = COMPOSITOR.lock();
+        let s = g.as_mut().ok_or(NotChanged::Closed)?;
+        let id = s.wm.id(window).ok_or(NotChanged::Closed)?;
+        let w = s.wm.window(id).ok_or(NotChanged::Closed)?;
+        if w.is_panel() {
+            return Err(NotChanged::Closed);
+        }
+        let out = if to { s.wm.minimize(id) } else { s.wm.restore(id) };
+        match out {
+            Some(out) => {
+                s.apply(out, &mut after);
+                root_row(s, id).ok_or(NotChanged::Closed)
+            }
+            None => Err(NotChanged::Already),
+        }
+    };
+    after.finish();
+    wake();
+    row
+}
+
+pub fn minimize_window(window: u32) -> Result<TreeRow, NotChanged> {
+    set_minimized(window, true)
+}
+
+pub fn restore_window(window: u32) -> Result<TreeRow, NotChanged> {
+    set_minimized(window, false)
+}
+
+/// Open a panel on the live desktop (see [`Desktop::open_panel`]).
+pub fn open_panel(title: &str, frame: Rect) -> Result<WindowHandle, OpenError> {
+    Desktop::LIVE.open_panel(title, frame)
+}
+
+/// The live desktop's screen size, once it exists.
+pub fn screen_size() -> Option<(u32, u32)> {
+    COMPOSITOR.lock().as_ref().map(|s| (s.width, s.height))
+}
+
+/// Poke the taskbar's owner (`desktop tick`: its clock moved).
+pub fn wake_taskbar() {
+    let taskbar = COMPOSITOR.lock().as_ref().and_then(|s| s.taskbar.clone());
+    if let Some(t) = taskbar {
+        t.wake();
+    }
+}
+
+/// The windows (not panels) in the order they opened, for the taskbar:
+/// id and title.
+pub fn window_list() -> Vec<(u32, String)> {
+    let g = COMPOSITOR.lock();
+    let Some(s) = g.as_ref() else { return Vec::new() };
+    let mut list: Vec<(u32, String)> =
+        s.wm.windows().iter().filter(|w| !w.is_panel()).map(|w| (w.id().get(), String::from(w.title()))).collect();
+    list.sort_unstable_by_key(|(id, _)| *id);
+    list
 }
 
 /// Whether the desktop has started.
@@ -2275,7 +2436,7 @@ fn open_demo_windows() {
         (Demo::Colours, "Colours", 400, 210, (440, 300), "desktop-colours"),
     ];
     for (demo, title, w, h, at, thread) in demos {
-        let handle = match Desktop::LIVE.open(title, w, h, Some(at), false) {
+        let handle = match Desktop::LIVE.open(title, w, h, Place::At(at.0, at.1), false) {
             Ok(h) => h,
             Err(e) => {
                 log::warn!(target: "desktop", "no {title} window: {e}");
@@ -2435,7 +2596,7 @@ fn spin() -> Result<u32, String> {
     let mut ui = lumen_ui::Ui::new();
     let stop = ui.button(None, "Stop");
     let area = Rect::new(0, SPIN_STRIP as i32, w, h - SPIN_STRIP);
-    let handle = Desktop::LIVE.open("spin", w, h, None, true).map_err(|e| alloc::format!("no window: {e}"))?;
+    let handle = Desktop::LIVE.open("spin", w, h, Place::Auto, true).map_err(|e| alloc::format!("no window: {e}"))?;
     let tk = crate::ui::Toolkit::new(Spin { ui, stop, x: 0 }, area, handle.theme())?;
     let id = handle.id();
     let _detached = crate::sched::spawn("desktop-spin", move || spin_owner(handle, tk))
@@ -2456,7 +2617,7 @@ fn hold(id: &str, held: bool) -> Result<(), String> {
     Ok(())
 }
 
-pub const USAGE: &str = "usage: desktop [status|check|spin|counter|hold <window>|release <window>]";
+pub const USAGE: &str = "usage: desktop [status|check|spin|counter|tick|hold <window>|release <window>]";
 
 // -- records -----------------------------------------------------------------------
 
@@ -2481,6 +2642,7 @@ struct WindowRow {
     frame: Rect,
     z: usize,
     focused: bool,
+    minimized: bool,
     owner: &'static str,
     lost: u64,
     keys: u64,
@@ -2506,9 +2668,11 @@ pub fn windows_table() -> Result<pipe::Table, String> {
         let g = COMPOSITOR.lock();
         let s = g.as_ref().ok_or_else(|| String::from("windows: no desktop"))?;
         let focused = s.wm.focused();
+        // Not the panels (the taskbar is the desktop's, like the frames).
         s.wm.windows()
             .iter()
             .rev()
+            .filter(|w| !w.is_panel())
             .enumerate()
             .filter_map(|(z, w)| {
                 let win = s.window(w.id())?;
@@ -2522,6 +2686,7 @@ pub fn windows_table() -> Result<pipe::Table, String> {
                     frame: w.frame(),
                     z,
                     focused: focused == Some(w.id()),
+                    minimized: w.is_minimized(),
                     owner,
                     lost,
                     keys: win.keys.load(Ordering::Relaxed),
@@ -2540,7 +2705,7 @@ pub fn windows_table() -> Result<pipe::Table, String> {
             int(u64::from(r.frame.h())),
             int(r.z as u64),
             yes(r.focused),
-            yes(false),
+            yes(r.minimized),
             text(r.owner),
             int(r.lost),
             int(r.keys),
@@ -2625,7 +2790,7 @@ pub fn status_table() -> pipe::Table {
     t.push(alloc::vec![
         text(if shown { "shown" } else { "paused" }),
         text(theme().id.name()),
-        int(s.windows.len() as u64),
+        int(s.ordinary() as u64),
         int(s.stats.frames),
         int(s.stats.rects),
         int(s.stats.pixels),
@@ -2757,7 +2922,7 @@ pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
     // `check`, `spin`, `counter`, `hold` and `release` need the desktop
     // shown.
     if let [what, ..] = words[..]
-        && matches!(what, "check" | "spin" | "counter" | "hold" | "release")
+        && matches!(what, "check" | "spin" | "counter" | "hold" | "release" | "tick")
         && let Some(why) = refused_while_paused()
     {
         return ctx.fail(why);
@@ -2806,6 +2971,10 @@ pub fn command(ctx: &mut crate::shell::Ctx<'_>, args: &[String]) {
                 }
                 Err(e) => ctx.fail(format_args!("desktop {what}: {e}")),
             }
+        }
+        ["tick"] => {
+            crate::taskbar::tick();
+            let _ = writeln!(ctx.out, "desktop tick: the clock moved a minute ahead");
         }
         [what @ ("hold" | "release"), id] => match hold(id, what == "hold") {
             Ok(()) => {

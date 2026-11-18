@@ -31,6 +31,11 @@ class ImageDiff:
         return self.differing / max(1, self.width * self.height)
 
 
+# The colour a golden's masked rectangles are painted (magenta: no theme
+# uses it).
+MASK = (0xFF, 0x00, 0xFF)
+
+
 def update_requested() -> bool:
     return os.environ.get("LUMEN_UPDATE_GOLDEN") == "1"
 
@@ -72,14 +77,20 @@ def assert_matches_golden(
     *,
     tolerance: int = 0,
     max_fraction: float = 0.0,
+    masks: tuple[tuple[int, int, int, int], ...] = (),
 ) -> ImageDiff | None:
     """Compare a region of `screenshot` to `golden_path`, or re-record it.
 
     Exact by default: our rendering is deterministic (pinned OVMF, fixed mode,
     pre-rasterized font), and identical on macOS/TCG and Linux/KVM. Loosen
-    the tolerance only with a reason written next to the call.
+    the tolerance only with a reason written next to the call. `masks`
+    (x, y, w, h in the screenshot) are painted `MASK` first, in the
+    region and in what is recorded: what changes by itself (the taskbar
+    clock) stays out of the comparison.
     """
     region = crop(screenshot, origin, size)
+    for x, y, w, h in masks:
+        region.paste(MASK, (x - origin[0], y - origin[1], x - origin[0] + w, y - origin[1] + h))
     if update_requested():
         golden_path.parent.mkdir(parents=True, exist_ok=True)
         region.save(golden_path)
