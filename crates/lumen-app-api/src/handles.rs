@@ -46,20 +46,26 @@ impl<T> HandleTable<T> {
         Ok(h as i32)
     }
 
+    /// Where open handle `h` is: [`Error::BadHandle`] for any `h` that
+    /// isn't one (0, negative, closed, never handed out).
+    fn index(&self, h: i32) -> Result<usize, Error> {
+        self.open.iter().position(|(id, _)| *id as i32 == h && h > 0).ok_or(Error::BadHandle)
+    }
+
     /// What handle `h` names.
     pub fn get(&self, h: i32) -> Result<&T, Error> {
-        self.open.iter().find(|(id, _)| *id as i32 == h && h > 0).map(|(_, o)| o).ok_or(Error::BadHandle)
+        self.index(h).map(|i| &self.open[i].1)
     }
 
     /// What handle `h` names, to change.
     pub fn get_mut(&mut self, h: i32) -> Result<&mut T, Error> {
-        self.open.iter_mut().find(|(id, _)| *id as i32 == h && h > 0).map(|(_, o)| o).ok_or(Error::BadHandle)
+        self.index(h).map(|i| &mut self.open[i].1)
     }
 
     /// Close handle `h`, giving back what it named.
     pub fn remove(&mut self, h: i32) -> Result<T, Error> {
-        let at = self.open.iter().position(|(id, _)| *id as i32 == h && h > 0).ok_or(Error::BadHandle)?;
-        Ok(self.open.remove(at).1)
+        let i = self.index(h)?;
+        Ok(self.open.remove(i).1)
     }
 
     /// The open handle whose object matches, if any.

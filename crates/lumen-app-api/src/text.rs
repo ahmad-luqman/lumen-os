@@ -31,12 +31,6 @@ pub const NAME_BYTES: usize = 32;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LogText(String);
 
-impl LogText {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 impl Deref for LogText {
     type Target = str;
 
@@ -101,26 +95,26 @@ mod tests {
 
     #[test]
     fn a_log_line_is_cut_on_a_char_boundary() {
-        assert_eq!(log_line("short").as_str(), "short");
+        assert_eq!(&*log_line("short"), "short");
         let long = "a".repeat(LOG_BYTES + 10);
         assert_eq!(log_line(&long).len(), LOG_BYTES);
         // A 2-byte char straddling the cut is dropped whole.
         let straddling = alloc::format!("{}é", "a".repeat(LOG_BYTES - 1));
-        assert_eq!(log_line(&straddling).as_str(), "a".repeat(LOG_BYTES - 1));
+        assert_eq!(&*log_line(&straddling), "a".repeat(LOG_BYTES - 1));
         // One that ends exactly at the cut stays.
         let ending = alloc::format!("{}é", "a".repeat(LOG_BYTES - 2));
-        assert_eq!(log_line(&ending).as_str(), ending);
-        assert_eq!(cut("abcdef", 3).as_str(), "abc");
+        assert_eq!(&*log_line(&ending), ending);
+        assert_eq!(&*cut("abcdef", 3), "abc");
     }
 
     #[test]
     fn control_characters_cant_forge_a_line() {
         assert_eq!(
-            log_line("ok\n[    0.1] INFO  boot: boot complete").as_str(),
+            &*log_line("ok\n[    0.1] INFO  boot: boot complete"),
             "ok\u{fffd}[    0.1] INFO  boot: boot complete"
         );
-        assert_eq!(log_line("a\rb\x1b[2Jc\td").as_str(), "a\u{fffd}b\u{fffd}[2Jc\u{fffd}d");
-        assert_eq!(log_line_lossy(b"bad \xff\nline").as_str(), "bad \u{fffd}\u{fffd}line");
+        assert_eq!(&*log_line("a\rb\x1b[2Jc\td"), "a\u{fffd}b\u{fffd}[2Jc\u{fffd}d");
+        assert_eq!(&*log_line_lossy(b"bad \xff\nline"), "bad \u{fffd}\u{fffd}line");
     }
 
     #[test]
@@ -128,7 +122,7 @@ mod tests {
         // Every character Python's `str.splitlines` splits on.
         for c in ['\n', '\r', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\u{85}', '\u{2028}', '\u{2029}'] {
             let line = log_line(&alloc::format!("a{c}INFO  boot: boot complete"));
-            assert_eq!(line.as_str(), "a\u{fffd}INFO  boot: boot complete", "{:?}", c);
+            assert_eq!(&*line, "a\u{fffd}INFO  boot: boot complete", "{:?}", c);
         }
     }
 

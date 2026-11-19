@@ -1,13 +1,13 @@
 //! How an app ends: one [`Outcome`], the first recorded ([`EndCell`]),
 //! deciding its one end line (ARCHITECTURE section 8, "One end reason,
-//! first writer wins"). In #199 the app's own thread is the only writer (a
-//! `kill` sets a flag the thread acts on); the cell keeps the rule for the
-//! writers #206 and #207 add (the close grace, a desktop that goes away),
-//! so whichever records first is the app's end and an app never gets two
+//! first writer wins"). The app's own thread is the only writer, through
+//! #207: an end decided elsewhere (a `kill`, later the close grace's
+//! `Close`) sets a flag the thread acts on at its next host call or slice
+//! end. The cell still keeps the first record, so an app never gets two
 //! end lines.
 
 use crate::limits::CLOSE_GRACE_SLICES;
-use crate::text::{self, LogText};
+use crate::text::LogText;
 use alloc::format;
 use alloc::string::String;
 
@@ -73,17 +73,6 @@ pub enum Level {
 }
 
 impl EndReason {
-    /// `panic` with this message: cut and sanitised as log text, so the end
-    /// line can't forge another line.
-    pub fn panicked(message: &str) -> EndReason {
-        EndReason::Panicked(text::log_line(message))
-    }
-
-    /// A trap with wasmi's message, sanitised as log text.
-    pub fn trapped(message: &str) -> EndReason {
-        EndReason::Trapped(text::log_line(message))
-    }
-
     /// What the end line says after the app's name and id
     /// (`exited with 0`, `ended: trap: ...`).
     pub fn what(&self) -> String {
@@ -103,11 +92,6 @@ impl EndReason {
             EndReason::Panicked(_) | EndReason::Trapped(_) => Level::Warn,
             EndReason::Exited(_) | EndReason::Killed | EndReason::CloseGrace => Level::Info,
         }
-    }
-
-    /// The end line's text (target `app`): `<name> (app <id>) <what>`.
-    pub fn line(&self, name: &str, id: u64) -> String {
-        format!("{name} (app {id}) {}", self.what())
     }
 }
 
@@ -172,6 +156,7 @@ impl CloseGrace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text;
 
     #[test]
     fn the_first_reason_recorded_wins() {
@@ -179,7 +164,7 @@ mod tests {
         assert_eq!(cell.outcome(), None);
         assert!(cell.record(EndReason::Killed));
         assert!(!cell.record(EndReason::Exited(0)));
-        assert!(!cell.record(EndReason::trapped("unreachable")));
+        assert!(!cell.record(EndReason::Trapped(text::log_line("unreachable"))));
         assert!(!cell.record(Outcome::NotStarted(text::log_line("x"))));
         assert_eq!(cell.outcome(), Some(&Outcome::Ended(EndReason::Killed)));
     }
@@ -191,22 +176,22 @@ mod tests {
             (EndReason::Exited(-2), Level::Info, "hello (app 3) exited with -2"),
             (EndReason::Killed, Level::Info, "hello (app 3) killed"),
             (EndReason::CloseGrace, Level::Info, "hello (app 3) ended: didn't close its window"),
-            (EndReason::panicked("oops"), Level::Warn, "hello (app 3) ended: panicked: oops"),
+            (EndReason::Panicked(text::log_line("oops")), Level::Warn, "hello (app 3) ended: panicked: oops"),
             (
-                EndReason::trapped("wasm `unreachable` instruction executed"),
+                EndReason::Trapped(text::log_line("wasm `unreachable` instruction executed")),
                 Level::Warn,
                 "hello (app 3) ended: trap: wasm `unreachable` instruction executed",
             ),
         ];
         for (reason, level, line) in cases {
             assert_eq!(reason.level(), level);
-            assert_eq!(reason.line("hello", 3), line);
+            assert_eq!(Outcome::from(reason).line("hello", 3), line);
         }
     }
 
     #[test]
     fn a_panic_message_cant_forge_a_line() {
-        let r = EndReason::panicked("bad\nWARN  app: fake");
+        let r = EndReason::Panicked(text::log_line("bad\nWARN  app: fake"));
         assert_eq!(r.what(), "ended: panicked: bad\u{fffd}WARN  app: fake");
     }
 

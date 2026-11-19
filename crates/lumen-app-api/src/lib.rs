@@ -42,47 +42,73 @@ pub use lumen_trace::kind;
 
 use core::fmt;
 
-/// What a host call returns when it fails, negated: `-1` is
-/// [`BadHandle`](Error::BadHandle). Stable, never reused (pinned by a test).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(i32)]
-pub enum Error {
-    /// No such open handle.
-    BadHandle = 1,
-    /// A handle of a kind the call doesn't take.
-    WrongKind = 2,
-    /// `handle_find` for a grant the app doesn't hold.
-    NotGranted = 3,
-    /// A range outside the app's memory, an overflow, or an unaligned
-    /// canvas.
-    BadPointer = 4,
-    /// Bad UTF-8, a value out of range, text past its cap, an encoding that
-    /// doesn't decode or breaks its rules.
-    BadArgument = 5,
-    /// The output didn't fit: nothing written.
-    BufferTooSmall = 6,
-    /// A count reached: windows, handles.
-    Limit = 7,
-    /// The object can't answer now: no desktop, no window, the RTC failed.
-    Unavailable = 8,
-    /// The heap refused although the worst case fits (a bug).
-    OutOfMemory = 9,
+/// One ABI enum from one list: the enum (`#[repr(i32)]`, each variant
+/// its number), `ALL` in that order, `from_number` and `name`, so a variant
+/// can't be added to one and missed by the others.
+macro_rules! abi_enum {
+    ($(#[$meta:meta])* $vis:vis enum $name:ident {
+        $($(#[$vmeta:meta])* $variant:ident = $num:literal,)*
+    }) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        #[repr(i32)]
+        $vis enum $name {
+            $($(#[$vmeta])* $variant = $num,)*
+        }
+
+        impl $name {
+            /// Every variant, in number order.
+            pub const ALL: [$name; [$($num),*].len()] = [$($name::$variant),*];
+
+            /// The variant numbered `n`, if any.
+            pub const fn from_number(n: i32) -> Option<$name> {
+                match n {
+                    $($num => Some($name::$variant),)*
+                    _ => None,
+                }
+            }
+
+            /// Its name (`NotGranted`).
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $($name::$variant => stringify!($variant),)*
+                }
+            }
+        }
+    };
+}
+
+abi_enum! {
+    /// What a host call returns when it fails, negated: `-1` is
+    /// [`BadHandle`](Error::BadHandle). Stable, never reused (pinned by a
+    /// test).
+    pub enum Error {
+        /// No such open handle.
+        BadHandle = 1,
+        /// A handle of a kind the call doesn't take.
+        WrongKind = 2,
+        /// `handle_find` for a grant the app doesn't hold.
+        NotGranted = 3,
+        /// A range outside the app's memory, an overflow, or an unaligned
+        /// canvas.
+        BadPointer = 4,
+        /// Bad UTF-8, a value out of range, text past its cap, an encoding
+        /// that doesn't decode or breaks its rules.
+        BadArgument = 5,
+        /// The output didn't fit: nothing written.
+        BufferTooSmall = 6,
+        /// A count reached: windows, handles.
+        Limit = 7,
+        /// The object can't answer now: no desktop, no window, the RTC
+        /// failed.
+        Unavailable = 8,
+        /// The heap refused although the worst case fits (a bug; #206's
+        /// calls).
+        OutOfMemory = 9,
+    }
 }
 
 impl Error {
-    /// Every code, in order.
-    pub const ALL: [Error; 9] = [
-        Error::BadHandle,
-        Error::WrongKind,
-        Error::NotGranted,
-        Error::BadPointer,
-        Error::BadArgument,
-        Error::BufferTooSmall,
-        Error::Limit,
-        Error::Unavailable,
-        Error::OutOfMemory,
-    ];
-
     /// Its code (positive).
     pub const fn code(self) -> i32 {
         self as i32
@@ -93,43 +119,10 @@ impl Error {
         -(self as i32)
     }
 
-    /// The error with code `code`, if any (an exhaustive match: a new
-    /// variant must be given here, and a test checks [`Error::ALL`] holds
-    /// every one this returns).
-    pub const fn from_code(code: i32) -> Option<Error> {
-        Some(match code {
-            1 => Error::BadHandle,
-            2 => Error::WrongKind,
-            3 => Error::NotGranted,
-            4 => Error::BadPointer,
-            5 => Error::BadArgument,
-            6 => Error::BufferTooSmall,
-            7 => Error::Limit,
-            8 => Error::Unavailable,
-            9 => Error::OutOfMemory,
-            _ => return None,
-        })
-    }
-
     /// The error a host call's negative result names, if any.
     pub fn from_returned(result: i64) -> Option<Error> {
         let code = i32::try_from(result.checked_neg()?).ok()?;
-        if code <= 0 { None } else { Error::from_code(code) }
-    }
-
-    /// Its name, as apps log it (`NotGranted`).
-    pub const fn name(self) -> &'static str {
-        match self {
-            Error::BadHandle => "BadHandle",
-            Error::WrongKind => "WrongKind",
-            Error::NotGranted => "NotGranted",
-            Error::BadPointer => "BadPointer",
-            Error::BadArgument => "BadArgument",
-            Error::BufferTooSmall => "BufferTooSmall",
-            Error::Limit => "Limit",
-            Error::Unavailable => "Unavailable",
-            Error::OutOfMemory => "OutOfMemory",
-        }
+        if code <= 0 { None } else { Error::from_number(code) }
     }
 }
 
@@ -172,26 +165,20 @@ pub enum Kind {
     Trace = 5,
 }
 
-/// What `handle_find` takes: the kinds an app is granted (not `Window`,
-/// which `window_open` makes). Its numbers are the kinds'.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(i32)]
-pub enum Grant {
-    Log = 1,
-    Time = 2,
-    Desktop = 3,
-    Trace = 5,
+abi_enum! {
+    /// What `handle_find` takes: the kinds an app is granted (not `Window`,
+    /// which `window_open` makes). Its numbers are the kinds'; `from_number`
+    /// is `None` for `Window` (4) and any number that names no grant (both
+    /// `BadArgument`).
+    pub enum Grant {
+        Log = 1,
+        Time = 2,
+        Desktop = 3,
+        Trace = 5,
+    }
 }
 
 impl Grant {
-    pub const ALL: [Grant; 4] = [Grant::Log, Grant::Time, Grant::Desktop, Grant::Trace];
-
-    /// The grant `handle_find(number)` asks for: `None` for `Window` (4)
-    /// and any number that names no grant (both `BadArgument`).
-    pub fn from_number(number: i32) -> Option<Grant> {
-        Grant::ALL.into_iter().find(|g| *g as i32 == number)
-    }
-
     /// The kind of handle it is.
     pub const fn kind(self) -> Kind {
         match self {
@@ -217,31 +204,15 @@ const _: () = {
     }
 };
 
-/// A `log` call's level: its numbers are the ABI's (pinned by a test).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(i32)]
-pub enum LogLevel {
-    Error = 1,
-    Warn = 2,
-    Info = 3,
-    Debug = 4,
-    Trace = 5,
-}
-
-impl LogLevel {
-    pub const ALL: [LogLevel; 5] = [LogLevel::Error, LogLevel::Warn, LogLevel::Info, LogLevel::Debug, LogLevel::Trace];
-
-    /// The level `log`'s `level` argument names: `None` (`BadArgument`)
-    /// outside 1..=5.
-    pub const fn from_number(n: i32) -> Option<LogLevel> {
-        Some(match n {
-            1 => LogLevel::Error,
-            2 => LogLevel::Warn,
-            3 => LogLevel::Info,
-            4 => LogLevel::Debug,
-            5 => LogLevel::Trace,
-            _ => return None,
-        })
+abi_enum! {
+    /// A `log` call's level: its numbers are the ABI's (pinned by a test);
+    /// `from_number` is `None` (`BadArgument`) outside 1..=5.
+    pub enum LogLevel {
+        Error = 1,
+        Warn = 2,
+        Info = 3,
+        Debug = 4,
+        Trace = 5,
     }
 }
 
@@ -344,13 +315,15 @@ mod tests {
 
     #[test]
     fn all_holds_every_code() {
-        // `from_code` is an exhaustive match: whatever it names, `ALL`
-        // (which `from_returned` and the apps' `named` go by) holds too.
-        let named: Vec<Error> = (-64..=64).filter_map(Error::from_code).collect();
+        // `abi_enum!` makes `ALL`, `from_number` and `name` from one list:
+        // whatever one names, the others do.
+        let named: Vec<Error> = (-64..=64).filter_map(Error::from_number).collect();
         assert_eq!(named, Error::ALL);
         for e in Error::ALL {
-            assert_eq!(Error::from_code(e.code()), Some(e));
+            assert_eq!(Error::from_number(e.code()), Some(e));
         }
+        assert_eq!(Grant::ALL.map(Grant::name), ["Log", "Time", "Desktop", "Trace"]);
+        assert_eq!(LogLevel::ALL.map(LogLevel::name), ["Error", "Warn", "Info", "Debug", "Trace"]);
         assert_eq!(returned(Ok(7)), 7);
         assert_eq!(returned(Err(Error::Limit)), -7);
         assert_eq!(returned64(Err(Error::Unavailable)), -8);
