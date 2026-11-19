@@ -39,7 +39,7 @@ pub static COMMANDS: Table<Run> = Table(&[
         name: "trace",
         args: &[&["runq", "xray"]],
         usage: "[n | runq [park <n>] | xray <cpu> [since]]",
-        about: "the boot CPU's last n trace events (default 16), run queues by X-ray, a CPU's X-ray events",
+        about: "this CPU's last n trace events (default 16), run queues by X-ray, a CPU's X-ray events",
         run: trace,
     },
     Command { name: "heap", args: &[], usage: "", about: "heap usage and free-list summary", run: heap },

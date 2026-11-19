@@ -79,9 +79,9 @@ use lumen_mm::stacks::{StackKind, StackRange};
 use crate::arch::{self, MAX_CPUS};
 use crate::mm::stack::{KernelStack, STACK_SIZE, StackError};
 use crate::sync::SpinLock;
-use crate::trace::{self, Kind};
+use crate::trace;
 use crate::{smp, time};
-use lumen_trace::kind::{RunQueue, RunQueueOp};
+use lumen_trace::kind::{RunQueue, RunQueueOp, Switch, ThreadState};
 
 /// Timer ticks (1 ms each) a thread runs before the next ready thread on its
 /// CPU gets a turn.
@@ -90,21 +90,46 @@ pub const SLICE_TICKS: u32 = 10;
 /// How long [`init`] waits, in all, for every CPU's scheduler to start.
 const START_TIMEOUT_NS: u64 = 1_000_000_000;
 
-/// Where a thread is in its life.
+/// Where a thread is in its life. The numbers are `ThreadState`'s, which a
+/// `switch` trace event records (pinned in `lumen_trace::kind`).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     /// Waiting for a turn: on its CPU's run queue (or about to be put there),
     /// or an idle thread that isn't running (never queued).
-    Ready = 0,
+    Ready = ThreadState::Ready as u8,
     /// Its CPU's current thread.
-    Running = 1,
+    Running = ThreadState::Running as u8,
     /// Waiting for a deadline ([`sleep`]).
-    Sleeping = 2,
+    Sleeping = ThreadState::Sleeping as u8,
     /// Waiting on a [`WaitQueue`].
-    Blocked = 3,
+    Blocked = ThreadState::Blocked as u8,
     /// Finished; its stack is freed once its CPU has switched away.
-    Dead = 4,
+    Dead = ThreadState::Dead as u8,
+}
+
+impl From<State> for ThreadState {
+    fn from(s: State) -> ThreadState {
+        match s {
+            State::Ready => ThreadState::Ready,
+            State::Running => ThreadState::Running,
+            State::Sleeping => ThreadState::Sleeping,
+            State::Blocked => ThreadState::Blocked,
+            State::Dead => ThreadState::Dead,
+        }
+    }
+}
+
+impl From<ThreadState> for State {
+    fn from(s: ThreadState) -> State {
+        match s {
+            ThreadState::Ready => State::Ready,
+            ThreadState::Running => State::Running,
+            ThreadState::Sleeping => State::Sleeping,
+            ThreadState::Blocked => State::Blocked,
+            ThreadState::Dead => State::Dead,
+        }
+    }
 }
 
 impl State {
@@ -112,11 +137,6 @@ impl State {
 
     fn from_raw(raw: u8) -> Option<State> {
         Self::ALL.into_iter().find(|&s| s as u8 == raw)
-    }
-
-    /// The name of the state whose number is `raw` (a trace event's), if any.
-    pub fn name_of(raw: u64) -> Option<&'static str> {
-        u8::try_from(raw).ok().and_then(State::from_raw).map(State::name)
     }
 
     pub fn name(self) -> &'static str {
@@ -630,9 +650,21 @@ static START_WAIT_OVER: AtomicBool = AtomicBool::new(false);
 pub struct QueueView {
     /// Threads on the queue.
     pub len: usize,
-    /// The length the ring's newest `runq` event for this queue says, and
-    /// that event's sequence number; `None` if the ring holds none.
-    pub traced: Option<(u64, u64)>,
+    /// The ring's newest `runq` event; `None` if the ring holds none.
+    pub traced: Option<Traced>,
+    /// The ring's next sequence number then: every change to the queue
+    /// before this reading has a smaller one, every change after it a
+    /// larger one (both record under the lock).
+    pub head: u64,
+}
+
+/// The newest `runq` event in a CPU's X-ray ring ([`QueueView`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Traced {
+    /// The queue's length it says.
+    pub len: u64,
+    /// Its sequence number.
+    pub seq: u64,
 }
 
 /// CPU `cpu`'s [`QueueView`], read under its queue's lock, so nothing
@@ -641,8 +673,9 @@ pub struct QueueView {
 /// scan takes no lock and allocates nothing.
 pub fn run_queue(cpu: usize) -> Option<QueueView> {
     let q = CPUS.get(cpu)?.lock();
-    let traced = trace::newest_run_queue(cpu).map(|(rq, seq)| (rq.len, seq));
-    Some(QueueView { len: q.ready.len(), traced })
+    let head = trace::xray_ring(cpu)?.written();
+    let traced = trace::newest_run_queue(cpu).map(|(rq, seq)| Traced { len: rq.len, seq });
+    Some(QueueView { len: q.ready.len(), traced, head })
 }
 
 /// Whether CPU `cpu`'s scheduler runs (threads can be spawned there).
@@ -1012,19 +1045,17 @@ fn schedule(cpu: usize) {
         if idle || requeue {
             prev.change(State::Running, State::Ready);
         }
-        let next = if requeue && q.ready.is_empty() {
-            // It would be queued and taken straight off again: it just
-            // keeps running, recording no run-queue change (a thread
-            // polling by yielding would fill the X-ray ring otherwise).
+        // Queued and taken straight off again, it just keeps running,
+        // recording no run-queue change (a thread polling by yielding would
+        // fill the X-ray ring otherwise).
+        let keep = requeue && q.ready.is_empty();
+        if requeue && !keep {
+            q.push_ready(cpu, prev.clone());
+        }
+        let next = if keep {
             prev.clone()
         } else {
-            if requeue {
-                q.push_ready(cpu, prev.clone());
-            }
-            match q.pop_ready(cpu) {
-                Some(t) => t,
-                None => q.idle.clone().expect("a running scheduler has an idle thread"),
-            }
+            q.pop_ready(cpu).unwrap_or_else(|| q.idle.clone().expect("a running scheduler has an idle thread"))
         };
         q.slice_left = SLICE_TICKS;
         assert_eq!(next.cpu, cpu, "thread {next:?} isn't cpu {cpu}'s");
@@ -1039,7 +1070,7 @@ fn schedule(cpu: usize) {
         // Checked before `CURRENT` names `next`, so a crash here names `prev`,
         // whose stack it runs on.
         assert!(load != 0, "switching to thread {next:?}, which has no saved context");
-        crate::ktrace!(Kind::Switch, prev.id, next.id, prev.state());
+        trace::record_switch(Switch { from: prev.id, to: next.id, state: prev.state().into() });
         CURRENT[cpu].store(Arc::as_ptr(&next).cast_mut(), Ordering::Release);
         q.current = Some(next);
         q.switched_from = Some(prev);
@@ -1477,7 +1508,10 @@ pub(crate) fn join_bounded(h: JoinHandle) -> crate::ktest::TestResult {
 #[cfg(feature = "ktest")]
 fn switches_since(start: u64) -> impl Iterator<Item = [u64; 4]> {
     let ring = crate::trace::ring();
-    (start..ring.written()).filter_map(|seq| ring.read(seq)).filter(|e| e.kind == Kind::Switch as u16).map(|e| e.args)
+    (start..ring.written())
+        .filter_map(|seq| ring.read(seq))
+        .filter(|e| e.kind == trace::Kind::Switch as u16)
+        .map(|e| e.args)
 }
 
 /// Whether the current CPU's ring has, from `start` on, a switch away from
@@ -2337,9 +2371,10 @@ crate::ktest!(
                 State::Ready | State::Running | State::Sleeping | State::Blocked | State::Dead => {} // keep in step with `ALL`
             }
             kassert_eq!(State::from_raw(s as u8), Some(s));
-            kassert_eq!(State::name_of(s as u64), Some(s.name()));
+            kassert_eq!(State::from(ThreadState::from(s)), s);
+            kassert_eq!(ThreadState::from(s) as u8, s as u8);
         }
-        kassert_eq!(State::name_of(State::ALL.len() as u64), None);
+        kassert_eq!(State::from_raw(State::ALL.len() as u8), None);
         Ok(())
     }
 );

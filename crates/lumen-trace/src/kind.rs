@@ -1,12 +1,15 @@
 //! Event kinds, numbered in one place: the kernel's `trace::Kind` takes its
 //! values from here, and apps (X-ray, through `lumen-app-api`) decode the
 //! events they read with the same numbers and layouts, so the two can't
-//! disagree.
+//! disagree. Which ring each kind goes to is [`stream_of`]; a reader names
+//! a ring by its [`Stream`].
 //!
-//! The X-ray kinds have typed layouts ([`RunQueue`], [`Irq`], [`LockWait`]):
-//! `args()` is what the kernel records, `decode` reads an [`Event`] back
-//! (`None` for another kind, or args no recorder writes). Their layouts are
-//! pinned by the tests below.
+//! Pinned by the tests below: every kind's number, the streams' numbers and
+//! [`stream_of`], [`ThreadState`]'s numbers, and the layouts of the kinds X-ray
+//! reads ([`Switch`], [`RunQueue`], [`Irq`], [`LockWait`]): `args()` is what
+//! the kernel records, `decode` reads an [`Event`] back (`None` for another
+//! kind, an unknown op or state, or a field past its range). The other
+//! kinds' arguments are described on their constants, not typed.
 
 use crate::Event;
 
@@ -20,8 +23,7 @@ pub const EXCEPTION: u16 = 2;
 pub const LOG: u16 = 3;
 /// A panic is being reported (main ring). `args[0]`: the source line.
 pub const PANIC: u16 = 4;
-/// The scheduler switched threads (main ring). `args`: previous thread,
-/// next thread, the previous thread's state.
+/// The scheduler switched threads (main ring): [`Switch`].
 pub const SWITCH: u16 = 5;
 /// A run queue changed (X-ray ring): [`RunQueue`].
 pub const RUN_QUEUE: u16 = 6;
@@ -31,6 +33,93 @@ pub const IRQ: u16 = 7;
 pub const LOCK_WAIT: u16 = 8;
 /// Recorded by in-kernel tests.
 pub const TEST: u16 = 0xff;
+
+/// Which of a CPU's two rings: the `Trace` capability's `stream`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Stream {
+    /// 0: the main ring (boot phases, exceptions, logs, panics, switches).
+    Main = 0,
+    /// 1: the X-ray ring (run queues, device interrupts, lock waits).
+    Xray = 1,
+}
+
+impl TryFrom<u32> for Stream {
+    type Error = u32;
+
+    fn try_from(raw: u32) -> Result<Self, u32> {
+        match raw {
+            0 => Ok(Stream::Main),
+            1 => Ok(Stream::Xray),
+            other => Err(other),
+        }
+    }
+}
+
+/// The ring a kind is recorded in: the X-ray kinds in [`Stream::Xray`],
+/// every other (unknown numbers too) in [`Stream::Main`].
+pub const fn stream_of(kind: u16) -> Stream {
+    match kind {
+        RUN_QUEUE | IRQ | LOCK_WAIT => Stream::Xray,
+        _ => Stream::Main,
+    }
+}
+
+/// A thread's state, as a [`Switch`] records the previous thread's (the
+/// kernel's `sched::State` takes its numbers from here).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ThreadState {
+    /// Waiting for a turn (preempted or yielding; or the idle thread).
+    Ready = 0,
+    Running = 1,
+    /// Waiting for a deadline.
+    Sleeping = 2,
+    /// Waiting on a wait queue.
+    Blocked = 3,
+    /// Finished.
+    Dead = 4,
+}
+
+impl ThreadState {
+    pub const ALL: [ThreadState; 5] =
+        [ThreadState::Ready, ThreadState::Running, ThreadState::Sleeping, ThreadState::Blocked, ThreadState::Dead];
+}
+
+impl TryFrom<u64> for ThreadState {
+    type Error = u64;
+
+    fn try_from(raw: u64) -> Result<Self, u64> {
+        ThreadState::ALL.into_iter().find(|&s| s as u64 == raw).ok_or(raw)
+    }
+}
+
+/// [`SWITCH`]: a CPU switched from thread `from` to thread `to`, `from`
+/// leaving in `state`; in that CPU's main ring. `args`: `[from, to, state,
+/// 0]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Switch {
+    pub from: u64,
+    pub to: u64,
+    /// The previous thread's state: ready when preempted or yielding, or
+    /// sleeping, blocked, dead.
+    pub state: ThreadState,
+}
+
+impl Switch {
+    pub const KIND: u16 = SWITCH;
+
+    pub fn args(&self) -> [u64; 4] {
+        [self.from, self.to, self.state as u64, 0]
+    }
+
+    pub fn decode(e: &Event) -> Option<Switch> {
+        if e.kind != Self::KIND {
+            return None;
+        }
+        Some(Switch { from: e.args[0], to: e.args[1], state: ThreadState::try_from(e.args[2]).ok()? })
+    }
+}
 
 /// What happened to a run queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,6 +242,34 @@ mod tests {
             [BOOT_PHASE, EXCEPTION, LOG, PANIC, SWITCH, RUN_QUEUE, IRQ, LOCK_WAIT, TEST],
             [1, 2, 3, 4, 5, 6, 7, 8, 0xff]
         );
+    }
+
+    #[test]
+    fn streams_and_routing_are_pinned() {
+        assert_eq!([Stream::Main as u32, Stream::Xray as u32], [0, 1]);
+        assert_eq!(Stream::try_from(0), Ok(Stream::Main));
+        assert_eq!(Stream::try_from(1), Ok(Stream::Xray));
+        assert_eq!(Stream::try_from(2), Err(2));
+        for k in [BOOT_PHASE, EXCEPTION, LOG, PANIC, SWITCH, TEST, 0, 9, 0x1234] {
+            assert_eq!(stream_of(k), Stream::Main, "kind {k}");
+        }
+        for k in [RUN_QUEUE, IRQ, LOCK_WAIT] {
+            assert_eq!(stream_of(k), Stream::Xray, "kind {k}");
+        }
+    }
+
+    #[test]
+    fn switch_layout_and_thread_states_are_pinned() {
+        assert_eq!(ThreadState::ALL.map(|s| s as u8), [0, 1, 2, 3, 4]);
+        let sw = Switch { from: 7, to: 9, state: ThreadState::Blocked };
+        assert_eq!(sw.args(), [7, 9, 3, 0]);
+        assert_eq!(Switch::decode(&event(SWITCH, sw.args())), Some(sw));
+        for s in ThreadState::ALL {
+            let sw = Switch { state: s, ..sw };
+            assert_eq!(Switch::decode(&event(SWITCH, sw.args())), Some(sw));
+        }
+        assert_eq!(Switch::decode(&event(SWITCH, [7, 9, 5, 0])), None, "no such state");
+        assert_eq!(Switch::decode(&event(RUN_QUEUE, sw.args())), None);
     }
 
     #[test]

@@ -71,22 +71,16 @@ impl<T> SpinLock<T> {
                     return SpinLockGuard { lock: self, _irq: irq };
                 }
                 Err(owner) if owner == me => relocked(core::ptr::from_ref(self).addr(), core::any::type_name::<T>()),
-                // Held elsewhere (or a spurious failure): wait until it looks free.
-                Err(owner) => {
-                    // A failure that saw another holder counts even if the
-                    // lock is free by the next look.
-                    if owner != FREE {
-                        if spins == 0 {
-                            since = arch::rdtsc();
-                        }
-                        spins += 1;
-                    }
-                    while self.owner.load(Ordering::Relaxed) != FREE {
+                // Held elsewhere (or a spurious failure, `FREE`): wait until
+                // it looks free. The failed exchange's own look counts.
+                Err(mut owner) => {
+                    while owner != FREE {
                         if spins == 0 {
                             since = arch::rdtsc();
                         }
                         spins += 1;
                         core::hint::spin_loop();
+                        owner = self.owner.load(Ordering::Relaxed);
                     }
                 }
             }

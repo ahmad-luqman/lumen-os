@@ -220,7 +220,7 @@ own PR that updates that doc first.
   PAT. `trace.rs`: trace rings (one per CPU), event kinds, `ktrace!`, the boot timeline
   (`Timeline`), and X-ray's rings (#198: one per CPU; typed recorders for run-queue
   changes, handled device interrupts and `SpinLock`s that waited; `read`: either ring
-  of an online CPU, events since a sequence number with the gap counted). `acpi.rs`: ACPI
+  of an online CPU, events since a sequence number with the gap counted; `cpus`). `acpi.rs`: ACPI
   discovery (CPUs, LAPIC, I/O APICs, HPET, the MCFG's ECAM regions, the S5
   power-off registers) and the firmware-table reader. `pci/mod.rs`: PCI
   functions found over ECAM at boot (`pci::devices`, which `lspci` lists,
@@ -370,8 +370,9 @@ own PR that updates that doc first.
   coalescing; host-tested, incl. a randomized stress test against a shadow map).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads;
   `read_since`: a polling reader's events since a sequence number, each
-  number copied or counted missed once), `kind` (every kind's number, and the
-  X-ray kinds' typed layouts: `RunQueue`, `Irq`, `LockWait`), and `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free).
+  number copied or counted missed once), `kind` (every kind's number, `Stream` and
+  `stream_of`: which ring each goes to, and typed layouts: `Switch`/`ThreadState`,
+  `RunQueue`, `Irq`, `LockWait`), and `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free).
 - `crates/lumen-time`: timekeeping arithmetic: calibration (windows'
   steadiness, the ones with the smallest bounds filling in, how far off a
   median can be for either rate, `tsc_error_ppm`, a window slow to read
