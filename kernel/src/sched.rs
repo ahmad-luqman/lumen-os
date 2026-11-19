@@ -59,7 +59,10 @@
 //!
 //! Every switch records a `switch` trace event (previous thread's id, next
 //! thread's id, the previous thread's state), and the crash report names the
-//! thread that was running (`thread: <name> (id N)`, read lock-free).
+//! thread that was running (`thread: <name> (id N)`, read lock-free). Every
+//! change to a run queue records a `runq` event in that CPU's X-ray ring
+//! (`trace::record_xray`), under the queue's lock ([`with_run_queue`]
+//! reads the queue's length under it too).
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -76,7 +79,7 @@ use lumen_mm::stacks::{StackKind, StackRange};
 use crate::arch::{self, MAX_CPUS};
 use crate::mm::stack::{KernelStack, STACK_SIZE, StackError};
 use crate::sync::SpinLock;
-use crate::trace::Kind;
+use crate::trace::{self, Kind};
 use crate::{smp, time};
 
 /// Timer ticks (1 ms each) a thread runs before the next ready thread on its
@@ -350,17 +353,27 @@ impl Cpu {
         self.current.as_ref().is_some_and(|c| self.is_idle_thread(c))
     }
 
-    /// Queue a ready thread, in the room reserved for it.
+    /// Queue a ready thread, in the room reserved for it. Every change to
+    /// the queue goes through here or [`pop_ready`](Self::pop_ready), each
+    /// recording a `runq` event in the CPU's X-ray ring under its lock.
     fn push_ready(&mut self, cpu: usize, t: Arc<Thread>) {
         assert!(self.ready.len() < self.ready.capacity(), "queueing thread {t:?}, which isn't homed on cpu {cpu}");
+        let id = t.id;
         self.ready.push_back(t);
-        READY[cpu].store(self.ready.len(), Ordering::Release);
+        self.queue_changed(cpu, id, trace::RUNQ_ENQUEUE);
     }
 
     fn pop_ready(&mut self, cpu: usize) -> Option<Arc<Thread>> {
-        let t = self.ready.pop_front();
-        READY[cpu].store(self.ready.len(), Ordering::Release);
-        t
+        let t = self.ready.pop_front()?;
+        self.queue_changed(cpu, t.id, trace::RUNQ_DEQUEUE);
+        Some(t)
+    }
+
+    /// Publish the queue's new length ([`READY`]) and trace the change.
+    fn queue_changed(&self, cpu: usize, id: u64, op: u64) {
+        let len = self.ready.len();
+        READY[cpu].store(len, Ordering::Release);
+        trace::record_xray(cpu, Kind::RunQueue, [cpu as u64, len as u64, id, op]);
     }
 
     /// Make every sleeper whose deadline is `now` or earlier ready. A
@@ -608,6 +621,16 @@ pub fn cpu_ticks(cpu: usize) -> CpuTicks {
 /// Set once [`init`] has stopped waiting for the schedulers to start: one
 /// that starts after that says so.
 static START_WAIT_OVER: AtomicBool = AtomicBool::new(false);
+
+/// `f`, given CPU `cpu`'s run-queue length, called with that queue locked,
+/// so nothing changes it meanwhile (`trace runq` reads the X-ray ring's
+/// newest `runq` event for it there, which a change records under the same
+/// lock). `f` runs with interrupts off and must not take a lock or
+/// allocate. `None` past the CPUs Lumen supports.
+pub fn with_run_queue<R>(cpu: usize, f: impl FnOnce(usize) -> R) -> Option<R> {
+    let q = CPUS.get(cpu)?.lock();
+    Some(f(q.ready.len()))
+}
 
 /// Whether CPU `cpu`'s scheduler runs (threads can be spawned there).
 pub fn running_on(cpu: usize) -> bool {

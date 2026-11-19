@@ -88,6 +88,21 @@ pub enum Missing {
     Overwritten,
 }
 
+/// What [`TraceRing::read_since`] did: events copied, numbers missed, and
+/// where to read from next. `next - since == copied + missed` (for a
+/// `since` not past the head).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Since {
+    /// Events copied into the buffer (its first `copied` entries).
+    pub copied: usize,
+    /// Sequence numbers from `since` on that weren't copied and won't be:
+    /// dropped, overwritten, or out of the ring already.
+    pub missed: u64,
+    /// The `since` of the next call: one past the last number copied or
+    /// missed.
+    pub next: u64,
+}
+
 const WORDS: usize = 6;
 
 /// One slot: a stamp and the event packed into words.
@@ -237,6 +252,53 @@ impl<const N: usize> TraceRing<N> {
         }
     }
 
+    /// Copy the events from sequence number `since` on, oldest first, into
+    /// `out`, as many as fit: what a reader polling the ring calls each time,
+    /// passing the last call's [`Since::next`]. Every sequence number from
+    /// `since` up to `next` is either copied or counted in
+    /// [`Since::missed`], once:
+    ///
+    /// - the ones the ring no longer holds (more than `N` behind its head)
+    ///   are missed, without being looked at;
+    /// - an event dropped or overwritten is missed (a writer that has
+    ///   claimed its number but not yet its slot reads as dropped, so a
+    ///   reader that close behind a writer may count a gap for an event that
+    ///   lands a moment later);
+    /// - an event still being written ends the copy there (`next` is its
+    ///   number), so the next call reads it once it is complete; unless the
+    ///   ring has moved a full lap past it (a writer stopped for good
+    ///   mid-write), which then counts it missed.
+    ///
+    /// A `since` past the head copies nothing and returns it as `next`.
+    pub fn read_since(&self, since: u64, out: &mut [Event]) -> Since {
+        let head = self.written();
+        let mut result = Since { copied: 0, missed: 0, next: since };
+        if since >= head {
+            return result;
+        }
+        // Numbers more than a lap behind the head are out of the ring.
+        let start = since.max(head.saturating_sub(N as u64));
+        result.missed = start - since;
+        result.next = start;
+        for seq in start..head {
+            if result.copied == out.len() {
+                break;
+            }
+            match self.try_read(seq) {
+                Ok(e) => {
+                    out[result.copied] = e;
+                    result.copied += 1;
+                }
+                // Lapped: its writer stopped mid-write and never came back.
+                Err(Missing::BeingWritten) if seq + N as u64 <= self.written() => result.missed += 1,
+                Err(Missing::BeingWritten | Missing::NotClaimed) => break,
+                Err(Missing::Overwritten | Missing::NotRecorded) => result.missed += 1,
+            }
+            result.next = seq + 1;
+        }
+        result
+    }
+
     /// Copy the newest events, oldest first, into `out`; returns how many
     /// were copied. Of the newest `min(out.len(), N)` sequence numbers, those
     /// dropped, overwritten or still being written are skipped (not replaced
@@ -356,6 +418,144 @@ mod tests {
         let mut none: [Event; 0] = [];
         assert_eq!(ring.snapshot(&mut none), 0);
         assert_eq!(TraceRing::<4>::new().snapshot(&mut out), 0, "empty ring");
+    }
+
+    /// `read_since`'s accounting: `next - since == copied + missed`.
+    fn accounts(since: u64, r: Since) -> bool {
+        r.next - since == r.copied as u64 + r.missed
+    }
+
+    #[test]
+    fn read_since_copies_in_batches_and_resumes_where_it_stopped() {
+        let ring = TraceRing::<8>::new();
+        let mut out = [Event::default(); 3];
+        assert_eq!(ring.read_since(0, &mut out), Since { copied: 0, missed: 0, next: 0 }, "empty");
+        for i in 0..5u64 {
+            let _ = ring.record(i, 0, 1, 0, args_for(i));
+        }
+        let r = ring.read_since(0, &mut out);
+        assert_eq!(r, Since { copied: 3, missed: 0, next: 3 });
+        assert_eq!(out.map(|e| e.seq), [0, 1, 2]);
+        let r = ring.read_since(r.next, &mut out);
+        assert_eq!(r, Since { copied: 2, missed: 0, next: 5 });
+        assert_eq!([out[0].seq, out[1].seq], [3, 4]);
+        assert!(out[..2].iter().all(|e| e.args == args_for(e.tsc)));
+        // Caught up: nothing more until something is recorded.
+        assert_eq!(ring.read_since(5, &mut out), Since { copied: 0, missed: 0, next: 5 });
+        let _ = ring.record(5, 0, 1, 0, [0; 4]);
+        assert_eq!(ring.read_since(5, &mut out), Since { copied: 1, missed: 0, next: 6 });
+        // A `since` past the head: nothing, and it stays where it was.
+        assert_eq!(ring.read_since(99, &mut out), Since { copied: 0, missed: 0, next: 99 });
+        // An empty buffer copies nothing and moves nowhere.
+        assert_eq!(ring.read_since(2, &mut []), Since { copied: 0, missed: 0, next: 2 });
+    }
+
+    #[test]
+    fn read_since_counts_what_the_ring_no_longer_holds() {
+        let ring = TraceRing::<4>::new();
+        for i in 0..10u64 {
+            let _ = ring.record(i, 0, 1, 0, [0; 4]);
+        }
+        let mut out = [Event::default(); 8];
+        // 0..6 are gone (the ring holds 6..10).
+        let r = ring.read_since(1, &mut out);
+        assert_eq!(r, Since { copied: 4, missed: 5, next: 10 });
+        assert_eq!(out[..4].iter().map(|e| e.seq).collect::<Vec<_>>(), [6, 7, 8, 9]);
+        assert!(accounts(1, r));
+    }
+
+    #[test]
+    fn read_since_counts_dropped_events_and_waits_for_one_being_written() {
+        let ring = TraceRing::<8>::new();
+        for i in 0..3u64 {
+            let _ = ring.record(i, 0, 1, 0, [0; 4]);
+        }
+        // Event 3 was dropped: claimed, but its slot never written.
+        ring.head.store(4, Ordering::Relaxed);
+        let _ = ring.record(4, 0, 1, 0, [0; 4]);
+        // Event 5's writer is mid-write; event 6 is complete after it.
+        ring.head.store(6, Ordering::Relaxed);
+        ring.slots[5].stamp.store(writing(5), Ordering::Relaxed);
+        let _ = ring.record(6, 0, 1, 0, [0; 4]);
+        let mut out = [Event::default(); 8];
+        let r = ring.read_since(0, &mut out);
+        assert_eq!(r, Since { copied: 4, missed: 1, next: 5 }, "stops at the event being written");
+        assert_eq!(out[..4].iter().map(|e| e.seq).collect::<Vec<_>>(), [0, 1, 2, 4]);
+        assert!(accounts(0, r));
+        // Still being written: nothing yet, still at 5.
+        assert_eq!(ring.read_since(5, &mut out), Since { copied: 0, missed: 0, next: 5 });
+        // Its writer finishes: 5 and 6 are read.
+        ring.slots[5].stamp.store(complete(5), Ordering::Relaxed);
+        let r = ring.read_since(5, &mut out);
+        assert_eq!(r, Since { copied: 2, missed: 0, next: 7 });
+        assert_eq!([out[0].seq, out[1].seq], [5, 6]);
+    }
+
+    #[test]
+    fn read_since_skips_a_writer_stopped_for_a_whole_lap() {
+        // Event 1's writer stopped mid-write; the ring went a lap past it
+        // (event 5 maps to its slot and was dropped).
+        let ring = TraceRing::<4>::new();
+        let _ = ring.record(0, 0, 1, 0, [0; 4]);
+        ring.slots[1].stamp.store(writing(1), Ordering::Relaxed);
+        ring.head.store(2, Ordering::Relaxed);
+        for i in 2..6u64 {
+            let _ = ring.record(i, 0, 1, 0, [0; 4]);
+        }
+        assert_eq!(ring.dropped(), 1, "event 5 found its slot busy");
+        let mut out = [Event::default(); 8];
+        // From 1: still in the ring's lap? head 6, 1 + 4 <= 6: lapped, missed.
+        let r = ring.read_since(1, &mut out);
+        assert_eq!(r, Since { copied: 3, missed: 2, next: 6 }, "1 lapped, 5 dropped");
+        assert_eq!(out[..3].iter().map(|e| e.seq).collect::<Vec<_>>(), [2, 3, 4]);
+        assert!(accounts(1, r));
+    }
+
+    /// A reader polling with `read_since` while a writer records: it sees
+    /// every event exactly once or counts it missed, in order, never torn,
+    /// and once the writer stops and the reader catches up, every number
+    /// is accounted for.
+    #[test]
+    fn a_polling_reader_accounts_for_every_event_once() {
+        const EVENTS: u64 = 300_000;
+        let ring = TraceRing::<64>::new();
+        let done = AtomicBool::new(false);
+        let start = Barrier::new(2);
+        let (seen, missed, next) = thread::scope(|s| {
+            let reader = s.spawn(|| {
+                let mut out = vec![Event::default(); 16];
+                let (mut since, mut seen, mut missed) = (0u64, 0u64, 0u64);
+                start.wait();
+                loop {
+                    let finished = done.load(Ordering::Acquire);
+                    let r = ring.read_since(since, &mut out);
+                    assert!(accounts(since, r), "{since} {r:?}");
+                    let mut want = since;
+                    for e in &out[..r.copied] {
+                        assert!(e.seq >= want, "out of order or read twice: {e:?} (from {want})");
+                        assert!(consistent(e) && e.tsc == e.seq, "torn or misfiled: {e:?}");
+                        want = e.seq + 1;
+                    }
+                    seen += r.copied as u64;
+                    missed += r.missed;
+                    since = r.next;
+                    if finished && since == ring.written() {
+                        break;
+                    }
+                }
+                (seen, missed, since)
+            });
+            start.wait();
+            let stop = StopOnDrop(&done);
+            for i in 0..EVENTS {
+                assert_eq!(record_derived(&ring, i, 1), Some(i));
+            }
+            drop(stop);
+            reader.join().unwrap()
+        });
+        assert_eq!(next, EVENTS);
+        assert_eq!(seen + missed, EVENTS, "every event copied or counted missed, once");
+        assert!(seen > 0);
     }
 
     #[test]

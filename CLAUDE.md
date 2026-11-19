@@ -169,7 +169,8 @@ own PR that updates that doc first.
   or a window; `closed`) and `Ctx` (keys through `poll_key`/`wait_key`, the screen
   through `canvas`), their commands (`commands.rs`: each row carries its
   help line; the system ones in `sysinfo.rs`), pipelines (`pipe.rs`: `cpus |
-  where busy > 50`) and deliberate faults (`crash.rs`). `fb.rs`:
+  where busy > 50`), deliberate faults (`crash.rs`) and `trace runq`/`trace xray`
+  (`xray.rs`: run queues by X-ray and the scheduler, `park` holding a CPU still). `fb.rs`:
   framebuffer pixels, the header (`draw_header`, again when the desktop is left) and the crash screen. `term.rs`: the
   terminals on the framebuffer (four virtual ones, one shown: log lines on the first, the screen shells, scrollback, `view_text`, and
   `Canvas`: the pixels below the header for one command, the terminals paused meanwhile;
@@ -216,7 +217,9 @@ own PR that updates that doc first.
   `mm/paging.rs`: the kernel's page tables (HHDM, W^X image, map/unmap,
   MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
   PAT. `trace.rs`: trace rings (one per CPU), event kinds, `ktrace!`, the boot timeline
-  (`Timeline`). `acpi.rs`: ACPI
+  (`Timeline`), and X-ray's rings (#198: one per CPU, `record_xray` for run-queue
+  changes, handled device interrupts and contended `SpinLock`s; `read_xray`, events
+  since a sequence number with the gap counted). `acpi.rs`: ACPI
   discovery (CPUs, LAPIC, I/O APICs, HPET, the MCFG's ECAM regions, the S5
   power-off registers) and the firmware-table reader. `pci/mod.rs`: PCI
   functions found over ECAM at boot (`pci::devices`, which `lspci` lists,
@@ -355,8 +358,9 @@ own PR that updates that doc first.
   lock-free stack registry.
 - `crates/lumen-heap`: heap allocator logic (address-ordered free list,
   coalescing; host-tested, incl. a randomized stress test against a shadow map).
-- `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads),
-  and `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free).
+- `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads;
+  `read_since`: a polling reader's events since a sequence number, each
+  number copied or counted missed once), and `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free).
 - `crates/lumen-time`: timekeeping arithmetic: calibration (windows'
   steadiness, the ones with the smallest bounds filling in, how far off a
   median can be for either rate, `tsc_error_ppm`, a window slow to read

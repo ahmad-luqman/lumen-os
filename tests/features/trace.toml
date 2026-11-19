@@ -16,3 +16,15 @@ tests = [
     "scenario:test_crash::test_panic_report_trace_ends_with_the_panic",
     "ktest:lumen_kernel::trace::describe_prints_unknown_values_raw",
 ]
+
+[[feature]]
+name = "X-ray's events in their own per-CPU trace rings: run-queue changes, device interrupts handled, contended locks; read since a sequence number with the gap counted; the main rings left alone"
+milestone = "M5"
+tests = [
+    "cargo:lumen-trace",
+    "ktest:lumen_kernel::trace::run_queue_changes_are_traced_in_order",
+    "ktest:lumen_kernel::trace::a_contended_lock_is_traced",
+    "ktest:lumen_kernel::trace::xray_events_leave_the_main_ring_alone",
+    "scenario:test_xray::test_run_queue_matches_trace",
+    "scenario:test_xray::test_device_interrupts_are_traced",
+]

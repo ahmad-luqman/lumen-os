@@ -525,11 +525,21 @@ fn unexpected(frame: &TrapFrame) {
     }
 }
 
+/// Run a device interrupt's handler, recorded first as an `irq` event in
+/// this CPU's X-ray ring (lock-free, so a handler interrupted by an NMI
+/// that records too loses nothing but maybe that event).
+fn handled(frame: &TrapFrame, handler: fn()) {
+    let cpu = super::percpu::index();
+    crate::trace::record_xray(cpu, crate::trace::Kind::Irq, [frame.vector, frame.rip, 0, 0]);
+    handler();
+}
+
 /// Called by `lumen_isr_common` for every vector; counts it first
 /// ([`vector_count`]). CPU exceptions are traced
 /// and fatal (bar #BP). Device interrupts are never fatal: the timer and
 /// spurious interrupts are counted, not traced (at 1 kHz they would flood
-/// the trace ring); the timer blinks the terminal's cursor on the boot CPU
+/// the trace ring; nor in the X-ray ring, which has the handled device
+/// interrupts: [`handled`]); the timer blinks the terminal's cursor on the boot CPU
 /// (`term::on_tick`, which never waits for a lock), then drives the
 /// scheduler (`sched::tick`, which may switch to another thread and return
 /// here only when this one runs again); a local APIC error is counted and
@@ -599,14 +609,14 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
         }
         v @ IOAPIC_BASE..=IOAPIC_LAST => {
             match irq_handler(v) {
-                Some(handler) => handler(),
+                Some(handler) => handled(frame, handler),
                 None => unexpected(frame),
             }
             super::apic::eoi();
         }
         v @ MSI_BASE..=MSI_LAST => {
             match msi_handler(v) {
-                Some(handler) => handler(),
+                Some(handler) => handled(frame, handler),
                 None => unexpected(frame),
             }
             super::apic::eoi();
