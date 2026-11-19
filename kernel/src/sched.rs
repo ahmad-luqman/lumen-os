@@ -61,8 +61,8 @@
 //! thread's id, the previous thread's state), and the crash report names the
 //! thread that was running (`thread: <name> (id N)`, read lock-free). Every
 //! change to a run queue records a `runq` event in that CPU's X-ray ring
-//! (`trace::record_xray`), under the queue's lock ([`with_run_queue`]
-//! reads the queue's length under it too).
+//! (`trace::record_run_queue`), under the queue's lock ([`run_queue`]
+//! reads the queue's length and the ring's newest such event under it).
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -81,6 +81,7 @@ use crate::mm::stack::{KernelStack, STACK_SIZE, StackError};
 use crate::sync::SpinLock;
 use crate::trace::{self, Kind};
 use crate::{smp, time};
+use lumen_trace::kind::{RunQueue, RunQueueOp};
 
 /// Timer ticks (1 ms each) a thread runs before the next ready thread on its
 /// CPU gets a turn.
@@ -360,20 +361,21 @@ impl Cpu {
         assert!(self.ready.len() < self.ready.capacity(), "queueing thread {t:?}, which isn't homed on cpu {cpu}");
         let id = t.id;
         self.ready.push_back(t);
-        self.queue_changed(cpu, id, trace::RUNQ_ENQUEUE);
+        self.queue_changed(cpu, id, RunQueueOp::Enqueue);
     }
 
     fn pop_ready(&mut self, cpu: usize) -> Option<Arc<Thread>> {
         let t = self.ready.pop_front()?;
-        self.queue_changed(cpu, t.id, trace::RUNQ_DEQUEUE);
+        self.queue_changed(cpu, t.id, RunQueueOp::Dequeue);
         Some(t)
     }
 
     /// Publish the queue's new length ([`READY`]) and trace the change.
-    fn queue_changed(&self, cpu: usize, id: u64, op: u64) {
+    fn queue_changed(&self, cpu: usize, thread: u64, op: RunQueueOp) {
         let len = self.ready.len();
         READY[cpu].store(len, Ordering::Release);
-        trace::record_xray(cpu, Kind::RunQueue, [cpu as u64, len as u64, id, op]);
+        const _: () = assert!(MAX_CPUS <= u16::MAX as usize);
+        trace::record_run_queue(RunQueue { cpu: cpu as u16, len: len as u64, thread, op });
     }
 
     /// Make every sleeper whose deadline is `now` or earlier ready. A
@@ -622,14 +624,25 @@ pub fn cpu_ticks(cpu: usize) -> CpuTicks {
 /// that starts after that says so.
 static START_WAIT_OVER: AtomicBool = AtomicBool::new(false);
 
-/// `f`, given CPU `cpu`'s run-queue length, called with that queue locked,
-/// so nothing changes it meanwhile (`trace runq` reads the X-ray ring's
-/// newest `runq` event for it there, which a change records under the same
-/// lock). `f` runs with interrupts off and must not take a lock or
-/// allocate. `None` past the CPUs Lumen supports.
-pub fn with_run_queue<R>(cpu: usize, f: impl FnOnce(usize) -> R) -> Option<R> {
+/// A CPU's run queue as the scheduler and its X-ray ring see it, read
+/// together under the queue's lock ([`run_queue`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueView {
+    /// Threads on the queue.
+    pub len: usize,
+    /// The length the ring's newest `runq` event for this queue says, and
+    /// that event's sequence number; `None` if the ring holds none.
+    pub traced: Option<(u64, u64)>,
+}
+
+/// CPU `cpu`'s [`QueueView`], read under its queue's lock, so nothing
+/// changes the queue between the two readings (a change records its event
+/// under the same lock). `None` past the CPUs Lumen supports. The ring's
+/// scan takes no lock and allocates nothing.
+pub fn run_queue(cpu: usize) -> Option<QueueView> {
     let q = CPUS.get(cpu)?.lock();
-    Some(f(q.ready.len()))
+    let traced = trace::newest_run_queue(cpu).map(|(rq, seq)| (rq.len, seq));
+    Some(QueueView { len: q.ready.len(), traced })
 }
 
 /// Whether CPU `cpu`'s scheduler runs (threads can be spawned there).
@@ -992,16 +1005,26 @@ fn schedule(cpu: usize) {
         assert!(q.switched_from.is_none(), "the last switch on cpu {cpu} wasn't finished");
         let prev = q.current.take().expect("a running scheduler has a current thread");
         assert_eq!(prev.cpu, cpu, "thread {prev:?} isn't cpu {cpu}'s");
-        if q.is_idle_thread(&prev) {
+        let idle = q.is_idle_thread(&prev);
+        // Only this CPU moves its running thread out of Running; one still
+        // running (not the idle thread, never queued) goes back on the queue.
+        let requeue = !idle && prev.state() == State::Running;
+        if idle || requeue {
             prev.change(State::Running, State::Ready);
-        } else if prev.state() == State::Running {
-            // Only this CPU moves its running thread out of Running.
-            prev.change(State::Running, State::Ready);
-            q.push_ready(cpu, prev.clone());
         }
-        let next = match q.pop_ready(cpu) {
-            Some(t) => t,
-            None => q.idle.clone().expect("a running scheduler has an idle thread"),
+        let next = if requeue && q.ready.is_empty() {
+            // It would be queued and taken straight off again: it just
+            // keeps running, recording no run-queue change (a thread
+            // polling by yielding would fill the X-ray ring otherwise).
+            prev.clone()
+        } else {
+            if requeue {
+                q.push_ready(cpu, prev.clone());
+            }
+            match q.pop_ready(cpu) {
+                Some(t) => t,
+                None => q.idle.clone().expect("a running scheduler has an idle thread"),
+            }
         };
         q.slice_left = SLICE_TICKS;
         assert_eq!(next.cpu, cpu, "thread {next:?} isn't cpu {cpu}'s");

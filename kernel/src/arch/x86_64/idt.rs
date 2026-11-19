@@ -526,11 +526,11 @@ fn unexpected(frame: &TrapFrame) {
 }
 
 /// Run a device interrupt's handler, recorded first as an `irq` event in
-/// this CPU's X-ray ring (lock-free, so a handler interrupted by an NMI
-/// that records too loses nothing but maybe that event).
+/// this CPU's X-ray ring (lock-free; an NMI arriving mid-record never
+/// returns into it: the crash path stops the CPU).
 fn handled(frame: &TrapFrame, handler: fn()) {
-    let cpu = super::percpu::index();
-    crate::trace::record_xray(cpu, crate::trace::Kind::Irq, [frame.vector, frame.rip, 0, 0]);
+    // Every vector here (I/O APIC or MSI) is below 256.
+    crate::trace::record_irq(lumen_trace::kind::Irq { vector: frame.vector as u8, rip: frame.rip });
     handler();
 }
 

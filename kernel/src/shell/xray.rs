@@ -1,46 +1,38 @@
 //! `trace runq` and `trace xray`: X-ray's rings (#198) from the shell.
 //!
 //! - `trace xray <cpu> [since]`: CPU `cpu`'s X-ray events from sequence
-//!   number `since` on (the newest 16 without it), read the way the
-//!   `Trace` capability reads them (`trace::read_xray`): each number shown
-//!   or counted missed, and where the next read would start.
+//!   number `since` on (the newest 16 without it), read as the `Trace`
+//!   capability reads them (`trace::read`): each number shown or counted
+//!   missed, and where the next read would start.
 //! - `trace runq`: each CPU's run-queue length as its X-ray ring's newest
-//!   `runq` event says it and as the scheduler does, both read under that
-//!   queue's lock (`sched::with_run_queue`).
-//! - `trace runq park <cpu> <n>`: the same for one CPU while it holds still:
-//!   a thread there turns its interrupts off (no tick, so nothing there
-//!   runs or takes a thread off its queue), then `n` threads are spawned
-//!   there, which wait on its queue; then the queue as both see it, the
-//!   threads `threads` lists as ready there, and the queue's changes traced
-//!   since the hold began; then the hold ends and the threads run and
-//!   finish. A count of what is queued that doesn't move under it, for
-//!   `test_xray`.
+//!   `runq` event says it and as the scheduler does, read together under
+//!   that queue's lock (`sched::run_queue`).
+//! - `trace runq park <n>`: the same for this CPU while it holds still:
+//!   with its interrupts off (no tick, so nothing here switches or takes a
+//!   thread off its queue), `n` threads are spawned here and wait on its
+//!   queue; the queue before and after, the threads `threads` lists as
+//!   ready here, and the queue's changes traced meanwhile are read, then
+//!   interrupts come back on and the threads run and finish. A count of
+//!   what is queued that nothing moves under it, for `test_xray`.
 
 use alloc::string::String;
-use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use lumen_trace::Event;
+use lumen_trace::kind::{RunQueue, RunQueueOp};
 
 use super::Ctx;
-use crate::trace::{self, Kind};
-use crate::{arch, sched, time};
+use crate::trace::{self, Stream};
+use crate::{arch, sched};
 
 /// The most threads `trace runq park` queues.
 const MAX_PARKED: usize = 16;
-/// How long the hold lasts at most, and how long the shell waits for it to
-/// begin: a safety net (a step that never comes), never reached in a run
-/// that works however slow the host.
-const HOLD_LIMIT_NS: u64 = 10_000_000_000;
-/// Events copied from a ring at a time.
-const BATCH: usize = 256;
 
-/// `trace runq [park <cpu> <n>]`.
+/// `trace runq [park <n>]`.
 pub fn runq(ctx: &mut Ctx<'_>, args: &[String]) {
-    const USAGE: &str = "usage: trace runq [park <cpu> <n>]";
+    const USAGE: &str = "usage: trace runq [park <n>]";
     match args {
         [] => {
             let mut t = String::from("runq: each run queue's length, by its X-ray ring and by the scheduler\n");
@@ -49,8 +41,8 @@ pub fn runq(ctx: &mut Ctx<'_>, args: &[String]) {
             }
             let _ = ctx.out.write_str(&t);
         }
-        [park, cpu, n] if park == "park" => match (cpu.parse(), n.parse()) {
-            (Ok(cpu), Ok(n)) if (1..=MAX_PARKED).contains(&n) => match self::park(cpu, n) {
+        [park, n] if park == "park" => match n.parse() {
+            Ok(n) if (1..=MAX_PARKED).contains(&n) => match self::park(n) {
                 Ok(t) => {
                     let _ = ctx.out.write_str(&t);
                 }
@@ -66,10 +58,9 @@ pub fn runq(ctx: &mut Ctx<'_>, args: &[String]) {
 /// its X-ray ring's newest `runq` event says (`-` if it holds none) and as
 /// the scheduler does, read together under the queue's lock.
 fn queue_line(t: &mut String, label: &str, cpu: usize) {
-    let Some((len, traced)) = sched::with_run_queue(cpu, |len| (len, trace::xray_run_queue_len(cpu))) else {
-        return;
-    };
-    match traced {
+    let Some(view) = sched::run_queue(cpu) else { return };
+    let len = view.len;
+    match view.traced {
         Some((traced, seq)) => {
             let _ = writeln!(t, "  {label}cpu {cpu}: trace {traced}, scheduler {len} (event #{seq})");
         }
@@ -79,100 +70,59 @@ fn queue_line(t: &mut String, label: &str, cpu: usize) {
     }
 }
 
-/// What `trace runq park` holds and signals.
-#[derive(Default)]
-struct Hold {
-    /// The holder has turned its CPU's interrupts off.
-    held: AtomicBool,
-    /// The shell is done: let go.
-    release: AtomicBool,
-    /// The holder let go at [`HOLD_LIMIT_NS`] without being told to.
-    timed_out: AtomicBool,
-}
-
-/// `trace runq park <cpu> <n>`'s report, or why it couldn't hold `cpu`.
-fn park(cpu: usize, n: usize) -> Result<String, String> {
-    if cpu == arch::cpu_index() {
-        return Err(alloc::format!("cpu {cpu} runs this shell; hold another"));
-    }
-    if !sched::running_on(cpu) {
-        return Err(alloc::format!("no scheduler runs on cpu {cpu}"));
-    }
-    let hold = Arc::new(Hold::default());
-    let h = hold.clone();
-    let holder = sched::spawn_on(cpu, "runq-hold", move || {
-        // Interrupts off, outside every critical section: no tick, so this
-        // CPU neither switches nor takes anything off its queue until the
-        // shell lets go (or the limit passes).
-        let were_on = arch::irq::disable();
-        h.held.store(true, Ordering::Release);
-        let limit = time::now_ns().saturating_add(HOLD_LIMIT_NS);
-        while !h.release.load(Ordering::Acquire) {
-            if time::now_ns() >= limit {
-                h.timed_out.store(true, Ordering::Release);
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        arch::irq::restore(were_on);
-    })
-    .map_err(|e| alloc::format!("no holder for cpu {cpu}: {e}"))?;
-    let wait_until = time::now_ns().saturating_add(HOLD_LIMIT_NS);
-    while !hold.held.load(Ordering::Acquire) && time::now_ns() < wait_until {
-        time::sleep(1_000_000);
-    }
-    if !hold.held.load(Ordering::Acquire) {
-        hold.release.store(true, Ordering::Release);
-        holder.join();
-        return Err(alloc::format!("cpu {cpu} never ran its holder"));
-    }
-    let ring = trace::xray_ring(cpu).ok_or("no X-ray ring for that cpu")?;
-    let since = ring.written();
-    let mut before = String::new();
-    queue_line(&mut before, "before: ", cpu);
+/// `trace runq park <n>`'s report, or why it couldn't park.
+fn park(n: usize) -> Result<String, String> {
+    let cpu = arch::cpu_index();
+    let ring = trace::xray_ring(cpu).ok_or("no X-ray ring for this cpu")?;
+    let mut t = String::new();
     let mut parked = Vec::with_capacity(n);
     let mut refused = None;
-    for _ in 0..n {
-        match sched::spawn_on(cpu, "runq-park", || {}) {
-            Ok(h) => parked.push(h),
-            Err(e) => {
-                refused = Some(e);
-                break;
+    {
+        // Interrupts off, outside every critical section (a shell command
+        // runs in none): no tick, so this CPU neither switches nor takes
+        // anything off its queue until they are back on. Spawning (a stack,
+        // the registry) and `threads` take locks and allocate, which works
+        // with interrupts off; nothing here waits for an interrupt.
+        let were_on = arch::irq::disable();
+        let since = ring.written();
+        queue_line(&mut t, "before: ", cpu);
+        for _ in 0..n {
+            match sched::spawn_on(cpu, "runq-park", || {}) {
+                Ok(h) => parked.push(h),
+                Err(e) => {
+                    refused = Some(e);
+                    break;
+                }
             }
         }
+        queue_line(&mut t, "after: ", cpu);
+        let mut ready: Vec<u64> = sched::threads()
+            .into_iter()
+            .filter(|th| th.cpu == cpu && th.state == sched::State::Ready && th.name != "idle")
+            .map(|th| th.id)
+            .collect();
+        ready.sort_unstable();
+        write_ids(&mut t, &alloc::format!("  ready on cpu {cpu} (threads):"), &ready);
+        let (enqueued, dequeued, missed) = changes_since(cpu, since);
+        write_ids(&mut t, "  traced meanwhile: enqueued", &enqueued);
+        write_ids(&mut t, "  traced meanwhile: dequeued", &dequeued);
+        let _ = writeln!(t, "  traced meanwhile: missed {missed}");
+        arch::irq::restore(were_on);
     }
-    let ids: Vec<u64> = parked.iter().map(|h| h.thread().id()).collect();
-    let mut t = String::new();
-    let _ = write!(t, "runq park: cpu {cpu} held, {} threads parked:", ids.len());
-    for id in &ids {
-        let _ = write!(t, " {id}");
+    let mut head = alloc::format!("runq park: cpu {cpu} held, {} threads parked:", parked.len());
+    for h in &parked {
+        let _ = write!(head, " {}", h.thread().id());
     }
-    t.push('\n');
-    t.push_str(&before);
-    queue_line(&mut t, "after: ", cpu);
-    let mut ready: Vec<u64> = sched::threads()
-        .into_iter()
-        .filter(|th| th.cpu == cpu && th.state == sched::State::Ready && th.name != "idle")
-        .map(|th| th.id)
-        .collect();
-    ready.sort_unstable();
-    write_ids(&mut t, &alloc::format!("  ready on cpu {cpu} (threads):"), &ready);
-    let (enqueued, dequeued, missed) = changes_since(cpu, since);
-    write_ids(&mut t, "  traced since the hold: enqueued", &enqueued);
-    write_ids(&mut t, "  traced since the hold: dequeued", &dequeued);
-    let _ = writeln!(t, "  traced since the hold: missed {missed}");
-    let timed_out = hold.timed_out.load(Ordering::Acquire);
-    hold.release.store(true, Ordering::Release);
+    head.push('\n');
     for h in parked {
         h.join();
     }
-    holder.join();
     if let Some(e) = refused {
         let _ = writeln!(t, "runq park: spawning stopped early: {e}");
     }
-    let how = if timed_out { "the hold ran out before the queue was read" } else { "held throughout" };
-    let _ = writeln!(t, "runq park: released ({how})");
-    Ok(t)
+    let _ = writeln!(t, "runq park: released");
+    head.push_str(&t);
+    Ok(head)
 }
 
 /// `<label> 1 2 3`, or `<label> none`, as a line.
@@ -188,65 +138,60 @@ fn write_ids(t: &mut String, label: &str, ids: &[u64]) {
 }
 
 /// The threads CPU `cpu`'s X-ray ring has queued and dequeued on its run
-/// queue from sequence number `since` on, and the numbers it missed.
+/// queue from sequence number `since` on, and the numbers it missed: one
+/// read of the whole ring.
 fn changes_since(cpu: usize, since: u64) -> (Vec<u64>, Vec<u64>, u64) {
-    let (mut enqueued, mut dequeued, mut missed) = (Vec::new(), Vec::new(), 0);
-    let mut out = vec![Event::default(); BATCH];
-    let mut next = since;
-    while let Some(r) = trace::read_xray(cpu, next, &mut out) {
-        missed += r.missed;
-        for e in out[..r.copied].iter().filter(|e| e.kind == Kind::RunQueue as u16 && e.args[0] == cpu as u64) {
-            match e.args[3] {
-                trace::RUNQ_ENQUEUE => enqueued.push(e.args[2]),
-                trace::RUNQ_DEQUEUE => dequeued.push(e.args[2]),
-                _ => {}
-            }
+    let mut out = vec![Event::default(); trace::XRAY_EVENTS];
+    let Ok(r) = trace::read(Stream::Xray, cpu, since, &mut out) else {
+        return (Vec::new(), Vec::new(), 0);
+    };
+    let (mut enqueued, mut dequeued) = (Vec::new(), Vec::new());
+    for rq in out[..r.copied].iter().filter_map(RunQueue::decode).filter(|rq| usize::from(rq.cpu) == cpu) {
+        match rq.op {
+            RunQueueOp::Enqueue => enqueued.push(rq.thread),
+            RunQueueOp::Dequeue => dequeued.push(rq.thread),
         }
-        if r.next == next {
-            break; // caught up (or at an event still being written)
-        }
-        next = r.next;
     }
-    (enqueued, dequeued, missed)
+    (enqueued, dequeued, r.missed)
 }
 
-/// `trace xray <cpu> [since]`.
+/// `trace xray <cpu> [since]`: one read of the ring from `since` (the
+/// newest 16 without it), up to its head or an event not yet written.
 pub fn events(ctx: &mut Ctx<'_>, args: &[String]) {
     const USAGE: &str = "usage: trace xray <cpu> [since]";
-    let (cpu, since) = match args {
-        [cpu] => (cpu.parse::<usize>().ok(), None),
-        [cpu, since] => match since.parse::<u64>() {
-            Ok(s) => (cpu.parse::<usize>().ok(), Some(s)),
-            Err(_) => (None, None),
-        },
-        _ => (None, None),
+    let parsed = match args {
+        [cpu] => cpu.parse::<usize>().ok().map(|c| (c, None)),
+        [cpu, since] => cpu.parse::<usize>().ok().zip(since.parse::<u64>().ok().map(Some)),
+        _ => None,
     };
-    let Some((cpu, ring)) = cpu.and_then(|c| Some((c, trace::xray_ring(c)?))) else {
+    let Some((cpu, since)) = parsed else {
         return ctx.fail(USAGE);
     };
+    let Some(ring) = trace::xray_ring(cpu) else {
+        return ctx.fail(format_args!("trace xray: cpu {cpu}: {}", trace::ReadError::NoSuchCpu));
+    };
     let first = since.unwrap_or_else(|| ring.written().saturating_sub(16));
+    let mut out = vec![Event::default(); trace::XRAY_EVENTS];
+    let r = match trace::read(Stream::Xray, cpu, first, &mut out) {
+        Ok(r) => r,
+        Err(e) => return ctx.fail(format_args!("trace xray: cpu {cpu}: {e}")),
+    };
     let mut t = String::new();
-    let mut out = vec![Event::default(); BATCH];
-    let (mut next, mut copied, mut missed) = (first, 0u64, 0u64);
-    // At most a ring's worth: events recorded while this reads don't
-    // keep it going.
-    while copied + missed < trace::XRAY_EVENTS as u64 {
-        let Some(r) = trace::read_xray(cpu, next, &mut out) else { break };
-        for e in &out[..r.copied] {
-            let _ = writeln!(t, "{}", trace::Describe(e));
-        }
-        copied += r.copied as u64;
-        missed += r.missed;
-        if r.next == next {
-            break;
-        }
-        next = r.next;
+    for e in &out[..r.copied] {
+        let _ = writeln!(t, "{}", trace::Describe(e));
     }
-    let _ = writeln!(
+    let claimed = ring.written();
+    let _ = write!(
         t,
-        "xray: cpu {cpu}, {copied} copied, {missed} missed, next {next} (claimed {}, dropped {})",
-        ring.written(),
+        "xray: cpu {cpu}, {} copied, {} missed, next {} (claimed {claimed}, dropped {})",
+        r.copied,
+        r.missed,
+        r.next,
         ring.dropped()
     );
+    if r.next < claimed {
+        let _ = write!(t, "; more from #{} on", r.next);
+    }
+    t.push('\n');
     let _ = ctx.out.write_str(&t);
 }

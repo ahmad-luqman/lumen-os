@@ -59,24 +59,32 @@ impl<T> SpinLock<T> {
         // thread between `owner_id()` and the compare-and-swap.
         let irq = arch::irq::push_off();
         let me = owner_id();
-        // Looks at a lock held elsewhere, and the TSC when it first did.
+        // Looks that found the lock held elsewhere, and the TSC at the first.
         let mut spins = 0u64;
         let mut since = 0;
         loop {
             match self.owner.compare_exchange_weak(FREE, me, Ordering::Acquire, Ordering::Relaxed) {
                 Ok(_) => {
                     if spins > 0 {
-                        self.contended(spins, since);
+                        self.waited(spins, since);
                     }
                     return SpinLockGuard { lock: self, _irq: irq };
                 }
                 Err(owner) if owner == me => relocked(core::ptr::from_ref(self).addr(), core::any::type_name::<T>()),
                 // Held elsewhere (or a spurious failure): wait until it looks free.
-                Err(_) => {
-                    if since == 0 {
-                        since = arch::rdtsc();
+                Err(owner) => {
+                    // A failure that saw another holder counts even if the
+                    // lock is free by the next look.
+                    if owner != FREE {
+                        if spins == 0 {
+                            since = arch::rdtsc();
+                        }
+                        spins += 1;
                     }
                     while self.owner.load(Ordering::Relaxed) != FREE {
+                        if spins == 0 {
+                            since = arch::rdtsc();
+                        }
                         spins += 1;
                         core::hint::spin_loop();
                     }
@@ -85,20 +93,22 @@ impl<T> SpinLock<T> {
         }
     }
 
-    /// Record that `lock` waited (`spins` looks at the lock held, from TSC
-    /// `since`) in this CPU's X-ray ring, as a `lock` event naming the
-    /// lock's address and the caller's line. Out of line, so the
-    /// uncontended `lock` stays small. Called holding the lock, with
-    /// interrupts off: it takes no lock (recording is lock-free), allocates
-    /// nothing and logs nothing, so it can't come back here.
+    /// Record that this lock waited (`spins` looks found it held, from TSC
+    /// `since`) in this CPU's X-ray ring: its address and the caller's line
+    /// (`#[track_caller]` through `lock`; the file isn't recorded). Out of
+    /// line, so the uncontended `lock` stays small. Called holding the lock,
+    /// with interrupts off: it takes no lock (recording is lock-free),
+    /// allocates nothing and logs nothing, so it can't come back here.
     #[cold]
     #[inline(never)]
     #[track_caller]
-    fn contended(&self, spins: u64, since: u64) {
-        let addr = core::ptr::from_ref(self).addr() as u64;
-        let waited = arch::rdtsc().saturating_sub(since);
-        let line = u64::from(core::panic::Location::caller().line());
-        crate::trace::record_xray(arch::cpu_index(), crate::trace::Kind::LockContended, [addr, spins, waited, line]);
+    fn waited(&self, spins: u64, since: u64) {
+        crate::trace::record_lock_wait(lumen_trace::kind::LockWait {
+            lock: core::ptr::from_ref(self).addr() as u64,
+            spins,
+            waited: arch::rdtsc().saturating_sub(since),
+            line: core::panic::Location::caller().line(),
+        });
     }
 
     /// Take the lock if it is free; `None` if any CPU holds it (this one
