@@ -2833,7 +2833,8 @@ process's handle table), like file descriptors but for everything.
 | `Memory` | a memory object | map, write |
 | `Process` / `Thread` | a child | kill, inspect, debug |
 | `Snapshot` | a filesystem snapshot | browse, restore |
-| `Trace` | the trace ring buffer (X-ray) | read |
+| `Trace` | the trace rings (X-ray) | read (none in M5: the handle is the read) |
+| `Log`, `Time`, `Desktop`, `Window` | M5's app kinds ("Apps", below) | none in M5 |
 | `Device` | device resources (for drivers in user space; section 7's `DeviceResources`) | mmio, irq, dma (DMA confined to the device's buffers only with an IOMMU) |
 
 Rules: rights can only be **narrowed** when deriving (`cap_derive`), a
@@ -2872,428 +2873,507 @@ agent process is appended to the audit log (section 13).
 | 70 | `clock_now()` / 71 `sleep(ns)` | |
 | 99 | `debug_log(*str, len)` | to the kernel logger, tagged with the pid |
 
-Numbers are reserved in ranges per subsystem so parallel work does not
+M9's calls and error codes follow the M5 host interface ("Apps",
+below); until then rows 60, 70, 71 and 99 are placeholders. A call with
+more than six arguments passes a pointer to a structure, as M5's
+`text_draw` does. Numbers are reserved in ranges per subsystem so parallel work does not
 collide. A user runtime crate (`lumen-rt`) wraps these. A minimal libc is
 optional and comes later, only if ports need it.
 
 ### Apps: WASM modules in the kernel (M5: designed in #195, built by #196 to #208)
 
-This subsection is the app interface every M5 issue codes against: what a
-module may import, how it holds capabilities, what limits it runs under
-and how it ends. It lives in section 8, not a section of its own, because
-it is this section's capability model enforced at the WASM host
-interface instead of the syscall boundary; M9 keeps the handles and
-error codes and moves the calls behind `syscall`.
-
-The pieces:
-
-| Piece | Where | Issue |
-|---|---|---|
-| The pinned target and the apps' workspace | `rust-toolchain.toml`, `apps/` | #196 |
-| `wasmi` in the kernel | `kernel/Cargo.toml` | #197 |
-| The interface's types: handle kinds, error codes, the manifest, limits, the wire formats | `crates/lumen-app-api` (`no_std` + `alloc`, host and wasm32) | #199 (tree and request types: #207) |
-| The runtime: loading, handles, host functions, fuel slices, kill, ends | `kernel/src/app.rs` (and `app/` if it grows) | #199 (windows and text: #206) |
-| The guest SDK: allocator, panic handler, safe wrappers, the entry point | `apps/lumen-app` | #206 |
-| `lumen-ui` inside apps, the trees' id mapping | `apps/lumen-app`, `kernel/src/app.rs`, `crates/lumen-ui` | #207 |
-| The trace reader behind `Trace` | `kernel/src/trace.rs` | #198 |
+The app interface every M5 issue codes against: what a module may
+import, how it holds capabilities, what limits it runs under and how it
+ends. The types (handle kinds, error codes, the manifest, the limits,
+the wire formats and fixed layouts) are `crates/lumen-app-api` (`no_std`
++ `alloc`, built for the host and wasm32); the runtime is
+`kernel/src/app.rs`; the guest SDK is `apps/lumen-app` (#206). Every
+number named in capitals below is in the limits table, and only there.
 
 #### What an app is
 
-- **A module:** a `cdylib` built by the pinned rustc for
-  `wasm32-unknown-unknown`, `no_std` with `alloc` (the SDK's allocator),
-  `panic = "abort"`. It runs on the default wasm features rustc 1.99
-  enables for that target (#196 lists them; wasmi 2.0.1 accepts them,
-  probed 2026-11-19). Float functions such as `f32::sqrt` aren't in
-  `core`: the SDK re-exports `libm`.
-- **Its exports:** `memory` (its one linear memory) and `lumen_main() ->
-  i32`, called once; its return value is the app's exit code (0 is
-  success). Nothing else is called from the host: events, requests and
-  wake-ups are what `lumen_main`'s own loop asks for.
+- **A module:** a `no_std` + `alloc` `cdylib` built by the pinned rustc
+  for `wasm32-unknown-unknown` with that target's default wasm features
+  (#196's harness test lists them; wasmi accepts them, #197). Float
+  functions such as `f32::sqrt` aren't in `core`: the SDK re-exports
+  `libm`.
+- **Its exports:** `memory` and `lumen_main() -> i32`, called once; its
+  result is the app's exit code (0 is success). Nothing else is called
+  from the host: events, requests and wake-ups are what `lumen_main`'s
+  own loop asks for.
 - **Its imports:** functions of the `lumen` module only, from the table
-  below. A module importing anything else (another module, an unknown
-  name, a known name with another signature, a memory, a table or a
-  global) is refused when it loads, naming the import.
-- **One kernel thread per app**, named `app:<name>` (so `threads`,
-  `top` and `perf top --threads`, #205, show it by name; the thread
-  name's string is the bundled app's, which lives as long as the
-  kernel), on an ordinary guarded kernel stack from `sched::spawn`.
-  wasmi keeps its value and call stacks on the heap; #197 checks that its
-  dispatch (tail calls in release without `auto-dispatch`) fits the
-  kernel stack while running a long loop.
+  below, with the signatures given. Anything else (another module, an
+  unknown name, a known name with another signature, an imported
+  memory, table or global) is refused at load, naming the import.
+- **One kernel thread per app**, named `app:<name>` (`kernel/build.rs`
+  generates each name as `concat!("app:", name)`, since `sched::spawn`
+  takes a `&'static str`), so `threads`, `top` and `perf top --threads`
+  (#205) show it by name. `run` places apps round robin over the started
+  CPUs in app-id order (`sched::spawn_on`), on an ordinary guarded
+  kernel stack. wasmi keeps its value and call stacks on the heap, and
+  `portable-dispatch` (#197) keeps one native frame however long a
+  module runs.
 - **App ids** count from 1 and are never reused in a boot. An app is
-  `running` (in a fuel slice), `waiting` (blocked in a host call: a
-  window wait or a sleep) or `ending` (killed or closed, not yet at its
-  next safe point); an ended app is gone from `apps`.
+  `running` (in a slice), `waiting` (in a blocking host call) or
+  `ending` (its end reason recorded, not yet joined).
+
+#### The wasmi configuration
+
+`wasmi = "=2.0.1"`, `default-features = false`, features `validate` and
+`portable-dispatch`. Each app has its own `Engine`, dropped when it ends
+(a shared engine would keep every module's compiled code for the boot
+and cache value stacks, and its locks would be shared by every app):
+
+- `Config::consume_fuel(true)`;
+- `compilation_mode(CompilationMode::Eager)`: the default lazy
+  translation compiles a function on its first call and charges that to
+  fuel, by the byte, so a big function's first call could need more
+  fuel than any slice gives; eager compilation charges none;
+- `wasm_multi_memory(false)` (on by default), and `allow_start_fn(false)`
+  (a module with a start section fails `Module::new`; a start function
+  would run inside instantiation, on `run`'s thread, outside any slice);
+- `set_max_recursion_depth(CALL_DEPTH)` and
+  `set_max_stack_height(VALUE_STACK_BYTES)` (wasmi counts the value stack
+  in bytes, 1,000,000 by default; past either, the app traps with "call
+  stack exhausted");
+- the store's limiter, `StoreLimitsBuilder::new().memories(1).tables(1)
+  .instances(1).memory_size(MEMORY_PAGES × 64 KiB)
+  .table_elements(TABLE_ELEMENTS)`, without `trap_on_grow_failure`.
+
+wasmi 2.0.1 allocates linear memory and tables fallibly
+(`alloc_zeroed` checked for null, `try_reserve`): a growth past the
+limiter or the heap makes `memory.grow` and `table.grow` return -1, as
+wasm defines. A value stack that can't grow traps ("out of system
+memory"). What can't fail gracefully (compiling, the instance, the
+host's own buffers) is covered by the budget below.
+
+#### The budget
+
+All apps together allocate from one `APP_BUDGET`, set well below the
+guest's RAM, so no app can drive the heap into an allocation the kernel
+can't survive.
+
+- `run` reserves the app's worst case before compiling anything:
+  `MEMORY_PAGES` of memory, `VALUE_STACK_BYTES`, `CODE_FACTOR` × the
+  module's size for its compiled code (eager compilation allocates
+  without failing), and `APP_OVERHEAD` for its store, handle table, tree
+  copy and glyph cache. If the budget can't cover it, `run` prints
+  `run: <name>: not enough memory` and starts nothing.
+- `window_open` charges the window's two surfaces (client width × height
+  × 4 bytes each) and answers `Limit` if the budget can't cover them.
+- Everything an app reserved returns to the budget when it ends (a
+  window's charge when it closes).
+- `MAX_APPS × (memory + value stack + code + overhead)` stays within
+  `APP_BUDGET`, so the budget refuses only when windows are big.
+
+`ktest:lumen_kernel::app::compiled_code_fits_its_charge` checks, for each
+bundled app, that the heap's growth across `Module::new` on a quiet
+thread is at most its `CODE_FACTOR` charge.
 
 #### Capabilities as handles
 
-Nothing is ambient: every call that touches an object takes a handle, a
-`u32` (an `i32` in wasm) naming a slot in the app's handle table. Handles
-count from 1 per app and are never reused within its life (0 and any
-number it wasn't given are `BadHandle`); at most `HANDLES` (64) open at
-once. A call with a missing, closed or made-up handle, or a handle of
-another kind, is refused with an error code, never a trap, so an app can
-always tell and go on.
+Nothing is ambient: every call that touches an object takes a handle,
+an opaque id in 1..=`i32::MAX` naming a slot in the app's handle table
+(`Handle(NonZeroU32)` in the SDK). Handles are never reused within an
+app's life; once its count is used up, calls that would make one get
+`Limit` (no wrap). A missing, closed or made-up handle is `BadHandle`,
+one of another kind `WrongKind`: an error code, never a trap.
 
-| Kind (`lumen_app_api::Kind`) | Number | Object | Granted by | Calls |
-|---|---|---|---|---|
-| `Log` | 1 | the kernel log, lines tagged with the app's name | every app, always | `log` |
-| `Time` | 2 | the clocks | manifest `time` | `time_now`, `time_wall`, `time_sleep` |
-| `Desktop` | 3 | the right to open windows, and the shared UI font | manifest `desktop` | `window_open`, `text_line_height`, `text_measure`, `text_draw` |
-| `Window` | 4 | one window the app opened | `window_open` only (never in a manifest) | `window_commit`, `window_next_event`, `window_wait`, `window_publish`, `window_answer` |
-| `Trace` | 5 | the per-CPU trace rings, read only (X-ray) | manifest `trace` | `trace_cpus`, `trace_read` |
-| `Dir` | 6 | reserved for M6 (a directory subtree, as in the table above) | | |
+| Kind (`lumen_app_api::Kind`) | Number | Object | Granted |
+|---|---|---|---|
+| `Log` | 1 | the kernel log, lines tagged with the app's name | every app, always (`run --without log` is refused) |
+| `Time` | 2 | the clocks | `caps` `time` |
+| `Desktop` | 3 | opening a window; the shared UI font | `caps` `desktop` |
+| `Window` | 4 | the app's window | only by `window_open` |
+| `Trace` | 5 | the per-CPU trace rings, read only (X-ray) | `caps` `trace` |
 
-An app starts with `Log` and the kinds its manifest declares, minus any
-its `run` withholds (`run --without <kind>`). There is no way to grant
-a kind the manifest doesn't declare: `run` can only take away. The app
-finds its handles with `handle_find(kind)`, which answers `NotGranted`
-for a kind it wasn't given. Closing a `Window` handle destroys the
-window; closing any other drops that capability for the rest of the
-app's life. When the app ends, every handle it holds is closed.
+`lumen_app_api::Grant` (`Log`, `Time`, `Desktop`, `Trace`) is what
+`caps=`, `run --without` and `handle_find` accept. An app starts with
+`Log` and the grants its manifest lists, minus what `run --without
+<grant>` withholds: `run` can only take away. `handle_find(kind)` returns
+the same handle every time, `NotGranted` for a grant the app doesn't
+hold (never given, withheld, or closed), and `BadArgument` for `Window`
+or a number that names no kind. Closing a `Window` handle destroys the
+window; closing another drops that grant for the rest of the app's life.
+An app has at most one window in M5 (`WINDOWS`).
 
 #### The manifest
 
-A custom section named `lumen.manifest` in the module: UTF-8 text, one
-`key=value` per line, in any order, each key once:
-
-```
-name=clock
-caps=time,desktop
-```
-
-- `name`: the app's name, `[a-z0-9-]{1,24}`, equal to its bundled name
-  (the file's stem).
-- `caps`: a comma-separated list of `time`, `desktop`, `trace` (and
-  `log`, allowed and granted anyway); may be empty.
-
-The SDK writes it with a macro (`lumen_app::manifest!(name = "clock",
-caps = [time, desktop])`) as a `#[unsafe(link_section =
-"lumen.manifest")]` byte string built with `concat!`, so no build step
-is needed. The kernel finds it with `lumen_app_api::manifest::find(&[u8])
--> Result<Manifest, ManifestError>`, which walks the module's sections
-itself (no wasmi API needed; host-tested on hand-made modules). A module
-with no manifest, two of them, an unknown key or capability, a repeated
-key, or a name that isn't its bundled name is refused at load, naming
-why.
+A custom section named `lumen.manifest`: UTF-8, one line, `caps=`
+followed by a comma-separated list of `time`, `desktop` and `trace`
+(possibly empty). The app's name is its bundled file's stem; `Log` is
+always granted and isn't listed. The SDK writes it with
+`lumen_app::manifest!(time, desktop)`, a `#[unsafe(link_section =
+"lumen.manifest")]` byte string built with `concat!`. The kernel reads
+it with `lumen_app_api::manifest::find(&[u8]) -> Result<Manifest,
+ManifestError>`, which walks the module's sections itself. No manifest,
+two, an unknown or repeated grant, or anything but one `caps=` line is
+refused at load, naming why. M6 adds an `abi=` key for modules loaded
+from disk.
 
 #### The host interface (import module `lumen`)
 
-Arguments and results are wasm `i32`/`i64`. A pointer is an offset into
-the app's memory (taken as unsigned), always with a length; a range that
-overflows or leaves the memory is `BadPointer`. A call returns its
-result, `>= 0`, or a negated `lumen_app_api::Error` code. Text is UTF-8
-(else `BadArgument`). Encoded values (events, trees, answers) are
-`postcard` (below). The SDK wraps every call (#206); apps never call
-these directly.
+Arguments and results are wasm `i32` and `i64`. Every call returns its
+result, `>= 0`, or a negated `lumen_app_api::Error` (also the calls
+returning `i64`). The SDK wraps every call (#206); apps don't call them
+directly.
+
+**Every call checks its arguments in one order:** the handle, then its
+kind; then every (pointer, length) range, taken as unsigned and summed
+as `u64`, against the memory's current size (`BadPointer` if any byte is
+outside); then it copies every input out of the app's memory (fixed
+structures by value; text into a kernel buffer, refused with
+`BadArgument` past its cap before it is decoded); and only then takes an
+output range and writes it whole or not at all. So overlapping input
+and output ranges are harmless, nothing is half-written, and a guest
+pointer is never held across anything that can run the app. Text is
+UTF-8, else `BadArgument`.
 
 | Function | Result | Notes |
 |---|---|---|
-| `handle_find(kind: i32) -> i32` | the handle | `NotGranted`, `BadArgument` (no such kind) |
-| `handle_close(h: i32) -> i32` | 0 | `BadHandle` |
-| `args_len() -> i32` | bytes | the `run` arguments after the app's name, each followed by a NUL |
+| `handle_find(kind: i32) -> i32` | the handle | above |
+| `handle_close(h: i32) -> i32` | 0 | |
+| `args_len() -> i32` | bytes | the `run` arguments after the app's name, each followed by a NUL; at most `ARGS_BYTES` |
 | `args_read(buf: i32, len: i32) -> i32` | bytes written | `BufferTooSmall` (nothing written) |
 | `exit(code: i32)` | never returns | ends the app as if `lumen_main` returned `code` |
-| `panic(msg: i32, len: i32)` | never returns | the SDK's panic handler: ends the app with `panicked: <msg>` (below) |
-| `log(h: i32, level: i32, msg: i32, len: i32) -> i32` | 0 | level 1 error .. 5 trace, as `trace::Kind::Log`; one line, cut at `LOG_BYTES` (256), control characters shown as U+FFFD; `Limit` past `LOG_LINES_PER_SLICE` (16) in one slice |
+| `panic(msg: i32, len: i32)` | never returns | the SDK's panic handler: ends the app with its message |
+| `log(h: i32, level: i32, msg: i32, len: i32) -> i32` | 0 | level 1 (error) to 5 (trace); the message cut at `LOG_BYTES` |
 | `time_now(h: i32) -> i64` | ns since boot | `time::since_boot_ns` |
-| `time_wall(h: i32, buf: i32, len: i32) -> i32` | 8 | `WallTime`: year `u16` LE, month, day, hour, minute, second (`u8`), one zero byte; the RTC's reading (`rtc::now_quiet`), `Unavailable` if it failed |
-| `time_sleep(h: i32, ns: i64) -> i32` | 0 | blocks the app's thread (`waiting`); a kill ends it at once |
-| `window_open(h: i32, title: i32, len: i32, width: i32, height: i32) -> i32` | a `Window` handle | `desktop::open_window`; `NoDesktop`, `Limit` (`WINDOWS`, 4, or the desktop's 32), `TooBig`, `OutOfMemory`, `BadArgument` (a zero size, a title over 64 bytes) |
-| `window_commit(h: i32, canvas: i32, rects: i32, n: i32) -> i32` | 0 | copies `n` (1..=16) `Rect`s of the `Canvas` (the window's client size) into the owner's surface, then `WindowHandle::commit`s them |
-| `window_next_event(h: i32, buf: i32, len: i32) -> i32` | bytes, 0 for none | one encoded `Event`, never blocking; `BufferTooSmall` keeps it queued (`EVENT_BYTES`, 1024, always fits) |
-| `window_wait(h: i32, deadline: i64, animating: i32) -> i32` | 1 an event, 0 the deadline | `Window::wait` (section 11); `deadline` in `time_now`'s ns, `-1` for none; `animating` 1 keeps the window out of `settled` while it waits (needs a deadline) |
-| `window_publish(h: i32, tree: i32, len: i32) -> i32` | 0 | an encoded `Tree` (below); `BadArgument` or `Limit` keeps the last one |
-| `window_answer(h: i32, request: i64, served: i32, len: i32) -> i32` | 0 | an encoded `Served` for a request the app was given; `BadArgument` for an unknown or already answered one |
-| `text_line_height(h: i32, px: i32) -> i32` | pixels | on a `Desktop` handle; `px` 8..=96 |
-| `text_measure(h: i32, px: i32, text: i32, len: i32) -> i32` | advance in pixels | `font::Text::measure` |
-| `text_draw(h: i32, canvas: i32, x: i32, y: i32, px: i32, rgb: i32, clip: i32, text: i32, len: i32) -> i32` | advance in pixels | `font::Text::draw` into the app's own `Canvas`, inside the `Rect` at `clip` |
-| `trace_cpus(h: i32) -> i32` | CPUs with a ring | |
+| `time_wall(h: i32) -> i64` | seconds since 1970-01-01 UTC | the RTC (taken as UTC) through `rtc::now_quiet`; `Unavailable` if it failed |
+| `time_sleep(h: i32, ns: i64) -> i32` | 0 | blocks (`waiting`) on the app's own wait queue until the time passes or a kill; `ns < 0` is `BadArgument` |
+| `window_open(h: i32, title: i32, len: i32, width: i32, height: i32) -> i32` | a `Window` handle | `desktop::open_window`; `Unavailable` (no desktop), `Limit` (`WINDOWS`, the desktop's 32, the budget), `BadArgument` (a zero size, bigger than the screen, a title past `TITLE_BYTES`), `OutOfMemory` |
+| `window_commit(h: i32, canvas: i32, rects: i32, n: i32) -> i32` | 0 | `n` (1..=`COMMIT_RECTS`) `Rect`s of the `Canvas` (the window's client size) copied into the owner's surface, then `WindowHandle::commit`ted |
+| `window_next_event(h: i32, buf: i32, len: i32) -> i32` | bytes, 0 for none | one encoded `Event`, never blocking |
+| `window_wait(h: i32, deadline: i64, animating: i32) -> i32` | 1 an event, 0 the deadline | below |
+| `window_publish(h: i32, tree: i32, len: i32) -> i32` | 0 | an encoded `Tree`; refused (`BadArgument`, `Limit`) keeps the last one |
+| `window_answer(h: i32, request: i64, answer: i32, len: i32) -> i32` | 0 | an encoded `AppAnswer` for a started request, at most `ANSWER_BYTES`; refused keeps the request pending |
+| `text_line_height(h: i32, px: i32) -> i32` | pixels | on a `Desktop` handle |
+| `text_measure(h: i32, px: i32, text: i32, len: i32) -> i32` | advance in pixels | `font::Text::measure`; text at most `TEXT_BYTES` |
+| `text_draw(h: i32, canvas: i32, args: i32, text: i32, len: i32) -> i32` | advance in pixels | a `TextDraw` at `args`; below |
+| `trace_cpus(h: i32) -> i32` | CPUs with rings | |
 | `trace_read(h: i32, stream: i32, cpu: i32, since: i64, buf: i32, len: i32) -> i32` | events copied | below |
 
-Structures in the app's memory, little-endian:
-`Canvas { ptr: u32, stride: u32, w: u32, h: u32 }` (16 bytes; xRGB8888
-pixels, `stride` in pixels, `>= w`; every pixel row inside the memory)
-and `Rect { x: i32, y: i32, w: u32, h: u32 }` (16 bytes, clipped to the
-canvas; an empty one is skipped).
+Every text call takes `px` in `TEXT_PX_MIN..=TEXT_PX_MAX`, else
+`BadArgument`.
+
+**Fixed layouts** (little-endian, no alignment needed in `buf`; encode
+and decode in `lumen-app-api`, their bytes pinned by host tests):
+
+| Layout | Bytes | Fields |
+|---|---|---|
+| `Canvas` | 16 | `ptr: u32` (a multiple of 4, else `BadPointer`), `stride: u32` (pixels, `>= w`), `w: u32`, `h: u32`; xRGB8888 pixels, every row inside the memory |
+| `Rect` | 16 | `x: i32`, `y: i32`, `w: u32`, `h: u32`; clipped to the canvas, an empty one skipped |
+| `TextDraw` | 32 | `x: i32`, `y: i32` (the line box's top left), `px: u32`, `rgb: u32`, `clip: Rect` |
+| trace header | 24 | `next: u64`, `missed: u64`, `copied: u32`, 4 zero bytes |
+| trace event | 56 | `seq: u64`, `tsc: u64`, `cpu: u16`, `kind: u16`, `pid: u32`, `args: [u64; 4]` (`lumen_trace::Event`) |
+
+**Text** is the kernel's, so the UI font and its parsing stay shared
+(`font::face`): the app's thread has one `font::Text` (its glyph cache),
+made on its first text call. `text_draw` copies the pixels of `clip`
+(cut to the canvas) out of the app's memory into a scratch
+`lumen_gfx::Surface` the runtime keeps for the app (no bigger than its
+window, charged to its budget), draws with `font::Text::draw`, and copies
+them back; its result is the advance `font::Text::measure` gives.
+`lumen_ui::Text` inside an app is the SDK's implementation over the three
+text calls.
 
 Error codes (`lumen_app_api::Error`, `#[repr(i32)]`, returned negated;
-numbers are stable and never reused, a host test pins them):
+stable, never reused, pinned by a host test):
 
 | Code | Error | Meaning |
 |---|---|---|
-| 1 | `BadHandle` | no such open handle: never given, closed, or made up |
-| 2 | `WrongKind` | a handle of another kind than the call takes |
-| 3 | `NotGranted` | `handle_find` for a kind the app wasn't given |
-| 4 | `BadPointer` | a range outside the app's memory, or overflowing |
-| 5 | `BadArgument` | bad UTF-8, a value out of range, an encoding that doesn't decode or breaks its rules |
+| 1 | `BadHandle` | no such open handle |
+| 2 | `WrongKind` | a handle of a kind the call doesn't take |
+| 3 | `NotGranted` | `handle_find` for a grant the app doesn't hold |
+| 4 | `BadPointer` | a range outside the app's memory, or an unaligned canvas |
+| 5 | `BadArgument` | bad UTF-8, a value out of range, text past its cap, an encoding that doesn't decode or breaks its rules |
 | 6 | `BufferTooSmall` | the output didn't fit: nothing written |
-| 7 | `Limit` | a per-app limit (handles, windows, log lines this slice, tree size) |
-| 8 | `NoDesktop` | no desktop running |
-| 9 | `TooBig` | a window bigger than the screen |
-| 10 | `OutOfMemory` | the kernel couldn't allocate for this call |
-| 11 | `Unavailable` | the object can't answer now (the RTC failed its read) |
+| 7 | `Limit` | a per-app or global limit, the budget included |
+| 8 | `Unavailable` | the object can't answer now: no desktop, the RTC failed |
+| 9 | `OutOfMemory` | the kernel couldn't allocate within the budget |
 
 #### Wire formats
 
-Encoded values are `postcard` (pinned with `=`, `default-features =
-false`, `alloc`; with `serde` it is one new dependency, added in a PR of
-its own ahead of #199, as ROADMAP's rules ask) over `serde`-derived types
-in `lumen-app-api`, each prefixed
-with one version byte (`WIRE_VERSION`, 1). A host test round-trips every
-type and pins one encoding of each as bytes, so a change to a type is a
-change to the format. A value that doesn't decode, has another version,
-or breaks its rules is `BadArgument`, never a trap.
+Events, trees and answers are `postcard` (pinned with `=`,
+`default-features = false`, `alloc`) over `serde`-derived types that
+`lumen-app-api` owns, mirroring `lumen-ui`'s and `lumen-input`'s
+(`Role`, `Action`, `InvokeError`, keys, buttons) with explicit
+`#[repr(u8)]` numbers declared in that order and `TryFrom` conversions
+both ways. So `lumen-ui` needs no `serde`, and reordering its variants
+can't change the ABI: a host test pins the encoding of every variant.
+postcard with `serde` (and their transitive crates: `serde_core`,
+`serde_derive`, `cobs`, `thiserror` and the proc-macro crates) is one new
+dependency, in a PR of its own ahead of #199. Apps are built into the
+image with the kernel, so M5 has no per-message version. A value that
+doesn't decode or breaks its rules is `BadArgument`, never a trap.
 
-- **`Event`** (host to app): `Theme { dark: bool, palette: Palette }`
-  (`lumen_ui::Palette`'s colours, as the kernel's `ui::palette(&Theme)`
-  gives a kernel toolkit: an app's toolkit looks like a kernel window's;
-  always a window's first event, section 11), `Key(Key)`, `PointerDown {
-  x, y, button }`, `PointerMove { x, y, buttons }`, `PointerUp { x, y,
-  button }` (client coordinates, `lumen_input::Button` numbers),
+- **`Event`** (host to app): `Theme { theme: u8, palette }` (the theme's
+  id and the `lumen_ui::Palette` the kernel's `ui::palette(&Theme)`
+  gives, so an app's toolkit looks like a kernel window's; always the
+  first event), `Key { name, mods, action }` (`action` is `Press { text:
+  Option<char> }` or `Release`, as `lumen_input::KeyAction`; `name`
+  `Enter`, `Backspace`, `Tab`, `Escape`, the arrows, `Home`, `End`,
+  `PageUp`, `PageDown`, `Insert`, `Delete`, `F(u8)`, `Char` or
+  `Other(u16)`), `PointerDown { x, y, button, buttons }`, `PointerMove {
+  x, y, buttons }`, `PointerUp { x, y, button, buttons }` (client
+  coordinates; buttons by `Button::index()` and `buttons` one bit each),
   `FocusGained`, `FocusLost`, `Lost`, `Close`, `Request { id: u64, node:
-  u64, action: lumen_ui::Action }` (`node` the app's own id). `Key {
-  press: bool, name: KeyName, text: Option<char>, mods: u8 }`:
-  `KeyName::{Char, Enter, Backspace, Tab, Escape, Left, Right, Up, Down,
-  Home, End, PageUp, PageDown, Insert, Delete, F(u8), Other(u16)}` from
-  `lumen_input::KeyEvent`, `mods` its `Mods` bits. Section 11's queue
-  rules hold unchanged: the runtime turns each `WindowEvent` into one
-  `Event`.
-- **`Tree`** (app to host, `window_publish`): the app's nodes depth
-  first, each `Node { id: u64, role: Role, name: String, value:
-  Option<Value>, state: u8, bounds: (i32, i32, u32, u32), children:
-  Vec<u64> }` (`lumen_ui::Role`, `Value`, `StateFlags`' bits, client
-  coordinates). Its rules: ids non-zero and unique; every child listed
-  once, after its parent; each node valid for its role (value kind and
-  flags, as `lumen_ui::AutomationNode`'s constructors check, through a
-  checked constructor #207 adds); at most `TREE_NODES` (1024) nodes and
-  `TREE_BYTES` (64 KiB) encoded. Its top-level nodes hang under the
-  window's root.
-- **`Served`** (app to host, `window_answer`): `lumen_ui::Served` with
-  the node's id the app's own: `Row { depth, node: Node }`,
-  `Error(lumen_ui::InvokeError)`, `RanNodeGone`, `ClosedItsWindow`,
-  `Failed(String)`.
-
-`lumen-ui` gets an optional `serde` feature deriving the traits for
-`Role`, `Value`, `Action`, `ActionKind`, `InvokeError` and `Palette` only;
-`NodeId` and `AutomationNode` stay without it, so text never becomes a
-`lumen_ui::NodeId` (section 11) in the kernel: app ids are plain `u64`s
-there until the map below gives them global ones.
+  u64, action }`. `mods` and `buttons` have their own pinned bits.
+  Section 11's queue, flags and rationing apply unchanged: each
+  `WindowEvent` becomes one `Event`. A `set_value` text past
+  `SET_VALUE_BYTES` is refused (wrong arguments) before it is encoded,
+  so every `Event` fits `EVENT_BYTES` (a host test encodes the largest).
+- **`Tree`** (app to host): the app's nodes in pre-order, each `Node {
+  id: u64, role, name, value, state: u8, bounds, children: u32 }`
+  (`children` the count of its direct children, which follow it), so a
+  tree can't have a dangling or orphaned node. Its rules: ids non-zero
+  and unique; no `window` role (an app can't publish a window's root);
+  value kind and state bits as the role allows (bits it doesn't allow
+  are refused, not masked); `Selected(i)` below its list's item count;
+  bounds through `lumen_gfx::Rect`'s checked constructor; at most
+  `TREE_NODES` nodes and `TREE_BYTES` encoded. Its top-level nodes hang
+  under the window's root.
+- **`AppAnswer`** (app to host): `Ran { node: u64 }`, `Error(code)` (the
+  owner's `InvokeError`s), `ClosedItsWindow`, or `Failed(String)` (cut
+  at `LOG_BYTES`). The runtime builds what the asker gets (below).
 
 #### Running an app
 
-- **Loading (`run <app> [args]`):** the bundled module (`MODULE_BYTES`,
-  4 MiB, at most), its manifest, `wasmi::Module::new` (validating), the
-  linker with the `lumen` functions, instantiation under the limits
-  below, then the thread. `run` prints `run: started <name> as app <id>`
-  and returns at once; it doesn't wait for the app. Errors (`run: no app
-  <name>`, `run: <name>: <why>`: too big, not valid (wasmi's message),
-  the manifest's error, an import refused, `MAX_APPS` (8) running) start
-  nothing.
-- **Fuel in slices:** `wasmi::Config::consume_fuel(true)`; the app runs
-  with `call_resumable` and `SLICE_FUEL` (1,000,000 units) at a time.
-  Out of fuel (`TypedResumableCall::OutOfFuel`) ends a slice: the
-  runtime counts it, adds its fuel to the app's total, checks the kill
-  flag and its windows' `Close` grace (below), yields
-  (`sched::yield_now`), refuels and resumes. Fuel is the safe point
-  where an app can be stopped; the timer still preempts the thread
-  inside a slice, as it does any thread, so a busy app never holds a CPU
-  from the shell. A host call that blocks (`window_wait`, `time_sleep`)
-  waits through one wait that a kill also wakes.
-- **Kill (`kill <id>`):** sets the flag, wakes the app if it waits,
-  joins its thread (the app stops at its next safe point: the end of its
-  slice or its host call), then prints `kill: app <id> (<name>) killed`.
-  `kill: no app <id>` otherwise.
-- **Close:** a `Close` event (the close box, `ui invoke <root> close`)
-  is the app's to act on (its SDK closes the window and returns). Once an
-  app has been given `Close` for a window and still holds it, it has
-  `CLOSE_GRACE_SLICES` (4) more slices; past them, or at its next
-  blocking call, it is ended (`ended: didn't close its window`). A count
-  of slices, not a time.
-- **Ends:** returning from `lumen_main` (or `exit`), a trap, a broken
-  limit, a kill or the close grace ends the app. Its windows are
-  destroyed (their `Pending` requests answered "window closed", section
-  11), every request it had started but not answered is answered `window
-  <id> closed`, its handles closed, and its `Store`, instance and module
-  dropped, so the heap comes back (baseline taken after one app has run,
-  since the UI font and the glyph cache are made on first use). Its
-  thread then exits and is joined (by `kill`, or by the runtime for an
-  app that ends by itself). One line says how it ended, with target
-  `app`:
+- **Loading (`run <app> [args]`):** the bundled module (at most
+  `MODULE_BYTES`), its manifest, the budget's reservation, the app's
+  `Engine` and `Module::new` (validating, eager), the linker with the
+  `lumen` functions, instantiation, then the thread. `run` prints `run:
+  started <name> as app <id>` and returns at once. Its errors (`run: no
+  app <name>`, `run: <name>: <why>`: too big, not valid (wasmi's
+  message), the manifest's error, a refused import, not enough memory,
+  `MAX_APPS` running) start nothing and reserve nothing.
+- **Slices:** the app runs with `call_resumable`. A slice ends when its
+  fuel runs out (`TypedResumableCall::OutOfFuel`) or at a blocking host
+  call (`window_wait`, `time_sleep`). At each end the runtime counts the
+  slice, adds the fuel used to the app's total, checks the kill flag
+  and the close grace, yields (`sched::yield_now`; a blocking call
+  waits instead), and refuels with `max(SLICE_FUEL, required_fuel)` (bulk
+  memory operations are charged by size, so a smaller refuel could stop
+  a slice from ever making progress). Fuel is the safe point where an
+  app can be stopped; the timer still preempts the thread inside a
+  slice, as any thread, so a busy app never keeps a CPU from the shell.
+- **`window_wait`** is `WindowHandle::wait_event_until`: the deadline,
+  in `time_now`'s clock, is converted to `time::now_ns`'s; `-1` means
+  none (`wait_event_until(None, No)`). Animating without a deadline,
+  `animating` other than 0 or 1, or a deadline below -1 is
+  `BadArgument`. A `Woken` wake re-checks the kill flag and waits again
+  until the deadline. The runtime keeps the event it took in hand for
+  the next `window_next_event`; `BufferTooSmall` leaves it there, and a
+  `Request` is `start`ed only once its bytes are written.
+- **One end reason, first writer wins:** returning from `lumen_main`,
+  `exit`, `panic`, a trap, a kill or the close grace records the app's
+  end reason under the app table's lock, unless one is recorded already.
+  `exit`, `panic` and a kill reach wasmi as one runtime-private host
+  error (`HostTrap`), never resumed and never reported as a trap. The
+  reason decides the app's one end line:
 
-  | How | Line |
+  | Reason | Line (target `app`) |
   |---|---|
   | returned or `exit` | `INFO  app: <name> (app <id>) exited with <code>` |
   | killed | `INFO  app: <name> (app <id>) killed` |
-  | ignored its close | `INFO  app: <name> (app <id>) ended: didn't close its window` |
-  | `panic` | `WARN  app: <name> (app <id>) ended: panicked: <msg>` |
-  | a trap | `WARN  app: <name> (app <id>) ended: trap: <wasmi's trap>` (`unreachable`, `out of bounds memory access`, `call stack exhausted`, ...) |
-  | a broken limit | `WARN  app: <name> (app <id>) ended: limit: <which>` (`out of fuel` never: fuel only ends a slice) |
+  | close grace | `INFO  app: <name> (app <id>) ended: didn't close its window` |
+  | `panic` | `WARN  app: <name> (app <id>) ended: panicked: <msg>` (cut at `LOG_BYTES`) |
+  | a trap | `WARN  app: <name> (app <id>) ended: trap: <wasmi's trap>` (`wasm \`unreachable\` instruction executed`, `out of bounds memory access`, `call stack exhausted`, ...) |
 
-  So a misbehaving app gives exactly one WARN, and the kernel goes on.
-  `memory.grow` past the limit isn't a broken limit: it returns -1, as
-  wasm defines, and only an app that then panics ends (with its WARN).
+  So an app that faults gives exactly one end-line WARN, and the kernel
+  goes on (its window may log its own "behind" WARN, section 11).
+  `memory.grow` past a limit isn't an end: it returns -1, and only an
+  app that then panics ends.
+- **Ending:** the app's thread destroys its window (its `Pending`
+  requests answered "window closed", section 11), answers every request
+  it started but didn't answer with `Answer::OwnerEnded`, closes its
+  handles, drops its store, instance, module and `Engine`, returns its
+  budget, marks its entry ended and wakes `app::ENDED`. The app table's
+  entry owns the thread's `JoinHandle`; the `app-reaper` thread (started
+  with the first app) waits on `ENDED` and removes and joins every ended
+  entry. So `apps` lists an app until it is joined (`ending` meanwhile),
+  and once `threads` no longer lists `app:<name>` it is gone.
+- **Kill (`kill <id>`):** sets the flag, wakes the app's waits (its own
+  wait queue and its window's `Waker`), then waits on `ENDED` until the
+  entry is gone or `KILL_WAIT` passes. It prints what happened:
+  `kill: app <id> (<name>) killed`, `kill: app <id> (<name>) had already
+  ended: <its end line's reason>` (another reason won), or `kill: app
+  <id> (<name>) still ending (in <host call or "a slice">)`, leaving the
+  reaper to join it. A second `kill` of an ending app waits the same
+  way; one of an id not listed prints `kill: no app <id>`.
+- **Close grace:** a `Close` event (the close box, `ui invoke <root>
+  close`) is the app's to act on (the SDK closes the window and
+  returns). Once it has been given `Close` and still holds the window,
+  it has `CLOSE_GRACE_SLICES` more slices, and its next blocking call
+  ends it at once: both triggers are deliberate (one for an app that
+  computes, one for an app that waits). An app that never reads its
+  events never sees `Close`; only `kill` ends it.
 - **Its log lines** are `<LEVEL> app: <name>: <text>` (`INFO  app:
-  hello: hello from wasm`).
+  hello: hello from wasm`): one line per call, cut at `LOG_BYTES` on a
+  char boundary, each control character shown as U+FFFD (so a newline
+  can't forge a line a test matches on). The same applies to `panic`'s
+  message and `Failed`'s text.
 
-#### Limits that keep the kernel alive
+#### Limits
 
-`lumen_app_api::limits`, applied by the runtime through wasmi's
-`Config` (the call-depth and value-stack rows are wasmi's stack limits;
-#199 maps them onto wasmi 2.0.1's names and pins the trap's text), its
-store limiter and the host functions:
+`lumen_app_api::limits`; the kernel applies them through wasmi's
+`Config` and limiter, the budget and the host calls.
 
-| Limit | Value | When broken |
+| Limit | Value | When reached |
 |---|---|---|
-| `MODULE_BYTES` | 4 MiB | `run` refuses it |
-| `MEMORY_PAGES` | 256 (16 MiB of linear memory) | an initial memory over it is refused at load; `memory.grow` past it returns -1 |
-| `TABLE_ELEMENTS` | 10,000 (one table) | refused at load; `table.grow` past it returns -1 |
-| call depth | 1024 frames | trap: call stack exhausted |
-| value stack | 1 Mi values | trap: call stack exhausted |
-| `SLICE_FUEL` | 1,000,000 per slice | ends the slice (not the app) |
+| `APP_BUDGET` | 128 MiB (guests have 256 MiB) | `run` or `window_open` refuses |
+| `MAX_APPS` | 4 running | `run` refuses |
+| `MODULE_BYTES` | 1 MiB | `run` refuses |
+| `CODE_FACTOR` | 8 (× the module's size) | the code charge at `run` |
+| `APP_OVERHEAD` | 1 MiB | charged at `run` |
+| `MEMORY_PAGES` | 192 (12 MiB) | refused at load if the initial memory is bigger; `memory.grow` returns -1 |
+| `TABLE_ELEMENTS` | 10,000 | refused at load; `table.grow` returns -1 |
+| `CALL_DEPTH` | 1000 frames | trap: call stack exhausted |
+| `VALUE_STACK_BYTES` | 1 MiB | trap: call stack exhausted |
+| `SLICE_FUEL` | 1,000,000 | the slice ends (refuelled with `max(SLICE_FUEL, required_fuel)`) |
 | `HANDLES` | 64 open | `Limit` |
-| `WINDOWS` | 4 per app | `Limit` |
-| `LOG_LINES_PER_SLICE`, `LOG_BYTES` | 16, 256 | `Limit`; longer lines cut |
-| `TREE_NODES`, `TREE_BYTES` | 1024, 64 KiB | `Limit` |
+| `WINDOWS` | 1 per app | `Limit` |
+| `COMMIT_RECTS` | 16 per commit | `BadArgument` |
+| `LOG_BYTES` | 256 | cut |
+| `ARGS_BYTES` | 1024 | `run` refuses longer arguments |
+| `TITLE_BYTES`, `TEXT_BYTES` | 64, 1024 | `BadArgument` |
+| `TEXT_PX_MIN`, `TEXT_PX_MAX` | 8, 96 | `BadArgument` |
+| `SET_VALUE_BYTES` | 512 | the request refused (wrong arguments) |
 | `EVENT_BYTES` | 1024 | every event fits |
+| `TREE_NODES`, `TREE_BYTES` | 1024, 64 KiB | `Limit` |
+| `ANSWER_BYTES` | 4 KiB | `BadArgument` |
+| `STARTED_REQUESTS` | 8 per window | further requests answered "window <id> busy" |
 | `TRACE_EVENTS_PER_READ` | 256 | the rest on the next read |
-| `MAX_APPS` | 8 running | `run` refuses |
 | `CLOSE_GRACE_SLICES` | 4 | the app is ended |
+| `KILL_WAIT` | 1 s | `kill` says "still ending" |
 
-A memory growth the heap can't serve must fail as the limit does, never
-abort the kernel: #199 checks how wasmi 2.0.1 allocates linear memory
-and, if a failed allocation would abort, makes the limiter refuse a
-growth the heap can't take first. wasmi runs floating point as
-soft-float in the kernel (no SSE); #197 checks the results' bits.
+`MAX_APPS × (MEMORY_PAGES × 64 KiB + VALUE_STACK_BYTES + CODE_FACTOR ×
+MODULE_BYTES + APP_OVERHEAD)` is 88 MiB, within `APP_BUDGET`. wasmi runs
+floating point as soft-float in the kernel (no SSE); #197 checks the
+results' bits.
 
-#### Windows and text for apps (#206)
+#### Windows (#206)
 
-- **Who draws:** the app draws into a `Canvas` in its own memory, the
-  window's client size, and commits rectangles; the host copies each
-  into the window's owner surface (the app's thread is the window's
-  owner, section 11) and commits them. So an app never touches kernel
-  memory, and a window's frame is still the compositor's.
-- **Events** reach the app only when it asks (`window_next_event`,
-  `window_wait`), between slices or inside its host call: section 11's
-  queue, flags and rationing apply as to any owner.
-- **Text** is drawn by the kernel, so the UI font and its parsing stay
-  shared (`font::face`): the app's thread has one `font::Text` (its glyph
-  cache), made on its first text call and freed when it ends.
-  `lumen_ui::Text` inside an app is the SDK's implementation over
-  `text_line_height`, `text_measure` and `text_draw`.
+The app draws into a `Canvas` in its own memory, the window's client
+size, and commits rectangles; the host copies each into the window's
+owner surface (the app's thread is its owner, section 11) and commits
+them. So an app never touches kernel memory, and the frame is the
+compositor's. Events reach the app only when it asks, inside its host
+calls.
 
 #### Apps' automation trees (#207)
 
-- **Ids:** apps run `lumen-ui` inside the module, so its
+- **Ids:** apps run `lumen-ui` inside the module, so their
   `lumen_ui::NodeId`s come from the module's own counter: app-local
-  `u64`s. For each window, the kernel keeps a map from the app's ids to
-  global `lumen_ui::NodeId`s: an id seen for the first time in a
-  published tree gets `NodeId::fresh()`, so global ids are never reused
-  in a boot and two apps' trees never share one. An id missing from the
-  newest tree leaves the map, so its global id names nothing again (as
-  after a window closes); if the app shows that local id again, it gets a
-  new global id. The map goes with the window.
+  `u64`s. For each window the kernel keeps a map from the app's ids to
+  global `lumen_ui::NodeId`s: an id first seen in a published tree gets
+  `NodeId::fresh()`, so global ids are never reused in a boot and two
+  apps' trees (even two copies of one app, whose local ids are the same)
+  never share one. An id missing from the newest tree leaves the map,
+  so its global id names nothing again; if it comes back it gets a new
+  global id. The map goes with the window.
 - **`ui tree`** shows an app's window like a kernel one: the root (the
-  compositor's), then the app's nodes with their global ids and bounds
-  in screen pixels.
+  compositor's), then the app's nodes with global ids, bounds in screen
+  pixels.
 - **`ui invoke`** on a mapped id builds the usual `ui::Request` and
-  pushes it to the window's queue (section 11: rationing, deadlines,
-  cancels unchanged). When the app takes it, the runtime starts it
-  (`ui::Request::start`), keeps the `Started` under a fresh request id,
-  and hands the app `Event::Request { id, node, action }` with the
-  app-local node. The app runs `lumen_ui::serve` (the same path as a
-  click), publishes its tree, then answers with `window_answer`. The
-  runtime maps the answer's node back through the newest tree (a node not
-  in it answers as `RanNodeGone`) and answers the `Started`. A
-  `ClosedItsWindow` answer is held until the app closes that window (or
-  ends), keeping section 11's rule that the answer comes after the
-  window is gone. The asker's deadlines are section 11's, unchanged: a
-  request the app hasn't taken yet (still `Pending` on the queue) is
-  cancelled at the first 1 s deadline, and the runtime skips it rather
-  than hand it to the app (`start` refuses a cancelled request). Once
-  the runtime has started it, it can't be cancelled (`Reply::cancel`
-  only leaves `Pending`): the asker waits a second 1 s, an answer then
-  prints with "ran late", and none gives "still running", since the app
-  may still complete the action; an answer after that, or the `window
-  <id> closed` an ending app gives, lands for nobody.
+  pushes it to the window's queue (rationing and deadlines as in section
+  11). When the app takes it:
+  - its node no longer in the map: the runtime answers it `no node`
+    (`ui::refuse`), never handing it to the app unmapped;
+  - `STARTED_REQUESTS` already started and unanswered: answered "window
+    <id> busy";
+  - else the runtime starts it (`ui::Request::start`), keeps the
+    `Started` under a request id (per window, from 1, never reused) and
+    hands the app `Event::Request { id, node, action }` with the
+    app-local node.
+
+  The app runs `lumen_ui::serve` (the same path as a click), publishes
+  its tree, then answers. The runtime builds the asker's answer from its
+  newest copy of the tree: `Ran { node }` becomes the node's `Row` (its
+  depth and global id from the map), or `RanNodeGone` if the node isn't
+  in it; `Error` and `Failed` pass through; `ClosedItsWindow` closes the
+  window first, then answers, keeping section 11's rule that this answer
+  comes once the window is gone. So an app can't answer with a row its
+  tree disagrees with.
+- **Deadlines** are section 11's ("A request is a reply slot"): a
+  request still on the queue can be cancelled at its asker's deadline
+  and is then skipped; one the runtime has started can't, and the asker
+  reports "ran late" or "still running" as for any window.
+- **`Answer::OwnerEnded`**, a new `ui::Answer`: a started request the
+  app never answered, when the app ends or closes its window. `ui
+  invoke` prints `ui invoke: app <id> ended while running it (it may
+  have run)` (or `window <id> closed while running it (it may have
+  run)`). None of the existing answers would be true, and a `Started`
+  dropped unanswered logs an ERROR.
 - **Root actions** (`focus`, `minimize`, `restore`, `close`) work on an
-  app's window as on any: `close` is a `Close` event to the app.
+  app's window as on any; `close` is a `Close` event to the app.
 
 #### The `Trace` capability (#198, read by X-ray in #208)
 
-- **Streams:** a `(stream, cpu)` pair names one per-CPU ring.
-  `stream` 0 is the trace ring of section 14 (boot phases, exceptions,
-  logs, switches); `stream` 1 holds the high-volume kinds #198 adds (run
-  queues, interrupts, lock contention). Section 14 says which ring each
-  kind is recorded in; if #198 records its kinds in the main ring, stream
-  1 reads the same ring as stream 0.
-- **`trace_read(h, stream, cpu, since, buf, len)`** copies, in sequence
-  order, the events of that ring with `seq >= since`, up to
-  `TRACE_EVENTS_PER_READ` and what fits, and never blocks a writer (it
-  reads through `TraceRing::try_read`). `buf` gets a 24-byte header,
-  `next: u64` (the `since` for the next read: one past the last sequence
-  number examined), `gap: u64` (sequence numbers in `[since, next)` it
-  couldn't copy: overwritten before the read, dropped by their writer,
-  or being written), `count: u32` and four zero bytes, then `count`
-  events of 56 bytes each (`seq: u64`, `tsc: u64`, `cpu: u16`, `kind:
-  u16`, `pid: u32`, `args: [u64; 4]`, little-endian: `lumen_trace::Event`).
-  It stops at the first sequence number not yet claimed; an event in
-  flight at the newest edge (claimed, not yet stored) may be counted as
-  a gap rather than read later, since a dropped event looks the same
-  (rare: X-ray shows a gap as one). Its result is `count`. A
-  `since` older than the ring holds counts the overwritten ones in
-  `gap` and starts at the oldest it still holds; reading with `since` 0
-  first gives the ring's whole contents.
-- **Kinds** are numbered in one place, `lumen_trace::kind` (moved there
-  by #198 from the kernel's `trace::Kind`, which uses them), and
-  `lumen-app-api` re-exports them, so the kernel and X-ray can't
-  disagree on a number.
+- **Streams:** `stream` 0 is a CPU's main trace ring (section 14: boot
+  phases, exceptions, logs, switches); `stream` 1 its X-ray ring (#198:
+  run queues, interrupts, lock contention, never in the main ring).
+  Section 14 says which ring each kind is recorded in.
+- **`trace_read`** reads with `lumen_trace::TraceRing::read_since(since,
+  out) -> Since { copied, missed, next }`, which never blocks a writer:
+  every sequence number from `since` to `next` is either copied or
+  counted in `missed` once (gone from the ring, dropped, overwritten); an
+  event still being written ends the read there, and the next read gets
+  it. `buf` gets the trace header then `copied` trace events (at most
+  `TRACE_EVENTS_PER_READ` and what fits); the result is `copied`. A `len`
+  below one header and one event is `BufferTooSmall`; an unknown stream
+  or CPU, or a `since` past the ring's next sequence number, is
+  `BadArgument`. `since` 0 reads from the oldest event the ring holds.
+- **`pid`** is 0 for every event in M5 (the kernel's); an app shows by
+  its thread's id in switch and run-queue events, which `apps`' `thread`
+  column names.
+- **Kinds** are numbered in one place, `lumen_trace::kind`, which the
+  kernel's `trace::Kind` uses and `lumen-app-api` re-exports, so the
+  kernel and X-ray can't disagree.
 
 #### Building and bundling
 
-- **`apps/`** is its own Cargo workspace (`apps/Cargo.toml`, excluded
-  from the root workspace, so host `cargo test`, `make lint`'s clippy on
-  the kernel and `make audit` don't change), built for
-  `wasm32-unknown-unknown` with `--release` (`opt-level = "s"`, `lto =
-  true`, `panic = "abort"`). Members: `apps/lumen-app` (the SDK, #206),
-  `apps/template` (#206), one directory per bundled app, and the test
-  apps under `apps/tests/` (#199: `hello`, `busy`, `trap`, `greedy`,
-  `nocap`). `lumen-app-api`, `lumen-ui` and the logic crates the apps
-  use (`lumen-demo`, ...) are path dependencies on `crates/`.
-- **`make build`** builds `apps/` first and copies each module to
-  `build/apps/<name>.wasm`; the kernel embeds every module there
-  (`kernel/build.rs` generates the list from the directory, sorted by
-  name: `app::BUNDLED: &[(&str, &[u8])]`), in both kernels. Until M6
-  apps load from disk (`scenario:test_apps::test_run_wasm_from_disk`),
-  bundling is the only way in. `make app NAME=foo` (#206) copies
-  `apps/template` to `apps/foo` and adds it to the workspace.
-- A host test (#196) checks each built module is valid wasm (magic and
-  version) and exports `memory` and `lumen_main`.
+- **`apps/`** is its own Cargo workspace (members `*`, `exclude`d by the
+  root workspace; #196), built for `wasm32-unknown-unknown` with
+  `--release`, its `Cargo.lock` committed and every dependency pinned
+  with `=`. It holds `lumen-app` (the SDK) and `template` (#206), one
+  directory per bundled app, and the runtime's test apps under
+  `apps/tests/` (#199: `hello`, `busy`, `trap`, `greedy`, `nocap`,
+  `abuse`). Crates the apps share with the kernel (`lumen-app-api`,
+  `lumen-ui`, `lumen-demo`, ...) are path dependencies on `crates/`.
+- **`make apps`** builds them into `build/apps/<name>.wasm`. The kernel
+  build depends on it, `KERNEL_SRCS` includes `apps/`, and
+  `kernel/build.rs` embeds every module there, sorted by name, in both
+  kernels (`app::BUNDLED: &[(&str, &[u8])]`); a missing `build/apps`
+  (`make lint` runs before `make build` in CI) gives an empty list, said
+  in a build warning. `harness:test_wasm_module::*` (#196) runs after the
+  apps are built. Until M6 loads apps from disk
+  (`scenario:test_apps::test_run_wasm_from_disk`), bundling is the only
+  way in. `make app NAME=foo` (#206) copies `apps/template` to
+  `apps/foo`.
+- **The launcher** (#157's taskbar) lists the bundled apps whose
+  manifest grants `desktop`, never the test apps, and starts one through
+  `run`'s path. Its Life item starts the Life app (#202, which updates
+  the M4 Life row and `tests/features/gui.toml`).
 
 #### Shell commands
 
-- `apps`, one record per running app, by id:
+- `apps`, one record per listed app, by id:
 
   | Column | Meaning |
   |---|---|
   | `id`, `name` | the app |
   | `state` | `running`, `waiting` or `ending` |
   | `thread` | its thread's id (as in `threads`) |
-  | `fuel` | fuel units used so far |
-  | `slices` | fuel slices it ran out of |
+  | `fuel` | fuel used so far |
+  | `slices` | slices it has run (either end counts) |
   | `memory` | its linear memory in KiB |
-  | `windows` | windows it has open |
+  | `windows` | 0 or 1 |
 
   No apps prints the header alone.
-- `run <app> [args...]` and `run --without <kind> <app> [args...]` (above);
-  `run` alone prints its usage and the bundled apps' names.
-- `kill <id>` (above).
-
-The M5 scenarios judge apps by counts and confirmed effects (CLAUDE.md,
-"Tests on a busy host"): a busy app is shown preempted by the shell
-answering and its `slices` growing, never by how fast; the games and
-Life advance by a `step` request, not by time, so their goldens don't
-depend on the host.
+- `run [--without <grant>] <app> [args...]`; `run` alone prints its usage
+  and the bundled apps' names.
+- `kill <id>`.
 
 ## 9. Storage: VFS, LumenFS and snapshots (planned: VFS and RAMFS M6, LumenFS M10)
 
