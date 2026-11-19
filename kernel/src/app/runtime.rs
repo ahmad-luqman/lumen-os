@@ -497,6 +497,13 @@ pub(super) fn start_of(state: &AppState) -> Start {
     }
 }
 
+/// What `run` takes of the start on a pass of its wait: nothing once its
+/// console has closed (nobody would see a line printed into it, so a load
+/// failure is left to [`Launched`]'s drop to log), else [`start_of`].
+pub(super) fn start_seen(state: &AppState, console_closed: bool) -> Option<Start> {
+    (!console_closed).then(|| start_of(state))
+}
+
 /// What `run` prints for `start` (`Ok`: on its output, `Err`: as a
 /// failure), or `None` while it is pending.
 pub(super) fn start_line(name: &str, id: u64, start: &Start) -> Option<Result<String, String>> {
@@ -1044,7 +1051,9 @@ pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
 
     // "started" or why not; `q` or Ctrl-C stops the wait, not the app.
     loop {
-        match start_line(name, state.id, &start_of(state)) {
+        // A console closed before the load ended takes nothing.
+        let Some(start) = start_seen(state, ctx.out.closed()) else { return };
+        match start_line(name, state.id, &start) {
             Some(Ok(line)) => {
                 let _ = writeln!(ctx.out, "{line}");
                 return;

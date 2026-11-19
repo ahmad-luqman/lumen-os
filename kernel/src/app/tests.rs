@@ -581,6 +581,13 @@ crate::ktest!(
         crate::kassert_eq!(runtime::stopped_by(&launched, "test", lumen_shell::Key::Closed), None);
         drop(launched);
         crate::kassert_eq!(logged(&line(9103)), 1);
+        // The console closed before the load failed: `run`'s next pass
+        // takes nothing, so it is logged.
+        let launched = runtime::Launched { state: Arc::new(AppState::new(9105, "test")) };
+        runtime::live(&bad, &launched.state, Grants::log(), Vec::new());
+        crate::kassert!(runtime::start_seen(&launched.state, true).is_none());
+        drop(launched);
+        crate::kassert_eq!(logged(&line(9105)), 1);
         // `q`: `run` prints it, and it isn't logged.
         let launched = runtime::Launched { state: Arc::new(AppState::new(9104, "test")) };
         runtime::live(&bad, &launched.state, Grants::log(), Vec::new());
