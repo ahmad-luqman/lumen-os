@@ -624,13 +624,14 @@ crate::ktest!(
         for (stream, c, since) in [(2, cpu, 0), (-1, cpu, 0), (0, -1, 0), (0, 99, 0), (0, cpu, -1)] {
             crate::kassert_eq!(host::read_trace(stream, c, since, one), Err(Error::BadArgument));
         }
-        // Enough events on this CPU's main ring to pass one read's cap.
-        for i in 0..TRACE_EVENTS_PER_READ as u64 + 10 {
+        // Enough events on this CPU's main ring to pass one read's cap,
+        // and to lap the ring, so a read from 0 has missed some.
+        for i in 0..crate::trace::EVENTS as u64 + 10 {
             crate::ktrace!(crate::trace::Kind::Test, 0x199, i);
         }
         // Every read: a header, then whole events numbered on from
         // `since + missed`, and `next` just past the last.
-        let read = |since: u64, len: usize| -> Result<(usize, u64), &'static str> {
+        let read = |since: u64, len: usize| -> Result<(usize, u64, u64), &'static str> {
             let bytes = host::read_trace(0, cpu, since as i64, len).map_err(|_| "a read failed")?;
             if bytes.len() < HEADER_SIZE || !(bytes.len() - HEADER_SIZE).is_multiple_of(EVENT_SIZE) {
                 return Err("not a header and whole events");
@@ -645,19 +646,21 @@ crate::ktest!(
             if next != since + missed + copied as u64 {
                 return Err("next isn't since + missed + copied");
             }
-            Ok((copied, next))
+            Ok((copied, next, missed))
         };
         // Room for two: two copied.
         crate::kassert_eq!(read(0, HEADER_SIZE + 2 * EVENT_SIZE)?.0, 2);
-        // From 0 with room for everything: the cap.
-        let (copied, mut since) = read(0, usize::MAX / 2)?;
+        // From 0 with room for everything: the cap, and the numbers the
+        // ring has lapped counted missed.
+        let (copied, mut since, missed) = read(0, usize::MAX / 2)?;
         crate::kassert_eq!(copied, TRACE_EVENTS_PER_READ);
+        crate::kassert!(missed > 0);
         // A `since` past the ring's next number is refused; one at `next`
         // reads what has come since: once that is nothing, just a header.
         crate::kassert_eq!(host::read_trace(0, cpu, i64::MAX, one), Err(Error::BadArgument));
         let mut caught_up = false;
         for _ in 0..1000 {
-            let (copied, next) = read(since, usize::MAX / 2)?;
+            let (copied, next, _) = read(since, usize::MAX / 2)?;
             if copied == 0 {
                 crate::kassert_eq!(next, since);
                 caught_up = true;
