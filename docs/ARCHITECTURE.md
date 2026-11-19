@@ -4356,4 +4356,20 @@ boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, wallpaper.py (makes the wallpaper), harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml
 docs/              ARCHITECTURE.md, ROADMAP.md, STATUS.md (generated)
+apps/              the WASM apps (M5): their own cargo workspace, no_std cdylibs for wasm32-unknown-unknown, built by `make build` into build/apps/<name>.wasm
 ```
+
+**The apps' target (#196).** `wasm32-unknown-unknown` is in the pinned
+toolchain (`rust-toolchain.toml`). `apps/` is a separate workspace, so the
+host crates' `cargo test` and clippy, the kernel builds and `make audit`
+never see it; `make lint` and `make fmt` cover it. Its release profile
+keeps the name section (function names for trap reports) and drops debug
+info. rustc 1.99.1 lets itself use these WASM features for this target by
+default, as the modules' `target_features` section lists them:
+`bulk-memory` (and `bulk-memory-opt`, LLVM's name for `memory.copy` and
+`memory.fill` alone), `call-indirect-overlong` (LLVM's name for the
+`reference-types` table index encoding), `multivalue`, `mutable-globals`,
+`nontrapping-fptoint`, `reference-types` and `sign-ext`; no `simd128`, no
+threads or atomics. The kernel's `wasmi` must accept every one (#197);
+`harness:test_wasm_module::test_apps_use_only_the_default_wasm_features`
+fails on a toolchain bump that changes the list, so it gets checked again.

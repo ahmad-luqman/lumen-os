@@ -20,7 +20,7 @@ KERNEL_SRCS := $(shell find kernel crates -name '*.rs' -o -name '*.toml' -o -nam
 # their recipes must never run concurrently (`make -j`).
 .NOTPARALLEL:
 
-.PHONY: help deps build iso run debug test test-host test-scenarios audit lint fmt fmt-check status status-check census golden clean
+.PHONY: help deps build apps iso run debug test test-host test-scenarios audit lint fmt fmt-check status status-check census golden clean
 
 help: ## Show this help
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-15s %s\n", $$1, $$2}'
@@ -39,7 +39,18 @@ $(BUILD)/lumen-kernel-ktest: $(KERNEL_SRCS)
 	$(CARGO_KERNEL) --features ktest
 	@mkdir -p $(BUILD) && cp $(KERNEL_OUT) $@
 
-build: $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest ## Build both kernels
+build: $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest apps ## Build both kernels and the apps
+
+# Apps (M5): every crate under apps/ (its own workspace, see apps/Cargo.toml)
+# is a WASM module, copied to build/apps/<name>.wasm (cargo names the file
+# after the crate, `-` as `_`). Always run: cargo knows what changed.
+APP_TARGET := wasm32-unknown-unknown
+APPS       := $(patsubst apps/%/Cargo.toml,%,$(wildcard apps/*/Cargo.toml))
+
+apps: ## Build the WASM apps into build/apps/
+	cd apps && cargo build --release --target $(APP_TARGET)
+	@mkdir -p $(BUILD)/apps && for app in $(APPS); do \
+		cp target/apps/$(APP_TARGET)/release/$${app//-/_}.wasm $(BUILD)/apps/$$app.wasm; done
 
 # Bootable images:
 #   lumen.iso           interactive (`make run`)
@@ -73,7 +84,8 @@ test: test-host audit test-scenarios ## Everything CI runs: host tests, flag aud
 # never leave a stale "passed" behind for `make status`.
 RESULTS := $(BUILD)/test-results
 
-test-host: ## Host-side unit tests (Rust crates + harness self-tests)
+# The harness checks the built apps (tests/harness/test_wasm_module.py).
+test-host: apps ## Host-side unit tests (Rust crates + harness self-tests)
 	@mkdir -p $(RESULTS) && rm -f $(RESULTS)/cargo.json $(RESULTS)/harness.xml
 	cargo test
 	# The stacks tests again, optimized: compiler-reordering mistakes in the seqlock are likelier to surface.
@@ -95,18 +107,21 @@ audit: build ## Prove kernel codegen flags and image layout (no SSE/AVX, no red 
 	@mkdir -p $(RESULTS) && rm -f $(RESULTS)/audit.json
 	$(HARNESS) audit $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest
 
-lint: ## clippy on host crates (incl. their tests) and the kernel; ruff on the harness
+lint: ## clippy on host crates (incl. their tests), the kernel and the apps; ruff on the harness
 	uv run --frozen ruff check tools tests
 	cargo clippy --all-targets -- -D warnings
 	cargo clippy -p lumen-kernel --target $(TARGET) --release -- -D warnings
 	cargo clippy -p lumen-kernel --target $(TARGET) --release --features ktest -- -D warnings
+	cd apps && cargo clippy --release --target $(APP_TARGET) -- -D warnings
 
 fmt: ## Format Rust and Python
 	cargo fmt --all
+	cd apps && cargo fmt --all
 	uv run --frozen ruff format tools tests
 
 fmt-check: ## Check formatting
 	cargo fmt --all -- --check
+	cd apps && cargo fmt --all -- --check
 	uv run --frozen ruff format --check tools tests
 
 status: ## Regenerate docs/STATUS.md from the last test results

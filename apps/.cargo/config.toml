@@ -1,0 +1,8 @@
+# `cargo build` inside apps/ builds for WASM. The Makefile passes the target
+# explicitly too (it runs cargo from the repository root).
+[build]
+target = "wasm32-unknown-unknown"
+
+# Next to the root workspace's output (target/ is what CI caches), apart
+# from it: target/apps/wasm32-unknown-unknown/release/<crate>.wasm.
+target-dir = "../target/apps"

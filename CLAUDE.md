@@ -8,7 +8,7 @@ milestones with test-based exit criteria; `docs/STATUS.md` is generated.
 
 ```bash
 make deps            # pinned Limine + OVMF into build/deps (sha256-checked)
-make build           # both kernels: build/lumen-kernel, build/lumen-kernel-ktest
+make build           # both kernels: build/lumen-kernel, build/lumen-kernel-ktest; the apps: build/apps/<name>.wasm
 make run             # QEMU with a window, serial on your terminal (Ctrl-A x quits; HEADLESS=1; SOUND=1 for beep/play; DESKTOP=1 starts the desktop)
 make debug           # QEMU paused + gdb attached, stopped at kmain
 make test            # everything CI runs: host tests, flag audit, QEMU scenarios
@@ -424,9 +424,16 @@ own PR that updates that doc first.
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
   (`t=140 w=sine C4/8 r/8`), and `Source`s that fill interleaved 16-bit
   PCM buffers (host-tested).
+- `apps/`: the WASM apps (M5), their own cargo workspace (out of the root
+  one) for `wasm32-unknown-unknown`, `no_std` `cdylib`s; `make build`
+  (`make apps`) builds each into `build/apps/<name>.wasm`, and `make lint`
+  and `fmt` cover them. `hello` is the smallest (one export, no imports;
+  #196). Nothing loads them yet.
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
   are built; virtio devices through `Devices`; `press`/`type_text` for keys,
   `move_pointer`/`click` for the tablet), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,
+  `wasm.py` (a WASM module's header, types, imports, exports and custom
+  sections, `target_features` among them: the built apps checked),
   `crash.py` (crash-report parsing), `audio.py` (wav files as QEMU's
   wav audiodev writes them: pitch by zero crossings, Goertzel amplitude),
   `screen.py` (the screen's rows through the serial shell's `term text`, a

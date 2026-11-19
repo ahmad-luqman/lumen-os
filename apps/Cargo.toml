@@ -1,0 +1,32 @@
+# Lumen's apps (M5): WASM modules for `wasm32-unknown-unknown`, run by the
+# kernel's `wasmi` (docs/ARCHITECTURE.md). Their own workspace, outside the
+# root one, so the host crates' `cargo test`/`clippy` and the kernel's builds
+# never see them. `make build` builds every app into build/apps/<name>.wasm.
+[workspace]
+resolver = "3"
+members = ["hello"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/ahmad-luqman/lumen-os"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.dev]
+panic = "abort"
+
+# Apps are always built with the release profile. Interpreted, so fewer
+# instructions matter more than size; the name section stays (symbols kept)
+# so a trap can name the function it happened in.
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+debug = false
+strip = "debuginfo"
