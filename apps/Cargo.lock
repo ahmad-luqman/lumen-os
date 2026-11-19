@@ -3,5 +3,61 @@
 version = 4
 
 [[package]]
-name = "hello"
+name = "lumen-app-api"
 version = "0.0.1"
+dependencies = [
+ "lumen-trace",
+]
+
+[[package]]
+name = "lumen-trace"
+version = "0.0.1"
+
+[[package]]
+name = "test-abuse"
+version = "0.0.1"
+dependencies = [
+ "testkit",
+]
+
+[[package]]
+name = "test-busy"
+version = "0.0.1"
+dependencies = [
+ "testkit",
+]
+
+[[package]]
+name = "test-greedy"
+version = "0.0.1"
+dependencies = [
+ "testkit",
+]
+
+[[package]]
+name = "test-hello"
+version = "0.0.1"
+dependencies = [
+ "testkit",
+]
+
+[[package]]
+name = "test-nocap"
+version = "0.0.1"
+dependencies = [
+ "testkit",
+]
+
+[[package]]
+name = "test-trap"
+version = "0.0.1"
+dependencies = [
+ "testkit",
+]
+
+[[package]]
+name = "testkit"
+version = "0.0.1"
+dependencies = [
+ "lumen-app-api",
+]

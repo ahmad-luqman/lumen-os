@@ -304,6 +304,7 @@ dependencies = [
  "limine",
  "log",
  "lumen-acpi",
+ "lumen-app-api",
  "lumen-demo",
  "lumen-elf",
  "lumen-font",

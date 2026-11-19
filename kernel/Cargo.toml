@@ -18,6 +18,7 @@ ktest = []
 
 [dependencies]
 lumen-acpi.workspace = true
+lumen-app-api.workspace = true
 lumen-demo.workspace = true
 lumen-elf.workspace = true
 lumen-font.workspace = true

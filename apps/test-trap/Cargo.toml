@@ -1,0 +1,21 @@
+[package]
+name = "test-trap"
+description = "A test app for the app runtime (#199): ends by a trap or a panic: `unreachable`, `panic` (a message with a newline and a control character), `depth` (recursion past the call depth)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+# A WASM module has no host-side tests: the kernel's runtime runs it
+# (tests/scenarios/test_apps.py).
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+testkit.workspace = true
+
+[lints]
+workspace = true

@@ -5,9 +5,11 @@
 # build/apps/<name>.wasm.
 [workspace]
 resolver = "3"
-# Every directory is an app, named after its crate (`make apps` copies one
-# .wasm per apps/*/; the harness checks the names). Not dot directories
-# (.cargo, an editor's): cargo's `*` would match them too.
+# Every directory is a crate named after it (the harness checks the names):
+# an app (a `cdylib`, which `make apps` copies: `test-<name>` to
+# build/apps/tests/<name>.wasm, the others to build/apps/<name>.wasm) or a
+# library the apps share (`testkit`). Not dot directories (.cargo, an
+# editor's): cargo's `*` would match them too.
 members = ["[!.]*"]
 
 [workspace.package]
@@ -15,6 +17,11 @@ version = "0.0.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/ahmad-luqman/lumen-os"
+
+# Crates the apps share with the kernel: path dependencies on crates/.
+[workspace.dependencies]
+lumen-app-api = { path = "../crates/lumen-app-api" }
+testkit = { path = "testkit" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

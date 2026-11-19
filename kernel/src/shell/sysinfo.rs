@@ -79,7 +79,8 @@ pub type MakeTable = fn(&[String]) -> Option<Result<pipe::Table, String>>;
 
 /// The system commands that give records in a pipeline (instead of their
 /// text), and the tables they give.
-pub const RECORDS: [(&str, MakeTable); 11] = [
+pub const RECORDS: [(&str, MakeTable); 12] = [
+    ("apps", crate::app::records),
     ("cpus", |a| no_args(a, cpu_table)),
     ("desktop", crate::desktop::records),
     ("irqs", |a| no_args(a, vector_table)),
