@@ -87,10 +87,7 @@ crate::ktest!(
         // (signed ones zigzagged), a `u8` as its one byte, a string as its
         // length then its bytes, an enum as its variant's position then its
         // fields.
-        round_trips(
-            Sample { id: 300, name: String::from("hi"), flags: 200 },
-            &[0xac, 0x02, 0x02, b'h', b'i', 0xc8],
-        )?;
+        round_trips(Sample { id: 300, name: String::from("hi"), flags: 200 }, &[0xac, 0x02, 0x02, b'h', b'i', 0xc8])?;
         round_trips(Shape::Unit, &[0x00])?;
         round_trips(Shape::Point(-1, 2), &[0x01, 0x01, 0x04])?;
         round_trips(Shape::Named { w: 128 }, &[0x02, 0x80, 0x01])?;
