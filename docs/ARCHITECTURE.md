@@ -4405,4 +4405,25 @@ boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, wallpaper.py (makes the wallpaper), harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml
 docs/              ARCHITECTURE.md, ROADMAP.md, STATUS.md (generated)
+apps/              the WASM apps (M5): their own cargo workspace, no_std cdylibs for wasm32-unknown-unknown, built by `make build` into build/apps/<name>.wasm
 ```
+
+**The apps' target (#196).** `wasm32-unknown-unknown` is in the pinned
+toolchain (`rust-toolchain.toml`). `apps/` is a separate workspace (every
+directory in it but dot ones a member, each named after its crate; the
+root workspace excludes it; output in `target-apps/`), so the host
+crates' `cargo test` and clippy and the kernel builds never see it; `make
+lint` and `make fmt` cover it. `make build` builds the apps, so `make
+audit` (which runs `build`) does too, but the audit's checks look only at
+the kernels. The default release profile keeps the name section (function
+names for trap reports). The harness validates each built module with
+`wasmtime` with the proposals past rustc's defaults that wasmtime-py can
+switch off switched off (SIMD, threads, tail calls, memory64, ...;
+extended-const has no switch, so only the next check catches it), runs
+hello's `answer`, and checks that each module's `target_features`
+section lists exactly rustc 1.99.1's default features for this target: the
+list is `DEFAULT_FEATURES` in `tests/harness/test_wasm_module.py` (six that
+`rustc --print cfg --target wasm32-unknown-unknown` shows, and two more
+that LLVM's generic CPU enables). The kernel's `wasmi` will have to accept every one (#197); a
+toolchain bump that changes the list fails that test, so it gets checked
+again.
