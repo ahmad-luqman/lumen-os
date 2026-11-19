@@ -1,0 +1,18 @@
+[package]
+name = "testkit"
+description = "What Lumen's test apps share (#199): the `lumen` imports, a log helper, the manifest macro, a panic handler that reports through `panic`, and a bump allocator. Not an app (an rlib: `make apps` copies only cdylibs); the real SDK is #206's lumen-app."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+lumen-app-api.workspace = true
+
+[lints]
+workspace = true

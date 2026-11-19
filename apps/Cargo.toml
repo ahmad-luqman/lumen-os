@@ -1,13 +1,15 @@
 # Lumen's apps (M5): WASM modules for `wasm32-unknown-unknown`, to be run by
 # the kernel's `wasmi` (#197, #199). Their own workspace, outside the root
 # one (which excludes apps/), so the host crates' `cargo test`/`clippy` and
-# the kernel's builds never see them. `make build` builds every app into
-# build/apps/<name>.wasm.
+# the kernel's builds never see them. `make build` builds them; the layout
+# (where each module goes, the test apps) is ARCHITECTURE section 8's
+# "Building and bundling".
 [workspace]
 resolver = "3"
-# Every directory is an app, named after its crate (`make apps` copies one
-# .wasm per apps/*/; the harness checks the names). Not dot directories
-# (.cargo, an editor's): cargo's `*` would match them too.
+# Every directory is a crate named after it (the harness checks the names):
+# an app (a `cdylib`, which `make apps` copies) or a library the apps share
+# (`testkit`). Not dot directories (.cargo, an
+# editor's): cargo's `*` would match them too.
 members = ["[!.]*"]
 
 [workspace.package]
@@ -15,6 +17,11 @@ version = "0.0.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/ahmad-luqman/lumen-os"
+
+# Crates the apps share with the kernel: path dependencies on crates/.
+[workspace.dependencies]
+lumen-app-api = { path = "../crates/lumen-app-api" }
+testkit = { path = "testkit" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

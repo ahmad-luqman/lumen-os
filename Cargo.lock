@@ -261,6 +261,13 @@ name = "lumen-acpi"
 version = "0.0.1"
 
 [[package]]
+name = "lumen-app-api"
+version = "0.0.1"
+dependencies = [
+ "lumen-trace",
+]
+
+[[package]]
 name = "lumen-demo"
 version = "0.0.1"
 
@@ -297,6 +304,7 @@ dependencies = [
  "limine",
  "log",
  "lumen-acpi",
+ "lumen-app-api",
  "lumen-demo",
  "lumen-elf",
  "lumen-font",

@@ -1,9 +1,16 @@
-//! WASM apps (M5). So far: `wasmi` linked into the kernel and running a
-//! module in fuel slices (#197), checked by the `wasm` command and its
-//! ktests over hand-assembled modules (`modules`). The app runtime (#199)
-//! takes from [`run_bounded`] its refuel rule (at least what the next
-//! instruction needs) and its `Config` (eager compilation), not this loop
-//! itself: its slices end on kills, closed windows and host calls too.
+//! WASM apps (M5; ARCHITECTURE section 8). The runtime (#199) is
+//! [`runtime`]: the table of running apps, loading one on its own thread,
+//! its fuel slices, kill, the reaper, and the shell's `apps`, `run` and
+//! `kill`; [`host`] defines the `lumen` host functions. The apps `make
+//! apps` built are embedded by `kernel/build.rs` as [`BUNDLED`] and
+//! [`TEST_APPS`].
+//!
+//! Below, #197's checks: `wasmi` running a module in fuel slices, checked
+//! by the `wasm` command and its ktests over hand-assembled modules
+//! (`modules`). The runtime takes from [`run_bounded`] its refuel rule (at
+//! least what the instruction that ran out needs) and eager compilation,
+//! not this loop itself: its slices end on kills and blocking host calls
+//! too.
 //!
 //! wasmi interprets on the calling thread's own stack: its value and call
 //! stacks are on the heap, so a module's recursion is bounded by
@@ -14,9 +21,27 @@
 //! `portable-dispatch` is on. A module's start function would run inside
 //! instantiation, outside any slice; these modules have none.
 
+mod host;
 mod modules;
+mod runtime;
+#[cfg(feature = "ktest")]
+mod tests;
 #[cfg(feature = "ktest")]
 mod wire;
+
+pub use runtime::{apps, kill, run, table};
+
+/// An app embedded in the kernel: its name (its file's stem), the name its
+/// thread runs under (`app:<name>`), and its module's bytes.
+pub struct App {
+    pub name: &'static str,
+    pub thread: &'static str,
+    pub module: &'static [u8],
+}
+
+// `BUNDLED` (build/apps/*.wasm) and `TEST_APPS` (build/apps/tests/*.wasm),
+// each sorted by name: written by kernel/build.rs.
+include!(concat!(env!("OUT_DIR"), "/apps.rs"));
 
 use crate::shell::Ctx;
 use alloc::format;

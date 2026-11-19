@@ -1,8 +1,11 @@
-"""The apps/ workspace's output (#196): `make build` builds every app into
-build/apps/<name>.wasm; each is a valid WASM module (wasmtime validates it,
-the later proposals it can switch off switched off) using only rustc's
-default WASM features, and hello exports what it says and returns what it
-says. Also lumen_harness.wasm's engine and custom-section reader, on
+"""The apps/ workspace's output (#196, #199): `make build` builds every app
+(a crate building a `cdylib`) into build/apps/<name>.wasm, the runtime's
+test apps (`test-<name>`) into build/apps/tests/<name>.wasm; each is a valid
+WASM module (wasmtime validates it, the later proposals it can switch off
+switched off) using only rustc's default WASM features, importing only the
+kernel's `lumen` functions, exporting `memory` (fixed: its maximum its
+initial size) and `lumen_main: [] -> [i32]`, with a `lumen.manifest`
+section. Also lumen_harness.wasm's engine and custom-section reader, on
 handcrafted modules."""
 
 import re
@@ -43,14 +46,27 @@ DEFAULT_FEATURES = {
 }
 
 
-def app_names() -> list[str]:
+def crates() -> list[str]:
+    """Every crate in apps/: its directory's name."""
     names = sorted(p.parent.name for p in (REPO_ROOT / "apps").glob("*/Cargo.toml"))
+    assert names, "apps/ has no crates"
+    return names
+
+
+def app_names() -> list[str]:
+    """The crates that are apps (build a `cdylib`); libraries like testkit
+    aren't."""
+    names = [
+        c for c in crates() if '"cdylib"' in (REPO_ROOT / "apps" / c / "Cargo.toml").read_text()
+    ]
     assert names, "apps/ has no apps"
     return names
 
 
-def built(name: str) -> bytes:
-    path = APPS / f"{name}.wasm"
+def built(crate: str) -> bytes:
+    """An app crate's module, where `make apps` copies it."""
+    name = crate.removeprefix("test-")
+    path = APPS / "tests" / f"{name}.wasm" if crate.startswith("test-") else APPS / f"{crate}.wasm"
     assert path.exists(), f"{path} is missing: `make build` (or `make test-host`) builds it"
     return path.read_bytes()
 
@@ -61,19 +77,28 @@ def test_every_app_validates_with_the_switchable_later_proposals_off():
         compile_module(built(name), eng)
 
 
-def test_hello_exports_answer_returning_42():
+def test_every_app_imports_lumen_and_exports_lumen_main():
+    # The app interface (ARCHITECTURE section 8): `lumen` functions only;
+    # `memory`, fixed, and `lumen_main: [] -> [i32]`; a manifest.
     eng = engine()
-    module = compile_module(built("hello"), eng)
-    assert module.imports == []
-    exports = {e.name: e.type for e in module.exports}
-    assert set(exports) == {"memory", "answer"}
-    assert isinstance(exports["memory"], wasmtime.MemoryType)
-    answer = exports["answer"]
-    assert isinstance(answer, wasmtime.FuncType)
-    assert (answer.params, answer.results) == ([], [wasmtime.ValType.i32()])
-    store = wasmtime.Store(eng)
-    instance = wasmtime.Instance(store, module, [])
-    assert instance.exports(store)["answer"](store) == 42
+    i32 = wasmtime.ValType.i32()
+    for name in app_names():
+        data = built(name)
+        module = compile_module(data, eng)
+        assert module.imports, name
+        for imp in module.imports:
+            assert imp.module == "lumen", (name, imp.module, imp.name)
+            assert isinstance(imp.type, wasmtime.FuncType), (name, imp.name)
+        exports = {e.name: e.type for e in module.exports}
+        assert set(exports) == {"memory", "lumen_main"}, name
+        main = exports["lumen_main"]
+        assert isinstance(main, wasmtime.FuncType)
+        assert (main.params, main.results) == ([], [i32]), name
+        memory = exports["memory"]
+        assert isinstance(memory, wasmtime.MemoryType)
+        assert memory.limits.max == memory.limits.min, name
+        manifest = custom_section(data, "lumen.manifest")
+        assert manifest is not None and manifest.startswith(b"caps="), name
 
 
 def test_every_app_uses_only_the_default_wasm_features():
@@ -87,14 +112,14 @@ def test_every_app_keeps_its_function_names():
     # The release profile keeps the name section, so a trap can name its function.
     for name in app_names():
         assert function_names(built(name)), name
-    assert "answer" in function_names(built("hello")).values()
+    assert "lumen_main" in function_names(built("test-hello")).values()
 
 
 def test_every_app_is_named_after_its_directory():
     # `make apps` copies target-apps/.../<dir>.wasm: a crate or [lib] named
     # otherwise would leave that file stale (or missing) while cargo builds
     # another one.
-    for name in app_names():
+    for name in crates():
         manifest = tomllib.loads((REPO_ROOT / "apps" / name / "Cargo.toml").read_text())
         assert manifest["package"]["name"] == name
         assert "name" not in manifest.get("lib", {}), name

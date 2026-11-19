@@ -1,0 +1,21 @@
+[package]
+name = "test-busy"
+description = "A test app for the app runtime (#199): loops forever without a host call (preempted, killed); with `sleep`, sleeps forever in time_sleep."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+# A WASM module has no host-side tests: the kernel's runtime runs it
+# (tests/scenarios/test_apps.py).
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+testkit.workspace = true
+
+[lints]
+workspace = true

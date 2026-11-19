@@ -113,6 +113,10 @@ const fn px(n: u16) -> Px {
 /// desktop take, so a redraw hits.
 const TEXT_CACHE_BYTES: usize = 128 * 1024;
 
+// An app's glyph cache (#206) is charged as `GLYPH_CACHE_BYTES`: the two
+// must agree.
+const _: () = assert!(TEXT_CACHE_BYTES as u64 == lumen_app_api::limits::GLYPH_CACHE_BYTES);
+
 /// Glyphs [`Text::draw`] left out because `lumen_gfx::Mask::new` refused
 /// their mask (a bug in `lumen-font`: its masks are always their size),
 /// counted for `desktop status` (`glyphs_dropped`); the first is warned

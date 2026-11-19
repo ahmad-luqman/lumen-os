@@ -1,7 +1,7 @@
 # Features: WASM apps (M5). See tests/features/README.md for the format.
 
 [[feature]]
-name = "Apps build for wasm32-unknown-unknown with the pinned toolchain (`make build`: build/apps/<name>.wasm), as WASM modules exporting what they say, using only rustc's default WASM features"
+name = "Apps build for wasm32-unknown-unknown with the pinned toolchain (`make build`: build/apps/<name>.wasm, the runtime's test apps build/apps/tests/<name>.wasm), as WASM modules using only rustc's default WASM features, importing only `lumen` functions, exporting a fixed `memory` and `lumen_main`, with a manifest"
 milestone = "M5"
 tests = [
     "harness:test_wasm_module::*",
@@ -27,4 +27,54 @@ milestone = "M5"
 tests = [
     "ktest:lumen_kernel::app::wire::postcard_round_trips_derived_types",
     "audit:flags",
+]
+
+[[feature]]
+name = "WASM apps load and run within fixed limits (#199): `lumen-app-api`'s types (error codes, kinds and grants, the manifest parser, the limits with each app's worst case checked against the budget at compile time, the handle table, range checks, log text, end reasons); a module is refused at load, naming why, for an import beyond the `lumen` functions or with another signature, an imported memory, table or global, a second memory or table, a start section, a missing or mistyped `memory` or `lumen_main`, a memory that isn't fixed or is past its limit, a table past its limit, no manifest or two, an unknown grant, a module too big, or invalid wasm, each with its reason, the heap left as it was; every host function defined with its listed signature; `run` refuses too long arguments, a NUL or an unknown app before taking a slot or an id; running out of memory at instantiation is `not enough memory`; compiled code within its charge, a fixed memory and the value stack each allocated once at their full size, by the heap's high-water mark; every host call costs `CALL_FUEL`, refused or not, however many run in one block (a slice ends at a call with too little left; a saturated charge is carried as debt), a log line and its bytes and a trace read's events their extra fuel; `run` starts an app on its own thread in fuel slices, `apps` lists it with its slices growing, the shell answers meanwhile, and `run` refuses past the slots and never reuses an id"
+milestone = "M5"
+tests = [
+    "cargo:lumen-app-api",
+    "ktest:lumen_kernel::app::tests::load_refuses_bad_modules",
+    "ktest:lumen_kernel::app::tests::every_host_function_is_defined_as_listed",
+    "ktest:lumen_kernel::app::tests::launch_refuses_before_taking_a_slot",
+    "ktest:lumen_kernel::app::tests::running_out_of_memory_is_not_enough_memory",
+    "ktest:lumen_kernel::app::tests::the_heaps_peak_follows_its_use",
+    "ktest:lumen_kernel::app::tests::compiled_code_fits_its_charge",
+    "ktest:lumen_kernel::app::tests::a_fixed_memory_is_allocated_once",
+    "ktest:lumen_kernel::app::tests::the_value_stack_is_allocated_once_at_its_full_size",
+    "ktest:lumen_kernel::app::tests::host_calls_charge_their_fuel",
+    "ktest:lumen_kernel::app::tests::host_calls_cost_fuel_however_many_in_one_block",
+    "scenario:test_apps::test_hello_wasm",
+    "scenario:test_apps::test_busy_app_is_preempted",
+    "scenario:test_apps::test_run_refuses_past_max_apps",
+]
+
+[[feature]]
+name = "Host calls without a window and capability handles (#199): every call checks the kill flag (a kill seen there ending the app, never as a trap), the handle and its kind, then its ranges, then its content, and writes nothing when it refuses; a grant `run --without` withholds is `NotGranted`, a made-up or closed handle `BadHandle`, a handle of another kind `WrongKind`, handles never reused; text past its cap, bad UTF-8, bad levels and negative sleeps are `BadArgument`; `time_wall` reads the RTC; `trace_read` refuses bad streams, CPUs and sequence numbers and copies at most its cap, its events numbered on from where it was asked and its header agreeing with what it copied; a log line is cut at 256 bytes on a char boundary and can't forge another line, with a control character or a Unicode line separator"
+milestone = "M5"
+tests = [
+    "cargo:lumen-app-api",
+    "ktest:lumen_kernel::app::tests::trace_read_edges",
+    "ktest:lumen_kernel::app::tests::a_kill_at_a_host_call_is_never_a_trap",
+    "scenario:test_apps::test_app_without_capability_is_not_granted",
+    "scenario:test_apps::test_handles_refuse_wrong_kind_and_closed",
+    "scenario:test_apps::test_host_calls_refuse_bad_arguments",
+    "scenario:test_apps::test_app_log_is_cut_and_sanitised",
+]
+
+[[feature]]
+name = "WASM apps end cleanly (#199): one outcome, the first recorded, and one line; a kill seen at a host call's entry is never reported as a trap, however the call was made and on whichever slice; a kill while loading runs nothing and gives back what loading took; a load failure is kept for the `run` waiting for it and logged once otherwise (a closed console included); `run` prints one line for each way a start goes; `kill` says killed, had already ended, or where the app still is; a trap, a panic (its message unable to forge a line, a bad pointer or a too long one read safely), memory past its fixed limit and recursion past the call depth each end only the app with one WARN, the shell working and the heap given back, as after a kill or an exit; `kill` wakes an app blocked in `time_sleep`, ends it and its thread is joined; a reaper whose spawn failed is started by a later `run`, which joins the apps that ended meanwhile"
+milestone = "M5"
+tests = [
+    "cargo:lumen-app-api",
+    "ktest:lumen_kernel::app::tests::a_kill_at_a_host_call_is_never_a_trap",
+    "ktest:lumen_kernel::app::tests::a_kill_at_a_resume_is_never_a_trap",
+    "ktest:lumen_kernel::app::tests::a_kill_while_loading_runs_nothing",
+    "ktest:lumen_kernel::app::tests::a_load_failure_is_kept_for_its_watcher",
+    "ktest:lumen_kernel::app::tests::a_load_failure_nobody_takes_is_logged_once",
+    "ktest:lumen_kernel::app::tests::run_prints_one_line_per_start",
+    "ktest:lumen_kernel::app::tests::kill_says_where_the_app_is",
+    "ktest:lumen_kernel::app::tests::a_reaper_that_failed_to_start_is_started_by_a_later_run",
+    "scenario:test_apps::test_app_trap_kills_app_not_kernel",
+    "scenario:test_apps::test_kill_wakes_a_waiting_app",
 ]

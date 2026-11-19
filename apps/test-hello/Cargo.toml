@@ -1,0 +1,21 @@
+[package]
+name = "test-hello"
+description = "A test app for the app runtime (#199): logs a line and exits 0; with `log`, a line past LOG_BYTES and one trying to forge a log line; with `exit N`, calls exit."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+# A WASM module has no host-side tests: the kernel's runtime runs it
+# (tests/scenarios/test_apps.py).
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+testkit.workspace = true
+
+[lints]
+workspace = true

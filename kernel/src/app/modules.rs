@@ -173,7 +173,7 @@ pub fn large_body(adds: u32) -> Vec<u8> {
 
 /// `v` as unsigned LEB128.
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by ktests
-fn leb128(out: &mut Vec<u8>, mut v: u32) {
+pub(super) fn leb128(out: &mut Vec<u8>, mut v: u32) {
     loop {
         let byte = (v & 0x7f) as u8;
         v >>= 7;

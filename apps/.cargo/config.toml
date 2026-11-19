@@ -7,3 +7,9 @@ target = "wasm32-unknown-unknown"
 # target/ by the root's packages):
 # target-apps/wasm32-unknown-unknown/release/<crate>.wasm.
 target-dir = "../target-apps"
+
+# Every app's memory is fixed (ARCHITECTURE section 8): its initial size is
+# its maximum, 2 MiB (wasm-ld's 1 MiB stack, the data, testkit's heap). One
+# setting for every module here; #206's template may give an app its own.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--initial-memory=2097152", "-C", "link-arg=--max-memory=2097152"]

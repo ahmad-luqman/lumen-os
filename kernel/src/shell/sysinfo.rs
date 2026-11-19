@@ -79,7 +79,8 @@ pub type MakeTable = fn(&[String]) -> Option<Result<pipe::Table, String>>;
 
 /// The system commands that give records in a pipeline (instead of their
 /// text), and the tables they give.
-pub const RECORDS: [(&str, MakeTable); 11] = [
+pub const RECORDS: [(&str, MakeTable); 12] = [
+    ("apps", |a| no_args(a, crate::app::table)),
     ("cpus", |a| no_args(a, cpu_table)),
     ("desktop", crate::desktop::records),
     ("irqs", |a| no_args(a, vector_table)),
@@ -974,9 +975,11 @@ crate::ktest!(
                 crate::ktest::diag(format_args!("{name} {args:?}: {rows} rows"));
                 // (`sound` has a row only with a device, and the ktest
                 // machine has none: `sound::the_record_fits_its_columns`
-                // checks one. The rings may be empty: nothing typed or
-                // moved, though other ktests push keys.)
-                kassert!(rows > 0 || name == "sound" || !args.is_empty());
+                // checks one. `apps` has a row per running app, and none
+                // runs here: test_apps' scenarios read its rows. The rings
+                // may be empty: nothing typed or moved, though other
+                // ktests push keys.)
+                kassert!(rows > 0 || name == "sound" || name == "apps" || !args.is_empty());
             }
         }
         // Rows of both rings fit their columns (events of a ring of our own,

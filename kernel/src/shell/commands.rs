@@ -102,6 +102,21 @@ pub static COMMANDS: Table<Run> = Table(&[
         run: crate::app::command,
     },
     Command {
+        name: "apps",
+        args: &[],
+        usage: "",
+        about: "the WASM apps running: id, name, state, thread, fuel, slices, memory (KiB), windows",
+        run: crate::app::apps,
+    },
+    Command {
+        name: "run",
+        args: &[&["--without"]],
+        usage: "[--without <grant>] <app> [args...]",
+        about: "start a WASM app (alone: the bundled apps' names)",
+        run: crate::app::run,
+    },
+    Command { name: "kill", args: &[], usage: "<id>", about: "end a WASM app", run: crate::app::kill },
+    Command {
         name: "desktop",
         args: &[&["status", "check", "spin", "counter", "tick", "hold", "release"]],
         usage: "[status|check|spin|counter|tick|hold <window>|release <window>]",

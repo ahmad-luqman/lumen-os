@@ -38,6 +38,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::fmt::{self, Write};
 use core::ops::Range;
 use core::ptr::{self, NonNull};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use lumen_heap::{CheckError, FreeList, Heap, Stats};
 use lumen_mm::FRAME_SIZE;
@@ -73,6 +74,11 @@ struct State {
 }
 
 static STATE: SpinLock<State> = SpinLock::new(State { heap: Heap::empty(), window: None, last_failure: None });
+
+/// The most bytes in use since the last [`reset_peak`] (or boot): updated
+/// under the heap's lock on every allocation, so nothing between two reads
+/// can pass it unseen (#199: the apps' charges are checked against it).
+static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 /// A failed growth: why, and for what request.
 #[derive(Clone, Copy, Debug)]
@@ -146,11 +152,19 @@ struct KernelAllocator;
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         debug_assert!(!crate::term::drawing_here(), "allocation under the screen's lock");
+        #[cfg(feature = "ktest")]
+        if layout.size() >= REFUSE_FROM.load(Ordering::Relaxed) {
+            return ptr::null_mut();
+        }
         let mut state = STATE.lock();
         if let Some(p) = state.heap.alloc(layout) {
+            note_peak(&state);
             return p.as_ptr();
         }
         let grown = grow(&mut state, layout).map(|()| state.heap.alloc(layout));
+        if let Ok(Some(_)) = grown {
+            note_peak(&state);
+        }
         drop(state); // panic without the lock: the crash line reads a consistent heap
         let (size, align) = (layout.size(), layout.align());
         match grown {
@@ -231,6 +245,36 @@ impl From<window::WindowError> for GrowError {
             window::WindowError::Map(e) => GrowError::Map(e),
         }
     }
+}
+
+/// ktest seam: allocations of at least this many bytes are refused (null),
+/// as when the heap runs out; `usize::MAX`: none.
+#[cfg(feature = "ktest")]
+static REFUSE_FROM: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Refuse every allocation of at least `bytes` (`usize::MAX`: none again),
+/// for a ktest of a caller that copes with running out.
+#[cfg(feature = "ktest")]
+pub fn refuse_from(bytes: usize) {
+    REFUSE_FROM.store(bytes, Ordering::Relaxed);
+}
+
+/// Raise [`PEAK`] to what is in use now (the heap's lock held).
+fn note_peak(state: &State) {
+    PEAK.fetch_max(state.heap.stats().used, Ordering::Relaxed);
+}
+
+/// The most bytes the heap has had in use since the last [`reset_peak`].
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests
+pub fn peak() -> usize {
+    PEAK.load(Ordering::Relaxed)
+}
+
+/// Start [`peak`] again from what is in use now.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests
+pub fn reset_peak() {
+    let state = STATE.lock();
+    PEAK.store(state.heap.stats().used, Ordering::Relaxed);
 }
 
 /// The heap's counters (O(1)).
