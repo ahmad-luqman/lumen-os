@@ -3437,28 +3437,31 @@ SSE); #197 checks the results' bits.
 
 #### Building and bundling
 
-- **`apps/`** is its own Cargo workspace (members `[!.]*`, the root
-  workspace excludes it; #196), built for `wasm32-unknown-unknown` with
-  `--release`, its `Cargo.lock` committed and every dependency pinned
-  with `=`. It holds `lumen-app` (the SDK, a library) and `template`
-  (#206), one directory per bundled app, and the runtime's test apps as
-  `apps/test-<name>` (#199: `hello`, `busy`, `trap`, `greedy`, `nocap`,
-  `abuse`; #199 moves #196's `hello` there). Test apps can't live under
-  `apps/tests/`: cargo's member glob would take `tests` itself as a
-  member, and excluding it also excludes `tests/*`. Crates the apps share
-  with the kernel (`lumen-app-api`, `lumen-ui`, `lumen-demo`, ...) are
-  path dependencies on `crates/`.
-- **`make apps`** copies each crate's `cdylib` (a library makes none):
-  `build/apps/<name>.wasm`, and the test apps to
-  `build/apps/tests/<name>.wasm`. The kernel build depends on it and
-  `KERNEL_SRCS` includes `apps/`. `kernel/build.rs` embeds both sets in
-  both kernels, sorted by name, as `app::BUNDLED` and `app::TEST_APPS`
-  (`&[App]`, `App { name, thread, module }`, `thread` the `app:<name>`
-  string); it refuses a stem outside `[a-z0-9_-]` or one in both sets,
-  and a missing `build/apps` (`make lint` runs before `make build` in
-  CI) gives empty lists, said in a build warning.
-  `harness:test_wasm_module::*` (#196) runs after the apps are built.
-  `make app NAME=foo` (#206) copies `apps/template` to `apps/foo`.
+- **On main (#196):** `apps/` is its own Cargo workspace (members
+  `[!.]*`, so every directory but a dot directory is a crate; the root
+  workspace excludes it), built for `wasm32-unknown-unknown` with
+  `--release` into `target-apps/`, its `Cargo.lock` committed. `make
+  apps` (part of `make build`) copies one module per `apps/*/` crate to
+  `build/apps/<name>.wasm`, and `harness:test_wasm_module::*` checks
+  them after they are built (section 16).
+- **What #199 changes on top:** the test apps become `apps/test-<name>`
+  (`hello`, `busy`, `trap`, `greedy`, `nocap`, `abuse`; #196's `hello`
+  moves there and exports `lumen_main`). They can't live under
+  `apps/tests/`: the member glob would take `tests` itself as a member,
+  and excluding it also excludes `tests/*`. `make apps` copies only
+  crates that build a `cdylib` (#206's `lumen-app` library makes none),
+  and the test apps to `build/apps/tests/<name>.wasm`. The kernel build
+  depends on `make apps`, and `KERNEL_SRCS` includes `apps/`.
+  `kernel/build.rs` embeds both sets in both kernels, sorted by name, as
+  `app::BUNDLED` and `app::TEST_APPS` (`&[App]`, `App { name, thread,
+  module }`, `thread` the `app:<name>` string); it refuses a stem
+  outside `[a-z0-9_-]` or one in both sets, and a missing `build/apps`
+  (`make lint` runs before `make build` in CI) gives empty lists, said
+  in a build warning. Every dependency in `apps/` is pinned with `=`.
+  Crates the apps share with the kernel (`lumen-app-api`, `lumen-ui`,
+  `lumen-demo`, ...) are path dependencies on `crates/`. #206 adds
+  `lumen-app`, `template` and `make app NAME=foo` (a copy of
+  `apps/template` as `apps/foo`).
 - **The launcher** (#157's taskbar) lists the bundled apps whose
   manifest lists `desktop`, never the test apps, and starts one through
   `run`'s path. Its Life item starts the Life app (#202, which updates
@@ -4963,7 +4966,6 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/shell/       the shells (lumen-shell): serial and the virtual terminals' consoles, the commands, system commands (sysinfo.rs), deliberate faults (crash.rs)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
-apps/              WASM apps (#196): their own Cargo workspace for wasm32-unknown-unknown; lumen-app (the SDK), template, one directory per bundled app, tests/ (the runtime's test apps)
 crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-gfx, lumen-acpi, lumen-pci, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, lumen-font, lumen-png, lumen-wm, lumen-app-api (the app interface's types, also built for wasm32), ...)
 assets/fonts/      the desktop's UI font (Atkinson Hyperlegible, SIL OFL 1.1) with its licence and source
 assets/wallpaper/  the desktop's wallpaper (original, made by tools/wallpaper.py; README.md)
