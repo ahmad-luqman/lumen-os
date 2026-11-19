@@ -14,6 +14,7 @@ line and its thread's join.
 import re
 
 from lumen_harness.gui import parse_records, poll
+from lumen_harness.klog import STAMP
 from lumen_harness.screen import PROMPT
 from lumen_harness.shell import heap_line, run, wait_for_output
 
@@ -81,7 +82,16 @@ def kill(m, app_id: int, name: str, allow: str | None = None) -> None:
 
 
 def end_line(m, mark: int, name: str, app_id: int, what: str, level: str = "INFO") -> None:
-    wait_for_output(m, mark, rf"{level}  app: {re.escape(name)} \(app {app_id}\) {what}\n", 30)
+    """Until the app's end line: a whole log line, from its stamp (at a
+    line's start, or right after the prompt it interrupted) to its end, so
+    no app's own log text can stand in for it."""
+    start = rf"(?:^|{re.escape(PROMPT)})"
+    wait_for_output(
+        m,
+        mark,
+        rf"(?m){start}{STAMP} {level}  app: {re.escape(name)} \(app {app_id}\) {what}$",
+        30,
+    )
 
 
 def test_hello_wasm(boot):
@@ -198,9 +208,7 @@ def test_app_trap_kills_app_not_kernel(boot):
     assert abs(after - before) <= 4096, (before, after)
     # Each ending gave exactly one WARN (its end line), and nothing an ERROR.
     serial = m.output[start_at:]
-    assert len(re.findall(r"WARN  app: (?:trap|greedy) \(app \d+\) ended", serial)) == 2 * len(
-        cases
-    )
+    assert len(re.findall(TRAP_ENDS, serial)) == 2 * len(cases)
     assert "ERROR" not in serial
     assert not re.search(r"^\[[ .\d]+\] WARN  app: forged", serial, re.MULTILINE)
 

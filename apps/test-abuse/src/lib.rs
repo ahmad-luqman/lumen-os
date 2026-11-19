@@ -20,7 +20,8 @@ extern crate alloc;
 use alloc::format;
 use alloc::vec;
 use testkit::api::limits::TEXT_BYTES;
-use testkit::{Error, Grant, host, info, log_handle, named, ptr};
+use testkit::api::trace::{EVENT_SIZE, HEADER_SIZE, decode_event, decode_header};
+use testkit::{Error, Grant, find, host, info, log_handle, named, ptr};
 
 testkit::manifest!(b"caps=time,trace");
 
@@ -33,7 +34,8 @@ struct Checks {
 }
 
 impl Checks {
-    fn check(&mut self, what: &str, got: i64, want: Result<(), Error>) {
+    fn check(&mut self, what: &str, got: impl Into<i64>, want: Result<(), Error>) {
+        let got = got.into();
         self.run += 1;
         let ok = match want {
             Ok(()) => got >= 0,
@@ -54,24 +56,29 @@ impl Checks {
     }
 }
 
-fn find(grant: Grant) -> i32 {
-    host::handle_find(grant as i32)
-}
-
 fn log_raw(h: i32, level: i32, msg: i32, len: i32) -> i64 {
     i64::from(host::log(h, level, msg, len))
 }
 
-/// `args_read` as the checks call it.
-fn args_read(buf: i32, len: i32) -> i32 {
-    // SAFETY: every range given is inside a buffer of ours, or one the host
-    // refuses (wrapping): it writes nothing there.
+/// `args_read`, as the checks call it.
+///
+/// # Safety
+///
+/// `[buf, buf + len)` is inside a buffer the caller may write, or a range
+/// the host refuses (wrapping, past the memory), into which it writes
+/// nothing.
+unsafe fn args_read(buf: i32, len: i32) -> i32 {
+    // SAFETY: the caller's contract is `host::args_read`'s.
     unsafe { host::args_read(buf, len) }
 }
 
-/// `trace_read` as the checks call it.
-fn trace_read(h: i32, stream: i32, cpu: i32, since: i64, buf: i32, len: i32) -> i32 {
-    // SAFETY: as `args_read`'s.
+/// `trace_read`, as the checks call it.
+///
+/// # Safety
+///
+/// As [`args_read`]'s.
+unsafe fn trace_read(h: i32, stream: i32, cpu: i32, since: i64, buf: i32, len: i32) -> i32 {
+    // SAFETY: the caller's contract is `host::trace_read`'s.
     unsafe { host::trace_read(h, stream, cpu, since, buf, len) }
 }
 
@@ -109,16 +116,16 @@ fn calls(c: &mut Checks) {
 
     // Outputs: a refused call writes nothing.
     let mut buf = [0xa5u8; 128];
+    let (b, blen) = (ptr(buf.as_mut_ptr()), buf.len() as i32);
     let args = host::args_len();
-    c.check("args_len", args.into(), Ok(()));
-    let r = args_read(ptr(buf.as_mut_ptr()), args - 1);
-    c.check("args_read too small", r.into(), Err(Error::BufferTooSmall));
-    c.holds("args_read too small wrote nothing", buf.iter().all(|&b| b == 0xa5));
-    let r = args_read(WRAPPING, 64);
-    c.check("args_read at a wrapping range", r.into(), Err(Error::BadPointer));
-    let r = args_read(ptr(buf.as_mut_ptr()), buf.len() as i32);
-    c.check("args_read", r.into(), Ok(()));
-    c.holds("args_read wrote the arguments", buf[..r.max(0) as usize] == *b"calls\0");
+    c.check("args_len", args, Ok(()));
+    // SAFETY: `buf` is ours; a wrapping range is refused, written nothing.
+    let (small, wrapping, whole) = unsafe { (args_read(b, args - 1), args_read(WRAPPING, 64), args_read(b, blen)) };
+    c.check("args_read too small", small, Err(Error::BufferTooSmall));
+    c.check("args_read at a wrapping range", wrapping, Err(Error::BadPointer));
+    c.check("args_read", whole, Ok(()));
+    c.holds("args_read wrote the arguments", buf[..whole.max(0) as usize] == *b"calls\0");
+    c.holds("args_read wrote only the arguments", buf[whole.max(0) as usize..].iter().all(|&b| b == 0xa5));
 
     // Time.
     c.check("time_now", host::time_now(time), Ok(()));
@@ -127,28 +134,45 @@ fn calls(c: &mut Checks) {
     c.holds("time_wall is past 2020", host::time_wall(time) > 1_577_836_800);
     c.check("time_wall on the log handle", host::time_wall(log), Err(Error::WrongKind));
     c.check("time_wall on a made-up handle", host::time_wall(999), Err(Error::BadHandle));
-    c.check("a negative sleep", host::time_sleep(time, -1).into(), Err(Error::BadArgument));
-    c.check("a zero sleep", host::time_sleep(time, 0).into(), Ok(()));
+    c.check("a negative sleep", host::time_sleep(time, -1), Err(Error::BadArgument));
+    c.check("a zero sleep", host::time_sleep(time, 0), Ok(()));
 
     // Trace: the header and one event (72 bytes) is the least.
-    let mut out = [0xa5u8; 16 + 56 * 2];
+    let mut out = [0xa5u8; 16 + 56 * 2 + 8];
     let o = ptr(out.as_mut_ptr());
+    let two = (HEADER_SIZE + 2 * EVENT_SIZE) as i32;
     let cpus = host::trace_cpus(trace);
     c.holds("trace_cpus is at least 1", cpus >= 1);
-    let r = trace_read(trace, 0, 0, 0, o, 71);
-    c.check("trace_read below one event", r.into(), Err(Error::BufferTooSmall));
+    // SAFETY: every range below is inside `out`, or refused (wrapping).
+    let read = |h: i32, stream: i32, cpu: i32, since: i64, buf: i32, len: i32| unsafe {
+        trace_read(h, stream, cpu, since, buf, len)
+    };
+    c.check("trace_read below one event", read(trace, 0, 0, 0, o, 71), Err(Error::BufferTooSmall));
     c.holds("trace_read too small wrote nothing", out.iter().all(|&b| b == 0xa5));
-    c.check("trace_read stream 2", trace_read(trace, 2, 0, 0, o, 72).into(), Err(Error::BadArgument));
-    c.check("trace_read stream -1", trace_read(trace, -1, 0, 0, o, 72).into(), Err(Error::BadArgument));
-    c.check("trace_read cpu -1", trace_read(trace, 0, -1, 0, o, 72).into(), Err(Error::BadArgument));
-    c.check("trace_read cpu 99", trace_read(trace, 0, 99, 0, o, 72).into(), Err(Error::BadArgument));
-    c.check("trace_read since -1", trace_read(trace, 0, 0, -1, o, 72).into(), Err(Error::BadArgument));
-    c.check("trace_read since ahead", trace_read(trace, 0, 0, i64::MAX, o, 72).into(), Err(Error::BadArgument));
-    c.check("trace_read at a wrapping range", trace_read(trace, 0, 0, 0, WRAPPING, 72).into(), Err(Error::BadPointer));
-    c.check("trace_read on the time handle", trace_read(time, 0, 0, 0, o, 72).into(), Err(Error::WrongKind));
-    let r = trace_read(trace, 0, 0, 0, o, out.len() as i32);
-    c.check("trace_read", r.into(), Ok(()));
+    c.check("trace_read stream 2", read(trace, 2, 0, 0, o, 72), Err(Error::BadArgument));
+    c.check("trace_read stream -1", read(trace, -1, 0, 0, o, 72), Err(Error::BadArgument));
+    c.check("trace_read cpu -1", read(trace, 0, -1, 0, o, 72), Err(Error::BadArgument));
+    c.check("trace_read cpu 99", read(trace, 0, 99, 0, o, 72), Err(Error::BadArgument));
+    c.check("trace_read since -1", read(trace, 0, 0, -1, o, 72), Err(Error::BadArgument));
+    c.check("trace_read since ahead", read(trace, 0, 0, i64::MAX, o, 72), Err(Error::BadArgument));
+    c.check("trace_read at a wrapping range", read(trace, 0, 0, 0, WRAPPING, 72), Err(Error::BadPointer));
+    c.check("trace_read on the time handle", read(time, 0, 0, 0, o, 72), Err(Error::WrongKind));
+    c.holds("refused trace_reads wrote nothing", out.iter().all(|&b| b == 0xa5));
+    // Room for two events: the header, then `r` events numbered on from
+    // `since + missed` (since 0), `next` just past them, and the bytes past
+    // the last event untouched.
+    let r = read(trace, 0, 0, 0, o, two);
+    c.check("trace_read", r, Ok(()));
     c.holds("trace_read copied at most what fits", (0..=2).contains(&r));
+    let r = r.clamp(0, 2) as usize;
+    let (next, missed) = decode_header(out[..HEADER_SIZE].try_into().expect("a header"));
+    c.holds("trace_read's next follows what it copied", next == missed + r as u64);
+    for i in 0..r {
+        let at = HEADER_SIZE + i * EVENT_SIZE;
+        let e = decode_event(out[at..at + EVENT_SIZE].try_into().expect("an event"));
+        c.holds("trace_read's events are numbered on from since + missed", e.seq == missed + i as u64);
+    }
+    c.holds("trace_read wrote nothing past its events", out[HEADER_SIZE + r * EVENT_SIZE..].iter().all(|&b| b == 0xa5));
 }
 
 fn handles(c: &mut Checks) {
@@ -157,19 +181,19 @@ fn handles(c: &mut Checks) {
     c.holds("the same log handle", find(Grant::Log) == log);
     let time = find(Grant::Time);
     c.holds("a time handle", time > 0 && time != log);
-    c.check("close time", host::handle_close(time).into(), Ok(()));
-    c.check("close time again", host::handle_close(time).into(), Err(Error::BadHandle));
+    c.check("close time", host::handle_close(time), Ok(()));
+    c.check("close time again", host::handle_close(time), Err(Error::BadHandle));
     c.check("time_now on the closed handle", host::time_now(time), Err(Error::BadHandle));
-    c.check("time after its close", find(Grant::Time).into(), Err(Error::NotGranted));
+    c.check("time after its close", find(Grant::Time), Err(Error::NotGranted));
     let trace = find(Grant::Trace);
     c.holds("a new handle never takes a closed one's id", trace > time);
-    c.check("Window (4) is no grant", host::handle_find(4).into(), Err(Error::BadArgument));
-    c.check("kind 0", host::handle_find(0).into(), Err(Error::BadArgument));
-    c.check("kind 99", host::handle_find(99).into(), Err(Error::BadArgument));
-    c.check("the wrong kind", host::trace_cpus(log).into(), Err(Error::WrongKind));
-    c.check("a made-up handle", host::trace_cpus(12345).into(), Err(Error::BadHandle));
-    c.check("handle 0", host::trace_cpus(0).into(), Err(Error::BadHandle));
-    c.check("a negative handle", host::handle_close(-3).into(), Err(Error::BadHandle));
+    c.check("Window (4) is no grant", host::handle_find(4), Err(Error::BadArgument));
+    c.check("kind 0", host::handle_find(0), Err(Error::BadArgument));
+    c.check("kind 99", host::handle_find(99), Err(Error::BadArgument));
+    c.check("the wrong kind", host::trace_cpus(log), Err(Error::WrongKind));
+    c.check("a made-up handle", host::trace_cpus(12345), Err(Error::BadHandle));
+    c.check("handle 0", host::trace_cpus(0), Err(Error::BadHandle));
+    c.check("a negative handle", host::handle_close(-3), Err(Error::BadHandle));
 }
 
 #[unsafe(no_mangle)]

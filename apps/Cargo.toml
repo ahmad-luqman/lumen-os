@@ -1,14 +1,14 @@
 # Lumen's apps (M5): WASM modules for `wasm32-unknown-unknown`, to be run by
 # the kernel's `wasmi` (#197, #199). Their own workspace, outside the root
 # one (which excludes apps/), so the host crates' `cargo test`/`clippy` and
-# the kernel's builds never see them. `make build` builds every app into
-# build/apps/<name>.wasm.
+# the kernel's builds never see them. `make build` builds them; the layout
+# (where each module goes, the test apps) is ARCHITECTURE section 8's
+# "Building and bundling".
 [workspace]
 resolver = "3"
 # Every directory is a crate named after it (the harness checks the names):
-# an app (a `cdylib`, which `make apps` copies: `test-<name>` to
-# build/apps/tests/<name>.wasm, the others to build/apps/<name>.wasm) or a
-# library the apps share (`testkit`). Not dot directories (.cargo, an
+# an app (a `cdylib`, which `make apps` copies) or a library the apps share
+# (`testkit`). Not dot directories (.cargo, an
 # editor's): cargo's `*` would match them too.
 members = ["[!.]*"]
 

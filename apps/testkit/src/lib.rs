@@ -20,7 +20,9 @@ pub use lumen_app_api::{Error, Grant, LogLevel};
 /// imports them. Pointers and lengths are wasm `i32`s. The host checks
 /// every range against the app's memory before it touches a byte, so the
 /// calls that only read the app's memory (or none) are safe: a wrong
-/// pointer is an error code. The two that write into it are `unsafe`.
+/// pointer is an error code (or, for `panic`, which ends the app anyway,
+/// the message `<a bad pointer>`). The two that write into it are
+/// `unsafe`.
 pub mod host {
     #[link(wasm_import_module = "lumen")]
     unsafe extern "C" {
@@ -71,9 +73,15 @@ pub fn memory_bytes() -> usize {
     core::arch::wasm32::memory_size(0) * 65536
 }
 
-/// The `Log` handle (`handle_find` gives the same one every time).
+/// The handle to `grant` (`handle_find` gives the same one every time), or
+/// the error code.
+pub fn find(grant: Grant) -> i32 {
+    host::handle_find(grant as i32)
+}
+
+/// The `Log` handle.
 pub fn log_handle() -> i32 {
-    host::handle_find(Grant::Log as i32)
+    find(Grant::Log)
 }
 
 /// Log `text` at INFO: what `log` returned.
@@ -92,7 +100,7 @@ pub fn named(result: i64) -> String {
 /// `run`'s arguments after the app's name, as one string (words joined by
 /// spaces), or empty.
 pub fn args() -> String {
-    let mut buf = [0u8; 256];
+    let mut buf = [0u8; api::limits::ARGS_BYTES];
     // SAFETY: `buf` is ours to write.
     let n = unsafe { host::args_read(ptr(buf.as_mut_ptr()), buf.len() as i32) };
     if n <= 0 {
