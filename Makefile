@@ -41,19 +41,21 @@ $(BUILD)/lumen-kernel-ktest: $(KERNEL_SRCS)
 
 build: $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest apps ## Build both kernels and the apps
 
-# Apps (M5): every crate under apps/ (its own workspace, `members = ["*"]`,
-# so every directory here is built) is a WASM module, copied to
-# build/apps/<name>.wasm (cargo names the file after the crate, `-` as `_`).
-# Cargo runs inside apps/, whose .cargo/config.toml sets the target and the
-# output directory. Always run: cargo knows what changed. `|| exit 1`: make
-# 3.81 (macOS's) ignores .SHELLFLAGS, so `-e` can't be relied on in a loop.
+# Apps (M5): every directory under apps/ (its own workspace, every
+# directory but dot ones a member) is a crate named after the directory and
+# a WASM module, copied to build/apps/<name>.wasm (cargo names the file after
+# the crate, `-` as `_`). Cargo runs inside apps/, whose .cargo/config.toml
+# sets the target and the output directory (target-apps/). Always run: cargo
+# knows what changed. build/apps/ is emptied first, so a removed app's
+# module doesn't linger. `|| exit 1`: make 3.81 (macOS's) ignores
+# .SHELLFLAGS, so `-e` can't be relied on in a loop.
 APP_TARGET := wasm32-unknown-unknown
 APPS       := $(patsubst apps/%/Cargo.toml,%,$(wildcard apps/*/Cargo.toml))
 
 apps: ## Build the WASM apps into build/apps/
 	cd apps && cargo build --release
-	@mkdir -p $(BUILD)/apps && for app in $(APPS); do \
-		cp target/apps/$(APP_TARGET)/release/$${app//-/_}.wasm $(BUILD)/apps/$$app.wasm || exit 1; done
+	@rm -rf $(BUILD)/apps && mkdir -p $(BUILD)/apps && for app in $(APPS); do \
+		cp target-apps/$(APP_TARGET)/release/$${app//-/_}.wasm $(BUILD)/apps/$$app.wasm || exit 1; done
 
 # Bootable images:
 #   lumen.iso           interactive (`make run`)
@@ -87,9 +89,11 @@ test: test-host audit test-scenarios ## Everything CI runs: host tests, flag aud
 # never leave a stale "passed" behind for `make status`.
 RESULTS := $(BUILD)/test-results
 
-# The harness checks the built apps (tests/harness/test_wasm_module.py).
-test-host: apps ## Host-side unit tests (Rust crates + harness self-tests)
+# The harness checks the built apps (tests/harness/test_wasm_module.py),
+# built after the old results are gone: a failed apps build leaves none.
+test-host: ## Host-side unit tests (Rust crates + harness self-tests)
 	@mkdir -p $(RESULTS) && rm -f $(RESULTS)/cargo.json $(RESULTS)/harness.xml
+	$(MAKE) --no-print-directory apps
 	cargo test
 	# The stacks tests again, optimized: compiler-reordering mistakes in the seqlock are likelier to surface.
 	cargo test --release -p lumen-mm stacks
@@ -142,4 +146,5 @@ golden: iso ## Re-record golden screenshots (review the diff before committing!)
 
 clean: ## Remove build outputs (keeps downloaded deps)
 	cargo clean
+	cd apps && cargo clean
 	find $(BUILD) -mindepth 1 -maxdepth 1 ! -name deps -exec rm -rf {} +

@@ -1,6 +1,6 @@
 [package]
 name = "hello"
-description = "The smallest Lumen app: a no_std WASM module (#196). Nothing loads it yet."
+description = "The smallest Lumen app: a no_std WASM module (#196). The kernel doesn't load it yet."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

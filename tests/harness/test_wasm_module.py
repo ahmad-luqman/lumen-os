@@ -1,16 +1,19 @@
 """The apps/ workspace's output (#196): `make build` builds every app into
-build/apps/<name>.wasm; each is a valid WASM module (wasmtime validates it)
-using only rustc's default WASM features, and hello exports what it says
-and returns what it says. Also lumen_harness.wasm's custom-section reader,
-on handcrafted modules."""
+build/apps/<name>.wasm; each is a valid WASM module (wasmtime validates it,
+the later proposals it can switch off switched off) using only rustc's
+default WASM features, and hello exports what it says and returns what it
+says. Also lumen_harness.wasm's engine and custom-section reader, on
+handcrafted modules."""
 
 import re
 import subprocess
+import tomllib
 
 import pytest
 import wasmtime
-from lumen_harness import REPO_ROOT
+from lumen_harness import REPO_ROOT, wasm
 from lumen_harness.wasm import (
+    OFF,
     WasmError,
     compile_module,
     custom_section,
@@ -24,8 +27,8 @@ APPS = REPO_ROOT / "build" / "apps"
 
 # What rustc 1.99.1 lets itself use for wasm32-unknown-unknown by default,
 # as the modules' target_features section lists it. `rustc --print cfg`
-# shows six of them; LLVM adds bulk-memory-opt (implied by bulk-memory) and
-# call-indirect-overlong (implied by reference-types). The kernel's wasmi
+# shows six of them; LLVM's generic CPU also enables bulk-memory-opt and
+# call-indirect-overlong, which rustc doesn't list. The kernel's wasmi
 # will have to accept every one (#197). A toolchain bump that changes the
 # list fails here, so it gets checked against wasmi again.
 DEFAULT_FEATURES = {
@@ -52,7 +55,7 @@ def built(name: str) -> bytes:
     return path.read_bytes()
 
 
-def test_every_app_is_a_valid_module_without_later_proposals():
+def test_every_app_validates_with_the_switchable_later_proposals_off():
     eng = engine()
     for name in app_names():
         compile_module(built(name), eng)
@@ -87,19 +90,95 @@ def test_every_app_keeps_its_function_names():
     assert "answer" in function_names(built("hello")).values()
 
 
-@pytest.mark.parametrize(
-    "wat",
-    [
+def test_every_app_is_named_after_its_directory():
+    # `make apps` copies target-apps/.../<dir>.wasm: a crate or [lib] named
+    # otherwise would leave that file stale (or missing) while cargo builds
+    # another one.
+    for name in app_names():
+        manifest = tomllib.loads((REPO_ROOT / "apps" / name / "Cargo.toml").read_text())
+        assert manifest["package"]["name"] == name
+        assert "name" not in manifest.get("lib", {}), name
+
+
+# Each setting in OFF: a module that needs its proposal, what wasmtime says
+# refusing it, and the settings kept as wasmtime has them for the probe.
+V128_PARAMS = "(param v128 v128 v128) (result v128) local.get 0 local.get 1 local.get 2"
+I64_PARAMS = "(param i64 i64 i64 i64) (result i64 i64)"
+PROBES = {
+    "wasm_simd": (
         "(module (func (result v128) v128.const i64x2 0 0))",
-        "(module (memory 1 1 shared))",
-        "(module (func return_call 0))",
-        "(module (memory i64 1))",
-    ],
-    ids=["simd", "threads", "tail-call", "memory64"],
-)
-def test_the_engine_refuses_later_proposals(wat):
-    with pytest.raises(wasmtime.WasmtimeError):
-        compile_module(wasmtime.wat2wasm(wat))
+        "SIMD support is not enabled",
+        (),
+    ),
+    # With SIMD off wasmtime says "SIMD", so SIMD stays on here.
+    "wasm_relaxed_simd": (
+        f"(module (func {V128_PARAMS} i32x4.relaxed_laneselect))",
+        "relaxed SIMD support is not enabled",
+        ("wasm_simd",),
+    ),
+    "wasm_threads": ("(module (memory 1 1 shared))", "threads must be enabled", ()),
+    "wasm_tail_call": ("(module (func return_call 0))", "tail calls support is not enabled", ()),
+    "wasm_gc": (
+        "(module (type (struct (field i32))))",
+        "not supported without the gc feature",
+        (),
+    ),
+    "wasm_function_references": (
+        "(module (type $f (func)) (func (param (ref $f))))",
+        "function references required",
+        (),
+    ),
+    "wasm_exceptions": (
+        "(module (tag $t) (func (throw $t)))",
+        "exceptions proposal not enabled",
+        (),
+    ),
+    "wasm_memory64": ("(module (memory i64 1))", "memory64 must be enabled", ()),
+    "wasm_multi_memory": ("(module (memory 1) (memory 1))", "multiple memories", ()),
+    "wasm_wide_arithmetic": (
+        f"(module (func {I64_PARAMS} local.get 0 local.get 1 local.get 2 local.get 3 i64.add128))",
+        "wide arithmetic support is not enabled",
+        (),
+    ),
+    # Off in wasmtime by default: only the setting check in engine() keeps
+    # these two meaning something if a wasmtime turns them on.
+    "wasm_custom_page_sizes": (
+        "(module (memory 1 (pagesize 1)))",
+        "custom page sizes proposal must be enabled",
+        (),
+    ),
+    "wasm_stack_switching": (
+        "(module (type $f (func)) (type $c (cont $f)))",
+        "stack switching is disabled",
+        (),
+    ),
+}
+
+
+def test_every_switched_off_proposal_has_a_probe():
+    assert set(PROBES) == set(OFF)
+
+
+@pytest.mark.parametrize("proposal", OFF)
+def test_the_engine_refuses_each_later_proposal(proposal):
+    wat, message, keep = PROBES[proposal]
+    data = wasmtime.wat2wasm(wat)
+    eng = engine(keep=keep)
+    with pytest.raises(wasmtime.WasmtimeError, match=message):
+        compile_module(data, eng)
+
+
+def test_the_engine_refuses_a_setting_wasmtime_does_not_have(monkeypatch):
+    monkeypatch.setattr(wasm, "OFF", (*OFF, "wasm_simd_typo"))
+    with pytest.raises(AttributeError, match="wasm_simd_typo"):
+        wasm.engine()
+    with pytest.raises(ValueError, match="not in OFF"):
+        engine(keep=("wasm_extended_const",))
+
+
+def test_compile_module_takes_only_binary_modules():
+    with pytest.raises(WasmError, match="binary"):
+        compile_module(b"(module)")
 
 
 def test_the_engine_accepts_the_default_features():
@@ -156,7 +235,7 @@ def custom(cname: str, payload: bytes) -> bytes:
 
 
 HEADER = b"\0asm\x01\0\0\0"
-# A function section between two custom sections: skipped, the order kept.
+# A type and a function section between custom sections: skipped, the order kept.
 TYPED = section(1, b"\x01\x60\x00\x00") + section(3, b"\x01\x00")
 
 
@@ -179,10 +258,8 @@ def test_reader_refuses_a_custom_section_named_twice():
 
 
 def test_target_features_reads_each_prefix():
-    data = HEADER + features(
-        b"+" + name("sign-ext"), b"-" + name("simd128"), b"=" + name("atomics")
-    )
-    assert target_features(data) == {"sign-ext": "+", "simd128": "-", "atomics": "="}
+    data = HEADER + features(b"+" + name("sign-ext"), b"-" + name("simd128"))
+    assert target_features(data) == {"sign-ext": "+", "simd128": "-"}
     assert target_features(HEADER + TYPED) == {}
 
 
@@ -191,6 +268,7 @@ def test_target_features_reads_each_prefix():
     [
         (HEADER + features(b"+" + name("a"), b"+" + name("a")), "listed twice"),
         (HEADER + features(b"?" + name("a")), "prefix"),
+        (HEADER + features(b"=" + name("a")), "prefix"),
         (HEADER + custom("target_features", b"\x01+\x05ab"), "truncated"),
         (HEADER + custom("target_features", b"\x00\x00"), "left over"),
         (HEADER + features() + features(), "appears 2 times"),
@@ -206,6 +284,20 @@ def test_function_names_reads_the_name_section():
     names = section(0, name("m")) + section(1, b"\x02\x00" + name("f") + b"\x03" + name("g"))
     assert function_names(HEADER + custom("name", names)) == {0: "f", 3: "g"}
     assert function_names(HEADER) == {}
+
+
+@pytest.mark.parametrize(
+    "names, message",
+    [
+        (section(1, b"\x00") + section(1, b"\x00"), "subsection 1 appears twice"),
+        (section(1, b"\x02\x03" + name("f") + b"\x03" + name("g")), "index 3 after 3"),
+        (section(1, b"\x02\x03" + name("f") + b"\x01" + name("g")), "index 1 after 3"),
+        (section(1, b"\x01\x00" + name("f") + b"\x00"), "1 bytes left over"),
+    ],
+)
+def test_function_names_refuses_malformed_sections(names, message):
+    with pytest.raises(WasmError, match=message):
+        function_names(HEADER + custom("name", names))
 
 
 @pytest.mark.parametrize(

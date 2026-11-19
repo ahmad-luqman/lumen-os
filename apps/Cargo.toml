@@ -5,10 +5,10 @@
 # build/apps/<name>.wasm.
 [workspace]
 resolver = "3"
-# Every directory is an app: `make apps` copies one .wasm per apps/*/.
-members = ["*"]
-# Not an app: cargo's glob also matches dot directories.
-exclude = [".cargo"]
+# Every directory is an app, named after its crate (`make apps` copies one
+# .wasm per apps/*/; the harness checks the names). Not dot directories
+# (.cargo, an editor's): cargo's `*` would match them too.
+members = ["[!.]*"]
 
 [workspace.package]
 version = "0.0.1"

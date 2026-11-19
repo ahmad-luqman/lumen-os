@@ -3,8 +3,8 @@
 //!
 //! It imports nothing, so any WASM runtime can instantiate it. The app
 //! interface (the `lumen` imports, capability handles) comes with M5's
-//! runtime (#199), which also renames the entry point to `lumen_main`, as
-//! PR #210's design says. Until then the harness checks this module's
+//! runtime (#199), which also renames the entry point to `lumen_main`.
+//! The kernel doesn't load it yet; the harness checks this module's
 //! exports, their types, and what `answer` returns, running it in wasmtime
 //! (`tests/harness/test_wasm_module.py`).
 

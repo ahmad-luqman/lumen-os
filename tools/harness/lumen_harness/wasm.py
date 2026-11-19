@@ -1,11 +1,13 @@
 """WASM modules as the apps/ workspace builds them (#196), checked before
 anything in the kernel loads them.
 
-`compile_module` validates a whole module with `wasmtime` under `engine()`, which
-switches off every proposal rustc doesn't use by default for
-wasm32-unknown-unknown (SIMD, threads, tail calls, ...), so a module that
-needs one is refused; a `wasmtime.Module` also gives the imports, the
-exports with their types, and can be instantiated and called.
+`compile_module` validates a whole binary module with `wasmtime` under
+`engine()`, which switches off the proposals past rustc's defaults for
+wasm32-unknown-unknown that wasmtime-py has a setting for (`OFF`: SIMD,
+threads, tail calls, ...), so a module that needs one is refused.
+extended-const has no setting there: only the `target_features` check
+catches a module built with it. A `wasmtime.Module` also gives the imports,
+the exports with their types, and can be instantiated and called.
 
 wasmtime has no API for custom sections, so a small reader here walks the
 section headers and keeps every custom section in order (`custom_sections`);
@@ -16,14 +18,20 @@ section headers and keeps every custom section in order (`custom_sections`);
 
 from __future__ import annotations
 
+from collections.abc import Collection
+
 import wasmtime
 
 MAGIC_AND_VERSION = b"\0asm\x01\0\0\0"
 CUSTOM = 0  # section id (WebAssembly core spec, 5.5.2)
 
-# Proposals past what rustc 1.99.1 enables by default for the target. With
-# them off, validation proves an app uses none of them.
-_OFF = (
+# The `wasmtime.Config` settings for proposals past what rustc 1.99.1
+# enables by default for the target. With them off, validation proves an app
+# uses none of them. custom-page-sizes and stack-switching are off in
+# wasmtime by default anyway; listed so a wasmtime that turns them on can't
+# let them through. The component model isn't listed: a core module is never
+# a component.
+OFF = (
     "wasm_simd",
     "wasm_relaxed_simd",
     "wasm_threads",
@@ -36,23 +44,39 @@ _OFF = (
     "wasm_wide_arithmetic",
     "wasm_custom_page_sizes",
     "wasm_stack_switching",
-    "wasm_component_model",
 )
 
 
 class WasmError(ValueError):
-    """A custom section, or the section headers around it, can't be read."""
+    """Not a binary WASM module, or a custom section (or the section headers
+    around it) that can't be read."""
 
 
-def engine() -> wasmtime.Engine:
+def engine(*, keep: Collection[str] = ()) -> wasmtime.Engine:
+    """An engine with every proposal in `OFF` switched off, but those in
+    `keep`, which stay as wasmtime has them (for tests: relaxed SIMD can only
+    be refused on its own with SIMD on). `wasmtime.Config` takes any
+    attribute, so a name that isn't one of its settings (a typo, a setting a
+    newer wasmtime renamed) is refused here rather than ignored."""
+    unknown = set(keep) - set(OFF)
+    if unknown:
+        raise ValueError(f"not in OFF: {sorted(unknown)}")
     config = wasmtime.Config()
-    for proposal in _OFF:
-        setattr(config, proposal, False)
+    for proposal in OFF:
+        setting = getattr(wasmtime.Config, proposal, None)
+        if not isinstance(setting, property) or setting.fset is None:
+            raise AttributeError(f"wasmtime.Config has no setting {proposal!r}")
+        if proposal not in keep:
+            setattr(config, proposal, False)
     return wasmtime.Engine(config)
 
 
 def compile_module(data: bytes, eng: wasmtime.Engine | None = None) -> wasmtime.Module:
-    """Validate and compile `data`; raises `wasmtime.WasmtimeError` if invalid."""
+    """Validate and compile the binary module `data`: `WasmError` if it isn't
+    one (wasmtime would also take WAT text), `wasmtime.WasmtimeError` if it
+    is invalid."""
+    if data[:8] != MAGIC_AND_VERSION:
+        raise WasmError(f"not a version 1 binary WASM module (starts {data[:8]!r})")
     return wasmtime.Module(eng or engine(), data)
 
 
@@ -133,9 +157,9 @@ def custom_section(data: bytes, name: str) -> bytes | None:
 
 def target_features(data: bytes) -> dict[str, str]:
     """The `target_features` section: each feature with its prefix (`+`: the
-    module uses it; `-`: it must not be used; `=`: used, and every module
-    linked with this one must use it too), or {} if the module has none. A
-    feature listed twice is refused."""
+    module uses it; `-`: it must not be used), or {} if the module has none.
+    A feature listed twice, or another prefix (tool-conventions dropped `=`),
+    is refused."""
     payload = custom_section(data, "target_features")
     if payload is None:
         return {}
@@ -143,7 +167,7 @@ def target_features(data: bytes) -> dict[str, str]:
     features: dict[str, str] = {}
     for _ in range(r.uleb()):
         prefix = chr(r.byte())
-        if prefix not in "+-=":
+        if prefix not in "+-":
             raise WasmError(f"target feature prefix {prefix!r}")
         feature = r.name()
         if feature in features:
@@ -158,18 +182,28 @@ FUNCTION_NAMES = 1  # the `name` section's function-names subsection
 
 
 def function_names(data: bytes) -> dict[int, str]:
-    """The `name` section's function names by function index ({} without one)."""
+    """The `name` section's function names by function index ({} without
+    one). A subsection that appears twice, function indices that don't
+    increase, or bytes left over in the function names are refused."""
     payload = custom_section(data, "name")
     names: dict[int, str] = {}
     if payload is None:
         return names
     r = _Reader(payload)
+    seen: set[int] = set()
     while not r.at_end():
         subsection = r.byte()
+        if subsection in seen:
+            raise WasmError(f"name subsection {subsection} appears twice")
+        seen.add(subsection)
         body = r.sub(r.uleb())
         if subsection != FUNCTION_NAMES:
             continue
         for _ in range(body.uleb()):
             index = body.uleb()
+            if names and index <= max(names):
+                raise WasmError(f"function index {index} after {max(names)}")
             names[index] = body.name()
+        if not body.at_end():
+            raise WasmError(f"function names: {body.limit - body.pos} bytes left over")
     return names
