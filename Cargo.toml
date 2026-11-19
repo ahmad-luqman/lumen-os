@@ -4,6 +4,8 @@ members = ["kernel", "crates/*"]
 # `cargo test` / `cargo clippy` with no flags run on the host-testable crates only.
 # The kernel is built for x86_64-unknown-none via `make build`.
 default-members = ["crates/*"]
+# The WASM apps are their own workspace (apps/Cargo.toml), built by `make build`.
+exclude = ["apps"]
 
 [workspace.package]
 version = "0.0.1"

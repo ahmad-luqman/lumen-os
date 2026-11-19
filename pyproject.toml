@@ -7,6 +7,7 @@ dependencies = [
     "pillow>=11",
     "pytest>=8",
     "pytest-xdist>=3",
+    "wasmtime>=50.0.1",
 ]
 
 [dependency-groups]

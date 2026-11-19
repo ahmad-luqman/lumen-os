@@ -1,0 +1,8 @@
+# Features: WASM apps (M5). See tests/features/README.md for the format.
+
+[[feature]]
+name = "Apps build for wasm32-unknown-unknown with the pinned toolchain (`make build`: build/apps/<name>.wasm), as WASM modules exporting what they say, using only rustc's default WASM features"
+milestone = "M5"
+tests = [
+    "harness:test_wasm_module::*",
+]
