@@ -77,8 +77,8 @@ zune-core = { version = "=0.5.3", default-features = false }
 # The WASM interpreter for apps (#197; M5). `validate`: `Module::new`
 # checks what it compiles. `portable-dispatch`: wasmi's loop dispatch, whose
 # native stack depth stays constant however long a module runs (host calls
-# aside). With default features off, `auto-dispatch` (a default) is
-# dropped and wasmi dispatches by tail calls whatever the profile: each
+# aside). This line's `default-features = false` drops `auto-dispatch` (a
+# default), and wasmi then dispatches by tail calls whatever the profile: each
 # instruction's handler calls the next, relying on LLVM to make those calls
 # jumps, which wasmi's build script expects only with debug assertions off.
 # The kernel keeps them on (`profile.release`), and in #197 a

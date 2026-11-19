@@ -23,8 +23,10 @@ def test_wasm_command_runs_a_loop_in_fuel_slices(boot):
     out = run(m, "wasm")
     lines = out.splitlines()
     assert len(lines) == 4, out
-    # Out of fuel and resumed at least twice (fuel is counted per
-    # instruction, so how many is no matter of time), and the right sum.
+    # Out of fuel and resumed at least twice, and the right sum. `wasm`
+    # itself checks the resumes against the band the loop's fuel gives
+    # (fuel is counted in instructions, so no matter of time): outside it,
+    # a failure line would make a fifth line.
     loop = re.fullmatch(
         rf"wasm: run\(300000\) = {LOOP_RESULT} after (\d+) resumes \(100000 fuel a slice\)",
         lines[0],

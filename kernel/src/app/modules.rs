@@ -114,8 +114,9 @@ pub const FLOATS: &[u8] = &[
 
 /// `fill(n) -> byte`: `memory.fill` of the first `n` bytes of its two pages
 /// (128 KiB) with 0xab, then the last of them read back. wasmi charges a
-/// bulk operation by the bytes it touches (1 fuel per 64), all before the
-/// instruction runs, so a large `n` needs more fuel than a small slice.
+/// bulk operation by the bytes it touches (1 fuel per 64, rounded down),
+/// all before the instruction runs, so a large `n` needs more fuel than a
+/// small slice.
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by ktests
 #[rustfmt::skip]
 pub const FILL: &[u8] = &[
@@ -143,8 +144,9 @@ pub const FILL: &[u8] = &[
 
 /// A module whose one export, `add(x) -> x + adds`, is `adds` repetitions
 /// of `i32.const 1, i32.add`: a body of `3 * adds + 4` bytes. wasmi's lazy
-/// compilation charges fuel for a body's bytes at its first call; compiled
-/// eagerly, a body costs only its instructions.
+/// compilation charges a body's bytes (7 fuel each) to the fuel left in
+/// the slice of its first call; compiled eagerly, a body costs only its
+/// instructions.
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by ktests
 pub fn large_body(adds: u32) -> Vec<u8> {
     let mut body = Vec::new();
