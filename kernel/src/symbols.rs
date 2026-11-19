@@ -53,6 +53,17 @@ pub fn resolve(addr: u64) -> Option<Location> {
     Some(Location { name: sym.name, offset })
 }
 
+/// Every function symbol with a name, as (start, size, raw name), in table
+/// order (none without a symbol table): for `perf`'s sorted index.
+pub fn functions() -> alloc::vec::Vec<(u64, u64, &'static str)> {
+    table().map_or_else(alloc::vec::Vec::new, |t| {
+        t.iter()
+            .filter(|s| s.kind == lumen_elf::STT_FUNC && !s.name.is_empty())
+            .map(|s| (s.value, s.size, s.name))
+            .collect()
+    })
+}
+
 /// Formats as `<symbol+0x12>` or `<unknown>`.
 pub struct Symbolized(pub u64);
 

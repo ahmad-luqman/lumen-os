@@ -560,7 +560,7 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
         TIMER => {
             let cpu = super::percpu::index();
             let tick = TICKS[cpu].fetch_add(1, Ordering::Relaxed) + 1;
-            crate::perf::on_tick(cpu, frame.rip);
+            crate::perf::on_tick(frame.rip);
             // Before the scheduler may switch threads: the next tick must be
             // able to arrive on whatever runs next.
             super::apic::eoi();

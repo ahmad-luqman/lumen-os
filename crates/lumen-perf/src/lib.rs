@@ -10,6 +10,10 @@
 //! A profile is a number of samples per CPU, never a duration: the buffer
 //! takes exactly as many as it was armed for and then refuses the rest, so
 //! a loaded host that delays ticks makes a profile slower, never smaller.
+//! While it waits, [`Silence`] notices a CPU whose timer stopped ticking
+//! while the others' went on (judged by progress, not time), and
+//! [`header`] says how many samples each CPU took. [`FnIndex`] finds the
+//! function an address is in by binary search, for symbolizing.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -53,8 +57,9 @@ const IDLE_BIT: u64 = 1 << 63;
 /// one CPU, so that rewrite comes before the slot is published). The
 /// generation is what makes the swap fail: without it, a disarm and a
 /// re-arm for the same count between a writer's load and its swap would
-/// bring back the exact state it loaded (PR #212's review). It wraps only
-/// after 2^24 armings inside one record's few instructions.
+/// bring back the exact state it loaded. A raced swap could still succeed
+/// only if a multiple of 2^[`GEN_BITS`] armings came between the writer's
+/// load and its swap, a few instructions with interrupts off.
 ///
 /// Callers keep to one writer at a time per buffer and one arming reader at
 /// a time; misuse can mix samples up but is never undefined behaviour (all
@@ -117,7 +122,10 @@ impl<const N: usize> Buffer<N> {
     }
 
     /// The writer's first step: the state it will write under, if armed and
-    /// not yet full.
+    /// not yet full. Acquire, pairing with the arming's Release store: the
+    /// reader's copy of the previous arming, made before it re-armed,
+    /// happens before this arming's slot writes, so it never reads one of
+    /// them.
     fn claim(&self) -> Option<u64> {
         let state = self.state.load(Ordering::Acquire);
         let (want, len) = split(state);
@@ -196,11 +204,7 @@ impl<K> Ranking<K> {
     /// A row's share of the busy samples, in whole percent (rounded; 0 when
     /// there are none).
     pub fn share(&self, row: &Row<K>) -> u64 {
-        let busy = self.busy();
-        if busy == 0 {
-            return 0;
-        }
-        (u128::from(row.samples.min(busy)) * 100 + u128::from(busy) / 2) as u64 / busy
+        lumen_time::percent(row.samples, self.busy())
     }
 }
 
@@ -235,6 +239,159 @@ fn ranked<K: Ord>(samples: &[Sample], counts: BTreeMap<K, u64>) -> Ranking<K> {
     // Stable: equal counts keep the map's key order.
     rows.sort_by_key(|r| core::cmp::Reverse(r.samples));
     Ranking { samples: samples.len() as u64, idle, rows }
+}
+
+/// Whether every CPU has taken its `want` samples (true for no CPUs): the
+/// end of a profile that wasn't stopped.
+pub fn all_taken(counts: impl IntoIterator<Item = usize>, want: usize) -> bool {
+    counts.into_iter().all(|n| n >= want)
+}
+
+/// How many polls in a row a CPU may take no tick while another CPU ticks
+/// before [`Silence`] calls it silent (at `perf top`'s 10 ms polls, about
+/// a second of the others' time).
+pub const SILENT_POLLS: u32 = 100;
+
+/// Notices CPUs that have stopped taking timer interrupts while a profile
+/// waits for their samples (one stuck with interrupts off, say), by
+/// progress rather than time: a CPU is silent once it has taken no tick
+/// across [`SILENT_POLLS`] polls in a row in each of which some other CPU
+/// took one, and it doesn't have its samples yet. A poll where no CPU
+/// ticked (the whole guest stalled) counts for nothing.
+#[derive(Clone, Debug)]
+pub struct Silence {
+    last: Vec<u64>,
+    still: Vec<u32>,
+    said: Vec<bool>,
+    started: bool,
+}
+
+impl Silence {
+    /// For `cpus` CPUs (indices into the slices [`observe`](Self::observe)
+    /// takes).
+    pub fn new(cpus: usize) -> Silence {
+        Silence {
+            last: alloc::vec![0; cpus],
+            still: alloc::vec![0; cpus],
+            said: alloc::vec![false; cpus],
+            started: false,
+        }
+    }
+
+    /// One poll: each CPU's timer interrupts so far and whether it has all
+    /// its samples. The CPUs found silent at this poll (each said once).
+    pub fn observe(&mut self, ticks: &[u64], done: &[bool]) -> Vec<usize> {
+        assert!(ticks.len() == self.last.len() && done.len() == self.last.len());
+        let moved: Vec<bool> = ticks.iter().zip(&self.last).map(|(t, l)| t != l).collect();
+        self.last.copy_from_slice(ticks);
+        if !core::mem::replace(&mut self.started, true) {
+            return Vec::new();
+        }
+        let mut found = Vec::new();
+        for i in 0..moved.len() {
+            let others = moved.iter().enumerate().any(|(j, &m)| j != i && m);
+            if moved[i] || done[i] {
+                self.still[i] = 0;
+            } else if others {
+                self.still[i] += 1;
+                if self.still[i] >= SILENT_POLLS && !self.said[i] {
+                    self.said[i] = true;
+                    found.push(i);
+                }
+            }
+        }
+        found
+    }
+
+    /// Every CPU found silent so far.
+    pub fn silent(&self) -> Vec<usize> {
+        self.said.iter().enumerate().filter(|&(_, &s)| s).map(|(i, _)| i).collect()
+    }
+}
+
+/// `perf top`'s header line, from what each CPU took (`taken`: (CPU,
+/// samples) pairs), the samples asked for per CPU, the CPUs found silent
+/// and the idle samples among them all. A profile where every CPU took
+/// `want` says `<want> samples per CPU`; any other says what each took,
+/// marking the silent ones.
+pub fn header(want: usize, taken: &[(usize, usize)], silent: &[usize], idle: u64) -> String {
+    let total: u64 = taken.iter().map(|&(_, n)| n as u64).sum();
+    let per_cpu = if all_taken(taken.iter().map(|&(_, n)| n), want) {
+        alloc::format!("{want} samples per CPU")
+    } else {
+        let counts: Vec<String> = taken
+            .iter()
+            .map(|&(c, n)| {
+                let mark = if silent.contains(&c) { " (silent)" } else { "" };
+                alloc::format!("cpu {c}: {n}{mark}")
+            })
+            .collect();
+        alloc::format!("stopped at {} of {want} samples per CPU", counts.join(", "))
+    };
+    let n = taken.len();
+    let plural = if n == 1 { "" } else { "s" };
+    let busy = total.saturating_sub(idle);
+    alloc::format!("perf top: {per_cpu} on {n} CPU{plural}: {total} samples, {idle} idle, {busy} busy")
+}
+
+/// The functions of a symbol table, sorted by address, for finding the
+/// one an address is in by binary search (a symbol table is a list to
+/// scan: about 10k entries for the kernel).
+///
+/// Same answers as `lumen_elf::SymbolTable::lookup` where sized functions
+/// don't overlap: the sized function containing the address, else the
+/// zero-sized one at or below it nearest to it, the first in table order
+/// among equal addresses. Where sized functions overlap, the one starting
+/// nearest below the address wins (a scan takes the first in table order).
+#[derive(Clone, Debug, Default)]
+pub struct FnIndex<'a> {
+    /// (start, size, name), size > 0, by start; equal starts in table order.
+    sized: Vec<(u64, u64, &'a str)>,
+    /// (start, name) of the zero-sized ones, likewise.
+    zero_sized: Vec<(u64, &'a str)>,
+}
+
+impl<'a> FnIndex<'a> {
+    /// From the functions' (start, size, name), in table order.
+    pub fn new(functions: impl IntoIterator<Item = (u64, u64, &'a str)>) -> FnIndex<'a> {
+        let mut index = FnIndex::default();
+        for (start, size, name) in functions {
+            if size == 0 {
+                index.zero_sized.push((start, name));
+            } else {
+                index.sized.push((start, size, name));
+            }
+        }
+        // Stable: equal starts keep table order.
+        index.sized.sort_by_key(|f| f.0);
+        index.zero_sized.sort_by_key(|f| f.0);
+        index
+    }
+
+    /// How many functions it holds.
+    pub fn len(&self) -> usize {
+        self.sized.len() + self.zero_sized.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The function `addr` is in and the offset into it.
+    pub fn lookup(&self, addr: u64) -> Option<(&'a str, u64)> {
+        let end = self.sized.partition_point(|f| f.0 <= addr);
+        if let Some(&(start, _, _)) = end.checked_sub(1).map(|i| &self.sized[i]) {
+            let first = self.sized.partition_point(|f| f.0 < start);
+            if let Some(&(_, _, name)) = self.sized[first..end].iter().find(|f| addr - f.0 < f.1) {
+                return Some((name, addr - start));
+            }
+        }
+        let end = self.zero_sized.partition_point(|f| f.0 <= addr);
+        let &(start, _) = self.zero_sized.get(end.checked_sub(1)?)?;
+        let first = self.zero_sized.partition_point(|f| f.0 < start);
+        let (_, name) = self.zero_sized[first];
+        Some((name, addr - start))
+    }
 }
 
 /// `perf top`'s default rows shown.
@@ -462,17 +619,18 @@ mod tests {
             0x200..0x300 => Some("b"),
             _ => None,
         };
-        let samples = [s(0x110, 5), s(0x120, 5), s(0x210, 6), idle(0x110), s(0x900, 7), s(0x150, 6), idle(0x5)];
+        let samples =
+            [s(0x110, 5), s(0x120, 5), s(0x210, 6), idle(0x110), s(0x900, 7), s(0x150, 6), idle(0x5), s(0x110, 6)];
         let mut calls = 0;
         let r = by_function(&samples, |rip| {
             calls += 1;
             resolve(rip)
         });
-        assert_eq!(calls, 5, "once per distinct busy address (idle ones skipped)");
-        assert_eq!((r.samples, r.idle, r.busy()), (7, 2, 5));
+        assert_eq!(calls, 5, "once per distinct busy address (repeats and idle ones skipped)");
+        assert_eq!((r.samples, r.idle, r.busy()), (8, 2, 6));
         assert_eq!(
             r.rows,
-            [Row { key: Some("a"), samples: 3 }, Row { key: None, samples: 1 }, Row { key: Some("b"), samples: 1 }]
+            [Row { key: Some("a"), samples: 4 }, Row { key: None, samples: 1 }, Row { key: Some("b"), samples: 1 }]
         );
         assert_eq!(r.rows.iter().map(|r| r.samples).sum::<u64>(), r.busy());
     }
@@ -510,6 +668,165 @@ mod tests {
         assert_eq!(r.share(&r.rows[1]), 33);
         let none = by_thread(&[idle(0)]);
         assert_eq!(none.share(&Row { key: 1, samples: 0 }), 0);
+    }
+
+    #[test]
+    fn shares_dont_overflow_on_huge_counts() {
+        let r = Ranking { samples: u64::MAX, idle: 0, rows: alloc::vec![Row { key: 0u8, samples: u64::MAX / 2 }] };
+        assert_eq!(r.share(&r.rows[0]), 50);
+    }
+
+    #[test]
+    fn all_taken_needs_every_cpu_at_its_count() {
+        assert!(all_taken([3, 3], 3));
+        assert!(!all_taken([3, 2], 3), "one sample short is not done");
+        assert!(!all_taken([0], 1));
+        assert!(all_taken([], 5));
+    }
+
+    #[test]
+    fn a_cpu_is_silent_after_enough_polls_where_only_others_tick() {
+        let mut q = Silence::new(2);
+        let (mut t0, t1) = (0u64, 7u64);
+        assert!(q.observe(&[t0, t1], &[false, false]).is_empty(), "the first poll is a baseline");
+        for poll in 1..SILENT_POLLS {
+            t0 += 1;
+            assert!(q.observe(&[t0, t1], &[false, false]).is_empty(), "poll {poll}");
+        }
+        t0 += 1;
+        assert_eq!(q.observe(&[t0, t1], &[false, false]), [1]);
+        t0 += 1;
+        assert!(q.observe(&[t0, t1], &[false, false]).is_empty(), "said once");
+        assert_eq!(q.silent(), [1]);
+    }
+
+    #[test]
+    fn a_stalled_guest_a_finished_cpu_or_a_tick_resets_silence() {
+        let mut q = Silence::new(2);
+        q.observe(&[0, 0], &[false, false]);
+        // Nobody ticks: the whole guest stalled, nothing counts.
+        for _ in 0..2 * SILENT_POLLS {
+            assert!(q.observe(&[0, 0], &[false, false]).is_empty());
+        }
+        // CPU 1 has all its samples: not silent, however long.
+        let mut t0 = 0;
+        for _ in 0..2 * SILENT_POLLS {
+            t0 += 1;
+            assert!(q.observe(&[t0, 0], &[false, true]).is_empty());
+        }
+        // One tick of CPU 1 just short of the limit starts it over.
+        for _ in 0..SILENT_POLLS - 1 {
+            t0 += 1;
+            q.observe(&[t0, 0], &[false, false]);
+        }
+        t0 += 1;
+        assert!(q.observe(&[t0, 1], &[false, false]).is_empty());
+        for _ in 0..SILENT_POLLS - 1 {
+            t0 += 1;
+            assert!(q.observe(&[t0, 1], &[false, false]).is_empty());
+        }
+        assert!(q.silent().is_empty());
+    }
+
+    #[test]
+    fn header_says_per_cpu_counts_unless_every_cpu_took_its_samples() {
+        assert_eq!(
+            header(500, &[(0, 500), (1, 500)], &[], 600),
+            "perf top: 500 samples per CPU on 2 CPUs: 1000 samples, 600 idle, 400 busy"
+        );
+        assert_eq!(
+            header(10, &[(0, 10)], &[], 10),
+            "perf top: 10 samples per CPU on 1 CPU: 10 samples, 10 idle, 0 busy"
+        );
+        assert_eq!(
+            header(500, &[(0, 500), (1, 499)], &[], 0),
+            "perf top: stopped at cpu 0: 500, cpu 1: 499 of 500 samples per CPU on 2 CPUs: 999 samples, 0 idle, 999 busy"
+        );
+        assert_eq!(
+            header(500, &[(0, 212), (3, 0)], &[3], 200),
+            "perf top: stopped at cpu 0: 212, cpu 3: 0 (silent) of 500 samples per CPU on 2 CPUs: 212 samples, 200 idle, 12 busy"
+        );
+    }
+
+    /// `lumen_elf::SymbolTable::lookup`'s rule, as a scan.
+    fn scan<'a>(fns: &[(u64, u64, &'a str)], addr: u64) -> Option<(&'a str, u64)> {
+        let mut fallback: Option<(u64, &str)> = None;
+        for &(start, size, name) in fns {
+            if start > addr {
+                continue;
+            }
+            if size != 0 {
+                if addr - start < size {
+                    return Some((name, addr - start));
+                }
+            } else if fallback.is_none_or(|f| start > f.0) {
+                fallback = Some((start, name));
+            }
+        }
+        fallback.map(|(start, name)| (name, addr - start))
+    }
+
+    #[test]
+    fn fn_index_agrees_with_a_scan_where_functions_dont_overlap() {
+        // Made-up functions in shuffled table order: sized ones with gaps,
+        // zero-sized ones among them (two at one address), one sized and
+        // one zero-sized at the same start.
+        let fns = [
+            (0x300, 0x40, "c"),
+            (0x100, 0x80, "a"),
+            (0x1f0, 0, "z1"),
+            (0x200, 0x10, "b"),
+            (0x1f0, 0, "z2"),
+            (0x400, 0, "z3"),
+            (0x300, 0, "z4"),
+            (0x500, 0x1, "d"),
+            // Two sized ones at one start: the first in table order that
+            // contains the address.
+            (0x600, 0x10, "s"),
+            (0x600, 0x40, "t"),
+        ];
+        let index = FnIndex::new(fns);
+        assert_eq!(index.len(), fns.len());
+        for addr in 0..0x700 {
+            assert_eq!(index.lookup(addr), scan(&fns, addr), "addr {addr:#x}");
+        }
+        assert_eq!(index.lookup(0x608), Some(("s", 8)));
+        assert_eq!(index.lookup(0x618), Some(("t", 0x18)));
+        assert_eq!(index.lookup(0x1f8), Some(("z1", 8)), "equal addresses: the first in table order");
+        assert!(FnIndex::new([]).lookup(5).is_none());
+    }
+
+    #[test]
+    fn fn_index_agrees_with_a_scan_on_random_tables() {
+        // A small LCG: deterministic, no dependency.
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: u64| {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (x >> 33) % n
+        };
+        let names = ["f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9"];
+        for _ in 0..200 {
+            // Non-overlapping sized functions laid out left to right, and
+            // zero-sized ones anywhere; then shuffled.
+            let mut fns = Vec::new();
+            let mut at = next(16);
+            for name in names {
+                if next(3) == 0 {
+                    fns.push((next(0x200), 0, name));
+                } else {
+                    let size = 1 + next(16);
+                    fns.push((at, size, name));
+                    at += size + next(8);
+                }
+            }
+            for i in (1..fns.len()).rev() {
+                fns.swap(i, next(i as u64 + 1) as usize);
+            }
+            let index = FnIndex::new(fns.iter().copied());
+            for addr in 0..0x220 {
+                assert_eq!(index.lookup(addr), scan(&fns, addr), "addr {addr:#x} in {fns:?}");
+            }
+        }
     }
 
     #[test]

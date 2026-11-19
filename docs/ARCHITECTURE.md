@@ -4294,26 +4294,40 @@ kernel. The kernel is the trusted computing base.
   (`lumen_perf::Buffer`: one writer, the CPU's own interrupt; lock-free,
   never waits, allocates nothing; armed for a count and refusing samples
   past it; each arming has a new generation in the buffer's state word, so
-  a record raced by a re-arm never lands in the later arming). Otherwise the tick pays one atomic load (`perf::on_tick`). A
-  profile is a number of samples per CPU on every CPU whose scheduler
-  runs (default 1000, at most 2048), never a duration, so a loaded host
-  makes it slower, not smaller; Ctrl-C or `q` stops it early and the header
-  says how many each CPU took. The busy samples are ranked by function
-  (symbolized once per distinct address with `symbols`, demangled) or, with
-  `--threads`, by thread (name and id); idle samples are counted in the
-  header and in no row; the share column is a row's part of the busy
-  samples. One profile at a time. `perf burn [cpu]` spins a thread
+  a record raced by a re-arm never lands in the later arming). Otherwise
+  the tick pays one atomic load (`perf::on_tick`). A profile is a number
+  of samples per CPU on every CPU whose scheduler runs (default 1000, at
+  most 2048), never a duration, so a loaded host makes it slower, not
+  smaller. Ctrl-C or `q` stops it early, and the header then says how many
+  each CPU took. A CPU that takes no tick across 100 polls in a row while
+  another CPU ticks (`lumen_perf::Silence`, judged by progress, not time)
+  is reported once ("cpu N has taken no samples (interrupts off?); q
+  stops") and marked `(silent)` in a stopped profile's header. The busy
+  samples are ranked by function or, with `--threads`, by thread (name
+  and id; `-` for a thread the scheduler no longer has a record of, or id
+  0, a tick before its CPU's threads were set up). Functions are found
+  through a sorted index of the kernel's function symbols
+  (`lumen_perf::FnIndex`, built on the first profile and kept, by binary
+  search), one lookup per distinct address. Idle samples are counted in
+  the header and in no row. They include `smp::run_on` jobs, which an AP
+  runs on its idle thread. The share column is a row's part of the busy
+  samples. One profile at a time. `perf top` refuses to run in a pipeline:
+  its header makes the table one the filters can't read, and it waits for
+  its samples. `perf burn [cpu]` spins a thread
   (`perf-burn`) in `perf::burn_loop` on a CPU (the last one by default) until
-  `perf burn stop`, something known to profile; each burn has its own stop
+  `perf burn stop`, something known to profile. Each burn has its own stop
   flag, and a stopping burn keeps the slot until its thread has ended, so a
-  start meanwhile is refused. Limits: a sample is
-  wherever the tick landed, so code that runs with interrupts off is
-  charged to the instruction after it re-enables them, and nothing
-  unwinds: a function's callers aren't credited. A WASM app (M5) shows up
-  by function as `wasmi`'s interpreter, not as its own functions; by
-  thread it shows up by its thread's name. Not in pipelines: `perf top`
-  blocks for its samples and stops on a key, which a records producer
-  can't wait for.
+  start meanwhile is refused. The start's wait for the thread to be in its
+  loop stops on a key. `perf burn stop`'s join can't be interrupted, but it
+  ends at the thread's next turn round the loop. Limits:
+  - A sample is wherever the tick landed. Code that runs with interrupts
+    off is charged to the instruction after it re-enables them, often
+    `IrqOff::drop` or `irq::restore`. Ticks don't queue, so a long stretch
+    with interrupts off counts once.
+  - Nothing unwinds, so a function's callers aren't credited.
+  - Once WASM apps run (#199), an app will show up by function as `wasmi`'s
+    interpreter, not as its own functions; by thread it will show up by its
+    thread's name.
 - **Learning:** `explain <subsystem>` and a guided tour link each subsystem to
   its source and docs inside the OS (M5+).
 

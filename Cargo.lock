@@ -315,6 +315,9 @@ version = "0.0.1"
 [[package]]
 name = "lumen-perf"
 version = "0.0.1"
+dependencies = [
+ "lumen-time",
+]
 
 [[package]]
 name = "lumen-png"

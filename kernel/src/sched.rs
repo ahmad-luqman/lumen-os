@@ -657,6 +657,13 @@ pub fn running_id_here() -> Option<(u64, bool)> {
     running_here().map(|(id, _)| (id, id == IDLE_ID[cpu].load(Ordering::Relaxed)))
 }
 
+/// CPU `cpu`'s idle thread's id (0 before its threads are set up, or for a
+/// CPU that doesn't exist).
+#[cfg(feature = "ktest")]
+pub fn idle_thread_id(cpu: usize) -> u64 {
+    IDLE_ID.get(cpu).map_or(0, |i| i.load(Ordering::Relaxed))
+}
+
 /// Can the running thread block here? Only with interrupts on and
 /// everything [`blockable_but_for_interrupts`] asks.
 fn can_block(cpu: usize) -> bool {

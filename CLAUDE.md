@@ -261,9 +261,11 @@ own PR that updates that doc first.
   as bands to a thread per CPU through `sched::scope`) and Life window (#157).
   `perf.rs`: `perf top`, the sampling profiler (#205): the timer tick's
   samples (`on_tick`, one load unless a profile runs) into a per-CPU
-  `lumen_perf::Buffer`, `profile` (a count per CPU, not a duration),
-  ranked by function (`symbols`) or `--threads`; `perf burn` spins
-  `burn_loop` on a CPU to have something to profile.
+  `lumen_perf::Buffer`, `profile` (a count per CPU, not a duration; a
+  `Profiling` guard disarms; silent CPUs reported), ranked by function
+  (a cached `FnIndex` over `symbols::functions`) or `--threads`; refused
+  in a pipeline; `perf burn` spins `burn_loop` on a CPU (`StartError`,
+  `StopError`; a stopping burn keeps its slot until joined).
   `font.rs`: the desktop's anti-aliased text (`lumen-font`): `font::face`,
   the UI font parsed on first use and shared; `font::Text`, one drawing
   thread's glyph cache over it (`draw` glyph by glyph inside a clip,
@@ -283,8 +285,11 @@ own PR that updates that doc first.
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
 - `crates/lumen-perf`: the sampling profiler's logic (#205): `Buffer`, a
   lock-free sample buffer with one writer (a CPU's timer interrupt) armed
-  for a count, `by_function`/`by_thread` rankings with idle counted apart,
-  and `perf top`'s arguments (host-tested, incl. a writer racing re-arms).
+  for a count (an arming generation in its state word), `by_function`/
+  `by_thread` rankings with idle counted apart, `all_taken`, `Silence`
+  (a CPU that stopped ticking, by progress), `header`, `FnIndex` (functions
+  by binary search, agreeing with `lumen_elf`'s scan) and `perf top`'s
+  arguments (host-tested, incl. a writer racing re-arms).
 - `crates/lumen-font`: anti-aliased TrueType text: `fontdue` (no `simd`)
   behind `Face` (parsed once, shared read-only; `measure`) and `Font`
   (a face plus its own glyph cache keyed by (glyph, pixel size), bounded
