@@ -7,10 +7,21 @@
 //! the frequency `time` calibrates; the shell's `trace` shows them raw). Each CPU
 //! records into its own ring ([`ring`] picks the current one), and each event
 //! carries the CPU's index; the boot timeline reads the boot CPU's.
+//!
+//! X-ray's events (run-queue changes, device interrupts handled, locks that
+//! waited) go into a second set of rings, one per CPU ([`xray_ring`]; the
+//! typed recorders [`record_run_queue`], [`record_irq`], [`record_lock_wait`]),
+//! so their volume never pushes the boot's events or the crash report's last
+//! events out of the first. [`read`] reads either ring of any online CPU:
+//! events since a sequence number, with the gap counted, as the `Trace`
+//! capability (section 8; its host functions come in #199) will hand them
+//! to apps. Kind numbers, the X-ray kinds' layouts and which ring each kind
+//! goes to are `lumen_trace::kind`'s.
 
 use core::fmt;
 
-use lumen_trace::{Event, Missing, TraceRing};
+use lumen_trace::kind::{self, Irq, LockWait, RunQueue, RunQueueOp, Switch};
+use lumen_trace::{Event, Missing, Since, Stream, TraceRing};
 
 use crate::arch;
 
@@ -19,36 +30,77 @@ pub const EVENTS: usize = 4096;
 
 static RINGS: [TraceRing<EVENTS>; arch::MAX_CPUS] = [const { TraceRing::new() }; arch::MAX_CPUS];
 
-/// What an event records. Stored as the event's `kind`. Values start at 1.
+/// Events an X-ray ring holds (a power of two): 224 KiB a CPU, as the main
+/// ring. Estimates, not tested: an idle AP records about none, the boot CPU
+/// a few dozen a second (each wake of a thread queues and dequeues it; a
+/// `yield_now` that picks the same thread again records nothing), a busy
+/// CPU a few hundred (a switch every 10 ms slice queues one thread and
+/// dequeues another; a thread polling by yielding while another is ready,
+/// two per yield), plus one per device interrupt and one per lock that
+/// waited.
+/// The main ring's size, so [`read`] serves both with one type.
+pub const XRAY_EVENTS: usize = EVENTS;
+
+static XRAY_RINGS: [TraceRing<XRAY_EVENTS>; arch::MAX_CPUS] = [const { TraceRing::new() }; arch::MAX_CPUS];
+
+/// What an event records. Stored as the event's `kind`; the numbers are
+/// `lumen_trace::kind`'s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
 pub enum Kind {
     /// `args[0]`: a [`BootPhase`].
-    BootPhase = 1,
+    BootPhase = kind::BOOT_PHASE,
     /// `args`: vector, rip, error code (0 if the vector pushes none).
     /// Recorded for every CPU exception and for device interrupts nothing
     /// handles; not for the timer, spurious interrupts or local APIC errors
     /// (counted instead: at 1 kHz the timer would flood the ring).
-    Exception = 2,
+    Exception = kind::EXCEPTION,
     /// `args[0]`: level (1 = error .. 5 = trace); `args[1]`: the subsystem
     /// tag's first 8 bytes, little-endian (longer tags are cut). Only lines
     /// that pass the log-level filter are recorded.
-    Log = 3,
+    Log = kind::LOG,
     /// A panic is being reported; `args[0]`: the source line, if known.
-    Panic = 4,
+    Panic = kind::PANIC,
     /// The scheduler switched threads on this CPU. `args`: the previous
     /// thread's id, the next thread's id, the previous thread's state
     /// (`sched::State`: ready when preempted or yielding (also the idle
     /// thread, and a thread another CPU woke before it switched out), or
     /// sleeping, blocked, dead).
-    Switch = 5,
+    Switch = kind::SWITCH,
+    /// X-ray ring: a CPU's run queue changed ([`RunQueue`]), recorded into
+    /// that CPU's X-ray ring under the queue's lock ([`record_run_queue`]).
+    RunQueue = kind::RUN_QUEUE,
+    /// X-ray ring: a device interrupt a handler took ([`Irq`]: an I/O APIC
+    /// input or an MSI vector; not the timer, whose ticks are counted).
+    Irq = kind::IRQ,
+    /// X-ray ring: a `SpinLock` had to wait ([`LockWait`]).
+    LockWait = kind::LOCK_WAIT,
     /// Recorded by in-kernel tests.
-    Test = 0xff,
+    Test = kind::TEST,
+}
+
+impl Kind {
+    /// Whether it goes to the X-ray rings (`lumen_trace::kind::stream_of`):
+    /// those have typed recorders, and `ktrace!` refuses them at compile
+    /// time.
+    pub const fn is_xray(self) -> bool {
+        matches!(kind::stream_of(self as u16), Stream::Xray)
+    }
 }
 
 impl Kind {
     // Keep in step with the enum: a kind missing here prints as a raw number.
-    const ALL: [Kind; 6] = [Kind::BootPhase, Kind::Exception, Kind::Log, Kind::Panic, Kind::Switch, Kind::Test];
+    const ALL: [Kind; 9] = [
+        Kind::BootPhase,
+        Kind::Exception,
+        Kind::Log,
+        Kind::Panic,
+        Kind::Switch,
+        Kind::RunQueue,
+        Kind::Irq,
+        Kind::LockWait,
+        Kind::Test,
+    ];
 
     fn from_raw(raw: u16) -> Option<Kind> {
         Self::ALL.into_iter().find(|&k| k as u16 == raw)
@@ -61,6 +113,9 @@ impl Kind {
             Kind::Log => "log",
             Kind::Panic => "panic",
             Kind::Switch => "switch",
+            Kind::RunQueue => "runq",
+            Kind::Irq => "irq",
+            Kind::LockWait => "lock",
             Kind::Test => "test",
         }
     }
@@ -166,6 +221,110 @@ pub fn boot_ring() -> &'static TraceRing<EVENTS> {
     &RINGS[0]
 }
 
+/// CPU `cpu`'s X-ray ring (`None` past the CPUs Lumen supports).
+pub fn xray_ring(cpu: usize) -> Option<&'static TraceRing<XRAY_EVENTS>> {
+    XRAY_RINGS.get(cpu)
+}
+
+/// Record a run-queue change in the X-ray ring of the queue's CPU
+/// (`rq.cpu`), stamped with this CPU's index (another CPU's when a wake
+/// from here queues there). The scheduler calls it under that queue's
+/// lock, so the ring holds the queue's changes in order. Lock-free, never
+/// allocates.
+pub fn record_run_queue(rq: RunQueue) {
+    debug_assert!(usize::from(rq.cpu) < arch::MAX_CPUS, "a run queue past MAX_CPUS: {rq:?}");
+    if let Some(ring) = XRAY_RINGS.get(usize::from(rq.cpu)) {
+        record_xray(ring, Kind::RunQueue, rq.args());
+    }
+}
+
+/// Record a device interrupt a handler took in this CPU's X-ray ring.
+/// Lock-free, never allocates: interrupt handlers call it.
+pub fn record_irq(irq: Irq) {
+    record_xray(&XRAY_RINGS[arch::cpu_index()], Kind::Irq, irq.args());
+}
+
+/// Record a lock that waited in this CPU's X-ray ring. Lock-free, never
+/// allocates, never logs: `SpinLock::lock` calls it holding the lock.
+pub fn record_lock_wait(w: LockWait) {
+    record_xray(&XRAY_RINGS[arch::cpu_index()], Kind::LockWait, w.args());
+}
+
+/// The typed recorders' one path into an X-ray ring (the main ring's,
+/// [`record_at`], refuses X-ray kinds).
+fn record_xray(ring: &TraceRing<XRAY_EVENTS>, kind: Kind, args: [u64; 4]) {
+    let _ = ring.record(arch::rdtsc(), arch::cpu_index() as u16, kind as u16, 0, args);
+}
+
+/// Record a switch in this CPU's main ring.
+pub fn record_switch(sw: Switch) {
+    record_in(ring(), Kind::Switch, sw.args());
+}
+
+/// One past the highest online CPU's index: the CPUs [`read`] may accept
+/// are below it (an index below it may still be offline: indices can have
+/// holes, e.g. an AP that didn't come online). The `Trace` capability's
+/// `trace_cpus`.
+pub fn cpus() -> usize {
+    (0..arch::MAX_CPUS).rev().find(|&c| crate::smp::online_lapic_id(c).is_some()).map_or(0, |c| c + 1)
+}
+
+/// Why [`read`] refused (the `Trace` capability answers both
+/// `BadArgument`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadError {
+    /// The CPU isn't online (or is past the CPUs Lumen supports).
+    NoSuchCpu,
+    /// `since` is past the ring's next sequence number, `next` (as read when
+    /// refusing): numbers no event has had yet, which a reader passing back
+    /// the last `next` never asks for.
+    SinceAhead { next: u64 },
+}
+
+impl fmt::Display for ReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReadError::NoSuchCpu => f.write_str("no such cpu online"),
+            ReadError::SinceAhead { next } => write!(f, "since is past the ring's next sequence number, {next}"),
+        }
+    }
+}
+
+/// Copy CPU `cpu`'s events in `stream` from sequence number `since` on
+/// into `out` (`TraceRing::read_since`: each number from `since` to the
+/// result's `next` copied or counted missed, once; pass `next` back as the
+/// next `since`; `since` 0 reads from the oldest event the ring holds,
+/// counting the numbers before it missed). Refuses a CPU that isn't online
+/// and a `since` past the ring's next sequence number. Lock-free.
+pub fn read(stream: Stream, cpu: usize, since: u64, out: &mut [Event]) -> Result<Since, ReadError> {
+    if crate::smp::online_lapic_id(cpu).is_none() {
+        return Err(ReadError::NoSuchCpu);
+    }
+    let ring: &TraceRing<EVENTS> = match stream {
+        Stream::Main => &RINGS[cpu],
+        Stream::Xray => &XRAY_RINGS[cpu],
+    };
+    let next = ring.written();
+    if since > next {
+        return Err(ReadError::SinceAhead { next });
+    }
+    Ok(ring.read_since(since, out))
+}
+
+/// The newest readable run-queue event in CPU `cpu`'s X-ray ring, and its
+/// sequence number: `None` if the ring holds none (none recorded yet, or
+/// all overwritten since). The queue's length while its lock is held
+/// (`sched::run_queue` reads it there), since a change records under it.
+pub fn newest_run_queue(cpu: usize) -> Option<(RunQueue, u64)> {
+    let ring = xray_ring(cpu)?;
+    let head = ring.written();
+    // Only this CPU's queue records here (`record_run_queue` routes by it).
+    (head.saturating_sub(XRAY_EVENTS as u64)..head)
+        .rev()
+        .filter_map(|seq| ring.read(seq))
+        .find_map(|e| RunQueue::decode(&e).map(|rq| (rq, e.seq)))
+}
+
 /// Record an event in `ring` now. Use [`ktrace!`](crate::ktrace!) instead.
 pub fn record_in<const N: usize>(ring: &TraceRing<N>, kind: Kind, args: [u64; 4]) {
     record_at(ring, arch::rdtsc(), kind, args);
@@ -178,6 +337,7 @@ pub fn record_in<const N: usize>(ring: &TraceRing<N>, kind: Kind, args: [u64; 4]
 /// recorded after (it stamps this CPU's index, read through GS, which
 /// `arch::init_early` sets).
 pub fn record_at<const N: usize>(ring: &TraceRing<N>, tsc: u64, kind: Kind, args: [u64; 4]) {
+    debug_assert!(!kind.is_xray(), "{kind:?} goes to the X-ray rings, through its typed recorder");
     // pid 0 until processes (M2) exist. A dropped event is counted in the
     // ring's `dropped()`; recording never fails loudly.
     let _ = ring.record(tsc, arch::cpu_index() as u16, kind as u16, 0, args);
@@ -328,9 +488,10 @@ pub const fn args<const M: usize>(given: [u64; M]) -> [u64; 4] {
 /// integers or fieldless enums.
 #[macro_export]
 macro_rules! ktrace {
-    ($kind:expr $(, $arg:expr)* $(,)?) => {
+    ($kind:expr $(, $arg:expr)* $(,)?) => {{
+        const { assert!(!$kind.is_xray(), "an X-ray kind: use its typed recorder") };
         $crate::trace::record_in($crate::trace::ring(), $kind, $crate::trace::args([$($arg as u64),*]))
-    };
+    }};
 }
 
 /// The first 8 bytes of a tag, packed little-endian (zero-padded), so a log
@@ -377,16 +538,35 @@ impl fmt::Display for Describe<'_> {
                 }
             }
             Kind::Panic => write!(f, " line={}", a[0]),
-            Kind::Switch => {
-                write!(f, " from={} to={}", a[0], a[1])?;
-                match crate::sched::State::name_of(a[2]) {
-                    Some(state) => write!(f, " ({state})"),
-                    None => write!(f, " state={}", a[2]),
+            Kind::Switch => match Switch::decode(e) {
+                Some(sw) => {
+                    write!(f, " from={} to={} ({})", sw.from, sw.to, crate::sched::State::from(sw.state).name())
                 }
-            }
-            Kind::Test => write!(f, " args=[{:#x}, {:#x}, {:#x}, {:#x}]", a[0], a[1], a[2], a[3]),
+                None => write!(f, " from={} to={} state={}", a[0], a[1], a[2]),
+            },
+            Kind::RunQueue => match RunQueue::decode(e) {
+                Some(rq) => {
+                    let op = if rq.op == RunQueueOp::Enqueue { "enqueue" } else { "dequeue" };
+                    write!(f, " queue={} {op} thread={} len={}", rq.cpu, rq.thread, rq.len)
+                }
+                None => raw_args(f, a),
+            },
+            Kind::Irq => match Irq::decode(e) {
+                Some(irq) => write!(f, " vector={:#x} rip={:#x}", irq.vector, irq.rip),
+                None => raw_args(f, a),
+            },
+            Kind::LockWait => match LockWait::decode(e) {
+                Some(w) => write!(f, " lock={:#x} spins={} waited={} line={}", w.lock, w.spins, w.waited, w.line),
+                None => raw_args(f, a),
+            },
+            Kind::Test => raw_args(f, a),
         }
     }
+}
+
+/// ` args=[0x1, 0x2, 0x3, 0x4]`: an event's arguments, raw.
+fn raw_args(f: &mut fmt::Formatter<'_>, a: [u64; 4]) -> fmt::Result {
+    write!(f, " args=[{:#x}, {:#x}, {:#x}, {:#x}]", a[0], a[1], a[2], a[3])
 }
 
 /// Print the newest `n` events of the current CPU's ring, oldest first, one
@@ -705,7 +885,7 @@ crate::ktest!(
     fn describe_prints_unknown_values_raw() {
         use crate::kassert;
         let base = Event { seq: 7, tsc: 99, ..Event::default() };
-        let cases: [(Event, &str); 6] = [
+        let cases: [(Event, &str); 13] = [
             (Event { kind: 0x99, args: [1, 2, 3, 4], ..base }, "kind=0x0099 args=[0x1, 0x2, 0x3, 0x4]"),
             (Event { kind: Kind::BootPhase as u16, args: [42, 0, 0, 0], ..base }, "boot-phase phase=42"),
             (Event { kind: Kind::Log as u16, args: [9, pack_tag("mem"), 0, 0], ..base }, "log        level=9 mem"),
@@ -715,6 +895,22 @@ crate::ktest!(
                 "test       args=[0x7e57, 0x1, 0x2, 0x0]",
             ),
             (Event { cpu: 2, pid: 5, kind: Kind::Panic as u16, args: [12, 0, 0, 0], ..base }, "cpu=2 pid=5 panic"),
+            (Event { kind: Kind::Switch as u16, args: [1, 2, 3, 0], ..base }, "switch     from=1 to=2 (blocked)"),
+            (Event { kind: Kind::Switch as u16, args: [1, 2, 9, 0], ..base }, "switch     from=1 to=2 state=9"),
+            (
+                Event { kind: Kind::RunQueue as u16, args: [1, 3, 5, 1], ..base },
+                "runq       queue=1 enqueue thread=5 len=3",
+            ),
+            (
+                Event { kind: Kind::RunQueue as u16, args: [1, 2, 5, 2], ..base },
+                "runq       queue=1 dequeue thread=5 len=2",
+            ),
+            (Event { kind: Kind::RunQueue as u16, args: [1, 2, 5, 9], ..base }, "runq       args=[0x1, 0x2, 0x5, 0x9]"),
+            (Event { kind: Kind::Irq as u16, args: [0x54, 0x10, 0, 0], ..base }, "irq        vector=0x54 rip=0x10"),
+            (
+                Event { kind: Kind::LockWait as u16, args: [0x10, 3, 40, 7], ..base },
+                "lock       lock=0x10 spins=3 waited=40 line=7",
+            ),
         ];
         for (e, want) in cases {
             let line = describe(&e);
@@ -729,6 +925,381 @@ crate::ktest!(
         // Tags longer than 8 bytes are cut, not mangled.
         crate::kassert_eq!(pack_tag("framebuffer"), u64::from_le_bytes(*b"framebuf"));
         crate::kassert_eq!(pack_tag(""), 0);
+        Ok(())
+    }
+);
+
+/// Ktests: a buffer for one read of a whole ring, reused by each test.
+#[cfg(feature = "ktest")]
+fn ring_buffer() -> alloc::vec::Vec<Event> {
+    alloc::vec![Event::default(); XRAY_EVENTS]
+}
+
+/// Ktests: CPU `cpu`'s X-ray events from `since` on, in one read of the
+/// whole ring into `out`, and the numbers missed; a refusal is a diag line.
+#[cfg(feature = "ktest")]
+fn xray_since(cpu: usize, since: u64, out: &mut [Event]) -> Result<(&[Event], u64), &'static str> {
+    match read(Stream::Xray, cpu, since, out) {
+        Ok(r) => Ok((&out[..r.copied], r.missed)),
+        Err(e) => {
+            crate::ktest::diag(format_args!("reading cpu {cpu}'s X-ray ring from #{since}: {e}"));
+            Err("the X-ray ring refused the read")
+        }
+    }
+}
+
+/// Ktests: whether `kind` is one of X-ray's.
+#[cfg(feature = "ktest")]
+fn is_xray_kind(kind: u16) -> bool {
+    kind::stream_of(kind) == Stream::Xray
+}
+
+/// Ktests: make this CPU and CPU 1 take one lock in turn until one of them
+/// had to wait, and return that `lock` event, the ring it was read from
+/// (the waiting CPU's, which also recorded it: checked), and the line of
+/// the `lock` call that CPU made. Waits for the effect (up to 10 s, a
+/// safety net); times nothing.
+#[cfg(feature = "ktest")]
+fn a_lock_wait(out: &mut [Event]) -> Result<(LockWait, usize, u32), &'static str> {
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    static HOT: crate::sync::SpinLock<u64> = crate::sync::SpinLock::new(0);
+    /// The line of each CPU's `lock` call (this CPU, CPU 1).
+    static LINES: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+    static STOP: AtomicBool = AtomicBool::new(false);
+    static DONE: AtomicBool = AtomicBool::new(false);
+    /// Take it once, holding it a little so the other CPU finds it held.
+    fn take(slot: usize) {
+        let (mut g, line) = (HOT.lock(), line!());
+        LINES[slot].store(line, Ordering::Relaxed);
+        *g += 1;
+        for _ in 0..64 {
+            core::hint::spin_loop();
+        }
+    }
+    fn on_cpu_1() {
+        while !STOP.load(Ordering::Relaxed) {
+            take(1);
+        }
+        DONE.store(true, Ordering::Release);
+    }
+    STOP.store(false, Ordering::Relaxed);
+    DONE.store(false, Ordering::Relaxed);
+    let rings = [arch::cpu_index(), 1];
+    let addr = core::ptr::from_ref(&HOT).addr() as u64;
+    let since = rings.map(|c| xray_ring(c).map_or(0, |r| r.written()));
+    crate::smp::run_on_test(1, on_cpu_1)?;
+    let deadline = crate::time::now_ns() + 10_000_000_000;
+    let mut found = None;
+    while found.is_none() && crate::time::now_ns() < deadline {
+        for _ in 0..1000 {
+            take(0);
+        }
+        for (slot, &c) in rings.iter().enumerate() {
+            let (events, _) = xray_since(c, since[slot], out)?;
+            if let Some(e) = events.iter().find(|e| LockWait::decode(e).is_some_and(|w| w.lock == addr)) {
+                found = Some((*e, slot));
+                break;
+            }
+        }
+    }
+    STOP.store(true, Ordering::Relaxed);
+    if !crate::smp::job_reached(1, || DONE.load(Ordering::Acquire)) {
+        return Err("cpu 1 didn't stop taking the lock");
+    }
+    let (e, slot) = found.ok_or("no lock event for the lock in 10 s")?;
+    if usize::from(e.cpu) != rings[slot] {
+        crate::ktest::diag(format_args!("cpu {}'s ring: {}", rings[slot], Describe(&e)));
+        return Err("a lock event in another CPU's ring");
+    }
+    let w = LockWait::decode(&e).ok_or("not a lock event")?;
+    Ok((w, rings[slot], LINES[slot].load(Ordering::Relaxed)))
+}
+
+/// Ktests: claim an MSI vector (once a boot: vectors are never freed), send
+/// it to CPU 1 from CPU 1, and wait until its handler ran there; the vector,
+/// or why not. A real device interrupt, through `idt::handled`, on a CPU
+/// other than this one (so a recorder that ignored the CPU would show).
+#[cfg(feature = "ktest")]
+fn a_msi_on_cpu_1() -> Result<u8, &'static str> {
+    use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+    static VECTOR: AtomicU8 = AtomicU8::new(0);
+    /// The CPU the handler last ran on, plus one (0: not yet).
+    static RAN_ON: AtomicUsize = AtomicUsize::new(0);
+    static SENT: AtomicBool = AtomicBool::new(false);
+    fn handler() {
+        RAN_ON.store(arch::cpu_index() + 1, Ordering::Release);
+    }
+    fn on_cpu_1() {
+        let v = VECTOR.load(Ordering::Relaxed);
+        SENT.store(arch::apic::send_ipi(arch::apic::lapic_id(), v), Ordering::Release);
+    }
+    let vector = match VECTOR.load(Ordering::Relaxed) {
+        0 => {
+            let v = arch::idt::claim_msi_vector(handler).map_err(|_| "no MSI vector free")?;
+            VECTOR.store(v, Ordering::Relaxed);
+            v
+        }
+        v => v,
+    };
+    RAN_ON.store(0, Ordering::Relaxed);
+    SENT.store(false, Ordering::Relaxed);
+    crate::smp::run_on_test(1, on_cpu_1)?;
+    if !crate::smp::job_reached(1, || RAN_ON.load(Ordering::Acquire) != 0) {
+        crate::ktest::diag(format_args!("the self-IPI was sent: {}", SENT.load(Ordering::Acquire)));
+        return Err("the MSI vector's handler never ran");
+    }
+    crate::kassert_eq!(RAN_ON.load(Ordering::Acquire), 2);
+    Ok(vector)
+}
+
+crate::ktest!(
+    fn run_queue_changes_are_traced_in_order() {
+        // A thread spawned on CPU 1 is queued there (by this CPU) and taken
+        // off to run (by CPU 1): both are in CPU 1's X-ray ring, naming it,
+        // in that order. Every runq event in that ring is about CPU 1's
+        // queue, and each steps the length by one (up for a queue, down
+        // for a dequeue), so no change went unrecorded or out of order; and
+        // the newest says the queue's length, read under its lock.
+        use crate::{kassert, kassert_eq};
+        let mut out = ring_buffer();
+        let since = xray_ring(1).ok_or("no X-ray ring for cpu 1")?.written();
+        let h = crate::sched::spawn_on(1, "xray-runq", || {}).map_err(|_| "spawn on cpu 1 failed")?;
+        let id = h.thread().id();
+        crate::sched::join_bounded(h)?;
+        let (events, missed) = xray_since(1, since, &mut out)?;
+        kassert_eq!(missed, 0);
+        let queue: alloc::vec::Vec<(RunQueue, u16)> =
+            events.iter().filter_map(|e| RunQueue::decode(e).map(|rq| (rq, e.cpu))).collect();
+        kassert!(queue.iter().all(|(rq, _)| rq.cpu == 1));
+        let at = |op| queue.iter().position(|(rq, _)| rq.thread == id && rq.op == op);
+        let (queued, taken) = (at(RunQueueOp::Enqueue), at(RunQueueOp::Dequeue));
+        let (Some(q), Some(t)) = (queued, taken) else {
+            crate::ktest::diag(format_args!("thread {id}: queued at {queued:?}, taken at {taken:?}"));
+            return Err("the thread's queueing and dequeueing aren't both traced");
+        };
+        kassert!(q < t);
+        kassert_eq!(queue[q].1, arch::cpu_index() as u16);
+        kassert_eq!(queue[t].1, 1);
+        for pair in queue.windows(2) {
+            let (prev, next) = (pair[0].0, pair[1].0);
+            let step = match next.op {
+                RunQueueOp::Enqueue => prev.len + 1,
+                RunQueueOp::Dequeue => prev.len.wrapping_sub(1),
+            };
+            if next.len != step {
+                crate::ktest::diag(format_args!("{prev:?} then {next:?}"));
+                return Err("a run-queue change is missing from the trace");
+            }
+        }
+        let view = crate::sched::run_queue(1).ok_or("no cpu 1")?;
+        kassert_eq!(view.traced.map(|t| t.len), Some(view.len as u64));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn yielding_alone_records_no_run_queue_change() {
+        // A thread alone on its CPU that yields keeps running: nothing is
+        // queued or taken off, so its X-ray ring gets no runq event from
+        // it (a thread polling by yielding would fill the ring otherwise).
+        // On CPU 2 (or 1), in a thread that yields 1000 times; each other
+        // thread that ran there meanwhile (a dequeue of its own) may make
+        // one queue-and-dequeue pair of this one's.
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static ID: AtomicU64 = AtomicU64::new(0);
+        let mut out = ring_buffer();
+        let cpu = if crate::sched::running_on(2) { 2 } else { 1 };
+        let since = xray_ring(cpu).ok_or("no X-ray ring")?.written();
+        let h = crate::sched::spawn_on(cpu, "xray-yield", || {
+            ID.store(crate::sched::current().map_or(0, |t| t.id()), Ordering::Relaxed);
+            for _ in 0..1000 {
+                crate::sched::yield_now();
+            }
+        })
+        .map_err(|_| "spawn failed")?;
+        let id = h.thread().id();
+        crate::sched::join_bounded(h)?;
+        crate::kassert_eq!(ID.load(Ordering::Relaxed), id);
+        let (events, missed) = xray_since(cpu, since, &mut out)?;
+        crate::kassert_eq!(missed, 0);
+        let changes: alloc::vec::Vec<RunQueue> = events.iter().filter_map(RunQueue::decode).collect();
+        let mine = changes.iter().filter(|rq| rq.thread == id).count();
+        let others = changes.iter().filter(|rq| rq.thread != id && rq.op == RunQueueOp::Dequeue).count();
+        if mine > 2 + 2 * others {
+            crate::ktest::diag(format_args!("{mine} runq events for it; {others} other threads ran"));
+            return Err("yielding with nothing else ready recorded run-queue changes");
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_contended_lock_is_traced() {
+        // This CPU and CPU 1 take one lock in turn until one of them had to
+        // wait, which then says so in its own X-ray ring: the lock's
+        // address, how often it looked (at least once), how long it waited
+        // (more than nothing, less than the whole contention took), and
+        // the line of that CPU's `lock` call (through `#[track_caller]`).
+        use crate::{kassert, kassert_eq};
+        let mut out = ring_buffer();
+        let t0 = arch::rdtsc();
+        let (w, cpu, line) = a_lock_wait(&mut out)?;
+        let t1 = arch::rdtsc();
+        crate::ktest::diag(format_args!("cpu {cpu} waited: {w:?}"));
+        kassert!(w.spins > 0);
+        kassert!(w.waited > 0 && w.waited <= t1 - t0);
+        kassert!(line > 0);
+        kassert_eq!(w.line, line);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn xray_events_leave_the_main_ring_alone() {
+        // With X-ray's kinds recorded for real in the window (a thread
+        // queued and run on CPU 1, a device interrupt through an MSI
+        // vector on CPU 1, a lock that waited), and this CPU's X-ray ring
+        // then filled two laps over, the main rings get none of them (nor
+        // an `exception` for the MSI vector: it was handled): each main
+        // ring's new events are of the old kinds, none dropped; the boot
+        // timeline reads the same text as before (if it was complete: once
+        // the main ring has wrapped since boot it is unavailable either
+        // way, and only that is compared); and the crash report's view of
+        // this CPU's ring (`write_recent`) still reaches back to a marker
+        // recorded before the load.
+        use core::fmt::Write;
+
+        use crate::{kassert, kassert_eq};
+        const MARK: u64 = 0x5a7a;
+        let mut out = ring_buffer();
+        let text_of = |t: &Timeline| {
+            let mut b = alloc::string::String::new();
+            let _ = write!(b, "{t}");
+            b
+        };
+        let before = Timeline::boot();
+        let main_before: [u64; arch::MAX_CPUS] = core::array::from_fn(|c| RINGS[c].written());
+        let dropped_before: [u64; arch::MAX_CPUS] = core::array::from_fn(|c| RINGS[c].dropped());
+        let me = arch::cpu_index();
+        let mark =
+            ring().record(arch::rdtsc(), me as u16, Kind::Test as u16, 0, args([MARK])).ok_or("marker dropped")?;
+        let xray_before = [me, 1].map(|c| xray_ring(c).map_or(0, |r| r.written()));
+        let h = crate::sched::spawn_on(1, "xray-load", || {}).map_err(|_| "spawn on cpu 1 failed")?;
+        crate::sched::join_bounded(h)?;
+        let vector = a_msi_on_cpu_1()?;
+        let (events, _) = xray_since(1, xray_before[1], &mut out)?;
+        kassert!(events.iter().filter_map(RunQueue::decode).any(|rq| rq.cpu == 1));
+        let irq = events.iter().find(|e| Irq::decode(e).is_some_and(|irq| irq.vector == vector));
+        kassert_eq!(irq.map(|e| e.cpu), Some(1));
+        let (_, waiter, _) = a_lock_wait(&mut out)?;
+        crate::ktest::diag(format_args!("msi vector {vector:#x} on cpu 1; cpu {waiter} waited for the lock"));
+        for _ in 0..2 * XRAY_EVENTS {
+            record_irq(Irq { vector: 0, rip: 0 });
+        }
+        kassert!(xray_ring(me).map_or(0, |r| r.written()) - xray_before[0] >= 2 * XRAY_EVENTS as u64);
+        for c in 0..arch::MAX_CPUS {
+            let ring = &RINGS[c];
+            for seq in main_before[c]..ring.written() {
+                if let Some(e) = ring.read(seq)
+                    && (is_xray_kind(e.kind) || (e.kind == Kind::Exception as u16 && e.args[0] == u64::from(vector)))
+                {
+                    crate::ktest::diag(format_args!("cpu {c}'s main ring: {}", Describe(&e)));
+                    return Err("an X-ray event (or the handled MSI as an exception) in a main ring");
+                }
+            }
+            kassert_eq!(ring.dropped(), dropped_before[c]);
+        }
+        let after = Timeline::boot();
+        if before.is_complete() {
+            kassert_eq!(text_of(&after), text_of(&before));
+        } else {
+            crate::ktest::diag(format_args!("the boot timeline was already unavailable: {before}"));
+            kassert!(!after.is_complete());
+        }
+        // The crash report prints the newest events; ask for all since the
+        // marker (still well inside the ring) and find it first.
+        let since_mark = RINGS[me].written() - mark;
+        kassert!(since_mark < EVENTS as u64);
+        let mut text = alloc::string::String::new();
+        write_recent(&mut text, since_mark, "").map_err(|_| "write_recent failed")?;
+        let first = text.lines().next().unwrap_or("");
+        let mut want = alloc::string::String::new();
+        let _ = write!(want, "#{mark:<6}");
+        if !(first.starts_with(want.as_str()) && first.contains("test") && first.contains("0x5a7a")) {
+            crate::ktest::diag(format_args!("first of {since_mark}: {first:?}"));
+            return Err("the crash report's events don't reach back to the marker");
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn read_gives_each_stream_its_own_ring() {
+        // A test event recorded in this CPU's main ring is read back from
+        // `Stream::Main` and not from `Stream::Xray`; an X-ray event the
+        // other way round.
+        use crate::kassert;
+        let mut out = ring_buffer();
+        let me = arch::cpu_index();
+        let since = [RINGS[me].written(), XRAY_RINGS[me].written()];
+        let mark = ring().record(arch::rdtsc(), me as u16, Kind::Test as u16, 0, args([0x5717])).ok_or("dropped")?;
+        record_irq(Irq { vector: 0xee, rip: 0x5717 });
+        let has_mark = |out: &[Event]| out.iter().any(|e| e.seq == mark && e.kind == Kind::Test as u16);
+        let has_irq = |out: &[Event]| out.iter().any(|e| Irq::decode(e).is_some_and(|i| i.rip == 0x5717));
+        let main = read(Stream::Main, me, since[0], &mut out).map_err(|_| "main refused")?;
+        kassert!(has_mark(&out[..main.copied]) && !has_irq(&out[..main.copied]));
+        let xray = read(Stream::Xray, me, since[1], &mut out).map_err(|_| "x-ray refused")?;
+        kassert!(has_irq(&out[..xray.copied]) && !has_mark(&out[..xray.copied]));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn read_refuses_an_offline_cpu_and_a_since_ahead() {
+        // A CPU that isn't online (or past MAX_CPUS) and a `since` past the
+        // ring's next number are refused, the latter naming that number
+        // exactly (read with interrupts off: nothing on this CPU records
+        // meanwhile; only another CPU's wake can add to the X-ray ring, so
+        // that number is bracketed by the heads read around it); since ==
+        // next reads from there.
+        use crate::{kassert, kassert_eq};
+        let mut out = [Event::default(); 4];
+        let me = arch::cpu_index();
+        for (stream, ring) in [(Stream::Main, &RINGS[me]), (Stream::Xray, &XRAY_RINGS[me])] {
+            let (low, said, high) = {
+                let _off = arch::irq::push_off();
+                let low = ring.written();
+                let r = read(stream, me, low + 1, &mut out);
+                (low, r, ring.written())
+            };
+            let Err(ReadError::SinceAhead { next }) = said else {
+                return Err("a since one past the head wasn't refused");
+            };
+            kassert!(low <= next && next <= high);
+            if stream == Stream::Main {
+                kassert_eq!(next, low); // only this CPU writes its main ring
+            }
+            kassert_eq!(read(stream, arch::MAX_CPUS, 0, &mut out), Err(ReadError::NoSuchCpu));
+            let next = ring.written();
+            let r = read(stream, me, next, &mut out).map_err(|_| "since == next was refused")?;
+            kassert!(r.next >= next && r.next - next == r.copied as u64 + r.missed);
+        }
+        let offline = (0..arch::MAX_CPUS).find(|&c| crate::smp::online_lapic_id(c).is_none());
+        if let Some(c) = offline {
+            kassert_eq!(read(Stream::Xray, c, 0, &mut out), Err(ReadError::NoSuchCpu));
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn cpus_is_one_past_the_highest_online_cpu() {
+        // Every online CPU is below it, and the one just below it is online.
+        use crate::kassert;
+        let n = cpus();
+        kassert!((1..=arch::MAX_CPUS).contains(&n));
+        kassert!(crate::smp::online_lapic_id(n - 1).is_some());
+        kassert!((n..arch::MAX_CPUS).all(|c| crate::smp::online_lapic_id(c).is_none()));
         Ok(())
     }
 );

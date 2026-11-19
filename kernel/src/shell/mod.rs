@@ -32,6 +32,7 @@ mod commands;
 mod crash;
 mod pipe;
 pub(crate) mod sysinfo;
+mod xray;
 
 use crate::keyboard::{self, KeyCode};
 use crate::serial_in;

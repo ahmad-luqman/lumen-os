@@ -1344,7 +1344,8 @@ drawing the shown one) and `kernel/src/vt.rs` (routing keys to them);
 
 `crates/lumen-shell` (host-tested) and `kernel/src/shell/` (the consoles,
 `mod.rs`; the commands, `commands.rs`; the system commands, `sysinfo.rs`;
-pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
+pipelines, `pipe.rs`; the deliberate faults, `crash.rs`; `trace runq` and
+`trace xray`, `xray.rs`).
 
 - **Five shells, one per console,** each with its own line and history
   (and one more per terminal window on the desktop, #155: `term-shell`,
@@ -1481,7 +1482,8 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
   them (a ktest checks it has a line for each command in the table, no
   name is there twice, and the layout), `echo` (its words joined by
   single spaces), `int3`, `crash <kind> [cpu|thread]` (the thread is
-  `shell-crash`), `trace [n]`, `heap`, `ticks`, `kbd`, `term [text [window]]`
+  `shell-crash`), `trace [n]` (this CPU's main ring), `trace runq [park <n>]`
+  and `trace xray <cpu> [since]` (section 14, X-ray rings), `heap`, `ticks`, `kbd`, `term [text [window]]`
   (a terminal window's rows with its id, #155), `terminal` (section 11),
   `clear`, `vt [n]` (the virtual terminals: above), `colors`, `seq`, `sleep`, `random [bytes | --stats]`
   (section 7, "Randomness"), `uptime`, `clocks`, `exit` (kmon's;
@@ -3098,7 +3100,7 @@ run the app.
 | `text_line_height(h: i32, px: i32) -> i32` | pixels | on the `Desktop` handle |
 | `text_measure(h: i32, px: i32, text: i32, len: i32) -> i32` | advance in pixels | `font::Text::measure` |
 | `text_draw(h: i32, canvas: i32, args: i32, text: i32, len: i32) -> i32` | advance in pixels | a `TextDraw` at `args`; below |
-| `trace_cpus(h: i32) -> i32` | CPUs with rings | |
+| `trace_cpus(h: i32) -> i32` | one past the highest online CPU | below |
 | `trace_read(h: i32, stream: i32, cpu: i32, since: i64, buf: i32, len: i32) -> i32` | events copied | below |
 
 Text (`log`, `panic`, titles, `text_*`) is at most `TEXT_BYTES` (titles
@@ -3415,26 +3417,37 @@ SSE); #197 checks the results' bits.
 #### The `Trace` capability (#198, read by X-ray in #208)
 
 - **Streams:** `stream` 0 is a CPU's main trace ring, `stream` 1 its
-  X-ray ring (#198). #198 adds to section 14 which kinds go to which
-  ring.
+  X-ray ring (#198; `lumen_trace::Stream`). Section 14 says which kinds
+  go to which ring (`lumen_trace::kind::stream_of`).
 - **`trace_read`** reads with `lumen_trace::TraceRing::read_since(since,
   out) -> Since { copied, missed, next }`, which never blocks a writer:
   every sequence number from `since` to `next` is either copied or
-  counted in `missed` once (gone from the ring, dropped, overwritten),
-  and an event still being written ends the read there, for the next
-  read. `buf` gets the trace header, then `copied` trace events (at most
+  counted in `missed` once (gone from the ring, dropped, overwritten).
+  An event not yet readable (being written, or its number claimed but
+  not yet its slot) ends the read there, for the next read; one that
+  never lands (dropped, or its writer stopped mid-write) can't be told
+  from that until the ring's head passes its number by the ring's size,
+  and is counted missed then, so a real drop holds a reader there for a
+  lap. `buf` gets the trace header, then `copied` trace events (at most
   `TRACE_EVENTS_PER_READ` and what fits); the result is `copied`. A `len`
   below one header and one event is `BufferTooSmall`; a negative or
-  unknown `stream` or `cpu`, or a `since` that is negative or past the
-  ring's next sequence number, is `BadArgument` (`since` equal to it
-  copies nothing). `since` 0 reads from the oldest event the ring holds.
+  unknown `stream`, a `cpu` that is negative or not online, or a `since`
+  that is negative or past the ring's next sequence number, is
+  `BadArgument` (`since` equal to it copies nothing yet). `since` 0
+  reads from the oldest event the ring holds (the numbers before it
+  counted missed).
+- **`trace_cpus`** is one past the highest online CPU's index
+  (`trace::cpus`): every CPU `trace_read` accepts is below it, but an
+  index below it may still be offline (indices can have holes).
 - **`pid`** is 0 for every event in M5 (the kernel's); an app shows by
   its thread's id in switch and run-queue events, which `apps`' `thread`
   column names.
 - **Kinds** are numbered in one place, `lumen_trace::kind` (#198 adds
   it): numbers and argument meanings stable, pinned by a
   `cargo:lumen-trace` test, used by the kernel's `trace::Kind` and
-  re-exported by `lumen-app-api`.
+  re-exported by `lumen-app-api`. The kinds X-ray reads have typed
+  layouts there (`Switch` with `ThreadState`, `RunQueue`, `Irq`,
+  `LockWait`), each pinned.
 
 #### Building and bundling
 
@@ -4882,7 +4895,8 @@ kernel. The kernel is the trusted computing base.
   writers. One 4096-event ring per CPU (up to 8); events carry the CPU's
   index, and the boot timeline reads the boot CPU's ring.
   Recorded so far: boot phases, CPU exceptions and device interrupts nothing
-  handles (not the timer, spurious interrupts or local APIC errors), log
+  handles (not the timer, spurious interrupts or local APIC errors; I/O
+  APIC and MSI interrupts a handler takes go to the X-ray rings, below), log
   lines, thread switches (`switch from=<id> to=<id> (<state>)`, the
   previous thread's state; an idle boot CPU records about 20 a second,
   the serial shell's 100 ms safety-net wakes: section 4, step 4). Later: syscalls, page faults, allocator
@@ -4891,10 +4905,66 @@ kernel. The kernel is the trusted computing base.
   under TCG locally; TCG's TSC rate depends on the host, so this is not
   comparable across machines or to cycles). Timestamps are raw TSC ticks
   (the boot timeline converts its phases; the shell and crash reports show them
-  raw). The shell's `trace [n]` prints the newest events of the boot CPU's ring
+  raw). The shell's `trace [n]` prints the newest events of this CPU's ring (the
+  serial shell runs on the boot CPU)
   (a gap line says why an event is missing), and the serial crash report
   includes the last 16 of the reporting CPU's (tested for a page fault and a
   panic, and on an AP).
+- **X-ray rings (built, #198):** what X-ray shows goes into a second set of
+  rings, one 4096-event ring per CPU of the same kind
+  (`trace::xray_ring`), never into the main ones, so however much the
+  scheduler, the devices and the locks record, the boot timeline and the
+  crash report's last 16 events read what they did
+  (`ktest:lumen_kernel::trace::xray_events_leave_the_main_ring_alone`
+  records each kind for real, fills a ring two laps over, and scans the
+  main rings). They are always on: nothing in them comes at the timer's
+  rate (a thread yielding with nothing else ready records nothing), so,
+  as estimates (not tested), an idle AP records about none, the boot CPU
+  a few dozen events a second, and a busy CPU a few hundred (two per
+  yield for a thread polling by yielding while another is ready), plus
+  one per device interrupt and lock wait; a reader can start at any
+  moment with the history the ring still holds.
+
+  Which ring each kind goes to (numbers, layouts and `stream_of` in
+  `lumen_trace::kind`, shared with apps and host-tested; every event's
+  `pid` is 0, the kernel's):
+
+  | Kind | Ring | Recorded |
+  |---|---|---|
+  | `boot-phase`, `exception`, `log`, `panic`, `switch` (`Switch`: from, to, the previous thread's `ThreadState`) | main, the recording CPU's | as above |
+  | `runq` (`RunQueue`: queue's CPU, length after, thread, enqueue or dequeue) | X-ray, *the queue's* CPU's | under that queue's lock, by whichever CPU changed it (a wake from another CPU queues there): the ring holds its queue's changes in order, each length one step from the last, and its newest is the queue's length while the lock is held (`sched::run_queue`) |
+  | `irq` (`Irq`: vector, interrupted rip) | X-ray, the CPU that took it | for each I/O APIC input or MSI vector a handler takes (`idt::handled`); the timer's ticks are counts (`cpus`, `ticks`), not events |
+  | `lock` (`LockWait`: address, looks that found it held, TSC ticks waited, the `lock` call's line, no file) | X-ray, the waiting CPU's | holding the lock, out of line, taking no lock, allocating and logging nothing, so it can't recurse; an uncontended `lock` records nothing |
+
+  The kernel's recorders are typed (`trace::record_run_queue`,
+  `record_irq`, `record_lock_wait`, `record_switch`), so the routing
+  above holds by construction: `ktrace!` refuses an X-ray kind at compile
+  time (`Kind::is_xray`), and the main ring's `record_at` asserts it in
+  debug builds. The reader is `trace::read(stream, cpu, since, out) ->
+  Result<Since, ReadError>`, either ring (`Stream::Main`, `Stream::Xray`)
+  of an online CPU (`trace::cpus()` is one past the highest online index;
+  indices can have holes), over `TraceRing::read_since` (host-tested): the events
+  from sequence number `since` on, oldest first, as many as fit, and
+  `Since { copied, missed, next }`, in which every number from `since` to
+  `next` is copied or counted missed exactly once. Missed means out of
+  the ring already (more than a lap behind its head: a first read from 0
+  of a wrapped ring counts every number it lost), overwritten, or never
+  written. An event not readable yet (being written, or its number
+  claimed but not its slot) ends the read there and the next read gets
+  it; one that never lands (dropped because its slot was busy or held a
+  newer event, or its writer stopped mid-write) can't be told apart from
+  that until the head passes its number by the ring's size (it then
+  leaves the window), and is counted missed then, so a real drop holds a
+  reader there for a lap. A CPU
+  that isn't online and a `since` past the ring's next number are
+  refused. That is the shape the `Trace` capability's read will have
+  (section 8; its host functions come in #199), which X-ray (#208) will
+  poll with the last `next`. The serial
+  shell's `trace xray <cpu> [since]` prints an X-ray ring that way;
+  `trace runq` each queue's length both ways (`MISMATCH` if they differ);
+  `trace runq park <n>` holds the shell's CPU still (its interrupts off:
+  no tick, its tick count shown unchanged) while `n` threads wait on its
+  queue, for `scenario:test_xray::test_run_queue_matches_trace`.
 - **Boot timeline:** boot phases emit trace events, printed as a timeline at
   boot complete (section 4). The fast-boot target is under 1 s from kernel
   entry to the shell, measured in the guest from TSC timestamps (never by
@@ -5005,10 +5075,10 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/keyboard.rs  the PS/2 keyboard: 8042 init, IRQ 1, decoding (pc-keyboard), lumen.keymap
   src/time.rs      TSC and local APIC timer calibration, the boot origin, now_ns, sleep, ticks
   src/smp.rs       starting the other CPUs, run_on
-  src/sched.rs     kernel threads: per-CPU run queues, preemption, sleep, wait queues
+  src/sched.rs     kernel threads: per-CPU run queues (each change an X-ray runq event), preemption, sleep, wait queues
   src/boot.rs      Limine requests
   src/cmdline.rs   kernel command line (flags, key=value)
-  src/sync.rs      SpinLock (interrupts off while held)
+  src/sync.rs      SpinLock (interrupts off while held; a wait an X-ray lock event)
   src/klog.rs      logger (levels, subsystem tags, serial timestamps, the ring dmesg reads)
   src/rtc.rs       the CMOS RTC: date and time (taken as UTC) for `date`
   src/fb.rs        framebuffer: pixels, glyphs, the hello screen (draw_header), the crash screen
@@ -5021,7 +5091,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/symbols.rs   kernel symbol table (symbolized crash reports)
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
-  src/shell/       the shells (lumen-shell): serial and the virtual terminals' consoles, the commands, system commands (sysinfo.rs), deliberate faults (crash.rs)
+  src/shell/       the shells (lumen-shell): serial and the virtual terminals' consoles, the commands, system commands (sysinfo.rs), deliberate faults (crash.rs), trace runq/xray (xray.rs)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section
 crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-gfx, lumen-acpi, lumen-pci, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, lumen-font, lumen-png, lumen-wm, lumen-app-api (the app interface's types, also built for wasm32), ...)

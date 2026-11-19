@@ -525,14 +525,24 @@ fn unexpected(frame: &TrapFrame) {
     }
 }
 
+/// Run a device interrupt's handler, recorded first as an `irq` event in
+/// this CPU's X-ray ring (lock-free; an NMI arriving mid-record never
+/// returns into it: the crash path stops the CPU).
+fn handled(frame: &TrapFrame, handler: fn()) {
+    // Every vector here (I/O APIC or MSI) is below 256.
+    crate::trace::record_irq(lumen_trace::kind::Irq { vector: frame.vector as u8, rip: frame.rip });
+    handler();
+}
+
 /// Called by `lumen_isr_common` for every vector; counts it first
 /// ([`vector_count`]). CPU exceptions are traced
 /// and fatal (bar #BP). Device interrupts are never fatal: the timer and
 /// spurious interrupts are counted, not traced (at 1 kHz they would flood
-/// the trace ring); the timer hands what it interrupted to the profiler
-/// (`perf::on_tick`: a call and one atomic load unless a profile runs), blinks the
-/// terminal's cursor on the boot CPU (`term::on_tick`, which never waits
-/// for a lock), then drives the
+/// the trace ring; nor in the X-ray ring, which has the handled device
+/// interrupts: [`handled`]); the timer hands what it interrupted to the
+/// profiler (`perf::on_tick`: a call and one atomic load unless a profile
+/// runs), blinks the terminal's cursor on the boot CPU (`term::on_tick`,
+/// which never waits for a lock), then drives the
 /// scheduler (`sched::tick`, which may switch to another thread and return
 /// here only when this one runs again); a local APIC error is counted and
 /// logged with its status (on the 1st, 2nd, 4th, 8th... one, and whenever a
@@ -602,14 +612,14 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
         }
         v @ IOAPIC_BASE..=IOAPIC_LAST => {
             match irq_handler(v) {
-                Some(handler) => handler(),
+                Some(handler) => handled(frame, handler),
                 None => unexpected(frame),
             }
             super::apic::eoi();
         }
         v @ MSI_BASE..=MSI_LAST => {
             match msi_handler(v) {
-                Some(handler) => handler(),
+                Some(handler) => handled(frame, handler),
                 None => unexpected(frame),
             }
             super::apic::eoi();

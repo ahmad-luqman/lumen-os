@@ -110,7 +110,7 @@ def _thread_ticks(m: Machine, allow: str | None = None) -> dict[str, int]:
     return {name: int(ticks) for name, ticks in rows}
 
 
-def _com1_interrupts(m: Machine, allow: str | None = None) -> int:
+def com1_interrupts(m: Machine, allow: str | None = None) -> int:
     """`irqs`' count for COM1's input (ISA IRQ 4: GSI 4 on q35, no
     override), which must be routed and unmasked."""
     out = run(m, "irqs", allow=allow)
@@ -177,13 +177,13 @@ def test_the_serial_shell_waits_for_input_by_interrupt(boot):
     # a loaded KVM runner, #170). Lines of 14+ bytes reach the FIFO's
     # trigger level, not only its timeout.
     m = shell(boot)
-    first = _com1_interrupts(m)
+    first = com1_interrupts(m)
     before = _serial(m)
     idle, main = _idle_second(m)
     assert idle >= 50 and idle > main, (idle, main)
     for i in range(6):
         assert run(m, f"echo a line typed while waiting {i}") == f"a line typed while waiting {i}\n"
-    assert _com1_interrupts(m) > first
+    assert com1_interrupts(m) > first
     after = _serial(m)
     assert after.at_deadline == 0, after
     assert after.woken > before.woken, (before, after)
@@ -252,7 +252,7 @@ def test_the_safety_net_reads_input_when_irq_4_never_comes(boot):
     for i in range(3):
         assert run(m, f"echo more {i}", allow=MISSED_WARNING) == f"more {i}\n"
     _until_at_deadline(m, counts.at_deadline + THRESHOLD)
-    assert _com1_interrupts(m, MISSED_WARNING) == 0
+    assert com1_interrupts(m, MISSED_WARNING) == 0
     idle, main = _idle_second(m, MISSED_WARNING)
     assert idle >= 50 and idle > main, (idle, main)
     assert m.output.count(MISSED_WARNING) == 1, m.output

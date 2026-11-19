@@ -47,7 +47,7 @@ def test_trace_defaults_and_usage(boot):
     events, claimed, _ = trace(m, "")
     assert len(events) == min(16, claimed)
     m.send_line("trace lots")
-    m.expect(r"usage: trace \[n\]\n", 10)
+    m.expect(r"usage: trace \[n \| runq \[park <n>\] \| xray <cpu> \[since\]\]\n", 10)
 
 
 def test_exception_appears_in_trace(boot):
