@@ -259,6 +259,15 @@ own PR that updates that doc first.
   `demo.rs`: the `mandelbrot` (bands on every CPU) and `life` commands, and
   the launcher's Mandelbrot window (`draw_bands`: a window's surface lent
   as bands to a thread per CPU through `sched::scope`) and Life window (#157).
+  `app.rs`: WASM apps (M5; #197 so far): `wasmi` (`portable-dispatch`: a constant native stack depth
+  however long a module runs; functions compiled eagerly; see ARCHITECTURE sections 2 and 8) running a
+  module in fuel slices (`run_in_slices`, `run_bounded` with a resume cap: out of fuel, yield, refuel at
+  least what the instruction that ran out needs, resume; `Failed`: load, export, run (after how many
+  resumes) or the resume cap; a host trap is an error, never a panic), `wasm` (the checks in the booted
+  kernel, shared with the ktests: `LoopChecks`, its resume band from the loop's fuel per iteration) and
+  its ktests, over hand-assembled modules (`app/modules.rs`: a long loop and call depth, one float
+  operation per export, a bulk `memory.fill`, a generated large body; not yet `apps/`'s builds, which
+  #199 loads).
   `font.rs`: the desktop's anti-aliased text (`lumen-font`): `font::face`,
   the UI font parsed on first use and shared; `font::Text`, one drawing
   thread's glyph cache over it (`draw` glyph by glyph inside a clip,
