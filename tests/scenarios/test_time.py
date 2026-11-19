@@ -11,6 +11,7 @@ import re
 from typing import NamedTuple
 
 from lumen_harness.calibration import (
+    HPET,
     PIT,
     TIMER,
     TSC,
@@ -19,12 +20,13 @@ from lumen_harness.calibration import (
     judged,
     no_other_warnings,
     stalled,
+    tsc_reference,
     warned_exactly_when_past,
     weighed,
     within_bounds,
 )
 from lumen_harness.crash import BEGIN, END
-from lumen_harness.klog import STAMP
+from lumen_harness.klog import unexpected_warnings
 from lumen_harness.qemu import EXIT_CRASH
 
 BOOT_TIMEOUT = 60
@@ -44,6 +46,7 @@ CLOCKS = re.compile(
 WINDOWS_SEGMENT = re.compile(r"(boot|pit|hpet) (\d+) Hz \[([^\]]*)\] retook (\d+)")
 PIT_HZ = 1_193_182
 HPET_HZ = 100_000_000  # QEMU's HPET ticks every 10 ns
+REFERENCE_HZ = {HPET: HPET_HZ, PIT: PIT_HZ}
 # A calibration takes at most 20 windows for 5 steady ones (time::ATTEMPTS).
 MOST_RETAKEN = 15
 
@@ -169,10 +172,12 @@ def ticks(m) -> tuple[int, int, int, int]:
     return int(t[1]), int(t[2]), int(t[3]), int(t[4])
 
 
-def test_boot_calibrates_the_tsc_against_the_hpet(boot):
+def test_boot_calibrates_the_tsc_against_the_clock_it_chose(boot):
+    # The HPET on q35, unless a loaded host left its calibration with no
+    # bound, or less precise than the PIT's (calibration.tsc_reference).
     m = boot("qemutest")
     line = m.expect(TSC_LINE, BOOT_TIMEOUT)
-    assert line[3] == "hpet", line[0]
+    assert line[3] == tsc_reference(m.output), line[0]
     m.expect(r"INFO  time: local APIC timer .*, ticking at 1 kHz\n", BOOT_TIMEOUT)
     m.expect(r"INFO  irq: interrupts on\n", BOOT_TIMEOUT)
 
@@ -183,10 +188,10 @@ def test_clocks_shows_the_windows_behind_each_measurement(boot):
     m = boot("qemutest")
     m.expect(r"lumen> ", BOOT_TIMEOUT)
     (tsc, reference, pit, hpet), cals = clocks_and_windows(m)
-    assert reference == "hpet"
+    assert reference == tsc_reference(m.output)
     assert sorted(cals) == ["boot", "hpet", "pit"]
     assert (cals["boot"].hz, cals["pit"].hz, cals["hpet"].hz) == (tsc, pit, hpet)
-    check_calibration(cals["boot"], HPET_HZ)
+    check_calibration(cals["boot"], REFERENCE_HZ[reference])
     check_calibration(cals["pit"], PIT_HZ)
     check_calibration(cals["hpet"], HPET_HZ)
     check_boot_verdict(m, cals["boot"])
@@ -207,12 +212,9 @@ def test_timer_interrupts_counted(boot):
     # sleep busy-waited then; it now halts in the idle thread).
     assert after - before >= 1, (before, after)
     assert strays == [0, 0, 0]
-    # No irq warning but the one a slow first tick logs (main.rs: no tick in
-    # 100 ms, which a host stalling boot can cause).
-    irq = [line for line in m.output.splitlines() if "WARN  irq" in line]
-    assert all(
-        re.fullmatch(rf"{STAMP} WARN  irq: no timer interrupt in 100 ms", line) for line in irq
-    ), irq
+    # No irq warning but, under TCG, the one a first tick missing for 100 ms
+    # logs (klog.HOST_TIMED: a loaded host can starve QEMU's timer thread).
+    assert not (bad := unexpected_warnings(m.output, "irq")), "\n".join(bad)
 
 
 def test_boot_calibration_agrees_with_both_clocks(boot):
@@ -222,7 +224,7 @@ def test_boot_calibration_agrees_with_both_clocks(boot):
     m = boot("qemutest")
     m.expect(r"lumen> ", BOOT_TIMEOUT)
     (_, reference, pit, hpet), cals = clocks_and_windows(m)
-    assert reference == "hpet"
+    assert reference == tsc_reference(m.output)
     assert pit is not None and hpet is not None
     assert_agree(cals["boot"], cals["pit"])
     assert_agree(cals["boot"], cals["hpet"])
@@ -379,7 +381,7 @@ def test_a_stall_past_ten_windows_is_ignored(boot):
         "ignored\n" in out
     ), out
     assert "stalling calibration windows" not in out, out
-    assert TSC_LINE.search(out)[3] == "hpet", out
+    assert TSC_LINE.search(out)[3] == tsc_reference(out), out
 
 
 def test_tsc_windows_stalled_without_an_hpet_fill_in_against_the_pit(boot):

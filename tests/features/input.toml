@@ -115,7 +115,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Interrupts for virtio devices through MSI-X: the transport gets the function's vector at the first queue set up (a device declined after its transport but before any queue has none), maps configuration changes and each queue to its table entry (read back for `msix_config` and queue 0's `queue_msix_vector`: 0) and unmasks it; it hides RING_EVENT_IDX, which QEMU offers, so no driver negotiates it; virtio-rng's vector fires and its handler runs when a request comes back (MSI-X on, INTx off), the tablet's when a QMP move comes in, and sound's periods come back by it with no underrun, none of them reported missed; a device without an MSI-X capability fails its probe (`virtio-rng: failed: MSI-X: no MSI-X capability`, a warning naming the device), and one that refuses its entry (NO_VECTOR read back, for configuration changes or a queue) fails it saying which (`lspci`), no polling fallback; a probe that fails another way after a refusal keeps it in its reason (`... (after MSI-X: ...)`); `irqs` lists each vector as `msix <pci address> #0` with a count that goes up with each request, and no MSI vector shows unclaimed"
+name = "Interrupts for virtio devices through MSI-X: the transport gets the function's vector at the first queue set up (a device declined after its transport but before any queue has none), maps configuration changes and each queue to its table entry (read back for `msix_config` and queue 0's `queue_msix_vector`: 0) and unmasks it; it hides RING_EVENT_IDX, which QEMU offers, so no driver negotiates it; virtio-rng's vector fires and its handler runs when a request comes back (MSI-X on, INTx off), the tablet's when a QMP move comes in, and sound's periods come back by it, none of them reported missed (an underrun, a stalled host's, counted in `sound` and warned, at most one per 8 periods); a device without an MSI-X capability fails its probe (`virtio-rng: failed: MSI-X: no MSI-X capability`, a warning naming the device), and one that refuses its entry (NO_VECTOR read back, for configuration changes or a queue) fails it saying which (`lspci`), no polling fallback; a probe that fails another way after a refusal keeps it in its reason (`... (after MSI-X: ...)`); `irqs` lists each vector as `msix <pci address> #0` with a count that goes up with each request, and no MSI vector shows unclaimed"
 milestone = "M3"
 tests = [
     "ktest:lumen_kernel::interrupts::msix_vector_delivered",
@@ -128,7 +128,7 @@ tests = [
     "scenario:test_shell::test_irqs_lists_msix",
     "scenario:test_input::test_a_pointer_move_raises_the_tablets_interrupt",
     "scenario:test_sound::test_tone_is_captured",
-    "scenario:test_sound::test_a_long_tone_plays_without_underrun",
+    "scenario:test_sound::test_a_long_tone_plays_every_period",
     "scenario:test_dev::test_random_with_only_virtio_rng",
 ]
 

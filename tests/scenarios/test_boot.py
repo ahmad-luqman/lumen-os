@@ -2,6 +2,7 @@
 
 import re
 
+from lumen_harness.calibration import assert_quiet_boot
 from lumen_harness.klog import LEVEL, stamp_capturing
 from lumen_harness.qemu import EXIT_SUCCESS
 
@@ -20,8 +21,11 @@ def test_boot_reaches_logger(boot):
     m.expect(r"boot: timeline: .*\n")
     # Then Limine's times (at warn if unknown or out of order).
     m.expect(r"boot: before kmain: .*\n")
+    # No warning or error, but those a loaded host can cause on its own
+    # (lumen_harness.klog.HOST_TIMED; the calibrations' checked against their
+    # own numbers), and no "ERROR" anywhere, log line or not.
     out = m.output
-    assert "WARN" not in out, "boot logged a warning"
+    assert_quiet_boot(out)
     assert "ERROR" not in out, "boot logged an error"
 
 

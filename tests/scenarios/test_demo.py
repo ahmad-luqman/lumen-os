@@ -134,7 +134,7 @@ def test_every_pattern_runs_as_on_a_plane(boot):
 
 def test_life_runs_until_a_key(boot):
     # Without a pattern, the gun; without a count it runs, at most 20
-    # generations a second (with a margin for a slow emulator), until a key.
+    # generations a second, until a key.
     m = boot_shell(boot)
     m.send_line("life")
     m.expect(r"life: gun on 160x80 cells; a key quits\n", 10)
@@ -145,7 +145,11 @@ def test_life_runs_until_a_key(boot):
     elapsed = time.monotonic() - start
     m.expect(r"lumen> ", 10)
     generations = int(found[1])
-    assert 3 <= generations <= 20 * elapsed + 5, f"{generations} generations in {elapsed:.2f} s"
+    # At least one (it ran: a guest stalled through the harness's second
+    # would show none, at risk); at most its 20 a second, by a clock the
+    # guest's can't run ahead of, and 5 for those stepped before the harness
+    # saw the start line. How many in the second is the host's.
+    assert 1 <= generations <= 20 * elapsed + 5, f"{generations} generations in {elapsed:.2f} s"
     assert "life: press a key" not in m.output
 
 

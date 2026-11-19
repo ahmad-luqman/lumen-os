@@ -207,3 +207,14 @@ milestone = "M4"
 tests = [
     "harness:test_scenario_typing::*",
 ]
+
+[[feature]]
+name = "A run's \"no warning\" checks leave out the warnings a loaded host can cause on its own (lumen_harness.klog.HOST_TIMED: a calibration's imprecise verdict, the TSC's fallback to the PIT when the HPET's calibration says nothing, no first timer interrupt in 100 ms under TCG only (QEMU's timer thread, which a loaded host starves; under KVM, or any accelerator but TCG, a stall delays a tick but never loses it), the serial prompt held, sound underruns; each tied by a test to text its kernel file holds once, to examples in the kernel's words, and to a near miss beside it that stays unexpected): `calibration.unexpected_boot_warnings` (whole boots: test_boot, test_dev, test_input; the calibration lines first checked against their own numbers, the fallback's included, each at the start of its line), `klog.unexpected_warnings` (by target: test_time's irq, test_sound) and a serial command's check (`shell.run`, the warning kept in its logs); any other WARN or ERROR, found wherever its stamped line starts, still fails, a broken PIT's included"
+milestone = "M4"
+tests = [
+    "harness:test_klog::*",
+    "harness:test_calibration::test_unexpected_boot_warnings_checks_the_calibration_lines",
+    "harness:test_calibration::test_the_fallback_line_is_checked_against_its_numbers",
+    "harness:test_shell_run::test_a_host_timed_warning_doesnt_fail_the_run_and_stays_in_its_logs",
+    "scenario:test_boot::test_boot_reaches_logger",
+]

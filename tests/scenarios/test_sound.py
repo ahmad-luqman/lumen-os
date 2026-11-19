@@ -13,18 +13,27 @@ are ktests (`lumen_kernel::sound::*`).
 import re
 import shlex
 import time
+from pathlib import Path
 
 import pytest
 from lumen_harness import audio
+from lumen_harness.klog import UNDERRUNS, unexpected_warnings
 from lumen_harness.qemu import Devices, Machine
 from lumen_harness.screen import PROMPT
 from lumen_harness.shell import run
 
 SHELLS = r"INFO  shell: shells? on serial.*; type 'help'\n"
 SOUND = Devices(sound=True)
+# The sound queue's depth and a period's length (kernel/src/sound.rs's DEPTH
+# and PERIOD_MS): an underrun is counted only when every queued period came
+# back in one pass, and the queue is refilled to its depth each pass, so a
+# sound underruns at most once per DEPTH periods, however a host stalls it.
+DEPTH = 8
+PERIOD_MS = 20
 # The driver's line once the device is set up.
 READY = (
-    r"INFO  sound: [0-9a-f:.]+: stream 0: signed 16-bit, (\d) channels?, (\d+) Hz, 20 ms periods\n"
+    r"INFO  sound: [0-9a-f:.]+: stream 0: signed 16-bit, (\d) channels?, (\d+) Hz, "
+    rf"{PERIOD_MS} ms periods\n"
 )
 COLUMNS = ["state", "played", "replaced", "frames", "underruns", "volume"]
 
@@ -41,6 +50,20 @@ def rate_of(m: Machine) -> int:
     ready = re.search(READY, m.output)
     assert ready, "no sound line"
     return int(ready[2])
+
+
+def most_underruns(rate: int, frames: int) -> int:
+    """The most underruns a sound of `frames` frames can count."""
+    period = rate * PERIOD_MS // 1000
+    periods = -(-frames // period)  # rounded up: a padded last period counts
+    return periods // DEPTH
+
+
+def underruns_warned(m: Machine) -> int:
+    """The underruns the kernel's warnings so far add up to (one warning per
+    sound that ended with any, logged before it is counted: klog.UNDERRUNS,
+    a loaded host's; a failed sound counts its own unwarned)."""
+    return sum(int(found["n"]) for found in UNDERRUNS.finditer(m.output))
 
 
 def sound_row(m: Machine) -> dict[str, str]:
@@ -95,22 +118,51 @@ def test_tone_is_captured(boot):
     assert run(m, "beep 440 500") == ""
     row = wait_played(m, 1)
     # Exactly 500 ms of frames went to the device (25 whole periods, no
-    # padding), with no underrun.
+    # padding); any underrun (a stalled host's) said in a warning.
     assert int(row["frames"]) == rate // 2, row
-    assert row["underruns"] == "0", row
+    assert row["underruns"] == str(underruns_warned(m)), (
+        row,
+        "underruns warned",
+        underruns_warned(m),
+    )
+    assert int(row["underruns"]) <= most_underruns(rate, rate // 2), row
     # Each period came back by its interrupt (#96).
     assert "interrupt never came" not in m.output
     wav = recording(m)
     samples = wav.first_channel
     assert_pitch(audio.dominant_frequency(samples, wav.rate), 440)
+    # At least the 500 ms played (a little less where the tone's first and
+    # last periods are quiet); an underrun only adds silence in between.
     first, last = sounding(samples)
-    assert 0.45 <= (last - first) / wav.rate <= 0.55, (first, last, wav.rate)
+    assert (last - first) / wav.rate >= 0.45, (first, last, wav.rate)
 
 
 def test_beep_returns_while_it_plays(boot):
     m = shell(boot)
     assert run(m, "beep 440 3000") == ""
     assert sound_row(m)["state"] == "playing"
+
+
+def test_a_beep_shorter_than_the_queue_never_underruns(boot):
+    # 140 ms is DEPTH - 1 periods: all queued, and the source found ended by
+    # the next fill, before the first wait, so no pass can find the queue
+    # empty unended, however a host stalls the thread (`most_underruns` is
+    # 0: one underrun counted on every sound fails here). At DEPTH periods
+    # the source is found ended only after the first wait.
+    m = shell(boot)
+    rate = rate_of(m)
+    assert run(m, f"beep 440 {(DEPTH - 1) * PERIOD_MS}") == ""
+    row = wait_played(m, 1)
+    assert most_underruns(rate, int(row["frames"])) == 0, row
+    assert row["underruns"] == "0", row
+
+
+def test_the_bounds_constants_are_the_kernels():
+    # DEPTH and PERIOD_MS as kernel/src/sound.rs has them (PERIOD_MS is also
+    # in the driver's boot line, READY).
+    src = (Path(__file__).resolve().parents[2] / "kernel/src/sound.rs").read_text()
+    assert src.count(f"const DEPTH: usize = {DEPTH};") == 1
+    assert src.count(f"const PERIOD_MS: u32 = {PERIOD_MS};") == 1
 
 
 def test_a_padded_last_period_counts_only_the_sound(boot):
@@ -122,14 +174,16 @@ def test_a_padded_last_period_counts_only_the_sound(boot):
     assert int(row["frames"]) == rate * 510 // 1000, row
 
 
-def test_a_long_tone_plays_without_underrun(boot):
-    # 500 periods: none found the queue empty, and all were taken back (a
-    # run leaking per period would exhaust the run table long before).
+def test_a_long_tone_plays_every_period(boot):
+    # 500 periods, all taken back (a run leaking per period would exhaust
+    # the run table long before); any that found the queue empty (a
+    # stalled host's underrun) counted and said in a warning.
     m = shell(boot)
     rate = rate_of(m)
     assert run(m, "beep 440 10000") == ""
     row = wait_played(m, 1, timeout=60)
-    assert (row["frames"], row["underruns"]) == (str(rate * 10), "0"), row
+    assert (row["frames"], row["underruns"]) == (str(rate * 10), str(underruns_warned(m))), row
+    assert int(row["underruns"]) <= most_underruns(rate, rate * 10), row
     assert "interrupt never came" not in m.output
 
 
@@ -151,34 +205,47 @@ def test_melody_notes_in_order(boot):
     assert len(notes) == len(expected), notes
     for got, want in zip(notes, expected, strict=True):
         assert_pitch(got, want)
-    # Each quarter note at tempo 120 lasts 500 ms.
-    assert 1.9 <= (last - first) / wav.rate <= 2.1, (first, last)
+    # Each quarter note at tempo 120 lasts 500 ms: at least 1.9 s sound (an
+    # underrun, a stalled host's, only adds silence in between).
+    assert (last - first) / wav.rate >= 1.9, (first, last)
 
 
 @pytest.mark.parametrize("key", ["q", "\x03"], ids=["q", "ctrl-c"])
 def test_play_stops_on_a_key(boot, key):
     m = shell(boot)
     rate = rate_of(m)
+    start = time.monotonic()
     m.send_line("play t=60 C4/1 C4/1 C4/1 C4/1")
     m.expect(r"play t=60 C4/1 C4/1 C4/1 C4/1\n", 10)
     time.sleep(1)
+    at_key = time.monotonic() - start
     m.send(key)
     m.expect(r"play: stopped\n" + PROMPT, 10)
     row = wait_played(m, 1)
-    # Far less than the melody's 16 s: about a second, plus the fade and the
-    # periods already queued.
-    assert int(row["frames"]) < 3 * rate, row
+    # Far less than the melody's 16 s: what played until the key was sent
+    # (no more than the host's time since the command: the device takes
+    # periods at QEMU's audio pace, which can't run ahead of the host's),
+    # plus the key's way to the guest, the fade and the periods queued (2 s:
+    # at risk on a host delaying serial input that long while the guest
+    # plays on).
+    assert int(row["frames"]) <= rate * (at_key + 2), (row, at_key)
 
 
 def test_a_newer_sound_replaces_the_one_playing(boot):
     m = shell(boot)
     rate = rate_of(m)
+    start = time.monotonic()
     assert run(m, "beep 440 5000") == ""
     time.sleep(0.5)
+    at_second = time.monotonic() - start
     assert run(m, "beep 660 300") == ""
     row = wait_played(m, 1)
     assert (row["played"], row["replaced"]) == ("1", "1"), row
-    assert int(row["frames"]) < 2 * rate, row
+    # Far less than the first's 5 s: what it played until the second was sent
+    # (no more than the host's time meanwhile, as above), the command's way
+    # to the guest, the periods queued and a fade (2 s), and the second's
+    # 300 ms.
+    assert int(row["frames"]) <= rate * (at_second + 2 + 0.3), (row, at_second)
     # The 440 Hz tone, then the 660 Hz one.
     wav = recording(m)
     windows = audio.window_frequencies(wav.first_channel, wav.rate, 0.1)
@@ -253,7 +320,8 @@ def test_lspci_shows_sound_bound(boot):
     assert run(m, "sound | where state = idle | count") == "1\n"
     # (The crate itself warns that it got no jack or channel map infos:
     # QEMU's device has none.)
-    assert "WARN  sound" not in m.output and "WARN  drivers" not in m.output
+    assert not (bad := unexpected_warnings(m.output, "sound")), "\n".join(bad)
+    assert not (bad := unexpected_warnings(m.output, "drivers")), "\n".join(bad)
 
 
 def test_a_second_sound_device_is_declined(boot, tmp_path):

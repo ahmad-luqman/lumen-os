@@ -3,6 +3,8 @@ and catch one that doesn't follow from the numbers it prints (#171): on the
 lines CI's loaded KVM runner printed in #171's two failed boots (run
 44158904486, verbatim), and edits of them."""
 
+import re
+
 import pytest
 from lumen_harness.calibration import (
     HPET,
@@ -11,12 +13,15 @@ from lumen_harness.calibration import (
     TSC,
     Judged,
     agree,
+    assert_quiet_boot,
     follows_the_tsc,
     judged,
     no_other_warnings,
     percent,
     ppm_range,
     stalled,
+    tsc_reference,
+    unexpected_boot_warnings,
     verdict,
     warned_exactly_when_past,
     weighed,
@@ -461,3 +466,56 @@ def test_two_calibrations_agree_within_2_or_their_bounds_under_9():
         agree(1_118_000_000, hz, 60_000, 29_000)
     with pytest.raises(AssertionError, match="disagree"):
         agree(hz, 1_118_000_000, 1_000, 88_000)
+
+
+FALLBACK = (
+    "[    1.204210] WARN  time: can't calibrate the tsc against the HPET: only 0 of 20 windows read promptly "
+    "(5 wanted), and the middle ones' end stalls were as long as the rest of their windows, so the rate says "
+    "nothing (tsc/reference/polls/start_gap/end_gap: 1/2/3/4/5); calibrating against the PIT\n"
+)
+
+
+def test_the_tsc_reference_is_the_kernels_choice():
+    assert tsc_reference("") == HPET
+    assert tsc_reference(TSC_OWN + WEIGHED) == PIT
+    assert tsc_reference(TSC_OWN + NO_BOUND) == HPET
+    # The HPET's calibration said nothing: the PIT, with no weighing.
+    assert tsc_reference(FALLBACK) == PIT
+
+
+def test_the_fallback_line_is_checked_against_its_numbers():
+    # 5 steady would have had a bound; fewer than 20 taken, attempts left.
+    for wrong in ("only 5 of 20", "only 0 of 19"):
+        with pytest.raises(AssertionError):
+            tsc_reference(FALLBACK.replace("only 0 of 20", wrong))
+    with pytest.raises(AssertionError):
+        tsc_reference(FALLBACK + FALLBACK)
+    with pytest.raises(AssertionError, match="and a weighing"):
+        tsc_reference(FALLBACK + WEIGHED)
+
+
+def test_unexpected_boot_warnings_checks_the_calibration_lines():
+    # Well-formed verdicts and weighing: left out.
+    assert unexpected_boot_warnings(TSC_OWN + WEIGHED + TIMER_OWN) == []
+    assert unexpected_boot_warnings(FALLBACK) == []
+    # A broken PIT's warning is not the host's.
+    assert unexpected_boot_warnings(TSC_OWN + PIT_FAILED) == [PIT_FAILED.rstrip("\n")]
+    # A line that contradicts its own numbers fails, though host-timed: the
+    # TSC's verdict, the timer's, the weighing, the fallback.
+    for wrong in (
+        TSC_OWN.replace("1.6%", "0.2%"),
+        TSC_OWN + TIMER_OWN.replace("3.8%", "1.0%"),
+        TSC_OWN + WEIGHED.replace("kept the PIT", "kept the HPET"),
+        FALLBACK.replace("only 0 of 20", "only 5 of 20"),
+    ):
+        with pytest.raises(AssertionError):
+            unexpected_boot_warnings(wrong)
+    # One that follows part of a line, where those checks wouldn't see it.
+    with pytest.raises(AssertionError):
+        unexpected_boot_warnings("abc" + TSC_OWN)
+
+
+def test_assert_quiet_boot_names_the_unexpected_lines():
+    assert_quiet_boot(TSC_OWN + WEIGHED + TIMER_OWN)
+    with pytest.raises(AssertionError, match=re.escape(PIT_FAILED.rstrip("\n"))):
+        assert_quiet_boot(TSC_OWN + PIT_FAILED)
