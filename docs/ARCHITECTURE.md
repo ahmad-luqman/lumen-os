@@ -3182,6 +3182,12 @@ host-tested):
 - **Leftovers:** `postcard::from_bytes` accepts trailing bytes, so decode
   with `take_from_bytes` and refuse a non-empty remainder; fuzz tests feed
   trailing bytes as well as truncations and flipped bytes.
+- **Malformed values,** each refused with its exact postcard error in a
+  host test (fuzzing can't see a decoder that accepts one without
+  panicking): bad UTF-8 (`DeserializeBadUtf8`), a bool byte of 2
+  (`DeserializeBadBool`), an overflowing u32 varint
+  (`DeserializeBadVarint`), a bad `Option` tag (`DeserializeBadOption`), a
+  surrogate `char` (`DeserializeBadChar`).
 - **Sizes first:** check `EVENT_BYTES`, `TREE_BYTES` and `ANSWER_BYTES` on
   what the app sent before decoding (never on a re-encode: overlong
   varints decode, so one value has more than one encoding; compare
