@@ -15,6 +15,8 @@
 //! instantiation, outside any slice; these modules have none.
 
 mod modules;
+#[cfg(feature = "ktest")]
+mod wire;
 
 use crate::shell::Ctx;
 use alloc::format;
