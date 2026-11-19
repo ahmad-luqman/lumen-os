@@ -1,11 +1,13 @@
-//! How an app ends: one reason, the first recorded ([`EndCell`]), deciding
-//! its one end line (ARCHITECTURE section 8, "One end reason, first writer
-//! wins"). A kill racing a return, a trap racing a kill: whichever records
-//! first is the app's end, and the other is dropped, so an app never gets
-//! two end lines.
+//! How an app ends: one [`Outcome`], the first recorded ([`EndCell`]),
+//! deciding its one end line (ARCHITECTURE section 8, "One end reason,
+//! first writer wins"). In #199 the app's own thread is the only writer (a
+//! `kill` sets a flag the thread acts on); the cell keeps the rule for the
+//! writers #206 and #207 add (the close grace, a desktop that goes away),
+//! so whichever records first is the app's end and an app never gets two
+//! end lines.
 
 use crate::limits::CLOSE_GRACE_SLICES;
-use crate::text;
+use crate::text::{self, LogText};
 use alloc::format;
 use alloc::string::String;
 
@@ -20,9 +22,47 @@ pub enum EndReason {
     /// slice ends.
     CloseGrace,
     /// `panic`, with its message (cut and sanitised as log text).
-    Panicked(String),
+    Panicked(LogText),
     /// A wasm trap, with wasmi's message.
-    Trapped(String),
+    Trapped(LogText),
+}
+
+/// How an app's life went: it never started (why), or it ended (why).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Loading failed: the module was refused, or there wasn't the memory.
+    NotStarted(LogText),
+    Ended(EndReason),
+}
+
+impl From<EndReason> for Outcome {
+    fn from(reason: EndReason) -> Outcome {
+        Outcome::Ended(reason)
+    }
+}
+
+impl Outcome {
+    /// What its line says after the app's name and id (`exited with 0`,
+    /// `didn't start: ...`).
+    pub fn what(&self) -> String {
+        match self {
+            Outcome::NotStarted(why) => format!("didn't start: {why}"),
+            Outcome::Ended(reason) => reason.what(),
+        }
+    }
+
+    /// Its line's level: a load failure is a fault, as a panic or trap is.
+    pub fn level(&self) -> Level {
+        match self {
+            Outcome::NotStarted(_) => Level::Warn,
+            Outcome::Ended(reason) => reason.level(),
+        }
+    }
+
+    /// Its line's text (target `app`): `<name> (app <id>) <what>`.
+    pub fn line(&self, name: &str, id: u64) -> String {
+        format!("{name} (app {id}) {}", self.what())
+    }
 }
 
 /// An end line's level.
@@ -71,27 +111,27 @@ impl EndReason {
     }
 }
 
-/// An app's end reason: empty until the first is recorded, which no later
-/// one replaces.
+/// An app's outcome: empty until the first is recorded, which no later one
+/// replaces.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct EndCell(Option<EndReason>);
+pub struct EndCell(Option<Outcome>);
 
 impl EndCell {
     pub const fn new() -> EndCell {
         EndCell(None)
     }
 
-    /// Record `reason` unless one is already: whether it was this one.
-    pub fn record(&mut self, reason: EndReason) -> bool {
+    /// Record `outcome` unless one is already: whether it was this one.
+    pub fn record(&mut self, outcome: impl Into<Outcome>) -> bool {
         if self.0.is_some() {
             return false;
         }
-        self.0 = Some(reason);
+        self.0 = Some(outcome.into());
         true
     }
 
-    /// The reason recorded, if any.
-    pub fn reason(&self) -> Option<&EndReason> {
+    /// The outcome recorded, if any.
+    pub fn outcome(&self) -> Option<&Outcome> {
         self.0.as_ref()
     }
 }
@@ -121,7 +161,7 @@ impl CloseGrace {
     pub fn slice_end(&mut self) -> bool {
         match &mut self.since_close {
             Some(n) => {
-                *n += 1;
+                *n = n.saturating_add(1);
                 *n >= CLOSE_GRACE_SLICES
             }
             None => false,
@@ -136,11 +176,12 @@ mod tests {
     #[test]
     fn the_first_reason_recorded_wins() {
         let mut cell = EndCell::new();
-        assert_eq!(cell.reason(), None);
+        assert_eq!(cell.outcome(), None);
         assert!(cell.record(EndReason::Killed));
         assert!(!cell.record(EndReason::Exited(0)));
         assert!(!cell.record(EndReason::trapped("unreachable")));
-        assert_eq!(cell.reason(), Some(&EndReason::Killed));
+        assert!(!cell.record(Outcome::NotStarted(text::log_line("x"))));
+        assert_eq!(cell.outcome(), Some(&Outcome::Ended(EndReason::Killed)));
     }
 
     #[test]
@@ -167,6 +208,15 @@ mod tests {
     fn a_panic_message_cant_forge_a_line() {
         let r = EndReason::panicked("bad\nWARN  app: fake");
         assert_eq!(r.what(), "ended: panicked: bad\u{fffd}WARN  app: fake");
+    }
+
+    #[test]
+    fn a_load_failure_is_a_warning_of_its_own() {
+        let o = Outcome::NotStarted(text::log_line("memory: not fixed"));
+        assert_eq!(o.level(), Level::Warn);
+        assert_eq!(o.line("hello", 4), "hello (app 4) didn't start: memory: not fixed");
+        let o: Outcome = EndReason::Exited(3).into();
+        assert_eq!((o.level(), o.what()), (Level::Info, String::from("exited with 3")));
     }
 
     #[test]
@@ -197,5 +247,9 @@ mod tests {
         for _ in 0..10 {
             assert!(!g.slice_end());
         }
+        // The count saturates rather than wrapping back under the grace.
+        let mut g = CloseGrace { since_close: Some(u32::MAX - 1) };
+        assert!(g.slice_end());
+        assert!(g.slice_end());
     }
 }

@@ -152,6 +152,10 @@ struct KernelAllocator;
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         debug_assert!(!crate::term::drawing_here(), "allocation under the screen's lock");
+        #[cfg(feature = "ktest")]
+        if layout.size() >= REFUSE_FROM.load(Ordering::Relaxed) {
+            return ptr::null_mut();
+        }
         let mut state = STATE.lock();
         if let Some(p) = state.heap.alloc(layout) {
             note_peak(&state);
@@ -241,6 +245,18 @@ impl From<window::WindowError> for GrowError {
             window::WindowError::Map(e) => GrowError::Map(e),
         }
     }
+}
+
+/// ktest seam: allocations of at least this many bytes are refused (null),
+/// as when the heap runs out; `usize::MAX`: none.
+#[cfg(feature = "ktest")]
+static REFUSE_FROM: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Refuse every allocation of at least `bytes` (`usize::MAX`: none again),
+/// for a ktest of a caller that copes with running out.
+#[cfg(feature = "ktest")]
+pub fn refuse_from(bytes: usize) {
+    REFUSE_FROM.store(bytes, Ordering::Relaxed);
 }
 
 /// Raise [`PEAK`] to what is in use now (the heap's lock held).

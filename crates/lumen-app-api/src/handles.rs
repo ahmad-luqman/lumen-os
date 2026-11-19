@@ -51,6 +51,11 @@ impl<T> HandleTable<T> {
         self.open.iter().find(|(id, _)| *id as i32 == h && h > 0).map(|(_, o)| o).ok_or(Error::BadHandle)
     }
 
+    /// What handle `h` names, to change.
+    pub fn get_mut(&mut self, h: i32) -> Result<&mut T, Error> {
+        self.open.iter_mut().find(|(id, _)| *id as i32 == h && h > 0).map(|(_, o)| o).ok_or(Error::BadHandle)
+    }
+
     /// Close handle `h`, giving back what it named.
     pub fn remove(&mut self, h: i32) -> Result<T, Error> {
         let at = self.open.iter().position(|(id, _)| *id as i32 == h && h > 0).ok_or(Error::BadHandle)?;
@@ -70,11 +75,6 @@ impl<T> HandleTable<T> {
     pub fn is_empty(&self) -> bool {
         self.open.is_empty()
     }
-
-    /// The open handles' objects.
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.open.iter().map(|(_, o)| o)
-    }
 }
 
 #[cfg(test)]
@@ -88,6 +88,10 @@ mod tests {
         let b = t.insert('b').unwrap();
         assert_eq!((a, b), (1, 2));
         assert_eq!(t.get(a), Ok(&'a'));
+        *t.get_mut(b).unwrap() = 'B';
+        assert_eq!(t.get(b), Ok(&'B'));
+        assert_eq!(t.get_mut(99), Err(Error::BadHandle));
+        *t.get_mut(b).unwrap() = 'b';
         assert_eq!(t.remove(a), Ok('a'));
         assert_eq!(t.get(a), Err(Error::BadHandle));
         assert_eq!(t.remove(a), Err(Error::BadHandle));

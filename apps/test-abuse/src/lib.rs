@@ -7,8 +7,8 @@
 //! - `calls`: the argument checks' order (handle, kind, ranges, content),
 //!   wrapping and out-of-range pointers, sentinel-filled outputs a refused
 //!   call leaves alone, the text cap (exactly at it accepted, a byte past
-//!   refused), bad UTF-8, log levels, a negative sleep, `trace_read`'s
-//!   refusals.
+//!   refused), bad UTF-8, log levels, the clocks (`time_wall` past 2020),
+//!   a negative sleep, `trace_read`'s refusals.
 //! - `handles`: the same handle from `handle_find` every time, no reuse
 //!   after a close, a closed grant `NotGranted`, the wrong kind, made-up
 //!   handles and kind numbers.
@@ -62,6 +62,19 @@ fn log_raw(h: i32, level: i32, msg: i32, len: i32) -> i64 {
     i64::from(host::log(h, level, msg, len))
 }
 
+/// `args_read` as the checks call it.
+fn args_read(buf: i32, len: i32) -> i32 {
+    // SAFETY: every range given is inside a buffer of ours, or one the host
+    // refuses (wrapping): it writes nothing there.
+    unsafe { host::args_read(buf, len) }
+}
+
+/// `trace_read` as the checks call it.
+fn trace_read(h: i32, stream: i32, cpu: i32, since: i64, buf: i32, len: i32) -> i32 {
+    // SAFETY: as `args_read`'s.
+    unsafe { host::trace_read(h, stream, cpu, since, buf, len) }
+}
+
 fn calls(c: &mut Checks) {
     let log = log_handle();
     let time = find(Grant::Time);
@@ -98,18 +111,22 @@ fn calls(c: &mut Checks) {
     let mut buf = [0xa5u8; 128];
     let args = host::args_len();
     c.check("args_len", args.into(), Ok(()));
-    let r = host::args_read(ptr(buf.as_mut_ptr()), args - 1);
+    let r = args_read(ptr(buf.as_mut_ptr()), args - 1);
     c.check("args_read too small", r.into(), Err(Error::BufferTooSmall));
     c.holds("args_read too small wrote nothing", buf.iter().all(|&b| b == 0xa5));
-    let r = host::args_read(WRAPPING, 64);
+    let r = args_read(WRAPPING, 64);
     c.check("args_read at a wrapping range", r.into(), Err(Error::BadPointer));
-    let r = host::args_read(ptr(buf.as_mut_ptr()), buf.len() as i32);
+    let r = args_read(ptr(buf.as_mut_ptr()), buf.len() as i32);
     c.check("args_read", r.into(), Ok(()));
     c.holds("args_read wrote the arguments", buf[..r.max(0) as usize] == *b"calls\0");
 
     // Time.
     c.check("time_now", host::time_now(time), Ok(()));
     c.check("time_now on the log handle", host::time_now(log), Err(Error::WrongKind));
+    // The RTC's Unix time: past 2020-01-01 (QEMU's clock is the host's).
+    c.holds("time_wall is past 2020", host::time_wall(time) > 1_577_836_800);
+    c.check("time_wall on the log handle", host::time_wall(log), Err(Error::WrongKind));
+    c.check("time_wall on a made-up handle", host::time_wall(999), Err(Error::BadHandle));
     c.check("a negative sleep", host::time_sleep(time, -1).into(), Err(Error::BadArgument));
     c.check("a zero sleep", host::time_sleep(time, 0).into(), Ok(()));
 
@@ -118,22 +135,18 @@ fn calls(c: &mut Checks) {
     let o = ptr(out.as_mut_ptr());
     let cpus = host::trace_cpus(trace);
     c.holds("trace_cpus is at least 1", cpus >= 1);
-    let r = host::trace_read(trace, 0, 0, 0, o, 71);
+    let r = trace_read(trace, 0, 0, 0, o, 71);
     c.check("trace_read below one event", r.into(), Err(Error::BufferTooSmall));
     c.holds("trace_read too small wrote nothing", out.iter().all(|&b| b == 0xa5));
-    c.check("trace_read stream 2", host::trace_read(trace, 2, 0, 0, o, 72).into(), Err(Error::BadArgument));
-    c.check("trace_read stream -1", host::trace_read(trace, -1, 0, 0, o, 72).into(), Err(Error::BadArgument));
-    c.check("trace_read cpu -1", host::trace_read(trace, 0, -1, 0, o, 72).into(), Err(Error::BadArgument));
-    c.check("trace_read cpu 99", host::trace_read(trace, 0, 99, 0, o, 72).into(), Err(Error::BadArgument));
-    c.check("trace_read since -1", host::trace_read(trace, 0, 0, -1, o, 72).into(), Err(Error::BadArgument));
-    c.check("trace_read since ahead", host::trace_read(trace, 0, 0, i64::MAX, o, 72).into(), Err(Error::BadArgument));
-    c.check(
-        "trace_read at a wrapping range",
-        host::trace_read(trace, 0, 0, 0, WRAPPING, 72).into(),
-        Err(Error::BadPointer),
-    );
-    c.check("trace_read on the time handle", host::trace_read(time, 0, 0, 0, o, 72).into(), Err(Error::WrongKind));
-    let r = host::trace_read(trace, 0, 0, 0, o, out.len() as i32);
+    c.check("trace_read stream 2", trace_read(trace, 2, 0, 0, o, 72).into(), Err(Error::BadArgument));
+    c.check("trace_read stream -1", trace_read(trace, -1, 0, 0, o, 72).into(), Err(Error::BadArgument));
+    c.check("trace_read cpu -1", trace_read(trace, 0, -1, 0, o, 72).into(), Err(Error::BadArgument));
+    c.check("trace_read cpu 99", trace_read(trace, 0, 99, 0, o, 72).into(), Err(Error::BadArgument));
+    c.check("trace_read since -1", trace_read(trace, 0, 0, -1, o, 72).into(), Err(Error::BadArgument));
+    c.check("trace_read since ahead", trace_read(trace, 0, 0, i64::MAX, o, 72).into(), Err(Error::BadArgument));
+    c.check("trace_read at a wrapping range", trace_read(trace, 0, 0, 0, WRAPPING, 72).into(), Err(Error::BadPointer));
+    c.check("trace_read on the time handle", trace_read(time, 0, 0, 0, o, 72).into(), Err(Error::WrongKind));
+    let r = trace_read(trace, 0, 0, 0, o, out.len() as i32);
     c.check("trace_read", r.into(), Ok(()));
     c.holds("trace_read copied at most what fits", (0..=2).contains(&r));
 }
@@ -141,7 +154,6 @@ fn calls(c: &mut Checks) {
 fn handles(c: &mut Checks) {
     let log = log_handle();
     c.holds("a log handle", log > 0);
-    c.check("the same log handle again", (find(Grant::Log) - log).into(), Ok(()));
     c.holds("the same log handle", find(Grant::Log) == log);
     let time = find(Grant::Time);
     c.holds("a time handle", time > 0 && time != log);

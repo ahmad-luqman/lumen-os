@@ -33,11 +33,31 @@ pub const MEMORY_PAGES: u64 = 256;
 pub const VALUE_STACK_BYTES: usize = MIB as usize;
 /// wasmi's call depth, in frames.
 pub const CALL_DEPTH: usize = 1000;
-/// The store, the call stack, the handle table, two tree copies, the glyph
-/// cache.
+/// Everything else an app holds, at most: the parts below (their sum
+/// checked at compile time).
 pub const APP_OVERHEAD: u64 = MIB;
+/// The store, the instance, the call stack (`CALL_DEPTH` frames) and the
+/// handle table.
+pub const STORE_BYTES: u64 = 512 * KIB;
+/// Its table, at `TABLE_ELEMENTS` elements of at most 16 bytes.
+pub const TABLE_BYTES: u64 = TABLE_ELEMENTS as u64 * 16;
+/// Its published tree, two copies (#207).
+pub const TREE_COPIES_BYTES: u64 = 2 * TREE_BYTES as u64;
+/// Its drawing thread's glyph cache (#206; the kernel's `font::Text`).
+pub const GLYPH_CACHE_BYTES: u64 = 128 * KIB;
+
+const _: () = assert!(
+    STORE_BYTES + TABLE_BYTES + TREE_COPIES_BYTES + GLYPH_CACHE_BYTES <= APP_OVERHEAD,
+    "APP_OVERHEAD's parts exceed it"
+);
+
 /// The largest window, in pixels (640 × 480).
 pub const WINDOW_PIXELS: u64 = 640 * 480;
+/// A window's surfaces: the owner's, the committed one, `text_draw`'s
+/// scratch.
+pub const SURFACES: u64 = 3;
+/// A pixel, xRGB8888.
+pub const BYTES_PER_PIXEL: u64 = 4;
 /// A table's most elements.
 pub const TABLE_ELEMENTS: usize = 10_000;
 /// Fuel per slice.
@@ -88,14 +108,14 @@ pub const APP_WORST: u64 = MEMORY_PAGES * PAGE_BYTES
     + VALUE_STACK_BYTES as u64
     + CODE_FACTOR * MODULE_BYTES as u64
     + APP_OVERHEAD
-    + 3 * WINDOW_PIXELS * 4;
+    + WINDOWS as u64 * SURFACES * WINDOW_PIXELS * BYTES_PER_PIXEL;
 
 const _: () = assert!(MAX_APPS as u64 * APP_WORST <= APP_BUDGET, "the apps' worst cases exceed the budget");
 
 /// How many apps may run at once on a machine whose frame allocator owns
-/// `usable` bytes:
-/// [`MAX_APPS`], or fewer when the worst cases wouldn't fit beside
-/// [`KERNEL_RESERVE`]. Worked out once at boot.
+/// `usable` bytes: [`MAX_APPS`], or fewer when the worst cases wouldn't fit
+/// beside [`KERNEL_RESERVE`]. The kernel works it out once, at the first
+/// `run`.
 pub fn slots(usable: u64) -> usize {
     let fit = usable.saturating_sub(KERNEL_RESERVE) / APP_WORST;
     (fit as usize).min(MAX_APPS)

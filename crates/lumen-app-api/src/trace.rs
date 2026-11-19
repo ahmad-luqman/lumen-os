@@ -39,13 +39,15 @@ pub fn decode_header(bytes: &[u8; HEADER_SIZE]) -> (u64, u64) {
 
 /// One event's bytes.
 pub fn event(e: &Event) -> [u8; EVENT_SIZE] {
+    // Every field named: one added to `Event` must be placed here.
+    let Event { seq, tsc, cpu, kind, pid, args } = *e;
     let mut out = [0; EVENT_SIZE];
-    out[0..8].copy_from_slice(&e.seq.to_le_bytes());
-    out[8..16].copy_from_slice(&e.tsc.to_le_bytes());
-    out[16..18].copy_from_slice(&e.cpu.to_le_bytes());
-    out[18..20].copy_from_slice(&e.kind.to_le_bytes());
-    out[20..24].copy_from_slice(&e.pid.to_le_bytes());
-    for (i, a) in e.args.iter().enumerate() {
+    out[0..8].copy_from_slice(&seq.to_le_bytes());
+    out[8..16].copy_from_slice(&tsc.to_le_bytes());
+    out[16..18].copy_from_slice(&cpu.to_le_bytes());
+    out[18..20].copy_from_slice(&kind.to_le_bytes());
+    out[20..24].copy_from_slice(&pid.to_le_bytes());
+    for (i, a) in args.iter().enumerate() {
         out[24 + 8 * i..32 + 8 * i].copy_from_slice(&a.to_le_bytes());
     }
     out

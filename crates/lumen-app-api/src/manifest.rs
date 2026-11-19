@@ -8,8 +8,8 @@
 //! sections. It never panics, whatever the bytes (tested on every
 //! truncation and flipped byte of a module).
 
+use crate::text::{self, LogText, NAME_BYTES};
 use crate::{Grants, Listable};
-use alloc::string::String;
 use core::fmt;
 
 /// The section's name.
@@ -37,8 +37,10 @@ pub enum ManifestError {
     /// The section doesn't start with `caps=`, has an empty grant (two
     /// commas, or one at the end) or isn't UTF-8.
     Grammar,
-    /// A grant no app can list (`log` included: every app has it).
-    Unknown(String),
+    /// A grant no app can list (`log` included: every app has it), as log
+    /// text cut at [`NAME_BYTES`] (the module's bytes, so they can't forge
+    /// a line or fill one).
+    Unknown(LogText),
     /// A grant listed twice.
     Repeated(Listable),
 }
@@ -89,7 +91,7 @@ pub fn parse(payload: &[u8]) -> Result<Manifest, ManifestError> {
         if name.is_empty() {
             return Err(ManifestError::Grammar);
         }
-        let l = Listable::from_name(name).ok_or_else(|| ManifestError::Unknown(String::from(name)))?;
+        let l = Listable::from_name(name).ok_or_else(|| ManifestError::Unknown(text::cut(name, NAME_BYTES)))?;
         if caps.has(l.grant()) {
             return Err(ManifestError::Repeated(l));
         }
@@ -161,6 +163,10 @@ mod tests {
     use crate::Grant;
     use alloc::vec::Vec;
 
+    fn unknown(name: &str) -> ManifestError {
+        ManifestError::Unknown(text::cut(name, NAME_BYTES))
+    }
+
     fn leb(mut n: u32) -> Vec<u8> {
         let mut out = Vec::new();
         loop {
@@ -216,11 +222,11 @@ mod tests {
             (b"caps=,time", ManifestError::Grammar),
             (b"caps=time,,trace", ManifestError::Grammar),
             (b"cap=time", ManifestError::Grammar),
-            (b"caps=time\n", ManifestError::Unknown("time\n".into())),
+            (b"caps=time\n", unknown("time\n")),
             (b" caps=time", ManifestError::Grammar),
-            (b"caps=log", ManifestError::Unknown("log".into())),
-            (b"caps=Time", ManifestError::Unknown("Time".into())),
-            (b"caps=time, trace", ManifestError::Unknown(" trace".into())),
+            (b"caps=log", unknown("log")),
+            (b"caps=Time", unknown("Time")),
+            (b"caps=time, trace", unknown(" trace")),
             (b"caps=time,time", ManifestError::Repeated(Listable::Time)),
             (b"caps=\xff", ManifestError::Grammar),
         ];
@@ -228,6 +234,19 @@ mod tests {
             assert_eq!(find(&module(&[(SECTION, payload)])), Err(want), "{payload:?}");
         }
         assert_eq!(find(&module(&[("other", b"caps=")])), Err(ManifestError::Missing));
+        // Only the exact name is a manifest.
+        for near in ["lumen.manifestX", "lumen.manifes", "Lumen.manifest", "lumen.manifest\0", ""] {
+            assert_eq!(find(&module(&[(near, b"caps=")])), Err(ManifestError::Missing), "{near:?}");
+        }
+        assert!(find(&module(&[("lumen.manifestX", b"caps=x"), (SECTION, b"caps=")])).is_ok());
+        // An unknown grant is shown cut and sanitised.
+        let long = alloc::format!("caps=\x1b[2J{}", "z".repeat(1000));
+        match find(&module(&[(SECTION, long.as_bytes())])) {
+            Err(ManifestError::Unknown(name)) => {
+                assert!(name.len() <= text::log_text_bound(NAME_BYTES) && name.starts_with('\u{fffd}'), "{name}");
+            }
+            other => panic!("{other:?}"),
+        }
         assert_eq!(find(&module(&[(SECTION, b"caps="), (SECTION, b"caps=")])), Err(ManifestError::Twice));
         assert_eq!(find(b"\0asm\x02\0\0\0"), Err(ManifestError::NotAModule));
         assert_eq!(find(b""), Err(ManifestError::NotAModule));

@@ -6,6 +6,10 @@
 
 /// The one module apps import from.
 pub const MODULE: &str = "lumen";
+/// The function a module exports for the runtime to call: `[] -> [i32]`.
+pub const ENTRY: &str = "lumen_main";
+/// The memory a module exports (its one memory, fixed in size).
+pub const MEMORY: &str = "memory";
 
 /// A wasm value type a host function takes or returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,10 +68,24 @@ mod tests {
     }
 
     #[test]
-    fn signatures_are_pinned() {
-        assert_eq!(lookup("time_sleep").unwrap().params, [I32, I64]);
-        assert_eq!(lookup("time_now").unwrap().results, [I64]);
-        assert_eq!(lookup("exit").unwrap().results, [] as [Ty; 0]);
-        assert_eq!(lookup("trace_read").unwrap().params, [I32, I32, I32, I64, I32, I32]);
+    fn every_signature_is_pinned() {
+        // The ABI: a change here breaks every built app.
+        let pinned: &[(&str, &[Ty], &[Ty])] = &[
+            ("handle_find", &[I32], &[I32]),
+            ("handle_close", &[I32], &[I32]),
+            ("args_len", &[], &[I32]),
+            ("args_read", &[I32, I32], &[I32]),
+            ("exit", &[I32], &[]),
+            ("panic", &[I32, I32], &[]),
+            ("log", &[I32, I32, I32, I32], &[I32]),
+            ("time_now", &[I32], &[I64]),
+            ("time_wall", &[I32], &[I64]),
+            ("time_sleep", &[I32, I64], &[I32]),
+            ("trace_cpus", &[I32], &[I32]),
+            ("trace_read", &[I32, I32, I32, I64, I32, I32], &[I32]),
+        ];
+        let got: Vec<(&str, &[Ty], &[Ty])> = FUNCTIONS.iter().map(|f| (f.name, f.params, f.results)).collect();
+        assert_eq!(got, pinned);
+        assert_eq!((MODULE, ENTRY, MEMORY), ("lumen", "lumen_main", "memory"));
     }
 }

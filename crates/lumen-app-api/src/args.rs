@@ -4,6 +4,7 @@
 
 use crate::limits::ARGS_BYTES;
 use alloc::vec::Vec;
+use core::fmt;
 
 /// Why arguments can't be handed to an app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,6 +13,15 @@ pub enum ArgsError {
     TooLong,
     /// A word holds a NUL, which would split it.
     Nul,
+}
+
+impl fmt::Display for ArgsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ArgsError::TooLong => write!(f, "arguments too long (past {ARGS_BYTES} bytes)"),
+            ArgsError::Nul => f.write_str("an argument holds a NUL"),
+        }
+    }
 }
 
 /// The arguments' bytes.
@@ -55,5 +65,7 @@ mod tests {
         let past = "a".repeat(ARGS_BYTES);
         assert_eq!(encode([past.as_str()]), Err(ArgsError::TooLong));
         assert_eq!(encode(["a\0b"]), Err(ArgsError::Nul));
+        assert_eq!(ArgsError::TooLong.to_string(), "arguments too long (past 1024 bytes)");
+        assert_eq!(ArgsError::Nul.to_string(), "an argument holds a NUL");
     }
 }

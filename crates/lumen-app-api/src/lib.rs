@@ -3,7 +3,8 @@
 //! (`kernel/src/app`) and the apps (through `apps/`'s path dependency), so
 //! the two can't disagree on a number:
 //!
-//! - [`Error`]: the codes a host call returns, negated;
+//! - [`Error`]: the codes a host call returns, negated; [`LogLevel`]: `log`'s
+//!   levels;
 //! - [`Kind`], [`Grant`], [`Listable`] and [`Grants`]: capability handles'
 //!   kinds, what `handle_find` takes, what a manifest and `run --without`
 //!   name;
@@ -92,9 +93,28 @@ impl Error {
         -(self as i32)
     }
 
+    /// The error with code `code`, if any (an exhaustive match: a new
+    /// variant must be given here, and a test checks [`Error::ALL`] holds
+    /// every one this returns).
+    pub const fn from_code(code: i32) -> Option<Error> {
+        Some(match code {
+            1 => Error::BadHandle,
+            2 => Error::WrongKind,
+            3 => Error::NotGranted,
+            4 => Error::BadPointer,
+            5 => Error::BadArgument,
+            6 => Error::BufferTooSmall,
+            7 => Error::Limit,
+            8 => Error::Unavailable,
+            9 => Error::OutOfMemory,
+            _ => return None,
+        })
+    }
+
     /// The error a host call's negative result names, if any.
     pub fn from_returned(result: i64) -> Option<Error> {
-        Error::ALL.into_iter().find(|e| i64::from(e.returned()) == result)
+        let code = i32::try_from(result.checked_neg()?).ok()?;
+        if code <= 0 { None } else { Error::from_code(code) }
     }
 
     /// Its name, as apps log it (`NotGranted`).
@@ -182,9 +202,46 @@ impl Grant {
         }
     }
 
-    /// Its bit in [`Grants`].
+    /// Its bit in [`Grants`] (every grant's number is below 8: checked
+    /// at compile time).
     const fn bit(self) -> u8 {
         1 << (self as i32 as u8)
+    }
+}
+
+const _: () = {
+    let mut i = 0;
+    while i < Grant::ALL.len() {
+        assert!((Grant::ALL[i] as i32) < 8, "a grant's number must fit a bit of Grants' u8");
+        i += 1;
+    }
+};
+
+/// A `log` call's level: its numbers are the ABI's (pinned by a test).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(i32)]
+pub enum LogLevel {
+    Error = 1,
+    Warn = 2,
+    Info = 3,
+    Debug = 4,
+    Trace = 5,
+}
+
+impl LogLevel {
+    pub const ALL: [LogLevel; 5] = [LogLevel::Error, LogLevel::Warn, LogLevel::Info, LogLevel::Debug, LogLevel::Trace];
+
+    /// The level `log`'s `level` argument names: `None` (`BadArgument`)
+    /// outside 1..=5.
+    pub const fn from_number(n: i32) -> Option<LogLevel> {
+        Some(match n {
+            1 => LogLevel::Error,
+            2 => LogLevel::Warn,
+            3 => LogLevel::Info,
+            4 => LogLevel::Debug,
+            5 => LogLevel::Trace,
+            _ => return None,
+        })
     }
 }
 
@@ -280,6 +337,20 @@ mod tests {
         }
         assert_eq!(Error::from_returned(0), None);
         assert_eq!(Error::from_returned(-10), None);
+        assert_eq!(Error::from_returned(1), None);
+        assert_eq!(Error::from_returned(i64::MIN), None);
+        assert_eq!(Error::from_returned(i64::from(i32::MIN)), None);
+    }
+
+    #[test]
+    fn all_holds_every_code() {
+        // `from_code` is an exhaustive match: whatever it names, `ALL`
+        // (which `from_returned` and the apps' `named` go by) holds too.
+        let named: Vec<Error> = (-64..=64).filter_map(Error::from_code).collect();
+        assert_eq!(named, Error::ALL);
+        for e in Error::ALL {
+            assert_eq!(Error::from_code(e.code()), Some(e));
+        }
         assert_eq!(returned(Ok(7)), 7);
         assert_eq!(returned(Err(Error::Limit)), -7);
         assert_eq!(returned64(Err(Error::Unavailable)), -8);
@@ -297,6 +368,17 @@ mod tests {
         // Window (4) and numbers naming no grant.
         for n in [-1, 0, 4, 6, i32::MAX] {
             assert_eq!(Grant::from_number(n), None, "{n}");
+        }
+    }
+
+    #[test]
+    fn log_levels_are_pinned() {
+        assert_eq!(LogLevel::ALL.map(|l| l as i32), [1, 2, 3, 4, 5]);
+        for l in LogLevel::ALL {
+            assert_eq!(LogLevel::from_number(l as i32), Some(l));
+        }
+        for n in [-1, 0, 6, i32::MAX] {
+            assert_eq!(LogLevel::from_number(n), None, "{n}");
         }
     }
 

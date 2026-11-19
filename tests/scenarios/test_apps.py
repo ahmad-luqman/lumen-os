@@ -1,13 +1,14 @@
 """The WASM app runtime (#199; ARCHITECTURE section 8): `run`, `apps`,
 `kill`, the host functions without a window, and how an app ends.
 
-The test apps (apps/test-*) are embedded in the kernel as `TEST_APPS`.
-Judged by confirmed effects and counts only (CLAUDE.md, "Tests on a busy
-host"): an app's log lines and end line, `apps`' records polled until they
-say what is expected, a thread's id gone from `threads`, never a time. A
-kill may answer "still ending" on a host that stalls the app's vCPU past
-`KILL_WAIT`, so the kill tests accept either line and confirm the end by the
-app's end line and its thread's join.
+The test apps are embedded in the kernel as `TEST_APPS` (ARCHITECTURE
+section 8, "What #199 adds"). Judged by confirmed effects and counts only
+(CLAUDE.md, "Tests on a busy host"): an app's log lines and end line,
+`apps`' records polled until they say what is expected, a thread's id gone
+from `threads`, never a time. A kill may answer "still ending (<place>)" on
+a host that stalls the app's vCPU past `KILL_WAIT_NS`, so the kill tests
+accept "killed" or any place (`kill`) and confirm the end by the app's end
+line and its thread's join.
 """
 
 import re
@@ -50,13 +51,33 @@ def thread_ids(m, allow: str | None = None) -> set[str]:
     }
 
 
+def wait_unlisted(m, app_id: int, allow: str | None = None) -> None:
+    """Until `apps` no longer lists the app (the reaper joined it)."""
+    _, done = poll(m, lambda: app(m, app_id, allow), lambda a: a is None, 30)
+    assert done, f"app {app_id} still listed"
+
+
 def wait_gone(m, app_id: int, thread: str, allow: str | None = None) -> None:
     """Until `apps` no longer lists the app and its thread is gone from
     `threads` (joined by the reaper)."""
-    _, done = poll(m, lambda: app(m, app_id, allow), lambda a: a is None, 30)
-    assert done, f"app {app_id} still listed"
+    wait_unlisted(m, app_id, allow)
     _, done = poll(m, lambda: thread_ids(m, allow), lambda ids: thread not in ids, 30)
     assert done, f"app {app_id}'s thread {thread} not joined"
+
+
+# Every place `kill` can say an app still ending is (runtime.rs,
+# `Phase::place`).
+KILL_PLACES = ("loading", "in a slice", "in time_sleep", "ending")
+
+
+def kill(m, app_id: int, name: str, allow: str | None = None) -> None:
+    """`kill <id>`: "killed", or "still ending (<place>)" on a host that
+    stalls the app past `KILL_WAIT_NS` (the caller confirms the end)."""
+    out = run(m, f"kill {app_id}", allow=allow).strip()
+    places = "|".join(re.escape(p) for p in KILL_PLACES)
+    assert re.fullmatch(
+        rf"kill: app {app_id} \({re.escape(name)}\) (killed|still ending \(({places})\))", out
+    ), out
 
 
 def end_line(m, mark: int, name: str, app_id: int, what: str, level: str = "INFO") -> None:
@@ -69,8 +90,7 @@ def test_hello_wasm(boot):
     assert app_id == 1
     wait_for_output(m, mark, r"INFO  app: hello: hello from wasm\n", 30)
     end_line(m, mark, "hello", app_id, "exited with 0")
-    _, done = poll(m, lambda: app(m, app_id), lambda a: a is None, 30)
-    assert done, "hello still listed after it exited"
+    wait_unlisted(m, app_id)
     # `run` alone: its usage and the bundled apps (none bundled yet).
     out = run(m, "run")
     assert out.startswith("usage: run [--without <grant>] <app> [args...]"), out
@@ -99,11 +119,7 @@ def test_busy_app_is_preempted(boot):
     assert later["state"] in ("running", "waiting"), later
     assert int(later["fuel"]) > 0
     mark = len(m.output)
-    out = run(m, f"kill {busy}").strip()
-    assert out in (
-        f"kill: app {busy} (busy) killed",
-        f"kill: app {busy} (busy) still ending (in a slice)",
-    ), out
+    kill(m, busy, "busy")
     end_line(m, mark, "busy", busy, "killed")
     wait_gone(m, busy, later["thread"])
 
@@ -114,17 +130,18 @@ def test_run_refuses_past_max_apps(boot):
     assert ids == [1, 2, 3, 4]
     assert run(m, "run hello").strip() == "run: hello: 4 apps running already"
     record = app(m, ids[0])
-    run(m, f"kill {ids[0]}")
+    kill(m, ids[0], "busy")
     wait_gone(m, ids[0], record["thread"])
     # A slot again, and a new id (never a used one).
     again, mark = start(m, "hello")
     assert again == 5
     end_line(m, mark, "hello", again, "exited with 0")
     for app_id in ids[1:]:
-        run(m, f"kill {app_id}")
+        kill(m, app_id, "busy")
 
 
 TRAP_ENDS = r"WARN  app: (trap|greedy) \(app \d+\) ended"
+BAD_TEXT = "ended: panicked: bad\ufffd" + "y" * 250
 
 
 def heap_used(m) -> int:
@@ -139,22 +156,34 @@ def test_app_trap_kills_app_not_kernel(boot):
         ("trap panic", "trap", "ended: panicked: boom�WARN  app: forged�"),
         ("greedy", "greedy", "ended: panicked: out of memory"),
         ("trap depth", "trap", "ended: trap: call stack exhausted"),
+        # A message past the memory's end; one whose claimed 2000 bytes
+        # would be, but whose first TEXT_BYTES fit: invalid UTF-8 as
+        # U+FFFD, cut at LOG_BYTES (3 + 3 + 250 bytes).
+        ("trap badptr", "trap", "ended: panicked: <a bad pointer>"),
+        ("trap badtext", "trap", BAD_TEXT),
     ]
 
     def round_of_traps() -> None:
         for line, name, what in cases:
             app_id, mark = start(m, line, allow=TRAP_ENDS)
+            # The whole line: nothing after what is expected.
             end_line(m, mark, name, app_id, re.escape(what), "WARN")
             if name == "greedy":
                 # Its memory is fixed: memory.grow gives -1.
                 wait_for_output(
                     m, mark, r"INFO  app: greedy: greedy: 32 pages, memory\.grow\(1\) gave -1\n"
                 )
-            _, done = poll(
-                m, lambda app_id=app_id: app(m, app_id, TRAP_ENDS), lambda a: a is None, 30
-            )
-            assert done, f"{line} still listed"
+            wait_unlisted(m, app_id, TRAP_ENDS)
             assert run(m, "echo still here", allow=TRAP_ENDS) == "still here\n"
+        # The other endings must give the heap back too: a kill (its store
+        # dropped on the app's thread) and an exit.
+        app_id, mark = start(m, "busy", allow=TRAP_ENDS)
+        kill(m, app_id, "busy", allow=TRAP_ENDS)
+        end_line(m, mark, "busy", app_id, "killed")
+        wait_unlisted(m, app_id, TRAP_ENDS)
+        app_id, mark = start(m, "hello exit 7", allow=TRAP_ENDS)
+        end_line(m, mark, "hello", app_id, "exited with 7")
+        wait_unlisted(m, app_id, TRAP_ENDS)
 
     # The shell's history at its cap first (100 lines), so the lines run
     # meanwhile replace others; one round to warm up (first-use
@@ -223,11 +252,7 @@ def test_kill_wakes_a_waiting_app(boot):
     )
     assert done, record
     mark = len(m.output)
-    out = run(m, f"kill {app_id}").strip()
-    assert out in (
-        f"kill: app {app_id} (busy) killed",
-        f"kill: app {app_id} (busy) still ending (in time_sleep)",
-    ), out
+    kill(m, app_id, "busy")
     end_line(m, mark, "busy", app_id, "killed")
     wait_gone(m, app_id, record["thread"])
     assert run(m, f"kill {app_id}").strip() == f"kill: no app {app_id}"

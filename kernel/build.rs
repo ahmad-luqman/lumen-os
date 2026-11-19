@@ -14,14 +14,14 @@ fn main() {
     embed_apps(Path::new(&dir).join("../build/apps").as_path());
 }
 
-/// Embed the WASM apps `make apps` built (ARCHITECTURE section 8,
-/// "Building and bundling"): build/apps/<name>.wasm as `app::BUNDLED`,
-/// build/apps/tests/<name>.wasm as `app::TEST_APPS`, each sorted by name,
-/// each an `App { name, thread, module }` (`thread` the `app:<name>` string
-/// its thread is named with, since `sched::spawn` takes a `&'static str`).
-/// A name outside `[a-z0-9_-]`, or one in both sets, fails the build; no
-/// build/apps at all (`make lint` runs before `make build` in CI) gives
-/// empty lists, said in a warning.
+/// Embed the WASM apps `make apps` built (the layout: ARCHITECTURE section
+/// 8, "Building and bundling") as `app::BUNDLED` and `app::TEST_APPS`, each
+/// sorted by name, each an `App { name, thread, module }` (`thread` the
+/// `app:<name>` string its thread is named with, since `sched::spawn` takes
+/// a `&'static str`). A name outside `[a-z0-9_-]`, or one in both sets,
+/// fails the build; no build/apps at all (`make lint` runs before `make
+/// build` in CI) gives empty lists, said in a warning, as does a directory
+/// that can't be read.
 fn embed_apps(apps: &Path) {
     println!("cargo:rerun-if-changed={}", apps.display());
     println!("cargo:rerun-if-changed={}", apps.join("tests").display());
@@ -52,10 +52,21 @@ fn embed_apps(apps: &Path) {
 }
 
 /// The `.wasm` files directly in `dir`, as (name, path), sorted by name.
+/// A directory that isn't there is empty; one that can't be read, or an
+/// entry that can't, is warned about.
 fn modules(dir: &Path) -> Vec<(String, std::path::PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            println!("cargo:warning=can't read {}: {e}: the kernel embeds none of its apps", dir.display());
+            return Vec::new();
+        }
+    };
     let mut found: Vec<_> = entries
-        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry.map_err(|e| println!("cargo:warning=can't read an entry of {}: {e}", dir.display())).ok()
+        })
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "wasm"))
         .map(|p| {
