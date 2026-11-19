@@ -22,7 +22,7 @@ tests = [
 ]
 
 [[feature]]
-name = "postcard 1.1.3 and serde 1.0.229, the app interface's wire format (section 8), run in the ktest kernel with the flag audit passing: a derived struct and enum encode to exactly the bytes postcard specifies (varints, zigzagged signed integers, length-prefixed strings, an enum's variant position) and decode back; bytes cut short or naming no variant are an error, not a panic"
+name = "postcard 1.1.3 and serde 1.0.229, the app interface's wire format (section 8), in the ktest kernel with the flag audit's binary checks passing: a derived struct and enums encode to exactly the bytes postcard specifies (integers wider than a byte as varints, signed ones zigzagged, a u8 as its one byte, length-prefixed strings, an enum's declaration position, never its repr discriminant) and decode back with nothing left over; trailing bytes are left over for the caller, every cut of an encoding is DeserializeUnexpectedEnd, and a variant past the last is serde's refusal"
 milestone = "M5"
 tests = [
     "ktest:lumen_kernel::app::wire::postcard_round_trips_derived_types",
