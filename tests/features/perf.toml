@@ -7,6 +7,7 @@ tests = [
     "cargo:lumen-perf",
     "ktest:lumen_kernel::perf::samples_land_while_armed_and_stop_when_disarmed",
     "ktest:lumen_kernel::perf::a_spinning_thread_ranks_first_by_function_and_by_thread",
+    "ktest:lumen_kernel::perf::a_burn_being_stopped_keeps_its_slot_until_its_thread_has_ended",
     "scenario:test_perf::test_hot_function_is_on_top",
     "scenario:test_perf::test_perf_usage_and_refusals",
 ]

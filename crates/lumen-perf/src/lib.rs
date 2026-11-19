@@ -40,18 +40,21 @@ const IDLE_BIT: u64 = 1 << 63;
 /// interrupt) while it is armed, and read by a thread.
 ///
 /// Lock-free and wait-free for the writer: [`record`](Self::record) never
-/// waits. The state is one word, `want << 32 | len`: armed for `want`
-/// samples, `len` taken so far. The writer stores a sample's words into
-/// slot `len`, then moves the state from `(want, len)` to `(want, len + 1)`
-/// by compare-and-swap (Release), so a reader that sees `len` (Acquire)
-/// sees every slot below it. [`arm`](Self::arm) and [`disarm`](Self::disarm)
-/// store a new state outright; a writer that raced them fails its
-/// compare-and-swap, and the slot it wrote is at or past the new `len`,
-/// so no reader takes it before the writer writes it again (the writer's
-/// records are serialized: one interrupt at a time on one CPU, so that
-/// rewrite comes before the slot is published). The state can't come back
-/// to the value the writer read before its swap: a new arming starts at
-/// `len` 0, and only this writer moves `len` up.
+/// waits. The state is one word: an arming generation (the top
+/// [`GEN_BITS`] bits), `want` (samples it is armed for) and `len` (taken so
+/// far), [`LEN_BITS`] bits each. The writer stores a sample's words into
+/// slot `len`, then moves the state from `len` to `len + 1` by
+/// compare-and-swap (Release), so a reader that sees `len` (Acquire) sees
+/// every slot below it. [`arm`](Self::arm) and [`disarm`](Self::disarm)
+/// store a new state outright, with the next generation; a writer that
+/// raced them fails its compare-and-swap, and the slot it wrote is at or
+/// past the new `len`, so no reader takes it before the writer writes it
+/// again (the writer's records are serialized: one interrupt at a time on
+/// one CPU, so that rewrite comes before the slot is published). The
+/// generation is what makes the swap fail: without it, a disarm and a
+/// re-arm for the same count between a writer's load and its swap would
+/// bring back the exact state it loaded (PR #212's review). It wraps only
+/// after 2^24 armings inside one record's few instructions.
 ///
 /// Callers keep to one writer at a time per buffer and one arming reader at
 /// a time; misuse can mix samples up but is never undefined behaviour (all
@@ -69,8 +72,8 @@ impl<const N: usize> Default for Buffer<N> {
 }
 
 impl<const N: usize> Buffer<N> {
-    /// Room for `N` must fit the state's 32-bit halves.
-    const FITS: () = assert!(N > 0 && N <= u32::MAX as usize);
+    /// Room for `N` must fit the state's `want` and `len` fields.
+    const FITS: () = assert!(N > 0 && N <= LEN_MASK as usize);
 
     pub const fn new() -> Self {
         let () = Self::FITS;
@@ -90,13 +93,21 @@ impl<const N: usize> Buffer<N> {
     /// held: how many it will take.
     pub fn arm(&self, want: usize) -> usize {
         let want = want.min(N);
-        self.state.store((want as u64) << 32, Ordering::Release);
+        self.rearm(want);
         want
     }
 
     /// Stop taking samples (what it held is dropped too).
     pub fn disarm(&self) {
-        self.state.store(0, Ordering::Release);
+        self.rearm(0);
+    }
+
+    /// Store a fresh state for `want` samples, in the next generation. For
+    /// the one arming reader (a load then a store: two readers at once
+    /// could reuse a generation).
+    fn rearm(&self, want: usize) {
+        let generation = (self.state.load(Ordering::Relaxed) >> GEN_SHIFT).wrapping_add(1);
+        self.state.store(generation << GEN_SHIFT | (want as u64) << LEN_BITS, Ordering::Release);
     }
 
     /// Record `sample` if armed and not yet full: whether it was taken. For
@@ -146,9 +157,16 @@ impl<const N: usize> Buffer<N> {
     }
 }
 
+/// The bits of a state word's `want` and of its `len`.
+pub const LEN_BITS: u32 = 20;
+/// The bits of a state word's arming generation (the rest).
+pub const GEN_BITS: u32 = 64 - 2 * LEN_BITS;
+const GEN_SHIFT: u32 = 2 * LEN_BITS;
+const LEN_MASK: u64 = (1 << LEN_BITS) - 1;
+
 /// A state word's `(want, len)`.
 fn split(state: u64) -> (usize, usize) {
-    ((state >> 32) as usize, (state & u64::from(u32::MAX)) as usize)
+    (((state >> LEN_BITS) & LEN_MASK) as usize, (state & LEN_MASK) as usize)
 }
 
 /// One row of a ranking: a key (a function, a thread) and its samples.
@@ -375,6 +393,34 @@ mod tests {
         let mut out = Vec::new();
         b.copy_into(&mut out);
         assert_eq!(out, [s(10, 10), s(11, 11), s(12, 12)], "slot 2 rewritten before it was published");
+    }
+
+    #[test]
+    fn a_disarm_and_rearm_for_the_same_count_still_drops_a_raced_record() {
+        // PR #212's review: arm(8), claim slot 0, disarm, arm(8) again: the
+        // state's want and len are back where the claim saw them, and only
+        // the generation tells the armings apart.
+        let b: Buffer<8> = Buffer::new();
+        b.arm(8);
+        let claimed = b.claim().unwrap();
+        b.disarm();
+        b.arm(8);
+        assert!(!b.publish(claimed, s(99, 99)), "the old arming's sample must not publish");
+        assert_eq!(b.progress(), (0, 8));
+        assert!(b.record(s(1, 1)));
+        let mut out = Vec::new();
+        b.copy_into(&mut out);
+        assert_eq!(out, [s(1, 1)]);
+    }
+
+    #[test]
+    fn generations_wrap_without_touching_want_or_len() {
+        let b: Buffer<4> = Buffer::new();
+        b.state.store(u64::MAX << GEN_SHIFT, Ordering::Relaxed);
+        assert_eq!(b.arm(3), 3);
+        assert_eq!(b.state.load(Ordering::Relaxed) >> GEN_SHIFT, 0, "wrapped");
+        assert!(b.record(s(1, 1)));
+        assert_eq!(b.progress(), (1, 3));
     }
 
     #[test]

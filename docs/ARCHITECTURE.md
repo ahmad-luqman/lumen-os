@@ -4293,7 +4293,8 @@ kernel. The kernel is the trusted computing base.
   `sched::running_id_here`) into that CPU's sample buffer
   (`lumen_perf::Buffer`: one writer, the CPU's own interrupt; lock-free,
   never waits, allocates nothing; armed for a count and refusing samples
-  past it). Otherwise the tick pays one atomic load (`perf::on_tick`). A
+  past it; each arming has a new generation in the buffer's state word, so
+  a record raced by a re-arm never lands in the later arming). Otherwise the tick pays one atomic load (`perf::on_tick`). A
   profile is a number of samples per CPU on every CPU whose scheduler
   runs (default 1000, at most 2048), never a duration, so a loaded host
   makes it slower, not smaller; Ctrl-C or `q` stops it early and the header
@@ -4303,7 +4304,9 @@ kernel. The kernel is the trusted computing base.
   header and in no row; the share column is a row's part of the busy
   samples. One profile at a time. `perf burn [cpu]` spins a thread
   (`perf-burn`) in `perf::burn_loop` on a CPU (the last one by default) until
-  `perf burn stop`, something known to profile. Limits: a sample is
+  `perf burn stop`, something known to profile; each burn has its own stop
+  flag, and a stopping burn keeps the slot until its thread has ended, so a
+  start meanwhile is refused. Limits: a sample is
   wherever the tick landed, so code that runs with interrupts off is
   charged to the instruction after it re-enables them, and nothing
   unwinds: a function's callers aren't credited. A WASM app (M5) shows up

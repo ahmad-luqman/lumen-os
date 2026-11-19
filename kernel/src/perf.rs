@@ -27,6 +27,7 @@ use crate::shell::sysinfo::{DASH, int, text};
 use crate::sync::SpinLock;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -210,32 +211,49 @@ fn thread_table(p: &Profile, rows: usize) -> pipe::Table {
     t
 }
 
-/// Set to end the burn thread's loop.
-static BURN_STOP: AtomicBool = AtomicBool::new(false);
-/// The burn thread's id once it has entered [`burn_loop`] (0: not yet).
-static BURN_THREAD: AtomicU64 = AtomicU64::new(0);
-/// The burn thread, while one runs.
-static BURNING: SpinLock<Option<(usize, JoinHandle)>> = SpinLock::new(None);
+/// One `perf burn` thread's flags: each burn has its own, so a stop meant
+/// for one can never end (or be undone by) the next.
+struct Session {
+    /// Set to end its loop.
+    stop: AtomicBool,
+    /// Its thread's id once it has entered [`burn_loop`] (0: not yet).
+    thread: AtomicU64,
+}
 
-/// Spin until [`BURN_STOP`]: the hot function `perf burn` profiles. Never
+/// The burn slot: free, a burn running, or one being stopped (reserved
+/// until its thread has been joined, so no new burn starts meanwhile).
+enum Burn {
+    Idle,
+    Running { cpu: usize, handle: JoinHandle, session: Arc<Session> },
+    Stopping(usize),
+}
+
+static BURNING: SpinLock<Burn> = SpinLock::new(Burn::Idle);
+
+/// Spin until `session.stop`: the hot function `perf burn` profiles. Never
 /// inlined, so its samples carry its name; how many turns it took.
 #[inline(never)]
-pub fn burn_loop() -> u64 {
+fn burn_loop(session: &Session) -> u64 {
     let id = sched::running_here().map_or(u64::MAX, |(id, _)| id);
-    BURN_THREAD.store(id, Ordering::Release);
+    session.thread.store(id, Ordering::Release);
     let mut turns = 0u64;
-    while !BURN_STOP.load(Ordering::Relaxed) {
+    while !session.stop.load(Ordering::Relaxed) {
         turns = core::hint::black_box(turns.wrapping_add(1));
         core::hint::spin_loop();
     }
     turns
 }
 
-/// Why [`start_burn`] refused.
+/// Why [`start_burn`] or [`stop_burn`] refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BurnError {
-    /// One is already running (on that CPU).
+    /// One is running (on that CPU).
     Running(usize),
+    /// One is being stopped (on that CPU): the slot is free once it has
+    /// ended.
+    Stopping(usize),
+    /// None is running.
+    NotRunning,
     /// That CPU has no scheduler.
     NoSuchCpu,
 }
@@ -249,22 +267,29 @@ fn last_cpu() -> usize {
 /// it is in [`burn_loop`]: its CPU and thread id.
 pub fn start_burn(cpu: Option<usize>) -> Result<(usize, u64), BurnError> {
     let cpu = cpu.unwrap_or_else(last_cpu);
+    // Made before the slot's lock is taken (it allocates); the spawn below
+    // allocates under it, which is fine: nothing takes the slot's lock
+    // under the heap's, the scheduler's or the thread registry's.
+    let session = Arc::new(Session { stop: AtomicBool::new(false), thread: AtomicU64::new(0) });
     let mut burning = BURNING.lock();
-    if let Some((c, _)) = burning.as_ref() {
-        return Err(BurnError::Running(*c));
+    match *burning {
+        Burn::Running { cpu: c, .. } => return Err(BurnError::Running(c)),
+        Burn::Stopping(c) => return Err(BurnError::Stopping(c)),
+        Burn::Idle => {}
     }
-    BURN_STOP.store(false, Ordering::Relaxed);
-    BURN_THREAD.store(0, Ordering::Relaxed);
-    let handle = sched::spawn_on(cpu, "perf-burn", || {
-        core::hint::black_box(burn_loop());
+    let mine = session.clone();
+    let handle = sched::spawn_on(cpu, "perf-burn", move || {
+        core::hint::black_box(burn_loop(&mine));
     })
     .map_err(|_| BurnError::NoSuchCpu)?;
-    *burning = Some((cpu, handle));
+    *burning = Burn::Running { cpu, handle, session: session.clone() };
     drop(burning);
     // Confirmed before it returns: the next step (a profile) finds it
-    // spinning. It is queued on a running scheduler, so it gets its turn.
+    // spinning. It is queued on a running scheduler, so it gets its turn
+    // (a stop before then still lets it enter the loop, store its id and
+    // leave).
     loop {
-        let id = BURN_THREAD.load(Ordering::Acquire);
+        let id = session.thread.load(Ordering::Acquire);
         if id != 0 {
             return Ok((cpu, id));
         }
@@ -272,23 +297,53 @@ pub fn start_burn(cpu: Option<usize>) -> Result<(usize, u64), BurnError> {
     }
 }
 
-/// Stop the burn thread and wait for it to end: the CPU it ran on, if one
-/// ran.
-pub fn stop_burn() -> Option<usize> {
-    let (cpu, handle) = BURNING.lock().take()?;
-    BURN_STOP.store(true, Ordering::Relaxed);
-    handle.join();
-    Some(cpu)
+/// A stop under way: the slot says [`Burn::Stopping`] until
+/// [`finish_stop`] has joined the thread.
+struct Stop {
+    cpu: usize,
+    handle: JoinHandle,
+}
+
+/// Mark the running burn as stopping and tell it to stop.
+fn begin_stop() -> Result<Stop, BurnError> {
+    let mut burning = BURNING.lock();
+    match core::mem::replace(&mut *burning, Burn::Idle) {
+        Burn::Running { cpu, handle, session } => {
+            *burning = Burn::Stopping(cpu);
+            drop(burning);
+            session.stop.store(true, Ordering::Relaxed);
+            Ok(Stop { cpu, handle })
+        }
+        Burn::Stopping(c) => {
+            *burning = Burn::Stopping(c);
+            Err(BurnError::Stopping(c))
+        }
+        Burn::Idle => Err(BurnError::NotRunning),
+    }
+}
+
+/// Wait for the stopped burn's thread to end (not under the slot's lock:
+/// a join blocks), then free the slot: the CPU it ran on.
+fn finish_stop(stop: Stop) -> usize {
+    stop.handle.join();
+    *BURNING.lock() = Burn::Idle;
+    stop.cpu
+}
+
+/// Stop the burn thread and wait for it to end: the CPU it ran on.
+pub fn stop_burn() -> Result<usize, BurnError> {
+    begin_stop().map(finish_stop)
 }
 
 /// `perf burn [cpu]`, `perf burn stop`.
 fn burn_command(ctx: &mut Ctx<'_>, args: &[String]) {
     match args {
         [stop] if stop == "stop" => match stop_burn() {
-            Some(cpu) => {
+            Ok(cpu) => {
                 let _ = writeln!(ctx.out, "perf burn: stopped on cpu {cpu}");
             }
-            None => ctx.fail("perf burn: none running"),
+            Err(BurnError::Stopping(c)) => ctx.fail(format_args!("perf burn: already stopping on cpu {c}")),
+            Err(_) => ctx.fail("perf burn: none running"),
         },
         [] | [_] => {
             let cpu = match args.first().map(|a| a.parse::<usize>()) {
@@ -301,7 +356,8 @@ fn burn_command(ctx: &mut Ctx<'_>, args: &[String]) {
                     let _ = writeln!(ctx.out, "perf burn: spinning on cpu {cpu} (thread perf-burn, id {id})");
                 }
                 Err(BurnError::Running(c)) => ctx.fail(format_args!("perf burn: already spinning on cpu {c}")),
-                Err(BurnError::NoSuchCpu) => ctx.fail("perf burn: no scheduler runs on that CPU"),
+                Err(BurnError::Stopping(c)) => ctx.fail(format_args!("perf burn: still stopping on cpu {c}")),
+                Err(_) => ctx.fail("perf burn: no scheduler runs on that CPU"),
             }
         }
         _ => ctx.fail("usage: perf burn [cpu|stop]"),
@@ -344,7 +400,7 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         let (_, id) = start_burn(None).map_err(|_| "perf burn didn't start")?;
         let p = profile(50, || false);
-        stop_burn();
+        stop_burn().map_err(|_| "perf burn didn't stop")?;
         let p = p.map_err(|_| "a profile was already running")?;
         let by_thread = lumen_perf::by_thread(&p.samples);
         kassert_eq!(by_thread.rows.first().map(|r| r.key), Some(id));
@@ -352,6 +408,27 @@ crate::ktest!(
         let top = by_fn.rows.first().and_then(|r| r.key).unwrap_or("");
         kassert!(top.contains("burn_loop"));
         kassert_eq!(by_fn.rows.iter().map(|r| r.samples).sum::<u64>(), by_fn.busy());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_burn_being_stopped_keeps_its_slot_until_its_thread_has_ended() {
+        use crate::{kassert, kassert_eq};
+        let (cpu, first) = start_burn(None).map_err(|_| "perf burn didn't start")?;
+        // Between telling the thread to stop and joining it, the slot stays
+        // taken: a start (or another stop) is refused, not run alongside.
+        let stop = begin_stop().map_err(|_| "nothing to stop")?;
+        kassert_eq!(start_burn(None), Err(BurnError::Stopping(cpu)));
+        kassert_eq!(stop_burn(), Err(BurnError::Stopping(cpu)));
+        kassert_eq!(finish_stop(stop), cpu);
+        kassert_eq!(stop_burn(), Err(BurnError::NotRunning));
+        // A new burn has its own flags: it runs (the old stop doesn't end
+        // it) until its own stop.
+        let (_, second) = start_burn(None).map_err(|_| "the second burn didn't start")?;
+        kassert!(second != first);
+        kassert!(matches!(*BURNING.lock(), Burn::Running { .. }));
+        kassert_eq!(stop_burn(), Ok(cpu));
         Ok(())
     }
 );
