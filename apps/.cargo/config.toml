@@ -1,0 +1,9 @@
+# Cargo inside apps/ (where `make apps`, `make lint` and `make fmt` run it)
+# builds for WASM.
+[build]
+target = "wasm32-unknown-unknown"
+
+# Next to the root workspace's target/, not inside it (CI's cache cleans
+# target/ by the root's packages):
+# target-apps/wasm32-unknown-unknown/release/<crate>.wasm.
+target-dir = "../target-apps"

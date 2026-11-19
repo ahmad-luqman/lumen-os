@@ -39,6 +39,12 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.2
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # The root workspace, and apps/ (its own workspace, building into
+          # target-apps/; the target is relative to the workspace).
+          workspaces: |
+            . -> target
+            apps -> ../target-apps
 
       - name: Cache boot dependencies (Limine, OVMF)
         uses: actions/cache@v6

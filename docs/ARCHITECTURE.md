@@ -4339,7 +4339,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/rtc.rs       the CMOS RTC: date and time (taken as UTC) for `date`
   src/fb.rs        framebuffer: pixels, glyphs, the hello screen (draw_header), the crash screen
   src/desktop.rs   the desktop (#153, #154): the compositor thread, windows (open_window, WindowHandle), desktop, windows, the themes (theme), the wallpaper
-  src/app.rs       WASM apps (M5): wasmi in fuel slices (run_in_slices), `wasm` and its ktests over the hand-assembled modules in app/modules.rs
+  src/app.rs       WASM apps (M5): wasmi in fuel slices (run_in_slices), `wasm` and its ktests over the hand-assembled modules in app/modules.rs (apps/'s builds come with #199)
   src/font.rs      the desktop's anti-aliased text (lumen-font): the UI font parsed once and shared (font::face), font::Text (a thread's glyph cache, drawing glyph by glyph), the golden sample for `font` and its ktest
   src/screenshot.rs  `screenshot`: the screen as a PNG (lumen-png) in a base64 frame on serial
   src/term.rs      the virtual terminals on the framebuffer (lumen-term): their grids, drawing the shown one's changed cells, log lines, the cursor, the canvas
@@ -4357,4 +4357,25 @@ boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, wallpaper.py (makes the wallpaper), harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml
 docs/              ARCHITECTURE.md, ROADMAP.md, STATUS.md (generated)
+apps/              the WASM apps (M5): their own cargo workspace, no_std cdylibs for wasm32-unknown-unknown, built by `make build` into build/apps/<name>.wasm
 ```
+
+**The apps' target (#196).** `wasm32-unknown-unknown` is in the pinned
+toolchain (`rust-toolchain.toml`). `apps/` is a separate workspace (every
+directory in it but dot ones a member, each named after its crate; the
+root workspace excludes it; output in `target-apps/`), so the host
+crates' `cargo test` and clippy and the kernel builds never see it; `make
+lint` and `make fmt` cover it. `make build` builds the apps, so `make
+audit` (which runs `build`) does too, but the audit's checks look only at
+the kernels. The default release profile keeps the name section (function
+names for trap reports). The harness validates each built module with
+`wasmtime` with the proposals past rustc's defaults that wasmtime-py can
+switch off switched off (SIMD, threads, tail calls, memory64, ...;
+extended-const has no switch, so only the next check catches it), runs
+hello's `answer`, and checks that each module's `target_features`
+section lists exactly rustc 1.99.1's default features for this target: the
+list is `DEFAULT_FEATURES` in `tests/harness/test_wasm_module.py` (six that
+`rustc --print cfg --target wasm32-unknown-unknown` shows, and two more
+that LLVM's generic CPU enables). The kernel's `wasmi` must accept every one: wasmi 2.0.1's default `Config` enables them all, and ran a rustc-built module on the host in #197's probe; in the kernel, #197's hand-assembled modules use only nontrapping-fptoint and bulk memory (`memory.fill`), and the apps-built modules come with #199. A
+toolchain bump that changes the list fails that test, so it gets checked
+again.
