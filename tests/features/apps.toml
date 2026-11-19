@@ -1,10 +1,13 @@
 # Features: WASM apps (M5). See tests/features/README.md for the format.
 
 [[feature]]
-name = "wasmi 2.0.1 linked into both kernels (#197) with the flag audit passing: a module runs in fuel slices (out of fuel, suspended and resumed until it finishes, with the right result) on a 64 KiB thread stack, wasmi's portable loop dispatch never growing the native stack per instruction; recursion past wasmi's call depth traps (stack overflow) instead of overflowing the kernel stack; float operations give the hardware's bits under the kernel's soft-float (rounding, signed zeros, quiet NaNs, round-half-even, u64 to f64, saturating truncation); the shell's `wasm` runs the same checks in the booted kernel"
+name = "wasmi 2.0.1 linked into both kernels (#197) with the flag audit passing: a module runs in fuel slices (out of fuel, suspended and resumed until it finishes, with the right result) on a 64 KiB thread stack, wasmi's portable loop dispatch keeping the native stack's depth constant however long it runs; a slice is topped up to what the next instruction needs (a bulk `memory.fill` costing more than a slice finishes); functions are compiled with the module, so a body costing more than a slice to compile still runs; recursion past wasmi's call depth traps (stack overflow), also after resumes, instead of overflowing the kernel stack; malformed modules (empty, cut short, bad magic or version, an unknown opcode) are refused; float operations give the hardware's bits under the kernel's soft-float (rounding, subnormals, infinities, signed zeros, round-half-even, u64 to f64, f64 to f32, comparisons with NaN, saturating truncation), the canonical NaN where wasm requires it and a quiet NaN from a signalling one; the shell's `wasm` runs the loop and float checks in the booted kernel"
 milestone = "M5"
 tests = [
     "ktest:lumen_kernel::app::wasmi_runs_a_long_loop_in_fuel_slices",
+    "ktest:lumen_kernel::app::a_slice_too_small_for_one_instruction_is_topped_up",
+    "ktest:lumen_kernel::app::a_function_bigger_than_a_slice_compiles_and_runs",
+    "ktest:lumen_kernel::app::malformed_modules_are_refused",
     "ktest:lumen_kernel::app::wasm_floats_match",
     "scenario:test_wasm::test_wasm_command_runs_a_loop_in_fuel_slices",
     "audit:flags",

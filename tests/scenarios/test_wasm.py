@@ -3,7 +3,9 @@ hand-assembled modules in `kernel/src/app/modules.rs` on the shell's own
 thread, so wasmi is linked into the kernel that boots (and `make audit`
 checks it there), not only into the ktest one. The ktests
 `app::wasmi_runs_a_long_loop_in_fuel_slices` and `app::wasm_floats_match`
-check the same on a 64 KiB thread and print each float that differs."""
+share its checks: the first runs the loop's on a 64 KiB thread (with
+`wasm`'s slices and with slices small enough that the deep call traps
+after resumes); the second prints each float that differs."""
 
 import re
 
@@ -30,7 +32,8 @@ def test_wasm_command_runs_a_loop_in_fuel_slices(boot):
     assert loop, out
     assert int(loop[1]) >= 2, out
     assert lines[1] == "wasm: depth(900) = 900", out
-    # Past wasmi's call depth: a trap, the kernel and the shell carry on.
-    assert lines[2].startswith("wasm: depth(5000) trapped: "), out
-    assert lines[3] == "wasm: floats: 19 of 19 match", out
+    # Past wasmi's call depth: that trap (`TrapCode::StackOverflow`, and
+    # no other), and the kernel and the shell carry on.
+    assert lines[2] == "wasm: depth(5000) trapped: call stack exhausted", out
+    assert lines[3] == "wasm: floats: 29 of 29 match", out
     assert run(m, "echo still here") == "still here\n"
