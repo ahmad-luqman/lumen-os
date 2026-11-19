@@ -16,8 +16,11 @@ const MIB: u64 = 1024 * KIB;
 pub const APP_BUDGET: u64 = 128 * MIB;
 /// Apps running or loading at once.
 pub const MAX_APPS: usize = 4;
-/// Memory left to the kernel when a smaller machine gets fewer slots.
-pub const KERNEL_RESERVE: u64 = 64 * MIB;
+/// Memory left to the kernel when a smaller machine gets fewer slots. The
+/// guests' 256 MiB leave the frame allocator about 167 MiB (the kernel's
+/// ELF, the boot structures and the firmware's reservations aside), which
+/// holds the kernel's few MiB and four worst cases with this to spare.
+pub const KERNEL_RESERVE: u64 = 32 * MIB;
 /// The largest module `run` takes.
 pub const MODULE_BYTES: usize = MIB as usize;
 /// Compiled code's charge: this many times the module's size.
@@ -89,7 +92,8 @@ pub const APP_WORST: u64 = MEMORY_PAGES * PAGE_BYTES
 
 const _: () = assert!(MAX_APPS as u64 * APP_WORST <= APP_BUDGET, "the apps' worst cases exceed the budget");
 
-/// How many apps may run at once on a machine with `usable` bytes of RAM:
+/// How many apps may run at once on a machine whose frame allocator owns
+/// `usable` bytes:
 /// [`MAX_APPS`], or fewer when the worst cases wouldn't fit beside
 /// [`KERNEL_RESERVE`]. Worked out once at boot.
 pub fn slots(usable: u64) -> usize {
@@ -106,15 +110,17 @@ mod tests {
         // 16 MiB of memory, 1 of value stack, 8 of code, 1 of overhead and
         // three 640 × 480 surfaces: about 29.5 MiB.
         assert_eq!(APP_WORST, 26 * MIB + 3 * 640 * 480 * 4);
-        // Beside the kernel's reserve on the guests' 256 MiB.
-        assert_eq!(slots(256 * MIB), MAX_APPS);
+        // Beside the kernel's reserve on what the guests' 256 MiB leave
+        // the frame allocator (166.7 MiB measured).
+        assert_eq!(slots(166 * MIB), MAX_APPS);
     }
 
     #[test]
     fn a_smaller_machine_gets_fewer_slots() {
         assert_eq!(slots(256 * MIB), MAX_APPS);
-        assert_eq!(slots(128 * MIB), 2);
-        assert_eq!(slots(64 * MIB), 0);
+        assert_eq!(slots(128 * MIB), 3);
+        assert_eq!(slots(64 * MIB), 1);
+        assert_eq!(slots(32 * MIB), 0);
         assert_eq!(slots(0), 0);
         assert_eq!(slots(u64::MAX), MAX_APPS);
     }

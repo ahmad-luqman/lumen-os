@@ -8,7 +8,7 @@ milestones with test-based exit criteria; `docs/STATUS.md` is generated.
 
 ```bash
 make deps            # pinned Limine + OVMF into build/deps (sha256-checked)
-make build           # both kernels: build/lumen-kernel, build/lumen-kernel-ktest; the apps: build/apps/<name>.wasm
+make build           # the apps (build/apps/<name>.wasm, test apps build/apps/tests/), then both kernels: build/lumen-kernel, build/lumen-kernel-ktest
 make run             # QEMU with a window, serial on your terminal (Ctrl-A x quits; HEADLESS=1; SOUND=1 for beep/play; DESKTOP=1 starts the desktop)
 make debug           # QEMU paused + gdb attached, stopped at kmain
 make test            # everything CI runs: host tests, flag audit, QEMU scenarios
@@ -272,16 +272,24 @@ own PR that updates that doc first.
   `burn_loop` on a CPU (`StartError`, `StopError`; a stopping burn keeps
   its slot and handle until a stop sees it finished, every wait stopping
   on `q` or Ctrl-C).
-  `app.rs`: WASM apps (M5; #197 so far): `wasmi` (`portable-dispatch`: a constant native stack depth
+  `app.rs`: WASM apps (M5): the embedded modules (`App`, `BUNDLED`, `TEST_APPS`, written by
+  `kernel/build.rs` from `build/apps`); `app/runtime.rs` the runtime (#199: the table of apps, a
+  starting slot under its lock, loading on the app's own thread behind a start gate, one `Engine` per
+  app with section 8's wasmi configuration, the import/export/fixed-memory checks, fuel slices (kill
+  checked at each end), one end reason (`lumen_app_api::end`) and its end line, `kill` waiting at most
+  `KILL_WAIT_NS`, the `app-reaper` joining ended apps; `apps` (records), `run`, `kill`);
+  `app/host.rs` the `lumen` host functions without a window (the six-step argument order, fuel
+  charged; `read_trace`); `app/tests.rs` the runtime's ktests over hand-assembled modules. And
+  #197's checks: `wasmi` (`portable-dispatch`: a constant native stack depth
   however long a module runs; functions compiled eagerly; see ARCHITECTURE sections 2 and 8) running a
   module in fuel slices (`run_in_slices`, `run_bounded` with a resume cap: out of fuel, yield, refuel at
   least what the instruction that ran out needs, resume; `Failed`: load, export, run (after how many
   resumes) or the resume cap; a host trap is an error, never a panic), `wasm` (the checks in the booted
   kernel, shared with the ktests: `LoopChecks`, its resume band from the loop's fuel per iteration) and
   its ktests, over hand-assembled modules (`app/modules.rs`: a long loop and call depth, one float
-  operation per export, a bulk `memory.fill`, a generated large body; not yet `apps/`'s builds, which
-  #199 loads). `app/wire.rs`: ktest only, postcard over serde-derived types (the wire format's crates,
-  linked ahead of #199's `lumen-app-api`).
+  operation per export, a bulk `memory.fill`, a generated large body). `app/wire.rs`: ktest only,
+  postcard over serde-derived types (the wire format's crates, linked ahead of the wire types, #206,
+  #207). `mm/heap.rs`'s `peak`/`reset_peak`: the heap's high-water mark.
   `font.rs`: the desktop's anti-aliased text (`lumen-font`): `font::face`,
   the UI font parsed on first use and shared; `font::Text`, one drawing
   thread's glyph cache over it (`draw` glyph by glyph inside a clip,
@@ -453,6 +461,15 @@ own PR that updates that doc first.
   the base64 frame a PNG travels in over serial, streamed from the stack
   (host-tested, incl. a refusing allocator, a golden file PIL decodes,
   every truncation and every flipped byte of a file).
+- `crates/lumen-app-api`: the WASM app interface's types (#199, section 8),
+  shared by the kernel and the apps (built for wasm32 too): `Error` codes,
+  `Kind`, `Grant`, `Listable`, `Grants`, `manifest::find` (walking the
+  module's sections itself, never panicking), `limits` (each app's worst case
+  `APP_WORST` checked against `APP_BUDGET` at compile time; `slots`),
+  `handles::HandleTable` (ids never reused), `range` (guest ranges), `text`
+  (log text cut and sanitised), `end` (`EndReason`, `EndCell`: the first
+  recorded wins; `CloseGrace`), `host` (the `lumen` functions'
+  signatures), `trace` (`trace_read`'s layouts), `args` (host-tested).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
@@ -462,10 +479,14 @@ own PR that updates that doc first.
   one; every directory but dot ones a member, named after its crate; output
   in `target-apps/`) for `wasm32-unknown-unknown`, `no_std`
   `cdylib`s; `make build` (`make apps`) builds each into
-  `build/apps/<name>.wasm`, and `make lint` and `fmt` cover them. `hello`
-  is the smallest (exports `memory` and `answer`, no imports; #196). The
-  kernel doesn't load them yet; the harness validates them in `wasmtime`
-  and runs hello's `answer`.
+  `build/apps/<name>.wasm` (the runtime's test apps, `test-<name>`: `hello`,
+  `busy`, `trap`, `greedy`, `nocap`, `abuse`, into `build/apps/tests/`, each
+  with a 2 MiB fixed memory from its `build.rs`), skipping libraries
+  (`testkit`: what the test apps share, the `lumen` imports and safe
+  wrappers, the manifest macro, a panic handler, a bump allocator), and
+  `make lint` and `fmt` cover them. The kernels embed them
+  (`app::BUNDLED`, `app::TEST_APPS`); the harness validates them in
+  `wasmtime` and checks the app interface's shape.
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
   are built; virtio devices through `Devices`; `press`/`type_text` for keys,
   `move_pointer`/`click` for the tablet), `qmp.py`, `tap.py`, `image.py`, `audit.py`, `status.py`,

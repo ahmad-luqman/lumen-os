@@ -32,7 +32,7 @@ is listed only in [STATUS.md](STATUS.md), which is generated from tests.
 | Bootloader | Limine 12.x (pinned binary release + sha256), `limine` crate **0.5.0** | Memory map, framebuffer, higher-half direct map, and our own ELF file for symbolization, with no loader to write. Crate 0.6.x requires nightly (`#![feature(ptr_metadata)]`), so we use 0.5.0 (base revision 3). | Custom UEFI loader (optional learning milestone), GRUB/multiboot2. |
 | Kernel shape | **Modular monolith** with message-shaped internal interfaces; capabilities enforced at the syscall boundary | One address space keeps early milestones fast and debuggable. Agent safety needs capability checks between *processes*, which a monolith enforces just as well. Drivers and services expose request/response interfaces, so any of them can move to user space later. | Microkernel: stronger isolation of drivers, but it puts IPC performance and many extra servers in front of every milestone. |
 | Test harness | Python (`uv`, pytest) on the host; TAP from the kernel | Fast to write scenarios, mature tooling, and QMP/PIL are easy to use. | Rust `xtask`: one language, but slower iteration on test scripts. |
-| Third-party crates | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), a PR adding only the crates its issue names (with their own dependencies), each checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX, no red zone, the kernel code model). Kernel crates so far: `limine`, `rustc-demangle`, `noto-sans-mono-bitmap` and `log` (from M0, before this policy; `log` is still `0.4`, to be pinned in a PR of its own), `pc-keyboard` (scancode decoding and layouts, #58, the first under it), `vte` (terminal escape parsing; brings `arrayvec` and `memchr`) and `unicode-width` (character widths), both #59. `rhai` (scripting, #67; integers only, no modules, no time, closures that can't capture (`no_closure`), `curry` disabled; brings `ahash`, `hashbrown`, `allocator-api2`, `equivalent`, `foldhash`, `smallvec`, `smartstring`, `thin-vec`, `num-traits`, `libm`, `bitflags`, `once_cell`, `portable-atomic`, `zerocopy`, `static_assertions`, `cfg-if`, `no-std-compat` and `core-error`, plus `const-random`, whose compile-time random seed stays linked but unused (the kernel sets a fixed hashing seed before any script runs), and the proc macros `rhai_codegen` and `const-random-macro`, which run only at build time). `virtio-drivers` `=0.13.0` (#95: virtqueues and the virtio device protocols; `default-features = false` with `alloc`; brings `safe-mmio` and `thiserror` (`bitflags` and `zerocopy` were already linked through `rhai`), plus the build-time proc macros `enumn`, `thiserror-impl` and `zerocopy-derive`), under the adapter rules in section 7, and `zerocopy` as a direct dependency, pinned to the lockfile's version (`=0.8.63`; the crate turns on `zerocopy`'s `derive` and `alloc` features for the whole kernel by feature unification, which `make audit` covers). `wasmi` `=2.0.1` (#197: the WASM interpreter for M5's apps; `default-features = false` with `validate` and `portable-dispatch`; brings `wasmi_core`, `wasmi_ir`, `wasmi_collections`, `wasmparser` and `spin`; its `libm` and `bitflags` were already linked through `rhai`). `portable-dispatch` is a stack-safety choice: our dependency line's `default-features = false` drops `auto-dispatch`, and wasmi then dispatches by tail calls, each instruction's handler calling the next and counting on LLVM to make those calls jumps, which its build script expects only without debug assertions; the kernel keeps them on, so a long loop overflowed a 64 KiB thread stack in #197 (`ktest:lumen_kernel::app::wasmi_runs_a_long_loop_in_fuel_slices` runs one on such a stack). The loop dispatch keeps the native stack's depth constant however long a module runs (host calls aside), and wasmi's own call depth (1000 frames, on the heap) bounds a module's recursion. Functions are compiled with the module (`CompilationMode::Eager`, section 8's wasmi configuration): lazily, a body's compilation is charged (7 fuel a byte) to the fuel left in the slice of the first call to reach it, and one costing more ends that call with an error that can't be resumed (though wasmi's message calls it resumable); compiling eagerly isn't metered, and keeps the compiled code, about 13 bytes of heap per body byte, for the module's life. `postcard` `=1.1.3` and `serde` `=1.0.229` (one PR for the pair, ahead of #199: the app interface's wire format, section 8; postcard with `default-features = false` and `alloc`, so without its default `heapless-cas`; serde with `default-features = false`, `derive` and `alloc`; they bring `serde_core` and `cobs` (`thiserror` was already linked through `virtio-drivers`), plus the build-time proc macro `serde_derive` (`proc-macro2`, `quote` and `syn`, already used by the other proc macros); two `embedded-io` versions are in `Cargo.lock` only, for postcard's optional features, and never built). Until #199's `lumen-app-api` uses them, only the ktest kernel links them (`ktest:lumen_kernel::app::wire::postcard_round_trips_derived_types`), so the flag audit covers them there. `shlex` (#62) is only a dev-dependency of `lumen-shell`, the word splitter's test oracle; `noline`, which #62 names, isn't used (no completion hook, escape codes always, and it queries the terminal for the cursor on every prompt). | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
+| Third-party crates | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), a PR adding only the crates its issue names (with their own dependencies), each checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX, no red zone, the kernel code model). Kernel crates so far: `limine`, `rustc-demangle`, `noto-sans-mono-bitmap` and `log` (from M0, before this policy; `log` is still `0.4`, to be pinned in a PR of its own), `pc-keyboard` (scancode decoding and layouts, #58, the first under it), `vte` (terminal escape parsing; brings `arrayvec` and `memchr`) and `unicode-width` (character widths), both #59. `rhai` (scripting, #67; integers only, no modules, no time, closures that can't capture (`no_closure`), `curry` disabled; brings `ahash`, `hashbrown`, `allocator-api2`, `equivalent`, `foldhash`, `smallvec`, `smartstring`, `thin-vec`, `num-traits`, `libm`, `bitflags`, `once_cell`, `portable-atomic`, `zerocopy`, `static_assertions`, `cfg-if`, `no-std-compat` and `core-error`, plus `const-random`, whose compile-time random seed stays linked but unused (the kernel sets a fixed hashing seed before any script runs), and the proc macros `rhai_codegen` and `const-random-macro`, which run only at build time). `virtio-drivers` `=0.13.0` (#95: virtqueues and the virtio device protocols; `default-features = false` with `alloc`; brings `safe-mmio` and `thiserror` (`bitflags` and `zerocopy` were already linked through `rhai`), plus the build-time proc macros `enumn`, `thiserror-impl` and `zerocopy-derive`), under the adapter rules in section 7, and `zerocopy` as a direct dependency, pinned to the lockfile's version (`=0.8.63`; the crate turns on `zerocopy`'s `derive` and `alloc` features for the whole kernel by feature unification, which `make audit` covers). `wasmi` `=2.0.1` (#197: the WASM interpreter for M5's apps; `default-features = false` with `validate` and `portable-dispatch`; brings `wasmi_core`, `wasmi_ir`, `wasmi_collections`, `wasmparser` and `spin`; its `libm` and `bitflags` were already linked through `rhai`). `portable-dispatch` is a stack-safety choice: our dependency line's `default-features = false` drops `auto-dispatch`, and wasmi then dispatches by tail calls, each instruction's handler calling the next and counting on LLVM to make those calls jumps, which its build script expects only without debug assertions; the kernel keeps them on, so a long loop overflowed a 64 KiB thread stack in #197 (`ktest:lumen_kernel::app::wasmi_runs_a_long_loop_in_fuel_slices` runs one on such a stack). The loop dispatch keeps the native stack's depth constant however long a module runs (host calls aside), and wasmi's own call depth (1000 frames, on the heap) bounds a module's recursion. Functions are compiled with the module (`CompilationMode::Eager`, section 8's wasmi configuration): lazily, a body's compilation is charged (7 fuel a byte) to the fuel left in the slice of the first call to reach it, and one costing more ends that call with an error that can't be resumed (though wasmi's message calls it resumable); compiling eagerly isn't metered, and keeps the compiled code, about 13 bytes of heap per body byte, for the module's life. `postcard` `=1.1.3` and `serde` `=1.0.229` (one PR for the pair, ahead of #199: the app interface's wire format, section 8; postcard with `default-features = false` and `alloc`, so without its default `heapless-cas`; serde with `default-features = false`, `derive` and `alloc`; they bring `serde_core` and `cobs` (`thiserror` was already linked through `virtio-drivers`), plus the build-time proc macro `serde_derive` (`proc-macro2`, `quote` and `syn`, already used by the other proc macros); two `embedded-io` versions are in `Cargo.lock` only, for postcard's optional features, and never built). Until the wire types use them (#206, #207: #199's host calls take none), only the ktest kernel links them (`ktest:lumen_kernel::app::wire::postcard_round_trips_derived_types`), so the flag audit covers them there. `shlex` (#62) is only a dev-dependency of `lumen-shell`, the word splitter's test oracle; `noline`, which #62 names, isn't used (no completion hook, escape codes always, and it queries the terminal for the cursor on every prompt). | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
 | Firmware for tests | OVMF `edk2-stable202605-r1` from rust-osdev/ovmf-prebuilt, pinned with sha256 | macOS and CI boot byte-identical firmware, so golden screenshots match. | Distro OVMF packages (paths and versions differ per OS). |
 
 ## 3. Layers
@@ -2983,21 +2983,23 @@ size or bounded:
 `lumen_app_api::limits::APP_WORST` is their sum, and a `const`
 assertion checks `MAX_APPS × APP_WORST <= APP_BUDGET`, so there is no
 runtime counter: holding a slot is holding its worst case. `APP_BUDGET`
-is well below the guests' RAM (`qemu.py` and `make run` give 256 MiB).
-On a smaller machine the runtime computes, once at boot, `slots =
-min(MAX_APPS, (usable RAM − KERNEL_RESERVE) / APP_WORST)`, and `run`
-refuses past `slots` with the `MAX_APPS` message. The slot count is
-`run`'s only refusal for memory.
+is well below the guests' RAM (`qemu.py` and `make run` give 256 MiB,
+which leave the frame allocator about 167 MiB). The runtime computes,
+once (at the first `run`), `slots = min(MAX_APPS, (usable RAM −
+KERNEL_RESERVE) / APP_WORST)` (`lumen_app_api::limits::slots`), usable RAM
+being what the frame allocator owns, and `run` refuses past `slots` with
+the `MAX_APPS` message. The slot count is `run`'s only refusal for
+memory.
 
 `OutOfMemory` means the heap refused although the worst case fits: a
 bug, but one the app survives (the call fails; if compiling or
 instantiating ran out, `run` prints `run: <name>: not enough memory`).
 #199 adds the heap's high-water mark (`heap::peak()`, reset by
 `heap::reset_peak()`), and two ktests check the charges against it:
-`app::compiled_code_fits_its_charge` (for every bundled module, a
+`app::tests::compiled_code_fits_its_charge` (for every bundled module, a
 non-empty list, the peak across `Module::new` on a quiet thread is at
 most `CODE_FACTOR` × the module's size) and
-`app::a_fixed_memory_is_allocated_once` (the peak across instantiation
+`app::tests::a_fixed_memory_is_allocated_once` (the peak across instantiation
 is at most the memory's size plus `APP_OVERHEAD`; `memory.grow` returns
 -1 and leaves `used` and the peak unchanged).
 
@@ -3054,7 +3056,11 @@ from disk.
 Arguments and results are wasm `i32` and `i64`. Every call returns its
 result, `>= 0`, or a negated `lumen_app_api::Error` (also the calls
 returning `i64`). The SDK wraps every call (#206); apps don't call them
-directly.
+directly. #199 builds the calls without a window (`handle_*`, `args_*`,
+`exit`, `panic`, `log`, `time_*`, `trace_*`: `lumen_app_api::host`
+lists them, and a module importing anything else is refused); the
+`window_*` and `text_*` calls, with the wire types below, come with #206
+and #207.
 
 **Every call, in this order:**
 
@@ -3169,6 +3175,34 @@ ABI. Apps are built into the image with the kernel, so M5 has no
 per-message version. A value that doesn't decode, has bytes left over,
 or breaks its rules is `BadArgument`, never a trap.
 
+Decoding rules for the wire types (measured with the pinned postcard
+1.1.3 and serde 1.0.229 in #215's review; #206 and #207 follow them, each
+host-tested):
+
+- **Leftovers:** `postcard::from_bytes` accepts trailing bytes, so decode
+  with `take_from_bytes` and refuse a non-empty remainder; fuzz tests feed
+  trailing bytes as well as truncations and flipped bytes.
+- **Sizes first:** check `EVENT_BYTES`, `TREE_BYTES` and `ANSWER_BYTES` on
+  what the app sent before decoding (never on a re-encode: overlong
+  varints decode, so one value has more than one encoding; compare
+  decoded values, never bytes).
+- **Sequences:** strings and byte buffers are safe (postcard checks the
+  bytes left before allocating), but serde preallocates a `Vec` up to
+  1 MiB from its claimed length, infallibly, before failing. Every wire
+  `Vec` takes a visitor that refuses a length past its cap and
+  preallocates at most `min(hint, cap)`; the tree is decoded node by node
+  (`take_from_bytes::<Node>` in a loop, counted against `TREE_NODES`); a
+  counting-allocator host test checks the peak.
+- **Shapes:** no recursive wire type (`Box<Self>`, `Vec<Self>`, mutual
+  recursion: postcard has no depth limit), and no sequence of zero-byte
+  elements (`()`, unit structs, `PhantomData`: a short length prefix
+  loops practically forever, and decoding isn't charged fuel).
+- **Encoding:** a `u8` is one raw byte, wider integers LEB128 (signed ones
+  zigzagged); an enum's tag is its declaration position (two bytes from
+  position 128); postcard's custom errors drop serde's message, so a
+  refusal's log names the decoder, the input's length and the bytes left
+  over.
+
 **`Event`** (host to app; each `WindowEvent` becomes one, section 11's
 queue rules unchanged):
 
@@ -3280,7 +3314,7 @@ hand per window.
 
 **One end reason, first writer wins.** Returning from `lumen_main`,
 `exit`, `panic`, a trap, a kill or the close grace records the app's end
-reason in its state under the app table's lock, unless one is recorded
+reason in its state (under the state's own lock), unless one is recorded
 already. `exit`, `panic` and a kill reach wasmi as one runtime-private
 host error (`HostTrap`), never resumed and never reported as a trap. The
 reason decides the app's one end line:
@@ -3313,7 +3347,7 @@ from `threads`.
 (`kill: no app <id>` without one), sets the kill flag, wakes the app's
 waits (its wait queue and its window's `Waker`), then waits on the
 state's queue until its end reason is recorded and its thread has marked
-it ended, or `KILL_WAIT` passes. It prints from that state: `kill: app
+it ended, or `KILL_WAIT_NS` passes. It prints from that state: `kill: app
 <id> (<name>) killed`, `kill: app <id> (<name>) had already ended:
 <its end line's reason>` (another reason won), or `kill: app <id>
 (<name>) still ending (in <host call, or "a slice">)`; the reaper joins
@@ -3341,7 +3375,7 @@ U+FFFD, so a newline can't forge a line a test matches on. Titles,
 |---|---|---|
 | `APP_BUDGET` | 128 MiB | a `const` assertion (`MAX_APPS × APP_WORST`) |
 | `MAX_APPS` | 4 running or loading | `run` refuses |
-| `KERNEL_RESERVE` | 64 MiB | fewer slots on a smaller machine |
+| `KERNEL_RESERVE` | 32 MiB | fewer slots on a smaller machine |
 | `MODULE_BYTES` | 1 MiB | `run` refuses |
 | `CODE_FACTOR` | 8 | the code charge |
 | `MEMORY_PAGES` | 256 (16 MiB) | refused at load |
@@ -3366,7 +3400,7 @@ U+FFFD, so a newline can't forge a line a test matches on. Titles,
 | `ANSWER_BYTES` | 4 KiB | `BadArgument` |
 | `TRACE_EVENTS_PER_READ` | 256 | the rest on the next read |
 | `CLOSE_GRACE_SLICES` | 4 | the app is ended |
-| `KILL_WAIT` | 1 s | `kill` says "still ending" |
+| `KILL_WAIT_NS` | 1 s | `kill` says "still ending" |
 
 The heaviest planned app, the viewer (#204), fits `MEMORY_PAGES`: its
 1 MiB wasm stack, the decoded wallpaper (1280 × 800 × 4 bytes),
@@ -3458,14 +3492,20 @@ SSE); #197 checks the results' bits.
   apps` (part of `make build`) copies one module per `apps/*/` crate to
   `build/apps/<name>.wasm`, and `harness:test_wasm_module::*` checks
   them after they are built (section 16).
-- **What #199 changes on top:** the test apps become `apps/test-<name>`
+- **What #199 adds:** the runtime's test apps are `apps/test-<name>`
   (`hello`, `busy`, `trap`, `greedy`, `nocap`, `abuse`; #196's `hello`
-  moves there and exports `lumen_main`). They can't live under
-  `apps/tests/`: the member glob would take `tests` itself as a member,
-  and excluding it also excludes `tests/*`. `make apps` copies only
-  crates that build a `cdylib` (#206's `lumen-app` library makes none),
-  and the test apps to `build/apps/tests/<name>.wasm`. The kernel build
-  depends on `make apps`, and `KERNEL_SRCS` includes `apps/`.
+  moved there and exports `lumen_main`), sharing `apps/testkit` (the
+  `lumen` imports, safe wrappers, the manifest macro, a panic handler
+  reporting through `panic`, a bump allocator; #206's `lumen-app` is the
+  real SDK). They can't live under `apps/tests/`: the member glob would
+  take `tests` itself as a member, and excluding it also excludes
+  `tests/*`. Each sets its fixed memory (2 MiB) in its `build.rs`. `make
+  apps` copies only crates that build a `cdylib` (`testkit` and #206's
+  `lumen-app` make none), the test apps to
+  `build/apps/tests/<name>.wasm`, with `cp -p` and only stale modules
+  removed, so the kernels rebuild only when a module did. The kernel
+  builds depend on `make apps` (order-only), and `KERNEL_SRCS` includes
+  `apps/`.
   `kernel/build.rs` embeds both sets in both kernels, sorted by name, as
   `app::BUNDLED` and `app::TEST_APPS` (`&[App]`, `App { name, thread,
   module }`, `thread` the `app:<name>` string); it refuses a stem
@@ -5083,7 +5123,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/rtc.rs       the CMOS RTC: date and time (taken as UTC) for `date`
   src/fb.rs        framebuffer: pixels, glyphs, the hello screen (draw_header), the crash screen
   src/desktop.rs   the desktop (#153, #154): the compositor thread, windows (open_window, WindowHandle), desktop, windows, the themes (theme), the wallpaper
-  src/app.rs       WASM apps (M5): wasmi in fuel slices (run_in_slices), `wasm` and its ktests over the hand-assembled modules in app/modules.rs (#197); #199 adds loading, handles, the `lumen` host functions, kill, the bundled modules (app::BUNDLED)
+  src/app.rs       WASM apps (M5): the embedded modules (app::BUNDLED, app::TEST_APPS, from kernel/build.rs); app/runtime.rs the runtime (#199: the table, loading on the app's thread, fuel slices, end reasons, kill, the reaper, `apps`/`run`/`kill`), app/host.rs the `lumen` host functions, app/tests.rs its ktests; wasmi in fuel slices (run_in_slices), `wasm` and its ktests over the hand-assembled modules in app/modules.rs (#197)
   src/font.rs      the desktop's anti-aliased text (lumen-font): the UI font parsed once and shared (font::face), font::Text (a thread's glyph cache, drawing glyph by glyph), the golden sample for `font` and its ktest
   src/screenshot.rs  `screenshot`: the screen as a PNG (lumen-png) in a base64 frame on serial
   src/term.rs      the virtual terminals on the framebuffer (lumen-term): their grids, drawing the shown one's changed cells, log lines, the cursor, the canvas
@@ -5101,7 +5141,7 @@ boot/limine.conf   bootloader config template
 tools/             fetch-deps.sh, mkiso.sh, wallpaper.py (makes the wallpaper), harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml
 docs/              ARCHITECTURE.md, ROADMAP.md, STATUS.md (generated)
-apps/              the WASM apps (M5): their own cargo workspace, no_std cdylibs for wasm32-unknown-unknown, built by `make build` into build/apps/<name>.wasm
+apps/              the WASM apps (M5): their own cargo workspace, no_std cdylibs for wasm32-unknown-unknown, built by `make build` into build/apps/<name>.wasm (the runtime's test apps, test-<name>, into build/apps/tests/<name>.wasm; testkit, the library they share)
 ```
 
 **The apps' target (#196).** `wasm32-unknown-unknown` is in the pinned
@@ -5115,8 +5155,9 @@ the kernels. The default release profile keeps the name section (function
 names for trap reports). The harness validates each built module with
 `wasmtime` with the proposals past rustc's defaults that wasmtime-py can
 switch off switched off (SIMD, threads, tail calls, memory64, ...;
-extended-const has no switch, so only the next check catches it), runs
-hello's `answer`, and checks that each module's `target_features`
+extended-const has no switch, so only the next check catches it), checks
+the app interface's shape (`lumen` imports only, `memory` fixed and
+`lumen_main: [] -> [i32]` exported, a manifest), and checks that each module's `target_features`
 section lists exactly rustc 1.99.1's default features for this target: the
 list is `DEFAULT_FEATURES` in `tests/harness/test_wasm_module.py` (six that
 `rustc --print cfg --target wasm32-unknown-unknown` shows, and two more
