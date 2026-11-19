@@ -1,0 +1,18 @@
+[package]
+name = "hello"
+description = "The smallest Lumen app: a no_std WASM module (#196). The kernel doesn't load it yet."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+# A WASM module has no host-side tests or doctests of its own: the harness
+# checks the built module (tests/harness/test_wasm_module.py).
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true
