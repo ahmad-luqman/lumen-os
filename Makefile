@@ -14,9 +14,10 @@ CARGO_KERNEL := cargo build -p lumen-kernel --target $(TARGET) --release
 HARNESS     := PYTHONPATH=tools/harness uv run --frozen python -m lumen_harness
 
 # `.rhai`: the built-in scripts, embedded with `include_str!`.
-# apps/: the kernels embed the built apps (kernel/build.rs), so a change
-# there rebuilds them after `make apps`.
-KERNEL_SRCS := $(shell find kernel crates apps -name '*.rs' -o -name '*.toml' -o -name '*.ld' -o -name '*.rhai') Cargo.toml Cargo.lock .cargo/config.toml rust-toolchain.toml
+# apps/ (its sources, manifests and lock file): the kernels embed the
+# modules `make apps` builds from them (kernel/build.rs), so a change there
+# rebuilds the kernels, `apps` first.
+KERNEL_SRCS := $(shell find kernel crates apps -name '*.rs' -o -name '*.toml' -o -name '*.ld' -o -name '*.rhai') Cargo.toml Cargo.lock apps/Cargo.lock .cargo/config.toml rust-toolchain.toml
 
 # Both kernels are built into the same cargo output path and copied out, so
 # their recipes must never run concurrently (`make -j`).
@@ -44,27 +45,27 @@ $(BUILD)/lumen-kernel-ktest: $(KERNEL_SRCS) | apps
 
 build: apps $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest ## Build the apps and both kernels
 
-# Apps (M5): apps/ is its own workspace, every directory but dot ones a
-# crate named after it. The ones that build a `cdylib` are WASM modules:
-# `test-<name>` (the runtime's test apps, #199) copied to
-# build/apps/tests/<name>.wasm, the others to build/apps/<name>.wasm (cargo
-# names the file after the crate, `-` as `_`); libraries the apps share
-# (`testkit`) are skipped. Cargo runs inside apps/, whose .cargo/config.toml
-# sets the target and the output directory (target-apps/). Always run:
-# cargo knows what changed. Copied with `cp -p` (a module's time is when
-# cargo last built it) and only stale modules removed, so the kernels,
-# which embed build/apps (kernel/build.rs), rebuild only when a module
-# did. `|| exit 1`: make 3.81 (macOS's) ignores .SHELLFLAGS, so `-e` can't
-# be relied on in a loop.
+# Apps (M5; the layout: ARCHITECTURE section 8, "Building and bundling"):
+# apps/ is its own workspace, and its crates that build a `cdylib` are WASM
+# modules (libraries the apps share, `testkit`, are skipped). `app_out`
+# says where each goes, and APP_OUT and APP_COPIES both come from it.
+# Cargo runs inside apps/, whose .cargo/config.toml sets the target and the
+# output directory (target-apps/; cargo names a module after its crate, `-`
+# as `_`). Always run: cargo knows what changed. Copied with `cp -p` (a
+# module's time is when cargo last built it) and only stale modules
+# removed, so the kernels, which embed build/apps (kernel/build.rs),
+# rebuild only when a module did. `|| exit 1`: make 3.81 (macOS's) ignores
+# .SHELLFLAGS, so `-e` can't be relied on in a loop.
 APP_TARGET := wasm32-unknown-unknown
 APP_CRATES := $(patsubst apps/%/Cargo.toml,%,$(shell grep -l '"cdylib"' apps/*/Cargo.toml))
-APP_OUT    := $(foreach c,$(APP_CRATES),$(if $(filter test-%,$(c)),$(BUILD)/apps/tests/$(patsubst test-%,%,$(c)).wasm,$(BUILD)/apps/$(c).wasm))
+app_out     = $(if $(filter test-%,$(1)),$(BUILD)/apps/tests/$(patsubst test-%,%,$(1)).wasm,$(BUILD)/apps/$(1).wasm)
+APP_OUT    := $(foreach c,$(APP_CRATES),$(call app_out,$(c)))
+APP_COPIES := $(foreach c,$(APP_CRATES),$(subst -,_,$(c)).wasm:$(call app_out,$(c)))
 
 apps: ## Build the WASM apps into build/apps/ (the test apps into build/apps/tests/)
 	cd apps && cargo build --release
-	@mkdir -p $(BUILD)/apps/tests && for crate in $(APP_CRATES); do \
-		case $$crate in test-*) out=$(BUILD)/apps/tests/$${crate#test-}.wasm;; *) out=$(BUILD)/apps/$$crate.wasm;; esac; \
-		cp -p target-apps/$(APP_TARGET)/release/$${crate//-/_}.wasm $$out || exit 1; done
+	@mkdir -p $(BUILD)/apps/tests && for copy in $(APP_COPIES); do \
+		cp -p target-apps/$(APP_TARGET)/release/$${copy%%:*} $${copy#*:} || exit 1; done
 	@for f in $(BUILD)/apps/*.wasm $(BUILD)/apps/tests/*.wasm; do \
 		[ -e "$$f" ] || continue; case " $(APP_OUT) " in *" $$f "*) ;; *) rm -f "$$f";; esac; done
 

@@ -273,13 +273,16 @@ own PR that updates that doc first.
   its slot and handle until a stop sees it finished, every wait stopping
   on `q` or Ctrl-C).
   `app.rs`: WASM apps (M5): the embedded modules (`App`, `BUNDLED`, `TEST_APPS`, written by
-  `kernel/build.rs` from `build/apps`); `app/runtime.rs` the runtime (#199: the table of apps, a
-  starting slot under its lock, loading on the app's own thread behind a start gate, one `Engine` per
-  app with section 8's wasmi configuration, the import/export/fixed-memory checks, fuel slices (kill
-  checked at each end), one end reason (`lumen_app_api::end`) and its end line, `kill` waiting at most
-  `KILL_WAIT_NS`, the `app-reaper` joining ended apps; `apps` (records), `run`, `kill`);
-  `app/host.rs` the `lumen` host functions without a window (the six-step argument order, fuel
-  charged; `read_trace`); `app/tests.rs` the runtime's ktests over hand-assembled modules. And
+  `kernel/build.rs` from `build/apps`); `app/runtime.rs` the runtime (#199: the table of apps,
+  `precheck` then a slot under its lock, loading on the app's own thread behind a start gate
+  (`live`), one `Engine` per app with section 8's wasmi configuration, the import/export/fixed-memory
+  checks, `out_of_memory`, fuel slices through one slice-end path (`AppCtx::end_slice`/`begin_slice`:
+  the kill flag, the close grace), each app's `Life` (one phase and one `Outcome`, the first recorded;
+  a load failure printed by `run` or logged once), `kill` waiting at most `KILL_WAIT_NS`
+  (`kill_outcome`, `Phase::place`), the `app-reaper` joining ended apps; `apps` (records), `run`,
+  `kill`); `app/host.rs` the `lumen` host functions without a window (`entry`: the kill flag and
+  `CALL_FUEL` for every call, then the argument order; `read_trace`); `app/tests.rs` the runtime's
+  ktests over hand-assembled modules. And
   #197's checks: `wasmi` (`portable-dispatch`: a constant native stack depth
   however long a module runs; functions compiled eagerly; see ARCHITECTURE sections 2 and 8) running a
   module in fuel slices (`run_in_slices`, `run_bounded` with a resume cap: out of fuel, yield, refuel at
@@ -289,7 +292,8 @@ own PR that updates that doc first.
   its ktests, over hand-assembled modules (`app/modules.rs`: a long loop and call depth, one float
   operation per export, a bulk `memory.fill`, a generated large body). `app/wire.rs`: ktest only,
   postcard over serde-derived types (the wire format's crates, linked ahead of the wire types, #206,
-  #207). `mm/heap.rs`'s `peak`/`reset_peak`: the heap's high-water mark.
+  #207). `mm/heap.rs`'s `peak`/`reset_peak`: the heap's high-water mark (and, in the ktest
+  kernel, `refuse_from`: the heap refusing big allocations, for `not enough memory`).
   `font.rs`: the desktop's anti-aliased text (`lumen-font`): `font::face`,
   the UI font parsed on first use and shared; `font::Text`, one drawing
   thread's glyph cache over it (`draw` glyph by glyph inside a clip,
@@ -463,13 +467,15 @@ own PR that updates that doc first.
   every truncation and every flipped byte of a file).
 - `crates/lumen-app-api`: the WASM app interface's types (#199, section 8),
   shared by the kernel and the apps (built for wasm32 too): `Error` codes,
-  `Kind`, `Grant`, `Listable`, `Grants`, `manifest::find` (walking the
-  module's sections itself, never panicking), `limits` (each app's worst case
-  `APP_WORST` checked against `APP_BUDGET` at compile time; `slots`),
-  `handles::HandleTable` (ids never reused), `range` (guest ranges), `text`
-  (log text cut and sanitised), `end` (`EndReason`, `EndCell`: the first
-  recorded wins; `CloseGrace`), `host` (the `lumen` functions'
-  signatures), `trace` (`trace_read`'s layouts), `args` (host-tested).
+  `LogLevel`, `Kind`, `Grant`, `Listable`, `Grants`, `manifest::find`
+  (walking the module's sections itself, never panicking), `limits` (each
+  app's worst case `APP_WORST`, `APP_OVERHEAD`'s named parts, checked at
+  compile time; `slots`), `handles::HandleTable` (ids never reused),
+  `range` (guest ranges), `text` (`LogText`: log text cut and sanitised,
+  line separators too), `end` (`Outcome`, `EndReason`, `EndCell`: the
+  first recorded wins; `CloseGrace`), `host` (the `lumen` functions'
+  signatures, `ENTRY`, `MEMORY`, all pinned), `trace` (`trace_read`'s
+  layouts), `args` (host-tested).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
@@ -479,12 +485,10 @@ own PR that updates that doc first.
   one; every directory but dot ones a member, named after its crate; output
   in `target-apps/`) for `wasm32-unknown-unknown`, `no_std`
   `cdylib`s; `make build` (`make apps`) builds each into
-  `build/apps/<name>.wasm` (the runtime's test apps, `test-<name>`: `hello`,
-  `busy`, `trap`, `greedy`, `nocap`, `abuse`, into `build/apps/tests/`, each
-  with a 2 MiB fixed memory from its `build.rs`), skipping libraries
-  (`testkit`: what the test apps share, the `lumen` imports and safe
-  wrappers, the manifest macro, a panic handler, a bump allocator), and
-  `make lint` and `fmt` cover them. The kernels embed them
+  `build/apps/<name>.wasm`, the runtime's test apps (`test-<name>`) into
+  `build/apps/tests/`, skipping libraries (`testkit`); the layout, the
+  test apps and `testkit` are described once, in ARCHITECTURE section 8
+  ("Building and bundling"). `make lint` and `fmt` cover them. The kernels embed them
   (`app::BUNDLED`, `app::TEST_APPS`); the harness validates them in
   `wasmtime` and checks the app interface's shape.
 - `tools/harness/lumen_harness/`: `qemu.py` (the only place QEMU command lines
