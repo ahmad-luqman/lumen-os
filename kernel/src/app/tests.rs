@@ -349,3 +349,34 @@ crate::ktest!(
         Ok(())
     }
 );
+
+/// Poll `done` until it holds or `ms` milliseconds pass (a safety bound,
+/// not a measurement): whether it held.
+fn wait_for(ms: u64, mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..ms {
+        if done() {
+            return true;
+        }
+        let _ = crate::sched::sleep(1_000_000);
+    }
+    done()
+}
+
+crate::ktest!(
+    fn a_reaper_that_failed_to_start_is_started_by_a_later_run() {
+        // Nothing has started it yet in the ktest kernel.
+        crate::kassert!(!runtime::reaper_running());
+        // Its spawn fails once: the app still runs and ends, but nothing
+        // joins it, so it keeps its entry (and its slot).
+        runtime::FAIL_REAPER_SPAWN.store(true, core::sync::atomic::Ordering::Release);
+        let first = runtime::launch("hello", &[], Grants::NONE).map_err(|_| "hello didn't launch")?;
+        crate::kassert!(wait_for(10_000, || first.has_ended()));
+        crate::kassert!(!runtime::reaper_running());
+        crate::kassert!(runtime::listed(first.id));
+        // The next run starts it, and both apps are joined and gone.
+        let second = runtime::launch("hello", &[], Grants::NONE).map_err(|_| "hello didn't launch again")?;
+        crate::kassert!(runtime::reaper_running());
+        crate::kassert!(wait_for(10_000, || !runtime::listed(first.id) && !runtime::listed(second.id)));
+        Ok(())
+    }
+);

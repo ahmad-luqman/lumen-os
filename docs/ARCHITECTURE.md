@@ -3342,7 +3342,9 @@ answered "window closed", section 11), answers a started request with
 instance, module and `Engine`, marks its state ended and wakes the
 state's wait queue and `app::ENDED`. The table's entry holds the thread's
 `JoinHandle` and an `Arc` of its state. The `app-reaper` thread (started
-with the first app) waits on `ENDED`; for each ended entry it takes the
+by the first `run`; one whose spawn of it fails, logged once, leaves it to
+the next, so ended apps wait for their join, never for good) waits on
+`ENDED`; for each ended entry it takes the
 `JoinHandle` under the lock, joins outside it, then removes the entry,
 which frees the slot. So `apps` lists an app until it is joined
 (`ending` meanwhile). Tests confirm the join by the thread id from the

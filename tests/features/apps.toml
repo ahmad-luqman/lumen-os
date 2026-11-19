@@ -55,10 +55,11 @@ tests = [
 ]
 
 [[feature]]
-name = "WASM apps end cleanly (#199): one end reason, the first recorded, and one end line; a trap, a panic (its message unable to forge a line), memory past its fixed limit and recursion past the call depth each end only the app with one WARN, the shell working and the heap given back; `kill` wakes an app blocked in `time_sleep`, ends it and its thread is joined"
+name = "WASM apps end cleanly (#199): one end reason, the first recorded, and one end line; a trap, a panic (its message unable to forge a line), memory past its fixed limit and recursion past the call depth each end only the app with one WARN, the shell working and the heap given back; `kill` wakes an app blocked in `time_sleep`, ends it and its thread is joined; a reaper whose spawn failed is started by a later `run`, which joins the apps that ended meanwhile"
 milestone = "M5"
 tests = [
     "cargo:lumen-app-api",
+    "ktest:lumen_kernel::app::tests::a_reaper_that_failed_to_start_is_started_by_a_later_run",
     "scenario:test_apps::test_app_trap_kills_app_not_kernel",
     "scenario:test_apps::test_kill_wakes_a_waiting_app",
 ]

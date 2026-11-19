@@ -209,10 +209,19 @@ struct Entry {
 struct Table {
     entries: Vec<Entry>,
     next_id: u64,
-    reaper: bool,
 }
 
-static TABLE: SpinLock<Table> = SpinLock::new(Table { entries: Vec::new(), next_id: 1, reaper: false });
+static TABLE: SpinLock<Table> = SpinLock::new(Table { entries: Vec::new(), next_id: 1 });
+
+/// The reaper runs (set once its spawn succeeded; never cleared).
+static REAPER: AtomicBool = AtomicBool::new(false);
+/// A `run` is starting it (so two don't).
+static REAPER_STARTING: AtomicBool = AtomicBool::new(false);
+/// Its failure to start has been logged (once).
+static REAPER_WARNED: AtomicBool = AtomicBool::new(false);
+/// ktest seam: the reaper's next spawn fails, as one without a stack would.
+#[cfg(feature = "ktest")]
+pub(super) static FAIL_REAPER_SPAWN: AtomicBool = AtomicBool::new(false);
 
 /// Apps ended and not yet joined; the reaper waits for it to be nonzero.
 static PENDING: AtomicUsize = AtomicUsize::new(0);
@@ -458,6 +467,54 @@ fn reaper() {
     }
 }
 
+/// Start the reaper unless it runs: each `run` tries, before taking a slot,
+/// until a spawn succeeds, so a failed spawn (no stack) only delays
+/// joining ended apps (they keep their slots) until a later `run`. The
+/// failure is logged once.
+fn ensure_reaper() {
+    if REAPER.load(Ordering::Acquire) || REAPER_STARTING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    #[cfg(feature = "ktest")]
+    let seam = FAIL_REAPER_SPAWN.swap(false, Ordering::AcqRel);
+    #[cfg(not(feature = "ktest"))]
+    let seam = false;
+    let spawned = if seam { Err(sched::SpawnError::NotRunning) } else { sched::spawn_on(0, "app-reaper", reaper) };
+    match spawned {
+        Ok(h) => {
+            // Detached: it runs for the rest of the boot.
+            core::mem::forget(h);
+            REAPER.store(true, Ordering::Release);
+        }
+        Err(e) => {
+            if !REAPER_WARNED.swap(true, Ordering::AcqRel) {
+                log::warn!(target: "app", "no app-reaper thread ({e}): ended apps keep their slots until a later run starts it");
+            }
+        }
+    }
+    REAPER_STARTING.store(false, Ordering::Release);
+}
+
+/// Whether the reaper runs.
+#[cfg(feature = "ktest")]
+pub(super) fn reaper_running() -> bool {
+    REAPER.load(Ordering::Acquire)
+}
+
+/// Whether app `id` is still in the table (not yet joined).
+#[cfg(feature = "ktest")]
+pub(super) fn listed(id: u64) -> bool {
+    TABLE.lock().entries.iter().any(|e| e.state.id == id)
+}
+
+impl AppState {
+    /// Its thread has finished with it.
+    #[cfg(feature = "ktest")]
+    pub(super) fn has_ended(&self) -> bool {
+        self.ended.load(Ordering::Acquire)
+    }
+}
+
 /// The CPUs apps are placed on, round robin by app id.
 fn cpu_for(id: u64) -> usize {
     let cpus: Vec<usize> = (0..crate::arch::MAX_CPUS).filter(|&c| sched::running_on(c)).collect();
@@ -472,6 +529,61 @@ fn find_app(name: &str) -> Option<&'static App> {
 /// Remove app `id`'s entry (it never started a thread).
 fn forget(id: u64) {
     TABLE.lock().entries.retain(|e| e.state.id != id);
+}
+
+/// Start app `name` with `args`, `without` those grants: a slot, an id and
+/// an entry under the table's lock, the module found and checked, its
+/// thread spawned and its handle stored, then the gate opened. Its state
+/// (whose `started` says how loading went), or the line `run` prints.
+pub(super) fn launch(name: &str, args: &[String], without: Grants) -> Result<Arc<AppState>, String> {
+    ensure_reaper();
+    let app_args = lumen_app_api::args::encode(args.iter().map(String::as_str))
+        .map_err(|_| format!("run: {name}: arguments too long"))?;
+    let state = {
+        let mut table = TABLE.lock();
+        let running = table.entries.len();
+        if running >= slot_count() {
+            return Err(format!("run: {name}: {running} apps running already"));
+        }
+        let id = table.next_id;
+        table.next_id += 1;
+        // The name is the app's once found; until then a placeholder (an
+        // entry that never starts is forgotten at once).
+        let state = Arc::new(AppState::new(id, find_app(name).map_or("?", |a| a.name)));
+        table.entries.push(Entry { state: state.clone(), handle: None });
+        state
+    };
+    let id = state.id;
+    let refuse = |why: String| {
+        forget(id);
+        Err(why)
+    };
+    let Some(app) = find_app(name) else { return refuse(format!("run: no app {name}")) };
+    if app.module.len() > MODULE_BYTES {
+        return refuse(format!("run: {name}: too big ({} bytes, past {MODULE_BYTES})", app.module.len()));
+    }
+    let manifest = match manifest::find(app.module) {
+        Ok(m) => m,
+        Err(e) => return refuse(format!("run: {name}: {e}")),
+    };
+    let mut grants = Grants::log();
+    for g in manifest.caps.iter() {
+        if !without.has(g) {
+            grants = grants.with(g);
+        }
+    }
+    let thread_state = state.clone();
+    let handle = match sched::spawn_on(cpu_for(id), app.thread, move || app_thread(app, thread_state, grants, app_args))
+    {
+        Ok(h) => h,
+        Err(e) => return refuse(format!("run: {name}: {e}")),
+    };
+    if let Some(entry) = TABLE.lock().entries.iter_mut().find(|e| e.state.id == id) {
+        entry.handle = Some(handle);
+    }
+    state.gate.store(true, Ordering::Release);
+    state.waits.wake_all();
+    Ok(state)
 }
 
 const RUN_USAGE: &str = "usage: run [--without <grant>] <app> [args...]";
@@ -496,74 +608,11 @@ pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
         let list = if names.is_empty() { String::from("none") } else { names.join(" ") };
         return ctx.fail(format_args!("{RUN_USAGE}\napps: {list}"));
     };
-    let app_args = match lumen_app_api::args::encode(app_args.iter().map(String::as_str)) {
-        Ok(a) => a,
-        Err(_) => return ctx.fail(format_args!("run: {name}: arguments too long")),
-    };
-
-    // A slot, an id and an entry, under the table's lock.
-    let state = {
-        let mut table = TABLE.lock();
-        let running = table.entries.len();
-        if running >= slot_count() {
-            drop(table);
-            return ctx.fail(format_args!("run: {name}: {running} apps running already"));
-        }
-        let id = table.next_id;
-        table.next_id += 1;
-        // The name is the app's once found; until then the one asked for
-        // (an entry that never starts is forgotten at once).
-        let state = Arc::new(AppState::new(id, find_app(name).map_or("?", |a| a.name)));
-        table.entries.push(Entry { state: state.clone(), handle: None });
-        state
+    let state = match launch(name, app_args, without) {
+        Ok(state) => state,
+        Err(why) => return ctx.fail(why),
     };
     let id = state.id;
-    let Some(app) = find_app(name) else {
-        forget(id);
-        return ctx.fail(format_args!("run: no app {name}"));
-    };
-    if app.module.len() > MODULE_BYTES {
-        forget(id);
-        return ctx.fail(format_args!("run: {name}: too big ({} bytes, past {MODULE_BYTES})", app.module.len()));
-    }
-    let manifest = match manifest::find(app.module) {
-        Ok(m) => m,
-        Err(e) => {
-            forget(id);
-            return ctx.fail(format_args!("run: {name}: {e}"));
-        }
-    };
-    let mut grants = Grants::log();
-    for g in manifest.caps.iter() {
-        if !without.has(g) {
-            grants = grants.with(g);
-        }
-    }
-
-    let thread_state = state.clone();
-    let spawned = sched::spawn_on(cpu_for(id), app.thread, move || app_thread(app, thread_state, grants, app_args));
-    let handle = match spawned {
-        Ok(h) => h,
-        Err(e) => {
-            forget(id);
-            return ctx.fail(format_args!("run: {name}: {e}"));
-        }
-    };
-    let start_reaper = {
-        let mut table = TABLE.lock();
-        if let Some(entry) = table.entries.iter_mut().find(|e| e.state.id == id) {
-            entry.handle = Some(handle);
-        }
-        !core::mem::replace(&mut table.reaper, true)
-    };
-    if start_reaper {
-        // Detached: it runs for the rest of the boot.
-        if let Ok(h) = sched::spawn_on(0, "app-reaper", reaper) {
-            core::mem::forget(h);
-        }
-    }
-    state.gate.store(true, Ordering::Release);
-    state.waits.wake_all();
 
     // "started" or why not; `q` or Ctrl-C stops the wait, not the app.
     loop {
