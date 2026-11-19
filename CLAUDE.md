@@ -276,13 +276,17 @@ own PR that updates that doc first.
   `kernel/build.rs` from `build/apps`); `app/runtime.rs` the runtime (#199: the table of apps,
   `precheck` then a slot under its lock, loading on the app's own thread behind a start gate
   (`live`), one `Engine` per app with section 8's wasmi configuration, the import/export/fixed-memory
-  checks, `out_of_memory`, fuel slices through one slice-end path (`AppCtx::end_slice`/`begin_slice`:
-  the kill flag, the close grace), each app's `Life` (one phase and one `Outcome`, the first recorded;
-  a load failure printed by `run` or logged once), `kill` waiting at most `KILL_WAIT_NS`
+  checks, `out_of_memory` (instantiation's and the translator's), fuel slices through one slice-end
+  path (`end_slice`/`begin_slice` over the store or a `Caller`: the kill flag, the close grace, fuel
+  debt), one reader of wasmi's answers (`step`: a host function's recorded `Stop`), each app's `Life`
+  (one phase, moving only forward, and one `Outcome`, the first recorded; `finish`; a load failure
+  printed by `run` or logged once, `start_line`, `stopped_by`), `kill` waiting at most `KILL_WAIT_NS`
   (`kill_outcome`, `Phase::place`), the `app-reaper` joining ended apps; `apps` (records), `run`,
-  `kill`); `app/host.rs` the `lumen` host functions without a window (`entry`: the kill flag and
-  `CALL_FUEL` for every call, then the argument order; `read_trace`); `app/tests.rs` the runtime's
-  ktests over hand-assembled modules. And
+  `kill`); `app/host.rs` the `lumen` host functions without a window (`entry`: the kill flag, a slice
+  end with too little fuel left, `CALL_FUEL`, for every call; `ending` for `exit` and `panic`;
+  `blocking` for `time_sleep` and #206's `window_wait`; `read_trace`); `app/tests.rs` the runtime's
+  ktests, over hand-assembled modules (a `Spec` builder) and the test apps, with seams for a kill at
+  a resume, a failed reaper spawn and the heap refusing. And
   #197's checks: `wasmi` (`portable-dispatch`: a constant native stack depth
   however long a module runs; functions compiled eagerly; see ARCHITECTURE sections 2 and 8) running a
   module in fuel slices (`run_in_slices`, `run_bounded` with a resume cap: out of fuel, yield, refuel at

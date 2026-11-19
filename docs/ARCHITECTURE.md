@@ -2893,8 +2893,8 @@ the wire formats and fixed layouts) are `crates/lumen-app-api` (`no_std`
 `kernel/src/app.rs` (created by #197) and `kernel/src/app/` (#199:
 `runtime.rs` the app table, loading, slices, endings and the shell's
 commands; `host.rs` the host functions; `tests.rs` their ktests); the
-guest SDK is `apps/lumen-app` (#206). Every number named in capitals below is in the limits table, and
-only there.
+guest SDK is `apps/lumen-app` (#206). Every number named in capitals below is in the limits table
+(`APP_OVERHEAD`'s parts included), and only there.
 
 #### What an app is
 
@@ -3004,14 +3004,16 @@ the `MAX_APPS` message. The slot count is `run`'s only refusal for
 memory.
 
 `OutOfMemory` means the heap refused although the worst case fits: a
-bug, but one the app survives where wasmi allocates fallibly. A host call
-fails with it; if instantiating ran out (its memory or table, which wasmi
-reports wrapped in an `InstantiationError`), `run` prints `run: <name>:
-not enough memory` (`runtime::out_of_memory`; a ktest makes the heap
-refuse the memory through a seam, `heap::refuse_from`). wasmi's other
-allocations are infallible and end in the kernel's allocation-error
-panic, and its translator's out-of-memory error can't be told apart (its
-type isn't exported): `run` prints it as `not valid: ...` (not tested).
+bug, but one the app survives where the heap is asked fallibly. #206's
+host calls fail with it. Where wasmi allocates fallibly while loading, its
+translator's buffers (its error type isn't exported, so its message tells
+it apart) or a linear memory or table at instantiation (wrapped in an
+`InstantiationError`), `run` prints `run: <name>: not enough memory`
+(`runtime::out_of_memory`; a ktest makes the heap refuse each through a
+seam, `heap::refuse_from`). wasmi's other allocations, its execution
+stacks among them (the value stack reserved at the first call, frames
+pushed), are infallible: running out there is the kernel's
+allocation-error panic, after "started".
 #199 adds the heap's high-water mark (`heap::peak()`, reset by
 `heap::reset_peak()`; `app::tests::the_heaps_peak_follows_its_use`), and
 ktests check the charges against it, assuming nothing else allocates
@@ -3091,7 +3093,11 @@ and #207.
 step 1):
 
 1. checks the kill flag (set: the app ends with the runtime's `Stop`
-   host error, below), then charges `CALL_FUEL`, refused or not;
+   host error, below); if the slice has less than `CALL_FUEL` left, ends
+   the slice right there (counted, a kill or the close grace ending the
+   app, the CPU given up, a fresh slice: wasmi checks fuel only where a
+   block starts, so a run of calls in one block would otherwise be free);
+   then charges `CALL_FUEL`, refused or not;
 2. checks the handle, then its kind;
 3. copies fixed structures (`Canvas`, `TextDraw`, `Rect`s) in by value,
    then checks every (pointer, length) range, taken as unsigned, with
@@ -3102,10 +3108,10 @@ step 1):
    `BadArgument`), then copies inputs out of the app's memory: text into
    a kernel buffer, refused with `BadArgument` past its cap before it is
    copied, then decoded (bad UTF-8 is `BadArgument`);
-5. does its work, and charges fuel for what it did (`Caller::get_fuel`,
-   then `Caller::set_fuel` with the remainder, saturating at 0: a charge
-   past what is left ends the slice at the next fuel check, resumably,
-   and never fails the call);
+5. does its work, and charges fuel for what it did (`runtime::charge`:
+   what the slice has left, and the rest carried as debt that the next
+   slice starts without, so a charge never fails the call and is never
+   lost);
 6. only then takes the output range and writes it whole, or writes
    nothing.
 
@@ -3145,7 +3151,10 @@ what it did (step 5), `BYTE_FUEL` per byte `log` copied in (charged even
 if the text is then refused), `LOG_FUEL` per line logged (so a logging
 loop writes few lines per slice), `PIXEL_FUEL` per pixel of a commit or
 of `text_draw`'s clip, and `EVENT_FUEL` per trace event copied out
-(`app::tests::host_calls_charge_their_fuel`).
+(`app::tests::host_calls_charge_their_fuel` checks `CALL_FUEL`,
+`BYTE_FUEL`, `LOG_FUEL` and `EVENT_FUEL`;
+`app::tests::host_calls_cost_fuel_however_many_in_one_block` a run of
+calls in one block across slices, debt included).
 
 **Fixed layouts** (little-endian, no alignment needed; encoded and
 decoded by `lumen-app-api`, their bytes pinned by host tests):
@@ -3218,16 +3227,19 @@ host-tested):
   (`DeserializeBadBool`), an overflowing u32 varint
   (`DeserializeBadVarint`), a bad `Option` tag (`DeserializeBadOption`), a
   surrogate `char` (`DeserializeBadChar`).
-- **Sizes first:** check `EVENT_BYTES`, `TREE_BYTES` and `ANSWER_BYTES` on
-  what the app sent before decoding (never on a re-encode: overlong
-  varints decode, so one value has more than one encoding; compare
-  decoded values, never bytes).
+- **Sizes first:** check `TREE_BYTES` and `ANSWER_BYTES` on what the app
+  sent before decoding (never on a re-encode: overlong varints decode, so
+  one value has more than one encoding; compare decoded values, never
+  bytes). `EVENT_BYTES` bounds the host's own encoding, which the app
+  only reads.
 - **Sequences:** strings and `serde_bytes` buffers are safe (postcard
   checks the bytes left before allocating), but a derived `Vec<u8>`
-  decodes as a sequence like any `Vec`, and serde preallocates a `Vec` up
-  to 1 MiB from its claimed length, infallibly, before failing. Every wire
-  `Vec` takes a visitor that refuses a length past its cap and
-  preallocates at most `min(hint, cap)`; the tree is decoded node by node
+  decodes as a sequence like any `Vec`. postcard gives serde no size hint
+  when the claimed length is more than the bytes left; otherwise serde
+  preallocates up to `min(len, 1 MiB / size_of::<T>())` elements,
+  infallibly, before decoding them, which for wide elements is far past
+  what the input holds. So every wire `Vec` takes a visitor that refuses a
+  length past its cap and preallocates at most `min(hint, cap)`; the tree is decoded node by node
   (`take_from_bytes::<Node>` in a loop, counted against `TREE_NODES`); a
   counting-allocator host test checks the peak.
 - **Shapes:** no recursive wire type (`Box<Self>`, `Vec<Self>`, mutual
@@ -3323,21 +3335,27 @@ own copy of the tree (below).
 A load failure is the app's outcome (`didn't start`): `run` prints it
 while it waits; once nobody waits (`q`, or a launch nobody watches),
 the app's thread logs `WARN  app: <name> (app <id>) didn't start:
-<why>` instead, whichever of the two comes second deciding under the
-app's lock, so it is reported once. The app's slot is freed when the
+<why>` instead: whichever of the app's thread (recording the failure)
+and the waiter (giving up) comes second reports it, decided under the
+app's lock, so it is reported once. A `run` whose console closed doesn't
+take the failure (nobody would see it printed): its drop logs it. The app's slot is freed when the
 reaper joins its thread, as for any ending.
 
 **Slices.** The app runs with `call_resumable`. A slice ends when its
-fuel runs out (`TypedResumableCall::OutOfFuel`) or at a blocking host
-call (`window_wait`, `time_sleep`). Every end goes through one path,
-`AppCtx::end_slice` (it counts the slice, adds the fuel used to the
-app's total, checks the kill flag and the close grace, which lives in
-the store's data), then the runtime yields (`sched::yield_now`) or
-blocks, and `AppCtx::begin_slice` refuels with `max(SLICE_FUEL,
-required_fuel)` (bulk memory operations are charged by size; a smaller
-refuel could keep a slice from ever making progress). A blocking call
-checks the kill flag again just before it blocks, and a deadline already
-reached doesn't block but yields. Fuel is the safe point
+fuel runs out (`TypedResumableCall::OutOfFuel`), at a blocking host call
+(`window_wait`, `time_sleep`), or at a host call's entry with less than
+`CALL_FUEL` left. Every end goes through one path, `runtime::end_slice`
+(over the store or a host call's `Caller`: it counts the slice, adds the
+fuel used to the app's total, checks the kill flag and the close grace,
+which lives in the store's data), then the runtime yields
+(`sched::yield_now`) or blocks (host.rs's `blocking`, with
+`AppState::waiting` owning the `waiting` phase), and
+`runtime::begin_slice` refuels with `max(SLICE_FUEL, required_fuel)`
+less any debt (bulk memory operations are charged by size; a smaller
+refuel could keep a slice from ever making progress). The last slice,
+partial, is counted when the app ends. A blocking call checks the kill
+flag again just before it blocks, and a deadline already reached doesn't
+block but yields. Fuel is the safe point
 where an app can be stopped; the timer still preempts the thread inside
 a slice, so a busy app never keeps a CPU from the shell.
 
@@ -3365,11 +3383,15 @@ hand per window.
 reason in its state (under the state's own lock), unless one is recorded
 already (in #199 the app's own thread is the only writer; the rule is for
 #206's and #207's). `exit`, `panic` and a kill seen by a host call raise
-one runtime-private host error, `Stop`, which wasmi hands back as a
-`HostTrap` (or, when it ends the very first call, a tail call from
-`lumen_main` to a host function or a `lumen_main` that is an exported
-import, as a plain error); both are read as `Stop`, never resumed and
-never reported as a trap (`app::tests::a_kill_at_a_host_call_is_never_a_trap`).
+one runtime-private host error, `Stop`, after recording why in the
+store's data. wasmi hands it back as a `HostTrap`, or as a plain error
+when the call it ends is a tail call to a host function from
+`lumen_main`'s own frame (on any slice: the first call or a resume) or a
+`lumen_main` that is an exported import. Both go through one reader,
+`runtime::step`, which takes the recorded reason, so it is never resumed
+and never reported as a trap
+(`app::tests::a_kill_at_a_host_call_is_never_a_trap`,
+`app::tests::a_kill_at_a_resume_is_never_a_trap`).
 The reason decides the app's one end line:
 
 | Reason | Line (target `app`) |
@@ -3439,14 +3461,18 @@ message, a trap's, `Failed`'s text and an unknown manifest grant (cut at
 | Limit | Value | When reached |
 |---|---|---|
 | `APP_BUDGET` | 128 MiB | a `const` assertion (`MAX_APPS × APP_WORST`) |
-| `MAX_APPS` | 4 running or loading | `run` refuses |
+| `MAX_APPS` | 4 listed (loading until joined) | `run` refuses |
 | `KERNEL_RESERVE` | 32 MiB | fewer slots on a smaller machine |
 | `MODULE_BYTES` | 1 MiB | `run` refuses |
 | `CODE_FACTOR` | 8 | the code charge |
 | `MEMORY_PAGES` | 256 (16 MiB) | refused at load |
 | `VALUE_STACK_BYTES` | 1 MiB | trap: call stack exhausted |
 | `CALL_DEPTH` | 1000 frames | trap: call stack exhausted |
-| `APP_OVERHEAD` | 1 MiB | the overhead charge: `STORE_BYTES` (512 KiB), `TABLE_BYTES`, `TREE_COPIES_BYTES`, `GLYPH_CACHE_BYTES` (128 KiB) at most |
+| `APP_OVERHEAD` | 1 MiB | the overhead charge, at least its parts' sum |
+| `STORE_BYTES` | 512 KiB | its part for the store, instance, call stack and handle table |
+| `TABLE_BYTES` | `TABLE_ELEMENTS` × 16 | its part for the table |
+| `TREE_COPIES_BYTES` | 2 × `TREE_BYTES` | its part for two tree copies (#207) |
+| `GLYPH_CACHE_BYTES` | 128 KiB | its part for the glyph cache (#206; a `const` assertion in `font.rs` ties it to `font::Text`'s) |
 | `WINDOW_PIXELS` | 307,200 (640 × 480) | `window_open`: `BadArgument` |
 | `SURFACES`, `BYTES_PER_PIXEL` | 3, 4 | the window charge |
 | `APP_WORST` | about 29.5 MiB (the sum above) | |
@@ -3565,7 +3591,8 @@ SSE); #197 checks the results' bits.
   reporting through `panic`, a bump allocator; #206's `lumen-app` is the
   real SDK). They can't live under `apps/tests/`: the member glob would
   take `tests` itself as a member, and excluding it also excludes
-  `tests/*`. Each sets its fixed memory (2 MiB) in its `build.rs`. `make
+  `tests/*`. Their fixed memory (2 MiB) is one `rustflags` entry in
+  `apps/.cargo/config.toml`. `make
   apps` copies only crates that build a `cdylib` (`testkit` and #206's
   `lumen-app` make none), the test apps to
   `build/apps/tests/<name>.wasm`, with `cp -p` and only stale modules
