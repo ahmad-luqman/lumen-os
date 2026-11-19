@@ -7,9 +7,11 @@
 //!
 //! It also links both crates into the ktest kernel, so `make audit`'s
 //! binary checks (no SSE, no red zone, the kernel code model) cover their
-//! code there. Its IR checks build the kernel without `ktest`, so they see
-//! these crates only once #199 uses them in the booted kernel; until then
-//! the booted kernel doesn't link them.
+//! code there. Its IR checks read only the kernel crate's own IR, built
+//! without `ktest`: from #199 on they see these crates' generic code
+//! compiled into the kernel, while their own non-generic code stays
+//! covered by the binary checks alone, as wasmi's and rhai's are. Until
+//! #199 the booted kernel doesn't link them.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -40,10 +42,11 @@ enum Tagged {
     B = 2,
 }
 
-/// Encode `value`, logging postcard's error if it refuses.
+/// Encode `value`, printing postcard's error as a TAP diagnostic if it
+/// refuses.
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, &'static str> {
-    // black_box: the value and the bytes come from outside as far as LLVM
-    // knows, so the encoder and decoder really run instead of folding.
+    // black_box: the value comes from outside as far as LLVM knows, so the
+    // encoder really runs instead of folding to constant bytes.
     postcard::to_allocvec(black_box(value)).map_err(|e| {
         crate::ktest::diag(format_args!("encode: {e:?}"));
         "postcard refused to encode"
@@ -54,6 +57,8 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, &'static str> {
 /// `postcard::from_bytes` ignores trailing bytes, and section 8 refuses
 /// them, so callers decode this way.
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, usize), Error> {
+    // black_box: the bytes come from outside as far as LLVM knows, so the
+    // decoder really runs instead of folding to a constant result.
     postcard::take_from_bytes(black_box(bytes)).map(|(value, rest)| (value, rest.len()))
 }
 
