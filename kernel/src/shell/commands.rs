@@ -253,6 +253,13 @@ pub static COMMANDS: Table<Run> = Table(&[
         about: "CPUs, interrupts, heap and threads each second (q quits)",
         run: sysinfo::top,
     },
+    Command {
+        name: "perf",
+        args: &[&["top", "burn"]],
+        usage: "top [n] [--samples N] [--threads] | burn [cpu|stop]",
+        about: "sample the CPUs on the timer tick: the top functions (or threads), idle apart; burn: a busy loop to profile",
+        run: crate::perf::command,
+    },
     Command { name: "history", args: &[], usage: "", about: "the lines entered on this console", run: history },
     Command {
         name: "threads",

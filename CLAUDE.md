@@ -259,6 +259,15 @@ own PR that updates that doc first.
   `demo.rs`: the `mandelbrot` (bands on every CPU) and `life` commands, and
   the launcher's Mandelbrot window (`draw_bands`: a window's surface lent
   as bands to a thread per CPU through `sched::scope`) and Life window (#157).
+  `perf.rs`: `perf top`, the sampling profiler (#205): the timer tick's
+  samples (`on_tick`, a call and one load unless a profile runs) into a
+  per-CPU `lumen_perf::Buffer`, `profile` (a count per CPU, not a duration;
+  a `Profiling` guard disarms; silent CPUs a hint), ranked by function (an
+  `FnIndex` over `symbols::functions`, built per ranking; `<unknown 0x…>`
+  rows) or `--threads`; refused in a pipeline; `perf burn` spins
+  `burn_loop` on a CPU (`StartError`, `StopError`; a stopping burn keeps
+  its slot and handle until a stop sees it finished, every wait stopping
+  on `q` or Ctrl-C).
   `app.rs`: WASM apps (M5; #197 so far): `wasmi` (`portable-dispatch`: a constant native stack depth
   however long a module runs; functions compiled eagerly; see ARCHITECTURE sections 2 and 8) running a
   module in fuel slices (`run_in_slices`, `run_bounded` with a resume cap: out of fuel, yield, refuel at
@@ -285,6 +294,14 @@ own PR that updates that doc first.
 - `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs
   in bands, and Game of Life with its patterns (host-tested).
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
+- `crates/lumen-perf`: the sampling profiler's logic (#205): `Buffer`, a
+  lock-free sample buffer with one writer (a CPU's timer interrupt) armed
+  for a count (an arming generation in its state word), `by_function`/
+  `by_thread` `Ranking`s with idle counted apart, `all_taken`, `Silence`
+  (a CPU that seems to have stopped ticking: a hint), `header` over
+  `Taken`s, `FnIndex` (functions by binary search, agreeing with
+  `lumen_elf`'s scan) and `perf top`'s arguments (host-tested, incl. a
+  writer racing re-arms and aliases at scale).
 - `crates/lumen-font`: anti-aliased TrueType text: `fontdue` (no `simd`)
   behind `Face` (parsed once, shared read-only; `measure`) and `Font`
   (a face plus its own glyph cache keyed by (glyph, pixel size), bounded

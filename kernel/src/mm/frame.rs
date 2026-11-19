@@ -801,7 +801,7 @@ crate::ktest!(
         // The check in never_returns_reserved must be able to fail: pretend
         // one frame in use is allocatable, and it must be named.
         use self::checks::*;
-        use crate::kassert_eq;
+        use crate::{kassert, kassert_eq};
         let (kstart, _) = kernel_image();
         let (_, stack_top) = arch::stacks::boot_stack();
         let image = translate(kstart).map_err(|_| "kernel not mapped")?;
@@ -815,10 +815,23 @@ crate::ktest!(
         kassert_eq!(first_live_owned(|p| p == bitmap, never)?, Some((BITMAP, bitmap)));
         kassert_eq!(first_live_owned(never, |p| p == table)?, Some(("page table", table)));
         // The running stack is allocated: owned is fine; free would mean it
-        // could be handed out while in use.
-        let running = translate(align_down(arch::read_rsp(), FRAME_SIZE)).map_err(|_| "stack not mapped")?;
-        kassert_eq!(first_live_owned(|p| p == running, never)?, None);
-        kassert_eq!(first_live_owned(never, |p| p == running)?, Some(("current stack page", running)));
+        // could be handed out while in use. `live_ranges` reads its own
+        // `rsp`, frames deeper than this one, so the page it names can be
+        // one below this frame's (it was, once a change elsewhere moved
+        // this test's frames, #205): every page of this thread's stack
+        // counts as the running one.
+        let me = match arch::stacks::REGISTRY.find(arch::read_rsp()) {
+            Some(lumen_mm::stacks::Hit::Stack(r)) => r.range,
+            _ => return Err("the ktest isn't running on a registered stack"),
+        };
+        let mut running = alloc::vec::Vec::new();
+        for page in (me.bottom..me.top).step_by(FRAME_SIZE as usize) {
+            running.push(translate(page).map_err(|_| "stack not mapped")?);
+        }
+        kassert!(running.contains(&translate(align_down(arch::read_rsp(), FRAME_SIZE)).map_err(|_| "rsp not mapped")?));
+        kassert_eq!(first_live_owned(|p| running.contains(&p), never)?, None);
+        let named = first_live_owned(never, |p| running.contains(&p))?;
+        kassert!(matches!(named, Some(("current stack page", p)) if running.contains(&p)));
         kassert_eq!(first_live_owned(never, never)?, None);
         Ok(())
     }
