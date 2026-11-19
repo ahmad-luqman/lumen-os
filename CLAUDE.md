@@ -280,7 +280,8 @@ own PR that updates that doc first.
   kernel, shared with the ktests: `LoopChecks`, its resume band from the loop's fuel per iteration) and
   its ktests, over hand-assembled modules (`app/modules.rs`: a long loop and call depth, one float
   operation per export, a bulk `memory.fill`, a generated large body; not yet `apps/`'s builds, which
-  #199 loads).
+  #199 loads). `app/wire.rs`: ktest only, postcard over serde-derived types (the wire format's crates,
+  linked ahead of #199's `lumen-app-api`).
   `font.rs`: the desktop's anti-aliased text (`lumen-font`): `font::face`,
   the UI font parsed on first use and shared; `font::Text`, one drawing
   thread's glyph cache over it (`draw` glyph by glyph inside a clip,

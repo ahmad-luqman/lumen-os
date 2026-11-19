@@ -20,3 +20,11 @@ tests = [
     "scenario:test_wasm::test_wasm_command_runs_a_loop_in_fuel_slices",
     "audit:flags",
 ]
+
+[[feature]]
+name = "postcard 1.1.3 and serde 1.0.229, the app interface's wire format (section 8), run in the ktest kernel with the flag audit passing: a derived struct and enum encode to exactly the bytes postcard specifies (varints, zigzagged signed integers, length-prefixed strings, an enum's variant position) and decode back; bytes cut short or naming no variant are an error, not a panic"
+milestone = "M5"
+tests = [
+    "ktest:lumen_kernel::app::wire::postcard_round_trips_derived_types",
+    "audit:flags",
+]
