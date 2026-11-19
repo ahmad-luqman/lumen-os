@@ -26,6 +26,7 @@ lumen-heap.workspace = true
 lumen-input.workspace = true
 lumen-mm.workspace = true
 lumen-pci.workspace = true
+lumen-perf.workspace = true
 lumen-png.workspace = true
 lumen-queue.workspace = true
 lumen-rand.workspace = true

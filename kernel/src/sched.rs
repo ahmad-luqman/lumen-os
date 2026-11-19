@@ -455,6 +455,9 @@ static READY: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS
 /// `next` local (until that moves into `current`); a crash never unwinds
 /// them.
 static CURRENT: [AtomicPtr<Thread>; MAX_CPUS] = [const { AtomicPtr::new(ptr::null_mut()) }; MAX_CPUS];
+/// Each CPU's idle thread's id (0 until its threads are set up), for
+/// [`running_id_here`]; stored once, by [`install`].
+static IDLE_ID: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The id the next thread made will get: every thread made from now on has
@@ -714,6 +717,15 @@ pub fn running_here() -> Option<(u64, &'static str)> {
     (!t.is_null()).then(|| unsafe { ((*t).id, (*t).name) })
 }
 
+/// The running thread's id on this CPU and whether it is the CPU's idle
+/// thread, lock-free (for the profiler's timer-tick samples, `perf`): `None`
+/// before this CPU's threads are set up. Called with interrupts off, so the
+/// running thread can't change under it.
+pub fn running_id_here() -> Option<(u64, bool)> {
+    let cpu = arch::cpu_index();
+    running_here().map(|(id, _)| (id, id == IDLE_ID[cpu].load(Ordering::Relaxed)))
+}
+
 /// Can the running thread block here? Only with interrupts on and
 /// everything [`blockable_but_for_interrupts`] asks.
 fn can_block(cpu: usize) -> bool {
@@ -774,6 +786,15 @@ pub struct JoinHandle {
 impl JoinHandle {
     pub fn thread(&self) -> &Thread {
         &self.thread
+    }
+
+    /// Whether the thread has ended and its CPU is done with it: whether
+    /// [`join`](Self::join) would return at once. For a caller that must
+    /// not block for good on a thread whose CPU may never run it (one
+    /// stuck with interrupts off): poll this, then join.
+    pub fn is_finished(&self) -> bool {
+        let t = &self.thread;
+        t.reaped.load(Ordering::Acquire) && FINISHING[t.cpu].load(Ordering::Acquire) != t.id
     }
 
     /// Wait until the thread has finished and its CPU's [`finish_switch`]
@@ -1367,6 +1388,7 @@ fn wake(thread: Arc<Thread>) -> bool {
 fn install(cpu: usize, current: Arc<Thread>, idle: Arc<Thread>) {
     let mut q = CPUS[cpu].lock();
     CURRENT[cpu].store(Arc::as_ptr(&current).cast_mut(), Ordering::Release);
+    IDLE_ID[cpu].store(idle.id, Ordering::Relaxed);
     q.current = Some(current);
     q.idle = Some(idle);
 }

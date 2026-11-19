@@ -1,0 +1,20 @@
+# Features: the sampling profiler. See tests/features/README.md for the format.
+
+[[feature]]
+name = "`perf top`: timer-tick samples per CPU (a count, not a duration), ranked by function or by thread, idle apart; `perf burn` ranks first"
+milestone = "M5"
+tests = [
+    "cargo:lumen-perf",
+    "ktest:lumen_kernel::perf::samples_land_while_armed_and_stop_when_disarmed",
+    "ktest:lumen_kernel::perf::a_spinning_thread_ranks_first_by_function_and_by_thread",
+    "ktest:lumen_kernel::perf::a_burn_being_stopped_keeps_its_slot_until_its_thread_has_ended",
+    "ktest:lumen_kernel::perf::a_profile_stopped_at_once_says_so_and_disarms",
+    "ktest:lumen_kernel::perf::the_function_index_finds_what_a_scan_finds",
+    "ktest:lumen_kernel::perf::a_cpu_stuck_with_interrupts_off_is_called_silent",
+    "ktest:lumen_kernel::perf::tables_show_the_rows_asked_for",
+    "ktest:lumen_kernel::perf::a_start_told_to_stop_waiting_leaves_a_stoppable_burn",
+    "ktest:lumen_kernel::perf::start_errors_say_what_went_wrong",
+    "scenario:test_perf::test_hot_function_is_on_top",
+    "scenario:test_perf::test_perf_usage_and_refusals",
+    "scenario:test_perf::test_q_stops_a_profile",
+]

@@ -539,8 +539,10 @@ fn handled(frame: &TrapFrame, handler: fn()) {
 /// and fatal (bar #BP). Device interrupts are never fatal: the timer and
 /// spurious interrupts are counted, not traced (at 1 kHz they would flood
 /// the trace ring; nor in the X-ray ring, which has the handled device
-/// interrupts: [`handled`]); the timer blinks the terminal's cursor on the boot CPU
-/// (`term::on_tick`, which never waits for a lock), then drives the
+/// interrupts: [`handled`]); the timer hands what it interrupted to the
+/// profiler (`perf::on_tick`: a call and one atomic load unless a profile
+/// runs), blinks the terminal's cursor on the boot CPU (`term::on_tick`,
+/// which never waits for a lock), then drives the
 /// scheduler (`sched::tick`, which may switch to another thread and return
 /// here only when this one runs again); a local APIC error is counted and
 /// logged with its status (on the 1st, 2nd, 4th, 8th... one, and whenever a
@@ -568,6 +570,7 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
         TIMER => {
             let cpu = super::percpu::index();
             let tick = TICKS[cpu].fetch_add(1, Ordering::Relaxed) + 1;
+            crate::perf::on_tick(frame.rip);
             // Before the scheduler may switch threads: the next tick must be
             // able to arrive on whatever runs next.
             super::apic::eoi();
