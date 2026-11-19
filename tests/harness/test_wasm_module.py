@@ -1,21 +1,33 @@
 """The apps/ workspace's output (#196): `make build` builds every app into
-build/apps/<name>.wasm, and each is a WASM module that exports what it says.
-Also the parser itself (lumen_harness.wasm) on handcrafted modules."""
+build/apps/<name>.wasm; each is a valid WASM module (wasmtime validates it)
+using only rustc's default WASM features, and hello exports what it says
+and returns what it says. Also lumen_harness.wasm's custom-section reader,
+on handcrafted modules."""
 
 import re
 import subprocess
 
 import pytest
+import wasmtime
 from lumen_harness import REPO_ROOT
-from lumen_harness.wasm import Export, Signature, WasmError, parse
+from lumen_harness.wasm import (
+    WasmError,
+    compile_module,
+    custom_section,
+    custom_sections,
+    engine,
+    function_names,
+    target_features,
+)
 
 APPS = REPO_ROOT / "build" / "apps"
 
-# What rustc 1.99.1 lets itself use for wasm32-unknown-unknown by default:
-# its target_features section (bulk-memory-opt and call-indirect-overlong
-# are LLVM's names for parts of bulk-memory and reference-types). The
-# kernel's wasmi must accept every one (#197); a toolchain bump that changes
-# this list fails here, so it gets checked against wasmi again.
+# What rustc 1.99.1 lets itself use for wasm32-unknown-unknown by default,
+# as the modules' target_features section lists it. `rustc --print cfg`
+# shows six of them; LLVM adds bulk-memory-opt (implied by bulk-memory) and
+# call-indirect-overlong (implied by reference-types). The kernel's wasmi
+# will have to accept every one (#197). A toolchain bump that changes the
+# list fails here, so it gets checked against wasmi again.
 DEFAULT_FEATURES = {
     "bulk-memory",
     "bulk-memory-opt",
@@ -28,45 +40,86 @@ DEFAULT_FEATURES = {
 }
 
 
+def app_names() -> list[str]:
+    names = sorted(p.parent.name for p in (REPO_ROOT / "apps").glob("*/Cargo.toml"))
+    assert names, "apps/ has no apps"
+    return names
+
+
 def built(name: str) -> bytes:
     path = APPS / f"{name}.wasm"
     assert path.exists(), f"{path} is missing: `make build` (or `make test-host`) builds it"
     return path.read_bytes()
 
 
-def test_every_app_is_built():
-    crates = {p.parent.name for p in (REPO_ROOT / "apps").glob("*/Cargo.toml")}
-    assert crates, "apps/ has no apps"
-    for name in crates:
-        parse(built(name))
+def test_every_app_is_a_valid_module_without_later_proposals():
+    eng = engine()
+    for name in app_names():
+        compile_module(built(name), eng)
 
 
-def test_hello_exports_answer_returning_i32():
-    module = parse(built("hello"))
+def test_hello_exports_answer_returning_42():
+    eng = engine()
+    module = compile_module(built("hello"), eng)
     assert module.imports == []
-    assert set(module.exports) == {"memory", "answer"}
-    assert module.exports["memory"].kind == "memory"
-    assert module.signature("answer") == Signature(params=(), results=("i32",))
+    exports = {e.name: e.type for e in module.exports}
+    assert set(exports) == {"memory", "answer"}
+    assert isinstance(exports["memory"], wasmtime.MemoryType)
+    answer = exports["answer"]
+    assert isinstance(answer, wasmtime.FuncType)
+    assert (answer.params, answer.results) == ([], [wasmtime.ValType.i32()])
+    store = wasmtime.Store(eng)
+    instance = wasmtime.Instance(store, module, [])
+    assert instance.exports(store)["answer"](store) == 42
 
 
-def test_apps_use_only_the_default_wasm_features():
-    features = parse(built("hello")).target_features()
-    assert set(features) == DEFAULT_FEATURES
-    assert set(features.values()) == {"+"}
+def test_every_app_uses_only_the_default_wasm_features():
+    for name in app_names():
+        features = target_features(built(name))
+        assert set(features) == DEFAULT_FEATURES, name
+        assert set(features.values()) == {"+"}, name
 
 
-def test_make_build_builds_the_apps():
+def test_every_app_keeps_its_function_names():
+    # The release profile keeps the name section, so a trap can name its function.
+    for name in app_names():
+        assert function_names(built(name)), name
+    assert "answer" in function_names(built("hello")).values()
+
+
+@pytest.mark.parametrize(
+    "wat",
+    [
+        "(module (func (result v128) v128.const i64x2 0 0))",
+        "(module (memory 1 1 shared))",
+        "(module (func return_call 0))",
+        "(module (memory i64 1))",
+    ],
+    ids=["simd", "threads", "tail-call", "memory64"],
+)
+def test_the_engine_refuses_later_proposals(wat):
+    with pytest.raises(wasmtime.WasmtimeError):
+        compile_module(wasmtime.wat2wasm(wat))
+
+
+def test_the_engine_accepts_the_default_features():
+    wat = """(module (memory 1)
+      (func (result i32 i32) i32.const 1 i32.extend8_s i32.const 2)
+      (func (memory.fill (i32.const 0) (i32.const 0) (i32.const 0)))
+      (func (param f32) (result i32) local.get 0 i32.trunc_sat_f32_s))"""
+    compile_module(wasmtime.wat2wasm(wat))
+
+
+@pytest.mark.parametrize("goal", ["build", "test-host"])
+def test_make_goal_builds_the_apps(goal):
     run = subprocess.run(
-        ["make", "-n", "-C", str(REPO_ROOT), "build", "test-host"],
+        ["make", "-n", "-C", str(REPO_ROOT), goal],
         capture_output=True,
         text=True,
         check=False,
     )
     assert run.returncode == 0, run.stderr
-    # Once for `build`, and `test-host` depends on the same target.
-    assert re.search(
-        r"cd apps && cargo build --release --target wasm32-unknown-unknown", run.stdout
-    )
+    assert "cd apps && cargo build --release" in run.stdout
 
 
 def test_the_toolchain_file_pins_the_wasm_target():
@@ -77,11 +130,7 @@ def test_the_toolchain_file_pins_the_wasm_target():
     assert re.search(r"^\s+rustup toolchain install\s*$", ci, re.MULTILINE)
 
 
-# --- the parser, on handcrafted modules ---
-
-
-def section(sid: int, body: bytes) -> bytes:
-    return bytes([sid]) + uleb(len(body)) + body
+# --- the custom-section reader, on handcrafted modules ---
 
 
 def uleb(n: int) -> bytes:
@@ -98,88 +147,77 @@ def name(s: str) -> bytes:
     return uleb(len(s)) + s.encode()
 
 
+def section(sid: int, body: bytes) -> bytes:
+    return bytes([sid]) + uleb(len(body)) + body
+
+
+def custom(cname: str, payload: bytes) -> bytes:
+    return section(0, name(cname) + payload)
+
+
 HEADER = b"\0asm\x01\0\0\0"
-# (func (param i64 f32) (result f64)) imported as env.log; one defined
-# function of type 1, () -> (i32 i32), exported as "pair" (index 1).
-SAMPLE = (
-    HEADER
-    + section(1, b"\x02" + b"\x60\x02\x7e\x7d\x01\x7c" + b"\x60\x00\x02\x7f\x7f")
-    + section(2, b"\x01" + name("env") + name("log") + b"\x00\x00")
-    + section(3, b"\x01\x01")
-    + section(7, b"\x02" + name("pair") + b"\x00\x01" + name("mem") + b"\x02\x00")
-    + section(
-        0, name("target_features") + b"\x02" + b"+" + name("sign-ext") + b"-" + name("simd128")
-    )
-)
+# A function section between two custom sections: skipped, the order kept.
+TYPED = section(1, b"\x01\x60\x00\x00") + section(3, b"\x01\x00")
 
 
-def test_parser_reads_types_imports_and_exports():
-    module = parse(SAMPLE)
-    assert module.types == [Signature(("i64", "f32"), ("f64",)), Signature((), ("i32", "i32"))]
-    assert [(i.module, i.name, i.kind) for i in module.imports] == [("env", "log", "func")]
-    assert module.exports == {"pair": Export("func", 1), "mem": Export("memory", 0)}
-    # Function index 1 is the first defined one: imports come first.
-    assert module.signature("pair") == Signature((), ("i32", "i32"))
-    assert module.target_features() == {"sign-ext": "+", "simd128": "-"}
-    with pytest.raises(KeyError):
-        module.signature("mem")
+def features(*entries: bytes) -> bytes:
+    return custom("target_features", uleb(len(entries)) + b"".join(entries))
 
 
-def test_parser_reads_multibyte_lengths():
+def test_reader_keeps_custom_sections_in_order():
     long = "x" * 200  # a 2-byte LEB128 length
-    module = parse(HEADER + section(0, name(long) + b"\x01\x02"))
-    assert module.custom == {long: b"\x01\x02"}
+    data = HEADER + custom("b", b"\x01") + TYPED + custom(long, b"") + custom("b", b"\x02")
+    assert custom_sections(data) == [("b", b"\x01"), (long, b""), ("b", b"\x02")]
+    assert custom_section(data, long) == b""
+    assert custom_section(data, "absent") is None
+
+
+def test_reader_refuses_a_custom_section_named_twice():
+    data = HEADER + custom("b", b"\x01") + TYPED + custom("b", b"\x02")
+    with pytest.raises(WasmError, match="appears 2 times"):
+        custom_section(data, "b")
+
+
+def test_target_features_reads_each_prefix():
+    data = HEADER + features(
+        b"+" + name("sign-ext"), b"-" + name("simd128"), b"=" + name("atomics")
+    )
+    assert target_features(data) == {"sign-ext": "+", "simd128": "-", "atomics": "="}
+    assert target_features(HEADER + TYPED) == {}
 
 
 @pytest.mark.parametrize(
     "data, message",
     [
-        (b"\0asx\x01\0\0\0", "not a WASM module"),
-        (b"\0asm\x02\0\0\0", "version 2"),
-        (b"\0asm", "not a WASM module"),
-        (HEADER + b"\x01\x05\x01", "truncated"),
-        (HEADER + section(1, b"\x01\x61\x00\x00"), "function type form"),
-        (HEADER + section(1, b"\x01\x60\x01\x01\x00"), "unknown value type"),
-        (HEADER + section(3, b"\x01\x00\x00"), "left over"),
-        (
-            HEADER + section(7, b"\x02" + name("a") + b"\x00\x00" + name("a") + b"\x00\x00"),
-            "exported twice",
-        ),
-        (HEADER + section(0, b"\x02\xff\xfe"), "not UTF-8"),
-        (HEADER + b"\x00\xff\xff\xff\xff\xff\x01", "LEB128"),
+        (HEADER + features(b"+" + name("a"), b"+" + name("a")), "listed twice"),
+        (HEADER + features(b"?" + name("a")), "prefix"),
+        (HEADER + custom("target_features", b"\x01+\x05ab"), "truncated"),
+        (HEADER + custom("target_features", b"\x00\x00"), "left over"),
+        (HEADER + features() + features(), "appears 2 times"),
     ],
 )
-def test_parser_refuses_malformed_modules(data, message):
+def test_target_features_refuses_malformed_sections(data, message):
     with pytest.raises(WasmError, match=message):
-        parse(data)
+        target_features(data)
 
 
-def test_every_truncation_and_flipped_byte_parses_or_is_refused():
-    # A module cut at a section boundary is a valid, smaller module; anywhere
-    # else, and with any byte flipped, the parser says WasmError, never
-    # another exception (an IndexError, a KeyError) or a hang.
-    data = built("hello")
-    for cut in range(len(data)):
-        try:
-            parse(data[:cut]).target_features()
-        except WasmError:
-            pass
-    for i in range(len(data)):
-        flipped = bytearray(data)
-        flipped[i] ^= 0xFF
-        try:
-            parse(bytes(flipped)).target_features()
-        except WasmError:
-            pass
+def test_function_names_reads_the_name_section():
+    # Subsection 0 (the module's name) skipped; 1: function 0 "f", 3 "g".
+    names = section(0, name("m")) + section(1, b"\x02\x00" + name("f") + b"\x03" + name("g"))
+    assert function_names(HEADER + custom("name", names)) == {0: "f", 3: "g"}
+    assert function_names(HEADER) == {}
 
 
-def test_signature_of_a_missing_function_type_is_an_error():
-    bad = HEADER + section(3, b"\x01\x05") + section(7, b"\x01" + name("f") + b"\x00\x00")
-    with pytest.raises(WasmError, match="type 5"):
-        parse(bad).signature("f")
-
-
-def test_target_features_with_a_bad_prefix_is_an_error():
-    module = parse(HEADER + section(0, name("target_features") + b"\x01" + b"?" + name("x")))
-    with pytest.raises(WasmError, match="prefix"):
-        module.target_features()
+@pytest.mark.parametrize(
+    "data, message",
+    [
+        (b"\0asm\x02\0\0\0", "not a version 1"),
+        (HEADER + b"\x01\x05\x01", "truncated"),
+        (HEADER + section(0, b"\x02\xff\xfe"), "not UTF-8"),
+        (HEADER + b"\x00\xff\xff\xff\xff\x7f", "doesn't fit 32 bits"),
+        (HEADER + b"\x00\xff\xff\xff\xff\xff\x01", "longer than 5 bytes"),
+    ],
+)
+def test_reader_refuses_broken_headers(data, message):
+    with pytest.raises(WasmError, match=message):
+        custom_sections(data)

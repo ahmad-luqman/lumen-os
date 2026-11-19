@@ -41,16 +41,19 @@ $(BUILD)/lumen-kernel-ktest: $(KERNEL_SRCS)
 
 build: $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest apps ## Build both kernels and the apps
 
-# Apps (M5): every crate under apps/ (its own workspace, see apps/Cargo.toml)
-# is a WASM module, copied to build/apps/<name>.wasm (cargo names the file
-# after the crate, `-` as `_`). Always run: cargo knows what changed.
+# Apps (M5): every crate under apps/ (its own workspace, `members = ["*"]`,
+# so every directory here is built) is a WASM module, copied to
+# build/apps/<name>.wasm (cargo names the file after the crate, `-` as `_`).
+# Cargo runs inside apps/, whose .cargo/config.toml sets the target and the
+# output directory. Always run: cargo knows what changed. `|| exit 1`: make
+# 3.81 (macOS's) ignores .SHELLFLAGS, so `-e` can't be relied on in a loop.
 APP_TARGET := wasm32-unknown-unknown
 APPS       := $(patsubst apps/%/Cargo.toml,%,$(wildcard apps/*/Cargo.toml))
 
 apps: ## Build the WASM apps into build/apps/
-	cd apps && cargo build --release --target $(APP_TARGET)
+	cd apps && cargo build --release
 	@mkdir -p $(BUILD)/apps && for app in $(APPS); do \
-		cp target/apps/$(APP_TARGET)/release/$${app//-/_}.wasm $(BUILD)/apps/$$app.wasm; done
+		cp target/apps/$(APP_TARGET)/release/$${app//-/_}.wasm $(BUILD)/apps/$$app.wasm || exit 1; done
 
 # Bootable images:
 #   lumen.iso           interactive (`make run`)
@@ -112,7 +115,7 @@ lint: ## clippy on host crates (incl. their tests), the kernel and the apps; ruf
 	cargo clippy --all-targets -- -D warnings
 	cargo clippy -p lumen-kernel --target $(TARGET) --release -- -D warnings
 	cargo clippy -p lumen-kernel --target $(TARGET) --release --features ktest -- -D warnings
-	cd apps && cargo clippy --release --target $(APP_TARGET) -- -D warnings
+	cd apps && cargo clippy --release -- -D warnings
 
 fmt: ## Format Rust and Python
 	cargo fmt --all

@@ -1,10 +1,14 @@
-# Lumen's apps (M5): WASM modules for `wasm32-unknown-unknown`, run by the
-# kernel's `wasmi` (docs/ARCHITECTURE.md). Their own workspace, outside the
-# root one, so the host crates' `cargo test`/`clippy` and the kernel's builds
-# never see them. `make build` builds every app into build/apps/<name>.wasm.
+# Lumen's apps (M5): WASM modules for `wasm32-unknown-unknown`, to be run by
+# the kernel's `wasmi` (#197, #199). Their own workspace, outside the root
+# one (which excludes apps/), so the host crates' `cargo test`/`clippy` and
+# the kernel's builds never see them. `make build` builds every app into
+# build/apps/<name>.wasm.
 [workspace]
 resolver = "3"
-members = ["hello"]
+# Every directory is an app: `make apps` copies one .wasm per apps/*/.
+members = ["*"]
+# Not an app: cargo's glob also matches dot directories.
+exclude = [".cargo"]
 
 [workspace.package]
 version = "0.0.1"
@@ -18,15 +22,10 @@ unsafe_op_in_unsafe_fn = "deny"
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"
 
-[profile.dev]
-panic = "abort"
-
 # Apps are always built with the release profile. Interpreted, so fewer
-# instructions matter more than size; the name section stays (symbols kept)
-# so a trap can name the function it happened in.
+# instructions matter more than size. The target's panic strategy is
+# already abort, and the default profile keeps the name section (function
+# names, so a trap can name where it happened; the harness checks it).
 [profile.release]
-panic = "abort"
 lto = true
 codegen-units = 1
-debug = false
-strip = "debuginfo"

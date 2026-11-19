@@ -1,103 +1,59 @@
-"""WASM modules as the apps/ workspace builds them (#196): enough of the
-binary format to check a built app before anything loads it.
+"""WASM modules as the apps/ workspace builds them (#196), checked before
+anything in the kernel loads them.
 
-`parse` reads a module's header and its sections: the types, imports,
-functions and exports (each export with its kind, and a function's
-signature), and the custom sections, among them `target_features`, which
-says which WASM features the compiler let itself use (the kernel's `wasmi`
-must accept every one, #197). It checks what it reads, so a truncated or
-malformed module raises `WasmError` rather than parsing to something wrong;
-it does not validate code bodies (wasmi does that when it loads a module).
+`compile_module` validates a whole module with `wasmtime` under `engine()`, which
+switches off every proposal rustc doesn't use by default for
+wasm32-unknown-unknown (SIMD, threads, tail calls, ...), so a module that
+needs one is refused; a `wasmtime.Module` also gives the imports, the
+exports with their types, and can be instantiated and called.
+
+wasmtime has no API for custom sections, so a small reader here walks the
+section headers and keeps every custom section in order (`custom_sections`);
+`custom_section` refuses a name that appears twice. Through it:
+`target_features` (which features the compiler let itself use) and
+`function_names` (the `name` section's function names).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
+import wasmtime
 
-MAGIC = b"\0asm"
-VERSION = 1
+MAGIC_AND_VERSION = b"\0asm\x01\0\0\0"
+CUSTOM = 0  # section id (WebAssembly core spec, 5.5.2)
 
-# Section ids (WebAssembly core spec, 5.5.2).
-CUSTOM, TYPE, IMPORT, FUNCTION = 0, 1, 2, 3
-EXPORT = 7
-
-VALTYPES = {
-    0x7F: "i32",
-    0x7E: "i64",
-    0x7D: "f32",
-    0x7C: "f64",
-    0x7B: "v128",
-    0x70: "funcref",
-    0x6F: "externref",
-}
-KINDS = {0: "func", 1: "table", 2: "memory", 3: "global"}
+# Proposals past what rustc 1.99.1 enables by default for the target. With
+# them off, validation proves an app uses none of them.
+_OFF = (
+    "wasm_simd",
+    "wasm_relaxed_simd",
+    "wasm_threads",
+    "wasm_tail_call",
+    "wasm_gc",
+    "wasm_function_references",
+    "wasm_exceptions",
+    "wasm_memory64",
+    "wasm_multi_memory",
+    "wasm_wide_arithmetic",
+    "wasm_custom_page_sizes",
+    "wasm_stack_switching",
+    "wasm_component_model",
+)
 
 
 class WasmError(ValueError):
-    """The bytes are not a WASM module this parser can read."""
+    """A custom section, or the section headers around it, can't be read."""
 
 
-@dataclass(frozen=True)
-class Signature:
-    params: tuple[str, ...]
-    results: tuple[str, ...]
+def engine() -> wasmtime.Engine:
+    config = wasmtime.Config()
+    for proposal in _OFF:
+        setattr(config, proposal, False)
+    return wasmtime.Engine(config)
 
 
-@dataclass(frozen=True)
-class Export:
-    kind: str
-    index: int
-
-
-@dataclass(frozen=True)
-class Import:
-    module: str
-    name: str
-    kind: str
-
-
-@dataclass
-class Module:
-    types: list[Signature] = field(default_factory=list)
-    imports: list[Import] = field(default_factory=list)
-    # The type index of each function the module defines (not the imported ones).
-    functions: list[int] = field(default_factory=list)
-    exports: dict[str, Export] = field(default_factory=dict)
-    custom: dict[str, bytes] = field(default_factory=dict)
-
-    def signature(self, export: str) -> Signature:
-        """The signature of the function exported as `export`."""
-        found = self.exports.get(export)
-        if found is None or found.kind != "func":
-            raise KeyError(f"no function exported as {export!r}")
-        imported = [i for i in self.imports if i.kind == "func"]
-        if found.index < len(imported):
-            raise WasmError(f"{export!r} re-exports an import; its type isn't read")
-        defined = found.index - len(imported)
-        if defined >= len(self.functions):
-            raise WasmError(f"{export!r} names function {found.index}, which doesn't exist")
-        type_index = self.functions[defined]
-        if type_index >= len(self.types):
-            raise WasmError(f"function {found.index} has type {type_index}, which doesn't exist")
-        return self.types[type_index]
-
-    def target_features(self) -> dict[str, str]:
-        """The `target_features` custom section: each feature with its prefix
-        (`+` used, `-` must not be used, `=` used and required by every
-        module linked with it), or {} if the module has none."""
-        payload = self.custom.get("target_features")
-        if payload is None:
-            return {}
-        r = _Reader(payload)
-        features = {}
-        for _ in range(r.uleb()):
-            prefix = chr(r.byte())
-            if prefix not in "+-=":
-                raise WasmError(f"target feature prefix {prefix!r}")
-            features[r.name()] = prefix
-        r.end("target_features")
-        return features
+def compile_module(data: bytes, eng: wasmtime.Engine | None = None) -> wasmtime.Module:
+    """Validate and compile `data`; raises `wasmtime.WasmtimeError` if invalid."""
+    return wasmtime.Module(eng or engine(), data)
 
 
 class _Reader:
@@ -105,6 +61,9 @@ class _Reader:
         self.data = data
         self.pos = pos
         self.limit = len(data) if end is None else end
+
+    def at_end(self) -> bool:
+        return self.pos >= self.limit
 
     def byte(self) -> int:
         if self.pos >= self.limit:
@@ -122,19 +81,17 @@ class _Reader:
         self.pos += n
         return out
 
-    def uleb(self, bits: int = 32) -> int:
-        result = shift = 0
-        while True:
+    def uleb(self) -> int:
+        """An unsigned LEB128 u32: at most 5 bytes, the value within 32 bits."""
+        result = 0
+        for i in range(5):
             b = self.byte()
-            result |= (b & 0x7F) << shift
-            shift += 7
+            result |= (b & 0x7F) << (7 * i)
             if not b & 0x80:
-                break
-            if shift >= bits + 7:
-                raise WasmError(f"LEB128 longer than {bits} bits at {self.pos}")
-        if result >> bits:
-            raise WasmError(f"LEB128 value {result} doesn't fit {bits} bits")
-        return result
+                if result >> 32:
+                    raise WasmError(f"LEB128 value {result} doesn't fit 32 bits")
+                return result
+        raise WasmError(f"LEB128 longer than 5 bytes at {self.pos}")
 
     def name(self) -> str:
         raw = self.take(self.uleb())
@@ -143,78 +100,76 @@ class _Reader:
         except UnicodeDecodeError as e:
             raise WasmError(f"name is not UTF-8: {raw!r}") from e
 
-    def valtype(self) -> str:
-        b = self.byte()
-        if b not in VALTYPES:
-            raise WasmError(f"unknown value type 0x{b:02x}")
-        return VALTYPES[b]
-
-    def limits(self) -> None:
-        flags = self.byte()
-        self.uleb(64)
-        if flags & 1:
-            self.uleb(64)
-
-    def end(self, what: str) -> None:
-        if self.pos != self.limit:
-            raise WasmError(f"{what}: {self.limit - self.pos} bytes left over")
+    def sub(self, size: int) -> _Reader:
+        """The next `size` bytes as a reader of their own (skipped here)."""
+        start = self.pos
+        self.take(size)
+        return _Reader(self.data, start, start + size)
 
 
-def parse(data: bytes) -> Module:
-    if len(data) < 8 or data[:4] != MAGIC:
-        raise WasmError(f"not a WASM module (starts {data[:4]!r})")
-    version = int.from_bytes(data[4:8], "little")
-    if version != VERSION:
-        raise WasmError(f"WASM version {version}, expected {VERSION}")
-    module = Module()
+def custom_sections(data: bytes) -> list[tuple[str, bytes]]:
+    """Every custom section, in the order the module has them (a name may repeat)."""
+    if data[:8] != MAGIC_AND_VERSION:
+        raise WasmError(f"not a version 1 WASM module (starts {data[:8]!r})")
     r = _Reader(data, 8)
-    while r.pos < r.limit:
+    found = []
+    while not r.at_end():
         section = r.byte()
-        size = r.uleb()
-        start = r.pos
-        r.take(size)  # checks the section fits
-        body = _Reader(data, start, start + size)
+        body = r.sub(r.uleb())
         if section == CUSTOM:
-            custom_name = body.name()  # before the payload: Python evaluates `d[k] = v`'s v first
-            module.custom[custom_name] = body.take(body.limit - body.pos)
-        elif section == TYPE:
-            for _ in range(body.uleb()):
-                if (form := body.byte()) != 0x60:
-                    raise WasmError(f"function type form 0x{form:02x}")
-                params = tuple(body.valtype() for _ in range(body.uleb()))
-                results = tuple(body.valtype() for _ in range(body.uleb()))
-                module.types.append(Signature(params, results))
-        elif section == IMPORT:
-            for _ in range(body.uleb()):
-                mod, name, kind = body.name(), body.name(), body.byte()
-                if kind == 0:
-                    body.uleb()
-                elif kind == 1:
-                    body.valtype()
-                    body.limits()
-                elif kind == 2:
-                    body.limits()
-                elif kind == 3:
-                    body.valtype()
-                    body.byte()
-                else:
-                    raise WasmError(f"import kind {kind}")
-                module.imports.append(Import(mod, name, KINDS[kind]))
-        elif section == FUNCTION:
-            module.functions = [body.uleb() for _ in range(body.uleb())]
-        elif section == EXPORT:
-            for _ in range(body.uleb()):
-                name, kind, index = body.name(), body.byte(), body.uleb()
-                if kind not in KINDS:
-                    raise WasmError(f"export kind {kind}")
-                if name in module.exports:
-                    raise WasmError(f"{name!r} exported twice")
-                module.exports[name] = Export(KINDS[kind], index)
-        else:
-            continue  # sections not read here (tables, memory, code, data, ...)
-        body.end(f"section {section}")
-    return module
+            name = body.name()
+            found.append((name, body.take(body.limit - body.pos)))
+    return found
 
 
-def load(path: Path) -> Module:
-    return parse(path.read_bytes())
+def custom_section(data: bytes, name: str) -> bytes | None:
+    """The custom section called `name`, None if there is none; a name that
+    appears twice is refused (which one would the kernel believe?)."""
+    payloads = [payload for n, payload in custom_sections(data) if n == name]
+    if len(payloads) > 1:
+        raise WasmError(f"custom section {name!r} appears {len(payloads)} times")
+    return payloads[0] if payloads else None
+
+
+def target_features(data: bytes) -> dict[str, str]:
+    """The `target_features` section: each feature with its prefix (`+`: the
+    module uses it; `-`: it must not be used; `=`: used, and every module
+    linked with this one must use it too), or {} if the module has none. A
+    feature listed twice is refused."""
+    payload = custom_section(data, "target_features")
+    if payload is None:
+        return {}
+    r = _Reader(payload)
+    features: dict[str, str] = {}
+    for _ in range(r.uleb()):
+        prefix = chr(r.byte())
+        if prefix not in "+-=":
+            raise WasmError(f"target feature prefix {prefix!r}")
+        feature = r.name()
+        if feature in features:
+            raise WasmError(f"target feature {feature!r} listed twice")
+        features[feature] = prefix
+    if not r.at_end():
+        raise WasmError(f"target_features: {r.limit - r.pos} bytes left over")
+    return features
+
+
+FUNCTION_NAMES = 1  # the `name` section's function-names subsection
+
+
+def function_names(data: bytes) -> dict[int, str]:
+    """The `name` section's function names by function index ({} without one)."""
+    payload = custom_section(data, "name")
+    names: dict[int, str] = {}
+    if payload is None:
+        return names
+    r = _Reader(payload)
+    while not r.at_end():
+        subsection = r.byte()
+        body = r.sub(r.uleb())
+        if subsection != FUNCTION_NAMES:
+            continue
+        for _ in range(body.uleb()):
+            index = body.uleb()
+            names[index] = body.name()
+    return names

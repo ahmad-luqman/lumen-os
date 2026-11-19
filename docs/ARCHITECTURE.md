@@ -4360,16 +4360,18 @@ apps/              the WASM apps (M5): their own cargo workspace, no_std cdylibs
 ```
 
 **The apps' target (#196).** `wasm32-unknown-unknown` is in the pinned
-toolchain (`rust-toolchain.toml`). `apps/` is a separate workspace, so the
-host crates' `cargo test` and clippy, the kernel builds and `make audit`
-never see it; `make lint` and `make fmt` cover it. Its release profile
-keeps the name section (function names for trap reports) and drops debug
-info. rustc 1.99.1 lets itself use these WASM features for this target by
-default, as the modules' `target_features` section lists them:
-`bulk-memory` (and `bulk-memory-opt`, LLVM's name for `memory.copy` and
-`memory.fill` alone), `call-indirect-overlong` (LLVM's name for the
-`reference-types` table index encoding), `multivalue`, `mutable-globals`,
-`nontrapping-fptoint`, `reference-types` and `sign-ext`; no `simd128`, no
-threads or atomics. The kernel's `wasmi` must accept every one (#197);
-`harness:test_wasm_module::test_apps_use_only_the_default_wasm_features`
-fails on a toolchain bump that changes the list, so it gets checked again.
+toolchain (`rust-toolchain.toml`). `apps/` is a separate workspace (every
+directory in it a member; the root workspace excludes it), so the host
+crates' `cargo test` and clippy and the kernel builds never see it; `make
+lint` and `make fmt` cover it. `make build` builds the apps, so `make
+audit` (which runs `build`) does too, but the audit's checks look only at
+the kernels. The default release profile keeps the name section (function
+names for trap reports). The harness validates each built module with
+`wasmtime` with every proposal past rustc's defaults switched off (no SIMD,
+threads, tail calls, memory64, ...), and checks that its `target_features`
+section lists exactly rustc 1.99.1's default features for this target: the
+list is `DEFAULT_FEATURES` in `tests/harness/test_wasm_module.py` (six that
+`rustc --print cfg --target wasm32-unknown-unknown` shows, and two that
+LLVM implies). The kernel's `wasmi` will have to accept every one (#197); a
+toolchain bump that changes the list fails that test, so it gets checked
+again.
