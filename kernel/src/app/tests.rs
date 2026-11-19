@@ -518,7 +518,8 @@ crate::ktest!(
         crate::kassert_eq!(state.outcome(), Some(Outcome::Ended(EndReason::Killed)));
         crate::kassert!(!state.ran());
         crate::kassert_eq!(state.slices(), 0);
-        // What `run` prints for it.
+        // What `run` sees, and prints, for it.
+        crate::kassert_eq!(runtime::start_of(&state), runtime::Start::Ended(EndReason::Killed));
         crate::kassert_eq!(
             runtime::start_line("hello", 3, &runtime::Start::Ended(EndReason::Killed)),
             Some(Err(String::from("run: hello: killed")))

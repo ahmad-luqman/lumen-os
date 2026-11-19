@@ -481,7 +481,7 @@ pub(super) enum Start {
 }
 
 /// The app's start, if it is decided.
-fn start_of(state: &AppState) -> Start {
+pub(super) fn start_of(state: &AppState) -> Start {
     let life = state.life.lock();
     if life.ran {
         return Start::Started;
