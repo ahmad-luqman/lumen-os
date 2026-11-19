@@ -818,7 +818,7 @@ crate::ktest!(
         // could be handed out while in use. `live_ranges` reads its own
         // `rsp`, frames deeper than this one, so the page it names can be
         // one below this frame's (it was, once a change elsewhere moved
-        // this test's frames, #205): every frame of this thread's stack
+        // this test's frames, #205): every page of this thread's stack
         // counts as the running one.
         let me = match arch::stacks::REGISTRY.find(arch::read_rsp()) {
             Some(lumen_mm::stacks::Hit::Stack(r)) => r.range,

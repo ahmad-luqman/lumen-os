@@ -184,18 +184,32 @@ pub struct Row<K> {
     pub samples: u64,
 }
 
-/// Samples ranked by some key, idle ones counted apart.
+/// Samples ranked by some key, idle ones counted apart. Made only by
+/// [`by_function`] and [`by_thread`], so its idle samples never outnumber
+/// its samples.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ranking<K> {
-    /// Every sample, idle or not.
-    pub samples: u64,
-    /// The samples that found a CPU's idle thread running (in no row).
-    pub idle: u64,
-    /// The other samples by key, most first; ties in key order.
-    pub rows: Vec<Row<K>>,
+    samples: u64,
+    idle: u64,
+    rows: Vec<Row<K>>,
 }
 
 impl<K> Ranking<K> {
+    /// Every sample, idle or not.
+    pub fn samples(&self) -> u64 {
+        self.samples
+    }
+
+    /// The samples that found a CPU's idle thread running (in no row).
+    pub fn idle(&self) -> u64 {
+        self.idle
+    }
+
+    /// The busy samples by key, most first; ties in key order.
+    pub fn rows(&self) -> &[Row<K>] {
+        &self.rows
+    }
+
     /// The samples that weren't idle: what the rows add up to.
     pub fn busy(&self) -> u64 {
         self.samples - self.idle
@@ -209,9 +223,8 @@ impl<K> Ranking<K> {
 }
 
 /// Rank the busy samples by the key of their instruction pointer, which
-/// `key_of` gives (a function, say: its symbol's name, or `None` where
-/// nothing resolves). `key_of` is called once per distinct address, not per
-/// sample (symbol lookup is a scan).
+/// `key_of` gives (a function, say). `key_of` is called once per distinct
+/// address, not per sample.
 pub fn by_function<K: Ord>(samples: &[Sample], mut key_of: impl FnMut(u64) -> K) -> Ranking<K> {
     let mut by_rip: BTreeMap<u64, u64> = BTreeMap::new();
     for s in samples.iter().filter(|s| !s.idle) {
@@ -249,33 +262,30 @@ pub fn all_taken(counts: impl IntoIterator<Item = usize>, want: usize) -> bool {
 
 /// How many polls in a row a CPU may take no tick while another CPU ticks
 /// before [`Silence`] calls it silent (at `perf top`'s 10 ms polls, about
-/// a second of the others' time).
+/// a second of the other CPUs' polls).
 pub const SILENT_POLLS: u32 = 100;
 
 /// Notices CPUs that have stopped taking timer interrupts while a profile
-/// waits for their samples (one stuck with interrupts off, say), by
-/// progress rather than time: a CPU is silent once it has taken no tick
-/// across [`SILENT_POLLS`] polls in a row in each of which some other CPU
-/// took one, and it doesn't have its samples yet. A poll where no CPU
-/// ticked (the whole guest stalled) counts for nothing.
+/// waits for their samples (one stuck with interrupts off, say): a CPU is
+/// silent once it has taken no tick across [`SILENT_POLLS`] polls in a row
+/// in each of which some other CPU took one, and it doesn't have its
+/// samples yet. A poll where no CPU ticked (the whole guest stalled) counts
+/// for nothing. It is a hint for a person, not a verdict: a host that stalls
+/// one vCPU for that long (about a second of the others' polls) makes a
+/// healthy CPU look silent.
 #[derive(Clone, Debug)]
 pub struct Silence {
     last: Vec<u64>,
     still: Vec<u32>,
     said: Vec<bool>,
-    started: bool,
 }
 
 impl Silence {
-    /// For `cpus` CPUs (indices into the slices [`observe`](Self::observe)
-    /// takes).
-    pub fn new(cpus: usize) -> Silence {
-        Silence {
-            last: alloc::vec![0; cpus],
-            still: alloc::vec![0; cpus],
-            said: alloc::vec![false; cpus],
-            started: false,
-        }
+    /// From each CPU's timer interrupts so far (the baseline; the CPUs are
+    /// the indices into the slices [`observe`](Self::observe) takes).
+    pub fn new(baseline: &[u64]) -> Silence {
+        let n = baseline.len();
+        Silence { last: baseline.to_vec(), still: alloc::vec![0; n], said: alloc::vec![false; n] }
     }
 
     /// One poll: each CPU's timer interrupts so far and whether it has all
@@ -283,16 +293,14 @@ impl Silence {
     pub fn observe(&mut self, ticks: &[u64], done: &[bool]) -> Vec<usize> {
         assert!(ticks.len() == self.last.len() && done.len() == self.last.len());
         let moved: Vec<bool> = ticks.iter().zip(&self.last).map(|(t, l)| t != l).collect();
+        let movers = moved.iter().filter(|&&m| m).count();
         self.last.copy_from_slice(ticks);
-        if !core::mem::replace(&mut self.started, true) {
-            return Vec::new();
-        }
         let mut found = Vec::new();
-        for i in 0..moved.len() {
-            let others = moved.iter().enumerate().any(|(j, &m)| j != i && m);
-            if moved[i] || done[i] {
+        for (i, &m) in moved.iter().enumerate() {
+            if m || done[i] {
                 self.still[i] = 0;
-            } else if others {
+            } else if movers > 0 {
+                // Some other CPU ticked (this one didn't).
                 self.still[i] += 1;
                 if self.still[i] >= SILENT_POLLS && !self.said[i] {
                     self.said[i] = true;
@@ -309,21 +317,27 @@ impl Silence {
     }
 }
 
-/// `perf top`'s header line, from what each CPU took (`taken`: (CPU,
-/// samples) pairs), the samples asked for per CPU, the CPUs found silent
-/// and the idle samples among them all. A profile where every CPU took
-/// `want` says `<want> samples per CPU`; any other says what each took,
-/// marking the silent ones.
-pub fn header(want: usize, taken: &[(usize, usize)], silent: &[usize], idle: u64) -> String {
-    let total: u64 = taken.iter().map(|&(_, n)| n as u64).sum();
-    let per_cpu = if all_taken(taken.iter().map(|&(_, n)| n), want) {
+/// What one CPU took in a profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Taken {
+    pub cpu: usize,
+    pub samples: usize,
+}
+
+/// `perf top`'s header line, from what each CPU took, the samples asked
+/// for per CPU, the CPUs found silent and the idle samples among them all.
+/// A profile where every CPU took `want` says `<want> samples per CPU`; any
+/// other says what each took, marking the silent ones.
+pub fn header(want: usize, taken: &[Taken], silent: &[usize], idle: u64) -> String {
+    let total: u64 = taken.iter().map(|t| t.samples as u64).sum();
+    let per_cpu = if all_taken(taken.iter().map(|t| t.samples), want) {
         alloc::format!("{want} samples per CPU")
     } else {
         let counts: Vec<String> = taken
             .iter()
-            .map(|&(c, n)| {
-                let mark = if silent.contains(&c) { " (silent)" } else { "" };
-                alloc::format!("cpu {c}: {n}{mark}")
+            .map(|t| {
+                let mark = if silent.contains(&t.cpu) { " (silent)" } else { "" };
+                alloc::format!("cpu {}: {}{mark}", t.cpu, t.samples)
             })
             .collect();
         alloc::format!("stopped at {} of {want} samples per CPU", counts.join(", "))
@@ -336,18 +350,26 @@ pub fn header(want: usize, taken: &[(usize, usize)], silent: &[usize], idle: u64
 
 /// The functions of a symbol table, sorted by address, for finding the
 /// one an address is in by binary search (a symbol table is a list to
-/// scan: about 10k entries for the kernel).
+/// scan: several thousand functions for the kernel).
 ///
 /// Same answers as `lumen_elf::SymbolTable::lookup` where sized functions
 /// don't overlap: the sized function containing the address, else the
 /// zero-sized one at or below it nearest to it, the first in table order
-/// among equal addresses. Where sized functions overlap, the one starting
-/// nearest below the address wins (a scan takes the first in table order).
+/// among equal addresses. Where sized functions overlap, an address in
+/// several of them resolves to the one starting nearest below it (a scan
+/// takes the first in table order), and an address past an inner
+/// function's end but inside an outer one resolves to the outer one, as a
+/// scan does.
 #[derive(Clone, Debug, Default)]
 pub struct FnIndex<'a> {
     /// (start, size, name), size > 0, by start; equal starts in table order.
     sized: Vec<(u64, u64, &'a str)>,
-    /// (start, name) of the zero-sized ones, likewise.
+    /// For each entry of `sized`, the index of the entry at or before it
+    /// that ends furthest (the earliest such), for addresses past an inner
+    /// function's end.
+    furthest: Vec<usize>,
+    /// (start, name) of the zero-sized ones, by start, one per address (the
+    /// first in table order).
     zero_sized: Vec<(u64, &'a str)>,
 }
 
@@ -362,13 +384,25 @@ impl<'a> FnIndex<'a> {
                 index.sized.push((start, size, name));
             }
         }
-        // Stable: equal starts keep table order.
+        // Stable: equal starts keep table order (and the dedup keeps the
+        // first of them).
         index.sized.sort_by_key(|f| f.0);
         index.zero_sized.sort_by_key(|f| f.0);
+        index.zero_sized.dedup_by_key(|f| f.0);
+        let end = |f: &(u64, u64, &str)| f.0.saturating_add(f.1);
+        let mut best = 0;
+        index.furthest = (0..index.sized.len())
+            .map(|i| {
+                if end(&index.sized[i]) > end(&index.sized[best]) {
+                    best = i;
+                }
+                best
+            })
+            .collect();
         index
     }
 
-    /// How many functions it holds.
+    /// How many functions it holds (zero-sized ones at one address once).
     pub fn len(&self) -> usize {
         self.sized.len() + self.zero_sized.len()
     }
@@ -379,17 +413,21 @@ impl<'a> FnIndex<'a> {
 
     /// The function `addr` is in and the offset into it.
     pub fn lookup(&self, addr: u64) -> Option<(&'a str, u64)> {
+        let contains = |f: &(u64, u64, &str)| addr - f.0 < f.1;
         let end = self.sized.partition_point(|f| f.0 <= addr);
-        if let Some(&(start, _, _)) = end.checked_sub(1).map(|i| &self.sized[i]) {
+        if let Some(last) = end.checked_sub(1) {
+            let start = self.sized[last].0;
             let first = self.sized.partition_point(|f| f.0 < start);
-            if let Some(&(_, _, name)) = self.sized[first..end].iter().find(|f| addr - f.0 < f.1) {
+            if let Some(&(_, _, name)) = self.sized[first..end].iter().find(|f| contains(f)) {
                 return Some((name, addr - start));
+            }
+            let outer = self.sized[self.furthest[last]];
+            if contains(&outer) {
+                return Some((outer.2, addr - outer.0));
             }
         }
         let end = self.zero_sized.partition_point(|f| f.0 <= addr);
-        let &(start, _) = self.zero_sized.get(end.checked_sub(1)?)?;
-        let first = self.zero_sized.partition_point(|f| f.0 < start);
-        let (_, name) = self.zero_sized[first];
+        let &(start, name) = self.zero_sized.get(end.checked_sub(1)?)?;
         Some((name, addr - start))
     }
 }
@@ -554,7 +592,7 @@ mod tests {
 
     #[test]
     fn a_disarm_and_rearm_for_the_same_count_still_drops_a_raced_record() {
-        // PR #212's review: arm(8), claim slot 0, disarm, arm(8) again: the
+        // arm(8), claim slot 0, disarm, arm(8) again: the
         // state's want and len are back where the claim saw them, and only
         // the generation tells the armings apart.
         let b: Buffer<8> = Buffer::new();
@@ -686,9 +724,8 @@ mod tests {
 
     #[test]
     fn a_cpu_is_silent_after_enough_polls_where_only_others_tick() {
-        let mut q = Silence::new(2);
         let (mut t0, t1) = (0u64, 7u64);
-        assert!(q.observe(&[t0, t1], &[false, false]).is_empty(), "the first poll is a baseline");
+        let mut q = Silence::new(&[t0, t1]);
         for poll in 1..SILENT_POLLS {
             t0 += 1;
             assert!(q.observe(&[t0, t1], &[false, false]).is_empty(), "poll {poll}");
@@ -702,8 +739,7 @@ mod tests {
 
     #[test]
     fn a_stalled_guest_a_finished_cpu_or_a_tick_resets_silence() {
-        let mut q = Silence::new(2);
-        q.observe(&[0, 0], &[false, false]);
+        let mut q = Silence::new(&[0, 0]);
         // Nobody ticks: the whole guest stalled, nothing counts.
         for _ in 0..2 * SILENT_POLLS {
             assert!(q.observe(&[0, 0], &[false, false]).is_empty());
@@ -730,20 +766,21 @@ mod tests {
 
     #[test]
     fn header_says_per_cpu_counts_unless_every_cpu_took_its_samples() {
+        let t = |cpu, samples| Taken { cpu, samples };
         assert_eq!(
-            header(500, &[(0, 500), (1, 500)], &[], 600),
+            header(500, &[t(0, 500), t(1, 500)], &[], 600),
             "perf top: 500 samples per CPU on 2 CPUs: 1000 samples, 600 idle, 400 busy"
         );
         assert_eq!(
-            header(10, &[(0, 10)], &[], 10),
+            header(10, &[t(0, 10)], &[], 10),
             "perf top: 10 samples per CPU on 1 CPU: 10 samples, 10 idle, 0 busy"
         );
         assert_eq!(
-            header(500, &[(0, 500), (1, 499)], &[], 0),
+            header(500, &[t(0, 500), t(1, 499)], &[], 0),
             "perf top: stopped at cpu 0: 500, cpu 1: 499 of 500 samples per CPU on 2 CPUs: 999 samples, 0 idle, 999 busy"
         );
         assert_eq!(
-            header(500, &[(0, 212), (3, 0)], &[3], 200),
+            header(500, &[t(0, 212), t(3, 0)], &[3], 200),
             "perf top: stopped at cpu 0: 212, cpu 3: 0 (silent) of 500 samples per CPU on 2 CPUs: 212 samples, 200 idle, 12 busy"
         );
     }
@@ -786,7 +823,7 @@ mod tests {
             (0x600, 0x40, "t"),
         ];
         let index = FnIndex::new(fns);
-        assert_eq!(index.len(), fns.len());
+        assert_eq!(index.len(), fns.len() - 1, "the two zero-sized ones at 0x1f0 kept once");
         for addr in 0..0x700 {
             assert_eq!(index.lookup(addr), scan(&fns, addr), "addr {addr:#x}");
         }
@@ -794,6 +831,52 @@ mod tests {
         assert_eq!(index.lookup(0x618), Some(("t", 0x18)));
         assert_eq!(index.lookup(0x1f8), Some(("z1", 8)), "equal addresses: the first in table order");
         assert!(FnIndex::new([]).lookup(5).is_none());
+    }
+
+    #[test]
+    fn fn_index_resolves_nested_functions() {
+        // An inner function inside an outer one, listed inner first: inside
+        // the inner one both find it; past its end, both find the outer.
+        let fns = [(0x120, 0x10, "inner"), (0x100, 0x100, "outer"), (0x400, 0, "z")];
+        let index = FnIndex::new(fns);
+        for addr in 0x100..0x500 {
+            assert_eq!(index.lookup(addr), scan(&fns, addr), "addr {addr:#x}");
+        }
+        assert_eq!(index.lookup(0x125), Some(("inner", 5)));
+        assert_eq!(index.lookup(0x140), Some(("outer", 0x40)));
+        // Outer listed first: inside the inner one the index takes the
+        // nearest start (the scan, the first listed): the documented case.
+        let fns = [(0x100, 0x100, "outer"), (0x120, 0x10, "inner")];
+        assert_eq!(FnIndex::new(fns).lookup(0x125), Some(("inner", 5)));
+        assert_eq!(scan(&fns, 0x125), Some(("outer", 0x25)));
+    }
+
+    #[test]
+    fn fn_index_keeps_table_order_among_many_aliases() {
+        // 40 sized aliases at each of two starts (sizes growing, so the
+        // first listed that contains an address is the smallest that does)
+        // and 40 zero-sized at each of two more, the starts interleaved in
+        // table order: enough entries, out of order, that an unstable sort
+        // would reorder equal starts.
+        const NAMES: [&str; 40] = [
+            "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7",
+            "b8", "b9", "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "d0", "d1", "d2", "d3", "d4", "d5",
+            "d6", "d7", "d8", "d9",
+        ];
+        let mut fns = Vec::new();
+        for (i, name) in NAMES.iter().enumerate() {
+            fns.push((0x3000, i as u64 + 1, *name));
+            fns.push((0x1000, i as u64 + 1, *name));
+            fns.push((0x4000, 0, *name));
+            fns.push((0x2000, 0, *name));
+        }
+        let index = FnIndex::new(fns.iter().copied());
+        for addr in 0x1000..0x4010 {
+            assert_eq!(index.lookup(addr), scan(&fns, addr), "addr {addr:#x}");
+        }
+        assert_eq!(index.lookup(0x1005), Some(("a5", 5)));
+        assert_eq!(index.lookup(0x3005), Some(("a5", 5)));
+        assert_eq!(index.lookup(0x2005), Some(("a0", 5)));
     }
 
     #[test]

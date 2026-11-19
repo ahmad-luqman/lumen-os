@@ -530,7 +530,7 @@ fn unexpected(frame: &TrapFrame) {
 /// and fatal (bar #BP). Device interrupts are never fatal: the timer and
 /// spurious interrupts are counted, not traced (at 1 kHz they would flood
 /// the trace ring); the timer hands what it interrupted to the profiler
-/// (`perf::on_tick`: one atomic load unless a profile runs), blinks the
+/// (`perf::on_tick`: a call and one atomic load unless a profile runs), blinks the
 /// terminal's cursor on the boot CPU (`term::on_tick`, which never waits
 /// for a lock), then drives the
 /// scheduler (`sched::tick`, which may switch to another thread and return

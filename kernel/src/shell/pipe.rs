@@ -12,6 +12,7 @@
 //! Its usage and error lines go to the console through [`Ctx::fail`] and
 //! end the pipeline; so do the refusals of commands that would wait on the
 //! console unseen: the rhai REPL and demos, `top` without a frame count,
+//! `perf top` (it waits for its samples),
 //! and whatever draws on the screen (`mandelbrot`, `life`, a script's
 //! drawing), which then waits for a key. Each filter takes what came
 //! before; the last one's output is printed in chunks of whole lines
