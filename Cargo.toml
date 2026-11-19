@@ -75,6 +75,19 @@ miniz_oxide = { version = "=0.9.1", default-features = false, features = ["with-
 # kernel is built without SSE).
 zune-png = { version = "=0.5.2", default-features = false }
 zune-core = { version = "=0.5.3", default-features = false }
+# The WASM interpreter for apps (#197; M5). `validate`: `Module::new`
+# checks what it compiles. `portable-dispatch`: wasmi's loop dispatch, whose
+# native stack depth stays constant however long a module runs (host calls
+# aside). This line's `default-features = false` drops `auto-dispatch` (a
+# default), and wasmi then dispatches by tail calls whatever the profile: each
+# instruction's handler calls the next, relying on LLVM to make those calls
+# jumps, which wasmi's build script expects only with debug assertions off.
+# The kernel keeps them on (`profile.release`), and in #197 a
+# 300k-iteration loop overflowed a 64 KiB thread stack that way (ktest
+# app::wasmi_runs_a_long_loop_in_fuel_slices). `auto-dispatch` would pick
+# the loop here too, but would switch back to tail calls if the profile
+# changed: stack safety should not hang on an optimizer.
+wasmi = { version = "=2.0.1", default-features = false, features = ["validate", "portable-dispatch"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

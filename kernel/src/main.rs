@@ -29,6 +29,7 @@
 extern crate alloc;
 
 mod acpi;
+mod app;
 mod arch;
 mod boot;
 mod cmdline;

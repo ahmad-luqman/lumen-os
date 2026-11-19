@@ -1,7 +1,7 @@
 //! The shell's commands: kmon's, with their names and output (`echo`
 //! joins its words with single spaces; `clear` and `colors` need a console
 //! that takes escape codes), plus `history`, `term text`, `vt`, `reboot`,
-//! `shutdown`, `random`, `screenshot` (`crate::screenshot`), the system commands (`cpus`, `mem`, `irqs`, `threads`,
+//! `shutdown`, `random`, `screenshot` (`crate::screenshot`), `wasm` (`crate::app`), the system commands (`cpus`, `mem`, `irqs`, `threads`,
 //! `lspci`, `mouse`, `dmesg`, `date`, `top`: `sysinfo.rs`) and the filters that come after a
 //! `|` (`grep`, `where`, `sort`, `first`, `count`, `select`: `pipe.rs`). A
 //! table the line editor completes from. Each writes to the console that
@@ -93,6 +93,13 @@ pub static COMMANDS: Table<Run> = Table(&[
         usage: "",
         about: "render the desktop font's sample twice: timings, cache, golden check",
         run: crate::font::command,
+    },
+    Command {
+        name: "wasm",
+        args: &[],
+        usage: "",
+        about: "wasmi's checks: a long loop in fuel slices, the call depth limit, float results",
+        run: crate::app::command,
     },
     Command {
         name: "desktop",
