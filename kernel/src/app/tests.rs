@@ -615,7 +615,11 @@ crate::ktest!(
     fn trace_read_edges() {
         use lumen_app_api::limits::TRACE_EVENTS_PER_READ;
         use lumen_app_api::trace::{EVENT_SIZE, HEADER_SIZE, decode_event, decode_header};
-        let cpu = crate::arch::cpu_index() as i32;
+        // CPU 1's ring, not the boot CPU's: lapping that one would break
+        // the trace ktests that read the boot's events from it.
+        const CPU: usize = 1;
+        crate::kassert!(crate::sched::running_on(CPU));
+        let cpu = CPU as i32;
         let one = HEADER_SIZE + EVENT_SIZE;
         // Too small, and exactly one event.
         crate::kassert_eq!(host::read_trace(0, cpu, 0, one - 1), Err(Error::BufferTooSmall));
@@ -624,11 +628,16 @@ crate::ktest!(
         for (stream, c, since) in [(2, cpu, 0), (-1, cpu, 0), (0, -1, 0), (0, 99, 0), (0, cpu, -1)] {
             crate::kassert_eq!(host::read_trace(stream, c, since, one), Err(Error::BadArgument));
         }
-        // Enough events on this CPU's main ring to pass one read's cap,
-        // and to lap the ring, so a read from 0 has missed some.
-        for i in 0..crate::trace::EVENTS as u64 + 10 {
-            crate::ktrace!(crate::trace::Kind::Test, 0x199, i);
-        }
+        // Enough events on that CPU's main ring to pass one read's cap,
+        // and to lap the ring, so a read from 0 has missed some: recorded
+        // by a thread on it.
+        let lap = crate::sched::spawn_on(CPU, "trace-lap", || {
+            for i in 0..crate::trace::EVENTS as u64 + 10 {
+                crate::ktrace!(crate::trace::Kind::Test, 0x199, i);
+            }
+        })
+        .map_err(|_| "no thread on CPU 1")?;
+        lap.join();
         // Every read: a header, then whole events numbered on from
         // `since + missed`, and `next` just past the last.
         let read = |since: u64, len: usize| -> Result<(usize, u64, u64), &'static str> {
