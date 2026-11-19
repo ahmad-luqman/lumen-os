@@ -46,7 +46,7 @@ tests = [
 ]
 
 [[feature]]
-name = "`beep 440 500` plays a 440 Hz tone (within 1%) sounding at least 450 ms into QEMU's wav audiodev, and returns while it plays (`sound` says `playing` right after: from the moment `beep` hands the sound over, so the scenario no longer shows that the thread took it; that the thread plays it is the recording's and the frame counts' to show, and `playing` before it takes it is a ktest with a made-up device); the frames handed to the device are exactly the tone's (a last period's padding not counted: 510 ms), also over a 10 s tone (500 periods), each underrun (a stalled host's) counted in `sound` and said in its warning, logged before it is counted, and at most one per 8 periods (the queue's depth: a driver underrunning every period fails); that none comes on an idle host is not tested"
+name = "`beep 440 500` plays a 440 Hz tone (within 1%) sounding at least 450 ms into QEMU's wav audiodev, and returns while it plays (`sound` says `playing` right after: from the moment `beep` hands the sound over, so the scenario no longer shows that the thread took it; that the thread plays it is the recording's and the frame counts' to show, and `playing` before it takes it is a ktest with a made-up device); the frames handed to the device are exactly the tone's (a last period's padding not counted: 510 ms), also over a 10 s tone (500 periods), each underrun (a stalled host's) counted in `sound` and said in its warning (logged before counted: the order is the code's, not tested), at most one per 8 periods (the queue's depth, tied to sound.rs: a driver underrunning every period fails), none for a beep of 7 periods (all queued, and the source ended, before the first wait); that none comes on a longer sound on an idle host is not tested"
 milestone = "M3"
 tests = [
     "scenario:test_sound::test_tone_is_captured",
@@ -54,10 +54,12 @@ tests = [
     "ktest:lumen_kernel::sound::a_sound_handed_over_shows_playing_before_the_thread_takes_it",
     "scenario:test_sound::test_a_padded_last_period_counts_only_the_sound",
     "scenario:test_sound::test_a_long_tone_plays_every_period",
+    "scenario:test_sound::test_a_beep_shorter_than_the_queue_never_underruns",
+    "scenario:test_sound::test_the_bounds_constants_are_the_kernels",
 ]
 
 [[feature]]
-name = "`play` plays a melody's notes in order at their pitch (within 1%) and tempo (four quarter notes at 120 in 2 s, within 5%), returning once it has played (`sound` idle with it counted); `q` or Ctrl-C after 1 s stops a 16 s melody with under 3 s of it played (`play: stopped`); a newer sound cuts the playing one off (440 Hz then 660 Hz in the recording; counted as replaced) and a `play` cut off says `play: interrupted by a newer sound`, while a sound that has made all its samples plays out (two short rhai beeps 30 ms apart both play); a melody that doesn't parse, or a `beep` the sample rate can't carry, is refused with the reason and nothing plays"
+name = "`play` plays a melody's notes in order at their pitch (within 1%) and tempo (four quarter notes at 120: at least 1.9 s sounding; an underrun only adds silence, so no ceiling), returning once it has played (`sound` idle with it counted); `q` or Ctrl-C after 1 s stops a 16 s melody with no more played than the host's time until the key plus 2 s (`play: stopped`); a newer sound cuts the playing one off (440 Hz then 660 Hz in the recording; counted as replaced) and a `play` cut off says `play: interrupted by a newer sound`, while a sound that has made all its samples plays out (two short rhai beeps 30 ms apart both play); a melody that doesn't parse, or a `beep` the sample rate can't carry, is refused with the reason and nothing plays"
 milestone = "M3"
 tests = [
     "scenario:test_sound::test_melody_notes_in_order",

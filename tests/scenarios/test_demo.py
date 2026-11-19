@@ -145,8 +145,10 @@ def test_life_runs_until_a_key(boot):
     elapsed = time.monotonic() - start
     m.expect(r"lumen> ", 10)
     generations = int(found[1])
-    # At least one (it ran); at most its 20 a second, by a clock the
-    # guest's can't run ahead of. How many in the second is the host's.
+    # At least one (it ran: a guest stalled through the harness's second
+    # would show none, at risk); at most its 20 a second, by a clock the
+    # guest's can't run ahead of, and 5 for those stepped before the harness
+    # saw the start line. How many in the second is the host's.
     assert 1 <= generations <= 20 * elapsed + 5, f"{generations} generations in {elapsed:.2f} s"
     assert "life: press a key" not in m.output
 

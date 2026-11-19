@@ -1579,9 +1579,9 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`).
     every thread with its share of its CPU's ticks; it polls the console
     for a key (`Ctx::poll_key`) between 20 ms sleeps and stops on `q` or
     Ctrl-C (or after `frames` frames). The scenario checks frames at least
-    0.9 s apart and the CPUs' ticks a second together at most the timers'
-    interrupts a second (each tick is one; the timers' 1 kHz is a ktest's).
-    With escape codes each
+    0.9 s apart, each CPU ticking, and the CPUs' ticks a second together
+    within 3 of the timers' interrupts a second (each interrupt is a tick;
+    the timers programmed for 1 kHz are two ktests'). With escape codes each
     frame replaces the last (home, erase; not tested); on plain serial
     frames follow one another as lines.
   - `threads`: every thread (`sched::threads`), its CPU, state and the

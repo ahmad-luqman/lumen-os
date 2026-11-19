@@ -14,7 +14,7 @@ from typing import NamedTuple
 
 import pytest
 from lumen_harness import gui
-from lumen_harness.calibration import unexpected_boot_warnings
+from lumen_harness.calibration import assert_quiet_boot
 from lumen_harness.image import assert_matches_golden, compare
 from lumen_harness.qemu import Devices, Machine
 from lumen_harness.qmp import QmpClient, QmpError, pointer_move_args, qcodes_for
@@ -129,7 +129,7 @@ def test_keys_via_qmp_send_key(boot):
     m.qmp().send_key(["shift"], hold_ms=400)
     gui.confirmed_keys(m, "echo b\n")
     expect_screen(m, r"^lumen> echo b\nb\nlumen>$")
-    assert not (bad := unexpected_boot_warnings(m.output)), "\n".join(bad)
+    assert_quiet_boot(m.output)
 
 
 def test_every_modelled_key_is_confirmed(boot):
@@ -155,7 +155,7 @@ def test_second_layout(boot):
     shells_ready(de, "de")
     echo_physical_yz(de, "zy")
     assert kbd_stats(de).layout == "de"
-    assert not (bad := unexpected_boot_warnings(de.output)), "\n".join(bad)
+    assert_quiet_boot(de.output)
 
 
 def test_an_unknown_keymap_falls_back_to_us(boot):
@@ -208,7 +208,7 @@ def test_keys_held_during_boot_leave_a_working_keyboard(boot):
     gui.confirmed_keys(m, ["ret"])
     echo_physical_yz(m, "yz")
     assert kbd_stats(m).skipped > 0
-    assert not (bad := unexpected_boot_warnings(m.output)), "\n".join(bad)
+    assert_quiet_boot(m.output)
 
 
 def test_every_printable_character_and_backspace(boot):
@@ -390,7 +390,7 @@ def test_mouse_moves_pointer(boot, artifacts, golden_dir):
     wait_mouse(m, wheel="1")
     m.click("wheel-down")
     wait_mouse(m, wheel="0", hwheel="0")
-    assert not (bad := unexpected_boot_warnings(m.output)), "\n".join(bad)
+    assert_quiet_boot(m.output)
 
 
 def pixels(shot: Image.Image, box: tuple[int, int, int, int]) -> list:
@@ -734,7 +734,7 @@ def test_tablet_is_bound_and_the_keyboard_is_not(boot):
     )
     assert re.findall(r"probing virtio-tablet on (\S+)\n", m.output) == [first, second]
     assert MOUSE_HEADER.fullmatch(mouse(m)[0])[1] == first
-    assert not (bad := unexpected_boot_warnings(m.output)), "\n".join(bad)
+    assert_quiet_boot(m.output)
 
 
 def test_an_input_device_without_absolute_axes_is_declined(boot):
@@ -751,7 +751,7 @@ def test_an_input_device_without_absolute_axes_is_declined(boot):
         m.output,
     )
     assert mouse(m)[0] == "mouse: no tablet (QEMU: -device virtio-tablet-pci)"
-    assert not (bad := unexpected_boot_warnings(m.output)), "\n".join(bad)
+    assert_quiet_boot(m.output)
 
 
 def test_mouse_without_a_tablet(boot):

@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 from typing import NamedTuple
 
-from lumen_harness.klog import STAMP, unexpected_warnings
+from lumen_harness.klog import PIT_FALLBACK_WARNING, STAMP, unexpected_warnings
 
 TSC = "tsc"
 TIMER = "local APIC timer"
@@ -286,18 +286,41 @@ def weighed(out: str) -> Weighed | None:
     return w
 
 
-# The fallback when the HPET's calibration said nothing (klog.HOST_TIMED's).
-PIT_FALLBACK = re.compile(
-    rf"(?m)^{STAMP} WARN  time: can't calibrate the tsc against the HPET: [^\n]*; calibrating against the PIT$"
+PIT_FALLBACK = re.compile(rf"(?m)^{STAMP} {PIT_FALLBACK_WARNING}")
+
+
+# What the fallback's line says of the HPET's windows (time.rs's Unusable
+# verdict): fewer than 5 steady when attempts ran out, so its median had no
+# bound left.
+FALLBACK_NUMBERS = re.compile(
+    r"can't calibrate the tsc against the HPET: only (?P<steady>\d+) of (?P<taken>\d+) windows read "
+    r"promptly \(5 wanted\), and the middle ones' end stalls were as long as the rest of their windows, "
+    r"so the rate says nothing"
 )
+
+
+def fallback(out: str) -> bool:
+    """Whether boot fell back to the PIT because the HPET's calibration said
+    nothing (klog.HOST_TIMED's warning), the line checked against its own
+    numbers: fewer than 5 steady of all 20 windows (time::ATTEMPTS), at
+    most once, and no weighing besides (the kernel does one or the other)."""
+    lines = [m[0] for m in PIT_FALLBACK.finditer(out)]
+    assert len(lines) <= 1, lines
+    if not lines:
+        return False
+    said = FALLBACK_NUMBERS.search(lines[0])
+    assert said and int(said["steady"]) < 5 and said["taken"] == "20", lines[0]
+    assert WEIGHING_START not in out, (lines[0], "and a weighing")
+    return True
 
 
 def tsc_reference(out: str) -> str:
     """Which clock boot calibrated the TSC against, on a machine with an
-    HPET: the PIT if the HPET's calibration said nothing, or was imprecise
-    and the PIT's could be off less (`weighed`, checked); else the HPET. A
-    loaded host can make either happen; which follows is the code's."""
-    if PIT_FALLBACK.search(out):
+    HPET: the PIT if the HPET's calibration said nothing (`fallback`,
+    checked), or was imprecise and the PIT's could be off less (`weighed`,
+    checked); else the HPET. A loaded host can make either happen; which
+    follows is the code's."""
+    if fallback(out):
         return PIT
     w = weighed(out)
     return HPET if w is None else w.kept
@@ -306,12 +329,23 @@ def tsc_reference(out: str) -> str:
 def unexpected_boot_warnings(out: str) -> list[str]:
     """`klog.unexpected_warnings` for a boot's output (one boot), its
     calibration lines first checked against the numbers they print
-    (`verdict` for each clock, `weighed`): a loaded host decides whether
-    they are logged, not what they say."""
+    (`verdict` for each clock, `weighed`, `fallback`): a loaded host decides
+    whether they are logged, not what they say. Each must start its line
+    (those checks read whole lines; the warnings are found anywhere)."""
+    mid_line = re.findall(rf"[^\n]{STAMP} WARN  time: [^\n]*", out)
+    assert not mid_line, mid_line
     verdict(out, TSC)
     verdict(out, TIMER)
     weighed(out)
+    fallback(out)
     return unexpected_warnings(out)
+
+
+def assert_quiet_boot(out: str) -> None:
+    """No warning or error in a boot's output `out` but those a loaded host
+    can cause on its own (`unexpected_boot_warnings`)."""
+    bad = unexpected_boot_warnings(out)
+    assert not bad, "\n".join(bad)
 
 
 def no_other_warnings(out: str) -> None:

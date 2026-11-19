@@ -195,20 +195,14 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     time::sleep(10_000_000);
     // A working timer's first tick can be late under QEMU's TCG on a loaded
     // host (none in the first 10 ms, then ticking normally, #45): wait up to
-    // 100 ms in all before warning that it doesn't tick, saying the longest
-    // the CPU itself went unrun meanwhile (a host's stall, in which a tick
-    // can be lost: what tells a stalled host from a timer that doesn't tick).
+    // 100 ms in all before warning that it doesn't tick.
     if time::ticks() == 0 {
         let late = time::now_ns();
-        match time::wait_for_tick_gaps(0, 90_000_000) {
-            (true, _) => {
-                let ms = (time::now_ns() - late) / 1_000_000 + 10;
-                info!(target: "irq", "first timer interrupt after about {ms} ms (late, not missing)");
-            }
-            (false, gap) => {
-                let us = gap / 1_000;
-                warn!(target: "irq", "no timer interrupt in 100 ms (the CPU's reads at most {us} us apart)");
-            }
+        if time::wait_for_tick(0, 90_000_000) {
+            let ms = (time::now_ns() - late) / 1_000_000 + 10;
+            info!(target: "irq", "first timer interrupt after about {ms} ms (late, not missing)");
+        } else {
+            warn!(target: "irq", "no timer interrupt in 100 ms");
         }
     }
     ktrace!(Kind::BootPhase, BootPhase::Time);

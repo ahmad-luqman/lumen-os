@@ -14,25 +14,33 @@ from lumen_harness.klog import (
 
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES = [(e, h) for h in HOST_TIMED for e in h.examples]
+NEAR_MISSES = [(e, h) for h in HOST_TIMED for e in h.near_misses]
 
 
 @pytest.mark.parametrize("h", HOST_TIMED, ids=lambda h: h.text)
-def test_each_host_timed_text_is_in_the_kernel_once(h):
+def test_each_host_timed_text_is_in_the_kernel_once_with_an_example(h):
     assert (ROOT / h.source).read_text().count(h.text) == 1, (h.source, h.text)
-
-
-def test_each_host_timed_warning_has_an_example():
-    assert all(h.examples for h in HOST_TIMED)
+    assert h.examples and h.near_misses, h.text
 
 
 @pytest.mark.parametrize(("example", "h"), EXAMPLES, ids=[e[:60] for e, _ in EXAMPLES])
 def test_each_example_is_left_out_and_matches_its_own_pattern_only(example, h):
     stamped = f"[    1.204210] {example}"
-    assert is_host_timed(stamped) and unexpected_warnings(stamped + "\n") == []
+    assert (
+        is_host_timed(stamped, accel="tcg")
+        and unexpected_warnings(stamped + "\n", accel="tcg") == []
+    )
     assert [g for g in HOST_TIMED if re.match(g.pattern, without_stamp(stamped))] == [h]
     # And it is the kernel's text, its placeholders filled in.
     words = re.split(r"\{[^}]*\}", h.text)
     assert re.search(".+".join(map(re.escape, words)), example), (h.text, example)
+
+
+@pytest.mark.parametrize(("near", "h"), NEAR_MISSES, ids=[e[:60] for e, _ in NEAR_MISSES])
+def test_each_near_miss_is_unexpected(near, h):
+    # A warning beside the host-timed one (its file's, or its subsystem's)
+    # stays unexpected: the pattern isn't the whole subsystem.
+    assert not is_host_timed(f"[    1.204210] {near}", accel="tcg"), (h.text, near)
 
 
 def test_other_warnings_and_errors_are_unexpected():
@@ -40,30 +48,31 @@ def test_other_warnings_and_errors_are_unexpected():
         "[    0.100000] INFO  boot: boot complete\n"
         "[    0.200000] WARN  boot: timeline: kmain 0.1 ms (incomplete)\n"
         "[    0.300000] ERROR mouse: 0000:00:03.0: the mouse thread (a bug): not held\n"
-        "[    0.400000] WARN  irq: no timer interrupt in 100 ms (the CPU's reads at most 2000 us apart)\n"
+        "[    0.400000] WARN  sound: a sound found the queue empty 2 times (underruns)\n"
         "[    0.500000] WARN  irq: unexpected interrupt on vector 0x8f\n"
     )
-    assert unexpected_warnings(out) == [
+    assert unexpected_warnings(out, accel="kvm") == [
         "[    0.200000] WARN  boot: timeline: kmain 0.1 ms (incomplete)",
         "[    0.300000] ERROR mouse: 0000:00:03.0: the mouse thread (a bug): not held",
         "[    0.500000] WARN  irq: unexpected interrupt on vector 0x8f",
     ]
-    assert unexpected_warnings(out, "irq") == [
+    assert unexpected_warnings(out, "irq", accel="kvm") == [
         "[    0.500000] WARN  irq: unexpected interrupt on vector 0x8f"
     ]
-    assert unexpected_warnings(out, "time") == []
+    assert unexpected_warnings(out, "time", accel="kvm") == []
 
 
-def test_a_first_tick_missing_with_the_cpu_running_throughout_is_unexpected_under_kvm(monkeypatch):
-    # Under KVM, reads under a tick period apart all along: the timer didn't
-    # tick, no host stalled the CPU past it. Under TCG the host can starve
-    # QEMU's timer thread meanwhile: the host's either way.
-    line = "[    0.400000] WARN  irq: no timer interrupt in 100 ms (the CPU's reads at most 999 us apart)"
-    monkeypatch.setenv("LUMEN_ACCEL", "kvm")
-    assert unexpected_warnings(line + "\n") == [line]
-    assert is_host_timed(line.replace("999 us", "1000 us"))
-    monkeypatch.setenv("LUMEN_ACCEL", "tcg")
-    assert is_host_timed(line)
+def test_a_first_tick_missing_is_the_hosts_only_under_tcg():
+    # Under KVM a tick due while the vCPU is descheduled is delivered as it
+    # resumes: no stall makes the first one missing for 100 ms. Under TCG
+    # the host can starve QEMU's timer thread meanwhile. Any accelerator
+    # but TCG counts as KVM (fails closed).
+    line = "[    0.400000] WARN  irq: no timer interrupt in 100 ms"
+    for accel in ("kvm", "kvm,kernel-irqchip=split", "hvf"):
+        assert unexpected_warnings(line + "\n", accel=accel) == [line], accel
+    assert is_host_timed(line, accel="tcg")
+    # And a longer line is something else, even under TCG.
+    assert not is_host_timed(line + " on cpu 3", accel="tcg")
 
 
 def test_a_broken_pit_is_unexpected():
@@ -73,7 +82,7 @@ def test_a_broken_pit_is_unexpected():
         "[    1.000000] WARN  time: tsc calibration: against the HPET within 1.4% (past the 1.0% allowed), "
         "against the PIT it failed (it didn't count through a window): kept the HPET"
     )
-    assert unexpected_warnings(line + "\n") == [line]
+    assert unexpected_warnings(line + "\n", accel="tcg") == [line]
 
 
 def test_a_warning_after_part_of_a_line_is_found():
@@ -81,12 +90,6 @@ def test_a_warning_after_part_of_a_line_is_found():
     assert unexpected_warnings(out) == [
         "[    0.200000] WARN  boot: timeline: kmain 0.1 ms (incomplete)"
     ]
-
-
-def test_a_host_timed_text_with_more_after_it_is_still_unexpected_where_anchored():
-    # The irq warning is matched whole: a longer line is something else.
-    out = "[    0.400000] WARN  irq: no timer interrupt in 100 ms (the CPU's reads at most 2000 us apart) on cpu 3\n"
-    assert unexpected_warnings(out) == [out.rstrip("\n")]
 
 
 def test_the_underrun_count_is_read_from_the_warning():

@@ -1049,37 +1049,17 @@ pub fn ticks() -> u64 {
     idt::ticks()
 }
 
-/// Wait up to `ns` nanoseconds for [`ticks`] to move past `seen`: whether it
-/// did, and the longest gap between two of the wait's own reads of the TSC,
-/// in ns: a gap of a tick period or more is time the CPU
-/// didn't run (a host stalling the vCPU), in which a tick could have come
-/// and gone unseen by the end of the wait; shorter gaps throughout mean the
-/// timer itself didn't tick. Panics before [`init`].
-#[must_use]
-pub fn wait_for_tick_gaps(seen: u64, ns: u64) -> (bool, u64) {
-    let tsc = tsc().expect("time::wait_for_tick_gaps before time::init");
-    let limit = tsc.ticks(ns);
-    let start = arch::rdtsc();
-    let (mut last, mut longest) = (start, 0);
-    while ticks() == seen {
-        let now = arch::rdtsc();
-        longest = longest.max(now.wrapping_sub(last));
-        last = now;
-        if now.wrapping_sub(start) >= limit {
-            break;
-        }
-        core::hint::spin_loop();
-    }
-    (ticks() != seen, tsc.ns(longest))
-}
-
 /// Wait up to `ns` nanoseconds for [`ticks`] to move past `seen`; whether it
-/// did (ktests). Panics before [`init`] (the timer doesn't tick yet, and the
-/// wait couldn't be bounded).
-#[cfg(feature = "ktest")]
+/// did. Panics before [`init`] (the timer doesn't tick yet, and the wait
+/// couldn't be bounded).
 #[must_use]
 pub fn wait_for_tick(seen: u64, ns: u64) -> bool {
-    wait_for_tick_gaps(seen, ns).0
+    let limit = tsc().expect("time::wait_for_tick before time::init").ticks(ns);
+    let start = arch::rdtsc();
+    while ticks() == seen && arch::rdtsc().wrapping_sub(start) < limit {
+        core::hint::spin_loop();
+    }
+    ticks() != seen
 }
 
 /// A window pause for the ktests: spins `ns` at `at`, as a host descheduling
@@ -2020,23 +2000,6 @@ fn with_one_shot_timer<T>(f: impl FnOnce() -> T) -> Result<T, &'static str> {
         f()
     })
 }
-
-crate::ktest!(
-    fn a_wait_for_a_tick_that_never_comes_says_its_longest_gap() {
-        // With interrupts off no tick is taken: the wait gives up, and its
-        // longest gap between reads is some of the time it took (main.rs
-        // prints it with the first tick's warning, which lumen_harness
-        // excuses only past a tick period). How long it is, a host decides.
-        use crate::kassert;
-        let _off = arch::irq::push_off();
-        let start = now_ns();
-        let (ticked, gap) = wait_for_tick_gaps(ticks(), 2_000_000);
-        let took = now_ns() - start;
-        crate::ktest::diag(format_args!("longest gap {gap} ns of {took} ns"));
-        kassert!(!ticked && gap > 0 && gap <= took);
-        Ok(())
-    }
-);
 
 crate::ktest!(
     fn a_paused_timer_reading_is_not_steady() {

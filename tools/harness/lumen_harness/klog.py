@@ -60,6 +60,15 @@ def without_stamp(line: str) -> str:
     return re.sub(rf"^{STAMP} ", "", line)
 
 
+# The HPET's calibration said nothing and the PIT's is taken instead
+# (calibration.tsc_reference reads it).
+PIT_FALLBACK_WARNING = (
+    r"WARN  time: can't calibrate the tsc against the HPET: .*; calibrating against the PIT$"
+)
+# A sound's underruns, its count as group `n` (test_sound adds them up).
+UNDERRUN_WARNING = r"WARN  sound: a sound found the queue empty (?P<n>\d+) times \(underruns\)"
+
+
 @dataclass(frozen=True)
 class HostTimed:
     """A warning a loaded host can cause on its own: stalling the vCPU
@@ -70,16 +79,18 @@ class HostTimed:
     # its start.
     pattern: str
     # The kernel file that logs it, and text its format string holds, once
-    # in that file; and lines as the kernel prints them, each matching this
-    # pattern only (tests/harness/test_klog.py ties the four).
+    # in that file; lines in the kernel's words (a calibration's windows
+    # made up), each matching this pattern only; and lines that must not
+    # match (other warnings near it). tests/harness/test_klog.py ties them.
     source: str
     text: str
     examples: tuple[str, ...]
+    near_misses: tuple[str, ...]
     # Why the host decides it, and what judges it instead.
     why: str
-    # A further decision from the line's own numbers (its pattern's match),
-    # if only some of what matches is the host's.
-    holds: Callable[[re.Match[str]], bool] | None = None
+    # If only some runs' lines are the host's: a decision from the match and
+    # the accelerator the run used.
+    holds: Callable[[re.Match[str], str], bool] | None = None
 
 
 HOST_TIMED = (
@@ -99,6 +110,12 @@ HOST_TIMED = (
                 "(tsc/reference/polls/start_gap/end_gap: 1/2/3/4/5)"
             ),
         ),
+        (
+            (
+                "WARN  time: tsc calibration: against the HPET within 1.4% (past the 1.0% allowed), against the "
+                "PIT it failed (it didn't count through a window): kept the HPET"
+            ),
+        ),
         "stalls next to a calibration's reads widen its windows' bounds past the clock's tolerance "
         "(#158's audit); calibration.verdict checks the line against its own numbers wherever "
         "unexpected_boot_warnings runs, and warned_exactly_when_past against the windows in test_time",
@@ -114,10 +131,13 @@ HOST_TIMED = (
                 "allowed (tsc/reference/polls/start_gap/end_gap: 1/2/3/4/5)"
             ),
         ),
+        (
+            "WARN  time: lumen.stall_timer_windows=x: not <end ppm>[,<start ppm>], each at most 10000000; ignored",
+        ),
         "the timer's bound past its tolerance through a stalled TSC calibration's; judged as the one above",
     ),
     HostTimed(
-        r"WARN  time: can't calibrate the tsc against the HPET: .*; calibrating against the PIT$",
+        PIT_FALLBACK_WARNING,
         "kernel/src/time.rs",
         "{judged}; calibrating against the PIT",
         (
@@ -127,20 +147,23 @@ HOST_TIMED = (
                 "(tsc/reference/polls/start_gap/end_gap: 1/2/3/4/5); calibrating against the PIT"
             ),
         ),
-        "the HPET's windows stalled until its median had no bound; the PIT's calibration that follows "
-        "is judged as any is (calibration.tsc_reference takes it as the boot's reference)",
+        (
+            "WARN  time: the HPET at 0xfed00000 is unusable (it doesn't count); calibrating against the PIT",
+        ),
+        "the HPET's windows stalled until its median had no bound; calibration.fallback checks the "
+        "line's numbers say so, and tsc_reference takes the PIT as the boot's reference",
     ),
     HostTimed(
-        r"WARN  irq: no timer interrupt in 100 ms \(the CPU's reads at most (?P<us>\d+) us apart\)$",
+        r"WARN  irq: no timer interrupt in 100 ms$",
         "kernel/src/main.rs",
-        "no timer interrupt in 100 ms (the CPU's reads at most {us} us apart)",
-        ("WARN  irq: no timer interrupt in 100 ms (the CPU's reads at most 31000 us apart)",),
-        "the first tick lost to the host. Under KVM the timer runs in the host's kernel and only a stall "
-        "of the vCPU loses a tick: host-timed only if the CPU went a tick period (1 ms) or more between "
-        "its own reads while it waited (shorter gaps throughout: the timer itself didn't tick). Under "
-        "TCG the timer is QEMU's own thread, which a loaded host starves while the vCPU runs on (#45): "
-        "host-timed whatever the gaps",
-        holds=lambda m: int(m["us"]) >= 1_000 or default_accel() != "kvm",
+        "no timer interrupt in 100 ms",
+        ("WARN  irq: no timer interrupt in 100 ms",),
+        ("WARN  irq: unexpected interrupt on vector 0x8f",),
+        "under TCG only: QEMU's timer is its own thread there, which a loaded host can starve while the "
+        "vCPU runs on (#45). Under KVM the timer is the host kernel's, and a tick due while the vCPU is "
+        "descheduled is delivered as it resumes: a stall delays the first tick, never loses it, so the "
+        "warning is the code's (unexpected under any other accelerator: fails closed)",
+        holds=lambda _m, accel: accel == "tcg",
     ),
     HostTimed(
         r"WARN  shell: serial prompt held: .* not yet waiting for keys \(still waiting\)$",
@@ -149,38 +172,43 @@ HOST_TIMED = (
         (
             "WARN  shell: serial prompt held: shell-vt2 (ready) not yet waiting for keys (still waiting)",
         ),
+        ("WARN  shell: top left the screen paused; took it back",),
         "a screen shell's thread stalled past the prompt's 5 s warning; the ktest "
         "shell::the_serial_prompt_waits_on_past_its_warning judges the wait (test_smp and test_shell "
         "still assert it never comes)",
     ),
     HostTimed(
-        r"WARN  sound: a sound found the queue empty (?P<n>\d+) times \(underruns\)$",
+        UNDERRUN_WARNING + "$",
         "kernel/src/sound.rs",
         "a sound found the queue empty {} times (underruns)",
         ("WARN  sound: a sound found the queue empty 3 times (underruns)",),
-        "the sound thread stalled past the 160 ms queued; test_sound checks the count `sound` shows is "
-        "the warnings' sum, and at most one per 8 periods (the queue's depth)",
+        ("WARN  sound: 0000:00:05.0: playing failed: no answer; the device is given up",),
+        "the sound thread late past the 160 ms queued (or QEMU returning periods in a burst after a "
+        "stall); test_sound checks the count `sound` shows is the warnings' sum, at most one per 8 "
+        "periods (the queue's depth), and none for a sound of 8 periods or fewer",
     ),
 )
-# The underrun warning (HOST_TIMED's), its count as group `n`.
-UNDERRUNS = re.compile(HOST_TIMED[-1].pattern.rstrip("$"))
+UNDERRUNS = re.compile(UNDERRUN_WARNING)
 
 
-def is_host_timed(line: str) -> bool:
-    """Whether log line `line` (its stamp optional) is a `HOST_TIMED` warning."""
+def is_host_timed(line: str, accel: str | None = None) -> bool:
+    """Whether log line `line` (its stamp optional) is a `HOST_TIMED` warning,
+    for a run under `accel` (by default the scenarios', `qemu.default_accel`)."""
+    accel = accel or default_accel()
     rest = without_stamp(line)
     for h in HOST_TIMED:
         m = re.match(h.pattern, rest)
-        if m and (h.holds is None or h.holds(m)):
+        if m and (h.holds is None or h.holds(m, accel)):
             return True
     return False
 
 
-def unexpected_warnings(out: str, target: str | None = None) -> list[str]:
+def unexpected_warnings(out: str, target: str | None = None, accel: str | None = None) -> list[str]:
     """The ERROR and WARN lines in `out` (only `target`'s, if given) that
-    aren't host-timed (`HOST_TIMED`): what a run that should be quiet must
-    not log, however loaded its host. A line is found wherever it starts
-    (it can follow part of a line on serial), from its stamp."""
+    aren't host-timed (`HOST_TIMED`) for a run under `accel`: what a run
+    that should be quiet must not log, however loaded its host. A line is
+    found wherever it starts (it can follow part of a line on serial), from
+    its stamp."""
     tag = re.escape(target) if target else r"[^ \n]+"
     lines = re.findall(rf"{STAMP} (?:ERROR|WARN ) {tag}: [^\n]*", out)
-    return [line for line in lines if not is_host_timed(line)]
+    return [line for line in lines if not is_host_timed(line, accel)]

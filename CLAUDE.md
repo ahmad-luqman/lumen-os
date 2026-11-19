@@ -441,6 +441,7 @@ own PR that updates that doc first.
   `calibration.py` (a boot calibration's verdict line, and the TSC's
   HPET-or-PIT choice, read back and checked against the numbers they print:
   `judged`, `verdict`, `weighed`, `no_other_warnings`, `warned_exactly_when_past`;
+  `fallback`, `tsc_reference`, `unexpected_boot_warnings`, `assert_quiet_boot`;
   the clocks' tolerances, and `agree`: two rates within 2% or their bounds,
   `CANT_TELL_PPM` the most those may add up to), `clock_diags.py` (the
   clock cross-check ktests' diagnostics, `check_clock_diags`),
@@ -455,8 +456,7 @@ own PR that updates that doc first.
   `PROMPT`), `klog.py` (the kernel log line's format, as kernel/src/klog.rs
   prints it; `HOST_TIMED`, the warnings a loaded host can cause on its own,
   each tied to the kernel's text, and `unexpected_warnings`, a run's "no
-  warning" check without them; `calibration.unexpected_boot_warnings` checks
-  a boot's calibration lines first).
+  warning" check without them).
 - `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests,
   and `test_scenario_typing.py`, a lint: a raw key in a scenario needs
   `# unconfirmed: <why>`, and lumen_harness types raw only where it

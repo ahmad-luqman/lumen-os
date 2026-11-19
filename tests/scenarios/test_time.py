@@ -173,8 +173,8 @@ def ticks(m) -> tuple[int, int, int, int]:
 
 
 def test_boot_calibrates_the_tsc_against_the_clock_it_chose(boot):
-    # The HPET on q35, unless a loaded host made its calibration say
-    # nothing or less than the PIT's (calibration.tsc_reference).
+    # The HPET on q35, unless a loaded host left its calibration with no
+    # bound, or less precise than the PIT's (calibration.tsc_reference).
     m = boot("qemutest")
     line = m.expect(TSC_LINE, BOOT_TIMEOUT)
     assert line[3] == tsc_reference(m.output), line[0]
@@ -212,9 +212,8 @@ def test_timer_interrupts_counted(boot):
     # sleep busy-waited then; it now halts in the idle thread).
     assert after - before >= 1, (before, after)
     assert strays == [0, 0, 0]
-    # No irq warning but the one a slow first tick logs when a host stalled
-    # the CPU past a tick period meanwhile (klog.HOST_TIMED: main.rs prints
-    # the longest gap between its reads).
+    # No irq warning but, under TCG, the one a first tick missing for 100 ms
+    # logs (klog.HOST_TIMED: a loaded host can starve QEMU's timer thread).
     assert not (bad := unexpected_warnings(m.output, "irq")), "\n".join(bad)
 
 

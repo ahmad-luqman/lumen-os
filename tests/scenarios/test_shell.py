@@ -629,9 +629,9 @@ def test_top_refreshes_and_quits(boot):
     # On plain serial, `top` prints a frame a second as lines (the CPUs and
     # how busy, interrupt rates, the heap, the threads), until `q`. Under
     # -smp 2: frames at least 0.9 s apart by the kernel's own clock (it waits
-    # a second from the last; a stall between a frame's counts and its
-    # printed time could show less, which none has), and the CPUs' ticks a
-    # share of the timers' interrupts over the same span.
+    # a second from the last; a stall of about 100 ms between a frame's
+    # counts and its printed uptime could show less: at risk on a busy
+    # host), and the CPUs' ticks the timers' interrupts over the same span.
     m = shells(boot, extra=["-smp", "2"])
     start = len(m.output)
     m.send_line("top")
@@ -646,20 +646,22 @@ def test_top_refreshes_and_quits(boot):
     assert tenths(second) - tenths(first) >= 9, (first[0], second[0])
     assert tenths(third) - tenths(second) >= 9, (second[0], third[0])
     frame = m.output[second.end() : third.start()]
-    assert re.search(r"^\s+0\s+\d+%\s+\d+$", frame, re.MULTILINE), frame
-    # Both CPUs ticked, and their ticks/s together are at most the timers'
-    # interrupts/s (one span, so the same scale): each tick is one of them.
-    # Not a rate: how often a stalled vCPU's timer fires is the host's (each
-    # CPU's timer at 1 kHz is the ktest sched::ap_timers_are_programmed_for_1_khz's).
-    # The 3: `top` reads the ticks, then the interrupts, so a tick between
-    # the two reads counts in one frame's ticks and the frame before's
-    # interrupts (a stall there of most of a second could add more).
+    # Both CPUs ticked, and their ticks/s together are the timers'
+    # interrupts/s (one span, so the same scale): each timer interrupt is a
+    # tick of the CPU it came to (sched::tick, once its scheduler runs). Not
+    # a rate: how often a stalled vCPU's timer fires is the host's (each
+    # timer programmed for 1 kHz is the ktests
+    # time::the_timer_is_programmed_for_1_khz's and
+    # sched::ap_timers_are_programmed_for_1_khz's). The 3: `top` reads the
+    # ticks, then the interrupts, so a tick between the two reads counts in
+    # one frame's ticks and the frame before's interrupts (a stall of a few
+    # ms there could add more: at risk on a busy host).
     bsp = re.search(r"^\s+0\s+\d+%\s+(\d+)$", frame, re.MULTILINE)
     ap = re.search(r"^\s+1\s+\d+%\s+(\d+)$", frame, re.MULTILINE)
     timer = re.search(r"^  irqs/s: .*local APIC timer (\d+)", frame, re.MULTILINE)
     assert bsp and ap and timer, frame
     assert int(bsp[1]) > 0 and int(ap[1]) > 0, frame
-    assert int(bsp[1]) + int(ap[1]) <= int(timer[1]) + 3, frame
+    assert abs(int(bsp[1]) + int(ap[1]) - int(timer[1])) <= 3, frame
     assert re.search(r"^  heap .* used of .* in \d+ allocations; frames ", frame, re.MULTILINE), (
         frame
     )

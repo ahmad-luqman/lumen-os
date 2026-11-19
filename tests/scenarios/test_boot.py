@@ -2,7 +2,7 @@
 
 import re
 
-from lumen_harness.calibration import unexpected_boot_warnings
+from lumen_harness.calibration import assert_quiet_boot
 from lumen_harness.klog import LEVEL, stamp_capturing
 from lumen_harness.qemu import EXIT_SUCCESS
 
@@ -25,7 +25,7 @@ def test_boot_reaches_logger(boot):
     # (lumen_harness.klog.HOST_TIMED; the calibrations' checked against their
     # own numbers), and no "ERROR" anywhere, log line or not.
     out = m.output
-    assert not (bad := unexpected_boot_warnings(out)), "\n".join(bad)
+    assert_quiet_boot(out)
     assert "ERROR" not in out, "boot logged an error"
 
 
