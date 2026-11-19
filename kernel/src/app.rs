@@ -29,7 +29,7 @@ mod tests;
 #[cfg(feature = "ktest")]
 mod wire;
 
-pub use runtime::{apps, kill, records, run};
+pub use runtime::{apps, kill, run, table};
 
 /// An app embedded in the kernel: its name (its file's stem), the name its
 /// thread runs under (`app:<name>`), and its module's bytes.

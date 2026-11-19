@@ -21,8 +21,8 @@ use core::hint::black_box;
 use lumen_app_api::end::{EndReason, Outcome};
 use lumen_app_api::host::{FUNCTIONS, MODULE, Ty};
 use lumen_app_api::limits::{
-    APP_OVERHEAD, BYTE_FUEL, CALL_FUEL, CODE_FACTOR, LOG_FUEL, MEMORY_PAGES, MODULE_BYTES, PAGE_BYTES, SLICE_FUEL,
-    STORE_BYTES, TABLE_ELEMENTS, VALUE_STACK_BYTES,
+    APP_OVERHEAD, BYTE_FUEL, CALL_FUEL, CODE_FACTOR, EVENT_FUEL, LOG_FUEL, MEMORY_PAGES, MODULE_BYTES, PAGE_BYTES,
+    SLICE_FUEL, STORE_BYTES, TABLE_ELEMENTS, VALUE_STACK_BYTES,
 };
 use lumen_app_api::{Error, Grants, manifest, text};
 use wasmi::{Engine, Linker, Module, Store};
@@ -41,24 +41,18 @@ fn name(s: &str) -> Vec<u8> {
     out
 }
 
+/// A section: its id, its size, its body.
+fn frame(id: u8, body: &[u8]) -> Vec<u8> {
+    [vec![id], leb(body.len() as u32), body.to_vec()].concat()
+}
+
+/// A section of `items`, counted.
 fn section(id: u8, items: &[Vec<u8>]) -> Vec<u8> {
-    let mut body = leb(items.len() as u32);
-    for i in items {
-        body.extend_from_slice(i);
-    }
-    let mut out = vec![id];
-    out.extend(leb(body.len() as u32));
-    out.extend(body);
-    out
+    frame(id, &[leb(items.len() as u32), items.concat()].concat())
 }
 
 fn custom(section_name: &str, payload: &[u8]) -> Vec<u8> {
-    let mut body = name(section_name);
-    body.extend_from_slice(payload);
-    let mut out = vec![0];
-    out.extend(leb(body.len() as u32));
-    out.extend(body);
-    out
+    frame(0, &[name(section_name), payload.to_vec()].concat())
 }
 
 /// A memory's (or table's) limits: `min`, and `max` if any.
@@ -103,6 +97,8 @@ struct Spec {
     export_memory: bool,
     export_main: bool,
     start: bool,
+    /// `lumen_main`'s locals (their vector's bytes: none by default).
+    locals: Vec<u8>,
     /// `lumen_main`'s body (without locals or `end`).
     body: Vec<u8>,
     manifests: Vec<&'static [u8]>,
@@ -123,6 +119,7 @@ impl Default for Spec {
             export_memory: true,
             export_main: true,
             start: false,
+            locals: vec![0x00],
             body: vec![0x41, 0x00], // i32.const 0
             manifests: vec![b"caps="],
             padding: 0,
@@ -176,13 +173,9 @@ impl Spec {
         }
         m.extend(section(7, &exports));
         if self.start {
-            let mut start = vec![8];
-            let idx = leb(self.func_imports + 1);
-            start.extend(leb(idx.len() as u32));
-            start.extend(idx);
-            m.extend(start);
+            m.extend(frame(8, &leb(self.func_imports + 1)));
         }
-        let main_body = [vec![0x00], self.body.clone(), vec![0x0b]].concat();
+        let main_body = [self.locals.clone(), self.body.clone(), vec![0x0b]].concat();
         let mut bodies = vec![[leb(main_body.len() as u32), main_body].concat()];
         if self.start {
             bodies.push(vec![0x02, 0x00, 0x0b]);
@@ -206,6 +199,30 @@ fn func_import(module: &str, field: &str, ty: u8) -> Vec<u8> {
 /// A test app's state (not in the table).
 fn test_state() -> Arc<AppState> {
     Arc::new(AppState::new(0, "test"))
+}
+
+/// `bytes` loaded on this thread for `state`, holding `grants`.
+fn load_as(
+    bytes: &[u8],
+    state: &Arc<AppState>,
+    grants: Grants,
+) -> Result<(Store<runtime::AppCtx>, wasmi::TypedFunc<(), i32>), &'static str> {
+    runtime::load(bytes, runtime::new_ctx(state.clone(), grants, Vec::new())).map_err(|_| "the module didn't load")
+}
+
+/// An `i32.const` of `n` (signed LEB128).
+fn i32_const(n: i32) -> Vec<u8> {
+    let mut out = vec![0x41];
+    let mut n = n as i64;
+    loop {
+        let b = (n & 0x7f) as u8;
+        n >>= 7;
+        if (n == 0 && b & 0x40 == 0) || (n == -1 && b & 0x40 != 0) {
+            out.push(b);
+            return out;
+        }
+        out.push(b | 0x80);
+    }
 }
 
 /// What `run` does with a module before its thread runs it, then the load
@@ -346,17 +363,14 @@ crate::ktest!(
         for (how, spec) in probes() {
             let bytes = spec.bytes();
             // Without a kill: args_len's 0 is lumen_main's result.
-            let state = test_state();
-            let (mut store, main) =
-                runtime::load(&bytes, runtime::new_ctx(state, Grants::log(), Vec::new())).map_err(|_| "no load")?;
+            let (mut store, main) = load_as(&bytes, &test_state(), Grants::log())?;
             let ended = runtime::run_slices(&mut store, main);
             crate::ktest::diag(format_args!("{how}: {}", ended.what()));
             crate::kassert_eq!(ended, EndReason::Exited(0));
             // With the kill flag set: the call's entry ends the app, and
             // it's a kill however wasmi hands the host error back.
             let state = test_state();
-            let (mut store, main) = runtime::load(&bytes, runtime::new_ctx(state.clone(), Grants::log(), Vec::new()))
-                .map_err(|_| "no load")?;
+            let (mut store, main) = load_as(&bytes, &state, Grants::log())?;
             state.ask_kill();
             let ended = runtime::run_slices(&mut store, main);
             crate::ktest::diag(format_args!("{how}, killed: {}", ended.what()));
@@ -366,11 +380,76 @@ crate::ktest!(
     }
 );
 
-/// Run `bytes`' `lumen_main` once with a slice's fuel: its result and the
-/// fuel it used.
-fn fuel_used(bytes: &[u8]) -> Result<(i32, u64), &'static str> {
-    let (mut store, main) =
-        runtime::load(bytes, runtime::new_ctx(test_state(), Grants::log(), Vec::new())).map_err(|_| "no load")?;
+crate::ktest!(
+    fn a_kill_at_a_resume_is_never_a_trap() {
+        // A loop past a slice's fuel, then `return_call args_len` from
+        // `lumen_main`'s frame, in the last slice: a host error there comes
+        // back from `resume` as a plain error.
+        let mut body = [i32_const(300_000), vec![0x21, 0x00]].concat(); // local.set 0
+        body.extend([0x03, 0x40, 0x20, 0x00, 0x41, 0x01, 0x6b, 0x22, 0x00, 0x0d, 0x00, 0x0b]); // loop: i -= 1 while i
+        body.extend([0x12, 0x00]); // return_call args_len
+        let spec = Spec { locals: vec![0x01, 0x01, 0x7f], body, ..Spec::importing(&["args_len"]) };
+        let bytes = spec.bytes();
+        // Unkilled: it ends `exited with 0`, after some slices.
+        let state = test_state();
+        let (mut store, main) = load_as(&bytes, &state, Grants::log())?;
+        crate::kassert_eq!(runtime::run_slices(&mut store, main), EndReason::Exited(0));
+        let slices = state.slices();
+        crate::ktest::diag(format_args!("unkilled: {slices} slices"));
+        crate::kassert!(slices >= 2);
+        // The kill flag set just before the last resume: `killed`.
+        let state = test_state();
+        let (mut store, main) = load_as(&bytes, &state, Grants::log())?;
+        state.kill_at_resume.store(slices - 1, core::sync::atomic::Ordering::Release);
+        crate::kassert_eq!(runtime::run_slices(&mut store, main), EndReason::Killed);
+        crate::kassert_eq!(state.slices(), slices);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn host_calls_cost_fuel_however_many_in_one_block() {
+        // 2 × SLICE_FUEL / CALL_FUEL calls to args_len in one block (wasmi
+        // checks fuel only where a block starts): at least two slices, and
+        // every call charged.
+        let n = 2 * SLICE_FUEL / CALL_FUEL;
+        let body: Vec<u8> = (0..n).flat_map(|_| [0x10, 0x00, 0x1a]).chain([0x41, 0x00]).collect();
+        let state = test_state();
+        let (mut store, main) =
+            load_as(&Spec { body, ..Spec::importing(&["args_len"]) }.bytes(), &state, Grants::log())?;
+        crate::kassert_eq!(runtime::run_slices(&mut store, main), EndReason::Exited(0));
+        crate::ktest::diag(format_args!("{n} args_len: {} slices, {} fuel", state.slices(), state.fuel()));
+        crate::kassert!(state.slices() >= 2);
+        crate::kassert!(state.fuel() >= n * CALL_FUEL);
+        // TRACE `log`s of 60 bytes in one block: their extra fuel past a
+        // slice's end carried into the next.
+        let per = CALL_FUEL + LOG_FUEL + 60 * BYTE_FUEL;
+        let m = 2 * SLICE_FUEL / per + 1;
+        let mut body = vec![0x41, 0x01, 0x10, 0x00, 0x21, 0x00]; // the log handle into local 0
+        for _ in 0..m {
+            body.extend([0x20, 0x00, 0x41, 0x05, 0x41, 0x00, 0x41, 60, 0x10, 0x01, 0x1a]);
+        }
+        body.extend([0x41, 0x00]);
+        let spec = Spec { locals: vec![0x01, 0x01, 0x7f], body, ..Spec::importing(&["handle_find", "log"]) };
+        let state = test_state();
+        let (mut store, main) = load_as(&spec.bytes(), &state, Grants::log())?;
+        crate::kassert_eq!(runtime::run_slices(&mut store, main), EndReason::Exited(0));
+        crate::ktest::diag(format_args!("{m} logs: {} slices, {} fuel", state.slices(), state.fuel()));
+        crate::kassert!(state.slices() >= 2);
+        crate::kassert!(state.fuel() >= m * per + CALL_FUEL);
+        Ok(())
+    }
+);
+
+/// Run `bytes`' `lumen_main` once with a slice's fuel, holding `grants`,
+/// after `prep` on its store: its result and the fuel it used.
+fn fuel_used(
+    bytes: &[u8],
+    grants: Grants,
+    prep: impl FnOnce(&mut Store<runtime::AppCtx>),
+) -> Result<(i32, u64), &'static str> {
+    let (mut store, main) = load_as(bytes, &test_state(), grants)?;
+    prep(&mut store);
     store.set_fuel(SLICE_FUEL).map_err(|_| "no fuel")?;
     let result = main.call(&mut store, ()).map_err(|_| "lumen_main trapped")?;
     Ok((result, SLICE_FUEL - store.get_fuel().map_err(|_| "no fuel")?))
@@ -382,7 +461,7 @@ crate::ktest!(
         // far more than the module's own instructions.
         let n = 50u64;
         let body: Vec<u8> = (0..n).flat_map(|_| [0x10, 0x00, 0x1a]).chain([0x41, 0x00]).collect();
-        let (_, used) = fuel_used(&Spec { body, ..Spec::importing(&["args_len"]) }.bytes())?;
+        let (_, used) = fuel_used(&Spec { body, ..Spec::importing(&["args_len"]) }.bytes(), Grants::log(), |_| {})?;
         crate::ktest::diag(format_args!("{n} args_len calls: {used} fuel"));
         crate::kassert!(used >= n * CALL_FUEL);
         // handle_find(Log), then one `log` of 60 bytes (NULs, at TRACE so
@@ -392,15 +471,41 @@ crate::ktest!(
             let body = vec![0x41, 0x01, 0x10, 0x00, 0x41, level, 0x41, 0x00, 0x41, 60, 0x10, 0x01];
             Spec { body, ..Spec::importing(&["handle_find", "log"]) }.bytes()
         };
-        let (result, used) = fuel_used(&log(5))?;
+        let (result, used) = fuel_used(&log(5), Grants::log(), |_| {})?;
         crate::ktest::diag(format_args!("a 60-byte log: {result}, {used} fuel"));
         crate::kassert_eq!(result, 0);
         crate::kassert!(used >= 2 * CALL_FUEL + LOG_FUEL + 60 * BYTE_FUEL);
         // A refused one (level 0) still costs its call, and no line.
-        let (result, used) = fuel_used(&log(0))?;
+        let (result, used) = fuel_used(&log(0), Grants::log(), |_| {})?;
         crate::ktest::diag(format_args!("a refused log: {result}, {used} fuel"));
         crate::kassert_eq!(result, Error::BadArgument.returned());
         crate::kassert!((2 * CALL_FUEL..2 * CALL_FUEL + LOG_FUEL).contains(&used));
+        // Bad UTF-8: refused, its copy paid for, no line.
+        let bad = |store: &mut Store<runtime::AppCtx>| {
+            let memory = store.data().memory.expect("a memory");
+            memory.data_mut(store)[..60].fill(0xff);
+        };
+        let (result, used) = fuel_used(&log(5), Grants::log(), bad)?;
+        crate::ktest::diag(format_args!("a bad UTF-8 log: {result}, {used} fuel"));
+        crate::kassert_eq!(result, Error::BadArgument.returned());
+        crate::kassert!((2 * CALL_FUEL + 60 * BYTE_FUEL..2 * CALL_FUEL + LOG_FUEL).contains(&used));
+        // trace_read: EVENT_FUEL per event copied (room for 10).
+        let cpu = crate::arch::cpu_index() as i32;
+        let len = (lumen_app_api::trace::HEADER_SIZE + 10 * lumen_app_api::trace::EVENT_SIZE) as i32;
+        let body = [
+            vec![0x41, 0x05, 0x10, 0x00], // handle_find(Trace)
+            vec![0x41, 0x00],             // stream 0
+            i32_const(cpu),
+            vec![0x42, 0x00, 0x41, 0x00], // since 0, buf 0
+            i32_const(len),
+            vec![0x10, 0x01], // trace_read
+        ]
+        .concat();
+        let spec = Spec { body, ..Spec::importing(&["handle_find", "trace_read"]) };
+        let (copied, used) = fuel_used(&spec.bytes(), Grants::log().with(lumen_app_api::Grant::Trace), |_| {})?;
+        crate::ktest::diag(format_args!("a trace_read: {copied} events, {used} fuel"));
+        crate::kassert!(copied > 0);
+        crate::kassert!(used >= 2 * CALL_FUEL + copied as u64 * EVENT_FUEL);
         Ok(())
     }
 );
@@ -413,6 +518,19 @@ crate::ktest!(
         crate::kassert_eq!(state.outcome(), Some(Outcome::Ended(EndReason::Killed)));
         crate::kassert!(!state.ran());
         crate::kassert_eq!(state.slices(), 0);
+        // What `run` prints for it.
+        crate::kassert_eq!(
+            runtime::start_line("hello", 3, &runtime::Start::Ended(EndReason::Killed)),
+            Some(Err(String::from("run: hello: killed")))
+        );
+        // And everything it loaded given back: a second time, the heap's
+        // `used` unchanged.
+        let again = test_state();
+        again.ask_kill();
+        let bytes = probes()[0].1.bytes();
+        let before = heap::stats().used;
+        runtime::live(&bytes, &again, Grants::log(), Vec::new());
+        crate::kassert_eq!(heap::stats().used, before);
         Ok(())
     }
 );
@@ -432,12 +550,80 @@ crate::ktest!(
     }
 );
 
+/// How many log lines in the kernel log's ring hold `text`.
+fn logged(text: &str) -> usize {
+    let mut buf = vec![0u8; 64 * 1024];
+    let (n, _) = crate::klog::copy_recent(&mut buf);
+    core::str::from_utf8(&buf[..n]).map_or(0, |s| s.lines().filter(|l| l.contains(text)).count())
+}
+
+crate::ktest!(
+    fn a_load_failure_nobody_takes_is_logged_once() {
+        let bad = Spec { export_main: false, ..Spec::default() }.bytes();
+        let line = |id: u64| alloc::format!("WARN  app: test (app {id}) didn't start: no export lumen_main");
+        // Nobody watching when it fails: its thread logs it.
+        let state = Arc::new(AppState::new(9101, "test"));
+        crate::kassert_eq!(state.stop_watching(), None);
+        runtime::live(&bad, &state, Grants::log(), Vec::new());
+        crate::kassert_eq!(logged(&line(9101)), 1);
+        // Watched when it fails, then the watcher goes without taking it:
+        // the watcher's drop logs it.
+        let launched = runtime::Launched { state: Arc::new(AppState::new(9102, "test")) };
+        runtime::live(&bad, &launched.state, Grants::log(), Vec::new());
+        crate::kassert_eq!(logged(&line(9102)), 0);
+        drop(launched);
+        crate::kassert_eq!(logged(&line(9102)), 1);
+        // `run`'s console closed: the failure isn't taken (nobody would see
+        // it printed), so it is logged.
+        let launched = runtime::Launched { state: Arc::new(AppState::new(9103, "test")) };
+        runtime::live(&bad, &launched.state, Grants::log(), Vec::new());
+        crate::kassert_eq!(runtime::stopped_by(&launched, "test", lumen_shell::Key::Closed), None);
+        drop(launched);
+        crate::kassert_eq!(logged(&line(9103)), 1);
+        // `q`: `run` prints it, and it isn't logged.
+        let launched = runtime::Launched { state: Arc::new(AppState::new(9104, "test")) };
+        runtime::live(&bad, &launched.state, Grants::log(), Vec::new());
+        crate::kassert_eq!(
+            runtime::stopped_by(&launched, "test", lumen_shell::Key::Char('q')),
+            Some(String::from("run: test: no export lumen_main"))
+        );
+        drop(launched);
+        crate::kassert_eq!(logged(&line(9104)), 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn run_prints_one_line_per_start() {
+        use runtime::{Start, start_line};
+        let why = text::log_line("no export lumen_main");
+        let cases = [
+            (Start::Started, Some(Ok("run: started hello as app 3"))),
+            (Start::Failed(why), Some(Err("run: hello: no export lumen_main"))),
+            (Start::Logged, Some(Err("run: hello: didn't start (see the log)"))),
+            (Start::Ended(EndReason::Killed), Some(Err("run: hello: killed"))),
+            (Start::Pending, None),
+        ];
+        for (start, want) in cases {
+            let want = want.map(|r| r.map(String::from).map_err(String::from));
+            crate::kassert_eq!(start_line("hello", 3, &start), want);
+        }
+        // Still loading, stopped by `q`: the kill hint.
+        let launched = runtime::Launched { state: test_state() };
+        crate::kassert_eq!(
+            runtime::stopped_by(&launched, "hello", lumen_shell::Key::Char('q')),
+            Some(String::from("run: hello: still loading (kill 0 ends it)"))
+        );
+        Ok(())
+    }
+);
+
 crate::ktest!(
     fn kill_says_where_the_app_is() {
         let ended = |outcome: Outcome| {
             let s = test_state();
             s.record(outcome);
-            s.set_phase(Phase::Ended);
+            s.finish();
             runtime::kill_outcome(&s)
         };
         crate::kassert_eq!(ended(EndReason::Killed.into()), "killed");
@@ -446,22 +632,22 @@ crate::ktest!(
             ended(Outcome::NotStarted(text::log_line("memory: not fixed"))),
             "had already ended: didn't start: memory: not fixed"
         );
-        let places = [
-            (Phase::Gated, "loading"),
-            (Phase::Loading, "loading"),
-            (Phase::Running, "in a slice"),
-            (Phase::Waiting("time_sleep"), "in time_sleep"),
-            (Phase::Ending, "ending"),
-        ];
-        for (phase, place) in places {
-            let s = test_state();
-            s.set_phase(phase);
-            crate::kassert_eq!(runtime::kill_outcome(&s), alloc::format!("still ending ({place})"));
-        }
-        // Killed, but its thread not yet done with it: still ending.
+        // Each place, going through an app's phases forward.
         let s = test_state();
+        let still = |place: &str| alloc::format!("still ending ({place})");
+        crate::kassert_eq!(runtime::kill_outcome(&s), still("loading"));
+        s.open_gate();
+        crate::kassert_eq!(runtime::kill_outcome(&s), still("loading"));
+        s.begin_running();
+        crate::kassert_eq!(runtime::kill_outcome(&s), still("in a slice"));
+        let waiting = s.waiting("time_sleep", || runtime::kill_outcome(&s));
+        crate::kassert_eq!(waiting, still("in time_sleep"));
+        crate::kassert_eq!(s.phase(), Phase::Running);
+        // Killed, but its thread not yet done with it: still ending.
         s.record(EndReason::Killed);
-        crate::kassert_eq!(runtime::kill_outcome(&s), "still ending (ending)");
+        crate::kassert_eq!(runtime::kill_outcome(&s), still("ending"));
+        s.finish();
+        crate::kassert_eq!(runtime::kill_outcome(&s), "killed");
         Ok(())
     }
 );
@@ -470,19 +656,20 @@ crate::ktest!(
     fn running_out_of_memory_is_not_enough_memory() {
         use wasmi::TrapCode;
         use wasmi::errors::{InstantiationError, MemoryError, TableError};
+        // (Execution's stacks are infallible: a trap code isn't one of these.)
         // How wasmi says it, wherever it allocates fallibly.
         let oom = [
             wasmi::Error::from(MemoryError::OutOfSystemMemory),
             wasmi::Error::from(TableError::OutOfSystemMemory),
             wasmi::Error::from(InstantiationError::FailedToInstantiateMemory(MemoryError::OutOfSystemMemory)),
             wasmi::Error::from(InstantiationError::FailedToInstantiateTable(TableError::OutOfSystemMemory)),
-            wasmi::Error::from(TrapCode::OutOfSystemMemory),
         ];
         crate::kassert!(oom.iter().all(runtime::out_of_memory));
         let other = [
             wasmi::Error::from(MemoryError::OutOfBoundsGrowth),
             wasmi::Error::from(InstantiationError::FailedToInstantiateMemory(MemoryError::OutOfBoundsGrowth)),
             wasmi::Error::from(TrapCode::UnreachableCodeReached),
+            wasmi::Error::from(TrapCode::OutOfSystemMemory),
         ];
         crate::kassert!(!other.iter().any(runtime::out_of_memory));
         // And the real path: a 16-page memory the heap refuses.
@@ -493,6 +680,14 @@ crate::ktest!(
         crate::ktest::diag(format_args!("the memory refused: {refused:?}"));
         crate::kassert_eq!(refused, Err(String::from("not enough memory")));
         crate::kassert!(try_load(&bytes).is_ok());
+        // And the translator's: a big body whose compiled code's buffer the
+        // heap refuses past 128 KiB.
+        let big = modules::large_body(60_000);
+        heap::refuse_from(128 * 1024);
+        let refused = runtime::load(&big, runtime::new_ctx(test_state(), Grants::log(), Vec::new())).map(|_| ());
+        heap::refuse_from(usize::MAX);
+        crate::ktest::diag(format_args!("compiling refused: {refused:?}"));
+        crate::kassert_eq!(refused, Err(String::from("not enough memory")));
         Ok(())
     }
 );

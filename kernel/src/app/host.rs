@@ -1,32 +1,19 @@
-//! The `lumen` host functions (ARCHITECTURE section 8, "The host interface"),
-//! defined into an app's `Linker`. Every call, in this order:
-//!
-//! 1. checks the kill flag (set: the app ends, as a [`Stop`] host error),
-//!    then charges `CALL_FUEL`, refused or not ([`entry`], one wrapper for
-//!    every call);
-//! 2. checks the handle, then its kind;
-//! 3. checks every (pointer, length) range against the memory's current
-//!    size (`lumen_app_api::range`: unsigned, no overflow);
-//! 4. checks its other arguments' values (`log`'s level, a negative sleep)
-//!    and copies its inputs out of the app's memory and checks their
-//!    content (text within its cap, UTF-8);
-//! 5. does its work, charging fuel for what it did (`BYTE_FUEL` per byte
-//!    copied in, `LOG_FUEL` per line logged, `EVENT_FUEL` per event
-//!    copied out; saturating: a charge past what is left ends the slice
-//!    at the next fuel check, resumably);
-//! 6. only then writes its output whole, or nothing.
-//!
-//! So a refused call writes nothing, overlapping ranges are harmless, and
-//! no guest pointer is held across anything that can run the app. The
-//! window and text calls come with #206.
+//! The `lumen` host functions without a window (ARCHITECTURE section 8,
+//! "The host interface"), defined into an app's `Linker`. Every call goes
+//! through [`entry`] (the kill flag, a slice end if too little fuel is
+//! left, `CALL_FUEL`), then checks its arguments in section 8's order
+//! ("Every call, in this order"): a refused call writes nothing, and no
+//! guest pointer is held across anything that can run the app. The window
+//! and text calls come with #206.
 
-use super::runtime::{AppCtx, Stop};
-use crate::{rtc, time, trace};
+use super::runtime::{self, AppCtx, AppState};
+use crate::{rtc, sched, time, trace};
 use alloc::vec;
 use alloc::vec::Vec;
 use lumen_app_api::end::EndReason;
 use lumen_app_api::limits::{BYTE_FUEL, CALL_FUEL, EVENT_FUEL, LOG_FUEL, TEXT_BYTES, TRACE_EVENTS_PER_READ};
 use lumen_app_api::text::{self, LogText};
+use lumen_app_api::trace::{EVENT_SIZE, HEADER_SIZE, events_that_fit, header};
 use lumen_app_api::{Error, Grant, Kind, LogLevel, range, returned, returned64};
 use lumen_trace::{Event, Stream};
 use wasmi::{Caller, Linker};
@@ -34,26 +21,53 @@ use wasmi::{Caller, Linker};
 type C<'a> = Caller<'a, AppCtx>;
 type Res<T> = Result<T, wasmi::Error>;
 
-/// The app ends with `reason` (a host error wasmi never resumes).
-fn stop(reason: EndReason) -> wasmi::Error {
-    wasmi::Error::host(Stop(reason))
+/// The app stops with `reason` (recorded, then the host error wasmi never
+/// resumes).
+fn stop(c: &mut C<'_>, reason: EndReason) -> wasmi::Error {
+    c.data_mut().stop(reason)
 }
 
-/// Step 1, every call's entry: the kill flag, then `CALL_FUEL`; then the
-/// call itself.
+/// Every call's entry: the kill flag; then, if the slice has less than
+/// `CALL_FUEL` left, the slice ends right here (counted, a kill or the
+/// close grace ending the app, the CPU given up, a fresh slice), since
+/// wasmi checks fuel only where a block starts and a run of calls in one
+/// block would otherwise be free; then `CALL_FUEL`, refused call or not;
+/// then the call itself.
 fn entry<T>(c: &mut C<'_>, call: impl FnOnce(&mut C<'_>) -> Res<T>) -> Res<T> {
     if c.data().state.kill_asked() {
-        return Err(stop(EndReason::Killed));
+        return Err(stop(c, EndReason::Killed));
     }
-    charge(c, CALL_FUEL);
+    if runtime::fuel_left(&*c) < CALL_FUEL {
+        runtime::end_slice(&mut *c).map_err(|reason| stop(c, reason))?;
+        sched::yield_now();
+        runtime::begin_slice(&mut *c, 0).map_err(|reason| stop(c, reason))?;
+    }
+    runtime::charge(&mut *c, CALL_FUEL);
     call(c)
 }
 
-/// A charge: `fuel` off what the slice has left, saturating.
-fn charge(c: &mut C<'_>, fuel: u64) {
-    if let Ok(left) = c.get_fuel() {
-        let _ = c.set_fuel(left.saturating_sub(fuel));
+/// A call that ends the app (`exit`, `panic`): its entry, then the end
+/// `reason` gives. Never `Ok`.
+fn ending(c: &mut C<'_>, reason: impl FnOnce(&mut C<'_>) -> EndReason) -> Res<()> {
+    entry(c, |c| {
+        let reason = reason(c);
+        Err(stop(c, reason))
+    })
+}
+
+/// A blocking call's wait (`time_sleep`; #206's `window_wait`): the slice
+/// ends (counted; a kill or the close grace ends the app), the app is
+/// `waiting` in `call` while `wait` runs, a kill meanwhile ends it, then a
+/// fresh slice.
+fn blocking<T>(c: &mut C<'_>, call: &'static str, wait: impl FnOnce(&AppState) -> T) -> Res<T> {
+    runtime::end_slice(&mut *c).map_err(|reason| stop(c, reason))?;
+    let state = c.data().state.clone();
+    let out = state.waiting(call, || wait(&state));
+    if state.kill_asked() {
+        return Err(stop(c, EndReason::Killed));
     }
+    runtime::begin_slice(&mut *c, 0).map_err(|reason| stop(c, reason))?;
+    Ok(out)
 }
 
 /// The app's memory's current size.
@@ -61,13 +75,12 @@ fn memory_len(c: &C<'_>) -> usize {
     c.data().memory.map_or(0, |m| m.data(c).len())
 }
 
-/// Step 4: a copy of `[ptr, ptr + len)`, already checked by [`range`].
+/// A copy of `[ptr, ptr + len)`, already checked by [`range`].
 fn copy_in(c: &C<'_>, r: core::ops::Range<usize>) -> Vec<u8> {
     c.data().memory.map_or_else(Vec::new, |m| m.data(c)[r].to_vec())
 }
 
-/// Step 6: `bytes` written at `at` (checked: within a range [`range`]
-/// accepted).
+/// `bytes` written at `at` (checked: within a range [`range`] accepted).
 fn write_out(c: &mut C<'_>, at: usize, bytes: &[u8]) {
     if let Some(m) = c.data().memory {
         m.data_mut(c)[at..at + bytes.len()].copy_from_slice(bytes);
@@ -90,11 +103,10 @@ pub(super) fn define(linker: &mut Linker<AppCtx>) -> Result<(), wasmi::Error> {
     linker.func_wrap(m, "args_read", |mut c: C<'_>, buf: i32, len: i32| -> Res<i32> {
         entry(&mut c, |c| Ok(returned(args_read(c, buf, len))))
     })?;
-    linker.func_wrap(m, "exit", |mut c: C<'_>, code: i32| -> Res<()> {
-        entry(&mut c, |_| Err(stop(EndReason::Exited(code))))
-    })?;
+    linker
+        .func_wrap(m, "exit", |mut c: C<'_>, code: i32| -> Res<()> { ending(&mut c, |_| EndReason::Exited(code)) })?;
     linker.func_wrap(m, "panic", |mut c: C<'_>, msg: i32, len: i32| -> Res<()> {
-        entry(&mut c, |c| Err(stop(EndReason::Panicked(panic_message(c, msg, len)))))
+        ending(&mut c, |c| EndReason::Panicked(panic_message(c, msg, len)))
     })?;
     linker.func_wrap(m, "log", |mut c: C<'_>, h: i32, level: i32, msg: i32, len: i32| -> Res<i32> {
         entry(&mut c, |c| Ok(returned(log(c, h, level, msg, len))))
@@ -120,7 +132,8 @@ pub(super) fn define(linker: &mut Linker<AppCtx>) -> Result<(), wasmi::Error> {
                 return Ok(e.returned());
             }
             let Ok(ns) = u64::try_from(ns) else { return Ok(Error::BadArgument.returned()) };
-            sleep(c, ns)?;
+            let deadline = time::now_ns().checked_add(ns);
+            blocking(c, "time_sleep", |state| state.wait_until(deadline))?;
             Ok(0)
         })
     })?;
@@ -138,7 +151,7 @@ pub(super) fn define(linker: &mut Linker<AppCtx>) -> Result<(), wasmi::Error> {
 }
 
 /// `panic`'s message, however bad: at most `TEXT_BYTES` of it read (a
-/// range past the memory, or a negative length, is `<a bad pointer>`),
+/// range past the memory, or a negative `len`, is `<a bad pointer>`),
 /// invalid UTF-8 shown as U+FFFD, cut and sanitised as log text.
 fn panic_message(c: &C<'_>, msg: i32, len: i32) -> LogText {
     if len < 0 {
@@ -171,34 +184,18 @@ fn log(c: &mut C<'_>, h: i32, level: i32, msg: i32, len: i32) -> Result<i32, Err
         LogLevel::Debug => log::Level::Debug,
         LogLevel::Trace => log::Level::Trace,
     };
-    // Checked against the cap before it is copied or decoded.
+    // The cap, checked before the text is copied (or decoded).
     if r.len() > TEXT_BYTES {
         return Err(Error::BadArgument);
     }
     let bytes = copy_in(c, r);
-    charge(c, BYTE_FUEL * bytes.len() as u64);
+    // The copy is paid for even if the text is then refused.
+    runtime::charge(&mut *c, BYTE_FUEL * bytes.len() as u64);
     let line = text::log_line(text::decode(&bytes, TEXT_BYTES)?);
-    charge(c, LOG_FUEL);
+    runtime::charge(&mut *c, LOG_FUEL);
     let name = c.data().state.name;
     log::log!(target: "app", level, "{name}: {line}");
     Ok(0)
-}
-
-/// `time_sleep`'s wait: a slice end (counted, the fuel used added, the
-/// kill flag and close grace checked), then blocking (`waiting`) on the
-/// app's own wait queue until `ns` pass or a kill (0, or a deadline
-/// already reached: a yield), then a fresh slice. A kill ends the app.
-fn sleep(c: &mut C<'_>, ns: u64) -> Res<()> {
-    let left = c.get_fuel().unwrap_or(0);
-    c.data_mut().end_slice(left).map_err(stop)?;
-    let state = c.data().state.clone();
-    state.block("time_sleep", time::now_ns().checked_add(ns));
-    if state.kill_asked() {
-        return Err(stop(EndReason::Killed));
-    }
-    let fuel = c.data_mut().begin_slice(0);
-    let _ = c.set_fuel(fuel);
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments, reason = "the host call's own arguments")]
@@ -206,8 +203,8 @@ fn trace_read(c: &mut C<'_>, h: i32, stream: i32, cpu: i32, since: i64, buf: i32
     c.data().grant_of(h, Kind::Trace)?;
     let out = range::range(buf, len, memory_len(c))?;
     let bytes = read_trace(stream, cpu, since, out.len())?;
-    let copied = (bytes.len() - lumen_app_api::trace::HEADER_SIZE) / lumen_app_api::trace::EVENT_SIZE;
-    charge(c, EVENT_FUEL * copied as u64);
+    let copied = (bytes.len() - HEADER_SIZE) / EVENT_SIZE;
+    runtime::charge(&mut *c, EVENT_FUEL * copied as u64);
     write_out(c, out.start, &bytes);
     Ok(copied as i32)
 }
@@ -222,12 +219,12 @@ pub(super) fn read_trace(stream: i32, cpu: i32, since: i64, len: usize) -> Resul
     let stream = u32::try_from(stream).ok().and_then(|s| Stream::try_from(s).ok()).ok_or(Error::BadArgument)?;
     let cpu = usize::try_from(cpu).map_err(|_| Error::BadArgument)?;
     let since = u64::try_from(since).map_err(|_| Error::BadArgument)?;
-    let fit = lumen_app_api::trace::events_that_fit(len)?;
+    let fit = events_that_fit(len)?;
     debug_assert!(fit <= TRACE_EVENTS_PER_READ);
     let mut events = vec![Event::default(); fit];
     let r = trace::read(stream, cpu, since, &mut events).map_err(|_| Error::BadArgument)?;
-    let mut bytes = Vec::with_capacity(lumen_app_api::trace::HEADER_SIZE + r.copied * lumen_app_api::trace::EVENT_SIZE);
-    bytes.extend_from_slice(&lumen_app_api::trace::header(r.next, r.missed));
+    let mut bytes = Vec::with_capacity(HEADER_SIZE + r.copied * EVENT_SIZE);
+    bytes.extend_from_slice(&header(r.next, r.missed));
     for e in &events[..r.copied] {
         bytes.extend_from_slice(&lumen_app_api::trace::event(e));
     }

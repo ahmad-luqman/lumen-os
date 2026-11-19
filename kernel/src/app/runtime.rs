@@ -1,8 +1,8 @@
 //! The app runtime (#199; ARCHITECTURE section 8, "Running an app"): the
 //! table of running apps, loading one on its own thread, its fuel slices,
-//! how its life goes (one [`Phase`] and one [`Outcome`], the first
-//! recorded), `kill`, the reaper that joins ended apps, and the shell's
-//! `apps`, `run` and `kill`.
+//! how its life goes (one [`Phase`], moving only forward, and one
+//! [`Outcome`], the first recorded), `kill` (section 8, "Kill"), the reaper
+//! that joins ended apps, and the shell's `apps`, `run` and `kill`.
 //!
 //! Locks: `TABLE` (the apps), each app's `life`, `REAPER_THREAD`. None is
 //! held across a wait, a spawn's join, a wake or a host call; `TABLE` is
@@ -35,22 +35,24 @@ use lumen_shell::Key;
 use lumen_shell::pipe::{self, Align, Column, Kind as ColKind};
 use wasmi::errors::{ErrorKind, InstantiationError, MemoryError, TableError};
 use wasmi::{
-    CompilationMode, Config, Engine, ExternType, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
-    TrapCode, TypedFunc, TypedResumableCall, ValType,
+    AsContext, AsContextMut, CompilationMode, Config, Engine, ExternType, Linker, Memory, Module, Store, StoreLimits,
+    StoreLimitsBuilder, TypedFunc, TypedResumableCall, ValType,
 };
 
-/// What a handle names (the `Window` kind comes with #206).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a handle names (the `Window` kind comes with #206; not `Copy`, as a
+/// window won't be).
+#[derive(Debug)]
 pub(super) enum Obj {
     Grant(Grant),
 }
 
-/// Why the app stops running, raised by a host function (`exit`, `panic`,
-/// a kill seen at a call's entry or in `time_sleep`): never resumed, never
-/// reported as a trap. wasmi hands it back as a `HostTrap`, or as a plain
-/// error when the call it ends is the first (a tail call from
-/// `lumen_main`, or `lumen_main` an exported import); both go through
-/// [`stop_reason`].
+/// The signal a host function raises when the app must stop (`exit`,
+/// `panic`, a kill seen at a call's entry or a slice end): never resumed.
+/// Why it stops is recorded in the store's data first ([`AppCtx::stop`]),
+/// and that record is what [`step`] reads, so the end reason doesn't
+/// depend on how wasmi hands the error back (a `HostTrap`, a plain error
+/// when the call it ends is a tail call from `lumen_main`'s frame or an
+/// exported import, wrapped or not).
 #[derive(Debug)]
 pub(super) struct Stop(pub(super) EndReason);
 
@@ -77,8 +79,13 @@ pub(super) struct AppCtx {
     limits: StoreLimits,
     /// The fuel the current slice started with.
     slice_given: u64,
+    /// Fuel charged past what a slice had left (a saturated charge),
+    /// taken from the next slice.
+    debt: u64,
     /// The close grace, once the app is given `Close` (#206 gives it).
     close_grace: CloseGrace,
+    /// Why the app is stopping, once a host function said so.
+    stopping: Option<EndReason>,
 }
 
 impl AppCtx {
@@ -88,7 +95,7 @@ impl AppCtx {
         if !self.grants.has(grant) {
             return Err(Error::NotGranted);
         }
-        match self.handles.find(|o| *o == Obj::Grant(grant)) {
+        match self.handles.find(|o| matches!(o, Obj::Grant(g) if *g == grant)) {
             Some(h) => Ok(h),
             None => self.handles.insert(Obj::Grant(grant)),
         }
@@ -102,8 +109,7 @@ impl AppCtx {
         Ok(())
     }
 
-    /// Handle `h` names a grant of `kind` (step 2: the handle, then its
-    /// kind).
+    /// Handle `h` names a grant of `kind` (the handle, then its kind).
     pub(super) fn grant_of(&self, h: i32, kind: Kind) -> Result<(), Error> {
         match self.handles.get(h)? {
             Obj::Grant(g) if g.kind() == kind => Ok(()),
@@ -111,30 +117,89 @@ impl AppCtx {
         }
     }
 
-    /// A slice ended with `fuel_left` of it unused (at a fuel check, or
-    /// when the app blocks): counted, then why the app must end now, if it
-    /// must (a kill, its close grace used up). The one slice-end path:
-    /// `run_slices`, `time_sleep` and #206's `window_wait` all come here.
-    pub(super) fn end_slice(&mut self, fuel_left: u64) -> Result<(), EndReason> {
-        self.state.slice_ended(self.slice_given.saturating_sub(fuel_left));
-        if self.state.kill_asked() {
-            return Err(EndReason::Killed);
-        }
-        if self.close_grace.slice_end() {
-            return Err(EndReason::CloseGrace);
-        }
-        Ok(())
-    }
-
-    /// The fuel for the next slice: [`SLICE_FUEL`], or what the instruction
-    /// that ran out needs if more.
-    pub(super) fn begin_slice(&mut self, required: u64) -> u64 {
-        self.slice_given = SLICE_FUEL.max(required);
-        self.slice_given
+    /// The app stops with `reason`: recorded (the first said wins), and
+    /// the host error that unwinds wasmi.
+    pub(super) fn stop(&mut self, reason: EndReason) -> wasmi::Error {
+        let signal = Stop(reason.clone());
+        self.stopping.get_or_insert(reason);
+        wasmi::Error::host(signal)
     }
 }
 
-/// Where an app is in its life.
+/// The fuel the slice has left.
+pub(super) fn fuel_left(cx: impl AsContext) -> u64 {
+    let left = cx.as_context().get_fuel();
+    debug_assert!(left.is_ok(), "fuel metering is on for every app");
+    left.unwrap_or(0)
+}
+
+/// Charge `fuel` off what the slice has left; what it hasn't left becomes
+/// debt, taken from the next slice (so a charge never fails a call and is
+/// never lost).
+pub(super) fn charge(mut cx: impl AsContextMut<Data = AppCtx>, fuel: u64) {
+    let mut cx = cx.as_context_mut();
+    let left = fuel_left(&cx);
+    cx.data_mut().debt += fuel.saturating_sub(left);
+    let set = cx.set_fuel(left.saturating_sub(fuel));
+    debug_assert!(set.is_ok(), "fuel metering is on for every app");
+}
+
+/// A slice ended (out of fuel, at a blocking call, or at a host call's
+/// entry with too little fuel left): counted with the fuel it used, then
+/// why the app must end now, if it must (a kill, its close grace used
+/// up). The one slice-end path.
+pub(super) fn end_slice(mut cx: impl AsContextMut<Data = AppCtx>) -> Result<(), EndReason> {
+    let mut cx = cx.as_context_mut();
+    count_slice(&mut cx);
+    let ctx = cx.data_mut();
+    if ctx.state.kill_asked() {
+        return Err(EndReason::Killed);
+    }
+    if ctx.close_grace.slice_end() {
+        return Err(EndReason::CloseGrace);
+    }
+    Ok(())
+}
+
+/// Count the slice so far: one more slice, and the fuel it used (nothing
+/// if it used none: it was just counted).
+fn count_slice(mut cx: impl AsContextMut<Data = AppCtx>) {
+    let mut cx = cx.as_context_mut();
+    let left = fuel_left(&cx);
+    let ctx = cx.data_mut();
+    let used = ctx.slice_given.saturating_sub(left);
+    // Counted already (a slice end just before the app stopped).
+    if used == 0 {
+        return;
+    }
+    ctx.state.slice_ended(used);
+    ctx.slice_given = left;
+}
+
+/// The app ended within a slice: that slice counted, and any debt (no
+/// slice will take it now) added to the fuel it used.
+fn last_slice(store: &mut Store<AppCtx>) {
+    count_slice(&mut *store);
+    let ctx = store.data_mut();
+    ctx.state.fuel.fetch_add(core::mem::take(&mut ctx.debt), Ordering::Relaxed);
+}
+
+/// Begin the next slice: [`SLICE_FUEL`], or what the instruction that ran
+/// out needs if more, less the debt (counted as used now).
+pub(super) fn begin_slice(mut cx: impl AsContextMut<Data = AppCtx>, required: u64) -> Result<(), EndReason> {
+    let mut cx = cx.as_context_mut();
+    let ctx = cx.data_mut();
+    let given = SLICE_FUEL.max(required);
+    let paid = ctx.debt.min(given);
+    ctx.debt -= paid;
+    ctx.state.fuel.fetch_add(paid, Ordering::Relaxed);
+    ctx.slice_given = given - paid;
+    let fuel = ctx.slice_given;
+    cx.set_fuel(fuel).map_err(|e| EndReason::Trapped(first_line(&e)))
+}
+
+/// Where an app is in its life. It only moves forward (`Waiting` and
+/// `Running` aside: a blocking call goes back to `Running`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Phase {
     /// Its thread waits for `launch` to store its handle.
@@ -153,6 +218,17 @@ pub(super) enum Phase {
 }
 
 impl Phase {
+    /// Its place in the order phases go through.
+    fn rank(self) -> u8 {
+        match self {
+            Phase::Gated => 0,
+            Phase::Loading => 1,
+            Phase::Running | Phase::Waiting(_) => 2,
+            Phase::Ending => 3,
+            Phase::Ended => 4,
+        }
+    }
+
     /// As `apps` shows it.
     fn name(self) -> &'static str {
         match self {
@@ -165,8 +241,7 @@ impl Phase {
     }
 
     /// Where `kill` says an app still ending is (ARCHITECTURE section 8,
-    /// "Ending an app"): `loading`, `in a slice`, `in <host call>`,
-    /// `ending`.
+    /// "Kill"): `loading`, `in a slice`, `in <host call>`, `ending`.
     pub(super) fn place(self) -> String {
         match self {
             Phase::Gated | Phase::Loading => String::from("loading"),
@@ -189,6 +264,17 @@ struct Life {
     ran: bool,
 }
 
+impl Life {
+    /// Move to `to` if that is forward (never back from `Ending` or
+    /// `Ended`, never back to `Gated` or `Loading`).
+    fn advance(&mut self, to: Phase) {
+        debug_assert!(to.rank() > self.phase.rank(), "{:?} -> {to:?}", self.phase);
+        if to.rank() > self.phase.rank() {
+            self.phase = to;
+        }
+    }
+}
+
 /// One app's shared state: its thread, `run`, `kill`, `apps` and the reaper
 /// each hold an `Arc` of it.
 pub(super) struct AppState {
@@ -203,6 +289,10 @@ pub(super) struct AppState {
     memory_kib: AtomicU64,
     /// What the app's thread, `run` and `kill` wait on.
     waits: WaitQueue,
+    /// ktest seam: the kill flag is set just before this resume of
+    /// `lumen_main` (counted from 1; 0: never).
+    #[cfg(feature = "ktest")]
+    pub(super) kill_at_resume: AtomicU64,
 }
 
 impl AppState {
@@ -218,7 +308,16 @@ impl AppState {
             slices: AtomicU64::new(0),
             memory_kib: AtomicU64::new(0),
             waits: WaitQueue::new(),
+            #[cfg(feature = "ktest")]
+            kill_at_resume: AtomicU64::new(0),
         }
+    }
+
+    /// Change the app's life under its lock, then wake its waiters.
+    fn update<R>(&self, f: impl FnOnce(&mut Life) -> R) -> R {
+        let r = f(&mut self.life.lock());
+        self.waits.wake_all();
+        r
     }
 
     pub(super) fn kill_asked(&self) -> bool {
@@ -236,18 +335,49 @@ impl AppState {
         self.life.lock().phase
     }
 
-    pub(super) fn set_phase(&self, p: Phase) {
-        self.life.lock().phase = p;
-        self.waits.wake_all();
+    /// The gate opens: `loading`.
+    pub(super) fn open_gate(&self) {
+        self.update(|life| life.advance(Phase::Loading));
     }
 
     /// `lumen_main` is about to be called: `running`, and started.
     pub(super) fn begin_running(&self) {
-        let mut life = self.life.lock();
-        life.phase = Phase::Running;
-        life.ran = true;
-        drop(life);
-        self.waits.wake_all();
+        self.update(|life| {
+            life.advance(Phase::Running);
+            life.ran = true;
+        });
+    }
+
+    /// Run `f` while `waiting` in host call `call`, then back to
+    /// `running` (unless the app moved on meanwhile).
+    pub(super) fn waiting<R>(&self, call: &'static str, f: impl FnOnce() -> R) -> R {
+        self.update(|life| {
+            debug_assert_eq!(life.phase, Phase::Running);
+            if life.phase == Phase::Running {
+                life.phase = Phase::Waiting(call);
+            }
+        });
+        let r = f();
+        self.update(|life| {
+            if matches!(life.phase, Phase::Waiting(_)) {
+                life.phase = Phase::Running;
+            }
+        });
+        r
+    }
+
+    /// Wait until `deadline` (`time::now_ns`; `None`: none) or a kill. A
+    /// deadline already reached doesn't block but gives up the CPU
+    /// (`time_sleep(h, 0)` is a yield); the kill flag is checked just before
+    /// blocking (the wait's own check).
+    pub(super) fn wait_until(&self, deadline: Option<u64>) {
+        match deadline {
+            Some(d) if d <= time::now_ns() => sched::yield_now(),
+            Some(d) => {
+                let _ = self.waits.wait_until_or_deadline(d, || self.kill_asked());
+            }
+            None => self.waits.wait_until(|| self.kill_asked()),
+        }
     }
 
     /// The outcome recorded, if any.
@@ -259,6 +389,12 @@ impl AppState {
     #[cfg(feature = "ktest")]
     pub(super) fn slices(&self) -> u64 {
         self.slices.load(Ordering::Relaxed)
+    }
+
+    /// Fuel used so far.
+    #[cfg(feature = "ktest")]
+    pub(super) fn fuel(&self) -> u64 {
+        self.fuel.load(Ordering::Relaxed)
     }
 
     /// Whether `lumen_main` was called.
@@ -273,42 +409,23 @@ impl AppState {
         self.fuel.fetch_add(fuel, Ordering::Relaxed);
     }
 
-    /// Block (`waiting`, in host call `call`) until `deadline`
-    /// (`time::now_ns`; `None`: none) or a kill. A deadline already
-    /// reached doesn't block but gives up the CPU (`time_sleep(h, 0)` is a
-    /// yield); the kill flag is checked just before blocking (the wait's
-    /// own check).
-    pub(super) fn block(&self, call: &'static str, deadline: Option<u64>) {
-        self.set_phase(Phase::Waiting(call));
-        match deadline {
-            Some(d) if d <= time::now_ns() => sched::yield_now(),
-            Some(d) => {
-                let _ = self.waits.wait_until_or_deadline(d, || self.kill_asked());
-            }
-            None => self.waits.wait_until(|| self.kill_asked()),
-        }
-        self.set_phase(Phase::Running);
-    }
-
-    /// Record `outcome` unless one is recorded already, and move to
-    /// `Ending`.
+    /// Record `outcome` unless one is recorded already: `ending`.
     pub(super) fn record(&self, outcome: impl Into<Outcome>) {
-        let mut life = self.life.lock();
-        life.outcome.record(outcome);
-        life.phase = Phase::Ending;
-        drop(life);
-        self.waits.wake_all();
+        let outcome = outcome.into();
+        self.update(|life| {
+            life.outcome.record(outcome);
+            life.advance(Phase::Ending);
+        });
     }
 
     /// Loading failed with `why`: recorded, and logged (one WARN) unless a
     /// `run` still waits to print it.
     fn not_started(&self, why: LogText) {
-        let mut life = self.life.lock();
-        life.outcome.record(Outcome::NotStarted(why));
-        life.phase = Phase::Ending;
-        let log = !life.watched;
-        drop(life);
-        self.waits.wake_all();
+        let log = self.update(|life| {
+            life.outcome.record(Outcome::NotStarted(why));
+            life.advance(Phase::Ending);
+            !life.watched
+        });
         if log {
             self.log_outcome();
         }
@@ -336,6 +453,14 @@ impl AppState {
         }
     }
 
+    /// Its thread is done with it: `ended`. Its outcome was recorded first.
+    pub(super) fn finish(&self) {
+        self.update(|life| {
+            debug_assert!(life.outcome.outcome().is_some(), "an app ended without an outcome");
+            life.advance(Phase::Ended);
+        });
+    }
+
     /// Its thread is done with it.
     pub(super) fn has_ended(&self) -> bool {
         self.phase() == Phase::Ended
@@ -343,13 +468,16 @@ impl AppState {
 }
 
 /// How an app's start went, as `run` waits for it.
-enum Start {
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Start {
     Pending,
     Started,
     /// Loading failed (the failure handed to the waiter, not logged).
     Failed(LogText),
+    /// Loading failed and the failure was logged already (nobody waited).
+    Logged,
     /// It ended before `lumen_main` ran (a kill while loading).
-    Ended(Outcome),
+    Ended(EndReason),
 }
 
 /// The app's start, if it is decided.
@@ -360,15 +488,38 @@ fn start_of(state: &AppState) -> Start {
     }
     match life.outcome.outcome() {
         None => Start::Pending,
-        Some(Outcome::NotStarted(why)) => {
-            let why = why.clone();
+        Some(Outcome::Ended(reason)) => Start::Ended(reason.clone()),
+        Some(Outcome::NotStarted(_)) => {
             drop(life);
             // Taken: the app's thread no longer logs it.
-            let _ = state.stop_watching();
-            Start::Failed(why)
+            state.stop_watching().map_or(Start::Logged, Start::Failed)
         }
-        Some(outcome) => Start::Ended(outcome.clone()),
     }
+}
+
+/// What `run` prints for `start` (`Ok`: on its output, `Err`: as a
+/// failure), or `None` while it is pending.
+pub(super) fn start_line(name: &str, id: u64, start: &Start) -> Option<Result<String, String>> {
+    Some(match start {
+        Start::Pending => return None,
+        Start::Started => Ok(format!("run: started {name} as app {id}")),
+        Start::Failed(why) => Err(format!("run: {name}: {why}")),
+        Start::Logged => Err(format!("run: {name}: didn't start (see the log)")),
+        Start::Ended(reason) => Err(format!("run: {name}: {}", reason.what())),
+    })
+}
+
+/// What `run` prints when it stops waiting because of `key`, if anything.
+/// A closed console takes nothing: nobody would see a line printed into
+/// it, so a load failure is left to [`Launched`]'s drop to log.
+pub(super) fn stopped_by(launched: &Launched, name: &str, key: Key) -> Option<String> {
+    if key == Key::Closed {
+        return None;
+    }
+    Some(match launched.state.stop_watching() {
+        Some(why) => format!("run: {name}: {why}"),
+        None => format!("run: {name}: still loading (kill {} ends it)", launched.state.id),
+    })
 }
 
 /// What `kill` says once it has waited: `killed`, `had already ended:
@@ -405,10 +556,8 @@ struct Table {
 
 static TABLE: SpinLock<Table> = SpinLock::new(Table { entries: Vec::new(), next_id: 1 });
 
-/// The reaper runs (set once its spawn succeeded).
-static REAPER: AtomicBool = AtomicBool::new(false);
-/// The reaper's thread (kept rather than detached, so the ktests can stop
-/// it).
+/// The reaper's thread, once a spawn of it succeeded (kept rather than
+/// detached, so the ktests can stop it).
 static REAPER_THREAD: SpinLock<Option<JoinHandle>> = SpinLock::new(None);
 /// A `run` is starting it (so two don't).
 static REAPER_STARTING: AtomicBool = AtomicBool::new(false);
@@ -426,8 +575,9 @@ static PENDING: AtomicUsize = AtomicUsize::new(0);
 /// What the reaper waits on.
 static ENDED: WaitQueue = WaitQueue::new();
 
-/// How many apps may run at once here: `MAX_APPS`, or fewer on a smaller
-/// machine (worked out at the first `run`).
+/// How many apps may be listed at once (loading until joined) here:
+/// `MAX_APPS`, or fewer on a smaller machine (worked out at the first
+/// `run`).
 fn slot_count() -> usize {
     static SLOTS: AtomicUsize = AtomicUsize::new(usize::MAX);
     let s = SLOTS.load(Ordering::Relaxed);
@@ -526,21 +676,26 @@ pub(super) fn check_module(module: &Module) -> Result<(), String> {
     Ok(())
 }
 
+/// wasmi's translator's message for running out of memory (its error type
+/// isn't exported, so its message is what tells it apart).
+const TRANSLATION_OOM: &str = "ran out of system memory during translation";
+
 /// Whether `e` is wasmi running out of memory where it allocates
-/// fallibly: a linear memory or table (at instantiation, wrapped, or
-/// growing) or its execution's stacks. Its other allocations, and the
-/// translator's (whose error type wasmi doesn't export), end in the
-/// kernel's allocation-error panic or in `not valid: ...`.
+/// fallibly: compiling (the translator's buffers), or a linear memory or
+/// table (at instantiation, wrapped in an `InstantiationError`, or
+/// growing). Its other allocations, its execution stacks among them, are
+/// infallible and end in the kernel's allocation-error panic.
 pub(super) fn out_of_memory(e: &wasmi::Error) -> bool {
-    matches!(
-        e.kind(),
+    match e.kind() {
         ErrorKind::Memory(MemoryError::OutOfSystemMemory)
-            | ErrorKind::Table(TableError::OutOfSystemMemory)
-            | ErrorKind::Instantiation(
-                InstantiationError::FailedToInstantiateMemory(MemoryError::OutOfSystemMemory)
-                    | InstantiationError::FailedToInstantiateTable(TableError::OutOfSystemMemory)
-            )
-    ) || e.as_trap_code() == Some(TrapCode::OutOfSystemMemory)
+        | ErrorKind::Table(TableError::OutOfSystemMemory)
+        | ErrorKind::Instantiation(
+            InstantiationError::FailedToInstantiateMemory(MemoryError::OutOfSystemMemory)
+            | InstantiationError::FailedToInstantiateTable(TableError::OutOfSystemMemory),
+        ) => true,
+        ErrorKind::Translation(t) => t.to_string() == TRANSLATION_OOM,
+        _ => false,
+    }
 }
 
 /// A load step's error as `run` prints it: `not enough memory`, or the
@@ -582,53 +737,76 @@ pub(super) fn new_ctx(state: Arc<AppState>, grants: Grants, args: Vec<u8>) -> Ap
         memory: None,
         limits: store_limits(),
         slice_given: 0,
+        debt: 0,
         close_grace: CloseGrace::default(),
+        stopping: None,
     }
 }
 
-/// Run `lumen_main` in fuel slices until it ends: why it did.
-pub(super) fn run_slices(store: &mut Store<AppCtx>, main: TypedFunc<(), i32>) -> EndReason {
-    let fuel = store.data_mut().begin_slice(0);
-    if let Err(e) = store.set_fuel(fuel) {
-        return EndReason::Trapped(first_line(&e));
-    }
-    // A host error on the first call (a root tail call to a host function,
-    // or an exported import) comes back as a plain error, not a `HostTrap`.
-    let mut call = match main.call_resumable(&mut *store, ()) {
-        Ok(call) => call,
-        Err(e) => return stop_reason(&e),
-    };
-    loop {
-        match call {
-            TypedResumableCall::Finished(code) => return EndReason::Exited(code),
-            TypedResumableCall::HostTrap(trap) => return stop_reason(trap.host_error()),
-            TypedResumableCall::OutOfFuel(out) => {
-                // A slice end: counted, the kill flag and close grace
-                // checked, the CPU given up, then a slice at least as big
-                // as what the instruction that ran out needs.
-                let left = store.get_fuel().unwrap_or(0);
-                if let Err(reason) = store.data_mut().end_slice(left) {
-                    return reason;
-                }
-                sched::yield_now();
-                let fuel = store.data_mut().begin_slice(out.required_fuel());
-                if let Err(e) = store.set_fuel(fuel) {
-                    return EndReason::Trapped(first_line(&e));
-                }
-                call = match out.resume(&mut *store) {
-                    Ok(call) => call,
-                    Err(e) => return stop_reason(&e),
-                };
-            }
-        }
+/// wasmi's answer to calling or resuming `lumen_main`, read in one place
+/// for both: on, out of fuel, or why the app ended. A host function's
+/// stop is the reason it recorded, however wasmi hands its error back;
+/// any other error is a trap.
+fn step(
+    store: &mut Store<AppCtx>,
+    answer: Result<TypedResumableCall<i32>, wasmi::Error>,
+) -> Result<TypedResumableCall<i32>, EndReason> {
+    let mut ended = |e: &wasmi::Error| store.data_mut().stopping.take().unwrap_or_else(|| stop_reason(e));
+    match answer {
+        Ok(TypedResumableCall::HostTrap(trap)) => Err(ended(trap.host_error())),
+        Ok(on) => Ok(on),
+        Err(e) => Err(ended(&e)),
     }
 }
 
-/// What a host error or trap means for the app's end.
+/// What an error means for the app's end, without the store's record: a
+/// `Stop` (as wasmi handed it back), else a trap.
 pub(super) fn stop_reason(e: &wasmi::Error) -> EndReason {
     match e.downcast_ref::<Stop>() {
         Some(Stop(reason)) => reason.clone(),
         None => EndReason::Trapped(first_line(e)),
+    }
+}
+
+/// Run `lumen_main` in fuel slices until it ends: why it did. The last
+/// slice, partial, is counted too.
+pub(super) fn run_slices(store: &mut Store<AppCtx>, main: TypedFunc<(), i32>) -> EndReason {
+    if let Err(reason) = begin_slice(&mut *store, 0) {
+        return reason;
+    }
+    let mut answer = main.call_resumable(&mut *store, ());
+    #[cfg(feature = "ktest")]
+    let mut resumes = 0;
+    loop {
+        let out = match step(store, answer) {
+            Ok(TypedResumableCall::OutOfFuel(out)) => out,
+            Ok(TypedResumableCall::Finished(code)) => {
+                last_slice(store);
+                return EndReason::Exited(code);
+            }
+            Ok(TypedResumableCall::HostTrap(_)) => unreachable!("step reads every host trap"),
+            Err(reason) => {
+                last_slice(store);
+                return reason;
+            }
+        };
+        // A slice end, then the CPU given up, then a slice at least as big
+        // as what the instruction that ran out needs.
+        if let Err(reason) = end_slice(&mut *store) {
+            return reason;
+        }
+        sched::yield_now();
+        if let Err(reason) = begin_slice(&mut *store, out.required_fuel()) {
+            return reason;
+        }
+        #[cfg(feature = "ktest")]
+        {
+            resumes += 1;
+            if store.data().state.kill_at_resume.load(Ordering::Acquire) == resumes {
+                store.data().state.ask_kill();
+            }
+        }
+        answer = out.resume(&mut *store);
     }
 }
 
@@ -640,7 +818,7 @@ fn app_thread(app: &'static App, state: Arc<AppState>, grants: Grants, args: Vec
         state.thread.store(id, Ordering::Relaxed);
     }
     live(app.module, &state, grants, args);
-    state.set_phase(Phase::Ended);
+    state.finish();
     PENDING.fetch_add(1, Ordering::AcqRel);
     ENDED.wake_all();
 }
@@ -712,7 +890,7 @@ fn reaper() {
 /// joining ended apps (they keep their slots) until a later `run` starts
 /// it. The failure is logged once.
 fn ensure_reaper() {
-    if REAPER.load(Ordering::Acquire) || REAPER_STARTING.swap(true, Ordering::AcqRel) {
+    if REAPER_THREAD.lock().is_some() || REAPER_STARTING.swap(true, Ordering::AcqRel) {
         return;
     }
     #[cfg(feature = "ktest")]
@@ -721,10 +899,7 @@ fn ensure_reaper() {
     let seam = false;
     let spawned = if seam { Err(sched::SpawnError::NotRunning) } else { sched::spawn_on(0, "app-reaper", reaper) };
     match spawned {
-        Ok(h) => {
-            *REAPER_THREAD.lock() = Some(h);
-            REAPER.store(true, Ordering::Release);
-        }
+        Ok(h) => *REAPER_THREAD.lock() = Some(h),
         Err(e) => {
             if !REAPER_WARNED.swap(true, Ordering::AcqRel) {
                 log::warn!(target: "app", "no app-reaper thread ({e}): ended apps keep their slots until a later run starts it");
@@ -743,13 +918,12 @@ pub(super) fn stop_reaper() {
     ENDED.wake_all();
     h.join();
     STOP_REAPER.store(false, Ordering::Release);
-    REAPER.store(false, Ordering::Release);
 }
 
 /// Whether the reaper runs.
 #[cfg(feature = "ktest")]
 pub(super) fn reaper_running() -> bool {
-    REAPER.load(Ordering::Acquire)
+    REAPER_THREAD.lock().is_some()
 }
 
 /// Whether app `id` is still in the table (not yet joined).
@@ -782,17 +956,9 @@ fn forget(id: u64) {
 }
 
 /// A launched app, watched until this is dropped: a load failure nobody
-/// took through [`Launched::start`] is then logged (one WARN).
+/// took ([`start_of`], [`stopped_by`]) is then logged (one WARN).
 pub(super) struct Launched {
     pub(super) state: Arc<AppState>,
-}
-
-impl Launched {
-    /// How its start went, if decided (a failure taken here is the
-    /// caller's to report).
-    fn start(&self) -> Start {
-        start_of(&self.state)
-    }
 }
 
 impl Drop for Launched {
@@ -844,7 +1010,7 @@ pub(super) fn launch(name: &str, args: &[String], without: Grants) -> Result<Lau
     if let Some(entry) = TABLE.lock().entries.iter_mut().find(|e| e.state.id == id) {
         entry.thread = Thread::Spawned(handle);
     }
-    state.set_phase(Phase::Loading);
+    state.open_gate();
     Ok(Launched { state })
 }
 
@@ -874,28 +1040,25 @@ pub fn run(ctx: &mut Ctx<'_>, args: &[String]) {
         Ok(launched) => launched,
         Err(why) => return ctx.fail(why),
     };
-    let id = launched.state.id;
+    let state = &launched.state;
 
     // "started" or why not; `q` or Ctrl-C stops the wait, not the app.
     loop {
-        match launched.start() {
-            Start::Started => {
-                let _ = writeln!(ctx.out, "run: started {name} as app {id}");
+        match start_line(name, state.id, &start_of(state)) {
+            Some(Ok(line)) => {
+                let _ = writeln!(ctx.out, "{line}");
                 return;
             }
-            Start::Failed(why) => return ctx.fail(format_args!("run: {name}: {why}")),
-            Start::Ended(outcome) => return ctx.fail(format_args!("run: {name}: {}", outcome.what())),
-            Start::Pending => {}
+            Some(Err(line)) => return ctx.fail(line),
+            None => {}
         }
-        if ctx.poll_key().is_some_and(|k| k == Key::Char('q') || k.interrupts()) {
-            // A failure recorded meanwhile is still printed here.
-            if let Some(why) = launched.state.stop_watching() {
-                return ctx.fail(format_args!("run: {name}: {why}"));
+        if let Some(key) = ctx.poll_key().filter(|k| *k == Key::Char('q') || k.interrupts()) {
+            if let Some(line) = stopped_by(&launched, name, key) {
+                ctx.fail(line);
             }
-            return ctx.fail(format_args!("run: {name}: still loading (kill {id} ends it)"));
+            return;
         }
         let deadline = time::now_ns().saturating_add(10_000_000);
-        let state = &launched.state;
         let _ = state.waits.wait_until_or_deadline(deadline, || {
             let life = state.life.lock();
             life.ran || life.outcome.outcome().is_some()
@@ -953,9 +1116,4 @@ pub fn table() -> pipe::Table {
         ]);
     }
     t
-}
-
-/// `apps` in a pipeline: its records.
-pub fn records(args: &[String]) -> Option<Result<pipe::Table, String>> {
-    args.is_empty().then(|| Ok(table()))
 }
