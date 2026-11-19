@@ -44,6 +44,7 @@ noto-sans-mono-bitmap.workspace = true
 pc-keyboard.workspace = true
 rhai.workspace = true
 virtio-drivers.workspace = true
+wasmi.workspace = true
 zerocopy.workspace = true
 
 [lints]
