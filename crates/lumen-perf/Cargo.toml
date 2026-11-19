@@ -1,0 +1,9 @@
+[package]
+name = "lumen-perf"
+description = "no_std sampling-profiler logic for the Lumen kernel's perf top: a lock-free per-CPU sample buffer, ranking by function and by thread, the command's arguments (host-tested)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

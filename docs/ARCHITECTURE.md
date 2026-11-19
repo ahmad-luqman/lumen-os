@@ -4286,6 +4286,31 @@ kernel. The kernel is the trusted computing base.
 - **Logger:** `log` facade with level and subsystem tags, and on serial a
   timestamp since kernel entry (built). Every emitted log line also records
   a `Log` trace event (level, tag).
+- **Sampling profiler (built, #205):** `perf top [n] [--samples N]
+  [--threads]`. While a profile runs, each CPU's local APIC timer interrupt
+  records what it interrupted (the instruction pointer, the running
+  thread's id, whether that was the CPU's idle thread: read lock-free,
+  `sched::running_id_here`) into that CPU's sample buffer
+  (`lumen_perf::Buffer`: one writer, the CPU's own interrupt; lock-free,
+  never waits, allocates nothing; armed for a count and refusing samples
+  past it). Otherwise the tick pays one atomic load (`perf::on_tick`). A
+  profile is a number of samples per CPU on every CPU whose scheduler
+  runs (default 1000, at most 2048), never a duration, so a loaded host
+  makes it slower, not smaller; Ctrl-C or `q` stops it early and the header
+  says how many each CPU took. The busy samples are ranked by function
+  (symbolized once per distinct address with `symbols`, demangled) or, with
+  `--threads`, by thread (name and id); idle samples are counted in the
+  header and in no row; the share column is a row's part of the busy
+  samples. One profile at a time. `perf burn [cpu]` spins a thread
+  (`perf-burn`) in `perf::burn_loop` on a CPU (the last one by default) until
+  `perf burn stop`, something known to profile. Limits: a sample is
+  wherever the tick landed, so code that runs with interrupts off is
+  charged to the instruction after it re-enables them, and nothing
+  unwinds: a function's callers aren't credited. A WASM app (M5) shows up
+  by function as `wasmi`'s interpreter, not as its own functions; by
+  thread it shows up by its thread's name. Not in pipelines: `perf top`
+  blocks for its samples and stops on a key, which a records producer
+  can't wait for.
 - **Learning:** `explain <subsystem>` and a guided tour link each subsystem to
   its source and docs inside the OS (M5+).
 

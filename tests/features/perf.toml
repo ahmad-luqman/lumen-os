@@ -1,0 +1,12 @@
+# Features: the sampling profiler. See tests/features/README.md for the format.
+
+[[feature]]
+name = "`perf top`: timer-tick samples per CPU (a count, not a duration), ranked by function or by thread, idle apart; `perf burn` ranks first"
+milestone = "M5"
+tests = [
+    "cargo:lumen-perf",
+    "ktest:lumen_kernel::perf::samples_land_while_armed_and_stop_when_disarmed",
+    "ktest:lumen_kernel::perf::a_spinning_thread_ranks_first_by_function_and_by_thread",
+    "scenario:test_perf::test_hot_function_is_on_top",
+    "scenario:test_perf::test_perf_usage_and_refusals",
+]

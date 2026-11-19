@@ -284,6 +284,7 @@ dependencies = [
  "lumen-input",
  "lumen-mm",
  "lumen-pci",
+ "lumen-perf",
  "lumen-png",
  "lumen-queue",
  "lumen-rand",
@@ -309,6 +310,10 @@ version = "0.0.1"
 
 [[package]]
 name = "lumen-pci"
+version = "0.0.1"
+
+[[package]]
+name = "lumen-perf"
 version = "0.0.1"
 
 [[package]]

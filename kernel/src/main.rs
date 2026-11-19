@@ -46,6 +46,7 @@ mod ktest;
 mod mm;
 mod mouse;
 mod pci;
+mod perf;
 mod power;
 mod rng;
 mod rtc;
