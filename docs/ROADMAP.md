@@ -141,13 +141,30 @@ change in the PR that adds each test.
 
 ## M5: Apps
 
+Apps are WASM modules run by `wasmi` on kernel threads, holding only the
+capability handles the kernel gives them. The design is ARCHITECTURE
+section 8, "Apps: WASM modules in the kernel" (#195); test names follow
+issues #196 to #208 and may still change in the PR that adds each test.
+No M5 test asserts a time bound (CLAUDE.md, "Tests on a busy host"):
+preemption, profiling and X-ray are judged by counts and confirmed
+effects, and the games advance by a `step` request.
+
 | Feature | Exit criteria (tests) |
 |---|---|
-| WASM apps on `wasmi`: written in stable Rust for `wasm32-unknown-unknown`; fuel metering preempts them; the host interface hands out capability handles (draw, input, time, files later) | `cargo:lumen-app-api` (ABI types, error codes), `scenario:test_apps::test_hello_wasm`, `scenario:test_apps::test_busy_app_is_preempted`, `scenario:test_apps::test_app_trap_kills_app_not_kernel`, `scenario:test_apps::test_app_without_capability_is_refused` |
-| App SDK: a template crate and `make app NAME=...` | `scenario:test_apps::test_template_app_runs` |
-| Bundled apps: text editor, image viewer, clock, calculator, an original snake-style game, Game of Life | one golden and one automation-tree scenario per app |
-| X-ray: a live view of the trace ring (run queue, IRQs, locks) | `scenario:test_xray::test_run_queue_matches_trace` |
-| Sampling profiler: `perf top` samples RIP on each timer tick and symbolizes it | `scenario:test_perf::test_hot_function_is_on_top` (a deliberate busy loop ranks first) |
+| The toolchain builds apps: `wasm32-unknown-unknown` in the pinned toolchain, the `apps/` workspace built by `make build` | `harness:test_apps_build::*` (each built module is valid wasm and exports `memory` and `lumen_main`), `audit:flags` unchanged |
+| `wasmi` runs in the kernel, in fuel slices, with soft-float | `ktest:lumen_kernel::app::wasmi_runs_a_long_loop_in_fuel_slices` (out of fuel at least twice, resumed each time, the right value; counts resumes, no time), `ktest:lumen_kernel::app::wasm_floats_match`, `audit:flags` with `wasmi` linked into the booted kernel |
+| WASM apps: capability handles at the host interface, a manifest, fuel slices, kill, limits; a trap or a broken limit ends only the app; `apps`, `run`, `kill` | `cargo:lumen-app-api` (error codes and kind numbers pinned, the manifest parser on hand-made modules, every wire type round-tripped and one encoding of each pinned), `scenario:test_apps::test_hello_wasm` (its log line, exit 0, `apps` lists it, then not), `scenario:test_apps::test_busy_app_is_preempted` (while `busy` runs the shell answers and another app finishes, each confirmed; its `slices` grow; `kill` ends it and its thread is joined), `scenario:test_apps::test_app_trap_kills_app_not_kernel` (unreachable, a panic, memory past the limit, call depth: one WARN each naming the app, the shell keeps working, the heap back to its baseline), `scenario:test_apps::test_app_without_capability_is_refused` (`handle_find` says `NotGranted` and a made-up handle `BadHandle`; the app logs both and exits 0) |
+| App SDK: the guest crate, a template, `make app NAME=...`, windows for apps, the launcher lists bundled apps | `scenario:test_apps::test_template_app_runs` (a fresh `make app` copy builds; `run` opens its window; a confirmed key changes what it draws; closing ends it, its thread joined) |
+| `lumen-ui` inside apps: their automation trees with global ids, `ui invoke` reaching the app | `cargo:lumen-ui` (the checked node constructor), `scenario:test_apps::test_app_ids_are_global` (two apps' trees never share an id; a closed app's ids name nothing), `scenario:test_apps::test_calculator_tree_and_invoke` |
+| Calculator | `cargo:lumen-calc`, `scenario:test_apps::test_calculator_tree_and_invoke` (`2 + 3 =` shows `5` in the display's value), `scenario:test_apps::test_calculator_golden` |
+| Clock | `scenario:test_apps::test_clock_golden` (a fixed time from `run clock --at 10:09`), `scenario:test_apps::test_clock_tree_matches_rtc` (polled until it agrees with `date`) |
+| An original snake-style game | `cargo:lumen-snake` (growth, wall and self collision, food never on the snake, same seed same game), `scenario:test_apps::test_snake_golden` (a seed and N steps), `scenario:test_apps::test_snake_tree_and_steps` |
+| Game of Life as an app (replacing the kernel's Life window; the text-mode `life` stays) | `scenario:test_apps::test_life_golden`, `scenario:test_apps::test_life_runs_unfocused_and_stops_when_closed` (replaces `scenario:test_gui::test_life_window_runs_unfocused_and_stops_when_closed`) |
+| Text editor on an in-memory buffer (files in M6) | `cargo:lumen-edit` (every edit undone and redone restores the text; a randomized model), `scenario:test_apps::test_editor_golden`, `scenario:test_apps::test_editor_typing_and_tree` |
+| Image viewer for bundled images, PNG decoded inside the app | `scenario:test_apps::test_viewer_golden` (the wallpaper at 1:1 equals the PNG's pixels), `scenario:test_apps::test_viewer_list_and_select`, `scenario:test_apps::test_viewer_bad_image_ends_only_the_app` |
+| Trace events for X-ray: run queues, interrupts, lock contention, in a ring that doesn't flood the boot events; the `Trace` reader | `cargo:lumen-trace`, `ktest:lumen_kernel::trace::boot_events_survive_xray_load` (the boot timeline and a crash report's events still read with the new kinds on under load), `scenario:test_xray::test_run_queue_matches_trace` (N threads parked on one CPU: the trace's run-queue length equals the scheduler's count) |
+| X-ray: a live view of the trace (run queues, IRQs, locks, switches) as an app holding `Trace` | `scenario:test_xray::test_xray_matches_the_scheduler`, `scenario:test_xray::test_xray_golden` (a frozen view of a fixed trace), `scenario:test_xray::test_xray_without_trace_capability_is_refused` (`run --without trace xray`) |
+| Sampling profiler: `perf top` samples RIP on each timer tick and symbolizes it | `cargo:lumen-perf` (ranking and grouping by symbol, made-up samples), `scenario:test_perf::test_hot_function_is_on_top` (with `perf burn` on one CPU, the burn function has the most non-idle samples, and the sample count asked for is the count reported; no share asserted) |
 
 ## M6: Files
 
