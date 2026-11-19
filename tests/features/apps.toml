@@ -1,0 +1,11 @@
+# Features: WASM apps (M5). See tests/features/README.md for the format.
+
+[[feature]]
+name = "wasmi 2.0.1 linked into both kernels (#197) with the flag audit passing: a module runs in fuel slices (out of fuel, suspended and resumed until it finishes, with the right result) on a 64 KiB thread stack, wasmi's portable loop dispatch never growing the native stack per instruction; recursion past wasmi's call depth traps (stack overflow) instead of overflowing the kernel stack; float operations give the hardware's bits under the kernel's soft-float (rounding, signed zeros, quiet NaNs, round-half-even, u64 to f64, saturating truncation); the shell's `wasm` runs the same checks in the booted kernel"
+milestone = "M5"
+tests = [
+    "ktest:lumen_kernel::app::wasmi_runs_a_long_loop_in_fuel_slices",
+    "ktest:lumen_kernel::app::wasm_floats_match",
+    "scenario:test_wasm::test_wasm_command_runs_a_loop_in_fuel_slices",
+    "audit:flags",
+]
