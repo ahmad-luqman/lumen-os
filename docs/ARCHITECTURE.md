@@ -3207,8 +3207,15 @@ soft-float in the kernel (no SSE); #197 checks the results' bits.
   in it answers as `RanNodeGone`) and answers the `Started`. A
   `ClosedItsWindow` answer is held until the app closes that window (or
   ends), keeping section 11's rule that the answer comes after the
-  window is gone. An app that never answers is cancelled at the asker's
-  deadline, as a kernel window is.
+  window is gone. The asker's deadlines are section 11's, unchanged: a
+  request the app hasn't taken yet (still `Pending` on the queue) is
+  cancelled at the first 1 s deadline, and the runtime skips it rather
+  than hand it to the app (`start` refuses a cancelled request). Once
+  the runtime has started it, it can't be cancelled (`Reply::cancel`
+  only leaves `Pending`): the asker waits a second 1 s, an answer then
+  prints with "ran late", and none gives "still running", since the app
+  may still complete the action; an answer after that, or the `window
+  <id> closed` an ending app gives, lands for nobody.
 - **Root actions** (`focus`, `minimize`, `restore`, `close`) work on an
   app's window as on any: `close` is a `Close` event to the app.
 
