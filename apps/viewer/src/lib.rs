@@ -39,7 +39,7 @@ use lumen_app::gfx::Rect;
 use lumen_app::ui::{Flow, Taken, Ticking, Toolkit};
 use lumen_app::{Desktop, Error, Event, KeyAction, KeyCode, Time, log};
 use lumen_png::decode::{Image, decode};
-use lumen_ui::{Action, App, Over, Then, Ui, UiEvent, Widget};
+use lumen_ui::{App, Over, Then, Ui, UiEvent, Widget};
 use lumen_view::{
     Area, MAX_IMAGE_H, MAX_IMAGE_W, PANEL_W, Pan, VIEW, WINDOW_H, WINDOW_W, actual, admit, fitted, scale,
 };
@@ -121,13 +121,11 @@ impl Viewer {
         v
     }
 
-    /// Choose image `i`: the list's selection follows (as a click on it
-    /// does), the image shown is dropped, and the next tick decodes it.
+    /// Choose image `i`: the list's selection follows (leaving the focus
+    /// where it is: Enter on a focused Next keeps pressing Next), the image
+    /// shown is dropped, and the next tick decodes it.
     fn choose(&mut self, i: usize) {
-        if let Some(item) = self.ui.item_id(self.list, i) {
-            // Its `Selected` event is this choice itself.
-            let _ = self.ui.invoke(item.get(), &Action::Select);
-        }
+        self.ui.set_selected(self.list, Some(i));
         self.current = i;
         self.shown = Shown::Decoding;
         self.pan = Pan::default();

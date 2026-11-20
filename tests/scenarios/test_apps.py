@@ -1163,6 +1163,15 @@ def test_viewer_list_and_select(boot):
     gui.press_buttons(m, rows, "Next", "Next", "Next")
     rows = wait_info(m, wid, "round to the wallpaper", lambda v: v == "lumen.png 1280x800")
     assert gui.node(rows, "list", "Images")["value"] == "0"
+    # Choosing an image leaves the focus where it was: with Next focused,
+    # two confirmed Enters move two images on (a choice that focused the
+    # list would take the second Enter there).
+    nxt = gui.node(rows, "button", "Next")
+    got = gui.invoke(m, nxt["id"], "focus")
+    assert got.row is not None and "focused" in got.row["state"], got
+    gui.confirmed_keys(m, ["ret"], ["ret"])
+    rows = wait_info(m, wid, "two Enters on Next", lambda v: v == "grey16.png 40x24")
+    assert "focused" in gui.node(rows, "button", "Next")["state"]
     gui.close_window(m, "Viewer")
     end_line(m, mark, "viewer", app_id, "exited with 0")
 
