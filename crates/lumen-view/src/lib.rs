@@ -241,8 +241,12 @@ fn fit_size(image_w: u32, image_h: u32, view_w: u32, view_h: u32) -> (u32, u32) 
     (w.max(1) as u32, h.max(1) as u32)
 }
 
-/// Where an `image_w` x `image_h` image fitted to `view` goes: centred.
+/// Where an `image_w` x `image_h` image fitted to `view` goes: centred
+/// (nowhere, `Rect::EMPTY`, in an empty view).
 pub fn fitted(image_w: u32, image_h: u32, view: Rect) -> Rect {
+    if view.is_empty() {
+        return Rect::EMPTY;
+    }
     let (w, h) = fit_size(image_w, image_h, view.w(), view.h());
     Rect::new(view.x() + ((view.w() - w) / 2) as i32, view.y() + ((view.h() - h) / 2) as i32, w, h)
 }
@@ -256,16 +260,20 @@ fn source(d: u32, dst_len: u32, src_len: u32) -> u32 {
 }
 
 /// `src` (`src_w` x `src_h` pixels, row after row) scaled to `dst_w` x
-/// `dst_h` by [`source`]; `None` if the heap refuses the copy (or a size
-/// is zero, or `src` is short).
+/// `dst_h` by [`source`]; `None` if the heap refuses the copy or its column
+/// table, a size is zero or too big to count (wasm32's `usize` is 32
+/// bits), or `src` is short.
 pub fn scale(src: &[u32], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Option<Vec<u32>> {
     let len = (dst_w as usize).checked_mul(dst_h as usize)?;
-    if src_w == 0 || src_h == 0 || len == 0 || src.len() < src_w as usize * src_h as usize {
+    let src_len = (src_w as usize).checked_mul(src_h as usize)?;
+    if src_w == 0 || src_h == 0 || len == 0 || src.len() < src_len {
         return None;
     }
     let mut out = Vec::new();
     out.try_reserve_exact(len).ok()?;
-    let columns: Vec<usize> = (0..dst_w).map(|x| source(x, dst_w, src_w) as usize).collect();
+    let mut columns: Vec<usize> = Vec::new();
+    columns.try_reserve_exact(dst_w as usize).ok()?;
+    columns.extend((0..dst_w).map(|x| source(x, dst_w, src_w) as usize));
     for y in 0..dst_h {
         let row = &src[source(y, dst_h, src_h) as usize * src_w as usize..][..src_w as usize];
         out.extend(columns.iter().map(|&x| row[x]));
@@ -581,6 +589,17 @@ mod tests {
         assert!(!Why::Refused(Refused::TooCostly { w: 1, h: 1, bytes: 1 }).out_of_memory());
         assert_eq!(Why::NoMemory.to_string(), "no memory for its fitted copy");
         assert_eq!(Why::Refused(Refused::NoHeader).to_string(), Refused::NoHeader.to_string());
+    }
+
+    #[test]
+    fn an_empty_view_fits_nothing() {
+        assert_eq!(fitted(1280, 800, Rect::EMPTY), Rect::EMPTY);
+        assert_eq!(fitted(1280, 800, Rect::new(5, 5, 0, 10)), Rect::EMPTY);
+    }
+
+    #[test]
+    fn scale_refuses_sizes_too_big_to_count() {
+        assert_eq!(scale(&[1], u32::MAX, u32::MAX, 1, 1), None);
     }
 
     #[test]
