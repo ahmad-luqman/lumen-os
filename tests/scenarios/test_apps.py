@@ -1025,22 +1025,41 @@ def life_tree(m) -> tuple[str, list[dict[str, str]]]:
     return wait_tree(m, "Life", "Generation")
 
 
+# Each argument `run life` refuses, and the ERROR naming it (the usage
+# after it).
+LIFE_REFUSALS = [
+    ("nope", "no pattern 'nope' (glider, gun, lwss, rpentomino, acorn)"),
+    ("--fast", "'--fast' isn't an argument it takes"),
+    ("gun acorn", "one pattern at most ('gun', then 'acorn')"),
+    ("--stopped --stopped", "'--stopped' given twice"),
+]
+
+
+def test_life_refuses_arguments_it_doesnt_take(boot):
+    # `run life <args>` with a pattern it doesn't know, an option it doesn't
+    # take, two patterns or `--stopped` twice: one ERROR naming what was
+    # wrong, with the usage, and exit 2 (before any window: no desktop).
+    m = boot_shell(boot)
+    # (An app's ERROR may come after `run`'s prompt: the next command
+    # reads it.)
+    allow = r"ERROR app: life: "
+    for args, why in LIFE_REFUSALS:
+        app_id, mark = start(m, f"life {args}", allow=allow)
+        line = rf"ERROR app: life: {re.escape(why)} \({re.escape(LIFE_USAGE)}\)\n"
+        wait_for_output(m, mark, line, 30)
+        end_line(m, mark, "life", app_id, "exited with 2")
+    run(m, "apps", allow=allow)
+
+
 def test_life_golden(boot, artifacts, golden_dir):
     # `run life --stopped`: no period, so the window settles. Acorn chosen
     # in its list (a pattern starts it again at generation 0), then twelve
     # presses of Step (each one generation: settled between them), against
     # a golden of its client area. Then Start runs it (the generation grows
     # while it animates) and Stop settles it again, the generation staying
-    # put. A pattern it doesn't know ends it with 2, the ERROR naming it.
+    # put.
     m = boot_desktop(boot)
-    bad = r"ERROR app: life: no pattern 'nope'"
-    app_id, mark = start(m, "life nope", allow=bad)
-    wait_for_output(
-        m, mark, rf"ERROR app: life: no pattern 'nope' \(.*\) \({re.escape(LIFE_USAGE)}\)\n", 30
-    )
-    end_line(m, mark, "life", app_id, "exited with 2")
-    # (Its ERROR may come after `run`'s prompt: the next command reads it.)
-    app_id, mark = start(m, "life --stopped", allow=bad)
+    app_id, mark = start(m, "life --stopped")
     wid, rows = life_tree(m)
     assert (life_state(rows), generation(rows)) == ("stopped", 0), rows
     assert gui.node(rows, "label", "Pattern")["value"] == "gun"

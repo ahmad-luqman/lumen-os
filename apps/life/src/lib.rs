@@ -215,14 +215,18 @@ impl Ticking for LifeApp {
 /// not.
 fn parse(args: &[String]) -> Result<(&'static Pattern, bool), String> {
     let mut running = true;
-    let mut name = None;
+    let mut name: Option<&'static Pattern> = None;
     for a in args {
         match a.as_str() {
-            "--stopped" if running => running = false,
-            n if name.is_none() && !n.starts_with('-') => {
+            "--stopped" if !running => return Err(String::from("'--stopped' given twice")),
+            "--stopped" => running = false,
+            n if n.starts_with('-') => return Err(format!("'{n}' isn't an argument it takes")),
+            n => {
+                if let Some(first) = name {
+                    return Err(format!("one pattern at most ('{}', then '{n}')", first.name));
+                }
                 name = Some(life::pattern(n).ok_or_else(|| format!("no pattern '{n}' ({})", life::NAMES.join(", ")))?);
             }
-            other => return Err(format!("'{other}' isn't an argument it takes")),
         }
     }
     let pattern = name.unwrap_or_else(|| life::pattern(life::DEFAULT_PATTERN).expect("the default pattern exists"));
