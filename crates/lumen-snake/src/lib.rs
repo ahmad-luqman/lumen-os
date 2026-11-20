@@ -108,6 +108,16 @@ pub enum Dir {
 }
 
 impl Dir {
+    /// Its name, as the `Comet` label shows it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Dir::Up => "up",
+            Dir::Down => "down",
+            Dir::Left => "left",
+            Dir::Right => "right",
+        }
+    }
+
     pub fn opposite(self) -> Dir {
         match self {
             Dir::Up => Dir::Down,
@@ -482,9 +492,10 @@ pub fn state_label(state: State, stepping: bool) -> &'static str {
     }
 }
 
-/// The `Comet` label's text: the head's cell.
-pub fn comet_label(head: Cell) -> String {
-    alloc::format!("at {},{}", head.x, head.y)
+/// The `Comet` label's text: the head's cell and the heading the next step
+/// takes (so a test sees a turn arrive before it steps).
+pub fn comet_label(head: Cell, heading: Dir) -> String {
+    alloc::format!("at {},{} {}", head.x, head.y, heading.name())
 }
 
 #[cfg(test)]

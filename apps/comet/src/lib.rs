@@ -11,7 +11,8 @@
 //!   `disabled`, the frame `border`).
 //! - **The widgets**, also its automation tree: `Score`, `Level`, `State`
 //!   (`flying`, `stepping`, `over: edge`, `over: tail`, `over: asteroid`,
-//!   `sky full`) and `Comet` (the head's cell, `at x,y`), fixed-width
+//!   `sky full`) and `Comet` (the head's cell and the heading the next
+//!   step takes, `at x,y right`), fixed-width
 //!   labels (a changing width would repaint the whole window); `Play`,
 //!   `Step` and `Restart`.
 //! - **Ticks:** flying, it steps every [`period`] (faster each level);
@@ -136,7 +137,7 @@ impl Comet {
     /// `LABEL_W`).
     fn show(&mut self) {
         let g = &self.game;
-        let (score, level, at) = (score_label(g.score()), level_label(g.level()), comet_label(g.head()));
+        let (score, level, at) = (score_label(g.score()), level_label(g.level()), comet_label(g.head(), g.heading()));
         let state = state_label(g.state(), self.stepping);
         self.ui.set_text(self.score, &score);
         self.ui.set_text(self.level, &level);
@@ -167,7 +168,9 @@ impl Comet {
             KeyCode::ArrowRight => Dir::Right,
             _ => return Taken::Pass,
         };
+        // The label shows the heading (a refused turn changes nothing).
         self.game.turn(d);
+        self.show();
         Taken::Took
     }
 }

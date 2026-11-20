@@ -475,7 +475,10 @@ fn the_labels_say_what_happened() {
     assert_eq!(score_label(12), "Score 12");
     assert_eq!(level_label(0), "Level 1: Open sky");
     assert_eq!(level_label(3), "Level 4: Ring of rocks");
-    assert_eq!(comet_label(Cell::new(23, 17)), "at 23,17");
+    assert_eq!(comet_label(Cell::new(23, 17), Dir::Right), "at 23,17 right");
+    assert_eq!(comet_label(Cell::new(0, 0), Dir::Up), "at 0,0 up");
+    let names: Vec<&str> = [Dir::Up, Dir::Down, Dir::Left, Dir::Right].iter().map(|d| d.name()).collect();
+    assert_eq!(names, ["up", "down", "left", "right"]);
     let states = [
         (State::Flying, false, "flying"),
         (State::Flying, true, "stepping"),
@@ -506,7 +509,9 @@ fn every_label_fits_its_width() {
     }
     for y in 0..SKY_H {
         for x in 0..SKY_W {
-            texts.push(comet_label(Cell::new(x, y)));
+            for d in [Dir::Up, Dir::Down, Dir::Left, Dir::Right] {
+                texts.push(comet_label(Cell::new(x, y), d));
+            }
         }
     }
     for t in &texts {

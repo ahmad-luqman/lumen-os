@@ -622,8 +622,23 @@ def comet_labels(m, wid: str) -> dict[str, str]:
     return {r["name"]: r["value"] for r in below_root(gui.ui_tree(m, wid)) if r["role"] == "label"}
 
 
-def comet_at(x: int, y: int) -> str:
-    return f"at {x},{y}"
+def comet_at(x: int, y: int, heading: str = "right") -> str:
+    """The `Comet` label: the head's cell and its heading."""
+    return f"at {x},{y} {heading}"
+
+
+def turn_comet(m, wid: str, key: str, x: int, y: int) -> None:
+    """Arrow `key` typed through confirmed steps, then its turn seen in the
+    tree (the label's heading) before anything else: a Step request goes
+    straight onto the window's queue and could overtake the key."""
+    gui.confirmed_keys(m, [key])
+    gui.wait_ui(
+        m,
+        f"the comet heading {key}",
+        lambda r: gui.node(r, "label", "Comet")["value"] == comet_at(x, y, key),
+        wid,
+        30,
+    )
 
 
 def step_comet(m, rows, times: int) -> None:
@@ -665,10 +680,10 @@ def test_snake_tree_and_steps(boot):
         labels
     )
 
-    # An arrow turns it: up, then a step goes a row up.
-    gui.confirmed_keys(m, ["up"])
+    # An arrow turns it: up (its heading seen first), then a step goes a row up.
+    turn_comet(m, wid, "up", x + COMET_DUST_AHEAD, y)
     step_comet(m, rows, 1)
-    assert comet_labels(m, wid)["Comet"] == comet_at(x + COMET_DUST_AHEAD, y - 1)
+    assert comet_labels(m, wid)["Comet"] == comet_at(x + COMET_DUST_AHEAD, y - 1, "up")
 
     # Restart: the seed's sky again, still stepping; straight on to the
     # edge, then one more step ends the flight.
@@ -740,11 +755,11 @@ def test_snake_golden(boot, artifacts, golden_dir):
     start(m, f"comet --seed {COMET_SEED} --step")
     wid, rows = comet_tree(m)
     step_comet(m, rows, COMET_DUST_AHEAD + 1)
-    gui.confirmed_keys(m, ["up"])
-    step_comet(m, rows, 3)
     x, y = COMET_START
+    turn_comet(m, wid, "up", x + COMET_DUST_AHEAD + 1, y)
+    step_comet(m, rows, 3)
     labels = comet_labels(m, wid)
-    assert labels["Comet"] == comet_at(x + COMET_DUST_AHEAD + 1, y - 3), labels
+    assert labels["Comet"] == comet_at(x + COMET_DUST_AHEAD + 1, y - 3, "up"), labels
     assert (labels["Score"], labels["State"]) == ("Score 1", "stepping"), labels
     row = gui.window(m, "Comet")
     x0, y0, x1, y1 = gui.client_box(row)
