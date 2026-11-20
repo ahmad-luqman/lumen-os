@@ -3118,10 +3118,10 @@ Lumen runs two kinds of user code:
   on error. **Every GPR except `rax`, `rcx`, and `r11`** (including `rdi`,
   `rsi`, `rdx`, `r8`, `r9`, `r10`, `rbx`, `rbp`, `r12`–`r15`, and user `rsp`)
   is preserved across `syscall`, matching `musl`'s `syscall_arch.h`.
-- **ABI types:** sourced from a pinned `no_std` crate (`linux-raw-sys` or
-  `syscalls`, adopted in its own PR) so syscall numbers, `errno` constants,
-  `utsname`, `timespec`, `iovec`, `stat`, `termios`, and `sigaction` layouts
-  match Linux x86-64 verbatim.
+- **ABI types:** sourced from the pinned `no_std` crate `linux-raw-sys` `=0.12.1`
+  (adopted in #232, re-exported by `kernel/src/linux.rs`) so syscall numbers,
+  `errno` constants, `utsname`, `timespec`, `iovec`, `stat`, `termios`, and
+  `sigaction` layouts match Linux x86-64 verbatim.
 - **Unknown syscalls:** return `-ENOSYS` (`-38`) and log once per syscall
   number per boot at `debug` level (never panic or kill the process).
 

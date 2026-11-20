@@ -5,20 +5,21 @@
 //! Re-exports the UAPI modules so ring-3 syscall and ELF loader modules share
 //! one canonical ABI surface.
 
-#![allow(dead_code, unused_imports)]
-
+#[allow(unused_imports)]
 pub use linux_raw_sys::{auxvec, ctypes, errno, general, ioctl, prctl, system};
 
 /// Linux x86-64 `struct new_utsname` written by `uname(2)` (syscall 63).
 pub type Utsname = system::new_utsname;
 
 /// `arch_prctl(2)` code to set the 64-bit base for the `FS` register.
+#[allow(unused_imports)]
 pub use general::ARCH_SET_FS;
 
 /// `arch_prctl(2)` code to read the 64-bit base for the `FS` register.
 ///
 /// `linux-raw-sys` 0.12.1 exports `ARCH_SET_FS` (`0x1002`) from `<asm/prctl.h>`
 /// but omits `ARCH_GET_FS` (`0x1003`), so we define it here beside `ARCH_SET_FS`.
+#[allow(dead_code)]
 pub const ARCH_GET_FS: u32 = 0x1003;
 
 /// The 30 initial M6 Linux x86-64 syscalls (`docs/ARCHITECTURE.md` section 8).
@@ -60,22 +61,21 @@ pub fn syscall_name(nr: u32) -> Option<&'static str> {
     M6_SYSCALLS.iter().find_map(|&(num, name)| (num == nr).then_some(name))
 }
 
-/// Copy an ASCII string into a fixed-size NUL-terminated `c_char` field.
+/// Copy an ASCII string into a fixed-size NUL-terminated `c_char` field,
+/// zeroing all trailing bytes.
 fn write_uts_field(dst: &mut [ctypes::c_char; 65], src: &str) {
     let bytes = src.as_bytes();
     let len = bytes.len().min(dst.len() - 1);
     for (slot, &b) in dst.iter_mut().zip(&bytes[..len]) {
         *slot = b as ctypes::c_char;
     }
-    dst[len] = 0;
+    dst[len..].fill(0);
 }
 
 /// Read the NUL-terminated UTF-8 prefix of a `Utsname` field.
 fn read_uts_field(src: &[ctypes::c_char; 65]) -> &str {
     let len = src.iter().position(|&c| c == 0).unwrap_or(src.len());
-    // SAFETY: `c_char` is `i8` on x86-64, which has the same size and
-    // alignment as `u8`, and `len <= src.len()`.
-    let bytes = unsafe { core::slice::from_raw_parts(src.as_ptr().cast::<u8>(), len) };
+    let bytes = zerocopy::IntoBytes::as_bytes(&src[..len]);
     core::str::from_utf8(bytes).unwrap_or("")
 }
 
@@ -211,7 +211,7 @@ crate::ktest!(
         crate::kassert_eq!(general::RLIMIT_NOFILE, 7);
         crate::kassert_eq!(general::RLIM_NLIMITS, 16);
 
-        // 7. Exact Linux x86-64 ABI struct sizes.
+        // 7. Exact Linux x86-64 ABI struct sizes and key field offsets.
         crate::kassert_eq!(size_of::<Utsname>(), 390);
         crate::kassert_eq!(size_of::<general::timespec>(), 16);
         crate::kassert_eq!(size_of::<general::__kernel_timespec>(), 16);
@@ -222,6 +222,10 @@ crate::ktest!(
         crate::kassert_eq!(size_of::<general::rlimit64>(), 16);
         crate::kassert_eq!(size_of::<general::sigaction>(), 32);
         crate::kassert_eq!(size_of::<general::kernel_sigaction>(), 32);
+        crate::kassert_eq!(core::mem::offset_of!(general::stat, st_mode), 24);
+        crate::kassert_eq!(core::mem::offset_of!(general::stat, st_size), 48);
+        crate::kassert_eq!(core::mem::offset_of!(general::kernel_sigaction, sa_mask), 24);
+        crate::kassert_eq!(core::mem::offset_of!(Utsname, release), 130);
 
         // 8. Default utsname payload matches ARCHITECTURE.md §8.
         let uts = core::hint::black_box(default_utsname());
