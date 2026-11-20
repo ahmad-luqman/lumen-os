@@ -49,11 +49,11 @@ const TREE_W: u32 = 200;
 const TREE: Area = Area::new(0, 0, TREE_W, HEIGHT);
 const LINE: Area = Area::new(TREE_W as i32, 0, 1, HEIGHT);
 const GRID: Area = Area::new(TREE_W as i32 + 2, 0, WIDTH - TREE_W - 2, HEIGHT);
-/// A cell's pixels (a pixel's gap between cells).
+/// The cells' pitch: 7 pixels and a pixel's gap.
 const CELL: u32 = 8;
 const COLS: usize = (GRID.w() / CELL) as usize;
 const ROWS: usize = (GRID.h() / CELL) as usize;
-/// A generation every 100 ms while running, as #157's window stepped.
+/// A generation every 100 ms while running.
 const PERIOD_NS: u64 = 100_000_000;
 /// The labels' fixed width: a label changing width would move the widgets
 /// after it, repainting (and committing) the whole window.
