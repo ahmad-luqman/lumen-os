@@ -45,13 +45,15 @@ const LIFE_APP: &str = "life";
 
 /// The launcher's items: [`ITEMS`], then the bundled apps whose manifest
 /// grants `desktop` (never the test apps), by name, except [`LIFE_APP`].
-/// Without [`LIFE_APP`] among them (not bundled, or left out by `precheck`,
-/// which warned), the Life item stays, its launch then refused (`run: no
-/// app life`): one WARN says so here.
+/// Without [`LIFE_APP`] among them the Life item stays, and one WARN says
+/// it won't open a window: not bundled, its launch is refused (`run: no
+/// app life`); left out by `precheck` (which warned), refused with why
+/// (`run: life: <why>`); without a `desktop` grant in its manifest, the
+/// app starts and ends by its own ERROR (`no desktop handle`).
 fn items() -> Vec<&'static str> {
     let apps = crate::app::desktop_apps();
     if !apps.contains(&LIFE_APP) {
-        log::warn!(target: "taskbar", "Life: no bundled desktop app {LIFE_APP}: the item can't start it");
+        log::warn!(target: "taskbar", "Life: no bundled desktop app {LIFE_APP}: the Life item won't open a window");
     }
     items_with(apps)
 }
@@ -318,6 +320,11 @@ crate::ktest!(
         crate::kassert_eq!(
             items_with(alloc::vec!["calculator", "life", "template"]),
             alloc::vec!["Terminal", "Mandelbrot", "Life", "Counter", "calculator", "template"]
+        );
+        // Without the app, the Life item still stays (its launch refused).
+        crate::kassert_eq!(
+            items_with(alloc::vec!["calculator"]),
+            alloc::vec!["Terminal", "Mandelbrot", "Life", "Counter", "calculator"]
         );
         // The bundled set: the app the Life item starts is there, and
         // listed only as Life.
