@@ -111,30 +111,17 @@ def worst(size: tuple[int, int], depth: int, samples: int) -> bytes:
     )
 
 
-def chunks(png: bytes) -> list[tuple[bytes, bytes]]:
-    """A PNG's chunks after the signature: (type, data)."""
-    out, at = [], 8
-    while at < len(png):
-        (length,) = struct.unpack(">I", png[at : at + 4])
-        kind = png[at + 4 : at + 8]
-        out.append((kind, png[at + 8 : at + 8 + length]))
-        at += 12 + length
-    return out
-
-
 def broken(good: bytes) -> bytes:
     """`good` with the middle byte of its first IDAT's data flipped, its CRC
     left as it was (so it no longer matches)."""
-    out, at, flipped = bytearray(good[:8]), 8, False
-    while at < len(good):
-        (length,) = struct.unpack(">I", good[at : at + 4])
-        chunk = bytearray(good[at : at + 12 + length])
-        if chunk[4:8] == b"IDAT" and not flipped:
-            chunk[8 + length // 2] ^= 0xFF
-            flipped = True
-        out += chunk
+    out, at = bytearray(good), 8
+    while out[at + 4 : at + 8] != b"IDAT":
+        (length,) = struct.unpack(">I", out[at : at + 4])
         at += 12 + length
-    assert flipped, "no IDAT"
+    (length,) = struct.unpack(">I", out[at : at + 4])
+    out[at + 8 + length // 2] ^= 0xFF
+    (crc,) = struct.unpack(">I", out[at + 8 + length : at + 12 + length])
+    assert zlib.crc32(out[at + 4 : at + 8 + length]) != crc
     return bytes(out)
 
 
@@ -142,14 +129,7 @@ def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
     tiles().save(OUT / "tiles.png", optimize=False)
     grey16().save(OUT / "grey16.png", optimize=False)
-    good = (OUT / "tiles.png").read_bytes()
-    bad = broken(good)
-    # The flipped chunk's CRC no longer matches its contents.
-    for kind, data in chunks(bad):
-        if kind == b"IDAT":
-            assert zlib.crc32(kind + data) != zlib.crc32(kind + dict(chunks(good))[b"IDAT"])
-            break
-    (OUT / "broken.png").write_bytes(bad)
+    (OUT / "broken.png").write_bytes(broken((OUT / "tiles.png").read_bytes()))
     for name, size, depth, samples in WORST:
         (TESTS / name).write_bytes(worst(size, depth, samples))
         with Image.open(TESTS / name) as check:
