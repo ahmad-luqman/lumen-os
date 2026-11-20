@@ -957,15 +957,20 @@ def recoloured(m, mark: int, light: int) -> None:
 
 def test_sdk_a_greedy_take_still_leaves_the_toolkit_its_events(boot):
     # `tick greedy` takes every event offered to it, yet requests, `Theme`
-    # and `Close` never reach its `take`: a press is still answered and seen
-    # in the tree, `theme dark` still recolours its square, and closing the
-    # window still ends it with 0.
+    # and `Close` never reach its `take`, and the focus reaches the tree
+    # after it: a press is still answered and seen in the tree, a focused
+    # button shows focused, `theme dark` still recolours its square, and
+    # closing the window still ends it with 0.
     m = boot_desktop(boot)
     app_id, mark, wid, rows = start_ticker(m, "greedy")
     record = app(m, app_id)
     light = int(wait_for_output(m, mark, TICK_ACCENT, 30)[1], 16)
     gui.wait_ui(m, "a tick", lambda r: ticks(r) >= 1, wid, 30)
-    stop_ticker(m, wid, rows)
+    rows = stop_ticker(m, wid, rows)
+    # Focused only with the window's focus, which the app's `take` took
+    # (`FocusGained`): it reached the tree through the `Notify` step.
+    focused = gui.invoke(m, gui.node(rows, "button", "Start")["id"], "focus")
+    assert focused.row is not None and "focused" in focused.row["state"], focused
     recoloured(m, mark, light)
     gui.close_window(m, "window")
     end_line(m, mark, "window", app_id, "exited with 0")
