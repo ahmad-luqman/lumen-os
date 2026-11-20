@@ -62,7 +62,7 @@
 //! The SDK's tick loop (`ui::Toolkit::run_until`), its window titled
 //! `window`, 320 × 160:
 //!
-//! - `tick [greedy|quit]`: a tree on the left (`Ticks`, a fixed-width
+//! - `tick [greedy|quit|slow]`: a tree on the left (`Ticks`, a fixed-width
 //!   label counting the ticks; `State`, `running` or `stopped`; buttons
 //!   `Stop` and `Start`) and the app's own area on the right, where a
 //!   16-pixel square in the palette's accent moves 8 pixels a tick (its own
@@ -74,7 +74,10 @@
 //!   quits (`Taken::Quit`). `greedy` also takes every other event offered
 //!   (doing nothing with it: requests, `Close`, `Theme`, focus and `Lost`
 //!   must still reach the toolkit); `quit` quits from its fifth tick
-//!   (`Flow::Quit`). It logs `window: tick: running`, `window: tick:
+//!   (`Flow::Quit`); `slow` makes each tick's work 75 ms, longer than its
+//!   period, and WARNs if a tick comes less than a period after the last
+//!   one's work ended (the pacer counts from the end of an overrunning
+//!   tick's work). It logs `window: tick: running`, `window: tick:
 //!   accent 0x<rrggbb>` each time its frame is drawn in a new accent, a
 //!   WARN if a tick comes less than a period after the one before (the
 //!   launch before the first: what the pacer guarantees, across Stop and
@@ -442,14 +445,18 @@ const SQUARE_HOME: i32 = TICK_OWN.x() + 10;
 const TICKS_W: u32 = 60;
 /// `tick quit`: the tick that quits.
 const QUIT_AT: u64 = 5;
+/// `tick slow`: how long each tick's work takes, longer than its period.
+const SLOW_NS: u64 = 75_000_000;
 
 /// How the `tick` mode runs: plainly, taking every event offered
-/// (`greedy`), or quitting from its fifth tick (`quit`).
+/// (`greedy`), quitting from its fifth tick (`quit`), or with each tick's
+/// work longer than its period (`slow`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TickMode {
     Plain,
     Greedy,
     Quit,
+    Slow,
 }
 
 /// The `tick` mode's app: see the crate's doc.
@@ -468,6 +475,10 @@ struct Ticker {
     /// tick's time.
     last_tick: u64,
     first_tick: Option<u64>,
+    /// `slow`: the clock, and when the last tick's work ended (the next
+    /// must come at least a period after it, else a WARN).
+    time: Time,
+    work_ended: Option<u64>,
     square: Area,
     drawn: Vec<Area>,
     /// The accent its frame was last drawn in (logged when it changes).
@@ -493,6 +504,8 @@ impl Ticker {
             running: true,
             last_tick: now,
             first_tick: None,
+            time,
+            work_ended: None,
             square: Area::new(SQUARE_HOME, 70, SQUARE, SQUARE),
             drawn: Vec::new(),
             accent: None,
@@ -580,10 +593,25 @@ impl Ticking for Ticker {
         if now < floor {
             log::warn(&format!("window: tick: tick {} came {} ns early", self.ticks, floor - now));
         }
+        if let Some(ended) = self.work_ended
+            && now < ended + TICK_NS
+        {
+            log::warn(&format!(
+                "window: tick: tick {} came {} ns early after the last one's work",
+                self.ticks,
+                ended + TICK_NS - now
+            ));
+        }
         self.last_tick = now;
         self.first_tick.get_or_insert(now);
         self.ui.set_text(self.count, &format!("{}", self.ticks));
         self.move_square();
+        if self.mode == TickMode::Slow {
+            if let Err(e) = self.time.sleep(SLOW_NS) {
+                log::error(&format!("window: tick: slow: {e}"));
+            }
+            self.work_ended = Some(clock(&self.time));
+        }
         if self.mode == TickMode::Quit && self.ticks == QUIT_AT { Flow::Quit } else { Flow::Carry }
     }
 }
@@ -604,6 +632,7 @@ fn tick(mode: &str) -> i32 {
         "" => TickMode::Plain,
         "greedy" => TickMode::Greedy,
         "quit" => TickMode::Quit,
+        "slow" => TickMode::Slow,
         other => {
             log::error(&format!("window: tick: no mode {other}"));
             return 1;

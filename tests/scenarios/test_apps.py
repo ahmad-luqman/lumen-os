@@ -981,3 +981,19 @@ def test_sdk_a_tick_can_quit(boot):
     end_line(m, mark, "window", app_id, "exited with 0")
     assert tick_ended(m, mark, "quit") == 5
     gui.wait_no_window(m, "window")
+
+
+def test_sdk_an_overrunning_tick_still_waits_a_period(boot):
+    # `tick slow`: each tick's work (a 75 ms sleep) is longer than its
+    # 50 ms period, so the pacer's next deadline has always passed when the
+    # work ends: only its count from the end of the work (`Pacer::ticked`)
+    # keeps the next tick a period away. Deterministic: the work is longer
+    # than the period however fast the host. The app WARNs on a tick less
+    # than a period after the last one's work ended; a few ticks, then
+    # closed.
+    m = boot_desktop(boot)
+    app_id, mark, wid, _ = start_ticker(m, "slow")
+    gui.wait_ui(m, "four slow ticks", lambda r: ticks(r) >= 4, wid, 30)
+    gui.close_window(m, "window")
+    end_line(m, mark, "window", app_id, "exited with 0")
+    assert tick_ended(m, mark) >= 4
