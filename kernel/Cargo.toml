@@ -40,6 +40,7 @@ lumen-uart.workspace = true
 lumen-ui.workspace = true
 lumen-wm.workspace = true
 limine.workspace = true
+linux-raw-sys.workspace = true
 log.workspace = true
 rustc-demangle.workspace = true
 noto-sans-mono-bitmap.workspace = true

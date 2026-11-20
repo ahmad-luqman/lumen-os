@@ -1,0 +1,9 @@
+# Features: Linux x86-64 user space and syscall ABI (M6+). See tests/features/README.md for the format.
+
+[[feature]]
+name = "linux-raw-sys 0.12.1 (MIT elected, zero transitive deps) pinned and linked into both kernels (#232) with the flag audit passing: all 30 M6 Linux x86-64 syscall numbers, core errno constants, terminal ioctl requests, arch_prctl FS codes, CLOCK_* IDs, and ABI struct sizes (`new_utsname`, `timespec`, `iovec`, `stat`, `termios`, `winsize`, `rlimit64`, `sigaction`) match ARCHITECTURE section 8"
+milestone = "M6"
+tests = [
+    "ktest:lumen_kernel::linux::abi_constants_match_spec",
+    "audit:flags",
+]
