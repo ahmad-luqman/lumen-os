@@ -21,6 +21,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "editor"
+version = "0.0.1"
+dependencies = [
+ "lumen-app",
+ "lumen-edit",
+ "lumen-ui",
+]
+
+[[package]]
 name = "embedded-io"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -57,6 +66,10 @@ dependencies = [
 
 [[package]]
 name = "lumen-calc"
+version = "0.0.1"
+
+[[package]]
+name = "lumen-edit"
 version = "0.0.1"
 
 [[package]]
