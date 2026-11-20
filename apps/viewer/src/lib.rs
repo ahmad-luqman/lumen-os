@@ -117,14 +117,23 @@ impl Viewer {
             pan: Pan::default(),
             dirty: true,
         };
-        v.choose(first);
+        v.start(first);
         v
     }
 
-    /// Choose image `i`: the list's selection follows (leaving the focus
-    /// where it is: Enter on a focused Next keeps pressing Next), the image
-    /// shown is dropped, and the next tick decodes it.
+    /// Choose image `i`; the one already chosen (shown, refused, or still
+    /// waiting for its decode) changes nothing, so a click on it never
+    /// decodes it again.
     fn choose(&mut self, i: usize) {
+        if i != self.current {
+            self.start(i);
+        }
+    }
+
+    /// Start showing image `i`: the list's selection follows (leaving the
+    /// focus where it is: Enter on a focused Next keeps pressing Next), the
+    /// image shown is dropped, and the next tick decodes it.
+    fn start(&mut self, i: usize) {
         self.ui.set_selected(self.list, Some(i));
         self.current = i;
         self.shown = Shown::Decoding;
