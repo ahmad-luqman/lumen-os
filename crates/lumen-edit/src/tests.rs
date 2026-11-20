@@ -74,6 +74,11 @@ fn new_says_whether_it_cut_the_text() {
     // A tab counts as its spaces.
     let (e, loaded) = Editor::new("a\t", lim);
     assert_eq!((e.text(), loaded), ("a   ", Loaded { cut: true }));
+    // A line is cut by its bytes, not its chars: two two-byte chars fill 4
+    // (the text's cap well past them).
+    let wide = Limits { text_bytes: 100, ..lim };
+    let (e, loaded) = Editor::new("ééé\nab", wide);
+    assert_eq!((e.text(), loaded), ("éé", Loaded { cut: true }));
 }
 
 #[test]
