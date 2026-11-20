@@ -3564,11 +3564,16 @@ message, a trap's, `Failed`'s text and an unknown manifest grant (cut at
 | `CLOSE_GRACE_SLICES` | 4 | the app is ended |
 | `KILL_WAIT_NS` | 1 s | `kill` says "still ending" |
 
-The heaviest planned app, the viewer (#204), fits `MEMORY_PAGES`: its
-1 MiB wasm stack, the decoded wallpaper (1280 × 800 × 4 bytes),
-`zune-png`'s inflated rows and RGB output, and a full-size canvas come to
-about 13 MiB. wasmi runs floating point as soft-float in the kernel (no
-SSE); #197 checks the results' bits.
+The heaviest app, the viewer (#204), fits `MEMORY_PAGES`, and takes all
+of it (16 MiB): its 1 MiB wasm stack and data, a full-size canvas, and,
+while one decodes, `zune-png`'s buffers (the inflated rows, the
+deinterlaced and the stripped samples, then the pixels) for the costliest
+PNG it takes (`lumen_view::admit`: 8-bit RGB at 1280 × 800, or what
+inflates to no more), the image shown (1280 × 800 × 4 bytes) and its fitted
+copy, measured through the app's own allocator logic by `lumen-view`'s
+`tests/memory.rs` (a 12.3 MB peak of a 14.5 MB heap, fragmentation after
+rounds of images included). wasmi runs floating point as soft-float in the
+kernel (no SSE); #197 checks the results' bits.
 
 #### Apps' automation trees (#207)
 
@@ -3852,6 +3857,35 @@ SSE); #197 checks the results' bits.
       first held answer.
   - **`test-window tick [greedy|quit|slow]`** exercises it (`slow`: each
     tick's work longer than its period, the next still a period after it).
+- **What #204 adds (the image viewer, `apps/viewer`, bundled):** images
+  built into the app (the wallpaper, `assets/wallpaper/lumen.png`; and
+  `apps/viewer/images/`, made by `tools/viewer-images.py`: a palette image,
+  a 16-bit grey one, and `broken.png`, whose IDAT's CRC is wrong) decoded
+  inside it by `lumen-png` (a path dependency of `apps/`, built for wasm32:
+  `zune-png` and `miniz_oxide`'s inflater; the module is about 390 KB), so a
+  bad file can only end the app. Manifest `time, desktop`: it runs on
+  `run_until`, its one tick (`period()` set only while an image waits) the
+  decode, so a request choosing an image is answered at once with
+  `decoding <name>`, and the window settles once it is shown.
+  - **What it decodes:** `lumen_view::admit`, from the PNG's header before
+    anything is inflated: at most 1280 × 800, and inflated rows of at most
+    `MAX_ROW_BYTES` (8-bit RGB at that size), else refused, as the decoder
+    refuses a bad file: the error shown in the view and the `Info` label,
+    one INFO line (`viewer: <name>: <why>`), and the app goes on.
+  - **The window:** 640 × 480, the tree in a 200-pixel panel on the left
+    (`with_area`: the `Images` list, `Previous`, `Next`, the `Fit`
+    checkbox, the `Info` label: `<name> <w>x<h>`, `decoding <name>` or
+    `<name>: <why>`), the view on the right, the app's own (one rectangle
+    of damage when it changes). Fitted (the start): the image's shape kept,
+    nearest neighbour, centred, a copy scaled once. At 1:1: from its top
+    left, the arrow keys panning (taken before the toolkit) in steps of
+    40, clamped so the view stays filled; a smaller image centred.
+    `run viewer <name>` chooses the first image.
+  - **Memory:** fixed at `lumen_view::MEMORY_BYTES` (16 MiB, its
+    `build.rs`), which the app checks at its start, with its heap's start
+    against the plan's stack and data (an ERROR and exit 1 otherwise).
+  - **Its logic** is `crates/lumen-view` (host-tested): the geometry, the
+    pan, the fitted copy, `admit`, and the memory plan.
 - **The launcher** (#157's taskbar) lists the bundled apps whose
   manifest lists `desktop`, never the test apps, after its four demo
   items, by name, and starts one through `run`'s path without waiting

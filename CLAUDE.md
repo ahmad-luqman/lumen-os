@@ -517,6 +517,12 @@ own PR that updates that doc first.
   worst trees against `TREE_COPIES_BYTES`, counting allocators).
 - `crates/lumen-calc`: the calculator app's logic (#207): keys in, the
   display out, left to right in exact decimal fixed point (host-tested).
+- `crates/lumen-view`: the image viewer app's logic (#204): an image at 1:1
+  (`actual`, `Pan`) or fitted (`fitted`, `scale`: nearest neighbour), what
+  it decodes (`admit`: size and inflated bytes from the header), and its
+  memory plan (`MEMORY_BYTES`; `tests/memory.rs` runs the app's
+  allocations, worst-case PNGs included, through `lumen-heap` over its heap
+  size) (host-tested).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
@@ -530,7 +536,9 @@ own PR that updates that doc first.
   `build/apps/tests/`, skipping libraries (`lumen-app`, the SDK, #206;
   `testkit`); `template`, the app `make app NAME=` copies
   (`tools/new-app.sh`); `calculator` (#207, the first app on the SDK's
-  `ui::Toolkit`, lumen-ui inside the app); the SDK's loops (`run_with`'s
+  `ui::Toolkit`, lumen-ui inside the app); `viewer` (#204, bundled images
+  decoded inside the app by `lumen-png`, `apps/viewer/images/` made by
+  `tools/viewer-images.py`); the SDK's loops (`run_with`'s
   `Taken`, `run_until` for a `Ticking` app, both returning `Ended`;
   `Event::offer`; `with_area`, `palette`) for the animated apps; the
   layout, the SDK, the
