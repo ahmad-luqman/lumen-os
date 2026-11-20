@@ -380,7 +380,8 @@ own PR that updates that doc first.
   randomized model of damage-only repainting with focus, and
   press-pause-resume-release through the queue).
 - `crates/lumen-ui`: the desktop's toolkit (#156): a retained widget tree
-  (`Ui`: stacks (`Stack` handles), labels (`fixed_label`), buttons, checkboxes, text fields, lists,
+  (`Ui`: stacks (`Stack` handles), labels (`fixed_label`), buttons, checkboxes, text fields, text areas
+  (`text_area`, #203: a `textfield` node its app draws), lists,
   menus with items (#157); `Ui::bar` (across, one widget pinned right); `remove`
   (generational `Widget`s: a freed slot taken again); per-widget damage (`take_damage`,
   `paint_in`); layout,
@@ -517,6 +518,10 @@ own PR that updates that doc first.
   worst trees against `TREE_COPIES_BYTES`, counting allocators).
 - `crates/lumen-calc`: the calculator app's logic (#207): keys in, the
   display out, left to right in exact decimal fixed point (host-tested).
+- `crates/lumen-edit`: the text editor app's logic (#203): a buffer with a
+  cursor, edits undone and redone (a typing run as one), the size and
+  history `Limits`, a view's scroll, and the `Change` naming the lines to
+  redraw (host-tested, incl. a randomized model against a naive editor).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
@@ -530,7 +535,7 @@ own PR that updates that doc first.
   `build/apps/tests/`, skipping libraries (`lumen-app`, the SDK, #206;
   `testkit`); `template`, the app `make app NAME=` copies
   (`tools/new-app.sh`); `calculator` (#207, the first app on the SDK's
-  `ui::Toolkit`, lumen-ui inside the app); the SDK's loops (`run_with`'s
+  `ui::Toolkit`, lumen-ui inside the app); `editor` (#203, on `lumen-edit`); the SDK's loops (`run_with`'s
   `Taken`, `run_until` for a `Ticking` app, both returning `Ended`;
   `Event::offer`; `with_area`, `palette`) for the animated apps; the
   layout, the SDK, the

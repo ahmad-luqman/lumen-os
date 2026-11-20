@@ -3852,6 +3852,17 @@ SSE); #197 checks the results' bits.
       first held answer.
   - **`test-window tick [greedy|quit|slow]`** exercises it (`slow`: each
     tick's work longer than its period, the next still a period after it).
+- **What #203 adds (the text editor):** `apps/editor` (bundled; `caps=time,desktop`), its editing
+  `crates/lumen-edit` (a path dependency, host-tested: the buffer, the cursor, a typing run undone as
+  one edit, the size and history `Limits`, the view's scroll, and the `Change` naming the lines to
+  redraw), and `lumen_ui::Ui::text_area`: a `textfield` node of a given size whose text its app draws
+  over it and edits (keys never edit it; `Ui::set_text` changes the node to publish but repaints
+  nothing; a focus change repaints only its ring), so an editor's buffer is one node whose value is
+  its text without the tree painting the text again. The editor's buffer node shows the text's first
+  `TEXT_BYTES` (the tree's cap); a `set_value` (at most `SET_VALUE_BYTES`) replaces the text as one
+  edit. It draws by damage, only inside `Over`'s rectangles, and blinks its cursor on `run_until`
+  (a fixed 500 ms period, solid through the tick after a key; `--no-blink` keeps it solid, so its
+  window settles).
 - **The launcher** (#157's taskbar) lists the bundled apps whose
   manifest lists `desktop`, never the test apps, after its four demo
   items, by name, and starts one through `run`'s path without waiting
@@ -4828,7 +4839,7 @@ impl Role { pub fn actions(self) -> &'static [ActionKind]; }
   | `label` | `Text` | none | `disabled`, `hidden` | |
   | `button` | none | `press`, `focus` | `focused`, `disabled`, `hidden` | the owner |
   | `checkbox` | `Checked` | `press` (toggles), `focus` | `focused`, `disabled`, `hidden` | the owner |
-  | `textfield` | `Text` | `set_value <text>` (replaces the text, as one edit, not keystrokes), `focus` | `focused`, `disabled`, `hidden` | the owner |
+  | `textfield` (a text field; or a text area, `Ui::text_area`, #203: its text drawn and edited by its app, the tree painting only its field, border and ring) | `Text` | `set_value <text>` (replaces the text, as one edit, not keystrokes), `focus` | `focused`, `disabled`, `hidden` | the owner |
   | `list` | `Selected` | `focus` | `focused`, `disabled`, `hidden` | the owner |
   | `listitem` | none | `select`, `press` | `selected`, `disabled`, `hidden` | the owner |
   | `menu` | none | `press`, `focus` | `focused`, `disabled`, `expanded`, `hidden` | the owner |
