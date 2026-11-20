@@ -1021,6 +1021,18 @@ def life_state(rows: list[dict[str, str]]) -> str:
     return gui.node(rows, "label", "State")["value"]
 
 
+def life_pattern(rows: list[dict[str, str]]) -> str:
+    return gui.node(rows, "label", "Pattern")["value"]
+
+
+def choose(m, rows: list[dict[str, str]], name: str, animating: bool = False) -> None:
+    """`ui invoke <pattern name> select` in the Patterns list: answered
+    with its row, or still running (the caller confirms the effect)."""
+    item = gui.node(rows, "listitem", name)
+    got = gui.invoke(m, item["id"], "select", animating=animating)
+    assert got.still_running or (got.row is not None and got.row["id"] == item["id"]), got
+
+
 def life_tree(m) -> tuple[str, list[dict[str, str]]]:
     return wait_tree(m, "Life", "Generation")
 
@@ -1052,23 +1064,22 @@ def test_life_refuses_arguments_it_doesnt_take(boot):
 
 
 def test_life_golden(boot, artifacts, golden_dir):
-    # `run life --stopped`: no period, so the window settles. Acorn chosen
-    # in its list (a pattern starts it again at generation 0), then twelve
-    # presses of Step (each one generation: settled between them), against
-    # a golden of its client area. Then Start runs it (the generation grows
-    # while it animates) and Stop settles it again, the generation staying
-    # put.
+    # `run life --stopped glider`: the glider, stopped (no period, so the
+    # window settles). Acorn chosen in its list starts it again at
+    # generation 0, still stopped; twelve presses of Step (each one
+    # generation, answered, or settled if still running) against a golden of
+    # its client area. Start runs it (the generation grows while it
+    # animates); the glider chosen while it runs starts again from it,
+    # still running. Stop settles it; acorn chosen then is generation 0,
+    # stopped.
     m = boot_desktop(boot)
-    app_id, mark = start(m, "life --stopped")
+    app_id, mark = start(m, "life --stopped glider")
     wid, rows = life_tree(m)
-    assert (life_state(rows), generation(rows)) == ("stopped", 0), rows
-    assert gui.node(rows, "label", "Pattern")["value"] == "gun"
-    acorn = gui.node(rows, "listitem", "acorn")
-    chosen = gui.invoke(m, acorn["id"], "select")
-    assert chosen.row is not None or chosen.still_running, chosen
+    assert (life_state(rows), generation(rows), life_pattern(rows)) == ("stopped", 0, "glider")
+    choose(m, rows, "acorn")
     gui.wait_settled(m)
     rows = below_root(gui.ui_tree(m, wid))
-    assert gui.node(rows, "label", "Pattern")["value"] == "acorn"
+    assert (life_state(rows), generation(rows), life_pattern(rows)) == ("stopped", 0, "acorn")
     assert gui.node(rows, "list", "Patterns")["value"] == "4", rows
     gui.press_buttons(m, rows, *["Step"] * 12)
     rows = below_root(gui.ui_tree(m, wid))
@@ -1085,11 +1096,32 @@ def test_life_golden(boot, artifacts, golden_dir):
     )
     rows = gui.press_animated(m, rows, "Start", "running", lambda r: generation(r) > 12, wid)
     assert life_state(rows) == "running", rows
+    choose(m, rows, "glider", animating=True)
+    rows = gui.wait_ui(
+        m,
+        "the glider chosen while running",
+        lambda r: life_pattern(r) == "glider" and life_state(r) == "running",
+        wid,
+        30,
+    )
+    seen = generation(rows)
+    rows = gui.wait_ui(
+        m,
+        "the glider running",
+        lambda r: life_pattern(r) == "glider" and generation(r) > seen,
+        wid,
+        30,
+    )
     rows = gui.press_animated(m, rows, "Stop", "stopped", lambda r: life_state(r) == "stopped", wid)
     gui.wait_settled(m)
     stopped_at = generation(gui.ui_tree(m, wid))
     gui.wait_settled(m)
-    assert generation(gui.ui_tree(m, wid)) == stopped_at
+    rows = below_root(gui.ui_tree(m, wid))
+    assert generation(rows) == stopped_at
+    choose(m, rows, "acorn")
+    gui.wait_settled(m)
+    rows = below_root(gui.ui_tree(m, wid))
+    assert (life_state(rows), generation(rows), life_pattern(rows)) == ("stopped", 0, "acorn")
     gui.close_window(m, "Life")
     end_line(m, mark, "life", app_id, "exited with 0")
 
