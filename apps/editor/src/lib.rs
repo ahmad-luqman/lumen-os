@@ -59,6 +59,9 @@ const HEIGHT: u32 = 400;
 /// The text's margin inside the area's border.
 const TEXT_PAD: i32 = 4;
 const CURSOR_W: u32 = 2;
+/// How far left of where a glyph starts it may draw (at `UI_TEXT_PX`): an
+/// edit at the cursor repaints from this far before it.
+const GLYPH_OVERHANG: i32 = 4;
 const BLINK_NS: u64 = 500_000_000;
 /// What the editor holds at most: 16 KiB of text, 4 KiB a line, and 500
 /// edits or 256 KiB of their text to undo (the app's memory is 4 MiB).
@@ -262,7 +265,10 @@ impl EditorApp {
             && let (Some(band), Some(old), Some(new)) = (self.line_rect(l), old_cursor, self.cursor_rect())
             && self.drawn.last() == Some(&band)
         {
-            let x = old.x().min(new.x());
+            // A few pixels before it too: a glyph reaches past where it
+            // starts (its anti-aliased edge, a kerned pair), so one typed or
+            // deleted at the cursor changes a pixel or two to its left.
+            let x = (old.x().min(new.x()) - GLYPH_OVERHANG).max(band.x());
             self.drawn.pop();
             self.drawn.push(Rect::new(x, band.y(), (band.right() - x) as u32, band.h()));
         }
