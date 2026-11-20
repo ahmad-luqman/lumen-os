@@ -1,0 +1,24 @@
+[package]
+name = "viewer"
+description = "The image viewer (#204): bundled images (the wallpaper, small test images, a corrupt one) decoded inside the app by lumen-png, so a bad file can only end the app; shown at 1:1 (panned with the arrow keys) or fitted to the view; the list, Previous/Next and Fit as automation nodes, the image's name and size in a label. Its geometry and memory plan are lumen-view's (host-tested)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+# A WASM module has no host-side tests: its logic is lumen-view's, and the
+# kernel runs it (tests/scenarios/test_apps.py).
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+lumen-app.workspace = true
+lumen-png.workspace = true
+lumen-ui.workspace = true
+lumen-view.workspace = true
+
+[lints]
+workspace = true
