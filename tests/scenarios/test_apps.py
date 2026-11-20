@@ -655,7 +655,8 @@ def test_snake_tree_and_steps(boot):
     # straight on it flies into the edge (`over: edge`), after which Play and
     # Step are disabled; Restart steps again (as launched); flying (Play),
     # it steps by itself until the same edge ends it, and the desktop
-    # settles once it has; its close ends it with 0. Arguments it doesn't
+    # settles once it has, Restart then stepping again too; its close ends
+    # it with 0. Arguments it doesn't
     # take: an ERROR naming them, exit 2.
     m = boot_desktop(boot)
     app_id, mark = start(m, f"comet --seed {COMET_SEED} --step")
@@ -741,6 +742,10 @@ def test_snake_tree_and_steps(boot):
         comet_at(x + COMET_STEPS_TO_EDGE, y),
     ), labels
     gui.wait_settled(m)
+    # That game ended flying; Restart still starts the next one stepping,
+    # as launched.
+    gui.press_buttons(m, rows, "Restart")
+    assert comet_labels(m, wid)["State"] == "stepping"
     gui.close_window(m, "Comet")
     end_line(m, mark, "comet", app_id, "exited with 0")
 
