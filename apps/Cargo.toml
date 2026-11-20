@@ -21,7 +21,10 @@ repository = "https://github.com/ahmad-luqman/lumen-os"
 # Crates the apps share with the kernel: path dependencies on crates/.
 [workspace.dependencies]
 lumen-app-api = { path = "../crates/lumen-app-api" }
+lumen-calc = { path = "../crates/lumen-calc" }
+lumen-gfx = { path = "../crates/lumen-gfx" }
 lumen-heap = { path = "../crates/lumen-heap" }
+lumen-ui = { path = "../crates/lumen-ui" }
 lumen-app = { path = "lumen-app" }
 testkit = { path = "testkit" }
 

@@ -89,8 +89,11 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     host::panic(ptr(msg.as_ptr()), msg.len() as i32)
 }
 
-/// The heap the bump allocator hands out: inside the app's fixed memory.
-const HEAP_BYTES: usize = 64 * 1024;
+/// The heap the bump allocator hands out (never freed): inside the app's
+/// fixed memory, in its zeroed data (no bytes in the module). 256 KiB:
+/// `abuse window`'s trees (#207) are a byte past `TREE_BYTES` (64 KiB) and
+/// exactly at it.
+const HEAP_BYTES: usize = 256 * 1024;
 
 struct Bump {
     heap: UnsafeCell<[u8; HEAP_BYTES]>,

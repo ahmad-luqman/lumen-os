@@ -12,8 +12,13 @@
 //!   [`Desktop`] (opening a window, measuring text), [`Window`] (its canvas,
 //!   commits, events, text drawn into the canvas), [`Trace`] (X-ray's
 //!   reads), [`args`] and [`exit`];
+//! - [`ui`] (#207): `lumen-ui` inside the app, the kernel's toolkit: its
+//!   text through the host's text calls ([`ui::HostText`]), one step per
+//!   event ([`ui::Toolkit`]: painted, committed, its tree published, then a
+//!   request answered), so the app's window shows in `ui tree` and `ui
+//!   invoke` reaches its widgets as a click does;
 //! - [`api`] (`lumen-app-api`): the error codes, the limits, the fixed
-//!   layouts and [`Event`].
+//!   layouts, [`Event`], the tree and the answer.
 //!
 //! An app is a `no_std` `cdylib` (apps/template is one to copy: `make app
 //! NAME=foo`). Float functions such as `f32::sqrt` aren't in `core`, and
@@ -24,6 +29,7 @@
 extern crate alloc;
 
 mod heap;
+pub mod ui;
 
 /// The `lumen` host functions as the module imports them (declared once,
 /// in `lumen-app-api`); apps use the wrappers here.
@@ -37,7 +43,9 @@ pub use lumen_app_api as api;
 pub use lumen_app_api::event::{Button, Buttons, Event, KeyAction, KeyCode, Mods, Palette, ThemeId, mods};
 pub use lumen_app_api::layout::Rect;
 pub use lumen_app_api::{Error, Grant, LogLevel};
+pub use lumen_gfx::Surface;
 
+use lumen_app_api::answer::AppAnswer;
 use lumen_app_api::layout::{CANVAS_SIZE, Canvas, RECT_SIZE, TextDraw};
 use lumen_app_api::limits::{ARGS_BYTES, COMMIT_RECTS, EVENT_BYTES, TEXT_BYTES, WINDOW_PIXELS};
 use sys::ptr;
@@ -212,10 +220,7 @@ impl Desktop {
         if pixels == 0 || pixels > WINDOW_PIXELS {
             return Err(Error::BadArgument);
         }
-        let pixels = pixels as usize;
-        let mut canvas = Vec::new();
-        canvas.try_reserve_exact(pixels).map_err(|_| Error::OutOfMemory)?;
-        canvas.resize(pixels, 0);
+        let canvas = Surface::with_stride(w, h, w as usize).ok_or(Error::OutOfMemory)?;
         let handle = Handle::from_result(sys::window_open(
             self.0.raw(),
             ptr(title.as_ptr()),
@@ -223,52 +228,62 @@ impl Desktop {
             w as i32,
             h as i32,
         ))?;
-        Ok(Window { handle, desktop: *self, canvas, w, h })
+        Ok(Window { handle, desktop: *self, canvas })
     }
 }
 
+/// A surface as the host's text and commit calls take a canvas.
+fn canvas_of(s: &Surface) -> [u8; CANVAS_SIZE] {
+    Canvas { ptr: ptr(s.pixels().as_ptr()) as u32, stride: s.stride() as u32, w: s.width(), h: s.height() }.encode()
+}
+
 /// The app's window: its canvas (`w` × `h` pixels, `0x00RRGGBB`, row after
-/// row) is the app's to draw in; [`Window::commit`] shows parts of it.
-/// Dropping it closes the window.
+/// row, a `lumen_gfx::Surface`) is the app's to draw in; [`Window::commit`]
+/// shows parts of it. Dropping it closes the window.
 pub struct Window {
     handle: Handle,
     desktop: Desktop,
-    canvas: Vec<u32>,
-    w: u32,
-    h: u32,
+    canvas: Surface,
 }
 
 impl Window {
     pub fn width(&self) -> u32 {
-        self.w
+        self.canvas.width()
     }
 
     pub fn height(&self) -> u32 {
-        self.h
+        self.canvas.height()
     }
 
     /// The whole client area.
     pub fn bounds(&self) -> Rect {
-        Rect::new(0, 0, self.w, self.h)
+        Rect::new(0, 0, self.width(), self.height())
+    }
+
+    /// The desktop it opened on (its text calls).
+    pub fn desktop(&self) -> Desktop {
+        self.desktop
     }
 
     /// The canvas's pixels, row after row.
     pub fn pixels_mut(&mut self) -> &mut [u32] {
+        self.canvas.pixels_mut()
+    }
+
+    /// The canvas, as a surface to draw on (lumen-gfx's fills and blits,
+    /// lumen-ui's painting).
+    pub fn surface_mut(&mut self) -> &mut Surface {
         &mut self.canvas
     }
 
     /// The canvas as the host functions take it.
     fn layout(&self) -> [u8; CANVAS_SIZE] {
-        Canvas { ptr: ptr(self.canvas.as_ptr()) as u32, stride: self.w, w: self.w, h: self.h }.encode()
+        canvas_of(&self.canvas)
     }
 
     /// Fill `r` (clipped to the canvas) with `rgb`.
     pub fn fill(&mut self, r: Rect, rgb: u32) {
-        let Some(c) = r.clip(self.w, self.h) else { return };
-        for y in c.y()..c.y() + c.h() {
-            let row = (y * self.w) as usize;
-            self.canvas[row + c.x() as usize..row + (c.x() + c.w()) as usize].fill(rgb);
-        }
+        self.canvas.fill_rect(lumen_gfx::Rect::new(r.x, r.y, r.w, r.h), rgb);
     }
 
     /// Draw `text` at `px` in `rgb` with its line box's top left at (`x`,
@@ -332,6 +347,20 @@ impl Window {
             return Ok(None);
         }
         Event::decode(&buf[..n as usize]).map(Some).map_err(|_| Error::BadArgument)
+    }
+
+    /// Publish the window's automation tree (`api::tree::Tree::encode`'s
+    /// bytes): `ui tree` shows it from now on. A refused one
+    /// (`BadArgument`) leaves the last.
+    pub fn publish(&self, tree: &[u8]) -> Result<()> {
+        check(sys::window_publish(self.handle.raw(), ptr(tree.as_ptr()), tree.len() as i32)).map(|_| ())
+    }
+
+    /// Answer the window's running request (the last `Event::Request`
+    /// read); `BadArgument` with none running.
+    pub fn answer(&self, answer: &AppAnswer) -> Result<()> {
+        let bytes = answer.encode().map_err(|_| Error::BadArgument)?;
+        check(sys::window_answer(self.handle.raw(), ptr(bytes.as_ptr()), bytes.len() as i32)).map(|_| ())
     }
 
     /// The next event, waiting for one as long as it takes.

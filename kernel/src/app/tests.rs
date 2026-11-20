@@ -1059,7 +1059,8 @@ fn poke(store: &mut Store<runtime::AppCtx>, at: usize, bytes: &[u8]) {
 }
 
 /// `lumen_main` of a module importing `handle_find`, `window_open`,
-/// `window_commit`, `text_draw` and `text_measure` (functions 0 to 4): it
+/// `window_commit`, `text_draw`, `text_measure` and `window_publish`
+/// (functions 0 to 5): it
 /// opens a 16 × 16 window titled by
 /// the byte at 128, then runs `then` (with the desktop handle in local 0
 /// and the window's in local 1), and returns the window's handle.
@@ -1076,7 +1077,14 @@ fn window_module(then: &[u8]) -> Vec<u8> {
         local_get(1), // return it
     ]
     .concat();
-    let spec = Spec::importing(&["handle_find", "window_open", "window_commit", "text_draw", "text_measure"]);
+    let spec = Spec::importing(&[
+        "handle_find",
+        "window_open",
+        "window_commit",
+        "text_draw",
+        "text_measure",
+        "window_publish",
+    ]);
     Spec { body, locals: vec![0x01, 0x02, 0x7f], ..spec }.bytes()
 }
 
@@ -1099,6 +1107,44 @@ fn run_window_module(bytes: &[u8], draw: TextDraw, text: &[u8]) -> Result<(i32, 
     let used = SLICE_FUEL - store.get_fuel().map_err(|_| "no fuel")? + store.data().debt();
     Ok((result, used, store.data().glyphs_rasterized()))
 }
+
+crate::ktest!(
+    fn window_publish_charges_by_the_byte_and_the_node() {
+        // window_publish of 100 buttons: BYTE_FUEL per byte copied in and
+        // NODE_FUEL per node decoded, on top of the open's; a refused tree
+        // (an id twice) still pays for its bytes. Floors only.
+        use lumen_app_api::limits::{BYTE_FUEL, NODE_FUEL};
+        use lumen_app_api::tree::{Common, Node, Tree};
+        let pixels = 16 * 16;
+        let none = TextDraw::default();
+        let button = |id| Node::Button {
+            common: Common {
+                id,
+                name: alloc::string::String::from("b"),
+                bounds: LRect::new(0, 0, 1, 1),
+                disabled: false,
+                hidden: false,
+            },
+            focused: false,
+        };
+        let tree = Tree::new((1..=100).map(button).collect()).map_err(|_| "a tree")?.encode().map_err(|_| "encoded")?;
+        // window_publish(window, tree at 256, its length)
+        let publish = [local_get(1), args(&[256, tree.len() as i32]), call(5), vec![DROP]].concat();
+        let (win, used, _) = run_window_module(&window_module(&publish), none, &tree)?;
+        crate::ktest::diag(format_args!("window_publish of 100 nodes, {} bytes: {used} fuel", tree.len()));
+        crate::kassert!(win > 0);
+        let open = 2 * CALL_FUEL + SURFACES * pixels * PIXEL_FUEL;
+        crate::kassert!(used >= open + CALL_FUEL + BYTE_FUEL * tree.len() as u64 + NODE_FUEL * 100);
+        let first = Tree::new(alloc::vec![button(1)]).map_err(|_| "a tree")?.encode().map_err(|_| "encoded")?;
+        let twice = [&tree[..], &first[..]].concat();
+        let publish = [local_get(1), args(&[256, twice.len() as i32]), call(5), vec![DROP]].concat();
+        let (win, used, _) = run_window_module(&window_module(&publish), none, &twice)?;
+        crate::ktest::diag(format_args!("a refused tree of {} bytes: {used} fuel", twice.len()));
+        crate::kassert!(win > 0);
+        crate::kassert!(used >= open + CALL_FUEL + BYTE_FUEL * twice.len() as u64);
+        Ok(())
+    }
+);
 
 crate::ktest!(
     fn window_calls_charge_their_fuel() {

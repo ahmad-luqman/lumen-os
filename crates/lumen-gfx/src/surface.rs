@@ -185,6 +185,18 @@ impl Surface {
         self.stride
     }
 
+    /// Every pixel of the buffer, row after row `stride` apart (the
+    /// padding past each row's `width` included): where a WASM app's
+    /// toolkit points the host's `text_draw` (#207).
+    pub fn pixels(&self) -> &[u32] {
+        &self.pixels
+    }
+
+    /// [`Surface::pixels`], to write.
+    pub fn pixels_mut(&mut self) -> &mut [u32] {
+        &mut self.pixels
+    }
+
     /// The whole surface as a rectangle at the origin.
     #[must_use]
     pub const fn bounds(&self) -> Rect {
@@ -439,6 +451,16 @@ mod tests {
             // The padding past each row's width is untouched.
             assert!(s.pixels.chunks(stride).all(|row| row[w as usize..].iter().all(|&p| p == 0)));
         }
+    }
+
+    #[test]
+    fn pixels_are_the_whole_buffer_rows_stride_apart() {
+        let mut s = Surface::with_stride(3, 2, 5).expect("small");
+        assert_eq!(s.pixels().len(), 10);
+        s.pixels_mut()[5 + 2] = 7;
+        assert_eq!(s.row(1), &[0, 0, 7]);
+        s.set_pixel(1, 0, 9);
+        assert_eq!(s.pixels()[1], 9);
     }
 
     #[test]

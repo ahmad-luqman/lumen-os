@@ -35,6 +35,12 @@
 //!     clip (from x = 0 and from x > 0), only within the window's size on a
 //!     bigger canvas, and a call whose text lies in its own canvas drawing
 //!     what one with a separate copy does;
+//!   - `window_publish` (#207): a made-up handle, the wrong kind, a wrapping
+//!     range; no nodes, a button and a tree of exactly `TREE_BYTES`
+//!     accepted; a byte past `TREE_BYTES` (before the copy), bytes that
+//!     don't decode and an id twice refused; `window_answer`: a made-up
+//!     handle, the wrong kind, a wrapping range (before "none running"),
+//!     and no request running, refused;
 //!   - a closed window's handle `BadHandle`, a new window a new handle.
 //!
 //!   `calls` checks `window_open` without a desktop (`Unavailable`).
@@ -47,7 +53,7 @@ use alloc::format;
 use alloc::vec;
 use testkit::api::event::Event;
 use testkit::api::layout::{CANVAS_SIZE, Canvas, RECT_SIZE, Rect, TextDraw};
-use testkit::api::limits::{COMMIT_RECTS, EVENT_BYTES, TEXT_BYTES, TITLE_BYTES};
+use testkit::api::limits::{COMMIT_RECTS, EVENT_BYTES, TEXT_BYTES, TITLE_BYTES, TREE_BYTES};
 use testkit::api::trace::{EVENT_SIZE, HEADER_SIZE, decode_event, decode_header};
 use testkit::{Error, Grant, find, host, info, log_handle, named, ptr};
 
@@ -483,6 +489,55 @@ fn window(c: &mut Checks) {
     c.holds("text_draw on a canvas bigger than the window", rbig > 0);
     let past = drawn(&big, 2 * W, W..2 * W, 0..2 * H) || drawn(&big, 2 * W, 0..W, H..2 * H);
     c.holds("nothing drawn past the window's size", !past);
+
+    // window_publish and window_answer (#207): the handle, its kind, the
+    // range, then the size (before the copy), then the encoding.
+    let none = [0u8; 1];
+    let np = ptr(none.as_ptr());
+    c.check("publish on a made-up handle", host::window_publish(999, np, 0), Err(Error::BadHandle));
+    c.check("publish on the desktop handle", host::window_publish(desk, np, 0), Err(Error::WrongKind));
+    c.check("publish: a wrapping tree", host::window_publish(w, WRAPPING, 64), Err(Error::BadPointer));
+    c.check("publish: no nodes", host::window_publish(w, np, 0), Ok(()));
+    let junk = vec![0xffu8; TREE_BYTES + 1];
+    let jp = ptr(junk.as_ptr());
+    c.check(
+        "publish: a byte past TREE_BYTES",
+        host::window_publish(w, jp, TREE_BYTES as i32 + 1),
+        Err(Error::BadArgument),
+    );
+    c.check(
+        "publish: TREE_BYTES that don't decode",
+        host::window_publish(w, jp, TREE_BYTES as i32),
+        Err(Error::BadArgument),
+    );
+    // A label padded to exactly TREE_BYTES: tag 1, id 1, no name, bounds
+    // 0 0 1 1, not disabled or hidden, then its text (a 3-byte length).
+    let mut label = vec![1u8, 1, 0, 0, 0, 1, 1, 0, 0];
+    let text = TREE_BYTES - label.len() - 3;
+    label.extend_from_slice(&[(text as u8 & 0x7f) | 0x80, ((text >> 7) as u8 & 0x7f) | 0x80, (text >> 14) as u8]);
+    label.resize(TREE_BYTES, b'x');
+    c.check(
+        "publish: a tree of exactly TREE_BYTES",
+        host::window_publish(w, ptr(label.as_ptr()), TREE_BYTES as i32),
+        Ok(()),
+    );
+    // A button, app id 1: tag 2, id 1, no name, bounds, flags, not focused.
+    let button = [2u8, 1, 0, 0, 0, 1, 1, 0, 0, 0];
+    c.check("publish: a button", host::window_publish(w, ptr(button.as_ptr()), button.len() as i32), Ok(()));
+    let twice = [button, button].concat();
+    c.check(
+        "publish: an id twice",
+        host::window_publish(w, ptr(twice.as_ptr()), twice.len() as i32),
+        Err(Error::BadArgument),
+    );
+    c.check("answer on a made-up handle", host::window_answer(999, np, 1), Err(Error::BadHandle));
+    c.check("answer on the desktop handle", host::window_answer(desk, np, 1), Err(Error::WrongKind));
+    c.check(
+        "answer: a wrapping range (before none running)",
+        host::window_answer(w, WRAPPING, 64),
+        Err(Error::BadPointer),
+    );
+    c.check("answer with no request running", host::window_answer(w, np, 1), Err(Error::BadArgument));
 
     // A closed window's handle is gone; a new window gets a new handle,
     // and exactly WINDOW_PIXELS (640 × 480) opens.

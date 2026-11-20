@@ -284,6 +284,13 @@ pub struct Window {
     spin: bool,
     /// Key events its queue took.
     keys: AtomicU64,
+    /// Whether it takes one `ui invoke` request at a time (an app's window,
+    /// #207: [`WindowHandle::one_request_at_a_time`]).
+    one_request: AtomicBool,
+    /// Its one request slot, while `one_request`: taken by the request
+    /// queued or running (`ui::RequestSlot`), freed when it is answered,
+    /// skipped or refused.
+    request_out: Arc<AtomicBool>,
 }
 
 /// What a window's owner has to read, kept apart so that every wait goes
@@ -907,6 +914,8 @@ impl Desktop {
                 held: AtomicBool::new(false),
                 spin,
                 keys: AtomicU64::new(0),
+                one_request: AtomicBool::new(false),
+                request_out: Arc::new(AtomicBool::new(false)),
             });
             s.windows.push(win.clone());
             s.apply(out, &mut after);
@@ -1190,6 +1199,21 @@ impl WindowHandle {
             (core::mem::replace(&mut inner.top, top), core::mem::replace(&mut inner.nodes, nodes))
         };
         drop((old_top, old_nodes));
+    }
+
+    /// From now on the window takes one `ui invoke` request at a time: one
+    /// queued or running refuses the next with `Refused::Busy` before
+    /// anything is queued (an app's window, #207: its `window_answer`
+    /// answers *the* running request).
+    pub fn one_request_at_a_time(&self) {
+        self.win.one_request.store(true, Ordering::Release);
+    }
+
+    /// Node `id` (a global id) of the tree as last published, with its
+    /// depth (client coordinates); `None` if it isn't in it.
+    pub fn published_node(&self, id: u64) -> Option<(u32, AutomationNode)> {
+        let inner = self.win.inner.lock();
+        inner.nodes.iter().find(|(_, n)| n.id().get() == id).cloned()
     }
 
     /// Whether `desktop hold` holds this window (a `desktop spin` one).
@@ -2409,6 +2433,15 @@ impl Desktop {
             let Some(win) = s.wm.id(window).and_then(|id| s.window(id)).cloned() else {
                 s.stats.dead_pushes += 1;
                 break 'push Err(lumen_wm::Refused::Dead(req));
+            };
+            // One at a time: the slot taken here, held by the request.
+            let req = if win.one_request.load(Ordering::Acquire) {
+                match crate::ui::RequestSlot::take(&win.request_out) {
+                    Some(slot) => req.holding(slot),
+                    None => break 'push Err(lumen_wm::Refused::Busy(req)),
+                }
+            } else {
+                req
             };
             let pushed = with_queue(&win, |q| q.push_request(req));
             if pushed.is_ok() {

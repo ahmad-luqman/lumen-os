@@ -35,6 +35,21 @@
 //!   at least 1, a read whose count agrees with its header), `Desktop::
 //!   measure`, `Time::now_ns` and `wall`, `Window::wait` with a deadline,
 //!   animating and not; then `exit(7)`.
+//!
+//! The toolkit modes (#207), each its window titled `window`:
+//!
+//! - `ui`: `lumen_ui::counter::Counter` (the kernel's demo app: Add, Reset,
+//!   Lock, Quit) in the SDK's `ui::Toolkit`, published after each change,
+//!   `ui invoke` reaching it as a click does; returns 0 when its window
+//!   closes (Quit, or `Close`).
+//! - `ui-trap`: the same, but a press on Add traps (`unreachable`) while
+//!   its request runs: the request is answered `OwnerEnded`.
+//! - `deep`: publishes the deepest tree there is, `TREE_NODES` groups each
+//!   holding the next (`window: deep: published <n> nodes (<b> bytes)`),
+//!   then goes on as with no argument (events read until `Close`).
+//! - `deaf`: publishes one button (app id 1), logs `window: deaf:
+//!   published`, then sleeps for good, never reading its events: a request
+//!   to it stays queued, so its window's one request slot stays taken.
 
 #![no_std]
 
@@ -45,8 +60,14 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::hint::black_box;
 use lumen_app::api::kind::Stream;
+use lumen_app::api::layout::Rect as WireRect;
+use lumen_app::api::limits::TREE_NODES;
 use lumen_app::api::trace::{EVENT_SIZE, HEADER_SIZE, decode_header};
+use lumen_app::api::tree::{Common, Node, Tree};
+use lumen_app::ui::Toolkit;
 use lumen_app::{Desktop, Error, Event, Rect, Time, Trace, log};
+use lumen_ui::counter::Counter;
+use lumen_ui::{App, Then, Ui, UiEvent};
 
 lumen_app::manifest!(time, desktop, trace);
 lumen_app::main!(run);
@@ -113,6 +134,16 @@ fn run() -> i32 {
             return 1;
         }
     };
+    match mode {
+        "ui" => return toolkit(Counter::new(), w),
+        "ui-trap" => return toolkit(Trapping(Counter::new()), w),
+        "deep" | "deaf" => {
+            if let Err(code) = publish(mode, &w) {
+                return code;
+            }
+        }
+        _ => {}
+    }
     if mode == "rects" {
         w.fill(w.bounds(), 0x00ff_0000);
         // 20 columns 5 pixels wide, from x = 100.
@@ -221,4 +252,79 @@ fn sdk() -> i32 {
     }
     log::info(&format!("window: sdk: {run} checks, {failed} failed"));
     lumen_app::exit(7)
+}
+
+/// Counter, but a press on Add traps while its request runs.
+struct Trapping(Counter);
+
+impl App for Trapping {
+    fn ui_mut(&mut self) -> &mut Ui {
+        self.0.ui_mut()
+    }
+
+    fn apply(&mut self, events: &[UiEvent]) -> Then {
+        if events.contains(&UiEvent::Pressed(self.0.add)) {
+            core::arch::wasm32::unreachable();
+        }
+        self.0.apply(events)
+    }
+}
+
+/// The `ui` modes: `app` in the SDK's toolkit until its window closes.
+fn toolkit(app: impl App, w: lumen_app::Window) -> i32 {
+    let mut tk = match Toolkit::new(app, w) {
+        Ok(tk) => tk,
+        Err(e) => {
+            log::error(&format!("window: no toolkit: {e}"));
+            return 1;
+        }
+    };
+    log::info("window: ui: running");
+    match tk.run() {
+        Ok(()) => 0,
+        Err(e) => {
+            log::error(&format!("window: ui: {e}"));
+            2
+        }
+    }
+}
+
+/// A node of the hand-made trees: id `id`, a 10 × 10 box.
+fn common(id: u64) -> Common {
+    Common { id, name: String::new(), bounds: WireRect::new(0, 0, 10, 10), disabled: false, hidden: false }
+}
+
+/// The `deep` and `deaf` modes: a hand-made tree published; `deaf` then
+/// sleeps for good (its events never read); `deep` goes on as the plain
+/// mode (events read until `Close`). An exit code if it failed.
+fn publish(mode: &str, w: &lumen_app::Window) -> Result<(), i32> {
+    let nodes: Vec<Node> = if mode == "deep" {
+        let n = TREE_NODES as u64;
+        (1..=n).map(|id| Node::Group { common: common(id), children: u32::from(id < n) }).collect()
+    } else {
+        alloc::vec![Node::Button { common: Common { name: String::from("Go"), ..common(1) }, focused: false }]
+    };
+    let count = nodes.len();
+    let bytes = match Tree::new(nodes).and_then(|t| t.encode()) {
+        Ok(b) => b,
+        Err(e) => {
+            log::error(&format!("window: {mode}: {e}"));
+            return Err(1);
+        }
+    };
+    if let Err(e) = w.publish(&bytes) {
+        log::error(&format!("window: {mode}: publish: {e}"));
+        return Err(2);
+    }
+    if mode == "deaf" {
+        log::info("window: deaf: published");
+        let Ok(time) = Time::get() else { return Err(4) };
+        loop {
+            if time.sleep(1_000_000_000).is_err() {
+                return Err(5);
+            }
+        }
+    }
+    log::info(&format!("window: deep: published {count} nodes ({} bytes)", bytes.len()));
+    Ok(())
 }

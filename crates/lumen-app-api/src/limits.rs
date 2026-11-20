@@ -77,6 +77,15 @@ pub const EVENT_FUEL: u64 = 16;
 /// next to a wasm instruction (measured in #218's review on TCG: ~170 a
 /// character for a measure, ~430 for a draw's two passes).
 pub const TEXT_CHAR_FUEL: u64 = 256;
+/// Fuel per node (items counted) of a tree `window_publish` decodes, checks
+/// and maps to global ids, on top of `BYTE_FUEL` per byte copied in: about
+/// what building a node's automation row costs next to a wasm instruction
+/// (its strings copied, its id looked up and mapped, its row made).
+pub const NODE_FUEL: u64 = 512;
+/// The toolkit's text size, in pixels: the kernel's windows' (`font::TEXT_PX`,
+/// a `const` assertion ties them), so an app's toolkit looks like a kernel
+/// window's.
+pub const UI_TEXT_PX: u32 = 16;
 /// Windows per app.
 pub const WINDOWS: usize = 1;
 /// `Rect`s in one `window_commit`.

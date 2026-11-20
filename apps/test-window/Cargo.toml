@@ -1,6 +1,6 @@
 [package]
 name = "test-window"
-description = "A test app for windows and the SDK (#206), built on lumen-app: opens a window and reads its events until `Close`; its modes (wait, ignore-close, close, rects, log, panic, panic-utf8, alloc, sdk) each exercise one part of the runtime or the SDK (see its lib.rs)."
+description = "A test app for windows and the SDK (#206), built on lumen-app: opens a window and reads its events until `Close`; its modes (wait, ignore-close, close, rects, log, panic, panic-utf8, alloc, sdk; #207's ui, ui-trap, deep, deaf) each exercise one part of the runtime or the SDK (see its lib.rs)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,6 +16,8 @@ bench = false
 
 [dependencies]
 lumen-app.workspace = true
+# The toolkit modes (#207) run lumen-ui's Counter, the kernel's demo app.
+lumen-ui.workspace = true
 
 [lints]
 workspace = true

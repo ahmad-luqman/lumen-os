@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "calculator"
+version = "0.0.1"
+dependencies = [
+ "lumen-app",
+ "lumen-calc",
+ "lumen-ui",
+]
+
+[[package]]
 name = "cobs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -28,13 +37,16 @@ name = "lumen-app"
 version = "0.0.1"
 dependencies = [
  "lumen-app-api",
+ "lumen-gfx",
  "lumen-heap",
+ "lumen-ui",
 ]
 
 [[package]]
 name = "lumen-app-api"
 version = "0.0.1"
 dependencies = [
+ "lumen-gfx",
  "lumen-input",
  "lumen-trace",
  "lumen-ui",
@@ -42,6 +54,10 @@ dependencies = [
  "postcard",
  "serde",
 ]
+
+[[package]]
+name = "lumen-calc"
+version = "0.0.1"
 
 [[package]]
 name = "lumen-gfx"
@@ -208,6 +224,7 @@ name = "test-window"
 version = "0.0.1"
 dependencies = [
  "lumen-app",
+ "lumen-ui",
 ]
 
 [[package]]

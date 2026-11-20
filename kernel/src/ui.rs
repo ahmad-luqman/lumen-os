@@ -22,8 +22,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use lumen_gfx::{Rect, Surface};
-use lumen_input::{Button, KeyAction, KeyCode, KeyEvent};
+use lumen_input::{Button, KeyEvent};
 use lumen_shell::pipe::{self, Align, Column, Kind, Value};
 use lumen_ui::counter::Counter;
 use lumen_ui::{
@@ -52,6 +53,9 @@ pub enum Answer {
     WindowClosed,
     /// The owner dropped it while running it, unanswered (a bug).
     Dropped,
+    /// Its owner, an app, ended or closed its window while running it,
+    /// unanswered (#207): it may have run.
+    OwnerEnded,
 }
 
 /// A request's reply slot, shared by its asker and the request: the reply
@@ -85,6 +89,27 @@ impl ReplyCell {
     }
 }
 
+/// A window's one request slot, held by its request (#207: an app's window
+/// holds at most one request queued or running, `desktop::push_request`
+/// refusing another with `Refused::Busy`): freed when the request is
+/// answered, skipped or refused, before its asker is woken, so the asker's
+/// next request finds it free.
+pub struct RequestSlot(Arc<AtomicBool>);
+
+impl RequestSlot {
+    /// The slot `flag` guards, if it is free.
+    pub(crate) fn take(flag: &Arc<AtomicBool>) -> Option<RequestSlot> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).ok()?;
+        Some(RequestSlot(flag.clone()))
+    }
+}
+
+impl Drop for RequestSlot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// `ui invoke`'s request in a window's queue: the node and the action, and
 /// its reply. Not `Clone`; answers "window closed" if dropped before it
 /// ran (so `ui invoke` always ends). Dropped only with no desktop lock
@@ -94,6 +119,8 @@ pub struct Request {
     action: Action,
     /// `None` once started.
     cell: Option<Arc<ReplyCell>>,
+    /// Its window's one request slot, if its window has one.
+    slot: Option<RequestSlot>,
 }
 
 /// A request the owner took ([`Request::start`]): the only thing that can
@@ -103,6 +130,7 @@ pub struct Started {
     node: u64,
     action: Action,
     cell: Option<Arc<ReplyCell>>,
+    slot: Option<RequestSlot>,
 }
 
 /// A request cancelled at its asker's deadline: the owner skips it.
@@ -120,7 +148,23 @@ impl Request {
     /// asker's side).
     pub(crate) fn new(node: u64, action: Action) -> (Request, Arc<ReplyCell>) {
         let cell = Arc::new(ReplyCell { reply: SpinLock::new(Reply::new()), done: WaitQueue::new() });
-        (Request { node, action, cell: Some(cell.clone()) }, cell)
+        (Request { node, action, cell: Some(cell.clone()), slot: None }, cell)
+    }
+
+    /// Its window's request slot, held until it is answered, skipped or
+    /// refused.
+    pub(crate) fn holding(mut self, slot: RequestSlot) -> Request {
+        self.slot = Some(slot);
+        self
+    }
+
+    /// The node it is for (a global id).
+    pub fn node(&self) -> u64 {
+        self.node
+    }
+
+    pub fn action(&self) -> &Action {
+        &self.action
     }
 
     /// The owner takes it: a [`Started`] to answer, or [`Skipped`] if it
@@ -130,7 +174,7 @@ impl Request {
         let action = core::mem::replace(&mut self.action, Action::Press);
         let started = cell.reply.lock().start();
         match started {
-            Ok(()) => Ok(Started { node: self.node, action, cell: Some(cell) }),
+            Ok(()) => Ok(Started { node: self.node, action, cell: Some(cell), slot: self.slot.take() }),
             Err(why) => {
                 // Only the asker's cancel takes a request out of `Pending`
                 // before its owner reads it.
@@ -143,6 +187,7 @@ impl Request {
 
 impl Drop for Request {
     fn drop(&mut self) {
+        drop(self.slot.take());
         if let Some(cell) = self.cell.take() {
             cell.answer(|r| r.answer_unrun(Answer::WindowClosed));
         }
@@ -158,8 +203,10 @@ impl Started {
         &self.action
     }
 
-    /// The owner's answer, which wakes the asker.
+    /// The owner's answer, which wakes the asker (its window's request
+    /// slot freed first).
     pub fn finish(mut self, answer: Answer) {
+        drop(self.slot.take());
         if let Some(cell) = self.cell.take() {
             cell.answer(|r| r.finish(answer));
         }
@@ -180,6 +227,7 @@ pub fn refuse(req: Request) {
 
 impl Drop for Started {
     fn drop(&mut self) {
+        drop(self.slot.take());
         if let Some(cell) = self.cell.take() {
             log::error!(target: "ui", "a request on node {} was dropped while running, unanswered (a bug)", self.node);
             cell.answer(|r| r.answer_dropped(Answer::Dropped));
@@ -401,18 +449,11 @@ pub fn close(h: WindowHandle, closing: Option<Started>) {
     }
 }
 
-/// A key press as the toolkit takes it (releases and keys it ignores:
-/// `None`).
+/// A key event as the toolkit takes it (releases and keys it ignores:
+/// `None`): `lumen_app_api::event::toolkit_key`, the one mapping an app's
+/// toolkit uses too.
 fn key(k: &KeyEvent) -> Option<Key> {
-    let KeyAction::Press { text } = k.action else { return None };
-    match (k.code, text) {
-        (KeyCode::Tab, _) if k.mods.is_shifted() => Some(Key::BackTab),
-        (KeyCode::Tab, _) => Some(Key::Tab),
-        (KeyCode::Backspace, _) => Some(Key::Backspace),
-        (KeyCode::Return | KeyCode::NumpadEnter, _) => Some(Key::Enter),
-        (_, Some(c)) if !c.is_control() => Some(Key::Char(c)),
-        _ => None,
-    }
+    lumen_app_api::event::toolkit_key(k.code.into(), k.mods.into(), k.action.into())
 }
 
 // -- Counter ------------------------------------------------------------------------------
@@ -670,6 +711,9 @@ fn print_answer(ctx: &mut crate::shell::Ctx<'_>, window: u32, node: u64, answer:
         Answer::Ran(Served::Failed(why)) => ctx.fail(format_args!("ui invoke: {why}")),
         Answer::WindowClosed => ctx.fail(format_args!("ui invoke: window {window} closed before it ran")),
         Answer::Dropped => ctx.fail(format_args!("ui invoke: dropped while running (window {window}): a bug")),
+        Answer::OwnerEnded => {
+            ctx.fail(format_args!("ui invoke: window {window} closed while running it (it may have run)"))
+        }
     }
 }
 

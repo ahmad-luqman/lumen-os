@@ -123,8 +123,10 @@ impl CheckedCanvas {
     }
 }
 
-/// A rectangle in a canvas's pixels.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// A rectangle in a canvas's pixels; also a tree node's bounds on the wire
+/// (#207: serde-derived, its fields in this order, so apart from its fixed
+/// 16-byte layout here it is four varints there).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
