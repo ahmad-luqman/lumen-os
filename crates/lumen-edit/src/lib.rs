@@ -37,6 +37,17 @@ pub use keys::command;
 /// What Tab inserts: four spaces.
 pub const TAB: &str = "    ";
 
+// Spaces only, and some: a tab is never a control character in the text.
+const _: () = {
+    let bytes = TAB.as_bytes();
+    assert!(!bytes.is_empty());
+    let mut i = 0;
+    while i < bytes.len() {
+        assert!(bytes[i] == b' ');
+        i += 1;
+    }
+};
+
 /// `text` as the editor holds a text: a tab as [`TAB`], `\r\n` and a lone
 /// `\r` as `\n`, the other control characters dropped (so a file's tabs and
 /// line ends survive, M6).

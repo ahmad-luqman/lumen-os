@@ -42,7 +42,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use lumen_app::api::limits::{TEXT_BYTES, UI_TEXT_PX};
+use lumen_app::api::limits::{SET_VALUE_BYTES, TEXT_BYTES, UI_TEXT_PX};
 use lumen_app::api::text::prefix;
 use lumen_app::gfx::Rect;
 use lumen_app::ui::{Flow, Taken, Ticking, Toolkit};
@@ -63,6 +63,12 @@ const BLINK_NS: u64 = 500_000_000;
 /// What the editor holds at most: 16 KiB of text, 4 KiB a line, and 500
 /// edits or 256 KiB of their text to undo (the app's memory is 4 MiB).
 const LIMITS: Limits = Limits { text_bytes: 16 * 1024, line_bytes: 4 * 1024, undo_edits: 500, undo_bytes: 256 * 1024 };
+
+// A `set_value` (at most `SET_VALUE_BYTES`, the kernel's cap) always fits
+// the text's and a line's limits; undoing one keeps its history (twice the
+// text: what it removed and inserted); and there is a history at all.
+const _: () = assert!(SET_VALUE_BYTES <= LIMITS.text_bytes && SET_VALUE_BYTES <= LIMITS.line_bytes);
+const _: () = assert!(LIMITS.undo_bytes >= 2 * LIMITS.text_bytes && LIMITS.undo_edits > 0);
 
 /// Narrow glyphs: the narrowest of them bounds how many chars the view
 /// shows.
@@ -335,18 +341,31 @@ impl App for EditorApp {
     }
 
     fn apply(&mut self, events: &[UiEvent]) -> Then {
+        let mut then = Then::Carry;
         for e in events {
             // `set_value` on the text: one edit replacing it all.
             if let UiEvent::Edited(w) = e
                 && *w == self.area
             {
                 let old_cursor = self.cursor_rect();
-                let text = String::from(self.ui.text(self.area).unwrap_or(""));
+                // A text area always has a text: none would be a bug, said
+                // (an ERROR, the request answered failed), never taken as
+                // an empty text wiping the buffer.
+                let Some(text) = self.ui.text(self.area).map(String::from) else {
+                    log::error("editor: the text area has no text");
+                    then = Then::Failed(String::from("the text area has no text"));
+                    continue;
+                };
                 let change = self.ed.replace_all(&text);
                 self.changed(change, old_cursor);
+                if change == Change::Refused {
+                    // Past the editor's limits (a `set_value` fits them: the
+                    // assertions below), answered so, the text as it was.
+                    then = Then::Failed(String::from("text too long"));
+                }
             }
         }
-        Then::Carry
+        then
     }
 
     fn paint_over(&mut self, over: &mut Over<'_>) {
