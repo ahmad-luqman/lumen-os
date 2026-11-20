@@ -517,6 +517,13 @@ own PR that updates that doc first.
   worst trees against `TREE_COPIES_BYTES`, counting allocators).
 - `crates/lumen-calc`: the calculator app's logic (#207): keys in, the
   display out, left to right in exact decimal fixed point (host-tested).
+- `crates/lumen-clock`: the clock app's logic (#200): `TimeOfDay` (from
+  Unix seconds, `--at`'s `H[H]:MM[:SS]`, `HH:MM:SS` shown), an integer sine
+  table in half-degree steps (no floats), `Hands`, `point` and `line`
+  (Bresenham) on the face; `face::Face`, the clock's window as a
+  `lumen_ui::App` (its drawing and its hands' boxes as damage, checked
+  against full repaints); `args` (`run clock`'s arguments); `rtc` (what it
+  shows while RTC reads fail, as the taskbar's clock) (host-tested).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
@@ -530,7 +537,8 @@ own PR that updates that doc first.
   `build/apps/tests/`, skipping libraries (`lumen-app`, the SDK, #206;
   `testkit`); `template`, the app `make app NAME=` copies
   (`tools/new-app.sh`); `calculator` (#207, the first app on the SDK's
-  `ui::Toolkit`, lumen-ui inside the app); the SDK's loops (`run_with`'s
+  `ui::Toolkit`, lumen-ui inside the app); `clock` (#200, an analog face
+  on `run_until`, `--at` freezing it); the SDK's loops (`run_with`'s
   `Taken`, `run_until` for a `Ticking` app, both returning `Ended`;
   `Event::offer`; `with_area`, `palette`) for the animated apps; the
   layout, the SDK, the
