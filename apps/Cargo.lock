@@ -12,6 +12,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clock"
+version = "0.0.1"
+dependencies = [
+ "lumen-app",
+ "lumen-clock",
+ "lumen-ui",
+]
+
+[[package]]
 name = "cobs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -67,6 +76,14 @@ dependencies = [
 [[package]]
 name = "lumen-calc"
 version = "0.0.1"
+
+[[package]]
+name = "lumen-clock"
+version = "0.0.1"
+dependencies = [
+ "lumen-gfx",
+ "lumen-ui",
+]
 
 [[package]]
 name = "lumen-edit"

@@ -162,6 +162,15 @@ tests = [
 ]
 
 [[feature]]
+name = "Clock (#200): a bundled app showing an analog face and the time as a label, read from the RTC and agreeing with `date` to the second, its seconds going on while the desktop settles between its ticks, what it draws following its label (only the moved hands' boxes repainted, leaving what a full repaint does a second at a time over twelve hours and after 1,500 jumps); a failing RTC kept, then blank, as the taskbar's clock; frozen with `--at` for good (no ticks at all), refusing arguments it doesn't take with an ERROR naming each; its window matching a golden"
+milestone = "M5"
+tests = [
+    "cargo:lumen-clock",
+    "scenario:test_apps::test_clock_golden",
+    "scenario:test_apps::test_clock_tree_matches_rtc",
+]
+
+[[feature]]
 name = "Text editor on an in-memory buffer (#203): a bundled app editing its text from the keyboard (typing, Enter, Tab, Backspace and Delete, the arrows, Home and End, Page Up and Down, Ctrl+Home and Ctrl+End, Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y, undo and redo by the layout's letters), every edit undone and redone restoring the text exactly, typing undone a run at a time, its text, lines and history bounded (a refused edit said in the status line), a text given normalised; its buffer a `textfield` node whose value is the text (`set_value` replacing it as one edit that undo takes back), its status line a label with the line, the column and whether it was modified; drawn by the app over a lumen-ui text area by damage, the pixels a full repaint draws, a key costing a fraction of a full repaint, its blink stopping while unfocused, its window matching a golden"
 milestone = "M5"
 tests = [
