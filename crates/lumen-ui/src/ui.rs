@@ -554,6 +554,22 @@ impl Ui {
         }
     }
 
+    /// Select a list's item `to` (`None`: none), as the app's own choice:
+    /// like [`Ui::set_text`], it changes the value and repaints the list, and
+    /// leaves the focus where it is (a click or `ui invoke`'s `select` runs
+    /// the click's handler, which also focuses the list). An index past its
+    /// items, or another kind of widget, is ignored.
+    pub fn set_selected(&mut self, w: Widget, to: Option<usize>) {
+        let Some(i) = self.at(w) else { return };
+        if let Kind::List { items, selected } = &mut self.widgets[i].kind
+            && to.is_none_or(|t| t < items.len())
+            && *selected != to
+        {
+            *selected = to;
+            self.touch(i);
+        }
+    }
+
     /// Whether a menu is expanded.
     pub fn expanded(&self, w: Widget) -> Option<bool> {
         match &self.widgets[self.at(w)?].kind {

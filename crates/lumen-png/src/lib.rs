@@ -1,6 +1,7 @@
 //! PNG for Lumen: the encoder the kernel's `screenshot` uses ([`encode`])
-//! and the decoder the desktop's wallpaper uses ([`decode`]). Kept free of
-//! kernel dependencies so it can be tested on the host:
+//! and the decoder the desktop's wallpaper and the image viewer app (#204,
+//! inside its WASM module) use ([`decode`]). Kept free of kernel
+//! dependencies so it can be tested on the host and built for wasm32:
 //!
 //! - [`decode`]: any PNG into `0x00RRGGBB` pixels ([`decode::Image`]),
 //!   with `zune-png`; a file that isn't a PNG, is cut short or corrupt, or

@@ -1,0 +1,17 @@
+[package]
+name = "lumen-view"
+description = "no_std logic for Lumen's image viewer app (#204): an image at 1:1 (panned, or centred) or fitted to the view (nearest neighbour), admit (a file's length and a PNG's header bounding the decoder's work), prepare (the app's one call for an image: decoded and fitted, or why not, out of memory told apart), and the app's memory plan, checked by running prepare through its own allocator logic; host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lumen-app-api.workspace = true
+lumen-gfx.workspace = true
+lumen-png.workspace = true
+
+[dev-dependencies]
+lumen-heap.workspace = true
+
+[lints]
+workspace = true
