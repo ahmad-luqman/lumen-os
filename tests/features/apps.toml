@@ -162,6 +162,15 @@ tests = [
 ]
 
 [[feature]]
+name = "Clock (#200): a bundled app showing an analog face and the time as a label, read from the RTC and agreeing with `date` to the second, its seconds going on while the desktop settles between its ticks, what it draws following its label (only the moved hands' boxes repainted, leaving what a full repaint does a second at a time over twelve hours and after 1,500 jumps); a failing RTC kept, then blank, as the taskbar's clock; frozen with `--at` for good (no ticks at all), refusing arguments it doesn't take with an ERROR naming each; its window matching a golden"
+milestone = "M5"
+tests = [
+    "cargo:lumen-clock",
+    "scenario:test_apps::test_clock_golden",
+    "scenario:test_apps::test_clock_tree_matches_rtc",
+]
+
+[[feature]]
 name = "An original snake-style game (#201): Comet, a comet steered with the arrow keys across a sky of cells, its tail growing with each grain of stardust, ended by the edge, its own tail or a level's asteroids; one seed plays one game; stepping one step per Step press (settling between), flying by itself, Step while flying stepping again; Play and Step disabled once over, Restart starting as launched and redrawing the sky; score, level, state, the head's cell and heading in its tree, each label fitting its width; its window matching a golden"
 milestone = "M5"
 tests = [

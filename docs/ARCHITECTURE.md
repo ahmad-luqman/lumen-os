@@ -3852,6 +3852,29 @@ SSE); #197 checks the results' bits.
       first held answer.
   - **`test-window tick [greedy|quit|slow]`** exercises it (`slow`: each
     tick's work longer than its period, the next still a period after it).
+- **What #200 adds:** `apps/clock` (bundled, `caps=time,desktop`; the
+  launcher lists it), on `run_until`. Its window is
+  `lumen_clock::face::Face`, a `lumen_ui::App` in `crates/lumen-clock`: an
+  analog face drawn in `paint_over` (sixty dots, three hands and a hub in
+  the theme's colours) above a tree holding one `fixed_label`, `Time`,
+  whose value is the time (`HH:MM:SS`, from `time_wall`, taken as UTC, as
+  `date` shows it). When the time changes, only the boxes of the hands
+  that moved (each exactly its brush at either end) are its `take_drawn`
+  damage: the second hand's every second, the minute hand's every fifth,
+  the hour hand's every minute; host tests check that a partial repaint
+  leaves what a full one does, a second at a time over twelve hours
+  (compared every 37 s, through the first two minutes and around each
+  hour's turn) and after 1,500 jumps. It reads the RTC every 250 ms; its waits aren't `animating`
+  (a tick finding the same second draws nothing), so the desktop settles
+  between ticks. A failing RTC is handled as the taskbar's clock does
+  (`lumen_clock::rtc`): the last good reading until `CLOCK_FAILURES` (3)
+  reads fail in a row, then `--:--:--` and no hands; the first failure of a run a WARN, a
+  recovery an INFO, one at startup showing no time rather than ending the
+  app. `run clock --at H[H]:MM[:SS]` freezes it: no period at all, so the
+  window settles for good (its golden); anything else is one ERROR naming
+  the argument, with the usage, and exit 2 (`lumen_clock::args`). Its
+  geometry has no floats (an integer sine table in half-degree steps), as
+  no app has `libm`.
 - **What #201 adds:** `apps/comet` (bundled, `caps=time,desktop`; the
   launcher lists it), Comet, an original snake-style game: a comet steered
   across a sky of cells with the arrow keys, its tail growing with each
