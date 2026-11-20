@@ -100,6 +100,16 @@ impl Text for HostText {
     }
 }
 
+/// `r`, its error first logged as an ERROR naming the loop's `stage`
+/// (`ui: run_until: wait: bad handle`): a loop's caller gets only the
+/// error, not where it came from.
+fn logged<T>(stage: &str, r: Result<T>) -> Result<T> {
+    if let Err(e) = &r {
+        crate::log::error(&alloc::format!("ui: {stage}: {e}"));
+    }
+    r
+}
+
 /// What a step did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
@@ -247,11 +257,13 @@ impl<A: App> Toolkit<A> {
     /// or a game's arrows) skips the tree, then the window is refreshed. The
     /// focus coming or going and `Lost` are offered too, then always handed
     /// to the tree; a request, `Close` or `Theme` never reaches `take`.
-    /// [`Taken::Quit`] returns [`Ended::Quit`], a close [`Ended::Closed`].
+    /// [`Taken::Quit`] returns [`Ended::Quit`], a close [`Ended::Closed`]. A
+    /// failed host call ends it with that error, logged first as one ERROR
+    /// naming the stage (`ui: run_with: next event: <e>`).
     pub fn run_with(&mut self, mut take: impl FnMut(&mut A, &Event) -> Taken) -> Result<Ended> {
         loop {
-            let e = self.window.wait_event()?;
-            if let Some(ended) = self.offer(e, &mut take)? {
+            let e = logged("run_with: next event", self.window.wait_event())?;
+            if let Some(ended) = logged("run_with: event", self.offer(e, &mut take))? {
                 return Ok(ended);
             }
         }
@@ -265,33 +277,35 @@ impl<A: App> Toolkit<A> {
     /// the window refreshed; otherwise it waits for an event until the next
     /// deadline (none without a period, so the desktop can settle). `time`
     /// is the clock the deadlines are on. A tick saying [`Flow::Quit`]
-    /// returns [`Ended::Quit`].
+    /// returns [`Ended::Quit`]. A failed host call ends it with that error,
+    /// logged first as one ERROR naming the stage (`ui: run_until: wait:
+    /// <e>`, `... tick refresh ...`).
     pub fn run_until(&mut self, time: Time, mut take: impl FnMut(&mut A, &Event) -> Taken) -> Result<Ended>
     where
         A: Ticking,
     {
         let mut pacer = Pacer::new();
         loop {
-            while let Some(e) = self.window.next_event()? {
-                if let Some(ended) = self.offer(e, &mut take)? {
+            while let Some(e) = logged("run_until: next event", self.window.next_event())? {
+                if let Some(ended) = logged("run_until: event", self.offer(e, &mut take))? {
                     return Ok(ended);
                 }
             }
             // No ticks before the first `Theme`: nothing is drawn until then.
             let period = if self.themed { self.app.period() } else { None };
-            match pacer.poll(period, time.now_ns()?) {
+            match pacer.poll(period, logged("run_until: clock", time.now_ns())?) {
                 Pace::Due => {
-                    if self.app.tick(time.now_ns()?) == Flow::Quit {
+                    if self.app.tick(logged("run_until: clock", time.now_ns())?) == Flow::Quit {
                         return Ok(Ended::Quit);
                     }
-                    self.refresh()?;
-                    pacer.ticked(time.now_ns()?);
+                    logged("run_until: tick refresh", self.refresh())?;
+                    pacer.ticked(logged("run_until: clock", time.now_ns())?);
                 }
                 Pace::Until(deadline) => {
-                    self.window.wait(Some(deadline), self.app.animating())?;
+                    logged("run_until: wait", self.window.wait(Some(deadline), self.app.animating()))?;
                 }
                 Pace::Idle => {
-                    self.window.wait(None, false)?;
+                    logged("run_until: wait", self.window.wait(None, false))?;
                 }
             }
         }
