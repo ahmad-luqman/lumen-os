@@ -10,18 +10,21 @@
 //!   fitted copy dropped first): `lumen_view::prepare`, the app's own call
 //!   (`lumen-png`'s copy of the image's chunks, the decoder's buffers, the
 //!   samples, the pixels, then the fitted copy);
-//! - every bundled image, the corrupt one, and the costliest PNGs the
+//! - every bundled image (the corrupt one and the one `admit` refuses
+//!   included), and the costliest PNGs the
 //!   viewer takes to decode (`lumen_view::admit`; made by
 //!   tools/viewer-images.py, both interlaced): `worst.png`, its biggest size
 //!   in 8-bit RGB, and `worst16.png`, 16-bit RGBA at the most pixels that
 //!   allows; and a file exactly `MAX_FILE_BYTES` long whose image data is
 //!   incompressible (built here: the most the file's copies can take); each
-//!   several times, so the free list's fragmentation after a
-//!   round of them is part of what must fit.
+//!   several times.
 //!
-//! An allocation the region can't hold fails the test (it is served from
-//! the system meanwhile, so the run finishes and says how much more it
-//! needed).
+//! It passes if nothing is refused in three rounds of them, so the free
+//! list's fragmentation after a round is part of what must fit, not only
+//! the peak (11.7 MiB of the 14.5 MiB heap, when last measured: 1.4 MiB of
+//! canvas and toolkit, and 10.3 MiB while `worst16.png` decodes). An
+//! allocation the region can't hold fails the test (it is served from the
+//! system meanwhile, so the run finishes and says how much more it needed).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::UnsafeCell;
@@ -152,15 +155,16 @@ fn longest() -> Vec<u8> {
         rows -= 1;
     }
     let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut noise = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed as u8
+    };
     let mut raw = Vec::with_capacity(rows * ROW);
     for _ in 0..rows {
-        raw.push(0); // filter: none
-        for _ in 0..3 * W {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            raw.push(seed as u8);
-        }
+        // Each row: its filter byte (none), then its samples.
+        raw.extend(std::iter::once(0).chain((0..3 * W).map(|_| noise())));
     }
     let (mut a, mut b) = (1u32, 0u32);
     for &byte in &raw {
@@ -224,7 +228,16 @@ fn the_viewer_s_allocations_fit_its_heap() {
     ARMED.store(false, Ordering::SeqCst);
 
     let (peak, refused) = (PEAK.load(Ordering::SeqCst), REFUSED.load(Ordering::SeqCst));
-    eprintln!("peak {peak} bytes of the heap's {HEAP_BYTES} ({} KiB left)", (HEAP_BYTES - peak) / 1024);
-    assert_eq!(refused, 0, "an allocation of {refused} bytes didn't fit (peak {peak} of {HEAP_BYTES})");
+    let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+    eprintln!(
+        "peak {:.1} MiB of the heap's {:.1} MiB ({:.1} MiB to spare at the peak)",
+        mib(peak),
+        mib(HEAP_BYTES),
+        mib(HEAP_BYTES - peak)
+    );
+    assert_eq!(
+        refused, 0,
+        "an allocation of {refused} bytes found no room (the peak so far {peak} of {HEAP_BYTES} bytes)"
+    );
     assert_eq!(NOW.load(Ordering::SeqCst), 0, "everything allocated was freed");
 }

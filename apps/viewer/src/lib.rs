@@ -1,33 +1,42 @@
 //! The image viewer (#204): the images bundled with it (the desktop's
 //! wallpaper, two small test images, a corrupt one, and one too costly to
-//! decode), decoded inside the
-//! app by `lumen-png`, so a bad file can only end the app, never the kernel
-//! (M6 brings files; until then these are its images).
+//! decode), decoded inside the app by `lumen-png`, so a bad file can only
+//! end the app, never the kernel (M6 brings files; until then these are
+//! its images).
 //!
 //! - **The window:** a panel of widgets on the left (the `Images` list,
 //!   `Previous` and `Next`, the `Fit` checkbox, the `Info` label: the
 //!   image's name and size, `decoding <name>`, or `<name>: <why>` for one
 //!   it couldn't show) and the view, lumen-view's `VIEW`, on the right.
 //! - **Showing an image:** choosing one (in the list, through Previous or
-//!   Next, or `run viewer <name>` for the first) drops the one shown, says
-//!   `decoding <name>` and answers at once; the decoding is the next tick's
-//!   (`Ticking::period` is set only while one waits), so a request is never
-//!   held up by it. `lumen_view::admit` refuses, from its header, an image
-//!   bigger or costlier to decode than the memory plan covers; the decoder
-//!   refuses a bad one. Either is shown in the view and the label, logged
-//!   at INFO, and the app goes on.
+//!   Next, or `run viewer <name>` for the first; the one already chosen
+//!   changes nothing) drops the one shown, says `decoding <name>` and
+//!   answers at once: the decoding is the next tick's (`Ticking::period`
+//!   is set only while one waits), so the request choosing it isn't held
+//!   up by it (one arriving meanwhile waits for it). The wait before that
+//!   tick animates, so the desktop settles only once the image is shown.
+//!   The list's selection follows the choice without taking the focus.
+//! - **Refused:** `lumen_view::prepare` refuses, from its length and
+//!   header (`admit`), a file longer, an image bigger or costlier to decode
+//!   than the memory plan covers; the decoder refuses a bad one. Either is
+//!   shown in the view (its reason wrapped to the view's width) and the
+//!   label, logged at INFO, and the app goes on. Running out of memory is
+//!   the plan failing, not the file: a WARN.
 //! - **1:1 or fitted:** `Fit` checked (the start) shows the image fitted
-//!   to the view (`lumen_view::fitted`, a copy scaled once, by nearest
-//!   neighbour); unchecked, at 1:1 (`lumen_view::actual`), the arrow keys
-//!   panning a bigger image (`Pan`).
+//!   to the view (a copy scaled once, by nearest neighbour); unchecked, at
+//!   1:1 (`lumen_view::actual`), the arrow keys panning a bigger image
+//!   (`Pan`).
 //! - **Drawing:** the view is the app's own (`with_area`: the tree is laid
 //!   out in the panel only); a change to it is one rectangle of damage
-//!   (`take_drawn`), drawn in `paint_over` only where the repainted
-//!   rectangles reach it, so a commit pays only for what changed.
+//!   (`take_drawn`), its pixels drawn in `paint_over` only where the
+//!   repainted rectangles reach it, each line of text only where its box
+//!   meets one.
 //! - **Memory:** fixed at `lumen_view::MEMORY_BYTES` (its `build.rs`),
 //!   checked at the start (with where the heap starts, against
 //!   lumen-view's plan): `tests/memory.rs` there checks the app's
-//!   allocations (`lumen_view::prepare`, this app's one call) fit.
+//!   allocations (`lumen_view::prepare`, this app's one call) fit. A
+//!   failed check, or an image `run` names that it doesn't have, is one
+//!   ERROR and exit 1, before the window opens.
 
 #![no_std]
 
@@ -258,7 +267,9 @@ impl App for Viewer {
         // (each `text_draw` is charged by the character, wherever it lands).
         let line_h = over.text.line_height() as i32;
         let text_w = VIEW.w() - 2 * TEXT_INSET as u32;
-        let line_at = |n: usize| Rect::new(VIEW.x() + TEXT_INSET, VIEW.y() + TEXT_INSET + n as i32 * line_h, text_w, line_h as u32);
+        let line_at = |n: usize| {
+            Rect::new(VIEW.x() + TEXT_INSET, VIEW.y() + TEXT_INSET + n as i32 * line_h, text_w, line_h as u32)
+        };
         if let Shown::Failed { why, lines: lines @ None } = &mut self.shown {
             *lines = Some(wrap(over.text, why, text_w));
         }

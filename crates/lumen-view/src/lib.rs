@@ -13,14 +13,16 @@
 //!   it is smaller shows all of it, centred.
 //! - **Fit** ([`fitted`], [`scale`]): the biggest size with the image's
 //!   shape that fits the view (smaller images are enlarged too), each pixel
-//!   of it taken from the source pixel [`source`] names.
-//! - **What it decodes** ([`admit`]): read from the PNG's header before
-//!   anything is inflated, an image at most [`MAX_IMAGE_W`] x
-//!   [`MAX_IMAGE_H`] whose inflated rows (the decoder's biggest buffer) are
-//!   at most [`MAX_ROW_BYTES`] in all: 8-bit RGB (the wallpaper's format)
-//!   at the biggest size, so an 8-bit RGBA image is taken at three quarters
-//!   of that many pixels, a 16-bit RGBA one at three eighths. The decoder's
-//!   work, and so the memory plan, is then bounded whatever a file says.
+//!   of it taken from its nearest source pixel, rounded down.
+//! - **What it decodes** ([`admit`]): from the file's length and the PNG's
+//!   header, before anything is inflated: a file of at most
+//!   [`MAX_FILE_BYTES`], an image of 1 x 1 to [`MAX_IMAGE_W`] x
+//!   [`MAX_IMAGE_H`] whose inflated rows (what the decoder's buffers grow
+//!   with) take at most [`MAX_INFLATED_BYTES`]: 8-bit RGB (the wallpaper's
+//!   format) at the biggest size, so an 8-bit RGBA image is taken at three
+//!   quarters of that many pixels, a 16-bit RGBA one at three eighths. The
+//!   decoder's work, and so the memory plan, is then bounded whatever a
+//!   file says.
 //! - **Showing one** ([`prepare`]): [`admit`], `lumen-png`'s decoder, and
 //!   the fitted copy, as the app does it, both held as surfaces; or why not
 //!   ([`Why`]: refused, the decoder's error, or out of memory, which is the
@@ -29,7 +31,10 @@
 //!   ([`HEAP_BYTES`]) `tests/memory.rs` checks the app's allocations fit,
 //!   running [`prepare`] through the app's own allocator logic
 //!   (`lumen-heap`) over a region of that size, for the bundled images and
-//!   the costliest ones [`admit`] takes.
+//!   the costliest ones [`admit`] takes: the costliest is 16-bit RGBA at
+//!   the inflated-bytes cap, interlaced (about 10.8 MB at its peak, 3.5 x
+//!   [`MAX_INFLATED_BYTES`]: the 16-bit rows inflated and deinterlaced, the
+//!   samples stripped to 8 bits, then the pixels).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -60,11 +65,12 @@ pub const PAN_STEP: u32 = 40;
 pub const MAX_IMAGE_W: u32 = 1280;
 pub const MAX_IMAGE_H: u32 = 800;
 /// The most bytes an image's inflated rows may take (each row its filter
-/// byte and its samples): 8-bit RGB at [`MAX_IMAGE_W`] x [`MAX_IMAGE_H`]. The
-/// decoder holds about three buffers of that size at once for an interlaced
-/// image (the inflated rows, the deinterlaced samples, the samples handed
-/// back), then the pixels (4 bytes each): `tests/memory.rs` measures it.
-pub const MAX_ROW_BYTES: u64 = (1 + 3 * MAX_IMAGE_W as u64) * MAX_IMAGE_H as u64;
+/// byte and its samples): 8-bit RGB at [`MAX_IMAGE_W`] x [`MAX_IMAGE_H`].
+/// The decoder's buffers grow with it: for the costliest image it takes,
+/// 16-bit RGBA at this many bytes, interlaced, they peak at about 3.5 times
+/// it (the inflated rows, the deinterlaced samples, the samples stripped to
+/// 8 bits, then the pixels): `tests/memory.rs` measures it.
+pub const MAX_INFLATED_BYTES: u64 = (1 + 3 * MAX_IMAGE_W as u64) * MAX_IMAGE_H as u64;
 
 /// The longest file it decodes (`lumen-png` and the decoder each copy a
 /// file's image data once): the module's data bound, so a bundled image is
@@ -78,11 +84,12 @@ pub const MEMORY_BYTES: usize = 16 * 1024 * 1024;
 /// wasm-ld's stack, at the bottom of the memory.
 pub const STACK_BYTES: usize = 1024 * 1024;
 /// The most the module's data (the bundled images, the strings) may take,
-/// after the stack (the app checks its heap starts below `STACK_BYTES +
-/// DATA_BYTES`).
+/// after the stack (the app checks its heap starts at or below
+/// `STACK_BYTES + DATA_BYTES`).
 pub const DATA_BYTES: usize = 512 * 1024;
-/// The heap: the rest, where the canvas, the decoder's buffers, the image
-/// shown and its fitted copy live.
+/// The smallest heap the app can have: the rest, where the canvas, the
+/// decoder's buffers, the image shown and its fitted copy live (the heap
+/// is this or more: the data is at most `DATA_BYTES`).
 pub const HEAP_BYTES: usize = MEMORY_BYTES - STACK_BYTES - DATA_BYTES;
 
 const _: () =
@@ -102,7 +109,7 @@ pub enum Refused {
     TooSmall { w: u32, h: u32 },
     /// Wider or taller than [`MAX_IMAGE_W`] x [`MAX_IMAGE_H`].
     TooBig { w: u32, h: u32 },
-    /// Its inflated rows would take more than [`MAX_ROW_BYTES`].
+    /// Its inflated rows would take more than [`MAX_INFLATED_BYTES`].
     TooCostly { w: u32, h: u32, bytes: u64 },
 }
 
@@ -117,7 +124,7 @@ impl core::fmt::Display for Refused {
                 write!(f, "{w}x{h} pixels, more than the {MAX_IMAGE_W}x{MAX_IMAGE_H} it shows")
             }
             Refused::TooCostly { w, h, bytes } => {
-                write!(f, "{w}x{h} pixels need {bytes} bytes inflated, more than the {MAX_ROW_BYTES} it takes")
+                write!(f, "{w}x{h} pixels need {bytes} bytes inflated, more than the {MAX_INFLATED_BYTES} it takes")
             }
         }
     }
@@ -147,10 +154,10 @@ fn inflated(w: u32, h: u32, per_pixel: u64, depth: u8) -> u64 {
 /// (before anything is inflated): its size, if so. Both bound the decoder's
 /// work: the length its copies of the file's data (`lumen-png` copies the
 /// image's chunks, and the decoder gathers the IDAT data again), the header
-/// its buffers. The inflated rows are counted as for an
-/// image that isn't interlaced (an interlaced image's seven passes add at
-/// most a filter byte a row of each, which the memory test's interlaced
-/// worst case includes).
+/// its buffers. The inflated rows are counted as for an image that isn't
+/// interlaced: Adam7's seven passes each add a filter byte to their rows
+/// and round each row up to a byte, a little more, which the memory test's
+/// interlaced worst cases include.
 pub fn admit(png: &[u8]) -> Result<(u32, u32), Refused> {
     if png.len() > MAX_FILE_BYTES {
         return Err(Refused::TooLong { bytes: png.len() });
@@ -172,7 +179,7 @@ pub fn admit(png: &[u8]) -> Result<(u32, u32), Refused> {
         return Err(Refused::TooBig { w, h });
     }
     let bytes = inflated(w, h, per_pixel, depth);
-    if bytes > MAX_ROW_BYTES {
+    if bytes > MAX_INFLATED_BYTES {
         return Err(Refused::TooCostly { w, h, bytes });
     }
     Ok((w, h))
@@ -493,7 +500,7 @@ mod tests {
         // eighths (480 x 800 is exactly the limit).
         assert_eq!(admit(&header(960, 800, 8, 6)), Ok((960, 800)));
         assert_eq!(admit(&header(480, 800, 16, 6)), Ok((480, 800)));
-        assert_eq!(inflated(480, 800, 4, 16), MAX_ROW_BYTES);
+        assert_eq!(inflated(480, 800, 4, 16), MAX_INFLATED_BYTES);
         assert_eq!(
             admit(&header(481, 800, 16, 6)),
             Err(Refused::TooCostly { w: 481, h: 800, bytes: (1 + 8 * 481) * 800 })
@@ -506,7 +513,7 @@ mod tests {
             admit(&header(1280, 800, 16, 4)),
             Err(Refused::TooCostly { w: 1280, h: 800, bytes: (1 + 4 * 1280) * 800 })
         );
-        assert_eq!((1 + 3 * 1280) * 800, MAX_ROW_BYTES);
+        assert_eq!((1 + 3 * 1280) * 800, MAX_INFLATED_BYTES);
     }
 
     #[test]

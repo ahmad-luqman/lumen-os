@@ -8,14 +8,14 @@ apps/viewer/images/ next to the wallpaper the viewer also bundles
   IDAT chunk's CRC no longer matches: a file the decoder refuses;
 - `costly.png`: 1280x800, 8-bit RGBA, one colour (a few KB): a valid PNG
   lumen-view's `admit` refuses from its header, its inflated rows past
-  `MAX_ROW_BYTES`;
+  `MAX_INFLATED_BYTES`;
 
 and, not bundled, the costliest PNGs the viewer takes to decode (lumen-view's
 `admit`), for the memory plan's test, both interlaced: `worst.png`, its
 biggest size (1280x800) in 8-bit RGB, and `worst16.png`, 16-bit RGBA at the
 most pixels that allows (480x800).
 
-Deterministic: the same Pillow gives the same files. They are committed, so
+Deterministic: the same Pillow and zlib give the same files. They are committed, so
 the build never runs this; run it again only to change them, then look at
 them.
 
@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "apps" / "viewer" / "images"
 TESTS = ROOT / "crates" / "lumen-view" / "tests"
 # (file, size, bits a sample, samples a pixel): lumen-view's MAX_IMAGE_W x
-# MAX_IMAGE_H in 8-bit RGB, and 16-bit RGBA at the most pixels MAX_ROW_BYTES
+# MAX_IMAGE_H in 8-bit RGB, and 16-bit RGBA at the most pixels MAX_INFLATED_BYTES
 # takes.
 WORST = [("worst.png", (1280, 800), 8, 3), ("worst16.png", (480, 800), 16, 4)]
 
