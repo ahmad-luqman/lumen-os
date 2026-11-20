@@ -3862,12 +3862,13 @@ SSE); #197 checks the results' bits.
   that moved (each exactly its brush at either end) are its `take_drawn`
   damage: the second hand's every second, the minute hand's every fifth,
   the hour hand's every minute; host tests check that a partial repaint
-  leaves what a full one does, after every second over twelve hours and
-  after jumps. It reads the RTC every 250 ms; its waits aren't `animating`
+  leaves what a full one does, a second at a time over twelve hours
+  (compared every 37 s, through the first two minutes and around each
+  hour's turn) and after 1,500 jumps. It reads the RTC every 250 ms; its waits aren't `animating`
   (a tick finding the same second draws nothing), so the desktop settles
   between ticks. A failing RTC is handled as the taskbar's clock does
-  (`lumen_clock::rtc`): the last good reading for `CLOCK_FAILURES` (3)
-  reads, then `--:--:--` and no hands; the first failure of a run a WARN, a
+  (`lumen_clock::rtc`): the last good reading until `CLOCK_FAILURES` (3)
+  reads fail in a row, then `--:--:--` and no hands; the first failure of a run a WARN, a
   recovery an INFO, one at startup showing no time rather than ending the
   app. `run clock --at H[H]:MM[:SS]` freezes it: no period at all, so the
   window settles for good (its golden); anything else is one ERROR naming

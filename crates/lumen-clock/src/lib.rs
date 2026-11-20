@@ -75,9 +75,9 @@ pub fn point(cx: i32, cy: i32, radius: i32, step: u32) -> (i32, i32) {
 }
 
 /// The pixels of the straight line from `from` to `to`, both included, each
-/// next to the one before (8-connected): Bresenham's. Coordinates within
-/// ±2^29 (so the differences and the error term fit an `i32`; a face's are
-/// a few hundred).
+/// next to the one before (8-connected): Bresenham's. Coordinates strictly
+/// within ±2^29, every difference below 2^30 (so the error term, twice a
+/// difference, fits an `i32`; a face's are a few hundred).
 pub fn line(from: (i32, i32), to: (i32, i32)) -> Line {
     let (dx, dy) = ((to.0 - from.0).abs(), -(to.1 - from.1).abs());
     Line {

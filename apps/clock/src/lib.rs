@@ -54,12 +54,10 @@ impl Clock {
         match note {
             Note::Nothing => {}
             Note::Failing { why, kept: true } => {
-                log::warn(&format!("the clock can't read the RTC ({why}); it keeps its last reading for now"))
+                log::warn(&format!("can't read the RTC ({why}); keeping the last reading for now"))
             }
-            Note::Failing { why, kept: false } => {
-                log::warn(&format!("the clock can't read the RTC ({why}); it shows {BLANK}"))
-            }
-            Note::Recovered => log::info("the clock reads the RTC again"),
+            Note::Failing { why, kept: false } => log::warn(&format!("can't read the RTC ({why}); showing {BLANK}")),
+            Note::Recovered => log::info("reading the RTC again"),
         }
         self.face.show(shown);
     }

@@ -656,6 +656,8 @@ def clock_shot(m, wid: str, name: str) -> tuple[str, bytes]:
     again, the label again, until the two labels are equal (a tick's
     commit and its publish come in one refresh, before the app waits:
     settled after the shot, a commit before it shows in the second label).
+    A try needs to finish within one RTC second (wall time): at risk on a
+    busy host, where every try may straddle a second.
     """
     for _ in range(10):
         before = clock_time(m, wid)
@@ -669,8 +671,9 @@ def clock_shot(m, wid: str, name: str) -> tuple[str, bytes]:
 
 def date_time(m) -> str:
     """`date`'s time of day (`HH:MM:SS`, UTC)."""
-    found = re.fullmatch(r"date: \d{4}-\d\d-\d\d (\d\d:\d\d:\d\d) UTC\n", run(m, "date"))
-    assert found, "date's format"
+    said = run(m, "date")
+    found = re.fullmatch(r"date: \d{4}-\d\d-\d\d (\d\d:\d\d:\d\d) UTC\n", said)
+    assert found, f"date's format: {said!r}"
     return found[1]
 
 
@@ -689,6 +692,8 @@ def test_clock_tree_matches_rtc(boot):
     app_id, mark = start(m, "clock")
     wid, _ = clock_tree(m)
 
+    # (A poll agrees only if its three reads fall within one RTC second:
+    # at risk on a busy host, where every poll may straddle one.)
     def around() -> tuple[str, str, str]:
         before = date_time(m)
         label = clock_time(m, wid)
@@ -720,9 +725,9 @@ def test_clock_tree_matches_rtc(boot):
     app_id, mark = start(m, f"clock --at {shown}")
     wid, rows = clock_tree(m)
     assert gui.node(rows, "label", "Time")["value"] == shown
-    assert clock_shot(m, wid, "clock-frozen.png") == (shown, live), (
-        f"the pictures at {shown} differ"
-    )
+    frozen, picture = clock_shot(m, wid, "clock-frozen.png")
+    assert frozen == shown, (frozen, shown)
+    assert picture == live, f"the pictures at {shown} differ"
     gui.close_window(m, "Clock")
     end_line(m, mark, "clock", app_id, "exited with 0")
     # Arguments it doesn't take: one ERROR naming what was wrong (waited
