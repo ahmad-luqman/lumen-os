@@ -9,13 +9,13 @@ use alloc::vec::Vec;
 
 use lumen_gfx::{Damage, Rect, Surface};
 
-/// The most rectangles one [`repaint`] paints and commits apart (more are
-/// merged into their bounding box).
-pub const REPAINT_RECTS: usize = 16;
-
 use crate::node::{Action, AutomationNode, InvokeError};
 use crate::text::Text;
 use crate::ui::{Palette, Repaint, Ui, UiEvent};
+
+/// The most rectangles one [`repaint`] paints and commits apart (more are
+/// merged into their bounding box).
+pub const REPAINT_RECTS: usize = 16;
 
 /// What a window does after an event.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,8 +32,9 @@ pub enum Then {
 
 /// What an app's own drawing is handed ([`App::paint_over`]): the surface,
 /// the window's text and palette (the theme's colours, so custom drawing
-/// follows a switch), and the rectangles being repainted now (the whole
-/// surface on a full repaint), each already painted with the tree's paint
+/// follows a switch), and the rectangles being repainted now (disjoint, so
+/// drawing once per rectangle draws each pixel once; the whole surface on a
+/// full repaint), each already painted with the tree's paint
 /// (its background and the widgets reaching it). Only pixels inside `rects`
 /// are committed now; what is drawn outside them shows only at a later
 /// commit that covers it, and text drawn there through the host is still
@@ -141,27 +142,45 @@ pub fn repaint(
     let changed = app.ui_mut().take_changed();
     let bounds = surface.bounds();
     let drawn: Vec<Rect> = app.take_drawn().iter().filter_map(|r| r.intersect(&bounds)).collect();
-    let rects = match app.ui_mut().take_damage() {
-        // A full paint covers the app's rectangles too.
+    let tree = match app.ui_mut().take_damage() {
+        Repaint::Nothing => Vec::new(),
+        // A full repaint takes in all of the app's rectangles.
         Repaint::All => alloc::vec![bounds],
-        // The tree's and the app's rectangles merged where that covers no
-        // more pixels (a commit pays by the pixel, so an overlap isn't
-        // painted or paid twice), a bounding box past REPAINT_RECTS.
-        damage => {
-            let mut merged = Damage::<REPAINT_RECTS>::new();
-            if let Repaint::Rects(tree) = damage {
-                tree.into_iter().for_each(|r| merged.add(r));
-            }
-            drawn.into_iter().for_each(|r| merged.add(r));
-            merged.rects().to_vec()
-        }
+        Repaint::Rects(rects) => rects,
     };
-    if rects.is_empty() {
-        return Repainted { rects, changed };
+    // The tree's and the app's rectangles merged where that covers no more
+    // pixels, then made disjoint: a commit pays by the pixel, and an app
+    // drawing once per rectangle (blending text, say) would draw an overlap
+    // twice.
+    let mut merged = Damage::<REPAINT_RECTS>::new();
+    for r in tree.into_iter().chain(drawn) {
+        merged.add(r);
     }
-    for r in &rects {
-        app.ui_mut().paint_in(surface, text, palette, *r);
+    let rects = disjoint(merged.rects());
+    if !rects.is_empty() {
+        for r in &rects {
+            app.ui_mut().paint_in(surface, text, palette, *r);
+        }
+        app.paint_over(&mut Over { surface, text, palette, rects: &rects });
     }
-    app.paint_over(&mut Over { surface, text, palette, rects: &rects });
     Repainted { rects, changed }
+}
+
+/// `rects` made disjoint, covering the same pixels: each with the ones
+/// before it taken out (`Rect::subtract`, at most four pieces each); past
+/// [`REPAINT_RECTS`] pieces, their bounding box alone.
+fn disjoint(rects: &[Rect]) -> Vec<Rect> {
+    let mut out: Vec<Rect> = Vec::new();
+    for r in rects {
+        let mut pieces = alloc::vec![*r];
+        for done in &out {
+            pieces = pieces.iter().flat_map(|p| p.subtract(done).to_vec()).collect();
+        }
+        out.extend(pieces);
+    }
+    if out.len() > REPAINT_RECTS {
+        let all = out.iter().fold(Rect::EMPTY, |acc, r| acc.union(r));
+        return alloc::vec![all];
+    }
+    out
 }

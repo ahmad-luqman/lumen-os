@@ -733,10 +733,107 @@ fn past_repaint_rects_they_merge_into_one_box() {
     let mut app = Board::new();
     let mut s = Board::surface();
     repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
-    app.drawn = (0..=crate::app::REPAINT_RECTS as i32).map(|i| Rect::new(420 + 10 * i, 10 * (i % 2), 2, 2)).collect();
+    // One more apart than fit: all of them in one bounding box.
+    let drawn: Vec<Rect> =
+        (0..=crate::app::REPAINT_RECTS as i32).map(|i| Rect::new(420 + 10 * i, 10 * (i % 2), 2, 2)).collect();
+    app.drawn = drawn.clone();
     let done = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
-    assert!(done.rects.len() <= crate::app::REPAINT_RECTS, "{:?}", done.rects);
-    for r in &app.calls.last().expect("painted")[..] {
-        assert!(done.rects.contains(r));
+    let bounds = drawn.iter().fold(Rect::EMPTY, |acc, r| acc.union(r));
+    assert_eq!(done.rects, alloc::vec![bounds]);
+}
+
+/// Whether `rects` are pairwise disjoint and cover exactly the pixels of
+/// `wanted` (counted pixel by pixel over `within`).
+fn disjoint_cover(rects: &[Rect], wanted: &[Rect], within: Rect) -> bool {
+    let pairwise = rects.iter().enumerate().all(|(i, a)| rects[i + 1..].iter().all(|b| a.intersect(b).is_none()));
+    let covered = |set: &[Rect], x: i32, y: i32| set.iter().any(|r| r.contains(x, y));
+    pairwise
+        && (within.y()..within.bottom())
+            .all(|y| (within.x()..within.right()).all(|x| covered(rects, x, y) == covered(wanted, x, y)))
+}
+
+#[test]
+fn crossing_rects_are_committed_as_their_union_once() {
+    // A plus (a box around both would cost more than the two, so they
+    // aren't merged) and a diagonal move: committed disjoint, their areas
+    // adding up to the union's.
+    let mut s = Board::surface();
+    for (a, b, union) in [
+        (Rect::new(420, 50, 60, 10), Rect::new(445, 30, 10, 50), 600 + 500 - 100),
+        (Rect::new(450, 50, 20, 20), Rect::new(460, 60, 20, 20), 400 + 400 - 100),
+    ] {
+        let mut app = Board::new();
+        repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+        app.drawn = alloc::vec![a, b];
+        let done = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+        let area: u64 = done.rects.iter().map(|r| r.area()).sum();
+        assert_eq!(area, union, "{:?}", done.rects);
+        assert!(disjoint_cover(&done.rects, &[a, b], s.bounds()), "{:?}", done.rects);
+        assert_eq!(app.calls.last(), Some(&done.rects), "the frame gets the disjoint ones");
+    }
+}
+
+#[test]
+fn an_app_drawing_once_per_rect_matches_a_full_repaint() {
+    // Its frame darkens its square's pixels by half once per rectangle it
+    // is handed (as blended text would): moved diagonally, the overlap is
+    // darkened once, as a full repaint leaves it.
+    struct Blender(Board);
+    impl App for Blender {
+        fn ui_mut(&mut self) -> &mut Ui {
+            self.0.ui_mut()
+        }
+        fn apply(&mut self, events: &[UiEvent]) -> Then {
+            self.0.apply(events)
+        }
+        fn paint_over(&mut self, over: &mut Over<'_>) {
+            for r in over.rects {
+                let Some(part) = r.intersect(&self.0.square) else { continue };
+                for y in part.y()..part.bottom() {
+                    for x in part.x()..part.right() {
+                        let p = over.surface.pixel(x, y).expect("inside");
+                        over.surface.fill_rect(Rect::new(x, y, 1, 1), (p >> 1) & 0x7f_7f7f);
+                    }
+                }
+            }
+        }
+        fn take_drawn(&mut self) -> Vec<Rect> {
+            self.0.take_drawn()
+        }
+    }
+    let mut app = Blender(Board::new());
+    let mut s = Board::surface();
+    repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    let old = app.0.square;
+    app.0.square = Rect::new(old.x() + 10, old.y() + 10, 20, 20);
+    app.0.drawn = alloc::vec![old, app.0.square];
+    repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    let mut full = Board::surface();
+    let mut again = Blender(Board::new());
+    again.0.square = app.0.square;
+    repaint(&mut again, &mut full, &mut FixedText, &PALETTE, AREA);
+    assert_eq!(s.pixels(), full.pixels());
+}
+
+#[test]
+fn a_tree_rect_and_an_app_rect_overlapping_are_committed_once() {
+    // A press on Add damages its widgets; the app's rect overlaps the Add
+    // button in the same repaint: committed disjoint, covering both.
+    let mut app = Board::new();
+    let mut s = Board::surface();
+    repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    let button = app.counter.ui().bounds(app.counter.add);
+    let add = app.counter.ui().id(app.counter.add).expect("live").get();
+    assert!(matches!(serve(&mut app, &mut FixedText, AREA, add, &Action::Press), Served::Row { .. }));
+    let over_button = Rect::new(button.x() + 5, button.y() + 5, button.w(), button.h());
+    app.drawn = alloc::vec![over_button];
+    let done = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    let pairwise =
+        done.rects.iter().enumerate().all(|(i, a)| done.rects[i + 1..].iter().all(|b| a.intersect(b).is_none()));
+    assert!(pairwise, "{:?}", done.rects);
+    for r in [button, over_button] {
+        let inside =
+            (r.y()..r.bottom()).all(|y| (r.x()..r.right()).all(|x| done.rects.iter().any(|d| d.contains(x, y))));
+        assert!(inside, "{r:?} not covered by {:?}", done.rects);
     }
 }
