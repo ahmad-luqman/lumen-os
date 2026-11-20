@@ -3757,6 +3757,43 @@ SSE); #197 checks the results' bits.
   toolkit modes (`ui`: Counter in the SDK's toolkit; `ui-trap`; `deep`:
   the deepest tree; `deaf`: a published button whose events are never
   read).
+- **What the SDK PR adds (the tick loop, before wave 3):** no host call
+  changes; `window_wait`'s deadline and `animating` carry it.
+  - `Toolkit::run_with`'s `take` returns `ui::Taken`: `Pass` (the tree
+    gets the event), `Took` (the app acted on it: a game's arrows, the
+    calculator's keys; the window refreshed) or `Quit` (the loop returns as
+    for `Close`, and the dropped `Window` closes the window). Only input
+    is offered (`Event::offered_to_app`, exhaustive): a `Request`, `Close`
+    or `Theme` always reaches the toolkit, so a request is always answered
+    and a close always ends the loop, whatever the app takes.
+  - `Toolkit::run_until(time, take)` for an app that is `ui::Ticking`
+    (`period()`, asked before every wait: `None` waits for events only, so
+    the desktop can settle; `animating()`, the wait's flag while ticking,
+    yes by default; `tick(now) -> Flow`, `Carry` or `Quit`). Each turn it
+    handles every event waiting first, then, once the first `Theme` has
+    come, takes a due tick and refreshes, else waits until the deadline.
+    The pacing is `lumen_ui::Pacer` (host-tested): a period appearing or
+    changing starts one period from now; after a tick the next is one
+    period on, or one period after the tick if that is past, so a stalled
+    app ticks once, never a burst.
+  - Custom drawing: `lumen_ui::App::paint_over` is handed an `Over`
+    (the surface, the window's text and palette, and the rectangles being
+    repainted, the whole surface on a full repaint), and the new
+    `App::take_drawn` reports what the app's own drawing changed.
+    `lumen_ui::repaint` repaints the tree only where those rectangles meet
+    its area, calls `paint_over` whenever anything is repainted, and
+    commits both; the tree's `changed` alone decides a publish, so a frame
+    of the app's own never republishes an unchanged tree. That is the
+    SDK's one frame path, `Toolkit::refresh`. `Toolkit::with_area` lays the
+    tree out in part of the client (the rest is the app's, painted only by
+    `paint_over`); `Toolkit::palette()`; `lumen_app::gfx` re-exports
+    `lumen-gfx`.
+  - The harness: `gui.press_animated` presses in a window that may be
+    animating and confirms by the tree (`wait_ui`), never by
+    `wait_settled`, and `gui.invoke(..., animating=True)` retries a held
+    slot instead of waiting for the desktop to settle, which it never does
+    while a window animates.
+  - `test-window`'s `tick` mode exercises it.
 - **The launcher** (#157's taskbar) lists the bundled apps whose
   manifest lists `desktop`, never the test apps, after its four demo
   items, by name, and starts one through `run`'s path without waiting
