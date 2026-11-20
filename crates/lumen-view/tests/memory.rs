@@ -14,7 +14,9 @@
 //!   viewer takes to decode (`lumen_view::admit`; made by
 //!   tools/viewer-images.py, both interlaced): `worst.png`, its biggest size
 //!   in 8-bit RGB, and `worst16.png`, 16-bit RGBA at the most pixels that
-//!   allows; each several times, so the free list's fragmentation after a
+//!   allows; and a file exactly `MAX_FILE_BYTES` long whose image data is
+//!   incompressible (built here: the most the file's copies can take); each
+//!   several times, so the free list's fragmentation after a
 //!   round of them is part of what must fit.
 //!
 //! An allocation the region can't hold fails the test (it is served from
@@ -125,6 +127,68 @@ const BROKEN: &[u8] = include_bytes!("../../../apps/viewer/images/broken.png");
 const WORST: &[u8] = include_bytes!("worst.png");
 const WORST16: &[u8] = include_bytes!("worst16.png");
 
+/// A PNG exactly `lumen_view::MAX_FILE_BYTES` long whose image data is
+/// incompressible (zlib stored blocks of pseudo-random rows): the most the
+/// file's copies can take. 8-bit RGB 1280 pixels wide, as many rows as the
+/// length allows, padded to the cap with an ancillary chunk.
+fn longest() -> Vec<u8> {
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = out.len();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let crc = lumen_png::crc32(&out[start..]);
+        out.extend_from_slice(&crc.to_be_bytes());
+    }
+    const W: usize = 1280;
+    const ROW: usize = 1 + 3 * W;
+    // The chunks around the image data: the signature, IHDR, IDAT's and
+    // the pad's framing, IEND; zlib's header and Adler-32; a stored
+    // block's 5 bytes a 65,535.
+    let budget = lumen_view::MAX_FILE_BYTES - (8 + 25 + 12 + 12 + 12 + 2 + 4);
+    let mut rows = budget / ROW;
+    while rows * ROW + 5 * (rows * ROW).div_ceil(65_535) > budget {
+        rows -= 1;
+    }
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut raw = Vec::with_capacity(rows * ROW);
+    for _ in 0..rows {
+        raw.push(0); // filter: none
+        for _ in 0..3 * W {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            raw.push(seed as u8);
+        }
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in &raw {
+        a = (a + u32::from(byte)) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    let mut zlib = vec![0x78, 0x01];
+    let blocks: Vec<&[u8]> = raw.chunks(65_535).collect();
+    for (i, block) in blocks.iter().enumerate() {
+        zlib.push(u8::from(i + 1 == blocks.len()));
+        zlib.extend_from_slice(&(block.len() as u16).to_le_bytes());
+        zlib.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
+    zlib.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    let mut png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&(W as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(rows as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    chunk(&mut png, b"IHDR", &ihdr);
+    chunk(&mut png, b"IDAT", &zlib);
+    let pad = lumen_view::MAX_FILE_BYTES - png.len() - 12 - 12;
+    chunk(&mut png, b"zzPd", &vec![0; pad]);
+    chunk(&mut png, b"IEND", &[]);
+    assert_eq!(png.len(), lumen_view::MAX_FILE_BYTES);
+    png
+}
+
 #[test]
 fn the_viewer_s_allocations_fit_its_heap() {
     // Each image is shown outside the region first (admitted and decoded).
@@ -134,12 +198,18 @@ fn the_viewer_s_allocations_fit_its_heap() {
         assert!(prepare(png).is_ok(), "{name} isn't shown");
     }
     assert!(prepare(BROKEN).is_err(), "broken is shown");
+    let longest = longest();
+    assert!(prepare(&longest).is_ok(), "the longest file isn't shown");
+    let mut too_long = longest.clone();
+    too_long.push(0);
+    assert!(prepare(&too_long).is_err(), "a file past the cap is shown");
 
     ARMED.store(true, Ordering::SeqCst);
     let canvas: Vec<u32> = vec![0; (WINDOW_W * WINDOW_H) as usize];
     let toolkit: Vec<u8> = vec![0; TOOLKIT_BYTES];
     let mut shown: Option<Prepared> = None;
-    let order = [WALLPAPER, TILES, GREY16, BROKEN, WORST, WALLPAPER, WORST16, TILES, WORST, WORST16, WALLPAPER];
+    let order: [&[u8]; 12] =
+        [WALLPAPER, TILES, GREY16, BROKEN, WORST, WALLPAPER, WORST16, TILES, &longest, WORST, WORST16, WALLPAPER];
     for _round in 0..3 {
         for png in order {
             // The old image goes before the new one is decoded.

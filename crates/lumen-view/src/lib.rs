@@ -66,6 +66,11 @@ pub const MAX_IMAGE_H: u32 = 800;
 /// back), then the pixels (4 bytes each): `tests/memory.rs` measures it.
 pub const MAX_ROW_BYTES: u64 = (1 + 3 * MAX_IMAGE_W as u64) * MAX_IMAGE_H as u64;
 
+/// The longest file it decodes (`lumen-png` and the decoder each copy a
+/// file's image data once): the module's data bound, so a bundled image is
+/// always within it.
+pub const MAX_FILE_BYTES: usize = DATA_BYTES;
+
 /// The app's fixed memory (its `build.rs` sets it; the app checks it at
 /// its start), a multiple of 64 KiB: the stack, the module's data, and the
 /// heap.
@@ -87,6 +92,8 @@ const _: () = assert!(WINDOW_W as u64 * WINDOW_H as u64 <= lumen_app_api::limits
 /// Why [`admit`] refused an image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refused {
+    /// Longer than [`MAX_FILE_BYTES`] (checked first, before the header).
+    TooLong { bytes: usize },
     /// No PNG signature and IHDR at its start (the decoder says the same).
     NoHeader,
     /// A colour type and bit depth PNG doesn't define.
@@ -100,6 +107,7 @@ pub enum Refused {
 impl core::fmt::Display for Refused {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match *self {
+            Refused::TooLong { bytes } => write!(f, "{bytes} bytes, more than the {MAX_FILE_BYTES} it takes"),
             Refused::NoHeader => f.write_str("not a PNG (no header)"),
             Refused::BadFormat { colour, depth } => write!(f, "colour type {colour} at {depth} bits isn't PNG's"),
             Refused::TooBig { w, h } => {
@@ -132,12 +140,18 @@ fn inflated(w: u32, h: u32, per_pixel: u64, depth: u8) -> u64 {
     (1 + (u64::from(w) * per_pixel * u64::from(depth)).div_ceil(8)) * u64::from(h)
 }
 
-/// Whether the viewer decodes `png`, from its header alone (before anything
-/// is inflated): its size, if so. The inflated rows are counted as for an
+/// Whether the viewer decodes `png`, from its length and its header alone
+/// (before anything is inflated): its size, if so. Both bound the decoder's
+/// work: the length its copies of the file's data (`lumen-png` copies the
+/// image's chunks, and the decoder gathers the IDAT data again), the header
+/// its buffers. The inflated rows are counted as for an
 /// image that isn't interlaced (an interlaced image's seven passes add at
 /// most a filter byte a row of each, which the memory test's interlaced
 /// worst case includes).
 pub fn admit(png: &[u8]) -> Result<(u32, u32), Refused> {
+    if png.len() > MAX_FILE_BYTES {
+        return Err(Refused::TooLong { bytes: png.len() });
+    }
     let be32 = |at: usize| png.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
     if png.get(..8) != Some(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'][..])
         || png.get(12..16) != Some(b"IHDR")
@@ -485,6 +499,21 @@ mod tests {
         assert_eq!(admit(&header(1281, 1, 1, 0)), Err(Refused::TooBig { w: 1281, h: 1 }));
         assert_eq!(admit(&header(1, 801, 1, 0)), Err(Refused::TooBig { w: 1, h: 801 }));
         assert_eq!(admit(&header(u32::MAX, u32::MAX, 16, 6)), Err(Refused::TooBig { w: u32::MAX, h: u32::MAX }));
+    }
+
+    #[test]
+    fn admit_refuses_a_file_past_its_length_first() {
+        let mut png = header(10, 10, 8, 2);
+        png.resize(MAX_FILE_BYTES, 0);
+        assert_eq!(admit(&png), Ok((10, 10)));
+        png.push(0);
+        assert_eq!(admit(&png), Err(Refused::TooLong { bytes: MAX_FILE_BYTES + 1 }));
+        // Before the header: a long file with none is too long, not headless.
+        assert_eq!(admit(&alloc::vec![0; MAX_FILE_BYTES + 1]), Err(Refused::TooLong { bytes: MAX_FILE_BYTES + 1 }));
+        assert_eq!(
+            Refused::TooLong { bytes: 9 }.to_string(),
+            alloc::format!("9 bytes, more than the {MAX_FILE_BYTES} it takes")
+        );
     }
 
     #[test]
