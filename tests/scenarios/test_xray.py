@@ -99,9 +99,10 @@ def test_device_interrupts_are_traced(boot):
     # counts between two of its runs is also in the X-ray ring, read from
     # before the first to after the last (a wider window): at least as
     # many `irq` events on COM1's vector, and none missed. Typing a command
-    # usually raises IRQ 4, but its input can also come in through the
-    # serial reader's safety-net read (#220, a loaded host): `irqs` is run
-    # until its count has risen, an interrupt confirmed before comparing.
+    # usually raises IRQ 4, but #220 saw input reach the shell without one
+    # (read straight from the UART: at the reader's safety-net deadline, or
+    # before it blocks): `irqs` is run until its count has risen, an
+    # interrupt confirmed before comparing.
     m = shell(boot)
     _, start = xray(m)
     first = com1_interrupts(m)
@@ -167,6 +168,37 @@ def stop_spinning(m, n: int, cpu: int) -> None:
     assert out == f"runq spin: {n} threads stopped on cpu {cpu}\n", out
 
 
+# The app's lanes (apps/xray's layout, client coordinates): where each
+# CPU's lane starts, its columns, and a run-queue bar's pixels a thread.
+LANES_X = 424 + 4
+COL_W = 4
+COLUMNS = 50
+LANE_Y0 = 10
+LANE_H = 56
+LANE_BASE = 48  # a bar's bottom row is LANE_BASE - 1 below the lane's top
+RUNQ_UNIT = 3
+
+
+def bar_of(img, cpu: int, length: int) -> int | None:
+    """The first column in CPU `cpu`'s lane whose run-queue bar is exactly
+    `length` threads tall (one colour, not the background, over those rows,
+    the background above them), or None."""
+    top = LANE_Y0 + cpu * LANE_H
+    bottom = top + LANE_BASE
+    h = length * RUNQ_UNIT
+    background = img.getpixel((LANES_X - 2, top + 30))
+    for c in range(COLUMNS):
+        x = LANES_X + c * COL_W + 1
+        rows = {img.getpixel((x, y)) for y in range(bottom - h, bottom)}
+        if (
+            len(rows) == 1
+            and rows != {background}
+            and img.getpixel((x, bottom - h - 1)) == background
+        ):
+            return c
+    return None
+
+
 def start_xray(m) -> tuple[int, int, str, dict[str, str]]:
     """`run xray`, live: its id, where serial was, its window's id and its
     `apps` record."""
@@ -207,6 +239,18 @@ def test_xray_matches_the_scheduler(boot):
         "X-ray's queue agreeing with the scheduler's",
         read,
         lambda g: g[0] == g[1] == waiting and g[2] in spinning,
+        60,
+    )
+    # Its lane for that CPU draws them: a column whose bar is 3 threads
+    # tall (a column shows its longest queue, and at each turn the thread
+    # leaving the CPU is queued before the next is taken off: all 3),
+    # polled for in screendumps (the lanes are its own damage).
+    shots = iter(range(1000))
+    gui.wait_for(
+        m,
+        "a 3-thread bar in cpu 1's lane",
+        lambda: bar_of(gui.client_pixels(m, "X-ray", f"xray-lane-{next(shots)}.png"), 1, SPIN),
+        lambda c: c is not None,
         60,
     )
     # Its switches on that CPU grow while they take turns (a floor).
@@ -325,3 +369,52 @@ def test_xray_without_trace_is_not_granted(boot):
     wait_for_output(m, mark, rf"(?m){refused}$", 30)
     end_line(m, mark, "xray", app_id, "exited with 1")
     assert not [w for w in gui.windows(m, refused) if w["title"] == "X-ray"]
+
+
+def test_xray_counts_no_more_than_its_ring_holds(boot):
+    # One CPU. After a few counted refreshes X-ray is paused (its labels
+    # then stay put); the interrupts it counted on CPU 0 are at most the
+    # `irq` events CPU 0's X-ray ring holds, read from 0, plus the numbers
+    # gone from it: an upper bound from the same ring, never a time. A
+    # reader that counted a ring's events more than once breaks it.
+    m = desktop(boot)
+    app_id, mark, wid, record = start_xray(m)
+    rows = gui.wait_ui(
+        m, "cpu 0's switches known", lambda r: label(r, "cpu 0 switches") != "-", wid, 60
+    )
+    for _ in range(3):
+        seen = int(label(rows, "cpu 0 switches"))
+        rows = gui.wait_ui(
+            m,
+            "a counted refresh",
+            lambda r, seen=seen: int(label(r, "cpu 0 switches")) > seen,
+            wid,
+            60,
+        )
+    rows = gui.press_animated(
+        m, below_root(rows), "Pause", "paused", lambda r: label(r, "State") == "paused", wid
+    )
+    gui.wait_settled(m)
+    counted = int(label(below_root(gui.ui_tree(m, wid)), "cpu 0 irqs"))
+    # The whole ring, up to 4096 lines: more time than a short command.
+    out = run(m, "trace xray 0 0", 120)
+    summary = XRAY_SUMMARY.search(out)
+    assert summary, out
+    events = out[: summary.start()]
+    held = len(re.findall(r"^#\d+ +tsc=\d+ +irq ", events, re.MULTILINE))
+    gone = int(summary[3])
+    assert counted <= held + gone, (counted, held, gone)
+    assert label(below_root(gui.ui_tree(m, wid)), "cpu 0 irqs") == str(counted)
+    gui.close_window(m, "X-ray")
+    end_line(m, mark, "xray", app_id, "exited with 0")
+    wait_gone(m, app_id, record["thread"])
+
+
+def test_xray_refuses_arguments_it_doesnt_take(boot):
+    # `run xray bogus`: its usage as one ERROR, exit 2, no window.
+    m = desktop(boot)
+    usage = r"ERROR app: xray: usage: xray \[--replay\]"
+    app_id, mark = start(m, "xray bogus", allow=usage)
+    wait_for_output(m, mark, rf"(?m){usage}$", 30)
+    end_line(m, mark, "xray", app_id, "exited with 2")
+    assert not [w for w in gui.windows(m, usage) if w["title"] == "X-ray"]
