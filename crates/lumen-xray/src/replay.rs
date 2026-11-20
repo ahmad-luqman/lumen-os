@@ -12,7 +12,11 @@
 //!   refused).
 //! - **CPU 2**: three threads taking turns (each turn an enqueue to 3 and a
 //!   dequeue to 2), interrupts every 7 columns, two locks that waited in
-//!   column 40; its first X-ray read counted 12 numbers missed.
+//!   column 40; 12 numbers of its X-ray ring gone before its first read (a
+//!   backlog's, not counted) and 5 more in column 30 (counted missed).
+//!
+//! Column 0 is every CPU's backlog (left out of the counts: a gap), as a
+//! live view's first column is.
 
 use alloc::vec::Vec;
 use lumen_trace::Event;
@@ -75,6 +79,13 @@ impl Ring {
         }
     }
 
+    /// `n` numbers gone before they were read: the next read counts them
+    /// missed.
+    fn skip(&mut self, n: u64) {
+        self.next += n;
+        self.missed += n;
+    }
+
     /// The events since the last read, read into `v` as `trace_read`
     /// would hand them over.
     fn read_into(&mut self, v: &mut View) {
@@ -121,6 +132,9 @@ pub fn view() -> View {
         xray0.locks(u32::from(k % 13 == 7));
         // CPU 2: each turn, the thread running goes back on the queue and
         // the next comes off it.
+        if k == 30 {
+            xray2.skip(5);
+        }
         for i in 2 * k..2 * k + 2 {
             let (from, to) = turn(&CPU2_THREADS, i);
             xray2.runq(3, from, RunQueueOp::Enqueue);
@@ -166,10 +180,12 @@ mod tests {
         assert_eq!(c0.presence, Presence::Online);
         assert_eq!(c0.runq, Some(0));
         assert_eq!(c0.thread, Some(CPU0_THREADS[(2 * 79 + 2) % 4]));
-        assert_eq!(c0.switches, Some(160));
+        // Every count leaves column 0 out (the backlog).
+        assert_eq!(c0.switches, Some(158));
         // irqs: 16 columns k % 5 == 0 (3 each), and those k % 3 == 0 but
-        // not % 5 (1 each): 27 multiples of 3 below 80, 6 of 15.
-        assert_eq!(c0.irqs, Some(16 * 3 + (27 - 6)));
+        // not % 5 (1 each): 27 multiples of 3 below 80, 6 of 15; less
+        // column 0's 3.
+        assert_eq!(c0.irqs, Some(16 * 3 + (27 - 6) - 3));
         assert_eq!(c0.locks, Some(6), "columns 7, 20, 33, 46, 59, 72");
         assert_eq!((c0.missed, c0.odd), (Some(0), 0));
         assert_eq!(v.since(0, Stream::Main), 160);
@@ -177,16 +193,16 @@ mod tests {
         // thread forgotten, its counts kept.
         assert_eq!(c1.presence, Presence::Offline);
         assert_eq!((c1.runq, c1.thread), (None, None));
-        assert_eq!((c1.switches, c1.irqs, c1.locks, c1.missed), (Some(10), Some(10), Some(0), Some(0)));
+        assert_eq!((c1.switches, c1.irqs, c1.locks, c1.missed), (Some(9), Some(9), Some(0), Some(0)));
         // CPU 2.
         assert_eq!(c2.presence, Presence::Online);
         assert_eq!(c2.runq, Some(2));
-        assert_eq!(c2.switches, Some(160));
+        assert_eq!(c2.switches, Some(158));
         assert_eq!(c2.thread, Some(CPU2_THREADS[160 % 3]));
-        assert_eq!(c2.irqs, Some(12 * 2), "columns 0, 7, ..., 77");
+        assert_eq!(c2.irqs, Some(11 * 2), "columns 7, 14, ..., 77");
         assert_eq!(c2.locks, Some(2));
-        assert_eq!(c2.missed, Some(12));
-        assert_eq!(v.since(2, Stream::Xray), 12 + 4 * COLUMNS as u64 + 24 + 2);
+        assert_eq!(c2.missed, Some(5), "the backlog's 12 left out");
+        assert_eq!(v.since(2, Stream::Xray), 12 + 4 * COLUMNS as u64 + 24 + 2 + 5);
     }
 
     #[test]
@@ -200,10 +216,12 @@ mod tests {
         assert_eq!(v.cpus()[0].column(7), Column { span: counted, runq: 3, switches: 2, irqs: 0, locks: 1 });
         assert_eq!(v.cpus()[0].column(15), Column { span: counted, runq: 1, switches: 2, irqs: 3, locks: 0 });
         assert_eq!(v.cpus()[2].column(40), Column { span: counted, runq: 3, switches: 2, irqs: 0, locks: 2 });
+        // Column 0: every CPU's backlog, a gap.
+        assert!(v.cpus().iter().all(|c| c.column(0) == Column { span: Span::CatchingUp, ..Column::default() }));
         // CPU 1: counted while there, offline after, its length not carried.
         let c1 = &v.cpus()[1];
         assert!(
-            (0..CPU1_COLUMNS)
+            (1..CPU1_COLUMNS)
                 .all(|k| c1.column(k) == Column { span: counted, runq: 1, switches: 1, irqs: 1, locks: 0 })
         );
         assert!((CPU1_COLUMNS..COLUMNS).all(|k| c1.column(k) == Column { span: Span::Offline, ..Column::default() }));

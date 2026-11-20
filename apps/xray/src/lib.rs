@@ -18,8 +18,11 @@
 //!   Each refresh repaints two columns' strips (its damage).
 //! - **Live** (`run xray`): every half second (`run_until`, animating),
 //!   each CPU's two rings are read on from where the last read stopped,
-//!   up to a whole ring's worth a refresh, and the labels follow. Pause
-//!   stops the reads (no period: the window settles); Resume reads on.
+//!   up to a whole ring's worth a refresh, and the labels follow. Each
+//!   ring's first read, and its first after Resume, is a backlog (what
+//!   piled up since boot or while paused): only its newest run queue and
+//!   thread are taken, and its column is a gap. Pause stops the reads (no
+//!   period: the window settles); Resume reads on.
 //! - **Frozen** (`run xray --replay`): `lumen_xray::replay`'s fixed trace,
 //!   read once: no period, Pause and Resume disabled, for the golden.
 //! - **Grants:** `trace` (live only), `desktop`, and `time` for the
@@ -288,7 +291,12 @@ impl App for Xray {
         for e in events {
             match (e, self.mode) {
                 (UiEvent::Pressed(w), Mode::Live) if *w == self.pause => self.mode = Mode::Paused,
-                (UiEvent::Pressed(w), Mode::Paused) if *w == self.resume => self.mode = Mode::Live,
+                (UiEvent::Pressed(w), Mode::Paused) if *w == self.resume => {
+                    // What piled up while paused is a backlog: the column it
+                    // is read in is a gap, its events left out of the counts.
+                    self.view.resume();
+                    self.mode = Mode::Live;
+                }
                 _ => {}
             }
         }

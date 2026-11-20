@@ -15,6 +15,13 @@
 //!   left alone.
 //! - **Reading on** ([`View::read`]): each read's `next` is where the next
 //!   one starts ([`View::since`]); its `missed` is added up.
+//! - **A backlog isn't activity:** a ring's first read (from 0: what the
+//!   ring holds since boot), its first after [`View::resume`] and its first
+//!   after coming back online read what piled up meanwhile. From such a read
+//!   only the newest `runq` and `switch` are taken (so the run queue and the
+//!   thread are right); its events are left out of the counts and its
+//!   `missed` out of the numbers missed, and the column it is read in is a
+//!   gap ([`Span::CatchingUp`]).
 //! - **CPUs** ([`Presence`]): each starts unread (nothing known: every
 //!   value `None`). `trace_cpus` is one past the highest online CPU, and an
 //!   index below it may be offline (`trace_read` refuses it):
@@ -47,6 +54,8 @@ pub enum Span {
     Empty,
     /// Its events counted.
     Counted,
+    /// A ring's backlog read in it (left out of the counts): a gap.
+    CatchingUp,
     /// The CPU offline: nothing to show.
     Offline,
 }
@@ -101,8 +110,10 @@ pub struct Cpu {
     /// Events of X-ray's kinds that didn't decode (a field out of range),
     /// or a `runq` event for another CPU's queue: counted, not shown.
     pub odd: u64,
-    /// Where each ring's next read starts (by [`Stream`]'s number).
-    since: [u64; 2],
+    /// Each ring's reading (by [`Stream`]'s number).
+    rings: [Ring; 2],
+    /// Whether a backlog was read in the column being gathered.
+    catching_up: bool,
     /// The column being gathered.
     column: Column,
     /// The last [`COLUMNS`] columns, by their place in the lanes.
@@ -120,42 +131,51 @@ impl Cpu {
             locks: None,
             missed: None,
             odd: 0,
-            since: [0; 2],
+            rings: [Ring::new(); 2],
+            catching_up: false,
             column: Column::default(),
             history: [Column::default(); COLUMNS],
         }
     }
 
-    /// One event of ring `stream`, read from CPU `cpu`'s.
-    fn apply(&mut self, cpu: usize, stream: Stream, e: &Event) {
+    /// One event of ring `stream`, read from CPU `cpu`'s; `counted`:
+    /// not from a backlog (whose events give only the newest run queue and
+    /// thread).
+    fn apply(&mut self, cpu: usize, stream: Stream, e: &Event, counted: bool) {
         match (stream, e.kind) {
             (Stream::Main, kind::SWITCH) => match Switch::decode(e) {
                 Some(s) => {
                     self.thread = Some(s.to);
-                    bump(&mut self.switches);
-                    self.column.switches = self.column.switches.saturating_add(1);
+                    if counted {
+                        bump(&mut self.switches);
+                        self.column.switches = self.column.switches.saturating_add(1);
+                    }
                 }
                 None => self.odd += 1,
             },
             (Stream::Xray, kind::RUN_QUEUE) => match RunQueue::decode(e) {
                 Some(q) if usize::from(q.cpu) == cpu => {
                     self.runq = Some(q.len);
-                    self.column.runq = self.column.runq.max(q.len);
+                    if counted {
+                        self.column.runq = self.column.runq.max(q.len);
+                    }
                 }
                 _ => self.odd += 1,
             },
             (Stream::Xray, kind::IRQ) => match Irq::decode(e) {
-                Some(_) => {
+                Some(_) if counted => {
                     bump(&mut self.irqs);
                     self.column.irqs = self.column.irqs.saturating_add(1);
                 }
+                Some(_) => {}
                 None => self.odd += 1,
             },
             (Stream::Xray, kind::LOCK_WAIT) => match LockWait::decode(e) {
-                Some(_) => {
+                Some(_) if counted => {
                     bump(&mut self.locks);
                     self.column.locks = self.column.locks.saturating_add(1);
                 }
+                Some(_) => {}
                 None => self.odd += 1,
             },
             _ => {}
@@ -165,6 +185,25 @@ impl Cpu {
     /// Column `i` of its lane (`i` below [`COLUMNS`]).
     pub fn column(&self, i: usize) -> Column {
         self.history[i]
+    }
+}
+
+/// One ring's reading: where its next read starts, and whether that read
+/// is of a backlog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Ring {
+    since: u64,
+    /// Its next read takes a backlog: its first, its first after a
+    /// resume, its first after the CPU comes back online.
+    backlog: bool,
+    /// Read in the column being gathered (a backlog read then is done
+    /// with once the column ends).
+    read: bool,
+}
+
+impl Ring {
+    const fn new() -> Ring {
+        Ring { since: 0, backlog: true, read: false }
     }
 }
 
@@ -194,7 +233,7 @@ impl View {
     /// Where the next read of CPU `cpu`'s ring `stream` starts (0 for one
     /// never read: the oldest event the ring holds).
     pub fn since(&self, cpu: usize, stream: Stream) -> u64 {
-        self.cpus[cpu].since[stream as usize]
+        self.cpus[cpu].rings[stream as usize].since
     }
 
     /// A read of CPU `cpu`'s ring `stream` taken: its header's `next` and
@@ -202,7 +241,13 @@ impl View {
     pub fn read(&mut self, cpu: usize, stream: Stream, next: u64, missed: u64, events: &[Event]) {
         let c = &mut self.cpus[cpu];
         c.presence = Presence::Online;
-        c.since[stream as usize] = next;
+        let ring = &mut c.rings[stream as usize];
+        ring.since = next;
+        ring.read = true;
+        let counted = !ring.backlog;
+        c.catching_up |= !counted;
+        // What a backlog's read counts missed went before X-ray looked.
+        let missed = if counted { missed } else { 0 };
         c.missed = Some(c.missed.unwrap_or(0).saturating_add(missed));
         // Known from its ring's first read on, at 0 if nothing came.
         match stream {
@@ -213,7 +258,7 @@ impl View {
             }
         }
         for e in events {
-            c.apply(cpu, stream, e);
+            c.apply(cpu, stream, e, counted);
         }
     }
 
@@ -227,6 +272,19 @@ impl View {
         c.runq = None;
         c.thread = None;
         c.column = Column::default();
+        for ring in &mut c.rings {
+            ring.backlog = true;
+            ring.read = false;
+        }
+        c.catching_up = false;
+    }
+
+    /// Reading resumes after a pause: each ring's next read takes what
+    /// piled up meanwhile as a backlog.
+    pub fn resume(&mut self) {
+        for ring in self.cpus.iter_mut().flat_map(|c| c.rings.iter_mut()) {
+            ring.backlog = true;
+        }
     }
 
     /// End the column: each CPU's goes into its lane at the cursor, and the
@@ -237,10 +295,16 @@ impl View {
         for c in &mut self.cpus {
             let span = match c.presence {
                 Presence::Unread => Span::Empty,
+                Presence::Online if c.catching_up => Span::CatchingUp,
                 Presence::Online => Span::Counted,
                 Presence::Offline => Span::Offline,
             };
             c.history[at] = Column { span, ..c.column };
+            for ring in c.rings.iter_mut().filter(|r| r.read) {
+                ring.backlog = false;
+                ring.read = false;
+            }
+            c.catching_up = false;
             c.column = Column { runq: c.runq.unwrap_or(0), ..Column::default() };
         }
         self.cursor = (at + 1) % COLUMNS;
@@ -284,6 +348,18 @@ mod tests {
         (c.switches, c.irqs, c.locks, c.missed)
     }
 
+    /// `cpus` CPUs whose backlogs (empty) have been read, one column ended:
+    /// what they read from now on is counted. The cursor is at 1.
+    fn live(cpus: usize) -> View {
+        let mut v = View::new(cpus);
+        for cpu in 0..cpus {
+            v.read(cpu, Stream::Main, 0, 0, &[]);
+            v.read(cpu, Stream::Xray, 0, 0, &[]);
+        }
+        v.end_column();
+        v
+    }
+
     #[test]
     fn a_new_view_knows_nothing_and_reads_from_the_oldest() {
         let v = View::new(2);
@@ -300,7 +376,7 @@ mod tests {
 
     #[test]
     fn each_ring_gives_its_own_kinds() {
-        let mut v = View::new(1);
+        let mut v = live(1);
         v.read(0, Stream::Xray, 5, 0, &[runq(1, 0, 2), irq(2), lock(3), runq(4, 0, 3)]);
         v.read(0, Stream::Main, 3, 0, &[switch(0, 7), switch(1, 11), ev(2, kind::LOG, [0; 4])]);
         let c = &v.cpus()[0];
@@ -325,10 +401,88 @@ mod tests {
     }
 
     #[test]
+    fn a_backlog_gives_only_the_newest_queue_and_thread() {
+        // The first reads: what the rings held since boot, 7 numbers of it
+        // already gone. The queue and the thread are taken from it; its
+        // events and its missed numbers aren't counted, and the column it
+        // was read in is a gap.
+        let mut v = View::new(1);
+        v.read(0, Stream::Xray, 12, 7, &[runq(7, 0, 4), irq(8), lock(9), runq(10, 0, 1), irq(11)]);
+        v.read(0, Stream::Main, 2, 0, &[switch(0, 5), switch(1, 6)]);
+        let c = &v.cpus()[0];
+        assert_eq!((c.runq, c.thread), (Some(1), Some(6)));
+        assert_eq!(counts(c), (Some(0), Some(0), Some(0), Some(0)));
+        assert_eq!(v.end_column(), 0);
+        assert_eq!(v.cpus()[0].column(0), Column { span: Span::CatchingUp, ..Column::default() });
+        // From the next read on, counted.
+        v.read(0, Stream::Xray, 14, 2, &[irq(13)]);
+        v.read(0, Stream::Main, 3, 0, &[switch(2, 8)]);
+        assert_eq!(counts(&v.cpus()[0]), (Some(1), Some(1), Some(0), Some(2)));
+        v.end_column();
+        assert_eq!(v.cpus()[0].column(1), Column { span: Span::Counted, runq: 1, switches: 1, irqs: 1, locks: 0 });
+    }
+
+    #[test]
+    fn every_read_of_a_backlog_in_its_column_is_one() {
+        // A backlog longer than one read: each read in that column is part
+        // of it; a ring not read in it keeps its backlog for its next read.
+        let mut v = View::new(1);
+        v.read(0, Stream::Xray, 256, 0, &[irq(0)]);
+        v.read(0, Stream::Xray, 300, 3, &[irq(256)]);
+        v.end_column();
+        assert_eq!(counts(&v.cpus()[0]), (None, Some(0), Some(0), Some(0)));
+        v.read(0, Stream::Main, 4, 0, &[switch(3, 2)]);
+        v.read(0, Stream::Xray, 301, 0, &[irq(300)]);
+        assert_eq!(counts(&v.cpus()[0]), (Some(0), Some(1), Some(0), Some(0)));
+        v.end_column();
+        assert_eq!(v.cpus()[0].column(1).span, Span::CatchingUp, "the main ring's backlog came in it");
+    }
+
+    #[test]
+    fn a_resume_reads_a_backlog_as_a_gap() {
+        let mut v = live(1);
+        v.read(0, Stream::Xray, 1, 0, &[irq(0)]);
+        v.end_column();
+        v.resume();
+        v.read(0, Stream::Xray, 40, 5, &[runq(38, 0, 6), irq(39)]);
+        v.read(0, Stream::Main, 1, 0, &[switch(0, 9)]);
+        let c = &v.cpus()[0];
+        assert_eq!((c.runq, c.thread), (Some(6), Some(9)));
+        assert_eq!(counts(c), (Some(0), Some(1), Some(0), Some(0)), "the pause's events left out");
+        assert_eq!(v.end_column(), 2);
+        assert_eq!(v.cpus()[0].column(2).span, Span::CatchingUp);
+        v.read(0, Stream::Xray, 41, 0, &[irq(40)]);
+        v.end_column();
+        assert_eq!(v.cpus()[0].column(3).span, Span::Counted);
+        assert_eq!(v.cpus()[0].irqs, Some(2));
+    }
+
+    #[test]
+    fn coming_back_online_reads_a_backlog() {
+        let mut v = live(1);
+        v.read(0, Stream::Xray, 1, 0, &[irq(0)]);
+        v.offline(0);
+        v.end_column();
+        v.read(0, Stream::Xray, 9, 4, &[irq(7), irq(8)]);
+        assert_eq!(v.cpus()[0].irqs, Some(1), "what came while it was away isn't counted");
+        assert_eq!(v.cpus()[0].missed, Some(0));
+        v.end_column();
+        assert_eq!(v.cpus()[0].column(2).span, Span::CatchingUp);
+        // A read and then a refusal in one column: the read counted, and
+        // what is read when it comes back is a backlog again.
+        v.read(0, Stream::Xray, 10, 0, &[irq(9)]);
+        v.offline(0);
+        v.end_column();
+        assert_eq!(v.cpus()[0].irqs, Some(2));
+        v.read(0, Stream::Xray, 12, 0, &[irq(10), irq(11)]);
+        assert_eq!(v.cpus()[0].irqs, Some(2));
+    }
+
+    #[test]
     fn a_kind_in_the_other_ring_is_left_alone() {
         // A switch in the X-ray ring, or a runq, irq or lock event in the
         // main one, isn't where section 14 puts it: not counted.
-        let mut v = View::new(1);
+        let mut v = live(1);
         v.read(0, Stream::Xray, 1, 0, &[switch(0, 7)]);
         v.read(0, Stream::Main, 3, 0, &[runq(0, 0, 4), irq(1), lock(2)]);
         let c = &v.cpus()[0];
@@ -338,29 +492,29 @@ mod tests {
 
     #[test]
     fn events_that_dont_decode_are_counted_odd() {
+        // Backlog or not: an event that doesn't decode is a fault, not
+        // activity.
         let mut v = View::new(2);
-        v.read(
-            0,
-            Stream::Xray,
-            4,
-            0,
-            &[
-                ev(0, kind::RUN_QUEUE, [0, 1, 9, 7]),       // no such op
-                runq(1, 1, 5),                              // another CPU's queue
-                ev(2, kind::IRQ, [0x1_00, 0, 0, 0]),        // a vector past a byte
-                ev(3, kind::LOCK_WAIT, [0, 0, 0, 1 << 33]), // a line past u32
-            ],
-        );
+        let bad = [
+            ev(0, kind::RUN_QUEUE, [0, 1, 9, 7]),       // no such op
+            runq(1, 1, 5),                              // another CPU's queue
+            ev(2, kind::IRQ, [0x1_00, 0, 0, 0]),        // a vector past a byte
+            ev(3, kind::LOCK_WAIT, [0, 0, 0, 1 << 33]), // a line past u32
+        ];
+        v.read(0, Stream::Xray, 4, 0, &bad);
         v.read(0, Stream::Main, 1, 0, &[ev(0, kind::SWITCH, [1, 2, 9, 0])]); // no such state
+        assert_eq!(v.cpus()[0].odd, 5);
+        v.end_column();
+        v.read(0, Stream::Xray, 8, 0, &bad);
         let c = &v.cpus()[0];
-        assert_eq!(c.odd, 5);
+        assert_eq!(c.odd, 9);
         assert_eq!((c.runq, c.thread), (None, None));
         assert_eq!(counts(c), (Some(0), Some(0), Some(0), Some(0)));
     }
 
     #[test]
     fn missed_numbers_add_up_and_reads_go_on_from_next() {
-        let mut v = View::new(1);
+        let mut v = live(1);
         v.read(0, Stream::Xray, 10, 4, &[runq(4, 0, 1)]);
         v.read(0, Stream::Xray, 300, 250, &[]);
         v.read(0, Stream::Main, 7, 3, &[]);
@@ -373,14 +527,13 @@ mod tests {
 
     #[test]
     fn offline_forgets_the_queue_and_thread_and_a_read_brings_it_back() {
-        let mut v = View::new(3);
+        let mut v = live(3);
         v.read(0, Stream::Xray, 2, 0, &[runq(0, 0, 2), irq(1)]);
         v.read(0, Stream::Main, 1, 0, &[switch(0, 5)]);
         v.offline(1);
         v.read(2, Stream::Main, 1, 0, &[]);
         let presence: Vec<Presence> = v.cpus().iter().map(|c| c.presence).collect();
         assert_eq!(presence, [Presence::Online, Presence::Offline, Presence::Online]);
-        assert_eq!(counts(&v.cpus()[1]), (None, None, None, None), "never read");
         v.offline(0);
         let c = &v.cpus()[0];
         assert_eq!(c.presence, Presence::Offline);
@@ -392,43 +545,47 @@ mod tests {
 
     #[test]
     fn a_column_is_written_as_the_cpu_was() {
-        let mut v = View::new(3);
+        let mut v = live(3);
+        let mut w = View::new(3);
         v.read(0, Stream::Xray, 1, 0, &[runq(0, 0, 3)]);
         v.read(1, Stream::Xray, 1, 0, &[runq(0, 1, 2)]);
         v.offline(1);
         v.end_column();
-        let spans: Vec<Span> = v.cpus().iter().map(|c| c.column(0).span).collect();
-        assert_eq!(spans, [Span::Counted, Span::Offline, Span::Empty]);
+        let spans: Vec<Span> = v.cpus().iter().map(|c| c.column(1).span).collect();
+        assert_eq!(spans, [Span::Counted, Span::Offline, Span::Counted]);
         // Nor does the column it went offline in.
-        assert_eq!(v.cpus()[1].column(0), Column { span: Span::Offline, ..Column::default() });
+        assert_eq!(v.cpus()[1].column(1), Column { span: Span::Offline, ..Column::default() });
         // An offline CPU's next column doesn't carry its old length.
         v.end_column();
-        assert_eq!(v.cpus()[1].column(1), Column { span: Span::Offline, ..Column::default() });
-        assert_eq!(v.cpus()[0].column(1).runq, 3);
+        assert_eq!(v.cpus()[1].column(2), Column { span: Span::Offline, ..Column::default() });
+        assert_eq!(v.cpus()[0].column(2).runq, 3);
+        // A CPU never read: empty.
+        w.end_column();
+        assert_eq!(w.cpus()[2].column(0), Column::default());
     }
 
     #[test]
     fn a_column_keeps_the_longest_queue_and_its_counts() {
-        let mut v = View::new(1);
+        let mut v = live(1);
         v.read(0, Stream::Xray, 6, 0, &[runq(0, 0, 1), runq(1, 0, 4), runq(2, 0, 2), irq(3), irq(4), lock(5)]);
         v.read(0, Stream::Main, 1, 0, &[switch(0, 3)]);
-        assert_eq!(v.end_column(), 0);
-        assert_eq!(v.cpus()[0].column(0), Column { span: Span::Counted, runq: 4, switches: 1, irqs: 2, locks: 1 });
-        // No events: the next column carries the length as it was (2).
         assert_eq!(v.end_column(), 1);
-        assert_eq!(v.cpus()[0].column(1), Column { span: Span::Counted, runq: 2, ..Column::default() });
+        assert_eq!(v.cpus()[0].column(1), Column { span: Span::Counted, runq: 4, switches: 1, irqs: 2, locks: 1 });
+        // No events: the next column carries the length as it was (2).
+        assert_eq!(v.end_column(), 2);
+        assert_eq!(v.cpus()[0].column(2), Column { span: Span::Counted, runq: 2, ..Column::default() });
         // A length that drops to 0 in a column still shows what it began with.
         v.read(0, Stream::Xray, 7, 0, &[runq(6, 0, 0)]);
         v.end_column();
-        assert_eq!(v.cpus()[0].column(2).runq, 2);
+        assert_eq!(v.cpus()[0].column(3).runq, 2);
         v.end_column();
-        assert_eq!(v.cpus()[0].column(3).runq, 0);
+        assert_eq!(v.cpus()[0].column(4).runq, 0);
     }
 
     #[test]
     fn columns_wrap_round_the_lane() {
-        let mut v = View::new(1);
-        for i in 0..COLUMNS {
+        let mut v = live(1);
+        for i in 1..COLUMNS {
             v.read(0, Stream::Xray, i as u64 + 1, 0, &[runq(i as u64, 0, i as u64)]);
             assert_eq!(v.end_column(), i);
         }
@@ -442,14 +599,14 @@ mod tests {
 
     #[test]
     fn counts_in_a_column_saturate() {
-        let mut v = View::new(1);
+        let mut v = live(1);
         v.cpus[0].column.irqs = u32::MAX;
         v.cpus[0].column.locks = u32::MAX;
         v.cpus[0].column.switches = u32::MAX;
         v.read(0, Stream::Xray, 2, 0, &[irq(0), lock(1)]);
         v.read(0, Stream::Main, 1, 0, &[switch(0, 4)]);
         v.end_column();
-        let col = v.cpus()[0].column(0);
+        let col = v.cpus()[0].column(1);
         assert_eq!((col.irqs, col.locks, col.switches), (u32::MAX, u32::MAX, u32::MAX));
         assert_eq!(counts(&v.cpus()[0]), (Some(1), Some(1), Some(1), Some(0)));
     }
