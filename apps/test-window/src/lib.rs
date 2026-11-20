@@ -34,7 +34,8 @@
 //!   `WINDOW_PIXELS` is `BadArgument` (not `OutOfMemory`), `Trace` (`cpus`
 //!   at least 1, a read whose count agrees with its header), `Desktop::
 //!   measure`, `Time::now_ns` and `wall`, `Window::wait` with a deadline,
-//!   animating and not; then `exit(7)`.
+//!   animating and not; a toolkit whose tree's area is off the client is
+//!   `BadArgument`; then `exit(7)`.
 //!
 //! The toolkit modes (#207), each its window titled `window`:
 //!
@@ -283,6 +284,15 @@ fn sdk() -> i32 {
             check("animating without a deadline", w.wait(None, true) == Err(Error::BadArgument));
         }
         Err(_) => check("a window", false),
+    }
+    // A toolkit whose tree's area is off the client: BadArgument (its
+    // window dropped with it).
+    match desk.open_window("sdk", 40, 20) {
+        Ok(w) => {
+            let off = lumen_app::gfx::Rect::new(40, 0, 10, 10);
+            check("a tree's area off the client is BadArgument", matches!(Toolkit::with_area(Grower::new(), w, off), Err(Error::BadArgument)));
+        }
+        Err(_) => check("a second window", false),
     }
     log::info(&format!("window: sdk: {run} checks, {failed} failed"));
     lumen_app::exit(7)

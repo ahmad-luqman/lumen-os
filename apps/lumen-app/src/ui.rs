@@ -24,7 +24,7 @@
 //!   host's text, and reports what it changed with `App::take_drawn`: that
 //!   is repainted and committed without republishing an unchanged tree.
 
-use crate::{Desktop, Event, Handle, Result, Time, Window, check, sys};
+use crate::{Desktop, Error, Event, Handle, Result, Time, Window, check, sys};
 use lumen_app_api::answer::AppAnswer;
 use lumen_app_api::event::{Button, Offer, toolkit_key};
 use lumen_app_api::layout::{Rect as WireRect, TextDraw};
@@ -202,14 +202,15 @@ impl<A: App> Toolkit<A> {
     }
 
     /// `app` in `window` with its tree laid out in `area` (cut to the
-    /// client area); the rest of the client is the app's own (a board, a
-    /// clock face, a buffer's text): every rect repainted there gets the
-    /// tree's background first, then the app's `paint_over` draws its
-    /// foreground.
+    /// client area; `BadArgument` if none of it is on the client, the
+    /// window then dropped); the rest of the client is the app's own (a
+    /// board, a clock face, a buffer's text): every rect repainted there
+    /// gets the tree's background first, then the app's `paint_over` draws
+    /// its foreground.
     pub fn with_area(app: A, window: Window, area: Rect) -> Result<Toolkit<A>> {
+        let area = area.intersect(&window.canvas.bounds()).ok_or(Error::BadArgument)?;
         let text = HostText::new(window.desktop())?;
         let palette = Palette::from(lumen_app_api::event::Palette::default());
-        let area = area.intersect(&window.canvas.bounds()).unwrap_or(Rect::EMPTY);
         Ok(Toolkit { app, area, text, palette, themed: false, window, unpublished: None, warned: false })
     }
 

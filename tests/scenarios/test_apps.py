@@ -496,14 +496,14 @@ CLOSE_GRACE_SLICES = 4
 def test_sdk_wraps_its_other_calls(boot):
     # `window sdk`: open_window past WINDOW_PIXELS is BadArgument, Trace
     # (cpus, a read agreeing with its header), measure, the clocks, waits
-    # with a deadline (animating or not), animating without one refused;
-    # then exit(7).
+    # with a deadline (animating or not), animating without one refused, a
+    # toolkit's tree area off the client refused; then exit(7).
     m = boot_desktop(boot)
     app_id, mark = start(m, "window sdk")
     found = wait_for_output(
         m, mark, r"INFO  app: window: window: sdk: (\d+) checks, (\d+) failed\n", 30
     )
-    assert (int(found[1]), found[2]) == (10, "0"), m.output[mark:]
+    assert (int(found[1]), found[2]) == (11, "0"), m.output[mark:]
     end_line(m, mark, "window", app_id, "exited with 7")
 
 
