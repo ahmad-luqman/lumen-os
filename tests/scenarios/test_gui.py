@@ -1219,19 +1219,6 @@ def minimize_box(frame: tuple[int, int, int, int]) -> tuple[int, int]:
     return x - 16 - 4, y
 
 
-def launch(m: Machine, item: str) -> gui.Invoked:
-    """Open launcher item `item` through `ui invoke`: the menu's `press`
-    unfolds it, its item's `press` opens the window (and folds it, so the
-    item's node is gone after)."""
-    launcher = gui.node(gui.taskbar(m), "menu", "Launcher")
-    unfolded = gui.invoke(m, launcher["id"], "press")
-    assert unfolded.row is not None and unfolded.row["state"] == "expanded", unfolded
-    entry = gui.node(gui.taskbar(m), "menuitem", item)
-    got = gui.invoke(m, entry["id"], "press")
-    assert got.message == f"ui invoke: ran; node {entry['id']} is gone", got
-    return got
-
-
 def test_launcher_opens_terminal(boot):
     # The taskbar's launcher, through `ui invoke` then through confirming
     # clicks: `press` unfolds it (`expanded`, its four items after it in
@@ -1390,7 +1377,7 @@ def test_mandelbrot_window_golden(boot, artifacts, golden_dir):
     m = boot_shells(boot, extra=["-smp", "4"])
     assert "INFO  smp: 4 CPUs online" in m.output
     gui.start_desktop(m)
-    launch(m, "Mandelbrot")
+    gui.launch(m, "Mandelbrot")
     found = gui.wait_for(
         m, "the Mandelbrot window drawn", lambda: MANDEL_WINDOW.search(m.output), bool, 60
     )
@@ -1502,7 +1489,7 @@ def test_a_window_opened_from_the_shell_gets_a_taskbar_button(boot):
         lambda: taskbar_buttons(m),
         lambda b: b == ["Welcome", "Colours", "Counter"],
     )
-    launch(m, "Counter")
+    gui.launch(m, "Counter")
     assert taskbar_buttons(m) == ["Welcome", "Colours", "Counter", "Counter"]
     assert [w["title"] for w in gui.windows(m)][:2] == ["Counter", "Counter"]
     assert gui.desktop_status(m)["taskbar"] == "yes"
@@ -1538,5 +1525,5 @@ def test_the_launcher_answers_with_the_new_window_s_button(boot):
     gui.start_desktop(m)
     said = "INFO  taskbar: waiting 2000 ms after each poke (lumen.taskbar_wake_delay_ms)"
     assert said in m.output, "the knob wasn't taken"
-    launch(m, "Counter")
+    gui.launch(m, "Counter")
     assert taskbar_buttons(m) == ["Welcome", "Colours", "Counter"]

@@ -111,6 +111,10 @@ pub const PATTERNS: &[Pattern] = &[
     },
 ];
 
+/// The pattern started without one named: the `life` command's and the
+/// Life app's.
+pub const DEFAULT_PATTERN: &str = "gun";
+
 /// The pattern called `name`.
 pub fn pattern(name: &str) -> Option<&'static Pattern> {
     PATTERNS.iter().find(|p| p.name == name)

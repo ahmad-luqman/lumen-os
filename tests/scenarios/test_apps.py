@@ -1025,18 +1025,6 @@ def life_tree(m) -> tuple[str, list[dict[str, str]]]:
     return wait_tree(m, "Life", "Generation")
 
 
-def launch_item(m, item: str) -> None:
-    """Choose launcher item `item` through `ui invoke`: the menu's `press`
-    unfolds it, its item's `press` launches it (and folds the menu, so the
-    item's node is gone after)."""
-    launcher = gui.node(gui.taskbar(m), "menu", "Launcher")
-    unfolded = gui.invoke(m, launcher["id"], "press")
-    assert unfolded.row is not None and unfolded.row["state"] == "expanded", unfolded
-    entry = gui.node(gui.taskbar(m), "menuitem", item)
-    got = gui.invoke(m, entry["id"], "press")
-    assert got.message == f"ui invoke: ran; node {entry['id']} is gone", got
-
-
 def test_life_golden(boot, artifacts, golden_dir):
     # `run life --stopped`: no period, so the window settles. Acorn chosen
     # in its list (a pattern starts it again at generation 0), then twelve
@@ -1096,7 +1084,7 @@ def test_life_runs_unfocused_and_stops_when_closed(boot):
     # it with 0, its thread joined, and the desktop settles again.
     m = boot_desktop(boot)
     mark = len(m.output)
-    launch_item(m, "Life")
+    gui.launch(m, "Life")
     listed = gui.wait_for(
         m,
         "apps listing life",

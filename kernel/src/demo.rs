@@ -35,7 +35,7 @@ use core::fmt::Write;
 use core::num::NonZeroUsize;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lumen_demo::bands;
-use lumen_demo::life::{self, Life, PATTERNS};
+use lumen_demo::life::{self, DEFAULT_PATTERN, Life, PATTERNS};
 use lumen_demo::mandel::{self, View};
 
 /// Rows per band.
@@ -250,8 +250,6 @@ const ALIVE: u32 = 0x7ee787;
 const DEAD: u32 = STATUS_BG;
 /// The most generations a second when running until a key.
 const LIFE_HZ: u64 = 20;
-/// The pattern `life` runs without one named.
-const DEFAULT_PATTERN: &str = "gun";
 const LIFE_USAGE: &str = "usage: life [pattern] [generations]";
 /// Refuse in a pipeline (`name`: the demo), where it would draw and wait
 /// for a key while its output went down the pipeline; whether it did.
@@ -364,7 +362,7 @@ pub fn life(ctx: &mut Ctx<'_>, args: &[String]) {
     }
 }
 
-// -- the demos in windows (#157) ------------------------------------------------
+// -- the Mandelbrot window (#157) ---------------------------------------------------
 
 /// The Mandelbrot window's client size.
 const MANDEL_WINDOW: (u32, u32) = (480, 320);
@@ -444,23 +442,15 @@ fn draw_bands(bands: Vec<lumen_gfx::BandMut<'_>>, view: View, others: &[usize]) 
     Ok(WindowDrawn { ns: crate::time::now_ns() - start, rows, caller, no_thread })
 }
 
-/// Open a `size` window titled `title` and start its owner, thread
-/// `thread` running `owner`; the window's id.
-fn open_owned(
-    title: &str,
-    size: (u32, u32),
-    thread: &'static str,
-    owner: fn(crate::desktop::WindowHandle),
-) -> Result<u32, String> {
-    let handle = crate::desktop::open_window(title, size.0, size.1).map_err(|e| format!("no window: {e}"))?;
-    let id = handle.id();
-    let _detached = sched::spawn(thread, move || owner(handle)).map_err(|e| format!("no thread: {e}"))?;
-    Ok(id)
-}
-
-/// The launcher's `Mandelbrot`: a window drawn once by every CPU; its id.
+/// The launcher's `Mandelbrot`: a window drawn once by every CPU, by its
+/// owner thread `desktop-mandelbrot`; its id.
 pub fn open_mandelbrot_window() -> Result<u32, String> {
-    open_owned("Mandelbrot", MANDEL_WINDOW, "desktop-mandelbrot", mandelbrot_owner)
+    let (w, h) = MANDEL_WINDOW;
+    let handle = crate::desktop::open_window("Mandelbrot", w, h).map_err(|e| format!("no window: {e}"))?;
+    let id = handle.id();
+    let _detached =
+        sched::spawn("desktop-mandelbrot", move || mandelbrot_owner(handle)).map_err(|e| format!("no thread: {e}"))?;
+    Ok(id)
 }
 
 /// Draw the set into `h`'s surface with this CPU and `others` and commit

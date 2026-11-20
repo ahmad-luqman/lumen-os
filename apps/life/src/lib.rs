@@ -28,8 +28,9 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::ops::Range;
 use lumen_app::gfx::Rect as Area;
-use lumen_app::ui::{Flow, Ticking, Toolkit};
+use lumen_app::ui::{Flow, Taken, Ticking, Toolkit};
 use lumen_app::{Desktop, Error, Time, log};
 use lumen_demo::life::{self, Life, Pattern};
 use lumen_ui::{App, Over, Then, Ui, UiEvent, Widget};
@@ -51,8 +52,6 @@ const COLS: usize = (GRID.w() / CELL) as usize;
 const ROWS: usize = (GRID.h() / CELL) as usize;
 /// A generation every 100 ms while running, as #157's window stepped.
 const PERIOD_NS: u64 = 100_000_000;
-/// The pattern without one named (the launcher's).
-const DEFAULT_PATTERN: &str = "gun";
 /// The labels' fixed width: a label changing width would move the widgets
 /// after it, repainting (and committing) the whole window.
 const LABEL_W: u32 = 140;
@@ -139,7 +138,18 @@ fn state_text(running: bool) -> &'static str {
 
 /// Cell (`x`, `y`)'s pixels: `CELL` less a pixel's gap, in the grid.
 fn cell(x: usize, y: usize) -> Area {
-    Area::new(GRID.x() + (x as u32 * CELL) as i32, (y as u32 * CELL) as i32, CELL - 1, CELL - 1)
+    Area::new(GRID.x() + (x as u32 * CELL) as i32, GRID.y() + (y as u32 * CELL) as i32, CELL - 1, CELL - 1)
+}
+
+/// The cells whose pixels `part` (inside the grid) may reach: their columns
+/// and their rows.
+fn cells_under(part: Area) -> (Range<usize>, Range<usize>) {
+    let first = |a: i32, edge: i32| ((a - edge) as u32 / CELL) as usize;
+    let past = |a: i32, edge: i32| ((a - edge) as u32).div_ceil(CELL) as usize;
+    (
+        first(part.x(), GRID.x())..past(part.right(), GRID.x()).min(COLS),
+        first(part.y(), GRID.y())..past(part.bottom(), GRID.y()).min(ROWS),
+    )
 }
 
 impl App for LifeApp {
@@ -172,12 +182,9 @@ impl App for LifeApp {
                 over.surface.fill_rect(line, over.palette.border);
             }
             let Some(part) = r.intersect(&GRID) else { continue };
-            let cols = |a: i32| ((a - GRID.x()) as u32).div_ceil(CELL) as usize;
-            let rows = |a: i32| (a as u32).div_ceil(CELL) as usize;
-            let (x0, y0) = (((part.x() - GRID.x()) as u32 / CELL) as usize, (part.y() as u32 / CELL) as usize);
-            let (x1, y1) = (cols(part.right()).min(COLS), rows(part.bottom()).min(ROWS));
-            for y in y0..y1 {
-                for x in x0..x1 {
+            let (cols, rows) = cells_under(part);
+            for y in rows {
+                for x in cols.clone() {
                     if self.grid.get(x, y)
                         && let Some(c) = cell(x, y).intersect(&part)
                     {
@@ -218,7 +225,7 @@ fn parse(args: &[String]) -> Result<(&'static Pattern, bool), String> {
             other => return Err(format!("'{other}' isn't an argument it takes")),
         }
     }
-    let pattern = name.unwrap_or_else(|| life::pattern(DEFAULT_PATTERN).expect("the default pattern exists"));
+    let pattern = name.unwrap_or_else(|| life::pattern(life::DEFAULT_PATTERN).expect("the default pattern exists"));
     Ok((pattern, running))
 }
 
@@ -247,5 +254,5 @@ fn app(pattern: &'static Pattern, running: bool) -> Result<(), (&'static str, Er
     let desktop = Desktop::get().map_err(|e| ("no desktop handle", e))?;
     let window = desktop.open_window("Life", WIDTH, HEIGHT).map_err(|e| ("no window", e))?;
     let mut tk = Toolkit::with_area(LifeApp::new(pattern, running), window, TREE).map_err(|e| ("no toolkit", e))?;
-    tk.run_until(time, |_, _| lumen_app::ui::Taken::Pass).map(|_| ()).map_err(|e| ("toolkit", e))
+    tk.run_until(time, |_, _| Taken::Pass).map(|_| ()).map_err(|e| ("toolkit", e))
 }
