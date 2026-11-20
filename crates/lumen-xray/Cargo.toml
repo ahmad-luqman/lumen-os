@@ -1,0 +1,12 @@
+[package]
+name = "lumen-xray"
+description = "no_std logic for Lumen's X-ray app (#208): trace events read from each CPU's two rings into per-CPU state (run-queue length, current thread, interrupt, lock-wait and switch counts, numbers missed) and a history of columns for the lanes; a fixed trace for the frozen view; host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lumen-trace.workspace = true
+
+[lints]
+workspace = true
