@@ -148,7 +148,7 @@ tests = [
     "harness:test_ui_tree::test_invoke_on_an_animating_window_retries_a_held_slot_without_settling",
     "harness:test_ui_tree::test_invoke_on_an_animating_window_gives_up_on_a_slot_held_too_long",
     "harness:test_ui_tree::test_press_animated_confirms_by_the_tree_not_by_settling",
-    "harness:test_ui_tree::test_press_animated_fails_on_another_row_or_a_refusal",
+    "harness:test_ui_tree::test_press_animated_fails_on_another_row_or_a_refusal*",
     "harness:test_ui_tree::test_press_animated_refuses_a_predicate_already_true",
     "scenario:test_apps::test_sdk_tick_loop_answers_requests_and_closes_while_ticking",
     "scenario:test_apps::test_sdk_tick_loop_stopped_lets_the_desktop_settle",
