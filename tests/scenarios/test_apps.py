@@ -977,21 +977,22 @@ def test_snake_steering_and_modes(boot):
             # The flight ended before the press came (a stalled host).
             continue
         assert got.still_running or (got.row is not None and got.row["id"] == step["id"]), got
-        break
+        rows = gui.wait_ui(
+            m, "Step's effect", lambda r: state(r) in ("stepping", "over: edge"), wid, 30
+        )
+        if state(rows) == "stepping":
+            break
+        # Step's own step ended the flight at the edge: try again.
     else:
-        raise AssertionError("every flight ended before Step came")
-    rows = gui.wait_ui(
-        m, "stepping again", lambda r: state(r) in ("stepping", "over: edge"), wid, 30
-    )
-    if state(rows) == "stepping":
-        before = gui.node(rows, "label", "Comet")["value"]
-        bx = int(before.split()[1].split(",")[0])
-        step_comet(m, below_root(rows), 1)
-        after = comet_labels(m, wid)
-        if bx + 1 < 24:
-            assert after["Comet"] == comet_at(bx + 1, y), (before, after)
-        else:
-            assert after["State"] == "over: edge", (before, after)
+        raise AssertionError("Step while flying never left it stepping")
+    before = gui.node(rows, "label", "Comet")["value"]
+    bx = int(before.split()[1].split(",")[0])
+    step_comet(m, below_root(rows), 1)
+    after = comet_labels(m, wid)
+    if bx < x + COMET_STEPS_TO_EDGE:
+        assert after["Comet"] == comet_at(bx + 1, y), (before, after)
+    else:
+        assert after["State"] == "over: edge", (before, after)
     gui.close_window(m, "Comet")
     end_line(m, mark, "comet", app_id, "exited with 0")
 
