@@ -26,6 +26,7 @@
 extern crate alloc;
 
 use alloc::collections::VecDeque;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// Cells a grain of stardust adds to the tail.
@@ -42,6 +43,11 @@ pub const MIN_H: u16 = 8;
 /// Comet's sky (the app's board): columns and rows.
 pub const SKY_W: u16 = 24;
 pub const SKY_H: u16 = 18;
+
+/// Comet's labels' fixed width in pixels (its widget column, less its
+/// padding): every text the label functions below give fits it in the UI
+/// font at the apps' toolkit size (`every_label_fits_its_width`).
+pub const LABEL_W: u32 = 164;
 
 /// The levels' names, in order: each one's asteroid field is [`rocks`]'.
 pub const LEVELS: [&str; 4] = ["Open sky", "Twin belts", "Crossing", "Ring of rocks"];
@@ -451,6 +457,34 @@ pub fn rocks(level: usize, w: u16, h: u16) -> Vec<Cell> {
         _ => {}
     }
     out
+}
+
+/// The `Score` label's text.
+pub fn score_label(score: u32) -> String {
+    alloc::format!("Score {score}")
+}
+
+/// The `Level` label's text: its number from 1, and its name.
+pub fn level_label(level: usize) -> String {
+    alloc::format!("Level {}: {}", level + 1, LEVELS[level.min(LEVELS.len() - 1)])
+}
+
+/// The `State` label's text: `flying` (or `stepping`, one step per press),
+/// or how the flight ended.
+pub fn state_label(state: State, stepping: bool) -> &'static str {
+    match state {
+        State::Flying if stepping => "stepping",
+        State::Flying => "flying",
+        State::Over(Crash::Edge) => "over: edge",
+        State::Over(Crash::Tail) => "over: tail",
+        State::Over(Crash::Rock) => "over: asteroid",
+        State::Full => "sky full",
+    }
+}
+
+/// The `Comet` label's text: the head's cell.
+pub fn comet_label(head: Cell) -> String {
+    alloc::format!("at {},{}", head.x, head.y)
 }
 
 #[cfg(test)]

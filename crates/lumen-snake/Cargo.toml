@@ -7,3 +7,9 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Comet's labels measured in the UI font at the apps' toolkit size
+# (`every_label_fits_its_width`).
+lumen-font.workspace = true
+lumen-app-api.workspace = true

@@ -36,7 +36,9 @@ use alloc::vec::Vec;
 use lumen_app::gfx::Rect as Area;
 use lumen_app::ui::{Flow, Taken, Ticking, Toolkit};
 use lumen_app::{Desktop, Error, Event, KeyAction, KeyCode, Time, log};
-use lumen_snake::{Cell, Content, Crash, Dir, Game, LEVELS, SKY_H, SKY_W, State};
+use lumen_snake::{
+    Cell, Content, Dir, Game, LABEL_W, SKY_H, SKY_W, State, comet_label, level_label, score_label, state_label,
+};
 use lumen_ui::{App, Over, Palette, Then, Ui, UiEvent, Widget};
 
 lumen_app::manifest!(time, desktop);
@@ -44,16 +46,16 @@ lumen_app::main!(run);
 
 /// A cell's side, in pixels.
 const CELL: u32 = 16;
-/// The widgets' column, then the sky (its frame a pixel outside it).
-const TREE_W: u32 = 150;
+/// The widgets' column (its labels lumen-snake's `LABEL_W`, which every
+/// label text fits, measured in the UI font), then the sky (its frame a
+/// pixel outside it).
 const PAD: u32 = 8;
+const TREE_W: u32 = LABEL_W + 2 * PAD;
 const SKY: Area = Area::new((TREE_W + PAD) as i32, PAD as i32, SKY_W as u32 * CELL, SKY_H as u32 * CELL);
 const FRAMED: Area = Area::new(SKY.x() - 1, SKY.y() - 1, SKY.w() + 2, SKY.h() + 2);
 const WIDTH: u32 = TREE_W + PAD + SKY.w() + PAD;
 const HEIGHT: u32 = PAD + SKY.h() + PAD;
 const TREE: Area = Area::new(0, 0, TREE_W, HEIGHT);
-/// The labels' fixed width (the column's, less its padding).
-const LABEL_W: u32 = TREE_W - 2 * PAD;
 const USAGE: &str = "usage: comet [--seed N] [--step]";
 
 /// The time between steps while flying at `level`: faster each level.
@@ -130,20 +132,12 @@ impl Comet {
         c
     }
 
-    /// The labels from the game.
+    /// The labels from the game (their texts lumen-snake's, each fitting
+    /// `LABEL_W`).
     fn show(&mut self) {
         let g = &self.game;
-        let level = format!("Level {}: {}", g.level() + 1, LEVELS[g.level()]);
-        let state = match g.state() {
-            State::Flying if self.stepping => "stepping",
-            State::Flying => "flying",
-            State::Over(Crash::Edge) => "over: edge",
-            State::Over(Crash::Tail) => "over: tail",
-            State::Over(Crash::Rock) => "over: asteroid",
-            State::Full => "sky full",
-        };
-        let head = g.head();
-        let (score, at) = (format!("Score {}", g.score()), format!("at {},{}", head.x, head.y));
+        let (score, level, at) = (score_label(g.score()), level_label(g.level()), comet_label(g.head()));
+        let state = state_label(g.state(), self.stepping);
         self.ui.set_text(self.score, &score);
         self.ui.set_text(self.level, &level);
         self.ui.set_text(self.state, state);

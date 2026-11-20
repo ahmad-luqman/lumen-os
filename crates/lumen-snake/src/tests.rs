@@ -469,3 +469,50 @@ fn the_scenario_s_seed_puts_its_first_grain_ahead() {
 const COMET_SEED: u64 = 65;
 const COMET_DUST_AHEAD: u16 = 6;
 const COMET_STEPS_TO_EDGE: u16 = 20;
+
+#[test]
+fn the_labels_say_what_happened() {
+    assert_eq!(score_label(12), "Score 12");
+    assert_eq!(level_label(0), "Level 1: Open sky");
+    assert_eq!(level_label(3), "Level 4: Ring of rocks");
+    assert_eq!(comet_label(Cell::new(23, 17)), "at 23,17");
+    let states = [
+        (State::Flying, false, "flying"),
+        (State::Flying, true, "stepping"),
+        (State::Over(Crash::Edge), false, "over: edge"),
+        (State::Over(Crash::Tail), true, "over: tail"),
+        (State::Over(Crash::Rock), false, "over: asteroid"),
+        (State::Full, true, "sky full"),
+    ];
+    for (state, stepping, said) in states {
+        assert_eq!(state_label(state, stepping), said);
+    }
+}
+
+#[test]
+fn every_label_fits_its_width() {
+    // Measured as the app's toolkit lays its labels out: the UI font at
+    // the apps' text size. A text past LABEL_W would be clipped.
+    let face = lumen_font::Face::ui().expect("the UI font parses");
+    let px = lumen_font::Px::new(lumen_app_api::limits::UI_TEXT_PX as u16).unwrap();
+    let width = |t: &str| face.measure(t, px).width;
+    let mut texts: Vec<String> = (0..LEVELS.len()).map(level_label).collect();
+    texts.push(score_label(u32::from(SKY_W) * u32::from(SKY_H)));
+    for state in
+        [State::Flying, State::Over(Crash::Edge), State::Over(Crash::Tail), State::Over(Crash::Rock), State::Full]
+    {
+        texts.push(state_label(state, false).into());
+        texts.push(state_label(state, true).into());
+    }
+    for y in 0..SKY_H {
+        for x in 0..SKY_W {
+            texts.push(comet_label(Cell::new(x, y)));
+        }
+    }
+    for t in &texts {
+        assert!(width(t) <= LABEL_W, "{t:?} is {} px, past {LABEL_W}", width(t));
+    }
+    // The widest is close to the width: the column isn't needlessly wide.
+    let widest = texts.iter().map(|t| width(t)).max().unwrap();
+    assert!(widest + 32 > LABEL_W, "the widest label is {widest} px");
+}
