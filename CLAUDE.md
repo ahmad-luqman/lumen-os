@@ -172,7 +172,8 @@ own PR that updates that doc first.
   through `canvas`), their commands (`commands.rs`: each row carries its
   help line; the system ones in `sysinfo.rs`), pipelines (`pipe.rs`: `cpus |
   where busy > 50`), deliberate faults (`crash.rs`) and `trace runq`/`trace xray`
-  (`xray.rs`: run queues by X-ray and the scheduler, `park` holding the shell's CPU still). `fb.rs`:
+  (`xray.rs`: run queues by X-ray and the scheduler, `park` holding the shell's CPU still, `spin` keeping
+  threads spinning on the last CPU until stopped, #208). `fb.rs`:
   framebuffer pixels, the header (`draw_header`, again when the desktop is left) and the crash screen. `term.rs`: the
   terminals on the framebuffer (four virtual ones, one shown: log lines on the first, the screen shells, scrollback, `view_text`, and
   `Canvas`: the pixels below the header for one command, the terminals paused meanwhile;
@@ -522,6 +523,12 @@ own PR that updates that doc first.
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
   (`t=140 w=sine C4/8 r/8`), and `Source`s that fill interleaved 16-bit
   PCM buffers (host-tested).
+- `crates/lumen-xray`: the X-ray app's logic (#208): trace events read from
+  each CPU's main and X-ray rings into per-CPU state (`View`, `Cpu`: the run
+  queue from the newest `runq` event, the thread from the newest `switch`,
+  counts, numbers missed, events that didn't decode, where each ring's next
+  read starts, offline CPUs) and the lanes' columns (`Column`, `COLUMNS`);
+  `replay`, the fixed trace of the frozen view (host-tested).
 - `apps/`: the WASM apps (M5), their own cargo workspace (out of the root
   one; every directory but dot ones a member, named after its crate; output
   in `target-apps/`) for `wasm32-unknown-unknown`, `no_std`
@@ -530,7 +537,8 @@ own PR that updates that doc first.
   `build/apps/tests/`, skipping libraries (`lumen-app`, the SDK, #206;
   `testkit`); `template`, the app `make app NAME=` copies
   (`tools/new-app.sh`); `calculator` (#207, the first app on the SDK's
-  `ui::Toolkit`, lumen-ui inside the app); the SDK's loops (`run_with`'s
+  `ui::Toolkit`, lumen-ui inside the app); `xray` (#208, the trace rings
+  live, `--replay` frozen); the SDK's loops (`run_with`'s
   `Taken`, `run_until` for a `Ticking` app, both returning `Ended`;
   `Event::offer`; `with_area`, `palette`) for the animated apps; the
   layout, the SDK, the

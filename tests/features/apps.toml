@@ -160,3 +160,14 @@ tests = [
     "scenario:test_apps::test_sdk_a_tick_can_quit",
     "scenario:test_apps::test_sdk_wraps_its_other_calls",
 ]
+
+[[feature]]
+name = "X-ray (#208): a bundled app reading every CPU's trace rings through the Trace capability: each CPU's run queue (from its newest runq event, agreeing with the scheduler's count), running thread, interrupts and locks that waited as labels, offline CPUs marked, lanes of its recent columns; Pause stops its reads (the window settles) and Resume catches up; a frozen view of a fixed trace (--replay) matching a golden; refused without the trace grant"
+milestone = "M5"
+tests = [
+    "cargo:lumen-xray",
+    "scenario:test_xray::test_xray_matches_the_scheduler",
+    "scenario:test_xray::test_xray_pause_stops_its_reads",
+    "scenario:test_xray::test_xray_golden",
+    "scenario:test_xray::test_xray_without_trace_is_not_granted",
+]
