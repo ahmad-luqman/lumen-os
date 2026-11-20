@@ -138,8 +138,9 @@ struct Xray {
     /// lane).
     presence: Vec<Presence>,
     drawn: Vec<Area>,
-    /// Why a read failed (the loop ends then; the app exits with 1).
-    failed: Option<Error>,
+    /// Whether a read failed (logged, naming its CPU, ring and `since`;
+    /// the loop ends then and the app exits with 1).
+    failed: bool,
     /// Whether an odd event (one that didn't decode, or in the wrong ring)
     /// was logged: once, the first time any CPU's count rises past 0.
     warned_odd: bool,
@@ -158,6 +159,14 @@ fn lane(cpu: usize) -> Area {
 /// Column `c`'s strip across `cpus` lanes.
 fn strip(c: usize, cpus: usize) -> Area {
     Area::new(LANES_X + (c as u32 * COL_W) as i32, LANE_Y0, COL_W, cpus as u32 * LANE_H)
+}
+
+/// A ring's name in a log line.
+fn ring_name(stream: Stream) -> &'static str {
+    match stream {
+        Stream::Main => "main",
+        Stream::Xray => "X-ray",
+    }
 }
 
 /// A count or `-` for one not known yet.
@@ -217,7 +226,7 @@ impl Xray {
             events: Vec::with_capacity(TRACE_EVENTS_PER_READ),
             presence,
             drawn: Vec::new(),
-            failed: None,
+            failed: false,
             warned_odd: false,
         };
         x.show();
@@ -242,8 +251,10 @@ impl Xray {
         self.ui.set_text(self.state, self.mode.name());
     }
 
-    /// Each CPU's two rings read on from where the last read stopped.
-    fn read_all(&mut self) -> Result<(), Error> {
+    /// Each CPU's two rings read on from where the last read stopped; a
+    /// read that fails other than for an offline CPU is logged (one ERROR,
+    /// naming the CPU, the ring and `since`) and is `Err`.
+    fn read_all(&mut self) -> Result<(), ()> {
         let Some(trace) = self.trace else { return Ok(()) };
         for cpu in 0..self.view.cpus().len() {
             'rings: for stream in [Stream::Main, Stream::Xray] {
@@ -251,16 +262,31 @@ impl Xray {
                     let since = self.view.since(cpu, stream);
                     let copied = match trace.read(stream, cpu as u32, since, &mut self.buf) {
                         Ok(n) => n as usize,
-                        // Not online (an index hole below `trace_cpus`): the
-                        // only argument a read from the last `next` can fail.
+                        // A CPU not online (an index hole below `trace_cpus`),
+                        // or a `since` past the ring's next number, which a
+                        // read from the last `next` can't be unless the
+                        // kernel is wrong: a read from 0 tells them apart.
                         Err(Error::BadArgument) => {
+                            if since != 0 && trace.read(stream, cpu as u32, 0, &mut self.buf).is_ok() {
+                                log::error(&format!(
+                                    "cpu {cpu}: its {} ring refused a read from {since} (its last next) but not \
+                                     one from 0",
+                                    ring_name(stream)
+                                ));
+                                return Err(());
+                            }
                             self.view.offline(cpu);
                             break 'rings;
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            log::error(&format!("cpu {cpu}: reading its {} ring from {since}: {e}", ring_name(stream)));
+                            return Err(());
+                        }
                     };
-                    let (header, rest) = self.buf.split_at(HEADER_SIZE);
-                    let (next, missed) = decode_header(header.try_into().map_err(|_| Error::BadArgument)?);
+                    // The buffer is made with room for the header and
+                    // `TRACE_EVENTS_PER_READ` events.
+                    let (header, rest) = self.buf.split_first_chunk::<HEADER_SIZE>().expect("a header's room");
+                    let (next, missed) = decode_header(header);
                     self.events.clear();
                     self.events.extend(rest.as_chunks::<EVENT_SIZE>().0.iter().take(copied).map(decode_event));
                     self.view.read(cpu, stream, next, missed, &self.events);
@@ -363,8 +389,8 @@ impl Ticking for Xray {
     }
 
     fn tick(&mut self, _now: u64) -> Flow {
-        if let Err(e) = self.read_all() {
-            self.failed = Some(e);
+        if self.read_all().is_err() {
+            self.failed = true;
             return Flow::Quit;
         }
         let n = self.view.cpus().len();
@@ -392,8 +418,9 @@ impl Ticking for Xray {
 }
 
 /// The app's exit code: 0 once its window closes; 1 once a failure is
-/// logged (no trace grant, no window, a read refused); 2 for arguments it
-/// doesn't take.
+/// logged (no trace grant, no window, a read that failed other than for an
+/// offline CPU, whose refused reads mark it off and the app goes on); 2
+/// for arguments it doesn't take.
 fn run() -> i32 {
     let replay = match lumen_app::args().as_deref() {
         Ok([]) => false,
@@ -403,11 +430,17 @@ fn run() -> i32 {
             return 2;
         }
     };
-    lumen_app::report(app(replay))
+    match app(replay) {
+        Ok(true) => 0,
+        // Its read's failure is logged already.
+        Ok(false) => 1,
+        Err(e) => lumen_app::report(Err(e)),
+    }
 }
 
-/// The app, live or frozen: what failed and how, if anything did.
-fn app(replay: bool) -> Result<(), (&'static str, Error)> {
+/// The app, live or frozen: whether it ended well (`false`: a read failed,
+/// logged), or what failed and how.
+fn app(replay: bool) -> Result<bool, (&'static str, Error)> {
     let time = Time::get().map_err(|e| ("no time grant", e))?;
     let (view, mode, trace) = if replay {
         (replay::view(), Mode::Replay, None)
@@ -423,8 +456,5 @@ fn app(replay: bool) -> Result<(), (&'static str, Error)> {
     let app = Xray::new(view, mode, trace);
     let mut tk = Toolkit::with_area(app, window, Area::new(0, 0, TREE_W, height)).map_err(|e| ("no toolkit", e))?;
     tk.run_until(time, |_: &mut Xray, _: &WindowEvent| Taken::Pass).map_err(|e| ("toolkit", e))?;
-    match tk.app_mut().failed {
-        Some(e) => Err(("reading the trace", e)),
-        None => Ok(()),
-    }
+    Ok(!tk.app_mut().failed)
 }

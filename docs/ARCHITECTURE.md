@@ -3859,9 +3859,11 @@ SSE); #197 checks the results' bits.
     last read's `next` (0 at first: the oldest event each ring holds), up
     to `TRACE_EVENTS_PER_READ` × 16 events a ring a refresh, a ring's
     worth, so it keeps up unless a ring fills faster (the kernel counts
-    the rest missed). A read refused with `BadArgument` (the one way a read
-    from the last `next` fails) marks the CPU offline until a read is taken
-    again; any other error ends the app with 1 (`reading the trace: <e>`).
+    the rest missed). A read refused with `BadArgument` is tried once more
+    from 0: refused again, the CPU isn't online (marked offline until a read
+    is taken again); taken, the kernel refused the last `next` (a bug), and,
+    like any other error, that ends the app with 1 after one ERROR naming
+    the CPU, the ring and `since`.
   - **What it shows:** per CPU, the run queue's length from its newest
     `runq` event (one for another CPU's queue is counted odd, not shown),
     the thread running from its newest `switch`, and the `irq` and `lock`
