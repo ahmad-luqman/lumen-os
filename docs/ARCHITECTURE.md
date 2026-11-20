@@ -3852,6 +3852,25 @@ SSE); #197 checks the results' bits.
       first held answer.
   - **`test-window tick [greedy|quit|slow]`** exercises it (`slow`: each
     tick's work longer than its period, the next still a period after it).
+- **What #202 adds:** `apps/life` (bundled, `caps=time,desktop`),
+  Conway's Game of Life on the SDK's tick loop, replacing #157's kernel
+  Life window (`demo.rs`'s window path is gone; the text-mode `life`
+  command stays). Its rules and patterns are `lumen_demo::life`'s, a path
+  dependency (host-tested, `cargo:lumen-demo`).
+  - **The window** (600×320): a tree on the left (`with_area`): the
+    `Patterns` list, `Start`, `Stop` and `Step`, and three fixed-width
+    labels, `Pattern`, `Generation` and `State` (`running` or `stopped`).
+    The grid is the rest, the app's own: a line in the palette's border
+    colour, then cells of 8 pixels, live ones in its accent.
+  - **Running**, a generation every 100 ms (`Ticking::period`, animating,
+    focused or not); its damage is the box around the cells that changed
+    (`take_drawn`), as #157's window committed. **Stopped**, no period:
+    the window settles, and `Step` advances one generation. A pattern
+    chosen in the list starts it again from that pattern at generation 0,
+    running or stopped as it was.
+  - **`run life [--stopped] [pattern]`** (`gun` without one; the launcher
+    starts it running with `gun`); anything else is one ERROR naming it,
+    with the usage, and exit 2.
 - **The launcher** (#157's taskbar) lists the bundled apps whose
   manifest lists `desktop`, never the test apps, after its four demo
   items, by name, and starts one through `run`'s path without waiting
@@ -3859,8 +3878,10 @@ SSE); #197 checks the results' bits.
   `Then::Failed`, a load failure the app's one WARN). A bundled app
   `precheck` refuses is left out with a WARN naming why
   (`app::tests::every_bundled_app_passes_precheck` keeps that from
-  shipping). Its Life item starts the Life app (#202, which updates
-  the M4 Life row and `tests/features/gui.toml`).
+  shipping). Its Life item starts the Life app (#202: `taskbar.rs`'s
+  `ITEM_APPS`), which is therefore left out of the apps after the demo
+  items, so it is listed once
+  (`taskbar::the_launcher_lists_the_life_app_once`).
 - **Loading from disk (M6)** will need more: import names in errors are
   sanitised already, but wasmi reserves vectors up front for the counts a
   module declares (`reserve_exact`), which `CODE_FACTOR` doesn't bound
@@ -4191,7 +4212,7 @@ until a crash.
   a `ui tree` value), then calls the harness's `wait_settled(m)`
   (`tools/harness/lumen_harness/gui.py`, #153), and brackets each
   screendump between two `desktop status` reads with the same `frames`.
-  Windows that animate (a blinking cursor, `desktop spin`, Life) never
+  Windows that animate (a blinking cursor, `desktop spin`, the running Life app) never
   idle: tests close them first, mask them or (a terminal window) unfocus
   them, and their goldens leave them out. A scenario that only checks state ends with `desktop check`
   reporting 0 and 0.
@@ -5040,8 +5061,9 @@ close, and the demos in windows of their own. All of it is built with
   `taskbar_text`, through the toolkit's palette choice):
   - a `menu` named `Launcher`: `press` (or a click) toggles it
     (`expanded`); expanded, its `menuitem`s follow it: `Terminal`,
-    `Mandelbrot`, `Life` and `Counter`, each opening that window and
-    folding the menu again. Each is refused while the desktop is paused,
+    `Mandelbrot`, `Life` and `Counter`, each opening that window (`Life`
+    starting the Life app since #202, section 8) and folding the menu
+    again. Each is refused while the desktop is paused,
     as `terminal` is; a launch that fails is warned about, and a `ui
     invoke` that chose it prints `ui invoke: <item>: <why>` and fails
     (`lumen_ui::Then::Failed`, answered `Served::Failed`), e.g. `ui
@@ -5088,7 +5110,7 @@ close, and the demos in windows of their own. All of it is built with
   the compositor, printing the root's row; `ui invoke: window <id> is
   minimized already` and `ui invoke: window <id> isn't minimized` when
   there is nothing to do). A minimized window's commits queue no damage
-  (Life presents nothing while minimized).
+  (the Life app presents nothing while minimized).
 - **`lumen-ui` for the shell:** `Stack`, the handle stacks are (only a
   stack takes children); `Ui::remove` (a widget and all in it; its node
   ids name nothing after, focus and a press on it dropped, what it covered
@@ -5117,11 +5139,10 @@ close, and the demos in windows of their own. All of it is built with
   window drawn once by every CPU (`sched::scope` and
   `Surface::bands_mut`, below; its rows by CPU logged as `INFO
   demo: mandelbrot window <id>: <n> CPUs in <ms> ms, rows by CPU: cpu0=<rows>
-  ...`), then waiting for its close; `Life` opens a window that keeps
-  stepping the `gun` pattern, focused or not (its waits are animating: it
-  never settles), until it is closed. Closing either stops
-  it. `mandelbrot` and `life` typed in a shell are as before (a canvas;
-  refused in a terminal window).
+  ...`), then waiting for its close, which stops it. `Life` was a
+  kernel window stepping the `gun` pattern until #202 made it an app
+  (section 8, "What #202 adds"). `mandelbrot` and `life` typed in a shell
+  are as before (a canvas; refused in a terminal window).
 - **Lent bands:** `lumen_gfx::Surface::bands_mut(rows)` splits a surface
   into disjoint bands of `rows` rows (`BandMut`: `row_mut`, `impl
   Target`), on the owner's surface (`h.surface_mut().bands_mut`), and

@@ -160,3 +160,14 @@ tests = [
     "scenario:test_apps::test_sdk_a_tick_can_quit",
     "scenario:test_apps::test_sdk_wraps_its_other_calls",
 ]
+
+[[feature]]
+name = "Game of Life as an app (#202), replacing the kernel's Life window: the launcher's Life item starts it (listed once), running the gun on the SDK's tick loop, its generation growing in its tree while unfocused or minimized (presenting nothing minimized); stopped it settles and Step advances one generation; a pattern chosen in its list starts it again at generation 0; its window matches a golden; Start and Stop through `ui invoke`; a pattern it doesn't know is refused, named; its close ends it with 0, its thread joined"
+milestone = "M5"
+tests = [
+    "cargo:lumen-demo",
+    "scenario:test_apps::test_life_golden",
+    "scenario:test_apps::test_life_runs_unfocused_and_stops_when_closed",
+    "ktest:lumen_kernel::taskbar::the_launcher_lists_the_life_app_once",
+    "scenario:test_apps::test_hello_wasm",
+]

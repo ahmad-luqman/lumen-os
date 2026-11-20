@@ -206,16 +206,16 @@ name = "Minimize and restore (#157): a minimize box beside the close box; a clic
 milestone = "M4"
 tests = [
     "scenario:test_gui::test_minimize_and_restore",
-    "scenario:test_gui::test_life_window_runs_unfocused_and_stops_when_closed",
+    "scenario:test_apps::test_life_runs_unfocused_and_stops_when_closed",
     "cargo:lumen-wm",
 ]
 
 [[feature]]
-name = "Demos in windows (#157): the launcher's Mandelbrot draws in a window with every CPU (`sched::scope` joining a thread per CPU, each lent bands of the window's surface: every CPU draws rows, every row once, the pixels those of one CPU drawing alone, the caller drawing a slot whose thread didn't start, warned about), against a golden, then settles; Life keeps stepping in its window, focused or not (it never settles), and closing either window ends its owner"
+name = "Demos in windows (#157): the launcher's Mandelbrot draws in a window with every CPU (`sched::scope` joining a thread per CPU, each lent bands of the window's surface: every CPU draws rows, every row once, the pixels those of one CPU drawing alone, the caller drawing a slot whose thread didn't start, warned about), against a golden, then settles; Life (since #202 the Life app the launcher starts) keeps stepping in its window, focused or not (it never settles), and closing either window ends its owner (the app's thread joined)"
 milestone = "M4"
 tests = [
     "scenario:test_gui::test_mandelbrot_window_golden",
-    "scenario:test_gui::test_life_window_runs_unfocused_and_stops_when_closed",
+    "scenario:test_apps::test_life_runs_unfocused_and_stops_when_closed",
     "ktest:lumen_kernel::demo::every_cpu_rendered_rows_in_a_window",
     "ktest:lumen_kernel::demo::the_caller_draws_the_slot_of_a_cpu_that_got_no_thread",
     "ktest:lumen_kernel::sched::a_scope_joins_every_thread_before_it_returns",
