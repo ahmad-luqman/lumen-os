@@ -633,8 +633,8 @@ def test_clock_tree_matches_rtc(boot):
     # and minute agree (as the taskbar clock's test does; the clock reads
     # the RTC four times a second). It goes on (its value changes as the
     # seconds pass), yet the desktop settles between its ticks (its waits
-    # aren't animating). Its close ends it with 0. A time `--at` doesn't
-    # take ends it with 2, saying why.
+    # aren't animating). Its close ends it with 0. Arguments it doesn't
+    # take end it with 2, an ERROR saying what was wrong.
     m = boot_desktop(boot)
     app_id, mark = start(m, "clock")
     wid, _ = clock_tree(m)
@@ -655,9 +655,18 @@ def test_clock_tree_matches_rtc(boot):
     gui.wait_settled(m)
     gui.close_window(m, "Clock")
     end_line(m, mark, "clock", app_id, "exited with 0")
-    bad = r"ERROR app: clock: '25:00' is not a time of day"
-    app_id, mark = start(m, "clock --at 25:00", allow=bad)
-    end_line(m, mark, "clock", app_id, "exited with 2")
+    # Arguments it doesn't take: one ERROR naming what was wrong (waited
+    # for: `allow` only permits it), then exit 2.
+    usage = "(usage: clock [--at H[H]:MM[:SS]])"
+    for args, why in [
+        ("--at 25:00", f"'25:00' is not a time of day {usage}"),
+        ("--at", f"--at needs a time {usage}"),
+        ("foo", f"'foo' is not an argument it takes {usage}"),
+    ]:
+        said = re.escape(f"ERROR app: clock: {why}")
+        app_id, mark = start(m, f"clock {args}", allow=said)
+        wait_for_output(m, mark, rf"(?m){STAMP} {said}$", 30)
+        end_line(m, mark, "clock", app_id, "exited with 2")
 
 
 def test_app_ids_are_global(boot):
