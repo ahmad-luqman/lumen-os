@@ -750,10 +750,94 @@ def test_snake_tree_and_steps(boot):
     bad, mark = start(m, "comet --fast", allow=re.escape(error))
     wait_for_output(m, mark, re.escape(error), 30)
     end_line(m, mark, "comet", bad, "exited with 2")
-    error = "ERROR app: comet: 'x' is not a seed (0 to 2^64 - 1); usage: comet [--seed N] [--step]"
-    bad, mark = start(m, "comet --seed x", allow=re.escape(error))
-    wait_for_output(m, mark, re.escape(error), 30)
-    end_line(m, mark, "comet", bad, "exited with 2")
+    for line, why in [
+        ("comet --seed x", "'x' is not a seed (0 to 2^64 - 1)"),
+        ("comet --step --step", "--step given twice"),
+        ("comet --seed --step", "--seed needs a number"),
+    ]:
+        error = f"ERROR app: comet: {why}; usage: comet [--seed N] [--step]"
+        bad, mark = start(m, line, allow=re.escape(error))
+        wait_for_output(m, mark, re.escape(error), 30)
+        end_line(m, mark, "comet", bad, "exited with 2")
+
+
+# Comet's sky with its frame, in its client area (apps/comet's FRAMED: the
+# widget column is lumen-snake's LABEL_W, 164, plus 8 px either side).
+COMET_FRAMED = (187, 7, 187 + 386, 7 + 290)
+
+
+def comet_sky(m, name: str) -> bytes:
+    """Comet's sky and frame in a settled screendump, as bytes."""
+    gui.wait_settled(m)
+    return gui.client_pixels(m, "Comet", name).crop(COMET_FRAMED).tobytes()
+
+
+def test_snake_steering_and_modes(boot):
+    # Comet stepping from the scenario's seed: down then right turn it (each
+    # heading seen in the tree before the step); Restart redraws the sky as
+    # it was at the start (the same pixels); the seed's grain eaten, up,
+    # left and down run it into its own tail (`over: tail`); Restart, Play,
+    # then Step while flying switches it to stepping (if the flight ended
+    # first, Step is disabled: Restart and try again), after which one Step
+    # moves it one cell.
+    m = boot_desktop(boot)
+    app_id, mark = start(m, f"comet --seed {COMET_SEED} --step")
+    wid, rows = comet_tree(m)
+    x, y = COMET_START
+    sky = comet_sky(m, "comet-start.png")
+    turn_comet(m, wid, "down", x, y)
+    step_comet(m, rows, 1)
+    turn_comet(m, wid, "right", x, y + 1)
+    step_comet(m, rows, 1)
+    assert comet_labels(m, wid)["Comet"] == comet_at(x + 1, y + 1, "right")
+    gui.press_buttons(m, rows, "Restart")
+    assert comet_labels(m, wid)["Comet"] == comet_at(x, y)
+    assert comet_sky(m, "comet-restarted.png") == sky, "Restart left the sky unlike its start"
+
+    step_comet(m, rows, COMET_DUST_AHEAD)
+    hx = x + COMET_DUST_AHEAD
+    turn_comet(m, wid, "up", hx, y)
+    step_comet(m, rows, 1)
+    turn_comet(m, wid, "left", hx, y - 1)
+    step_comet(m, rows, 1)
+    turn_comet(m, wid, "down", hx - 1, y - 1)
+    step_comet(m, rows, 1)
+    labels = comet_labels(m, wid)
+    assert labels["State"] == "over: tail", labels
+
+    def state(r):
+        return gui.node(r, "label", "State")["value"]
+
+    for attempt in range(5):
+        gui.press_buttons(m, rows, "Restart")
+        rows = below_root(gui.ui_tree(m, wid))
+        assert state(rows) == "stepping", rows
+        rows = gui.press_animated(
+            m, rows, "Play", "Play's effect", lambda r: state(r) != "stepping", wid
+        )
+        step = gui.node(rows, "button", "Step")
+        got = gui.invoke(m, step["id"], "press", animating=True)
+        if got.message == "ui invoke: the node is disabled":
+            # The flight ended before the press came (a stalled host).
+            continue
+        assert got.still_running or (got.row is not None and got.row["id"] == step["id"]), got
+        break
+    else:
+        raise AssertionError("every flight ended before Step came")
+    rows = gui.wait_ui(
+        m, "stepping again", lambda r: state(r) in ("stepping", "over: edge"), wid, 30
+    )
+    if state(rows) == "stepping":
+        before = gui.node(rows, "label", "Comet")["value"]
+        bx = int(before.split()[1].split(",")[0])
+        step_comet(m, below_root(rows), 1)
+        after = comet_labels(m, wid)
+        if bx + 1 < 24:
+            assert after["Comet"] == comet_at(bx + 1, y), (before, after)
+        else:
+            assert after["State"] == "over: edge", (before, after)
+    gui.close_window(m, "Comet")
+    end_line(m, mark, "comet", app_id, "exited with 0")
 
 
 def test_snake_golden(boot, artifacts, golden_dir):
