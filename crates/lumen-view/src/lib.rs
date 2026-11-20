@@ -288,6 +288,34 @@ pub fn scale(src: &[u32], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Opt
     Some(out)
 }
 
+/// `s` cut into lines at most `width` wide at its spaces, as `measure`
+/// gives widths (the app's text through the host): each word measured once,
+/// and the space once; a word wider than `width` alone on its line (cut by
+/// the clip when drawn); runs of spaces taken as one.
+pub fn wrap(s: &str, width: u32, mut measure: impl FnMut(&str) -> u32) -> Vec<String> {
+    let space = measure(" ");
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    let mut line_w = 0;
+    for word in s.split(' ').filter(|w| !w.is_empty()) {
+        let w = measure(word);
+        if !line.is_empty() && line_w + space + w > width {
+            lines.push(core::mem::take(&mut line));
+            line_w = 0;
+        }
+        if !line.is_empty() {
+            line.push(' ');
+            line_w += space;
+        }
+        line.push_str(word);
+        line_w += w;
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
 /// Why an image can't be shown.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Why {
@@ -596,6 +624,36 @@ mod tests {
         assert!(!Why::Refused(Refused::TooCostly { w: 1, h: 1, bytes: 1 }).out_of_memory());
         assert_eq!(Why::NoMemory.to_string(), "no memory for its fitted copy");
         assert_eq!(Why::Refused(Refused::NoHeader).to_string(), Refused::NoHeader.to_string());
+    }
+
+    /// 8 pixels a character, as lumen-ui's `FixedText`.
+    fn fixed(t: &str) -> u32 {
+        8 * t.chars().count() as u32
+    }
+
+    #[test]
+    fn wrap_cuts_at_spaces_to_fit_the_width() {
+        // "aaa bb" is 6 characters, 48 pixels: it fits 48, not 47.
+        assert_eq!(wrap("aaa bb cccc", 48, fixed), ["aaa bb", "cccc"]);
+        assert_eq!(wrap("aaa bb cccc", 47, fixed), ["aaa", "bb", "cccc"]);
+        assert_eq!(wrap("aaa bb cccc", 1000, fixed), ["aaa bb cccc"]);
+        // A word wider than the width keeps a line of its own.
+        assert_eq!(wrap("a toolongword b", 40, fixed), ["a", "toolongword", "b"]);
+        // Runs of spaces are one; none, no lines.
+        assert_eq!(wrap("  a   b  ", 1000, fixed), ["a b"]);
+        assert!(wrap("", 100, fixed).is_empty());
+        assert!(wrap("   ", 100, fixed).is_empty());
+    }
+
+    #[test]
+    fn wrap_measures_each_word_once_and_the_space_once() {
+        let mut asked = Vec::new();
+        let lines = wrap("one two one", 1000, |t| {
+            asked.push(String::from(t));
+            fixed(t)
+        });
+        assert_eq!(lines, ["one two one"]);
+        assert_eq!(asked, [" ", "one", "two", "one"]);
     }
 
     #[test]

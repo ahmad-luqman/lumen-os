@@ -201,33 +201,6 @@ impl Viewer {
     }
 }
 
-/// `text` cut into lines at most `width` pixels wide at its spaces (a word
-/// wider than that alone on its line, cut by the clip when drawn); each
-/// word measured once.
-fn wrap(text: &mut dyn lumen_ui::Text, s: &str, width: u32) -> Vec<String> {
-    let space = text.width(" ");
-    let mut lines: Vec<String> = Vec::new();
-    let mut line = String::new();
-    let mut line_w = 0;
-    for word in s.split(' ').filter(|w| !w.is_empty()) {
-        let w = text.width(word);
-        if !line.is_empty() && line_w + space + w > width {
-            lines.push(core::mem::take(&mut line));
-            line_w = 0;
-        }
-        if !line.is_empty() {
-            line.push(' ');
-            line_w += space;
-        }
-        line.push_str(word);
-        line_w += w;
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    lines
-}
-
 /// The images' names, in the list's order.
 fn names() -> Vec<&'static str> {
     IMAGES.iter().map(|i| i.name).collect()
@@ -271,7 +244,7 @@ impl App for Viewer {
             Rect::new(VIEW.x() + TEXT_INSET, VIEW.y() + TEXT_INSET + n as i32 * line_h, text_w, line_h as u32)
         };
         if let Shown::Failed { why, lines: lines @ None } = &mut self.shown {
-            *lines = Some(wrap(over.text, why, text_w));
+            *lines = Some(lumen_view::wrap(why, text_w, |t| over.text.width(t)));
         }
         let text: Vec<String> = match &self.shown {
             Shown::Image(_) => Vec::new(),

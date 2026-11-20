@@ -1230,6 +1230,27 @@ def differing(actual, want) -> int:
     return sum(a[i : i + 3] != b[i : i + 3] for i in range(0, len(a), 3))
 
 
+def text_bands(view) -> int:
+    """How many lines of text the viewer's view shows: bands of rows holding
+    a dark pixel (each channel below 0x60, as the light theme's text is and
+    its background isn't), apart from the next by at least two rows with
+    none."""
+    w, h = view.size
+    data = view.tobytes()
+    dark = [
+        any(max(data[i : i + 3]) < 0x60 for i in range(y * w * 3, (y + 1) * w * 3, 3))
+        for y in range(h)
+    ]
+    bands, gap = 0, 2
+    for d in dark:
+        if d:
+            bands += gap >= 2
+            gap = 0
+        else:
+            gap += 1
+    return bands
+
+
 def set_fit(m, wid: str, rows: list[dict[str, str]], on: bool) -> list[dict[str, str]]:
     """Press `Fit` until it is `on` (its row's value), then wait for the
     desktop to settle (the view redrawn)."""
@@ -1392,6 +1413,9 @@ def test_viewer_bad_image_shows_an_error(boot):
     for line in ((0, 0, VIEW[2], 30), (0, 34, VIEW[2], 200)):
         colours = {c for _, c in view.crop(line).getcolors(1 << 20)}
         assert LIGHT_TEXT in colours, (line, sorted(colours)[:8])
+    # The reason is wider than the view's text column, so it wraps: three
+    # bands of rows hold text (the heading and the reason's two lines).
+    assert text_bands(view) == 3, text_bands(view)
     record = app(m, app_id)
     assert record is not None and record["windows"] == "1", record
     assert not klog.unexpected_warnings(m.output[mark:]), klog.unexpected_warnings(m.output[mark:])
