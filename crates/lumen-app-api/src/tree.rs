@@ -19,12 +19,16 @@
 //! copy, each app id mapped to a global `lumen_ui::NodeId`).
 
 use crate::layout::Rect;
-use crate::limits::{TREE_BYTES, TREE_NODES};
-use crate::wire::CappedVec;
-use alloc::string::{String, ToString};
+use crate::limits::{TEXT_BYTES, TREE_BYTES, TREE_NODES};
+use crate::wire::{Capped, CappedVec};
 use alloc::vec::Vec;
 use lumen_ui::{AutomationNode, NodeId, Role, StateFlags, Value};
 use serde::{Deserialize, Serialize};
+
+/// A node's name or text: at most [`TEXT_BYTES`] (an app's toolkit cuts a
+/// longer one, `Capped::cut`; a longer one decoded is refused). The kernel
+/// shows it sanitised, as log text is ([`Tree::rows`]).
+pub type Text = Capped<TEXT_BYTES>;
 
 /// What every node and every item has.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,7 +37,7 @@ pub struct Common {
     /// tree.
     pub id: u64,
     /// The accessible label ("Add").
-    pub name: String,
+    pub name: Text,
     /// Client coordinates; `x + w` and `y + h` within `i32`.
     pub bounds: Rect,
     pub disabled: bool,
@@ -59,7 +63,7 @@ pub enum Node {
     },
     Label {
         common: Common,
-        text: String,
+        text: Text,
     },
     Button {
         common: Common,
@@ -73,7 +77,7 @@ pub enum Node {
     TextField {
         common: Common,
         focused: bool,
-        text: String,
+        text: Text,
     },
     List {
         common: Common,
@@ -189,26 +193,36 @@ impl Tree {
     /// node, at most [`TREE_NODES`] (items counted), then the rules above.
     /// No bytes is a tree of no nodes.
     pub fn decode(bytes: &[u8]) -> Result<Tree, TreeError> {
+        Tree::decode_counted(bytes).0
+    }
+
+    /// [`Tree::decode`], and how many nodes it decoded (items counted),
+    /// refused or not: the work `window_publish` charges `NODE_FUEL` for
+    /// (a refusal can come after every node was decoded and its ids
+    /// sorted).
+    pub fn decode_counted(bytes: &[u8]) -> (Result<Tree, TreeError>, usize) {
         if bytes.len() > TREE_BYTES {
-            return Err(TreeError::TooBig(bytes.len()));
+            return (Err(TreeError::TooBig(bytes.len())), 0);
         }
         let mut nodes = Vec::new();
         let mut count = 0;
         let mut rest = bytes;
         while !rest.is_empty() {
             if count >= TREE_NODES {
-                return Err(TreeError::TooManyNodes);
+                return (Err(TreeError::TooManyNodes), count);
             }
-            let (node, more) = postcard::take_from_bytes::<Node>(rest)
-                .map_err(|error| TreeError::Decode { node: nodes.len(), error })?;
+            let (node, more) = match postcard::take_from_bytes::<Node>(rest) {
+                Ok(taken) => taken,
+                Err(error) => return (Err(TreeError::Decode { node: nodes.len(), error }), count),
+            };
             count += 1 + node.items().len();
             if count > TREE_NODES {
-                return Err(TreeError::TooManyNodes);
+                return (Err(TreeError::TooManyNodes), count);
             }
             nodes.push(node);
             rest = more;
         }
-        Tree::new(nodes)
+        (Tree::new(nodes), count)
     }
 
     /// `nodes`, checked against every rule but the size.
@@ -299,8 +313,8 @@ impl Tree {
             let state = n.state();
             let focused = state.contains(StateFlags::FOCUSED);
             let text = || match n.value() {
-                Some(Value::Text(t)) => t.clone(),
-                _ => String::new(),
+                Some(Value::Text(t)) => Text::cut(t),
+                _ => Text::cut(""),
             };
             let item_rows = |role: Role| -> Result<Items, TreeError> {
                 let want = n.children();
@@ -345,7 +359,10 @@ impl Tree {
     /// The kernel's copy: the root's children (the top nodes) and every
     /// node with its depth (from 1; items one deeper than their list or
     /// menu), client coordinates, each app id `global` maps, given with its
-    /// role (asked in pre-order, a node before its items).
+    /// role (asked in pre-order, a node before its items). Names and texts
+    /// are shown sanitised, as log text is (`text::cut`: each control
+    /// character and line or paragraph separator U+FFFD), so an app's node
+    /// can't forge a line of `ui tree`.
     pub fn rows(&self, mut global: impl FnMut(u64, Role) -> NodeId) -> (Vec<NodeId>, Vec<(u32, AutomationNode)>) {
         let ids: Vec<(NodeId, Vec<NodeId>)> = self
             .nodes
@@ -368,16 +385,17 @@ impl Tree {
         for (i, ((node, place), kids)) in self.nodes.iter().zip(&self.places).zip(children).enumerate() {
             let (id, item_ids) = &ids[i];
             let c = node.common();
-            let (name, bounds, disabled) = (c.name.as_str(), c.bounds.into(), c.disabled);
+            let name = shown(&c.name);
+            let (name, bounds, disabled) = (&*name, c.bounds.into(), c.disabled);
             let made = match node {
                 Node::Group { .. } => AutomationNode::group(*id, name, bounds, disabled, kids),
-                Node::Label { text, .. } => AutomationNode::label(*id, name, text, bounds, disabled),
+                Node::Label { text, .. } => AutomationNode::label(*id, name, &shown(text), bounds, disabled),
                 Node::Button { focused, .. } => AutomationNode::button(*id, name, bounds, *focused, disabled),
                 Node::Checkbox { focused, checked, .. } => {
                     AutomationNode::checkbox(*id, name, *checked, bounds, *focused, disabled)
                 }
                 Node::TextField { focused, text, .. } => {
-                    AutomationNode::textfield(*id, name, text, bounds, *focused, disabled)
+                    AutomationNode::textfield(*id, name, &shown(text), bounds, *focused, disabled)
                 }
                 Node::List { focused, selected, .. } => {
                     let selected = selected.map(|s| s as usize);
@@ -389,7 +407,8 @@ impl Tree {
             };
             rows.push((place.depth, made.hidden_if(c.hidden)));
             for (index, (item, item_id)) in node.items().iter().zip(item_ids).enumerate() {
-                let (name, bounds) = (item.name.as_str(), item.bounds.into());
+                let name = shown(&item.name);
+                let (name, bounds) = (&*name, item.bounds.into());
                 let made = match node {
                     Node::List { selected, .. } => {
                         let selected = selected.map(|s| s as usize);
@@ -404,11 +423,74 @@ impl Tree {
     }
 }
 
+/// A window's ids (the kernel's side, #207): each app id in the newest
+/// published tree and its global `lumen_ui::NodeId`, and back (with its
+/// role). An id first seen gets a fresh global id; one missing from a newer
+/// tree leaves, so its global id names nothing again, and if it comes back
+/// it gets a new one. Global ids are never reused.
+#[derive(Clone, Debug, Default)]
+pub struct IdMap {
+    /// App id to global id.
+    ids: alloc::collections::BTreeMap<u64, NodeId>,
+    /// Global id to app id and role.
+    nodes: alloc::collections::BTreeMap<u64, (u64, Role)>,
+}
+
+impl IdMap {
+    pub fn new() -> IdMap {
+        IdMap::default()
+    }
+
+    /// Map `tree`'s ids (an id kept from the last tree keeps its global id,
+    /// a new one gets `fresh()`), replacing the old map: the kernel's rows,
+    /// as [`Tree::rows`] gives them.
+    pub fn remap(
+        &mut self,
+        tree: &Tree,
+        mut fresh: impl FnMut() -> NodeId,
+    ) -> (Vec<NodeId>, Vec<(u32, AutomationNode)>) {
+        let old = core::mem::take(&mut self.ids);
+        self.nodes.clear();
+        let (ids, nodes) = (&mut self.ids, &mut self.nodes);
+        tree.rows(|local, role| {
+            let global = old.get(&local).copied().unwrap_or_else(&mut fresh);
+            ids.insert(local, global);
+            nodes.insert(global.get(), (local, role));
+            global
+        })
+    }
+
+    /// The app id and role of global id `global`, if it is in the newest
+    /// tree.
+    pub fn local(&self, global: u64) -> Option<(u64, Role)> {
+        self.nodes.get(&global).copied()
+    }
+
+    /// The global id of app id `local`, if it is in the newest tree.
+    pub fn global(&self, local: u64) -> Option<NodeId> {
+        self.ids.get(&local).copied()
+    }
+
+    /// How many ids it maps (nodes and items).
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
+
+/// A name or a text as `ui tree` shows it: sanitised.
+fn shown(t: &Text) -> crate::text::LogText {
+    crate::text::cut(t.as_str(), TEXT_BYTES)
+}
+
 /// A node's or an item's common fields from its automation node.
 fn common_of(n: &AutomationNode) -> Common {
     Common {
         id: n.id().get(),
-        name: n.name().to_string(),
+        name: Text::cut(n.name()),
         bounds: n.bounds().into(),
         disabled: n.state().contains(StateFlags::DISABLED),
         hidden: n.state().contains(StateFlags::HIDDEN),
@@ -422,7 +504,7 @@ mod tests {
     use postcard::Error as P;
 
     fn c(id: u64) -> Common {
-        Common { id, name: String::from("a"), bounds: Rect::new(-1, 2, 3, 4), disabled: true, hidden: false }
+        Common { id, name: Text::cut("a"), bounds: Rect::new(-1, 2, 3, 4), disabled: true, hidden: false }
     }
 
     /// `c(1)`'s bytes: id, name, bounds (zigzagged x), disabled, hidden.
@@ -455,11 +537,11 @@ mod tests {
     fn every_node_s_encoding_is_pinned() {
         let cases: Vec<(Node, Vec<u8>)> = vec![
             (Node::Group { common: c(1), children: 2 }, [&[0][..], &C1, &[2]].concat()),
-            (Node::Label { common: c(1), text: String::from("t") }, [&[1][..], &C1, &[1, b't']].concat()),
+            (Node::Label { common: c(1), text: Text::cut("t") }, [&[1][..], &C1, &[1, b't']].concat()),
             (Node::Button { common: c(1), focused: true }, [&[2][..], &C1, &[1]].concat()),
             (Node::Checkbox { common: c(1), focused: false, checked: true }, [&[3][..], &C1, &[0, 1]].concat()),
             (
-                Node::TextField { common: c(1), focused: true, text: String::from("x") },
+                Node::TextField { common: c(1), focused: true, text: Text::cut("x") },
                 [&[4][..], &C1, &[1, 1, b'x']].concat(),
             ),
             (
@@ -522,7 +604,7 @@ mod tests {
         assert_eq!(Tree::new(vec![at(i32::MAX - 10, 11)]), Err(TreeError::Bounds { node: 0 }));
         assert!(Tree::new(vec![at(i32::MIN, u32::MAX)]).is_ok(), "-2^31 + 2^32 - 1 = i32::MAX");
         let tall =
-            Node::Label { common: Common { bounds: Rect::new(0, 1, 1, i32::MAX as u32), ..c(1) }, text: String::new() };
+            Node::Label { common: Common { bounds: Rect::new(0, 1, 1, i32::MAX as u32), ..c(1) }, text: Text::cut("") };
         assert_eq!(Tree::new(vec![tall]), Err(TreeError::Bounds { node: 0 }));
         let mut wide_item = c(4);
         wide_item.bounds = Rect::new(1, 0, i32::MAX as u32, 1);
@@ -538,6 +620,72 @@ mod tests {
         assert!(Tree::new(vec![group(1, 1), button(2), button(3)]).is_ok(), "the third at the top");
         assert_eq!(Tree::new(vec![group(1, u32::MAX), button(2)]), Err(TreeError::Children));
         assert!(Tree::new(vec![group(1, 0), group(2, 0)]).is_ok());
+    }
+
+    #[test]
+    fn names_and_texts_are_capped_and_shown_sanitised() {
+        // Past TEXT_BYTES: refused when decoded (an app's toolkit cuts it).
+        let mut long = vec![1u8, 1, 0x81, 0x08];
+        long.extend(core::iter::repeat_n(b'x', TEXT_BYTES + 1));
+        assert_eq!(Tree::decode(&long), Err(TreeError::Decode { node: 0, error: P::SerdeDeCustom }));
+        assert_eq!(Text::cut(&"é".repeat(TEXT_BYTES)).as_str().len(), TEXT_BYTES);
+        // Control characters and line separators: U+FFFD in the kernel's
+        // rows, so no name or text can forge a line of `ui tree`.
+        let bad = "a\u{1b}b\nc\u{2028}d\u{2029}e";
+        let named = Common { name: Text::cut(bad), ..c(1) };
+        let tree = Tree::new(vec![Node::Label { common: named, text: Text::cut(bad) }]).unwrap();
+        let (_, rows) = tree.rows(|_, _| NodeId::fresh());
+        let shown = "a\u{fffd}b\u{fffd}c\u{fffd}d\u{fffd}e";
+        assert_eq!(rows[0].1.name(), shown);
+        assert_eq!(rows[0].1.value(), Some(&Value::Text(alloc::string::String::from(shown))));
+    }
+
+    #[test]
+    fn ids_keep_their_global_id_and_one_that_leaves_comes_back_new() {
+        let list =
+            |items: &[u64]| Node::List { common: c(3), focused: false, selected: None, items: self::items(items) };
+        let mut map = IdMap::new();
+        let (_, first) = map.remap(&Tree::new(vec![button(1), list(&[4, 5])]).unwrap(), NodeId::fresh);
+        let g = |rows: &[(u32, AutomationNode)], i: usize| rows[i].1.id();
+        // Kept ids keep their global ids; each role is the node's own (a
+        // list's items are list items, which take `select`).
+        assert_eq!(map.local(g(&first, 0).get()), Some((1, Role::Button)));
+        assert_eq!(map.local(g(&first, 2).get()), Some((4, Role::ListItem)));
+        assert!(Role::ListItem.actions().contains(&lumen_ui::ActionKind::Select));
+        assert_eq!(map.len(), 4);
+        // 1 leaves; 4 stays; 6 is new.
+        let (_, second) = map.remap(&Tree::new(vec![list(&[4, 6])]).unwrap(), NodeId::fresh);
+        assert_eq!(map.global(4), Some(g(&first, 2)));
+        assert_eq!(map.local(g(&first, 0).get()), None, "a leaving id names nothing");
+        assert_eq!(map.global(1), None);
+        let new6 = map.global(6).unwrap();
+        assert!(![g(&first, 0), g(&first, 1), g(&first, 2), g(&first, 3)].contains(&new6));
+        assert_eq!(g(&second, 2), new6);
+        // 1 comes back: a new global id, never its old one.
+        map.remap(&Tree::new(vec![button(1), list(&[4, 6])]).unwrap(), NodeId::fresh);
+        let back = map.global(1).unwrap();
+        assert_ne!(back, g(&first, 0));
+        assert_eq!(map.local(back.get()), Some((1, Role::Button)));
+        // A menu's items are menu items.
+        let menu = Node::Menu { common: c(7), focused: false, expanded: true, items: items(&[8]) };
+        map.remap(&Tree::new(vec![menu]).unwrap(), NodeId::fresh);
+        assert_eq!(map.global(8).and_then(|g| map.local(g.get())), Some((8, Role::MenuItem)));
+        assert!(!map.is_empty());
+    }
+
+    #[test]
+    fn a_refused_tree_still_counts_the_nodes_it_decoded() {
+        // An id twice, found after both were decoded (and sorted): both
+        // counted. A node that doesn't decode: those before it. Too big:
+        // none.
+        let list = Node::List { common: c(3), focused: false, selected: None, items: items(&[4, 5]) };
+        let (got, n) = Tree::decode_counted(&bytes_of(&[button(1), list, button(1)]));
+        assert_eq!((got, n), (Err(TreeError::DuplicateId(1)), 5));
+        let (got, n) = Tree::decode_counted(&[&bytes_of(&[button(1), button(2)])[..], &[0xff]].concat());
+        assert!(matches!(got, Err(TreeError::Decode { node: 2, .. })));
+        assert_eq!(n, 2);
+        assert_eq!(Tree::decode_counted(&vec![0; TREE_BYTES + 1]).1, 0);
+        assert_eq!(Tree::decode_counted(&bytes_of(&[button(1)])).1, 1);
     }
 
     #[test]
@@ -590,14 +738,27 @@ mod tests {
         assert_eq!(Tree::decode(&bytes_of(&[full, button(5000)])), Err(TreeError::TooManyNodes));
     }
 
-    /// A label whose text pads the tree's encoding to exactly `len` bytes.
+    /// Labels (texts at most `TEXT_BYTES`) whose encoding is exactly `len`
+    /// bytes (`len` at least a few hundred).
     fn padded(len: usize) -> Vec<u8> {
-        let base = enc(&Node::Label { common: c(1), text: String::new() }).len();
-        // The text's length prefix grows with it: 3 bytes for 16 KiB or more.
-        let text = "x".repeat(len - base - 2);
-        let bytes = enc(&Node::Label { common: c(1), text });
-        assert_eq!(bytes.len(), len);
-        bytes
+        let label = |id: u64, n: usize| enc(&Node::Label { common: c(id), text: Text::cut(&"x".repeat(n)) });
+        let mut out = Vec::new();
+        let mut id = 1;
+        // Whole labels of 1000 characters while more than two fit.
+        while len - out.len() > 2 * label(id, 1000).len() {
+            out.extend(label(id, 1000));
+            id += 1;
+        }
+        // Then two that make up the rest exactly (each length prefix 1 or 2
+        // bytes: the text's size tried until the bytes add up).
+        let rest = len - out.len();
+        let half = rest / 2;
+        out.extend(label(id, half - 12));
+        let left = len - out.len();
+        let n = (0..TEXT_BYTES).find(|&n| label(id + 1, n).len() == left).expect("a text that pads it exactly");
+        out.extend(label(id + 1, n));
+        assert_eq!(out.len(), len);
+        out
     }
 
     #[test]
@@ -609,7 +770,8 @@ mod tests {
         assert_eq!(Tree::decode(&vec![0xff; TREE_BYTES + 1]), Err(TreeError::TooBig(TREE_BYTES + 1)));
         assert!(matches!(Tree::decode(&vec![0xff; TREE_BYTES]), Err(TreeError::Decode { node: 0, .. })));
         // Encoding refuses what decoding would.
-        let big = Tree::new(vec![Node::Label { common: c(1), text: "x".repeat(TREE_BYTES) }]).unwrap();
+        let label = |id| Node::Label { common: c(id), text: Text::cut(&"x".repeat(TEXT_BYTES)) };
+        let big = Tree::new((1..=70).map(label).collect()).unwrap();
         assert!(matches!(big.encode(), Err(TreeError::TooBig(_))));
     }
 
@@ -658,10 +820,10 @@ mod tests {
     fn sample() -> Vec<u8> {
         bytes_of(&[
             group(1, 3),
-            Node::Label { common: c(2), text: String::from("12") },
+            Node::Label { common: c(2), text: Text::cut("12") },
             Node::Checkbox { common: c(3), focused: true, checked: false },
             Node::List { common: c(4), focused: false, selected: Some(0), items: items(&[5, 6]) },
-            Node::TextField { common: c(7), focused: false, text: String::from("é") },
+            Node::TextField { common: c(7), focused: false, text: Text::cut("é") },
             Node::Menu { common: c(8), focused: false, expanded: true, items: items(&[9]) },
         ])
     }

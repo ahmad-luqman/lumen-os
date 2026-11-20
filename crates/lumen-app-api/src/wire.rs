@@ -115,12 +115,23 @@ impl<'de, const N: usize> Deserialize<'de> for Capped<N> {
 /// `min(hint, N)` (postcard gives a hint only for a length within the bytes
 /// left), and refuses an element past `N`; a derived `Vec` would
 /// preallocate up to 1 MiB of elements first (section 8, "Sequences").
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CappedVec<T, const N: usize>(Vec<T>);
 
+impl<T, const N: usize> Default for CappedVec<T, N> {
+    fn default() -> Self {
+        CappedVec(Vec::new())
+    }
+}
+
 impl<T, const N: usize> CappedVec<T, N> {
+    /// What the visitor may preallocate, `N` elements, is at most 1 MiB
+    /// (checked at compile time where the type is used).
+    const BOUNDED: () = assert!(N * size_of::<T>() <= 1 << 20, "a CappedVec's cap past 1 MiB of elements");
+
     /// `items`, or `None` past the cap.
     pub fn new(items: Vec<T>) -> Option<CappedVec<T, N>> {
+        let () = Self::BOUNDED;
         (items.len() <= N).then_some(CappedVec(items))
     }
 
@@ -155,6 +166,7 @@ impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for CappedVec<T,
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<CappedVec<T, N>, A::Error> {
+                let () = CappedVec::<T, N>::BOUNDED;
                 let hint = seq.size_hint().unwrap_or(0);
                 if hint > N {
                     return Err(serde::de::Error::custom("a sequence past its cap"));
@@ -209,7 +221,15 @@ mod tests {
             decode_exact::<CappedVec<u8, 2>>(&[0xff, 0xff, 0xff, 0xff, 0x0f, 1]),
             Err(DecodeError::Postcard(postcard::Error::DeserializeUnexpectedEnd))
         );
+        // A claim past the bytes left (no hint) but more elements than the
+        // cap behind it: refused at the element past the cap.
+        assert_eq!(
+            decode_exact::<CappedVec<u8, 2>>(&[5, 1, 2, 3]),
+            Err(DecodeError::Postcard(postcard::Error::SerdeDeCustom))
+        );
         assert!(CappedVec::<u8, 2>::new(vec![1, 2, 3]).is_none());
+        assert_eq!(CappedVec::<u8, 2>::new(vec![1, 2]).map(|v| v.len()), Some(2), "exactly at the cap");
         assert_eq!(CappedVec::<u8, 2>::new(vec![1]).map(|v| v.len()), Some(1));
+        assert!(CappedVec::<u8, 2>::default().is_empty());
     }
 }

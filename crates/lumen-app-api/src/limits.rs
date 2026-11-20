@@ -35,14 +35,19 @@ pub const VALUE_STACK_BYTES: usize = MIB as usize;
 pub const CALL_DEPTH: usize = 1000;
 /// Everything else an app holds, at most: the parts below (their sum
 /// checked at compile time).
-pub const APP_OVERHEAD: u64 = MIB;
+pub const APP_OVERHEAD: u64 = 2 * MIB;
 /// The store, the instance, the call stack (`CALL_DEPTH` frames) and the
 /// handle table.
 pub const STORE_BYTES: u64 = 512 * KIB;
 /// Its table, at `TABLE_ELEMENTS` elements of at most 16 bytes.
 pub const TABLE_BYTES: u64 = TABLE_ELEMENTS as u64 * 16;
-/// Its published tree, two copies (#207).
-pub const TREE_COPIES_BYTES: u64 = 2 * TREE_BYTES as u64;
+/// Its published tree (#207): what the kernel holds for it (the desktop's
+/// rows, the id map) and the peak while a new one replaces it (the old
+/// still held, the new decoded and its rows built). Measured on the worst
+/// trees by `tests/publish_peak.rs` (929,280 bytes at the peak, each block
+/// counted as the kernel's heap sizes it), with room to spare for the
+/// heap's fragmentation.
+pub const TREE_COPIES_BYTES: u64 = MIB;
 /// Its drawing thread's glyph cache (#206; the kernel's `font::Text`).
 pub const GLYPH_CACHE_BYTES: u64 = 128 * KIB;
 
@@ -66,7 +71,8 @@ pub const SLICE_FUEL: u64 = 1_000_000;
 pub const CALL_FUEL: u64 = 1_000;
 /// Fuel a `log` line costs on top.
 pub const LOG_FUEL: u64 = 10_000;
-/// Fuel per byte of a `log` line.
+/// Fuel per byte of a `log` line, of a published tree and of an answer
+/// copied in (#207).
 pub const BYTE_FUEL: u64 = 1;
 /// Fuel per pixel of a commit or a `text_draw` clip.
 pub const PIXEL_FUEL: u64 = 1;
@@ -105,7 +111,8 @@ pub const TEXT_PX_MAX: u32 = 96;
 pub const SET_VALUE_BYTES: usize = 512;
 /// The largest encoded event.
 pub const EVENT_BYTES: usize = 1024;
-/// A published tree's nodes and encoded bytes.
+/// A published tree's nodes, items counted (the most widgets and list or
+/// menu items an app's window can expose), and encoded bytes.
 pub const TREE_NODES: usize = 1024;
 pub const TREE_BYTES: usize = 64 * KIB as usize;
 /// An encoded answer.
@@ -141,9 +148,9 @@ mod tests {
 
     #[test]
     fn the_worst_case_fits_the_budget() {
-        // 16 MiB of memory, 1 of value stack, 8 of code, 1 of overhead and
-        // three 640 × 480 surfaces: about 29.5 MiB.
-        assert_eq!(APP_WORST, 26 * MIB + 3 * 640 * 480 * 4);
+        // 16 MiB of memory, 1 of value stack, 8 of code, 2 of overhead and
+        // three 640 × 480 surfaces: about 30.5 MiB.
+        assert_eq!(APP_WORST, 27 * MIB + 3 * 640 * 480 * 4);
         // Beside the kernel's reserve on what the guests' 256 MiB leave
         // the frame allocator (166.7 MiB measured).
         assert_eq!(slots(166 * MIB), MAX_APPS);

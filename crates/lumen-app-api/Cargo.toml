@@ -21,5 +21,7 @@ postcard.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+# Each block counted as the kernel's heap sizes it (tests/publish_peak.rs).
+lumen-heap.workspace = true
 # pc-keyboard's modifier state, every bit of it, for the `mods` byte's test.
 pc-keyboard.workspace = true

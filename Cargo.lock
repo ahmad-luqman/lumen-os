@@ -265,6 +265,7 @@ name = "lumen-app-api"
 version = "0.0.1"
 dependencies = [
  "lumen-gfx",
+ "lumen-heap",
  "lumen-input",
  "lumen-trace",
  "lumen-ui",

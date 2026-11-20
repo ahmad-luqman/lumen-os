@@ -52,7 +52,7 @@ fn peak_of<T>(f: impl FnOnce() -> T) -> usize {
 fn common(id: u64) -> Common {
     Common {
         id,
-        name: String::new(),
+        name: lumen_app_api::tree::Text::cut(""),
         bounds: lumen_app_api::layout::Rect::new(0, 0, 1, 1),
         disabled: false,
         hidden: false,

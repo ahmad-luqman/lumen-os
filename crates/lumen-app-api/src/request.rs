@@ -62,10 +62,14 @@ impl<S> Running<S> {
     }
 
     /// The request delivered (one at a time: the window's queue refuses a
-    /// second while one is queued or running).
-    pub fn start(&mut self, started: S) {
-        debug_assert!(self.0.is_none(), "a second request running");
+    /// second while one is queued or running), or handed back if one is
+    /// running already (a bug in that refusal: the caller answers it).
+    pub fn start(&mut self, started: S) -> Result<(), S> {
+        if self.0.is_some() {
+            return Err(started);
+        }
         self.0 = Some(started);
+        Ok(())
     }
 
     pub fn is_running(&self) -> bool {
@@ -139,8 +143,10 @@ mod tests {
     fn a_refused_answer_leaves_the_request_running() {
         let mut r: Running<u8> = Running::new();
         assert_eq!(r.answer(&[0]), Err(AnswerError::NoneStarted));
-        r.start(9);
+        assert_eq!(r.start(9), Ok(()));
         assert!(r.is_running());
+        // A second while one runs is handed back, the first kept.
+        assert_eq!(r.start(10), Err(10));
         // Too big (before decoding), malformed, bytes left over: refused,
         // still running.
         assert_eq!(r.answer(&[0; ANSWER_BYTES + 1]), Err(AnswerError::TooBig(ANSWER_BYTES + 1)));
@@ -153,7 +159,7 @@ mod tests {
         assert!(!r.is_running());
         assert_eq!(r.answer(&[0]), Err(AnswerError::NoneStarted));
         // Taken unanswered (the app ended).
-        r.start(3);
+        assert_eq!(r.start(3), Ok(()));
         assert_eq!(r.take(), Some(3));
         assert_eq!(r.take(), None);
     }
