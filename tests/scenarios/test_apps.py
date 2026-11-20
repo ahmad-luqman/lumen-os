@@ -1033,6 +1033,28 @@ def choose(m, rows: list[dict[str, str]], name: str, animating: bool = False) ->
     assert got.still_running or (got.row is not None and got.row["id"] == item["id"]), got
 
 
+def life_client(m, name: str) -> bytes:
+    """The Life window's client area in a settled screendump `name`."""
+    from PIL import Image
+
+    box = gui.client_box(gui.window(m, "Life"))
+    with Image.open(gui.settled_screendump(m, name)) as img:
+        return img.convert("RGB").crop(box).tobytes()
+
+
+def life_matches_a_full_repaint(m, name: str) -> None:
+    """The settled client area (what the app's damage committed) equals the
+    same area after a full repaint (a theme switch to dark and back
+    repaints the whole window)."""
+    before = life_client(m, f"{name}.png")
+    assert run(m, "theme dark") == "theme: dark\n"
+    gui.wait_settled(m)
+    assert run(m, "theme light") == "theme: light\n"
+    assert life_client(m, f"{name}-repainted.png") == before, (
+        f"{name}: not what a full repaint draws"
+    )
+
+
 def life_tree(m) -> tuple[str, list[dict[str, str]]]:
     return wait_tree(m, "Life", "Generation")
 
@@ -1068,7 +1090,8 @@ def test_life_golden(boot, artifacts, golden_dir):
     # window settles). Acorn chosen in its list starts it again at
     # generation 0, still stopped; twelve presses of Step (each one
     # generation, answered, or settled if still running) against a golden of
-    # its client area. Start runs it (the generation grows while it
+    # its client area, what the steps' damage committed (after three, and
+    # after running) equal to a full repaint. Start runs it (the generation grows while it
     # animates); the glider chosen while it runs starts again from it,
     # still running. Stop settles it; acorn chosen then is generation 0,
     # stopped.
@@ -1081,7 +1104,11 @@ def test_life_golden(boot, artifacts, golden_dir):
     rows = below_root(gui.ui_tree(m, wid))
     assert (life_state(rows), generation(rows), life_pattern(rows)) == ("stopped", 0, "acorn")
     assert gui.node(rows, "list", "Patterns")["value"] == "4", rows
-    gui.press_buttons(m, rows, *["Step"] * 12)
+    # What each Step's damage committed is what a full repaint draws (after
+    # three, then after twelve: the golden).
+    gui.press_buttons(m, rows, *["Step"] * 3)
+    life_matches_a_full_repaint(m, "life-step-3")
+    gui.press_buttons(m, rows, *["Step"] * 9)
     rows = below_root(gui.ui_tree(m, wid))
     assert (life_state(rows), generation(rows)) == ("stopped", 12), rows
     row = gui.window(m, "Life")
@@ -1118,6 +1145,8 @@ def test_life_golden(boot, artifacts, golden_dir):
     gui.wait_settled(m)
     rows = below_root(gui.ui_tree(m, wid))
     assert generation(rows) == stopped_at
+    # What running committed is what a full repaint draws.
+    life_matches_a_full_repaint(m, "life-stopped")
     choose(m, rows, "acorn")
     gui.wait_settled(m)
     rows = below_root(gui.ui_tree(m, wid))
@@ -1129,7 +1158,8 @@ def test_life_golden(boot, artifacts, golden_dir):
 def test_life_runs_unfocused_and_stops_when_closed(boot):
     # The launcher's Life item starts the Life app (#202; it replaced the
     # kernel's window), running the gun: its generation (the tree's value)
-    # grows while another window has the focus, and its waits are an
+    # grows while another window has the focus (its client area changing on
+    # the screen too), and its waits are an
     # animation's (the desktop never reads settled). Minimized, it presents
     # nothing (its commits queue no damage) yet still steps. Its close ends
     # it with 0, its thread joined, and the desktop settles again.
@@ -1152,6 +1182,15 @@ def test_life_runs_unfocused_and_stops_when_closed(boot):
     gui.wait_for(m, "Life unfocused", lambda: gui.window(m, "Life")["focused"], lambda f: f == "no")
     seen = generation(gui.ui_tree(m, wid))
     gui.wait_ui(m, "generations while unfocused", lambda r: generation(r) > seen + 2, wid, 30)
+    assert gui.window(m, "Life")["focused"] == "no"
+    # ... and its client area changes on the screen meanwhile.
+    first = gui.client_pixels(m, "Life", "life-1.png").tobytes()
+    gui.wait_for(
+        m,
+        "Life's next generations on the screen",
+        lambda: gui.client_pixels(m, "Life", "life-2.png").tobytes(),
+        lambda c: c != first,
+    )
     assert gui.window(m, "Life")["focused"] == "no"
     for _ in range(5):
         assert gui.desktop_status(m)["settled"] == "no"
