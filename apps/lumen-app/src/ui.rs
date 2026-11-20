@@ -289,9 +289,13 @@ impl<A: App> Toolkit<A> {
             }
             // No ticks before the first `Theme`: nothing is drawn until then.
             let period = if self.themed { self.app.period() } else { None };
-            match pacer.poll(period, logged("run_until: clock", time.now_ns())?) {
+            // One read a turn: the time the tick is found due is the time it
+            // is handed (so ticks are at least a period apart by the time
+            // each one is given).
+            let now = logged("run_until: clock", time.now_ns())?;
+            match pacer.poll(period, now) {
                 Pace::Due => {
-                    if self.app.tick(logged("run_until: clock", time.now_ns())?) == Flow::Quit {
+                    if self.app.tick(now) == Flow::Quit {
                         return Ok(Ended::Quit);
                     }
                     logged("run_until: tick refresh", self.refresh())?;

@@ -483,7 +483,7 @@ impl Ticker {
         let state = ui.label(None, "State", "running");
         let stop = ui.button(None, "Stop");
         let start = ui.button(None, "Start");
-        let now = time.now_ns().unwrap_or(0);
+        let now = clock(&time);
         Ticker {
             ui,
             count,
@@ -547,7 +547,7 @@ impl App for Ticker {
                 }
                 UiEvent::Pressed(w) if *w == self.start => {
                     if !self.running {
-                        let now = self.time.now_ns().unwrap_or(0);
+                        let now = clock(&self.time);
                         (self.stretch_start, self.stretch, self.last_tick) = (now, 0, now);
                     }
                     self.running = true;
@@ -594,6 +594,15 @@ impl Ticking for Ticker {
         self.move_square();
         if self.mode == TickMode::Quit && self.ticks == QUIT_AT { Flow::Quit } else { Flow::Carry }
     }
+}
+
+/// The time now, or 0 once an ERROR is logged (a 0 would switch the floor
+/// checks off, so it isn't silent).
+fn clock(time: &Time) -> u64 {
+    time.now_ns().unwrap_or_else(|e| {
+        log::error(&format!("window: tick: no clock: {e}"));
+        0
+    })
 }
 
 /// The `tick` mode ([`Ticker`] in the SDK's `run_until`, until its window
