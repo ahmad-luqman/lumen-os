@@ -610,21 +610,27 @@ def clock_time(m, wid: str) -> str:
 def test_clock_golden(boot, artifacts, golden_dir):
     # `run clock --at 10:09`: frozen at 10:09:00 (its label's value, and
     # the hands at nine minutes past ten, the second hand at 12), with no
-    # ticks, so the desktop settles; its client area against a golden.
+    # ticks (its fuel and slices still over two seconds of `date`), so the
+    # desktop settles; its client area against a golden.
     m = boot_desktop(boot)
-    start(m, "clock --at 10:09")
+    app_id, _ = start(m, "clock --at 10:09")
     wid, rows = clock_tree(m)
     assert gui.node(rows, "label", "Time")["value"] == "10:09:00"
     row = gui.window(m, "Clock")
     x0, y0, x1, y1 = gui.client_box(row)
     shot = gui.settled_screendump(m, "clock.png")
     # Frozen for good: still 10:09:00 once `date` shows two seconds more
-    # (at least a whole second, past the ticks a live clock would take).
+    # (at least a whole second, past the ticks a live clock would take),
+    # and no ticks at all meanwhile: its fuel and slices unchanged.
+    idle = app(m, app_id)
     then = date_time(m)
     gui.wait_for(
         m, "two seconds by date", lambda: date_time(m), lambda t: seconds_from(then, t) >= 2
     )
     assert clock_time(m, wid) == "10:09:00"
+    still = app(m, app_id)
+    assert idle and still, (idle, still)
+    assert (still["fuel"], still["slices"]) == (idle["fuel"], idle["slices"]), (idle, still)
     assert_matches_golden(
         shot,
         golden_dir / "app-clock.png",
