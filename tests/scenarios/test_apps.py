@@ -510,28 +510,26 @@ def test_sdk_wraps_its_other_calls(boot):
 # -- apps' automation trees (#207) ------------------------------------------------
 
 
-def app_rows(m, title: str) -> tuple[str, list[dict[str, str]]]:
-    """The one window titled `title`: its id and its tree's rows below the
-    root (depth 1 on)."""
-    wid = gui.window(m, title)["id"]
-    return wid, [r for r in gui.ui_tree(m, wid) if r["depth"] != "0"]
+def below_root(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """A window's tree rows without its root (depth 1 on)."""
+    return [r for r in rows if r["depth"] != "0"]
 
 
-def wait_tree(m, title: str, done) -> tuple[str, list[dict[str, str]]]:
-    """Until window `title`'s published tree (below its root) satisfies
-    `done`: its id and those rows."""
+def wait_tree(m, title: str, name: str) -> tuple[str, list[dict[str, str]]]:
+    """Until window `title`'s published tree has a node named `name`: its
+    id and its rows below the root."""
     wid = gui.wait_window(m, title)["id"]
     rows = gui.wait_ui(
-        m, f"{title}'s tree", lambda r: done([x for x in r if x["depth"] != "0"]), wid, 30
+        m, f"{title}'s {name}", lambda r: any(x["name"] == name for x in below_root(r)), wid, 30
     )
-    return wid, [r for r in rows if r["depth"] != "0"]
+    return wid, below_root(rows)
 
 
 CALC_BUTTONS = [*"789/456*123-0.=+", "C", "Back"]
 
 
 def calc_tree(m) -> tuple[str, list[dict[str, str]]]:
-    return wait_tree(m, "Calculator", lambda r: any(x["name"] == "Display" for x in r))
+    return wait_tree(m, "Calculator", "Display")
 
 
 def display(m, wid: str) -> str:
@@ -610,7 +608,7 @@ def test_app_ids_are_global(boot):
     trees = {}
     for w in (r for r in gui.windows(m) if r["title"] == "Calculator"):
         rows = gui.wait_ui(m, f"window {w['id']}'s tree", lambda r: len(r) > 1, w["id"], 30)
-        trees[w["id"]] = [r for r in rows if r["depth"] != "0"]
+        trees[w["id"]] = below_root(rows)
     (a, rows_a), (b, rows_b) = trees.items()
     assert [r["name"] for r in rows_a] == [r["name"] for r in rows_b]
     ids_a, ids_b = {r["id"] for r in rows_a}, {r["id"] for r in rows_b}
@@ -636,7 +634,7 @@ def test_closed_its_window_answer_comes_after_the_window_closes(boot):
     # app returns 0.
     m = boot_desktop(boot)
     app_id, mark = start(m, "window ui")
-    wid, rows = wait_tree(m, "window", lambda r: any(x["name"] == "Quit" for x in r))
+    wid, rows = wait_tree(m, "window", "Quit")
     press(m, rows, "Add")
     assert gui.node(gui.ui_tree(m, wid), "label", "Count")["value"] == "1"
     quit_ = gui.node(rows, "button", "Quit")
@@ -657,7 +655,7 @@ def test_app_that_traps_closes_its_window_and_answers(boot):
     # "dropped" (an ERROR). One end-line WARN.
     m = boot_desktop(boot)
     app_id, mark = start(m, "window ui-trap")
-    wid, rows = wait_tree(m, "window", lambda r: any(x["name"] == "Add" for x in r))
+    wid, rows = wait_tree(m, "window", "Add")
     add = gui.node(rows, "button", "Add")
     out = run(m, f"ui invoke {add['id']} press", allow=TRAPPED)
     assert out == f"ui invoke: window {wid} closed while running it (it may have run)\n", out
@@ -698,7 +696,7 @@ def test_one_request_per_window_refuses_a_second_as_busy(boot):
     m = boot_desktop(boot)
     app_id, mark = start(m, "window deaf")
     wait_for_output(m, mark, r"INFO  app: window: window: deaf: published\n", 30)
-    wid, rows = wait_tree(m, "window", lambda r: any(x["name"] == "Go" for x in r))
+    wid, rows = wait_tree(m, "window", "Go")
     go = gui.node(rows, "button", "Go")
     first = run(m, f"ui invoke {go['id']} press")
     assert first == f"ui invoke: cancelled: window {wid} didn't take it in 1 s (try again)\n", first
