@@ -371,6 +371,30 @@ fn past_undo_bytes_the_oldest_edits_are_forgotten() {
 }
 
 #[test]
+fn a_huge_view_neither_overflows_nor_turns_a_page_around() {
+    let mut e = ed("0\n1\n2\n3");
+    e.apply(Command::Down);
+    assert!(!e.scroll_to(usize::MAX));
+    assert_eq!(e.top(), 0);
+    assert_eq!(e.apply(Command::PageDown), Change::Cursor { from: 1, to: 3 });
+    assert_eq!(e.line_col(), (3, 0), "the last line, at the goal column");
+    assert_eq!(e.apply(Command::PageUp), Change::Cursor { from: 3, to: 0 });
+    assert_eq!(e.line_col(), (0, 0), "the first line");
+}
+
+#[test]
+fn a_typing_run_the_history_forgot_is_over() {
+    let mut f = Editor::new("", Limits { text_bytes: BIG, line_bytes: BIG, undo_edits: 100, undo_bytes: 4 }).0;
+    typed(&mut f, "abcd");
+    assert!(f.typing);
+    typed(&mut f, "e");
+    assert_eq!(f.undo_depth(), 0);
+    assert!(!f.typing, "nothing left to join");
+    typed(&mut f, "f");
+    assert_eq!((f.undo_depth(), f.text()), (1, "abcdef"));
+}
+
+#[test]
 fn the_view_keeps_the_cursor_s_line_in_its_rows() {
     let mut e = ed("0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
     assert!(!e.scroll_to(4));

@@ -78,6 +78,9 @@ pub struct Loaded {
     pub cut: bool,
 }
 
+/// The most rows a view is taken to have ([`Editor::scroll_to`]).
+pub const MAX_ROWS: usize = 1 << 20;
+
 /// What an editor holds at most.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -141,7 +144,10 @@ pub enum Change {
 }
 
 /// One edit: `removed` at `at` replaced by `inserted`, and the cursor
-/// before and after.
+/// before and after. Its invariant: `at <= before <= at + removed.len()`
+/// and `after == at + inserted.len()` (an edit is made at the cursor, or
+/// replaces the whole text), all on char boundaries, so undoing or redoing
+/// it puts the cursor inside what it puts back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Edit {
     at: usize,
@@ -280,7 +286,9 @@ impl Editor {
     /// Show `rows` lines (at least 1), scrolled so the cursor's line is
     /// among them: whether the view's first line moved.
     pub fn scroll_to(&mut self, rows: usize) -> bool {
-        self.rows = rows.max(1);
+        // At least one, and few enough that a page's move (`rows` as an
+        // `isize`) never overflows.
+        self.rows = rows.clamp(1, MAX_ROWS);
         let line = self.cursor_line();
         // The cursor's line in the view, and the view as full as the text
         // allows (lines removed): `lowest <= highest` always.
@@ -328,7 +336,9 @@ impl Editor {
         };
         // Only typing right after typing joins it: any other command, a
         // refused or empty one included, ends the run.
-        self.typing = matches!((cmd, change), (Command::Insert(_), Change::Line(_)));
+        // ...and only while the history still holds the run (the limits
+        // may have forgotten it).
+        self.typing = matches!((cmd, change), (Command::Insert(_), Change::Line(_))) && !self.undo.is_empty();
         self.refused = change == Change::Refused;
         change
     }
@@ -469,16 +479,20 @@ impl Editor {
 
     /// `len` bytes at `at` replaced by `with`, the cursor then at `cursor`
     /// (an edit's, an undo's and a redo's change to the text).
+    /// `cursor` is within what goes in (`at..=at + with.len()`, the
+    /// [`Edit`] invariant), so without a line break gone or come it is on
+    /// `at`'s line: one line changed, unless the cursor left another.
     fn replace(&mut self, at: usize, len: usize, with: &str, cursor: usize) -> Change {
-        let first = self.line_of(at).min(self.line_of(cursor));
+        debug_assert!(at <= cursor && cursor <= at + with.len(), "{at} {cursor} {}", with.len());
+        debug_assert!(self.text.is_char_boundary(at) && self.text.is_char_boundary(at + len));
+        let first = self.line_of(at);
         let lines_change = self.text[at..at + len].contains('\n') || with.contains('\n');
         let from = self.cursor_line();
         self.text.replace_range(at..at + len, with);
         self.cursor = cursor;
         self.goal = None;
         self.index();
-        let to = self.cursor_line();
-        if lines_change || from != to || from != first { Change::From(first.min(from)) } else { Change::Line(first) }
+        if lines_change || from != first { Change::From(first.min(from)) } else { Change::Line(first) }
     }
 }
 
