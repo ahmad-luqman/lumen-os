@@ -735,8 +735,10 @@ fn the_scenario_s_turns_run_into_the_tail() {
 #[test]
 fn a_new_field_spares_the_two_cells_ahead() {
     // The comet flying up column 6 eats its fifth grain at (6, 4): the
-    // twin belts' upper row is row 3, right ahead, but (6, 3) and (6, 2)
-    // stay empty; the rest of the field is placed.
+    // twin belts' upper row is row 3, the cell right ahead, and (6, 3)
+    // stays empty; the rest of the field is placed. (The second cell
+    // ahead, (6, 2), is in no field: `the_second_cell_ahead_is_spared_too`
+    // checks that one.)
     let mut g = game(12);
     for c in g.comet().collect::<Vec<_>>() {
         g.set(c, Content::Empty);
@@ -781,4 +783,53 @@ fn a_cell_in_both_fields_held_at_the_last_change_takes_its_rock_now() {
     g.change_level(2, &mut changed);
     assert_eq!(g.content(shared), Content::Rock);
     assert!(changed.contains(&shared), "{changed:?}");
+}
+
+/// The comet straight up column 6 with its head at `head_y`, its fifth
+/// grain just ahead.
+fn up_column_6(head_y: u16) -> Game {
+    let mut g = game(12);
+    for c in g.comet().collect::<Vec<_>>() {
+        g.set(c, Content::Empty);
+    }
+    let cells = [Cell::new(6, head_y), Cell::new(6, head_y + 1), Cell::new(6, head_y + 2)];
+    g.body = cells.into_iter().collect();
+    g.set(cells[0], Content::Head);
+    g.set(cells[1], Content::Tail);
+    g.set(cells[2], Content::Tail);
+    (g.moved, g.heading) = (Dir::Up, Dir::Up);
+    g.score = LEVEL_EVERY - 1;
+    put_dust(&mut g, Cell::new(6, head_y - 1));
+    g
+}
+
+#[test]
+fn the_second_cell_ahead_is_spared_too() {
+    // The fifth grain eaten at (6, 5): the twin belts' (6, 3) is two cells
+    // ahead and stays empty; its neighbour (5, 3), not ahead, is a rock.
+    let mut g = up_column_6(6);
+    g.step();
+    assert_eq!((g.level(), g.head()), (1, Cell::new(6, 5)));
+    assert_ne!(g.content(Cell::new(6, 3)), Content::Rock);
+    assert_eq!(g.content(Cell::new(5, 3)), Content::Rock);
+    // Three ahead isn't spared: eating at (6, 6), the belt's (6, 3) is
+    // three cells ahead, and placed.
+    let mut g = up_column_6(7);
+    g.step();
+    assert_eq!((g.level(), g.head()), (1, Cell::new(6, 6)));
+    assert_eq!(g.content(Cell::new(6, 3)), Content::Rock);
+}
+
+#[test]
+fn below_draws_again_for_a_draw_past_the_zone() {
+    // 2^64 - 2's remainder by 19 lies past the last whole multiple of 19
+    // below 2^64: `below(19)` draws again and answers the second draw's.
+    let seed = seed_drawing_first(u64::MAX - 1);
+    let mut r = Rng::new(seed);
+    let first = r.next_u64();
+    assert_eq!(first, u64::MAX - 1);
+    // Past 19's zone: the last whole multiple of 19 below 2^64.
+    assert!(first >= u64::MAX - u64::MAX % 19, "{first} is inside the zone");
+    let second = r.next_u64();
+    assert_eq!(u64::from(Rng::new(seed).below(19)), second % 19);
 }
