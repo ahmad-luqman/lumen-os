@@ -234,15 +234,11 @@ impl<A: App> Toolkit<A> {
         &mut self.window
     }
 
-    /// The palette the window is drawn with now (the last `Theme`'s; the
-    /// light one before the first). `paint_over` is handed it too.
+    /// The palette the window is drawn with now (the last `Theme`'s; all
+    /// zero before the first, which comes before anything is drawn).
+    /// `paint_over` is handed it too.
     pub fn palette(&self) -> &Palette {
         &self.palette
-    }
-
-    /// Where the tree is laid out.
-    pub fn area(&self) -> Rect {
-        self.area
     }
 
     /// Steps until the window closes (it can't quit: nothing takes an
@@ -410,13 +406,14 @@ impl<A: App> Toolkit<A> {
 
     /// Lay the tree out; repaint and commit only what changed
     /// (`lumen_ui::repaint`, as the kernel's toolkit does): the tree's
-    /// damage and the app's own (`App::take_drawn`), with `paint_over` over
-    /// it; then publish the tree only if it changed (the app's drawing alone
-    /// never republishes it). This is the one frame path: a tick's, an
-    /// event's, or an app's own call after it drew. A failed commit marks
-    /// everything to repaint again, so the next refresh repaints and
-    /// republishes it; a refused publish is logged once a run and tried
-    /// again when the tree changes.
+    /// damage and the app's own (`App::take_drawn`), merged, each with the
+    /// tree's paint and `paint_over` over it; then publish the tree only if
+    /// it changed (the app's drawing alone never republishes it). This is
+    /// the one frame path: a tick's, an event's, or an app's own call after
+    /// it drew. A failed commit marks everything to repaint again, so a
+    /// later refresh repaints and republishes it (for an app calling
+    /// `refresh` itself: the loops return the error); a refused publish is
+    /// logged once a run and tried again when the tree changes.
     pub fn refresh(&mut self) -> Result<()> {
         let done = repaint(&mut self.app, &mut self.window.canvas, &mut self.text, &self.palette, self.area);
         if !done.rects.is_empty() {
