@@ -16,7 +16,6 @@ bench = false
 
 [dependencies]
 lumen-app.workspace = true
-lumen-png.workspace = true
 lumen-ui.workspace = true
 lumen-view.workspace = true
 

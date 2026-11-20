@@ -426,6 +426,7 @@ name = "lumen-view"
 version = "0.0.1"
 dependencies = [
  "lumen-app-api",
+ "lumen-gfx",
  "lumen-heap",
  "lumen-png",
 ]

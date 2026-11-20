@@ -21,17 +21,26 @@
 //!   at the biggest size, so an 8-bit RGBA image is taken at three quarters
 //!   of that many pixels, a 16-bit RGBA one at three eighths. The decoder's
 //!   work, and so the memory plan, is then bounded whatever a file says.
+//! - **Showing one** ([`prepare`]): [`admit`], `lumen-png`'s decoder, and
+//!   the fitted copy, as the app does it, both held as surfaces; or why not
+//!   ([`Why`]: refused, the decoder's error, or out of memory, which is the
+//!   plan failing, not the file).
 //! - **Memory** ([`MEMORY_BYTES`]): the app's fixed memory, whose heap part
 //!   ([`HEAP_BYTES`]) `tests/memory.rs` checks the app's allocations fit,
-//!   running them through the app's own allocator logic (`lumen-heap`) over
-//!   a region of that size, for the bundled images and the costliest ones
-//!   [`admit`] takes.
+//!   running [`prepare`] through the app's own allocator logic
+//!   (`lumen-heap`) over a region of that size, for the bundled images and
+//!   the costliest ones [`admit`] takes.
 
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
+
+pub use lumen_gfx::{Rect, Surface};
+pub use lumen_png::decode::DecodeError;
+use lumen_png::decode::decode;
 
 /// The window's client size.
 pub const WINDOW_W: u32 = 640;
@@ -39,8 +48,10 @@ pub const WINDOW_H: u32 = 480;
 /// The panel of widgets on the left (the image list, the buttons, the
 /// label): the toolkit's area.
 pub const PANEL_W: u32 = 200;
+/// The panel: the client left of the view.
+pub const PANEL: Rect = Rect::new(0, 0, PANEL_W, WINDOW_H);
 /// The view: the client right of the panel.
-pub const VIEW: Area = Area { x: PANEL_W as i32, y: 0, w: WINDOW_W - PANEL_W, h: WINDOW_H };
+pub const VIEW: Rect = Rect::new(PANEL_W as i32, 0, WINDOW_W - PANEL_W, WINDOW_H);
 /// How far one arrow key moves a 1:1 view.
 pub const PAN_STEP: u32 = 40;
 
@@ -117,7 +128,7 @@ fn samples(colour: u8, depth: u8) -> Option<u64> {
 /// The bytes a `w` x `h` image's inflated rows take, `per_pixel` samples of
 /// `depth` bits a pixel: each row a filter byte and its samples, rounded up
 /// to a whole byte.
-pub fn inflated(w: u32, h: u32, per_pixel: u64, depth: u8) -> u64 {
+fn inflated(w: u32, h: u32, per_pixel: u64, depth: u8) -> u64 {
     (1 + (u64::from(w) * per_pixel * u64::from(depth)).div_ceil(8)) * u64::from(h)
 }
 
@@ -147,21 +158,6 @@ pub fn admit(png: &[u8]) -> Result<(u32, u32), Refused> {
     Ok((w, h))
 }
 
-/// A rectangle in client coordinates.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Area {
-    pub x: i32,
-    pub y: i32,
-    pub w: u32,
-    pub h: u32,
-}
-
-impl Area {
-    pub const fn new(x: i32, y: i32, w: u32, h: u32) -> Area {
-        Area { x, y, w, h }
-    }
-}
-
 /// Where a 1:1 view is panned to: the image's pixel at the view's top left
 /// on each axis on which the image is bigger than the view.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -171,21 +167,13 @@ pub struct Pan {
 }
 
 impl Pan {
-    pub fn x(self) -> u32 {
-        self.x
-    }
-
-    pub fn y(self) -> u32 {
-        self.y
-    }
-
     /// Moved by (`dx`, `dy`) steps of [`PAN_STEP`], clamped to what an
     /// `image_w` x `image_h` image allows in `view` (the view stays
     /// filled): whether it moved.
-    pub fn by(&mut self, dx: i32, dy: i32, image_w: u32, image_h: u32, view: Area) -> bool {
+    pub fn by(&mut self, dx: i32, dy: i32, image_w: u32, image_h: u32, view: Rect) -> bool {
         let before = *self;
-        self.x = step(self.x, dx, image_w.saturating_sub(view.w));
-        self.y = step(self.y, dy, image_h.saturating_sub(view.h));
+        self.x = step(self.x, dx, image_w.saturating_sub(view.w()));
+        self.y = step(self.y, dy, image_h.saturating_sub(view.h()));
         *self != before
     }
 }
@@ -200,7 +188,7 @@ fn step(at: u32, steps: i32, max: u32) -> u32 {
 /// from (`src_x`, `src_y`), `dst.w` x `dst.h` of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Placed {
-    pub dst: Area,
+    pub dst: Rect,
     pub src_x: u32,
     pub src_y: u32,
 }
@@ -208,10 +196,10 @@ pub struct Placed {
 /// An `image_w` x `image_h` image at 1:1 in `view`, panned to `pan`
 /// (clamped): per axis, the part from the pan when the image is bigger
 /// than the view, all of it centred when it isn't.
-pub fn actual(image_w: u32, image_h: u32, view: Area, pan: Pan) -> Placed {
-    let (x, src_x, w) = axis(image_w, view.w, pan.x);
-    let (y, src_y, h) = axis(image_h, view.h, pan.y);
-    Placed { dst: Area::new(view.x + x as i32, view.y + y as i32, w, h), src_x, src_y }
+pub fn actual(image_w: u32, image_h: u32, view: Rect, pan: Pan) -> Placed {
+    let (x, src_x, w) = axis(image_w, view.w(), pan.x);
+    let (y, src_y, h) = axis(image_h, view.h(), pan.y);
+    Placed { dst: Rect::new(view.x() + x as i32, view.y() + y as i32, w, h), src_x, src_y }
 }
 
 /// One axis of [`actual`]: (the offset in the view, the first source
@@ -222,7 +210,7 @@ fn axis(image: u32, view: u32, pan: u32) -> (u32, u32, u32) {
 
 /// The biggest `w` x `h` with an `image_w` x `image_h` image's shape that
 /// fits `view_w` x `view_h` (at least 1 x 1; rounded down).
-pub fn fit_size(image_w: u32, image_h: u32, view_w: u32, view_h: u32) -> (u32, u32) {
+fn fit_size(image_w: u32, image_h: u32, view_w: u32, view_h: u32) -> (u32, u32) {
     let (iw, ih, vw, vh) = (u64::from(image_w.max(1)), u64::from(image_h.max(1)), u64::from(view_w), u64::from(view_h));
     let (w, h) = if iw * vh <= ih * vw {
         // The height decides.
@@ -234,16 +222,16 @@ pub fn fit_size(image_w: u32, image_h: u32, view_w: u32, view_h: u32) -> (u32, u
 }
 
 /// Where an `image_w` x `image_h` image fitted to `view` goes: centred.
-pub fn fitted(image_w: u32, image_h: u32, view: Area) -> Area {
-    let (w, h) = fit_size(image_w, image_h, view.w, view.h);
-    Area::new(view.x + ((view.w - w) / 2) as i32, view.y + ((view.h - h) / 2) as i32, w, h)
+pub fn fitted(image_w: u32, image_h: u32, view: Rect) -> Rect {
+    let (w, h) = fit_size(image_w, image_h, view.w(), view.h());
+    Rect::new(view.x() + ((view.w() - w) / 2) as i32, view.y() + ((view.h() - h) / 2) as i32, w, h)
 }
 
 /// The source pixel (on one axis) that pixel `d` of a `dst_len` long scaled
 /// copy of a `src_len` long axis takes: `d × src_len / dst_len`, rounded
 /// down (nearest neighbour; the first pixel from the first, never past the
 /// last).
-pub fn source(d: u32, dst_len: u32, src_len: u32) -> u32 {
+fn source(d: u32, dst_len: u32, src_len: u32) -> u32 {
     (u64::from(d) * u64::from(src_len) / u64::from(dst_len.max(1))) as u32
 }
 
@@ -265,13 +253,98 @@ pub fn scale(src: &[u32], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Opt
     Some(out)
 }
 
+/// Why an image can't be shown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Why {
+    /// [`admit`] refused it from its header.
+    Refused(Refused),
+    /// The decoder refused it (a bad file), or ran out of memory
+    /// ([`DecodeError::OutOfMemory`]).
+    Decode(DecodeError),
+    /// No memory for its fitted copy.
+    NoMemory,
+}
+
+impl Why {
+    /// Whether it is the memory plan failing (the heap refused what the
+    /// plan says fits), not the file: the app warns about these.
+    pub fn out_of_memory(&self) -> bool {
+        matches!(self, Why::NoMemory | Why::Decode(DecodeError::OutOfMemory))
+    }
+}
+
+impl core::fmt::Display for Why {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Why::Refused(r) => r.fmt(f),
+            Why::Decode(e) => e.fmt(f),
+            Why::NoMemory => f.write_str("no memory for its fitted copy"),
+        }
+    }
+}
+
+/// An image's copy fitted to [`VIEW`] and where it goes ([`fitted`]): the
+/// place's size is the copy's.
+pub struct Fitted {
+    at: Rect,
+    pixels: Surface,
+}
+
+impl Fitted {
+    /// Where it goes in the client.
+    pub fn at(&self) -> Rect {
+        self.at
+    }
+
+    /// Its pixels, `at()`'s size.
+    pub fn pixels(&self) -> &Surface {
+        &self.pixels
+    }
+}
+
+/// An image decoded and fitted to [`VIEW`]: what the app shows.
+pub struct Prepared {
+    image: Surface,
+    fitted: Fitted,
+}
+
+impl Prepared {
+    /// The image, 1:1.
+    pub fn image(&self) -> &Surface {
+        &self.image
+    }
+
+    /// Its copy fitted to [`VIEW`].
+    pub fn fitted(&self) -> &Fitted {
+        &self.fitted
+    }
+}
+
+/// `png` [`admit`]ted, decoded and fitted to [`VIEW`], or why it can't be
+/// shown: the app's one call for an image, which `tests/memory.rs` runs
+/// through the app's allocator logic.
+pub fn prepare(png: &[u8]) -> Result<Prepared, Why> {
+    admit(png).map_err(Why::Refused)?;
+    let image = decode(png, MAX_IMAGE_W, MAX_IMAGE_H).map_err(Why::Decode)?;
+    let (w, h) = (image.width(), image.height());
+    let at = fitted(w, h, VIEW);
+    let pixels = scale(image.pixels(), w, h, at.w(), at.h())
+        .and_then(|fit| Surface::from_pixels(at.w(), at.h(), fit))
+        .ok_or(Why::NoMemory)?;
+    // The decoder hands back exactly `w` x `h` pixels.
+    let image = Surface::from_pixels(w, h, image.into_pixels())
+        .ok_or_else(|| Why::Decode(DecodeError::Png(String::from("its pixels and its size disagree"))))?;
+    Ok(Prepared { image, fitted: Fitted { at, pixels } })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn the_view_is_the_client_right_of_the_panel() {
-        assert_eq!(VIEW, Area::new(200, 0, 440, 480));
+        assert_eq!(VIEW, Rect::new(200, 0, 440, 480));
+        assert_eq!(PANEL, Rect::new(0, 0, 200, 480));
     }
 
     #[test]
@@ -291,9 +364,9 @@ mod tests {
     fn a_pan_stops_where_the_view_is_still_filled() {
         let mut pan = Pan::default();
         assert!(pan.by(1000, 1000, 1280, 800, VIEW));
-        assert_eq!((pan.x(), pan.y()), (1280 - 440, 800 - 480));
+        assert_eq!(pan, Pan { x: 1280 - 440, y: 800 - 480 });
         let placed = actual(1280, 800, VIEW, pan);
-        assert_eq!((placed.src_x + placed.dst.w, placed.src_y + placed.dst.h), (1280, 800));
+        assert_eq!((placed.src_x + placed.dst.w(), placed.src_y + placed.dst.h()), (1280, 800));
         assert!(!pan.by(1, 1, 1280, 800, VIEW));
     }
 
@@ -303,13 +376,13 @@ mod tests {
         assert!(!pan.by(3, 3, 96, 64, VIEW));
         assert_eq!(
             actual(96, 64, VIEW, pan),
-            Placed { dst: Area::new(200 + (440 - 96) / 2, (480 - 64) / 2, 96, 64), src_x: 0, src_y: 0 }
+            Placed { dst: Rect::new(200 + (440 - 96) / 2, (480 - 64) / 2, 96, 64), src_x: 0, src_y: 0 }
         );
         // Bigger on one axis only: that one pans, the other is centred.
         assert!(pan.by(2, 2, 1000, 100, VIEW));
         let placed = actual(1000, 100, VIEW, pan);
         assert_eq!((placed.src_x, placed.src_y), (2 * PAN_STEP, 0));
-        assert_eq!(placed.dst, Area::new(200, (480 - 100) / 2, 440, 100));
+        assert_eq!(placed.dst, Rect::new(200, (480 - 100) / 2, 440, 100));
     }
 
     #[test]
@@ -321,14 +394,14 @@ mod tests {
         assert_eq!((placed.src_x, placed.src_y), (60, 20));
         // And moving from there starts at the clamped place.
         assert!(pan.by(-1, 0, 500, 500, VIEW));
-        assert_eq!(pan.x(), 20);
+        assert_eq!(pan.x, 20);
     }
 
     #[test]
     fn fit_keeps_the_shape_and_fills_one_side() {
         // The wallpaper: the width decides.
         assert_eq!(fit_size(1280, 800, 440, 480), (440, 275));
-        assert_eq!(fitted(1280, 800, VIEW), Area::new(200, (480 - 275) / 2, 440, 275));
+        assert_eq!(fitted(1280, 800, VIEW), Rect::new(200, (480 - 275) / 2, 440, 275));
         // A tall image: the height decides.
         assert_eq!(fit_size(100, 400, 440, 480), (120, 480));
         // A small one is enlarged.

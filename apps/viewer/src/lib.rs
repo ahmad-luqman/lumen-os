@@ -26,7 +26,7 @@
 //! - **Memory:** fixed at `lumen_view::MEMORY_BYTES` (its `build.rs`),
 //!   checked at the start (with where the heap starts, against
 //!   lumen-view's plan): `tests/memory.rs` there checks the app's
-//!   allocations fit.
+//!   allocations (`lumen_view::prepare`, this app's one call) fit.
 
 #![no_std]
 
@@ -37,12 +37,9 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lumen_app::gfx::Rect;
 use lumen_app::ui::{Flow, Taken, Ticking, Toolkit};
-use lumen_app::{Desktop, Error, Event, KeyAction, KeyCode, Time, log};
-use lumen_png::decode::{Image, decode};
+use lumen_app::{Desktop, Error, Event, KeyAction, KeyCode, Surface, Time, log};
 use lumen_ui::{App, Over, Then, Ui, UiEvent, Widget};
-use lumen_view::{
-    Area, MAX_IMAGE_H, MAX_IMAGE_W, PANEL_W, Pan, VIEW, WINDOW_H, WINDOW_W, actual, admit, fitted, scale,
-};
+use lumen_view::{PANEL, PANEL_W, Pan, Prepared, VIEW, WINDOW_H, WINDOW_W, actual, prepare};
 
 lumen_app::manifest!(time, desktop);
 lumen_app::main!(run);
@@ -71,9 +68,8 @@ const TEXT_INSET: i32 = 12;
 enum Shown {
     /// Waiting for the next tick to decode the current image.
     Decoding,
-    /// The image, and its copy fitted to the view (where it goes, its
-    /// pixels).
-    Image { image: Image, fit_at: Area, fit: Vec<u32> },
+    /// The image, and its copy fitted to the view.
+    Image(Prepared),
     /// Why it couldn't be shown.
     Failed(String),
 }
@@ -97,8 +93,7 @@ struct Viewer {
 impl Viewer {
     fn new(first: usize) -> Viewer {
         let mut ui = Ui::new();
-        let names: Vec<&str> = IMAGES.iter().map(|i| i.name).collect();
-        let list = ui.list(None, "Images", &names);
+        let list = ui.list(None, "Images", &names());
         let row = ui.hstack(None, "Browse");
         let previous = ui.button(Some(row), "Previous");
         let next = ui.button(Some(row), "Next");
@@ -144,31 +139,31 @@ impl Viewer {
 
     /// Decode the current image: shown, or why not.
     fn decode(&mut self) {
-        let image = &IMAGES[self.current];
-        self.shown = match show(image.png) {
-            Ok((image, fit_at, fit)) => Shown::Image { image, fit_at, fit },
-            Err(why) => {
-                log::info(&format!("viewer: {}: {why}", image.name));
-                Shown::Failed(why)
+        let name = IMAGES[self.current].name;
+        let info = match prepare(IMAGES[self.current].png) {
+            Ok(shown) => {
+                let info = format!("{name} {}x{}", shown.image().width(), shown.image().height());
+                self.shown = Shown::Image(shown);
+                info
             }
-        };
-        let info = match &self.shown {
-            Shown::Image { image: shown, .. } => format!("{} {}x{}", image.name, shown.width(), shown.height()),
-            Shown::Failed(why) => format!("{}: {why}", image.name),
-            Shown::Decoding => format!("decoding {}", image.name),
+            Err(why) => {
+                log::info(&format!("viewer: {name}: {why}"));
+                let info = format!("{name}: {why}");
+                self.shown = Shown::Failed(why.to_string());
+                info
+            }
         };
         self.ui.set_text(self.info, &info);
         self.dirty = true;
     }
 
-    /// An arrow key in a 1:1 view: the pan moved (whether it did).
-    fn pan_by(&mut self, dx: i32, dy: i32) -> bool {
-        let Shown::Image { image, .. } = &self.shown else { return false };
-        if self.fit || !self.pan.by(dx, dy, image.width(), image.height(), VIEW) {
-            return false;
+    /// An arrow key in a 1:1 view: the pan moved.
+    fn pan_by(&mut self, dx: i32, dy: i32) {
+        let Shown::Image(shown) = &self.shown else { return };
+        let image = shown.image();
+        if !self.fit && self.pan.by(dx, dy, image.width(), image.height(), VIEW) {
+            self.dirty = true;
         }
-        self.dirty = true;
-        true
     }
 
     /// `run_until`'s `take`: the arrow keys pan a 1:1 view; everything else
@@ -187,38 +182,15 @@ impl Viewer {
     }
 }
 
-/// `png` decoded and fitted to the view, or why it can't be shown.
-fn show(png: &[u8]) -> Result<(Image, Area, Vec<u32>), String> {
-    admit(png).map_err(|e| e.to_string())?;
-    let image = decode(png, MAX_IMAGE_W, MAX_IMAGE_H).map_err(|e| e.to_string())?;
-    let at = fitted(image.width(), image.height(), VIEW);
-    let fit = scale(image.pixels(), image.width(), image.height(), at.w, at.h)
-        .ok_or_else(|| String::from("no memory for its fitted copy"))?;
-    Ok((image, at, fit))
+/// The images' names, in the list's order.
+fn names() -> Vec<&'static str> {
+    IMAGES.iter().map(|i| i.name).collect()
 }
 
-fn rect(a: Area) -> Rect {
-    Rect::new(a.x, a.y, a.w, a.h)
-}
-
-/// Copy `src`'s rows (each `src_stride` pixels, starting at (`src_x`,
-/// `src_y`) for the corner of `at`) into `surface` where `at` meets `clip`.
-fn blit(
-    surface: &mut lumen_app::Surface,
-    src: &[u32],
-    src_stride: usize,
-    src_x: u32,
-    src_y: u32,
-    at: Area,
-    clip: Rect,
-) {
-    let Some(r) = rect(at).intersect(&clip) else { return };
-    let (dx, dy) = ((r.x() - at.x) as usize, (r.y() - at.y) as usize);
-    for row in 0..r.h() as usize {
-        let from = (src_y as usize + dy + row) * src_stride + src_x as usize + dx;
-        let to = &mut surface.row_mut(r.y() as u32 + row as u32)[r.x() as usize..][..r.w() as usize];
-        to.copy_from_slice(&src[from..from + r.w() as usize]);
-    }
+/// Copy `src`, its corner at (`x`, `y`), into `surface` inside `clip` (and
+/// inside `src`: lumen-gfx's clipped copy).
+fn blit(surface: &mut Surface, src: &Surface, x: i32, y: i32, clip: Rect) {
+    src.copy_to(clip.translate(-x, -y), surface, clip.x(), clip.y());
 }
 
 impl App for Viewer {
@@ -244,31 +216,24 @@ impl App for Viewer {
     }
 
     fn paint_over(&mut self, over: &mut Over<'_>) {
-        let view = rect(VIEW);
+        let (x, y) = (VIEW.x() + TEXT_INSET, VIEW.y() + TEXT_INSET);
         for r in over.rects {
-            let Some(clip) = r.intersect(&view) else { continue };
+            let Some(clip) = r.intersect(&VIEW) else { continue };
             match &self.shown {
-                Shown::Image { image, fit_at, fit } => {
+                Shown::Image(shown) => {
+                    let (image, fitted) = (shown.image(), shown.fitted());
                     if self.fit {
-                        blit(over.surface, fit, fit_at.w as usize, 0, 0, *fit_at, clip);
+                        blit(over.surface, fitted.pixels(), fitted.at().x(), fitted.at().y(), clip);
                     } else {
                         let p = actual(image.width(), image.height(), VIEW, self.pan);
-                        blit(over.surface, image.pixels(), image.width() as usize, p.src_x, p.src_y, p.dst, clip);
+                        blit(over.surface, image, p.dst.x() - p.src_x as i32, p.dst.y() - p.src_y as i32, clip);
                     }
                 }
                 Shown::Decoding => {
                     let line = format!("Decoding {}...", IMAGES[self.current].name);
-                    over.text.draw(
-                        over.surface,
-                        VIEW.x + TEXT_INSET,
-                        VIEW.y + TEXT_INSET,
-                        &line,
-                        over.palette.text,
-                        clip,
-                    );
+                    over.text.draw(over.surface, x, y, &line, over.palette.text, clip);
                 }
                 Shown::Failed(why) => {
-                    let (x, y) = (VIEW.x + TEXT_INSET, VIEW.y + TEXT_INSET);
                     let first = format!("Can't show {}:", IMAGES[self.current].name);
                     over.text.draw(over.surface, x, y, &first, over.palette.text, clip);
                     let next = y + over.text.line_height() as i32;
@@ -279,7 +244,7 @@ impl App for Viewer {
     }
 
     fn take_drawn(&mut self) -> Vec<Rect> {
-        if core::mem::take(&mut self.dirty) { alloc::vec![rect(VIEW)] } else { Vec::new() }
+        if core::mem::take(&mut self.dirty) { alloc::vec![VIEW] } else { Vec::new() }
     }
 }
 
@@ -337,8 +302,7 @@ fn app() -> Result<(), (&'static str, Error)> {
         Some(name) => match IMAGES.iter().position(|i| i.name == name.as_str()) {
             Some(i) => i,
             None => {
-                let names: Vec<&str> = IMAGES.iter().map(|i| i.name).collect();
-                log::error(&format!("viewer: no image {name} (it has {})", names.join(", ")));
+                log::error(&format!("viewer: no image {name} (it has {})", names().join(", ")));
                 return Err(("arguments", Error::BadArgument));
             }
         },
@@ -346,7 +310,6 @@ fn app() -> Result<(), (&'static str, Error)> {
     let time = Time::get().map_err(|e| ("no time handle", e))?;
     let desktop = Desktop::get().map_err(|e| ("no desktop handle", e))?;
     let window = desktop.open_window("Viewer", WINDOW_W, WINDOW_H).map_err(|e| ("no window", e))?;
-    let panel = Rect::new(0, 0, PANEL_W, WINDOW_H);
-    let mut tk = Toolkit::with_area(Viewer::new(first), window, panel).map_err(|e| ("no toolkit", e))?;
+    let mut tk = Toolkit::with_area(Viewer::new(first), window, PANEL).map_err(|e| ("no toolkit", e))?;
     tk.run_until(time, Viewer::take).map(|_| ()).map_err(|e| ("toolkit", e))
 }

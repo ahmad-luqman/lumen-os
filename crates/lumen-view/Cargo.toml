@@ -7,10 +7,11 @@ license.workspace = true
 
 [dependencies]
 lumen-app-api.workspace = true
+lumen-gfx.workspace = true
+lumen-png.workspace = true
 
 [dev-dependencies]
 lumen-heap.workspace = true
-lumen-png.workspace = true
 
 [lints]
 workspace = true

@@ -7,9 +7,9 @@
 //! - the canvas the SDK reserves for its window, and a block standing for
 //!   the toolkit's own (its widgets, its strings), held throughout;
 //! - then, image after image as the app shows them (the old one and its
-//!   fitted copy dropped first): the PNG decoded by `lumen-png` (its copy of
-//!   the image's chunks, the decoder's buffers, the samples, the pixels) and
-//!   its fitted copy;
+//!   fitted copy dropped first): `lumen_view::prepare`, the app's own call
+//!   (`lumen-png`'s copy of the image's chunks, the decoder's buffers, the
+//!   samples, the pixels, then the fitted copy);
 //! - every bundled image, the corrupt one, and the costliest PNGs the
 //!   viewer takes to decode (`lumen_view::admit`; made by
 //!   tools/viewer-images.py, both interlaced): `worst.png`, its biggest size
@@ -27,7 +27,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use lumen_heap::Heap;
-use lumen_view::{HEAP_BYTES, MAX_IMAGE_H, MAX_IMAGE_W, VIEW, WINDOW_H, WINDOW_W, fitted, scale};
+use lumen_view::{HEAP_BYTES, Prepared, WINDOW_H, WINDOW_W, prepare};
 
 /// Standing for the toolkit's allocations (the widgets, their strings, the
 /// tree published), held throughout: generous (a few KiB in practice).
@@ -125,43 +125,26 @@ const BROKEN: &[u8] = include_bytes!("../../../apps/viewer/images/broken.png");
 const WORST: &[u8] = include_bytes!("worst.png");
 const WORST16: &[u8] = include_bytes!("worst16.png");
 
-/// What the app holds for the image shown: its pixels and its fitted copy.
-struct Shown {
-    _pixels: Vec<u32>,
-    _fitted: Option<Vec<u32>>,
-}
-
-/// The app's work for one image: decode it, then fit it (as `apps/viewer`
-/// does; a refused image holds nothing).
-fn show(png: &[u8]) -> Option<Shown> {
-    lumen_view::admit(png).ok()?;
-    let image = lumen_png::decode::decode(png, MAX_IMAGE_W, MAX_IMAGE_H).ok()?;
-    let at = fitted(image.width(), image.height(), VIEW);
-    let fitted = scale(image.pixels(), image.width(), image.height(), at.w, at.h);
-    Some(Shown { _pixels: image.into_pixels(), _fitted: fitted })
-}
-
 #[test]
 fn the_viewer_s_allocations_fit_its_heap() {
-    // Each image decodes outside the region first (the decoder works).
+    // Each image is shown outside the region first (admitted and decoded).
     for (name, png) in
         [("wallpaper", WALLPAPER), ("tiles", TILES), ("grey16", GREY16), ("worst", WORST), ("worst16", WORST16)]
     {
-        assert!(lumen_view::admit(png).is_ok(), "{name} isn't admitted");
-        assert!(lumen_png::decode::decode(png, MAX_IMAGE_W, MAX_IMAGE_H).is_ok(), "{name} doesn't decode");
+        assert!(prepare(png).is_ok(), "{name} isn't shown");
     }
-    assert!(lumen_png::decode::decode(BROKEN, MAX_IMAGE_W, MAX_IMAGE_H).is_err(), "broken decodes");
+    assert!(prepare(BROKEN).is_err(), "broken is shown");
 
     ARMED.store(true, Ordering::SeqCst);
     let canvas: Vec<u32> = vec![0; (WINDOW_W * WINDOW_H) as usize];
     let toolkit: Vec<u8> = vec![0; TOOLKIT_BYTES];
-    let mut shown: Option<Shown> = None;
+    let mut shown: Option<Prepared> = None;
     let order = [WALLPAPER, TILES, GREY16, BROKEN, WORST, WALLPAPER, WORST16, TILES, WORST, WORST16, WALLPAPER];
     for _round in 0..3 {
         for png in order {
             // The old image goes before the new one is decoded.
             drop(shown.take());
-            shown = show(png);
+            shown = prepare(png).ok();
         }
     }
     drop((shown, canvas, toolkit));

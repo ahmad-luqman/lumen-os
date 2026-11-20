@@ -105,6 +105,8 @@ name = "lumen-view"
 version = "0.0.1"
 dependencies = [
  "lumen-app-api",
+ "lumen-gfx",
+ "lumen-png",
 ]
 
 [[package]]
@@ -302,7 +304,6 @@ name = "viewer"
 version = "0.0.1"
 dependencies = [
  "lumen-app",
- "lumen-png",
  "lumen-ui",
  "lumen-view",
 ]
