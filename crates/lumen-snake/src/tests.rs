@@ -761,3 +761,24 @@ fn a_new_field_spares_the_two_cells_ahead() {
     g.step();
     assert_eq!((g.state(), g.head()), (State::Flying, Cell::new(6, 2)));
 }
+
+#[test]
+fn a_cell_in_both_fields_held_at_the_last_change_takes_its_rock_now() {
+    // (8, 3) is in the twin belts and the crossing. The comet held it when
+    // the belts were placed, so it stayed empty; by the next level it has
+    // moved on, and the crossing's rock goes there like the rest.
+    let shared = Cell::new(8, 3);
+    assert!(rocks(1, W, H).contains(&shared) && rocks(2, W, H).contains(&shared));
+    let mut g = game(0);
+    dust_aside(&mut g);
+    g.level = 1;
+    for c in rocks(1, W, H) {
+        if c != shared && g.content(c) == Content::Empty {
+            g.set(c, Content::Rock);
+        }
+    }
+    let mut changed = Vec::new();
+    g.change_level(2, &mut changed);
+    assert_eq!(g.content(shared), Content::Rock);
+    assert!(changed.contains(&shared), "{changed:?}");
+}
