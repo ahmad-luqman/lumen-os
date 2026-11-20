@@ -1,6 +1,6 @@
 [package]
 name = "lumen-snake"
-description = "no_std logic for Lumen's Comet game (#201), an original snake-style game: a comet steered across a night sky, its tail growing with each grain of stardust; walls, its own tail and each level's asteroids end it; a seeded generator, so one seed plays one game. Host-tested"
+description = "no_std logic for Lumen's Comet game (#201), an original snake-style game: a comet steered across a sky of cells, its tail growing with each grain of stardust; the edge, its own tail and each level's asteroids end it; a seeded generator, so one seed plays one game. Host-tested"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

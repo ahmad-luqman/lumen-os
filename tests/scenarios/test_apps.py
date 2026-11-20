@@ -901,20 +901,25 @@ def test_snake_tree_and_steps(boot):
     gui.close_window(m, "Comet")
     end_line(m, mark, "comet", app_id, "exited with 0")
 
-    # Arguments it doesn't take: one ERROR naming why, then exit 2. Each
-    # `run` allows any of these errors: an app's ERROR can come after its
-    # `run` returned, and is then the next command's to allow.
+    # Arguments it doesn't take: one ERROR naming why (exactly one), then
+    # exit 2. Each `run` allows any of these errors: an app's ERROR can come
+    # after its `run` returned, and is then the next command's to allow.
     usage_error = r"ERROR app: comet: .*; usage: comet \[--seed N\] \[--step\]"
     for line, why in [
         ("comet --fast", "'--fast' isn't an argument it takes"),
         ("comet --seed x", "'x' is not a seed (0 to 2^64 - 1)"),
         ("comet --step --step", "--step given twice"),
+        ("comet --seed 1 --seed 2", "--seed given twice"),
         ("comet --seed --step", "--seed needs a number"),
     ]:
         error = f"ERROR app: comet: {why}; usage: comet [--seed N] [--step]"
         bad, mark = start(m, line, allow=usage_error)
         wait_for_output(m, mark, re.escape(error), 30)
         end_line(m, mark, "comet", bad, "exited with 2")
+        # One ERROR: the app logs it before it returns, so by its end line
+        # every line it logged is in.
+        logged = re.findall(usage_error, m.output[mark:])
+        assert logged == [error], (line, logged)
 
 
 # Comet's sky with its frame, in its client area (apps/comet's FRAMED: the

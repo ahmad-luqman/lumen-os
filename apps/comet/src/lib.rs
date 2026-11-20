@@ -21,12 +21,14 @@
 //!   on the host's speed), and `Play` back to flying. Over, `Play` and
 //!   `Step` are disabled until `Restart`, which starts the next game in the
 //!   mode it was launched in (stepping with `--step`, else flying).
-//! - **Keys:** the arrows turn it (taken before the toolkit, which never
-//!   sees them).
+//! - **Keys:** an arrow press turns it (taken before the toolkit, which
+//!   never sees arrow presses; their releases reach it and do nothing).
 //! - **`run comet [--seed N] [--step]`:** a seed plays the same sky every
 //!   time (also after `Restart`; without one, each game's seed is the clock);
-//!   `--step` starts it stepping. Anything else is an ERROR naming it and
-//!   the usage, then exit 2.
+//!   `--step` starts it stepping. An argument it doesn't take (an unknown
+//!   one, a flag given twice, `--seed` without a number or with a bad
+//!   seed, one that isn't UTF-8) is one ERROR naming it and the usage, then
+//!   exit 2; any other failure to read the arguments is exit 1.
 
 #![no_std]
 
@@ -256,9 +258,10 @@ impl App for Comet {
         for e in events {
             match *e {
                 UiEvent::Pressed(w) if w == self.restart => self.restart(),
-                // Over, Play and Step change nothing (they are disabled
-                // then, but a press already queued may come): it waits for
-                // Restart.
+                // Over, Play and Step change nothing: they are disabled
+                // then (`ui invoke` refuses a disabled button before the
+                // app sees it; this guards the rule anyway), and it waits
+                // for Restart.
                 _ if self.game.state() != State::Flying => {}
                 UiEvent::Pressed(w) if w == self.play => {
                     self.stepping = false;

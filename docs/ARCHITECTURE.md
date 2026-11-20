@@ -3898,8 +3898,10 @@ SSE); #197 checks the results' bits.
   sees a turn arrive) are `fixed_label`s whose texts (lumen-snake's label
   functions) all fit their width in the UI font, a host test measures;
   arrow presses are taken before the toolkit. Arguments it doesn't take (an
-  unknown one, a flag twice, `--seed` without a number, an argument that
-  isn't UTF-8) are one ERROR naming them, then exit 2.
+  unknown one, a flag twice, `--seed` without a number or with a bad seed,
+  an argument that isn't UTF-8) are one ERROR naming them, then exit 2; any
+  other failure to read the arguments is exit 1. Launched without `--step`
+  it flies from the start, and its Restarts fly too.
 - **The launcher** (#157's taskbar) lists the bundled apps whose
   manifest lists `desktop`, never the test apps, after its four demo
   items, by name, and starts one through `run`'s path without waiting
