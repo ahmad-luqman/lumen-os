@@ -23,7 +23,7 @@ KERNEL_SRCS := $(shell find kernel crates apps -name '*.rs' -o -name '*.toml' -o
 # their recipes must never run concurrently (`make -j`).
 .NOTPARALLEL:
 
-.PHONY: help deps build apps iso run debug test test-host test-scenarios audit lint fmt fmt-check status status-check census golden clean
+.PHONY: help deps build app apps iso run debug test test-host test-scenarios audit lint fmt fmt-check status status-check census golden clean
 
 help: ## Show this help
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-15s %s\n", $$1, $$2}'
@@ -47,7 +47,7 @@ build: apps $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest ## Build the apps 
 
 # Apps (M5; the layout: ARCHITECTURE section 8, "Building and bundling"):
 # apps/ is its own workspace, and its crates that build a `cdylib` are WASM
-# modules (libraries the apps share, `testkit`, are skipped). `app_out`
+# modules (libraries the apps share, `lumen-app` and `testkit`, are skipped). `app_out`
 # says where each goes, and APP_OUT and APP_COPIES both come from it.
 # Cargo runs inside apps/, whose .cargo/config.toml sets the target and the
 # output directory (target-apps/; cargo names a module after its crate, `-`
@@ -61,6 +61,10 @@ APP_CRATES := $(patsubst apps/%/Cargo.toml,%,$(shell grep -l '"cdylib"' apps/*/C
 app_out     = $(if $(filter test-%,$(1)),$(BUILD)/apps/tests/$(patsubst test-%,%,$(1)).wasm,$(BUILD)/apps/$(1).wasm)
 APP_OUT    := $(foreach c,$(APP_CRATES),$(call app_out,$(c)))
 APP_COPIES := $(foreach c,$(APP_CRATES),$(subst -,_,$(c)).wasm:$(call app_out,$(c)))
+
+# `make app NAME=foo`: apps/foo, a copy of apps/template (tools/new-app.sh).
+app: ## Make a new app copied from apps/template: make app NAME=foo makes apps/foo
+	tools/new-app.sh "$(NAME)"
 
 apps: ## Build the WASM apps into build/apps/ (the test apps into build/apps/tests/)
 	cd apps && cargo build --release

@@ -66,13 +66,21 @@ pub fn log_line(text: &str) -> LogText {
     cut(text, LOG_BYTES)
 }
 
-/// [`log_line`] cut at `cap` bytes instead.
-pub fn cut(text: &str, cap: usize) -> LogText {
+/// `text`'s first `cap` bytes at most, cut on a char boundary (what an
+/// app passes so a long text is cut, not refused).
+pub fn prefix(text: &str, cap: usize) -> &str {
     let mut end = text.len().min(cap);
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    LogText(text[..end].chars().map(|c| if unsafe_in_a_line(c) { char::REPLACEMENT_CHARACTER } else { c }).collect())
+    &text[..end]
+}
+
+/// [`log_line`] cut at `cap` bytes instead.
+pub fn cut(text: &str, cap: usize) -> LogText {
+    LogText(
+        prefix(text, cap).chars().map(|c| if unsafe_in_a_line(c) { char::REPLACEMENT_CHARACTER } else { c }).collect(),
+    )
 }
 
 /// [`log_line`] for bytes that may not be UTF-8 (`panic`'s message: the app

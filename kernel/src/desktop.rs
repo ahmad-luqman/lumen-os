@@ -1167,6 +1167,13 @@ impl WindowHandle {
         Waker(Arc::downgrade(&self.win))
     }
 
+    /// The window's title, as the title bar and `windows` show it (for
+    /// the tests).
+    #[cfg(feature = "ktest")]
+    pub fn title(&self) -> &str {
+        &self.win.title
+    }
+
     /// Whether a [`Waker`] marks the window busy (for the tests).
     #[cfg(feature = "ktest")]
     pub fn is_busy(&self) -> bool {

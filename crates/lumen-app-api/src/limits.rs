@@ -72,6 +72,11 @@ pub const BYTE_FUEL: u64 = 1;
 pub const PIXEL_FUEL: u64 = 1;
 /// Fuel per trace event copied.
 pub const EVENT_FUEL: u64 = 16;
+/// Fuel per character of each layout pass over a text (`text_measure`
+/// makes one, `text_draw` two): about what laying a character out costs
+/// next to a wasm instruction (measured in #218's review on TCG: ~170 a
+/// character for a measure, ~430 for a draw's two passes).
+pub const TEXT_CHAR_FUEL: u64 = 256;
 /// Windows per app.
 pub const WINDOWS: usize = 1;
 /// `Rect`s in one `window_commit`.

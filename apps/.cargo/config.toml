@@ -9,7 +9,9 @@ target = "wasm32-unknown-unknown"
 target-dir = "../target-apps"
 
 # Every app's memory is fixed (ARCHITECTURE section 8): its initial size is
-# its maximum, 2 MiB (wasm-ld's 1 MiB stack, the data, testkit's heap). One
-# setting for every module here; #206's template may give an app its own.
+# its maximum, 2 MiB (wasm-ld's 1 MiB stack, the data, the heap). The
+# default for every module here; an app sets its own in its build.rs
+# (apps/template's: a build script's link arguments come after these, and
+# wasm-ld takes the last).
 [target.wasm32-unknown-unknown]
 rustflags = ["-C", "link-arg=--initial-memory=2097152", "-C", "link-arg=--max-memory=2097152"]

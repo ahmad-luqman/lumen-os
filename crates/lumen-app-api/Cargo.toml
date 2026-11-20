@@ -1,6 +1,6 @@
 [package]
 name = "lumen-app-api"
-description = "no_std types of Lumen's WASM app interface (M5): error codes, capability kinds and grants, the manifest parser, the limits and their worst case, the handle table, guest ranges, log text, end reasons and the trace read's layouts; shared by the kernel and the apps (host-tested)"
+description = "no_std types of Lumen's WASM app interface (M5): error codes, capability kinds and grants, the manifest parser, the limits and their worst case, the handle table, guest ranges, log text, end reasons, the trace read's layouts, the window calls' fixed layouts and the Event wire type (postcard); shared by the kernel and the apps (host-tested)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,3 +10,15 @@ workspace = true
 
 [dependencies]
 lumen-trace.workspace = true
+# The kernel's types the wire types convert from and to (ARCHITECTURE
+# section 8, "Wire formats"), so those crates need no serde.
+lumen-input.workspace = true
+lumen-ui.workspace = true
+lumen-wm.workspace = true
+# The wire format (section 8): postcard over serde-derived types.
+postcard.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+# pc-keyboard's modifier state, every bit of it, for the `mods` byte's test.
+pc-keyboard.workspace = true

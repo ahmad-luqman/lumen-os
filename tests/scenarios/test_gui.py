@@ -610,7 +610,7 @@ def test_desktop_screenshot_matches_screendump(boot, artifacts):
 TERM_PAD, TERM_CELL_W, TERM_CELL_H = 4, 7, 16
 TERM_TEXT_RGB = (0xE6, 0xE6, 0xE6)
 TERM_BG_RGB = (0x0F, 0x14, 0x20)
-TITLE_H = 24
+TITLE_H = gui.TITLE_H
 NO_CANVAS = "life: a terminal window has no canvas: run it on a virtual terminal (Alt+F1)"
 TERM_THREADS = ("terminal", "term-shell")
 
@@ -1197,7 +1197,9 @@ def test_a_toolkit_window_repaints_in_a_new_theme(boot):
 
 # -- the desktop shell (#157) ---------------------------------------------------
 
-LAUNCHER_ITEMS = ["Terminal", "Mandelbrot", "Life", "Counter"]
+# The bundled apps whose manifest grants `desktop` (#206: never a test app).
+DESKTOP_APPS = ["template"]
+LAUNCHER_ITEMS = ["Terminal", "Mandelbrot", "Life", "Counter", *DESKTOP_APPS]
 # kernel/src/demo.rs `mandelbrot_owner`'s line.
 MANDEL_WINDOW = re.compile(
     r"INFO  demo: mandelbrot window (\d+): (\d+) CPUs? in \d+ ms, rows by CPU:((?: cpu\d+=\d+)+)\n"
@@ -1412,6 +1414,38 @@ def test_mandelbrot_window_golden(boot, artifacts, golden_dir):
         m, "its owner gone", lambda: thread_names(m), lambda t: "desktop-mandelbrot" not in t
     )
     assert "Mandelbrot" not in taskbar_buttons(m)
+
+
+def test_launcher_lists_desktop_apps_only(boot):
+    # The launcher's items: the demos, then the bundled apps granting
+    # `desktop`, never a test app (`window` grants it too). Choosing one
+    # starts it through `run`'s path: `apps` lists it and its window opens;
+    # its close ends it.
+    m = boot_shells(boot)
+    gui.start_desktop(m)
+    launcher = gui.node(gui.taskbar(m), "menu", "Launcher")
+    assert gui.invoke(m, launcher["id"], "press").row is not None
+    items = [r["name"] for r in gui.taskbar(m) if r["role"] == "menuitem"]
+    assert items == LAUNCHER_ITEMS, items
+    entry = gui.node(gui.taskbar(m), "menuitem", "template")
+    got = gui.invoke(m, entry["id"], "press")
+    assert got.message == f"ui invoke: ran; node {entry['id']} is gone", got
+    listed = gui.wait_for(
+        m,
+        "apps listing template",
+        lambda: gui.parse_records(run(m, "apps"), "id"),
+        lambda rows: any(r["name"] == "template" for r in rows),
+    )
+    assert [r["name"] for r in listed] == ["template"], listed
+    gui.wait_window(m, "template")
+    gui.close_window(m, "template")
+    gui.wait_for(
+        m,
+        "template ended",
+        lambda: gui.parse_records(run(m, "apps"), "id"),
+        lambda rows: not rows,
+        30,
+    )
 
 
 def test_life_window_runs_unfocused_and_stops_when_closed(boot):

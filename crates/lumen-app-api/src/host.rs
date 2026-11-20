@@ -1,8 +1,8 @@
 //! The functions a module may import, all from module [`MODULE`], with
 //! their signatures: the kernel defines exactly these and refuses a module
 //! importing anything else (another module, an unknown name, a known name
-//! with another signature) at load, naming the import. The window and text
-//! calls join with #206.
+//! with another signature) at load, naming the import. `window_publish` and
+//! `window_answer` join with #207.
 
 /// The one module apps import from.
 pub const MODULE: &str = "lumen";
@@ -44,6 +44,13 @@ pub const FUNCTIONS: &[HostFn] = &[
     f("time_now", &[I32], &[I64]),
     f("time_wall", &[I32], &[I64]),
     f("time_sleep", &[I32, I64], &[I32]),
+    f("window_open", &[I32, I32, I32, I32, I32], &[I32]),
+    f("window_commit", &[I32, I32, I32, I32], &[I32]),
+    f("window_next_event", &[I32, I32, I32], &[I32]),
+    f("window_wait", &[I32, I64, I32], &[I32]),
+    f("text_line_height", &[I32, I32], &[I32]),
+    f("text_measure", &[I32, I32, I32, I32], &[I32]),
+    f("text_draw", &[I32, I32, I32, I32, I32], &[I32]),
     f("trace_cpus", &[I32], &[I32]),
     f("trace_read", &[I32, I32, I32, I64, I32, I32], &[I32]),
 ];
@@ -63,7 +70,7 @@ mod tests {
             assert!(FUNCTIONS[..i].iter().all(|g| g.name != f.name), "{} twice", f.name);
             assert_eq!(lookup(f.name), Some(f));
         }
-        assert_eq!(lookup("window_open"), None);
+        assert_eq!(lookup("window_publish"), None);
         assert_eq!(lookup(""), None);
     }
 
@@ -81,6 +88,13 @@ mod tests {
             ("time_now", &[I32], &[I64]),
             ("time_wall", &[I32], &[I64]),
             ("time_sleep", &[I32, I64], &[I32]),
+            ("window_open", &[I32, I32, I32, I32, I32], &[I32]),
+            ("window_commit", &[I32, I32, I32, I32], &[I32]),
+            ("window_next_event", &[I32, I32, I32], &[I32]),
+            ("window_wait", &[I32, I64, I32], &[I32]),
+            ("text_line_height", &[I32, I32], &[I32]),
+            ("text_measure", &[I32, I32, I32, I32], &[I32]),
+            ("text_draw", &[I32, I32, I32, I32, I32], &[I32]),
             ("trace_cpus", &[I32], &[I32]),
             ("trace_read", &[I32, I32, I32, I64, I32, I32], &[I32]),
         ];

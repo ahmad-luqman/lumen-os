@@ -2,7 +2,11 @@
 //! a kill ending the app at a host call's entry however the call is made,
 //! fuel, the code, memory and value-stack charges against the heap's
 //! high-water mark, `trace_read`'s edges, `kill`'s lines, `launch`'s
-//! refusals and the reaper.
+//! refusals and the reaper; and #206's: the close grace's slice trigger, a
+//! kill waking an app's window wait, the window calls' fuel (pixels,
+//! glyphs, characters), a title capped before its copy and sanitised, the
+//! launcher's list and every embedded app passing `precheck` (window calls
+//! on `Desktop::without_screen`, through `AppCtx`'s ktest seam).
 //!
 //! The charge tests read the global heap's counters: they assume nothing
 //! else allocates meanwhile (ktests run one at a time, no app runs, and
@@ -12,6 +16,7 @@
 use super::modules::{self, leb128};
 use super::runtime::{self, AppState, Phase};
 use super::{BUNDLED, TEST_APPS, host};
+use crate::desktop::{Animating, Wait};
 use crate::mm::heap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -20,9 +25,11 @@ use alloc::vec::Vec;
 use core::hint::black_box;
 use lumen_app_api::end::{EndReason, Outcome};
 use lumen_app_api::host::{FUNCTIONS, MODULE, Ty};
+use lumen_app_api::layout::{Canvas, Rect as LRect, TextDraw};
 use lumen_app_api::limits::{
-    APP_OVERHEAD, BYTE_FUEL, CALL_FUEL, CODE_FACTOR, EVENT_FUEL, LOG_FUEL, MEMORY_PAGES, MODULE_BYTES, PAGE_BYTES,
-    SLICE_FUEL, STORE_BYTES, TABLE_ELEMENTS, VALUE_STACK_BYTES,
+    APP_OVERHEAD, BYTE_FUEL, CALL_FUEL, CLOSE_GRACE_SLICES, CODE_FACTOR, EVENT_FUEL, LOG_FUEL, MEMORY_PAGES,
+    MODULE_BYTES, PAGE_BYTES, PIXEL_FUEL, SLICE_FUEL, STORE_BYTES, SURFACES, TABLE_ELEMENTS, TEXT_CHAR_FUEL,
+    VALUE_STACK_BYTES,
 };
 use lumen_app_api::{Error, Grants, manifest, text};
 use wasmi::{Engine, Linker, Module, Store};
@@ -225,6 +232,29 @@ fn i32_const(n: i32) -> Vec<u8> {
     }
 }
 
+/// `call f` (a function index below 64: one byte).
+fn call(f: u8) -> Vec<u8> {
+    debug_assert!(f < 64);
+    vec![0x10, f]
+}
+
+/// `local.get i`, `local.set i` (an index below 64).
+fn local_get(i: u8) -> Vec<u8> {
+    vec![0x20, i]
+}
+
+fn local_set(i: u8) -> Vec<u8> {
+    vec![0x21, i]
+}
+
+/// `drop`.
+const DROP: u8 = 0x1a;
+
+/// `i32.const` of each of `ns`, in order: a call's arguments.
+fn args(ns: &[i32]) -> Vec<u8> {
+    ns.iter().flat_map(|&n| i32_const(n)).collect()
+}
+
 /// What `run` does with a module before its thread runs it, then the load
 /// itself (on this thread): the reason it is refused, if it is.
 fn try_load(bytes: &[u8]) -> Result<(), String> {
@@ -342,8 +372,10 @@ crate::ktest!(
         let mut wrong_type = Spec::importing(&["args_len"]);
         wrong_type.types = vec![host_type(&[Ty::I32], &[Ty::I32])];
         crate::kassert!(!links(&wrong_type.bytes()));
+        // (A name no host function has: its type is `args_len`'s, so only
+        // the name can refuse it.)
         let mut unknown = Spec::importing(&["args_len"]);
-        unknown.imports = vec![func_import(MODULE, "window_open", 2)];
+        unknown.imports = vec![func_import(MODULE, "nope", 2)];
         crate::kassert!(!links(&unknown.bytes()));
         Ok(())
     }
@@ -937,6 +969,236 @@ crate::ktest!(
         crate::kassert!(runtime::reaper_running());
         let (a, b) = (first.state.id, second.state.id);
         crate::kassert!(wait_for(10_000, || !runtime::listed(a) && !runtime::listed(b)));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn the_close_grace_ends_an_app_at_its_slice_ends() {
+        let state = test_state();
+        let (mut store, _) = load_as(&Spec::default().bytes(), &state, Grants::log())?;
+        runtime::begin_slice(&mut store, 0).map_err(|_| "no slice")?;
+        // Not given `Close`: slice ends don't count.
+        for _ in 0..2 * CLOSE_GRACE_SLICES {
+            crate::kassert!(runtime::end_slice(&mut store).is_ok());
+        }
+        // Given it (`window_next_event` handing it over): the grace's last
+        // slice end ends the app.
+        store.data_mut().given_close();
+        for _ in 1..CLOSE_GRACE_SLICES {
+            crate::kassert!(runtime::end_slice(&mut store).is_ok());
+        }
+        crate::kassert_eq!(runtime::end_slice(&mut store), Err(EndReason::CloseGrace));
+        // A kill outranks it: checked first at the same slice end.
+        let state = test_state();
+        let (mut store, _) = load_as(&Spec::default().bytes(), &state, Grants::log())?;
+        store.data_mut().given_close();
+        for _ in 1..CLOSE_GRACE_SLICES {
+            crate::kassert!(runtime::end_slice(&mut store).is_ok());
+        }
+        state.ask_kill();
+        crate::kassert_eq!(runtime::end_slice(&mut store), Err(EndReason::Killed));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_kill_wakes_the_app_s_window_wait() {
+        let desktop = crate::desktop::Desktop::without_screen();
+        let mut window = desktop.open_window("app", 16, 16).map_err(|_| "no window")?;
+        let state = test_state();
+        state.set_window(Some(window.waker()));
+        // Its first event (the theme) taken: nothing more to read.
+        while window.next_event().is_some() {}
+        // The kill comes before the wait: the waker's poke is sticky, so the
+        // wait ends at once, woken, with no event (a kill while it is blocked
+        // wakes it the same way: test_kill_wakes_an_app_waiting_on_its_window),
+        // and `window_wait` then sees the kill flag.
+        state.ask_kill();
+        let woke = window.wait_event_until(None, Animating::No);
+        crate::kassert!(matches!(woke, Wait::Woken));
+        crate::kassert!(state.kill_asked());
+        // Without a window, a kill wakes nothing more (and doesn't fail).
+        state.set_window(None);
+        state.ask_kill();
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn every_bundled_app_passes_precheck() {
+        // An app grown past MODULE_BYTES, or with a bad manifest, fails here
+        // rather than silently leaving the launcher (which warns).
+        for app in BUNDLED.iter().chain(TEST_APPS) {
+            if let Err(why) = runtime::precheck(app.module) {
+                crate::ktest::diag(format_args!("{}: {why}", app.name));
+                return Err("an embedded app fails precheck");
+            }
+        }
+        crate::kassert!(!BUNDLED.is_empty());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn the_launcher_lists_the_apps_granting_desktop() {
+        // Over the test apps: exactly those whose manifest grants
+        // `desktop` (abuse's `caps=time,desktop,trace`, window's
+        // `caps=desktop`), none of the others.
+        crate::kassert_eq!(runtime::desktop_apps_in(TEST_APPS), vec!["abuse", "window"]);
+        crate::kassert!(!runtime::desktop_apps().iter().any(|n| TEST_APPS.iter().any(|t| t.name == *n)));
+        crate::kassert!(runtime::desktop_apps().contains(&"template"));
+        Ok(())
+    }
+);
+
+/// Bytes put into a test module's memory before it runs.
+fn poke(store: &mut Store<runtime::AppCtx>, at: usize, bytes: &[u8]) {
+    let memory = store.data().memory.expect("a memory");
+    memory.data_mut(store)[at..at + bytes.len()].copy_from_slice(bytes);
+}
+
+/// `lumen_main` of a module importing `handle_find`, `window_open`,
+/// `window_commit`, `text_draw` and `text_measure` (functions 0 to 4): it
+/// opens a 16 × 16 window titled by
+/// the byte at 128, then runs `then` (with the desktop handle in local 0
+/// and the window's in local 1), and returns the window's handle.
+fn window_module(then: &[u8]) -> Vec<u8> {
+    let body = [
+        args(&[3]), // local 0 = handle_find(Desktop)
+        call(0),
+        local_set(0),
+        local_get(0), // local 1 = window_open(desk, title at 128, 1 byte, 16 × 16)
+        args(&[128, 1, 16, 16]),
+        call(1),
+        local_set(1),
+        then.to_vec(),
+        local_get(1), // return it
+    ]
+    .concat();
+    let spec = Spec::importing(&["handle_find", "window_open", "window_commit", "text_draw", "text_measure"]);
+    Spec { body, locals: vec![0x01, 0x02, 0x7f], ..spec }.bytes()
+}
+
+/// Run a window module on a desktop with no screen, its memory laid out
+/// for [`window_module`]: a 16 × 16 canvas at 1024 (its layout at 0), one
+/// rectangle over it at 16, a `TextDraw` at 64 (`draw`), the title at 128
+/// and `text` at 256. What `lumen_main` returned, the fuel it used (debt
+/// included) and the glyphs its cache rasterized.
+fn run_window_module(bytes: &[u8], draw: TextDraw, text: &[u8]) -> Result<(i32, u64, u64), &'static str> {
+    let grants = Grants::log().with(lumen_app_api::Grant::Desktop);
+    let (mut store, main) = load_as(bytes, &test_state(), grants)?;
+    store.data_mut().desktop = Some(crate::desktop::Desktop::without_screen());
+    poke(&mut store, 0, &Canvas { ptr: 1024, stride: 16, w: 16, h: 16 }.encode());
+    poke(&mut store, 16, &LRect::new(0, 0, 16, 16).encode());
+    poke(&mut store, 64, &draw.encode());
+    poke(&mut store, 128, b"t");
+    poke(&mut store, 256, text);
+    store.set_fuel(SLICE_FUEL).map_err(|_| "no fuel")?;
+    let result = main.call(&mut store, ()).map_err(|_| "lumen_main trapped")?;
+    let used = SLICE_FUEL - store.get_fuel().map_err(|_| "no fuel")? + store.data().debt();
+    Ok((result, used, store.data().glyphs_rasterized()))
+}
+
+crate::ktest!(
+    fn window_calls_charge_their_fuel() {
+        let pixels = 16 * 16;
+        let none = TextDraw::default();
+        // window_open: its call, and its three surfaces' pixels.
+        let (win, used, _) = run_window_module(&window_module(&[]), none, &[])?;
+        crate::ktest::diag(format_args!("window_open: handle {win}, {used} fuel"));
+        crate::kassert!(win > 0);
+        crate::kassert!(used >= 2 * CALL_FUEL + SURFACES * pixels * PIXEL_FUEL);
+        // window_commit of the whole canvas: its pixels too.
+        // window_commit(window, canvas at 0, rects at 16, 1)
+        let commit = [local_get(1), args(&[0, 16, 1]), call(2), vec![DROP]].concat();
+        let (win, used, _) = run_window_module(&window_module(&commit), none, &[])?;
+        crate::ktest::diag(format_args!("window_commit: {used} fuel"));
+        crate::kassert!(win > 0);
+        crate::kassert!(used >= 3 * CALL_FUEL + (SURFACES + 1) * pixels * PIXEL_FUEL);
+        // text_draw of 94 characters (93 different glyphs: `!` becomes a
+        // second `W`) at px 32 into the 16 × 16 canvas,
+        // from a cold cache: only the glyphs whose box reaches the clip (the
+        // first, a `W`, and perhaps its neighbour) are rasterized, each
+        // charged px² pixels on top of the clip's.
+        let text: Vec<u8> = (b'!'..=b'~').collect();
+        let mut text = text;
+        text[0] = b'W';
+        let draw = TextDraw { x: 0, y: 0, px: 32, rgb: 0xffffff, clip: LRect::new(0, 0, 16, 16) };
+        // text_draw(desk, canvas at 0, args at 64, text at 256, its length)
+        let td = [local_get(0), args(&[0, 64, 256, text.len() as i32]), call(3), vec![DROP]].concat();
+        let (win, used, glyphs) = run_window_module(&window_module(&td), draw, &text)?;
+        crate::ktest::diag(format_args!("text_draw: {glyphs} glyphs rasterized, {used} fuel"));
+        crate::kassert!(win > 0);
+        crate::kassert!((1..10).contains(&glyphs));
+        let passes = 2 * text.len() as u64 * TEXT_CHAR_FUEL;
+        crate::kassert!(
+            used >= 3 * CALL_FUEL + passes + SURFACES * pixels * PIXEL_FUEL + (pixels + glyphs * 32 * 32) * PIXEL_FUEL
+        );
+        // Layout is paid by the character, whatever reaches the clip:
+        // text_measure of 1,024 characters (one pass), and a text_draw of
+        // them with nothing reaching the clip (two passes, no glyph).
+        let long = vec![b'a'; 1024];
+        // text_measure(desk, px 16, text at 256, 1024)
+        let measure = [local_get(0), args(&[16, 256, 1024]), call(4), vec![DROP]].concat();
+        let (win, used, glyphs) = run_window_module(&window_module(&measure), none, &long)?;
+        crate::ktest::diag(format_args!("text_measure of 1024: {used} fuel"));
+        crate::kassert!(win > 0 && glyphs == 0);
+        crate::kassert!(used >= 3 * CALL_FUEL + SURFACES * pixels * PIXEL_FUEL + 1024 * TEXT_CHAR_FUEL);
+        let away = TextDraw { x: 0, y: -1000, px: 16, rgb: 0xffffff, clip: LRect::new(0, 0, 16, 16) };
+        let td = [local_get(0), args(&[0, 64, 256, 1024]), call(3), vec![DROP]].concat();
+        let (win, used, glyphs) = run_window_module(&window_module(&td), away, &long)?;
+        crate::ktest::diag(format_args!("text_draw of 1024, none in the clip: {glyphs} glyphs, {used} fuel"));
+        crate::kassert!(win > 0 && glyphs == 0);
+        crate::kassert!(
+            used >= 3 * CALL_FUEL + SURFACES * pixels * PIXEL_FUEL + 2 * 1024 * TEXT_CHAR_FUEL + pixels * PIXEL_FUEL
+        );
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_title_is_capped_before_it_is_copied() {
+        // window_open with a 60,000-byte title (inside the memory): refused
+        // past TITLE_BYTES before a byte is copied, so the heap's peak
+        // doesn't move at all.
+        // window_open(handle_find(Desktop), title at 0, 60,000 bytes, 16 × 16)
+        let body = [args(&[3]), call(0), args(&[0, 60_000, 16, 16]), call(1)].concat();
+        let bytes = Spec { body, ..Spec::importing(&["handle_find", "window_open"]) }.bytes();
+        let grants = Grants::log().with(lumen_app_api::Grant::Desktop);
+        let (mut store, main) = load_as(&bytes, &test_state(), grants)?;
+        store.set_fuel(SLICE_FUEL).map_err(|_| "no fuel")?;
+        // A first call allocates the value stack (VALUE_STACK_BYTES): the
+        // second is measured.
+        main.call(&mut store, ()).map_err(|_| "lumen_main trapped")?;
+        store.set_fuel(SLICE_FUEL).map_err(|_| "no fuel")?;
+        let before = heap::stats().used;
+        heap::reset_peak();
+        let result = main.call(&mut store, ()).map_err(|_| "lumen_main trapped")?;
+        let rise = heap::peak() - before;
+        crate::ktest::diag(format_args!("refused: {result}, the peak rose {rise} bytes"));
+        crate::kassert_eq!(result, Error::BadArgument.returned());
+        crate::kassert_eq!(rise, 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_window_title_is_sanitised() {
+        // window_open(desk, 128, 4, 16, 16) with the title `a ESC b LF` at
+        // 128: each control character shown as U+FFFD, on the desktop's own
+        // copy (the shell's table printing would hide a missed one).
+        let body = [args(&[3]), call(0), args(&[128, 4, 16, 16]), call(1)].concat();
+        let bytes = Spec { body, ..Spec::importing(&["handle_find", "window_open"]) }.bytes();
+        let grants = Grants::log().with(lumen_app_api::Grant::Desktop);
+        let (mut store, main) = load_as(&bytes, &test_state(), grants)?;
+        store.data_mut().desktop = Some(crate::desktop::Desktop::without_screen());
+        poke(&mut store, 128, b"a\x1bb\n");
+        store.set_fuel(SLICE_FUEL).map_err(|_| "no fuel")?;
+        let h = main.call(&mut store, ()).map_err(|_| "lumen_main trapped")?;
+        crate::kassert!(h > 0);
+        let title = alloc::string::String::from(store.data_mut().window_mut(h).map_err(|_| "no window")?.title());
+        crate::kassert_eq!(title.as_str(), "a\u{fffd}b\u{fffd}");
         Ok(())
     }
 );

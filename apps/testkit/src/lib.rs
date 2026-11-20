@@ -1,5 +1,5 @@
 //! What Lumen's test apps share (#199): the `lumen` host functions as
-//! imports, a log helper, [`manifest!`], a panic handler that reports the
+//! imports (the window and text calls too, #206), a log helper, [`manifest!`], a panic handler that reports the
 //! message through `panic`, and a bump allocator in the app's fixed memory.
 //! Not the SDK (that is #206's `lumen-app`): just enough for the runtime's
 //! tests to call every host function, right and wrong.
@@ -16,41 +16,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 pub use lumen_app_api as api;
 pub use lumen_app_api::{Error, Grant, LogLevel};
 
-/// The `lumen` host functions (ARCHITECTURE section 8), as the module
-/// imports them. Pointers and lengths are wasm `i32`s. The host checks
-/// every range against the app's memory before it touches a byte, so the
-/// calls that only read the app's memory (or none) are safe: a wrong
-/// pointer is an error code (or, for `panic`, which ends the app anyway,
-/// the message `<a bad pointer>`). The two that write into it are
-/// `unsafe`.
-pub mod host {
-    #[link(wasm_import_module = "lumen")]
-    unsafe extern "C" {
-        pub safe fn handle_find(kind: i32) -> i32;
-        pub safe fn handle_close(h: i32) -> i32;
-        pub safe fn args_len() -> i32;
-        /// Writes the arguments into `[buf, buf + len)`.
-        ///
-        /// # Safety
-        ///
-        /// The caller owns that range (a buffer it may write), whatever the
-        /// call returns: Rust knows nothing of the host's writes.
-        pub unsafe fn args_read(buf: i32, len: i32) -> i32;
-        pub safe fn exit(code: i32) -> !;
-        pub safe fn panic(msg: i32, len: i32) -> !;
-        pub safe fn log(h: i32, level: i32, msg: i32, len: i32) -> i32;
-        pub safe fn time_now(h: i32) -> i64;
-        pub safe fn time_wall(h: i32) -> i64;
-        pub safe fn time_sleep(h: i32, ns: i64) -> i32;
-        pub safe fn trace_cpus(h: i32) -> i32;
-        /// Writes the trace header and events into `[buf, buf + len)`.
-        ///
-        /// # Safety
-        ///
-        /// As [`args_read`]: the caller owns that range.
-        pub unsafe fn trace_read(h: i32, stream: i32, cpu: i32, since: i64, buf: i32, len: i32) -> i32;
-    }
-}
+/// The `lumen` host functions, as the module imports them (declared once,
+/// in `lumen-app-api`).
+pub use lumen_app_api::sys as host;
+pub use lumen_app_api::sys::ptr;
 
 /// The app's manifest: `manifest!(b"caps=time")` puts the bytes in a
 /// `lumen.manifest` custom section.
@@ -61,11 +30,6 @@ macro_rules! manifest {
         #[used]
         static LUMEN_MANIFEST: [u8; $caps.len()] = *$caps;
     };
-}
-
-/// A pointer as the `i32` a host function takes.
-pub fn ptr<T: ?Sized>(p: *const T) -> i32 {
-    p as *const u8 as usize as i32
 }
 
 /// The linear memory's size in bytes.

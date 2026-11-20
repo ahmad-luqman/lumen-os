@@ -9,7 +9,9 @@
 //! taken before an app's own lock, never after. A wait queue's condition
 //! may take an app's `life` (nobody wakes while holding it).
 
+use super::window::AppWindow;
 use super::{App, BUNDLED, TEST_APPS, host};
+use crate::desktop::Waker;
 use crate::sched::{self, JoinHandle, WaitQueue};
 use crate::shell::Ctx;
 use crate::shell::sysinfo::{int, text};
@@ -39,11 +41,10 @@ use wasmi::{
     StoreLimitsBuilder, TypedFunc, TypedResumableCall, ValType,
 };
 
-/// What a handle names (the `Window` kind comes with #206; not `Copy`, as a
-/// window won't be).
-#[derive(Debug)]
+/// What a handle names: a grant, or the app's window.
 pub(super) enum Obj {
     Grant(Grant),
+    Window(alloc::boxed::Box<AppWindow>),
 }
 
 /// The signal a host function raises when the app must stop (`exit`,
@@ -82,10 +83,17 @@ pub(super) struct AppCtx {
     /// Fuel charged past what a slice had left (a saturated charge),
     /// taken from the next slice.
     debt: u64,
-    /// The close grace, once the app is given `Close` (#206 gives it).
+    /// The close grace, once the app is given `Close`
+    /// (`window_next_event`).
     close_grace: CloseGrace,
     /// Why the app is stopping, once a host function said so.
     stopping: Option<EndReason>,
+    /// Its glyph cache over the UI font, made at its first text call.
+    text: Option<crate::font::Text>,
+    /// ktest seam: the desktop `window_open` opens on (the live one
+    /// otherwise), `Desktop::without_screen` in the ktests.
+    #[cfg(feature = "ktest")]
+    pub(super) desktop: Option<crate::desktop::Desktop>,
 }
 
 impl AppCtx {
@@ -102,10 +110,16 @@ impl AppCtx {
     }
 
     /// `handle_close`: a closed grant is gone for the rest of the app's
-    /// life.
+    /// life; closing the window destroys it (and ends any close grace).
     pub(super) fn close(&mut self, h: i32) -> Result<(), Error> {
-        let Obj::Grant(g) = self.handles.remove(h)?;
-        self.grants = self.grants.without(g);
+        match self.handles.remove(h)? {
+            Obj::Grant(g) => self.grants = self.grants.without(g),
+            Obj::Window(w) => {
+                self.close_grace.closed();
+                self.state.set_window(None);
+                drop(w);
+            }
+        }
         Ok(())
     }
 
@@ -113,8 +127,80 @@ impl AppCtx {
     pub(super) fn grant_of(&self, h: i32, kind: Kind) -> Result<(), Error> {
         match self.handles.get(h)? {
             Obj::Grant(g) if g.kind() == kind => Ok(()),
+            Obj::Grant(_) | Obj::Window(_) => Err(Error::WrongKind),
+        }
+    }
+
+    /// The window handle `h` names (the handle, then its kind).
+    pub(super) fn window_mut(&mut self, h: i32) -> Result<&mut AppWindow, Error> {
+        match self.handles.get_mut(h)? {
+            Obj::Window(w) => Ok(w),
             Obj::Grant(_) => Err(Error::WrongKind),
         }
+    }
+
+    /// Open a window for the app: on the live desktop, or in the ktests on
+    /// the one their seam set (`desktop`).
+    pub(super) fn open_window(
+        &self,
+        title: &str,
+        w: u32,
+        h: u32,
+    ) -> Result<crate::desktop::WindowHandle, crate::desktop::OpenError> {
+        #[cfg(feature = "ktest")]
+        if let Some(d) = &self.desktop {
+            return d.open_window(title, w, h);
+        }
+        crate::desktop::open_window(title, w, h)
+    }
+
+    /// Whether the app holds a window (it may hold `WINDOWS`, one: the
+    /// only window [`AppCtx::text_and_window`] can find).
+    pub(super) fn has_window(&self) -> bool {
+        self.handles.find(|o| matches!(o, Obj::Window(_))).is_some()
+    }
+
+    /// Hand the app its new window: its handle (`Limit` once the app's
+    /// handles are used up, the window then closed), and `kill` can wake
+    /// it.
+    pub(super) fn add_window(&mut self, window: AppWindow) -> Result<i32, Error> {
+        let waker = window.waker();
+        let h = self.handles.insert(Obj::Window(alloc::boxed::Box::new(window)))?;
+        self.state.set_window(Some(waker));
+        Ok(h)
+    }
+
+    /// The app was given `Close`: its close grace runs (counted at slice
+    /// ends from now on, until it closes its window).
+    pub(super) fn given_close(&mut self) {
+        self.close_grace.given();
+    }
+
+    /// Its glyph cache (made now if this is its first text call) and its
+    /// window, if it has one; `Unavailable` if the UI font didn't load.
+    pub(super) fn text_and_window(&mut self) -> Result<(&mut crate::font::Text, Option<&mut AppWindow>), Error> {
+        const _: () = assert!(lumen_app_api::limits::WINDOWS == 1, "text_draw draws for the app's one window");
+        if self.text.is_none() {
+            self.text = Some(crate::font::Text::new().map_err(|_| Error::Unavailable)?);
+        }
+        let text = self.text.as_mut().ok_or(Error::Unavailable)?;
+        let window = self.handles.iter_mut().find_map(|o| match o {
+            Obj::Window(w) => Some(&mut **w),
+            Obj::Grant(_) => None,
+        });
+        Ok((text, window))
+    }
+
+    /// Fuel charged past what the slice had left, not yet taken (ktests).
+    #[cfg(feature = "ktest")]
+    pub(super) fn debt(&self) -> u64 {
+        self.debt
+    }
+
+    /// Glyphs its cache rasterized so far (ktests).
+    #[cfg(feature = "ktest")]
+    pub(super) fn glyphs_rasterized(&self) -> u64 {
+        self.text.as_ref().map_or(0, |t| t.stats().misses)
     }
 
     /// The app stops with `reason`: recorded (the first said wins), and
@@ -289,6 +375,8 @@ pub(super) struct AppState {
     memory_kib: AtomicU64,
     /// What the app's thread, `run` and `kill` wait on.
     waits: WaitQueue,
+    /// Its window's waker, while it has one: `kill` wakes a `window_wait`.
+    window: SpinLock<Option<Waker>>,
     /// ktest seam: the kill flag is set just before this resume of
     /// `lumen_main` (counted from 1; 0: never).
     #[cfg(feature = "ktest")]
@@ -308,6 +396,7 @@ impl AppState {
             slices: AtomicU64::new(0),
             memory_kib: AtomicU64::new(0),
             waits: WaitQueue::new(),
+            window: SpinLock::new(None),
             #[cfg(feature = "ktest")]
             kill_at_resume: AtomicU64::new(0),
         }
@@ -325,10 +414,21 @@ impl AppState {
     }
 
     /// Ask the app to end: its thread sees the flag at its next host call,
-    /// slice end or wake.
+    /// slice end or wake (a `time_sleep`'s, or its window's `window_wait`).
     pub(super) fn ask_kill(&self) {
         self.kill.store(true, Ordering::Release);
         self.waits.wake_all();
+        // Woken outside the lock (the waker takes the window's queue's).
+        let waker = self.window.lock().clone();
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
+    /// The app's window opened (its waker) or closed (`None`).
+    pub(super) fn set_window(&self, waker: Option<Waker>) {
+        let old = core::mem::replace(&mut *self.window.lock(), waker);
+        drop(old);
     }
 
     pub(super) fn phase(&self) -> Phase {
@@ -747,6 +847,9 @@ pub(super) fn new_ctx(state: Arc<AppState>, grants: Grants, args: Vec<u8>) -> Ap
         debt: 0,
         close_grace: CloseGrace::default(),
         stopping: None,
+        text: None,
+        #[cfg(feature = "ktest")]
+        desktop: None,
     }
 }
 
@@ -848,9 +951,10 @@ pub(super) fn live(module: &[u8], state: &Arc<AppState>, grants: Grants, args: V
                 let reason = run_slices(&mut store, main);
                 state.record(reason);
             }
-            // Closing its handles and dropping its store, instance, module
-            // and engine: everything the app held.
+            // Closing its handles (its window destroyed) and dropping its
+            // store, instance, module and engine: everything the app held.
             drop(store);
+            state.set_window(None);
             state.log_outcome();
         }
     }
@@ -1021,6 +1125,36 @@ pub(super) fn launch(name: &str, args: &[String], without: Grants) -> Result<Lau
     Ok(Launched { state })
 }
 
+/// The bundled apps whose manifest grants `desktop`, by name (the
+/// launcher's; never the test apps).
+pub fn desktop_apps() -> Vec<&'static str> {
+    desktop_apps_in(BUNDLED)
+}
+
+/// The apps of `apps` whose manifest grants `desktop`. One that `precheck`
+/// refuses (too big, a bad manifest: `run` would refuse it too) is left
+/// out with a WARN naming why (`taskbar: <name>: left out of the launcher:
+/// <why>`), never silently.
+pub(super) fn desktop_apps_in(apps: &'static [App]) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    for app in apps {
+        match precheck(app.module) {
+            Ok(m) if m.caps.has(Grant::Desktop) => names.push(app.name),
+            Ok(_) => {}
+            Err(why) => log::warn!(target: "taskbar", "{}: left out of the launcher: {why}", app.name),
+        }
+    }
+    names
+}
+
+/// Start app `name` with no arguments and every grant, as `run` does but
+/// without waiting for its start (the launcher, #206): its id, or why not.
+/// A load failure nobody waits for is logged (one WARN).
+pub fn start(name: &str) -> Result<u64, String> {
+    // Dropped at once: nobody watches its start (a load failure is logged).
+    Ok(launch(name, &[], Grants::NONE)?.state.id)
+}
+
 const RUN_USAGE: &str = "usage: run [--without <grant>] <app> [args...]";
 
 /// `run [--without <grant>] <app> [args...]`.
@@ -1121,7 +1255,8 @@ pub fn table() -> pipe::Table {
             int(s.fuel.load(Ordering::Relaxed)),
             int(s.slices.load(Ordering::Relaxed)),
             int(s.memory_kib.load(Ordering::Relaxed)),
-            int(0),
+            // Windows it holds (0 or 1): one while it has a waker.
+            int(u64::from(s.window.lock().is_some())),
         ]);
     }
     t

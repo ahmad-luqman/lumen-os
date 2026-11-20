@@ -236,12 +236,32 @@ impl<'f> Font<'f> {
     /// nothing). Characters the face lacks draw its missing-glyph box (and
     /// count in [`Stats::missing`]). Glyphs come from the cache, rasterized
     /// only on a miss.
-    pub fn render(&mut self, text: &str, px: Px, mut draw: impl FnMut(Placed<'_>)) {
+    pub fn render(&mut self, text: &str, px: Px, draw: impl FnMut(Placed<'_>)) {
+        self.render_where(text, px, |_, _, _, _| true, draw);
+    }
+
+    /// [`Font::render`], but a glyph with ink whose box (`x`, `y`, width,
+    /// height, relative to the line box's top-left corner, from the metrics
+    /// alone) `visible` refuses is neither rasterized nor drawn: a caller
+    /// drawing inside a clip pays only for the glyphs that reach it.
+    pub fn render_where(
+        &mut self,
+        text: &str,
+        px: Px,
+        mut visible: impl FnMut(i32, i32, u32, u32) -> bool,
+        mut draw: impl FnMut(Placed<'_>),
+    ) {
         let Font { face, cache } = self;
         let ascent = face.line_metrics(px).ascent;
         face.layout(text, px, |glyph, at| {
             if glyph == 0 {
                 cache.count_missing();
+            }
+            let ink = face.ink_box(glyph, px);
+            if ink.width > 0
+                && !visible(at.saturating_add(ink.left), ascent.saturating_sub(ink.top), ink.width, ink.height)
+            {
+                return;
             }
             cache.with(face, glyph, px, |g| {
                 if !g.coverage.is_empty() {

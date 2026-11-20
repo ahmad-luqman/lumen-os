@@ -1,0 +1,21 @@
+[package]
+name = "lumen-app"
+description = "Lumen's app SDK (#206): safe wrappers over the `lumen` host functions (log, time, trace, a window with its canvas, events, text), a global allocator over the app's fixed memory, a panic handler reporting through `panic` with where it happened, and the `manifest!` and `main!` macros. Not an app (an rlib: `make apps` copies only cdylibs); apps/template is a start."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# Built for wasm32 only (apps/.cargo/config.toml): the logic worth testing
+# lives in lumen-app-api, host-tested.
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+lumen-app-api.workspace = true
+lumen-heap.workspace = true
+
+[lints]
+workspace = true

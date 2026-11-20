@@ -9,6 +9,7 @@ milestones with test-based exit criteria; `docs/STATUS.md` is generated.
 ```bash
 make deps            # pinned Limine + OVMF into build/deps (sha256-checked)
 make build           # the apps (build/apps/<name>.wasm, test apps build/apps/tests/), then both kernels: build/lumen-kernel, build/lumen-kernel-ktest
+make app NAME=foo    # a new app: apps/foo copied from apps/template (tools/new-app.sh); `make build` bundles it
 make run             # QEMU with a window, serial on your terminal (Ctrl-A x quits; HEADLESS=1; SOUND=1 for beep/play; DESKTOP=1 starts the desktop)
 make debug           # QEMU paused + gdb attached, stopped at kmain
 make test            # everything CI runs: host tests, flag audit, QEMU scenarios
@@ -205,7 +206,8 @@ own PR that updates that doc first.
   owner thread (`terminal`: draws the grid, hands keys over, blinks the focused one's cursor) and its shell
   (`term-shell`, `shell::run_in_window` on a closable console), joined on close; `term text <window>`.
   `taskbar.rs`: the desktop shell's taskbar (#157): a panel along the bottom, its `Launcher` menu
-  (Terminal, Mandelbrot, Life, Counter; refused while paused, a failure answered `Then::Failed`), a
+  (Terminal, Mandelbrot, Life, Counter, then the bundled apps granting `desktop`, #206; refused while
+  paused, a failure answered `Then::Failed`), a
   button per window, the `Clock` (the RTC polled without animating, `rtc::now_quiet`, its last reading kept
   on errors; `desktop tick` moves it a minute ahead), its `taskbar` owner thread
   (`lumen.taskbar_wake_delay_ms=` holds back a poke's handling, for the scenarios). `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`, `now_quiet` for pollers; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
@@ -282,7 +284,12 @@ own PR that updates that doc first.
   (one phase, moving only forward, and one `Outcome`, the first recorded; `finish`; a load failure
   printed by `run` or logged once, `start_line`, `stopped_by`), `kill` waiting at most `KILL_WAIT_NS`
   (`kill_outcome`, `Phase::place`), the `app-reaper` joining ended apps; `apps` (records), `run`,
-  `kill`); `app/host.rs` the `lumen` host functions without a window (`entry`: the kill flag, a slice
+  `kill`; `desktop_apps` and `start`, the launcher's); `app/window.rs` the window and text calls (#206:
+  `AppWindow`, an app's one window on the live desktop with the event in hand (`Held`) and `text_draw`'s
+  scratch surface; the canvas copied in by rows; a request refused `no node` until #207; `window_wait`
+  through `blocking`, a kill waking it through the window's `Waker`; fuel by the pixel and by the glyph
+  rasterized); `app/host.rs` the `lumen` host
+  functions without a window (`entry`: the kill flag, a slice
   end with too little fuel left, `CALL_FUEL`, for every call; `ending` for `exit` and `panic`;
   `blocking` for `time_sleep` and #206's `window_wait`; `read_trace`); `app/tests.rs` the runtime's
   ktests, over hand-assembled modules (a `Spec` builder) and the test apps, with seams for a kill at
@@ -295,12 +302,13 @@ own PR that updates that doc first.
   kernel, shared with the ktests: `LoopChecks`, its resume band from the loop's fuel per iteration) and
   its ktests, over hand-assembled modules (`app/modules.rs`: a long loop and call depth, one float
   operation per export, a bulk `memory.fill`, a generated large body). `app/wire.rs`: ktest only,
-  postcard over serde-derived types (the wire format's crates, linked ahead of the wire types, #206,
-  #207). `mm/heap.rs`'s `peak`/`reset_peak`: the heap's high-water mark (and, in the ktest
+  postcard's encoding and decoding rules over serde-derived types (the wire types themselves are
+  `lumen-app-api`'s `event` and `wire`, host-tested). `mm/heap.rs`'s `peak`/`reset_peak`: the heap's high-water mark (and, in the ktest
   kernel, `refuse_from`: the heap refusing big allocations, for `not enough memory`).
   `font.rs`: the desktop's anti-aliased text (`lumen-font`): `font::face`,
   the UI font parsed on first use and shared; `font::Text`, one drawing
   thread's glyph cache over it (`draw` glyph by glyph inside a clip,
+  rasterizing only the glyphs reaching it and saying how many it did,
   `measure`, `line_height`; `TITLE_PX`, `TEXT_PX`, `HEADING_PX`); `font`
   renders the golden sample twice (timings, cache, golden check), as its
   ktest does.
@@ -326,8 +334,9 @@ own PR that updates that doc first.
 - `crates/lumen-font`: anti-aliased TrueType text: `fontdue` (no `simd`)
   behind `Face` (parsed once, shared read-only; `measure`) and `Font`
   (a face plus its own glyph cache keyed by (glyph, pixel size), bounded
-  in bytes, least recently used evicted), one-line layout (`render`,
-  `render_mask` into a `LineMask`) into plain coverage masks, and the
+  in bytes, least recently used evicted), one-line layout (`render`;
+  `render_where`, which skips a glyph whose box a caller refuses before
+  rasterizing it; `render_mask` into a `LineMask`) into plain coverage masks, and the
   embedded UI font, Atkinson Hyperlegible (`assets/fonts/`, SIL OFL)
   (host-tested, incl. a model LRU, a `kern` fixture and a golden mask
   whose hash the kernel's ktest also checks).
@@ -479,7 +488,15 @@ own PR that updates that doc first.
   line separators too), `end` (`Outcome`, `EndReason`, `EndCell`: the
   first recorded wins; `CloseGrace`), `host` (the `lumen` functions'
   signatures, `ENTRY`, `MEMORY`, all pinned), `trace` (`trace_read`'s
-  layouts), `args` (host-tested).
+  layouts), `args`, `layout` (#206: `Canvas`, `Rect`, `TextDraw` and their
+  checks: `Canvas::pixels` giving a `CheckedCanvas`, the one way to a
+  clip's rows, `Rect::clip` giving a `Clipped`, `commit_count`), `event`
+  (#206: `Event`, the wire type `window_next_event` hands an app,
+  postcard; its wire tables `ThemeId`, `KeyCode`, `Mods`/`mods`,
+  `Buttons`/`buttons`, `SetValue`, and the conversions from `lumen-input`'s,
+  `lumen-wm`'s and `lumen-ui`'s types), `wire` (`wire_enum!`,
+  `DecodeError`, `decode_exact`), `sys` (the `lumen` imports, declared once
+  for the SDK and testkit; wasm32 only) (host-tested).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
@@ -490,7 +507,9 @@ own PR that updates that doc first.
   in `target-apps/`) for `wasm32-unknown-unknown`, `no_std`
   `cdylib`s; `make build` (`make apps`) builds each into
   `build/apps/<name>.wasm`, the runtime's test apps (`test-<name>`) into
-  `build/apps/tests/`, skipping libraries (`testkit`); the layout, the
+  `build/apps/tests/`, skipping libraries (`lumen-app`, the SDK, #206;
+  `testkit`); `template`, the app `make app NAME=` copies
+  (`tools/new-app.sh`); the layout, the SDK, the
   test apps and `testkit` are described once, in ARCHITECTURE section 8
   ("Building and bundling"). `make lint` and `fmt` cover them. The kernels embed them
   (`app::BUNDLED`, `app::TEST_APPS`); the harness validates them in
@@ -511,6 +530,8 @@ own PR that updates that doc first.
   `confirmed_keys`/`type_confirmed` against `kbd`'s presses, bytes and
   held keys, `KEY_BYTES` the keys it models; the desktop's `windows`,
   `desktop_status`, `wait_settled`, `desktop_check`, `settled_screendump`;
+  `wait_window`, `wait_no_window`, `close_window` (`ui invoke`'s close, then
+  the window's going), `TITLE_H`, `client_box`, `client_pixels`;
   the automation tree's `ui_tree`, `node`, `wait_ui`, `invoke`,
   `desktop_counter`; `parse_records` reads quoted cells with `shlex`),
   `calibration.py` (a boot calibration's verdict line, and the TSC's

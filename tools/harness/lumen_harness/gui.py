@@ -773,6 +773,72 @@ def wait_for[T](
     return got
 
 
+def wait_window(m: Machine, title: str, timeout: float = 30) -> dict[str, str]:
+    """Wait until `windows` lists a window titled `title`; its row then."""
+    rows = wait_for(
+        m,
+        f"window {title!r} open",
+        lambda: windows(m),
+        lambda rows: any(r["title"] == title for r in rows),
+        timeout,
+    )
+    return one(rows, f"windows titled {title!r}", title=title)
+
+
+def wait_no_window(m: Machine, title: str, timeout: float = 30) -> None:
+    """Wait until `windows` lists no window titled `title`."""
+    wait_for(
+        m,
+        f"window {title!r} closed",
+        lambda: windows(m),
+        lambda rows: all(r["title"] != title for r in rows),
+        timeout,
+    )
+
+
+# A window frame's title bar, in pixels (kernel/src/desktop.rs METRICS).
+TITLE_H = 24
+
+
+def client_box(row: dict[str, str]) -> tuple[int, int, int, int]:
+    """A `windows` row's client area on the screen, as PIL's crop box
+    (left, top, right, bottom): inside its border, below its title bar."""
+    x, y, w, h = bounds(row)
+    return x + 1, y + TITLE_H, x + w - 1, y + h - 1
+
+
+def client_pixels(m: Machine, title: str, name: str):
+    """Window `title`'s client area in a screendump named `name`: an RGB
+    PIL image (`.tobytes()` to compare two, `.getpixel` to read one)."""
+    from PIL import Image
+
+    box = client_box(window(m, title))
+    with Image.open(m.screendump(name)) as img:
+        return img.convert("RGB").crop(box)
+
+
+def close_window(m: Machine, title: str) -> None:
+    """`ui invoke <root> close` on window `title`, then wait until it is
+    gone. `ui invoke` waits for the close only up to its guest deadline, so
+    "still open (its close is still queued)" is as good as "closed" on a
+    loaded host: the window's going is what confirms it."""
+    row = window(m, title)
+    out = invoke_close(m, title)
+    said = (
+        f"ui invoke: window {row['id']} closed\n",
+        f"ui invoke: window {row['id']} still open (its close is still queued)\n",
+    )
+    if out not in said:
+        raise AssertionError(f"ui invoke close said {out!r}")
+    wait_no_window(m, title)
+
+
+def invoke_close(m: Machine, title: str) -> str:
+    """`ui invoke <root> close` on the window titled `title`: what it said."""
+    root = node(ui_tree(m), "window", title)
+    return run(m, f"ui invoke {root['id']} close")
+
+
 def wait_windows(m: Machine, count: int, timeout: float = 30) -> list[dict[str, str]]:
     """Wait until `windows` lists `count` windows; its rows then."""
     return wait_for(m, f"{count} windows", lambda: windows(m), lambda w: len(w) == count, timeout)

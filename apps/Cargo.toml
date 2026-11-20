@@ -8,7 +8,7 @@
 resolver = "3"
 # Every directory is a crate named after it (the harness checks the names):
 # an app (a `cdylib`, which `make apps` copies) or a library the apps share
-# (`testkit`). Not dot directories (.cargo, an
+# (`lumen-app`, the SDK; `testkit`, the runtime tests' raw calls). Not dot directories (.cargo, an
 # editor's): cargo's `*` would match them too.
 members = ["[!.]*"]
 
@@ -21,6 +21,8 @@ repository = "https://github.com/ahmad-luqman/lumen-os"
 # Crates the apps share with the kernel: path dependencies on crates/.
 [workspace.dependencies]
 lumen-app-api = { path = "../crates/lumen-app-api" }
+lumen-heap = { path = "../crates/lumen-heap" }
+lumen-app = { path = "lumen-app" }
 testkit = { path = "testkit" }
 
 [workspace.lints.rust]
