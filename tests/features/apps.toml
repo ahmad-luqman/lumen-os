@@ -172,3 +172,12 @@ tests = [
     "ktest:lumen_kernel::taskbar::the_launcher_lists_the_life_app_once",
     "scenario:test_apps::test_hello_wasm",
 ]
+
+[[feature]]
+name = "Clock (#200): a bundled app showing an analog face and the time as a label, read from the RTC and agreeing with `date` to the second, its seconds going on while the desktop settles between its ticks, what it draws following its label (only the moved hands' boxes repainted, leaving what a full repaint does a second at a time over twelve hours and after 1,500 jumps); a failing RTC kept, then blank, as the taskbar's clock; frozen with `--at` for good (no ticks at all), refusing arguments it doesn't take with an ERROR naming each; its window matching a golden"
+milestone = "M5"
+tests = [
+    "cargo:lumen-clock",
+    "scenario:test_apps::test_clock_golden",
+    "scenario:test_apps::test_clock_tree_matches_rtc",
+]
