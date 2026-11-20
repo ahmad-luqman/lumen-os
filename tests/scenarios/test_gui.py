@@ -1198,7 +1198,7 @@ def test_a_toolkit_window_repaints_in_a_new_theme(boot):
 # -- the desktop shell (#157) ---------------------------------------------------
 
 # The bundled apps whose manifest grants `desktop` (#206: never a test app).
-DESKTOP_APPS = ["calculator", "template", "xray"]
+DESKTOP_APPS = ["calculator", "clock", "template", "xray"]
 LAUNCHER_ITEMS = ["Terminal", "Mandelbrot", "Life", "Counter", *DESKTOP_APPS]
 # kernel/src/demo.rs `mandelbrot_owner`'s line.
 MANDEL_WINDOW = re.compile(

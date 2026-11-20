@@ -110,7 +110,7 @@ def test_hello_wasm(boot):
     # `run` alone: its usage and the bundled apps (not the test apps).
     out = run(m, "run")
     assert (
-        out == "usage: run [--without <grant>] <app> [args...]\napps: calculator template xray\n"
+        out == "usage: run [--without <grant>] <app> [args...]\napps: calculator clock template xray\n"
     ), out
     assert "run: no app nope" in run(m, "run nope")
     # `exit(n)` is an ending like returning n.
@@ -596,6 +596,157 @@ def test_calculator_golden(boot, artifacts, golden_dir):
         size=(x1 - x0, y1 - y0),
         artifacts=artifacts,
     )
+
+
+def clock_tree(m) -> tuple[str, list[dict[str, str]]]:
+    return wait_tree(m, "Clock", "Time")
+
+
+def clock_time(m, wid: str) -> str:
+    """The clock's `Time` label's value (`HH:MM:SS`)."""
+    return gui.node(gui.ui_tree(m, wid), "label", "Time")["value"]
+
+
+def test_clock_golden(boot, artifacts, golden_dir):
+    # `run clock --at 10:09`: frozen at 10:09:00 (its label's value, and
+    # the hands at nine minutes past ten, the second hand at 12), with no
+    # ticks (its fuel and slices still over two seconds of `date`), so the
+    # desktop settles; its client area against a golden.
+    m = boot_desktop(boot)
+    app_id, _ = start(m, "clock --at 10:09")
+    wid, rows = clock_tree(m)
+    assert gui.node(rows, "label", "Time")["value"] == "10:09:00"
+    row = gui.window(m, "Clock")
+    x0, y0, x1, y1 = gui.client_box(row)
+    shot = gui.settled_screendump(m, "clock.png")
+    # Frozen for good: still 10:09:00 once `date` shows two seconds more
+    # (at least a whole second, past the ticks a live clock would take),
+    # and no ticks at all meanwhile: its fuel and slices unchanged.
+    idle = app(m, app_id)
+    then = date_time(m)
+    gui.wait_for(
+        m, "two seconds by date", lambda: date_time(m), lambda t: seconds_from(then, t) >= 2
+    )
+    assert clock_time(m, wid) == "10:09:00"
+    still = app(m, app_id)
+    assert idle and still, (idle, still)
+    assert (still["fuel"], still["slices"]) == (idle["fuel"], idle["slices"]), (idle, still)
+    assert_matches_golden(
+        shot,
+        golden_dir / "app-clock.png",
+        origin=(x0, y0),
+        size=(x1 - x0, y1 - y0),
+        artifacts=artifacts,
+    )
+
+
+def seconds_from(a: str, b: str) -> int:
+    """Seconds from time of day `a` to `b` (`HH:MM:SS`), across midnight."""
+
+    def secs(t: str) -> int:
+        h, mm, ss = map(int, t.split(":"))
+        return h * 3600 + mm * 60 + ss
+
+    return (secs(b) - secs(a)) % 86_400
+
+
+def clock_shot(m, wid: str, name: str) -> tuple[str, bytes]:
+    """The clock's client area and the time its label shows, read when both
+    agree: the label, a settled desktop, a screendump, a settled desktop
+    again, the label again, until the two labels are equal (a tick's
+    commit and its publish come in one refresh, before the app waits:
+    settled after the shot, a commit before it shows in the second label).
+    A try needs to finish within one RTC second (wall time): at risk on a
+    busy host, where every try may straddle a second.
+    """
+    for _ in range(10):
+        before = clock_time(m, wid)
+        gui.wait_settled(m)
+        shot = gui.client_pixels(m, "Clock", name).tobytes()
+        gui.wait_settled(m)
+        if clock_time(m, wid) == before:
+            return before, shot
+    raise AssertionError("the clock's label changed around every screendump")
+
+
+def date_time(m) -> str:
+    """`date`'s time of day (`HH:MM:SS`, UTC)."""
+    said = run(m, "date")
+    found = re.fullmatch(r"date: \d{4}-\d\d-\d\d (\d\d:\d\d:\d\d) UTC\n", said)
+    assert found, f"date's format: {said!r}"
+    return found[1]
+
+
+def test_clock_tree_matches_rtc(boot):
+    # The clock's `Time` label shows `date`'s time to the second: `date`,
+    # the label, then `date` again, polled until the label equals one of
+    # the two (the clock reads the RTC four times a second, so on some
+    # poll it has the second `date` saw; whole strings, so midnight is
+    # no different), and never ahead of the `date` after it, on every poll
+    # and for two more seconds. It goes on (its value changes as the seconds pass),
+    # yet the desktop settles between its ticks (its waits aren't
+    # animating), and what it draws is what a clock frozen at the label's
+    # time draws. Its close ends it with 0. Arguments it doesn't take end
+    # it with 2, an ERROR saying what was wrong.
+    m = boot_desktop(boot)
+    app_id, mark = start(m, "clock")
+    wid, _ = clock_tree(m)
+
+    # (A poll agrees only if its three reads fall within one RTC second:
+    # at risk on a busy host, where every poll may straddle one.)
+    def around() -> tuple[str, str, str]:
+        before = date_time(m)
+        label = clock_time(m, wid)
+        after = date_time(m)
+        # Never ahead of the `date` read after it: the label trails the RTC
+        # both read (an ordering, not a time bound), so a fast clock fails
+        # here even where its label matches a later `date`.
+        assert not 0 < seconds_from(after, label) < 3600, f"ahead of date: {(before, label, after)}"
+        return before, label, after
+
+    agreed = gui.wait_for(
+        m, "the clock showing date's time", around, lambda r: r[1] in (r[0], r[2])
+    )
+    # Checked again until `date` has moved two seconds on.
+    gui.wait_for(
+        m, "two more seconds by date", around, lambda r: seconds_from(agreed[2], r[2]) >= 2
+    )
+    first = clock_time(m, wid)
+    gui.wait_ui(
+        m, "the clock's next second", lambda r: gui.node(r, "label", "Time")["value"] != first, wid
+    )
+    gui.wait_settled(m)
+    # What it draws follows the time: its client area at a time its label
+    # showed throughout equals a frozen clock's at that time (same labels,
+    # same picture: no timing bound).
+    shown, live = clock_shot(m, wid, "clock-live.png")
+    gui.close_window(m, "Clock")
+    end_line(m, mark, "clock", app_id, "exited with 0")
+    app_id, mark = start(m, f"clock --at {shown}")
+    wid, rows = clock_tree(m)
+    assert gui.node(rows, "label", "Time")["value"] == shown
+    frozen, picture = clock_shot(m, wid, "clock-frozen.png")
+    assert frozen == shown, (frozen, shown)
+    assert picture == live, f"the pictures at {shown} differ"
+    gui.close_window(m, "Clock")
+    end_line(m, mark, "clock", app_id, "exited with 0")
+    # Arguments it doesn't take: one ERROR naming what was wrong (waited
+    # for: `allow` only permits it), then exit 2. The app logs on its own
+    # thread, so a line landing after `run`'s prompt counts against the
+    # next command: each case also allows the one before's.
+    usage = "(usage: clock [--at H[H]:MM[:SS]])"
+    prev = None
+    for args, why in [
+        ("--at 25:00", f"'25:00' is not a time of day {usage}"),
+        ("--at", f"--at needs a time {usage}"),
+        ("foo", f"'foo' is not an argument it takes {usage}"),
+    ]:
+        said = re.escape(f"ERROR app: clock: {why}")
+        allow = said if prev is None else f"(?:{said}|{prev})"
+        app_id, mark = start(m, f"clock {args}", allow=allow)
+        wait_for_output(m, mark, rf"(?m){STAMP} {said}$", 30)
+        end_line(m, mark, "clock", app_id, "exited with 2")
+        prev = said
 
 
 def test_app_ids_are_global(boot):

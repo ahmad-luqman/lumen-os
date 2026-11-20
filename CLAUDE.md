@@ -518,17 +518,28 @@ own PR that updates that doc first.
   worst trees against `TREE_COPIES_BYTES`, counting allocators).
 - `crates/lumen-calc`: the calculator app's logic (#207): keys in, the
   display out, left to right in exact decimal fixed point (host-tested).
+- `crates/lumen-clock`: the clock app's logic (#200): `TimeOfDay` (from
+  Unix seconds, `--at`'s `H[H]:MM[:SS]`, `HH:MM:SS` shown), an integer sine
+  table in half-degree steps (no floats), `Hands`, `point` and `line`
+  (Bresenham) on the face; `face::Face`, the clock's window as a
+  `lumen_ui::App` (its drawing and its hands' boxes as damage, checked
+  against full repaints); `args` (`run clock`'s arguments); `rtc` (what it
+  shows while RTC reads fail, as the taskbar's clock) (host-tested).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
   (`t=140 w=sine C4/8 r/8`), and `Source`s that fill interleaved 16-bit
   PCM buffers (host-tested).
 - `crates/lumen-xray`: the X-ray app's logic (#208): trace events read from
-  each CPU's main and X-ray rings into per-CPU state (`View`, `Cpu`: the run
-  queue from the newest `runq` event, the thread from the newest `switch`,
-  counts, numbers missed, events that didn't decode, where each ring's next
-  read starts, offline CPUs) and the lanes' columns (`Column`, `COLUMNS`);
-  `replay`, the fixed trace of the frozen view (host-tested).
+  each CPU's main and X-ray rings into per-CPU state (`View`, `Cpu`:
+  `Presence` unread, online or offline; the run queue from the newest `runq`
+  event, the thread from the newest `switch`, counts known from a ring's
+  first read, numbers missed, odd events (undecodable, or a kind in the
+  wrong ring by `stream_of`), where each ring's next read starts; a ring's
+  backlog (its first read, after `resume`, after coming back online) giving
+  only the newest queue and thread; `presence_changes`) and the lanes'
+  columns (`Column`, `Span`: empty, counted, a backlog's gap, offline;
+  `COLUMNS`); `replay`, the fixed trace of the frozen view (host-tested).
 - `apps/`: the WASM apps (M5), their own cargo workspace (out of the root
   one; every directory but dot ones a member, named after its crate; output
   in `target-apps/`) for `wasm32-unknown-unknown`, `no_std`
@@ -537,7 +548,8 @@ own PR that updates that doc first.
   `build/apps/tests/`, skipping libraries (`lumen-app`, the SDK, #206;
   `testkit`); `template`, the app `make app NAME=` copies
   (`tools/new-app.sh`); `calculator` (#207, the first app on the SDK's
-  `ui::Toolkit`, lumen-ui inside the app); `xray` (#208, the trace rings
+  `ui::Toolkit`, lumen-ui inside the app); `clock` (#200, an analog face
+  on `run_until`, `--at` freezing it); `xray` (#208, the trace rings
   live, `--replay` frozen); the SDK's loops (`run_with`'s
   `Taken`, `run_until` for a `Ticking` app, both returning `Ended`;
   `Event::offer`; `with_area`, `palette`) for the animated apps; the
