@@ -32,7 +32,7 @@ is listed only in [STATUS.md](STATUS.md), which is generated from tests.
 | Bootloader | Limine 12.x (pinned binary release + sha256), `limine` crate **0.5.0** | Memory map, framebuffer, higher-half direct map, and our own ELF file for symbolization, with no loader to write. Crate 0.6.x requires nightly (`#![feature(ptr_metadata)]`), so we use 0.5.0 (base revision 3). | Custom UEFI loader (optional learning milestone), GRUB/multiboot2. |
 | Kernel shape | **Modular monolith** with message-shaped internal interfaces; Linux x86-64 syscall ABI from M6, wrapped in capability-scoped namespaces in M11 | One address space keeps early milestones fast and debuggable. Speaking the Linux x86-64 ABI lets Lumen run unmodified Alpine Linux (`musl`) compilers and runtimes without maintaining custom `libc`, `ld.so`, or runtime forks; per-process VFS mount namespaces and network policies still enforce Principle 2 around agents and sandboxed processes. | Microkernel (puts IPC overhead in front of every milestone); custom ring-3 syscall ABI + custom `libc` (multiplies porting and maintenance cost by an order of magnitude). |
 | Test harness | Python (`uv`, pytest) on the host; TAP from the kernel | Fast to write scenarios, mature tooling, and QMP/PIL are easy to use. | Rust `xtask`: one language, but slower iteration on test scripts. |
-| Third-party crates & upstream OS code | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), a PR adding only the crates its issue names (with their own dependencies), each checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX outside M6's two named FP save/restore stubs, no red zone, the kernel code model). Any PR that adopts a crate or adapts code from an upstream Rust OS (Lumen is MIT: see [ROADMAP.md](ROADMAP.md#reference-rust-oses-and-license-policy-lumen-is-mit)) must explicitly name the elected license (for multi-licensed projects such as ArceOS/Starry, elect `Apache-2.0`; keep MPL-2.0 code such as Asterinas crates in separate MPL-2.0-marked crates/files; never copy GPL-3.0 code) and preserve upstream copyright notices. Kernel crates so far: `limine`, `rustc-demangle`, `noto-sans-mono-bitmap` and `log` (from M0, before this policy; `log` is still `0.4`, to be pinned in a PR of its own), `pc-keyboard` (scancode decoding and layouts, #58, the first under it), `vte` (terminal escape parsing; brings `arrayvec` and `memchr`) and `unicode-width` (character widths), both #59. `rhai` (scripting, #67; integers only, no modules, no time, closures that can't capture (`no_closure`), `curry` disabled; brings `ahash`, `hashbrown`, `allocator-api2`, `equivalent`, `foldhash`, `smallvec`, `smartstring`, `thin-vec`, `num-traits`, `libm`, `bitflags`, `once_cell`, `portable-atomic`, `zerocopy`, `static_assertions`, `cfg-if`, `no-std-compat` and `core-error`, plus `const-random`, whose compile-time random seed stays linked but unused (the kernel sets a fixed hashing seed before any script runs), and the proc macros `rhai_codegen` and `const-random-macro`, which run only at build time). `virtio-drivers` `=0.13.0` (#95: virtqueues and the virtio device protocols; `default-features = false` with `alloc`; brings `safe-mmio` and `thiserror` (`bitflags` and `zerocopy` were already linked through `rhai`), plus the build-time proc macros `enumn`, `thiserror-impl` and `zerocopy-derive`), under the adapter rules in section 7, and `zerocopy` as a direct dependency, pinned to the lockfile's version (`=0.8.63`; the crate turns on `zerocopy`'s `derive` and `alloc` features for the whole kernel by feature unification, which `make audit` covers). `wasmi` `=2.0.1` (#197: the WASM interpreter for M5's apps; `default-features = false` with `validate` and `portable-dispatch`; brings `wasmi_core`, `wasmi_ir`, `wasmi_collections`, `wasmparser` and `spin`; its `libm` and `bitflags` were already linked through `rhai`). `portable-dispatch` is a stack-safety choice: our dependency line's `default-features = false` drops `auto-dispatch`, and wasmi then dispatches by tail calls, each instruction's handler calling the next and counting on LLVM to make those calls jumps, which its build script expects only without debug assertions; the kernel keeps them on, so a long loop overflowed a 64 KiB thread stack in #197 (`ktest:lumen_kernel::app::wasmi_runs_a_long_loop_in_fuel_slices` runs one on such a stack). The loop dispatch keeps the native stack's depth constant however long a module runs (host calls aside), and wasmi's own call depth (1000 frames, on the heap) bounds a module's recursion. Functions are compiled with the module (`CompilationMode::Eager`, section 8's wasmi configuration): lazily, a body's compilation is charged (7 fuel a byte) to the fuel left in the slice of the first call to reach it, and one costing more ends that call with an error that can't be resumed (though wasmi's message calls it resumable); compiling eagerly isn't metered, and keeps the compiled code, about 13 bytes of heap per body byte, for the module's life. `postcard` `=1.1.3` and `serde` `=1.0.229` (the app interface's wire format, section 8, for the wire types #206 and #207 add to `lumen-app-api`: #199's host calls take none; postcard with `default-features = false` and `alloc`, so without its default `heapless-cas`; serde with `default-features = false`, `derive` and `alloc`; they bring `serde_core` and `cobs` (`thiserror` was already linked through `virtio-drivers`), plus the build-time proc macro `serde_derive` (`proc-macro2`, `quote` and `syn` 3, already built for `thiserror-impl`); two `embedded-io` versions are in `Cargo.lock` only, named weakly by postcard's `alloc` feature, and never built). `ktest:lumen_kernel::app::wire::postcard_round_trips_derived_types` pins their encoding and decoding rules and links them into the ktest kernel, where `make audit`'s binary checks cover them; its IR checks read only the kernel crate's own IR, so once the wire types use them they see the generic code of these crates compiled into it, while their own non-generic code is covered by the binary checks alone, as wasmi's and rhai's is. `shlex` (#62) is only a dev-dependency of `lumen-shell`, the word splitter's test oracle; `noline`, which #62 names, isn't used (no completion hook, escape codes always, and it queries the terminal for the cursor on every prompt). | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
+| Third-party crates & upstream OS code | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), a PR adding only the crates its issue names (with their own dependencies), each checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX outside M6's two named FP save/restore stubs, no red zone, the kernel code model). Any PR that adopts a crate or adapts code from an upstream Rust OS (Lumen is MIT: see [ROADMAP.md](ROADMAP.md#reference-rust-oses-and-license-policy-lumen-is-mit)) must explicitly name the elected license (for multi-licensed projects such as ArceOS/Starry, elect `Apache-2.0`, retain any upstream `NOTICE` and license text, and mark modified files as changed; for BSD-3-Clause code such as Starnix, retain copyright and no-endorsement notices; keep MPL-2.0 code such as Asterinas crates in separate MPL-2.0-marked crates/files; never copy GPL-3.0 code) and preserve upstream copyright notices. Pre-baked Alpine Linux `ext4` test images (containing GPL userspace binaries) live only in the untracked `build/deps/` cache and are never committed to the MIT repository. Kernel crates so far: `limine`, `rustc-demangle`, `noto-sans-mono-bitmap` and `log` (from M0, before this policy; `log` is still `0.4`, to be pinned in a PR of its own), `pc-keyboard` (scancode decoding and layouts, #58, the first under it), `vte` (terminal escape parsing; brings `arrayvec` and `memchr`) and `unicode-width` (character widths), both #59. `rhai` (scripting, #67; integers only, no modules, no time, closures that can't capture (`no_closure`), `curry` disabled; brings `ahash`, `hashbrown`, `allocator-api2`, `equivalent`, `foldhash`, `smallvec`, `smartstring`, `thin-vec`, `num-traits`, `libm`, `bitflags`, `once_cell`, `portable-atomic`, `zerocopy`, `static_assertions`, `cfg-if`, `no-std-compat` and `core-error`, plus `const-random`, whose compile-time random seed stays linked but unused (the kernel sets a fixed hashing seed before any script runs), and the proc macros `rhai_codegen` and `const-random-macro`, which run only at build time). `virtio-drivers` `=0.13.0` (#95: virtqueues and the virtio device protocols; `default-features = false` with `alloc`; brings `safe-mmio` and `thiserror` (`bitflags` and `zerocopy` were already linked through `rhai`), plus the build-time proc macros `enumn`, `thiserror-impl` and `zerocopy-derive`), under the adapter rules in section 7, and `zerocopy` as a direct dependency, pinned to the lockfile's version (`=0.8.63`; the crate turns on `zerocopy`'s `derive` and `alloc` features for the whole kernel by feature unification, which `make audit` covers). `wasmi` `=2.0.1` (#197: the WASM interpreter for M5's apps; `default-features = false` with `validate` and `portable-dispatch`; brings `wasmi_core`, `wasmi_ir`, `wasmi_collections`, `wasmparser` and `spin`; its `libm` and `bitflags` were already linked through `rhai`). `portable-dispatch` is a stack-safety choice: our dependency line's `default-features = false` drops `auto-dispatch`, and wasmi then dispatches by tail calls, each instruction's handler calling the next and counting on LLVM to make those calls jumps, which its build script expects only without debug assertions; the kernel keeps them on, so a long loop overflowed a 64 KiB thread stack in #197 (`ktest:lumen_kernel::app::wasmi_runs_a_long_loop_in_fuel_slices` runs one on such a stack). The loop dispatch keeps the native stack's depth constant however long a module runs (host calls aside), and wasmi's own call depth (1000 frames, on the heap) bounds a module's recursion. Functions are compiled with the module (`CompilationMode::Eager`, section 8's wasmi configuration): lazily, a body's compilation is charged (7 fuel a byte) to the fuel left in the slice of the first call to reach it, and one costing more ends that call with an error that can't be resumed (though wasmi's message calls it resumable); compiling eagerly isn't metered, and keeps the compiled code, about 13 bytes of heap per body byte, for the module's life. `postcard` `=1.1.3` and `serde` `=1.0.229` (the app interface's wire format, section 8, for the wire types #206 and #207 add to `lumen-app-api`: #199's host calls take none; postcard with `default-features = false` and `alloc`, so without its default `heapless-cas`; serde with `default-features = false`, `derive` and `alloc`; they bring `serde_core` and `cobs` (`thiserror` was already linked through `virtio-drivers`), plus the build-time proc macro `serde_derive` (`proc-macro2`, `quote` and `syn` 3, already built for `thiserror-impl`); two `embedded-io` versions are in `Cargo.lock` only, named weakly by postcard's `alloc` feature, and never built). `ktest:lumen_kernel::app::wire::postcard_round_trips_derived_types` pins their encoding and decoding rules and links them into the ktest kernel, where `make audit`'s binary checks cover them; its IR checks read only the kernel crate's own IR, so once the wire types use them they see the generic code of these crates compiled into it, while their own non-generic code is covered by the binary checks alone, as wasmi's and rhai's is. `shlex` (#62) is only a dev-dependency of `lumen-shell`, the word splitter's test oracle; `noline`, which #62 names, isn't used (no completion hook, escape codes always, and it queries the terminal for the cursor on every prompt). | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
 | Firmware for tests | OVMF `edk2-stable202605-r1` from rust-osdev/ovmf-prebuilt, pinned with sha256 | macOS and CI boot byte-identical firmware, so golden screenshots match. | Distro OVMF packages (paths and versions differ per OS). |
 
 ## 3. Layers
@@ -2352,9 +2352,8 @@ impl DeviceResources {
   reach its MSI-X table through `bar(i)`, and is expected not to.
 - **Ownership, not confinement.** A driver only reaches its own registers
   and config space, but DMA isn't scoped per device in M3: without an
-  IOMMU a device can write any physical memory. If a driver moves out of
-  the kernel, these resources become a `Device` capability's contents
-  (section 8); confining DMA then also needs an IOMMU.
+  IOMMU a device can write any physical memory. Moving a driver out of the
+  kernel later would require explicit MMIO/IRQ/DMA isolation and an IOMMU.
 
 ### virtio: the adapter for `virtio-drivers` (built, #95)
 
@@ -5344,8 +5343,8 @@ impl Role { pub fn actions(self) -> &'static [ActionKind]; }
 ```
 
 - **`lumen_ui::NodeId` is global** (always written qualified, the kernel's
-  `desktop.rs` included: the VFS's
-  `NodeId`, section 9, is another type). `NodeId::fresh()` is one counter
+  `desktop.rs` included, distinguishing it from VFS inode numbers in
+  section 9). `NodeId::fresh()` is one counter
   for the whole system and an id is never reused in a boot. Lookups go by
   the raw number (`NodeId::get()`): `ui invoke 12 press` looks up 12, and
   text never becomes a `NodeId`; an id kept after its window closed names
@@ -5967,11 +5966,8 @@ kernel. The kernel is the trusted computing base.
       Ticks don't queue, so a long stretch with interrupts off counts
       once.
     - Nothing unwinds, so a function's callers aren't credited.
-    - Once WASM apps run (#199), an app will show up by function as
-      `wasmi`'s interpreter, not as its own functions; by thread it will
-      show up by its thread's name.
-- **Learning:** `explain <subsystem>` and a guided tour link each subsystem to
-  its source and docs inside the OS (M5+).
+    - WASM apps (#199) show up by function as `wasmi`'s interpreter, not as
+      their own functions; by thread they show up by their thread's name.
 
 ## 15. Testing architecture (built)
 
@@ -5986,26 +5982,37 @@ kernel. The kernel is the trusted computing base.
 | Feature gate | every feature in `tests/features/*.toml` must pass (CI); `docs/STATUS.md` generated from the same data | `make status-check`, `make status` |
 | Linux ABI conformance (M6+) | upstream `musl` `libc-test`, gVisor syscall suites, and targeted LTP cases plus unmodified Alpine `ext4` runtime tests | `tests/scenarios/test_linux_*`, `test_alpine.py`, `test_runtimes.py` |
 
-**CI tiers and deterministic disk images (M7–M10, #230).** Starting in M7,
-Linux-userspace tests run against a deterministic, pre-baked Alpine Linux
-`x86_64` (`musl`) `ext4` disk image built/fetched on the host and pinned by
-sha256 (just like Limine and OVMF)—CI scenarios never depend on live external
-package mirrors; M9's `apk`/HTTPS test talks to a local host test server.
-Because M10's full compiler/runtime tests (`gcc`/`g++` C++20 builds, `go
-build`, `rustc`/`cargo` with proc-macros, `node` V8 + `npm`) require 2–4 GiB
-guests and would take tens of minutes under TCG software emulation (which CI
-uses on failure re-runs and macOS uses locally), CI splits into two tiers
-before M10 issues are filed:
+**CI tiers, `status.py` feature gate, and deterministic disk images (M7–M10, #230).**
+Starting in M7, Linux-userspace tests run against a deterministic, pre-baked
+Alpine Linux `x86_64` (`musl`) `ext4` disk image built/fetched on the host into
+`build/deps/` and pinned by sha256 (just like Limine and OVMF, never committed
+to the MIT repo)—CI scenarios never depend on live external package mirrors;
+M9's `apk`/HTTPS test talks to a local host test server.
 
-1. **PR gate (fast, KVM, existing `ci.yml`):** M0–M9 scenarios, `audit:flags`,
-   host tests, ktests, and lightweight M10 smoke tests (single-file `gcc`,
-   minimal `python3`, `ruby`, `go run`, tiny `rustc`, `node -e`), keeping the
-   bounded TCG failure re-run.
-2. **Heavy runtime gate (separate workflow / merge-queue / nightly, KVM-only,
-   2–4 GiB RAM, no automatic TCG re-run):** full `cargo` proc-macro builds,
-   multi-file C++20 builds, `npm`, and full gVisor/LTP suites. Both tiers obey
-   the busy-host rule (no tight wall-clock ceilings inside scenarios; only
-   outer CI job timeouts).
+Because M10's full compiler/runtime tests (multi-file C++20 builds, `go build`,
+`rustc`/`cargo` with proc-macros, `node` V8 + `npm`, and full gVisor/LTP
+suites) require 2–4 GiB guests and would take tens of minutes under TCG
+software emulation (which `ci.yml` uses on failure re-runs and macOS uses
+locally), CI and `status.py` split into two tiers before M10 issues are filed
+so Hard Rules 1 and 10 stay intact:
+
+1. **Feature-gate schema (`tests/features/*.toml` + `status.py`):** every
+   feature defaults to `tier = "pr"`; M10 heavy runtime features declare
+   `tier = "heavy"` and their scenarios carry `@pytest.mark.heavy`. `status.py`
+   gains `--tier pr|heavy|all` (defaulting to `pr` in `ci.yml`, `heavy` in the
+   heavy workflow, and `all` when generating `docs/STATUS.md`, which records
+   each feature's tier and last verified result).
+2. **PR gate (fast, KVM, `ci.yml`):** runs `-m "not heavy"`, `audit:flags`,
+   host tests, ktests, M0–M9 scenarios, and lightweight M10 smoke tests
+   (`test_go_run_smoke`, `test_rustc_tiny_smoke`, `test_node_eval_smoke`),
+   gated by `status.py --check --tier pr`, keeping the 10-minute TCG failure
+   re-run.
+3. **Heavy runtime gate (separate workflow / merge-queue / nightly, KVM-only):**
+   runs `-m heavy` with `SCENARIO_JOBS=1` (avoiding 4×4 GiB OOM on 16 GiB
+   runners), fails fast if `/dev/kvm` is absent (never silently falling back to
+   TCG), omits the TCG failure re-run, and gates with `status.py --check --tier
+   heavy`. Both tiers obey the busy-host rule (no tight wall-clock ceilings
+   inside scenarios; only outer CI job timeouts).
 
 QEMU exit codes: 33 = tests passed, 35 = a test failed (or `lumen.ktest=` selected none), 37 = crash report.
 A triple fault exits with 0 (`-no-reboot`) and therefore fails; the power-off
@@ -6055,8 +6062,8 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/ktest.rs     in-kernel test registry and runner
   src/shell/       the shells (lumen-shell): serial and the virtual terminals' consoles, the commands, system commands (sysinfo.rs), deliberate faults (crash.rs), trace runq/xray (xray.rs)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
-  linker.ld        layout at -2 GiB, .ktests section
-crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-gfx, lumen-acpi, lumen-pci, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, lumen-font, lumen-png, lumen-wm, lumen-app-api (the app interface's types, also built for wasm32), ...)
+  linker.ld        layout at -2 GiB, .ktests section (M6 adds .lumen_fixup in :rodata)
+crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-gfx, lumen-acpi, lumen-pci, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, lumen-font, lumen-png, lumen-wm, lumen-app-api, lumen-calc, lumen-clock, lumen-edit, lumen-perf, lumen-snake, lumen-view, lumen-xray; M6 adds lumen-vm)
 assets/fonts/      the desktop's UI font (Atkinson Hyperlegible, SIL OFL 1.1) with its licence and source
 assets/wallpaper/  the desktop's wallpaper (original, made by tools/wallpaper.py; README.md)
 boot/limine.conf   bootloader config template

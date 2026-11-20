@@ -104,9 +104,9 @@ Each rule exists because breaking it caused a real bug in v1.
    notes anything not yet tested. CI must be green; a reviewer agent or a human
    reviews before merge.
 
-Interfaces shared across issues (syscall numbers, `FileSystem`, driver traits,
-the automation tree) are defined in `docs/ARCHITECTURE.md`. Changing one is its
-own PR that updates that doc first.
+Interfaces shared across issues (syscall numbers, VFS interfaces, driver
+traits, the automation tree) are defined in `docs/ARCHITECTURE.md`. Changing
+one is its own PR that updates that doc first.
 
 ## Conventions
 
