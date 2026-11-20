@@ -280,6 +280,22 @@ mod tests {
     }
 
     #[test]
+    fn it_draws_the_hands_in_their_colours_and_labels_the_time() {
+        // 10:09:00: the second hand straight up from the centre, in the
+        // accent (the hour and minute hands far from it); with no time,
+        // no hands: the background there.
+        let t = at(36_540);
+        assert_eq!(full(t).pixel(CX, CY - 60), Some(PALETTE.accent));
+        assert_eq!(full(None).pixel(CX, CY - 60), Some(PALETTE.background));
+        // The hour hand (towards 10) in the text colour, a minute hand's
+        // length out from the centre: the minute hand points elsewhere.
+        let (hx, hy) = point(CX, CY, 40, t.unwrap().hands().hour);
+        assert_eq!(full(t).pixel(hx, hy), Some(PALETTE.text));
+        let face = Face::new(t);
+        assert_eq!(face.ui.text(face.label), Some("10:09:00"));
+    }
+
+    #[test]
     fn showing_follows_the_time_and_the_same_time_repaints_nothing() {
         let (mut face, mut s) = painted(at(0));
         let t = at(10 * 3600 + 9 * 60);
