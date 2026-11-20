@@ -3167,7 +3167,9 @@ drawing walk every character, whatever reaches the clip),
 or an answer copied in (refused or not), and `NODE_FUEL` per node of a
 tree decoded, items counted, refused or not (#207: its strings copied,
 its id mapped, its row made; a refusal can come after every node was
-decoded and its ids sorted, `Tree::decode_counted`)
+decoded and its ids sorted, or partway through a list's items, which
+counts the items its bytes could hold, `tree::MIN_ITEM_BYTES` each:
+`Tree::decode_counted`)
 (`app::tests::host_calls_charge_their_fuel` checks `CALL_FUEL`,
 `BYTE_FUEL`, `LOG_FUEL` and `EVENT_FUEL`;
 `app::tests::window_calls_charge_their_fuel` the pixels and glyphs, as

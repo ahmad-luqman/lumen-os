@@ -48,6 +48,12 @@ pub struct Common {
 /// item's `selected` flag comes from its list).
 pub type Item = Common;
 
+/// The fewest bytes an item is encoded in: its id (1), its name's length
+/// (1, an empty name), its rectangle (4 one-byte varints) and its two
+/// flags (2). A node failing partway through its items decoded at most its
+/// bytes / this of them.
+pub const MIN_ITEM_BYTES: usize = 8;
+
 /// A list's or a menu's items: at most [`TREE_NODES`], refused past that
 /// before anything is allocated.
 pub type Items = CappedVec<Item, TREE_NODES>;
@@ -211,10 +217,13 @@ impl Tree {
         Tree::decode_counted(bytes).0
     }
 
-    /// [`Tree::decode`], and how many nodes it decoded (items counted),
-    /// refused or not: the work `window_publish` charges `NODE_FUEL` for
-    /// (a refusal can come after every node was decoded and its ids
-    /// sorted).
+    /// [`Tree::decode`], and how many nodes it worked through (items
+    /// counted), refused or not: the work `window_publish` charges
+    /// `NODE_FUEL` for. A refusal can come after every node was decoded and
+    /// its ids sorted; one partway through a node (a list's items cut short,
+    /// or more of them claimed than the cap) has decoded up to
+    /// `rest / MIN_ITEM_BYTES` items of it before failing, so that many more
+    /// are counted (at most `TREE_NODES` in all).
     pub fn decode_counted(bytes: &[u8]) -> (Result<Tree, TreeError>, usize) {
         if bytes.len() > TREE_BYTES {
             return (Err(TreeError::TooBig(bytes.len())), 0);
@@ -228,7 +237,10 @@ impl Tree {
             }
             let (node, more) = match postcard::take_from_bytes::<Node>(rest) {
                 Ok(taken) => taken,
-                Err(error) => return (Err(TreeError::Decode { node: nodes.len(), error }), count),
+                Err(error) => {
+                    let partway = (rest.len() / MIN_ITEM_BYTES).min(TREE_NODES - count);
+                    return (Err(TreeError::Decode { node: nodes.len(), error }), count + partway);
+                }
             };
             count += 1 + node.items().len();
             if count > TREE_NODES {
@@ -715,6 +727,32 @@ mod tests {
         assert_eq!(n, 2);
         assert_eq!(Tree::decode_counted(&vec![0; TREE_BYTES + 1]).1, 0);
         assert_eq!(Tree::decode_counted(&bytes_of(&[button(1)])).1, 1);
+        // Partway through a node: a list of TREE_NODES - 1 items with its
+        // last byte cut, and one claiming TREE_NODES + 1 items with the
+        // bytes behind them: each counted for the items it went through.
+        let full = Node::List {
+            common: c(1),
+            focused: false,
+            selected: None,
+            items: items(&(2..=TREE_NODES as u64).collect::<Vec<_>>()),
+        };
+        let cut = enc(&full);
+        let (got, n) = Tree::decode_counted(&cut[..cut.len() - 1]);
+        assert!(matches!(got, Err(TreeError::Decode { node: 0, .. })));
+        assert!(n >= TREE_NODES - 1, "{n}");
+        let mut past = vec![5u8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x81, 0x08];
+        past.extend([1u8, 0, 0, 0, 0, 0, 0, 0].repeat(TREE_NODES + 1));
+        let (got, n) = Tree::decode_counted(&past);
+        assert_eq!(got, Err(TreeError::Decode { node: 0, error: P::SerdeDeCustom }));
+        assert!(n >= TREE_NODES - 1, "{n}");
+        assert!(n <= TREE_NODES);
+        // The smallest item is MIN_ITEM_BYTES.
+        assert_eq!(
+            postcard::to_allocvec(&Common { name: Text::cut(""), bounds: Rect::new(0, 0, 0, 0), ..c(1) })
+                .unwrap()
+                .len(),
+            MIN_ITEM_BYTES
+        );
     }
 
     #[test]
