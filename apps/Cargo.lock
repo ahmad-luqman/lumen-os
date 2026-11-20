@@ -66,6 +66,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
+name = "life"
+version = "0.0.1"
+dependencies = [
+ "lumen-app",
+ "lumen-demo",
+ "lumen-ui",
+]
+
+[[package]]
 name = "lumen-app"
 version = "0.0.1"
 dependencies = [
@@ -99,6 +108,10 @@ dependencies = [
  "lumen-gfx",
  "lumen-ui",
 ]
+
+[[package]]
+name = "lumen-demo"
+version = "0.0.1"
 
 [[package]]
 name = "lumen-edit"

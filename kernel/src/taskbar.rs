@@ -2,21 +2,26 @@
 //! screen (`Desktop::open_panel`: frameless, in front, never focused),
 //! built with `lumen-ui` so its buttons are in the automation tree.
 //!
-//! Left to right: the `Launcher` menu (its items open a terminal, the
-//! Mandelbrot and Life windows or Counter, then start each bundled app
-//! whose manifest grants `desktop`, by name: #206), a button per window in the
-//! order they opened (a press restores it if minimized, then raises and
-//! focuses it), and at the right end the `Clock`, a fixed-size label
-//! showing the RTC's `HH:MM`.
+//! Left to right: the `Launcher` menu (its items open a terminal or the
+//! Mandelbrot window, start the Life app (#202) or open Counter, then
+//! start each other bundled app whose manifest grants `desktop`, by name:
+//! #206), a button per window in the order they opened (a press restores
+//! it if minimized, then raises and focuses it), and at the right end the
+//! `Clock`, a fixed-size label showing the RTC's `HH:MM`.
 //!
 //! Its owner, the `taskbar` thread, waits up to a second at a time
 //! (non-animating: the window settles between polls), polls the RTC each
 //! second and redraws the clock when the minute changes (the toolkit's
 //! per-widget damage: only the label's bounds are committed). The desktop
 //! pokes it (its `Waker`) when a window opens or closes, and it brings its
-//! buttons in line with the window list. Launching from a menu item brings
-//! them in line at once, before the request that chose it is answered, so
-//! `ui tree` after `ui invoke` already shows the new window's button.
+//! buttons in line with the window list. Launching a kernel window from a
+//! menu item (Terminal, Mandelbrot, Counter) brings them in line at once,
+//! before the request that chose it is answered, so `ui tree` after `ui
+//! invoke` already shows the new window's button. An item starting an app
+//! (Life, the bundled apps) is answered once the app is started, without
+//! waiting for its window, which the app's own thread opens (its button
+//! comes with it, maybe before the answer, maybe after); the taskbar logs
+//! `INFO  taskbar: <item>: app <id>`.
 
 use alloc::format;
 use alloc::string::String;
@@ -33,11 +38,29 @@ const PAD: u32 = 4;
 /// What the launcher opens first, in its order; the bundled desktop apps
 /// follow ([`items`]).
 const ITEMS: [&str; 4] = ["Terminal", "Mandelbrot", "Life", "Counter"];
+/// The bundled app the `Life` item starts (#202: the Life app replaced the
+/// kernel's Life window): left out of the apps after [`ITEMS`], so it is
+/// listed once.
+const LIFE_APP: &str = "life";
 
 /// The launcher's items: [`ITEMS`], then the bundled apps whose manifest
-/// grants `desktop` (never the test apps), by name.
+/// grants `desktop` (never the test apps), by name, except [`LIFE_APP`].
+/// Without [`LIFE_APP`] among them the Life item stays, and one WARN says
+/// it won't open a window: not bundled, its launch is refused (`run: no
+/// app life`); left out by `precheck` (which warned), refused with why
+/// (`run: life: <why>`); without a `desktop` grant in its manifest, the
+/// app starts and ends by its own ERROR (`no desktop handle`).
 fn items() -> Vec<&'static str> {
-    ITEMS.into_iter().chain(crate::app::desktop_apps()).collect()
+    let apps = crate::app::desktop_apps();
+    if !apps.contains(&LIFE_APP) {
+        log::warn!(target: "taskbar", "Life: no bundled desktop app {LIFE_APP}: the Life item won't open a window");
+    }
+    items_with(apps)
+}
+
+/// [`items`] over the bundled desktop apps `apps`.
+fn items_with(apps: Vec<&'static str>) -> Vec<&'static str> {
+    ITEMS.into_iter().chain(apps.into_iter().filter(|&a| a != LIFE_APP)).collect()
 }
 /// How often the clock polls the RTC.
 const POLL_NS: u64 = 1_000_000_000;
@@ -181,13 +204,14 @@ impl Taskbar {
         }
         let Some(&name) = self.items.get(item) else { return Err(String::from("no such item")) };
         let window = |id: Result<u32, String>| id.map(|id| format!("window {id}"));
-        // An app's name is lower case (kernel/build.rs): never a demo's.
+        let app = |name: &str| crate::app::start(name).map(|id| format!("app {id}"));
         match name {
             "Terminal" => window(crate::termwin::open()),
             "Mandelbrot" => window(crate::demo::open_mandelbrot_window()),
-            "Life" => window(crate::demo::open_life_window()),
+            "Life" => app(LIFE_APP),
             "Counter" => window(crate::ui::open_counter()),
-            app => crate::app::start(app).map(|id| format!("app {id}")),
+            // An app's name is lower case (kernel/build.rs): never a demo's.
+            bundled => app(bundled),
         }
     }
 }
@@ -203,7 +227,9 @@ impl App for Taskbar {
                 UiEvent::Chosen(w, item) if w == self.launcher => {
                     let name = self.items.get(item).copied().unwrap_or("?");
                     let opened = self.launch(item);
-                    // Its button now, before the request is answered.
+                    // A kernel window's button now, before the request is
+                    // answered (an app's window is its own thread's, not
+                    // waited for).
                     self.sync();
                     match opened {
                         Ok(what) => log::info!(target: "taskbar", "{name}: {what}"),
@@ -286,3 +312,25 @@ fn owner(mut h: WindowHandle, mut tk: Toolkit<Taskbar>) {
         }
     }
 }
+
+crate::ktest!(
+    fn the_launcher_lists_the_life_app_once() {
+        // The Life item starts the bundled `life` (#202), which is left out
+        // of the apps after the demo items; the others stay, in order.
+        crate::kassert_eq!(
+            items_with(alloc::vec!["calculator", "life", "template"]),
+            alloc::vec!["Terminal", "Mandelbrot", "Life", "Counter", "calculator", "template"]
+        );
+        // Without the app, the Life item still stays (its launch refused).
+        crate::kassert_eq!(
+            items_with(alloc::vec!["calculator"]),
+            alloc::vec!["Terminal", "Mandelbrot", "Life", "Counter", "calculator"]
+        );
+        // The bundled set: the app the Life item starts is there, and
+        // listed only as Life.
+        crate::kassert!(crate::app::desktop_apps().contains(&LIFE_APP));
+        let listed = items();
+        crate::kassert_eq!(listed.iter().filter(|i| i.eq_ignore_ascii_case("life")).count(), 1);
+        Ok(())
+    }
+);

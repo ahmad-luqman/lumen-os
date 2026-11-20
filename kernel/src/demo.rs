@@ -35,7 +35,7 @@ use core::fmt::Write;
 use core::num::NonZeroUsize;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lumen_demo::bands;
-use lumen_demo::life::{self, Life, PATTERNS};
+use lumen_demo::life::{self, DEFAULT_PATTERN, Life, PATTERNS};
 use lumen_demo::mandel::{self, View};
 
 /// Rows per band.
@@ -250,8 +250,6 @@ const ALIVE: u32 = 0x7ee787;
 const DEAD: u32 = STATUS_BG;
 /// The most generations a second when running until a key.
 const LIFE_HZ: u64 = 20;
-/// The pattern `life` runs without one named.
-const DEFAULT_PATTERN: &str = "gun";
 const LIFE_USAGE: &str = "usage: life [pattern] [generations]";
 /// Refuse in a pipeline (`name`: the demo), where it would draw and wait
 /// for a key while its output went down the pipeline; whether it did.
@@ -364,14 +362,10 @@ pub fn life(ctx: &mut Ctx<'_>, args: &[String]) {
     }
 }
 
-// -- the demos in windows (#157) ------------------------------------------------
+// -- the Mandelbrot window (#157) ---------------------------------------------------
 
 /// The Mandelbrot window's client size.
 const MANDEL_WINDOW: (u32, u32) = (480, 320);
-/// The Life window's client size (cells of [`CELL`] pixels).
-const LIFE_WINDOW: (u32, u32) = (400, 280);
-/// Life's generations a second in its window.
-const LIFE_WINDOW_HZ: u64 = 10;
 
 /// What a drawing in a window did: rows by CPU, and the CPUs whose thread
 /// couldn't be started (their bands drawn by the caller).
@@ -448,23 +442,15 @@ fn draw_bands(bands: Vec<lumen_gfx::BandMut<'_>>, view: View, others: &[usize]) 
     Ok(WindowDrawn { ns: crate::time::now_ns() - start, rows, caller, no_thread })
 }
 
-/// Open a `size` window titled `title` and start its owner, thread
-/// `thread` running `owner`; the window's id.
-fn open_owned(
-    title: &str,
-    size: (u32, u32),
-    thread: &'static str,
-    owner: fn(crate::desktop::WindowHandle),
-) -> Result<u32, String> {
-    let handle = crate::desktop::open_window(title, size.0, size.1).map_err(|e| format!("no window: {e}"))?;
-    let id = handle.id();
-    let _detached = sched::spawn(thread, move || owner(handle)).map_err(|e| format!("no thread: {e}"))?;
-    Ok(id)
-}
-
-/// The launcher's `Mandelbrot`: a window drawn once by every CPU; its id.
+/// The launcher's `Mandelbrot`: a window drawn once by every CPU, by its
+/// owner thread `desktop-mandelbrot`; its id.
 pub fn open_mandelbrot_window() -> Result<u32, String> {
-    open_owned("Mandelbrot", MANDEL_WINDOW, "desktop-mandelbrot", mandelbrot_owner)
+    let (w, h) = MANDEL_WINDOW;
+    let handle = crate::desktop::open_window("Mandelbrot", w, h).map_err(|e| format!("no window: {e}"))?;
+    let id = handle.id();
+    let _detached =
+        sched::spawn("desktop-mandelbrot", move || mandelbrot_owner(handle)).map_err(|e| format!("no thread: {e}"))?;
+    Ok(id)
 }
 
 /// Draw the set into `h`'s surface with this CPU and `others` and commit
@@ -524,63 +510,6 @@ fn mandelbrot_owner(mut h: crate::desktop::WindowHandle) {
             | WindowEvent::FocusGained
             | WindowEvent::FocusLost
             | WindowEvent::Lost => {}
-        }
-    }
-}
-
-/// The launcher's `Life`: a window stepping the `gun` pattern ten times a
-/// second, focused or not, until it closes; its id.
-pub fn open_life_window() -> Result<u32, String> {
-    open_owned("Life", LIFE_WINDOW, "desktop-life", life_owner)
-}
-
-/// The Life window's owner: a generation every 100 ms (an animating wait:
-/// the desktop never settles while it runs), committing only the cells
-/// that changed, until its close.
-fn life_owner(mut h: crate::desktop::WindowHandle) {
-    use crate::desktop::{Animating, Wait, WindowEvent};
-    use lumen_gfx::Rect;
-    let s = h.surface_mut();
-    let mut grid = Life::new(s.width() as usize / CELL, s.height() as usize / CELL);
-    let pattern = life::pattern(DEFAULT_PATTERN).expect("the default pattern exists");
-    let (x0, y0) = pattern.origin(grid.width(), grid.height());
-    grid.place(pattern, x0, y0);
-    let cell_rect =
-        |x: usize, y: usize| Rect::new((x * CELL) as i32, (y * CELL) as i32, CELL as u32 - 1, CELL as u32 - 1);
-    {
-        let s = h.surface_mut();
-        s.fill(DEAD);
-        for y in 0..grid.height() {
-            for x in 0..grid.width() {
-                if grid.get(x, y) {
-                    s.fill_rect(cell_rect(x, y), ALIVE);
-                }
-            }
-        }
-        let b = s.bounds();
-        h.commit(&[b]);
-    }
-    let period = 1_000_000_000 / LIFE_WINDOW_HZ;
-    let mut next = crate::time::now_ns().saturating_add(period);
-    loop {
-        match h.wait_event_until(Some(next), Animating::Yes) {
-            Wait::Event(WindowEvent::Close) => return,
-            Wait::Event(WindowEvent::Request(r)) => crate::ui::refuse(r),
-            Wait::Event(_) | Wait::Woken => {}
-            Wait::Deadline => {
-                // The changed cells' bounding box is committed.
-                let mut changed: Option<Rect> = None;
-                let s = h.surface_mut();
-                grid.step(|x, y, alive| {
-                    let r = cell_rect(x, y);
-                    s.fill_rect(r, if alive { ALIVE } else { DEAD });
-                    changed = Some(changed.map_or(r, |c| c.union(&r)));
-                });
-                if let Some(c) = changed {
-                    h.commit(&[c]);
-                }
-                next = next.saturating_add(period).max(crate::time::now_ns());
-            }
         }
     }
 }

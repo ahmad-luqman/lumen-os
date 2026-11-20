@@ -1197,7 +1197,8 @@ def test_a_toolkit_window_repaints_in_a_new_theme(boot):
 
 # -- the desktop shell (#157) ---------------------------------------------------
 
-# The bundled apps whose manifest grants `desktop` (#206: never a test app).
+# The bundled apps whose manifest grants `desktop` (#206: never a test app),
+# but `life`, which the Life item starts (#202: listed once).
 DESKTOP_APPS = ["calculator", "clock", "comet", "editor", "template", "viewer"]
 LAUNCHER_ITEMS = ["Terminal", "Mandelbrot", "Life", "Counter", *DESKTOP_APPS]
 # kernel/src/demo.rs `mandelbrot_owner`'s line.
@@ -1216,19 +1217,6 @@ def minimize_box(frame: tuple[int, int, int, int]) -> tuple[int, int]:
     pixels left of it)."""
     x, y = close_box(frame)
     return x - 16 - 4, y
-
-
-def launch(m: Machine, item: str) -> gui.Invoked:
-    """Open launcher item `item` through `ui invoke`: the menu's `press`
-    unfolds it, its item's `press` opens the window (and folds it, so the
-    item's node is gone after)."""
-    launcher = gui.node(gui.taskbar(m), "menu", "Launcher")
-    unfolded = gui.invoke(m, launcher["id"], "press")
-    assert unfolded.row is not None and unfolded.row["state"] == "expanded", unfolded
-    entry = gui.node(gui.taskbar(m), "menuitem", item)
-    got = gui.invoke(m, entry["id"], "press")
-    assert got.message == f"ui invoke: ran; node {entry['id']} is gone", got
-    return got
 
 
 def test_launcher_opens_terminal(boot):
@@ -1389,7 +1377,7 @@ def test_mandelbrot_window_golden(boot, artifacts, golden_dir):
     m = boot_shells(boot, extra=["-smp", "4"])
     assert "INFO  smp: 4 CPUs online" in m.output
     gui.start_desktop(m)
-    launch(m, "Mandelbrot")
+    gui.launch(m, "Mandelbrot")
     found = gui.wait_for(
         m, "the Mandelbrot window drawn", lambda: MANDEL_WINDOW.search(m.output), bool, 60
     )
@@ -1448,52 +1436,6 @@ def test_launcher_lists_desktop_apps_only(boot):
     )
 
 
-def test_life_window_runs_unfocused_and_stops_when_closed(boot):
-    # The launcher's Life: it keeps stepping (an animating wait: the desktop
-    # never settles), also when another window takes the focus (its client
-    # area changes between screendumps); minimized it presents nothing (its
-    # thread still there); its close ends its owner, and the desktop
-    # settles again.
-    m = boot_tablet(boot)
-    gui.start_desktop(m)
-    launch(m, "Life")
-    life = gui.wait_for(m, "Life open", lambda: gui.windows(m), lambda r: r[0]["title"] == "Life")[
-        0
-    ]
-    assert "desktop-life" in thread_names(m)
-    click_to_focus(m, "Colours", COLOURS[0] + 200, COLOURS[1] + 150)
-    assert gui.window(m, "Life")["focused"] == "no"
-    never_settled(m, 4)
-    x, y, w, h = frame_of(gui.window(m, "Life"))
-    box = (x + 1, y + TITLE_H, x + w - 1, y + h - 1)
-
-    def client(name: str) -> bytes:
-        with Image.open(m.screendump(name)) as img:
-            return img.convert("RGB").crop(box).tobytes()
-
-    first = client("life-1.png")
-    gui.wait_for(m, "Life's next generations", lambda: client("life-2.png"), lambda c: c != first)
-    # Minimized, it presents nothing (nothing else moves).
-    root = gui.node(gui.ui_tree(m), "window", "Life")
-    assert gui.invoke(m, root["id"], "minimize").row is not None
-    # (Read again if something else presented: the minimize's own redraw,
-    # or the clock's minute; Life presenting would show in every try.)
-    tries = []
-    for _ in range(3):
-        before = gui.desktop_status(m)
-        time.sleep(0.5)
-        after = gui.desktop_status(m)
-        tries.append((before["frames"], after["frames"]))
-        if after["frames"] == before["frames"]:
-            break
-    else:
-        raise AssertionError(f"presented while Life was minimized: {tries}")
-    assert "desktop-life" in thread_names(m)
-    assert run(m, f"ui invoke {root['id']} close") == f"ui invoke: window {life['id']} closed\n"
-    gui.wait_for(m, "Life's owner gone", lambda: thread_names(m), lambda t: "desktop-life" not in t)
-    gui.wait_settled(m)
-
-
 def plus_minute(hhmm: str) -> str:
     h, mm = map(int, hhmm.split(":"))
     t = (h * 60 + mm + 1) % (24 * 60)
@@ -1547,7 +1489,7 @@ def test_a_window_opened_from_the_shell_gets_a_taskbar_button(boot):
         lambda: taskbar_buttons(m),
         lambda b: b == ["Welcome", "Colours", "Counter"],
     )
-    launch(m, "Counter")
+    gui.launch(m, "Counter")
     assert taskbar_buttons(m) == ["Welcome", "Colours", "Counter", "Counter"]
     assert [w["title"] for w in gui.windows(m)][:2] == ["Counter", "Counter"]
     assert gui.desktop_status(m)["taskbar"] == "yes"
@@ -1583,5 +1525,5 @@ def test_the_launcher_answers_with_the_new_window_s_button(boot):
     gui.start_desktop(m)
     said = "INFO  taskbar: waiting 2000 ms after each poke (lumen.taskbar_wake_delay_ms)"
     assert said in m.output, "the knob wasn't taken"
-    launch(m, "Counter")
+    gui.launch(m, "Counter")
     assert taskbar_buttons(m) == ["Welcome", "Colours", "Counter"]
