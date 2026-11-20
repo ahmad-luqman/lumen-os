@@ -151,6 +151,11 @@ impl VirtAddr {
         assert!(align.is_power_of_two(), "alignment must be a power of two");
         self.0 & (align - 1) == 0
     }
+
+    /// Is this a lower-half canonical address (`L4[0..256]`, bit 47 clear)?
+    pub const fn is_lower_half(self) -> bool {
+        self.0 < (1 << (VIRT_ADDR_BITS - 1))
+    }
 }
 
 macro_rules! hex_formatting {
@@ -214,6 +219,10 @@ mod tests {
         assert_eq!(low_top.checked_add(0xfff).map(VirtAddr::as_u64), Some(0x0000_7fff_ffff_ffff));
         assert_eq!(low_top.checked_add(0x1000), None, "crossing into the non-canonical hole");
         assert_eq!(VirtAddr::new(u64::MAX).unwrap().checked_add(1), None);
+        assert!(VirtAddr::new(0).unwrap().is_lower_half());
+        assert!(VirtAddr::new(0x0000_7fff_ffff_ffff).unwrap().is_lower_half());
+        assert!(!VirtAddr::new(0xffff_8000_0000_0000).unwrap().is_lower_half());
+        assert!(!VirtAddr::new(u64::MAX).unwrap().is_lower_half());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use core::arch::asm;
 
 use lumen_mm::{PhysFrame, VirtAddr, paging::Cache};
 
-use super::cpu::{cpuid, rdmsr, read_cr0, read_cr3, read_cr4, write_cr0, write_cr3, write_cr4, wrmsr};
+use super::cpu::{cpuid, rdmsr, read_cr0, read_cr3, read_cr4, write_cr0, write_cr3 as write_cr3_raw, write_cr4, wrmsr};
 
 /// CR0.WP: supervisor writes honour read-only pages.
 pub const CR0_WP: u64 = 1 << 16;
@@ -16,6 +16,8 @@ pub const CR0_WP: u64 = 1 << 16;
 const CR4_PGE: u64 = 1 << 7;
 /// CR4.LA57: 5-level paging.
 const CR4_LA57: u64 = 1 << 12;
+/// CR4.PCIDE: process-context identifiers (not used; must stay 0).
+const CR4_PCIDE: u64 = 1 << 17;
 const IA32_EFER: u32 = 0xc000_0080;
 /// EFER.NXE: the no-execute bit in page-table entries is honoured.
 pub const EFER_NXE: u64 = 1 << 11;
@@ -50,13 +52,31 @@ pub unsafe fn load_root(root: PhysFrame) {
     // kernel. A CR3 write flushes non-global entries; toggling PGE flushes
     // the global ones too (Limine may have set G on its mappings).
     unsafe {
-        write_cr3(root.as_u64());
+        write_cr3_raw(root.as_u64());
         let cr4 = read_cr4();
         if cr4 & CR4_PGE != 0 {
             write_cr4(cr4 & !CR4_PGE);
             write_cr4(cr4);
         }
     }
+}
+
+/// Write `root` directly to CR3 (`CR4.PCIDE = 0`), without toggling `CR4.PGE`.
+///
+/// Used on per-process address-space switches: flushes non-global TLB entries
+/// while avoiding [`load_root`]'s global-page flush.
+///
+/// # Safety
+/// `root` must be a 4 KiB-aligned physical L4 root table (below 2^52) whose
+/// upper half (`L4[256..512]`) maps the running kernel identically to the
+/// kernel hierarchy.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by per-process switches (Wave 2) and ktests
+pub unsafe fn write_cr3(root: u64) {
+    debug_assert!(PhysFrame::from_u64(root).is_some(), "CR3 root {root:#x} is not a 4 KiB physical frame");
+    debug_assert!(read_cr4() & CR4_PCIDE == 0, "CR4.PCIDE must remain 0");
+    // SAFETY: delegated to the caller. With CR4.PCIDE = 0, a plain mov to CR3
+    // loads the new L4 root and flushes non-global TLB entries.
+    unsafe { write_cr3_raw(root) }
 }
 
 /// Drop any TLB entry for the page containing `virt`.

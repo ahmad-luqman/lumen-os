@@ -98,3 +98,12 @@ tests = [
     "ktest:lumen_kernel::mm::heap::growth_failure_rolls_back",
     "ktest:lumen_kernel::mm::stack::guard_page_unmapped",
 ]
+
+[[feature]]
+name = "User VMA interval tree (lumen-vm), lower-half-only user PTEs with PTE_PROTNONE frame preservation, plain CR3 switch helper, and pre-allocated L3 tables for all 6 dynamic kernel L4 slots"
+milestone = "M6"
+tests = [
+    "cargo:lumen-vm",
+    "cargo:lumen-mm",
+    "ktest:lumen_kernel::mm::paging::dynamic_kernel_l4_slots_have_l3_tables",
+]

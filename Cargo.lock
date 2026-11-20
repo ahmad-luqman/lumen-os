@@ -360,6 +360,7 @@ dependencies = [
  "lumen-trace",
  "lumen-uart",
  "lumen-ui",
+ "lumen-vm",
  "lumen-wm",
  "noto-sans-mono-bitmap",
  "pc-keyboard",
@@ -462,6 +463,10 @@ dependencies = [
  "lumen-heap",
  "lumen-png",
 ]
+
+[[package]]
+name = "lumen-vm"
+version = "0.0.1"
 
 [[package]]
 name = "lumen-wm"
