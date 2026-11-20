@@ -218,3 +218,11 @@ tests = [
     "harness:test_shell_run::test_a_host_timed_warning_doesnt_fail_the_run_and_stays_in_its_logs",
     "scenario:test_boot::test_boot_reaches_logger",
 ]
+
+[[feature]]
+name = "Codegen audit FPU allowlist: exempts strictly `fxsave64`/`xsave64` in `lumen_fpu_save` and `fxrstor64`/`xrstor64` in `lumen_fpu_restore`, rejecting swapped mnemonics, state instructions in any other symbol, and vector/MMX/mask registers everywhere (including inside those two symbols), while keeping LLVM IR checks 100% strict"
+milestone = "M6"
+tests = [
+    "audit:flags",
+    "harness:test_audit::test_fpu_allowlist_rejects_simd_outside_named_stubs",
+]

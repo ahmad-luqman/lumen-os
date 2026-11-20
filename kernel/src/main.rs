@@ -179,6 +179,7 @@ fn install_stacks() -> StackRange {
 
 /// The rest of boot, on the allocated main stack.
 extern "C" fn kmain_on_kernel_stack() -> ! {
+    arch::fpu::init_cpu();
     acpi::init();
     ktrace!(Kind::BootPhase, BootPhase::Acpi);
     // Sizing a BAR turns its device's decoding off for a moment: this runs

@@ -1,0 +1,9 @@
+# Features: arch. See tests/features/README.md for the format.
+
+[[feature]]
+name = "User FPU/SSE/AVX state (`FXSAVE64` baseline + optional `XSAVE64`/`XRSTOR64` when CPUID advertises it), boot/AP `CR0`/`CR4` setup (`CR0.NE`, `CR0.MP`, `CR4.OSFXSR`, `CR4.OSXMMEXCPT`, `CR4.FSGSBASE = 0`), clean `UserFpuState` defaults (`FCW = 0x037F`, `MXCSR = 0x1F80`), and `IA32_FS_BASE` read/write helpers"
+milestone = "M6"
+tests = [
+    "ktest:lumen_kernel::arch::x86_64::fpu::save_restore_roundtrip_preserves_control_words",
+    "audit:flags",
+]
