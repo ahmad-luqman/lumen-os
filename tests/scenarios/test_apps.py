@@ -1087,7 +1087,7 @@ def test_life_refuses_arguments_it_doesnt_take(boot):
 
 def test_life_golden(boot, artifacts, golden_dir):
     # `run life --stopped glider`: the glider, stopped (no period, so the
-    # window settles). Acorn chosen in its list starts it again at
+    # window settles, and it spends no fuel). Acorn chosen in its list starts it again at
     # generation 0, still stopped; twelve presses of Step (each one
     # generation, answered, or settled if still running) against a golden of
     # its client area, what the steps' damage committed (after three, and
@@ -1099,6 +1099,14 @@ def test_life_golden(boot, artifacts, golden_dir):
     app_id, mark = start(m, "life --stopped glider")
     wid, rows = life_tree(m)
     assert (life_state(rows), generation(rows), life_pattern(rows)) == ("stopped", 0, "glider")
+    # Stopped, it spends no fuel: settled, `apps`' fuel stays exactly the
+    # same (an idle app runs nothing, so a slow host can't change it; a
+    # stopped app that still woke on a period would).
+    gui.wait_settled(m)
+    fuel = int(app(m, app_id)["fuel"])
+    time.sleep(1.5)
+    gui.wait_settled(m)
+    assert int(app(m, app_id)["fuel"]) == fuel, "a stopped Life spent fuel"
     choose(m, rows, "acorn")
     gui.wait_settled(m)
     rows = below_root(gui.ui_tree(m, wid))
