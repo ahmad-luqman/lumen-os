@@ -6,7 +6,7 @@
 //! statement of each rule.
 
 use crate::Error;
-use crate::limits::{COMMIT_RECTS, TITLE_BYTES};
+use crate::limits::COMMIT_RECTS;
 use core::ops::Range;
 
 /// A [`Canvas`]'s encoded size.
@@ -188,12 +188,6 @@ pub fn commit_count(n: i32) -> Result<usize, Error> {
     }
 }
 
-/// A window title's length: at most [`TITLE_BYTES`], else
-/// [`Error::BadArgument`] (checked before the title is copied).
-pub fn title_len(len: usize) -> Result<usize, Error> {
-    if len > TITLE_BYTES { Err(Error::BadArgument) } else { Ok(len) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,14 +266,11 @@ mod tests {
     }
 
     #[test]
-    fn commit_counts_and_titles_have_caps() {
+    fn commit_counts_have_caps() {
         assert_eq!(commit_count(1), Ok(RECT_SIZE));
         assert_eq!(commit_count(COMMIT_RECTS as i32), Ok(COMMIT_RECTS * RECT_SIZE));
         for n in [0, -1, COMMIT_RECTS as i32 + 1, i32::MAX, i32::MIN] {
             assert_eq!(commit_count(n), Err(Error::BadArgument), "{n}");
         }
-        assert_eq!(title_len(0), Ok(0));
-        assert_eq!(title_len(TITLE_BYTES), Ok(TITLE_BYTES));
-        assert_eq!(title_len(TITLE_BYTES + 1), Err(Error::BadArgument));
     }
 }

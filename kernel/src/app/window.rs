@@ -11,7 +11,7 @@
 //! copied in, then every range they name; then the other values; then the
 //! work. A refused call writes nothing.
 
-use super::host::{C, Res, blocking, copy_in, entry, memory_len, write_out};
+use super::host::{C, Res, blocking, copy_in, copy_in_capped, entry, memory_len, write_out};
 use super::runtime::{self, AppCtx};
 use crate::desktop::{self, Animating, OpenError, Wait, WindowEvent, WindowHandle};
 use crate::{sched, time};
@@ -102,14 +102,10 @@ fn text_px(px: i32) -> Result<Px, Error> {
     Px::new(px as u16).ok_or(Error::BadArgument)
 }
 
-/// Text at `[ptr, ptr + len)`: the range checked, then its cap (before the
-/// copy), then decoded (bad UTF-8 is `BadArgument`).
-fn text_in(c: &C<'_>, ptr: i32, len: i32, cap: usize) -> Result<alloc::string::String, Error> {
-    let r = range::range(ptr, len, memory_len(c))?;
-    if r.len() > cap {
-        return Err(Error::BadArgument);
-    }
-    let bytes = copy_in(c, r);
+/// Text at `r` (a range already checked): its cap (before the copy), then
+/// decoded (bad UTF-8 is `BadArgument`).
+fn text_in(c: &C<'_>, r: core::ops::Range<usize>, cap: usize) -> Result<alloc::string::String, Error> {
+    let bytes = copy_in_capped(c, r, cap)?;
     text::decode(&bytes, cap).map(alloc::string::String::from)
 }
 
@@ -130,10 +126,8 @@ fn window_open(c: &mut C<'_>, h: i32, title: i32, len: i32, width: i32, height: 
     if w == 0 || ht == 0 || u64::from(w) * u64::from(ht) > WINDOW_PIXELS {
         return Err(Error::BadArgument);
     }
-    layout::title_len(r.len())?;
-    let bytes = copy_in(c, r);
     // Shown in the title bar, the taskbar and `windows`: cut and sanitised.
-    let title = text::cut(text::decode(&bytes, TITLE_BYTES)?, TITLE_BYTES);
+    let title = text::cut(&text_in(c, r, TITLE_BYTES)?, TITLE_BYTES);
     if c.data().has_window() {
         const _: () = assert!(WINDOWS == 1, "one window per app");
         return Err(Error::Limit);
@@ -330,7 +324,7 @@ fn measure(c: &mut C<'_>, h: i32, px: i32, ptr: i32, len: i32) -> Result<i32, Er
     c.data().grant_of(h, Kind::Desktop)?;
     let r = range::range(ptr, len, memory_len(c))?;
     let px = text_px(px)?;
-    let s = text_in(c, r.start as i32, r.len() as i32, TEXT_BYTES)?;
+    let s = text_in(c, r, TEXT_BYTES)?;
     let (text, _) = c.data_mut().text_and_window()?;
     Ok(text.measure(&s, px).min(i32::MAX as u32) as i32)
 }
@@ -342,7 +336,7 @@ fn text_draw(c: &mut C<'_>, h: i32, canvas: i32, args: i32, ptr: i32, len: i32) 
     let r = range::range(ptr, len, memory_len(c))?;
     let pixels = canvas.pixels(memory_len(c))?;
     let px = text_px(args.px as i32)?;
-    let s = text_in(c, r.start as i32, r.len() as i32, TEXT_BYTES)?;
+    let s = text_in(c, r, TEXT_BYTES)?;
     let memory = c.data().memory.ok_or(Error::BadPointer)?;
     let (mem, ctx) = memory.data_and_store_mut(&mut *c);
     let (text, window) = ctx.text_and_window()?;

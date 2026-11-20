@@ -344,8 +344,6 @@ pub(super) struct AppState {
     waits: WaitQueue,
     /// Its window's waker, while it has one: `kill` wakes a `window_wait`.
     window: SpinLock<Option<Waker>>,
-    /// Windows it holds (0 or 1), for `apps`.
-    windows: AtomicU64,
     /// ktest seam: the kill flag is set just before this resume of
     /// `lumen_main` (counted from 1; 0: never).
     #[cfg(feature = "ktest")]
@@ -366,7 +364,6 @@ impl AppState {
             memory_kib: AtomicU64::new(0),
             waits: WaitQueue::new(),
             window: SpinLock::new(None),
-            windows: AtomicU64::new(0),
             #[cfg(feature = "ktest")]
             kill_at_resume: AtomicU64::new(0),
         }
@@ -397,7 +394,6 @@ impl AppState {
 
     /// The app's window opened (its waker) or closed (`None`).
     pub(super) fn set_window(&self, waker: Option<Waker>) {
-        self.windows.store(u64::from(waker.is_some()), Ordering::Relaxed);
         let old = core::mem::replace(&mut *self.window.lock(), waker);
         drop(old);
     }
@@ -1104,11 +1100,8 @@ pub fn desktop_apps() -> impl Iterator<Item = &'static str> {
 /// without waiting for its start (the launcher, #206): its id, or why not.
 /// A load failure nobody waits for is logged (one WARN).
 pub fn start(name: &str) -> Result<u64, String> {
-    let launched = launch(name, &[], Grants::NONE)?;
-    let id = launched.state.id;
-    // Dropped: nobody watches its start (a load failure is logged).
-    drop(launched);
-    Ok(id)
+    // Dropped at once: nobody watches its start (a load failure is logged).
+    Ok(launch(name, &[], Grants::NONE)?.state.id)
 }
 
 const RUN_USAGE: &str = "usage: run [--without <grant>] <app> [args...]";
@@ -1211,7 +1204,8 @@ pub fn table() -> pipe::Table {
             int(s.fuel.load(Ordering::Relaxed)),
             int(s.slices.load(Ordering::Relaxed)),
             int(s.memory_kib.load(Ordering::Relaxed)),
-            int(s.windows.load(Ordering::Relaxed)),
+            // Windows it holds (0 or 1): one while it has a waker.
+            int(u64::from(s.window.lock().is_some())),
         ]);
     }
     t

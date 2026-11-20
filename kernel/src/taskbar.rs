@@ -179,16 +179,15 @@ impl Taskbar {
         if let Some(why) = desktop::refused_while_paused() {
             return Err(String::from(why));
         }
+        let Some(&name) = self.items.get(item) else { return Err(String::from("no such item")) };
         let window = |id: Result<u32, String>| id.map(|id| format!("window {id}"));
-        match item {
-            0 => window(crate::termwin::open()),
-            1 => window(crate::demo::open_mandelbrot_window()),
-            2 => window(crate::demo::open_life_window()),
-            3 => window(crate::ui::open_counter()),
-            _ => match self.items.get(item) {
-                Some(app) => crate::app::start(app).map(|id| format!("app {id}")),
-                None => Err(String::from("no such item")),
-            },
+        // An app's name is lower case (kernel/build.rs): never a demo's.
+        match name {
+            "Terminal" => window(crate::termwin::open()),
+            "Mandelbrot" => window(crate::demo::open_mandelbrot_window()),
+            "Life" => window(crate::demo::open_life_window()),
+            "Counter" => window(crate::ui::open_counter()),
+            app => crate::app::start(app).map(|id| format!("app {id}")),
         }
     }
 }

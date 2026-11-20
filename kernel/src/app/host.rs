@@ -80,6 +80,16 @@ pub(super) fn copy_in(c: &C<'_>, r: core::ops::Range<usize>) -> Vec<u8> {
     c.data().memory.map_or_else(Vec::new, |m| m.data(c)[r].to_vec())
 }
 
+/// A copy of text or an encoding at `r` (already checked by [`range`]),
+/// refused with `BadArgument` past `cap` bytes before anything is copied
+/// (section 8's step 4).
+pub(super) fn copy_in_capped(c: &C<'_>, r: core::ops::Range<usize>, cap: usize) -> Result<Vec<u8>, Error> {
+    if r.len() > cap {
+        return Err(Error::BadArgument);
+    }
+    Ok(copy_in(c, r))
+}
+
 /// `bytes` written at `at` (checked: within a range [`range`] accepted).
 pub(super) fn write_out(c: &mut C<'_>, at: usize, bytes: &[u8]) {
     if let Some(m) = c.data().memory {
@@ -184,11 +194,7 @@ fn log(c: &mut C<'_>, h: i32, level: i32, msg: i32, len: i32) -> Result<i32, Err
         LogLevel::Debug => log::Level::Debug,
         LogLevel::Trace => log::Level::Trace,
     };
-    // The cap, checked before the text is copied (or decoded).
-    if r.len() > TEXT_BYTES {
-        return Err(Error::BadArgument);
-    }
-    let bytes = copy_in(c, r);
+    let bytes = copy_in_capped(c, r, TEXT_BYTES)?;
     // The copy is paid for even if the text is then refused.
     runtime::charge(&mut *c, BYTE_FUEL * bytes.len() as u64);
     let line = text::log_line(text::decode(&bytes, TEXT_BYTES)?);

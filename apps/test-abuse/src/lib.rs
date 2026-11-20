@@ -33,7 +33,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::vec;
 use testkit::api::event::Event;
-use testkit::api::layout::{Canvas, Rect, TextDraw};
+use testkit::api::layout::{CANVAS_SIZE, Canvas, RECT_SIZE, Rect, TextDraw};
 use testkit::api::limits::{COMMIT_RECTS, EVENT_BYTES, TEXT_BYTES, TITLE_BYTES};
 use testkit::api::trace::{EVENT_SIZE, HEADER_SIZE, decode_event, decode_header};
 use testkit::{Error, Grant, find, host, info, log_handle, named, ptr};
@@ -223,18 +223,8 @@ fn next_event(w: i32, buf: &mut [u8]) -> i32 {
     unsafe { host::window_next_event(w, ptr(buf.as_mut_ptr()), buf.len() as i32) }
 }
 
-/// `text_draw` with fixed structures at the given pointers.
-///
-/// # Safety
-///
-/// The canvas they name is the caller's to write (or refused).
-unsafe fn text_draw(h: i32, canvas: i32, args: i32, text: i32, len: i32) -> i32 {
-    // SAFETY: the caller's contract is `host::text_draw`'s.
-    unsafe { host::text_draw(h, canvas, args, text, len) }
-}
-
 /// A canvas over `px`, `w` × `h` with `stride`.
-fn canvas(px: &[u32], stride: u32, w: u32, h: u32) -> [u8; 16] {
+fn canvas(px: &[u32], stride: u32, w: u32, h: u32) -> [u8; CANVAS_SIZE] {
     Canvas { ptr: ptr(px.as_ptr()) as u32, stride, w, h }.encode()
 }
 
@@ -256,7 +246,7 @@ fn window(c: &mut Checks) {
     let ca = canvas(&a, W, W, H);
     let args = draw(0, 16, Rect::new(0, 0, W, H));
     // SAFETY: `a` is ours.
-    let r = unsafe { text_draw(desk, ptr(ca.as_ptr()), ptr(args.as_ptr()), t, tn) };
+    let r = unsafe { host::text_draw(desk, ptr(ca.as_ptr()), ptr(args.as_ptr()), t, tn) };
     c.check("text_draw without a window", r, Err(Error::Unavailable));
 
     // window_open: the handle, its kind, the title's range, the size, the
@@ -336,8 +326,8 @@ fn window(c: &mut Checks) {
     c.check("commit: too many rects", host::window_commit(w, cp, fp, COMMIT_RECTS as i32 + 1), Err(Error::BadArgument));
     c.check("commit: -1 rects", host::window_commit(w, cp, fp, -1), Err(Error::BadArgument));
     c.check("commit: wrapping rects", host::window_commit(w, cp, WRAPPING, 1), Err(Error::BadPointer));
-    let mut rects = [0u8; 16 * COMMIT_RECTS];
-    for (i, r) in rects.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+    let mut rects = [0u8; RECT_SIZE * COMMIT_RECTS];
+    for (i, r) in rects.as_chunks_mut::<RECT_SIZE>().0.iter_mut().enumerate() {
         // One whole, the rest outside or empty: skipped.
         *r = if i == 0 { Rect::new(0, 0, W, H) } else { Rect::new(-100 * i as i32, 5, 10, 10) }.encode();
     }
@@ -348,7 +338,7 @@ fn window(c: &mut Checks) {
     );
     let base = ptr(a.as_ptr()) as u32;
     let bad = |ptr: u32, stride: u32, w: u32, h: u32| Canvas { ptr, stride, w, h }.encode();
-    let commit_with = |cv: [u8; 16]| host::window_commit(w, testkit::ptr(cv.as_ptr()), fp, 1);
+    let commit_with = |cv: [u8; CANVAS_SIZE]| host::window_commit(w, ptr(cv.as_ptr()), fp, 1);
     c.check("commit: an unaligned canvas", commit_with(bad(base + 1, W, W, H)), Err(Error::BadPointer));
     c.check("commit: a stride below the width", commit_with(bad(base, W - 1, W, H)), Err(Error::BadArgument));
     c.check("commit: stride × height overflowing", commit_with(bad(base, 0x4000_0000, W, H)), Err(Error::BadPointer));
@@ -376,7 +366,7 @@ fn window(c: &mut Checks) {
     let td = |h: i32, canvas: i32, args: i32, text: i32, len: i32| {
         // SAFETY: every canvas passed below is `a` or `b`, ours to write,
         // or one the host refuses (unaligned, or at a wrapping range).
-        unsafe { text_draw(h, canvas, args, text, len) }
+        unsafe { host::text_draw(h, canvas, args, text, len) }
     };
     let px7 = draw(0, 7, Rect::new(0, 0, W, H));
     c.check("text_draw: px 7", td(desk, cp, ptr(px7.as_ptr()), t, tn), Err(Error::BadArgument));
@@ -401,7 +391,7 @@ fn window(c: &mut Checks) {
     a[0] = u32::from_le_bytes(*b"Hi\0\0");
     b[0] = a[0];
     let below = draw(0, 16, Rect::new(0, 1, W, H - 1));
-    let ra = td(desk, cp, ptr(below.as_ptr()), cp_text(&a), 2);
+    let ra = td(desk, cp, ptr(below.as_ptr()), ptr(a.as_ptr()), 2);
     let cb = canvas(&b, W, W, H);
     let rb = td(desk, ptr(cb.as_ptr()), ptr(below.as_ptr()), ptr(b"Hi".as_ptr()), 2);
     c.holds("an overlapping text_draw's advance", ra > 0 && ra == rb);
@@ -419,11 +409,6 @@ fn window(c: &mut Checks) {
 /// The bytes `a, 0xff, b`.
 fn bad_utf8() -> [u8; 3] {
     [b'a', 0xff, b'b']
-}
-
-/// The address of `px`'s first pixel's bytes (text written into it).
-fn cp_text(px: &[u32]) -> i32 {
-    ptr(px.as_ptr())
 }
 
 /// `window_next_event` at any range (refused ones write nothing).

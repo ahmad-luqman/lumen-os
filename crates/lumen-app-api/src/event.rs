@@ -18,42 +18,9 @@
 //! encodes into a fixed buffer ([`Event::encode`]) and allocates nothing.
 
 use crate::limits::{EVENT_BYTES, SET_VALUE_BYTES};
+pub use crate::wire::DecodeError;
 use alloc::string::String;
 use serde::{Deserialize, Serialize};
-
-/// A field-less wire enum from one list: explicit discriminants, each
-/// checked against its declaration position at compile time (serde encodes
-/// the position), `ALL` in that order and `name`.
-macro_rules! wire_enum {
-    ($(#[$meta:meta])* $vis:vis enum $name:ident { $($variant:ident = $num:literal,)* }) => {
-        $(#[$meta])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        #[repr(u8)]
-        $vis enum $name {
-            $($variant = $num,)*
-        }
-
-        impl $name {
-            /// Every variant, in its numbered (declaration) order.
-            pub const ALL: [$name; [$($num),*].len()] = [$($name::$variant),*];
-
-            /// Its name (`F1`).
-            pub const fn name(self) -> &'static str {
-                match self {
-                    $($name::$variant => stringify!($variant),)*
-                }
-            }
-        }
-
-        const _: () = {
-            let mut i = 0;
-            while i < $name::ALL.len() {
-                assert!($name::ALL[i] as usize == i, "a wire enum's discriminant must be its position");
-                i += 1;
-            }
-        };
-    };
-}
 
 wire_enum! {
     /// A desktop theme (`lumen_wm::ThemeId`).
@@ -289,15 +256,6 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TooLong;
 
-/// Why bytes aren't an [`Event`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DecodeError {
-    /// postcard's refusal.
-    Postcard(postcard::Error),
-    /// A whole event, then this many bytes more.
-    LeftOver(usize),
-}
-
 impl Event {
     /// A key event (`lumen_input::KeyEvent`; its `after_drop` mark stays
     /// the kernel's).
@@ -340,11 +298,7 @@ impl Event {
     /// The event `bytes` hold, exactly: postcard's refusal, or bytes left
     /// over after a whole event.
     pub fn decode(bytes: &[u8]) -> Result<Event, DecodeError> {
-        match postcard::take_from_bytes::<Event>(bytes) {
-            Ok((event, [])) => Ok(event),
-            Ok((_, rest)) => Err(DecodeError::LeftOver(rest.len())),
-            Err(e) => Err(DecodeError::Postcard(e)),
-        }
+        crate::wire::decode_exact(bytes)
     }
 }
 

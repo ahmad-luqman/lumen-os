@@ -295,28 +295,6 @@ def boot_desktop(boot):
     return m
 
 
-def wait_window(m, title: str) -> dict[str, str]:
-    """Until `windows` lists a window titled `title`: its row."""
-    rows = gui.wait_for(
-        m,
-        f"window {title!r} open",
-        lambda: gui.windows(m),
-        lambda rows: any(r["title"] == title for r in rows),
-        30,
-    )
-    return next(r for r in rows if r["title"] == title)
-
-
-def wait_no_window(m, title: str) -> None:
-    gui.wait_for(
-        m,
-        f"window {title!r} closed",
-        lambda: gui.windows(m),
-        lambda rows: all(r["title"] != title for r in rows),
-        30,
-    )
-
-
 def test_template_app_runs(boot):
     # The committed template (what `make app` copies): `run` opens its
     # window, focused in front; a key typed through confirmed steps
@@ -324,7 +302,7 @@ def test_template_app_runs(boot):
     # thread joined and its window gone.
     m = boot_desktop(boot)
     app_id, mark = start(m, "template")
-    row = wait_window(m, "template")
+    row = gui.wait_window(m, "template")
     assert row["focused"] == "yes", row
     record, done = poll(
         m, lambda: app(m, app_id), lambda a: a is not None and a["windows"] == "1", 30
@@ -342,11 +320,10 @@ def test_template_app_runs(boot):
     assert len(set(before)) > 2, "the template drew nothing"
     gui.type_confirmed(m, "a")
     gui.wait_for(m, "the key redrawn", lambda: client("template-after.png"), lambda c: c != before)
-    root = gui.node(gui.ui_tree(m), "window", "template")
-    assert run(m, f"ui invoke {root['id']} close") == f"ui invoke: window {row['id']} closed\n"
+    assert gui.invoke_close(m, "template") == f"ui invoke: window {row['id']} closed\n"
     end_line(m, mark, "template", app_id, "exited with 0")
     wait_gone(m, app_id, record["thread"])
-    wait_no_window(m, "template")
+    gui.wait_no_window(m, "template")
 
 
 def test_app_ignoring_close_is_ended(boot):
@@ -357,10 +334,9 @@ def test_app_ignoring_close_is_ended(boot):
     m = boot_desktop(boot)
     app_id, mark = start(m, "window ignore-close")
     wait_for_output(m, mark, r"INFO  app: window: window: opened\n", 30)
-    row = wait_window(m, "window")
+    row = gui.wait_window(m, "window")
     record = app(m, app_id)
-    root = gui.node(gui.ui_tree(m), "window", "window")
-    out = run(m, f"ui invoke {root['id']} close")
+    out = gui.invoke_close(m, "window")
     assert out in (
         f"ui invoke: window {row['id']} closed\n",
         f"ui invoke: window {row['id']} still open (its close is still queued)\n",
@@ -368,7 +344,7 @@ def test_app_ignoring_close_is_ended(boot):
     wait_for_output(m, mark, r"INFO  app: window: window: ignoring close\n", 30)
     end_line(m, mark, "window", app_id, "ended: didn't close its window")
     wait_gone(m, app_id, record["thread"])
-    wait_no_window(m, "window")
+    gui.wait_no_window(m, "window")
 
 
 def test_window_calls_refuse_bad_arguments(boot):
@@ -384,7 +360,7 @@ def test_window_calls_refuse_bad_arguments(boot):
     serial = m.output[mark:]
     assert "FAILED" not in serial and "WARN" not in serial and "ERROR" not in serial, serial
     wait_unlisted(m, app_id)
-    wait_no_window(m, "abuse")
+    gui.wait_no_window(m, "abuse")
 
 
 def test_kill_wakes_an_app_waiting_on_its_window(boot):
@@ -405,4 +381,4 @@ def test_kill_wakes_an_app_waiting_on_its_window(boot):
     kill(m, app_id, "window")
     end_line(m, mark, "window", app_id, "killed")
     wait_gone(m, app_id, record["thread"])
-    wait_no_window(m, "window")
+    gui.wait_no_window(m, "window")

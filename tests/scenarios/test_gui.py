@@ -1440,16 +1440,8 @@ def test_launcher_lists_desktop_apps_only(boot):
         lambda rows: any(r["name"] == "template" for r in rows),
     )
     assert [r["name"] for r in listed] == ["template"], listed
-    win = gui.wait_for(
-        m,
-        "template's window",
-        lambda: gui.windows(m),
-        lambda rows: any(r["title"] == "template" for r in rows),
-        30,
-    )
-    win = next(r for r in win if r["title"] == "template")
-    root = gui.node(gui.ui_tree(m), "window", "template")
-    assert run(m, f"ui invoke {root['id']} close") == f"ui invoke: window {win['id']} closed\n"
+    win = gui.wait_window(m, "template")
+    assert gui.invoke_close(m, "template") == f"ui invoke: window {win['id']} closed\n"
     gui.wait_for(
         m,
         "template ended",

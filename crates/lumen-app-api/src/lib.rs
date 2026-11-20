@@ -31,6 +31,9 @@
 
 extern crate alloc;
 
+#[macro_use]
+pub mod wire;
+
 pub mod args;
 pub mod end;
 pub mod event;
@@ -40,6 +43,8 @@ pub mod layout;
 pub mod limits;
 pub mod manifest;
 pub mod range;
+#[cfg(target_arch = "wasm32")]
+pub mod sys;
 pub mod text;
 pub mod trace;
 

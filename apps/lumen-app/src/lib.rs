@@ -21,7 +21,10 @@
 extern crate alloc;
 
 mod heap;
-pub mod sys;
+
+/// The `lumen` host functions as the module imports them (declared once,
+/// in `lumen-app-api`); apps use the wrappers here.
+pub use lumen_app_api::sys;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -32,7 +35,7 @@ pub use lumen_app_api::event::{Event, KeyAction, KeyCode, Palette, ThemeId};
 pub use lumen_app_api::layout::Rect;
 pub use lumen_app_api::{Error, Grant, LogLevel};
 
-use lumen_app_api::layout::{Canvas, TextDraw};
+use lumen_app_api::layout::{CANVAS_SIZE, Canvas, RECT_SIZE, TextDraw};
 use lumen_app_api::limits::{ARGS_BYTES, COMMIT_RECTS, EVENT_BYTES};
 use sys::ptr;
 
@@ -60,8 +63,12 @@ pub struct Handle(NonZeroU32);
 impl Handle {
     /// The handle to `grant` (the same every time), or `NotGranted`.
     pub fn find(grant: Grant) -> Result<Handle> {
-        let h = check(sys::handle_find(grant as i32))?;
-        NonZeroU32::new(h).map(Handle).ok_or(Error::BadHandle)
+        Handle::from_result(sys::handle_find(grant as i32))
+    }
+
+    /// The handle a host call returned (`0` is never one).
+    fn from_result(r: i32) -> Result<Handle> {
+        NonZeroU32::new(check(r)?).map(Handle).ok_or(Error::BadHandle)
     }
 
     /// Its number, as the host functions take it.
@@ -165,9 +172,13 @@ impl Desktop {
         let mut canvas = Vec::new();
         canvas.try_reserve_exact(pixels).map_err(|_| Error::OutOfMemory)?;
         canvas.resize(pixels, 0);
-        let handle =
-            check(sys::window_open(self.0.raw(), ptr(title.as_ptr()), title.len() as i32, w as i32, h as i32))?;
-        let handle = NonZeroU32::new(handle).map(Handle).ok_or(Error::BadHandle)?;
+        let handle = Handle::from_result(sys::window_open(
+            self.0.raw(),
+            ptr(title.as_ptr()),
+            title.len() as i32,
+            w as i32,
+            h as i32,
+        ))?;
         Ok(Window { handle, desktop: *self, canvas, w, h })
     }
 }
@@ -203,7 +214,7 @@ impl Window {
     }
 
     /// The canvas as the host functions take it.
-    fn layout(&self) -> [u8; 16] {
+    fn layout(&self) -> [u8; CANVAS_SIZE] {
         Canvas { ptr: ptr(self.canvas.as_ptr()) as u32, stride: self.w, w: self.w, h: self.h }.encode()
     }
 
@@ -245,9 +256,9 @@ impl Window {
     pub fn commit(&self, rects: &[Rect]) -> Result<()> {
         let canvas = self.layout();
         for chunk in rects.chunks(COMMIT_RECTS) {
-            let mut raw = [0u8; COMMIT_RECTS * 16];
-            for (i, r) in chunk.iter().enumerate() {
-                raw[i * 16..i * 16 + 16].copy_from_slice(&r.encode());
+            let mut raw = [0u8; COMMIT_RECTS * RECT_SIZE];
+            for (slot, r) in raw.as_chunks_mut::<RECT_SIZE>().0.iter_mut().zip(chunk) {
+                *slot = r.encode();
             }
             check(sys::window_commit(self.handle.raw(), ptr(canvas.as_ptr()), ptr(raw.as_ptr()), chunk.len() as i32))?;
         }

@@ -773,6 +773,35 @@ def wait_for[T](
     return got
 
 
+def wait_window(m: Machine, title: str, timeout: float = 30) -> dict[str, str]:
+    """Wait until `windows` lists a window titled `title`; its row then."""
+    rows = wait_for(
+        m,
+        f"window {title!r} open",
+        lambda: windows(m),
+        lambda rows: any(r["title"] == title for r in rows),
+        timeout,
+    )
+    return one(rows, f"windows titled {title!r}", title=title)
+
+
+def wait_no_window(m: Machine, title: str, timeout: float = 30) -> None:
+    """Wait until `windows` lists no window titled `title`."""
+    wait_for(
+        m,
+        f"window {title!r} closed",
+        lambda: windows(m),
+        lambda rows: all(r["title"] != title for r in rows),
+        timeout,
+    )
+
+
+def invoke_close(m: Machine, title: str) -> str:
+    """`ui invoke <root> close` on the window titled `title`: what it said."""
+    root = node(ui_tree(m), "window", title)
+    return run(m, f"ui invoke {root['id']} close")
+
+
 def wait_windows(m: Machine, count: int, timeout: float = 30) -> list[dict[str, str]]:
     """Wait until `windows` lists `count` windows; its rows then."""
     return wait_for(m, f"{count} windows", lambda: windows(m), lambda w: len(w) == count, timeout)
