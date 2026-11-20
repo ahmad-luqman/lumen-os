@@ -83,8 +83,10 @@ const SET_VALUE_NORMALISED: usize = SET_VALUE_BYTES * TAB.len();
 const _: () = assert!(SET_VALUE_NORMALISED <= LIMITS.text_bytes && SET_VALUE_NORMALISED <= LIMITS.line_bytes);
 const _: () = assert!(LIMITS.undo_bytes >= 2 * LIMITS.text_bytes && LIMITS.undo_edits > 0);
 
-/// Narrow glyphs: the narrowest of them bounds how many chars the view
-/// shows.
+/// Narrow glyphs: the narrowest one's measured advance bounds how many
+/// chars the view shows (as many as fit: a run of narrower ones, each
+/// advance rounded by the host, or of zero-width marks may stop short of
+/// the view's right edge).
 const NARROW: [&str; 9] = [" ", ".", ",", "'", "i", "l", "|", "!", "j"];
 
 /// The view's width for the text, inside an area `area_w` wide: less its

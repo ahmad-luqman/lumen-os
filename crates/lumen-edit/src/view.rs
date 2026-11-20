@@ -4,9 +4,12 @@
 //!
 //! The view is scrolled across by characters: every line shows from the
 //! same column, `first`, and at most `max_chars` characters of it (the
-//! view's width over the narrowest glyph, so they always reach its right
-//! edge). With a proportional font the columns don't line up across lines
-//! once scrolled; the cursor's line always shows its cursor.
+//! caller's estimate of as many as fit: the editor takes the view's width
+//! over the narrowest glyph it measured). A line of glyphs narrower than
+//! that estimate (the host rounds each glyph's advance, so a run of narrow
+//! ones adds up to less) or of zero-width marks may stop short of the
+//! view's right edge. With a proportional font the columns don't line up
+//! across lines once scrolled; the cursor's line always shows its cursor.
 
 /// `line`'s characters from char `first` on: at most `max_chars` of them
 /// and `max_bytes` bytes (cut on a char boundary).
