@@ -7,3 +7,15 @@ tests = [
     "ktest:lumen_kernel::linux::abi_constants_match_spec",
     "audit:flags",
 ]
+
+[[feature]]
+name = "Ring-3 entry/exit (`iretq` and `syscall`/`sysretq`), writable `PerCpu` + `TSS.rsp0`, conditional `SWAPGS` + guarded `IST_DEBUG = 4` (CVE-2018-8897 deferred `#DB` at `LSTAR` handoff), non-fatal ring-3 exceptions, canonical RIP and sanitized RFLAGS return validation, and `.lumen_fixup` fault-safe user copies (`copy_from_user`, `copy_to_user`, `copy_cstr_from_user`) with runtime-gated SMEP/SMAP (#236)"
+milestone = "M6"
+tests = [
+    "ktest:lumen_kernel::arch::x86_64::syscall::syscall_msrs_are_programmed_on_all_cpus",
+    "ktest:lumen_kernel::user::bad_user_pointer_returns_efault",
+    "scenario:test_linux_user::test_ring3_entry_and_exit",
+    "scenario:test_linux_user::test_user_fault_kills_process_not_kernel",
+    "scenario:test_linux_user::test_non_canonical_sysret_does_not_crash_kernel",
+    "audit:flags",
+]

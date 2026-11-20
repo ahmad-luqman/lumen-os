@@ -51,8 +51,8 @@ use crate::{boot, mm, time};
 /// every CPU past the cap to halt.
 const START_TIMEOUT_NS: u64 = 2_000_000_000;
 
-// Four stacks a CPU (main, #DF, NMI, #MC), and room left for others.
-const _: () = assert!(4 * MAX_CPUS < lumen_mm::stacks::MAX_STACKS);
+// Five stacks a CPU (main, #DF, NMI, #DB, #MC), and room left for others.
+const _: () = assert!(5 * MAX_CPUS < lumen_mm::stacks::MAX_STACKS);
 
 /// Where a CPU's slot is in its life. It only moves forward (Empty,
 /// Starting, Online; the boot CPU straight to Online), which the lock-free
@@ -344,19 +344,21 @@ fn allocate(size: u64, kind: StackKind, index: usize) -> StackRange {
 fn start(cpu: &Cpu, index: usize) {
     let df = allocate(STACK_SIZE, StackKind::DoubleFault, index);
     let nmi = allocate(STACK_SIZE, StackKind::Nmi, index);
+    let db = allocate(STACK_SIZE, StackKind::Debug, index);
     let mc = allocate(STACK_SIZE, StackKind::MachineCheck, index);
     let main = allocate(MAIN_STACK_SIZE, StackKind::Main, index);
     // SAFETY: leaked, mapped stacks nothing else uses; the AP is parked in
     // Limine and runs no kernel code until `goto_address` is written below.
-    unsafe { arch::set_ap_ist_stacks(index, df.top, nmi.top, mc.top) };
+    unsafe { arch::set_ap_ist_stacks(index, df.top, nmi.top, mc.top, db.top) };
     info!(
         target: "smp",
-        "cpu {index} stacks: main {:#x}..{:#x}, IST {:#x} {:#x} {:#x} (guard page below each)",
+        "cpu {index} stacks: main {:#x}..{:#x}, IST {:#x} {:#x} {:#x} {:#x} (guard page below each)",
         main.bottom,
         main.top,
         df.bottom,
         nmi.bottom,
-        mc.bottom
+        mc.bottom,
+        db.bottom
     );
     let slot = &SLOTS[index];
     slot.main_top.store(main.top, Ordering::Relaxed);
@@ -406,6 +408,7 @@ extern "C" fn ap_main() -> ! {
     arch::paging::enforce_nx_and_wp();
     arch::paging::check_pat();
     arch::fpu::init_cpu();
+    arch::syscall::init_cpu();
     let lapic = arch::apic::lapic_id();
     assert_eq!(
         lapic,

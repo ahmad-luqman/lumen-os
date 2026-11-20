@@ -21,10 +21,8 @@ use super::percpu::{self, MAX_CPUS};
 
 pub const KERNEL_CODE: u16 = 0x08;
 pub const KERNEL_DATA: u16 = 0x10;
-/// User selectors include RPL 3. Order (data before code) is what `sysret` needs.
-#[allow(dead_code)] // used by M2 (user mode)
+/// User selectors include RPL 3. Order (data before code) is what `sysretq` needs.
 pub const USER_DATA: u16 = 0x18 | 3;
-#[allow(dead_code)] // used by M2 (user mode)
 pub const USER_CODE: u16 = 0x20 | 3;
 pub const TSS: u16 = 0x28;
 
@@ -32,6 +30,7 @@ pub const TSS: u16 = 0x28;
 pub const IST_DOUBLE_FAULT: u8 = 1;
 pub const IST_NMI: u8 = 2;
 pub const IST_MACHINE_CHECK: u8 = 3;
+pub const IST_DEBUG: u8 = 4;
 
 #[repr(C, packed(4))]
 struct TaskStateSegment {
@@ -82,17 +81,17 @@ const GDT_TEMPLATE: [u64; GDT_ENTRIES] = [
 
 static mut GDTS: [[u64; GDT_ENTRIES]; MAX_CPUS] = [GDT_TEMPLATE; MAX_CPUS];
 
-/// Point CPU `cpu`'s IST slots at the tops of its double-fault, NMI and
-/// machine-check stacks. Only through `install_ist_stacks` (boot CPU, which
-/// then makes the IDT use them) or `smp` (an application processor, before
-/// it loads its TSS).
+/// Point CPU `cpu`'s IST slots at the tops of its double-fault, NMI,
+/// machine-check, and `#DB` debug stacks. Only through `install_ist_stacks`
+/// (boot CPU, which then makes the IDT use them) or `smp` (an application
+/// processor, before it loads its TSS).
 ///
 /// # Safety
 /// Each top is the top of a mapped stack that is never freed and that
 /// nothing else uses; CPU `cpu` takes no interrupt that uses an IST slot
 /// meanwhile (the boot CPU: the IDT doesn't use them yet; an AP: it isn't
 /// running kernel code yet), and nothing else writes its TSS.
-pub(super) unsafe fn set_ist_stacks(cpu: usize, double_fault: u64, nmi: u64, machine_check: u64) {
+pub(super) unsafe fn set_ist_stacks(cpu: usize, double_fault: u64, nmi: u64, machine_check: u64, debug: u64) {
     let tss = tss(cpu);
     // SAFETY: upheld by the caller; the CPU reads its TSS only when it takes
     // an interrupt that uses an IST slot.
@@ -100,7 +99,30 @@ pub(super) unsafe fn set_ist_stacks(cpu: usize, double_fault: u64, nmi: u64, mac
         (*tss).ist[usize::from(IST_DOUBLE_FAULT - 1)] = double_fault;
         (*tss).ist[usize::from(IST_NMI - 1)] = nmi;
         (*tss).ist[usize::from(IST_MACHINE_CHECK - 1)] = machine_check;
+        (*tss).ist[usize::from(IST_DEBUG - 1)] = debug;
     }
+}
+
+/// Set CPU `cpu`'s ring-0 interrupt/exception stack pointer (`TSS.rsp0`).
+///
+/// # Safety
+/// Must be called on CPU `cpu` with interrupts disabled (or before `cpu`
+/// enters ring 3), and `rsp0` must be a valid 16-byte-aligned kernel stack
+/// top that remains mapped while ring 3 executes on `cpu`.
+pub unsafe fn set_rsp0(cpu: usize, rsp0: u64) {
+    let tss = tss(cpu);
+    // SAFETY: upheld by the caller; `TSS_SEGMENTS[cpu]` is owned by `cpu`.
+    unsafe {
+        (*tss).rsp[0] = rsp0;
+    }
+}
+
+/// Read this CPU's `TSS.rsp0` (for ktests).
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))]
+pub fn rsp0() -> u64 {
+    let tss = tss(percpu::index());
+    // SAFETY: plain read of this CPU's own TSS.
+    unsafe { (*tss).rsp[0] }
 }
 
 /// The stack top in this CPU's IST slot `slot` (1-based), 0 if unset.

@@ -206,14 +206,15 @@ crate::ktest!(
 
 crate::ktest!(
     fn ist_stacks_are_guarded() {
-        // The #DF, NMI and #MC gates switch to IST stacks, and each slot holds
-        // the top of an allocated, registered stack with an unmapped guard
-        // page below it.
+        // The #DB, #DF, NMI and #MC gates switch to IST stacks, and each slot
+        // holds the top of an allocated, registered stack with an unmapped
+        // guard page below it.
         use crate::arch::{gdt, idt};
         use crate::{kassert, kassert_eq};
         let ists = [
-            (8, gdt::IST_DOUBLE_FAULT, StackKind::DoubleFault),
+            (1, gdt::IST_DEBUG, StackKind::Debug),
             (2, gdt::IST_NMI, StackKind::Nmi),
+            (8, gdt::IST_DOUBLE_FAULT, StackKind::DoubleFault),
             (18, gdt::IST_MACHINE_CHECK, StackKind::MachineCheck),
         ];
         for (vector, slot, kind) in ists {
@@ -226,7 +227,7 @@ crate::ktest!(
             check_guarded(r.range, kind)?;
         }
         // No other vector switches stacks.
-        kassert!((0..256).filter(|v| ![2, 8, 18].contains(v)).all(|v| idt::ist_index(v) == 0));
+        kassert!((0..256).filter(|v| ![1, 2, 8, 18].contains(v)).all(|v| idt::ist_index(v) == 0));
         Ok(())
     }
 );

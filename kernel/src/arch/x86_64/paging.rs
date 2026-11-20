@@ -70,7 +70,6 @@ pub unsafe fn load_root(root: PhysFrame) {
 /// `root` must be a 4 KiB-aligned physical L4 root table (below 2^52) whose
 /// upper half (`L4[256..512]`) maps the running kernel identically to the
 /// kernel hierarchy.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // used by per-process switches (Wave 2) and ktests
 pub unsafe fn write_cr3(root: u64) {
     debug_assert!(PhysFrame::from_u64(root).is_some(), "CR3 root {root:#x} is not a 4 KiB physical frame");
     debug_assert!(read_cr4() & CR4_PCIDE == 0, "CR4.PCIDE must remain 0");

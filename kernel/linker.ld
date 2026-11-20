@@ -42,6 +42,14 @@ SECTIONS
         __ktests_end = .;
     } :rodata
 
+    /* Exception fixup table for fault-safe user copies (copy_from_user,
+     * copy_to_user, copy_cstr_from_user): pairs of (fault_ip, fixup_ip). */
+    .lumen_fixup : ALIGN(8) {
+        __lumen_fixup_start = .;
+        KEEP(*(.lumen_fixup))
+        __lumen_fixup_end = .;
+    } :rodata
+
     /* Precompiled compiler_builtins calls `memcpy` and friends through the
      * GOT. With static relocation its entries are link-time constants, so it
      * is read-only data. Without this rule the linker placed it after
