@@ -15,7 +15,7 @@
 //!   step takes, `at x,y right`), fixed-width
 //!   labels (a changing width would repaint the whole window); `Play`,
 //!   `Step` and `Restart`.
-//! - **Ticks:** flying, it steps every [`period`] (faster each level);
+//! - **Ticks:** flying, it steps every [`PERIOD_MS`] (faster each level);
 //!   `Step` switches to stepping, a step per press with no ticks at all (so
 //!   the desktop settles between presses: goldens and the tree don't depend
 //!   on the host's speed), and `Play` back to flying. Over, `Play` and
@@ -39,7 +39,7 @@ use lumen_app::gfx::Rect as Area;
 use lumen_app::ui::{Flow, Taken, Ticking, Toolkit};
 use lumen_app::{Desktop, Error, Event, KeyAction, KeyCode, Time, log};
 use lumen_snake::{
-    Cell, Content, Dir, Game, LABEL_W, SKY_H, SKY_W, State, comet_label, level_label, score_label, state_label,
+    Cell, Content, Dir, Game, LABEL_W, LEVELS, SKY_H, SKY_W, State, comet_label, level_label, score_label, state_label,
 };
 use lumen_ui::{App, Over, Palette, Then, Ui, UiEvent, Widget};
 
@@ -60,10 +60,8 @@ const HEIGHT: u32 = PAD + SKY.h() + PAD;
 const TREE: Area = Area::new(0, 0, TREE_W, HEIGHT);
 const USAGE: &str = "usage: comet [--seed N] [--step]";
 
-/// The time between steps while flying at `level`: faster each level.
-fn period(level: usize) -> u64 {
-    [160, 140, 120, 100][level.min(3)] * 1_000_000
-}
+/// The time between steps while flying, in ms, by level: faster each one.
+const PERIOD_MS: [u64; LEVELS.len()] = [160, 140, 120, 100];
 
 /// What `run` asked for.
 struct Args {
@@ -71,14 +69,17 @@ struct Args {
     stepping: bool,
 }
 
+/// `run`'s words after the app's name, or why not.
 fn parse(words: &[String]) -> Result<Args, String> {
     let mut args = Args { seed: None, stepping: false };
-    let mut it = words.iter();
+    let mut it = words.iter().peekable();
     while let Some(w) = it.next() {
         match w.as_str() {
-            "--step" if !args.stepping => args.stepping = true,
-            "--seed" if args.seed.is_none() => {
-                let n = it.next().ok_or_else(|| String::from("--seed needs a number"))?;
+            "--step" if args.stepping => return Err(String::from("--step given twice")),
+            "--step" => args.stepping = true,
+            "--seed" if args.seed.is_some() => return Err(String::from("--seed given twice")),
+            "--seed" => {
+                let n = it.next_if(|n| !n.starts_with("--")).ok_or_else(|| String::from("--seed needs a number"))?;
                 args.seed = Some(n.parse().map_err(|_| format!("'{n}' is not a seed (0 to 2^64 - 1)"))?);
             }
             other => return Err(format!("'{other}' isn't an argument it takes")),
@@ -93,6 +94,8 @@ struct Comet {
     game: Game,
     seed: Option<u64>,
     time: Time,
+    /// Whether a clock read for a seed failed already (logged once).
+    clock_warned: bool,
     /// Stepping (one step per Step press) or flying; and how it was
     /// launched, which each Restart starts again.
     stepping: bool,
@@ -117,10 +120,12 @@ impl Comet {
         let play = ui.button(None, "Play");
         let step = ui.button(None, "Step");
         let restart = ui.button(None, "Restart");
-        let game = new_game(time, args.seed);
+        let mut clock_warned = false;
+        let game = new_game(time, args.seed, &mut clock_warned);
         let mut c = Comet {
             ui,
             game,
+            clock_warned,
             seed: args.seed,
             time,
             stepping: args.stepping,
@@ -165,9 +170,10 @@ impl Comet {
     /// A new game, in the mode it was launched in (stepping with
     /// `--step`): a mode chosen in the last game doesn't carry over.
     fn restart(&mut self) {
-        self.game = new_game(self.time, self.seed);
+        self.game = new_game(self.time, self.seed, &mut self.clock_warned);
         self.stepping = self.launched_stepping;
-        self.drawn.push(FRAMED);
+        // The whole sky (the frame doesn't change).
+        self.drawn.push(SKY);
         self.show();
     }
 
@@ -188,9 +194,17 @@ impl Comet {
     }
 }
 
-/// A game on Comet's sky, seeded with `seed` or else the clock.
-fn new_game(time: Time, seed: Option<u64>) -> Game {
-    let seed = seed.unwrap_or_else(|| time.now_ns().unwrap_or(0).rotate_left(17));
+/// A game on Comet's sky, seeded with `seed` or else the clock (a failed
+/// read seeds 0, logged the first time: `warned`).
+fn new_game(time: Time, seed: Option<u64>, warned: &mut bool) -> Game {
+    let seed = seed.unwrap_or_else(|| {
+        time.now_ns().unwrap_or_else(|e| {
+            if !core::mem::replace(warned, true) {
+                log::warn(&format!("no clock for a seed ({e}): seed 0"));
+            }
+            0
+        })
+    });
     Game::new(SKY_W, SKY_H, seed).expect("Comet's sky is big enough")
 }
 
@@ -293,7 +307,7 @@ impl App for Comet {
 
 impl Ticking for Comet {
     fn period(&self) -> Option<u64> {
-        (!self.stepping && self.game.state() == State::Flying).then(|| period(self.game.level()))
+        (!self.stepping && self.game.state() == State::Flying).then(|| PERIOD_MS[self.game.level()] * 1_000_000)
     }
 
     fn tick(&mut self, _now: u64) -> Flow {
@@ -305,7 +319,17 @@ impl Ticking for Comet {
 /// The app's exit code: 0 once its window is closed; 2 for arguments it
 /// doesn't take; 1 once another failure is logged.
 fn run() -> i32 {
-    let args = match lumen_app::args().map_err(|e| format!("{e}")).and_then(|w| parse(&w)) {
+    // An argument that isn't UTF-8 is one it doesn't take (2); another
+    // failure to read them is the app's (1, through `report`).
+    let words = match lumen_app::args() {
+        Ok(w) => w,
+        Err(Error::BadArgument) => {
+            log::error(&format!("an argument isn't UTF-8; {USAGE}"));
+            return 2;
+        }
+        Err(e) => return lumen_app::report(Err(("no arguments", e))),
+    };
+    let args = match parse(&words) {
         Ok(a) => a,
         Err(why) => {
             log::error(&format!("{why}; {USAGE}"));

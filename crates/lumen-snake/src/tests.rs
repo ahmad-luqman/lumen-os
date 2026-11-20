@@ -91,7 +91,7 @@ fn a_game_starts_on_the_middle_row_heading_right() {
     let g = game(1);
     assert_eq!(g.state(), State::Flying);
     assert_eq!(g.comet().collect::<Vec<_>>(), [Cell::new(3, 5), Cell::new(2, 5), Cell::new(1, 5)]);
-    assert_eq!((g.score(), g.level(), g.steps(), g.heading()), (0, 0, 0, Dir::Right));
+    assert_eq!((g.score(), g.level(), g.heading()), (0, 0, Dir::Right));
     assert!(g.dust().is_some());
     check(&g);
     assert!(Game::new(MIN_W - 1, H, 1).is_none());
@@ -160,17 +160,17 @@ fn a_grain_scores_and_grows_the_tail_a_cell_a_step() {
     put_dust(&mut g, Cell::new(START_LEN + 1, 5));
     let changed = g.step();
     assert_eq!(g.score(), 1);
-    assert_eq!(g.len(), START_LEN as usize);
+    assert_eq!(g.comet().count(), START_LEN as usize);
     // The grain eaten; the next one placed (and reported).
     let next = g.dust().expect("a new grain");
     assert!(changed.contains(&next));
     dust_aside(&mut g);
     for k in 1..=GROWTH as usize {
         g.step();
-        assert_eq!(g.len(), START_LEN as usize + k);
+        assert_eq!(g.comet().count(), START_LEN as usize + k);
     }
     g.step();
-    assert_eq!(g.len(), START_LEN as usize + GROWTH as usize);
+    assert_eq!(g.comet().count(), START_LEN as usize + GROWTH as usize);
     check(&g);
 }
 
@@ -198,7 +198,7 @@ fn it_may_move_into_the_cell_its_tail_leaves() {
     // tail's end just left.
     g.grow = 1;
     g.step();
-    assert_eq!(g.len(), 4);
+    assert_eq!(g.comet().count(), 4);
     for _ in 0..3 {
         for d in [Dir::Down, Dir::Left, Dir::Up, Dir::Right] {
             assert!(g.turn(d));
@@ -385,7 +385,8 @@ fn levels_change_every_few_grains_and_the_last_stays() {
                 }
             }
         }
-        // Turn round at the edges (a U-turn two rows down, clear of rocks).
+        // Turn round at the edges: a U-turn one row down (the two cells below
+        // cleared of rocks and grains first).
         let h = g.head();
         if (g.heading() == Dir::Right && h.x + 2 >= W) || (g.heading() == Dir::Left && h.x <= 1) {
             let back = g.heading().opposite();
@@ -454,15 +455,14 @@ fn the_scenario_s_seed_puts_its_first_grain_ahead() {
     }
     assert_eq!(g.score(), 1);
     // The second grain isn't on the row ahead either: straight on, it
-    // ends at the edge with a score of 1, after COMET_STEPS_TO_EDGE steps.
-    let mut steps = COMET_DUST_AHEAD as u64;
-    while g.state() == State::Flying {
-        g.step();
-        steps += 1;
+    // moves COMET_STEPS_TO_EDGE times in all, then ends at the edge with a
+    // score of 1 (a step that moves changes cells; the crash changes none).
+    let mut moves = COMET_DUST_AHEAD;
+    while !g.step().is_empty() {
+        moves += 1;
     }
     assert_eq!((g.state(), g.score()), (State::Over(Crash::Edge), 1));
-    assert_eq!(g.steps(), u64::from(COMET_STEPS_TO_EDGE));
-    assert_eq!(steps, u64::from(COMET_STEPS_TO_EDGE) + 1);
+    assert_eq!(moves, COMET_STEPS_TO_EDGE);
 }
 
 /// The scenario's numbers (tests/scenarios/test_apps.py says the same).
@@ -730,4 +730,34 @@ fn the_scenario_s_turns_run_into_the_tail() {
     g.step();
     assert_eq!(g.head(), Cell::new(START_LEN + 1, SKY_H / 2 + 1));
     assert_eq!(g.score(), 0);
+}
+
+#[test]
+fn a_new_field_spares_the_two_cells_ahead() {
+    // The comet flying up column 6 eats its fifth grain at (6, 4): the
+    // twin belts' upper row is row 3, right ahead, but (6, 3) and (6, 2)
+    // stay empty; the rest of the field is placed.
+    let mut g = game(12);
+    for c in g.comet().collect::<Vec<_>>() {
+        g.set(c, Content::Empty);
+    }
+    g.body = [Cell::new(6, 5), Cell::new(6, 6), Cell::new(6, 7)].into_iter().collect();
+    g.set(Cell::new(6, 5), Content::Head);
+    g.set(Cell::new(6, 6), Content::Tail);
+    g.set(Cell::new(6, 7), Content::Tail);
+    (g.moved, g.heading) = (Dir::Up, Dir::Up);
+    g.score = LEVEL_EVERY - 1;
+    put_dust(&mut g, Cell::new(6, 4));
+    g.step();
+    assert_eq!(g.level(), 1);
+    assert_ne!(g.content(Cell::new(6, 3)), Content::Rock);
+    // (The lower belt crosses the comet's tail, which keeps its cell.)
+    for c in rocks(1, W, H).into_iter().filter(|c| *c != Cell::new(6, 3)) {
+        assert!(matches!(g.content(c), Content::Rock | Content::Dust | Content::Tail), "{c:?}");
+    }
+    // Two steps up: it flies on through the gap.
+    put_dust(&mut g, Cell::new(0, 0));
+    g.step();
+    g.step();
+    assert_eq!((g.state(), g.head()), (State::Flying, Cell::new(6, 2)));
 }

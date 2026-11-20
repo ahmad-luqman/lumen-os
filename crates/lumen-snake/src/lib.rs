@@ -14,7 +14,8 @@
 //!   (the tail's end stays put meanwhile), and one to the score.
 //! - **Levels:** every [`LEVEL_EVERY`] grains the sky changes to the next
 //!   of [`LEVELS`]' asteroid fields (the last one stays), the old asteroids
-//!   gone and the new ones placed only on empty cells.
+//!   gone and the new ones placed only on empty cells, never on the two
+//!   cells straight ahead of the comet.
 //! - **Stardust** goes on an empty cell chosen by the game's own
 //!   generator ([`Rng`], seeded at [`Game::new`]), never on the comet or an
 //!   asteroid; with no empty cell left the sky is full ([`State::Full`]).
@@ -35,21 +36,24 @@ pub const GROWTH: u32 = 3;
 pub const LEVEL_EVERY: u32 = 5;
 /// The comet's cells at the start (its head and tail).
 pub const START_LEN: u16 = 3;
-/// The smallest sky a game takes: room for the comet's start and every
-/// level's field.
+/// The narrowest sky a game takes: room for the comet's start and every
+/// level's field across.
 pub const MIN_W: u16 = 12;
+/// The shortest sky a game takes: room for every level's field down (the
+/// ring two cells in from each edge needs rows inside it).
 pub const MIN_H: u16 = 8;
 
 /// Comet's sky (the app's board): columns and rows.
 pub const SKY_W: u16 = 24;
 pub const SKY_H: u16 = 18;
+const _: () = assert!(SKY_W >= MIN_W && SKY_H >= MIN_H);
 
 /// Comet's labels' fixed width in pixels (its widget column, less its
 /// padding): every text the label functions below give fits it in the UI
 /// font at the apps' toolkit size (`every_label_fits_its_width`).
 pub const LABEL_W: u32 = 164;
 
-/// The levels' names, in order: each one's asteroid field is [`rocks`]'.
+/// The levels' names, in order: each one's asteroid field is `rocks`'.
 pub const LEVELS: [&str; 4] = ["Open sky", "Twin belts", "Crossing", "Ring of rocks"];
 
 /// The game's generator: SplitMix64, small and good enough for a game, the
@@ -173,7 +177,6 @@ pub struct Game {
     dust: Option<Cell>,
     score: u32,
     level: usize,
-    steps: u64,
     rng: Rng,
     state: State,
 }
@@ -197,7 +200,6 @@ impl Game {
             dust: None,
             score: 0,
             level: 0,
-            steps: 0,
             rng: Rng::new(seed),
             state: State::Flying,
         };
@@ -233,10 +235,6 @@ impl Game {
         self.level
     }
 
-    pub fn steps(&self) -> u64 {
-        self.steps
-    }
-
     pub fn head(&self) -> Cell {
         self.body[0]
     }
@@ -246,19 +244,12 @@ impl Game {
         self.body.iter().copied()
     }
 
-    pub fn len(&self) -> usize {
-        self.body.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.body.is_empty()
-    }
-
     pub fn dust(&self) -> Option<Cell> {
         self.dust
     }
 
-    /// The heading the next step takes.
+    /// The heading the next step takes: the last move's, or the last turn
+    /// taken since (a refused turn leaves it).
     pub fn heading(&self) -> Dir {
         self.heading
     }
@@ -282,7 +273,7 @@ impl Game {
     /// One step: the comet moves a cell in its heading, eating a grain
     /// there (its score, its growth, maybe a new level, the next grain), or
     /// the flight ends against the edge, its tail or an asteroid (the comet
-    /// left where it was). The cells it changed, each once, in order; none
+    /// left where it was). The cells it changed, each once; none
     /// once the flight is over.
     pub fn step(&mut self) -> Vec<Cell> {
         let mut changed = Vec::new();
@@ -298,7 +289,8 @@ impl Game {
         // so its cell is free to move into.
         let vacates = self.grow == 0;
         let end = *self.body.back().expect("a comet has cells");
-        match self.content(to) {
+        let what = self.content(to);
+        match what {
             Content::Rock => {
                 self.state = State::Over(Crash::Rock);
                 return changed;
@@ -309,9 +301,7 @@ impl Game {
             }
             _ => {}
         }
-        let eats = self.content(to) == Content::Dust;
         self.moved = self.heading;
-        self.steps += 1;
         if vacates {
             self.body.pop_back();
             self.set(end, Content::Empty);
@@ -324,7 +314,7 @@ impl Game {
         self.body.push_front(to);
         self.set(to, Content::Head);
         changed.push(to);
-        if eats {
+        if what == Content::Dust {
             self.dust = None;
             self.score += 1;
             self.grow += GROWTH;
@@ -334,16 +324,25 @@ impl Game {
             }
             self.place_dust(&mut changed);
         }
-        dedup_in_order(&mut changed);
+        // A cell emptied and filled again in this step (the tail's end the
+        // head moved into, one the new field or the next grain took) is
+        // reported once.
+        changed.sort_unstable();
+        changed.dedup();
         changed
     }
 
     /// The old level's asteroids gone, the new one's placed on the empty
-    /// cells of its field; a cell that is a rock in both is left alone (and
-    /// not reported: it didn't change).
+    /// cells of its field, except the two cells straight ahead of the head
+    /// (a rock appearing right in front would end the flight with no chance
+    /// to turn); a cell that is a rock in both is left alone (and not
+    /// reported: it didn't change).
     fn change_level(&mut self, level: usize, changed: &mut Vec<Cell>) {
         let old = rocks(self.level, self.w, self.h);
-        let new = rocks(level, self.w, self.h);
+        let mut new = rocks(level, self.w, self.h);
+        let ahead = self.next_cell(self.head(), self.moved);
+        let further = ahead.and_then(|c| self.next_cell(c, self.moved));
+        new.retain(|c| Some(*c) != ahead && Some(*c) != further);
         for &c in old.iter().filter(|c| !new.contains(c)) {
             if self.content(c) == Content::Rock {
                 self.set(c, Content::Empty);
@@ -402,19 +401,6 @@ impl Game {
     }
 }
 
-/// `cells` with each cell kept at its first place only.
-fn dedup_in_order(cells: &mut Vec<Cell>) {
-    let mut seen: Vec<Cell> = Vec::with_capacity(cells.len());
-    cells.retain(|c| {
-        if seen.contains(c) {
-            false
-        } else {
-            seen.push(*c);
-            true
-        }
-    });
-}
-
 /// Level `level`'s asteroid field on a `w` × `h` sky (our own layouts,
 /// scaled to the sky; the cells may hold the comet or a grain when placed,
 /// which then keep them):
@@ -424,7 +410,7 @@ fn dedup_in_order(cells: &mut Vec<Cell>) {
 /// - 2, "Crossing": a cross through the middle, its centre open;
 /// - 3, "Ring of rocks": a ring two cells in from the edge, every third
 ///   cell open.
-pub fn rocks(level: usize, w: u16, h: u16) -> Vec<Cell> {
+pub(crate) fn rocks(level: usize, w: u16, h: u16) -> Vec<Cell> {
     let mut out = Vec::new();
     match level {
         1 => {
