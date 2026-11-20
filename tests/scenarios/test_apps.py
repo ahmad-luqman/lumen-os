@@ -1386,6 +1386,8 @@ def test_editor_golden_scrolled_across(boot, artifacts, golden_dir):
         size=(x1 - x0, y1 - y0),
         artifacts=artifacts,
     )
+
+
 # -- the image viewer (#204) ---------------------------------------------------
 
 WALLPAPER = REPO_ROOT / "assets" / "wallpaper" / "lumen.png"
