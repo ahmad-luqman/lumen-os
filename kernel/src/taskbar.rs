@@ -34,22 +34,26 @@ const PAD: u32 = 4;
 /// What the launcher opens first, in its order; the bundled desktop apps
 /// follow ([`items`]).
 const ITEMS: [&str; 4] = ["Terminal", "Mandelbrot", "Life", "Counter"];
-/// The items of [`ITEMS`] that start a bundled app (#202: the Life app
-/// replaced the kernel's Life window), and the app each starts: left out of
-/// the apps after them, so none is listed twice.
-const ITEM_APPS: [(&str, &str); 1] = [("Life", "life")];
+/// The bundled app the `Life` item starts (#202: the Life app replaced the
+/// kernel's Life window): left out of the apps after [`ITEMS`], so it is
+/// listed once.
+const LIFE_APP: &str = "life";
 
 /// The launcher's items: [`ITEMS`], then the bundled apps whose manifest
-/// grants `desktop` (never the test apps), by name, but those an item of
-/// [`ITEMS`] starts ([`ITEM_APPS`]).
+/// grants `desktop` (never the test apps), by name, but [`LIFE_APP`].
 fn items() -> Vec<&'static str> {
     items_with(crate::app::desktop_apps())
 }
 
-/// [`items`] over the bundled desktop apps `apps`.
+/// [`items`] over the bundled desktop apps `apps`. Without [`LIFE_APP`]
+/// among them (not bundled, or left out by `precheck`, which warned), the
+/// Life item stays, its launch then refused (`run: no app life`): one WARN
+/// says so here.
 fn items_with(apps: Vec<&'static str>) -> Vec<&'static str> {
-    let started_by_an_item = |a: &&str| ITEM_APPS.iter().any(|&(_, app)| app == *a);
-    ITEMS.into_iter().chain(apps.into_iter().filter(|a| !started_by_an_item(a))).collect()
+    if !apps.contains(&LIFE_APP) {
+        log::warn!(target: "taskbar", "Life: no bundled desktop app {LIFE_APP}: the item can't start it");
+    }
+    ITEMS.into_iter().chain(apps.into_iter().filter(|&a| a != LIFE_APP)).collect()
 }
 /// How often the clock polls the RTC.
 const POLL_NS: u64 = 1_000_000_000;
@@ -193,16 +197,14 @@ impl Taskbar {
         }
         let Some(&name) = self.items.get(item) else { return Err(String::from("no such item")) };
         let window = |id: Result<u32, String>| id.map(|id| format!("window {id}"));
-        // An app's name is lower case (kernel/build.rs): never a demo's.
         let app = |name: &str| crate::app::start(name).map(|id| format!("app {id}"));
+        // An app's name is lower case (kernel/build.rs): never a demo's.
         match name {
             "Terminal" => window(crate::termwin::open()),
             "Mandelbrot" => window(crate::demo::open_mandelbrot_window()),
+            "Life" => app(LIFE_APP),
             "Counter" => window(crate::ui::open_counter()),
-            item => match ITEM_APPS.iter().find(|&&(i, _)| i == item) {
-                Some(&(_, started)) => app(started),
-                None => app(item),
-            },
+            bundled => app(bundled),
         }
     }
 }
@@ -310,8 +312,9 @@ crate::ktest!(
             items_with(alloc::vec!["calculator", "life", "template"]),
             alloc::vec!["Terminal", "Mandelbrot", "Life", "Counter", "calculator", "template"]
         );
-        // The bundled set: `life` is there, and listed only as Life.
-        crate::kassert!(crate::app::desktop_apps().contains(&"life"));
+        // The bundled set: the app the Life item starts is there, and
+        // listed only as Life.
+        crate::kassert!(crate::app::desktop_apps().contains(&LIFE_APP));
         let listed = items();
         crate::kassert_eq!(listed.iter().filter(|i| i.eq_ignore_ascii_case("life")).count(), 1);
         Ok(())

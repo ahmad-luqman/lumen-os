@@ -209,7 +209,7 @@ own PR that updates that doc first.
   owner thread (`terminal`: draws the grid, hands keys over, blinks the focused one's cursor) and its shell
   (`term-shell`, `shell::run_in_window` on a closable console), joined on close; `term text <window>`.
   `taskbar.rs`: the desktop shell's taskbar (#157): a panel along the bottom, its `Launcher` menu
-  (Terminal, Mandelbrot, Life, Counter, then the bundled apps granting `desktop`, #206; Life starting the Life app, which is left out of those, `ITEM_APPS`, #202; refused while
+  (Terminal, Mandelbrot, Life, Counter, then the bundled apps granting `desktop`, #206; Life starting the Life app, which is left out of those, `LIFE_APP`, #202; refused while
   paused, a failure answered `Then::Failed`), a
   button per window, the `Clock` (the RTC polled without animating, `rtc::now_quiet`, its last reading kept
   on errors; `desktop tick` moves it a minute ahead), its `taskbar` owner thread

@@ -3879,7 +3879,7 @@ SSE); #197 checks the results' bits.
   `precheck` refuses is left out with a WARN naming why
   (`app::tests::every_bundled_app_passes_precheck` keeps that from
   shipping). Its Life item starts the Life app (#202: `taskbar.rs`'s
-  `ITEM_APPS`), which is therefore left out of the apps after the demo
+  `LIFE_APP`), which is therefore left out of the apps after the demo
   items, so it is listed once
   (`taskbar::the_launcher_lists_the_life_app_once`).
 - **Loading from disk (M6)** will need more: import names in errors are
