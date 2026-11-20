@@ -837,3 +837,109 @@ fn a_tree_rect_and_an_app_rect_overlapping_are_committed_once() {
         assert!(inside, "{r:?} not covered by {:?}", done.rects);
     }
 }
+
+/// A tree with a text area (an editor's buffer, its text the app's to
+/// draw) and a button, laid out, the window focused, damage and changes
+/// taken.
+fn area_tree(text: &str) -> (Ui, Widget, Widget) {
+    let mut ui = Ui::new();
+    let area = ui.text_area(None, "Buffer", text, 200, 100);
+    let ok = ui.button(None, "OK");
+    ui.layout(AREA, &mut FixedText);
+    ui.set_window_focused(true);
+    let _ = ui.take_damage();
+    let _ = ui.take_changed();
+    (ui, area, ok)
+}
+
+#[test]
+fn a_text_area_is_a_textfield_node_of_its_size_whose_text_the_tree_never_paints() {
+    let (ui, area, _) = area_tree("hello");
+    let b = ui.bounds(area);
+    assert_eq!((b.w(), b.h()), (200, 100));
+    let (_, node) = ui.nodes().into_iter().find(|(_, n)| n.name() == "Buffer").expect("its node");
+    assert_eq!(node.role(), Role::TextField);
+    assert_eq!(node.value(), Some(&Value::Text(String::from("hello"))));
+    assert_eq!(node.bounds(), b);
+    // Its field colour inside its border, and no text: every pixel inside
+    // is the field's (a text field would show its text's blocks there).
+    let mut s = Surface::new(400, 200);
+    ui.paint(&mut s, &mut FixedText, &PALETTE);
+    for y in b.y() + 1..b.bottom() - 1 {
+        for x in b.x() + 1..b.right() - 1 {
+            assert_eq!(s.pixel(x, y), Some(PALETTE.field), "({x}, {y})");
+        }
+    }
+    assert_eq!(s.pixel(b.x(), b.y()), Some(PALETTE.border));
+}
+
+#[test]
+fn setting_a_text_area_s_text_changes_the_tree_but_repaints_nothing() {
+    let (mut ui, area, _) = area_tree("hello");
+    ui.set_text(area, "hello, world");
+    assert_eq!(ui.text(area), Some("hello, world"));
+    assert!(ui.take_changed(), "the tree changed: to publish");
+    assert_eq!(ui.take_damage(), crate::ui::Repaint::Nothing, "its app draws the text");
+    // The same text again changes nothing.
+    ui.set_text(area, "hello, world");
+    assert!(!ui.take_changed());
+}
+
+#[test]
+fn keys_never_edit_a_text_area_and_a_click_only_focuses_it() {
+    let (mut ui, area, _) = area_tree("abc");
+    let (x, y) = centre(ui.bounds(area));
+    let mut events = ui.handle(Input::Down { x, y });
+    events.extend(ui.handle(Input::Up { x, y }));
+    assert!(events.is_empty(), "{events:?}");
+    assert_eq!(ui.focused(), Some(area));
+    assert!(ui.handle(Input::Key(Key::Char('d'))).is_empty());
+    assert!(ui.handle(Input::Key(Key::Backspace)).is_empty());
+    assert_eq!(ui.text(area), Some("abc"));
+}
+
+#[test]
+fn set_value_on_a_text_area_sets_its_text_and_reports_it_edited() {
+    let (mut ui, area, _) = area_tree("old");
+    let id = ui.id(area).expect("not removed").get();
+    assert_eq!(ui.invoke(id, &Action::SetValue(String::from("new text"))), Ok(alloc::vec![UiEvent::Edited(area)]));
+    assert_eq!(ui.text(area), Some("new text"));
+    assert_eq!(ui.focused(), Some(area));
+    assert!(ui.take_changed());
+}
+
+#[test]
+fn a_text_area_s_focus_changing_repaints_only_its_ring() {
+    let (mut ui, area, ok) = area_tree("text");
+    let b = ui.bounds(area);
+    let only_ring = |ui: &mut Ui| match ui.take_damage() {
+        crate::ui::Repaint::Rects(rects) => {
+            assert!(!rects.is_empty());
+            for r in &rects {
+                assert!(r.intersect(&b).is_none(), "{r:?} inside the area {b:?}");
+            }
+            rects
+        }
+        other => panic!("{other:?}"),
+    };
+    // Focused: its ring's strips (all four sides, around it), not its inside.
+    ui.invoke(ui.id(area).expect("not removed").get(), &Action::Focus).expect("focusable");
+    let strips = only_ring(&mut ui);
+    let covered: u64 = strips.iter().map(|r| r.area()).sum();
+    let ring_area = Rect::new(b.x() - 2, b.y() - 2, b.w() + 4, b.h() + 4).area() - b.area();
+    assert_eq!(covered, ring_area, "{strips:?}");
+    // The window losing the focus, and gaining it again.
+    ui.set_window_focused(false);
+    only_ring(&mut ui);
+    ui.set_window_focused(true);
+    only_ring(&mut ui);
+    // The focus moving to the button: the area's ring, and the button.
+    ui.invoke(ui.id(ok).expect("not removed").get(), &Action::Focus).expect("focusable");
+    match ui.take_damage() {
+        crate::ui::Repaint::Rects(rects) => {
+            assert!(rects.iter().all(|r| r.intersect(&b).is_none()), "{rects:?}");
+            assert!(rects.iter().any(|r| r.intersect(&ui.bounds(ok)).is_some()), "{rects:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
