@@ -1364,3 +1364,25 @@ def test_editor_a_key_costs_a_fraction_of_a_full_repaint(boot):
     run(m, "theme dark")
     full = fuel(m, app_id) - before - key
     assert 0 < key and key * 13 < full, (key, full)
+
+
+def test_editor_golden_scrolled_across(boot, artifacts, golden_dir):
+    # A line wider than the view (100 chars, its last a "Z"), the cursor at
+    # its end: the view scrolled across, its text drawn from the view's
+    # first column (`lumen_edit::view`), not the line's start, against a
+    # golden, the blink off.
+    m = boot_desktop(boot)
+    start(m, "editor --empty --no-blink")
+    wid, _ = editor_tree(m)
+    gui.type_confirmed(m, "0123456789" * 9 + "abcdefghiZ")
+    gui.wait_ui(m, "a wide line", lambda r: editor_status(r) == "Ln 1, Col 101, modified", wid)
+    row = gui.window(m, "Editor")
+    x0, y0, x1, y1 = gui.client_box(row)
+    shot = gui.settled_screendump(m, "editor-scrolled.png")
+    assert_matches_golden(
+        shot,
+        golden_dir / "app-editor-scrolled.png",
+        origin=(x0, y0),
+        size=(x1 - x0, y1 - y0),
+        artifacts=artifacts,
+    )
