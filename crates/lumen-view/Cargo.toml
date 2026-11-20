@@ -1,0 +1,16 @@
+[package]
+name = "lumen-view"
+description = "no_std logic for Lumen's image viewer app (#204): an image at 1:1 (panned, or centred) or fitted to the view (nearest neighbour), and the app's memory plan, checked by running its allocations through its own allocator logic; host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lumen-app-api.workspace = true
+
+[dev-dependencies]
+lumen-heap.workspace = true
+lumen-png.workspace = true
+
+[lints]
+workspace = true
