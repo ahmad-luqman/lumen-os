@@ -496,7 +496,7 @@ pub fn new_user_root() -> Option<PhysFrame> {
 /// half, and `phys` must be an allocated physical frame whose ownership is
 /// transferred to `root` (freed on [`destroy_user_root`] or unmap).
 pub unsafe fn map_user_page(root: PhysFrame, virt: VirtAddr, phys: PhysFrame, attrs: Attrs) -> Result<(), MapError> {
-    debug_assert_ne!(root, kernel_root(), "map_user_page must never mutate kernel_root()");
+    assert_ne!(root, kernel_root(), "map_user_page must never mutate kernel_root()");
     assert!(attrs.user(), "map_user_page requires user-mode attributes");
     pt::map(&mut Hhdm, root, virt, phys, PageSize::Size4K, attrs)
 }
@@ -514,7 +514,7 @@ pub fn walk_user(root: PhysFrame, virt: VirtAddr) -> Walk {
 /// [`kernel_root`]), and the caller must have exclusive write access to its
 /// lower half and flush the TLB if `root` is active and the page was present.
 pub unsafe fn protect_user_page(root: PhysFrame, virt: VirtAddr, attrs: Attrs) -> Result<Mapping, ProtectError> {
-    debug_assert_ne!(root, kernel_root(), "protect_user_page must never mutate kernel_root()");
+    assert_ne!(root, kernel_root(), "protect_user_page must never mutate kernel_root()");
     assert!(attrs.user(), "protect_user_page requires user-mode attributes");
     pt::protect(&mut Hhdm, root, virt, attrs)
 }
@@ -534,12 +534,12 @@ pub unsafe fn unmap_user_range(
     end: u64,
     mut on_unmapped: impl FnMut(VirtAddr, PhysFrame, bool),
 ) {
-    debug_assert_ne!(root, kernel_root(), "unmap_user_range must never mutate kernel_root()");
-    debug_assert!(start.is_multiple_of(FRAME_SIZE) && end.is_multiple_of(FRAME_SIZE) && start <= end);
+    assert_ne!(root, kernel_root(), "unmap_user_range must never mutate kernel_root()");
+    assert!(start.is_multiple_of(FRAME_SIZE) && end.is_multiple_of(FRAME_SIZE) && start <= end);
     let mut addr = start;
     while addr < end {
         let va = VirtAddr::new(addr).expect("lower-half user address is canonical");
-        debug_assert!(va.is_lower_half(), "unmap_user_range called on upper-half {va}");
+        assert!(va.is_lower_half(), "unmap_user_range called on upper-half {va}");
         let w = pt::walk(&Hhdm, root, va);
         match w.end() {
             WalkEnd::Mapped(_) | WalkEnd::ProtNone(_) => {
@@ -577,13 +577,13 @@ pub unsafe fn protect_user_range(
     attrs: Attrs,
     mut on_protected: impl FnMut(VirtAddr, bool),
 ) {
-    debug_assert_ne!(root, kernel_root(), "protect_user_range must never mutate kernel_root()");
+    assert_ne!(root, kernel_root(), "protect_user_range must never mutate kernel_root()");
     assert!(attrs.user(), "protect_user_range requires user-mode attributes");
-    debug_assert!(start.is_multiple_of(FRAME_SIZE) && end.is_multiple_of(FRAME_SIZE) && start <= end);
+    assert!(start.is_multiple_of(FRAME_SIZE) && end.is_multiple_of(FRAME_SIZE) && start <= end);
     let mut addr = start;
     while addr < end {
         let va = VirtAddr::new(addr).expect("lower-half user address is canonical");
-        debug_assert!(va.is_lower_half(), "protect_user_range called on upper-half {va}");
+        assert!(va.is_lower_half(), "protect_user_range called on upper-half {va}");
         let w = pt::walk(&Hhdm, root, va);
         match w.end() {
             WalkEnd::Mapped(_) | WalkEnd::ProtNone(_) => {
@@ -641,6 +641,7 @@ unsafe fn free_user_subtree(table: PhysFrame, level: pt::Level) {
 /// and intermediate table under `root` must be exclusively owned by this
 /// address space.
 pub unsafe fn clear_user_lower_half(root: PhysFrame) {
+    assert_ne!(root, kernel_root(), "clear_user_lower_half must never mutate kernel_root()");
     assert_ne!(hw::active_root(), root, "cannot clear active CR3 root {root}");
     for index in 0..(ENTRIES / 2) {
         let Some(raw) = Hhdm.read(root, index) else {

@@ -128,12 +128,13 @@ def test_non_canonical_sysret_does_not_crash_kernel(boot):
 
 
 def test_bad_elf_rejected(boot):
-    """Malformed, W+X, overlapping, kernel-half, PT_INTERP, and W+X-shared-page
-    ELF64 images are rejected cleanly with zero leaked physical frames or heap."""
+    """Malformed, W+X, overlapping, kernel-half, PT_INTERP, W+X-shared-page,
+    and stack-overlapping ELF64 images are rejected cleanly with zero leaked
+    physical frames or heap."""
     m = boot_shell(boot)
 
     m.send_line("usertest bad_elf")
-    m.expect(r"usertest: bad_elf rejected=6 leaked_frames=0 leaked_heap=0\n", 15)
+    m.expect(r"usertest: bad_elf rejected=7 leaked_frames=0 leaked_heap=0\n", 15)
     m.expect(r"lumen> ", 10)
 
     assert CRASH_BEGIN not in m.output

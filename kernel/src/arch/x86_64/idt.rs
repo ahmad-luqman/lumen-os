@@ -731,11 +731,12 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
             let fixup_rip = if !from_user && in_user_range { crate::user::lookup_fixup(frame.rip) } else { None };
 
             if from_user || fixup_rip.is_some() {
-                // Step 2: assert interrupts were enabled (or disabled_for_good)
-                // and no SpinLock critical section is open, then re-enable IRQs
-                // so `AddressSpace`'s sleeping `SleepMutex` can safely block.
+                // Step 2: assert interrupts were enabled (or another CPU disabled
+                // them for good during a crash/reboot) and no SpinLock critical
+                // section is open, then re-enable IRQs so `AddressSpace`'s
+                // sleeping `SleepMutex` can safely block.
                 assert!(
-                    (frame.rflags & (1 << 9)) != 0 || super::irq::disabled_for_good(),
+                    (frame.rflags & (1 << 9)) != 0 || super::irq::disabled_for_good_but_not_here(),
                     "user/#PF fault with interrupts disabled (rflags {:#x}, rip {:#x}, cr2 {cr2:#x})",
                     frame.rflags,
                     frame.rip

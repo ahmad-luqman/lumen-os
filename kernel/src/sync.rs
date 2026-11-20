@@ -200,7 +200,7 @@ fn relocked(addr: usize, ty: &str) -> ! {
 ///
 /// Lock order: never acquire a [`SleepMutex`] while holding a [`SpinLock`] or
 /// with interrupts disabled (`lock()` asserts
-/// `(irq::enabled() || irq::disabled_for_good()) && irq::depth() == 0`).
+/// `(irq::enabled() || irq::disabled_for_good_but_not_here()) && irq::depth() == 0`).
 pub struct SleepMutex<T> {
     locked: SpinLock<bool>,
     waiters: WaitQueue,
@@ -221,12 +221,13 @@ impl<T> SleepMutex<T> {
     /// currently holds it.
     ///
     /// # Panics
-    /// If interrupts are disabled (unless `irq::disabled_for_good()`) or a
-    /// `SpinLock` critical section is open (`irq::depth() != 0`).
+    /// If interrupts are disabled (unless another CPU disabled them for good
+    /// during a crash report or reboot) or a `SpinLock` critical section is
+    /// open (`irq::depth() != 0`).
     #[track_caller]
     pub fn lock(&self) -> SleepMutexGuard<'_, T> {
         assert!(
-            (arch::irq::enabled() || arch::irq::disabled_for_good()) && arch::irq::depth() == 0,
+            (arch::irq::enabled() || arch::irq::disabled_for_good_but_not_here()) && arch::irq::depth() == 0,
             "SleepMutex::lock requires interrupts enabled and no SpinLock held"
         );
         // Fast path: uncontended acquire without touching the wait queue.

@@ -10,7 +10,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use log::warn;
 use lumen_elf::loader::{
@@ -24,7 +24,7 @@ use crate::arch::{self, TrapFrame};
 use crate::linux::{ARCH_GET_FS, ARCH_SET_FS, errno, general};
 #[cfg(feature = "ktest")]
 use crate::mm::paging;
-use crate::mm::user_vm::{AddressSpace, UserVmError, prot_from_linux};
+use crate::mm::user_vm::{AddressSpace, USER_STACK_BOTTOM, UserVmError, prot_from_linux};
 use crate::mm::{frame, heap};
 use crate::sched;
 use crate::shell::Ctx;
@@ -348,12 +348,17 @@ static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 /// Synchronization state for the concurrent same-CPU `sse_tls` preemption test.
 struct SseTlsSync {
     ready_mask: AtomicU8,
+    aborted: AtomicBool,
     base_switches: AtomicU64,
     target_cpu: AtomicUsize,
 }
 
-static SSE_TLS_SYNC: SseTlsSync =
-    SseTlsSync { ready_mask: AtomicU8::new(0), base_switches: AtomicU64::new(0), target_cpu: AtomicUsize::new(0) };
+static SSE_TLS_SYNC: SseTlsSync = SseTlsSync {
+    ready_mask: AtomicU8::new(0),
+    aborted: AtomicBool::new(false),
+    base_switches: AtomicU64::new(0),
+    target_cpu: AtomicUsize::new(0),
+};
 
 // Test-only syscall numbers used by `usertest` to exercise return-path
 // validation (canonical check on `sysretq`/`iretq`, rewritten-frame `iretq`,
@@ -375,6 +380,9 @@ fn neg_errno(code: u32) -> u64 {
 
 /// Record `exit` for the active ring-3 thread and return its pid.
 fn record_exit(exit: UserExit) -> u32 {
+    if !matches!(exit, UserExit::Exited(0)) {
+        SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
+    }
     let tid = current_tid();
     let mut guard = ACTIVE_RUNS.lock();
     let slot = guard.get_mut(&tid).expect("user exit with no active ring-3 run");
@@ -478,7 +486,7 @@ pub fn dispatch_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
             };
             frame.rax = match space.mprotect(frame.rdi, frame.rsi, prot) {
                 Ok(()) => 0,
-                Err(e) => neg_errno(e.to_errno()),
+                Err(e) => neg_errno(e.to_mprotect_errno()),
             };
             SyscallReturn::Sysret
         }
@@ -543,6 +551,10 @@ pub fn dispatch_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
             SyscallReturn::Iret
         }
         SYS_TEST_PREEMPT_COUNT => {
+            if SSE_TLS_SYNC.aborted.load(Ordering::Acquire) {
+                frame.rax = u64::MAX;
+                return SyscallReturn::Sysret;
+            }
             let bit = (frame.rdi & 3) as u8;
             let now_mask = SSE_TLS_SYNC.ready_mask.fetch_or(bit, Ordering::AcqRel) | bit;
             if now_mask != 3 {
@@ -998,9 +1010,13 @@ fn run_bad_elf_tests(ctx: &mut Ctx<'_>) {
         ],
         None,
     );
+    // Passes `LoadedElf::parse` but places PT_LOAD inside the reserved stack +
+    // guard region, exercising `commit_loaded_elf` rejection + AddressSpace::drop.
+    let bad_stack_overlap =
+        build_elf_with_phdrs(USER_STACK_BOTTOM, &[(PT_LOAD, PF_R | PF_X, 0x100, USER_STACK_BOTTOM, 0x10, 0x10)], None);
 
     type BadElfCase<'a> = (&'static str, &'a [u8], fn(&UserVmError) -> bool);
-    let cases: [BadElfCase<'_>; 6] = [
+    let cases: [BadElfCase<'_>; 7] = [
         ("truncated", &bad_truncated, |e| matches!(e, UserVmError::Elf(ElfLoadError::Truncated))),
         ("wx", &bad_wx, |e| matches!(e, UserVmError::Elf(ElfLoadError::WritableAndExecutable { .. }))),
         ("overlap", &bad_overlap, |e| matches!(e, UserVmError::Elf(ElfLoadError::OverlappingSegments { .. }))),
@@ -1009,6 +1025,7 @@ fn run_bad_elf_tests(ctx: &mut Ctx<'_>) {
         ("shared_wx", &bad_shared_wx, |e| {
             matches!(e, UserVmError::Elf(ElfLoadError::SharedPageWritableAndExecutable { .. }))
         }),
+        ("stack_overlap", &bad_stack_overlap, |e| matches!(e, UserVmError::Vm(lumen_vm::VmError::Exists))),
     ];
 
     let frames_before = frame::free_frames();
@@ -1322,6 +1339,7 @@ fn run_sse_tls_test(ctx: &mut Ctx<'_>) {
 
     let frames_before = frame::free_frames();
     SSE_TLS_SYNC.ready_mask.store(0, Ordering::Release);
+    SSE_TLS_SYNC.aborted.store(false, Ordering::Release);
     SSE_TLS_SYNC.base_switches.store(0, Ordering::Release);
     SSE_TLS_SYNC.target_cpu.store(target_cpu, Ordering::Release);
 

@@ -73,6 +73,16 @@ impl UserVmError {
             UserVmError::Stack(_) => errno::E2BIG,
         }
     }
+
+    /// Linux `mprotect(2)` `errno` mapping: out-of-range `[addr, addr + len)`
+    /// (`VmError::InvalidRange`) returns `ENOMEM`, while misaligned `addr`
+    /// remains `EINVAL`.
+    pub const fn to_mprotect_errno(self) -> u32 {
+        match self {
+            UserVmError::Vm(VmError::InvalidRange) => errno::ENOMEM,
+            other => other.to_errno(),
+        }
+    }
 }
 
 impl From<VmError> for UserVmError {
@@ -446,6 +456,11 @@ impl AddressSpace {
     /// write fault (`bit 1`) on non-writable VMA, exec fault (`bit 4`) on
     /// non-executable VMA, and present-page protection violations (`bit 0 == 1`).
     pub fn handle_page_fault(&self, fault_addr: u64, error_code: u64) -> FaultResult {
+        // Defensive RSVD guard (bit 3): `idt.rs` panics on RSVD before reaching
+        // here, and direct callers must never map a frame for an RSVD fault.
+        if (error_code & (1 << 3)) != 0 {
+            return FaultResult::Invalid;
+        }
         if !(USER_MIN..USER_MAX).contains(&fault_addr) {
             return FaultResult::Invalid;
         }
@@ -746,6 +761,19 @@ crate::ktest!(
             kassert_eq!(copy_from_user(&mut buf, base + PAGE_SIZE), Ok(()));
             kassert_eq!(&buf, sentinel1);
             kassert_eq!(copy_to_user(base + PAGE_SIZE, sentinel0), Err(CopyError::Fault));
+
+            // mprotect error mapping: misaligned -> EINVAL, out-of-range/hole -> ENOMEM, len==0 -> Ok.
+            kassert_eq!(
+                space.mprotect(base + 1, PAGE_SIZE, Prot::READ).map_err(UserVmError::to_mprotect_errno),
+                Err(errno::EINVAL)
+            );
+            kassert_eq!(
+                space.mprotect(0, PAGE_SIZE, Prot::READ).map_err(UserVmError::to_mprotect_errno),
+                Err(errno::ENOMEM)
+            );
+            kassert_eq!(space.mprotect(base, 0, Prot::READ), Ok(()));
+            // Defensive RSVD bit check never maps a frame.
+            kassert_eq!(space.handle_page_fault(base + 2 * PAGE_SIZE, 1 << 3), FaultResult::Invalid);
 
             // Turn page 0 back to PROT_NONE and verify munmap frees BOTH Present and PTE_PROTNONE frames.
             space.mprotect(base, PAGE_SIZE, Prot::NONE).map_err(|_| "mprotect PROT_NONE 2")?;
