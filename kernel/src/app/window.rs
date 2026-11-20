@@ -25,7 +25,7 @@ use super::host::{C, Res, blocking, copy_in, copy_in_capped, entry, memory_len, 
 use super::runtime::{self, AppCtx};
 use crate::desktop::{self, Animating, OpenError, Wait, WindowEvent, WindowHandle};
 use crate::{sched, time};
-use lumen_app_api::event::{self, Event};
+use lumen_app_api::event::Event;
 use lumen_app_api::layout::{self, CANVAS_SIZE, Canvas, CheckedCanvas, Clipped, RECT_SIZE, TEXT_DRAW_SIZE, TextDraw};
 use lumen_app_api::limits::{COMMIT_RECTS, EVENT_BYTES, PIXEL_FUEL, TEXT_BYTES, TEXT_PX_MAX, TEXT_PX_MIN, TITLE_BYTES};
 use lumen_app_api::limits::{SURFACES, TEXT_CHAR_FUEL, WINDOW_PIXELS};
@@ -254,10 +254,10 @@ fn wire_event(e: WindowEvent) -> Result<Event, crate::ui::Request> {
         WindowEvent::Theme(t) => Event::theme(t.id, &crate::ui::palette(t)),
         WindowEvent::Key(k) => Event::key(&k),
         WindowEvent::PointerDown { x, y, button, buttons } => {
-            Event::PointerDown { x, y, button: event::button(button), buttons: buttons.into() }
+            Event::PointerDown { x, y, button: button.into(), buttons: buttons.into() }
         }
         WindowEvent::PointerUp { x, y, button, buttons } => {
-            Event::PointerUp { x, y, button: event::button(button), buttons: buttons.into() }
+            Event::PointerUp { x, y, button: button.into(), buttons: buttons.into() }
         }
         WindowEvent::PointerMove { x, y, buttons } => Event::PointerMove { x, y, buttons: buttons.into() },
         WindowEvent::FocusGained => Event::FocusGained,

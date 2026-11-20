@@ -32,7 +32,7 @@ use alloc::vec::Vec;
 use core::num::NonZeroU32;
 
 pub use lumen_app_api as api;
-pub use lumen_app_api::event::{Buttons, Event, KeyAction, KeyCode, Mods, Palette, ThemeId, buttons, mods};
+pub use lumen_app_api::event::{Button, Buttons, Event, KeyAction, KeyCode, Mods, Palette, ThemeId, mods};
 pub use lumen_app_api::layout::Rect;
 pub use lumen_app_api::{Error, Grant, LogLevel};
 
@@ -86,19 +86,10 @@ impl Handle {
 pub mod log {
     use super::{Error, Grant, Handle, LogLevel, TEXT_BYTES, check, ptr, sys};
 
-    /// `text`'s first `TEXT_BYTES` at most, cut on a char boundary.
-    fn cut(text: &str) -> &str {
-        let mut end = text.len().min(TEXT_BYTES);
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        &text[..end]
-    }
-
     /// Log `text` (cut to `TEXT_BYTES`) at `level`.
     pub fn log(level: LogLevel, text: &str) -> Result<(), Error> {
         let h = Handle::find(Grant::Log)?;
-        let text = cut(text);
+        let text = lumen_app_api::text::prefix(text, TEXT_BYTES);
         check(sys::log(h.raw(), level as i32, ptr(text.as_ptr()), text.len() as i32)).map(|_| ())
     }
 

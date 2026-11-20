@@ -3280,7 +3280,7 @@ queue rules unchanged):
 |---|---|
 | `Theme` | `theme: ThemeId`, `palette: Palette` (as the kernel's `ui::palette(&Theme)` gives, so an app's toolkit looks like a kernel window's; always the first event) |
 | `Key` | `code: KeyCode`, `mods: u8`, `action: Press { text: Option<char> }` or `Release` (`lumen_input::KeyAction`, so a release says which key) |
-| `PointerDown`, `PointerUp` | `x: i32`, `y: i32`, `button: u8`, `buttons: u8` (client coordinates) |
+| `PointerDown`, `PointerUp` | `x: i32`, `y: i32`, `button: Button`, `buttons: u8` (client coordinates) |
 | `PointerMove` | `x: i32`, `y: i32`, `buttons: u8` |
 | `FocusGained`, `FocusLost`, `Lost`, `Close` | none |
 | `Request` | `node: u64` (the app's own id), `action` |
@@ -3291,7 +3291,7 @@ both ways (`lumen_input::KeyCode` is pc-keyboard's) generated from one
 list as exhaustive matches and host-tested over every variant. `mods` is
 `lumen_input::Mods::bits()` (`lumen_app_api::event::mods`: left and
 right Shift, Ctrl and Alt, then Caps Lock and Num Lock, bits 0 to 7);
-`button` is a button's number (`event::buttons`: left 0 to extra 4) and
+`button` is an `event::Button` (numbered left 0 to extra 4) and
 `buttons` the held set's bits, `1 << number`. Until #207 an app's window
 publishes no tree, so a `Request` that reaches its queue names no node
 and is answered `no node` (`ui::refuse`) instead of being handed on. A `set_value` text past `SET_VALUE_BYTES` is refused

@@ -223,6 +223,12 @@ fn next_event(w: i32, buf: &mut [u8]) -> i32 {
     unsafe { host::window_next_event(w, ptr(buf.as_mut_ptr()), buf.len() as i32) }
 }
 
+/// Whether any pixel of `px` (rows `stride` apart) in columns `xs` of
+/// rows `ys` is drawn (not 0).
+fn drawn(px: &[u32], stride: u32, xs: core::ops::Range<u32>, ys: core::ops::Range<u32>) -> bool {
+    ys.into_iter().any(|y| px[(y * stride + xs.start) as usize..(y * stride + xs.end) as usize].iter().any(|&p| p != 0))
+}
+
 /// A canvas over `px`, `w` × `h` with `stride`.
 fn canvas(px: &[u32], stride: u32, w: u32, h: u32) -> [u8; CANVAS_SIZE] {
     Canvas { ptr: ptr(px.as_ptr()) as u32, stride, w, h }.encode()
@@ -421,20 +427,16 @@ fn window(c: &mut Checks) {
     let left = draw(0, 16, Rect::new(0, 0, W / 2, H));
     let r = td(desk, cp, ptr(left.as_ptr()), t, tn);
     c.holds("text_draw's advance", r > 0);
-    let inside = (0..H).any(|y| a[(y * W) as usize..(y * W + W / 2) as usize].iter().any(|&p| p != 0));
-    let outside = (0..H).all(|y| a[(y * W + W / 2) as usize..((y + 1) * W) as usize].iter().all(|&p| p == 0));
-    c.holds("text_draw drew inside its clip", inside);
-    c.holds("text_draw drew nothing outside its clip", outside);
+    c.holds("text_draw drew inside its clip", drawn(&a, W, 0..W / 2, 0..H));
+    c.holds("text_draw drew nothing outside its clip", !drawn(&a, W, W / 2..W, 0..H));
     // A clip from x > 0: the right half only.
     a.fill(0);
     let right = draw(0, 16, Rect::new((W / 2) as i32, 0, W / 2, H));
     let wide = "mmmmmmmm";
     let r = td(desk, cp, ptr(right.as_ptr()), ptr(wide.as_ptr()), wide.len() as i32);
     c.holds("text_draw's advance from x > 0", r > 0);
-    let left_clear = (0..H).all(|y| a[(y * W) as usize..(y * W + W / 2) as usize].iter().all(|&p| p == 0));
-    let right_drawn = (0..H).any(|y| a[(y * W + W / 2) as usize..((y + 1) * W) as usize].iter().any(|&p| p != 0));
-    c.holds("a clip from x > 0 drew inside it", right_drawn);
-    c.holds("a clip from x > 0 drew nothing left of it", left_clear);
+    c.holds("a clip from x > 0 drew inside it", drawn(&a, W, W / 2..W, 0..H));
+    c.holds("a clip from x > 0 drew nothing left of it", !drawn(&a, W, 0..W / 2, 0..H));
     // Its text inside its own canvas draws what a separate copy does.
     let mut b = vec![0u32; (W * H) as usize];
     a.fill(0);
@@ -454,8 +456,8 @@ fn window(c: &mut Checks) {
     let wide = draw(0, 16, Rect::new(0, 0, 2 * W, 2 * H));
     let rbig = td(desk, ptr(cbig.as_ptr()), ptr(wide.as_ptr()), ptr(b"mmmmmmmm".as_ptr()), 8);
     c.holds("text_draw on a canvas bigger than the window", rbig > 0);
-    let outside = (0..2 * H).all(|y| (0..2 * W).all(|x| (x < W && y < H) || big[(y * 2 * W + x) as usize] == 0));
-    c.holds("nothing drawn past the window's size", outside);
+    let past = drawn(&big, 2 * W, W..2 * W, 0..2 * H) || drawn(&big, 2 * W, 0..W, H..2 * H);
+    c.holds("nothing drawn past the window's size", !past);
 
     // A closed window's handle is gone; a new window gets a new handle,
     // and exactly WINDOW_PIXELS (640 × 480) opens.

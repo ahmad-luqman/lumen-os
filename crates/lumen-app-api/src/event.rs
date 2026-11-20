@@ -147,14 +147,28 @@ pub mod mods {
     pub const ALT: u8 = LALT | RALT;
 }
 
-/// A pointer button's number (`button`), and its bit in a `buttons` byte
-/// (`1 << number`).
-pub mod buttons {
-    pub const LEFT: u8 = 0;
-    pub const RIGHT: u8 = 1;
-    pub const MIDDLE: u8 = 2;
-    pub const SIDE: u8 = 3;
-    pub const EXTRA: u8 = 4;
+wire_enum! {
+    /// A pointer button (`lumen_input::Button`): its number on the wire,
+    /// and its bit in a [`Buttons`] byte (`1 << number`).
+    pub enum Button {
+        Left = 0,
+        Right = 1,
+        Middle = 2,
+        Side = 3,
+        Extra = 4,
+    }
+}
+
+impl From<lumen_input::Button> for Button {
+    fn from(b: lumen_input::Button) -> Button {
+        match b {
+            lumen_input::Button::Left => Button::Left,
+            lumen_input::Button::Right => Button::Right,
+            lumen_input::Button::Middle => Button::Middle,
+            lumen_input::Button::Side => Button::Side,
+            lumen_input::Button::Extra => Button::Extra,
+        }
+    }
 }
 
 /// The modifier state after a key event (`Event::Key`'s `mods`): one raw
@@ -205,7 +219,7 @@ impl From<lumen_input::Mods> for Mods {
 }
 
 /// The pointer buttons held (a pointer event's `buttons`): one raw byte on
-/// the wire, a button numbered `n` ([`buttons`]) at bit `1 << n`.
+/// the wire, a [`Button`] numbered `n` at bit `1 << n`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Buttons(u8);
@@ -219,26 +233,15 @@ impl Buttons {
         self.0
     }
 
-    /// Whether the button numbered `number` ([`buttons`]) is held.
-    pub const fn has(self, number: u8) -> bool {
-        number < 8 && self.0 & (1 << number) != 0
+    /// Whether `b` is held.
+    pub const fn has(self, b: Button) -> bool {
+        self.0 & (1 << b as u8) != 0
     }
 }
 
 impl From<lumen_input::Buttons> for Buttons {
     fn from(set: lumen_input::Buttons) -> Buttons {
-        Buttons(set.each().fold(0, |bits, b| bits | 1 << button(b)))
-    }
-}
-
-/// A button's number on the wire.
-pub fn button(b: lumen_input::Button) -> u8 {
-    match b {
-        lumen_input::Button::Left => buttons::LEFT,
-        lumen_input::Button::Right => buttons::RIGHT,
-        lumen_input::Button::Middle => buttons::MIDDLE,
-        lumen_input::Button::Side => buttons::SIDE,
-        lumen_input::Button::Extra => buttons::EXTRA,
+        Buttons(set.each().fold(0, |bits, b| bits | 1 << Button::from(b) as u8))
     }
 }
 
@@ -314,18 +317,18 @@ pub enum Event {
         mods: Mods,
         action: KeyAction,
     },
-    /// Client coordinates; `button` a [`buttons`] number, `buttons` the
+    /// Client coordinates; `button` the one pressed or released, `buttons` the
     /// set held after it.
     PointerDown {
         x: i32,
         y: i32,
-        button: u8,
+        button: Button,
         buttons: Buttons,
     },
     PointerUp {
         x: i32,
         y: i32,
-        button: u8,
+        button: Button,
         buttons: Buttons,
     },
     PointerMove {
@@ -477,11 +480,11 @@ mod tests {
             ),
             // Zigzagged: -1 is 1, 2 is 4.
             (
-                Event::PointerDown { x: -1, y: 2, button: buttons::RIGHT, buttons: Buttons::from_bits(0b10) },
+                Event::PointerDown { x: -1, y: 2, button: Button::Right, buttons: Buttons::from_bits(0b10) },
                 alloc::vec![2, 1, 4, 1, 2],
             ),
             (
-                Event::PointerUp { x: 64, y: 0, button: buttons::LEFT, buttons: Buttons::default() },
+                Event::PointerUp { x: 64, y: 0, button: Button::Left, buttons: Buttons::default() },
                 alloc::vec![3, 0x80, 1, 0, 0, 0],
             ),
             (Event::PointerMove { x: 3, y: -2, buttons: Buttons::from_bits(0b101) }, alloc::vec![4, 6, 3, 5]),
@@ -559,7 +562,7 @@ mod tests {
             ],
             [1, 2, 4, 8, 16, 32, 64, 128]
         );
-        assert_eq!([buttons::LEFT, buttons::RIGHT, buttons::MIDDLE, buttons::SIDE, buttons::EXTRA], [0, 1, 2, 3, 4]);
+        assert_eq!(Button::ALL.map(|b| b as u8), [0, 1, 2, 3, 4]);
     }
 
     #[test]
@@ -575,7 +578,7 @@ mod tests {
 
     #[test]
     fn kernel_types_convert() {
-        use lumen_input::{Button, KeyEvent};
+        use lumen_input::KeyEvent;
         let k = KeyEvent {
             code: lumen_input::KeyCode::Return,
             action: lumen_input::KeyAction::Press { text: Some('\n') },
@@ -619,15 +622,15 @@ mod tests {
         let m = Mods::from_bits(mods::RSHIFT | mods::LALT | mods::NUMLOCK);
         assert_eq!((m.shift(), m.ctrl(), m.alt(), m.capslock(), m.numlock()), (true, false, true, false, true));
         // Buttons.
-        for b in Button::ALL {
-            assert_eq!(button(b) as usize, b.index());
+        for b in lumen_input::Button::ALL {
+            assert_eq!(Button::from(b) as usize, b.index());
             let set = Buttons::from(lumen_input::Buttons::from(b));
             assert_eq!(set.bits(), 1 << b.index());
-            assert!(set.has(button(b)));
+            assert!(set.has(b.into()));
         }
         let two = Buttons::from(lumen_input::Buttons::LEFT.with(lumen_input::Buttons::EXTRA));
         assert_eq!(two.bits(), 0b1_0001);
-        assert!(two.has(buttons::LEFT) && two.has(buttons::EXTRA) && !two.has(buttons::RIGHT) && !two.has(9));
+        assert!(two.has(Button::Left) && two.has(Button::Extra) && !two.has(Button::Right));
         assert_eq!(Buttons::from(lumen_input::Buttons::NONE).bits(), 0);
         // The theme and its palette.
         let ui = lumen_ui::Palette {
@@ -720,7 +723,7 @@ mod tests {
                 mods: Mods::from_bits(0xff),
                 action: KeyAction::Press { text: Some('\u{10ffff}') },
             },
-            Event::PointerDown { x: i32::MIN, y: i32::MIN, button: 0xff, buttons: Buttons::from_bits(0xff) },
+            Event::PointerDown { x: i32::MIN, y: i32::MIN, button: Button::Extra, buttons: Buttons::from_bits(0xff) },
             Event::PointerMove { x: i32::MIN, y: i32::MAX, buttons: Buttons::from_bits(0xff) },
         ] {
             assert!(enc(&e).len() < 64, "{e:?}");
@@ -733,7 +736,7 @@ mod tests {
             largest(),
             Event::Theme { theme: ThemeId::Light, palette: palette() },
             Event::Key { code: KeyCode::Q, mods: Mods::from_bits(3), action: KeyAction::Press { text: Some('é') } },
-            Event::PointerUp { x: -300, y: 70000, button: 1, buttons: Buttons::default() },
+            Event::PointerUp { x: -300, y: 70000, button: Button::Right, buttons: Buttons::default() },
             Event::Request { node: 9, action: Action::SetValue(sv("12+3")) },
             Event::Close,
         ] {
