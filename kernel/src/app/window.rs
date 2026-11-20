@@ -187,15 +187,43 @@ fn window_commit(c: &mut C<'_>, h: i32, canvas: i32, rects: i32, n: i32) -> Resu
     Ok(0)
 }
 
+/// A kernel bug in the window calls: one ERROR, then a crash report (debug
+/// assertions are on in every built kernel). In a kernel built without
+/// them the call goes on, touching nothing.
+fn kernel_bug(what: &str) {
+    log::error!(target: "app", "{what} (a kernel bug)");
+    debug_assert!(false, "{what}");
+}
+
+/// The rows of `clip`, a clip of `canvas` that, moved by `to` less its
+/// corner, must also fit `surface`: checked on both sides before a pixel is
+/// touched, either failing [`kernel_bug`] (nothing copied).
+fn rows_between(
+    canvas: &CheckedCanvas,
+    clip: &Clipped,
+    surface: &Surface,
+    to: (u32, u32),
+) -> Option<impl Iterator<Item = (u32, core::ops::Range<usize>)> + use<>> {
+    let fits = clip.x() >= to.0
+        && clip.y() >= to.1
+        && u64::from(clip.x() - to.0) + u64::from(clip.w()) <= u64::from(surface.width())
+        && u64::from(clip.y() - to.1) + u64::from(clip.h()) <= u64::from(surface.height());
+    if !fits {
+        kernel_bug("a clip that doesn't fit its surface");
+        return None;
+    }
+    let rows = canvas.rows(clip);
+    if rows.is_none() {
+        kernel_bug("a clip outside its canvas");
+    }
+    rows
+}
+
 /// Copy `clip` of a checked canvas's pixels into `surface`, its corner at
 /// `to` less the clip's (so `(0, 0)` keeps canvas coordinates), the top
-/// byte cleared. The caller makes sure `clip`, moved so, fits `surface`;
-/// a `clip` outside the canvas copies nothing.
+/// byte cleared. Both sides are checked first ([`rows_between`]).
 fn copy_rows(mem: &[u8], canvas: &CheckedCanvas, clip: &Clipped, surface: &mut Surface, to: (u32, u32)) {
-    let Some(rows) = canvas.rows(clip) else {
-        debug_assert!(false, "a clip outside its canvas");
-        return;
-    };
+    let Some(rows) = rows_between(canvas, clip, surface, to) else { return };
     let x = (clip.x() - to.0) as usize;
     for (y, bytes) in rows {
         let row = surface.row_mut(y - to.1);
@@ -208,10 +236,7 @@ fn copy_rows(mem: &[u8], canvas: &CheckedCanvas, clip: &Clipped, surface: &mut S
 /// The reverse of [`copy_rows`]: `clip` of `surface` (at `to` less the
 /// clip's corner) back into the canvas's pixels.
 fn copy_back(mem: &mut [u8], canvas: &CheckedCanvas, clip: &Clipped, surface: &Surface, to: (u32, u32)) {
-    let Some(rows) = canvas.rows(clip) else {
-        debug_assert!(false, "a clip outside its canvas");
-        return;
-    };
+    let Some(rows) = rows_between(canvas, clip, surface, to) else { return };
     let x = (clip.x() - to.0) as usize;
     for (y, bytes) in rows {
         let row = surface.row(y - to.1);
@@ -267,13 +292,12 @@ fn next_event(c: &mut C<'_>, h: i32, buf: i32, len: i32) -> Result<i32, Error> {
         };
         // Encoded first, into a buffer as big as any event (lumen-app-api
         // tests the largest; `SetValue` holds every request's text to its
-        // cap): a failure is the kernel's bug, said once here, and the
-        // event is dropped rather than reported as something it isn't.
+        // cap): a failure is a kernel bug (an ERROR, then a crash report),
+        // never reported to the app as something it isn't.
         let n = match wire.encode(&mut bytes) {
             Ok(encoded) => encoded.len(),
             Err(e) => {
-                log::error!(target: "app", "an event for app {} didn't encode ({e:?}): dropped (a bug)", ctx.state.id);
-                debug_assert!(false, "an event past EVENT_BYTES");
+                kernel_bug(&alloc::format!("an event for app {} didn't encode ({e:?})", ctx.state.id));
                 continue;
             }
         };

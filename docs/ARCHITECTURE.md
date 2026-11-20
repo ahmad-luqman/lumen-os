@@ -3404,8 +3404,8 @@ hand per window.
   buffer of `EVENT_BYTES`; only an app buffer shorter than the encoding
   is `BufferTooSmall`, which keeps the event in hand. Every event fits
   (`SetValue` holds a request's text to `SET_VALUE_BYTES`, however it is
-  made), so a failed encoding is the kernel's bug: one ERROR, the event
-  dropped. Handing over `Close` starts the close grace. In #206 every
+  made), so a failed encoding is a kernel bug: one ERROR, then a crash
+  report (debug assertions are on in every built kernel). Handing over `Close` starts the close grace. In #206 every
   `Request` is refused `no node` (`ui::refuse`); #207 `start`s it
   instead: a `Skipped` one (its asker cancelled) is dropped and the next
   event taken; one whose node has left the map is answered `no node`;

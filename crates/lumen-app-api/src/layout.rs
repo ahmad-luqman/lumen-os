@@ -108,7 +108,8 @@ impl CheckedCanvas {
 
     /// The bytes of each row of `clip`'s pixels, top to bottom, with the
     /// row's number; `None` if `clip` isn't inside the canvas (a caller's
-    /// bug: nothing to touch then, rather than bytes outside it).
+    /// bug, never bytes outside it: the kernel then logs an ERROR and
+    /// crashes with a report).
     pub fn rows(&self, clip: &Clipped) -> Option<impl Iterator<Item = (u32, Range<usize>)> + use<>> {
         let (c, clip, start) = (self.canvas, *clip, self.bytes.start);
         let inside = u64::from(clip.x) + u64::from(clip.w) <= u64::from(c.w)
