@@ -36,7 +36,14 @@ pub struct Across {
 /// before the line's start. `max_chars` is the most characters the view
 /// shows: every text handed to `measure` is at most that many, from the
 /// view's start to the cursor.
-pub fn across(line: &str, col: usize, first: usize, max_chars: usize, width: u32, mut measure: impl FnMut(&str) -> u32) -> Across {
+pub fn across(
+    line: &str,
+    col: usize,
+    first: usize,
+    max_chars: usize,
+    width: u32,
+    mut measure: impl FnMut(&str) -> u32,
+) -> Across {
     let max = max_chars.max(1);
     let mut fits = |first: usize| -> Option<u32> {
         if col < first || col - first > max {

@@ -596,7 +596,8 @@ impl Model {
         let bytes: usize = self.text.iter().map(|c| c.len_utf8()).sum();
         let starts = self.line_starts();
         let (line, _) = self.line_col();
-        let line_bytes: usize = self.text[starts[line]..starts[line] + self.line_len(line)].iter().map(|c| c.len_utf8()).sum();
+        let line_bytes: usize =
+            self.text[starts[line]..starts[line] + self.line_len(line)].iter().map(|c| c.len_utf8()).sum();
         if bytes + s.len() > cap || (s != "\n" && line_bytes + s.len() > line_cap) {
             return;
         }

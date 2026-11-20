@@ -331,7 +331,8 @@ impl EditorApp {
     /// focus), and the window's focus (seen, then handed on to the toolkit).
     fn take(&mut self, e: &Event) -> Taken {
         match *e {
-            Event::Key { code, mods, action: KeyAction::Press { text } } => match lumen_edit::command(code, mods, text) {
+            Event::Key { code, mods, action: KeyAction::Press { text } } => match lumen_edit::command(code, mods, text)
+            {
                 Some(cmd) => {
                     self.command(cmd);
                     Taken::Took

@@ -954,7 +954,13 @@ fn focusing_a_text_area_changes_the_tree() {
     // is repainted.
     let (mut ui, area, ok) = area_tree("text");
     let focused = |ui: &Ui| {
-        ui.nodes().into_iter().find(|(_, n)| n.name() == "Buffer").expect("its node").1.state().contains(StateFlags::FOCUSED)
+        ui.nodes()
+            .into_iter()
+            .find(|(_, n)| n.name() == "Buffer")
+            .expect("its node")
+            .1
+            .state()
+            .contains(StateFlags::FOCUSED)
     };
     let (x, y) = centre(ui.bounds(area));
     ui.handle(Input::Down { x, y });
@@ -1004,4 +1010,3 @@ fn a_text_area_s_ring_repainted_by_damage_matches_a_full_paint() {
         assert!(s.pixels() == full.pixels(), "step {n}: the damage's pixels differ from a full paint");
     }
 }
-
