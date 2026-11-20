@@ -3853,19 +3853,27 @@ SSE); #197 checks the results' bits.
   - **`test-window tick [greedy|quit|slow]`** exercises it (`slow`: each
     tick's work longer than its period, the next still a period after it).
 - **What #200 adds:** `apps/clock` (bundled, `caps=time,desktop`; the
-  launcher lists it), on `run_until`: an analog face drawn in `paint_over`
-  (sixty dots and three hands in the theme's colours; when the time
-  changes, only the boxes of the hands that moved are its `take_drawn`
-  damage) over a tree holding one `fixed_label`, `Time`, whose value is
-  the time (`HH:MM:SS`, from `time_wall`, taken as UTC, as `date` shows
-  it). It reads the RTC every 250 ms; its waits aren't `animating` (a tick
-  finding the same second draws nothing), so the desktop settles between
-  ticks. `run clock --at HH:MM[:SS]` freezes it: no period at all, so the
-  window settles for good (its golden); a time `--at` doesn't take is
-  logged as an ERROR and ends it with 2. Its logic (the time of day,
-  `--at`'s grammar, an integer sine table in half-degree steps, each
-  hand's angle, points and lines on the face) is `crates/lumen-clock`, a
-  path dependency, host-tested: no floats, as no app has `libm`.
+  launcher lists it), on `run_until`. Its window is
+  `lumen_clock::face::Face`, a `lumen_ui::App` in `crates/lumen-clock`: an
+  analog face drawn in `paint_over` (sixty dots, three hands and a hub in
+  the theme's colours) above a tree holding one `fixed_label`, `Time`,
+  whose value is the time (`HH:MM:SS`, from `time_wall`, taken as UTC, as
+  `date` shows it). When the time changes, only the boxes of the hands
+  that moved (each exactly its brush at either end) are its `take_drawn`
+  damage: the second hand's every second, the minute hand's every fifth,
+  the hour hand's every minute; host tests check that a partial repaint
+  leaves what a full one does, after every second over twelve hours and
+  after jumps. It reads the RTC every 250 ms; its waits aren't `animating`
+  (a tick finding the same second draws nothing), so the desktop settles
+  between ticks. A failing RTC is handled as the taskbar's clock does
+  (`lumen_clock::rtc`): the last good reading for `CLOCK_FAILURES` (3)
+  reads, then `--:--:--` and no hands; the first failure of a run a WARN, a
+  recovery an INFO, one at startup showing no time rather than ending the
+  app. `run clock --at H[H]:MM[:SS]` freezes it: no period at all, so the
+  window settles for good (its golden); anything else is one ERROR naming
+  the argument, with the usage, and exit 2 (`lumen_clock::args`). Its
+  geometry has no floats (an integer sine table in half-degree steps), as
+  no app has `libm`.
 - **The launcher** (#157's taskbar) lists the bundled apps whose
   manifest lists `desktop`, never the test apps, after its four demo
   items, by name, and starts one through `run`'s path without waiting

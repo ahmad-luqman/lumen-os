@@ -34,7 +34,8 @@ use lumen_ui::{App, Over, Then, Ui, UiEvent};
 lumen_app::manifest!(time, desktop);
 lumen_app::main!(run);
 
-/// How often it reads the RTC (a second shows at most this late).
+/// How often it reads the RTC (a new second shows about this late on an
+/// idle host).
 const TICK_NS: u64 = 250_000_000;
 
 /// The app: its window ([`Face`]) and where its time comes from.

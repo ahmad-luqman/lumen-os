@@ -518,9 +518,12 @@ own PR that updates that doc first.
 - `crates/lumen-calc`: the calculator app's logic (#207): keys in, the
   display out, left to right in exact decimal fixed point (host-tested).
 - `crates/lumen-clock`: the clock app's logic (#200): `TimeOfDay` (from
-  Unix seconds, `--at`'s `HH:MM[:SS]`, `HH:MM:SS` shown), an integer sine
-  table in half-degree steps (`sin`, `cos`: no floats), `Hands`, `point`
-  and `line` (Bresenham) on the face (host-tested).
+  Unix seconds, `--at`'s `H[H]:MM[:SS]`, `HH:MM:SS` shown), an integer sine
+  table in half-degree steps (no floats), `Hands`, `point` and `line`
+  (Bresenham) on the face; `face::Face`, the clock's window as a
+  `lumen_ui::App` (its drawing and its hands' boxes as damage, checked
+  against full repaints); `args` (`run clock`'s arguments); `rtc` (what it
+  shows while RTC reads fail, as the taskbar's clock) (host-tested).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation

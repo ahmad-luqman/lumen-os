@@ -24,7 +24,10 @@ pub enum Note<E> {
     Nothing,
     /// The first failure of a run (a WARN): why, and whether the last good
     /// reading is kept for now (else nothing is shown).
-    Failing { why: E, kept: bool },
+    Failing {
+        why: E,
+        kept: bool,
+    },
     /// Reads work again after failing (an INFO).
     Recovered,
 }
@@ -48,7 +51,8 @@ impl Rtc {
                 (Some(t), note)
             }
             Err(why) => {
-                let note = if self.failures == 0 { Note::Failing { why, kept: self.last.is_some() } } else { Note::Nothing };
+                let note =
+                    if self.failures == 0 { Note::Failing { why, kept: self.last.is_some() } } else { Note::Nothing };
                 self.failures = self.failures.saturating_add(1);
                 let shown = self.last.filter(|_| self.failures < CLOCK_FAILURES);
                 (shown, note)
