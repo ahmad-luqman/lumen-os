@@ -163,8 +163,13 @@ pub struct Toolkit<A: App> {
     /// Where the tree is laid out (the rest of the client is the app's).
     area: Rect,
     text: HostText,
-    /// From the last `Theme` event (the first event, always).
+    /// From the last `Theme` event (the first event, always); all zero
+    /// before it.
     palette: Palette,
+    /// Whether a `Theme` has come (through any loop or [`Toolkit::step`]):
+    /// [`Toolkit::run_until`] ticks only after it, since nothing is drawn
+    /// until then.
+    themed: bool,
     window: Window,
     /// Why the last publish was refused, while the tree published is stale
     /// (the kernel keeps the last one): a request is then answered failed,
@@ -193,7 +198,7 @@ impl<A: App> Toolkit<A> {
         let text = HostText::new(window.desktop())?;
         let palette = Palette::from(lumen_app_api::event::Palette::default());
         let area = area.intersect(&window.canvas.bounds()).unwrap_or(Rect::EMPTY);
-        Ok(Toolkit { app, area, text, palette, window, unpublished: None, warned: false })
+        Ok(Toolkit { app, area, text, palette, themed: false, window, unpublished: None, warned: false })
     }
 
     pub fn app_mut(&mut self) -> &mut A {
@@ -252,16 +257,14 @@ impl<A: App> Toolkit<A> {
         A: Ticking,
     {
         let mut pacer = Pacer::new();
-        let mut themed = false;
         loop {
             while let Some(e) = self.window.next_event()? {
-                themed |= matches!(e, Event::Theme { .. });
                 if self.offer(e, &mut take)? == Step::Close {
                     return Ok(());
                 }
             }
             // No ticks before the first `Theme`: nothing is drawn until then.
-            let period = if themed { self.app.period() } else { None };
+            let period = if self.themed { self.app.period() } else { None };
             match pacer.poll(period, time.now_ns()?) {
                 Pace::Due => {
                     if self.app.tick(time.now_ns()?) == Flow::Quit {
@@ -312,6 +315,7 @@ impl<A: App> Toolkit<A> {
             Event::Request { node, action } => return self.request(node, action.into()),
             Event::Theme { palette, .. } => {
                 self.palette = palette.into();
+                self.themed = true;
                 self.app.ui_mut().invalidate();
                 Then::Carry
             }
