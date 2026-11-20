@@ -805,17 +805,18 @@ def stop_ticker(m, wid: str, rows: list[dict[str, str]]) -> list[dict[str, str]]
 
 
 TICK_PERIOD_MS = 50
-TICK_ENDED = re.compile(
-    r"INFO  app: window: window: tick: ended after (\d+) ticks; the last stretch (\d+) ticks in (\d+) ms\n"
+TICK_ENDED = (
+    r"INFO  app: window: window: tick: {how} after (\d+) ticks; "
+    r"the last stretch (\d+) ticks in (\d+) ms\n"
 )
 
 
-def tick_ended(m, mark: int) -> int:
-    """The tick app's end line: its tick count, once the pacer's floor is
-    checked: no tick came before its floor (the app's WARN), and the last
-    stretch's ticks took at least a period each."""
+def tick_ended(m, mark: int, how: str = "closed") -> int:
+    """The tick app's end line (`closed` or `quit`): its tick count, once
+    the pacer's floor is checked: no tick came before its floor (the app's
+    WARN), and the last stretch's ticks took at least a period each."""
     assert "ns early" not in m.output[mark:], m.output[mark:]
-    found = TICK_ENDED.search(m.output[mark:])
+    found = re.search(TICK_ENDED.format(how=how), m.output[mark:])
     assert found, m.output[mark:]
     stretch, elapsed = int(found[2]), int(found[3])
     assert elapsed >= stretch * TICK_PERIOD_MS, found[0]
@@ -904,7 +905,7 @@ def test_sdk_app_takes_keys_draws_alone_and_quits(boot):
     assert ticks(below_root(gui.ui_tree(m, wid))) == count, "a key the app took is no tick"
     gui.confirmed_keys(m, ["esc"])
     end_line(m, mark, "window", app_id, "exited with 0")
-    assert tick_ended(m, mark) == count
+    assert tick_ended(m, mark, "quit") == count
     gui.wait_no_window(m, "window")
     wait_gone(m, app_id, record["thread"])
 

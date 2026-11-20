@@ -116,5 +116,6 @@ fn app() -> Result<(), (&'static str, Error)> {
         calc.press(key);
         Taken::Took
     })
+    .map(|_| ())
     .map_err(|e| ("toolkit", e))
 }

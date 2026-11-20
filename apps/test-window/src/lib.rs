@@ -72,9 +72,9 @@
 //!   accent 0x<rrggbb>` each time its frame is drawn in a new accent, a
 //!   WARN if tick `k` of a stretch (since launch or the last Start) comes
 //!   less than `k` periods after it began (the pacer's floor), and
-//!   `window: tick: ended after <n> ticks; the last stretch <k> ticks in
-//!   <ms> ms` (from the stretch's start to its last tick) when the loop
-//!   returns (`Close` or Escape), then returns 0.
+//!   `window: tick: <how> after <n> ticks; the last stretch <k> ticks in
+//!   <ms> ms` (`closed` or `quit`; the stretch from its start to its last
+//!   tick) when the loop returns, then returns 0.
 
 #![no_std]
 
@@ -90,7 +90,7 @@ use lumen_app::api::limits::{TEXT_BYTES, TREE_NODES};
 use lumen_app::api::trace::{EVENT_SIZE, HEADER_SIZE, decode_header};
 use lumen_app::api::tree::{Common, Node, Text, Tree};
 use lumen_app::gfx::Rect as Area;
-use lumen_app::ui::{Flow, Taken, Ticking, Toolkit};
+use lumen_app::ui::{Ended, Flow, Taken, Ticking, Toolkit};
 use lumen_app::{Desktop, Error, Event, KeyAction, KeyCode, Rect, Time, Trace, log};
 use lumen_ui::counter::Counter;
 use lumen_ui::{App, Over, Then, Ui, UiEvent, Widget};
@@ -578,11 +578,12 @@ fn tick() -> i32 {
         _ => Taken::Pass,
     });
     match ended {
-        Ok(()) => {
+        Ok(how) => {
             let t = tk.app_mut();
             let elapsed_ms = (t.last_tick - t.stretch_start) / 1_000_000;
+            let how = if how == Ended::Quit { "quit" } else { "closed" };
             log::info(&format!(
-                "window: tick: ended after {} ticks; the last stretch {} ticks in {elapsed_ms} ms",
+                "window: tick: {how} after {} ticks; the last stretch {} ticks in {elapsed_ms} ms",
                 t.ticks, t.stretch
             ));
             0

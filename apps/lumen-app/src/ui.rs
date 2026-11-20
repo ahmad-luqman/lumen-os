@@ -118,8 +118,20 @@ pub enum Taken {
     /// The app acted on it itself (the tree never sees it); the window is
     /// refreshed.
     Took,
-    /// Stop: the loop returns `Ok(())`, as for `Close` (the app's
-    /// `Window`, dropped by its caller, closes the window).
+    /// Stop: the loop returns [`Ended::Quit`]; the window closes when the
+    /// caller drops the `Toolkit`, which owns the `Window`.
+    Quit,
+}
+
+/// How a loop ended ([`Toolkit::run_with`], [`Toolkit::run_until`]). The
+/// window is still open either way: it closes when the `Toolkit` (which
+/// owns the `Window`) is dropped, and a request still queued then is
+/// answered "window closed".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ended {
+    /// The window's `Close`, or an action that closed it.
+    Closed,
+    /// The app said [`Taken::Quit`] or [`Flow::Quit`].
     Quit,
 }
 
@@ -222,9 +234,10 @@ impl<A: App> Toolkit<A> {
         self.area
     }
 
-    /// Steps until the window closes.
+    /// Steps until the window closes (it can't quit: nothing takes an
+    /// event).
     pub fn run(&mut self) -> Result<()> {
-        self.run_with(|_, _| Taken::Pass)
+        self.run_with(|_, _| Taken::Pass).map(|_| ())
     }
 
     /// [`Toolkit::run`], each input event offered to `take` first
@@ -233,12 +246,12 @@ impl<A: App> Toolkit<A> {
     /// or a game's arrows) skips the tree, then the window is refreshed. The
     /// focus coming or going and `Lost` are offered too, then always handed
     /// to the tree; a request, `Close` or `Theme` never reaches `take`.
-    /// [`Taken::Quit`] returns as `Close` does.
-    pub fn run_with(&mut self, mut take: impl FnMut(&mut A, &Event) -> Taken) -> Result<()> {
+    /// [`Taken::Quit`] returns [`Ended::Quit`], a close [`Ended::Closed`].
+    pub fn run_with(&mut self, mut take: impl FnMut(&mut A, &Event) -> Taken) -> Result<Ended> {
         loop {
             let e = self.window.wait_event()?;
-            if self.offer(e, &mut take)? == Step::Close {
-                return Ok(());
+            if let Some(ended) = self.offer(e, &mut take)? {
+                return Ok(ended);
             }
         }
     }
@@ -251,16 +264,16 @@ impl<A: App> Toolkit<A> {
     /// the window refreshed; otherwise it waits for an event until the next
     /// deadline (none without a period, so the desktop can settle). `time`
     /// is the clock the deadlines are on. A tick saying [`Flow::Quit`]
-    /// returns as `Close` does.
-    pub fn run_until(&mut self, time: Time, mut take: impl FnMut(&mut A, &Event) -> Taken) -> Result<()>
+    /// returns [`Ended::Quit`].
+    pub fn run_until(&mut self, time: Time, mut take: impl FnMut(&mut A, &Event) -> Taken) -> Result<Ended>
     where
         A: Ticking,
     {
         let mut pacer = Pacer::new();
         loop {
             while let Some(e) = self.window.next_event()? {
-                if self.offer(e, &mut take)? == Step::Close {
-                    return Ok(());
+                if let Some(ended) = self.offer(e, &mut take)? {
+                    return Ok(ended);
                 }
             }
             // No ticks before the first `Theme`: nothing is drawn until then.
@@ -268,7 +281,7 @@ impl<A: App> Toolkit<A> {
             match pacer.poll(period, time.now_ns()?) {
                 Pace::Due => {
                     if self.app.tick(time.now_ns()?) == Flow::Quit {
-                        return Ok(());
+                        return Ok(Ended::Quit);
                     }
                     self.refresh()?;
                     pacer.ticked(time.now_ns()?);
@@ -287,24 +300,24 @@ impl<A: App> Toolkit<A> {
     /// offered to `take`, stepped unless it took it; the focus or `Lost`
     /// offered to `take`, then always stepped (unless it quit); a request,
     /// `Close` or `Theme` stepped.
-    fn offer(&mut self, e: Event, take: &mut impl FnMut(&mut A, &Event) -> Taken) -> Result<Step> {
+    fn offer(&mut self, e: Event, take: &mut impl FnMut(&mut A, &Event) -> Taken) -> Result<Option<Ended>> {
         match e.offer() {
             Offer::Toolkit => {}
             Offer::App => match take(&mut self.app, &e) {
                 Taken::Pass => {}
                 Taken::Took => {
                     self.refresh()?;
-                    return Ok(Step::Carry);
+                    return Ok(None);
                 }
-                Taken::Quit => return Ok(Step::Close),
+                Taken::Quit => return Ok(Some(Ended::Quit)),
             },
             Offer::Notify => {
                 if take(&mut self.app, &e) == Taken::Quit {
-                    return Ok(Step::Close);
+                    return Ok(Some(Ended::Quit));
                 }
             }
         }
-        self.step(e)
+        Ok((self.step(e)? == Step::Close).then_some(Ended::Closed))
     }
 
     /// One step: hand `e` to the tree; then, if it changed, repaint, commit
