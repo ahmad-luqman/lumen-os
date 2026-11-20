@@ -1,6 +1,6 @@
 [package]
 name = "xray"
-description = "X-ray (#208): a live view of what the kernel is doing, from the trace rings (the Trace capability): per-CPU lanes of run-queue length, interrupts and locks that waited, the run queue and the running thread as automation nodes, a Pause button, and a frozen view of a fixed trace (`--replay`). Its logic is lumen-xray's (host-tested)."
+description = "X-ray (#208): a live view of what the kernel is doing, from the trace rings (the Trace capability): per-CPU lanes of run-queue length, interrupts, locks that waited and switches; each CPU's run queue, running thread, switches, interrupts, locks and numbers missed as automation nodes; Pause and Resume (what piled up while paused not counted); and a frozen view of a fixed trace (`--replay`). Its logic is lumen-xray's (host-tested)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

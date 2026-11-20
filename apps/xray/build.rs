@@ -1,7 +1,7 @@
 //! The app's fixed memory (ARCHITECTURE section 8, "Its memory is fixed"):
 //! 4 MiB, for wasm-ld's 1 MiB stack, its data and a heap holding its canvas
 //! (4 bytes a pixel), its widget tree, the tree it publishes, one read's
-//! buffer and the view (80 columns a CPU). These link arguments come after
+//! buffer and the view (`lumen_xray::COLUMNS`, 50, columns a CPU). These link arguments come after
 //! the workspace's default (apps/.cargo/config.toml's 2 MiB), and wasm-ld
 //! takes the last.
 

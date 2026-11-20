@@ -34,7 +34,8 @@
 //!   between two ends, kept for the last [`COLUMNS`] ends (the lanes),
 //!   the oldest overwritten.
 //! - **The frozen view** ([`replay`]): a fixed trace of three CPUs (the
-//!   middle one offline) read the same way, for `run xray --replay`.
+//!   middle one read for ten columns, then offline) read the same way, for
+//!   `run xray --replay`.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -109,7 +110,8 @@ pub struct Cpu {
     /// `lock` events read (`None` until its X-ray ring's first read).
     pub locks: Option<u64>,
     /// Sequence numbers its reads counted missed (gone from a ring before
-    /// they were read), both rings together (`None` until a first read).
+    /// they were read), both rings together, after each ring's backlog (a
+    /// backlog's are left out); `None` until a first read.
     pub missed: Option<u64>,
     /// Events of the kinds X-ray reads that didn't decode (a field out of
     /// range), a `runq` event for another CPU's queue, a kind in the other
@@ -153,8 +155,7 @@ impl Cpu {
                 Some(s) => {
                     self.thread = Some(s.to);
                     if counted {
-                        bump(&mut self.switches);
-                        self.column.switches = self.column.switches.saturating_add(1);
+                        count(&mut self.switches, &mut self.column.switches);
                     }
                 }
                 None => self.odd += 1,
@@ -169,18 +170,12 @@ impl Cpu {
                 _ => self.odd += 1,
             },
             (Stream::Xray, kind::IRQ) => match Irq::decode(e) {
-                Some(_) if counted => {
-                    bump(&mut self.irqs);
-                    self.column.irqs = self.column.irqs.saturating_add(1);
-                }
+                Some(_) if counted => count(&mut self.irqs, &mut self.column.irqs),
                 Some(_) => {}
                 None => self.odd += 1,
             },
             (Stream::Xray, kind::LOCK_WAIT) => match LockWait::decode(e) {
-                Some(_) if counted => {
-                    bump(&mut self.locks);
-                    self.column.locks = self.column.locks.saturating_add(1);
-                }
+                Some(_) if counted => count(&mut self.locks, &mut self.column.locks),
                 Some(_) => {}
                 None => self.odd += 1,
             },
@@ -227,9 +222,12 @@ impl Ring {
     }
 }
 
-/// One more of a count known by now.
-fn bump(count: &mut Option<u64>) {
-    *count = Some(count.unwrap_or(0).saturating_add(1));
+/// One more counted event: in its CPU's total (known by now) and in its
+/// column.
+fn count(total: &mut Option<u64>, in_column: &mut u32) {
+    let t = total.get_or_insert(0);
+    *t = t.saturating_add(1);
+    *in_column = in_column.saturating_add(1);
 }
 
 /// Every CPU X-ray reads, and where the lanes' next column goes.
@@ -304,6 +302,9 @@ impl View {
     pub fn resume(&mut self) {
         for ring in self.cpus.iter_mut().flat_map(|c| c.rings.iter_mut()) {
             ring.backlog = true;
+            // As `offline` does: a read earlier in this column can't end
+            // the backlog it starts.
+            ring.read = false;
         }
     }
 
@@ -475,6 +476,19 @@ mod tests {
         v.end_column();
         assert_eq!(v.cpus()[0].column(3).span, Span::Counted);
         assert_eq!(v.cpus()[0].irqs, Some(2));
+    }
+
+    #[test]
+    fn a_resume_after_a_read_in_the_same_column_still_takes_a_backlog() {
+        // A read, then Resume, before the column ends: the next read is
+        // still the backlog (the column's end mustn't take the earlier read
+        // as the backlog read).
+        let mut v = live(1);
+        v.read(0, Stream::Xray, 1, 0, &[irq(0)]);
+        v.resume();
+        v.end_column();
+        v.read(0, Stream::Xray, 5, 0, &[irq(1), irq(2), irq(3), irq(4)]);
+        assert_eq!(v.cpus()[0].irqs, Some(1));
     }
 
     #[test]

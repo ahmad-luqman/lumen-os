@@ -24,8 +24,9 @@
 //! - **Live** (`run xray`): every half second (`run_until`, animating),
 //!   each CPU's two rings are read on from where the last read stopped,
 //!   up to a whole ring's worth a refresh, and the labels follow. Each
-//!   ring's first read, and its first after Resume, is a backlog (what
-//!   piled up since boot or while paused): only its newest run queue and
+//!   ring's first read, its first after Resume and its first after its
+//!   CPU comes back online is a backlog (what piled up since boot, while
+//!   paused or while away): only its newest run queue and
 //!   thread are taken, and its column is a gap. Pause stops the reads (no
 //!   period: the window settles); Resume reads on.
 //! - **Frozen** (`run xray --replay`): `lumen_xray::replay`'s fixed trace,
@@ -87,9 +88,10 @@ const MAX_HEIGHT: u32 = 480;
 /// A run-queue length's pixels in a bar, and the longest a bar shows.
 const RUNQ_UNIT: u32 = 3;
 const RUNQ_CAP: u64 = 8;
-/// The interrupt mark's pixels an interrupt, and the most.
+/// The interrupt mark: a pixel tall an interrupt in the column, at most
+/// this many.
 const IRQ_CAP: u32 = 8;
-/// The switch mark's pixels a switch, and the most.
+/// The switch mark: a pixel tall a switch in the column, at most this many.
 const SWITCH_CAP: u32 = 6;
 /// A lock that waited: an orange mark (the palettes have no such colour).
 const LOCK_RGB: u32 = 0x00d8_3b01;
@@ -154,19 +156,19 @@ struct Xray {
     warned_odd: bool,
 }
 
-/// A lane's top.
-fn lane_top(cpu: usize) -> i32 {
-    LANE_Y0 + cpu as i32 * LANE_H as i32
-}
-
 /// CPU `cpu`'s lane.
 fn lane(cpu: usize) -> Area {
-    Area::new(LANES_X, lane_top(cpu), LANES_W, LANE_H - LANE_GAP)
+    Area::new(LANES_X, LANE_Y0 + cpu as i32 * LANE_H as i32, LANES_W, LANE_H - LANE_GAP)
+}
+
+/// Column `c`'s left edge.
+fn column_x(c: usize) -> i32 {
+    LANES_X + (c as u32 * COL_W) as i32
 }
 
 /// Column `c`'s strip across `cpus` lanes.
 fn strip(c: usize, cpus: usize) -> Area {
-    Area::new(LANES_X + (c as u32 * COL_W) as i32, LANE_Y0, COL_W, cpus as u32 * LANE_H)
+    Area::new(column_x(c), LANE_Y0, COL_W, cpus as u32 * LANE_H)
 }
 
 /// A ring's name in a log line.
@@ -269,16 +271,34 @@ impl Xray {
                         // read from the last `next` can't be unless the
                         // kernel is wrong: a read from 0 tells them apart.
                         Err(Error::BadArgument) => {
-                            if since != 0 && trace.read(stream, cpu as u32, 0, &mut self.buf).is_ok() {
-                                log::error(&format!(
-                                    "cpu {cpu}: its {} ring refused a read from {since} (its last next) but not \
-                                     one from 0",
-                                    ring_name(stream)
-                                ));
-                                return Err(());
+                            let retry = if since == 0 {
+                                Err(Error::BadArgument)
+                            } else {
+                                trace.read(stream, cpu as u32, 0, &mut self.buf)
+                            };
+                            match retry {
+                                // Refused from 0 too: not online.
+                                Err(Error::BadArgument) => {
+                                    self.view.offline(cpu);
+                                    break 'rings;
+                                }
+                                Ok(_) => {
+                                    log::error(&format!(
+                                        "cpu {cpu}: its {} ring refused a read from {since} (its last next) \
+                                         but not one from 0",
+                                        ring_name(stream)
+                                    ));
+                                    return Err(());
+                                }
+                                Err(e) => {
+                                    log::error(&format!(
+                                        "cpu {cpu}: reading its {} ring from 0 after a refused read from \
+                                         {since}: {e}",
+                                        ring_name(stream)
+                                    ));
+                                    return Err(());
+                                }
                             }
-                            self.view.offline(cpu);
-                            break 'rings;
                         }
                         Err(e) => {
                             log::error(&format!("cpu {cpu}: reading its {} ring from {since}: {e}", ring_name(stream)));
@@ -303,9 +323,9 @@ impl Xray {
 }
 
 /// One CPU's column `c` drawn where `part` (inside its lane) reaches.
-fn draw_column(over: &mut Over<'_>, part: Area, cpu: &Cpu, i: usize, c: usize, cursor: usize) {
+fn draw_column(over: &mut Over<'_>, lane: Area, part: Area, cpu: &Cpu, c: usize, cursor: usize) {
     let x = LANES_X + (c as u32 * COL_W) as i32;
-    let top = lane_top(i);
+    let top = lane.y();
     let mut fill = |r: Area, rgb: u32| {
         if let Some(r) = r.intersect(&part) {
             over.surface.fill_rect(r, rgb);
@@ -320,7 +340,7 @@ fn draw_column(over: &mut Over<'_>, part: Area, cpu: &Cpu, i: usize, c: usize, c
     if col.span != Span::Counted {
         return;
     }
-    let base = top + (LANE_H - LANE_GAP) as i32 - 2;
+    let base = lane.bottom() - 2;
     let h = col.runq.min(RUNQ_CAP) as u32 * RUNQ_UNIT;
     if h > 0 {
         fill(Area::new(x, base - h as i32, COL_W - 1, h), over.palette.accent);
@@ -374,7 +394,7 @@ impl App for Xray {
                 let first = ((part.x() - LANES_X) / COL_W as i32) as usize;
                 let last = ((part.right() - 1 - LANES_X) / COL_W as i32) as usize;
                 for c in first..=last.min(COLUMNS - 1) {
-                    draw_column(over, part, cpu, i, c, cursor);
+                    draw_column(over, lane, part, cpu, c, cursor);
                 }
             }
         }
