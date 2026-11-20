@@ -934,6 +934,15 @@ def settled_screendump(m: Machine, name: str, tries: int = 5, allow: str | None 
 # kernel/src/ui.rs `invoke`'s lines (change them together).
 INVOKE_CANCELLED = "ui invoke: cancelled"
 INVOKE_LATE = "ui invoke: ran late"
+# Refused before it was queued: it never ran, so a retry can't act twice.
+# A queue rationing requests says busy; an app's window holding one request
+# at a time (#207) says one is still queued or running.
+INVOKE_BUSY = re.compile(
+    r"ui invoke: (window \d+ busy \(try again\)|a request is still queued or running in window \d+)$"
+)
+# Taken but not answered by the second deadline (a stalled owner): it may
+# still run; the caller confirms its effect.
+INVOKE_STILL_RUNNING = re.compile(r"ui invoke: still running \(window \d+\)$")
 
 
 def ui_tree(
@@ -986,10 +995,10 @@ class Invoked:
 
 def parse_invoke(out: str) -> Invoked | None:
     """`ui invoke`'s output read: `None` for a request cancelled at its
-    deadline (to retry: it never ran), else what it said: a row or a
-    message, either after `ui invoke: ran late` (`late`)."""
+    deadline or refused busy (to retry: it never ran), else what it said: a
+    row or a message, either after `ui invoke: ran late` (`late`)."""
     lines = [line for line in out.splitlines() if line.strip()]
-    if lines and lines[0].startswith(INVOKE_CANCELLED):
+    if lines and (lines[0].startswith(INVOKE_CANCELLED) or INVOKE_BUSY.match(lines[0])):
         return None
     late = bool(lines) and lines[0] == INVOKE_LATE
     body = lines[1:] if late else lines
@@ -1015,7 +1024,7 @@ def invoke(
     allow: str | None = None,
 ) -> Invoked:
     """`ui invoke <node> <action> [args]`: retried while cancelled at its
-    deadline (a cancelled request never ran, so a retry can't act twice);
+    deadline or refused busy (neither ran, so a retry can't act twice);
     "ran late" with its row or message counts as done (`Invoked.late`), and
     `Invoked.retries` says how many were cancelled first."""
     line = shlex.join(["ui", "invoke", str(node_id), action, *args])

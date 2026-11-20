@@ -2988,7 +2988,7 @@ size or bounded:
 | compiled code | `CODE_FACTOR` × `MODULE_BYTES` |
 | store, instance, call stack (`CALL_DEPTH` frames), handle table | `STORE_BYTES` |
 | table | `TABLE_BYTES` (`TABLE_ELEMENTS` × 16) |
-| two tree copies (#207) | `TREE_COPIES_BYTES` (2 × `TREE_BYTES`) |
+| its published tree (#207): the desktop's rows and the id map held, and a republish's peak | `TREE_COPIES_BYTES` (1 MiB: 929,280 bytes measured at the worst trees' peak by `lumen-app-api`'s `tests/publish_peak.rs`, each block as the kernel's heap sizes it) |
 | glyph cache (#206) | `GLYPH_CACHE_BYTES` |
 | its window: two surfaces plus `text_draw`'s scratch | `WINDOWS` × `SURFACES` × `WINDOW_PIXELS` × `BYTES_PER_PIXEL` |
 
@@ -3165,12 +3165,15 @@ over a text (`text_measure` one, `text_draw` two: its advance and its
 drawing walk every character, whatever reaches the clip),
 `EVENT_FUEL` per trace event copied out, `BYTE_FUEL` per byte of a tree
 or an answer copied in (refused or not), and `NODE_FUEL` per node of a
-tree decoded, items counted (#207: its strings copied, its id mapped, its
-row made) (`app::tests::host_calls_charge_their_fuel` checks `CALL_FUEL`,
+tree decoded, items counted, refused or not (#207: its strings copied,
+its id mapped, its row made; a refusal can come after every node was
+decoded and its ids sorted, `Tree::decode_counted`)
+(`app::tests::host_calls_charge_their_fuel` checks `CALL_FUEL`,
 `BYTE_FUEL`, `LOG_FUEL` and `EVENT_FUEL`;
 `app::tests::window_calls_charge_their_fuel` the pixels and glyphs, as
 floors; `app::tests::window_publish_charges_by_the_byte_and_the_node` a
-tree's bytes and nodes, and a refused tree's bytes;
+tree's bytes and nodes, items counted, a refused tree's too;
+`app::tests::window_answer_charges_by_the_byte` an answer's bytes;
 `app::tests::host_calls_cost_fuel_however_many_in_one_block` a run of
 calls in one block across slices, debt included).
 
@@ -3327,8 +3330,11 @@ the five every node has, first, then its own, in the table's order):
 | `Menu` | `focused`, `expanded`, `items: Vec<Item>` |
 
 `Item` is `{ id, name, bounds, disabled, hidden }` (`common`'s fields): a
-list item's `selected` flag is derived from its list. What is left to
-check: ids non-zero and unique (items' too); `selected` below
+list item's `selected` flag is derived from its list. Names and texts are
+`tree::Text` (`Capped<TEXT_BYTES>`: an app's toolkit cuts a longer one, a
+longer one decoded is refused), shown sanitised as log text in the
+kernel's rows (`ui tree` can't be forged a line). What is left to
+check: ids non-zero and unique (items' too); at most one node focused; `selected` below
 `items.len()`; every `bounds` with `x + w` and `y + h` fitting in `i32`;
 `children` counts consuming the list exactly; at most `TREE_NODES` nodes,
 items counted, and `TREE_BYTES` encoded. The kernel decodes it
@@ -3526,14 +3532,14 @@ message, a trap's, `Failed`'s text and an unknown manifest grant (cut at
 | `MEMORY_PAGES` | 256 (16 MiB) | refused at load |
 | `VALUE_STACK_BYTES` | 1 MiB | trap: call stack exhausted |
 | `CALL_DEPTH` | 1000 frames | trap: call stack exhausted |
-| `APP_OVERHEAD` | 1 MiB | the overhead charge, at least its parts' sum |
+| `APP_OVERHEAD` | 2 MiB | the overhead charge, at least its parts' sum |
 | `STORE_BYTES` | 512 KiB | its part for the store, instance, call stack and handle table |
 | `TABLE_BYTES` | `TABLE_ELEMENTS` × 16 | its part for the table |
-| `TREE_COPIES_BYTES` | 2 × `TREE_BYTES` | its part for two tree copies (#207) |
+| `TREE_COPIES_BYTES` | 1 MiB | its part for its published tree (#207: what the kernel holds for it and a republish's peak, measured) |
 | `GLYPH_CACHE_BYTES` | 128 KiB | its part for the glyph cache (#206; a `const` assertion in `font.rs` ties it to `font::Text`'s) |
 | `WINDOW_PIXELS` | 307,200 (640 × 480) | `window_open`: `BadArgument` |
 | `SURFACES`, `BYTES_PER_PIXEL` | 3, 4 | the window charge |
-| `APP_WORST` | about 29.5 MiB (the sum above) | |
+| `APP_WORST` | about 30.5 MiB (the sum above) | |
 | `TABLE_ELEMENTS` | 10,000 | refused at load; `table.grow` returns -1 |
 | `SLICE_FUEL` | 1,000,000 | the slice ends |
 | `CALL_FUEL`, `LOG_FUEL` | 1,000, 10,000 | fuel per call, per log line |
@@ -3575,11 +3581,13 @@ SSE); #197 checks the results' bits.
 - **`ui tree`** shows an app's window like a kernel one: the root (the
   compositor's), then the app's nodes with global ids, bounds in screen
   pixels.
-- **One request per window.** An app's window
-  (`WindowHandle::one_request_at_a_time`) holds at most one request that
-  is queued or started and not yet answered: `desktop::push_request`
-  refuses another with `Refused::Busy` (`ui invoke: window <id> busy
-  (try again)`) before anything is queued, which also covers a second
+- **One request per window.** An app's window (opened with
+  `desktop::Requests::OneAtATime`, so it never exists without the rule)
+  holds at most one request that is queued or started and not yet
+  answered: `desktop::push_request` refuses another with `Refused::Busy`,
+  the request marked held out (`ui invoke: a request is still queued or
+  running in window <id>`: retrying helps only once that one is answered),
+  before anything is queued, which also covers a second
   request pushed before the first is taken. The request holds the slot
   (`ui::RequestSlot`), which frees when it is answered (`OwnerEnded` and
   "window closed" included), skipped or refused, before its asker is
@@ -3603,8 +3611,17 @@ SSE); #197 checks the results' bits.
   invoke: window <id> closed while running it (it may have run)`. None
   of section 11's answers would be true, and a `Started` dropped
   unanswered is "dropped while running" (a bug). The app's window
-  (`app/window.rs`'s `AppWindow`) drops its desktop handle before its
-  running request (field order), so the window is gone first.
+  (`app/window.rs`'s `AppWindow`) drops its desktop handle first in its
+  `Drop`, then answers its running request, so the window is gone first;
+  `ClosedItsWindow` closes the window's handle (as `handle_close` would:
+  later calls on it are `BadHandle`, and a close grace ends), then answers
+  (`answer_request`). The ktests check both through a probe on the reply,
+  which sees the window gone when the asker is answered.
+- **Refusals** of a tree or an answer (the caps included) log a DEBUG
+  line naming the call, the length and why; a refused `Refused(_)` for a
+  node gone from the newest tree answers `no node`.
+- **Ids** (`lumen_app_api::tree::IdMap`): each window's app ids and global
+  ids both ways, the reuse and leave-and-come-back rules host-tested.
 - **The SDK** (`lumen_app::ui`): `HostText`, and `Toolkit`, which runs an
   app's `lumen_ui::App` one step per event as the kernel's `ui::Toolkit`
   does (painted, committed, published, then answered); an app may take
@@ -4183,7 +4200,8 @@ client area with, a window's first event and again after each switch).
   answers and wakes its asker): `EventQueue::push_request` hands a refused
   request back (`lumen_wm::Refused::Busy` past the ration, `Refused::Dead`
   once the queue is dead), `desktop::push_request` does the same for a
-  window no longer on the list, and `EventQueue::kill` returns the
+  window no longer on the list and, #207, `Refused::Busy` for an app's
+  window whose one request slot is held (section 8), and `EventQueue::kill` returns the
   requests still queued; each is answered once the locks are released
   (the asker prints "busy" or "window <id> closed", `WindowHandle`'s drop
   answers "window closed").

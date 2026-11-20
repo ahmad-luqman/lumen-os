@@ -124,6 +124,15 @@ mod tests {
                 Taken::Answer { started: 1, error: InvokeError::NotAllowed(Role::Button, kind) }
             );
         }
+        // `focus` where the role doesn't take it (a label, a list item).
+        for role in [Role::Label, Role::ListItem] {
+            assert_eq!(
+                take(Some(1), Some((5, role)), &Action::Focus),
+                Taken::Answer { started: 1, error: InvokeError::NotAllowed(role, ActionKind::Focus) }
+            );
+        }
+        // A list item takes `select`.
+        assert!(matches!(take(Some(1), Some((5, Role::ListItem)), &Action::Select), Taken::Deliver { .. }));
         // A set_value text past its cap.
         let long = Action::SetValue("v".repeat(SET_VALUE_BYTES + 1));
         assert_eq!(

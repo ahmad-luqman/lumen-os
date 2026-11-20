@@ -6,7 +6,7 @@
 //! stray item and a disagreeing selection can't be written at all.
 //!
 //! What is left to check, [`Tree::decode`] checks: ids non-zero and unique
-//! (items' too); a list's selection below its items' count; every
+//! (items' too); at most one node focused; a list's selection below its items' count; every
 //! rectangle's far edges within `i32`; the groups' `children` counts
 //! consuming the nodes exactly; at most [`TREE_NODES`] nodes (items
 //! counted) and [`TREE_BYTES`] encoded. It decodes node by node
@@ -114,6 +114,18 @@ impl Node {
         }
     }
 
+    /// Whether it says it has the focus.
+    pub fn focused(&self) -> bool {
+        match self {
+            Node::Button { focused, .. }
+            | Node::Checkbox { focused, .. }
+            | Node::TextField { focused, .. }
+            | Node::List { focused, .. }
+            | Node::Menu { focused, .. } => *focused,
+            Node::Group { .. } | Node::Label { .. } => false,
+        }
+    }
+
     /// Its role in the automation tree.
     pub fn role(&self) -> Role {
         match self {
@@ -147,6 +159,8 @@ pub enum TreeError {
     Bounds { node: usize },
     /// The groups' `children` counts don't consume the nodes exactly.
     Children,
+    /// More than one node focused (a window has one focus).
+    Focus,
     /// A row `Tree::from_automation` can't write: a window's root, or an
     /// item that doesn't follow its list or menu (an app-side bug).
     Shape { row: usize },
@@ -163,6 +177,7 @@ impl core::fmt::Display for TreeError {
             TreeError::Selection { node } => write!(f, "node {node}'s selection is past its items"),
             TreeError::Bounds { node } => write!(f, "node {node}'s bounds pass i32"),
             TreeError::Children => f.write_str("the children counts don't consume the nodes exactly"),
+            TreeError::Focus => f.write_str("more than one node focused"),
             TreeError::Shape { row } => write!(f, "row {row} has no wire node"),
         }
     }
@@ -252,6 +267,9 @@ impl Tree {
             return Err(TreeError::DuplicateId(w[0]));
         }
         drop(ids);
+        if nodes.iter().filter(|n| n.focused()).count() > 1 {
+            return Err(TreeError::Focus);
+        }
         // The shape: a stack of (children still to come, the group's
         // index), on the heap and no deeper than the nodes.
         let mut places = Vec::with_capacity(nodes.len());
@@ -518,9 +536,13 @@ mod tests {
         postcard::to_allocvec(n).unwrap()
     }
 
+    /// How many variants `Node` has: written once, for the pin's range and
+    /// the past-the-last byte.
+    const NODE_VARIANTS: u8 = 7;
+
     /// Each variant's tag, by an exhaustive match: a variant added fails to
-    /// build here until its arm is written; then the range checked below
-    /// needs its case, and its bytes pinned.
+    /// build here until its arm is written; then `NODE_VARIANTS` needs
+    /// raising, its case and bytes pinned.
     fn tag(n: &Node) -> u8 {
         match n {
             Node::Group { .. } => 0,
@@ -560,7 +582,7 @@ mod tests {
             assert_eq!(postcard::from_bytes::<Node>(bytes).as_ref(), Ok(node));
         }
         tags.sort_unstable();
-        assert_eq!(tags, (0..=6).collect::<Vec<u8>>(), "every variant pinned once");
+        assert_eq!(tags, (0..NODE_VARIANTS).collect::<Vec<u8>>(), "every variant pinned once");
     }
 
     /// A tree of `nodes`, encoded.
@@ -615,6 +637,13 @@ mod tests {
             items: CappedVec::new(vec![wide_item]).unwrap(),
         };
         assert_eq!(Tree::new(vec![button(1), bad_item]), Err(TreeError::Bounds { node: 1 }));
+        // At most one node focused.
+        let focused = |id| Node::Button { common: c(id), focused: true };
+        assert!(Tree::new(vec![focused(1), button(2)]).is_ok());
+        assert_eq!(Tree::new(vec![focused(1), button(2), focused(3)]), Err(TreeError::Focus));
+        // TREE_NODES nodes, items counted, by `new` too.
+        assert_eq!(Tree::new((1..=TREE_NODES as u64 + 1).map(button).collect()), Err(TreeError::TooManyNodes));
+        assert!(Tree::new((1..=TREE_NODES as u64).map(button).collect()).is_ok());
         // Children counts consuming the nodes exactly.
         assert_eq!(Tree::new(vec![group(1, 2), button(2)]), Err(TreeError::Children), "one short");
         assert!(Tree::new(vec![group(1, 1), button(2), button(3)]).is_ok(), "the third at the top");
@@ -791,7 +820,7 @@ mod tests {
         assert_eq!(bad(&[5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2]), err(P::DeserializeBadOption));
         // A variant past the last (serde's own message: postcard's custom
         // error).
-        assert_eq!(bad(&[7]), err(P::SerdeDeCustom));
+        assert_eq!(bad(&[NODE_VARIANTS]), err(P::SerdeDeCustom));
         // Truncated.
         assert_eq!(bad(&[2, 1]), err(P::DeserializeUnexpectedEnd));
         // No wire type here holds a `char` (the surrogate case is `Event`'s).
@@ -902,10 +931,35 @@ mod tests {
             );
             assert_eq!(a.children().iter().map(|&c| global(c)).collect::<Vec<_>>(), b.children());
         }
-        // A row the wire can't hold: a window's root, a stray item.
+        // Hidden nodes and items go over too: a bar too narrow for its
+        // widgets hides those past its pinned one.
+        let mut bar = Ui::bar(4);
+        for name in ["One", "Two", "Three", "Four"] {
+            bar.button(None, name);
+        }
+        let pinned = bar.button(None, "Pinned");
+        assert!(bar.pin_right(pinned));
+        bar.layout(lumen_gfx::Rect::new(0, 0, 120, 30), &mut FixedText);
+        let bar_rows = bar.nodes();
+        assert!(bar_rows.iter().any(|(_, n)| n.state().contains(StateFlags::HIDDEN)), "something hidden");
+        let back = Tree::decode(&Tree::from_automation(&bar_rows).unwrap().encode().unwrap()).unwrap();
+        let (_, got) = back.rows(|_, _| NodeId::fresh());
+        let hidden = |rows: &[(u32, AutomationNode)]| -> Vec<bool> {
+            rows.iter().map(|(_, n)| n.state().contains(StateFlags::HIDDEN)).collect()
+        };
+        assert_eq!(hidden(&bar_rows), hidden(&got));
+        // A row the wire can't hold: a window's root, a stray item, a list
+        // followed by a row that isn't its item.
         let root = AutomationNode::window(NodeId::fresh(), "w", lumen_gfx::Rect::new(0, 0, 1, 1), false, Vec::new());
         assert_eq!(Tree::from_automation(&[(0, root)]), Err(TreeError::Shape { row: 0 }));
         let item_row = rows.iter().position(|(_, n)| n.role() == Role::ListItem).unwrap();
         assert_eq!(Tree::from_automation(&rows[item_row..]), Err(TreeError::Shape { row: 0 }));
+        let mut wrong = rows.clone();
+        let list_row = item_row - 1;
+        wrong[item_row] = (
+            wrong[item_row].0,
+            AutomationNode::button(NodeId::fresh(), "x", lumen_gfx::Rect::new(0, 0, 1, 1), false, false),
+        );
+        assert_eq!(Tree::from_automation(&wrong), Err(TreeError::Shape { row: list_row }));
     }
 }

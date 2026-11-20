@@ -95,6 +95,9 @@ mod tests {
     use lumen_ui::{AutomationNode, NodeId};
     use postcard::Error as P;
 
+    /// How many variants `AppAnswer` has (see `tree`'s `NODE_VARIANTS`).
+    const ANSWER_VARIANTS: u8 = 4;
+
     /// Each variant's tag, by an exhaustive match (see `tree`'s).
     fn tag(a: &AppAnswer) -> u8 {
         match a {
@@ -120,7 +123,7 @@ mod tests {
             assert_eq!(AppAnswer::decode(bytes).as_ref(), Ok(a));
         }
         tags.sort_unstable();
-        assert_eq!(tags, [0, 1, 2, 3], "every variant pinned once");
+        assert_eq!(tags, (0..ANSWER_VARIANTS).collect::<Vec<u8>>(), "every variant pinned once");
         let names: Vec<&str> = Refusal::ALL.iter().map(|r| r.name()).collect();
         assert_eq!(names, ["NoNode", "Disabled", "Hidden", "NotAllowed", "Arguments"]);
         for (i, r) in Refusal::ALL.into_iter().enumerate() {
@@ -175,8 +178,9 @@ mod tests {
         assert_eq!(AppAnswer::decode(&[2, 1, 2, 3]), Err(DecodeError::LeftOver(3)));
         // Malformed values: a variant past the last, a refusal past its
         // table, bad UTF-8, an overflowing length.
-        assert_eq!(AppAnswer::decode(&[4]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
-        assert_eq!(AppAnswer::decode(&[1, 5]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
+        assert_eq!(AppAnswer::decode(&[ANSWER_VARIANTS]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
+        let refusals = Refusal::ALL.len() as u8;
+        assert_eq!(AppAnswer::decode(&[1, refusals]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
         assert_eq!(AppAnswer::decode(&[3, 1, 0xff]), Err(DecodeError::Postcard(P::DeserializeBadUtf8)));
         assert_eq!(
             AppAnswer::decode(&[3, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]),

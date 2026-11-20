@@ -1159,7 +1159,10 @@ fn tree_call_module(f: u8) -> Vec<u8> {
 /// Load `tree_call_module(f)` with a window on a screenless desktop (a
 /// request running on it if `running`): the store, `lumen_main`, the
 /// window's handle (poked at 0).
-fn with_window(f: u8, running: bool) -> Result<(Store<runtime::AppCtx>, wasmi::TypedFunc<(), i32>, i32), &'static str> {
+/// A loaded app: its store, `lumen_main`, and a window's handle.
+type Loaded = (Store<runtime::AppCtx>, wasmi::TypedFunc<(), i32>, i32);
+
+fn with_window(f: u8, running: bool) -> Result<Loaded, &'static str> {
     let grants = Grants::log().with(lumen_app_api::Grant::Desktop);
     let (mut store, main) = load_as(&tree_call_module(f), &test_state(), grants)?;
     store.data_mut().desktop = Some(crate::desktop::Desktop::without_screen());

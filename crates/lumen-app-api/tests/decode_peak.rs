@@ -1,9 +1,10 @@
 //! The heap's peak while the wire decoders take hostile input (ARCHITECTURE
 //! section 8, "Sequences"): a counting global allocator, in a test binary of
 //! its own with one test, so nothing else allocates meanwhile. A length
-//! claimed past the bytes left, or past a sequence's cap, must not reserve
-//! for it; the largest valid tree stays within a small multiple of its
-//! encoding.
+//! claimed past a sequence's cap must not reserve for it (refused first),
+//! and one claimed past the bytes left reserves nothing (postcard gives no
+//! hint then); the largest valid trees stay within 4 × `TREE_BYTES` at the
+//! peak (an absolute bound, measured on them).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -91,6 +92,34 @@ fn hostile_lengths_reserve_nothing_and_the_largest_tree_stays_small() {
     let peak = peak_of(|| Tree::decode(&backed));
     assert!(Tree::decode(&backed).is_err());
     assert!(peak <= 4096, "a backed claim: {peak} bytes at the peak");
+    // A claim one past the bytes left (no hint: nothing reserved for it),
+    // its elements decoded until the input ends: within 2 × TREE_BYTES.
+    let item = &postcard::to_allocvec(&common(9)).unwrap();
+    let n = (TREE_BYTES - 16) / item.len();
+    let mut short = [head, &postcard::to_allocvec(&(n as u32 + 1)).unwrap()[..]].concat();
+    for i in 0..n {
+        let mut it = postcard::to_allocvec(&common(2 + i as u64)).unwrap();
+        it.truncate(item.len().min(it.len()));
+        short.extend(it);
+    }
+    let short = &short[..short.len().min(TREE_BYTES)];
+    let peak = peak_of(|| Tree::decode(short));
+    assert!(Tree::decode(short).is_err());
+    assert!(peak <= 2 * TREE_BYTES, "a claim one past the bytes left: {peak} bytes at the peak");
+    // Seven lists of TREE_NODES - 1 items each, with the bytes behind
+    // them: refused once the nodes pass TREE_NODES, after the first two.
+    let full = postcard::to_allocvec(&Node::List {
+        common: common(1),
+        focused: false,
+        selected: None,
+        items: CappedVec::new((2..=TREE_NODES as u64).map(common).collect()).unwrap(),
+    })
+    .unwrap();
+    let seven: Vec<u8> = full.iter().copied().cycle().take(7 * full.len()).collect();
+    let seven = &seven[..seven.len().min(TREE_BYTES)];
+    let peak = peak_of(|| Tree::decode(seven));
+    assert!(Tree::decode(seven).is_err());
+    assert!(peak <= 4 * TREE_BYTES, "seven long lists: {peak} bytes at the peak");
     // An answer claiming a huge text: postcard checks the bytes left first.
     let peak = peak_of(|| AppAnswer::decode(&[3, 0xff, 0xff, 0xff, 0xff, 0x0f, b'a']));
     assert!(peak <= 64, "{peak}");

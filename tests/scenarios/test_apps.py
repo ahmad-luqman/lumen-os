@@ -16,6 +16,7 @@ line and its thread's join.
 """
 
 import re
+import time
 
 from lumen_harness import REPO_ROOT, gui, klog
 from lumen_harness.gui import parse_records, poll
@@ -362,7 +363,7 @@ def test_window_calls_refuse_bad_arguments(boot):
 
 
 # `abuse window`'s checks: every one runs, whatever the answers.
-ABUSE_WINDOW_CHECKS = 97
+ABUSE_WINDOW_CHECKS = 98
 
 
 def test_kill_wakes_an_app_waiting_on_its_window(boot):
@@ -538,10 +539,15 @@ def display(m, wid: str) -> str:
 
 def press(m, rows: list[dict[str, str]], *names: str) -> None:
     """`ui invoke <button> press` for each button named, in turn: each
-    answered with its row."""
+    answered with its row, or (an owner the host stalled past both
+    deadlines) still running, then waited for: the desktop settled, no
+    request outstanding, so its effect is in the tree the caller reads."""
     for name in names:
         button = gui.node(rows, "button", name)
         got = gui.invoke(m, button["id"], "press")
+        if got.message is not None and gui.INVOKE_STILL_RUNNING.match(got.message):
+            gui.wait_settled(m)
+            continue
         assert got.row is not None and got.row["id"] == button["id"], (name, got)
 
 
@@ -550,7 +556,8 @@ def test_calculator_tree_and_invoke(boot):
     # and every button, ids global; `ui invoke` presses them as clicks do:
     # 2 + 3 = shows 5 in the display's value, published before each answer
     # (read at once, no poll); keys typed through confirmed steps reach it
-    # too; closing its window ends it with 0.
+    # too (a sum with a new result, Backspace and Escape); closing its
+    # window ends it with 0.
     m = boot_desktop(boot)
     app_id, mark = start(m, "calculator")
     wid, rows = calc_tree(m)
@@ -562,23 +569,36 @@ def test_calculator_tree_and_invoke(boot):
     assert display(m, wid) == "3"
     press(m, rows, "=")
     assert display(m, wid) == "5"
-    # Keys: Escape-less `c` clears, then 9 - 4 and Enter.
-    gui.confirmed_keys(m, "c9-4", ["ret"])
-    gui.wait_ui(
-        m, "9 - 4 = 5 typed", lambda r: gui.node(r, "label", "Display")["value"] == "5", wid
-    )
+
+    # Keys: `c` clears, then 9 - 2 and Enter: 7 (a value the display
+    # didn't show before).
+    def shows(value: str):
+        return lambda r: gui.node(r, "label", "Display")["value"] == value
+
+    gui.confirmed_keys(m, "c9-2", ["ret"])
+    gui.wait_ui(m, "9 - 2 = 7 typed", shows("7"), wid)
+    # Backspace edits the entry; Escape clears.
+    gui.confirmed_keys(m, "12", ["backspace"])
+    gui.wait_ui(m, "12 then Backspace", shows("1"), wid)
+    gui.confirmed_keys(m, ["esc"])
+    gui.wait_ui(m, "Escape", shows("0"), wid)
     gui.close_window(m, "Calculator")
     end_line(m, mark, "calculator", app_id, "exited with 0")
 
 
+# The longest value the display shows (lumen-calc's
+# `the_longest_result_shows_whole`): 0 - 999999999999999 = / 7 =.
+LONGEST = "-142857142857142.714285714"
+
+
 def test_calculator_golden(boot, artifacts, golden_dir):
-    # The calculator's client area after 2 + 3 =, against a golden: the
-    # kernel's toolkit and font, drawn inside the app.
+    # The calculator's client area showing its longest value whole, against
+    # a golden: the kernel's toolkit and font, drawn inside the app.
     m = boot_desktop(boot)
     start(m, "calculator")
     wid, rows = calc_tree(m)
-    press(m, rows, "2", "+", "3", "=")
-    assert display(m, wid) == "5"
+    press(m, rows, "0", "-", *"999999999999999", "=", "/", "7", "=")
+    assert display(m, wid) == LONGEST
     row = gui.window(m, "Calculator")
     x0, y0, x1, y1 = gui.client_box(row)
     shot = gui.settled_screendump(m, "calculator.png")
@@ -629,19 +649,30 @@ def test_app_ids_are_global(boot):
 
 def test_closed_its_window_answer_comes_after_the_window_closes(boot):
     # `window ui` runs Counter (the kernel's demo app) in the SDK's
-    # toolkit: Quit closes its window, and `ui invoke`'s "ran; window
-    # closed" comes once the window is gone (read at once, no poll); the
-    # app returns 0.
+    # toolkit: its answers come once their effect is published (Lock's own
+    # row says checked); Quit closes its window, and `ui invoke`'s "ran;
+    # window closed" comes once the window is gone (read at once, no poll;
+    # on a host that stalled the owner past both deadlines, "still running"
+    # then the window's going); the app returns 0. A label longer than
+    # TEXT_BYTES is measured and drawn cut (no text call refused: no WARN).
     m = boot_desktop(boot)
     app_id, mark = start(m, "window ui")
     wid, rows = wait_tree(m, "window", "Quit")
     press(m, rows, "Add")
     assert gui.node(gui.ui_tree(m, wid), "label", "Count")["value"] == "1"
+    lock = gui.node(rows, "checkbox", "Lock")
+    got = gui.invoke(m, lock["id"], "press")
+    if got.row is not None:
+        assert got.row["value"] == "checked", got
     quit_ = gui.node(rows, "button", "Quit")
     got = gui.invoke(m, quit_["id"], "press")
-    assert got.message == f"ui invoke: ran; window {wid} closed", got
-    assert all(r["id"] != wid for r in gui.windows(m)), "answered before its window went"
+    if got.message is not None and gui.INVOKE_STILL_RUNNING.match(got.message):
+        gui.wait_no_window(m, "window")
+    else:
+        assert got.message == f"ui invoke: ran; window {wid} closed", got
+        assert all(r["id"] != wid for r in gui.windows(m)), "answered before its window went"
     end_line(m, mark, "window", app_id, "exited with 0")
+    assert "refused" not in m.output[mark:], "a text call refused"
 
 
 TRAPPED = r"WARN  app: window \(app \d+\) ended: trap: "
@@ -650,15 +681,27 @@ TRAPPED = r"WARN  app: window \(app \d+\) ended: trap: "
 def test_app_that_traps_closes_its_window_and_answers(boot):
     # `window ui-trap`: a press on Add traps while its request runs; the
     # app's end closes its window and answers the asker `OwnerEnded`
-    # ("closed while running it"), never "still running" (its 2 s of
-    # deadlines: the precondition, at risk on a stalled host) and never
-    # "dropped" (an ERROR). One end-line WARN.
+    # ("closed while running it", perhaps after "ran late"), or, on a host
+    # that stalled the app past both deadlines, "still running"; never
+    # "dropped" (an ERROR). A request cancelled or refused busy never ran:
+    # tried again. Confirmed by the end line (one WARN), the window's going
+    # and no ERROR.
     m = boot_desktop(boot)
     app_id, mark = start(m, "window ui-trap")
     wid, rows = wait_tree(m, "window", "Add")
     add = gui.node(rows, "button", "Add")
-    out = run(m, f"ui invoke {add['id']} press", allow=TRAPPED)
-    assert out == f"ui invoke: window {wid} closed while running it (it may have run)\n", out
+    ended = f"ui invoke: window {wid} closed while running it (it may have run)"
+    line = f"ui invoke {add['id']} press"
+    for _ in range(20):
+        lines = [x for x in run(m, line, 10, allow=TRAPPED).splitlines() if x]
+        if lines[0].startswith(gui.INVOKE_CANCELLED) or gui.INVOKE_BUSY.match(lines[0]):
+            time.sleep(0.2)  # never ran: nothing happened
+            continue
+        break
+    else:
+        raise AssertionError("never taken")
+    body = lines[1:] if lines[0] == gui.INVOKE_LATE else lines
+    assert body in ([ended], [f"ui invoke: still running (window {wid})"]), lines
     end_line(
         m, mark, "window", app_id, "ended: trap: wasm `unreachable` instruction executed", "WARN"
     )
@@ -688,20 +731,27 @@ TREE_NODES = 1024
 
 
 def test_one_request_per_window_refuses_a_second_as_busy(boot):
-    # `window deaf` publishes a button and never reads its events: a
-    # request to it is never taken (its asker cancels it at the deadline,
-    # whatever the host's speed), so it stays queued and holds the window's
-    # one request slot: a second `ui invoke` is refused busy before
-    # anything is queued. Killing the app frees everything.
+    # `window deaf` publishes a button and a label whose name and text hold
+    # ESC, LF and U+2028 (each shown U+FFFD: `ui tree` still parses), then a
+    # tree the host refuses (the last one stays: `ui tree` still has them),
+    # and never reads its events: a request to it is never taken (its asker
+    # cancels it at the deadline, whatever the host's speed), so it stays
+    # queued and holds the window's one request slot: a second `ui invoke`
+    # is refused before anything is queued. (A request running, not queued,
+    # holds it too: the window ktest.) Killing the app frees everything.
     m = boot_desktop(boot)
     app_id, mark = start(m, "window deaf")
-    wait_for_output(m, mark, r"INFO  app: window: window: deaf: published\n", 30)
+    wait_for_output(
+        m, mark, r"INFO  app: window: window: deaf: published; a bad tree then: -5\n", 30
+    )
     wid, rows = wait_tree(m, "window", "Go")
+    say = gui.node(rows, "label", "Say")
+    assert say["value"] == "a\ufffdb\ufffdc\ufffdd", say
     go = gui.node(rows, "button", "Go")
     first = run(m, f"ui invoke {go['id']} press")
     assert first == f"ui invoke: cancelled: window {wid} didn't take it in 1 s (try again)\n", first
     second = run(m, f"ui invoke {go['id']} press")
-    assert second == f"ui invoke: window {wid} busy (try again)\n", second
+    assert second == f"ui invoke: a request is still queued or running in window {wid}\n", second
     record = app(m, app_id)
     mark = len(m.output)
     kill(m, app_id, "window")

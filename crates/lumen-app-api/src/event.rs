@@ -440,9 +440,15 @@ mod tests {
         SetValue::try_from(text).unwrap()
     }
 
+    /// How many variants each data-carrying enum has: written once, for the
+    /// pin's range and the past-the-last bytes.
+    const EVENT_VARIANTS: u8 = 10;
+    const ACTION_VARIANTS: u8 = 7;
+    const KEY_ACTION_VARIANTS: u8 = 2;
+
     /// Each variant's tag, as an exhaustive match (no `_` arm): a variant
-    /// added fails to build here until its tag arm is written; the range
-    /// checked below and the pinned bytes are then to be extended with it.
+    /// added fails to build here until its tag arm is written; its count
+    /// above, its case and its bytes are then to be extended with it.
     fn event_tag(e: &Event) -> u8 {
         match e {
             Event::Theme { .. } => 0,
@@ -537,7 +543,7 @@ mod tests {
         // Every tag of each enum pinned above.
         let mut tags: Vec<u8> = cases.iter().map(|(e, _)| event_tag(e)).collect();
         tags.dedup();
-        assert_eq!(tags, (0..=9).collect::<Vec<u8>>());
+        assert_eq!(tags, (0..EVENT_VARIANTS).collect::<Vec<u8>>());
         let mut actions: Vec<u8> = cases
             .iter()
             .filter_map(|(e, _)| match e {
@@ -546,7 +552,7 @@ mod tests {
             })
             .collect();
         actions.dedup();
-        assert_eq!(actions, (0..=6).collect::<Vec<u8>>());
+        assert_eq!(actions, (0..ACTION_VARIANTS).collect::<Vec<u8>>());
         let mut keys: Vec<u8> = cases
             .iter()
             .filter_map(|(e, _)| match e {
@@ -556,7 +562,7 @@ mod tests {
             .collect();
         keys.sort_unstable();
         keys.dedup();
-        assert_eq!(keys, [0, 1]);
+        assert_eq!(keys, (0..KEY_ACTION_VARIANTS).collect::<Vec<u8>>());
     }
 
     /// The bytes an action takes at the end of a request's encoding.
@@ -876,7 +882,11 @@ mod tests {
         // A variant past the last, and a key code past the table.
         // A variant past the last, a key code past the table, a theme past
         // the two: serde's refusal, postcard's custom error.
-        assert_eq!(bad(&[10]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
+        assert_eq!(bad(&[EVENT_VARIANTS]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
+        // A request's action past the last, and a key's action past the
+        // last (nested enums).
+        assert_eq!(bad(&[9, 1, ACTION_VARIANTS]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
+        assert_eq!(bad(&[1, 61, 0, KEY_ACTION_VARIANTS]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
         assert_eq!(bad(&[1, 125, 0, 1]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
         assert_eq!(bad(&[0, 2, 0, 0, 0, 0, 0, 0, 0]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
     }
