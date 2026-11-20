@@ -249,6 +249,10 @@ fn fly(seed: u64, steps: usize, mut each: impl FnMut(&Game, &[Content], &[Cell],
     g
 }
 
+fn rock_count(g: &Game) -> usize {
+    grid(g).iter().filter(|&&c| c == Content::Rock).count()
+}
+
 /// The cells a step changed are exactly the ones it reported, each once.
 fn reports_exactly(g: &Game, before: &[Content], changed: &[Cell], after: &[Content]) {
     let reported: BTreeSet<Cell> = changed.iter().copied().collect();
@@ -310,10 +314,15 @@ fn a_grain_never_lands_on_the_comet_or_an_asteroid() {
             {
                 put_dust(&mut g, ahead);
             }
-            let score = g.score();
+            let (score, level, rocks_before) = (g.score(), g.level(), rock_count(&g));
             let before = grid(&g);
             let changed = g.step();
             check(&g);
+            // A grain never lands on an asteroid (it would erase it): the
+            // rocks only change with the level.
+            if g.level() == level {
+                assert_eq!(rock_count(&g), rocks_before, "seed {seed}: a rock gone or added");
+            }
             // Every level is reached here, so level changes' damage is
             // checked too.
             reports_exactly(&g, &before, &changed, &grid(&g));
