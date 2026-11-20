@@ -18,6 +18,7 @@ lumen-acpi = { path = "crates/lumen-acpi" }
 lumen-app-api = { path = "crates/lumen-app-api" }
 lumen-calc = { path = "crates/lumen-calc" }
 lumen-clock = { path = "crates/lumen-clock" }
+lumen-edit = { path = "crates/lumen-edit" }
 lumen-demo = { path = "crates/lumen-demo" }
 lumen-elf = { path = "crates/lumen-elf" }
 lumen-font = { path = "crates/lumen-font" }

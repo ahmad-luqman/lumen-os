@@ -184,6 +184,20 @@ tests = [
 ]
 
 [[feature]]
+name = "Text editor on an in-memory buffer (#203): a bundled app editing its text from the keyboard (typing, Enter, Tab, Backspace and Delete, the arrows, Home and End, Page Up and Down, Ctrl+Home and Ctrl+End, Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y, undo and redo by the layout's letters), every edit undone and redone restoring the text exactly, typing undone a run at a time, its text, lines and history bounded (`lumen_edit::Editor::status` saying `, full` after a refused edit), a text given normalised; its buffer a `textfield` node whose value is the text's first 1,024 bytes (`set_value` replacing it as one edit that undo takes back), its status line a label with the line, the column and whether it was modified; drawn by the app over a lumen-ui text area by damage, the pixels a full repaint draws, a view scrolled across showing the line's tail, a key costing a fraction of a full repaint, its blink stopping while unfocused, its window matching a golden"
+milestone = "M5"
+tests = [
+    "cargo:lumen-edit",
+    "cargo:lumen-ui",
+    "scenario:test_apps::test_editor_typing_and_tree",
+    "scenario:test_apps::test_editor_golden",
+    "scenario:test_apps::test_editor_redraws_what_a_full_repaint_draws",
+    "scenario:test_apps::test_editor_a_key_costs_a_fraction_of_a_full_repaint",
+    "scenario:test_apps::test_editor_unfocused_stops_ticking",
+    "scenario:test_apps::test_editor_golden_scrolled_across",
+]
+
+[[feature]]
 name = "An original snake-style game (#201): Comet, a comet steered with the arrow keys across a sky of cells, its tail growing with each grain of stardust, ended by the edge, its own tail or a level's asteroids; one seed plays one game; stepping one step per Step press (settling between), flying by itself, Step while flying stepping again; Play and Step disabled once over, Restart starting as launched and redrawing the sky; score, level, state, the head's cell and heading in its tree, each label fitting its width; its window matching a golden"
 milestone = "M5"
 tests = [

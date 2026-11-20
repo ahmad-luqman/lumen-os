@@ -1199,7 +1199,7 @@ def test_a_toolkit_window_repaints_in_a_new_theme(boot):
 
 # The bundled apps whose manifest grants `desktop` (#206: never a test app),
 # but `life`, which the Life item starts (#202: listed once).
-DESKTOP_APPS = ["calculator", "clock", "comet", "template", "viewer"]
+DESKTOP_APPS = ["calculator", "clock", "comet", "editor", "template", "viewer"]
 LAUNCHER_ITEMS = ["Terminal", "Mandelbrot", "Life", "Counter", *DESKTOP_APPS]
 # kernel/src/demo.rs `mandelbrot_owner`'s line.
 MANDEL_WINDOW = re.compile(

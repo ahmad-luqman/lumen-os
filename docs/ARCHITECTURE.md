@@ -3933,6 +3933,23 @@ kernel (no SSE); #197 checks the results' bits.
   - **`run life [--stopped] [pattern]`** (`gun` without one; the launcher
     starts it running with `gun`); anything else is one ERROR naming it,
     with the usage, and exit 2.
+- **What #203 adds (the text editor):** `apps/editor` (bundled; `caps=time,desktop`), its logic
+  `crates/lumen-edit` (a path dependency, host-tested): the buffer and cursor, a typing run undone as
+  one edit, the `Limits` (the text's bytes, a line's, and the history's edits and bytes, so its memory
+  is bounded), a text given `normalise`d (a tab as spaces, `\r` as `\n`) and a cut one reported
+  (`Loaded`), the status line, the `Change` naming the lines to redraw, the keys (`command`: Ctrl+Z
+  and Ctrl+Y by the layout's letters, the press's control-code text, since a `KeyCode` names a US
+  place; the other keys by code) and the view across (`view`: scrolled by characters, at most its
+  width over the narrowest glyph shown, so every text drawn or measured costs no more than what the
+  view can show). And `lumen_ui::Ui::text_area`: a `textfield` node of a given size whose text its
+  app draws over it and edits (keys never edit it; `Ui::set_text` changes the node to publish but
+  repaints nothing; a focus change repaints only its ring). The editor's node is a lossy view of its
+  buffer: the first `TEXT_BYTES`, each control character (`\n` included) shown as U+FFFD; a
+  `set_value` (at most `SET_VALUE_BYTES`) replaces the text as one edit. It draws by damage (a
+  line changed at the cursor from just before it on, an undo's whole line, the rows below when lines
+  come or go, a cursor move as one rect, each line once a repaint, only inside the rect repainted), and blinks its cursor on `run_until` only while its window has the focus (a
+  fixed 500 ms period, solid through the tick after a key): unfocused, or with `--no-blink`, it has
+  no period and the desktop settles.
 - **What #204 adds (the image viewer, `apps/viewer`, bundled):** images
   built into the app (the wallpaper, `assets/wallpaper/lumen.png`; and
   `apps/viewer/images/`, made by `tools/viewer-images.py`: a palette image,
@@ -4960,7 +4977,7 @@ impl Role { pub fn actions(self) -> &'static [ActionKind]; }
   | `label` | `Text` | none | `disabled`, `hidden` | |
   | `button` | none | `press`, `focus` | `focused`, `disabled`, `hidden` | the owner |
   | `checkbox` | `Checked` | `press` (toggles), `focus` | `focused`, `disabled`, `hidden` | the owner |
-  | `textfield` | `Text` | `set_value <text>` (replaces the text, as one edit, not keystrokes), `focus` | `focused`, `disabled`, `hidden` | the owner |
+  | `textfield` (a text field; or a text area, `Ui::text_area`, #203: its text drawn and edited by its app, the tree painting only its field, border and ring; its value is what the app sets, which for the editor is a lossy view of its buffer) | `Text` | `set_value <text>` (replaces the text, as one edit, not keystrokes), `focus` | `focused`, `disabled`, `hidden` | the owner |
   | `list` | `Selected` | `focus` | `focused`, `disabled`, `hidden` | the owner |
   | `listitem` | none | `select`, `press` | `selected`, `disabled`, `hidden` | the owner |
   | `menu` | none | `press`, `focus` | `focused`, `disabled`, `expanded`, `hidden` | the owner |

@@ -1,0 +1,23 @@
+[package]
+name = "editor"
+description = "The text editor (#203): an in-memory buffer drawn by the app over a lumen-ui text area, keyboard editing with undo and redo, a blinking cursor, a status line; files come with M6. Its editing logic is lumen-edit's (host-tested)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+# A WASM module has no host-side tests: its logic is lumen-edit's, and the
+# kernel runs it (tests/scenarios/test_apps.py).
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+lumen-app.workspace = true
+lumen-edit.workspace = true
+lumen-ui.workspace = true
+
+[lints]
+workspace = true
