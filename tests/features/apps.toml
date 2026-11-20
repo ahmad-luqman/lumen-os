@@ -177,5 +177,6 @@ tests = [
     "cargo:lumen-snake",
     "scenario:test_apps::test_snake_tree_and_steps",
     "scenario:test_apps::test_snake_steering_and_modes",
+    "scenario:test_apps::test_snake_flies_by_default_and_restarts_as_launched",
     "scenario:test_apps::test_snake_golden",
 ]

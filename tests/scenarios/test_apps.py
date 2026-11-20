@@ -997,6 +997,32 @@ def test_snake_steering_and_modes(boot):
     end_line(m, mark, "comet", app_id, "exited with 0")
 
 
+def test_snake_flies_by_default_and_restarts_as_launched(boot):
+    # Comet launched without `--step` flies by itself: the seed's straight
+    # flight ends at the edge with nothing pressed. Restart then starts the
+    # next game flying too, as launched (never stepping).
+    m = boot_desktop(boot)
+    app_id, mark = start(m, f"comet --seed {COMET_SEED}")
+    wid, rows = comet_tree(m)
+    x, y = COMET_START
+
+    def state(r):
+        return gui.node(r, "label", "State")["value"]
+
+    rows = gui.wait_ui(m, "the flight's end", lambda r: state(r) == "over: edge", wid, 60)
+    labels = comet_labels(m, wid)
+    assert (labels["Score"], labels["Comet"]) == (
+        "Score 1",
+        comet_at(x + COMET_STEPS_TO_EDGE, y),
+    ), labels
+    if gui.press_button(m, below_root(rows), "Restart", animating=True).still_running:
+        gui.wait_settled(m)
+    after = state(below_root(gui.ui_tree(m, wid)))
+    assert after != "stepping", after
+    gui.close_window(m, "Comet")
+    end_line(m, mark, "comet", app_id, "exited with 0")
+
+
 def test_snake_golden(boot, artifacts, golden_dir):
     # Comet stepping from the scenario's seed: seven steps (its first grain
     # eaten, the tail growing), up, three more: the bent comet, the next
