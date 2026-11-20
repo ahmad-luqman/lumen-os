@@ -187,9 +187,10 @@ def test_xray_matches_the_scheduler(boot):
     # Two CPUs: X-ray (the first app) runs on CPU 0, and `trace runq spin`
     # starts 3 threads spinning on CPU 1, the last: one runs, two wait on
     # its queue. X-ray's run-queue label for CPU 1 and the scheduler's
-    # count (`trace runq`) are read together until both say 2, and its
-    # thread label names one of the spinning threads; once they stop, until
-    # both say 0. Counts, polled until they agree, never a time.
+    # count (`trace runq`) are read together until both say 2, its thread
+    # label names one of the spinning threads and its switches there grow;
+    # once they stop, until both say 0. Counts, polled until they agree,
+    # never a time.
     m = desktop(boot, "-smp", "2")
     app_id, mark, wid, record = start_xray(m)
     assert xray_cpu(m, record) == "0", record
@@ -207,6 +208,11 @@ def test_xray_matches_the_scheduler(boot):
         read,
         lambda g: g[0] == g[1] == waiting and g[2] in spinning,
         60,
+    )
+    # Its switches on that CPU grow while they take turns (a floor).
+    switched = int(label(gui.ui_tree(m, wid), "cpu 1 switches"))
+    gui.wait_ui(
+        m, "switches on cpu 1", lambda r: int(label(r, "cpu 1 switches")) > switched, wid, 60
     )
     stop_spinning(m, SPIN, cpu)
     gui.wait_for(m, "both queues empty again", read, lambda g: g[0] == g[1] == "0", 60)
@@ -260,18 +266,24 @@ REPLAY = {
     "cpu 0": "cpu 0",
     "cpu 0 runq": "0",
     "cpu 0 thread": "3",
-    "cpu 0 irqs": "66",
-    "cpu 0 locks": "6",
+    "cpu 0 switches": "98",
+    "cpu 0 irqs": "40",
+    "cpu 0 locks": "4",
+    "cpu 0 missed": "0",
     "cpu 1": "cpu 1 off",
     "cpu 1 runq": "-",
     "cpu 1 thread": "-",
+    "cpu 1 switches": "9",
     "cpu 1 irqs": "9",
     "cpu 1 locks": "0",
+    "cpu 1 missed": "0",
     "cpu 2": "cpu 2",
     "cpu 2 runq": "2",
     "cpu 2 thread": "22",
-    "cpu 2 irqs": "22",
+    "cpu 2 switches": "98",
+    "cpu 2 irqs": "14",
     "cpu 2 locks": "2",
+    "cpu 2 missed": "5",
     "State": "replay",
 }
 

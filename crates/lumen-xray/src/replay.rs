@@ -172,23 +172,25 @@ mod tests {
 
     #[test]
     fn the_frozen_view_is_pinned() {
+        // The numbers below are for 50 columns.
+        assert_eq!(COLUMNS, 50);
         let v = view();
         assert_eq!(v.cpus().len(), CPUS);
         assert_eq!(v.cursor(), 0, "every column written once");
         let [c0, c1, c2] = [&v.cpus()[0], &v.cpus()[1], &v.cpus()[2]];
-        // CPU 0: column 79's length is 79 % 16 = 15: (16 - 15) / 2 = 0.
+        // Every count leaves column 0 out (the backlog).
+        // CPU 0: its length last changed in column 47 (to (16 - 15) / 2 = 0).
         assert_eq!(c0.presence, Presence::Online);
         assert_eq!(c0.runq, Some(0));
-        assert_eq!(c0.thread, Some(CPU0_THREADS[(2 * 79 + 2) % 4]));
-        // Every count leaves column 0 out (the backlog).
-        assert_eq!(c0.switches, Some(158));
-        // irqs: 16 columns k % 5 == 0 (3 each), and those k % 3 == 0 but
-        // not % 5 (1 each): 27 multiples of 3 below 80, 6 of 15; less
-        // column 0's 3.
-        assert_eq!(c0.irqs, Some(16 * 3 + (27 - 6) - 3));
-        assert_eq!(c0.locks, Some(6), "columns 7, 20, 33, 46, 59, 72");
+        // The 100th switch (99 from 0) goes to CPU0_THREADS[100 % 4].
+        assert_eq!(c0.thread, Some(CPU0_THREADS[0]));
+        assert_eq!(c0.switches, Some(98));
+        // irqs in columns 1 to 49: 3 in each of 5, 10, ..., 45 (9), 1 in
+        // each other multiple of 3 (16 multiples, 3 of them of 15: 13).
+        assert_eq!(c0.irqs, Some(9 * 3 + 13));
+        assert_eq!(c0.locks, Some(4), "columns 7, 20, 33, 46");
         assert_eq!((c0.missed, c0.odd), (Some(0), 0));
-        assert_eq!(v.since(0, Stream::Main), 160);
+        assert_eq!(v.since(0, Stream::Main), 100);
         // CPU 1: read for its first columns, then offline: its queue and
         // thread forgotten, its counts kept.
         assert_eq!(c1.presence, Presence::Offline);
@@ -197,12 +199,15 @@ mod tests {
         // CPU 2.
         assert_eq!(c2.presence, Presence::Online);
         assert_eq!(c2.runq, Some(2));
-        assert_eq!(c2.switches, Some(158));
-        assert_eq!(c2.thread, Some(CPU2_THREADS[160 % 3]));
-        assert_eq!(c2.irqs, Some(11 * 2), "columns 7, 14, ..., 77");
+        assert_eq!(c2.switches, Some(98));
+        assert_eq!(c2.thread, Some(CPU2_THREADS[100 % 3]));
+        assert_eq!(c2.irqs, Some(7 * 2), "columns 7, 14, ..., 49");
         assert_eq!(c2.locks, Some(2));
         assert_eq!(c2.missed, Some(5), "the backlog's 12 left out");
-        assert_eq!(v.since(2, Stream::Xray), 12 + 4 * COLUMNS as u64 + 24 + 2 + 5);
+        assert_eq!(c2.odd, 0);
+        // 12 gone, 4 runq a column, 2 irqs in each of 8 columns (0 to 49 by
+        // 7), 2 locks, 5 gone.
+        assert_eq!(v.since(2, Stream::Xray), 12 + 4 * 50 + 16 + 2 + 5);
     }
 
     #[test]

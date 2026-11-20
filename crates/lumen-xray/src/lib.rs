@@ -8,11 +8,14 @@
 //!   counts of switches, handled device interrupts and locks that waited,
 //!   plus the sequence numbers the kernel counted missed and the events of
 //!   X-ray's kinds that didn't decode.
-//! - **Which ring holds what** (section 14): a CPU's main ring
-//!   ([`Stream::Main`]) holds its `switch` events among others; its X-ray
-//!   ring ([`Stream::Xray`]) its `runq` (the queue's changes, in the ring of
-//!   the queue's CPU), `irq` and `lock` events. An event of another kind is
-//!   left alone.
+//! - **Which ring holds what** (section 14, `lumen_trace::kind::stream_of`):
+//!   a CPU's main ring ([`Stream::Main`]) holds its `switch` events among
+//!   others X-ray leaves alone; its X-ray ring ([`Stream::Xray`]) its `runq`
+//!   (the queue's changes, in the ring of the queue's CPU), `irq` and `lock`
+//!   events. A kind in the other ring than `stream_of` says, or one the
+//!   X-ray ring has no number for, is counted odd, as is an event of the
+//!   kinds X-ray reads (`switch`, `runq`, `irq`, `lock`) that doesn't
+//!   decode.
 //! - **Reading on** ([`View::read`]): each read's `next` is where the next
 //!   one starts ([`View::since`]); its `missed` is added up.
 //! - **A backlog isn't activity:** a ring's first read (from 0: what the
@@ -44,7 +47,7 @@ use lumen_trace::Event;
 use lumen_trace::kind::{self, Irq, LockWait, RunQueue, Stream, Switch};
 
 /// The columns kept for each CPU: the lanes' width.
-pub const COLUMNS: usize = 80;
+pub const COLUMNS: usize = 50;
 
 /// Whether a CPU was there for a column.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -107,8 +110,10 @@ pub struct Cpu {
     /// Sequence numbers its reads counted missed (gone from a ring before
     /// they were read), both rings together (`None` until a first read).
     pub missed: Option<u64>,
-    /// Events of X-ray's kinds that didn't decode (a field out of range),
-    /// or a `runq` event for another CPU's queue: counted, not shown.
+    /// Events of the kinds X-ray reads that didn't decode (a field out of
+    /// range), a `runq` event for another CPU's queue, a kind in the other
+    /// ring than `lumen_trace::kind::stream_of` says, or one the X-ray ring
+    /// has no number for (backlog or not: a fault, not activity).
     pub odd: u64,
     /// Each ring's reading (by [`Stream`]'s number).
     rings: [Ring; 2],
@@ -178,6 +183,10 @@ impl Cpu {
                 Some(_) => {}
                 None => self.odd += 1,
             },
+            // In the other ring than section 14 puts it (an unknown kind's
+            // ring is the main one).
+            (stream, kind) if kind::stream_of(kind) != stream => self.odd += 1,
+            // The main ring's other kinds: not X-ray's.
             _ => {}
         }
     }
@@ -479,13 +488,24 @@ mod tests {
     }
 
     #[test]
-    fn a_kind_in_the_other_ring_is_left_alone() {
+    fn a_kind_in_the_other_ring_is_odd() {
         // A switch in the X-ray ring, or a runq, irq or lock event in the
-        // main one, isn't where section 14 puts it: not counted.
+        // main one, isn't where section 14 puts it, and the X-ray ring has
+        // no other kinds: each counted odd, none counted as activity. The
+        // main ring's own other kinds (a log line, an unknown number) are
+        // left alone.
         let mut v = live(1);
-        v.read(0, Stream::Xray, 1, 0, &[switch(0, 7)]);
-        v.read(0, Stream::Main, 3, 0, &[runq(0, 0, 4), irq(1), lock(2)]);
+        v.read(0, Stream::Xray, 3, 0, &[switch(0, 7), ev(1, kind::LOG, [0; 4]), ev(2, 0x1234, [0; 4])]);
+        assert_eq!(v.cpus()[0].odd, 3);
+        v.read(
+            0,
+            Stream::Main,
+            5,
+            0,
+            &[runq(0, 0, 4), irq(1), lock(2), ev(3, kind::LOG, [0; 4]), ev(4, 0x1234, [0; 4])],
+        );
         let c = &v.cpus()[0];
+        assert_eq!(c.odd, 6);
         assert_eq!((c.runq, c.thread), (None, None));
         assert_eq!(counts(c), (Some(0), Some(0), Some(0), Some(0)));
     }

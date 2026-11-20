@@ -6,15 +6,18 @@
 //!   a row for each CPU of fixed-width labels: `cpu <n>` (`cpu <n> off`
 //!   only while its reads are refused), `cpu <n> runq` (its run queue's
 //!   length, from its newest `runq` event), `cpu <n> thread` (the thread
-//!   running, from its newest `switch`), `cpu <n> irqs` and `cpu <n> locks`
-//!   (the handled device interrupts and the locks that waited, read so far).
+//!   running, from its newest `switch`), `cpu <n> switches`, `cpu <n> irqs`
+//!   and `cpu <n> locks` (the switches, handled device interrupts and locks
+//!   that waited, read so far) and `cpu <n> missed` (sequence numbers gone
+//!   before they were read, after the first read).
 //!   A value not known yet (nothing read, or the queue and thread of a CPU
 //!   gone offline) is `-`.
 //! - **The lanes** (on the right, the app's own drawing): one per CPU, a
 //!   column per refresh, swept left to right over the oldest: the run
 //!   queue's longest length in the column as a bar (the palette's accent),
 //!   its interrupts as a mark at the top (the text colour), a lock that
-//!   waited as an orange mark, and a gap at the column written next.
+//!   waited as an orange mark, its switches as a grey mark, and a gap at
+//!   the column written next.
 //!   Each refresh repaints two columns' strips (its damage).
 //! - **Live** (`run xray`): every half second (`run_until`, animating),
 //!   each CPU's two rings are read on from where the last read stopped,
@@ -60,7 +63,7 @@ const READS_PER_RING: usize = 16;
 const MAX_SHOWN: usize = 8;
 
 /// The tree's part of the window, on the left.
-const TREE_W: u32 = 300;
+const TREE_W: u32 = 424;
 /// Where the lanes start, and each column's width.
 const LANES_X: i32 = TREE_W as i32 + 4;
 const COL_W: u32 = 4;
@@ -68,21 +71,25 @@ const LANES_W: u32 = COLUMNS as u32 * COL_W;
 const WIDTH: u32 = LANES_X as u32 + LANES_W + 8;
 /// The first lane's top, each lane's height and the space below it.
 const LANE_Y0: i32 = 10;
-const LANE_H: u32 = 52;
+const LANE_H: u32 = 56;
 const LANE_GAP: u32 = 6;
 /// A run-queue length's pixels in a bar, and the longest a bar shows.
-const RUNQ_UNIT: u32 = 4;
+const RUNQ_UNIT: u32 = 3;
 const RUNQ_CAP: u64 = 8;
 /// The interrupt mark's pixels an interrupt, and the most.
 const IRQ_CAP: u32 = 8;
+/// The switch mark's pixels a switch, and the most.
+const SWITCH_CAP: u32 = 6;
 /// A lock that waited: an orange mark (the palettes have no such colour).
 const LOCK_RGB: u32 = 0x00d8_3b01;
 /// The labels' widths in a CPU's row.
 const CPU_W: u32 = 64;
 const RUNQ_W: u32 = 40;
-const THREAD_W: u32 = 56;
-const IRQS_W: u32 = 56;
-const LOCKS_W: u32 = 48;
+const THREAD_W: u32 = 48;
+const SWITCHES_W: u32 = 72;
+const IRQS_W: u32 = 48;
+const LOCKS_W: u32 = 40;
+const MISSED_W: u32 = 56;
 
 /// Live, paused or the frozen view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,8 +114,10 @@ struct Row {
     cpu: Widget,
     runq: Widget,
     thread: Widget,
+    switches: Widget,
     irqs: Widget,
     locks: Widget,
+    missed: Widget,
 }
 
 /// The app: see the crate's doc.
@@ -131,6 +140,9 @@ struct Xray {
     drawn: Vec<Area>,
     /// Why a read failed (the loop ends then; the app exits with 1).
     failed: Option<Error>,
+    /// Whether an odd event (one that didn't decode, or in the wrong ring)
+    /// was logged: once, the first time any CPU's count rises past 0.
+    warned_odd: bool,
 }
 
 /// A lane's top.
@@ -161,8 +173,15 @@ impl Xray {
         let resume = ui.button(Some(controls), "Resume");
         let state = ui.fixed_label(None, "State", mode.name(), CPU_W);
         let heading = ui.hstack(None, "Heading");
-        for (name, w) in [("cpu", CPU_W), ("runq", RUNQ_W), ("thread", THREAD_W), ("irqs", IRQS_W), ("locks", LOCKS_W)]
-        {
+        for (name, w) in [
+            ("cpu", CPU_W),
+            ("runq", RUNQ_W),
+            ("thread", THREAD_W),
+            ("switches", SWITCHES_W),
+            ("irqs", IRQS_W),
+            ("locks", LOCKS_W),
+            ("missed", MISSED_W),
+        ] {
             ui.fixed_label(Some(heading), name, name, w);
         }
         let n = view.cpus().len();
@@ -173,8 +192,10 @@ impl Xray {
                     cpu: ui.fixed_label(Some(row), &format!("cpu {i}"), &format!("cpu {i}"), CPU_W),
                     runq: ui.fixed_label(Some(row), &format!("cpu {i} runq"), "-", RUNQ_W),
                     thread: ui.fixed_label(Some(row), &format!("cpu {i} thread"), "-", THREAD_W),
+                    switches: ui.fixed_label(Some(row), &format!("cpu {i} switches"), "-", SWITCHES_W),
                     irqs: ui.fixed_label(Some(row), &format!("cpu {i} irqs"), "-", IRQS_W),
                     locks: ui.fixed_label(Some(row), &format!("cpu {i} locks"), "-", LOCKS_W),
+                    missed: ui.fixed_label(Some(row), &format!("cpu {i} missed"), "-", MISSED_W),
                 }
             })
             .collect();
@@ -197,6 +218,7 @@ impl Xray {
             presence,
             drawn: Vec::new(),
             failed: None,
+            warned_odd: false,
         };
         x.show();
         x
@@ -212,8 +234,10 @@ impl Xray {
             self.ui.set_text(row.cpu, &label);
             self.ui.set_text(row.runq, &shown(c.runq));
             self.ui.set_text(row.thread, &shown(c.thread));
+            self.ui.set_text(row.switches, &shown(c.switches));
             self.ui.set_text(row.irqs, &shown(c.irqs));
             self.ui.set_text(row.locks, &shown(c.locks));
+            self.ui.set_text(row.missed, &shown(c.missed));
         }
         self.ui.set_text(self.state, self.mode.name());
     }
@@ -278,6 +302,10 @@ impl Xray {
         }
         if col.locks > 0 {
             fill(Area::new(x, top + 1 + IRQ_CAP as i32 + 1, COL_W - 1, 3), LOCK_RGB);
+        }
+        let switches = col.switches.min(SWITCH_CAP);
+        if switches > 0 {
+            fill(Area::new(x, top + IRQ_CAP as i32 + 6, COL_W - 1, switches), over.palette.disabled);
         }
     }
 }
@@ -348,6 +376,15 @@ impl Ticking for Xray {
                 *was = c.presence;
                 self.drawn.push(lane(i));
             }
+        }
+        if !self.warned_odd
+            && let Some((i, c)) = self.view.cpus().iter().enumerate().find(|(_, c)| c.odd > 0)
+        {
+            self.warned_odd = true;
+            log::warn(&format!(
+                "cpu {i}: {} trace events that didn't decode or were in the wrong ring (left out)",
+                c.odd
+            ));
         }
         self.show();
         Flow::Carry
