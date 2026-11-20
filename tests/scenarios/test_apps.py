@@ -708,17 +708,22 @@ def test_clock_tree_matches_rtc(boot):
     gui.close_window(m, "Clock")
     end_line(m, mark, "clock", app_id, "exited with 0")
     # Arguments it doesn't take: one ERROR naming what was wrong (waited
-    # for: `allow` only permits it), then exit 2.
+    # for: `allow` only permits it), then exit 2. The app logs on its own
+    # thread, so a line landing after `run`'s prompt counts against the
+    # next command: each case also allows the one before's.
     usage = "(usage: clock [--at H[H]:MM[:SS]])"
+    prev = None
     for args, why in [
         ("--at 25:00", f"'25:00' is not a time of day {usage}"),
         ("--at", f"--at needs a time {usage}"),
         ("foo", f"'foo' is not an argument it takes {usage}"),
     ]:
         said = re.escape(f"ERROR app: clock: {why}")
-        app_id, mark = start(m, f"clock {args}", allow=said)
+        allow = said if prev is None else f"(?:{said}|{prev})"
+        app_id, mark = start(m, f"clock {args}", allow=allow)
         wait_for_output(m, mark, rf"(?m){STAMP} {said}$", 30)
         end_line(m, mark, "clock", app_id, "exited with 2")
+        prev = said
 
 
 def test_app_ids_are_global(boot):
