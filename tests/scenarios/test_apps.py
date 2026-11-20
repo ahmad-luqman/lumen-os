@@ -1311,7 +1311,7 @@ def test_life_golden(boot, artifacts, golden_dir):
         artifacts=artifacts,
     )
     # Start goes on from where it stopped: the same pattern, its
-    # generation never back below 12.
+    # generation at least 12 when the tree first shows it running.
     rows = gui.press_animated(
         m, rows, "Start", "running", lambda r: life_state(r) == "running", wid
     )
