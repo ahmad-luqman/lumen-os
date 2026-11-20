@@ -1553,9 +1553,9 @@ def test_life_refuses_arguments_it_doesnt_take(boot):
 
 
 def test_life_without_a_window_ends_with_its_own_error(boot):
-    # An app the launcher starts is answered before its window is opened
-    # (section 8's launcher): one that then can't open it ends by its own
-    # ERROR and end line, not the item's failure. Here, with no desktop,
+    # An app the launcher starts is answered once started, without waiting
+    # for its window (section 8's launcher): one that then can't open it
+    # ends by its own ERROR and end line, not the item's failure. Here, with no desktop,
     # `run life` starts it, then its window is refused: one ERROR naming
     # the step and the error, then exit 1.
     m = boot_shell(boot)
