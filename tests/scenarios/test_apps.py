@@ -15,6 +15,7 @@ accept "killed" or any place (`kill`) and confirm the end by the app's end
 line and its thread's join.
 """
 
+import hashlib
 import re
 import time
 
@@ -1185,6 +1186,20 @@ def choose(m, rows: list[dict[str, str]], name: str, animating: bool = False) ->
     assert got.still_running or (got.row is not None and got.row["id"] == item["id"]), got
 
 
+# Where apps/life's grid starts in its client area (`GRID.x()`: the tree's
+# 200 pixels, its line, a pixel's gap): right of it nothing but the cells
+# changes.
+LIFE_GRID_X = 202
+
+
+def life_grid(m, name: str) -> str:
+    """The Life window's grid (its client area from `LIFE_GRID_X` on) in a
+    screendump `name`, the tree's labels left out: its pixels' digest (a
+    failure then names a digest, not every pixel)."""
+    img = gui.client_pixels(m, "Life", name)
+    return hashlib.sha256(img.crop((LIFE_GRID_X, 0, img.width, img.height)).tobytes()).hexdigest()
+
+
 def life_client(m, name: str) -> bytes:
     """The Life window's client area in a settled screendump `name`."""
     return gui.settled_capture(m, lambda: gui.client_pixels(m, "Life", name)).tobytes()
@@ -1324,8 +1339,8 @@ def test_life_golden(boot, artifacts, golden_dir):
 def test_life_runs_unfocused_and_stops_when_closed(boot):
     # The launcher's Life item starts the Life app (#202; it replaced the
     # kernel's window), running the gun: its generation (the tree's value)
-    # grows while another window has the focus (its client area changing on
-    # the screen too), and its waits are an animation's (the desktop never
+    # grows while another window has the focus (its grid changing on the
+    # screen too), and its waits are an animation's (the desktop never
     # reads settled). Minimized, it presents nothing (its commits queue no
     # damage) yet still steps. Its close ends it with 0, its thread joined,
     # and the desktop settles again.
@@ -1350,13 +1365,15 @@ def test_life_runs_unfocused_and_stops_when_closed(boot):
     seen = generation(gui.ui_tree(m, wid))
     gui.wait_ui(m, "generations while unfocused", lambda r: generation(r) > seen + 2, wid, 30)
     assert gui.window(m, "Life")["focused"] == "no"
-    # ... and its client area changes on the screen meanwhile.
-    first = gui.client_pixels(m, "Life", "life-1.png").tobytes()
+    # ... and its grid changes on the screen meanwhile (the grid alone:
+    # the Generation label changes every tick too).
+    first = life_grid(m, "life-1.png")
     gui.wait_for(
         m,
-        "Life's next generations on the screen",
-        lambda: gui.client_pixels(m, "Life", "life-2.png").tobytes(),
+        "Life's grid changing on the screen",
+        lambda: life_grid(m, "life-2.png"),
         lambda c: c != first,
+        30,
     )
     assert gui.window(m, "Life")["focused"] == "no"
     for _ in range(5):
