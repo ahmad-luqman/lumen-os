@@ -24,7 +24,7 @@ use core::fmt;
 pub const STEPS: u32 = 720;
 
 /// What [`sin`] and [`cos`] give for 1: values are scaled by `2^14`.
-pub const SCALE: i32 = 1 << 14;
+pub(crate) const SCALE: i32 = 1 << 14;
 
 /// `sin` of 0° to 90° in half-degree steps, scaled by [`SCALE`] and
 /// rounded (a host test checks every entry against `f64::sin`).
@@ -49,7 +49,7 @@ const QUARTER: [i16; 181] = [
 
 /// `sin` of `step` (any number: taken modulo [`STEPS`]), scaled by
 /// [`SCALE`].
-pub fn sin(step: u32) -> i32 {
+pub(crate) fn sin(step: u32) -> i32 {
     let s = step % STEPS;
     let q = (s % 360) as usize;
     let v = if q <= 180 { QUARTER[q] } else { QUARTER[360 - q] };
@@ -57,23 +57,27 @@ pub fn sin(step: u32) -> i32 {
 }
 
 /// `cos` of `step`, scaled by [`SCALE`].
-pub fn cos(step: u32) -> i32 {
+pub(crate) fn cos(step: u32) -> i32 {
     sin(step % STEPS + 180)
 }
 
-/// `n / SCALE` rounded to the nearest (halves up).
-fn unscale(n: i32) -> i32 {
-    (n + SCALE / 2).div_euclid(SCALE)
+/// `radius × v / SCALE` rounded to the nearest (halves up), in `i64` so no
+/// radius overflows.
+fn scaled(radius: i32, v: i32) -> i32 {
+    let n = i64::from(radius) * i64::from(v);
+    (n + i64::from(SCALE / 2)).div_euclid(i64::from(SCALE)) as i32
 }
 
 /// The point `radius` pixels from (`cx`, `cy`) at angle `step` (clockwise
 /// from 12 o'clock; y grows downwards, as on the screen).
 pub fn point(cx: i32, cy: i32, radius: i32, step: u32) -> (i32, i32) {
-    (cx + unscale(radius * sin(step)), cy - unscale(radius * cos(step)))
+    (cx + scaled(radius, sin(step)), cy - scaled(radius, cos(step)))
 }
 
 /// The pixels of the straight line from `from` to `to`, both included, each
-/// next to the one before (8-connected): Bresenham's.
+/// next to the one before (8-connected): Bresenham's. Coordinates within
+/// ±2^29 (so the differences and the error term fit an `i32`; a face's are
+/// a few hundred).
 pub fn line(from: (i32, i32), to: (i32, i32)) -> Line {
     let (dx, dy) = ((to.0 - from.0).abs(), -(to.1 - from.1).abs());
     Line {
@@ -168,18 +172,6 @@ impl TimeOfDay {
         TimeOfDay::new(h, m, s)
     }
 
-    pub fn hour(&self) -> u8 {
-        self.h
-    }
-
-    pub fn minute(&self) -> u8 {
-        self.m
-    }
-
-    pub fn second(&self) -> u8 {
-        self.s
-    }
-
     /// Where each hand points, in steps: the hour hand moving with the
     /// minutes (half a degree a minute), the minute hand with the seconds
     /// (a step every five), the second hand a second at a time.
@@ -249,7 +241,10 @@ mod tests {
         assert_eq!(point(cx, cy, r, 180), (140, 50)); // 3
         assert_eq!(point(cx, cy, r, 360), (100, 90)); // 6
         assert_eq!(point(cx, cy, r, 540), (60, 50)); // 9
-        // 45°: r / √2 = 28.28 each way, rounded.
+        // An exact half rounds up: sin 30° × 1 = 0.5.
+        assert_eq!(point(0, 0, 1, 60), (1, -1));
+        // 45° (step 90) and 315° (step 630): r / √2 = 28.28 each way,
+        // rounded.
         assert_eq!(point(cx, cy, r, 90), (128, 22));
         assert_eq!(point(cx, cy, r, 630), (72, 22));
         for step in 0..STEPS {
@@ -274,6 +269,44 @@ mod tests {
             }
             // Backwards, as many pixels.
             assert_eq!(line(to, from).count(), len);
+        }
+    }
+
+    #[test]
+    fn a_line_breaks_its_ties_the_same_way() {
+        // Bresenham's two tie-breaks (an error of exactly zero on either
+        // axis), pinned pixel by pixel.
+        let pts = |a, b| line(a, b).collect::<Vec<_>>();
+        assert_eq!(pts((0, 0), (-3, -4)), [(0, 0), (-1, -1), (-2, -2), (-2, -3), (-3, -4)]);
+        assert_eq!(pts((0, 0), (-4, -2)), [(0, 0), (-1, -1), (-2, -1), (-3, -2), (-4, -2)]);
+        assert_eq!(pts((0, 0), (2, 1)), [(0, 0), (1, 1), (2, 1)]);
+    }
+
+    #[test]
+    fn a_line_stays_within_half_a_pixel_of_the_true_one() {
+        // Every pixel within 0.5 of the ideal line along the minor axis
+        // (either tie-break passes), over lines in every direction.
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % 241) as i32 - 120
+        };
+        for _ in 0..2000 {
+            let (from, to) = ((next(), next()), (next(), next()));
+            let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+            for (px, py) in line(from, to) {
+                // The distance along the minor axis, times the major span
+                // (integers: |off| ≤ span / 2).
+                let off = if dx.abs() >= dy.abs() {
+                    (py - from.1) * dx - (px - from.0) * dy
+                } else {
+                    (px - from.0) * dy - (py - from.1) * dx
+                };
+                let span = dx.abs().max(dy.abs());
+                assert!(2 * off.abs() <= span, "({px}, {py}) on {from:?} -> {to:?}");
+            }
         }
     }
 
@@ -329,6 +362,8 @@ mod tests {
             "1a:05",
             "10:0x",
             "１0:09",
+            "010:09",
+            "007:05",
         ] {
             assert_eq!(TimeOfDay::parse(bad), None, "{bad:?}");
         }
