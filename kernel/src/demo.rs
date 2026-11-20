@@ -368,10 +368,6 @@ pub fn life(ctx: &mut Ctx<'_>, args: &[String]) {
 
 /// The Mandelbrot window's client size.
 const MANDEL_WINDOW: (u32, u32) = (480, 320);
-/// The Life window's client size (cells of [`CELL`] pixels).
-const LIFE_WINDOW: (u32, u32) = (400, 280);
-/// Life's generations a second in its window.
-const LIFE_WINDOW_HZ: u64 = 10;
 
 /// What a drawing in a window did: rows by CPU, and the CPUs whose thread
 /// couldn't be started (their bands drawn by the caller).
@@ -524,63 +520,6 @@ fn mandelbrot_owner(mut h: crate::desktop::WindowHandle) {
             | WindowEvent::FocusGained
             | WindowEvent::FocusLost
             | WindowEvent::Lost => {}
-        }
-    }
-}
-
-/// The launcher's `Life`: a window stepping the `gun` pattern ten times a
-/// second, focused or not, until it closes; its id.
-pub fn open_life_window() -> Result<u32, String> {
-    open_owned("Life", LIFE_WINDOW, "desktop-life", life_owner)
-}
-
-/// The Life window's owner: a generation every 100 ms (an animating wait:
-/// the desktop never settles while it runs), committing only the cells
-/// that changed, until its close.
-fn life_owner(mut h: crate::desktop::WindowHandle) {
-    use crate::desktop::{Animating, Wait, WindowEvent};
-    use lumen_gfx::Rect;
-    let s = h.surface_mut();
-    let mut grid = Life::new(s.width() as usize / CELL, s.height() as usize / CELL);
-    let pattern = life::pattern(DEFAULT_PATTERN).expect("the default pattern exists");
-    let (x0, y0) = pattern.origin(grid.width(), grid.height());
-    grid.place(pattern, x0, y0);
-    let cell_rect =
-        |x: usize, y: usize| Rect::new((x * CELL) as i32, (y * CELL) as i32, CELL as u32 - 1, CELL as u32 - 1);
-    {
-        let s = h.surface_mut();
-        s.fill(DEAD);
-        for y in 0..grid.height() {
-            for x in 0..grid.width() {
-                if grid.get(x, y) {
-                    s.fill_rect(cell_rect(x, y), ALIVE);
-                }
-            }
-        }
-        let b = s.bounds();
-        h.commit(&[b]);
-    }
-    let period = 1_000_000_000 / LIFE_WINDOW_HZ;
-    let mut next = crate::time::now_ns().saturating_add(period);
-    loop {
-        match h.wait_event_until(Some(next), Animating::Yes) {
-            Wait::Event(WindowEvent::Close) => return,
-            Wait::Event(WindowEvent::Request(r)) => crate::ui::refuse(r),
-            Wait::Event(_) | Wait::Woken => {}
-            Wait::Deadline => {
-                // The changed cells' bounding box is committed.
-                let mut changed: Option<Rect> = None;
-                let s = h.surface_mut();
-                grid.step(|x, y, alive| {
-                    let r = cell_rect(x, y);
-                    s.fill_rect(r, if alive { ALIVE } else { DEAD });
-                    changed = Some(changed.map_or(r, |c| c.union(&r)));
-                });
-                if let Some(c) = changed {
-                    h.commit(&[c]);
-                }
-                next = next.saturating_add(period).max(crate::time::now_ns());
-            }
         }
     }
 }
