@@ -15,9 +15,12 @@
 //! second and redraws the clock when the minute changes (the toolkit's
 //! per-widget damage: only the label's bounds are committed). The desktop
 //! pokes it (its `Waker`) when a window opens or closes, and it brings its
-//! buttons in line with the window list. Launching from a menu item brings
-//! them in line at once, before the request that chose it is answered, so
-//! `ui tree` after `ui invoke` already shows the new window's button.
+//! buttons in line with the window list. Launching a kernel window from a
+//! menu item (Terminal, Mandelbrot, Counter) brings them in line at once,
+//! before the request that chose it is answered, so `ui tree` after `ui
+//! invoke` already shows the new window's button. An item starting an app
+//! (Life, the bundled apps) answers once the app is started (`app <id>`),
+//! its window and button still to come, opened by the app's own thread.
 
 use alloc::format;
 use alloc::string::String;
@@ -220,7 +223,8 @@ impl App for Taskbar {
                 UiEvent::Chosen(w, item) if w == self.launcher => {
                     let name = self.items.get(item).copied().unwrap_or("?");
                     let opened = self.launch(item);
-                    // Its button now, before the request is answered.
+                    // A kernel window's button now, before the request is
+                    // answered (an app's window comes later, from its thread).
                     self.sync();
                     match opened {
                         Ok(what) => log::info!(target: "taskbar", "{name}: {what}"),

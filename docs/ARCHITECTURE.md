@@ -3881,7 +3881,11 @@ SSE); #197 checks the results' bits.
   shipping). Its Life item starts the Life app (#202: `taskbar.rs`'s
   `LIFE_APP`), which is therefore left out of the apps after the demo
   items, so it is listed once
-  (`taskbar::the_launcher_lists_the_life_app_once`).
+  (`taskbar::the_launcher_lists_the_life_app_once`). An item starting an
+  app is answered once the app is started, before its window opens: an
+  app that then can't open its window ends with its own ERROR and end
+  line (as every bundled app does, #206), not with the item's
+  `Then::Failed`, which only a refused start gives.
 - **Loading from disk (M6)** will need more: import names in errors are
   sanitised already, but wasmi reserves vectors up front for the counts a
   module declares (`reserve_exact`), which `CODE_FACTOR` doesn't bound
@@ -5083,10 +5087,14 @@ close, and the demos in windows of their own. All of it is built with
   windows change (one opened or closed), and it brings its buttons in
   line (and reads the clock): a button for a window gone is removed from
   its tree (its node id names nothing after), one for a new window added.
-  A launcher item brings them in line itself, before its request is
-  answered, so `ui tree` after `ui invoke` shows the new window's button
+  A launcher item opening a kernel window (Terminal, Mandelbrot, Counter)
+  brings them in line itself, before its request is answered, so `ui
+  tree` after `ui invoke` shows the new window's button
   (`lumen.taskbar_wake_delay_ms=<ms>` holds back its handling of a poke,
-  so a test can tell the two apart).
+  so a test can tell the two apart). An item starting an app (Life since
+  #202, the bundled apps since #206) answers once the app is started
+  (`app <id>`); its window and button come later, when the app's thread
+  opens it.
 - **The clock** polls the RTC without animating (the desktop settles
   between polls; `rtc::now_quiet`) and redraws the label when the
   minute changes, damaging only its bounds (the toolkit's per-widget
