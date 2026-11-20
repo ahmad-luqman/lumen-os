@@ -375,18 +375,22 @@ def test_xray_without_trace_is_not_granted(boot):
     assert not [w for w in gui.windows(m, refused) if w["title"] == "X-ray"]
 
 
-def test_xray_counts_no_more_than_its_ring_holds(boot):
-    # One CPU. After a few counted refreshes X-ray is paused (its labels
-    # then stay put); the interrupts it counted on CPU 0 are at most the
-    # `irq` events CPU 0's X-ray ring holds, read from 0, plus the numbers
-    # gone from it: an upper bound from the same ring, never a time. A
-    # reader that counted a ring's events more than once breaks it.
-    m = desktop(boot)
-    app_id, mark, wid, record = start_xray(m)
-    rows = gui.wait_ui(
-        m, "cpu 0's switches known", lambda r: label(r, "cpu 0 switches") != "-", wid, 60
-    )
-    for _ in range(3):
+def irq_events_since(m, since: int) -> int:
+    """The `irq` events CPU 0's X-ray ring holds from sequence number
+    `since` on, read to its head with nothing gone from it (a lapped ring
+    would leave the count short)."""
+    # Up to a whole ring, 4096 lines: more time than a short command.
+    out = run(m, f"trace xray 0 {since}", 120)
+    summary = XRAY_SUMMARY.search(out)
+    assert summary, out
+    assert summary[3] == "0", summary[0]  # none gone: the count is whole
+    assert summary["stopped"] is None, summary[0]  # read to the head
+    return len(re.findall(r"^#\d+ +tsc=\d+ +irq ", out[: summary.start()], re.MULTILINE))
+
+
+def counted_refreshes(m, wid: str, rows: list[dict[str, str]], n: int) -> list[dict[str, str]]:
+    """Until `n` more refreshes have counted CPU 0's switches; the rows then."""
+    for _ in range(n):
         seen = int(label(rows, "cpu 0 switches"))
         rows = gui.wait_ui(
             m,
@@ -395,19 +399,31 @@ def test_xray_counts_no_more_than_its_ring_holds(boot):
             wid,
             60,
         )
+    return rows
+
+
+def test_xray_counts_no_more_than_its_ring_holds(boot):
+    # One CPU. CPU 0's X-ray ring's next number is taken before X-ray
+    # starts; after a few counted refreshes X-ray is paused (its labels
+    # then stay put), and the interrupts it counted on CPU 0 are at most the
+    # `irq` events that ring holds from that number on, none gone: an upper
+    # bound from the same ring, with no boot backlog in it, never a time. A
+    # reader that counted a ring's events twice breaks it.
+    m = desktop(boot)
+    _, before = xray(m)
+    start_at = int(before[4])
+    app_id, mark, wid, record = start_xray(m)
+    rows = gui.wait_ui(
+        m, "cpu 0's switches known", lambda r: label(r, "cpu 0 switches") != "-", wid, 60
+    )
+    rows = counted_refreshes(m, wid, rows, 3)
     rows = gui.press_animated(
         m, below_root(rows), "Pause", "paused", lambda r: label(r, "State") == "paused", wid
     )
     gui.wait_settled(m)
     counted = int(label(below_root(gui.ui_tree(m, wid)), "cpu 0 irqs"))
-    # The whole ring, up to 4096 lines: more time than a short command.
-    out = run(m, "trace xray 0 0", 120)
-    summary = XRAY_SUMMARY.search(out)
-    assert summary, out
-    events = out[: summary.start()]
-    held = len(re.findall(r"^#\d+ +tsc=\d+ +irq ", events, re.MULTILINE))
-    gone = int(summary[3])
-    assert counted <= held + gone, (counted, held, gone)
+    held = irq_events_since(m, start_at)
+    assert counted <= held, (counted, held)
     assert label(below_root(gui.ui_tree(m, wid)), "cpu 0 irqs") == str(counted)
     gui.close_window(m, "X-ray")
     end_line(m, mark, "xray", app_id, "exited with 0")
