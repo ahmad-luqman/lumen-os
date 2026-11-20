@@ -213,6 +213,20 @@ mod tests {
         // Not ticked yet: not due again, waiting a period from then.
         assert_eq!(p.poll(Some(P), P), Pace::Until(2 * P));
         assert_eq!(p.poll(Some(P), P + 1), Pace::Until(2 * P));
+        // Only the tick found due is ticked: a second call, however late,
+        // moves nothing.
+        p.ticked(P + 1);
+        p.ticked(5 * P);
+        assert_eq!(p.poll(Some(P), 5 * P), Pace::Due);
+    }
+
+    #[test]
+    fn a_stray_ticked_moves_nothing() {
+        // Ticked with no tick found due: the schedule stands.
+        let mut p = Pacer::new();
+        p.poll(Some(P), 0);
+        p.ticked(10 * P);
+        assert_eq!(p.poll(Some(P), P), Pace::Due);
     }
 
     #[test]
