@@ -717,6 +717,23 @@ mod tests {
         let low = map.map_anon(MapPlace::Hint(Some(P)), P, Prot::NONE).unwrap();
         assert_eq!((low.start, low.end), (MMAP_TOP - 6 * P, MMAP_TOP - 5 * P));
 
+        // Misaligned hint: aligned up when free, or falls back to top-down when
+        // the rounded-up page overlaps or overflows.
+        let mis_free = map.map_anon(MapPlace::Hint(Some(hint + 3 * P + 0x123)), P, RX).unwrap();
+        assert_eq!((mis_free.start, mis_free.end), (hint + 4 * P, hint + 5 * P));
+        let mis_overlap = map.map_anon(MapPlace::Hint(Some(hint + 0x123)), P, Prot::READ).unwrap();
+        assert_eq!((mis_overlap.start, mis_overlap.end), (MMAP_TOP - 7 * P, MMAP_TOP - 6 * P));
+        let mis_ovf = map.map_anon(MapPlace::Hint(Some(u64::MAX - 5)), P, Prot::WRITE).unwrap();
+        assert_eq!((mis_ovf.start, mis_ovf.end), (MMAP_TOP - 8 * P, MMAP_TOP - 7 * P));
+
+        // Out-of-bounds hints at or above USER_MAX fall back to top-down search.
+        let at_max = map.map_anon(MapPlace::Hint(Some(USER_MAX)), P, RX).unwrap();
+        assert_eq!((at_max.start, at_max.end), (MMAP_TOP - 9 * P, MMAP_TOP - 8 * P));
+        let above_max = map.map_anon(MapPlace::Hint(Some(USER_MAX + P)), P, RW).unwrap();
+        assert_eq!((above_max.start, above_max.end), (MMAP_TOP - 10 * P, MMAP_TOP - 9 * P));
+        let kernel_hint = map.map_anon(MapPlace::Hint(Some(0xffff_8000_0000_0000)), P, Prot::NONE).unwrap();
+        assert_eq!((kernel_hint.start, kernel_hint.end), (MMAP_TOP - 11 * P, MMAP_TOP - 10 * P));
+
         // A fixed mapping straddling MMAP_TOP does not fool top-down search.
         let mut m2 = VmaMap::new();
         m2.map_fixed_noreplace(MMAP_TOP - 2 * P, 4 * P, RW).unwrap();

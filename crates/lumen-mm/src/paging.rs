@@ -685,17 +685,18 @@ pub fn map(
     }
 }
 
-/// Ensure L4 entry `slot` points to a present supervisor-only L3 table,
-/// allocating a zeroed table frame if empty.
+/// Ensure kernel upper-half L4 entry `slot` (`256..512`) points to a present
+/// supervisor-only L3 table, allocating a zeroed table frame if empty.
 ///
 /// Used during `mm::init` to pre-allocate L3 tables for the 6 dynamic kernel
 /// L4 slots (`384, 385, 416, 417, 448, 449`) so copying `L4[256..512]` into a
 /// new process's `AddressSpace` shares all future kernel growth automatically.
-/// Never sets `USER`.
+/// Panics if `slot` is outside `256..512` or if an existing entry has `USER`.
 pub fn ensure_l3_table(mem: &mut impl TableMemoryMut, root: PhysFrame, slot: usize) -> Result<PhysFrame, MapError> {
-    assert!(slot < ENTRIES, "L4 slot {slot} out of range");
+    assert!((ENTRIES / 2..ENTRIES).contains(&slot), "kernel L4 slot {slot} must be in upper half (256..512)");
     let entry = Entry(mem.read(root, slot).ok_or(MapError::Unreadable(root))?);
     if entry.is_present() {
+        assert!(!entry.has(USER), "kernel L4 slot {slot} must not have USER set");
         return Ok(entry.table());
     }
     let new = mem.alloc_table().ok_or(MapError::OutOfMemory)?;
@@ -1566,5 +1567,97 @@ mod tests {
         assert!(!removed.present && removed.phys == frame2);
         assert_eq!(walk(&m, root, va2).end(), WalkEnd::NotPresent(Level::L1));
         assert_eq!(unmap(&mut m, root, va2), Err(UnmapError::NotMapped));
+    }
+
+    #[test]
+    fn for_each_leaf_in_visits_mixed_present_and_prot_none_leaves() {
+        let (mut m, root) = FakeMem::new();
+        let va_rw = v(0x0000_0000_0060_0000);
+        let va_pn = v(0x0000_0000_0060_1000);
+        let va_rx = v(0x0000_0000_0060_2000);
+        map(&mut m, root, va_rw, f(0x60_0000), PageSize::Size4K, Attrs::USER_RW).unwrap();
+        map(&mut m, root, va_pn, f(0x61_0000), PageSize::Size4K, Attrs::USER_NONE).unwrap();
+        map(&mut m, root, va_rx, f(0x62_0000), PageSize::Size4K, Attrs::USER_RX).unwrap();
+        // Kernel upper-half mapping must not appear in a 0..256 user sweep.
+        map(&mut m, root, v(KERNEL), f(0x90_0000), PageSize::Size4K, Attrs::CODE).unwrap();
+
+        let mut seen = Vec::new();
+        for_each_leaf_in(&m, root, 0..256, |mp| {
+            seen.push((mp.virt, mp.phys, mp.present, mp.writable, mp.executable, mp.user));
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            [
+                (va_rw, f(0x60_0000), true, true, false, true),
+                (va_pn, f(0x61_0000), false, false, false, true),
+                (va_rx, f(0x62_0000), true, false, true, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn lower_half_user_sibling_promotes_intermediate_tables_without_exposing_supervisor_leaf() {
+        let (mut m, root) = FakeMem::new();
+        let sup_va = v(0x0000_0000_0020_0000);
+        let usr_va = v(0x0000_0000_0020_1000);
+
+        // First map a supervisor-only page in the lower half: intermediate tables lack USER.
+        map(&mut m, root, sup_va, f(0x10_0000), PageSize::Size4K, Attrs::DATA).unwrap();
+        for s in walk(&m, root, sup_va).steps() {
+            assert!(!s.entry.has(USER), "level {:?} should not have USER yet", s.level);
+        }
+
+        // Now map a user sibling sharing the same L4/L3/L2/L1 tables: intermediate
+        // entries are promoted to USER, the user leaf is accessible from ring 3,
+        // and the supervisor leaf stays supervisor-only.
+        map(&mut m, root, usr_va, f(0x11_0000), PageSize::Size4K, Attrs::USER_RO).unwrap();
+        let uw = walk(&m, root, usr_va);
+        assert!(uw.mapping().unwrap().user);
+        for s in uw.steps() {
+            assert!(s.entry.has(USER), "level {:?} must have USER after promotion", s.level);
+        }
+        let sw = walk(&m, root, sup_va);
+        assert!(!sw.mapping().unwrap().user, "supervisor leaf must remain non-USER");
+        assert!(!sw.steps()[3].entry.has(USER));
+    }
+
+    #[test]
+    fn protect_reports_not_mapped_not_page_start_and_unreadable() {
+        let (mut m, root) = FakeMem::new();
+        let va = v(0x0000_0000_0040_0000);
+        // Unmapped address.
+        assert_eq!(protect(&mut m, root, va, Attrs::USER_RO), Err(ProtectError::NotMapped));
+
+        // Unaligned offset inside a 4 KiB page.
+        map(&mut m, root, va, f(0x40_0000), PageSize::Size4K, Attrs::USER_RW).unwrap();
+        assert_eq!(
+            protect(&mut m, root, va.checked_add(0x10).unwrap(), Attrs::USER_RO),
+            Err(ProtectError::NotPageStart)
+        );
+        // Offset inside a 2 MiB huge page (not its start).
+        map(&mut m, root, v(HHDM), f(0), PageSize::Size2M, Attrs::DATA).unwrap();
+        assert_eq!(protect(&mut m, root, v(HHDM + K), Attrs::RODATA), Err(ProtectError::NotPageStart));
+
+        // Unreadable table on the walk.
+        let l1 = m.table_at(root, va, Level::L1);
+        m.unreadable.insert(l1.as_u64());
+        assert_eq!(protect(&mut m, root, va, Attrs::USER_RO), Err(ProtectError::Unreadable(l1)));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be in upper half")]
+    fn ensure_l3_table_rejects_lower_half_slot() {
+        let (mut m, root) = FakeMem::new();
+        let _ = ensure_l3_table(&mut m, root, 255);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not have USER set")]
+    fn ensure_l3_table_rejects_existing_user_entry() {
+        let (mut m, root) = FakeMem::new();
+        let l3 = m.alloc_table().unwrap();
+        m.set(root, 384, PRESENT | WRITABLE | USER | l3.as_u64());
+        let _ = ensure_l3_table(&mut m, root, 384);
     }
 }
