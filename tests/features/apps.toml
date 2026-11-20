@@ -160,3 +160,12 @@ tests = [
     "scenario:test_apps::test_sdk_a_tick_can_quit",
     "scenario:test_apps::test_sdk_wraps_its_other_calls",
 ]
+
+[[feature]]
+name = "Clock (#200): a bundled app showing an analog face (an integer sine table, no floats) and the time as a label, read from the RTC and agreeing with `date`, its seconds going on while the desktop settles between its ticks; frozen with `--at` (refusing a time it doesn't take), its window matching a golden"
+milestone = "M5"
+tests = [
+    "cargo:lumen-clock",
+    "scenario:test_apps::test_clock_golden",
+    "scenario:test_apps::test_clock_tree_matches_rtc",
+]

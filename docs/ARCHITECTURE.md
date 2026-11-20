@@ -3852,6 +3852,20 @@ SSE); #197 checks the results' bits.
       first held answer.
   - **`test-window tick [greedy|quit|slow]`** exercises it (`slow`: each
     tick's work longer than its period, the next still a period after it).
+- **What #200 adds:** `apps/clock` (bundled, `caps=time,desktop`; the
+  launcher lists it), on `run_until`: an analog face drawn in `paint_over`
+  (sixty dots and three hands in the theme's colours; when the time
+  changes, only the boxes of the hands that moved are its `take_drawn`
+  damage) over a tree holding one `fixed_label`, `Time`, whose value is
+  the time (`HH:MM:SS`, from `time_wall`, taken as UTC, as `date` shows
+  it). It reads the RTC every 250 ms; its waits aren't `animating` (a tick
+  finding the same second draws nothing), so the desktop settles between
+  ticks. `run clock --at HH:MM[:SS]` freezes it: no period at all, so the
+  window settles for good (its golden); a time `--at` doesn't take is
+  logged as an ERROR and ends it with 2. Its logic (the time of day,
+  `--at`'s grammar, an integer sine table in half-degree steps, each
+  hand's angle, points and lines on the face) is `crates/lumen-clock`, a
+  path dependency, host-tested: no floats, as no app has `libm`.
 - **The launcher** (#157's taskbar) lists the bundled apps whose
   manifest lists `desktop`, never the test apps, after its four demo
   items, by name, and starts one through `run`'s path without waiting
