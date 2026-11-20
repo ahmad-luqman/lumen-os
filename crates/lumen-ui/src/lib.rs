@@ -20,7 +20,11 @@
 //!   nothing.
 //! - **An app** ([`App`]): a window's tree and what it does with what the
 //!   tree reports; [`serve`] runs a request on it (the same handler a click
-//!   reaches) and says what to answer once the tree is published.
+//!   reaches) and says what to answer once the tree is published;
+//!   [`repaint`] paints what changed, the app's own drawing over it
+//!   ([`App::paint_over`], [`App::take_drawn`]).
+//! - **Ticks** ([`Pacer`]): when an animated window's next tick is due,
+//!   from the period its app asks for before each wait.
 //! - **Counter** ([`counter`]): the demo app, its logic here so tests
 //!   drive the app the scenarios use.
 //! - **A request's reply** ([`Reply`]): the state machine of `ui invoke`'s
@@ -33,6 +37,7 @@ extern crate alloc;
 pub mod app;
 pub mod counter;
 pub mod node;
+pub mod pace;
 pub mod reply;
 pub mod text;
 pub mod ui;
@@ -42,8 +47,9 @@ mod shell_tests;
 #[cfg(test)]
 mod tests;
 
-pub use app::{App, Repainted, Served, Then, repaint, serve};
+pub use app::{App, Over, Repainted, Served, Then, repaint, serve};
 pub use node::{Action, ActionKind, AutomationNode, InvokeError, NodeId, Role, StateFlags, Value, ValueKind};
+pub use pace::Pacer;
 pub use reply::{First, NotStarted, Phase, Reply, Second};
 pub use text::{FixedText, Text};
 pub use ui::{Input, Key, Palette, Repaint, Stack, Ui, UiEvent, Widget};

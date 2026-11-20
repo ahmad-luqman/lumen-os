@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use lumen_gfx::{Rect, Surface};
 
-use crate::app::{App, Repainted, Served, Then, repaint, serve};
+use crate::app::{App, Over, Repainted, Served, Then, repaint, serve};
 use crate::counter::Counter;
 use crate::node::{Action, ActionKind, InvokeError, Role, StateFlags, Value};
 use crate::reply::{First, NotStarted, Reply};
@@ -506,7 +506,7 @@ fn repaint_paints_what_changed_and_says_whether_to_publish() {
         fn apply(&mut self, events: &[UiEvent]) -> Then {
             self.0.apply(events)
         }
-        fn paint_over(&mut self, _: &mut Surface) {
+        fn paint_over(&mut self, _: &mut Over<'_>) {
             self.1 += 1;
         }
     }
@@ -539,4 +539,138 @@ fn a_full_repaint_covers_the_surface_even_laid_out_in_less() {
     assert_eq!(first.rects, alloc::vec![s.bounds()]);
     let corner = (s.width() - 1, s.height() - 1);
     assert_eq!(s.pixel(corner.0 as i32, corner.1 as i32), Some(PALETTE.background), "painted past the area");
+}
+
+/// An app drawing a square of its own beside the Counter's tree: the tree
+/// laid out in [`AREA`], the surface [`BOARD_W`] wider (the app's area).
+/// Its frame paints the square in the palette's accent where the rectangles
+/// being repainted reach, recording each call's rectangles; `drawn` is what
+/// it reports changed next.
+struct Board {
+    counter: Counter,
+    square: Rect,
+    drawn: Vec<Rect>,
+    calls: Vec<Vec<Rect>>,
+}
+
+const BOARD_W: u32 = 200;
+
+impl Board {
+    fn new() -> Board {
+        Board { counter: Counter::new(), square: Rect::new(450, 50, 20, 20), drawn: Vec::new(), calls: Vec::new() }
+    }
+
+    fn surface() -> Surface {
+        Surface::new(AREA.w() + BOARD_W, AREA.h())
+    }
+}
+
+impl App for Board {
+    fn ui_mut(&mut self) -> &mut Ui {
+        self.counter.ui_mut()
+    }
+    fn apply(&mut self, events: &[UiEvent]) -> Then {
+        self.counter.apply(events)
+    }
+    fn paint_over(&mut self, over: &mut Over<'_>) {
+        self.calls.push(over.rects.to_vec());
+        for r in over.rects {
+            if let Some(part) = r.intersect(&self.square) {
+                over.surface.fill_rect(part, over.palette.accent);
+            }
+        }
+    }
+    fn take_drawn(&mut self) -> Vec<Rect> {
+        core::mem::take(&mut self.drawn)
+    }
+}
+
+#[test]
+fn the_app_s_own_damage_is_repainted_and_committed_without_publishing() {
+    let mut app = Board::new();
+    let mut s = Board::surface();
+    let first = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    assert_eq!(first, Repainted { rects: alloc::vec![s.bounds()], changed: true });
+    assert_eq!(app.calls, alloc::vec![alloc::vec![s.bounds()]], "a full repaint: everything over it");
+    assert_eq!(s.pixel(455, 55), Some(PALETTE.accent));
+    // Nothing changed: no frame.
+    assert_eq!(repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA).rects, Vec::new());
+    assert_eq!(app.calls.len(), 1);
+    // The square moves: its old and new places are the app's damage,
+    // committed and handed to its frame exactly, the tree unchanged (no
+    // publish).
+    let old = app.square;
+    app.square = Rect::new(500, 120, 20, 20);
+    app.drawn = alloc::vec![old, app.square];
+    let moved = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    assert_eq!(moved, Repainted { rects: alloc::vec![old, app.square], changed: false });
+    assert_eq!(app.calls.last(), Some(&alloc::vec![old, app.square]));
+    assert_eq!(s.pixel(505, 125), Some(PALETTE.accent), "drawn at its new place");
+    // Rectangles are cut to the surface; one wholly off it is dropped, and
+    // with nothing else to repaint there's no frame at all.
+    app.drawn = alloc::vec![Rect::new(-50, -50, 10, 10)];
+    let calls = app.calls.len();
+    assert_eq!(repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA).rects, Vec::new());
+    assert_eq!(app.calls.len(), calls);
+    app.drawn = alloc::vec![Rect::new(590, 190, 50, 50)];
+    assert_eq!(
+        repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA).rects,
+        alloc::vec![Rect::new(590, 190, 10, 10)]
+    );
+}
+
+#[test]
+fn the_tree_is_repainted_under_the_app_s_damage_only_inside_its_area() {
+    // A rectangle straddling the tree's area's right edge: the tree's
+    // background is painted where it meets the area, and nothing else is
+    // touched outside it (the app paints that part itself).
+    let mut app = Board::new();
+    let mut s = Board::surface();
+    repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    const JUNK: u32 = 0x00ab_cdef;
+    let straddling = Rect::new(390, 150, 20, 20);
+    s.fill_rect(straddling, JUNK);
+    app.drawn = alloc::vec![straddling];
+    let done = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    assert_eq!(done.rects, alloc::vec![straddling]);
+    assert_eq!(s.pixel(395, 155), Some(PALETTE.background), "the tree, inside its area");
+    assert_eq!(s.pixel(405, 155), Some(JUNK), "outside it: the app's to paint");
+}
+
+#[test]
+fn the_tree_s_damage_and_the_app_s_are_committed_together() {
+    let mut app = Board::new();
+    let mut s = Board::surface();
+    repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    let add = app.counter.ui().id(app.counter.add).expect("live").get();
+    assert!(matches!(serve(&mut app, &mut FixedText, AREA, add, &Action::Press), Served::Row { .. }));
+    app.drawn = alloc::vec![app.square];
+    let both = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    assert!(both.changed, "the tree changed: publish");
+    assert_eq!(both.rects.last(), Some(&app.square));
+    assert!(both.rects.len() > 1 && both.rects.iter().all(|r| *r != s.bounds()), "{:?}", both.rects);
+    assert_eq!(app.calls.last(), Some(&both.rects), "the frame over all of it");
+}
+
+#[test]
+fn a_new_palette_repaints_the_app_s_drawing_in_its_colours() {
+    let mut app = Board::new();
+    let mut s = Board::surface();
+    repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    let dark = Palette { accent: 0x00ff8800, background: 0x202020, ..PALETTE };
+    app.ui_mut().invalidate();
+    let done = repaint(&mut app, &mut s, &mut FixedText, &dark, AREA);
+    assert_eq!(done.rects, alloc::vec![s.bounds()]);
+    assert_eq!(s.pixel(455, 55), Some(dark.accent));
+}
+
+#[test]
+fn over_touches_says_whether_a_rect_meets_the_repainted_ones() {
+    let mut s = Surface::new(10, 10);
+    let rects = [Rect::new(0, 0, 4, 4), Rect::new(6, 6, 4, 4)];
+    let over = Over { surface: &mut s, text: &mut FixedText, palette: &PALETTE, rects: &rects };
+    assert!(over.touches(Rect::new(3, 3, 1, 1)));
+    assert!(over.touches(Rect::new(9, 9, 5, 5)));
+    assert!(!over.touches(Rect::new(4, 4, 2, 2)));
+    assert!(!over.touches(Rect::EMPTY));
 }

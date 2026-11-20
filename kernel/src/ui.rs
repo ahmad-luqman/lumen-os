@@ -378,7 +378,9 @@ impl<A: App> Toolkit<A> {
     /// the tree if it changed. Every frame of an animation.
     pub fn frame(&mut self, h: &mut WindowHandle) {
         let changed = self.lay_out();
+        // Painted whole: the tree's damage and the app's own are covered.
         let _all = self.app.ui_mut().take_damage();
+        let _drawn = self.app.take_drawn();
         self.paint_all(h);
         if changed {
             self.publish(h);
@@ -389,8 +391,13 @@ impl<A: App> Toolkit<A> {
     fn paint_all(&mut self, h: &mut WindowHandle) {
         let s = h.surface_mut();
         self.app.ui_mut().paint(s, &mut self.text, &self.palette);
-        self.app.paint_over(s);
         let bounds = s.bounds();
+        self.app.paint_over(&mut lumen_ui::Over {
+            surface: s,
+            text: &mut self.text,
+            palette: &self.palette,
+            rects: &[bounds],
+        });
         h.commit(&[bounds]);
     }
 
@@ -855,7 +862,7 @@ crate::ktest!(
             fn apply(&mut self, events: &[UiEvent]) -> Then {
                 if self.closes && events.contains(&UiEvent::Pressed(self.button)) { Then::Close } else { Then::Carry }
             }
-            fn paint_over(&mut self, _: &mut Surface) {
+            fn paint_over(&mut self, _: &mut lumen_ui::Over<'_>) {
                 if let Some(cell) = &self.cell {
                     self.seen = Some(cell.phase());
                 }

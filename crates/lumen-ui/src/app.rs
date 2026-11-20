@@ -1,7 +1,8 @@
-//! A window's app ([`App`]: its tree, and what it does with what the tree
-//! reports), running a request on it ([`serve`]) and painting what changed
-//! ([`repaint`]). The kernel's `ui::Toolkit` and an app's (the SDK's
-//! `ui::Toolkit`) drive all three; host tests run the same code.
+//! A window's app ([`App`]: its tree, what it does with what the tree
+//! reports, and what it draws itself over it), running a request on it
+//! ([`serve`]) and painting what changed ([`repaint`]). The kernel's
+//! `ui::Toolkit` and an app's (the SDK's `ui::Toolkit`) drive all three;
+//! host tests run the same code.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -25,14 +26,43 @@ pub enum Then {
     Failed(String),
 }
 
+/// What an app's own drawing is handed ([`App::paint_over`]): the surface,
+/// the window's text and palette (the theme's colours, so custom drawing
+/// follows a switch), and the rectangles being repainted now (the whole
+/// surface on a full repaint). Only pixels inside `rects` are committed
+/// this time, so drawing elsewhere is wasted (and, through the host's text
+/// calls, paid for in fuel by the character).
+pub struct Over<'a> {
+    pub surface: &'a mut Surface,
+    pub text: &'a mut dyn Text,
+    pub palette: &'a Palette,
+    pub rects: &'a [Rect],
+}
+
+impl Over<'_> {
+    /// Whether `r` meets a rectangle being repainted.
+    pub fn touches(&self, r: Rect) -> bool {
+        self.rects.iter().any(|d| d.intersect(&r).is_some())
+    }
+}
+
 /// A window's app.
 pub trait App {
     fn ui_mut(&mut self) -> &mut Ui;
     /// Act on what the tree reported.
     fn apply(&mut self, events: &[UiEvent]) -> Then;
-    /// Drawn over the painted tree (an animation's frame); nothing by
-    /// default.
-    fn paint_over(&mut self, _surface: &mut Surface) {}
+    /// Drawn over the painted tree in `over.rects` (an animation's frame,
+    /// a board, a buffer's text); nothing by default. The app's own area
+    /// (outside the tree's) is painted by nothing else, so it paints all of
+    /// it that `over.rects` reach.
+    fn paint_over(&mut self, _over: &mut Over<'_>) {}
+    /// What the app's own drawing changed since the last repaint (surface
+    /// coordinates): [`repaint`] repaints and commits it with the tree's
+    /// damage, without the tree counting as changed (so it isn't
+    /// republished). None by default.
+    fn take_drawn(&mut self) -> Vec<Rect> {
+        Vec::new()
+    }
 }
 
 /// What running a request did: the answer its asker gets, once the owner
@@ -86,7 +116,11 @@ pub struct Repainted {
 
 /// Lay `app`'s tree out in `area`, then paint only what changed into
 /// `surface` (the widgets whose look changed, or everything after a move or
-/// a new palette) with the app's frame over it.
+/// a new palette) and what the app's own drawing changed
+/// ([`App::take_drawn`]: the tree repainted only where those meet `area`),
+/// with the app's frame over all of it ([`App::paint_over`], called
+/// whenever anything is repainted). `changed` is the tree's alone: the
+/// app's drawing never makes it publish.
 pub fn repaint(
     app: &mut dyn App,
     surface: &mut Surface,
@@ -96,21 +130,42 @@ pub fn repaint(
 ) -> Repainted {
     app.ui_mut().layout(area, text);
     let changed = app.ui_mut().take_changed();
+    let bounds = surface.bounds();
+    let drawn: Vec<Rect> = app.take_drawn().iter().filter_map(|r| r.intersect(&bounds)).collect();
     let rects = match app.ui_mut().take_damage() {
-        Repaint::Nothing => return Repainted { rects: Vec::new(), changed },
+        Repaint::Nothing if drawn.is_empty() => return Repainted { rects: Vec::new(), changed },
+        // A full paint covers the app's rectangles too.
         Repaint::All => {
             app.ui_mut().paint(surface, text, palette);
-            alloc::vec![surface.bounds()]
+            alloc::vec![bounds]
         }
-        Repaint::Rects(rects) => {
+        Repaint::Nothing => tree_under(app, surface, text, palette, area, drawn),
+        Repaint::Rects(mut rects) => {
             for r in &rects {
                 app.ui_mut().paint_in(surface, text, palette, *r);
             }
+            rects.extend(tree_under(app, surface, text, palette, area, drawn));
             rects
         }
     };
-    // The app's frame over it again (what it draws outside the rectangles
-    // is committed with its next full paint).
-    app.paint_over(surface);
+    app.paint_over(&mut Over { surface, text, palette, rects: &rects });
     Repainted { rects, changed }
+}
+
+/// The tree repainted where the app's rectangles `drawn` meet its `area`
+/// (the app paints the rest of them): `drawn`, to commit.
+fn tree_under(
+    app: &mut dyn App,
+    surface: &mut Surface,
+    text: &mut dyn Text,
+    palette: &Palette,
+    area: Rect,
+    drawn: Vec<Rect>,
+) -> Vec<Rect> {
+    for r in &drawn {
+        if let Some(under) = r.intersect(&area) {
+            app.ui_mut().paint_in(surface, text, palette, under);
+        }
+    }
+    drawn
 }
