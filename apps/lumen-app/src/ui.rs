@@ -20,7 +20,7 @@ use lumen_app_api::layout::{Rect as WireRect, TextDraw};
 use lumen_app_api::limits::{TEXT_BYTES, UI_TEXT_PX};
 use lumen_app_api::tree::Tree;
 use lumen_gfx::{Rect, Surface};
-use lumen_ui::{App, Input, Palette, Repaint, Served, Text, Then, serve};
+use lumen_ui::{App, Input, Palette, Served, Text, Then, repaint, serve};
 use sys::ptr;
 
 /// The toolkit's text through the host: the kernel's UI font at
@@ -176,32 +176,18 @@ impl<A: App> Toolkit<A> {
         self.app.apply(&events)
     }
 
-    /// Lay the tree out; repaint and commit only what changed (everything
-    /// after a move or a new palette), then publish the tree if it changed.
+    /// Lay the tree out; repaint and commit only what changed
+    /// (`lumen_ui::repaint`, as the kernel's toolkit does), then publish the
+    /// tree if it changed.
     pub fn refresh(&mut self) -> Result<()> {
         let area = self.window.canvas.bounds();
-        self.app.ui_mut().layout(area, &mut self.text);
-        let changed = self.app.ui_mut().take_changed();
-        let rects = match self.app.ui_mut().take_damage() {
-            Repaint::Nothing => alloc::vec::Vec::new(),
-            Repaint::All => {
-                self.app.ui_mut().paint(&mut self.window.canvas, &mut self.text, &self.palette);
-                alloc::vec![area]
-            }
-            Repaint::Rects(rects) => {
-                for r in &rects {
-                    self.app.ui_mut().paint_in(&mut self.window.canvas, &mut self.text, &self.palette, *r);
-                }
-                rects
-            }
-        };
-        if !rects.is_empty() {
-            self.app.paint_over(&mut self.window.canvas);
+        let done = repaint(&mut self.app, &mut self.window.canvas, &mut self.text, &self.palette, area);
+        if !done.rects.is_empty() {
             let wire: alloc::vec::Vec<WireRect> =
-                rects.iter().map(|r| WireRect::new(r.x(), r.y(), r.w(), r.h())).collect();
+                done.rects.iter().map(|r| WireRect::new(r.x(), r.y(), r.w(), r.h())).collect();
             self.window.commit(&wire)?;
         }
-        if changed {
+        if done.changed {
             self.publish()?;
         }
         Ok(())

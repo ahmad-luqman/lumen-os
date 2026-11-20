@@ -28,8 +28,7 @@ use lumen_input::{Button, KeyEvent};
 use lumen_shell::pipe::{self, Align, Column, Kind, Value};
 use lumen_ui::counter::Counter;
 use lumen_ui::{
-    Action, ActionKind, App, First, Input, InvokeError, Key, Palette, Phase, Repaint, Reply, Second, Served, Text,
-    Then, serve,
+    Action, ActionKind, App, First, Input, InvokeError, Key, Palette, Phase, Reply, Second, Served, Text, Then, serve,
 };
 use lumen_wm::{Refused, Theme};
 
@@ -346,26 +345,14 @@ impl<A: App> Toolkit<A> {
         h.commit(&[bounds]);
     }
 
-    /// Lay the tree out; repaint and commit only what changed (the widgets
-    /// whose look changed, or everything after a move or a new palette),
-    /// then publish the tree if it changed.
+    /// Lay the tree out; repaint and commit only what changed
+    /// (`lumen_ui::repaint`), then publish the tree if it changed.
     pub fn refresh(&mut self, h: &mut WindowHandle) {
-        let changed = self.lay_out();
-        match self.app.ui_mut().take_damage() {
-            Repaint::Nothing => {}
-            Repaint::All => self.paint_all(h),
-            Repaint::Rects(rects) => {
-                let s = h.surface_mut();
-                for r in &rects {
-                    self.app.ui_mut().paint_in(s, &mut self.text, &self.palette, *r);
-                }
-                // The app's frame over it again (what it draws outside the
-                // rectangles is committed with its next full paint).
-                self.app.paint_over(s);
-                h.commit(&rects);
-            }
+        let done = lumen_ui::repaint(&mut self.app, h.surface_mut(), &mut self.text, &self.palette, self.area);
+        if !done.rects.is_empty() {
+            h.commit(&done.rects);
         }
-        if changed {
+        if done.changed {
             self.publish(h);
         }
     }

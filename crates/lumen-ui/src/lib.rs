@@ -42,7 +42,7 @@ mod shell_tests;
 #[cfg(test)]
 mod tests;
 
-pub use app::{App, Served, Then, serve};
+pub use app::{App, Repainted, Served, Then, repaint, serve};
 pub use node::{Action, ActionKind, AutomationNode, InvokeError, NodeId, Role, StateFlags, Value, ValueKind};
 pub use reply::{First, NotStarted, Phase, Reply, Second};
 pub use text::{FixedText, Text};
