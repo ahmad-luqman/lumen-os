@@ -315,7 +315,9 @@ fn memory_as_planned() -> Result<(), String> {
 }
 
 /// The app's exit code: 0 once its window is closed; 1 once a failure is
-/// logged as one ERROR (the viewer's own checks, or a host call's).
+/// logged. Its own checks before the window log one ERROR; a host call
+/// failing inside the SDK's loop logs two, the loop's naming the stage and
+/// `report`'s (#222's pattern).
 fn run() -> i32 {
     match first_image() {
         Ok(first) => lumen_app::report(app(first)),

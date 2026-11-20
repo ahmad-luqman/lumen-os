@@ -3891,7 +3891,7 @@ kernel (no SSE); #197 checks the results' bits.
   `costly.png`, a valid 8-bit RGBA PNG at full size, too costly to decode)
   decoded inside it by `lumen-png` (a path dependency of `apps/`, built for
   wasm32: `zune-png`, inflating with `zune-inflate`; `miniz_oxide` is only
-  the encoder's; the module is 392 KiB), so a bad file can only end the
+  the encoder's; the module is under 400 KiB), so a bad file can only end the
   app. Manifest `time, desktop`: it runs on `run_until`, its one tick
   (`period()` set only while an image waits) the decode, so the request
   choosing an image is answered at once with `decoding <name>` (one

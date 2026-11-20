@@ -71,8 +71,9 @@ pub const MAX_IMAGE_H: u32 = 800;
 /// byte and its samples): 8-bit RGB at [`MAX_IMAGE_W`] x [`MAX_IMAGE_H`].
 /// The decoder's buffers grow with it: for the costliest image it takes,
 /// 16-bit RGBA at this many bytes, interlaced, they peak at about 3.5 times
-/// it (the inflated rows, the deinterlaced samples, the samples stripped to
-/// 8 bits, then the pixels): `tests/memory.rs` measures it.
+/// it (the inflated rows, two 16-bit copies of the samples and `lumen-png`'s
+/// 8-bit buffer, reserved first; the pixels come only once those are
+/// freed): `tests/memory.rs` measures it.
 pub const MAX_INFLATED_BYTES: u64 = (1 + 3 * MAX_IMAGE_W as u64) * MAX_IMAGE_H as u64;
 
 /// The longest file it decodes (`lumen-png` and the decoder each copy a
