@@ -278,14 +278,12 @@ impl App for Viewer {
 
 impl Ticking for Viewer {
     /// A tick only while an image waits to be decoded (the floor's 10 ms
-    /// later): otherwise the window waits for events, and settles.
+    /// later): otherwise the window waits for events, and settles. The wait
+    /// before that tick is an animating one (`animating`'s default), so the
+    /// desktop never counts the window settled while its view still says
+    /// `Decoding`.
     fn period(&self) -> Option<u64> {
         matches!(self.shown, Shown::Decoding).then_some(0)
-    }
-
-    /// Not an animation: the one tick decodes, then it waits.
-    fn animating(&self) -> bool {
-        false
     }
 
     fn tick(&mut self, _now: u64) -> Flow {
