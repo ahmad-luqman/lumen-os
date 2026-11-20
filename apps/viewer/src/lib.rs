@@ -147,7 +147,14 @@ impl Viewer {
                 info
             }
             Err(why) => {
-                log::info(&format!("viewer: {name}: {why}"));
+                // A bad or refused file is the file's; running out of memory
+                // is the memory plan failing (lumen-view's tests/memory.rs
+                // says it fits), worth a warning.
+                if why.out_of_memory() {
+                    log::warn(&format!("viewer: {name}: out of memory: lumen-view's memory plan doesn't hold ({why})"));
+                } else {
+                    log::info(&format!("viewer: {name}: {why}"));
+                }
                 let info = format!("{name}: {why}");
                 self.shown = Shown::Failed(why.to_string());
                 info

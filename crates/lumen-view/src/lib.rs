@@ -516,6 +516,19 @@ mod tests {
     }
 
     #[test]
+    fn only_running_out_of_memory_is_the_plan_failing() {
+        assert!(Why::NoMemory.out_of_memory());
+        assert!(Why::Decode(DecodeError::OutOfMemory).out_of_memory());
+        assert!(!Why::Decode(DecodeError::Png(String::from("bad"))).out_of_memory());
+        let big = DecodeError::TooBig { width: 2, height: 2, max_width: 1, max_height: 1 };
+        assert!(!Why::Decode(big).out_of_memory());
+        assert!(!Why::Refused(Refused::NoHeader).out_of_memory());
+        assert!(!Why::Refused(Refused::TooCostly { w: 1, h: 1, bytes: 1 }).out_of_memory());
+        assert_eq!(Why::NoMemory.to_string(), "no memory for its fitted copy");
+        assert_eq!(Why::Refused(Refused::NoHeader).to_string(), Refused::NoHeader.to_string());
+    }
+
+    #[test]
     fn scale_refuses_zero_sizes_and_short_sources() {
         assert_eq!(scale(&[1, 2, 3], 2, 2, 1, 1), None);
         assert_eq!(scale(&[1], 0, 1, 1, 1), None);
