@@ -30,39 +30,40 @@ is listed only in [STATUS.md](STATUS.md), which is generated from tests.
 | Language | Rust, **stable only**, pinned in `rust-toolchain.toml` (1.99.1) | Memory safety removes whole bug classes, which matters with many agents writing kernel code in parallel. Stable-only means the build still works next year. | C17 with strict warnings and sanitizers in host tests: simpler interop and faster builds, but it relies on reviewer discipline for memory safety. Nightly Rust: `x86-interrupt` ABI and custom test frameworks, but it breaks over time. |
 | Target | x86-64 UEFI, QEMU `q35` + OVMF, virtio devices first | Closest to a modern laptop; virtio is simple and well documented. | BIOS (legacy), ARM64 first (M13 port instead). |
 | Bootloader | Limine 12.x (pinned binary release + sha256), `limine` crate **0.5.0** | Memory map, framebuffer, higher-half direct map, and our own ELF file for symbolization, with no loader to write. Crate 0.6.x requires nightly (`#![feature(ptr_metadata)]`), so we use 0.5.0 (base revision 3). | Custom UEFI loader (optional learning milestone), GRUB/multiboot2. |
-| Kernel shape | **Modular monolith** with message-shaped internal interfaces; capabilities enforced at the syscall boundary | One address space keeps early milestones fast and debuggable. Agent safety needs capability checks between *processes*, which a monolith enforces just as well. Drivers and services expose request/response interfaces, so any of them can move to user space later. | Microkernel: stronger isolation of drivers, but it puts IPC performance and many extra servers in front of every milestone. |
+| Kernel shape | **Modular monolith** with message-shaped internal interfaces; Linux x86-64 syscall ABI from M6, wrapped in capability-scoped namespaces in M11 | One address space keeps early milestones fast and debuggable. Speaking the Linux x86-64 ABI lets Lumen run unmodified Alpine Linux (`musl`) compilers and runtimes without maintaining custom `libc`, `ld.so`, or runtime forks; per-process VFS mount namespaces and network policies still enforce Principle 2 around agents and sandboxed processes. | Microkernel (puts IPC overhead in front of every milestone); custom ring-3 syscall ABI + custom `libc` (multiplies porting and maintenance cost by an order of magnitude). |
 | Test harness | Python (`uv`, pytest) on the host; TAP from the kernel | Fast to write scenarios, mature tooling, and QMP/PIL are easy to use. | Rust `xtask`: one language, but slower iteration on test scripts. |
-| Third-party crates | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), a PR adding only the crates its issue names (with their own dependencies), each checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX, no red zone, the kernel code model). Kernel crates so far: `limine`, `rustc-demangle`, `noto-sans-mono-bitmap` and `log` (from M0, before this policy; `log` is still `0.4`, to be pinned in a PR of its own), `pc-keyboard` (scancode decoding and layouts, #58, the first under it), `vte` (terminal escape parsing; brings `arrayvec` and `memchr`) and `unicode-width` (character widths), both #59. `rhai` (scripting, #67; integers only, no modules, no time, closures that can't capture (`no_closure`), `curry` disabled; brings `ahash`, `hashbrown`, `allocator-api2`, `equivalent`, `foldhash`, `smallvec`, `smartstring`, `thin-vec`, `num-traits`, `libm`, `bitflags`, `once_cell`, `portable-atomic`, `zerocopy`, `static_assertions`, `cfg-if`, `no-std-compat` and `core-error`, plus `const-random`, whose compile-time random seed stays linked but unused (the kernel sets a fixed hashing seed before any script runs), and the proc macros `rhai_codegen` and `const-random-macro`, which run only at build time). `virtio-drivers` `=0.13.0` (#95: virtqueues and the virtio device protocols; `default-features = false` with `alloc`; brings `safe-mmio` and `thiserror` (`bitflags` and `zerocopy` were already linked through `rhai`), plus the build-time proc macros `enumn`, `thiserror-impl` and `zerocopy-derive`), under the adapter rules in section 7, and `zerocopy` as a direct dependency, pinned to the lockfile's version (`=0.8.63`; the crate turns on `zerocopy`'s `derive` and `alloc` features for the whole kernel by feature unification, which `make audit` covers). `wasmi` `=2.0.1` (#197: the WASM interpreter for M5's apps; `default-features = false` with `validate` and `portable-dispatch`; brings `wasmi_core`, `wasmi_ir`, `wasmi_collections`, `wasmparser` and `spin`; its `libm` and `bitflags` were already linked through `rhai`). `portable-dispatch` is a stack-safety choice: our dependency line's `default-features = false` drops `auto-dispatch`, and wasmi then dispatches by tail calls, each instruction's handler calling the next and counting on LLVM to make those calls jumps, which its build script expects only without debug assertions; the kernel keeps them on, so a long loop overflowed a 64 KiB thread stack in #197 (`ktest:lumen_kernel::app::wasmi_runs_a_long_loop_in_fuel_slices` runs one on such a stack). The loop dispatch keeps the native stack's depth constant however long a module runs (host calls aside), and wasmi's own call depth (1000 frames, on the heap) bounds a module's recursion. Functions are compiled with the module (`CompilationMode::Eager`, section 8's wasmi configuration): lazily, a body's compilation is charged (7 fuel a byte) to the fuel left in the slice of the first call to reach it, and one costing more ends that call with an error that can't be resumed (though wasmi's message calls it resumable); compiling eagerly isn't metered, and keeps the compiled code, about 13 bytes of heap per body byte, for the module's life. `postcard` `=1.1.3` and `serde` `=1.0.229` (the app interface's wire format, section 8, for the wire types #206 and #207 add to `lumen-app-api`: #199's host calls take none; postcard with `default-features = false` and `alloc`, so without its default `heapless-cas`; serde with `default-features = false`, `derive` and `alloc`; they bring `serde_core` and `cobs` (`thiserror` was already linked through `virtio-drivers`), plus the build-time proc macro `serde_derive` (`proc-macro2`, `quote` and `syn` 3, already built for `thiserror-impl`); two `embedded-io` versions are in `Cargo.lock` only, named weakly by postcard's `alloc` feature, and never built). `ktest:lumen_kernel::app::wire::postcard_round_trips_derived_types` pins their encoding and decoding rules and links them into the ktest kernel, where `make audit`'s binary checks cover them; its IR checks read only the kernel crate's own IR, so once the wire types use them they see the generic code of these crates compiled into it, while their own non-generic code is covered by the binary checks alone, as wasmi's and rhai's is. `shlex` (#62) is only a dev-dependency of `lumen-shell`, the word splitter's test oracle; `noline`, which #62 names, isn't used (no completion hook, escape codes always, and it queries the terminal for the cursor on every prompt). | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
+| Third-party crates & upstream OS code | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), a PR adding only the crates its issue names (with their own dependencies), each checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX outside M6's two named FP save/restore stubs, no red zone, the kernel code model). Any PR that adopts a crate or adapts code from an upstream Rust OS (Lumen is MIT: see [ROADMAP.md](ROADMAP.md#reference-rust-oses-and-license-policy-lumen-is-mit)) must explicitly name the elected license (for multi-licensed projects such as ArceOS/Starry, elect `Apache-2.0`, retain any upstream `NOTICE` and license text, and mark modified files as changed; for BSD-3-Clause code such as Starnix, retain copyright and no-endorsement notices; keep MPL-2.0 code such as Asterinas crates in separate MPL-2.0-marked crates/files; never copy GPL-3.0 code) and preserve upstream copyright notices. Pre-baked Alpine Linux `ext4` test images (containing GPL userspace binaries) live only in the untracked `build/deps/` cache and are never committed to the MIT repository. Kernel crates so far: `limine`, `rustc-demangle`, `noto-sans-mono-bitmap` and `log` (from M0, before this policy; `log` is still `0.4`, to be pinned in a PR of its own), `pc-keyboard` (scancode decoding and layouts, #58, the first under it), `vte` (terminal escape parsing; brings `arrayvec` and `memchr`) and `unicode-width` (character widths), both #59. `rhai` (scripting, #67; integers only, no modules, no time, closures that can't capture (`no_closure`), `curry` disabled; brings `ahash`, `hashbrown`, `allocator-api2`, `equivalent`, `foldhash`, `smallvec`, `smartstring`, `thin-vec`, `num-traits`, `libm`, `bitflags`, `once_cell`, `portable-atomic`, `zerocopy`, `static_assertions`, `cfg-if`, `no-std-compat` and `core-error`, plus `const-random`, whose compile-time random seed stays linked but unused (the kernel sets a fixed hashing seed before any script runs), and the proc macros `rhai_codegen` and `const-random-macro`, which run only at build time). `virtio-drivers` `=0.13.0` (#95: virtqueues and the virtio device protocols; `default-features = false` with `alloc`; brings `safe-mmio` and `thiserror` (`bitflags` and `zerocopy` were already linked through `rhai`), plus the build-time proc macros `enumn`, `thiserror-impl` and `zerocopy-derive`), under the adapter rules in section 7, and `zerocopy` as a direct dependency, pinned to the lockfile's version (`=0.8.63`; the crate turns on `zerocopy`'s `derive` and `alloc` features for the whole kernel by feature unification, which `make audit` covers). `wasmi` `=2.0.1` (#197: the WASM interpreter for M5's apps; `default-features = false` with `validate` and `portable-dispatch`; brings `wasmi_core`, `wasmi_ir`, `wasmi_collections`, `wasmparser` and `spin`; its `libm` and `bitflags` were already linked through `rhai`). `portable-dispatch` is a stack-safety choice: our dependency line's `default-features = false` drops `auto-dispatch`, and wasmi then dispatches by tail calls, each instruction's handler calling the next and counting on LLVM to make those calls jumps, which its build script expects only without debug assertions; the kernel keeps them on, so a long loop overflowed a 64 KiB thread stack in #197 (`ktest:lumen_kernel::app::wasmi_runs_a_long_loop_in_fuel_slices` runs one on such a stack). The loop dispatch keeps the native stack's depth constant however long a module runs (host calls aside), and wasmi's own call depth (1000 frames, on the heap) bounds a module's recursion. Functions are compiled with the module (`CompilationMode::Eager`, section 8's wasmi configuration): lazily, a body's compilation is charged (7 fuel a byte) to the fuel left in the slice of the first call to reach it, and one costing more ends that call with an error that can't be resumed (though wasmi's message calls it resumable); compiling eagerly isn't metered, and keeps the compiled code, about 13 bytes of heap per body byte, for the module's life. `postcard` `=1.1.3` and `serde` `=1.0.229` (the app interface's wire format, section 8, for the wire types #206 and #207 add to `lumen-app-api`: #199's host calls take none; postcard with `default-features = false` and `alloc`, so without its default `heapless-cas`; serde with `default-features = false`, `derive` and `alloc`; they bring `serde_core` and `cobs` (`thiserror` was already linked through `virtio-drivers`), plus the build-time proc macro `serde_derive` (`proc-macro2`, `quote` and `syn` 3, already built for `thiserror-impl`); two `embedded-io` versions are in `Cargo.lock` only, named weakly by postcard's `alloc` feature, and never built). `ktest:lumen_kernel::app::wire::postcard_round_trips_derived_types` pins their encoding and decoding rules and links them into the ktest kernel, where `make audit`'s binary checks cover them; its IR checks read only the kernel crate's own IR, so once the wire types use them they see the generic code of these crates compiled into it, while their own non-generic code is covered by the binary checks alone, as wasmi's and rhai's is. `shlex` (#62) is only a dev-dependency of `lumen-shell`, the word splitter's test oracle; `noline`, which #62 names, isn't used (no completion hook, escape codes always, and it queries the terminal for the cursor on every prompt). | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
 | Firmware for tests | OVMF `edk2-stable202605-r1` from rust-osdev/ovmf-prebuilt, pinned with sha256 | macOS and CI boot byte-identical firmware, so golden screenshots match. | Distro OVMF packages (paths and versions differ per OS). |
 
 ## 3. Layers
 
 ```
  ┌──────────────────────────────────────────────────────────────────────┐
- │ Apps (WASM, sandboxed)   Shell   File manager   Editor   X-ray   Tour│  user mode
+ │ Linux userspace (Alpine musl: busybox, gcc, rustc, go, python, node, │  ring 3
+ │ ruby, git, Claude CLI/agent)  +  WASM apps (in-kernel wasmi, M5)     │
  ├──────────────────────────────────────────────────────────────────────┤
- │ Claude service: Ask bar, agent lanes, capability prompts, audit log │
- │ GUI: compositor, window manager, toolkit + automation API           │  user-mode
- │ System services: keychain, network stack, VFS server*, login        │  services
+ │ Linux x86-64 syscall ABI (M6–M10)  +  Capability namespaces (M11)    │  boundary
  ├──────────────────────────────────────────────────────────────────────┤
- │ Syscall ABI (capability handles)        IPC channels                │  boundary
+ │ Kernel core: scheduler (SMP migration M8), user VM + VMA tree (M6),  │
+ │ CoW/TLB shootdown/futex/signals (M8), epoll/AF_UNIX (M9),            │
+ │ trace ring buffer + X-ray, crash reporter, logger                    │  kernel
+ │ Kernel subsystems: POSIX VFS + writable ext4 + tmpfs/devfs/procfs    │
+ │ (M7), block/page cache, BSD sockets/smoltcp (M9), GUI compositor &   │
+ │ automation tree (M4), PTYs (M8), drivers (virtio-*, PS/2, NVMe...)   │
  ├──────────────────────────────────────────────────────────────────────┤
- │ Kernel core: scheduler, processes, VM, capability tables, IPC,      │
- │ trace ring buffer, crash reporter, logger                           │
- │ Kernel subsystems: VFS + LumenFS (CoW), block cache, drivers        │  kernel
- │ (virtio-blk/net/input/gpu/console, PS/2, NVMe, xHCI...)             │
+ │ HAL (`kernel/src/arch/`): CPU, GDT/TSS, IDT, syscall/SWAPGS,         │
+ │ FXSAVE/XSAVE stubs, paging, timers, ports, IPIs                      │
  ├──────────────────────────────────────────────────────────────────────┤
- │ HAL (`kernel/src/arch/`): CPU, interrupts, paging, timers, ports    │
- ├──────────────────────────────────────────────────────────────────────┤
- │ Limine (UEFI) → kernel ELF at 0xffffffff80000000                    │  boot
+ │ Limine (UEFI) → kernel ELF at 0xffffffff80000000                     │  boot
  └──────────────────────────────────────────────────────────────────────┘
-   * starts in-kernel; the interface allows moving it out later
 ```
 
-This is the target. To reach a usable system sooner, everything above the
-boundary (the shell, the GUI, WASM apps, the network stack and the Claude
-service) runs in the kernel on kernel threads until M9 adds user mode; see
-[ROADMAP.md](ROADMAP.md#how-this-roadmap-is-ordered).
+M2–M5 run the Lumen shell, the desktop compositor/toolkit, and sandboxed WASM
+apps in ring 0 on kernel threads. From M6 onward, native ring-3 processes enter
+through the Linux x86-64 syscall ABI and execute unmodified Alpine Linux
+(`musl`) binaries, with Lumen's capability namespaces, snapshots, PTY-backed
+desktop terminals, X-ray tracing, and userspace Claude service layered on top
+in M11; see [ROADMAP.md](ROADMAP.md#how-this-roadmap-is-ordered).
 
 Module boundaries inside the kernel are enforced by Rust visibility. Code
 outside `arch/` may only use what `arch/mod.rs` re-exports (the HAL surface).
@@ -200,8 +201,10 @@ tests (for example `lumen-elf`, the symbol-table reader).
 7. Either the in-kernel test runner (`--features ktest`) or the shells
    (`shell::run`, section 6, "Shell"): the screen's in a thread of its own,
    then the serial one on the `main` thread (`INFO  shell: shells on serial
-   and the screen; type 'help'`). They run in the kernel until the shell
-   moves to user mode in M9.
+   and the screen; type 'help'`). Lumen's built-in console shell stays in the
+   kernel as a rescue/inspection shell; Linux user shells (`busybox ash`,
+   `bash`) run in ring 3 from M6 (over PTYs in desktop terminal windows from
+   M11).
 
 ### Boot timeline and log timestamps (built in M1)
 
@@ -346,7 +349,8 @@ sends the same IPI when it queues a thread on another CPU (`smp::wake`).
 
 APs handle no I/O APIC interrupts: every input goes to the boot CPU. An AP
 starts its local APIC timer once the boot CPU publishes the count, and the
-timer's first tick starts its scheduler. Known gap: there
+timer's first tick starts its scheduler. Known gap (in M1–M7; cross-CPU
+`TLB_SHOOTDOWN` IPI arrives in M8, section 5): there
 is no TLB shootdown; `unmap` flushes only the CPU that runs it. Mapping
 needs none (x86 caches no not-present entries; an AP may grow the heap, or
 map a thread's stack, from a thread or a `run_on` job there). The only
@@ -469,7 +473,8 @@ with one of them, said in a TAP comment; none selected fails the run).
 
 | Range | Use | Status |
 |---|---|---|
-| `0x0000_0000_0000_0000 – 0x0000_7fff_ffff_ffff` | empty in the kernel's tables (null guard); user space, per process, from M9 (except the first 64 KiB) | built (empty) |
+| `0x0000_0000_0000_0000 – 0x0000_0000_0000_ffff` | unmapped null guard (first 64 KiB, never mapped in any address space) | built (empty) |
+| `0x0000_0000_0001_0000 – 0x0000_7fff_ffff_efff` | user space, per process, from M6 (`USER_MIN` to `USER_MAX`; top canonical page `0x0000_7fff_ffff_f000` stays unmapped as a boundary guard) | designed (#230, M6) |
 | `0xffff_8000_0000_0000 – +phys size` | higher-half direct map (HHDM) of RAM: usable, bootloader-reclaimable, kernel-and-modules and framebuffer entries; NX, RW- except kernel-and-modules (R--), framebuffer write-combining | built |
 | `0xffff_c000_0000_0000 – 0xffff_c0ff_ffff_ffff` | kernel heap (grows up by mapping frames, to 1 GiB below the top; the top GiB holds a ktest scratch page) | built |
 | `0xffff_d000_0000_0000 – 0xffff_d0ff_ffff_ffff` | kernel stacks: 64 KiB (the main stack 128 KiB, script threads 1 MiB), **unmapped guard page below every stack**; the top GiB holds a ktest page | built |
@@ -478,7 +483,8 @@ with one of them, said in a TAP comment; none selected fails the run).
 
 The kernel is linked at -2 GiB because the **kernel code model** requires it
 (all symbols fit in sign-extended 32-bit immediates). `make audit` verifies
-this along with the absence of SSE/AVX and red-zone use and the presence of
+this along with the absence of SSE/AVX (outside M6's two named user-thread FP
+save/restore assembly stubs, section 6), no red-zone use, and the presence of
 stack probes (hard rule 3).
 
 ### Physical memory (built in M1)
@@ -633,9 +639,112 @@ read, then the page and its rights, or the level that is not present. It
 takes no locks; a table outside HHDM-mapped RAM ends the walk instead of
 being read, and if the walk itself faults the report still ends properly.
 
-The kernel's upper-half entries are not yet shared with anything; processes
-(M9) will need the kernel's L4 entries 256-511 copied into every address
-space, so new kernel L3 tables must be allocated up front then.
+### Per-process address spaces and user VM (designed in #230, built in M6; CoW and shootdowns in M8)
+
+Each user process owns an `AddressSpace` protected by a **sleeping,
+interrupt-enabled `Mutex`/`RwLock`** (not an IRQ-off `SpinLock`—needed both for
+M7 blocking file-backed `#PF` I/O and to prevent M8 `TLB_SHOOTDOWN` IPI
+deadlocks, below). It holds a dedicated 4-level page-table root (L4 frame,
+loaded into `CR3` when switching to one of its threads) and a VMA interval tree
+(pure logic in host-tested `crates/lumen-vm`):
+
+- **Upper-half sharing (L4 entries 256–511):** Each 1 TiB kernel window
+  (`WINDOW = 1 << 40`) spans two 512 GiB L4 slots. During `mm::init`, before
+  any process is created, the kernel pre-allocates L3 tables for all 6 dynamic
+  kernel L4 slots—kernel heap (`384`, `385`, including the ktest scratch slot),
+  kernel stacks (`416`, `417`), and MMIO (`448`, `449`)—alongside the static
+  HHDM (`256..`) and kernel image (`511`) tables already built by `paging`.
+  Creating a new `AddressSpace` copies L4 entries 256–511 from the kernel root
+  table verbatim, so subsequent kernel heap, stack, and MMIO mappings become
+  visible in every address space automatically without patching other L4
+  tables. Kernel entries are never marked `USER`; `lumen-mm::paging` extends
+  intermediate table entries and `Attrs` with an explicit `user` bit set **only**
+  within `L4[0..256]`, and `arch::x86_64::paging` adds a plain `write_cr3`
+  helper (`CR4.PCIDE = 0`; avoiding `load_root`'s `CR4.PGE` toggle on every
+  context switch).
+- **Lower-half layout (L4 entries 0–255, `USER_MIN..USER_MAX`):**
+  - `USER_MIN = 0x0000_0000_0001_0000` (64 KiB null guard below).
+  - `USER_MAX = 0x0000_7fff_ffff_f000` (top 4 KiB canonical user page unmapped
+    so no valid user slice can wrap past the canonical boundary).
+  - Static ELF `PT_LOAD` segments map at their `p_vaddr`; PIE binaries (and
+    M7's dynamic linker `ld-musl`) map at `PIE_BASE = 0x0000_5555_5555_4000`
+    and `INTERP_BASE = 0x0000_7f00_0000_0000` (or top-down from `MMAP_TOP`).
+  - `brk` starts page-aligned immediately above the highest loaded ELF segment
+    and tracks a byte-granular cursor upward up to the next VMA (capped away
+    from `mmap`).
+  - Anonymous (M6) and file-backed (M7) `mmap` regions allocate top-down from
+    `MMAP_TOP = 0x0000_7f00_0000_0000`.
+  - Initial user stack top: `USER_STACK_TOP = 0x0000_7fff_f000_0000`, with an
+    8 MiB demand-paged VMA and an unmapped guard page below it.
+- **VMA interval tree (`crates/lumen-vm`, host-tested):** tracks non-overlapping
+  page-aligned virtual ranges (`start..end`), protection flags (`R`, `W`, `X`,
+  or `PROT_NONE`), and backing (`Anonymous`, plus `File` in M7). Supports
+  exact-range lookup, top-down free-gap search, `MAP_FIXED` unmap-and-replace
+  (and `MAP_FIXED_NOREPLACE` returning `-EEXIST`), partial-range
+  `munmap`/`mprotect` sub-VMA splitting (required from M6 for `musl` `mallocng`
+  `PROT_NONE` guard pages and from M7 for `ld-musl` `PT_GNU_RELRO`), and
+  adjacent same-attribute merging. Every range validates `start >= USER_MIN`,
+  `end <= USER_MAX`, page alignment, and no overflow.
+- **Demand paging, `#PF` interrupt protocol and `PROT_NONE` (M6):**
+  `mmap(MAP_ANONYMOUS)` and `brk` growth record VMAs without eagerly allocating
+  physical frames. Because `idt.rs` installs all 256 IDT entries as 64-bit
+  interrupt gates (`IF = 0` on entry) while `AddressSpace` uses a sleeping
+  lock (which blocks via `WaitQueue::block`, requiring `IF = 1`), user
+  (`cs & 3 != 0`) and `.lumen_fixup` `#PF`s follow an explicit 4-step
+  interrupt protocol:
+  1. Read `CR2` into a local while `IF = 0`; panic immediately if `RSVD`
+     (error code bit 3) is set.
+  2. Assert `frame.rflags & IF != 0` and `irq::depth() == 0` (guaranteed for
+     ring-3 `#PF` and by `copy_from_user`'s lock-ordering precondition), then
+     re-enable interrupts via `irq::restore(true)` (respecting
+     `irq::disabled_for_good()`).
+  3. Acquire `AddressSpace`'s sleeping lock, resolve demand paging / CoW /
+     M7 file I/O / M8 shootdown, and release the lock. If the faulting address
+     lies in a permitted VMA (not `PROT_NONE`) and the access matches its
+     rights, allocate one zeroed frame and map it with `USER` + the VMA's
+     `W`/`NX` flags.
+  4. Call `irq::disable()` (`IF = 0`, `depth == 0`) **before** returning to
+     `lumen_isr_common` (keeping `swapgs; iretq` atomic with respect to IRQs)
+     or calling `sched::exit()` on a fatal fault.
+
+  `PROT_NONE` VMAs reserve VA space without demand-paging on fault;
+  `mprotect(..., PROT_NONE)` on already-populated pages preserves their
+  physical frames (clearing `PTE_PRESENT` and setting a software `PTE_PROTNONE`
+  bit while retaining the frame address so a later `mprotect` back to
+  `PROT_READ` preserves data and teardown still frees the frame). If no frame
+  is available or the access violates VMA rights (or hits an unmapped address),
+  the process is terminated (M6) or sent `SIGSEGV`/`SIGBUS` (M8). Note on W^X:
+  ELF `PT_LOAD` segments enforce W^X at load; `mmap`/`mprotect` support
+  switching pages between `RW-` and `R-X` and permit explicit
+  `PROT_READ | PROT_WRITE | PROT_EXEC` when a Linux binary requests it (needed
+  by Python `ctypes`/`libffi`, Ruby, and JITs).
+- **Teardown:** When a process's last thread exits (`exit_group`, running with
+  interrupts ON), it switches `CR3` back to `kernel_root()`, closes its FD
+  table, and tears down all VMAs and user mappings (walking L4 entries 0–255,
+  freeing leaf frames including `PTE_PROTNONE` frames—decrementing refcounts
+  from M8 onward—and user L1/L2/L3 tables) while sleeping VFS locks are
+  permitted. `AddressSpace::drop` (which may run inside `sched::finish_switch`
+  with interrupts off once no CPU holds its `CR3`) then frees at most the bare
+  L4 root frame without taking any sleeping lock. Kernel upper-half tables
+  (256–511) are untouched.
+- **Cross-CPU TLB shootdowns (M8; M6–M7 single-CPU invariant):** In M6 and M7,
+  every user process is single-threaded and pinned to its home CPU (as all
+  threads are today in `sched.rs`), so local `invlpg` is exact and no other CPU
+  can hold a stale entry for its `CR3`. In **M8**, as soon as `clone(CLONE_VM)`
+  (shared address spaces), CoW `fork`, and SMP thread migration land, every
+  `munmap`, `mprotect`, or CoW write-protect on an `AddressSpace` active on
+  other CPUs issues a synchronous **`TLB_SHOOTDOWN` IPI** (vector `0x3e`,
+  section 6) and waits for every targeted online CPU to acknowledge after
+  flushing the range (or reloading `CR3` past a page-count threshold) before
+  returning or freeing any unmapped frame. **Locking rule (deadlock
+  prevention):** because `SpinLock` disables interrupts before spinning,
+  `tlb_shootdown` must **never** be waited on while holding an IRQ-off
+  `SpinLock` (`debug_assert!(irq::enabled() && irq::depth() == 0)` on entry;
+  shootdown requests are serialized under an interrupt-enabled lock or
+  per-CPU slots that service incoming shootdowns while waiting), and unmapped
+  frames are freed only after all ACKs complete. This closes both the
+  cross-CPU stale-TLB hole and the IRQ-off AB-BA IPI deadlock at the exact
+  milestone that introduces shared multi-CPU address spaces.
 
 ### Kernel stacks (built in M1)
 
@@ -747,7 +856,8 @@ reserves room in its queues so the timer never allocates.
   calls `lumen_exception_dispatch`.
 - **Vector map** (`arch/x86_64/idt.rs`): 0-31 CPU exceptions; 0x20-0x2f the
   8259 PICs, remapped there and masked (only a spurious IRQ 7 or 15 should
-  arrive); 0x30-0x3e unused (ktests raise 0x30 and 0x31); 0x3f the `WAKEUP` IPI
+  arrive); 0x30-0x3d unused (ktests raise 0x30 and 0x31); 0x3e reserved for
+  the `TLB_SHOOTDOWN` IPI (M8); 0x3f the `WAKEUP` IPI
   (section 4, "Other CPUs"); 0x40 the local APIC
   timer; 0x50 + n global system interrupt n (GSIs 0-63, up to 0x8f),
   once a driver routes it (`interrupts::route_isa_irq`; every other I/O
@@ -929,7 +1039,178 @@ reserves room in its queues so the timer never allocates.
 - A fault during the report prints one line and halts, with no recursion. With
   `lumen.qemu_exit` the kernel exits QEMU with status 37; otherwise it halts.
 - Planned: "Explain this crash with Claude" in the GUI, which sends the same
-  report text with the user's consent (M8).
+  report text with the user's consent (M11).
+
+### Ring 3 entry, `syscall`/`sysretq`, user CPU state and safe copies (designed in #230, built in M6)
+
+M6 brings native ring-3 user threads into the existing x86-64 HAL without
+weakening crash reporting or `make audit`.
+
+- **GDT, TSS, `PerCpu` and context switch order:** `arch/x86_64/gdt.rs`
+  already places user segments in the exact order `sysretq` requires: `0x08`
+  `KERNEL_CODE`, `0x10` `KERNEL_DATA`, `0x18 | 3` `USER_DATA`, `0x20 | 3`
+  `USER_CODE`, `0x28` `TSS`. `PerCpu` (`arch/x86_64/percpu.rs`, pointed to by
+  `IA32_GS_BASE` in ring 0) moves from `.rodata` into `.data`/`.bss` (via
+  `AtomicU64`/`UnsafeCell`) and gains `kernel_rsp: u64` (top of the current
+  thread's kernel stack) and `user_rsp_scratch: u64` (scratch slot for the
+  `syscall` entry prologue). Because a freshly spawned thread returns from
+  `arch::context::switch` into `thread_entry` rather than back into
+  `schedule()`, all per-thread hardware state transitions happen **before**
+  `arch::context::switch` (with interrupts off):
+  1. If `prev` is a user thread, call `lumen_fpu_save(prev.fpu)`.
+  2. Switch `CR3`: load `next`'s `AddressSpace` root for a user thread, or
+     switch back to `kernel_root()` when switching to a kernel/idle thread (so
+     a dying process's L4 frame is never freed while still active in `CR3`).
+  3. If `next` is a user thread, write its kernel stack top to `TSS.rsp0` and
+     `PerCpu.kernel_rsp`, write `next.fs_base` to `IA32_FS_BASE`, and call
+     `lumen_fpu_restore(next.fpu)`.
+- **MSRs and `syscall`/`sysretq`:** On the boot CPU (and on each AP in
+  `ap_main`, once on kernel tables and guarded stack), the kernel enables
+  `IA32_EFER.SCE` (bit 0, keeping `NXE` bit 11), keeps `CR4.FSGSBASE = 0`, and
+  sets:
+  - `IA32_STAR = (0x0010u64 << 48) | (0x0008u64 << 32)`: `syscall` loads
+    `CS = 0x08` (`KERNEL_CODE`) and `SS = 0x10` (`KERNEL_DATA`); 64-bit
+    `sysretq` loads `SS = (0x10 + 8) | 3 = 0x18 | 3` (`USER_DATA`) and
+    `CS = (0x10 + 16) | 3 = 0x20 | 3` (`USER_CODE`).
+  - `IA32_LSTAR = lumen_syscall_entry`.
+  - `IA32_FMASK = 0x0005_7700` (`TF | IF | DF | IOPL | NT | RF | AC`): clears
+    interrupts, direction flag, single-step trap, IOPL, nested task, resume
+    flag, and SMAP `AC` atomically on entry.
+  - `IA32_KERNEL_GS_BASE = 0` initially (holds user GS base while in ring 0;
+    holds `&CPUS[index]` while in ring 3).
+- **Syscall entry, RFLAGS sanitization and canonical RIP safety:** Because
+  `syscall` does not switch `rsp`, `lumen_syscall_entry` executes with
+  interrupts off: `swapgs`, saves user `rsp` to `gs:[user_rsp_scratch]`, loads
+  `gs:[kernel_rsp]`, builds a full register frame on the kernel stack (saving
+  `rcx` = user RIP, `r11` = user RFLAGS, `user_rsp_scratch`, and all GPRs),
+  zeros `rbp` (`xor ebp, ebp`) so kernel backtraces terminate cleanly at the
+  syscall boundary, re-enables interrupts via `irq::restore(true)` (respecting
+  `irq::disabled_for_good()`), and calls the Rust syscall dispatcher. Before
+  returning to ring 3, interrupts are disabled and the return frame is
+  validated on **both** return paths (`sysretq` and `iretq`):
+  - **RFLAGS sanitization:** `(rflags & 0x0024_0CD5) | 0x0202` — retains only
+    user-safe flags (`CF | PF | AF | ZF | SF | DF | OF | AC | ID`), forces
+    `IF = 1` and reserved bit 1 = 1, and unconditionally clears `TF`, `IOPL`,
+    `NT`, `RF`, `VM`, `VIF`, `VIP`, and all other reserved bits so neither
+    `sysretq` nor `iretq` (including `rt_sigreturn` in M8) can leak ring-3
+    port-I/O privileges or raise ring-0 `#GP`.
+  - **Canonical RIP validation:** both `sysretq` and `iretq` raise `#GP(0)` in
+    ring 0 (with user `GS_BASE` already loaded after `swapgs`) if the return
+    RIP is non-canonical. The kernel therefore checks `rip < USER_MAX`
+    **before** `swapgs` or returning: if non-canonical, it never attempts
+    `sysretq` or `iretq` and instead terminates the process (M6) or delivers
+    `SIGSEGV` (M8). For a valid canonical `rip < USER_MAX`, ordinary syscalls
+    return via `swapgs; sysretq` and rewritten register frames (`execve`,
+    `fork` child, `rt_sigreturn`) return via `swapgs; iretq` (with
+    `USER_CODE`/`USER_DATA`).
+- **Conditional `SWAPGS` and IST protection (incl. `#DB` / CVE-2018-8897):**
+  `lumen_isr_common` inspects the saved `CS` on the stack (`cs & 3 != 0`): if
+  the interrupt or exception came from ring 3, it executes `swapgs` on entry
+  and `swapgs` before `iretq`. For IST vectors—`#DF`, `NMI`, `#MC`, plus
+  **`#DB` (vector 1, `IST_DEBUG = 4`, guarded IST stack registered as
+  `StackKind::Debug` in `lumen-mm::stacks` as each CPU's 5th permanent stack;
+  `MAX_STACKS` is raised in M8 for multithreaded workloads)** so a ring-3
+  `MOV SS`/`POP SS` + `SYSCALL` with `TF = 1` (CVE-2018-8897) cannot deliver
+  `#DB` onto untrusted user `RSP` at `LSTAR`—an exception can arrive in the
+  `syscall` entry or exit `swapgs` window with `CS == KERNEL_CODE`. Those IST
+  stubs therefore save `rax`/`rcx`/`rdx` first, clear `RFLAGS.AC` if
+  `SMAP_ENABLED`, read `rdmsr(IA32_GS_BASE)`, and execute `swapgs` only if it
+  is below the kernel half (`< 0xffff_8000_0000_0000`), recording a stack flag
+  to undo `swapgs` on exit. Keeping `CR4.FSGSBASE = 0` and enforcing
+  `addr < USER_MAX` on any future `ARCH_SET_GS` guarantees user `GS_BASE` can
+  never lie in the kernel half.
+- **User exceptions do not crash the kernel:** When `lumen_exception_dispatch`
+  handles **any** exception with `cs & 3 != 0` (including `#PF`, `#UD`, `#GP`,
+  `#DE`, `#SS`, `#AC`, `#MF`, `#XM`, `#DB`, `#BP`—guarding the kernel ktest
+  `#BP` resume branch with `cs & 3 == 0`):
+  - `#PF` runs the 4-step interrupt protocol and user VM demand-paging / CoW
+    handler (section 5); if the fault is invalid, the process exits with a
+    fatal fault status (M6) or receives `SIGSEGV` with `si_addr = CR2` (M8),
+    logged once at `WARN` with pid, vector, `rip` and `cr2`—never
+    `crash::exception`.
+  - Every other ring-3 exception likewise terminates only the offending user
+    process (M6) or delivers the corresponding POSIX signal (M8).
+  - **Deferred `#DB` at `LSTAR` (CVE-2018-8897 handoff):** never delivers
+    `SIGTRAP` or calls `sched::exit()` directly on the shared per-CPU
+    `IST_DEBUG` stack (where `IF = 0` and `did_swapgs = 1`). Instead, it clears
+    `TF` in the saved `RFLAGS` (and clears `DR6`), sets a per-thread
+    pending-debug-trap flag, and returns via `iretq` (undoing `swapgs`) back to
+    `LSTAR`; `lumen_syscall_entry` then switches immediately onto the thread's
+    normal kernel stack, where the syscall dispatcher checks the flag before
+    executing the syscall and terminates the process (M6) or delivers `SIGTRAP`
+    (M8). Any other exception from ring 0 outside the `.lumen_fixup` table
+    remains fatal and goes to `crash::exception` as before.
+- **User FP/SSE/AVX state (`FXSAVE64` baseline + optional `XSAVE64`/`XRSTOR64`) and `audit.py`:**
+  - Every x86-64 CPU guarantees SSE2 and `FXSAVE64`/`FXRSTOR64`, whereas the
+    `XSAVE` CPUID feature and AVX depend on CPUID (and QEMU's default
+    `-cpu qemu64` in `lumen_harness/qemu.py` does not expose `XSAVE`/AVX). On
+    the boot CPU and each AP (`ap_main`), the kernel clears `CR0.EM` and
+    `CR0.TS`, sets `CR0.MP`, **`CR0.NE`** (bit 5, so unmasked ring-3 x87 errors
+    raise `#MF` vector 16 rather than legacy IRQ 13), `CR4.OSFXSR` and
+    `CR4.OSXMMEXCPT`. Only when CPUID leaf 1 ECX bit 26 (`XSAVE`) is set does
+    it enable `CR4.OSXSAVE`, write `XCR0 = 0x3 | (cpuid(0xD, 0).eax & 0x4)`
+    (enabling AVX bit 2 only if hardware actually supports it—avoiding `#GP(0)`
+    on XSAVE-without-AVX CPUs), and then query `CPUID(0xD, 0).ebx` for the
+    active save-area size.
+  - Each user thread owns an aligned FPU save buffer: a 512-byte,
+    16-byte-aligned `FxSaveArea` (initialized with `FCW = 0x037F`,
+    `MXCSR = 0x1F80`) on baseline CPUs, or a 64-byte-aligned CPUID-sized
+    `XSaveArea` when `XSAVE64`/`XRSTOR64` is active (reset to clean initial
+    state on `execve`; in M8, `rt_sigreturn` masks `MXCSR` against `MXCSR_MASK`
+    and validates `XSTATE_BV`/`XCOMP_BV` before restoring to prevent ring-0
+    `#GP`). Pure kernel threads carry no FPU buffer. Because kernel code uses
+    no SIMD/x87, user FPU state is saved/restored only on thread context
+    switches and signal delivery/return (M8), not on every syscall.
+  - **`make audit` exemption (hard rule 3):** `lumen_fpu_save` and
+    `lumen_fpu_restore` must be defined via `global_asm!` or
+    `#[unsafe(naked)] #[unsafe(no_mangle)]` so both lower to `module asm` with
+    **no LLVM IR `define`** (`audit.py`'s `check_ir` stays 100% strict with no
+    IR allowlist, LLVM cannot inline them into `sched`, and un-demangled
+    `llvm-objdump -d` sees their exact symbol names). `audit.py` exempts
+    **only** `fxsave64`/`xsave64` inside `lumen_fpu_save` and
+    `fxrstor64`/`xrstor64` inside `lumen_fpu_restore`, keeping `%xmm`/`%ymm`/
+    `%zmm`/`%mm`/`%k` registers banned everywhere (including inside those two
+    symbols). `tests/harness/test_audit.py` pins a negative test proving that
+    `fxsave64`, `xsave64`, or any `%xmm` instruction in any other symbol still
+    fails `audit:flags`.
+- **Thread-Local Storage (`IA32_FS_BASE`):** Each user thread stores a
+  `fs_base: u64` field (default 0), updated by `arch_prctl(ARCH_SET_FS, addr)`
+  (validating `addr < USER_MAX`, allowing `0`) and written to `IA32_FS_BASE`
+  (`0xC000_0100`) on context switch.
+- **Fault-safe user memory copies (`copy_from_user` / `copy_to_user`):**
+  Every kernel read/write of user memory goes through `user::copy_from_user` /
+  `copy_to_user` / `copy_cstr_from_user`:
+  1. **Lock-ordering precondition:** must never be called with any `SpinLock`
+     held or interrupts off (`debug_assert!(irq::enabled() && irq::depth() == 0)`),
+     so a demand-paging `#PF` inside a copy can never re-lock a held `SpinLock`
+     or invert `heap -> paging -> frame`.
+  2. **Bounds check:** returns `Ok(())` immediately if `len == 0` (POSIX allows
+     zero-length `read`/`write` with a null pointer); otherwise validates
+     `start >= USER_MIN` and
+     `start.checked_add(len).is_some_and(|end| end <= USER_MAX)` before
+     touching memory (explicitly rejecting `u64` overflow and kernel pointers
+     with `-EFAULT`).
+  3. **Fixup table:** executes a small assembly copy routine whose faulting
+     load/store instruction addresses are registered in a read-only
+     `.lumen_fixup` linker section (`"a"` flags, `ALIGN(8)` +
+     `KEEP(*(.lumen_fixup))` inside `:rodata` in `kernel/linker.ld` so
+     `make audit` verifies it is read-only and inside
+     `[__kernel_start, __kernel_end)`).
+  4. **Fault resolution:** if `#PF` fires in ring 0 with `frame.rip` matching a
+     `.lumen_fixup` entry and `CR2` in `USER_MIN..USER_MAX` (with `RSVD == 0`),
+     the handler first runs user demand paging / CoW for `CR2`; if the address
+     is unmapped or lacks the required permission, it sets
+     `frame.rip = fixup_rip` (and clears `RFLAGS.AC` in `frame.rflags` if SMAP
+     is active) and resumes, returning `Err(EFAULT)` instead of panicking.
+  5. **Optional SMEP/SMAP:** if `cpuid(0).eax >= 7`, boot/AP setup checks
+     CPUID 7.0 EBX bit 7 (`SMEP`) and bit 20 (`SMAP`) and enables them in
+     `CR4`. Because `stac`/`clac` raise `#UD` on CPUs without SMAP (including
+     QEMU's default `-cpu qemu64`) and hardware interrupt gates do not clear
+     `RFLAGS.AC`, SMAP code paths are runtime-gated on `SMAP_ENABLED`: the copy
+     routine brackets accesses with `stac`/`clac` only when `SMAP_ENABLED`,
+     `lumen_isr_common` clears `AC` on entry when `SMAP_ENABLED` (preventing
+     `AC = 1` from leaking into `#PF`/IRQs or across `context::switch`), and
+     the fixup path clears `AC` in `frame.rflags`.
 
 ### Kernel threads (built in M2)
 
@@ -948,8 +1229,9 @@ on another; both return a `JoinHandle`, whose `join` blocks until the
 thread has finished and its CPU's `finish_switch` is done with it (its
 stack and joiners' list freed, its reference dropped), so nothing that CPU
 frees for it lands after `join` returns (#183; its record goes when a later
-spawn prunes it). A thread **never moves between CPUs**: each CPU has its
-own run queue (a FIFO) and only that CPU takes
+spawn prunes it). In M2–M7, a thread **never moves between CPUs** (M8 lifts
+this with cross-CPU work-stealing and `TLB_SHOOTDOWN` IPIs, section 5): each
+CPU has its own run queue (a FIFO) and only that CPU takes
 threads off it, so once its spawner has laid out its first frame, a
 thread's saved registers are touched only by its home CPU with interrupts
 off. A wake from another CPU queues the thread there and sends the
@@ -958,8 +1240,10 @@ IPI is tested; how soon the thread runs isn't, a loaded host decides it).
 
 - **Switching** (`arch::context::switch`, naked asm): pushes the
   callee-saved registers (rbx, rbp, r12-r15), saves `rsp`, loads the next
-  thread's and pops its registers. There is no SSE/AVX state (`make audit`
-  proves none is used; x87 isn't checked). It happens only with interrupts
+  thread's and pops its registers. Kernel threads carry no SSE/AVX state
+  (`make audit` proves kernel code uses none; M6 user threads save/restore
+  FP/SSE state around `switch` via the two allowlisted assembly stubs above).
+  It happens only with interrupts
   off and no critical section open (asserted): a held `SpinLock`'s section
   belongs to the CPU, so one held across a switch would be closed by
   another thread. Whether interrupts were on is a local on the switching
@@ -1663,7 +1947,8 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`; `trace runq` and
   and they end it; headers and notes, such as `dmesg`'s first line and
   `trace`'s note on the ring's size, are data like the rest), the I/O
   APIC's inputs as
-  records, redirection, variables, and a shell in user mode (M9).
+  records, redirection, variables, and running Linux shells (`busybox ash`,
+  `bash`) in ring 3 (M6–M8; over PTYs in desktop terminal windows in M11).
   Scripts: see below.
 
 ### Scripting (built in M2)
@@ -1680,7 +1965,7 @@ section 2).
   `rhai -e <expr>` evaluates its words joined by spaces; `rhai demo` lists
   the built-in scripts (`kernel/src/script/*.rhai`: `rainbow`, `fib`,
   `count`; make rebuilds the kernel when one changes) and `rhai demo
-  <name>` runs one, until M6 brings files. A value other than `()` is
+  <name>` runs one, until M7 brings files. A value other than `()` is
   printed (at most 64 KiB of text, else an error saying so); an error is
   one line, `rhai: ...` (the innermost error, a limit in its own words, and
   `in function 'f'` naming the innermost function it happened in; a thrown
@@ -1779,8 +2064,8 @@ section 2).
 - **Not tested:** the REPL on the screen shell or with `lumen.ansi`, and
   its Tab completion and history; `sleep`'s 60 s clamp; the heap budget's
   overshoot; running out of memory or stack window for the script thread.
-- **Not yet:** scripts from files (M6), floats, capturing closures,
-  scripts in user mode (M9), a script running in the background.
+- **Not yet:** scripts from files (M7), floats, capturing closures,
+  a script running in the background.
 
 ## 7. Driver interface (M3: PCI discovery, claiming, the virtio adapter, MSI-X, virtio-rng, the tablet and sound built; device classes later)
 
@@ -2098,9 +2383,8 @@ impl DeviceResources {
   reach its MSI-X table through `bar(i)`, and is expected not to.
 - **Ownership, not confinement.** A driver only reaches its own registers
   and config space, but DMA isn't scoped per device in M3: without an
-  IOMMU a device can write any physical memory. If a driver moves out of
-  the kernel, these resources become a `Device` capability's contents
-  (section 8); confining DMA then also needs an IOMMU.
+  IOMMU a device can write any physical memory. Moving a driver out of the
+  kernel later would require explicit MMIO/IRQ/DMA isolation and an IOMMU.
 
 ### virtio: the adapter for `virtio-drivers` (built, #95)
 
@@ -2229,7 +2513,7 @@ doesn't re-export them. Lumen supplies the transport and the `Hal`.
     frame.
   - The cost: an allocation and a copy per buffer, fine for rng, input and
     sound; a fast path (no bounce for a buffer within one page or in the
-    HHDM) can come with networking (M7) if profiling asks for it; rng's
+    HHDM) can come with networking (M9) if profiling asks for it; rng's
     early return after a wait that gave up relies on the bounce (the
     device never has the caller's buffer), so such a fast path must reset
     the device first. Each
@@ -2528,7 +2812,7 @@ is tested by taking the device).
 
 ### Device classes (later)
 
-`BlockDevice` (M6), `NetDevice` (send/receive frames, M7), `InputDevice`
+`BlockDevice` (M7), `NetDevice` (send/receive frames, M9), `InputDevice`
 (event stream: the keyboard and the tablet), `Display` (framebuffer +
 flush rectangles), `Console`: traits whose methods are the messages above,
 added when a class has a second implementation and a consumer that needs
@@ -2807,81 +3091,165 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
   `crate::vt`; no `Reader` follows the rings (they fill and wrap): only the
   shell's `mouse events` and `kbd events` look at the newest.
 
-**virtio first** (rng, input, sound in M3; blk, 9p in M6; net in M7) under
+**virtio first** (rng, input, sound in M3; blk in M7; net in M9) under
 QEMU; real-hardware drivers (NVMe, AHCI, xHCI HID, a common NIC) in M12
 behind the same traits.
 
-## 8. Processes, syscalls and capabilities (apps M5: designed in #195; processes and syscalls planned, M9)
+## 8. Processes, syscalls and capabilities (WASM apps M5: built, #195; Linux x86-64 ABI M6–M10: designed in #230; capability namespaces M11)
 
-Until M9, apps are WASM modules running in the kernel (M5), and the
-capabilities below are enforced at the WASM host interface: an app holds
-only the handles the kernel passes it ("Apps: WASM modules in the
-kernel", the end of this section). M9 adds ring 3 and the syscall ABI
-below for native programs.
+Lumen runs two kinds of user code:
 
-### Capabilities
+1. **Sandboxed WASM apps (M5, built):** run by `wasmi` on kernel threads with
+   explicit capability handles (`Log`, `Time`, `Desktop`, `Window`, `Trace`),
+   described in "Apps: WASM modules in the kernel" below.
+2. **Native ring-3 Linux x86-64 processes (M6–M10, designed in #230):**
+   unmodified Linux `x86_64` ELF binaries (targeting Alpine Linux `musl`)
+   entering through the standard Linux `syscall` ABI. Starting in M11, each
+   Linux process/sandbox can be confined by capability-scoped VFS mount
+   namespaces and network allowlists, preserving Principle 2 (no ambient
+   authority for agents) without requiring custom `libc` or runtime forks.
 
-A **capability** is an unforgeable reference to a kernel object plus a set of
-rights. Processes refer to them by **handle** (an opaque `u32` naming a
-slot in the process's handle table, never reused, as M5's apps' handles
-are), like file descriptors but for everything.
+### Linux x86-64 syscall ABI (M6–M10, designed in #230)
 
-| Kind | Object | Example rights |
+- **Register convention:** identical to Linux x86-64. Syscall number in `rax`;
+  up to 6 arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9` (`r10` replaces
+  `rcx`, which `syscall` overwrites with user RIP). Return value in `rax`:
+  `0..=usize::MAX - 4096` on success, or negated Linux `errno` (`-4095..=-1`)
+  on error. **Every GPR except `rax`, `rcx`, and `r11`** (including `rdi`,
+  `rsi`, `rdx`, `r8`, `r9`, `r10`, `rbx`, `rbp`, `r12`–`r15`, and user `rsp`)
+  is preserved across `syscall`, matching `musl`'s `syscall_arch.h`.
+- **ABI types:** sourced from a pinned `no_std` crate (`linux-raw-sys` or
+  `syscalls`, adopted in its own PR) so syscall numbers, `errno` constants,
+  `utsname`, `timespec`, `iovec`, `stat`, `termios`, and `sigaction` layouts
+  match Linux x86-64 verbatim.
+- **Unknown syscalls:** return `-ENOSYS` (`-38`) and log once per syscall
+  number per boot at `debug` level (never panic or kill the process).
+
+#### M6 initial syscall table (30 syscalls: static `musl` & `busybox ash` built-ins)
+
+| # | Syscall | M6 behaviour |
 |---|---|---|
-| `Dir` | a directory subtree (cannot name `..` above its root) | read, write, create, delete, snapshot |
-| `File` | an open file | read, write, map, exec |
-| `Channel` | one end of an IPC channel | send, recv, transfer |
-| `Net` | network endpoint filter (`host:port` pattern, protocol) | connect, listen |
-| `AppActions` | a set of automation actions in one app (section 11) | invoke, observe |
-| `Memory` | a memory object | map, write |
-| `Process` / `Thread` | a child | kill, inspect, debug |
-| `Snapshot` | a filesystem snapshot | browse, restore |
-| `Trace` | the trace rings (X-ray) | read (none in M5: the handle is the read) |
-| `Log`, `Time`, `Desktop`, `Window` | M5's app kinds ("Apps", below) | none in M5 |
-| `Device` | device resources (for drivers in user space; section 7's `DeviceResources`) | mmio, irq, dma (DMA confined to the device's buffers only with an IOMMU) |
+| 0 | `read(fd, buf, count)` | fd 0 reads from the console/serial input queue (blocking until bytes arrive or EOF); other fds `-EBADF` |
+| 1 | `write(fd, buf, count)` | fd 1/2 write to the console/serial output via `copy_from_user`; other fds `-EBADF` |
+| 3 | `close(fd)` | closes an open entry in the process's FD table; `-EBADF` if absent |
+| 5 | `fstat(fd, statbuf)` | minimal character-device `stat` for fd 0/1/2 (so `musl` stdio and `busybox ash` detect a terminal); `-EBADF` otherwise |
+| 9 | `mmap(addr, len, prot, flags, fd, off)` | `MAP_ANONYMOUS` with `MAP_PRIVATE` or `MAP_SHARED` (rejecting `MAP_ANONYMOUS` without either, and rejecting `len == 0`, with `-EINVAL`; ignoring `fd` and `off`); supports `MAP_FIXED`, `MAP_FIXED_NOREPLACE` (`-EEXIST`), and `PROT_NONE` guard VMAs; demand-paged via `lumen-vm` (section 5); file-backed `mmap` arrives in M7 |
+| 10 | `mprotect(addr, len, prot)` | updates VMA rights (splitting sub-VMAs when needed) and mapped PTEs (preserving `PROT_NONE` frames, section 5); returns `0` on `len == 0` (page-aligned `addr`), `-ENOMEM` on any unmapped hole; local `invlpg` in M6–M7, cross-CPU shootdown in M8 |
+| 11 | `munmap(addr, len)` | unmaps pages, frees frames, splits/removes VMAs; ignores unmapped holes, returns `-EINVAL` on `len == 0` or misaligned `addr` |
+| 12 | `brk(addr)` | tracks a byte-granular heap cursor (backing VMAs page-aligned); returns current `brk` on `addr == 0`, exact requested `addr` on success, and unchanged current `brk` on any failure (`addr < initial_brk`, VMA overlap, OOM)—never `-ENOMEM` |
+| 13 | `rt_sigaction(sig, act, oldact, sigsetsize)` | requires `sigsetsize == 8` (`-EINVAL` otherwise); rejects non-null `act` for `SIGKILL`/`SIGSTOP` (`-EINVAL`); stores a per-process 64-entry `sigaction` table so `oldact` preserves prior handlers/`SIG_IGN`; real signal dispatch arrives in M8 |
+| 14 | `rt_sigprocmask(how, set, oldset, sigsetsize)` | requires `sigsetsize == 8`; maintains per-thread signal mask (silently dropping `SIGKILL`/`SIGSTOP`); real delivery arrives in M8 |
+| 16 | `ioctl(fd, req, arg)` | returns `-EBADF` for unopened/closed fds; on fd 0/1/2: `TCGETS` (`0x5401`) fills a default `struct termios`, `TCSETS`/`TCSETSW`/`TCSETSF` (`0x5402`–`0x5404`) succeed as no-ops (0), and `TIOCGWINSZ` (`0x5413`) fills `struct winsize` with console rows/cols; all other requests `-ENOTTY` |
+| 19 | `readv(fd, iov, iovcnt)` | validates `0 <= iovcnt <= 1024`, copies `iovec` array via `copy_from_user`, skips zero-length spans without dereferencing `iov_base`, reads from fd 0 (needed by `musl` `__stdio_read` for buffered stdin) |
+| 20 | `writev(fd, iov, iovcnt)` | validates `0 <= iovcnt <= 1024`, copies `iovec` array via `copy_from_user`, skips zero-length spans without dereferencing `iov_base`, writes each span to fd 1/2 |
+| 39 | `getpid()` | returns process PID (`>= 1`) |
+| 60 | `exit(status)` | terminates the calling thread (and single-threaded M6 process), recording exit status |
+| 63 | `uname(buf)` | fills `utsname` (`sysname = "Linux"`, `release = "6.6.0-lumen"`, `machine = "x86_64"`) so `musl`/Alpine binaries accept the kernel |
+| 79 | `getcwd(buf, size)` | copies `"/"\0` and returns `2` (byte length including the NUL terminator), or `-ERANGE` if `size < 2` (real cwd from VFS in M7) |
+| 102 | `getuid()` | returns `0` in M6 |
+| 104 | `getgid()` | returns `0` in M6 |
+| 107 | `geteuid()` | returns `0` in M6 |
+| 108 | `getegid()` | returns `0` in M6 |
+| 110 | `getppid()` | returns parent PID (`0` for kernel-spawned root process) |
+| 111 | `getpgrp()` | returns process PID in M6 (real process groups in M8) |
+| 158 | `arch_prctl(code, addr)` | `ARCH_SET_FS` (`0x1002`, validates `addr < USER_MAX`, `0` allowed); `ARCH_GET_FS` (`0x1003`, writes `fs_base` to `*addr` via `copy_to_user` and returns `0`); other codes `-EINVAL` |
+| 186 | `gettid()` | returns thread TID |
+| 218 | `set_tid_address(tidptr)` | stores `clear_child_tid` pointer and returns current TID |
+| 228 | `clock_gettime(clockid, tp)` | `CLOCK_REALTIME` (0, from RTC/boot offset), `CLOCK_MONOTONIC` (1), `CLOCK_MONOTONIC_RAW` (4), `CLOCK_REALTIME_COARSE` (5), `CLOCK_MONOTONIC_COARSE` (6), `CLOCK_BOOTTIME` (7) |
+| 231 | `exit_group(status)` | terminates the process and frees its `AddressSpace` and FD table |
+| 302 | `prlimit64(pid, res, new, old)` | validates `pid == 0 \|\| pid == current_pid` (`-ESRCH` otherwise) and `res < RLIM_NLIMITS` (16, `-EINVAL` otherwise); M6 read-only defaults for `RLIMIT_STACK` (8 MiB), `RLIMIT_NOFILE` (1024), and `RLIM_INFINITY` for other valid resources when `old` is non-null; writable per-process limit enforcement arrives in M10 |
+| 318 | `getrandom(buf, len, flags)` | rejects unknown flag bits (`-EINVAL`), fills user buffer from `crate::rng` (section 7) via `copy_to_user`, and returns bytes written |
 
-Rules: rights can only be **narrowed** when deriving (`cap_derive`), a
-capability is **transferred** only through channels and only with the
-`transfer` right, and there is **no ambient authority**: `open` takes a
-`Dir` handle, `connect` takes a `Net` handle, and so on. A process starts with
-exactly the handles its parent passes in. Every capability operation by an
-agent process is appended to the audit log (section 13).
+Because `musl` on `x86_64` invokes legacy non-`*at` / non-`*2` syscalls
+directly (unlike `aarch64`), later milestones wire both the `*at` and legacy
+x86-64 entry points (trivial shims over `*at(AT_FDCWD, ...)`):
 
-### Syscall ABI (x86-64)
+- **M7 (POSIX VFS & dynamic linking):** `open` (2) (called by `ld-musl`
+  `dynlink.c`), `openat` (257), `stat` (4), `lstat` (6), `newfstatat` (262),
+  `statx` (332), `access` (21), `faccessat` (269), `lseek` (8), `pread64`
+  (17), `pwrite64` (18), `getdents64` (217), `fsync` (74), `fdatasync` (75),
+  `sync` (162), `truncate` (76), `ftruncate` (77), `rename` (82), `renameat`
+  (264), `renameat2` (316), `mkdir` (83), `mkdirat` (258), `rmdir` (84),
+  `link` (86), `linkat` (265), `unlink` (87), `unlinkat` (263), `symlink`
+  (88), `symlinkat` (266), `readlink` (89), `readlinkat` (267), `chmod` (90),
+  `fchmod` (91), `fchmodat` (268), `chown` (92), `fchown` (93), `lchown` (94),
+  `fchownat` (260), `umask` (95), `utimensat` (280),
+  `chdir` (80), `fchdir` (81), `fcntl` (72), `flock` (73), and file-backed
+  `mmap`.
+- **M8 (Processes, threads, signals, `futex`, PTYs):** `fork`/`vfork`/`clone`/
+  `execve`/`wait4`, `futex`, real signals (`rt_sigreturn`, `sigaltstack`,
+  `kill`/`tgkill`, `si_addr = CR2`), `pipe` (22) + `pipe2` (293),
+  `dup`/`dup2`/`dup3`, `poll`/`ppoll`/`select`, `nanosleep` (35) +
+  `clock_nanosleep` (230), `clock_getres`, `getrusage`, `prctl(PR_SET_NAME)`,
+  `statfs`/`fstatfs`, and PTYs (`setsid`, `setpgid`, `tcsetpgrp`, `termios`).
+- **M9 (Networking & async I/O):** BSD sockets including both `accept` (43)
+  and `accept4` (288), `AF_UNIX` (`socketpair`, `SCM_RIGHTS`), `epoll_*`,
+  `eventfd2`, and `timerfd_*`.
+- **M10 (JIT VM & Tier-1 runtimes):** `mremap`, `madvise` (`MADV_DONTNEED`,
+  `MADV_FREE`), `memfd_create`, `inotify_*`, writable `prlimit64`, `sysinfo`,
+  and full `SIGURG`/`SIGSEGV` `ucontext_t` delivery.
 
-- Entry: `syscall`. Number in `rax`; arguments in `rdi, rsi, rdx, r10, r8, r9`
-  (Linux-like register order, our own numbers).
-- Return: `rax` = result (≥ 0) or a negative `Error` code; `rdx` = second
-  value when needed.
-- Every syscall that touches an object takes a handle as its first argument and
-  checks rights before doing anything.
+### Static ELF64 loader and initial stack (designed in #230, M6; dynamic `PT_INTERP` in M7)
 
-| # | Call | Notes |
+- **Validation (`crates/lumen-elf`, host-tested, or `xmas-elf`/`goblin`):**
+  checks ELF64 little-endian `ET_EXEC` (or `ET_DYN` PIE), `EM_X86_64`, no
+  overlapping `PT_LOAD` byte ranges (`p_vaddr..p_vaddr + p_memsz`),
+  `p_filesz <= p_memsz`, every mapped range within `USER_MIN..USER_MAX`, and no
+  single `PT_LOAD` segment both writable and executable (W^X). Because real
+  Alpine ELFs often place adjacent `R--` and `RW-` segments (RELRO) on a shared
+  4 KiB boundary page, overlap is checked on byte ranges and a shared boundary
+  page receives the union of both segments' permissions without zeroing or
+  overwriting bytes already copied from the prior segment. Malformed binaries
+  are rejected before any process slot is created, leaving kernel heap and
+  frames unchanged.
+- **Loading (M6):** creates an `AddressSpace`, maps each `PT_LOAD` segment with
+  its `PF_R`/`PF_W`/`PF_X` rights, copies `p_filesz` bytes and zero-fills the
+  `p_memsz - p_filesz` `.bss` tail, records the initial `brk` page-aligned
+  above the highest segment, and maps the initial user stack VMA below
+  `USER_STACK_TOP`.
+- **Initial stack and register hygiene (`musl` System V ABI):** `%rsp` is
+  16-byte-aligned at `_start` (`argc` at `[rsp]`, inserting an 8-byte pad above
+  `auxv` whenever `1 + argc + 1 + envc + 1` is odd), and **every other GPR is
+  zeroed** (especially `%rdx = 0`, which SysV AMD64 `_start` treats as an
+  `atexit` function pointer). Stack contents top-down: `argv`/`envp` strings,
+  `execfn` string, 16 random bytes for `AT_RANDOM` (from `crate::rng`), the
+  auxiliary vector (`AT_PHDR` = mapped user VA `load_bias + PT_PHDR.p_vaddr` or
+  `load_bias + seg.p_vaddr + (e_phoff - seg.p_offset)` in the `PT_LOAD`
+  covering `e_phoff`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ = 4096`, `AT_ENTRY`,
+  `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`, `AT_SECURE = 0`, `AT_CLKTCK = 100`,
+  `AT_EXECFN`, `AT_RANDOM`, `AT_NULL`; `AT_BASE` is omitted or 0 for static
+  PIE), `envp` pointers + null, `argv` pointers + null, and `argc` at `[rsp]`.
+- **M6 scope for `busybox ash`:** M6 runs embedded/test static `musl` binaries
+  (including `busybox ash -s` exercising built-in commands such as `echo`,
+  `pwd`, `export`, arithmetic, loops, and `exit` over serial without job
+  control). Interactive `lineedit`, pipes, and external subprocesses require
+  `fork`/`pipe`/`dup2`/`wait4`/PTYs and arrive in M8.
+- **Dynamic linking (M7):** when `PT_INTERP` is present (e.g.
+  `/lib/ld-musl-x86_64.so.1`), the loader maps the interpreter at
+  `INTERP_BASE`, sets `AT_BASE` to the interpreter base and `AT_ENTRY` to the
+  main binary's entry, and enters the interpreter's entry point.
+
+### Capabilities and sandboxing (WASM M5; Linux namespaces M11)
+
+Lumen's Principle 2 (no ambient authority) holds in two layers:
+
+- **M5 WASM apps:** hold opaque `u32` capability handles (`Log`, `Time`,
+  `Desktop`, `Window`, `Trace`) checked on every host call ("Apps", below).
+- **M11 Linux sandboxes:** each sandboxed Linux process/agent receives a
+  **per-process VFS mount namespace** (only explicitly granted subtrees are
+  mounted into its `/`; `..` cannot escape a mount root) and a **network
+  policy filter** (allowed `host:port` patterns, or no network), plus optional
+  `AppActions` access to Lumen's GUI automation tree (section 11). Every
+  sandboxed agent action is appended to the tamper-evident audit log
+  (section 13) and paired with a filesystem snapshot (section 9).
+
+| Kind | Scope | Built / planned |
 |---|---|---|
-| 0 | `handle_close(h)` | |
-| 1 | `cap_derive(h, rights_mask) -> h2` | narrow only |
-| 2 | `cap_info(h, *out)` | kind and rights, for UIs and debugging |
-| 10 | `chan_create() -> (h_a, h_b)` | |
-| 11 | `chan_send(h, *msg, len, *handles, n)` | moves handles |
-| 12 | `chan_recv(h, *buf, len, *handles, n, timeout)` | |
-| 20 | `vm_map(h_mem, addr_hint, len, prot) -> addr` | |
-| 21 | `vm_unmap(addr, len)` | |
-| 30 | `proc_spawn(h_image, *handles, n) -> h_proc` | child gets only these |
-| 31 | `proc_exit(code)` / 32 `proc_wait(h_proc)` | |
-| 40 | `fs_open(h_dir, *path, len, flags) -> h_file` | path relative to the `Dir` |
-| 41 | `fs_read(h, *buf, len)` / 42 `fs_write` / 43 `fs_stat` | |
-| 44 | `fs_snapshot(h_dir, *label) -> h_snap` | section 9 |
-| 50 | `net_socket(h_net, kind) -> h_sock` | `Net` capability filters peers |
-| 60 | `trace_read(h_trace, *buf, len)` | X-ray |
-| 70 | `clock_now()` / 71 `sleep(ns)` | |
-| 99 | `debug_log(*str, len)` | to the kernel logger, tagged with the pid |
-
-M9's calls and error codes follow the M5 host interface ("Apps",
-below); until then rows 60, 70, 71 and 99 are placeholders. A call with
-more than six arguments passes a pointer to a structure, as M5's
-`text_draw` does. Numbers are reserved in ranges per subsystem so parallel work does not
-collide. A user runtime crate (`lumen-rt`) wraps these. A minimal libc is
-optional and comes later, only if ports need it.
+| `Log`, `Time`, `Desktop`, `Window`, `Trace` | M5 WASM app handles | built (M5) |
+| VFS mount namespace (`Dir` subtree grants) | Scoped directory mounts for Linux processes/agents (read-only or read-write) | planned (M11) |
+| Network policy (`Net` allowlist) | Per-process host/port/protocol filter over BSD sockets | planned (M11) |
+| `AppActions` | Named automation-tree actions in one GUI window | planned (M11) |
+| `Snapshot` | Read-only snapshot view or restore right over a sandbox root | planned (M11) |
 
 ### Apps: WASM modules in the kernel (M5: designed in #195, built by #196 to #208)
 
@@ -3078,8 +3446,8 @@ the app makes one section that breaks the grammar. The kernel reads it
 with `lumen_app_api::manifest::find(&[u8]) -> Result<Manifest,
 ManifestError>`, which walks the module's sections itself. No manifest,
 two sections, an unknown or repeated grant, or anything off the grammar
-is refused at load, naming why. M6 adds an `abi=` key for modules loaded
-from disk.
+is refused at load, naming why. Loading modules from disk (M7+) adds an `abi=`
+key.
 
 #### The host interface (import module `lumen`)
 
@@ -4063,7 +4431,7 @@ kernel (no SSE); #197 checks the results' bits.
   the answer. An app that then can't open its window ends with its own
   ERROR and end line (as every bundled app does, #206), not with the
   item's `Then::Failed`, which only a refused start gives.
-- **Loading from disk (M6)** will need more: import names in errors are
+- **Loading from disk (M7+)** will need more: import names in errors are
   sanitised already, but wasmi reserves vectors up front for the counts a
   module declares (`reserve_exact`), which `CODE_FACTOR` doesn't bound
   for an untrusted module.
@@ -4087,71 +4455,69 @@ kernel (no SSE); #197 checks the results' bits.
   and the bundled apps' names.
 - `kill <id>`.
 
-## 9. Storage: VFS, LumenFS and snapshots (planned: VFS and RAMFS M6, LumenFS M10)
+## 9. Storage: POSIX VFS, writable `ext4` and snapshots (VFS and `ext4` planned, M7; OverlayFS/CoW snapshots planned, M11)
 
-- **VFS:** mount table plus per-process `Dir` capabilities (there is no global
-  root namespace in a process; the shell receives a home `Dir`). The trait
-  includes snapshot hooks from day one:
+- **Block layer & unified page cache (M7):** `virtio-blk` behind
+  `BlockDevice` (section 7), feeding a unified block/page cache (`lumen-bcache`)
+  shared by regular file I/O and file-backed `mmap` (so `read`/`write` and
+  `MAP_SHARED` stay coherent without double buffering).
+- **Writable `ext4` rootfs (M7):** boots an unmodified Alpine Linux `x86_64`
+  (`musl`) `ext4` disk image through a pinned `no_std` driver (`ext4plus`,
+  `rust-fs-ext4`, or `lwext4` FFI; chosen in its own dependency PR). Persistence
+  is tested directly on `ext4`: write, sync, kill QEMU, reboot against the same
+  disk image, and verify.
+- **POSIX VFS & pseudo-filesystems (M7; adapted from `Starry`/`axfs_vfs`):**
+  - Mount table plus dentry and inode caches (`crates/lumen-vfs`, host-tested).
+  - Full POSIX metadata and operations (both `*at` and legacy x86-64 shims
+    called by `musl`, section 8): `open`/`openat`,
+    `read`/`write`/`pread64`/`pwrite64`, `lseek`, `getdents64`,
+    `stat`/`lstat`/`fstat`/`newfstatat`/`statx`, `access`/`faccessat`,
+    `fsync`/`fdatasync`/`sync`, symlinks (`symlink`/`symlinkat`/
+    `readlink`/`readlinkat` with `ELOOP`), hard links (`link`/`linkat`) and
+    unlink-while-open inode refcounting, atomic `rename`/`renameat2`,
+    `truncate`/`ftruncate`, `chmod`/`fchmod`/`chown`/`fchown`/`lchown`/
+    `umask`, `utimensat`, `fcntl`, and advisory file locks (`flock` and
+    `F_SETLK`—required by SQLite, Cargo, and Git).
+  - Pseudo-filesystems: `/tmp` (`tmpfs`), `/dev` (`null`, `zero`, `urandom`,
+    `random`, `tty`, plus `/dev/ptmx` and `/dev/pts/*` in M8), `/proc`
+    (`self/exe`, `self/fd`, `self/maps` in strict Linux `start-end rwxp offset
+    dev:dev ino path` format so `musl`'s `pthread_getattr_np` parses main-stack
+    bounds, `cpuinfo`, `meminfo`).
+- **Snapshots, namespaces & agent undo (M11):** per-process VFS mount
+  namespaces confine sandboxed processes and agents to explicitly granted
+  subtrees (`..` cannot escape a mount root). OverlayFS or block-level CoW
+  snapshots (or an optional LumenFS volume) back `snap`/`undo`, so an agent
+  session still takes an O(1) snapshot before each step and supports "Undo
+  step" and "Undo all" (Principle 3).
 
-```rust
-pub trait FileSystem: Send + Sync {
-    fn root(&self) -> NodeId;
-    fn lookup(&self, dir: NodeId, name: &str) -> Result<NodeId>;
-    fn read(&self, n: NodeId, off: u64, buf: &mut [u8]) -> Result<usize>;
-    fn write(&self, n: NodeId, off: u64, buf: &[u8]) -> Result<usize>;
-    fn create(&self, dir: NodeId, name: &str, kind: NodeKind) -> Result<NodeId>;
-    fn remove(&self, dir: NodeId, name: &str) -> Result<()>;
-    fn rename(&self, from: (NodeId, &str), to: (NodeId, &str)) -> Result<()>;
-    // Snapshot hooks (filesystems without CoW return Unsupported):
-    fn snapshot_create(&self, label: &str) -> Result<SnapshotId>;
-    fn snapshot_list(&self) -> Result<Vec<SnapshotInfo>>;
-    fn snapshot_open(&self, id: SnapshotId) -> Result<Box<dyn FileSystem>>; // read-only view
-    fn snapshot_restore(&self, id: SnapshotId) -> Result<()>;
-    fn sync(&self) -> Result<()>;
-}
-```
+## 10. IPC (pipes and PTYs planned, M8; `AF_UNIX` and `epoll` planned, M9)
 
-- **RAMFS** for early boot and tests; **LumenFS** as the main disk format.
-- **LumenFS (copy-on-write, journaled):** blocks are never overwritten in
-  place. A write produces new blocks up to a new root, which is committed
-  atomically by writing one of two alternating superblocks (with checksums and
-  a generation counter). A **snapshot is a retained old root**, so taking one is
-  O(1). Freed blocks are tracked with reference counts per snapshot. A small
-  intent journal covers metadata updates between commits. v1's SFS on-disk
-  layout (`~/src/build-your-own-os`) is a reference for directory entries and
-  inodes only.
-- **Agent undo:** the Claude service takes a snapshot when an agent session
-  starts and after each agent step. "Undo step" restores the previous step's
-  snapshot for that session's `Dir` subtree. "Undo all" restores the session's
-  start. The file manager browses snapshots read-only.
-- **Persistence test:** write, sync, kill QEMU, reboot against the same disk
-  image, and verify (M6 exit criterion with the RAMFS image, M10 with LumenFS).
+Instead of a separate custom IPC channel ABI, native ring-3 processes use
+standard Linux IPC primitives:
 
-## 10. IPC (planned, M9)
+- **Pipes & PTYs (M8):** `pipe2` (atomic `PIPE_BUF` writes, `O_CLOEXEC`,
+  `SIGPIPE`), `/dev/ptmx` + `/dev/pts/*` pseudo-terminals with `termios` line
+  discipline, `TIOCGWINSZ`/`SIGWINCH`, and process groups/sessions (`setsid`,
+  `setpgid`, `tcsetpgrp`).
+- **Unix domain sockets & event multiplexing (M9):** `AF_UNIX` (`SOCK_STREAM`,
+  `SOCK_DGRAM`, `socketpair`, and `SCM_RIGHTS` FD passing), plus
+  `epoll_create1`/`epoll_ctl`/`epoll_wait` (level- and edge-triggered),
+  `eventfd2`, and `timerfd_*`.
+- **Desktop & automation bridge (M11):** userspace agents and desktop apps
+  reach Lumen's automation tree (section 11) over a dedicated `AF_UNIX` socket
+  (or `/dev/lumen-ui` device) carrying the existing postcard wire protocol
+  (`lumen-app-api`), gated by the process's `AppActions` policy.
 
-- **Channels:** bidirectional message queues created in pairs. A message is up
-  to 64 KiB of bytes plus up to 16 handles (moved, not copied).
-- **Typed protocols:** every service defines its messages as Rust types in a
-  shared `no_std` crate (`lumen-proto-*`), encoded with a compact, versioned
-  binary format (postcard-style). The same types serve in-kernel and
-  user-space implementations.
-- **Service registry:** `init` holds a registry channel. Services register a
-  name and receive requests; clients ask the registry for a service and get a
-  channel only if their capability set allows it.
-- **Notifications:** a lightweight `event` object (signal and wait) for IRQs
-  delivered to user-space drivers and for UI wakeups.
+## 11. GUI and the automation API (built in M4: designed in #146, built by #147 to #157)
 
-## 11. GUI and the automation API (planned, M4: designed in #146, built by #147 to #157)
-
-Like the shell, the desktop runs in the kernel on kernel threads until M9
-(see [ROADMAP.md](ROADMAP.md#how-this-roadmap-is-ordered)): the
-compositor and every window's owner are kernel threads, and a window's
-"shared memory" is heap memory both reach. M9 moves the owners into
-processes (surfaces in shared pages, the protocol over IPC channels)
-without changing the shapes below. Each heading names the issue that
-builds it. The desktop's kernel code is `kernel/src/desktop.rs` (the
-compositor, windows, `windows`, `desktop`) and `kernel/src/ui.rs` (`ui
-tree`, `ui invoke`).
+The desktop compositor and built-in toolkit windows run in the kernel on kernel
+threads (`kernel/src/desktop.rs`, `kernel/src/ui.rs`), and M5 WASM apps render
+into windows through the `lumen` host interface. In M11, M4's terminal windows
+(`kernel/src/termwin.rs`) attach to real `/dev/ptmx` PTYs so Linux shells and
+tools (`bash`, `vim`, `cargo`, `node`) run directly inside Lumen windows; an
+optional Wayland bridge (`wl_shm`, then `virtio-gpu` 3D / Mesa) in M12 allows
+unmodified Linux GUI apps to render through the same compositor. Each heading
+below names the issue that built M4.
 
 ### Desktop mode (#153)
 
@@ -5009,8 +5375,8 @@ impl Role { pub fn actions(self) -> &'static [ActionKind]; }
 ```
 
 - **`lumen_ui::NodeId` is global** (always written qualified, the kernel's
-  `desktop.rs` included: the VFS's
-  `NodeId`, section 9, is another type). `NodeId::fresh()` is one counter
+  `desktop.rs` included, distinguishing it from VFS inode numbers in
+  section 9). `NodeId::fresh()` is one counter
   for the whole system and an id is never reused in a boot. Lookups go by
   the raw number (`NodeId::get()`): `ui invoke 12 press` looks up 12, and
   text never becomes a `NodeId`; an id kept after its window closed names
@@ -5192,14 +5558,14 @@ meaning none (`kbd events`' mods) is an absent value, unquoted.
 **The rule: agents act only through this tree.** The automation commands,
 and later the protocol, never inject synthetic mouse or keyboard input: an
 action is the widget's own handler, not a fabricated event. The serial
-commands are for tests and people. Agents (M8) use the protocol below and
-hold an `AppActions` capability (section 8; threat model, section 13).
+commands are for tests and people. Agents (M11) use the protocol below and
+hold an `AppActions` policy grant (section 8; threat model, section 13).
 Tests may still drive QEMU's real input devices over QMP (#149's
 confirming steps): that path is the user's, and the guest can't tell it
 from a person.
 
-**Later (M8, M9):** the same operations become a protocol on a channel
-per app: `get_tree(window)`, `invoke(node, action, args) -> Result`,
+**Later (M11):** the same operations are exposed over an `AF_UNIX` automation
+socket: `get_tree(window)`, `invoke(node, action, args) -> Result`,
 `subscribe(changes)`, and app-level semantic actions (`files.copy(src,
 dst)`, `editor.replace(range, text)`) an app may declare beside widget
 actions; the `AppActions` capability names the app and the allowed
@@ -5345,7 +5711,7 @@ close, and the demos in windows of their own. All of it is built with
 ### Screenshot (#150)
 
 `screenshot` on the serial shell sends the screen as a PNG over serial (to
-disk once there are files, M6). Capture and encoding are separate steps
+disk once there are files, M7). Capture and encoding are separate steps
 (`kernel/src/screenshot.rs`), so the desktop brings its own source.
 
 **Source.** In text mode the kernel reads the framebuffer once, row by
@@ -5413,23 +5779,27 @@ Cost, for example (one TCG run on the text console; the times vary): about
 encoding, 31 to 40 ms sending 47 to 63 KB of PNG. QEMU's UART doesn't pace
 output at the baud rate.
 
-## 12. The Claude service (planned, M8)
+## 12. The Claude service (planned, M11 — userspace)
 
-- **Keychain service:** holds the API key, which is entered at setup and stored
-  encrypted on disk. It is never in source, logs, crash reports or agent
-  memory. Only the keychain and the API client process can use it; the agent
-  runtime asks the client to make requests and never sees the key.
-- **API client:** HTTPS (TLS 1.3) to the Anthropic API, using current model IDs
-  (load the `claude-api` skill before writing it). It streams responses.
-- **Ask Claude bar:** a system-wide input available in every app.
-- **Agent runtime and lanes:** each agent session is a *lane* with its own
-  process, capability set, snapshot chain and audit-log stream. The panel shows
-  lanes running in parallel with live status, pause/resume, per-step undo, and
-  "Undo all".
-- **Capability prompts:** when an agent needs a capability it lacks, the user
-  sees a readable prompt ("Allow *Tidy Downloads* to move files inside
-  `~/Downloads` for this session?") and can grant it narrowed, time-limited and
-  revocable.
+Rather than implementing TLS and HTTP in ring 0 with soft-float crypto, the
+Claude service runs as a native ring-3 userspace service once the Alpine
+networking and runtime stack is up (M9–M10):
+
+- **Keychain service:** holds the API key encrypted on disk; never in source,
+  logs, crash reports, or agent memory. Only the keychain and API proxy process
+  can read it.
+- **API client:** native userspace HTTPS (TLS 1.3 via OpenSSL/rustls with the
+  system CA store) to the Anthropic Messages API, streaming responses.
+- **Ask Claude bar:** a system-wide input on the desktop (section 11) and `ask`
+  in the shell.
+- **Agent runtime and lanes:** each agent session runs inside its own
+  capability-scoped Linux sandbox (per-process VFS mount namespace + network
+  allowlist + OverlayFS/CoW snapshot chain + audit-log stream), with live
+  status, pause/resume, per-step undo, and "Undo all".
+- **Capability prompts:** when an agent needs a grant it lacks, the system
+  renders a readable prompt outside the agent's sandbox ("Allow *Tidy
+  Downloads* to move files inside `~/Downloads` for this session?") and can
+  grant it narrowed, time-limited, and revocable.
 
 ## 13. Threat model for agents
 
@@ -5451,9 +5821,11 @@ the integrity of the system and of the audit log, and the user's attention.
 kernel. The kernel is the trusted computing base.
 
 **Mitigations (design requirements):**
-- **Least privilege by construction:** an agent starts with *no* capabilities
-  except a channel to the agent runtime. Each grant is narrow (a subtree, one
-  host, one app's named actions), time-boxed to the session, and revocable.
+- **Least privilege by construction (M11):** an agent process starts in an
+  isolated VFS mount namespace and network policy with *no* grants except its
+  control socket to the agent runtime. Each grant is narrow (a mounted subtree,
+  one host allowlist entry, one app's named automation actions), time-boxed to
+  the session, and revocable.
 - **Human in the loop for new authority:** capability prompts are rendered by
   the system (not by the agent or the app), state the scope in plain words, and
   cannot be clicked by agents (agents have no input-injection path at all).
@@ -5491,8 +5863,9 @@ kernel. The kernel is the trusted computing base.
   APIC and MSI interrupts a handler takes go to the X-ray rings, below), log
   lines, thread switches (`switch from=<id> to=<id> (<state>)`, the
   previous thread's state; an idle boot CPU records about 20 a second,
-  the serial shell's 100 ms safety-net wakes: section 4, step 4). Later: syscalls, page faults, allocator
-  activity. Cost per event is printed by
+  the serial shell's 100 ms safety-net wakes: section 4, step 4). Later (M11):
+  Linux syscalls, `#PF`/CoW faults, `futex` waits, and cross-CPU thread
+  migrations in X-ray. Cost per event is printed by
   `ktest:lumen_kernel::trace::trace_overhead_is_small` (tens of TSC ticks
   under TCG locally; TCG's TSC rate depends on the host, so this is not
   comparable across machines or to cycles). Timestamps are raw TSC ticks
@@ -5625,11 +5998,8 @@ kernel. The kernel is the trusted computing base.
       Ticks don't queue, so a long stretch with interrupts off counts
       once.
     - Nothing unwinds, so a function's callers aren't credited.
-    - Once WASM apps run (#199), an app will show up by function as
-      `wasmi`'s interpreter, not as its own functions; by thread it will
-      show up by its thread's name.
-- **Learning:** `explain <subsystem>` and a guided tour link each subsystem to
-  its source and docs inside the OS (M5+).
+    - WASM apps (#199) show up by function as `wasmi`'s interpreter, not as
+      their own functions; by thread they show up by their thread's name.
 
 ## 15. Testing architecture (built)
 
@@ -5642,6 +6012,46 @@ kernel. The kernel is the trusted computing base.
 | Codegen | `make audit`: disassembly and LLVM IR checks | `tools/harness/lumen_harness/audit.py` |
 | Harness itself | self-tests that the TAP parser, audit and image diff catch failures, and that the QEMU command line, artifact layout, CI wiring and status generation behave | `tests/harness` |
 | Feature gate | every feature in `tests/features/*.toml` must pass (CI); `docs/STATUS.md` generated from the same data | `make status-check`, `make status` |
+| Linux ABI conformance (M6+) | upstream `musl` `libc-test`, gVisor syscall suites, and targeted LTP cases plus unmodified Alpine `ext4` runtime tests | `tests/scenarios/test_linux_*`, `test_alpine.py`, `test_conformance.py`, `test_runtimes.py` |
+
+**CI tiers, `status.py` feature gate, and deterministic disk images (M7–M10, #230).**
+Starting in M7, Linux-userspace tests run against a deterministic, pre-baked
+Alpine Linux `x86_64` (`musl`) `ext4` disk image built/fetched on the host into
+`build/deps/` and pinned by sha256 (just like Limine and OVMF, never committed
+to the MIT repo)—CI scenarios never depend on live external package mirrors;
+M9's `apk`/HTTPS test talks to a local host test server.
+
+Because M10's full compiler/runtime tests (multi-file C++20 builds, `go build`,
+`rustc`/`cargo` with proc-macros, `node` V8 + `npm`, 2–4 GiB page-cache
+reclaim, and full gVisor/LTP suites) require 2–4 GiB guests and would take tens
+of minutes under TCG software emulation (which `ci.yml` uses on failure re-runs
+and macOS uses locally), CI and `status.py` split into two tiers before M10
+issues are filed while keeping `status.py` strictly stateless (Hard Rules 1
+and 10—never carrying forward stale `"passing"` rows from an older `STATUS.md`):
+
+1. **Separate JUnit outputs & feature-gate schema (`tests/features/*.toml` +
+   `status.py`):** every feature defaults to `tier = "pr"`; M10 heavy features
+   declare `tier = "heavy"` and their scenarios carry `@pytest.mark.heavy`.
+   `make test-scenarios` runs `-m "not heavy"` and writes
+   `build/test-results/scenarios.xml`; a new `make test-heavy` target runs
+   `-m heavy` (`SCENARIO_JOBS=1`, KVM-only) and writes
+   `build/test-results/scenarios-heavy.xml`, with neither target deleting the
+   other. `status.py::collect_results()` merges both XML files when present,
+   and `status.py` gains `--tier pr|heavy|all`.
+2. **PR gate (fast, KVM, `ci.yml`):** runs `make test-scenarios` (`-m "not
+   heavy"`), `audit:flags`, host tests, ktests, M0–M9 scenarios, and
+   lightweight M10 smoke tests (`test_go_run_smoke`, `test_rustc_tiny_smoke`,
+   `test_node_eval_smoke`), gated by `make status-check`
+   (`status.py --check --tier pr`), keeping the 10-minute TCG failure re-run.
+3. **Heavy runtime gate (separate workflow / merge-queue / nightly, KVM-only):**
+   runs `make test-heavy` (`SCENARIO_JOBS=1`, avoiding 4×4 GiB OOM on 16 GiB
+   runners), fails fast if `/dev/kvm` is absent (never silently falling back to
+   TCG), omits the TCG failure re-run, and gates with
+   `status.py --check --tier heavy`. Refreshing `docs/STATUS.md`
+   (`status.py --write --tier all`) runs strictly over fresh merged PR + heavy
+   results (either on a KVM host running both targets or a `main` CI job
+   merging both artifacts). Both tiers obey the busy-host rule (no tight
+   wall-clock ceilings inside scenarios; only outer CI job timeouts).
 
 QEMU exit codes: 33 = tests passed, 35 = a test failed (or `lumen.ktest=` selected none), 37 = crash report.
 A triple fault exits with 0 (`-no-reboot`) and therefore fails; the power-off
@@ -5691,8 +6101,8 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/ktest.rs     in-kernel test registry and runner
   src/shell/       the shells (lumen-shell): serial and the virtual terminals' consoles, the commands, system commands (sysinfo.rs), deliberate faults (crash.rs), trace runq/xray (xray.rs)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
-  linker.ld        layout at -2 GiB, .ktests section
-crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-gfx, lumen-acpi, lumen-pci, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, lumen-font, lumen-png, lumen-wm, lumen-app-api (the app interface's types, also built for wasm32), ...)
+  linker.ld        layout at -2 GiB, .ktests section (M6 adds .lumen_fixup in :rodata)
+crates/            no_std, host-testable libraries (lumen-acpi, lumen-app-api, lumen-calc, lumen-clock, lumen-demo, lumen-edit, lumen-elf, lumen-font, lumen-gfx, lumen-heap, lumen-input, lumen-mm, lumen-pci, lumen-perf, lumen-png, lumen-queue, lumen-rand, lumen-shell, lumen-snake, lumen-synth, lumen-term, lumen-time, lumen-trace, lumen-uart, lumen-ui, lumen-view, lumen-wm, lumen-xray; M6 adds lumen-vm)
 assets/fonts/      the desktop's UI font (Atkinson Hyperlegible, SIL OFL 1.1) with its licence and source
 assets/wallpaper/  the desktop's wallpaper (original, made by tools/wallpaper.py; README.md)
 boot/limine.conf   bootloader config template
