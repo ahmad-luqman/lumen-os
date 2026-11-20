@@ -42,6 +42,7 @@ extern crate alloc;
 
 pub mod replay;
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use lumen_trace::Event;
 use lumen_trace::kind::{self, Irq, LockWait, RunQueue, Stream, Switch};
@@ -188,6 +189,16 @@ impl Cpu {
             (stream, kind) if kind::stream_of(kind) != stream => self.odd += 1,
             // The main ring's other kinds: not X-ray's.
             _ => {}
+        }
+    }
+
+    /// Its row's first label as X-ray shows it, CPU `i`: `cpu <i>`, or
+    /// `cpu <i> off` only while its reads are refused (an unread CPU isn't
+    /// offline: nothing is known of it yet).
+    pub fn label(&self, i: usize) -> String {
+        match self.presence {
+            Presence::Offline => alloc::format!("cpu {i} off"),
+            Presence::Unread | Presence::Online => alloc::format!("cpu {i}"),
         }
     }
 
@@ -576,6 +587,19 @@ mod tests {
         assert_eq!(counts(c), (Some(1), Some(1), Some(0), Some(0)), "counts stay");
         v.read(0, Stream::Main, 2, 0, &[]);
         assert_eq!(v.cpus()[0].presence, Presence::Online);
+    }
+
+    #[test]
+    fn a_cpu_s_label_says_off_only_while_offline() {
+        let mut v = View::new(3);
+        assert_eq!(v.cpus()[1].label(1), "cpu 1", "unread is not offline");
+        v.read(1, Stream::Main, 0, 0, &[]);
+        assert_eq!(v.cpus()[1].label(1), "cpu 1");
+        v.offline(1);
+        assert_eq!(v.cpus()[1].label(1), "cpu 1 off");
+        v.read(1, Stream::Xray, 0, 0, &[]);
+        assert_eq!(v.cpus()[1].label(1), "cpu 1", "back online");
+        assert_eq!(v.cpus()[2].label(7), "cpu 7");
     }
 
     #[test]

@@ -49,7 +49,7 @@ use lumen_app::ui::{Flow, Taken, Ticking, Toolkit};
 use lumen_app::{Desktop, Error, Event as WindowEvent, Time, Trace, log};
 use lumen_trace::Event;
 use lumen_ui::{App, Over, Then, Ui, UiEvent, Widget};
-use lumen_xray::{COLUMNS, Cpu, Presence, Span, View, replay};
+use lumen_xray::{COLUMNS, Cpu, Span, View, replay};
 
 lumen_app::manifest!(time, desktop, trace);
 lumen_app::main!(run);
@@ -241,11 +241,7 @@ impl Xray {
     /// The labels set from the view (`set_text` changes only what differs).
     fn show(&mut self) {
         for (i, (row, c)) in self.rows.iter().zip(self.view.cpus()).enumerate() {
-            let label = match c.presence {
-                Presence::Offline => format!("cpu {i} off"),
-                Presence::Unread | Presence::Online => format!("cpu {i}"),
-            };
-            self.ui.set_text(row.cpu, &label);
+            self.ui.set_text(row.cpu, &c.label(i));
             self.ui.set_text(row.runq, &shown(c.runq));
             self.ui.set_text(row.thread, &shown(c.thread));
             self.ui.set_text(row.switches, &shown(c.switches));

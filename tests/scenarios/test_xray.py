@@ -273,8 +273,12 @@ def test_xray_pause_stops_its_reads(boot):
     # reads on and catches up with the scheduler.
     m = desktop(boot, "-smp", "2")
     app_id, mark, wid, record = start_xray(m)
-    # CPU 1 idle: its queue empty, or no `runq` event in its ring yet (`-`).
-    rows = gui.wait_ui(m, "X-ray reading cpu 1", lambda r: label(r, "cpu 1") == "cpu 1", wid, 60)
+    # Until X-ray has read CPU 1 (its switches known: only a read sets
+    # them). CPU 1 is idle: its queue empty, or `-` while its ring holds no
+    # `runq` event yet.
+    rows = gui.wait_ui(
+        m, "X-ray reading cpu 1", lambda r: label(r, "cpu 1 switches") != "-", wid, 60
+    )
     rows = gui.press_animated(
         m, below_root(rows), "Pause", "paused", lambda r: label(r, "State") == "paused", wid
     )
