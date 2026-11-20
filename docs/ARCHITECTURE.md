@@ -3894,8 +3894,9 @@ kernel (no SSE); #197 checks the results' bits.
     labels, `Pattern`, `Generation` and `State` (`running` or `stopped`).
     The grid is the rest, the app's own: a line in the palette's border
     colour, then cells 7 pixels square on an 8-pixel pitch, live ones in
-    its accent. The `Pattern` label names the pattern running; the list
-    shows no selection until one is chosen in it.
+    its accent. The pattern running is the list's selection (from the
+    start, the focus left alone: `Ui::set_selected`) and the `Pattern`
+    label's text.
   - **Running**, a generation every 100 ms (`Ticking::period`, animating,
     focused or not); a step commits the box around the cells that changed
     (`take_drawn`) and the `Generation` label. **Stopped**, no period:

@@ -15,9 +15,8 @@
 //!   around the cells that changed (`take_drawn`) and the `Generation`
 //!   label. **Stopped**, it has no period: the window settles, and each
 //!   `Step` advances one generation.
-//! - **The `Pattern` label** names the pattern it runs; the list shows no
-//!   selection until one is chosen in it (lumen-ui has no way yet to set a
-//!   list's selection from the app).
+//! - **The pattern it runs** is the list's selection (from the start, the
+//!   focus left alone: `Ui::set_selected`) and the `Pattern` label's text.
 //! - **A pattern** chosen in the list starts it again from that pattern at
 //!   generation 0, running or stopped as it was.
 //! - **`run life [--stopped] [pattern]`:** the pattern to start with (`gun`
@@ -105,11 +104,14 @@ impl LifeApp {
         app
     }
 
-    /// The grid from `pattern` at generation 0, all of it to draw again.
+    /// The grid from `pattern` at generation 0, all of it to draw again;
+    /// the list showing it selected (the focus left where it is).
     fn reset(&mut self, pattern: &'static Pattern) {
         self.grid = Life::new(COLS, ROWS);
         let (x, y) = pattern.origin(COLS, ROWS);
         self.grid.place(pattern, x, y);
+        let index = life::PATTERNS.iter().position(|p| p.name == pattern.name);
+        self.ui.set_selected(self.patterns, index);
         self.ui.set_text(self.pattern_label, pattern.name);
         self.ui.set_text(self.generation, "0");
         self.drawn.push(GRID);

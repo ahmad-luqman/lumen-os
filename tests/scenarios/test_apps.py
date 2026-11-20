@@ -1251,6 +1251,10 @@ def test_life_golden(boot, artifacts, golden_dir):
     app_id, mark = start(m, "life --stopped glider")
     wid, rows = life_tree(m)
     assert (life_state(rows), generation(rows), life_pattern(rows)) == ("stopped", 0, "glider")
+    # The list shows the pattern it runs from the start (glider: item 0),
+    # the focus left alone.
+    patterns = gui.node(rows, "list", "Patterns")
+    assert (patterns["value"], "focused" in patterns["state"]) == ("0", False), patterns
     # Stopped, it spends no fuel: settled, `apps`' fuel stays exactly the
     # same (an idle app runs nothing, so a slow host can't change it; a
     # stopped app that still woke on a period would).
@@ -1343,6 +1347,7 @@ def test_life_runs_unfocused_and_stops_when_closed(boot):
     app_id = int(record["id"])
     wid, rows = life_tree(m)
     assert (life_state(rows), gui.node(rows, "label", "Pattern")["value"]) == ("running", "gun")
+    assert gui.node(rows, "list", "Patterns")["value"] == "1", rows
     colours = gui.node(gui.ui_tree(m), "window", "Colours")
     assert gui.invoke(m, colours["id"], "focus").row is not None
     gui.wait_for(m, "Life unfocused", lambda: gui.window(m, "Life")["focused"], lambda f: f == "no")
