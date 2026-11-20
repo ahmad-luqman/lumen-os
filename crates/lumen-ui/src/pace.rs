@@ -190,6 +190,39 @@ mod tests {
     }
 
     #[test]
+    fn an_app_pacing_itself_to_its_own_deadline_gets_one_extra_tick_never_more() {
+        // An app giving "the time until my next deadline" (0 at the due
+        // moment, taken as the floor) every 500 ms: after each real tick
+        // one extra, 10 ms later, before its own target (it checks `now`
+        // and does nothing), and never two in a row.
+        const T: u64 = 500_000_000;
+        let mut p = Pacer::new();
+        let mut target = T;
+        let mut now = 0u64;
+        let (mut real, mut extra, mut extras_in_a_row) = (0, 0, 0);
+        while now < 5_000_000_000 {
+            match p.poll(Some(target.saturating_sub(now)), now) {
+                Pace::Due if now >= target => {
+                    real += 1;
+                    extras_in_a_row = 0;
+                    target += T;
+                    p.ticked(now + 1_000_000);
+                }
+                Pace::Due => {
+                    extra += 1;
+                    extras_in_a_row += 1;
+                    assert!(extras_in_a_row <= 1, "two extra ticks in a row at {now}");
+                    p.ticked(now + 1_000_000);
+                }
+                Pace::Until(d) => now = d.min(now + 37_000_000),
+                Pace::Idle => unreachable!(),
+            }
+        }
+        assert_eq!(real, 9);
+        assert!(extra <= real, "{extra} extra for {real} real");
+    }
+
+    #[test]
     fn quick_ticks_come_a_period_after_each_was_found_due() {
         let mut p = Pacer::new();
         p.poll(Some(P), 0);

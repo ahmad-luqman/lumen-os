@@ -664,7 +664,10 @@ fn tick(mode: &str) -> i32 {
         Ok(how) => {
             let t = tk.app_mut();
             let elapsed_ms = t.first_tick.map_or(0, |first| (t.last_tick - first) / 1_000_000);
-            let how = if how == Ended::Quit { "quit" } else { "closed" };
+            let how = match how {
+                Ended::Closed => "closed",
+                Ended::Quit => "quit",
+            };
             log::info(&format!(
                 "window: tick: {how} after {} ticks, {elapsed_ms} ms from the first to the last",
                 t.ticks

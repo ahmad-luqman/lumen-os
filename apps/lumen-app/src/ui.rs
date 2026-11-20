@@ -125,8 +125,8 @@ pub enum Step {
 pub enum Taken {
     /// Not the app's: the tree gets it.
     Pass,
-    /// The app acted on it itself (the tree never sees it); the window is
-    /// refreshed.
+    /// The app acted on it itself (input: the tree never sees it; the focus
+    /// and `Lost` reach the tree anyway); the window is refreshed.
     Took,
     /// Stop: the loop returns [`Ended::Quit`]; the window closes when the
     /// caller drops the `Toolkit`, which owns the `Window`.
@@ -162,7 +162,10 @@ pub trait Ticking: App {
     /// before every wait, so a button that starts or stops the animation
     /// takes effect at once; a shorter period takes effect at once, a
     /// longer one after the next tick, and one that changes on every ask
-    /// (a clock's "until the next second") still ticks at its boundary.
+    /// (a clock's "until the next second") still ticks at its boundary. At
+    /// a due moment, give the period of the tick after it (a fixed period
+    /// is simplest: a cursor's blink is a fixed 500 ms, with a "solid until"
+    /// time set on each key, rather than a deadline moved by each key).
     fn period(&self) -> Option<u64>;
 
     /// Whether the waits between ticks are an animation's (the desktop
@@ -175,7 +178,9 @@ pub trait Ticking: App {
     /// A tick that is due (`now` on `Time::now_ns`'s clock, at or past its
     /// deadline; one tick however late). What it changes is shown by the
     /// refresh after it: the tree's changes through the tree, its own
-    /// drawing through `take_drawn`.
+    /// drawing through `take_drawn`. A tick may come before a target of the
+    /// app's own (one it just moved later, or 10 ms after a tick whose
+    /// period it gave as 0): check `now`.
     fn tick(&mut self, now: u64) -> Flow;
 }
 
