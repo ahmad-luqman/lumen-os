@@ -26,7 +26,7 @@ use super::{paging, window};
 use crate::arch::stacks;
 use crate::sync::SpinLock;
 
-/// Size of each IST stack (#DF, NMI, #MC) and each thread's stack.
+/// Size of each IST stack (#DF, NMI, #MC, #DB) and each thread's stack.
 pub const STACK_SIZE: u64 = 64 * 1024;
 
 /// The boot CPU's kernel stack, from `kmain_on_kernel_stack` on (the size

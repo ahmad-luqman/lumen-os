@@ -10,8 +10,8 @@
 //! No vector ever reaches the CPU without a handler, so an unexpected
 //! exception produces a crash report and an unexpected interrupt is counted
 //! and warned about, never a triple fault. (Until
-//! [`use_ist_stacks`], right after `mm::init`, #DF, NMI and #MC run on the
-//! current stack: a #DF from a broken stack pointer then is still a triple
+//! [`use_ist_stacks`], right after `mm::init`, #DB, #DF, NMI and #MC run on
+//! the current stack: a #DF from a broken stack pointer then is still a triple
 //! fault.)
 
 use super::gdt;
@@ -271,8 +271,8 @@ pub(super) fn load() {
     unsafe { asm!("lidt [{}]", in(reg) &raw const ptr, options(readonly, nostack, preserves_flags)) };
 }
 
-/// Make the NMI, double-fault and machine-check gates switch to their IST
-/// stacks. Only through `install_ist_stacks`, after the slots are filled.
+/// Make the `#DB`, NMI, double-fault and machine-check gates switch to their
+/// IST stacks. Only through `install_ist_stacks`, after the slots are filled.
 ///
 /// # Safety
 /// `gdt::set_ist_stacks` has filled the boot CPU's slots with valid stacks,
@@ -320,6 +320,28 @@ pub fn our_base() -> u64 {
 pub static BREAKPOINTS: AtomicU64 = AtomicU64::new(0);
 /// Deferred `#DB` traps caught at `LSTAR` (CVE-2018-8897 handoff count).
 pub static DEFERRED_LSTAR_DB: AtomicU64 = AtomicU64::new(0);
+/// Deferred `#DB` traps caught at an IDT exception stub entry (`MOV SS; INT3`
+/// / `MOV SS; <exception>` CVE-2018-8897 handoff count).
+pub static DEFERRED_STUB_DB: AtomicU64 = AtomicU64::new(0);
+
+/// Entry address of IDT stub `vector` (`lumen_isr_stubs + vector * STUB_STRIDE`).
+pub fn stub_entry_addr(vector: u8) -> u64 {
+    &raw const lumen_isr_stubs as u64 + u64::from(vector) * STUB_STRIDE
+}
+
+/// Whether `rip` is the entry address of a non-NMI/DF/MC CPU exception stub
+/// (`vector < 32` and not `2 | 8 | 18`).
+fn is_user_exception_stub_entry(rip: u64) -> bool {
+    let base = &raw const lumen_isr_stubs as u64;
+    let Some(off) = rip.checked_sub(base) else {
+        return false;
+    };
+    if !off.is_multiple_of(STUB_STRIDE) {
+        return false;
+    }
+    let vec = off / STUB_STRIDE;
+    vec < 32 && !matches!(vec, 2 | 8 | 18)
+}
 
 // The vector map. 0-31 are the CPU's exceptions.
 /// `PIC_BASE..PIC_BASE + 16`: the 8259s, remapped and masked, so only a
@@ -656,24 +678,39 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
         crate::ktrace!(crate::trace::Kind::Exception, vector, frame.rip, frame.error_code);
         let from_user = (frame.cs & 3) != 0;
 
-        // Deferred `#DB` at `LSTAR` (CVE-2018-8897 handoff): ring 3 executed
-        // `MOV SS; SYSCALL` with `TF = 1`, so `#DB` arrived on `IST_DEBUG`
-        // before `lumen_syscall_entry`'s first instruction (`swapgs`). Clear
-        // `TF` and `DR6`, record the pending debug trap for this CPU, and
-        // return via `iretq` (undoing `swapgs`) back to `LSTAR` so
-        // `lumen_syscall_entry` handles termination on the normal kernel stack.
-        if vector == 1 && !from_user && frame.rip == super::syscall::entry_addr() {
-            frame.rflags &= !(1 << 8); // clear TF
-            frame.rflags |= 1 << 16; // set RF so any DR0 breakpoint on LSTAR advances past `swapgs`
-            super::cpu::write_dr6(0);
-            super::percpu::set_pending_debug_trap(true);
-            DEFERRED_LSTAR_DB.fetch_add(1, Ordering::Relaxed);
-            return;
+        // Deferred `#DB` from ring 3 (CVE-2018-8897 handoff):
+        // - `MOV SS; SYSCALL` with `TF = 1` delivers `#DB` on `IST_DEBUG` at
+        //   `LSTAR` before `swapgs`. Clear `TF`, set `RF`, clear `DR6`, flag
+        //   this CPU's pending debug trap, and `iretq` back to `LSTAR` so
+        //   `lumen_syscall_entry` terminates cleanly on the normal kernel stack.
+        // - `MOV SS; INT3` / `MOV SS; <exception>` with `TF = 1` delivers `#DB`
+        //   on `IST_DEBUG` at the target exception stub's first instruction
+        //   (before `lumen_isr_common`'s `swapgs`). Clear `TF`, set `RF`, clear
+        //   `DR6`, and `iretq` back to the stub, which immediately runs
+        //   `lumen_isr_common` and terminates only the offending user process.
+        if vector == 1 && !from_user {
+            if frame.rip == super::syscall::entry_addr() {
+                frame.rflags &= !(1 << 8); // clear TF
+                frame.rflags |= 1 << 16; // set RF so any DR0 breakpoint on LSTAR advances past `swapgs`
+                super::cpu::write_dr6(0);
+                super::percpu::set_pending_debug_trap(true);
+                DEFERRED_LSTAR_DB.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if is_user_exception_stub_entry(frame.rip) {
+                frame.rflags &= !(1 << 8); // clear TF
+                frame.rflags |= 1 << 16; // set RF so any DR0 breakpoint advances past the stub entry
+                super::cpu::write_dr6(0);
+                DEFERRED_STUB_DB.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         }
 
-        // Any exception originating in ring 3 terminates only the offending
-        // user context, never the kernel (`crash::exception` is ring 0 only).
-        if from_user {
+        // Any synchronous exception originating in ring 3 terminates only the
+        // offending user context, never the kernel. Stop-NMIs (2), `#DF` (8),
+        // and `#MC` (18) are never user-recoverable and always go to
+        // `crash::exception` even if they interrupt ring 3.
+        if from_user && !matches!(vector, 2 | 8 | 18) {
             if vector == 1 {
                 super::cpu::write_dr6(0);
             }

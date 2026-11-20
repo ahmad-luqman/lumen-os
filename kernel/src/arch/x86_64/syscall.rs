@@ -458,6 +458,10 @@ pub unsafe fn enter_ring3(rip: u64, user_rsp: u64, rflags: u64) {
     unsafe { lumen_enter_ring3_call(rip, user_rsp, sanitized) };
 
     // Returned via `lumen_user_unwind` with interrupts off and `user_exit_rsp == 0`.
+    let cpu = percpu::index();
+    // SAFETY: interrupts are off on `cpu` and no ring-3 context is active.
+    unsafe { gdt::set_rsp0(cpu, 0) };
+    percpu::set_kernel_rsp(0);
     percpu::set_pending_debug_trap(false);
     irq::restore(were_on);
 }

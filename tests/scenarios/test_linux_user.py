@@ -49,13 +49,15 @@ def test_user_fault_kills_process_not_kernel(boot):
         ("bp", 3, r"0x0"),
         ("db", 1, r"0x0"),
         ("lstar_db", 1, r"0x0"),
+        ("movss_bp", 3, r"0x0"),
+        ("stub_db", 3, r"0x0"),
     ]
     for kind, vec, cr2_pat in cases:
         start = len(m.output)
         m.send_line(f"usertest {kind}")
         line = m.expect(
             rf"usertest: fault vector={vec} \([^)]+\) error=0x[0-9a-f]+ "
-            rf"rip=0x[0-9a-f]+ cr2={cr2_pat} deferred_lstar=(\d+)\n",
+            rf"rip=0x[0-9a-f]+ cr2={cr2_pat} deferred_lstar=(\d+) deferred_stub=(\d+)\n",
             15,
         )
         m.expect(r"lumen> ", 10)
@@ -68,6 +70,10 @@ def test_user_fault_kills_process_not_kernel(boot):
             assert int(line.group(1)) == 1, (
                 f"lstar_db did not exercise the IST_DEBUG / LSTAR deferred #DB handoff:\n{chunk}"
             )
+        if kind == "stub_db":
+            assert int(line.group(2)) == 1, (
+                f"stub_db did not exercise the IST_DEBUG / IDT exception stub deferred #DB handoff:\n{chunk}"
+            )
 
     # Also exercise bare `MOV SS; SYSCALL` with TF=1 (CVE-2018-8897): on KVM /
     # real x86-64 hardware this fires the deferred #DB at LSTAR (vector=1,
@@ -77,7 +83,7 @@ def test_user_fault_kills_process_not_kernel(boot):
     m.send_line("usertest cve_db")
     cve_line = m.expect(
         r"usertest: (?:fault vector=1 \(#DB debug\) error=0x0 rip=0x[0-9a-f]+ cr2=0x0 "
-        r"deferred_lstar=(\d+)|exit=77 stdout=\"\")\n",
+        r"deferred_lstar=(\d+) deferred_stub=\d+|exit=77 stdout=\"\")\n",
         15,
     )
     m.expect(r"lumen> ", 10)

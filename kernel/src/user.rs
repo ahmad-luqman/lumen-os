@@ -38,20 +38,21 @@ struct FixupEntry {
 }
 
 unsafe extern "C" {
-    static __lumen_fixup_start: FixupEntry;
-    static __lumen_fixup_end: FixupEntry;
+    static __lumen_fixup_start: [FixupEntry; 0];
+    static __lumen_fixup_end: [FixupEntry; 0];
 }
 
 /// Look up `rip` in the read-only `.lumen_fixup` table. Returns the fixup
 /// recovery address if `rip` is a registered user-copy faulting instruction.
 pub fn lookup_fixup(rip: u64) -> Option<u64> {
-    let start = &raw const __lumen_fixup_start as usize;
-    let end = &raw const __lumen_fixup_end as usize;
-    debug_assert!(start <= end && (end - start).is_multiple_of(core::mem::size_of::<FixupEntry>()));
-    let count = (end - start) / core::mem::size_of::<FixupEntry>();
+    let start = (&raw const __lumen_fixup_start).cast::<FixupEntry>();
+    let end = (&raw const __lumen_fixup_end).cast::<FixupEntry>();
+    let bytes = (end as usize).saturating_sub(start as usize);
+    debug_assert!(start as usize <= end as usize && bytes.is_multiple_of(core::mem::size_of::<FixupEntry>()));
+    let count = bytes / core::mem::size_of::<FixupEntry>();
     // SAFETY: `.lumen_fixup` is a read-only linker section of initialized
     // `FixupEntry` pairs between `__lumen_fixup_start` and `__lumen_fixup_end`.
-    let entries = unsafe { core::slice::from_raw_parts(&raw const __lumen_fixup_start, count) };
+    let entries = unsafe { core::slice::from_raw_parts(start, count) };
     entries.iter().find_map(|e| (e.fault_ip == rip).then_some(e.fixup_ip))
 }
 
@@ -209,7 +210,7 @@ pub const fn user_range_valid(start: u64, len: usize) -> bool {
 /// (`debug_assert!(irq::enabled() && irq::depth() == 0)`).
 pub fn copy_from_user(dst: &mut [u8], user_src: u64) -> Result<(), CopyError> {
     debug_assert!(
-        arch::irq::enabled() && arch::irq::depth() == 0,
+        (arch::irq::enabled() || arch::irq::disabled_for_good()) && arch::irq::depth() == 0,
         "copy_from_user requires interrupts enabled and no SpinLock held"
     );
     if dst.is_empty() {
@@ -232,7 +233,7 @@ pub fn copy_from_user(dst: &mut [u8], user_src: u64) -> Result<(), CopyError> {
 #[allow(dead_code)] // HAL/kernel surface used by ktests and M6 syscalls
 pub fn copy_to_user(user_dst: u64, src: &[u8]) -> Result<(), CopyError> {
     debug_assert!(
-        arch::irq::enabled() && arch::irq::depth() == 0,
+        (arch::irq::enabled() || arch::irq::disabled_for_good()) && arch::irq::depth() == 0,
         "copy_to_user requires interrupts enabled and no SpinLock held"
     );
     if src.is_empty() {
@@ -258,7 +259,7 @@ pub fn copy_to_user(user_dst: u64, src: &[u8]) -> Result<(), CopyError> {
 #[allow(dead_code)] // HAL/kernel surface used by ktests and M6 syscalls
 pub fn copy_cstr_from_user(user_src: u64, max_len: usize) -> Result<Vec<u8>, CopyError> {
     debug_assert!(
-        arch::irq::enabled() && arch::irq::depth() == 0,
+        (arch::irq::enabled() || arch::irq::disabled_for_good()) && arch::irq::depth() == 0,
         "copy_cstr_from_user requires interrupts enabled and no SpinLock held"
     );
     if !(USER_MIN..USER_MAX).contains(&user_src) {
@@ -440,6 +441,13 @@ pub fn dispatch_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
 /// RAII temporary user address space (lower half `L4[0..256]` + shared kernel
 /// upper half `L4[256..512]`). Dropping always switches `CR3` back to
 /// `kernel_root()` and frees all user leaf and page-table frames.
+///
+/// Wave-2 preemption note: until #237 wires per-thread `CR3` switching into
+/// `sched::schedule`, timer preemption while `TempUserSpace` is active may run
+/// kernel threads under this `CR3`. Because `L4[256..512]` shares all kernel
+/// mappings (including the 6 pre-allocated dynamic L3 slots for heap, stacks,
+/// and MMIO) and no other thread enters ring 3 concurrently on this CPU, that
+/// is sound for the M6 wave-2 test runner.
 struct TempUserSpace {
     root: PhysFrame,
     active: bool,
@@ -454,7 +462,10 @@ impl TempUserSpace {
     fn map_page(&mut self, virt: u64, attrs: Attrs) -> Option<PhysFrame> {
         let va = VirtAddr::new(virt)?;
         let phys = frame::alloc_zeroed()?;
-        if paging::map_user_page(self.root, va, phys, attrs).is_err() {
+        // SAFETY: `self.root` was allocated by `new_user_root` (distinct from
+        // `kernel_root()`), `self` has exclusive access to its lower half, and
+        // `phys` is a freshly allocated frame owned by `self` until teardown.
+        if unsafe { paging::map_user_page(self.root, va, phys, attrs) }.is_err() {
             // SAFETY: freshly allocated frame, not mapped anywhere.
             unsafe { frame::free(phys) }.expect("freeing unmapped user frame");
             return None;
@@ -508,16 +519,17 @@ struct RunResult {
     exit: UserExit,
     stdout: Vec<u8>,
     deferred_lstar_db: u64,
+    deferred_stub_db: u64,
 }
 
 /// Run raw x86-64 user machine code `code` (with optional `data` mapped at
 /// `TEST_DATA_VA`) in ring 3 inside a fresh temporary address space.
 ///
-/// When `arm_lstar_dr0` is true, arms a hardware execution breakpoint (`DR0`
-/// = `lumen_syscall_entry`) before entering ring 3 and disarms it on return,
-/// deterministically exercising the `IST_DEBUG` / `LSTAR` pre-`swapgs` `#DB`
-/// handoff under both QEMU TCG and KVM.
-fn run_ring3_program(code: &[u8], data: &[u8], arm_lstar_dr0: bool) -> Result<RunResult, &'static str> {
+/// When `dr0_target` is `Some(addr)`, arms a hardware execution breakpoint
+/// (`DR0 = addr`) before entering ring 3 and disarms it on return,
+/// deterministically exercising the `IST_DEBUG` pre-`swapgs` `#DB` handoff at
+/// `LSTAR` or an IDT exception stub under both QEMU TCG and KVM.
+fn run_ring3_program(code: &[u8], data: &[u8], dr0_target: Option<u64>) -> Result<RunResult, &'static str> {
     let mut space = TempUserSpace::new().ok_or("out of frames for user page table")?;
     let code_frame = space.map_page(TEST_CODE_VA, Attrs::USER_RX).ok_or("out of frames for user code")?;
     let _stack_frame = space.map_page(TEST_STACK_VA, Attrs::USER_RW).ok_or("out of frames for user stack")?;
@@ -536,27 +548,34 @@ fn run_ring3_program(code: &[u8], data: &[u8], arm_lstar_dr0: bool) -> Result<Ru
         *guard = Some(RunSlot { pid, exit: None, stdout: Vec::new() });
     }
 
-    let db_before = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
+    let lstar_before = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
+    let stub_before = arch::idt::DEFERRED_STUB_DB.load(Ordering::Relaxed);
     space.activate();
-    if arm_lstar_dr0 {
+    if let Some(addr) = dr0_target {
         arch::write_dr6(0);
-        arch::write_dr0(arch::syscall::entry_addr());
+        arch::write_dr0(addr);
         arch::write_dr7(0x0000_0001); // L0 = 1, execute breakpoint (RW0=00, LEN0=00)
     }
     // SAFETY: `space` maps `TEST_CODE_VA` (USER_RX), `TEST_STACK_VA` (USER_RW),
     // and the full kernel upper half; `enter_ring3` checks interrupts/locks.
     unsafe { arch::syscall::enter_ring3(TEST_CODE_VA, TEST_STACK_VA + FRAME_SIZE, 0x0202) };
-    if arm_lstar_dr0 {
+    if dr0_target.is_some() {
         arch::write_dr7(0);
         arch::write_dr0(0);
         arch::write_dr6(0);
     }
     drop(space);
-    let db_after = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
+    let lstar_after = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
+    let stub_after = arch::idt::DEFERRED_STUB_DB.load(Ordering::Relaxed);
 
     let slot = ACTIVE_RUNS[cpu].lock().take().expect("active run slot missing after ring-3 exit");
     let exit = slot.exit.expect("ring-3 exited without recording UserExit");
-    Ok(RunResult { exit, stdout: slot.stdout, deferred_lstar_db: db_after.saturating_sub(db_before) })
+    Ok(RunResult {
+        exit,
+        stdout: slot.stdout,
+        deferred_lstar_db: lstar_after.saturating_sub(lstar_before),
+        deferred_stub_db: stub_after.saturating_sub(stub_before),
+    })
 }
 
 /// Tiny x86-64 machine-code builder for ring-3 test programs.
@@ -747,6 +766,20 @@ fn program_cve_db() -> Vec<u8> {
     c.0
 }
 
+/// CVE-2018-8897: `MOV SS; INT3` with `TF = 1`, deferring `#DB` onto IDT
+/// vector 3's stub entry before `lumen_isr_common`'s `swapgs`.
+fn program_movss_bp() -> Vec<u8> {
+    let mut c = CodeBuf::new();
+    c.bytes(&[0x8c, 0xd1]); // mov cx, ss
+    c.bytes(&[0x9c]); // pushfq
+    c.bytes(&[0x81, 0x0c, 0x24, 0x00, 0x01, 0x00, 0x00]); // or dword ptr [rsp], 0x100 (TF)
+    c.bytes(&[0x9d]); // popfq
+    c.bytes(&[0x8e, 0xd1]); // mov ss, cx (suppresses #DB for 1 instruction)
+    c.bytes(&[0xcc]); // int3 (#DB delivered at IDT stub 3 before `swapgs`)
+    c.ud2();
+    c.0
+}
+
 /// Ring-3 test triggering a non-canonical `rip` (`0x0000_8000_0000_0000`) on
 /// the `sysretq` or `iretq` return path.
 fn program_noncanon(iret_path: bool) -> Vec<u8> {
@@ -757,29 +790,33 @@ fn program_noncanon(iret_path: bool) -> Vec<u8> {
     c.0
 }
 
-/// Shell command: `usertest <ok|iret|pf|ud|gp|bp|db|cve_db|lstar_db|noncanon|noncanon-iret>`.
+/// Shell command: `usertest <ok|iret|pf|ud|gp|bp|db|cve_db|lstar_db|movss_bp|stub_db|noncanon|noncanon-iret>`.
 pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
+    const USAGE: &str =
+        "usage: usertest <ok|iret|pf|ud|gp|bp|db|cve_db|lstar_db|movss_bp|stub_db|noncanon|noncanon-iret>";
     let [kind] = args else {
-        return ctx.fail("usage: usertest <ok|iret|pf|ud|gp|bp|db|cve_db|lstar_db|noncanon|noncanon-iret>");
+        return ctx.fail(USAGE);
     };
-    let (code, data, arm_lstar_dr0): (Vec<u8>, &[u8], bool) = match kind.as_str() {
+    let (code, data, dr0_target): (Vec<u8>, &[u8], Option<u64>) = match kind.as_str() {
         "ok" => {
             let (code, data) = program_ok();
-            (code, data, false)
+            (code, data, None)
         }
-        "iret" => (program_iret(), &[], false),
-        "pf" => (program_pf(), &[], false),
-        "ud" => (program_ud(), &[], false),
-        "gp" => (program_gp(), &[], false),
-        "bp" => (program_bp(), &[], false),
-        "db" => (program_db(), &[], false),
-        "cve_db" => (program_cve_db(), &[], false),
-        "lstar_db" => (program_cve_db(), &[], true),
-        "noncanon" => (program_noncanon(false), &[], false),
-        "noncanon-iret" => (program_noncanon(true), &[], false),
-        _ => return ctx.fail("usage: usertest <ok|iret|pf|ud|gp|bp|db|cve_db|lstar_db|noncanon|noncanon-iret>"),
+        "iret" => (program_iret(), &[], None),
+        "pf" => (program_pf(), &[], None),
+        "ud" => (program_ud(), &[], None),
+        "gp" => (program_gp(), &[], None),
+        "bp" => (program_bp(), &[], None),
+        "db" => (program_db(), &[], None),
+        "cve_db" => (program_cve_db(), &[], None),
+        "lstar_db" => (program_cve_db(), &[], Some(arch::syscall::entry_addr())),
+        "movss_bp" => (program_movss_bp(), &[], None),
+        "stub_db" => (program_movss_bp(), &[], Some(arch::idt::stub_entry_addr(3))),
+        "noncanon" => (program_noncanon(false), &[], None),
+        "noncanon-iret" => (program_noncanon(true), &[], None),
+        _ => return ctx.fail(USAGE),
     };
-    let result = match run_ring3_program(&code, data, arm_lstar_dr0) {
+    let result = match run_ring3_program(&code, data, dr0_target) {
         Ok(r) => r,
         Err(e) => return ctx.fail(format_args!("usertest: {e}")),
     };
@@ -791,9 +828,10 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
         UserExit::Fault { vector, error_code, rip, cr2 } => {
             let _ = writeln!(
                 ctx.out,
-                "usertest: fault vector={vector} ({}) error={error_code:#x} rip={rip:#x} cr2={cr2:#x} deferred_lstar={}",
+                "usertest: fault vector={vector} ({}) error={error_code:#x} rip={rip:#x} cr2={cr2:#x} deferred_lstar={} deferred_stub={}",
                 arch::idt::exception_name(vector),
-                result.deferred_lstar_db
+                result.deferred_lstar_db,
+                result.deferred_stub_db
             );
         }
         UserExit::NonCanonicalRip(rip) => {
@@ -882,12 +920,21 @@ crate::ktest!(
             kassert_eq!(&ro_read, b"readonly-ok");
             kassert_eq!(copy_to_user(ro_va, b"nope"), Err(CopyError::Fault));
 
-            // copy_cstr_from_user: valid, empty, page-edge, TooLong, unmapped fault.
+            // copy_cstr_from_user: valid, empty, page-edge, multi-chunk (> 256 bytes), TooLong, unmapped fault.
             kassert_eq!(copy_cstr_from_user(ro_va, 64), Ok(b"readonly-ok".to_vec()));
             kassert_eq!(copy_cstr_from_user(ro_va + 11, 0), Ok(Vec::new()));
             kassert_eq!(copy_cstr_from_user(ro_va + FRAME_SIZE - 5, 64), Ok(b"edge".to_vec()));
             kassert_eq!(copy_cstr_from_user(ro_va, 4), Err(CopyError::TooLong));
             kassert_eq!(copy_cstr_from_user(unmapped_va, 64), Err(CopyError::Fault));
+            // Multi-chunk (> 256-byte internal buffer) C string round-trip and TooLong boundary.
+            let mut long_src = [b'x'; 601];
+            for (i, slot) in long_src[..600].iter_mut().enumerate() {
+                *slot = b'a' + (i % 26) as u8;
+            }
+            long_src[600] = 0;
+            kassert_eq!(copy_to_user(rw_va, &long_src), Ok(()));
+            kassert_eq!(copy_cstr_from_user(rw_va, 600), Ok(long_src[..600].to_vec()));
+            kassert_eq!(copy_cstr_from_user(rw_va, 599), Err(CopyError::TooLong));
             // Unterminated bytes running off the RW page into the unmapped page.
             kassert_eq!(copy_to_user(rw_va + FRAME_SIZE - 4, b"ABCD"), Ok(()));
             kassert_eq!(copy_cstr_from_user(rw_va + FRAME_SIZE - 4, 64), Err(CopyError::Fault));

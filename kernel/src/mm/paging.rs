@@ -482,7 +482,14 @@ pub fn new_user_root() -> Option<PhysFrame> {
 
 /// Map a 4 KiB user-mode page at `virt` (lower half only, `attrs.user()`) to
 /// `phys` in the user hierarchy rooted at `root`.
-pub fn map_user_page(root: PhysFrame, virt: VirtAddr, phys: PhysFrame, attrs: Attrs) -> Result<(), MapError> {
+///
+/// # Safety
+/// `root` must be an L4 root allocated by [`new_user_root`] (never
+/// [`kernel_root`]), the caller must have exclusive write access to its lower
+/// half, and `phys` must be an allocated physical frame whose ownership is
+/// transferred to `root` (freed on [`destroy_user_root`] or unmap).
+pub unsafe fn map_user_page(root: PhysFrame, virt: VirtAddr, phys: PhysFrame, attrs: Attrs) -> Result<(), MapError> {
+    debug_assert_ne!(root, kernel_root(), "map_user_page must never mutate kernel_root()");
     assert!(attrs.user(), "map_user_page requires user-mode attributes");
     pt::map(&mut Hhdm, root, virt, phys, PageSize::Size4K, attrs)
 }
