@@ -22,7 +22,8 @@
 //!   on the last CPU with a scheduler until stopped (interrupts on, so the
 //!   timer takes turns among them): a run queue that stays `n - 1` long,
 //!   apart from what else wakes there, for as long as a test needs to read
-//!   it (`test_xray::test_xray_matches_the_scheduler`). One set at a time.
+//!   it (`test_xray::test_xray_matches_the_scheduler` and
+//!   `test_xray_pause_stops_its_reads`). One set in the slot at a time.
 
 use alloc::collections::TryReserveError;
 use alloc::string::String;
@@ -353,7 +354,9 @@ crate::ktest!(
         // `trace runq spin`'s contract, through the shell's own dispatch:
         // one set at a time, its CPU named; stopped, its threads are
         // joined (none of them left in `threads`); a stop with nothing
-        // spinning, and counts out of range, are refused.
+        // spinning, and counts out of range, are refused. The spinners are
+        // stopped whatever the checks while they run say, so a failure
+        // here leaves no threads spinning for the tests after it.
         use crate::{kassert, kassert_eq};
         let run = |line: &str| super::pipe::run_line(line, &[]).0;
         let usage =
@@ -364,11 +367,17 @@ crate::ktest!(
         kassert_eq!(run("trace runq spin stop").as_str(), "runq spin: nothing is spinning\n");
         let cpu = crate::perf::last_cpu();
         let started = run("trace runq spin 2");
-        let head = alloc::format!("runq spin: 2 threads spinning on cpu {cpu}:");
-        kassert!(started.starts_with(&head));
-        kassert_eq!(started.split_whitespace().count(), head.split_whitespace().count() + 2);
-        kassert_eq!(run("trace runq spin 1"), alloc::format!("runq spin: already spinning on cpu {cpu}\n"));
-        kassert_eq!(run("trace runq spin stop"), alloc::format!("runq spin: 2 threads stopped on cpu {cpu}\n"));
+        let while_spinning = || -> crate::ktest::TestResult {
+            let head = alloc::format!("runq spin: 2 threads spinning on cpu {cpu}:");
+            kassert!(started.starts_with(&head));
+            kassert_eq!(started.split_whitespace().count(), head.split_whitespace().count() + 2);
+            kassert_eq!(run("trace runq spin 1"), alloc::format!("runq spin: already spinning on cpu {cpu}\n"));
+            Ok(())
+        };
+        let checked = while_spinning();
+        let stopped = run("trace runq spin stop");
+        checked?;
+        kassert_eq!(stopped, alloc::format!("runq spin: 2 threads stopped on cpu {cpu}\n"));
         // Joined: their records are gone (no live `Arc` to upgrade).
         kassert!(!sched::threads().iter().any(|t| t.name == "runq-spin"));
         kassert_eq!(run("trace runq spin stop").as_str(), "runq spin: nothing is spinning\n");
