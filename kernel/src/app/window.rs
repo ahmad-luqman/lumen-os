@@ -442,24 +442,12 @@ fn window_publish(c: &mut C<'_>, h: i32, ptr: i32, len: i32) -> Result<i32, Erro
     let old = core::mem::take(&mut win.ids);
     let mut ids = BTreeMap::new();
     let mut nodes = BTreeMap::new();
-    let roles: alloc::vec::Vec<(u64, Role)> = tree
-        .nodes()
-        .iter()
-        .flat_map(|n| {
-            let item_role = if n.role() == Role::List { Role::ListItem } else { Role::MenuItem };
-            core::iter::once((n.common().id, n.role())).chain(n.items().iter().map(move |it| (it.id, item_role)))
-        })
-        .collect();
-    let (top, rows) = tree.rows(|local| {
+    let (top, rows) = tree.rows(|local, role| {
         let global = old.get(&local).copied().unwrap_or_else(NodeId::fresh);
         ids.insert(local, global);
+        nodes.insert(global.get(), (local, role));
         global
     });
-    for (local, role) in roles {
-        if let Some(global) = ids.get(&local) {
-            nodes.insert(global.get(), (local, role));
-        }
-    }
     win.ids = ids;
     win.nodes = nodes;
     win.handle.publish(top, rows);

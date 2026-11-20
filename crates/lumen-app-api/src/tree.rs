@@ -344,13 +344,17 @@ impl Tree {
 
     /// The kernel's copy: the root's children (the top nodes) and every
     /// node with its depth (from 1; items one deeper than their list or
-    /// menu), client coordinates, each app id `global` maps (asked in
-    /// pre-order, a node before its items).
-    pub fn rows(&self, mut global: impl FnMut(u64) -> NodeId) -> (Vec<NodeId>, Vec<(u32, AutomationNode)>) {
+    /// menu), client coordinates, each app id `global` maps, given with its
+    /// role (asked in pre-order, a node before its items).
+    pub fn rows(&self, mut global: impl FnMut(u64, Role) -> NodeId) -> (Vec<NodeId>, Vec<(u32, AutomationNode)>) {
         let ids: Vec<(NodeId, Vec<NodeId>)> = self
             .nodes
             .iter()
-            .map(|n| (global(n.common().id), n.items().iter().map(|it| global(it.id)).collect()))
+            .map(|n| {
+                let id = global(n.common().id, n.role());
+                let item_role = if n.role() == Role::List { Role::ListItem } else { Role::MenuItem };
+                (id, n.items().iter().map(|it| global(it.id, item_role)).collect())
+            })
             .collect();
         let mut children: Vec<Vec<NodeId>> = alloc::vec![Vec::new(); self.nodes.len()];
         let mut top = Vec::new();
@@ -548,11 +552,22 @@ mod tests {
         let tree = Tree::new(nodes).unwrap();
         let ids: Vec<NodeId> = (0..5).map(|_| NodeId::fresh()).collect();
         let mut asked = Vec::new();
-        let (top, rows) = tree.rows(|local| {
-            asked.push(local);
+        let (top, rows) = tree.rows(|local, role| {
+            asked.push((local, role));
             ids[local as usize - 1]
         });
-        assert_eq!(asked, [1, 2, 3, 4, 5], "asked in pre-order");
+        let (g, b) = (Role::Group, Role::Button);
+        assert_eq!(asked, [(1, g), (2, b), (3, g), (4, b), (5, b)], "asked in pre-order, with roles");
+        // A list or a menu before its items, each item with its role.
+        let list = Node::List { common: c(1), focused: false, selected: None, items: items(&[2, 3]) };
+        let menu = Node::Menu { common: c(4), focused: false, expanded: true, items: items(&[5]) };
+        let mut asked = Vec::new();
+        let _ = Tree::new(vec![list, menu]).unwrap().rows(|local, role| {
+            asked.push((local, role));
+            NodeId::fresh()
+        });
+        let (l, li, m, mi) = (Role::List, Role::ListItem, Role::Menu, Role::MenuItem);
+        assert_eq!(asked, [(1, l), (2, li), (3, li), (4, m), (5, mi)], "a node before its items");
         assert_eq!(top, [ids[0], ids[4]]);
         let depths: Vec<u32> = rows.iter().map(|(d, _)| *d).collect();
         assert_eq!(depths, [1, 2, 2, 3, 1]);
@@ -568,7 +583,7 @@ mod tests {
         let bytes = bytes_of(&chain(TREE_NODES as u64));
         assert!(bytes.len() <= TREE_BYTES);
         let tree = Tree::decode(&bytes).unwrap();
-        let (top, rows) = tree.rows(|_| NodeId::fresh());
+        let (top, rows) = tree.rows(|_, _| NodeId::fresh());
         assert_eq!(top.len(), 1);
         assert_eq!(rows.last().map(|(d, _)| *d), Some(TREE_NODES as u32));
         assert_eq!(Tree::decode(&bytes_of(&chain(TREE_NODES as u64 + 1))), Err(TreeError::TooManyNodes));
@@ -708,13 +723,17 @@ mod tests {
         let tree = Tree::from_automation(&rows).unwrap();
         let back = Tree::decode(&tree.encode().unwrap()).unwrap();
         assert_eq!(back, tree);
-        let mut map: Vec<(u64, NodeId)> = Vec::new();
-        let (top_ids, got) = back.rows(|local| {
+        let mut map: Vec<(u64, NodeId, Role)> = Vec::new();
+        let (top_ids, got) = back.rows(|local, role| {
             let id = NodeId::fresh();
-            map.push((local, id));
+            map.push((local, id, role));
             id
         });
-        let global = |local: NodeId| map.iter().find(|(l, _)| *l == local.get()).map(|(_, g)| *g).unwrap();
+        // Each id asked with the role its row gets.
+        for (_, id, role) in &map {
+            assert_eq!(got.iter().find(|(_, n)| n.id() == *id).map(|(_, n)| n.role()), Some(*role));
+        }
+        let global = |local: NodeId| map.iter().find(|(l, ..)| *l == local.get()).map(|(_, g, _)| *g).unwrap();
         assert_eq!(top_ids, ui.top_ids().into_iter().map(global).collect::<Vec<_>>());
         assert_eq!(got.len(), rows.len());
         for ((d0, a), (d1, b)) in rows.iter().zip(&got) {
