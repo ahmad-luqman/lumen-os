@@ -111,7 +111,7 @@ def test_hello_wasm(boot):
     out = run(m, "run")
     assert (
         out
-        == "usage: run [--without <grant>] <app> [args...]\napps: calculator clock template xray\n"
+        == "usage: run [--without <grant>] <app> [args...]\napps: calculator clock template viewer xray\n"
     ), out
     assert "run: no app nope" in run(m, "run nope")
     # `exit(n)` is an ending like returning n.
@@ -1156,3 +1156,312 @@ def test_sdk_an_overrunning_tick_still_waits_a_period(boot):
     gui.close_window(m, "window")
     end_line(m, mark, "window", app_id, "exited with 0")
     assert tick_ended(m, mark) >= 4
+
+
+# -- the image viewer (#204) ---------------------------------------------------
+
+WALLPAPER = REPO_ROOT / "assets" / "wallpaper" / "lumen.png"
+VIEWER_IMAGES = REPO_ROOT / "apps" / "viewer" / "images"
+# lumen-view's VIEW (client coordinates: x, y, w, h) and PAN_STEP.
+VIEW = (200, 0, 440, 480)
+PAN_STEP = 40
+# Decoding the wallpaper takes about 350 fuel slices (356 measured;
+# tiles.png 13): a bound before failing, not a timing claim.
+DECODE_TIMEOUT = 120
+# The viewer's images, in its list's order (apps/viewer's IMAGES).
+VIEWER_ITEMS = ["lumen.png", "tiles.png", "grey16.png", "broken.png", "costly.png"]
+# The light theme's text (lumen-wm's `client_text`), as a PIL RGB tuple.
+LIGHT_TEXT = (0x1A, 0x1A, 0x1A)
+
+
+def viewer_tree(m) -> tuple[str, list[dict[str, str]]]:
+    """The viewer's window id and its tree (the root's children), once
+    `ui tree` shows its widgets."""
+    wid = gui.wait_window(m, "Viewer")["id"]
+    rows = gui.wait_ui(m, "the viewer's widgets", lambda r: len(r) > 1, wid, 30)
+    return wid, below_root(rows)
+
+
+def viewer_info(rows: list[dict[str, str]]) -> str:
+    return gui.node(rows, "label", "Info")["value"]
+
+
+def wait_info(m, wid: str, what: str, done) -> list[dict[str, str]]:
+    """Until the viewer's `Info` label satisfies `done` (an image decoded
+    is confirmed by its name and size there); its tree then."""
+    rows = gui.wait_ui(m, what, lambda r: done(viewer_info(below_root(r))), wid, DECODE_TIMEOUT)
+    return below_root(rows)
+
+
+def view_of(m, name: str):
+    """The viewer's view (lumen-view's VIEW of its client area) in a settled
+    screendump: an RGB PIL image."""
+    from PIL import Image
+
+    x0, y0, _, _ = gui.client_box(gui.window(m, "Viewer"))
+    shot = gui.settled_screendump(m, name)
+    vx, vy, vw, vh = VIEW
+    with Image.open(shot) as img:
+        return img.convert("RGB").crop((x0 + vx, y0 + vy, x0 + vx + vw, y0 + vy + vh))
+
+
+def fitted(png) -> tuple[tuple[int, int, int, int], object]:
+    """Where `png` fitted to the view goes (a crop box in view coordinates)
+    and what it shows there: lumen-view's `fit_size`, `fitted` and `source`
+    (nearest neighbour, rounded down), restated."""
+    from PIL import Image
+
+    with Image.open(png) as img:
+        src = img.convert("RGB")
+    sw, sh = src.size
+    vw, vh = VIEW[2], VIEW[3]
+    w, h = (sw * vh // sh, vh) if sw * vh <= sh * vw else (vw, sh * vw // sw)
+    w, h = max(w, 1), max(h, 1)
+    x0, y0 = (vw - w) // 2, (vh - h) // 2
+    out = Image.new("RGB", (w, h))
+    out.putdata([src.getpixel((x * sw // w, y * sh // h)) for y in range(h) for x in range(w)])
+    return (x0, y0, x0 + w, y0 + h), out
+
+
+def differing(actual, want) -> int:
+    """How many pixels of two same-sized RGB images differ."""
+    assert actual.size == want.size, (actual.size, want.size)
+    a, b = actual.tobytes(), want.tobytes()
+    return sum(a[i : i + 3] != b[i : i + 3] for i in range(0, len(a), 3))
+
+
+def text_bands(view) -> int:
+    """How many lines of text the viewer's view shows: bands of rows holding
+    a dark pixel (each channel below 0x60, as the light theme's text is and
+    its background isn't), apart from the next by at least two rows with
+    none."""
+    w, h = view.size
+    data = view.tobytes()
+    dark = [
+        any(max(data[i : i + 3]) < 0x60 for i in range(y * w * 3, (y + 1) * w * 3, 3))
+        for y in range(h)
+    ]
+    bands, gap = 0, 2
+    for d in dark:
+        if d:
+            bands += gap >= 2
+            gap = 0
+        else:
+            gap += 1
+    return bands
+
+
+def set_fit(m, wid: str, rows: list[dict[str, str]], on: bool) -> list[dict[str, str]]:
+    """Press `Fit` until it is `on` (its row's value), then wait for the
+    desktop to settle (the view redrawn)."""
+    box = gui.node(rows, "checkbox", "Fit")
+    if (box["value"] == "checked") != on:
+        got = gui.invoke(m, box["id"], "press")
+        assert got.row is not None or got.still_running, got
+    rows = gui.wait_ui(
+        m,
+        f"Fit {on}",
+        lambda r: (gui.node(r, "checkbox", "Fit")["value"] == "checked") == on,
+        wid,
+        30,
+    )
+    gui.wait_settled(m)
+    return below_root(rows)
+
+
+def test_viewer_golden(boot):
+    # The wallpaper, decoded inside the app, at 1:1: the view equals the
+    # PNG's own pixels from its top left, and after the arrow keys pan it
+    # (confirmed keys: right twice, down once, then left and up) from where
+    # they moved it; fitted, the view equals the PNG scaled by nearest
+    # neighbour (lumen-view's rule, restated here) into the middle of the
+    # view, the bars around it one colour each; once shown, it spends no
+    # fuel while it waits.
+    from PIL import Image
+
+    m = boot_desktop(boot)
+    app_id, mark = start(m, "viewer")
+    wid, rows = viewer_tree(m)
+    rows = wait_info(m, wid, "the wallpaper decoded", lambda v: v == "lumen.png 1280x800")
+    assert gui.node(rows, "list", "Images")["value"] == "0"
+    with Image.open(WALLPAPER) as img:
+        wallpaper = img.convert("RGB")
+    vw, vh = VIEW[2], VIEW[3]
+
+    rows = set_fit(m, wid, rows, False)
+    view = view_of(m, "viewer-1to1.png")
+    assert differing(view, wallpaper.crop((0, 0, vw, vh))) == 0
+
+    gui.confirmed_keys(m, ["right"], ["right"], ["down"])
+    x, y = 2 * PAN_STEP, PAN_STEP
+    want = wallpaper.crop((x, y, x + vw, y + vh))
+    gui.wait_for(
+        m,
+        "the view panned",
+        lambda: differing(view_of(m, "viewer-panned.png"), want),
+        lambda n: n == 0,
+        30,
+    )
+    # Left and up pan back: one step each.
+    gui.confirmed_keys(m, ["left"], ["up"])
+    want = wallpaper.crop((PAN_STEP, 0, PAN_STEP + vw, vh))
+    gui.wait_for(
+        m,
+        "the view panned back",
+        lambda: differing(view_of(m, "viewer-panned-back.png"), want),
+        lambda n: n == 0,
+        30,
+    )
+
+    rows = set_fit(m, wid, rows, True)
+    box, want = fitted(WALLPAPER)
+    view = view_of(m, "viewer-fit.png")
+    assert differing(view.crop(box), want) == 0
+    # The bars above and below the fitted image: one colour each (nothing
+    # left of the 1:1 view there).
+    for bar in ((0, 0, vw, box[1]), (0, box[3], vw, vh)):
+        assert len(view.crop(bar).getcolors(1 << 20)) == 1, bar
+    # Shown, it stops ticking: settled, it spends no fuel and ends no
+    # slice, however long it waits (an idle app spends exactly 0).
+    gui.wait_settled(m)
+    before = app(m, app_id)
+    for _ in range(3):
+        gui.wait_settled(m)
+    after = app(m, app_id)
+    assert before is not None and after is not None
+    assert (after["fuel"], after["slices"]) == (before["fuel"], before["slices"]), (before, after)
+    gui.close_window(m, "Viewer")
+    end_line(m, mark, "viewer", app_id, "exited with 0")
+
+
+def test_viewer_list_and_select(boot):
+    # The image list through `ui invoke`: selecting `tiles.png` shows it
+    # (the label its name and size once decoded, the list's value its
+    # index), fitted: a small image enlarged by nearest neighbour into the
+    # middle of the view; Next and Previous move through the list (each
+    # going round at its end), the label following each time; choosing
+    # keeps the focus where it was.
+    m = boot_desktop(boot)
+    app_id, mark = start(m, "viewer")
+    wid, rows = viewer_tree(m)
+    rows = wait_info(m, wid, "the wallpaper decoded", lambda v: v == "lumen.png 1280x800")
+    items = [r["name"] for r in rows if r["role"] == "listitem"]
+    assert items == VIEWER_ITEMS, items
+    # Choosing the image already shown doesn't decode it again: its slices
+    # barely move (a request's answer), where a decode takes about 350.
+    gui.wait_settled(m)
+    before = app(m, app_id)
+    got = gui.invoke(m, gui.node(rows, "listitem", "lumen.png")["id"], "select")
+    assert got.row is not None or got.still_running, got
+    gui.wait_settled(m)
+    after = app(m, app_id)
+    assert before is not None and after is not None
+    assert int(after["slices"]) - int(before["slices"]) < 10, (before, after)
+    tiles = gui.node(rows, "listitem", "tiles.png")
+    got = gui.invoke(m, tiles["id"], "select")
+    assert got.row is not None or got.still_running, got
+    # Settled means decoded: the wait before the decoding tick animates, so
+    # the desktop never settles while the view still says `Decoding`.
+    gui.wait_settled(m)
+    rows = below_root(gui.ui_tree(m, wid))
+    assert viewer_info(rows) == "tiles.png 96x64"
+    assert gui.node(rows, "list", "Images")["value"] == "1"
+    box, want = fitted(VIEWER_IMAGES / "tiles.png")
+    assert differing(view_of(m, "viewer-tiles.png").crop(box), want) == 0
+
+    gui.press_buttons(m, rows, "Next")
+    rows = wait_info(m, wid, "grey16.png decoded", lambda v: v == "grey16.png 40x24")
+    assert gui.node(rows, "list", "Images")["value"] == "2"
+    gui.press_buttons(m, rows, "Previous")
+    rows = wait_info(m, wid, "back to tiles.png", lambda v: v == "tiles.png 96x64")
+    gui.press_buttons(m, rows, "Previous")
+    rows = wait_info(m, wid, "back to the wallpaper", lambda v: v == "lumen.png 1280x800")
+    # Previous from the first goes round to the last; Next from the last
+    # round to the first.
+    gui.press_buttons(m, rows, "Previous")
+    rows = wait_info(m, wid, "round to the last", lambda v: v.startswith("costly.png: "))
+    assert gui.node(rows, "list", "Images")["value"] == str(len(VIEWER_ITEMS) - 1)
+    gui.press_buttons(m, rows, "Next")
+    rows = wait_info(m, wid, "round to the wallpaper", lambda v: v == "lumen.png 1280x800")
+    assert gui.node(rows, "list", "Images")["value"] == "0"
+    # Choosing an image leaves the focus where it was: with Next focused,
+    # two confirmed Enters move two images on (a choice that focused the
+    # list would take the second Enter there).
+    nxt = gui.node(rows, "button", "Next")
+    got = gui.invoke(m, nxt["id"], "focus")
+    assert got.row is not None and "focused" in got.row["state"], got
+    gui.confirmed_keys(m, ["ret"], ["ret"])
+    rows = wait_info(m, wid, "two Enters on Next", lambda v: v == "grey16.png 40x24")
+    assert gui.node(rows, "list", "Images")["value"] == "2"
+    assert "focused" in gui.node(rows, "button", "Next")["state"]
+    gui.close_window(m, "Viewer")
+    end_line(m, mark, "viewer", app_id, "exited with 0")
+
+
+def test_viewer_bad_image_shows_an_error(boot):
+    # A corrupt bundled image (`broken.png`: a flipped byte, its IDAT's CRC
+    # wrong), chosen at the start: the decoder inside the app refuses it;
+    # the label and the view say why (the reason drawn in the text's
+    # colour), one INFO line logs it, no WARN or ERROR; the app keeps
+    # running. `costly.png`, a valid PNG too costly to decode, is refused
+    # from its header (lumen-view's `admit`) the same way; the wallpaper,
+    # chosen next, is shown, and its close ends it with 0.
+    m = boot_desktop(boot)
+    app_id, mark = start(m, "viewer broken.png")
+    wid, rows = viewer_tree(m)
+    prefix = "broken.png: not a PNG it can read: "
+    rows = wait_info(m, wid, "broken.png refused", lambda v: v.startswith(prefix))
+    assert gui.node(rows, "list", "Images")["value"] == "3"
+    why = viewer_info(rows)[len("broken.png: ") :]
+    assert "CRC does not match" in why, why
+    said = rf"INFO  app: viewer: broken\.png: {re.escape(why)}\n"
+    wait_for_output(m, mark, said, 10)
+    assert len(re.findall(said, m.output[mark:])) == 1
+    # The view says it in the text's colour: "Can't show" on the first
+    # line, the reason below it.
+    view = view_of(m, "viewer-broken.png")
+    for line in ((0, 0, VIEW[2], 30), (0, 34, VIEW[2], 200)):
+        colours = {c for _, c in view.crop(line).getcolors(1 << 20)}
+        assert LIGHT_TEXT in colours, (line, sorted(colours)[:8])
+    # The reason is wider than the view's text column, so it wraps: three
+    # bands of rows hold text (the heading and the reason's two lines).
+    assert text_bands(view) == 3, text_bands(view)
+    record = app(m, app_id)
+    assert record is not None and record["windows"] == "1", record
+    assert not klog.unexpected_warnings(m.output[mark:]), klog.unexpected_warnings(m.output[mark:])
+    costly = gui.node(rows, "listitem", "costly.png")
+    got = gui.invoke(m, costly["id"], "select")
+    assert got.row is not None or got.still_running, got
+    refused = (
+        "costly.png: 1280x800 pixels need 4096800 bytes inflated, more than the 3072800 it takes"
+    )
+    rows = wait_info(m, wid, "costly.png refused", lambda v: v == refused)
+    said = rf"INFO  app: viewer: {re.escape(refused)}\n"
+    wait_for_output(m, mark, said, 10)
+    assert len(re.findall(said, m.output[mark:])) == 1
+    view = view_of(m, "viewer-costly.png")
+    for line in ((0, 0, VIEW[2], 30), (0, 34, VIEW[2], 200)):
+        colours = {c for _, c in view.crop(line).getcolors(1 << 20)}
+        assert LIGHT_TEXT in colours, (line, sorted(colours)[:8])
+    assert app(m, app_id) is not None
+    wallpaper = gui.node(rows, "listitem", "lumen.png")
+    got = gui.invoke(m, wallpaper["id"], "select")
+    assert got.row is not None or got.still_running, got
+    wait_info(m, wid, "the wallpaper decoded", lambda v: v == "lumen.png 1280x800")
+    gui.close_window(m, "Viewer")
+    end_line(m, mark, "viewer", app_id, "exited with 0")
+
+
+def test_viewer_refuses_an_image_it_doesnt_have(boot):
+    # `run viewer nope.png`: one ERROR naming the images it has, exit 1, no
+    # window opened (its own check, before the window).
+    m = boot_desktop(boot)
+    allow = r"ERROR app: viewer: no image nope\.png"
+    app_id, mark = start(m, "viewer nope.png", allow=allow)
+    end_line(m, mark, "viewer", app_id, "exited with 1")
+    errors = re.findall(rf"{STAMP} ERROR [^\n]*", m.output[mark:])
+    assert len(errors) == 1, errors
+    assert errors[0].endswith(
+        "app: viewer: no image nope.png (it has " + ", ".join(VIEWER_ITEMS) + ")"
+    ), errors
+    assert not [w for w in gui.windows(m, allow) if w["title"] == "Viewer"]

@@ -171,6 +171,19 @@ tests = [
 ]
 
 [[feature]]
+name = "Image viewer (#204): a bundled app showing images built into it, decoded inside the app (a corrupt one, and one too costly to decode refused from its header, each an error shown in the view, its label and one INFO line, the app going on; an image it doesn't have refused with one ERROR before its window); the wallpaper at 1:1 equal to the PNG's pixels and panned by the arrow keys all four ways, or fitted to the view by nearest neighbour; the image list, Previous and Next through `ui invoke`, going round at both ends, the label and list following without taking the focus; settled once an image is shown, then spending no fuel; files too long, images empty, too big or too costly to decode refused from their length and header; its allocations, the costliest PNG it takes and the longest file included, fitting its fixed memory through its own allocator logic"
+milestone = "M5"
+tests = [
+    "cargo:lumen-view",
+    "cargo:lumen-ui",
+    "scenario:test_apps::test_viewer_golden",
+    "scenario:test_apps::test_viewer_list_and_select",
+    "scenario:test_apps::test_viewer_bad_image_shows_an_error",
+    "scenario:test_apps::test_viewer_refuses_an_image_it_doesnt_have",
+    "scenario:test_gui::test_launcher_lists_desktop_apps_only",
+]
+
+[[feature]]
 name = "X-ray (#208): a bundled app reading every CPU's trace rings through the Trace capability: each CPU's run queue (from its newest runq event, agreeing with the scheduler's count), running thread, switches, interrupts, locks that waited and numbers missed as labels (unknown until read, offline CPUs marked), its counts never more than the ring holds (a ring's backlog left out), lanes of its recent columns (a live run-queue bar's height checked); Pause stops its reads (the window settles) and Resume catches up; a frozen view of a fixed trace (--replay) matching a golden; without the trace grant it starts, logs one ERROR and exits with 1; other arguments its usage and 2; the kernel's trace runq spin seam keeps one set of threads and joins it"
 milestone = "M5"
 tests = [

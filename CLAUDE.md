@@ -381,7 +381,8 @@ own PR that updates that doc first.
   randomized model of damage-only repainting with focus, and
   press-pause-resume-release through the queue).
 - `crates/lumen-ui`: the desktop's toolkit (#156): a retained widget tree
-  (`Ui`: stacks (`Stack` handles), labels (`fixed_label`), buttons, checkboxes, text fields, lists,
+  (`Ui`: stacks (`Stack` handles), labels (`fixed_label`), buttons, checkboxes, text fields, lists
+  (`set_selected`: the app's own choice, the focus left where it is),
   menus with items (#157); `Ui::bar` (across, one widget pinned right); `remove`
   (generational `Widget`s: a freed slot taken again); per-widget damage (`take_damage`,
   `paint_in`); layout,
@@ -483,7 +484,7 @@ own PR that updates that doc first.
   (`encode`: RGB8 `Rows` into a `Png`, unfiltered, zlib from
   `miniz_oxide`, the rows' and the file's buffers refused rather than
   aborted, the compressor's own boxes excepted), the decoder the
-  wallpaper uses (`decode`: any PNG into `0x00RRGGBB` pixels with
+  wallpaper and the viewer app use (`decode`: any PNG into `0x00RRGGBB` pixels with
   `zune-png`, only the image's own chunks handed to it; a bad, truncated,
   corrupt or too big file an error, never a panic), CRC-32, and
   the base64 frame a PNG travels in over serial, streamed from the stack
@@ -525,6 +526,14 @@ own PR that updates that doc first.
   `lumen_ui::App` (its drawing and its hands' boxes as damage, checked
   against full repaints); `args` (`run clock`'s arguments); `rtc` (what it
   shows while RTC reads fail, as the taskbar's clock) (host-tested).
+- `crates/lumen-view`: the image viewer app's logic (#204): an image at 1:1
+  (`actual`, `Pan`) or fitted (`fitted`, `scale`: nearest neighbour), what
+  it decodes (`admit`: the file's length, then the size and inflated bytes
+  from the header), `prepare` (its one call for an image: `Prepared`, or
+  `Why`, out of memory told apart), and its memory plan (`MEMORY_BYTES`;
+  `tests/memory.rs` runs `prepare` on the bundled images, worst-case PNGs
+  and the longest file through `lumen-heap` over its heap size)
+  (host-tested).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
@@ -549,7 +558,9 @@ own PR that updates that doc first.
   `testkit`); `template`, the app `make app NAME=` copies
   (`tools/new-app.sh`); `calculator` (#207, the first app on the SDK's
   `ui::Toolkit`, lumen-ui inside the app); `clock` (#200, an analog face
-  on `run_until`, `--at` freezing it); `xray` (#208, the trace rings
+  on `run_until`, `--at` freezing it); `viewer` (#204, bundled images
+  decoded inside the app by `lumen-png`, `apps/viewer/images/` made by
+  `tools/viewer-images.py`); `xray` (#208, the trace rings
   live, `--replay` frozen); the SDK's loops (`run_with`'s
   `Taken`, `run_until` for a `Ticking` app, both returning `Ended`;
   `Event::offer`; `with_area`, `palette`) for the animated apps; the
