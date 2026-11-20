@@ -1,27 +1,39 @@
-//! Minimal, allocation-free ELF64 (little-endian) reader.
+//! Minimal `no_std` ELF64 (little-endian) reader, static program-header
+//! loader, and System V / `musl` initial user stack builder.
 //!
-//! The kernel uses this to symbolize addresses in crash reports: Limine hands
-//! the kernel its own ELF file, and [`SymbolTable::lookup`] maps an
-//! instruction pointer to `function+offset`. It must work with no heap and in
-//! a crashed kernel, so it only borrows the input bytes, never panics on
-//! malformed input, and every read is bounds-checked.
+//! - **Crash symbolization (zero-alloc):** [`Elf`] and [`SymbolTable::lookup`]
+//!   borrow the kernel's ELF image with no heap allocation, never panic on
+//!   malformed input, and bounds-check every read.
+//! - **Static ELF64 loading ([`loader`]):** validates `ET_EXEC` and static PIE
+//!   `ET_DYN` `x86_64` program headers, enforces W^X and user-space bounds,
+//!   handles RELRO shared 4 KiB boundary pages, and computes `AT_PHDR` and
+//!   `initial_brk`.
+//! - **Initial user stack ([`stack`]):** builds a 16-byte-aligned System V /
+//!   `musl` initial stack (`argc`, `argv`, `envp`, `auxv`, `AT_RANDOM`,
+//!   `AT_EXECFN`) directly into a caller-provided buffer with zero heap
+//!   allocations.
 //!
 //! The crate is `no_std` and has host-side unit tests (`cargo test -p lumen-elf`).
 
 #![no_std]
 
+extern crate alloc;
+
+pub mod loader;
+pub mod stack;
+
 use core::fmt;
 
-const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
-const ELFCLASS64: u8 = 2;
-const ELFDATA2LSB: u8 = 1;
+pub(crate) const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+pub(crate) const ELFCLASS64: u8 = 2;
+pub(crate) const ELFDATA2LSB: u8 = 1;
 
 /// Section type of a full symbol table.
 pub const SHT_SYMTAB: u32 = 2;
 /// Symbol type: function / code.
 pub const STT_FUNC: u8 = 2;
 
-const EHDR_SIZE: usize = 64;
+pub(crate) const EHDR_SIZE: usize = 64;
 const SHDR_SIZE: usize = 64;
 const SYM_SIZE: usize = 24;
 
@@ -53,13 +65,13 @@ impl fmt::Display for ElfError {
     }
 }
 
-fn read_u16(b: &[u8], off: usize) -> Option<u16> {
+pub(crate) fn read_u16(b: &[u8], off: usize) -> Option<u16> {
     Some(u16::from_le_bytes(b.get(off..off.checked_add(2)?)?.try_into().ok()?))
 }
-fn read_u32(b: &[u8], off: usize) -> Option<u32> {
+pub(crate) fn read_u32(b: &[u8], off: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(off..off.checked_add(4)?)?.try_into().ok()?))
 }
-fn read_u64(b: &[u8], off: usize) -> Option<u64> {
+pub(crate) fn read_u64(b: &[u8], off: usize) -> Option<u64> {
     Some(u64::from_le_bytes(b.get(off..off.checked_add(8)?)?.try_into().ok()?))
 }
 

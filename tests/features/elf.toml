@@ -1,0 +1,8 @@
+# Features: ELF loading. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Static ELF64 loader (ET_EXEC / PIE ET_DYN, W^X, RELRO shared 4 KiB boundary pages, AT_PHDR) and System V / musl initial user stack builder (16-byte alignment, auxv)"
+milestone = "M6"
+tests = [
+    "cargo:lumen-elf",
+]
