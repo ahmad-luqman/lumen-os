@@ -3085,8 +3085,9 @@ Lumen runs two kinds of user code:
   up to 6 arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9` (`r10` replaces
   `rcx`, which `syscall` overwrites with user RIP). Return value in `rax`:
   `0..=usize::MAX - 4096` on success, or negated Linux `errno` (`-4095..=-1`)
-  on error. Every callee-saved register (`rbx`, `rbp`, `r12`–`r15`) and user
-  `rsp` are preserved across `syscall`.
+  on error. **Every GPR except `rax`, `rcx`, and `r11`** (including `rdi`,
+  `rsi`, `rdx`, `r8`, `r9`, `r10`, `rbx`, `rbp`, `r12`–`r15`, and user `rsp`)
+  is preserved across `syscall`, matching `musl`'s `syscall_arch.h`.
 - **ABI types:** sourced from a pinned `no_std` crate (`linux-raw-sys` or
   `syscalls`, adopted in its own PR) so syscall numbers, `errno` constants,
   `utsname`, `timespec`, `iovec`, `stat`, `termios`, and `sigaction` layouts
@@ -3094,7 +3095,7 @@ Lumen runs two kinds of user code:
 - **Unknown syscalls:** return `-ENOSYS` (`-38`) and log once per syscall
   number per boot at `debug` level (never panic or kill the process).
 
-#### M6 initial syscall table (static `musl` & `busybox ash` built-ins)
+#### M6 initial syscall table (30 syscalls: static `musl` & `busybox ash` built-ins)
 
 | # | Syscall | M6 behaviour |
 |---|---|---|
@@ -3102,65 +3103,96 @@ Lumen runs two kinds of user code:
 | 1 | `write(fd, buf, count)` | fd 1/2 write to the console/serial output via `copy_from_user`; other fds `-EBADF` |
 | 3 | `close(fd)` | closes an open entry in the process's FD table; `-EBADF` if absent |
 | 5 | `fstat(fd, statbuf)` | minimal character-device `stat` for fd 0/1/2 (so `musl` stdio and `busybox ash` detect a terminal); `-EBADF` otherwise |
-| 9 | `mmap(addr, len, prot, flags, fd, off)` | `MAP_ANONYMOUS \| MAP_PRIVATE` (and `MAP_FIXED`), demand-paged via `lumen-vm` (section 5); file-backed `mmap` arrives in M7 |
-| 10 | `mprotect(addr, len, prot)` | updates VMA rights and mapped PTEs (local `invlpg` in M6–M7; cross-CPU shootdown in M8) |
-| 11 | `munmap(addr, len)` | unmaps pages, frees frames, splits/removes VMAs |
-| 12 | `brk(addr)` | queries (`addr == 0`) or grows/shrinks the heap VMA page-aligned above the ELF image |
-| 13 | `rt_sigaction(sig, act, oldact, sigsetsize)` | M6 no-op stub returning 0 (stores/clears `oldact` if non-null) so `busybox ash` startup succeeds; real signal dispatch arrives in M8 |
-| 14 | `rt_sigprocmask(how, set, oldset, sigsetsize)` | M6 per-thread signal mask bookkeeping; real delivery arrives in M8 |
-| 16 | `ioctl(fd, req, arg)` | on fd 0/1/2: `TCGETS` (`0x5401`) and `TIOCGWINSZ` (`0x5413`) return fixed console geometry; all other requests `-ENOTTY` |
-| 20 | `writev(fd, iov, iovcnt)` | validates `iovcnt <= 1024`, copies `iovec` array via `copy_from_user`, writes each span to fd 1/2 |
+| 9 | `mmap(addr, len, prot, flags, fd, off)` | `MAP_ANONYMOUS` with `MAP_PRIVATE` or `MAP_SHARED` (rejecting `MAP_ANONYMOUS` without either, and rejecting `len == 0`, with `-EINVAL`; ignoring `fd` and `off`); supports `MAP_FIXED`, `MAP_FIXED_NOREPLACE` (`-EEXIST`), and `PROT_NONE` guard VMAs; demand-paged via `lumen-vm` (section 5); file-backed `mmap` arrives in M7 |
+| 10 | `mprotect(addr, len, prot)` | updates VMA rights (splitting sub-VMAs when needed) and mapped PTEs (preserving `PROT_NONE` frames, section 5); returns `0` on `len == 0` (page-aligned `addr`), `-ENOMEM` on any unmapped hole; local `invlpg` in M6–M7, cross-CPU shootdown in M8 |
+| 11 | `munmap(addr, len)` | unmaps pages, frees frames, splits/removes VMAs; ignores unmapped holes, returns `-EINVAL` on `len == 0` or misaligned `addr` |
+| 12 | `brk(addr)` | tracks a byte-granular heap cursor (backing VMAs page-aligned); returns current `brk` on `addr == 0`, exact requested `addr` on success, and unchanged current `brk` on any failure (`addr < initial_brk`, VMA overlap, OOM)—never `-ENOMEM` |
+| 13 | `rt_sigaction(sig, act, oldact, sigsetsize)` | requires `sigsetsize == 8` (`-EINVAL` otherwise); rejects non-null `act` for `SIGKILL`/`SIGSTOP` (`-EINVAL`); stores a per-process 64-entry `sigaction` table so `oldact` preserves prior handlers/`SIG_IGN`; real signal dispatch arrives in M8 |
+| 14 | `rt_sigprocmask(how, set, oldset, sigsetsize)` | requires `sigsetsize == 8`; maintains per-thread signal mask (silently dropping `SIGKILL`/`SIGSTOP`); real delivery arrives in M8 |
+| 16 | `ioctl(fd, req, arg)` | on fd 0/1/2: `TCGETS` (`0x5401`) fills a default `struct termios`, `TCSETS`/`TCSETSW`/`TCSETSF` (`0x5402`–`0x5404`) succeed as no-ops (0), and `TIOCGWINSZ` (`0x5413`) fills `struct winsize` with console rows/cols; all other requests `-ENOTTY` |
+| 19 | `readv(fd, iov, iovcnt)` | validates `0 <= iovcnt <= 1024`, copies `iovec` array via `copy_from_user`, skips zero-length spans without dereferencing `iov_base`, reads from fd 0 (needed by `musl` `__stdio_read` for buffered stdin) |
+| 20 | `writev(fd, iov, iovcnt)` | validates `0 <= iovcnt <= 1024`, copies `iovec` array via `copy_from_user`, skips zero-length spans without dereferencing `iov_base`, writes each span to fd 1/2 |
 | 39 | `getpid()` | returns process PID (`>= 1`) |
 | 60 | `exit(status)` | terminates the calling thread (and single-threaded M6 process), recording exit status |
 | 63 | `uname(buf)` | fills `utsname` (`sysname = "Linux"`, `release = "6.6.0-lumen"`, `machine = "x86_64"`) so `musl`/Alpine binaries accept the kernel |
-| 79 | `getcwd(buf, size)` | returns `"/"` in M6 (real cwd from VFS in M7) |
+| 79 | `getcwd(buf, size)` | copies `"/"\0` and returns `2` (byte length including the NUL terminator), or `-ERANGE` if `size < 2` (real cwd from VFS in M7) |
 | 102 | `getuid()` | returns `0` in M6 |
 | 104 | `getgid()` | returns `0` in M6 |
 | 107 | `geteuid()` | returns `0` in M6 |
 | 108 | `getegid()` | returns `0` in M6 |
 | 110 | `getppid()` | returns parent PID (`0` for kernel-spawned root process) |
 | 111 | `getpgrp()` | returns process PID in M6 (real process groups in M8) |
-| 158 | `arch_prctl(code, addr)` | `ARCH_SET_FS` (`0x1002`, checks `addr < USER_MAX`), `ARCH_GET_FS` (`0x1003`); other codes `-EINVAL` |
+| 158 | `arch_prctl(code, addr)` | `ARCH_SET_FS` (`0x1002`, validates `addr < USER_MAX`, `0` allowed); `ARCH_GET_FS` (`0x1003`, writes `fs_base` to `*addr` via `copy_to_user` and returns `0`); other codes `-EINVAL` |
 | 186 | `gettid()` | returns thread TID |
 | 218 | `set_tid_address(tidptr)` | stores `clear_child_tid` pointer and returns current TID |
-| 228 | `clock_gettime(clockid, tp)` | `CLOCK_REALTIME` (0, from RTC/boot offset), `CLOCK_MONOTONIC` (1), `CLOCK_MONOTONIC_COARSE` (6), `CLOCK_BOOTTIME` (7) |
+| 228 | `clock_gettime(clockid, tp)` | `CLOCK_REALTIME` (0, from RTC/boot offset), `CLOCK_MONOTONIC` (1), `CLOCK_MONOTONIC_RAW` (4), `CLOCK_REALTIME_COARSE` (5), `CLOCK_MONOTONIC_COARSE` (6), `CLOCK_BOOTTIME` (7) |
 | 231 | `exit_group(status)` | terminates the process and frees its `AddressSpace` and FD table |
-| 302 | `prlimit64(pid, res, new, old)` | returns sane defaults for `RLIMIT_STACK` (8 MiB), `RLIMIT_NOFILE` (1024), `RLIMIT_AS` (`RLIM_INFINITY`) when `old` is non-null |
-| 318 | `getrandom(buf, len, flags)` | fills user buffer from `crate::rng` (section 7) via `copy_to_user` |
+| 302 | `prlimit64(pid, res, new, old)` | M6 read-only defaults for `RLIMIT_STACK` (8 MiB), `RLIMIT_NOFILE` (1024), `RLIMIT_AS` (`RLIM_INFINITY`) when `old` is non-null; writable per-process limit enforcement arrives in M10 |
+| 318 | `getrandom(buf, len, flags)` | rejects unknown flag bits (`-EINVAL`), fills user buffer from `crate::rng` (section 7) via `copy_to_user`, and returns bytes written |
 
-M7 adds POSIX file and directory syscalls (`openat`, `newfstatat`, `statx`,
-`getdents64`, `lseek`, `pread64`/`pwrite64`, `readlinkat`, `symlinkat`,
-`linkat`, `unlinkat`, `mkdirat`, `renameat2`, `ftruncate`, `fcntl`, `flock`,
-`chdir`, file-backed `mmap`). M8 adds `fork`/`vfork`/`clone`/`execve`/`wait4`,
-`futex`, real signals (`rt_sigreturn`, `sigaltstack`, `kill`/`tgkill`),
-`pipe2`/`dup*`, `poll`/`ppoll`/`select`, and PTYs. M9 adds BSD sockets,
-`AF_UNIX`, `epoll_*`, `eventfd2`, and `timerfd_*`. M10 adds `mremap`,
-`madvise`, `memfd_create`, `inotify_*`, `sysinfo`, and full `SIGURG`/`SIGSEGV`
-`ucontext_t` delivery.
+Because `musl` on `x86_64` invokes legacy non-`*at` / non-`*2` syscalls
+directly (unlike `aarch64`), later milestones wire both the `*at` and legacy
+x86-64 entry points (trivial shims over `*at(AT_FDCWD, ...)`):
+
+- **M7 (POSIX VFS & dynamic linking):** `open` (2) (called by `ld-musl`
+  `dynlink.c`), `openat` (257), `stat` (4), `lstat` (6), `newfstatat` (262),
+  `statx` (332), `access` (21), `faccessat` (269), `lseek` (8), `pread64`
+  (17), `pwrite64` (18), `getdents64` (217), `fsync` (74), `fdatasync` (75),
+  `sync` (162), `truncate` (76), `ftruncate` (77), `rename` (82), `renameat2`
+  (316), `mkdir` (83), `mkdirat` (258), `rmdir` (84), `link` (86), `linkat`
+  (265), `unlink` (87), `unlinkat` (263), `symlink` (88), `symlinkat` (266),
+  `readlink` (89), `readlinkat` (267), `chmod` (90), `fchmod` (91), `chown`
+  (92), `fchown` (93), `lchown` (94), `umask` (95), `utimensat` (280),
+  `chdir` (80), `fchdir` (81), `fcntl` (72), `flock` (73), and file-backed
+  `mmap`.
+- **M8 (Processes, threads, signals, `futex`, PTYs):** `fork`/`vfork`/`clone`/
+  `execve`/`wait4`, `futex`, real signals (`rt_sigreturn`, `sigaltstack`,
+  `kill`/`tgkill`, `si_addr = CR2`), `pipe` (22) + `pipe2` (293),
+  `dup`/`dup2`/`dup3`, `poll`/`ppoll`/`select`, `nanosleep` (35) +
+  `clock_nanosleep` (230), `clock_getres`, `getrusage`, `prctl(PR_SET_NAME)`,
+  `statfs`/`fstatfs`, and PTYs (`setsid`, `setpgid`, `tcsetpgrp`, `termios`).
+- **M9 (Networking & async I/O):** BSD sockets including both `accept` (43)
+  and `accept4` (288), `AF_UNIX` (`socketpair`, `SCM_RIGHTS`), `epoll_*`,
+  `eventfd2`, and `timerfd_*`.
+- **M10 (JIT VM & Tier-1 runtimes):** `mremap`, `madvise` (`MADV_DONTNEED`,
+  `MADV_FREE`), `memfd_create`, `inotify_*`, writable `prlimit64`, `sysinfo`,
+  and full `SIGURG`/`SIGSEGV` `ucontext_t` delivery.
 
 ### Static ELF64 loader and initial stack (designed in #230, M6; dynamic `PT_INTERP` in M7)
 
 - **Validation (`crates/lumen-elf`, host-tested, or `xmas-elf`/`goblin`):**
   checks ELF64 little-endian `ET_EXEC` (or `ET_DYN` PIE), `EM_X86_64`, no
-  overlapping `PT_LOAD` segments, `p_filesz <= p_memsz`, every mapped range
-  within `USER_MIN..USER_MAX`, and no segment both writable and executable
-  (W^X). Malformed binaries are rejected before any process slot is created,
-  leaving kernel heap and frames unchanged.
+  overlapping `PT_LOAD` byte ranges (`p_vaddr..p_vaddr + p_memsz`),
+  `p_filesz <= p_memsz`, every mapped range within `USER_MIN..USER_MAX`, and no
+  single `PT_LOAD` segment both writable and executable (W^X). Because real
+  Alpine ELFs often place adjacent `R--` and `RW-` segments (RELRO) on a shared
+  4 KiB boundary page, overlap is checked on byte ranges and a shared boundary
+  page receives the union of both segments' permissions without zeroing or
+  overwriting bytes already copied from the prior segment. Malformed binaries
+  are rejected before any process slot is created, leaving kernel heap and
+  frames unchanged.
 - **Loading (M6):** creates an `AddressSpace`, maps each `PT_LOAD` segment with
   its `PF_R`/`PF_W`/`PF_X` rights, copies `p_filesz` bytes and zero-fills the
   `p_memsz - p_filesz` `.bss` tail, records the initial `brk` page-aligned
   above the highest segment, and maps the initial user stack VMA below
   `USER_STACK_TOP`.
-- **Initial stack (`musl` System V ABI):** 16-byte-aligned at `_start`, laid
-  out top-down with `argv`/`envp` strings, 16 random bytes for `AT_RANDOM`
-  (from `crate::rng`), the auxiliary vector (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`,
-  `AT_PAGESZ = 4096`, `AT_ENTRY`, `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`,
-  `AT_SECURE = 0`, `AT_RANDOM`, `AT_NULL`), `envp` pointers + null, `argv`
-  pointers + null, and `argc` at `[rsp]`.
+- **Initial stack and register hygiene (`musl` System V ABI):** `%rsp` is
+  16-byte-aligned at `_start` (`argc` at `[rsp]`, inserting an 8-byte pad above
+  `auxv` whenever `1 + argc + 1 + envc + 1` is odd), and **every other GPR is
+  zeroed** (especially `%rdx = 0`, which SysV AMD64 `_start` treats as an
+  `atexit` function pointer). Stack contents top-down: `argv`/`envp` strings,
+  `execfn` string, 16 random bytes for `AT_RANDOM` (from `crate::rng`), the
+  auxiliary vector (`AT_PHDR` = mapped user VA `load_bias + PT_PHDR.p_vaddr` or
+  `load_bias + seg.p_vaddr + (e_phoff - seg.p_offset)` in the `PT_LOAD`
+  covering `e_phoff`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ = 4096`, `AT_ENTRY`,
+  `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`, `AT_SECURE = 0`, `AT_CLKTCK = 100`,
+  `AT_EXECFN`, `AT_RANDOM`, `AT_NULL`; `AT_BASE` is omitted or 0 for static
+  PIE), `envp` pointers + null, `argv` pointers + null, and `argc` at `[rsp]`.
 - **M6 scope for `busybox ash`:** M6 runs embedded/test static `musl` binaries
-  (including `busybox ash` exercising built-in commands such as `echo`, `pwd`,
-  `export`, arithmetic, loops, and `exit`). Pipes and external subprocesses
-  require `fork`/`pipe2`/`dup2`/`wait4` and arrive in M8.
+  (including `busybox ash -s` exercising built-in commands such as `echo`,
+  `pwd`, `export`, arithmetic, loops, and `exit` over serial without job
+  control). Interactive `lineedit`, pipes, and external subprocesses require
+  `fork`/`pipe`/`dup2`/`wait4`/PTYs and arrive in M8.
 - **Dynamic linking (M7):** when `PT_INTERP` is present (e.g.
   `/lib/ld-musl-x86_64.so.1`), the loader maps the interpreter at
   `INTERP_BASE`, sets `AT_BASE` to the interpreter base and `AT_ENTRY` to the
@@ -4405,15 +4437,21 @@ kernel (no SSE); #197 checks the results' bits.
   disk image, and verify.
 - **POSIX VFS & pseudo-filesystems (M7; adapted from `Starry`/`axfs_vfs`):**
   - Mount table plus dentry and inode caches (`crates/lumen-vfs`, host-tested).
-  - Full POSIX metadata and operations: `openat`, `read`/`write`/`pread`/`pwrite`,
-    `lseek`, `getdents64`, `stat`/`fstat`/`newfstatat`/`statx`, symlinks
-    (`symlinkat`/`readlinkat`/`lstat` with `ELOOP`), hard links (`linkat`) and
-    unlink-while-open inode refcounting, atomic `renameat2`,
-    `truncate`/`ftruncate`, `chmod`/`chown`/`umask`, `fcntl`, and advisory file
-    locks (`flock` and `F_SETLK`—required by SQLite, Cargo, and Git).
+  - Full POSIX metadata and operations (both `*at` and legacy x86-64 shims
+    called by `musl`, section 8): `open`/`openat`,
+    `read`/`write`/`pread64`/`pwrite64`, `lseek`, `getdents64`,
+    `stat`/`lstat`/`fstat`/`newfstatat`/`statx`, `access`/`faccessat`,
+    `fsync`/`fdatasync`/`sync`, symlinks (`symlink`/`symlinkat`/
+    `readlink`/`readlinkat` with `ELOOP`), hard links (`link`/`linkat`) and
+    unlink-while-open inode refcounting, atomic `rename`/`renameat2`,
+    `truncate`/`ftruncate`, `chmod`/`fchmod`/`chown`/`fchown`/`lchown`/
+    `umask`, `utimensat`, `fcntl`, and advisory file locks (`flock` and
+    `F_SETLK`—required by SQLite, Cargo, and Git).
   - Pseudo-filesystems: `/tmp` (`tmpfs`), `/dev` (`null`, `zero`, `urandom`,
     `random`, `tty`, plus `/dev/ptmx` and `/dev/pts/*` in M8), `/proc`
-    (`self/exe`, `self/fd`, `self/maps`, `cpuinfo`, `meminfo`).
+    (`self/exe`, `self/fd`, `self/maps` in strict Linux `start-end rwxp offset
+    dev:dev ino path` format so `musl`'s `pthread_getattr_np` parses main-stack
+    bounds, `cpuinfo`, `meminfo`).
 - **Snapshots, namespaces & agent undo (M11):** per-process VFS mount
   namespaces confine sandboxed processes and agents to explicitly granted
   subtrees (`..` cannot escape a mount root). OverlayFS or block-level CoW
