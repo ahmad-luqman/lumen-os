@@ -265,7 +265,7 @@ REPLAY = {
     "cpu 1": "cpu 1 off",
     "cpu 1 runq": "-",
     "cpu 1 thread": "-",
-    "cpu 1 irqs": "0",
+    "cpu 1 irqs": "10",
     "cpu 1 locks": "0",
     "cpu 2": "cpu 2",
     "cpu 2 runq": "2",
@@ -278,7 +278,7 @@ REPLAY = {
 
 def test_xray_golden(boot, artifacts, golden_dir):
     # `run xray --replay`: the frozen view of a fixed trace (three CPUs,
-    # the middle one offline), its labels as the trace gives them, Pause
+    # the middle one there for ten columns, then offline), its labels as the trace gives them, Pause
     # and Resume disabled, no period (it settles), its window against a
     # golden; closed, it exits with 0.
     m = desktop(boot)

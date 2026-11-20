@@ -3,12 +3,13 @@
 //!
 //! - **The tree** (on the left, in lumen-ui through the SDK's toolkit):
 //!   Pause and Resume, a `State` label (`live`, `paused` or `replay`), and
-//!   a row for each CPU of fixed-width labels: `cpu <n>` (with ` off` while
-//!   it isn't online), `cpu <n> runq` (its run queue's length, from its
-//!   newest `runq` event), `cpu <n> thread` (the thread running, from its
-//!   newest `switch`), `cpu <n> irqs` and `cpu <n> locks` (the handled
-//!   device interrupts and the locks that waited, read so far). A value not
-//!   known yet is `-`.
+//!   a row for each CPU of fixed-width labels: `cpu <n>` (`cpu <n> off`
+//!   only while its reads are refused), `cpu <n> runq` (its run queue's
+//!   length, from its newest `runq` event), `cpu <n> thread` (the thread
+//!   running, from its newest `switch`), `cpu <n> irqs` and `cpu <n> locks`
+//!   (the handled device interrupts and the locks that waited, read so far).
+//!   A value not known yet (nothing read, or the queue and thread of a CPU
+//!   gone offline) is `-`.
 //! - **The lanes** (on the right, the app's own drawing): one per CPU, a
 //!   column per refresh, swept left to right over the oldest: the run
 //!   queue's longest length in the column as a bar (the palette's accent),
@@ -41,7 +42,7 @@ use lumen_app::ui::{Flow, Taken, Ticking, Toolkit};
 use lumen_app::{Desktop, Error, Event as WindowEvent, Time, Trace, log};
 use lumen_trace::Event;
 use lumen_ui::{App, Over, Then, Ui, UiEvent, Widget};
-use lumen_xray::{COLUMNS, Cpu, View, replay};
+use lumen_xray::{COLUMNS, Cpu, Presence, Span, View, replay};
 
 lumen_app::manifest!(time, desktop, trace);
 lumen_app::main!(run);
@@ -121,9 +122,9 @@ struct Xray {
     /// One read's bytes, and its events decoded.
     buf: Vec<u8>,
     events: Vec<Event>,
-    /// Whether each CPU was online at the last refresh (a change repaints
-    /// its lane).
-    online: Vec<bool>,
+    /// Each CPU's presence at the last refresh (a change repaints its
+    /// lane).
+    presence: Vec<Presence>,
     drawn: Vec<Area>,
     /// Why a read failed (the loop ends then; the app exits with 1).
     failed: Option<Error>,
@@ -178,7 +179,7 @@ impl Xray {
             ui.set_disabled(pause, true);
             ui.set_disabled(resume, true);
         }
-        let online = view.cpus().iter().map(|c| c.online).collect();
+        let presence = view.cpus().iter().map(|c| c.presence).collect();
         let mut x = Xray {
             ui,
             view,
@@ -190,7 +191,7 @@ impl Xray {
             trace,
             buf: vec![0; HEADER_SIZE + EVENT_SIZE * TRACE_EVENTS_PER_READ],
             events: Vec::with_capacity(TRACE_EVENTS_PER_READ),
-            online,
+            presence,
             drawn: Vec::new(),
             failed: None,
         };
@@ -201,12 +202,15 @@ impl Xray {
     /// The labels set from the view (`set_text` changes only what differs).
     fn show(&mut self) {
         for (i, (row, c)) in self.rows.iter().zip(self.view.cpus()).enumerate() {
-            let label = if c.online { format!("cpu {i}") } else { format!("cpu {i} off") };
+            let label = match c.presence {
+                Presence::Offline => format!("cpu {i} off"),
+                Presence::Unread | Presence::Online => format!("cpu {i}"),
+            };
             self.ui.set_text(row.cpu, &label);
             self.ui.set_text(row.runq, &shown(c.runq));
             self.ui.set_text(row.thread, &shown(c.thread));
-            self.ui.set_text(row.irqs, &format!("{}", c.irqs));
-            self.ui.set_text(row.locks, &format!("{}", c.locks));
+            self.ui.set_text(row.irqs, &shown(c.irqs));
+            self.ui.set_text(row.locks, &shown(c.locks));
         }
         self.ui.set_text(self.state, self.mode.name());
     }
@@ -257,6 +261,9 @@ impl Xray {
             return;
         }
         let col = cpu.column(c);
+        if col.span != Span::Counted {
+            return;
+        }
         let base = top + (LANE_H - LANE_GAP) as i32 - 2;
         let h = col.runq.min(RUNQ_CAP) as u32 * RUNQ_UNIT;
         if h > 0 {
@@ -300,9 +307,6 @@ impl App for Xray {
                 if let Some(b) = base.intersect(&part) {
                     over.surface.fill_rect(b, over.palette.border);
                 }
-                if !cpu.online {
-                    continue;
-                }
                 let first = ((part.x() - LANES_X) / COL_W as i32) as usize;
                 let last = ((part.right() - 1 - LANES_X) / COL_W as i32) as usize;
                 for c in first..=last.min(COLUMNS - 1) {
@@ -331,9 +335,9 @@ impl Ticking for Xray {
         let written = self.view.end_column();
         self.drawn.push(strip(written, n));
         self.drawn.push(strip(self.view.cursor(), n));
-        for (i, (was, c)) in self.online.iter_mut().zip(self.view.cpus()).enumerate() {
-            if *was != c.online {
-                *was = c.online;
+        for (i, (was, c)) in self.presence.iter_mut().zip(self.view.cpus()).enumerate() {
+            if *was != c.presence {
+                *was = c.presence;
                 self.drawn.push(lane(i));
             }
         }
