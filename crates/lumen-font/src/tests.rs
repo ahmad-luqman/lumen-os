@@ -282,6 +282,41 @@ fn rounding_helpers() {
 }
 
 #[test]
+fn glyphs_a_caller_refuses_are_never_rasterized() {
+    let face = face();
+    let mut font = Font::new(&face, MIB);
+    let before = rasterized();
+    let mut drawn = 0;
+    font.render_where(sample::TEXT, px(24), |_, _, _, _| false, |_| drawn += 1);
+    // Only the glyphs without ink (the space) still go through the cache:
+    // their box is empty, so there is nothing to refuse.
+    let mut inkless: Vec<u16> =
+        sample::TEXT.chars().map(|c| face.glyph_index(c)).filter(|&g| face.ink_box(g, px(24)).width == 0).collect();
+    inkless.sort_unstable();
+    inkless.dedup();
+    assert!(!inkless.is_empty());
+    assert_eq!(drawn, 0);
+    assert_eq!(rasterized() - before, inkless.len() as u64);
+    assert_eq!(font.stats().misses, inkless.len() as u64);
+    // Only the glyphs whose box reaches x < 12: the first letter or two.
+    let all = placed(&mut Font::new(&face, MIB), sample::TEXT, px(24));
+    let mut font = Font::new(&face, MIB);
+    let before = rasterized();
+    let mut kept = Vec::new();
+    font.render_where(sample::TEXT, px(24), |x, _, _, _| x < 12, |g| kept.push((g.x(), g.y())));
+    let want: Vec<(i32, i32)> = all.iter().filter(|g| g.0 < 12).map(|g| (g.0, g.1)).collect();
+    assert!(!want.is_empty() && want.len() < all.len());
+    assert_eq!(kept, want);
+    assert_eq!(rasterized() - before, font.stats().misses);
+    assert!(font.stats().misses < all.len() as u64);
+    // Keeping everything is `render`.
+    let mut font = Font::new(&face, MIB);
+    let mut every = Vec::new();
+    font.render_where(sample::TEXT, px(24), |_, _, _, _| true, |g| every.push((g.x(), g.y())));
+    assert_eq!(every, all.iter().map(|g| (g.0, g.1)).collect::<Vec<_>>());
+}
+
+#[test]
 fn a_second_render_rasterizes_nothing() {
     let face = face();
     let mut font = Font::new(&face, MIB);

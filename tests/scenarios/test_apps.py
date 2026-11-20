@@ -15,12 +15,11 @@ line and its thread's join.
 
 import re
 
-from lumen_harness import gui
+from lumen_harness import gui, klog
 from lumen_harness.gui import parse_records, poll
 from lumen_harness.klog import STAMP
 from lumen_harness.screen import PROMPT
 from lumen_harness.shell import heap_line, run, wait_for_output
-from PIL import Image
 
 BOOT_TIMEOUT = 60
 STARTED = re.compile(r"^run: started (\S+) as app (\d+)$")
@@ -285,9 +284,6 @@ def test_app_log_is_cut_and_sanitised(boot):
 
 # -- windows (#206) -------------------------------------------------------------
 
-# The window frame's title bar (kernel/src/desktop.rs METRICS).
-TITLE_H = 24
-
 
 def boot_desktop(boot):
     m = boot_shell(boot)
@@ -309,17 +305,15 @@ def test_template_app_runs(boot):
     )
     assert done, record
     gui.wait_settled(m)
-    x, y, w, h = gui.bounds(gui.window(m, "template"))
-    box = (x + 1, y + TITLE_H, x + w - 1, y + h - 1)
-
-    def client(name: str) -> bytes:
-        with Image.open(m.screendump(name)) as img:
-            return img.convert("RGB").crop(box).tobytes()
-
-    before = client("template-before.png")
+    before = gui.client_pixels(m, "template", "template-before.png")
     assert len(set(before)) > 2, "the template drew nothing"
     gui.type_confirmed(m, "a")
-    gui.wait_for(m, "the key redrawn", lambda: client("template-after.png"), lambda c: c != before)
+    gui.wait_for(
+        m,
+        "the key redrawn",
+        lambda: gui.client_pixels(m, "template", "template-after.png"),
+        lambda c: c != before,
+    )
     assert gui.invoke_close(m, "template") == f"ui invoke: window {row['id']} closed\n"
     end_line(m, mark, "template", app_id, "exited with 0")
     wait_gone(m, app_id, record["thread"])
@@ -349,18 +343,24 @@ def test_app_ignoring_close_is_ended(boot):
 
 def test_window_calls_refuse_bad_arguments(boot):
     # The `abuse` app's `window` checks (see its doc): every refusal an
-    # error code, each asserted by the app; exit 0, no WARN or ERROR.
+    # error code, each asserted by the app (all of them run: the count is
+    # exact); exit 0, no WARN or ERROR but what a loaded host can cause.
     m = boot_desktop(boot)
     app_id, mark = start(m, "abuse window")
     found = wait_for_output(
         m, mark, r"INFO  app: abuse: abuse: window: (\d+) checks, (\d+) failed\n", 30
     )
     end_line(m, mark, "abuse", app_id, "exited with 0")
-    assert int(found[1]) >= 60 and found[2] == "0", m.output[mark:]
+    assert (int(found[1]), found[2]) == (ABUSE_WINDOW_CHECKS, "0"), m.output[mark:]
     serial = m.output[mark:]
-    assert "FAILED" not in serial and "WARN" not in serial and "ERROR" not in serial, serial
+    assert "FAILED" not in serial, serial
+    assert not klog.unexpected_warnings(serial), serial
     wait_unlisted(m, app_id)
     gui.wait_no_window(m, "abuse")
+
+
+# `abuse window`'s checks: every one runs, whatever the answers.
+ABUSE_WINDOW_CHECKS = 83
 
 
 def test_kill_wakes_an_app_waiting_on_its_window(boot):
@@ -382,3 +382,83 @@ def test_kill_wakes_an_app_waiting_on_its_window(boot):
     end_line(m, mark, "window", app_id, "killed")
     wait_gone(m, app_id, record["thread"])
     gui.wait_no_window(m, "window")
+
+
+def test_sdk_logs_a_long_line_cut(boot):
+    # The SDK cuts a line past TEXT_BYTES before `log` (the kernel would
+    # refuse it whole): its start is logged, cut at LOG_BYTES (5 + 251).
+    m = boot_shell(boot)
+    app_id, mark = start(m, "window log")
+    wait_for_output(m, mark, r"INFO  app: window: log: L{251}\n", 30)
+    end_line(m, mark, "window", app_id, "exited with 0")
+
+
+PANIC_END = r"WARN  app: window \(app \d+\) ended"
+
+
+def test_sdk_panic_says_where(boot):
+    # The SDK's panic handler: a 300-byte message cut so ` at <file>:<line>`
+    # fits; one WARN, the end line.
+    m = boot_shell(boot)
+    app_id, mark = start(m, "window panic", allow=PANIC_END)
+    end_line(m, mark, "window", app_id, r"ended: panicked: p{50,299} at \S+\.rs:\d+", "WARN")
+    wait_unlisted(m, app_id, PANIC_END)
+    warnings = klog.unexpected_warnings(m.output[mark:])
+    assert len(warnings) == 1 and "ended: panicked" in warnings[0], warnings
+
+
+def test_sdk_allocator_frees(boot):
+    # 64 rounds of 256 KiB allocated and freed in a 2 MiB memory: only a
+    # heap that frees gets through them.
+    m = boot_shell(boot)
+    app_id, mark = start(m, "window alloc")
+    wait_for_output(m, mark, r"INFO  app: window: window: alloc: 64 rounds\n", 30)
+    end_line(m, mark, "window", app_id, "exited with 0")
+
+
+RED = (0xFF, 0x00, 0x00)
+
+
+def test_sdk_commits_more_rects_than_one_call_takes(boot):
+    # 20 rectangles (past COMMIT_RECTS: the SDK commits in turns) over the
+    # right half of a red canvas, from x = 100: that half is red on the
+    # screen, the left half (never committed) isn't.
+    m = boot_desktop(boot)
+    app_id, mark = start(m, "window rects")
+    wait_for_output(m, mark, r"INFO  app: window: window: rects: committed 20\n", 30)
+    row = gui.wait_window(m, "window")
+    gui.wait_settled(m)
+    w = int(row["w"]) - 2
+    pixels = gui.client_pixels(m, "window", "rects.png")
+
+    def at(x: int, y: int) -> tuple[int, ...]:
+        i = (y * w + x) * 3
+        return tuple(pixels[i : i + 3])
+
+    for y in (0, 50, 99):
+        assert all(at(x, y) == RED for x in range(100, 200)), y
+        assert all(at(x, y) != RED for x in range(100)), y
+    assert gui.invoke_close(m, "window") == f"ui invoke: window {row['id']} closed\n"
+    end_line(m, mark, "window", app_id, "exited with 0")
+
+
+def test_an_app_that_closes_its_window_has_no_close_grace(boot):
+    # Its title sanitised (ESC and LF as U+FFFD); given `Close`, it drops
+    # its window, then sleeps far past CLOSE_GRACE_SLICES slice ends: listed
+    # with no window meanwhile, and ending with its own 0, never "didn't
+    # close its window".
+    m = boot_desktop(boot)
+    app_id, mark = start(m, "window close")
+    title = "a\ufffdb\ufffdc"
+    row = gui.wait_window(m, title)
+    assert gui.invoke_close(m, title) == f"ui invoke: window {row['id']} closed\n"
+    wait_for_output(m, mark, r"INFO  app: window: window: closed it\n", 30)
+    record, done = poll(
+        m,
+        lambda: app(m, app_id),
+        lambda a: a is None or (a["windows"] == "0" and int(a["slices"]) > 4),
+        30,
+    )
+    assert done and record is not None, f"app {app_id} gone before it was seen without its window"
+    end_line(m, mark, "window", app_id, "exited with 0")
+    assert "didn't close its window" not in m.output[mark:]

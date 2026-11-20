@@ -796,6 +796,27 @@ def wait_no_window(m: Machine, title: str, timeout: float = 30) -> None:
     )
 
 
+# A window frame's title bar, in pixels (kernel/src/desktop.rs METRICS).
+TITLE_H = 24
+
+
+def client_box(row: dict[str, str]) -> tuple[int, int, int, int]:
+    """A `windows` row's client area on the screen, as PIL's crop box
+    (left, top, right, bottom): inside its border, below its title bar."""
+    x, y, w, h = bounds(row)
+    return x + 1, y + TITLE_H, x + w - 1, y + h - 1
+
+
+def client_pixels(m: Machine, title: str, name: str) -> bytes:
+    """Window `title`'s client area in a screendump named `name`, as RGB
+    bytes row after row."""
+    from PIL import Image
+
+    box = client_box(window(m, title))
+    with Image.open(m.screendump(name)) as img:
+        return img.convert("RGB").crop(box).tobytes()
+
+
 def invoke_close(m: Machine, title: str) -> str:
     """`ui invoke <root> close` on the window titled `title`: what it said."""
     root = node(ui_tree(m), "window", title)

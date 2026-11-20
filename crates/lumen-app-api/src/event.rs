@@ -157,6 +157,80 @@ pub mod buttons {
     pub const EXTRA: u8 = 4;
 }
 
+/// The modifier state after a key event (`Event::Key`'s `mods`): one raw
+/// byte on the wire, [`mods`]' bits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Mods(u8);
+
+impl Mods {
+    pub const fn from_bits(bits: u8) -> Mods {
+        Mods(bits)
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Whether any of `bits` ([`mods`]' constants) is set.
+    pub const fn any(self, bits: u8) -> bool {
+        self.0 & bits != 0
+    }
+
+    pub const fn shift(self) -> bool {
+        self.any(mods::SHIFT)
+    }
+
+    pub const fn ctrl(self) -> bool {
+        self.any(mods::CTRL)
+    }
+
+    pub const fn alt(self) -> bool {
+        self.any(mods::ALT)
+    }
+
+    pub const fn capslock(self) -> bool {
+        self.any(mods::CAPSLOCK)
+    }
+
+    pub const fn numlock(self) -> bool {
+        self.any(mods::NUMLOCK)
+    }
+}
+
+impl From<lumen_input::Mods> for Mods {
+    fn from(m: lumen_input::Mods) -> Mods {
+        Mods(m.bits())
+    }
+}
+
+/// The pointer buttons held (a pointer event's `buttons`): one raw byte on
+/// the wire, a button numbered `n` ([`buttons`]) at bit `1 << n`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Buttons(u8);
+
+impl Buttons {
+    pub const fn from_bits(bits: u8) -> Buttons {
+        Buttons(bits)
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Whether the button numbered `number` ([`buttons`]) is held.
+    pub const fn has(self, number: u8) -> bool {
+        number < 8 && self.0 & (1 << number) != 0
+    }
+}
+
+impl From<lumen_input::Buttons> for Buttons {
+    fn from(set: lumen_input::Buttons) -> Buttons {
+        Buttons(set.each().fold(0, |bits, b| bits | 1 << button(b)))
+    }
+}
+
 /// A button's number on the wire.
 pub fn button(b: lumen_input::Button) -> u8 {
     match b {
@@ -166,16 +240,6 @@ pub fn button(b: lumen_input::Button) -> u8 {
         lumen_input::Button::Side => buttons::SIDE,
         lumen_input::Button::Extra => buttons::EXTRA,
     }
-}
-
-/// A set of held buttons on the wire: each one's bit `1 << button(b)`.
-pub fn button_set(set: lumen_input::Buttons) -> u8 {
-    set.each().fold(0, |bits, b| bits | 1 << button(b))
-}
-
-/// A modifier state on the wire ([`mods`]'s bits).
-pub fn mods_byte(m: lumen_input::Mods) -> u8 {
-    m.bits()
 }
 
 /// What a key event did.
@@ -189,14 +253,46 @@ pub enum KeyAction {
     Release,
 }
 
+/// A `set_value` request's text: at most [`SET_VALUE_BYTES`], whichever
+/// way it is made ([`SetValue::try_from`], or decoded: a longer one is
+/// refused, postcard's `SerdeDeCustom`), so every [`Event`] fits
+/// [`EVENT_BYTES`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct SetValue(String);
+
+impl SetValue {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<&str> for SetValue {
+    type Error = TooLong;
+
+    fn try_from(text: &str) -> Result<SetValue, TooLong> {
+        if text.len() > SET_VALUE_BYTES { Err(TooLong) } else { Ok(SetValue(String::from(text))) }
+    }
+}
+
+impl<'de> Deserialize<'de> for SetValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<SetValue, D::Error> {
+        // A string postcard decodes is no longer than the bytes it was
+        // handed (it checks before allocating).
+        let text = String::deserialize(d)?;
+        if text.len() > SET_VALUE_BYTES {
+            return Err(serde::de::Error::custom("a set_value text past SET_VALUE_BYTES"));
+        }
+        Ok(SetValue(text))
+    }
+}
+
 /// An automation request's action (`lumen_ui::Action`), for the app's
 /// node `node`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     Press,
-    /// At most [`SET_VALUE_BYTES`] (a longer one is refused before it is
-    /// encoded: [`Event::request`]).
-    SetValue(String),
+    SetValue(SetValue),
     Select,
     Focus,
     Close,
@@ -215,7 +311,7 @@ pub enum Event {
     },
     Key {
         code: KeyCode,
-        mods: u8,
+        mods: Mods,
         action: KeyAction,
     },
     /// Client coordinates; `button` a [`buttons`] number, `buttons` the
@@ -224,18 +320,18 @@ pub enum Event {
         x: i32,
         y: i32,
         button: u8,
-        buttons: u8,
+        buttons: Buttons,
     },
     PointerUp {
         x: i32,
         y: i32,
         button: u8,
-        buttons: u8,
+        buttons: Buttons,
     },
     PointerMove {
         x: i32,
         y: i32,
-        buttons: u8,
+        buttons: Buttons,
     },
     FocusGained,
     /// Every key and button counts as released.
@@ -264,7 +360,7 @@ impl Event {
             lumen_input::KeyAction::Press { text } => KeyAction::Press { text },
             lumen_input::KeyAction::Release => KeyAction::Release,
         };
-        Event::Key { code: k.code.into(), mods: mods_byte(k.mods), action }
+        Event::Key { code: k.code.into(), mods: k.mods.into(), action }
     }
 
     /// The theme `id` with the toolkit's `palette` for it.
@@ -277,8 +373,7 @@ impl Event {
     pub fn request(node: u64, action: &lumen_ui::Action) -> Result<Event, TooLong> {
         let action = match action {
             lumen_ui::Action::Press => Action::Press,
-            lumen_ui::Action::SetValue(text) if text.len() > SET_VALUE_BYTES => return Err(TooLong),
-            lumen_ui::Action::SetValue(text) => Action::SetValue(text.clone()),
+            lumen_ui::Action::SetValue(text) => Action::SetValue(SetValue::try_from(text.as_str())?),
             lumen_ui::Action::Select => Action::Select,
             lumen_ui::Action::Focus => Action::Focus,
             lumen_ui::Action::Close => Action::Close,
@@ -318,36 +413,84 @@ mod tests {
         Palette { background: 1, text: 2, accent: 3, accent_text: 4, border: 5, disabled: 6, field: 0x80 }
     }
 
+    fn sv(text: &str) -> SetValue {
+        SetValue::try_from(text).unwrap()
+    }
+
+    /// Each variant's tag, as an exhaustive match (no `_` arm): a variant
+    /// added fails to build here until its tag, and its bytes below, are
+    /// pinned.
+    fn event_tag(e: &Event) -> u8 {
+        match e {
+            Event::Theme { .. } => 0,
+            Event::Key { .. } => 1,
+            Event::PointerDown { .. } => 2,
+            Event::PointerUp { .. } => 3,
+            Event::PointerMove { .. } => 4,
+            Event::FocusGained => 5,
+            Event::FocusLost => 6,
+            Event::Lost => 7,
+            Event::Close => 8,
+            Event::Request { .. } => 9,
+        }
+    }
+
+    fn action_tag(a: &Action) -> u8 {
+        match a {
+            Action::Press => 0,
+            Action::SetValue(_) => 1,
+            Action::Select => 2,
+            Action::Focus => 3,
+            Action::Close => 4,
+            Action::Minimize => 5,
+            Action::Restore => 6,
+        }
+    }
+
+    fn key_action_tag(a: &KeyAction) -> u8 {
+        match a {
+            KeyAction::Press { .. } => 0,
+            KeyAction::Release => 1,
+        }
+    }
+
     #[test]
     fn every_variant_s_encoding_is_pinned() {
         let p = palette();
         let cases: Vec<(Event, Vec<u8>)> = alloc::vec![
             (Event::Theme { theme: ThemeId::Dark, palette: p }, alloc::vec![0, 1, 1, 2, 3, 4, 5, 6, 0x80, 1]),
             (
-                Event::Key { code: KeyCode::A, mods: mods::LSHIFT, action: KeyAction::Press { text: Some('A') } },
+                Event::Key {
+                    code: KeyCode::A,
+                    mods: Mods::from_bits(mods::LSHIFT),
+                    action: KeyAction::Press { text: Some('A') },
+                },
                 alloc::vec![1, 61, 1, 0, 1, 1, b'A'],
             ),
             (
-                Event::Key { code: KeyCode::Escape, mods: 0, action: KeyAction::Press { text: None } },
+                Event::Key { code: KeyCode::Escape, mods: Mods::default(), action: KeyAction::Press { text: None } },
                 alloc::vec![1, 0, 0, 0, 0],
             ),
             (
-                Event::Key { code: KeyCode::Unknown, mods: 0xff, action: KeyAction::Release },
+                Event::Key { code: KeyCode::Unknown, mods: Mods::from_bits(0xff), action: KeyAction::Release },
                 alloc::vec![1, 124, 0xff, 1],
             ),
             // Zigzagged: -1 is 1, 2 is 4.
-            (Event::PointerDown { x: -1, y: 2, button: buttons::RIGHT, buttons: 0b10 }, alloc::vec![2, 1, 4, 1, 2],),
-            (Event::PointerUp { x: 64, y: 0, button: buttons::LEFT, buttons: 0 }, alloc::vec![3, 0x80, 1, 0, 0, 0]),
-            (Event::PointerMove { x: 3, y: -2, buttons: 0b101 }, alloc::vec![4, 6, 3, 5]),
+            (
+                Event::PointerDown { x: -1, y: 2, button: buttons::RIGHT, buttons: Buttons::from_bits(0b10) },
+                alloc::vec![2, 1, 4, 1, 2],
+            ),
+            (
+                Event::PointerUp { x: 64, y: 0, button: buttons::LEFT, buttons: Buttons::default() },
+                alloc::vec![3, 0x80, 1, 0, 0, 0],
+            ),
+            (Event::PointerMove { x: 3, y: -2, buttons: Buttons::from_bits(0b101) }, alloc::vec![4, 6, 3, 5]),
             (Event::FocusGained, alloc::vec![5]),
             (Event::FocusLost, alloc::vec![6]),
             (Event::Lost, alloc::vec![7]),
             (Event::Close, alloc::vec![8]),
             (Event::Request { node: 300, action: Action::Press }, alloc::vec![9, 0xac, 2, 0]),
-            (
-                Event::Request { node: 1, action: Action::SetValue(String::from("hi")) },
-                alloc::vec![9, 1, 1, 2, b'h', b'i'],
-            ),
+            (Event::Request { node: 1, action: Action::SetValue(sv("hi")) }, alloc::vec![9, 1, 1, 2, b'h', b'i'],),
             (Event::Request { node: 1, action: Action::Select }, alloc::vec![9, 1, 2]),
             (Event::Request { node: 1, action: Action::Focus }, alloc::vec![9, 1, 3]),
             (Event::Request { node: 1, action: Action::Close }, alloc::vec![9, 1, 4]),
@@ -356,6 +499,37 @@ mod tests {
         ];
         for (event, bytes) in &cases {
             assert_eq!(&enc(event), bytes, "{event:?}");
+            // The first byte is the tag the exhaustive match pins; a
+            // request's third byte its action's, a key's fourth its action's.
+            assert_eq!(bytes[0], event_tag(event), "{event:?}");
+            match event {
+                Event::Request { action, .. } => {
+                    assert_eq!(bytes[bytes.len() - action_bytes(action)], action_tag(action))
+                }
+                Event::Key { action, .. } => assert_eq!(bytes[3], key_action_tag(action)),
+                _ => {}
+            }
+        }
+        // Every tag of each enum pinned above.
+        let mut tags: Vec<u8> = cases.iter().map(|(e, _)| event_tag(e)).collect();
+        tags.dedup();
+        assert_eq!(tags, (0..=9).collect::<Vec<u8>>());
+        let mut actions: Vec<u8> = cases
+            .iter()
+            .filter_map(|(e, _)| match e {
+                Event::Request { action, .. } => Some(action_tag(action)),
+                _ => None,
+            })
+            .collect();
+        actions.dedup();
+        assert_eq!(actions, (0..=6).collect::<Vec<u8>>());
+    }
+
+    /// The bytes an action takes at the end of a request's encoding.
+    fn action_bytes(a: &Action) -> usize {
+        match a {
+            Action::SetValue(text) => 2 + text.as_str().len(),
+            _ => 1,
         }
     }
 
@@ -401,47 +575,60 @@ mod tests {
 
     #[test]
     fn kernel_types_convert() {
-        use lumen_input::{Button, Buttons, KeyEvent, Mods};
+        use lumen_input::{Button, KeyEvent};
         let k = KeyEvent {
             code: lumen_input::KeyCode::Return,
             action: lumen_input::KeyAction::Press { text: Some('\n') },
-            mods: Mods::NONE.with_shift().with_ctrl(),
+            mods: lumen_input::Mods::NONE.with_shift().with_ctrl(),
             after_drop: false,
         };
         assert_eq!(
             Event::key(&k),
             Event::Key {
                 code: KeyCode::Return,
-                mods: mods::LSHIFT | mods::LCTRL,
+                mods: Mods::from_bits(mods::LSHIFT | mods::LCTRL),
                 action: KeyAction::Press { text: Some('\n') }
             }
         );
-        let up = KeyEvent { action: lumen_input::KeyAction::Release, mods: Mods::NONE, ..k };
-        assert_eq!(Event::key(&up), Event::Key { code: KeyCode::Return, mods: 0, action: KeyAction::Release });
-        // Every modifier bit, from pc-keyboard's state.
-        let mut m = pc_modifiers();
-        m.lshift = true;
-        m.rshift = true;
-        m.lctrl = true;
-        m.rctrl = true;
-        m.lalt = true;
-        m.ralt = true;
-        m.capslock = true;
-        m.numlock = true;
-        assert_eq!(mods_byte(Mods::from(&m)), 0xff);
-        let mut only = pc_modifiers();
-        only.ralt = true;
-        assert_eq!(mods_byte(Mods::from(&only)), mods::RALT);
-        let mut only = pc_modifiers();
-        only.capslock = true;
-        assert_eq!(mods_byte(Mods::from(&only)), mods::CAPSLOCK);
+        let up = KeyEvent { action: lumen_input::KeyAction::Release, mods: lumen_input::Mods::NONE, ..k };
+        assert_eq!(
+            Event::key(&up),
+            Event::Key { code: KeyCode::Return, mods: Mods::default(), action: KeyAction::Release }
+        );
+        // Each of pc-keyboard's eight modifier fields alone: its own bit.
+        type Set = fn(&mut pc_keyboard::Modifiers);
+        let fields: [(Set, u8); 8] = [
+            (|m| m.lshift = true, mods::LSHIFT),
+            (|m| m.rshift = true, mods::RSHIFT),
+            (|m| m.lctrl = true, mods::LCTRL),
+            (|m| m.rctrl = true, mods::RCTRL),
+            (|m| m.lalt = true, mods::LALT),
+            (|m| m.ralt = true, mods::RALT),
+            (|m| m.capslock = true, mods::CAPSLOCK),
+            (|m| m.numlock = true, mods::NUMLOCK),
+        ];
+        let mut all = pc_modifiers();
+        for (set, bit) in fields {
+            let mut m = pc_modifiers();
+            set(&mut m);
+            set(&mut all);
+            assert_eq!(Mods::from(lumen_input::Mods::from(&m)).bits(), bit);
+        }
+        assert_eq!(Mods::from(lumen_input::Mods::from(&all)).bits(), 0xff);
+        assert_eq!(Mods::from(lumen_input::Mods::from(&pc_modifiers())).bits(), 0);
+        let m = Mods::from_bits(mods::RSHIFT | mods::LALT | mods::NUMLOCK);
+        assert_eq!((m.shift(), m.ctrl(), m.alt(), m.capslock(), m.numlock()), (true, false, true, false, true));
         // Buttons.
         for b in Button::ALL {
             assert_eq!(button(b) as usize, b.index());
-            assert_eq!(button_set(b.into()), 1 << b.index());
+            let set = Buttons::from(lumen_input::Buttons::from(b));
+            assert_eq!(set.bits(), 1 << b.index());
+            assert!(set.has(button(b)));
         }
-        assert_eq!(button_set(Buttons::LEFT.with(Buttons::EXTRA)), 0b1_0001);
-        assert_eq!(button_set(Buttons::NONE), 0);
+        let two = Buttons::from(lumen_input::Buttons::LEFT.with(lumen_input::Buttons::EXTRA));
+        assert_eq!(two.bits(), 0b1_0001);
+        assert!(two.has(buttons::LEFT) && two.has(buttons::EXTRA) && !two.has(buttons::RIGHT) && !two.has(9));
+        assert_eq!(Buttons::from(lumen_input::Buttons::NONE).bits(), 0);
         // The theme and its palette.
         let ui = lumen_ui::Palette {
             background: 10,
@@ -455,6 +642,11 @@ mod tests {
         let e = Event::theme(lumen_wm::ThemeId::Light, &ui);
         let Event::Theme { theme, palette } = e else { panic!("{e:?}") };
         assert_eq!(theme, ThemeId::Light);
+        // Field by field, so two swapped fields can't pass.
+        assert_eq!(
+            palette,
+            Palette { background: 10, text: 11, accent: 12, accent_text: 13, border: 14, disabled: 15, field: 16 }
+        );
         assert_eq!(lumen_ui::Palette::from(palette), ui);
         for id in lumen_wm::ThemeId::ALL {
             assert_eq!(lumen_wm::ThemeId::from(ThemeId::from(id)), id);
@@ -485,6 +677,16 @@ mod tests {
         ] {
             assert_eq!(Event::request(3, &ui), Ok(Event::Request { node: 3, action: wire }));
         }
+        // The text type itself: built at most at the cap, and a longer one
+        // refused when decoded too (an app can't be handed one).
+        assert_eq!(SetValue::try_from("v".repeat(SET_VALUE_BYTES + 1).as_str()), Err(TooLong));
+        assert_eq!(sv("abc").as_str(), "abc");
+        let mut bytes = alloc::vec![9, 1, 1, 0x81, 0x04];
+        bytes.extend(core::iter::repeat_n(b'v', SET_VALUE_BYTES + 1));
+        assert_eq!(Event::decode(&bytes), Err(DecodeError::Postcard(postcard::Error::SerdeDeCustom)));
+        let mut at = alloc::vec![9, 1, 1, 0x80, 0x04];
+        at.extend(core::iter::repeat_n(b'v', SET_VALUE_BYTES));
+        assert!(Event::decode(&at).is_ok());
     }
 
     /// The largest event: a request with the biggest node id and a
@@ -492,7 +694,7 @@ mod tests {
     fn largest() -> Event {
         let text: String = core::iter::repeat_n('\u{10ffff}', SET_VALUE_BYTES / 4).collect();
         assert_eq!(text.len(), SET_VALUE_BYTES);
-        Event::Request { node: u64::MAX, action: Action::SetValue(text) }
+        Event::Request { node: u64::MAX, action: Action::SetValue(sv(&text)) }
     }
 
     #[test]
@@ -513,9 +715,13 @@ mod tests {
         };
         for e in [
             Event::Theme { theme: ThemeId::Dark, palette: p },
-            Event::Key { code: KeyCode::Unknown, mods: 0xff, action: KeyAction::Press { text: Some('\u{10ffff}') } },
-            Event::PointerDown { x: i32::MIN, y: i32::MIN, button: 0xff, buttons: 0xff },
-            Event::PointerMove { x: i32::MIN, y: i32::MAX, buttons: 0xff },
+            Event::Key {
+                code: KeyCode::Unknown,
+                mods: Mods::from_bits(0xff),
+                action: KeyAction::Press { text: Some('\u{10ffff}') },
+            },
+            Event::PointerDown { x: i32::MIN, y: i32::MIN, button: 0xff, buttons: Buttons::from_bits(0xff) },
+            Event::PointerMove { x: i32::MIN, y: i32::MAX, buttons: Buttons::from_bits(0xff) },
         ] {
             assert!(enc(&e).len() < 64, "{e:?}");
         }
@@ -526,9 +732,9 @@ mod tests {
         for e in [
             largest(),
             Event::Theme { theme: ThemeId::Light, palette: palette() },
-            Event::Key { code: KeyCode::Q, mods: 3, action: KeyAction::Press { text: Some('é') } },
-            Event::PointerUp { x: -300, y: 70000, button: 1, buttons: 0 },
-            Event::Request { node: 9, action: Action::SetValue(String::from("12+3")) },
+            Event::Key { code: KeyCode::Q, mods: Mods::from_bits(3), action: KeyAction::Press { text: Some('é') } },
+            Event::PointerUp { x: -300, y: 70000, button: 1, buttons: Buttons::default() },
+            Event::Request { node: 9, action: Action::SetValue(sv("12+3")) },
             Event::Close,
         ] {
             out.push(enc(&e));

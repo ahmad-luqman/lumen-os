@@ -1,7 +1,9 @@
-//! A Lumen app to start from (`make app NAME=foo` copies it to apps/foo):
-//! it opens a window titled with its crate's name, draws its name and the
-//! keys typed so far in the desktop theme's colours, redraws on each key
-//! and on each theme switch, and returns 0 when its window is closed.
+//! A Lumen app, as apps/template has it (`make app NAME=<name>` copies it
+//! to apps/<name>: change it from here): it opens a window titled with its
+//! crate's name, draws its name and the keys typed so far in the desktop
+//! theme's colours, redraws on each key and on each theme switch, and
+//! returns 0 when its window is closed (the `Window` dropped with it closes
+//! the window).
 
 #![no_std]
 

@@ -6,9 +6,10 @@
 //! - a global allocator over the app's fixed memory (`heap`), and a panic
 //!   handler that reports the message through `panic` (the runtime ends the
 //!   app with it: one WARN);
-//! - safe wrappers over the host functions: [`log`]'s functions, [`Time`],
+//! - safe wrappers over every host function: [`log`]'s functions, [`Time`],
 //!   [`Desktop`] (opening a window, measuring text), [`Window`] (its canvas,
-//!   commits, events, text drawn into the canvas), [`args`];
+//!   commits, events, text drawn into the canvas), [`Trace`] (X-ray's
+//!   reads), [`args`] and [`exit`];
 //! - [`api`] (`lumen-app-api`): the error codes, the limits, the fixed
 //!   layouts and [`Event`].
 //!
@@ -31,12 +32,12 @@ use alloc::vec::Vec;
 use core::num::NonZeroU32;
 
 pub use lumen_app_api as api;
-pub use lumen_app_api::event::{Event, KeyAction, KeyCode, Palette, ThemeId};
+pub use lumen_app_api::event::{Buttons, Event, KeyAction, KeyCode, Mods, Palette, ThemeId, buttons, mods};
 pub use lumen_app_api::layout::Rect;
 pub use lumen_app_api::{Error, Grant, LogLevel};
 
 use lumen_app_api::layout::{CANVAS_SIZE, Canvas, RECT_SIZE, TextDraw};
-use lumen_app_api::limits::{ARGS_BYTES, COMMIT_RECTS, EVENT_BYTES};
+use lumen_app_api::limits::{ARGS_BYTES, COMMIT_RECTS, EVENT_BYTES, TEXT_BYTES, WINDOW_PIXELS};
 use sys::ptr;
 
 #[global_allocator]
@@ -78,13 +79,26 @@ impl Handle {
 }
 
 /// The kernel log: lines tagged with the app's name (`INFO  app: <name>:
-/// <text>`), at most `TEXT_BYTES` each, cut and sanitised by the kernel.
+/// <text>`). The kernel takes at most `TEXT_BYTES` a line (refusing more)
+/// and shows at most `LOG_BYTES` of it, sanitised; these functions cut a
+/// longer text to `TEXT_BYTES` on a char boundary first, so its start is
+/// logged rather than nothing.
 pub mod log {
-    use super::{Error, Grant, Handle, LogLevel, check, ptr, sys};
+    use super::{Error, Grant, Handle, LogLevel, TEXT_BYTES, check, ptr, sys};
 
-    /// Log `text` at `level`.
+    /// `text`'s first `TEXT_BYTES` at most, cut on a char boundary.
+    fn cut(text: &str) -> &str {
+        let mut end = text.len().min(TEXT_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
+    }
+
+    /// Log `text` (cut to `TEXT_BYTES`) at `level`.
     pub fn log(level: LogLevel, text: &str) -> Result<(), Error> {
         let h = Handle::find(Grant::Log)?;
+        let text = cut(text);
         check(sys::log(h.raw(), level as i32, ptr(text.as_ptr()), text.len() as i32)).map(|_| ())
     }
 
@@ -105,14 +119,14 @@ pub mod log {
     }
 }
 
-/// `run`'s arguments after the app's name.
-pub fn args() -> Vec<String> {
+/// `run`'s arguments after the app's name; `BadArgument` if one isn't
+/// UTF-8 (the shell only passes UTF-8, but a word isn't dropped silently).
+pub fn args() -> Result<Vec<String>> {
     let mut buf = [0u8; ARGS_BYTES];
     // SAFETY: `buf` is ours to write.
-    let n = unsafe { sys::args_read(ptr(buf.as_mut_ptr()), buf.len() as i32) };
-    let Ok(n) = check(n) else { return Vec::new() };
+    let n = check(unsafe { sys::args_read(ptr(buf.as_mut_ptr()), buf.len() as i32) })?;
     lumen_app_api::args::words(&buf[..n as usize])
-        .map(|w| String::from(core::str::from_utf8(w).unwrap_or("")))
+        .map(|w| core::str::from_utf8(w).map(String::from).map_err(|_| Error::BadArgument))
         .collect()
 }
 
@@ -146,6 +160,35 @@ impl Time {
     }
 }
 
+/// The per-CPU trace rings, read only (`caps` `trace`; X-ray, #208).
+#[derive(Clone, Copy, Debug)]
+pub struct Trace(Handle);
+
+impl Trace {
+    pub fn get() -> Result<Trace> {
+        Handle::find(Grant::Trace).map(Trace)
+    }
+
+    /// One past the highest online CPU's index (an index below it may
+    /// still be offline).
+    pub fn cpus(&self) -> Result<u32> {
+        check(sys::trace_cpus(self.0.raw()))
+    }
+
+    /// CPU `cpu`'s ring `stream` (0 main, 1 X-ray) from sequence number
+    /// `since` into `buf`: the header (`api::trace::decode_header`), then
+    /// the events copied (`api::trace::decode_event`), whose count is the
+    /// result.
+    pub fn read(&self, stream: u32, cpu: u32, since: u64, buf: &mut [u8]) -> Result<u32> {
+        let since = i64::try_from(since).map_err(|_| Error::BadArgument)?;
+        let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
+        // SAFETY: `buf` is ours to write, and the host writes at most `len`
+        // bytes of it.
+        let r = unsafe { sys::trace_read(self.0.raw(), stream as i32, cpu as i32, since, ptr(buf.as_mut_ptr()), len) };
+        check(r)
+    }
+}
+
 /// The desktop (`caps` `desktop`): opening a window, and the UI font.
 #[derive(Clone, Copy, Debug)]
 pub struct Desktop(Handle);
@@ -155,7 +198,7 @@ impl Desktop {
         Handle::find(Grant::Desktop).map(Desktop)
     }
 
-    /// A line's height at `px` (8 to 96).
+    /// A line's height at `px` (`TEXT_PX_MIN..=TEXT_PX_MAX`).
     pub fn line_height(&self, px: u32) -> Result<u32> {
         check(sys::text_line_height(self.0.raw(), px as i32))
     }
@@ -168,7 +211,13 @@ impl Desktop {
     /// Open the app's window (one per app): `w` × `h` client pixels titled
     /// `title`, in front and focused, with a canvas of its size to draw in.
     pub fn open_window(&self, title: &str, w: u32, h: u32) -> Result<Window> {
-        let pixels = (w as usize).checked_mul(h as usize).ok_or(Error::BadArgument)?;
+        // The host's size check, made before the canvas is reserved, so a
+        // bad size is `BadArgument` and not `OutOfMemory`.
+        let pixels = u64::from(w) * u64::from(h);
+        if pixels == 0 || pixels > WINDOW_PIXELS {
+            return Err(Error::BadArgument);
+        }
+        let pixels = pixels as usize;
         let mut canvas = Vec::new();
         canvas.try_reserve_exact(pixels).map_err(|_| Error::OutOfMemory)?;
         canvas.resize(pixels, 0);
@@ -221,9 +270,9 @@ impl Window {
     /// Fill `r` (clipped to the canvas) with `rgb`.
     pub fn fill(&mut self, r: Rect, rgb: u32) {
         let Some(c) = r.clip(self.w, self.h) else { return };
-        for y in c.y..c.y + c.h {
+        for y in c.y()..c.y() + c.h() {
             let row = (y * self.w) as usize;
-            self.canvas[row + c.x as usize..row + (c.x + c.w) as usize].fill(rgb);
+            self.canvas[row + c.x() as usize..row + (c.x() + c.w()) as usize].fill(rgb);
         }
     }
 
@@ -307,26 +356,42 @@ impl Drop for Window {
     }
 }
 
-/// The app's panic: its message, through `panic` (the runtime ends the app
-/// with it). Formatted into a fixed buffer: a panic can come from the
-/// allocator running out.
+/// The most bytes of a panic's report: the kernel shows `LOG_BYTES`.
+const PANIC_BYTES: usize = 256;
+
+/// Text formatted into `bytes`, up to `cap` of them (the rest dropped).
+struct Buf {
+    bytes: [u8; PANIC_BYTES],
+    len: usize,
+    cap: usize,
+}
+
+impl core::fmt::Write for Buf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let n = s.len().min(self.cap - self.len);
+        self.bytes[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
+/// The app's panic: its message (cut so it fits) and ` at <file>:<line>`,
+/// through `panic` (the runtime ends the app with it: one WARN). Formatted
+/// into fixed buffers: a panic can come from the allocator running out.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    struct Buf {
-        bytes: [u8; 256],
-        len: usize,
+    use core::fmt::Write;
+    let mut place = Buf { bytes: [0; PANIC_BYTES], len: 0, cap: PANIC_BYTES / 2 };
+    if let Some(l) = info.location() {
+        let _ = write!(place, " at {}:{}", l.file(), l.line());
     }
-    impl core::fmt::Write for Buf {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let n = s.len().min(self.bytes.len() - self.len);
-            self.bytes[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
-            self.len += n;
-            Ok(())
-        }
-    }
-    let mut buf = Buf { bytes: [0; 256], len: 0 };
-    let _ = core::fmt::write(&mut buf, format_args!("{}", info.message()));
-    sys::panic(ptr(buf.bytes.as_ptr()), buf.len as i32)
+    let mut out = Buf { bytes: [0; PANIC_BYTES], len: 0, cap: PANIC_BYTES - place.len };
+    let _ = write!(out, "{}", info.message());
+    // A cut can leave a character's first bytes: the kernel shows them as
+    // U+FFFD.
+    out.cap = PANIC_BYTES;
+    let _ = out.write_str(core::str::from_utf8(&place.bytes[..place.len]).unwrap_or(""));
+    sys::panic(ptr(out.bytes.as_ptr()), out.len as i32)
 }
 
 /// The app's entry point: `lumen_app::main!(run);` with `fn run() -> i32`

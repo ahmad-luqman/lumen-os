@@ -80,16 +80,26 @@ tests = [
 ]
 
 [[feature]]
-name = "App SDK and windows for apps (#206): the guest crate `lumen-app` (an allocator over the app's fixed memory, a panic handler, the manifest and entry macros, safe wrappers), `apps/template` and `make app NAME=` (a copy that builds; bad, taken or existing names refused, making nothing); an app opens its window, draws into its canvas and commits it, reads its events (the theme first, keys typed through confirmed steps changing what it draws) and ends when the window is closed, its thread joined; the `Event` wire type (every variant's bytes pinned, the largest within its bound, trailing bytes and malformed values refused, no panic on any cut or flipped byte) and the window calls' fixed layouts and checks; every window and text call refuses bad handles, kinds, ranges, canvases, counts, sizes and text with an error code, keeps an event in hand across a too small buffer, and waits until a deadline; an app given `Close` that keeps its window is ended after its slice count; `kill` wakes an app waiting on its window; the launcher lists the bundled apps granting `desktop`, never a test app, and starts one"
+name = "App SDK and windows for apps (#206): the guest crate `lumen-app` (an allocator over the app's fixed memory that frees, a panic handler saying where, the manifest and entry macros, log lines cut to fit, safe wrappers), `apps/template` and `make app NAME=` (a copy that builds; bad, test, taken, twin, dependency or existing names refused, and a failed copy, making nothing); an app opens its window, draws into its canvas and commits it (more rectangles than one call takes, from any x), reads its events (the theme first, keys typed through confirmed steps changing what it draws) and ends when the window is closed, its thread joined, its title sanitised; the `Event` wire type (every variant's bytes and tags pinned, the largest within its bound, a `set_value` past its cap refused, trailing bytes and malformed values refused, no panic on any cut or flipped byte) and the window calls' fixed layouts and checks; every window and text call refuses bad handles and kinds, and the bad ranges, canvases, counts, sizes, text sizes and text the abuse checks list, with an error code, keeps an event in hand across a too small buffer, waits until a deadline and not less, and draws text only inside its clip and the window's size; window calls cost fuel by the pixel and by the glyph rasterized, only glyphs reaching the clip rasterized; a title is capped before it is copied; an app given `Close` that keeps its window is ended after its slice count, and one that closes it has no grace; `kill` wakes an app waiting on its window; the launcher lists the bundled apps granting `desktop`, never a test app, and starts one"
 milestone = "M5"
 tests = [
     "cargo:lumen-app-api",
+    "cargo:lumen-font",
     "harness:test_make_app::*",
     "ktest:lumen_kernel::app::tests::the_close_grace_ends_an_app_at_its_slice_ends",
     "ktest:lumen_kernel::app::tests::a_kill_wakes_the_app_s_window_wait",
+    "ktest:lumen_kernel::app::tests::window_calls_charge_their_fuel",
+    "ktest:lumen_kernel::app::tests::a_title_is_capped_before_it_is_copied",
+    "ktest:lumen_kernel::app::tests::every_bundled_app_passes_precheck",
+    "ktest:lumen_kernel::app::tests::the_launcher_lists_the_apps_granting_desktop",
     "scenario:test_apps::test_template_app_runs",
     "scenario:test_apps::test_app_ignoring_close_is_ended",
+    "scenario:test_apps::test_an_app_that_closes_its_window_has_no_close_grace",
     "scenario:test_apps::test_window_calls_refuse_bad_arguments",
     "scenario:test_apps::test_kill_wakes_an_app_waiting_on_its_window",
+    "scenario:test_apps::test_sdk_logs_a_long_line_cut",
+    "scenario:test_apps::test_sdk_panic_says_where",
+    "scenario:test_apps::test_sdk_allocator_frees",
+    "scenario:test_apps::test_sdk_commits_more_rects_than_one_call_takes",
     "scenario:test_gui::test_launcher_lists_desktop_apps_only",
 ]

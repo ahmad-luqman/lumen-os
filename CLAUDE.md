@@ -287,7 +287,8 @@ own PR that updates that doc first.
   `kill`; `desktop_apps` and `start`, the launcher's); `app/window.rs` the window and text calls (#206:
   `AppWindow`, an app's one window on the live desktop with the event in hand (`Held`) and `text_draw`'s
   scratch surface; the canvas copied in by rows; a request refused `no node` until #207; `window_wait`
-  through `blocking`, a kill waking it through the window's `Waker`); `app/host.rs` the `lumen` host
+  through `blocking`, a kill waking it through the window's `Waker`; fuel by the pixel and by the glyph
+  rasterized); `app/host.rs` the `lumen` host
   functions without a window (`entry`: the kill flag, a slice
   end with too little fuel left, `CALL_FUEL`, for every call; `ending` for `exit` and `panic`;
   `blocking` for `time_sleep` and #206's `window_wait`; `read_trace`); `app/tests.rs` the runtime's
@@ -301,8 +302,8 @@ own PR that updates that doc first.
   kernel, shared with the ktests: `LoopChecks`, its resume band from the loop's fuel per iteration) and
   its ktests, over hand-assembled modules (`app/modules.rs`: a long loop and call depth, one float
   operation per export, a bulk `memory.fill`, a generated large body). `app/wire.rs`: ktest only,
-  postcard over serde-derived types (the wire format's crates, linked ahead of the wire types, #206,
-  #207). `mm/heap.rs`'s `peak`/`reset_peak`: the heap's high-water mark (and, in the ktest
+  postcard's encoding and decoding rules over serde-derived types (the wire types themselves are
+  `lumen-app-api`'s `event` and `wire`, host-tested). `mm/heap.rs`'s `peak`/`reset_peak`: the heap's high-water mark (and, in the ktest
   kernel, `refuse_from`: the heap refusing big allocations, for `not enough memory`).
   `font.rs`: the desktop's anti-aliased text (`lumen-font`): `font::face`,
   the UI font parsed on first use and shared; `font::Text`, one drawing
@@ -486,11 +487,14 @@ own PR that updates that doc first.
   first recorded wins; `CloseGrace`), `host` (the `lumen` functions'
   signatures, `ENTRY`, `MEMORY`, all pinned), `trace` (`trace_read`'s
   layouts), `args`, `layout` (#206: `Canvas`, `Rect`, `TextDraw` and their
-  checks: `Canvas::pixels`, `Rect::clip`, `commit_count`, `title_len`),
-  `event` (#206: `Event`, the wire type `window_next_event` hands an app,
-  postcard; its wire tables `ThemeId`, `KeyCode`, `mods`, `buttons`, and
-  the conversions from `lumen-input`'s, `lumen-wm`'s and `lumen-ui`'s
-  types) (host-tested).
+  checks: `Canvas::pixels` giving a `CheckedCanvas`, the one way to a
+  clip's rows, `Rect::clip` giving a `Clipped`, `commit_count`), `event`
+  (#206: `Event`, the wire type `window_next_event` hands an app,
+  postcard; its wire tables `ThemeId`, `KeyCode`, `Mods`/`mods`,
+  `Buttons`/`buttons`, `SetValue`, and the conversions from `lumen-input`'s,
+  `lumen-wm`'s and `lumen-ui`'s types), `wire` (`wire_enum!`,
+  `DecodeError`, `decode_exact`), `sys` (the `lumen` imports, declared once
+  for the SDK and testkit; wasm32 only) (host-tested).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation

@@ -156,12 +156,16 @@ impl Text {
 
     /// Draw `text` at `px` with its line box's top-left corner at (`x`,
     /// `y`), in `color`, touching only pixels inside `clip`: each glyph's
-    /// mask blended on its own (no line mask allocated), clipped. Blending
-    /// isn't idempotent, so a redraw of one damaged rectangle passes that
-    /// rectangle and the pixels outside it stay as they were.
+    /// mask blended on its own (no line mask allocated), clipped. A glyph
+    /// whose box misses `clip` is skipped before it is rasterized, so the
+    /// work follows the clip, not the text (an app's `text_draw`, #206).
+    /// Blending isn't idempotent, so a redraw of one damaged rectangle
+    /// passes that rectangle and the pixels outside it stay as they were.
     #[allow(clippy::too_many_arguments, reason = "a line of text: where, what, how big, which colour, inside what")]
     pub fn draw(&mut self, s: &mut Surface, x: i32, y: i32, text: &str, px: Px, color: u32, clip: Rect) {
-        self.font.render(text, px, |g| match Mask::new(g.width(), g.height(), g.coverage()) {
+        let visible =
+            |gx: i32, gy: i32, w: u32, h: u32| Rect::new(gx, gy, w, h).translate(x, y).intersect(&clip).is_some();
+        self.font.render_where(text, px, visible, |g| match Mask::new(g.width(), g.height(), g.coverage()) {
             Some(mask) => s.blend_mask_in(&mask, x.saturating_add(g.x()), y.saturating_add(g.y()), color, clip),
             None => {
                 if GLYPHS_DROPPED.fetch_add(1, Ordering::Relaxed) == 0 {

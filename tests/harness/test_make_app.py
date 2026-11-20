@@ -53,6 +53,7 @@ def make_app(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 def app_dirs(repo: Path) -> list[str]:
+    """Every entry of apps/, dot ones too (a half-made copy would be one)."""
     return sorted(p.name for p in (repo / "apps").iterdir())
 
 
@@ -68,8 +69,9 @@ def test_a_new_app_is_the_template_renamed_and_builds(repo):
         assert (repo / "apps" / "foo" / f).read_bytes() == (
             REPO_ROOT / "apps" / "template" / f
         ).read_bytes()
-    # Built like `make apps` builds it, into the copy's own target
-    # directory (nothing left in the real one).
+    # Built as `make apps` builds every crate (`cargo build --release`, here
+    # with `-p foo`), into the copy's own target directory (nothing left in
+    # the real one).
     target = repo / "target-apps"
     env = dict(os.environ, CARGO_TARGET_DIR=str(target))
     built = subprocess.run(
@@ -101,9 +103,20 @@ def test_a_new_app_is_the_template_renamed_and_builds(repo):
         (("NAME=a.b",), "a.b: lower case letters, digits, - and _ only"),
         (("NAME=../x",), "../x: lower case letters, digits, - and _ only"),
         (("NAME=test-x",), "test-x: test- names are the runtime's test apps"),
-        (("NAME=template",), "template: that name is taken"),
-        (("NAME=testkit",), "testkit: that name is taken"),
-        (("NAME=lumen-app",), "lumen-app: that name is taken"),
+        (("NAME=template",), "apps/template already exists"),
+        (("NAME=testkit",), "apps/testkit already exists"),
+        (("NAME=lumen-app",), "apps/lumen-app already exists"),
+        # A leading `-` or `_` would break cargo for the whole workspace.
+        (("NAME=-x",), "-x: lower case letters, digits, - and _ only"),
+        (("NAME=_x",), "_x: lower case letters, digits, - and _ only"),
+        (("NAME=test_x",), "test_x: test- names are the runtime's test apps"),
+        # The same crate once `-` and `_` are alike: cargo's output file
+        # would be another crate's.
+        (("NAME=lumen_app",), "lumen_app: that name is taken (apps/lumen-app)"),
+        (("NAME=test_window",), "test_window: test- names are the runtime's test apps"),
+        # The workspace's path dependencies.
+        (("NAME=lumen-heap",), "lumen-heap: that name is taken (a dependency of apps/)"),
+        (("NAME=lumen_app_api",), "lumen_app_api: that name is taken (a dependency of apps/)"),
         # A test app's module name (apps/test-hello is `hello`): the kernel
         # refuses a name in both sets.
         (("NAME=hello",), "hello: a test app's name (apps/test-hello)"),
@@ -126,3 +139,19 @@ def test_an_existing_app_is_not_overwritten(repo):
     assert "make app: apps/bar already exists" in made.stderr, made.stderr
     assert sorted(p.name for p in (repo / "apps" / "bar").iterdir()) == ["mine.txt"]
     shutil.rmtree(repo / "apps" / "bar")
+
+
+def test_a_copy_that_fails_leaves_nothing_behind(repo):
+    # The rename fails (a template whose package isn't named `template`):
+    # the half-made copy, in its dot directory, is removed.
+    manifest = repo / "apps" / "template" / "Cargo.toml"
+    good = manifest.read_text()
+    before = app_dirs(repo)
+    try:
+        manifest.write_text(good.replace('name = "template"', 'name = "other"'))
+        made = make_app(repo, "NAME=baz")
+    finally:
+        manifest.write_text(good)
+    assert made.returncode != 0
+    assert "make app: apps/baz/Cargo.toml: couldn't rename its package" in made.stderr, made.stderr
+    assert app_dirs(repo) == before

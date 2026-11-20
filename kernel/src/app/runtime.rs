@@ -90,6 +90,10 @@ pub(super) struct AppCtx {
     stopping: Option<EndReason>,
     /// Its glyph cache over the UI font, made at its first text call.
     text: Option<crate::font::Text>,
+    /// ktest seam: the desktop `window_open` opens on (the live one
+    /// otherwise), `Desktop::without_screen` in the ktests.
+    #[cfg(feature = "ktest")]
+    pub(super) desktop: Option<crate::desktop::Desktop>,
 }
 
 impl AppCtx {
@@ -135,7 +139,8 @@ impl AppCtx {
         }
     }
 
-    /// Whether the app holds a window (it may hold `WINDOWS`, one).
+    /// Whether the app holds a window (it may hold `WINDOWS`, one: the
+    /// only window [`AppCtx::text_and_window`] can find).
     pub(super) fn has_window(&self) -> bool {
         self.handles.find(|o| matches!(o, Obj::Window(_))).is_some()
     }
@@ -159,6 +164,7 @@ impl AppCtx {
     /// Its glyph cache (made now if this is its first text call) and its
     /// window, if it has one; `Unavailable` if the UI font didn't load.
     pub(super) fn text_and_window(&mut self) -> Result<(&mut crate::font::Text, Option<&mut AppWindow>), Error> {
+        const _: () = assert!(lumen_app_api::limits::WINDOWS == 1, "text_draw draws for the app's one window");
         if self.text.is_none() {
             self.text = Some(crate::font::Text::new().map_err(|_| Error::Unavailable)?);
         }
@@ -168,6 +174,18 @@ impl AppCtx {
             Obj::Grant(_) => None,
         });
         Ok((text, window))
+    }
+
+    /// Fuel charged past what the slice had left, not yet taken (ktests).
+    #[cfg(feature = "ktest")]
+    pub(super) fn debt(&self) -> u64 {
+        self.debt
+    }
+
+    /// Glyphs its cache rasterized so far (ktests).
+    #[cfg(feature = "ktest")]
+    pub(super) fn glyphs_rasterized(&self) -> u64 {
+        self.text.as_ref().map_or(0, |t| t.stats().misses)
     }
 
     /// The app stops with `reason`: recorded (the first said wins), and
@@ -815,6 +833,8 @@ pub(super) fn new_ctx(state: Arc<AppState>, grants: Grants, args: Vec<u8>) -> Ap
         close_grace: CloseGrace::default(),
         stopping: None,
         text: None,
+        #[cfg(feature = "ktest")]
+        desktop: None,
     }
 }
 
@@ -1092,8 +1112,23 @@ pub(super) fn launch(name: &str, args: &[String], without: Grants) -> Result<Lau
 
 /// The bundled apps whose manifest grants `desktop`, by name (the
 /// launcher's; never the test apps).
-pub fn desktop_apps() -> impl Iterator<Item = &'static str> {
-    BUNDLED.iter().filter(|a| precheck(a.module).is_ok_and(|m| m.caps.has(Grant::Desktop))).map(|a| a.name)
+pub fn desktop_apps() -> Vec<&'static str> {
+    desktop_apps_in(BUNDLED)
+}
+
+/// The apps of `apps` whose manifest grants `desktop`. One that `precheck`
+/// refuses (too big, a bad manifest: `run` would refuse it too) is left
+/// out with a WARN naming why (`taskbar: <name>: <why>`), never silently.
+pub(super) fn desktop_apps_in(apps: &'static [App]) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    for app in apps {
+        match precheck(app.module) {
+            Ok(m) if m.caps.has(Grant::Desktop) => names.push(app.name),
+            Ok(_) => {}
+            Err(why) => log::warn!(target: "taskbar", "{}: {why}: not in the launcher", app.name),
+        }
+    }
+    names
 }
 
 /// Start app `name` with no arguments and every grant, as `run` does but

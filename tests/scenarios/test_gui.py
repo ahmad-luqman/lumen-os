@@ -610,7 +610,7 @@ def test_desktop_screenshot_matches_screendump(boot, artifacts):
 TERM_PAD, TERM_CELL_W, TERM_CELL_H = 4, 7, 16
 TERM_TEXT_RGB = (0xE6, 0xE6, 0xE6)
 TERM_BG_RGB = (0x0F, 0x14, 0x20)
-TITLE_H = 24
+TITLE_H = gui.TITLE_H
 NO_CANVAS = "life: a terminal window has no canvas: run it on a virtual terminal (Alt+F1)"
 TERM_THREADS = ("terminal", "term-shell")
 
@@ -1200,8 +1200,6 @@ def test_a_toolkit_window_repaints_in_a_new_theme(boot):
 # The bundled apps whose manifest grants `desktop` (#206: never a test app).
 DESKTOP_APPS = ["template"]
 LAUNCHER_ITEMS = ["Terminal", "Mandelbrot", "Life", "Counter", *DESKTOP_APPS]
-# Every test app (apps/test-<name>): none is ever in the launcher.
-TEST_APPS = ["abuse", "busy", "greedy", "hello", "nocap", "trap", "window"]
 # kernel/src/demo.rs `mandelbrot_owner`'s line.
 MANDEL_WINDOW = re.compile(
     r"INFO  demo: mandelbrot window (\d+): (\d+) CPUs? in \d+ ms, rows by CPU:((?: cpu\d+=\d+)+)\n"
@@ -1429,7 +1427,6 @@ def test_launcher_lists_desktop_apps_only(boot):
     assert gui.invoke(m, launcher["id"], "press").row is not None
     items = [r["name"] for r in gui.taskbar(m) if r["role"] == "menuitem"]
     assert items == LAUNCHER_ITEMS, items
-    assert not set(items) & set(TEST_APPS), items
     entry = gui.node(gui.taskbar(m), "menuitem", "template")
     got = gui.invoke(m, entry["id"], "press")
     assert got.message == f"ui invoke: ran; node {entry['id']} is gone", got

@@ -9,16 +9,25 @@
 //! Every call goes through `host::entry` and checks its arguments in
 //! section 8's order: the handle, then its kind; the fixed structures
 //! copied in, then every range they name; then the other values; then the
-//! work. A refused call writes nothing.
+//! work. A refused call writes nothing. Where a layout's own check comes
+//! within that order, section 8's "Fixed layouts" rows say so: a canvas's
+//! stride below its width is `BadArgument` before its rows' range, and
+//! `window_commit`'s count is checked before its rectangles' range (the
+//! count says how long that range is).
+//!
+//! Fuel, on top of `CALL_FUEL` (section 8's list): `PIXEL_FUEL` per pixel
+//! committed, per pixel of `text_draw`'s clip, per pixel of the three
+//! surfaces `window_open` fills, and `PIXEL_FUEL × px²` per glyph
+//! `text_draw` rasterizes (a glyph its cache didn't hold).
 
 use super::host::{C, Res, blocking, copy_in, copy_in_capped, entry, memory_len, write_out};
 use super::runtime::{self, AppCtx};
 use crate::desktop::{self, Animating, OpenError, Wait, WindowEvent, WindowHandle};
 use crate::{sched, time};
 use lumen_app_api::event::{self, Event};
-use lumen_app_api::layout::{self, CANVAS_SIZE, Canvas, Clipped, RECT_SIZE, TEXT_DRAW_SIZE, TextDraw};
+use lumen_app_api::layout::{self, CANVAS_SIZE, Canvas, CheckedCanvas, Clipped, RECT_SIZE, TEXT_DRAW_SIZE, TextDraw};
 use lumen_app_api::limits::{COMMIT_RECTS, EVENT_BYTES, PIXEL_FUEL, TEXT_BYTES, TEXT_PX_MAX, TEXT_PX_MIN, TITLE_BYTES};
-use lumen_app_api::limits::{WINDOW_PIXELS, WINDOWS};
+use lumen_app_api::limits::{SURFACES, WINDOW_PIXELS};
 use lumen_app_api::{Error, Kind, range, returned, text};
 use lumen_font::Px;
 use lumen_gfx::{Rect, Surface};
@@ -38,9 +47,10 @@ pub(super) struct AppWindow {
     scratch: Surface,
 }
 
-/// The event in hand: as the desktop gave it (`window_wait`), or as the
+/// The event in hand: as the desktop gave it (`window_wait`, which never
+/// keeps a request: until #207 it refuses them as it takes them), or as the
 /// app would read it (kept by `BufferTooSmall`; the desktop's is gone once
-/// converted, and a request is never kept).
+/// converted). A request is never held in either form.
 enum Held {
     Desktop(WindowEvent),
     Wire(Event),
@@ -129,11 +139,19 @@ fn window_open(c: &mut C<'_>, h: i32, title: i32, len: i32, width: i32, height: 
     // Shown in the title bar, the taskbar and `windows`: cut and sanitised.
     let title = text::cut(&text_in(c, r, TITLE_BYTES)?, TITLE_BYTES);
     if c.data().has_window() {
-        const _: () = assert!(WINDOWS == 1, "one window per app");
         return Err(Error::Limit);
     }
-    let handle = desktop::open_window(&title, w, ht).map_err(open_error)?;
+    #[cfg(feature = "ktest")]
+    let opened = match &c.data().desktop {
+        Some(d) => d.open_window(&title, w, ht),
+        None => desktop::open_window(&title, w, ht),
+    };
+    #[cfg(not(feature = "ktest"))]
+    let opened = desktop::open_window(&title, w, ht);
+    let handle = opened.map_err(open_error)?;
     let scratch = Surface::with_stride(w, ht, w as usize).ok_or(Error::OutOfMemory)?;
+    // Its three surfaces, each allocated and filled: paid by the pixel.
+    runtime::charge(&mut *c, PIXEL_FUEL * SURFACES * u64::from(w) * u64::from(ht));
     c.data_mut().add_window(AppWindow { handle, w, h: ht, in_hand: None, scratch })
 }
 
@@ -158,8 +176,8 @@ fn window_commit(c: &mut C<'_>, h: i32, canvas: i32, rects: i32, n: i32) -> Resu
     let win = ctx.window_mut(h)?;
     for b in raw.as_chunks::<RECT_SIZE>().0 {
         let Some(clip) = layout::Rect::decode(b).clip(w, ht) else { continue };
-        copy_rows(mem, &canvas, pixels.start, &clip, win.handle.surface_mut(), (0, 0));
-        damage[count] = Rect::new(clip.x as i32, clip.y as i32, clip.w, clip.h);
+        copy_rows(mem, &pixels, &clip, win.handle.surface_mut(), (0, 0));
+        damage[count] = Rect::new(clip.x() as i32, clip.y() as i32, clip.w(), clip.h());
         count += 1;
         area += clip.area();
     }
@@ -168,17 +186,19 @@ fn window_commit(c: &mut C<'_>, h: i32, canvas: i32, rects: i32, n: i32) -> Resu
     Ok(0)
 }
 
-/// Copy `clip` (inside the canvas, which [`Canvas::pixels`] accepted: its
-/// rows start at `start`) of the canvas's pixels into `surface`, its corner
-/// at `to` less the clip's (so `(0, 0)` keeps canvas coordinates), the top
-/// byte cleared.
-fn copy_rows(mem: &[u8], canvas: &Canvas, start: usize, clip: &Clipped, surface: &mut Surface, to: (u32, u32)) {
-    for y in clip.y..clip.y + clip.h {
-        let from = start + canvas.offset(clip.x, y);
-        let src = &mem[from..from + clip.w as usize * 4];
+/// Copy `clip` of a checked canvas's pixels into `surface`, its corner at
+/// `to` less the clip's (so `(0, 0)` keeps canvas coordinates), the top
+/// byte cleared. The caller makes sure `clip`, moved so, fits `surface`;
+/// a `clip` outside the canvas copies nothing.
+fn copy_rows(mem: &[u8], canvas: &CheckedCanvas, clip: &Clipped, surface: &mut Surface, to: (u32, u32)) {
+    let Some(rows) = canvas.rows(clip) else {
+        debug_assert!(false, "a clip outside its canvas");
+        return;
+    };
+    let x = (clip.x() - to.0) as usize;
+    for (y, bytes) in rows {
         let row = surface.row_mut(y - to.1);
-        let x = (clip.x - to.0) as usize;
-        for (d, s) in row[x..x + clip.w as usize].iter_mut().zip(src.as_chunks::<4>().0) {
+        for (d, s) in row[x..x + clip.w() as usize].iter_mut().zip(mem[bytes].as_chunks::<4>().0) {
             *d = u32::from_le_bytes(*s) & 0x00ff_ffff;
         }
     }
@@ -186,13 +206,15 @@ fn copy_rows(mem: &[u8], canvas: &Canvas, start: usize, clip: &Clipped, surface:
 
 /// The reverse of [`copy_rows`]: `clip` of `surface` (at `to` less the
 /// clip's corner) back into the canvas's pixels.
-fn copy_back(mem: &mut [u8], canvas: &Canvas, start: usize, clip: &Clipped, surface: &Surface, to: (u32, u32)) {
-    for y in clip.y..clip.y + clip.h {
-        let at = start + canvas.offset(clip.x, y);
-        let dst = &mut mem[at..at + clip.w as usize * 4];
+fn copy_back(mem: &mut [u8], canvas: &CheckedCanvas, clip: &Clipped, surface: &Surface, to: (u32, u32)) {
+    let Some(rows) = canvas.rows(clip) else {
+        debug_assert!(false, "a clip outside its canvas");
+        return;
+    };
+    let x = (clip.x() - to.0) as usize;
+    for (y, bytes) in rows {
         let row = surface.row(y - to.1);
-        let x = (clip.x - to.0) as usize;
-        for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(&row[x..x + clip.w as usize]) {
+        for (d, s) in mem[bytes].as_chunks_mut::<4>().0.iter_mut().zip(&row[x..x + clip.w() as usize]) {
             d.copy_from_slice(&s.to_le_bytes());
         }
     }
@@ -206,12 +228,12 @@ fn wire_event(e: WindowEvent) -> Result<Event, crate::ui::Request> {
         WindowEvent::Theme(t) => Event::theme(t.id, &crate::ui::palette(t)),
         WindowEvent::Key(k) => Event::key(&k),
         WindowEvent::PointerDown { x, y, button, buttons } => {
-            Event::PointerDown { x, y, button: event::button(button), buttons: event::button_set(buttons) }
+            Event::PointerDown { x, y, button: event::button(button), buttons: buttons.into() }
         }
         WindowEvent::PointerUp { x, y, button, buttons } => {
-            Event::PointerUp { x, y, button: event::button(button), buttons: event::button_set(buttons) }
+            Event::PointerUp { x, y, button: event::button(button), buttons: buttons.into() }
         }
-        WindowEvent::PointerMove { x, y, buttons } => Event::PointerMove { x, y, buttons: event::button_set(buttons) },
+        WindowEvent::PointerMove { x, y, buttons } => Event::PointerMove { x, y, buttons: buttons.into() },
         WindowEvent::FocusGained => Event::FocusGained,
         WindowEvent::FocusLost => Event::FocusLost,
         WindowEvent::Lost => Event::Lost,
@@ -242,8 +264,18 @@ fn next_event(c: &mut C<'_>, h: i32, buf: i32, len: i32) -> Result<i32, Error> {
                 continue;
             }
         };
-        // Every event fits EVENT_BYTES (lumen-app-api's test of the largest).
-        let n = wire.encode(&mut bytes).map_err(|_| Error::BufferTooSmall)?.len();
+        // Encoded first, into a buffer as big as any event (lumen-app-api
+        // tests the largest; `SetValue` holds every request's text to its
+        // cap): a failure is the kernel's bug, said once here, and the
+        // event is dropped rather than reported as something it isn't.
+        let n = match wire.encode(&mut bytes) {
+            Ok(encoded) => encoded.len(),
+            Err(e) => {
+                log::error!(target: "app", "an event for app {} didn't encode ({e:?}): dropped (a bug)", ctx.state.id);
+                debug_assert!(false, "an event past EVENT_BYTES");
+                continue;
+            }
+        };
         if n > out.len() {
             win.in_hand = Some(Held::Wire(wire));
             return Err(Error::BufferTooSmall);
@@ -283,25 +315,25 @@ fn window_wait(c: &mut C<'_>, h: i32, deadline: i64, animating: i32) -> Res<i32>
     });
     blocking(c, "window_wait", |ctx, state| {
         let Ok(win) = ctx.window_mut(h) else { return 0 };
-        if let Some(d) = until
-            && d <= time::now_ns()
-        {
-            return match win.handle.next_event() {
-                Some(e) => {
-                    win.in_hand = Some(Held::Desktop(e));
-                    1
-                }
-                None => {
-                    sched::yield_now();
-                    0
-                }
-            };
-        }
         loop {
             if state.kill_asked() {
                 return 0;
             }
-            match win.handle.wait_event_until(until, animating) {
+            // A deadline already reached: a look, then the CPU given up.
+            let next = match until {
+                Some(d) if d <= time::now_ns() => match win.handle.next_event() {
+                    Some(e) => Wait::Event(e),
+                    None => {
+                        sched::yield_now();
+                        return 0;
+                    }
+                },
+                _ => win.handle.wait_event_until(until, animating),
+            };
+            match next {
+                // Until #207 a request names no node of the app's: refused
+                // here, so a 1 always means an event to read.
+                Wait::Event(WindowEvent::Request(r)) => crate::ui::refuse(r),
                 Wait::Event(e) => {
                     win.in_hand = Some(Held::Desktop(e));
                     return 1;
@@ -344,18 +376,22 @@ fn text_draw(c: &mut C<'_>, h: i32, canvas: i32, args: i32, ptr: i32, len: i32) 
     let advance = text.measure(&s, px).min(i32::MAX as u32) as i32;
     // The clip, cut to the canvas, then to the scratch surface (the
     // window's size) from the clip's corner.
-    let Some(mut clip) = args.clip.clip(canvas.w, canvas.h) else { return Ok(advance) };
-    clip.w = clip.w.min(win.w);
-    clip.h = clip.h.min(win.h);
-    let to = (clip.x, clip.y);
-    copy_rows(mem, &canvas, pixels.start, &clip, &mut win.scratch, to);
-    let x = i64::from(args.x) - i64::from(clip.x);
-    let y = i64::from(args.y) - i64::from(clip.y);
+    let Some(clip) = args.clip.clip(canvas.w, canvas.h).and_then(|c| c.shrink_to(win.w, win.h)) else {
+        return Ok(advance);
+    };
+    let to = (clip.x(), clip.y());
+    copy_rows(mem, &pixels, &clip, &mut win.scratch, to);
+    let x = i64::from(args.x) - i64::from(clip.x());
+    let y = i64::from(args.y) - i64::from(clip.y());
     let at = |v: i64| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
-    let inside = Rect::new(0, 0, clip.w, clip.h);
+    let inside = Rect::new(0, 0, clip.w(), clip.h());
+    let rasterized = text.stats().misses;
+    // Only the glyphs reaching the clip are rasterized (`font::Text::draw`).
     text.draw(&mut win.scratch, at(x), at(y), &s, px, args.rgb & 0x00ff_ffff, inside);
-    copy_back(mem, &canvas, pixels.start, &clip, &win.scratch, to);
-    let area = clip.area();
-    runtime::charge(&mut *c, PIXEL_FUEL * area);
+    let glyphs = text.stats().misses - rasterized;
+    copy_back(mem, &pixels, &clip, &win.scratch, to);
+    // The clip's pixels, and each glyph rasterized at px² of them.
+    let px2 = u64::from(px.get()) * u64::from(px.get());
+    runtime::charge(&mut *c, PIXEL_FUEL * (clip.area() + glyphs * px2));
     Ok(advance)
 }

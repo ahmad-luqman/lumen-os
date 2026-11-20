@@ -3085,7 +3085,8 @@ from disk.
 
 Arguments and results are wasm `i32` and `i64`. Every call returns its
 result, `>= 0`, or a negated `lumen_app_api::Error` (also the calls
-returning `i64`). The SDK wraps every call (#206); apps don't call them
+returning `i64`). The SDK wraps every call (#206: the imports declared
+once, `lumen_app_api::sys`, wasm32 only); apps don't call them
 directly. #199 builds the calls without a window (`handle_*`, `args_*`,
 `exit`, `panic`, `log`, `time_*`, `trace_*`: `lumen_app_api::host`
 lists them, and a module importing anything else is refused); #206 the
@@ -3154,10 +3155,16 @@ Text (`log`, `panic`, titles, `text_*`) is at most `TEXT_BYTES` (titles
 `CALL_FUEL` at its entry (step 1), every call, refused or not; then, for
 what it did (step 5), `BYTE_FUEL` per byte `log` copied in (charged even
 if the text is then refused), `LOG_FUEL` per line logged (so a logging
-loop writes few lines per slice), `PIXEL_FUEL` per pixel of a commit or
-of `text_draw`'s clip, and `EVENT_FUEL` per trace event copied out
-(`app::tests::host_calls_charge_their_fuel` checks `CALL_FUEL`,
+loop writes few lines per slice), `PIXEL_FUEL` per pixel of a commit, of
+`text_draw`'s clip and of the three surfaces `window_open` allocates and
+fills (`SURFACES` × w × h), `PIXEL_FUEL` × px² per glyph `text_draw`
+rasterizes (one its glyph cache didn't hold: `font::Text::draw` skips a
+glyph whose box misses the clip before rasterizing it, so the work
+follows the clip, not the text), and `EVENT_FUEL` per trace event copied
+out (`app::tests::host_calls_charge_their_fuel` checks `CALL_FUEL`,
 `BYTE_FUEL`, `LOG_FUEL` and `EVENT_FUEL`;
+`app::tests::window_calls_charge_their_fuel` the pixels and glyphs, as
+floors;
 `app::tests::host_calls_cost_fuel_however_many_in_one_block` a run of
 calls in one block across slices, debt included).
 
@@ -3183,7 +3190,7 @@ the charge), draws with `font::Text::draw`, and copies them back; its
 result is the advance `font::Text::measure` gives. Its errors:
 `BadHandle`, `WrongKind`, `Unavailable`, `BadPointer` (the canvas, the
 `TextDraw`, the text, the clip's pixels), `BadArgument` (`px`, the
-text). `lumen_ui::Text` inside an app is the SDK's implementation over
+text). `lumen_ui::Text` inside an app (#207) is to be the SDK's implementation over
 the three text calls.
 
 Error codes (`lumen_app_api::Error`, `#[repr(i32)]`, returned negated;
@@ -3213,10 +3220,15 @@ bit set (`Role`, `ActionKind`, `Refusal`, `KeyCode`, `Event`,
 `AppAnswer`, `ThemeId`, `Palette`'s field order, button numbers and
 mods bits), declared in that order. Field-less enums carry explicit
 discriminants with a `const` check that each equals its position, and a
-host test pins the encoding of every variant. `TryFrom` conversions to
-and from `lumen-ui`'s and `lumen-input`'s types live beside them, so
-`lumen-ui` needs no `serde` and reordering its variants can't change the
-ABI. Apps are built into the image with the kernel, so M5 has no
+host test pins the encoding of every variant (each data-carrying enum's
+tags through an exhaustive match, so an appended variant fails to build
+until it is pinned). `From` conversions from `lumen-ui`'s, `lumen-wm`'s
+and `lumen-input`'s types (and back, where an app needs them: key codes,
+the theme, the palette) live beside them in `lumen_app_api::event`, so
+those crates need no `serde` and reordering their variants can't change
+the ABI. What every wire type shares is `lumen_app_api::wire`:
+`wire_enum!`, `DecodeError` and `decode_exact` (take, then refuse a
+remainder). Apps are built into the image with the kernel, so M5 has no
 per-message version. A value that doesn't decode, has bytes left over,
 or breaks its rules is `BadArgument`, never a trap.
 
@@ -3381,15 +3393,22 @@ hand per window.
   None, No)`); the event it wakes for is kept in hand. A `Woken` wake
   re-checks the kill flag and waits again until the deadline. Animating
   without a deadline, `animating` other than 0 or 1, or a deadline below
-  -1 is `BadArgument`.
-- `window_next_event` takes the event in hand (or the next queued one),
-  encodes it into a kernel buffer, and checks the output range and size
-  (`BufferTooSmall` keeps it in hand, not started). A `Request` is then
-  `start`ed: a `Skipped` one (its asker cancelled) is dropped and the
-  next event taken; one whose node has left the map is answered `no
-  node` (`ui::refuse`); otherwise the bytes are written, which can't
-  fail. So a request runs only once its asker can no longer cancel it,
-  and a `window_wait` of 1 may be followed by a `window_next_event` of 0.
+  -1 is `BadArgument`. Until #207 a `Request` it wakes for is refused
+  there (`no node`: apps publish no tree yet) and the wait goes on, so 1
+  always means an event to read.
+- `window_next_event` checks its output range first, then takes the
+  event in hand (or the next queued one) and encodes it into a kernel
+  buffer of `EVENT_BYTES`; only an app buffer shorter than the encoding
+  is `BufferTooSmall`, which keeps the event in hand. Every event fits
+  (`SetValue` holds a request's text to `SET_VALUE_BYTES`, however it is
+  made), so a failed encoding is the kernel's bug: one ERROR, the event
+  dropped. Handing over `Close` starts the close grace. In #206 every
+  `Request` is refused `no node` (`ui::refuse`); #207 `start`s it
+  instead: a `Skipped` one (its asker cancelled) is dropped and the next
+  event taken; one whose node has left the map is answered `no node`;
+  otherwise the bytes are written, which can't fail. So a request runs
+  only once its asker can no longer cancel it, and from #207 a
+  `window_wait` of 1 may be followed by a `window_next_event` of 0.
 
 **One end reason, first writer wins.** Returning from `lumen_main`,
 `exit`, `panic`, a trap, a kill or the close grace records the app's end
@@ -3449,7 +3468,9 @@ done); the reaper joins it either way. A second `kill` of an ending app
 waits the same way.
 
 **Close grace.** A `Close` event (the close box, `ui invoke <root>
-close`) is the app's to act on (the SDK closes the window and returns).
+close`) is the app's to act on (an SDK app returns, and the `Window`
+dropped with it closes the window; closing the `Window` handle ends the
+grace).
 Once it has been given `Close` and still holds the window, it has
 `CLOSE_GRACE_SLICES` more slice ends before it is ended. An app that
 ignores `Close` while blocked has no slice ends and stays open until
@@ -3634,24 +3655,37 @@ SSE); #197 checks the results' bits.
   (`NonZeroU32`), `log`'s functions, `Time`, `Desktop` (`open_window`,
   `line_height`, `measure`) and `Window` (its canvas, `fill`, `text`,
   `commit` in turns of `COMMIT_RECTS`, `wait`, `next_event`, `wait_event`;
-  dropping it closes the window). `apps/template`, the app to copy, sets
+  dropping it closes the window), `Trace` (`cpus`, `read`: X-ray, #208);
+  `Event`'s `Mods`, `Buttons` and their bit constants re-exported. The log
+  functions cut a text past `TEXT_BYTES` on a char boundary (the kernel
+  refuses a longer one), the panic message is cut to make room for ` at
+  <file>:<line>`, a refused free ends the app (as a bad free in the
+  kernel's heap does), and `open_window` checks the size before it
+  reserves its canvas. `apps/template`, the app to copy, sets
   its own memory (4 MiB) in its `build.rs`: link arguments from a build
   script come after the workspace's `rustflags`, and wasm-ld takes the
   last. `make app NAME=foo` (`tools/new-app.sh`) copies it to `apps/foo`
-  and renames the crate; it refuses a name `kernel/build.rs` wouldn't
-  embed (lower case letters, digits, `-` and `_`, starting with a
-  letter), a `test-` name, a taken one (`template`, `lumen-app`,
-  `testkit`, or a test app's module name: `hello` for `apps/test-hello`,
-  which `kernel/build.rs` would refuse in both sets) and an existing
-  directory, making nothing
-  (`harness:test_make_app::*`). Nothing needs registering: the member
+  and renames the crate. It refuses, making nothing
+  (`harness:test_make_app::*`): a name `kernel/build.rs` wouldn't embed
+  (its rule: lower case letters, digits, `-` and `_`) or one not starting
+  with a letter (the script's own: a leading `-` or `_` breaks cargo for
+  the whole workspace); a `test-` or `test_` name, or a test app's module
+  name (`hello` for `apps/test-hello`: `kernel/build.rs` refuses a name in
+  both sets); an existing directory; a name the workspace has already
+  once `-` and `_` are alike (cargo names the output file with `_`, so
+  `a_b` would overwrite `a-b`'s module), a crate or one of its path
+  dependencies (`lumen-app-api`, `lumen-heap`). The copy is made in a dot
+  directory (not a member) and moved into place only once finished. Nothing needs registering: the member
   glob takes the crate, `make apps` bundles its module, and the launcher
   lists it.
 - **The launcher** (#157's taskbar) lists the bundled apps whose
   manifest lists `desktop`, never the test apps, after its four demo
   items, by name, and starts one through `run`'s path without waiting
   (`runtime::start`; `INFO  taskbar: <name>: app <id>`, a refusal
-  `Then::Failed`, a load failure the app's one WARN). Its Life item starts the Life app (#202, which updates
+  `Then::Failed`, a load failure the app's one WARN). A bundled app
+  `precheck` refuses is left out with a WARN naming why
+  (`app::tests::every_bundled_app_passes_precheck` keeps that from
+  shipping). Its Life item starts the Life app (#202, which updates
   the M4 Life row and `tests/features/gui.toml`).
 - **Loading from disk (M6)** will need more: import names in errors are
   sanitised already, but wasmi reserves vectors up front for the counts a

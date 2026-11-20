@@ -57,7 +57,8 @@ impl AppHeap {
 
 // SAFETY: `lumen_heap::Heap` hands out disjoint blocks aligned as asked,
 // inside its span, and takes back only blocks it handed out with their
-// layout (`dealloc` refuses anything else, changing nothing).
+// layout (`dealloc` refuses anything else, changing nothing, and the app
+// then panics).
 unsafe impl GlobalAlloc for AppHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: `Heap::alloc` doesn't allocate.
@@ -67,12 +68,12 @@ unsafe impl GlobalAlloc for AppHeap {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let Some(p) = NonNull::new(ptr) else { return };
         // SAFETY: `Heap::dealloc` doesn't allocate; `ptr` came from `alloc`
-        // with `layout` (GlobalAlloc's contract), and a refusal changes
-        // nothing.
-        unsafe {
-            self.with(|heap| {
-                let _ = heap.dealloc(p, layout);
-            })
+        // with `layout` (GlobalAlloc's contract).
+        let freed = unsafe { self.with(|heap| heap.dealloc(p, layout)) };
+        // A refusal (a double free, a wrong layout) changes nothing, and is
+        // a bug: the app ends, as the kernel's heap does on one.
+        if let Err(e) = freed {
+            panic!("a bad free: {e}");
         }
     }
 }

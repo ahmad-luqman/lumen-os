@@ -262,6 +262,11 @@ fn window(c: &mut Checks) {
         host::window_open(desk, WRAPPING, 0x20, W as i32, H as i32),
         Err(Error::BadPointer),
     );
+    c.check(
+        "open: a wrapping title before a zero size",
+        host::window_open(desk, WRAPPING, 0x20, 0, H as i32),
+        Err(Error::BadPointer),
+    );
     c.check("open: zero wide", host::window_open(desk, t, tn, 0, H as i32), Err(Error::BadArgument));
     c.check("open: a negative height", host::window_open(desk, t, tn, W as i32, -1), Err(Error::BadArgument));
     c.check("open: past WINDOW_PIXELS", host::window_open(desk, t, tn, 640, 481), Err(Error::BadArgument));
@@ -288,6 +293,8 @@ fn window(c: &mut Checks) {
     c.holds("a refused next_event wrote nothing", buf.iter().all(|&b| b == 0xa5));
     c.check("next_event on the log handle", next_event(log, &mut buf), Err(Error::WrongKind));
     c.check("next_event at a wrapping range", unsafe_next(w, WRAPPING, 64), Err(Error::BadPointer));
+    c.check("next_event on a made-up handle", next_event(999, &mut buf), Err(Error::BadHandle));
+    c.check("window_wait on a made-up handle", host::window_wait(999, -1, 0), Err(Error::BadHandle));
     c.check("window_wait with one in hand", host::window_wait(w, -1, 0), Ok(()));
     c.holds("window_wait with one in hand is 1", host::window_wait(w, -1, 0) == 1);
     let n = next_event(w, &mut buf);
@@ -309,6 +316,11 @@ fn window(c: &mut Checks) {
         }
     }
     c.holds("window_wait at its deadline is 0", got == 0);
+    // And not before it: whatever it returns, a 0 comes at or after it.
+    while next_event(w, &mut buf) > 0 {}
+    let dl = host::time_now(time) + 20_000_000;
+    let got = host::window_wait(w, dl, 0);
+    c.holds("a deadline's 0 not before it", got != 0 || host::time_now(time) >= dl);
 
     // window_commit: the handle, the canvas's range, the count, the rects'
     // range, the canvas's pixels, its size.
@@ -326,6 +338,7 @@ fn window(c: &mut Checks) {
     c.check("commit: too many rects", host::window_commit(w, cp, fp, COMMIT_RECTS as i32 + 1), Err(Error::BadArgument));
     c.check("commit: -1 rects", host::window_commit(w, cp, fp, -1), Err(Error::BadArgument));
     c.check("commit: wrapping rects", host::window_commit(w, cp, WRAPPING, 1), Err(Error::BadPointer));
+    c.check("commit: a bad count before bad rects", host::window_commit(w, cp, WRAPPING, 0), Err(Error::BadArgument));
     let mut rects = [0u8; RECT_SIZE * COMMIT_RECTS];
     for (i, r) in rects.as_chunks_mut::<RECT_SIZE>().0.iter_mut().enumerate() {
         // One whole, the rest outside or empty: skipped.
@@ -341,7 +354,21 @@ fn window(c: &mut Checks) {
     let commit_with = |cv: [u8; CANVAS_SIZE]| host::window_commit(w, ptr(cv.as_ptr()), fp, 1);
     c.check("commit: an unaligned canvas", commit_with(bad(base + 1, W, W, H)), Err(Error::BadPointer));
     c.check("commit: a stride below the width", commit_with(bad(base, W - 1, W, H)), Err(Error::BadArgument));
-    c.check("commit: stride × height overflowing", commit_with(bad(base, 0x4000_0000, W, H)), Err(Error::BadPointer));
+    c.check(
+        "commit: stride × height past the memory",
+        commit_with(bad(base, 0x4000_0000, W, H)),
+        Err(Error::BadPointer),
+    );
+    c.check(
+        "commit: stride × height overflowing",
+        commit_with(bad(0, u32::MAX, u32::MAX, u32::MAX)),
+        Err(Error::BadPointer),
+    );
+    c.check(
+        "commit: a stride below the width before rows past the memory",
+        commit_with(bad(end as u32 - 4, W - 1, W, H)),
+        Err(Error::BadArgument),
+    );
     c.check("commit: rows past the memory", commit_with(bad(end as u32 - 4, W, W, H)), Err(Error::BadPointer));
     c.check("commit: a canvas unlike the window", commit_with(bad(base, W, W - 1, H)), Err(Error::BadArgument));
 
@@ -351,6 +378,9 @@ fn window(c: &mut Checks) {
     c.check("line_height px 7", host::text_line_height(desk, 7), Err(Error::BadArgument));
     c.check("line_height px 97", host::text_line_height(desk, 97), Err(Error::BadArgument));
     c.check("line_height on the window", host::text_line_height(w, 16), Err(Error::WrongKind));
+    c.check("line_height on a made-up handle", host::text_line_height(999, 16), Err(Error::BadHandle));
+    c.check("measure on the window", host::text_measure(w, 16, t, tn), Err(Error::WrongKind));
+    c.check("measure on a made-up handle", host::text_measure(999, 16, t, tn), Err(Error::BadHandle));
     c.holds("measure", host::text_measure(desk, 16, t, tn) > 0);
     c.check("measure: not UTF-8", host::text_measure(desk, 16, ptr(bad_utf8().as_ptr()), 3), Err(Error::BadArgument));
     let past = vec![b'm'; TEXT_BYTES + 1];
@@ -376,6 +406,16 @@ fn window(c: &mut Checks) {
     c.check("text_draw: an unaligned canvas", td(desk, ptr(unaligned.as_ptr()), ap, t, tn), Err(Error::BadPointer));
     c.check("text_draw: wrapping args", td(desk, cp, WRAPPING, t, tn), Err(Error::BadPointer));
     c.check("text_draw on the log handle", td(log, cp, ap, t, tn), Err(Error::WrongKind));
+    c.check("text_draw on a made-up handle", td(999, cp, ap, t, tn), Err(Error::BadHandle));
+    c.check("text_draw: a wrapping canvas", td(desk, WRAPPING, ap, t, tn), Err(Error::BadPointer));
+    c.check("text_draw: a wrapping text", td(desk, cp, ap, WRAPPING, 0x20), Err(Error::BadPointer));
+    let long_text = vec![b't'; TEXT_BYTES + 1];
+    c.check(
+        "text_draw: text past TEXT_BYTES",
+        td(desk, cp, ap, ptr(long_text.as_ptr()), long_text.len() as i32),
+        Err(Error::BadArgument),
+    );
+    c.check("text_draw: text not UTF-8", td(desk, cp, ap, ptr(bad_utf8().as_ptr()), 3), Err(Error::BadArgument));
     a.fill(0);
     // Drawn only inside the clip: the left half.
     let left = draw(0, 16, Rect::new(0, 0, W / 2, H));
@@ -385,6 +425,16 @@ fn window(c: &mut Checks) {
     let outside = (0..H).all(|y| a[(y * W + W / 2) as usize..((y + 1) * W) as usize].iter().all(|&p| p == 0));
     c.holds("text_draw drew inside its clip", inside);
     c.holds("text_draw drew nothing outside its clip", outside);
+    // A clip from x > 0: the right half only.
+    a.fill(0);
+    let right = draw(0, 16, Rect::new((W / 2) as i32, 0, W / 2, H));
+    let wide = "mmmmmmmm";
+    let r = td(desk, cp, ptr(right.as_ptr()), ptr(wide.as_ptr()), wide.len() as i32);
+    c.holds("text_draw's advance from x > 0", r > 0);
+    let left_clear = (0..H).all(|y| a[(y * W) as usize..(y * W + W / 2) as usize].iter().all(|&p| p == 0));
+    let right_drawn = (0..H).any(|y| a[(y * W + W / 2) as usize..((y + 1) * W) as usize].iter().any(|&p| p != 0));
+    c.holds("a clip from x > 0 drew inside it", right_drawn);
+    c.holds("a clip from x > 0 drew nothing left of it", left_clear);
     // Its text inside its own canvas draws what a separate copy does.
     let mut b = vec![0u32; (W * H) as usize];
     a.fill(0);
@@ -397,11 +447,22 @@ fn window(c: &mut Checks) {
     c.holds("an overlapping text_draw's advance", ra > 0 && ra == rb);
     c.holds("an overlapping text_draw draws what a separate one does", a == b);
 
-    // A closed window's handle is gone; a new window gets a new handle.
+    // A canvas bigger than the window: drawn only within the window's
+    // size from the clip's corner (its scratch surface's).
+    let big = vec![0u32; (4 * W * H) as usize];
+    let cbig = canvas(&big, 2 * W, 2 * W, 2 * H);
+    let wide = draw(0, 16, Rect::new(0, 0, 2 * W, 2 * H));
+    let rbig = td(desk, ptr(cbig.as_ptr()), ptr(wide.as_ptr()), ptr(b"mmmmmmmm".as_ptr()), 8);
+    c.holds("text_draw on a canvas bigger than the window", rbig > 0);
+    let outside = (0..2 * H).all(|y| (0..2 * W).all(|x| (x < W && y < H) || big[(y * 2 * W + x) as usize] == 0));
+    c.holds("nothing drawn past the window's size", outside);
+
+    // A closed window's handle is gone; a new window gets a new handle,
+    // and exactly WINDOW_PIXELS (640 × 480) opens.
     c.check("close the window", host::handle_close(w), Ok(()));
     c.check("commit on the closed window", host::window_commit(w, cp, fp, 1), Err(Error::BadHandle));
-    let again = host::window_open(desk, t, tn, W as i32, H as i32);
-    c.check("a window again", again, Ok(()));
+    let again = host::window_open(desk, t, tn, 640, 480);
+    c.check("a window again, at exactly WINDOW_PIXELS", again, Ok(()));
     c.holds("a new window gets a new handle", again > w);
     c.check("close it", host::handle_close(again), Ok(()));
 }
