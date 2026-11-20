@@ -1024,11 +1024,12 @@ def editor_status(rows: list[dict[str, str]]) -> str:
 
 def test_editor_typing_and_tree(boot):
     # The editor, empty and blinking (an animating window while focused:
-    # nothing here waits for the desktop to settle). Keys typed through
-    # confirmed steps edit its buffer, which is its `textfield` node's value
-    # (a line break shown as U+FFFD), the status line following; `set_value`
-    # replaces the text as one edit, which Ctrl+Z takes back and Ctrl+Y
-    # brings again; closing its window ends it with 0, its thread joined.
+    # nothing here waits for the desktop to settle). Every key it maps,
+    # pressed through confirmed steps, edits its buffer (its `textfield`
+    # node's value, a line break shown as U+FFFD) or moves its cursor (the
+    # status line); `set_value` replaces the text as one edit, which Ctrl+Z
+    # takes back, Ctrl+Shift+Z and Ctrl+Y bring again; closing its window
+    # ends it with 0, its thread joined.
     m = boot_desktop(boot)
     app_id, mark = start(m, "editor --empty")
     record = app(m, app_id)
@@ -1036,34 +1037,93 @@ def test_editor_typing_and_tree(boot):
     assert editor_text(rows) == "", rows
     assert editor_status(rows) == "Ln 1, Col 1"
 
-    def shows(text: str, status: str):
-        return lambda r: editor_text(r) == text and editor_status(r) == status
+    def step(what: str, keys: list, text: str, status: str) -> list[dict[str, str]]:
+        """`keys` (text, or lists of keys pressed together) typed through
+        confirmed steps, then the node's value and the status line."""
+        gui.confirmed_keys(m, *keys)
+        return gui.wait_ui(
+            m,
+            what,
+            lambda r: editor_text(r) == text and editor_status(r) == status,
+            wid,
+        )
 
-    gui.type_confirmed(m, "hello world")
-    gui.wait_ui(m, "hello world typed", shows("hello world", "Ln 1, Col 12, modified"), wid)
-    gui.confirmed_keys(m, ["ret"])
-    gui.type_confirmed(m, "Lumen")
-    typed = "hello world�Lumen"
-    rows = gui.wait_ui(m, "a second line typed", shows(typed, "Ln 2, Col 6, modified"), wid)
-    # Backspace, and the arrows: back to the first line's end.
-    gui.confirmed_keys(m, ["backspace"], ["up"], ["end"])
-    rows = gui.wait_ui(
-        m, "Backspace, Up, End", shows("hello world�Lume", "Ln 1, Col 12, modified"), wid
-    )
+    nl = "\ufffd"
+    step("hello world", ["hello world"], "hello world", "Ln 1, Col 12, modified")
+    step("Enter, Lumen", [["ret"], "Lumen"], f"hello world{nl}Lumen", "Ln 2, Col 6, modified")
+    step("Backspace", [["backspace"]], f"hello world{nl}Lume", "Ln 2, Col 5, modified")
+    step("Up", [["up"]], f"hello world{nl}Lume", "Ln 1, Col 5, modified")
+    step("End", [["end"]], f"hello world{nl}Lume", "Ln 1, Col 12, modified")
+    step("Tab", [["tab"]], f"hello world    {nl}Lume", "Ln 1, Col 16, modified")
+    step("Home", [["home"]], f"hello world    {nl}Lume", "Ln 1, Col 1, modified")
+    step("Delete", [["delete"]], f"ello world    {nl}Lume", "Ln 1, Col 1, modified")
+    step("Right, Right", [["right"], ["right"]], f"ello world    {nl}Lume", "Ln 1, Col 3, modified")
+    step("Left", [["left"]], f"ello world    {nl}Lume", "Ln 1, Col 2, modified")
+    step("Down", [["down"]], f"ello world    {nl}Lume", "Ln 2, Col 2, modified")
+    step("Page Up", [["pgup"]], f"ello world    {nl}Lume", "Ln 1, Col 2, modified")
+    step("Page Down", [["pgdn"]], f"ello world    {nl}Lume", "Ln 2, Col 2, modified")
+    step("Ctrl+Home", [["ctrl", "home"]], f"ello world    {nl}Lume", "Ln 1, Col 1, modified")
+    rows = step("Ctrl+End", [["ctrl", "end"]], f"ello world    {nl}Lume", "Ln 2, Col 5, modified")
 
     text_node = gui.node(rows, "textfield", "Text")["id"]
     got = gui.invoke(m, text_node, "set_value", "replaced text", animating=True)
     if not got.still_running:
         assert got.row is not None and got.row["value"] == "replaced text", got
-    gui.wait_ui(m, "set_value", shows("replaced text", "Ln 1, Col 14, modified"), wid)
-    gui.confirmed_keys(m, ["ctrl", "z"])
-    gui.wait_ui(m, "Ctrl+Z undid it", lambda r: editor_text(r) == "hello world�Lume", wid)
-    gui.confirmed_keys(m, ["ctrl", "y"])
-    gui.wait_ui(m, "Ctrl+Y redid it", lambda r: editor_text(r) == "replaced text", wid)
+    gui.wait_ui(m, "set_value", lambda r: editor_status(r) == "Ln 1, Col 14, modified", wid)
+    step("Ctrl+Z", [["ctrl", "z"]], f"ello world    {nl}Lume", "Ln 2, Col 5, modified")
+    step("Ctrl+Shift+Z", [["ctrl", "shift", "z"]], "replaced text", "Ln 1, Col 14, modified")
+    step("Ctrl+Z again", [["ctrl", "z"]], f"ello world    {nl}Lume", "Ln 2, Col 5, modified")
+    step("Ctrl+Y", [["ctrl", "y"]], "replaced text", "Ln 1, Col 14, modified")
 
     gui.close_window(m, "Editor")
     end_line(m, mark, "editor", app_id, "exited with 0")
     wait_gone(m, app_id, record["thread"])
+
+
+def test_editor_unfocused_stops_ticking(boot):
+    # A blinking editor animates only while its window has the focus: with
+    # another window in front (the calculator's), it has no period and the
+    # desktop settles.
+    m = boot_desktop(boot)
+    start(m, "editor --empty")
+    editor_tree(m)
+    start(m, "calculator")
+    calc_tree(m)
+    assert gui.window(m, "Editor")["focused"] == "no"
+    gui.wait_settled(m)
+
+
+def test_editor_redraws_what_a_full_repaint_draws(boot):
+    # Edits drawn by damage alone (a character, Enter and Backspace, lines
+    # past the view's foot, a line wider than it, Page Up, then typing and a
+    # move that only a line's and the cursor's damage draw) leave the window
+    # exactly as a full repaint draws it (a theme switch there and back).
+    m = boot_desktop(boot)
+    start(m, "editor --empty --no-blink")
+    wid, _ = editor_tree(m)
+    gui.confirmed_keys(m, "a", ["ret"], ["backspace"])
+    for n in range(20):
+        gui.confirmed_keys(m, f"line {n}", ["ret"])
+    gui.type_confirmed(m, "w" * 100)
+    gui.wait_ui(m, "a wide line", lambda r: editor_status(r) == "Ln 21, Col 101, modified", wid)
+    gui.confirmed_keys(m, ["pgup"])
+    # A page up from line 21: a line above it, however many rows the view has.
+    rows = gui.wait_ui(m, "Page Up", lambda r: int(editor_status(r).split(",")[0][3:]) < 21, wid)
+    # Last, edits only a line's or the cursor's damage draws (no scroll after
+    # them to repaint everything): two characters typed, one taken back, a
+    # move left.
+    # Three typed, one taken back, a move left over the second: the first
+    # "z" only its line's damage draws.
+    line, col = editor_status(rows).split(",")[:2]
+    after = f"{line}, Col {int(col.split()[1]) + 1}, modified"
+    gui.confirmed_keys(m, "zzz", ["backspace"], ["left"])
+    gui.wait_ui(m, "z typed", lambda r: editor_status(r) == after and "zz" in editor_text(r), wid)
+    by_damage = gui.settled_capture(m, lambda: gui.client_pixels(m, "Editor", "damage.png"))
+    run(m, "theme dark")
+    gui.wait_settled(m)
+    run(m, "theme light")
+    full = gui.settled_capture(m, lambda: gui.client_pixels(m, "Editor", "full.png"))
+    assert by_damage.tobytes() == full.tobytes()
 
 
 def test_editor_golden(boot, artifacts, golden_dir):
@@ -1116,4 +1176,3 @@ def test_editor_a_key_costs_a_fraction_of_a_full_repaint(boot):
     run(m, "theme dark")
     full = fuel(m, app_id) - before - key
     assert 0 < key and key * 8 < full, (key, full)
-
