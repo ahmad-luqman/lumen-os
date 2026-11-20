@@ -618,6 +618,12 @@ def test_clock_golden(boot, artifacts, golden_dir):
     row = gui.window(m, "Clock")
     x0, y0, x1, y1 = gui.client_box(row)
     shot = gui.settled_screendump(m, "clock.png")
+    # Frozen for good: still 10:09:00 once `date` shows two seconds more
+    # (at least a whole second, past the ticks a live clock would take).
+    then = date_time(m)
+    gui.wait_for(
+        m, "two seconds by date", lambda: date_time(m), lambda t: seconds_from(then, t) >= 2
+    )
     assert clock_time(m, wid) == "10:09:00"
     assert_matches_golden(
         shot,
@@ -626,6 +632,33 @@ def test_clock_golden(boot, artifacts, golden_dir):
         size=(x1 - x0, y1 - y0),
         artifacts=artifacts,
     )
+
+
+def seconds_from(a: str, b: str) -> int:
+    """Seconds from time of day `a` to `b` (`HH:MM:SS`), across midnight."""
+
+    def secs(t: str) -> int:
+        h, mm, ss = map(int, t.split(":"))
+        return h * 3600 + mm * 60 + ss
+
+    return (secs(b) - secs(a)) % 86_400
+
+
+def clock_shot(m, wid: str, name: str) -> tuple[str, bytes]:
+    """The clock's client area and the time its label shows, read when both
+    agree: the label, a settled desktop, a screendump, a settled desktop
+    again, the label again, until the two labels are equal (a tick's
+    commit and its publish come in one refresh, before the app waits:
+    settled after the shot, a commit before it shows in the second label).
+    """
+    for _ in range(10):
+        before = clock_time(m, wid)
+        gui.wait_settled(m)
+        shot = gui.client_pixels(m, "Clock", name).tobytes()
+        gui.wait_settled(m)
+        if clock_time(m, wid) == before:
+            return before, shot
+    raise AssertionError("the clock's label changed around every screendump")
 
 
 def date_time(m) -> str:
@@ -642,7 +675,8 @@ def test_clock_tree_matches_rtc(boot):
     # poll it has the second `date` saw; whole strings, so midnight is
     # no different). It goes on (its value changes as the seconds pass),
     # yet the desktop settles between its ticks (its waits aren't
-    # animating). Its close ends it with 0. Arguments it doesn't take end
+    # animating), and what it draws is what a clock frozen at the label's
+    # time draws. Its close ends it with 0. Arguments it doesn't take end
     # it with 2, an ERROR saying what was wrong.
     m = boot_desktop(boot)
     app_id, mark = start(m, "clock")
@@ -659,6 +693,18 @@ def test_clock_tree_matches_rtc(boot):
         m, "the clock's next second", lambda r: gui.node(r, "label", "Time")["value"] != first, wid
     )
     gui.wait_settled(m)
+    # What it draws follows the time: its client area at a time its label
+    # showed throughout equals a frozen clock's at that time (same labels,
+    # same picture: no timing bound).
+    shown, live = clock_shot(m, wid, "clock-live.png")
+    gui.close_window(m, "Clock")
+    end_line(m, mark, "clock", app_id, "exited with 0")
+    app_id, mark = start(m, f"clock --at {shown}")
+    wid, rows = clock_tree(m)
+    assert gui.node(rows, "label", "Time")["value"] == shown
+    assert clock_shot(m, wid, "clock-frozen.png") == (shown, live), (
+        f"the pictures at {shown} differ"
+    )
     gui.close_window(m, "Clock")
     end_line(m, mark, "clock", app_id, "exited with 0")
     # Arguments it doesn't take: one ERROR naming what was wrong (waited
