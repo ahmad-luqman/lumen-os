@@ -1247,6 +1247,12 @@ impl WindowHandle {
         drop((old_top, old_nodes));
     }
 
+    /// Whether it takes one `ui invoke` request at a time
+    /// ([`Requests::OneAtATime`]).
+    pub fn takes_one_request(&self) -> bool {
+        self.win.one_request
+    }
+
     /// Its request slot's flag (for the ktests: whether a request holds it).
     #[cfg(feature = "ktest")]
     pub fn request_flag(&self) -> Arc<AtomicBool> {

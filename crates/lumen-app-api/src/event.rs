@@ -879,7 +879,6 @@ mod tests {
             Err(DecodeError::Postcard(P::DeserializeBadVarint))
         );
         assert_eq!(bad(&[4, 0xff, 0xff, 0xff, 0xff, 0x7f, 0, 0]), Err(DecodeError::Postcard(P::DeserializeBadVarint)));
-        // A variant past the last, and a key code past the table.
         // A variant past the last, a key code past the table, a theme past
         // the two: serde's refusal, postcard's custom error.
         assert_eq!(bad(&[EVENT_VARIANTS]), Err(DecodeError::Postcard(P::SerdeDeCustom)));

@@ -58,9 +58,10 @@ pub enum Key {
 }
 
 impl Key {
-    /// The key a typed character stands for (`0`-`9`, `.`, `+ - * /`, `x`,
-    /// `=`, `c`/`C`; Enter and Backspace are the toolkit's keys, not
-    /// characters).
+    /// The key a typed character stands for: `0`-`9`; `.` or `,`; `+`, `-`;
+    /// `*`, `x`, `X` or `×`; `/` or `÷`; `=`; `c` or `C` (Enter, Backspace
+    /// and Escape are keys, not characters: the app maps them). A digit or
+    /// `.` after an error starts again; `C` clears.
     pub fn from_char(c: char) -> Option<Key> {
         Some(match c {
             '0'..='9' => Key::Digit(c as u8 - b'0'),

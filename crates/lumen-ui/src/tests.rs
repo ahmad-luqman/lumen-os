@@ -526,3 +526,17 @@ fn repaint_paints_what_changed_and_says_whether_to_publish() {
     assert!(pressed.rects.iter().all(|r| *r != s.bounds()), "only the changed widgets: {:?}", pressed.rects);
     assert_eq!(app.1, 2);
 }
+
+#[test]
+fn a_full_repaint_covers_the_surface_even_laid_out_in_less() {
+    // The tree laid out in an area smaller than its surface: a full paint
+    // still paints the whole surface (its background), so all of it is to
+    // commit, not just the area.
+    let mut app = Counter::new();
+    let mut s = Surface::new(AREA.w() + 40, AREA.h() + 30);
+    s.fill(0x123456);
+    let first = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    assert_eq!(first.rects, alloc::vec![s.bounds()]);
+    let corner = (s.width() - 1, s.height() - 1);
+    assert_eq!(s.pixel(corner.0 as i32, corner.1 as i32), Some(PALETTE.background), "painted past the area");
+}

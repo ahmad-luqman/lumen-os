@@ -97,6 +97,7 @@ impl AppWindow {
     /// at a time: `Requests::OneAtATime`), with `text_draw`'s `scratch`, no
     /// tree yet.
     fn new(handle: WindowHandle, w: u32, h: u32, scratch: Surface) -> AppWindow {
+        debug_assert!(handle.takes_one_request(), "an app's window opened without OneAtATime");
         AppWindow {
             handle: ManuallyDrop::new(handle),
             w,
@@ -502,9 +503,9 @@ fn window_answer(c: &mut C<'_>, h: i32, ptr: i32, len: i32) -> Result<i32, Error
 /// closed, as `handle_close` would: later calls on it are `BadHandle` and a
 /// close grace ends), so `ui invoke`'s answer comes once it is gone.
 fn answer_request(ctx: &mut AppCtx, h: i32, started: Started, served: Served) {
-    if served == Served::ClosedItsWindow {
-        // (`h` named the window a moment ago: closing it can't fail.)
-        let _ = ctx.close(h);
+    if served == Served::ClosedItsWindow && ctx.close(h).is_err() {
+        // `h` named the window a moment ago: closing it can't fail.
+        kernel_bug("an app's window handle gone before its ClosedItsWindow answer");
     }
     started.finish(Answer::Ran(served));
 }
@@ -625,11 +626,12 @@ fn text_draw(c: &mut C<'_>, h: i32, canvas: i32, args: i32, ptr: i32, len: i32) 
     Ok(advance)
 }
 
-/// An app window over `handle` with a published tree: a button, app id
-/// 1, and a list (app id 3, its items 4 and 5); its global ids (for the
-/// ktests, which have no module).
+/// An app window opened on `d` taking one request at a time, with a
+/// published tree: a button, app id 1, and a list (app id 3, its items 4
+/// and 5); the button's and item 4's global ids (for the ktests, which
+/// have no module).
 #[cfg(feature = "ktest")]
-fn test_window(handle: WindowHandle) -> (AppWindow, NodeId, NodeId) {
+fn probe_window(d: &desktop::Desktop) -> Result<(AppWindow, NodeId, NodeId), &'static str> {
     use lumen_app_api::layout::Rect as WireRect;
     use lumen_app_api::tree::{Common, Node, Text};
     let common = |id, name: &str| Common {
@@ -639,18 +641,19 @@ fn test_window(handle: WindowHandle) -> (AppWindow, NodeId, NodeId) {
         disabled: false,
         hidden: false,
     };
-    let items = lumen_app_api::wire::CappedVec::new(alloc::vec![common(4, "a"), common(5, "b")]).unwrap_or_default();
+    let items = lumen_app_api::wire::CappedVec::new(alloc::vec![common(4, "a"), common(5, "b")]).ok_or("items")?;
     let tree = Tree::new(alloc::vec![
         Node::Button { common: common(1, "Go"), focused: false },
         Node::List { common: common(3, "Files"), focused: false, selected: None, items },
     ])
-    .unwrap_or_else(|_| unreachable!("a valid tree"));
+    .map_err(|_| "a valid tree")?;
+    let handle = d.open_window_with("probe", 8, 8, desktop::Requests::OneAtATime).map_err(|_| "a window")?;
     let mut win = AppWindow::new(handle, 8, 8, Surface::new(8, 8));
     let (top, rows) = win.ids.remap(&tree, NodeId::fresh);
     win.handle.publish(top, rows);
-    let button = win.ids.global(1).unwrap_or_else(NodeId::fresh);
-    let item = win.ids.global(4).unwrap_or_else(NodeId::fresh);
-    (win, button, item)
+    let button = win.ids.global(1).ok_or("the button mapped")?;
+    let item = win.ids.global(4).ok_or("item 4 mapped")?;
+    Ok((win, button, item))
 }
 
 /// The next request in `win`'s queue, taken as `window_next_event` takes
@@ -666,25 +669,18 @@ fn take_next(win: &mut AppWindow) -> Option<Event> {
 }
 
 /// For `app::tests`' module ktests: an app window opened on `ctx`'s seam
-/// desktop (with `test_window`'s tree), a request on its button pushed and
+/// desktop (`probe_window`), a request on its button pushed and
 /// delivered if `running`, added to `ctx`: its handle.
 #[cfg(feature = "ktest")]
 pub(super) fn ktest_window(ctx: &mut AppCtx, running: bool) -> Result<i32, &'static str> {
     let d = ctx.desktop.clone().ok_or("no desktop seam")?;
-    let handle = d.open_window_with("probe", 8, 8, desktop::Requests::OneAtATime).map_err(|_| "a window")?;
-    let (mut win, button, _) = test_window(handle);
+    let (mut win, button, _) = probe_window(&d)?;
     if running {
         let (req, _) = Request::new(button.get(), lumen_ui::Action::Press);
         d.push_request(win.handle.id(), req).map_err(|_| "pushed")?;
         take_next(&mut win).ok_or("delivered")?;
     }
     ctx.add_window(win).map_err(|_| "a handle")
-}
-
-/// Open a test window on `d` taking one request at a time.
-#[cfg(feature = "ktest")]
-fn probe_window(d: &desktop::Desktop) -> Result<(AppWindow, NodeId, NodeId), &'static str> {
-    Ok(test_window(d.open_window_with("probe", 8, 8, desktop::Requests::OneAtATime).map_err(|_| "a window")?))
 }
 
 crate::ktest!(

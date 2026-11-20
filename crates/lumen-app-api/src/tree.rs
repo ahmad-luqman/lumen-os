@@ -153,6 +153,8 @@ pub enum TreeError {
     TooBig(usize),
     /// Node `node` (counted from 0) didn't decode: postcard's refusal.
     Decode { node: usize, error: postcard::Error },
+    /// Node `node` didn't encode (postcard's refusal; a bug, or no memory).
+    Encode { node: usize, error: postcard::Error },
     /// More than [`TREE_NODES`] nodes, items counted.
     TooManyNodes,
     /// An id of 0.
@@ -177,6 +179,7 @@ impl core::fmt::Display for TreeError {
         match self {
             TreeError::TooBig(n) => write!(f, "{n} bytes, past {TREE_BYTES}"),
             TreeError::Decode { node, error } => write!(f, "node {node} didn't decode ({error:?})"),
+            TreeError::Encode { node, error } => write!(f, "node {node} didn't encode ({error:?})"),
             TreeError::TooManyNodes => write!(f, "more than {TREE_NODES} nodes"),
             TreeError::ZeroId => f.write_str("an id of 0"),
             TreeError::DuplicateId(id) => write!(f, "id {id} twice"),
@@ -324,7 +327,7 @@ impl Tree {
     pub fn encode(&self) -> Result<Vec<u8>, TreeError> {
         let mut out = Vec::new();
         for (i, node) in self.nodes.iter().enumerate() {
-            out = postcard::to_extend(node, out).map_err(|error| TreeError::Decode { node: i, error })?;
+            out = postcard::to_extend(node, out).map_err(|error| TreeError::Encode { node: i, error })?;
             if out.len() > TREE_BYTES {
                 return Err(TreeError::TooBig(out.len()));
             }
@@ -679,6 +682,14 @@ mod tests {
         let shown = "a\u{fffd}b\u{fffd}c\u{fffd}d\u{fffd}e";
         assert_eq!(rows[0].1.name(), shown);
         assert_eq!(rows[0].1.value(), Some(&Value::Text(alloc::string::String::from(shown))));
+        // A list item's name and a text field's text too.
+        let item = Common { name: Text::cut(bad), ..c(3) };
+        let list =
+            Node::List { common: c(2), focused: false, selected: None, items: CappedVec::new(vec![item]).unwrap() };
+        let field = Node::TextField { common: c(4), focused: false, text: Text::cut(bad) };
+        let (_, rows) = Tree::new(vec![list, field]).unwrap().rows(|_, _| NodeId::fresh());
+        assert_eq!(rows[1].1.name(), shown, "the list's item");
+        assert_eq!(rows[2].1.value(), Some(&Value::Text(alloc::string::String::from(shown))), "the field's text");
     }
 
     #[test]
@@ -969,8 +980,8 @@ mod tests {
             );
             assert_eq!(a.children().iter().map(|&c| global(c)).collect::<Vec<_>>(), b.children());
         }
-        // Hidden nodes and items go over too: a bar too narrow for its
-        // widgets hides those past its pinned one.
+        // Hidden widgets go over too: a bar too narrow for its widgets hides
+        // those past its pinned one (a hidden item: below).
         let mut bar = Ui::bar(4);
         for name in ["One", "Two", "Three", "Four"] {
             bar.button(None, name);
@@ -986,18 +997,36 @@ mod tests {
             rows.iter().map(|(_, n)| n.state().contains(StateFlags::HIDDEN)).collect()
         };
         assert_eq!(hidden(&bar_rows), hidden(&got));
+        // A hidden item shown so in the kernel's rows.
+        let mut shut = c(9);
+        shut.hidden = true;
+        let open = Node::List {
+            common: c(7),
+            focused: false,
+            selected: None,
+            items: CappedVec::new(vec![shut, c(10)]).unwrap(),
+        };
+        let (_, item_rows) = Tree::new(vec![open]).unwrap().rows(|_, _| NodeId::fresh());
+        assert_eq!(hidden(&item_rows), [false, true, false]);
         // A row the wire can't hold: a window's root, a stray item, a list
         // followed by a row that isn't its item.
         let root = AutomationNode::window(NodeId::fresh(), "w", lumen_gfx::Rect::new(0, 0, 1, 1), false, Vec::new());
         assert_eq!(Tree::from_automation(&[(0, root)]), Err(TreeError::Shape { row: 0 }));
         let item_row = rows.iter().position(|(_, n)| n.role() == Role::ListItem).unwrap();
         assert_eq!(Tree::from_automation(&rows[item_row..]), Err(TreeError::Shape { row: 0 }));
-        let mut wrong = rows.clone();
         let list_row = item_row - 1;
-        wrong[item_row] = (
-            wrong[item_row].0,
-            AutomationNode::button(NodeId::fresh(), "x", lumen_gfx::Rect::new(0, 0, 1, 1), false, false),
-        );
-        assert_eq!(Tree::from_automation(&wrong), Err(TreeError::Shape { row: list_row }));
+        let r1 = lumen_gfx::Rect::new(0, 0, 1, 1);
+        // A row of another kind, one with its item's id but another role, and
+        // one of the right role but another id: none is the list's item.
+        let item_id = rows[item_row].1.id();
+        for (what, row) in [
+            ("a button", AutomationNode::button(NodeId::fresh(), "x", r1, false, false)),
+            ("another role", AutomationNode::menu_item(item_id, "x", r1, false)),
+            ("another id", AutomationNode::list_item(NodeId::fresh(), "x", 0, None, r1, false)),
+        ] {
+            let mut wrong = rows.clone();
+            wrong[item_row] = (wrong[item_row].0, row);
+            assert_eq!(Tree::from_automation(&wrong), Err(TreeError::Shape { row: list_row }), "{what}");
+        }
     }
 }

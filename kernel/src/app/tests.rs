@@ -1110,7 +1110,8 @@ fn run_window_module(bytes: &[u8], draw: TextDraw, text: &[u8]) -> Result<(i32, 
 
 crate::ktest!(
     fn window_publish_charges_by_the_byte_and_the_node() {
-        // window_publish of 90 buttons and a list of 10 items: BYTE_FUEL per
+        // window_publish of 89 buttons and a list of 10 items (100 nodes,
+        // items counted): BYTE_FUEL per
         // byte copied in and NODE_FUEL per node decoded, items counted, on
         // top of the open's; a refused tree (an id twice, found once every
         // node was decoded) pays for its bytes and its nodes too. Floors
@@ -1152,16 +1153,17 @@ fn tree_call_module(f: u8) -> Vec<u8> {
     // i32.load (align 2, offset 0) of the address on the stack.
     let load = |at| [i32_const(at), vec![0x28, 0x02, 0x00]].concat();
     let body = [load(0), i32_const(256), load(4), call(f)].concat();
-    // Two pages: room for a tree a byte past TREE_BYTES at 256.
+    // Two pages: room for a tree a byte past TREE_BYTES (65,537 bytes) at
+    // 256.
     Spec { body, memories: vec![(2, Some(2))], ..Spec::importing(&["window_publish", "window_answer"]) }.bytes()
 }
+
+/// A loaded app: its store, `lumen_main`, and a window's handle.
+type Loaded = (Store<runtime::AppCtx>, wasmi::TypedFunc<(), i32>, i32);
 
 /// Load `tree_call_module(f)` with a window on a screenless desktop (a
 /// request running on it if `running`): the store, `lumen_main`, the
 /// window's handle (poked at 0).
-/// A loaded app: its store, `lumen_main`, and a window's handle.
-type Loaded = (Store<runtime::AppCtx>, wasmi::TypedFunc<(), i32>, i32);
-
 fn with_window(f: u8, running: bool) -> Result<Loaded, &'static str> {
     let grants = Grants::log().with(lumen_app_api::Grant::Desktop);
     let (mut store, main) = load_as(&tree_call_module(f), &test_state(), grants)?;
