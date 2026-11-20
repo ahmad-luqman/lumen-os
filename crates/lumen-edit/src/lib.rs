@@ -13,8 +13,9 @@
 //!   edit drops what could be redone. Past [`Limits::undo_edits`] edits, or
 //!   [`Limits::undo_bytes`] bytes of them (each edit's removed and inserted
 //!   text), the oldest are forgotten, so the history's memory is bounded.
-//! - **The size** is capped at [`Limits::text_bytes`]: an edit that would
-//!   pass it is refused ([`Change::Refused`]), changing nothing.
+//! - **The size** is capped at [`Limits::text_bytes`], and each line at
+//!   [`Limits::line_bytes`]: an edit that would pass either is refused
+//!   ([`Change::Refused`]), changing nothing.
 //! - **The view** shows `rows` lines from `top` ([`Editor::scroll_to`]):
 //!   the cursor's line is kept inside it.
 //! - **What changed** ([`Change`]) is what a window needs to redraw: the
@@ -45,6 +46,8 @@ fn allowed(c: char) -> bool {
 pub struct Limits {
     /// The text's bytes.
     pub text_bytes: usize,
+    /// A line's bytes (without its `\n`).
+    pub line_bytes: usize,
     /// Edits kept to undo.
     pub undo_edits: usize,
     /// Bytes of the edits kept to undo (each one's removed and inserted
@@ -138,8 +141,10 @@ impl Editor {
     /// at its start.
     pub fn new(text: &str, limits: Limits) -> Editor {
         let mut clean = String::new();
+        let mut line = 0;
         for c in text.chars().filter(|&c| allowed(c)) {
-            if clean.len() + c.len_utf8() > limits.text_bytes {
+            line = if c == '\n' { 0 } else { line + c.len_utf8() };
+            if clean.len() + c.len_utf8() > limits.text_bytes || line > limits.line_bytes {
                 break;
             }
             clean.push(c);
@@ -342,7 +347,7 @@ impl Editor {
     /// Replace `start..end` with `with` as an edit (`typed`: one character
     /// typed, which may join the run before it).
     fn edit(&mut self, start: usize, end: usize, with: &str, typed: bool) -> Change {
-        if self.text.len() - (end - start) + with.len() > self.limits.text_bytes {
+        if self.text.len() - (end - start) + with.len() > self.limits.text_bytes || !self.lines_fit(start, end, with) {
             return Change::Refused;
         }
         let before = self.cursor;
@@ -361,6 +366,18 @@ impl Editor {
         }
         self.forget_past_limits();
         change
+    }
+
+    /// Whether every line `start..end` replaced by `with` would make is at
+    /// most [`Limits::line_bytes`].
+    fn lines_fit(&self, start: usize, end: usize, with: &str) -> bool {
+        let head = start - self.starts[self.line_of(start)];
+        let tail = self.text[end..].find('\n').unwrap_or(self.text.len() - end);
+        let last = with.split('\n').count() - 1;
+        with.split('\n').enumerate().all(|(i, piece)| {
+            let len = piece.len() + if i == 0 { head } else { 0 } + if i == last { tail } else { 0 };
+            len <= self.limits.line_bytes
+        })
     }
 
     /// The oldest edits forgotten while the history is past its limits.

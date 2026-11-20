@@ -8,7 +8,7 @@ use super::*;
 const BIG: usize = 1 << 20;
 
 fn limits(text_bytes: usize, undo_edits: usize) -> Limits {
-    Limits { text_bytes, undo_edits, undo_bytes: BIG }
+    Limits { text_bytes, line_bytes: BIG, undo_edits, undo_bytes: BIG }
 }
 
 fn ed(text: &str) -> Editor {
@@ -260,6 +260,35 @@ fn the_size_cap_refuses_an_edit_whole() {
 }
 
 #[test]
+fn the_line_cap_refuses_an_edit_making_a_line_too_long() {
+    let lim = Limits { text_bytes: BIG, line_bytes: 5, undo_edits: 100, undo_bytes: BIG };
+    // A longer line given is cut there (the rest of the text with it).
+    assert_eq!(Editor::new("abcdefg\nhi", lim).text(), "abcde");
+    assert_eq!(Editor::new("abc\nhijklmn", lim).text(), "abc\nhijkl");
+    let mut e = Editor::new("abcd\nxy", lim);
+    assert_eq!(e.apply(Command::Insert('Z')), Change::Line(0), "to exactly the cap");
+    assert_eq!(e.apply(Command::Insert('Z')), Change::Refused);
+    assert_eq!(e.apply(Command::Tab), Change::Refused);
+    assert_eq!(e.text(), "Zabcd\nxy");
+    // A newline splits a line: always fits.
+    e.apply(Command::Right);
+    assert_eq!(e.apply(Command::Newline), Change::From(0));
+    assert_eq!(e.text(), "Za\nbcd\nxy");
+    // Joining two lines is refused if the joined one is too long.
+    e.apply(Command::Bottom);
+    e.apply(Command::Home);
+    assert_eq!(e.apply(Command::Backspace), Change::From(1), "bcd + xy = 5 bytes");
+    e.apply(Command::Up);
+    e.apply(Command::End);
+    assert_eq!(e.apply(Command::Delete), Change::Refused, "Za + bcdxy = 7 bytes");
+    // Multi-byte chars count by the byte; a whole text too.
+    let mut u = Editor::new("", lim);
+    assert_eq!(u.replace_all("ééé"), Change::Refused, "6 bytes on one line");
+    assert_eq!(u.replace_all("éé\né"), Change::From(0));
+    assert_eq!(u.replace_all("12345\n123456"), Change::Refused, "its second line too long");
+}
+
+#[test]
 fn past_max_undo_the_oldest_edit_is_forgotten() {
     let mut e = Editor::new("", limits(BIG, 3));
     for _ in 0..5 {
@@ -274,7 +303,7 @@ fn past_max_undo_the_oldest_edit_is_forgotten() {
 fn past_undo_bytes_the_oldest_edits_are_forgotten() {
     // 10 bytes of history: "abc" (3) and "defg" (4) kept, then a 5-byte
     // edit forgets the first; one past the limit alone keeps nothing.
-    let mut e = Editor::new("", Limits { text_bytes: BIG, undo_edits: 100, undo_bytes: 10 });
+    let mut e = Editor::new("", Limits { text_bytes: BIG, line_bytes: BIG, undo_edits: 100, undo_bytes: 10 });
     typed(&mut e, "abc");
     e.apply(Command::Left);
     e.apply(Command::Right);
@@ -288,7 +317,7 @@ fn past_undo_bytes_the_oldest_edits_are_forgotten() {
     assert_eq!(e.undo_depth(), 0, "a 23-byte edit alone is past the limit");
     assert_eq!(e.apply(Command::Undo), Change::None);
     // A typing run growing past it forgets itself too.
-    let mut f = Editor::new("", Limits { text_bytes: BIG, undo_edits: 100, undo_bytes: 4 });
+    let mut f = Editor::new("", Limits { text_bytes: BIG, line_bytes: BIG, undo_edits: 100, undo_bytes: 4 });
     typed(&mut f, "abcd");
     assert_eq!(f.undo_depth(), 1);
     typed(&mut f, "e");
@@ -382,6 +411,18 @@ impl Model {
         end - starts[line]
     }
 
+    /// Whether removing the char at `at`, a line break, would join two
+    /// lines into one past `line_cap` bytes.
+    fn join_too_long(&self, at: usize, line_cap: usize) -> bool {
+        if self.text[at] != '\n' {
+            return false;
+        }
+        let bytes = |cs: &[char]| cs.iter().map(|c| c.len_utf8()).sum::<usize>();
+        let start = self.text[..at].iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
+        let end = self.text[at + 1..].iter().position(|&c| c == '\n').map_or(self.text.len(), |i| at + 1 + i);
+        bytes(&self.text[start..at]) + bytes(&self.text[at + 1..end]) > line_cap
+    }
+
     fn vertical(&mut self, by: isize) {
         let (line, col) = self.line_col();
         let goal = *self.goal.get_or_insert(col);
@@ -396,9 +437,12 @@ impl Model {
         }
     }
 
-    fn insert(&mut self, s: &str, cap: usize) {
+    fn insert(&mut self, s: &str, cap: usize, line_cap: usize) {
         let bytes: usize = self.text.iter().map(|c| c.len_utf8()).sum();
-        if bytes + s.len() > cap {
+        let starts = self.line_starts();
+        let (line, _) = self.line_col();
+        let line_bytes: usize = self.text[starts[line]..starts[line] + self.line_len(line)].iter().map(|c| c.len_utf8()).sum();
+        if bytes + s.len() > cap || (s != "\n" && line_bytes + s.len() > line_cap) {
             return;
         }
         for c in s.chars() {
@@ -408,19 +452,19 @@ impl Model {
         self.goal = None;
     }
 
-    fn apply(&mut self, cmd: Command, cap: usize) {
+    fn apply(&mut self, cmd: Command, cap: usize, line_cap: usize) {
         let (line, _) = self.line_col();
         match cmd {
-            Command::Insert(c) if !c.is_control() => self.insert(c.encode_utf8(&mut [0; 4]), cap),
+            Command::Insert(c) if !c.is_control() => self.insert(c.encode_utf8(&mut [0; 4]), cap, line_cap),
             Command::Insert(_) => {}
-            Command::Newline => self.insert("\n", cap),
-            Command::Tab => self.insert("    ", cap),
-            Command::Backspace if self.cursor > 0 => {
+            Command::Newline => self.insert("\n", cap, line_cap),
+            Command::Tab => self.insert("    ", cap, line_cap),
+            Command::Backspace if self.cursor > 0 && !self.join_too_long(self.cursor - 1, line_cap) => {
                 self.cursor -= 1;
                 self.text.remove(self.cursor);
                 self.goal = None;
             }
-            Command::Delete if self.cursor < self.text.len() => {
+            Command::Delete if self.cursor < self.text.len() && !self.join_too_long(self.cursor, line_cap) => {
                 self.text.remove(self.cursor);
                 self.goal = None;
             }
@@ -508,7 +552,8 @@ fn a_randomized_model_agrees_and_every_undo_and_redo_restores_the_text_exactly()
     for seed in 1..=300u64 {
         let cap = if seed % 5 == 0 { 24 } else { 4096 };
         let rows = 1 + (seed % 7) as usize;
-        let mut e = Editor::new("start\ntext", limits(cap, 1000));
+        let line_cap = if seed % 3 == 0 { 12 } else { BIG };
+        let mut e = Editor::new("start\ntext", Limits { line_bytes: line_cap, ..limits(cap, 1000) });
         e.scroll_to(rows);
         let mut m = model_of(&e, rows);
         let mut r = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
@@ -533,7 +578,7 @@ fn a_randomized_model_agrees_and_every_undo_and_redo_restores_the_text_exactly()
                 }
                 m = model_of(&e, rows);
             } else {
-                m.apply(cmd, cap);
+                m.apply(cmd, cap, line_cap);
                 let text: String = m.text.iter().collect();
                 assert_eq!(e.text(), text, "seed {seed} step {step} {cmd:?}");
                 let cursor = e.text()[..e.cursor()].chars().count();
@@ -550,6 +595,7 @@ fn a_randomized_model_agrees_and_every_undo_and_redo_restores_the_text_exactly()
                 }
             }
             assert!(e.text().len() <= cap);
+            assert!((0..e.line_count()).all(|n| e.line(n).len() <= line_cap), "seed {seed} step {step}");
             assert!(e.text().is_char_boundary(e.cursor()));
             e.scroll_to(rows);
             let line = e.cursor_line();

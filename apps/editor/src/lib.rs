@@ -16,9 +16,10 @@
 //!   Each line is drawn only inside the rectangles being repainted
 //!   (`Over`'s): `text_draw` costs the app fuel by the character, so a
 //!   screenful drawn again a key would be a slice's worth.
-//! - **The view** scrolls to keep the cursor in it: by lines, and across in
-//!   jumps of half its width. A line past 1,024 bytes shows (and measures)
-//!   only its first 1,024 (the host's text cap).
+//! - **The view** scrolls to keep the cursor in it: by lines, and across by
+//!   characters (`lumen_edit::view`): each line drawn, and the cursor
+//!   measured, only as far as the view can show. A line holds at most
+//!   4 KiB.
 //! - **The cursor** blinks every 500 ms while the window has the focus, and
 //!   stays solid through the tick after a key; `run editor --no-blink`
 //!   keeps it solid (the window then settles: the golden). Without the
@@ -57,9 +58,9 @@ const HEIGHT: u32 = 400;
 const TEXT_PAD: i32 = 4;
 const CURSOR_W: u32 = 2;
 const BLINK_NS: u64 = 500_000_000;
-/// What the editor holds at most: 16 KiB of text, and 500 edits or 256 KiB
-/// of them to undo (the app's memory is 4 MiB).
-const LIMITS: Limits = Limits { text_bytes: 16 * 1024, undo_edits: 500, undo_bytes: 256 * 1024 };
+/// What the editor holds at most: 16 KiB of text, 4 KiB a line, and 500
+/// edits or 256 KiB of their text to undo (the app's memory is 4 MiB).
+const LIMITS: Limits = Limits { text_bytes: 16 * 1024, line_bytes: 4 * 1024, undo_edits: 500, undo_bytes: 256 * 1024 };
 
 /// Narrow glyphs: the narrowest of them bounds how many chars the view
 /// shows.
