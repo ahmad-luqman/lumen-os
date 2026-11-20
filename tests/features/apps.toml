@@ -160,3 +160,12 @@ tests = [
     "scenario:test_apps::test_sdk_a_tick_can_quit",
     "scenario:test_apps::test_sdk_wraps_its_other_calls",
 ]
+
+[[feature]]
+name = "An original snake-style game (#201): Comet, a comet steered with the arrow keys across a night sky, its tail growing with each grain of stardust, ended by the edge, its own tail or a level's asteroids; one seed plays one game; stepping one step per Step press (settling between), flying by itself on a period; score, level, state and the head's cell in its tree; Restart; its window matching a golden"
+milestone = "M5"
+tests = [
+    "cargo:lumen-snake",
+    "scenario:test_apps::test_snake_tree_and_steps",
+    "scenario:test_apps::test_snake_golden",
+]

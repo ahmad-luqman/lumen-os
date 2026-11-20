@@ -517,6 +517,11 @@ own PR that updates that doc first.
   worst trees against `TREE_COPIES_BYTES`, counting allocators).
 - `crates/lumen-calc`: the calculator app's logic (#207): keys in, the
   display out, left to right in exact decimal fixed point (host-tested).
+- `crates/lumen-snake`: Comet's logic (#201, an original snake-style
+  game): the sky's cells, steering, growth, the edge, tail and asteroids
+  ending a flight, levels (`rocks`), stardust on empty cells, `Rng`
+  (seeded SplitMix64: one seed, one game), `Game::step` reporting exactly
+  the cells it changed (the app's damage) (host-tested).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
@@ -530,7 +535,8 @@ own PR that updates that doc first.
   `build/apps/tests/`, skipping libraries (`lumen-app`, the SDK, #206;
   `testkit`); `template`, the app `make app NAME=` copies
   (`tools/new-app.sh`); `calculator` (#207, the first app on the SDK's
-  `ui::Toolkit`, lumen-ui inside the app); the SDK's loops (`run_with`'s
+  `ui::Toolkit`, lumen-ui inside the app); `comet` (#201, the snake-style
+  game on `run_until`, `--seed N --step` for tests); the SDK's loops (`run_with`'s
   `Taken`, `run_until` for a `Ticking` app, both returning `Ended`;
   `Event::offer`; `with_area`, `palette`) for the animated apps; the
   layout, the SDK, the
