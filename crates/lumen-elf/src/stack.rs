@@ -10,7 +10,7 @@
 
 use core::fmt;
 
-use crate::loader::{LoadedElf, PAGE_SIZE};
+use crate::loader::{LoadedElf, PAGE_SIZE, USER_MAX, USER_MIN};
 
 /// Default initial user stack top (`docs/ARCHITECTURE.md` §5).
 pub const USER_STACK_TOP: u64 = 0x0000_7fff_f000_0000;
@@ -81,11 +81,19 @@ pub struct AuxvInfo {
 
 impl AuxvInfo {
     /// Construct M6 default `auxv` metadata from a validated [`LoadedElf`].
+    ///
+    /// When the program header table is not mapped into user memory
+    /// (`loaded.phdr_vaddr` is `None`), both `phdr` and `phnum` are set to `0`
+    /// so `musl`'s `static_init_tls` never dereferences a null `AT_PHDR`.
     pub const fn from_loaded(loaded: &LoadedElf) -> Self {
+        let (phdr, phnum) = match loaded.phdr_vaddr {
+            Some(va) => (va, loaded.phnum as u64),
+            None => (0, 0),
+        };
         Self {
-            phdr: loaded.at_phdr(),
+            phdr,
             phent: loaded.phent as u64,
-            phnum: loaded.phnum as u64,
+            phnum,
             pagesz: PAGE_SIZE,
             base: None,
             entry: loaded.entry,
@@ -117,7 +125,7 @@ pub struct InitialStack {
 pub enum StackBuildError {
     /// `stack_top` is not 16-byte aligned.
     UnalignedStackTop(u64),
-    /// `stack_top <= buf.len()` (would underflow or map address `0`).
+    /// `[stack_top - buf.len() .. stack_top)` underflows or lies outside `USER_MIN..USER_MAX`.
     InvalidStackTop { stack_top: u64, buf_len: usize },
     /// One of `argv`, `envp`, or `execfn` contains an interior NUL byte.
     InteriorNul,
@@ -132,7 +140,7 @@ impl fmt::Display for StackBuildError {
         match *self {
             Self::UnalignedStackTop(top) => write!(f, "stack_top {top:#x} is not 16-byte aligned"),
             Self::InvalidStackTop { stack_top, buf_len } => {
-                write!(f, "stack_top {stack_top:#x} cannot cover {buf_len}-byte buffer above 0")
+                write!(f, "stack range for top {stack_top:#x} ({buf_len} bytes) lies outside user space")
             }
             Self::InteriorNul => f.write_str("argv/envp/execfn string contains an interior NUL byte"),
             Self::SizeOverflow => f.write_str("initial user stack size overflow"),
@@ -182,7 +190,7 @@ pub fn build_initial_stack(
     }
     let stack_bottom = stack_top
         .checked_sub(buf.len() as u64)
-        .filter(|&b| b > 0)
+        .filter(|&b| b >= USER_MIN && stack_top <= USER_MAX)
         .ok_or(StackBuildError::InvalidStackTop { stack_top, buf_len: buf.len() })?;
 
     // Validate no interior NULs and compute total string bytes with checked arithmetic.
@@ -482,7 +490,7 @@ mod tests {
             Err(StackBuildError::UnalignedStackTop(USER_STACK_TOP + 8))
         );
 
-        // Underflowing / zero-reaching stack_top
+        // Underflowing or below USER_MIN / above USER_MAX
         assert_eq!(
             build_initial_stack(&mut buf, 1024, &[], &[], b"x", [0; 16], &auxv),
             Err(StackBuildError::InvalidStackTop { stack_top: 1024, buf_len: 1024 })
@@ -491,6 +499,17 @@ mod tests {
             build_initial_stack(&mut buf, 512, &[], &[], b"x", [0; 16], &auxv),
             Err(StackBuildError::InvalidStackTop { stack_top: 512, buf_len: 1024 })
         );
+        assert_eq!(
+            build_initial_stack(&mut buf, USER_MIN + 512, &[], &[], b"x", [0; 16], &auxv),
+            Err(StackBuildError::InvalidStackTop { stack_top: USER_MIN + 512, buf_len: 1024 })
+        );
+        assert_eq!(
+            build_initial_stack(&mut buf, USER_MAX + 16, &[], &[], b"x", [0; 16], &auxv),
+            Err(StackBuildError::InvalidStackTop { stack_top: USER_MAX + 16, buf_len: 1024 })
+        );
+        // Exact USER_MIN bottom and exact USER_MAX top succeed.
+        assert!(build_initial_stack(&mut buf, USER_MIN + 1024, &[], &[], b"x", [0; 16], &auxv).is_ok());
+        assert!(build_initial_stack(&mut buf, USER_MAX, &[], &[], b"x", [0; 16], &auxv).is_ok());
 
         // Interior NUL in argv, envp, and execfn
         assert_eq!(
@@ -593,5 +612,68 @@ mod tests {
         assert!(!saw_base);
         assert!(saw_phdr);
         assert!(saw_entry);
+    }
+
+    #[test]
+    fn auxv_from_loaded_zeros_phnum_when_phdrs_unmapped() {
+        use crate::loader::{EM_X86_64, ET_EXEC, EV_CURRENT, PF_R, PF_X, PHDR_MIN_SIZE, PT_LOAD};
+
+        // Minimal ET_EXEC whose only PT_LOAD starts at file offset 0x100 (after
+        // the ELF header and phdr table), so phdr_vaddr is None.
+        let mut img = vec![0u8; 0x200];
+        img[0..4].copy_from_slice(&crate::ELF_MAGIC);
+        img[4] = crate::ELFCLASS64;
+        img[5] = crate::ELFDATA2LSB;
+        img[6] = EV_CURRENT;
+        img[0x10..0x12].copy_from_slice(&ET_EXEC.to_le_bytes());
+        img[0x12..0x14].copy_from_slice(&EM_X86_64.to_le_bytes());
+        img[0x14..0x18].copy_from_slice(&u32::from(EV_CURRENT).to_le_bytes());
+        img[0x18..0x20].copy_from_slice(&0x401000u64.to_le_bytes());
+        img[0x20..0x28].copy_from_slice(&(crate::EHDR_SIZE as u64).to_le_bytes());
+        img[0x36..0x38].copy_from_slice(&PHDR_MIN_SIZE.to_le_bytes());
+        img[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes());
+
+        let o = crate::EHDR_SIZE;
+        img[o..o + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        img[o + 4..o + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
+        img[o + 8..o + 16].copy_from_slice(&0x100u64.to_le_bytes());
+        img[o + 16..o + 24].copy_from_slice(&0x401000u64.to_le_bytes());
+        img[o + 24..o + 32].copy_from_slice(&0x401000u64.to_le_bytes());
+        img[o + 32..o + 40].copy_from_slice(&0x100u64.to_le_bytes());
+        img[o + 40..o + 48].copy_from_slice(&0x100u64.to_le_bytes());
+        img[o + 48..o + 56].copy_from_slice(&PAGE_SIZE.to_le_bytes());
+
+        let loaded = LoadedElf::parse(&img).unwrap();
+        assert_eq!(loaded.phdr_vaddr, None);
+        assert_eq!(loaded.phnum, 1);
+
+        let auxv = AuxvInfo::from_loaded(&loaded);
+        assert_eq!(auxv.phdr, 0);
+        assert_eq!(auxv.phnum, 0);
+
+        let mut buf = vec![0u8; 1024];
+        let stack_bottom = USER_STACK_TOP - buf.len() as u64;
+        let info = build_initial_stack(&mut buf, USER_STACK_TOP, &[b"/tiny"], &[], b"/tiny", [5; 16], &auxv).unwrap();
+        let mut cur = info.rsp + 4 * 8;
+        let mut saw_phdr_zero = false;
+        let mut saw_phnum_zero = false;
+        loop {
+            let k = read_u64_at(&buf, stack_bottom, cur);
+            let v = read_u64_at(&buf, stack_bottom, cur + 8);
+            cur += 16;
+            if k == AT_PHDR {
+                assert_eq!(v, 0);
+                saw_phdr_zero = true;
+            }
+            if k == AT_PHNUM {
+                assert_eq!(v, 0);
+                saw_phnum_zero = true;
+            }
+            if k == AT_NULL {
+                break;
+            }
+        }
+        assert!(saw_phdr_zero);
+        assert!(saw_phnum_zero);
     }
 }

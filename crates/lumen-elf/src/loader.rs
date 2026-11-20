@@ -639,13 +639,24 @@ fn compute_at_phdr(
     if let Some(ph) = pt_phdr
         && let Some(va) = load_bias.checked_add(ph.p_vaddr)
         && let Some(va_end) = va.checked_add(ph_bytes as u64)
-        && segments.iter().any(|s| va >= s.vaddr && va_end <= s.end())
+        && segments.iter().any(|s| {
+            s.perm.read
+                && va >= s.vaddr
+                && s.vaddr.checked_add(s.filesz as u64).is_some_and(|file_va_end| va_end <= file_va_end)
+                && usize::try_from(va - s.vaddr)
+                    .ok()
+                    .and_then(|delta| s.file_offset.checked_add(delta))
+                    .is_some_and(|mapped_off| mapped_off == phoff)
+        })
     {
         return Some(va);
     }
 
     let ph_end = phoff.checked_add(ph_bytes)?;
     for seg in segments {
+        if !seg.perm.read {
+            continue;
+        }
         let seg_file_end = seg.file_offset.checked_add(seg.filesz)?;
         if seg.file_offset <= phoff && ph_end <= seg_file_end {
             let delta = (phoff - seg.file_offset) as u64;
@@ -930,6 +941,90 @@ mod tests {
         let img = b.build_raw();
         let loaded = LoadedElf::parse(&img).unwrap();
         assert_eq!(loaded.phdr_vaddr, Some(0x400040));
+    }
+
+    #[test]
+    fn pt_phdr_into_bss_or_wrong_file_bytes_falls_back_to_actual_phdr_table() {
+        let ph_size = 4 * u64::from(PHDR_MIN_SIZE);
+        let pad = 0x1000 - (EHDR_SIZE + ph_size as usize);
+
+        // Case 1: PT_PHDR points into the .bss tail of a readable RW- segment.
+        let mut b = ElfBuilder::new(ET_EXEC, 0x401000);
+        b.push_data(&vec![0u8; pad]);
+        b.push_data(&[0xc3; 0x40]); // .text at file offset 0x1000
+        b.push_data(&[0x77; 0x200]); // .data at file offset 0x1040
+
+        b.add_phdr(ProgramHeader {
+            p_type: PT_PHDR,
+            p_flags: PF_R,
+            p_offset: EHDR_SIZE as u64,
+            p_vaddr: 0x402300, // inside .bss (filesz ends at 0x402200)
+            p_paddr: 0x402300,
+            p_filesz: ph_size,
+            p_memsz: ph_size,
+            p_align: 8,
+        });
+        b.add_phdr(load_phdr(PF_R, 0, 0x400000, 0x400, 0x400));
+        b.add_phdr(load_phdr(PF_R | PF_X, 0x1000, 0x401000, 0x40, 0x40));
+        b.add_phdr(load_phdr(PF_R | PF_W, 0x1040, 0x402000, 0x200, 0x1000));
+
+        let img = b.build_raw();
+        let loaded = LoadedElf::parse(&img).unwrap();
+        // Must reject the .bss PT_PHDR and fall back to the actual mapped header table.
+        assert_eq!(loaded.phdr_vaddr, Some(0x400040));
+
+        // Case 2: PT_PHDR points to wrong initialized bytes within a readable PT_LOAD
+        // (maps file offset 0x1040 instead of e_phoff = 0x40).
+        let mut b2 = ElfBuilder::new(ET_EXEC, 0x401000);
+        b2.push_data(&vec![0u8; pad]);
+        b2.push_data(&[0xc3; 0x40]);
+        b2.push_data(&[0x77; 0x200]);
+
+        b2.add_phdr(ProgramHeader {
+            p_type: PT_PHDR,
+            p_flags: PF_R,
+            p_offset: EHDR_SIZE as u64,
+            p_vaddr: 0x402000, // initialized .data bytes, NOT e_phoff!
+            p_paddr: 0x402000,
+            p_filesz: ph_size,
+            p_memsz: ph_size,
+            p_align: 8,
+        });
+        b2.add_phdr(load_phdr(PF_R, 0, 0x400000, 0x400, 0x400));
+        b2.add_phdr(load_phdr(PF_R | PF_X, 0x1000, 0x401000, 0x40, 0x40));
+        b2.add_phdr(load_phdr(PF_R | PF_W, 0x1040, 0x402000, 0x200, 0x200));
+
+        let img2 = b2.build_raw();
+        let loaded2 = LoadedElf::parse(&img2).unwrap();
+        assert_eq!(loaded2.phdr_vaddr, Some(0x400040));
+    }
+
+    #[test]
+    fn unreadable_pt_load_covering_phdrs_yields_none_for_at_phdr() {
+        // An execute-only (PF_X, no PF_R) PT_LOAD covering offset 0..0x400 cannot
+        // supply readable AT_PHDR even with a matching PT_PHDR.
+        let mut b = ElfBuilder::new(ET_EXEC, 0x400200);
+        let ph_size = 2 * u64::from(PHDR_MIN_SIZE);
+        let pad = 0x200 - (EHDR_SIZE + ph_size as usize);
+        b.push_data(&vec![0u8; pad]);
+        b.push_data(&[0xc3; 0x200]);
+
+        b.add_phdr(ProgramHeader {
+            p_type: PT_PHDR,
+            p_flags: PF_R,
+            p_offset: EHDR_SIZE as u64,
+            p_vaddr: 0x400000 + EHDR_SIZE as u64,
+            p_paddr: 0x400000 + EHDR_SIZE as u64,
+            p_filesz: ph_size,
+            p_memsz: ph_size,
+            p_align: 8,
+        });
+        b.add_phdr(load_phdr(PF_X, 0, 0x400000, 0x400, 0x400));
+
+        let img = b.build_raw();
+        let loaded = LoadedElf::parse(&img).unwrap();
+        assert_eq!(loaded.phdr_vaddr, None);
+        assert_eq!(loaded.at_phdr(), 0);
     }
 
     #[test]
