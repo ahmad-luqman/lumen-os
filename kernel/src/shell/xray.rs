@@ -347,3 +347,31 @@ pub fn events(ctx: &mut Ctx<'_>, args: &[String]) {
     t.push('\n');
     let _ = ctx.out.write_str(&t);
 }
+
+crate::ktest!(
+    fn trace_runq_spin_keeps_one_set_and_joins_it() {
+        // `trace runq spin`'s contract, through the shell's own dispatch:
+        // one set at a time, its CPU named; stopped, its threads are
+        // joined (none of them left in `threads`); a stop with nothing
+        // spinning, and counts out of range, are refused.
+        use crate::{kassert, kassert_eq};
+        let run = |line: &str| super::pipe::run_line(line, &[]).0;
+        let usage =
+            alloc::format!("usage: trace runq [park <n> | spin <n> | spin stop] (1 to {MAX_THREADS} threads)\n");
+        for bad in ["trace runq spin 0", "trace runq spin 17", "trace runq spin x"] {
+            kassert_eq!(run(bad), usage);
+        }
+        kassert_eq!(run("trace runq spin stop").as_str(), "runq spin: nothing is spinning\n");
+        let cpu = crate::perf::last_cpu();
+        let started = run("trace runq spin 2");
+        let head = alloc::format!("runq spin: 2 threads spinning on cpu {cpu}:");
+        kassert!(started.starts_with(&head));
+        kassert_eq!(started.split_whitespace().count(), head.split_whitespace().count() + 2);
+        kassert_eq!(run("trace runq spin 1"), alloc::format!("runq spin: already spinning on cpu {cpu}\n"));
+        kassert_eq!(run("trace runq spin stop"), alloc::format!("runq spin: 2 threads stopped on cpu {cpu}\n"));
+        // Joined: their records are gone (no live `Arc` to upgrade).
+        kassert!(!sched::threads().iter().any(|t| t.name == "runq-spin"));
+        kassert_eq!(run("trace runq spin stop").as_str(), "runq spin: nothing is spinning\n");
+        Ok(())
+    }
+);

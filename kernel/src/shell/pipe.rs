@@ -185,8 +185,10 @@ pub fn needs_input(ctx: &mut Ctx<'_>, name: &str) {
     ));
 }
 
+/// `line` run on a console that captures what it writes, `keys` waiting:
+/// what it wrote, whether it ran out of keys, and the keys left.
 #[cfg(feature = "ktest")]
-fn run_line(line: &str, keys: &[Key]) -> (String, bool, usize) {
+pub(super) fn run_line(line: &str, keys: &[Key]) -> (String, bool, usize) {
     let mut console = super::Captured::default();
     console.keys.extend(keys.iter().copied());
     let history = lumen_shell::History::new(0);
