@@ -1,5 +1,6 @@
 //! The image viewer (#204): the images bundled with it (the desktop's
-//! wallpaper, two small test images, and a corrupt one), decoded inside the
+//! wallpaper, two small test images, a corrupt one, and one too costly to
+//! decode), decoded inside the
 //! app by `lumen-png`, so a bad file can only end the app, never the kernel
 //! (M6 brings files; until then these are its images).
 //!
@@ -52,11 +53,12 @@ struct Bundled {
 }
 
 /// The images, in the list's order: the first is shown at the start.
-const IMAGES: [Bundled; 4] = [
+const IMAGES: [Bundled; 5] = [
     Bundled { name: "lumen.png", png: include_bytes!("../../../assets/wallpaper/lumen.png") },
     Bundled { name: "tiles.png", png: include_bytes!("../images/tiles.png") },
     Bundled { name: "grey16.png", png: include_bytes!("../images/grey16.png") },
     Bundled { name: "broken.png", png: include_bytes!("../images/broken.png") },
+    Bundled { name: "costly.png", png: include_bytes!("../images/costly.png") },
 ];
 
 /// The label's width: the panel's, less its padding.

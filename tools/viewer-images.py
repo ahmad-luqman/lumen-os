@@ -6,6 +6,9 @@ apps/viewer/images/ next to the wallpaper the viewer also bundles
 - `grey16.png`: 40x24, 16-bit greyscale (the decoder keeps the top 8 bits);
 - `broken.png`: `tiles.png` with one byte of its image data flipped, so its
   IDAT chunk's CRC no longer matches: a file the decoder refuses;
+- `costly.png`: 1280x800, 8-bit RGBA, one colour (a few KB): a valid PNG
+  lumen-view's `admit` refuses from its header, its inflated rows past
+  `MAX_ROW_BYTES`;
 
 and, not bundled, the costliest PNGs the viewer takes to decode (lumen-view's
 `admit`), for the memory plan's test, both interlaced: `worst.png`, its
@@ -71,6 +74,11 @@ def grey16() -> Image.Image:
     return img
 
 
+def costly() -> Image.Image:
+    """1280x800 RGBA, every pixel the same."""
+    return Image.new("RGBA", (1280, 800), (0x2A, 0x9D, 0x8F, 0xFF))
+
+
 def chunk(kind: bytes, data: bytes) -> bytes:
     """One PNG chunk: length, type, data, CRC."""
     return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
@@ -129,6 +137,7 @@ def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
     tiles().save(OUT / "tiles.png", optimize=False)
     grey16().save(OUT / "grey16.png", optimize=False)
+    costly().save(OUT / "costly.png", optimize=False)
     (OUT / "broken.png").write_bytes(broken((OUT / "tiles.png").read_bytes()))
     for name, size, depth, samples in WORST:
         (TESTS / name).write_bytes(worst(size, depth, samples))
@@ -136,7 +145,7 @@ def main() -> int:
             check.load()
             assert check.size == size, check.size
         print(f"{TESTS / name}: {(TESTS / name).stat().st_size} bytes")
-    for name in ("tiles.png", "grey16.png", "broken.png"):
+    for name in ("tiles.png", "grey16.png", "broken.png", "costly.png"):
         print(f"{OUT / name}: {(OUT / name).stat().st_size} bytes")
     return 0
 

@@ -98,6 +98,8 @@ pub enum Refused {
     NoHeader,
     /// A colour type and bit depth PNG doesn't define.
     BadFormat { colour: u8, depth: u8 },
+    /// No pixels: a width or height of 0.
+    TooSmall { w: u32, h: u32 },
     /// Wider or taller than [`MAX_IMAGE_W`] x [`MAX_IMAGE_H`].
     TooBig { w: u32, h: u32 },
     /// Its inflated rows would take more than [`MAX_ROW_BYTES`].
@@ -110,6 +112,7 @@ impl core::fmt::Display for Refused {
             Refused::TooLong { bytes } => write!(f, "{bytes} bytes, more than the {MAX_FILE_BYTES} it takes"),
             Refused::NoHeader => f.write_str("not a PNG (no header)"),
             Refused::BadFormat { colour, depth } => write!(f, "colour type {colour} at {depth} bits isn't PNG's"),
+            Refused::TooSmall { w, h } => write!(f, "{w}x{h} pixels: no image"),
             Refused::TooBig { w, h } => {
                 write!(f, "{w}x{h} pixels, more than the {MAX_IMAGE_W}x{MAX_IMAGE_H} it shows")
             }
@@ -162,6 +165,9 @@ pub fn admit(png: &[u8]) -> Result<(u32, u32), Refused> {
         return Err(Refused::NoHeader);
     };
     let per_pixel = samples(colour, depth).ok_or(Refused::BadFormat { colour, depth })?;
+    if w == 0 || h == 0 {
+        return Err(Refused::TooSmall { w, h });
+    }
     if w > MAX_IMAGE_W || h > MAX_IMAGE_H {
         return Err(Refused::TooBig { w, h });
     }
@@ -416,8 +422,9 @@ mod tests {
         // The wallpaper: the width decides.
         assert_eq!(fit_size(1280, 800, 440, 480), (440, 275));
         assert_eq!(fitted(1280, 800, VIEW), Rect::new(200, (480 - 275) / 2, 440, 275));
-        // A tall image: the height decides.
+        // A tall image: the height decides, and it is centred across.
         assert_eq!(fit_size(100, 400, 440, 480), (120, 480));
+        assert_eq!(fitted(100, 400, VIEW), Rect::new(200 + (440 - 120) / 2, 0, 120, 480));
         // A small one is enlarged.
         assert_eq!(fit_size(96, 64, 440, 480), (440, 293));
         // Exactly the view's shape: the whole view.
@@ -499,6 +506,25 @@ mod tests {
         assert_eq!(admit(&header(1281, 1, 1, 0)), Err(Refused::TooBig { w: 1281, h: 1 }));
         assert_eq!(admit(&header(1, 801, 1, 0)), Err(Refused::TooBig { w: 1, h: 801 }));
         assert_eq!(admit(&header(u32::MAX, u32::MAX, 16, 6)), Err(Refused::TooBig { w: u32::MAX, h: u32::MAX }));
+    }
+
+    #[test]
+    fn refusals_say_why() {
+        assert_eq!(Refused::NoHeader.to_string(), "not a PNG (no header)");
+        assert_eq!(Refused::BadFormat { colour: 5, depth: 8 }.to_string(), "colour type 5 at 8 bits isn't PNG's");
+        assert_eq!(Refused::TooBig { w: 1281, h: 1 }.to_string(), "1281x1 pixels, more than the 1280x800 it shows");
+        assert_eq!(
+            Refused::TooCostly { w: 1280, h: 800, bytes: 4_096_800 }.to_string(),
+            "1280x800 pixels need 4096800 bytes inflated, more than the 3072800 it takes"
+        );
+    }
+
+    #[test]
+    fn admit_refuses_an_image_with_no_pixels() {
+        assert_eq!(admit(&header(0, 10, 8, 2)), Err(Refused::TooSmall { w: 0, h: 10 }));
+        assert_eq!(admit(&header(10, 0, 8, 2)), Err(Refused::TooSmall { w: 10, h: 0 }));
+        assert_eq!(admit(&header(0, 0, 8, 2)), Err(Refused::TooSmall { w: 0, h: 0 }));
+        assert_eq!(Refused::TooSmall { w: 0, h: 10 }.to_string(), "0x10 pixels: no image");
     }
 
     #[test]

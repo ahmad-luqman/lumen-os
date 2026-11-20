@@ -124,6 +124,7 @@ const WALLPAPER: &[u8] = include_bytes!("../../../assets/wallpaper/lumen.png");
 const TILES: &[u8] = include_bytes!("../../../apps/viewer/images/tiles.png");
 const GREY16: &[u8] = include_bytes!("../../../apps/viewer/images/grey16.png");
 const BROKEN: &[u8] = include_bytes!("../../../apps/viewer/images/broken.png");
+const COSTLY: &[u8] = include_bytes!("../../../apps/viewer/images/costly.png");
 const WORST: &[u8] = include_bytes!("worst.png");
 const WORST16: &[u8] = include_bytes!("worst16.png");
 
@@ -198,6 +199,7 @@ fn the_viewer_s_allocations_fit_its_heap() {
         assert!(prepare(png).is_ok(), "{name} isn't shown");
     }
     assert!(prepare(BROKEN).is_err(), "broken is shown");
+    assert!(prepare(COSTLY).is_err(), "costly is shown");
     let longest = longest();
     assert!(prepare(&longest).is_ok(), "the longest file isn't shown");
     let mut too_long = longest.clone();
@@ -208,8 +210,9 @@ fn the_viewer_s_allocations_fit_its_heap() {
     let canvas: Vec<u32> = vec![0; (WINDOW_W * WINDOW_H) as usize];
     let toolkit: Vec<u8> = vec![0; TOOLKIT_BYTES];
     let mut shown: Option<Prepared> = None;
-    let order: [&[u8]; 12] =
-        [WALLPAPER, TILES, GREY16, BROKEN, WORST, WALLPAPER, WORST16, TILES, &longest, WORST, WORST16, WALLPAPER];
+    let order: [&[u8]; 13] = [
+        WALLPAPER, TILES, GREY16, BROKEN, WORST, WALLPAPER, WORST16, TILES, &longest, COSTLY, WORST, WORST16, WALLPAPER,
+    ];
     for _round in 0..3 {
         for png in order {
             // The old image goes before the new one is decoded.
