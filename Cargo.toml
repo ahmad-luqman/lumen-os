@@ -17,6 +17,7 @@ repository = "https://github.com/ahmad-luqman/lumen-os"
 lumen-acpi = { path = "crates/lumen-acpi" }
 lumen-app-api = { path = "crates/lumen-app-api" }
 lumen-calc = { path = "crates/lumen-calc" }
+lumen-edit = { path = "crates/lumen-edit" }
 lumen-demo = { path = "crates/lumen-demo" }
 lumen-elf = { path = "crates/lumen-elf" }
 lumen-font = { path = "crates/lumen-font" }

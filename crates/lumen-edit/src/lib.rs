@@ -1,0 +1,412 @@
+//! The text editor's logic (#203; `apps/editor` is its window): a text
+//! buffer with a cursor, edits that can be undone and redone, and the
+//! scroll of a view of so many rows. Host-tested, `no_std` with `alloc`.
+//!
+//! - **The text** is a `String` of lines separated by `\n`. The cursor is
+//!   a byte offset on a char boundary; columns count chars. Control
+//!   characters other than `\n` never enter it ([`Command::Insert`]
+//!   refuses them; Tab inserts [`TAB_SPACES`] spaces).
+//! - **Edits** each replace one range with another text, recorded for
+//!   undo with the cursor before and after. A run of characters typed one
+//!   after another (no newline, no other command between) is one edit, as
+//!   editors undo typing a word at a time; anything else is its own. A new
+//!   edit drops what could be redone. Past [`Limits::undo_edits`] edits, or
+//!   [`Limits::undo_bytes`] bytes of them (each edit's removed and inserted
+//!   text), the oldest are forgotten, so the history's memory is bounded.
+//! - **The size** is capped at [`Limits::text_bytes`]: an edit that would
+//!   pass it is refused ([`Change::Refused`]), changing nothing.
+//! - **The view** shows `rows` lines from `top` ([`Editor::scroll_to`]):
+//!   the cursor's line is kept inside it.
+//! - **What changed** ([`Change`]) is what a window needs to redraw: the
+//!   cursor alone, one line, or every line from one on.
+
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
+
+/// How many spaces Tab inserts.
+pub const TAB_SPACES: usize = 4;
+
+/// What an editor holds at most.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// The text's bytes.
+    pub text_bytes: usize,
+    /// Edits kept to undo.
+    pub undo_edits: usize,
+    /// Bytes of the edits kept to undo (each one's removed and inserted
+    /// text): one bigger than this alone can't be undone.
+    pub undo_bytes: usize,
+}
+
+/// What the editor is asked to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    /// Type a character (refused if it is a control character: Enter is
+    /// [`Command::Newline`], Tab [`Command::Tab`]).
+    Insert(char),
+    Newline,
+    /// [`TAB_SPACES`] spaces, as one edit.
+    Tab,
+    /// The character before the cursor (joining lines at a line's start).
+    Backspace,
+    /// The character after the cursor (joining lines at a line's end).
+    Delete,
+    Left,
+    Right,
+    /// A line up or down, at the column the cursor was last moved to
+    /// across (or the line's end if shorter).
+    Up,
+    Down,
+    /// The line's start or end.
+    Home,
+    End,
+    /// A view's rows up or down ([`Editor::scroll_to`]'s rows).
+    PageUp,
+    PageDown,
+    /// The text's start or end.
+    Top,
+    Bottom,
+    Undo,
+    Redo,
+}
+
+/// What a command changed (lines numbered from 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// Nothing (a move at an edge, an undo with nothing to undo).
+    None,
+    /// Nothing: the edit would pass the size cap.
+    Refused,
+    /// Only the cursor moved, from line `from` to line `to`.
+    Cursor { from: usize, to: usize },
+    /// The text of one line changed (no line came or went), and the
+    /// cursor is on it.
+    Line(usize),
+    /// Every line from this one on may have changed (lines came or went).
+    From(usize),
+}
+
+/// One edit: `removed` at `at` replaced by `inserted`, and the cursor
+/// before and after.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Edit {
+    at: usize,
+    removed: String,
+    inserted: String,
+    before: usize,
+    after: usize,
+}
+
+/// The buffer, its cursor, its history and its view.
+#[derive(Clone, Debug)]
+pub struct Editor {
+    text: String,
+    /// Each line's first byte (the first is 0).
+    starts: Vec<usize>,
+    cursor: usize,
+    /// The column Up and Down aim for (chars), set by moving across.
+    goal: Option<usize>,
+    undo: Vec<Edit>,
+    redo: Vec<Edit>,
+    /// Whether the last edit is a run of typing the next character typed
+    /// right after it may join.
+    typing: bool,
+    limits: Limits,
+    /// The text as given (to tell whether it was modified).
+    original: String,
+    top: usize,
+    rows: usize,
+}
+
+impl Editor {
+    /// An editor holding `text` (its control characters but `\n` taken
+    /// out, and cut to `limits.text_bytes` on a char boundary), the cursor
+    /// at its start.
+    pub fn new(text: &str, limits: Limits) -> Editor {
+        let mut clean = String::new();
+        for c in text.chars().filter(|&c| c == '\n' || !c.is_control()) {
+            if clean.len() + c.len_utf8() > limits.text_bytes {
+                break;
+            }
+            clean.push(c);
+        }
+        let mut e = Editor {
+            text: clean.clone(),
+            starts: Vec::new(),
+            cursor: 0,
+            goal: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            typing: false,
+            limits,
+            original: clean,
+            top: 0,
+            rows: 1,
+        };
+        e.index();
+        e
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Whether the text differs from the one it started with.
+    pub fn modified(&self) -> bool {
+        self.text != self.original
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.starts.len()
+    }
+
+    /// Line `n` without its `\n` (empty past the last).
+    pub fn line(&self, n: usize) -> &str {
+        let Some(&start) = self.starts.get(n) else { return "" };
+        let end = self.starts.get(n + 1).map_or(self.text.len(), |&s| s - 1);
+        &self.text[start..end]
+    }
+
+    /// The line the cursor is on.
+    pub fn cursor_line(&self) -> usize {
+        self.line_of(self.cursor)
+    }
+
+    /// The cursor's line and column (chars), from 0.
+    pub fn line_col(&self) -> (usize, usize) {
+        let line = self.cursor_line();
+        (line, self.text[self.starts[line]..self.cursor].chars().count())
+    }
+
+    /// The cursor's line's text before the cursor.
+    pub fn before_cursor(&self) -> &str {
+        &self.text[self.starts[self.cursor_line()]..self.cursor]
+    }
+
+    /// How many edits can be undone and redone.
+    pub fn undo_depth(&self) -> usize {
+        self.undo.len()
+    }
+
+    pub fn redo_depth(&self) -> usize {
+        self.redo.len()
+    }
+
+    /// The view's first line.
+    pub fn top(&self) -> usize {
+        self.top
+    }
+
+    /// Show `rows` lines (at least 1), scrolled so the cursor's line is
+    /// among them: whether the view's first line moved.
+    pub fn scroll_to(&mut self, rows: usize) -> bool {
+        self.rows = rows.max(1);
+        let line = self.cursor_line();
+        let top = if line < self.top {
+            // Up to it, as far as still fills the view (lines removed).
+            line.min(self.line_count().saturating_sub(self.rows))
+        } else if line >= self.top + self.rows {
+            line + 1 - self.rows
+        } else {
+            // Past the end (lines removed): as far down as still fills it.
+            self.top.min(self.line_count().saturating_sub(self.rows)).min(line)
+        };
+        let moved = top != self.top;
+        self.top = top;
+        moved
+    }
+
+    /// Do `cmd`: what changed.
+    pub fn apply(&mut self, cmd: Command) -> Change {
+        let joins_typing = matches!(cmd, Command::Insert(_));
+        let change = match cmd {
+            Command::Insert(c) if c.is_control() => Change::None,
+            Command::Insert(c) => {
+                let mut buf = [0u8; 4];
+                self.edit(self.cursor, self.cursor, c.encode_utf8(&mut buf), true)
+            }
+            Command::Newline => self.edit(self.cursor, self.cursor, "\n", false),
+            Command::Tab => {
+                let spaces = [b' '; TAB_SPACES];
+                self.edit(self.cursor, self.cursor, core::str::from_utf8(&spaces).unwrap_or(" "), false)
+            }
+            Command::Backspace => match self.text[..self.cursor].chars().next_back() {
+                Some(c) => self.edit(self.cursor - c.len_utf8(), self.cursor, "", false),
+                None => Change::None,
+            },
+            Command::Delete => match self.text[self.cursor..].chars().next() {
+                Some(c) => self.edit(self.cursor, self.cursor + c.len_utf8(), "", false),
+                None => Change::None,
+            },
+            Command::Left => {
+                let to =
+                    self.text[..self.cursor].chars().next_back().map_or(self.cursor, |c| self.cursor - c.len_utf8());
+                self.move_to(to, true)
+            }
+            Command::Right => {
+                let to = self.text[self.cursor..].chars().next().map_or(self.cursor, |c| self.cursor + c.len_utf8());
+                self.move_to(to, true)
+            }
+            Command::Up => self.vertical(-1),
+            Command::Down => self.vertical(1),
+            Command::PageUp => self.vertical(-(self.rows as isize)),
+            Command::PageDown => self.vertical(self.rows as isize),
+            Command::Home => self.move_to(self.starts[self.cursor_line()], true),
+            Command::End => {
+                let line = self.cursor_line();
+                self.move_to(self.starts[line] + self.line(line).len(), true)
+            }
+            Command::Top => self.move_to(0, true),
+            Command::Bottom => self.move_to(self.text.len(), true),
+            Command::Undo => self.undo(),
+            Command::Redo => self.redo(),
+        };
+        // Only typing right after typing joins it: any other command, a
+        // refused or empty one included, ends the run.
+        if !(joins_typing && matches!(change, Change::Line(_))) {
+            self.typing = false;
+        }
+        change
+    }
+
+    /// Replace the whole text with `text` (its control characters but
+    /// `\n` taken out) as one edit, the cursor at its end; refused past
+    /// the size cap, nothing if it is the same.
+    pub fn replace_all(&mut self, text: &str) -> Change {
+        let clean: String = text.chars().filter(|&c| c == '\n' || !c.is_control()).collect();
+        self.typing = false;
+        if clean == self.text {
+            return Change::None;
+        }
+        let change = self.edit(0, self.text.len(), &clean, false);
+        if matches!(change, Change::Refused) {
+            return change;
+        }
+        Change::From(0)
+    }
+
+    /// The line holding byte `at`.
+    fn line_of(&self, at: usize) -> usize {
+        match self.starts.binary_search(&at) {
+            Ok(n) => n,
+            Err(n) => n - 1,
+        }
+    }
+
+    /// Recompute where each line starts.
+    fn index(&mut self) {
+        self.starts.clear();
+        self.starts.push(0);
+        self.starts.extend(self.text.match_indices('\n').map(|(i, _)| i + 1));
+    }
+
+    fn move_to(&mut self, to: usize, across: bool) -> Change {
+        if across {
+            self.goal = None;
+        }
+        if to == self.cursor {
+            return Change::None;
+        }
+        let from = self.cursor_line();
+        self.cursor = to;
+        Change::Cursor { from, to: self.cursor_line() }
+    }
+
+    /// `by` lines down (up if negative), at the goal column.
+    fn vertical(&mut self, by: isize) -> Change {
+        let (line, col) = self.line_col();
+        let goal = *self.goal.get_or_insert(col);
+        let last = self.line_count() - 1;
+        let target = line.saturating_add_signed(by).min(last);
+        let to = if by < 0 && line == 0 {
+            0
+        } else if by > 0 && line == last {
+            self.text.len()
+        } else {
+            let text = self.line(target);
+            self.starts[target] + text.char_indices().nth(goal).map_or(text.len(), |(i, _)| i)
+        };
+        self.move_to(to, false)
+    }
+
+    /// Replace `start..end` with `with` as an edit (`typed`: one character
+    /// typed, which may join the run before it).
+    fn edit(&mut self, start: usize, end: usize, with: &str, typed: bool) -> Change {
+        if self.text.len() - (end - start) + with.len() > self.limits.text_bytes {
+            return Change::Refused;
+        }
+        let before = self.cursor;
+        let first = self.line_of(start);
+        let removed = String::from(&self.text[start..end]);
+        let lines_change = removed.contains('\n') || with.contains('\n');
+        self.text.replace_range(start..end, with);
+        self.cursor = start + with.len();
+        self.goal = None;
+        self.redo.clear();
+        let joined = typed
+            && self.typing
+            && self.undo.last().is_some_and(|last| last.removed.is_empty() && last.at + last.inserted.len() == start);
+        match self.undo.last_mut() {
+            Some(last) if joined => {
+                last.inserted.push_str(with);
+                last.after = self.cursor;
+            }
+            _ => self.undo.push(Edit { at: start, removed, inserted: String::from(with), before, after: self.cursor }),
+        }
+        self.forget_past_limits();
+        self.typing = typed;
+        self.index();
+        if lines_change { Change::From(first) } else { Change::Line(first) }
+    }
+
+    /// The oldest edits forgotten while the history is past its limits.
+    fn forget_past_limits(&mut self) {
+        let size = |e: &Edit| e.removed.len() + e.inserted.len();
+        let mut bytes: usize = self.undo.iter().map(size).sum();
+        let mut gone = 0;
+        while self.undo.len() - gone > self.limits.undo_edits || bytes > self.limits.undo_bytes {
+            bytes -= size(&self.undo[gone]);
+            gone += 1;
+        }
+        self.undo.drain(..gone);
+    }
+
+    fn undo(&mut self) -> Change {
+        let Some(e) = self.undo.pop() else { return Change::None };
+        let change = self.swap(e.at, e.inserted.len(), &e.removed, e.before);
+        self.redo.push(e);
+        change
+    }
+
+    fn redo(&mut self) -> Change {
+        let Some(e) = self.redo.pop() else { return Change::None };
+        let change = self.swap(e.at, e.removed.len(), &e.inserted, e.after);
+        self.undo.push(e);
+        change
+    }
+
+    /// Undo's and redo's replacement: `len` bytes at `at` by `with`, the
+    /// cursor then at `cursor`.
+    fn swap(&mut self, at: usize, len: usize, with: &str, cursor: usize) -> Change {
+        let first = self.line_of(at).min(self.line_of(cursor));
+        let lines_change = self.text[at..at + len].contains('\n') || with.contains('\n');
+        let from = self.cursor_line();
+        self.text.replace_range(at..at + len, with);
+        self.cursor = cursor;
+        self.goal = None;
+        self.index();
+        let to = self.cursor_line();
+        if lines_change || from != to || from != first { Change::From(first.min(from)) } else { Change::Line(first) }
+    }
+}
+
+#[cfg(test)]
+mod tests;
