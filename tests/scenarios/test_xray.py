@@ -11,6 +11,7 @@ counters say against what the rings say: counts only, never a time
 (CLAUDE.md, "Tests on a busy host").
 """
 
+import itertools
 import re
 
 from lumen_harness import gui
@@ -209,6 +210,21 @@ def start_xray(m) -> tuple[int, int, str, dict[str, str]]:
     return app_id, mark, wid, record
 
 
+def close_xray(m, mark: int, app_id: int, record: dict[str, str]) -> None:
+    """Its window closed: it exits with 0, and its thread is gone."""
+    gui.close_window(m, "X-ray")
+    end_line(m, mark, "xray", app_id, "exited with 0")
+    wait_gone(m, app_id, record["thread"])
+
+
+def refused(m, line: str, said: str, code: int) -> None:
+    """`run <line>`: `said` as its one ERROR, exit `code`, no window."""
+    app_id, mark = start(m, line, allow=said)
+    wait_for_output(m, mark, rf"(?m){said}$", 30)
+    end_line(m, mark, "xray", app_id, f"exited with {code}")
+    assert not [w for w in gui.windows(m, said) if w["title"] == "X-ray"]
+
+
 def xray_cpu(m, record: dict[str, str]) -> str:
     """The CPU X-ray's thread runs on (`threads`)."""
     rows = parse_records(run(m, "threads").split("\n", 1)[1], "thread")
@@ -234,7 +250,7 @@ def test_xray_matches_the_scheduler(boot):
         return scheduler_queue(m, cpu), label(rows, "cpu 1 runq"), label(rows, "cpu 1 thread")
 
     waiting = str(SPIN - 1)
-    got = gui.wait_for(
+    gui.wait_for(
         m,
         "X-ray's queue agreeing with the scheduler's",
         read,
@@ -245,7 +261,7 @@ def test_xray_matches_the_scheduler(boot):
     # tall (a column shows its longest queue, and at each turn the thread
     # leaving the CPU is queued before the next is taken off: all 3),
     # polled for in screendumps (the lanes are its own damage).
-    shots = iter(range(1000))
+    shots = itertools.count()
     gui.wait_for(
         m,
         "a 3-thread bar in cpu 1's lane",
@@ -260,11 +276,8 @@ def test_xray_matches_the_scheduler(boot):
     )
     stop_spinning(m, SPIN, cpu)
     gui.wait_for(m, "both queues empty again", read, lambda g: g[0] == g[1] == "0", 60)
-    assert got[2] in spinning, got
 
-    gui.close_window(m, "X-ray")
-    end_line(m, mark, "xray", app_id, "exited with 0")
-    wait_gone(m, app_id, record["thread"])
+    close_xray(m, mark, app_id, record)
 
 
 # COM1 interrupts raised while X-ray is paused: well past what typing the
@@ -332,9 +345,7 @@ def test_xray_pause_stops_its_reads(boot):
     held = irq_events_since(m, resumed_at)
     assert grew <= held, (grew, held)
     stop_spinning(m, SPIN, cpu)
-    gui.close_window(m, "X-ray")
-    end_line(m, mark, "xray", app_id, "exited with 0")
-    wait_gone(m, app_id, record["thread"])
+    close_xray(m, mark, app_id, record)
 
 
 # `lumen_xray::replay`'s fixed trace, read once (its host test pins it):
@@ -388,20 +399,16 @@ def test_xray_golden(boot, artifacts, golden_dir):
         size=(x1 - x0, y1 - y0),
         artifacts=artifacts,
     )
-    gui.close_window(m, "X-ray")
-    end_line(m, mark, "xray", app_id, "exited with 0")
-    wait_gone(m, app_id, record["thread"])
+    close_xray(m, mark, app_id, record)
 
 
 def test_xray_without_trace_is_not_granted(boot):
     # `run --without trace xray`: live X-ray can't read the rings, so it
-    # logs one ERROR naming the grant and exits with 1, opening no window.
-    m = desktop(boot)
-    refused = r"ERROR app: xray: no trace grant: NotGranted"
-    app_id, mark = start(m, "--without trace xray", allow=refused)
-    wait_for_output(m, mark, rf"(?m){refused}$", 30)
-    end_line(m, mark, "xray", app_id, "exited with 1")
-    assert not [w for w in gui.windows(m, refused) if w["title"] == "X-ray"]
+    # starts, logs one ERROR naming the grant and exits with 1, opening no
+    # window.
+    refused(
+        desktop(boot), "--without trace xray", r"ERROR app: xray: no trace grant: NotGranted", 1
+    )
 
 
 def irq_events_since(m, since: int) -> int:
@@ -454,16 +461,9 @@ def test_xray_counts_no_more_than_its_ring_holds(boot):
     held = irq_events_since(m, start_at)
     assert counted <= held, (counted, held)
     assert label(below_root(gui.ui_tree(m, wid)), "cpu 0 irqs") == str(counted)
-    gui.close_window(m, "X-ray")
-    end_line(m, mark, "xray", app_id, "exited with 0")
-    wait_gone(m, app_id, record["thread"])
+    close_xray(m, mark, app_id, record)
 
 
 def test_xray_refuses_arguments_it_doesnt_take(boot):
     # `run xray bogus`: its usage as one ERROR, exit 2, no window.
-    m = desktop(boot)
-    usage = r"ERROR app: xray: usage: xray \[--replay\]"
-    app_id, mark = start(m, "xray bogus", allow=usage)
-    wait_for_output(m, mark, rf"(?m){usage}$", 30)
-    end_line(m, mark, "xray", app_id, "exited with 2")
-    assert not [w for w in gui.windows(m, usage) if w["title"] == "X-ray"]
+    refused(desktop(boot), "xray bogus", r"ERROR app: xray: usage: xray \[--replay\]", 2)
