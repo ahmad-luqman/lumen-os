@@ -59,7 +59,10 @@ struct Held {
 }
 
 /// `window_publish`'s steps on `bytes` (as the app sent them), the old
-/// tree in `held` swapped out last.
+/// tree in `held` swapped out last. The order is the kernel's
+/// (`app/window.rs`): the copied bytes dropped once decoded, the decoded
+/// tree dropped once its rows are built; dropping either later raises the
+/// peak (to about 990 KB).
 fn publish(held: &mut Held, sent: &[u8]) {
     let bytes = sent.to_vec(); // copy_in_capped
     let (tree, _) = Tree::decode_counted(&bytes);
@@ -102,7 +105,21 @@ fn worst() -> Vec<(&'static str, Vec<u8>)> {
         selected: None,
         items: CappedVec::new(items).unwrap(),
     }];
-    vec![("many labels", encode(many)), ("long texts", encode(long)), ("a long list", encode(list))]
+    // A chain as deep as allowed, each group named with ESCs.
+    let name = (TREE_BYTES - 16) / TREE_NODES - 11;
+    let chain = (1..=TREE_NODES as u64)
+        .map(|id| Node::Group { common: common(id, odd(name)), children: u32::from(id < TREE_NODES as u64) })
+        .collect();
+    // Labels with short names and long texts.
+    let lopsided =
+        (1..=TREE_NODES as u64).map(|id| Node::Label { common: common(id, odd(11)), text: odd(42) }).collect();
+    vec![
+        ("many labels", encode(many)),
+        ("long texts", encode(long)),
+        ("a long list", encode(list)),
+        ("a deep chain", encode(chain)),
+        ("labels of 11 + 42", encode(lopsided)),
+    ]
 }
 
 #[test]

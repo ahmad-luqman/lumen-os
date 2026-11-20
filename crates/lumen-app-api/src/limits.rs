@@ -44,9 +44,9 @@ pub const TABLE_BYTES: u64 = TABLE_ELEMENTS as u64 * 16;
 /// Its published tree (#207): what the kernel holds for it (the desktop's
 /// rows, the id map) and the peak while a new one replaces it (the old
 /// still held, the new decoded and its rows built). Measured on the worst
-/// trees by `tests/publish_peak.rs` (929,280 bytes at the peak, each block
-/// counted as the kernel's heap sizes it), with room to spare for the
-/// heap's fragmentation.
+/// trees by `tests/publish_peak.rs` (each block counted as the kernel's heap
+/// sizes it): 978,336 bytes at the peak, for a 1,024-deep chain of groups
+/// named with ESCs; 1 MiB leaves 7% for the heap's fragmentation.
 pub const TREE_COPIES_BYTES: u64 = MIB;
 /// Its drawing thread's glyph cache (#206; the kernel's `font::Text`).
 pub const GLYPH_CACHE_BYTES: u64 = 128 * KIB;

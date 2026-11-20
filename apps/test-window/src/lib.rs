@@ -45,6 +45,10 @@
 //!   closes (Quit, or `Close`).
 //! - `ui-trap`: the same, but a press on Add traps (`unreachable`) while
 //!   its request runs: the request is answered `OwnerEnded`.
+//! - `ui-big`: a button `Grow` whose press adds `TREE_NODES + 1` labels:
+//!   the SDK refuses that tree itself (one WARN `ui: a tree not published:
+//!   the tree: ...`), the kernel keeps the last one, and the press (and any
+//!   later request) is answered `couldn't publish: ...`.
 //! - `deep`: publishes the deepest tree there is, `TREE_NODES` groups each
 //!   holding the next (`window: deep: published <n> nodes (<b> bytes)`),
 //!   then goes on as with no argument (events read until `Close`).
@@ -146,6 +150,7 @@ fn run() -> i32 {
             return toolkit(counter, w);
         }
         "ui-trap" => return toolkit(Trapping(Counter::new()), w),
+        "ui-big" => return toolkit(Grower::new(), w),
         "deep" | "deaf" => {
             if let Err(code) = publish(mode, &w) {
                 return code;
@@ -261,6 +266,37 @@ fn sdk() -> i32 {
     }
     log::info(&format!("window: sdk: {run} checks, {failed} failed"));
     lumen_app::exit(7)
+}
+
+/// A button `Grow` whose press adds more labels than `TREE_NODES`: the
+/// SDK can't publish that tree (it refuses it itself), so the kernel keeps
+/// the last one and the press is answered failed.
+struct Grower {
+    ui: Ui,
+    grow: lumen_ui::Widget,
+}
+
+impl Grower {
+    fn new() -> Grower {
+        let mut ui = Ui::new();
+        let grow = ui.button(None, "Grow");
+        Grower { ui, grow }
+    }
+}
+
+impl App for Grower {
+    fn ui_mut(&mut self) -> &mut Ui {
+        &mut self.ui
+    }
+
+    fn apply(&mut self, events: &[UiEvent]) -> Then {
+        if events.contains(&UiEvent::Pressed(self.grow)) {
+            for _ in 0..=TREE_NODES {
+                self.ui.label(None, "n", "");
+            }
+        }
+        Then::Carry
+    }
 }
 
 /// Counter, but a press on Add traps while its request runs.

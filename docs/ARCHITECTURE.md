@@ -2988,7 +2988,7 @@ size or bounded:
 | compiled code | `CODE_FACTOR` × `MODULE_BYTES` |
 | store, instance, call stack (`CALL_DEPTH` frames), handle table | `STORE_BYTES` |
 | table | `TABLE_BYTES` (`TABLE_ELEMENTS` × 16) |
-| its published tree (#207): the desktop's rows and the id map held, and a republish's peak | `TREE_COPIES_BYTES` (1 MiB: 929,280 bytes measured at the worst trees' peak by `lumen-app-api`'s `tests/publish_peak.rs`, each block as the kernel's heap sizes it) |
+| its published tree (#207): the desktop's rows and the id map held, and a republish's peak | `TREE_COPIES_BYTES` (1 MiB: the worst trees' peak, measured by `lumen-app-api`'s `tests/publish_peak.rs`, with the headroom `limits.rs` states) |
 | glyph cache (#206) | `GLYPH_CACHE_BYTES` |
 | its window: two surfaces plus `text_draw`'s scratch | `WINDOWS` × `SURFACES` × `WINDOW_PIXELS` × `BYTES_PER_PIXEL` |
 

@@ -454,7 +454,9 @@ fn window_publish(c: &mut C<'_>, h: i32, ptr: i32, len: i32) -> Result<i32, Erro
     let bytes = copy_in_capped(c, r, TREE_BYTES).map_err(|_| refused(c, "a tree", n, "past TREE_BYTES"))?;
     let (decoded, nodes) = Tree::decode_counted(&bytes);
     // The bytes go once decoded (what a window holds is
-    // `TREE_COPIES_BYTES`'s: the rows and the id map).
+    // `TREE_COPIES_BYTES`'s: the rows and the id map). This order, and the
+    // tree's drop below, is what lumen-app-api's `tests/publish_peak.rs`
+    // models: dropping either later raises the peak past its measure.
     drop(bytes);
     // Paid for what was copied and worked through, refused or not.
     runtime::charge(&mut *c, BYTE_FUEL * n as u64 + NODE_FUEL * nodes as u64);
@@ -464,6 +466,7 @@ fn window_publish(c: &mut C<'_>, h: i32, ptr: i32, len: i32) -> Result<i32, Erro
     // paid by the node as well.
     let freed = win.ids.len() as u64;
     let (top, rows) = win.ids.remap(&tree, NodeId::fresh);
+    // Gone before the swap (`publish_peak` models this order).
     drop(tree);
     win.handle.publish(top, rows);
     runtime::charge(&mut *c, NODE_FUEL * freed);
