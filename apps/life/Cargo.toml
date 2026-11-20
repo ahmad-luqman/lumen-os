@@ -1,0 +1,23 @@
+[package]
+name = "life"
+description = "Conway's Game of Life (#202): a grid stepping on the SDK's tick loop, with a pattern picker, Start, Stop and Step in its automation tree; the launcher's Life item starts it. Its rules and patterns are lumen-demo's (host-tested), the text-mode `life` command's too."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+# A WASM module has no host-side tests: its logic is lumen-demo's, and the
+# kernel runs it (tests/scenarios/test_apps.py).
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+lumen-app.workspace = true
+lumen-demo.workspace = true
+lumen-ui.workspace = true
+
+[lints]
+workspace = true

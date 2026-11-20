@@ -22,6 +22,7 @@ repository = "https://github.com/ahmad-luqman/lumen-os"
 [workspace.dependencies]
 lumen-app-api = { path = "../crates/lumen-app-api" }
 lumen-calc = { path = "../crates/lumen-calc" }
+lumen-demo = { path = "../crates/lumen-demo" }
 lumen-gfx = { path = "../crates/lumen-gfx" }
 lumen-heap = { path = "../crates/lumen-heap" }
 lumen-ui = { path = "../crates/lumen-ui" }
