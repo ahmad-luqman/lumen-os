@@ -528,6 +528,12 @@ own PR that updates that doc first.
   `lumen_ui::App` (its drawing and its hands' boxes as damage, checked
   against full repaints); `args` (`run clock`'s arguments); `rtc` (what it
   shows while RTC reads fail, as the taskbar's clock) (host-tested).
+- `crates/lumen-snake`: Comet's logic (#201, an original snake-style
+  game): the sky's cells, steering, growth, the edge, tail and asteroids
+  ending a flight, levels (`rocks`, sparing the cells ahead), stardust on
+  empty cells, `Rng` (seeded SplitMix64: one seed, one game), `Game::step`
+  reporting exactly the cells it changed (the app's damage), the labels'
+  texts and `LABEL_W` (each measured in the UI font) (host-tested).
 - `crates/lumen-view`: the image viewer app's logic (#204): an image at 1:1
   (`actual`, `Pan`) or fitted (`fitted`, `scale`: nearest neighbour), what
   it decodes (`admit`: the file's length, then the size and inflated bytes
@@ -550,7 +556,8 @@ own PR that updates that doc first.
   `testkit`); `template`, the app `make app NAME=` copies
   (`tools/new-app.sh`); `calculator` (#207, the first app on the SDK's
   `ui::Toolkit`, lumen-ui inside the app); `clock` (#200, an analog face
-  on `run_until`, `--at` freezing it); `life` (#202, Conway's Game of Life on
+  on `run_until`, `--at` freezing it); `comet` (#201, the snake-style
+  game on `run_until`, `--seed N --step` for tests); `life` (#202, Conway's Game of Life on
   `run_until`, lumen-demo's rules; the launcher's Life); `viewer` (#204, bundled images
   decoded inside the app by `lumen-png`, `apps/viewer/images/` made by
   `tools/viewer-images.py`); the SDK's loops (`run_with`'s

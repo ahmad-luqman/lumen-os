@@ -3,7 +3,8 @@
 template, the window calls' checks, the close grace, a kill waking a
 `window_wait`), and apps' automation trees (#207: lumen-ui inside apps,
 global ids, `ui invoke` reaching an app one request at a time, the
-calculator).
+calculator), and the bundled apps on the SDK's tick loop (#222: Comet,
+#201).
 
 The test apps are embedded in the kernel as `TEST_APPS` (ARCHITECTURE
 section 8, "What #199 adds"). Judged by confirmed effects and counts only
@@ -113,7 +114,7 @@ def test_hello_wasm(boot):
     out = run(m, "run")
     assert (
         out
-        == "usage: run [--without <grant>] <app> [args...]\napps: calculator clock life template viewer\n"
+        == "usage: run [--without <grant>] <app> [args...]\napps: calculator clock comet life template viewer\n"
     ), out
     assert "run: no app nope" in run(m, "run nope")
     # `exit(n)` is an ending like returning n.
@@ -750,6 +751,309 @@ def test_clock_tree_matches_rtc(boot):
         wait_for_output(m, mark, rf"(?m){STAMP} {said}$", 30)
         end_line(m, mark, "clock", app_id, "exited with 2")
         prev = said
+
+
+# -- Comet (#201) ------------------------------------------------------------
+
+# lumen-snake's `the_scenario_s_seed_puts_its_first_grain_ahead` pins these
+# on Comet's sky: with this seed the first grain lies on the start row this
+# many cells ahead of the head, and flying straight on the comet reaches the
+# sky's edge after COMET_STEPS_TO_EDGE steps (a score of 1); the next step
+# ends the flight.
+COMET_SEED = 65
+COMET_DUST_AHEAD = 6
+COMET_STEPS_TO_EDGE = 20
+COMET_START = (3, 9)
+COMET_BUTTONS = ["Play", "Step", "Restart"]
+
+
+def comet_tree(m) -> tuple[str, list[dict[str, str]]]:
+    return wait_tree(m, "Comet", "Score")
+
+
+def comet_labels(m, wid: str) -> dict[str, str]:
+    """Comet's labels by name: `Score`, `Level`, `State`, `Comet`."""
+    return {r["name"]: r["value"] for r in below_root(gui.ui_tree(m, wid)) if r["role"] == "label"}
+
+
+def comet_at(x: int, y: int, heading: str = "right") -> str:
+    """The `Comet` label: the head's cell and its heading."""
+    return f"at {x},{y} {heading}"
+
+
+def turn_comet(m, wid: str, key: str, x: int, y: int) -> None:
+    """Arrow `key` typed through confirmed steps, then its turn seen in the
+    tree (the label's heading) before anything else: a Step request goes
+    straight onto the window's queue and could overtake the key."""
+    gui.confirmed_keys(m, [key])
+    gui.wait_ui(
+        m,
+        f"the comet heading {key}",
+        lambda r: gui.node(r, "label", "Comet")["value"] == comet_at(x, y, key),
+        wid,
+        30,
+    )
+
+
+def step_comet(m, rows, times: int) -> None:
+    """`times` presses of Step (stepping: no ticks, so each press is
+    answered and its step is in the tree before the next)."""
+    gui.press_buttons(m, rows, *["Step"] * times)
+
+
+def test_snake_tree_and_steps(boot):
+    # Comet stepping (`--step`): its labels and buttons in the tree; each
+    # Step press one step, the head's cell and the score following (the
+    # seed's first grain eaten after COMET_DUST_AHEAD steps); an arrow typed
+    # through confirmed steps turns it; Restart plays the seed's sky again;
+    # straight on it flies into the edge (`over: edge`), after which Play and
+    # Step are disabled; Restart steps again (as launched); flying (Play),
+    # it steps by itself until the same edge ends it, and the desktop
+    # settles once it has, Restart then stepping again too; its close ends
+    # it with 0. Arguments it doesn't
+    # take: an ERROR naming them, exit 2.
+    m = boot_desktop(boot)
+    app_id, mark = start(m, f"comet --seed {COMET_SEED} --step")
+    wid, rows = comet_tree(m)
+    assert gui.window(m, "Comet")["focused"] == "yes"
+    assert [r["name"] for r in rows if r["role"] == "button"] == COMET_BUTTONS
+    x, y = COMET_START
+    assert comet_labels(m, wid) == {
+        "Score": "Score 0",
+        "Level": "Level 1: Open sky",
+        "State": "stepping",
+        "Comet": comet_at(x, y),
+    }
+    step_comet(m, rows, COMET_DUST_AHEAD - 1)
+    labels = comet_labels(m, wid)
+    assert (labels["Score"], labels["Comet"]) == (
+        "Score 0",
+        comet_at(x + COMET_DUST_AHEAD - 1, y),
+    ), labels
+    step_comet(m, rows, 1)
+    labels = comet_labels(m, wid)
+    assert (labels["Score"], labels["Comet"]) == ("Score 1", comet_at(x + COMET_DUST_AHEAD, y)), (
+        labels
+    )
+
+    # An arrow turns it: up (its heading seen first), then a step goes a row up.
+    turn_comet(m, wid, "up", x + COMET_DUST_AHEAD, y)
+    step_comet(m, rows, 1)
+    assert comet_labels(m, wid)["Comet"] == comet_at(x + COMET_DUST_AHEAD, y - 1, "up")
+
+    # Restart: the seed's sky again, still stepping; straight on to the
+    # edge, then one more step ends the flight.
+    gui.press_buttons(m, rows, "Restart")
+    assert comet_labels(m, wid) == {
+        "Score": "Score 0",
+        "Level": "Level 1: Open sky",
+        "State": "stepping",
+        "Comet": comet_at(x, y),
+    }
+    step_comet(m, rows, COMET_STEPS_TO_EDGE)
+    labels = comet_labels(m, wid)
+    assert labels["Comet"] == comet_at(x + COMET_STEPS_TO_EDGE, y), labels
+    assert (labels["Score"], labels["State"]) == ("Score 1", "stepping"), labels
+    step_comet(m, rows, 1)
+    over = comet_labels(m, wid)
+    assert over["State"] == "over: edge", over
+    # Over: Play and Step are disabled (they would change nothing), `ui
+    # invoke` saying so, and nothing changes; with no ticks it settles.
+    rows = below_root(gui.ui_tree(m, wid))
+    for name in ("Play", "Step"):
+        button = gui.node(rows, "button", name)
+        assert "disabled" in button["state"], button
+        got = gui.invoke(m, button["id"], "press")
+        assert got.message == "ui invoke: the node is disabled", (name, got)
+    gui.wait_settled(m)
+    assert comet_labels(m, wid) == over
+
+    # Restart starts the next game as it was launched: stepping (the mode
+    # doesn't carry over), on the seed's sky. Then Play: it flies by itself
+    # (`stepping` gone from the State label, which stays gone: "flying" lasts
+    # only a few guest seconds), until the same edge ends it.
+    gui.press_buttons(m, rows, "Restart")
+    rows = below_root(gui.ui_tree(m, wid))
+    assert gui.node(rows, "label", "State")["value"] == "stepping", rows
+    rows = gui.press_animated(
+        m,
+        rows,
+        "Play",
+        "Play's effect",
+        lambda r: gui.node(r, "label", "State")["value"] != "stepping",
+        wid,
+    )
+    gui.wait_ui(
+        m,
+        "the flight's end",
+        lambda r: gui.node(r, "label", "State")["value"] == "over: edge",
+        wid,
+        60,
+    )
+    labels = comet_labels(m, wid)
+    assert (labels["Score"], labels["Comet"]) == (
+        "Score 1",
+        comet_at(x + COMET_STEPS_TO_EDGE, y),
+    ), labels
+    gui.wait_settled(m)
+    # That game ended flying; Restart still starts the next one stepping,
+    # as launched.
+    gui.press_buttons(m, rows, "Restart")
+    assert comet_labels(m, wid)["State"] == "stepping"
+    gui.close_window(m, "Comet")
+    end_line(m, mark, "comet", app_id, "exited with 0")
+
+    # Arguments it doesn't take: one ERROR naming why (exactly one), then
+    # exit 2. Each `run` allows any of these errors: an app's ERROR can come
+    # after its `run` returned, and is then the next command's to allow.
+    usage_error = r"ERROR app: comet: .*; usage: comet \[--seed N\] \[--step\]"
+    for line, why in [
+        ("comet --fast", "'--fast' isn't an argument it takes"),
+        ("comet --seed x", "'x' is not a seed (0 to 2^64 - 1)"),
+        ("comet --step --step", "--step given twice"),
+        ("comet --seed 1 --seed 2", "--seed given twice"),
+        ("comet --seed --step", "--seed needs a number"),
+    ]:
+        error = f"ERROR app: comet: {why}; usage: comet [--seed N] [--step]"
+        bad, mark = start(m, line, allow=usage_error)
+        wait_for_output(m, mark, re.escape(error), 30)
+        end_line(m, mark, "comet", bad, "exited with 2")
+        # One ERROR: the app logs it before it returns, so by its end line
+        # every line it logged is in.
+        logged = re.findall(usage_error, m.output[mark:])
+        assert logged == [error], (line, logged)
+
+
+# Comet's sky with its frame, in its client area (apps/comet's FRAMED: the
+# widget column is lumen-snake's LABEL_W, 164, plus 8 px either side).
+COMET_FRAMED = (187, 7, 187 + 386, 7 + 290)
+
+
+def comet_sky(m, name: str) -> bytes:
+    """Comet's sky and frame in a settled screendump, as bytes."""
+    gui.wait_settled(m)
+    return gui.client_pixels(m, "Comet", name).crop(COMET_FRAMED).tobytes()
+
+
+def test_snake_steering_and_modes(boot):
+    # Comet stepping from the scenario's seed: down then right turn it (each
+    # heading seen in the tree before the step); Restart redraws the sky as
+    # it was at the start (the same pixels); the seed's grain eaten, up,
+    # left and down run it into its own tail (`over: tail`); Restart, Play,
+    # then Step while flying switches it to stepping (if the flight ended
+    # first, Step is disabled: Restart and try again), after which one Step
+    # moves it one cell.
+    m = boot_desktop(boot)
+    app_id, mark = start(m, f"comet --seed {COMET_SEED} --step")
+    wid, rows = comet_tree(m)
+    x, y = COMET_START
+    sky = comet_sky(m, "comet-start.png")
+    turn_comet(m, wid, "down", x, y)
+    step_comet(m, rows, 1)
+    turn_comet(m, wid, "right", x, y + 1)
+    step_comet(m, rows, 1)
+    assert comet_labels(m, wid)["Comet"] == comet_at(x + 1, y + 1, "right")
+    gui.press_buttons(m, rows, "Restart")
+    assert comet_labels(m, wid)["Comet"] == comet_at(x, y)
+    assert comet_sky(m, "comet-restarted.png") == sky, "Restart left the sky unlike its start"
+
+    step_comet(m, rows, COMET_DUST_AHEAD)
+    hx = x + COMET_DUST_AHEAD
+    turn_comet(m, wid, "up", hx, y)
+    step_comet(m, rows, 1)
+    turn_comet(m, wid, "left", hx, y - 1)
+    step_comet(m, rows, 1)
+    turn_comet(m, wid, "down", hx - 1, y - 1)
+    step_comet(m, rows, 1)
+    labels = comet_labels(m, wid)
+    assert labels["State"] == "over: tail", labels
+
+    def state(r):
+        return gui.node(r, "label", "State")["value"]
+
+    for attempt in range(5):
+        gui.press_buttons(m, rows, "Restart")
+        rows = below_root(gui.ui_tree(m, wid))
+        assert state(rows) == "stepping", rows
+        rows = gui.press_animated(
+            m, rows, "Play", "Play's effect", lambda r: state(r) != "stepping", wid
+        )
+        step = gui.node(rows, "button", "Step")
+        got = gui.invoke(m, step["id"], "press", animating=True)
+        if got.message == "ui invoke: the node is disabled":
+            # The flight ended before the press came (a stalled host).
+            continue
+        assert got.still_running or (got.row is not None and got.row["id"] == step["id"]), got
+        rows = gui.wait_ui(
+            m, "Step's effect", lambda r: state(r) in ("stepping", "over: edge"), wid, 30
+        )
+        if state(rows) == "stepping":
+            break
+        # Step's own step ended the flight at the edge: try again.
+    else:
+        raise AssertionError("Step while flying never left it stepping")
+    before = gui.node(rows, "label", "Comet")["value"]
+    bx = int(before.split()[1].split(",")[0])
+    step_comet(m, below_root(rows), 1)
+    after = comet_labels(m, wid)
+    if bx < x + COMET_STEPS_TO_EDGE:
+        assert after["Comet"] == comet_at(bx + 1, y), (before, after)
+    else:
+        assert after["State"] == "over: edge", (before, after)
+    gui.close_window(m, "Comet")
+    end_line(m, mark, "comet", app_id, "exited with 0")
+
+
+def test_snake_flies_by_default_and_restarts_as_launched(boot):
+    # Comet launched without `--step` flies by itself: the seed's straight
+    # flight ends at the edge with nothing pressed. Restart then starts the
+    # next game flying too, as launched (never stepping).
+    m = boot_desktop(boot)
+    app_id, mark = start(m, f"comet --seed {COMET_SEED}")
+    wid, rows = comet_tree(m)
+    x, y = COMET_START
+
+    def state(r):
+        return gui.node(r, "label", "State")["value"]
+
+    rows = gui.wait_ui(m, "the flight's end", lambda r: state(r) == "over: edge", wid, 60)
+    labels = comet_labels(m, wid)
+    assert (labels["Score"], labels["Comet"]) == (
+        "Score 1",
+        comet_at(x + COMET_STEPS_TO_EDGE, y),
+    ), labels
+    if gui.press_button(m, below_root(rows), "Restart", animating=True).still_running:
+        gui.wait_settled(m)
+    after = state(below_root(gui.ui_tree(m, wid)))
+    assert after != "stepping", after
+    gui.close_window(m, "Comet")
+    end_line(m, mark, "comet", app_id, "exited with 0")
+
+
+def test_snake_golden(boot, artifacts, golden_dir):
+    # Comet stepping from the scenario's seed: seven steps (its first grain
+    # eaten, the tail growing), up, three more: the bent comet, the next
+    # grain and the frame, in the light palette, against a golden.
+    m = boot_desktop(boot)
+    start(m, f"comet --seed {COMET_SEED} --step")
+    wid, rows = comet_tree(m)
+    step_comet(m, rows, COMET_DUST_AHEAD + 1)
+    x, y = COMET_START
+    turn_comet(m, wid, "up", x + COMET_DUST_AHEAD + 1, y)
+    step_comet(m, rows, 3)
+    labels = comet_labels(m, wid)
+    assert labels["Comet"] == comet_at(x + COMET_DUST_AHEAD + 1, y - 3, "up"), labels
+    assert (labels["Score"], labels["State"]) == ("Score 1", "stepping"), labels
+    row = gui.window(m, "Comet")
+    x0, y0, x1, y1 = gui.client_box(row)
+    shot = gui.settled_screendump(m, "comet.png")
+    assert_matches_golden(
+        shot,
+        golden_dir / "app-comet.png",
+        origin=(x0, y0),
+        size=(x1 - x0, y1 - y0),
+        artifacts=artifacts,
+    )
 
 
 def test_app_ids_are_global(boot):

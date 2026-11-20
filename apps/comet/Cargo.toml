@@ -1,0 +1,23 @@
+[package]
+name = "comet"
+description = "Comet (#201), an original snake-style game: steer a comet across a sky of cells with the arrow keys, its tail growing with each grain of stardust, past each level's asteroids. Its logic is lumen-snake's (host-tested); a seed and a step mode (`run comet --seed N --step`, a tick per Step press) make a game repeatable for tests."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+# A WASM module has no host-side tests: its logic is lumen-snake's, and the
+# kernel runs it (tests/scenarios/test_apps.py).
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+lumen-app.workspace = true
+lumen-snake.workspace = true
+lumen-ui.workspace = true
+
+[lints]
+workspace = true

@@ -27,6 +27,7 @@ lumen-demo = { path = "../crates/lumen-demo" }
 lumen-gfx = { path = "../crates/lumen-gfx" }
 lumen-heap = { path = "../crates/lumen-heap" }
 lumen-png = { path = "../crates/lumen-png" }
+lumen-snake = { path = "../crates/lumen-snake" }
 lumen-ui = { path = "../crates/lumen-ui" }
 lumen-view = { path = "../crates/lumen-view" }
 lumen-app = { path = "lumen-app" }
