@@ -3757,7 +3757,7 @@ SSE); #197 checks the results' bits.
   toolkit modes (`ui`: Counter in the SDK's toolkit; `ui-trap`; `deep`:
   the deepest tree; `deaf`: a published button whose events are never
   read).
-- **What the SDK PR adds (the tick loop, before wave 3):** no host call
+- **What #222 adds (the SDK's tick loop, before wave 3):** no host call
   changes; `window_wait`'s deadline and `animating` carry it.
   - **Who gets an event:** `Event::offer` (exhaustive) says. Input is
     `Offer::App`: offered to the app's `take` first. The focus coming or
@@ -3775,7 +3775,12 @@ SSE); #197 checks the results' bits.
     - `period()` is asked before every wait, and `None` waits for events
       only, so the desktop can settle;
     - `animating()` is the wait's flag while ticking (yes by default);
-    - `tick(now)` returns a `Flow`: `Carry` or `Quit`.
+    - `tick(now)` returns a `Flow`: `Carry` or `Quit`. A tick may come
+      before a target of the app's own (one it just moved later, or the
+      floor after a tick whose period it gave as 0: one extra, never more),
+      so it checks `now`; at a due moment an app gives the period of the
+      tick after it (a blink: a fixed 500 ms with a "solid until" time set
+      on each key).
 
     Each turn handles every event waiting first. Then, once a `Theme` has
     come (the `Toolkit` remembers, through any loop or `step`), it takes a
@@ -3785,9 +3790,11 @@ SSE); #197 checks the results' bits.
     the `Window`; a request still queued then is answered "window closed".
     A failed host call ends a loop with its error, logged first as one
     ERROR naming the stage (`ui: run_until: wait: <e>`).
-  - **Pacing** is `lumen_ui::Pacer`, through one call, `poll(period, now) ->
-    Pace { Due, Until, Idle }`, and `ticked(after)` once the tick's work is
-    done (all host-tested):
+  - **Pacing** is `lumen_ui::Pacer`, through two calls: `poll(period, now)
+    -> Pace { Due, Until, Idle }` before every wait (one clock read a turn,
+    the same `now` handed to the tick), and `ticked(after)` once a due
+    tick's work is done (a second or stray `ticked` moves nothing). All
+    host-tested:
     - a period below `MIN_PERIOD_NS` (10 ms) is taken as that;
     - due is decided on the schedule as it stands, before a changed period
       moves it;
@@ -3797,7 +3804,7 @@ SSE); #197 checks the results' bits.
       on every ask (a clock's "until the next second") still ticks at its
       boundary;
     - a tick is due once; the next is a period after it was found due, or
-      a period after its work if that ran past.
+      a period after its work if that ran past that deadline.
 
     So ticks are always at least a period apart and never burst to catch
     up. The next tick counts from when a tick was found due, not from its
@@ -3809,9 +3816,11 @@ SSE); #197 checks the results' bits.
     repainted. `App::take_drawn` reports the rectangles the app's drawing
     will now paint differently from what is shown. `lumen_ui::repaint`
     then:
-    - merges the tree's damage and the app's through a `lumen_gfx::Damage`
-      (a commit pays by the pixel, so an overlap is painted and paid once;
-      a bounding box past `REPAINT_RECTS`);
+    - merges the tree's damage and the app's through a `lumen_gfx::Damage`,
+      then makes them disjoint (each with the ones before it subtracted;
+      past `REPAINT_RECTS` pieces, their bounding box): a commit pays by
+      the pixel, and an app drawing once per rectangle (blended text)
+      would draw an overlap twice, so each pixel is painted and paid once;
     - gives every rectangle the tree's paint first (its background, and
       the widgets reaching it), inside the tree's area or not, whether the
       repaint is full or partial;
@@ -3841,7 +3850,8 @@ SSE); #197 checks the results' bits.
       waiting for the desktop to settle, which it never does while a
       window animates; it fails `INVOKE_HELD_TIMEOUT` seconds after the
       first held answer.
-  - **`test-window tick [greedy|quit]`** exercises it.
+  - **`test-window tick [greedy|quit|slow]`** exercises it (`slow`: each
+    tick's work longer than its period, the next still a period after it).
 - **The launcher** (#157's taskbar) lists the bundled apps whose
   manifest lists `desktop`, never the test apps, after its four demo
   items, by name, and starts one through `run`'s path without waiting

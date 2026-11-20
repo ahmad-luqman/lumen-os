@@ -391,8 +391,8 @@ own PR that updates that doc first.
   handler, `App` (`ui_mut`, `apply`, `paint_over` handed an `Over`: surface, text, palette, the rects
   repainted; `take_drawn`: the app's own damage), `serve` (a request run on an app, what to answer)
   and `repaint` (lay out, paint only what changed, the app's own damage too, publishing only for the
-  tree: the kernel's toolkit and an app's share it, #207; overlaps merged, every rect given the
-  tree's paint first), `Pacer` (an animated window's next tick: `poll`, `ticked`, `MIN_PERIOD_NS`),
+  tree: the kernel's toolkit and an app's share it, #207; rects merged and disjoint, every rect given
+  the tree's paint first), `Pacer` (an animated window's next tick: `poll`, `ticked`, `MIN_PERIOD_NS`),
   `Reply` (`ui invoke`'s reply slot, its state private: pending, running,
   cancelled, done, taken) and `counter` (the demo app's logic)
   (host-tested).
