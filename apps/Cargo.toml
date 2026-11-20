@@ -24,7 +24,9 @@ lumen-app-api = { path = "../crates/lumen-app-api" }
 lumen-calc = { path = "../crates/lumen-calc" }
 lumen-gfx = { path = "../crates/lumen-gfx" }
 lumen-heap = { path = "../crates/lumen-heap" }
+lumen-trace = { path = "../crates/lumen-trace" }
 lumen-ui = { path = "../crates/lumen-ui" }
+lumen-xray = { path = "../crates/lumen-xray" }
 lumen-app = { path = "lumen-app" }
 testkit = { path = "testkit" }
 

@@ -1,0 +1,24 @@
+[package]
+name = "xray"
+description = "X-ray (#208): a live view of what the kernel is doing, from the trace rings (the Trace capability): per-CPU lanes of run-queue length, interrupts and locks that waited, the run queue and the running thread as automation nodes, a Pause button, and a frozen view of a fixed trace (`--replay`). Its logic is lumen-xray's (host-tested)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+# A WASM module has no host-side tests: its logic is lumen-xray's, and the
+# kernel runs it (tests/scenarios/test_xray.py).
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+lumen-app.workspace = true
+lumen-trace.workspace = true
+lumen-ui.workspace = true
+lumen-xray.workspace = true
+
+[lints]
+workspace = true
