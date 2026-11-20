@@ -1426,6 +1426,13 @@ def test_viewer_bad_image_shows_an_error(boot):
         "costly.png: 1280x800 pixels need 4096800 bytes inflated, more than the 3072800 it takes"
     )
     rows = wait_info(m, wid, "costly.png refused", lambda v: v == refused)
+    said = rf"INFO  app: viewer: {re.escape(refused)}\n"
+    wait_for_output(m, mark, said, 10)
+    assert len(re.findall(said, m.output[mark:])) == 1
+    view = view_of(m, "viewer-costly.png")
+    for line in ((0, 0, VIEW[2], 30), (0, 34, VIEW[2], 200)):
+        colours = {c for _, c in view.crop(line).getcolors(1 << 20)}
+        assert LIGHT_TEXT in colours, (line, sorted(colours)[:8])
     assert app(m, app_id) is not None
     wallpaper = gui.node(rows, "listitem", "lumen.png")
     got = gui.invoke(m, wallpaper["id"], "select")
