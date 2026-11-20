@@ -10,8 +10,8 @@
 //! No vector ever reaches the CPU without a handler, so an unexpected
 //! exception produces a crash report and an unexpected interrupt is counted
 //! and warned about, never a triple fault. (Until
-//! [`use_ist_stacks`], right after `mm::init`, #DF, NMI and #MC run on the
-//! current stack: a #DF from a broken stack pointer then is still a triple
+//! [`use_ist_stacks`], right after `mm::init`, #DB, #DF, NMI and #MC run on
+//! the current stack: a #DF from a broken stack pointer then is still a triple
 //! fault.)
 
 use super::gdt;
@@ -50,6 +50,14 @@ pub struct TrapFrame {
 
 // Vectors where the CPU pushes an error code: #DF 8, #TS 10, #NP 11, #SS 12,
 // #GP 13, #PF 14, #AC 17, #CP 21, #VC 29, #SX 30.
+//
+// IST vectors (#DB 1, NMI 2, #DF 8, #MC 18) can fire inside the `syscall`
+// entry/exit `swapgs` window with `CS == KERNEL_CODE`, so they route through
+// `lumen_isr_ist_common`, which reads `IA32_GS_BASE` via `rdmsr` and executes
+// `swapgs` only when `GS_BASE < 0xffff_8000_0000_0000` (recording a stack flag
+// to undo `swapgs` before `iretq`). All other vectors route through
+// `lumen_isr_common`, which inspects saved `CS & 3` for conditional `swapgs`.
+// Both paths clear `RFLAGS.AC` on entry when `LUMEN_SMAP_ENABLED != 0`.
 global_asm!(
     r#"
     .section .text.lumen_isr, "ax"
@@ -63,12 +71,25 @@ lumen_isr_stubs:
             pushq $0
         .endif
         pushq $vec
-        jmp lumen_isr_common
+        .if (vec - 1) && (vec - 2) && (vec - 8) && (vec - 18)
+            jmp lumen_isr_common
+        .else
+            jmp lumen_isr_ist_common
+        .endif
         .set vec, vec + 1
     .endr
 
     .globl lumen_isr_common
 lumen_isr_common:
+    cmpb $0, LUMEN_SMAP_ENABLED(%rip)
+    jz 1f
+    clac
+1:
+    # Saved CS is at 24(%rsp): [0]=vector, [8]=error_code, [16]=rip, [24]=cs.
+    testq $3, 24(%rsp)
+    jz 2f
+    swapgs
+2:
     pushq %rax
     pushq %rbx
     pushq %rcx
@@ -87,6 +108,73 @@ lumen_isr_common:
     movq %rsp, %rdi
     cld
     call lumen_exception_dispatch
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rbp
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
+    testq $3, 24(%rsp)
+    jz 3f
+    swapgs
+3:
+    addq $16, %rsp
+    iretq
+
+    .globl lumen_isr_ist_common
+lumen_isr_ist_common:
+    # Clear RFLAGS.AC if SMAP is active (clobbers no GPRs).
+    cmpb $0, LUMEN_SMAP_ENABLED(%rip)
+    jz 1f
+    clac
+1:
+    # Save all 15 GPRs first (including rax/rcx/rdx before rdmsr) so %rsp
+    # points directly to a standard TrapFrame and is 16-byte aligned.
+    pushq %rax
+    pushq %rbx
+    pushq %rcx
+    pushq %rdx
+    pushq %rsi
+    pushq %rdi
+    pushq %rbp
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    # Read IA32_GS_BASE (0xC000_0101): execute swapgs iff GS_BASE < 0xffff_8000_0000_0000,
+    # i.e. unsigned EDX < 0xffff_8000.
+    movl $0xc0000101, %ecx
+    rdmsr
+    xorl %ebx, %ebx
+    cmpl $0xffff8000, %edx
+    jae 2f
+    swapgs
+    movl $1, %ebx
+2:
+    movq %rsp, %rdi             # arg1: &mut TrapFrame
+    pushq %rbx                  # did_swapgs flag (0 or 1)
+    pushq %rbx                  # keep 16-byte stack alignment before call
+    cld
+    call lumen_exception_dispatch
+    popq %rbx                   # discard alignment slot
+    popq %rbx                   # did_swapgs
+    testq %rbx, %rbx
+    jz 3f
+    swapgs
+3:
     popq %r15
     popq %r14
     popq %r13
@@ -130,12 +218,12 @@ impl IdtEntry {
     const MISSING: Self =
         Self { offset_low: 0, selector: 0, ist: 0, type_attr: 0, offset_mid: 0, offset_high: 0, _zero: 0 };
 
-    fn interrupt_gate(handler: u64, ist: u8) -> Self {
+    fn interrupt_gate(handler: u64, ist: u8, dpl: u8) -> Self {
         Self {
             offset_low: handler as u16,
             selector: gdt::KERNEL_CODE,
             ist,
-            type_attr: 0x8e, // present, ring 0, 64-bit interrupt gate (clears IF)
+            type_attr: 0x8e | ((dpl & 3) << 5), // present, 64-bit interrupt gate (clears IF)
             offset_mid: (handler >> 16) as u16,
             offset_high: (handler >> 32) as u32,
             _zero: 0,
@@ -152,7 +240,8 @@ struct IdtPointer {
 static mut IDT: [IdtEntry; 256] = [IdtEntry::MISSING; 256];
 
 /// The vectors that run on their own IST stack, and their slots.
-const IST_VECTORS: [(usize, u8); 3] = [(2, gdt::IST_NMI), (8, gdt::IST_DOUBLE_FAULT), (18, gdt::IST_MACHINE_CHECK)];
+const IST_VECTORS: [(usize, u8); 4] =
+    [(1, gdt::IST_DEBUG), (2, gdt::IST_NMI), (8, gdt::IST_DOUBLE_FAULT), (18, gdt::IST_MACHINE_CHECK)];
 
 /// Fill the IDT. Every vector runs on the current stack until
 /// [`use_ist_stacks`].
@@ -166,7 +255,11 @@ pub(super) unsafe fn fill() {
     // and lives forever.
     unsafe {
         for vector in 0..256u64 {
-            (*idt)[vector as usize] = IdtEntry::interrupt_gate(stubs + vector * STUB_STRIDE, 0);
+            // Vector 3 (`#BP`, `int3`) uses DPL 3 so ring-3 software breakpoints
+            // deliver `#BP` (and terminate the user process / deliver SIGTRAP)
+            // rather than faulting with `#GP(0x1a)`. Every other gate stays DPL 0.
+            let dpl = if vector == 3 { 3 } else { 0 };
+            (*idt)[vector as usize] = IdtEntry::interrupt_gate(stubs + vector * STUB_STRIDE, 0, dpl);
         }
     }
 }
@@ -178,8 +271,8 @@ pub(super) fn load() {
     unsafe { asm!("lidt [{}]", in(reg) &raw const ptr, options(readonly, nostack, preserves_flags)) };
 }
 
-/// Make the NMI, double-fault and machine-check gates switch to their IST
-/// stacks. Only through `install_ist_stacks`, after the slots are filled.
+/// Make the `#DB`, NMI, double-fault and machine-check gates switch to their
+/// IST stacks. Only through `install_ist_stacks`, after the slots are filled.
 ///
 /// # Safety
 /// `gdt::set_ist_stacks` has filled the boot CPU's slots with valid stacks,
@@ -223,8 +316,34 @@ pub fn our_base() -> u64 {
     &raw const IDT as u64
 }
 
-/// Breakpoints (`int3`) taken so far. #BP is the only non-fatal exception.
+/// Breakpoints (`int3`) taken in ring 0 so far (used by the kernel ktest).
 pub static BREAKPOINTS: AtomicU64 = AtomicU64::new(0);
+/// Deferred `#DB` traps caught at `LSTAR` (CVE-2018-8897 handoff count).
+pub static DEFERRED_LSTAR_DB: AtomicU64 = AtomicU64::new(0);
+/// Deferred `#DB` traps caught at an IDT exception stub entry (`MOV SS; INT3`
+/// / `MOV SS; <exception>` CVE-2018-8897 handoff count).
+pub static DEFERRED_STUB_DB: AtomicU64 = AtomicU64::new(0);
+
+/// Entry address of IDT stub `vector` (`lumen_isr_stubs + vector * STUB_STRIDE`).
+pub fn stub_entry_addr(vector: u8) -> u64 {
+    &raw const lumen_isr_stubs as u64 + u64::from(vector) * STUB_STRIDE
+}
+
+/// Whether `rip` is the entry address of a non-IST CPU exception stub
+/// (`vector < 32` and not `1 | 2 | 8 | 18`). Vector 1 (`#DB`) uses `IST_DEBUG`
+/// and is handled separately so a nested `#DB` at `stub_entry_addr(1)` never
+/// `iretq`s into a self-overwriting IST loop.
+fn is_user_exception_stub_entry(rip: u64) -> bool {
+    let base = &raw const lumen_isr_stubs as u64;
+    let Some(off) = rip.checked_sub(base) else {
+        return false;
+    };
+    if !off.is_multiple_of(STUB_STRIDE) {
+        return false;
+    }
+    let vec = off / STUB_STRIDE;
+    vec < 32 && !matches!(vec, 1 | 2 | 8 | 18)
+}
 
 // The vector map. 0-31 are the CPU's exceptions.
 /// `PIC_BASE..PIC_BASE + 16`: the 8259s, remapped and masked, so only a
@@ -559,11 +678,80 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
     }
     if vector < 32 {
         crate::ktrace!(crate::trace::Kind::Exception, vector, frame.rip, frame.error_code);
+        let from_user = (frame.cs & 3) != 0;
+
+        // Deferred `#DB` from ring 3 (CVE-2018-8897 handoff):
+        // - `MOV SS; SYSCALL` with `TF = 1` delivers `#DB` on `IST_DEBUG` at
+        //   `LSTAR` before `swapgs`. Clear `TF`, set `RF`, clear `DR6`, flag
+        //   this CPU's pending debug trap, and `iretq` back to `LSTAR` so
+        //   `lumen_syscall_entry` terminates cleanly on the normal kernel stack.
+        // - `MOV SS; INT3` / `MOV SS; <non-IST exception>` with `TF = 1`
+        //   delivers `#DB` on `IST_DEBUG` at the target exception stub's first
+        //   instruction (before `lumen_isr_common`'s `swapgs`). Clear `TF`, set
+        //   `RF`, clear `DR6`, and `iretq` back to the stub, which immediately
+        //   runs `lumen_isr_common` and terminates only the offending process.
+        // - `MOV SS; ICEBP (0xF1)` with `TF = 1` delivers a nested `#DB` at
+        //   `stub_entry_addr(1)`, overwriting the outer frame on `IST_DEBUG`.
+        //   Returning via `iretq` would loop forever, so when a ring-3 context
+        //   is active on this CPU (`user_exit_rsp() != 0`), clear `DR6` and
+        //   unwind directly off `IST_DEBUG` via `user::handle_user_exception`.
+        if vector == 1 && !from_user {
+            if frame.rip == super::syscall::entry_addr() {
+                frame.rflags &= !(1 << 8); // clear TF
+                frame.rflags |= 1 << 16; // set RF so any DR0 breakpoint on LSTAR advances past `swapgs`
+                super::cpu::write_dr6(0);
+                super::percpu::set_pending_debug_trap(true);
+                DEFERRED_LSTAR_DB.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if frame.rip == stub_entry_addr(1) && super::percpu::user_exit_rsp() != 0 {
+                super::cpu::write_dr6(0);
+                DEFERRED_STUB_DB.fetch_add(1, Ordering::Relaxed);
+                crate::user::handle_user_exception(frame, 0);
+            }
+            if is_user_exception_stub_entry(frame.rip) {
+                frame.rflags &= !(1 << 8); // clear TF
+                frame.rflags |= 1 << 16; // set RF so any DR0 breakpoint advances past the stub entry
+                super::cpu::write_dr6(0);
+                DEFERRED_STUB_DB.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+
+        // Any synchronous exception originating in ring 3 terminates only the
+        // offending user context, never the kernel. Stop-NMIs (2), `#DF` (8),
+        // and `#MC` (18) are never user-recoverable and always go to
+        // `crash::exception` even if they interrupt ring 3.
+        if from_user && !matches!(vector, 2 | 8 | 18) {
+            if vector == 1 {
+                super::cpu::write_dr6(0);
+            }
+            let cr2 = if vector == 14 { super::cpu::read_cr2() } else { 0 };
+            crate::user::handle_user_exception(frame, cr2);
+        }
+
+        // Ring-0 `#PF` fixup for fault-safe user copies (`.lumen_fixup`).
+        // A reserved-bit violation (`RSVD`, bit 3) always crashes the kernel.
+        if vector == 14 {
+            let cr2 = super::cpu::read_cr2();
+            let rsvd = (frame.error_code & (1 << 3)) != 0;
+            if !rsvd
+                && (crate::user::USER_MIN..crate::user::USER_MAX).contains(&cr2)
+                && let Some(fixup_rip) = crate::user::lookup_fixup(frame.rip)
+            {
+                frame.rip = fixup_rip;
+                frame.rflags &= !(1 << 18); // clear RFLAGS.AC
+                return;
+            }
+        }
+
+        // Kernel-mode `#BP` resume (guarded by `!from_user` above).
         if vector == 3 {
             BREAKPOINTS.fetch_add(1, Ordering::Relaxed);
             log::debug!(target: "idt", "breakpoint at {:#x}", frame.rip);
             return;
         }
+
         crate::crash::exception(frame);
     }
     match vector as u8 {

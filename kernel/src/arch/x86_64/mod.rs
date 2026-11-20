@@ -22,6 +22,7 @@ pub mod qemu;
 pub mod reset;
 pub mod serial;
 pub mod stacks;
+pub mod syscall;
 
 /// The earliest setup on the boot CPU: serial out, then its GDT/TSS, its
 /// per-CPU record (GS) and the IDT, so that any fault from here on produces a
@@ -64,28 +65,28 @@ pub unsafe fn init_ap(cpu: usize) {
 }
 
 /// Point CPU `cpu`'s IST slots (an application processor's) at its own
-/// double-fault, NMI and machine-check stacks, before it starts.
+/// double-fault, NMI, machine-check, and `#DB` debug stacks, before it starts.
 ///
 /// # Safety
 /// Each top is the top of a mapped stack that is never freed and nothing
 /// else uses; CPU `cpu` isn't running kernel code yet.
-pub unsafe fn set_ap_ist_stacks(cpu: usize, double_fault: u64, nmi: u64, machine_check: u64) {
+pub unsafe fn set_ap_ist_stacks(cpu: usize, double_fault: u64, nmi: u64, machine_check: u64, debug: u64) {
     assert!(cpu != 0, "the boot CPU's IST stacks go through install_ist_stacks");
     // SAFETY: upheld by the caller.
-    unsafe { gdt::set_ist_stacks(cpu, double_fault, nmi, machine_check) };
+    unsafe { gdt::set_ist_stacks(cpu, double_fault, nmi, machine_check, debug) };
 }
 
-/// Make the double-fault, NMI and machine-check handlers run on their own
-/// stacks: TSS first, then the IDT, so no gate ever names an empty slot (an
-/// NMI or #MC can arrive even with interrupts off).
+/// Make the double-fault, NMI, machine-check, and `#DB` debug handlers run on
+/// their own stacks: TSS first, then the IDT, so no gate ever names an empty
+/// slot (an NMI, #MC, or #DB can arrive even with interrupts off).
 ///
 /// # Safety
 /// Each top is the top of a mapped stack that is never freed and nothing
 /// else uses; called once, on the boot CPU, before any AP starts.
-pub unsafe fn install_ist_stacks(double_fault: u64, nmi: u64, machine_check: u64) {
+pub unsafe fn install_ist_stacks(double_fault: u64, nmi: u64, machine_check: u64, debug: u64) {
     assert_eq!(percpu::index(), 0, "install_ist_stacks is for the boot CPU");
     // SAFETY: upheld by the caller.
-    unsafe { gdt::set_ist_stacks(0, double_fault, nmi, machine_check) };
+    unsafe { gdt::set_ist_stacks(0, double_fault, nmi, machine_check, debug) };
     // The two are plain stores to different statics: keep the compiler from
     // putting the IDT's before the TSS's.
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);

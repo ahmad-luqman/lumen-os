@@ -23,11 +23,11 @@ BOOT_TIMEOUT = 60
 ONLINE = re.compile(r"INFO  smp: cpu (\d+) online \(lapic id (\d+)\)\n")
 STACKS = re.compile(
     r"INFO  smp: cpu (\d+) stacks: main (0x[0-9a-f]+)\.\.(0x[0-9a-f]+), "
-    r"IST (0x[0-9a-f]+) (0x[0-9a-f]+) (0x[0-9a-f]+) \(guard page below each\)\n"
+    r"IST (0x[0-9a-f]+) (0x[0-9a-f]+) (0x[0-9a-f]+) (0x[0-9a-f]+) \(guard page below each\)\n"
 )
 BOOT_CPU_STACKS = re.compile(
     r"INFO  mem: stacks: main (0x[0-9a-f]+)\.\.0x[0-9a-f]+, "
-    r"IST (0x[0-9a-f]+) (0x[0-9a-f]+) (0x[0-9a-f]+) \(guard page below each\)\n"
+    r"IST (0x[0-9a-f]+) (0x[0-9a-f]+) (0x[0-9a-f]+) (0x[0-9a-f]+) \(guard page below each\)\n"
 )
 SUMMARY = re.compile(r"INFO  smp: (\d+) CPUs? online\n")
 RUNNING_ON = re.compile(
@@ -43,6 +43,7 @@ class ApStacks(NamedTuple):
     df: str
     nmi: str
     mc: str
+    db: str
 
 
 def ap_stacks(output: str) -> dict[int, ApStacks]:
@@ -81,12 +82,12 @@ def test_all_cpus_online(boot):
     # The APs start together, so they may say so in any order.
     assert sorted((int(c), int(a)) for c, a in ONLINE.findall(m.output)) == [(1, 1), (2, 2), (3, 3)]
     # Every AP has its own main and IST stacks, none shared with another AP
-    # or with the boot CPU's four.
+    # or with the boot CPU's five.
     stacks = ap_stacks(m.output)
     assert sorted(stacks) == [1, 2, 3]
     bottoms = list(BOOT_CPU_STACKS.search(m.output).groups())
-    bottoms += [b for s in stacks.values() for b in (s.main_bottom, s.df, s.nmi, s.mc)]
-    assert len(set(bottoms)) == len(bottoms) == 16
+    bottoms += [b for s in stacks.values() for b in (s.main_bottom, s.df, s.nmi, s.mc, s.db)]
+    assert len(set(bottoms)) == len(bottoms) == 20
     assert "WARN  smp" not in m.output
     # Every CPU runs threads (its timer ticks), and none is warned about.
     assert "INFO  sched: threads on 4 CPUs, 10 ms slices\n" in m.output

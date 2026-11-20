@@ -67,6 +67,7 @@ mod termwin;
 mod time;
 mod trace;
 mod ui;
+mod user;
 mod virtio;
 mod vt;
 
@@ -160,19 +161,21 @@ fn install_stacks() -> StackRange {
     };
     let df = stack(STACK_SIZE, StackKind::DoubleFault);
     let nmi = stack(STACK_SIZE, StackKind::Nmi);
+    let db = stack(STACK_SIZE, StackKind::Debug);
     let mc = stack(STACK_SIZE, StackKind::MachineCheck);
     // SAFETY: leaked, mapped stacks nothing else uses; the boot CPU, before
     // any other starts, interrupts off.
-    unsafe { arch::install_ist_stacks(df.top, nmi.top, mc.top) };
+    unsafe { arch::install_ist_stacks(df.top, nmi.top, mc.top, db.top) };
     let main = stack(MAIN_STACK_SIZE, StackKind::Main);
     info!(
         target: "mem",
-        "stacks: main {:#x}..{:#x}, IST {:#x} {:#x} {:#x} (guard page below each)",
+        "stacks: main {:#x}..{:#x}, IST {:#x} {:#x} {:#x} {:#x} (guard page below each)",
         main.bottom,
         main.top,
         df.bottom,
         nmi.bottom,
-        mc.bottom
+        mc.bottom,
+        db.bottom
     );
     main
 }
@@ -180,6 +183,7 @@ fn install_stacks() -> StackRange {
 /// The rest of boot, on the allocated main stack.
 extern "C" fn kmain_on_kernel_stack() -> ! {
     arch::fpu::init_cpu();
+    arch::syscall::init_cpu();
     acpi::init();
     ktrace!(Kind::BootPhase, BootPhase::Acpi);
     // Sizing a BAR turns its device's decoding off for a moment: this runs

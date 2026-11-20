@@ -462,9 +462,91 @@ fn with_space<R>(f: impl FnOnce(&mut Space) -> R) -> R {
 }
 
 /// The root of the kernel's page tables.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: ktests; processes (M2)
 pub fn kernel_root() -> PhysFrame {
     with_space(|s| s.root)
+}
+
+/// Allocate a fresh L4 page-table root for a user address space with the
+/// kernel upper half (`L4[256..512]`) copied from [`kernel_root`] and the
+/// lower half (`L4[0..256]`) zeroed.
+pub fn new_user_root() -> Option<PhysFrame> {
+    let root = frame::alloc_zeroed()?;
+    with_space(|s| {
+        for slot in (ENTRIES / 2)..ENTRIES {
+            let raw = Hhdm.read(s.root, slot).expect("kernel L4 table is readable");
+            Hhdm.write(root, slot, raw);
+        }
+    });
+    Some(root)
+}
+
+/// Map a 4 KiB user-mode page at `virt` (lower half only, `attrs.user()`) to
+/// `phys` in the user hierarchy rooted at `root`.
+///
+/// # Safety
+/// `root` must be an L4 root allocated by [`new_user_root`] (never
+/// [`kernel_root`]), the caller must have exclusive write access to its lower
+/// half, and `phys` must be an allocated physical frame whose ownership is
+/// transferred to `root` (freed on [`destroy_user_root`] or unmap).
+pub unsafe fn map_user_page(root: PhysFrame, virt: VirtAddr, phys: PhysFrame, attrs: Attrs) -> Result<(), MapError> {
+    debug_assert_ne!(root, kernel_root(), "map_user_page must never mutate kernel_root()");
+    assert!(attrs.user(), "map_user_page requires user-mode attributes");
+    pt::map(&mut Hhdm, root, virt, phys, PageSize::Size4K, attrs)
+}
+
+/// Recursively free all lower-half leaf frames (present or `PTE_PROTNONE`) and
+/// intermediate L3/L2/L1 tables under a user L4 subtree.
+///
+/// # Safety
+/// Every leaf and table frame in `table`'s subtree must be exclusively owned
+/// by an inactive user address space.
+unsafe fn free_user_subtree(table: PhysFrame, level: pt::Level) {
+    for index in 0..ENTRIES {
+        let Some(raw) = Hhdm.read(table, index) else {
+            continue;
+        };
+        let entry = pt::Entry::from_raw(raw);
+        if level == pt::Level::L1 {
+            if entry.is_present() || entry.is_prot_none() {
+                // SAFETY: leaf frame belongs exclusively to this user address space.
+                unsafe { frame::free(entry.page(PageSize::Size4K)) }.expect("freeing owned user leaf frame");
+            }
+        } else if entry.is_present() && !entry.is_leaf(level) {
+            let child = entry.table();
+            // SAFETY: lower-half child table belongs exclusively to this user address space.
+            unsafe {
+                free_user_subtree(child, level.below().expect("L3/L2 have a level below"));
+                frame::free(child).expect("freeing owned user page-table frame");
+            }
+        }
+    }
+}
+
+/// Tear down a user L4 root created by [`new_user_root`]: frees all lower-half
+/// leaf frames, all lower-half L3/L2/L1 page-table frames, and `root` itself,
+/// without modifying the shared kernel upper half (`L4[256..512]`).
+///
+/// # Safety
+/// `root` must not be loaded in `CR3` on any CPU, and every lower-half leaf
+/// mapped in `root` must be exclusively owned by this address space.
+pub unsafe fn destroy_user_root(root: PhysFrame) {
+    assert_ne!(hw::active_root(), root, "cannot destroy active CR3 root {root}");
+    for index in 0..(ENTRIES / 2) {
+        let Some(raw) = Hhdm.read(root, index) else {
+            continue;
+        };
+        let entry = pt::Entry::from_raw(raw);
+        if entry.is_present() && !entry.is_leaf(pt::Level::L4) {
+            let child = entry.table();
+            // SAFETY: lower-half L3 subtree belongs exclusively to `root`.
+            unsafe {
+                free_user_subtree(child, pt::Level::L3);
+                frame::free(child).expect("freeing owned user L3 table frame");
+            }
+        }
+    }
+    // SAFETY: `root` is no longer active in CR3 and was allocated by `new_user_root`.
+    unsafe { frame::free(root) }.expect("freeing owned user L4 root frame");
 }
 
 /// Why [`map`] or [`unmap`] refused.

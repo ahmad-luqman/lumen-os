@@ -23,9 +23,9 @@ use crate::window::Window;
 /// The unmapped page below every stack.
 pub const GUARD_SIZE: u64 = FRAME_SIZE;
 
-/// How many stacks can be registered at once: four per CPU (main, #DF, NMI,
-/// #MC) for up to eight CPUs, and the rest for kernel threads (one each) and
-/// tests.
+/// How many stacks can be registered at once: five per CPU (main, #DF, NMI,
+/// #MC, #DB) for up to eight CPUs, and the rest for kernel threads (one each)
+/// and tests.
 pub const MAX_STACKS: usize = 128;
 
 /// What a stack is for (names it in crash reports). Stored in the registry as
@@ -46,16 +46,19 @@ pub enum StackKind {
     Test = 5,
     /// A kernel thread's stack (`sched::spawn`).
     Thread = 6,
+    /// IST stack for debug exceptions (`#DB`, vector 1).
+    Debug = 7,
 }
 
 impl StackKind {
-    const ALL: [StackKind; 6] = [
+    const ALL: [StackKind; 7] = [
         StackKind::Main,
         StackKind::DoubleFault,
         StackKind::Nmi,
         StackKind::MachineCheck,
         StackKind::Test,
         StackKind::Thread,
+        StackKind::Debug,
     ];
 
     fn from_raw(raw: u8) -> Option<StackKind> {
@@ -70,6 +73,7 @@ impl StackKind {
             StackKind::MachineCheck => "#MC IST",
             StackKind::Test => "test",
             StackKind::Thread => "thread",
+            StackKind::Debug => "#DB IST",
         }
     }
 }
@@ -446,7 +450,8 @@ mod tests {
                 | StackKind::Nmi
                 | StackKind::MachineCheck
                 | StackKind::Test
-                | StackKind::Thread => {} // keep in step with `StackKind::ALL`
+                | StackKind::Thread
+                | StackKind::Debug => {} // keep in step with `StackKind::ALL`
             }
             assert_eq!(StackKind::from_raw(k as u8), Some(k));
             assert!(!k.name().is_empty());

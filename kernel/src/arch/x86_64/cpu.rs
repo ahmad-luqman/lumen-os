@@ -151,6 +151,25 @@ write_cr!(write_cr0, "cr0");
 write_cr!(write_cr3, "cr3");
 write_cr!(write_cr4, "cr4");
 
+/// Write debug status register `DR6` (e.g. clearing trap bits after `#DB`).
+pub fn write_dr6(v: u64) {
+    // SAFETY: writing DR6 in ring 0 updates only debug status flags.
+    unsafe { asm!("mov dr6, {}", in(reg) v, options(nomem, nostack, preserves_flags)) }
+}
+
+/// Write debug address register `DR0` (used to arm/clear a kernel debug
+/// breakpoint when verifying the `IST_DEBUG` / `LSTAR` `#DB` handoff).
+pub fn write_dr0(v: u64) {
+    // SAFETY: writing DR0 in ring 0 updates only breakpoint address 0.
+    unsafe { asm!("mov dr0, {}", in(reg) v, options(nomem, nostack, preserves_flags)) }
+}
+
+/// Write debug control register `DR7`.
+pub fn write_dr7(v: u64) {
+    // SAFETY: writing DR7 in ring 0 configures hardware debug breakpoints.
+    unsafe { asm!("mov dr7, {}", in(reg) v, options(nomem, nostack, preserves_flags)) }
+}
+
 /// Continue on another stack: point `rsp` at `top` and call `entry`, which
 /// never returns. A frame record (the caller's `rbp` and return address) is
 /// planted at the top of the new stack, so the frame-pointer chain runs from
