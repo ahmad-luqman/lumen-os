@@ -107,3 +107,13 @@ tests = [
     "cargo:lumen-mm",
     "ktest:lumen_kernel::mm::paging::dynamic_kernel_l4_slots_have_l3_tables",
 ]
+
+[[feature]]
+name = "Per-process AddressSpace with SleepMutex, 4-step interrupt-enabled #PF demand-paging protocol, PROT_NONE frame preservation, byte-granular brk, static ELF64 loading, and safe teardown (#237)"
+milestone = "M6"
+tests = [
+    "ktest:lumen_kernel::sync::sleep_mutex_keeps_irqs_on_and_wakes_waiter",
+    "ktest:lumen_kernel::mm::user_vm::lazy_zero_fill_and_unmap",
+    "scenario:test_linux_user::test_bad_elf_rejected",
+    "scenario:test_linux_user::test_mmap_and_brk",
+]

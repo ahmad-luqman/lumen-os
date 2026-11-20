@@ -496,9 +496,10 @@ pub fn bitmap() -> Option<PhysRange> {
     STATE.lock().as_ref().and_then(|s| s.reserved.get(BITMAP))
 }
 
-/// How many frames are free (for the heap's tests).
-#[cfg(feature = "ktest")]
-pub use checks::free_frames;
+/// How many physical frames are currently free.
+pub fn free_frames() -> usize {
+    with_frames(|a| a.free_frames())
+}
 
 #[cfg(feature = "ktest")]
 mod checks {
@@ -512,10 +513,6 @@ mod checks {
 
     pub fn is_owned(phys: u64) -> bool {
         with_state(|s| s.frames.is_owned(phys))
-    }
-
-    pub fn free_frames() -> usize {
-        with_state(|s| s.frames.free_frames())
     }
 
     /// Is any frame free, by scanning the bitmap (not the counters or hint)?

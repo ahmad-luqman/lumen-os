@@ -4,21 +4,36 @@
 //! See `docs/ARCHITECTURE.md` §5 and §6 ("Ring 3 entry, `syscall`/`sysretq`,
 //! user CPU state and safe copies").
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use log::warn;
-use lumen_mm::paging::Attrs;
-use lumen_mm::{FRAME_SIZE, PhysFrame, VirtAddr};
+use lumen_elf::loader::{
+    EM_X86_64, ET_EXEC, EV_CURRENT, ElfLoadError, PF_R, PF_W, PF_X, PHDR_MIN_SIZE, PT_INTERP, PT_LOAD,
+};
+use lumen_mm::FRAME_SIZE;
+use lumen_vm::Prot;
 
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
 use crate::arch::{self, TrapFrame};
-use crate::linux::{errno, general};
-use crate::mm::{self, frame, paging};
+use crate::linux::{ARCH_GET_FS, ARCH_SET_FS, errno, general};
+#[cfg(feature = "ktest")]
+use crate::mm::paging;
+use crate::mm::user_vm::{AddressSpace, USER_STACK_BOTTOM, UserVmError, prot_from_linux};
+use crate::mm::{frame, heap};
+use crate::sched;
 use crate::shell::Ctx;
 use crate::sync::SpinLock;
+
+const ELF_EHDR_SIZE: usize = 64;
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+const ELFCLASS64: u8 = 2;
+const ELFDATA2LSB: u8 = 1;
 
 /// Lowest valid user virtual address (first 64 KiB is the unmapped null guard).
 pub const USER_MIN: u64 = 0x0000_0000_0001_0000;
@@ -319,27 +334,58 @@ pub enum UserExit {
     NonCanonicalRip(u64),
 }
 
-/// Active ring-3 test-runner slot on one CPU.
+/// Active ring-3 test-runner slot keyed by kernel thread id (so multiple
+/// independent user processes can run concurrently on the same CPU).
 struct RunSlot {
     pid: u32,
     exit: Option<UserExit>,
     stdout: Vec<u8>,
 }
 
-static ACTIVE_RUNS: [SpinLock<Option<RunSlot>>; arch::MAX_CPUS] = [const { SpinLock::new(None) }; arch::MAX_CPUS];
+static ACTIVE_RUNS: SpinLock<BTreeMap<u64, RunSlot>> = SpinLock::new(BTreeMap::new());
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 
+/// Synchronization state for the concurrent same-CPU `sse_tls` preemption test.
+struct SseTlsSync {
+    ready_mask: AtomicU8,
+    aborted: AtomicBool,
+    base_switches: AtomicU64,
+    target_cpu: AtomicUsize,
+}
+
+static SSE_TLS_SYNC: SseTlsSync = SseTlsSync {
+    ready_mask: AtomicU8::new(0),
+    aborted: AtomicBool::new(false),
+    base_switches: AtomicU64::new(0),
+    target_cpu: AtomicUsize::new(0),
+};
+
 // Test-only syscall numbers used by `usertest` to exercise return-path
-// validation (canonical check on `sysretq`/`iretq` and rewritten-frame `iretq`).
+// validation (canonical check on `sysretq`/`iretq`, rewritten-frame `iretq`,
+// and deterministic scheduler-switch counting for `sse_tls`).
 const SYS_TEST_NONCANON_SYSRET: u64 = 0x1000_0001;
 const SYS_TEST_NONCANON_IRET: u64 = 0x1000_0002;
 const SYS_TEST_IRET_RETURN: u64 = 0x1000_0003;
+const SYS_TEST_PREEMPT_COUNT: u64 = 0x1000_0004;
 
-/// Record `exit` for the active ring-3 context on this CPU and return its pid.
+#[inline]
+fn current_tid() -> u64 {
+    sched::running_here().expect("ring-3 syscall/exception requires a running thread").0
+}
+
+#[inline]
+fn neg_errno(code: u32) -> u64 {
+    -(code as i64) as u64
+}
+
+/// Record `exit` for the active ring-3 thread and return its pid.
 fn record_exit(exit: UserExit) -> u32 {
-    let cpu = arch::cpu_index();
-    let mut guard = ACTIVE_RUNS[cpu].lock();
-    let slot = guard.as_mut().expect("user exit with no active ring-3 run");
+    if !matches!(exit, UserExit::Exited(0)) {
+        SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
+    }
+    let tid = current_tid();
+    let mut guard = ACTIVE_RUNS.lock();
+    let slot = guard.get_mut(&tid).expect("user exit with no active ring-3 run");
     slot.exit = Some(exit);
     slot.pid
 }
@@ -388,7 +434,7 @@ pub fn handle_non_canonical_return(rip: u64) -> ! {
     unsafe { arch::syscall::unwind_to_kernel() }
 }
 
-/// Minimal M6 wave-2 syscall dispatcher for ring-3 validation.
+/// M6 wave-2 syscall dispatcher for ring-3 VM, TLS, I/O, and exit syscalls.
 pub fn dispatch_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
     let nr = frame.rax;
     match nr {
@@ -397,27 +443,98 @@ pub fn dispatch_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
             let buf = frame.rsi;
             let count = frame.rdx;
             if fd != 1 && fd != 2 {
-                frame.rax = -(errno::EBADF as i64) as u64;
+                frame.rax = neg_errno(errno::EBADF);
                 return SyscallReturn::Sysret;
             }
             let n = count.min(4096) as usize;
             let mut kbuf = [0u8; 4096];
             if copy_from_user(&mut kbuf[..n], buf).is_err() {
-                frame.rax = -(errno::EFAULT as i64) as u64;
+                frame.rax = neg_errno(errno::EFAULT);
                 return SyscallReturn::Sysret;
             }
-            let cpu = arch::cpu_index();
-            if let Some(slot) = ACTIVE_RUNS[cpu].lock().as_mut() {
+            let tid = current_tid();
+            if let Some(slot) = ACTIVE_RUNS.lock().get_mut(&tid) {
                 let room = 4096usize.saturating_sub(slot.stdout.len());
                 slot.stdout.extend_from_slice(&kbuf[..n.min(room)]);
             }
             frame.rax = n as u64;
             SyscallReturn::Sysret
         }
+        n if n == u64::from(general::__NR_mmap) => {
+            let Some(prot) = prot_from_linux(frame.rdx) else {
+                frame.rax = neg_errno(errno::EINVAL);
+                return SyscallReturn::Sysret;
+            };
+            let Some(space) = sched::current_address_space() else {
+                frame.rax = neg_errno(errno::ENOMEM);
+                return SyscallReturn::Sysret;
+            };
+            frame.rax = match space.mmap_anon(frame.rdi, frame.rsi, prot, frame.r10) {
+                Ok(va) => va,
+                Err(e) => neg_errno(e.to_errno()),
+            };
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_mprotect) => {
+            let Some(prot) = prot_from_linux(frame.rdx) else {
+                frame.rax = neg_errno(errno::EINVAL);
+                return SyscallReturn::Sysret;
+            };
+            let Some(space) = sched::current_address_space() else {
+                frame.rax = neg_errno(errno::ENOMEM);
+                return SyscallReturn::Sysret;
+            };
+            frame.rax = match space.mprotect(frame.rdi, frame.rsi, prot) {
+                Ok(()) => 0,
+                Err(e) => neg_errno(e.to_mprotect_errno()),
+            };
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_munmap) => {
+            let Some(space) = sched::current_address_space() else {
+                frame.rax = neg_errno(errno::EINVAL);
+                return SyscallReturn::Sysret;
+            };
+            frame.rax = match space.munmap(frame.rdi, frame.rsi) {
+                Ok(()) => 0,
+                Err(e) => neg_errno(e.to_errno()),
+            };
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_brk) => {
+            let Some(space) = sched::current_address_space() else {
+                frame.rax = 0;
+                return SyscallReturn::Sysret;
+            };
+            frame.rax = space.brk(frame.rdi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_arch_prctl) => {
+            let code = frame.rdi;
+            let addr = frame.rsi;
+            if code == u64::from(ARCH_SET_FS) {
+                if addr >= USER_MAX {
+                    frame.rax = neg_errno(errno::EINVAL);
+                } else {
+                    sched::set_current_fs_base(addr);
+                    frame.rax = 0;
+                }
+            } else if code == u64::from(ARCH_GET_FS) {
+                let fs = sched::current_fs_base();
+                frame.rax = match copy_to_user(addr, &fs.to_le_bytes()) {
+                    Ok(()) => 0,
+                    Err(e) => neg_errno(e.to_errno()),
+                };
+            } else {
+                frame.rax = neg_errno(errno::EINVAL);
+            }
+            SyscallReturn::Sysret
+        }
         n if n == u64::from(general::__NR_exit) || n == u64::from(general::__NR_exit_group) => {
             let status = (frame.rdi & 0xff) as i32;
             let _ = record_exit(UserExit::Exited(status));
-            // SAFETY: unwinds cleanly back to `enter_ring3`, no lock held.
+            // SAFETY: unwinds cleanly back to `enter_ring3`, no lock held and
+            // no live Rust `Drop` values on this stack frame.
             unsafe { arch::syscall::unwind_to_kernel() }
         }
         SYS_TEST_NONCANON_SYSRET => {
@@ -433,90 +550,45 @@ pub fn dispatch_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
             frame.rax = 0x1337;
             SyscallReturn::Iret
         }
+        SYS_TEST_PREEMPT_COUNT => {
+            if SSE_TLS_SYNC.aborted.load(Ordering::Acquire) {
+                frame.rax = u64::MAX;
+                return SyscallReturn::Sysret;
+            }
+            let bit = (frame.rdi & 3) as u8;
+            let now_mask = SSE_TLS_SYNC.ready_mask.fetch_or(bit, Ordering::AcqRel) | bit;
+            if now_mask != 3 {
+                frame.rax = 0;
+            } else {
+                let cpu = SSE_TLS_SYNC.target_cpu.load(Ordering::Acquire);
+                let cur = sched::switch_count(cpu);
+                let existing = SSE_TLS_SYNC.base_switches.load(Ordering::Acquire);
+                let base = if existing == 0 {
+                    let anchor = cur.max(1);
+                    match SSE_TLS_SYNC.base_switches.compare_exchange(0, anchor, Ordering::AcqRel, Ordering::Acquire) {
+                        Ok(_) => anchor,
+                        Err(val) => val,
+                    }
+                } else {
+                    existing
+                };
+                frame.rax = cur.saturating_sub(base);
+            }
+            SyscallReturn::Sysret
+        }
         _ => {
-            frame.rax = -(errno::ENOSYS as i64) as u64;
+            frame.rax = neg_errno(errno::ENOSYS);
             SyscallReturn::Sysret
         }
     }
 }
 
-/// RAII temporary user address space (lower half `L4[0..256]` + shared kernel
-/// upper half `L4[256..512]`). Dropping always switches `CR3` back to
-/// `kernel_root()` and frees all user leaf and page-table frames.
-///
-/// Wave-2 preemption note: until #237 wires per-thread `CR3` switching into
-/// `sched::schedule`, timer preemption while `TempUserSpace` is active may run
-/// kernel threads under this `CR3`. Because `L4[256..512]` shares all kernel
-/// mappings (including the 6 pre-allocated dynamic L3 slots for heap, stacks,
-/// and MMIO) and no other thread enters ring 3 concurrently on this CPU, that
-/// is sound for the M6 wave-2 test runner.
-struct TempUserSpace {
-    root: PhysFrame,
-    active: bool,
-}
-
-impl TempUserSpace {
-    fn new() -> Option<Self> {
-        let root = paging::new_user_root()?;
-        Some(Self { root, active: false })
-    }
-
-    fn map_page(&mut self, virt: u64, attrs: Attrs) -> Option<PhysFrame> {
-        let va = VirtAddr::new(virt)?;
-        let phys = frame::alloc_zeroed()?;
-        // SAFETY: `self.root` was allocated by `new_user_root` (distinct from
-        // `kernel_root()`), `self` has exclusive access to its lower half, and
-        // `phys` is a freshly allocated frame owned by `self` until teardown.
-        if unsafe { paging::map_user_page(self.root, va, phys, attrs) }.is_err() {
-            // SAFETY: freshly allocated frame, not mapped anywhere.
-            unsafe { frame::free(phys) }.expect("freeing unmapped user frame");
-            return None;
-        }
-        Some(phys)
-    }
-
-    fn activate(&mut self) {
-        if !self.active {
-            // SAFETY: `self.root` copies the kernel upper half `L4[256..512]`
-            // identically from `kernel_root()`.
-            unsafe { arch::paging::write_cr3(self.root.as_u64()) };
-            self.active = true;
-        }
-    }
-
-    fn deactivate(&mut self) {
-        if self.active {
-            // SAFETY: restoring the kernel's own page-table root.
-            unsafe { arch::paging::write_cr3(paging::kernel_root().as_u64()) };
-            self.active = false;
-        }
-    }
-}
-
-impl Drop for TempUserSpace {
-    fn drop(&mut self) {
-        self.deactivate();
-        // SAFETY: `self.root` is no longer active in `CR3`, and every mapped
-        // lower-half leaf and table belongs exclusively to `self`.
-        unsafe { paging::destroy_user_root(self.root) };
-    }
-}
-
-/// Write `bytes` into physical frame `frame` at `offset` through the HHDM.
-fn write_frame_bytes(frame: PhysFrame, offset: usize, bytes: &[u8]) {
-    assert!(offset + bytes.len() <= FRAME_SIZE as usize);
-    let ptr = mm::phys_to_virt(frame.start()).as_mut_ptr::<u8>();
-    // SAFETY: `frame` is a newly allocated usable RAM frame mapped read-write
-    // through the HHDM, and `offset + bytes.len() <= FRAME_SIZE`.
-    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(offset), bytes.len()) };
-}
-
-/// Virtual layout for temporary ring-3 test programs.
+/// Virtual layout for raw ring-3 test programs.
 const TEST_CODE_VA: u64 = 0x0000_0000_0040_0000;
 const TEST_STACK_VA: u64 = 0x0000_0000_0050_0000;
 const TEST_DATA_VA: u64 = 0x0000_0000_0060_0000;
 
-/// Result of running one temporary ring-3 test program.
+/// Result of running one ring-3 user process.
 struct RunResult {
     exit: UserExit,
     stdout: Vec<u8>,
@@ -551,52 +623,66 @@ impl Drop for Dr0Guard {
     }
 }
 
-/// Run raw x86-64 user machine code `code` (with optional `data` mapped at
-/// `TEST_DATA_VA`) in ring 3 inside a fresh temporary address space.
-///
-/// When `dr0_target` is `Some(addr)`, arms a hardware execution breakpoint
-/// (`DR0 = addr`) before entering ring 3 and disarms it on return,
-/// deterministically exercising the `IST_DEBUG` pre-`swapgs` `#DB` handoff at
-/// `LSTAR` or an IDT exception stub under both QEMU TCG and KVM.
-fn run_ring3_program(code: &[u8], data: &[u8], dr0_target: Option<u64>) -> Result<RunResult, &'static str> {
-    let mut space = TempUserSpace::new().ok_or("out of frames for user page table")?;
-    let code_frame = space.map_page(TEST_CODE_VA, Attrs::USER_RX).ok_or("out of frames for user code")?;
-    let _stack_frame = space.map_page(TEST_STACK_VA, Attrs::USER_RW).ok_or("out of frames for user stack")?;
-    let data_frame = space.map_page(TEST_DATA_VA, Attrs::USER_RW).ok_or("out of frames for user data")?;
+type ResultSlot = Arc<SpinLock<Option<RunResult>>>;
 
-    write_frame_bytes(code_frame, 0, code);
-    write_frame_bytes(data_frame, 0, data);
+/// Spawn a pinned user thread on `cpu` executing `(entry, rsp)` inside `space`,
+/// returning `(JoinHandle, result_slot)`.
+fn spawn_ring3_on(
+    cpu: usize,
+    name: &'static str,
+    space: Arc<AddressSpace>,
+    entry: u64,
+    rsp: u64,
+    dr0_target: Option<u64>,
+) -> Result<(sched::JoinHandle, ResultSlot), &'static str> {
+    let result_slot: ResultSlot = Arc::new(SpinLock::new(None));
+    let out = result_slot.clone();
+    let handle = sched::spawn_user_on(cpu, name, space, move || {
+        let tid = current_tid();
+        let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_RUNS.lock().insert(tid, RunSlot { pid, exit: None, stdout: Vec::new() });
 
-    let cpu = arch::cpu_index();
-    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
-    {
-        let mut guard = ACTIVE_RUNS[cpu].lock();
-        if guard.is_some() {
-            return Err("ring-3 runner already active on this CPU");
+        let lstar_before = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
+        let stub_before = arch::idt::DEFERRED_STUB_DB.load(Ordering::Relaxed);
+        let _dr0 = Dr0Guard::arm(dr0_target);
+        // SAFETY: `sched::spawn_user_on` loaded `space.root()` into CR3,
+        // `entry` and `rsp` are mapped inside `space`, and interrupts are on.
+        unsafe { arch::syscall::enter_ring3(entry, rsp, 0x0202) };
+        drop(_dr0);
+        let lstar_after = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
+        let stub_after = arch::idt::DEFERRED_STUB_DB.load(Ordering::Relaxed);
+
+        let slot = ACTIVE_RUNS.lock().remove(&tid).expect("active run slot missing after ring-3 exit");
+        let exit = slot.exit.expect("ring-3 exited without recording UserExit");
+        *out.lock() = Some(RunResult {
+            exit,
+            stdout: slot.stdout,
+            deferred_lstar_db: lstar_after.saturating_sub(lstar_before),
+            deferred_stub_db: stub_after.saturating_sub(stub_before),
+        });
+        // Detach and tear down user mappings with interrupts ON before exiting.
+        if let Some(detached) = sched::detach_user_space()
+            && Arc::strong_count(&detached) == 1
+        {
+            detached.teardown();
         }
-        *guard = Some(RunSlot { pid, exit: None, stdout: Vec::new() });
-    }
-
-    let lstar_before = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
-    let stub_before = arch::idt::DEFERRED_STUB_DB.load(Ordering::Relaxed);
-    space.activate();
-    let _dr0 = Dr0Guard::arm(dr0_target);
-    // SAFETY: `space` maps `TEST_CODE_VA` (USER_RX), `TEST_STACK_VA` (USER_RW),
-    // and the full kernel upper half; `enter_ring3` checks interrupts/locks.
-    unsafe { arch::syscall::enter_ring3(TEST_CODE_VA, TEST_STACK_VA + FRAME_SIZE, 0x0202) };
-    drop(_dr0);
-    drop(space);
-    let lstar_after = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
-    let stub_after = arch::idt::DEFERRED_STUB_DB.load(Ordering::Relaxed);
-
-    let slot = ACTIVE_RUNS[cpu].lock().take().expect("active run slot missing after ring-3 exit");
-    let exit = slot.exit.expect("ring-3 exited without recording UserExit");
-    Ok(RunResult {
-        exit,
-        stdout: slot.stdout,
-        deferred_lstar_db: lstar_after.saturating_sub(lstar_before),
-        deferred_stub_db: stub_after.saturating_sub(stub_before),
     })
+    .map_err(|_| "failed to spawn user thread")?;
+    Ok((handle, result_slot))
+}
+
+/// Run raw x86-64 user machine code `code` (with optional `data` mapped at
+/// `TEST_DATA_VA`) in ring 3 inside a real [`AddressSpace`] on a user thread.
+fn run_ring3_program(code: &[u8], data: &[u8], dr0_target: Option<u64>) -> Result<RunResult, &'static str> {
+    let space = Arc::new(AddressSpace::new().map_err(|_| "out of frames for AddressSpace")?);
+    space.map_eager_with_bytes(TEST_CODE_VA, FRAME_SIZE, Prot::READ | Prot::EXEC, code).map_err(|_| "map code")?;
+    space.map_eager_with_bytes(TEST_STACK_VA, FRAME_SIZE, Prot::READ | Prot::WRITE, &[]).map_err(|_| "map stack")?;
+    space.map_eager_with_bytes(TEST_DATA_VA, FRAME_SIZE, Prot::READ | Prot::WRITE, data).map_err(|_| "map data")?;
+
+    let (handle, slot) =
+        spawn_ring3_on(arch::cpu_index(), "usertest", space, TEST_CODE_VA, TEST_STACK_VA + FRAME_SIZE, dr0_target)?;
+    handle.join();
+    Ok(slot.lock().take().expect("user thread finished without RunResult"))
 }
 
 /// Tiny x86-64 machine-code builder for ring-3 test programs.
@@ -648,6 +734,50 @@ impl CodeBuf {
     fn mov_r15d(&mut self, imm: u32) {
         self.bytes(&[0x41, 0xbf]);
         self.bytes(&imm.to_le_bytes());
+    }
+    fn mov_r10d(&mut self, imm: u32) {
+        self.bytes(&[0x41, 0xba]);
+        self.bytes(&imm.to_le_bytes());
+    }
+    fn mov_r8d(&mut self, imm: u32) {
+        self.bytes(&[0x41, 0xb8]);
+        self.bytes(&imm.to_le_bytes());
+    }
+    fn mov_r9d(&mut self, imm: u32) {
+        self.bytes(&[0x41, 0xb9]);
+        self.bytes(&imm.to_le_bytes());
+    }
+    fn mov_rcx_u64(&mut self, imm: u64) {
+        self.bytes(&[0x48, 0xb9]);
+        self.bytes(&imm.to_le_bytes());
+    }
+    fn mov_rsi_u64(&mut self, imm: u64) {
+        self.bytes(&[0x48, 0xbe]);
+        self.bytes(&imm.to_le_bytes());
+    }
+    fn mov_rbp_u64(&mut self, imm: u64) {
+        self.bytes(&[0x48, 0xbd]);
+        self.bytes(&imm.to_le_bytes());
+    }
+    fn exit_group_imm(&mut self, code: u32) {
+        self.mov_edi(code);
+        self.mov_eax(general::__NR_exit_group);
+        self.syscall();
+    }
+    /// Emit `je +12; exit_group(code)` (skips the 12-byte exit sequence when ZF=1).
+    fn fail_if_ne(&mut self, code: u32) {
+        self.bytes(&[0x74, 0x0c]); // je +12
+        self.exit_group_imm(code);
+    }
+    /// Emit `test rax, rax; jz +12; exit_group(code)`.
+    fn fail_if_rax_nonzero(&mut self, code: u32) {
+        self.bytes(&[0x48, 0x85, 0xc0]); // test rax, rax
+        self.fail_if_ne(code);
+    }
+    /// Emit `cmp rax, rcx; je +12; exit_group(code)`.
+    fn fail_if_rax_ne_rcx(&mut self, code: u32) {
+        self.bytes(&[0x48, 0x39, 0xc8]); // cmp rax, rcx
+        self.fail_if_ne(code);
     }
     fn syscall(&mut self) {
         self.bytes(&[0x0f, 0x05]);
@@ -811,13 +941,481 @@ fn program_noncanon(iret_path: bool) -> Vec<u8> {
     c.0
 }
 
-/// Shell command: `usertest <ok|iret|pf|ud|gp|bp|db|cve_db|lstar_db|movss_bp|stub_db|noncanon|noncanon-iret>`.
+/// Build a minimal static ELF64 (`ET_EXEC`) with custom program headers.
+fn build_elf_with_phdrs(
+    entry: u64,
+    phdrs: &[(u32, u32, u64, u64, u64, u64)],
+    payload_at_page: Option<&[u8]>,
+) -> Vec<u8> {
+    let total_len = if payload_at_page.is_some() { 0x2000 } else { 0x1000 };
+    let mut img = vec![0u8; total_len];
+    img[0..4].copy_from_slice(&ELF_MAGIC);
+    img[4] = ELFCLASS64;
+    img[5] = ELFDATA2LSB;
+    img[6] = EV_CURRENT;
+    img[0x10..0x12].copy_from_slice(&ET_EXEC.to_le_bytes());
+    img[0x12..0x14].copy_from_slice(&EM_X86_64.to_le_bytes());
+    img[0x14..0x18].copy_from_slice(&u32::from(EV_CURRENT).to_le_bytes());
+    img[0x18..0x20].copy_from_slice(&entry.to_le_bytes());
+    img[0x20..0x28].copy_from_slice(&(ELF_EHDR_SIZE as u64).to_le_bytes());
+    img[0x34..0x36].copy_from_slice(&(ELF_EHDR_SIZE as u16).to_le_bytes());
+    img[0x36..0x38].copy_from_slice(&PHDR_MIN_SIZE.to_le_bytes());
+    img[0x38..0x3a].copy_from_slice(&(phdrs.len() as u16).to_le_bytes());
+
+    for (idx, &(p_type, flags, off, va, filesz, memsz)) in phdrs.iter().enumerate() {
+        let o = ELF_EHDR_SIZE + idx * usize::from(PHDR_MIN_SIZE);
+        img[o..o + 4].copy_from_slice(&p_type.to_le_bytes());
+        img[o + 4..o + 8].copy_from_slice(&flags.to_le_bytes());
+        img[o + 8..o + 16].copy_from_slice(&off.to_le_bytes());
+        img[o + 16..o + 24].copy_from_slice(&va.to_le_bytes());
+        img[o + 24..o + 32].copy_from_slice(&va.to_le_bytes());
+        img[o + 32..o + 40].copy_from_slice(&filesz.to_le_bytes());
+        img[o + 40..o + 48].copy_from_slice(&memsz.to_le_bytes());
+        img[o + 48..o + 56].copy_from_slice(&FRAME_SIZE.to_le_bytes());
+    }
+    if let Some(code) = payload_at_page {
+        img[0x1000..0x1000 + code.len()].copy_from_slice(code);
+    }
+    img
+}
+
+/// Exercise malformed/W+X/overlapping/kernel-half/PT_INTERP/RELRO-W+X ELF
+/// rejections through `AddressSpace::from_elf`, verifying zero frame and heap
+/// leaks across all rejections.
+fn run_bad_elf_tests(ctx: &mut Ctx<'_>) {
+    // Pre-build all bad ELF images before measuring frames/heap so test fixture
+    // allocation itself isn't counted as a loader leak.
+    let bad_truncated = b"\x7fELF\x02\x01\x01".to_vec();
+    let bad_wx = build_elf_with_phdrs(0x40_1000, &[(PT_LOAD, PF_R | PF_W | PF_X, 0x100, 0x40_1000, 0x10, 0x10)], None);
+    let bad_overlap = build_elf_with_phdrs(
+        0x40_1000,
+        &[(PT_LOAD, PF_R | PF_X, 0x100, 0x40_1000, 0x200, 0x200), (PT_LOAD, PF_R, 0x200, 0x40_1100, 0x200, 0x200)],
+        None,
+    );
+    let bad_kernel_half = build_elf_with_phdrs(
+        0xffff_8000_0000_1000,
+        &[(PT_LOAD, PF_R | PF_X, 0x100, 0xffff_8000_0000_1000, 0x10, 0x10)],
+        None,
+    );
+    let bad_interp = build_elf_with_phdrs(
+        0x40_1000,
+        &[(PT_INTERP, PF_R, 0x100, 0x40_0100, 0x20, 0x20), (PT_LOAD, PF_R | PF_X, 0x100, 0x40_1000, 0x10, 0x10)],
+        None,
+    );
+    let bad_shared_wx = build_elf_with_phdrs(
+        0x40_1000,
+        &[
+            (PT_LOAD, PF_R | PF_X, 0x100, 0x40_1000, 0x400, 0x400),
+            (PT_LOAD, PF_R | PF_W, 0x500, 0x40_1400, 0x400, 0x400),
+        ],
+        None,
+    );
+    // Passes `LoadedElf::parse` but places PT_LOAD inside the reserved stack +
+    // guard region, exercising `commit_loaded_elf` rejection + AddressSpace::drop.
+    let bad_stack_overlap =
+        build_elf_with_phdrs(USER_STACK_BOTTOM, &[(PT_LOAD, PF_R | PF_X, 0x100, USER_STACK_BOTTOM, 0x10, 0x10)], None);
+
+    type BadElfCase<'a> = (&'static str, &'a [u8], fn(&UserVmError) -> bool);
+    let cases: [BadElfCase<'_>; 7] = [
+        ("truncated", &bad_truncated, |e| matches!(e, UserVmError::Elf(ElfLoadError::Truncated))),
+        ("wx", &bad_wx, |e| matches!(e, UserVmError::Elf(ElfLoadError::WritableAndExecutable { .. }))),
+        ("overlap", &bad_overlap, |e| matches!(e, UserVmError::Elf(ElfLoadError::OverlappingSegments { .. }))),
+        ("kernel_half", &bad_kernel_half, |e| matches!(e, UserVmError::Elf(ElfLoadError::AddressOutOfRange { .. }))),
+        ("pt_interp", &bad_interp, |e| matches!(e, UserVmError::Elf(ElfLoadError::DynamicInterpreterUnsupported))),
+        ("shared_wx", &bad_shared_wx, |e| {
+            matches!(e, UserVmError::Elf(ElfLoadError::SharedPageWritableAndExecutable { .. }))
+        }),
+        ("stack_overlap", &bad_stack_overlap, |e| matches!(e, UserVmError::Vm(lumen_vm::VmError::Exists))),
+    ];
+
+    let frames_before = frame::free_frames();
+    let heap_before = heap::stats().used;
+    let mut rejected = 0usize;
+    for (name, img, check) in cases {
+        match AddressSpace::from_elf(img, &[b"/bad"], &[], b"/bad", [0; 16]) {
+            Err(err) if check(&err) => rejected += 1,
+            Err(err) => {
+                return ctx.fail(format_args!("usertest: bad_elf {name}: unexpected error {err}"));
+            }
+            Ok((space, _)) => {
+                space.teardown();
+                return ctx.fail(format_args!("usertest: bad_elf {name}: unexpectedly accepted"));
+            }
+        }
+    }
+    let frames_after = frame::free_frames();
+    let heap_after = heap::stats().used;
+    let leaked_frames = frames_before as i64 - frames_after as i64;
+    let leaked_heap = heap_after as i64 - heap_before as i64;
+    let _ = writeln!(
+        ctx.out,
+        "usertest: bad_elf rejected={rejected} leaked_frames={leaked_frames} leaked_heap={leaked_heap}"
+    );
+}
+
+/// Ring-3 machine code (loaded as a real static ELF64) exercising:
+/// `mmap` (2 pages lazy RW), demand-paged `#PF` zero-fill, `mprotect(PROT_NONE)`
+/// -> `mprotect(PROT_READ|PROT_WRITE)` preserving data, byte-granular `brk`
+/// grow/shrink/invalid, and `munmap` freeing frames. Exits 0 on success.
+fn program_mmap_brk() -> Vec<u8> {
+    const SENT0: u64 = 0x1122_3344_5566_7788;
+    const SENT1: u64 = 0xaabb_ccdd_eeff_0011;
+    const BRK0: u64 = 0xdead_beef_cafe_babe;
+    const BRK1: u64 = 0x55aa_55aa_55aa_55aa;
+
+    let mut c = CodeBuf::new();
+    // 1. rbx = mmap(0, 2*4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+    c.mov_eax(general::__NR_mmap);
+    c.mov_edi(0);
+    c.mov_esi(2 * FRAME_SIZE as u32);
+    c.mov_edx(general::PROT_READ | general::PROT_WRITE);
+    c.mov_r10d(general::MAP_PRIVATE | general::MAP_ANONYMOUS);
+    c.mov_r8d(u32::MAX);
+    c.mov_r9d(0);
+    c.syscall();
+    // Check rax > 0 (not negative errno): test rax, rax; jns +12; exit_group(1)
+    c.bytes(&[0x48, 0x85, 0xc0]);
+    c.bytes(&[0x79, 0x0c]);
+    c.exit_group_imm(1);
+    c.bytes(&[0x48, 0x89, 0xc3]); // mov rbx, rax
+
+    // 2. Verify demand-paged zero-fill on page 0 and page 1.
+    c.bytes(&[0x48, 0x8b, 0x03]); // mov rax, [rbx]
+    c.fail_if_rax_nonzero(2);
+    c.bytes(&[0x48, 0x8b, 0x83]); // mov rax, [rbx + 4096]
+    c.bytes(&(FRAME_SIZE as u32).to_le_bytes());
+    c.fail_if_rax_nonzero(3);
+
+    // 3. Write sentinels into page 0 and page 1.
+    c.mov_rcx_u64(SENT0);
+    c.bytes(&[0x48, 0x89, 0x0b]); // mov [rbx], rcx
+    c.mov_rcx_u64(SENT1);
+    c.bytes(&[0x48, 0x89, 0x8b]); // mov [rbx + 4096], rcx
+    c.bytes(&(FRAME_SIZE as u32).to_le_bytes());
+
+    // 4. mprotect(rbx, 4096, PROT_NONE) -> 0
+    c.mov_eax(general::__NR_mprotect);
+    c.bytes(&[0x48, 0x89, 0xdf]); // mov rdi, rbx
+    c.mov_esi(FRAME_SIZE as u32);
+    c.mov_edx(general::PROT_NONE);
+    c.syscall();
+    c.fail_if_rax_nonzero(4);
+
+    // 5. mprotect(rbx, 4096, PROT_READ|PROT_WRITE) -> 0
+    c.mov_eax(general::__NR_mprotect);
+    c.bytes(&[0x48, 0x89, 0xdf]); // mov rdi, rbx
+    c.mov_esi(FRAME_SIZE as u32);
+    c.mov_edx(general::PROT_READ | general::PROT_WRITE);
+    c.syscall();
+    c.fail_if_rax_nonzero(5);
+
+    // 6. Verify page 0 sentinel survived PROT_NONE round-trip and page 1 is intact.
+    c.bytes(&[0x48, 0x8b, 0x03]); // mov rax, [rbx]
+    c.mov_rcx_u64(SENT0);
+    c.fail_if_rax_ne_rcx(6);
+    c.bytes(&[0x48, 0x8b, 0x83]); // mov rax, [rbx + 4096]
+    c.bytes(&(FRAME_SIZE as u32).to_le_bytes());
+    c.mov_rcx_u64(SENT1);
+    c.fail_if_rax_ne_rcx(7);
+
+    // 7. rbp = brk(0) (initial_brk)
+    c.mov_eax(general::__NR_brk);
+    c.mov_edi(0);
+    c.syscall();
+    c.bytes(&[0x48, 0x89, 0xc5]); // mov rbp, rax
+
+    // 8. brk(rbp + 137) -> exact rbp + 137
+    c.mov_eax(general::__NR_brk);
+    c.bytes(&[0x48, 0x8d, 0xbd]); // lea rdi, [rbp + 137]
+    c.bytes(&137u32.to_le_bytes());
+    c.syscall();
+    c.bytes(&[0x48, 0x89, 0xf9]); // mov rcx, rdi (rdi preserved across syscall; rcx clobbered)
+    c.fail_if_rax_ne_rcx(8);
+
+    // 9. Verify brk page 0 demand-paged zero-fill, write BRK0.
+    c.bytes(&[0x48, 0x8b, 0x85]); // mov rax, [rbp + 0]
+    c.bytes(&0u32.to_le_bytes());
+    c.fail_if_rax_nonzero(9);
+    c.mov_rcx_u64(BRK0);
+    c.bytes(&[0x48, 0x89, 0x8d]); // mov [rbp + 0], rcx
+    c.bytes(&0u32.to_le_bytes());
+
+    // 10. brk(rbp + 4096 + 500) -> exact, verify zero-fill on page 1, write BRK1.
+    c.mov_eax(general::__NR_brk);
+    c.bytes(&[0x48, 0x8d, 0xbd]); // lea rdi, [rbp + 4596]
+    c.bytes(&(FRAME_SIZE as u32 + 500).to_le_bytes());
+    c.syscall();
+    c.bytes(&[0x48, 0x89, 0xf9]); // mov rcx, rdi
+    c.fail_if_rax_ne_rcx(10);
+    c.bytes(&[0x48, 0x8b, 0x85]); // mov rax, [rbp + 4096]
+    c.bytes(&(FRAME_SIZE as u32).to_le_bytes());
+    c.fail_if_rax_nonzero(11);
+    c.mov_rcx_u64(BRK1);
+    c.bytes(&[0x48, 0x89, 0x8d]); // mov [rbp + 4096], rcx
+    c.bytes(&(FRAME_SIZE as u32).to_le_bytes());
+
+    // 11. Shrink brk back to rbp + 137 -> exact, page 0 data still intact.
+    c.mov_eax(general::__NR_brk);
+    c.bytes(&[0x48, 0x8d, 0xbd]); // lea rdi, [rbp + 137]
+    c.bytes(&137u32.to_le_bytes());
+    c.syscall();
+    c.bytes(&[0x48, 0x89, 0xf9]); // mov rcx, rdi
+    c.fail_if_rax_ne_rcx(12);
+    c.bytes(&[0x48, 0x8b, 0x85]); // mov rax, [rbp + 0]
+    c.bytes(&0u32.to_le_bytes());
+    c.mov_rcx_u64(BRK0);
+    c.fail_if_rax_ne_rcx(13);
+
+    // 12. Invalid brk(rbp - 16) returns unchanged rbp + 137.
+    c.mov_eax(general::__NR_brk);
+    c.bytes(&[0x48, 0x8d, 0xbd]); // lea rdi, [rbp - 16]
+    c.bytes(&(-16i32 as u32).to_le_bytes());
+    c.syscall();
+    c.bytes(&[0x48, 0x8d, 0x8d]); // lea rcx, [rbp + 137]
+    c.bytes(&137u32.to_le_bytes());
+    c.fail_if_rax_ne_rcx(14);
+
+    // 13. munmap(rbx, 2*4096) -> 0
+    c.mov_eax(general::__NR_munmap);
+    c.bytes(&[0x48, 0x89, 0xdf]); // mov rdi, rbx
+    c.mov_esi(2 * FRAME_SIZE as u32);
+    c.syscall();
+    c.fail_if_rax_nonzero(15);
+
+    // 14. Clean exit(0).
+    c.exit_group_imm(0);
+    c.ud2();
+    c.0
+}
+
+fn run_mmap_brk_test(ctx: &mut Ctx<'_>) {
+    let code = program_mmap_brk();
+    let elf = build_elf_with_phdrs(
+        0x40_1000,
+        &[(PT_LOAD, PF_R | PF_X, 0x1000, 0x40_1000, code.len() as u64, code.len() as u64)],
+        Some(&code),
+    );
+    // Pre-warm heap so thread/slot metadata reuses existing heap pages.
+    let _warm: Vec<u8> = vec![0u8; 8192];
+    drop(_warm);
+
+    let frames_before = frame::free_frames();
+    let (space, prog) = match AddressSpace::from_elf(&elf, &[b"/mmap_brk"], &[], b"/mmap_brk", [0x11; 16]) {
+        Ok(loaded) => loaded,
+        Err(e) => return ctx.fail(format_args!("usertest: mmap_brk load failed: {e}")),
+    };
+    let space = Arc::new(space);
+    let (handle, slot) = match spawn_ring3_on(arch::cpu_index(), "mmap-brk", space, prog.entry, prog.rsp, None) {
+        Ok(pair) => pair,
+        Err(e) => return ctx.fail(format_args!("usertest: mmap_brk spawn failed: {e}")),
+    };
+    handle.join();
+    let result = slot.lock().take().expect("mmap-brk finished without RunResult");
+    drop(slot);
+    let frames_after = frame::free_frames();
+    let leaked_frames = frames_before as i64 - frames_after as i64;
+    match result.exit {
+        UserExit::Exited(status) => {
+            let _ = writeln!(ctx.out, "usertest: mmap_brk exit={status} leaked_frames={leaked_frames}");
+        }
+        other => {
+            ctx.fail(format_args!("usertest: mmap_brk unexpected exit {other:?} leaked_frames={leaked_frames}"));
+        }
+    }
+}
+
+/// Ring-3 machine code + data for one worker in the concurrent same-CPU
+/// SSE (`xmm0`–`xmm7`) + TLS (`IA32_FS_BASE` / `%fs:0`) preemption test.
+fn program_sse_tls(worker_bit: u32, tls_offset: u64, seed: u8, min_preempts: u8) -> (Vec<u8>, Vec<u8>) {
+    // Data page layout at TEST_DATA_VA:
+    //   [0x000..0x080]: 8 x 16-byte distinct expected patterns for xmm0..xmm7
+    //   [0x080..0x088]: scratch u64 for arch_prctl(ARCH_GET_FS)
+    //   [tls_offset..tls_offset+24]: TLS block (fs:0 = sentinel0, fs:8 = sentinel1, fs:16 = iter)
+    let mut data = vec![0u8; 0x300];
+    for reg in 0..8usize {
+        for b in 0..16usize {
+            data[reg * 16 + b] = seed.wrapping_add((reg as u8).wrapping_mul(17)).wrapping_add(b as u8);
+        }
+    }
+    let tls_addr = TEST_DATA_VA + tls_offset;
+    let getfs_scratch = TEST_DATA_VA + 0x80;
+    let tls_sent0 = u64::from_le_bytes([seed; 8]) ^ 0x1357_2468_9bdf_0246;
+    let tls_sent1 = !tls_sent0;
+
+    let mut c = CodeBuf::new();
+    // 1. arch_prctl(ARCH_SET_FS, tls_addr) -> 0
+    c.mov_eax(general::__NR_arch_prctl);
+    c.mov_edi(ARCH_SET_FS);
+    c.mov_rsi_u64(tls_addr);
+    c.syscall();
+    c.fail_if_rax_nonzero(1);
+
+    // 2. arch_prctl(ARCH_GET_FS, getfs_scratch) -> 0 and *getfs_scratch == tls_addr
+    c.mov_eax(general::__NR_arch_prctl);
+    c.mov_edi(ARCH_GET_FS);
+    c.mov_rsi_u64(getfs_scratch);
+    c.syscall();
+    c.fail_if_rax_nonzero(2);
+    c.mov_rbp_u64(TEST_DATA_VA);
+    c.bytes(&[0x48, 0x8b, 0x85]); // mov rax, [rbp + 0x80]
+    c.bytes(&0x80u32.to_le_bytes());
+    c.mov_rcx_u64(tls_addr);
+    c.fail_if_rax_ne_rcx(3);
+
+    // 3. rbx = 0; initialize %fs:0, %fs:8, %fs:16.
+    c.bytes(&[0x31, 0xdb]); // xor ebx, ebx
+    c.mov_rcx_u64(tls_sent0);
+    c.bytes(&[0x64, 0x48, 0x89, 0x4b, 0x00]); // mov fs:[rbx + 0], rcx
+    c.mov_rcx_u64(tls_sent1);
+    c.bytes(&[0x64, 0x48, 0x89, 0x4b, 0x08]); // mov fs:[rbx + 8], rcx
+    c.bytes(&[0x48, 0x31, 0xc9]); // xor rcx, rcx
+    c.bytes(&[0x64, 0x48, 0x89, 0x4b, 0x10]); // mov fs:[rbx + 16], rcx
+    c.bytes(&[0x4d, 0x31, 0xe4]); // xor r12, r12 (expected local counter)
+
+    // 4. Load xmm0..xmm7 ONCE from [rbp + k*16]; never reloaded inside loop.
+    for k in 0..8u8 {
+        c.bytes(&[0xf3, 0x0f, 0x6f, 0x45 | (k << 3), k * 16]); // movdqu xmmK, [rbp + k*16]
+    }
+
+    // 5. Loop verifying xmm0..xmm7 and %fs:0/%fs:8/%fs:16 across >= min_preempts switches.
+    let loop_top = c.0.len();
+    for k in 0..8u8 {
+        // movdqu xmm8, [rbp + k*16]
+        c.bytes(&[0xf3, 0x44, 0x0f, 0x6f, 0x45, k * 16]);
+        // pcmpeqb xmm8, xmmK
+        c.bytes(&[0x66, 0x44, 0x0f, 0x74, 0xc0 | k]);
+        // pmovmskb eax, xmm8
+        c.bytes(&[0x66, 0x41, 0x0f, 0xd7, 0xc0]);
+        // cmp eax, 0xffff; je +12; exit_group(10 + k)
+        c.bytes(&[0x3d, 0xff, 0xff, 0x00, 0x00]);
+        c.fail_if_ne(10 + u32::from(k));
+    }
+
+    // Verify %fs:0 == tls_sent0, %fs:8 == tls_sent1, %fs:16 == r12, then increment both.
+    c.bytes(&[0x64, 0x48, 0x8b, 0x43, 0x00]); // mov rax, fs:[rbx + 0]
+    c.mov_rcx_u64(tls_sent0);
+    c.fail_if_rax_ne_rcx(20);
+    c.bytes(&[0x64, 0x48, 0x8b, 0x43, 0x08]); // mov rax, fs:[rbx + 8]
+    c.mov_rcx_u64(tls_sent1);
+    c.fail_if_rax_ne_rcx(21);
+    c.bytes(&[0x64, 0x48, 0x8b, 0x43, 0x10]); // mov rax, fs:[rbx + 16]
+    c.bytes(&[0x4c, 0x39, 0xe0]); // cmp rax, r12
+    c.fail_if_ne(22);
+    c.bytes(&[0x49, 0xff, 0xc4]); // inc r12
+    c.bytes(&[0x64, 0x4c, 0x89, 0x63, 0x10]); // mov fs:[rbx + 16], r12
+
+    // Short busy spin while holding live xmm0..xmm7 and %fs so timer ticks fire in ring 3.
+    c.bytes(&[0xb9]); // mov ecx, 2000
+    c.bytes(&2000u32.to_le_bytes());
+    c.bytes(&[0xf3, 0x90]); // pause
+    c.bytes(&[0xff, 0xc9]); // dec ecx
+    c.bytes(&[0x75, 0xfa]); // jnz -6
+
+    // Check how many real scheduler switches have occurred since both workers entered ring 3.
+    c.mov_eax(SYS_TEST_PREEMPT_COUNT as u32);
+    c.mov_edi(worker_bit);
+    c.syscall();
+    c.bytes(&[0x48, 0x83, 0xf8, min_preempts]); // cmp rax, min_preempts
+    let disp = (loop_top as i64 - (c.0.len() as i64 + 6)) as i32;
+    c.bytes(&[0x0f, 0x82]); // jb loop_top
+    c.bytes(&disp.to_le_bytes());
+
+    c.exit_group_imm(0);
+    c.ud2();
+    (c.0, data)
+}
+
+fn run_sse_tls_test(ctx: &mut Ctx<'_>) {
+    const MIN_PREEMPTS: u8 = 6;
+    // Pin BOTH user processes to the same CPU (prefer AP 1 if online so serial
+    // shell I/O never competes; otherwise CPU 0).
+    let target_cpu = if sched::running_on(1) { 1 } else { arch::cpu_index() };
+
+    let (code_a, data_a) = program_sse_tls(1, 0x100, 0x21, MIN_PREEMPTS);
+    let (code_b, data_b) = program_sse_tls(2, 0x200, 0x97, MIN_PREEMPTS);
+
+    let _warm: Vec<u8> = vec![0u8; 8192];
+    drop(_warm);
+
+    let frames_before = frame::free_frames();
+    SSE_TLS_SYNC.ready_mask.store(0, Ordering::Release);
+    SSE_TLS_SYNC.aborted.store(false, Ordering::Release);
+    SSE_TLS_SYNC.base_switches.store(0, Ordering::Release);
+    SSE_TLS_SYNC.target_cpu.store(target_cpu, Ordering::Release);
+
+    let make_space = |code: &[u8], data: &[u8]| -> Result<Arc<AddressSpace>, &'static str> {
+        let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
+        space.map_eager_with_bytes(TEST_CODE_VA, FRAME_SIZE, Prot::READ | Prot::EXEC, code).map_err(|_| "map code")?;
+        space
+            .map_eager_with_bytes(TEST_STACK_VA, FRAME_SIZE, Prot::READ | Prot::WRITE, &[])
+            .map_err(|_| "map stack")?;
+        space.map_eager_with_bytes(TEST_DATA_VA, FRAME_SIZE, Prot::READ | Prot::WRITE, data).map_err(|_| "map data")?;
+        Ok(space)
+    };
+
+    let space_a = match make_space(&code_a, &data_a) {
+        Ok(s) => s,
+        Err(e) => return ctx.fail(format_args!("usertest: sse_tls space_a: {e}")),
+    };
+    let space_b = match make_space(&code_b, &data_b) {
+        Ok(s) => s,
+        Err(e) => return ctx.fail(format_args!("usertest: sse_tls space_b: {e}")),
+    };
+
+    let (ha, slot_a) =
+        match spawn_ring3_on(target_cpu, "sse-tls-a", space_a, TEST_CODE_VA, TEST_STACK_VA + FRAME_SIZE, None) {
+            Ok(p) => p,
+            Err(e) => return ctx.fail(format_args!("usertest: sse_tls spawn A: {e}")),
+        };
+    let (hb, slot_b) =
+        match spawn_ring3_on(target_cpu, "sse-tls-b", space_b, TEST_CODE_VA, TEST_STACK_VA + FRAME_SIZE, None) {
+            Ok(p) => p,
+            Err(e) => {
+                ha.join();
+                return ctx.fail(format_args!("usertest: sse_tls spawn B: {e}"));
+            }
+        };
+
+    ha.join();
+    hb.join();
+
+    let base = SSE_TLS_SYNC.base_switches.load(Ordering::Acquire);
+    let switches = if base > 0 { sched::switch_count(target_cpu).saturating_sub(base) } else { 0 };
+    let res_a = slot_a.lock().take().expect("sse-tls-a finished without RunResult");
+    let res_b = slot_b.lock().take().expect("sse-tls-b finished without RunResult");
+    drop(slot_a);
+    drop(slot_b);
+
+    let frames_after = frame::free_frames();
+    let leaked_frames = frames_before as i64 - frames_after as i64;
+
+    match (res_a.exit, res_b.exit) {
+        (UserExit::Exited(ea), UserExit::Exited(eb)) => {
+            let _ = writeln!(
+                ctx.out,
+                "usertest: sse_tls cpu={target_cpu} exit_a={ea} exit_b={eb} switches={switches} leaked_frames={leaked_frames}"
+            );
+        }
+        (ea, eb) => {
+            ctx.fail(format_args!(
+                "usertest: sse_tls unexpected exit a={ea:?} b={eb:?} switches={switches} leaked_frames={leaked_frames}"
+            ));
+        }
+    }
+}
+
+/// Shell command: `usertest <ok|iret|pf|ud|gp|bp|db|cve_db|lstar_db|movss_bp|stub_db|noncanon|noncanon-iret|bad_elf|mmap_brk|sse_tls>`.
 pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
-    const USAGE: &str =
-        "usage: usertest <ok|iret|pf|ud|gp|bp|db|cve_db|lstar_db|movss_bp|stub_db|noncanon|noncanon-iret>";
+    const USAGE: &str = "usage: usertest <ok|iret|pf|ud|gp|bp|db|cve_db|lstar_db|movss_bp|stub_db|noncanon|noncanon-iret|bad_elf|mmap_brk|sse_tls>";
     let [kind] = args else {
         return ctx.fail(USAGE);
     };
+    match kind.as_str() {
+        "bad_elf" => return run_bad_elf_tests(ctx),
+        "mmap_brk" => return run_mmap_brk_test(ctx),
+        "sse_tls" => return run_sse_tls_test(ctx),
+        _ => {}
+    }
     let (code, data, dr0_target): (Vec<u8>, &[u8], Option<u64>) = match kind.as_str() {
         "ok" => {
             let (code, data) = program_ok();
@@ -902,22 +1500,27 @@ crate::ktest!(
         kassert_eq!(copy_cstr_from_user(USER_MAX, 16), Err(CopyError::Fault));
         kassert_eq!(copy_cstr_from_user(0xffff_ffff_8000_0000, 16), Err(CopyError::Fault));
 
-        // 3. Live user page table tests exercising `.lumen_fixup` on real `#PF`s.
+        // 3. Live user page table tests exercising `.lumen_fixup` on real `#PF`s
+        //    through a real `AddressSpace` + `UserSpaceGuard`.
+        let _warm: Vec<u8> = vec![0u8; 4096];
+        drop(_warm);
         let free_before = frame::free_frames();
         {
-            let mut space = TempUserSpace::new().ok_or("out of frames for TempUserSpace")?;
+            let space = Arc::new(AddressSpace::new().map_err(|_| "out of frames for AddressSpace")?);
             let rw_va = TEST_DATA_VA;
             let unmapped_va = TEST_DATA_VA + FRAME_SIZE;
             let ro_va = TEST_DATA_VA + 2 * FRAME_SIZE;
 
-            let _rw_frame = space.map_page(rw_va, Attrs::USER_RW).ok_or("map USER_RW")?;
-            let ro_frame = space.map_page(ro_va, Attrs::USER_RO).ok_or("map USER_RO")?;
-            write_frame_bytes(ro_frame, 0, b"readonly-ok\0");
+            space.map_eager_with_bytes(rw_va, FRAME_SIZE, Prot::READ | Prot::WRITE, &[]).map_err(|_| "map USER_RW")?;
+            let mut ro_page = vec![0u8; FRAME_SIZE as usize];
+            ro_page[..12].copy_from_slice(b"readonly-ok\0");
             // Place a NUL-terminated string right at the end of the RO page
             // (next page is unmapped) and an unterminated string right after.
-            write_frame_bytes(ro_frame, FRAME_SIZE as usize - 5, b"edge\0");
+            ro_page[FRAME_SIZE as usize - 5..].copy_from_slice(b"edge\0");
+            space.map_eager_with_bytes(ro_va, FRAME_SIZE, Prot::READ, &ro_page).map_err(|_| "map USER_RO")?;
+            drop(ro_page);
 
-            space.activate();
+            let _active = sched::UserSpaceGuard::enter(space.clone());
 
             // Valid RW copy_to_user + copy_from_user round-trip.
             let payload = b"hello-lumen-uaccess";
@@ -959,6 +1562,9 @@ crate::ktest!(
             // Unterminated bytes running off the RW page into the unmapped page.
             kassert_eq!(copy_to_user(rw_va + FRAME_SIZE - 4, b"ABCD"), Ok(()));
             kassert_eq!(copy_cstr_from_user(rw_va + FRAME_SIZE - 4, 64), Err(CopyError::Fault));
+
+            drop(_active);
+            space.teardown();
         }
 
         // Kernel root restored and zero leaked frames/tables.

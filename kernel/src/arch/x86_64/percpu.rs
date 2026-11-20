@@ -112,7 +112,6 @@ pub fn set_kernel_rsp(rsp: u64) {
 }
 
 /// Read this CPU's ring-0 syscall kernel stack pointer (`PerCpu::kernel_rsp`).
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))]
 #[inline]
 pub fn kernel_rsp() -> u64 {
     CPUS[index()].kernel_rsp.load(Ordering::Relaxed)

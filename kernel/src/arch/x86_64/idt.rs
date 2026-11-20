@@ -718,31 +718,69 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
             }
         }
 
-        // Any synchronous exception originating in ring 3 terminates only the
-        // offending user context, never the kernel. Stop-NMIs (2), `#DF` (8),
+        // 4-step `#PF` interrupt protocol for ring-3 faults AND ring-0
+        // `.lumen_fixup` user-copy faults (ARCHITECTURE.md §5).
+        if vector == 14 {
+            // Step 1: read CR2 while IF = 0; reserved-bit violations (RSVD,
+            // error_code bit 3) always crash the kernel immediately.
+            let cr2 = super::cpu::read_cr2();
+            if (frame.error_code & (1 << 3)) != 0 {
+                crate::crash::exception(frame);
+            }
+            let in_user_range = (crate::user::USER_MIN..crate::user::USER_MAX).contains(&cr2);
+            let fixup_rip = if !from_user && in_user_range { crate::user::lookup_fixup(frame.rip) } else { None };
+
+            if from_user || fixup_rip.is_some() {
+                // Step 2: assert interrupts were enabled (or another CPU disabled
+                // them for good during a crash/reboot) and no SpinLock critical
+                // section is open, then re-enable IRQs so `AddressSpace`'s
+                // sleeping `SleepMutex` can safely block.
+                assert!(
+                    (frame.rflags & (1 << 9)) != 0 || super::irq::disabled_for_good_but_not_here(),
+                    "user/#PF fault with interrupts disabled (rflags {:#x}, rip {:#x}, cr2 {cr2:#x})",
+                    frame.rflags,
+                    frame.rip
+                );
+                assert_eq!(super::irq::depth(), 0, "user/#PF fault inside SpinLock critical section");
+                super::irq::restore(true);
+
+                // Step 3: resolve demand paging in the current thread's
+                // `AddressSpace`. Drop `Arc<AddressSpace>` before step 4 so a
+                // fatal unwind never leaks a reference.
+                let resolved = in_user_range
+                    && crate::sched::current_address_space().is_some_and(|space| {
+                        space.handle_page_fault(cr2, frame.error_code) == crate::mm::user_vm::FaultResult::Resolved
+                    });
+
+                // Step 4: disable interrupts (IF = 0, depth == 0) BEFORE
+                // returning to `lumen_isr_common` (keeping `swapgs; iretq`
+                // atomic), redirecting `.lumen_fixup`, or terminating the
+                // faulting user process.
+                let _ = super::irq::disable();
+                if resolved {
+                    return;
+                }
+                if let Some(target) = fixup_rip {
+                    frame.rip = target;
+                    frame.rflags &= !(1 << 18); // clear RFLAGS.AC
+                    return;
+                }
+                crate::user::handle_user_exception(frame, cr2);
+            }
+
+            // Ring-0 `#PF` outside `.lumen_fixup`: kernel bug.
+            crate::crash::exception(frame);
+        }
+
+        // Any other synchronous exception originating in ring 3 terminates only
+        // the offending user context, never the kernel. Stop-NMIs (2), `#DF` (8),
         // and `#MC` (18) are never user-recoverable and always go to
         // `crash::exception` even if they interrupt ring 3.
         if from_user && !matches!(vector, 2 | 8 | 18) {
             if vector == 1 {
                 super::cpu::write_dr6(0);
             }
-            let cr2 = if vector == 14 { super::cpu::read_cr2() } else { 0 };
-            crate::user::handle_user_exception(frame, cr2);
-        }
-
-        // Ring-0 `#PF` fixup for fault-safe user copies (`.lumen_fixup`).
-        // A reserved-bit violation (`RSVD`, bit 3) always crashes the kernel.
-        if vector == 14 {
-            let cr2 = super::cpu::read_cr2();
-            let rsvd = (frame.error_code & (1 << 3)) != 0;
-            if !rsvd
-                && (crate::user::USER_MIN..crate::user::USER_MAX).contains(&cr2)
-                && let Some(fixup_rip) = crate::user::lookup_fixup(frame.rip)
-            {
-                frame.rip = fixup_rip;
-                frame.rflags &= !(1 << 18); // clear RFLAGS.AC
-                return;
-            }
+            crate::user::handle_user_exception(frame, 0);
         }
 
         // Kernel-mode `#BP` resume (guarded by `!from_user` above).

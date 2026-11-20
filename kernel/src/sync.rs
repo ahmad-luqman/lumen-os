@@ -17,10 +17,12 @@
 //! neither runs again until the second `lock` returns.
 
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch;
+use crate::sched::WaitQueue;
 
 /// A spinlock protecting a `T`, whose word is its owner (a compare-and-swap
 /// takes it). Interrupts are off while it is held (and while waiting for it).
@@ -187,6 +189,121 @@ fn owner_id() -> u32 {
 fn relocked(addr: usize, ty: &str) -> ! {
     let cpu = arch::cpu_index();
     panic!("SpinLock<{ty}> at {addr:#x} re-locked on cpu {cpu}, which already holds it")
+}
+
+/// A sleeping, interrupt-enabled mutex protecting a `T`.
+///
+/// Unlike [`SpinLock`], holding a [`SleepMutex`] keeps interrupts enabled so
+/// callers may block (e.g. demand-paging I/O or cross-CPU shootdowns) and
+/// be preempted by the timer without holding an IRQ-off critical section.
+/// Contended waiters sleep on an internal [`WaitQueue`].
+///
+/// Lock order: never acquire a [`SleepMutex`] while holding a [`SpinLock`] or
+/// with interrupts disabled (`lock()` asserts
+/// `(irq::enabled() || irq::disabled_for_good_but_not_here()) && irq::depth() == 0`).
+pub struct SleepMutex<T> {
+    locked: SpinLock<bool>,
+    waiters: WaitQueue,
+    value: UnsafeCell<T>,
+}
+
+// SAFETY: access to `value` is serialized by `locked`.
+unsafe impl<T: Send> Sync for SleepMutex<T> {}
+// SAFETY: moving the mutex moves `value`; `T: Send` makes that sound.
+unsafe impl<T: Send> Send for SleepMutex<T> {}
+
+impl<T> SleepMutex<T> {
+    pub const fn new(value: T) -> Self {
+        Self { locked: SpinLock::new(false), waiters: WaitQueue::new(), value: UnsafeCell::new(value) }
+    }
+
+    /// Acquire the mutex, sleeping with interrupts enabled if another thread
+    /// currently holds it.
+    ///
+    /// # Panics
+    /// If interrupts are disabled (unless another CPU disabled them for good
+    /// during a crash report or reboot) or a `SpinLock` critical section is
+    /// open (`irq::depth() != 0`).
+    #[track_caller]
+    pub fn lock(&self) -> SleepMutexGuard<'_, T> {
+        assert!(
+            (arch::irq::enabled() || arch::irq::disabled_for_good_but_not_here()) && arch::irq::depth() == 0,
+            "SleepMutex::lock requires interrupts enabled and no SpinLock held"
+        );
+        // Fast path: uncontended acquire without touching the wait queue.
+        {
+            let mut held = self.locked.lock();
+            if !*held {
+                *held = true;
+                return SleepMutexGuard { lock: self, _not_send: PhantomData };
+            }
+        }
+        // Slow path: sleep on `waiters` until we observe `*held == false` and
+        // claim it under the wait queue's lock (lock order: `waiters` -> `locked`;
+        // `Drop` releases `locked` before calling `wake_one()`, preventing AB-BA).
+        self.waiters.wait_until(|| {
+            let mut held = self.locked.lock();
+            if !*held {
+                *held = true;
+                true
+            } else {
+                false
+            }
+        });
+        SleepMutexGuard { lock: self, _not_send: PhantomData }
+    }
+
+    /// Acquire the mutex if it is currently unlocked without sleeping.
+    #[allow(dead_code)] // general synchronization surface
+    pub fn try_lock(&self) -> Option<SleepMutexGuard<'_, T>> {
+        let mut held = self.locked.lock();
+        if *held {
+            return None;
+        }
+        *held = true;
+        Some(SleepMutexGuard { lock: self, _not_send: PhantomData })
+    }
+
+    /// Mutable access to the inner value when the caller has exclusive access
+    /// to the mutex (e.g. inside `Drop`, where taking a sleeping lock may be
+    /// disallowed because interrupts are off).
+    pub fn get_mut(&mut self) -> &mut T {
+        self.value.get_mut()
+    }
+}
+
+/// Guard returned by [`SleepMutex::lock`] / [`SleepMutex::try_lock`].
+/// Interrupts remain enabled while held.
+pub struct SleepMutexGuard<'a, T> {
+    lock: &'a SleepMutex<T>,
+    /// Not `Send`: keeps unlock paired with the acquiring thread.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<T> Deref for SleepMutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: we exclusively hold `self.lock`.
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<T> DerefMut for SleepMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: we exclusively hold `self.lock`.
+        unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl<T> Drop for SleepMutexGuard<'_, T> {
+    fn drop(&mut self) {
+        {
+            let mut held = self.lock.locked.lock();
+            debug_assert!(*held, "SleepMutex unlocked while not held");
+            *held = false;
+        }
+        self.lock.waiters.wake_one();
+    }
 }
 
 crate::ktest!(
@@ -434,6 +551,48 @@ crate::ktest!(
         let stayed_off = !arch::irq::enabled();
         arch::irq::enable();
         kassert!(stayed_off);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn sleep_mutex_keeps_irqs_on_and_wakes_waiter() {
+        use crate::{kassert, kassert_eq};
+        use alloc::sync::Arc;
+        use core::sync::atomic::AtomicBool;
+
+        let mutex = Arc::new(SleepMutex::new(0u64));
+        let entered = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Holding a SleepMutex leaves interrupts ON and irq::depth() == 0.
+        let mut g = mutex.lock();
+        kassert!(arch::irq::enabled());
+        kassert_eq!(arch::irq::depth(), 0);
+        kassert!(mutex.try_lock().is_none());
+        *g = 10;
+
+        let m2 = mutex.clone();
+        let e2 = entered.clone();
+        let d2 = done.clone();
+        let handle = crate::sched::spawn("sleep-mutex-waiter", move || {
+            e2.store(true, Ordering::Release);
+            let mut guard = m2.lock();
+            assert!(arch::irq::enabled() && arch::irq::depth() == 0);
+            *guard += 32;
+            d2.store(true, Ordering::Release);
+        })
+        .map_err(|_| "spawn failed")?;
+
+        // Let the waiter run and block on the mutex while we still hold it.
+        kassert!(crate::sched::yield_until_blocked(core::iter::once(&handle), None));
+        kassert!(entered.load(Ordering::Acquire));
+        kassert!(!done.load(Ordering::Acquire));
+
+        drop(g);
+        handle.join();
+        kassert!(done.load(Ordering::Acquire));
+        kassert_eq!(*mutex.lock(), 42);
         Ok(())
     }
 );

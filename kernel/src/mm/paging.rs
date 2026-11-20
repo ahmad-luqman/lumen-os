@@ -30,12 +30,14 @@
 //! The crash reporter calls [`write_walk`] for a page fault; it takes no lock.
 
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use limine::memory_map::{Entry, EntryType};
 use log::{debug, info};
 pub use lumen_mm::paging::WalkEnd;
 use lumen_mm::paging::{
-    self as pt, Attrs, Cache, ENTRIES, MapError, Mapping, PageSize, TableMemory, TableMemoryMut, UnmapError, Walk,
+    self as pt, Attrs, Cache, ENTRIES, MapError, Mapping, PageSize, ProtectError, TableMemory, TableMemoryMut,
+    UnmapError, Walk,
 };
 use lumen_mm::{FRAME_SIZE, PhysAddr, PhysFrame, VirtAddr, align_down, align_up};
 
@@ -138,6 +140,8 @@ struct Space {
 }
 
 static SPACE: SpinLock<Option<Space>> = SpinLock::new(None);
+/// Lock-free copy of `Space::root`, set once in [`init`] for `sched::schedule`.
+static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 
 /// The memory-map entries the HHDM maps.
 fn hhdm_entries() -> impl Iterator<Item = &'static Entry> {
@@ -340,6 +344,7 @@ pub fn init() {
 
     let tables = pt::for_each_table(&Hhdm, root, |_| {}).expect("the new page tables are readable");
     info!(target: "mem", "paging: kernel page tables active ({tables} tables, root {root})");
+    KERNEL_ROOT.store(root.as_u64(), Ordering::Release);
     *SPACE.lock() = Some(Space { root, next_mmio: MMIO_BASE });
 }
 
@@ -461,9 +466,11 @@ fn with_space<R>(f: impl FnOnce(&mut Space) -> R) -> R {
     f(SPACE.lock().as_mut().expect("page tables used before mm::init"))
 }
 
-/// The root of the kernel's page tables.
+/// The root of the kernel's page tables (lock-free once initialized).
 pub fn kernel_root() -> PhysFrame {
-    with_space(|s| s.root)
+    let raw = KERNEL_ROOT.load(Ordering::Acquire);
+    assert_ne!(raw, 0, "page tables used before mm::init");
+    PhysFrame::from_u64(raw).expect("kernel root is a valid physical frame")
 }
 
 /// Allocate a fresh L4 page-table root for a user address space with the
@@ -489,9 +496,112 @@ pub fn new_user_root() -> Option<PhysFrame> {
 /// half, and `phys` must be an allocated physical frame whose ownership is
 /// transferred to `root` (freed on [`destroy_user_root`] or unmap).
 pub unsafe fn map_user_page(root: PhysFrame, virt: VirtAddr, phys: PhysFrame, attrs: Attrs) -> Result<(), MapError> {
-    debug_assert_ne!(root, kernel_root(), "map_user_page must never mutate kernel_root()");
+    assert_ne!(root, kernel_root(), "map_user_page must never mutate kernel_root()");
     assert!(attrs.user(), "map_user_page requires user-mode attributes");
     pt::map(&mut Hhdm, root, virt, phys, PageSize::Size4K, attrs)
+}
+
+/// Walk `virt` in user hierarchy `root`. Read-only; takes no lock.
+pub fn walk_user(root: PhysFrame, virt: VirtAddr) -> Walk {
+    pt::walk(&Hhdm, root, virt)
+}
+
+/// Update the attributes of an existing user 4 KiB page (present or
+/// `PTE_PROTNONE`) at `virt` in `root`, preserving its physical frame.
+///
+/// # Safety
+/// `root` must be an L4 root allocated by [`new_user_root`] (never
+/// [`kernel_root`]), and the caller must have exclusive write access to its
+/// lower half and flush the TLB if `root` is active and the page was present.
+pub unsafe fn protect_user_page(root: PhysFrame, virt: VirtAddr, attrs: Attrs) -> Result<Mapping, ProtectError> {
+    assert_ne!(root, kernel_root(), "protect_user_page must never mutate kernel_root()");
+    assert!(attrs.user(), "protect_user_page requires user-mode attributes");
+    pt::protect(&mut Hhdm, root, virt, attrs)
+}
+
+/// Unmap every mapped leaf (present or `PTE_PROTNONE`) in lower-half
+/// page-aligned `[start, end)` under `root`, skipping empty subtrees in O(1)
+/// and invoking `on_unmapped(va, phys, was_present)` for each removed leaf.
+///
+/// # Safety
+/// `root` must be an L4 root allocated by [`new_user_root`] (never
+/// [`kernel_root`]), `[start, end)` must be page-aligned and strictly in the
+/// lower half, and the caller must have exclusive write access to `root`'s
+/// lower half and flush the TLB / free each returned physical frame.
+pub unsafe fn unmap_user_range(
+    root: PhysFrame,
+    start: u64,
+    end: u64,
+    mut on_unmapped: impl FnMut(VirtAddr, PhysFrame, bool),
+) {
+    assert_ne!(root, kernel_root(), "unmap_user_range must never mutate kernel_root()");
+    assert!(start.is_multiple_of(FRAME_SIZE) && end.is_multiple_of(FRAME_SIZE) && start <= end);
+    let mut addr = start;
+    while addr < end {
+        let va = VirtAddr::new(addr).expect("lower-half user address is canonical");
+        assert!(va.is_lower_half(), "unmap_user_range called on upper-half {va}");
+        let w = pt::walk(&Hhdm, root, va);
+        match w.end() {
+            WalkEnd::Mapped(_) | WalkEnd::ProtNone(_) => {
+                let m = pt::unmap(&mut Hhdm, root, va).expect("walk just found mapped user leaf");
+                debug_assert_eq!(m.size, PageSize::Size4K);
+                on_unmapped(va, m.phys, m.present);
+                addr += FRAME_SIZE;
+            }
+            WalkEnd::NotPresent(level) => {
+                let span = 1u64 << (12 + 9 * (u32::from(level.number()) - 1));
+                let next = (addr & !(span - 1)).saturating_add(span);
+                addr = next.min(end);
+            }
+            WalkEnd::Unreadable(level, frame) => {
+                panic!("unreadable user page table {frame} at {level:?} for {va}");
+            }
+        }
+    }
+}
+
+/// Update attributes of every already-mapped leaf (present or `PTE_PROTNONE`)
+/// in lower-half page-aligned `[start, end)` under `root` to `attrs` via
+/// `lumen_mm::paging::protect`, preserving physical frames and skipping empty
+/// subtrees in O(1). Invokes `on_protected(va, was_present)` for each leaf.
+///
+/// # Safety
+/// `root` must be an L4 root allocated by [`new_user_root`] (never
+/// [`kernel_root`]), `[start, end)` must be page-aligned and strictly in the
+/// lower half, and the caller must have exclusive write access to `root`'s
+/// lower half and flush the TLB if `root` is active.
+pub unsafe fn protect_user_range(
+    root: PhysFrame,
+    start: u64,
+    end: u64,
+    attrs: Attrs,
+    mut on_protected: impl FnMut(VirtAddr, bool),
+) {
+    assert_ne!(root, kernel_root(), "protect_user_range must never mutate kernel_root()");
+    assert!(attrs.user(), "protect_user_range requires user-mode attributes");
+    assert!(start.is_multiple_of(FRAME_SIZE) && end.is_multiple_of(FRAME_SIZE) && start <= end);
+    let mut addr = start;
+    while addr < end {
+        let va = VirtAddr::new(addr).expect("lower-half user address is canonical");
+        assert!(va.is_lower_half(), "protect_user_range called on upper-half {va}");
+        let w = pt::walk(&Hhdm, root, va);
+        match w.end() {
+            WalkEnd::Mapped(_) | WalkEnd::ProtNone(_) => {
+                let prev = pt::protect(&mut Hhdm, root, va, attrs).expect("walk just found mapped user leaf");
+                debug_assert_eq!(prev.size, PageSize::Size4K);
+                on_protected(va, prev.present);
+                addr += FRAME_SIZE;
+            }
+            WalkEnd::NotPresent(level) => {
+                let span = 1u64 << (12 + 9 * (u32::from(level.number()) - 1));
+                let next = (addr & !(span - 1)).saturating_add(span);
+                addr = next.min(end);
+            }
+            WalkEnd::Unreadable(level, frame) => {
+                panic!("unreadable user page table {frame} at {level:?} for {va}");
+            }
+        }
+    }
 }
 
 /// Recursively free all lower-half leaf frames (present or `PTE_PROTNONE`) and
@@ -522,6 +632,34 @@ unsafe fn free_user_subtree(table: PhysFrame, level: pt::Level) {
     }
 }
 
+/// Free all lower-half (`L4[0..256]`) leaf frames (present and `PTE_PROTNONE`)
+/// and intermediate L3/L2/L1 tables under `root` and zero `L4[0..256]`, keeping
+/// `root` itself allocated (and leaving kernel `L4[256..512]` untouched).
+///
+/// # Safety
+/// `root` must not be loaded in `CR3` on any CPU, and every lower-half leaf
+/// and intermediate table under `root` must be exclusively owned by this
+/// address space.
+pub unsafe fn clear_user_lower_half(root: PhysFrame) {
+    assert_ne!(root, kernel_root(), "clear_user_lower_half must never mutate kernel_root()");
+    assert_ne!(hw::active_root(), root, "cannot clear active CR3 root {root}");
+    for index in 0..(ENTRIES / 2) {
+        let Some(raw) = Hhdm.read(root, index) else {
+            continue;
+        };
+        let entry = pt::Entry::from_raw(raw);
+        if entry.is_present() && !entry.is_leaf(pt::Level::L4) {
+            let child = entry.table();
+            Hhdm.write(root, index, 0);
+            // SAFETY: lower-half L3 subtree belongs exclusively to `root`.
+            unsafe {
+                free_user_subtree(child, pt::Level::L3);
+                frame::free(child).expect("freeing owned user L3 table frame");
+            }
+        }
+    }
+}
+
 /// Tear down a user L4 root created by [`new_user_root`]: frees all lower-half
 /// leaf frames, all lower-half L3/L2/L1 page-table frames, and `root` itself,
 /// without modifying the shared kernel upper half (`L4[256..512]`).
@@ -530,21 +668,8 @@ unsafe fn free_user_subtree(table: PhysFrame, level: pt::Level) {
 /// `root` must not be loaded in `CR3` on any CPU, and every lower-half leaf
 /// mapped in `root` must be exclusively owned by this address space.
 pub unsafe fn destroy_user_root(root: PhysFrame) {
-    assert_ne!(hw::active_root(), root, "cannot destroy active CR3 root {root}");
-    for index in 0..(ENTRIES / 2) {
-        let Some(raw) = Hhdm.read(root, index) else {
-            continue;
-        };
-        let entry = pt::Entry::from_raw(raw);
-        if entry.is_present() && !entry.is_leaf(pt::Level::L4) {
-            let child = entry.table();
-            // SAFETY: lower-half L3 subtree belongs exclusively to `root`.
-            unsafe {
-                free_user_subtree(child, pt::Level::L3);
-                frame::free(child).expect("freeing owned user L3 table frame");
-            }
-        }
-    }
+    // SAFETY: upheld by the caller.
+    unsafe { clear_user_lower_half(root) };
     // SAFETY: `root` is no longer active in CR3 and was allocated by `new_user_root`.
     unsafe { frame::free(root) }.expect("freeing owned user L4 root frame");
 }

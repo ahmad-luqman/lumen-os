@@ -125,3 +125,55 @@ def test_non_canonical_sysret_does_not_crash_kernel(boot):
     m.expect(r"lumen> ", 10)
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_bad_elf_rejected(boot):
+    """Malformed, W+X, overlapping, kernel-half, PT_INTERP, W+X-shared-page,
+    and stack-overlapping ELF64 images are rejected cleanly with zero leaked
+    physical frames or heap."""
+    m = boot_shell(boot)
+
+    m.send_line("usertest bad_elf")
+    m.expect(r"usertest: bad_elf rejected=7 leaked_frames=0 leaked_heap=0\n", 15)
+    m.expect(r"lumen> ", 10)
+
+    assert CRASH_BEGIN not in m.output
+    m.send_line("usertest ok")
+    m.expect(r'usertest: exit=42 stdout="hello from ring3"\n', 15)
+    m.expect(r"lumen> ", 10)
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_mmap_and_brk(boot):
+    """Ring-3 ELF64 program executes lazy anonymous mmap (#PF zero-fill),
+    mprotect(PROT_NONE) -> mprotect(RW) preserving frames/data, byte-granular
+    brk growth/shrink/failure, and munmap with zero leaked frames."""
+    m = boot_shell(boot)
+
+    m.send_line("usertest mmap_brk")
+    m.expect(r"usertest: mmap_brk exit=0 leaked_frames=0\n", 20)
+    m.expect(r"lumen> ", 10)
+
+    assert CRASH_BEGIN not in m.output
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_sse_and_tls_preserved_across_preemption(boot):
+    """Two concurrent user processes pinned to the same CPU hold distinct
+    xmm0-xmm7 patterns and distinct IA32_FS_BASE TLS pointers across multiple
+    real timer-driven scheduler switches with zero corruption or frame leaks."""
+    m = boot_shell(boot)
+
+    m.send_line("usertest sse_tls")
+    line = m.expect(
+        r"usertest: sse_tls cpu=\d+ exit_a=0 exit_b=0 switches=(\d+) leaked_frames=0\n",
+        30,
+    )
+    m.expect(r"lumen> ", 10)
+    assert int(line.group(1)) >= 6, f"expected >= 6 preemptive switches, got {line.group(0)}"
+
+    assert CRASH_BEGIN not in m.output
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
