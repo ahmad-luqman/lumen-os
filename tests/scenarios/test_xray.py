@@ -267,10 +267,20 @@ def test_xray_matches_the_scheduler(boot):
     wait_gone(m, app_id, record["thread"])
 
 
+# COM1 interrupts raised while X-ray is paused: well past what typing the
+# commands between the ring's number and X-ray's first read can raise.
+PAUSED_IRQS = 100
+
+
 def test_xray_pause_stops_its_reads(boot):
     # Paused, X-ray reads nothing (no period: the window settles), so its
     # label stays where it was while the queue it shows grows; resumed, it
-    # reads on and catches up with the scheduler.
+    # reads on and catches up with the scheduler. What piled up while it
+    # was paused is a backlog, not counted: COM1 interrupts are raised on
+    # CPU 0 while it is paused, CPU 0's X-ray ring's next number is taken
+    # before Resume, and once resumed and paused again the interrupts it
+    # counted are at most the ring's `irq` events from that number on (none
+    # gone). Counting the backlog would add the PAUSED_IRQS raised before it.
     m = desktop(boot, "-smp", "2")
     app_id, mark, wid, record = start_xray(m)
     # Until X-ray has read CPU 1 (its switches known: only a read sets
@@ -293,7 +303,18 @@ def test_xray_pause_stops_its_reads(boot):
     paused = below_root(gui.ui_tree(m, wid))
     assert label(paused, "cpu 1 runq") == before, paused
     assert label(paused, "State") == "paused", paused
-    gui.press_animated(
+    irqs_before = int(label(paused, "cpu 0 irqs"))
+    first = com1_interrupts(m)
+    gui.wait_for(
+        m,
+        f"{PAUSED_IRQS} COM1 interrupts",
+        lambda: com1_interrupts(m),
+        lambda n: n >= first + PAUSED_IRQS,
+        120,
+    )
+    _, summary = xray(m)
+    resumed_at = int(summary[4])
+    rows = gui.press_animated(
         m,
         paused,
         "Resume",
@@ -302,6 +323,14 @@ def test_xray_pause_stops_its_reads(boot):
         wid,
         60,
     )
+    rows = counted_refreshes(m, wid, below_root(rows), 2)
+    rows = gui.press_animated(
+        m, rows, "Pause", "paused again", lambda r: label(r, "State") == "paused", wid
+    )
+    gui.wait_settled(m)
+    grew = int(label(below_root(gui.ui_tree(m, wid)), "cpu 0 irqs")) - irqs_before
+    held = irq_events_since(m, resumed_at)
+    assert grew <= held, (grew, held)
     stop_spinning(m, SPIN, cpu)
     gui.close_window(m, "X-ray")
     end_line(m, mark, "xray", app_id, "exited with 0")
