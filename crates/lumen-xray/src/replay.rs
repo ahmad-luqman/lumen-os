@@ -26,46 +26,60 @@ const CPU0_THREADS: [u64; 4] = [3, 7, 11, 15];
 /// The threads taking turns on CPU 2.
 const CPU2_THREADS: [u64; 3] = [21, 22, 23];
 
-/// One ring's events, numbered on from its last.
+/// One ring of one CPU: its events since the last read, numbered on from
+/// its last.
 struct Ring {
+    cpu: u16,
+    stream: Stream,
     next: u64,
+    /// What its next read counts missed.
+    missed: u64,
     events: Vec<Event>,
 }
 
 impl Ring {
-    fn new(first: u64) -> Ring {
-        Ring { next: first, events: Vec::new() }
+    /// CPU `cpu`'s ring `stream`, its first `gone` numbers already gone
+    /// (counted missed by its first read).
+    fn new(cpu: u16, stream: Stream, gone: u64) -> Ring {
+        Ring { cpu, stream, next: gone, missed: gone, events: Vec::new() }
     }
 
-    fn push(&mut self, cpu: u16, kind: u16, args: [u64; 4]) {
-        self.events.push(Event { seq: self.next, tsc: self.next * 1000, cpu, kind, pid: 0, args });
+    fn push(&mut self, kind: u16, args: [u64; 4]) {
+        self.events.push(Event { seq: self.next, tsc: self.next * 1000, cpu: self.cpu, kind, pid: 0, args });
         self.next += 1;
     }
 
-    fn runq(&mut self, cpu: u16, len: u64, thread: u64, op: RunQueueOp) {
-        self.push(cpu, kind::RUN_QUEUE, RunQueue { cpu, len, thread, op }.args());
+    fn runq(&mut self, len: u64, thread: u64, op: RunQueueOp) {
+        self.push(kind::RUN_QUEUE, RunQueue { cpu: self.cpu, len, thread, op }.args());
     }
 
-    fn switch(&mut self, cpu: u16, from: u64, to: u64) {
-        self.push(cpu, kind::SWITCH, Switch { from, to, state: ThreadState::Ready }.args());
+    fn switch(&mut self, from: u64, to: u64) {
+        self.push(kind::SWITCH, Switch { from, to, state: ThreadState::Ready }.args());
     }
 
-    fn irqs(&mut self, cpu: u16, n: u32) {
+    fn irqs(&mut self, n: u32) {
         for _ in 0..n {
-            self.push(cpu, kind::IRQ, Irq { vector: 0x54, rip: 0xffff_ffff_8000_1000 }.args());
+            self.push(kind::IRQ, Irq { vector: 0x54, rip: 0xffff_ffff_8000_1000 }.args());
         }
     }
 
-    fn locks(&mut self, cpu: u16, n: u32) {
+    fn locks(&mut self, n: u32) {
         for _ in 0..n {
-            self.push(cpu, kind::LOCK_WAIT, LockWait { lock: 0x2000, spins: 12, waited: 900, line: 77 }.args());
+            self.push(kind::LOCK_WAIT, LockWait { lock: 0x2000, spins: 12, waited: 900, line: 77 }.args());
         }
     }
 
-    /// The events since the last take, and the `next` a read of them says.
-    fn take(&mut self) -> (u64, Vec<Event>) {
-        (self.next, core::mem::take(&mut self.events))
+    /// The events since the last read, read into `v` as `trace_read`
+    /// would hand them over.
+    fn read_into(&mut self, v: &mut View) {
+        let events = core::mem::take(&mut self.events);
+        v.read(usize::from(self.cpu), self.stream, self.next, core::mem::take(&mut self.missed), &events);
     }
+}
+
+/// Switch `i` among `threads` taking turns: from the one running to the next.
+fn turn(threads: &[u64], i: usize) -> (u64, u64) {
+    (threads[i % threads.len()], threads[(i + 1) % threads.len()])
 }
 
 /// CPU 0's run-queue length in column `k`: 0 to 4 and back, every 16.
@@ -74,58 +88,43 @@ fn cpu0_len(k: usize) -> u64 {
     if p < 8 { p / 2 } else { (16 - p) / 2 }
 }
 
+/// CPU 0's interrupts in column `k`: 3 every 5 columns, else 1 every 3.
+fn cpu0_irqs(k: usize) -> u32 {
+    if k.is_multiple_of(5) { 3 } else { u32::from(k.is_multiple_of(3)) }
+}
+
 /// The view the fixed trace gives once every column is read.
 pub fn view() -> View {
     let mut v = View::new(CPUS);
-    let (mut main0, mut xray0) = (Ring::new(0), Ring::new(0));
-    // CPU 2's X-ray ring starts past 12 numbers already gone.
-    let (mut main2, mut xray2) = (Ring::new(0), Ring::new(12));
-    let mut missed2 = 12;
-    let mut thread0 = CPU0_THREADS[0];
-    let mut thread2 = CPU2_THREADS[0];
+    let (mut main0, mut xray0) = (Ring::new(0, Stream::Main, 0), Ring::new(0, Stream::Xray, 0));
+    let (mut main2, mut xray2) = (Ring::new(2, Stream::Main, 0), Ring::new(2, Stream::Xray, 12));
     for k in 0..COLUMNS {
         // CPU 0.
         let len = cpu0_len(k);
-        if k == 0 || len != cpu0_len(k - 1) {
-            let op = if k > 0 && len < cpu0_len(k - 1) { RunQueueOp::Dequeue } else { RunQueueOp::Enqueue };
-            xray0.runq(0, len, 40 + k as u64, op);
+        let before = k.checked_sub(1).map(cpu0_len);
+        if before != Some(len) {
+            let op = if before.is_some_and(|b| len < b) { RunQueueOp::Dequeue } else { RunQueueOp::Enqueue };
+            xray0.runq(len, 40 + k as u64, op);
         }
-        for s in 0..2 {
-            let to = CPU0_THREADS[(2 * k + s + 1) % CPU0_THREADS.len()];
-            main0.switch(0, thread0, to);
-            thread0 = to;
+        for i in 2 * k..2 * k + 2 {
+            let (from, to) = turn(&CPU0_THREADS, i);
+            main0.switch(from, to);
         }
-        xray0.irqs(
-            0,
-            if k % 5 == 0 {
-                3
-            } else if k % 3 == 0 {
-                1
-            } else {
-                0
-            },
-        );
-        xray0.locks(0, u32::from(k % 13 == 7));
+        xray0.irqs(cpu0_irqs(k));
+        xray0.locks(u32::from(k % 13 == 7));
         // CPU 2: each turn, the thread running goes back on the queue and
         // the next comes off it.
-        for _ in 0..2 {
-            let to = CPU2_THREADS[(CPU2_THREADS.iter().position(|&t| t == thread2).unwrap_or(0) + 1) % 3];
-            xray2.runq(2, 3, thread2, RunQueueOp::Enqueue);
-            xray2.runq(2, 2, to, RunQueueOp::Dequeue);
-            main2.switch(2, thread2, to);
-            thread2 = to;
+        for i in 2 * k..2 * k + 2 {
+            let (from, to) = turn(&CPU2_THREADS, i);
+            xray2.runq(3, from, RunQueueOp::Enqueue);
+            xray2.runq(2, to, RunQueueOp::Dequeue);
+            main2.switch(from, to);
         }
-        xray2.irqs(2, if k % 7 == 0 { 2 } else { 0 });
-        xray2.locks(2, if k == 40 { 2 } else { 0 });
+        xray2.irqs(if k % 7 == 0 { 2 } else { 0 });
+        xray2.locks(if k == 40 { 2 } else { 0 });
 
-        for (cpu, stream, ring, missed) in [
-            (0, Stream::Main, &mut main0, 0),
-            (0, Stream::Xray, &mut xray0, 0),
-            (2, Stream::Main, &mut main2, 0),
-            (2, Stream::Xray, &mut xray2, core::mem::take(&mut missed2)),
-        ] {
-            let (next, events) = ring.take();
-            v.read(cpu, stream, next, missed, &events);
+        for ring in [&mut main0, &mut xray0, &mut main2, &mut xray2] {
+            ring.read_into(&mut v);
         }
         v.offline(1);
         v.end_column();
