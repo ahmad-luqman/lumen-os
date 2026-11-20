@@ -5,8 +5,15 @@
 //! angle, a point at a radius and angle, and the pixels of a straight line.
 //!
 //! Angles are **steps**: half-degrees clockwise from 12 o'clock, `0..STEPS`.
+//!
+//! [`face`] is the clock's window as a `lumen_ui::App`: its drawing and its
+//! damage, checked against full repaints.
 
 #![no_std]
+
+extern crate alloc;
+
+pub mod face;
 
 use core::fmt;
 

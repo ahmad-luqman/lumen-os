@@ -71,6 +71,10 @@ version = "0.0.1"
 [[package]]
 name = "lumen-clock"
 version = "0.0.1"
+dependencies = [
+ "lumen-gfx",
+ "lumen-ui",
+]
 
 [[package]]
 name = "lumen-gfx"

@@ -1,6 +1,6 @@
 [package]
 name = "clock"
-description = "The clock (#200): an analog face and the digital time from the RTC, on the SDK's tick loop; the time a label in its automation tree. `run clock --at HH:MM[:SS]` freezes it. Its geometry and time of day are lumen-clock's (host-tested)."
+description = "The clock (#200): lumen-clock's window (an analog face above the time as a label, host-tested) wired to the RTC and the SDK's tick loop. `run clock --at H[H]:MM[:SS]` freezes it."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
