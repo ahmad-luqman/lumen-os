@@ -18,8 +18,9 @@
 //! - **Ticks:** flying, it steps every [`period`] (faster each level);
 //!   `Step` switches to stepping, a step per press with no ticks at all (so
 //!   the desktop settles between presses: goldens and the tree don't depend
-//!   on the host's speed), and `Play` back to flying. Over, it waits for
-//!   `Restart`.
+//!   on the host's speed), and `Play` back to flying. Over, `Play` and
+//!   `Step` are disabled until `Restart`, which starts the next game in the
+//!   mode it was launched in (stepping with `--step`, else flying).
 //! - **Keys:** the arrows turn it (taken before the toolkit, which never
 //!   sees them).
 //! - **`run comet [--seed N] [--step]`:** a seed plays the same sky every
@@ -92,7 +93,10 @@ struct Comet {
     game: Game,
     seed: Option<u64>,
     time: Time,
+    /// Stepping (one step per Step press) or flying; and how it was
+    /// launched, which each Restart starts again.
     stepping: bool,
+    launched_stepping: bool,
     score: Widget,
     level: Widget,
     state: Widget,
@@ -120,6 +124,7 @@ impl Comet {
             seed: args.seed,
             time,
             stepping: args.stepping,
+            launched_stepping: args.stepping,
             score,
             level,
             state,
@@ -143,6 +148,11 @@ impl Comet {
         self.ui.set_text(self.level, &level);
         self.ui.set_text(self.state, state);
         self.ui.set_text(self.comet, &at);
+        // Over, Play and Step would change nothing: disabled, so `ui invoke`
+        // says why, until Restart.
+        let over = g.state() != State::Flying;
+        self.ui.set_disabled(self.play, over);
+        self.ui.set_disabled(self.step, over);
     }
 
     /// One step of the game: the cells it changed to redraw, the labels.
@@ -152,8 +162,11 @@ impl Comet {
         self.show();
     }
 
+    /// A new game, in the mode it was launched in (stepping with
+    /// `--step`): a mode chosen in the last game doesn't carry over.
     fn restart(&mut self) {
         self.game = new_game(self.time, self.seed);
+        self.stepping = self.launched_stepping;
         self.drawn.push(FRAMED);
         self.show();
     }
@@ -227,6 +240,11 @@ impl App for Comet {
     fn apply(&mut self, events: &[UiEvent]) -> Then {
         for e in events {
             match *e {
+                UiEvent::Pressed(w) if w == self.restart => self.restart(),
+                // Over, Play and Step change nothing (they are disabled
+                // then, but a press already queued may come): it waits for
+                // Restart.
+                _ if self.game.state() != State::Flying => {}
                 UiEvent::Pressed(w) if w == self.play => {
                     self.stepping = false;
                     self.show();
@@ -235,7 +253,6 @@ impl App for Comet {
                     self.stepping = true;
                     self.advance();
                 }
-                UiEvent::Pressed(w) if w == self.restart => self.restart(),
                 _ => {}
             }
         }

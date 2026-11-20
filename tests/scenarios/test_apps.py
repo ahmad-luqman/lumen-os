@@ -652,10 +652,11 @@ def test_snake_tree_and_steps(boot):
     # Step press one step, the head's cell and the score following (the
     # seed's first grain eaten after COMET_DUST_AHEAD steps); an arrow typed
     # through confirmed steps turns it; Restart plays the seed's sky again;
-    # straight on it flies into the edge (`over: edge`), after which Step
-    # and Play change nothing; flying (Play), it steps by itself until the
-    # same edge ends it, and the desktop settles once it has; its close ends
-    # it with 0. Arguments it doesn't take: an ERROR naming them, exit 2.
+    # straight on it flies into the edge (`over: edge`), after which Play and
+    # Step are disabled; Restart steps again (as launched); flying (Play),
+    # it steps by itself until the same edge ends it, and the desktop
+    # settles once it has; its close ends it with 0. Arguments it doesn't
+    # take: an ERROR naming them, exit 2.
     m = boot_desktop(boot)
     app_id, mark = start(m, f"comet --seed {COMET_SEED} --step")
     wid, rows = comet_tree(m)
@@ -701,23 +702,31 @@ def test_snake_tree_and_steps(boot):
     step_comet(m, rows, 1)
     over = comet_labels(m, wid)
     assert over["State"] == "over: edge", over
-    # Over: Step and Play change nothing (no ticks: it settles).
-    gui.press_buttons(m, rows, "Step", "Play")
+    # Over: Play and Step are disabled (they would change nothing), `ui
+    # invoke` saying so, and nothing changes; with no ticks it settles.
+    rows = below_root(gui.ui_tree(m, wid))
+    for name in ("Play", "Step"):
+        button = gui.node(rows, "button", name)
+        assert "disabled" in button["state"], button
+        got = gui.invoke(m, button["id"], "press")
+        assert got.message == "ui invoke: the node is disabled", (name, got)
     gui.wait_settled(m)
     assert comet_labels(m, wid) == over
 
-    # Flying: Restart, then Play; it steps by itself (the head moving: a
-    # confirmed effect, never a time) until the same edge ends it.
+    # Restart starts the next game as it was launched: stepping (the mode
+    # doesn't carry over), on the seed's sky. Then Play: it flies by itself
+    # (`stepping` gone from the State label, which stays gone: "flying" lasts
+    # only a few guest seconds), until the same edge ends it.
     gui.press_buttons(m, rows, "Restart")
+    rows = below_root(gui.ui_tree(m, wid))
+    assert gui.node(rows, "label", "State")["value"] == "stepping", rows
     rows = gui.press_animated(
-        m, rows, "Play", "flying", lambda r: gui.node(r, "label", "State")["value"] == "flying", wid
-    )
-    gui.wait_ui(
         m,
-        "the comet moving by itself",
-        lambda r: gui.node(r, "label", "Comet")["value"] != comet_at(x, y),
+        rows,
+        "Play",
+        "Play's effect",
+        lambda r: gui.node(r, "label", "State")["value"] != "stepping",
         wid,
-        30,
     )
     gui.wait_ui(
         m,
