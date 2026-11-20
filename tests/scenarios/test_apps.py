@@ -1248,6 +1248,20 @@ def test_life_refuses_arguments_it_doesnt_take(boot):
     run(m, "apps", allow=allow)
 
 
+def test_life_without_a_window_ends_with_its_own_error(boot):
+    # An app the launcher starts is answered before its window is opened
+    # (section 8's launcher): one that then can't open it ends by its own
+    # ERROR and end line, not the item's failure. Here, with no desktop,
+    # `run life` starts it, then its window is refused: one ERROR naming
+    # the step and the error, then exit 1.
+    m = boot_shell(boot)
+    allow = r"ERROR app: life: no window: "
+    app_id, mark = start(m, "life", allow=allow)
+    wait_for_output(m, mark, r"ERROR app: life: no window: Unavailable\n", 30)
+    end_line(m, mark, "life", app_id, "exited with 1")
+    run(m, "apps", allow=allow)
+
+
 def test_life_golden(boot, artifacts, golden_dir):
     # `run life --stopped glider`: the glider, stopped (no period, so the
     # window settles, and it spends no fuel). Acorn chosen in its list
