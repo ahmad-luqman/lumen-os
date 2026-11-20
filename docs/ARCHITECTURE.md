@@ -3759,41 +3759,89 @@ SSE); #197 checks the results' bits.
   read).
 - **What the SDK PR adds (the tick loop, before wave 3):** no host call
   changes; `window_wait`'s deadline and `animating` carry it.
-  - `Toolkit::run_with`'s `take` returns `ui::Taken`: `Pass` (the tree
-    gets the event), `Took` (the app acted on it: a game's arrows, the
-    calculator's keys; the window refreshed) or `Quit` (the loop returns as
-    for `Close`, and the dropped `Window` closes the window). Only input
-    is offered (`Event::offered_to_app`, exhaustive): a `Request`, `Close`
-    or `Theme` always reaches the toolkit, so a request is always answered
-    and a close always ends the loop, whatever the app takes.
-  - `Toolkit::run_until(time, take)` for an app that is `ui::Ticking`
-    (`period()`, asked before every wait: `None` waits for events only, so
-    the desktop can settle; `animating()`, the wait's flag while ticking,
-    yes by default; `tick(now) -> Flow`, `Carry` or `Quit`). Each turn it
-    handles every event waiting first, then, once the first `Theme` has
-    come, takes a due tick and refreshes, else waits until the deadline.
-    The pacing is `lumen_ui::Pacer` (host-tested): a period appearing or
-    changing starts one period from now; after a tick the next is one
-    period on, or one period after the tick if that is past, so a stalled
-    app ticks once, never a burst.
-  - Custom drawing: `lumen_ui::App::paint_over` is handed an `Over`
-    (the surface, the window's text and palette, and the rectangles being
-    repainted, the whole surface on a full repaint), and the new
-    `App::take_drawn` reports what the app's own drawing changed.
-    `lumen_ui::repaint` repaints the tree only where those rectangles meet
-    its area, calls `paint_over` whenever anything is repainted, and
-    commits both; the tree's `changed` alone decides a publish, so a frame
-    of the app's own never republishes an unchanged tree. That is the
-    SDK's one frame path, `Toolkit::refresh`. `Toolkit::with_area` lays the
-    tree out in part of the client (the rest is the app's, painted only by
-    `paint_over`); `Toolkit::palette()`; `lumen_app::gfx` re-exports
-    `lumen-gfx`.
-  - The harness: `gui.press_animated` presses in a window that may be
-    animating and confirms by the tree (`wait_ui`), never by
-    `wait_settled`, and `gui.invoke(..., animating=True)` retries a held
-    slot instead of waiting for the desktop to settle, which it never does
-    while a window animates.
-  - `test-window`'s `tick` mode exercises it.
+  - **Who gets an event:** `Event::offer` (exhaustive) says. Input is
+    `Offer::App`: offered to the app's `take` first. The focus coming or
+    going and `Lost` are `Offer::Notify`: offered to `take`, then always
+    handed to the toolkit, which cancels a press and moves the focus,
+    unless `take` quits. A `Request`, `Close` or `Theme` is
+    `Offer::Toolkit` and never reaches `take`. So a request is always
+    answered, a close always ends the loop and the palette always follows
+    the theme, whatever an app takes.
+  - **`Toolkit::run_with(take)`:** `take` returns `ui::Taken`. `Pass`
+    hands the event to the tree. `Took` means the app acted on it (a
+    game's arrows, the calculator's keys), and the window is refreshed.
+    `Quit` stops the loop.
+  - **`Toolkit::run_until(time, take)`** runs an app that is `ui::Ticking`:
+    - `period()` is asked before every wait, and `None` waits for events
+      only, so the desktop can settle;
+    - `animating()` is the wait's flag while ticking (yes by default);
+    - `tick(now)` returns a `Flow`: `Carry` or `Quit`.
+
+    Each turn handles every event waiting first. Then, once a `Theme` has
+    come (the `Toolkit` remembers, through any loop or `step`), it takes a
+    due tick and refreshes, else waits until the deadline.
+  - **How a loop ends:** both loops return `ui::Ended`, `Closed` or `Quit`.
+    The window stays open until the caller drops the `Toolkit`, which owns
+    the `Window`; a request still queued then is answered "window closed".
+    A failed host call ends a loop with its error, logged first as one
+    ERROR naming the stage (`ui: run_until: wait: <e>`).
+  - **Pacing** is `lumen_ui::Pacer`, through one call, `poll(period, now) ->
+    Pace { Due, Until, Idle }`, and `ticked(after)` once the tick's work is
+    done (all host-tested):
+    - a period below `MIN_PERIOD_NS` (10 ms) is taken as that;
+    - due is decided on the schedule as it stands, before a changed period
+      moves it;
+    - a changed period not yet due takes the earlier of the old deadline
+      and one new period from now, so a shorter period takes effect at
+      once and a longer one after the next tick, and a period that changes
+      on every ask (a clock's "until the next second") still ticks at its
+      boundary;
+    - a tick is due once; the next is a period after it was found due, or
+      a period after its work if that ran past.
+
+    So ticks are always at least a period apart and never burst to catch
+    up. The next tick counts from when a tick was found due, not from its
+    deadline: a period asked at that moment is measured from then, and
+    counting it from an earlier deadline would tick early. A steady period
+    therefore drifts late by each tick's lateness.
+  - **Custom drawing:** `lumen_ui::App::paint_over` is handed an `Over`:
+    the surface, the window's text and palette, and the rectangles being
+    repainted. `App::take_drawn` reports the rectangles the app's drawing
+    will now paint differently from what is shown. `lumen_ui::repaint`
+    then:
+    - merges the tree's damage and the app's through a `lumen_gfx::Damage`
+      (a commit pays by the pixel, so an overlap is painted and paid once;
+      a bounding box past `REPAINT_RECTS`);
+    - gives every rectangle the tree's paint first (its background, and
+      the widgets reaching it), inside the tree's area or not, whether the
+      repaint is full or partial;
+    - calls `paint_over`, which draws only its foreground (Life's cells, a
+      clock's hands);
+    - commits.
+
+    What is drawn outside the rectangles shows only at a later commit
+    covering it, and text drawn there is still charged by the character.
+    The tree's `changed` alone decides a publish, so a frame of the app's
+    own never republishes an unchanged tree. That is the SDK's one frame
+    path, `Toolkit::refresh`.
+  - **Layout:** `Toolkit::with_area` lays the tree out in part of the
+    client (`BadArgument` if none of it is on the client); the rest is the
+    app's. Labels that change on every tick should be `fixed_label`s: a
+    label changing width moves the widgets after it, repainting and
+    committing the whole window.
+  - **Also new:** `Toolkit::palette()` (all zero before the first `Theme`).
+    `lumen_app::gfx` re-exports `lumen-gfx`: its `Rect` is for drawing and
+    damage, and the root `lumen_app::Rect` is the wire layout's.
+  - **The harness:**
+    - `gui.press_animated` presses in a window that may be animating
+      (through `gui.press_button`, as `press_buttons` does) and confirms
+      by the tree (`wait_ui`, its predicate false before the press), never
+      by `wait_settled`;
+    - `gui.invoke(..., animating=True)` retries a held slot instead of
+      waiting for the desktop to settle, which it never does while a
+      window animates; it fails `INVOKE_HELD_TIMEOUT` seconds after the
+      first held answer.
+  - **`test-window tick [greedy|quit]`** exercises it.
 - **The launcher** (#157's taskbar) lists the bundled apps whose
   manifest lists `desktop`, never the test apps, after its four demo
   items, by name, and starts one through `run`'s path without waiting
@@ -5049,7 +5097,8 @@ close, and the demos in windows of their own. All of it is built with
   rectangles of the widgets whose look changed, focus rings included;
   `paint_in(clip)` paints exactly what `paint` does there; a randomized
   host test repaints only the damage against a full repaint). The kernel's
-  `Toolkit::refresh` commits only those rectangles; `Toolkit::frame` (an
+  `Toolkit::refresh` commits only those rectangles, and the app's own
+  (`take_drawn`; none for the kernel's apps); `Toolkit::frame` (an
   animation) commits everything; the palette is made from each theme by
   the function handed to `Toolkit::with_palette(.., choose)`
   (`ui::palette` for `Toolkit::new`, `ui::taskbar_palette` for the

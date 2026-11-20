@@ -391,7 +391,8 @@ own PR that updates that doc first.
   handler, `App` (`ui_mut`, `apply`, `paint_over` handed an `Over`: surface, text, palette, the rects
   repainted; `take_drawn`: the app's own damage), `serve` (a request run on an app, what to answer)
   and `repaint` (lay out, paint only what changed, the app's own damage too, publishing only for the
-  tree: the kernel's toolkit and an app's share it, #207), `Pacer` (an animated window's next tick),
+  tree: the kernel's toolkit and an app's share it, #207; overlaps merged, every rect given the
+  tree's paint first), `Pacer` (an animated window's next tick: `poll`, `ticked`, `MIN_PERIOD_NS`),
   `Reply` (`ui invoke`'s reply slot, its state private: pending, running,
   cancelled, done, taken) and `counter` (the demo app's logic)
   (host-tested).
@@ -530,8 +531,9 @@ own PR that updates that doc first.
   `testkit`); `template`, the app `make app NAME=` copies
   (`tools/new-app.sh`); `calculator` (#207, the first app on the SDK's
   `ui::Toolkit`, lumen-ui inside the app); the SDK's loops (`run_with`'s
-  `Taken`, `run_until` for a `Ticking` app, `with_area`, `palette`) for the
-  animated apps; the layout, the SDK, the
+  `Taken`, `run_until` for a `Ticking` app, both returning `Ended`;
+  `Event::offer`; `with_area`, `palette`) for the animated apps; the
+  layout, the SDK, the
   test apps and `testkit` are described once, in ARCHITECTURE section 8
   ("Building and bundling"). `make lint` and `fmt` cover them. The kernels embed them
   (`app::BUNDLED`, `app::TEST_APPS`); the harness validates them in
@@ -556,8 +558,8 @@ own PR that updates that doc first.
   the window's going), `TITLE_H`, `client_box`, `client_pixels`;
   the automation tree's `ui_tree`, `node`, `wait_ui`, `invoke`,
   `press_buttons` (each answered, or still running and then settled: `Invoked.still_running`),
-  `press_animated` (in a window that may animate: confirmed by `wait_ui`, never settling; `invoke`'s
-  `animating` retries a held slot instead of settling),
+  `press_button`, `press_animated` (in a window that may animate: confirmed by `wait_ui`, never
+  settling; `invoke`'s `animating` retries a held slot instead of settling, `INVOKE_HELD_TIMEOUT`),
   `desktop_counter`; `parse_records` reads quoted cells with `shlex`),
   `calibration.py` (a boot calibration's verdict line, and the TSC's
   HPET-or-PIT choice, read back and checked against the numbers they print:

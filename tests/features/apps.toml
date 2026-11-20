@@ -140,7 +140,7 @@ tests = [
 ]
 
 [[feature]]
-name = "The SDK's tick loop: an app ticks on a period it gives before every wait (a late tick once, never a burst) and still answers requests and closes while it ticks; with no period the desktop settles, and while it ticks it never does; input the app takes itself (its own keys) skips the tree, and it can quit from a key; its own drawing gets the theme's palette and is committed without republishing an unchanged tree"
+name = "The SDK's tick loop: an app ticks on a period it gives before every wait (never faster than a 10 ms floor or its own period, a late tick once, never a burst; a period changing on every ask still ticking at its boundary) and still answers requests and closes while it ticks, even taking every event offered; with no period the desktop settles, and while it ticks it never does; input the app takes itself (its own keys) never reaches the tree; it can quit from a key or a tick; its own drawing gets the theme's palette and the tree's paint under it, and is committed (overlaps merged) without republishing an unchanged tree"
 milestone = "M5"
 tests = [
     "cargo:lumen-ui",
@@ -148,8 +148,13 @@ tests = [
     "harness:test_ui_tree::test_invoke_on_an_animating_window_retries_a_held_slot_without_settling",
     "harness:test_ui_tree::test_invoke_on_an_animating_window_gives_up_on_a_slot_held_too_long",
     "harness:test_ui_tree::test_press_animated_confirms_by_the_tree_not_by_settling",
+    "harness:test_ui_tree::test_press_animated_fails_on_another_row_or_a_refusal",
+    "harness:test_ui_tree::test_press_animated_refuses_a_predicate_already_true",
     "scenario:test_apps::test_sdk_tick_loop_answers_requests_and_closes_while_ticking",
     "scenario:test_apps::test_sdk_tick_loop_stopped_lets_the_desktop_settle",
     "scenario:test_apps::test_sdk_app_takes_keys_draws_alone_and_quits",
     "scenario:test_apps::test_sdk_custom_drawing_follows_the_theme",
+    "scenario:test_apps::test_sdk_a_greedy_take_still_leaves_the_toolkit_its_events",
+    "scenario:test_apps::test_sdk_a_tick_can_quit",
+    "scenario:test_apps::test_sdk_wraps_its_other_calls",
 ]
