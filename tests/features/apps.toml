@@ -195,7 +195,7 @@ tests = [
 ]
 
 [[feature]]
-name = "X-ray (#208): a bundled app reading every CPU's trace rings through the Trace capability: each CPU's run queue (from its newest runq event, agreeing with the scheduler's count), running thread, switches, interrupts, locks that waited and numbers missed as labels (unknown until read, offline CPUs marked), its counts never more than the ring holds (a ring's backlog left out), lanes of its recent columns (a live run-queue bar's height checked); Pause stops its reads (the window settles) and Resume catches up; a frozen view of a fixed trace (--replay) matching a golden; without the trace grant it starts, logs one ERROR and exits with 1; other arguments its usage and 2; the kernel's trace runq spin seam keeps one set of threads and joins it"
+name = "X-ray (#208): a bundled app reading every CPU's trace rings through the Trace capability: each CPU's run queue (from its newest runq event, agreeing with the scheduler's count), running thread, switches, interrupts, locks that waited and numbers missed as labels (unknown until read, offline CPUs marked), its interrupt count never more than the ring holds, nor counting what piled up while paused, lanes of its recent columns (a live run-queue bar's height checked); Pause stops its reads (the window settles) and Resume catches up; a frozen view of a fixed trace (--replay; its labels show a ring's backlog left out) matching a golden; without the trace grant it starts, logs one ERROR and exits with 1; other arguments its usage and 2; the kernel's trace runq spin seam keeps one set of threads and joins it"
 milestone = "M5"
 tests = [
     "cargo:lumen-xray",

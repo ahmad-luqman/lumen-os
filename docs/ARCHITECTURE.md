@@ -5507,8 +5507,9 @@ kernel. The kernel is the trusted computing base.
   `trace runq spin <n>` starts `n` threads spinning on the last CPU with
   a scheduler (interrupts on: the timer takes turns among them, so its
   queue stays `n - 1` long apart from what else wakes there) until `trace
-  runq spin stop` joins them, one set at a time, for
-  `scenario:test_xray::test_xray_matches_the_scheduler` (#208).
+  runq spin stop` joins them, one set in the slot at a time, for
+  `scenario:test_xray::test_xray_matches_the_scheduler` and
+  `test_xray_pause_stops_its_reads` (#208).
 - **Boot timeline:** boot phases emit trace events, printed as a timeline at
   boot complete (section 4). The fast-boot target is under 1 s from kernel
   entry to the shell, measured in the guest from TSC timestamps (never by
