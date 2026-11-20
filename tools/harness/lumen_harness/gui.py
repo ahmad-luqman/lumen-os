@@ -940,6 +940,9 @@ INVOKE_LATE = "ui invoke: ran late"
 INVOKE_BUSY = re.compile(
     r"ui invoke: (window \d+ busy \(try again\)|a request is still queued or running in window \d+)$"
 )
+# The second kind: an earlier request (one its asker cancelled, say) still
+# holds the window's slot until its owner takes it.
+INVOKE_HELD = re.compile(r"ui invoke: a request is still queued or running in window \d+$")
 # Taken but not answered by the second deadline (a stalled owner): it may
 # still run; the caller confirms its effect.
 INVOKE_STILL_RUNNING = re.compile(r"ui invoke: still running \(window \d+\)$")
@@ -992,6 +995,12 @@ class Invoked:
     late: bool = False
     retries: int = 0
 
+    @property
+    def still_running(self) -> bool:
+        """Taken but not answered by the second deadline (an owner the host
+        stalled): it may still run, so the caller confirms its effect."""
+        return self.message is not None and INVOKE_STILL_RUNNING.match(self.message) is not None
+
 
 def parse_invoke(out: str) -> Invoked | None:
     """`ui invoke`'s output read: `None` for a request cancelled at its
@@ -1024,16 +1033,41 @@ def invoke(
     allow: str | None = None,
 ) -> Invoked:
     """`ui invoke <node> <action> [args]`: retried while cancelled at its
-    deadline or refused busy (neither ran, so a retry can't act twice);
-    "ran late" with its row or message counts as done (`Invoked.late`), and
-    `Invoked.retries` says how many were cancelled first."""
+    deadline or refused busy (neither ran, so a retry can't act twice), up
+    to `tries` times; a refusal because an earlier request still holds an
+    app window's slot (a cancelled one stays queued until its owner takes
+    it) waits for that first, a confirmed state (`wait_settled`: every
+    queue empty, its owner waiting), and isn't counted. "ran late" with its
+    row or message counts as done (`Invoked.late`), and `Invoked.retries`
+    says how many were cancelled or busy first."""
     line = shlex.join(["ui", "invoke", str(node_id), action, *args])
-    for retries in range(tries):
-        got = parse_invoke(run(m, line, 10, allow=allow))
+    retries = 0
+    while retries < tries:
+        out = run(m, line, 10, allow=allow)
+        got = parse_invoke(out)
         if got is not None:
             return replace(got, retries=retries)
+        first = next((x for x in out.splitlines() if x.strip()), "")
+        if INVOKE_HELD.match(first):
+            wait_settled(m, allow=allow)
+            continue
+        retries += 1
         time.sleep(0.2)
-    raise AssertionError(f"{line} was cancelled {tries} times")
+    raise AssertionError(f"{line} was cancelled or busy {tries} times")
+
+
+def press_buttons(m: Machine, rows: list[dict[str, str]], *names: str) -> None:
+    """`ui invoke <button> press` for each button named in `rows`, in turn:
+    each answered with its row, or still running (`Invoked.still_running`),
+    then waited for: the desktop settled, no request outstanding, so its
+    effect is in the tree the caller reads next."""
+    for name in names:
+        button = node(rows, "button", name)
+        got = invoke(m, button["id"], "press")
+        if got.still_running:
+            wait_settled(m)
+            continue
+        assert got.row is not None and got.row["id"] == button["id"], (name, got)
 
 
 # -- the desktop shell (#157) --------------------------------------------------

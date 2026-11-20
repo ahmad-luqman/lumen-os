@@ -16,7 +16,6 @@ line and its thread's join.
 """
 
 import re
-import time
 
 from lumen_harness import REPO_ROOT, gui, klog
 from lumen_harness.gui import parse_records, poll
@@ -537,20 +536,6 @@ def display(m, wid: str) -> str:
     return gui.node(gui.ui_tree(m, wid), "label", "Display")["value"]
 
 
-def press(m, rows: list[dict[str, str]], *names: str) -> None:
-    """`ui invoke <button> press` for each button named, in turn: each
-    answered with its row, or (an owner the host stalled past both
-    deadlines) still running, then waited for: the desktop settled, no
-    request outstanding, so its effect is in the tree the caller reads."""
-    for name in names:
-        button = gui.node(rows, "button", name)
-        got = gui.invoke(m, button["id"], "press")
-        if got.message is not None and gui.INVOKE_STILL_RUNNING.match(got.message):
-            gui.wait_settled(m)
-            continue
-        assert got.row is not None and got.row["id"] == button["id"], (name, got)
-
-
 def test_calculator_tree_and_invoke(boot):
     # The calculator (lumen-ui inside the app): `ui tree` lists its display
     # and every button, ids global; `ui invoke` presses them as clicks do:
@@ -565,9 +550,9 @@ def test_calculator_tree_and_invoke(boot):
     buttons = [r["name"] for r in rows if r["role"] == "button"]
     assert buttons == CALC_BUTTONS, buttons
     assert gui.node(rows, "label", "Display")["value"] == "0"
-    press(m, rows, "2", "+", "3")
+    gui.press_buttons(m, rows, "2", "+", "3")
     assert display(m, wid) == "3"
-    press(m, rows, "=")
+    gui.press_buttons(m, rows, "=")
     assert display(m, wid) == "5"
 
     # Keys: `c` clears, then 9 - 2 and Enter: 7 (a value the display
@@ -597,7 +582,7 @@ def test_calculator_golden(boot, artifacts, golden_dir):
     m = boot_desktop(boot)
     start(m, "calculator")
     wid, rows = calc_tree(m)
-    press(m, rows, "0", "-", *"999999999999999", "=", "/", "7", "=")
+    gui.press_buttons(m, rows, "0", "-", *"999999999999999", "=", "/", "7", "=")
     assert display(m, wid) == LONGEST
     row = gui.window(m, "Calculator")
     x0, y0, x1, y1 = gui.client_box(row)
@@ -643,7 +628,7 @@ def test_app_ids_are_global(boot):
     )
     seven = gui.node(rows_a, "button", "7")
     assert run(m, f"ui invoke {seven['id']} press") == f"ui invoke: no node {seven['id']}\n"
-    press(m, rows_b, "7")
+    gui.press_buttons(m, rows_b, "7")
     assert display(m, b) == "7"
 
 
@@ -658,7 +643,7 @@ def test_closed_its_window_answer_comes_after_the_window_closes(boot):
     m = boot_desktop(boot)
     app_id, mark = start(m, "window ui")
     wid, rows = wait_tree(m, "window", "Quit")
-    press(m, rows, "Add")
+    gui.press_buttons(m, rows, "Add")
     assert gui.node(gui.ui_tree(m, wid), "label", "Count")["value"] == "1"
     lock = gui.node(rows, "checkbox", "Lock")
     got = gui.invoke(m, lock["id"], "press")
@@ -666,7 +651,7 @@ def test_closed_its_window_answer_comes_after_the_window_closes(boot):
         assert got.row["value"] == "checked", got
     quit_ = gui.node(rows, "button", "Quit")
     got = gui.invoke(m, quit_["id"], "press")
-    if got.message is not None and gui.INVOKE_STILL_RUNNING.match(got.message):
+    if got.still_running:
         gui.wait_no_window(m, "window")
     else:
         assert got.message == f"ui invoke: ran; window {wid} closed", got
@@ -690,18 +675,9 @@ def test_app_that_traps_closes_its_window_and_answers(boot):
     app_id, mark = start(m, "window ui-trap")
     wid, rows = wait_tree(m, "window", "Add")
     add = gui.node(rows, "button", "Add")
+    got = gui.invoke(m, add["id"], "press", tries=20, allow=TRAPPED)
     ended = f"ui invoke: window {wid} closed while running it (it may have run)"
-    line = f"ui invoke {add['id']} press"
-    for _ in range(20):
-        lines = [x for x in run(m, line, 10, allow=TRAPPED).splitlines() if x]
-        if lines[0].startswith(gui.INVOKE_CANCELLED) or gui.INVOKE_BUSY.match(lines[0]):
-            time.sleep(0.2)  # never ran: nothing happened
-            continue
-        break
-    else:
-        raise AssertionError("never taken")
-    body = lines[1:] if lines[0] == gui.INVOKE_LATE else lines
-    assert body in ([ended], [f"ui invoke: still running (window {wid})"]), lines
+    assert got.message in (ended, f"ui invoke: still running (window {wid})"), got
     end_line(
         m, mark, "window", app_id, "ended: trap: wasm `unreachable` instruction executed", "WARN"
     )

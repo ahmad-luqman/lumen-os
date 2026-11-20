@@ -551,6 +551,7 @@ own PR that updates that doc first.
   `wait_window`, `wait_no_window`, `close_window` (`ui invoke`'s close, then
   the window's going), `TITLE_H`, `client_box`, `client_pixels`;
   the automation tree's `ui_tree`, `node`, `wait_ui`, `invoke`,
+  `press_buttons` (each answered, or still running and then settled: `Invoked.still_running`),
   `desktop_counter`; `parse_records` reads quoted cells with `shlex`),
   `calibration.py` (a boot calibration's verdict line, and the TSC's
   HPET-or-PIT choice, read back and checked against the numbers they print:
