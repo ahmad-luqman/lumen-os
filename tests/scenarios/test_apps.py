@@ -1002,3 +1002,86 @@ def test_sdk_an_overrunning_tick_still_waits_a_period(boot):
     gui.close_window(m, "window")
     end_line(m, mark, "window", app_id, "exited with 0")
     assert tick_ended(m, mark) >= 4
+
+
+# -- the text editor (#203) ----------------------------------------------------
+
+
+def editor_tree(m) -> tuple[str, list[dict[str, str]]]:
+    return wait_tree(m, "Editor", "Text")
+
+
+def editor_text(rows: list[dict[str, str]]) -> str:
+    """The buffer's node's value (the kernel shows `\\n` as U+FFFD)."""
+    return gui.node(rows, "textfield", "Text")["value"]
+
+
+def editor_status(rows: list[dict[str, str]]) -> str:
+    return gui.node(rows, "label", "Status")["value"]
+
+
+def test_editor_typing_and_tree(boot):
+    # The editor, empty and blinking (an animating window while focused:
+    # nothing here waits for the desktop to settle). Keys typed through
+    # confirmed steps edit its buffer, which is its `textfield` node's value
+    # (a line break shown as U+FFFD), the status line following; `set_value`
+    # replaces the text as one edit, which Ctrl+Z takes back and Ctrl+Y
+    # brings again; closing its window ends it with 0, its thread joined.
+    m = boot_desktop(boot)
+    app_id, mark = start(m, "editor --empty")
+    record = app(m, app_id)
+    wid, rows = editor_tree(m)
+    assert editor_text(rows) == "", rows
+    assert editor_status(rows) == "Ln 1, Col 1"
+
+    def shows(text: str, status: str):
+        return lambda r: editor_text(r) == text and editor_status(r) == status
+
+    gui.type_confirmed(m, "hello world")
+    gui.wait_ui(m, "hello world typed", shows("hello world", "Ln 1, Col 12, modified"), wid)
+    gui.confirmed_keys(m, ["ret"])
+    gui.type_confirmed(m, "Lumen")
+    typed = "hello world�Lumen"
+    rows = gui.wait_ui(m, "a second line typed", shows(typed, "Ln 2, Col 6, modified"), wid)
+    # Backspace, and the arrows: back to the first line's end.
+    gui.confirmed_keys(m, ["backspace"], ["up"], ["end"])
+    rows = gui.wait_ui(
+        m, "Backspace, Up, End", shows("hello world�Lume", "Ln 1, Col 12, modified"), wid
+    )
+
+    text_node = gui.node(rows, "textfield", "Text")["id"]
+    got = gui.invoke(m, text_node, "set_value", "replaced text", animating=True)
+    if not got.still_running:
+        assert got.row is not None and got.row["value"] == "replaced text", got
+    gui.wait_ui(m, "set_value", shows("replaced text", "Ln 1, Col 14, modified"), wid)
+    gui.confirmed_keys(m, ["ctrl", "z"])
+    gui.wait_ui(m, "Ctrl+Z undid it", lambda r: editor_text(r) == "hello world�Lume", wid)
+    gui.confirmed_keys(m, ["ctrl", "y"])
+    gui.wait_ui(m, "Ctrl+Y redid it", lambda r: editor_text(r) == "replaced text", wid)
+
+    gui.close_window(m, "Editor")
+    end_line(m, mark, "editor", app_id, "exited with 0")
+    wait_gone(m, app_id, record["thread"])
+
+
+def test_editor_golden(boot, artifacts, golden_dir):
+    # The editor's window with its sample text, the cursor moved to the end
+    # of the third line through confirmed keys, the blink off (`--no-blink`:
+    # the window then settles), against a golden: the text drawn by the app
+    # over its lumen-ui text area, the status line below.
+    m = boot_desktop(boot)
+    start(m, "editor --no-blink")
+    wid, rows = editor_tree(m)
+    assert editor_text(rows).startswith("Welcome to Lumen's editor.�"), rows
+    gui.confirmed_keys(m, ["down"], ["down"], ["end"])
+    gui.wait_ui(m, "the cursor at line 3's end", lambda r: editor_status(r) == "Ln 3, Col 47", wid)
+    row = gui.window(m, "Editor")
+    x0, y0, x1, y1 = gui.client_box(row)
+    shot = gui.settled_screendump(m, "editor.png")
+    assert_matches_golden(
+        shot,
+        golden_dir / "app-editor.png",
+        origin=(x0, y0),
+        size=(x1 - x0, y1 - y0),
+        artifacts=artifacts,
+    )

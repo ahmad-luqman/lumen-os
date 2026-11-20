@@ -160,3 +160,13 @@ tests = [
     "scenario:test_apps::test_sdk_a_tick_can_quit",
     "scenario:test_apps::test_sdk_wraps_its_other_calls",
 ]
+
+[[feature]]
+name = "Text editor on an in-memory buffer (#203): a bundled app editing its text from the keyboard (typing, Enter, Tab, Backspace and Delete, the arrows, Home and End, Page Up and Down, Ctrl+Z and Ctrl+Y), every edit undone and redone restoring the text exactly, typing undone a run at a time, its size and history bounded; its buffer a `textfield` node whose value is the text (`set_value` replacing it as one edit that undo takes back), its status line a label with the line, the column and whether it was modified; drawn by the app over a lumen-ui text area, only the lines a change names, its window matching a golden"
+milestone = "M5"
+tests = [
+    "cargo:lumen-edit",
+    "cargo:lumen-ui",
+    "scenario:test_apps::test_editor_typing_and_tree",
+    "scenario:test_apps::test_editor_golden",
+]
