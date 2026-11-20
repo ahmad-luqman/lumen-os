@@ -543,9 +543,9 @@ fn a_full_repaint_covers_the_surface_even_laid_out_in_less() {
 
 /// An app drawing a square of its own beside the Counter's tree: the tree
 /// laid out in [`AREA`], the surface [`BOARD_W`] wider (the app's area).
-/// Its frame paints the square in the palette's accent where the rectangles
-/// being repainted reach, recording each call's rectangles; `drawn` is what
-/// it reports changed next.
+/// Its frame paints only the square (its foreground) in the palette's
+/// accent where the rectangles being repainted reach, recording each
+/// call's rectangles; `drawn` is what it reports changed next.
 struct Board {
     counter: Counter,
     square: Rect,
@@ -606,6 +606,7 @@ fn the_app_s_own_damage_is_repainted_and_committed_without_publishing() {
     assert_eq!(moved, Repainted { rects: alloc::vec![old, app.square], changed: false });
     assert_eq!(app.calls.last(), Some(&alloc::vec![old, app.square]));
     assert_eq!(s.pixel(505, 125), Some(PALETTE.accent), "drawn at its new place");
+    assert_eq!(s.pixel(455, 55), Some(PALETTE.background), "its old place the tree's background: no trail");
     // Rectangles are cut to the surface; one wholly off it is dropped, and
     // with nothing else to repaint there's no frame at all.
     app.drawn = alloc::vec![Rect::new(-50, -50, 10, 10)];
@@ -620,10 +621,10 @@ fn the_app_s_own_damage_is_repainted_and_committed_without_publishing() {
 }
 
 #[test]
-fn the_tree_is_repainted_under_the_app_s_damage_only_inside_its_area() {
+fn every_rect_repainted_gets_the_tree_s_paint_inside_its_area_or_not() {
     // A rectangle straddling the tree's area's right edge: the tree's
-    // background is painted where it meets the area, and nothing else is
-    // touched outside it (the app paints that part itself).
+    // background on both sides (the app's frame paints only its square,
+    // elsewhere), as a full repaint would leave it.
     let mut app = Board::new();
     let mut s = Board::surface();
     repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
@@ -633,8 +634,37 @@ fn the_tree_is_repainted_under_the_app_s_damage_only_inside_its_area() {
     app.drawn = alloc::vec![straddling];
     let done = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
     assert_eq!(done.rects, alloc::vec![straddling]);
-    assert_eq!(s.pixel(395, 155), Some(PALETTE.background), "the tree, inside its area");
-    assert_eq!(s.pixel(405, 155), Some(JUNK), "outside it: the app's to paint");
+    assert_eq!(s.pixel(395, 155), Some(PALETTE.background), "inside the tree's area");
+    assert_eq!(s.pixel(405, 155), Some(PALETTE.background), "outside it");
+}
+
+#[test]
+fn the_app_s_rects_get_the_tree_s_paint_when_the_tree_changed_too() {
+    // Junk straddling the area's edge, reported with a label change in the
+    // same repaint: repainted as background (or tree) on both sides.
+    let mut app = Board::new();
+    let mut s = Board::surface();
+    repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    const JUNK: u32 = 0x00ab_cdef;
+    let straddling = Rect::new(390, 150, 20, 20);
+    s.fill_rect(straddling, JUNK);
+    let add = app.counter.ui().id(app.counter.add).expect("live").get();
+    assert!(matches!(serve(&mut app, &mut FixedText, AREA, add, &Action::Press), Served::Row { .. }));
+    app.drawn = alloc::vec![straddling];
+    let done = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    assert!(done.changed);
+    let junk_left = (390..410).flat_map(|x| (150..170).map(move |y| (x, y))).filter(|&(x, y)| s.pixel(x, y) == Some(JUNK));
+    assert_eq!(junk_left.count(), 0);
+    let mut full = Board::surface();
+    let mut again = Board::new();
+    let add2 = again.counter.ui().id(again.counter.add).expect("live").get();
+    let _ = serve(&mut again, &mut FixedText, AREA, add2, &Action::Press);
+    repaint(&mut again, &mut full, &mut FixedText, &PALETTE, AREA);
+    for x in 390..410 {
+        for y in 150..170 {
+            assert_eq!(s.pixel(x, y), full.pixel(x, y), "({x}, {y}) as a full repaint leaves it");
+        }
+    }
 }
 
 #[test]

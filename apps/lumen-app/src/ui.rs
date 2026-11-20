@@ -184,9 +184,10 @@ impl<A: App> Toolkit<A> {
     }
 
     /// `app` in `window` with its tree laid out in `area` (cut to the
-    /// client area); the rest of the client is the app's own, painted only
-    /// by its `paint_over` (a board, a clock face, a buffer's text). A full
-    /// repaint paints the tree's background over the whole client first.
+    /// client area); the rest of the client is the app's own (a board, a
+    /// clock face, a buffer's text): every rect repainted there gets the
+    /// tree's background first, then the app's `paint_over` draws its
+    /// foreground.
     pub fn with_area(app: A, window: Window, area: Rect) -> Result<Toolkit<A>> {
         let text = HostText::new(window.desktop())?;
         let palette = Palette::from(lumen_app_api::event::Palette::default());

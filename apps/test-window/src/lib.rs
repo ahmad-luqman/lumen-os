@@ -512,11 +512,8 @@ impl App for Ticker {
     }
 
     fn paint_over(&mut self, over: &mut Over<'_>) {
-        let area = Ticker::area();
+        // Only the foreground: each rect has the tree's background already.
         for r in over.rects {
-            if let Some(part) = r.intersect(&area) {
-                over.surface.fill_rect(part, over.palette.background);
-            }
             if let Some(part) = r.intersect(&self.square) {
                 over.surface.fill_rect(part, over.palette.accent);
             }
