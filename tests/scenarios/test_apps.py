@@ -655,7 +655,7 @@ def test_clock_tree_matches_rtc(boot):
     gui.wait_settled(m)
     gui.close_window(m, "Clock")
     end_line(m, mark, "clock", app_id, "exited with 0")
-    bad = r"ERROR app: clock: clock: '25:00' is not a time of day"
+    bad = r"ERROR app: clock: '25:00' is not a time of day"
     app_id, mark = start(m, "clock --at 25:00", allow=bad)
     end_line(m, mark, "clock", app_id, "exited with 2")
 

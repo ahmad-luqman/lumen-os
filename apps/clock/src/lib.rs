@@ -21,12 +21,12 @@
 extern crate alloc;
 
 use alloc::format;
-use alloc::string::String;
 use alloc::vec::Vec;
 use lumen_app::gfx::Rect;
 use lumen_app::ui::{Flow, Taken, Ticking, Toolkit};
 use lumen_app::{Desktop, Time, log};
 use lumen_clock::TimeOfDay;
+use lumen_clock::args::{self, Mode};
 use lumen_clock::face::{Face, HEIGHT, TREE, WIDTH};
 use lumen_ui::{App, Over, Then, Ui, UiEvent};
 
@@ -83,7 +83,7 @@ impl Ticking for Clock {
                 Ok(secs) => self.face.show(Some(TimeOfDay::from_unix(secs))),
                 Err(e) if !self.warned => {
                     self.warned = true;
-                    log::warn(&format!("clock: the RTC: {e} (showing the last time read)"));
+                    log::warn(&format!("the RTC: {e} (showing the last time read)"));
                 }
                 Err(_) => {}
             }
@@ -92,30 +92,25 @@ impl Ticking for Clock {
     }
 }
 
-const USAGE: &str = "usage: clock [--at HH:MM[:SS]]";
-
-/// What `run`'s arguments ask for: `Some(t)` frozen at `t`, `None` live.
-fn frozen_at(args: &[String]) -> Result<Option<TimeOfDay>, String> {
-    match args {
-        [] => Ok(None),
-        [at, t] if at == "--at" => {
-            TimeOfDay::parse(t).map(Some).ok_or_else(|| format!("clock: '{t}' is not a time of day ({USAGE})"))
-        }
-        _ => Err(format!("clock: {USAGE}")),
-    }
-}
-
 /// The app's exit code: 0 once its window is closed; 1 once a failure is
-/// logged; 2 for arguments it doesn't take.
+/// logged; 2 for arguments it doesn't take (an ERROR naming what was
+/// wrong).
 fn run() -> i32 {
-    let at = match lumen_app::args().map_err(|e| format!("clock: its arguments: {e}")).and_then(|a| frozen_at(&a)) {
-        Ok(at) => at,
+    let words = match lumen_app::args() {
+        Ok(w) => w,
         Err(e) => {
-            log::error(&e);
+            log::error(&format!("its arguments: {e}"));
             return 2;
         }
     };
-    lumen_app::report(app(at))
+    match args::mode(&words) {
+        Ok(Mode::Live) => lumen_app::report(app(None)),
+        Ok(Mode::Frozen(t)) => lumen_app::report(app(Some(t))),
+        Err(e) => {
+            log::error(&format!("{e}"));
+            2
+        }
+    }
 }
 
 fn app(at: Option<TimeOfDay>) -> Result<(), (&'static str, lumen_app::Error)> {
