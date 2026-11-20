@@ -3959,10 +3959,12 @@ kernel (no SSE); #197 checks the results' bits.
   `LIFE_APP`), which is therefore left out of the apps after the demo
   items, so it is listed once
   (`taskbar::the_launcher_lists_the_life_app_once`). An item starting an
-  app is answered once the app is started, before its window opens: an
-  app that then can't open its window ends with its own ERROR and end
-  line (as every bundled app does, #206), not with the item's
-  `Then::Failed`, which only a refused start gives.
+  app is answered once the app is started, without waiting for its
+  window, which the app's thread opens (so its button may come before
+  the answer or after); `app <id>` is in the taskbar's INFO line, not
+  the answer. An app that then can't open its window ends with its own
+  ERROR and end line (as every bundled app does, #206), not with the
+  item's `Then::Failed`, which only a refused start gives.
 - **Loading from disk (M6)** will need more: import names in errors are
   sanitised already, but wasmi reserves vectors up front for the counts a
   module declares (`reserve_exact`), which `CODE_FACTOR` doesn't bound
@@ -5170,9 +5172,10 @@ close, and the demos in windows of their own. All of it is built with
   tree` after `ui invoke` shows the new window's button
   (`lumen.taskbar_wake_delay_ms=<ms>` holds back its handling of a poke,
   so a test can tell the two apart). An item starting an app (Life since
-  #202, the bundled apps since #206) answers once the app is started
-  (`app <id>`); its window and button come later, when the app's thread
-  opens it.
+  #202, the bundled apps since #206) is answered once the app is started,
+  without waiting for its window: the app's thread opens it, and its
+  button comes with it, before or after the answer (`INFO  taskbar:
+  <item>: app <id>` logs the start).
 - **The clock** polls the RTC without animating (the desktop settles
   between polls; `rtc::now_quiet`) and redraws the label when the
   minute changes, damaging only its bounds (the toolkit's per-widget

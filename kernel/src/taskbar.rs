@@ -18,8 +18,10 @@
 //! menu item (Terminal, Mandelbrot, Counter) brings them in line at once,
 //! before the request that chose it is answered, so `ui tree` after `ui
 //! invoke` already shows the new window's button. An item starting an app
-//! (Life, the bundled apps) answers once the app is started (`app <id>`),
-//! its window and button still to come, opened by the app's own thread.
+//! (Life, the bundled apps) is answered once the app is started, without
+//! waiting for its window, which the app's own thread opens (its button
+//! comes with it, maybe before the answer, maybe after); the taskbar logs
+//! `INFO  taskbar: <item>: app <id>`.
 
 use alloc::format;
 use alloc::string::String;
@@ -224,7 +226,8 @@ impl App for Taskbar {
                     let name = self.items.get(item).copied().unwrap_or("?");
                     let opened = self.launch(item);
                     // A kernel window's button now, before the request is
-                    // answered (an app's window comes later, from its thread).
+                    // answered (an app's window is its own thread's, not
+                    // waited for).
                     self.sync();
                     match opened {
                         Ok(what) => log::info!(target: "taskbar", "{name}: {what}"),
