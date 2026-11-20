@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "calculator"
 version = "0.0.1"
 dependencies = [
@@ -101,6 +107,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-png"
+version = "0.0.1"
+dependencies = [
+ "miniz_oxide",
+ "zune-core",
+ "zune-png",
+]
+
+[[package]]
 name = "lumen-snake"
 version = "0.0.1"
 
@@ -116,11 +131,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-view"
+version = "0.0.1"
+dependencies = [
+ "lumen-app-api",
+ "lumen-gfx",
+ "lumen-png",
+]
+
+[[package]]
 name = "lumen-wm"
 version = "0.0.1"
 dependencies = [
  "lumen-gfx",
  "lumen-input",
+]
+
+[[package]]
+name = "miniz_oxide"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
+dependencies = [
+ "adler2",
 ]
 
 [[package]]
@@ -188,6 +221,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "simd-adler32"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "syn"
@@ -289,3 +328,37 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "viewer"
+version = "0.0.1"
+dependencies = [
+ "lumen-app",
+ "lumen-ui",
+ "lumen-view",
+]
+
+[[package]]
+name = "zune-core"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d56377fd46368984a170bc5aac5567e52ca5da874caa60bea39fcbca78fb658b"
+
+[[package]]
+name = "zune-inflate"
+version = "0.2.54"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73ab332fe2f6680068f3582b16a24f90ad7096d5d39b974d1c0aff0125116f02"
+dependencies = [
+ "simd-adler32",
+]
+
+[[package]]
+name = "zune-png"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a321146329f7617ba0a5b26982cba45b7ce78163135aba78be25850aefcea80"
+dependencies = [
+ "zune-core",
+ "zune-inflate",
+]

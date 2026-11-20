@@ -180,3 +180,16 @@ tests = [
     "scenario:test_apps::test_snake_flies_by_default_and_restarts_as_launched",
     "scenario:test_apps::test_snake_golden",
 ]
+
+[[feature]]
+name = "Image viewer (#204): a bundled app showing images built into it, decoded inside the app (a corrupt one, and one too costly to decode refused from its header, each an error shown in the view, its label and one INFO line, the app going on; an image it doesn't have refused with one ERROR before its window); the wallpaper at 1:1 equal to the PNG's pixels and panned by the arrow keys all four ways, or fitted to the view by nearest neighbour; the image list, Previous and Next through `ui invoke`, going round at both ends, the label and list following without taking the focus; settled once an image is shown, then spending no fuel; files too long, images empty, too big or too costly to decode refused from their length and header; its allocations, the costliest PNG it takes and the longest file included, fitting its fixed memory through its own allocator logic"
+milestone = "M5"
+tests = [
+    "cargo:lumen-view",
+    "cargo:lumen-ui",
+    "scenario:test_apps::test_viewer_golden",
+    "scenario:test_apps::test_viewer_list_and_select",
+    "scenario:test_apps::test_viewer_bad_image_shows_an_error",
+    "scenario:test_apps::test_viewer_refuses_an_image_it_doesnt_have",
+    "scenario:test_gui::test_launcher_lists_desktop_apps_only",
+]
