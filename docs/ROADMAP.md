@@ -171,6 +171,8 @@ Not yet tested: `run`'s key-stopped "still loading" wait (a load is too quick to
 
 Not yet tested, from #222 (the SDK's tick loop): no republish for a frame of the app's own, in QEMU (no deterministic signal for one publish fewer; `repaint`'s `changed` is host-tested, and the SDK publishes only on it); the order "every waiting event before a tick" (no seam pins it; a request answered while ticking and the never-settled reads cover the outcomes); a focus lost, or events lost, while a button is pressed still cancelling it (the greedy app takes the pointer, so its press can't be made; the window's `FocusGained` reaching the tree through the `Notify` step is `test_sdk_a_greedy_take_still_leaves_the_toolkit_its_events`'s); a `Notify` event never offered to `take`, or its `Quit` ignored (nothing observes either); a `Took` without its refresh (the key's release refreshes the window anyway, and no held-key step is confirmed); `run_until` not ticking before the first `Theme` (the `Theme` always comes first, so nothing can be seen before it); the loops' ERROR naming a failed stage (no seam makes a host call fail there).
 
+Not yet tested, from #202 (the Life app): a step's damage being only the changed cells' box (a whole-grid commit each step would show only as cost: the screen equals a full repaint either way, so `test_life_golden`'s comparisons can't tell); running at 10 generations a second (a rate, by the busy-host rule: only growth is checked); `run life`'s argument parsing on the host (`test_life_refuses_arguments_it_doesnt_take` covers each refusal in QEMU).
+
 ## M6: Files
 
 | Feature | Exit criteria (tests) |
