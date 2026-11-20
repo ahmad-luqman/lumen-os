@@ -121,8 +121,10 @@ impl Value {
 /// holds whitespace, a quote (`'`, `"`), a backslash, a `#` or a control
 /// character; then in double quotes, with `"` and `\` escaped by a
 /// backslash (the only escapes both readers take inside them) and each
-/// control character printed as U+FFFD (neither reader has an escape for
-/// one).
+/// control character and line or paragraph separator (U+2028, U+2029)
+/// printed as U+FFFD (neither reader has an escape for one, and a line
+/// reader such as Python's `splitlines` would split a row there: one app's
+/// node name could break every window's `ui tree`, #207).
 pub fn quoted(text: &str) -> String {
     let plain = !text.is_empty()
         && text != "-"
@@ -133,7 +135,7 @@ pub fn quoted(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
     for c in text.chars() {
-        let c = if c.is_control() { '\u{fffd}' } else { c };
+        let c = if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') { '\u{fffd}' } else { c };
         if c == '"' || c == '\\' {
             out.push('\\');
         }
