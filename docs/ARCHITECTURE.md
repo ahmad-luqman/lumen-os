@@ -482,7 +482,8 @@ with one of them, said in a TAP comment; none selected fails the run).
 
 The kernel is linked at -2 GiB because the **kernel code model** requires it
 (all symbols fit in sign-extended 32-bit immediates). `make audit` verifies
-this along with the absence of SSE/AVX and red-zone use and the presence of
+this along with the absence of SSE/AVX (outside M6's two named user-thread FP
+save/restore assembly stubs, section 6), no red-zone use, and the presence of
 stack probes (hard rule 3).
 
 ### Physical memory (built in M1)
@@ -639,17 +640,27 @@ being read, and if the walk itself faults the report still ends properly.
 
 ### Per-process address spaces and user VM (designed in #230, built in M6; CoW and shootdowns in M8)
 
-Each user process owns an `AddressSpace` holding a dedicated 4-level page-table
-root (L4 frame, loaded into `CR3` when switching to one of its threads) and a
-VMA interval tree (pure logic in host-tested `crates/lumen-vm`):
+Each user process owns an `AddressSpace` protected by a **sleeping,
+interrupt-enabled `Mutex`/`RwLock`** (not an IRQ-off `SpinLock`—needed both for
+M7 blocking file-backed `#PF` I/O and to prevent M8 `TLB_SHOOTDOWN` IPI
+deadlocks, below). It holds a dedicated 4-level page-table root (L4 frame,
+loaded into `CR3` when switching to one of its threads) and a VMA interval tree
+(pure logic in host-tested `crates/lumen-vm`):
 
-- **Upper-half sharing (L4 entries 256–511):** Every kernel-owned L4 slot
-  covering the HHDM, kernel heap window, kernel stack window, MMIO window, and
-  kernel image has its L3 table pre-allocated during `mm::init` before any
-  process is created. Creating a new `AddressSpace` copies L4 entries 256–511
-  from the kernel root table verbatim, so subsequent kernel heap, stack, and
-  MMIO mappings become visible in every address space automatically without
-  patching other L4 tables. Kernel entries are never marked `USER`.
+- **Upper-half sharing (L4 entries 256–511):** Each 1 TiB kernel window
+  (`WINDOW = 1 << 40`) spans two 512 GiB L4 slots. During `mm::init`, before
+  any process is created, the kernel pre-allocates L3 tables for all 6 dynamic
+  kernel L4 slots—kernel heap (`384`, `385`, including the ktest scratch slot),
+  kernel stacks (`416`, `417`), and MMIO (`448`, `449`)—alongside the static
+  HHDM (`256..`) and kernel image (`511`) tables already built by `paging`.
+  Creating a new `AddressSpace` copies L4 entries 256–511 from the kernel root
+  table verbatim, so subsequent kernel heap, stack, and MMIO mappings become
+  visible in every address space automatically without patching other L4
+  tables. Kernel entries are never marked `USER`; `lumen-mm::paging` extends
+  intermediate table entries and `Attrs` with an explicit `user` bit set **only**
+  within `L4[0..256]`, and `arch::x86_64::paging` adds a plain `write_cr3`
+  helper (`CR4.PCIDE = 0`; avoiding `load_root`'s `CR4.PGE` toggle on every
+  context switch).
 - **Lower-half layout (L4 entries 0–255, `USER_MIN..USER_MAX`):**
   - `USER_MIN = 0x0000_0000_0001_0000` (64 KiB null guard below).
   - `USER_MAX = 0x0000_7fff_ffff_f000` (top 4 KiB canonical user page unmapped
@@ -658,33 +669,45 @@ VMA interval tree (pure logic in host-tested `crates/lumen-vm`):
     M7's dynamic linker `ld-musl`) map at `PIE_BASE = 0x0000_5555_5555_4000`
     and `INTERP_BASE = 0x0000_7f00_0000_0000` (or top-down from `MMAP_TOP`).
   - `brk` starts page-aligned immediately above the highest loaded ELF segment
-    and grows upward up to the next VMA (capped away from `mmap`).
+    and tracks a byte-granular cursor upward up to the next VMA (capped away
+    from `mmap`).
   - Anonymous (M6) and file-backed (M7) `mmap` regions allocate top-down from
     `MMAP_TOP = 0x0000_7f00_0000_0000`.
   - Initial user stack top: `USER_STACK_TOP = 0x0000_7fff_f000_0000`, with an
     8 MiB demand-paged VMA and an unmapped guard page below it.
 - **VMA interval tree (`crates/lumen-vm`, host-tested):** tracks non-overlapping
-  page-aligned virtual ranges (`start..end`), protection flags (`R`, `W`, `X`),
-  and backing (`Anonymous`, plus `File` in M7). Supports exact-range lookup,
-  top-down free-gap search, `MAP_FIXED` unmap-and-replace, partial-range
-  `munmap`/`mprotect` splitting, and adjacent same-attribute merging. Every
-  range validates `start >= USER_MIN`, `end <= USER_MAX`, page alignment, and
-  no overflow.
-- **Demand paging (M6):** `mmap(MAP_ANONYMOUS)` and `brk` growth record VMAs
-  without eagerly allocating physical frames. On a user `#PF` (or a kernel
-  `copy_from_user`/`copy_to_user` `#PF` into `USER_MIN..USER_MAX`), the page
-  fault handler checks the process's VMA tree: if the faulting address lies in
-  a permitted VMA and the access matches its rights, it allocates one zeroed
-  frame, maps it with `USER` + the VMA's `W`/`NX` flags, and resumes. If no
+  page-aligned virtual ranges (`start..end`), protection flags (`R`, `W`, `X`,
+  or `PROT_NONE`), and backing (`Anonymous`, plus `File` in M7). Supports
+  exact-range lookup, top-down free-gap search, `MAP_FIXED` unmap-and-replace
+  (and `MAP_FIXED_NOREPLACE` returning `-EEXIST`), partial-range
+  `munmap`/`mprotect` sub-VMA splitting (required from M6 for `musl` `mallocng`
+  `PROT_NONE` guard pages and from M7 for `ld-musl` `PT_GNU_RELRO`), and
+  adjacent same-attribute merging. Every range validates `start >= USER_MIN`,
+  `end <= USER_MAX`, page alignment, and no overflow.
+- **Demand paging and `PROT_NONE` (M6):** `mmap(MAP_ANONYMOUS)` and `brk`
+  growth record VMAs without eagerly allocating physical frames. On a user
+  `#PF` (or a kernel `copy_from_user`/`copy_to_user` `#PF` into
+  `USER_MIN..USER_MAX`), the page fault handler reads `CR2` into a local before
+  anything can re-enable interrupts, panics immediately if `RSVD` (error code
+  bit 3) is set, and checks the process's VMA tree: if the faulting address
+  lies in a permitted VMA (not `PROT_NONE`) and the access matches its rights,
+  it allocates one zeroed frame, maps it with `USER` + the VMA's `W`/`NX`
+  flags, and resumes. `PROT_NONE` VMAs reserve VA space without demand-paging
+  on fault; `mprotect(..., PROT_NONE)` on already-populated pages preserves
+  their physical frames (clearing `PTE_PRESENT` and setting a software
+  `PTE_PROTNONE` bit while retaining the frame address so a later `mprotect`
+  back to `PROT_READ` preserves data and teardown still frees the frame). If no
   frame is available or the access violates VMA rights (or hits an unmapped
   address), the process is terminated (M6) or sent `SIGSEGV`/`SIGBUS` (M8).
-  Note on W^X: M6 enforces W^X on ELF segments; M10's JIT `mprotect` switches
-  pages between `RW-` and `R-X` cleanly (and allows `RWX` only if a Linux
-  binary explicitly requests `PROT_READ | PROT_WRITE | PROT_EXEC`).
-- **Teardown:** When an `AddressSpace` drops (after no CPU holds its `CR3`),
-  the kernel walks L4 entries 0–255, frees every user leaf frame (decrementing
-  its refcount from M8 onward) and every user L1/L2/L3/L4 page-table frame.
-  Kernel upper-half tables (256–511) are untouched.
+  Note on W^X: ELF `PT_LOAD` segments enforce W^X at load; `mmap`/`mprotect`
+  support switching pages between `RW-` and `R-X` and permit explicit
+  `PROT_READ | PROT_WRITE | PROT_EXEC` when a Linux binary requests it (needed
+  by Python `ctypes`/`libffi`, Ruby, and JITs).
+- **Teardown:** When an `AddressSpace` drops (only after every CPU has switched
+  its `CR3` away—see section 6), the kernel walks L4 entries 0–255, frees every
+  user leaf frame (including `PTE_PROTNONE` frames, decrementing refcounts from
+  M8 onward) and every user L1/L2/L3/L4 page-table frame. Kernel upper-half
+  tables (256–511) are untouched.
 - **Cross-CPU TLB shootdowns (M8; M6–M7 single-CPU invariant):** In M6 and M7,
   every user process is single-threaded and pinned to its home CPU (as all
   threads are today in `sched.rs`), so local `invlpg` is exact and no other CPU
@@ -694,9 +717,15 @@ VMA interval tree (pure logic in host-tested `crates/lumen-vm`):
   other CPUs issues a synchronous **`TLB_SHOOTDOWN` IPI** (vector `0x3e`,
   section 6) and waits for every targeted online CPU to acknowledge after
   flushing the range (or reloading `CR3` past a page-count threshold) before
-  returning or freeing any unmapped frame. This closes the cross-CPU stale-TLB
-  memory-safety hole at the exact milestone that introduces shared multi-CPU
-  address spaces.
+  returning or freeing any unmapped frame. **Locking rule (deadlock
+  prevention):** because `SpinLock` disables interrupts before spinning,
+  `tlb_shootdown` must **never** be waited on while holding an IRQ-off
+  `SpinLock` (`debug_assert!(irq::enabled() && irq::depth() == 0)` on entry;
+  shootdown requests are serialized under an interrupt-enabled lock or
+  per-CPU slots that service incoming shootdowns while waiting), and unmapped
+  frames are freed only after all ACKs complete. This closes both the
+  cross-CPU stale-TLB hole and the IRQ-off AB-BA IPI deadlock at the exact
+  milestone that introduces shared multi-CPU address spaces.
 
 ### Kernel stacks (built in M1)
 
@@ -998,104 +1027,160 @@ reserves room in its queues so the timer never allocates.
 M6 brings native ring-3 user threads into the existing x86-64 HAL without
 weakening crash reporting or `make audit`.
 
-- **GDT, TSS and `PerCpu`:** `arch/x86_64/gdt.rs` already places user segments
-  in the exact order `sysretq` requires: `0x08` `KERNEL_CODE`, `0x10`
-  `KERNEL_DATA`, `0x18 | 3` `USER_DATA`, `0x20 | 3` `USER_CODE`, `0x28` `TSS`.
-  `PerCpu` (`arch/x86_64/percpu.rs`, pointed to by `IA32_GS_BASE` in ring 0)
-  gains `kernel_rsp: u64` (top of the current thread's kernel stack) and
-  `user_rsp_scratch: u64` (scratch slot for the `syscall` entry prologue).
-  Whenever the scheduler switches to a user thread, it writes that thread's
-  kernel stack top to both `TSS.rsp0` (for ring-3 interrupts/exceptions) and
-  `PerCpu.kernel_rsp` (for `syscall`), loads the process's `CR3` if different,
-  restores the thread's `IA32_FS_BASE`, and restores its FP/SSE state.
-- **MSRs and `syscall`/`sysretq`:** At boot (and on every AP in `init_ap`), the
-  kernel enables `IA32_EFER.SCE` (bit 0, keeping `NXE` bit 11), sets:
+- **GDT, TSS, `PerCpu` and context switch order:** `arch/x86_64/gdt.rs`
+  already places user segments in the exact order `sysretq` requires: `0x08`
+  `KERNEL_CODE`, `0x10` `KERNEL_DATA`, `0x18 | 3` `USER_DATA`, `0x20 | 3`
+  `USER_CODE`, `0x28` `TSS`. `PerCpu` (`arch/x86_64/percpu.rs`, pointed to by
+  `IA32_GS_BASE` in ring 0) moves from `.rodata` into `.data`/`.bss` (via
+  `AtomicU64`/`UnsafeCell`) and gains `kernel_rsp: u64` (top of the current
+  thread's kernel stack) and `user_rsp_scratch: u64` (scratch slot for the
+  `syscall` entry prologue). Because a freshly spawned thread returns from
+  `arch::context::switch` into `thread_entry` rather than back into
+  `schedule()`, all per-thread hardware state transitions happen **before**
+  `arch::context::switch` (with interrupts off):
+  1. If `prev` is a user thread, call `lumen_fpu_save(prev.fpu)`.
+  2. Switch `CR3`: load `next`'s `AddressSpace` root for a user thread, or
+     switch back to `kernel_root()` when switching to a kernel/idle thread (so
+     a dying process's L4 frame is never freed while still active in `CR3`).
+  3. If `next` is a user thread, write its kernel stack top to `TSS.rsp0` and
+     `PerCpu.kernel_rsp`, write `next.fs_base` to `IA32_FS_BASE`, and call
+     `lumen_fpu_restore(next.fpu)`.
+- **MSRs and `syscall`/`sysretq`:** On the boot CPU (and on each AP in
+  `ap_main`, once on kernel tables and guarded stack), the kernel enables
+  `IA32_EFER.SCE` (bit 0, keeping `NXE` bit 11), keeps `CR4.FSGSBASE = 0`, and
+  sets:
   - `IA32_STAR = (0x0010u64 << 48) | (0x0008u64 << 32)`: `syscall` loads
     `CS = 0x08` (`KERNEL_CODE`) and `SS = 0x10` (`KERNEL_DATA`); 64-bit
     `sysretq` loads `SS = (0x10 + 8) | 3 = 0x18 | 3` (`USER_DATA`) and
     `CS = (0x10 + 16) | 3 = 0x20 | 3` (`USER_CODE`).
   - `IA32_LSTAR = lumen_syscall_entry`.
-  - `IA32_FMASK = 0x0004_4700` (`TF | IF | DF | NT | AC`): clears interrupts,
-    direction flag, single-step trap, nested task, and SMAP `AC` atomically on
-    entry.
+  - `IA32_FMASK = 0x0005_7700` (`TF | IF | DF | IOPL | NT | RF | AC`): clears
+    interrupts, direction flag, single-step trap, IOPL, nested task, resume
+    flag, and SMAP `AC` atomically on entry.
   - `IA32_KERNEL_GS_BASE = 0` initially (holds user GS base while in ring 0;
     holds `&CPUS[index]` while in ring 3).
-- **Syscall entry and canonical `sysretq` safety:** Because `syscall` does not
-  switch `rsp`, `lumen_syscall_entry` executes with interrupts off: `swapgs`,
-  saves user `rsp` to `gs:[user_rsp_scratch]`, loads `gs:[kernel_rsp]`, builds
-  a full register frame on the kernel stack (saving `rcx` = user RIP,
-  `r11` = user RFLAGS, `user_rsp_scratch`, and GPRs), enables interrupts, and
-  calls the Rust syscall dispatcher. Before returning to ring 3, interrupts are
-  disabled and `r11` is sanitized (`(r11 & 0x003F_FFFF) | 0x0202`, forcing
-  `IF = 1`, bit 1 = 1, `IOPL = 0`, `NT = 0`, `RF = 0`, `VM = 0`). Because
-  `sysretq` with a non-canonical `rcx` raises `#GP` in ring 0 with user `rsp`
-  loaded, the exit path checks `rcx < USER_MAX` (strictly canonical lower half)
-  and falls back to `iretq` (with `USER_CODE`/`USER_DATA`) whenever `rcx` is
-  non-canonical or the register frame was rewritten (e.g. `execve`, `fork`
-  child, or `rt_sigreturn`).
-- **Conditional `SWAPGS` on exceptions and interrupts:** `lumen_isr_common`
-  inspects the saved `CS` on the stack (`cs & 3 != 0`): if the interrupt or
-  exception came from ring 3, it executes `swapgs` on entry and `swapgs` before
-  `iretq`. For IST vectors (`#DF`, `NMI`, `#MC`), which can preempt the
-  2-instruction `syscall` prologue before its `swapgs` even though
-  `CS == KERNEL_CODE`, the IST entry path checks `rdmsr(IA32_GS_BASE)`: if it
-  is below the kernel half (`< 0xffff_8000_0000_0000`), it executes `swapgs` and
-  records a flag so the exit path undoes it (or halts on crash).
+- **Syscall entry, RFLAGS sanitization and canonical RIP safety:** Because
+  `syscall` does not switch `rsp`, `lumen_syscall_entry` executes with
+  interrupts off: `swapgs`, saves user `rsp` to `gs:[user_rsp_scratch]`, loads
+  `gs:[kernel_rsp]`, builds a full register frame on the kernel stack (saving
+  `rcx` = user RIP, `r11` = user RFLAGS, `user_rsp_scratch`, and all GPRs),
+  zeros `rbp` (`xor ebp, ebp`) so kernel backtraces terminate cleanly at the
+  syscall boundary, re-enables interrupts via `irq::restore(true)` (respecting
+  `irq::disabled_for_good()`), and calls the Rust syscall dispatcher. Before
+  returning to ring 3, interrupts are disabled and the return frame is
+  validated on **both** return paths (`sysretq` and `iretq`):
+  - **RFLAGS sanitization:** `(rflags & 0x0024_0CD5) | 0x0202` — retains only
+    user-safe flags (`CF | PF | AF | ZF | SF | DF | OF | AC | ID`), forces
+    `IF = 1` and reserved bit 1 = 1, and unconditionally clears `TF`, `IOPL`,
+    `NT`, `RF`, `VM`, `VIF`, `VIP`, and all other reserved bits so neither
+    `sysretq` nor `iretq` (including `rt_sigreturn` in M8) can leak ring-3
+    port-I/O privileges or raise ring-0 `#GP`.
+  - **Canonical RIP validation:** both `sysretq` and `iretq` raise `#GP(0)` in
+    ring 0 (with user `GS_BASE` already loaded after `swapgs`) if the return
+    RIP is non-canonical. The kernel therefore checks `rip < USER_MAX`
+    **before** `swapgs` or returning: if non-canonical, it never attempts
+    `sysretq` or `iretq` and instead terminates the process (M6) or delivers
+    `SIGSEGV` (M8). For a valid canonical `rip < USER_MAX`, ordinary syscalls
+    return via `swapgs; sysretq` and rewritten register frames (`execve`,
+    `fork` child, `rt_sigreturn`) return via `swapgs; iretq` (with
+    `USER_CODE`/`USER_DATA`).
+- **Conditional `SWAPGS` and IST protection (incl. `#DB` / CVE-2018-8897):**
+  `lumen_isr_common` inspects the saved `CS` on the stack (`cs & 3 != 0`): if
+  the interrupt or exception came from ring 3, it executes `swapgs` on entry
+  and `swapgs` before `iretq`. For IST vectors—`#DF`, `NMI`, `#MC`, plus
+  **`#DB` (vector 1, `IST_DEBUG = 4`, guarded IST stack)** so a ring-3
+  `MOV SS`/`POP SS` + `SYSCALL` with `TF = 1` (CVE-2018-8897) cannot deliver
+  `#DB` onto untrusted user `RSP` at `LSTAR`—an exception can arrive in the
+  `syscall` entry or exit `swapgs` window with `CS == KERNEL_CODE`. Those IST
+  stubs therefore save `rax`/`rcx`/`rdx` first, read `rdmsr(IA32_GS_BASE)`,
+  and execute `swapgs` only if it is below the kernel half
+  (`< 0xffff_8000_0000_0000`), recording a stack flag to undo `swapgs` on
+  exit. Keeping `CR4.FSGSBASE = 0` and enforcing `addr < USER_MAX` on any
+  future `ARCH_SET_GS` guarantees user `GS_BASE` can never lie in the kernel
+  half.
 - **User exceptions do not crash the kernel:** When `lumen_exception_dispatch`
-  handles an exception with `cs & 3 != 0`:
+  handles **any** exception with `cs & 3 != 0` (including `#PF`, `#UD`, `#GP`,
+  `#DE`, `#SS`, `#AC`, `#MF`, `#XM`, `#DB`, `#BP`—guarding the kernel ktest
+  `#BP` resume branch with `cs & 3 == 0`):
   - `#PF` goes to the user VM demand-paging / CoW handler (section 5); if the
     fault is invalid, the process exits with a fatal fault status (M6) or
-    receives `SIGSEGV` (M8), logged once at `WARN` with pid, vector, `rip` and
-    `cr2`—never `crash::exception`.
-  - `#UD`, `#GP`, `#DE`, `#SS`, `#AC`, `#MF`, `#XM`, `#BP` from ring 3 likewise
-    terminate only the user process (M6) or deliver the corresponding POSIX
-    signal (M8). Any exception from ring 0 outside the `.lumen_fixup` table
-    below remains fatal and goes to `crash::exception` as before.
+    receives `SIGSEGV` with `si_addr = CR2` (M8), logged once at `WARN` with
+    pid, vector, `rip` and `cr2`—never `crash::exception`.
+  - Every other ring-3 exception likewise terminates only the offending user
+    process (M6) or delivers the corresponding POSIX signal (M8). Any exception
+    from ring 0 outside the `.lumen_fixup` table below (or a deferred `#DB` at
+    `LSTAR`, which clears `TF` and delivers `SIGTRAP`/terminates the user
+    process) remains fatal and goes to `crash::exception` as before.
 - **User FP/SSE/AVX state (`FXSAVE64` baseline + optional `XSAVE`) and `audit.py`:**
   - Every x86-64 CPU guarantees SSE2 and `FXSAVE64`/`FXRSTOR64`, whereas
     `XSAVE`/AVX depend on CPUID (and QEMU's default `-cpu qemu64` in
-    `lumen_harness/qemu.py` does not expose `XSAVE`/AVX). At boot (and on each
-    AP), the kernel clears `CR0.EM` and `CR0.TS`, sets `CR0.MP`, `CR4.OSFXSR`
-    and `CR4.OSXMMEXCPT`, and enables `CR4.OSXSAVE` + `XCR0` (x87 + SSE + AVX)
-    only when CPUID leaf 1 ECX bit 26 (`XSAVE`) is present.
+    `lumen_harness/qemu.py` does not expose `XSAVE`/AVX). On the boot CPU and
+    each AP (`ap_main`), the kernel clears `CR0.EM` and `CR0.TS`, sets `CR0.MP`,
+    **`CR0.NE`** (bit 5, so unmasked ring-3 x87 errors raise `#MF` vector 16
+    rather than legacy IRQ 13), `CR4.OSFXSR` and `CR4.OSXMMEXCPT`. Only when
+    CPUID leaf 1 ECX bit 26 (`XSAVE`) is set does it enable `CR4.OSXSAVE`,
+    write `XCR0 = 0x3 | (cpuid(0xD, 0).eax & 0x4)` (enabling AVX bit 2 only if
+    hardware actually supports it—avoiding `#GP(0)` on XSAVE-without-AVX CPUs),
+    and then query `CPUID(0xD, 0).ebx` for the active save-area size.
   - Each user thread owns an aligned FPU save buffer: a 512-byte,
     16-byte-aligned `FxSaveArea` (initialized with `FCW = 0x037F`,
     `MXCSR = 0x1F80`) on baseline CPUs, or a 64-byte-aligned CPUID-sized
-    `XSaveArea` when `XSAVE` is active. Pure kernel threads carry no FPU buffer.
-    Because kernel code uses no SIMD/x87, user FPU state is saved/restored only
-    when switching between threads (eagerly on switch out/in of a user thread)
-    and when delivering/returning from user signals (M8), not on every syscall.
-  - **`make audit` exemption (hard rule 3):** `tools/harness/lumen_harness/audit.py`
-    keeps its ban on `%xmm`/`%ymm`/`%zmm`/`%mm`/`%k` registers across the
-    entire kernel binary and keeps its ban on SIMD state mnemonics everywhere
-    **except** inside two exact named symbols (`lumen_fpu_save` and
-    `lumen_fpu_restore`), which execute only `fxsave64`/`fxrstor64` (and
-    `xsave64`/`xrstor64` when `XSAVE` is enabled). `tests/harness/test_audit.py`
-    pins a negative test proving that `fxsave64`, `xsave64`, or any `%xmm`
-    instruction in any other function still fails `audit:flags`.
+    `XSaveArea` when `XSAVE` is active (reset to clean initial state on
+    `execve`; in M8, `rt_sigreturn` masks `MXCSR` against `MXCSR_MASK` and
+    validates `XSTATE_BV`/`XCOMP_BV` before restoring to prevent ring-0 `#GP`).
+    Pure kernel threads carry no FPU buffer. Because kernel code uses no
+    SIMD/x87, user FPU state is saved/restored only on thread context switches
+    and signal delivery/return (M8), not on every syscall.
+  - **`make audit` exemption (hard rule 3):** `lumen_fpu_save` and
+    `lumen_fpu_restore` must be defined via `global_asm!` or
+    `#[unsafe(naked)] #[unsafe(no_mangle)]` so both lower to `module asm` with
+    **no LLVM IR `define`** (`audit.py`'s `check_ir` stays 100% strict with no
+    IR allowlist, LLVM cannot inline them into `sched`, and un-demangled
+    `llvm-objdump -d` sees their exact symbol names). `audit.py` exempts
+    **only** `fxsave64`/`xsave64` inside `lumen_fpu_save` and
+    `fxrstor64`/`xrstor64` inside `lumen_fpu_restore`, keeping `%xmm`/`%ymm`/
+    `%zmm`/`%mm`/`%k` registers banned everywhere (including inside those two
+    symbols). `tests/harness/test_audit.py` pins a negative test proving that
+    `fxsave64`, `xsave64`, or any `%xmm` instruction in any other symbol still
+    fails `audit:flags`.
 - **Thread-Local Storage (`IA32_FS_BASE`):** Each user thread stores a
   `fs_base: u64` field (default 0), updated by `arch_prctl(ARCH_SET_FS, addr)`
-  (validating `addr < USER_MAX`) and written to `IA32_FS_BASE` (`0xC000_0100`)
-  on context switch.
+  (validating `addr < USER_MAX`, allowing `0`) and written to `IA32_FS_BASE`
+  (`0xC000_0100`) on context switch.
 - **Fault-safe user memory copies (`copy_from_user` / `copy_to_user`):**
   Every kernel read/write of user memory goes through `user::copy_from_user` /
   `copy_to_user` / `copy_cstr_from_user`:
-  1. Validates `start >= USER_MIN` and `start.checked_add(len) <= Some(USER_MAX)`
-     before touching memory (rejecting kernel pointers and wraparound with
-     `-EFAULT`).
-  2. Executes a small assembly copy routine whose faulting load/store
-     instruction addresses are registered in a read-only `.lumen_fixup` linker
-     section (`struct Fixup { fault_rip: u64, fixup_rip: u64 }`, placed inside
-     `.rodata` so `make audit` verifies it is read-only and inside
+  1. **Lock-ordering precondition:** must never be called with any `SpinLock`
+     held or interrupts off (`debug_assert!(irq::enabled() && irq::depth() == 0)`),
+     so a demand-paging `#PF` inside a copy can never re-lock a held `SpinLock`
+     or invert `heap -> paging -> frame`.
+  2. **Bounds check:** returns `Ok(())` immediately if `len == 0` (POSIX allows
+     zero-length `read`/`write` with a null pointer); otherwise validates
+     `start >= USER_MIN` and
+     `start.checked_add(len).is_some_and(|end| end <= USER_MAX)` before
+     touching memory (explicitly rejecting `u64` overflow and kernel pointers
+     with `-EFAULT`).
+  3. **Fixup table:** executes a small assembly copy routine whose faulting
+     load/store instruction addresses are registered in a read-only
+     `.lumen_fixup` linker section (`"a"` flags, `ALIGN(8)` +
+     `KEEP(*(.lumen_fixup))` inside `:rodata` in `kernel/linker.ld` so
+     `make audit` verifies it is read-only and inside
      `[__kernel_start, __kernel_end)`).
-  3. If `#PF` fires in ring 0 with `frame.rip` matching a `.lumen_fixup` entry
-     and `CR2` in `USER_MIN..USER_MAX`, the handler first runs user demand
-     paging / CoW for `CR2`; if the address is unmapped or lacks the required
-     permission, it sets `frame.rip = fixup_rip` and resumes, returning
-     `Err(EFAULT)` instead of panicking.
-  4. If the CPU advertises `SMEP` (CPUID 7.0 EBX bit 7) or `SMAP` (CPUID 7.0
-     EBX bit 20), boot enables them in `CR4` and the copy routine brackets user
-     accesses with `stac`/`clac` when `SMAP` is active.
+  4. **Fault resolution:** if `#PF` fires in ring 0 with `frame.rip` matching a
+     `.lumen_fixup` entry and `CR2` in `USER_MIN..USER_MAX` (with `RSVD == 0`),
+     the handler first runs user demand paging / CoW for `CR2`; if the address
+     is unmapped or lacks the required permission, it sets
+     `frame.rip = fixup_rip` (and clears `RFLAGS.AC` in `frame.rflags` if SMAP
+     is active) and resumes, returning `Err(EFAULT)` instead of panicking.
+  5. **Optional SMEP/SMAP:** if `cpuid(0).eax >= 7`, boot/AP setup checks
+     CPUID 7.0 EBX bit 7 (`SMEP`) and bit 20 (`SMAP`) and enables them in
+     `CR4`. Because `stac`/`clac` raise `#UD` on CPUs without SMAP (including
+     QEMU's default `-cpu qemu64`) and hardware interrupt gates do not clear
+     `RFLAGS.AC`, SMAP code paths are runtime-gated on `SMAP_ENABLED`: the copy
+     routine brackets accesses with `stac`/`clac` only when `SMAP_ENABLED`,
+     `lumen_isr_common` clears `AC` on entry when `SMAP_ENABLED` (preventing
+     `AC = 1` from leaking into `#PF`/IRQs or across `context::switch`), and
+     the fixup path clears `AC` in `frame.rflags`.
 
 ### Kernel threads (built in M2)
 
@@ -1124,8 +1209,10 @@ IPI is tested; how soon the thread runs isn't, a loaded host decides it).
 
 - **Switching** (`arch::context::switch`, naked asm): pushes the
   callee-saved registers (rbx, rbp, r12-r15), saves `rsp`, loads the next
-  thread's and pops its registers. There is no SSE/AVX state (`make audit`
-  proves none is used; x87 isn't checked). It happens only with interrupts
+  thread's and pops its registers. Kernel threads carry no SSE/AVX state
+  (`make audit` proves kernel code uses none; M6 user threads save/restore
+  FP/SSE state around `switch` via the two allowlisted assembly stubs above).
+  It happens only with interrupts
   off and no critical section open (asserted): a held `SpinLock`'s section
   belongs to the CPU, so one held across a switch would be closed by
   another thread. Whether interrupts were on is a local on the switching
