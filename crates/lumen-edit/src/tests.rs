@@ -417,6 +417,28 @@ fn undo_forgets_the_goal_column() {
 }
 
 #[test]
+fn undo_and_redo_forget_a_goal_column_kept_until_them() {
+    // A goal kept through Up and Down right before the undo (no edit
+    // between to clear it first): the undo forgets it, and so does the redo.
+    let mut e = ed("abcdef\nab\nabcdef");
+    for _ in 0..5 {
+        e.apply(Command::Right);
+    }
+    e.apply(Command::Down);
+    e.apply(Command::Insert('x'));
+    e.apply(Command::Up);
+    e.apply(Command::Undo);
+    assert_eq!(e.line_col(), (1, 2));
+    e.apply(Command::Down);
+    assert_eq!(e.line_col(), (2, 2), "down from column 2, not the goal Up set");
+    e.apply(Command::Up);
+    e.apply(Command::Redo);
+    assert_eq!(e.line_col(), (1, 3));
+    e.apply(Command::Down);
+    assert_eq!(e.line_col(), (2, 3), "the redo forgot it too");
+}
+
+#[test]
 fn modified_is_the_text_not_the_history() {
     let mut e = ed("abc");
     e.apply(Command::Insert('x'));
