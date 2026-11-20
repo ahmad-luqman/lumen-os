@@ -36,6 +36,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "comet"
+version = "0.0.1"
+dependencies = [
+ "lumen-app",
+ "lumen-snake",
+ "lumen-ui",
+]
+
+[[package]]
 name = "embedded-io"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -105,6 +114,10 @@ dependencies = [
  "zune-core",
  "zune-png",
 ]
+
+[[package]]
+name = "lumen-snake"
+version = "0.0.1"
 
 [[package]]
 name = "lumen-trace"
