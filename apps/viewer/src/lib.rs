@@ -72,8 +72,9 @@ enum Shown {
     Decoding,
     /// The image, and its copy fitted to the view.
     Image(Prepared),
-    /// Why it couldn't be shown.
-    Failed(String),
+    /// Why it couldn't be shown, and that reason wrapped to the view's
+    /// width (worked out at its first paint).
+    Failed { why: String, lines: Option<Vec<String>> },
 }
 
 struct Viewer {
@@ -153,12 +154,12 @@ impl Viewer {
                 // is the memory plan failing (lumen-view's tests/memory.rs
                 // says it fits), worth a warning.
                 if why.out_of_memory() {
-                    log::warn(&format!("viewer: {name}: out of memory: lumen-view's memory plan doesn't hold ({why})"));
+                    log::warn(&format!("{name}: out of memory: lumen-view's memory plan doesn't hold ({why})"));
                 } else {
-                    log::info(&format!("viewer: {name}: {why}"));
+                    log::info(&format!("{name}: {why}"));
                 }
                 let info = format!("{name}: {why}");
-                self.shown = Shown::Failed(why.to_string());
+                self.shown = Shown::Failed { why: why.to_string(), lines: None };
                 info
             }
         };
@@ -189,6 +190,33 @@ impl Viewer {
         self.pan_by(dx, dy);
         Taken::Took
     }
+}
+
+/// `text` cut into lines at most `width` pixels wide at its spaces (a word
+/// wider than that alone on its line, cut by the clip when drawn); each
+/// word measured once.
+fn wrap(text: &mut dyn lumen_ui::Text, s: &str, width: u32) -> Vec<String> {
+    let space = text.width(" ");
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    let mut line_w = 0;
+    for word in s.split(' ').filter(|w| !w.is_empty()) {
+        let w = text.width(word);
+        if !line.is_empty() && line_w + space + w > width {
+            lines.push(core::mem::take(&mut line));
+            line_w = 0;
+        }
+        if !line.is_empty() {
+            line.push(' ');
+            line_w += space;
+        }
+        line.push_str(word);
+        line_w += w;
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// The images' names, in the list's order.
@@ -225,28 +253,42 @@ impl App for Viewer {
     }
 
     fn paint_over(&mut self, over: &mut Over<'_>) {
-        let (x, y) = (VIEW.x() + TEXT_INSET, VIEW.y() + TEXT_INSET);
+        let name = IMAGES[self.current].name;
+        // Text lines: drawn only where their box meets what is repainted
+        // (each `text_draw` is charged by the character, wherever it lands).
+        let line_h = over.text.line_height() as i32;
+        let text_w = VIEW.w() - 2 * TEXT_INSET as u32;
+        let line_at = |n: usize| Rect::new(VIEW.x() + TEXT_INSET, VIEW.y() + TEXT_INSET + n as i32 * line_h, text_w, line_h as u32);
+        if let Shown::Failed { why, lines: lines @ None } = &mut self.shown {
+            *lines = Some(wrap(over.text, why, text_w));
+        }
+        let text: Vec<String> = match &self.shown {
+            Shown::Image(_) => Vec::new(),
+            Shown::Decoding => alloc::vec![format!("Decoding {name}...")],
+            Shown::Failed { lines, .. } => {
+                let mut text = alloc::vec![format!("Can't show {name}:")];
+                text.extend(lines.iter().flatten().cloned());
+                text
+            }
+        };
         for r in over.rects {
             let Some(clip) = r.intersect(&VIEW) else { continue };
-            match &self.shown {
-                Shown::Image(shown) => {
-                    let (image, fitted) = (shown.image(), shown.fitted());
-                    if self.fit {
-                        blit(over.surface, fitted.pixels(), fitted.at().x(), fitted.at().y(), clip);
-                    } else {
-                        let p = actual(image.width(), image.height(), VIEW, self.pan);
-                        blit(over.surface, image, p.dst.x() - p.src_x as i32, p.dst.y() - p.src_y as i32, clip);
-                    }
+            if let Shown::Image(shown) = &self.shown {
+                let (image, fitted) = (shown.image(), shown.fitted());
+                if self.fit {
+                    blit(over.surface, fitted.pixels(), fitted.at().x(), fitted.at().y(), clip);
+                } else {
+                    let p = actual(image.width(), image.height(), VIEW, self.pan);
+                    blit(over.surface, image, p.dst.x() - p.src_x as i32, p.dst.y() - p.src_y as i32, clip);
                 }
-                Shown::Decoding => {
-                    let line = format!("Decoding {}...", IMAGES[self.current].name);
-                    over.text.draw(over.surface, x, y, &line, over.palette.text, clip);
+            }
+            for (n, line) in text.iter().enumerate() {
+                let at = line_at(n);
+                if at.bottom() > VIEW.bottom() {
+                    break;
                 }
-                Shown::Failed(why) => {
-                    let first = format!("Can't show {}:", IMAGES[self.current].name);
-                    over.text.draw(over.surface, x, y, &first, over.palette.text, clip);
-                    let next = y + over.text.line_height() as i32;
-                    over.text.draw(over.surface, x, next, why, over.palette.text, clip);
+                if let Some(cut) = at.intersect(&clip) {
+                    over.text.draw(over.surface, at.x(), at.y(), line, over.palette.text, cut);
                 }
             }
         }
@@ -300,7 +342,7 @@ fn run() -> i32 {
     match first_image() {
         Ok(first) => lumen_app::report(app(first)),
         Err(why) => {
-            log::error(&format!("viewer: {why}"));
+            log::error(&why);
             1
         }
     }
