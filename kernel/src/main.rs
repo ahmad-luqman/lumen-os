@@ -139,7 +139,6 @@ extern "C" fn kmain(stack_top: u64) -> ! {
     }
     log_memory_map();
     mm::init();
-    arch::fpu::init_cpu();
     ktrace!(Kind::BootPhase, BootPhase::Memory);
     let main_stack = install_stacks();
     ktrace!(Kind::BootPhase, BootPhase::Stacks);
@@ -179,6 +178,7 @@ fn install_stacks() -> StackRange {
 
 /// The rest of boot, on the allocated main stack.
 extern "C" fn kmain_on_kernel_stack() -> ! {
+    arch::fpu::init_cpu();
     acpi::init();
     ktrace!(Kind::BootPhase, BootPhase::Acpi);
     // Sizing a BAR turns its device's decoding off for a moment: this runs

@@ -78,12 +78,22 @@ ffffffff80002024:      \txsave64\t(%rdi)
             bad = f"ffffffff80003000 <{sym}>:\nffffffff80003000:      \t{insn}\n"
             assert [f.check for f in scan_disassembly(bad)] == ["simd"], (sym, insn)
 
-    # Vector/MMX/mask registers are banned everywhere, even inside the stubs.
+    # Vector/MMX/mask registers and non-allowlisted state instructions (including
+    # 32-bit fxsave/xsave/fxrstor/xrstor and ldmxcsr/stmxcsr) are banned
+    # everywhere, even inside the two named stubs.
     for stub in ("lumen_fpu_save", "lumen_fpu_restore"):
         for insn in (
             "movaps\t%xmm0, (%rdi)",
             "vmovdqu\t%ymm0, (%rdi)",
+            "vmovdqu64\t%zmm0, (%rdi)",
+            "movq\t%mm0, (%rdi)",
             "kmovw\t%k1, %eax",
+            "fxsave\t(%rdi)",
+            "xsave\t(%rdi)",
+            "fxrstor\t(%rdi)",
+            "xrstor\t(%rdi)",
+            "ldmxcsr\t(%rdi)",
+            "stmxcsr\t(%rdi)",
         ):
             bad = f"ffffffff80002000 <{stub}>:\nffffffff80002000:      \t{insn}\n"
             assert [f.check for f in scan_disassembly(bad)] == ["simd"], (stub, insn)

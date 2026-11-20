@@ -11,7 +11,7 @@
 //! See `docs/ARCHITECTURE.md` §6 ("User FP/SSE/AVX state" and "Thread-Local
 //! Storage").
 
-use alloc::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
+use alloc::alloc::{Layout, alloc, alloc_zeroed, dealloc, handle_alloc_error};
 use core::arch::{asm, global_asm};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -52,6 +52,12 @@ const XCR0_AVX: u64 = 1 << 2;
 
 /// Legacy `FXSAVE64` buffer size in bytes.
 pub const FXSAVE_SIZE: usize = 512;
+/// Byte offset of the 64-byte `XSAVE` header (`XSTATE_BV`, `XCOMP_BV`, reserved).
+pub const XSAVE_HEADER_OFFSET: usize = 512;
+/// Length of the `XSAVE` header in bytes.
+pub const XSAVE_HEADER_SIZE: usize = 64;
+/// Minimum valid `XSAVE64` save-area size in bytes (512-byte legacy region + 64-byte header).
+pub const XSAVE_MIN_SIZE: usize = XSAVE_HEADER_OFFSET + XSAVE_HEADER_SIZE;
 /// Buffer alignment in bytes: 64 bytes satisfies both `FXSAVE64` (16-byte)
 /// and `XSAVE64`/`XRSTOR64` (64-byte).
 pub const FPU_ALIGN: usize = 64;
@@ -71,8 +77,9 @@ const MXCSR_OFFSET: usize = 24;
 
 /// `IA32_FS_BASE` MSR: user thread-local storage base address.
 const IA32_FS_BASE: u32 = 0xC000_0100;
-/// First non-canonical address; lower-half canonical user addresses are `< USER_CANONICAL_LIMIT`.
-const USER_CANONICAL_LIMIT: u64 = 0x0000_8000_0000_0000;
+/// Exclusive upper bound of the user virtual address space (`docs/ARCHITECTURE.md` §5/§6;
+/// the top canonical page `0x0000_7fff_ffff_f000` remains unmapped as a boundary guard).
+pub const USER_MAX: u64 = 0x0000_7fff_ffff_f000;
 
 /// Detected FPU save/restore mechanism on this machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,7 +128,7 @@ static XSAVE_XCR0: AtomicU64 = AtomicU64::new(0);
 // `%mm`/`%k`) or the red zone.
 global_asm!(
     r#"
-    .section .text.lumen_fpu, "ax"
+    .pushsection .text.lumen_fpu, "ax", @progbits
     .globl lumen_fpu_save
     .type lumen_fpu_save, @function
     .balign 16
@@ -153,6 +160,7 @@ lumen_fpu_restore:
     fxrstor64 (%rdi)
     ret
     .size lumen_fpu_restore, . - lumen_fpu_restore
+    .popsection
 "#,
     options(att_syntax)
 );
@@ -207,13 +215,20 @@ fn configure_registers() -> FpuMode {
     unsafe { write_cr4(base_cr4 | CR4_OSXSAVE) };
 
     let supported_xcr0 = cpuid_count(0xD, 0).0;
+    if supported_xcr0 & 0x3 != 0x3 {
+        // Defensive fallback if a non-standard CPUID leaf omits x87/SSE bits.
+        // SAFETY: `base_cr4` keeps `OSFXSR` and `OSXMMEXCPT` enabled and clears `OSXSAVE`.
+        unsafe { write_cr4(base_cr4) };
+        return FpuMode::FxSave;
+    }
+
     let xcr0 = (XCR0_X87 | XCR0_SSE) | (u64::from(supported_xcr0) & XCR0_AVX);
-    // SAFETY: `CR4.OSXSAVE` is set, bit 0 (`x87`) and bit 1 (`SSE`) are
-    // architectural on x86-64, and bit 2 (`AVX`) is masked by `CPUID(0xD,0).eax`.
+    // SAFETY: `CR4.OSXSAVE` is set, `supported_xcr0 & 0x3 == 0x3` was verified
+    // above, and bit 2 (`AVX`) is masked by `CPUID(0xD, 0).eax`.
     unsafe { xsetbv(0, xcr0) };
 
     let size = cpuid_count(0xD, 0).1 as usize;
-    if (FXSAVE_SIZE..=MAX_XSAVE_SIZE).contains(&size) && size.is_multiple_of(FPU_ALIGN) {
+    if (XSAVE_MIN_SIZE..=MAX_XSAVE_SIZE).contains(&size) && size.is_multiple_of(FPU_ALIGN) {
         FpuMode::XSave { size, xcr0 }
     } else {
         // Unexpected CPUID save-area size: disable OSXSAVE and fall back safely.
@@ -236,12 +251,12 @@ pub fn mode() -> FpuMode {
 
 /// Initialize FPU/SSE/AVX hardware state on the current CPU.
 ///
-/// Called once on the boot CPU (in `kmain`, right after `mm::init`) and once
-/// on each AP (in `smp::ap_main`, once on kernel page tables and its guarded
-/// stack). The boot CPU detects and publishes the active [`FpuMode`] and
-/// verifies the `lumen_fpu_restore` / `lumen_fpu_save` round-trip; each AP
-/// applies the identical `CR0`/`CR4`/`XCR0` setup and loads a clean baseline
-/// state.
+/// Called once on the boot CPU (at the start of `kmain_on_kernel_stack`, once
+/// the heap, guarded main stack, and IST stacks are active) and once on each AP
+/// (in `smp::ap_main`, once on kernel page tables and its guarded stack). The
+/// boot CPU detects and publishes the active [`FpuMode`] and verifies the
+/// `lumen_fpu_restore` / `lumen_fpu_save` round-trip; each AP applies the
+/// identical `CR0`/`CR4`/`XCR0` setup and loads a clean baseline state.
 pub fn init_cpu() {
     let detected = configure_registers();
     if super::percpu::index() == 0 {
@@ -313,6 +328,10 @@ impl UserFpuState {
     }
 
     fn write_defaults(&mut self) {
+        // In `XSAVE` mode, leaving bytes 512..576 zeroed sets `XSTATE_BV = 0`
+        // and `XCOMP_BV = 0` (standard, non-compacted format), so `XRSTOR64`
+        // initializes x87/XMM/YMM registers to clean architectural defaults
+        // while loading `MXCSR` from offset 24.
         let bytes = self.as_bytes_mut_internal();
         bytes[FCW_OFFSET..FCW_OFFSET + 2].copy_from_slice(&DEFAULT_FCW.to_le_bytes());
         bytes[MXCSR_OFFSET..MXCSR_OFFSET + 4].copy_from_slice(&DEFAULT_MXCSR.to_le_bytes());
@@ -392,8 +411,9 @@ impl Default for UserFpuState {
 
 impl Clone for UserFpuState {
     fn clone(&self) -> Self {
-        // SAFETY: `self.layout` is the valid layout used to allocate `self`.
-        let raw = unsafe { alloc_zeroed(self.layout) };
+        // SAFETY: `self.layout` is the valid nonzero layout used to allocate `self`;
+        // every byte is immediately initialized by `copy_nonoverlapping` below.
+        let raw = unsafe { alloc(self.layout) };
         let Some(ptr) = NonNull::new(raw) else {
             handle_alloc_error(self.layout);
         };
@@ -419,44 +439,72 @@ pub fn read_fs_base() -> u64 {
 
 /// Write the current CPU's `IA32_FS_BASE` MSR (`0xC000_0100`).
 ///
-/// Panics if `addr >= 0x0000_8000_0000_0000` (not a lower-half canonical user
-/// address).
+/// Panics if `addr >= USER_MAX` (`0x0000_7fff_ffff_f000`, per
+/// `docs/ARCHITECTURE.md` §5/§6; `0` is allowed).
 ///
 /// # Safety
 /// The caller must ensure changing `FS` base is valid for the currently
 /// running thread / user context.
 #[allow(dead_code)] // HAL surface for M6 TLS / context switch
 pub unsafe fn write_fs_base(addr: u64) {
-    assert!(addr < USER_CANONICAL_LIMIT, "IA32_FS_BASE {addr:#x} is not a lower-half canonical user address");
-    // SAFETY: `IA32_FS_BASE` exists on every x86-64 CPU, and `addr` was just
-    // verified to be canonical so `wrmsr` cannot raise `#GP(0)`.
+    assert!(addr < USER_MAX, "IA32_FS_BASE {addr:#x} is not below USER_MAX ({USER_MAX:#x})");
+    // SAFETY: `IA32_FS_BASE` exists on every x86-64 CPU, and `addr < USER_MAX`
+    // guarantees a canonical lower-half address so `wrmsr` cannot raise `#GP(0)`.
     unsafe { wrmsr(IA32_FS_BASE, addr) };
+}
+
+#[cfg(feature = "ktest")]
+fn check_cr0_cr4(cr0: u64, cr4: u64, active: FpuMode) -> crate::ktest::TestResult {
+    crate::kassert!(cr0 & CR0_NE != 0);
+    crate::kassert_eq!(cr0 & CR0_EM, 0);
+    crate::kassert_eq!(cr0 & CR0_TS, 0);
+    crate::kassert!(cr0 & CR0_MP != 0);
+    crate::kassert!(cr4 & CR4_OSFXSR != 0);
+    crate::kassert!(cr4 & CR4_OSXMMEXCPT != 0);
+    crate::kassert_eq!(cr4 & CR4_FSGSBASE, 0);
+    match active {
+        FpuMode::FxSave => crate::kassert_eq!(cr4 & CR4_OSXSAVE, 0),
+        FpuMode::XSave { .. } => crate::kassert!(cr4 & CR4_OSXSAVE != 0),
+    }
+    Ok(())
 }
 
 crate::ktest!(
     fn save_restore_roundtrip_preserves_control_words() {
-        let cr0 = read_cr0();
-        let cr4 = read_cr4();
-        crate::kassert!(cr0 & CR0_NE != 0);
-        crate::kassert_eq!(cr0 & CR0_EM, 0);
-        crate::kassert_eq!(cr0 & CR0_TS, 0);
-        crate::kassert!(cr0 & CR0_MP != 0);
-        crate::kassert!(cr4 & CR4_OSFXSR != 0);
-        crate::kassert!(cr4 & CR4_OSXMMEXCPT != 0);
-        crate::kassert_eq!(cr4 & CR4_FSGSBASE, 0);
+        use core::sync::atomic::AtomicBool;
 
         let active = mode();
         match active {
             FpuMode::FxSave => {
-                crate::kassert_eq!(cr4 & CR4_OSXSAVE, 0);
                 crate::kassert_eq!(active.area_size(), FXSAVE_SIZE);
             }
             FpuMode::XSave { size, xcr0 } => {
-                crate::kassert!(cr4 & CR4_OSXSAVE != 0);
-                crate::kassert!(size >= FXSAVE_SIZE && size.is_multiple_of(FPU_ALIGN));
+                crate::kassert!(size >= XSAVE_MIN_SIZE && size.is_multiple_of(FPU_ALIGN));
                 crate::kassert!(xcr0 & (XCR0_X87 | XCR0_SSE) == (XCR0_X87 | XCR0_SSE));
             }
         }
+
+        // Verify CR0/CR4 on the boot CPU and across every online AP.
+        check_cr0_cr4(read_cr0(), read_cr4(), active)?;
+        static AP_CR0: AtomicU64 = AtomicU64::new(0);
+        static AP_CR4: AtomicU64 = AtomicU64::new(0);
+        static AP_DONE: AtomicBool = AtomicBool::new(false);
+        let mut checked_aps = 0usize;
+        for cpu in 1..super::percpu::MAX_CPUS {
+            if crate::smp::online_lapic_id(cpu).is_none() {
+                continue;
+            }
+            AP_DONE.store(false, Ordering::Release);
+            crate::smp::run_on_test(cpu, || {
+                AP_CR0.store(read_cr0(), Ordering::Relaxed);
+                AP_CR4.store(read_cr4(), Ordering::Relaxed);
+                AP_DONE.store(true, Ordering::Release);
+            })?;
+            crate::kassert!(crate::smp::job_reached(cpu, || AP_DONE.load(Ordering::Acquire)));
+            check_cr0_cr4(AP_CR0.load(Ordering::Relaxed), AP_CR4.load(Ordering::Relaxed), active)?;
+            checked_aps += 1;
+        }
+        crate::kassert!(checked_aps > 0);
 
         let initial = UserFpuState::new();
         crate::kassert!((initial.as_ptr() as usize).is_multiple_of(FPU_ALIGN));
@@ -464,19 +512,41 @@ crate::ktest!(
         crate::kassert_eq!(initial.fcw(), DEFAULT_FCW);
         crate::kassert_eq!(initial.mxcsr(), DEFAULT_MXCSR);
 
-        // Restore clean defaults into hardware, then save into a zeroed buffer
-        // to prove `lumen_fpu_save` actually writes FCW and MXCSR back out.
-        initial.restore();
+        // Round-trip non-default valid control words so a broken/no-op restore
+        // cannot pass by relying on hardware reset defaults.
+        const CUSTOM_FCW: u16 = 0x0F7F;
+        const CUSTOM_MXCSR: u32 = 0x7F80;
+        let mut custom = UserFpuState::new();
+        {
+            let bytes = custom.as_bytes_mut_internal();
+            bytes[FCW_OFFSET..FCW_OFFSET + 2].copy_from_slice(&CUSTOM_FCW.to_le_bytes());
+            bytes[MXCSR_OFFSET..MXCSR_OFFSET + 4].copy_from_slice(&CUSTOM_MXCSR.to_le_bytes());
+            if matches!(active, FpuMode::XSave { .. }) {
+                // Mark x87 + SSE present in XSTATE_BV so XRSTOR64 loads FCW
+                // from offset 0 instead of initializing x87 to 0x037F.
+                let xstate_bv = XCR0_X87 | XCR0_SSE;
+                bytes[XSAVE_HEADER_OFFSET..XSAVE_HEADER_OFFSET + 8].copy_from_slice(&xstate_bv.to_le_bytes());
+            }
+        }
+        custom.restore();
+
         let mut saved = UserFpuState::new();
         saved.as_bytes_mut_internal().fill(0);
         crate::kassert_eq!(saved.fcw(), 0);
         crate::kassert_eq!(saved.mxcsr(), 0);
+        saved.save();
+        crate::kassert_eq!(saved.fcw(), CUSTOM_FCW);
+        crate::kassert_eq!(saved.mxcsr(), CUSTOM_MXCSR);
 
+        // Restore clean defaults (XSTATE_BV = 0 in XSAVE mode) and verify
+        // hardware returns to DEFAULT_FCW / DEFAULT_MXCSR.
+        initial.restore();
+        saved.as_bytes_mut_internal().fill(0);
         saved.save();
         crate::kassert_eq!(saved.fcw(), DEFAULT_FCW);
         crate::kassert_eq!(saved.mxcsr(), DEFAULT_MXCSR);
 
-        // Verify `IA32_FS_BASE` round-trip with a canonical lower-half address,
+        // Verify `IA32_FS_BASE` round-trip with a valid user address (< USER_MAX),
         // restoring 0 afterward.
         let sample_tls = 0x0000_7fff_1234_5678u64;
         // SAFETY: no user thread is running during ktest; we restore 0 right after.
