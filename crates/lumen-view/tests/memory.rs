@@ -134,10 +134,6 @@ const COSTLY: &[u8] = include_bytes!("../../../apps/viewer/images/costly.png");
 const WORST: &[u8] = include_bytes!("worst.png");
 const WORST16: &[u8] = include_bytes!("worst16.png");
 
-/// A PNG exactly `lumen_view::MAX_FILE_BYTES` long whose image data is
-/// incompressible (zlib stored blocks of pseudo-random rows): the most the
-/// file's copies can take. 8-bit RGB 1280 pixels wide, as many rows as the
-/// length allows, padded to the cap with an ancillary chunk.
 /// `png`'s chunks after the signature: (type, data).
 fn chunks(png: &[u8]) -> Vec<([u8; 4], &[u8])> {
     let mut out = Vec::new();
@@ -192,6 +188,10 @@ fn padded(png: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A PNG exactly `lumen_view::MAX_FILE_BYTES` long whose image data is
+/// incompressible (zlib stored blocks of pseudo-random rows): the most the
+/// file's copies can take. 8-bit RGB 1280 pixels wide, as many rows as the
+/// length allows, padded to the cap with an ancillary chunk.
 fn longest() -> Vec<u8> {
     const W: usize = 1280;
     const ROW: usize = 1 + 3 * W;
