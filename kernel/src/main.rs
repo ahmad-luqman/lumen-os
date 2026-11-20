@@ -44,6 +44,7 @@ mod interrupts;
 mod keyboard;
 mod klog;
 mod ktest;
+mod linux;
 mod mm;
 mod mouse;
 mod pci;
@@ -232,6 +233,7 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     drivers::probe_all();
     // Randomness: RDRAND, and the virtio-rng the probe brought up.
     rng::init();
+    linux::log_abi_summary();
 
     // Keep these three together and in this order (`boot complete`, the
     // complete mark, the timeline's line): test_boot_timeline_printed checks
