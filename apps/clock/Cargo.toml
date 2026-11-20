@@ -1,0 +1,23 @@
+[package]
+name = "clock"
+description = "The clock (#200): an analog face and the digital time from the RTC, on the SDK's tick loop; the time a label in its automation tree. `run clock --at HH:MM[:SS]` freezes it. Its geometry and time of day are lumen-clock's (host-tested)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+# A WASM module has no host-side tests: its logic is lumen-clock's, and the
+# kernel runs it (tests/scenarios/test_apps.py).
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+lumen-app.workspace = true
+lumen-clock.workspace = true
+lumen-ui.workspace = true
+
+[lints]
+workspace = true
