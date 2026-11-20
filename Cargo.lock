@@ -286,6 +286,11 @@ version = "0.0.1"
 [[package]]
 name = "lumen-edit"
 version = "0.0.1"
+dependencies = [
+ "lumen-app-api",
+ "lumen-input",
+ "pc-keyboard",
+]
 
 [[package]]
 name = "lumen-elf"

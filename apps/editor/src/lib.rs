@@ -5,10 +5,12 @@
 //! edit that undo takes back. Its editing is `lumen_edit::Editor`'s
 //! (host-tested).
 //!
-//! - **Keys** go to it whatever has the focus: characters type, Enter
-//!   breaks the line, Tab inserts four spaces, Backspace and Delete, the
-//!   arrows, Home and End (with Ctrl: the text's start and end), Page Up
-//!   and Page Down; Ctrl+Z undoes, Ctrl+Y and Ctrl+Shift+Z redo.
+//! - **Keys** go to it whatever has the focus, mapped by
+//!   `lumen_edit::command` (host-tested, on several layouts): characters
+//!   type, Enter breaks the line, Tab inserts four spaces, Backspace and
+//!   Delete, the arrows, Home and End (with Ctrl: the text's start and
+//!   end), Page Up and Page Down; Ctrl+Z undoes, Ctrl+Y and Ctrl+Shift+Z
+//!   redo, by the layout's letters.
 //! - **Drawing** is by damage: only the lines an edit changed, the cursor's
 //!   old and new places for a move, everything only when the view scrolls.
 //!   Each line is drawn only inside the rectangles being repainted
@@ -41,7 +43,7 @@ use lumen_app::api::limits::{TEXT_BYTES, UI_TEXT_PX};
 use lumen_app::api::text::prefix;
 use lumen_app::gfx::Rect;
 use lumen_app::ui::{Flow, Taken, Ticking, Toolkit};
-use lumen_app::{Desktop, Error, Event, KeyAction, KeyCode, Mods, Time, log, mods};
+use lumen_app::{Desktop, Error, Event, KeyAction, Time, log};
 use lumen_edit::{Change, Command, Editor, Limits};
 use lumen_ui::ui::{GAP, PAD};
 use lumen_ui::{App, Over, Then, Ui, UiEvent, Widget};
@@ -263,7 +265,7 @@ impl EditorApp {
     /// focus), and the window's focus (seen, then handed on to the toolkit).
     fn take(&mut self, e: &Event) -> Taken {
         match *e {
-            Event::Key { code, mods, action: KeyAction::Press { text } } => match command(code, mods, text) {
+            Event::Key { code, mods, action: KeyAction::Press { text } } => match lumen_edit::command(code, mods, text) {
                 Some(cmd) => {
                     self.command(cmd);
                     Taken::Took
@@ -279,33 +281,6 @@ impl EditorApp {
             _ => Taken::Pass,
         }
     }
-}
-
-/// The command a key press stands for, if any.
-fn command(code: KeyCode, m: Mods, text: Option<char>) -> Option<Command> {
-    let ctrl = m.any(mods::CTRL);
-    let shift = m.any(mods::SHIFT);
-    Some(match code {
-        KeyCode::Z if ctrl && shift => Command::Redo,
-        KeyCode::Z if ctrl => Command::Undo,
-        KeyCode::Y if ctrl => Command::Redo,
-        KeyCode::Home if ctrl => Command::Top,
-        KeyCode::End if ctrl => Command::Bottom,
-        KeyCode::Return | KeyCode::NumpadEnter => Command::Newline,
-        KeyCode::Tab => Command::Tab,
-        KeyCode::Backspace => Command::Backspace,
-        KeyCode::Delete => Command::Delete,
-        KeyCode::ArrowLeft => Command::Left,
-        KeyCode::ArrowRight => Command::Right,
-        KeyCode::ArrowUp => Command::Up,
-        KeyCode::ArrowDown => Command::Down,
-        KeyCode::Home => Command::Home,
-        KeyCode::End => Command::End,
-        KeyCode::PageUp => Command::PageUp,
-        KeyCode::PageDown => Command::PageDown,
-        _ if ctrl => return None,
-        _ => return text.filter(|c| !c.is_control()).map(Command::Insert),
-    })
 }
 
 impl App for EditorApp {

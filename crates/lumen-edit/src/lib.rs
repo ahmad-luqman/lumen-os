@@ -27,6 +27,9 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+mod keys;
+pub use keys::command;
+
 /// What Tab inserts: four spaces.
 pub const TAB: &str = "    ";
 
