@@ -57,6 +57,21 @@
 //!   (`window: deaf: published; a bad tree then: -5`: the last one stays),
 //!   then sleeps for good, never reading its events: a request to it stays
 //!   queued, so its window's one request slot stays taken.
+//!
+//! The SDK's tick loop (`ui::Toolkit::run_until`), its window titled
+//! `window`, 320 × 160:
+//!
+//! - `tick`: a tree on the left (`Ticks`, a label counting the ticks;
+//!   `State`, `running` or `stopped`; buttons `Stop` and `Start`) and the
+//!   app's own area on the right, where a 16-pixel square in the palette's
+//!   accent moves 8 pixels a tick (its own damage, `take_drawn`). It ticks
+//!   every 50 ms while running (an animating wait) and not at all stopped
+//!   (so the desktop settles). `n` moves the square without a tick (taken
+//!   by the app: its drawing committed, the tree unchanged); Escape quits
+//!   (`Taken::Quit`). It logs `window: tick: running`, `window: tick:
+//!   accent 0x<rrggbb>` each time its frame is drawn in a new accent, and
+//!   `window: tick: ended after <n> ticks` when the loop returns (`Close` or
+//!   Escape), then returns 0.
 
 #![no_std]
 
@@ -71,10 +86,11 @@ use lumen_app::api::layout::Rect as WireRect;
 use lumen_app::api::limits::{TEXT_BYTES, TREE_NODES};
 use lumen_app::api::trace::{EVENT_SIZE, HEADER_SIZE, decode_header};
 use lumen_app::api::tree::{Common, Node, Text, Tree};
-use lumen_app::ui::Toolkit;
-use lumen_app::{Desktop, Error, Event, Rect, Time, Trace, log};
+use lumen_app::gfx::Rect as Area;
+use lumen_app::ui::{Flow, Taken, Ticking, Toolkit};
+use lumen_app::{Desktop, Error, Event, KeyAction, KeyCode, Rect, Time, Trace, log};
 use lumen_ui::counter::Counter;
-use lumen_ui::{App, Then, Ui, UiEvent};
+use lumen_ui::{App, Over, Then, Ui, UiEvent, Widget};
 
 lumen_app::manifest!(time, desktop, trace);
 lumen_app::main!(run);
@@ -115,6 +131,7 @@ fn run() -> i32 {
             return 0;
         }
         "sdk" => return sdk(),
+        "tick" => return tick(),
         "panic" => {
             let long: String = core::iter::repeat_n('p', 300).collect();
             panic!("{long}");
@@ -383,4 +400,157 @@ fn publish(mode: &str, w: &lumen_app::Window) -> Result<(), i32> {
     let bytes = tree.encode().map_or(0, |b| b.len());
     log::info(&format!("window: deep: published {count} nodes ({bytes} bytes)"));
     Ok(())
+}
+
+/// The `tick` mode's window and its tree's width (the app's area is the
+/// rest).
+const TICK_W: u32 = 320;
+const TICK_H: u32 = 160;
+const TICK_TREE_W: u32 = 140;
+/// Its ticks while running, and how far the square moves each one.
+const TICK_NS: u64 = 50_000_000;
+const STEP: i32 = 8;
+const SQUARE: u32 = 16;
+
+/// The `tick` mode's app: see the crate's doc.
+struct Ticker {
+    ui: Ui,
+    count: Widget,
+    state: Widget,
+    stop: Widget,
+    start: Widget,
+    ticks: u64,
+    running: bool,
+    square: Area,
+    drawn: Vec<Area>,
+    /// The accent its frame was last drawn in (logged when it changes).
+    accent: Option<u32>,
+}
+
+impl Ticker {
+    fn new() -> Ticker {
+        let mut ui = Ui::new();
+        let count = ui.label(None, "Ticks", "0");
+        let state = ui.label(None, "State", "running");
+        let stop = ui.button(None, "Stop");
+        let start = ui.button(None, "Start");
+        let square = Area::new(TICK_TREE_W as i32 + 10, 70, SQUARE, SQUARE);
+        Ticker { ui, count, state, stop, start, ticks: 0, running: true, square, drawn: Vec::new(), accent: None }
+    }
+
+    /// The app's own area: right of the tree.
+    fn area() -> Area {
+        Area::new(TICK_TREE_W as i32, 0, TICK_W - TICK_TREE_W, TICK_H)
+    }
+
+    /// The square moved `STEP` pixels right, back to the area's left past
+    /// its right edge; its old and new places are the app's damage.
+    fn move_square(&mut self) {
+        let a = Ticker::area();
+        let mut x = self.square.x() + STEP;
+        if x + SQUARE as i32 > a.right() {
+            x = a.x() + 10;
+        }
+        let old = self.square;
+        self.square = Area::new(x, self.square.y(), SQUARE, SQUARE);
+        self.drawn.push(old);
+        self.drawn.push(self.square);
+    }
+}
+
+impl App for Ticker {
+    fn ui_mut(&mut self) -> &mut Ui {
+        &mut self.ui
+    }
+
+    fn apply(&mut self, events: &[UiEvent]) -> Then {
+        for e in events {
+            match e {
+                UiEvent::Pressed(w) if *w == self.stop => {
+                    self.running = false;
+                    self.ui.set_text(self.state, "stopped");
+                }
+                UiEvent::Pressed(w) if *w == self.start => {
+                    self.running = true;
+                    self.ui.set_text(self.state, "running");
+                }
+                _ => {}
+            }
+        }
+        Then::Carry
+    }
+
+    fn paint_over(&mut self, over: &mut Over<'_>) {
+        let area = Ticker::area();
+        for r in over.rects {
+            if let Some(part) = r.intersect(&area) {
+                over.surface.fill_rect(part, over.palette.background);
+            }
+            if let Some(part) = r.intersect(&self.square) {
+                over.surface.fill_rect(part, over.palette.accent);
+            }
+        }
+        if self.accent != Some(over.palette.accent) {
+            self.accent = Some(over.palette.accent);
+            log::info(&format!("window: tick: accent 0x{:06x}", over.palette.accent));
+        }
+    }
+
+    fn take_drawn(&mut self) -> Vec<Area> {
+        core::mem::take(&mut self.drawn)
+    }
+}
+
+impl Ticking for Ticker {
+    fn period(&self) -> Option<u64> {
+        self.running.then_some(TICK_NS)
+    }
+
+    fn tick(&mut self, _now: u64) -> Flow {
+        self.ticks += 1;
+        let text = format!("{}", self.ticks);
+        self.ui.set_text(self.count, &text);
+        self.move_square();
+        Flow::Carry
+    }
+}
+
+/// The `tick` mode: [`Ticker`] in the SDK's `run_until` until its window
+/// closes or Escape quits; 0 then.
+fn tick() -> i32 {
+    let (Ok(desk), Ok(time)) = (Desktop::get(), Time::get()) else { return 1 };
+    let w = match desk.open_window("window", TICK_W, TICK_H) {
+        Ok(w) => w,
+        Err(e) => {
+            log::error(&format!("window: no window: {e}"));
+            return 1;
+        }
+    };
+    let tree = Area::new(0, 0, TICK_TREE_W, TICK_H);
+    let mut tk = match Toolkit::with_area(Ticker::new(), w, tree) {
+        Ok(tk) => tk,
+        Err(e) => {
+            log::error(&format!("window: no toolkit: {e}"));
+            return 1;
+        }
+    };
+    log::info("window: tick: running");
+    let ended = tk.run_until(time, |app, e| match *e {
+        Event::Key { code: KeyCode::Escape, action: KeyAction::Press { .. }, .. } => Taken::Quit,
+        Event::Key { code: KeyCode::N, action: KeyAction::Press { .. }, .. } => {
+            app.move_square();
+            Taken::Took
+        }
+        _ => Taken::Pass,
+    });
+    match ended {
+        Ok(()) => {
+            log::info(&format!("window: tick: ended after {} ticks", tk.app_mut().ticks));
+            0
+        }
+        Err(e) => {
+            log::error(&format!("window: tick: {e}"));
+            2
+        }
+    }
 }

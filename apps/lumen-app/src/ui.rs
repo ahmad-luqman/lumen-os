@@ -12,15 +12,25 @@
 //!   its effect. A request runs through `lumen_ui::serve`, the handler a
 //!   click reaches; what it said goes back as an `AppAnswer` (the kernel
 //!   builds the row from the published tree).
+//! - Its loops: [`Toolkit::run`], [`Toolkit::run_with`] (the app takes some
+//!   input itself first: [`Taken`]) and [`Toolkit::run_until`] (an animated
+//!   app's ticks, [`Ticking`], paced by `lumen_ui::Pacer`). Whatever the
+//!   app takes, a `Request`, `Close` or `Theme` always reaches the toolkit
+//!   (`Event::offered_to_app`), so a request is always answered and a close
+//!   always ends the loop.
+//! - An app draws its own area (beside the tree's: [`Toolkit::with_area`])
+//!   in `lumen_ui::App::paint_over`, with the theme's palette and the
+//!   host's text, and reports what it changed with `App::take_drawn`: that
+//!   is repainted and committed without republishing an unchanged tree.
 
-use crate::{Desktop, Event, Handle, Result, Window, check, sys};
+use crate::{Desktop, Event, Handle, Result, Time, Window, check, sys};
 use lumen_app_api::answer::AppAnswer;
 use lumen_app_api::event::{Button, toolkit_key};
 use lumen_app_api::layout::{Rect as WireRect, TextDraw};
 use lumen_app_api::limits::{TEXT_BYTES, UI_TEXT_PX};
 use lumen_app_api::tree::Tree;
 use lumen_gfx::{Rect, Surface};
-use lumen_ui::{App, Input, Palette, Served, Text, Then, repaint, serve};
+use lumen_ui::{App, Input, Pacer, Palette, Served, Text, Then, repaint, serve};
 use sys::ptr;
 
 /// The toolkit's text through the host: the kernel's UI font at
@@ -98,9 +108,56 @@ pub enum Step {
     Close,
 }
 
+/// What an app's `take` did with an input event offered to it
+/// ([`Toolkit::run_with`], [`Toolkit::run_until`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Taken {
+    /// Not the app's: the tree gets it.
+    Pass,
+    /// The app acted on it itself (the tree never sees it); the window is
+    /// refreshed.
+    Took,
+    /// Stop: the loop returns `Ok(())`, as for `Close` (the app's
+    /// `Window`, dropped by its caller, closes the window).
+    Quit,
+}
+
+/// What a tick said ([`Ticking::tick`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flow {
+    Carry,
+    /// Stop, as [`Taken::Quit`] does.
+    Quit,
+}
+
+/// An app that changes on its own, tick by tick ([`Toolkit::run_until`]).
+pub trait Ticking: App {
+    /// Nanoseconds between ticks now, or `None` while nothing moves (the
+    /// loop then waits for events only, so the desktop can settle: a
+    /// stopped animation, a step mode, a frozen view). Asked before every
+    /// wait, so a button that starts or stops the animation takes effect at
+    /// once; a changed period starts a fresh schedule.
+    fn period(&self) -> Option<u64>;
+
+    /// Whether the waits between ticks are an animation's (the desktop
+    /// never counts the window idle meanwhile). Yes by default; a clock
+    /// that ticks once a second may say no.
+    fn animating(&self) -> bool {
+        true
+    }
+
+    /// A tick that is due (`now` on `Time::now_ns`'s clock, at or past its
+    /// deadline; one tick however late). What it changes is shown by the
+    /// refresh after it: the tree's changes through the tree, its own
+    /// drawing through `take_drawn`.
+    fn tick(&mut self, now: u64) -> Flow;
+}
+
 /// An app's toolkit in its window: see the module's doc.
 pub struct Toolkit<A: App> {
     app: A,
+    /// Where the tree is laid out (the rest of the client is the app's).
+    area: Rect,
     text: HostText,
     /// From the last `Theme` event (the first event, always).
     palette: Palette,
@@ -119,9 +176,19 @@ impl<A: App> Toolkit<A> {
     /// `app` in `window`, laid out in the whole client area; drawn once its
     /// first event, `Theme`, says how.
     pub fn new(app: A, window: Window) -> Result<Toolkit<A>> {
+        let area = window.canvas.bounds();
+        Toolkit::with_area(app, window, area)
+    }
+
+    /// `app` in `window` with its tree laid out in `area` (cut to the
+    /// client area); the rest of the client is the app's own, painted only
+    /// by its `paint_over` (a board, a clock face, a buffer's text). A full
+    /// repaint paints the tree's background over the whole client first.
+    pub fn with_area(app: A, window: Window, area: Rect) -> Result<Toolkit<A>> {
         let text = HostText::new(window.desktop())?;
         let palette = Palette::from(lumen_app_api::event::Palette::default());
-        Ok(Toolkit { app, text, palette, window, unpublished: None, warned: false })
+        let area = area.intersect(&window.canvas.bounds()).unwrap_or(Rect::EMPTY);
+        Ok(Toolkit { app, area, text, palette, window, unpublished: None, warned: false })
     }
 
     pub fn app_mut(&mut self) -> &mut A {
@@ -134,26 +201,91 @@ impl<A: App> Toolkit<A> {
         &mut self.window
     }
 
-    /// Steps until the window closes.
-    pub fn run(&mut self) -> Result<()> {
-        self.run_with(|_, _| false)
+    /// The palette the window is drawn with now (the last `Theme`'s; the
+    /// light one before the first). `paint_over` is handed it too.
+    pub fn palette(&self) -> &Palette {
+        &self.palette
     }
 
-    /// [`Toolkit::run`], each input event (not a request, `Close` or
-    /// `Theme`: those are the toolkit's) offered to `take` first: one it
-    /// takes (`true`: the app acted on it itself, such as the calculator's
-    /// keys whichever button has the focus) skips the tree, then the window
-    /// is refreshed.
-    pub fn run_with(&mut self, mut take: impl FnMut(&mut A, &Event) -> bool) -> Result<()> {
+    /// Where the tree is laid out.
+    pub fn area(&self) -> Rect {
+        self.area
+    }
+
+    /// Steps until the window closes.
+    pub fn run(&mut self) -> Result<()> {
+        self.run_with(|_, _| Taken::Pass)
+    }
+
+    /// [`Toolkit::run`], each input event (`Event::offered_to_app`: not a
+    /// request, `Close` or `Theme`, which are the toolkit's) offered to
+    /// `take` first: one it takes ([`Taken::Took`]: the app acted on it
+    /// itself, such as the calculator's keys whichever button has the focus,
+    /// or a game's arrows) skips the tree, then the window is refreshed;
+    /// [`Taken::Quit`] returns as `Close` does.
+    pub fn run_with(&mut self, mut take: impl FnMut(&mut A, &Event) -> Taken) -> Result<()> {
         loop {
             let e = self.window.wait_event()?;
-            let offered = !matches!(e, Event::Request { .. } | Event::Close | Event::Theme { .. });
-            if offered && take(&mut self.app, &e) {
-                self.refresh()?;
-            } else if self.step(e)? == Step::Close {
+            if self.offer(e, &mut take)? == Step::Close {
                 return Ok(());
             }
         }
+    }
+
+    /// [`Toolkit::run_with`] for an animated app: each turn, every event
+    /// waiting is handled first (as `run_with` does), then, once the first
+    /// `Theme` has come, a tick that is due ([`Ticking::period`] asked
+    /// before every wait, paced by `lumen_ui::Pacer`: one tick however late)
+    /// is taken and the window refreshed; otherwise it waits for an event
+    /// until the next deadline (none without a period, so the desktop can
+    /// settle). `time` is the clock the deadlines are on. A tick saying
+    /// [`Flow::Quit`] returns as `Close` does.
+    pub fn run_until(&mut self, time: Time, mut take: impl FnMut(&mut A, &Event) -> Taken) -> Result<()>
+    where
+        A: Ticking,
+    {
+        let mut pacer = Pacer::new();
+        let mut themed = false;
+        loop {
+            while let Some(e) = self.window.next_event()? {
+                themed |= matches!(e, Event::Theme { .. });
+                if self.offer(e, &mut take)? == Step::Close {
+                    return Ok(());
+                }
+            }
+            if !themed {
+                self.window.wait(None, false)?;
+                continue;
+            }
+            let now = time.now_ns()?;
+            let deadline = pacer.deadline(self.app.period(), now);
+            if pacer.due(now) {
+                pacer.ticked(now);
+                if self.app.tick(now) == Flow::Quit {
+                    return Ok(());
+                }
+                self.refresh()?;
+                continue;
+            }
+            let animating = deadline.is_some() && self.app.animating();
+            self.window.wait(deadline, animating)?;
+        }
+    }
+
+    /// One event of a loop: offered to `take` if it may be
+    /// (`Event::offered_to_app`), else (or passed) a [`Toolkit::step`].
+    fn offer(&mut self, e: Event, take: &mut impl FnMut(&mut A, &Event) -> Taken) -> Result<Step> {
+        if e.offered_to_app() {
+            match take(&mut self.app, &e) {
+                Taken::Pass => {}
+                Taken::Took => {
+                    self.refresh()?;
+                    return Ok(Step::Carry);
+                }
+                Taken::Quit => return Ok(Step::Close),
+            }
+        }
+        self.step(e)
     }
 
     /// One step: hand `e` to the tree; then, if it changed, repaint, commit
@@ -195,8 +327,7 @@ impl<A: App> Toolkit<A> {
     /// closed the window is answered at once: the kernel closes the window,
     /// then answers its asker).
     fn request(&mut self, node: u64, action: lumen_ui::Action) -> Result<Step> {
-        let area = self.window.canvas.bounds();
-        let served = serve(&mut self.app, &mut self.text, area, node, &action);
+        let served = serve(&mut self.app, &mut self.text, self.area, node, &action);
         let answer = AppAnswer::from_served(&served);
         if served == Served::ClosedItsWindow {
             self.window.answer(&answer)?;
@@ -230,13 +361,16 @@ impl<A: App> Toolkit<A> {
     }
 
     /// Lay the tree out; repaint and commit only what changed
-    /// (`lumen_ui::repaint`, as the kernel's toolkit does), then publish the
-    /// tree if it changed. A failed commit marks the whole tree changed
-    /// again, so the next refresh repaints and republishes it; a refused
-    /// publish is logged once a run and tried again when the tree changes.
+    /// (`lumen_ui::repaint`, as the kernel's toolkit does): the tree's
+    /// damage and the app's own (`App::take_drawn`), with `paint_over` over
+    /// it; then publish the tree only if it changed (the app's drawing alone
+    /// never republishes it). This is the one frame path: a tick's, an
+    /// event's, or an app's own call after it drew. A failed commit marks
+    /// everything to repaint again, so the next refresh repaints and
+    /// republishes it; a refused publish is logged once a run and tried
+    /// again when the tree changes.
     pub fn refresh(&mut self) -> Result<()> {
-        let area = self.window.canvas.bounds();
-        let done = repaint(&mut self.app, &mut self.window.canvas, &mut self.text, &self.palette, area);
+        let done = repaint(&mut self.app, &mut self.window.canvas, &mut self.text, &self.palette, self.area);
         if !done.rects.is_empty() {
             let wire: alloc::vec::Vec<WireRect> = done.rects.iter().map(|&r| r.into()).collect();
             if let Err(e) = self.window.commit(&wire) {
