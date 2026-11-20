@@ -1,0 +1,18 @@
+[package]
+name = "lumen-edit"
+description = "no_std editing logic for Lumen's text editor app (#203): a text buffer with a cursor, insert and delete, undo and redo, and a view's scroll, host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The keys' wire codes and mods, as an app's `Event::Key` carries them.
+lumen-app-api.workspace = true
+
+[dev-dependencies]
+# The keyboard decoded as the kernel decodes it, for the keymaps' tests.
+lumen-input.workspace = true
+pc-keyboard.workspace = true
+
+[lints]
+workspace = true

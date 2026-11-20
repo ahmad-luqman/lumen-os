@@ -157,6 +157,12 @@ enum Kind {
     Button,
     Checkbox(bool),
     TextField(String),
+    /// A text field its app draws ([`Ui::text_area`]): `size` its bounds'
+    /// size; the tree paints its field and border, never its text.
+    TextArea {
+        text: String,
+        size: (u32, u32),
+    },
     List {
         items: Vec<Item>,
         selected: Option<usize>,
@@ -211,7 +217,7 @@ impl W {
             Kind::Label { .. } => Role::Label,
             Kind::Button => Role::Button,
             Kind::Checkbox(_) => Role::Checkbox,
-            Kind::TextField(_) => Role::TextField,
+            Kind::TextField(_) | Kind::TextArea { .. } => Role::TextField,
             Kind::List { .. } => Role::List,
             Kind::Menu { .. } => Role::Menu,
         }
@@ -413,6 +419,19 @@ impl Ui {
         self.add(parent, name, Kind::TextField(String::from(text)))
     }
 
+    /// A text field whose text its app draws and edits (an editor's
+    /// buffer): a `textfield` node of `width` x `height`, its value `text`.
+    /// The tree paints its field colour, its border and its focus ring,
+    /// never its text, and keys don't edit it: the app draws the text over
+    /// it ([`crate::App::paint_over`]) and takes the keys. So
+    /// [`Ui::set_text`] on it changes the node (the tree changed, to
+    /// publish) without repainting it, and a focus change repaints only its
+    /// ring. `set_value` sets its text and reports [`UiEvent::Edited`], as a
+    /// text field's does.
+    pub fn text_area(&mut self, parent: Option<Stack>, name: &str, text: &str, width: u32, height: u32) -> Widget {
+        self.add(parent, name, Kind::TextArea { text: String::from(text), size: (width, height) })
+    }
+
     pub fn list(&mut self, parent: Option<Stack>, name: &str, items: &[&str]) -> Widget {
         let items = items.iter().map(|s| Item::new(s)).collect();
         self.add(parent, name, Kind::List { items, selected: None })
@@ -498,19 +517,26 @@ impl Ui {
     /// A label's or a text field's text.
     pub fn text(&self, w: Widget) -> Option<&str> {
         match &self.widgets[self.at(w)?].kind {
-            Kind::Label { text: t, .. } | Kind::TextField(t) => Some(t),
+            Kind::Label { text: t, .. } | Kind::TextField(t) | Kind::TextArea { text: t, .. } => Some(t),
             _ => None,
         }
     }
 
-    /// Set a label's or a text field's text (others ignore it).
+    /// Set a label's or a text field's text (others ignore it). A text
+    /// area's ([`Ui::text_area`]) changes the tree, to publish, but
+    /// repaints nothing: its app draws the text.
     pub fn set_text(&mut self, w: Widget, text: &str) {
         let Some(i) = self.at(w) else { return };
-        if let Kind::Label { text: t, .. } | Kind::TextField(t) = &mut self.widgets[i].kind
-            && t != text
-        {
-            *t = String::from(text);
-            self.touch(i);
+        match &mut self.widgets[i].kind {
+            Kind::Label { text: t, .. } | Kind::TextField(t) if t != text => {
+                *t = String::from(text);
+                self.touch(i);
+            }
+            Kind::TextArea { text: t, .. } if t != text => {
+                *t = String::from(text);
+                self.changed = true;
+            }
+            _ => {}
         }
     }
 
@@ -606,7 +632,7 @@ impl Ui {
             self.window_focused = focused;
             self.changed = true;
             if let Some(f) = self.focus {
-                self.touch(f);
+                self.touch_focus(f);
             }
         }
     }
@@ -643,6 +669,25 @@ impl Ui {
     fn touch(&mut self, i: usize) {
         self.changed = true;
         let r = self.widgets[i].painted();
+        self.damage_rect(r);
+    }
+
+    /// Widget `i`'s focus changed: [`Ui::touch`], but a text area
+    /// ([`Ui::text_area`]) repaints only its ring (its text is its app's,
+    /// and costs the app by the character to draw again).
+    fn touch_focus(&mut self, i: usize) {
+        let b = self.widgets[i].bounds;
+        if !matches!(self.widgets[i].kind, Kind::TextArea { .. }) || b.is_empty() {
+            return self.touch(i);
+        }
+        self.changed = true;
+        for strip in ring(b).subtract(&b).iter() {
+            self.damage_rect(*strip);
+        }
+    }
+
+    /// `r` to repaint (nothing if empty; everything past `MAX_DAMAGE`).
+    fn damage_rect(&mut self, r: Rect) {
         if !r.is_empty() && !self.all {
             if self.damage.len() >= MAX_DAMAGE {
                 self.all = true;
@@ -771,6 +816,7 @@ impl Ui {
             Kind::Button => button_size(text, &w.name),
             Kind::Checkbox(_) => (BOX + BOX_GAP + text.width(&w.name), line.max(BOX) + 2 * BUTTON_PAD_Y),
             Kind::TextField(_) => (FIELD_W, line + 2 * FIELD_PAD),
+            Kind::TextArea { size, .. } => *size,
             Kind::List { items, .. } => {
                 let widest = items.iter().map(|i| text.width(&i.name)).max().unwrap_or(0);
                 (widest + 2 * FIELD_PAD, items.len() as u32 * (line + 2 * ROW_PAD))
@@ -988,9 +1034,9 @@ impl Ui {
     fn focus_on(&mut self, i: usize) {
         if self.takes_focus(i) && self.focus != Some(i) {
             if let Some(old) = self.focus.replace(i) {
-                self.touch(old);
+                self.touch_focus(old);
             }
-            self.touch(i);
+            self.touch_focus(i);
         }
     }
 
@@ -1022,7 +1068,7 @@ impl Ui {
                     alloc::vec![UiEvent::Expanded(w, *expanded)]
                 }
             },
-            Kind::Stack(_) | Kind::Label { .. } | Kind::TextField(_) => return Vec::new(),
+            Kind::Stack(_) | Kind::Label { .. } | Kind::TextField(_) | Kind::TextArea { .. } => return Vec::new(),
         };
         self.touch(i);
         events
@@ -1112,7 +1158,9 @@ impl Ui {
                 Kind::Label { text: t, .. } => AutomationNode::label(w.id, &w.name, t, w.bounds, w.disabled),
                 Kind::Button => AutomationNode::button(w.id, &w.name, w.bounds, focused, w.disabled),
                 Kind::Checkbox(c) => AutomationNode::checkbox(w.id, &w.name, *c, w.bounds, focused, w.disabled),
-                Kind::TextField(t) => AutomationNode::textfield(w.id, &w.name, t, w.bounds, focused, w.disabled),
+                Kind::TextField(t) | Kind::TextArea { text: t, .. } => {
+                    AutomationNode::textfield(w.id, &w.name, t, w.bounds, focused, w.disabled)
+                }
                 Kind::List { items, selected } => {
                     let ids = items.iter().map(|it| it.id).collect();
                     AutomationNode::list(w.id, &w.name, ids, *selected, w.bounds, focused, w.disabled)
@@ -1186,6 +1234,11 @@ impl Ui {
                     pen.fill(b, p.field);
                     pen.stroke(b, p.border);
                     pen.text(text, b.x() + FIELD_PAD as i32, b.y() + FIELD_PAD as i32, t, fg, b);
+                }
+                // Its text is its app's to draw.
+                Kind::TextArea { .. } => {
+                    pen.fill(b, p.field);
+                    pen.stroke(b, p.border);
                 }
                 Kind::List { items, selected } => {
                     pen.fill(b, p.field);

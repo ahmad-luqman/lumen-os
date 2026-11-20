@@ -384,8 +384,9 @@ own PR that updates that doc first.
   randomized model of damage-only repainting with focus, and
   press-pause-resume-release through the queue).
 - `crates/lumen-ui`: the desktop's toolkit (#156): a retained widget tree
-  (`Ui`: stacks (`Stack` handles), labels (`fixed_label`), buttons, checkboxes, text fields, lists
-  (`set_selected`: the app's own choice, the focus left where it is),
+  (`Ui`: stacks (`Stack` handles), labels (`fixed_label`), buttons, checkboxes, text fields, text areas
+  (`text_area`, #203: a `textfield` node its app draws), lists (`set_selected`: the app's own
+  choice, the focus left where it is),
   menus with items (#157); `Ui::bar` (across, one widget pinned right); `remove`
   (generational `Widget`s: a freed slot taken again); per-widget damage (`take_damage`,
   `paint_in`); layout,
@@ -529,6 +530,13 @@ own PR that updates that doc first.
   `lumen_ui::App` (its drawing and its hands' boxes as damage, checked
   against full repaints); `args` (`run clock`'s arguments); `rtc` (what it
   shows while RTC reads fail, as the taskbar's clock) (host-tested).
+- `crates/lumen-edit`: the text editor app's logic (#203): a buffer with a
+  cursor, edits undone and redone (a typing run as one), the text's, a
+  line's and the history's `Limits`, `normalise`, `Loaded`, the status
+  line, a view's scroll, the `Change` naming the lines to redraw, the keys
+  (`command`: undo and redo by the layout's letters) and the view across
+  (`view`: bounded by what it shows) (host-tested, incl. a randomized model
+  against a naive editor and real keymaps through `lumen-input`).
 - `crates/lumen-snake`: Comet's logic (#201, an original snake-style
   game): the sky's cells, steering, growth, the edge, tail and asteroids
   ending a flight, levels (`rocks`, sparing the cells ahead), stardust on
@@ -568,7 +576,7 @@ own PR that updates that doc first.
   (`tools/new-app.sh`); `calculator` (#207, the first app on the SDK's
   `ui::Toolkit`, lumen-ui inside the app); `clock` (#200, an analog face
   on `run_until`, `--at` freezing it); `comet` (#201, the snake-style
-  game on `run_until`, `--seed N --step` for tests); `life` (#202, Conway's Game of Life on
+  game on `run_until`, `--seed N --step` for tests); `editor` (#203, on `lumen-edit`); `life` (#202, Conway's Game of Life on
   `run_until`, lumen-demo's rules; the launcher's Life); `viewer` (#204, bundled images
   decoded inside the app by `lumen-png`, `apps/viewer/images/` made by
   `tools/viewer-images.py`); `xray` (#208, the trace rings
