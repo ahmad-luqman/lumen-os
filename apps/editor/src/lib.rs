@@ -28,8 +28,10 @@
 //!   the text's first 1,024 bytes (`TEXT_BYTES`, the tree's cap; the kernel
 //!   shows control characters, `\n` included, as U+FFFD). A `set_value`
 //!   (at most 512 bytes, the kernel's cap) replaces the text. The status
-//!   line is a label named `Status`: `Ln <line>, Col <column>`, then
-//!   `, modified` once the text differs from the one it started with.
+//!   line is a label named `Status` (`lumen_edit::Editor::status`): `Ln
+//!   <line>, Col <column>`, then `, modified` once the text differs from
+//!   the one it started with, and `, full` while the last edit was refused
+//!   (past the text's 16 KiB or a line's 4 KiB).
 //! - **Arguments:** `--empty` starts with no text (else a short sample),
 //!   `--no-blink` as above.
 
@@ -119,7 +121,12 @@ impl EditorApp {
         let mut ui = Ui::new();
         let w = WIDTH - 2 * PAD;
         let h = HEIGHT - 2 * PAD - GAP - line;
-        let ed = Editor::new(text, LIMITS);
+        let (ed, loaded) = Editor::new(text, LIMITS);
+        if loaded.cut {
+            // The sample fits its limits (a const assertion can't measure
+            // it): a cut is a bug, said rather than shown short.
+            log::error(&format!("editor: the text given was cut to {} bytes", ed.text().len()));
+        }
         let area = ui.text_area(None, "Text", prefix(ed.text(), TEXT_BYTES), w, h);
         // As wide as its longest text, not the window's: its repaint (each
         // key's) costs the app by the pixel.
@@ -259,8 +266,9 @@ impl EditorApp {
     /// cursor was drawn), scroll to the cursor, and update the tree.
     fn changed(&mut self, change: Change, old_cursor: Option<Rect>) {
         // The tree's value follows the text: after an edit, and after a
-        // `set_value` the editor took in differently (its control
-        // characters but `\n` dropped) or not at all (the same text).
+        // `set_value` the editor took in differently (normalised: a tab as
+        // spaces, `\r` as `\n`, other control characters dropped) or not at
+        // all (the same text, or refused).
         self.ui.set_text(self.area, prefix(self.ed.text(), TEXT_BYTES));
         // A key keeps the cursor solid through the next tick.
         self.keyed = true;
@@ -270,6 +278,8 @@ impl EditorApp {
             if !was_on {
                 self.damage_cursor();
             }
+            // A refused edit says so (`, full`); the next command clears it.
+            self.show_status();
             return;
         }
         let scrolled = self.ed.scroll_to(self.rows) | self.across();
@@ -293,9 +303,7 @@ impl EditorApp {
     }
 
     fn show_status(&mut self) {
-        let (line, col) = self.ed.line_col();
-        let modified = if self.ed.modified() { ", modified" } else { "" };
-        let text = format!("Ln {}, Col {}{modified}", line + 1, col + 1);
+        let text = self.ed.status();
         self.ui.set_text(self.status, &text);
     }
 

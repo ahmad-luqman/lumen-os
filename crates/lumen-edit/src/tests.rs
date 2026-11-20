@@ -12,7 +12,7 @@ fn limits(text_bytes: usize, undo_edits: usize) -> Limits {
 }
 
 fn ed(text: &str) -> Editor {
-    Editor::new(text, limits(BIG, 1000))
+    Editor::new(text, limits(BIG, 1000)).0
 }
 
 fn typed(e: &mut Editor, s: &str) {
@@ -45,15 +45,60 @@ fn typing_inserts_at_the_cursor_and_reports_the_line() {
 }
 
 #[test]
-fn control_characters_never_enter_the_text() {
-    let mut e = ed("a\tb\u{1b}c\nd\u{7f}");
-    assert_eq!(e.text(), "abc\nd");
+fn control_characters_never_enter_the_text_and_tabs_and_line_ends_are_kept() {
+    // A tab given becomes the editor's spaces, \r\n and a lone \r a line
+    // break; the other control characters are dropped.
+    let mut e = ed("a\tb\u{1b}c\r\nd\u{7f}\re");
+    assert_eq!(e.text(), "a    bc\nd\ne");
     assert_eq!(e.apply(Command::Insert('\u{1b}')), Change::None);
     assert_eq!(e.apply(Command::Insert('\n')), Change::None);
-    assert_eq!(e.text(), "abc\nd");
-    assert_eq!(e.replace_all("x\ty\u{2028}z\n"), Change::From(0));
-    // U+2028 isn't a control character: the kernel's sanitisers show it.
-    assert_eq!(e.text(), "xy\u{2028}z\n");
+    assert_eq!(e.apply(Command::Insert('\t')), Change::None);
+    assert_eq!(e.text(), "a    bc\nd\ne");
+    assert_eq!(e.replace_all("x\ty\u{2028}z\r\n\r\n"), Change::From(0));
+    // U+2028 isn't a control character: the editor keeps it (the kernel's
+    // sanitisers replace it with U+FFFD wherever it is shown or logged).
+    assert_eq!(e.text(), "x    y\u{2028}z\n\n");
+    assert_eq!(normalise("\r\r\n\n"), "\n\n\n");
+    assert_eq!(normalise(""), "");
+}
+
+#[test]
+fn new_says_whether_it_cut_the_text() {
+    let lim = Limits { text_bytes: 5, line_bytes: 4, undo_edits: 10, undo_bytes: 100 };
+    let (e, loaded) = Editor::new("ab\ncd", lim);
+    assert_eq!((e.text(), loaded), ("ab\ncd", Loaded { cut: false }));
+    let (e, loaded) = Editor::new("ab\ncde", lim);
+    assert_eq!((e.text(), loaded), ("ab\ncd", Loaded { cut: true }), "past the text's bytes");
+    let (e, loaded) = Editor::new("abcde\nx", lim);
+    assert_eq!((e.text(), loaded), ("abcd", Loaded { cut: true }), "past a line's bytes");
+    // A tab counts as its spaces.
+    let (e, loaded) = Editor::new("a\t", lim);
+    assert_eq!((e.text(), loaded), ("a   ", Loaded { cut: true }));
+}
+
+#[test]
+fn the_status_line_says_where_the_cursor_is_and_what_happened() {
+    let mut e = Editor::new("ab\ncd", Limits { text_bytes: 5, line_bytes: 100, undo_edits: 10, undo_bytes: 100 }).0;
+    assert_eq!(e.status(), "Ln 1, Col 1");
+    e.apply(Command::Down);
+    e.apply(Command::End);
+    assert_eq!(e.status(), "Ln 2, Col 3");
+    e.apply(Command::Backspace);
+    assert_eq!(e.status(), "Ln 2, Col 2, modified");
+    e.apply(Command::Insert('x'));
+    assert!(!e.full());
+    assert_eq!(e.apply(Command::Insert('y')), Change::Refused);
+    assert!(e.full());
+    assert_eq!(e.status(), "Ln 2, Col 3, modified, full");
+    // Any command after clears it; undone back to the start, not modified.
+    e.apply(Command::Left);
+    assert_eq!(e.status(), "Ln 2, Col 2, modified");
+    assert_eq!(e.replace_all("1234567"), Change::Refused);
+    assert!(e.full(), "a replacement refused too");
+    e.apply(Command::Undo);
+    e.apply(Command::Undo);
+    assert_eq!(e.text(), "ab\ncd");
+    assert_eq!(e.status(), "Ln 2, Col 3");
 }
 
 #[test]
@@ -172,7 +217,7 @@ fn a_run_of_typing_is_one_edit_and_anything_else_ends_it() {
     typed(&mut e, "y");
     assert_eq!(e.undo_depth(), 6);
     // A refused character ends the run too.
-    let mut f = Editor::new("", limits(3, 100));
+    let mut f = Editor::new("", limits(3, 100)).0;
     typed(&mut f, "abc");
     assert_eq!(f.apply(Command::Insert('d')), Change::Refused);
     f.apply(Command::Backspace);
@@ -241,9 +286,9 @@ fn replace_all_is_one_undoable_edit() {
 
 #[test]
 fn the_size_cap_refuses_an_edit_whole() {
-    let mut e = Editor::new("abcdefgh", limits(5, 100));
+    let mut e = Editor::new("abcdefgh", limits(5, 100)).0;
     assert_eq!(e.text(), "abcde", "the start cut to the cap");
-    let mut u = Editor::new("aé", limits(2, 100));
+    let mut u = Editor::new("aé", limits(2, 100)).0;
     assert_eq!(u.text(), "a", "cut on a char boundary");
     assert_eq!(e.apply(Command::Insert('x')), Change::Refused);
     assert_eq!(e.apply(Command::Newline), Change::Refused);
@@ -263,9 +308,9 @@ fn the_size_cap_refuses_an_edit_whole() {
 fn the_line_cap_refuses_an_edit_making_a_line_too_long() {
     let lim = Limits { text_bytes: BIG, line_bytes: 5, undo_edits: 100, undo_bytes: BIG };
     // A longer line given is cut there (the rest of the text with it).
-    assert_eq!(Editor::new("abcdefg\nhi", lim).text(), "abcde");
-    assert_eq!(Editor::new("abc\nhijklmn", lim).text(), "abc\nhijkl");
-    let mut e = Editor::new("abcd\nxy", lim);
+    assert_eq!(Editor::new("abcdefg\nhi", lim).0.text(), "abcde");
+    assert_eq!(Editor::new("abc\nhijklmn", lim).0.text(), "abc\nhijkl");
+    let mut e = Editor::new("abcd\nxy", lim).0;
     assert_eq!(e.apply(Command::Insert('Z')), Change::Line(0), "to exactly the cap");
     assert_eq!(e.apply(Command::Insert('Z')), Change::Refused);
     assert_eq!(e.apply(Command::Tab), Change::Refused);
@@ -282,7 +327,7 @@ fn the_line_cap_refuses_an_edit_making_a_line_too_long() {
     e.apply(Command::End);
     assert_eq!(e.apply(Command::Delete), Change::Refused, "Za + bcdxy = 7 bytes");
     // Multi-byte chars count by the byte; a whole text too.
-    let mut u = Editor::new("", lim);
+    let mut u = Editor::new("", lim).0;
     assert_eq!(u.replace_all("ééé"), Change::Refused, "6 bytes on one line");
     assert_eq!(u.replace_all("éé\né"), Change::From(0));
     assert_eq!(u.replace_all("12345\n123456"), Change::Refused, "its second line too long");
@@ -290,7 +335,7 @@ fn the_line_cap_refuses_an_edit_making_a_line_too_long() {
 
 #[test]
 fn past_max_undo_the_oldest_edit_is_forgotten() {
-    let mut e = Editor::new("", limits(BIG, 3));
+    let mut e = Editor::new("", limits(BIG, 3)).0;
     for _ in 0..5 {
         e.apply(Command::Newline);
     }
@@ -303,7 +348,7 @@ fn past_max_undo_the_oldest_edit_is_forgotten() {
 fn past_undo_bytes_the_oldest_edits_are_forgotten() {
     // 10 bytes of history: "abc" (3) and "defg" (4) kept, then a 5-byte
     // edit forgets the first; one past the limit alone keeps nothing.
-    let mut e = Editor::new("", Limits { text_bytes: BIG, line_bytes: BIG, undo_edits: 100, undo_bytes: 10 });
+    let mut e = Editor::new("", Limits { text_bytes: BIG, line_bytes: BIG, undo_edits: 100, undo_bytes: 10 }).0;
     typed(&mut e, "abc");
     e.apply(Command::Left);
     e.apply(Command::Right);
@@ -317,7 +362,7 @@ fn past_undo_bytes_the_oldest_edits_are_forgotten() {
     assert_eq!(e.undo_depth(), 0, "a 23-byte edit alone is past the limit");
     assert_eq!(e.apply(Command::Undo), Change::None);
     // A typing run growing past it forgets itself too.
-    let mut f = Editor::new("", Limits { text_bytes: BIG, line_bytes: BIG, undo_edits: 100, undo_bytes: 4 });
+    let mut f = Editor::new("", Limits { text_bytes: BIG, line_bytes: BIG, undo_edits: 100, undo_bytes: 4 }).0;
     typed(&mut f, "abcd");
     assert_eq!(f.undo_depth(), 1);
     typed(&mut f, "e");
@@ -553,7 +598,7 @@ fn a_randomized_model_agrees_and_every_undo_and_redo_restores_the_text_exactly()
         let cap = if seed % 5 == 0 { 24 } else { 4096 };
         let rows = 1 + (seed % 7) as usize;
         let line_cap = if seed % 3 == 0 { 12 } else { BIG };
-        let mut e = Editor::new("start\ntext", Limits { line_bytes: line_cap, ..limits(cap, 1000) });
+        let mut e = Editor::new("start\ntext", Limits { line_bytes: line_cap, ..limits(cap, 1000) }).0;
         e.scroll_to(rows);
         let mut m = model_of(&e, rows);
         let mut r = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);

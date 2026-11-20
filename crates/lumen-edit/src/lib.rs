@@ -4,8 +4,10 @@
 //!
 //! - **The text** is a `String` of lines separated by `\n`. The cursor is
 //!   a byte offset on a char boundary; columns count chars. Control
-//!   characters other than `\n` never enter it ([`Command::Insert`]
-//!   refuses them; Tab inserts [`TAB`]).
+//!   characters other than `\n` never enter it: [`Command::Insert`] does
+//!   nothing with one, Tab inserts [`TAB`], and a text given
+//!   ([`Editor::new`], [`Editor::replace_all`]) is [`normalise`]d (a tab as
+//!   [`TAB`], `\r\n` and a lone `\r` as `\n`, the others dropped).
 //! - **Edits** each replace one range with another text, recorded for
 //!   undo with the cursor before and after. A run of characters typed one
 //!   after another (no newline, no other command between) is one edit, as
@@ -35,10 +37,34 @@ pub use keys::command;
 /// What Tab inserts: four spaces.
 pub const TAB: &str = "    ";
 
-/// Whether `c` may enter the text: anything but a control character,
-/// except `\n`.
-fn allowed(c: char) -> bool {
-    c == '\n' || !c.is_control()
+/// `text` as the editor holds a text: a tab as [`TAB`], `\r\n` and a lone
+/// `\r` as `\n`, the other control characters dropped (so a file's tabs and
+/// line ends survive, M6).
+pub fn normalise(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\t' => out.push_str(TAB),
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                out.push('\n');
+            }
+            '\n' => out.push('\n'),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// What [`Editor::new`] did with the text it was given.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Loaded {
+    /// The text didn't fit its limits (its bytes, or a line's) and was
+    /// cut where it stopped fitting: the rest is not in the editor.
+    pub cut: bool,
 }
 
 /// What an editor holds at most.
@@ -131,20 +157,24 @@ pub struct Editor {
     limits: Limits,
     /// The text as given (to tell whether it was modified).
     original: String,
+    /// Whether the last command or replacement was refused (past a limit).
+    refused: bool,
     top: usize,
     rows: usize,
 }
 
 impl Editor {
-    /// An editor holding `text` (its control characters but `\n` taken
-    /// out, and cut to `limits.text_bytes` on a char boundary), the cursor
-    /// at its start.
-    pub fn new(text: &str, limits: Limits) -> Editor {
+    /// An editor holding `text` ([`normalise`]d, then cut where it passes
+    /// `limits.text_bytes` or a line passes `limits.line_bytes`, on a char
+    /// boundary: [`Loaded::cut`] says so), the cursor at its start.
+    pub fn new(text: &str, limits: Limits) -> (Editor, Loaded) {
         let mut clean = String::new();
         let mut line = 0;
-        for c in text.chars().filter(|&c| allowed(c)) {
+        let mut cut = false;
+        for c in normalise(text).chars() {
             line = if c == '\n' { 0 } else { line + c.len_utf8() };
             if clean.len() + c.len_utf8() > limits.text_bytes || line > limits.line_bytes {
+                cut = true;
                 break;
             }
             clean.push(c);
@@ -159,11 +189,12 @@ impl Editor {
             typing: false,
             limits,
             original: clean,
+            refused: false,
             top: 0,
             rows: 1,
         };
         e.index();
-        e
+        (e, Loaded { cut })
     }
 
     pub fn text(&self) -> &str {
@@ -173,6 +204,22 @@ impl Editor {
     /// Whether the text differs from the one it started with.
     pub fn modified(&self) -> bool {
         self.text != self.original
+    }
+
+    /// Whether the last command or replacement was refused: it would have
+    /// passed a limit (the text's size, or a line's).
+    pub fn full(&self) -> bool {
+        self.refused
+    }
+
+    /// The status line: `Ln <line>, Col <column>` from 1, then `, modified`
+    /// once the text differs from the one it started with, and `, full`
+    /// while the last edit was refused.
+    pub fn status(&self) -> String {
+        let (line, col) = self.line_col();
+        let modified = if self.modified() { ", modified" } else { "" };
+        let full = if self.refused { ", full" } else { "" };
+        alloc::format!("Ln {}, Col {}{modified}{full}", line + 1, col + 1)
     }
 
     pub fn cursor(&self) -> usize {
@@ -271,22 +318,25 @@ impl Editor {
         // Only typing right after typing joins it: any other command, a
         // refused or empty one included, ends the run.
         self.typing = matches!((cmd, change), (Command::Insert(_), Change::Line(_)));
+        self.refused = change == Change::Refused;
         change
     }
 
-    /// Replace the whole text with `text` (its control characters but
-    /// `\n` taken out) as one edit, the cursor at its end; refused past
-    /// the size cap, nothing if it is the same.
+    /// Replace the whole text with `text` ([`normalise`]d) as one edit, the
+    /// cursor at its end; refused past a limit, nothing if it is the same.
     pub fn replace_all(&mut self, text: &str) -> Change {
-        let clean: String = text.chars().filter(|&c| allowed(c)).collect();
+        let clean = normalise(text);
         self.typing = false;
-        if clean == self.text {
-            return Change::None;
-        }
-        match self.edit(0, self.text.len(), &clean, false) {
-            Change::Refused => Change::Refused,
-            _ => Change::From(0),
-        }
+        let change = if clean == self.text {
+            Change::None
+        } else {
+            match self.edit(0, self.text.len(), &clean, false) {
+                Change::Refused => Change::Refused,
+                _ => Change::From(0),
+            }
+        };
+        self.refused = change == Change::Refused;
+        change
     }
 
     /// The line holding byte `at`.
