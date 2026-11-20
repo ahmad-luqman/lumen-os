@@ -653,7 +653,8 @@ fn the_app_s_rects_get_the_tree_s_paint_when_the_tree_changed_too() {
     app.drawn = alloc::vec![straddling];
     let done = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
     assert!(done.changed);
-    let junk_left = (390..410).flat_map(|x| (150..170).map(move |y| (x, y))).filter(|&(x, y)| s.pixel(x, y) == Some(JUNK));
+    let junk_left =
+        (390..410).flat_map(|x| (150..170).map(move |y| (x, y))).filter(|&(x, y)| s.pixel(x, y) == Some(JUNK));
     assert_eq!(junk_left.count(), 0);
     let mut full = Board::surface();
     let mut again = Board::new();
@@ -721,7 +722,10 @@ fn overlapping_rects_are_painted_and_committed_once() {
     assert_eq!(area, 600);
     // A rect inside another adds nothing.
     app.drawn = alloc::vec![Rect::new(450, 50, 40, 40), Rect::new(460, 60, 5, 5)];
-    assert_eq!(repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA).rects, alloc::vec![Rect::new(450, 50, 40, 40)]);
+    assert_eq!(
+        repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA).rects,
+        alloc::vec![Rect::new(450, 50, 40, 40)]
+    );
 }
 
 #[test]

@@ -787,10 +787,10 @@ def tick_state(rows: list[dict[str, str]]) -> str:
     return gui.node(rows, "label", "State")["value"]
 
 
-def start_ticker(m) -> tuple[int, int, str, list[dict[str, str]]]:
-    """`run window tick`: its app id, the serial mark, its window's id and
-    its tree's rows."""
-    app_id, mark = start(m, "window tick")
+def start_ticker(m, mode: str = "") -> tuple[int, int, str, list[dict[str, str]]]:
+    """`run window tick [mode]`: its app id, the serial mark, its window's
+    id and its tree's rows."""
+    app_id, mark = start(m, f"window tick {mode}".strip())
     wait_for_output(m, mark, TICK_RUNNING, 30)
     wid, rows = wait_tree(m, "window", "Ticks")
     return app_id, mark, wid, rows
@@ -823,6 +823,20 @@ def tick_ended(m, mark: int, how: str = "closed") -> int:
     return int(found[1])
 
 
+def square_moved(m, accent: int, before: list[tuple[int, int]], name: str) -> None:
+    """Until the square is drawn one step on from `before` (test-window's
+    `move_square`: 8 to the right, back to the area's left edge + 10 past
+    its right one), seen on the screen."""
+    x0 = min(x for x, _ in before)
+    want = x0 + 8 if x0 + 8 + SQUARE <= TICK_W else TICK_TREE_W + 10
+    gui.wait_for(
+        m,
+        f"the square moved to x {want}",
+        lambda: accent_pixels(m, name, accent),
+        lambda p: len(p) == SQUARE * SQUARE and min(x for x, _ in p) == want,
+    )
+
+
 def accent_pixels(m, name: str, accent: int) -> list[tuple[int, int]]:
     """The client pixels right of the tree in colour `accent`: the square."""
     img = gui.client_pixels(m, "window", name)
@@ -836,19 +850,17 @@ def test_sdk_tick_loop_answers_requests_and_closes_while_ticking(boot):
     # and still hands requests to the toolkit: Stop, pressed while it
     # ticks, is answered (or still running, then seen in the tree); Start
     # sets it ticking again; the window's close, while it ticks, ends the
-    # loop: exit 0, its line counting at least the ticks seen, its thread
-    # joined.
+    # loop: exit 0, its line counting at least the ticks seen (each stretch
+    # no faster than the pacer's floor), its thread joined.
     m = boot_desktop(boot)
     app_id, mark, wid, rows = start_ticker(m)
     record = app(m, app_id)
-    rows = gui.wait_ui(m, "two ticks", lambda r: ticks(below_root(r)) >= 2, wid, 30)
+    rows = gui.wait_ui(m, "two ticks", lambda r: ticks(r) >= 2, wid, 30)
     rows = gui.press_animated(m, rows, "Stop", "stopped", lambda r: tick_state(r) == "stopped", wid)
-    seen = ticks(below_root(rows))
-    rows = gui.press_animated(
-        m, rows, "Start", "ticking again", lambda r: ticks(below_root(r)) > seen + 1, wid
-    )
-    assert tick_state(below_root(rows)) == "running"
-    seen = ticks(below_root(rows))
+    seen = ticks(rows)
+    rows = gui.press_animated(m, rows, "Start", "ticking again", lambda r: ticks(r) > seen + 1, wid)
+    assert tick_state(rows) == "running"
+    seen = ticks(rows)
     gui.close_window(m, "window")
     end_line(m, mark, "window", app_id, "exited with 0")
     assert tick_ended(m, mark) >= seen
@@ -862,16 +874,14 @@ def test_sdk_tick_loop_stopped_lets_the_desktop_settle(boot):
     # the count stays put across two settled reads; Start resumes it.
     m = boot_desktop(boot)
     app_id, mark, wid, rows = start_ticker(m)
-    gui.wait_ui(m, "a tick", lambda r: ticks(below_root(r)) >= 1, wid, 30)
+    gui.wait_ui(m, "a tick", lambda r: ticks(r) >= 1, wid, 30)
     for _ in range(5):
         assert gui.desktop_status(m)["settled"] == "no"
-    rows = below_root(stop_ticker(m, wid, rows))
+    rows = stop_ticker(m, wid, rows)
     first = ticks(rows)
     gui.wait_settled(m)
-    assert ticks(below_root(gui.ui_tree(m, wid))) == first
-    gui.press_animated(
-        m, rows, "Start", "ticking again", lambda r: ticks(below_root(r)) > first, wid
-    )
+    assert ticks(gui.ui_tree(m, wid)) == first
+    gui.press_animated(m, rows, "Start", "ticking again", lambda r: ticks(r) > first, wid)
     gui.close_window(m, "window")
     end_line(m, mark, "window", app_id, "exited with 0")
     tick_ended(m, mark)
@@ -880,29 +890,30 @@ def test_sdk_tick_loop_stopped_lets_the_desktop_settle(boot):
 def test_sdk_app_takes_keys_draws_alone_and_quits(boot):
     # Keys the app takes before the toolkit (`Taken`): `n` moves its square
     # with no tick, the move committed (seen on the screen) and the tree
-    # unchanged; Escape quits the loop (`Taken::Quit`): exit 0, the window
-    # gone, its thread joined.
+    # unchanged; Space, with Start focused, moves it too and never reaches
+    # the tree (Start isn't pressed: still stopped, no tick); Escape quits
+    # the loop (`Taken::Quit`): exit 0, the window gone, its thread joined.
     m = boot_desktop(boot)
     app_id, mark, wid, rows = start_ticker(m)
     record = app(m, app_id)
     accent = int(wait_for_output(m, mark, TICK_ACCENT, 30)[1], 16)
-    rows = below_root(stop_ticker(m, wid, rows))
+    rows = stop_ticker(m, wid, rows)
     count = ticks(rows)
     before = accent_pixels(m, "tick-before.png", accent)
     assert len(before) == SQUARE * SQUARE, len(before)
-    x0 = min(x for x, _ in before)
-    # The square's next place (test-window's `move_square`: 8 to the right,
-    # back to the area's left edge + 10 past its right one).
-    want = x0 + 8 if x0 + 8 + SQUARE <= TICK_W else TICK_TREE_W + 10
     gui.confirmed_keys(m, "n")
-    gui.wait_for(
-        m,
-        "the square moved",
-        lambda: accent_pixels(m, "tick-after.png", accent),
-        lambda p: len(p) == SQUARE * SQUARE and min(x for x, _ in p) == want,
-    )
+    square_moved(m, accent, before, "tick-after-n.png")
     gui.wait_settled(m)
-    assert ticks(below_root(gui.ui_tree(m, wid))) == count, "a key the app took is no tick"
+    assert ticks(gui.ui_tree(m, wid)) == count, "a key the app took is no tick"
+    start_button = gui.node(rows, "button", "Start")
+    focused = gui.invoke(m, start_button["id"], "focus")
+    assert focused.row is not None and "focused" in focused.row["state"], focused
+    before = accent_pixels(m, "tick-before-space.png", accent)
+    gui.confirmed_keys(m, " ")
+    square_moved(m, accent, before, "tick-after-space.png")
+    gui.wait_settled(m)
+    rows = gui.ui_tree(m, wid)
+    assert (tick_state(rows), ticks(rows)) == ("stopped", count), "Space reached the tree"
     gui.confirmed_keys(m, ["esc"])
     end_line(m, mark, "window", app_id, "exited with 0")
     assert tick_ended(m, mark, "quit") == count
@@ -918,6 +929,16 @@ def test_sdk_custom_drawing_follows_the_theme(boot):
     app_id, mark, wid, rows = start_ticker(m)
     light = int(wait_for_output(m, mark, TICK_ACCENT, 30)[1], 16)
     stop_ticker(m, wid, rows)
+    recoloured(m, mark, light)
+    gui.close_window(m, "window")
+    end_line(m, mark, "window", app_id, "exited with 0")
+    tick_ended(m, mark)
+
+
+def recoloured(m, mark: int, light: int) -> None:
+    """The stopped tick app's square in `light` (the light accent), then,
+    after `theme dark`, in the dark accent (a new accent logged) at the same
+    pixels."""
     square = accent_pixels(m, "tick-light.png", light)
     assert len(square) == SQUARE * SQUARE, len(square)
     switched = len(m.output)
@@ -930,6 +951,31 @@ def test_sdk_custom_drawing_follows_the_theme(boot):
         lambda: accent_pixels(m, "tick-dark.png", dark),
         lambda p: sorted(p) == sorted(square),
     )
+
+
+def test_sdk_a_greedy_take_still_leaves_the_toolkit_its_events(boot):
+    # `tick greedy` takes every event offered to it, yet requests, `Theme`
+    # and `Close` never reach its `take`: a press is still answered and seen
+    # in the tree, `theme dark` still recolours its square, and closing the
+    # window still ends it with 0.
+    m = boot_desktop(boot)
+    app_id, mark, wid, rows = start_ticker(m, "greedy")
+    record = app(m, app_id)
+    light = int(wait_for_output(m, mark, TICK_ACCENT, 30)[1], 16)
+    gui.wait_ui(m, "a tick", lambda r: ticks(r) >= 1, wid, 30)
+    stop_ticker(m, wid, rows)
+    recoloured(m, mark, light)
     gui.close_window(m, "window")
     end_line(m, mark, "window", app_id, "exited with 0")
     tick_ended(m, mark)
+    wait_gone(m, app_id, record["thread"])
+
+
+def test_sdk_a_tick_can_quit(boot):
+    # `tick quit`: its fifth tick says `Flow::Quit`: the loop returns
+    # (`quit after 5 ticks`), exit 0, the window gone.
+    m = boot_desktop(boot)
+    app_id, mark, _, _ = start_ticker(m, "quit")
+    end_line(m, mark, "window", app_id, "exited with 0")
+    assert tick_ended(m, mark, "quit") == 5
+    gui.wait_no_window(m, "window")

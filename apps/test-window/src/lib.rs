@@ -62,20 +62,26 @@
 //! The SDK's tick loop (`ui::Toolkit::run_until`), its window titled
 //! `window`, 320 × 160:
 //!
-//! - `tick`: a tree on the left (`Ticks`, a label counting the ticks;
-//!   `State`, `running` or `stopped`; buttons `Stop` and `Start`) and the
-//!   app's own area on the right, where a 16-pixel square in the palette's
-//!   accent moves 8 pixels a tick (its own damage, `take_drawn`). It ticks
-//!   every 50 ms while running (an animating wait) and not at all stopped
-//!   (so the desktop settles). `n` moves the square without a tick (taken
-//!   by the app: its drawing committed, the tree unchanged); Escape quits
-//!   (`Taken::Quit`). It logs `window: tick: running`, `window: tick:
+//! - `tick [greedy|quit]`: a tree on the left (`Ticks`, a fixed-width
+//!   label counting the ticks; `State`, `running` or `stopped`; buttons
+//!   `Stop` and `Start`) and the app's own area on the right, where a
+//!   16-pixel square in the palette's accent moves 8 pixels a tick (its own
+//!   damage, `take_drawn`; it paints only the square, the background being
+//!   the tree's). It ticks every 50 ms while running (an animating wait)
+//!   and not at all stopped (so the desktop settles). `n` and Space move
+//!   the square without a tick (taken by the app: its drawing committed,
+//!   the tree unchanged, a focused button never pressed by Space); Escape
+//!   quits (`Taken::Quit`). `greedy` also takes every other event offered
+//!   (doing nothing with it: requests, `Close`, `Theme`, focus and `Lost`
+//!   must still reach the toolkit); `quit` quits from its fifth tick
+//!   (`Flow::Quit`). It logs `window: tick: running`, `window: tick:
 //!   accent 0x<rrggbb>` each time its frame is drawn in a new accent, a
 //!   WARN if tick `k` of a stretch (since launch or the last Start) comes
 //!   less than `k` periods after it began (the pacer's floor), and
 //!   `window: tick: <how> after <n> ticks; the last stretch <k> ticks in
 //!   <ms> ms` (`closed` or `quit`; the stretch from its start to its last
-//!   tick) when the loop returns, then returns 0.
+//!   tick) when the loop returns, then returns 0; with no time grant, it
+//!   logs `window: tick: no time grant: <e>` and returns 1.
 
 #![no_std]
 
@@ -135,7 +141,7 @@ fn run() -> i32 {
             return 0;
         }
         "sdk" => return sdk(),
-        "tick" => return tick(),
+        "tick" => return tick(args.get(1).map_or("", |a| a.as_str())),
         "panic" => {
             let long: String = core::iter::repeat_n('p', 300).collect();
             panic!("{long}");
@@ -290,7 +296,10 @@ fn sdk() -> i32 {
     match desk.open_window("sdk", 40, 20) {
         Ok(w) => {
             let off = lumen_app::gfx::Rect::new(40, 0, 10, 10);
-            check("a tree's area off the client is BadArgument", matches!(Toolkit::with_area(Grower::new(), w, off), Err(Error::BadArgument)));
+            check(
+                "a tree's area off the client is BadArgument",
+                matches!(Toolkit::with_area(Grower::new(), w, off), Err(Error::BadArgument)),
+            );
         }
         Err(_) => check("a second window", false),
     }
@@ -415,15 +424,33 @@ fn publish(mode: &str, w: &lumen_app::Window) -> Result<(), i32> {
     Ok(())
 }
 
-/// The `tick` mode's window and its tree's width (the app's area is the
-/// rest).
+/// The `tick` mode's window, the tree's part of it (left) and the app's
+/// own (the rest).
 const TICK_W: u32 = 320;
 const TICK_H: u32 = 160;
 const TICK_TREE_W: u32 = 140;
+const TICK_TREE: Area = Area::new(0, 0, TICK_TREE_W, TICK_H);
+const TICK_OWN: Area = Area::new(TICK_TREE_W as i32, 0, TICK_W - TICK_TREE_W, TICK_H);
 /// Its ticks while running, and how far the square moves each one.
 const TICK_NS: u64 = 50_000_000;
 const STEP: i32 = 8;
 const SQUARE: u32 = 16;
+/// Where the square starts, and goes back to past the area's right edge.
+const SQUARE_HOME: i32 = TICK_OWN.x() + 10;
+/// The `Ticks` label's fixed width: its count changing width would move
+/// the widgets after it, repainting (and committing) the whole window.
+const TICKS_W: u32 = 60;
+/// `tick quit`: the tick that quits.
+const QUIT_AT: u64 = 5;
+
+/// How the `tick` mode runs: plainly, taking every event offered
+/// (`greedy`), or quitting from its fifth tick (`quit`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TickMode {
+    Plain,
+    Greedy,
+    Quit,
+}
 
 /// The `tick` mode's app: see the crate's doc.
 struct Ticker {
@@ -432,6 +459,7 @@ struct Ticker {
     state: Widget,
     stop: Widget,
     start: Widget,
+    mode: TickMode,
     ticks: u64,
     running: bool,
     /// The clock, and the current stretch of ticks (since launch or the
@@ -449,13 +477,12 @@ struct Ticker {
 }
 
 impl Ticker {
-    fn new(time: Time) -> Ticker {
+    fn new(time: Time, mode: TickMode) -> Ticker {
         let mut ui = Ui::new();
-        let count = ui.label(None, "Ticks", "0");
+        let count = ui.fixed_label(None, "Ticks", "0", TICKS_W);
         let state = ui.label(None, "State", "running");
         let stop = ui.button(None, "Stop");
         let start = ui.button(None, "Start");
-        let square = Area::new(TICK_TREE_W as i32 + 10, 70, SQUARE, SQUARE);
         let now = time.now_ns().unwrap_or(0);
         Ticker {
             ui,
@@ -463,35 +490,46 @@ impl Ticker {
             state,
             stop,
             start,
+            mode,
             ticks: 0,
             running: true,
             time,
             stretch_start: now,
             stretch: 0,
             last_tick: now,
-            square,
+            square: Area::new(SQUARE_HOME, 70, SQUARE, SQUARE),
             drawn: Vec::new(),
             accent: None,
         }
     }
 
-    /// The app's own area: right of the tree.
-    fn area() -> Area {
-        Area::new(TICK_TREE_W as i32, 0, TICK_W - TICK_TREE_W, TICK_H)
-    }
-
-    /// The square moved `STEP` pixels right, back to the area's left past
-    /// its right edge; its old and new places are the app's damage.
+    /// The square moved `STEP` pixels right, back home past the area's
+    /// right edge; its old and new places are the app's damage.
     fn move_square(&mut self) {
-        let a = Ticker::area();
         let mut x = self.square.x() + STEP;
-        if x + SQUARE as i32 > a.right() {
-            x = a.x() + 10;
+        if x + SQUARE as i32 > TICK_OWN.right() {
+            x = SQUARE_HOME;
         }
         let old = self.square;
         self.square = Area::new(x, self.square.y(), SQUARE, SQUARE);
         self.drawn.push(old);
         self.drawn.push(self.square);
+    }
+
+    /// What `take` does with an event offered: Escape quits; `n` and Space
+    /// move the square (taken: the tree never sees them, so Space never
+    /// presses a focused button); in `greedy` mode everything else offered
+    /// is taken too (doing nothing).
+    fn take(&mut self, e: &Event) -> Taken {
+        match *e {
+            Event::Key { code: KeyCode::Escape, action: KeyAction::Press { .. }, .. } => Taken::Quit,
+            Event::Key { code: KeyCode::N | KeyCode::Spacebar, action: KeyAction::Press { .. }, .. } => {
+                self.move_square();
+                Taken::Took
+            }
+            _ if self.mode == TickMode::Greedy => Taken::Took,
+            _ => Taken::Pass,
+        }
     }
 }
 
@@ -552,26 +590,39 @@ impl Ticking for Ticker {
         if now < floor {
             log::warn(&format!("window: tick: tick {} of its stretch came {} ns early", self.stretch, floor - now));
         }
-        let text = format!("{}", self.ticks);
-        self.ui.set_text(self.count, &text);
+        self.ui.set_text(self.count, &format!("{}", self.ticks));
         self.move_square();
-        Flow::Carry
+        if self.mode == TickMode::Quit && self.ticks == QUIT_AT { Flow::Quit } else { Flow::Carry }
     }
 }
 
-/// The `tick` mode: [`Ticker`] in the SDK's `run_until` until its window
-/// closes or Escape quits; 0 then.
-fn tick() -> i32 {
-    let (Ok(desk), Ok(time)) = (Desktop::get(), Time::get()) else { return 1 };
-    let w = match desk.open_window("window", TICK_W, TICK_H) {
+/// The `tick` mode ([`Ticker`] in the SDK's `run_until`, until its window
+/// closes or it quits; 0 then), `mode` its argument after `tick`.
+fn tick(mode: &str) -> i32 {
+    let mode = match mode {
+        "" => TickMode::Plain,
+        "greedy" => TickMode::Greedy,
+        "quit" => TickMode::Quit,
+        other => {
+            log::error(&format!("window: tick: no mode {other}"));
+            return 1;
+        }
+    };
+    let time = match Time::get() {
+        Ok(t) => t,
+        Err(e) => {
+            log::error(&format!("window: tick: no time grant: {e}"));
+            return 1;
+        }
+    };
+    let w = match Desktop::get().and_then(|d| d.open_window("window", TICK_W, TICK_H)) {
         Ok(w) => w,
         Err(e) => {
             log::error(&format!("window: no window: {e}"));
             return 1;
         }
     };
-    let tree = Area::new(0, 0, TICK_TREE_W, TICK_H);
-    let mut tk = match Toolkit::with_area(Ticker::new(time), w, tree) {
+    let mut tk = match Toolkit::with_area(Ticker::new(time, mode), w, TICK_TREE) {
         Ok(tk) => tk,
         Err(e) => {
             log::error(&format!("window: no toolkit: {e}"));
@@ -579,15 +630,7 @@ fn tick() -> i32 {
         }
     };
     log::info("window: tick: running");
-    let ended = tk.run_until(time, |app, e| match *e {
-        Event::Key { code: KeyCode::Escape, action: KeyAction::Press { .. }, .. } => Taken::Quit,
-        Event::Key { code: KeyCode::N, action: KeyAction::Press { .. }, .. } => {
-            app.move_square();
-            Taken::Took
-        }
-        _ => Taken::Pass,
-    });
-    match ended {
+    match tk.run_until(time, Ticker::take) {
         Ok(how) => {
             let t = tk.app_mut();
             let elapsed_ms = (t.last_tick - t.stretch_start) / 1_000_000;
