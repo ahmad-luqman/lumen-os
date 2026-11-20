@@ -349,7 +349,8 @@ sends the same IPI when it queues a thread on another CPU (`smp::wake`).
 
 APs handle no I/O APIC interrupts: every input goes to the boot CPU. An AP
 starts its local APIC timer once the boot CPU publishes the count, and the
-timer's first tick starts its scheduler. Known gap: there
+timer's first tick starts its scheduler. Known gap (in M1–M7; cross-CPU
+`TLB_SHOOTDOWN` IPI arrives in M8, section 5): there
 is no TLB shootdown; `unmap` flushes only the CPU that runs it. Mapping
 needs none (x86 caches no not-present entries; an AP may grow the heap, or
 map a thread's stack, from a thread or a `run_on` job there). The only
@@ -684,30 +685,48 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
   `PROT_NONE` guard pages and from M7 for `ld-musl` `PT_GNU_RELRO`), and
   adjacent same-attribute merging. Every range validates `start >= USER_MIN`,
   `end <= USER_MAX`, page alignment, and no overflow.
-- **Demand paging and `PROT_NONE` (M6):** `mmap(MAP_ANONYMOUS)` and `brk`
-  growth record VMAs without eagerly allocating physical frames. On a user
-  `#PF` (or a kernel `copy_from_user`/`copy_to_user` `#PF` into
-  `USER_MIN..USER_MAX`), the page fault handler reads `CR2` into a local before
-  anything can re-enable interrupts, panics immediately if `RSVD` (error code
-  bit 3) is set, and checks the process's VMA tree: if the faulting address
-  lies in a permitted VMA (not `PROT_NONE`) and the access matches its rights,
-  it allocates one zeroed frame, maps it with `USER` + the VMA's `W`/`NX`
-  flags, and resumes. `PROT_NONE` VMAs reserve VA space without demand-paging
-  on fault; `mprotect(..., PROT_NONE)` on already-populated pages preserves
-  their physical frames (clearing `PTE_PRESENT` and setting a software
-  `PTE_PROTNONE` bit while retaining the frame address so a later `mprotect`
-  back to `PROT_READ` preserves data and teardown still frees the frame). If no
-  frame is available or the access violates VMA rights (or hits an unmapped
-  address), the process is terminated (M6) or sent `SIGSEGV`/`SIGBUS` (M8).
-  Note on W^X: ELF `PT_LOAD` segments enforce W^X at load; `mmap`/`mprotect`
-  support switching pages between `RW-` and `R-X` and permit explicit
+- **Demand paging, `#PF` interrupt protocol and `PROT_NONE` (M6):**
+  `mmap(MAP_ANONYMOUS)` and `brk` growth record VMAs without eagerly allocating
+  physical frames. Because `idt.rs` installs all 256 IDT entries as 64-bit
+  interrupt gates (`IF = 0` on entry) while `AddressSpace` uses a sleeping
+  lock (which blocks via `WaitQueue::block`, requiring `IF = 1`), user
+  (`cs & 3 != 0`) and `.lumen_fixup` `#PF`s follow an explicit 4-step
+  interrupt protocol:
+  1. Read `CR2` into a local while `IF = 0`; panic immediately if `RSVD`
+     (error code bit 3) is set.
+  2. Assert `frame.rflags & IF != 0` and `irq::depth() == 0` (guaranteed for
+     ring-3 `#PF` and by `copy_from_user`'s lock-ordering precondition), then
+     re-enable interrupts via `irq::restore(true)` (respecting
+     `irq::disabled_for_good()`).
+  3. Acquire `AddressSpace`'s sleeping lock, resolve demand paging / CoW /
+     M7 file I/O / M8 shootdown, and release the lock. If the faulting address
+     lies in a permitted VMA (not `PROT_NONE`) and the access matches its
+     rights, allocate one zeroed frame and map it with `USER` + the VMA's
+     `W`/`NX` flags.
+  4. Call `irq::disable()` (`IF = 0`, `depth == 0`) **before** returning to
+     `lumen_isr_common` (keeping `swapgs; iretq` atomic with respect to IRQs)
+     or calling `sched::exit()` on a fatal fault.
+
+  `PROT_NONE` VMAs reserve VA space without demand-paging on fault;
+  `mprotect(..., PROT_NONE)` on already-populated pages preserves their
+  physical frames (clearing `PTE_PRESENT` and setting a software `PTE_PROTNONE`
+  bit while retaining the frame address so a later `mprotect` back to
+  `PROT_READ` preserves data and teardown still frees the frame). If no frame
+  is available or the access violates VMA rights (or hits an unmapped address),
+  the process is terminated (M6) or sent `SIGSEGV`/`SIGBUS` (M8). Note on W^X:
+  ELF `PT_LOAD` segments enforce W^X at load; `mmap`/`mprotect` support
+  switching pages between `RW-` and `R-X` and permit explicit
   `PROT_READ | PROT_WRITE | PROT_EXEC` when a Linux binary requests it (needed
   by Python `ctypes`/`libffi`, Ruby, and JITs).
-- **Teardown:** When an `AddressSpace` drops (only after every CPU has switched
-  its `CR3` away—see section 6), the kernel walks L4 entries 0–255, frees every
-  user leaf frame (including `PTE_PROTNONE` frames, decrementing refcounts from
-  M8 onward) and every user L1/L2/L3/L4 page-table frame. Kernel upper-half
-  tables (256–511) are untouched.
+- **Teardown:** When a process's last thread exits (`exit_group`, running with
+  interrupts ON), it switches `CR3` back to `kernel_root()`, closes its FD
+  table, and tears down all VMAs and user mappings (walking L4 entries 0–255,
+  freeing leaf frames including `PTE_PROTNONE` frames—decrementing refcounts
+  from M8 onward—and user L1/L2/L3 tables) while sleeping VFS locks are
+  permitted. `AddressSpace::drop` (which may run inside `sched::finish_switch`
+  with interrupts off once no CPU holds its `CR3`) then frees at most the bare
+  L4 root frame without taking any sleeping lock. Kernel upper-half tables
+  (256–511) are untouched.
 - **Cross-CPU TLB shootdowns (M8; M6–M7 single-CPU invariant):** In M6 and M7,
   every user process is single-threaded and pinned to its home CPU (as all
   threads are today in `sched.rs`), so local `invlpg` is exact and no other CPU
@@ -1088,49 +1107,60 @@ weakening crash reporting or `make audit`.
   `lumen_isr_common` inspects the saved `CS` on the stack (`cs & 3 != 0`): if
   the interrupt or exception came from ring 3, it executes `swapgs` on entry
   and `swapgs` before `iretq`. For IST vectors—`#DF`, `NMI`, `#MC`, plus
-  **`#DB` (vector 1, `IST_DEBUG = 4`, guarded IST stack)** so a ring-3
+  **`#DB` (vector 1, `IST_DEBUG = 4`, guarded IST stack registered as
+  `StackKind::Debug` in `lumen-mm::stacks` as each CPU's 5th permanent stack;
+  `MAX_STACKS` is raised in M8 for multithreaded workloads)** so a ring-3
   `MOV SS`/`POP SS` + `SYSCALL` with `TF = 1` (CVE-2018-8897) cannot deliver
   `#DB` onto untrusted user `RSP` at `LSTAR`—an exception can arrive in the
   `syscall` entry or exit `swapgs` window with `CS == KERNEL_CODE`. Those IST
-  stubs therefore save `rax`/`rcx`/`rdx` first, read `rdmsr(IA32_GS_BASE)`,
-  and execute `swapgs` only if it is below the kernel half
-  (`< 0xffff_8000_0000_0000`), recording a stack flag to undo `swapgs` on
-  exit. Keeping `CR4.FSGSBASE = 0` and enforcing `addr < USER_MAX` on any
-  future `ARCH_SET_GS` guarantees user `GS_BASE` can never lie in the kernel
-  half.
+  stubs therefore save `rax`/`rcx`/`rdx` first, clear `RFLAGS.AC` if
+  `SMAP_ENABLED`, read `rdmsr(IA32_GS_BASE)`, and execute `swapgs` only if it
+  is below the kernel half (`< 0xffff_8000_0000_0000`), recording a stack flag
+  to undo `swapgs` on exit. Keeping `CR4.FSGSBASE = 0` and enforcing
+  `addr < USER_MAX` on any future `ARCH_SET_GS` guarantees user `GS_BASE` can
+  never lie in the kernel half.
 - **User exceptions do not crash the kernel:** When `lumen_exception_dispatch`
   handles **any** exception with `cs & 3 != 0` (including `#PF`, `#UD`, `#GP`,
   `#DE`, `#SS`, `#AC`, `#MF`, `#XM`, `#DB`, `#BP`—guarding the kernel ktest
   `#BP` resume branch with `cs & 3 == 0`):
-  - `#PF` goes to the user VM demand-paging / CoW handler (section 5); if the
-    fault is invalid, the process exits with a fatal fault status (M6) or
-    receives `SIGSEGV` with `si_addr = CR2` (M8), logged once at `WARN` with
-    pid, vector, `rip` and `cr2`—never `crash::exception`.
+  - `#PF` runs the 4-step interrupt protocol and user VM demand-paging / CoW
+    handler (section 5); if the fault is invalid, the process exits with a
+    fatal fault status (M6) or receives `SIGSEGV` with `si_addr = CR2` (M8),
+    logged once at `WARN` with pid, vector, `rip` and `cr2`—never
+    `crash::exception`.
   - Every other ring-3 exception likewise terminates only the offending user
-    process (M6) or delivers the corresponding POSIX signal (M8). Any exception
-    from ring 0 outside the `.lumen_fixup` table below (or a deferred `#DB` at
-    `LSTAR`, which clears `TF` and delivers `SIGTRAP`/terminates the user
-    process) remains fatal and goes to `crash::exception` as before.
-- **User FP/SSE/AVX state (`FXSAVE64` baseline + optional `XSAVE`) and `audit.py`:**
-  - Every x86-64 CPU guarantees SSE2 and `FXSAVE64`/`FXRSTOR64`, whereas
-    `XSAVE`/AVX depend on CPUID (and QEMU's default `-cpu qemu64` in
-    `lumen_harness/qemu.py` does not expose `XSAVE`/AVX). On the boot CPU and
-    each AP (`ap_main`), the kernel clears `CR0.EM` and `CR0.TS`, sets `CR0.MP`,
-    **`CR0.NE`** (bit 5, so unmasked ring-3 x87 errors raise `#MF` vector 16
-    rather than legacy IRQ 13), `CR4.OSFXSR` and `CR4.OSXMMEXCPT`. Only when
-    CPUID leaf 1 ECX bit 26 (`XSAVE`) is set does it enable `CR4.OSXSAVE`,
-    write `XCR0 = 0x3 | (cpuid(0xD, 0).eax & 0x4)` (enabling AVX bit 2 only if
-    hardware actually supports it—avoiding `#GP(0)` on XSAVE-without-AVX CPUs),
-    and then query `CPUID(0xD, 0).ebx` for the active save-area size.
+    process (M6) or delivers the corresponding POSIX signal (M8).
+  - **Deferred `#DB` at `LSTAR` (CVE-2018-8897 handoff):** never delivers
+    `SIGTRAP` or calls `sched::exit()` directly on the shared per-CPU
+    `IST_DEBUG` stack (where `IF = 0` and `did_swapgs = 1`). Instead, it clears
+    `TF` in the saved `RFLAGS` (and clears `DR6`), sets a per-thread
+    pending-debug-trap flag, and returns via `iretq` (undoing `swapgs`) back to
+    `LSTAR`; `lumen_syscall_entry` then switches immediately onto the thread's
+    normal kernel stack, where the syscall dispatcher checks the flag before
+    executing the syscall and terminates the process (M6) or delivers `SIGTRAP`
+    (M8). Any other exception from ring 0 outside the `.lumen_fixup` table
+    remains fatal and goes to `crash::exception` as before.
+- **User FP/SSE/AVX state (`FXSAVE64` baseline + optional `XSAVE64`/`XRSTOR64`) and `audit.py`:**
+  - Every x86-64 CPU guarantees SSE2 and `FXSAVE64`/`FXRSTOR64`, whereas the
+    `XSAVE` CPUID feature and AVX depend on CPUID (and QEMU's default
+    `-cpu qemu64` in `lumen_harness/qemu.py` does not expose `XSAVE`/AVX). On
+    the boot CPU and each AP (`ap_main`), the kernel clears `CR0.EM` and
+    `CR0.TS`, sets `CR0.MP`, **`CR0.NE`** (bit 5, so unmasked ring-3 x87 errors
+    raise `#MF` vector 16 rather than legacy IRQ 13), `CR4.OSFXSR` and
+    `CR4.OSXMMEXCPT`. Only when CPUID leaf 1 ECX bit 26 (`XSAVE`) is set does
+    it enable `CR4.OSXSAVE`, write `XCR0 = 0x3 | (cpuid(0xD, 0).eax & 0x4)`
+    (enabling AVX bit 2 only if hardware actually supports it—avoiding `#GP(0)`
+    on XSAVE-without-AVX CPUs), and then query `CPUID(0xD, 0).ebx` for the
+    active save-area size.
   - Each user thread owns an aligned FPU save buffer: a 512-byte,
     16-byte-aligned `FxSaveArea` (initialized with `FCW = 0x037F`,
     `MXCSR = 0x1F80`) on baseline CPUs, or a 64-byte-aligned CPUID-sized
-    `XSaveArea` when `XSAVE` is active (reset to clean initial state on
-    `execve`; in M8, `rt_sigreturn` masks `MXCSR` against `MXCSR_MASK` and
-    validates `XSTATE_BV`/`XCOMP_BV` before restoring to prevent ring-0 `#GP`).
-    Pure kernel threads carry no FPU buffer. Because kernel code uses no
-    SIMD/x87, user FPU state is saved/restored only on thread context switches
-    and signal delivery/return (M8), not on every syscall.
+    `XSaveArea` when `XSAVE64`/`XRSTOR64` is active (reset to clean initial
+    state on `execve`; in M8, `rt_sigreturn` masks `MXCSR` against `MXCSR_MASK`
+    and validates `XSTATE_BV`/`XCOMP_BV` before restoring to prevent ring-0
+    `#GP`). Pure kernel threads carry no FPU buffer. Because kernel code uses
+    no SIMD/x87, user FPU state is saved/restored only on thread context
+    switches and signal delivery/return (M8), not on every syscall.
   - **`make audit` exemption (hard rule 3):** `lumen_fpu_save` and
     `lumen_fpu_restore` must be defined via `global_asm!` or
     `#[unsafe(naked)] #[unsafe(no_mangle)]` so both lower to `module asm` with
@@ -1199,8 +1229,9 @@ on another; both return a `JoinHandle`, whose `join` blocks until the
 thread has finished and its CPU's `finish_switch` is done with it (its
 stack and joiners' list freed, its reference dropped), so nothing that CPU
 frees for it lands after `join` returns (#183; its record goes when a later
-spawn prunes it). A thread **never moves between CPUs**: each CPU has its
-own run queue (a FIFO) and only that CPU takes
+spawn prunes it). In M2–M7, a thread **never moves between CPUs** (M8 lifts
+this with cross-CPU work-stealing and `TLB_SHOOTDOWN` IPIs, section 5): each
+CPU has its own run queue (a FIFO) and only that CPU takes
 threads off it, so once its spawner has laid out its first frame, a
 thread's saved registers are touched only by its home CPU with interrupts
 off. A wake from another CPU queues the thread there and sends the
@@ -3108,7 +3139,7 @@ Lumen runs two kinds of user code:
 | 12 | `brk(addr)` | tracks a byte-granular heap cursor (backing VMAs page-aligned); returns current `brk` on `addr == 0`, exact requested `addr` on success, and unchanged current `brk` on any failure (`addr < initial_brk`, VMA overlap, OOM)—never `-ENOMEM` |
 | 13 | `rt_sigaction(sig, act, oldact, sigsetsize)` | requires `sigsetsize == 8` (`-EINVAL` otherwise); rejects non-null `act` for `SIGKILL`/`SIGSTOP` (`-EINVAL`); stores a per-process 64-entry `sigaction` table so `oldact` preserves prior handlers/`SIG_IGN`; real signal dispatch arrives in M8 |
 | 14 | `rt_sigprocmask(how, set, oldset, sigsetsize)` | requires `sigsetsize == 8`; maintains per-thread signal mask (silently dropping `SIGKILL`/`SIGSTOP`); real delivery arrives in M8 |
-| 16 | `ioctl(fd, req, arg)` | on fd 0/1/2: `TCGETS` (`0x5401`) fills a default `struct termios`, `TCSETS`/`TCSETSW`/`TCSETSF` (`0x5402`–`0x5404`) succeed as no-ops (0), and `TIOCGWINSZ` (`0x5413`) fills `struct winsize` with console rows/cols; all other requests `-ENOTTY` |
+| 16 | `ioctl(fd, req, arg)` | returns `-EBADF` for unopened/closed fds; on fd 0/1/2: `TCGETS` (`0x5401`) fills a default `struct termios`, `TCSETS`/`TCSETSW`/`TCSETSF` (`0x5402`–`0x5404`) succeed as no-ops (0), and `TIOCGWINSZ` (`0x5413`) fills `struct winsize` with console rows/cols; all other requests `-ENOTTY` |
 | 19 | `readv(fd, iov, iovcnt)` | validates `0 <= iovcnt <= 1024`, copies `iovec` array via `copy_from_user`, skips zero-length spans without dereferencing `iov_base`, reads from fd 0 (needed by `musl` `__stdio_read` for buffered stdin) |
 | 20 | `writev(fd, iov, iovcnt)` | validates `0 <= iovcnt <= 1024`, copies `iovec` array via `copy_from_user`, skips zero-length spans without dereferencing `iov_base`, writes each span to fd 1/2 |
 | 39 | `getpid()` | returns process PID (`>= 1`) |
@@ -3126,7 +3157,7 @@ Lumen runs two kinds of user code:
 | 218 | `set_tid_address(tidptr)` | stores `clear_child_tid` pointer and returns current TID |
 | 228 | `clock_gettime(clockid, tp)` | `CLOCK_REALTIME` (0, from RTC/boot offset), `CLOCK_MONOTONIC` (1), `CLOCK_MONOTONIC_RAW` (4), `CLOCK_REALTIME_COARSE` (5), `CLOCK_MONOTONIC_COARSE` (6), `CLOCK_BOOTTIME` (7) |
 | 231 | `exit_group(status)` | terminates the process and frees its `AddressSpace` and FD table |
-| 302 | `prlimit64(pid, res, new, old)` | M6 read-only defaults for `RLIMIT_STACK` (8 MiB), `RLIMIT_NOFILE` (1024), `RLIMIT_AS` (`RLIM_INFINITY`) when `old` is non-null; writable per-process limit enforcement arrives in M10 |
+| 302 | `prlimit64(pid, res, new, old)` | validates `pid == 0 \|\| pid == current_pid` (`-ESRCH` otherwise) and `res < RLIM_NLIMITS` (16, `-EINVAL` otherwise); M6 read-only defaults for `RLIMIT_STACK` (8 MiB), `RLIMIT_NOFILE` (1024), and `RLIM_INFINITY` for other valid resources when `old` is non-null; writable per-process limit enforcement arrives in M10 |
 | 318 | `getrandom(buf, len, flags)` | rejects unknown flag bits (`-EINVAL`), fills user buffer from `crate::rng` (section 7) via `copy_to_user`, and returns bytes written |
 
 Because `musl` on `x86_64` invokes legacy non-`*at` / non-`*2` syscalls
@@ -3137,11 +3168,12 @@ x86-64 entry points (trivial shims over `*at(AT_FDCWD, ...)`):
   `dynlink.c`), `openat` (257), `stat` (4), `lstat` (6), `newfstatat` (262),
   `statx` (332), `access` (21), `faccessat` (269), `lseek` (8), `pread64`
   (17), `pwrite64` (18), `getdents64` (217), `fsync` (74), `fdatasync` (75),
-  `sync` (162), `truncate` (76), `ftruncate` (77), `rename` (82), `renameat2`
-  (316), `mkdir` (83), `mkdirat` (258), `rmdir` (84), `link` (86), `linkat`
-  (265), `unlink` (87), `unlinkat` (263), `symlink` (88), `symlinkat` (266),
-  `readlink` (89), `readlinkat` (267), `chmod` (90), `fchmod` (91), `chown`
-  (92), `fchown` (93), `lchown` (94), `umask` (95), `utimensat` (280),
+  `sync` (162), `truncate` (76), `ftruncate` (77), `rename` (82), `renameat`
+  (264), `renameat2` (316), `mkdir` (83), `mkdirat` (258), `rmdir` (84),
+  `link` (86), `linkat` (265), `unlink` (87), `unlinkat` (263), `symlink`
+  (88), `symlinkat` (266), `readlink` (89), `readlinkat` (267), `chmod` (90),
+  `fchmod` (91), `fchmodat` (268), `chown` (92), `fchown` (93), `lchown` (94),
+  `fchownat` (260), `umask` (95), `utimensat` (280),
   `chdir` (80), `fchdir` (81), `fcntl` (72), `flock` (73), and file-backed
   `mmap`.
 - **M8 (Processes, threads, signals, `futex`, PTYs):** `fork`/`vfork`/`clone`/
@@ -5980,7 +6012,7 @@ kernel. The kernel is the trusted computing base.
 | Codegen | `make audit`: disassembly and LLVM IR checks | `tools/harness/lumen_harness/audit.py` |
 | Harness itself | self-tests that the TAP parser, audit and image diff catch failures, and that the QEMU command line, artifact layout, CI wiring and status generation behave | `tests/harness` |
 | Feature gate | every feature in `tests/features/*.toml` must pass (CI); `docs/STATUS.md` generated from the same data | `make status-check`, `make status` |
-| Linux ABI conformance (M6+) | upstream `musl` `libc-test`, gVisor syscall suites, and targeted LTP cases plus unmodified Alpine `ext4` runtime tests | `tests/scenarios/test_linux_*`, `test_alpine.py`, `test_runtimes.py` |
+| Linux ABI conformance (M6+) | upstream `musl` `libc-test`, gVisor syscall suites, and targeted LTP cases plus unmodified Alpine `ext4` runtime tests | `tests/scenarios/test_linux_*`, `test_alpine.py`, `test_conformance.py`, `test_runtimes.py` |
 
 **CI tiers, `status.py` feature gate, and deterministic disk images (M7–M10, #230).**
 Starting in M7, Linux-userspace tests run against a deterministic, pre-baked
@@ -5990,29 +6022,36 @@ to the MIT repo)—CI scenarios never depend on live external package mirrors;
 M9's `apk`/HTTPS test talks to a local host test server.
 
 Because M10's full compiler/runtime tests (multi-file C++20 builds, `go build`,
-`rustc`/`cargo` with proc-macros, `node` V8 + `npm`, and full gVisor/LTP
-suites) require 2–4 GiB guests and would take tens of minutes under TCG
-software emulation (which `ci.yml` uses on failure re-runs and macOS uses
-locally), CI and `status.py` split into two tiers before M10 issues are filed
-so Hard Rules 1 and 10 stay intact:
+`rustc`/`cargo` with proc-macros, `node` V8 + `npm`, 2–4 GiB page-cache
+reclaim, and full gVisor/LTP suites) require 2–4 GiB guests and would take tens
+of minutes under TCG software emulation (which `ci.yml` uses on failure re-runs
+and macOS uses locally), CI and `status.py` split into two tiers before M10
+issues are filed while keeping `status.py` strictly stateless (Hard Rules 1
+and 10—never carrying forward stale `"passing"` rows from an older `STATUS.md`):
 
-1. **Feature-gate schema (`tests/features/*.toml` + `status.py`):** every
-   feature defaults to `tier = "pr"`; M10 heavy runtime features declare
-   `tier = "heavy"` and their scenarios carry `@pytest.mark.heavy`. `status.py`
-   gains `--tier pr|heavy|all` (defaulting to `pr` in `ci.yml`, `heavy` in the
-   heavy workflow, and `all` when generating `docs/STATUS.md`, which records
-   each feature's tier and last verified result).
-2. **PR gate (fast, KVM, `ci.yml`):** runs `-m "not heavy"`, `audit:flags`,
-   host tests, ktests, M0–M9 scenarios, and lightweight M10 smoke tests
-   (`test_go_run_smoke`, `test_rustc_tiny_smoke`, `test_node_eval_smoke`),
-   gated by `status.py --check --tier pr`, keeping the 10-minute TCG failure
-   re-run.
+1. **Separate JUnit outputs & feature-gate schema (`tests/features/*.toml` +
+   `status.py`):** every feature defaults to `tier = "pr"`; M10 heavy features
+   declare `tier = "heavy"` and their scenarios carry `@pytest.mark.heavy`.
+   `make test-scenarios` runs `-m "not heavy"` and writes
+   `build/test-results/scenarios.xml`; a new `make test-heavy` target runs
+   `-m heavy` (`SCENARIO_JOBS=1`, KVM-only) and writes
+   `build/test-results/scenarios-heavy.xml`, with neither target deleting the
+   other. `status.py::collect_results()` merges both XML files when present,
+   and `status.py` gains `--tier pr|heavy|all`.
+2. **PR gate (fast, KVM, `ci.yml`):** runs `make test-scenarios` (`-m "not
+   heavy"`), `audit:flags`, host tests, ktests, M0–M9 scenarios, and
+   lightweight M10 smoke tests (`test_go_run_smoke`, `test_rustc_tiny_smoke`,
+   `test_node_eval_smoke`), gated by `make status-check`
+   (`status.py --check --tier pr`), keeping the 10-minute TCG failure re-run.
 3. **Heavy runtime gate (separate workflow / merge-queue / nightly, KVM-only):**
-   runs `-m heavy` with `SCENARIO_JOBS=1` (avoiding 4×4 GiB OOM on 16 GiB
+   runs `make test-heavy` (`SCENARIO_JOBS=1`, avoiding 4×4 GiB OOM on 16 GiB
    runners), fails fast if `/dev/kvm` is absent (never silently falling back to
-   TCG), omits the TCG failure re-run, and gates with `status.py --check --tier
-   heavy`. Both tiers obey the busy-host rule (no tight wall-clock ceilings
-   inside scenarios; only outer CI job timeouts).
+   TCG), omits the TCG failure re-run, and gates with
+   `status.py --check --tier heavy`. Refreshing `docs/STATUS.md`
+   (`status.py --write --tier all`) runs strictly over fresh merged PR + heavy
+   results (either on a KVM host running both targets or a `main` CI job
+   merging both artifacts). Both tiers obey the busy-host rule (no tight
+   wall-clock ceilings inside scenarios; only outer CI job timeouts).
 
 QEMU exit codes: 33 = tests passed, 35 = a test failed (or `lumen.ktest=` selected none), 37 = crash report.
 A triple fault exits with 0 (`-no-reboot`) and therefore fails; the power-off
@@ -6063,7 +6102,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/shell/       the shells (lumen-shell): serial and the virtual terminals' consoles, the commands, system commands (sysinfo.rs), deliberate faults (crash.rs), trace runq/xray (xray.rs)
   src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
   linker.ld        layout at -2 GiB, .ktests section (M6 adds .lumen_fixup in :rodata)
-crates/            no_std, host-testable libraries (lumen-elf, lumen-mm, lumen-heap, lumen-gfx, lumen-acpi, lumen-pci, lumen-time, lumen-queue, lumen-term, lumen-shell, lumen-uart, lumen-font, lumen-png, lumen-wm, lumen-app-api, lumen-calc, lumen-clock, lumen-edit, lumen-perf, lumen-snake, lumen-view, lumen-xray; M6 adds lumen-vm)
+crates/            no_std, host-testable libraries (lumen-acpi, lumen-app-api, lumen-calc, lumen-clock, lumen-demo, lumen-edit, lumen-elf, lumen-font, lumen-gfx, lumen-heap, lumen-input, lumen-mm, lumen-pci, lumen-perf, lumen-png, lumen-queue, lumen-rand, lumen-shell, lumen-snake, lumen-synth, lumen-term, lumen-time, lumen-trace, lumen-uart, lumen-ui, lumen-view, lumen-wm, lumen-xray; M6 adds lumen-vm)
 assets/fonts/      the desktop's UI font (Atkinson Hyperlegible, SIL OFL 1.1) with its licence and source
 assets/wallpaper/  the desktop's wallpaper (original, made by tools/wallpaper.py; README.md)
 boot/limine.conf   bootloader config template
