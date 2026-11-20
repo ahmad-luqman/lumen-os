@@ -64,10 +64,17 @@ def test_invoke_outputs_are_told_apart():
     late = gui.parse_invoke("ui invoke: ran late\n" + ROW)
     assert late is not None and late.late and late.row is not None and late.row["id"] == "17"
     assert gui.parse_invoke(CANCELLED) is None
+    # Refused before it was queued (a rationed queue, or an app's window
+    # holding one request, #207): it never ran, so it is retried too.
+    for busy in [
+        "ui invoke: window 3 busy (try again)",
+        "ui invoke: a request is still queued or running in window 3",
+    ]:
+        assert gui.parse_invoke(busy + "\n") is None, busy
+    assert gui.INVOKE_STILL_RUNNING.match("ui invoke: still running (window 3)")
     for message in [
         "ui invoke: window 3 closed",
         "ui invoke: ran; window 3 closed",
-        "ui invoke: window 3 busy (try again)",
         "ui invoke: no node 17",
         "ui invoke: still running (window 3)",
     ]:
