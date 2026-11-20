@@ -596,6 +596,68 @@ def test_calculator_golden(boot, artifacts, golden_dir):
     )
 
 
+def clock_tree(m) -> tuple[str, list[dict[str, str]]]:
+    return wait_tree(m, "Clock", "Time")
+
+
+def clock_time(m, wid: str) -> str:
+    """The clock's `Time` label's value (`HH:MM:SS`)."""
+    return gui.node(gui.ui_tree(m, wid), "label", "Time")["value"]
+
+
+def test_clock_golden(boot, artifacts, golden_dir):
+    # `run clock --at 10:09`: frozen at 10:09:00 (its label's value, and
+    # the hands at nine minutes past ten, the second hand at 12), with no
+    # ticks, so the desktop settles; its client area against a golden.
+    m = boot_desktop(boot)
+    start(m, "clock --at 10:09")
+    wid, rows = clock_tree(m)
+    assert gui.node(rows, "label", "Time")["value"] == "10:09:00"
+    row = gui.window(m, "Clock")
+    x0, y0, x1, y1 = gui.client_box(row)
+    shot = gui.settled_screendump(m, "clock.png")
+    assert clock_time(m, wid) == "10:09:00"
+    assert_matches_golden(
+        shot,
+        golden_dir / "app-clock.png",
+        origin=(x0, y0),
+        size=(x1 - x0, y1 - y0),
+        artifacts=artifacts,
+    )
+
+
+def test_clock_tree_matches_rtc(boot):
+    # The clock's `Time` label shows `date`'s time: polled until the hour
+    # and minute agree (as the taskbar clock's test does; the clock reads
+    # the RTC four times a second). It goes on (its value changes as the
+    # seconds pass), yet the desktop settles between its ticks (its waits
+    # aren't animating). Its close ends it with 0. A time `--at` doesn't
+    # take ends it with 2, saying why.
+    m = boot_desktop(boot)
+    app_id, mark = start(m, "clock")
+    wid, _ = clock_tree(m)
+
+    def date_and_label() -> tuple[str, str]:
+        found = re.fullmatch(r"date: \d{4}-\d\d-\d\d (\d\d:\d\d:\d\d) UTC\n", run(m, "date"))
+        assert found, "date's format"
+        return found[1], clock_time(m, wid)
+
+    agreed = gui.wait_for(
+        m, "the clock showing date's minute", date_and_label, lambda dl: dl[0][:5] == dl[1][:5]
+    )
+    assert re.fullmatch(r"\d\d:\d\d:\d\d", agreed[1]), agreed
+    first = clock_time(m, wid)
+    gui.wait_ui(
+        m, "the clock's next second", lambda r: gui.node(r, "label", "Time")["value"] != first, wid
+    )
+    gui.wait_settled(m)
+    gui.close_window(m, "Clock")
+    end_line(m, mark, "clock", app_id, "exited with 0")
+    bad = r"ERROR app: clock: clock: '25:00' is not a time of day"
+    app_id, mark = start(m, "clock --at 25:00", allow=bad)
+    end_line(m, mark, "clock", app_id, "exited with 2")
+
+
 def test_app_ids_are_global(boot):
     # Two copies of one app (the same app ids inside): their trees never
     # share a global id; once one closes, its ids name nothing (`no node`)
