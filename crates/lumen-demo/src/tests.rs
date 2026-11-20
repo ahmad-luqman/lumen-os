@@ -1,7 +1,7 @@
 extern crate std;
 
 use crate::bands;
-use crate::life::{Life, ORIGIN, PATTERNS, Place, pattern};
+use crate::life::{DEFAULT_PATTERN, Life, ORIGIN, PATTERNS, Place, pattern};
 use crate::mandel::{ONE, View, color, escape};
 use core::num::NonZeroUsize;
 use std::collections::{HashMap, HashSet};
@@ -244,6 +244,11 @@ fn the_gun_fires_a_glider_every_thirty_generations() {
         assert_eq!(life.population(), 36 + 5 * period, "period {period}");
         assert!(gun_cells.iter().all(|&(x, y)| life.get(x, y)));
     }
+}
+
+#[test]
+fn the_default_pattern_is_the_gun() {
+    assert_eq!(pattern(DEFAULT_PATTERN).map(|p| p.name), Some("gun"));
 }
 
 #[test]

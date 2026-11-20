@@ -3911,6 +3911,28 @@ kernel (no SSE); #197 checks the results' bits.
   an argument that isn't UTF-8) are one ERROR naming them, then exit 2; any
   other failure to read the arguments is exit 1. Launched without `--step`
   it flies from the start, and its Restarts fly too.
+- **What #202 adds:** `apps/life` (bundled, `caps=time,desktop`),
+  Conway's Game of Life on the SDK's tick loop, replacing #157's kernel
+  Life window (`demo.rs`'s window path is gone; the text-mode `life`
+  command stays). Its rules and patterns are `lumen_demo::life`'s, a path
+  dependency (host-tested, `cargo:lumen-demo`).
+  - **The window** (600×320): a tree on the left (`with_area`): the
+    `Patterns` list, `Start`, `Stop` and `Step`, and three fixed-width
+    labels, `Pattern`, `Generation` and `State` (`running` or `stopped`).
+    The grid is the rest, the app's own: a line in the palette's border
+    colour, then cells 7 pixels square on an 8-pixel pitch, live ones in
+    its accent. The pattern running is the list's selection (from the
+    start, the focus left alone: `Ui::set_selected`) and the `Pattern`
+    label's text.
+  - **Running**, a generation every 100 ms (`Ticking::period`, animating,
+    focused or not); a step commits the box around the cells that changed
+    (`take_drawn`) and the `Generation` label. **Stopped**, no period:
+    the window settles, and `Step` advances one generation. A pattern
+    chosen in the list starts it again from that pattern at generation 0,
+    running or stopped as it was.
+  - **`run life [--stopped] [pattern]`** (`gun` without one; the launcher
+    starts it running with `gun`); anything else is one ERROR naming it,
+    with the usage, and exit 2.
 - **What #204 adds (the image viewer, `apps/viewer`, bundled):** images
   built into the app (the wallpaper, `assets/wallpaper/lumen.png`; and
   `apps/viewer/images/`, made by `tools/viewer-images.py`: a palette image,
@@ -4014,8 +4036,16 @@ kernel (no SSE); #197 checks the results' bits.
   `Then::Failed`, a load failure the app's one WARN). A bundled app
   `precheck` refuses is left out with a WARN naming why
   (`app::tests::every_bundled_app_passes_precheck` keeps that from
-  shipping). Its Life item starts the Life app (#202, which updates
-  the M4 Life row and `tests/features/gui.toml`).
+  shipping). Its Life item starts the Life app (#202: `taskbar.rs`'s
+  `LIFE_APP`), which is therefore left out of the apps after the demo
+  items, so it is listed once
+  (`taskbar::the_launcher_lists_the_life_app_once`). An item starting an
+  app is answered once the app is started, without waiting for its
+  window, which the app's thread opens (so its button may come before
+  the answer or after); `app <id>` is in the taskbar's INFO line, not
+  the answer. An app that then can't open its window ends with its own
+  ERROR and end line (as every bundled app does, #206), not with the
+  item's `Then::Failed`, which only a refused start gives.
 - **Loading from disk (M6)** will need more: import names in errors are
   sanitised already, but wasmi reserves vectors up front for the counts a
   module declares (`reserve_exact`), which `CODE_FACTOR` doesn't bound
@@ -4346,9 +4376,10 @@ until a crash.
   a `ui tree` value), then calls the harness's `wait_settled(m)`
   (`tools/harness/lumen_harness/gui.py`, #153), and brackets each
   screendump between two `desktop status` reads with the same `frames`.
-  Windows that animate (a blinking cursor, `desktop spin`, Life) never
-  idle: tests close them first, mask them or (a terminal window) unfocus
-  them, and their goldens leave them out. A scenario that only checks state ends with `desktop check`
+  Windows that animate (a blinking cursor, `desktop spin`, the running
+  Life app) never idle: tests close them first, mask them, (a terminal
+  window) unfocus them or stop them (the Life app's `--stopped` and Stop), and their
+  goldens leave them out. A scenario that only checks state ends with `desktop check`
   reporting 0 and 0.
 
 ### Windows and who draws (#153)
@@ -5195,8 +5226,9 @@ close, and the demos in windows of their own. All of it is built with
   `taskbar_text`, through the toolkit's palette choice):
   - a `menu` named `Launcher`: `press` (or a click) toggles it
     (`expanded`); expanded, its `menuitem`s follow it: `Terminal`,
-    `Mandelbrot`, `Life` and `Counter`, each opening that window and
-    folding the menu again. Each is refused while the desktop is paused,
+    `Mandelbrot`, `Life` and `Counter`, each opening that window (`Life`
+    starting the Life app since #202, section 8) and folding the menu
+    again. Each is refused while the desktop is paused,
     as `terminal` is; a launch that fails is warned about, and a `ui
     invoke` that chose it prints `ui invoke: <item>: <why>` and fails
     (`lumen_ui::Then::Failed`, answered `Served::Failed`), e.g. `ui
@@ -5216,10 +5248,15 @@ close, and the demos in windows of their own. All of it is built with
   windows change (one opened or closed), and it brings its buttons in
   line (and reads the clock): a button for a window gone is removed from
   its tree (its node id names nothing after), one for a new window added.
-  A launcher item brings them in line itself, before its request is
-  answered, so `ui tree` after `ui invoke` shows the new window's button
+  A launcher item opening a kernel window (Terminal, Mandelbrot, Counter)
+  brings them in line itself, before its request is answered, so `ui
+  tree` after `ui invoke` shows the new window's button
   (`lumen.taskbar_wake_delay_ms=<ms>` holds back its handling of a poke,
-  so a test can tell the two apart).
+  so a test can tell the two apart). An item starting an app (Life since
+  #202, the bundled apps since #206) is answered once the app is started,
+  without waiting for its window: the app's thread opens it, and its
+  button comes with it, before or after the answer (`INFO  taskbar:
+  <item>: app <id>` logs the start).
 - **The clock** polls the RTC without animating (the desktop settles
   between polls; `rtc::now_quiet`) and redraws the label when the
   minute changes, damaging only its bounds (the toolkit's per-widget
@@ -5243,7 +5280,7 @@ close, and the demos in windows of their own. All of it is built with
   the compositor, printing the root's row; `ui invoke: window <id> is
   minimized already` and `ui invoke: window <id> isn't minimized` when
   there is nothing to do). A minimized window's commits queue no damage
-  (Life presents nothing while minimized).
+  (the Life app presents nothing while minimized).
 - **`lumen-ui` for the shell:** `Stack`, the handle stacks are (only a
   stack takes children); `Ui::remove` (a widget and all in it; its node
   ids name nothing after, focus and a press on it dropped, what it covered
@@ -5272,11 +5309,10 @@ close, and the demos in windows of their own. All of it is built with
   window drawn once by every CPU (`sched::scope` and
   `Surface::bands_mut`, below; its rows by CPU logged as `INFO
   demo: mandelbrot window <id>: <n> CPUs in <ms> ms, rows by CPU: cpu0=<rows>
-  ...`), then waiting for its close; `Life` opens a window that keeps
-  stepping the `gun` pattern, focused or not (its waits are animating: it
-  never settles), until it is closed. Closing either stops
-  it. `mandelbrot` and `life` typed in a shell are as before (a canvas;
-  refused in a terminal window).
+  ...`), then waiting for its close, which stops it. `Life` was a
+  kernel window stepping the `gun` pattern until #202 made it an app
+  (section 8, "What #202 adds"). `mandelbrot` and `life` typed in a shell
+  are as before (a canvas; refused in a terminal window).
 - **Lent bands:** `lumen_gfx::Surface::bands_mut(rows)` splits a surface
   into disjoint bands of `rows` rows (`BandMut`: `row_mut`, `impl
   Target`), on the owner's surface (`h.surface_mut().bands_mut`), and

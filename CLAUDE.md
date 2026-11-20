@@ -210,7 +210,8 @@ own PR that updates that doc first.
   owner thread (`terminal`: draws the grid, hands keys over, blinks the focused one's cursor) and its shell
   (`term-shell`, `shell::run_in_window` on a closable console), joined on close; `term text <window>`.
   `taskbar.rs`: the desktop shell's taskbar (#157): a panel along the bottom, its `Launcher` menu
-  (Terminal, Mandelbrot, Life, Counter, then the bundled apps granting `desktop`, #206; refused while
+  (Terminal, Mandelbrot, Life, Counter, then the bundled apps granting `desktop`, #206;
+  Life starting the Life app, which is left out of those, `LIFE_APP`, #202; refused while
   paused, a failure answered `Then::Failed`), a
   button per window, the `Clock` (the RTC polled without animating, `rtc::now_quiet`, its last reading kept
   on errors; `desktop tick` moves it a minute ahead), its `taskbar` owner thread
@@ -268,7 +269,8 @@ own PR that updates that doc first.
   (`mark_boot`, `since_boot_ns`), `now_ns`, `sleep`, `ticks`.
   `demo.rs`: the `mandelbrot` (bands on every CPU) and `life` commands, and
   the launcher's Mandelbrot window (`draw_bands`: a window's surface lent
-  as bands to a thread per CPU through `sched::scope`) and Life window (#157).
+  as bands to a thread per CPU through `sched::scope`; #157's Life window
+  is the Life app since #202).
   `perf.rs`: `perf top`, the sampling profiler (#205): the timer tick's
   samples (`on_tick`, a call and one load unless a profile runs) into a
   per-CPU `lumen_perf::Buffer`, `profile` (a count per CPU, not a duration;
@@ -328,7 +330,8 @@ own PR that updates that doc first.
   playing `lumen-synth` sources paced by the device), `beep`, `play`,
   `volume` and `sound`.
 - `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs
-  in bands, and Game of Life with its patterns (host-tested).
+  in bands, and Game of Life with its patterns (host-tested; the `life`
+  command's and the Life app's, a path dependency of `apps/`, #202).
 - `crates/lumen-elf`: ELF symbol-table reader (host-tested).
 - `crates/lumen-perf`: the sampling profiler's logic (#205): `Buffer`, a
   lock-free sample buffer with one writer (a CPU's timer interrupt) armed
@@ -565,7 +568,8 @@ own PR that updates that doc first.
   (`tools/new-app.sh`); `calculator` (#207, the first app on the SDK's
   `ui::Toolkit`, lumen-ui inside the app); `clock` (#200, an analog face
   on `run_until`, `--at` freezing it); `comet` (#201, the snake-style
-  game on `run_until`, `--seed N --step` for tests); `viewer` (#204, bundled images
+  game on `run_until`, `--seed N --step` for tests); `life` (#202, Conway's Game of Life on
+  `run_until`, lumen-demo's rules; the launcher's Life); `viewer` (#204, bundled images
   decoded inside the app by `lumen-png`, `apps/viewer/images/` made by
   `tools/viewer-images.py`); `xray` (#208, the trace rings
   live, `--replay` frozen); the SDK's loops (`run_with`'s
