@@ -315,6 +315,7 @@ mod tests {
         assert!(face.take_drawn().is_empty());
         assert!(refresh(&mut face, &mut s).is_empty());
         // No time: the label blank and the hands gone (all three boxes).
+        assert_eq!(BLANK, "--:--:--");
         face.show(None);
         assert_eq!(face.ui.text(face.label), Some(BLANK));
         assert_eq!(face.drawn.len(), 3);
