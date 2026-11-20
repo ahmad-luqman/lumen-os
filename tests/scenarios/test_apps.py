@@ -1129,8 +1129,12 @@ def test_life_golden(boot, artifacts, golden_dir):
         size=(x1 - x0, y1 - y0),
         artifacts=artifacts,
     )
-    rows = gui.press_animated(m, rows, "Start", "running", lambda r: generation(r) > 12, wid)
-    assert life_state(rows) == "running", rows
+    # Start goes on from where it stopped: the same pattern, its
+    # generation never back below 12.
+    rows = gui.press_animated(m, rows, "Start", "running", lambda r: life_state(r) == "running", wid)
+    assert (life_pattern(rows), generation(rows) >= 12) == ("acorn", True), rows
+    rows = gui.wait_ui(m, "acorn running on", lambda r: generation(r) > 12, wid, 30)
+    assert life_pattern(rows) == "acorn", rows
     choose(m, rows, "glider", animating=True)
     rows = gui.wait_ui(
         m,
