@@ -1187,11 +1187,7 @@ def choose(m, rows: list[dict[str, str]], name: str, animating: bool = False) ->
 
 def life_client(m, name: str) -> bytes:
     """The Life window's client area in a settled screendump `name`."""
-    from PIL import Image
-
-    box = gui.client_box(gui.window(m, "Life"))
-    with Image.open(gui.settled_screendump(m, name)) as img:
-        return img.convert("RGB").crop(box).tobytes()
+    return gui.settled_capture(m, lambda: gui.client_pixels(m, "Life", name)).tobytes()
 
 
 def life_matches_a_full_repaint(m, name: str) -> None:
@@ -1239,14 +1235,14 @@ def test_life_refuses_arguments_it_doesnt_take(boot):
 
 def test_life_golden(boot, artifacts, golden_dir):
     # `run life --stopped glider`: the glider, stopped (no period, so the
-    # window settles, and it spends no fuel). Acorn chosen in its list starts it again at
-    # generation 0, still stopped; twelve presses of Step (each one
-    # generation, answered, or settled if still running) against a golden of
-    # its client area, what the steps' damage committed (after three, and
-    # after running) equal to a full repaint. Start runs it (the generation grows while it
-    # animates); the glider chosen while it runs starts again from it,
-    # still running. Stop settles it; acorn chosen then is generation 0,
-    # stopped.
+    # window settles, and it spends no fuel). Acorn chosen in its list
+    # starts it again at generation 0, still stopped; twelve presses of Step
+    # (each one generation, answered, or settled if still running) against a
+    # golden of its client area, what the steps' damage committed (after
+    # three, and after running) equal to a full repaint. Start runs it (the
+    # generation grows while it animates); the glider chosen while it runs
+    # starts again from it, still running. Stop settles it; acorn chosen
+    # then is generation 0, stopped.
     m = boot_desktop(boot)
     app_id, mark = start(m, "life --stopped glider")
     wid, rows = life_tree(m)
@@ -1290,7 +1286,7 @@ def test_life_golden(boot, artifacts, golden_dir):
     rows = gui.press_animated(
         m, rows, "Start", "running", lambda r: life_state(r) == "running", wid
     )
-    assert (life_pattern(rows), generation(rows) >= 12) == ("acorn", True), rows
+    assert life_pattern(rows) == "acorn" and generation(rows) >= 12, rows
     rows = gui.wait_ui(m, "acorn running on", lambda r: generation(r) > 12, wid, 30)
     assert life_pattern(rows) == "acorn", rows
     choose(m, rows, "glider", animating=True)
@@ -1329,10 +1325,10 @@ def test_life_runs_unfocused_and_stops_when_closed(boot):
     # The launcher's Life item starts the Life app (#202; it replaced the
     # kernel's window), running the gun: its generation (the tree's value)
     # grows while another window has the focus (its client area changing on
-    # the screen too), and its waits are an
-    # animation's (the desktop never reads settled). Minimized, it presents
-    # nothing (its commits queue no damage) yet still steps. Its close ends
-    # it with 0, its thread joined, and the desktop settles again.
+    # the screen too), and its waits are an animation's (the desktop never
+    # reads settled). Minimized, it presents nothing (its commits queue no
+    # damage) yet still steps. Its close ends it with 0, its thread joined,
+    # and the desktop settles again.
     m = boot_desktop(boot)
     mark = len(m.output)
     gui.launch(m, "Life")
@@ -1346,7 +1342,7 @@ def test_life_runs_unfocused_and_stops_when_closed(boot):
     record = gui.one(listed, "life apps", name="life")
     app_id = int(record["id"])
     wid, rows = life_tree(m)
-    assert (life_state(rows), gui.node(rows, "label", "Pattern")["value"]) == ("running", "gun")
+    assert (life_state(rows), life_pattern(rows)) == ("running", "gun"), rows
     assert gui.node(rows, "list", "Patterns")["value"] == "1", rows
     colours = gui.node(gui.ui_tree(m), "window", "Colours")
     assert gui.invoke(m, colours["id"], "focus").row is not None

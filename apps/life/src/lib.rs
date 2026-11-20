@@ -87,7 +87,8 @@ impl LifeApp {
         let pattern_label = ui.fixed_label(None, "Pattern", pattern.name, LABEL_W);
         let generation = ui.fixed_label(None, "Generation", "0", LABEL_W);
         let state = ui.fixed_label(None, "State", state_text(running), LABEL_W);
-        let mut app = LifeApp {
+        ui.set_selected(patterns, index_of(pattern));
+        LifeApp {
             ui,
             patterns,
             start,
@@ -96,22 +97,17 @@ impl LifeApp {
             pattern_label,
             generation,
             state,
-            grid: Life::new(COLS, ROWS),
+            grid: seeded(pattern),
             running,
-            drawn: Vec::new(),
-        };
-        app.reset(pattern);
-        app
+            drawn: alloc::vec![GRID],
+        }
     }
 
     /// The grid from `pattern` at generation 0, all of it to draw again;
     /// the list showing it selected (the focus left where it is).
     fn reset(&mut self, pattern: &'static Pattern) {
-        self.grid = Life::new(COLS, ROWS);
-        let (x, y) = pattern.origin(COLS, ROWS);
-        self.grid.place(pattern, x, y);
-        let index = life::PATTERNS.iter().position(|p| p.name == pattern.name);
-        self.ui.set_selected(self.patterns, index);
+        self.grid = seeded(pattern);
+        self.ui.set_selected(self.patterns, index_of(pattern));
         self.ui.set_text(self.pattern_label, pattern.name);
         self.ui.set_text(self.generation, "0");
         self.drawn.push(GRID);
@@ -136,6 +132,19 @@ impl LifeApp {
         self.running = running;
         self.ui.set_text(self.state, state_text(running));
     }
+}
+
+/// `pattern`'s place in the list (the patterns' order).
+fn index_of(pattern: &Pattern) -> Option<usize> {
+    life::PATTERNS.iter().position(|p| p.name == pattern.name)
+}
+
+/// A grid holding `pattern` at generation 0.
+fn seeded(pattern: &Pattern) -> Life {
+    let mut grid = Life::new(COLS, ROWS);
+    let (x, y) = pattern.origin(COLS, ROWS);
+    grid.place(pattern, x, y);
+    grid
 }
 
 fn state_text(running: bool) -> &'static str {
@@ -221,21 +230,22 @@ impl Ticking for LifeApp {
 /// not.
 fn parse(args: &[String]) -> Result<(&'static Pattern, bool), String> {
     let mut running = true;
-    let mut name: Option<&'static Pattern> = None;
+    let mut chosen: Option<&'static Pattern> = None;
     for a in args {
         match a.as_str() {
             "--stopped" if !running => return Err(String::from("'--stopped' given twice")),
             "--stopped" => running = false,
             n if n.starts_with('-') => return Err(format!("'{n}' isn't an argument it takes")),
             n => {
-                if let Some(first) = name {
+                if let Some(first) = chosen {
                     return Err(format!("one pattern at most ('{}', then '{n}')", first.name));
                 }
-                name = Some(life::pattern(n).ok_or_else(|| format!("no pattern '{n}' ({})", life::NAMES.join(", ")))?);
+                let found = life::pattern(n).ok_or_else(|| format!("no pattern '{n}' ({})", life::NAMES.join(", ")))?;
+                chosen = Some(found);
             }
         }
     }
-    let pattern = name.unwrap_or_else(|| life::pattern(life::DEFAULT_PATTERN).expect("the default pattern exists"));
+    let pattern = chosen.unwrap_or_else(|| life::pattern(life::DEFAULT_PATTERN).expect("the default pattern exists"));
     Ok((pattern, running))
 }
 

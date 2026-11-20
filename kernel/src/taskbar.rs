@@ -5,9 +5,9 @@
 //! Left to right: the `Launcher` menu (its items open a terminal or the
 //! Mandelbrot window, start the Life app (#202) or open Counter, then
 //! start each other bundled app whose manifest grants `desktop`, by name:
-//! #206), a button per window in the order they opened (a press restores it if minimized, then raises and
-//! focuses it), and at the right end the `Clock`, a fixed-size label
-//! showing the RTC's `HH:MM`.
+//! #206), a button per window in the order they opened (a press restores
+//! it if minimized, then raises and focuses it), and at the right end the
+//! `Clock`, a fixed-size label showing the RTC's `HH:MM`.
 //!
 //! Its owner, the `taskbar` thread, waits up to a second at a time
 //! (non-animating: the window settles between polls), polls the RTC each
@@ -43,18 +43,19 @@ const LIFE_APP: &str = "life";
 
 /// The launcher's items: [`ITEMS`], then the bundled apps whose manifest
 /// grants `desktop` (never the test apps), by name, except [`LIFE_APP`].
+/// Without [`LIFE_APP`] among them (not bundled, or left out by `precheck`,
+/// which warned), the Life item stays, its launch then refused (`run: no
+/// app life`): one WARN says so here.
 fn items() -> Vec<&'static str> {
-    items_with(crate::app::desktop_apps())
-}
-
-/// [`items`] over the bundled desktop apps `apps`. Without [`LIFE_APP`]
-/// among them (not bundled, or left out by `precheck`, which warned), the
-/// Life item stays, its launch then refused (`run: no app life`): one WARN
-/// says so here.
-fn items_with(apps: Vec<&'static str>) -> Vec<&'static str> {
+    let apps = crate::app::desktop_apps();
     if !apps.contains(&LIFE_APP) {
         log::warn!(target: "taskbar", "Life: no bundled desktop app {LIFE_APP}: the item can't start it");
     }
+    items_with(apps)
+}
+
+/// [`items`] over the bundled desktop apps `apps`.
+fn items_with(apps: Vec<&'static str>) -> Vec<&'static str> {
     ITEMS.into_iter().chain(apps.into_iter().filter(|&a| a != LIFE_APP)).collect()
 }
 /// How often the clock polls the RTC.
