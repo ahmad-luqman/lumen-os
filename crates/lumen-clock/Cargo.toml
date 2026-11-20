@@ -1,0 +1,9 @@
+[package]
+name = "lumen-clock"
+description = "no_std clock logic for Lumen's clock app (#200): the time of day from the RTC's seconds, `--at` parsing, hand angles from an integer sine table (no floats), points and lines on the face, host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
