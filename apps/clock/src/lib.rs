@@ -131,7 +131,8 @@ impl Clock {
             return;
         }
         let (was, now) = (self.shown.hands(), t.hands());
-        for (hand, a, b) in [(HOUR, was.hour, now.hour), (MINUTE, was.minute, now.minute), (SECOND, was.second, now.second)]
+        for (hand, a, b) in
+            [(HOUR, was.hour, now.hour), (MINUTE, was.minute, now.minute), (SECOND, was.second, now.second)]
         {
             if a != b {
                 self.drawn.push(hand.bounds(a));
@@ -159,7 +160,8 @@ impl App for Clock {
         for &clip in over.rects {
             for i in 0..60u32 {
                 let (x, y) = point(CX, CY, DOTS_R, i * 12);
-                let (w, colour) = if i % 5 == 0 { (HOUR_DOT, over.palette.text) } else { (MINUTE_DOT, over.palette.border) };
+                let (w, colour) =
+                    if i % 5 == 0 { (HOUR_DOT, over.palette.text) } else { (MINUTE_DOT, over.palette.border) };
                 if let Some(part) = square(x, y, w).intersect(&clip) {
                     over.surface.fill_rect(part, colour);
                 }
