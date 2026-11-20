@@ -421,8 +421,8 @@ mod tests {
     }
 
     /// Each variant's tag, as an exhaustive match (no `_` arm): a variant
-    /// added fails to build here until its tag, and its bytes below, are
-    /// pinned.
+    /// added fails to build here until its tag arm is written; the range
+    /// checked below and the pinned bytes are then to be extended with it.
     fn event_tag(e: &Event) -> u8 {
         match e {
             Event::Theme { .. } => 0,
@@ -484,8 +484,8 @@ mod tests {
                 alloc::vec![2, 1, 4, 1, 2],
             ),
             (
-                Event::PointerUp { x: 64, y: 0, button: Button::Left, buttons: Buttons::default() },
-                alloc::vec![3, 0x80, 1, 0, 0, 0],
+                Event::PointerUp { x: 64, y: 0, button: Button::Middle, buttons: Buttons::from_bits(0b1_0001) },
+                alloc::vec![3, 0x80, 1, 0, 2, 0x11],
             ),
             (Event::PointerMove { x: 3, y: -2, buttons: Buttons::from_bits(0b101) }, alloc::vec![4, 6, 3, 5]),
             (Event::FocusGained, alloc::vec![5]),
@@ -502,8 +502,9 @@ mod tests {
         ];
         for (event, bytes) in &cases {
             assert_eq!(&enc(event), bytes, "{event:?}");
-            // The first byte is the tag the exhaustive match pins; a
-            // request's third byte its action's, a key's fourth its action's.
+            // The first byte is the tag the exhaustive match pins; the first
+            // of a request's action bytes its action's, a key's fourth byte
+            // its action's.
             assert_eq!(bytes[0], event_tag(event), "{event:?}");
             match event {
                 Event::Request { action, .. } => {
@@ -526,6 +527,16 @@ mod tests {
             .collect();
         actions.dedup();
         assert_eq!(actions, (0..=6).collect::<Vec<u8>>());
+        let mut keys: Vec<u8> = cases
+            .iter()
+            .filter_map(|(e, _)| match e {
+                Event::Key { action, .. } => Some(key_action_tag(action)),
+                _ => None,
+            })
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys, [0, 1]);
     }
 
     /// The bytes an action takes at the end of a request's encoding.
@@ -795,8 +806,10 @@ mod tests {
         );
         assert_eq!(bad(&[4, 0xff, 0xff, 0xff, 0xff, 0x7f, 0, 0]), Err(DecodeError::Postcard(P::DeserializeBadVarint)));
         // A variant past the last, and a key code past the table.
-        assert!(bad(&[10]).is_err());
-        assert!(bad(&[1, 125, 0, 1]).is_err());
-        assert!(bad(&[0, 2, 0, 0, 0, 0, 0, 0, 0]).is_err());
+        // A variant past the last, a key code past the table, a theme past
+        // the two: serde's refusal, postcard's custom error.
+        assert_eq!(bad(&[10]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
+        assert_eq!(bad(&[1, 125, 0, 1]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
+        assert_eq!(bad(&[0, 2, 0, 0, 0, 0, 0, 0, 0]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
     }
 }

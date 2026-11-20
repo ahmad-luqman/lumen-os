@@ -6,7 +6,9 @@
 //! - a global allocator over the app's fixed memory (`heap`), and a panic
 //!   handler that reports the message through `panic` (the runtime ends the
 //!   app with it: one WARN);
-//! - safe wrappers over every host function: [`log`]'s functions, [`Time`],
+//! - safe wrappers over the host functions (`args_len` is `args`' own, and
+//!   `handle_close` is reached by dropping a [`Window`]): [`log`]'s
+//!   functions, [`Time`],
 //!   [`Desktop`] (opening a window, measuring text), [`Window`] (its canvas,
 //!   commits, events, text drawn into the canvas), [`Trace`] (X-ray's
 //!   reads), [`args`] and [`exit`];
@@ -166,16 +168,18 @@ impl Trace {
         check(sys::trace_cpus(self.0.raw()))
     }
 
-    /// CPU `cpu`'s ring `stream` (0 main, 1 X-ray) from sequence number
+    /// CPU `cpu`'s ring `stream` (`Main` or `Xray`) from sequence number
     /// `since` into `buf`: the header (`api::trace::decode_header`), then
     /// the events copied (`api::trace::decode_event`), whose count is the
     /// result.
-    pub fn read(&self, stream: u32, cpu: u32, since: u64, buf: &mut [u8]) -> Result<u32> {
+    pub fn read(&self, stream: api::kind::Stream, cpu: u32, since: u64, buf: &mut [u8]) -> Result<u32> {
         let since = i64::try_from(since).map_err(|_| Error::BadArgument)?;
         let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
         // SAFETY: `buf` is ours to write, and the host writes at most `len`
         // bytes of it.
-        let r = unsafe { sys::trace_read(self.0.raw(), stream as i32, cpu as i32, since, ptr(buf.as_mut_ptr()), len) };
+        let r = unsafe {
+            sys::trace_read(self.0.raw(), stream as u32 as i32, cpu as i32, since, ptr(buf.as_mut_ptr()), len)
+        };
         check(r)
     }
 }

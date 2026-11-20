@@ -9,10 +9,10 @@
 //! It also links both crates into the ktest kernel, so `make audit`'s
 //! binary checks (no SSE, no red zone, the kernel code model) cover their
 //! code there. Its IR checks read only the kernel crate's own IR, built
-//! without `ktest`: they see these crates' generic code compiled into the
-//! kernel (the booted kernel encodes events with them), while their own
-//! non-generic code stays covered by the binary checks alone, as wasmi's
-//! and rhai's are.
+//! without `ktest`, which doesn't see postcard: the booted kernel encodes
+//! events through `lumen_app_api::event::Event::encode`, compiled in
+//! `lumen-app-api`, so that code (and postcard's and serde's) is covered by
+//! the binary checks alone, as wasmi's and rhai's is.
 
 use alloc::string::String;
 use alloc::vec::Vec;

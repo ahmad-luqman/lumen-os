@@ -308,6 +308,7 @@ own PR that updates that doc first.
   `font.rs`: the desktop's anti-aliased text (`lumen-font`): `font::face`,
   the UI font parsed on first use and shared; `font::Text`, one drawing
   thread's glyph cache over it (`draw` glyph by glyph inside a clip,
+  rasterizing only the glyphs reaching it and saying how many it did,
   `measure`, `line_height`; `TITLE_PX`, `TEXT_PX`, `HEADING_PX`); `font`
   renders the golden sample twice (timings, cache, golden check), as its
   ktest does.
@@ -333,8 +334,9 @@ own PR that updates that doc first.
 - `crates/lumen-font`: anti-aliased TrueType text: `fontdue` (no `simd`)
   behind `Face` (parsed once, shared read-only; `measure`) and `Font`
   (a face plus its own glyph cache keyed by (glyph, pixel size), bounded
-  in bytes, least recently used evicted), one-line layout (`render`,
-  `render_mask` into a `LineMask`) into plain coverage masks, and the
+  in bytes, least recently used evicted), one-line layout (`render`;
+  `render_where`, which skips a glyph whose box a caller refuses before
+  rasterizing it; `render_mask` into a `LineMask`) into plain coverage masks, and the
   embedded UI font, Atkinson Hyperlegible (`assets/fonts/`, SIL OFL)
   (host-tested, incl. a model LRU, a `kern` fixture and a golden mask
   whose hash the kernel's ktest also checks).
@@ -528,6 +530,8 @@ own PR that updates that doc first.
   `confirmed_keys`/`type_confirmed` against `kbd`'s presses, bytes and
   held keys, `KEY_BYTES` the keys it models; the desktop's `windows`,
   `desktop_status`, `wait_settled`, `desktop_check`, `settled_screendump`;
+  `wait_window`, `wait_no_window`, `close_window` (`ui invoke`'s close, then
+  the window's going), `TITLE_H`, `client_box`, `client_pixels`;
   the automation tree's `ui_tree`, `node`, `wait_ui`, `invoke`,
   `desktop_counter`; `parse_records` reads quoted cells with `shlex`),
   `calibration.py` (a boot calibration's verdict line, and the TSC's

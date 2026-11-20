@@ -309,6 +309,22 @@ fn glyphs_a_caller_refuses_are_never_rasterized() {
     assert_eq!(kept, want);
     assert_eq!(rasterized() - before, font.stats().misses);
     assert!(font.stats().misses < all.len() as u64);
+    // The box `visible` is handed for each inked glyph is exactly where
+    // `render` draws it (its corner, then width and height).
+    let mut boxes = Vec::new();
+    let mut font = Font::new(&face, MIB);
+    font.render_where(
+        sample::TEXT,
+        px(24),
+        |x, y, w, h| {
+            boxes.push((x, y, w, h));
+            true
+        },
+        |_| {},
+    );
+    let drawn: Vec<(i32, i32, u32, u32)> = all.iter().map(|g| (g.0, g.1, g.2, g.3)).collect();
+    assert_eq!(boxes, drawn);
+    assert!(drawn.iter().any(|&(x, _, w, h)| x != 0 && w != h), "a box that tells x and w from h");
     // Keeping everything is `render`.
     let mut font = Font::new(&face, MIB);
     let mut every = Vec::new();

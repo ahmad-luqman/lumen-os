@@ -12,19 +12,32 @@
 //! - `handles`: the same handle from `handle_find` every time, no reuse
 //!   after a close, a closed grant `NotGranted`, the wrong kind, made-up
 //!   handles and kind numbers.
-//! - `window` (#206; the desktop started): `window_open`'s checks in order
-//!   (a title exactly at `TITLE_BYTES` accepted, a byte past refused), a
-//!   second window `Limit`; the first event `Theme`, kept in hand across
-//!   `BufferTooSmall`; `window_wait`'s argument errors and its 0 at a
-//!   deadline; `window_commit`'s canvas and rectangle checks (unaligned,
-//!   a stride below the width, stride × height overflowing, rows past the
-//!   memory, a size unlike the window's, 0 or too many rects, exactly
-//!   `COMMIT_RECTS` accepted); the text calls' `px` range, caps and UTF-8;
-//!   `text_draw` without a window `Unavailable`, drawing only inside its
-//!   clip, and a call whose text lies in its own canvas drawing what one
-//!   with a separate copy does; a closed window's handle `BadHandle`, a new
-//!   window a new handle. `calls` checks `window_open` without a desktop
-//!   (`Unavailable`).
+//! - `window` (#206; the desktop started):
+//!   - `window_open`: a made-up handle, the wrong kind, a wrapping title
+//!     (before a zero size), a zero, negative or past-`WINDOW_PIXELS` size,
+//!     a title a byte past `TITLE_BYTES` or not UTF-8 refused, one exactly
+//!     at it accepted; a second window `Limit`; exactly `WINDOW_PIXELS`
+//!     (640 × 480) opening;
+//!   - events: a made-up handle, the wrong kind, a wrapping range; the
+//!     first event `Theme`, kept in hand across `BufferTooSmall` (nothing
+//!     written; `window_wait` then 1 at once), taken by a buffer exactly its
+//!     size; `window_wait`'s argument errors, its 0 at a deadline and never
+//!     before it;
+//!   - `window_commit`: a made-up handle, the wrong kind, a wrapping canvas
+//!     or rects, 0, -1 or too many rects (a bad count before bad rects),
+//!     exactly `COMMIT_RECTS`; an unaligned canvas, a stride below the width
+//!     (before rows past the memory), stride × height past the memory or
+//!     overflowing, rows past the memory, a canvas unlike the window;
+//!   - text: made-up handles and the wrong kind for all three calls; `px` 0,
+//!     7 and 97; text past `TEXT_BYTES`, not UTF-8 or at a wrapping range;
+//!     `text_draw` with an unaligned or wrapping canvas or wrapping
+//!     arguments, `Unavailable` without a window, drawing only inside its
+//!     clip (from x = 0 and from x > 0), only within the window's size on a
+//!     bigger canvas, and a call whose text lies in its own canvas drawing
+//!     what one with a separate copy does;
+//!   - a closed window's handle `BadHandle`, a new window a new handle.
+//!
+//!   `calls` checks `window_open` without a desktop (`Unavailable`).
 
 #![no_std]
 
@@ -255,8 +268,9 @@ fn window(c: &mut Checks) {
     let r = unsafe { host::text_draw(desk, ptr(ca.as_ptr()), ptr(args.as_ptr()), t, tn) };
     c.check("text_draw without a window", r, Err(Error::Unavailable));
 
-    // window_open: the handle, its kind, the title's range, the size, the
-    // title's cap and text.
+    // window_open: the handle, its kind, the title's range before its size,
+    // the size, the title's cap and text (the last two both BadArgument:
+    // their order can't be seen).
     c.check(
         "open: a made-up handle and a bad pointer",
         host::window_open(999, WRAPPING, 10, W as i32, H as i32),
@@ -303,8 +317,19 @@ fn window(c: &mut Checks) {
     c.check("window_wait on a made-up handle", host::window_wait(999, -1, 0), Err(Error::BadHandle));
     c.check("window_wait with one in hand", host::window_wait(w, -1, 0), Ok(()));
     c.holds("window_wait with one in hand is 1", host::window_wait(w, -1, 0) == 1);
-    let n = next_event(w, &mut buf);
+    // Grown a byte at a time from 2: refused while too small, then taken
+    // with a buffer exactly its size (its length one more than the last
+    // refused).
+    let mut len = 2;
+    let n = loop {
+        let r = next_event(w, &mut buf[..len]);
+        if r != Error::BufferTooSmall.returned() || len == EVENT_BYTES {
+            break r;
+        }
+        len += 1;
+    };
     c.check("next_event", n, Ok(()));
+    c.holds("an event taken by a buffer exactly its size", n == len as i32);
     let first = Event::decode(&buf[..n.clamp(0, EVENT_BYTES as i32) as usize]);
     c.holds("the first event is the theme", matches!(first, Ok(Event::Theme { .. })));
     c.check("window_wait animating 2", host::window_wait(w, -1, 2), Err(Error::BadArgument));

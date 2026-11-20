@@ -22,6 +22,9 @@
 //! - [`args`]: `run`'s arguments as the app reads them;
 //! - [`layout`]: the window calls' fixed layouts (`Canvas`, `Rect`,
 //!   `TextDraw`) and the checks on them;
+//! - [`wire`]: what every wire type shares (`wire_enum!`, `decode_exact`);
+//! - `sys`: the `lumen` imports, declared once for every app (wasm32
+//!   only);
 //! - [`event`]: [`event::Event`], the wire type `window_next_event` hands an
 //!   app (postcard), with its conversions from the kernel's types.
 //!

@@ -286,6 +286,13 @@ mod tests {
         assert!(checked.rows(&wide).is_none());
         let tall = Rect::new(0, 2, 1, 2).clip(8, 4).unwrap();
         assert!(checked.rows(&tall).is_none());
+        // Past the right edge only because it starts at x = 5 (4 wide in
+        // a 9-wide canvas): none; ending exactly at the edge: its rows.
+        let shifted = Rect::new(5, 0, 4, 1).clip(9, 1).unwrap();
+        assert!(checked.rows(&shifted).is_none());
+        let edge = Rect::new(5, 2, 3, 1).clip(8, 3).unwrap();
+        let rows: Vec<(u32, Range<usize>)> = checked.rows(&edge).unwrap().collect();
+        assert_eq!(rows, [(2, 64 + 25 * 4..64 + 28 * 4)]);
     }
 
     #[test]

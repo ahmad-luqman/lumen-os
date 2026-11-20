@@ -1,6 +1,6 @@
 [package]
 name = "lumen-app"
-description = "Lumen's app SDK (#206): safe wrappers over the `lumen` host functions (log, time, a window with its canvas, events, text), a global allocator over the app's fixed memory, a panic handler reporting through `panic`, and the `manifest!` and `main!` macros. Not an app (an rlib: `make apps` copies only cdylibs); apps/template is a start."
+description = "Lumen's app SDK (#206): safe wrappers over the `lumen` host functions (log, time, trace, a window with its canvas, events, text), a global allocator over the app's fixed memory, a panic handler reporting through `panic` with where it happened, and the `manifest!` and `main!` macros. Not an app (an rlib: `make apps` copies only cdylibs); apps/template is a start."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

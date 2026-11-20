@@ -9,15 +9,18 @@
 //! - `ignore-close`: given `Close`, logs `window: ignoring close` and spins
 //!   for good, never closing its window: the close grace ends it after
 //!   `CLOSE_GRACE_SLICES` slice ends.
-//! - `close`: its window titled `a<ESC>b<LF>c` (shown sanitised); given
-//!   `Close`, it drops the window (`window: closed it`), then sleeps 50
-//!   times 100 ms, far past the close grace's slice ends, and returns 0.
+//! - `close`: its window titled `a<ESC>b<LF>c`; given `Close`, it drops
+//!   the window (`window: closed it`), then sleeps 100 ms at a time until
+//!   killed: each sleep a slice end, so it is soon far past the close
+//!   grace's.
 //! - `rects`: fills its canvas red and commits 20 rectangles covering only
 //!   its right half (`x` from 100: more than `COMMIT_RECTS`, so the SDK
 //!   commits in turns), logs `window: rects: committed 20`, then reads
 //!   events until `Close`.
-//! - `log`: logs one 1,100-byte line (`log: ` then `L`s): the SDK cuts it
-//!   to `TEXT_BYTES`, so the kernel logs its start rather than refusing it.
+//! - `log`: logs one 1,205-byte line (`log: ` then 600 `é`s, 2 bytes each,
+//!   so byte `TEXT_BYTES` falls inside one): the SDK cuts it to
+//!   `TEXT_BYTES` on a char boundary, so the kernel logs its start rather
+//!   than refusing it whole.
 //! - `panic`: panics with a 300-byte message: the SDK's panic handler cuts
 //!   it to fit ` at <file>:<line>`.
 //! - `panic-utf8`: the same with 200 `€`s (3 bytes each): cut on a char
@@ -26,6 +29,12 @@
 //! - `alloc`: allocates and frees 256 KiB 64 times (16 MiB in all, in a
 //!   2 MiB memory): only a heap that frees lasts; logs `window: alloc: 64
 //!   rounds` and returns 0.
+//! - `sdk`: the SDK's other calls, each checked (`window: sdk: <n> checks,
+//!   <f> failed`, and a line per failure): `open_window` past
+//!   `WINDOW_PIXELS` is `BadArgument` (not `OutOfMemory`), `Trace` (`cpus`
+//!   at least 1, a read whose count agrees with its header), `Desktop::
+//!   measure`, `Time::now_ns` and `wall`, `Window::wait` with a deadline,
+//!   animating and not; then `exit(7)`.
 
 #![no_std]
 
@@ -35,9 +44,11 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::hint::black_box;
-use lumen_app::{Desktop, Event, Rect, Time, log};
+use lumen_app::api::kind::Stream;
+use lumen_app::api::trace::{EVENT_SIZE, HEADER_SIZE, decode_header};
+use lumen_app::{Desktop, Error, Event, Rect, Time, Trace, log};
 
-lumen_app::manifest!(time, desktop);
+lumen_app::manifest!(time, desktop, trace);
 lumen_app::main!(run);
 
 const W: u32 = 200;
@@ -71,10 +82,11 @@ fn run() -> i32 {
     match mode {
         "log" => {
             let mut line = String::from("log: ");
-            line.extend(core::iter::repeat_n('L', 1095));
+            line.extend(core::iter::repeat_n('é', 600));
             log::info(&line);
             return 0;
         }
+        "sdk" => return sdk(),
         "panic" => {
             let long: String = core::iter::repeat_n('p', 300).collect();
             panic!("{long}");
@@ -149,14 +161,64 @@ fn run() -> i32 {
                 drop(w);
                 log::info("window: closed it");
                 let Ok(time) = Time::get() else { return 4 };
-                for _ in 0..50 {
+                loop {
                     if time.sleep(100_000_000).is_err() {
                         return 5;
                     }
                 }
-                return 0;
             }
             _ => return 0,
         }
     }
+}
+
+/// The `sdk` mode's checks: a line per failure, then the count; `exit(7)`.
+fn sdk() -> i32 {
+    let mut run = 0;
+    let mut failed = 0;
+    let mut check = |what: &str, ok: bool| {
+        run += 1;
+        if !ok {
+            failed += 1;
+            log::info(&format!("window: sdk: FAILED {what}"));
+        }
+    };
+    let Ok(desk) = Desktop::get() else { return 1 };
+    check(
+        "a window past WINDOW_PIXELS is BadArgument",
+        matches!(desk.open_window("x", 65536, 65536), Err(Error::BadArgument)),
+    );
+    check("measure", desk.measure(16, "abc").is_ok_and(|w| w > 0));
+    match Trace::get() {
+        Ok(trace) => {
+            check("trace cpus", trace.cpus().is_ok_and(|n| n >= 1));
+            let mut buf = [0u8; HEADER_SIZE + 4 * EVENT_SIZE];
+            match trace.read(Stream::Main, 0, 0, &mut buf) {
+                Ok(n) => {
+                    let mut header = [0u8; HEADER_SIZE];
+                    header.copy_from_slice(&buf[..HEADER_SIZE]);
+                    let (next, missed) = decode_header(&header);
+                    check("a trace read's count agrees with its header", n <= 4 && next == missed + u64::from(n));
+                }
+                Err(_) => check("a trace read", false),
+            }
+        }
+        Err(_) => check("a trace handle", false),
+    }
+    let Ok(time) = Time::get() else { return 2 };
+    check("now_ns", time.now_ns().is_ok_and(|ns| ns > 0));
+    check("wall past 2020", time.wall().is_ok_and(|s| s > 1_577_836_800));
+    match desk.open_window("sdk", 40, 20) {
+        Ok(mut w) => {
+            // Its first event (the theme) read, then waits with deadlines.
+            check("wait for the theme", w.wait_event().is_ok_and(|e| matches!(e, Event::Theme { .. })));
+            let soon = |t: &Time| t.now_ns().unwrap_or(0) + 10_000_000;
+            check("wait with a deadline", w.wait(Some(soon(&time)), false).is_ok());
+            check("an animating wait", w.wait(Some(soon(&time)), true).is_ok());
+            check("animating without a deadline", w.wait(None, true) == Err(Error::BadArgument));
+        }
+        Err(_) => check("a window", false),
+    }
+    log::info(&format!("window: sdk: {run} checks, {failed} failed"));
+    lumen_app::exit(7)
 }

@@ -305,19 +305,18 @@ def test_template_app_runs(boot):
     )
     assert done, record
     gui.wait_settled(m)
-    before = gui.client_pixels(m, "template", "template-before.png")
+    before = gui.client_pixels(m, "template", "template-before.png").tobytes()
     assert len(set(before)) > 2, "the template drew nothing"
     gui.type_confirmed(m, "a")
     gui.wait_for(
         m,
         "the key redrawn",
-        lambda: gui.client_pixels(m, "template", "template-after.png"),
+        lambda: gui.client_pixels(m, "template", "template-after.png").tobytes(),
         lambda c: c != before,
     )
-    assert gui.invoke_close(m, "template") == f"ui invoke: window {row['id']} closed\n"
+    gui.close_window(m, "template")
     end_line(m, mark, "template", app_id, "exited with 0")
     wait_gone(m, app_id, record["thread"])
-    gui.wait_no_window(m, "template")
 
 
 def test_app_ignoring_close_is_ended(boot):
@@ -360,7 +359,7 @@ def test_window_calls_refuse_bad_arguments(boot):
 
 
 # `abuse window`'s checks: every one runs, whatever the answers.
-ABUSE_WINDOW_CHECKS = 83
+ABUSE_WINDOW_CHECKS = 84
 
 
 def test_kill_wakes_an_app_waiting_on_its_window(boot):
@@ -385,11 +384,13 @@ def test_kill_wakes_an_app_waiting_on_its_window(boot):
 
 
 def test_sdk_logs_a_long_line_cut(boot):
-    # The SDK cuts a line past TEXT_BYTES before `log` (the kernel would
-    # refuse it whole): its start is logged, cut at LOG_BYTES (5 + 251).
+    # The SDK cuts a line past TEXT_BYTES on a char boundary before `log`
+    # (byte TEXT_BYTES falls inside an `é`: cut there, the kernel would
+    # refuse it whole as bad UTF-8): its start is logged, cut at LOG_BYTES
+    # (5 + 125 two-byte characters).
     m = boot_shell(boot)
     app_id, mark = start(m, "window log")
-    wait_for_output(m, mark, r"INFO  app: window: log: L{251}\n", 30)
+    wait_for_output(m, mark, r"INFO  app: window: log: é{125}\n", 30)
     end_line(m, mark, "window", app_id, "exited with 0")
 
 
@@ -441,37 +442,63 @@ def test_sdk_commits_more_rects_than_one_call_takes(boot):
     wait_for_output(m, mark, r"INFO  app: window: window: rects: committed 20\n", 30)
     row = gui.wait_window(m, "window")
     gui.wait_settled(m)
-    w = int(row["w"]) - 2
-    pixels = gui.client_pixels(m, "window", "rects.png")
-
-    def at(x: int, y: int) -> tuple[int, ...]:
-        i = (y * w + x) * 3
-        return tuple(pixels[i : i + 3])
-
+    client = gui.client_pixels(m, "window", "rects.png")
+    assert client.size == (200, 100), (client.size, row)
     for y in (0, 50, 99):
-        assert all(at(x, y) == RED for x in range(100, 200)), y
-        assert all(at(x, y) != RED for x in range(100)), y
-    assert gui.invoke_close(m, "window") == f"ui invoke: window {row['id']} closed\n"
+        assert all(client.getpixel((x, y)) == RED for x in range(100, 200)), y
+        assert all(client.getpixel((x, y)) != RED for x in range(100)), y
+    gui.close_window(m, "window")
     end_line(m, mark, "window", app_id, "exited with 0")
 
 
 def test_an_app_that_closes_its_window_has_no_close_grace(boot):
-    # Its title sanitised (ESC and LF as U+FFFD); given `Close`, it drops
-    # its window, then sleeps far past CLOSE_GRACE_SLICES slice ends: listed
-    # with no window meanwhile, and ending with its own 0, never "didn't
-    # close its window".
+    # Given `Close`, it drops its window, then sleeps 100 ms at a time until
+    # killed: once seen past CLOSE_GRACE_SLICES more slice ends than it had
+    # when it said so, with no window, the grace can't have ended it; its
+    # end is the kill's, never "didn't close its window".
     m = boot_desktop(boot)
     app_id, mark = start(m, "window close")
-    title = "a\ufffdb\ufffdc"
-    row = gui.wait_window(m, title)
-    assert gui.invoke_close(m, title) == f"ui invoke: window {row['id']} closed\n"
+    gui.wait_window(m, CLOSE_TITLE)
+    gui.close_window(m, CLOSE_TITLE)
     wait_for_output(m, mark, r"INFO  app: window: window: closed it\n", 30)
+    closed = app(m, app_id)
+    assert closed is not None, f"app {app_id} gone"
     record, done = poll(
         m,
         lambda: app(m, app_id),
-        lambda a: a is None or (a["windows"] == "0" and int(a["slices"]) > 4),
+        lambda a: (
+            a is None
+            or (
+                a["windows"] == "0"
+                and int(a["slices"]) >= int(closed["slices"]) + CLOSE_GRACE_SLICES + 1
+            )
+        ),
         30,
     )
-    assert done and record is not None, f"app {app_id} gone before it was seen without its window"
-    end_line(m, mark, "window", app_id, "exited with 0")
-    assert "didn't close its window" not in m.output[mark:]
+    assert done and record is not None, (closed, record)
+    mark = len(m.output)
+    kill(m, app_id, "window")
+    end_line(m, mark, "window", app_id, "killed")
+    wait_gone(m, app_id, record["thread"])
+    assert "didn't close its window" not in m.output
+
+
+# `window close`'s title, `a ESC b LF c`, as `windows` shows it (the
+# desktop's own copy is checked in `a_window_title_is_sanitised`).
+CLOSE_TITLE = "a\ufffdb\ufffdc"
+# lumen_app_api::limits::CLOSE_GRACE_SLICES.
+CLOSE_GRACE_SLICES = 4
+
+
+def test_sdk_wraps_its_other_calls(boot):
+    # `window sdk`: open_window past WINDOW_PIXELS is BadArgument, Trace
+    # (cpus, a read agreeing with its header), measure, the clocks, waits
+    # with a deadline (animating or not), animating without one refused;
+    # then exit(7).
+    m = boot_desktop(boot)
+    app_id, mark = start(m, "window sdk")
+    found = wait_for_output(
+        m, mark, r"INFO  app: window: window: sdk: (\d+) checks, (\d+) failed\n", 30
+    )
+    assert (int(found[1]), found[2]) == (10, "0"), m.output[mark:]
+    end_line(m, mark, "window", app_id, "exited with 7")

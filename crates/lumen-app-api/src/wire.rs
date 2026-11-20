@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 macro_rules! wire_enum {
     ($(#[$meta:meta])* $vis:vis enum $name:ident { $($variant:ident = $num:literal,)* }) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize)]
         #[repr(u8)]
         $vis enum $name {
             $($variant = $num,)*

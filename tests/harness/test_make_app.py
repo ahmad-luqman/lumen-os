@@ -3,9 +3,12 @@ bundling"), in a temporary copy of the repository: it makes apps/foo from
 apps/template with the crate renamed, and that copy builds into a module
 the kernel would take (validated by wasmtime, `lumen` imports only,
 `memory` fixed at the template's size, `lumen_main`, the template's
-manifest). Names the kernel wouldn't embed, taken names (a test app's
-module name among them) and an existing directory are refused, making
-nothing."""
+manifest). Refused, making nothing: names the kernel wouldn't embed or
+not starting with a letter, `test-`/`test_` names and test apps' module
+names, names the workspace has once `-` and `_` are alike (a directory,
+any package of apps/Cargo.lock), an existing directory; a lock file
+naming no package fails closed, and a copy that fails leaves nothing
+behind."""
 
 import os
 import shutil

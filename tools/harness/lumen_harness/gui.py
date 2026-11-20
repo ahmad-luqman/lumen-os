@@ -807,14 +807,30 @@ def client_box(row: dict[str, str]) -> tuple[int, int, int, int]:
     return x + 1, y + TITLE_H, x + w - 1, y + h - 1
 
 
-def client_pixels(m: Machine, title: str, name: str) -> bytes:
-    """Window `title`'s client area in a screendump named `name`, as RGB
-    bytes row after row."""
+def client_pixels(m: Machine, title: str, name: str):
+    """Window `title`'s client area in a screendump named `name`: an RGB
+    PIL image (`.tobytes()` to compare two, `.getpixel` to read one)."""
     from PIL import Image
 
     box = client_box(window(m, title))
     with Image.open(m.screendump(name)) as img:
-        return img.convert("RGB").crop(box).tobytes()
+        return img.convert("RGB").crop(box)
+
+
+def close_window(m: Machine, title: str) -> None:
+    """`ui invoke <root> close` on window `title`, then wait until it is
+    gone. `ui invoke` waits for the close only up to its guest deadline, so
+    "still open (its close is still queued)" is as good as "closed" on a
+    loaded host: the window's going is what confirms it."""
+    row = window(m, title)
+    out = invoke_close(m, title)
+    said = (
+        f"ui invoke: window {row['id']} closed\n",
+        f"ui invoke: window {row['id']} still open (its close is still queued)\n",
+    )
+    if out not in said:
+        raise AssertionError(f"ui invoke close said {out!r}")
+    wait_no_window(m, title)
 
 
 def invoke_close(m: Machine, title: str) -> str:

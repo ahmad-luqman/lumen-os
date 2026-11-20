@@ -162,8 +162,12 @@ impl Text {
     /// character: an app's `text_draw` pays for that by the character, #206).
     /// Blending isn't idempotent, so a redraw of one damaged rectangle
     /// passes that rectangle and the pixels outside it stay as they were.
+    ///
+    /// Returns the glyphs it rasterized (ones its cache didn't hold): what an app's
+    /// `text_draw` pays for by the glyph.
     #[allow(clippy::too_many_arguments, reason = "a line of text: where, what, how big, which colour, inside what")]
-    pub fn draw(&mut self, s: &mut Surface, x: i32, y: i32, text: &str, px: Px, color: u32, clip: Rect) {
+    pub fn draw(&mut self, s: &mut Surface, x: i32, y: i32, text: &str, px: Px, color: u32, clip: Rect) -> u64 {
+        let before = self.font.stats().misses;
         let visible =
             |gx: i32, gy: i32, w: u32, h: u32| Rect::new(gx, gy, w, h).translate(x, y).intersect(&clip).is_some();
         self.font.render_where(text, px, visible, |g| match Mask::new(g.width(), g.height(), g.coverage()) {
@@ -180,6 +184,7 @@ impl Text {
                 }
             }
         });
+        self.font.stats().misses - before
     }
 
     /// `text`'s advance width at `px`, from the metrics alone (nothing

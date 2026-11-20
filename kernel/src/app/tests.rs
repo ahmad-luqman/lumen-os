@@ -2,8 +2,11 @@
 //! a kill ending the app at a host call's entry however the call is made,
 //! fuel, the code, memory and value-stack charges against the heap's
 //! high-water mark, `trace_read`'s edges, `kill`'s lines, `launch`'s
-//! refusals and the reaper; the close grace's slice trigger and a kill
-//! waking an app's window wait (#206).
+//! refusals and the reaper; and #206's: the close grace's slice trigger, a
+//! kill waking an app's window wait, the window calls' fuel (pixels,
+//! glyphs, characters), a title capped before its copy and sanitised, the
+//! launcher's list and every embedded app passing `precheck` (window calls
+//! on `Desktop::without_screen`, through `AppCtx`'s ktest seam).
 //!
 //! The charge tests read the global heap's counters: they assume nothing
 //! else allocates meanwhile (ktests run one at a time, no app runs, and
@@ -227,6 +230,29 @@ fn i32_const(n: i32) -> Vec<u8> {
         }
         out.push(b | 0x80);
     }
+}
+
+/// `call f` (a function index below 64: one byte).
+fn call(f: u8) -> Vec<u8> {
+    debug_assert!(f < 64);
+    vec![0x10, f]
+}
+
+/// `local.get i`, `local.set i` (an index below 64).
+fn local_get(i: u8) -> Vec<u8> {
+    vec![0x20, i]
+}
+
+fn local_set(i: u8) -> Vec<u8> {
+    vec![0x21, i]
+}
+
+/// `drop`.
+const DROP: u8 = 0x1a;
+
+/// `i32.const` of each of `ns`, in order: a call's arguments.
+fn args(ns: &[i32]) -> Vec<u8> {
+    ns.iter().flat_map(|&n| i32_const(n)).collect()
 }
 
 /// What `run` does with a module before its thread runs it, then the load
@@ -1039,13 +1065,15 @@ fn poke(store: &mut Store<runtime::AppCtx>, at: usize, bytes: &[u8]) {
 /// and the window's in local 1), and returns the window's handle.
 fn window_module(then: &[u8]) -> Vec<u8> {
     let body = [
-        vec![0x41, 0x03, 0x10, 0x00, 0x21, 0x00], // local 0 = handle_find(Desktop)
-        vec![0x20, 0x00],                         // window_open(desk,
-        i32_const(128),                           //   title at 128,
-        vec![0x41, 0x01, 0x41, 0x10, 0x41, 0x10], //   1 byte, 16 × 16)
-        vec![0x10, 0x01, 0x21, 0x01],             // local 1 = the window
+        args(&[3]), // local 0 = handle_find(Desktop)
+        call(0),
+        local_set(0),
+        local_get(0), // local 1 = window_open(desk, title at 128, 1 byte, 16 × 16)
+        args(&[128, 1, 16, 16]),
+        call(1),
+        local_set(1),
         then.to_vec(),
-        vec![0x20, 0x01], // return it
+        local_get(1), // return it
     ]
     .concat();
     let spec = Spec::importing(&["handle_find", "window_open", "window_commit", "text_draw", "text_measure"]);
@@ -1082,12 +1110,14 @@ crate::ktest!(
         crate::kassert!(win > 0);
         crate::kassert!(used >= 2 * CALL_FUEL + SURFACES * pixels * PIXEL_FUEL);
         // window_commit of the whole canvas: its pixels too.
-        let commit = [vec![0x20, 0x01, 0x41, 0x00, 0x41, 0x10, 0x41, 0x01, 0x10, 0x02], vec![0x1a]].concat();
+        // window_commit(window, canvas at 0, rects at 16, 1)
+        let commit = [local_get(1), args(&[0, 16, 1]), call(2), vec![DROP]].concat();
         let (win, used, _) = run_window_module(&window_module(&commit), none, &[])?;
         crate::ktest::diag(format_args!("window_commit: {used} fuel"));
         crate::kassert!(win > 0);
         crate::kassert!(used >= 3 * CALL_FUEL + (SURFACES + 1) * pixels * PIXEL_FUEL);
-        // text_draw of 94 different glyphs at px 32 into the 16 × 16 canvas,
+        // text_draw of 94 characters (93 different glyphs: `!` becomes a
+        // second `W`) at px 32 into the 16 × 16 canvas,
         // from a cold cache: only the glyphs whose box reaches the clip (the
         // first, a `W`, and perhaps its neighbour) are rasterized, each
         // charged px² pixels on top of the clip's.
@@ -1095,9 +1125,8 @@ crate::ktest!(
         let mut text = text;
         text[0] = b'W';
         let draw = TextDraw { x: 0, y: 0, px: 32, rgb: 0xffffff, clip: LRect::new(0, 0, 16, 16) };
-        let call =
-            [vec![0x20, 0x00, 0x41, 0x00, 0x41, 0xc0, 0x00], i32_const(256), i32_const(text.len() as i32)].concat();
-        let td = [call, vec![0x10, 0x03, 0x1a]].concat();
+        // text_draw(desk, canvas at 0, args at 64, text at 256, its length)
+        let td = [local_get(0), args(&[0, 64, 256, text.len() as i32]), call(3), vec![DROP]].concat();
         let (win, used, glyphs) = run_window_module(&window_module(&td), draw, &text)?;
         crate::ktest::diag(format_args!("text_draw: {glyphs} glyphs rasterized, {used} fuel"));
         crate::kassert!(win > 0);
@@ -1110,15 +1139,15 @@ crate::ktest!(
         // text_measure of 1,024 characters (one pass), and a text_draw of
         // them with nothing reaching the clip (two passes, no glyph).
         let long = vec![b'a'; 1024];
-        let measure = [vec![0x20, 0x00, 0x41, 0x10], i32_const(256), i32_const(1024), vec![0x10, 0x04, 0x1a]].concat();
+        // text_measure(desk, px 16, text at 256, 1024)
+        let measure = [local_get(0), args(&[16, 256, 1024]), call(4), vec![DROP]].concat();
         let (win, used, glyphs) = run_window_module(&window_module(&measure), none, &long)?;
         crate::ktest::diag(format_args!("text_measure of 1024: {used} fuel"));
         crate::kassert!(win > 0 && glyphs == 0);
         crate::kassert!(used >= 3 * CALL_FUEL + SURFACES * pixels * PIXEL_FUEL + 1024 * TEXT_CHAR_FUEL);
         let away = TextDraw { x: 0, y: -1000, px: 16, rgb: 0xffffff, clip: LRect::new(0, 0, 16, 16) };
-        let call = [vec![0x20, 0x00, 0x41, 0x00, 0x41, 0xc0, 0x00], i32_const(256), i32_const(1024)].concat();
-        let (win, used, glyphs) =
-            run_window_module(&window_module(&[call, vec![0x10, 0x03, 0x1a]].concat()), away, &long)?;
+        let td = [local_get(0), args(&[0, 64, 256, 1024]), call(3), vec![DROP]].concat();
+        let (win, used, glyphs) = run_window_module(&window_module(&td), away, &long)?;
         crate::ktest::diag(format_args!("text_draw of 1024, none in the clip: {glyphs} glyphs, {used} fuel"));
         crate::kassert!(win > 0 && glyphs == 0);
         crate::kassert!(
@@ -1132,14 +1161,9 @@ crate::ktest!(
     fn a_title_is_capped_before_it_is_copied() {
         // window_open with a 60,000-byte title (inside the memory): refused
         // past TITLE_BYTES before a byte is copied, so the heap's peak
-        // doesn't move by anything like it.
-        let body = [
-            vec![0x41, 0x03, 0x10, 0x00], // handle_find(Desktop)
-            vec![0x41, 0x00],             // title at 0,
-            i32_const(60_000),
-            vec![0x41, 0x10, 0x41, 0x10, 0x10, 0x01], // 16 × 16
-        ]
-        .concat();
+        // doesn't move at all.
+        // window_open(handle_find(Desktop), title at 0, 60,000 bytes, 16 × 16)
+        let body = [args(&[3]), call(0), args(&[0, 60_000, 16, 16]), call(1)].concat();
         let bytes = Spec { body, ..Spec::importing(&["handle_find", "window_open"]) }.bytes();
         let grants = Grants::log().with(lumen_app_api::Grant::Desktop);
         let (mut store, main) = load_as(&bytes, &test_state(), grants)?;
@@ -1154,7 +1178,27 @@ crate::ktest!(
         let rise = heap::peak() - before;
         crate::ktest::diag(format_args!("refused: {result}, the peak rose {rise} bytes"));
         crate::kassert_eq!(result, Error::BadArgument.returned());
-        crate::kassert!(rise < 60_000);
+        crate::kassert_eq!(rise, 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_window_title_is_sanitised() {
+        // window_open(desk, 128, 4, 16, 16) with the title `a ESC b LF` at
+        // 128: each control character shown as U+FFFD, on the desktop's own
+        // copy (the shell's table printing would hide a missed one).
+        let body = [args(&[3]), call(0), args(&[128, 4, 16, 16]), call(1)].concat();
+        let bytes = Spec { body, ..Spec::importing(&["handle_find", "window_open"]) }.bytes();
+        let grants = Grants::log().with(lumen_app_api::Grant::Desktop);
+        let (mut store, main) = load_as(&bytes, &test_state(), grants)?;
+        store.data_mut().desktop = Some(crate::desktop::Desktop::without_screen());
+        poke(&mut store, 128, b"a\x1bb\n");
+        store.set_fuel(SLICE_FUEL).map_err(|_| "no fuel")?;
+        let h = main.call(&mut store, ()).map_err(|_| "lumen_main trapped")?;
+        crate::kassert!(h > 0);
+        let title = alloc::string::String::from(store.data_mut().window_mut(h).map_err(|_| "no window")?.title());
+        crate::kassert_eq!(title.as_str(), "a\u{fffd}b\u{fffd}");
         Ok(())
     }
 );

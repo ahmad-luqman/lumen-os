@@ -1,6 +1,6 @@
 [package]
 name = "test-window"
-description = "A test app for windows (#206), built on the SDK (lumen-app): opens a window and reads its events until `Close`; with `wait`, blocks in window_wait for good (kill wakes it); with `ignore-close`, spins once given `Close` (the close grace ends it)."
+description = "A test app for windows and the SDK (#206), built on lumen-app: opens a window and reads its events until `Close`; its modes (wait, ignore-close, close, rects, log, panic, panic-utf8, alloc, sdk) each exercise one part of the runtime or the SDK (see its lib.rs)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

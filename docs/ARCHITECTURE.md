@@ -3279,20 +3279,21 @@ queue rules unchanged):
 | Event | Fields |
 |---|---|
 | `Theme` | `theme: ThemeId`, `palette: Palette` (as the kernel's `ui::palette(&Theme)` gives, so an app's toolkit looks like a kernel window's; always the first event) |
-| `Key` | `code: KeyCode`, `mods: u8`, `action: Press { text: Option<char> }` or `Release` (`lumen_input::KeyAction`, so a release says which key) |
-| `PointerDown`, `PointerUp` | `x: i32`, `y: i32`, `button: Button`, `buttons: u8` (client coordinates) |
-| `PointerMove` | `x: i32`, `y: i32`, `buttons: u8` |
+| `Key` | `code: KeyCode`, `mods: Mods`, `action: Press { text: Option<char> }` or `Release` (`lumen_input::KeyAction`, so a release says which key) |
+| `PointerDown`, `PointerUp` | `x: i32`, `y: i32`, `button: Button`, `buttons: Buttons` (client coordinates) |
+| `PointerMove` | `x: i32`, `y: i32`, `buttons: Buttons` |
 | `FocusGained`, `FocusLost`, `Lost`, `Close` | none |
 | `Request` | `node: u64` (the app's own id), `action` |
 
 `KeyCode` numbers every `pc_keyboard::KeyCode` pc-keyboard 0.9.0 has
 (125, `F1` to `F12` included, each one byte on the wire), with `From`
 both ways (`lumen_input::KeyCode` is pc-keyboard's) generated from one
-list as exhaustive matches and host-tested over every variant. `mods` is
-`lumen_input::Mods::bits()` (`lumen_app_api::event::mods`: left and
-right Shift, Ctrl and Alt, then Caps Lock and Num Lock, bits 0 to 7);
-`button` is an `event::Button` (numbered left 0 to extra 4) and
-`buttons` the held set's bits, `1 << number`. Until #207 an app's window
+list as exhaustive matches and host-tested over every variant. `Mods`
+is one raw byte, `lumen_input::Mods::bits()` (`lumen_app_api::event::mods`:
+left and right Shift, Ctrl and Alt, then Caps Lock and Num Lock, bits 0
+to 7); `button` is an `event::Button`, a wire enum (left 0 to extra 4, a
+number past it refused when decoded), and `Buttons` one raw byte, the
+held set's bits, `1 << number`. Until #207 an app's window
 publishes no tree, so a `Request` that reaches its queue names no node
 and is answered `no node` (`ui::refuse`) instead of being handed on. A `set_value` text past `SET_VALUE_BYTES` is refused
 (wrong arguments) before it is encoded, so every `Event` fits

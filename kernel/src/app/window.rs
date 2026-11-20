@@ -62,6 +62,12 @@ impl AppWindow {
     pub(super) fn waker(&self) -> desktop::Waker {
         self.handle.waker()
     }
+
+    /// Its title, as the desktop shows it (for the ktests).
+    #[cfg(feature = "ktest")]
+    pub(super) fn title(&self) -> &str {
+        self.handle.title()
+    }
 }
 
 pub(super) fn define(linker: &mut Linker<AppCtx>) -> Result<(), wasmi::Error> {
@@ -117,7 +123,12 @@ fn text_px(px: i32) -> Result<Px, Error> {
 /// decoded (bad UTF-8 is `BadArgument`).
 fn text_in(c: &C<'_>, r: core::ops::Range<usize>, cap: usize) -> Result<alloc::string::String, Error> {
     let bytes = copy_in_capped(c, r, cap)?;
-    text::decode(&bytes, cap).map(alloc::string::String::from)
+    alloc::string::String::from_utf8(bytes).map_err(|_| Error::BadArgument)
+}
+
+/// A text's advance as a host call returns it (an `i32`).
+fn advance(text: &crate::font::Text, s: &str, px: Px) -> i32 {
+    text.measure(s, px).min(i32::MAX as u32) as i32
 }
 
 /// What the desktop's refusal to open a window is to the app.
@@ -142,14 +153,7 @@ fn window_open(c: &mut C<'_>, h: i32, title: i32, len: i32, width: i32, height: 
     if c.data().has_window() {
         return Err(Error::Limit);
     }
-    #[cfg(feature = "ktest")]
-    let opened = match &c.data().desktop {
-        Some(d) => d.open_window(&title, w, ht),
-        None => desktop::open_window(&title, w, ht),
-    };
-    #[cfg(not(feature = "ktest"))]
-    let opened = desktop::open_window(&title, w, ht);
-    let handle = opened.map_err(open_error)?;
+    let handle = c.data().open_window(&title, w, ht).map_err(open_error)?;
     let scratch = Surface::with_stride(w, ht, w as usize).ok_or(Error::OutOfMemory)?;
     // Its three surfaces, each allocated and filled: paid by the pixel.
     runtime::charge(&mut *c, PIXEL_FUEL * SURFACES * u64::from(w) * u64::from(ht));
@@ -344,7 +348,8 @@ fn window_wait(c: &mut C<'_>, h: i32, deadline: i64, animating: i32) -> Res<i32>
             if state.kill_asked() {
                 return 0;
             }
-            // A deadline already reached: a look, then the CPU given up.
+            // A deadline already reached: a look (again, after a refused
+            // request), then the CPU given up.
             let next = match until {
                 Some(d) if d <= time::now_ns() => match win.handle.next_event() {
                     Some(e) => Wait::Event(e),
@@ -383,7 +388,7 @@ fn measure(c: &mut C<'_>, h: i32, px: i32, ptr: i32, len: i32) -> Result<i32, Er
     let px = text_px(px)?;
     let s = text_in(c, r, TEXT_BYTES)?;
     let (text, _) = c.data_mut().text_and_window()?;
-    let advance = text.measure(&s, px).min(i32::MAX as u32) as i32;
+    let advance = advance(text, &s, px);
     // One layout pass over every character.
     runtime::charge(&mut *c, TEXT_CHAR_FUEL * s.chars().count() as u64);
     Ok(advance)
@@ -401,7 +406,7 @@ fn text_draw(c: &mut C<'_>, h: i32, canvas: i32, args: i32, ptr: i32, len: i32) 
     let (mem, ctx) = memory.data_and_store_mut(&mut *c);
     let (text, window) = ctx.text_and_window()?;
     let win = window.ok_or(Error::Unavailable)?;
-    let advance = text.measure(&s, px).min(i32::MAX as u32) as i32;
+    let advance = advance(text, &s, px);
     let chars = s.chars().count() as u64;
     // The clip, cut to the canvas, then to the scratch surface (the
     // window's size) from the clip's corner.
@@ -416,10 +421,8 @@ fn text_draw(c: &mut C<'_>, h: i32, canvas: i32, args: i32, ptr: i32, len: i32) 
     let y = i64::from(args.y) - i64::from(clip.y());
     let at = |v: i64| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
     let inside = Rect::new(0, 0, clip.w(), clip.h());
-    let rasterized = text.stats().misses;
     // Only the glyphs reaching the clip are rasterized (`font::Text::draw`).
-    text.draw(&mut win.scratch, at(x), at(y), &s, px, args.rgb & 0x00ff_ffff, inside);
-    let glyphs = text.stats().misses - rasterized;
+    let glyphs = text.draw(&mut win.scratch, at(x), at(y), &s, px, args.rgb & 0x00ff_ffff, inside);
     copy_back(mem, &pixels, &clip, &win.scratch, to);
     // Two layout passes over every character (the advance, the drawing),
     // the clip's pixels, and each glyph rasterized at px² of them.

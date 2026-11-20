@@ -10,7 +10,7 @@
 extern crate alloc;
 
 use alloc::format;
-use lumen_app::{Desktop, Event, KeyAction, Palette, Rect, Window, log};
+use lumen_app::{Desktop, Error, Event, KeyAction, Palette, Rect, Window, log};
 
 lumen_app::manifest!(desktop);
 lumen_app::main!(run);
@@ -30,45 +30,35 @@ struct State {
     last: Option<char>,
 }
 
+/// The app's exit code: 0, or 1 once `app`'s failure is logged.
 fn run() -> i32 {
-    let desktop = match Desktop::get() {
-        Ok(d) => d,
-        Err(e) => {
-            log::error(&format!("no desktop handle: {e}"));
-            return 1;
+    match app() {
+        Ok(()) => 0,
+        Err((what, e)) => {
+            log::error(&format!("{what}: {e}"));
+            1
         }
-    };
-    let mut window = match desktop.open_window(NAME, WIDTH, HEIGHT) {
-        Ok(w) => w,
-        Err(e) => {
-            log::error(&format!("no window: {e}"));
-            return 1;
-        }
-    };
+    }
+}
+
+/// The app: what failed and how, if anything did.
+fn app() -> Result<(), (&'static str, Error)> {
+    let desktop = Desktop::get().map_err(|e| ("no desktop handle", e))?;
+    let mut window = desktop.open_window(NAME, WIDTH, HEIGHT).map_err(|e| ("no window", e))?;
     let mut state = State { palette: Palette::default(), keys: 0, last: None };
     loop {
-        let event = match window.wait_event() {
-            Ok(e) => e,
-            Err(e) => {
-                log::error(&format!("events: {e}"));
-                return 1;
-            }
-        };
-        match event {
+        match window.wait_event().map_err(|e| ("events", e))? {
             // The first event, and again after each switch.
             Event::Theme { palette, .. } => state.palette = palette,
             Event::Key { action: KeyAction::Press { text }, .. } => {
                 state.keys += 1;
                 state.last = text.filter(|c| !c.is_control());
             }
-            // Closing the window ends the app.
-            Event::Close => return 0,
+            // Closing the window ends the app (`window`, dropped, closes it).
+            Event::Close => return Ok(()),
             _ => continue,
         }
-        if let Err(e) = draw(&desktop, &mut window, &state) {
-            log::error(&format!("draw: {e}"));
-            return 1;
-        }
+        draw(&desktop, &mut window, &state).map_err(|e| ("draw", e))?;
     }
 }
 

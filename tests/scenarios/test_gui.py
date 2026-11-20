@@ -1437,8 +1437,8 @@ def test_launcher_lists_desktop_apps_only(boot):
         lambda rows: any(r["name"] == "template" for r in rows),
     )
     assert [r["name"] for r in listed] == ["template"], listed
-    win = gui.wait_window(m, "template")
-    assert gui.invoke_close(m, "template") == f"ui invoke: window {win['id']} closed\n"
+    gui.wait_window(m, "template")
+    gui.close_window(m, "template")
     gui.wait_for(
         m,
         "template ended",

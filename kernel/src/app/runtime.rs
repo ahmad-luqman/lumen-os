@@ -139,6 +139,21 @@ impl AppCtx {
         }
     }
 
+    /// Open a window for the app: on the live desktop, or in the ktests on
+    /// the one their seam set (`desktop`).
+    pub(super) fn open_window(
+        &self,
+        title: &str,
+        w: u32,
+        h: u32,
+    ) -> Result<crate::desktop::WindowHandle, crate::desktop::OpenError> {
+        #[cfg(feature = "ktest")]
+        if let Some(d) = &self.desktop {
+            return d.open_window(title, w, h);
+        }
+        crate::desktop::open_window(title, w, h)
+    }
+
     /// Whether the app holds a window (it may hold `WINDOWS`, one: the
     /// only window [`AppCtx::text_and_window`] can find).
     pub(super) fn has_window(&self) -> bool {
@@ -1118,14 +1133,15 @@ pub fn desktop_apps() -> Vec<&'static str> {
 
 /// The apps of `apps` whose manifest grants `desktop`. One that `precheck`
 /// refuses (too big, a bad manifest: `run` would refuse it too) is left
-/// out with a WARN naming why (`taskbar: <name>: <why>`), never silently.
+/// out with a WARN naming why (`taskbar: <name>: left out of the launcher:
+/// <why>`), never silently.
 pub(super) fn desktop_apps_in(apps: &'static [App]) -> Vec<&'static str> {
     let mut names = Vec::new();
     for app in apps {
         match precheck(app.module) {
             Ok(m) if m.caps.has(Grant::Desktop) => names.push(app.name),
             Ok(_) => {}
-            Err(why) => log::warn!(target: "taskbar", "{}: {why}: not in the launcher", app.name),
+            Err(why) => log::warn!(target: "taskbar", "{}: left out of the launcher: {why}", app.name),
         }
     }
     names
