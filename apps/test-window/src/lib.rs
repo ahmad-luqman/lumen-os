@@ -76,12 +76,12 @@
 //!   must still reach the toolkit); `quit` quits from its fifth tick
 //!   (`Flow::Quit`). It logs `window: tick: running`, `window: tick:
 //!   accent 0x<rrggbb>` each time its frame is drawn in a new accent, a
-//!   WARN if tick `k` of a stretch (since launch or the last Start) comes
-//!   less than `k` periods after it began (the pacer's floor), and
-//!   `window: tick: <how> after <n> ticks; the last stretch <k> ticks in
-//!   <ms> ms` (`closed` or `quit`; the stretch from its start to its last
-//!   tick) when the loop returns, then returns 0; with no time grant, it
-//!   logs `window: tick: no time grant: <e>` and returns 1.
+//!   WARN if a tick comes less than a period after the one before (the
+//!   launch before the first: what the pacer guarantees, across Stop and
+//!   Start too), and `window: tick: <how> after <n> ticks, <ms> ms from the
+//!   first to the last` (`closed` or `quit`) when the loop returns, then
+//!   returns 0; with no time grant, it logs `window: tick: no time grant:
+//!   <e>` and returns 1.
 
 #![no_std]
 
@@ -462,14 +462,12 @@ struct Ticker {
     mode: TickMode,
     ticks: u64,
     running: bool,
-    /// The clock, and the current stretch of ticks (since launch or the
-    /// last Start): when it started, how many, the last one's time. Tick
-    /// `k` of a stretch must come at least `k` periods after its start (the
-    /// pacer's floor): an earlier one logs a WARN.
-    time: Time,
-    stretch_start: u64,
-    stretch: u64,
+    /// The time of the last tick (the launch before the first), which the
+    /// next must come at least a period after (what the pacer guarantees,
+    /// across Stop and Start too): an earlier one logs a WARN; and the first
+    /// tick's time.
     last_tick: u64,
+    first_tick: Option<u64>,
     square: Area,
     drawn: Vec<Area>,
     /// The accent its frame was last drawn in (logged when it changes).
@@ -493,10 +491,8 @@ impl Ticker {
             mode,
             ticks: 0,
             running: true,
-            time,
-            stretch_start: now,
-            stretch: 0,
             last_tick: now,
+            first_tick: None,
             square: Area::new(SQUARE_HOME, 70, SQUARE, SQUARE),
             drawn: Vec::new(),
             accent: None,
@@ -546,10 +542,6 @@ impl App for Ticker {
                     self.ui.set_text(self.state, "stopped");
                 }
                 UiEvent::Pressed(w) if *w == self.start => {
-                    if !self.running {
-                        let now = clock(&self.time);
-                        (self.stretch_start, self.stretch, self.last_tick) = (now, 0, now);
-                    }
                     self.running = true;
                     self.ui.set_text(self.state, "running");
                 }
@@ -584,12 +576,12 @@ impl Ticking for Ticker {
 
     fn tick(&mut self, now: u64) -> Flow {
         self.ticks += 1;
-        self.stretch += 1;
-        self.last_tick = now;
-        let floor = self.stretch_start + self.stretch * TICK_NS;
+        let floor = self.last_tick + TICK_NS;
         if now < floor {
-            log::warn(&format!("window: tick: tick {} of its stretch came {} ns early", self.stretch, floor - now));
+            log::warn(&format!("window: tick: tick {} came {} ns early", self.ticks, floor - now));
         }
+        self.last_tick = now;
+        self.first_tick.get_or_insert(now);
         self.ui.set_text(self.count, &format!("{}", self.ticks));
         self.move_square();
         if self.mode == TickMode::Quit && self.ticks == QUIT_AT { Flow::Quit } else { Flow::Carry }
@@ -642,11 +634,11 @@ fn tick(mode: &str) -> i32 {
     match tk.run_until(time, Ticker::take) {
         Ok(how) => {
             let t = tk.app_mut();
-            let elapsed_ms = (t.last_tick - t.stretch_start) / 1_000_000;
+            let elapsed_ms = t.first_tick.map_or(0, |first| (t.last_tick - first) / 1_000_000);
             let how = if how == Ended::Quit { "quit" } else { "closed" };
             log::info(&format!(
-                "window: tick: {how} after {} ticks; the last stretch {} ticks in {elapsed_ms} ms",
-                t.ticks, t.stretch
+                "window: tick: {how} after {} ticks, {elapsed_ms} ms from the first to the last",
+                t.ticks
             ));
             0
         }

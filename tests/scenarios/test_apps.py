@@ -806,21 +806,22 @@ def stop_ticker(m, wid: str, rows: list[dict[str, str]]) -> list[dict[str, str]]
 
 TICK_PERIOD_MS = 50
 TICK_ENDED = (
-    r"INFO  app: window: window: tick: {how} after (\d+) ticks; "
-    r"the last stretch (\d+) ticks in (\d+) ms\n"
+    r"INFO  app: window: window: tick: {how} after (\d+) ticks, "
+    r"(\d+) ms from the first to the last\n"
 )
 
 
 def tick_ended(m, mark: int, how: str = "closed") -> int:
     """The tick app's end line (`closed` or `quit`): its tick count, once
-    the pacer's floor is checked: no tick came before its floor (the app's
-    WARN), and the last stretch's ticks took at least a period each."""
+    the pacer's floor is checked: no tick came less than a period after the
+    one before (the app's WARN), and from the first tick to the last took
+    at least a period a tick."""
     assert "ns early" not in m.output[mark:], m.output[mark:]
     found = re.search(TICK_ENDED.format(how=how), m.output[mark:])
     assert found, m.output[mark:]
-    stretch, elapsed = int(found[2]), int(found[3])
-    assert elapsed >= stretch * TICK_PERIOD_MS, found[0]
-    return int(found[1])
+    count, elapsed = int(found[1]), int(found[2])
+    assert elapsed >= max(count - 1, 0) * TICK_PERIOD_MS, found[0]
+    return count
 
 
 def square_moved(m, accent: int, before: list[tuple[int, int]], name: str) -> None:
@@ -849,14 +850,15 @@ def test_sdk_tick_loop_answers_requests_and_closes_while_ticking(boot):
     # `run_until` ticks (the label's count grows: a floor, never a time)
     # and still hands requests to the toolkit: Stop, pressed while it
     # ticks, is answered (or still running, then seen in the tree); Start
-    # sets it ticking again; the window's close, while it ticks, ends the
-    # loop: exit 0, its line counting at least the ticks seen (each stretch
-    # no faster than the pacer's floor), its thread joined.
+    # sets it ticking again (once the stop is confirmed: settled); the
+    # window's close, while it ticks, ends the loop: exit 0, its line
+    # counting at least the ticks seen (each tick at least a period after
+    # the one before), its thread joined.
     m = boot_desktop(boot)
     app_id, mark, wid, rows = start_ticker(m)
     record = app(m, app_id)
     rows = gui.wait_ui(m, "two ticks", lambda r: ticks(r) >= 2, wid, 30)
-    rows = gui.press_animated(m, rows, "Stop", "stopped", lambda r: tick_state(r) == "stopped", wid)
+    rows = stop_ticker(m, wid, rows)
     seen = ticks(rows)
     rows = gui.press_animated(m, rows, "Start", "ticking again", lambda r: ticks(r) > seen + 1, wid)
     assert tick_state(rows) == "running"
