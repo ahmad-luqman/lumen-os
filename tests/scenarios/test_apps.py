@@ -1245,37 +1245,69 @@ def test_editor_unfocused_stops_ticking(boot):
     gui.wait_settled(m)
 
 
+def editor_line_col(rows: list[dict[str, str]]) -> tuple[int, int]:
+    """The status line's line and column."""
+    line, col = editor_status(rows).split(",")[:2]
+    return int(line.split()[1]), int(col.split()[1])
+
+
+def as_a_full_repaint_draws(m, name: str) -> None:
+    """The editor's window as damage drew it equals what a full repaint
+    (a theme switch there and back) draws."""
+    by_damage = gui.settled_capture(m, lambda: gui.client_pixels(m, "Editor", f"{name}-damage.png"))
+    run(m, "theme dark")
+    gui.wait_settled(m)
+    run(m, "theme light")
+    full = gui.settled_capture(m, lambda: gui.client_pixels(m, "Editor", f"{name}-full.png"))
+    assert by_damage.tobytes() == full.tobytes(), name
+
+
 def test_editor_redraws_what_a_full_repaint_draws(boot):
-    # Edits drawn by damage alone (a character, Enter and Backspace, lines
-    # past the view's foot, a line wider than it, Page Up, then typing and a
-    # move that only a line's and the cursor's damage draw) leave the window
-    # exactly as a full repaint draws it (a theme switch there and back).
+    # Edits drawn by damage alone leave the window exactly as a full repaint
+    # draws it (a theme switch there and back), checked twice:
+    # - after a character, Enter and Backspace, lines past the view's foot
+    #   and a line wider than it (the view scrolled across as it is typed:
+    #   every row repainted, not only the line's end);
+    # - after Page Up, then edits only a line's, the rows below's or the
+    #   cursor's damage draws, no scroll after them: Enter (the rows below
+    #   it), three typed, one taken back and a move left over the second
+    #   (the first "z" only its line's damage draws), then a Backspace in
+    #   the middle of a line, three moves right and an undo putting back the
+    #   character left of the cursor (an undo's whole line repainted, not
+    #   from the cursor on).
     m = boot_desktop(boot)
     start(m, "editor --empty --no-blink")
     wid, _ = editor_tree(m)
+
+    def at(what: str, line: int, col: int, has: str = "") -> list[dict[str, str]]:
+        return gui.wait_ui(
+            m, what, lambda r: editor_line_col(r) == (line, col) and has in editor_text(r), wid
+        )
+
     gui.confirmed_keys(m, "a", ["ret"], ["backspace"])
     for n in range(20):
         gui.confirmed_keys(m, f"line {n}", ["ret"])
     gui.type_confirmed(m, "w" * 100)
-    gui.wait_ui(m, "a wide line", lambda r: editor_status(r) == "Ln 21, Col 101, modified", wid)
+    at("a wide line", 21, 101)
+    as_a_full_repaint_draws(m, "scrolled-across")
+
     gui.confirmed_keys(m, ["pgup"])
     # A page up from line 21: a line above it, however many rows the view has.
-    rows = gui.wait_ui(m, "Page Up", lambda r: int(editor_status(r).split(",")[0][3:]) < 21, wid)
-    # Last, edits only a line's or the cursor's damage draws (no scroll after
-    # them to repaint everything): two characters typed, one taken back, a
-    # move left.
-    # Three typed, one taken back, a move left over the second: the first
-    # "z" only its line's damage draws.
-    line, col = editor_status(rows).split(",")[:2]
-    after = f"{line}, Col {int(col.split()[1]) + 1}, modified"
+    rows = gui.wait_ui(m, "Page Up", lambda r: editor_line_col(r)[0] < 21, wid)
+    line = editor_line_col(rows)[0]
+    gui.confirmed_keys(m, ["ret"])
+    at("Enter", line + 1, 1)
     gui.confirmed_keys(m, "zzz", ["backspace"], ["left"])
-    gui.wait_ui(m, "z typed", lambda r: editor_status(r) == after and "zz" in editor_text(r), wid)
-    by_damage = gui.settled_capture(m, lambda: gui.client_pixels(m, "Editor", "damage.png"))
-    run(m, "theme dark")
-    gui.wait_settled(m)
-    run(m, "theme light")
-    full = gui.settled_capture(m, lambda: gui.client_pixels(m, "Editor", "full.png"))
-    assert by_damage.tobytes() == full.tobytes()
+    at("z typed", line + 1, 2, "zz")
+    gui.confirmed_keys(m, ["end"], "abcdef", ["left"], ["left"], ["left"])
+    at("abcdef, three left", line + 1, 6, "zzabcdef")
+    gui.confirmed_keys(m, ["backspace"])
+    at("a Backspace mid-line", line + 1, 5, "zzabdef")
+    gui.confirmed_keys(m, ["right"], ["right"], ["right"])
+    at("three right", line + 1, 8)
+    gui.confirmed_keys(m, ["ctrl", "z"])
+    at("the Backspace undone", line + 1, 6, "zzabcdef")
+    as_a_full_repaint_draws(m, "edited")
 
 
 def test_editor_golden(boot, artifacts, golden_dir):
