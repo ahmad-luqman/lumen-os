@@ -3567,13 +3567,16 @@ message, a trap's, `Failed`'s text and an unknown manifest grant (cut at
 The heaviest app, the viewer (#204), fits `MEMORY_PAGES`, and takes all
 of it (16 MiB): its 1 MiB wasm stack and up to 512 KiB of data, a
 full-size canvas, and, while one decodes, `zune-png`'s buffers for the
-costliest PNG it takes (`lumen_view::admit`: 16-bit RGBA at the
-inflated-bytes cap, interlaced: the inflated rows, the deinterlaced
-samples, the samples stripped to 8 bits, then the pixels, about 10.3 MiB),
-or the image shown (1280 × 800 × 4 bytes) and its fitted copy. `lumen-view`'s
-`tests/memory.rs` measures it through the app's own allocator logic: an
-11.7 MiB peak of a 14.5 MiB heap (2.8 MiB to spare), and nothing refused in
-three rounds of images, fragmentation included. wasmi runs floating point as soft-float in the
+costliest PNG it takes (`lumen_view::admit` bounds the file's length and
+its header alone, so the worst is both at once: 16-bit RGBA at the
+inflated-bytes cap, interlaced, its stream padded to the 512 KiB cap; the
+inflated rows, two 16-bit copies of the samples and `lumen-png`'s 8-bit
+buffer, reserved first, and the file's two copies, about 11.3 MiB; the
+pixels only once those are freed), or the image shown (1280 × 800 × 4
+bytes) and its fitted copy. `lumen-view`'s `tests/memory.rs` measures it
+through the app's own allocator logic: a 12.7 MiB peak of a 14.5 MiB heap
+(1.8 MiB to spare), and nothing refused in three rounds of images,
+fragmentation included. wasmi runs floating point as soft-float in the
 kernel (no SSE); #197 checks the results' bits.
 
 #### Apps' automation trees (#207)

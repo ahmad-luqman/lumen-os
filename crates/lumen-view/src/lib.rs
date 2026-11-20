@@ -32,9 +32,12 @@
 //!   running [`prepare`] through the app's own allocator logic
 //!   (`lumen-heap`) over a region of that size, for the bundled images and
 //!   the costliest ones [`admit`] takes: the costliest is 16-bit RGBA at
-//!   the inflated-bytes cap, interlaced (about 10.8 MB at its peak, 3.5 x
-//!   [`MAX_INFLATED_BYTES`]: the 16-bit rows inflated and deinterlaced, the
-//!   samples stripped to 8 bits, then the pixels).
+//!   the inflated-bytes cap, interlaced, its stream padded to the longest
+//!   file [`admit`] takes (about 11.3 MiB while it decodes: 10.3 MiB, 3.5 x
+//!   [`MAX_INFLATED_BYTES`], for the inflated rows, two 16-bit copies of the
+//!   samples and `lumen-png`'s 8-bit buffer, reserved first, the pixels
+//!   only once those are freed; and the file's two copies, its own and the
+//!   decoder's).
 
 #![cfg_attr(not(test), no_std)]
 

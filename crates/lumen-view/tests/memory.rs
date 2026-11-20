@@ -16,13 +16,16 @@
 //!   tools/viewer-images.py, both interlaced): `worst.png`, its biggest size
 //!   in 8-bit RGB, and `worst16.png`, 16-bit RGBA at the most pixels that
 //!   allows; and a file exactly `MAX_FILE_BYTES` long whose image data is
-//!   incompressible (built here: the most the file's copies can take); each
-//!   several times.
+//!   incompressible (built here: the most the file's copies can take); and
+//!   the costliest header and the longest file at once, `worst16.png`'s
+//!   stream padded to `MAX_FILE_BYTES` with empty stored deflate blocks
+//!   (built here: `admit` bounds each alone); each several times.
 //!
 //! It passes if nothing is refused in three rounds of them, so the free
 //! list's fragmentation after a round is part of what must fit, not only
-//! the peak (11.7 MiB of the 14.5 MiB heap, when last measured: 1.4 MiB of
-//! canvas and toolkit, and 10.3 MiB while `worst16.png` decodes). An
+//! the peak (12.7 MiB of the 14.5 MiB heap, 1.8 MiB to spare, when last
+//! measured: 1.4 MiB of canvas and toolkit, and 11.3 MiB while the padded
+//! `worst16.png` decodes). An
 //! allocation the region can't hold fails the test (it is served from the
 //! system meanwhile, so the run finishes and says how much more it needed).
 
@@ -135,15 +138,61 @@ const WORST16: &[u8] = include_bytes!("worst16.png");
 /// incompressible (zlib stored blocks of pseudo-random rows): the most the
 /// file's copies can take. 8-bit RGB 1280 pixels wide, as many rows as the
 /// length allows, padded to the cap with an ancillary chunk.
-fn longest() -> Vec<u8> {
-    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
-        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        let start = out.len();
-        out.extend_from_slice(kind);
-        out.extend_from_slice(data);
-        let crc = lumen_png::crc32(&out[start..]);
-        out.extend_from_slice(&crc.to_be_bytes());
+/// `png`'s chunks after the signature: (type, data).
+fn chunks(png: &[u8]) -> Vec<([u8; 4], &[u8])> {
+    let mut out = Vec::new();
+    let mut at = 8;
+    while at + 8 <= png.len() {
+        let len = u32::from_be_bytes(png[at..at + 4].try_into().expect("4 bytes")) as usize;
+        out.push((png[at + 4..at + 8].try_into().expect("4 bytes"), &png[at + 8..at + 8 + len]));
+        at += 12 + len;
     }
+    out
+}
+
+/// One PNG chunk: its length, type, data and CRC.
+fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let start = out.len();
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    let crc = lumen_png::crc32(&out[start..]);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+/// `png` (one IDAT) padded to exactly `lumen_view::MAX_FILE_BYTES` inside
+/// its image data: empty stored deflate blocks (5 bytes each, inflating to
+/// nothing) between the zlib header and the stream, so `admit` takes the
+/// costliest header and the longest file at once and the decoder gathers
+/// and walks every byte (an ancillary chunk takes the last 0 to 4 bytes).
+fn padded(png: &[u8]) -> Vec<u8> {
+    let all = chunks(png);
+    let ihdr = all.iter().find(|(k, _)| k == b"IHDR").expect("an IHDR").1;
+    let idat = all.iter().find(|(k, _)| k == b"IDAT").expect("an IDAT").1;
+    // The fixed parts: the signature, IHDR, IDAT's framing and zlib header
+    // and the stream after it, IEND.
+    let fixed = 8 + (12 + ihdr.len()) + 12 + idat.len() + 12;
+    let room = lumen_view::MAX_FILE_BYTES - fixed;
+    let (blocks, pad) =
+        if room.is_multiple_of(5) { (room / 5, None) } else { ((room - 12) / 5, Some((room - 12) % 5)) };
+    let mut data = idat[..2].to_vec();
+    for _ in 0..blocks {
+        // BFINAL 0, BTYPE 00 (stored), padded to the byte; LEN 0, NLEN !0.
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0xff, 0xff]);
+    }
+    data.extend_from_slice(&idat[2..]);
+    let mut out = png[..8].to_vec();
+    chunk(&mut out, b"IHDR", ihdr);
+    chunk(&mut out, b"IDAT", &data);
+    if let Some(k) = pad {
+        chunk(&mut out, b"zzPd", &vec![0; k]);
+    }
+    chunk(&mut out, b"IEND", &[]);
+    assert_eq!(out.len(), lumen_view::MAX_FILE_BYTES);
+    out
+}
+
+fn longest() -> Vec<u8> {
     const W: usize = 1280;
     const ROW: usize = 1 + 3 * W;
     // The chunks around the image data: the signature, IHDR, IDAT's and
@@ -206,6 +255,8 @@ fn the_viewer_s_allocations_fit_its_heap() {
     assert!(prepare(COSTLY).is_err(), "costly is shown");
     let longest = longest();
     assert!(prepare(&longest).is_ok(), "the longest file isn't shown");
+    let costliest = padded(WORST16);
+    assert!(prepare(&costliest).is_ok(), "worst16.png padded to the longest file isn't shown");
     let mut too_long = longest.clone();
     too_long.push(0);
     assert!(prepare(&too_long).is_err(), "a file past the cap is shown");
@@ -214,8 +265,9 @@ fn the_viewer_s_allocations_fit_its_heap() {
     let canvas: Vec<u32> = vec![0; (WINDOW_W * WINDOW_H) as usize];
     let toolkit: Vec<u8> = vec![0; TOOLKIT_BYTES];
     let mut shown: Option<Prepared> = None;
-    let order: [&[u8]; 13] = [
-        WALLPAPER, TILES, GREY16, BROKEN, WORST, WALLPAPER, WORST16, TILES, &longest, COSTLY, WORST, WORST16, WALLPAPER,
+    let order: [&[u8]; 15] = [
+        WALLPAPER, TILES, GREY16, BROKEN, WORST, WALLPAPER, WORST16, TILES, &longest, COSTLY, &costliest, WORST,
+        WORST16, &costliest, WALLPAPER,
     ];
     for _round in 0..3 {
         for png in order {
