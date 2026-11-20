@@ -69,9 +69,12 @@
 //!   (so the desktop settles). `n` moves the square without a tick (taken
 //!   by the app: its drawing committed, the tree unchanged); Escape quits
 //!   (`Taken::Quit`). It logs `window: tick: running`, `window: tick:
-//!   accent 0x<rrggbb>` each time its frame is drawn in a new accent, and
-//!   `window: tick: ended after <n> ticks` when the loop returns (`Close` or
-//!   Escape), then returns 0.
+//!   accent 0x<rrggbb>` each time its frame is drawn in a new accent, a
+//!   WARN if tick `k` of a stretch (since launch or the last Start) comes
+//!   less than `k` periods after it began (the pacer's floor), and
+//!   `window: tick: ended after <n> ticks; the last stretch <k> ticks in
+//!   <ms> ms` (from the stretch's start to its last tick) when the loop
+//!   returns (`Close` or Escape), then returns 0.
 
 #![no_std]
 
@@ -421,6 +424,14 @@ struct Ticker {
     start: Widget,
     ticks: u64,
     running: bool,
+    /// The clock, and the current stretch of ticks (since launch or the
+    /// last Start): when it started, how many, the last one's time. Tick
+    /// `k` of a stretch must come at least `k` periods after its start (the
+    /// pacer's floor): an earlier one logs a WARN.
+    time: Time,
+    stretch_start: u64,
+    stretch: u64,
+    last_tick: u64,
     square: Area,
     drawn: Vec<Area>,
     /// The accent its frame was last drawn in (logged when it changes).
@@ -428,14 +439,30 @@ struct Ticker {
 }
 
 impl Ticker {
-    fn new() -> Ticker {
+    fn new(time: Time) -> Ticker {
         let mut ui = Ui::new();
         let count = ui.label(None, "Ticks", "0");
         let state = ui.label(None, "State", "running");
         let stop = ui.button(None, "Stop");
         let start = ui.button(None, "Start");
         let square = Area::new(TICK_TREE_W as i32 + 10, 70, SQUARE, SQUARE);
-        Ticker { ui, count, state, stop, start, ticks: 0, running: true, square, drawn: Vec::new(), accent: None }
+        let now = time.now_ns().unwrap_or(0);
+        Ticker {
+            ui,
+            count,
+            state,
+            stop,
+            start,
+            ticks: 0,
+            running: true,
+            time,
+            stretch_start: now,
+            stretch: 0,
+            last_tick: now,
+            square,
+            drawn: Vec::new(),
+            accent: None,
+        }
     }
 
     /// The app's own area: right of the tree.
@@ -471,6 +498,10 @@ impl App for Ticker {
                     self.ui.set_text(self.state, "stopped");
                 }
                 UiEvent::Pressed(w) if *w == self.start => {
+                    if !self.running {
+                        let now = self.time.now_ns().unwrap_or(0);
+                        (self.stretch_start, self.stretch, self.last_tick) = (now, 0, now);
+                    }
                     self.running = true;
                     self.ui.set_text(self.state, "running");
                 }
@@ -506,8 +537,14 @@ impl Ticking for Ticker {
         self.running.then_some(TICK_NS)
     }
 
-    fn tick(&mut self, _now: u64) -> Flow {
+    fn tick(&mut self, now: u64) -> Flow {
         self.ticks += 1;
+        self.stretch += 1;
+        self.last_tick = now;
+        let floor = self.stretch_start + self.stretch * TICK_NS;
+        if now < floor {
+            log::warn(&format!("window: tick: tick {} of its stretch came {} ns early", self.stretch, floor - now));
+        }
         let text = format!("{}", self.ticks);
         self.ui.set_text(self.count, &text);
         self.move_square();
@@ -527,7 +564,7 @@ fn tick() -> i32 {
         }
     };
     let tree = Area::new(0, 0, TICK_TREE_W, TICK_H);
-    let mut tk = match Toolkit::with_area(Ticker::new(), w, tree) {
+    let mut tk = match Toolkit::with_area(Ticker::new(time), w, tree) {
         Ok(tk) => tk,
         Err(e) => {
             log::error(&format!("window: no toolkit: {e}"));
@@ -545,7 +582,12 @@ fn tick() -> i32 {
     });
     match ended {
         Ok(()) => {
-            log::info(&format!("window: tick: ended after {} ticks", tk.app_mut().ticks));
+            let t = tk.app_mut();
+            let elapsed_ms = (t.last_tick - t.stretch_start) / 1_000_000;
+            log::info(&format!(
+                "window: tick: ended after {} ticks; the last stretch {} ticks in {elapsed_ms} ms",
+                t.ticks, t.stretch
+            ));
             0
         }
         Err(e) => {

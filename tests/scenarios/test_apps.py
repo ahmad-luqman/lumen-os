@@ -804,6 +804,24 @@ def stop_ticker(m, wid: str, rows: list[dict[str, str]]) -> list[dict[str, str]]
     return gui.ui_tree(m, wid)
 
 
+TICK_PERIOD_MS = 50
+TICK_ENDED = re.compile(
+    r"INFO  app: window: window: tick: ended after (\d+) ticks; the last stretch (\d+) ticks in (\d+) ms\n"
+)
+
+
+def tick_ended(m, mark: int) -> int:
+    """The tick app's end line: its tick count, once the pacer's floor is
+    checked: no tick came before its floor (the app's WARN), and the last
+    stretch's ticks took at least a period each."""
+    assert "ns early" not in m.output[mark:], m.output[mark:]
+    found = TICK_ENDED.search(m.output[mark:])
+    assert found, m.output[mark:]
+    stretch, elapsed = int(found[2]), int(found[3])
+    assert elapsed >= stretch * TICK_PERIOD_MS, found[0]
+    return int(found[1])
+
+
 def accent_pixels(m, name: str, accent: int) -> list[tuple[int, int]]:
     """The client pixels right of the tree in colour `accent`: the square."""
     img = gui.client_pixels(m, "window", name)
@@ -832,10 +850,7 @@ def test_sdk_tick_loop_answers_requests_and_closes_while_ticking(boot):
     seen = ticks(below_root(rows))
     gui.close_window(m, "window")
     end_line(m, mark, "window", app_id, "exited with 0")
-    found = re.search(
-        r"INFO  app: window: window: tick: ended after (\d+) ticks\n", m.output[mark:]
-    )
-    assert found and int(found[1]) >= seen, m.output[mark:]
+    assert tick_ended(m, mark) >= seen
     wait_gone(m, app_id, record["thread"])
 
 
@@ -858,6 +873,7 @@ def test_sdk_tick_loop_stopped_lets_the_desktop_settle(boot):
     )
     gui.close_window(m, "window")
     end_line(m, mark, "window", app_id, "exited with 0")
+    tick_ended(m, mark)
 
 
 def test_sdk_app_takes_keys_draws_alone_and_quits(boot):
@@ -888,7 +904,7 @@ def test_sdk_app_takes_keys_draws_alone_and_quits(boot):
     assert ticks(below_root(gui.ui_tree(m, wid))) == count, "a key the app took is no tick"
     gui.confirmed_keys(m, ["esc"])
     end_line(m, mark, "window", app_id, "exited with 0")
-    assert f"INFO  app: window: window: tick: ended after {count} ticks\n" in m.output[mark:]
+    assert tick_ended(m, mark) == count
     gui.wait_no_window(m, "window")
     wait_gone(m, app_id, record["thread"])
 
@@ -915,3 +931,4 @@ def test_sdk_custom_drawing_follows_the_theme(boot):
     )
     gui.close_window(m, "window")
     end_line(m, mark, "window", app_id, "exited with 0")
+    tick_ended(m, mark)

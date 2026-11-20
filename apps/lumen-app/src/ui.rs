@@ -30,7 +30,7 @@ use lumen_app_api::layout::{Rect as WireRect, TextDraw};
 use lumen_app_api::limits::{TEXT_BYTES, UI_TEXT_PX};
 use lumen_app_api::tree::Tree;
 use lumen_gfx::{Rect, Surface};
-use lumen_ui::{App, Input, Pacer, Palette, Served, Text, Then, repaint, serve};
+use lumen_ui::{App, Input, Pace, Pacer, Palette, Served, Text, Then, repaint, serve};
 use sys::ptr;
 
 /// The toolkit's text through the host: the kernel's UI font at
@@ -132,11 +132,14 @@ pub enum Flow {
 
 /// An app that changes on its own, tick by tick ([`Toolkit::run_until`]).
 pub trait Ticking: App {
-    /// Nanoseconds between ticks now, or `None` while nothing moves (the
-    /// loop then waits for events only, so the desktop can settle: a
-    /// stopped animation, a step mode, a frozen view). Asked before every
-    /// wait, so a button that starts or stops the animation takes effect at
-    /// once; a changed period starts a fresh schedule.
+    /// Nanoseconds between ticks now (at least `lumen_ui::MIN_PERIOD_NS`,
+    /// 10 ms: a shorter one is taken as that), or `None` while nothing
+    /// moves (the loop then waits for events only, so the desktop can
+    /// settle: a stopped animation, a step mode, a frozen view). Asked
+    /// before every wait, so a button that starts or stops the animation
+    /// takes effect at once; a shorter period takes effect at once, a
+    /// longer one after the next tick, and one that changes on every ask
+    /// (a clock's "until the next second") still ticks at its boundary.
     fn period(&self) -> Option<u64>;
 
     /// Whether the waits between ticks are an animation's (the desktop
@@ -235,11 +238,12 @@ impl<A: App> Toolkit<A> {
     /// [`Toolkit::run_with`] for an animated app: each turn, every event
     /// waiting is handled first (as `run_with` does), then, once the first
     /// `Theme` has come, a tick that is due ([`Ticking::period`] asked
-    /// before every wait, paced by `lumen_ui::Pacer`: one tick however late)
-    /// is taken and the window refreshed; otherwise it waits for an event
-    /// until the next deadline (none without a period, so the desktop can
-    /// settle). `time` is the clock the deadlines are on. A tick saying
-    /// [`Flow::Quit`] returns as `Close` does.
+    /// before every wait, paced by `lumen_ui::Pacer`: at least a period
+    /// apart, at least `MIN_PERIOD_NS`, one tick however late) is taken and
+    /// the window refreshed; otherwise it waits for an event until the next
+    /// deadline (none without a period, so the desktop can settle). `time`
+    /// is the clock the deadlines are on. A tick saying [`Flow::Quit`]
+    /// returns as `Close` does.
     pub fn run_until(&mut self, time: Time, mut take: impl FnMut(&mut A, &Event) -> Taken) -> Result<()>
     where
         A: Ticking,
@@ -253,22 +257,23 @@ impl<A: App> Toolkit<A> {
                     return Ok(());
                 }
             }
-            if !themed {
-                self.window.wait(None, false)?;
-                continue;
-            }
-            let now = time.now_ns()?;
-            let deadline = pacer.deadline(self.app.period(), now);
-            if pacer.due(now) {
-                pacer.ticked(now);
-                if self.app.tick(now) == Flow::Quit {
-                    return Ok(());
+            // No ticks before the first `Theme`: nothing is drawn until then.
+            let period = if themed { self.app.period() } else { None };
+            match pacer.poll(period, time.now_ns()?) {
+                Pace::Due => {
+                    if self.app.tick(time.now_ns()?) == Flow::Quit {
+                        return Ok(());
+                    }
+                    self.refresh()?;
+                    pacer.ticked(time.now_ns()?);
                 }
-                self.refresh()?;
-                continue;
+                Pace::Until(deadline) => {
+                    self.window.wait(Some(deadline), self.app.animating())?;
+                }
+                Pace::Idle => {
+                    self.window.wait(None, false)?;
+                }
             }
-            let animating = deadline.is_some() && self.app.animating();
-            self.window.wait(deadline, animating)?;
         }
     }
 

@@ -49,7 +49,7 @@ mod tests;
 
 pub use app::{App, Over, Repainted, Served, Then, repaint, serve};
 pub use node::{Action, ActionKind, AutomationNode, InvokeError, NodeId, Role, StateFlags, Value, ValueKind};
-pub use pace::Pacer;
+pub use pace::{MIN_PERIOD_NS, Pace, Pacer};
 pub use reply::{First, NotStarted, Phase, Reply, Second};
 pub use text::{FixedText, Text};
 pub use ui::{Input, Key, Palette, Repaint, Stack, Ui, UiEvent, Widget};
