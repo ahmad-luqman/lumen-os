@@ -230,15 +230,16 @@ mod tests {
     }
 
     #[test]
-    fn every_square_a_hand_paints_is_in_its_box_on_the_face() {
+    fn each_hand_s_box_is_its_squares_union_on_the_face() {
         for hand in &HANDS {
             for step in 0..STEPS {
                 let hands = Hands { hour: step, minute: step, second: step };
                 let b = hand.bounds(&hands);
                 assert!(FACE.contains_rect(&b), "box {b:?} at step {step}");
-                for s in hand.squares(&hands) {
-                    assert!(b.contains_rect(&s), "{s:?} outside {b:?} at step {step}");
-                }
+                // Exactly the squares' union: nothing outside it painted,
+                // nothing past it committed.
+                let union = hand.squares(&hands).reduce(|a, s| a.union(&s)).expect("a line has a pixel");
+                assert_eq!(b, union, "at step {step}");
             }
         }
         for i in 0..60u32 {
@@ -253,7 +254,12 @@ mod tests {
         // first two minutes and each hour's turn.
         let (mut face, mut s) = painted(at(0));
         for secs in 1..=12 * 3600 + 2 {
+            let (was, now) = (TimeOfDay::from_unix(secs - 1).hands(), TimeOfDay::from_unix(secs).hands());
+            let moved = HANDS.iter().filter(|h| (h.angle)(&was) != (h.angle)(&now)).count();
             face.show(at(secs));
+            // Two boxes for each hand that moved (where it was and is), no
+            // more.
+            assert_eq!(face.drawn.len(), 2 * moved, "at {}", TimeOfDay::from_unix(secs));
             refresh(&mut face, &mut s);
             let check = secs < 120 || secs % 37 == 0 || secs % 3600 < 2 || secs % 3600 == 3599;
             if check {
