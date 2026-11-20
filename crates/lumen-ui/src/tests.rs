@@ -922,16 +922,20 @@ fn a_text_area_s_focus_changing_repaints_only_its_ring() {
         }
         other => panic!("{other:?}"),
     };
-    // Focused: its ring's strips (all four sides, around it), not its inside.
+    // Focused: its ring's strips (all four sides, around it), not its inside;
+    // the tree changed (the node's `focused` flag), to publish.
     ui.invoke(ui.id(area).expect("not removed").get(), &Action::Focus).expect("focusable");
+    assert!(ui.take_changed());
     let strips = only_ring(&mut ui);
     let covered: u64 = strips.iter().map(|r| r.area()).sum();
     let ring_area = Rect::new(b.x() - 2, b.y() - 2, b.w() + 4, b.h() + 4).area() - b.area();
     assert_eq!(covered, ring_area, "{strips:?}");
     // The window losing the focus, and gaining it again.
     ui.set_window_focused(false);
+    assert!(ui.take_changed());
     only_ring(&mut ui);
     ui.set_window_focused(true);
+    assert!(ui.take_changed());
     only_ring(&mut ui);
     // The focus moving to the button: the area's ring, and the button.
     ui.invoke(ui.id(ok).expect("not removed").get(), &Action::Focus).expect("focusable");
@@ -943,3 +947,61 @@ fn a_text_area_s_focus_changing_repaints_only_its_ring() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn focusing_a_text_area_changes_the_tree() {
+    // Its node's `focused` flag: published, though nothing of its inside
+    // is repainted.
+    let (mut ui, area, ok) = area_tree("text");
+    let focused = |ui: &Ui| {
+        ui.nodes().into_iter().find(|(_, n)| n.name() == "Buffer").expect("its node").1.state().contains(StateFlags::FOCUSED)
+    };
+    let (x, y) = centre(ui.bounds(area));
+    ui.handle(Input::Down { x, y });
+    ui.handle(Input::Up { x, y });
+    assert!(ui.take_changed(), "a click focusing it");
+    assert!(focused(&ui));
+    ui.invoke(ui.id(ok).expect("not removed").get(), &Action::Focus).expect("focusable");
+    assert!(ui.take_changed(), "the focus leaving it");
+    assert!(!focused(&ui));
+}
+
+#[test]
+fn a_text_area_s_ring_repainted_by_damage_matches_a_full_paint() {
+    // Through each focus step, the rects repainted give the same pixels as
+    // painting everything again: the ring drawn and taken away whole.
+    let (mut ui, area, ok) = area_tree("text");
+    let mut s = Surface::new(400, 200);
+    ui.paint(&mut s, &mut FixedText, &PALETTE);
+    let area_id = ui.id(area).expect("not removed").get();
+    let ok_id = ui.id(ok).expect("not removed").get();
+    let steps: [&dyn Fn(&mut Ui); 5] = [
+        &|ui| {
+            ui.invoke(area_id, &Action::Focus).expect("focusable");
+        },
+        &|ui| ui.set_window_focused(false),
+        &|ui| ui.set_window_focused(true),
+        &|ui| {
+            ui.invoke(ok_id, &Action::Focus).expect("focusable");
+        },
+        &|ui| {
+            ui.invoke(area_id, &Action::SetValue(String::from("new"))).expect("settable");
+        },
+    ];
+    for (n, step) in steps.iter().enumerate() {
+        step(&mut ui);
+        match ui.take_damage() {
+            crate::ui::Repaint::Rects(rects) => {
+                for r in rects {
+                    ui.paint_in(&mut s, &mut FixedText, &PALETTE, r);
+                }
+            }
+            crate::ui::Repaint::Nothing => {}
+            crate::ui::Repaint::All => ui.paint(&mut s, &mut FixedText, &PALETTE),
+        }
+        let mut full = Surface::new(400, 200);
+        ui.paint(&mut full, &mut FixedText, &PALETTE);
+        assert!(s.pixels() == full.pixels(), "step {n}: the damage's pixels differ from a full paint");
+    }
+}
+
