@@ -1087,3 +1087,33 @@ def test_editor_golden(boot, artifacts, golden_dir):
         size=(x1 - x0, y1 - y0),
         artifacts=artifacts,
     )
+
+
+def fuel(m, app_id: int) -> int:
+    """An app's fuel used so far, once the desktop has settled (every event
+    handled, its owner waiting)."""
+    gui.wait_settled(m)
+    return int(app(m, app_id)["fuel"])
+
+
+def test_editor_a_key_costs_a_fraction_of_a_full_repaint(boot):
+    # One key typed at the end of a line far wider than the view (250 chars,
+    # the view scrolled across) costs the app less than an eighth of a full
+    # repaint (a theme switch) in the same run: the line is drawn only as
+    # far as the view can show, once, and repainted from the cursor on.
+    # Fuel is a count, not a time: the same inputs cost the same however
+    # loaded the host. (The editor drew and measured the whole line, once a
+    # rect, before: about 800k against a full repaint's 5.9M.)
+    m = boot_desktop(boot)
+    app_id, _ = start(m, "editor --empty --no-blink")
+    wid, _ = editor_tree(m)
+    gui.type_confirmed(m, "x" * 250)
+    gui.wait_ui(m, "a 250-char line", lambda r: editor_status(r) == "Ln 1, Col 251, modified", wid)
+    before = fuel(m, app_id)
+    gui.type_confirmed(m, "y")
+    gui.wait_ui(m, "one more", lambda r: editor_status(r) == "Ln 1, Col 252, modified", wid)
+    key = fuel(m, app_id) - before
+    run(m, "theme dark")
+    full = fuel(m, app_id) - before - key
+    assert 0 < key and key * 8 < full, (key, full)
+

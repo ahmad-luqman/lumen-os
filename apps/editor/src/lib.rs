@@ -61,6 +61,20 @@ const BLINK_NS: u64 = 500_000_000;
 /// of them to undo (the app's memory is 4 MiB).
 const LIMITS: Limits = Limits { text_bytes: 16 * 1024, undo_edits: 500, undo_bytes: 256 * 1024 };
 
+/// Narrow glyphs: the narrowest of them bounds how many chars the view
+/// shows.
+const NARROW: [&str; 9] = [" ", ".", ",", "'", "i", "l", "|", "!", "j"];
+
+/// The view's width for the text, inside an area `area_w` wide: less its
+/// border, the margins and the cursor.
+const fn view_width(area_w: u32) -> u32 {
+    area_w.saturating_sub(2 + 2 * TEXT_PAD as u32 + CURSOR_W)
+}
+
+/// The widest status line it shows (a 16 KiB text has fewer lines and
+/// columns than this).
+const WIDEST_STATUS: &str = "Ln 99999, Col 99999, modified, full";
+
 /// The text it starts with (unless `--empty`).
 const SAMPLE: &str = "Welcome to Lumen's editor.\n\
 \n\
@@ -81,10 +95,12 @@ struct EditorApp {
     /// A line's height, and how many the view shows.
     line: u32,
     rows: usize,
-    /// The cursor's x in its line's text (pixels from the line's start),
-    /// and how far the view is scrolled across.
+    /// The view across: the first char each line shows from, the most it
+    /// shows (its width over the narrowest glyph), and the cursor's x from
+    /// the view's start (`lumen_edit::view`).
+    first: usize,
+    max_chars: usize,
     cursor_x: u32,
-    hscroll: u32,
     blink: bool,
     focused: bool,
     /// The blink's phase, and whether a key came since the last tick (the
@@ -104,9 +120,20 @@ impl EditorApp {
         let h = HEIGHT - 2 * PAD - GAP - line;
         let ed = Editor::new(text, LIMITS);
         let area = ui.text_area(None, "Text", prefix(ed.text(), TEXT_BYTES), w, h);
-        let status = ui.fixed_label(None, "Status", "", w);
+        // As wide as its longest text, not the window's: its repaint (each
+        // key's) costs the app by the pixel.
+        let status_w = (desktop.measure(UI_TEXT_PX, WIDEST_STATUS)? + 4).min(w);
+        let status = ui.fixed_label(None, "Status", "", status_w);
         // Inside the border, less the margin above and below.
         let rows = (h.saturating_sub(2 + 2 * TEXT_PAD as u32) / line.max(1)).max(1) as usize;
+        // The narrowest glyph the view may show, and so the most chars it
+        // shows (each text drawn or measured at most that many, so at most
+        // `TEXT_BYTES`: 4 bytes a char).
+        let mut narrowest = u32::MAX;
+        for c in NARROW {
+            narrowest = narrowest.min(desktop.measure(UI_TEXT_PX, c)?);
+        }
+        let max_chars = ((view_width(w) / narrowest.max(1)) as usize + 2).min(TEXT_BYTES / 4);
         let mut app = EditorApp {
             ui,
             area,
@@ -115,8 +142,9 @@ impl EditorApp {
             desktop,
             line,
             rows,
+            first: 0,
+            max_chars,
             cursor_x: 0,
-            hscroll: 0,
             blink,
             focused: false,
             cursor_on: true,
@@ -135,9 +163,9 @@ impl EditorApp {
         Rect::new(b.x() + 1, b.y() + 1, b.w().saturating_sub(2), b.h().saturating_sub(2))
     }
 
-    /// Where the text's lines start across (scrolled).
+    /// Where the view's text starts across.
     fn text_x(&self) -> i32 {
-        self.inner().x() + TEXT_PAD - self.hscroll as i32
+        self.inner().x() + TEXT_PAD
     }
 
     /// View row `row`'s band, the area's width.
@@ -181,25 +209,49 @@ impl EditorApp {
         }
     }
 
-    /// The cursor's x from its line's text before it (the host's measure).
-    fn measure_cursor(&mut self) -> u32 {
-        match self.desktop.measure(UI_TEXT_PX, prefix(self.ed.before_cursor(), TEXT_BYTES)) {
-            Ok(x) => x,
-            Err(e) => {
-                if !self.warned {
-                    self.warned = true;
-                    log::warn(&format!("editor: measure refused: {e}"));
-                }
+    /// The view across scrolled so the cursor shows (`lumen_edit::view::
+    /// across`: every text measured at most the view's chars), the
+    /// cursor's x measured: whether the view moved.
+    fn across(&mut self) -> bool {
+        let width = view_width(self.ui.bounds(self.area).w());
+        let (line, col) = self.ed.line_col();
+        let desktop = self.desktop;
+        let mut refused = None;
+        let a = lumen_edit::view::across(self.ed.line(line), col, self.first, self.max_chars, width, |t| {
+            desktop.measure(UI_TEXT_PX, t).unwrap_or_else(|e| {
+                refused = Some(e);
                 0
-            }
+            })
+        });
+        if let Some(e) = refused
+            && !self.warned
+        {
+            self.warned = true;
+            log::warn(&format!("editor: measure refused: {e}"));
         }
+        let moved = a.first != self.first;
+        (self.first, self.cursor_x) = (a.first, a.x);
+        moved
     }
 
-    /// Run `cmd`, then show what it changed.
+    /// Run `cmd`, then show what it changed. An edit at the cursor (typing,
+    /// Tab, Backspace, Delete) changes its line only from the cursor's
+    /// leftmost place on: that part of the line is repainted, not all of it
+    /// (the app pays by the pixel).
     fn command(&mut self, cmd: Command) {
         let old_cursor = self.cursor_rect();
         let change = self.ed.apply(cmd);
+        let at_cursor = matches!(cmd, Command::Insert(_) | Command::Tab | Command::Backspace | Command::Delete);
         self.changed(change, old_cursor);
+        if at_cursor
+            && let Change::Line(l) = change
+            && let (Some(band), Some(old), Some(new)) = (self.line_rect(l), old_cursor, self.cursor_rect())
+            && self.drawn.last() == Some(&band)
+        {
+            let x = old.x().min(new.x());
+            self.drawn.pop();
+            self.drawn.push(Rect::new(x, band.y(), (band.right() - x) as u32, band.h()));
+        }
     }
 
     /// Mark what `change` changed to repaint (`old_cursor`: where the
@@ -219,16 +271,15 @@ impl EditorApp {
             }
             return;
         }
-        self.cursor_x = self.measure_cursor();
-        let scrolled = self.ed.scroll_to(self.rows) | self.scroll_across();
+        let scrolled = self.ed.scroll_to(self.rows) | self.across();
         match change {
             _ if scrolled => self.damage_from(0),
-            Change::Cursor { .. } => {
-                if let Some(r) = old_cursor {
-                    self.drawn.push(r);
-                }
-                self.damage_cursor();
-            }
+            // The old and new places; on one line, one rect covering both,
+            // so the line is drawn once (`paint_over`).
+            Change::Cursor { .. } => match (old_cursor, self.cursor_rect()) {
+                (Some(old), Some(new)) if old.y() == new.y() => self.drawn.push(old.union(&new)),
+                (old, new) => self.drawn.extend(old.into_iter().chain(new)),
+            },
             Change::Line(l) => {
                 if let Some(r) = self.line_rect(l) {
                     self.drawn.push(r);
@@ -238,20 +289,6 @@ impl EditorApp {
             Change::None | Change::Refused => {}
         }
         self.show_status();
-    }
-
-    /// Scroll across so the cursor shows (in jumps of half the view's
-    /// width): whether it moved.
-    fn scroll_across(&mut self) -> bool {
-        let width = self.inner().w().saturating_sub(2 * TEXT_PAD as u32 + CURSOR_W);
-        let x = self.cursor_x;
-        if x >= self.hscroll && x <= self.hscroll + width {
-            return false;
-        }
-        let to = if x <= width { 0 } else { x - width / 2 };
-        let moved = to != self.hscroll;
-        self.hscroll = to;
-        moved
     }
 
     fn show_status(&mut self) {
@@ -309,12 +346,14 @@ impl App for EditorApp {
         let cursor = if self.cursor_shown() { self.cursor_rect() } else { None };
         for row in 0..self.rows {
             let band = self.row_rect(row);
-            if !over.touches(band) {
-                continue;
-            }
-            let text = self.ed.line(top + row);
-            // Each line only inside the rectangles being repainted (they are
-            // disjoint: each pixel drawn once).
+            // Only what the view can show of the line (the host charges
+            // `text_draw` by the character, whatever reaches the clip).
+            let text = lumen_edit::view::slice(self.ed.line(top + row), self.first, self.max_chars, TEXT_BYTES);
+            // Drawn inside each rectangle being repainted that meets its
+            // band, never across the gap between two (pixels not repainted
+            // would be blended twice, showing at a later commit). The damage
+            // gives a band one rectangle (a line, the cursor's places on it
+            // merged, every row from one on), so a line is drawn once.
             for r in over.rects {
                 let Some(clip) = band.intersect(r) else { continue };
                 if !text.is_empty() {

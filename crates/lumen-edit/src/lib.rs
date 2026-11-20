@@ -28,6 +28,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 mod keys;
+pub mod view;
 pub use keys::command;
 
 /// What Tab inserts: four spaces.
