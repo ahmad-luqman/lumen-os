@@ -1201,3 +1201,18 @@ def test_viewer_bad_image_shows_an_error(boot):
     wait_info(m, wid, "the wallpaper decoded", lambda v: v == "lumen.png 1280x800")
     gui.close_window(m, "Viewer")
     end_line(m, mark, "viewer", app_id, "exited with 0")
+
+
+def test_viewer_refuses_an_image_it_doesnt_have(boot):
+    # `run viewer nope.png`: one ERROR naming the images it has, exit 1, no
+    # window opened (its own check, before the window).
+    m = boot_desktop(boot)
+    allow = r"ERROR app: viewer: viewer: no image nope\.png"
+    app_id, mark = start(m, "viewer nope.png", allow=allow)
+    end_line(m, mark, "viewer", app_id, "exited with 1")
+    errors = re.findall(rf"{STAMP} ERROR [^\n]*", m.output[mark:])
+    assert len(errors) == 1, errors
+    assert errors[0].endswith(
+        "app: viewer: viewer: no image nope.png (it has lumen.png, tiles.png, grey16.png, broken.png)"
+    ), errors
+    assert not [w for w in gui.windows(m, allow) if w["title"] == "Viewer"]

@@ -292,28 +292,32 @@ fn memory_as_planned() -> Result<(), String> {
     Ok(())
 }
 
-/// The app's exit code: 0 once its window is closed, or 1 once its failure
-/// is logged.
+/// The app's exit code: 0 once its window is closed; 1 once a failure is
+/// logged as one ERROR (the viewer's own checks, or a host call's).
 fn run() -> i32 {
-    lumen_app::report(app())
+    match first_image() {
+        Ok(first) => lumen_app::report(app(first)),
+        Err(why) => {
+            log::error(&format!("viewer: {why}"));
+            1
+        }
+    }
 }
 
-fn app() -> Result<(), (&'static str, Error)> {
-    if let Err(why) = memory_as_planned() {
-        log::error(&format!("viewer: {why}"));
-        return Err(("memory", Error::Unavailable));
-    }
-    let args = lumen_app::args().map_err(|e| ("arguments", e))?;
-    let first = match args.first() {
-        None => 0,
-        Some(name) => match IMAGES.iter().position(|i| i.name == name.as_str()) {
-            Some(i) => i,
-            None => {
-                log::error(&format!("viewer: no image {name} (it has {})", names().join(", ")));
-                return Err(("arguments", Error::BadArgument));
-            }
-        },
-    };
+/// The viewer's own checks before it opens its window: its memory is the
+/// plan's, and the image `run viewer <name>` names (the first, without
+/// one) is one it has. Which image to show first, or why not.
+fn first_image() -> Result<usize, String> {
+    memory_as_planned()?;
+    let args = lumen_app::args().map_err(|e| format!("its arguments: {e}"))?;
+    let Some(name) = args.first() else { return Ok(0) };
+    IMAGES
+        .iter()
+        .position(|i| i.name == name.as_str())
+        .ok_or_else(|| format!("no image {name} (it has {})", names().join(", ")))
+}
+
+fn app(first: usize) -> Result<(), (&'static str, Error)> {
     let time = Time::get().map_err(|e| ("no time handle", e))?;
     let desktop = Desktop::get().map_err(|e| ("no desktop handle", e))?;
     let window = desktop.open_window("Viewer", WINDOW_W, WINDOW_H).map_err(|e| ("no window", e))?;
