@@ -673,7 +673,8 @@ def test_clock_tree_matches_rtc(boot):
     # the label, then `date` again, polled until the label equals one of
     # the two (the clock reads the RTC four times a second, so on some
     # poll it has the second `date` saw; whole strings, so midnight is
-    # no different). It goes on (its value changes as the seconds pass),
+    # no different), and never ahead of the `date` after it, on every poll
+    # and for two more seconds. It goes on (its value changes as the seconds pass),
     # yet the desktop settles between its ticks (its waits aren't
     # animating), and what it draws is what a clock frozen at the label's
     # time draws. Its close ends it with 0. Arguments it doesn't take end
@@ -685,9 +686,20 @@ def test_clock_tree_matches_rtc(boot):
     def around() -> tuple[str, str, str]:
         before = date_time(m)
         label = clock_time(m, wid)
-        return before, label, date_time(m)
+        after = date_time(m)
+        # Never ahead of the `date` read after it: the label trails the RTC
+        # both read (an ordering, not a time bound), so a fast clock fails
+        # here even where its label matches a later `date`.
+        assert not 0 < seconds_from(after, label) < 3600, f"ahead of date: {(before, label, after)}"
+        return before, label, after
 
-    gui.wait_for(m, "the clock showing date's time", around, lambda r: r[1] in (r[0], r[2]))
+    agreed = gui.wait_for(
+        m, "the clock showing date's time", around, lambda r: r[1] in (r[0], r[2])
+    )
+    # Checked again until `date` has moved two seconds on.
+    gui.wait_for(
+        m, "two more seconds by date", around, lambda r: seconds_from(agreed[2], r[2]) >= 2
+    )
     first = clock_time(m, wid)
     gui.wait_ui(
         m, "the clock's next second", lambda r: gui.node(r, "label", "Time")["value"] != first, wid
