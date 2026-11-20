@@ -8,7 +8,7 @@
 //!
 //! [`face`] is the clock's window as a `lumen_ui::App`: its drawing and its
 //! damage, checked against full repaints; [`args`], `run clock`'s
-//! arguments.
+//! arguments; [`rtc`], what it shows while RTC reads fail.
 
 #![no_std]
 
@@ -16,6 +16,7 @@ extern crate alloc;
 
 pub mod args;
 pub mod face;
+pub mod rtc;
 
 use core::fmt;
 
