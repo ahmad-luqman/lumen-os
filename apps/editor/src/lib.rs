@@ -12,8 +12,8 @@
 //!   Delete, the arrows, Home and End (with Ctrl: the text's start and
 //!   end), Page Up and Page Down; Ctrl+Z undoes, Ctrl+Y and Ctrl+Shift+Z
 //!   redo, by the layout's letters.
-//! - **Drawing** is by damage: a line an edit changed (from the cursor on,
-//!   for an edit at it), every row from the first changed line on when
+//! - **Drawing** is by damage: a line an edit changed (for an edit at the
+//!   cursor, from just before it on: a glyph's edge reaches a little left), every row from the first changed line on when
 //!   lines come or go, the cursor's old and new places for a move (one rect
 //!   on one line), every row when the view scrolls. Each line is drawn once
 //!   a repaint, only as far as the view shows and only inside the rect

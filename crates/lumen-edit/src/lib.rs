@@ -11,8 +11,9 @@
 //! - **Edits** each replace one range with another text, recorded for
 //!   undo with the cursor before and after. A run of characters typed one
 //!   after another (no newline, no other command between) is one edit,
-//!   spaces included: undo takes back the whole run; anything else (a
-//!   refused or ignored character too) is its own edit. A new
+//!   spaces included: undo takes back the whole run. Anything else ends
+//!   the run (a refused or ignored character too, which edits nothing),
+//!   and any other edit is one of its own. A new
 //!   edit drops what could be redone. Past [`Limits::undo_edits`] edits, or
 //!   [`Limits::undo_bytes`] bytes of them (each edit's removed and inserted
 //!   text), the oldest are forgotten, so the history's memory is bounded.
@@ -136,7 +137,8 @@ pub enum Command {
 pub enum Change {
     /// Nothing (a move at an edge, an undo with nothing to undo).
     None,
-    /// Nothing: the edit would pass the size cap.
+    /// Nothing: the edit would pass a limit (the text's size, or a line's:
+    /// [`Limits`]).
     Refused,
     /// Only the cursor moved, from line `from` to line `to`.
     Cursor { from: usize, to: usize },

@@ -3888,8 +3888,8 @@ SSE); #197 checks the results' bits.
   repaints nothing; a focus change repaints only its ring). The editor's node is a lossy view of its
   buffer: the first `TEXT_BYTES`, each control character (`\n` included) shown as U+FFFD; a
   `set_value` (at most `SET_VALUE_BYTES`) replaces the text as one edit. It draws by damage (a
-  changed line from the cursor on, a cursor move as one rect, each line once a repaint, only inside
-  the rect repainted), and blinks its cursor on `run_until` only while its window has the focus (a
+  line changed at the cursor from just before it on, an undo's whole line, the rows below when lines
+  come or go, a cursor move as one rect, each line once a repaint, only inside the rect repainted), and blinks its cursor on `run_until` only while its window has the focus (a
   fixed 500 ms period, solid through the tick after a key): unfocused, or with `--no-blink`, it has
   no period and the desktop settles.
 - **The launcher** (#157's taskbar) lists the bundled apps whose
