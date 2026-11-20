@@ -12,6 +12,7 @@ counters say against what the rings say: counts only, never a time
 
 import re
 
+from lumen_harness import gui
 from lumen_harness.shell import PROMPT, run
 from test_serial import com1_interrupts
 
@@ -92,13 +93,17 @@ def xray(m, since: int | None = None) -> tuple[str, re.Match[str]]:
 def test_device_interrupts_are_traced(boot):
     # One CPU, so COM1's interrupts are all handled there. Every one `irqs`
     # counts between two of its runs is also in the X-ray ring, read from
-    # before the first to after the second (a wider window): at least as
-    # many `irq` events on COM1's vector, and none missed.
+    # before the first to after the last (a wider window): at least as
+    # many `irq` events on COM1's vector, and none missed. Typing a command
+    # usually raises IRQ 4, but its input can also come in through the
+    # serial reader's safety-net read (#220, a loaded host): `irqs` is run
+    # until its count has risen, an interrupt confirmed before comparing.
     m = shell(boot)
     _, start = xray(m)
     first = com1_interrupts(m)
-    second = com1_interrupts(m)
-    assert second > first, (first, second)  # typing `irqs` interrupts
+    second = gui.wait_for(
+        m, "a COM1 interrupt", lambda: com1_interrupts(m), lambda n: n > first, 30
+    )
     events, summary = xray(m, int(start[4]))
     assert summary[3] == "0" and summary[6] == "0", summary[0]
     assert summary["stopped"] is None, summary[0]  # read to the head
