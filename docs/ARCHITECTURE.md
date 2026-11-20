@@ -3689,7 +3689,8 @@ SSE); #197 checks the results' bits.
   real SDK). They can't live under `apps/tests/`: the member glob would
   take `tests` itself as a member, and excluding it also excludes
   `tests/*`. Their fixed memory (2 MiB) is one `rustflags` entry in
-  `apps/.cargo/config.toml`. `make
+  `apps/.cargo/config.toml` (`window`'s is 4 MiB, in its `build.rs`: its
+  `ui-big` toolkit holds more widgets than `TREE_NODES`). `make
   apps` copies only crates that build a `cdylib` (`testkit` and #206's
   `lumen-app` make none), the test apps to
   `build/apps/tests/<name>.wasm`, with `cp -p` and only stale modules
@@ -3743,8 +3744,13 @@ SSE); #197 checks the results' bits.
   before. Nothing needs registering: the member
   glob takes the crate, `make apps` bundles its module, and the launcher
   lists it.
-- **What #207 adds:** `lumen_app::ui` (`HostText`, `Toolkit`: above) and
-  `Window::publish` and `Window::answer`; the window's canvas is a
+- **What #207 adds:** `lumen_app::ui` (`HostText`; `Toolkit`, with
+  `run`, `run_with` (an app takes some input events itself first: the
+  calculator its keys), `step`, `refresh` and `publish`, a refused tree
+  answered `couldn't publish`), `Window::publish(&Tree)` (`PublishError`:
+  the tree's or the host's refusal), `Window::answer`, `Window::handle`,
+  and `lumen_app::report` (an app's exit code from its steps' result): what
+  wave 3's apps build on; the window's canvas is a
   `lumen_gfx::Surface` (`Window::surface_mut`), which lumen-ui paints.
   `apps/calculator` (bundled: the launcher lists it), with its logic in
   `crates/lumen-calc` (a path dependency, host-tested); `test-window`'s
@@ -4204,7 +4210,8 @@ client area with, a window's first event and again after each switch).
   request back (`lumen_wm::Refused::Busy` past the ration, `Refused::Dead`
   once the queue is dead), `desktop::push_request` does the same for a
   window no longer on the list and, #207, `Refused::Busy` for an app's
-  window whose one request slot is held (section 8), and `EventQueue::kill` returns the
+  window whose one request slot is held (section 8; `ui invoke: a request
+  is still queued or running in window <id>`), and `EventQueue::kill` returns the
   requests still queued; each is answered once the locks are released
   (the asker prints "busy" or "window <id> closed", `WindowHandle`'s drop
   answers "window closed").

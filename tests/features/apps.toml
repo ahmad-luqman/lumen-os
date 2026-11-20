@@ -119,6 +119,8 @@ tests = [
     "ktest:lumen_kernel::app::window::closed_its_window_is_answered_once_the_window_is_gone",
     "ktest:lumen_kernel::app::tests::window_answer_charges_by_the_byte",
     "ktest:lumen_kernel::app::tests::tree_and_answer_caps_are_checked_before_the_copy",
+    "ktest:lumen_kernel::app::tests::a_disjoint_republish_pays_for_both_trees",
+    "scenario:test_apps::test_a_tree_the_sdk_cant_publish_answers_failed",
     "cargo:lumen-shell",
     "scenario:test_apps::test_app_ids_are_global",
     "scenario:test_apps::test_closed_its_window_answer_comes_after_the_window_closes",
