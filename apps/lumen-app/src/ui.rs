@@ -15,9 +15,10 @@
 //! - Its loops: [`Toolkit::run`], [`Toolkit::run_with`] (the app takes some
 //!   input itself first: [`Taken`]) and [`Toolkit::run_until`] (an animated
 //!   app's ticks, [`Ticking`], paced by `lumen_ui::Pacer`). Whatever the
-//!   app takes, a `Request`, `Close` or `Theme` always reaches the toolkit
-//!   (`Event::offered_to_app`), so a request is always answered and a close
-//!   always ends the loop.
+//!   app takes, a `Request`, `Close` or `Theme` always reaches the toolkit,
+//!   and the focus and `Lost` reach it too after the app (`Event::offer`),
+//!   so a request is always answered, a close always ends the loop and a
+//!   press is always cancelled when the focus goes.
 //! - An app draws its own area (beside the tree's: [`Toolkit::with_area`])
 //!   in `lumen_ui::App::paint_over`, with the theme's palette and the
 //!   host's text, and reports what it changed with `App::take_drawn`: that
@@ -25,7 +26,7 @@
 
 use crate::{Desktop, Event, Handle, Result, Time, Window, check, sys};
 use lumen_app_api::answer::AppAnswer;
-use lumen_app_api::event::{Button, toolkit_key};
+use lumen_app_api::event::{Button, Offer, toolkit_key};
 use lumen_app_api::layout::{Rect as WireRect, TextDraw};
 use lumen_app_api::limits::{TEXT_BYTES, UI_TEXT_PX};
 use lumen_app_api::tree::Tree;
@@ -221,11 +222,12 @@ impl<A: App> Toolkit<A> {
         self.run_with(|_, _| Taken::Pass)
     }
 
-    /// [`Toolkit::run`], each input event (`Event::offered_to_app`: not a
-    /// request, `Close` or `Theme`, which are the toolkit's) offered to
-    /// `take` first: one it takes ([`Taken::Took`]: the app acted on it
+    /// [`Toolkit::run`], each input event offered to `take` first
+    /// (`Event::offer`): one it takes ([`Taken::Took`]: the app acted on it
     /// itself, such as the calculator's keys whichever button has the focus,
-    /// or a game's arrows) skips the tree, then the window is refreshed;
+    /// or a game's arrows) skips the tree, then the window is refreshed. The
+    /// focus coming or going and `Lost` are offered too, then always handed
+    /// to the tree; a request, `Close` or `Theme` never reaches `take`.
     /// [`Taken::Quit`] returns as `Close` does.
     pub fn run_with(&mut self, mut take: impl FnMut(&mut A, &Event) -> Taken) -> Result<()> {
         loop {
@@ -278,17 +280,25 @@ impl<A: App> Toolkit<A> {
         }
     }
 
-    /// One event of a loop: offered to `take` if it may be
-    /// (`Event::offered_to_app`), else (or passed) a [`Toolkit::step`].
+    /// One event of a loop, by who it is for (`Event::offer`): input
+    /// offered to `take`, stepped unless it took it; the focus or `Lost`
+    /// offered to `take`, then always stepped (unless it quit); a request,
+    /// `Close` or `Theme` stepped.
     fn offer(&mut self, e: Event, take: &mut impl FnMut(&mut A, &Event) -> Taken) -> Result<Step> {
-        if e.offered_to_app() {
-            match take(&mut self.app, &e) {
+        match e.offer() {
+            Offer::Toolkit => {}
+            Offer::App => match take(&mut self.app, &e) {
                 Taken::Pass => {}
                 Taken::Took => {
                     self.refresh()?;
                     return Ok(Step::Carry);
                 }
                 Taken::Quit => return Ok(Step::Close),
+            },
+            Offer::Notify => {
+                if take(&mut self.app, &e) == Taken::Quit {
+                    return Ok(Step::Close);
+                }
             }
         }
         self.step(e)
