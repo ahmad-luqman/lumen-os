@@ -11,7 +11,7 @@ extern crate alloc;
 
 use alloc::format;
 use alloc::vec::Vec;
-use lumen_app::ui::{Step, Toolkit};
+use lumen_app::ui::Toolkit;
 use lumen_app::{Desktop, Error, Event, KeyAction, KeyCode, log};
 use lumen_calc::{Calc, Key, Op};
 use lumen_ui::{App, Then, Ui, UiEvent, Widget};
@@ -108,19 +108,13 @@ fn app() -> Result<(), (&'static str, Error)> {
     let desktop = Desktop::get().map_err(|e| ("no desktop handle", e))?;
     let window = desktop.open_window("Calculator", WIDTH, HEIGHT).map_err(|e| ("no window", e))?;
     let mut tk = Toolkit::new(Calculator::new(), window).map_err(|e| ("no toolkit", e))?;
-    loop {
-        let e = tk.window_mut().wait_event().map_err(|e| ("events", e))?;
-        // The calculator's keys go to it whichever button has the focus;
-        // the others (Tab, Space) to the toolkit.
-        if let Event::Key { code, action: KeyAction::Press { text }, .. } = e
-            && let Some(key) = key_of(code, text)
-        {
-            tk.app_mut().press(key);
-            tk.refresh().map_err(|e| ("draw", e))?;
-            continue;
-        }
-        if tk.step(e).map_err(|e| ("draw", e))? == Step::Close {
-            return Ok(());
-        }
-    }
+    // The calculator's keys go to it whichever button has the focus; the
+    // others (Tab, Space) to the toolkit.
+    tk.run_with(|calc, e| {
+        let Event::Key { code, action: KeyAction::Press { text }, .. } = *e else { return false };
+        let Some(key) = key_of(code, text) else { return false };
+        calc.press(key);
+        true
+    })
+    .map_err(|e| ("toolkit", e))
 }

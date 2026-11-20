@@ -112,9 +112,21 @@ impl<A: App> Toolkit<A> {
 
     /// Steps until the window closes.
     pub fn run(&mut self) -> Result<()> {
+        self.run_with(|_, _| false)
+    }
+
+    /// [`Toolkit::run`], each input event (not a request, `Close` or
+    /// `Theme`: those are the toolkit's) offered to `take` first: one it
+    /// takes (`true`: the app acted on it itself, such as the calculator's
+    /// keys whichever button has the focus) skips the tree, then the window
+    /// is refreshed.
+    pub fn run_with(&mut self, mut take: impl FnMut(&mut A, &Event) -> bool) -> Result<()> {
         loop {
             let e = self.window.wait_event()?;
-            if self.step(e)? == Step::Close {
+            let offered = !matches!(e, Event::Request { .. } | Event::Close | Event::Theme { .. });
+            if offered && take(&mut self.app, &e) {
+                self.refresh()?;
+            } else if self.step(e)? == Step::Close {
                 return Ok(());
             }
         }
