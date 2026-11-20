@@ -36,6 +36,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "comet"
+version = "0.0.1"
+dependencies = [
+ "lumen-app",
+ "lumen-snake",
+ "lumen-ui",
+]
+
+[[package]]
 name = "editor"
 version = "0.0.1"
 dependencies = [
@@ -121,6 +130,10 @@ dependencies = [
  "zune-core",
  "zune-png",
 ]
+
+[[package]]
+name = "lumen-snake"
+version = "0.0.1"
 
 [[package]]
 name = "lumen-trace"
