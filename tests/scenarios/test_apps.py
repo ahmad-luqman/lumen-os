@@ -16,7 +16,9 @@ accept "killed" or any place (`kill`) and confirm the end by the app's end
 line and its thread's join.
 """
 
+import hashlib
 import re
+import time
 
 from lumen_harness import REPO_ROOT, gui, klog
 from lumen_harness.gui import parse_records, poll
@@ -112,7 +114,7 @@ def test_hello_wasm(boot):
     out = run(m, "run")
     assert (
         out
-        == "usage: run [--without <grant>] <app> [args...]\napps: calculator clock comet template viewer\n"
+        == "usage: run [--without <grant>] <app> [args...]\napps: calculator clock comet life template viewer\n"
     ), out
     assert "run: no app nope" in run(m, "run nope")
     # `exit(n)` is an ending like returning n.
@@ -1460,6 +1462,261 @@ def test_sdk_an_overrunning_tick_still_waits_a_period(boot):
     gui.close_window(m, "window")
     end_line(m, mark, "window", app_id, "exited with 0")
     assert tick_ended(m, mark) >= 4
+
+
+# -- Life (#202) ----------------------------------------------------------------
+
+# apps/life's usage (logged with a refusal).
+LIFE_USAGE = "usage: life [--stopped] [pattern]"
+
+
+def generation(rows: list[dict[str, str]]) -> int:
+    return int(gui.node(rows, "label", "Generation")["value"])
+
+
+def life_state(rows: list[dict[str, str]]) -> str:
+    return gui.node(rows, "label", "State")["value"]
+
+
+def life_pattern(rows: list[dict[str, str]]) -> str:
+    return gui.node(rows, "label", "Pattern")["value"]
+
+
+def choose(m, rows: list[dict[str, str]], name: str, animating: bool = False) -> None:
+    """`ui invoke <pattern name> select` in the Patterns list: answered
+    with its row, or still running (the caller confirms the effect)."""
+    item = gui.node(rows, "listitem", name)
+    got = gui.invoke(m, item["id"], "select", animating=animating)
+    assert got.still_running or (got.row is not None and got.row["id"] == item["id"]), got
+
+
+# Where apps/life's grid starts in its client area (`GRID.x()`: the tree's
+# 200 pixels, its line, a pixel's gap): right of it nothing but the cells
+# changes.
+LIFE_GRID_X = 202
+
+
+def life_grid(m, name: str) -> str:
+    """The Life window's grid (its client area from `LIFE_GRID_X` on) in a
+    screendump `name`, the tree's labels left out: its pixels' digest (a
+    failure then names a digest, not every pixel)."""
+    img = gui.client_pixels(m, "Life", name)
+    return hashlib.sha256(img.crop((LIFE_GRID_X, 0, img.width, img.height)).tobytes()).hexdigest()
+
+
+def life_client(m, name: str) -> bytes:
+    """The Life window's client area in a settled screendump `name`."""
+    return gui.settled_capture(m, lambda: gui.client_pixels(m, "Life", name)).tobytes()
+
+
+def life_matches_a_full_repaint(m, name: str) -> None:
+    """The settled client area (what the app's damage committed) equals the
+    same area after a full repaint (a theme switch to dark and back
+    repaints the whole window)."""
+    before = life_client(m, f"{name}.png")
+    assert run(m, "theme dark") == "theme: dark\n"
+    gui.wait_settled(m)
+    assert run(m, "theme light") == "theme: light\n"
+    assert life_client(m, f"{name}-repainted.png") == before, (
+        f"{name}: not what a full repaint draws"
+    )
+
+
+def life_tree(m) -> tuple[str, list[dict[str, str]]]:
+    return wait_tree(m, "Life", "Generation")
+
+
+# Each argument `run life` refuses, and the ERROR naming it (the usage
+# after it).
+LIFE_REFUSALS = [
+    ("nope", "no pattern 'nope' (glider, gun, lwss, rpentomino, acorn)"),
+    ("--fast", "'--fast' isn't an argument it takes"),
+    ("gun acorn", "one pattern at most ('gun', then 'acorn')"),
+    ("--stopped --stopped", "'--stopped' given twice"),
+]
+
+
+def test_life_refuses_arguments_it_doesnt_take(boot):
+    # `run life <args>` with a pattern it doesn't know, an option it doesn't
+    # take, two patterns or `--stopped` twice: one ERROR naming what was
+    # wrong, with the usage, and exit 2 (before any window: no desktop).
+    m = boot_shell(boot)
+    # (An app's ERROR may come after `run`'s prompt: the next command
+    # reads it.)
+    allow = r"ERROR app: life: "
+    for args, why in LIFE_REFUSALS:
+        app_id, mark = start(m, f"life {args}", allow=allow)
+        line = rf"ERROR app: life: {re.escape(why)} \({re.escape(LIFE_USAGE)}\)\n"
+        wait_for_output(m, mark, line, 30)
+        end_line(m, mark, "life", app_id, "exited with 2")
+    run(m, "apps", allow=allow)
+
+
+def test_life_without_a_window_ends_with_its_own_error(boot):
+    # An app the launcher starts is answered once started, without waiting
+    # for its window (section 8's launcher): one that then can't open it
+    # ends by its own ERROR and end line, not the item's failure. Here, with no desktop,
+    # `run life` starts it, then its window is refused: one ERROR naming
+    # the step and the error, then exit 1.
+    m = boot_shell(boot)
+    allow = r"ERROR app: life: no window: "
+    app_id, mark = start(m, "life", allow=allow)
+    wait_for_output(m, mark, r"ERROR app: life: no window: Unavailable\n", 30)
+    end_line(m, mark, "life", app_id, "exited with 1")
+    run(m, "apps", allow=allow)
+
+
+def test_life_golden(boot, artifacts, golden_dir):
+    # `run life --stopped glider`: the glider, stopped (no period, so the
+    # window settles, and it spends no fuel). Acorn chosen in its list
+    # starts it again at generation 0, still stopped; twelve presses of Step
+    # (each one generation, answered, or settled if still running) against a
+    # golden of its client area, what the steps' damage committed (after
+    # three, and after running) equal to a full repaint. Start runs it (the
+    # generation grows while it animates); the glider chosen while it runs
+    # starts again from it, still running. Stop settles it; acorn chosen
+    # then is generation 0, stopped.
+    m = boot_desktop(boot)
+    app_id, mark = start(m, "life --stopped glider")
+    wid, rows = life_tree(m)
+    assert (life_state(rows), generation(rows), life_pattern(rows)) == ("stopped", 0, "glider")
+    # The list shows the pattern it runs from the start (glider: item 0),
+    # the focus left alone.
+    patterns = gui.node(rows, "list", "Patterns")
+    assert (patterns["value"], "focused" in patterns["state"]) == ("0", False), patterns
+    # Stopped, it spends no fuel: settled, `apps`' fuel stays exactly the
+    # same (an idle app runs nothing, so a slow host can't change it; a
+    # stopped app that still woke on a period would).
+    gui.wait_settled(m)
+    fuel = int(app(m, app_id)["fuel"])
+    time.sleep(1.5)
+    gui.wait_settled(m)
+    assert int(app(m, app_id)["fuel"]) == fuel, "a stopped Life spent fuel"
+    choose(m, rows, "acorn")
+    gui.wait_settled(m)
+    rows = below_root(gui.ui_tree(m, wid))
+    assert (life_state(rows), generation(rows), life_pattern(rows)) == ("stopped", 0, "acorn")
+    assert gui.node(rows, "list", "Patterns")["value"] == "4", rows
+    # What each Step's damage committed is what a full repaint draws (after
+    # three, then after twelve: the golden).
+    gui.press_buttons(m, rows, *["Step"] * 3)
+    life_matches_a_full_repaint(m, "life-step-3")
+    gui.press_buttons(m, rows, *["Step"] * 9)
+    rows = below_root(gui.ui_tree(m, wid))
+    assert (life_state(rows), generation(rows)) == ("stopped", 12), rows
+    row = gui.window(m, "Life")
+    x0, y0, x1, y1 = gui.client_box(row)
+    shot = gui.settled_screendump(m, "life.png")
+    assert_matches_golden(
+        shot,
+        golden_dir / "app-life.png",
+        origin=(x0, y0),
+        size=(x1 - x0, y1 - y0),
+        artifacts=artifacts,
+    )
+    # Start goes on from where it stopped: the same pattern, its
+    # generation at least 12 when the tree first shows it running.
+    rows = gui.press_animated(
+        m, rows, "Start", "running", lambda r: life_state(r) == "running", wid
+    )
+    assert life_pattern(rows) == "acorn" and generation(rows) >= 12, rows
+    rows = gui.wait_ui(m, "acorn running on", lambda r: generation(r) > 12, wid, 30)
+    assert life_pattern(rows) == "acorn", rows
+    choose(m, rows, "glider", animating=True)
+    rows = gui.wait_ui(
+        m,
+        "the glider chosen while running",
+        lambda r: life_pattern(r) == "glider" and life_state(r) == "running",
+        wid,
+        30,
+    )
+    seen = generation(rows)
+    rows = gui.wait_ui(
+        m,
+        "the glider running",
+        lambda r: life_pattern(r) == "glider" and generation(r) > seen,
+        wid,
+        30,
+    )
+    rows = gui.press_animated(m, rows, "Stop", "stopped", lambda r: life_state(r) == "stopped", wid)
+    gui.wait_settled(m)
+    stopped_at = generation(gui.ui_tree(m, wid))
+    gui.wait_settled(m)
+    rows = below_root(gui.ui_tree(m, wid))
+    assert generation(rows) == stopped_at
+    # What running committed is what a full repaint draws.
+    life_matches_a_full_repaint(m, "life-stopped")
+    choose(m, rows, "acorn")
+    gui.wait_settled(m)
+    rows = below_root(gui.ui_tree(m, wid))
+    assert (life_state(rows), generation(rows), life_pattern(rows)) == ("stopped", 0, "acorn")
+    gui.close_window(m, "Life")
+    end_line(m, mark, "life", app_id, "exited with 0")
+
+
+def test_life_runs_unfocused_and_stops_when_closed(boot):
+    # The launcher's Life item starts the Life app (#202; it replaced the
+    # kernel's window), running the gun: its generation (the tree's value)
+    # grows while another window has the focus (its grid changing on the
+    # screen too), and its waits are an animation's (the desktop never
+    # reads settled). Minimized, it presents nothing (its commits queue no
+    # damage) yet still steps. Its close ends it with 0, its thread joined,
+    # and the desktop settles again.
+    m = boot_desktop(boot)
+    mark = len(m.output)
+    gui.launch(m, "Life")
+    listed = gui.wait_for(
+        m,
+        "apps listing life",
+        lambda: apps(m),
+        lambda rows: any(r["name"] == "life" for r in rows),
+        30,
+    )
+    record = gui.one(listed, "life apps", name="life")
+    app_id = int(record["id"])
+    wid, rows = life_tree(m)
+    assert (life_state(rows), life_pattern(rows)) == ("running", "gun"), rows
+    assert gui.node(rows, "list", "Patterns")["value"] == "1", rows
+    colours = gui.node(gui.ui_tree(m), "window", "Colours")
+    assert gui.invoke(m, colours["id"], "focus").row is not None
+    gui.wait_for(m, "Life unfocused", lambda: gui.window(m, "Life")["focused"], lambda f: f == "no")
+    seen = generation(gui.ui_tree(m, wid))
+    gui.wait_ui(m, "generations while unfocused", lambda r: generation(r) > seen + 2, wid, 30)
+    assert gui.window(m, "Life")["focused"] == "no"
+    # ... and its grid changes on the screen meanwhile (the grid alone:
+    # the Generation label changes every tick too).
+    first = life_grid(m, "life-1.png")
+    gui.wait_for(
+        m,
+        "Life's grid changing on the screen",
+        lambda: life_grid(m, "life-2.png"),
+        lambda c: c != first,
+        30,
+    )
+    assert gui.window(m, "Life")["focused"] == "no"
+    for _ in range(5):
+        assert gui.desktop_status(m)["settled"] == "no"
+    # Minimized, it presents nothing (read again if something else
+    # presented: the minimize's own redraw, or the clock; Life presenting
+    # would show in every try), yet its generation still grows.
+    root = gui.node(gui.ui_tree(m), "window", "Life")
+    assert gui.invoke(m, root["id"], "minimize", animating=True).row is not None
+    tries = []
+    for _ in range(3):
+        before = gui.desktop_status(m)
+        time.sleep(0.5)
+        after = gui.desktop_status(m)
+        tries.append((before["frames"], after["frames"]))
+        if after["frames"] == before["frames"]:
+            break
+    else:
+        raise AssertionError(f"presented while Life was minimized: {tries}")
+    seen = generation(gui.ui_tree(m, wid))
+    gui.wait_ui(m, "generations while minimized", lambda r: generation(r) > seen, wid, 30)
+    gui.close_window(m, "Life")
+    end_line(m, mark, "life", app_id, "exited with 0")
+    wait_gone(m, app_id, record["thread"])
+    gui.wait_settled(m)
 
 
 # -- the image viewer (#204) ---------------------------------------------------

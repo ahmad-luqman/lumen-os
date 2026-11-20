@@ -1131,6 +1131,19 @@ def taskbar(m: Machine) -> list[dict[str, str]]:
     return [r for r in rows if r["window"] == root["window"]]
 
 
+def launch(m: Machine, item: str) -> Invoked:
+    """Choose launcher item `item` through `ui invoke`: the menu's `press`
+    unfolds it, its item's `press` opens the window or starts the app (and
+    folds the menu, so the item's node is gone after)."""
+    launcher = node(taskbar(m), "menu", "Launcher")
+    unfolded = invoke(m, launcher["id"], "press")
+    assert unfolded.row is not None and unfolded.row["state"] == "expanded", unfolded
+    entry = node(taskbar(m), "menuitem", item)
+    got = invoke(m, entry["id"], "press")
+    assert got.message == f"ui invoke: ran; node {entry['id']} is gone", got
+    return got
+
+
 def bounds(row: dict[str, str]) -> tuple[int, int, int, int]:
     """A tree row's bounds: x, y, w, h."""
     return int(row["x"]), int(row["y"]), int(row["w"]), int(row["h"])
