@@ -105,9 +105,13 @@ pub struct Toolkit<A: App> {
     /// From the last `Theme` event (the first event, always).
     palette: Palette,
     window: Window,
-    /// The last publish was refused: try again at the next refresh (the
-    /// kernel keeps the last tree meanwhile), logged once.
-    unpublished: bool,
+    /// Why the last publish was refused, while the tree published is stale
+    /// (the kernel keeps the last one): a request is then answered failed,
+    /// since its row would come from that stale tree. Tried again when the
+    /// tree next changes.
+    unpublished: Option<crate::PublishError>,
+    /// Whether this run of refusals was logged (once a run: a publish that
+    /// goes through re-arms it).
     warned: bool,
 }
 
@@ -117,7 +121,7 @@ impl<A: App> Toolkit<A> {
     pub fn new(app: A, window: Window) -> Result<Toolkit<A>> {
         let text = HostText::new(window.desktop())?;
         let palette = Palette::from(lumen_app_api::event::Palette::default());
-        Ok(Toolkit { app, text, palette, window, unpublished: false, warned: false })
+        Ok(Toolkit { app, text, palette, window, unpublished: None, warned: false })
     }
 
     pub fn app_mut(&mut self) -> &mut A {
@@ -199,12 +203,23 @@ impl<A: App> Toolkit<A> {
             return Ok(Step::Close);
         }
         // Answered even if the refresh fails (its asker would wait for
-        // nothing), then the failure is the step's.
+        // nothing), then the failure is the step's; one whose effect isn't
+        // published (the tree refused) is answered failed, not with a row
+        // from the stale tree.
         if let Err(e) = self.refresh() {
             let why = lumen_app_api::answer::FailText::cut(&alloc::format!("couldn't refresh: {e}"));
-            self.window.answer(&AppAnswer::Failed(why))?;
+            if let Err(lost) = self.window.answer(&AppAnswer::Failed(why)) {
+                crate::log::error(&alloc::format!("ui: couldn't refresh: {e}"));
+                return Err(lost);
+            }
             return Err(e);
         }
+        let answer = match &self.unpublished {
+            Some(e) => {
+                AppAnswer::Failed(lumen_app_api::answer::FailText::cut(&alloc::format!("couldn't publish: {e}")))
+            }
+            None => answer,
+        };
         self.window.answer(&answer)?;
         Ok(Step::Carry)
     }
@@ -216,9 +231,9 @@ impl<A: App> Toolkit<A> {
 
     /// Lay the tree out; repaint and commit only what changed
     /// (`lumen_ui::repaint`, as the kernel's toolkit does), then publish the
-    /// tree if it changed (or the last publish was refused). A failed commit
-    /// marks the whole tree changed again, so the next refresh repaints and
-    /// republishes it; a refused publish is logged once and tried again.
+    /// tree if it changed. A failed commit marks the whole tree changed
+    /// again, so the next refresh repaints and republishes it; a refused
+    /// publish is logged once a run and tried again when the tree changes.
     pub fn refresh(&mut self) -> Result<()> {
         let area = self.window.canvas.bounds();
         let done = repaint(&mut self.app, &mut self.window.canvas, &mut self.text, &self.palette, area);
@@ -229,24 +244,34 @@ impl<A: App> Toolkit<A> {
                 return Err(e);
             }
         }
-        if done.changed || self.unpublished {
-            self.publish();
+        if done.changed {
+            // (A refusal is kept in `unpublished` and logged: the window
+            // goes on with the last tree published.)
+            let _ = self.publish();
         }
         Ok(())
     }
 
-    /// Publish the tree as it is now; a refusal (the tree too big, the host
-    /// refusing it) logged once, the kernel keeping the last tree.
-    pub fn publish(&mut self) {
+    /// Publish the tree as it is now. A refusal (the tree too big, the host
+    /// refusing it) is logged once a run of refusals and kept until a
+    /// publish goes through; the kernel keeps the last tree meanwhile.
+    pub fn publish(&mut self) -> core::result::Result<(), crate::PublishError> {
         let nodes = self.app.ui_mut().nodes();
         let result =
             Tree::from_automation(&nodes).map_err(crate::PublishError::Tree).and_then(|t| self.window.publish(&t));
-        self.unpublished = result.is_err();
-        if let Err(e) = result
-            && !self.warned
-        {
-            self.warned = true;
-            crate::log::warn(&alloc::format!("ui: a tree not published: {e}"));
+        match &result {
+            Ok(()) => {
+                self.unpublished = None;
+                self.warned = false;
+            }
+            Err(e) => {
+                if !self.warned {
+                    self.warned = true;
+                    crate::log::warn(&alloc::format!("ui: a tree not published: {e}"));
+                }
+                self.unpublished = Some(e.clone());
+            }
         }
+        result
     }
 }
