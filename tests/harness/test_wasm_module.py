@@ -48,7 +48,13 @@ DEFAULT_FEATURES = {
 
 def crates() -> list[str]:
     """Every crate in apps/: its directory's name."""
-    names = sorted(p.parent.name for p in (REPO_ROOT / "apps").glob("*/Cargo.toml"))
+    # Not dot directories (apps/.cargo, a half-made `make app` copy): cargo's
+    # member glob `[!.]*` skips them too.
+    names = sorted(
+        p.parent.name
+        for p in (REPO_ROOT / "apps").glob("*/Cargo.toml")
+        if not p.parent.name.startswith(".")
+    )
     assert names, "apps/ has no crates"
     return names
 

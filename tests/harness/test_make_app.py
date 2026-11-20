@@ -114,9 +114,17 @@ def test_a_new_app_is_the_template_renamed_and_builds(repo):
         # would be another crate's.
         (("NAME=lumen_app",), "lumen_app: that name is taken (apps/lumen-app)"),
         (("NAME=test_window",), "test_window: test- names are the runtime's test apps"),
-        # The workspace's path dependencies.
-        (("NAME=lumen-heap",), "lumen-heap: that name is taken (a dependency of apps/)"),
-        (("NAME=lumen_app_api",), "lumen_app_api: that name is taken (a dependency of apps/)"),
+        # A package of apps/Cargo.lock: the workspace's path dependencies,
+        # what they pull in, and registry crates (`cargo build -p` would be
+        # ambiguous).
+        (("NAME=lumen-heap",), "lumen-heap: that name is taken (a package of apps/Cargo.lock)"),
+        (
+            ("NAME=lumen_app_api",),
+            "lumen_app_api: that name is taken (a package of apps/Cargo.lock)",
+        ),
+        (("NAME=lumen-gfx",), "lumen-gfx: that name is taken (a package of apps/Cargo.lock)"),
+        (("NAME=lumen_ui",), "lumen_ui: that name is taken (a package of apps/Cargo.lock)"),
+        (("NAME=serde",), "serde: that name is taken (a package of apps/Cargo.lock)"),
         # A test app's module name (apps/test-hello is `hello`): the kernel
         # refuses a name in both sets.
         (("NAME=hello",), "hello: a test app's name (apps/test-hello)"),
@@ -154,4 +162,18 @@ def test_a_copy_that_fails_leaves_nothing_behind(repo):
         manifest.write_text(good)
     assert made.returncode != 0
     assert "make app: apps/baz/Cargo.toml: couldn't rename its package" in made.stderr, made.stderr
+    assert app_dirs(repo) == before
+
+
+def test_a_lock_file_naming_no_package_fails_closed(repo):
+    lock = repo / "apps" / "Cargo.lock"
+    good = lock.read_text()
+    before = app_dirs(repo)
+    try:
+        lock.write_text("# empty\n")
+        made = make_app(repo, "NAME=qux")
+    finally:
+        lock.write_text(good)
+    assert made.returncode != 0
+    assert "make app: apps/Cargo.lock names no package" in made.stderr, made.stderr
     assert app_dirs(repo) == before

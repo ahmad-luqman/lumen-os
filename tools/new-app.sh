@@ -12,10 +12,12 @@
 # - a test app's name: `test-`/`test_` names, or a test app's module name
 #   (apps/test-hello is `hello`; kernel/build.rs refuses a name in both
 #   sets);
-# - a name the apps/ workspace has already: a directory, a path
-#   dependency (`lumen-app-api`, `lumen-heap`), or the same crate once `-`
-#   and `_` are alike (cargo's output file is named with `_`: `a-b` and
-#   `a_b` would overwrite each other's module).
+# - a name the apps/ workspace has already: a directory, or a package of
+#   apps/Cargo.lock (a path dependency such as `lumen-app-api` or what it
+#   pulls in, `lumen-gfx`; a crate from the registry, `serde`: `cargo build
+#   -p` would be ambiguous), each the same once `-` and `_` are alike
+#   (cargo's output file is named with `_`: `a-b` and `a_b` would overwrite
+#   each other's module).
 # The copy is made in a dot directory (not a member) and moved into place
 # only once it is finished, so a failure leaves nothing behind.
 set -euo pipefail
@@ -54,11 +56,13 @@ for dir in "$apps"/*/; do
 		;;
 	esac
 done
-# The workspace's path dependencies (apps/Cargo.toml): a crate named so
-# would collide with one in the lock file.
-while IFS= read -r dep; do
-	[ "$(crate_file "$dep")" != "$want" ] || fail "$name: that name is taken (a dependency of apps/)"
-done < <(sed -n 's/^\([a-z0-9_-]*\) = { path = .*/\1/p' "$apps/Cargo.toml")
+# Every package of apps/Cargo.lock. Failing closed: a lock file that names
+# none can't be read right, and nothing is made.
+packages="$(sed -n 's/^name = "\([^"]*\)"$/\1/p' "$apps/Cargo.lock")"
+[ -n "$packages" ] || fail "apps/Cargo.lock names no package: can't check $name against it"
+while IFS= read -r package; do
+	[ "$(crate_file "$package")" != "$want" ] || fail "$name: that name is taken (a package of apps/Cargo.lock)"
+done <<<"$packages"
 
 tmp="$(mktemp -d "$apps/.new-$name.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
@@ -70,6 +74,8 @@ sed -e "s/^name = \"template\"$/name = \"$name\"/" \
 	"$manifest" >"$manifest.new"
 mv "$manifest.new" "$manifest"
 grep -q "^name = \"$name\"$" "$manifest" || fail "apps/$name/Cargo.toml: couldn't rename its package"
+# Made meanwhile? `mv` would put the copy inside it.
+[ ! -e "$apps/$name" ] || fail "apps/$name already exists"
 mv "$tmp" "$apps/$name"
 trap - EXIT
 

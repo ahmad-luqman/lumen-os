@@ -3677,9 +3677,12 @@ SSE); #197 checks the results' bits.
   name (`hello` for `apps/test-hello`: `kernel/build.rs` refuses a name in
   both sets); an existing directory; a name the workspace has already
   once `-` and `_` are alike (cargo names the output file with `_`, so
-  `a_b` would overwrite `a-b`'s module), a crate or one of its path
-  dependencies (`lumen-app-api`, `lumen-heap`). The copy is made in a dot
-  directory (not a member) and moved into place only once finished. Nothing needs registering: the member
+  `a_b` would overwrite `a-b`'s module): a directory, or a package of
+  `apps/Cargo.lock` (a path dependency, what it pulls in, a registry
+  crate: `cargo build -p` would be ambiguous; a lock file naming none
+  fails closed). The copy is made in a dot directory (not a member) and
+  moved into place only once finished, `apps/<name>` checked again just
+  before. Nothing needs registering: the member
   glob takes the crate, `make apps` bundles its module, and the launcher
   lists it.
 - **The launcher** (#157's taskbar) lists the bundled apps whose
