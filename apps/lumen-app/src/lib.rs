@@ -283,7 +283,7 @@ impl Window {
 
     /// Fill `r` (clipped to the canvas) with `rgb`.
     pub fn fill(&mut self, r: Rect, rgb: u32) {
-        self.canvas.fill_rect(lumen_gfx::Rect::new(r.x, r.y, r.w, r.h), rgb);
+        self.canvas.fill_rect(r.into(), rgb);
     }
 
     /// Draw `text` at `px` in `rgb` with its line box's top left at (`x`,

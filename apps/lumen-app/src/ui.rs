@@ -52,8 +52,7 @@ impl Text for HostText {
 
     fn draw(&mut self, surface: &mut Surface, x: i32, y: i32, text: &str, color: u32, clip: Rect) {
         let text = lumen_app_api::text::prefix(text, TEXT_BYTES);
-        let clip = WireRect::new(clip.x(), clip.y(), clip.w(), clip.h());
-        let args = TextDraw { x, y, px: UI_TEXT_PX, rgb: color, clip }.encode();
+        let args = TextDraw { x, y, px: UI_TEXT_PX, rgb: color, clip: clip.into() }.encode();
         let canvas = crate::canvas_of(surface);
         // SAFETY: the canvas's pixels are `surface`'s, ours to write (the
         // host writes only inside `clip`, cut to the canvas). A refusal
@@ -195,8 +194,7 @@ impl<A: App> Toolkit<A> {
         let area = self.window.canvas.bounds();
         let done = repaint(&mut self.app, &mut self.window.canvas, &mut self.text, &self.palette, area);
         if !done.rects.is_empty() {
-            let wire: alloc::vec::Vec<WireRect> =
-                done.rects.iter().map(|r| WireRect::new(r.x(), r.y(), r.w(), r.h())).collect();
+            let wire: alloc::vec::Vec<WireRect> = done.rects.iter().map(|&r| r.into()).collect();
             self.window.commit(&wire)?;
         }
         if done.changed {

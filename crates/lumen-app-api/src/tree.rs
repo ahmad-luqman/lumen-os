@@ -368,7 +368,7 @@ impl Tree {
         for (i, ((node, place), kids)) in self.nodes.iter().zip(&self.places).zip(children).enumerate() {
             let (id, item_ids) = &ids[i];
             let c = node.common();
-            let (name, bounds, disabled) = (c.name.as_str(), gfx(&c.bounds), c.disabled);
+            let (name, bounds, disabled) = (c.name.as_str(), c.bounds.into(), c.disabled);
             let made = match node {
                 Node::Group { .. } => AutomationNode::group(*id, name, bounds, disabled, kids),
                 Node::Label { text, .. } => AutomationNode::label(*id, name, text, bounds, disabled),
@@ -389,7 +389,7 @@ impl Tree {
             };
             rows.push((place.depth, made.hidden_if(c.hidden)));
             for (index, (item, item_id)) in node.items().iter().zip(item_ids).enumerate() {
-                let (name, bounds) = (item.name.as_str(), gfx(&item.bounds));
+                let (name, bounds) = (item.name.as_str(), item.bounds.into());
                 let made = match node {
                     Node::List { selected, .. } => {
                         let selected = selected.map(|s| s as usize);
@@ -406,18 +406,13 @@ impl Tree {
 
 /// A node's or an item's common fields from its automation node.
 fn common_of(n: &AutomationNode) -> Common {
-    let b = n.bounds();
     Common {
         id: n.id().get(),
         name: n.name().to_string(),
-        bounds: Rect::new(b.x(), b.y(), b.w(), b.h()),
+        bounds: n.bounds().into(),
         disabled: n.state().contains(StateFlags::DISABLED),
         hidden: n.state().contains(StateFlags::HIDDEN),
     }
-}
-
-fn gfx(r: &Rect) -> lumen_gfx::Rect {
-    lumen_gfx::Rect::new(r.x, r.y, r.w, r.h)
 }
 
 #[cfg(test)]
