@@ -323,16 +323,19 @@ impl Game {
     }
 
     /// The old level's asteroids gone, the new one's placed on the empty
-    /// cells of its field.
+    /// cells of its field; a cell that is a rock in both is left alone (and
+    /// not reported: it didn't change).
     fn change_level(&mut self, level: usize, changed: &mut Vec<Cell>) {
-        for c in rocks(self.level, self.w, self.h) {
+        let old = rocks(self.level, self.w, self.h);
+        let new = rocks(level, self.w, self.h);
+        for &c in old.iter().filter(|c| !new.contains(c)) {
             if self.content(c) == Content::Rock {
                 self.set(c, Content::Empty);
                 changed.push(c);
             }
         }
         self.level = level;
-        for c in rocks(level, self.w, self.h) {
+        for &c in new.iter().filter(|c| !old.contains(c)) {
             if self.content(c) == Content::Empty {
                 self.set(c, Content::Rock);
                 changed.push(c);

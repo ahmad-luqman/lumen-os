@@ -249,23 +249,23 @@ fn fly(seed: u64, steps: usize, mut each: impl FnMut(&Game, &[Content], &[Cell],
     g
 }
 
+/// The cells a step changed are exactly the ones it reported, each once.
+fn reports_exactly(g: &Game, before: &[Content], changed: &[Cell], after: &[Content]) {
+    let reported: BTreeSet<Cell> = changed.iter().copied().collect();
+    assert_eq!(reported.len(), changed.len(), "a cell reported twice");
+    let differ: BTreeSet<Cell> = (0..before.len())
+        .filter(|&i| before[i] != after[i])
+        .map(|i| Cell::new((i % usize::from(g.width())) as u16, (i / usize::from(g.width())) as u16))
+        .collect();
+    assert_eq!(reported, differ);
+}
+
 #[test]
 fn every_step_reports_exactly_the_cells_it_changed() {
     let mut steps = 0;
     for seed in 0..300 {
         fly(seed, 400, |g, before, changed, after| {
-            let reported: BTreeSet<Cell> = changed.iter().copied().collect();
-            assert_eq!(reported.len(), changed.len(), "a cell reported twice");
-            let differ: BTreeSet<Cell> = (0..before.len())
-                .filter(|&i| before[i] != after[i])
-                .map(|i| Cell::new((i % usize::from(g.width())) as u16, (i / usize::from(g.width())) as u16))
-                .collect();
-            // A cell that changed and changed back within one step (the
-            // tail's end the head moved into) is reported though equal.
-            assert!(differ.is_subset(&reported), "{differ:?} not in {reported:?}");
-            for c in reported.difference(&differ) {
-                assert_eq!(*c, g.head(), "{c:?} reported, unchanged and not the head");
-            }
+            reports_exactly(g, before, changed, after);
             steps += 1;
         });
     }
@@ -274,7 +274,8 @@ fn every_step_reports_exactly_the_cells_it_changed() {
 
 #[test]
 fn a_grain_never_lands_on_the_comet_or_an_asteroid() {
-    // `check` after every step says so; enough flights reach later levels.
+    // `check` after every step says so; enough flights reach every level,
+    // and each step's damage is exact there too.
     let mut levels = BTreeSet::new();
     let mut grains = 0;
     for seed in 0..300 {
@@ -310,8 +311,12 @@ fn a_grain_never_lands_on_the_comet_or_an_asteroid() {
                 put_dust(&mut g, ahead);
             }
             let score = g.score();
-            g.step();
+            let before = grid(&g);
+            let changed = g.step();
             check(&g);
+            // Every level is reached here, so level changes' damage is
+            // checked too.
+            reports_exactly(&g, &before, &changed, &grid(&g));
             grains += (g.score() - score) as usize;
             levels.insert(g.level());
         }
