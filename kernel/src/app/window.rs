@@ -95,6 +95,23 @@ impl Drop for OwnerEnded {
 }
 
 impl AppWindow {
+    /// The app's window over `handle` (`w` × `h`), with `text_draw`'s
+    /// `scratch`: one request at a time (`window_answer` answers *the*
+    /// running request), no tree yet.
+    fn new(handle: WindowHandle, w: u32, h: u32, scratch: Surface) -> AppWindow {
+        handle.one_request_at_a_time();
+        AppWindow {
+            handle,
+            w,
+            h,
+            in_hand: None,
+            scratch,
+            ids: BTreeMap::new(),
+            nodes: BTreeMap::new(),
+            running: OwnerEnded(Running::new()),
+        }
+    }
+
     /// A waker for its owner's wait (`kill` uses it).
     pub(super) fn waker(&self) -> desktop::Waker {
         self.handle.waker()
@@ -225,19 +242,7 @@ fn window_open(c: &mut C<'_>, h: i32, title: i32, len: i32, width: i32, height: 
     let scratch = Surface::with_stride(w, ht, w as usize).ok_or(Error::OutOfMemory)?;
     // Its three surfaces, each allocated and filled: paid by the pixel.
     runtime::charge(&mut *c, PIXEL_FUEL * SURFACES * u64::from(w) * u64::from(ht));
-    // `window_answer` answers *the* running request.
-    handle.one_request_at_a_time();
-    let window = AppWindow {
-        handle,
-        w,
-        h: ht,
-        in_hand: None,
-        scratch,
-        ids: BTreeMap::new(),
-        nodes: BTreeMap::new(),
-        running: OwnerEnded(Running::new()),
-    };
-    c.data_mut().add_window(window)
+    c.data_mut().add_window(AppWindow::new(handle, w, ht, scratch))
 }
 
 fn window_commit(c: &mut C<'_>, h: i32, canvas: i32, rects: i32, n: i32) -> Result<i32, Error> {
@@ -598,17 +603,7 @@ fn text_draw(c: &mut C<'_>, h: i32, canvas: i32, args: i32, ptr: i32, len: i32) 
 /// button, global id `global` (for the ktests, which have no module).
 #[cfg(feature = "ktest")]
 fn test_window(handle: WindowHandle, global: NodeId) -> AppWindow {
-    handle.one_request_at_a_time();
-    let mut win = AppWindow {
-        handle,
-        w: 8,
-        h: 8,
-        in_hand: None,
-        scratch: Surface::new(8, 8),
-        ids: BTreeMap::new(),
-        nodes: BTreeMap::new(),
-        running: OwnerEnded(Running::new()),
-    };
+    let mut win = AppWindow::new(handle, 8, 8, Surface::new(8, 8));
     win.ids.insert(1, global);
     win.nodes.insert(global.get(), (1, Role::Button));
     let node = lumen_ui::AutomationNode::button(global, "Go", Rect::new(0, 0, 4, 4), false, false);
