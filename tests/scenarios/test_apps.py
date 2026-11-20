@@ -15,7 +15,7 @@ line and its thread's join.
 
 import re
 
-from lumen_harness import gui, klog
+from lumen_harness import REPO_ROOT, gui, klog
 from lumen_harness.gui import parse_records, poll
 from lumen_harness.klog import STAMP
 from lumen_harness.screen import PROMPT
@@ -405,6 +405,19 @@ def test_sdk_panic_says_where(boot):
     wait_unlisted(m, app_id, PANIC_END)
     warnings = klog.unexpected_warnings(m.output[mark:])
     assert len(warnings) == 1 and "ended: panicked" in warnings[0], warnings
+
+
+def test_sdk_panic_cuts_on_a_char_boundary(boot):
+    # 200 three-byte characters: the message is cut on a char boundary, so
+    # nothing turns into U+FFFD and pushes the end past LOG_BYTES: the line
+    # number shown is exactly the panic's.
+    source = (REPO_ROOT / "apps" / "test-window" / "src" / "lib.rs").read_text().splitlines()
+    line = next(i for i, text in enumerate(source, 1) if text.endswith("// marker: panic-utf8"))
+    m = boot_shell(boot)
+    app_id, mark = start(m, "window panic-utf8", allow=PANIC_END)
+    end_line(m, mark, "window", app_id, rf"ended: panicked: €+ at \S+\.rs:{line}", "WARN")
+    wait_unlisted(m, app_id, PANIC_END)
+    assert "\ufffd" not in m.output[mark:]
 
 
 def test_sdk_allocator_frees(boot):

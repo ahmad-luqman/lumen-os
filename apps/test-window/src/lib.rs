@@ -20,6 +20,9 @@
 //!   to `TEXT_BYTES`, so the kernel logs its start rather than refusing it.
 //! - `panic`: panics with a 300-byte message: the SDK's panic handler cuts
 //!   it to fit ` at <file>:<line>`.
+//! - `panic-utf8`: the same with 200 `€`s (3 bytes each): cut on a char
+//!   boundary, so the line number shown is whole (the scenario finds the
+//!   line by its `panic-utf8` marker).
 //! - `alloc`: allocates and frees 256 KiB 64 times (16 MiB in all, in a
 //!   2 MiB memory): only a heap that frees lasts; logs `window: alloc: 64
 //!   rounds` and returns 0.
@@ -75,6 +78,10 @@ fn run() -> i32 {
         "panic" => {
             let long: String = core::iter::repeat_n('p', 300).collect();
             panic!("{long}");
+        }
+        "panic-utf8" => {
+            let long: String = core::iter::repeat_n('€', 200).collect();
+            panic!("{long}"); // marker: panic-utf8
         }
         "alloc" => {
             for _ in 0..64 {

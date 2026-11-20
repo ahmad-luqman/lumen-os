@@ -356,10 +356,12 @@ impl Drop for Window {
     }
 }
 
-/// The most bytes of a panic's report: the kernel shows `LOG_BYTES`.
-const PANIC_BYTES: usize = 256;
+/// The most bytes of a panic's report: what the kernel shows of it.
+const PANIC_BYTES: usize = lumen_app_api::limits::LOG_BYTES;
 
-/// Text formatted into `bytes`, up to `cap` of them (the rest dropped).
+/// Text formatted into `bytes`, up to `cap` of them, cut on a char
+/// boundary (the rest dropped): no stray bytes for the kernel to show as
+/// U+FFFD, which would push the end of the report past what it shows.
 struct Buf {
     bytes: [u8; PANIC_BYTES],
     len: usize,
@@ -368,7 +370,10 @@ struct Buf {
 
 impl core::fmt::Write for Buf {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let n = s.len().min(self.cap - self.len);
+        let mut n = s.len().min(self.cap - self.len);
+        while !s.is_char_boundary(n) {
+            n -= 1;
+        }
         self.bytes[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
         self.len += n;
         Ok(())
@@ -387,8 +392,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     }
     let mut out = Buf { bytes: [0; PANIC_BYTES], len: 0, cap: PANIC_BYTES - place.len };
     let _ = write!(out, "{}", info.message());
-    // A cut can leave a character's first bytes: the kernel shows them as
-    // U+FFFD.
     out.cap = PANIC_BYTES;
     let _ = out.write_str(core::str::from_utf8(&place.bytes[..place.len]).unwrap_or(""));
     sys::panic(ptr(out.bytes.as_ptr()), out.len as i32)
