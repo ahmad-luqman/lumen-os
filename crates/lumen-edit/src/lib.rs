@@ -176,6 +176,8 @@ pub struct Editor {
     original: String,
     /// Whether the last command or replacement was refused (past a limit).
     refused: bool,
+    /// How many edits the history's limits forgot (its tests follow it).
+    forgotten: usize,
     top: usize,
     rows: usize,
 }
@@ -207,6 +209,7 @@ impl Editor {
             limits,
             original: clean,
             refused: false,
+            forgotten: 0,
             top: 0,
             rows: 1,
         };
@@ -461,6 +464,7 @@ impl Editor {
             gone += 1;
         }
         self.undo.drain(..gone);
+        self.forgotten += gone;
     }
 
     fn undo(&mut self) -> Change {

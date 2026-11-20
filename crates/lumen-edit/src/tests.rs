@@ -371,6 +371,92 @@ fn past_undo_bytes_the_oldest_edits_are_forgotten() {
 }
 
 #[test]
+fn the_view_refills_when_lines_below_a_visible_cursor_go() {
+    // The cursor shown on the view's first row, the lines below it removed:
+    // the view moves up to show as many lines as fit.
+    let mut e = ed("0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
+    e.apply(Command::Bottom);
+    e.scroll_to(4);
+    for _ in 0..3 {
+        e.apply(Command::Up);
+    }
+    assert!(!e.scroll_to(4));
+    assert_eq!((e.top(), e.cursor_line()), (6, 6));
+    e.apply(Command::End);
+    for _ in 0..6 {
+        e.apply(Command::Delete);
+    }
+    assert_eq!(e.text(), "0\n1\n2\n3\n4\n5\n6");
+    assert!(e.scroll_to(4), "rows 7 to 9 would be empty");
+    assert_eq!(e.top(), 3);
+}
+
+#[test]
+fn undo_forgets_the_goal_column() {
+    let mut e = ed("abcdefg\nab\nabcdefg");
+    e.apply(Command::End);
+    e.apply(Command::Down);
+    assert_eq!(e.line_col(), (1, 2));
+    e.apply(Command::Insert('x'));
+    e.apply(Command::Undo);
+    // The goal (7) was forgotten by the edit and stays so after its undo:
+    // down from column 2.
+    e.apply(Command::Down);
+    assert_eq!(e.line_col(), (2, 2));
+    // A move up and down without edits keeps it.
+    e.apply(Command::End);
+    e.apply(Command::Up);
+    e.apply(Command::Down);
+    assert_eq!(e.line_col(), (2, 7));
+    e.apply(Command::Up);
+    e.apply(Command::Insert('y'));
+    e.apply(Command::Undo);
+    e.apply(Command::Redo);
+    e.apply(Command::Down);
+    assert_eq!(e.line_col(), (2, 3), "a redo forgets it too");
+}
+
+#[test]
+fn modified_is_the_text_not_the_history() {
+    let mut e = ed("abc");
+    e.apply(Command::Insert('x'));
+    assert!(e.modified());
+    e.apply(Command::Backspace);
+    assert_eq!(e.undo_depth(), 2);
+    assert!(!e.modified(), "the same text as it started with");
+    e.apply(Command::Undo);
+    assert!(e.modified());
+}
+
+#[test]
+fn a_same_text_or_refused_replacement_ends_a_typing_run() {
+    let mut e = Editor::new("", limits(8, 100)).0;
+    typed(&mut e, "ab");
+    assert_eq!(e.replace_all("ab"), Change::None);
+    typed(&mut e, "c");
+    assert_eq!(e.undo_depth(), 2, "a new edit after the same text");
+    assert_eq!(e.replace_all("123456789"), Change::Refused);
+    typed(&mut e, "d");
+    assert_eq!(e.undo_depth(), 3, "a new edit after a refused one");
+    assert_eq!(e.text(), "abcd");
+}
+
+#[test]
+fn an_edit_s_removed_bytes_count_toward_undo_bytes() {
+    let lim = |text_bytes| Limits { text_bytes, line_bytes: BIG, undo_edits: 100, undo_bytes: 10 };
+    // 9 removed + 1 inserted: 10, kept.
+    let mut e = Editor::new("123456789", lim(BIG)).0;
+    e.replace_all("x");
+    assert_eq!(e.undo_depth(), 1);
+    e.apply(Command::Undo);
+    assert_eq!(e.text(), "123456789");
+    // 10 removed + 1 inserted: 11, forgotten.
+    let mut f = Editor::new("1234567890", lim(BIG)).0;
+    f.replace_all("x");
+    assert_eq!(f.undo_depth(), 0);
+}
+
+#[test]
 fn a_huge_view_neither_overflows_nor_turns_a_page_around() {
     let mut e = ed("0\n1\n2\n3");
     e.apply(Command::Down);
@@ -622,7 +708,10 @@ fn a_randomized_model_agrees_and_every_undo_and_redo_restores_the_text_exactly()
         let cap = if seed % 5 == 0 { 24 } else { 4096 };
         let rows = 1 + (seed % 7) as usize;
         let line_cap = if seed % 3 == 0 { 12 } else { BIG };
-        let mut e = Editor::new("start\ntext", Limits { line_bytes: line_cap, ..limits(cap, 1000) }).0;
+        // A fifth of the seeds with a small history: 5 edits, 32 bytes.
+        let (undo_edits, undo_bytes) = if seed % 5 == 2 { (5, 32) } else { (1000, BIG) };
+        let mut e =
+            Editor::new("start\ntext", Limits { text_bytes: cap, line_bytes: line_cap, undo_edits, undo_bytes }).0;
         e.scroll_to(rows);
         let mut m = model_of(&e, rows);
         let mut r = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
@@ -632,6 +721,7 @@ fn a_randomized_model_agrees_and_every_undo_and_redo_restores_the_text_exactly()
         for step in 0..400 {
             let cmd = random_command(&mut r);
             let before = String::from(e.text());
+            let (depth_before, forgotten_before) = (e.undo_depth(), e.forgotten);
             let (before_line, before_cursor) = (e.cursor_line(), e.cursor());
             let before_lines: Vec<String> = (0..e.line_count()).map(|n| String::from(e.line(n))).collect();
             let change = e.apply(cmd);
@@ -653,11 +743,19 @@ fn a_randomized_model_agrees_and_every_undo_and_redo_restores_the_text_exactly()
                 let cursor = e.text()[..e.cursor()].chars().count();
                 assert_eq!(cursor, m.cursor, "seed {seed} step {step} {cmd:?} in {:?}", e.text());
                 // An edit (the text changed) drops what could be redone: a
-                // new depth, or a typing run joined at this one.
-                let d = e.undo_depth();
+                // new depth, or a typing run joined at this one; then the
+                // oldest the limits forgot (depth 0 is then the oldest text
+                // undo reaches).
                 if e.text() != before {
-                    at_depth.truncate(d);
-                    at_depth.push((String::from(e.text()), e.cursor()));
+                    let gone = e.forgotten - forgotten_before;
+                    at_depth.truncate(depth_before + 1);
+                    if e.undo_depth() + gone == depth_before + 1 {
+                        at_depth.push((String::from(e.text()), e.cursor()));
+                    } else {
+                        *at_depth.last_mut().expect("a depth") = (String::from(e.text()), e.cursor());
+                    }
+                    at_depth.drain(..gone);
+                    assert_eq!(at_depth.len(), e.undo_depth() + 1, "seed {seed} step {step}");
                 }
                 if matches!(change, Change::Refused) {
                     assert_eq!(e.text(), before, "a refused edit changes nothing");
