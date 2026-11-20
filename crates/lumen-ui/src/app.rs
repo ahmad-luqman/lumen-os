@@ -7,7 +7,11 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use lumen_gfx::{Rect, Surface};
+use lumen_gfx::{Damage, Rect, Surface};
+
+/// The most rectangles one [`repaint`] paints and commits apart (more are
+/// merged into their bounding box).
+pub const REPAINT_RECTS: usize = 16;
 
 use crate::node::{Action, AutomationNode, InvokeError};
 use crate::text::Text;
@@ -140,10 +144,16 @@ pub fn repaint(
     let rects = match app.ui_mut().take_damage() {
         // A full paint covers the app's rectangles too.
         Repaint::All => alloc::vec![bounds],
-        Repaint::Nothing => drawn,
-        Repaint::Rects(mut rects) => {
-            rects.extend(drawn);
-            rects
+        // The tree's and the app's rectangles merged where that covers no
+        // more pixels (a commit pays by the pixel, so an overlap isn't
+        // painted or paid twice), a bounding box past REPAINT_RECTS.
+        damage => {
+            let mut merged = Damage::<REPAINT_RECTS>::new();
+            if let Repaint::Rects(tree) = damage {
+                tree.into_iter().for_each(|r| merged.add(r));
+            }
+            drawn.into_iter().for_each(|r| merged.add(r));
+            merged.rects().to_vec()
         }
     };
     if rects.is_empty() {

@@ -677,7 +677,7 @@ fn the_tree_s_damage_and_the_app_s_are_committed_together() {
     app.drawn = alloc::vec![app.square];
     let both = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
     assert!(both.changed, "the tree changed: publish");
-    assert_eq!(both.rects.last(), Some(&app.square));
+    assert!(both.rects.contains(&app.square), "{:?}", both.rects);
     assert!(both.rects.len() > 1 && both.rects.iter().all(|r| *r != s.bounds()), "{:?}", both.rects);
     assert_eq!(app.calls.last(), Some(&both.rects), "the frame over all of it");
 }
@@ -703,4 +703,36 @@ fn over_touches_says_whether_a_rect_meets_the_repainted_ones() {
     assert!(over.touches(Rect::new(9, 9, 5, 5)));
     assert!(!over.touches(Rect::new(4, 4, 2, 2)));
     assert!(!over.touches(Rect::EMPTY));
+}
+
+#[test]
+fn overlapping_rects_are_painted_and_committed_once() {
+    // The square (20 pixels) moved by half its width: its old and new
+    // places overlap, committed as their union (600 pixels), not both (800).
+    let mut app = Board::new();
+    let mut s = Board::surface();
+    repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    let old = app.square;
+    app.square = Rect::new(old.x() + 10, old.y(), 20, 20);
+    app.drawn = alloc::vec![old, app.square];
+    let done = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    assert_eq!(done.rects, alloc::vec![Rect::new(old.x(), old.y(), 30, 20)]);
+    let area: u64 = done.rects.iter().map(|r| r.area()).sum();
+    assert_eq!(area, 600);
+    // A rect inside another adds nothing.
+    app.drawn = alloc::vec![Rect::new(450, 50, 40, 40), Rect::new(460, 60, 5, 5)];
+    assert_eq!(repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA).rects, alloc::vec![Rect::new(450, 50, 40, 40)]);
+}
+
+#[test]
+fn past_repaint_rects_they_merge_into_one_box() {
+    let mut app = Board::new();
+    let mut s = Board::surface();
+    repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    app.drawn = (0..=crate::app::REPAINT_RECTS as i32).map(|i| Rect::new(420 + 10 * i, 10 * (i % 2), 2, 2)).collect();
+    let done = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    assert!(done.rects.len() <= crate::app::REPAINT_RECTS, "{:?}", done.rects);
+    for r in &app.calls.last().expect("painted")[..] {
+        assert!(done.rects.contains(r));
+    }
 }
