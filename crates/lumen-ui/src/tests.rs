@@ -837,3 +837,46 @@ fn a_tree_rect_and_an_app_rect_overlapping_are_committed_once() {
         assert!(inside, "{r:?} not covered by {:?}", done.rects);
     }
 }
+
+#[test]
+fn set_selected_changes_a_list_s_selection_and_keeps_the_focus() {
+    let mut ui = Ui::new();
+    let list = ui.list(None, "L", &["a", "b", "c"]);
+    let ok = ui.button(None, "OK");
+    ui.layout(AREA, &mut FixedText);
+    assert_eq!(ui.invoke(ui.id(ok).expect("not removed").get(), &Action::Focus), Ok(alloc::vec![UiEvent::Focused(ok)]));
+    let _ = ui.take_changed();
+    let _ = ui.take_damage();
+    ui.set_selected(list, Some(2));
+    assert_eq!(ui.selected(list), Some(2));
+    assert_eq!(ui.focused(), Some(ok), "the focus stays on OK");
+    assert!(ui.take_changed());
+    // Repainted: one rect, around the list (its focus ring's margin too).
+    let list_box = ui.bounds(list);
+    assert!(
+        matches!(ui.take_damage(), crate::ui::Repaint::Rects(r) if r.len() == 1 && r[0].intersect(&list_box) == Some(list_box))
+    );
+    // The same selection again changes nothing.
+    ui.set_selected(list, Some(2));
+    assert!(!ui.take_changed());
+    // None clears it.
+    ui.set_selected(list, None);
+    assert_eq!(ui.selected(list), None);
+    assert!(ui.take_changed());
+}
+
+#[test]
+fn set_selected_ignores_an_index_past_the_items_and_other_widgets() {
+    let mut ui = Ui::new();
+    let list = ui.list(None, "L", &["a", "b"]);
+    let ok = ui.button(None, "OK");
+    ui.layout(AREA, &mut FixedText);
+    ui.set_selected(list, Some(1));
+    let _ = ui.take_changed();
+    ui.set_selected(list, Some(2));
+    assert_eq!(ui.selected(list), Some(1));
+    assert!(!ui.take_changed());
+    ui.set_selected(ok, Some(0));
+    assert_eq!(ui.selected(ok), None);
+    assert!(!ui.take_changed());
+}
