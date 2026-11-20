@@ -12,54 +12,79 @@ and a component (`area:mm`, `area:arch`, ...). One issue is one branch is one PR
 
 ## How this roadmap is ordered
 
-From M2 on, the goal is a system you can **play with** as early as
-possible, built quickly. That changes three things compared with the
-original plan:
+M2–M5 prioritized a system you can **play with** early by running the shell,
+desktop, and sandboxed WASM apps (`wasmi`) in ring 0 on kernel threads.
 
-- **Crates before hand-written code.** If a maintained `no_std` crate does
-  the job, use it: drivers (`virtio-drivers`), networking (`smoltcp`), TLS
-  (`rustls`), WASM (`wasmi`), fonts, images, terminal parsing. We still
-  write what is Lumen's own (the kernel core, capabilities, snapshots, the
-  automation tree) and the glue. The M1 code stays; nothing is rewritten
-  just to swap in a crate.
-- **Playable features run in the kernel first.** The shell, the desktop,
-  WASM apps and networking run in ring 0 on kernel threads. WASM gives apps
-  their sandbox (an app can only call what the kernel hands it), so ring 3,
-  syscalls and ELF programs move to M9. LumenFS moves to M10, after a
-  RAM-backed filesystem with snapshots and persistence (M6). Principles 2
-  and 3 in [ARCHITECTURE.md](ARCHITECTURE.md) still hold. Capabilities are
-  enforced at the WASM host interface until M9. Undo comes from RAMFS
-  snapshots until M10.
+From **M6 onward**, the goal shifts to the **shortest path to a full
+general-purpose developer OS** capable of running unmodified compilers,
+runtimes, and major software—**C/C++ (`gcc`/`g++`/`clang`), Rust
+(`rustc`/`cargo`), Go, Python (`python3`), Node.js (V8/`libuv`), Ruby, Git,
+SQLite, OpenSSL, and standard packages**—without writing or maintaining custom
+forks of `libc`, `ld.so`, LLVM, V8, Go, Rust, Python, or Ruby. That drives four
+decisions:
+
+- **Linux x86-64 syscall ABI + Alpine Linux (`musl`) rootfs.** Rather than
+  building a custom ring-3 ABI (`lumen-rt`), a custom `libc`, and custom ports,
+  M6–M10 implement the Linux x86-64 ABI and boot an unmodified Alpine Linux
+  `x86_64` `ext4` rootfs. `musl` uses far fewer syscalls than `glibc` (~120–160
+  vs. ~250+), bundles its dynamic linker and C library into one binary
+  (`/lib/ld-musl-x86_64.so.1`), and ships official `apk` packages for all six
+  target language ecosystems.
+- **Crates and permissive Rust OS architectures before hand-written code.**
+  Reuse maintained `no_std` crates (`virtio-drivers`, `linux-raw-sys`,
+  `xmas-elf`/`goblin`, writable `ext4`, `smoltcp`) and adapt designs/components
+  from permissive Rust Linux-ABI OSes (keeping MIT license compatibility; see
+  below). M0–M5 code stays; we build directly on it.
+- **Lumen's superpowers wrap Linux processes instead of competing with them.**
+  In-kernel HTTP/TLS, custom RAMFS persistence, and custom LumenFS are deferred
+  or dropped in favor of real `ext4` + userspace TLS/Claude. Once the six
+  runtimes pass CI (M10), M11 wires Lumen's desktop terminals to real PTYs,
+  wraps Linux processes in capability-scoped VFS/network namespaces (Principle
+  2) with OverlayFS/CoW snapshots for agent undo (Principle 3), extends X-ray
+  to live Linux syscalls/faults/futexes (Principle 4), and runs Claude natively
+  in userspace.
 - **The rules don't change.** Stable Rust only. Every dependency is pinned
-  with `=`, and each new one goes in its own PR. `make audit` must still
-  pass with the crate linked in. A feature counts as done only when its
-  test passes in CI.
+  with `=`, and each new one goes in its own PR. `make audit` must still pass
+  (M6 adds one tightly-scoped allowlist in `audit.py` solely for the user-thread
+  `XSAVE`/`XRSTOR` save/restore stub; the rest of the kernel stays SSE-free). A
+  feature counts as done only when its automated test passes in CI—starting in
+  M6, including upstream Linux conformance suites (`musl` `libc-test`, gVisor
+  syscall tests, and targeted LTP cases) run in Lumen's QEMU harness.
+
+### Reference Rust OSes and license policy (Lumen is MIT)
+
+| Project | License | How to use |
+|---|---|---|
+| **Starry / ArceOS** | Apache-2.0 (permissive) | Reuse/adapt modular `no_std` Linux-ABI crates and designs (`axfs_vfs`, `starry-signal`, `starry-vm`, `starry-process`, `axnet`) |
+| **Maestro OS** | MIT | Direct reference/adaptation for compact x86-64 Linux syscalls, `musl`, dynamic ELF, signals, and PTY/`termios` |
+| **Fuchsia Starnix** | BSD-3-Clause (permissive) | Gold-standard reference for Linux ABI edge cases (`epoll`, `futex`, `SIGSEGV`/`ucontext`, `AF_UNIX`, `procfs`, `mmap`) |
+| **Asterinas** | MPL-2.0 (file-level weak copyleft) | Reference for VFS/VM/epoll/futex architecture; individual crates (e.g. `aster-bigtcp`) may be linked as separate MPL-2.0 crates if needed |
+| *Aero OS* | *GPL-3.0* | *Study concepts only — do not copy code into MIT Lumen* |
 
 ### Candidate crates
 
-Each of these compiles as a dependency for `x86_64-unknown-none` on the
-pinned toolchain (checked 2026-11-13). None is linked into the kernel or
-tested in Lumen yet. The PR that adopts one proves it.
+The original rows below were checked to compile for `x86_64-unknown-none` on
+the pinned toolchain on 2026-11-13; rows marked **(to verify)** are candidates
+for the M6–M10 Linux-ABI track not yet tested on this target. The PR that
+adopts any crate proves it builds and passes `make audit`.
 
 | Area | Crates | Notes |
 |---|---|---|
-| Input, terminal, shell | `pc-keyboard`, `vte`, `noline`, `shlex`, `unicode-width`, `rhai` | `vt100` needs `std` |
-| Devices | `virtio-drivers` (blk, net, gpu, input, console, rng, sound, 9p transport over PCI) | `pci_types` is only needed for non-virtio devices (M12) |
-| Graphics | `tiny-skia` (`no-std-float`), `embedded-graphics`, `fontdue`, `zune-png` | Floating-point math runs as soft-float in the kernel: cache glyphs |
-| Apps | `wasmi` | `wasmtime` is too big |
-| Data | `serde`, `serde_json`, `postcard`, `hashbrown` | |
-| Files | `ext4-view` (read-only) | `fatfs` 0.3 needs nightly; no writable FS crate builds on stable |
-| Network | `smoltcp`, `httparse`, `rustls` + `rustls-rustcrypto` (pre-release) or `embedded-tls` | Crypto needs software backends (below) |
-| Crypto | `sha2`, `chacha20poly1305`, `argon2` | |
+| Input, terminal, shell | `pc-keyboard`, `vte`, `shlex`, `unicode-width`, `rhai` | Linked in M2 |
+| Devices | `virtio-drivers` (blk, net, gpu, input, console, rng, sound) | Linked in M3 (`pci_types` only if needed for M12) |
+| Graphics | `tiny-skia` (`no-std-float`), `embedded-graphics`, `fontdue`, `zune-png` | `fontdue` and `zune-png` linked in M4 |
+| Apps & data | `wasmi`, `serde`, `serde_json`, `postcard`, `hashbrown` | `wasmi`, `serde`, `postcard` linked in M5 |
+| Linux ABI & ELF | `linux-raw-sys` or `syscalls`, `xmas-elf` or `goblin` **(to verify)** | Exact x86-64 Linux syscall numbers/structs and ELF64/`PT_INTERP` parsing |
+| Filesystems | `ext4plus` (writable fork of `ext4-view`), `rust-fs-ext4`, or `lwext4` C FFI **(to verify)**; `ext4-view` (read-only, verified) | Need writable `ext4` for Alpine rootfs in M7; pick the cleanest stable `no_std` option in its own PR |
+| Network | `smoltcp` (verified), optionally `aster-bigtcp` (MPL-2.0) **(to verify)** | BSD sockets + loopback + IPv6 in M9; TLS moves to userspace OpenSSL/rustls |
+| Memory alloc | `buddy_system_allocator` or `talc` **(to verify)** | Optional upgrade if heavy `fork`/`mmap` workloads stress the M1 allocator |
+| Conformance suites | gVisor syscall tests, `musl` `libc-test`, LTP (host-built Linux binaries on test disk) | Driven from `tests/scenarios/` starting in M6 |
 
-The kernel has no SSE, and the RustCrypto SIMD backends make LLVM crash
-on this target. They build with software backends:
-`--cfg poly1305_backend="soft" --cfg chacha20_backend="soft"
---cfg sha2_backend="soft"`, plus `--cfg curve25519_dalek_backend="serial"`
-and `--cfg getrandom_backend="custom"` for `rustls-rustcrypto`. Older
-crates such as `aes` and `polyval` use `--cfg aes_force_soft` /
-`polyval_force_soft` instead. Unusable on stable: `acpi` 5/6 and `aml`
-(no AML interpreter, see M12), `ps2-mouse`, `fatfs` 0.3.
+Note on kernel SIMD/soft-float: the kernel itself stays SSE/AVX-free so
+interrupts don't clobber user vector state. In M6, user-mode context switches
+introduce a single audited `XSAVE`/`XRSTOR` (or `FXSAVE`/`FXRSTOR`) stub to
+preserve user SSE/AVX state across threads and signals. Unusable on stable:
+`acpi` 5/6 and `aml`, `ps2-mouse`, `fatfs` 0.3.
 
 ---
 
@@ -179,79 +204,100 @@ Not yet tested, from #203 (the text editor): the app's status line saying `, ful
 
 Not yet tested, from #208 (X-ray): a read error other than `BadArgument`, and a `BadArgument` the retry from 0 takes (a kernel refusing the last `next`), ending the app (no seam makes `trace_read` fail so); a CPU going offline mid-run in QEMU (CPUs don't; the offline path is host-tested and in the frozen view); a ring filling faster than a refresh reads (the kernel counting the rest missed; the accounting is host-tested); that a backlog longer than one read is read whole in its first refresh (with one read a ring a refresh, the rest would count as activity; no scenario bounds `switches`); the odd-event WARN (no kernel writes an odd event; the counting is host-tested); `trace runq spin`'s rollback when a spawn fails (no seam makes `spawn_on` fail there); the lanes' interrupt, lock and switch marks in QEMU (a bar's height is checked; the marks are in the frozen view's golden); that a refresh's damage is only two columns' strips (no seam measures one app's damage: damaging every lane each refresh would look the same).
 
-## M6: Files
+## M6: User mode, CPU state and static Linux ELF
+
+First unmodified Linux `x86_64` static `musl` binaries running in ring 3,
+including `busybox ash`. Design updates go into ARCHITECTURE sections 5, 6 and
+8 before coding.
 
 | Feature | Exit criteria (tests) |
 |---|---|
-| virtio-blk behind `BlockDevice`, block cache | `scenario:test_blk::test_read_write_sectors`, `cargo:lumen-bcache` (eviction, write-back ordering) |
-| VFS with `Dir` capabilities and RAMFS; `ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `edit` | `scenario:test_fs::test_ramfs_ops`, `scenario:test_fs::test_mv_across_directories` (v1 regression) |
-| Snapshots and undo in RAMFS: `snap`, `snaps`, `undo` | `scenario:test_fs::test_snapshot_restore_exact` |
-| Persistence: the RAMFS image (with its snapshots) is saved to virtio-blk (`postcard`) and loaded at boot | `scenario:test_fs::test_persists_across_reboot` (write, sync, kill QEMU, boot again on the same image, verify) |
-| Host folder over virtio-9p: edit on the Mac, run in Lumen. QEMU accepts a macOS host folder (checked 2026-11-13); the 9P2000.L client is ours | `scenario:test_9p::test_reads_host_file`, `scenario:test_9p::test_writes_host_file` |
-| Read-only ext4 disks (`ext4-view`) for apps, fonts and pictures | `scenario:test_fs::test_ext4_image_readable` |
-| Apps and scripts load from disk; the editor (#203) opens and saves files | `scenario:test_apps::test_run_wasm_from_disk`, `scenario:test_apps::test_editor_opens_and_saves` |
+| Ring 3 transition: user GDT segments, `TSS.rsp0`, `SWAPGS` on every ring 3↔0 entry/exit (syscall, IRQ, exception), `IA32_STAR`/`LSTAR`/`FMASK`, `syscall`/`sysret` | `scenario:test_linux_user::test_ring3_entry_and_exit`, `scenario:test_linux_user::test_user_fault_kills_process_not_kernel` (a user `#PF`/`#UD`/`#GP` terminates only the process, never panics the kernel) |
+| User CPU state: `XSAVE`/`XRSTOR` (or `FXSAVE`/`FXRSTOR`) per-thread FP/SSE/AVX state save/restore (with one narrowly scoped allowlist in `audit.py` for the save/restore stub) and per-thread `IA32_FS_BASE` (`arch_prctl(ARCH_SET_FS)`) | `audit:flags` (still forbids SIMD everywhere outside the explicit save/restore stub), `scenario:test_linux_user::test_sse_and_tls_preserved_across_preemption` (two threads clobbering XMM regs and TLS concurrently) |
+| Fault-safe user memory access (`copy_from_user`/`copy_to_user` with exception fixup table, SMAP/SMEP) | `ktest:lumen_kernel::user::bad_user_pointer_returns_efault`, `scenario:test_linux_user::test_syscall_bad_pointers_return_efault` |
+| Per-process address spaces and demand-paged anonymous VM: per-process CR3, VMA interval tree (`lumen-vm`), lazy zero-fill `#PF`, `brk`, anonymous `mmap`/`munmap`/`mprotect` | `cargo:lumen-vm` (splitting, merging, overlap refusal, bounds), `ktest:lumen_kernel::mm::user_vm::lazy_zero_fill_and_unmap`, `scenario:test_linux_user::test_mmap_and_brk` |
+| Static ELF64 loader (`xmas-elf` or `goblin`): `PT_LOAD` segments with W^X, initial stack with `argc`, `argv`, `envp` and `auxv` (`AT_PAGESZ`, `AT_PHDR`, `AT_RANDOM`, etc.) | `cargo:lumen-elf` (program headers and `auxv` layout), `scenario:test_linux_user::test_bad_elf_rejected` |
+| Initial Linux x86-64 syscall table (~25 syscalls, types from `linux-raw-sys`/`syscalls`): `read`, `write`, `writev`, `close`, `exit`, `exit_group`, `brk`, `mmap`, `munmap`, `mprotect`, `arch_prctl`, `set_tid_address`, `clock_gettime`, `getrandom`, `uname`, `getpid`/`getuid`/`getgid`, minimal TTY `ioctl` (`TIOCGWINSZ`/`TCGETS`) | `scenario:test_linux_user::test_static_musl_hello`, `scenario:test_linux_user::test_static_busybox_ash` (unmodified static `musl` `busybox ash` runs commands and pipes/redirects over serial) |
 
-## M7: Networking
+## M7: Writable ext4, POSIX VFS and dynamic linking
 
-| Feature | Exit criteria (tests) |
-|---|---|
-| virtio-net with `smoltcp`: Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP, DNS; `ifconfig`, `ping`, `host` | `scenario:test_net::test_dhcp_lease` (QEMU user net), `scenario:test_net::test_ping_gateway`, `scenario:test_net::test_dns_resolves`, `scenario:test_net::test_tcp_echo` (to a host echo server) |
-| HTTP client (`httparse`): `get <url>` | `scenario:test_net::test_http_get_local` |
-| A web page served by Lumen: live CPUs, heap, threads and trace, opened from the host's browser (port forwarding) | `scenario:test_net::test_status_page_from_host` |
-| Remote shell: `nc localhost 2323` on the host opens a Lumen shell | `scenario:test_net::test_remote_shell` |
-| TLS 1.3 with `rustls` + `rustls-rustcrypto` (or `embedded-tls`); decision recorded in ARCHITECTURE before starting | `scenario:test_net::test_tls_handshake_local` (to a local test server with a test CA), `scenario:test_net::test_bad_certificate_rejected` |
-
-## M8: Claude
-
-Load the `claude-api` skill before writing the client, and use current model IDs.
+Boot an unmodified **Alpine Linux `x86_64` (`musl`) `ext4` rootfs** and execute
+dynamically linked binaries via `/lib/ld-musl-x86_64.so.1`.
 
 | Feature | Exit criteria (tests) |
 |---|---|
-| Keychain service | `scenario:test_keychain::test_key_never_logged` (grep every log for the test key) |
-| API client (streaming, `serde_json`) | `scenario:test_claude::test_against_mock_server` (local mock of the Messages API) |
-| `ask` in the shell, and an Ask bar on the desktop | `scenario:test_claude::test_shell_ask_streams_answer` (mock model) |
-| Agent: runs shell commands and app actions through capabilities, with a snapshot per step, per-step undo and undo-all | `scenario:test_agent::test_undo_all_restores_snapshot` (mock model) |
-| Capability prompts and audit log | `cargo:lumen-audit` (hash chain verification, tamper detection), `scenario:test_agent::test_denied_capability_blocks_action` |
+| `virtio-blk` behind `BlockDevice` + unified block/page cache | `cargo:lumen-bcache` (eviction, dirty writeback, ordering), `scenario:test_blk::test_read_write_sectors` |
+| Writable `ext4` driver (`ext4plus`, `rust-fs-ext4`, or `lwext4` FFI; crate chosen and verified in its own PR) | `scenario:test_fs::test_ext4_read_write_persists_across_reboot` (write, sync, kill QEMU, reboot on the same disk image, verify) |
+| POSIX VFS + mount table (design adapted from `Starry`/`axfs_vfs`): dentry/inode caches, symlinks (`symlink`/`readlink`/`lstat` with `ELOOP`), hard links and unlink-while-open, `stat`/`fstat`/`newfstatat`/`statx`, `openat`, `getdents64`, atomic `renameat2`, `truncate`/`ftruncate`, `chmod`/`chown`/`umask`, `chdir`/`getcwd`, `fcntl`, advisory file locks (`flock` and `F_SETLK`) | `cargo:lumen-vfs` (path resolution, symlink loops, mount crossings, open-unlinked inodes), `scenario:test_fs::test_posix_vfs_semantics`, `scenario:test_fs::test_flock_and_atomic_rename` |
+| Virtual filesystems: `/tmp` (`tmpfs`), `/dev` (`null`, `zero`, `urandom`, `random`, `tty`), `/proc` (`self/exe`, `self/fd`, `self/maps`, `cpuinfo`, `meminfo`) | `scenario:test_fs::test_dev_tmp_proc_filesystems` |
+| Dynamic ELF loader (`PT_INTERP` → `/lib/ld-musl-x86_64.so.1`, `AT_BASE`/`AT_ENTRY`) and file-backed `mmap` (`MAP_PRIVATE` CoW and `MAP_SHARED`) | `scenario:test_linux_user::test_dynamic_musl_binary_and_dlopen` (loads a shared `.so` via `dlopen`/`dlsym`), `scenario:test_alpine::test_alpine_minirootfs_coreutils` (unmodified Alpine `busybox` `ls`, `cp`, `mv`, `grep`, `sed`, `awk`, `tar`, `ash` scripts) |
 
-## M9: User mode and isolation
+## M8: Processes, threads, signals, `futex` and PTYs
 
-Native programs in ring 3, for when WASM isn't enough and drivers or
-services move out of the kernel.
+Full POSIX process/thread lifecycle, signals, synchronization, and interactive
+terminals—unlocking self-hosting **C/C++ (`gcc`/`g++` + `make`), `git`,
+`sqlite3`, and `vim`**.
 
 | Feature | Exit criteria (tests) |
 |---|---|
-| User mode (ring 3), `syscall`/`sysret`, per-process address spaces | `scenario:test_user::test_hello_user` (a user program prints through `debug_log`), `scenario:test_user::test_user_fault_kills_process_not_kernel` |
-| Syscall ABI and capability tables from ARCHITECTURE section 8 | `ktest:cap::derive_only_narrows`, `scenario:test_cap::test_open_without_dir_cap_fails`, `cargo:lumen-abi` (ABI structs, error codes) |
-| ELF loader (`goblin` or `xmas-elf`) | `cargo:lumen-elf` (program headers), `scenario:test_user::test_bad_elf_rejected` |
-| IPC channels with handle passing | `scenario:test_ipc::test_ping_pong`, `scenario:test_ipc::test_handle_transfer_moves` |
-| User runtime (`lumen-rt`), and the shell as a user process | `scenario:test_user::test_rt_alloc_and_print`, every `test_shell` scenario passes with the shell in ring 3 |
+| Physical frame reference counting and CoW page-fault splitting; `fork`, `vfork`, `clone` (`CLONE_VM`, `CLONE_THREAD`, `CLONE_FILES`, `CLONE_SETTLS`, `CLONE_CHILD_CLEARTID`, `CLONE_PARENT_SETTID`), `execve` (with `#!` shebang parsing), `wait4`/`waitpid` | `ktest:lumen_kernel::mm::frame::refcount_and_cow_split`, `scenario:test_linux_proc::test_fork_cow_and_exec_shebang`, `scenario:test_linux_proc::test_pthread_create_and_join` |
+| SMP load-balancing scheduler: lift single-CPU thread pinning in `sched.rs`, add cross-CPU work-stealing/migration, priorities, `sched_yield`, `sched_getaffinity`/`setaffinity` | `ktest:lumen_kernel::sched::threads_migrate_to_idle_cpus`, `scenario:test_smp::test_multithreaded_workload_uses_all_cpus` |
+| Userspace synchronization: `futex` (`WAIT`, `WAKE`, `WAIT_BITSET`, `REQUEUE`, relative/absolute timeouts) | `cargo:lumen-futex` (queue ordering, requeue, spurious wakes), `scenario:test_linux_proc::test_futex_and_pthread_mutex_stress` |
+| POSIX signals: `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`/`tgkill`, `EINTR`/`SA_RESTART`, user signal frames preserving GPRs + XSAVE state | `scenario:test_linux_proc::test_signals_and_sigaltstack`, `scenario:test_linux_proc::test_sigchld_and_sigint_interrupt_wait` |
+| Pipes, FD semantics and PTYs: `pipe2`, `dup`/`dup2`/`dup3`, `O_CLOEXEC`, `pread64`/`pwrite64`, `poll`/`ppoll`/`select`, `/dev/ptmx` + `/dev/pts/*`, `termios` (canonical/raw mode, echo, Ctrl-C→`SIGINT`), `SIGWINCH`, sessions & process groups (`setsid`, `setpgid`, `tcsetpgrp`) | `scenario:test_linux_io::test_pipes_and_poll`, `scenario:test_linux_io::test_pty_termios_and_job_control` |
+| M8 real-software & conformance exit gate | `scenario:test_alpine::test_gcc_gpp_compile_cpp20_and_shared_lib` (unmodified Alpine `gcc`/`g++` + `make` building C++20 with exceptions and a `.so`), `scenario:test_alpine::test_git_and_sqlite3`, `scenario:test_conformance::test_musl_libc_test_core` |
 
-## M10: LumenFS
+## M9: Async I/O (`epoll`) and full BSD networking
 
-| Feature | Exit criteria |
+Real TCP/IP + Unix domain sockets and `epoll`—unlocking **`apk`, `curl`,
+`python3`, and `ruby`**.
+
+| Feature | Exit criteria (tests) |
 |---|---|
-| LumenFS on disk: copy-on-write, journaled, snapshots (ARCHITECTURE section 9); replaces the RAMFS image as the main disk format | `cargo:lumen-fs` (crash consistency: inject a crash at every write, then remount and check invariants), `scenario:test_fs::test_snapshot_restore_exact` and `scenario:test_fs::test_persists_across_reboot` on LumenFS |
+| `virtio-net` + `smoltcp` (or `aster-bigtcp`): Ethernet, ARP, IPv4 + **IPv6**, **loopback (`127.0.0.1`/`::1`)**, ICMP, UDP, TCP, DHCP, DNS (`/etc/resolv.conf`, `/etc/hosts`) | `scenario:test_net::test_dhcp_dns_and_loopback`, `scenario:test_net::test_ipv4_and_ipv6_tcp_echo` |
+| Full BSD socket syscalls: `socket`, `bind`, `listen`, `accept4`, `connect`, `sendto`/`recvfrom`, `sendmsg`/`recvmsg`, `shutdown`, `getsockname`/`getpeername`, `setsockopt`/`getsockopt` (`SO_REUSEADDR`, `SO_REUSEPORT`, `TCP_NODELAY`, `SO_KEEPALIVE`, `SO_ERROR`, `O_NONBLOCK`) | `scenario:test_net::test_bsd_socket_options_and_nonblocking`, `scenario:test_conformance::test_gvisor_socket_suite` |
+| Unix domain sockets (`AF_UNIX`: `SOCK_STREAM`, `SOCK_DGRAM`, `socketpair`, `SCM_RIGHTS` FD passing) | `scenario:test_net::test_af_unix_and_scm_rights` |
+| Event multiplexing: `epoll_create1`, `epoll_ctl`, `epoll_wait`/`epoll_pwait` (level and edge-triggered `EPOLLET`), `eventfd2`, `timerfd_create`/`settime` | `scenario:test_linux_io::test_epoll_edge_and_level_triggered`, `scenario:test_linux_io::test_eventfd_and_timerfd` |
+| M9 real-software exit gate | `scenario:test_alpine::test_apk_and_curl_https` (DNS + TCP + userspace TLS with CA bundle over QEMU user-net), `scenario:test_alpine::test_python3_asyncio_sqlite_and_c_ext`, `scenario:test_alpine::test_ruby_http_fibers_and_native_gem` |
 
-## M11: Product
+## M10: JIT VM, advanced signals and Tier-1 runtimes
 
-Login screen and user accounts (`argon2` password hashes), installer (writes
-the system to a disk), settings. Exit:
-`scenario:test_install::test_install_then_boot_from_disk`,
-`scenario:test_login::test_wrong_password_rejected`, golden screens per
-theme.
+Production virtual memory, cross-CPU TLB shootdowns, and signal/syscall corner
+cases required by **`go`, `rustc`/`cargo`, and `node` (V8 + `libuv`)**.
 
-## M12: Real hardware
+| Feature | Exit criteria (tests) |
+|---|---|
+| JIT-ready VM and TLB shootdowns: sub-VMA splitting in `mprotect` (RW ↔ RX), cross-CPU TLB shootdown IPIs, `mremap`, `madvise` (`MADV_DONTNEED` zeroes/unmaps pages, `MADV_FREE`), `memfd_create`, huge sparse virtual reservations (4+ GiB VA cages for V8 pointer compression and Go heap arenas) | `ktest:lumen_kernel::mm::tlb_shootdown_across_cpus`, `scenario:test_linux_vm::test_jit_mprotect_and_madvise_dontneed`, `scenario:test_linux_vm::test_sparse_4gb_va_reservation` |
+| Go & V8 signal/syscall edge cases: `SIGURG` async preemption with exact `ucontext_t` (`rip`, GPRs, `fpstate`), `SIGSEGV` delivery with `si_addr` (`CR2`) and register modification on `rt_sigreturn` (V8 WASM traps & Go nil-checks), `inotify` (`inotify_init1`/`add_watch`), `prlimit64`, `sysinfo`, clean `ENOSYS` fallback for `rseq`/`io_uring` | `scenario:test_linux_proc::test_sigsegv_ucontext_recovery`, `scenario:test_linux_io::test_inotify_watch`, `scenario:test_conformance::test_gvisor_mm_and_signal_suite` |
+| Memory pressure & allocator scaling: page-cache eviction/reclaim, scalable kernel allocator for 2–4+ GiB compiler/linker workloads | `scenario:test_linux_vm::test_page_cache_reclaim_under_memory_pressure` |
+| **M10 Tier-1 Runtime CI Matrix (all unmodified Alpine binaries in QEMU):** `gcc`/`clang++`, `python3`, `ruby` (+ YJIT), `go`, `rustc`/`cargo`, `node` (V8 + `libuv`) | `scenario:test_runtimes::test_go_build_goroutines_and_http`, `scenario:test_runtimes::test_rustc_cargo_with_proc_macro` (exercises `dlopen` + `flock` + LLVM linking), `scenario:test_runtimes::test_node_v8_jit_libuv_http_and_npm` |
 
-UEFI on a real x86-64 laptop, NVMe/AHCI, USB HID (xHCI), a common NIC, and
-a USB boot image. No AML interpreter builds on stable Rust, so devices use
-MSI/MSI-X (no `_PRT`) and shutdown uses the `\_S5` byte search from M2. The
-serial driver skips a missing UART. Exit: the same scenario suite on QEMU
-with the real-hardware drivers (`-device nvme`, `qemu-xhci`, `e1000e`),
-plus a manual hardware checklist recorded in the PR (the only manual step
-allowed).
+## M11: Lumen integration (desktop, capabilities, snapshots, X-ray, Claude)
+
+Re-attach Lumen's distinguishing architecture on top of the full Linux
+ecosystem.
+
+| Feature | Exit criteria (tests) |
+|---|---|
+| Desktop terminal windows backed by real PTYs: M4's `termwin` runs Alpine `ash`/`bash`, `vim`, `cargo`, `node` with `ui tree`/`ui invoke` automation | `scenario:test_gui::test_terminal_window_runs_linux_shell_over_pty` |
+| Capability-scoped Linux sandboxes (Principle 2): per-process VFS mount namespaces and network allowlists so agents/apps get scoped roots instead of ambient authority | `scenario:test_sandbox::test_scoped_mount_namespace_blocks_escape`, `scenario:test_sandbox::test_network_policy_blocks_disallowed_peer` |
+| Snapshots & instant agent undo (Principle 3): OverlayFS or block-level CoW snapshots over `ext4` (or LumenFS) with `snap`/`undo` | `scenario:test_fs::test_snapshot_restore_exact_on_rootfs` |
+| X-ray for Linux workloads (Principle 4): extend `lumen-xray` to trace Linux syscalls, `#PF`/CoW faults, `futex` waits, and cross-CPU migrations live | `scenario:test_xray::test_xray_traces_linux_syscalls_and_faults` |
+| Claude in userspace: native Claude CLI/SDK/agent running inside a capability-scoped sandbox with real userspace TLS, per-step snapshot/undo, capability prompts, and hash-chained audit log | `cargo:lumen-audit`, `scenario:test_agent::test_userspace_agent_undo_and_capability_denial` (against local mock Messages API) |
+
+## M12: GUI ecosystem and real hardware
+
+- **Wayland compositor bridge (optional GUI ecosystem):** expose a Wayland
+  socket (`wl_shm` first, then `virtio-gpu` 3D / Mesa) from Lumen's M4
+  compositor so unmodified Linux GUI apps (SDL/GTK/Qt/browsers) render in
+  Lumen windows. Exit: `scenario:test_wayland::test_weston_simple_shm_renders`.
+- **Real hardware & product polish:** UEFI on a real x86-64 laptop, NVMe/AHCI,
+  USB HID (xHCI), `e1000e` NIC, installer & login (`argon2`), and `uACPI` (if
+  needed on target laptops). Exit: the scenario suite on QEMU with
+  `-device nvme`, `qemu-xhci`, `e1000e`, plus a manual hardware checklist in
+  the PR.
 
 ## M13: ARM64 port
 
-QEMU `virt` (and UTM), built on the HAL. `virtio-drivers` also speaks the
-MMIO transport that `virt` uses. Exit: the entire scenario suite runs on
-both architectures in CI.
+QEMU `virt` (and UTM) running the Alpine `aarch64` rootfs and the same runtime
+matrix on both x86-64 and ARM64 in CI.
