@@ -1186,6 +1186,80 @@ fn call_measured(
     Ok((result, heap::peak() - before))
 }
 
+/// A tree of 1,024 labels with ids from `first`, each name and text of
+/// ESC characters (the kernel shows each as U+FFFD: 3 bytes), as long as
+/// `TREE_BYTES` allows: the costliest tree to publish.
+fn esc_labels(first: u64) -> Result<Vec<u8>, &'static str> {
+    use lumen_app_api::limits::TREE_NODES;
+    use lumen_app_api::tree::{Common, Node, Text, Tree};
+    let esc = |n: usize| Text::cut(&"\u{1b}".repeat(n));
+    let label = |id| Node::Label {
+        common: Common { id, name: esc(25), bounds: LRect::new(0, 0, 1, 1), disabled: false, hidden: false },
+        text: esc(24),
+    };
+    let nodes = (first..first + TREE_NODES as u64).map(label).collect();
+    Tree::new(nodes).map_err(|_| "a tree")?.encode().map_err(|_| "encoded")
+}
+
+crate::ktest!(
+    fn a_disjoint_republish_pays_for_both_trees() {
+        // Publishing a tree of 1,024 ESC labels in place of another with
+        // none of its ids (the old one held until the new is swapped in, then
+        // freed): BYTE_FUEL per byte and NODE_FUEL per node of both trees,
+        // the old one's freed too (floors only). The diag lines give the
+        // time per fuel unit of these publishes and of a plain wasm loop in
+        // the same run: what NODE_FUEL is priced from (limits.rs).
+        use lumen_app_api::limits::{BYTE_FUEL, NODE_FUEL, TREE_NODES};
+        let a = esc_labels(1)?;
+        let b = esc_labels(5001)?;
+        let (mut store, main, _) = with_window(0, false)?;
+        let mut worst = 0u64;
+        for (i, tree) in [&a, &b, &a, &b, &a, &b, &a, &b].into_iter().enumerate() {
+            poke(&mut store, 256, tree);
+            poke(&mut store, 4, &(tree.len() as i32).to_le_bytes());
+            store.set_fuel(SLICE_FUEL).map_err(|_| "no fuel")?;
+            let debt = store.data().debt();
+            let start = crate::time::now_ns();
+            let result = main.call(&mut store, ()).map_err(|_| "lumen_main trapped")?;
+            let ns = crate::time::now_ns() - start;
+            // This call's: what it took from the slice, and the debt it
+            // added (a charge past the slice carries over).
+            let used = SLICE_FUEL - store.get_fuel().map_err(|_| "no fuel")? + store.data().debt() - debt;
+            crate::ktest::diag(format_args!("republish {i}: {result}, {} bytes, {used} fuel, {ns} ns", tree.len()));
+            crate::kassert_eq!(result, 0);
+            let freed = if i == 0 { 0 } else { TREE_NODES as u64 };
+            crate::kassert!(
+                used >= CALL_FUEL + BYTE_FUEL * tree.len() as u64 + NODE_FUEL * (TREE_NODES as u64 + freed)
+            );
+            if i > 0 {
+                worst = worst.max(ns * 1000 / used);
+            }
+        }
+        // The baseline: a plain wasm loop (i -= 1 while i) of about a slice.
+        let body = [
+            i32_const(200_000),
+            local_set(0),
+            vec![0x03, 0x40, 0x20, 0x00, 0x41, 0x01, 0x6b, 0x22, 0x00, 0x0d, 0x00, 0x0b],
+            i32_const(0),
+        ]
+        .concat();
+        let bytes = Spec { body, locals: vec![0x01, 0x01, 0x7f], ..Spec::default() }.bytes();
+        let (mut store, main) = load_as(&bytes, &test_state(), Grants::log())?;
+        store.set_fuel(10 * SLICE_FUEL).map_err(|_| "no fuel")?;
+        main.call(&mut store, ()).map_err(|_| "the loop trapped")?;
+        store.set_fuel(10 * SLICE_FUEL).map_err(|_| "no fuel")?;
+        let start = crate::time::now_ns();
+        main.call(&mut store, ()).map_err(|_| "the loop trapped")?;
+        let ns = crate::time::now_ns() - start;
+        let used = 10 * SLICE_FUEL - store.get_fuel().map_err(|_| "no fuel")?;
+        crate::ktest::diag(format_args!(
+            "a wasm loop: {used} fuel, {ns} ns ({} ps a fuel unit); the republishes' worst {worst} ps a unit",
+            ns * 1000 / used
+        ));
+        Ok(())
+    }
+);
+
 crate::ktest!(
     fn tree_and_answer_caps_are_checked_before_the_copy() {
         // window_publish and window_answer with 60,000 bytes (inside the

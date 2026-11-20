@@ -3165,7 +3165,8 @@ over a text (`text_measure` one, `text_draw` two: its advance and its
 drawing walk every character, whatever reaches the clip),
 `EVENT_FUEL` per trace event copied out, `BYTE_FUEL` per byte of a tree
 or an answer copied in (refused or not), and `NODE_FUEL` per node of a
-tree decoded, items counted, refused or not (#207: its strings copied,
+tree decoded, items counted, refused or not, and per node of the tree an
+accepted one replaces (freed) (#207: its strings copied,
 its id mapped, its row made; a refusal can come after every node was
 decoded and its ids sorted, or partway through a list's items, which
 counts the items its bytes could hold, `tree::MIN_ITEM_BYTES` each:
@@ -3547,7 +3548,7 @@ message, a trap's, `Failed`'s text and an unknown manifest grant (cut at
 | `CALL_FUEL`, `LOG_FUEL` | 1,000, 10,000 | fuel per call, per log line |
 | `BYTE_FUEL`, `PIXEL_FUEL`, `EVENT_FUEL` | 1, 1, 16 | fuel per byte, pixel, trace event |
 | `TEXT_CHAR_FUEL` | 256 | fuel per character of a text layout pass (`text_measure` one, `text_draw` two) |
-| `NODE_FUEL` | 512 | fuel per node of a published tree, items counted (#207) |
+| `NODE_FUEL` | 1,280 | fuel per node of a published tree, items counted, and of the tree it replaces (#207; priced from a disjoint republish, `limits.rs`) |
 | `UI_TEXT_PX` | 16 | an app toolkit's text size (the kernel windows') |
 | `WINDOWS` | 1 per app | `Limit` |
 | `COMMIT_RECTS` | 16 | `BadArgument` |

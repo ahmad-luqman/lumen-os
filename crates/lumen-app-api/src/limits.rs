@@ -84,10 +84,16 @@ pub const EVENT_FUEL: u64 = 16;
 /// character for a measure, ~430 for a draw's two passes).
 pub const TEXT_CHAR_FUEL: u64 = 256;
 /// Fuel per node (items counted) of a tree `window_publish` decodes, checks
-/// and maps to global ids, on top of `BYTE_FUEL` per byte copied in: about
-/// what building a node's automation row costs next to a wasm instruction
-/// (its strings copied, its id looked up and mapped, its row made).
-pub const NODE_FUEL: u64 = 512;
+/// and maps to global ids, and per node of the tree it replaces (freed), on
+/// top of `BYTE_FUEL` per byte copied in. Priced from the costliest
+/// publish, `app::tests::a_disjoint_republish_pays_for_both_trees`: 1,024
+/// labels of ESC names and texts (shown 3 times as long) in place of 1,024
+/// others with no id in common, the old tree held until the new is swapped
+/// in. Measured in #219's review on TCG at 512 a node: about 2.0 times the
+/// time per fuel unit of a plain wasm loop in the same run (31.4 to 35.7 ps
+/// against 16.0 to 17.8), so about 1,050 a node pays its way; 1,280 leaves a
+/// fifth to spare.
+pub const NODE_FUEL: u64 = 1280;
 /// The toolkit's text size, in pixels: the kernel's windows' (`font::TEXT_PX`,
 /// a `const` assertion ties them), so an app's toolkit looks like a kernel
 /// window's.

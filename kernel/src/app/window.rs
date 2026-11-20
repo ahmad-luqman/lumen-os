@@ -443,7 +443,8 @@ fn refused(c: &C<'_>, call: &str, len: usize, why: impl core::fmt::Display) -> E
 /// checked before it is copied (`TREE_BYTES`), decoded node by node and
 /// checked (`Tree::decode_counted`), each app id mapped to a global one
 /// (`IdMap`), then swapped in (`ui tree` reads it). A refused tree keeps
-/// the last; every node it worked through is paid for, refused or not
+/// the last; every node it worked through is paid for, refused or not, and
+/// an accepted tree pays for the old tree's nodes it frees too
 /// (`Tree::decode_counted`: a node failing partway counts the items its
 /// bytes could hold).
 fn window_publish(c: &mut C<'_>, h: i32, ptr: i32, len: i32) -> Result<i32, Error> {
@@ -459,9 +460,13 @@ fn window_publish(c: &mut C<'_>, h: i32, ptr: i32, len: i32) -> Result<i32, Erro
     runtime::charge(&mut *c, BYTE_FUEL * n as u64 + NODE_FUEL * nodes as u64);
     let tree = decoded.map_err(|e| refused(c, "a tree", n, e))?;
     let win = c.data_mut().window_mut(h)?;
+    // The old tree's nodes are freed here too (its rows and its ids):
+    // paid by the node as well.
+    let freed = win.ids.len() as u64;
     let (top, rows) = win.ids.remap(&tree, NodeId::fresh);
     drop(tree);
     win.handle.publish(top, rows);
+    runtime::charge(&mut *c, NODE_FUEL * freed);
     Ok(0)
 }
 
