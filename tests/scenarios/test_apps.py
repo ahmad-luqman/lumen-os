@@ -109,7 +109,9 @@ def test_hello_wasm(boot):
     wait_unlisted(m, app_id)
     # `run` alone: its usage and the bundled apps (not the test apps).
     out = run(m, "run")
-    assert out == "usage: run [--without <grant>] <app> [args...]\napps: calculator template\n", out
+    assert (
+        out == "usage: run [--without <grant>] <app> [args...]\napps: calculator template xray\n"
+    ), out
     assert "run: no app nope" in run(m, "run nope")
     # `exit(n)` is an ending like returning n.
     app_id, mark = start(m, "hello exit 7")
