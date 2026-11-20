@@ -138,3 +138,18 @@ tests = [
     "scenario:test_apps::test_calculator_tree_and_invoke",
     "scenario:test_apps::test_calculator_golden",
 ]
+
+[[feature]]
+name = "The SDK's tick loop: an app ticks on a period it gives before every wait (a late tick once, never a burst) and still answers requests and closes while it ticks; with no period the desktop settles, and while it ticks it never does; input the app takes itself (its own keys) skips the tree, and it can quit from a key; its own drawing gets the theme's palette and is committed without republishing an unchanged tree"
+milestone = "M5"
+tests = [
+    "cargo:lumen-ui",
+    "cargo:lumen-app-api",
+    "harness:test_ui_tree::test_invoke_on_an_animating_window_retries_a_held_slot_without_settling",
+    "harness:test_ui_tree::test_invoke_on_an_animating_window_gives_up_on_a_slot_held_too_long",
+    "harness:test_ui_tree::test_press_animated_confirms_by_the_tree_not_by_settling",
+    "scenario:test_apps::test_sdk_tick_loop_answers_requests_and_closes_while_ticking",
+    "scenario:test_apps::test_sdk_tick_loop_stopped_lets_the_desktop_settle",
+    "scenario:test_apps::test_sdk_app_takes_keys_draws_alone_and_quits",
+    "scenario:test_apps::test_sdk_custom_drawing_follows_the_theme",
+]

@@ -181,3 +181,49 @@ def test_invoke_waits_out_a_held_slot_without_counting_it(monkeypatch):
     got = gui.invoke(None, 17, "press", tries=2)
     assert got.row is not None and got.retries == 1
     assert len(settled) == 2 and len(shell.lines) == 4
+
+
+def test_invoke_on_an_animating_window_retries_a_held_slot_without_settling(monkeypatch):
+    # Animating: a held slot is tried again (not counted, never waiting for
+    # the desktop to settle, which it wouldn't), a busy one still counts.
+    held = "ui invoke: a request is still queued or running in window 3\n"
+    busy = "ui invoke: window 3 busy (try again)\n"
+    shell = FakeShell([held, held, busy, ROW])
+    monkeypatch.setattr(gui, "run", shell)
+    monkeypatch.setattr(gui.time, "sleep", lambda s: None)
+
+    def never(m, allow=None):
+        raise AssertionError("waited for the desktop to settle")
+
+    monkeypatch.setattr(gui, "wait_settled", never)
+    got = gui.invoke(None, 17, "press", tries=2, animating=True)
+    assert got.row is not None and got.retries == 1
+    assert len(shell.lines) == 4
+
+
+def test_invoke_on_an_animating_window_gives_up_on_a_slot_held_too_long(monkeypatch):
+    held = "ui invoke: a request is still queued or running in window 3\n"
+    clock = iter([0.0, 10.0, 31.0, 1e9])
+    monkeypatch.setattr(gui, "run", FakeShell([held] * 4))
+    monkeypatch.setattr(gui.time, "sleep", lambda s: None)
+    monkeypatch.setattr(gui.time, "monotonic", lambda: next(clock))
+    with pytest.raises(AssertionError, match="stayed held for 30 s"):
+        gui.invoke(None, 17, "press", animating=True, held_timeout=30)
+
+
+def test_press_animated_confirms_by_the_tree_not_by_settling(monkeypatch):
+    # A still-running answer is accepted, then the tree is waited on; a row
+    # for another node fails.
+    still = "ui invoke: still running (window 3)\n"
+    monkeypatch.setattr(gui, "run", FakeShell([still]))
+    waited = []
+    monkeypatch.setattr(
+        gui, "wait_ui", lambda m, what, done, window, timeout: waited.append(what) or ["ok"]
+    )
+    rows = gui.parse_records(TREE, "id")
+    assert gui.press_animated(None, rows, "Add", "the count", lambda r: True) == ["ok"]
+    assert waited == ["the count"]
+    other = ROW.replace("   17 ", "   18 ")
+    monkeypatch.setattr(gui, "run", FakeShell([other]))
+    with pytest.raises(AssertionError):
+        gui.press_animated(None, rows, "Add", "the count", lambda r: True)
