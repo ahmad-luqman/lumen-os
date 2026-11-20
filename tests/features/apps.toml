@@ -129,7 +129,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Calculator (#207): a bundled app with digit and operator buttons and a display, left to right in exact decimals (division by zero and overflow an error until a digit or C, long inputs stopping at the digit limits), pressed through `ui invoke` or typed on the keyboard, its window matching a golden"
+name = "Calculator (#207): a bundled app with digit and operator buttons and a display, left to right in exact decimals (division by zero and overflow an error until a digit, `.` or C, long inputs stopping at the digit limits), pressed through `ui invoke` or typed on the keyboard, its window matching a golden"
 milestone = "M5"
 tests = [
     "cargo:lumen-calc",

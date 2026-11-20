@@ -425,7 +425,7 @@ def test_sdk_panic_cuts_on_a_char_boundary(boot):
 
 
 def test_sdk_allocator_frees(boot):
-    # 64 rounds of 256 KiB allocated and freed in a 2 MiB memory: only a
+    # 64 rounds of 256 KiB allocated and freed in a 4 MiB memory: only a
     # heap that frees gets through them.
     m = boot_shell(boot)
     app_id, mark = start(m, "window alloc")
@@ -647,8 +647,12 @@ def test_closed_its_window_answer_comes_after_the_window_closes(boot):
     assert gui.node(gui.ui_tree(m, wid), "label", "Count")["value"] == "1"
     lock = gui.node(rows, "checkbox", "Lock")
     got = gui.invoke(m, lock["id"], "press")
-    if got.row is not None:
-        assert got.row["value"] == "checked", got
+    if got.still_running:
+        gui.wait_ui(
+            m, "Lock checked", lambda r: gui.node(r, "checkbox", "Lock")["value"] == "checked", wid
+        )
+    else:
+        assert got.row is not None and got.row["value"] == "checked", got
     quit_ = gui.node(rows, "button", "Quit")
     got = gui.invoke(m, quit_["id"], "press")
     if got.still_running:
@@ -707,7 +711,7 @@ TREE_NODES = 1024
 
 
 def test_one_request_per_window_refuses_a_second_as_busy(boot):
-    # `window deaf` publishes a button and a label whose name and text hold
+    # `window deaf` publishes a button and a label whose text holds
     # ESC, LF and U+2028 (each shown U+FFFD: `ui tree` still parses), then a
     # tree the host refuses (the last one stays: `ui tree` still has them),
     # and never reads its events: a request to it is never taken (its asker
@@ -734,3 +738,30 @@ def test_one_request_per_window_refuses_a_second_as_busy(boot):
     end_line(m, mark, "window", app_id, "killed")
     wait_gone(m, app_id, record["thread"])
     gui.wait_no_window(m, "window")
+
+
+# The SDK's line when its toolkit can't publish a tree (lumen-app's ui.rs).
+NOT_PUBLISHED = r"WARN  app: window: ui: a tree not published: the tree: more than 1024 nodes"
+
+
+def test_a_tree_the_sdk_cant_publish_answers_failed(boot):
+    # `window ui-big`: a press on Grow adds more labels than TREE_NODES.
+    # The SDK refuses that tree itself: one WARN, the kernel keeping the
+    # last tree (`ui tree` still shows Grow alone), and the press answered
+    # "couldn't publish", not with a row from the stale tree; a second
+    # press is answered so too, with no second WARN (once a run).
+    m = boot_desktop(boot)
+    app_id, mark = start(m, "window ui-big")
+    wid, rows = wait_tree(m, "window", "Grow")
+    grow = gui.node(rows, "button", "Grow")
+    failed = "ui invoke: couldn't publish: the tree: more than 1024 nodes"
+    for _ in range(2):
+        got = gui.invoke(m, grow["id"], "press", allow=NOT_PUBLISHED)
+        if got.still_running:
+            gui.wait_settled(m, allow=NOT_PUBLISHED)
+        else:
+            assert got.message == failed, got
+    assert len(re.findall(NOT_PUBLISHED, m.output[mark:])) == 1, m.output[mark:]
+    assert [r["name"] for r in below_root(gui.ui_tree(m, wid))] == ["Grow"]
+    gui.close_window(m, "window")
+    end_line(m, mark, "window", app_id, "exited with 0")

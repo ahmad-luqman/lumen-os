@@ -5,7 +5,8 @@
 //! characters (`0`-`9`, `.` or `,`, `+ - * /`, `x` or `×`, `÷`, `=`, `c`),
 //! Enter (`=`), Backspace and Escape (`C`); Tab and Space go to the
 //! toolkit. The arithmetic is `lumen_calc::Calc`'s (host-tested): left to
-//! right, in exact decimals.
+//! right, in exact decimals; after an error (dividing by zero, an
+//! overflow) a digit or `.` starts again, as `C` does.
 
 #![no_std]
 

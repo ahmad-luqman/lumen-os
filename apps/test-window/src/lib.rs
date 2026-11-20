@@ -27,7 +27,7 @@
 //!   boundary, so the line number shown is whole (the scenario finds the
 //!   line by its `panic-utf8` marker).
 //! - `alloc`: allocates and frees 256 KiB 64 times (16 MiB in all, in a
-//!   2 MiB memory): only a heap that frees lasts; logs `window: alloc: 64
+//!   4 MiB memory: its `build.rs`): only a heap that frees lasts; logs `window: alloc: 64
 //!   rounds` and returns 0.
 //! - `sdk`: the SDK's other calls, each checked (`window: sdk: <n> checks,
 //!   <f> failed`, and a line per failure): `open_window` past
@@ -53,7 +53,7 @@
 //!   holding the next (`window: deep: published <n> nodes (<b> bytes)`),
 //!   then goes on as with no argument (events read until `Close`).
 //! - `deaf`: publishes a button `Go` (app id 1) and a label `Say` whose
-//!   name and text hold ESC, LF and U+2028, then a tree the host refuses
+//!   text holds ESC, LF and U+2028, then a tree the host refuses
 //!   (`window: deaf: published; a bad tree then: -5`: the last one stays),
 //!   then sleeps for good, never reading its events: a request to it stays
 //!   queued, so its window's one request slot stays taken.
@@ -347,8 +347,8 @@ fn publish(mode: &str, w: &lumen_app::Window) -> Result<(), i32> {
         let n = TREE_NODES as u64;
         (1..=n).map(|id| Node::Group { common: common(id), children: u32::from(id < n) }).collect()
     } else {
-        // A button, and a label whose name and text hold an ESC, a line
-        // feed and a line separator (`ui tree` shows U+FFFD for each).
+        // A button, and a label whose text holds an ESC, a line feed and a
+        // line separator (`ui tree` shows U+FFFD for each).
         let odd = "a\u{1b}b\nc\u{2028}d";
         alloc::vec![
             Node::Button { common: Common { name: Text::cut("Go"), ..common(1) }, focused: false },
