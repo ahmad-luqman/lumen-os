@@ -285,8 +285,8 @@ pub struct Window {
     /// Key events its queue took.
     keys: AtomicU64,
     /// Whether it takes one `ui invoke` request at a time (an app's window,
-    /// #207: [`WindowHandle::one_request_at_a_time`]).
-    one_request: AtomicBool,
+    /// #207: opened with [`Requests::OneAtATime`]).
+    one_request: bool,
     /// Its one request slot, while `one_request`: taken by the request
     /// queued or running (`ui::RequestSlot`), freed when it is answered,
     /// skipped or refused.
@@ -370,6 +370,18 @@ struct WindowInner {
     /// 1), client coordinates. Empty for a window without a toolkit.
     top: Vec<lumen_ui::NodeId>,
     nodes: Vec<(u32, AutomationNode)>,
+}
+
+/// How many `ui invoke` requests a window holds at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Requests {
+    /// As many as its queue takes (a kernel window: its owner answers each
+    /// in turn).
+    Many,
+    /// One queued or running (an app's window, #207: its `window_answer`
+    /// answers *the* running request): another is refused busy before
+    /// anything is queued.
+    OneAtATime,
 }
 
 /// Why [`open_window`] failed.
@@ -793,7 +805,8 @@ impl Home {
 
 /// A desktop: the live one ([`Desktop::LIVE`], [`open_window`]) or one
 /// with no compositor thread and no screen, for the ktests, so none leaves
-/// a desktop running.
+/// a desktop running. A clone is the same desktop.
+#[derive(Clone)]
 pub struct Desktop {
     home: Home,
 }
@@ -837,7 +850,26 @@ impl Desktop {
     /// in front and focused, its frame's corner placed by how many are
     /// open. `NoDesktop` until the desktop's start completed.
     pub fn open_window(&self, title: &str, width: u32, height: u32) -> Result<WindowHandle, OpenError> {
-        self.open(title, width, height, Place::Auto, false)
+        self.open(title, width, height, Place::Auto, false, Requests::Many)
+    }
+
+    /// Whether window `id` is open on this desktop (for the ktests: a
+    /// request's answer checks its window is gone first).
+    #[cfg(feature = "ktest")]
+    pub fn is_open(&self, id: u32) -> bool {
+        self.home.lock().as_ref().is_some_and(|s| s.wm.id(id).is_some())
+    }
+
+    /// [`Desktop::open_window`], taking `ui invoke` requests as `requests`
+    /// says (an app's window: one at a time, from its opening on).
+    pub fn open_window_with(
+        &self,
+        title: &str,
+        width: u32,
+        height: u32,
+        requests: Requests,
+    ) -> Result<WindowHandle, OpenError> {
+        self.open(title, width, height, Place::Auto, false, requests)
     }
 
     /// Open a panel (#157, the taskbar) docked along the bottom, `rows`
@@ -847,14 +879,22 @@ impl Desktop {
     /// whenever a window opens or closes.
     pub fn open_panel(&self, title: &str, rows: u32) -> Result<WindowHandle, OpenError> {
         let width = self.home.lock().as_ref().map_or(0, |s| s.width);
-        let h = self.open(title, width, rows, Place::Panel, false)?;
+        let h = self.open(title, width, rows, Place::Panel, false, Requests::Many)?;
         if let Some(s) = self.home.lock().as_mut() {
             s.taskbar = Some(h.waker());
         }
         Ok(h)
     }
 
-    fn open(&self, title: &str, width: u32, height: u32, at: Place, spin: bool) -> Result<WindowHandle, OpenError> {
+    fn open(
+        &self,
+        title: &str,
+        width: u32,
+        height: u32,
+        at: Place,
+        spin: bool,
+        requests: Requests,
+    ) -> Result<WindowHandle, OpenError> {
         let (sw, sh) = {
             let g = self.home.lock();
             let s = g.as_ref().filter(|s| s.started).ok_or(OpenError::NoDesktop)?;
@@ -914,7 +954,7 @@ impl Desktop {
                 held: AtomicBool::new(false),
                 spin,
                 keys: AtomicU64::new(0),
-                one_request: AtomicBool::new(false),
+                one_request: requests == Requests::OneAtATime,
                 request_out: Arc::new(AtomicBool::new(false)),
             });
             s.windows.push(win.clone());
@@ -935,11 +975,17 @@ pub fn open_window(title: &str, width: u32, height: u32) -> Result<WindowHandle,
     Desktop::LIVE.open_window(title, width, height)
 }
 
+/// Open a window on the live desktop taking requests as `requests` says
+/// (see [`Desktop::open_window_with`]).
+pub fn open_window_with(title: &str, width: u32, height: u32, requests: Requests) -> Result<WindowHandle, OpenError> {
+    Desktop::LIVE.open_window_with(title, width, height, requests)
+}
+
 /// [`open_window`] with its frame's corner at (`x`, `y`) (clamped like a
 /// move, so a strip of its title bar stays on the screen): terminal windows
 /// (#155) side by side.
 pub fn open_window_at(title: &str, width: u32, height: u32, x: i32, y: i32) -> Result<WindowHandle, OpenError> {
-    Desktop::LIVE.open(title, width, height, Place::At(x, y), false)
+    Desktop::LIVE.open(title, width, height, Place::At(x, y), false, Requests::Many)
 }
 
 /// Where [`Desktop::open`] puts a window.
@@ -1201,12 +1247,10 @@ impl WindowHandle {
         drop((old_top, old_nodes));
     }
 
-    /// From now on the window takes one `ui invoke` request at a time: one
-    /// queued or running refuses the next with `Refused::Busy` before
-    /// anything is queued (an app's window, #207: its `window_answer`
-    /// answers *the* running request).
-    pub fn one_request_at_a_time(&self) {
-        self.win.one_request.store(true, Ordering::Release);
+    /// Its request slot's flag (for the ktests: whether a request holds it).
+    #[cfg(feature = "ktest")]
+    pub fn request_flag(&self) -> Arc<AtomicBool> {
+        self.win.request_out.clone()
     }
 
     /// Node `id` (a global id) of the tree as last published, with its
@@ -2435,10 +2479,10 @@ impl Desktop {
                 break 'push Err(lumen_wm::Refused::Dead(req));
             };
             // One at a time: the slot taken here, held by the request.
-            let req = if win.one_request.load(Ordering::Acquire) {
+            let req = if win.one_request {
                 match crate::ui::RequestSlot::take(&win.request_out) {
                     Some(slot) => req.holding(slot),
-                    None => break 'push Err(lumen_wm::Refused::Busy(req)),
+                    None => break 'push Err(lumen_wm::Refused::Busy(req.slot_held())),
                 }
             } else {
                 req
@@ -2494,7 +2538,7 @@ fn open_demo_windows() {
         (Demo::Colours, "Colours", 400, 210, (440, 300), "desktop-colours"),
     ];
     for (demo, title, w, h, at, thread) in demos {
-        let handle = match Desktop::LIVE.open(title, w, h, Place::At(at.0, at.1), false) {
+        let handle = match Desktop::LIVE.open(title, w, h, Place::At(at.0, at.1), false, Requests::Many) {
             Ok(h) => h,
             Err(e) => {
                 log::warn!(target: "desktop", "no {title} window: {e}");
@@ -2654,7 +2698,9 @@ fn spin() -> Result<u32, String> {
     let mut ui = lumen_ui::Ui::new();
     let stop = ui.button(None, "Stop");
     let area = Rect::new(0, SPIN_STRIP as i32, w, h - SPIN_STRIP);
-    let handle = Desktop::LIVE.open("spin", w, h, Place::Auto, true).map_err(|e| alloc::format!("no window: {e}"))?;
+    let handle = Desktop::LIVE
+        .open("spin", w, h, Place::Auto, true, Requests::Many)
+        .map_err(|e| alloc::format!("no window: {e}"))?;
     let tk = crate::ui::Toolkit::new(Spin { ui, stop, x: 0 }, area, handle.theme())?;
     let id = handle.id();
     let _detached = crate::sched::spawn("desktop-spin", move || spin_owner(handle, tk))

@@ -32,7 +32,7 @@ use super::runtime::{self, AppCtx};
 use crate::desktop::{self, Animating, OpenError, Wait, WindowEvent, WindowHandle};
 use crate::ui::{Answer, Request, Started};
 use crate::{sched, time};
-use alloc::collections::BTreeMap;
+use core::mem::ManuallyDrop;
 use lumen_app_api::answer::AppAnswer;
 use lumen_app_api::event::Event;
 use lumen_app_api::layout::{self, CANVAS_SIZE, Canvas, CheckedCanvas, Clipped, RECT_SIZE, TEXT_DRAW_SIZE, TextDraw};
@@ -40,7 +40,7 @@ use lumen_app_api::limits::{ANSWER_BYTES, BYTE_FUEL, NODE_FUEL, TREE_BYTES};
 use lumen_app_api::limits::{COMMIT_RECTS, EVENT_BYTES, PIXEL_FUEL, TEXT_BYTES, TEXT_PX_MAX, TEXT_PX_MIN, TITLE_BYTES};
 use lumen_app_api::limits::{SURFACES, TEXT_CHAR_FUEL, WINDOW_PIXELS};
 use lumen_app_api::request::{self, Running, Taken};
-use lumen_app_api::tree::Tree;
+use lumen_app_api::tree::{IdMap, Tree};
 use lumen_app_api::{Error, Kind, range, returned, text};
 use lumen_font::Px;
 use lumen_gfx::{Rect, Surface};
@@ -49,11 +49,12 @@ use wasmi::Linker;
 
 /// An app's window: the desktop's handle (its owner surface the canvas is
 /// copied into), the event in hand, `text_draw`'s scratch surface, its
-/// tree's ids, and the request it runs. Its fields drop in this order: the
-/// window goes first (its queued requests answered "window closed"), then
-/// a request the app was running is answered `OwnerEnded`.
+/// tree's ids, and the request it runs. Dropped, the window goes first
+/// (its queued requests answered "window closed"), then a request the app
+/// was running is answered `OwnerEnded` (its `Drop`).
 pub(super) struct AppWindow {
-    handle: WindowHandle,
+    /// Dropped first, by `Drop` (never used after).
+    handle: ManuallyDrop<WindowHandle>,
     w: u32,
     h: u32,
     /// The event `window_wait` woke for, or one `window_next_event` kept
@@ -62,14 +63,11 @@ pub(super) struct AppWindow {
     /// `text_draw`'s pixels, the window's size: the third surface in the
     /// app's worst case.
     scratch: Surface,
-    /// The newest published tree's ids: each app id's global one (an id
-    /// first seen gets `NodeId::fresh()`; one missing from a newer tree
-    /// leaves, so its global id names nothing again).
-    ids: BTreeMap<u64, NodeId>,
-    /// The other way: each global id's app id and role.
-    nodes: BTreeMap<u64, (u64, Role)>,
+    /// The newest published tree's ids, both ways (`IdMap`: an id first
+    /// seen gets a fresh global id; one missing from a newer tree leaves).
+    ids: IdMap,
     /// The request delivered (or kept in hand) and not yet answered.
-    running: OwnerEnded,
+    running: Running<Started>,
 }
 
 /// The event in hand: as the desktop gave it (`window_wait`: a request
@@ -81,34 +79,32 @@ enum Held {
     Wire(Event),
 }
 
-/// A window's running request, answered `OwnerEnded` if it is dropped
-/// unanswered: the app ended, or closed its window, while running it
-/// (section 8's `Answer::OwnerEnded`).
-pub(super) struct OwnerEnded(Running<Started>);
-
-impl Drop for OwnerEnded {
+impl Drop for AppWindow {
     fn drop(&mut self) {
-        if let Some(started) = self.0.take() {
+        // SAFETY: dropped once, here, and never used after: the rest of the
+        // fields drop after this function, and none touches the handle.
+        unsafe { ManuallyDrop::drop(&mut self.handle) };
+        // The window is gone: a request the app was running (it ended, or
+        // closed its window) is answered so (section 8's `OwnerEnded`).
+        if let Some(started) = self.running.take() {
             started.finish(Answer::OwnerEnded);
         }
     }
 }
 
 impl AppWindow {
-    /// The app's window over `handle` (`w` × `h`), with `text_draw`'s
-    /// `scratch`: one request at a time (`window_answer` answers *the*
-    /// running request), no tree yet.
+    /// The app's window over `handle` (`w` × `h`, opened taking one request
+    /// at a time: `Requests::OneAtATime`), with `text_draw`'s `scratch`, no
+    /// tree yet.
     fn new(handle: WindowHandle, w: u32, h: u32, scratch: Surface) -> AppWindow {
-        handle.one_request_at_a_time();
         AppWindow {
-            handle,
+            handle: ManuallyDrop::new(handle),
             w,
             h,
             in_hand: None,
             scratch,
-            ids: BTreeMap::new(),
-            nodes: BTreeMap::new(),
-            running: OwnerEnded(Running::new()),
+            ids: IdMap::new(),
+            running: Running::new(),
         }
     }
 
@@ -125,7 +121,7 @@ impl AppWindow {
 
     /// The app id and role of global node `node` in the newest tree.
     fn local(&self, node: u64) -> Option<(u64, Role)> {
-        self.nodes.get(&node).copied()
+        self.ids.local(node)
     }
 
     /// What the asker of a running request on global node `node` gets for
@@ -368,10 +364,18 @@ fn take_request(win: &mut AppWindow, req: Request) -> Option<Event> {
             started.finish(Answer::Ran(Served::Error(error)));
             None
         }
-        Taken::Deliver { started, event } => {
-            win.running.0.start(started);
-            Some(event)
-        }
+        Taken::Deliver { started, event } => match win.running.start(started) {
+            Ok(()) => Some(event),
+            // The window's slot lets one request in at a time: a second
+            // running is a kernel bug, answered before it is reported.
+            Err(extra) => {
+                extra.finish(Answer::Ran(Served::Failed(alloc::string::String::from(
+                    "a second request (a kernel bug)",
+                ))));
+                kernel_bug("a second request running in an app's window");
+                None
+            }
+        },
     }
 }
 
@@ -424,63 +428,75 @@ fn next_event(c: &mut C<'_>, h: i32, buf: i32, len: i32) -> Result<i32, Error> {
 /// Whether the window's running request has been read by the app (not in
 /// hand): only then may it answer.
 fn delivered(win: &AppWindow) -> bool {
-    win.running.0.is_running() && !matches!(win.in_hand, Some(Held::Wire(Event::Request { .. })))
+    win.running.is_running() && !matches!(win.in_hand, Some(Held::Wire(Event::Request { .. })))
+}
+
+/// A tree or an answer the app sent, refused: a DEBUG line naming why
+/// (postcard's custom errors carry no message, so it names the call, the
+/// length and the reason).
+fn refused(c: &C<'_>, call: &str, len: usize, why: impl core::fmt::Display) -> Error {
+    log::debug!(target: "app", "app {}: {call} of {len} bytes refused: {why}", c.data().state.id);
+    Error::BadArgument
 }
 
 /// `window_publish(h, tree, len)`: the app's automation tree, its size
 /// checked before it is copied (`TREE_BYTES`), decoded node by node and
-/// checked (`Tree::decode`), each app id mapped to a global one, then
-/// swapped in (`ui tree` reads it). A refused tree keeps the last.
+/// checked (`Tree::decode_counted`), each app id mapped to a global one
+/// (`IdMap`), then swapped in (`ui tree` reads it). A refused tree keeps
+/// the last; every node decoded is paid for, refused or not.
 fn window_publish(c: &mut C<'_>, h: i32, ptr: i32, len: i32) -> Result<i32, Error> {
     c.data_mut().window_mut(h)?;
     let r = range::range(ptr, len, memory_len(c))?;
-    let bytes = copy_in_capped(c, r, TREE_BYTES)?;
-    let decoded = Tree::decode(&bytes);
-    let nodes = decoded.as_ref().map_or(0, |t| t.count()) as u64;
+    let n = r.len();
+    let bytes = copy_in_capped(c, r, TREE_BYTES).map_err(|_| refused(c, "a tree", n, "past TREE_BYTES"))?;
+    let (decoded, nodes) = Tree::decode_counted(&bytes);
+    // The bytes go once decoded (what a window holds is
+    // `TREE_COPIES_BYTES`'s: the rows and the id map).
+    drop(bytes);
     // Paid for what was copied and decoded, refused or not.
-    runtime::charge(&mut *c, BYTE_FUEL * bytes.len() as u64 + NODE_FUEL * nodes);
-    let tree = decoded.map_err(|e| {
-        log::debug!(target: "app", "app {}: a tree of {} bytes refused: {e}", c.data().state.id, bytes.len());
-        Error::BadArgument
-    })?;
+    runtime::charge(&mut *c, BYTE_FUEL * n as u64 + NODE_FUEL * nodes as u64);
+    let tree = decoded.map_err(|e| refused(c, "a tree", n, e))?;
     let win = c.data_mut().window_mut(h)?;
-    let old = core::mem::take(&mut win.ids);
-    let mut ids = BTreeMap::new();
-    let mut nodes = BTreeMap::new();
-    let (top, rows) = tree.rows(|local, role| {
-        let global = old.get(&local).copied().unwrap_or_else(NodeId::fresh);
-        ids.insert(local, global);
-        nodes.insert(global.get(), (local, role));
-        global
-    });
-    win.ids = ids;
-    win.nodes = nodes;
+    let (top, rows) = win.ids.remap(&tree, NodeId::fresh);
+    drop(tree);
     win.handle.publish(top, rows);
     Ok(0)
 }
 
 /// `window_answer(h, answer, len)`: the app's answer to its running
 /// request (`BadArgument` with none read, past `ANSWER_BYTES` before the
-/// copy, or one that doesn't decode: it stays running), built into the
-/// asker's answer from the newest published tree. `ClosedItsWindow` closes
-/// the window first, then answers.
+/// copy, or one that doesn't decode: it stays running; each refusal a DEBUG
+/// line), built into the asker's answer from the newest published tree.
+/// `ClosedItsWindow` closes the window first, then answers.
 fn window_answer(c: &mut C<'_>, h: i32, ptr: i32, len: i32) -> Result<i32, Error> {
     c.data_mut().window_mut(h)?;
     let r = range::range(ptr, len, memory_len(c))?;
+    let n = r.len();
     if !delivered(c.data_mut().window_mut(h)?) {
-        return Err(Error::BadArgument);
+        return Err(refused(c, "an answer", n, "no request running"));
     }
-    let bytes = copy_in_capped(c, r, ANSWER_BYTES)?;
-    runtime::charge(&mut *c, BYTE_FUEL * bytes.len() as u64);
+    let bytes = copy_in_capped(c, r, ANSWER_BYTES).map_err(|_| refused(c, "an answer", n, "past ANSWER_BYTES"))?;
+    runtime::charge(&mut *c, BYTE_FUEL * n as u64);
     let win = c.data_mut().window_mut(h)?;
-    let (started, answer) = win.running.0.answer(&bytes).map_err(|_| Error::BadArgument)?;
+    let (started, answer) = match win.running.answer(&bytes) {
+        Ok(taken) => taken,
+        Err(e) => return Err(refused(c, "an answer", n, format_args!("{e:?}"))),
+    };
     let served = win.served(started.node(), started.action().kind(), answer);
+    answer_request(c.data_mut(), h, started, served);
+    Ok(0)
+}
+
+/// Answer the window `h`'s request `started` with `served`; one whose
+/// action closed the window (`ClosedItsWindow`) closes it first (its handle
+/// closed, as `handle_close` would: later calls on it are `BadHandle` and a
+/// close grace ends), so `ui invoke`'s answer comes once it is gone.
+fn answer_request(ctx: &mut AppCtx, h: i32, started: Started, served: Served) {
     if served == Served::ClosedItsWindow {
-        // The window goes first: `ui invoke`'s answer comes once it is gone.
-        c.data_mut().close(h)?;
+        // (`h` named the window a moment ago: closing it can't fail.)
+        let _ = ctx.close(h);
     }
     started.finish(Answer::Ran(served));
-    Ok(0)
 }
 
 /// `window_wait(h, deadline, animating)`: 1 with an event in hand, 0 at the
@@ -599,16 +615,32 @@ fn text_draw(c: &mut C<'_>, h: i32, canvas: i32, args: i32, ptr: i32, len: i32) 
     Ok(advance)
 }
 
-/// An app window over `handle` with one published node: app id 1, a
-/// button, global id `global` (for the ktests, which have no module).
+/// An app window over `handle` with a published tree: a button, app id
+/// 1, and a list (app id 3, its items 4 and 5); its global ids (for the
+/// ktests, which have no module).
 #[cfg(feature = "ktest")]
-fn test_window(handle: WindowHandle, global: NodeId) -> AppWindow {
+fn test_window(handle: WindowHandle) -> (AppWindow, NodeId, NodeId) {
+    use lumen_app_api::layout::Rect as WireRect;
+    use lumen_app_api::tree::{Common, Node, Text};
+    let common = |id, name: &str| Common {
+        id,
+        name: Text::cut(name),
+        bounds: WireRect::new(0, 0, 4, 4),
+        disabled: false,
+        hidden: false,
+    };
+    let items = lumen_app_api::wire::CappedVec::new(alloc::vec![common(4, "a"), common(5, "b")]).unwrap_or_default();
+    let tree = Tree::new(alloc::vec![
+        Node::Button { common: common(1, "Go"), focused: false },
+        Node::List { common: common(3, "Files"), focused: false, selected: None, items },
+    ])
+    .unwrap_or_else(|_| unreachable!("a valid tree"));
     let mut win = AppWindow::new(handle, 8, 8, Surface::new(8, 8));
-    win.ids.insert(1, global);
-    win.nodes.insert(global.get(), (1, Role::Button));
-    let node = lumen_ui::AutomationNode::button(global, "Go", Rect::new(0, 0, 4, 4), false, false);
-    win.handle.publish(alloc::vec![global], alloc::vec![(1, node)]);
-    win
+    let (top, rows) = win.ids.remap(&tree, NodeId::fresh);
+    win.handle.publish(top, rows);
+    let button = win.ids.global(1).unwrap_or_else(NodeId::fresh);
+    let item = win.ids.global(4).unwrap_or_else(NodeId::fresh);
+    (win, button, item)
 }
 
 /// The next request in `win`'s queue, taken as `window_next_event` takes
@@ -623,21 +655,44 @@ fn take_next(win: &mut AppWindow) -> Option<Event> {
     None
 }
 
+/// For `app::tests`' module ktests: an app window opened on `ctx`'s seam
+/// desktop (with `test_window`'s tree), a request on its button pushed and
+/// delivered if `running`, added to `ctx`: its handle.
+#[cfg(feature = "ktest")]
+pub(super) fn ktest_window(ctx: &mut AppCtx, running: bool) -> Result<i32, &'static str> {
+    let d = ctx.desktop.clone().ok_or("no desktop seam")?;
+    let handle = d.open_window_with("probe", 8, 8, desktop::Requests::OneAtATime).map_err(|_| "a window")?;
+    let (mut win, button, _) = test_window(handle);
+    if running {
+        let (req, _) = Request::new(button.get(), lumen_ui::Action::Press);
+        d.push_request(win.handle.id(), req).map_err(|_| "pushed")?;
+        take_next(&mut win).ok_or("delivered")?;
+    }
+    ctx.add_window(win).map_err(|_| "a handle")
+}
+
+/// Open a test window on `d` taking one request at a time.
+#[cfg(feature = "ktest")]
+fn probe_window(d: &desktop::Desktop) -> Result<(AppWindow, NodeId, NodeId), &'static str> {
+    Ok(test_window(d.open_window_with("probe", 8, 8, desktop::Requests::OneAtATime).map_err(|_| "a window")?))
+}
+
 crate::ktest!(
     fn one_request_per_window_is_refused_busy_until_answered() {
         // An app's window holds one request queued or running: a second is
-        // refused busy before it is queued, while the first waits and while
-        // it runs; the slot frees once it is answered (here, "no node"
-        // without the app, then a delivered one answered).
+        // refused busy (marked held out) before it is queued, while the
+        // first waits and while it runs; the slot frees once it is answered,
+        // before the asker is woken. A request for a node not in the tree,
+        // and a role that doesn't take the action, are answered without the
+        // app.
         use crate::kassert;
-        use lumen_ui::Action;
+        use lumen_ui::{Action, ActionKind, InvokeError};
         let d = desktop::Desktop::without_screen();
-        let global = NodeId::fresh();
-        let mut win = test_window(d.open_window("probe", 8, 8).map_err(|_| "a window")?, global);
+        let (mut win, global, item) = probe_window(&d)?;
         let id = win.handle.id();
         let busy = |d: &desktop::Desktop| {
             let (req, _) = Request::new(global.get(), Action::Press);
-            matches!(d.push_request(id, req), Err(lumen_wm::Refused::Busy(_)))
+            matches!(d.push_request(id, req), Err(lumen_wm::Refused::Busy(r)) if r.was_held_out())
         };
         // Queued: a second is busy. A request for a node the app doesn't
         // have is answered "no node" without the app, which frees the slot.
@@ -645,38 +700,55 @@ crate::ktest!(
         kassert!(d.push_request(id, req).is_ok());
         kassert!(busy(&d));
         kassert!(take_next(&mut win).is_none());
-        kassert!(matches!(cell.take(), Some(Answer::Ran(Served::Error(lumen_ui::InvokeError::NoNode)))));
+        kassert!(matches!(cell.take(), Some(Answer::Ran(Served::Error(InvokeError::NoNode)))));
+        // A role that doesn't take the action: a window's root action, and
+        // `select` or `focus` where the role lists neither.
+        for (node, action, role) in [
+            (global, Action::Close, Role::Button),
+            (global, Action::Select, Role::Button),
+            (item, Action::Focus, Role::ListItem),
+        ] {
+            let kind = action.kind();
+            let (req, cell) = Request::new(node.get(), action);
+            kassert!(d.push_request(id, req).is_ok());
+            kassert!(take_next(&mut win).is_none());
+            let want = InvokeError::NotAllowed(role, kind);
+            kassert!(matches!(cell.take(), Some(Answer::Ran(Served::Error(e))) if e == want));
+        }
+        // A list item takes `select`: delivered as its app id.
+        let (req, cell) = Request::new(item.get(), Action::Select);
+        kassert!(d.push_request(id, req).is_ok());
+        kassert!(matches!(take_next(&mut win), Some(Event::Request { node: 4, .. })));
+        let (started, _) = win.running.answer(&[1, 0]).map_err(|_| "an answer")?;
+        started.finish(Answer::Ran(Served::Error(InvokeError::NoNode)));
+        kassert!(cell.take().is_some());
         // Delivered, as the app's id 1: running, still busy.
         let (req, cell) = Request::new(global.get(), Action::Press);
         kassert!(d.push_request(id, req).is_ok());
-        let got = take_next(&mut win);
-        kassert!(matches!(got, Some(Event::Request { node: 1, .. })));
+        kassert!(matches!(take_next(&mut win), Some(Event::Request { node: 1, .. })));
         kassert!(delivered(&win));
         kassert!(busy(&d));
-        // Answered: the row from the published tree; the slot free, so a
-        // root action can be asked (never reaching the app: NotAllowed on
-        // its button).
-        let (started, answer) = win.running.0.answer(&[0]).map_err(|_| "an answer")?;
+        // Answered: the row from the published tree; the slot freed before
+        // the asker is woken (the probe sees it free).
+        let flag = win.handle.request_flag();
+        cell.set_probe(move || !flag.load(core::sync::atomic::Ordering::Acquire));
+        let (started, answer) = win.running.answer(&[0]).map_err(|_| "an answer")?;
         let served = win.served(started.node(), started.action().kind(), answer);
         kassert!(matches!(&served, Served::Row { depth: 1, node } if node.id() == global));
         started.finish(Answer::Ran(served));
+        kassert!(cell.probed() == Some(true));
         kassert!(matches!(cell.take(), Some(Answer::Ran(Served::Row { .. }))));
-        let (req, cell) = Request::new(global.get(), Action::Close);
-        kassert!(d.push_request(id, req).is_ok());
-        kassert!(take_next(&mut win).is_none());
-        let not_allowed = lumen_ui::InvokeError::NotAllowed(Role::Button, lumen_ui::ActionKind::Close);
-        kassert!(matches!(cell.take(), Some(Answer::Ran(Served::Error(e))) if e == not_allowed));
         // Refused answers name the role and the action; a failure is cut
-        // and sanitised.
+        // and sanitised; a node gone from the tree ran ("node gone") or is
+        // "no node" for a refusal.
         use lumen_app_api::answer::Refusal;
-        let refused = win.served(global.get(), lumen_ui::ActionKind::Press, AppAnswer::Refused(Refusal::NotAllowed));
-        let press = lumen_ui::InvokeError::NotAllowed(Role::Button, lumen_ui::ActionKind::Press);
-        kassert!(matches!(refused, Served::Error(e) if e == press));
+        let refused = win.served(global.get(), ActionKind::Press, AppAnswer::Refused(Refusal::NotAllowed));
+        kassert!(matches!(refused, Served::Error(e) if e == InvokeError::NotAllowed(Role::Button, ActionKind::Press)));
         let failed = AppAnswer::Failed(lumen_app_api::wire::Capped::try_from("a\nb").map_err(|_| "text")?);
-        kassert!(
-            matches!(win.served(global.get(), lumen_ui::ActionKind::Press, failed), Served::Failed(t) if t == "a\u{fffd}b")
-        );
-        kassert!(matches!(win.served(999, lumen_ui::ActionKind::Press, AppAnswer::Ran), Served::RanNodeGone));
+        kassert!(matches!(win.served(global.get(), ActionKind::Press, failed), Served::Failed(t) if t == "a\u{fffd}b"));
+        kassert!(matches!(win.served(999, ActionKind::Press, AppAnswer::Ran), Served::RanNodeGone));
+        let gone = win.served(999, ActionKind::Press, AppAnswer::Refused(Refusal::Disabled));
+        kassert!(matches!(gone, Served::Error(InvokeError::NoNode)));
         // Answered at once: the slot is free again (the probe queues one).
         kassert!(!busy(&d));
         Ok(())
@@ -685,25 +757,50 @@ crate::ktest!(
 
 crate::ktest!(
     fn an_app_ending_answers_owner_ended() {
-        // A request the app was running when it ended (its window dropped):
-        // answered `OwnerEnded` (the ending path's own drop), after its
-        // window is gone; a request still queued is answered "window
-        // closed".
+        // A request the app was running when it ended (its window dropped,
+        // as the ending path drops it): answered `OwnerEnded`, its window
+        // already gone when it is answered (the probe asks the desktop).
         use crate::kassert;
         use lumen_ui::Action;
         let d = desktop::Desktop::without_screen();
-        let global = NodeId::fresh();
-        let mut win = test_window(d.open_window("probe", 8, 8).map_err(|_| "a window")?, global);
+        let (mut win, global, _) = probe_window(&d)?;
         let id = win.handle.id();
         let (req, running) = Request::new(global.get(), Action::Press);
         kassert!(d.push_request(id, req).is_ok());
         kassert!(take_next(&mut win).is_some());
         kassert!(running.phase() == lumen_ui::Phase::Running);
+        let seen = d.clone();
+        running.set_probe(move || !seen.is_open(id));
         drop(win);
+        kassert!(running.probed() == Some(true));
         kassert!(matches!(running.take(), Some(Answer::OwnerEnded)));
-        let (req, _) = Request::new(global.get(), Action::Press);
-        // Its window is gone.
-        kassert!(matches!(d.push_request(id, req), Err(lumen_wm::Refused::Dead(_))));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn closed_its_window_is_answered_once_the_window_is_gone() {
+        // An answer whose action closed the window: the window closed first
+        // (the probe sees it gone when the asker is answered), its handle
+        // then `BadHandle`.
+        use crate::kassert;
+        use lumen_ui::Action;
+        let d = desktop::Desktop::without_screen();
+        let state = alloc::sync::Arc::new(runtime::AppState::new(0, "probe"));
+        let mut ctx = runtime::new_ctx(state, lumen_app_api::Grants::log(), alloc::vec::Vec::new());
+        let (mut win, global, _) = probe_window(&d)?;
+        let id = win.handle.id();
+        let (req, cell) = Request::new(global.get(), Action::Press);
+        kassert!(d.push_request(id, req).is_ok());
+        kassert!(take_next(&mut win).is_some());
+        let started = win.running.take().ok_or("running")?;
+        let h = ctx.add_window(win).map_err(|_| "a handle")?;
+        let seen = d.clone();
+        cell.set_probe(move || !seen.is_open(id));
+        answer_request(&mut ctx, h, started, Served::ClosedItsWindow);
+        kassert!(cell.probed() == Some(true));
+        kassert!(matches!(cell.take(), Some(Answer::Ran(Served::ClosedItsWindow))));
+        kassert!(matches!(ctx.window_mut(h), Err(Error::BadHandle)));
         Ok(())
     }
 );
