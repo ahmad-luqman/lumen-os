@@ -10,8 +10,9 @@
 //!   [`TAB`], `\r\n` and a lone `\r` as `\n`, the others dropped).
 //! - **Edits** each replace one range with another text, recorded for
 //!   undo with the cursor before and after. A run of characters typed one
-//!   after another (no newline, no other command between) is one edit, as
-//!   editors undo typing a word at a time; anything else is its own. A new
+//!   after another (no newline, no other command between) is one edit,
+//!   spaces included: undo takes back the whole run; anything else (a
+//!   refused or ignored character too) is its own edit. A new
 //!   edit drops what could be redone. Past [`Limits::undo_edits`] edits, or
 //!   [`Limits::undo_bytes`] bytes of them (each edit's removed and inserted
 //!   text), the oldest are forgotten, so the history's memory is bounded.
@@ -98,8 +99,8 @@ pub struct Limits {
 /// What the editor is asked to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// Type a character (refused if it is a control character: Enter is
-    /// [`Command::Newline`], Tab [`Command::Tab`]).
+    /// Type a character ([`Change::None`] for a control character: Enter
+    /// is [`Command::Newline`], Tab [`Command::Tab`]).
     Insert(char),
     Newline,
     /// [`TAB`], as one edit.
@@ -110,14 +111,17 @@ pub enum Command {
     Delete,
     Left,
     Right,
-    /// A line up or down, at the column the cursor was last moved to
-    /// across (or the line's end if shorter).
+    /// A line up or down, at the goal column (the column it was at when
+    /// Up or Down began, kept through them; the line's end if shorter).
+    /// Up on the first line goes to the text's start, Down on the last to
+    /// its end.
     Up,
     Down,
     /// The line's start or end.
     Home,
     End,
-    /// A view's rows up or down ([`Editor::scroll_to`]'s rows).
+    /// A view's rows up or down ([`Editor::scroll_to`]'s rows; one before
+    /// the first `scroll_to`), at the goal column.
     PageUp,
     PageDown,
     /// The text's start or end.
@@ -139,7 +143,10 @@ pub enum Change {
     /// The text of one line changed (no line came or went), and the
     /// cursor is on it.
     Line(usize),
-    /// Every line from this one on may have changed (lines came or went).
+    /// Every line from this one on may have changed: lines came or went (a
+    /// newline, a join, an undo or redo across lines, [`Editor::replace_all`]),
+    /// or the cursor left another line than the one changed (an undo or
+    /// redo).
     From(usize),
 }
 
@@ -164,7 +171,9 @@ pub struct Editor {
     /// Each line's first byte (the first is 0).
     starts: Vec<usize>,
     cursor: usize,
-    /// The column Up and Down aim for (chars), set by moving across.
+    /// The column Up and Down aim for (chars): set by the first of them,
+    /// kept through the next, forgotten by any other move or edit (an undo
+    /// and a redo too).
     goal: Option<usize>,
     undo: Vec<Edit>,
     redo: Vec<Edit>,

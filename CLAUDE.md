@@ -519,9 +519,12 @@ own PR that updates that doc first.
 - `crates/lumen-calc`: the calculator app's logic (#207): keys in, the
   display out, left to right in exact decimal fixed point (host-tested).
 - `crates/lumen-edit`: the text editor app's logic (#203): a buffer with a
-  cursor, edits undone and redone (a typing run as one), the size and
-  history `Limits`, a view's scroll, and the `Change` naming the lines to
-  redraw (host-tested, incl. a randomized model against a naive editor).
+  cursor, edits undone and redone (a typing run as one), the text's, a
+  line's and the history's `Limits`, `normalise`, `Loaded`, the status
+  line, a view's scroll, the `Change` naming the lines to redraw, the keys
+  (`command`: undo and redo by the layout's letters) and the view across
+  (`view`: bounded by what it shows) (host-tested, incl. a randomized model
+  against a naive editor and real keymaps through `lumen-input`).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation

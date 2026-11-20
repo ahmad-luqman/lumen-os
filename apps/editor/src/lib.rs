@@ -2,8 +2,9 @@
 //! by the app over a `lumen-ui` text area, so its window shows in `ui tree`
 //! (the buffer a `textfield` node whose value is its text, the status line
 //! a label) and `ui invoke <Text> set_value <text>` replaces the text as one
-//! edit that undo takes back. Its editing is `lumen_edit::Editor`'s
-//! (host-tested).
+//! edit that undo takes back. Its logic is `lumen-edit`'s (host-tested):
+//! the editing (`Editor`), the keys (`command`) and the view across
+//! (`view`).
 //!
 //! - **Keys** go to it whatever has the focus, mapped by
 //!   `lumen_edit::command` (host-tested, on several layouts): characters
@@ -11,29 +12,36 @@
 //!   Delete, the arrows, Home and End (with Ctrl: the text's start and
 //!   end), Page Up and Page Down; Ctrl+Z undoes, Ctrl+Y and Ctrl+Shift+Z
 //!   redo, by the layout's letters.
-//! - **Drawing** is by damage: only the lines an edit changed, the cursor's
-//!   old and new places for a move, everything only when the view scrolls.
-//!   Each line is drawn only inside the rectangles being repainted
-//!   (`Over`'s): `text_draw` costs the app fuel by the character, so a
-//!   screenful drawn again a key would be a slice's worth.
+//! - **Drawing** is by damage: a line an edit changed (from the cursor on,
+//!   for an edit at it), every row from the first changed line on when
+//!   lines come or go, the cursor's old and new places for a move (one rect
+//!   on one line), every row when the view scrolls. Each line is drawn once
+//!   a repaint, only as far as the view shows and only inside the rect
+//!   being repainted that meets it: `text_draw` costs the app fuel by the
+//!   character, and repainting costs it by the pixel.
 //! - **The view** scrolls to keep the cursor in it: by lines, and across by
 //!   characters (`lumen_edit::view`): each line drawn, and the cursor
 //!   measured, only as far as the view can show. A line holds at most
 //!   4 KiB.
-//! - **The cursor** blinks every 500 ms while the window has the focus, and
-//!   stays solid through the tick after a key; `run editor --no-blink`
-//!   keeps it solid (the window then settles: the golden). Without the
-//!   focus it isn't shown.
+//! - **The cursor** toggles every 500 ms while the window has the focus
+//!   (shown 500, hidden 500), and stays solid through the tick after a
+//!   key; `run editor --no-blink` keeps it solid (the window then settles:
+//!   the golden). Without the focus it isn't shown and the editor has no
+//!   period, so the desktop settles.
 //! - **The tree:** the buffer is a `textfield` node named `Text`, its value
 //!   the text's first 1,024 bytes (`TEXT_BYTES`, the tree's cap; the kernel
-//!   shows control characters, `\n` included, as U+FFFD). A `set_value`
-//!   (at most 512 bytes, the kernel's cap) replaces the text. The status
+//!   shows control characters, `\n` included, as U+FFFD): a lossy view of
+//!   the buffer, not the buffer. A `set_value` (at most 512 bytes, the
+//!   kernel's cap) replaces the text, normalised (a tab as spaces), as one
+//!   edit; one past the editor's limits is answered failed. The status
 //!   line is a label named `Status` (`lumen_edit::Editor::status`): `Ln
 //!   <line>, Col <column>`, then `, modified` once the text differs from
 //!   the one it started with, and `, full` while the last edit was refused
 //!   (past the text's 16 KiB or a line's 4 KiB).
 //! - **Arguments:** `--empty` starts with no text (else a short sample),
 //!   `--no-blink` as above.
+//! - **Not built:** selection, a scrollbar and placing the cursor with the
+//!   mouse (a click focuses the text); opening and saving files (M6).
 
 #![no_std]
 
