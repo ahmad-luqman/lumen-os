@@ -10,12 +10,17 @@
 //! # Permissions
 //!
 //! The CPU combines the rights of every level on the way down: a page is
-//! writable only if every entry on its path has `WRITABLE`, and executable
-//! only if none has `NO_EXECUTE`. The mapper makes every table entry
-//! permissive (present and writable, executable) and enforces permissions at
-//! the leaf only; walks and sweeps report the *combined* rights, which is
-//! what the CPU enforces. [`Attrs`] can't express a writable and executable
-//! page: W^X holds for every page this mapper creates.
+//! writable only if every entry on its path has `WRITABLE`, executable only
+//! if none has `NO_EXECUTE`, and user-accessible only if every entry on its
+//! path has `USER`. The mapper makes intermediate table entries permissive
+//! (present, writable, executable, plus `USER` on lower-half user paths only)
+//! and enforces permissions at the leaf; walks and sweeps report the
+//! *combined* rights, which is what the CPU enforces. Kernel [`Attrs`]
+//! constants cannot express a writable and executable page (W^X holds for
+//! every kernel page); user mappings use dedicated user constructors (which
+//! also support explicit `PROT_READ | PROT_WRITE | PROT_EXEC` when Linux
+//! `mmap`/`mprotect` requests it, and `PROT_NONE` via [`bits::PTE_PROTNONE`])
+//! and are strictly restricted to the lower half (`L4[0..256]`).
 //!
 //! # Caching
 //!
@@ -27,16 +32,16 @@
 //!
 //! # Scope
 //!
-//! Kernel mappings only: leaves are never user-accessible (M9 adds that).
-//! Tables are never freed: unmapping the last page under a table leaves the
-//! empty table in place (it is reused by later maps). A 2 MiB or 1 GiB map
-//! where a table already exists fails with [`MapError::AlreadyMapped`] even
-//! if that table is empty.
+//! Tables are never freed by [`unmap`]: unmapping the last page under a table
+//! leaves the empty table in place (it is reused by later maps). A 2 MiB or
+//! 1 GiB map where a table already exists fails with
+//! [`MapError::AlreadyMapped`] even if that table is empty.
 //!
 //! Walks don't model reserved bits: a huge bit in an L4 entry (reserved, a
 //! #PF on real hardware) is treated as a table pointer.
 
 use core::fmt;
+use core::ops::Range;
 
 use crate::{FRAME_SIZE, PhysAddr, PhysFrame, VirtAddr};
 
@@ -59,6 +64,11 @@ pub mod bits {
     /// PAT index bit 2, in a 4 KiB (L1) entry.
     pub const PAT_4K: u64 = 1 << 7;
     pub const GLOBAL: u64 = 1 << 8;
+    /// Software bit (bit 9, ignored by hardware): marks a non-present leaf
+    /// (`PRESENT = 0`) whose physical frame is still owned by a `PROT_NONE`
+    /// user mapping, so `mprotect` back to readable preserves data and
+    /// teardown still frees the frame.
+    pub const PTE_PROTNONE: u64 = 1 << 9;
     /// PAT index bit 2, in a 2 MiB or 1 GiB entry.
     pub const PAT_HUGE: u64 = 1 << 12;
     pub const NO_EXECUTE: u64 = 1 << 63;
@@ -196,27 +206,67 @@ impl Cache {
     }
 }
 
-/// What a leaf mapping allows: one of the named combinations, none of which
-/// is both writable and executable (the fields are private so W^X can't be
-/// broken by building one). Leaves are always supervisor-only.
+/// What a leaf mapping allows.
+///
+/// The fields are private so kernel W^X cannot be broken: none of the named
+/// kernel constants (`CODE`, `RODATA`, `DATA`, `MMIO`, `FRAMEBUFFER`) is both
+/// writable and executable, and none is user-accessible. User-mode mappings
+/// (`USER_NONE`, `USER_RO`, `USER_RW`, `USER_RX`, and [`Attrs::for_user`]) are
+/// strictly restricted to lower-half addresses (`L4[0..256]`) by [`map`] and
+/// [`protect`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Attrs {
     writable: bool,
     executable: bool,
+    user: bool,
+    present: bool,
     cache: Cache,
 }
 
 impl Attrs {
     /// Kernel code: read and execute.
-    pub const CODE: Attrs = Attrs { writable: false, executable: true, cache: Cache::WriteBack };
-    /// Read-only data.
-    pub const RODATA: Attrs = Attrs { writable: false, executable: false, cache: Cache::WriteBack };
-    /// Read-write data.
-    pub const DATA: Attrs = Attrs { writable: true, executable: false, cache: Cache::WriteBack };
+    pub const CODE: Attrs =
+        Attrs { writable: false, executable: true, user: false, present: true, cache: Cache::WriteBack };
+    /// Kernel read-only data.
+    pub const RODATA: Attrs =
+        Attrs { writable: false, executable: false, user: false, present: true, cache: Cache::WriteBack };
+    /// Kernel read-write data.
+    pub const DATA: Attrs =
+        Attrs { writable: true, executable: false, user: false, present: true, cache: Cache::WriteBack };
     /// Device registers: read-write, uncached.
-    pub const MMIO: Attrs = Attrs { writable: true, executable: false, cache: Cache::Uncached };
+    pub const MMIO: Attrs =
+        Attrs { writable: true, executable: false, user: false, present: true, cache: Cache::Uncached };
     /// A framebuffer: read-write, write-combining.
-    pub const FRAMEBUFFER: Attrs = Attrs { writable: true, executable: false, cache: Cache::WriteCombining };
+    pub const FRAMEBUFFER: Attrs =
+        Attrs { writable: true, executable: false, user: false, present: true, cache: Cache::WriteCombining };
+
+    /// User `PROT_NONE`: non-present (`PRESENT = 0`, `PTE_PROTNONE = 1`) so
+    /// hardware faults on access while preserving the underlying physical frame.
+    pub const USER_NONE: Attrs =
+        Attrs { writable: false, executable: false, user: true, present: false, cache: Cache::WriteBack };
+    /// User read-only data (`PROT_READ`).
+    pub const USER_RO: Attrs =
+        Attrs { writable: false, executable: false, user: true, present: true, cache: Cache::WriteBack };
+    /// User read-write data (`PROT_READ | PROT_WRITE`).
+    pub const USER_RW: Attrs =
+        Attrs { writable: true, executable: false, user: true, present: true, cache: Cache::WriteBack };
+    /// User read-execute code (`PROT_READ | PROT_EXEC`).
+    pub const USER_RX: Attrs =
+        Attrs { writable: false, executable: true, user: true, present: true, cache: Cache::WriteBack };
+
+    /// Build user-mode page attributes from Linux `PROT_READ`/`PROT_WRITE`/
+    /// `PROT_EXEC` flags.
+    ///
+    /// When all three flags are false, returns [`Attrs::USER_NONE`]. Supports
+    /// explicit user `RWX` when requested by Linux `mmap`/`mprotect` (e.g.
+    /// `libffi`, JITs) without relaxing kernel W^X.
+    pub const fn for_user(readable: bool, writable: bool, executable: bool) -> Attrs {
+        if !readable && !writable && !executable {
+            Self::USER_NONE
+        } else {
+            Attrs { writable, executable, user: true, present: true, cache: Cache::WriteBack }
+        }
+    }
 
     pub const fn writable(self) -> bool {
         self.writable
@@ -226,18 +276,39 @@ impl Attrs {
         self.executable
     }
 
+    /// Is this a user-accessible (`USER`, ring-3) mapping?
+    pub const fn user(self) -> bool {
+        self.user
+    }
+
+    /// Is this a `PROT_NONE` mapping (`PRESENT = 0`, `PTE_PROTNONE = 1`)?
+    pub const fn is_prot_none(self) -> bool {
+        !self.present
+    }
+
     pub const fn cache(self) -> Cache {
         self.cache
     }
 
     /// The leaf entry mapping a page of `size` at `frame` with these rights.
     fn leaf(self, frame: PhysFrame, size: PageSize) -> u64 {
-        let mut e = PRESENT | frame.as_u64() | self.cache.bits(size);
+        let mut e = frame.as_u64() | self.cache.bits(size);
         if size != PageSize::Size4K {
             e |= HUGE;
         }
+        if !self.present {
+            e |= PTE_PROTNONE | NO_EXECUTE;
+            if self.user {
+                e |= USER;
+            }
+            return e;
+        }
+        e |= PRESENT;
         if self.writable {
             e |= WRITABLE;
+        }
+        if self.user {
+            e |= USER;
         }
         if !self.executable {
             e |= NO_EXECUTE;
@@ -247,9 +318,10 @@ impl Attrs {
 }
 
 /// An entry pointing to a lower-level table: permissive, so that the leaf
-/// alone decides the rights.
-fn table_entry(table: PhysFrame) -> u64 {
-    PRESENT | WRITABLE | table.as_u64()
+/// alone decides the rights. `user` is only ever true in the lower half
+/// (`L4[0..256]`).
+fn table_entry(table: PhysFrame, user: bool) -> u64 {
+    PRESENT | WRITABLE | if user { USER } else { 0 } | table.as_u64()
 }
 
 /// A raw page-table entry, as read. The decoding methods assume it is
@@ -258,6 +330,10 @@ fn table_entry(table: PhysFrame) -> u64 {
 pub struct Entry(u64);
 
 impl Entry {
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
     pub const fn raw(self) -> u64 {
         self.0
     }
@@ -268,6 +344,11 @@ impl Entry {
 
     pub const fn is_present(self) -> bool {
         self.has(PRESENT)
+    }
+
+    /// Is this a software `PROT_NONE` leaf (`PRESENT = 0`, `PTE_PROTNONE = 1`)?
+    pub const fn is_prot_none(self) -> bool {
+        !self.is_present() && self.has(PTE_PROTNONE)
     }
 
     /// The size of the page this present entry maps at `level`, or `None` if
@@ -341,8 +422,10 @@ pub struct Step {
     pub entry: Entry,
 }
 
-/// A present page, with the rights the CPU enforces for it (built only by
-/// walks and sweeps).
+/// A mapped page, with the rights the CPU enforces for it (built only by
+/// walks and sweeps). For a `PROT_NONE` leaf (`WalkEnd::ProtNone`), `present`
+/// is `false`, `writable` and `executable` are `false`, and `phys` still names
+/// the preserved backing frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Mapping {
@@ -351,6 +434,8 @@ pub struct Mapping {
     /// First frame of the physical page.
     pub phys: PhysFrame,
     pub size: PageSize,
+    /// Hardware-present (`PRESENT = 1`). `false` only for `PTE_PROTNONE` leaves.
+    pub present: bool,
     /// Combined over every level.
     pub writable: bool,
     /// Combined over every level.
@@ -365,6 +450,11 @@ impl Mapping {
     /// The memory type, if it is one [`Cache`] names.
     pub const fn cache(&self) -> Option<Cache> {
         Cache::from_pat_slot(self.pat_slot)
+    }
+
+    /// Is this a `PROT_NONE` mapping (`PRESENT = 0`, `PTE_PROTNONE = 1`)?
+    pub const fn is_prot_none(&self) -> bool {
+        !self.present
     }
 
     /// The physical address of `virt`, which must be inside this page.
@@ -392,16 +482,33 @@ impl PathRights {
         }
     }
 
-    /// The mapping of the page starting at `virt` that leaf `e` (of `size`)
-    /// maps, with these rights combined with `e`'s.
+    /// The mapping of the page starting at `virt` that present leaf `e` (of
+    /// `size`) maps, with these rights combined with `e`'s.
     fn leaf(self, virt: VirtAddr, e: Entry, size: PageSize) -> Mapping {
         let rights = self.and(e);
         Mapping {
             virt,
             phys: e.page(size),
             size,
+            present: true,
             writable: rights.writable,
             executable: rights.executable,
+            user: rights.user,
+            pat_slot: e.pat_slot(size),
+        }
+    }
+
+    /// A `PROT_NONE` leaf (`PRESENT = 0`, `PTE_PROTNONE = 1`) preserving its
+    /// backing physical frame.
+    fn prot_none_leaf(self, virt: VirtAddr, e: Entry, size: PageSize) -> Mapping {
+        let rights = self.and(e);
+        Mapping {
+            virt,
+            phys: e.page(size),
+            size,
+            present: false,
+            writable: false,
+            executable: false,
             user: rights.user,
             pat_slot: e.pat_slot(size),
         }
@@ -413,6 +520,9 @@ impl PathRights {
 pub enum WalkEnd {
     /// A present page maps the address.
     Mapped(Mapping),
+    /// A `PTE_PROTNONE` page holds the address: hardware treats it as not
+    /// present (`#PF`), while the physical frame is still owned by this entry.
+    ProtNone(Mapping),
     /// The entry at this level is not present.
     NotPresent(Level),
     /// The table at this level (in this frame) could not be read.
@@ -436,10 +546,18 @@ impl Walk {
         self.end
     }
 
-    /// The page mapping the address, if one does.
+    /// The hardware-present page mapping the address, if one does.
     pub fn mapping(&self) -> Option<Mapping> {
         match self.end {
             WalkEnd::Mapped(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// The `PTE_PROTNONE` page holding the address, if one does.
+    pub fn prot_none_mapping(&self) -> Option<Mapping> {
+        match self.end {
+            WalkEnd::ProtNone(m) => Some(m),
             _ => None,
         }
     }
@@ -460,6 +578,12 @@ pub fn walk(mem: &impl TableMemory, root: PhysFrame, virt: VirtAddr) -> Walk {
         w.steps[w.len] = Step { level, table, index, entry };
         w.len += 1;
         if !entry.is_present() {
+            if entry.is_prot_none()
+                && let Some(size) = entry.page_size(level)
+            {
+                w.end = WalkEnd::ProtNone(rights.prot_none_leaf(virt.align_down(size.bytes()), entry, size));
+                return w;
+            }
             w.end = WalkEnd::NotPresent(level);
             return w;
         }
@@ -484,13 +608,17 @@ pub fn translate(mem: &impl TableMemory, root: PhysFrame, virt: VirtAddr) -> Opt
 pub enum MapError {
     /// The virtual or physical address is not aligned to the page size.
     Misaligned,
-    /// Something is already mapped there: a page of this size, a larger page
-    /// covering it, or (for a 2 MiB or 1 GiB page) a table of smaller pages.
+    /// Something is already mapped there: a page of this size (including a
+    /// `PTE_PROTNONE` page), a larger page covering it, or (for a 2 MiB or
+    /// 1 GiB page) a table of smaller pages.
     AlreadyMapped,
     /// No frame for a new table.
     OutOfMemory,
     /// A table on the way down could not be read.
     Unreadable(PhysFrame),
+    /// A user-accessible (`USER`) mapping was requested in the kernel upper
+    /// half (`L4[256..512]`).
+    UserInUpperHalf,
 }
 
 impl fmt::Display for MapError {
@@ -500,6 +628,7 @@ impl fmt::Display for MapError {
             MapError::AlreadyMapped => f.write_str("already mapped"),
             MapError::OutOfMemory => f.write_str("out of memory for page tables"),
             MapError::Unreadable(t) => write!(f, "page table {t} unreadable"),
+            MapError::UserInUpperHalf => f.write_str("user mapping not allowed in kernel upper half"),
         }
     }
 }
@@ -507,6 +636,10 @@ impl fmt::Display for MapError {
 /// Map the page of `size` at `virt` to the physical page starting at
 /// `phys`, with `attrs`. The caller flushes nothing: the entry was not
 /// present, so no TLB holds it.
+///
+/// User-accessible mappings (`attrs.user()`) are allowed only in the lower half
+/// (`L4[0..256]`); upper-half addresses fail with [`MapError::UserInUpperHalf`]
+/// without allocating tables.
 pub fn map(
     mem: &mut impl TableMemoryMut,
     root: PhysFrame,
@@ -518,28 +651,56 @@ pub fn map(
     if !virt.is_aligned(size.bytes()) || !phys.start().is_aligned(size.bytes()) {
         return Err(MapError::Misaligned);
     }
+    if attrs.user() && !virt.is_lower_half() {
+        return Err(MapError::UserInUpperHalf);
+    }
+    let user_table = attrs.user() && virt.is_lower_half();
     let (mut table, mut level) = (root, Level::L4);
     loop {
         let index = level.index_of(virt);
         let entry = Entry(mem.read(table, index).ok_or(MapError::Unreadable(table))?);
         if level == size.level() {
-            if entry.is_present() {
+            if entry.is_present() || entry.is_prot_none() {
                 return Err(MapError::AlreadyMapped);
             }
             mem.write(table, index, attrs.leaf(phys, size));
             return Ok(());
         }
         table = if !entry.is_present() {
+            if entry.is_prot_none() && entry.is_leaf(level) {
+                return Err(MapError::AlreadyMapped);
+            }
             let new = mem.alloc_table().ok_or(MapError::OutOfMemory)?;
-            mem.write(table, index, table_entry(new));
+            mem.write(table, index, table_entry(new, user_table));
             new
         } else if entry.is_leaf(level) {
             return Err(MapError::AlreadyMapped);
         } else {
+            if user_table && !entry.has(USER) {
+                mem.write(table, index, entry.raw() | USER);
+            }
             entry.table()
         };
         level = level.below().expect("the leaf level is L1 at the lowest");
     }
+}
+
+/// Ensure L4 entry `slot` points to a present supervisor-only L3 table,
+/// allocating a zeroed table frame if empty.
+///
+/// Used during `mm::init` to pre-allocate L3 tables for the 6 dynamic kernel
+/// L4 slots (`384, 385, 416, 417, 448, 449`) so copying `L4[256..512]` into a
+/// new process's `AddressSpace` shares all future kernel growth automatically.
+/// Never sets `USER`.
+pub fn ensure_l3_table(mem: &mut impl TableMemoryMut, root: PhysFrame, slot: usize) -> Result<PhysFrame, MapError> {
+    assert!(slot < ENTRIES, "L4 slot {slot} out of range");
+    let entry = Entry(mem.read(root, slot).ok_or(MapError::Unreadable(root))?);
+    if entry.is_present() {
+        return Ok(entry.table());
+    }
+    let new = mem.alloc_table().ok_or(MapError::OutOfMemory)?;
+    mem.write(root, slot, table_entry(new, false));
+    Ok(new)
 }
 
 /// Map `[virt, virt + len)` to `[phys, phys + len)` (both page aligned)
@@ -602,12 +763,13 @@ impl fmt::Display for UnmapError {
     }
 }
 
-/// Unmap the page starting at `virt` and return what it mapped. The caller
-/// must then invalidate the TLB entry for `virt`.
+/// Unmap the page starting at `virt` (present or `PTE_PROTNONE`) and return
+/// what it mapped (including its physical frame). The caller must then
+/// invalidate the TLB entry for `virt`.
 pub fn unmap(mem: &mut impl TableMemoryMut, root: PhysFrame, virt: VirtAddr) -> Result<Mapping, UnmapError> {
     let w = walk(mem, root, virt);
     let m = match w.end {
-        WalkEnd::Mapped(m) => m,
+        WalkEnd::Mapped(m) | WalkEnd::ProtNone(m) => m,
         WalkEnd::NotPresent(_) => return Err(UnmapError::NotMapped),
         WalkEnd::Unreadable(_, t) => return Err(UnmapError::Unreadable(t)),
     };
@@ -616,6 +778,64 @@ pub fn unmap(mem: &mut impl TableMemoryMut, root: PhysFrame, virt: VirtAddr) -> 
     }
     let leaf = *w.steps().last().expect("a mapped walk read its leaf");
     mem.write(leaf.table, leaf.index, 0);
+    Ok(m)
+}
+
+/// Why [`protect`] failed. Nothing changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProtectError {
+    NotMapped,
+    /// `virt` is inside a page but not its first byte.
+    NotPageStart,
+    /// A user-accessible (`USER`) protection was requested in the kernel upper
+    /// half (`L4[256..512]`).
+    UserInUpperHalf,
+    Unreadable(PhysFrame),
+}
+
+impl fmt::Display for ProtectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProtectError::NotMapped => f.write_str("not mapped"),
+            ProtectError::NotPageStart => f.write_str("not the start of a page"),
+            ProtectError::UserInUpperHalf => f.write_str("user mapping not allowed in kernel upper half"),
+            ProtectError::Unreadable(t) => write!(f, "page table {t} unreadable"),
+        }
+    }
+}
+
+/// Update the attributes of an existing mapped page (present or `PTE_PROTNONE`)
+/// at `virt` in place, preserving its physical frame. Returns the previous
+/// [`Mapping`]. The caller must invalidate the TLB entry for `virt` if the
+/// previous mapping was present.
+pub fn protect(
+    mem: &mut impl TableMemoryMut,
+    root: PhysFrame,
+    virt: VirtAddr,
+    attrs: Attrs,
+) -> Result<Mapping, ProtectError> {
+    if attrs.user() && !virt.is_lower_half() {
+        return Err(ProtectError::UserInUpperHalf);
+    }
+    let w = walk(mem, root, virt);
+    let m = match w.end {
+        WalkEnd::Mapped(m) | WalkEnd::ProtNone(m) => m,
+        WalkEnd::NotPresent(_) => return Err(ProtectError::NotMapped),
+        WalkEnd::Unreadable(_, t) => return Err(ProtectError::Unreadable(t)),
+    };
+    if m.virt != virt {
+        return Err(ProtectError::NotPageStart);
+    }
+    let steps = w.steps();
+    if attrs.user() {
+        for s in &steps[..steps.len() - 1] {
+            if !s.entry.has(USER) {
+                mem.write(s.table, s.index, s.entry.raw() | USER);
+            }
+        }
+    }
+    let leaf = *steps.last().expect("a mapped walk read its leaf");
+    mem.write(leaf.table, leaf.index, attrs.leaf(m.phys, m.size));
     Ok(m)
 }
 
@@ -658,6 +878,52 @@ pub fn for_each_mapping(mem: &impl TableMemory, root: PhysFrame, mut f: impl FnM
     let mut unreadable = None;
     go(mem, Level::L4, root, 0, PathRights::ALL, &mut f, &mut unreadable);
     unreadable.map_or(Ok(()), Err)
+}
+
+/// Call `f` with every leaf page under `root` in `l4_slots` (both present and
+/// `PTE_PROTNONE` leaves), in address order. Intended for per-process address
+/// space teardown (`l4_slots = 0..256`), where `PTE_PROTNONE` frames must still
+/// be discovered and freed without touching kernel `L4[256..512]`.
+pub fn for_each_leaf_in(
+    mem: &impl TableMemory,
+    root: PhysFrame,
+    l4_slots: Range<usize>,
+    mut f: impl FnMut(Mapping),
+) -> Result<(), PhysFrame> {
+    struct Sweep<'a, M: TableMemory> {
+        mem: &'a M,
+        f: &'a mut dyn FnMut(Mapping),
+        unreadable: Option<PhysFrame>,
+    }
+    impl<M: TableMemory> Sweep<'_, M> {
+        fn go(&mut self, level: Level, table: PhysFrame, indices: Range<usize>, base: u64, rights: PathRights) {
+            for index in indices {
+                let Some(raw) = self.mem.read(table, index) else {
+                    self.unreadable.get_or_insert(table);
+                    return;
+                };
+                let entry = Entry(raw);
+                let base = base | (index as u64) << level.shift();
+                if !entry.is_present() {
+                    if entry.is_prot_none()
+                        && let Some(size) = entry.page_size(level)
+                    {
+                        (self.f)(rights.prot_none_leaf(canonical(base), entry, size));
+                    }
+                    continue;
+                }
+                match (entry.page_size(level), level.below()) {
+                    (Some(size), _) => (self.f)(rights.leaf(canonical(base), entry, size)),
+                    (None, Some(below)) => self.go(below, entry.table(), 0..ENTRIES, base, rights.and(entry)),
+                    (None, None) => unreachable!("every L1 entry is a page"),
+                }
+            }
+        }
+    }
+    let slots = l4_slots.start.min(ENTRIES)..l4_slots.end.min(ENTRIES);
+    let mut sweep = Sweep { mem, f: &mut f, unreadable: None };
+    sweep.go(Level::L4, root, slots, 0, PathRights::ALL);
+    sweep.unreadable.map_or(Ok(()), Err)
 }
 
 /// Call `f` with every table frame under `root` (including `root`). Returns
@@ -1203,5 +1469,102 @@ mod tests {
         }
         // Every kind of outcome happened, so no branch above is vacuous.
         assert!(outcomes.iter().all(|&n| n > 0), "outcomes {outcomes:?}");
+    }
+
+    #[test]
+    fn user_mappings_allowed_in_lower_half_only() {
+        let (mut m, root) = FakeMem::new();
+        let user_va = v(0x0000_0000_0040_0000);
+        let user_top_va = v(0x0000_7fff_ffff_e000);
+
+        // User mapping in L4[0..256] sets USER on leaf AND all intermediate tables.
+        map(&mut m, root, user_va, f(0x20_0000), PageSize::Size4K, Attrs::USER_RW).unwrap();
+        map(&mut m, root, user_top_va, f(0x21_0000), PageSize::Size4K, Attrs::for_user(true, true, true)).unwrap();
+
+        let w = walk(&m, root, user_va);
+        let mp = w.mapping().unwrap();
+        assert!(mp.present && mp.user && mp.writable && !mp.executable);
+        for s in w.steps() {
+            assert!(s.entry.has(USER), "level {:?} missing USER", s.level);
+        }
+        // Explicit user RWX is supported via Attrs::for_user.
+        let rwx = walk(&m, root, user_top_va).mapping().unwrap();
+        assert!(rwx.present && rwx.user && rwx.writable && rwx.executable);
+
+        // Kernel upper half (L4[256..512]) strictly rejects USER, allocating nothing.
+        let tables_before = m.tables.len();
+        for upper in [HHDM, 0xffff_c000_0000_0000, KERNEL] {
+            for attrs in [Attrs::USER_RO, Attrs::USER_RW, Attrs::USER_RX, Attrs::USER_NONE] {
+                assert_eq!(
+                    map(&mut m, root, v(upper), f(0x30_0000), PageSize::Size4K, attrs),
+                    Err(MapError::UserInUpperHalf),
+                    "upper={upper:#x} attrs={attrs:?}"
+                );
+            }
+        }
+        assert_eq!(m.tables.len(), tables_before, "rejected upper-half user maps allocate nothing");
+
+        // Kernel mapping in upper half never sets USER on any level, and protect refuses USER there.
+        map(&mut m, root, v(KERNEL), f(0x40_0000), PageSize::Size4K, Attrs::DATA).unwrap();
+        let kw = walk(&m, root, v(KERNEL));
+        assert!(!kw.mapping().unwrap().user);
+        for s in kw.steps() {
+            assert!(!s.entry.has(USER), "kernel level {:?} must not have USER", s.level);
+        }
+        assert_eq!(protect(&mut m, root, v(KERNEL), Attrs::USER_RW), Err(ProtectError::UserInUpperHalf));
+
+        // Pre-allocating an L3 table in a dynamic kernel slot sets PRESENT|WRITABLE, never USER.
+        let l3 = ensure_l3_table(&mut m, root, 384).unwrap();
+        assert_eq!(ensure_l3_table(&mut m, root, 384), Ok(l3));
+        let l4e = Entry(m.entry(root, 384));
+        assert!(l4e.is_present() && l4e.has(WRITABLE) && !l4e.has(USER) && l4e.table() == l3);
+    }
+
+    #[test]
+    fn prot_none_preserves_frame_across_round_trip_and_teardown() {
+        let (mut m, root) = FakeMem::new();
+        let va = v(0x0000_0000_0050_0000);
+        let frame = f(0x55_0000);
+        let va2 = v(0x0000_0000_0050_1000);
+        let frame2 = f(0x56_0000);
+
+        // Map RW, then downgrade to PROT_NONE: hardware PRESENT=0, software PTE_PROTNONE=1.
+        map(&mut m, root, va, frame, PageSize::Size4K, Attrs::USER_RW).unwrap();
+        map(&mut m, root, va2, frame2, PageSize::Size4K, Attrs::USER_NONE).unwrap();
+        map(&mut m, root, v(KERNEL), f(0x90_0000), PageSize::Size4K, Attrs::DATA).unwrap();
+
+        let prev = protect(&mut m, root, va, Attrs::USER_NONE).unwrap();
+        assert!(prev.present && prev.writable && prev.user && prev.phys == frame);
+
+        // Not hardware-translatable while PROT_NONE.
+        assert_eq!(translate(&m, root, va), None);
+        assert_eq!(walk(&m, root, va).mapping(), None);
+        let pn = walk(&m, root, va).prot_none_mapping().unwrap();
+        assert!(!pn.present && pn.is_prot_none() && !pn.writable && !pn.executable && pn.user);
+        assert_eq!(pn.phys, frame);
+        let raw_leaf = walk(&m, root, va).steps()[3].entry;
+        assert!(!raw_leaf.is_present() && raw_leaf.is_prot_none() && raw_leaf.has(PTE_PROTNONE));
+
+        // Mapping over a PROT_NONE slot is refused (would leak the physical frame).
+        assert_eq!(map(&mut m, root, va, f(0x77_0000), PageSize::Size4K, Attrs::USER_RW), Err(MapError::AlreadyMapped));
+
+        // Teardown sweep of L4[0..256] finds both PROT_NONE frames and skips kernel L4[256..512].
+        let mut user_leaves = Vec::new();
+        for_each_leaf_in(&m, root, 0..256, |mp| user_leaves.push((mp.virt, mp.phys, mp.present))).unwrap();
+        assert_eq!(user_leaves, [(va, frame, false), (va2, frame2, false)]);
+
+        // Restoring PROT_READ brings back PRESENT=1 with the exact same physical frame.
+        let prev_pn = protect(&mut m, root, va, Attrs::USER_RO).unwrap();
+        assert!(!prev_pn.present && prev_pn.phys == frame);
+        assert_eq!(translate(&m, root, va.checked_add(0x123).unwrap()), Some(p(0x55_0123)));
+        let restored = walk(&m, root, va).mapping().unwrap();
+        assert!(restored.present && restored.user && !restored.writable && !restored.executable);
+        assert_eq!(restored.phys, frame);
+
+        // Unmapping a PROT_NONE page clears the PTE and returns its physical frame for freeing.
+        let removed = unmap(&mut m, root, va2).unwrap();
+        assert!(!removed.present && removed.phys == frame2);
+        assert_eq!(walk(&m, root, va2).end(), WalkEnd::NotPresent(Level::L1));
+        assert_eq!(unmap(&mut m, root, va2), Err(UnmapError::NotMapped));
     }
 }

@@ -113,6 +113,24 @@ pub(super) fn claim_stack_window() -> Window {
 const MMIO_BASE: u64 = 0xffff_e000_0000_0000;
 const MMIO_END: u64 = MMIO_BASE + WINDOW;
 
+/// All 6 dynamic kernel L4 slots (two 512 GiB slots per 1 TiB window):
+/// heap (`384`, `385`), stacks (`416`, `417`), and MMIO (`448`, `449`).
+///
+/// Pre-allocating their L3 tables in [`build`] means copying `L4[256..512]`
+/// into each user process's `AddressSpace` shares all future kernel heap,
+/// stack, and MMIO growth automatically.
+pub const DYNAMIC_KERNEL_L4_SLOTS: [usize; 6] = [384, 385, 416, 417, 448, 449];
+
+const _: () = {
+    const fn slot(va: u64) -> usize {
+        ((va >> 39) & 0x1ff) as usize
+    }
+    let half = 1u64 << 39;
+    assert!(slot(HEAP_BASE) == DYNAMIC_KERNEL_L4_SLOTS[0] && slot(HEAP_BASE + half) == DYNAMIC_KERNEL_L4_SLOTS[1]);
+    assert!(slot(STACKS_BASE) == DYNAMIC_KERNEL_L4_SLOTS[2] && slot(STACKS_BASE + half) == DYNAMIC_KERNEL_L4_SLOTS[3]);
+    assert!(slot(MMIO_BASE) == DYNAMIC_KERNEL_L4_SLOTS[4] && slot(MMIO_BASE + half) == DYNAMIC_KERNEL_L4_SLOTS[5]);
+};
+
 struct Space {
     root: PhysFrame,
     /// Next free address in the MMIO window (it only grows).
@@ -288,6 +306,13 @@ fn build() -> PhysFrame {
         assert!(start % FRAME_SIZE == 0 && end % FRAME_SIZE == 0, "kernel {name} segment is not page aligned");
         let phys = image.physical_base() + (start - image.virtual_base());
         map_range(root, start, phys, end - start, attrs).unwrap_or_else(|err| panic!("kernel {name}: {err}"));
+    }
+    // Pre-allocate L3 tables for all 6 dynamic kernel L4 slots so copying
+    // L4[256..512] into per-process address spaces shares all future kernel
+    // heap, stack, and MMIO growth automatically.
+    for slot in DYNAMIC_KERNEL_L4_SLOTS {
+        pt::ensure_l3_table(&mut Hhdm, root, slot)
+            .unwrap_or_else(|err| panic!("pre-allocating kernel L3 table for L4[{slot}]: {err}"));
     }
     root
 }
@@ -695,6 +720,7 @@ fn write_walk_from(w: &mut dyn Write, root: PhysFrame, v: VirtAddr) -> fmt::Resu
     }
     match walk.end() {
         WalkEnd::Mapped(m) => writeln!(w, "  -> {} page at phys {}: {}", m.size, m.phys, Rights(m)),
+        WalkEnd::ProtNone(m) => writeln!(w, "  -> {} page at phys {}: PROT_NONE", m.size, m.phys),
         WalkEnd::NotPresent(level) => writeln!(w, "  -> not present at L{}", level.number()),
         WalkEnd::Unreadable(level, t) => {
             writeln!(w, "  -> L{} table {t} is not in mapped RAM; stopped", level.number())
@@ -1441,6 +1467,52 @@ crate::ktest!(
             nothing.map(|m| (m.what, m.after)),
             Some((frame::KERNEL_IMAGE, WalkEnd::NotPresent(lumen_mm::paging::Level::L4)))
         );
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn dynamic_kernel_l4_slots_have_l3_tables() {
+        // All 6 dynamic kernel L4 slots (heap 384/385, stacks 416/417, MMIO
+        // 448/449) must have pre-allocated, non-USER L3 tables backed by
+        // allocated frames, and plain `write_cr3` must reload CR3 cleanly.
+        use crate::{kassert, kassert_eq};
+        use lumen_mm::paging::{Entry, Level, bits};
+
+        let root = kernel_root();
+        let mut l3_frames = [PhysFrame::from_u64(0).ok_or("frame")?; 6];
+        for (i, slot) in DYNAMIC_KERNEL_L4_SLOTS.into_iter().enumerate() {
+            let raw = Hhdm.read(root, slot).ok_or("kernel L4 root unreadable")?;
+            let entry = Entry::from_raw(raw);
+            kassert!(entry.is_present());
+            kassert!(entry.has(bits::WRITABLE));
+            kassert!(!entry.has(bits::USER));
+            kassert!(!entry.is_leaf(Level::L4));
+            let l3 = entry.table();
+            kassert!(frame::is_allocated(l3));
+            // Every slot gets its own distinct L3 table frame.
+            for &prev in &l3_frames[..i] {
+                kassert!(prev != l3);
+            }
+            l3_frames[i] = l3;
+        }
+        // All 6 L3 tables are reachable by the active table sweep.
+        let mut found = [false; 6];
+        for_each_active_table(|t| {
+            for (seen, &l3) in found.iter_mut().zip(&l3_frames) {
+                if t == l3 {
+                    *seen = true;
+                }
+            }
+        })
+        .map_err(|_| "active page table unreadable")?;
+        kassert!(found.into_iter().all(|b| b));
+
+        // Reloading the active kernel root via plain `write_cr3` preserves it
+        // without toggling CR4.PGE or tripping CR4.PCIDE.
+        // SAFETY: `root` is the active kernel hierarchy, mapping the running kernel.
+        unsafe { hw::write_cr3(root.as_u64()) };
+        kassert_eq!(hw::active_root(), root);
         Ok(())
     }
 );

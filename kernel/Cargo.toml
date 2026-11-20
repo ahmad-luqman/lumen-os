@@ -38,6 +38,7 @@ lumen-time.workspace = true
 lumen-trace.workspace = true
 lumen-uart.workspace = true
 lumen-ui.workspace = true
+lumen-vm.workspace = true
 lumen-wm.workspace = true
 limine.workspace = true
 log.workspace = true

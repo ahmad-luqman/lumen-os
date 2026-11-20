@@ -1,0 +1,9 @@
+[package]
+name = "lumen-vm"
+description = "no_std user virtual memory area (VMA) interval tree and brk logic for the Lumen kernel, host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

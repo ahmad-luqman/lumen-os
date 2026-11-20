@@ -40,6 +40,7 @@ lumen-trace = { path = "crates/lumen-trace" }
 lumen-uart = { path = "crates/lumen-uart" }
 lumen-ui = { path = "crates/lumen-ui" }
 lumen-view = { path = "crates/lumen-view" }
+lumen-vm = { path = "crates/lumen-vm" }
 lumen-wm = { path = "crates/lumen-wm" }
 lumen-xray = { path = "crates/lumen-xray" }
 # 0.6.x needs nightly (#![feature(ptr_metadata)]); 0.5.0 is the newest stable-compatible release.
