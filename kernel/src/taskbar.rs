@@ -3,7 +3,8 @@
 //! built with `lumen-ui` so its buttons are in the automation tree.
 //!
 //! Left to right: the `Launcher` menu (its items open a terminal, the
-//! Mandelbrot and Life windows, or Counter), a button per window in the
+//! Mandelbrot and Life windows or Counter, then start each bundled app
+//! whose manifest grants `desktop`, by name: #206), a button per window in the
 //! order they opened (a press restores it if minimized, then raises and
 //! focuses it), and at the right end the `Clock`, a fixed-size label
 //! showing the RTC's `HH:MM`.
@@ -29,8 +30,15 @@ use crate::ui::{Step, Toolkit};
 
 /// Pixels between the taskbar's edges and its widgets.
 const PAD: u32 = 4;
-/// What the launcher opens, in its order.
+/// What the launcher opens first, in its order; the bundled desktop apps
+/// follow ([`items`]).
 const ITEMS: [&str; 4] = ["Terminal", "Mandelbrot", "Life", "Counter"];
+
+/// The launcher's items: [`ITEMS`], then the bundled apps whose manifest
+/// grants `desktop` (never the test apps), by name.
+fn items() -> Vec<&'static str> {
+    ITEMS.into_iter().chain(crate::app::desktop_apps()).collect()
+}
 /// How often the clock polls the RTC.
 const POLL_NS: u64 = 1_000_000_000;
 
@@ -114,6 +122,8 @@ impl Clock {
 struct Taskbar {
     ui: Ui,
     launcher: Widget,
+    /// The launcher's items ([`items`]), in its order.
+    items: Vec<&'static str>,
     windows: Stack,
     /// A button per window: its id and the button, in the order opened.
     buttons: Vec<(u32, Widget)>,
@@ -124,12 +134,13 @@ struct Taskbar {
 impl Taskbar {
     fn new(clock_width: u32) -> Taskbar {
         let mut ui = Ui::bar(PAD);
-        let launcher = ui.menu(None, "Launcher", &ITEMS);
+        let items = items();
+        let launcher = ui.menu(None, "Launcher", &items);
         let windows = ui.hstack(None, "Windows");
         let clock = ui.fixed_label(None, "Clock", "--:--", clock_width);
         let pinned = ui.pin_right(clock);
         debug_assert!(pinned, "the clock is a top widget of a bar");
-        Taskbar { ui, launcher, windows, buttons: Vec::new(), clock, readings: Clock::default() }
+        Taskbar { ui, launcher, items, windows, buttons: Vec::new(), clock, readings: Clock::default() }
     }
 
     /// Bring the buttons in line with the window list: a button for a
@@ -160,18 +171,24 @@ impl Taskbar {
         self.ui.set_text(self.clock, &text);
     }
 
-    /// Open what launcher item `item` names: its window's id, or why not
-    /// (each refused while the desktop is paused, as `terminal` is).
-    fn launch(item: usize) -> Result<u32, String> {
+    /// Open what launcher item `item` names: what it opened (`window 3`,
+    /// or an app started through `run`'s path, `app 2`, its window still to
+    /// come), or why not (each refused while the desktop is paused, as
+    /// `terminal` is).
+    fn launch(&self, item: usize) -> Result<String, String> {
         if let Some(why) = desktop::refused_while_paused() {
             return Err(String::from(why));
         }
+        let window = |id: Result<u32, String>| id.map(|id| format!("window {id}"));
         match item {
-            0 => crate::termwin::open(),
-            1 => crate::demo::open_mandelbrot_window(),
-            2 => crate::demo::open_life_window(),
-            3 => crate::ui::open_counter(),
-            _ => Err(String::from("no such item")),
+            0 => window(crate::termwin::open()),
+            1 => window(crate::demo::open_mandelbrot_window()),
+            2 => window(crate::demo::open_life_window()),
+            3 => window(crate::ui::open_counter()),
+            _ => match self.items.get(item) {
+                Some(app) => crate::app::start(app).map(|id| format!("app {id}")),
+                None => Err(String::from("no such item")),
+            },
         }
     }
 }
@@ -185,12 +202,12 @@ impl App for Taskbar {
         for e in events {
             match *e {
                 UiEvent::Chosen(w, item) if w == self.launcher => {
-                    let name = ITEMS.get(item).copied().unwrap_or("?");
-                    let opened = Taskbar::launch(item);
+                    let name = self.items.get(item).copied().unwrap_or("?");
+                    let opened = self.launch(item);
                     // Its button now, before the request is answered.
                     self.sync();
                     match opened {
-                        Ok(id) => log::info!(target: "taskbar", "{name}: window {id}"),
+                        Ok(what) => log::info!(target: "taskbar", "{name}: {what}"),
                         Err(e) => {
                             log::warn!(target: "taskbar", "{name}: {e}");
                             return Then::Failed(format!("{name}: {e}"));

@@ -1,5 +1,5 @@
 //! What Lumen's test apps share (#199): the `lumen` host functions as
-//! imports, a log helper, [`manifest!`], a panic handler that reports the
+//! imports (the window and text calls too, #206), a log helper, [`manifest!`], a panic handler that reports the
 //! message through `panic`, and a bump allocator in the app's fixed memory.
 //! Not the SDK (that is #206's `lumen-app`): just enough for the runtime's
 //! tests to call every host function, right and wrong.
@@ -21,8 +21,7 @@ pub use lumen_app_api::{Error, Grant, LogLevel};
 /// every range against the app's memory before it touches a byte, so the
 /// calls that only read the app's memory (or none) are safe: a wrong
 /// pointer is an error code (or, for `panic`, which ends the app anyway,
-/// the message `<a bad pointer>`). The two that write into it are
-/// `unsafe`.
+/// the message `<a bad pointer>`). Those that write into it are `unsafe`.
 pub mod host {
     #[link(wasm_import_module = "lumen")]
     unsafe extern "C" {
@@ -42,6 +41,23 @@ pub mod host {
         pub safe fn time_now(h: i32) -> i64;
         pub safe fn time_wall(h: i32) -> i64;
         pub safe fn time_sleep(h: i32, ns: i64) -> i32;
+        pub safe fn window_open(h: i32, title: i32, len: i32, width: i32, height: i32) -> i32;
+        pub safe fn window_commit(h: i32, canvas: i32, rects: i32, n: i32) -> i32;
+        /// Writes one encoded event into `[buf, buf + len)`.
+        ///
+        /// # Safety
+        ///
+        /// As [`args_read`]: the caller owns that range.
+        pub unsafe fn window_next_event(h: i32, buf: i32, len: i32) -> i32;
+        pub safe fn window_wait(h: i32, deadline: i64, animating: i32) -> i32;
+        pub safe fn text_line_height(h: i32, px: i32) -> i32;
+        pub safe fn text_measure(h: i32, px: i32, text: i32, len: i32) -> i32;
+        /// Draws into the canvas's pixels (inside its clip).
+        ///
+        /// # Safety
+        ///
+        /// The caller owns the canvas's pixels.
+        pub unsafe fn text_draw(h: i32, canvas: i32, args: i32, text: i32, len: i32) -> i32;
         pub safe fn trace_cpus(h: i32) -> i32;
         /// Writes the trace header and events into `[buf, buf + len)`.
         ///

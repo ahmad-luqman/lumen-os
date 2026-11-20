@@ -2,7 +2,8 @@
 //! a kill ending the app at a host call's entry however the call is made,
 //! fuel, the code, memory and value-stack charges against the heap's
 //! high-water mark, `trace_read`'s edges, `kill`'s lines, `launch`'s
-//! refusals and the reaper.
+//! refusals and the reaper; the close grace's slice trigger and a kill
+//! waking an app's window wait (#206).
 //!
 //! The charge tests read the global heap's counters: they assume nothing
 //! else allocates meanwhile (ktests run one at a time, no app runs, and
@@ -12,6 +13,7 @@
 use super::modules::{self, leb128};
 use super::runtime::{self, AppState, Phase};
 use super::{BUNDLED, TEST_APPS, host};
+use crate::desktop::{Animating, Wait};
 use crate::mm::heap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -21,8 +23,8 @@ use core::hint::black_box;
 use lumen_app_api::end::{EndReason, Outcome};
 use lumen_app_api::host::{FUNCTIONS, MODULE, Ty};
 use lumen_app_api::limits::{
-    APP_OVERHEAD, BYTE_FUEL, CALL_FUEL, CODE_FACTOR, EVENT_FUEL, LOG_FUEL, MEMORY_PAGES, MODULE_BYTES, PAGE_BYTES,
-    SLICE_FUEL, STORE_BYTES, TABLE_ELEMENTS, VALUE_STACK_BYTES,
+    APP_OVERHEAD, BYTE_FUEL, CALL_FUEL, CLOSE_GRACE_SLICES, CODE_FACTOR, EVENT_FUEL, LOG_FUEL, MEMORY_PAGES,
+    MODULE_BYTES, PAGE_BYTES, SLICE_FUEL, STORE_BYTES, TABLE_ELEMENTS, VALUE_STACK_BYTES,
 };
 use lumen_app_api::{Error, Grants, manifest, text};
 use wasmi::{Engine, Linker, Module, Store};
@@ -937,6 +939,56 @@ crate::ktest!(
         crate::kassert!(runtime::reaper_running());
         let (a, b) = (first.state.id, second.state.id);
         crate::kassert!(wait_for(10_000, || !runtime::listed(a) && !runtime::listed(b)));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn the_close_grace_ends_an_app_at_its_slice_ends() {
+        let state = test_state();
+        let (mut store, _) = load_as(&Spec::default().bytes(), &state, Grants::log())?;
+        runtime::begin_slice(&mut store, 0).map_err(|_| "no slice")?;
+        // Not given `Close`: slice ends don't count.
+        for _ in 0..2 * CLOSE_GRACE_SLICES {
+            crate::kassert!(runtime::end_slice(&mut store).is_ok());
+        }
+        // Given it (`window_next_event` handing it over): the grace's last
+        // slice end ends the app.
+        store.data_mut().given_close();
+        for _ in 1..CLOSE_GRACE_SLICES {
+            crate::kassert!(runtime::end_slice(&mut store).is_ok());
+        }
+        crate::kassert_eq!(runtime::end_slice(&mut store), Err(EndReason::CloseGrace));
+        // A kill outranks it: checked first at the same slice end.
+        let state = test_state();
+        let (mut store, _) = load_as(&Spec::default().bytes(), &state, Grants::log())?;
+        store.data_mut().given_close();
+        for _ in 1..CLOSE_GRACE_SLICES {
+            crate::kassert!(runtime::end_slice(&mut store).is_ok());
+        }
+        state.ask_kill();
+        crate::kassert_eq!(runtime::end_slice(&mut store), Err(EndReason::Killed));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn a_kill_wakes_the_app_s_window_wait() {
+        let desktop = crate::desktop::Desktop::without_screen();
+        let mut window = desktop.open_window("app", 16, 16).map_err(|_| "no window")?;
+        let state = test_state();
+        state.set_window(Some(window.waker()));
+        // Its first event (the theme) taken: nothing more to read.
+        while window.next_event().is_some() {}
+        state.ask_kill();
+        // The wait ends at once, woken, with no event: `window_wait` then
+        // sees the kill flag.
+        let woke = window.wait_event_until(None, Animating::No);
+        crate::kassert!(matches!(woke, Wait::Woken));
+        crate::kassert!(state.kill_asked());
+        // Without a window, a kill wakes nothing more (and doesn't fail).
+        state.set_window(None);
+        state.ask_kill();
         Ok(())
     }
 );

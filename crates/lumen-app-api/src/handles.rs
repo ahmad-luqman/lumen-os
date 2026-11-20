@@ -73,6 +73,11 @@ impl<T> HandleTable<T> {
         self.open.iter().find(|(_, o)| matches(o)).map(|(id, _)| *id as i32)
     }
 
+    /// Every open handle's object, in the order they were opened.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.open.iter_mut().map(|(_, o)| o)
+    }
+
     /// Open handles.
     pub fn len(&self) -> usize {
         self.open.len()
@@ -106,6 +111,11 @@ mod tests {
         assert_eq!(t.find(|o| *o == 'c'), Some(3));
         assert_eq!(t.find(|o| *o == 'a'), None);
         assert_eq!(t.len(), 2);
+        // Every open object, oldest first, to change.
+        for o in t.iter_mut() {
+            *o = o.to_ascii_uppercase();
+        }
+        assert_eq!((t.get(b), t.get(3)), (Ok(&'B'), Ok(&'C')));
     }
 
     #[test]

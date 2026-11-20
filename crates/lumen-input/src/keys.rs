@@ -139,6 +139,13 @@ impl Mods {
     pub const fn with_numlock(self) -> Mods {
         Mods(self.0 | Self::NUMLOCK)
     }
+
+    /// Its bits: left and right Shift, Ctrl and Alt (bits 0 to 5, left
+    /// first), Caps Lock (6), Num Lock (7). The WASM app interface's `mods`
+    /// byte (`lumen-app-api`, which pins it).
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
 }
 
 impl From<&Modifiers> for Mods {

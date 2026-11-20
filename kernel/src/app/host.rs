@@ -1,10 +1,10 @@
-//! The `lumen` host functions without a window (ARCHITECTURE section 8,
-//! "The host interface"), defined into an app's `Linker`. Every call goes
-//! through [`entry`] (the kill flag, a slice end if too little fuel is
-//! left, `CALL_FUEL`), then checks its arguments in section 8's order
-//! ("Every call, in this order"): a refused call writes nothing, and no
-//! guest pointer is held across anything that can run the app. The window
-//! and text calls come with #206.
+//! The `lumen` host functions (ARCHITECTURE section 8, "The host
+//! interface"), defined into an app's `Linker`: those without a window here,
+//! the window and text calls in `window.rs` (#206). Every call goes through
+//! [`entry`] (the kill flag, a slice end if too little fuel is left,
+//! `CALL_FUEL`), then checks its arguments in section 8's order ("Every
+//! call, in this order"): a refused call writes nothing, and no guest
+//! pointer is held across anything that can run the app.
 
 use super::runtime::{self, AppCtx, AppState};
 use crate::{rtc, sched, time, trace};
@@ -18,8 +18,8 @@ use lumen_app_api::{Error, Grant, Kind, LogLevel, range, returned, returned64};
 use lumen_trace::{Event, Stream};
 use wasmi::{Caller, Linker};
 
-type C<'a> = Caller<'a, AppCtx>;
-type Res<T> = Result<T, wasmi::Error>;
+pub(super) type C<'a> = Caller<'a, AppCtx>;
+pub(super) type Res<T> = Result<T, wasmi::Error>;
 
 /// The app stops with `reason` (recorded, then the host error wasmi never
 /// resumes).
@@ -33,7 +33,7 @@ fn stop(c: &mut C<'_>, reason: EndReason) -> wasmi::Error {
 /// wasmi checks fuel only where a block starts and a run of calls in one
 /// block would otherwise be free; then `CALL_FUEL`, refused call or not;
 /// then the call itself.
-fn entry<T>(c: &mut C<'_>, call: impl FnOnce(&mut C<'_>) -> Res<T>) -> Res<T> {
+pub(super) fn entry<T>(c: &mut C<'_>, call: impl FnOnce(&mut C<'_>) -> Res<T>) -> Res<T> {
     if c.data().state.kill_asked() {
         return Err(stop(c, EndReason::Killed));
     }
@@ -55,14 +55,14 @@ fn ending(c: &mut C<'_>, reason: impl FnOnce(&mut C<'_>) -> EndReason) -> Res<()
     })
 }
 
-/// A blocking call's wait (`time_sleep`; #206's `window_wait`): the slice
-/// ends (counted; a kill or the close grace ends the app), the app is
-/// `waiting` in `call` while `wait` runs, a kill meanwhile ends it, then a
-/// fresh slice.
-fn blocking<T>(c: &mut C<'_>, call: &'static str, wait: impl FnOnce(&AppState) -> T) -> Res<T> {
+/// A blocking call's wait (`time_sleep`, `window_wait`): the slice ends
+/// (counted; a kill or the close grace ends the app), the app is `waiting`
+/// in `call` while `wait` runs (with the store's data, for a window), a
+/// kill meanwhile ends it, then a fresh slice.
+pub(super) fn blocking<T>(c: &mut C<'_>, call: &'static str, wait: impl FnOnce(&mut AppCtx, &AppState) -> T) -> Res<T> {
     runtime::end_slice(&mut *c).map_err(|reason| stop(c, reason))?;
     let state = c.data().state.clone();
-    let out = state.waiting(call, || wait(&state));
+    let out = state.waiting(call, || wait(c.data_mut(), &state));
     if state.kill_asked() {
         return Err(stop(c, EndReason::Killed));
     }
@@ -71,17 +71,17 @@ fn blocking<T>(c: &mut C<'_>, call: &'static str, wait: impl FnOnce(&AppState) -
 }
 
 /// The app's memory's current size.
-fn memory_len(c: &C<'_>) -> usize {
+pub(super) fn memory_len(c: &C<'_>) -> usize {
     c.data().memory.map_or(0, |m| m.data(c).len())
 }
 
 /// A copy of `[ptr, ptr + len)`, already checked by [`range`].
-fn copy_in(c: &C<'_>, r: core::ops::Range<usize>) -> Vec<u8> {
+pub(super) fn copy_in(c: &C<'_>, r: core::ops::Range<usize>) -> Vec<u8> {
     c.data().memory.map_or_else(Vec::new, |m| m.data(c)[r].to_vec())
 }
 
 /// `bytes` written at `at` (checked: within a range [`range`] accepted).
-fn write_out(c: &mut C<'_>, at: usize, bytes: &[u8]) {
+pub(super) fn write_out(c: &mut C<'_>, at: usize, bytes: &[u8]) {
     if let Some(m) = c.data().memory {
         m.data_mut(c)[at..at + bytes.len()].copy_from_slice(bytes);
     }
@@ -133,7 +133,7 @@ pub(super) fn define(linker: &mut Linker<AppCtx>) -> Result<(), wasmi::Error> {
             }
             let Ok(ns) = u64::try_from(ns) else { return Ok(Error::BadArgument.returned()) };
             let deadline = time::now_ns().checked_add(ns);
-            blocking(c, "time_sleep", |state| state.wait_until(deadline))?;
+            blocking(c, "time_sleep", |_, state| state.wait_until(deadline))?;
             Ok(0)
         })
     })?;
@@ -147,7 +147,7 @@ pub(super) fn define(linker: &mut Linker<AppCtx>) -> Result<(), wasmi::Error> {
             entry(&mut c, |c| Ok(returned(trace_read(c, h, stream, cpu, since, buf, len))))
         },
     )?;
-    Ok(())
+    super::window::define(linker)
 }
 
 /// `panic`'s message, however bad: at most `TEXT_BYTES` of it read (a

@@ -1,5 +1,7 @@
 """The WASM app runtime (#199; ARCHITECTURE section 8): `run`, `apps`,
-`kill`, the host functions without a window, and how an app ends.
+`kill`, the host functions, how an app ends, and apps' windows (#206: the
+template, the window calls' checks, the close grace, a kill waking a
+`window_wait`).
 
 The test apps are embedded in the kernel as `TEST_APPS` (ARCHITECTURE
 section 8, "What #199 adds"). Judged by confirmed effects and counts only
@@ -13,10 +15,12 @@ line and its thread's join.
 
 import re
 
+from lumen_harness import gui
 from lumen_harness.gui import parse_records, poll
 from lumen_harness.klog import STAMP
 from lumen_harness.screen import PROMPT
 from lumen_harness.shell import heap_line, run, wait_for_output
+from PIL import Image
 
 BOOT_TIMEOUT = 60
 STARTED = re.compile(r"^run: started (\S+) as app (\d+)$")
@@ -68,7 +72,7 @@ def wait_gone(m, app_id: int, thread: str, allow: str | None = None) -> None:
 
 # Every place `kill` can say an app still ending is (runtime.rs,
 # `Phase::place`).
-KILL_PLACES = ("loading", "in a slice", "in time_sleep", "ending")
+KILL_PLACES = ("loading", "in a slice", "in time_sleep", "in window_wait", "ending")
 
 
 def kill(m, app_id: int, name: str, allow: str | None = None) -> None:
@@ -101,9 +105,9 @@ def test_hello_wasm(boot):
     wait_for_output(m, mark, r"INFO  app: hello: hello from wasm\n", 30)
     end_line(m, mark, "hello", app_id, "exited with 0")
     wait_unlisted(m, app_id)
-    # `run` alone: its usage and the bundled apps (none bundled yet).
+    # `run` alone: its usage and the bundled apps (not the test apps).
     out = run(m, "run")
-    assert out.startswith("usage: run [--without <grant>] <app> [args...]"), out
+    assert out == "usage: run [--without <grant>] <app> [args...]\napps: template\n", out
     assert "run: no app nope" in run(m, "run nope")
     # `exit(n)` is an ending like returning n.
     app_id, mark = start(m, "hello exit 7")
@@ -277,3 +281,128 @@ def test_app_log_is_cut_and_sanitised(boot):
     )
     end_line(m, mark, "hello", app_id, "exited with 0")
     assert not re.search(r"^\[    1\.000000\] INFO  boot", m.output[mark:], re.MULTILINE)
+
+
+# -- windows (#206) -------------------------------------------------------------
+
+# The window frame's title bar (kernel/src/desktop.rs METRICS).
+TITLE_H = 24
+
+
+def boot_desktop(boot):
+    m = boot_shell(boot)
+    gui.start_desktop(m)
+    return m
+
+
+def wait_window(m, title: str) -> dict[str, str]:
+    """Until `windows` lists a window titled `title`: its row."""
+    rows = gui.wait_for(
+        m,
+        f"window {title!r} open",
+        lambda: gui.windows(m),
+        lambda rows: any(r["title"] == title for r in rows),
+        30,
+    )
+    return next(r for r in rows if r["title"] == title)
+
+
+def wait_no_window(m, title: str) -> None:
+    gui.wait_for(
+        m,
+        f"window {title!r} closed",
+        lambda: gui.windows(m),
+        lambda rows: all(r["title"] != title for r in rows),
+        30,
+    )
+
+
+def test_template_app_runs(boot):
+    # The committed template (what `make app` copies): `run` opens its
+    # window, focused in front; a key typed through confirmed steps
+    # changes what it draws; closing the window ends it (exit 0), its
+    # thread joined and its window gone.
+    m = boot_desktop(boot)
+    app_id, mark = start(m, "template")
+    row = wait_window(m, "template")
+    assert row["focused"] == "yes", row
+    record, done = poll(
+        m, lambda: app(m, app_id), lambda a: a is not None and a["windows"] == "1", 30
+    )
+    assert done, record
+    gui.wait_settled(m)
+    x, y, w, h = gui.bounds(gui.window(m, "template"))
+    box = (x + 1, y + TITLE_H, x + w - 1, y + h - 1)
+
+    def client(name: str) -> bytes:
+        with Image.open(m.screendump(name)) as img:
+            return img.convert("RGB").crop(box).tobytes()
+
+    before = client("template-before.png")
+    assert len(set(before)) > 2, "the template drew nothing"
+    gui.type_confirmed(m, "a")
+    gui.wait_for(m, "the key redrawn", lambda: client("template-after.png"), lambda c: c != before)
+    root = gui.node(gui.ui_tree(m), "window", "template")
+    assert run(m, f"ui invoke {root['id']} close") == f"ui invoke: window {row['id']} closed\n"
+    end_line(m, mark, "template", app_id, "exited with 0")
+    wait_gone(m, app_id, record["thread"])
+    wait_no_window(m, "template")
+
+
+def test_app_ignoring_close_is_ended(boot):
+    # A busy app given `Close` that keeps its window: ended after
+    # CLOSE_GRACE_SLICES slice ends ("didn't close its window"), its window
+    # gone with it and its thread joined. `ui invoke`'s close says closed
+    # or, if the grace outlasts its deadline, still open.
+    m = boot_desktop(boot)
+    app_id, mark = start(m, "window ignore-close")
+    wait_for_output(m, mark, r"INFO  app: window: window: opened\n", 30)
+    row = wait_window(m, "window")
+    record = app(m, app_id)
+    root = gui.node(gui.ui_tree(m), "window", "window")
+    out = run(m, f"ui invoke {root['id']} close")
+    assert out in (
+        f"ui invoke: window {row['id']} closed\n",
+        f"ui invoke: window {row['id']} still open (its close is still queued)\n",
+    ), out
+    wait_for_output(m, mark, r"INFO  app: window: window: ignoring close\n", 30)
+    end_line(m, mark, "window", app_id, "ended: didn't close its window")
+    wait_gone(m, app_id, record["thread"])
+    wait_no_window(m, "window")
+
+
+def test_window_calls_refuse_bad_arguments(boot):
+    # The `abuse` app's `window` checks (see its doc): every refusal an
+    # error code, each asserted by the app; exit 0, no WARN or ERROR.
+    m = boot_desktop(boot)
+    app_id, mark = start(m, "abuse window")
+    found = wait_for_output(
+        m, mark, r"INFO  app: abuse: abuse: window: (\d+) checks, (\d+) failed\n", 30
+    )
+    end_line(m, mark, "abuse", app_id, "exited with 0")
+    assert int(found[1]) >= 60 and found[2] == "0", m.output[mark:]
+    serial = m.output[mark:]
+    assert "FAILED" not in serial and "WARN" not in serial and "ERROR" not in serial, serial
+    wait_unlisted(m, app_id)
+    wait_no_window(m, "abuse")
+
+
+def test_kill_wakes_an_app_waiting_on_its_window(boot):
+    # `window_wait(-1, 0)` blocks (`waiting`); `kill` wakes it through its
+    # window: "killed", or any place `kill` can print on a host that
+    # stalls the app; confirmed by the end line and the thread's join.
+    m = boot_desktop(boot)
+    app_id, mark = start(m, "window wait")
+    wait_for_output(m, mark, r"INFO  app: window: window: waiting\n", 30)
+    record, done = poll(
+        m,
+        lambda: app(m, app_id),
+        lambda a: a is not None and a["state"] == "waiting" and a["windows"] == "1",
+        30,
+    )
+    assert done, record
+    mark = len(m.output)
+    kill(m, app_id, "window")
+    end_line(m, mark, "window", app_id, "killed")
+    wait_gone(m, app_id, record["thread"])
+    wait_no_window(m, "window")

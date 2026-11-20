@@ -1,0 +1,639 @@
+//! [`Event`], what `window_next_event` hands an app (ARCHITECTURE section 8,
+//! "Wire formats"): postcard over the serde-derived types here, each
+//! `WindowEvent` the desktop delivers becoming one.
+//!
+//! serde numbers an enum's variants by declaration position (a `repr`
+//! discriminant is ignored on the wire), so every wire enum here is
+//! declared in its numbered order, field-less ones with explicit
+//! discriminants checked against their positions at compile time, and a
+//! host test pins every variant's bytes. The conversions from the kernel's
+//! types (`lumen-input`'s keys, buttons and modifiers, `lumen-wm`'s theme,
+//! `lumen-ui`'s palette and actions) live here too, so those crates need no
+//! serde and reordering their variants can't change the ABI.
+//!
+//! Decoding follows section 8's rules: [`Event::decode`] refuses bytes
+//! left over (`postcard::take_from_bytes`, then the remainder), and no type
+//! here is recursive or a sequence of zero-sized elements. The host's
+//! encoding is at most [`EVENT_BYTES`] (the largest event is tested), so it
+//! encodes into a fixed buffer ([`Event::encode`]) and allocates nothing.
+
+use crate::limits::{EVENT_BYTES, SET_VALUE_BYTES};
+use alloc::string::String;
+use serde::{Deserialize, Serialize};
+
+/// A field-less wire enum from one list: explicit discriminants, each
+/// checked against its declaration position at compile time (serde encodes
+/// the position), `ALL` in that order and `name`.
+macro_rules! wire_enum {
+    ($(#[$meta:meta])* $vis:vis enum $name:ident { $($variant:ident = $num:literal,)* }) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[repr(u8)]
+        $vis enum $name {
+            $($variant = $num,)*
+        }
+
+        impl $name {
+            /// Every variant, in its numbered (declaration) order.
+            pub const ALL: [$name; [$($num),*].len()] = [$($name::$variant),*];
+
+            /// Its name (`F1`).
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $($name::$variant => stringify!($variant),)*
+                }
+            }
+        }
+
+        const _: () = {
+            let mut i = 0;
+            while i < $name::ALL.len() {
+                assert!($name::ALL[i] as usize == i, "a wire enum's discriminant must be its position");
+                i += 1;
+            }
+        };
+    };
+}
+
+wire_enum! {
+    /// A desktop theme (`lumen_wm::ThemeId`).
+    pub enum ThemeId {
+        Light = 0,
+        Dark = 1,
+    }
+}
+
+impl From<lumen_wm::ThemeId> for ThemeId {
+    fn from(id: lumen_wm::ThemeId) -> ThemeId {
+        match id {
+            lumen_wm::ThemeId::Light => ThemeId::Light,
+            lumen_wm::ThemeId::Dark => ThemeId::Dark,
+        }
+    }
+}
+
+impl From<ThemeId> for lumen_wm::ThemeId {
+    fn from(id: ThemeId) -> lumen_wm::ThemeId {
+        match id {
+            ThemeId::Light => lumen_wm::ThemeId::Light,
+            ThemeId::Dark => lumen_wm::ThemeId::Dark,
+        }
+    }
+}
+
+/// The toolkit's colours for a theme, `0x00RRGGBB` each, in this (wire)
+/// order: as the kernel's `ui::palette` gives them, so an app's toolkit
+/// looks like a kernel window's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Palette {
+    pub background: u32,
+    pub text: u32,
+    pub accent: u32,
+    pub accent_text: u32,
+    pub border: u32,
+    pub disabled: u32,
+    pub field: u32,
+}
+
+impl From<&lumen_ui::Palette> for Palette {
+    fn from(p: &lumen_ui::Palette) -> Palette {
+        let lumen_ui::Palette { background, text, accent, accent_text, border, disabled, field } = *p;
+        Palette { background, text, accent, accent_text, border, disabled, field }
+    }
+}
+
+impl From<Palette> for lumen_ui::Palette {
+    fn from(p: Palette) -> lumen_ui::Palette {
+        let Palette { background, text, accent, accent_text, border, disabled, field } = p;
+        lumen_ui::Palette { background, text, accent, accent_text, border, disabled, field }
+    }
+}
+
+/// [`KeyCode`] from one list of `pc_keyboard::KeyCode`'s variants (0.9.0's,
+/// in its order): the wire enum, and both conversions as exhaustive
+/// matches, so a variant can't be missed by either.
+macro_rules! key_codes {
+    ($($variant:ident = $num:literal,)*) => {
+        wire_enum! {
+            /// A physical key: every `pc_keyboard::KeyCode` pc-keyboard 0.9.0
+            /// has, in its order (all below 128: one byte on the wire).
+            pub enum KeyCode {
+                $($variant = $num,)*
+            }
+        }
+
+        impl From<lumen_input::KeyCode> for KeyCode {
+            fn from(k: lumen_input::KeyCode) -> KeyCode {
+                match k {
+                    $(lumen_input::KeyCode::$variant => KeyCode::$variant,)*
+                }
+            }
+        }
+
+        impl From<KeyCode> for lumen_input::KeyCode {
+            fn from(k: KeyCode) -> lumen_input::KeyCode {
+                match k {
+                    $(KeyCode::$variant => lumen_input::KeyCode::$variant,)*
+                }
+            }
+        }
+    };
+}
+
+key_codes! {
+    Escape = 0, F1 = 1, F2 = 2, F3 = 3, F4 = 4, F5 = 5, F6 = 6, F7 = 7, F8 = 8, F9 = 9, F10 = 10,
+    F11 = 11, F12 = 12, PrintScreen = 13, SysRq = 14, ScrollLock = 15, PauseBreak = 16, Oem8 = 17,
+    Key1 = 18, Key2 = 19, Key3 = 20, Key4 = 21, Key5 = 22, Key6 = 23, Key7 = 24, Key8 = 25,
+    Key9 = 26, Key0 = 27, OemMinus = 28, OemPlus = 29, Backspace = 30, Insert = 31, Home = 32,
+    PageUp = 33, NumpadLock = 34, NumpadDivide = 35, NumpadMultiply = 36, NumpadSubtract = 37,
+    Tab = 38, Q = 39, W = 40, E = 41, R = 42, T = 43, Y = 44, U = 45, I = 46, O = 47, P = 48,
+    Oem4 = 49, Oem6 = 50, Oem5 = 51, Oem7 = 52, Delete = 53, End = 54, PageDown = 55,
+    Numpad7 = 56, Numpad8 = 57, Numpad9 = 58, NumpadAdd = 59, CapsLock = 60, A = 61, S = 62,
+    D = 63, F = 64, G = 65, H = 66, J = 67, K = 68, L = 69, Oem1 = 70, Oem3 = 71, Return = 72,
+    Numpad4 = 73, Numpad5 = 74, Numpad6 = 75, LShift = 76, Z = 77, X = 78, C = 79, V = 80,
+    B = 81, N = 82, M = 83, OemComma = 84, OemPeriod = 85, Oem2 = 86, RShift = 87, ArrowUp = 88,
+    Numpad1 = 89, Numpad2 = 90, Numpad3 = 91, NumpadEnter = 92, LControl = 93, LWin = 94,
+    LAlt = 95, Spacebar = 96, RAltGr = 97, RWin = 98, Apps = 99, RControl = 100, ArrowLeft = 101,
+    ArrowDown = 102, ArrowRight = 103, Numpad0 = 104, NumpadPeriod = 105, Oem9 = 106,
+    Oem10 = 107, Oem11 = 108, Oem12 = 109, Oem13 = 110, PrevTrack = 111, NextTrack = 112,
+    Mute = 113, Calculator = 114, Play = 115, Stop = 116, VolumeDown = 117, VolumeUp = 118,
+    WWWHome = 119, PowerOnTestOk = 120, TooManyKeys = 121, RControl2 = 122, RAlt2 = 123,
+    Unknown = 124,
+}
+
+/// The modifier byte's bits (`Event::Key`'s `mods`): the state after the
+/// key event.
+pub mod mods {
+    pub const LSHIFT: u8 = 1 << 0;
+    pub const RSHIFT: u8 = 1 << 1;
+    pub const LCTRL: u8 = 1 << 2;
+    pub const RCTRL: u8 = 1 << 3;
+    pub const LALT: u8 = 1 << 4;
+    pub const RALT: u8 = 1 << 5;
+    pub const CAPSLOCK: u8 = 1 << 6;
+    pub const NUMLOCK: u8 = 1 << 7;
+    /// Either Shift.
+    pub const SHIFT: u8 = LSHIFT | RSHIFT;
+    /// Either Ctrl.
+    pub const CTRL: u8 = LCTRL | RCTRL;
+    /// Either Alt.
+    pub const ALT: u8 = LALT | RALT;
+}
+
+/// A pointer button's number (`button`), and its bit in a `buttons` byte
+/// (`1 << number`).
+pub mod buttons {
+    pub const LEFT: u8 = 0;
+    pub const RIGHT: u8 = 1;
+    pub const MIDDLE: u8 = 2;
+    pub const SIDE: u8 = 3;
+    pub const EXTRA: u8 = 4;
+}
+
+/// A button's number on the wire.
+pub fn button(b: lumen_input::Button) -> u8 {
+    match b {
+        lumen_input::Button::Left => buttons::LEFT,
+        lumen_input::Button::Right => buttons::RIGHT,
+        lumen_input::Button::Middle => buttons::MIDDLE,
+        lumen_input::Button::Side => buttons::SIDE,
+        lumen_input::Button::Extra => buttons::EXTRA,
+    }
+}
+
+/// A set of held buttons on the wire: each one's bit `1 << button(b)`.
+pub fn button_set(set: lumen_input::Buttons) -> u8 {
+    set.each().fold(0, |bits, b| bits | 1 << button(b))
+}
+
+/// A modifier state on the wire ([`mods`]'s bits).
+pub fn mods_byte(m: lumen_input::Mods) -> u8 {
+    m.bits()
+}
+
+/// What a key event did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyAction {
+    /// Pressed, with the character it typed, if any (control characters
+    /// included: Enter is `'\n'`).
+    Press {
+        text: Option<char>,
+    },
+    Release,
+}
+
+/// An automation request's action (`lumen_ui::Action`), for the app's
+/// node `node`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Action {
+    Press,
+    /// At most [`SET_VALUE_BYTES`] (a longer one is refused before it is
+    /// encoded: [`Event::request`]).
+    SetValue(String),
+    Select,
+    Focus,
+    Close,
+    Minimize,
+    Restore,
+}
+
+/// One event for an app's window, in its numbered order (pinned by a test).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Event {
+    /// The theme to draw with: always the first event, and again after
+    /// each switch.
+    Theme {
+        theme: ThemeId,
+        palette: Palette,
+    },
+    Key {
+        code: KeyCode,
+        mods: u8,
+        action: KeyAction,
+    },
+    /// Client coordinates; `button` a [`buttons`] number, `buttons` the
+    /// set held after it.
+    PointerDown {
+        x: i32,
+        y: i32,
+        button: u8,
+        buttons: u8,
+    },
+    PointerUp {
+        x: i32,
+        y: i32,
+        button: u8,
+        buttons: u8,
+    },
+    PointerMove {
+        x: i32,
+        y: i32,
+        buttons: u8,
+    },
+    FocusGained,
+    /// Every key and button counts as released.
+    FocusLost,
+    /// Events were dropped: every key and button counts as released.
+    Lost,
+    /// The close box, or `ui invoke <root> close`: the app's to act on.
+    Close,
+    /// An automation request for the app's node `node` (its own id; #207).
+    Request {
+        node: u64,
+        action: Action,
+    },
+}
+
+/// A request's `set_value` text past [`SET_VALUE_BYTES`]: refused (wrong
+/// arguments) before it becomes an [`Event`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TooLong;
+
+/// Why bytes aren't an [`Event`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// postcard's refusal.
+    Postcard(postcard::Error),
+    /// A whole event, then this many bytes more.
+    LeftOver(usize),
+}
+
+impl Event {
+    /// A key event (`lumen_input::KeyEvent`; its `after_drop` mark stays
+    /// the kernel's).
+    pub fn key(k: &lumen_input::KeyEvent) -> Event {
+        let action = match k.action {
+            lumen_input::KeyAction::Press { text } => KeyAction::Press { text },
+            lumen_input::KeyAction::Release => KeyAction::Release,
+        };
+        Event::Key { code: k.code.into(), mods: mods_byte(k.mods), action }
+    }
+
+    /// The theme `id` with the toolkit's `palette` for it.
+    pub fn theme(id: lumen_wm::ThemeId, palette: &lumen_ui::Palette) -> Event {
+        Event::Theme { theme: id.into(), palette: palette.into() }
+    }
+
+    /// A request to the app's node `node`, or [`TooLong`] for a `set_value`
+    /// text past [`SET_VALUE_BYTES`].
+    pub fn request(node: u64, action: &lumen_ui::Action) -> Result<Event, TooLong> {
+        let action = match action {
+            lumen_ui::Action::Press => Action::Press,
+            lumen_ui::Action::SetValue(text) if text.len() > SET_VALUE_BYTES => return Err(TooLong),
+            lumen_ui::Action::SetValue(text) => Action::SetValue(text.clone()),
+            lumen_ui::Action::Select => Action::Select,
+            lumen_ui::Action::Focus => Action::Focus,
+            lumen_ui::Action::Close => Action::Close,
+            lumen_ui::Action::Minimize => Action::Minimize,
+            lumen_ui::Action::Restore => Action::Restore,
+        };
+        Ok(Event::Request { node, action })
+    }
+
+    /// Its encoding, written into `buf` (no allocation): the bytes used.
+    /// Every event fits [`EVENT_BYTES`] (tested on the largest), so with a
+    /// buffer that big this can't fail.
+    pub fn encode<'b>(&self, buf: &'b mut [u8; EVENT_BYTES]) -> Result<&'b [u8], postcard::Error> {
+        postcard::to_slice(self, buf).map(|used| &*used)
+    }
+
+    /// The event `bytes` hold, exactly: postcard's refusal, or bytes left
+    /// over after a whole event.
+    pub fn decode(bytes: &[u8]) -> Result<Event, DecodeError> {
+        match postcard::take_from_bytes::<Event>(bytes) {
+            Ok((event, [])) => Ok(event),
+            Ok((_, rest)) => Err(DecodeError::LeftOver(rest.len())),
+            Err(e) => Err(DecodeError::Postcard(e)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    fn enc(e: &Event) -> Vec<u8> {
+        let mut buf = [0; EVENT_BYTES];
+        let bytes = e.encode(&mut buf).unwrap().to_vec();
+        assert_eq!(Event::decode(&bytes), Ok(e.clone()), "{e:?} round trip");
+        bytes
+    }
+
+    fn palette() -> Palette {
+        Palette { background: 1, text: 2, accent: 3, accent_text: 4, border: 5, disabled: 6, field: 0x80 }
+    }
+
+    #[test]
+    fn every_variant_s_encoding_is_pinned() {
+        let p = palette();
+        let cases: Vec<(Event, Vec<u8>)> = alloc::vec![
+            (Event::Theme { theme: ThemeId::Dark, palette: p }, alloc::vec![0, 1, 1, 2, 3, 4, 5, 6, 0x80, 1]),
+            (
+                Event::Key { code: KeyCode::A, mods: mods::LSHIFT, action: KeyAction::Press { text: Some('A') } },
+                alloc::vec![1, 61, 1, 0, 1, 1, b'A'],
+            ),
+            (
+                Event::Key { code: KeyCode::Escape, mods: 0, action: KeyAction::Press { text: None } },
+                alloc::vec![1, 0, 0, 0, 0],
+            ),
+            (
+                Event::Key { code: KeyCode::Unknown, mods: 0xff, action: KeyAction::Release },
+                alloc::vec![1, 124, 0xff, 1],
+            ),
+            // Zigzagged: -1 is 1, 2 is 4.
+            (Event::PointerDown { x: -1, y: 2, button: buttons::RIGHT, buttons: 0b10 }, alloc::vec![2, 1, 4, 1, 2],),
+            (Event::PointerUp { x: 64, y: 0, button: buttons::LEFT, buttons: 0 }, alloc::vec![3, 0x80, 1, 0, 0, 0]),
+            (Event::PointerMove { x: 3, y: -2, buttons: 0b101 }, alloc::vec![4, 6, 3, 5]),
+            (Event::FocusGained, alloc::vec![5]),
+            (Event::FocusLost, alloc::vec![6]),
+            (Event::Lost, alloc::vec![7]),
+            (Event::Close, alloc::vec![8]),
+            (Event::Request { node: 300, action: Action::Press }, alloc::vec![9, 0xac, 2, 0]),
+            (
+                Event::Request { node: 1, action: Action::SetValue(String::from("hi")) },
+                alloc::vec![9, 1, 1, 2, b'h', b'i'],
+            ),
+            (Event::Request { node: 1, action: Action::Select }, alloc::vec![9, 1, 2]),
+            (Event::Request { node: 1, action: Action::Focus }, alloc::vec![9, 1, 3]),
+            (Event::Request { node: 1, action: Action::Close }, alloc::vec![9, 1, 4]),
+            (Event::Request { node: 1, action: Action::Minimize }, alloc::vec![9, 1, 5]),
+            (Event::Request { node: 1, action: Action::Restore }, alloc::vec![9, 1, 6]),
+        ];
+        for (event, bytes) in &cases {
+            assert_eq!(&enc(event), bytes, "{event:?}");
+        }
+    }
+
+    #[test]
+    fn wire_tables_are_pinned() {
+        assert_eq!(ThemeId::ALL.map(|t| t as u8), [0, 1]);
+        assert_eq!(ThemeId::ALL.map(ThemeId::name), ["Light", "Dark"]);
+        assert_eq!(KeyCode::ALL.len(), 125);
+        for (i, k) in KeyCode::ALL.iter().enumerate() {
+            assert_eq!(*k as usize, i);
+            // Each one byte on the wire: its position.
+            assert_eq!(postcard::to_allocvec(k).unwrap(), [i as u8], "{k:?}");
+        }
+        let firsts: Vec<&str> = KeyCode::ALL[..4].iter().map(|k| k.name()).collect();
+        assert_eq!(firsts, ["Escape", "F1", "F2", "F3"]);
+        assert_eq!((KeyCode::F12 as u8, KeyCode::Return as u8, KeyCode::Spacebar as u8), (12, 72, 96));
+        assert_eq!(
+            [
+                mods::LSHIFT,
+                mods::RSHIFT,
+                mods::LCTRL,
+                mods::RCTRL,
+                mods::LALT,
+                mods::RALT,
+                mods::CAPSLOCK,
+                mods::NUMLOCK
+            ],
+            [1, 2, 4, 8, 16, 32, 64, 128]
+        );
+        assert_eq!([buttons::LEFT, buttons::RIGHT, buttons::MIDDLE, buttons::SIDE, buttons::EXTRA], [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn key_codes_convert_both_ways_for_every_variant() {
+        for k in KeyCode::ALL {
+            let pc: lumen_input::KeyCode = k.into();
+            assert_eq!(KeyCode::from(pc), k);
+            // Named alike, numbered as pc-keyboard declares them.
+            assert_eq!(alloc::format!("{pc:?}"), k.name());
+            assert_eq!(pc as usize, k as usize, "{pc:?}");
+        }
+    }
+
+    #[test]
+    fn kernel_types_convert() {
+        use lumen_input::{Button, Buttons, KeyEvent, Mods};
+        let k = KeyEvent {
+            code: lumen_input::KeyCode::Return,
+            action: lumen_input::KeyAction::Press { text: Some('\n') },
+            mods: Mods::NONE.with_shift().with_ctrl(),
+            after_drop: false,
+        };
+        assert_eq!(
+            Event::key(&k),
+            Event::Key {
+                code: KeyCode::Return,
+                mods: mods::LSHIFT | mods::LCTRL,
+                action: KeyAction::Press { text: Some('\n') }
+            }
+        );
+        let up = KeyEvent { action: lumen_input::KeyAction::Release, mods: Mods::NONE, ..k };
+        assert_eq!(Event::key(&up), Event::Key { code: KeyCode::Return, mods: 0, action: KeyAction::Release });
+        // Every modifier bit, from pc-keyboard's state.
+        let mut m = pc_modifiers();
+        m.lshift = true;
+        m.rshift = true;
+        m.lctrl = true;
+        m.rctrl = true;
+        m.lalt = true;
+        m.ralt = true;
+        m.capslock = true;
+        m.numlock = true;
+        assert_eq!(mods_byte(Mods::from(&m)), 0xff);
+        let mut only = pc_modifiers();
+        only.ralt = true;
+        assert_eq!(mods_byte(Mods::from(&only)), mods::RALT);
+        let mut only = pc_modifiers();
+        only.capslock = true;
+        assert_eq!(mods_byte(Mods::from(&only)), mods::CAPSLOCK);
+        // Buttons.
+        for b in Button::ALL {
+            assert_eq!(button(b) as usize, b.index());
+            assert_eq!(button_set(b.into()), 1 << b.index());
+        }
+        assert_eq!(button_set(Buttons::LEFT.with(Buttons::EXTRA)), 0b1_0001);
+        assert_eq!(button_set(Buttons::NONE), 0);
+        // The theme and its palette.
+        let ui = lumen_ui::Palette {
+            background: 10,
+            text: 11,
+            accent: 12,
+            accent_text: 13,
+            border: 14,
+            disabled: 15,
+            field: 16,
+        };
+        let e = Event::theme(lumen_wm::ThemeId::Light, &ui);
+        let Event::Theme { theme, palette } = e else { panic!("{e:?}") };
+        assert_eq!(theme, ThemeId::Light);
+        assert_eq!(lumen_ui::Palette::from(palette), ui);
+        for id in lumen_wm::ThemeId::ALL {
+            assert_eq!(lumen_wm::ThemeId::from(ThemeId::from(id)), id);
+            assert_eq!(ThemeId::from(id) as u8, id.index());
+        }
+    }
+
+    fn pc_modifiers() -> pc_keyboard::Modifiers {
+        pc_keyboard::Modifiers::default()
+    }
+
+    #[test]
+    fn a_set_value_past_its_cap_is_refused_before_encoding() {
+        let at = lumen_ui::Action::SetValue("v".repeat(SET_VALUE_BYTES));
+        assert!(Event::request(7, &at).is_ok());
+        let past = lumen_ui::Action::SetValue("v".repeat(SET_VALUE_BYTES + 1));
+        assert_eq!(Event::request(7, &past), Err(TooLong));
+        // Bytes, not characters: 256 two-byte characters are at the cap.
+        assert!(Event::request(7, &lumen_ui::Action::SetValue("é".repeat(SET_VALUE_BYTES / 2))).is_ok());
+        assert_eq!(Event::request(7, &lumen_ui::Action::SetValue("é".repeat(SET_VALUE_BYTES / 2 + 1))), Err(TooLong));
+        for (ui, wire) in [
+            (lumen_ui::Action::Press, Action::Press),
+            (lumen_ui::Action::Select, Action::Select),
+            (lumen_ui::Action::Focus, Action::Focus),
+            (lumen_ui::Action::Close, Action::Close),
+            (lumen_ui::Action::Minimize, Action::Minimize),
+            (lumen_ui::Action::Restore, Action::Restore),
+        ] {
+            assert_eq!(Event::request(3, &ui), Ok(Event::Request { node: 3, action: wire }));
+        }
+    }
+
+    /// The largest event: a request with the biggest node id and a
+    /// `set_value` text at its cap of 4-byte characters.
+    fn largest() -> Event {
+        let text: String = core::iter::repeat_n('\u{10ffff}', SET_VALUE_BYTES / 4).collect();
+        assert_eq!(text.len(), SET_VALUE_BYTES);
+        Event::Request { node: u64::MAX, action: Action::SetValue(text) }
+    }
+
+    #[test]
+    fn the_largest_event_fits() {
+        let bytes = enc(&largest());
+        assert!(bytes.len() <= EVENT_BYTES, "{}", bytes.len());
+        // Tag, a 10-byte u64, the action's tag, a 2-byte length, the text.
+        assert_eq!(bytes.len(), 1 + 10 + 1 + 2 + SET_VALUE_BYTES);
+        // Every other variant at its biggest varints is far smaller.
+        let p = Palette {
+            background: u32::MAX,
+            text: u32::MAX,
+            accent: u32::MAX,
+            accent_text: u32::MAX,
+            border: u32::MAX,
+            disabled: u32::MAX,
+            field: u32::MAX,
+        };
+        for e in [
+            Event::Theme { theme: ThemeId::Dark, palette: p },
+            Event::Key { code: KeyCode::Unknown, mods: 0xff, action: KeyAction::Press { text: Some('\u{10ffff}') } },
+            Event::PointerDown { x: i32::MIN, y: i32::MIN, button: 0xff, buttons: 0xff },
+            Event::PointerMove { x: i32::MIN, y: i32::MAX, buttons: 0xff },
+        ] {
+            assert!(enc(&e).len() < 64, "{e:?}");
+        }
+    }
+
+    fn samples() -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for e in [
+            largest(),
+            Event::Theme { theme: ThemeId::Light, palette: palette() },
+            Event::Key { code: KeyCode::Q, mods: 3, action: KeyAction::Press { text: Some('é') } },
+            Event::PointerUp { x: -300, y: 70000, button: 1, buttons: 0 },
+            Event::Request { node: 9, action: Action::SetValue(String::from("12+3")) },
+            Event::Close,
+        ] {
+            out.push(enc(&e));
+        }
+        out
+    }
+
+    #[test]
+    fn decoding_never_panics_on_truncations_flips_or_trailing_bytes() {
+        for bytes in samples() {
+            // Every cut short is an error.
+            for n in 0..bytes.len() {
+                assert!(Event::decode(&bytes[..n]).is_err(), "{n} of {bytes:?}");
+            }
+            // Trailing bytes: refused, counted.
+            for extra in [&[0u8][..], &[1, 2, 3], &[0xff; 9]] {
+                let mut longer = bytes.clone();
+                longer.extend_from_slice(extra);
+                assert_eq!(Event::decode(&longer), Err(DecodeError::LeftOver(extra.len())));
+            }
+            // Every byte flipped every way: decodes or errs, never panics.
+            for i in 0..bytes.len() {
+                for v in 0..=255u8 {
+                    let mut b = bytes.clone();
+                    b[i] = v;
+                    let _ = Event::decode(&b);
+                }
+            }
+        }
+        // Random bytes too (a fixed xorshift, so a failure repeats).
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..20_000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let len = (s % 40) as usize;
+            let bytes: Vec<u8> = (0..len).map(|i| (s >> (i % 8 * 8)) as u8 ^ i as u8).collect();
+            let _ = Event::decode(&bytes);
+        }
+    }
+
+    #[test]
+    fn malformed_values_are_refused_with_postcard_s_errors() {
+        use postcard::Error as P;
+        let bad = |bytes: &[u8]| Event::decode(bytes);
+        // A set_value text that isn't UTF-8.
+        assert_eq!(bad(&[9, 1, 1, 2, 0xff, b'a']), Err(DecodeError::Postcard(P::DeserializeBadUtf8)));
+        // A key's text: a bad Option tag, and a surrogate char.
+        assert_eq!(bad(&[1, 61, 0, 0, 2]), Err(DecodeError::Postcard(P::DeserializeBadOption)));
+        assert_eq!(bad(&[1, 61, 0, 0, 1, 3, 0xed, 0xa0, 0x80]), Err(DecodeError::Postcard(P::DeserializeBadChar)));
+        // An i32 varint running past 5 bytes, and one past u32's range.
+        assert_eq!(
+            bad(&[4, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0, 0]),
+            Err(DecodeError::Postcard(P::DeserializeBadVarint))
+        );
+        assert_eq!(bad(&[4, 0xff, 0xff, 0xff, 0xff, 0x7f, 0, 0]), Err(DecodeError::Postcard(P::DeserializeBadVarint)));
+        // A variant past the last, and a key code past the table.
+        assert!(bad(&[10]).is_err());
+        assert!(bad(&[1, 125, 0, 1]).is_err());
+        assert!(bad(&[0, 2, 0, 0, 0, 0, 0, 0, 0]).is_err());
+    }
+}

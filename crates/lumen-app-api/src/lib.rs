@@ -19,10 +19,13 @@
 //! - [`host`]: the `lumen` functions a module may import, with their
 //!   signatures;
 //! - [`trace`]: `trace_read`'s header and event layouts;
-//! - [`args`]: `run`'s arguments as the app reads them.
+//! - [`args`]: `run`'s arguments as the app reads them;
+//! - [`layout`]: the window calls' fixed layouts (`Canvas`, `Rect`,
+//!   `TextDraw`) and the checks on them;
+//! - [`event`]: [`event::Event`], the wire type `window_next_event` hands an
+//!   app (postcard), with its conversions from the kernel's types.
 //!
-//! Wire formats for events, trees and answers (postcard) come with the
-//! window calls (#206, #207).
+//! The tree and answer wire types come with #207.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -30,8 +33,10 @@ extern crate alloc;
 
 pub mod args;
 pub mod end;
+pub mod event;
 pub mod handles;
 pub mod host;
+pub mod layout;
 pub mod limits;
 pub mod manifest;
 pub mod range;
