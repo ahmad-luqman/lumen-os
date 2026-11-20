@@ -3982,7 +3982,9 @@ kernel (no SSE); #197 checks the results' bits.
     written next a line (the sweep's front): the run queue's longest length
     in a column as a bar, its interrupts, locks that waited and switches as
     marks; a gap or an offline column is blank. A refresh's damage is two
-    columns' strips, and a whole lane when its CPU's presence changes.
+    columns' strips (the column written and the sweep's front): only a
+    refresh writes a column, and the drawing reads only the columns and the
+    cursor.
   - **Odd events:** an event of the kinds X-ray reads (`switch`, `runq`,
     `irq`, `lock`) that doesn't decode, a kind in the other ring than
     `lumen_trace::kind::stream_of` says, or one the X-ray ring has no

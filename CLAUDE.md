@@ -552,7 +552,7 @@ own PR that updates that doc first.
   first read, numbers missed, odd events (undecodable, or a kind in the
   wrong ring by `stream_of`), where each ring's next read starts; a ring's
   backlog (its first read, after `resume`, after coming back online) giving
-  only the newest queue and thread; `presence_changes`) and the lanes'
+  only the newest queue and thread) and the lanes'
   columns (`Column`, `Span`: empty, counted, a backlog's gap, offline;
   `COLUMNS`); `replay`, the fixed trace of the frozen view (host-tested).
 - `apps/`: the WASM apps (M5), their own cargo workspace (out of the root

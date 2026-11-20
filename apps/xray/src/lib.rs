@@ -19,7 +19,8 @@
 //!   as a mark at the top (the text colour), a lock that waited as an
 //!   orange mark, its switches as a grey mark; a backlog's column (a gap)
 //!   and an offline CPU's are blank. Each refresh repaints two columns'
-//!   strips (its damage), and a CPU's whole lane when its presence changes.
+//!   strips (its damage): only `end_column` writes a column, and the
+//!   drawing reads only the columns and the cursor.
 //! - **Live** (`run xray`): every half second (`run_until`, animating),
 //!   each CPU's two rings are read on from where the last read stopped,
 //!   up to a whole ring's worth a refresh, and the labels follow. Each
@@ -398,9 +399,6 @@ impl Ticking for Xray {
         let written = self.view.end_column();
         self.drawn.push(strip(written, n));
         self.drawn.push(strip(self.view.cursor(), n));
-        for i in self.view.presence_changes() {
-            self.drawn.push(lane(i));
-        }
         if !self.warned_odd
             && let Some((i, c)) = self.view.cpus().iter().enumerate().find(|(_, c)| c.odd > 0)
         {
