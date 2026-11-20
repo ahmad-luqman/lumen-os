@@ -521,3 +521,213 @@ fn every_label_fits_its_width() {
     let widest = texts.iter().map(|t| width(t)).max().unwrap();
     assert!(widest + 32 > LABEL_W, "the widest label is {widest} px");
 }
+
+#[test]
+fn rng_is_splitmix64() {
+    // SplitMix64's reference outputs for seed 1234567 (as published with
+    // the algorithm), and a seed's high bits count.
+    let mut r = Rng::new(1_234_567);
+    let want =
+        [6457827717110365317, 3203168211198807973, 9817491932198370423, 4593380528125082431, 16408922859458223821];
+    for w in want {
+        assert_eq!(r.next_u64(), w);
+    }
+    assert_ne!(Rng::new(1 << 40).next_u64(), Rng::new(0).next_u64());
+    assert_ne!(Game::new(SKY_W, SKY_H, 1 << 40), Game::new(SKY_W, SKY_H, 0));
+}
+
+/// SplitMix64's output is a bijection of its state, so a test can pick the
+/// seed whose first draw is any value it wants.
+fn seed_drawing_first(out: u64) -> u64 {
+    fn unxorshift(y: u64, k: u32) -> u64 {
+        let mut x = y;
+        for _ in 0..64 / k + 1 {
+            x = y ^ (x >> k);
+        }
+        x
+    }
+    fn inv(c: u64) -> u64 {
+        let mut x = c;
+        for _ in 0..6 {
+            x = x.wrapping_mul(2u64.wrapping_sub(c.wrapping_mul(x)));
+        }
+        x
+    }
+    let z2 = unxorshift(out, 31);
+    let z1 = unxorshift(z2.wrapping_mul(inv(0x94d0_49bb_1331_11eb)), 27);
+    let z = unxorshift(z1.wrapping_mul(inv(0xbf58_476d_1ce4_e5b9)), 30);
+    z.wrapping_sub(0x9e37_79b9_7f4a_7c15)
+}
+
+#[test]
+fn below_draws_again_past_the_last_whole_multiple() {
+    let seed = seed_drawing_first(u64::MAX);
+    let mut r = Rng::new(seed);
+    assert_eq!(r.next_u64(), u64::MAX);
+    let second = r.next_u64();
+    for n in [3u32, 5, 15, 17] {
+        // 2^64 - 1 is a multiple of n: the zone is u64::MAX, which is past it.
+        assert_eq!(u64::MAX % u64::from(n), 0);
+        assert_ne!(second % u64::from(n), 0, "{n}");
+        assert_eq!(u64::from(Rng::new(seed).below(n)), second % u64::from(n), "{n}");
+    }
+}
+
+#[test]
+fn one_empty_cell_left_still_takes_a_grain_and_eating_the_last_fills_the_sky() {
+    let mut g = game(10);
+    let ahead = Cell::new(g.head().x + 1, g.head().y);
+    let spare = Cell::new(W - 1, H - 1);
+    for i in 0..g.grid.len() {
+        if g.grid[i] == Content::Empty || g.grid[i] == Content::Dust {
+            g.grid[i] = Content::Rock;
+        }
+    }
+    g.dust = None;
+    g.set(spare, Content::Empty);
+    let mut changed = Vec::new();
+    g.place_dust(&mut changed);
+    assert_eq!((g.state(), g.dust(), changed.as_slice()), (State::Flying, Some(spare), &[spare][..]));
+    // Now the grain right ahead, the last empty cell: eating it fills the sky.
+    g.set(spare, Content::Rock);
+    g.set(ahead, Content::Dust);
+    g.dust = Some(ahead);
+    g.grow = 1; // still growing: the tail's end stays
+    let head = g.head();
+    let changed = g.step();
+    assert_eq!(g.state(), State::Full);
+    assert_eq!((g.score(), g.dust()), (1, None));
+    assert_eq!(changed, [head, ahead]);
+}
+
+#[test]
+fn two_turns_in_one_step_keep_only_the_last_allowed() {
+    // Heading right: Up then Left before the next step (a U-turn typed
+    // quickly): Left is refused against the last move, so only Up is kept.
+    let mut g = game(1);
+    dust_aside(&mut g);
+    assert!(g.turn(Dir::Up));
+    assert!(!g.turn(Dir::Left));
+    g.step();
+    g.step();
+    assert_eq!(g.head(), Cell::new(3, 3), "the second turn was dropped");
+}
+
+#[test]
+fn a_second_grain_while_growing_adds_its_growth_too() {
+    let mut g = game(11);
+    put_dust(&mut g, Cell::new(START_LEN + 1, 5));
+    g.step();
+    put_dust(&mut g, Cell::new(START_LEN + 2, 5));
+    g.step();
+    assert_eq!(g.score(), 2);
+    dust_aside(&mut g);
+    for _ in 0..2 * GROWTH {
+        g.step();
+    }
+    assert_eq!(g.comet().count(), (START_LEN + 2 * GROWTH as u16) as usize);
+    g.step();
+    assert_eq!(g.comet().count(), (START_LEN + 2 * GROWTH as u16) as usize);
+}
+
+/// A field as rows of `#` (a rock) and `.`.
+fn picture(field: &[Cell], w: u16, h: u16) -> Vec<String> {
+    (0..h).map(|y| (0..w).map(|x| if field.contains(&Cell::new(x, y)) { '#' } else { '.' }).collect()).collect()
+}
+
+#[test]
+fn the_fields_on_comet_s_sky() {
+    // Our own layouts, pinned on the app's sky.
+    let twin_belts = [
+        "........................",
+        "........................",
+        "........................",
+        "........................",
+        "........................",
+        "........................",
+        "......############......",
+        "........................",
+        "........................",
+        "........................",
+        "........................",
+        "......############......",
+        "........................",
+        "........................",
+        "........................",
+        "........................",
+        "........................",
+        "........................",
+    ];
+    let crossing = [
+        "........................",
+        "........................",
+        "........................",
+        "........................",
+        "............#...........",
+        "............#...........",
+        "............#...........",
+        "............#...........",
+        "........................",
+        "......#####...####......",
+        "........................",
+        "............#...........",
+        "............#...........",
+        "............#...........",
+        "........................",
+        "........................",
+        "........................",
+        "........................",
+    ];
+    let ring_of_rocks = [
+        "........................",
+        "........................",
+        "..##.##.##.##.##.##.##..",
+        "..#.....................",
+        ".....................#..",
+        "..#..................#..",
+        "..#.....................",
+        ".....................#..",
+        "..#..................#..",
+        "..#.....................",
+        ".....................#..",
+        "..#..................#..",
+        "..#.....................",
+        ".....................#..",
+        "..#..................#..",
+        "..#.##.##.##.##.##.##...",
+        "........................",
+        "........................",
+    ];
+    assert!(rocks(0, SKY_W, SKY_H).is_empty());
+    for (level, want) in [(1, twin_belts), (2, crossing), (3, ring_of_rocks)] {
+        assert_eq!(picture(&rocks(level, SKY_W, SKY_H), SKY_W, SKY_H), want, "{}", LEVELS[level]);
+    }
+}
+
+#[test]
+fn the_scenario_s_turns_run_into_the_tail() {
+    // test_apps.py's steering test: from the scenario's seed, the grain
+    // eaten (growing), then up, left and down: into its own tail.
+    let mut g = Game::new(SKY_W, SKY_H, COMET_SEED).unwrap();
+    for _ in 0..COMET_DUST_AHEAD {
+        g.step();
+    }
+    let h = g.head();
+    assert_eq!((g.score(), h), (1, Cell::new(START_LEN + COMET_DUST_AHEAD, SKY_H / 2)));
+    for d in [Dir::Up, Dir::Left] {
+        assert!(g.turn(d));
+        g.step();
+        assert_eq!(g.state(), State::Flying);
+    }
+    assert!(g.turn(Dir::Down));
+    g.step();
+    assert_eq!(g.state(), State::Over(Crash::Tail));
+    // And from the start: down, then right, both moves made.
+    let mut g = Game::new(SKY_W, SKY_H, COMET_SEED).unwrap();
+    assert!(g.turn(Dir::Down));
+    g.step();
+    assert!(g.turn(Dir::Right));
+    g.step();
+    assert_eq!(g.head(), Cell::new(START_LEN + 1, SKY_H / 2 + 1));
+    assert_eq!(g.score(), 0);
+}
