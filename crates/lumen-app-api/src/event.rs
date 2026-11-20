@@ -406,6 +406,25 @@ impl Event {
         Ok(Event::Request { node, action })
     }
 
+    /// Whether an app may take this event itself before its toolkit sees it
+    /// (the SDK's `run_with`/`run_until` offer it to the app's `take`):
+    /// input, yes; a `Request`, `Close` or `Theme`, never. Those are the
+    /// toolkit's, so a request is always answered, a close always ends the
+    /// loop and the palette always follows the theme, whatever the app
+    /// takes. Exhaustive, so a new variant has to be decided here.
+    pub fn offered_to_app(&self) -> bool {
+        match self {
+            Event::Key { .. }
+            | Event::PointerDown { .. }
+            | Event::PointerUp { .. }
+            | Event::PointerMove { .. }
+            | Event::FocusGained
+            | Event::FocusLost
+            | Event::Lost => true,
+            Event::Request { .. } | Event::Close | Event::Theme { .. } => false,
+        }
+    }
+
     /// Its encoding, written into `buf` (no allocation): the bytes used.
     /// Every event fits [`EVENT_BYTES`] (tested on the largest), so with a
     /// buffer that big this can't fail.
@@ -480,6 +499,32 @@ mod tests {
         match a {
             KeyAction::Press { .. } => 0,
             KeyAction::Release => 1,
+        }
+    }
+
+    #[test]
+    fn only_input_is_offered_to_the_app() {
+        let p = Palette::default();
+        let key = KeyAction::Press { text: None };
+        let none = Buttons::from_bits(0);
+        let cases = [
+            (Event::Theme { theme: ThemeId::Light, palette: p }, false),
+            (Event::Key { code: KeyCode::ArrowUp, mods: Mods::default(), action: key }, true),
+            (Event::PointerDown { x: 0, y: 0, button: Button::Left, buttons: none }, true),
+            (Event::PointerUp { x: 0, y: 0, button: Button::Left, buttons: none }, true),
+            (Event::PointerMove { x: 0, y: 0, buttons: none }, true),
+            (Event::FocusGained, true),
+            (Event::FocusLost, true),
+            (Event::Lost, true),
+            (Event::Close, false),
+            (Event::Request { node: 1, action: Action::Press }, false),
+        ];
+        // Every variant once (the tags 0 to 9).
+        let mut tags: Vec<u8> = cases.iter().map(|(e, _)| event_tag(e)).collect();
+        tags.sort_unstable();
+        assert_eq!(tags, (0..10).collect::<Vec<u8>>());
+        for (e, offered) in cases {
+            assert_eq!(e.offered_to_app(), offered, "{e:?}");
         }
     }
 
