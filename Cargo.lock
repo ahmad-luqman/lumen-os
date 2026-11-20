@@ -391,6 +391,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-snake"
+version = "0.0.1"
+
+[[package]]
 name = "lumen-synth"
 version = "0.0.1"
 

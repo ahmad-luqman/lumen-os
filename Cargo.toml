@@ -30,6 +30,7 @@ lumen-png = { path = "crates/lumen-png" }
 lumen-queue = { path = "crates/lumen-queue" }
 lumen-rand = { path = "crates/lumen-rand" }
 lumen-shell = { path = "crates/lumen-shell" }
+lumen-snake = { path = "crates/lumen-snake" }
 lumen-synth = { path = "crates/lumen-synth" }
 lumen-term = { path = "crates/lumen-term" }
 lumen-time = { path = "crates/lumen-time" }
