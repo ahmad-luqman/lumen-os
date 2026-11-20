@@ -13,12 +13,13 @@
 //!   A value not known yet (nothing read, or the queue and thread of a CPU
 //!   gone offline) is `-`.
 //! - **The lanes** (on the right, the app's own drawing): one per CPU, a
-//!   column per refresh, swept left to right over the oldest: the run
-//!   queue's longest length in the column as a bar (the palette's accent),
-//!   its interrupts as a mark at the top (the text colour), a lock that
-//!   waited as an orange mark, its switches as a grey mark, and a gap at
-//!   the column written next.
-//!   Each refresh repaints two columns' strips (its damage).
+//!   column per refresh, swept left to right over the oldest, the column
+//!   written next a line (the sweep's front): the run queue's longest
+//!   length in the column as a bar (the palette's accent), its interrupts
+//!   as a mark at the top (the text colour), a lock that waited as an
+//!   orange mark, its switches as a grey mark; a backlog's column (a gap)
+//!   and an offline CPU's are blank. Each refresh repaints two columns'
+//!   strips (its damage), and a CPU's whole lane when its presence changes.
 //! - **Live** (`run xray`): every half second (`run_until`, animating),
 //!   each CPU's two rings are read on from where the last read stopped,
 //!   up to a whole ring's worth a refresh, and the labels follow. Each
@@ -55,10 +56,12 @@ lumen_app::main!(run);
 
 /// How often live X-ray reads the rings.
 const REFRESH_NS: u64 = 500_000_000;
-/// Reads of one ring a refresh at most: a whole ring's worth
-/// (`TRACE_EVENTS_PER_READ` each), so it keeps up unless a ring fills
-/// faster than that; what it can't keep up with the kernel counts missed.
+/// Reads of one ring a refresh at most: 16 × `TRACE_EVENTS_PER_READ`
+/// (256) = 4096 events, a whole ring (the kernel's `trace::EVENTS`), so it
+/// keeps up unless a ring fills faster than that; what it can't keep up
+/// with the kernel counts missed.
 const READS_PER_RING: usize = 16;
+const _: () = assert!(READS_PER_RING * TRACE_EVENTS_PER_READ == 4096);
 /// The CPUs shown at most (the kernel's `MAX_CPUS`).
 const MAX_SHOWN: usize = 8;
 
@@ -73,6 +76,13 @@ const WIDTH: u32 = LANES_X as u32 + LANES_W + 8;
 const LANE_Y0: i32 = 10;
 const LANE_H: u32 = 56;
 const LANE_GAP: u32 = 6;
+/// The tree's height above its first CPU row (Pause and Resume, `State`,
+/// the heading, with lumen-ui's padding and gaps), and each CPU row's (a
+/// label's line and the gap below it): what `ui tree` shows of the layout.
+const TREE_HEAD_H: u32 = 107;
+const TREE_ROW_H: u32 = 29;
+/// The tallest window (`WINDOW_PIXELS` allows 640 × 480).
+const MAX_HEIGHT: u32 = 480;
 /// A run-queue length's pixels in a bar, and the longest a bar shows.
 const RUNQ_UNIT: u32 = 3;
 const RUNQ_CAP: u64 = 8;
@@ -134,9 +144,6 @@ struct Xray {
     /// One read's bytes, and its events decoded.
     buf: Vec<u8>,
     events: Vec<Event>,
-    /// Each CPU's presence at the last refresh (a change repaints its
-    /// lane).
-    presence: Vec<Presence>,
     drawn: Vec<Area>,
     /// Whether a read failed (logged, naming its CPU, ring and `since`;
     /// the loop ends then and the app exits with 1).
@@ -212,7 +219,6 @@ impl Xray {
             ui.set_disabled(pause, true);
             ui.set_disabled(resume, true);
         }
-        let presence = view.cpus().iter().map(|c| c.presence).collect();
         let mut x = Xray {
             ui,
             view,
@@ -224,7 +230,6 @@ impl Xray {
             trace,
             buf: vec![0; HEADER_SIZE + EVENT_SIZE * TRACE_EVENTS_PER_READ],
             events: Vec::with_capacity(TRACE_EVENTS_PER_READ),
-            presence,
             drawn: Vec::new(),
             failed: false,
             warned_odd: false,
@@ -298,41 +303,41 @@ impl Xray {
         }
         Ok(())
     }
+}
 
-    /// One CPU's column `c` drawn where `part` (inside its lane) reaches.
-    fn draw_column(over: &mut Over<'_>, part: Area, cpu: &Cpu, i: usize, c: usize, cursor: usize) {
-        let x = LANES_X + (c as u32 * COL_W) as i32;
-        let top = lane_top(i);
-        let mut fill = |r: Area, rgb: u32| {
-            if let Some(r) = r.intersect(&part) {
-                over.surface.fill_rect(r, rgb);
-            }
-        };
-        if c == cursor {
-            // The column written next: a gap with a line, the sweep's front.
-            fill(Area::new(x, top, 1, LANE_H - LANE_GAP), over.palette.border);
-            return;
+/// One CPU's column `c` drawn where `part` (inside its lane) reaches.
+fn draw_column(over: &mut Over<'_>, part: Area, cpu: &Cpu, i: usize, c: usize, cursor: usize) {
+    let x = LANES_X + (c as u32 * COL_W) as i32;
+    let top = lane_top(i);
+    let mut fill = |r: Area, rgb: u32| {
+        if let Some(r) = r.intersect(&part) {
+            over.surface.fill_rect(r, rgb);
         }
-        let col = cpu.column(c);
-        if col.span != Span::Counted {
-            return;
-        }
-        let base = top + (LANE_H - LANE_GAP) as i32 - 2;
-        let h = col.runq.min(RUNQ_CAP) as u32 * RUNQ_UNIT;
-        if h > 0 {
-            fill(Area::new(x, base - h as i32, COL_W - 1, h), over.palette.accent);
-        }
-        let irqs = col.irqs.min(IRQ_CAP);
-        if irqs > 0 {
-            fill(Area::new(x, top + 1, COL_W - 1, irqs), over.palette.text);
-        }
-        if col.locks > 0 {
-            fill(Area::new(x, top + 1 + IRQ_CAP as i32 + 1, COL_W - 1, 3), LOCK_RGB);
-        }
-        let switches = col.switches.min(SWITCH_CAP);
-        if switches > 0 {
-            fill(Area::new(x, top + IRQ_CAP as i32 + 6, COL_W - 1, switches), over.palette.disabled);
-        }
+    };
+    if c == cursor {
+        // The column written next: a gap with a line, the sweep's front.
+        fill(Area::new(x, top, 1, LANE_H - LANE_GAP), over.palette.border);
+        return;
+    }
+    let col = cpu.column(c);
+    if col.span != Span::Counted {
+        return;
+    }
+    let base = top + (LANE_H - LANE_GAP) as i32 - 2;
+    let h = col.runq.min(RUNQ_CAP) as u32 * RUNQ_UNIT;
+    if h > 0 {
+        fill(Area::new(x, base - h as i32, COL_W - 1, h), over.palette.accent);
+    }
+    let irqs = col.irqs.min(IRQ_CAP);
+    if irqs > 0 {
+        fill(Area::new(x, top + 1, COL_W - 1, irqs), over.palette.text);
+    }
+    if col.locks > 0 {
+        fill(Area::new(x, top + 1 + IRQ_CAP as i32 + 1, COL_W - 1, 3), LOCK_RGB);
+    }
+    let switches = col.switches.min(SWITCH_CAP);
+    if switches > 0 {
+        fill(Area::new(x, top + IRQ_CAP as i32 + 6, COL_W - 1, switches), over.palette.disabled);
     }
 }
 
@@ -372,7 +377,7 @@ impl App for Xray {
                 let first = ((part.x() - LANES_X) / COL_W as i32) as usize;
                 let last = ((part.right() - 1 - LANES_X) / COL_W as i32) as usize;
                 for c in first..=last.min(COLUMNS - 1) {
-                    Xray::draw_column(over, part, cpu, i, c, cursor);
+                    draw_column(over, part, cpu, i, c, cursor);
                 }
             }
         }
@@ -397,11 +402,8 @@ impl Ticking for Xray {
         let written = self.view.end_column();
         self.drawn.push(strip(written, n));
         self.drawn.push(strip(self.view.cursor(), n));
-        for (i, (was, c)) in self.presence.iter_mut().zip(self.view.cpus()).enumerate() {
-            if *was != c.presence {
-                *was = c.presence;
-                self.drawn.push(lane(i));
-            }
+        for i in self.view.presence_changes() {
+            self.drawn.push(lane(i));
         }
         if !self.warned_odd
             && let Some((i, c)) = self.view.cpus().iter().enumerate().find(|(_, c)| c.odd > 0)
@@ -450,7 +452,9 @@ fn app(replay: bool) -> Result<bool, (&'static str, Error)> {
         (View::new(cpus.min(MAX_SHOWN)), Mode::Live, Some(trace))
     };
     let n = view.cpus().len();
-    let height = (2 * LANE_Y0 as u32 + n as u32 * LANE_H).max(110 + 28 * n as u32).min(480);
+    let lanes = 2 * LANE_Y0 as u32 + n as u32 * LANE_H;
+    let tree = TREE_HEAD_H + n as u32 * TREE_ROW_H;
+    let height = lanes.max(tree).min(MAX_HEIGHT);
     let desktop = Desktop::get().map_err(|e| ("no desktop grant", e))?;
     let window = desktop.open_window("X-ray", WIDTH, height).map_err(|e| ("no window", e))?;
     let app = Xray::new(view, mode, trace);

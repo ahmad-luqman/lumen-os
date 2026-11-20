@@ -227,12 +227,14 @@ pub struct View {
     cpus: Vec<Cpu>,
     /// The column [`View::end_column`] writes next.
     cursor: usize,
+    /// Each CPU's presence as [`View::presence_changes`] last reported it.
+    reported: Vec<Presence>,
 }
 
 impl View {
     /// `cpus` CPUs (`trace_cpus`), none read yet.
     pub fn new(cpus: usize) -> View {
-        View { cpus: (0..cpus).map(|_| Cpu::new()).collect(), cursor: 0 }
+        View { cpus: (0..cpus).map(|_| Cpu::new()).collect(), cursor: 0, reported: alloc::vec![Presence::Unread; cpus] }
     }
 
     pub fn cpus(&self) -> &[Cpu] {
@@ -318,6 +320,19 @@ impl View {
         }
         self.cursor = (at + 1) % COLUMNS;
         at
+    }
+
+    /// The CPUs whose presence changed since the last call (a lane to
+    /// repaint whole), in order.
+    pub fn presence_changes(&mut self) -> Vec<usize> {
+        let mut changed = Vec::new();
+        for (i, (c, was)) in self.cpus.iter().zip(&mut self.reported).enumerate() {
+            if c.presence != *was {
+                *was = c.presence;
+                changed.push(i);
+            }
+        }
+        changed
     }
 
     /// The column the next [`View::end_column`] writes.
@@ -561,6 +576,21 @@ mod tests {
         assert_eq!(counts(c), (Some(1), Some(1), Some(0), Some(0)), "counts stay");
         v.read(0, Stream::Main, 2, 0, &[]);
         assert_eq!(v.cpus()[0].presence, Presence::Online);
+    }
+
+    #[test]
+    fn presence_changes_are_reported_once() {
+        let mut v = View::new(3);
+        assert_eq!(v.presence_changes(), Vec::<usize>::new(), "all unread, as they began");
+        v.read(0, Stream::Main, 0, 0, &[]);
+        v.offline(2);
+        assert_eq!(v.presence_changes(), [0, 2]);
+        assert_eq!(v.presence_changes(), Vec::<usize>::new());
+        v.read(0, Stream::Xray, 0, 0, &[]);
+        assert_eq!(v.presence_changes(), Vec::<usize>::new(), "still online");
+        v.offline(0);
+        v.read(2, Stream::Main, 0, 0, &[]);
+        assert_eq!(v.presence_changes(), [0, 2]);
     }
 
     #[test]
