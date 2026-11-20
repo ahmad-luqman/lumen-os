@@ -1,0 +1,23 @@
+[package]
+name = "calculator"
+description = "The calculator (#207): digit and operator buttons, a display, keyboard input too; lumen-ui inside the app (the SDK's toolkit), so its window shows in `ui tree` and `ui invoke` presses its buttons. Its arithmetic is lumen-calc's (host-tested): left to right, exact decimals."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+# A WASM module has no host-side tests: its logic is lumen-calc's, and the
+# kernel runs it (tests/scenarios/test_apps.py).
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+lumen-app.workspace = true
+lumen-calc.workspace = true
+lumen-ui.workspace = true
+
+[lints]
+workspace = true

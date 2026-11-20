@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use lumen_gfx::{Rect, Surface};
 
-use crate::app::{Served, Then, serve};
+use crate::app::{App, Repainted, Served, Then, repaint, serve};
 use crate::counter::Counter;
 use crate::node::{Action, ActionKind, InvokeError, Role, StateFlags, Value};
 use crate::reply::{First, NotStarted, Reply};
@@ -491,4 +491,52 @@ fn changes_are_reported_once() {
     c.ui_mut().handle(Input::Down { x: 399, y: 199 });
     c.ui_mut().handle(Input::Up { x: 399, y: 199 });
     assert!(!c.ui_mut().take_changed());
+}
+
+#[test]
+fn repaint_paints_what_changed_and_says_whether_to_publish() {
+    // An app whose frame over the tree counts its paints: the first repaint
+    // paints everything (and the tree changed: publish); then nothing, and
+    // no frame painted; a press on Add repaints only its widgets.
+    struct Framed(Counter, u32);
+    impl App for Framed {
+        fn ui_mut(&mut self) -> &mut Ui {
+            self.0.ui_mut()
+        }
+        fn apply(&mut self, events: &[UiEvent]) -> Then {
+            self.0.apply(events)
+        }
+        fn paint_over(&mut self, _: &mut Surface) {
+            self.1 += 1;
+        }
+    }
+    let mut app = Framed(Counter::new(), 0);
+    let mut s = Surface::new(AREA.w(), AREA.h());
+    let first = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    assert_eq!(first, Repainted { rects: alloc::vec![s.bounds()], changed: true });
+    assert_eq!(app.1, 1);
+    let idle = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    assert_eq!(idle, Repainted { rects: Vec::new(), changed: false });
+    assert_eq!(app.1, 1, "nothing painted, no frame over it");
+    let add = app.0.ui().id(app.0.add).expect("live").get();
+    let served = serve(&mut app, &mut FixedText, AREA, add, &Action::Press);
+    assert!(matches!(served, Served::Row { .. }));
+    let pressed = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    assert!(pressed.changed && !pressed.rects.is_empty());
+    assert!(pressed.rects.iter().all(|r| *r != s.bounds()), "only the changed widgets: {:?}", pressed.rects);
+    assert_eq!(app.1, 2);
+}
+
+#[test]
+fn a_full_repaint_covers_the_surface_even_laid_out_in_less() {
+    // The tree laid out in an area smaller than its surface: a full paint
+    // still paints the whole surface (its background), so all of it is to
+    // commit, not just the area.
+    let mut app = Counter::new();
+    let mut s = Surface::new(AREA.w() + 40, AREA.h() + 30);
+    s.fill(0x123456);
+    let first = repaint(&mut app, &mut s, &mut FixedText, &PALETTE, AREA);
+    assert_eq!(first.rects, alloc::vec![s.bounds()]);
+    let corner = (s.width() - 1, s.height() - 1);
+    assert_eq!(s.pixel(corner.0 as i32, corner.1 as i32), Some(PALETTE.background), "painted past the area");
 }

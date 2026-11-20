@@ -76,11 +76,17 @@ pub fn prefix(text: &str, cap: usize) -> &str {
     &text[..end]
 }
 
-/// [`log_line`] cut at `cap` bytes instead.
+/// [`log_line`] cut at `cap` bytes instead. Its string is reserved at its
+/// exact size first (each unsafe character U+FFFD's 3 bytes): a growing
+/// `collect` reallocates as it goes, which the kernel's heap (no `realloc`)
+/// does by copying, slowly on a fragmented heap (#219's review measured a
+/// tree's publish 15 times slower).
 pub fn cut(text: &str, cap: usize) -> LogText {
-    LogText(
-        prefix(text, cap).chars().map(|c| if unsafe_in_a_line(c) { char::REPLACEMENT_CHARACTER } else { c }).collect(),
-    )
+    let shown = |c: char| if unsafe_in_a_line(c) { char::REPLACEMENT_CHARACTER } else { c };
+    let kept = prefix(text, cap);
+    let mut out = String::with_capacity(kept.chars().map(|c| shown(c).len_utf8()).sum());
+    out.extend(kept.chars().map(shown));
+    LogText(out)
 }
 
 /// [`log_line`] for bytes that may not be UTF-8 (`panic`'s message: the app
@@ -92,6 +98,14 @@ pub fn log_line_lossy(bytes: &[u8]) -> LogText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cut_text_is_allocated_once_at_its_size() {
+        for text in ["", "plain", "a\u{1b}b\nc\u{2028}", &"é".repeat(300)] {
+            let shown = cut(text, LOG_BYTES);
+            assert_eq!(shown.0.capacity(), shown.0.len(), "{text:?}");
+        }
+    }
 
     #[test]
     fn decoding_checks_the_cap_then_utf8() {

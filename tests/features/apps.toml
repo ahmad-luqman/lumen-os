@@ -106,3 +106,35 @@ tests = [
     "ktest:lumen_kernel::app::tests::a_window_title_is_sanitised",
     "scenario:test_gui::test_launcher_lists_desktop_apps_only",
 ]
+
+[[feature]]
+name = "lumen-ui inside apps (#207): an app's toolkit (the SDK's, the kernel's own lumen-ui with the host's text) publishes its automation tree, which `ui tree` shows with global ids (two copies of one app never share one; a closed app's ids name nothing); `ui invoke` reaches an app's widgets as a click does, answered from the published tree after the effect is published, one request per window (a second refused busy while one is queued or running), a root action or a node not in the tree answered without the app, a window the action closed gone before the answer, an app ending mid-request answering `OwnerEnded`; the deepest tree allowed is published; trees and answers are checked wire types (every variant pinned, the tree's rules, sizes before decoding, capped sequences with a bounded heap peak, exact malformed-value errors, no panic on any cut or flipped byte) and cost fuel by the byte and the node (a refused tree's nodes too), within a measured heap charge"
+milestone = "M5"
+tests = [
+    "cargo:lumen-app-api",
+    "cargo:lumen-gfx",
+    "ktest:lumen_kernel::app::window::one_request_per_window_is_refused_busy_until_answered",
+    "ktest:lumen_kernel::app::window::an_app_ending_answers_owner_ended",
+    "ktest:lumen_kernel::app::tests::window_publish_charges_by_the_byte_and_the_node",
+    "ktest:lumen_kernel::app::window::closed_its_window_is_answered_once_the_window_is_gone",
+    "ktest:lumen_kernel::app::tests::window_answer_charges_by_the_byte",
+    "ktest:lumen_kernel::app::tests::tree_and_answer_caps_are_checked_before_the_copy",
+    "ktest:lumen_kernel::app::tests::a_disjoint_republish_pays_for_both_trees",
+    "scenario:test_apps::test_a_tree_the_sdk_cant_publish_answers_failed",
+    "cargo:lumen-shell",
+    "scenario:test_apps::test_app_ids_are_global",
+    "scenario:test_apps::test_closed_its_window_answer_comes_after_the_window_closes",
+    "scenario:test_apps::test_app_that_traps_closes_its_window_and_answers",
+    "scenario:test_apps::test_one_request_per_window_refuses_a_second_as_busy",
+    "scenario:test_apps::test_deepest_tree_is_published",
+    "scenario:test_apps::test_window_calls_refuse_bad_arguments",
+]
+
+[[feature]]
+name = "Calculator (#207): a bundled app with digit and operator buttons and a display, left to right in exact decimals (division by zero and overflow an error until a digit, `.` or C, long inputs stopping at the digit limits), pressed through `ui invoke` or typed on the keyboard, its window matching a golden"
+milestone = "M5"
+tests = [
+    "cargo:lumen-calc",
+    "scenario:test_apps::test_calculator_tree_and_invoke",
+    "scenario:test_apps::test_calculator_golden",
+]

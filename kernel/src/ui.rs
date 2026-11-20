@@ -22,13 +22,13 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use lumen_gfx::{Rect, Surface};
-use lumen_input::{Button, KeyAction, KeyCode, KeyEvent};
+use lumen_input::{Button, KeyEvent};
 use lumen_shell::pipe::{self, Align, Column, Kind, Value};
 use lumen_ui::counter::Counter;
 use lumen_ui::{
-    Action, ActionKind, App, First, Input, InvokeError, Key, Palette, Phase, Repaint, Reply, Second, Served, Text,
-    Then, serve,
+    Action, ActionKind, App, First, Input, InvokeError, Key, Palette, Phase, Reply, Second, Served, Text, Then, serve,
 };
 use lumen_wm::{Refused, Theme};
 
@@ -52,6 +52,9 @@ pub enum Answer {
     WindowClosed,
     /// The owner dropped it while running it, unanswered (a bug).
     Dropped,
+    /// Its owner, an app, ended or closed its window while running it,
+    /// unanswered (#207): it may have run.
+    OwnerEnded,
 }
 
 /// A request's reply slot, shared by its asker and the request: the reply
@@ -61,6 +64,13 @@ pub enum Answer {
 pub struct ReplyCell {
     reply: SpinLock<Reply<Answer>>,
     done: WaitQueue,
+    /// ktest seam: run when the request is answered (before the reply is
+    /// written and the asker woken), its result kept in `probed`: whether
+    /// its window was gone, whether its slot was free, at that moment.
+    #[cfg(feature = "ktest")]
+    probe: SpinLock<Option<alloc::boxed::Box<dyn Fn() -> bool + Send>>>,
+    #[cfg(feature = "ktest")]
+    probed: SpinLock<Option<bool>>,
 }
 
 impl ReplyCell {
@@ -76,12 +86,54 @@ impl ReplyCell {
         self.reply.lock().take()
     }
 
+    /// Set the ktest probe (see `probe`).
+    #[cfg(feature = "ktest")]
+    pub fn set_probe(&self, f: impl Fn() -> bool + Send + 'static) {
+        *self.probe.lock() = Some(alloc::boxed::Box::new(f));
+    }
+
+    /// What the probe said when the request was answered.
+    #[cfg(feature = "ktest")]
+    pub fn probed(&self) -> Option<bool> {
+        *self.probed.lock()
+    }
+
     /// Answer with `write` if it applies; wake the asker if it did.
     fn answer(&self, write: impl FnOnce(&mut Reply<Answer>) -> bool) {
+        #[cfg(feature = "ktest")]
+        {
+            let probe = self.probe.lock().take();
+            if let Some(f) = probe {
+                let seen = f();
+                *self.probed.lock() = Some(seen);
+            }
+        }
         let wrote = write(&mut self.reply.lock());
         if wrote {
             self.done.wake_all();
         }
+    }
+}
+
+/// A window's one request slot, held by its request (#207: an app's window
+/// holds at most one request queued or running, `desktop::push_request`
+/// refusing another with `Refused::Busy`): freed when the request is
+/// answered, skipped or refused, before its asker is woken, so the asker's
+/// next request finds it free. A request its asker cancelled at the deadline
+/// keeps it until its window's owner takes the request (and skips it).
+pub struct RequestSlot(Arc<AtomicBool>);
+
+impl RequestSlot {
+    /// The slot `flag` guards, if it is free.
+    pub(crate) fn take(flag: &Arc<AtomicBool>) -> Option<RequestSlot> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).ok()?;
+        Some(RequestSlot(flag.clone()))
+    }
+}
+
+impl Drop for RequestSlot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -94,6 +146,11 @@ pub struct Request {
     action: Action,
     /// `None` once started.
     cell: Option<Arc<ReplyCell>>,
+    /// Its window's one request slot, if its window has one.
+    slot: Option<RequestSlot>,
+    /// Refused because its window's slot was held (by another request
+    /// queued or running).
+    held_out: bool,
 }
 
 /// A request the owner took ([`Request::start`]): the only thing that can
@@ -103,6 +160,7 @@ pub struct Started {
     node: u64,
     action: Action,
     cell: Option<Arc<ReplyCell>>,
+    slot: Option<RequestSlot>,
 }
 
 /// A request cancelled at its asker's deadline: the owner skips it.
@@ -119,8 +177,42 @@ impl Request {
     /// A request for `action` on node `node`, and its reply's cell (the
     /// asker's side).
     pub(crate) fn new(node: u64, action: Action) -> (Request, Arc<ReplyCell>) {
-        let cell = Arc::new(ReplyCell { reply: SpinLock::new(Reply::new()), done: WaitQueue::new() });
-        (Request { node, action, cell: Some(cell.clone()) }, cell)
+        let cell = Arc::new(ReplyCell {
+            reply: SpinLock::new(Reply::new()),
+            done: WaitQueue::new(),
+            #[cfg(feature = "ktest")]
+            probe: SpinLock::new(None),
+            #[cfg(feature = "ktest")]
+            probed: SpinLock::new(None),
+        });
+        (Request { node, action, cell: Some(cell.clone()), slot: None, held_out: false }, cell)
+    }
+
+    /// Marked refused for its window's slot being held.
+    pub(crate) fn slot_held(mut self) -> Request {
+        self.held_out = true;
+        self
+    }
+
+    /// Whether it was refused because its window's slot was held.
+    pub fn was_held_out(&self) -> bool {
+        self.held_out
+    }
+
+    /// Its window's request slot, held until it is answered, skipped or
+    /// refused.
+    pub(crate) fn holding(mut self, slot: RequestSlot) -> Request {
+        self.slot = Some(slot);
+        self
+    }
+
+    /// The node it is for (a global id).
+    pub fn node(&self) -> u64 {
+        self.node
+    }
+
+    pub fn action(&self) -> &Action {
+        &self.action
     }
 
     /// The owner takes it: a [`Started`] to answer, or [`Skipped`] if it
@@ -130,7 +222,7 @@ impl Request {
         let action = core::mem::replace(&mut self.action, Action::Press);
         let started = cell.reply.lock().start();
         match started {
-            Ok(()) => Ok(Started { node: self.node, action, cell: Some(cell) }),
+            Ok(()) => Ok(Started { node: self.node, action, cell: Some(cell), slot: self.slot.take() }),
             Err(why) => {
                 // Only the asker's cancel takes a request out of `Pending`
                 // before its owner reads it.
@@ -143,6 +235,7 @@ impl Request {
 
 impl Drop for Request {
     fn drop(&mut self) {
+        drop(self.slot.take());
         if let Some(cell) = self.cell.take() {
             cell.answer(|r| r.answer_unrun(Answer::WindowClosed));
         }
@@ -158,8 +251,10 @@ impl Started {
         &self.action
     }
 
-    /// The owner's answer, which wakes the asker.
+    /// The owner's answer, which wakes the asker (its window's request
+    /// slot freed first).
     pub fn finish(mut self, answer: Answer) {
+        drop(self.slot.take());
         if let Some(cell) = self.cell.take() {
             cell.answer(|r| r.finish(answer));
         }
@@ -180,6 +275,7 @@ pub fn refuse(req: Request) {
 
 impl Drop for Started {
     fn drop(&mut self) {
+        drop(self.slot.take());
         if let Some(cell) = self.cell.take() {
             log::error!(target: "ui", "a request on node {} was dropped while running, unanswered (a bug)", self.node);
             cell.answer(|r| r.answer_dropped(Answer::Dropped));
@@ -298,26 +394,14 @@ impl<A: App> Toolkit<A> {
         h.commit(&[bounds]);
     }
 
-    /// Lay the tree out; repaint and commit only what changed (the widgets
-    /// whose look changed, or everything after a move or a new palette),
-    /// then publish the tree if it changed.
+    /// Lay the tree out; repaint and commit only what changed
+    /// (`lumen_ui::repaint`), then publish the tree if it changed.
     pub fn refresh(&mut self, h: &mut WindowHandle) {
-        let changed = self.lay_out();
-        match self.app.ui_mut().take_damage() {
-            Repaint::Nothing => {}
-            Repaint::All => self.paint_all(h),
-            Repaint::Rects(rects) => {
-                let s = h.surface_mut();
-                for r in &rects {
-                    self.app.ui_mut().paint_in(s, &mut self.text, &self.palette, *r);
-                }
-                // The app's frame over it again (what it draws outside the
-                // rectangles is committed with its next full paint).
-                self.app.paint_over(s);
-                h.commit(&rects);
-            }
+        let done = lumen_ui::repaint(&mut self.app, h.surface_mut(), &mut self.text, &self.palette, self.area);
+        if !done.rects.is_empty() {
+            h.commit(&done.rects);
         }
-        if changed {
+        if done.changed {
             self.publish(h);
         }
     }
@@ -401,18 +485,11 @@ pub fn close(h: WindowHandle, closing: Option<Started>) {
     }
 }
 
-/// A key press as the toolkit takes it (releases and keys it ignores:
-/// `None`).
+/// A key event as the toolkit takes it (releases and keys it ignores:
+/// `None`): `lumen_app_api::event::toolkit_key`, the one mapping an app's
+/// toolkit uses too.
 fn key(k: &KeyEvent) -> Option<Key> {
-    let KeyAction::Press { text } = k.action else { return None };
-    match (k.code, text) {
-        (KeyCode::Tab, _) if k.mods.is_shifted() => Some(Key::BackTab),
-        (KeyCode::Tab, _) => Some(Key::Tab),
-        (KeyCode::Backspace, _) => Some(Key::Backspace),
-        (KeyCode::Return | KeyCode::NumpadEnter, _) => Some(Key::Enter),
-        (_, Some(c)) if !c.is_control() => Some(Key::Char(c)),
-        _ => None,
-    }
+    lumen_app_api::event::toolkit_key(k.code.into(), k.mods.into(), k.action.into())
 }
 
 // -- Counter ------------------------------------------------------------------------------
@@ -599,15 +676,19 @@ fn invoke_root(ctx: &mut crate::shell::Ctx<'_>, window: u32, action: &Action) {
 fn invoke_widget(ctx: &mut crate::shell::Ctx<'_>, window: u32, node: u64, action: Action) {
     let (req, cell) = Request::new(node, action);
     if let Err(refused) = desktop::push_request(window, req) {
-        let busy = matches!(refused, Refused::Busy(_));
+        let why = match &refused {
+            // An app's window holds one request at a time (#207): retrying
+            // helps only once that one is answered.
+            Refused::Busy(r) if r.was_held_out() => {
+                alloc::format!("ui invoke: a request is still queued or running in window {window}")
+            }
+            Refused::Busy(_) => alloc::format!("ui invoke: window {window} busy (try again)"),
+            Refused::Dead(_) => alloc::format!("ui invoke: window {window} closed"),
+        };
         // Dropped here, with no desktop lock held: it answers a reply
         // nobody reads.
         drop(refused);
-        return if busy {
-            ctx.fail(format_args!("ui invoke: window {window} busy (try again)"))
-        } else {
-            ctx.fail(format_args!("ui invoke: window {window} closed"))
-        };
+        return ctx.fail(why);
     }
     let wait = || {
         let deadline = crate::time::now_ns().saturating_add(DEADLINE_NS);
@@ -670,6 +751,9 @@ fn print_answer(ctx: &mut crate::shell::Ctx<'_>, window: u32, node: u64, answer:
         Answer::Ran(Served::Failed(why)) => ctx.fail(format_args!("ui invoke: {why}")),
         Answer::WindowClosed => ctx.fail(format_args!("ui invoke: window {window} closed before it ran")),
         Answer::Dropped => ctx.fail(format_args!("ui invoke: dropped while running (window {window}): a bug")),
+        Answer::OwnerEnded => {
+            ctx.fail(format_args!("ui invoke: window {window} closed while running it (it may have run)"))
+        }
     }
 }
 

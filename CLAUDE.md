@@ -191,7 +191,9 @@ own PR that updates that doc first.
   (#157: `open_panel`, the taskbar: frameless, in front, never focused, left out of `windows`), minimized
   windows (not composed; `minimize_window`/`restore_window`), `desktop` (`status`,
   `check`, `spin`, `counter`, `tick`, `hold`/`release`) and `windows`, and the tree's accessors for `ui.rs`
-  (`tree_rows`, `find_node`, `push_request`: a refused request handed back);
+  (`tree_rows`, `find_node`, `push_request`: a refused request handed back; #207: a window taking one
+  request at a time from its opening, `Requests::OneAtATime`, refusing another busy, and
+  `published_node`, a node of its published tree);
   `lumen.desktop_cut_delay_ms=` widens the race at a pause for the scenarios;
   the look (#154): titles and the demos' text in the UI font (`font::Text`), the embedded
   wallpaper (`assets/wallpaper/lumen.png`, made by `tools/wallpaper.py`; decoded once a boot at
@@ -202,7 +204,8 @@ own PR that updates that doc first.
   (#156: `Toolkit<A: lumen_ui::App>`, one step per event that publishes before it answers, its palette from the
   `Theme` it is handed (`with_palette`: `taskbar_palette`, #157), its text `font::Text`, `refresh` committing
   only the damaged widgets), `ui invoke`'s `Request` (its reply slot; `start` gives the
-  `Started` that answers; either answers for itself if dropped), Counter's owner, and `ui tree`/`ui invoke`. `termwin.rs`: terminal windows (#155): `terminal` opens one, its
+  `Started` that answers; either answers for itself if dropped; a `RequestSlot`, a window's one
+  request slot, freed before its asker is woken, #207; `Answer::OwnerEnded`), Counter's owner, and `ui tree`/`ui invoke`. `termwin.rs`: terminal windows (#155): `terminal` opens one, its
   owner thread (`terminal`: draws the grid, hands keys over, blinks the focused one's cursor) and its shell
   (`term-shell`, `shell::run_in_window` on a closable console), joined on close; `term text <window>`.
   `taskbar.rs`: the desktop shell's taskbar (#157): a panel along the bottom, its `Launcher` menu
@@ -286,9 +289,12 @@ own PR that updates that doc first.
   (`kill_outcome`, `Phase::place`), the `app-reaper` joining ended apps; `apps` (records), `run`,
   `kill`; `desktop_apps` and `start`, the launcher's); `app/window.rs` the window and text calls (#206:
   `AppWindow`, an app's one window on the live desktop with the event in hand (`Held`) and `text_draw`'s
-  scratch surface; the canvas copied in by rows; a request refused `no node` until #207; `window_wait`
+  scratch surface; the canvas copied in by rows; `window_wait`
   through `blocking`, a kill waking it through the window's `Waker`; fuel by the pixel and by the glyph
-  rasterized); `app/host.rs` the `lumen` host
+  rasterized) and its automation tree (#207: `window_publish`, the app's ids mapped to global ones;
+  requests taken by `request::take` and handed on as the app's ids, one running (answered `OwnerEnded`
+  by `AppWindow`'s `Drop`, after the window); `IdMap` for the ids; `window_answer`, answered from the published tree; the request
+  ktests over a screenless desktop); `app/host.rs` the `lumen` host
   functions without a window (`entry`: the kill flag, a slice
   end with too little fuel left, `CALL_FUEL`, for every call; `ending` for `exit` and `panic`;
   `blocking` for `time_sleep` and #206's `window_wait`; `read_trace`); `app/tests.rs` the runtime's
@@ -303,7 +309,7 @@ own PR that updates that doc first.
   its ktests, over hand-assembled modules (`app/modules.rs`: a long loop and call depth, one float
   operation per export, a bulk `memory.fill`, a generated large body). `app/wire.rs`: ktest only,
   postcard's encoding and decoding rules over serde-derived types (the wire types themselves are
-  `lumen-app-api`'s `event` and `wire`, host-tested). `mm/heap.rs`'s `peak`/`reset_peak`: the heap's high-water mark (and, in the ktest
+  `lumen-app-api`'s `event`, `tree`, `answer` and `wire`, host-tested). `mm/heap.rs`'s `peak`/`reset_peak`: the heap's high-water mark (and, in the ktest
   kernel, `refuse_from`: the heap refusing big allocations, for `not enough memory`).
   `font.rs`: the desktop's anti-aliased text (`lumen-font`): `font::face`,
   the UI font parsed on first use and shared; `font::Text`, one drawing
@@ -382,7 +388,8 @@ own PR that updates that doc first.
   tests), every widget an automation node (`NodeId` from one counter,
   `Role` with its actions, value kind and flags, `Value`, `Action`,
   `StateFlags`, `AutomationNode`), `Ui::invoke` through the click's own
-  handler, `App` (`ui_mut`, `apply`, `paint_over`) and `serve` (a request run on an app, what to answer),
+  handler, `App` (`ui_mut`, `apply`, `paint_over`), `serve` (a request run on an app, what to answer)
+  and `repaint` (lay out, paint only what changed: the kernel's toolkit and an app's share it, #207),
   `Reply` (`ui invoke`'s reply slot, its state private: pending, running,
   cancelled, done, taken) and `counter` (the demo app's logic)
   (host-tested).
@@ -494,9 +501,19 @@ own PR that updates that doc first.
   (#206: `Event`, the wire type `window_next_event` hands an app,
   postcard; its wire tables `ThemeId`, `KeyCode`, `Mods`/`mods`,
   `Buttons`/`buttons`, `SetValue`, and the conversions from `lumen-input`'s,
-  `lumen-wm`'s and `lumen-ui`'s types), `wire` (`wire_enum!`,
-  `DecodeError`, `decode_exact`), `sys` (the `lumen` imports, declared once
-  for the SDK and testkit; wasm32 only) (host-tested).
+  `lumen-wm`'s and `lumen-ui`'s types and back, `toolkit_key`), `tree` (#207:
+  `Tree`, what `window_publish` takes: role-fused `Node`s in pre-order,
+  decoded node by node and checked, `from_automation`/`rows` both ways to
+  lumen-ui's rows), `answer` (#207: `AppAnswer`, `Refusal`), `request`
+  (#207: `take`, `Running`: a window's request on the kernel's side), `IdMap`
+  (#207, in `tree`: a window's ids both ways), `wire`
+  (`wire_enum!`, `DecodeError`, `decode_exact`, `Capped`, `CappedVec`), `sys`
+  (the `lumen` imports, declared once for the SDK and testkit; wasm32 only)
+  (host-tested, incl. `tests/decode_peak.rs`: the heap's peak under hostile
+  lengths, and `tests/publish_peak.rs`: `window_publish`'s steps on the
+  worst trees against `TREE_COPIES_BYTES`, counting allocators).
+- `crates/lumen-calc`: the calculator app's logic (#207): keys in, the
+  display out, left to right in exact decimal fixed point (host-tested).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
@@ -509,7 +526,8 @@ own PR that updates that doc first.
   `build/apps/<name>.wasm`, the runtime's test apps (`test-<name>`) into
   `build/apps/tests/`, skipping libraries (`lumen-app`, the SDK, #206;
   `testkit`); `template`, the app `make app NAME=` copies
-  (`tools/new-app.sh`); the layout, the SDK, the
+  (`tools/new-app.sh`); `calculator` (#207, the first app on the SDK's
+  `ui::Toolkit`, lumen-ui inside the app); the layout, the SDK, the
   test apps and `testkit` are described once, in ARCHITECTURE section 8
   ("Building and bundling"). `make lint` and `fmt` cover them. The kernels embed them
   (`app::BUNDLED`, `app::TEST_APPS`); the harness validates them in
@@ -533,6 +551,7 @@ own PR that updates that doc first.
   `wait_window`, `wait_no_window`, `close_window` (`ui invoke`'s close, then
   the window's going), `TITLE_H`, `client_box`, `client_pixels`;
   the automation tree's `ui_tree`, `node`, `wait_ui`, `invoke`,
+  `press_buttons` (each answered, or still running and then settled: `Invoked.still_running`),
   `desktop_counter`; `parse_records` reads quoted cells with `shlex`),
   `calibration.py` (a boot calibration's verdict line, and the TSC's
   HPET-or-PIT choice, read back and checked against the numbers they print:

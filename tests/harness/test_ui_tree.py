@@ -64,15 +64,23 @@ def test_invoke_outputs_are_told_apart():
     late = gui.parse_invoke("ui invoke: ran late\n" + ROW)
     assert late is not None and late.late and late.row is not None and late.row["id"] == "17"
     assert gui.parse_invoke(CANCELLED) is None
+    # Refused before it was queued (a rationed queue, or an app's window
+    # holding one request, #207): it never ran, so it is retried too.
+    for busy in [
+        "ui invoke: window 3 busy (try again)",
+        "ui invoke: a request is still queued or running in window 3",
+    ]:
+        assert gui.parse_invoke(busy + "\n") is None, busy
+    assert gui.INVOKE_STILL_RUNNING.match("ui invoke: still running (window 3)")
     for message in [
         "ui invoke: window 3 closed",
         "ui invoke: ran; window 3 closed",
-        "ui invoke: window 3 busy (try again)",
         "ui invoke: no node 17",
         "ui invoke: still running (window 3)",
     ]:
         got = gui.parse_invoke(message + "\n")
         assert got == gui.Invoked(None, message)
+        assert got.still_running == ("still running" in message), message
     with pytest.raises(AssertionError, match="ran late but said nothing more"):
         gui.parse_invoke("ui invoke: ran late\n")
 
@@ -155,5 +163,21 @@ def test_invoke_quotes_its_arguments(monkeypatch):
 def test_invoke_gives_up_after_its_tries(monkeypatch):
     monkeypatch.setattr(gui, "run", FakeShell([CANCELLED] * 3))
     monkeypatch.setattr(gui.time, "sleep", lambda s: None)
-    with pytest.raises(AssertionError, match="cancelled 3 times"):
+    with pytest.raises(AssertionError, match="cancelled or busy 3 times"):
         gui.invoke(None, 17, "press", tries=3)
+
+
+def test_invoke_waits_out_a_held_slot_without_counting_it(monkeypatch):
+    # An app window's slot held by an earlier request: wait for the desktop
+    # to settle (that request taken), then try again, not counted; a rationed
+    # queue's busy counts like a cancel.
+    held = "ui invoke: a request is still queued or running in window 3\n"
+    busy = "ui invoke: window 3 busy (try again)\n"
+    shell = FakeShell([held, held, busy, ROW])
+    settled = []
+    monkeypatch.setattr(gui, "run", shell)
+    monkeypatch.setattr(gui.time, "sleep", lambda s: None)
+    monkeypatch.setattr(gui, "wait_settled", lambda m, allow=None: settled.append(1))
+    got = gui.invoke(None, 17, "press", tries=2)
+    assert got.row is not None and got.retries == 1
+    assert len(settled) == 2 and len(shell.lines) == 4

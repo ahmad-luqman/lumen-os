@@ -37,6 +37,8 @@ unsafe extern "C" {
     /// As [`args_read`]: the caller owns that range.
     pub unsafe fn window_next_event(h: i32, buf: i32, len: i32) -> i32;
     pub safe fn window_wait(h: i32, deadline: i64, animating: i32) -> i32;
+    pub safe fn window_publish(h: i32, tree: i32, len: i32) -> i32;
+    pub safe fn window_answer(h: i32, answer: i32, len: i32) -> i32;
     pub safe fn text_line_height(h: i32, px: i32) -> i32;
     pub safe fn text_measure(h: i32, px: i32, text: i32, len: i32) -> i32;
     /// Draws into the canvas's pixels (inside its clip).

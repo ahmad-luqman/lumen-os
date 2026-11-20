@@ -35,6 +35,12 @@
 //!     clip (from x = 0 and from x > 0), only within the window's size on a
 //!     bigger canvas, and a call whose text lies in its own canvas drawing
 //!     what one with a separate copy does;
+//!   - `window_publish` (#207): a made-up handle, the wrong kind, a wrapping
+//!     range; no nodes, a button, a label holding ESC, LF and U+2028, and
+//!     a tree of exactly `TREE_BYTES` (labels within `TEXT_BYTES`) accepted; a byte past `TREE_BYTES` (before the copy), bytes that
+//!     don't decode and an id twice refused; `window_answer`: a made-up
+//!     handle, the wrong kind, a wrapping range (before "none running"),
+//!     and no request running, refused;
 //!   - a closed window's handle `BadHandle`, a new window a new handle.
 //!
 //!   `calls` checks `window_open` without a desktop (`Unavailable`).
@@ -47,7 +53,7 @@ use alloc::format;
 use alloc::vec;
 use testkit::api::event::Event;
 use testkit::api::layout::{CANVAS_SIZE, Canvas, RECT_SIZE, Rect, TextDraw};
-use testkit::api::limits::{COMMIT_RECTS, EVENT_BYTES, TEXT_BYTES, TITLE_BYTES};
+use testkit::api::limits::{COMMIT_RECTS, EVENT_BYTES, TEXT_BYTES, TITLE_BYTES, TREE_BYTES};
 use testkit::api::trace::{EVENT_SIZE, HEADER_SIZE, decode_event, decode_header};
 use testkit::{Error, Grant, find, host, info, log_handle, named, ptr};
 
@@ -484,6 +490,62 @@ fn window(c: &mut Checks) {
     let past = drawn(&big, 2 * W, W..2 * W, 0..2 * H) || drawn(&big, 2 * W, 0..W, H..2 * H);
     c.holds("nothing drawn past the window's size", !past);
 
+    // window_publish and window_answer (#207): the handle, its kind, the
+    // range, then the size (before the copy), then the encoding.
+    let none = [0u8; 1];
+    let np = ptr(none.as_ptr());
+    c.check("publish on a made-up handle", host::window_publish(999, np, 0), Err(Error::BadHandle));
+    c.check("publish on the desktop handle", host::window_publish(desk, np, 0), Err(Error::WrongKind));
+    c.check("publish: a wrapping tree", host::window_publish(w, WRAPPING, 64), Err(Error::BadPointer));
+    c.check("publish: no nodes", host::window_publish(w, np, 0), Ok(()));
+    let junk = vec![0xffu8; TREE_BYTES + 1];
+    let jp = ptr(junk.as_ptr());
+    c.check(
+        "publish: a byte past TREE_BYTES",
+        host::window_publish(w, jp, TREE_BYTES as i32 + 1),
+        Err(Error::BadArgument),
+    );
+    c.check(
+        "publish: TREE_BYTES that don't decode",
+        host::window_publish(w, jp, TREE_BYTES as i32),
+        Err(Error::BadArgument),
+    );
+    // Labels making a tree of exactly TREE_BYTES (each text within
+    // TEXT_BYTES: a longer one is refused).
+    let tree = exact_tree(TREE_BYTES);
+    c.check(
+        "publish: a tree of exactly TREE_BYTES",
+        host::window_publish(w, ptr(tree.as_ptr()), TREE_BYTES as i32),
+        Ok(()),
+    );
+    // A label whose text holds ESC, LF and U+2028: accepted (`ui tree`
+    // shows each as U+FFFD).
+    let odd = "a\u{1b}b\nc\u{2028}d".as_bytes();
+    let mut label = vec![1u8, 1, 0, 0, 0, 1, 1, 0, 0, odd.len() as u8];
+    label.extend_from_slice(odd);
+    c.check(
+        "publish: a label with control characters",
+        host::window_publish(w, ptr(label.as_ptr()), label.len() as i32),
+        Ok(()),
+    );
+    // A button, app id 1: tag 2, id 1, no name, bounds, flags, not focused.
+    let button = [2u8, 1, 0, 0, 0, 1, 1, 0, 0, 0];
+    c.check("publish: a button", host::window_publish(w, ptr(button.as_ptr()), button.len() as i32), Ok(()));
+    let twice = [button, button].concat();
+    c.check(
+        "publish: an id twice",
+        host::window_publish(w, ptr(twice.as_ptr()), twice.len() as i32),
+        Err(Error::BadArgument),
+    );
+    c.check("answer on a made-up handle", host::window_answer(999, np, 1), Err(Error::BadHandle));
+    c.check("answer on the desktop handle", host::window_answer(desk, np, 1), Err(Error::WrongKind));
+    c.check(
+        "answer: a wrapping range (before none running)",
+        host::window_answer(w, WRAPPING, 64),
+        Err(Error::BadPointer),
+    );
+    c.check("answer with no request running", host::window_answer(w, np, 1), Err(Error::BadArgument));
+
     // A closed window's handle is gone; a new window gets a new handle,
     // and exactly WINDOW_PIXELS (640 × 480) opens.
     c.check("close the window", host::handle_close(w), Ok(()));
@@ -520,4 +582,41 @@ pub extern "C" fn lumen_main() -> i32 {
     }
     info(&format!("abuse: {mode}: {} checks, {} failed", c.run, c.failed));
     c.failed as i32
+}
+
+/// A label's encoded length with `n` characters of text (its length one
+/// byte below 128, two from there).
+fn label_len(n: usize) -> usize {
+    9 + if n < 128 { 1 } else { 2 } + n
+}
+
+/// Push a label's bytes onto `out`: tag 1, app id `id` (below 128), no
+/// name, bounds 0 0 1 1, not disabled or hidden, then `n` (at most
+/// `TEXT_BYTES`) characters of text with their length.
+fn push_label(out: &mut alloc::vec::Vec<u8>, id: u8, n: usize) {
+    out.extend_from_slice(&[1u8, id, 0, 0, 0, 1, 1, 0, 0]);
+    if n < 128 {
+        out.push(n as u8);
+    } else {
+        out.extend_from_slice(&[(n as u8 & 0x7f) | 0x80, (n >> 7) as u8]);
+    }
+    out.resize(out.len() + n, b'x');
+}
+
+/// Labels whose encoding is exactly `len` bytes, in one allocation (the
+/// bump heap never frees): whole ones of 1,000 characters, then two making
+/// up the rest.
+fn exact_tree(len: usize) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::with_capacity(len);
+    let mut id = 1;
+    while len - out.len() > 2 * label_len(1000) {
+        push_label(&mut out, id, 1000);
+        id += 1;
+    }
+    let half = (len - out.len()) / 2;
+    push_label(&mut out, id, half - 12);
+    let left = len - out.len();
+    let n = (0..TEXT_BYTES).find(|&n| label_len(n) == left).unwrap_or(0);
+    push_label(&mut out, id + 1, n);
+    out
 }

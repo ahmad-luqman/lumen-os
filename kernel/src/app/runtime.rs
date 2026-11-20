@@ -139,19 +139,22 @@ impl AppCtx {
         }
     }
 
-    /// Open a window for the app: on the live desktop, or in the ktests on
-    /// the one their seam set (`desktop`).
+    /// Open a window for the app, taking one `ui invoke` request at a time
+    /// from its opening on (`window_answer` answers *the* running request):
+    /// on the live desktop, or in the ktests on the one their seam set
+    /// (`desktop`).
     pub(super) fn open_window(
         &self,
         title: &str,
         w: u32,
         h: u32,
     ) -> Result<crate::desktop::WindowHandle, crate::desktop::OpenError> {
+        use crate::desktop::Requests::OneAtATime;
         #[cfg(feature = "ktest")]
         if let Some(d) = &self.desktop {
-            return d.open_window(title, w, h);
+            return d.open_window_with(title, w, h, OneAtATime);
         }
-        crate::desktop::open_window(title, w, h)
+        crate::desktop::open_window_with(title, w, h, OneAtATime)
     }
 
     /// Whether the app holds a window (it may hold `WINDOWS`, one: the

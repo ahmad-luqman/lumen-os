@@ -35,14 +35,19 @@ pub const VALUE_STACK_BYTES: usize = MIB as usize;
 pub const CALL_DEPTH: usize = 1000;
 /// Everything else an app holds, at most: the parts below (their sum
 /// checked at compile time).
-pub const APP_OVERHEAD: u64 = MIB;
+pub const APP_OVERHEAD: u64 = 2 * MIB;
 /// The store, the instance, the call stack (`CALL_DEPTH` frames) and the
 /// handle table.
 pub const STORE_BYTES: u64 = 512 * KIB;
 /// Its table, at `TABLE_ELEMENTS` elements of at most 16 bytes.
 pub const TABLE_BYTES: u64 = TABLE_ELEMENTS as u64 * 16;
-/// Its published tree, two copies (#207).
-pub const TREE_COPIES_BYTES: u64 = 2 * TREE_BYTES as u64;
+/// Its published tree (#207): what the kernel holds for it (the desktop's
+/// rows, the id map) and the peak while a new one replaces it (the old
+/// still held, the new decoded and its rows built). Measured on the worst
+/// trees by `tests/publish_peak.rs` (each block counted as the kernel's heap
+/// sizes it): 978,336 bytes at the peak, for a 1,024-deep chain of groups
+/// named with ESCs; 1 MiB leaves 7% for the heap's fragmentation.
+pub const TREE_COPIES_BYTES: u64 = MIB;
 /// Its drawing thread's glyph cache (#206; the kernel's `font::Text`).
 pub const GLYPH_CACHE_BYTES: u64 = 128 * KIB;
 
@@ -66,7 +71,8 @@ pub const SLICE_FUEL: u64 = 1_000_000;
 pub const CALL_FUEL: u64 = 1_000;
 /// Fuel a `log` line costs on top.
 pub const LOG_FUEL: u64 = 10_000;
-/// Fuel per byte of a `log` line.
+/// Fuel per byte of a `log` line, of a published tree and of an answer
+/// copied in (#207).
 pub const BYTE_FUEL: u64 = 1;
 /// Fuel per pixel of a commit or a `text_draw` clip.
 pub const PIXEL_FUEL: u64 = 1;
@@ -77,6 +83,21 @@ pub const EVENT_FUEL: u64 = 16;
 /// next to a wasm instruction (measured in #218's review on TCG: ~170 a
 /// character for a measure, ~430 for a draw's two passes).
 pub const TEXT_CHAR_FUEL: u64 = 256;
+/// Fuel per node (items counted) of a tree `window_publish` decodes, checks
+/// and maps to global ids, and per node of the tree it replaces (freed), on
+/// top of `BYTE_FUEL` per byte copied in. Priced from the costliest
+/// publish, `app::tests::a_disjoint_republish_pays_for_both_trees`: 1,024
+/// labels of ESC names and texts (shown 3 times as long) in place of 1,024
+/// others with no id in common, the old tree held until the new is swapped
+/// in. Measured in #219's review on TCG at 512 a node: about 2.0 times the
+/// time per fuel unit of a plain wasm loop in the same run (31.4 to 35.7 ps
+/// against 16.0 to 17.8), so about 1,050 a node pays its way; 1,280 leaves a
+/// fifth to spare.
+pub const NODE_FUEL: u64 = 1280;
+/// The toolkit's text size, in pixels: the kernel's windows' (`font::TEXT_PX`,
+/// a `const` assertion ties them), so an app's toolkit looks like a kernel
+/// window's.
+pub const UI_TEXT_PX: u32 = 16;
 /// Windows per app.
 pub const WINDOWS: usize = 1;
 /// `Rect`s in one `window_commit`.
@@ -96,7 +117,8 @@ pub const TEXT_PX_MAX: u32 = 96;
 pub const SET_VALUE_BYTES: usize = 512;
 /// The largest encoded event.
 pub const EVENT_BYTES: usize = 1024;
-/// A published tree's nodes and encoded bytes.
+/// A published tree's nodes, items counted (the most widgets and list or
+/// menu items an app's window can expose), and encoded bytes.
 pub const TREE_NODES: usize = 1024;
 pub const TREE_BYTES: usize = 64 * KIB as usize;
 /// An encoded answer.
@@ -132,9 +154,9 @@ mod tests {
 
     #[test]
     fn the_worst_case_fits_the_budget() {
-        // 16 MiB of memory, 1 of value stack, 8 of code, 1 of overhead and
-        // three 640 × 480 surfaces: about 29.5 MiB.
-        assert_eq!(APP_WORST, 26 * MIB + 3 * 640 * 480 * 4);
+        // 16 MiB of memory, 1 of value stack, 8 of code, 2 of overhead and
+        // three 640 × 480 surfaces: about 30.5 MiB.
+        assert_eq!(APP_WORST, 27 * MIB + 3 * 640 * 480 * 4);
         // Beside the kernel's reserve on what the guests' 256 MiB leave
         // the frame allocator (166.7 MiB measured).
         assert_eq!(slots(166 * MIB), MAX_APPS);

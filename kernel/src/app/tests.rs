@@ -1059,7 +1059,8 @@ fn poke(store: &mut Store<runtime::AppCtx>, at: usize, bytes: &[u8]) {
 }
 
 /// `lumen_main` of a module importing `handle_find`, `window_open`,
-/// `window_commit`, `text_draw` and `text_measure` (functions 0 to 4): it
+/// `window_commit`, `text_draw`, `text_measure` and `window_publish`
+/// (functions 0 to 5): it
 /// opens a 16 × 16 window titled by
 /// the byte at 128, then runs `then` (with the desktop handle in local 0
 /// and the window's in local 1), and returns the window's handle.
@@ -1076,7 +1077,14 @@ fn window_module(then: &[u8]) -> Vec<u8> {
         local_get(1), // return it
     ]
     .concat();
-    let spec = Spec::importing(&["handle_find", "window_open", "window_commit", "text_draw", "text_measure"]);
+    let spec = Spec::importing(&[
+        "handle_find",
+        "window_open",
+        "window_commit",
+        "text_draw",
+        "text_measure",
+        "window_publish",
+    ]);
     Spec { body, locals: vec![0x01, 0x02, 0x7f], ..spec }.bytes()
 }
 
@@ -1099,6 +1107,212 @@ fn run_window_module(bytes: &[u8], draw: TextDraw, text: &[u8]) -> Result<(i32, 
     let used = SLICE_FUEL - store.get_fuel().map_err(|_| "no fuel")? + store.data().debt();
     Ok((result, used, store.data().glyphs_rasterized()))
 }
+
+crate::ktest!(
+    fn window_publish_charges_by_the_byte_and_the_node() {
+        // window_publish of 89 buttons and a list of 10 items (100 nodes,
+        // items counted): BYTE_FUEL per
+        // byte copied in and NODE_FUEL per node decoded, items counted, on
+        // top of the open's; a refused tree (an id twice, found once every
+        // node was decoded) pays for its bytes and its nodes too. Floors
+        // only.
+        use lumen_app_api::limits::{BYTE_FUEL, NODE_FUEL};
+        use lumen_app_api::tree::{Common, Node, Text, Tree};
+        use lumen_app_api::wire::CappedVec;
+        let pixels = 16 * 16;
+        let none = TextDraw::default();
+        let common =
+            |id| Common { id, name: Text::cut("b"), bounds: LRect::new(0, 0, 1, 1), disabled: false, hidden: false };
+        let button = |id| Node::Button { common: common(id), focused: false };
+        let items = CappedVec::new((91..=100).map(common).collect()).ok_or("items")?;
+        let mut nodes: Vec<Node> = (1..=89).map(button).collect();
+        nodes.push(Node::List { common: common(90), focused: false, selected: None, items });
+        let tree = Tree::new(nodes).map_err(|_| "a tree")?.encode().map_err(|_| "encoded")?;
+        // window_publish(window, tree at 256, its length)
+        let publish = [local_get(1), args(&[256, tree.len() as i32]), call(5), vec![DROP]].concat();
+        let (win, used, _) = run_window_module(&window_module(&publish), none, &tree)?;
+        crate::ktest::diag(format_args!("window_publish of 100 nodes, {} bytes: {used} fuel", tree.len()));
+        crate::kassert!(win > 0);
+        let open = 2 * CALL_FUEL + SURFACES * pixels * PIXEL_FUEL;
+        crate::kassert!(used >= open + CALL_FUEL + BYTE_FUEL * tree.len() as u64 + NODE_FUEL * 100);
+        let first = Tree::new(alloc::vec![button(1)]).map_err(|_| "a tree")?.encode().map_err(|_| "encoded")?;
+        let twice = [&tree[..], &first[..]].concat();
+        let publish = [local_get(1), args(&[256, twice.len() as i32]), call(5), vec![DROP]].concat();
+        let (win, used, _) = run_window_module(&window_module(&publish), none, &twice)?;
+        crate::ktest::diag(format_args!("a refused tree of {} bytes: {used} fuel", twice.len()));
+        crate::kassert!(win > 0);
+        crate::kassert!(used >= open + CALL_FUEL + BYTE_FUEL * twice.len() as u64 + NODE_FUEL * 101);
+        Ok(())
+    }
+);
+
+/// `lumen_main` of a module importing `window_publish` and `window_answer`
+/// (functions 0 and 1) calling function `f` with the handle at 0, bytes at
+/// 256 and the length at 4: its result.
+fn tree_call_module(f: u8) -> Vec<u8> {
+    // i32.load (align 2, offset 0) of the address on the stack.
+    let load = |at| [i32_const(at), vec![0x28, 0x02, 0x00]].concat();
+    let body = [load(0), i32_const(256), load(4), call(f)].concat();
+    // Two pages: room for a tree a byte past TREE_BYTES (65,537 bytes) at
+    // 256.
+    Spec { body, memories: vec![(2, Some(2))], ..Spec::importing(&["window_publish", "window_answer"]) }.bytes()
+}
+
+/// A loaded app: its store, `lumen_main`, and a window's handle.
+type Loaded = (Store<runtime::AppCtx>, wasmi::TypedFunc<(), i32>, i32);
+
+/// Load `tree_call_module(f)` with a window on a screenless desktop (a
+/// request running on it if `running`): the store, `lumen_main`, the
+/// window's handle (poked at 0).
+fn with_window(f: u8, running: bool) -> Result<Loaded, &'static str> {
+    let grants = Grants::log().with(lumen_app_api::Grant::Desktop);
+    let (mut store, main) = load_as(&tree_call_module(f), &test_state(), grants)?;
+    store.data_mut().desktop = Some(crate::desktop::Desktop::without_screen());
+    let h = super::window::ktest_window(store.data_mut(), running)?;
+    poke(&mut store, 0, &h.to_le_bytes());
+    Ok((store, main, h))
+}
+
+/// Call `main` with `len` at 4: its result, and how far the heap's peak
+/// rose (`used` before it).
+fn call_measured(
+    store: &mut Store<runtime::AppCtx>,
+    main: &wasmi::TypedFunc<(), i32>,
+    len: i32,
+) -> Result<(i32, usize), &'static str> {
+    poke(store, 4, &len.to_le_bytes());
+    store.set_fuel(SLICE_FUEL).map_err(|_| "no fuel")?;
+    let before = heap::stats().used;
+    heap::reset_peak();
+    let result = main.call(&mut *store, ()).map_err(|_| "lumen_main trapped")?;
+    Ok((result, heap::peak() - before))
+}
+
+/// A tree of 1,024 labels with ids from `first`, each name and text of
+/// ESC characters (the kernel shows each as U+FFFD: 3 bytes), as long as
+/// `TREE_BYTES` allows: the costliest tree to publish.
+fn esc_labels(first: u64) -> Result<Vec<u8>, &'static str> {
+    use lumen_app_api::limits::TREE_NODES;
+    use lumen_app_api::tree::{Common, Node, Text, Tree};
+    let esc = |n: usize| Text::cut(&"\u{1b}".repeat(n));
+    let label = |id| Node::Label {
+        common: Common { id, name: esc(25), bounds: LRect::new(0, 0, 1, 1), disabled: false, hidden: false },
+        text: esc(24),
+    };
+    let nodes = (first..first + TREE_NODES as u64).map(label).collect();
+    Tree::new(nodes).map_err(|_| "a tree")?.encode().map_err(|_| "encoded")
+}
+
+crate::ktest!(
+    fn a_disjoint_republish_pays_for_both_trees() {
+        // Publishing a tree of 1,024 ESC labels in place of another with
+        // none of its ids (the old one held until the new is swapped in, then
+        // freed): BYTE_FUEL per byte and NODE_FUEL per node of both trees,
+        // the old one's freed too (floors only). The diag lines give the
+        // time per fuel unit of these publishes and of a plain wasm loop in
+        // the same run: what NODE_FUEL is priced from (limits.rs).
+        use lumen_app_api::limits::{BYTE_FUEL, NODE_FUEL, TREE_NODES};
+        let a = esc_labels(1)?;
+        let b = esc_labels(5001)?;
+        let (mut store, main, _) = with_window(0, false)?;
+        let mut worst = 0u64;
+        for (i, tree) in [&a, &b, &a, &b, &a, &b, &a, &b].into_iter().enumerate() {
+            poke(&mut store, 256, tree);
+            poke(&mut store, 4, &(tree.len() as i32).to_le_bytes());
+            store.set_fuel(SLICE_FUEL).map_err(|_| "no fuel")?;
+            let debt = store.data().debt();
+            let start = crate::time::now_ns();
+            let result = main.call(&mut store, ()).map_err(|_| "lumen_main trapped")?;
+            let ns = crate::time::now_ns() - start;
+            // This call's: what it took from the slice, and the debt it
+            // added (a charge past the slice carries over).
+            let used = SLICE_FUEL - store.get_fuel().map_err(|_| "no fuel")? + store.data().debt() - debt;
+            crate::ktest::diag(format_args!("republish {i}: {result}, {} bytes, {used} fuel, {ns} ns", tree.len()));
+            crate::kassert_eq!(result, 0);
+            let freed = if i == 0 { 0 } else { TREE_NODES as u64 };
+            crate::kassert!(
+                used >= CALL_FUEL + BYTE_FUEL * tree.len() as u64 + NODE_FUEL * (TREE_NODES as u64 + freed)
+            );
+            if i > 0 {
+                worst = worst.max(ns * 1000 / used);
+            }
+        }
+        // The baseline: a plain wasm loop (i -= 1 while i) of about a slice.
+        let body = [
+            i32_const(200_000),
+            local_set(0),
+            vec![0x03, 0x40, 0x20, 0x00, 0x41, 0x01, 0x6b, 0x22, 0x00, 0x0d, 0x00, 0x0b],
+            i32_const(0),
+        ]
+        .concat();
+        let bytes = Spec { body, locals: vec![0x01, 0x01, 0x7f], ..Spec::default() }.bytes();
+        let (mut store, main) = load_as(&bytes, &test_state(), Grants::log())?;
+        store.set_fuel(10 * SLICE_FUEL).map_err(|_| "no fuel")?;
+        main.call(&mut store, ()).map_err(|_| "the loop trapped")?;
+        store.set_fuel(10 * SLICE_FUEL).map_err(|_| "no fuel")?;
+        let start = crate::time::now_ns();
+        main.call(&mut store, ()).map_err(|_| "the loop trapped")?;
+        let ns = crate::time::now_ns() - start;
+        let used = 10 * SLICE_FUEL - store.get_fuel().map_err(|_| "no fuel")?;
+        crate::ktest::diag(format_args!(
+            "a wasm loop: {used} fuel, {ns} ns ({} ps a fuel unit); the republishes' worst {worst} ps a unit",
+            ns * 1000 / used
+        ));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn tree_and_answer_caps_are_checked_before_the_copy() {
+        // window_publish and window_answer with 60,000 bytes (inside the
+        // memory; past TREE_BYTES is 65,537, so 60,000 is past ANSWER_BYTES
+        // only): the answer is refused before a byte is copied (the heap's
+        // peak doesn't move), the request still running; a tree a byte
+        // past TREE_BYTES likewise.
+        use lumen_app_api::limits::{ANSWER_BYTES, TREE_BYTES};
+        crate::kassert!(60_000 > ANSWER_BYTES && 60_000 < TREE_BYTES);
+        let (mut store, main, h) = with_window(1, true)?;
+        // A first call allocates the value stack: a refused 1-byte answer.
+        poke(&mut store, 256, &[9]);
+        crate::kassert_eq!(call_measured(&mut store, &main, 1)?.0, Error::BadArgument.returned());
+        let (result, rise) = call_measured(&mut store, &main, 60_000)?;
+        crate::ktest::diag(format_args!("an answer of 60000 bytes: {result}, the peak rose {rise}"));
+        crate::kassert_eq!(result, Error::BadArgument.returned());
+        crate::kassert_eq!(rise, 0);
+        // Still running: a good answer (`Ran`) is taken.
+        poke(&mut store, 256, &[0]);
+        crate::kassert_eq!(call_measured(&mut store, &main, 1)?.0, 0);
+        crate::kassert!(store.data_mut().window_mut(h).is_ok());
+        let (mut store, main, _) = with_window(0, false)?;
+        crate::kassert_eq!(call_measured(&mut store, &main, 0)?.0, 0);
+        let past = TREE_BYTES as i32 + 1;
+        let (result, rise) = call_measured(&mut store, &main, past)?;
+        crate::ktest::diag(format_args!("a tree of {past} bytes: {result}, the peak rose {rise}"));
+        crate::kassert_eq!(result, Error::BadArgument.returned());
+        crate::kassert_eq!(rise, 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn window_answer_charges_by_the_byte() {
+        // A `Failed` answer of 1,003 bytes: CALL_FUEL and BYTE_FUEL per
+        // byte copied in (a floor).
+        use lumen_app_api::limits::BYTE_FUEL;
+        let (mut store, main, _) = with_window(1, true)?;
+        let mut answer = alloc::vec![3u8, 0xe8, 0x07];
+        answer.resize(1003, b'x');
+        poke(&mut store, 256, &answer);
+        poke(&mut store, 4, &1003i32.to_le_bytes());
+        store.set_fuel(SLICE_FUEL).map_err(|_| "no fuel")?;
+        let result = main.call(&mut store, ()).map_err(|_| "lumen_main trapped")?;
+        let used = SLICE_FUEL - store.get_fuel().map_err(|_| "no fuel")? + store.data().debt();
+        crate::ktest::diag(format_args!("an answer of 1003 bytes: {result}, {used} fuel"));
+        crate::kassert_eq!(result, 0);
+        crate::kassert!(used >= CALL_FUEL + BYTE_FUEL * 1003);
+        Ok(())
+    }
+);
 
 crate::ktest!(
     fn window_calls_charge_their_fuel() {

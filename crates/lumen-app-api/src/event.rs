@@ -171,6 +171,18 @@ impl From<lumen_input::Button> for Button {
     }
 }
 
+impl From<Button> for lumen_input::Button {
+    fn from(b: Button) -> lumen_input::Button {
+        match b {
+            Button::Left => lumen_input::Button::Left,
+            Button::Right => lumen_input::Button::Right,
+            Button::Middle => lumen_input::Button::Middle,
+            Button::Side => lumen_input::Button::Side,
+            Button::Extra => lumen_input::Button::Extra,
+        }
+    }
+}
+
 /// The modifier state after a key event (`Event::Key`'s `mods`): one raw
 /// byte on the wire, [`mods`]' bits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -256,39 +268,38 @@ pub enum KeyAction {
     Release,
 }
 
-/// A `set_value` request's text: at most [`SET_VALUE_BYTES`], whichever
-/// way it is made ([`SetValue::try_from`], or decoded: a longer one is
-/// refused, postcard's `SerdeDeCustom`), so every [`Event`] fits
-/// [`EVENT_BYTES`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(transparent)]
-pub struct SetValue(String);
-
-impl SetValue {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<&str> for SetValue {
-    type Error = TooLong;
-
-    fn try_from(text: &str) -> Result<SetValue, TooLong> {
-        if text.len() > SET_VALUE_BYTES { Err(TooLong) } else { Ok(SetValue(String::from(text))) }
-    }
-}
-
-impl<'de> Deserialize<'de> for SetValue {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<SetValue, D::Error> {
-        // A string postcard decodes is no longer than the bytes it was
-        // handed (it checks before allocating).
-        let text = String::deserialize(d)?;
-        if text.len() > SET_VALUE_BYTES {
-            return Err(serde::de::Error::custom("a set_value text past SET_VALUE_BYTES"));
+impl From<lumen_input::KeyAction> for KeyAction {
+    fn from(a: lumen_input::KeyAction) -> KeyAction {
+        match a {
+            lumen_input::KeyAction::Press { text } => KeyAction::Press { text },
+            lumen_input::KeyAction::Release => KeyAction::Release,
         }
-        Ok(SetValue(text))
     }
 }
+
+/// A key event as `lumen-ui`'s toolkit takes it (releases and the keys it
+/// ignores: `None`): Tab (Shift+Tab is `BackTab`), Backspace, Enter (Return
+/// or the keypad's), or a press's text that isn't a control character. The
+/// kernel's toolkit and an app's (the SDK's) both map keys through this, so
+/// the two can't disagree.
+pub fn toolkit_key(code: KeyCode, mods: Mods, action: KeyAction) -> Option<lumen_ui::Key> {
+    use lumen_ui::Key;
+    let KeyAction::Press { text } = action else { return None };
+    match (code, text) {
+        (KeyCode::Tab, _) if mods.shift() => Some(Key::BackTab),
+        (KeyCode::Tab, _) => Some(Key::Tab),
+        (KeyCode::Backspace, _) => Some(Key::Backspace),
+        (KeyCode::Return | KeyCode::NumpadEnter, _) => Some(Key::Enter),
+        (_, Some(c)) if !c.is_control() => Some(Key::Char(c)),
+        _ => None,
+    }
+}
+
+/// A `set_value` request's text: at most [`SET_VALUE_BYTES`], whichever
+/// way it is made ([`crate::wire::Capped`]: built with `try_from`, or
+/// decoded, a longer one refused with postcard's `SerdeDeCustom`), so every
+/// [`Event`] fits [`EVENT_BYTES`].
+pub type SetValue = crate::wire::Capped<SET_VALUE_BYTES>;
 
 /// An automation request's action (`lumen_ui::Action`), for the app's
 /// node `node`.
@@ -301,6 +312,20 @@ pub enum Action {
     Close,
     Minimize,
     Restore,
+}
+
+impl From<Action> for lumen_ui::Action {
+    fn from(a: Action) -> lumen_ui::Action {
+        match a {
+            Action::Press => lumen_ui::Action::Press,
+            Action::SetValue(text) => lumen_ui::Action::SetValue(String::from(text.as_str())),
+            Action::Select => lumen_ui::Action::Select,
+            Action::Focus => lumen_ui::Action::Focus,
+            Action::Close => lumen_ui::Action::Close,
+            Action::Minimize => lumen_ui::Action::Minimize,
+            Action::Restore => lumen_ui::Action::Restore,
+        }
+    }
 }
 
 /// One event for an app's window, in its numbered order (pinned by a test).
@@ -352,18 +377,13 @@ pub enum Event {
 
 /// A request's `set_value` text past [`SET_VALUE_BYTES`]: refused (wrong
 /// arguments) before it becomes an [`Event`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TooLong;
+pub use crate::wire::TooLong;
 
 impl Event {
     /// A key event (`lumen_input::KeyEvent`; its `after_drop` mark stays
     /// the kernel's).
     pub fn key(k: &lumen_input::KeyEvent) -> Event {
-        let action = match k.action {
-            lumen_input::KeyAction::Press { text } => KeyAction::Press { text },
-            lumen_input::KeyAction::Release => KeyAction::Release,
-        };
-        Event::Key { code: k.code.into(), mods: k.mods.into(), action }
+        Event::Key { code: k.code.into(), mods: k.mods.into(), action: k.action.into() }
     }
 
     /// The theme `id` with the toolkit's `palette` for it.
@@ -420,9 +440,15 @@ mod tests {
         SetValue::try_from(text).unwrap()
     }
 
+    /// How many variants each data-carrying enum has: written once, for the
+    /// pin's range and the past-the-last bytes.
+    const EVENT_VARIANTS: u8 = 10;
+    const ACTION_VARIANTS: u8 = 7;
+    const KEY_ACTION_VARIANTS: u8 = 2;
+
     /// Each variant's tag, as an exhaustive match (no `_` arm): a variant
-    /// added fails to build here until its tag arm is written; the range
-    /// checked below and the pinned bytes are then to be extended with it.
+    /// added fails to build here until its tag arm is written; its count
+    /// above, its case and its bytes are then to be extended with it.
     fn event_tag(e: &Event) -> u8 {
         match e {
             Event::Theme { .. } => 0,
@@ -517,7 +543,7 @@ mod tests {
         // Every tag of each enum pinned above.
         let mut tags: Vec<u8> = cases.iter().map(|(e, _)| event_tag(e)).collect();
         tags.dedup();
-        assert_eq!(tags, (0..=9).collect::<Vec<u8>>());
+        assert_eq!(tags, (0..EVENT_VARIANTS).collect::<Vec<u8>>());
         let mut actions: Vec<u8> = cases
             .iter()
             .filter_map(|(e, _)| match e {
@@ -526,7 +552,7 @@ mod tests {
             })
             .collect();
         actions.dedup();
-        assert_eq!(actions, (0..=6).collect::<Vec<u8>>());
+        assert_eq!(actions, (0..ACTION_VARIANTS).collect::<Vec<u8>>());
         let mut keys: Vec<u8> = cases
             .iter()
             .filter_map(|(e, _)| match e {
@@ -536,7 +562,7 @@ mod tests {
             .collect();
         keys.sort_unstable();
         keys.dedup();
-        assert_eq!(keys, [0, 1]);
+        assert_eq!(keys, (0..KEY_ACTION_VARIANTS).collect::<Vec<u8>>());
     }
 
     /// The bytes an action takes at the end of a request's encoding.
@@ -585,6 +611,54 @@ mod tests {
             assert_eq!(alloc::format!("{pc:?}"), k.name());
             assert_eq!(pc as usize, k as usize, "{pc:?}");
         }
+    }
+
+    #[test]
+    fn actions_and_buttons_convert_back_for_an_app_s_toolkit() {
+        // Every wire action to lumen-ui's and back (`Event::request`).
+        let actions = [
+            lumen_ui::Action::Press,
+            lumen_ui::Action::SetValue(String::from("12")),
+            lumen_ui::Action::Select,
+            lumen_ui::Action::Focus,
+            lumen_ui::Action::Close,
+            lumen_ui::Action::Minimize,
+            lumen_ui::Action::Restore,
+        ];
+        assert_eq!(actions.len(), lumen_ui::ActionKind::ALL.len());
+        for a in actions {
+            let Ok(Event::Request { node: 3, action }) = Event::request(3, &a) else { panic!("{a:?}") };
+            assert_eq!(lumen_ui::Action::from(action), a);
+        }
+        // Every button both ways.
+        for b in Button::ALL {
+            assert_eq!(Button::from(lumen_input::Button::from(b)), b);
+        }
+        assert_eq!(lumen_input::Button::from(Button::Middle), lumen_input::Button::Middle);
+        assert_eq!(
+            KeyAction::from(lumen_input::KeyAction::Press { text: Some('x') }),
+            KeyAction::Press { text: Some('x') }
+        );
+        assert_eq!(KeyAction::from(lumen_input::KeyAction::Release), KeyAction::Release);
+    }
+
+    #[test]
+    fn keys_reach_the_toolkit_as_the_kernel_s_windows_take_them() {
+        use lumen_ui::Key;
+        let press = |text| KeyAction::Press { text };
+        let none = Mods::default();
+        let shift = Mods::from_bits(mods::RSHIFT);
+        assert_eq!(toolkit_key(KeyCode::Tab, none, press(Some('\t'))), Some(Key::Tab));
+        assert_eq!(toolkit_key(KeyCode::Tab, shift, press(None)), Some(Key::BackTab));
+        assert_eq!(toolkit_key(KeyCode::Backspace, none, press(Some('\u{8}'))), Some(Key::Backspace));
+        assert_eq!(toolkit_key(KeyCode::Return, none, press(Some('\n'))), Some(Key::Enter));
+        assert_eq!(toolkit_key(KeyCode::NumpadEnter, none, press(Some('\n'))), Some(Key::Enter));
+        assert_eq!(toolkit_key(KeyCode::Key7, none, press(Some('7'))), Some(Key::Char('7')));
+        assert_eq!(toolkit_key(KeyCode::OemPlus, shift, press(Some('+'))), Some(Key::Char('+')));
+        // A control character, a key that typed nothing, a release: none.
+        assert_eq!(toolkit_key(KeyCode::C, Mods::from_bits(mods::LCTRL), press(Some('\u{3}'))), None);
+        assert_eq!(toolkit_key(KeyCode::ArrowUp, none, press(None)), None);
+        assert_eq!(toolkit_key(KeyCode::Key7, none, KeyAction::Release), None);
     }
 
     #[test]
@@ -805,10 +879,13 @@ mod tests {
             Err(DecodeError::Postcard(P::DeserializeBadVarint))
         );
         assert_eq!(bad(&[4, 0xff, 0xff, 0xff, 0xff, 0x7f, 0, 0]), Err(DecodeError::Postcard(P::DeserializeBadVarint)));
-        // A variant past the last, and a key code past the table.
         // A variant past the last, a key code past the table, a theme past
         // the two: serde's refusal, postcard's custom error.
-        assert_eq!(bad(&[10]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
+        assert_eq!(bad(&[EVENT_VARIANTS]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
+        // A request's action past the last, and a key's action past the
+        // last (nested enums).
+        assert_eq!(bad(&[9, 1, ACTION_VARIANTS]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
+        assert_eq!(bad(&[1, 61, 0, KEY_ACTION_VARIANTS]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
         assert_eq!(bad(&[1, 125, 0, 1]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
         assert_eq!(bad(&[0, 2, 0, 0, 0, 0, 0, 0, 0]), Err(DecodeError::Postcard(P::SerdeDeCustom)));
     }

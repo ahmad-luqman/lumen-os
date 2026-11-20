@@ -2988,7 +2988,7 @@ size or bounded:
 | compiled code | `CODE_FACTOR` × `MODULE_BYTES` |
 | store, instance, call stack (`CALL_DEPTH` frames), handle table | `STORE_BYTES` |
 | table | `TABLE_BYTES` (`TABLE_ELEMENTS` × 16) |
-| two tree copies (#207) | `TREE_COPIES_BYTES` (2 × `TREE_BYTES`) |
+| its published tree (#207): the desktop's rows and the id map held, and a republish's peak | `TREE_COPIES_BYTES` (1 MiB: the worst trees' peak, measured by `lumen-app-api`'s `tests/publish_peak.rs`, with the headroom `limits.rs` states) |
 | glyph cache (#206) | `GLYPH_CACHE_BYTES` |
 | its window: two surfaces plus `text_draw`'s scratch | `WINDOWS` × `SURFACES` × `WINDOW_PIXELS` × `BYTES_PER_PIXEL` |
 
@@ -3141,8 +3141,8 @@ run the app.
 | `window_commit(h: i32, canvas: i32, rects: i32, n: i32) -> i32` | 0 | `n` (1..=`COMMIT_RECTS`) `Rect`s of the `Canvas`, whose `w` and `h` must equal the client size (else `BadArgument`), copied into the owner's surface, then `WindowHandle::commit`ted |
 | `window_next_event(h: i32, buf: i32, len: i32) -> i32` | bytes, 0 for none | one encoded `Event`, never blocking (below) |
 | `window_wait(h: i32, deadline: i64, animating: i32) -> i32` | 1 something to read, 0 the deadline | below |
-| `window_publish(h: i32, tree: i32, len: i32) -> i32` | 0 | an encoded `Tree`; refused (`BadArgument`) keeps the last one |
-| `window_answer(h: i32, answer: i32, len: i32) -> i32` | 0 | an encoded `AppAnswer` for the window's started request; `BadArgument` with none started, or past `ANSWER_BYTES`; a refused answer leaves the request pending |
+| `window_publish(h: i32, tree: i32, len: i32) -> i32` | 0 | an encoded `Tree` (#207): past `TREE_BYTES` refused before it is copied, then decoded node by node and checked (`lumen_app_api::tree::Tree::decode`); refused (`BadArgument`, a DEBUG line naming why) keeps the last one |
+| `window_answer(h: i32, answer: i32, len: i32) -> i32` | 0 | an encoded `AppAnswer` for the window's running request (one the app has read: one kept in hand by `BufferTooSmall` isn't); `BadArgument` with none (checked after the range, before the copy), past `ANSWER_BYTES` (before the copy), or one that doesn't decode; a refused answer leaves the request running |
 | `text_line_height(h: i32, px: i32) -> i32` | pixels | on the `Desktop` handle |
 | `text_measure(h: i32, px: i32, text: i32, len: i32) -> i32` | advance in pixels | `font::Text::measure` |
 | `text_draw(h: i32, canvas: i32, args: i32, text: i32, len: i32) -> i32` | advance in pixels | a `TextDraw` at `args`; below |
@@ -3162,12 +3162,21 @@ rasterizes (one its glyph cache didn't hold: `font::Text::draw` skips a
 glyph whose box misses the clip before rasterizing it, so rasterizing
 follows the clip), `TEXT_CHAR_FUEL` per character of each layout pass
 over a text (`text_measure` one, `text_draw` two: its advance and its
-drawing walk every character, whatever reaches the clip), and
-`EVENT_FUEL` per trace event copied
-out (`app::tests::host_calls_charge_their_fuel` checks `CALL_FUEL`,
+drawing walk every character, whatever reaches the clip),
+`EVENT_FUEL` per trace event copied out, `BYTE_FUEL` per byte of a tree
+or an answer copied in (refused or not), and `NODE_FUEL` per node of a
+tree decoded, items counted, refused or not, and per node of the tree an
+accepted one replaces (freed) (#207: its strings copied,
+its id mapped, its row made; a refusal can come after every node was
+decoded and its ids sorted, or partway through a list's items, which
+counts the items its bytes could hold, `tree::MIN_ITEM_BYTES` each:
+`Tree::decode_counted`)
+(`app::tests::host_calls_charge_their_fuel` checks `CALL_FUEL`,
 `BYTE_FUEL`, `LOG_FUEL` and `EVENT_FUEL`;
 `app::tests::window_calls_charge_their_fuel` the pixels and glyphs, as
-floors;
+floors; `app::tests::window_publish_charges_by_the_byte_and_the_node` a
+tree's bytes and nodes, items counted, a refused tree's too;
+`app::tests::window_answer_charges_by_the_byte` an answer's bytes;
 `app::tests::host_calls_cost_fuel_however_many_in_one_block` a run of
 calls in one block across slices, debt included).
 
@@ -3193,8 +3202,10 @@ the charge), draws with `font::Text::draw`, and copies them back; its
 result is the advance `font::Text::measure` gives. Its errors:
 `BadHandle`, `WrongKind`, `Unavailable`, `BadPointer` (the canvas, the
 `TextDraw`, the text, the clip's pixels), `BadArgument` (`px`, the
-text). `lumen_ui::Text` inside an app (#207) is to be the SDK's implementation over
-the three text calls.
+text). `lumen_ui::Text` inside an app (#207) is the SDK's `ui::HostText`
+over the three text calls, at `UI_TEXT_PX` (the kernel windows'
+`font::TEXT_PX`, a `const` assertion in `font.rs` ties them), each text
+cut to `TEXT_BYTES` first.
 
 Error codes (`lumen_app_api::Error`, `#[repr(i32)]`, returned negated;
 stable, never reused, pinned by a host test):
@@ -3227,11 +3238,15 @@ host test pins the encoding of every variant (each data-carrying enum's
 tags through an exhaustive match, so an appended variant fails to build
 until it is pinned). `From` conversions from `lumen-ui`'s, `lumen-wm`'s
 and `lumen-input`'s types (and back, where an app needs them: key codes,
-the theme, the palette) live beside them in `lumen_app_api::event`, so
-those crates need no `serde` and reordering their variants can't change
-the ABI. What every wire type shares is `lumen_app_api::wire`:
-`wire_enum!`, `DecodeError` and `decode_exact` (take, then refuse a
-remainder). Apps are built into the image with the kernel, so M5 has no
+the theme, the palette, actions, buttons, key actions) live beside them in
+`lumen_app_api::event`, so those crates need no `serde` and reordering
+their variants can't change the ABI; so does `toolkit_key`, the one
+mapping from a key event to `lumen_ui::Key` that the kernel's toolkit and
+an app's both use (#207). What every wire type shares is
+`lumen_app_api::wire`: `wire_enum!`, `DecodeError`, `decode_exact` (take,
+then refuse a remainder), `Capped<N>` (a string held to `N` bytes however
+it is made: `SetValue`, `Failed`'s text) and `CappedVec<T, N>` (the capped
+visitor below: the tree's items). Apps are built into the image with the kernel, so M5 has no
 per-message version. A value that doesn't decode, has bytes left over,
 or breaks its rules is `BadArgument`, never a trap.
 
@@ -3293,17 +3308,19 @@ is one raw byte, `lumen_input::Mods::bits()` (`lumen_app_api::event::mods`:
 left and right Shift, Ctrl and Alt, then Caps Lock and Num Lock, bits 0
 to 7); `button` is an `event::Button`, a wire enum (left 0 to extra 4, a
 number past it refused when decoded), and `Buttons` one raw byte, the
-held set's bits, `1 << number`. Until #207 an app's window
-publishes no tree, so a `Request` that reaches its queue names no node
-and is answered `no node` (`ui::refuse`) instead of being handed on. A `set_value` text past `SET_VALUE_BYTES` is refused
+held set's bits, `1 << number`. A `Request`'s `node` is the app's own id
+(the kernel maps the global one back, below). A `set_value` text past `SET_VALUE_BYTES` is refused
 (wrong arguments) before it is encoded, so every `Event` fits
 `EVENT_BYTES`; a host test encodes the largest, with the biggest
 varints.
 
-**`Tree`** (app to host): the app's nodes in pre-order, as a role-fused
-enum mirroring `lumen-ui`'s per-role constructors, so a mismatched
-value, a flag a role doesn't allow, a window's root, children under a
-leaf, a stray item and a disagreeing selection can't be written:
+**`Tree`** (app to host; `lumen_app_api::tree`): the app's nodes in
+pre-order, each a `Node` encoded one after another (no length before
+them: no bytes is a tree of no nodes), a role-fused enum mirroring
+`lumen-ui`'s per-role constructors, so a mismatched value, a flag a role
+doesn't allow, a window's root, children under a leaf, a stray item and a
+disagreeing selection can't be written (each variant's fields: `common`,
+the five every node has, first, then its own, in the table's order):
 
 | Node | Fields (each also `id: u64`, `name`, `bounds: Rect`, `disabled`, `hidden`) |
 |---|---|
@@ -3315,19 +3332,28 @@ leaf, a stray item and a disagreeing selection can't be written:
 | `List` | `focused`, `selected: Option<u32>`, `items: Vec<Item>` |
 | `Menu` | `focused`, `expanded`, `items: Vec<Item>` |
 
-`Item` is `{ id, name, bounds, disabled, hidden }`: a list item's
-`selected` flag is derived from its list. What is left to check: ids
-non-zero and unique; `selected` below `items.len()`; every `bounds`
-with `x + w` and `y + h` fitting in `i32`; `children` counts consuming
-the list exactly; at most `TREE_NODES` nodes and `TREE_BYTES` encoded.
-The kernel decodes it iteratively (its stack on the heap, bounded by
-`TREE_NODES`), never by recursion on a kernel stack. Top-level nodes
-hang under the window's root.
+`Item` is `{ id, name, bounds, disabled, hidden }` (`common`'s fields): a
+list item's `selected` flag is derived from its list. Names and texts are
+`tree::Text` (`Capped<TEXT_BYTES>`: an app's toolkit cuts a longer one, a
+longer one decoded is refused), shown sanitised as log text in the
+kernel's rows (`ui tree` can't be forged a line). What is left to
+check: ids non-zero and unique (items' too); at most one node focused; `selected` below
+`items.len()`; every `bounds` with `x + w` and `y + h` fitting in `i32`;
+`children` counts consuming the list exactly; at most `TREE_NODES` nodes,
+items counted, and `TREE_BYTES` encoded. The kernel decodes it
+iteratively (its stack on the heap, bounded by `TREE_NODES`), never by
+recursion on a kernel stack. Top-level nodes hang under the window's
+root. `Tree::from_automation` (an app's `Ui::nodes()`, the SDK's publish)
+and `Tree::rows` (the kernel's copy, each id mapped) are the two ways
+over the wire; a host test sends every widget `lumen-ui` has across and
+back.
 
-**`AppAnswer`** (app to host): `Ran`, `Refused(Refusal)` (`NoNode`,
-`Disabled`, `Hidden`, `NotAllowed`, `Arguments`), `ClosedItsWindow`, or
-`Failed(String)` (text up to `TEXT_BYTES`, then cut to `LOG_BYTES` and
-sanitised as log text). The runtime builds what the asker gets from its
+**`AppAnswer`** (app to host; `lumen_app_api::answer`): `Ran`,
+`Refused(Refusal)` (`NoNode`, `Disabled`, `Hidden`, `NotAllowed`,
+`Arguments`, numbered so), `ClosedItsWindow`, or `Failed(FailText)` (text
+up to `TEXT_BYTES`, then cut to `LOG_BYTES` and sanitised as log text).
+`AppAnswer::from_served` is what the SDK answers for what
+`lumen_ui::serve` said. The runtime builds what the asker gets from its
 own copy of the tree (below).
 
 #### Running an app
@@ -3397,22 +3423,25 @@ hand per window.
   None, No)`); the event it wakes for is kept in hand. A `Woken` wake
   re-checks the kill flag and waits again until the deadline. Animating
   without a deadline, `animating` other than 0 or 1, or a deadline below
-  -1 is `BadArgument`. Until #207 a `Request` it wakes for is refused
-  there (`no node`: apps publish no tree yet) and the wait goes on, so 1
-  always means an event to read.
+  -1 is `BadArgument`. A `Request` it wakes for is kept in hand as it
+  came (not started): if `window_next_event` then skips it or answers it
+  without the app, that call returns 0, so a 1 may be followed by a 0.
 - `window_next_event` checks its output range first, then takes the
   event in hand (or the next queued one) and encodes it into a kernel
   buffer of `EVENT_BYTES`; only an app buffer shorter than the encoding
   is `BufferTooSmall`, which keeps the event in hand. Every event fits
   (`SetValue` holds a request's text to `SET_VALUE_BYTES`, however it is
   made), so a failed encoding is a kernel bug: one ERROR, then a crash
-  report (debug assertions are on in every built kernel). Handing over `Close` starts the close grace. In #206 every
-  `Request` is refused `no node` (`ui::refuse`); #207 `start`s it
-  instead: a `Skipped` one (its asker cancelled) is dropped and the next
-  event taken; one whose node has left the map is answered `no node`;
-  otherwise the bytes are written, which can't fail. So a request runs
-  only once its asker can no longer cancel it, and from #207 a
-  `window_wait` of 1 may be followed by a `window_next_event` of 0.
+  report (debug assertions are on in every built kernel). Handing over `Close` starts the close grace. A `Request` is
+  `start`ed (`lumen_app_api::request::take`): a `Skipped` one (its asker
+  cancelled) is dropped and the next event taken; one whose node isn't in
+  the newest tree is answered `no node`, one whose node's role doesn't take
+  the action `NotAllowed` (a window's root actions, `close`, `minimize`,
+  `restore`, never reach an app), one whose `set_value` text is past
+  `SET_VALUE_BYTES` wrong arguments, each without the app, and the next
+  event taken; otherwise it is running and handed over as the app's id
+  (kept in hand, still running, across `BufferTooSmall`). So a request runs
+  only once its asker can no longer cancel it.
 
 **One end reason, first writer wins.** Returning from `lumen_main`,
 `exit`, `panic`, a trap, a kill or the close grace records the app's end
@@ -3506,19 +3535,21 @@ message, a trap's, `Failed`'s text and an unknown manifest grant (cut at
 | `MEMORY_PAGES` | 256 (16 MiB) | refused at load |
 | `VALUE_STACK_BYTES` | 1 MiB | trap: call stack exhausted |
 | `CALL_DEPTH` | 1000 frames | trap: call stack exhausted |
-| `APP_OVERHEAD` | 1 MiB | the overhead charge, at least its parts' sum |
+| `APP_OVERHEAD` | 2 MiB | the overhead charge, at least its parts' sum |
 | `STORE_BYTES` | 512 KiB | its part for the store, instance, call stack and handle table |
 | `TABLE_BYTES` | `TABLE_ELEMENTS` × 16 | its part for the table |
-| `TREE_COPIES_BYTES` | 2 × `TREE_BYTES` | its part for two tree copies (#207) |
+| `TREE_COPIES_BYTES` | 1 MiB | its part for its published tree (#207: what the kernel holds for it and a republish's peak, measured) |
 | `GLYPH_CACHE_BYTES` | 128 KiB | its part for the glyph cache (#206; a `const` assertion in `font.rs` ties it to `font::Text`'s) |
 | `WINDOW_PIXELS` | 307,200 (640 × 480) | `window_open`: `BadArgument` |
 | `SURFACES`, `BYTES_PER_PIXEL` | 3, 4 | the window charge |
-| `APP_WORST` | about 29.5 MiB (the sum above) | |
+| `APP_WORST` | about 30.5 MiB (the sum above) | |
 | `TABLE_ELEMENTS` | 10,000 | refused at load; `table.grow` returns -1 |
 | `SLICE_FUEL` | 1,000,000 | the slice ends |
 | `CALL_FUEL`, `LOG_FUEL` | 1,000, 10,000 | fuel per call, per log line |
 | `BYTE_FUEL`, `PIXEL_FUEL`, `EVENT_FUEL` | 1, 1, 16 | fuel per byte, pixel, trace event |
 | `TEXT_CHAR_FUEL` | 256 | fuel per character of a text layout pass (`text_measure` one, `text_draw` two) |
+| `NODE_FUEL` | 1,280 | fuel per node of a published tree, items counted, and of the tree it replaces (#207; priced from a disjoint republish, `limits.rs`) |
+| `UI_TEXT_PX` | 16 | an app toolkit's text size (the kernel windows') |
 | `WINDOWS` | 1 per app | `Limit` |
 | `COMMIT_RECTS` | 16 | `BadArgument` |
 | `ARGS_BYTES` | 1024 | `run` refuses |
@@ -3553,14 +3584,20 @@ SSE); #197 checks the results' bits.
 - **`ui tree`** shows an app's window like a kernel one: the root (the
   compositor's), then the app's nodes with global ids, bounds in screen
   pixels.
-- **One request per window.** An app's window holds at most one request
-  that is queued or started and not yet answered: `desktop::push_request`
-  refuses another with `Refused::Busy` (`ui invoke: window <id> busy
-  (try again)`) before anything is queued, which also covers a second
-  request pushed before the first is taken. The slot frees when the
-  request is answered (`OwnerEnded` and "window closed" included),
-  skipped or refused. So `window_answer` answers
-  *the* started request, and requests carry no ids. Deadlines are
+- **One request per window.** An app's window (opened with
+  `desktop::Requests::OneAtATime`, so it never exists without the rule)
+  holds at most one request that is queued or started and not yet
+  answered: `desktop::push_request` refuses another with `Refused::Busy`,
+  the request marked held out (`ui invoke: a request is still queued or
+  running in window <id>`: retrying helps only once that one is answered),
+  before anything is queued, which also covers a second
+  request pushed before the first is taken. The request holds the slot
+  (`ui::RequestSlot`), which frees when it is answered (`OwnerEnded` and
+  "window closed" included), skipped or refused, before its asker is
+  woken. A request its asker cancelled stays queued, holding the slot,
+  until the app takes (skips) it: an app that never reads its events keeps
+  its window busy (its root's actions still work). So `window_answer`
+  answers *the* running request, and requests carry no ids. Deadlines are
   section 11's ("A request is a reply slot").
 - **Answers.** The app runs `lumen_ui::serve` (the same path as a
   click), publishes its tree, then answers. The runtime builds the
@@ -3568,14 +3605,33 @@ SSE); #197 checks the results' bits.
   node's row (its depth and global id from the map), or `RanNodeGone`
   if the node isn't in it; `Refused(NotAllowed)` becomes
   `InvokeError::NotAllowed(node.role(), action.kind())` and the other
-  refusals their `InvokeError`s; `Failed` passes through;
-  `ClosedItsWindow` closes the window first, then answers, keeping
-  section 11's rule that this answer comes once the window is gone.
+  refusals their `InvokeError`s; `Failed` passes through, cut and
+  sanitised; `ClosedItsWindow` closes the window first (its handle
+  closed, as `handle_close` would), then answers, keeping section 11's
+  rule that this answer comes once the window is gone.
 - **`Answer::OwnerEnded`**, a new `ui::Answer`: the started request when
   the app ends or closes its window unanswered. `ui invoke` prints `ui
   invoke: window <id> closed while running it (it may have run)`. None
   of section 11's answers would be true, and a `Started` dropped
-  unanswered is "dropped while running" (a bug).
+  unanswered is "dropped while running" (a bug). The app's window
+  (`app/window.rs`'s `AppWindow`) drops its desktop handle first in its
+  `Drop`, then answers its running request, so the window is gone first;
+  `ClosedItsWindow` closes the window's handle (as `handle_close` would:
+  later calls on it are `BadHandle`, and a close grace ends), then answers
+  (`answer_request`). The ktests check both through a probe on the reply,
+  which sees the window gone when the asker is answered.
+- **Refusals** of a tree or an answer (the caps included) log a DEBUG
+  line naming the call, the length and why; a refused `Refused(_)` for a
+  node gone from the newest tree answers `no node`.
+- **Ids** (`lumen_app_api::tree::IdMap`): each window's app ids and global
+  ids both ways, the reuse and leave-and-come-back rules host-tested.
+- **The SDK** (`lumen_app::ui`): `HostText`, and `Toolkit`, which runs an
+  app's `lumen_ui::App` one step per event as the kernel's `ui::Toolkit`
+  does (painted, committed, published, then answered); an app may take
+  some events itself first (the calculator its keys). The calculator
+  (`apps/calculator`, bundled) is the first app built on it; its
+  arithmetic is `crates/lumen-calc` (left to right, exact decimals,
+  host-tested).
 - **Root actions** (`focus`, `minimize`, `restore`, `close`) work on an
   app's window as on any.
 
@@ -3628,11 +3684,13 @@ SSE); #197 checks the results' bits.
   `window`, built on the SDK; #196's `hello`
   moved there and exports `lumen_main`), sharing `apps/testkit` (the
   `lumen` imports, the manifest macro, a panic handler
-  reporting through `panic`, a bump allocator; #206's `lumen-app` is the
+  reporting through `panic`, a bump allocator of 256 KiB, never freeing:
+  `abuse window`'s trees are `TREE_BYTES` long; #206's `lumen-app` is the
   real SDK). They can't live under `apps/tests/`: the member glob would
   take `tests` itself as a member, and excluding it also excludes
   `tests/*`. Their fixed memory (2 MiB) is one `rustflags` entry in
-  `apps/.cargo/config.toml`. `make
+  `apps/.cargo/config.toml` (`window`'s is 4 MiB, in its `build.rs`: its
+  `ui-big` toolkit holds more widgets than `TREE_NODES`). `make
   apps` copies only crates that build a `cdylib` (`testkit` and #206's
   `lumen-app` make none), the test apps to
   `build/apps/tests/<name>.wasm`, with `cp -p` and only stale modules
@@ -3686,6 +3744,19 @@ SSE); #197 checks the results' bits.
   before. Nothing needs registering: the member
   glob takes the crate, `make apps` bundles its module, and the launcher
   lists it.
+- **What #207 adds:** `lumen_app::ui` (`HostText`; `Toolkit`, with
+  `run`, `run_with` (an app takes some input events itself first: the
+  calculator its keys), `step`, `refresh` and `publish`, a refused tree
+  answered `couldn't publish`), `Window::publish(&Tree)` (`PublishError`:
+  the tree's or the host's refusal), `Window::answer`, `Window::handle`,
+  and `lumen_app::report` (an app's exit code from its steps' result): what
+  wave 3's apps build on; the window's canvas is a
+  `lumen_gfx::Surface` (`Window::surface_mut`), which lumen-ui paints.
+  `apps/calculator` (bundled: the launcher lists it), with its logic in
+  `crates/lumen-calc` (a path dependency, host-tested); `test-window`'s
+  toolkit modes (`ui`: Counter in the SDK's toolkit; `ui-trap`; `deep`:
+  the deepest tree; `deaf`: a published button whose events are never
+  read).
 - **The launcher** (#157's taskbar) lists the bundled apps whose
   manifest lists `desktop`, never the test apps, after its four demo
   items, by name, and starts one through `run`'s path without waiting
@@ -4138,7 +4209,9 @@ client area with, a window's first event and again after each switch).
   answers and wakes its asker): `EventQueue::push_request` hands a refused
   request back (`lumen_wm::Refused::Busy` past the ration, `Refused::Dead`
   once the queue is dead), `desktop::push_request` does the same for a
-  window no longer on the list, and `EventQueue::kill` returns the
+  window no longer on the list and, #207, `Refused::Busy` for an app's
+  window whose one request slot is held (section 8; `ui invoke: a request
+  is still queued or running in window <id>`), and `EventQueue::kill` returns the
   requests still queued; each is answered once the locks are released
   (the asker prints "busy" or "window <id> closed", `WindowHandle`'s drop
   answers "window closed").

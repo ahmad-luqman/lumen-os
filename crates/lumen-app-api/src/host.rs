@@ -1,8 +1,7 @@
 //! The functions a module may import, all from module [`MODULE`], with
 //! their signatures: the kernel defines exactly these and refuses a module
 //! importing anything else (another module, an unknown name, a known name
-//! with another signature) at load, naming the import. `window_publish` and
-//! `window_answer` join with #207.
+//! with another signature) at load, naming the import.
 
 /// The one module apps import from.
 pub const MODULE: &str = "lumen";
@@ -48,6 +47,8 @@ pub const FUNCTIONS: &[HostFn] = &[
     f("window_commit", &[I32, I32, I32, I32], &[I32]),
     f("window_next_event", &[I32, I32, I32], &[I32]),
     f("window_wait", &[I32, I64, I32], &[I32]),
+    f("window_publish", &[I32, I32, I32], &[I32]),
+    f("window_answer", &[I32, I32, I32], &[I32]),
     f("text_line_height", &[I32, I32], &[I32]),
     f("text_measure", &[I32, I32, I32, I32], &[I32]),
     f("text_draw", &[I32, I32, I32, I32, I32], &[I32]),
@@ -70,7 +71,7 @@ mod tests {
             assert!(FUNCTIONS[..i].iter().all(|g| g.name != f.name), "{} twice", f.name);
             assert_eq!(lookup(f.name), Some(f));
         }
-        assert_eq!(lookup("window_publish"), None);
+        assert_eq!(lookup("window_close"), None);
         assert_eq!(lookup(""), None);
     }
 
@@ -92,6 +93,8 @@ mod tests {
             ("window_commit", &[I32, I32, I32, I32], &[I32]),
             ("window_next_event", &[I32, I32, I32], &[I32]),
             ("window_wait", &[I32, I64, I32], &[I32]),
+            ("window_publish", &[I32, I32, I32], &[I32]),
+            ("window_answer", &[I32, I32, I32], &[I32]),
             ("text_line_height", &[I32, I32], &[I32]),
             ("text_measure", &[I32, I32, I32, I32], &[I32]),
             ("text_draw", &[I32, I32, I32, I32, I32], &[I32]),

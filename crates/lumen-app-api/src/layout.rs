@@ -123,13 +123,27 @@ impl CheckedCanvas {
     }
 }
 
-/// A rectangle in a canvas's pixels.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// A rectangle in a canvas's pixels; also a tree node's bounds on the wire
+/// (#207: serde-derived, its fields in this order, so apart from its fixed
+/// 16-byte layout here it is four varints there).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
     pub w: u32,
     pub h: u32,
+}
+
+impl From<lumen_gfx::Rect> for Rect {
+    fn from(r: lumen_gfx::Rect) -> Rect {
+        Rect::new(r.x(), r.y(), r.w(), r.h())
+    }
+}
+
+impl From<Rect> for lumen_gfx::Rect {
+    fn from(r: Rect) -> lumen_gfx::Rect {
+        lumen_gfx::Rect::new(r.x, r.y, r.w, r.h)
+    }
 }
 
 /// A rectangle cut to a canvas ([`Rect::clip`]): inside it, never empty.
@@ -248,6 +262,17 @@ pub fn commit_count(n: i32) -> Result<usize, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rects_convert_to_and_from_lumen_gfx_s() {
+        let r = Rect::new(-3, 4, 5, 6);
+        let g = lumen_gfx::Rect::from(r);
+        assert_eq!((g.x(), g.y(), g.w(), g.h()), (-3, 4, 5, 6));
+        assert_eq!(Rect::from(g), r);
+        // lumen-gfx's far edges stay within i32 (`lumen_gfx::Rect::new`).
+        let tall = lumen_gfx::Rect::from(Rect::new(0, 4, 1, u32::MAX));
+        assert_eq!(tall.h(), i32::MAX as u32 - 4);
+    }
 
     #[test]
     fn layouts_are_pinned() {

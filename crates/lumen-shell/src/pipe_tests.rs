@@ -558,6 +558,10 @@ fn a_text_cell_that_would_not_read_back_as_one_word_is_quoted() {
     assert_eq!(read[3], strings(&["plain", "x", "7"]));
     assert_eq!(pipe::quoted("x"), "x");
     assert_eq!(pipe::quoted(""), "\"\"");
+    // Control characters and line or paragraph separators never reach a
+    // row: each is U+FFFD (a line reader would split there).
+    assert_eq!(pipe::quoted("a\u{1b}b\nc\u{2028}d\u{2029}e"), "\"a\u{fffd}b\u{fffd}c\u{fffd}d\u{fffd}e\"");
+    assert_eq!(pipe::quoted("\u{2028}"), "\"\u{fffd}\"");
 }
 
 /// Each rendered row of `rows` (text cells) split back as the shell does.

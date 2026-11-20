@@ -1,14 +1,16 @@
 //! A window's app ([`App`]: its tree, and what it does with what the tree
-//! reports) and running a request on it ([`serve`]). The kernel's
-//! `ui::Toolkit` drives both; host tests run the same code.
+//! reports), running a request on it ([`serve`]) and painting what changed
+//! ([`repaint`]). The kernel's `ui::Toolkit` and an app's (the SDK's
+//! `ui::Toolkit`) drive all three; host tests run the same code.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use lumen_gfx::{Rect, Surface};
 
 use crate::node::{Action, AutomationNode, InvokeError};
 use crate::text::Text;
-use crate::ui::{Ui, UiEvent};
+use crate::ui::{Palette, Repaint, Ui, UiEvent};
 
 /// What a window does after an event.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,4 +73,44 @@ pub fn serve(app: &mut dyn App, text: &mut dyn Text, area: Rect, node: u64, acti
         Some((depth, row)) => Served::Row { depth, node: row },
         None => Served::RanNodeGone,
     }
+}
+
+/// What [`repaint`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Repainted {
+    /// The rectangles painted, to commit (none: nothing to show).
+    pub rects: Vec<Rect>,
+    /// Whether the tree changed since it was last published.
+    pub changed: bool,
+}
+
+/// Lay `app`'s tree out in `area`, then paint only what changed into
+/// `surface` (the widgets whose look changed, or everything after a move or
+/// a new palette) with the app's frame over it.
+pub fn repaint(
+    app: &mut dyn App,
+    surface: &mut Surface,
+    text: &mut dyn Text,
+    palette: &Palette,
+    area: Rect,
+) -> Repainted {
+    app.ui_mut().layout(area, text);
+    let changed = app.ui_mut().take_changed();
+    let rects = match app.ui_mut().take_damage() {
+        Repaint::Nothing => return Repainted { rects: Vec::new(), changed },
+        Repaint::All => {
+            app.ui_mut().paint(surface, text, palette);
+            alloc::vec![surface.bounds()]
+        }
+        Repaint::Rects(rects) => {
+            for r in &rects {
+                app.ui_mut().paint_in(surface, text, palette, *r);
+            }
+            rects
+        }
+    };
+    // The app's frame over it again (what it draws outside the rectangles
+    // is committed with its next full paint).
+    app.paint_over(surface);
+    Repainted { rects, changed }
 }

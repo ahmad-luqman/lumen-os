@@ -264,6 +264,8 @@ version = "0.0.1"
 name = "lumen-app-api"
 version = "0.0.1"
 dependencies = [
+ "lumen-gfx",
+ "lumen-heap",
  "lumen-input",
  "lumen-trace",
  "lumen-ui",
@@ -272,6 +274,10 @@ dependencies = [
  "postcard",
  "serde",
 ]
+
+[[package]]
+name = "lumen-calc"
+version = "0.0.1"
 
 [[package]]
 name = "lumen-demo"

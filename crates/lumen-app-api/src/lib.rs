@@ -26,9 +26,12 @@
 //! - `sys`: the `lumen` imports, declared once for every app (wasm32
 //!   only);
 //! - [`event`]: [`event::Event`], the wire type `window_next_event` hands an
-//!   app (postcard), with its conversions from the kernel's types.
-//!
-//! The tree and answer wire types come with #207.
+//!   app (postcard), with its conversions from and to the kernel's types;
+//! - [`tree`]: [`tree::Tree`], what `window_publish` takes (#207): the app's
+//!   toolkit nodes, checked, and both ways to `lumen-ui`'s automation rows;
+//! - [`answer`]: [`answer::AppAnswer`], what `window_answer` takes;
+//! - [`request`]: a window's automation request on the kernel's side, as
+//!   plain logic (taking one, the one running).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -37,6 +40,7 @@ extern crate alloc;
 #[macro_use]
 pub mod wire;
 
+pub mod answer;
 pub mod args;
 pub mod end;
 pub mod event;
@@ -46,10 +50,12 @@ pub mod layout;
 pub mod limits;
 pub mod manifest;
 pub mod range;
+pub mod request;
 #[cfg(target_arch = "wasm32")]
 pub mod sys;
 pub mod text;
 pub mod trace;
+pub mod tree;
 
 pub use lumen_trace::kind;
 

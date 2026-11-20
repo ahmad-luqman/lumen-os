@@ -1,6 +1,6 @@
 [package]
 name = "lumen-app"
-description = "Lumen's app SDK (#206): safe wrappers over the `lumen` host functions (log, time, trace, a window with its canvas, events, text), a global allocator over the app's fixed memory, a panic handler reporting through `panic` with where it happened, and the `manifest!` and `main!` macros. Not an app (an rlib: `make apps` copies only cdylibs); apps/template is a start."
+description = "Lumen's app SDK (#206): safe wrappers over the `lumen` host functions (log, time, trace, a window with its canvas, events, text, its published tree and answers), lumen-ui inside the app (`ui`: the host's text, a toolkit step per event), a global allocator over the app's fixed memory, a panic handler reporting through `panic` with where it happened, and the `manifest!` and `main!` macros. Not an app (an rlib: `make apps` copies only cdylibs); apps/template is a start."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,6 +16,10 @@ bench = false
 [dependencies]
 lumen-app-api.workspace = true
 lumen-heap.workspace = true
+# The toolkit inside apps (#207): the kernel's own, its text through the
+# host's text calls (`ui::HostText`), its canvas a lumen-gfx surface.
+lumen-gfx.workspace = true
+lumen-ui.workspace = true
 
 [lints]
 workspace = true
