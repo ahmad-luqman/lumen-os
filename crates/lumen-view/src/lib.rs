@@ -397,9 +397,9 @@ pub fn prepare(png: &[u8]) -> Result<Prepared, Why> {
     let pixels = scale(image.pixels(), w, h, at.w(), at.h())
         .and_then(|fit| Surface::from_pixels(at.w(), at.h(), fit))
         .ok_or(Why::NoMemory)?;
-    // The decoder hands back exactly `w` x `h` pixels.
-    let image = Surface::from_pixels(w, h, image.into_pixels())
-        .ok_or_else(|| Why::Decode(DecodeError::Png(String::from("its pixels and its size disagree"))))?;
+    // `lumen-png` hands back exactly `w` x `h` pixels (its `Image`'s own
+    // invariant), so this can't fail: not a file's fault if it did.
+    let image = Surface::from_pixels(w, h, image.into_pixels()).expect("lumen-png's image is its size");
     Ok(Prepared { image, fitted: Fitted { at, pixels } })
 }
 

@@ -1363,8 +1363,8 @@ def test_viewer_list_and_select(boot):
     # Settled means decoded: the wait before the decoding tick animates, so
     # the desktop never settles while the view still says `Decoding`.
     gui.wait_settled(m)
-    assert viewer_info(below_root(gui.ui_tree(m, wid))) == "tiles.png 96x64"
-    rows = wait_info(m, wid, "tiles.png decoded", lambda v: v == "tiles.png 96x64")
+    rows = below_root(gui.ui_tree(m, wid))
+    assert viewer_info(rows) == "tiles.png 96x64"
     assert gui.node(rows, "list", "Images")["value"] == "1"
     box, want = fitted(VIEWER_IMAGES / "tiles.png")
     assert differing(view_of(m, "viewer-tiles.png").crop(box), want) == 0

@@ -151,27 +151,23 @@ impl Viewer {
 
     /// Decode the current image: shown, or why not.
     fn decode(&mut self) {
-        let name = IMAGES[self.current].name;
-        let info = match prepare(IMAGES[self.current].png) {
-            Ok(shown) => {
-                let info = format!("{name} {}x{}", shown.image().width(), shown.image().height());
-                self.shown = Shown::Image(shown);
-                info
-            }
+        let Bundled { name, png } = IMAGES[self.current];
+        let (info, shown) = match prepare(png) {
+            Ok(p) => (format!("{name} {}x{}", p.image().width(), p.image().height()), Shown::Image(p)),
             Err(why) => {
+                let info = format!("{name}: {why}");
                 // A bad or refused file is the file's; running out of memory
                 // is the memory plan failing (lumen-view's tests/memory.rs
                 // says it fits), worth a warning.
                 if why.out_of_memory() {
                     log::warn(&format!("{name}: out of memory: lumen-view's memory plan doesn't hold ({why})"));
                 } else {
-                    log::info(&format!("{name}: {why}"));
+                    log::info(&info);
                 }
-                let info = format!("{name}: {why}");
-                self.shown = Shown::Failed { why: why.to_string(), lines: None };
-                info
+                (info, Shown::Failed { why: why.to_string(), lines: None })
             }
         };
+        self.shown = shown;
         self.ui.set_text(self.info, &info);
         self.dirty = true;
     }
@@ -246,14 +242,12 @@ impl App for Viewer {
         if let Shown::Failed { why, lines: lines @ None } = &mut self.shown {
             *lines = Some(lumen_view::wrap(why, text_w, |t| over.text.width(t)));
         }
-        let text: Vec<String> = match &self.shown {
-            Shown::Image(_) => Vec::new(),
-            Shown::Decoding => alloc::vec![format!("Decoding {name}...")],
-            Shown::Failed { lines, .. } => {
-                let mut text = alloc::vec![format!("Can't show {name}:")];
-                text.extend(lines.iter().flatten().cloned());
-                text
-            }
+        // The view's text: a heading, then a failure's reason (its wrapped
+        // lines, borrowed).
+        let (heading, reason): (Option<String>, &[String]) = match &self.shown {
+            Shown::Image(_) => (None, &[]),
+            Shown::Decoding => (Some(format!("Decoding {name}...")), &[]),
+            Shown::Failed { lines, .. } => (Some(format!("Can't show {name}:")), lines.as_deref().unwrap_or(&[])),
         };
         for r in over.rects {
             let Some(clip) = r.intersect(&VIEW) else { continue };
@@ -266,7 +260,7 @@ impl App for Viewer {
                     blit(over.surface, image, p.dst.x() - p.src_x as i32, p.dst.y() - p.src_y as i32, clip);
                 }
             }
-            for (n, line) in text.iter().enumerate() {
+            for (n, line) in heading.iter().chain(reason).enumerate() {
                 let at = line_at(n);
                 if at.bottom() > VIEW.bottom() {
                     break;
