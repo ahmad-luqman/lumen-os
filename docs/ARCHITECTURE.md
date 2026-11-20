@@ -3884,6 +3884,33 @@ kernel (no SSE); #197 checks the results' bits.
   the argument, with the usage, and exit 2 (`lumen_clock::args`). Its
   geometry has no floats (an integer sine table in half-degree steps), as
   no app has `libm`.
+- **What #201 adds:** `apps/comet` (bundled, `caps=time,desktop`; the
+  launcher lists it), Comet, an original snake-style game: a comet steered
+  across a sky of cells with the arrow keys, its tail growing with each
+  grain of stardust, past each level's asteroids (our own layouts: Open
+  sky, Twin belts, Crossing, Ring of rocks). Its logic is
+  `crates/lumen-snake` (a path dependency, host-tested): steering (a turn
+  back into the tail refused, one turn a step), growth, the edge, the tail
+  and asteroids ending a flight, a level every few grains (its field placed
+  on empty cells, never the two straight ahead of the head), stardust only
+  on empty cells, `Rng` (SplitMix64, checked against its published
+  outputs), so one seed plays one game, and `Game::step` reporting exactly
+  the cells it changed. On the SDK's tick loop: flying, it steps on a
+  period that shortens each level; `Step` switches to stepping, one step
+  per press and no period, so the window settles between presses (`run
+  comet --seed N --step` starts that way, for its golden and tree tests);
+  `Play` flies again. Over, `Play` and `Step` are disabled until
+  `Restart`, which starts the next game in the mode it was launched in.
+  Each step's changed cells are its `take_drawn` damage (Restart the whole
+  sky), drawn in the theme's palette; `Score`, `Level`, `State` and
+  `Comet` (the head's cell and the heading the next step takes, so a test
+  sees a turn arrive) are `fixed_label`s whose texts (lumen-snake's label
+  functions) all fit their width in the UI font, a host test measures;
+  arrow presses are taken before the toolkit. Arguments it doesn't take (an
+  unknown one, a flag twice, `--seed` without a number or with a bad seed,
+  an argument that isn't UTF-8) are one ERROR naming them, then exit 2; any
+  other failure to read the arguments is exit 1. Launched without `--step`
+  it flies from the start, and its Restarts fly too.
 - **What #204 adds (the image viewer, `apps/viewer`, bundled):** images
   built into the app (the wallpaper, `assets/wallpaper/lumen.png`; and
   `apps/viewer/images/`, made by `tools/viewer-images.py`: a palette image,
