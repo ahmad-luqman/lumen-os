@@ -25,7 +25,8 @@ use lumen_app_api::host::{FUNCTIONS, MODULE, Ty};
 use lumen_app_api::layout::{Canvas, Rect as LRect, TextDraw};
 use lumen_app_api::limits::{
     APP_OVERHEAD, BYTE_FUEL, CALL_FUEL, CLOSE_GRACE_SLICES, CODE_FACTOR, EVENT_FUEL, LOG_FUEL, MEMORY_PAGES,
-    MODULE_BYTES, PAGE_BYTES, PIXEL_FUEL, SLICE_FUEL, STORE_BYTES, SURFACES, TABLE_ELEMENTS, VALUE_STACK_BYTES,
+    MODULE_BYTES, PAGE_BYTES, PIXEL_FUEL, SLICE_FUEL, STORE_BYTES, SURFACES, TABLE_ELEMENTS, TEXT_CHAR_FUEL,
+    VALUE_STACK_BYTES,
 };
 use lumen_app_api::{Error, Grants, manifest, text};
 use wasmi::{Engine, Linker, Module, Store};
@@ -1032,7 +1033,8 @@ fn poke(store: &mut Store<runtime::AppCtx>, at: usize, bytes: &[u8]) {
 }
 
 /// `lumen_main` of a module importing `handle_find`, `window_open`,
-/// `window_commit` and `text_draw`: it opens a 16 × 16 window titled by
+/// `window_commit`, `text_draw` and `text_measure` (functions 0 to 4): it
+/// opens a 16 × 16 window titled by
 /// the byte at 128, then runs `then` (with the desktop handle in local 0
 /// and the window's in local 1), and returns the window's handle.
 fn window_module(then: &[u8]) -> Vec<u8> {
@@ -1046,7 +1048,7 @@ fn window_module(then: &[u8]) -> Vec<u8> {
         vec![0x20, 0x01], // return it
     ]
     .concat();
-    let spec = Spec::importing(&["handle_find", "window_open", "window_commit", "text_draw"]);
+    let spec = Spec::importing(&["handle_find", "window_open", "window_commit", "text_draw", "text_measure"]);
     Spec { body, locals: vec![0x01, 0x02, 0x7f], ..spec }.bytes()
 }
 
@@ -1100,8 +1102,27 @@ crate::ktest!(
         crate::ktest::diag(format_args!("text_draw: {glyphs} glyphs rasterized, {used} fuel"));
         crate::kassert!(win > 0);
         crate::kassert!((1..10).contains(&glyphs));
+        let passes = 2 * text.len() as u64 * TEXT_CHAR_FUEL;
         crate::kassert!(
-            used >= 3 * CALL_FUEL + SURFACES * pixels * PIXEL_FUEL + (pixels + glyphs * 32 * 32) * PIXEL_FUEL
+            used >= 3 * CALL_FUEL + passes + SURFACES * pixels * PIXEL_FUEL + (pixels + glyphs * 32 * 32) * PIXEL_FUEL
+        );
+        // Layout is paid by the character, whatever reaches the clip:
+        // text_measure of 1,024 characters (one pass), and a text_draw of
+        // them with nothing reaching the clip (two passes, no glyph).
+        let long = vec![b'a'; 1024];
+        let measure = [vec![0x20, 0x00, 0x41, 0x10], i32_const(256), i32_const(1024), vec![0x10, 0x04, 0x1a]].concat();
+        let (win, used, glyphs) = run_window_module(&window_module(&measure), none, &long)?;
+        crate::ktest::diag(format_args!("text_measure of 1024: {used} fuel"));
+        crate::kassert!(win > 0 && glyphs == 0);
+        crate::kassert!(used >= 3 * CALL_FUEL + SURFACES * pixels * PIXEL_FUEL + 1024 * TEXT_CHAR_FUEL);
+        let away = TextDraw { x: 0, y: -1000, px: 16, rgb: 0xffffff, clip: LRect::new(0, 0, 16, 16) };
+        let call = [vec![0x20, 0x00, 0x41, 0x00, 0x41, 0xc0, 0x00], i32_const(256), i32_const(1024)].concat();
+        let (win, used, glyphs) =
+            run_window_module(&window_module(&[call, vec![0x10, 0x03, 0x1a]].concat()), away, &long)?;
+        crate::ktest::diag(format_args!("text_draw of 1024, none in the clip: {glyphs} glyphs, {used} fuel"));
+        crate::kassert!(win > 0 && glyphs == 0);
+        crate::kassert!(
+            used >= 3 * CALL_FUEL + SURFACES * pixels * PIXEL_FUEL + 2 * 1024 * TEXT_CHAR_FUEL + pixels * PIXEL_FUEL
         );
         Ok(())
     }

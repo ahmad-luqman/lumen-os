@@ -3159,8 +3159,11 @@ loop writes few lines per slice), `PIXEL_FUEL` per pixel of a commit, of
 `text_draw`'s clip and of the three surfaces `window_open` allocates and
 fills (`SURFACES` × w × h), `PIXEL_FUEL` × px² per glyph `text_draw`
 rasterizes (one its glyph cache didn't hold: `font::Text::draw` skips a
-glyph whose box misses the clip before rasterizing it, so the work
-follows the clip, not the text), and `EVENT_FUEL` per trace event copied
+glyph whose box misses the clip before rasterizing it, so rasterizing
+follows the clip), `TEXT_CHAR_FUEL` per character of each layout pass
+over a text (`text_measure` one, `text_draw` two: its advance and its
+drawing walk every character, whatever reaches the clip), and
+`EVENT_FUEL` per trace event copied
 out (`app::tests::host_calls_charge_their_fuel` checks `CALL_FUEL`,
 `BYTE_FUEL`, `LOG_FUEL` and `EVENT_FUEL`;
 `app::tests::window_calls_charge_their_fuel` the pixels and glyphs, as
@@ -3514,6 +3517,7 @@ message, a trap's, `Failed`'s text and an unknown manifest grant (cut at
 | `SLICE_FUEL` | 1,000,000 | the slice ends |
 | `CALL_FUEL`, `LOG_FUEL` | 1,000, 10,000 | fuel per call, per log line |
 | `BYTE_FUEL`, `PIXEL_FUEL`, `EVENT_FUEL` | 1, 1, 16 | fuel per byte, pixel, trace event |
+| `TEXT_CHAR_FUEL` | 256 | fuel per character of a text layout pass (`text_measure` one, `text_draw` two) |
 | `WINDOWS` | 1 per app | `Limit` |
 | `COMMIT_RECTS` | 16 | `BadArgument` |
 | `ARGS_BYTES` | 1024 | `run` refuses |

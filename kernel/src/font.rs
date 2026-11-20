@@ -157,8 +157,9 @@ impl Text {
     /// Draw `text` at `px` with its line box's top-left corner at (`x`,
     /// `y`), in `color`, touching only pixels inside `clip`: each glyph's
     /// mask blended on its own (no line mask allocated), clipped. A glyph
-    /// whose box misses `clip` is skipped before it is rasterized, so the
-    /// work follows the clip, not the text (an app's `text_draw`, #206).
+    /// whose box misses `clip` is skipped before it is rasterized, so
+    /// rasterizing follows the clip (laying the line out still walks every
+    /// character: an app's `text_draw` pays for that by the character, #206).
     /// Blending isn't idempotent, so a redraw of one damaged rectangle
     /// passes that rectangle and the pixels outside it stay as they were.
     #[allow(clippy::too_many_arguments, reason = "a line of text: where, what, how big, which colour, inside what")]

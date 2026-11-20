@@ -17,8 +17,9 @@
 //!
 //! Fuel, on top of `CALL_FUEL` (section 8's list): `PIXEL_FUEL` per pixel
 //! committed, per pixel of `text_draw`'s clip, per pixel of the three
-//! surfaces `window_open` fills, and `PIXEL_FUEL × px²` per glyph
-//! `text_draw` rasterizes (a glyph its cache didn't hold).
+//! surfaces `window_open` fills, `PIXEL_FUEL × px²` per glyph `text_draw`
+//! rasterizes (a glyph its cache didn't hold), and `TEXT_CHAR_FUEL` per
+//! character of each layout pass (`text_measure` one, `text_draw` two).
 
 use super::host::{C, Res, blocking, copy_in, copy_in_capped, entry, memory_len, write_out};
 use super::runtime::{self, AppCtx};
@@ -27,7 +28,7 @@ use crate::{sched, time};
 use lumen_app_api::event::{self, Event};
 use lumen_app_api::layout::{self, CANVAS_SIZE, Canvas, CheckedCanvas, Clipped, RECT_SIZE, TEXT_DRAW_SIZE, TextDraw};
 use lumen_app_api::limits::{COMMIT_RECTS, EVENT_BYTES, PIXEL_FUEL, TEXT_BYTES, TEXT_PX_MAX, TEXT_PX_MIN, TITLE_BYTES};
-use lumen_app_api::limits::{SURFACES, WINDOW_PIXELS};
+use lumen_app_api::limits::{SURFACES, TEXT_CHAR_FUEL, WINDOW_PIXELS};
 use lumen_app_api::{Error, Kind, range, returned, text};
 use lumen_font::Px;
 use lumen_gfx::{Rect, Surface};
@@ -358,7 +359,10 @@ fn measure(c: &mut C<'_>, h: i32, px: i32, ptr: i32, len: i32) -> Result<i32, Er
     let px = text_px(px)?;
     let s = text_in(c, r, TEXT_BYTES)?;
     let (text, _) = c.data_mut().text_and_window()?;
-    Ok(text.measure(&s, px).min(i32::MAX as u32) as i32)
+    let advance = text.measure(&s, px).min(i32::MAX as u32) as i32;
+    // One layout pass over every character.
+    runtime::charge(&mut *c, TEXT_CHAR_FUEL * s.chars().count() as u64);
+    Ok(advance)
 }
 
 fn text_draw(c: &mut C<'_>, h: i32, canvas: i32, args: i32, ptr: i32, len: i32) -> Result<i32, Error> {
@@ -374,9 +378,12 @@ fn text_draw(c: &mut C<'_>, h: i32, canvas: i32, args: i32, ptr: i32, len: i32) 
     let (text, window) = ctx.text_and_window()?;
     let win = window.ok_or(Error::Unavailable)?;
     let advance = text.measure(&s, px).min(i32::MAX as u32) as i32;
+    let chars = s.chars().count() as u64;
     // The clip, cut to the canvas, then to the scratch surface (the
     // window's size) from the clip's corner.
     let Some(clip) = args.clip.clip(canvas.w, canvas.h).and_then(|c| c.shrink_to(win.w, win.h)) else {
+        // Only the advance's layout pass ran.
+        runtime::charge(&mut *c, TEXT_CHAR_FUEL * chars);
         return Ok(advance);
     };
     let to = (clip.x(), clip.y());
@@ -390,8 +397,9 @@ fn text_draw(c: &mut C<'_>, h: i32, canvas: i32, args: i32, ptr: i32, len: i32) 
     text.draw(&mut win.scratch, at(x), at(y), &s, px, args.rgb & 0x00ff_ffff, inside);
     let glyphs = text.stats().misses - rasterized;
     copy_back(mem, &pixels, &clip, &win.scratch, to);
-    // The clip's pixels, and each glyph rasterized at px² of them.
+    // Two layout passes over every character (the advance, the drawing),
+    // the clip's pixels, and each glyph rasterized at px² of them.
     let px2 = u64::from(px.get()) * u64::from(px.get());
-    runtime::charge(&mut *c, PIXEL_FUEL * (clip.area() + glyphs * px2));
+    runtime::charge(&mut *c, 2 * TEXT_CHAR_FUEL * chars + PIXEL_FUEL * (clip.area() + glyphs * px2));
     Ok(advance)
 }
