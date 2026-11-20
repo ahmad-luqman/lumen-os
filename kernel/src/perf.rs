@@ -376,7 +376,7 @@ pub enum StopError {
 }
 
 /// The last CPU whose scheduler runs.
-fn last_cpu() -> usize {
+pub(crate) fn last_cpu() -> usize {
     (0..MAX_CPUS).rev().find(|&c| sched::running_on(c)).unwrap_or(0)
 }
 

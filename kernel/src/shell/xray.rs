@@ -39,15 +39,15 @@ use crate::sync::SpinLock;
 use crate::trace::{self, ReadError};
 use crate::{arch, sched, time};
 
-/// The most threads `trace runq park` queues.
-const MAX_PARKED: usize = 16;
+/// The most threads `trace runq park` queues or `trace runq spin` spins.
+const MAX_THREADS: usize = 16;
 /// How long `park` holds its CPU at least, past the spawns: two timer
 /// ticks, so a hold that didn't hold (interrupts on after all) would see a
 /// tick and say so. A floor on the hold, not a bound on anything.
 const HOLD_AT_LEAST_NS: u64 = 2_000_000;
 
 /// `trace runq spin`'s threads while they spin: their CPU, the flag that
-/// stops them, and their handles (empty while they are being started).
+/// stops them, and their handles.
 struct Spinning {
     cpu: usize,
     stop: Arc<AtomicBool>,
@@ -82,13 +82,13 @@ pub fn runq(ctx: &mut Ctx<'_>, args: &[String]) {
             }
         }
         [park, n] if park == "park" => match n.parse() {
-            Ok(n) if (1..=MAX_PARKED).contains(&n) => self::park(ctx, n),
-            _ => ctx.fail(format_args!("{USAGE} (1 to {MAX_PARKED} threads)")),
+            Ok(n) if (1..=MAX_THREADS).contains(&n) => self::park(ctx, n),
+            _ => ctx.fail(format_args!("{USAGE} (1 to {MAX_THREADS} threads)")),
         },
         [spin, stop] if spin == "spin" && stop == "stop" => spin_stop(ctx),
         [spin, n] if spin == "spin" => match n.parse() {
-            Ok(n) if (1..=MAX_PARKED).contains(&n) => self::spin(ctx, n),
-            _ => ctx.fail(format_args!("{USAGE} (1 to {MAX_PARKED} threads)")),
+            Ok(n) if (1..=MAX_THREADS).contains(&n) => self::spin(ctx, n),
+            _ => ctx.fail(format_args!("{USAGE} (1 to {MAX_THREADS} threads)")),
         },
         _ => ctx.fail(USAGE),
     }
@@ -203,24 +203,15 @@ fn park(ctx: &mut Ctx<'_>, n: usize) {
 /// `trace runq spin <n>`: `n` threads spinning on the last CPU with a
 /// scheduler until `trace runq spin stop`.
 fn spin(ctx: &mut Ctx<'_>, n: usize) {
-    let Some(cpu) = (0..arch::MAX_CPUS).rev().find(|&c| sched::running_on(c)) else {
-        return ctx.fail("runq spin: no cpu runs a scheduler");
-    };
+    let cpu = crate::perf::last_cpu();
     let stop = Arc::new(AtomicBool::new(false));
-    // Claimed before any thread starts (a second shell's spin is refused
-    // meanwhile), filled in once they have; the lock is never held while
-    // printing.
-    let busy = {
-        let mut slot = SPINNING.lock();
-        match slot.as_ref() {
-            Some(s) => Some(s.cpu),
-            None => {
-                *slot = Some(Spinning { cpu, stop: stop.clone(), threads: Vec::new() });
-                None
-            }
-        }
-    };
-    if let Some(on) = busy {
+    // Spawned under the slot's lock, as `perf burn` spawns under its own
+    // (nothing takes it under another lock): a second shell's spin waits,
+    // then finds the slot taken. Dropped before joining or printing.
+    let mut slot = SPINNING.lock();
+    if let Some(s) = slot.as_ref() {
+        let on = s.cpu;
+        drop(slot);
         return ctx.fail(format_args!("runq spin: already spinning on cpu {on}"));
     }
     let mut threads = Vec::with_capacity(n);
@@ -240,12 +231,11 @@ fn spin(ctx: &mut Ctx<'_>, n: usize) {
         }
     }
     if let Some(e) = refused {
-        // Stop the ones that started, and give the slot back.
+        drop(slot);
         stop.store(true, Ordering::Relaxed);
         for h in threads {
             h.join();
         }
-        *SPINNING.lock() = None;
         return ctx.fail(format_args!("runq spin: spawning failed: {e}"));
     }
     let mut t = alloc::format!("runq spin: {n} threads spinning on cpu {cpu}:");
@@ -253,26 +243,15 @@ fn spin(ctx: &mut Ctx<'_>, n: usize) {
         let _ = write!(t, " {}", h.thread().id());
     }
     t.push('\n');
-    if let Some(s) = SPINNING.lock().as_mut() {
-        s.threads = threads;
-    }
+    *slot = Some(Spinning { cpu, stop, threads });
+    drop(slot);
     let _ = ctx.out.write_str(&t);
 }
 
 /// `trace runq spin stop`: the spinning threads told to stop, and joined.
 fn spin_stop(ctx: &mut Ctx<'_>) {
-    let taken = {
-        let mut slot = SPINNING.lock();
-        match slot.as_ref() {
-            None => Err("runq spin: nothing is spinning"),
-            // Still being started by another shell: left to it.
-            Some(s) if s.threads.is_empty() => Err("runq spin: still starting"),
-            Some(_) => slot.take().ok_or("runq spin: nothing is spinning"),
-        }
-    };
-    let s = match taken {
-        Ok(s) => s,
-        Err(why) => return ctx.fail(why),
+    let Some(s) = SPINNING.lock().take() else {
+        return ctx.fail("runq spin: nothing is spinning");
     };
     s.stop.store(true, Ordering::Relaxed);
     let n = s.threads.len();
