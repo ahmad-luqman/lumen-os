@@ -10,7 +10,7 @@
 extern crate alloc;
 
 use alloc::format;
-use lumen_app::{Desktop, Error, Event, KeyAction, Palette, Rect, Window, log};
+use lumen_app::{Desktop, Error, Event, KeyAction, Palette, Rect, Window};
 
 lumen_app::manifest!(desktop);
 lumen_app::main!(run);
@@ -32,13 +32,7 @@ struct State {
 
 /// The app's exit code: 0, or 1 once `app`'s failure is logged.
 fn run() -> i32 {
-    match app() {
-        Ok(()) => 0,
-        Err((what, e)) => {
-            log::error(&format!("{what}: {e}"));
-            1
-        }
-    }
+    lumen_app::report(app())
 }
 
 /// The app: what failed and how, if anything did.

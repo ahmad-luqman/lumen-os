@@ -48,6 +48,7 @@ pub use lumen_gfx::Surface;
 use lumen_app_api::answer::AppAnswer;
 use lumen_app_api::layout::{CANVAS_SIZE, Canvas, RECT_SIZE, TextDraw};
 use lumen_app_api::limits::{ARGS_BYTES, COMMIT_RECTS, EVENT_BYTES, TEXT_BYTES, WINDOW_PIXELS};
+use lumen_app_api::tree::{Tree, TreeError};
 use sys::ptr;
 
 #[global_allocator]
@@ -129,6 +130,19 @@ pub fn args() -> Result<Vec<String>> {
     lumen_app_api::args::words(&buf[..n as usize])
         .map(|w| core::str::from_utf8(w).map(String::from).map_err(|_| Error::BadArgument))
         .collect()
+}
+
+/// An app's exit code from its body's result: 0, or 1 once `<what>: <why>`
+/// is logged as an ERROR (`fn run() -> i32 { lumen_app::report(app()) }`,
+/// each failing step naming itself with `map_err(|e| ("no window", e))`).
+pub fn report(result: core::result::Result<(), (&str, Error)>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err((what, e)) => {
+            log::error(&alloc::format!("{what}: {e}"));
+            1
+        }
+    }
 }
 
 /// End the app now, as if `lumen_main` returned `code`.
@@ -232,9 +246,34 @@ impl Desktop {
     }
 }
 
-/// A surface as the host's text and commit calls take a canvas.
+/// Why a tree wasn't published.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PublishError {
+    /// It doesn't encode within `TREE_BYTES` (or breaks a rule).
+    Tree(TreeError),
+    /// The host refused it.
+    Host(Error),
+}
+
+impl core::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PublishError::Tree(e) => write!(f, "the tree: {e}"),
+            PublishError::Host(e) => write!(f, "the host: {e}"),
+        }
+    }
+}
+
+/// A surface as the host's commit call takes a canvas (read only).
 fn canvas_of(s: &Surface) -> [u8; CANVAS_SIZE] {
     Canvas { ptr: ptr(s.pixels().as_ptr()) as u32, stride: s.stride() as u32, w: s.width(), h: s.height() }.encode()
+}
+
+/// A surface as `text_draw` takes a canvas it writes: the pointer from a
+/// mutable borrow (the host writes the pixels).
+fn canvas_of_mut(s: &mut Surface) -> [u8; CANVAS_SIZE] {
+    let (stride, w, h) = (s.stride() as u32, s.width(), s.height());
+    Canvas { ptr: ptr(s.pixels_mut().as_mut_ptr()) as u32, stride, w, h }.encode()
 }
 
 /// The app's window: its canvas (`w` × `h` pixels, `0x00RRGGBB`, row after
@@ -290,8 +329,9 @@ impl Window {
     /// `y`), touching only `clip`'s pixels: its advance.
     pub fn text_in(&mut self, x: i32, y: i32, px: u32, rgb: u32, text: &str, clip: Rect) -> Result<u32> {
         let args = TextDraw { x, y, px, rgb, clip }.encode();
-        let canvas = self.layout();
-        // SAFETY: the canvas's pixels are ours (`self.canvas`).
+        let canvas = canvas_of_mut(&mut self.canvas);
+        // SAFETY: the canvas's pixels are ours (`self.canvas`, borrowed
+        // mutably for the pointer).
         let r = unsafe {
             sys::text_draw(
                 self.desktop.0.raw(),
@@ -349,11 +389,19 @@ impl Window {
         Event::decode(&buf[..n as usize]).map(Some).map_err(|_| Error::BadArgument)
     }
 
-    /// Publish the window's automation tree (`api::tree::Tree::encode`'s
-    /// bytes): `ui tree` shows it from now on. A refused one
-    /// (`BadArgument`) leaves the last.
-    pub fn publish(&self, tree: &[u8]) -> Result<()> {
-        check(sys::window_publish(self.handle.raw(), ptr(tree.as_ptr()), tree.len() as i32)).map(|_| ())
+    /// Publish the window's automation tree: `ui tree` shows it from now
+    /// on. A refused one (too big to encode, or refused by the host) leaves
+    /// the last.
+    pub fn publish(&self, tree: &Tree) -> core::result::Result<(), PublishError> {
+        let bytes = tree.encode().map_err(PublishError::Tree)?;
+        check(sys::window_publish(self.handle.raw(), ptr(bytes.as_ptr()), bytes.len() as i32))
+            .map(|_| ())
+            .map_err(PublishError::Host)
+    }
+
+    /// Its handle (for a test app's raw calls).
+    pub fn handle(&self) -> Handle {
+        self.handle
     }
 
     /// Answer the window's running request (the last `Event::Request`

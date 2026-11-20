@@ -36,8 +36,8 @@
 //!     bigger canvas, and a call whose text lies in its own canvas drawing
 //!     what one with a separate copy does;
 //!   - `window_publish` (#207): a made-up handle, the wrong kind, a wrapping
-//!     range; no nodes, a button and a tree of exactly `TREE_BYTES`
-//!     accepted; a byte past `TREE_BYTES` (before the copy), bytes that
+//!     range; no nodes, a button, a label holding ESC, LF and U+2028, and
+//!     a tree of exactly `TREE_BYTES` (labels within `TEXT_BYTES`) accepted; a byte past `TREE_BYTES` (before the copy), bytes that
 //!     don't decode and an id twice refused; `window_answer`: a made-up
 //!     handle, the wrong kind, a wrapping range (before "none running"),
 //!     and no request running, refused;
@@ -510,15 +510,22 @@ fn window(c: &mut Checks) {
         host::window_publish(w, jp, TREE_BYTES as i32),
         Err(Error::BadArgument),
     );
-    // A label padded to exactly TREE_BYTES: tag 1, id 1, no name, bounds
-    // 0 0 1 1, not disabled or hidden, then its text (a 3-byte length).
-    let mut label = vec![1u8, 1, 0, 0, 0, 1, 1, 0, 0];
-    let text = TREE_BYTES - label.len() - 3;
-    label.extend_from_slice(&[(text as u8 & 0x7f) | 0x80, ((text >> 7) as u8 & 0x7f) | 0x80, (text >> 14) as u8]);
-    label.resize(TREE_BYTES, b'x');
+    // Labels making a tree of exactly TREE_BYTES (each text within
+    // TEXT_BYTES: a longer one is refused).
+    let tree = exact_tree(TREE_BYTES);
     c.check(
         "publish: a tree of exactly TREE_BYTES",
-        host::window_publish(w, ptr(label.as_ptr()), TREE_BYTES as i32),
+        host::window_publish(w, ptr(tree.as_ptr()), TREE_BYTES as i32),
+        Ok(()),
+    );
+    // A label whose text holds ESC, LF and U+2028: accepted (`ui tree`
+    // shows each as U+FFFD).
+    let odd = "a\u{1b}b\nc\u{2028}d".as_bytes();
+    let mut label = vec![1u8, 1, 0, 0, 0, 1, 1, 0, 0, odd.len() as u8];
+    label.extend_from_slice(odd);
+    c.check(
+        "publish: a label with control characters",
+        host::window_publish(w, ptr(label.as_ptr()), label.len() as i32),
         Ok(()),
     );
     // A button, app id 1: tag 2, id 1, no name, bounds, flags, not focused.
@@ -575,4 +582,41 @@ pub extern "C" fn lumen_main() -> i32 {
     }
     info(&format!("abuse: {mode}: {} checks, {} failed", c.run, c.failed));
     c.failed as i32
+}
+
+/// A label's encoded length with `n` characters of text (its length one
+/// byte below 128, two from there).
+fn label_len(n: usize) -> usize {
+    9 + if n < 128 { 1 } else { 2 } + n
+}
+
+/// Push a label's bytes onto `out`: tag 1, app id `id` (below 128), no
+/// name, bounds 0 0 1 1, not disabled or hidden, then `n` (at most
+/// `TEXT_BYTES`) characters of text with their length.
+fn push_label(out: &mut alloc::vec::Vec<u8>, id: u8, n: usize) {
+    out.extend_from_slice(&[1u8, id, 0, 0, 0, 1, 1, 0, 0]);
+    if n < 128 {
+        out.push(n as u8);
+    } else {
+        out.extend_from_slice(&[(n as u8 & 0x7f) | 0x80, (n >> 7) as u8]);
+    }
+    out.resize(out.len() + n, b'x');
+}
+
+/// Labels whose encoding is exactly `len` bytes, in one allocation (the
+/// bump heap never frees): whole ones of 1,000 characters, then two making
+/// up the rest.
+fn exact_tree(len: usize) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::with_capacity(len);
+    let mut id = 1;
+    while len - out.len() > 2 * label_len(1000) {
+        push_label(&mut out, id, 1000);
+        id += 1;
+    }
+    let half = (len - out.len()) / 2;
+    push_label(&mut out, id, half - 12);
+    let left = len - out.len();
+    let n = (0..TEXT_BYTES).find(|&n| label_len(n) == left).unwrap_or(0);
+    push_label(&mut out, id + 1, n);
+    out
 }

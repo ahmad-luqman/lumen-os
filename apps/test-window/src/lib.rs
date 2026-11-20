@@ -39,7 +39,8 @@
 //! The toolkit modes (#207), each its window titled `window`:
 //!
 //! - `ui`: `lumen_ui::counter::Counter` (the kernel's demo app: Add, Reset,
-//!   Lock, Quit) in the SDK's `ui::Toolkit`, published after each change,
+//!   Lock, Quit), with a label `Long` of `2 × TEXT_BYTES` characters (the
+//!   SDK's text cuts it), in the SDK's `ui::Toolkit`, published after each change,
 //!   `ui invoke` reaching it as a click does; returns 0 when its window
 //!   closes (Quit, or `Close`).
 //! - `ui-trap`: the same, but a press on Add traps (`unreachable`) while
@@ -47,9 +48,11 @@
 //! - `deep`: publishes the deepest tree there is, `TREE_NODES` groups each
 //!   holding the next (`window: deep: published <n> nodes (<b> bytes)`),
 //!   then goes on as with no argument (events read until `Close`).
-//! - `deaf`: publishes one button (app id 1), logs `window: deaf:
-//!   published`, then sleeps for good, never reading its events: a request
-//!   to it stays queued, so its window's one request slot stays taken.
+//! - `deaf`: publishes a button `Go` (app id 1) and a label `Say` whose
+//!   name and text hold ESC, LF and U+2028, then a tree the host refuses
+//!   (`window: deaf: published; a bad tree then: -5`: the last one stays),
+//!   then sleeps for good, never reading its events: a request to it stays
+//!   queued, so its window's one request slot stays taken.
 
 #![no_std]
 
@@ -61,9 +64,9 @@ use alloc::vec::Vec;
 use core::hint::black_box;
 use lumen_app::api::kind::Stream;
 use lumen_app::api::layout::Rect as WireRect;
-use lumen_app::api::limits::TREE_NODES;
+use lumen_app::api::limits::{TEXT_BYTES, TREE_NODES};
 use lumen_app::api::trace::{EVENT_SIZE, HEADER_SIZE, decode_header};
-use lumen_app::api::tree::{Common, Node, Tree};
+use lumen_app::api::tree::{Common, Node, Text, Tree};
 use lumen_app::ui::Toolkit;
 use lumen_app::{Desktop, Error, Event, Rect, Time, Trace, log};
 use lumen_ui::counter::Counter;
@@ -135,7 +138,13 @@ fn run() -> i32 {
         }
     };
     match mode {
-        "ui" => return toolkit(Counter::new(), w),
+        "ui" => {
+            // A label past TEXT_BYTES: the SDK's text cuts it before the
+            // host's calls (a refused one would log `ui: ... refused`).
+            let mut counter = Counter::new();
+            counter.ui_mut().label(None, "Long", &"x".repeat(2 * TEXT_BYTES));
+            return toolkit(counter, w);
+        }
         "ui-trap" => return toolkit(Trapping(Counter::new()), w),
         "deep" | "deaf" => {
             if let Err(code) = publish(mode, &w) {
@@ -291,7 +300,7 @@ fn toolkit(app: impl App, w: lumen_app::Window) -> i32 {
 
 /// A node of the hand-made trees: id `id`, a 10 × 10 box.
 fn common(id: u64) -> Common {
-    Common { id, name: String::new(), bounds: WireRect::new(0, 0, 10, 10), disabled: false, hidden: false }
+    Common { id, name: Text::cut(""), bounds: WireRect::new(0, 0, 10, 10), disabled: false, hidden: false }
 }
 
 /// The `deep` and `deaf` modes: a hand-made tree published; `deaf` then
@@ -302,22 +311,32 @@ fn publish(mode: &str, w: &lumen_app::Window) -> Result<(), i32> {
         let n = TREE_NODES as u64;
         (1..=n).map(|id| Node::Group { common: common(id), children: u32::from(id < n) }).collect()
     } else {
-        alloc::vec![Node::Button { common: Common { name: String::from("Go"), ..common(1) }, focused: false }]
+        // A button, and a label whose name and text hold an ESC, a line
+        // feed and a line separator (`ui tree` shows U+FFFD for each).
+        let odd = "a\u{1b}b\nc\u{2028}d";
+        alloc::vec![
+            Node::Button { common: Common { name: Text::cut("Go"), ..common(1) }, focused: false },
+            Node::Label { common: Common { name: Text::cut("Say"), ..common(2) }, text: Text::cut(odd) },
+        ]
     };
     let count = nodes.len();
-    let bytes = match Tree::new(nodes).and_then(|t| t.encode()) {
-        Ok(b) => b,
+    let tree = match Tree::new(nodes) {
+        Ok(t) => t,
         Err(e) => {
             log::error(&format!("window: {mode}: {e}"));
             return Err(1);
         }
     };
-    if let Err(e) = w.publish(&bytes) {
+    if let Err(e) = w.publish(&tree) {
         log::error(&format!("window: {mode}: publish: {e}"));
         return Err(2);
     }
     if mode == "deaf" {
-        log::info("window: deaf: published");
+        // Then a tree the host refuses (a node that doesn't decode): the
+        // last one stays published.
+        let junk = [0xffu8; 4];
+        let r = lumen_app::sys::window_publish(w.handle().raw(), lumen_app::sys::ptr(junk.as_ptr()), 4);
+        log::info(&format!("window: deaf: published; a bad tree then: {r}"));
         let Ok(time) = Time::get() else { return Err(4) };
         loop {
             if time.sleep(1_000_000_000).is_err() {
@@ -325,6 +344,7 @@ fn publish(mode: &str, w: &lumen_app::Window) -> Result<(), i32> {
             }
         }
     }
-    log::info(&format!("window: deep: published {count} nodes ({} bytes)", bytes.len()));
+    let bytes = tree.encode().map_or(0, |b| b.len());
+    log::info(&format!("window: deep: published {count} nodes ({bytes} bytes)"));
     Ok(())
 }

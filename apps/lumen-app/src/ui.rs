@@ -13,7 +13,7 @@
 //!   click reaches; what it said goes back as an `AppAnswer` (the kernel
 //!   builds the row from the published tree).
 
-use crate::{Desktop, Error, Event, Handle, Result, Window, check, sys};
+use crate::{Desktop, Event, Handle, Result, Window, check, sys};
 use lumen_app_api::answer::AppAnswer;
 use lumen_app_api::event::{Button, toolkit_key};
 use lumen_app_api::layout::{Rect as WireRect, TextDraw};
@@ -30,12 +30,31 @@ use sys::ptr;
 pub struct HostText {
     desktop: Handle,
     line: u32,
+    /// Whether a refused text call was logged (once: the toolkit has no
+    /// way to report it, and a WARN a frame would flood the log).
+    warned: bool,
 }
 
 impl HostText {
     pub fn new(desktop: Desktop) -> Result<HostText> {
         let line = desktop.line_height(UI_TEXT_PX)?;
-        Ok(HostText { desktop: desktop.0, line })
+        Ok(HostText { desktop: desktop.0, line, warned: false })
+    }
+
+    /// A text call's result: its value, or (refused: a bug, the text is cut
+    /// to its cap first) 0, the first refusal logged.
+    fn checked(&mut self, call: &str, r: i32) -> u32 {
+        match check(r) {
+            Ok(v) => v,
+            Err(e) => {
+                if !self.warned {
+                    self.warned = true;
+                    crate::log::warn(&alloc::format!("ui: {call} refused: {e}"));
+                }
+                debug_assert!(false, "a text call refused");
+                0
+            }
+        }
     }
 }
 
@@ -46,18 +65,18 @@ impl Text for HostText {
 
     fn width(&mut self, text: &str) -> u32 {
         let text = lumen_app_api::text::prefix(text, TEXT_BYTES);
-        check(sys::text_measure(self.desktop.raw(), UI_TEXT_PX as i32, ptr(text.as_ptr()), text.len() as i32))
-            .unwrap_or(0)
+        let r = sys::text_measure(self.desktop.raw(), UI_TEXT_PX as i32, ptr(text.as_ptr()), text.len() as i32);
+        self.checked("text_measure", r)
     }
 
     fn draw(&mut self, surface: &mut Surface, x: i32, y: i32, text: &str, color: u32, clip: Rect) {
         let text = lumen_app_api::text::prefix(text, TEXT_BYTES);
         let args = TextDraw { x, y, px: UI_TEXT_PX, rgb: color, clip: clip.into() }.encode();
-        let canvas = crate::canvas_of(surface);
-        // SAFETY: the canvas's pixels are `surface`'s, ours to write (the
-        // host writes only inside `clip`, cut to the canvas). A refusal
-        // draws nothing: there is nothing to report it to.
-        let _ = unsafe {
+        let canvas = crate::canvas_of_mut(surface);
+        // SAFETY: the canvas's pixels are `surface`'s, borrowed mutably and
+        // ours to write (the host writes only inside `clip`, cut to the
+        // canvas). A refusal draws nothing (logged once).
+        let r = unsafe {
             sys::text_draw(
                 self.desktop.raw(),
                 ptr(canvas.as_ptr()),
@@ -66,6 +85,7 @@ impl Text for HostText {
                 text.len() as i32,
             )
         };
+        self.checked("text_draw", r);
     }
 }
 
@@ -85,6 +105,10 @@ pub struct Toolkit<A: App> {
     /// From the last `Theme` event (the first event, always).
     palette: Palette,
     window: Window,
+    /// The last publish was refused: try again at the next refresh (the
+    /// kernel keeps the last tree meanwhile), logged once.
+    unpublished: bool,
+    warned: bool,
 }
 
 impl<A: App> Toolkit<A> {
@@ -92,15 +116,12 @@ impl<A: App> Toolkit<A> {
     /// first event, `Theme`, says how.
     pub fn new(app: A, window: Window) -> Result<Toolkit<A>> {
         let text = HostText::new(window.desktop())?;
-        Ok(Toolkit { app, text, palette: Palette::from(lumen_app_api::event::Palette::default()), window })
+        let palette = Palette::from(lumen_app_api::event::Palette::default());
+        Ok(Toolkit { app, text, palette, window, unpublished: false, warned: false })
     }
 
     pub fn app_mut(&mut self) -> &mut A {
         &mut self.app
-    }
-
-    pub fn window(&self) -> &Window {
-        &self.window
     }
 
     /// Its window (its events: an app may take some itself before handing
@@ -177,7 +198,13 @@ impl<A: App> Toolkit<A> {
             self.window.answer(&answer)?;
             return Ok(Step::Close);
         }
-        self.refresh()?;
+        // Answered even if the refresh fails (its asker would wait for
+        // nothing), then the failure is the step's.
+        if let Err(e) = self.refresh() {
+            let why = lumen_app_api::answer::FailText::cut(&alloc::format!("couldn't refresh: {e}"));
+            self.window.answer(&AppAnswer::Failed(why))?;
+            return Err(e);
+        }
         self.window.answer(&answer)?;
         Ok(Step::Carry)
     }
@@ -189,24 +216,37 @@ impl<A: App> Toolkit<A> {
 
     /// Lay the tree out; repaint and commit only what changed
     /// (`lumen_ui::repaint`, as the kernel's toolkit does), then publish the
-    /// tree if it changed.
+    /// tree if it changed (or the last publish was refused). A failed commit
+    /// marks the whole tree changed again, so the next refresh repaints and
+    /// republishes it; a refused publish is logged once and tried again.
     pub fn refresh(&mut self) -> Result<()> {
         let area = self.window.canvas.bounds();
         let done = repaint(&mut self.app, &mut self.window.canvas, &mut self.text, &self.palette, area);
         if !done.rects.is_empty() {
             let wire: alloc::vec::Vec<WireRect> = done.rects.iter().map(|&r| r.into()).collect();
-            self.window.commit(&wire)?;
+            if let Err(e) = self.window.commit(&wire) {
+                self.app.ui_mut().invalidate();
+                return Err(e);
+            }
         }
-        if done.changed {
-            self.publish()?;
+        if done.changed || self.unpublished {
+            self.publish();
         }
         Ok(())
     }
 
-    /// Publish the tree as it is now.
-    pub fn publish(&mut self) -> Result<()> {
+    /// Publish the tree as it is now; a refusal (the tree too big, the host
+    /// refusing it) logged once, the kernel keeping the last tree.
+    pub fn publish(&mut self) {
         let nodes = self.app.ui_mut().nodes();
-        let bytes = Tree::from_automation(&nodes).and_then(|t| t.encode()).map_err(|_| Error::BadArgument)?;
-        self.window.publish(&bytes)
+        let result =
+            Tree::from_automation(&nodes).map_err(crate::PublishError::Tree).and_then(|t| self.window.publish(&t));
+        self.unpublished = result.is_err();
+        if let Err(e) = result
+            && !self.warned
+        {
+            self.warned = true;
+            crate::log::warn(&alloc::format!("ui: a tree not published: {e}"));
+        }
     }
 }

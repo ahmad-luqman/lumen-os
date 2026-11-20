@@ -10,7 +10,12 @@
 //! - **Limits**: an entry takes at most [`DIGITS`] digits, [`DECIMALS`] of
 //!   them after the point (more are ignored); a result whose integer part
 //!   needs more than [`DIGITS`] digits, or a division by zero, shows
-//!   [`ERROR`] until the next digit or `C`.
+//!   [`ERROR`] until the next digit, `.` or `C`. A result smaller than
+//!   10^-[`DECIMALS`] rounds to 0 (half away from zero).
+//! - **Keys** ([`Key::from_char`]): `0`-`9`; `.` or `,`; `+`, `-`, `*`
+//!   (also `x`, `X`, `×`), `/` (also `÷`); `=`; `c` or `C`; the app maps
+//!   Enter to `=`, Backspace and Escape (`C`) itself. An operator first
+//!   applies to 0 (`- 3 =` is -3).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -92,10 +97,10 @@ impl Dec {
                 if b.0 == 0 {
                     return None;
                 }
-                let n = a.0.checked_mul(SCALE)?;
-                let d = b.0;
-                // Rounded with the divisor's sign moved to the dividend.
-                if d < 0 { div_round(-n, -d) } else { div_round(n, d) }
+                // A divisor is always an entry: never negative (there is no
+                // sign key), so `div_round`'s positive divisor holds.
+                debug_assert!(b.0 > 0);
+                div_round(a.0.checked_mul(SCALE)?, b.0)
             }
         };
         (raw.abs() < LIMIT).then_some(Dec(raw))
@@ -329,6 +334,43 @@ mod tests {
         assert_eq!(calc("2 + * 3 ="), "6", "a second operator replaces the first");
         assert_eq!(calc("2 + ="), "2", "= without a second number waits for it");
         assert_eq!(calc("2 + = 3 ="), "5");
+    }
+
+    #[test]
+    fn an_operator_first_applies_to_zero_and_a_point_shows_its_zero() {
+        assert_eq!(calc("- 3 + 1 ="), "-2");
+        assert_eq!(calc("."), "0.");
+        assert_eq!(calc("5 / 0 = ."), "0.", "a point starts again after an error too");
+        assert_eq!(calc("0.000000001 / 3 ="), "0", "underflow rounds to 0");
+    }
+
+    #[test]
+    fn every_key_alias_is_its_key() {
+        for (c, k) in [
+            (',', Key::Point),
+            ('x', Key::Op(Op::Mul)),
+            ('X', Key::Op(Op::Mul)),
+            ('×', Key::Op(Op::Mul)),
+            ('*', Key::Op(Op::Mul)),
+            ('÷', Key::Op(Op::Div)),
+            ('/', Key::Op(Op::Div)),
+            ('c', Key::Clear),
+            ('C', Key::Clear),
+            ('=', Key::Equals),
+            ('7', Key::Digit(7)),
+        ] {
+            assert_eq!(Key::from_char(c), Some(k), "{c}");
+        }
+        assert_eq!(calc("3 x 4 ="), "12");
+        assert_eq!(calc("1,5 ÷ 3 ="), "0.5");
+    }
+
+    #[test]
+    fn the_longest_result_shows_whole() {
+        // What the display must fit: 15 integer digits, a point, 9
+        // decimals and a sign (the calculator app's display is sized for it,
+        // its golden showing it).
+        assert_eq!(calc("0 - 999999999999999 = / 7 ="), "-142857142857142.714285714");
     }
 
     #[test]

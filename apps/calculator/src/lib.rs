@@ -1,9 +1,11 @@
 //! The calculator (#207): a display and a pad of buttons in `lumen-ui`,
 //! inside the app (the SDK's `ui::Toolkit`), so its window shows in `ui
 //! tree` like a kernel window and `ui invoke` presses its buttons as a
-//! click does. Keys work too: digits, `.`, `+ - * /`, `=` or Enter,
-//! Backspace, Escape or `c`. The arithmetic is `lumen_calc::Calc`'s
-//! (host-tested): left to right, in exact decimals.
+//! click does. Keys work too, whichever button has the focus: lumen-calc's
+//! characters (`0`-`9`, `.` or `,`, `+ - * /`, `x` or `×`, `÷`, `=`, `c`),
+//! Enter (`=`), Backspace and Escape (`C`); Tab and Space go to the
+//! toolkit. The arithmetic is `lumen_calc::Calc`'s (host-tested): left to
+//! right, in exact decimals.
 
 #![no_std]
 
@@ -12,14 +14,17 @@ extern crate alloc;
 use alloc::format;
 use alloc::vec::Vec;
 use lumen_app::ui::Toolkit;
-use lumen_app::{Desktop, Error, Event, KeyAction, KeyCode, log};
+use lumen_app::{Desktop, Error, Event, KeyAction, KeyCode};
 use lumen_calc::{Calc, Key, Op};
 use lumen_ui::{App, Then, Ui, UiEvent, Widget};
 
 lumen_app::manifest!(desktop);
 lumen_app::main!(run);
 
-const WIDTH: u32 = 248;
+/// Wide enough for the longest value the display shows,
+/// `-142857142857142.714285714` (lumen-calc's `the_longest_result_shows_whole`;
+/// the golden shows it).
+const WIDTH: u32 = 300;
 const HEIGHT: u32 = 300;
 /// The display's width: the pad's.
 const DISPLAY: u32 = WIDTH - 2 * 8;
@@ -95,13 +100,7 @@ fn key_of(code: KeyCode, text: Option<char>) -> Option<Key> {
 /// The app's exit code: 0 once its window is closed, or 1 once `app`'s
 /// failure is logged.
 fn run() -> i32 {
-    match app() {
-        Ok(()) => 0,
-        Err((what, e)) => {
-            log::error(&format!("{what}: {e}"));
-            1
-        }
-    }
+    lumen_app::report(app())
 }
 
 fn app() -> Result<(), (&'static str, Error)> {
