@@ -1,5 +1,5 @@
-//! Comet (#201): an original snake-style game. Steer a comet across the
-//! night sky with the arrow keys; each grain of stardust it reaches
+//! Comet (#201): an original snake-style game. Steer a comet across a sky
+//! of cells with the arrow keys; each grain of stardust it reaches
 //! lengthens its tail; the sky's edge, its own tail and each level's
 //! asteroids end the flight. The game is `lumen_snake::Game`'s
 //! (host-tested); this is its window, on the SDK's tick loop (#222):
@@ -177,7 +177,8 @@ impl Comet {
         self.show();
     }
 
-    /// An arrow turns the comet (taken: the toolkit never sees arrows).
+    /// An arrow press turns the comet (taken: the toolkit never sees arrow
+    /// presses; their releases go to it, which ignores them).
     fn take(&mut self, e: &Event) -> Taken {
         let Event::Key { code, action: KeyAction::Press { .. }, .. } = *e else { return Taken::Pass };
         let d = match code {

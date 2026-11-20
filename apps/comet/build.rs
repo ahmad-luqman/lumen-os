@@ -1,9 +1,9 @@
 //! The app's fixed memory (ARCHITECTURE section 8, "Its memory is fixed"):
-//! its initial size is its maximum, at most `MEMORY_PAGES` (lumen-app-api's
-//! limits: 16 MiB). This app's
-//! 4 MiB hold wasm-ld's 1 MiB stack, its data and a heap for its canvas
-//! (4 bytes a pixel). These link arguments come after the workspace's
-//! default (apps/.cargo/config.toml's 2 MiB), and wasm-ld takes the last.
+//! 4 MiB, for wasm-ld's 1 MiB stack, its data and a heap holding its canvas
+//! (4 bytes a pixel), its widget tree, the tree it publishes and the game
+//! (a few KiB for the sky's cells). These link arguments come after the
+//! workspace's default (apps/.cargo/config.toml's 2 MiB), and wasm-ld takes
+//! the last.
 
 /// The app's memory, in bytes: a multiple of 64 KiB.
 const MEMORY_BYTES: u32 = 4 * 1024 * 1024;

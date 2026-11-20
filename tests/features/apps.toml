@@ -162,10 +162,11 @@ tests = [
 ]
 
 [[feature]]
-name = "An original snake-style game (#201): Comet, a comet steered with the arrow keys across a night sky, its tail growing with each grain of stardust, ended by the edge, its own tail or a level's asteroids; one seed plays one game; stepping one step per Step press (settling between), flying by itself on a period; score, level, state and the head's cell in its tree; Restart; its window matching a golden"
+name = "An original snake-style game (#201): Comet, a comet steered with the arrow keys across a sky of cells, its tail growing with each grain of stardust, ended by the edge, its own tail or a level's asteroids; one seed plays one game; stepping one step per Step press (settling between), flying by itself, Step while flying stepping again; Play and Step disabled once over, Restart starting as launched and redrawing the sky; score, level, state, the head's cell and heading in its tree, each label fitting its width; its window matching a golden"
 milestone = "M5"
 tests = [
     "cargo:lumen-snake",
     "scenario:test_apps::test_snake_tree_and_steps",
+    "scenario:test_apps::test_snake_steering_and_modes",
     "scenario:test_apps::test_snake_golden",
 ]

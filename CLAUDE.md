@@ -519,9 +519,10 @@ own PR that updates that doc first.
   display out, left to right in exact decimal fixed point (host-tested).
 - `crates/lumen-snake`: Comet's logic (#201, an original snake-style
   game): the sky's cells, steering, growth, the edge, tail and asteroids
-  ending a flight, levels (`rocks`), stardust on empty cells, `Rng`
-  (seeded SplitMix64: one seed, one game), `Game::step` reporting exactly
-  the cells it changed (the app's damage) (host-tested).
+  ending a flight, levels (`rocks`, sparing the cells ahead), stardust on
+  empty cells, `Rng` (seeded SplitMix64: one seed, one game), `Game::step`
+  reporting exactly the cells it changed (the app's damage), the labels'
+  texts and `LABEL_W` (each measured in the UI font) (host-tested).
 - `crates/lumen-synth`: sound synthesis for the shell's `beep` and
   `play`: fixed-point oscillators (square, triangle, sine table,
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation

@@ -1,5 +1,5 @@
 //! Comet's logic (#201; `apps/comet` is its window): an original
-//! snake-style game. A comet crosses a night sky of cells; each grain of
+//! snake-style game. A comet crosses a sky of cells; each grain of
 //! stardust it reaches lengthens its tail; the sky's edge, its own tail and
 //! each level's asteroids end the flight. Host-tested, `no_std` with
 //! `alloc`.
