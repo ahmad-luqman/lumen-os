@@ -1,6 +1,6 @@
 [package]
 name = "lumen-png"
-description = "no_std PNG for Lumen: the decoder the desktop's wallpaper uses (zune-png: any PNG to xRGB pixels, a bad or truncated file an error), the encoder the kernel's screenshot uses (RGB8 rows, unfiltered, zlib from miniz_oxide, its own buffers refused rather than aborted when the allocator says no), CRC-32, and the base64 frame a PNG travels in over serial; host-tested"
+description = "no_std PNG for Lumen: the decoder the desktop's wallpaper and the image viewer app use (zune-png: any PNG to xRGB pixels, a bad or truncated file an error), the encoder the kernel's screenshot uses (RGB8 rows, unfiltered, zlib from miniz_oxide, its own buffers refused rather than aborted when the allocator says no), CRC-32, and the base64 frame a PNG travels in over serial; host-tested"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
