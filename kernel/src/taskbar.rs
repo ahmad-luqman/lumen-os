@@ -2,11 +2,10 @@
 //! screen (`Desktop::open_panel`: frameless, in front, never focused),
 //! built with `lumen-ui` so its buttons are in the automation tree.
 //!
-//! Left to right: the `Launcher` menu (its items open a terminal, the
-//! Mandelbrot window or Counter, or start the Life app (#202), then start
-//! each other bundled app whose manifest grants `desktop`, by name: #206), a
-//! button per window in the
-//! order they opened (a press restores it if minimized, then raises and
+//! Left to right: the `Launcher` menu (its items open a terminal or the
+//! Mandelbrot window, start the Life app (#202) or open Counter, then
+//! start each other bundled app whose manifest grants `desktop`, by name:
+//! #206), a button per window in the order they opened (a press restores it if minimized, then raises and
 //! focuses it), and at the right end the `Clock`, a fixed-size label
 //! showing the RTC's `HH:MM`.
 //!
@@ -43,7 +42,7 @@ const ITEMS: [&str; 4] = ["Terminal", "Mandelbrot", "Life", "Counter"];
 const LIFE_APP: &str = "life";
 
 /// The launcher's items: [`ITEMS`], then the bundled apps whose manifest
-/// grants `desktop` (never the test apps), by name, but [`LIFE_APP`].
+/// grants `desktop` (never the test apps), by name, except [`LIFE_APP`].
 fn items() -> Vec<&'static str> {
     items_with(crate::app::desktop_apps())
 }
@@ -201,12 +200,12 @@ impl Taskbar {
         let Some(&name) = self.items.get(item) else { return Err(String::from("no such item")) };
         let window = |id: Result<u32, String>| id.map(|id| format!("window {id}"));
         let app = |name: &str| crate::app::start(name).map(|id| format!("app {id}"));
-        // An app's name is lower case (kernel/build.rs): never a demo's.
         match name {
             "Terminal" => window(crate::termwin::open()),
             "Mandelbrot" => window(crate::demo::open_mandelbrot_window()),
             "Life" => app(LIFE_APP),
             "Counter" => window(crate::ui::open_counter()),
+            // An app's name is lower case (kernel/build.rs): never a demo's.
             bundled => app(bundled),
         }
     }

@@ -8,12 +8,16 @@
 //!   labels, `Pattern` (its name), `Generation` and `State` (`running` or
 //!   `stopped`). The grid is the rest, the app's own, drawn in
 //!   `paint_over`: a line in the palette's border colour between the two,
-//!   live cells in its accent, so it follows the theme.
+//!   live cells in its accent (7 pixels square on an 8-pixel pitch), so it
+//!   follows the theme.
 //! - **Running**, it steps a generation every 100 ms (`Ticking::period`; its
-//!   waits are an animation's, focused or not), committing only the box
-//!   around the cells that changed (`take_drawn`), as #157's window did.
-//!   **Stopped**, it has no period: the window settles, and each `Step`
-//!   advances one generation.
+//!   waits are an animation's, focused or not). A step commits the box
+//!   around the cells that changed (`take_drawn`) and the `Generation`
+//!   label. **Stopped**, it has no period: the window settles, and each
+//!   `Step` advances one generation.
+//! - **The `Pattern` label** names the pattern it runs; the list shows no
+//!   selection until one is chosen in it (lumen-ui has no way yet to set a
+//!   list's selection from the app).
 //! - **A pattern** chosen in the list starts it again from that pattern at
 //!   generation 0, running or stopped as it was.
 //! - **`run life [--stopped] [pattern]`:** the pattern to start with (`gun`
@@ -163,11 +167,11 @@ impl App for LifeApp {
                 UiEvent::Pressed(w) if w == self.start => self.set_running(true),
                 UiEvent::Pressed(w) if w == self.stop => self.set_running(false),
                 UiEvent::Pressed(w) if w == self.step => self.advance(),
-                UiEvent::Selected(w, i) if w == self.patterns => {
-                    if let Some(p) = life::PATTERNS.get(i) {
-                        self.reset(p);
-                    }
-                }
+                UiEvent::Selected(w, i) if w == self.patterns => match life::PATTERNS.get(i) {
+                    Some(p) => self.reset(p),
+                    // The list holds exactly the patterns: a bug.
+                    None => log::error(&format!("the list chose pattern {i} of {}", life::PATTERNS.len())),
+                },
                 _ => {}
             }
         }

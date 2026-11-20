@@ -56,7 +56,8 @@ impl Pattern {
     }
 }
 
-/// The patterns' names, in [`PATTERNS`]' order (for completion).
+/// The patterns' names, in [`PATTERNS`]' order (the `life` command's
+/// completion, the Life app's list).
 pub const NAMES: [&str; PATTERNS.len()] = {
     let mut names = [""; PATTERNS.len()];
     let mut i = 0;
@@ -67,7 +68,7 @@ pub const NAMES: [&str; PATTERNS.len()] = {
     names
 };
 
-/// The patterns the `life` command knows, by name.
+/// The patterns the `life` command and the Life app know, by name.
 pub const PATTERNS: &[Pattern] = &[
     Pattern {
         name: "glider",

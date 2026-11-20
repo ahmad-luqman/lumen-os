@@ -3861,10 +3861,12 @@ SSE); #197 checks the results' bits.
     `Patterns` list, `Start`, `Stop` and `Step`, and three fixed-width
     labels, `Pattern`, `Generation` and `State` (`running` or `stopped`).
     The grid is the rest, the app's own: a line in the palette's border
-    colour, then cells of 8 pixels, live ones in its accent.
+    colour, then cells 7 pixels square on an 8-pixel pitch, live ones in
+    its accent. The `Pattern` label names the pattern running; the list
+    shows no selection until one is chosen in it.
   - **Running**, a generation every 100 ms (`Ticking::period`, animating,
-    focused or not); its damage is the box around the cells that changed
-    (`take_drawn`), as #157's window committed. **Stopped**, no period:
+    focused or not); a step commits the box around the cells that changed
+    (`take_drawn`) and the `Generation` label. **Stopped**, no period:
     the window settles, and `Step` advances one generation. A pattern
     chosen in the list starts it again from that pattern at generation 0,
     running or stopped as it was.
@@ -4216,9 +4218,10 @@ until a crash.
   a `ui tree` value), then calls the harness's `wait_settled(m)`
   (`tools/harness/lumen_harness/gui.py`, #153), and brackets each
   screendump between two `desktop status` reads with the same `frames`.
-  Windows that animate (a blinking cursor, `desktop spin`, the running Life app) never
-  idle: tests close them first, mask them or (a terminal window) unfocus
-  them, and their goldens leave them out. A scenario that only checks state ends with `desktop check`
+  Windows that animate (a blinking cursor, `desktop spin`, the running
+  Life app) never idle: tests close them first, mask them, (a terminal
+  window) unfocus them or stop them (the Life app's `--stopped` and Stop), and their
+  goldens leave them out. A scenario that only checks state ends with `desktop check`
   reporting 0 and 0.
 
 ### Windows and who draws (#153)

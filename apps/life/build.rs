@@ -1,6 +1,7 @@
 //! The app's fixed memory (ARCHITECTURE section 8, "Its memory is fixed"):
 //! 4 MiB, for wasm-ld's 1 MiB stack, its data and a heap holding its canvas
-//! (4 bytes a pixel), the grid (two cells' worth of bytes per cell), its
+//! (4 bytes a pixel), the grid (two bytes a cell: this generation and the
+//! next), its
 //! widget tree and the tree it publishes. These link arguments come after
 //! the workspace's default (apps/.cargo/config.toml's 2 MiB), and wasm-ld
 //! takes the last.

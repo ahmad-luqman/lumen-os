@@ -1,5 +1,6 @@
-//! The logic behind the shell's demos, kept free of kernel dependencies so
-//! it can be tested on the host:
+//! The logic behind the shell's demos and the Life app (#202, a path
+//! dependency of `apps/`), kept free of kernel dependencies so it can be
+//! tested on the host:
 //!
 //! - [`mandel`]: the Mandelbrot set in fixed-point integer arithmetic (the
 //!   kernel is built without SSE, so no floating point), and its colours.

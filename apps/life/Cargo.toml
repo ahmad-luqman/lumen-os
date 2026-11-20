@@ -8,8 +8,9 @@ repository.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
-# A WASM module has no host-side tests: its logic is lumen-demo's, and the
-# kernel runs it (tests/scenarios/test_apps.py).
+# A WASM module has no host-side tests: its rules and patterns are
+# lumen-demo's (host-tested); its own argument parsing and drawing are
+# checked by the scenarios (tests/scenarios/test_apps.py).
 test = false
 doctest = false
 bench = false

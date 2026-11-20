@@ -1128,8 +1128,9 @@ pub(super) fn launch(name: &str, args: &[String], without: Grants) -> Result<Lau
     Ok(Launched { state })
 }
 
-/// The bundled apps whose manifest grants `desktop`, by name (the
-/// launcher's; never the test apps).
+/// The bundled apps whose manifest grants `desktop`, by name (never the
+/// test apps): the launcher lists them after its demo items, except the
+/// one its Life item starts (`taskbar::LIFE_APP`, #202).
 pub fn desktop_apps() -> Vec<&'static str> {
     desktop_apps_in(BUNDLED)
 }
